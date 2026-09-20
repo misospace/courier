@@ -5,6 +5,10 @@ on:
     branches: ["main"]
   pull_request:
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
 permissions:
   contents: read
 
@@ -16,7 +20,7 @@ jobs:
 
       - uses: actions/setup-go@v5
         with:
-          go-version: "1.24"
+          go-version: "1.26.6"
           cache: true
 
       - name: Verify generated code is up to date
@@ -33,12 +37,25 @@ jobs:
         run: go build ./...
 
       - name: Test
-        run: go test ./... -coverprofile cover.out
+        run: go test -race ./... -coverprofile cover.out
 
       - name: Build images
         run: |
           docker build --target manager -t courier:ci .
           docker build --target coordinator -t courier-coordinator:ci .
+
+  vulnerability:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.26.6"
+          cache: true
+
+      - name: Check vulnerabilities
+        run: make govulncheck
 
   chart:
     runs-on: ubuntu-latest
