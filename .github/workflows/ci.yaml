@@ -54,7 +54,8 @@ jobs:
           helm lint charts/courier
           helm template courier charts/courier --namespace courier-system > rendered.yaml
           test "$(grep -c '^kind: CustomResourceDefinition' rendered.yaml)" -eq 2
-          helm template courier charts/courier --namespace courier-system \
-            --set crds.enabled=false | grep -q CustomResourceDefinition \
-            && { echo "crds.enabled=false still renders CRDs"; exit 1; } \
-            || true
+          if helm template courier charts/courier --namespace courier-system \
+            --set crds.enabled=false | grep -q CustomResourceDefinition; then
+            echo "crds.enabled=false still renders CRDs"
+            exit 1
+          fi
