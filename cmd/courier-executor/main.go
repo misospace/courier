@@ -43,6 +43,7 @@ type config struct {
 	TerminationFile string
 	GitUsername     string
 	GitToken        string
+	GitHubToken     string
 }
 
 type termination struct {
@@ -79,7 +80,11 @@ func readConfig(getenv func(string) string) (config, error) {
 		TerminationFile: strings.TrimSpace(getenv("COURIER_TERMINATION_FILE")),
 		GitUsername:     getenv("COURIER_GIT_USERNAME"),
 		GitToken:        getenv("COURIER_GIT_TOKEN"),
+		GitHubToken:     getenv("GITHUB_TOKEN"),
 		GitHubAPIBase:   strings.TrimSpace(getenv("COURIER_GITHUB_API_BASE")),
+	}
+	if strings.TrimSpace(cfg.GitHubToken) == "" {
+		cfg.GitHubToken = cfg.GitToken
 	}
 	if cfg.Directory == "" {
 		cfg.Directory = defaultWork
@@ -145,7 +150,7 @@ func run(ctx context.Context, stdout, stderr io.Writer) int {
 		Branch:    cfg.Branch,
 	})
 	if err != nil {
-		reason := redact(err.Error(), cfg.GitToken)
+		reason := redactCredentials(err.Error(), cfg)
 		emitTermination(stdout, cfg, termination{Phase: "Failed", Result: "failure", ExitCode: 1, Reason: reason})
 		return 1
 	}
@@ -170,7 +175,7 @@ func run(ctx context.Context, stdout, stderr io.Writer) int {
 			emitTermination(stdout, cfg, termination{Phase: "NeedsHuman", Result: "needs-human", ExitCode: code, Reason: "opencode requested human attention"})
 			return code
 		}
-		emitTermination(stdout, cfg, termination{Phase: "Failed", Result: "failure", ExitCode: code, Reason: redact(fmt.Sprintf("opencode exited with status %d", code), cfg.GitToken)})
+		emitTermination(stdout, cfg, termination{Phase: "Failed", Result: "failure", ExitCode: code, Reason: redactCredentials(fmt.Sprintf("opencode exited with status %d", code), cfg)})
 		return code
 	}
 
@@ -189,7 +194,7 @@ func guardAdoption(ctx context.Context, cfg config, stdout io.Writer) int {
 	}
 	exists, err := git.RemoteBranchExists(ctx, cfg.RemoteURL, cfg.Branch)
 	if err != nil {
-		reason := redact(err.Error(), cfg.GitToken)
+		reason := redactCredentials(err.Error(), cfg)
 		emitTermination(stdout, cfg, termination{Phase: "Failed", Result: "failure", ExitCode: 1, Reason: reason})
 		return 1
 	}
@@ -202,15 +207,15 @@ func guardAdoption(ctx context.Context, cfg config, stdout io.Writer) int {
 		emitTermination(stdout, cfg, termination{Phase: "Failed", Result: "failure", ExitCode: 1, Reason: reason})
 		return 1
 	}
-	client, err := github.NewClient(cfg.GitHubAPIBase, cfg.GitToken)
+	client, err := github.NewClient(cfg.GitHubAPIBase, cfg.GitHubToken)
 	if err != nil {
-		reason := redact(err.Error(), cfg.GitToken)
+		reason := redactCredentials(err.Error(), cfg)
 		emitTermination(stdout, cfg, termination{Phase: "Failed", Result: "failure", ExitCode: 1, Reason: reason})
 		return 1
 	}
 	pulls, err := client.PullRequestsForHead(ctx, owner, name, cfg.Branch)
 	if err != nil {
-		reason := redact(err.Error(), cfg.GitToken)
+		reason := redactCredentials(err.Error(), cfg)
 		emitTermination(stdout, cfg, termination{Phase: "Failed", Result: "failure", ExitCode: 1, Reason: reason})
 		return 1
 	}
@@ -318,6 +323,11 @@ func emitTermination(stdout io.Writer, cfg config, result termination) {
 	// never used for credentials and is replaced atomically enough for a single
 	// writer in the ephemeral workspace.
 	_ = os.WriteFile(cfg.TerminationFile, []byte(line), 0o600)
+}
+
+func redactCredentials(value string, cfg config) string {
+	value = redact(value, cfg.GitToken)
+	return redact(value, cfg.GitHubToken)
 }
 
 func redact(value, secret string) string {

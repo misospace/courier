@@ -113,13 +113,19 @@ func TestRunResolveIssueAdoptsBranchWithoutPullRequest(t *testing.T) {
 	fakeOpenCode := filepath.Join(root, "opencode")
 	writeExecutable(t, fakeOpenCode, "#!/bin/sh\nprintf 'opencode argv: %s\\n' \"$*\"\n")
 
+	const githubToken = "github-api-token"
+	const gitToken = "git-token"
+	var authorization string
 	prServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		authorization = r.Header.Get("Authorization")
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = io.WriteString(w, `[]`)
 	}))
 	defer prServer.Close()
 
 	workspace := setResolveIssueEnv(t, root, remote, prServer.URL, fakeOpenCode)
+	t.Setenv("COURIER_GIT_TOKEN", gitToken)
+	t.Setenv("GITHUB_TOKEN", githubToken)
 
 	var output bytes.Buffer
 	var errorsOut bytes.Buffer
@@ -135,6 +141,43 @@ func TestRunResolveIssueAdoptsBranchWithoutPullRequest(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(workspace, "work.txt")); err != nil {
 		t.Fatalf("existing branch was not adopted: %v", err)
+	}
+	if authorization != "Bearer github-api-token" {
+		t.Fatalf("GitHub authorization = %q, want narrow GitHub token", authorization)
+	}
+}
+
+func TestReadConfigGitHubTokenPrecedenceAndFallback(t *testing.T) {
+	base := map[string]string{
+		"COURIER_REPO_URL": "https://git.example/acme/widgets.git",
+		"COURIER_BRANCH":   "feature/7",
+		"COURIER_GOAL":     "goal",
+		"COURIER_MODEL":    "model",
+	}
+	for _, test := range []struct {
+		name       string
+		github     string
+		git        string
+		wantGitHub string
+	}{
+		{name: "GitHub token wins", github: "github-token", git: "git-token", wantGitHub: "github-token"},
+		{name: "Git token fallback", git: "git-token", wantGitHub: "git-token"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			values := make(map[string]string, len(base)+2)
+			for key, value := range base {
+				values[key] = value
+			}
+			values["GITHUB_TOKEN"] = test.github
+			values["COURIER_GIT_TOKEN"] = test.git
+			cfg, err := readConfig(func(name string) string { return values[name] })
+			if err != nil {
+				t.Fatalf("readConfig() error = %v", err)
+			}
+			if cfg.GitHubToken != test.wantGitHub {
+				t.Fatalf("GitHub token = %q, want %q", cfg.GitHubToken, test.wantGitHub)
+			}
+		})
 	}
 }
 

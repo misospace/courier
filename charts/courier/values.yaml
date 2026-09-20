@@ -39,7 +39,12 @@ controllers:
         #   --git-remote-template      forge remote URL template, one %s
         #                               placeholder filled with spec.repo
         #   --git-credential-secret    Secret with username/token keys for
-        #                               git access; empty disables injection
+        #                               git access; empty disables git injection
+        #   --git-token-key             Optional key for the git token; defaults to token
+        #   --github-credential-secret  Optional Secret for the GitHub API token;
+        #                               empty falls back to --git-credential-secret
+        #   --github-token-key          Optional key for the GitHub API token;
+        #                               empty falls back to --git-token-key or token
         #   --executor-environment-secret
         #                               Secret exposed to coordinator pods for
         #                               model/provider environment
@@ -47,6 +52,8 @@ controllers:
           - --leader-elect
           - --git-remote-template=https://github.com/%s.git
           - --git-credential-secret=courier-github
+          # - --github-credential-secret=courier-github-api
+          # - --github-token-key=token
         probes:
           liveness:
             enabled: true
