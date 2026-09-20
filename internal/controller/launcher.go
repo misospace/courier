@@ -26,7 +26,8 @@ type CoordinatorLauncher struct {
 
 // Launch implements LaunchFunc. The run is already Claimed when this method
 // is called, so a failed create is returned to the reconciler, which releases
-// the claim back to Pending.
+// the claim back to Pending. Phase transitions are the reconciler's to write
+// through the status contract; the launcher only creates the pod.
 func (l *CoordinatorLauncher) Launch(ctx context.Context, run *courierv1alpha1.CoderRun) error {
 	if l == nil || l.Client == nil {
 		return ErrLauncherClientRequired
@@ -47,8 +48,5 @@ func (l *CoordinatorLauncher) Launch(ctx context.Context, run *courierv1alpha1.C
 	if err := l.Client.Create(ctx, pod); err != nil && !apierrors.IsAlreadyExists(err) {
 		return err
 	}
-
-	before := run.DeepCopy()
-	run.Status.Phase = courierv1alpha1.PhaseRunning
-	return l.Client.Status().Patch(ctx, run, client.MergeFrom(before))
+	return nil
 }

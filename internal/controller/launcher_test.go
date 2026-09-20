@@ -15,7 +15,7 @@ import (
 	"github.com/misospace/courier/internal/executor"
 )
 
-func TestCoordinatorLauncherCreatesPodAndMarksRunRunning(t *testing.T) {
+func TestCoordinatorLauncherCreatesPodForClaimedRun(t *testing.T) {
 	run := &courierv1alpha1.CoderRun{
 		ObjectMeta: metav1.ObjectMeta{Name: "run-1", Namespace: "default", UID: types.UID("run-uid")},
 		Spec: courierv1alpha1.CoderRunSpec{
@@ -54,8 +54,8 @@ func TestCoordinatorLauncherCreatesPodAndMarksRunRunning(t *testing.T) {
 	if err := fakeClient.Get(context.Background(), client.ObjectKey{Namespace: "default", Name: "run-1"}, &updated); err != nil {
 		t.Fatalf("get updated run: %v", err)
 	}
-	if updated.Status.Phase != courierv1alpha1.PhaseRunning {
-		t.Fatalf("run phase = %q, want Running", updated.Status.Phase)
+	if updated.Status.Phase != courierv1alpha1.PhaseClaimed {
+		t.Fatalf("run phase = %q, want unchanged Claimed; phase transitions belong to the reconciler", updated.Status.Phase)
 	}
 }
 

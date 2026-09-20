@@ -3,6 +3,7 @@ package controller
 import (
 	"context"
 	"errors"
+	"reflect"
 	"strings"
 
 	corev1 "k8s.io/api/core/v1"
@@ -280,7 +281,7 @@ func (r *CoderRunReconciler) patchStatus(ctx context.Context, before, after *cou
 		branch := after.Status.Branch
 		fields.Branch = &branch
 	}
-	if fields.Phase == "" && fields.Branch == nil {
+	if reflect.DeepEqual(fields, status.OperatorPatch{}) {
 		return nil
 	}
 	writer := status.NewOperatorWriter(r.statusWriter())
