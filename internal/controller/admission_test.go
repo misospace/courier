@@ -209,16 +209,15 @@ func admissionClient(t *testing.T, objects ...runtime.Object) client.Client {
 		Build()
 }
 
-// fakeStatusWriter applies operator status apply-patches through the fake
-// client, which cannot serve real server-side-apply patches
-// (kubernetes/kubernetes#115598). It interprets only the fields the operator
-// owns, mirroring what the apiserver would do for the courier-operator field
-// manager.
+// fakeStatusWriter applies operator status patches through the fake client,
+// which serves JSON merge patches exactly like the status subresource does.
+// It interprets only the fields the operator owns; omitted fields are left
+// untouched, so harness checkpoint/heartbeat state survives operator writes.
 type fakeStatusWriter struct {
 	client client.Client
 }
 
-func (w fakeStatusWriter) PatchStatus(ctx context.Context, name types.NamespacedName, patch []byte, _ string) error {
+func (w fakeStatusWriter) PatchStatus(ctx context.Context, name types.NamespacedName, patch []byte) error {
 	var document struct {
 		Status struct {
 			Phase  courierv1alpha1.Phase `json:"phase,omitempty"`

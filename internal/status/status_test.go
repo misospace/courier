@@ -9,15 +9,17 @@ import (
 	"time"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
 	courierv1alpha1 "github.com/misospace/courier/api/v1alpha1"
 )
 
 type recordedPatch struct {
-	name    types.NamespacedName
-	patch   []byte
-	manager string
+	name  types.NamespacedName
+	patch []byte
 }
 
 type fakePatcher struct {
@@ -25,16 +27,15 @@ type fakePatcher struct {
 	err     error
 }
 
-func (f *fakePatcher) PatchStatus(_ context.Context, name types.NamespacedName, patch []byte, manager string) error {
+func (f *fakePatcher) PatchStatus(_ context.Context, name types.NamespacedName, patch []byte) error {
 	f.patches = append(f.patches, recordedPatch{
-		name:    name,
-		patch:   append([]byte(nil), patch...),
-		manager: manager,
+		name:  name,
+		patch: append([]byte(nil), patch...),
 	})
 	return f.err
 }
 
-func TestStatusWritersUseSeparateManagersAndOwnedFields(t *testing.T) {
+func TestStatusWritersOwnDisjointFields(t *testing.T) {
 	patcher := &fakePatcher{}
 	name := types.NamespacedName{Namespace: "default", Name: "run"}
 	operator := NewOperatorWriter(patcher)
@@ -61,12 +62,6 @@ func TestStatusWritersUseSeparateManagersAndOwnedFields(t *testing.T) {
 
 	if len(patcher.patches) != 2 {
 		t.Fatalf("patch count = %d, want 2", len(patcher.patches))
-	}
-	if got := patcher.patches[0].manager; got != OperatorFieldManager {
-		t.Fatalf("operator manager = %q, want %q", got, OperatorFieldManager)
-	}
-	if got := patcher.patches[1].manager; got != HarnessFieldManager {
-		t.Fatalf("harness manager = %q, want %q", got, HarnessFieldManager)
 	}
 
 	var operatorPayload map[string]interface{}
@@ -174,7 +169,7 @@ func TestHeartbeatPatchPreservesOperatorFieldsByConstruction(t *testing.T) {
 	}
 }
 
-func TestMarshalPatchIncludesObjectIdentity(t *testing.T) {
+func TestMarshalPatchCarriesOnlyStatus(t *testing.T) {
 	patch, err := marshalPatch(types.NamespacedName{Namespace: "default", Name: "run"}, HarnessPatch{})
 	if err != nil {
 		t.Fatalf("marshal patch: %v", err)
@@ -183,12 +178,88 @@ func TestMarshalPatchIncludesObjectIdentity(t *testing.T) {
 	if err := json.Unmarshal(patch, &got); err != nil {
 		t.Fatalf("decode patch: %v", err)
 	}
-	if got["apiVersion"] != courierv1alpha1.GroupVersion.String() || got["kind"] != "CoderRun" {
-		t.Fatalf("identity = %#v", got)
+	if !reflect.DeepEqual(got, map[string]interface{}{"status": map[string]interface{}{}}) {
+		t.Fatalf("patch = %#v, want a status-only document", got)
 	}
-	metadata := got["metadata"].(map[string]interface{})
-	if !reflect.DeepEqual(metadata, map[string]interface{}{"name": "run", "namespace": "default"}) {
-		t.Fatalf("metadata = %#v", metadata)
+}
+
+// statusClient builds a fake client whose merge-patch handling mirrors the
+// status subresource, seeded with one CoderRun.
+func statusClient(t *testing.T, run *courierv1alpha1.CoderRun) client.Client {
+	t.Helper()
+	scheme := runtime.NewScheme()
+	if err := courierv1alpha1.AddToScheme(scheme); err != nil {
+		t.Fatalf("add Courier scheme: %v", err)
+	}
+	return fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithStatusSubresource(&courierv1alpha1.CoderRun{}).
+		WithRuntimeObjects(run).
+		Build()
+}
+
+func statusTestRun() *courierv1alpha1.CoderRun {
+	return &courierv1alpha1.CoderRun{
+		ObjectMeta: metav1.ObjectMeta{Name: "run", Namespace: "default"},
+		Status: courierv1alpha1.CoderRunStatus{
+			Phase:      courierv1alpha1.PhaseClaimed,
+			Checkpoint: &courierv1alpha1.Checkpoint{Plan: "seeded checkpoint"},
+		},
+	}
+}
+
+func TestSequentialOperatorWritesPreserveOtherFields(t *testing.T) {
+	name := types.NamespacedName{Namespace: "default", Name: "run"}
+	kube := statusClient(t, statusTestRun())
+	writer := NewOperatorWriter(KubePatchWriter{Client: kube})
+
+	if err := writer.Patch(context.Background(), name, OperatorPatch{Phase: courierv1alpha1.PhaseRunning}); err != nil {
+		t.Fatalf("phase write: %v", err)
+	}
+	branch := "courier/issue-7"
+	if err := writer.Patch(context.Background(), name, OperatorPatch{Branch: &branch}); err != nil {
+		t.Fatalf("branch write: %v", err)
+	}
+
+	var run courierv1alpha1.CoderRun
+	if err := kube.Get(context.Background(), name, &run); err != nil {
+		t.Fatalf("get run: %v", err)
+	}
+	if run.Status.Phase != courierv1alpha1.PhaseRunning {
+		t.Fatalf("phase = %q, want Running preserved after the branch write", run.Status.Phase)
+	}
+	if run.Status.Branch != branch {
+		t.Fatalf("branch = %q, want %q", run.Status.Branch, branch)
+	}
+	if run.Status.Checkpoint == nil || run.Status.Checkpoint.Plan != "seeded checkpoint" {
+		t.Fatalf("harness checkpoint was disturbed by operator writes: %#v", run.Status.Checkpoint)
+	}
+}
+
+func TestSequentialHarnessWritesPreserveOtherFields(t *testing.T) {
+	name := types.NamespacedName{Namespace: "default", Name: "run"}
+	kube := statusClient(t, statusTestRun())
+	writer := NewHarnessWriter(KubePatchWriter{Client: kube})
+
+	if err := writer.Checkpoint(context.Background(), name, &courierv1alpha1.Checkpoint{Plan: "revised plan"}); err != nil {
+		t.Fatalf("checkpoint write: %v", err)
+	}
+	if err := writer.Heartbeat(context.Background(), name, &courierv1alpha1.Heartbeat{Kind: "tool"}); err != nil {
+		t.Fatalf("heartbeat write: %v", err)
+	}
+
+	var run courierv1alpha1.CoderRun
+	if err := kube.Get(context.Background(), name, &run); err != nil {
+		t.Fatalf("get run: %v", err)
+	}
+	if run.Status.Checkpoint == nil || run.Status.Checkpoint.Plan != "revised plan" {
+		t.Fatalf("checkpoint = %#v, want the revised plan preserved after the heartbeat write", run.Status.Checkpoint)
+	}
+	if run.Status.Heartbeat == nil || run.Status.Heartbeat.Kind != "tool" {
+		t.Fatalf("heartbeat = %#v, want the tool heartbeat", run.Status.Heartbeat)
+	}
+	if run.Status.Phase != courierv1alpha1.PhaseClaimed {
+		t.Fatalf("phase = %q, want Claimed preserved; operator fields must be untouched", run.Status.Phase)
 	}
 }
 

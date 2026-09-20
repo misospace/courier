@@ -2,10 +2,10 @@
 // and the coordinator harness.
 //
 // Status is split deliberately: the operator owns lifecycle and observed-world
-// fields, while the harness owns its checkpoint and activity heartbeat. Each
-// writer emits a server-side-apply patch containing only its fields and uses a
-// distinct field manager, so one writer cannot accidentally overwrite the
-// other's status.
+// fields, while the harness owns its checkpoint, activity heartbeat, and last
+// brief commit. Each writer emits a narrow JSON merge patch against the status
+// subresource containing only its own fields, so one writer cannot overwrite
+// the other's status and a partial write never removes fields it omitted.
 package status
 
 import (
@@ -23,17 +23,10 @@ import (
 	courierv1alpha1 "github.com/misospace/courier/api/v1alpha1"
 )
 
-const (
-	// OperatorFieldManager owns lifecycle and observed-world status fields.
-	OperatorFieldManager = "courier-operator"
-	// HarnessFieldManager owns checkpoint and activity status fields.
-	HarnessFieldManager = "courier-harness"
-
-	// DefaultHeartbeatCadence bounds status writes while successful activity is
-	// continuous. A caller can provide a shorter cadence for a deployment that
-	// needs tighter liveness observation.
-	DefaultHeartbeatCadence = 15 * time.Second
-)
+// DefaultHeartbeatCadence bounds status writes while successful activity is
+// continuous. A caller can provide a shorter cadence for a deployment that
+// needs tighter liveness observation.
+const DefaultHeartbeatCadence = 15 * time.Second
 
 var (
 	ErrNilPatcher = errors.New("status: nil patcher")
@@ -41,23 +34,23 @@ var (
 )
 
 // PatchWriter is the narrow status transport used by both writers. The patch
-// is a Kubernetes server-side-apply document and manager is its field manager.
-// Keeping this interface small makes status behavior testable without an API
-// server and leaves transport/authentication to controller-runtime.
+// is a JSON merge patch document applied to a CoderRun's status subresource;
+// fields absent from the patch are left untouched. Keeping this interface
+// small makes status behavior testable without an API server and leaves
+// transport/authentication to controller-runtime.
 type PatchWriter interface {
-	PatchStatus(context.Context, types.NamespacedName, []byte, string) error
+	PatchStatus(context.Context, types.NamespacedName, []byte) error
 }
 
-// KubePatchWriter adapts a controller-runtime client to PatchWriter. Status is
-// patched through the status subresource using server-side apply.
+// KubePatchWriter adapts a controller-runtime client to PatchWriter. Status
+// is patched through the status subresource with a JSON merge patch.
 type KubePatchWriter struct {
 	Client client.Client
 }
 
-// PatchStatus applies a status-subresource patch with the requested field
-// manager. The payload must identify a CoderRun and contain only the caller's
-// owned status fields.
-func (w KubePatchWriter) PatchStatus(ctx context.Context, name types.NamespacedName, patch []byte, manager string) error {
+// PatchStatus merges a status-subresource patch into the named CoderRun. The
+// payload must contain only the caller's owned status fields under "status".
+func (w KubePatchWriter) PatchStatus(ctx context.Context, name types.NamespacedName, patch []byte) error {
 	if w.Client == nil {
 		return ErrNilPatcher
 	}
@@ -68,8 +61,7 @@ func (w KubePatchWriter) PatchStatus(ctx context.Context, name types.NamespacedN
 	obj.Namespace = name.Namespace
 	obj.Name = name.Name
 	return w.Client.Status().Patch(ctx, obj,
-		client.RawPatch(types.ApplyPatchType, patch),
-		client.FieldOwner(manager),
+		client.RawPatch(types.MergePatchType, patch),
 	)
 }
 
@@ -95,18 +87,6 @@ type HarnessPatch struct {
 	LastCommit string                      `json:"lastCommit,omitempty"`
 }
 
-type applyPatch struct {
-	APIVersion string      `json:"apiVersion"`
-	Kind       string      `json:"kind"`
-	Metadata   patchObject `json:"metadata"`
-	Status     interface{} `json:"status"`
-}
-
-type patchObject struct {
-	Name      string `json:"name"`
-	Namespace string `json:"namespace,omitempty"`
-}
-
 // OperatorWriter writes only operator-owned status fields.
 type OperatorWriter struct {
 	patcher PatchWriter
@@ -117,7 +97,7 @@ func NewOperatorWriter(patcher PatchWriter) *OperatorWriter {
 	return &OperatorWriter{patcher: patcher}
 }
 
-// Patch applies operator-owned status fields with OperatorFieldManager.
+// Patch merges operator-owned status fields into the named run.
 func (w *OperatorWriter) Patch(ctx context.Context, name types.NamespacedName, fields OperatorPatch) error {
 	if w == nil || w.patcher == nil {
 		return ErrNilWriter
@@ -126,7 +106,7 @@ func (w *OperatorWriter) Patch(ctx context.Context, name types.NamespacedName, f
 	if err != nil {
 		return err
 	}
-	return w.patcher.PatchStatus(ctx, name, patch, OperatorFieldManager)
+	return w.patcher.PatchStatus(ctx, name, patch)
 }
 
 // HarnessWriter writes only harness-owned status fields.
@@ -139,7 +119,7 @@ func NewHarnessWriter(patcher PatchWriter) *HarnessWriter {
 	return &HarnessWriter{patcher: patcher}
 }
 
-// Patch applies harness-owned status fields with HarnessFieldManager.
+// Patch merges harness-owned status fields into the named run.
 func (w *HarnessWriter) Patch(ctx context.Context, name types.NamespacedName, fields HarnessPatch) error {
 	if w == nil || w.patcher == nil {
 		return ErrNilWriter
@@ -148,7 +128,7 @@ func (w *HarnessWriter) Patch(ctx context.Context, name types.NamespacedName, fi
 	if err != nil {
 		return err
 	}
-	return w.patcher.PatchStatus(ctx, name, patch, HarnessFieldManager)
+	return w.patcher.PatchStatus(ctx, name, patch)
 }
 
 // Checkpoint persists a checkpoint without touching the heartbeat or any
@@ -163,19 +143,18 @@ func (w *HarnessWriter) Heartbeat(ctx context.Context, name types.NamespacedName
 	return w.Patch(ctx, name, HarnessPatch{Heartbeat: heartbeat})
 }
 
+// mergePatch is the JSON merge patch document for a status subresource. Only
+// the status fields are present: the object is identified by the patch
+// request, so the body never carries identity that a merge could misapply.
+type mergePatch struct {
+	Status interface{} `json:"status"`
+}
+
 func marshalPatch(name types.NamespacedName, fields interface{}) ([]byte, error) {
 	if name.Name == "" {
 		return nil, fmt.Errorf("status: empty object name")
 	}
-	return json.Marshal(applyPatch{
-		APIVersion: courierv1alpha1.GroupVersion.String(),
-		Kind:       "CoderRun",
-		Metadata: patchObject{
-			Name:      name.Name,
-			Namespace: name.Namespace,
-		},
-		Status: fields,
-	})
+	return json.Marshal(mergePatch{Status: fields})
 }
 
 // Clock is the small time dependency needed by Heartbeat. Tests can provide a
