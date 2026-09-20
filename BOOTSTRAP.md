@@ -35,7 +35,12 @@ selected with `--executor-environment-secret`.
 
 ## Manual first run
 
-Apply a lane and a manual run after installing `config/default`:
+Install the chart, then apply a lane and a manual run:
+
+```sh
+helm dependency build charts/courier
+helm install courier charts/courier --namespace courier-system --create-namespace
+```
 
 ```yaml
 apiVersion: courier.misospace.dev/v1alpha1

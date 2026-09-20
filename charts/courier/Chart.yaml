@@ -1,0 +1,20 @@
+apiVersion: v2
+name: courier
+description: >-
+  Kubernetes operator that runs autonomous coding coordinators in pods and
+  leaves reviewable pull requests for a human to merge.
+type: application
+version: 0.1.0
+appVersion: 0.1.0
+home: https://github.com/misospace/courier
+sources:
+  - https://github.com/misospace/courier
+keywords:
+  - ai
+  - agents
+  - kubernetes
+  - operator
+dependencies:
+  - name: common
+    repository: https://bjw-s-labs.github.io/helm-charts
+    version: 5.2.0

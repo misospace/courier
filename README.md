@@ -33,6 +33,22 @@ recovery remain later work. See [BOOTSTRAP.md](./BOOTSTRAP.md) for the temporary
 executor contract and a manual first-run example. Contributor conventions are
 in [AGENTS.md](./AGENTS.md).
 
+## Install
+
+Courier ships a Helm chart built on the
+[bjw-s common library](https://bjw-s-labs.github.io/helm-charts/) — consumable
+by any Helm workflow, including Argo CD:
+
+```sh
+helm dependency build charts/courier
+helm install courier charts/courier --namespace courier-system --create-namespace
+```
+
+The chart installs the `CoderRun`/`LaneProfile` CRDs, the manager's RBAC, and
+the Deployment. Deployment-specific choices — forge remote, credential secrets,
+coordinator image — are plain values in `charts/courier/values.yaml`; nothing
+assumes a particular cluster or GitOps tooling.
+
 ## Design
 
 - **Inform, don't constrain.** Give the coordinator context and tools; trust its

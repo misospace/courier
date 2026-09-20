@@ -1,0 +1,122 @@
+# This chart is powered by the bjw-s common library and uses its native
+# values API — the same shape as an app-template HelmRelease:
+# https://bjw-s-labs.github.io/helm-charts/docs/common-library/
+#
+# Courier-specific configuration is plain manager flags under
+# `controllers.main.containers.main.args` and the RBAC objects under `rbac:`.
+# Required Secret keys for coordinator pods are documented in BOOTSTRAP.md.
+controllers:
+  main:
+    replicas: 1
+    pod:
+      # The manager talks to the Kubernetes API with its ServiceAccount
+      # token, which the library hardening default would leave unmounted.
+      automountServiceAccountToken: true
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile:
+          type: RuntimeDefault
+    containers:
+      main:
+        image:
+          # -- Image repository.
+          repository: ghcr.io/misospace/courier
+          # -- Image tag. Empty falls back to the chart appVersion.
+          tag: ""
+          # -- Image digest (sha256:...); takes precedence over tag when set.
+          digest: ""
+          pullPolicy: IfNotPresent
+        # -- Manager flags. Commonly overridden keys:
+        #   --executor-image           coordinator image (courier-executor +
+        #                               git + opencode + model config)
+        #   --git-remote-template      forge remote URL template, one %s
+        #                               placeholder filled with spec.repo
+        #   --git-credential-secret    Secret with username/token keys for
+        #                               git access; empty disables injection
+        #   --executor-environment-secret
+        #                               Secret exposed to coordinator pods for
+        #                               model/provider environment
+        args:
+          - --leader-elect
+          - --git-remote-template=https://github.com/%s.git
+          - --git-credential-secret=courier-github
+        probes:
+          liveness:
+            enabled: true
+            custom: true
+            spec:
+              httpGet:
+                path: /healthz
+                port: 8081
+              initialDelaySeconds: 15
+              periodSeconds: 20
+          readiness:
+            enabled: true
+            custom: true
+            spec:
+              httpGet:
+                path: /readyz
+                port: 8081
+              initialDelaySeconds: 5
+              periodSeconds: 10
+        resources:
+          requests:
+            cpu: 10m
+            memory: 64Mi
+          limits:
+            cpu: 500m
+            memory: 128Mi
+        securityContext:
+          allowPrivilegeEscalation: false
+          capabilities:
+            drop:
+              - ALL
+
+serviceAccount:
+  main: {}
+
+# -- RBAC required by the operator. The ClusterRole rules mirror the
+# +kubebuilder:rbac markers in internal/controller; keep both in sync.
+# config/rbac/role.yaml is the generated reference for that comparison.
+rbac:
+  roles:
+    operator:
+      type: ClusterRole
+      rules:
+        - apiGroups: [""]
+          resources: [pods]
+          verbs: [create, delete, get, list, watch]
+        - apiGroups: [courier.misospace.dev]
+          resources: [coderuns]
+          verbs: [create, delete, get, list, patch, update, watch]
+        - apiGroups: [courier.misospace.dev]
+          resources: [coderuns/finalizers]
+          verbs: [update]
+        - apiGroups: [courier.misospace.dev]
+          resources: [coderuns/status]
+          verbs: [get, patch, update]
+        - apiGroups: [courier.misospace.dev]
+          resources: [laneprofiles]
+          verbs: [get, list, watch]
+    leader-election:
+      type: Role
+      rules:
+        - apiGroups: [coordination.k8s.io]
+          resources: [leases]
+          verbs: [create, get, list, patch, update, watch]
+        - apiGroups: [""]
+          resources: [events]
+          verbs: [create, patch, update]
+  bindings:
+    operator:
+      type: ClusterRoleBinding
+      roleRef:
+        identifier: operator
+      subjects:
+        - identifier: main
+    leader-election:
+      type: RoleBinding
+      roleRef:
+        identifier: leader-election
+      subjects:
+        - identifier: main

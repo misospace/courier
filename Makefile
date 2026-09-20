@@ -14,10 +14,10 @@ all: build
 ##@ Development
 
 .PHONY: manifests
-manifests: controller-gen ## Generate CRDs and RBAC into config/.
+manifests: controller-gen ## Generate CRDs into the Helm chart and the RBAC reference into config/.
 	$(CONTROLLER_GEN) rbac:roleName=manager-role crd \
 		paths="./..." \
-		output:crd:artifacts:config=config/crd/bases \
+		output:crd:artifacts:config=charts/courier/crds \
 		output:rbac:artifacts:config=config/rbac
 
 .PHONY: generate

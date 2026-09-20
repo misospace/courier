@@ -34,3 +34,16 @@ jobs:
 
       - name: Test
         run: go test ./... -coverprofile cover.out
+
+  chart:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: azure/setup-helm@v4
+
+      - name: Lint chart
+        run: |
+          helm dependency build charts/courier
+          helm lint charts/courier
+          helm template courier charts/courier --namespace courier-system > /dev/null

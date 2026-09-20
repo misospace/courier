@@ -14,11 +14,17 @@ that plans, delegates, and produces PRs. See DESIGN.md for the full architecture
 
 ```
 api/v1alpha1/          CRD types (CoderRun, LaneProfile) + generated deepcopy
+charts/courier/        Helm chart (bjw-s/common) — the install path
+charts/courier/crds/   generated CRDs (do not hand-edit)
 cmd/main.go            manager entrypoint
 internal/controller/   reconcilers
-config/                generated CRDs + RBAC (do not hand-edit generated files)
+config/rbac/           generated RBAC reference
 hack/                  codegen boilerplate
 ```
+
+`charts/courier/values.yaml` carries the chart's RBAC rules; when you change a
+`+kubebuilder:rbac` marker, regenerate `config/rbac/role.yaml` and mirror the
+change in the chart's values.
 
 ## Build, test, generate
 
