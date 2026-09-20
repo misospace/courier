@@ -304,14 +304,15 @@ status and dies with the CR).
 spec:                       # set once by the source adapter, then immutable
   mode: resolve-issue | fix-pr
   source: dispatch | github-label | cron | cli | web
+  workItemID: <opaque ID understood by the source adapter>
   repo: owner/name
   ref: <issue# or pr#>
   lane: local | cloud | ...        # names a LaneProfile
-  branch: <deterministic, from repo+ref>   # materialized; never a fallback number
   debug: false                     # per-run: bumps pod log level, nothing else
   # no attempts field — by design
 status:
   phase: Pending | Claimed | Running | AwaitingReview | NeedsHuman | Done | Failed
+  branch: <derived resolve branch or adopted PR head>
   pr: <#/url>
   lastCommit: <sha>
   checkpoint:
@@ -349,7 +350,7 @@ it modest" with `concurrency: 1`. Same schema, no local assumption baked in.
 ## Reconcile loop
 
 - **Pending** — created by a source. The operator checks the lane's `concurrency`
-  against `Running` runs on that lane. Over capacity → stays Pending (this is the
+  against admitted (`Claimed` + `Running`) runs on that lane. Over capacity → stays Pending (this is the
   concurrency limit; a count, no slot object). Under → proceed.
 - **Claimed** — the source adapter claims the work (dispatch: claim +
   status=in-progress; label/cron/cli: no-op or equivalent). Branch name derived.
@@ -408,6 +409,13 @@ The coordinator pod gets:
 
 - The coordinator can read, push a branch, and open/update a PR. It cannot merge,
   cannot mutate the queue, cannot make an irreversible outward change.
+- **Deployment invariant:** the repository's default branch is protected and
+  requires an independent human approval before merge. The Courier identity is
+  not an administrator and has no bypass permission for branch protection.
+- A raw push credential can still write to any ref that the credential permits;
+  branch protection is therefore a required deployment control, not a property
+  supplied by the GitHub client. Scope the credential to the work repository and
+  keep its permissions no broader than the coordinator needs.
 - Source-state transitions (claim, in-review, needs-human, resolve) are the
   operator's, done by deterministic code — the one place non-determinism would be
   dangerous, kept mechanical.

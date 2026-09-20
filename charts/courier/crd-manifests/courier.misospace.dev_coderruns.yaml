@@ -27,6 +27,9 @@ spec:
     - jsonPath: .spec.lane
       name: Lane
       type: string
+    - jsonPath: .status.branch
+      name: Branch
+      type: string
     - jsonPath: .status.phase
       name: Phase
       type: string
@@ -66,11 +69,6 @@ spec:
               There is deliberately no attempts field: each CoderRun is one immutable
               attempt at one goal. History is the sequence of runs linked by the branch/PR.
             properties:
-              branch:
-                description: |-
-                  Branch is the deterministic work branch derived from repo+ref.
-                  It must never be a fallback number.
-                type: string
               debug:
                 description: Debug, when true, raises the pod log level for this run
                   only.
@@ -78,6 +76,7 @@ spec:
               lane:
                 description: Lane names the LaneProfile that supplies the model ensemble
                   and framing.
+                minLength: 1
                 type: string
               mode:
                 description: 'Mode is the kind of work: resolve-issue or fix-pr.'
@@ -88,26 +87,45 @@ spec:
               ref:
                 description: Ref is the issue number (resolve-issue) or PR number
                   (fix-pr).
+                minimum: 1
                 type: integer
               repo:
                 description: Repo is the target repository, "owner/name".
+                minLength: 3
+                pattern: ^[^/]+/[^/]+$
                 type: string
               source:
                 description: |-
                   Source names the adapter that created this run
                   (dispatch, github-label, cron, cli, web).
+                minLength: 1
+                type: string
+              workItemID:
+                description: |-
+                  WorkItemID is the opaque identifier assigned by the source adapter. It
+                  is persisted so lifecycle calls never need to infer source identity from
+                  the Kubernetes name or the numeric ref.
+                minLength: 1
                 type: string
             required:
-            - branch
             - lane
             - mode
             - ref
             - repo
             - source
+            - workItemID
             type: object
+            x-kubernetes-validations:
+            - message: spec is immutable
+              rule: self == oldSelf
           status:
             description: CoderRunStatus is the observed state of a CoderRun.
             properties:
+              branch:
+                description: |-
+                  Branch is the observed work branch. Resolve-issue runs derive it from the
+                  repository and issue; fix-pr runs adopt the branch attached to the PR.
+                type: string
               checkpoint:
                 description: Checkpoint is the compact resumable state written by
                   the harness.

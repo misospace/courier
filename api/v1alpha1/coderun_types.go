@@ -31,26 +31,34 @@ const (
 //
 // There is deliberately no attempts field: each CoderRun is one immutable
 // attempt at one goal. History is the sequence of runs linked by the branch/PR.
+// +kubebuilder:validation:XValidation:rule="self == oldSelf",message="spec is immutable"
 type CoderRunSpec struct {
 	// Mode is the kind of work: resolve-issue or fix-pr.
 	Mode Mode `json:"mode"`
 
 	// Source names the adapter that created this run
 	// (dispatch, github-label, cron, cli, web).
+	// +kubebuilder:validation:MinLength=1
 	Source string `json:"source"`
 
+	// WorkItemID is the opaque identifier assigned by the source adapter. It
+	// is persisted so lifecycle calls never need to infer source identity from
+	// the Kubernetes name or the numeric ref.
+	// +kubebuilder:validation:MinLength=1
+	WorkItemID string `json:"workItemID"`
+
 	// Repo is the target repository, "owner/name".
+	// +kubebuilder:validation:MinLength=3
+	// +kubebuilder:validation:Pattern=`^[^/]+/[^/]+$`
 	Repo string `json:"repo"`
 
 	// Ref is the issue number (resolve-issue) or PR number (fix-pr).
+	// +kubebuilder:validation:Minimum=1
 	Ref int `json:"ref"`
 
 	// Lane names the LaneProfile that supplies the model ensemble and framing.
+	// +kubebuilder:validation:MinLength=1
 	Lane string `json:"lane"`
-
-	// Branch is the deterministic work branch derived from repo+ref.
-	// It must never be a fallback number.
-	Branch string `json:"branch"`
 
 	// Debug, when true, raises the pod log level for this run only.
 	// +optional
@@ -96,6 +104,11 @@ type CoderRunStatus struct {
 	// +optional
 	Phase Phase `json:"phase,omitempty"`
 
+	// Branch is the observed work branch. Resolve-issue runs derive it from the
+	// repository and issue; fix-pr runs adopt the branch attached to the PR.
+	// +optional
+	Branch string `json:"branch,omitempty"`
+
 	// PR is the pull request opened by this run (number or URL).
 	// +optional
 	PR string `json:"pr,omitempty"`
@@ -130,6 +143,7 @@ type CoderRunStatus struct {
 // +kubebuilder:printcolumn:name="Repo",type=string,JSONPath=`.spec.repo`
 // +kubebuilder:printcolumn:name="Ref",type=integer,JSONPath=`.spec.ref`
 // +kubebuilder:printcolumn:name="Lane",type=string,JSONPath=`.spec.lane`
+// +kubebuilder:printcolumn:name="Branch",type=string,JSONPath=`.status.branch`
 // +kubebuilder:printcolumn:name="Phase",type=string,JSONPath=`.status.phase`
 // +kubebuilder:printcolumn:name="PR",type=string,JSONPath=`.status.pr`
 // +kubebuilder:printcolumn:name="Age",type=date,JSONPath=`.metadata.creationTimestamp`

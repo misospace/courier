@@ -34,3 +34,28 @@ jobs:
 
       - name: Test
         run: go test ./... -coverprofile cover.out
+
+      - name: Build images
+        run: |
+          docker build --target manager -t courier:ci .
+          docker build --target coordinator -t courier-coordinator:ci .
+
+  chart:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: azure/setup-helm@v4
+
+      - name: Lint chart
+        run: |
+          helm repo add bjw-s-labs https://bjw-s-labs.github.io/helm-charts
+          helm dependency build charts/courier
+          helm lint charts/courier
+          helm template courier charts/courier --namespace courier-system > rendered.yaml
+          test "$(grep -c '^kind: CustomResourceDefinition' rendered.yaml)" -eq 2
+          if helm template courier charts/courier --namespace courier-system \
+            --set crds.enabled=false | grep -q CustomResourceDefinition; then
+            echo "crds.enabled=false still renders CRDs"
+            exit 1
+          fi

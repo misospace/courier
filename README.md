@@ -16,12 +16,38 @@ Courier replaces a narrow one-shot executor with a long-lived, resumable
 coordinator that can watch CI, take feedback, and iterate — the loop that lets a
 model actually converge on a mergeable change.
 
+Courier is designed as general infrastructure that anyone can run, not as a
+system scoped to one operator's problems. Its core does not require a particular
+organization, cluster, model provider, source queue, forge, or hardware: those
+choices enter through `LaneProfile`, source adapters, executor implementations,
+and forge clients. The GitHub + OpenCode path currently checked in is the first
+reference deployment and a replaceable bootstrap configuration, not a product
+boundary.
+
 ## Status
 
-Early. The architecture is specified in [DESIGN.md](./DESIGN.md); this repository
-currently contains the operator scaffold (CRDs + a stub reconciler) and is built
-out through the issues. Contributor conventions are in
-[AGENTS.md](./AGENTS.md).
+Bootstrap MVP. Courier can admit a `CoderRun`, claim its source work, derive or
+adopt a branch, launch the temporary OpenCode coordinator, and map the completed
+pod back to review/needs-human state. The resumable custom harness and liveness
+recovery remain later work. See [BOOTSTRAP.md](./BOOTSTRAP.md) for the temporary
+executor contract and a manual first-run example. Contributor conventions are
+in [AGENTS.md](./AGENTS.md).
+
+## Install
+
+Courier ships a Helm chart built on the
+[bjw-s common library](https://bjw-s-labs.github.io/helm-charts/) — consumable
+by any Helm workflow, including Argo CD:
+
+```sh
+helm dependency build charts/courier
+helm install courier charts/courier --namespace courier-system --create-namespace
+```
+
+The chart installs the `CoderRun`/`LaneProfile` CRDs, the manager's RBAC, and
+the Deployment. Deployment-specific choices — forge remote, credential secrets,
+coordinator image — are plain values in `charts/courier/values.yaml`; nothing
+assumes a particular cluster or GitOps tooling.
 
 ## Design
 
