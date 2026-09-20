@@ -70,5 +70,5 @@ jobs:
           on_model_failure: notice
           inline_findings: "true"
           verdict_policy: findings_severity_gated
-          publish_mode: review_comment
-          allow_approve: "false"
+          publish_mode: review_verdict
+          allow_approve: "true"
