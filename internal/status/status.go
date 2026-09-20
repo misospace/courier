@@ -73,25 +73,26 @@ func (w KubePatchWriter) PatchStatus(ctx context.Context, name types.NamespacedN
 	)
 }
 
-// OperatorPatch contains only fields owned by the operator. Empty values are
-// omitted, which is appropriate for additive observed status and avoids
-// clearing harness-owned fields or previously published operator fields.
-// Branch is a pointer because a failed launch must be able to clear a stale
-// resolved branch back to empty, which omitempty on a plain string cannot
-// express.
+// OperatorPatch contains only fields owned by the operator: lifecycle and
+// observed-world fields. Empty values are omitted, which is appropriate for
+// additive observed status and avoids clearing harness-owned fields or
+// previously published operator fields. Branch is a pointer because a failed
+// launch must be able to clear a stale resolved branch back to empty, which
+// omitempty on a plain string cannot express.
 type OperatorPatch struct {
 	Phase      courierv1alpha1.Phase `json:"phase,omitempty"`
 	Branch     *string               `json:"branch,omitempty"`
 	PR         string                `json:"pr,omitempty"`
-	LastCommit string                `json:"lastCommit,omitempty"`
 	Restarts   int                   `json:"restarts,omitempty"`
 	Conditions []metav1.Condition    `json:"conditions,omitempty"`
 }
 
-// HarnessPatch contains only fields owned by the coordinator harness.
+// HarnessPatch contains only fields owned by the coordinator harness: its
+// checkpoint, its activity heartbeat, and the last brief commit it published.
 type HarnessPatch struct {
 	Checkpoint *courierv1alpha1.Checkpoint `json:"checkpoint,omitempty"`
 	Heartbeat  *courierv1alpha1.Heartbeat  `json:"heartbeat,omitempty"`
+	LastCommit string                      `json:"lastCommit,omitempty"`
 }
 
 type applyPatch struct {

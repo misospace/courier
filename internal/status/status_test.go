@@ -46,14 +46,16 @@ func TestStatusWritersUseSeparateManagersAndOwnedFields(t *testing.T) {
 		Phase:      phase,
 		Branch:     &branch,
 		PR:         "#42",
-		LastCommit: "abc123",
 		Restarts:   2,
 		Conditions: []metav1.Condition{{Type: "Ready", Status: metav1.ConditionTrue}},
 	}); err != nil {
 		t.Fatalf("operator patch: %v", err)
 	}
 	checkpoint := &courierv1alpha1.Checkpoint{Plan: "finish the work"}
-	if err := harness.Checkpoint(context.Background(), name, checkpoint); err != nil {
+	if err := harness.Patch(context.Background(), name, HarnessPatch{
+		Checkpoint: checkpoint,
+		LastCommit: "abc123",
+	}); err != nil {
 		t.Fatalf("harness patch: %v", err)
 	}
 
@@ -77,12 +79,12 @@ func TestStatusWritersUseSeparateManagersAndOwnedFields(t *testing.T) {
 	}
 	operatorStatus := operatorPayload["status"].(map[string]interface{})
 	harnessStatus := harnessPayload["status"].(map[string]interface{})
-	for _, field := range []string{"phase", "branch", "pr", "lastCommit", "restarts", "conditions"} {
+	for _, field := range []string{"phase", "branch", "pr", "restarts", "conditions"} {
 		if _, ok := operatorStatus[field]; !ok {
 			t.Errorf("operator status missing owned field %q", field)
 		}
 	}
-	for _, field := range []string{"checkpoint", "heartbeat"} {
+	for _, field := range []string{"checkpoint", "heartbeat", "lastCommit"} {
 		if _, ok := operatorStatus[field]; ok {
 			t.Errorf("operator patch unexpectedly contains harness field %q", field)
 		}
@@ -90,7 +92,10 @@ func TestStatusWritersUseSeparateManagersAndOwnedFields(t *testing.T) {
 	if _, ok := harnessStatus["checkpoint"]; !ok {
 		t.Error("harness patch missing checkpoint")
 	}
-	for _, field := range []string{"phase", "branch", "pr", "lastCommit", "restarts", "conditions", "heartbeat"} {
+	if _, ok := harnessStatus["lastCommit"]; !ok {
+		t.Error("harness patch missing lastCommit")
+	}
+	for _, field := range []string{"phase", "branch", "pr", "restarts", "conditions", "heartbeat"} {
 		if _, ok := harnessStatus[field]; ok {
 			t.Errorf("harness patch unexpectedly contains field %q", field)
 		}
@@ -162,7 +167,7 @@ func TestHeartbeatPatchPreservesOperatorFieldsByConstruction(t *testing.T) {
 	if _, ok := payload.Status["checkpoint"]; ok {
 		t.Error("heartbeat patch unexpectedly contains checkpoint")
 	}
-	for _, field := range []string{"phase", "branch", "pr", "lastCommit", "restarts", "conditions"} {
+	for _, field := range []string{"phase", "branch", "pr", "restarts", "conditions"} {
 		if _, ok := payload.Status[field]; ok {
 			t.Errorf("heartbeat patch unexpectedly contains operator field %q", field)
 		}
