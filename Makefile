@@ -50,7 +50,7 @@ run: manifests generate fmt vet ## Run the manager against the current kubeconfi
 
 .PHONY: docker-build
 docker-build: ## Build the operator image.
-	docker build -t $(IMG) .
+	docker build --target manager -t $(IMG) .
 
 .PHONY: docker-build-coordinator
 docker-build-coordinator: ## Build the bootstrap coordinator image (courier-executor + git + opencode).

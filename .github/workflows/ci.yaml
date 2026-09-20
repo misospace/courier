@@ -37,7 +37,7 @@ jobs:
 
       - name: Build images
         run: |
-          docker build -t courier:ci .
+          docker build --target manager -t courier:ci .
           docker build --target coordinator -t courier-coordinator:ci .
 
   chart:

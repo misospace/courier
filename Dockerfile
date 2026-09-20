@@ -16,14 +16,6 @@ RUN CGO_ENABLED=0 GOOS=${TARGETOS:-linux} GOARCH=${TARGETARCH} \
 	go build -a -o manager cmd/main.go && \
 	go build -a -o courier-executor ./cmd/courier-executor
 
-# Manager image: distroless, manager binary only.
-FROM gcr.io/distroless/static:nonroot
-WORKDIR /
-COPY --from=builder /workspace/manager .
-USER 65532:65532
-
-ENTRYPOINT ["/manager"]
-
 # Coordinator image: the bootstrap OpenCode runtime. The executor contract
 # (BOOTSTRAP.md) requires courier-executor, git, and opencode in one image.
 # Debian (not alpine) because the opencode npm package ships glibc binaries.
@@ -42,3 +34,13 @@ COPY --from=builder /workspace/courier-executor /usr/local/bin/courier-executor
 USER courier
 ENV HOME=/home/courier
 WORKDIR /workspace
+
+# Manager image: distroless, manager binary only. Kept last so a bare
+# `docker build .` produces the operator image; build paths still pass
+# --target explicitly.
+FROM gcr.io/distroless/static:nonroot AS manager
+WORKDIR /
+COPY --from=builder /workspace/manager .
+USER 65532:65532
+
+ENTRYPOINT ["/manager"]
