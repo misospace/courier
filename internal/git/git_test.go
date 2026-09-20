@@ -11,6 +11,23 @@ import (
 	"testing"
 )
 
+// TestMain pins a committer identity for the whole package: Prepare runs git
+// merges inside workspaces it clones itself, and CI runners have no global
+// git config to borrow one from.
+func TestMain(m *testing.M) {
+	for key, value := range map[string]string{
+		"GIT_AUTHOR_NAME":     "Courier Test",
+		"GIT_AUTHOR_EMAIL":    "courier-test@example.invalid",
+		"GIT_COMMITTER_NAME":  "Courier Test",
+		"GIT_COMMITTER_EMAIL": "courier-test@example.invalid",
+	} {
+		if err := os.Setenv(key, value); err != nil {
+			panic(err)
+		}
+	}
+	os.Exit(m.Run())
+}
+
 func TestPrepareAdoptsOrphanAndSyncsBaseBeforeWork(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
