@@ -15,7 +15,9 @@ that plans, delegates, and produces PRs. See DESIGN.md for the full architecture
 ```
 api/v1alpha1/          CRD types (CoderRun, LaneProfile) + generated deepcopy
 charts/courier/        Helm chart (bjw-s/common) — the install path
-charts/courier/crds/   generated CRDs (do not hand-edit)
+charts/courier/crd-manifests/
+                       generated CRDs, rendered as templates so helm upgrade
+                       evolves them (do not hand-edit)
 cmd/main.go            manager entrypoint
 internal/controller/   reconcilers
 config/rbac/           generated RBAC reference
