@@ -1,6 +1,8 @@
 # Courier operator Makefile.
 
 IMG ?= ghcr.io/misospace/courier:latest
+EXECUTOR_IMG ?= ghcr.io/misospace/courier-opencode:latest
+OPENCODE_VERSION ?= 1.18.31
 
 # Tool versions.
 CONTROLLER_TOOLS_VERSION ?= v0.16.5
@@ -17,7 +19,7 @@ all: build
 manifests: controller-gen ## Generate CRDs into the Helm chart and the RBAC reference into config/.
 	$(CONTROLLER_GEN) rbac:roleName=manager-role crd \
 		paths="./..." \
-		output:crd:artifacts:config=charts/courier/crds \
+		output:crd:artifacts:config=charts/courier/crd-manifests \
 		output:rbac:artifacts:config=config/rbac
 
 .PHONY: generate
@@ -49,6 +51,10 @@ run: manifests generate fmt vet ## Run the manager against the current kubeconfi
 .PHONY: docker-build
 docker-build: ## Build the operator image.
 	docker build -t $(IMG) .
+
+.PHONY: docker-build-coordinator
+docker-build-coordinator: ## Build the bootstrap coordinator image (courier-executor + git + opencode).
+	docker build --target coordinator --build-arg OPENCODE_VERSION=$(OPENCODE_VERSION) -t $(EXECUTOR_IMG) .
 
 ##@ Dependencies
 

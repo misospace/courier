@@ -1,0 +1,19 @@
+{{- if .Values.crds.enabled }}
+{{- /*
+  CRDs are rendered as regular template resources rather than shipped in the
+  chart's crds/ directory, because Helm installs crds/ on first install only
+  and never upgrades them. Rendering keeps `helm upgrade` able to evolve the
+  CRD schemas during dogfooding. The resource-policy annotation preserves the
+  crds/ behavior of never deleting CRDs (and every CoderRun with them) on
+  uninstall. Set crds.enabled=false to manage CRDs out-of-band.
+*/}}
+{{- range $path, $content := .Files.Glob "crd-manifests/*.yaml" }}
+{{- $crd := toString $content | fromYaml }}
+{{- if not $crd }}{{ fail (printf "unparseable CRD manifest: %s" $path) }}{{ end }}
+{{- if not $crd.metadata }}{{ $_ := set $crd "metadata" (dict) }}{{ end }}
+{{- if not $crd.metadata.annotations }}{{ $_ := set $crd.metadata "annotations" (dict) }}{{ end }}
+{{- $_ := set $crd.metadata.annotations "helm.sh/resource-policy" "keep" }}
+---
+{{ toYaml $crd }}
+{{- end }}
+{{- end }}

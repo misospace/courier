@@ -5,6 +5,13 @@
 # Courier-specific configuration is plain manager flags under
 # `controllers.main.containers.main.args` and the RBAC objects under `rbac:`.
 # Required Secret keys for coordinator pods are documented in BOOTSTRAP.md.
+
+# -- CRDs are rendered as regular resources so `helm upgrade` evolves them;
+# they carry helm.sh/resource-policy=keep and survive uninstall. Disable to
+# manage CRDs out-of-band.
+crds:
+  enabled: true
+
 controllers:
   main:
     replicas: 1
