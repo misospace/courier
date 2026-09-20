@@ -5,6 +5,7 @@ import (
 	"errors"
 	"reflect"
 	"strings"
+	"time"
 
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -17,6 +18,10 @@ import (
 	"github.com/misospace/courier/internal/source"
 	"github.com/misospace/courier/internal/status"
 )
+
+// capacityRequeueDelay bounds how long a Pending run can wait behind a full
+// lane before checking again.
+const capacityRequeueDelay = 15 * time.Second
 
 // CoderRunReconciler reconciles a CoderRun object.
 type CoderRunReconciler struct {
@@ -97,7 +102,11 @@ func (r *CoderRunReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 			"capacity", lane.Spec.Concurrency,
 			"admitted", admittedCount(runs.Items, run.Spec.Lane),
 		)
-		return ctrl.Result{}, nil
+		// No object transition wakes a Pending run when capacity frees: the
+		// run that releases a slot only triggers its own reconcile. Requeue
+		// so the wait is bounded rather than permanent; the delay also covers
+		// a concurrency bump on the LaneProfile itself.
+		return ctrl.Result{RequeueAfter: capacityRequeueDelay}, nil
 	}
 
 	if err := adapter.Claim(ctx, item); err != nil {

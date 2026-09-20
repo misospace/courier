@@ -51,8 +51,12 @@ func TestReconcileLeavesNPlusOnePending(t *testing.T) {
 	)
 	reconciler := admissionReconciler(client)
 
-	if _, err := reconciler.Reconcile(context.Background(), admissionRequest("next")); err != nil {
+	result, err := reconciler.Reconcile(context.Background(), admissionRequest("next"))
+	if err != nil {
 		t.Fatalf("Reconcile() error = %v", err)
+	}
+	if result.RequeueAfter != capacityRequeueDelay {
+		t.Fatalf("RequeueAfter = %v, want %v; a blocked Pending run must wake itself", result.RequeueAfter, capacityRequeueDelay)
 	}
 
 	var next courierv1alpha1.CoderRun
@@ -61,6 +65,46 @@ func TestReconcileLeavesNPlusOnePending(t *testing.T) {
 	}
 	if next.Status.Phase != courierv1alpha1.PhasePending {
 		t.Fatalf("next phase = %q, want Pending", next.Status.Phase)
+	}
+}
+
+func TestReconcileAdmitsNPlusOneAfterCapacityFrees(t *testing.T) {
+	client := admissionClient(t,
+		admissionLane("local", 1),
+		admissionRun("busy", "local", courierv1alpha1.PhaseRunning),
+		admissionRun("next", "local", courierv1alpha1.PhasePending),
+	)
+	reconciler := admissionReconciler(client)
+
+	if result, err := reconciler.Reconcile(context.Background(), admissionRequest("next")); err != nil {
+		t.Fatalf("Reconcile() while full: %v", err)
+	} else if result.RequeueAfter != capacityRequeueDelay {
+		t.Fatalf("RequeueWhile full = %v, want %v", result.RequeueAfter, capacityRequeueDelay)
+	}
+
+	// The occupying run finishes, releasing its slot.
+	var busy courierv1alpha1.CoderRun
+	if err := client.Get(context.Background(), admissionKey("busy"), &busy); err != nil {
+		t.Fatalf("get busy run: %v", err)
+	}
+	busy.Status.Phase = courierv1alpha1.PhaseAwaitingReview
+	if err := client.Status().Update(context.Background(), &busy); err != nil {
+		t.Fatalf("mark busy run terminal: %v", err)
+	}
+
+	result, err := reconciler.Reconcile(context.Background(), admissionRequest("next"))
+	if err != nil {
+		t.Fatalf("Reconcile() after capacity freed: %v", err)
+	}
+	if result.RequeueAfter != 0 {
+		t.Fatalf("RequeueAfter after admission = %v, want 0", result.RequeueAfter)
+	}
+	var next courierv1alpha1.CoderRun
+	if err := client.Get(context.Background(), admissionKey("next"), &next); err != nil {
+		t.Fatalf("get next run: %v", err)
+	}
+	if next.Status.Phase != courierv1alpha1.PhaseClaimed {
+		t.Fatalf("next phase = %q, want Claimed after capacity freed", next.Status.Phase)
 	}
 }
 
