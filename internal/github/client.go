@@ -207,6 +207,21 @@ func (c *Client) ReadPR(ctx context.Context, owner, repo string, number int) (Pu
 	return c.GetPullRequest(ctx, owner, repo, number)
 }
 
+// PullRequestsForHead lists every pull request whose head is owner:branch,
+// including merged and closed ones. state=all is deliberate: an adoption
+// guard must see pull requests in any state, not only open ones.
+func (c *Client) PullRequestsForHead(ctx context.Context, owner, repo, branch string) ([]PullRequest, error) {
+	var out []PullRequest
+	err := c.doJSONQuery(ctx, http.MethodGet, repoEndpoint(owner, repo, "pulls"), headFilterQuery(owner, branch), nil, &out)
+	return out, err
+}
+
+// headFilterQuery builds the pulls-list query for a head ref owned by the
+// repository. GitHub requires the owner:branch form of the head filter.
+func headFilterQuery(owner, branch string) string {
+	return "head=" + url.QueryEscape(owner) + ":" + url.QueryEscape(branch) + "&state=all"
+}
+
 // GetCheckRuns reads CI checks for a commit, branch, or tag ref.
 func (c *Client) GetCheckRuns(ctx context.Context, owner, repo, ref string) (CheckRuns, error) {
 	var out CheckRuns
@@ -235,6 +250,10 @@ func repoEndpoint(owner, repo string, parts ...string) string {
 }
 
 func (c *Client) endpoint(relative string) *url.URL {
+	return c.endpointWithQuery(relative, "")
+}
+
+func (c *Client) endpointWithQuery(relative, query string) *url.URL {
 	u := *c.baseURL
 	basePath := u.EscapedPath()
 	if !strings.HasPrefix(basePath, "/") {
@@ -253,11 +272,17 @@ func (c *Client) endpoint(relative string) *url.URL {
 	if u.EscapedPath() == u.Path {
 		u.RawPath = ""
 	}
-	u.RawQuery = ""
+	u.RawQuery = query
 	return &u
 }
 
 func (c *Client) doJSON(ctx context.Context, method, relative string, input, output any) error {
+	return c.doJSONQuery(ctx, method, relative, "", input, output)
+}
+
+// doJSONQuery is doJSON with a raw query string, for list endpoints that
+// filter server-side.
+func (c *Client) doJSONQuery(ctx context.Context, method, relative, query string, input, output any) error {
 	var body io.Reader
 	if input != nil {
 		encoded, err := json.Marshal(input)
@@ -266,7 +291,7 @@ func (c *Client) doJSON(ctx context.Context, method, relative string, input, out
 		}
 		body = bytes.NewReader(encoded)
 	}
-	req, err := http.NewRequestWithContext(ctx, method, c.endpoint(relative).String(), body)
+	req, err := http.NewRequestWithContext(ctx, method, c.endpointWithQuery(relative, query).String(), body)
 	if err != nil {
 		return fmt.Errorf("create GitHub request: %w", err)
 	}

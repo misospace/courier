@@ -142,6 +142,41 @@ func TestPrepareCreatesBranchFromBase(t *testing.T) {
 	}
 }
 
+func TestRemoteBranchExists(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	root := t.TempDir()
+	remote := filepath.Join(root, "remote.git")
+	source := filepath.Join(root, "source")
+	initBare(t, remote)
+	initRepo(t, source)
+	writeFile(t, filepath.Join(source, "README.md"), "base\n")
+	commit(t, source, "base: initial")
+	git(t, source, "branch", "-M", "main")
+	git(t, source, "remote", "add", "origin", remote)
+	git(t, source, "push", "-u", "origin", "main")
+
+	exists, err := RemoteBranchExists(ctx, remote, "main")
+	if err != nil {
+		t.Fatalf("RemoteBranchExists(main): %v", err)
+	}
+	if !exists {
+		t.Fatal("expected main to be advertised by the remote")
+	}
+
+	exists, err = RemoteBranchExists(ctx, remote, "courier/resolve-issue/acme-widget/10")
+	if err != nil {
+		t.Fatalf("RemoteBranchExists(missing): %v", err)
+	}
+	if exists {
+		t.Fatal("expected a missing branch to report false")
+	}
+
+	if _, err := RemoteBranchExists(ctx, remote, "-not-a-branch"); err == nil {
+		t.Fatal("RemoteBranchExists accepted an invalid ref")
+	}
+}
+
 func TestBranchNameRejectsMissingRef(t *testing.T) {
 	if _, err := BranchName("acme/widget", 0, "resolve-issue"); err == nil {
 		t.Fatal("BranchName accepted a missing ref")

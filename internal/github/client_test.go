@@ -109,6 +109,55 @@ func TestReadPullRequestAndChecks(t *testing.T) {
 	}
 }
 
+func TestPullRequestsForHead(t *testing.T) {
+	t.Parallel()
+	var rawQuery string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/repos/acme/demo/pulls" {
+			http.NotFound(w, r)
+			return
+		}
+		rawQuery = r.URL.RawQuery
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `[{"number":12,"state":"open","head":{"ref":"work"}},{"number":9,"state":"merged"}]`)
+	}))
+	defer server.Close()
+	client, err := NewClient(server.URL, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	pulls, err := client.PullRequestsForHead(context.Background(), "acme", "demo", "work")
+	if err != nil {
+		t.Fatalf("PullRequestsForHead: %v", err)
+	}
+	if len(pulls) != 2 || pulls[0].Number != 12 || pulls[0].State != "open" || pulls[1].State != "merged" {
+		t.Fatalf("pulls = %#v, want an open and a merged PR", pulls)
+	}
+	if !strings.Contains(rawQuery, "head=acme:work") {
+		t.Fatalf("query %q does not filter on head=owner:branch", rawQuery)
+	}
+	if !strings.Contains(rawQuery, "state=all") {
+		t.Fatalf("query %q must use state=all so closed and merged PRs are visible", rawQuery)
+	}
+}
+
+func TestPullRequestsForHeadAPIError(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+		_, _ = io.WriteString(w, `{"message":"internal error"}`)
+	}))
+	defer server.Close()
+	client, err := NewClient(server.URL, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = client.PullRequestsForHead(context.Background(), "acme", "demo", "work")
+	var apiErr *APIError
+	if !errors.As(err, &apiErr) || apiErr.StatusCode != http.StatusInternalServerError {
+		t.Fatalf("error = %v (%T), want a 500 APIError", err, err)
+	}
+}
+
 func TestAPIErrorAndAuthentication(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if got := r.Header.Get("Authorization"); got != "Bearer token" {

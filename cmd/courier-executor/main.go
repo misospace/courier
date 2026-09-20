@@ -16,6 +16,7 @@ import (
 
 	"github.com/misospace/courier/internal/executor"
 	"github.com/misospace/courier/internal/git"
+	"github.com/misospace/courier/internal/github"
 )
 
 const (
@@ -31,9 +32,12 @@ type config struct {
 	Directory       string
 	Base            string
 	Branch          string
+	Repo            string
+	Mode            string
 	Goal            string
 	Model           string
 	Framing         string
+	GitHubAPIBase   string
 	OpenCodeBinary  string
 	OpenCodeFormat  string
 	TerminationFile string
@@ -65,14 +69,17 @@ func readConfig(getenv func(string) string) (config, error) {
 		Directory:       strings.TrimSpace(getenv("COURIER_WORKSPACE")),
 		Base:            strings.TrimSpace(getenv("COURIER_BASE")),
 		Branch:          strings.TrimSpace(getenv("COURIER_BRANCH")),
+		Repo:            strings.TrimSpace(getenv("COURIER_REPO")),
 		Goal:            strings.TrimSpace(getenv("COURIER_GOAL")),
 		Model:           strings.TrimSpace(getenv("COURIER_MODEL")),
 		Framing:         getenv("COURIER_FRAMING"),
+		Mode:            strings.TrimSpace(getenv("COURIER_MODE")),
 		OpenCodeBinary:  strings.TrimSpace(getenv("COURIER_OPENCODE_BINARY")),
 		OpenCodeFormat:  strings.TrimSpace(getenv("COURIER_OPENCODE_FORMAT")),
 		TerminationFile: strings.TrimSpace(getenv("COURIER_TERMINATION_FILE")),
 		GitUsername:     getenv("COURIER_GIT_USERNAME"),
 		GitToken:        getenv("COURIER_GIT_TOKEN"),
+		GitHubAPIBase:   strings.TrimSpace(getenv("COURIER_GITHUB_API_BASE")),
 	}
 	if cfg.Directory == "" {
 		cfg.Directory = defaultWork
@@ -85,6 +92,9 @@ func readConfig(getenv func(string) string) (config, error) {
 	}
 	if cfg.OpenCodeFormat == "" {
 		cfg.OpenCodeFormat = defaultFormat
+	}
+	if cfg.GitHubAPIBase == "" {
+		cfg.GitHubAPIBase = "https://api.github.com/"
 	}
 	for _, required := range []struct {
 		name  string
@@ -124,6 +134,10 @@ func run(ctx context.Context, stdout, stderr io.Writer) int {
 	restoreEnv := installAskpass(askpassPath)
 	defer restoreEnv()
 
+	if code := guardAdoption(ctx, cfg, stdout); code != 0 {
+		return code
+	}
+
 	workspace, err := git.Prepare(ctx, git.PrepareOptions{
 		RemoteURL: cfg.RemoteURL,
 		Directory: cfg.Directory,
@@ -162,6 +176,60 @@ func run(ctx context.Context, stdout, stderr io.Writer) int {
 
 	emitTermination(stdout, cfg, termination{Phase: "AwaitingReview", Result: "success", ExitCode: exitSuccess, Reason: "opencode completed"})
 	return exitSuccess
+}
+
+// guardAdoption enforces the resolve-issue invariant that a deterministic
+// branch may be adopted only when it is orphaned. If the branch already
+// exists on the remote, no pull request may exist for that head; if one
+// does, a human decides, and the run stops before Prepare or OpenCode.
+// It returns 0 when the run may proceed.
+func guardAdoption(ctx context.Context, cfg config, stdout io.Writer) int {
+	if cfg.Mode != "resolve-issue" {
+		return 0
+	}
+	exists, err := git.RemoteBranchExists(ctx, cfg.RemoteURL, cfg.Branch)
+	if err != nil {
+		reason := redact(err.Error(), cfg.GitToken)
+		emitTermination(stdout, cfg, termination{Phase: "Failed", Result: "failure", ExitCode: 1, Reason: reason})
+		return 1
+	}
+	if !exists {
+		return 0
+	}
+	owner, name, ok := splitOwnerRepo(cfg.Repo)
+	if !ok {
+		reason := "resolve branch already exists on the remote and COURIER_REPO does not name an owner/repo; refusing adoption"
+		emitTermination(stdout, cfg, termination{Phase: "Failed", Result: "failure", ExitCode: 1, Reason: reason})
+		return 1
+	}
+	client, err := github.NewClient(cfg.GitHubAPIBase, cfg.GitToken)
+	if err != nil {
+		reason := redact(err.Error(), cfg.GitToken)
+		emitTermination(stdout, cfg, termination{Phase: "Failed", Result: "failure", ExitCode: 1, Reason: reason})
+		return 1
+	}
+	pulls, err := client.PullRequestsForHead(ctx, owner, name, cfg.Branch)
+	if err != nil {
+		reason := redact(err.Error(), cfg.GitToken)
+		emitTermination(stdout, cfg, termination{Phase: "Failed", Result: "failure", ExitCode: 1, Reason: reason})
+		return 1
+	}
+	for _, pull := range pulls {
+		reason := fmt.Sprintf("resolve branch already has PR #%d (%s); refusing adoption", pull.Number, pull.State)
+		emitTermination(stdout, cfg, termination{Phase: "NeedsHuman", Result: "needs-human", ExitCode: exitNeedsHuman, Reason: reason})
+		return exitNeedsHuman
+	}
+	return 0
+}
+
+// splitOwnerRepo splits an owner/name repository identity on the final "/".
+func splitOwnerRepo(value string) (owner, name string, ok bool) {
+	value = strings.TrimSpace(value)
+	idx := strings.LastIndex(value, "/")
+	if idx <= 0 || idx == len(value)-1 {
+		return "", "", false
+	}
+	return value[:idx], value[idx+1:], true
 }
 
 func installGitIdentity() func() {

@@ -113,6 +113,24 @@ func Clone(ctx context.Context, remoteURL, destination string) error {
 	return err
 }
 
+// RemoteBranchExists reports whether remoteURL advertises the branch, without
+// requiring a local clone. It is the forge-agnostic half of the "adopt only
+// when orphaned" guard: deciding what an existing remote branch means is the
+// caller's job.
+func RemoteBranchExists(ctx context.Context, remoteURL, branch string) (bool, error) {
+	if strings.TrimSpace(remoteURL) == "" {
+		return false, errors.New("remote URL is required")
+	}
+	if err := validateRef(branch, "branch"); err != nil {
+		return false, err
+	}
+	out, err := run(ctx, "", "ls-remote", "--heads", "--", remoteURL, "refs/heads/"+branch)
+	if err != nil {
+		return false, err
+	}
+	return len(bytes.TrimSpace(out)) > 0, nil
+}
+
 // Prepare clones a repository and checks out its deterministic work branch.
 // If the branch already exists on the remote, it is adopted and synchronized
 // with Base before returning.  New branches are created from the fetched Base.
