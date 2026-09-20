@@ -36,7 +36,12 @@ vet: ## Run go vet.
 
 .PHONY: test
 test: manifests generate fmt vet ## Run tests.
-	go test ./... -coverprofile cover.out
+	go test -race ./... -coverprofile cover.out
+
+.PHONY: govulncheck
+govulncheck: ## Run the Go vulnerability scanner.
+	go install golang.org/x/vuln/cmd/govulncheck@latest
+	govulncheck ./...
 
 ##@ Build
 
