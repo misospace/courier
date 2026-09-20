@@ -211,6 +211,124 @@ func TestBuildCoordinatorPodWiresGitSecretWithoutEmbeddingCredentials(t *testing
 	}
 }
 
+func TestBuildCoordinatorPodWiresDistinctGitHubSecret(t *testing.T) {
+	run := &courierv1alpha1.CoderRun{
+		ObjectMeta: metav1.ObjectMeta{Name: "run-distinct-secret", Namespace: "courier-system"},
+		Spec: courierv1alpha1.CoderRunSpec{
+			Mode: courierv1alpha1.ModeResolveIssue,
+			Repo: "acme/widgets",
+			Ref:  7,
+			Lane: "local",
+		},
+		Status: courierv1alpha1.CoderRunStatus{Branch: "courier/acme/widgets/issue-7"},
+	}
+	lane := &courierv1alpha1.LaneProfile{
+		ObjectMeta: metav1.ObjectMeta{Name: "local", Namespace: "courier-system"},
+		Spec:       courierv1alpha1.LaneProfileSpec{Roles: map[string]string{"coordinator": "any-model"}},
+	}
+	pod, err := BuildCoordinatorPod(run, lane, PodConfig{
+		Image:                  "registry.example/courier-opencode:test",
+		WorkspacePath:          "/workspace",
+		GitCredentialSecret:    "courier-git",
+		GitTokenKey:            "git-token",
+		GitHubCredentialSecret: "courier-github-api",
+		GitHubTokenKey:         "api-token",
+	})
+	if err != nil {
+		t.Fatalf("BuildCoordinatorPod() error = %v", err)
+	}
+	refs := make(map[string]*corev1.SecretKeySelector)
+	for index := range pod.Spec.Containers[0].Env {
+		env := &pod.Spec.Containers[0].Env[index]
+		if env.ValueFrom != nil && env.ValueFrom.SecretKeyRef != nil {
+			refs[env.Name] = env.ValueFrom.SecretKeyRef
+		}
+	}
+	if ref := refs["COURIER_GIT_TOKEN"]; ref == nil || ref.Name != "courier-git" || ref.Key != "git-token" {
+		t.Fatalf("git token reference = %#v", ref)
+	}
+	if ref := refs["GITHUB_TOKEN"]; ref == nil || ref.Name != "courier-github-api" || ref.Key != "api-token" {
+		t.Fatalf("GitHub token reference = %#v", ref)
+	}
+}
+
+func TestBuildCoordinatorPodFallsBackToGitTokenKeyForGitHubSecret(t *testing.T) {
+	run := &courierv1alpha1.CoderRun{
+		ObjectMeta: metav1.ObjectMeta{Name: "run-github-key-fallback", Namespace: "courier-system"},
+		Spec: courierv1alpha1.CoderRunSpec{
+			Mode: courierv1alpha1.ModeResolveIssue,
+			Repo: "acme/widgets",
+			Ref:  7,
+			Lane: "local",
+		},
+		Status: courierv1alpha1.CoderRunStatus{Branch: "courier/acme/widgets/issue-7"},
+	}
+	lane := &courierv1alpha1.LaneProfile{
+		ObjectMeta: metav1.ObjectMeta{Name: "local", Namespace: "courier-system"},
+		Spec:       courierv1alpha1.LaneProfileSpec{Roles: map[string]string{"coordinator": "any-model"}},
+	}
+	pod, err := BuildCoordinatorPod(run, lane, PodConfig{
+		Image:                  "registry.example/courier-opencode:test",
+		WorkspacePath:          "/workspace",
+		GitCredentialSecret:    "courier-git",
+		GitTokenKey:            "git-token",
+		GitHubCredentialSecret: "courier-github-api",
+	})
+	if err != nil {
+		t.Fatalf("BuildCoordinatorPod() error = %v", err)
+	}
+	for _, env := range pod.Spec.Containers[0].Env {
+		if env.Name == "GITHUB_TOKEN" {
+			if env.ValueFrom == nil || env.ValueFrom.SecretKeyRef == nil || env.ValueFrom.SecretKeyRef.Name != "courier-github-api" || env.ValueFrom.SecretKeyRef.Key != "git-token" {
+				t.Fatalf("GitHub token reference = %#v", env.ValueFrom)
+			}
+			return
+		}
+	}
+	t.Fatal("GITHUB_TOKEN environment variable is missing")
+}
+
+func TestBuildCoordinatorPodWiresAPIOnlySecret(t *testing.T) {
+	run := &courierv1alpha1.CoderRun{
+		ObjectMeta: metav1.ObjectMeta{Name: "run-api-only-secret", Namespace: "courier-system"},
+		Spec: courierv1alpha1.CoderRunSpec{
+			Mode: courierv1alpha1.ModeResolveIssue,
+			Repo: "acme/widgets",
+			Ref:  7,
+			Lane: "local",
+		},
+		Status: courierv1alpha1.CoderRunStatus{Branch: "courier/acme/widgets/issue-7"},
+	}
+	lane := &courierv1alpha1.LaneProfile{
+		ObjectMeta: metav1.ObjectMeta{Name: "local", Namespace: "courier-system"},
+		Spec:       courierv1alpha1.LaneProfileSpec{Roles: map[string]string{"coordinator": "any-model"}},
+	}
+	pod, err := BuildCoordinatorPod(run, lane, PodConfig{
+		Image:                  "registry.example/courier-opencode:test",
+		WorkspacePath:          "/workspace",
+		GitHubCredentialSecret: "courier-github-api",
+		GitHubTokenKey:         "api-token",
+	})
+	if err != nil {
+		t.Fatalf("BuildCoordinatorPod() error = %v", err)
+	}
+	foundGitHub := false
+	for _, env := range pod.Spec.Containers[0].Env {
+		if env.Name == "COURIER_GIT_USERNAME" || env.Name == "COURIER_GIT_TOKEN" {
+			t.Fatalf("git credential environment variable %q was unexpectedly wired", env.Name)
+		}
+		if env.Name == "GITHUB_TOKEN" {
+			foundGitHub = true
+			if env.ValueFrom == nil || env.ValueFrom.SecretKeyRef == nil || env.ValueFrom.SecretKeyRef.Name != "courier-github-api" || env.ValueFrom.SecretKeyRef.Key != "api-token" {
+				t.Fatalf("GitHub token reference = %#v", env.ValueFrom)
+			}
+		}
+	}
+	if !foundGitHub {
+		t.Fatal("GITHUB_TOKEN environment variable is missing")
+	}
+}
+
 func TestRepositoryTemplateEscapesPathComponents(t *testing.T) {
 	got := escapedRepositoryPath("acme/widgets?read=all")
 	if got != "acme/widgets%3Fread=all" {

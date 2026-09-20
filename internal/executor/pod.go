@@ -34,15 +34,17 @@ type PodConfig struct {
 	RuntimeClassName   string
 	// GitRemoteURL may contain one %s placeholder for the run's owner/name.
 	// It is deployment configuration, not a provider-specific assumption.
-	GitRemoteURL        string
-	BaseBranch          string
-	GitCredentialSecret string
-	GitUsernameKey      string
-	GitTokenKey         string
-	EnvironmentSecret   string
-	BootstrapBinary     string
-	OpenCode            OpenCode
-	Resources           corev1.ResourceRequirements
+	GitRemoteURL           string
+	BaseBranch             string
+	GitCredentialSecret    string
+	GitUsernameKey         string
+	GitTokenKey            string
+	GitHubCredentialSecret string
+	GitHubTokenKey         string
+	EnvironmentSecret      string
+	BootstrapBinary        string
+	OpenCode               OpenCode
+	Resources              corev1.ResourceRequirements
 }
 
 // DefaultPodConfig is suitable for the temporary OpenCode shim image. The
@@ -209,28 +211,45 @@ func podEnvironment(invocation Invocation, executorName string, config PodConfig
 	}
 	terminationFile := strings.TrimRight(config.WorkspacePath, "/") + "/termination"
 	values := toKubernetesEnv(EnvironmentWithConfig(invocation, executorName, remoteURL, config.BaseBranch, config.OpenCode.Binary, config.OpenCode.Format, terminationFile))
-	if strings.TrimSpace(config.GitCredentialSecret) == "" {
+	githubSecret := config.GitHubCredentialSecret
+	if githubSecret == "" {
+		githubSecret = config.GitCredentialSecret
+	}
+	if strings.TrimSpace(config.GitCredentialSecret) == "" && strings.TrimSpace(githubSecret) == "" {
 		return values
 	}
-	usernameKey := config.GitUsernameKey
-	if usernameKey == "" {
-		usernameKey = "username"
+	env := values
+	if strings.TrimSpace(config.GitCredentialSecret) != "" {
+		usernameKey := config.GitUsernameKey
+		if usernameKey == "" {
+			usernameKey = "username"
+		}
+		tokenKey := config.GitTokenKey
+		if tokenKey == "" {
+			tokenKey = "token"
+		}
+		env = append(env,
+			corev1.EnvVar{Name: "COURIER_GIT_USERNAME", ValueFrom: &corev1.EnvVarSource{SecretKeyRef: &corev1.SecretKeySelector{
+				LocalObjectReference: corev1.LocalObjectReference{Name: config.GitCredentialSecret}, Key: usernameKey,
+			}}},
+			corev1.EnvVar{Name: "COURIER_GIT_TOKEN", ValueFrom: &corev1.EnvVarSource{SecretKeyRef: &corev1.SecretKeySelector{
+				LocalObjectReference: corev1.LocalObjectReference{Name: config.GitCredentialSecret}, Key: tokenKey,
+			}}},
+		)
 	}
-	tokenKey := config.GitTokenKey
-	if tokenKey == "" {
-		tokenKey = "token"
+	if strings.TrimSpace(githubSecret) != "" {
+		githubTokenKey := config.GitHubTokenKey
+		if githubTokenKey == "" {
+			githubTokenKey = config.GitTokenKey
+			if githubTokenKey == "" {
+				githubTokenKey = "token"
+			}
+		}
+		env = append(env, corev1.EnvVar{Name: "GITHUB_TOKEN", ValueFrom: &corev1.EnvVarSource{SecretKeyRef: &corev1.SecretKeySelector{
+			LocalObjectReference: corev1.LocalObjectReference{Name: githubSecret}, Key: githubTokenKey,
+		}}})
 	}
-	return append(values,
-		corev1.EnvVar{Name: "COURIER_GIT_USERNAME", ValueFrom: &corev1.EnvVarSource{SecretKeyRef: &corev1.SecretKeySelector{
-			LocalObjectReference: corev1.LocalObjectReference{Name: config.GitCredentialSecret}, Key: usernameKey,
-		}}},
-		corev1.EnvVar{Name: "COURIER_GIT_TOKEN", ValueFrom: &corev1.EnvVarSource{SecretKeyRef: &corev1.SecretKeySelector{
-			LocalObjectReference: corev1.LocalObjectReference{Name: config.GitCredentialSecret}, Key: tokenKey,
-		}}},
-		corev1.EnvVar{Name: "GITHUB_TOKEN", ValueFrom: &corev1.EnvVarSource{SecretKeyRef: &corev1.SecretKeySelector{
-			LocalObjectReference: corev1.LocalObjectReference{Name: config.GitCredentialSecret}, Key: tokenKey,
-		}}},
-	)
+	return env
 }
 
 // escapedRepositoryPath keeps repository components in the configured URL's

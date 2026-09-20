@@ -37,6 +37,9 @@ func main() {
 	var executorImage string
 	var gitRemoteTemplate string
 	var gitCredentialSecret string
+	var gitTokenKey string
+	var githubCredentialSecret string
+	var githubTokenKey string
 	var executorEnvironmentSecret string
 	flag.StringVar(&metricsAddr, "metrics-bind-address", ":8080", "The address the metric endpoint binds to.")
 	flag.StringVar(&probeAddr, "health-probe-bind-address", ":8081", "The address the probe endpoint binds to.")
@@ -44,7 +47,10 @@ func main() {
 	defaults := executor.DefaultPodConfig()
 	flag.StringVar(&executorImage, "executor-image", defaults.Image, "Coordinator image containing courier-executor, git, and opencode.")
 	flag.StringVar(&gitRemoteTemplate, "git-remote-template", defaults.GitRemoteURL, "Git remote URL template containing one %s repository placeholder.")
-	flag.StringVar(&gitCredentialSecret, "git-credential-secret", "courier-github", "Secret containing username and token keys for private git access; empty disables secret injection.")
+	flag.StringVar(&gitCredentialSecret, "git-credential-secret", "courier-github", "Secret containing username and token keys for private git access; empty disables git secret injection.")
+	flag.StringVar(&gitTokenKey, "git-token-key", "", "Optional key in the git credential Secret; empty defaults to token.")
+	flag.StringVar(&githubCredentialSecret, "github-credential-secret", "", "Optional Secret containing the GitHub API token; empty falls back to --git-credential-secret.")
+	flag.StringVar(&githubTokenKey, "github-token-key", "", "Optional key in the GitHub API credential Secret; empty falls back to --git-token-key or token.")
 	flag.StringVar(&executorEnvironmentSecret, "executor-environment-secret", "", "Optional Secret exposed as coordinator environment variables for model/provider configuration.")
 	opts := zap.Options{Development: true}
 	opts.BindFlags(flag.CommandLine)
@@ -68,6 +74,9 @@ func main() {
 	podConfig.Image = executorImage
 	podConfig.GitRemoteURL = gitRemoteTemplate
 	podConfig.GitCredentialSecret = gitCredentialSecret
+	podConfig.GitTokenKey = gitTokenKey
+	podConfig.GitHubCredentialSecret = githubCredentialSecret
+	podConfig.GitHubTokenKey = githubTokenKey
 	podConfig.EnvironmentSecret = executorEnvironmentSecret
 	launcher := &controller.CoordinatorLauncher{
 		Client: mgr.GetClient(),

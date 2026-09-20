@@ -412,10 +412,17 @@ The coordinator pod gets:
 - **Deployment invariant:** the repository's default branch is protected and
   requires an independent human approval before merge. The Courier identity is
   not an administrator and has no bypass permission for branch protection.
+  Courier's runtime push identity must be a dedicated GitHub App installation
+  token or a fine-grained PAT scoped to the work repository, with permission to
+  trigger the repository's workflows. It must not be an Actions
+  `GITHUB_TOKEN`, whose lifecycle and permissions are tied to an individual
+  workflow run.
 - A raw push credential can still write to any ref that the credential permits;
   branch protection is therefore a required deployment control, not a property
-  supplied by the GitHub client. Scope the credential to the work repository and
-  keep its permissions no broader than the coordinator needs.
+  supplied by the GitHub client. Scope the push credential to the work
+  repository and keep its permissions no broader than the coordinator needs.
+  The GitHub API credential may be separate from the push credential and should
+  be narrower when the deployment only needs PR, comment, and check-run access.
 - Source-state transitions (claim, in-review, needs-human, resolve) are the
   operator's, done by deterministic code — the one place non-determinism would be
   dangerous, kept mechanical.
