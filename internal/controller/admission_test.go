@@ -2,6 +2,7 @@ package controller
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"testing"
 
@@ -164,10 +165,43 @@ func admissionClient(t *testing.T, objects ...runtime.Object) client.Client {
 		Build()
 }
 
+// fakeStatusWriter applies operator status apply-patches through the fake
+// client, which cannot serve real server-side-apply patches
+// (kubernetes/kubernetes#115598). It interprets only the fields the operator
+// owns, mirroring what the apiserver would do for the courier-operator field
+// manager.
+type fakeStatusWriter struct {
+	client client.Client
+}
+
+func (w fakeStatusWriter) PatchStatus(ctx context.Context, name types.NamespacedName, patch []byte, _ string) error {
+	var document struct {
+		Status struct {
+			Phase  courierv1alpha1.Phase `json:"phase,omitempty"`
+			Branch *string               `json:"branch,omitempty"`
+		} `json:"status"`
+	}
+	if err := json.Unmarshal(patch, &document); err != nil {
+		return err
+	}
+	var run courierv1alpha1.CoderRun
+	if err := w.client.Get(ctx, name, &run); err != nil {
+		return err
+	}
+	if document.Status.Phase != "" {
+		run.Status.Phase = document.Status.Phase
+	}
+	if document.Status.Branch != nil {
+		run.Status.Branch = *document.Status.Branch
+	}
+	return w.client.Status().Update(ctx, &run)
+}
+
 func admissionReconciler(c client.Client) *CoderRunReconciler {
 	return &CoderRunReconciler{
-		Client:  c,
-		Sources: NewSourceRegistry(map[string]source.Adapter{"test": &admissionSource{}}),
+		Client:       c,
+		Sources:      NewSourceRegistry(map[string]source.Adapter{"test": &admissionSource{}}),
+		StatusWriter: fakeStatusWriter{client: c},
 	}
 }
 

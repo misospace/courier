@@ -41,9 +41,10 @@ func TestStatusWritersUseSeparateManagersAndOwnedFields(t *testing.T) {
 	harness := NewHarnessWriter(patcher)
 
 	phase := courierv1alpha1.PhaseRunning
+	branch := "courier/issue-7"
 	if err := operator.Patch(context.Background(), name, OperatorPatch{
 		Phase:      phase,
-		Branch:     "courier/issue-7",
+		Branch:     &branch,
 		PR:         "#42",
 		LastCommit: "abc123",
 		Restarts:   2,

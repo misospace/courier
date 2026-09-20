@@ -51,7 +51,7 @@ func TestSourceRegistryUsesSpecSourceAndDurableWorkItemID(t *testing.T) {
 	run.Spec.Source = "first"
 	run.Spec.WorkItemID = "opaque/source/id"
 	client := phaseClient(t, admissionLane("local", 1), run)
-	reconciler := &CoderRunReconciler{Client: client, Sources: registry}
+	reconciler := &CoderRunReconciler{Client: client, Sources: registry, StatusWriter: fakeStatusWriter{client: client}}
 	if _, err := reconciler.Reconcile(context.Background(), admissionRequest("run")); err != nil {
 		t.Fatalf("Reconcile() error = %v", err)
 	}
@@ -69,8 +69,9 @@ func TestOperatorStatusPatchesPreserveHarnessFields(t *testing.T) {
 	run.Status.Heartbeat = &courierv1alpha1.Heartbeat{Kind: "stream"}
 	client := phaseClient(t, admissionLane("local", 1), run)
 	reconciler := &CoderRunReconciler{
-		Client:  client,
-		Sources: NewSourceRegistry(map[string]source.Adapter{"test": &admissionSource{}}),
+		Client:       client,
+		Sources:      NewSourceRegistry(map[string]source.Adapter{"test": &admissionSource{}}),
+		StatusWriter: fakeStatusWriter{client: client},
 	}
 	if _, err := reconciler.Reconcile(context.Background(), admissionRequest("run")); err != nil {
 		t.Fatalf("Reconcile() error = %v", err)
@@ -102,6 +103,7 @@ func TestPendingClaimsBeforeBranchResolutionAndLaunch(t *testing.T) {
 		Client:         client,
 		Sources:        NewSourceRegistry(map[string]source.Adapter{"dispatch": item}),
 		PRHeadResolver: resolver,
+		StatusWriter:   fakeStatusWriter{client: client},
 		Launch: func(_ context.Context, run *courierv1alpha1.CoderRun) error {
 			order = append(order, "launch")
 			run.Status.Phase = courierv1alpha1.PhaseRunning
@@ -138,9 +140,10 @@ func TestLaunchFailureReleasesSourceAndCapacity(t *testing.T) {
 	run := admissionRun("run", "local", courierv1alpha1.PhasePending)
 	client := phaseClient(t, admissionLane("local", 1), run)
 	reconciler := &CoderRunReconciler{
-		Client:  client,
-		Sources: NewSourceRegistry(map[string]source.Adapter{"test": item}),
-		Launch:  func(context.Context, *courierv1alpha1.CoderRun) error { return wantErr },
+		Client:       client,
+		Sources:      NewSourceRegistry(map[string]source.Adapter{"test": item}),
+		StatusWriter: fakeStatusWriter{client: client},
+		Launch:       func(context.Context, *courierv1alpha1.CoderRun) error { return wantErr },
 	}
 	if _, err := reconciler.Reconcile(context.Background(), admissionRequest("run")); !errors.Is(err, wantErr) {
 		t.Fatalf("Reconcile() error = %v, want %v", err, wantErr)
@@ -163,8 +166,9 @@ func TestClaimedRunRetriesLaunchAfterPartialAdmission(t *testing.T) {
 	run.Status.Branch = "courier/acme/widgets/issue-1"
 	client := phaseClient(t, admissionLane("local", 1), run)
 	reconciler := &CoderRunReconciler{
-		Client:  client,
-		Sources: NewSourceRegistry(map[string]source.Adapter{"test": item}),
+		Client:       client,
+		Sources:      NewSourceRegistry(map[string]source.Adapter{"test": item}),
+		StatusWriter: fakeStatusWriter{client: client},
 		Launch: func(_ context.Context, run *courierv1alpha1.CoderRun) error {
 			run.Status.Phase = courierv1alpha1.PhaseRunning
 			return nil
@@ -205,8 +209,9 @@ func TestRunningPodExitMapsPhaseAndSourceState(t *testing.T) {
 			pod := coordinatorPod(run, tt.exitCode)
 			client := phaseClient(t, run, pod)
 			reconciler := &CoderRunReconciler{
-				Client:  client,
-				Sources: NewSourceRegistry(map[string]source.Adapter{"test": item}),
+				Client:       client,
+				Sources:      NewSourceRegistry(map[string]source.Adapter{"test": item}),
+				StatusWriter: fakeStatusWriter{client: client},
 			}
 			if _, err := reconciler.Reconcile(context.Background(), admissionRequest("run")); err != nil {
 				t.Fatalf("Reconcile() error = %v", err)
@@ -230,8 +235,9 @@ func TestDoneRunResolvesSourceWorkItem(t *testing.T) {
 	run := admissionRun("run", "local", courierv1alpha1.PhaseDone)
 	client := phaseClient(t, run)
 	reconciler := &CoderRunReconciler{
-		Client:  client,
-		Sources: NewSourceRegistry(map[string]source.Adapter{"test": item}),
+		Client:       client,
+		Sources:      NewSourceRegistry(map[string]source.Adapter{"test": item}),
+		StatusWriter: fakeStatusWriter{client: client},
 	}
 	if _, err := reconciler.Reconcile(context.Background(), admissionRequest("run")); err != nil {
 		t.Fatalf("Reconcile() error = %v", err)

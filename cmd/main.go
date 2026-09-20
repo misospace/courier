@@ -17,6 +17,7 @@ import (
 	"github.com/misospace/courier/internal/executor"
 	"github.com/misospace/courier/internal/source"
 	"github.com/misospace/courier/internal/source/manual"
+	"github.com/misospace/courier/internal/status"
 )
 
 var (
@@ -80,6 +81,7 @@ func main() {
 		Sources: controller.NewSourceRegistry(map[string]source.Adapter{
 			"manual": manual.Adapter{},
 		}),
+		StatusWriter: status.KubePatchWriter{Client: mgr.GetClient()},
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "CoderRun")
 		os.Exit(1)

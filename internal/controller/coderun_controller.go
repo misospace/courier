@@ -14,6 +14,7 @@ import (
 	courierv1alpha1 "github.com/misospace/courier/api/v1alpha1"
 	"github.com/misospace/courier/internal/executor"
 	"github.com/misospace/courier/internal/source"
+	"github.com/misospace/courier/internal/status"
 )
 
 // CoderRunReconciler reconciles a CoderRun object.
@@ -33,6 +34,10 @@ type CoderRunReconciler struct {
 	// PRHeadResolver is required for fix-pr runs. It returns the branch attached
 	// to the existing PR; no branch is synthesized from the PR number.
 	PRHeadResolver ExistingPRHeadResolver
+
+	// StatusWriter is the status transport used for operator-owned fields.
+	// Nil falls back to server-side apply through the reconciler's client.
+	StatusWriter status.PatchWriter
 }
 
 // +kubebuilder:rbac:groups=courier.misospace.dev,resources=coderuns,verbs=get;list;watch;create;update;patch;delete
@@ -258,14 +263,35 @@ func (r *CoderRunReconciler) observeRunning(ctx context.Context, run *courierv1a
 	return ctrl.Result{}, nil
 }
 
-// patchStatus writes only the status fields changed by the operator. A full
-// status Update would race with the harness heartbeat/checkpoint writer and
-// could overwrite fields the operator does not own.
+// patchStatus writes only the operator-owned status fields that changed
+// between before and after, using server-side apply with the operator's field
+// manager. A full status Update would race with the harness
+// heartbeat/checkpoint writer and could overwrite fields the operator does
+// not own.
 func (r *CoderRunReconciler) patchStatus(ctx context.Context, before, after *courierv1alpha1.CoderRun) error {
 	if before == nil || after == nil {
 		return errors.New("coderun controller: status patch requires a run")
 	}
-	return r.Status().Patch(ctx, after, client.MergeFrom(before))
+	var fields status.OperatorPatch
+	if before.Status.Phase != after.Status.Phase {
+		fields.Phase = after.Status.Phase
+	}
+	if before.Status.Branch != after.Status.Branch {
+		branch := after.Status.Branch
+		fields.Branch = &branch
+	}
+	if fields.Phase == "" && fields.Branch == nil {
+		return nil
+	}
+	writer := status.NewOperatorWriter(r.statusWriter())
+	return writer.Patch(ctx, client.ObjectKeyFromObject(after), fields)
+}
+
+func (r *CoderRunReconciler) statusWriter() status.PatchWriter {
+	if r.StatusWriter != nil {
+		return r.StatusWriter
+	}
+	return status.KubePatchWriter{Client: r.Client}
 }
 
 func podBelongsToRun(pod *corev1.Pod, run *courierv1alpha1.CoderRun) bool {
