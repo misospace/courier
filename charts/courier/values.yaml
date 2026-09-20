@@ -25,6 +25,11 @@ controllers:
           type: RuntimeDefault
     containers:
       main:
+        env:
+          POD_NAMESPACE:
+            valueFrom:
+              fieldRef:
+                fieldPath: metadata.namespace
         image:
           # -- Image repository.
           repository: ghcr.io/misospace/courier
@@ -100,6 +105,9 @@ rbac:
         - apiGroups: [""]
           resources: [pods]
           verbs: [create, delete, get, list, watch]
+        - apiGroups: [""]
+          resources: [secrets]
+          verbs: [get]
         - apiGroups: [courier.misospace.dev]
           resources: [coderuns]
           verbs: [create, delete, get, list, patch, update, watch]

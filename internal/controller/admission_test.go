@@ -222,6 +222,7 @@ func (w fakeStatusWriter) PatchStatus(ctx context.Context, name types.Namespaced
 		Status struct {
 			Phase  courierv1alpha1.Phase `json:"phase,omitempty"`
 			Branch *string               `json:"branch,omitempty"`
+			PR     string                `json:"pr,omitempty"`
 		} `json:"status"`
 	}
 	if err := json.Unmarshal(patch, &document); err != nil {
@@ -236,6 +237,9 @@ func (w fakeStatusWriter) PatchStatus(ctx context.Context, name types.Namespaced
 	}
 	if document.Status.Branch != nil {
 		run.Status.Branch = *document.Status.Branch
+	}
+	if document.Status.PR != "" {
+		run.Status.PR = document.Status.PR
 	}
 	return w.client.Status().Update(ctx, &run)
 }

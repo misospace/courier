@@ -141,6 +141,33 @@ func TestPullRequestsForHead(t *testing.T) {
 	}
 }
 
+func TestObserverReportsDraftPullRequest(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/repos/acme/demo/pulls":
+			_, _ = io.WriteString(w, `[{"number":12,"state":"open","draft":true,"head":{"ref":"work","sha":"abc"}}]`)
+		case "/repos/acme/demo/commits/abc/check-runs":
+			_, _ = io.WriteString(w, `{"total_count":1,"check_runs":[{"conclusion":"success"}]}`)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	client, err := NewClient(server.URL, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	observation, err := (Observer{Client: client}).Observe(context.Background(), "acme/demo", "work")
+	if err != nil {
+		t.Fatalf("Observe() error = %v", err)
+	}
+	if observation.PR != "12" || !observation.Draft {
+		t.Fatalf("observation = %#v, want draft PR 12", observation)
+	}
+}
+
 func TestPullRequestsForHeadAPIError(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusInternalServerError)

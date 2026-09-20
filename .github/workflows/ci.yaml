@@ -36,6 +36,19 @@ jobs:
       - name: Build
         run: go build ./...
 
+      - name: Install setup-envtest
+        run: make setup-envtest
+
+      - name: Cache envtest assets
+        uses: actions/cache@v4
+        with:
+          path: ~/.local/share/kubebuilder-envtest
+          key: envtest-k8s-1.31-${{ runner.os }}-${{ runner.arch }}
+
+      - name: Provision envtest assets
+        run: |
+          echo "KUBEBUILDER_ASSETS=$(bin/setup-envtest use -p path 1.31.x!)" >> "$GITHUB_ENV"
+
       - name: Test
         run: go test -race ./... -coverprofile cover.out
 

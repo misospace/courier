@@ -6,9 +6,12 @@ OPENCODE_VERSION ?= 1.18.31
 
 # Tool versions.
 CONTROLLER_TOOLS_VERSION ?= v0.16.5
+ENVTEST_VERSION ?= release-0.19
+ENVTEST_K8S_VERSION ?= 1.31.x!
 
 LOCALBIN ?= $(shell pwd)/bin
 CONTROLLER_GEN ?= $(LOCALBIN)/controller-gen
+SETUP_ENVTEST ?= $(LOCALBIN)/setup-envtest
 
 .PHONY: all
 all: build
@@ -37,6 +40,11 @@ vet: ## Run go vet.
 .PHONY: test
 test: manifests generate fmt vet ## Run tests.
 	go test -race ./... -coverprofile cover.out
+
+.PHONY: envtest
+envtest: setup-envtest ## Download Kubernetes assets for envtest.
+	@KUBEBUILDER_ASSETS=$$($(SETUP_ENVTEST) use -p path $(ENVTEST_K8S_VERSION)) \
+		go test -race ./internal/controller -coverprofile cover.out
 
 .PHONY: govulncheck
 govulncheck: ## Run the Go vulnerability scanner.
@@ -70,3 +78,8 @@ $(LOCALBIN):
 controller-gen: $(LOCALBIN) ## Install controller-gen into ./bin.
 	@test -x $(CONTROLLER_GEN) || \
 		GOBIN=$(LOCALBIN) go install sigs.k8s.io/controller-tools/cmd/controller-gen@$(CONTROLLER_TOOLS_VERSION)
+
+.PHONY: setup-envtest
+setup-envtest: $(LOCALBIN) ## Install setup-envtest into ./bin.
+	@test -x $(SETUP_ENVTEST) || \
+		GOBIN=$(LOCALBIN) go install sigs.k8s.io/controller-runtime/tools/setup-envtest@$(ENVTEST_VERSION)

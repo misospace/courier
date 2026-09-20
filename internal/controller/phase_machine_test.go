@@ -22,6 +22,19 @@ type admissionSource struct {
 	resolved    []string
 }
 
+type fakeWorldObserver struct {
+	observation PRObservation
+	err         error
+	calls       *int
+}
+
+func (o fakeWorldObserver) Observe(context.Context, string, string) (PRObservation, error) {
+	if o.calls != nil {
+		*o.calls = *o.calls + 1
+	}
+	return o.observation, o.err
+}
+
 func (s *admissionSource) Discover(context.Context) ([]source.WorkItem, error) { return nil, nil }
 func (s *admissionSource) Claim(_ context.Context, item source.WorkItem) error {
 	s.claimed = append(s.claimed, item.ID)
@@ -208,10 +221,15 @@ func TestRunningPodExitMapsPhaseAndSourceState(t *testing.T) {
 			run.Spec.WorkItemID = "opaque-work-item"
 			pod := coordinatorPod(run, tt.exitCode)
 			client := phaseClient(t, run, pod)
+			calls := 0
 			reconciler := &CoderRunReconciler{
 				Client:       client,
 				Sources:      NewSourceRegistry(map[string]source.Adapter{"test": item}),
 				StatusWriter: fakeStatusWriter{client: client},
+				Observer: fakeWorldObserver{
+					observation: PRObservation{PR: "42", Checks: []CheckObservation{{Conclusion: "success"}}},
+					calls:       &calls,
+				},
 			}
 			if _, err := reconciler.Reconcile(context.Background(), admissionRequest("run")); err != nil {
 				t.Fatalf("Reconcile() error = %v", err)
@@ -225,6 +243,84 @@ func TestRunningPodExitMapsPhaseAndSourceState(t *testing.T) {
 			}
 			if len(item.transitions) != 1 || item.transitions[0] != tt.wantSource {
 				t.Fatalf("source transitions = %#v, want %#v", item.transitions, []source.State{tt.wantSource})
+			}
+			if tt.exitCode == 0 && calls != 1 {
+				t.Fatalf("observer calls = %d, want 1", calls)
+			}
+		})
+	}
+}
+
+func TestResolveIssueObservationGatesReview(t *testing.T) {
+	tests := []struct {
+		name            string
+		observation     PRObservation
+		err             error
+		observerMissing bool
+		wantPhase       courierv1alpha1.Phase
+		wantRequeue     bool
+		wantTransition  source.State
+	}{
+		{name: "observer missing", observerMissing: true, wantPhase: courierv1alpha1.PhaseNeedsHuman, wantTransition: source.StateNeedsHuman},
+		{name: "no PR", wantPhase: courierv1alpha1.PhaseNeedsHuman, wantTransition: source.StateNeedsHuman},
+		{name: "draft", observation: PRObservation{PR: "42", Draft: true, Checks: []CheckObservation{{Conclusion: "success"}}}, wantPhase: courierv1alpha1.PhaseNeedsHuman, wantTransition: source.StateNeedsHuman},
+		{name: "no checks", observation: PRObservation{PR: "42"}, wantPhase: courierv1alpha1.PhaseNeedsHuman, wantTransition: source.StateNeedsHuman},
+		{name: "pending", observation: PRObservation{PR: "42", Checks: []CheckObservation{{Conclusion: ""}}}, wantPhase: courierv1alpha1.PhaseNeedsHuman, wantTransition: source.StateNeedsHuman},
+		{name: "failed", observation: PRObservation{PR: "42", Checks: []CheckObservation{{Conclusion: "failure"}}}, wantPhase: courierv1alpha1.PhaseNeedsHuman, wantTransition: source.StateNeedsHuman},
+		{name: "skipped and neutral", observation: PRObservation{PR: "42", Checks: []CheckObservation{{Conclusion: "skipped"}, {Conclusion: "neutral"}}}, wantPhase: courierv1alpha1.PhaseAwaitingReview, wantTransition: source.StateInReview},
+		{name: "transient error", err: errors.New("GitHub unavailable"), wantPhase: courierv1alpha1.PhaseRunning, wantRequeue: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			item := &admissionSource{}
+			run := admissionRun("run", "local", courierv1alpha1.PhaseRunning)
+			run.Spec.Source = "manual"
+			run.Status.Branch = "courier/acme/widgets/issue-1"
+			run.Status.Checkpoint = &courierv1alpha1.Checkpoint{Plan: "preserve"}
+			run.Status.Heartbeat = &courierv1alpha1.Heartbeat{Kind: "stream"}
+			run.Status.LastCommit = "abc123"
+			client := phaseClient(t, run, coordinatorPod(run, 0))
+			var observer WorldObserver = fakeWorldObserver{observation: tt.observation, err: tt.err}
+			if tt.observerMissing {
+				observer = nil
+			}
+			reconciler := &CoderRunReconciler{
+				Client:       client,
+				Sources:      NewSourceRegistry(map[string]source.Adapter{"manual": item}),
+				StatusWriter: fakeStatusWriter{client: client},
+				Observer:     observer,
+			}
+			result, err := reconciler.Reconcile(context.Background(), admissionRequest("run"))
+			if err != nil {
+				t.Fatalf("Reconcile() error = %v", err)
+			}
+			if tt.wantRequeue && result.RequeueAfter != observationRequeueDelay {
+				t.Fatalf("RequeueAfter = %v, want %v", result.RequeueAfter, observationRequeueDelay)
+			}
+			if !tt.wantRequeue && result.RequeueAfter != 0 {
+				t.Fatalf("RequeueAfter = %v, want none", result.RequeueAfter)
+			}
+			var updated courierv1alpha1.CoderRun
+			if err := client.Get(context.Background(), admissionKey("run"), &updated); err != nil {
+				t.Fatalf("get run: %v", err)
+			}
+			if updated.Status.Phase != tt.wantPhase {
+				t.Fatalf("phase = %q, want %q", updated.Status.Phase, tt.wantPhase)
+			}
+			if tt.wantPhase == courierv1alpha1.PhaseAwaitingReview && updated.Status.PR != "42" {
+				t.Fatalf("PR = %q, want 42", updated.Status.PR)
+			}
+			if tt.name == "skipped and neutral" && updated.Status.PR != "42" {
+				t.Fatalf("PR = %q, want 42", updated.Status.PR)
+			}
+			if updated.Status.Checkpoint == nil || updated.Status.Checkpoint.Plan != "preserve" || updated.Status.Heartbeat == nil || updated.Status.LastCommit != "abc123" {
+				t.Fatalf("harness status was not preserved: checkpoint=%#v heartbeat=%#v lastCommit=%q", updated.Status.Checkpoint, updated.Status.Heartbeat, updated.Status.LastCommit)
+			}
+			if tt.wantTransition != "" && (len(item.transitions) != 1 || item.transitions[0] != tt.wantTransition) {
+				t.Fatalf("transitions = %#v, want %q", item.transitions, tt.wantTransition)
+			}
+			if tt.wantRequeue && len(item.transitions) != 0 {
+				t.Fatalf("transitions = %#v, want none on observation error", item.transitions)
 			}
 		})
 	}

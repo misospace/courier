@@ -21,7 +21,10 @@ import (
 
 // capacityRequeueDelay bounds how long a Pending run can wait behind a full
 // lane before checking again.
-const capacityRequeueDelay = 15 * time.Second
+const (
+	capacityRequeueDelay    = 15 * time.Second
+	observationRequeueDelay = 5 * time.Second
+)
 
 // CoderRunReconciler reconciles a CoderRun object.
 type CoderRunReconciler struct {
@@ -44,6 +47,9 @@ type CoderRunReconciler struct {
 	// StatusWriter is the status transport used for operator-owned fields.
 	// Nil falls back to server-side apply through the reconciler's client.
 	StatusWriter status.PatchWriter
+
+	// Observer reads the external pull request and CI state after a successful run.
+	Observer WorldObserver
 }
 
 // +kubebuilder:rbac:groups=courier.misospace.dev,resources=coderuns,verbs=get;list;watch;create;update;patch;delete
@@ -51,6 +57,7 @@ type CoderRunReconciler struct {
 // +kubebuilder:rbac:groups=courier.misospace.dev,resources=coderuns/finalizers,verbs=update
 // +kubebuilder:rbac:groups=courier.misospace.dev,resources=laneprofiles,verbs=get;list;watch
 // +kubebuilder:rbac:groups="",resources=pods,verbs=get;list;watch;create;delete
+// +kubebuilder:rbac:groups="",resources=secrets,verbs=get
 
 // Reconcile is the CoderRun control loop.
 //
@@ -251,6 +258,21 @@ func (r *CoderRunReconciler) observeRunning(ctx context.Context, run *courierv1a
 			continue
 		}
 		phase := terminalPhaseForExit(exitCode)
+		pr := ""
+		if phase == courierv1alpha1.PhaseAwaitingReview {
+			if r.Observer == nil {
+				phase = courierv1alpha1.PhaseNeedsHuman
+			} else {
+				observation, err := r.Observer.Observe(ctx, run.Spec.Repo, run.Status.Branch)
+				if err != nil {
+					return ctrl.Result{RequeueAfter: observationRequeueDelay}, nil
+				}
+				pr = observation.PR
+				if !observationReady(observation) {
+					phase = courierv1alpha1.PhaseNeedsHuman
+				}
+			}
+		}
 		var transitionErr error
 		switch phase {
 		case courierv1alpha1.PhaseAwaitingReview:
@@ -261,9 +283,12 @@ func (r *CoderRunReconciler) observeRunning(ctx context.Context, run *courierv1a
 		if transitionErr != nil {
 			return ctrl.Result{}, transitionErr
 		}
-		if run.Status.Phase != phase {
-			before := run.DeepCopy()
-			run.Status.Phase = phase
+		before := run.DeepCopy()
+		run.Status.Phase = phase
+		if pr != "" {
+			run.Status.PR = pr
+		}
+		if run.Status.Phase != before.Status.Phase || run.Status.PR != before.Status.PR {
 			if err := r.patchStatus(ctx, before, run); err != nil {
 				return ctrl.Result{}, err
 			}
@@ -289,6 +314,9 @@ func (r *CoderRunReconciler) patchStatus(ctx context.Context, before, after *cou
 	if before.Status.Branch != after.Status.Branch {
 		branch := after.Status.Branch
 		fields.Branch = &branch
+	}
+	if before.Status.PR != after.Status.PR {
+		fields.PR = after.Status.PR
 	}
 	if reflect.DeepEqual(fields, status.OperatorPatch{}) {
 		return nil
