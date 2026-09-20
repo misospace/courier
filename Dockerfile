@@ -13,12 +13,14 @@ COPY api/ api/
 COPY internal/ internal/
 
 RUN CGO_ENABLED=0 GOOS=${TARGETOS:-linux} GOARCH=${TARGETARCH} \
-	go build -a -o manager cmd/main.go
+	go build -a -o manager cmd/main.go && \
+	go build -a -o courier-executor ./cmd/courier-executor
 
 # Use distroless as minimal base image to package the manager binary.
 FROM gcr.io/distroless/static:nonroot
 WORKDIR /
 COPY --from=builder /workspace/manager .
+COPY --from=builder /workspace/courier-executor /usr/local/bin/courier-executor
 USER 65532:65532
 
 ENTRYPOINT ["/manager"]

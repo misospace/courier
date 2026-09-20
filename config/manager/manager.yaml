@@ -1,0 +1,64 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: manager
+  labels:
+    app.kubernetes.io/name: courier
+    app.kubernetes.io/component: manager
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: courier
+      app.kubernetes.io/component: manager
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: courier
+        app.kubernetes.io/component: manager
+    spec:
+      serviceAccountName: manager
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+      - name: manager
+        image: courier:latest
+        imagePullPolicy: IfNotPresent
+        args:
+        - --leader-elect
+        - --git-remote-template=https://github.com/%s.git
+        - --git-credential-secret=courier-github
+        ports:
+        - name: metrics
+          containerPort: 8080
+          protocol: TCP
+        - name: health
+          containerPort: 8081
+          protocol: TCP
+        livenessProbe:
+          httpGet:
+            path: /healthz
+            port: health
+          initialDelaySeconds: 15
+          periodSeconds: 20
+        readinessProbe:
+          httpGet:
+            path: /readyz
+            port: health
+          initialDelaySeconds: 5
+          periodSeconds: 10
+        resources:
+          limits:
+            cpu: 500m
+            memory: 128Mi
+          requests:
+            cpu: 10m
+            memory: 64Mi
+        securityContext:
+          allowPrivilegeEscalation: false
+          capabilities:
+            drop:
+            - ALL
+      terminationGracePeriodSeconds: 10

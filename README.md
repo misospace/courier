@@ -18,10 +18,12 @@ model actually converge on a mergeable change.
 
 ## Status
 
-Early. The architecture is specified in [DESIGN.md](./DESIGN.md); this repository
-currently contains the operator scaffold (CRDs + a stub reconciler) and is built
-out through the issues. Contributor conventions are in
-[AGENTS.md](./AGENTS.md).
+Bootstrap MVP. Courier can admit a `CoderRun`, claim its source work, derive or
+adopt a branch, launch the temporary OpenCode coordinator, and map the completed
+pod back to review/needs-human state. The resumable custom harness and liveness
+recovery remain later work. See [BOOTSTRAP.md](./BOOTSTRAP.md) for the temporary
+executor contract and a manual first-run example. Contributor conventions are
+in [AGENTS.md](./AGENTS.md).
 
 ## Design
 
