@@ -16,6 +16,14 @@ Courier replaces a narrow one-shot executor with a long-lived, resumable
 coordinator that can watch CI, take feedback, and iterate — the loop that lets a
 model actually converge on a mergeable change.
 
+Courier is designed as general infrastructure that anyone can run, not as a
+system scoped to one operator's problems. Its core does not require a particular
+organization, cluster, model provider, source queue, forge, or hardware: those
+choices enter through `LaneProfile`, source adapters, executor implementations,
+and forge clients. The GitHub + OpenCode path currently checked in is the first
+reference deployment and a replaceable bootstrap configuration, not a product
+boundary.
+
 ## Status
 
 Bootstrap MVP. Courier can admit a `CoderRun`, claim its source work, derive or

@@ -119,6 +119,8 @@ func run(ctx context.Context, stdout, stderr io.Writer) int {
 		emitTermination(stdout, cfg, termination{Phase: "Failed", Result: "failure", ExitCode: 1, Reason: "resolve executable: " + err.Error()})
 		return 1
 	}
+	restoreIdentity := installGitIdentity()
+	defer restoreIdentity()
 	restoreEnv := installAskpass(askpassPath)
 	defer restoreEnv()
 
@@ -160,6 +162,36 @@ func run(ctx context.Context, stdout, stderr io.Writer) int {
 
 	emitTermination(stdout, cfg, termination{Phase: "AwaitingReview", Result: "success", ExitCode: exitSuccess, Reason: "opencode completed"})
 	return exitSuccess
+}
+
+func installGitIdentity() func() {
+	defaults := map[string]string{
+		"GIT_AUTHOR_NAME":     "Courier",
+		"GIT_AUTHOR_EMAIL":    "courier@localhost",
+		"GIT_COMMITTER_NAME":  "Courier",
+		"GIT_COMMITTER_EMAIL": "courier@localhost",
+	}
+	type previousValue struct {
+		value string
+		set   bool
+	}
+	previous := make(map[string]previousValue, len(defaults))
+	for name, fallback := range defaults {
+		value, set := os.LookupEnv(name)
+		previous[name] = previousValue{value: value, set: set}
+		if !set || strings.TrimSpace(value) == "" {
+			_ = os.Setenv(name, fallback)
+		}
+	}
+	return func() {
+		for name, value := range previous {
+			if !value.set {
+				_ = os.Unsetenv(name)
+				continue
+			}
+			_ = os.Setenv(name, value.value)
+		}
+	}
 }
 
 func processExitCode(err error) int {

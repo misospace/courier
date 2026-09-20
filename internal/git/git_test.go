@@ -28,6 +28,8 @@ func TestPrepareAdoptsOrphanAndSyncsBaseBeforeWork(t *testing.T) {
 	// Create the orphaned work branch from the first base revision.
 	orphan := filepath.Join(root, "orphan")
 	git(t, root, "clone", remote, orphan)
+	git(t, orphan, "config", "user.name", "Courier Test")
+	git(t, orphan, "config", "user.email", "courier-test@example.invalid")
 	git(t, orphan, "checkout", "-b", "courier/resolve-issue/acme-widget/10", "origin/main")
 	writeFile(t, filepath.Join(orphan, "work.txt"), "completed brief\n")
 	commit(t, orphan, "work: previous brief")

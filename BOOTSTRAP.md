@@ -3,6 +3,15 @@
 The MVP uses a temporary headless OpenCode coordinator so Courier can begin
 working on Courier before the resumable harness is complete.
 
+This is one bootstrap assembly, not a required Courier stack. Courier is general
+infrastructure intended for any operator to run; it is not scoped to the
+original operator's organization or problems. Its core is model-, provider-,
+source-, forge-, and hardware-agnostic, so operators can supply different
+adapters, credentials, model gateways, and executor images without changing the
+lifecycle machinery. The GitHub remote template, Secret names, OpenCode image,
+and example LiteLLM model below are deployment defaults for this first dogfood
+path and are all replaceable.
+
 ## Runtime requirements
 
 The image selected with `--executor-image` must contain:
