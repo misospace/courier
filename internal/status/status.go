@@ -68,15 +68,18 @@ func (w KubePatchWriter) PatchStatus(ctx context.Context, name types.NamespacedN
 // OperatorPatch contains only fields owned by the operator: lifecycle and
 // observed-world fields. Empty values are omitted, which is appropriate for
 // additive observed status and avoids clearing harness-owned fields or
-// previously published operator fields. Branch is a pointer because a failed
-// launch must be able to clear a stale resolved branch back to empty, which
-// omitempty on a plain string cannot express.
+// previously published operator fields. Branch and CheckFingerprint are
+// pointers because the operator must be able to clear them back to empty — a
+// failed launch discards a stale resolved branch, and a pending or reshaped
+// check observation discards stale green evidence — which omitempty on a
+// plain string cannot express.
 type OperatorPatch struct {
-	Phase      courierv1alpha1.Phase `json:"phase,omitempty"`
-	Branch     *string               `json:"branch,omitempty"`
-	PR         string                `json:"pr,omitempty"`
-	Restarts   int                   `json:"restarts,omitempty"`
-	Conditions []metav1.Condition    `json:"conditions,omitempty"`
+	Phase            courierv1alpha1.Phase `json:"phase,omitempty"`
+	Branch           *string               `json:"branch,omitempty"`
+	PR               string                `json:"pr,omitempty"`
+	CheckFingerprint *string               `json:"checkFingerprint,omitempty"`
+	Restarts         int                   `json:"restarts,omitempty"`
+	Conditions       []metav1.Condition    `json:"conditions,omitempty"`
 }
 
 // HarnessPatch contains only fields owned by the coordinator harness: its

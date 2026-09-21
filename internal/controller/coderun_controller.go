@@ -279,23 +279,35 @@ func (r *CoderRunReconciler) observeVerifying(ctx context.Context, run *courierv
 		return ctrl.Result{RequeueAfter: observationRequeueDelay}, nil
 	}
 	pr := observation.PR
-	switch observeState(observation) {
-	case observationPending:
-		before := run.DeepCopy()
-		if pr != "" {
-			run.Status.PR = pr
-		}
-		if run.Status.PR != before.Status.PR {
-			if err := r.patchStatus(ctx, before, run); err != nil {
-				return ctrl.Result{}, err
-			}
-		}
-		return ctrl.Result{RequeueAfter: observationRequeueDelay}, nil
-	case observationPassed:
-		return r.transitionTerminal(ctx, run, courierv1alpha1.PhaseAwaitingReview, pr)
-	default:
+	state := observeState(observation)
+	if state == observationNeedsHuman || state == observationFailed {
 		return r.transitionTerminal(ctx, run, courierv1alpha1.PhaseNeedsHuman, pr)
 	}
+	// status.checkFingerprint is the prior all-green candidate: the identity
+	// of the last poll on which every observed check passed. Green settles
+	// only onto an identical candidate — two consecutive all-green
+	// observations of the same check set. A pending or empty observation
+	// clears the candidate, because checks that have not registered yet can
+	// still appear at any later poll; a changed identity resets it the same
+	// way. A real failure is recognized immediately and skips the settle; it
+	// needs no second observation.
+	fingerprint := ""
+	if state == observationPassed {
+		fingerprint = checkSetFingerprint(observation)
+	}
+	settled := fingerprint != "" && fingerprint == run.Status.CheckFingerprint
+	before := run.DeepCopy()
+	if pr != "" {
+		run.Status.PR = pr
+	}
+	run.Status.CheckFingerprint = fingerprint
+	if err := r.patchStatus(ctx, before, run); err != nil {
+		return ctrl.Result{}, err
+	}
+	if settled {
+		return r.transitionTerminal(ctx, run, courierv1alpha1.PhaseAwaitingReview, pr)
+	}
+	return ctrl.Result{RequeueAfter: observationRequeueDelay}, nil
 }
 
 func (r *CoderRunReconciler) transitionTerminal(ctx context.Context, run *courierv1alpha1.CoderRun, phase courierv1alpha1.Phase, pr string) (ctrl.Result, error) {
@@ -345,6 +357,10 @@ func (r *CoderRunReconciler) patchStatus(ctx context.Context, before, after *cou
 	}
 	if before.Status.PR != after.Status.PR {
 		fields.PR = after.Status.PR
+	}
+	if before.Status.CheckFingerprint != after.Status.CheckFingerprint {
+		fingerprint := after.Status.CheckFingerprint
+		fields.CheckFingerprint = &fingerprint
 	}
 	if reflect.DeepEqual(fields, status.OperatorPatch{}) {
 		return nil

@@ -368,10 +368,18 @@ it modest" with `concurrency: 1`. Same schema, no local assumption baked in.
   the external PR and CI world indefinitely, with a reconciliation cadence and
   no deadline. Observer errors remain Verifying and requeue. A missing observer,
   missing/draft PR, or failed check reaches **NeedsHuman**. A PR with no checks
-  or pending checks remains Verifying; the PR is persisted. A PR with all checks
-  passed transitions to **AwaitingReview** and the source becomes in-review.
-  Verifying does not consume LaneProfile execution capacity, and the source
-  remains in-progress throughout it.
+  or pending checks remains Verifying; the PR is persisted. Green is declared
+  only from **two consecutive all-green observations of the same check set**:
+  every all-green observation records a compact fingerprint of the check
+  identities (head commit plus sorted check names) on the run status, and an
+  observation may transition to **AwaitingReview** only when it matches the
+  previous all-green observation's fingerprint. Any pending or empty
+  observation clears that recorded candidate — checks that have not registered
+  yet can still appear at any later poll, so a pending observation can never
+  pre-settle an identity — and a changed set (a new check, a new push) resets
+  it the same way. A partial snapshot cannot pass. The source becomes
+  in-review with the transition. Verifying does not consume LaneProfile
+  execution capacity, and the source remains in-progress throughout it.
 - **AwaitingReview** is terminal for this run. Human merges → operator marks
   **Done** and resolves the source; or feedback/conflict → the source spawns a
   fresh `fix-pr` run, and this one goes Done/archived.

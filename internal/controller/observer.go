@@ -1,6 +1,12 @@
 package controller
 
-import "context"
+import (
+	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"slices"
+	"strings"
+)
 
 type CheckState string
 
@@ -11,12 +17,20 @@ const (
 )
 
 type CheckObservation struct {
+	// Name is the stable external identifier of the check (a check-run name
+	// or a commit-status context). Registration is asynchronous, so identity
+	// — not state — is what a settle decision can be built on.
+	Name  string
 	State CheckState
 }
 
 type PRObservation struct {
-	PR     string
-	Draft  bool
+	PR    string
+	Draft bool
+	// Head is the source's identifier for the commit under observation. A new
+	// push re-registers checks under the same names, so the fingerprint treats
+	// a different head as a different check set.
+	Head   string
 	Checks []CheckObservation
 }
 
@@ -52,4 +66,22 @@ func observeState(observation PRObservation) observationState {
 		}
 	}
 	return observationPassed
+}
+
+// checkSetFingerprint is the compact, stable identity of an observed check
+// set: the head commit plus the sorted external check identifiers. It is
+// deliberately independent of check state, which changes as checks complete,
+// and of completion timestamps, which change on every read. An observation
+// with no checks carries no identity and yields an empty fingerprint.
+func checkSetFingerprint(observation PRObservation) string {
+	if len(observation.Checks) == 0 {
+		return ""
+	}
+	names := make([]string, 0, len(observation.Checks))
+	for _, check := range observation.Checks {
+		names = append(names, check.Name)
+	}
+	slices.Sort(names)
+	digest := sha256.Sum256([]byte(observation.Head + "\x00" + strings.Join(names, "\x00")))
+	return hex.EncodeToString(digest[:])
 }

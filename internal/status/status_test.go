@@ -43,12 +43,14 @@ func TestStatusWritersOwnDisjointFields(t *testing.T) {
 
 	phase := courierv1alpha1.PhaseRunning
 	branch := "courier/issue-7"
+	fingerprint := "observed-check-set"
 	if err := operator.Patch(context.Background(), name, OperatorPatch{
-		Phase:      phase,
-		Branch:     &branch,
-		PR:         "#42",
-		Restarts:   2,
-		Conditions: []metav1.Condition{{Type: "Ready", Status: metav1.ConditionTrue}},
+		Phase:            phase,
+		Branch:           &branch,
+		PR:               "#42",
+		CheckFingerprint: &fingerprint,
+		Restarts:         2,
+		Conditions:       []metav1.Condition{{Type: "Ready", Status: metav1.ConditionTrue}},
 	}); err != nil {
 		t.Fatalf("operator patch: %v", err)
 	}
@@ -74,7 +76,7 @@ func TestStatusWritersOwnDisjointFields(t *testing.T) {
 	}
 	operatorStatus := operatorPayload["status"].(map[string]interface{})
 	harnessStatus := harnessPayload["status"].(map[string]interface{})
-	for _, field := range []string{"phase", "branch", "pr", "restarts", "conditions"} {
+	for _, field := range []string{"phase", "branch", "pr", "checkFingerprint", "restarts", "conditions"} {
 		if _, ok := operatorStatus[field]; !ok {
 			t.Errorf("operator status missing owned field %q", field)
 		}
@@ -90,7 +92,7 @@ func TestStatusWritersOwnDisjointFields(t *testing.T) {
 	if _, ok := harnessStatus["lastCommit"]; !ok {
 		t.Error("harness patch missing lastCommit")
 	}
-	for _, field := range []string{"phase", "branch", "pr", "restarts", "conditions", "heartbeat"} {
+	for _, field := range []string{"phase", "branch", "pr", "checkFingerprint", "restarts", "conditions", "heartbeat"} {
 		if _, ok := harnessStatus[field]; ok {
 			t.Errorf("harness patch unexpectedly contains field %q", field)
 		}
@@ -162,7 +164,7 @@ func TestHeartbeatPatchPreservesOperatorFieldsByConstruction(t *testing.T) {
 	if _, ok := payload.Status["checkpoint"]; ok {
 		t.Error("heartbeat patch unexpectedly contains checkpoint")
 	}
-	for _, field := range []string{"phase", "branch", "pr", "restarts", "conditions"} {
+	for _, field := range []string{"phase", "branch", "pr", "checkFingerprint", "restarts", "conditions"} {
 		if _, ok := payload.Status[field]; ok {
 			t.Errorf("heartbeat patch unexpectedly contains operator field %q", field)
 		}
@@ -220,6 +222,15 @@ func TestSequentialOperatorWritesPreserveOtherFields(t *testing.T) {
 	if err := writer.Patch(context.Background(), name, OperatorPatch{Branch: &branch}); err != nil {
 		t.Fatalf("branch write: %v", err)
 	}
+	fingerprint := "observed-check-set"
+	if err := writer.Patch(context.Background(), name, OperatorPatch{CheckFingerprint: &fingerprint}); err != nil {
+		t.Fatalf("fingerprint write: %v", err)
+	}
+	// The pointer form must let a reshaped check set clear stale evidence.
+	cleared := ""
+	if err := writer.Patch(context.Background(), name, OperatorPatch{CheckFingerprint: &cleared}); err != nil {
+		t.Fatalf("fingerprint clear: %v", err)
+	}
 
 	var run courierv1alpha1.CoderRun
 	if err := kube.Get(context.Background(), name, &run); err != nil {
@@ -230,6 +241,9 @@ func TestSequentialOperatorWritesPreserveOtherFields(t *testing.T) {
 	}
 	if run.Status.Branch != branch {
 		t.Fatalf("branch = %q, want %q", run.Status.Branch, branch)
+	}
+	if run.Status.CheckFingerprint != "" {
+		t.Fatalf("checkFingerprint = %q, want cleared by the empty pointer write", run.Status.CheckFingerprint)
 	}
 	if run.Status.Checkpoint == nil || run.Status.Checkpoint.Plan != "seeded checkpoint" {
 		t.Fatalf("harness checkpoint was disturbed by operator writes: %#v", run.Status.Checkpoint)

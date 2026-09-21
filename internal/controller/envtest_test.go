@@ -73,8 +73,9 @@ func TestEnvtestResolveIssueLifecycle(t *testing.T) {
 		}),
 		StatusWriter: status.KubePatchWriter{Client: envtestClient},
 		Observer: &sequenceWorldObserver{observations: []PRObservation{
-			{PR: "42", Checks: []CheckObservation{{State: CheckStatePending}}},
-			{PR: "42", Checks: []CheckObservation{{State: CheckStatePassed}}},
+			{PR: "42", Head: "sha-1", Checks: []CheckObservation{{Name: "check-a", State: CheckStatePending}}},
+			greenObservation("sha-1", "check-a", "check-b"),
+			greenObservation("sha-1", "check-a", "check-b"),
 		}},
 
 		Launch: func(ctx context.Context, run *courierv1alpha1.CoderRun) error {
@@ -139,12 +140,20 @@ func TestEnvtestResolveIssueLifecycle(t *testing.T) {
 	if updated.Status.PR != "42" {
 		t.Fatalf("run PR = %q, want 42", updated.Status.PR)
 	}
+	// A second check registers while the first is green: the check set grew,
+	// so the run must stay Verifying even though every visible check passed.
+	reconcile()
+	assertEnvtestPhase(t, name, courierv1alpha1.PhaseVerifying)
+	// Only a second look at the identical all-green check set settles it.
 	reconcile()
 	if err := envtestClient.Get(ctx, envtestKey(name), &updated); err != nil {
 		t.Fatal(err)
 	}
 	if updated.Status.Phase != courierv1alpha1.PhaseAwaitingReview {
 		t.Fatalf("run phase = %q, want AwaitingReview", updated.Status.Phase)
+	}
+	if updated.Status.CheckFingerprint == "" {
+		t.Fatal("checkFingerprint = empty at AwaitingReview, want the settled check set")
 	}
 	if len(item.transitions) != 2 || item.transitions[0] != source.StateInProgress || item.transitions[1] != source.StateInReview {
 		t.Fatalf("source transitions = %#v", item.transitions)

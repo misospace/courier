@@ -269,7 +269,7 @@ func TestVerifyingObservationGatesReview(t *testing.T) {
 		{name: "pending", observation: PRObservation{PR: "42", Checks: []CheckObservation{{State: CheckStatePending}}}, wantPhase: courierv1alpha1.PhaseVerifying, wantRequeue: true, wantPR: "42"},
 		{name: "pending failure mix", observation: PRObservation{PR: "42", Checks: []CheckObservation{{State: CheckStateFailed}, {State: CheckStatePending}}}, wantPhase: courierv1alpha1.PhaseVerifying, wantRequeue: true, wantPR: "42"},
 		{name: "failed", observation: PRObservation{PR: "42", Checks: []CheckObservation{{State: CheckStateFailed}}}, wantPhase: courierv1alpha1.PhaseNeedsHuman, wantTransition: source.StateNeedsHuman},
-		{name: "all checks passed", observation: PRObservation{PR: "42", Checks: []CheckObservation{{State: CheckStatePassed}, {State: CheckStatePassed}}}, wantPhase: courierv1alpha1.PhaseAwaitingReview, wantTransition: source.StateInReview},
+		{name: "single green observation", observation: PRObservation{PR: "42", Checks: []CheckObservation{{State: CheckStatePassed}, {State: CheckStatePassed}}}, wantPhase: courierv1alpha1.PhaseVerifying, wantRequeue: true, wantPR: "42"},
 		{name: "transient error", err: errors.New("GitHub unavailable"), wantPhase: courierv1alpha1.PhaseVerifying, wantRequeue: true},
 	}
 	for _, tt := range tests {
@@ -323,6 +323,282 @@ func TestVerifyingObservationGatesReview(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestVerifyingSettlesOnSecondStableGreenObservation(t *testing.T) {
+	item := &admissionSource{}
+	run := admissionRun("run", "local", courierv1alpha1.PhaseVerifying)
+	run.Spec.Source = "manual"
+	run.Status.Branch = "courier/acme/widgets/issue-1"
+	client := phaseClient(t, run)
+	observer := &sequenceWorldObserver{observations: []PRObservation{
+		greenObservation("sha-1", "check-a", "check-b"),
+		greenObservation("sha-1", "check-b", "check-a"),
+	}}
+	newReconciler := func() *CoderRunReconciler {
+		return &CoderRunReconciler{
+			Client:       client,
+			Sources:      NewSourceRegistry(map[string]source.Adapter{"manual": item}),
+			StatusWriter: fakeStatusWriter{client: client},
+			Observer:     observer,
+		}
+	}
+	if _, err := newReconciler().Reconcile(context.Background(), admissionRequest("run")); err != nil {
+		t.Fatalf("first Reconcile() error = %v", err)
+	}
+	var verifying courierv1alpha1.CoderRun
+	if err := client.Get(context.Background(), admissionKey("run"), &verifying); err != nil {
+		t.Fatalf("get run: %v", err)
+	}
+	if verifying.Status.Phase != courierv1alpha1.PhaseVerifying {
+		t.Fatalf("phase after first green observation = %q, want Verifying", verifying.Status.Phase)
+	}
+	if verifying.Status.CheckFingerprint == "" {
+		t.Fatal("checkFingerprint after first green observation = empty, want the recorded check set")
+	}
+	if len(item.transitions) != 0 {
+		t.Fatalf("transitions = %#v, want none before the check set settles", item.transitions)
+	}
+	// A restarted controller shares no process memory: the fingerprint
+	// recorded in the status is the only settle evidence available.
+	if _, err := newReconciler().Reconcile(context.Background(), admissionRequest("run")); err != nil {
+		t.Fatalf("second Reconcile() error = %v", err)
+	}
+	var settled courierv1alpha1.CoderRun
+	if err := client.Get(context.Background(), admissionKey("run"), &settled); err != nil {
+		t.Fatalf("get run: %v", err)
+	}
+	if settled.Status.Phase != courierv1alpha1.PhaseAwaitingReview {
+		t.Fatalf("phase after stable green observation = %q, want AwaitingReview", settled.Status.Phase)
+	}
+	if len(item.transitions) != 1 || item.transitions[0] != source.StateInReview {
+		t.Fatalf("transitions = %#v, want exactly one in-review", item.transitions)
+	}
+}
+
+func TestVerifyingPendingObservationCannotPresettleGreen(t *testing.T) {
+	item := &admissionSource{}
+	run := admissionRun("run", "local", courierv1alpha1.PhaseVerifying)
+	run.Spec.Source = "manual"
+	run.Status.Branch = "courier/acme/widgets/issue-1"
+	client := phaseClient(t, run)
+	reconciler := &CoderRunReconciler{
+		Client:       client,
+		Sources:      NewSourceRegistry(map[string]source.Adapter{"manual": item}),
+		StatusWriter: fakeStatusWriter{client: client},
+		Observer: &sequenceWorldObserver{observations: []PRObservation{
+			{PR: "42", Head: "sha-1", Checks: []CheckObservation{{Name: "check-a", State: CheckStatePending}}},
+			greenObservation("sha-1", "check-a"),
+			greenObservation("sha-1", "check-a", "check-b"),
+			greenObservation("sha-1", "check-a", "check-b"),
+		}},
+	}
+	for i, want := range []courierv1alpha1.Phase{
+		courierv1alpha1.PhaseVerifying,
+		courierv1alpha1.PhaseVerifying,
+		courierv1alpha1.PhaseVerifying,
+		courierv1alpha1.PhaseAwaitingReview,
+	} {
+		if _, err := reconciler.Reconcile(context.Background(), admissionRequest("run")); err != nil {
+			t.Fatalf("Reconcile() %d error = %v", i+1, err)
+		}
+		var updated courierv1alpha1.CoderRun
+		if err := client.Get(context.Background(), admissionKey("run"), &updated); err != nil {
+			t.Fatalf("get run: %v", err)
+		}
+		if updated.Status.Phase != want {
+			t.Fatalf("phase after observation %d = %q, want %q; a pending observation must never pre-settle the identities it saw", i+1, updated.Status.Phase, want)
+		}
+	}
+}
+
+func TestVerifyingPendingClearsGreenCandidate(t *testing.T) {
+	item := &admissionSource{}
+	run := admissionRun("run", "local", courierv1alpha1.PhaseVerifying)
+	run.Spec.Source = "manual"
+	run.Status.Branch = "courier/acme/widgets/issue-1"
+	client := phaseClient(t, run)
+	reconciler := &CoderRunReconciler{
+		Client:       client,
+		Sources:      NewSourceRegistry(map[string]source.Adapter{"manual": item}),
+		StatusWriter: fakeStatusWriter{client: client},
+		Observer: &sequenceWorldObserver{observations: []PRObservation{
+			greenObservation("sha-1", "check-a", "check-b"),
+			{PR: "42", Head: "sha-1", Checks: []CheckObservation{
+				{Name: "check-a", State: CheckStatePassed},
+				{Name: "check-b", State: CheckStatePassed},
+				{Name: "check-c", State: CheckStatePending},
+			}},
+			greenObservation("sha-1", "check-a", "check-b", "check-c"),
+			greenObservation("sha-1", "check-a", "check-b", "check-c"),
+		}},
+	}
+	if _, err := reconciler.Reconcile(context.Background(), admissionRequest("run")); err != nil {
+		t.Fatalf("first Reconcile() error = %v", err)
+	}
+	// A pending observation clears the green candidate instead of recording
+	// its own identity, so the next green observation starts a fresh settle.
+	if _, err := reconciler.Reconcile(context.Background(), admissionRequest("run")); err != nil {
+		t.Fatalf("second Reconcile() error = %v", err)
+	}
+	var updated courierv1alpha1.CoderRun
+	if err := client.Get(context.Background(), admissionKey("run"), &updated); err != nil {
+		t.Fatalf("get run: %v", err)
+	}
+	if updated.Status.CheckFingerprint != "" {
+		t.Fatalf("checkFingerprint after pending observation = %q, want cleared", updated.Status.CheckFingerprint)
+	}
+	for i, want := range []courierv1alpha1.Phase{
+		courierv1alpha1.PhaseVerifying,
+		courierv1alpha1.PhaseAwaitingReview,
+	} {
+		if _, err := reconciler.Reconcile(context.Background(), admissionRequest("run")); err != nil {
+			t.Fatalf("Reconcile() %d error = %v", i+3, err)
+		}
+		if err := client.Get(context.Background(), admissionKey("run"), &updated); err != nil {
+			t.Fatalf("get run: %v", err)
+		}
+		if updated.Status.Phase != want {
+			t.Fatalf("phase after observation %d = %q, want %q; the green set after a pending poll must settle twice", i+3, updated.Status.Phase, want)
+		}
+	}
+}
+
+func TestVerifyingGrowingGreenCheckSetRestartsSettle(t *testing.T) {
+	item := &admissionSource{}
+	run := admissionRun("run", "local", courierv1alpha1.PhaseVerifying)
+	run.Spec.Source = "manual"
+	run.Status.Branch = "courier/acme/widgets/issue-1"
+	client := phaseClient(t, run)
+	reconciler := &CoderRunReconciler{
+		Client:       client,
+		Sources:      NewSourceRegistry(map[string]source.Adapter{"manual": item}),
+		StatusWriter: fakeStatusWriter{client: client},
+		Observer: &sequenceWorldObserver{observations: []PRObservation{
+			greenObservation("sha-1", "check-a", "check-b"),
+			greenObservation("sha-1", "check-a", "check-b", "check-c"),
+			greenObservation("sha-1", "check-a", "check-b", "check-c"),
+		}},
+	}
+	for i, want := range []courierv1alpha1.Phase{
+		courierv1alpha1.PhaseVerifying,
+		courierv1alpha1.PhaseVerifying,
+		courierv1alpha1.PhaseAwaitingReview,
+	} {
+		if _, err := reconciler.Reconcile(context.Background(), admissionRequest("run")); err != nil {
+			t.Fatalf("Reconcile() %d error = %v", i+1, err)
+		}
+		var updated courierv1alpha1.CoderRun
+		if err := client.Get(context.Background(), admissionKey("run"), &updated); err != nil {
+			t.Fatalf("get run: %v", err)
+		}
+		if updated.Status.Phase != want {
+			t.Fatalf("phase after observation %d = %q, want %q; a changed check set must reset the settle", i+1, updated.Status.Phase, want)
+		}
+	}
+}
+
+func TestVerifyingNewHeadResetsSettle(t *testing.T) {
+	item := &admissionSource{}
+	run := admissionRun("run", "local", courierv1alpha1.PhaseVerifying)
+	run.Spec.Source = "manual"
+	run.Status.Branch = "courier/acme/widgets/issue-1"
+	client := phaseClient(t, run)
+	reconciler := &CoderRunReconciler{
+		Client:       client,
+		Sources:      NewSourceRegistry(map[string]source.Adapter{"manual": item}),
+		StatusWriter: fakeStatusWriter{client: client},
+		Observer: &sequenceWorldObserver{observations: []PRObservation{
+			greenObservation("sha-1", "check-a", "check-b"),
+			greenObservation("sha-2", "check-a", "check-b"),
+			greenObservation("sha-2", "check-a", "check-b"),
+		}},
+	}
+	for i, want := range []courierv1alpha1.Phase{
+		courierv1alpha1.PhaseVerifying,
+		courierv1alpha1.PhaseVerifying,
+		courierv1alpha1.PhaseAwaitingReview,
+	} {
+		if _, err := reconciler.Reconcile(context.Background(), admissionRequest("run")); err != nil {
+			t.Fatalf("Reconcile() %d error = %v", i+1, err)
+		}
+		var updated courierv1alpha1.CoderRun
+		if err := client.Get(context.Background(), admissionKey("run"), &updated); err != nil {
+			t.Fatalf("get run: %v", err)
+		}
+		if updated.Status.Phase != want {
+			t.Fatalf("phase after observation %d = %q, want %q; a new head commit must reset the settle", i+1, updated.Status.Phase, want)
+		}
+	}
+}
+
+func TestVerifyingFailureSkipsSettle(t *testing.T) {
+	item := &admissionSource{}
+	run := admissionRun("run", "local", courierv1alpha1.PhaseVerifying)
+	run.Spec.Source = "manual"
+	run.Status.Branch = "courier/acme/widgets/issue-1"
+	client := phaseClient(t, run)
+	reconciler := &CoderRunReconciler{
+		Client:       client,
+		Sources:      NewSourceRegistry(map[string]source.Adapter{"manual": item}),
+		StatusWriter: fakeStatusWriter{client: client},
+		Observer: &sequenceWorldObserver{observations: []PRObservation{
+			greenObservation("sha-1", "check-a", "check-b"),
+			{PR: "42", Head: "sha-1", Checks: []CheckObservation{
+				{Name: "check-a", State: CheckStatePassed},
+				{Name: "check-b", State: CheckStateFailed},
+			}},
+		}},
+	}
+	if _, err := reconciler.Reconcile(context.Background(), admissionRequest("run")); err != nil {
+		t.Fatalf("first Reconcile() error = %v", err)
+	}
+	if _, err := reconciler.Reconcile(context.Background(), admissionRequest("run")); err != nil {
+		t.Fatalf("second Reconcile() error = %v", err)
+	}
+	var updated courierv1alpha1.CoderRun
+	if err := client.Get(context.Background(), admissionKey("run"), &updated); err != nil {
+		t.Fatalf("get run: %v", err)
+	}
+	if updated.Status.Phase != courierv1alpha1.PhaseNeedsHuman {
+		t.Fatalf("phase = %q, want NeedsHuman without waiting for a stable observation", updated.Status.Phase)
+	}
+	if len(item.transitions) != 1 || item.transitions[0] != source.StateNeedsHuman {
+		t.Fatalf("transitions = %#v, want exactly one needs-human", item.transitions)
+	}
+}
+
+func TestCheckSetFingerprintRepresentsIdentity(t *testing.T) {
+	passed := func(name string) CheckObservation { return CheckObservation{Name: name, State: CheckStatePassed} }
+	pending := func(name string) CheckObservation { return CheckObservation{Name: name, State: CheckStatePending} }
+	ab := checkSetFingerprint(PRObservation{Head: "sha-1", Checks: []CheckObservation{passed("check-a"), passed("check-b")}})
+	if ab == "" {
+		t.Fatal("fingerprint of a check set = empty, want a digest")
+	}
+	if ba := checkSetFingerprint(PRObservation{Head: "sha-1", Checks: []CheckObservation{passed("check-b"), passed("check-a")}}); ba != ab {
+		t.Fatalf("fingerprint changed with check order: %q vs %q", ab, ba)
+	}
+	if pendingAB := checkSetFingerprint(PRObservation{Head: "sha-1", Checks: []CheckObservation{pending("check-a"), pending("check-b")}}); pendingAB != ab {
+		t.Fatalf("fingerprint changed with check state: %q vs %q; identity is state-independent", ab, pendingAB)
+	}
+	if otherNames := checkSetFingerprint(PRObservation{Head: "sha-1", Checks: []CheckObservation{passed("check-a"), passed("check-c")}}); otherNames == ab {
+		t.Fatal("fingerprint ignored a changed check name")
+	}
+	if otherHead := checkSetFingerprint(PRObservation{Head: "sha-2", Checks: []CheckObservation{passed("check-a"), passed("check-b")}}); otherHead == ab {
+		t.Fatal("fingerprint ignored a changed head commit")
+	}
+	if empty := checkSetFingerprint(PRObservation{Head: "sha-1"}); empty != "" {
+		t.Fatalf("fingerprint of an empty check set = %q, want empty", empty)
+	}
+}
+
+// greenObservation builds an all-green observation over the named checks.
+func greenObservation(head string, names ...string) PRObservation {
+	observation := PRObservation{PR: "42", Head: head}
+	for _, name := range names {
+		observation.Checks = append(observation.Checks, CheckObservation{Name: name, State: CheckStatePassed})
+	}
+	return observation
 }
 
 func TestDoneRunResolvesSourceWorkItem(t *testing.T) {

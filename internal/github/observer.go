@@ -46,12 +46,12 @@ func (o Observer) Observe(ctx context.Context, repository, branch string) (contr
 		if err != nil {
 			return controller.PRObservation{}, err
 		}
-		observed := controller.PRObservation{PR: strconv.Itoa(pull.Number), Draft: pull.Draft}
+		observed := controller.PRObservation{PR: strconv.Itoa(pull.Number), Draft: pull.Draft, Head: pull.Head.SHA}
 		for _, check := range checks.CheckRuns {
-			observed.Checks = append(observed.Checks, controller.CheckObservation{State: checkState(check.Status, check.Conclusion)})
+			observed.Checks = append(observed.Checks, controller.CheckObservation{Name: check.Name, State: checkState(check.Status, check.Conclusion)})
 		}
 		for _, status := range statuses.Statuses {
-			observed.Checks = append(observed.Checks, controller.CheckObservation{State: commitStatusState(status.State)})
+			observed.Checks = append(observed.Checks, controller.CheckObservation{Name: status.Context, State: commitStatusState(status.State)})
 		}
 		return observed, nil
 	}

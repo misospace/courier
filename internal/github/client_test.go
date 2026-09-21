@@ -389,9 +389,9 @@ func TestObserverCombinesChecksAndStatuses(t *testing.T) {
 		case "/repos/acme/demo/pulls":
 			_, _ = io.WriteString(w, `[{"number":12,"state":"open","head":{"ref":"work","sha":"abc"}}]`)
 		case "/repos/acme/demo/commits/abc/check-runs":
-			_, _ = io.WriteString(w, `{"total_count":1,"check_runs":[{"status":"completed","conclusion":"success"}]}`)
+			_, _ = io.WriteString(w, `{"total_count":1,"check_runs":[{"name":"build","status":"completed","conclusion":"success"}]}`)
 		case "/repos/acme/demo/commits/abc/status":
-			_, _ = io.WriteString(w, `{"total_count":1,"statuses":[{"state":"failure"}]}`)
+			_, _ = io.WriteString(w, `{"total_count":1,"statuses":[{"context":"deploy","state":"failure"}]}`)
 		default:
 			http.NotFound(w, r)
 		}
@@ -407,6 +407,12 @@ func TestObserverCombinesChecksAndStatuses(t *testing.T) {
 	}
 	if len(observation.Checks) != 2 || observation.Checks[0].State != controller.CheckStatePassed || observation.Checks[1].State != controller.CheckStateFailed {
 		t.Fatalf("checks = %#v, want passed check and failed status", observation.Checks)
+	}
+	if observation.Head != "abc" {
+		t.Fatalf("Head = %q, want the observed commit sha", observation.Head)
+	}
+	if observation.Checks[0].Name != "build" || observation.Checks[1].Name != "deploy" {
+		t.Fatalf("check identities = %q/%q, want the stable external names", observation.Checks[0].Name, observation.Checks[1].Name)
 	}
 }
 
