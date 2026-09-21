@@ -14,6 +14,9 @@ func TestChartRendersDispatchConfiguration(t *testing.T) {
 	}
 
 	chartDir := copyChart(t)
+	if err := exec.Command("helm", "repo", "add", "bjw-s-labs", "https://bjw-s-labs.github.io/helm-charts").Run(); err != nil {
+		t.Fatalf("configure chart repository: %v", err)
+	}
 	runHelm(t, chartDir, "dependency", "build")
 
 	enabled := runHelm(t, chartDir, "template", "courier", ".",
