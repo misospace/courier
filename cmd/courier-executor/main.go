@@ -257,11 +257,23 @@ func run(ctx context.Context, stdout, stderr io.Writer) int {
 		"executor": runtime.Name(),
 		"format":   cfg.OpenCodeFormat,
 	})
+	// The child's output is untrusted verbose tool I/O: route both streams
+	// through the run's redactor before they reach the real stdout/stderr
+	// (DESIGN.md: redact before stdout). The transport is transparent — no
+	// semantic parsing, ordering and stream separation preserved. Lines
+	// buffered across Write chunks are flushed after the child exits.
+	stdoutTransport := courierlog.NewRedactingWriter(stdout, report.red)
+	stderrTransport := courierlog.NewRedactingWriter(stderr, report.red)
 	process := exec.CommandContext(ctx, command.Binary, command.Args...)
 	process.Dir = workspace.Directory
-	process.Stdout = stdout
-	process.Stderr = stderr
-	if err := process.Run(); err != nil {
+	process.Stdout = stdoutTransport
+	process.Stderr = stderrTransport
+	err = process.Run()
+	// Release whatever the child left as a final partial line before the
+	// outcome is reported, so output ordering stays faithful.
+	_ = stdoutTransport.Flush()
+	_ = stderrTransport.Flush()
+	if err != nil {
 		code := processExitCode(err)
 		if code < 0 {
 			code = 1
