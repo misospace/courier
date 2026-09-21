@@ -42,6 +42,9 @@ type PodConfig struct {
 	GitHubCredentialSecret string
 	GitHubTokenKey         string
 	EnvironmentSecret      string
+	GitHubMCPURL           string
+	Context7MCPURL         string
+	MetricsMCPURL          string
 	BootstrapBinary        string
 	OpenCode               OpenCode
 	Resources              corev1.ResourceRequirements
@@ -135,6 +138,10 @@ func (b *PodBuilder) Build(run *courierv1alpha1.CoderRun, lane *courierv1alpha1.
 	if strings.TrimSpace(run.Name) == "" {
 		return nil, ErrMissingRunName
 	}
+	openCodeConfig, err := marshalOpenCodeConfig(invocation.Roles, config.GitHubMCPURL, config.Context7MCPURL, config.MetricsMCPURL)
+	if err != nil {
+		return nil, fmt.Errorf("executor: marshal OpenCode config: %w", err)
+	}
 
 	labels := map[string]string{
 		LabelRun:                       labelValue(run.Name),
@@ -154,6 +161,9 @@ func (b *PodBuilder) Build(run *courierv1alpha1.CoderRun, lane *courierv1alpha1.
 			Name:      podName(run.Name),
 			Namespace: run.Namespace,
 			Labels:    labels,
+			Annotations: map[string]string{
+				opencodeConfigAnnotation: string(openCodeConfig),
+			},
 			OwnerReferences: []metav1.OwnerReference{{
 				APIVersion:         courierv1alpha1.GroupVersion.String(),
 				Kind:               "CoderRun",
@@ -175,6 +185,12 @@ func (b *PodBuilder) Build(run *courierv1alpha1.CoderRun, lane *courierv1alpha1.
 			Volumes: []corev1.Volume{{
 				Name:         "workspace",
 				VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{}},
+			}, {
+				Name: "opencode-config",
+				VolumeSource: corev1.VolumeSource{DownwardAPI: &corev1.DownwardAPIVolumeSource{Items: []corev1.DownwardAPIVolumeFile{{
+					Path: "opencode.json",
+					FieldRef: &corev1.ObjectFieldSelector{FieldPath: "metadata.annotations['" + opencodeConfigAnnotation + "']"},
+				}}}},
 			}},
 			Containers: []corev1.Container{{
 				Name:            "coordinator",
@@ -188,6 +204,10 @@ func (b *PodBuilder) Build(run *courierv1alpha1.CoderRun, lane *courierv1alpha1.
 				VolumeMounts: []corev1.VolumeMount{{
 					Name:      "workspace",
 					MountPath: config.WorkspacePath,
+				}, {
+					Name:      "opencode-config",
+					MountPath: opencodeConfigMountPath,
+					ReadOnly:  true,
 				}},
 				SecurityContext: &corev1.SecurityContext{
 					AllowPrivilegeEscalation: boolPtr(false),
@@ -211,6 +231,10 @@ func podEnvironment(invocation Invocation, executorName string, config PodConfig
 	}
 	terminationFile := strings.TrimRight(config.WorkspacePath, "/") + "/termination"
 	values := toKubernetesEnv(EnvironmentWithConfig(invocation, executorName, remoteURL, config.BaseBranch, config.OpenCode.Binary, config.OpenCode.Format, terminationFile))
+	values = append(values, corev1.EnvVar{
+		Name:  "OPENCODE_CONFIG",
+		Value: opencodeConfigMountPath + "/" + opencodeConfigFilename,
+	})
 	githubSecret := config.GitHubCredentialSecret
 	if githubSecret == "" {
 		githubSecret = config.GitCredentialSecret

@@ -4,6 +4,7 @@
 package executor
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"strconv"
@@ -43,6 +44,7 @@ type Invocation struct {
 	Branch    string
 	Goal      string
 	Model     string
+	Roles     map[string]string
 	Framing   string
 	Workspace string
 	Debug     bool
@@ -127,6 +129,10 @@ func NewInvocation(run *courierv1alpha1.CoderRun, lane *courierv1alpha1.LaneProf
 	if model == "" {
 		return Invocation{}, ErrMissingModel
 	}
+	roles := make(map[string]string, len(lane.Spec.Roles))
+	for role, roleModel := range lane.Spec.Roles {
+		roles[role] = roleModel
+	}
 	return Invocation{
 		RunName:   run.Name,
 		Namespace: run.Namespace,
@@ -136,6 +142,7 @@ func NewInvocation(run *courierv1alpha1.CoderRun, lane *courierv1alpha1.LaneProf
 		Branch:    run.Status.Branch,
 		Goal:      goal,
 		Model:     model,
+		Roles:     roles,
 		Framing:   lane.Spec.Framing,
 		Workspace: workspace,
 		Debug:     run.Spec.Debug,
@@ -157,6 +164,10 @@ func EnvironmentWithConfig(inv Invocation, executorName, remoteURL, baseBranch, 
 	if inv.Debug {
 		level = "debug"
 	}
+	rolesJSON, err := json.Marshal(inv.Roles)
+	if err != nil {
+		rolesJSON = []byte("{}")
+	}
 	values := []EnvVar{
 		{Name: "COURIER_EXECUTOR", Value: executorName},
 		{Name: "COURIER_RUN_NAME", Value: inv.RunName},
@@ -167,6 +178,7 @@ func EnvironmentWithConfig(inv Invocation, executorName, remoteURL, baseBranch, 
 		{Name: "COURIER_BRANCH", Value: inv.Branch},
 		{Name: "COURIER_GOAL", Value: inv.Goal},
 		{Name: "COURIER_MODEL", Value: inv.Model},
+		{Name: "COURIER_ROLES_JSON", Value: string(rolesJSON)},
 		{Name: "COURIER_FRAMING", Value: inv.Framing},
 		{Name: "COURIER_WORKSPACE", Value: inv.Workspace},
 		{Name: "COURIER_LOG_LEVEL", Value: level},
