@@ -37,7 +37,8 @@ Create `courier-github` in the operator namespace with `username` and `token`
 keys. The token needs branch push, pull-request read, Checks read, and commit-status
 read permissions, but must retain least privilege and must not have
 administration or protected-branch bypass. The repository's default branch must
-require independent human approval.
+be protected so Courier cannot push or merge directly. Merge authority must
+remain with a human maintainer.
 
 Provider or gateway environment variables can be placed in another Secret and
 selected with `--executor-environment-secret`.

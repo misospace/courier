@@ -116,8 +116,8 @@ A run ends at exactly one of:
 
 - **PR open, CI green, coordinator declares ready** → the run is done. What
   happens next is human-gated: merge it, or add feedback. The coordinator has
-  no merge capability; where repository auto-merge is enabled, it completes
-  only after the required human approval (see
+  no merge capability; merging is an explicit human-maintainer action, or an
+  auto-merge a maintainer enabled (see
   [docs/repository-settings.md](./docs/repository-settings.md)).
 - **needs-human** → the coordinator (or the operator, on crashloop) could not
   reach a healthy state and labels the PR/issue for a human.
@@ -425,9 +425,10 @@ The coordinator pod gets:
 
 - The coordinator can read, push a branch, and open/update a PR. It cannot merge,
   cannot mutate the queue, cannot make an irreversible outward change.
-- **Deployment invariant:** the repository's default branch is protected and
-  requires an independent human approval before merge. The Courier identity is
-  not an administrator and has no bypass permission for branch protection.
+- **Deployment invariant:** the repository's default branch is protected so
+  merge remains a human-maintainer action, never a Courier one. The Courier
+  identity is not an administrator and has no bypass permission for branch
+  protection.
   Courier's runtime push identity must be a dedicated GitHub App installation
   token or a fine-grained PAT scoped to the work repository, with permission to
   trigger the repository's workflows. It must not be an Actions
