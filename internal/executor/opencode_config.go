@@ -9,9 +9,9 @@ const (
 )
 
 type openCodeConfig struct {
-	Agents    map[string]openCodeAgent `json:"agent"`
-	Permission map[string]string       `json:"permission,omitempty"`
-	MCP       map[string]openCodeMCP   `json:"mcp,omitempty"`
+	Agents     map[string]openCodeAgent `json:"agent"`
+	Permission map[string]string        `json:"permission,omitempty"`
+	MCP        map[string]openCodeMCP   `json:"mcp,omitempty"`
 }
 
 type openCodeAgent struct {
@@ -37,7 +37,7 @@ func marshalOpenCodeConfig(roles map[string]string, githubURL, context7URL, metr
 		agents[role] = openCodeAgent{Mode: "all", Model: model}
 	}
 	config := openCodeConfig{
-		Agents:    agents,
+		Agents:     agents,
 		Permission: denyMerge,
 	}
 	config.MCP = make(map[string]openCodeMCP)
