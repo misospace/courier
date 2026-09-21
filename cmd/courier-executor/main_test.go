@@ -43,7 +43,7 @@ func TestRunPreparesOrphanBranchAndInvokesOpenCodeWithExactContext(t *testing.T)
 	runGit(t, source, "push", "origin", "main")
 
 	fakeOpenCode := filepath.Join(root, "opencode")
-	writeExecutable(t, fakeOpenCode, "#!/bin/sh\nprintf 'opencode argv: %s\\n' \"$*\"\n")
+	writeExecutable(t, fakeOpenCode, "#!/bin/sh\nprintf 'opencode argv: %s\\n' \"$*\"\nprintf 'completed\\n' > completed.txt\ngit add --all -- .\ngit commit -m 'test: completed work' >/dev/null\n")
 	workspace := filepath.Join(root, "workspace")
 	termination := filepath.Join(root, "termination")
 	t.Setenv("COURIER_REPO_URL", remote)
@@ -119,7 +119,7 @@ func TestRunResolveIssueAdoptsBranchWithoutPullRequest(t *testing.T) {
 	remote := remoteWithExistingBranch(t, root)
 
 	fakeOpenCode := filepath.Join(root, "opencode")
-	writeExecutable(t, fakeOpenCode, "#!/bin/sh\nprintf 'opencode argv: %s\\n' \"$*\"\n")
+	writeExecutable(t, fakeOpenCode, "#!/bin/sh\nprintf 'opencode argv: %s\\n' \"$*\"\nprintf 'completed\\n' > completed.txt\ngit add --all -- .\ngit commit -m 'test: completed work' >/dev/null\n")
 
 	const githubToken = "github-api-token"
 	const gitToken = "git-token"
@@ -152,6 +152,72 @@ func TestRunResolveIssueAdoptsBranchWithoutPullRequest(t *testing.T) {
 	}
 	if authorization != "Bearer github-api-token" {
 		t.Fatalf("GitHub authorization = %q, want narrow GitHub token", authorization)
+	}
+}
+
+func TestRunExitZeroWithoutLocalWorkBecomesNeedsHuman(t *testing.T) {
+	root := t.TempDir()
+	remote := remoteWithExistingBranch(t, root)
+	fakeOpenCode := filepath.Join(root, "opencode")
+	writeExecutable(t, fakeOpenCode, "#!/bin/sh\nexit 0\n")
+	prServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `[]`)
+	}))
+	defer prServer.Close()
+	setResolveIssueEnv(t, root, remote, prServer.URL, fakeOpenCode)
+
+	var output bytes.Buffer
+	var errorsOut bytes.Buffer
+	if code := run(context.Background(), &output, &errorsOut); code != exitNeedsHuman {
+		t.Fatalf("run exit code = %d, want %d; stderr=%q stdout=%q", code, exitNeedsHuman, errorsOut.String(), output.String())
+	}
+	if !strings.Contains(output.String(), "without producing a commit or workspace changes") {
+		t.Fatalf("no-op reason = %q", output.String())
+	}
+}
+
+func TestRunExitZeroWithDirtyWorkBecomesNeedsHuman(t *testing.T) {
+	root := t.TempDir()
+	remote := remoteWithExistingBranch(t, root)
+	fakeOpenCode := filepath.Join(root, "opencode")
+	writeExecutable(t, fakeOpenCode, "#!/bin/sh\nprintf 'partial\\n' > partial.txt\nexit 0\n")
+	prServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `[]`)
+	}))
+	defer prServer.Close()
+	setResolveIssueEnv(t, root, remote, prServer.URL, fakeOpenCode)
+
+	var output bytes.Buffer
+	var errorsOut bytes.Buffer
+	if code := run(context.Background(), &output, &errorsOut); code != exitNeedsHuman {
+		t.Fatalf("run exit code = %d, want %d; stderr=%q stdout=%q", code, exitNeedsHuman, errorsOut.String(), output.String())
+	}
+	if !strings.Contains(output.String(), "uncommitted workspace changes") {
+		t.Fatalf("dirty-work reason = %q", output.String())
+	}
+}
+
+func TestRunPreservesExplicitNeedsHumanSignal(t *testing.T) {
+	root := t.TempDir()
+	remote := remoteWithExistingBranch(t, root)
+	fakeOpenCode := filepath.Join(root, "opencode")
+	writeExecutable(t, fakeOpenCode, "#!/bin/sh\nexit 2\n")
+	prServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `[]`)
+	}))
+	defer prServer.Close()
+	setResolveIssueEnv(t, root, remote, prServer.URL, fakeOpenCode)
+
+	var output bytes.Buffer
+	var errorsOut bytes.Buffer
+	if code := run(context.Background(), &output, &errorsOut); code != exitNeedsHuman {
+		t.Fatalf("run exit code = %d, want %d; stderr=%q stdout=%q", code, exitNeedsHuman, errorsOut.String(), output.String())
+	}
+	if !strings.Contains(output.String(), "requested human attention") {
+		t.Fatalf("explicit needs-human reason = %q", output.String())
 	}
 }
 
@@ -256,7 +322,7 @@ func TestRunEmitsRunScopedEventsWithoutDetail(t *testing.T) {
 	remote := remoteWithExistingBranch(t, root)
 
 	fakeOpenCode := filepath.Join(root, "opencode")
-	writeExecutable(t, fakeOpenCode, "#!/bin/sh\nprintf 'opencode ran\\n'\n")
+	writeExecutable(t, fakeOpenCode, "#!/bin/sh\nprintf 'opencode ran\\n'\nprintf 'completed\\n' > completed.txt\ngit add --all -- .\ngit commit -m 'test: completed work' >/dev/null\n")
 
 	// The branch exists on the remote and is orphaned: the adoption guard
 	// must see no pull requests and let the run proceed.
@@ -400,6 +466,9 @@ printf 'stdout plain line\n'
 printf 'stderr bearer ' >&2
 printf '%s\n' >&2
 printf 'stderr partial without newline ' >&2
+printf 'completed\n' > completed.txt
+git add --all -- .
+git commit -m 'test: completed work' >/dev/null
 `, fragment1, fragment2, testGitHubTokn)
 	fakeOpenCode := filepath.Join(root, "opencode")
 	writeExecutable(t, fakeOpenCode, script)

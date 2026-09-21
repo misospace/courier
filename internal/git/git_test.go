@@ -198,6 +198,44 @@ func TestTrustDirectoryAddsOnlyConfiguredPath(t *testing.T) {
 	}
 }
 
+func TestWorkStateDistinguishesNoWorkDirtyWorkAndCommits(t *testing.T) {
+	root := t.TempDir()
+	initRepo(t, root)
+	writeFile(t, filepath.Join(root, "base.txt"), "base\n")
+	commit(t, root, "base: initial")
+	workspace := &Workspace{Directory: root}
+	start, err := workspace.Head(context.Background())
+	if err != nil {
+		t.Fatalf("Head: %v", err)
+	}
+
+	state, err := workspace.WorkState(context.Background(), start)
+	if err != nil {
+		t.Fatalf("WorkState(no work): %v", err)
+	}
+	if state != WorkStateNone {
+		t.Fatalf("WorkState(no work) = %q, want %q", state, WorkStateNone)
+	}
+
+	writeFile(t, filepath.Join(root, "partial.txt"), "partial\n")
+	state, err = workspace.WorkState(context.Background(), start)
+	if err != nil {
+		t.Fatalf("WorkState(dirty): %v", err)
+	}
+	if state != WorkStateDirty {
+		t.Fatalf("WorkState(dirty) = %q, want %q", state, WorkStateDirty)
+	}
+
+	commit(t, root, "work: complete")
+	state, err = workspace.WorkState(context.Background(), start)
+	if err != nil {
+		t.Fatalf("WorkState(committed): %v", err)
+	}
+	if state != WorkStateCommitted {
+		t.Fatalf("WorkState(committed) = %q, want %q", state, WorkStateCommitted)
+	}
+}
+
 func TestBranchNameRejectsMissingRef(t *testing.T) {
 	if _, err := BranchName("acme/widget", 0, "resolve-issue"); err == nil {
 		t.Fatal("BranchName accepted a missing ref")
