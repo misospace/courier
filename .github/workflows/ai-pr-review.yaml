@@ -19,21 +19,21 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        uses: actions/checkout@v7.0.1
         with:
           fetch-depth: 0
           ref: ${{ github.event.pull_request.head.sha || github.sha }}
 
       - name: Generate bot token
         id: app-token
-        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3
+        uses: actions/create-github-app-token@v3.2.0
         with:
           client-id: ${{ secrets.BOT_CLIENT_ID }}
           private-key: ${{ secrets.BOT_APP_PRIVATE_KEY }}
 
       - name: Review PR
         if: github.event_name == 'pull_request'
-        uses: misospace/pr-reviewer-action@a962cdfc21c378a3b8cf2d8b194c787408e60e6b # v2.5.0
+        uses: misospace/pr-reviewer-action@v2.5.0
         with:
           github_token: ${{ steps.app-token.outputs.token }}
           ai_primary_retries: "3"

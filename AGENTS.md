@@ -66,7 +66,7 @@ These are not style preferences; a change that violates them is wrong.
   inline file comments.
 - **PR body length scales to the diff**: a one-line change gets a one-line body;
   reserve structure for medium or risky changes.
-- **Pin GitHub Actions to `@vN` tags**, not commit SHAs (a bot pins SHAs later).
+- **Pin GitHub Actions to full semver tags** (`@v6.1.0`), never bare majors (`@v6`) or commit SHAs.
 - Keep the branch synced to base before opening or updating a PR.
 
 ## Issue conventions (for work you file)

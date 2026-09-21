@@ -2,5 +2,12 @@
   "$schema": "https://docs.renovatebot.com/renovate-schema.json",
   "extends": [
     "local>misospace/renovate-config"
+  ],
+  "packageRules": [
+    {
+      "description": "Keep GitHub Actions pinned to readable semver tags, not SHA digests (overrides the shared preset's pinDigests rule)",
+      "matchManagers": ["github-actions"],
+      "pinDigests": false
+    }
   ]
 }
