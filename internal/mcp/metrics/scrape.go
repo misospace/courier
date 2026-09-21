@@ -56,17 +56,18 @@ func (s *Scraper) scrape(ctx context.Context, metricsURL string) ([]*dto.MetricF
 	req.Header.Set("Accept", "text/plain; version=0.0.4, application/openmetrics-text; version=1.0.0, text/plain")
 	resp, err := s.client.Do(req)
 	if err != nil {
-		// net/http echoes the concrete URL (credentials included) inside
-		// url.Error; never surface it unredacted.
-		return nil, fmt.Errorf("metrics scrape of %s failed: %s", parsed.Redacted(), redactError(parsed, err))
+		// url.Error carries the URL's userinfo — net/http masks only the
+		// password — and a username can itself be a secret. Never surface
+		// it unredacted.
+		return nil, fmt.Errorf("metrics scrape of %s failed: %s", redacted(parsed), redactError(parsed, err))
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("metrics scrape of %s failed: %s", parsed.Redacted(), resp.Status)
+		return nil, fmt.Errorf("metrics scrape of %s failed: %s", redacted(parsed), resp.Status)
 	}
 	families, err := parsePrometheus(io.LimitReader(resp.Body, maxScrapeBytes))
 	if err != nil {
-		return nil, fmt.Errorf("metrics response from %s was malformed", parsed.Redacted())
+		return nil, fmt.Errorf("metrics response from %s was malformed", redacted(parsed))
 	}
 	return families, nil
 }
@@ -84,17 +85,33 @@ func ValidateMetricsURL(raw string) (*url.URL, error) {
 	return parsed, nil
 }
 
-// RedactedURL renders raw with any password replaced, for diagnostics.
+// RedactedURL renders raw safe for diagnostics: the entire userinfo
+// component is removed, not just the password — a username can itself be a
+// bearer token. Host and path are kept for debugging.
 func RedactedURL(raw string) string {
 	parsed, err := url.Parse(strings.TrimSpace(raw))
 	if err != nil {
 		return "(invalid URL)"
 	}
-	return parsed.Redacted()
+	return redacted(parsed)
+}
+
+func redacted(parsed *url.URL) string {
+	sanitized := *parsed
+	sanitized.User = nil
+	return sanitized.String()
 }
 
 func redactError(parsed *url.URL, err error) string {
-	return strings.ReplaceAll(err.Error(), parsed.String(), parsed.Redacted())
+	message := strings.ReplaceAll(err.Error(), parsed.String(), redacted(parsed))
+	// The URL can survive inside the error in other renderings: verbatim,
+	// with net/http's own password masking (user:***@), or as bare userinfo.
+	if parsed.User != nil {
+		message = strings.ReplaceAll(message, parsed.User.String()+"@", "")
+		message = strings.ReplaceAll(message, parsed.User.Username()+":***@", "")
+		message = strings.ReplaceAll(message, parsed.User.Username()+"@", "")
+	}
+	return message
 }
 
 // parsePrometheus decodes the Prometheus text exposition format. The text

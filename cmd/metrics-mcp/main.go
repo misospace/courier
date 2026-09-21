@@ -8,6 +8,7 @@ import (
 	"context"
 	"errors"
 	"flag"
+	"fmt"
 	"io"
 	"log"
 	"net"
@@ -56,6 +57,10 @@ func run(ctx context.Context, listener net.Listener, opts options, logw io.Write
 	mapping, err := couriermetrics.For(opts.backend)
 	if err != nil {
 		return err
+	}
+	// http.Client.Timeout <= 0 means no timeout; every scrape must be bounded.
+	if opts.scrapeTimeout <= 0 {
+		return fmt.Errorf("-scrape-timeout must be positive (got %s)", opts.scrapeTimeout)
 	}
 	logger := log.New(logw, "metrics-mcp ", log.LstdFlags|log.Lmsgprefix)
 	scraper := couriermetrics.NewScraper(&http.Client{Timeout: opts.scrapeTimeout}, mapping)

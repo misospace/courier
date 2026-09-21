@@ -2,8 +2,10 @@ package metrics
 
 import (
 	"context"
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strings"
 	"testing"
 	"time"
@@ -166,23 +168,97 @@ process_cpu_seconds_total 4.2
 }
 
 // Credentials embedded in the configured URL must never leak into tool
-// output: net/http echoes them in transport errors unless scrubbed.
+// output: net/http echoes them in transport errors unless scrubbed, and the
+// whole userinfo component is secret — a username can be a bearer token.
 func TestScrapeRedactsCredentialsInDiagnostics(t *testing.T) {
 	dead := httptest.NewServer(http.NotFoundHandler())
-	url := dead.URL
+	host := dead.URL
 	dead.Close()
-	url = strings.Replace(url, "http://", "http://alice:hunter2@", 1)
+	parsed, err := url.Parse(host)
+	if err != nil {
+		t.Fatal(err)
+	}
 
-	scraper := NewScraper(&http.Client{Timeout: 2 * time.Second}, mustMapping(t, BackendAuto))
-	load := scraper.Scrape(context.Background(), url)
-	if load.Available {
-		t.Fatalf("load = %+v, want unavailable", load)
+	tests := []struct {
+		name   string
+		raw    string
+		secret string
+	}{
+		{name: "password userinfo", raw: "http://alice:hunter2@" + parsed.Host + "/metrics", secret: "hunter2"},
+		{name: "username is the token", raw: "http://super-secret-token@" + parsed.Host + "/metrics", secret: "super-secret-token"},
 	}
-	if strings.Contains(load.Detail, "hunter2") {
-		t.Fatalf("detail %q leaks the password", load.Detail)
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			scraper := NewScraper(&http.Client{Timeout: 2 * time.Second}, mustMapping(t, BackendAuto))
+			load := scraper.Scrape(context.Background(), tt.raw)
+			if load.Available {
+				t.Fatalf("load = %+v, want unavailable", load)
+			}
+			for _, leaked := range []string{tt.secret, "alice", "@", "xxxxx"} {
+				if strings.Contains(load.Detail, leaked) {
+					t.Fatalf("detail %q leaks %q", load.Detail, leaked)
+				}
+			}
+			if !strings.Contains(load.Detail, parsed.Host+"/metrics") {
+				t.Fatalf("detail %q should keep the host and path for debugging", load.Detail)
+			}
+		})
 	}
-	if !strings.Contains(load.Detail, "xxxxx") {
-		t.Fatalf("detail %q should carry a redacted URL", load.Detail)
+}
+
+// RedactedURL backs every diagnostic surface that prints the URL, including
+// the startup log.
+func TestRedactedURLStripsAllUserinfo(t *testing.T) {
+	tests := []struct{ raw, want string }{
+		{raw: "https://alice:hunter2@example/metrics", want: "https://example/metrics"},
+		{raw: "https://super-secret-token@example/metrics", want: "https://example/metrics"},
+		{raw: "http://vllm:8000/metrics", want: "http://vllm:8000/metrics"},
+	}
+	for _, tt := range tests {
+		if got := RedactedURL(tt.raw); got != tt.want {
+			t.Fatalf("RedactedURL(%q) = %q, want %q", tt.raw, got, tt.want)
+		}
+	}
+}
+
+// Non-finite samples must never reach the JSON-facing Load — Go's JSON
+// encoding rejects NaN and infinities, so letting one through would turn a
+// valid scrape into a serialization failure.
+func TestScrapeDropsNonFiniteGauges(t *testing.T) {
+	nonFinite := `# TYPE vllm:num_requests_running gauge
+vllm:num_requests_running 2.0
+# TYPE vllm:num_requests_waiting gauge
+vllm:num_requests_waiting NaN
+# TYPE vllm:gpu_cache_usage_perc gauge
+vllm:gpu_cache_usage_perc -Inf
+`
+	server := serve(t, http.StatusOK, nonFinite)
+	scraper := NewScraper(server.Client(), mustMapping(t, BackendAuto))
+	load := scraper.Scrape(context.Background(), server.URL)
+	if !load.Available {
+		t.Fatalf("load = %+v, want available with the usable running gauge", load)
+	}
+	if load.Running == nil || *load.Running != 2.0 {
+		t.Fatalf("running = %v, want 2", load.Running)
+	}
+	if load.Waiting != nil || load.Backpressured != nil || load.KVCacheUsage != nil {
+		t.Fatalf("non-finite gauges leaked into the load: %+v", load)
+	}
+	encoded, err := json.Marshal(load)
+	if err != nil {
+		t.Fatalf("marshal load: %v", err)
+	}
+	if strings.Contains(string(encoded), "NaN") || strings.Contains(string(encoded), "Inf") {
+		t.Fatalf("encoded load %s carries a non-finite value", encoded)
+	}
+
+	allBad := `# TYPE vllm:num_requests_waiting gauge
+vllm:num_requests_waiting +Inf
+`
+	server = serve(t, http.StatusOK, allBad)
+	load = scraper.Scrape(context.Background(), server.URL)
+	if load.Available || load.Detail == "" {
+		t.Fatalf("load = %+v, want the normal unavailable result", load)
 	}
 }
 

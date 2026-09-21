@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -76,6 +77,42 @@ func TestMCPServerListsAndInvokesLoadTool(t *testing.T) {
 	}
 	if !load.Available || load.Waiting == nil || *load.Waiting != 3.0 || load.Backpressured == nil || !*load.Backpressured {
 		t.Fatalf("load = %+v, want waiting=3 with backpressure", load)
+	}
+}
+
+// Non-finite gauges ride a valid scrape: the call must still return a normal
+// result, since serialization would otherwise fail on NaN/±Inf.
+func TestMCPServerHandlesNonFiniteGauges(t *testing.T) {
+	nonFinite := `# TYPE vllm:num_requests_running gauge
+vllm:num_requests_running 2.0
+# TYPE vllm:num_requests_waiting gauge
+vllm:num_requests_waiting NaN
+# TYPE vllm:gpu_cache_usage_perc gauge
+vllm:gpu_cache_usage_perc +Inf
+`
+	endpoint := serve(t, http.StatusOK, nonFinite)
+	session := connectMCP(t, NewServer(endpoint.URL, NewScraper(endpoint.Client(), mustMapping(t, BackendAuto))))
+
+	result, err := session.CallTool(t.Context(), &mcp.CallToolParams{Name: ToolName})
+	if err != nil {
+		t.Fatalf("tools/call: %v", err)
+	}
+	if result.IsError {
+		t.Fatalf("non-finite gauges must degrade in the payload, not error: %+v", result)
+	}
+	raw, err := json.Marshal(result.StructuredContent)
+	if err != nil {
+		t.Fatalf("structured content: %v", err)
+	}
+	if strings.Contains(string(raw), "NaN") || strings.Contains(string(raw), "Inf") {
+		t.Fatalf("structured content %s carries a non-finite value", raw)
+	}
+	var load Load
+	if err := json.Unmarshal(raw, &load); err != nil {
+		t.Fatalf("structured content %s is not a Load: %v", raw, err)
+	}
+	if !load.Available || load.Running == nil || *load.Running != 2.0 || load.Waiting != nil || load.Backpressured != nil {
+		t.Fatalf("load = %+v, want available with only the usable running gauge", load)
 	}
 }
 

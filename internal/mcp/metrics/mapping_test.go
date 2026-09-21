@@ -109,6 +109,49 @@ vllm:some_other_metric 1.0
 	}
 }
 
+// Non-finite gauges are broken instrumentation, not load: they must never
+// reach Load, and when nothing usable remains the mapping reports
+// unrecognized so the caller degrades normally.
+func TestVLLMMappingIgnoresNonFiniteGauges(t *testing.T) {
+	nonFinite := `# TYPE vllm:num_requests_running gauge
+vllm:num_requests_running 2.0
+# TYPE vllm:num_requests_waiting gauge
+vllm:num_requests_waiting NaN
+# TYPE vllm:gpu_cache_usage_perc gauge
+vllm:gpu_cache_usage_perc +Inf
+`
+	signals, ok := (vllmMapping{}).Map(mustParse(t, nonFinite))
+	if !ok {
+		t.Fatal("vllmMapping.Map discarded a backend with a usable running gauge")
+	}
+	running := 2.0
+	if !reflect.DeepEqual(signals, Signals{Running: &running}) {
+		t.Fatalf("signals = %+v, want only running=2", signals)
+	}
+}
+
+func TestVLLMMappingUnusableWhenAllGaugesNonFinite(t *testing.T) {
+	allBad := `# TYPE vllm:num_requests_running gauge
+vllm:num_requests_running -Inf
+# TYPE vllm:num_requests_waiting gauge
+vllm:num_requests_waiting NaN
+`
+	if _, ok := (vllmMapping{}).Map(mustParse(t, allBad)); ok {
+		t.Fatal("vllmMapping.Map claimed usable signals from only non-finite gauges")
+	}
+}
+
+func TestVLLMMappingKeepsFiniteSeriesBesideNonFinite(t *testing.T) {
+	mixed := `# TYPE vllm:num_requests_waiting gauge
+vllm:num_requests_waiting{model_name="broken"} NaN
+vllm:num_requests_waiting{model_name="healthy"} 7.0
+`
+	signals, ok := (vllmMapping{}).Map(mustParse(t, mixed))
+	if !ok || signals.Waiting == nil || *signals.Waiting != 7.0 {
+		t.Fatalf("signals = %+v, ok = %v, want waiting=7", signals, ok)
+	}
+}
+
 func TestFor(t *testing.T) {
 	tests := []struct {
 		backend string

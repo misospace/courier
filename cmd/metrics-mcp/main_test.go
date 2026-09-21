@@ -29,6 +29,8 @@ func TestRunValidatesOptions(t *testing.T) {
 		{name: "metrics URL is required", wantErr: "-metrics-url is required"},
 		{name: "unknown backend", opts: options{metricsURL: "http://vllm:8000/metrics", backend: "sglang"}, wantErr: "unknown backend mapping"},
 		{name: "non-HTTP scheme", opts: options{metricsURL: "ftp://vllm:8000/metrics"}, wantErr: "must be http or https"},
+		{name: "zero scrape timeout", opts: options{metricsURL: "http://vllm:8000/metrics", backend: "vllm"}, wantErr: "-scrape-timeout must be positive (got 0s)"},
+		{name: "negative scrape timeout", opts: options{metricsURL: "http://vllm:8000/metrics", backend: "vllm", scrapeTimeout: -time.Second}, wantErr: "-scrape-timeout must be positive (got -1s)"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

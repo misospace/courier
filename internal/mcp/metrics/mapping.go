@@ -2,6 +2,7 @@ package metrics
 
 import (
 	"fmt"
+	"math"
 
 	dto "github.com/prometheus/client_model/go"
 )
@@ -66,6 +67,13 @@ func gaugeValues(families []*dto.MetricFamily) map[string]*float64 {
 				continue
 			}
 			value := metric.GetGauge().GetValue()
+			// The text format legitimately carries NaN and ±Inf; such a
+			// sample is broken instrumentation, not load, and would break
+			// JSON encoding of the result. Skip it; if nothing usable
+			// remains the caller sees the normal unavailable result.
+			if !finite(value) {
+				continue
+			}
 			if existing, ok := values[name]; ok && *existing >= value {
 				continue
 			}
@@ -73,4 +81,8 @@ func gaugeValues(families []*dto.MetricFamily) map[string]*float64 {
 		}
 	}
 	return values
+}
+
+func finite(v float64) bool {
+	return !math.IsNaN(v) && !math.IsInf(v, 0)
 }
