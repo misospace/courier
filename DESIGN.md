@@ -342,7 +342,13 @@ spec:
   framing: |                       # free-text lane context injected into the prompt
     single 3090, may queue behind a shared pool, keep parallelism modest,
     use the load tool before you fan out
+  runtimeImage: <optional image>   # repository-specific coordinator/toolchain image
 ```
+
+`runtimeImage` is an optional execution-environment selector. It is an image
+capability seam, not a Go or Kubernetes requirement: a lane can select a
+repository-specific image containing whatever tools its workflow needs, while
+the deployment default remains the minimal bootstrap image.
 
 Roles name whatever models the operator has configured — cloud (`anthropic/...`,
 `openai/...`, `litellm-anthropic/MiniMax-M3`), local (`litellm/qwen3.8-27b`), or

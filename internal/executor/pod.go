@@ -101,6 +101,9 @@ func (b *PodBuilder) Build(run *courierv1alpha1.CoderRun, lane *courierv1alpha1.
 	if strings.TrimSpace(config.Image) == "" {
 		config.Image = DefaultPodConfig().Image
 	}
+	if runtimeImage := strings.TrimSpace(lane.Spec.RuntimeImage); runtimeImage != "" {
+		config.Image = runtimeImage
+	}
 	if config.ImagePullPolicy == "" {
 		config.ImagePullPolicy = corev1.PullIfNotPresent
 	}

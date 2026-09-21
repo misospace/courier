@@ -33,6 +33,25 @@ image that satisfies the contract above:
 make docker-build-coordinator EXECUTOR_IMG=ghcr.io/misospace/courier-opencode:0.1.0
 ```
 
+For repository-specific toolchains, set `spec.runtimeImage` on the selected
+`LaneProfile`. A non-empty value overrides `--executor-image` for runs on that
+lane; an empty value keeps the deployment default. This is the generic runtime
+selection seam, so another repository can select a different image without a
+Courier code change.
+
+Courier publishes `ghcr.io/misospace/courier-go:0.1.0` as the first dogfood
+runtime. It layers Go 1.27.1, `make`, `controller-gen`, and Helm onto the
+bootstrap image. It is an optional lane image, not part of the universal
+coordinator contract:
+
+```yaml
+spec:
+  runtimeImage: ghcr.io/misospace/courier-go:0.1.0
+```
+
+The image deliberately does not require the `gh` CLI. Forge operations use the
+configured forge capability; `git` remains the local repository transport.
+
 Create `courier-github` in the operator namespace with `username` and `token`
 keys. The token needs branch push, pull-request read, Checks read, and commit-status
 read permissions, but must retain least privilege and must not have
@@ -66,6 +85,7 @@ metadata:
   namespace: courier-system
 spec:
   concurrency: 1
+  runtimeImage: ghcr.io/misospace/courier-go:0.1.0
   roles:
     coordinator: litellm/your-model
   framing: keep parallelism modest and leave the pull request ready for review

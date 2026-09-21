@@ -2,6 +2,7 @@
 
 IMG ?= ghcr.io/misospace/courier:latest
 EXECUTOR_IMG ?= ghcr.io/misospace/courier-opencode:latest
+TOOLCHAIN_IMG ?= ghcr.io/misospace/courier-go:latest
 OPENCODE_VERSION ?= 1.18.31
 
 # Tool versions.
@@ -68,6 +69,10 @@ docker-build: ## Build the operator image.
 .PHONY: docker-build-coordinator
 docker-build-coordinator: ## Build the bootstrap coordinator image (courier-executor + git + opencode).
 	docker build --target coordinator --build-arg OPENCODE_VERSION=$(OPENCODE_VERSION) -t $(EXECUTOR_IMG) .
+
+.PHONY: docker-build-coordinator-go
+docker-build-coordinator-go: ## Build the Go-capable dogfood coordinator image.
+	docker build --target coordinator-go --build-arg OPENCODE_VERSION=$(OPENCODE_VERSION) -t $(TOOLCHAIN_IMG) .
 
 ##@ Dependencies
 
