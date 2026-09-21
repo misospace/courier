@@ -30,6 +30,15 @@ jobs:
             echo "generated code is stale; run 'make manifests generate' and commit"; \
             exit 1; }
 
+      - name: Check formatting
+        run: |
+          unformatted="$(gofmt -l .)"
+          if [ -n "$unformatted" ]; then
+            echo "files not gofmt-clean:"
+            printf '%s\n' "$unformatted"
+            exit 1
+          fi
+
       - name: Vet
         run: go vet ./...
 
