@@ -11,15 +11,18 @@ ARG TARGETARCH
 WORKDIR /workspace
 COPY go.mod go.mod
 COPY go.sum go.sum
-RUN go mod download
+RUN --mount=type=cache,target=/go/pkg/mod \
+	go mod download
 
 COPY cmd/ cmd/
 COPY api/ api/
 COPY internal/ internal/
 
-RUN CGO_ENABLED=0 GOOS=${TARGETOS:-linux} GOARCH=${TARGETARCH} \
-	go build -a -o manager cmd/main.go && \
-	go build -a -o courier-executor ./cmd/courier-executor
+RUN --mount=type=cache,target=/go/pkg/mod \
+	--mount=type=cache,target=/root/.cache/go-build \
+	CGO_ENABLED=0 GOOS=${TARGETOS:-linux} GOARCH=${TARGETARCH} \
+	go build -o manager cmd/main.go && \
+	go build -o courier-executor ./cmd/courier-executor
 
 # Coordinator image: the bootstrap OpenCode runtime. The executor contract
 # (BOOTSTRAP.md) requires courier-executor, git, and opencode in one image.
