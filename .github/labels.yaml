@@ -1,0 +1,97 @@
+---
+# Status
+- name: status/backlog
+  color: "cfd3d7"
+  description: Not ready for worker pickup yet.
+- name: status/ready
+  color: "0e8a16"
+  description: Ready for worker pickup.
+- name: status/in-progress
+  color: "fbca04"
+  description: Work has been claimed or started.
+- name: status/in-review
+  color: "5319e7"
+  description: Pull request or human review in progress.
+- name: status/done
+  color: "0e8a16"
+  description: Work is complete.
+- name: status/blocked
+  color: "e11d21"
+  description: Progress is blocked.
+# Priority
+- name: priority/p0
+  color: "b60205"
+  description: Critical priority.
+- name: priority/p1
+  color: "d93f0b"
+  description: High priority.
+- name: priority/p2
+  color: "fbca04"
+  description: Normal priority.
+- name: priority/p3
+  color: "0e8a16"
+  description: Low priority.
+# Type / Classification
+- name: bug
+  color: "d73a4a"
+  description: Something isn't working.
+- name: enhancement
+  color: "a2eeef"
+  description: New feature or request.
+- name: documentation
+  color: "0075ca"
+  description: Improvements or additions to documentation.
+- name: dependencies
+  color: "0366d6"
+  description: Dependency update or maintenance.
+- name: audit
+  color: "bfdadc"
+  description: Filing from automated tech-debt audit run.
+- name: pr-review-fix
+  color: "c5def5"
+  description: Follow-up work from pull request review.
+- name: ai-review
+  color: "b4f8f8"
+  description: Request an AI pull request review.
+- name: umbrella
+  color: "5319e7"
+  description: Parent issue tracking child work.
+# Type (conventional-commit magnitude)
+- name: type/bug
+  color: "ee0701"
+  description: Something isn't working.
+- name: type/chore
+  color: "e4e669"
+  description: Routine tasks and maintenance.
+- name: type/feature
+  color: "a2eeef"
+  description: New feature or improvement.
+- name: type/major
+  color: "ededed"
+  description: Breaking change; bumps the major version.
+- name: type/minor
+  color: "ededed"
+  description: Backward-compatible feature; bumps the minor version.
+- name: type/patch
+  color: "ededed"
+  description: Backward-compatible fix; bumps the patch version.
+- name: type/security
+  color: "ededed"
+  description: Security-related change.
+# Release (release-please)
+- name: "autorelease: pending"
+  color: "ededed"
+  description: Release PR awaiting tag; managed by release-please.
+- name: "autorelease: tagged"
+  color: "ededed"
+  description: Tagged by release-please; the Release workflow publishes it.
+# Workflow
+- name: needs-info
+  color: "d4c5f9"
+  description: More information is needed before work can continue.
+- name: needs-human
+  color: "e99695"
+  description: Human input or decision is required.
+- name: needs-escalation
+  color: "b60205"
+  description: Needs escalated lane attention.
