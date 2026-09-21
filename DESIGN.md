@@ -115,8 +115,10 @@ Prompts are that short by design. Goal plus tools; the coordinator owns the how.
 A run ends at exactly one of:
 
 - **PR open, CI green, coordinator declares ready** → the run is done. What
-  happens next is human-gated: merge it, or add feedback. There is no
-  auto-merge.
+  happens next is human-gated: merge it, or add feedback. The coordinator has
+  no merge capability; where repository auto-merge is enabled, it completes
+  only after the required human approval (see
+  [docs/repository-settings.md](./docs/repository-settings.md)).
 - **needs-human** → the coordinator (or the operator, on crashloop) could not
   reach a healthy state and labels the PR/issue for a human.
 
