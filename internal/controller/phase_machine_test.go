@@ -376,7 +376,43 @@ func TestVerifyingSettlesOnSecondStableGreenObservation(t *testing.T) {
 	}
 }
 
-func TestVerifyingPartialRegistrationNeverPassesEarly(t *testing.T) {
+func TestVerifyingPendingObservationCannotPresettleGreen(t *testing.T) {
+	item := &admissionSource{}
+	run := admissionRun("run", "local", courierv1alpha1.PhaseVerifying)
+	run.Spec.Source = "manual"
+	run.Status.Branch = "courier/acme/widgets/issue-1"
+	client := phaseClient(t, run)
+	reconciler := &CoderRunReconciler{
+		Client:       client,
+		Sources:      NewSourceRegistry(map[string]source.Adapter{"manual": item}),
+		StatusWriter: fakeStatusWriter{client: client},
+		Observer: &sequenceWorldObserver{observations: []PRObservation{
+			{PR: "42", Head: "sha-1", Checks: []CheckObservation{{Name: "check-a", State: CheckStatePending}}},
+			greenObservation("sha-1", "check-a"),
+			greenObservation("sha-1", "check-a", "check-b"),
+			greenObservation("sha-1", "check-a", "check-b"),
+		}},
+	}
+	for i, want := range []courierv1alpha1.Phase{
+		courierv1alpha1.PhaseVerifying,
+		courierv1alpha1.PhaseVerifying,
+		courierv1alpha1.PhaseVerifying,
+		courierv1alpha1.PhaseAwaitingReview,
+	} {
+		if _, err := reconciler.Reconcile(context.Background(), admissionRequest("run")); err != nil {
+			t.Fatalf("Reconcile() %d error = %v", i+1, err)
+		}
+		var updated courierv1alpha1.CoderRun
+		if err := client.Get(context.Background(), admissionKey("run"), &updated); err != nil {
+			t.Fatalf("get run: %v", err)
+		}
+		if updated.Status.Phase != want {
+			t.Fatalf("phase after observation %d = %q, want %q; a pending observation must never pre-settle the identities it saw", i+1, updated.Status.Phase, want)
+		}
+	}
+}
+
+func TestVerifyingPendingClearsGreenCandidate(t *testing.T) {
 	item := &admissionSource{}
 	run := admissionRun("run", "local", courierv1alpha1.PhaseVerifying)
 	run.Spec.Source = "manual"
@@ -394,22 +430,36 @@ func TestVerifyingPartialRegistrationNeverPassesEarly(t *testing.T) {
 				{Name: "check-c", State: CheckStatePending},
 			}},
 			greenObservation("sha-1", "check-a", "check-b", "check-c"),
+			greenObservation("sha-1", "check-a", "check-b", "check-c"),
 		}},
 	}
+	if _, err := reconciler.Reconcile(context.Background(), admissionRequest("run")); err != nil {
+		t.Fatalf("first Reconcile() error = %v", err)
+	}
+	// A pending observation clears the green candidate instead of recording
+	// its own identity, so the next green observation starts a fresh settle.
+	if _, err := reconciler.Reconcile(context.Background(), admissionRequest("run")); err != nil {
+		t.Fatalf("second Reconcile() error = %v", err)
+	}
+	var updated courierv1alpha1.CoderRun
+	if err := client.Get(context.Background(), admissionKey("run"), &updated); err != nil {
+		t.Fatalf("get run: %v", err)
+	}
+	if updated.Status.CheckFingerprint != "" {
+		t.Fatalf("checkFingerprint after pending observation = %q, want cleared", updated.Status.CheckFingerprint)
+	}
 	for i, want := range []courierv1alpha1.Phase{
-		courierv1alpha1.PhaseVerifying,
 		courierv1alpha1.PhaseVerifying,
 		courierv1alpha1.PhaseAwaitingReview,
 	} {
 		if _, err := reconciler.Reconcile(context.Background(), admissionRequest("run")); err != nil {
-			t.Fatalf("Reconcile() %d error = %v", i+1, err)
+			t.Fatalf("Reconcile() %d error = %v", i+3, err)
 		}
-		var updated courierv1alpha1.CoderRun
 		if err := client.Get(context.Background(), admissionKey("run"), &updated); err != nil {
 			t.Fatalf("get run: %v", err)
 		}
 		if updated.Status.Phase != want {
-			t.Fatalf("phase after observation %d = %q, want %q", i+1, updated.Status.Phase, want)
+			t.Fatalf("phase after observation %d = %q, want %q; the green set after a pending poll must settle twice", i+3, updated.Status.Phase, want)
 		}
 	}
 }

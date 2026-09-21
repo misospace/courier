@@ -283,13 +283,19 @@ func (r *CoderRunReconciler) observeVerifying(ctx context.Context, run *courierv
 	if state == observationNeedsHuman || state == observationFailed {
 		return r.transitionTerminal(ctx, run, courierv1alpha1.PhaseNeedsHuman, pr)
 	}
-	// status.checkFingerprint records the previous observation's check set, so
-	// green settles only onto a poll that saw the identical set. Checks still
-	// registering, a new push, or a new check each reshape the fingerprint and
-	// restart the settle. A real failure is recognized immediately and skips
-	// the settle; it needs no second observation.
-	fingerprint := checkSetFingerprint(observation)
-	settled := state == observationPassed && fingerprint != "" && fingerprint == run.Status.CheckFingerprint
+	// status.checkFingerprint is the prior all-green candidate: the identity
+	// of the last poll on which every observed check passed. Green settles
+	// only onto an identical candidate — two consecutive all-green
+	// observations of the same check set. A pending or empty observation
+	// clears the candidate, because checks that have not registered yet can
+	// still appear at any later poll; a changed identity resets it the same
+	// way. A real failure is recognized immediately and skips the settle; it
+	// needs no second observation.
+	fingerprint := ""
+	if state == observationPassed {
+		fingerprint = checkSetFingerprint(observation)
+	}
+	settled := fingerprint != "" && fingerprint == run.Status.CheckFingerprint
 	before := run.DeepCopy()
 	if pr != "" {
 		run.Status.PR = pr

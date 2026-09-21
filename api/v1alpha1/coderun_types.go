@@ -118,11 +118,12 @@ type CoderRunStatus struct {
 	// +optional
 	LastCommit string `json:"lastCommit,omitempty"`
 
-	// CheckFingerprint is the operator's compact identity of the most recent
+	// CheckFingerprint is the operator's compact identity of the last all-green
 	// CI check observation while Verifying: the head commit plus the sorted
 	// external check identifiers. A run leaves Verifying for AwaitingReview
-	// only when an all-green observation matches the previous observation's
-	// fingerprint, so a check set that is still registering cannot pass.
+	// only when two consecutive all-green observations carry the same
+	// fingerprint; a pending or empty observation clears it, and a changed
+	// check set resets it, so checks that are still registering cannot pass.
 	// +optional
 	CheckFingerprint string `json:"checkFingerprint,omitempty"`
 
