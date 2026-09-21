@@ -128,6 +128,18 @@ jobs:
           app_version=$(awk '$1 == "appVersion:" { print $2; exit }' charts/courier/Chart.yaml)
           test "$(grep -c -F "image: ghcr.io/misospace/courier:${app_version}" rendered.yaml)" -eq 1
           test "$(grep -c -F -- "--executor-image=ghcr.io/misospace/courier-opencode:${app_version}" rendered.yaml)" -eq 1
+          test "$(grep -c -F -- "--opencode-agent=coordinator" rendered.yaml)" -eq 1
+
+          helm template courier charts/courier --namespace courier-system \
+            --set executor.openCode.agent=architect \
+            --set executor.mcp.githubURL=https://github.example/mcp \
+            --set executor.mcp.context7URL=https://context7.example/mcp \
+            --set executor.mcp.metricsURL=https://metrics.example/mcp \
+            > rendered-executor.yaml
+          test "$(grep -c -F -- "--opencode-agent=architect" rendered-executor.yaml)" -eq 1
+          test "$(grep -c -F -- "--github-mcp-url=https://github.example/mcp" rendered-executor.yaml)" -eq 1
+          test "$(grep -c -F -- "--context7-mcp-url=https://context7.example/mcp" rendered-executor.yaml)" -eq 1
+          test "$(grep -c -F -- "--metrics-mcp-url=https://metrics.example/mcp" rendered-executor.yaml)" -eq 1
 
           helm template courier charts/courier --namespace courier-system \
             --set 'controllers.main.containers.main.args={--leader-elect,--git-remote-template=https://github.com/%s.git,--git-credential-secret=courier-github,--executor-image=ghcr.io/example/custom:1.2.3}' \

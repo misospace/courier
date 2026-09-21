@@ -48,6 +48,10 @@ func main() {
 	var githubCredentialSecret string
 	var githubTokenKey string
 	var executorEnvironmentSecret string
+	var opencodeAgent string
+	var githubMCPURL string
+	var context7MCPURL string
+	var metricsMCPURL string
 	flag.StringVar(&metricsAddr, "metrics-bind-address", ":8080", "The address the metric endpoint binds to.")
 	flag.StringVar(&probeAddr, "health-probe-bind-address", ":8081", "The address the probe endpoint binds to.")
 	flag.BoolVar(&enableLeaderElection, "leader-elect", false, "Enable leader election for controller manager.")
@@ -59,6 +63,10 @@ func main() {
 	flag.StringVar(&githubCredentialSecret, "github-credential-secret", "", "Optional Secret containing the GitHub API token; empty falls back to --git-credential-secret.")
 	flag.StringVar(&githubTokenKey, "github-token-key", "", "Optional key in the GitHub API credential Secret; empty falls back to --git-token-key or token.")
 	flag.StringVar(&executorEnvironmentSecret, "executor-environment-secret", "", "Optional Secret exposed as coordinator environment variables for model/provider configuration.")
+	flag.StringVar(&opencodeAgent, "opencode-agent", "", "Optional OpenCode agent name used for coordinator runs.")
+	flag.StringVar(&githubMCPURL, "github-mcp-url", "", "Optional remote MCP endpoint for GitHub.")
+	flag.StringVar(&context7MCPURL, "context7-mcp-url", "", "Optional remote MCP endpoint for Context7.")
+	flag.StringVar(&metricsMCPURL, "metrics-mcp-url", "", "Optional remote MCP endpoint for metrics; absence is harmless.")
 	opts := zap.Options{Development: true}
 	opts.BindFlags(flag.CommandLine)
 	flag.Parse()
@@ -85,6 +93,10 @@ func main() {
 	podConfig.GitHubCredentialSecret = githubCredentialSecret
 	podConfig.GitHubTokenKey = githubTokenKey
 	podConfig.EnvironmentSecret = executorEnvironmentSecret
+	podConfig.OpenCode.Agent = opencodeAgent
+	podConfig.GitHubMCPURL = githubMCPURL
+	podConfig.Context7MCPURL = context7MCPURL
+	podConfig.MetricsMCPURL = metricsMCPURL
 	launcher := &controller.CoordinatorLauncher{
 		Client: mgr.GetClient(),
 		Scheme: mgr.GetScheme(),

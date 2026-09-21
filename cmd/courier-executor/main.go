@@ -40,6 +40,7 @@ type config struct {
 	GitHubAPIBase   string
 	OpenCodeBinary  string
 	OpenCodeFormat  string
+	OpenCodeAgent   string
 	TerminationFile string
 	GitUsername     string
 	GitToken        string
@@ -77,6 +78,7 @@ func readConfig(getenv func(string) string) (config, error) {
 		Mode:            strings.TrimSpace(getenv("COURIER_MODE")),
 		OpenCodeBinary:  strings.TrimSpace(getenv("COURIER_OPENCODE_BINARY")),
 		OpenCodeFormat:  strings.TrimSpace(getenv("COURIER_OPENCODE_FORMAT")),
+		OpenCodeAgent:   strings.TrimSpace(getenv("COURIER_OPENCODE_AGENT")),
 		TerminationFile: strings.TrimSpace(getenv("COURIER_TERMINATION_FILE")),
 		GitUsername:     getenv("COURIER_GIT_USERNAME"),
 		GitToken:        getenv("COURIER_GIT_TOKEN"),
@@ -155,7 +157,7 @@ func run(ctx context.Context, stdout, stderr io.Writer) int {
 		return 1
 	}
 
-	runtime := executor.OpenCode{Binary: cfg.OpenCodeBinary, Format: cfg.OpenCodeFormat}
+	runtime := executor.OpenCode{Binary: cfg.OpenCodeBinary, Format: cfg.OpenCodeFormat, Agent: cfg.OpenCodeAgent}
 	command := runtime.Command(executor.Invocation{
 		Goal:      cfg.Goal,
 		Model:     cfg.Model,

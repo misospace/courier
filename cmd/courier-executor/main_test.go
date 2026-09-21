@@ -48,6 +48,7 @@ func TestRunPreparesOrphanBranchAndInvokesOpenCodeWithExactContext(t *testing.T)
 	t.Setenv("COURIER_BRANCH", "courier/resolve-issue/acme-widgets/7")
 	t.Setenv("COURIER_GOAL", "Open a PR to address issue #7.")
 	t.Setenv("COURIER_MODEL", "any-model/name")
+	t.Setenv("COURIER_OPENCODE_AGENT", "architect")
 	t.Setenv("COURIER_FRAMING", "capacity is elastic; fan out freely")
 	t.Setenv("COURIER_OPENCODE_BINARY", fakeOpenCode)
 	t.Setenv("COURIER_TERMINATION_FILE", termination)
@@ -62,6 +63,9 @@ func TestRunPreparesOrphanBranchAndInvokesOpenCodeWithExactContext(t *testing.T)
 	}
 	if !strings.Contains(output.String(), "Open a PR to address issue #7.") || !strings.Contains(output.String(), "any-model/name") || !strings.Contains(output.String(), "capacity is elastic; fan out freely") {
 		t.Fatalf("OpenCode did not receive exact goal/model/framing: %q", output.String())
+	}
+	if !strings.Contains(output.String(), "--agent architect") {
+		t.Fatalf("OpenCode did not receive configured agent: %q", output.String())
 	}
 	if !strings.Contains(output.String(), `COURIER_TERMINATION {"phase":"Verifying","result":"success","exit_code":0`) {
 		t.Fatalf("missing stable success termination: %q", output.String())
