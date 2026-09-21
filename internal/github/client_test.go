@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -220,6 +221,74 @@ func TestCheckRunsRejectPrematureEmptyPage(t *testing.T) {
 	_, err = client.GetCheckRuns(context.Background(), "acme", "demo", "abc")
 	if err == nil || !strings.Contains(err.Error(), "ended after 1 of 2") {
 		t.Fatalf("error = %v, want incomplete pagination error", err)
+	}
+}
+
+func TestCheckRunsRejectChangingTotalCount(t *testing.T) {
+	tests := []struct {
+		name        string
+		secondTotal int
+	}{
+		{name: "increases", secondTotal: 3},
+		{name: "decreases", secondTotal: 1},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				switch r.URL.Query().Get("page") {
+				case "1":
+					_, _ = io.WriteString(w, `{"total_count":2,"check_runs":[{"id":1}]}`)
+				case "2":
+					_, _ = fmt.Fprintf(w, `{"total_count":%d,"check_runs":[{"id":2}]}`, tt.secondTotal)
+				default:
+					http.NotFound(w, r)
+				}
+			}))
+			defer server.Close()
+			client, err := NewClient(server.URL, "")
+			if err != nil {
+				t.Fatal(err)
+			}
+			_, err = client.GetCheckRuns(context.Background(), "acme", "demo", "abc")
+			if err == nil || !strings.Contains(err.Error(), "total_count changed from 2 to") {
+				t.Fatalf("error = %v, want changing total_count error", err)
+			}
+		})
+	}
+}
+
+func TestCommitStatusesRejectChangingTotalCount(t *testing.T) {
+	tests := []struct {
+		name        string
+		secondTotal int
+	}{
+		{name: "increases", secondTotal: 3},
+		{name: "decreases", secondTotal: 1},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				switch r.URL.Query().Get("page") {
+				case "1":
+					_, _ = io.WriteString(w, `{"total_count":2,"statuses":[{"state":"success"}]}`)
+				case "2":
+					_, _ = fmt.Fprintf(w, `{"total_count":%d,"statuses":[{"state":"success"}]}`, tt.secondTotal)
+				default:
+					http.NotFound(w, r)
+				}
+			}))
+			defer server.Close()
+			client, err := NewClient(server.URL, "")
+			if err != nil {
+				t.Fatal(err)
+			}
+			_, err = client.GetCommitStatuses(context.Background(), "acme", "demo", "abc")
+			if err == nil || !strings.Contains(err.Error(), "total_count changed from 2 to") {
+				t.Fatalf("error = %v, want changing total_count error", err)
+			}
+		})
 	}
 }
 

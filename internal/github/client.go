@@ -244,6 +244,8 @@ func (c *Client) GetCheckRuns(ctx context.Context, owner, repo, ref string) (Che
 		}
 		if page == 1 {
 			out.TotalCount = current.TotalCount
+		} else if current.TotalCount != out.TotalCount {
+			return CheckRuns{}, fmt.Errorf("GitHub check-runs total_count changed from %d to %d during pagination", out.TotalCount, current.TotalCount)
 		}
 		if len(current.CheckRuns) == 0 && len(out.CheckRuns) < out.TotalCount {
 			return CheckRuns{}, fmt.Errorf("GitHub check-runs response ended after %d of %d checks", len(out.CheckRuns), out.TotalCount)
@@ -270,6 +272,8 @@ func (c *Client) GetCommitStatuses(ctx context.Context, owner, repo, ref string)
 		}
 		if page == 1 {
 			out.TotalCount = current.TotalCount
+		} else if current.TotalCount != out.TotalCount {
+			return CommitStatuses{}, fmt.Errorf("GitHub commit-status total_count changed from %d to %d during pagination", out.TotalCount, current.TotalCount)
 		}
 		if len(current.Statuses) == 0 && len(out.Statuses) < out.TotalCount {
 			return CommitStatuses{}, fmt.Errorf("GitHub commit-status response ended after %d of %d statuses", len(out.Statuses), out.TotalCount)
