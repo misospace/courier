@@ -26,15 +26,15 @@ code on the default branch.
 `main` is protected. Every change arrives through a pull request, and the
 required checks must be green before merge:
 
-- `static`, `test`, `images`, `vulnerability`, `chart`, `review` (the AI PR
-  review check), and `Analyze (go)` (CodeQL).
+- `static`, `test`, `images`, `vulnerability`, `chart`, and `Analyze (go)`
+  (CodeQL). Saffron's AI PR review also runs on every pull request, but it is
+  advisory: input to the maintainer's merge decision, never a gate on it.
 - Branch freshness is not enforced: a PR whose own required checks are green
   does not need a rebase just because `main` advanced. Maintainers update
   branches when there is meaningful integration risk, not mechanically.
 - No force pushes, no deletions.
 - Approving reviews are not a hard GitHub gate: no review count and no
-  code-owner requirement is enforced. Saffron's automated review is input to
-  a human decision, not a substitute for one.
+  code-owner requirement is enforced.
 
 Maintainers — the repository's administrators — retain the normal merge
 ergonomics of the maintained misospace repositories, including bypassing
