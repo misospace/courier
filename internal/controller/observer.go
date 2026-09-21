@@ -35,8 +35,11 @@ const (
 )
 
 func observeState(observation PRObservation) observationState {
-	if observation.PR == "" || observation.Draft || len(observation.Checks) == 0 {
+	if observation.PR == "" || observation.Draft {
 		return observationNeedsHuman
+	}
+	if len(observation.Checks) == 0 {
+		return observationPending
 	}
 	for _, check := range observation.Checks {
 		if check.State == CheckStatePending {

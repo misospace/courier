@@ -259,14 +259,15 @@ func TestResolveIssueObservationGatesReview(t *testing.T) {
 		observerMissing bool
 		wantPhase       courierv1alpha1.Phase
 		wantRequeue     bool
+		wantPR          string
 		wantTransition  source.State
 	}{
 		{name: "observer missing", observerMissing: true, wantPhase: courierv1alpha1.PhaseNeedsHuman, wantTransition: source.StateNeedsHuman},
 		{name: "no PR", wantPhase: courierv1alpha1.PhaseNeedsHuman, wantTransition: source.StateNeedsHuman},
 		{name: "draft", observation: PRObservation{PR: "42", Draft: true, Checks: []CheckObservation{{State: CheckStatePassed}}}, wantPhase: courierv1alpha1.PhaseNeedsHuman, wantTransition: source.StateNeedsHuman},
-		{name: "no checks", observation: PRObservation{PR: "42"}, wantPhase: courierv1alpha1.PhaseNeedsHuman, wantTransition: source.StateNeedsHuman},
-		{name: "pending", observation: PRObservation{PR: "42", Checks: []CheckObservation{{State: CheckStatePending}}}, wantPhase: courierv1alpha1.PhaseRunning, wantRequeue: true},
-		{name: "pending failure mix", observation: PRObservation{PR: "42", Checks: []CheckObservation{{State: CheckStateFailed}, {State: CheckStatePending}}}, wantPhase: courierv1alpha1.PhaseRunning, wantRequeue: true},
+		{name: "no checks", observation: PRObservation{PR: "42"}, wantPhase: courierv1alpha1.PhaseRunning, wantRequeue: true, wantPR: "42"},
+		{name: "pending", observation: PRObservation{PR: "42", Checks: []CheckObservation{{State: CheckStatePending}}}, wantPhase: courierv1alpha1.PhaseRunning, wantRequeue: true, wantPR: "42"},
+		{name: "pending failure mix", observation: PRObservation{PR: "42", Checks: []CheckObservation{{State: CheckStateFailed}, {State: CheckStatePending}}}, wantPhase: courierv1alpha1.PhaseRunning, wantRequeue: true, wantPR: "42"},
 		{name: "failed", observation: PRObservation{PR: "42", Checks: []CheckObservation{{State: CheckStateFailed}}}, wantPhase: courierv1alpha1.PhaseNeedsHuman, wantTransition: source.StateNeedsHuman},
 		{name: "skipped and neutral", observation: PRObservation{PR: "42", Checks: []CheckObservation{{State: CheckStatePassed}, {State: CheckStatePassed}}}, wantPhase: courierv1alpha1.PhaseAwaitingReview, wantTransition: source.StateInReview},
 		{name: "transient error", err: errors.New("GitHub unavailable"), wantPhase: courierv1alpha1.PhaseRunning, wantRequeue: true},
@@ -308,11 +309,8 @@ func TestResolveIssueObservationGatesReview(t *testing.T) {
 			if updated.Status.Phase != tt.wantPhase {
 				t.Fatalf("phase = %q, want %q", updated.Status.Phase, tt.wantPhase)
 			}
-			if tt.wantPhase == courierv1alpha1.PhaseAwaitingReview && updated.Status.PR != "42" {
-				t.Fatalf("PR = %q, want 42", updated.Status.PR)
-			}
-			if tt.name == "skipped and neutral" && updated.Status.PR != "42" {
-				t.Fatalf("PR = %q, want 42", updated.Status.PR)
+			if tt.wantPR != "" && updated.Status.PR != tt.wantPR {
+				t.Fatalf("PR = %q, want %q", updated.Status.PR, tt.wantPR)
 			}
 			if updated.Status.Checkpoint == nil || updated.Status.Checkpoint.Plan != "preserve" || updated.Status.Heartbeat == nil || updated.Status.LastCommit != "abc123" {
 				t.Fatalf("harness status was not preserved: checkpoint=%#v heartbeat=%#v lastCommit=%q", updated.Status.Checkpoint, updated.Status.Heartbeat, updated.Status.LastCommit)

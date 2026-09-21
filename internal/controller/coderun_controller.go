@@ -267,8 +267,18 @@ func (r *CoderRunReconciler) observeRunning(ctx context.Context, run *courierv1a
 					return ctrl.Result{RequeueAfter: observationRequeueDelay}, nil
 				}
 				pr = observation.PR
-				switch observeState(observation) {
+				state := observeState(observation)
+				switch state {
 				case observationPending:
+					before := run.DeepCopy()
+					if pr != "" {
+						run.Status.PR = pr
+					}
+					if run.Status.PR != before.Status.PR {
+						if err := r.patchStatus(ctx, before, run); err != nil {
+							return ctrl.Result{}, err
+						}
+					}
 					return ctrl.Result{RequeueAfter: observationRequeueDelay}, nil
 				case observationPassed:
 					phase = courierv1alpha1.PhaseAwaitingReview
