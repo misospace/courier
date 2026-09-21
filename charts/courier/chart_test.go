@@ -62,6 +62,35 @@ func TestChartRendersDispatchConfiguration(t *testing.T) {
 	}
 }
 
+func TestRBACResourceNamesMatchCoderunCRD(t *testing.T) {
+	crd := mustReadChartFile(t, "crd-manifests/courier.misospace.dev_coderruns.yaml")
+	generated := mustReadRepositoryFile(t, "config/rbac/role.yaml")
+	values := mustReadRepositoryFile(t, "charts/courier/values.yaml")
+
+	if !strings.Contains(crd, "plural: coderruns") {
+		t.Fatal("CoderRun CRD does not declare the coderruns plural")
+	}
+	for _, resource := range []string{"coderruns", "coderruns/status", "coderruns/finalizers"} {
+		if !strings.Contains(generated, "- "+resource) {
+			t.Fatalf("generated RBAC is missing resource %q", resource)
+		}
+		if !strings.Contains(values, "resources: ["+resource+"]") {
+			t.Fatalf("chart RBAC is missing resource %q", resource)
+		}
+	}
+	for _, content := range []struct {
+		name string
+		data string
+	}{
+		{name: "generated RBAC", data: generated},
+		{name: "chart values", data: values},
+	} {
+		if strings.Contains(content.data, "coderuns") {
+			t.Fatalf("%s still contains the stale coderuns resource name", content.name)
+		}
+	}
+}
+
 func copyChart(t *testing.T) string {
 	t.Helper()
 	temporary := t.TempDir()
@@ -70,6 +99,24 @@ func copyChart(t *testing.T) string {
 		t.Fatalf("copy chart: %v", err)
 	}
 	return chartDir
+}
+
+func mustReadChartFile(t *testing.T, path string) string {
+	t.Helper()
+	data, err := os.ReadFile(filepath.Join(".", path))
+	if err != nil {
+		t.Fatalf("read chart file %s: %v", path, err)
+	}
+	return string(data)
+}
+
+func mustReadRepositoryFile(t *testing.T, path string) string {
+	t.Helper()
+	data, err := os.ReadFile(filepath.Join("..", "..", path))
+	if err != nil {
+		t.Fatalf("read repository file %s: %v", path, err)
+	}
+	return string(data)
 }
 
 func runHelm(t *testing.T, chartDir string, args ...string) string {

@@ -44,6 +44,22 @@ type Workspace struct {
 	Adopted    bool
 }
 
+// TrustDirectory adds only the configured workspace to Git's global
+// safe.directory list. Kubernetes volumes can be mounted with an owner that
+// differs from the process UID; this preserves Git's ownership protection
+// while allowing the coordinator to operate on that one configured path.
+func TrustDirectory(ctx context.Context, directory string) error {
+	directory = filepath.Clean(strings.TrimSpace(directory))
+	if directory == "." || !filepath.IsAbs(directory) {
+		return fmt.Errorf("git trust directory: path must be absolute: %q", directory)
+	}
+	if strings.ContainsAny(directory, "\x00\n\r") {
+		return errors.New("git trust directory: path contains control characters")
+	}
+	_, err := run(ctx, "", "config", "--global", "--add", "safe.directory", directory)
+	return err
+}
+
 // Brief describes one completed delegation unit.  Objective and Outcome are
 // both included in the commit message so the log remains useful if a status
 // checkpoint is lost.

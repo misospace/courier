@@ -128,6 +128,15 @@ func TestBuildCoordinatorPodInjectsRunContextAndEphemeralWorkspace(t *testing.T)
 	if pod.Spec.SecurityContext == nil || pod.Spec.SecurityContext.RunAsNonRoot == nil || !*pod.Spec.SecurityContext.RunAsNonRoot {
 		t.Fatal("pod does not require a non-root security context")
 	}
+	if pod.Spec.SecurityContext.RunAsUser == nil || *pod.Spec.SecurityContext.RunAsUser != CoordinatorUID {
+		t.Fatalf("pod runAsUser = %v, want %d", pod.Spec.SecurityContext.RunAsUser, CoordinatorUID)
+	}
+	if pod.Spec.SecurityContext.RunAsGroup == nil || *pod.Spec.SecurityContext.RunAsGroup != CoordinatorGID {
+		t.Fatalf("pod runAsGroup = %v, want %d", pod.Spec.SecurityContext.RunAsGroup, CoordinatorGID)
+	}
+	if pod.Spec.SecurityContext.FSGroup == nil || *pod.Spec.SecurityContext.FSGroup != CoordinatorGID {
+		t.Fatalf("pod fsGroup = %v, want %d for the emptyDir workspace", pod.Spec.SecurityContext.FSGroup, CoordinatorGID)
+	}
 	container := pod.Spec.Containers[0]
 	if container.Image != "registry.example/courier-opencode:test" || container.WorkingDir != "/workspace" {
 		t.Fatalf("container runtime = image %q, working dir %q", container.Image, container.WorkingDir)

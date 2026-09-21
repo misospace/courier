@@ -15,6 +15,11 @@ import (
 )
 
 const (
+	// CoordinatorUID and CoordinatorGID are the non-root identity contract
+	// shared by the published coordinator image and its generated Pods.
+	CoordinatorUID int64 = 65532
+	CoordinatorGID int64 = 65532
+
 	LabelRun       = "courier.misospace.dev/coderrun"
 	LabelComponent = "courier.misospace.dev/component"
 	LabelExecutor  = "courier.misospace.dev/executor"
@@ -180,6 +185,9 @@ func (b *PodBuilder) Build(run *courierv1alpha1.CoderRun, lane *courierv1alpha1.
 			RestartPolicy:                corev1.RestartPolicyNever,
 			SecurityContext: &corev1.PodSecurityContext{
 				RunAsNonRoot:   boolPtr(true),
+				RunAsUser:      int64Ptr(CoordinatorUID),
+				RunAsGroup:     int64Ptr(CoordinatorGID),
+				FSGroup:        int64Ptr(CoordinatorGID),
 				SeccompProfile: &corev1.SeccompProfile{Type: corev1.SeccompProfileTypeRuntimeDefault},
 			},
 			Volumes: []corev1.Volume{{
@@ -330,6 +338,8 @@ func labelValue(value string) string {
 func nonEmpty(value string) string { return strings.TrimSpace(value) }
 
 func boolPtr(value bool) *bool { return &value }
+
+func int64Ptr(value int64) *int64 { return &value }
 
 func stringPtr(value string) *string {
 	if value == "" {

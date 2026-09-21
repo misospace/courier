@@ -114,6 +114,8 @@ jobs:
           docker run --rm --entrypoint sh
           ${{ env.COORDINATOR_IMAGE }}:${{ steps.version.outputs.version }}
           -c 'test -x /usr/local/bin/courier-executor && opencode --help'
+      - name: Validate coordinator identity
+        run: test "$(docker inspect --format '{{.Config.User}}' ${{ env.COORDINATOR_IMAGE }}:${{ steps.version.outputs.version }})" = "65532:65532"
 
       - name: Set up Helm
         uses: azure/setup-helm@v5.0.1

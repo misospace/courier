@@ -105,6 +105,8 @@ jobs:
         run: >-
           docker run --rm --entrypoint sh courier-coordinator:ci
           -c 'test -x /usr/local/bin/courier-executor && opencode --help'
+      - name: Validate coordinator identity
+        run: test "$(docker inspect --format '{{.Config.User}}' courier-coordinator:ci)" = "65532:65532"
 
   vulnerability:
     runs-on: ubuntu-latest
