@@ -1,5 +1,10 @@
+# Base images are pinned tag@sha256 for reproducible builds. Renovate updates
+# these automatically; to bump by hand, resolve the tag's current digest
+# (`crane digest <image:tag>`, or the gcr.io web UI for distroless) and
+# replace the digest. Never retag to a different version.
+
 # Build the manager and executor binaries.
-FROM golang:1.26.6 AS builder
+FROM golang:1.26.6@sha256:0d1d3a794be25f809dd2cb3160d8c73276c4056a9f8242a138e908ddeee7b6b6 AS builder
 ARG TARGETOS
 ARG TARGETARCH
 
@@ -19,7 +24,7 @@ RUN CGO_ENABLED=0 GOOS=${TARGETOS:-linux} GOARCH=${TARGETARCH} \
 # Coordinator image: the bootstrap OpenCode runtime. The executor contract
 # (BOOTSTRAP.md) requires courier-executor, git, and opencode in one image.
 # Debian (not alpine) because the opencode npm package ships glibc binaries.
-FROM node:22-bookworm-slim AS coordinator
+FROM node:22-bookworm-slim@sha256:48e4b67d85f87bd551df43704e24d252f56cc5f8e9718841aace50f19948f0f9 AS coordinator
 ARG OPENCODE_VERSION=1.18.31
 
 RUN apt-get update && \
@@ -38,7 +43,7 @@ WORKDIR /workspace
 # Manager image: distroless, manager binary only. Kept last so a bare
 # `docker build .` produces the operator image; build paths still pass
 # --target explicitly.
-FROM gcr.io/distroless/static:nonroot AS manager
+FROM gcr.io/distroless/static:nonroot@sha256:e2e927ec666bae08560abb3c55d0659eceabb657f56b6782ab500a9fc7f555e3 AS manager
 WORKDIR /
 COPY --from=builder /workspace/manager .
 USER 65532:65532
