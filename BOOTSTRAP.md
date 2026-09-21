@@ -22,13 +22,15 @@ The image selected with `--executor-image` must contain:
 - any OpenCode configuration needed to reach the models named by a
   `LaneProfile`.
 
-The default image name is `ghcr.io/misospace/courier-opencode:latest`. Build it
-from this repository's `coordinator` Dockerfile target (Debian-based: the
-opencode npm package ships glibc binaries) and publish it, or point
-`--executor-image` at an equivalent image that satisfies the contract above:
+The published bootstrap image is
+`ghcr.io/misospace/courier-opencode:0.1.0`; replace `0.1.0` with the Courier
+release selected for the deployment. Build it from this repository's
+`coordinator` Dockerfile target (Debian-based: the opencode npm package ships
+glibc binaries) and publish it, or point `--executor-image` at an equivalent
+image that satisfies the contract above:
 
 ```sh
-make docker-build-coordinator EXECUTOR_IMG=ghcr.io/misospace/courier-opencode:latest
+make docker-build-coordinator EXECUTOR_IMG=ghcr.io/misospace/courier-opencode:0.1.0
 ```
 
 Create `courier-github` in the operator namespace with `username` and `token`

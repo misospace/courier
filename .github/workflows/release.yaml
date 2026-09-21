@@ -1,0 +1,134 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  REGISTRY: ghcr.io
+  MANAGER_IMAGE: ghcr.io/misospace/courier
+  COORDINATOR_IMAGE: ghcr.io/misospace/courier-opencode
+  CHART_REGISTRY: oci://ghcr.io/misospace/charts
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Parse release version
+        id: version
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          version="${TAG#v}"
+          if [[ "$TAG" != v* || ! "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "expected a v-prefixed semver tag, got $TAG"
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - name: Validate chart release coordinates
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          chart_version=$(awk '$1 == "version:" { print $2; exit }' charts/courier/Chart.yaml)
+          app_version=$(awk '$1 == "appVersion:" { print $2; exit }' charts/courier/Chart.yaml)
+          if [[ "$chart_version" != "$VERSION" || "$app_version" != "$VERSION" ]]; then
+            echo "Chart.yaml version=$chart_version appVersion=$app_version does not match tag=$VERSION"
+            exit 1
+          fi
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v4
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Manager metadata
+        id: manager-meta
+        uses: docker/metadata-action@v6
+        with:
+          images: ${{ env.MANAGER_IMAGE }}
+          tags: |
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+
+      - name: Coordinator metadata
+        id: coordinator-meta
+        uses: docker/metadata-action@v6
+        with:
+          images: ${{ env.COORDINATOR_IMAGE }}
+          tags: |
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+
+      - name: Build and push manager
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          target: manager
+          push: true
+          tags: ${{ steps.manager-meta.outputs.tags }}
+          labels: ${{ steps.manager-meta.outputs.labels }}
+          cache-from: type=gha,scope=manager
+          cache-to: type=gha,mode=max,scope=manager
+
+      - name: Build and push coordinator
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          target: coordinator
+          push: true
+          tags: ${{ steps.coordinator-meta.outputs.tags }}
+          labels: ${{ steps.coordinator-meta.outputs.labels }}
+          cache-from: type=gha,scope=coordinator
+          cache-to: type=gha,mode=max,scope=coordinator
+
+      - name: Pull published images for validation
+        run: |
+          docker pull ${{ env.MANAGER_IMAGE }}:${{ steps.version.outputs.version }}
+          docker pull ${{ env.COORDINATOR_IMAGE }}:${{ steps.version.outputs.version }}
+
+      - name: Validate manager image
+        run: docker run --rm ${{ env.MANAGER_IMAGE }}:${{ steps.version.outputs.version }} --help
+
+      - name: Validate coordinator image
+        run: >-
+          docker run --rm --entrypoint sh
+          ${{ env.COORDINATOR_IMAGE }}:${{ steps.version.outputs.version }}
+          -c 'test -x /usr/local/bin/courier-executor && opencode --help'
+
+      - name: Set up Helm
+        uses: azure/setup-helm@v4
+
+      - name: Build chart dependency
+        run: |
+          helm repo add bjw-s-labs https://bjw-s-labs.github.io/helm-charts
+          helm dependency build charts/courier
+
+      - name: Package chart
+        run: |
+          mkdir -p .release
+          helm package charts/courier --destination .release
+
+      - name: Log in to GHCR for Helm
+        run: echo '${{ secrets.GITHUB_TOKEN }}' | helm registry login ghcr.io --username '${{ github.actor }}' --password-stdin
+
+      - name: Push chart
+        run: helm push .release/courier-*.tgz "${CHART_REGISTRY}"

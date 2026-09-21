@@ -40,7 +40,8 @@ controllers:
           pullPolicy: IfNotPresent
         # -- Manager flags. Commonly overridden keys:
         #   --executor-image           coordinator image (courier-executor +
-        #                               git + opencode + model config)
+        #                               git + opencode + model config); defaults
+        #                               to the chart appVersion release tag
         #   --git-remote-template      forge remote URL template, one %s
         #                               placeholder filled with spec.repo
         #   --git-credential-secret    Secret with username/token keys for
