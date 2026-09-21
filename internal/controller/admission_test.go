@@ -205,9 +205,10 @@ type fakeStatusWriter struct {
 func (w fakeStatusWriter) PatchStatus(ctx context.Context, name types.NamespacedName, patch []byte) error {
 	var document struct {
 		Status struct {
-			Phase  courierv1alpha1.Phase `json:"phase,omitempty"`
-			Branch *string               `json:"branch,omitempty"`
-			PR     string                `json:"pr,omitempty"`
+			Phase            courierv1alpha1.Phase `json:"phase,omitempty"`
+			Branch           *string               `json:"branch,omitempty"`
+			PR               string                `json:"pr,omitempty"`
+			CheckFingerprint *string               `json:"checkFingerprint,omitempty"`
 		} `json:"status"`
 	}
 	if err := json.Unmarshal(patch, &document); err != nil {
@@ -225,6 +226,9 @@ func (w fakeStatusWriter) PatchStatus(ctx context.Context, name types.Namespaced
 	}
 	if document.Status.PR != "" {
 		run.Status.PR = document.Status.PR
+	}
+	if document.Status.CheckFingerprint != nil {
+		run.Status.CheckFingerprint = *document.Status.CheckFingerprint
 	}
 	return w.client.Status().Update(ctx, &run)
 }

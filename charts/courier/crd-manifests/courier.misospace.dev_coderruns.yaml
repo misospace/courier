@@ -126,6 +126,14 @@ spec:
                   Branch is the observed work branch. Resolve-issue runs derive it from the
                   repository and issue; fix-pr runs adopt the branch attached to the PR.
                 type: string
+              checkFingerprint:
+                description: |-
+                  CheckFingerprint is the operator's compact identity of the most recent
+                  CI check observation while Verifying: the head commit plus the sorted
+                  external check identifiers. A run leaves Verifying for AwaitingReview
+                  only when an all-green observation matches the previous observation's
+                  fingerprint, so a check set that is still registering cannot pass.
+                type: string
               checkpoint:
                 description: Checkpoint is the compact resumable state written by
                   the harness.

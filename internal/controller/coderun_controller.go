@@ -279,23 +279,29 @@ func (r *CoderRunReconciler) observeVerifying(ctx context.Context, run *courierv
 		return ctrl.Result{RequeueAfter: observationRequeueDelay}, nil
 	}
 	pr := observation.PR
-	switch observeState(observation) {
-	case observationPending:
-		before := run.DeepCopy()
-		if pr != "" {
-			run.Status.PR = pr
-		}
-		if run.Status.PR != before.Status.PR {
-			if err := r.patchStatus(ctx, before, run); err != nil {
-				return ctrl.Result{}, err
-			}
-		}
-		return ctrl.Result{RequeueAfter: observationRequeueDelay}, nil
-	case observationPassed:
-		return r.transitionTerminal(ctx, run, courierv1alpha1.PhaseAwaitingReview, pr)
-	default:
+	state := observeState(observation)
+	if state == observationNeedsHuman || state == observationFailed {
 		return r.transitionTerminal(ctx, run, courierv1alpha1.PhaseNeedsHuman, pr)
 	}
+	// status.checkFingerprint records the previous observation's check set, so
+	// green settles only onto a poll that saw the identical set. Checks still
+	// registering, a new push, or a new check each reshape the fingerprint and
+	// restart the settle. A real failure is recognized immediately and skips
+	// the settle; it needs no second observation.
+	fingerprint := checkSetFingerprint(observation)
+	settled := state == observationPassed && fingerprint != "" && fingerprint == run.Status.CheckFingerprint
+	before := run.DeepCopy()
+	if pr != "" {
+		run.Status.PR = pr
+	}
+	run.Status.CheckFingerprint = fingerprint
+	if err := r.patchStatus(ctx, before, run); err != nil {
+		return ctrl.Result{}, err
+	}
+	if settled {
+		return r.transitionTerminal(ctx, run, courierv1alpha1.PhaseAwaitingReview, pr)
+	}
+	return ctrl.Result{RequeueAfter: observationRequeueDelay}, nil
 }
 
 func (r *CoderRunReconciler) transitionTerminal(ctx context.Context, run *courierv1alpha1.CoderRun, phase courierv1alpha1.Phase, pr string) (ctrl.Result, error) {
@@ -345,6 +351,10 @@ func (r *CoderRunReconciler) patchStatus(ctx context.Context, before, after *cou
 	}
 	if before.Status.PR != after.Status.PR {
 		fields.PR = after.Status.PR
+	}
+	if before.Status.CheckFingerprint != after.Status.CheckFingerprint {
+		fingerprint := after.Status.CheckFingerprint
+		fields.CheckFingerprint = &fingerprint
 	}
 	if reflect.DeepEqual(fields, status.OperatorPatch{}) {
 		return nil
