@@ -3,6 +3,7 @@ package controller
 import (
 	"context"
 	"errors"
+	"fmt"
 	"reflect"
 	"strings"
 	"time"
@@ -417,7 +418,9 @@ func (r *CoderRunReconciler) transitionTerminal(ctx context.Context, run *courie
 		run.Status.PR = pr
 	}
 	if phaseChanged {
-		if err := reportLifecycle(ctx, adapter, item, lifecycleForPhase(phase, state, run.Status.PR)); err != nil {
+		lifecycle := lifecycleForPhase(phase, state, run.Status.PR)
+		lifecycle.IdempotencyKey = lifecycleIdempotencyKey(run, phase)
+		if err := reportLifecycle(ctx, adapter, item, lifecycle); err != nil {
 			return ctrl.Result{}, err
 		}
 	}
@@ -430,6 +433,18 @@ func (r *CoderRunReconciler) transitionTerminal(ctx context.Context, run *courie
 		r.emitPhaseTransition(run, phase, map[string]any{"branch": run.Status.Branch, "pr": run.Status.PR})
 	}
 	return ctrl.Result{}, nil
+}
+
+// lifecycleIdempotencyKey derives the publication identity from the run's
+// namespace, name, and the terminal phase. It is deterministic across
+// reconciles, so a retry after a failed status patch re-reports the same
+// lifecycle with the same key and a deduplicating source ignores it.
+func lifecycleIdempotencyKey(run *courierv1alpha1.CoderRun, phase courierv1alpha1.Phase) string {
+	key := fmt.Sprintf("coderun/%s/%s/%s", run.Namespace, run.Name, string(phase))
+	if run.UID != "" {
+		key = key + "/" + string(run.UID)
+	}
+	return key
 }
 
 func reportLifecycle(ctx context.Context, adapter source.Adapter, item source.WorkItem, lifecycle source.Lifecycle) error {

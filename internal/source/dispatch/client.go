@@ -40,7 +40,14 @@ type Task struct {
 	ShouldRun   bool         `json:"shouldRun"`
 	Issue       *Issue       `json:"issue,omitempty"`
 	PullRequest *PullRequest `json:"pullRequest,omitempty"`
+	PRFixItem   *PRFixItem   `json:"prFixItem,omitempty"`
 	Reasons     []string     `json:"reasons,omitempty"`
+}
+
+// PRFixItem identifies one generation of a queued PR followup.
+type PRFixItem struct {
+	ID         string `json:"id"`
+	Generation int    `json:"generation"`
 }
 
 // Issue identifies the issue associated with a Dispatch task.
@@ -86,6 +93,8 @@ type workDescriptor struct {
 	Repo        string `json:"repo,omitempty"`
 	Number      int    `json:"number,omitempty"`
 	PRURL       string `json:"prURL,omitempty"`
+	PRFixID     string `json:"prFixId,omitempty"`
+	Generation  int    `json:"generation,omitempty"`
 }
 
 // APIError reports a non-2xx Dispatch response.
@@ -187,8 +196,10 @@ func (c *HTTPClient) Discover(ctx context.Context) ([]source.WorkItem, error) {
 			return nil, err
 		}
 		if state.Merged || strings.EqualFold(state.State, "closed") {
-			if err := c.markPRFixStale(ctx, task.PullRequest, state); err != nil {
-				return nil, err
+			if task.PRFixItem != nil {
+				if err := c.markPRFixStale(ctx, task.PullRequest, state); err != nil {
+					return nil, err
+				}
 			}
 			return nil, nil
 		}
@@ -202,7 +213,7 @@ func (c *HTTPClient) Claim(ctx context.Context, id string) error {
 	if err != nil {
 		return err
 	}
-	if d.IssueID == "" {
+	if d.Type == "followup-pr" || d.IssueID == "" {
 		return nil
 	}
 	body := map[string]any{
@@ -219,7 +230,7 @@ func (c *HTTPClient) Release(ctx context.Context, id string) error {
 	if err != nil {
 		return err
 	}
-	if d.IssueID == "" {
+	if d.Type == "followup-pr" || d.IssueID == "" {
 		return nil
 	}
 	body := map[string]any{
@@ -235,6 +246,9 @@ func (c *HTTPClient) SetStatus(ctx context.Context, id, status string) error {
 	d, err := c.resolveIssue(ctx, id)
 	if err != nil {
 		return err
+	}
+	if d.Type == "followup-pr" {
+		return nil
 	}
 	if strings.TrimPrefix(status, "status/") == "needs-human" {
 		status = "blocked"
@@ -266,7 +280,7 @@ func (c *HTTPClient) checkPullRequestState(ctx context.Context, pullRequest *Pul
 }
 
 func (c *HTTPClient) markPRFixBlocked(ctx context.Context, d workDescriptor, note string) error {
-	if d.Type != "followup-pr" {
+	if d.Type != "followup-pr" || d.PRFixID == "" {
 		return nil
 	}
 	if strings.TrimSpace(note) == "" {
@@ -281,6 +295,9 @@ func (c *HTTPClient) markPRFixBlocked(ctx context.Context, d workDescriptor, not
 }
 
 func (c *HTTPClient) markPRFixStale(ctx context.Context, pullRequest *PullRequest, state PullRequestState) error {
+	if pullRequest == nil {
+		return errors.New("dispatch client: cannot mark missing pull request stale")
+	}
 	note := "upstream pull request is closed without merge"
 	if state.Merged {
 		note = "upstream pull request is merged"
@@ -293,11 +310,14 @@ func (c *HTTPClient) markPRFixStale(ctx context.Context, pullRequest *PullReques
 	}, nil)
 }
 
-func (c *HTTPClient) reportTaskWithPR(ctx context.Context, d workDescriptor, outcome, failure, observedPR string) error {
+func (c *HTTPClient) reportTaskWithPR(ctx context.Context, d workDescriptor, outcome, failure, observedPR, idempotencyKey string) error {
 	body := map[string]any{
 		"taskType":     d.Type,
 		"outcome":      outcome,
 		"repoFullName": d.Repo,
+	}
+	if idempotencyKey != "" {
+		body["idempotencyKey"] = idempotencyKey
 	}
 	if d.Type == "followup-pr" {
 		body["pullRequestNumber"] = d.Number
@@ -360,8 +380,10 @@ func (c *HTTPClient) PreLaunch(ctx context.Context, id string) error {
 		return err
 	}
 	if state.Merged || strings.EqualFold(state.State, "closed") {
-		if err := c.markPRFixStale(ctx, pullRequest, state); err != nil {
-			return err
+		if d.PRFixID != "" {
+			if err := c.markPRFixStale(ctx, pullRequest, state); err != nil {
+				return err
+			}
 		}
 		return fmt.Errorf("%w: upstream pull request %s#%d is no longer open", source.ErrStaleWork, d.Repo, d.Number)
 	}
@@ -379,12 +401,12 @@ func (c *HTTPClient) Report(ctx context.Context, id string, lifecycle source.Lif
 		if d.Type == "implement" {
 			outcome = "pr_opened"
 		}
-		return c.reportTaskWithPR(ctx, d, outcome, "", lifecycle.PR)
+		return c.reportTaskWithPR(ctx, d, outcome, "", lifecycle.PR, lifecycle.IdempotencyKey)
 	case source.ResultBlocked:
-		reportErr := c.reportTaskWithPR(ctx, d, "blocked", lifecycle.Error, lifecycle.PR)
+		reportErr := c.reportTaskWithPR(ctx, d, "blocked", lifecycle.Error, lifecycle.PR, lifecycle.IdempotencyKey)
 		return errors.Join(reportErr, c.markPRFixBlocked(ctx, d, lifecycle.Error))
 	case source.ResultFailed:
-		reportErr := c.reportTaskWithPR(ctx, d, "failed", lifecycle.Error, lifecycle.PR)
+		reportErr := c.reportTaskWithPR(ctx, d, "failed", lifecycle.Error, lifecycle.PR, lifecycle.IdempotencyKey)
 		return errors.Join(reportErr, c.markPRFixBlocked(ctx, d, lifecycle.Error))
 	default:
 		return nil
@@ -392,8 +414,12 @@ func (c *HTTPClient) Report(ctx context.Context, id string, lifecycle source.Lif
 }
 
 func (c *HTTPClient) Resolve(ctx context.Context, id string) error {
-	if _, err := decodeWorkID(id); err != nil {
+	d, err := decodeWorkID(id)
+	if err != nil {
 		return err
+	}
+	if d.Type == "followup-pr" {
+		return nil
 	}
 	return c.SetStatus(ctx, id, "done")
 }
@@ -401,8 +427,14 @@ func (c *HTTPClient) Resolve(ctx context.Context, id string) error {
 // EncodeWorkID creates the opaque source ID carried by a CoderRun.
 func EncodeWorkID(task Task) string {
 	d := workDescriptor{Type: task.Type}
+	if task.Type == "followup-pr" && task.PRFixItem != nil {
+		d.PRFixID = strings.TrimSpace(task.PRFixItem.ID)
+		d.Generation = task.PRFixItem.Generation
+	}
 	if task.Issue != nil {
-		d.IssueID = strings.TrimSpace(task.Issue.ID)
+		if task.Type == "implement" {
+			d.IssueID = strings.TrimSpace(task.Issue.ID)
+		}
 		d.IssueRepo = task.Issue.Repo
 		d.IssueNumber = task.Issue.Number
 		d.Repo = task.Issue.Repo
@@ -426,7 +458,7 @@ func (c *HTTPClient) resolveIssue(ctx context.Context, id string) (workDescripto
 	if err != nil {
 		return workDescriptor{}, err
 	}
-	if d.IssueRepo == "" || d.IssueNumber <= 0 || (d.Type == "followup-pr" && d.IssueID != "") {
+	if d.Type == "followup-pr" || d.IssueRepo == "" || d.IssueNumber <= 0 {
 		return d, nil
 	}
 	path := "/api/issues/state?repo=" + url.QueryEscape(d.IssueRepo) + "&number=" + strconv.Itoa(d.IssueNumber)
@@ -451,6 +483,9 @@ func decodeWorkID(id string) (workDescriptor, error) {
 		return workDescriptor{}, ErrUnknownWorkID
 	}
 	if d.IssueID != "" && (d.IssueRepo == "" || d.IssueNumber <= 0) {
+		return workDescriptor{}, ErrUnknownWorkID
+	}
+	if (d.PRFixID == "") != (d.Generation == 0) {
 		return workDescriptor{}, ErrUnknownWorkID
 	}
 	return d, nil
@@ -525,6 +560,9 @@ func taskWorkItem(task Task) (string, error) {
 	}
 	if task.Type == "followup-pr" && task.Issue != nil && (task.Issue.Repo == "" || task.Issue.Number <= 0) {
 		return "", errors.New("dispatch client: followup task has invalid issue")
+	}
+	if task.Type == "followup-pr" && task.PRFixItem != nil && (strings.TrimSpace(task.PRFixItem.ID) == "" || task.PRFixItem.Generation < 1) {
+		return "", errors.New("dispatch client: followup task has invalid PR-fix item")
 	}
 	return EncodeWorkID(task), nil
 }

@@ -85,6 +85,9 @@ type Lifecycle struct {
 	Result Result
 	PR     string
 	Error  string
+	// IdempotencyKey identifies the publication so a source can deduplicate a
+	// retry of the same report. Empty means the source has no deduplication.
+	IdempotencyKey string
 }
 
 // Reporter optionally publishes lifecycle results in addition to ordinary

@@ -50,6 +50,35 @@ func TestRunnerPollMaterializesAndDeduplicatesByOpaqueID(t *testing.T) {
 	}
 }
 
+func TestRunnerCreatesFreshRunWhenWorkItemGenerationChanges(t *testing.T) {
+	adapter := &testAdapter{items: []WorkItem{{ID: "pr-fix/queue-item/generation-1", Mode: "fix-pr", Repo: "acme/widgets", Ref: 42}}}
+	kubeClient := fake.NewClientBuilder().WithScheme(testScheme()).Build()
+	runner := NewRunner(kubeClient, adapter, RunnerConfig{Source: "dispatch", LaneProfile: "local", Namespace: "courier"})
+
+	if err := runner.Poll(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	adapter.items[0].ID = "pr-fix/queue-item/generation-2"
+	if err := runner.Poll(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	var runs courierv1alpha1.CoderRunList
+	if err := kubeClient.List(context.Background(), &runs, client.InNamespace("courier")); err != nil {
+		t.Fatal(err)
+	}
+	if len(runs.Items) != 2 {
+		t.Fatalf("created %d runs, want one run per generation", len(runs.Items))
+	}
+	seen := map[string]bool{}
+	for _, run := range runs.Items {
+		seen[run.Spec.WorkItemID] = true
+	}
+	if !seen["pr-fix/queue-item/generation-1"] || !seen["pr-fix/queue-item/generation-2"] {
+		t.Fatalf("runs have work item IDs %#v", seen)
+	}
+}
+
 func TestRunnerDoesNotClaimDuringDiscovery(t *testing.T) {
 	adapter := &testAdapter{items: []WorkItem{{ID: "opaque-a", Mode: "resolve-issue", Repo: "acme/widgets", Ref: 1}}}
 	kubeClient := fake.NewClientBuilder().WithScheme(testScheme()).Build()

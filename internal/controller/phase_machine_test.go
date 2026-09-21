@@ -9,6 +9,7 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
@@ -25,6 +26,22 @@ type admissionSource struct {
 	resolved     []string
 	preLaunchErr error
 	preLaunches  []string
+}
+
+// failingStatusWriter fails its first patches, then forwards to the fake
+// status writer.
+type failingStatusWriter struct {
+	fakeStatusWriter
+	failures int
+	calls    int
+}
+
+func (w *failingStatusWriter) PatchStatus(ctx context.Context, name types.NamespacedName, patch []byte) error {
+	w.calls++
+	if w.calls <= w.failures {
+		return errors.New("status patch failed")
+	}
+	return w.fakeStatusWriter.PatchStatus(ctx, name, patch)
 }
 
 type fakeWorldObserver struct {
@@ -709,15 +726,15 @@ func TestTerminalLifecycleReportsToSource(t *testing.T) {
 	}{
 		{
 			name:        "awaiting review",
-			observation: PRObservation{PR: "42", Checks: []CheckObservation{{State: CheckStatePassed}}},
+			observation: PRObservation{PR: "42", Head: "sha-1", Checks: []CheckObservation{{Name: "check", State: CheckStatePassed}}},
 			wantPhase:   courierv1alpha1.PhaseAwaitingReview,
-			wantReport:  source.Lifecycle{State: source.StateInReview, Result: source.ResultReady, PR: "42"},
+			wantReport:  source.Lifecycle{State: source.StateInReview, Result: source.ResultReady, PR: "42", IdempotencyKey: "coderun/default/run/AwaitingReview"},
 		},
 		{
 			name:        "needs human",
 			observation: PRObservation{PR: "42", Checks: []CheckObservation{{State: CheckStateFailed}}},
 			wantPhase:   courierv1alpha1.PhaseNeedsHuman,
-			wantReport:  source.Lifecycle{State: source.StateNeedsHuman, Result: source.ResultBlocked, PR: "42", Error: "run requires human intervention"},
+			wantReport:  source.Lifecycle{State: source.StateNeedsHuman, Result: source.ResultBlocked, PR: "42", Error: "run requires human intervention", IdempotencyKey: "coderun/default/run/NeedsHuman"},
 		},
 	}
 	for _, tt := range tests {
@@ -732,8 +749,10 @@ func TestTerminalLifecycleReportsToSource(t *testing.T) {
 				StatusWriter: fakeStatusWriter{client: client},
 				Observer:     fakeWorldObserver{observation: tt.observation},
 			}
-			if _, err := reconciler.Reconcile(context.Background(), admissionRequest("run")); err != nil {
-				t.Fatalf("Reconcile() error = %v", err)
+			for attempt := 0; attempt < 2; attempt++ {
+				if _, err := reconciler.Reconcile(context.Background(), admissionRequest("run")); err != nil {
+					t.Fatalf("Reconcile() %d error = %v", attempt+1, err)
+				}
 			}
 			if len(item.reports) != 1 || item.reports[0] != tt.wantReport {
 				t.Fatalf("reports = %#v, want %#v", item.reports, []source.Lifecycle{tt.wantReport})
@@ -746,6 +765,47 @@ func TestTerminalLifecycleReportsToSource(t *testing.T) {
 				t.Fatalf("status = phase %q PR %q, want %q 42", updated.Status.Phase, updated.Status.PR, tt.wantPhase)
 			}
 		})
+	}
+}
+
+// TestTerminalLifecycleReportRetryReusesIdempotencyKey checks the retry-safe
+// ordering: the lifecycle report precedes the status patch, so a failed patch
+// leaves the phase unchanged and the next reconcile re-reports the same
+// lifecycle carrying the same idempotency key for the source to deduplicate.
+func TestTerminalLifecycleReportRetryReusesIdempotencyKey(t *testing.T) {
+	item := &admissionSource{}
+	run := admissionRun("run", "local", courierv1alpha1.PhaseVerifying)
+	run.Status.Branch = "courier/acme/widgets/issue-1"
+	client := phaseClient(t, run)
+	writer := &failingStatusWriter{fakeStatusWriter: fakeStatusWriter{client: client}, failures: 1}
+	reconciler := &CoderRunReconciler{
+		Client:       client,
+		Sources:      NewSourceRegistry(map[string]source.Adapter{"test": item}),
+		StatusWriter: writer,
+		Observer:     fakeWorldObserver{observation: PRObservation{PR: "42", Checks: []CheckObservation{{State: CheckStateFailed}}}},
+	}
+	if _, err := reconciler.Reconcile(context.Background(), admissionRequest("run")); err == nil {
+		t.Fatal("first Reconcile() error = nil, want status patch failure")
+	}
+	if _, err := reconciler.Reconcile(context.Background(), admissionRequest("run")); err != nil {
+		t.Fatalf("second Reconcile() error = %v", err)
+	}
+	if len(item.reports) != 2 {
+		t.Fatalf("reports = %#v, want one per attempt", item.reports)
+	}
+	want := lifecycleIdempotencyKey(run, courierv1alpha1.PhaseNeedsHuman)
+	if item.reports[0].IdempotencyKey != want {
+		t.Fatalf("first report key = %q, want %q", item.reports[0].IdempotencyKey, want)
+	}
+	if item.reports[1].IdempotencyKey != item.reports[0].IdempotencyKey {
+		t.Fatalf("retry report key = %q, want %q", item.reports[1].IdempotencyKey, item.reports[0].IdempotencyKey)
+	}
+	var updated courierv1alpha1.CoderRun
+	if err := client.Get(context.Background(), admissionKey("run"), &updated); err != nil {
+		t.Fatalf("get run: %v", err)
+	}
+	if updated.Status.Phase != courierv1alpha1.PhaseNeedsHuman {
+		t.Fatalf("phase = %q, want NeedsHuman", updated.Status.Phase)
 	}
 }
 

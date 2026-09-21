@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -54,6 +55,7 @@ func TestHTTPClientDiscoverMapsFollowupPR(t *testing.T) {
 			ShouldRun:   true,
 			Issue:       &Issue{ID: "issue-id", Repo: "acme/widgets", Number: 41},
 			PullRequest: &PullRequest{Repo: "acme/widgets", Number: 42, URL: "https://github.com/acme/widgets/pull/42"},
+			PRFixItem:   &PRFixItem{ID: "queue-item", Generation: 1},
 		})
 	}))
 	defer server.Close()
@@ -76,8 +78,40 @@ func TestHTTPClientDiscoverMapsFollowupPR(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if descriptor.IssueID != "issue-id" || descriptor.IssueNumber != 41 || descriptor.Number != 42 {
+	if descriptor.IssueID != "" || descriptor.IssueNumber != 41 || descriptor.Number != 42 || descriptor.PRFixID != "queue-item" || descriptor.Generation != 1 {
 		t.Fatalf("descriptor = %#v", descriptor)
+	}
+}
+
+func TestHTTPClientPRFixGenerationChangesWorkID(t *testing.T) {
+	base := Task{Type: "followup-pr", PullRequest: &PullRequest{Repo: "acme/widgets", Number: 42}, PRFixItem: &PRFixItem{ID: "queue-item", Generation: 1}}
+	if got, want := EncodeWorkID(base), EncodeWorkID(base); got != want {
+		t.Fatalf("same PR-fix item IDs differ: %q != %q", got, want)
+	}
+	changed := base
+	changed.PRFixItem = &PRFixItem{ID: "queue-item", Generation: 2}
+	if got, want := EncodeWorkID(base), EncodeWorkID(changed); got == want {
+		t.Fatalf("generation change did not change work ID: %q", got)
+	}
+}
+
+func TestHTTPClientLinkedFollowupFallbackIDIgnoresIssueIdentity(t *testing.T) {
+	base := Task{
+		Type:        "followup-pr",
+		Issue:       &Issue{ID: "issue-id-1", Repo: "acme/widgets", Number: 41},
+		PullRequest: &PullRequest{Repo: "acme/widgets", Number: 42},
+	}
+	changedIssue := base
+	changedIssue.Issue = &Issue{ID: "issue-id-2", Repo: "acme/widgets", Number: 41}
+	if got, want := EncodeWorkID(base), EncodeWorkID(changedIssue); got != want {
+		t.Fatalf("linked followup fallback IDs differ: %q != %q", got, want)
+	}
+	descriptor, err := decodeWorkID(EncodeWorkID(base))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if descriptor.IssueID != "" || descriptor.PRFixID != "" || descriptor.Generation != 0 {
+		t.Fatalf("fallback descriptor carries mutation identity: %#v", descriptor)
 	}
 }
 
@@ -98,7 +132,7 @@ func TestHTTPClientPreLaunchAllowsOpenFollowup(t *testing.T) {
 	client.WithPullRequestStateChecker(PullRequestStateCheckerFunc(func(context.Context, string, int) (PullRequestState, error) {
 		return PullRequestState{State: "open"}, nil
 	}))
-	id := EncodeWorkID(Task{Type: "followup-pr", PullRequest: &PullRequest{Repo: "acme/widgets", Number: 42}})
+	id := EncodeWorkID(Task{Type: "followup-pr", PullRequest: &PullRequest{Repo: "acme/widgets", Number: 42}, PRFixItem: &PRFixItem{ID: "queue-item", Generation: 1}})
 	if err := client.PreLaunch(context.Background(), id); err != nil {
 		t.Fatalf("PreLaunch() error = %v", err)
 	}
@@ -128,7 +162,7 @@ func TestHTTPClientPreLaunchRejectsClosedFollowup(t *testing.T) {
 	client.WithPullRequestStateChecker(PullRequestStateCheckerFunc(func(context.Context, string, int) (PullRequestState, error) {
 		return PullRequestState{State: "closed"}, nil
 	}))
-	id := EncodeWorkID(Task{Type: "followup-pr", PullRequest: &PullRequest{Repo: "acme/widgets", Number: 42}})
+	id := EncodeWorkID(Task{Type: "followup-pr", PullRequest: &PullRequest{Repo: "acme/widgets", Number: 42}, PRFixItem: &PRFixItem{ID: "queue-item", Generation: 1}})
 	if err := client.PreLaunch(context.Background(), id); !errors.Is(err, source.ErrStaleWork) {
 		t.Fatalf("PreLaunch() error = %v, want ErrStaleWork", err)
 	}
@@ -158,7 +192,7 @@ func TestHTTPClientPreLaunchRejectsMergedFollowup(t *testing.T) {
 	client.WithPullRequestStateChecker(PullRequestStateCheckerFunc(func(context.Context, string, int) (PullRequestState, error) {
 		return PullRequestState{State: "closed", Merged: true}, nil
 	}))
-	id := EncodeWorkID(Task{Type: "followup-pr", PullRequest: &PullRequest{Repo: "acme/widgets", Number: 42}})
+	id := EncodeWorkID(Task{Type: "followup-pr", PullRequest: &PullRequest{Repo: "acme/widgets", Number: 42}, PRFixItem: &PRFixItem{ID: "queue-item", Generation: 1}})
 	if err := client.PreLaunch(context.Background(), id); !errors.Is(err, source.ErrStaleWork) {
 		t.Fatalf("PreLaunch() error = %v, want ErrStaleWork", err)
 	}
@@ -172,7 +206,7 @@ func TestHTTPClientDiscoverMarksClosedUnmergedFollowupStale(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
 		case "/api/agents/worker/next-task":
-			_ = json.NewEncoder(w).Encode(Task{Type: "followup-pr", ShouldRun: true, PullRequest: &PullRequest{Repo: "acme/widgets", Number: 42}})
+			_ = json.NewEncoder(w).Encode(Task{Type: "followup-pr", ShouldRun: true, PullRequest: &PullRequest{Repo: "acme/widgets", Number: 42}, PRFixItem: &PRFixItem{ID: "queue-item", Generation: 1}})
 		case "/api/pr-fix-queue/mark":
 			body, _ := io.ReadAll(r.Body)
 			if err := json.Unmarshal(body, &request); err != nil {
@@ -206,7 +240,7 @@ func TestHTTPClientDiscoverMarksMergedFollowupStale(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
 		case "/api/agents/worker/next-task":
-			_ = json.NewEncoder(w).Encode(Task{Type: "followup-pr", ShouldRun: true, PullRequest: &PullRequest{Repo: "acme/widgets", Number: 42}})
+			_ = json.NewEncoder(w).Encode(Task{Type: "followup-pr", ShouldRun: true, PullRequest: &PullRequest{Repo: "acme/widgets", Number: 42}, PRFixItem: &PRFixItem{ID: "queue-item", Generation: 1}})
 		case "/api/pr-fix-queue/mark":
 			body, _ := io.ReadAll(r.Body)
 			if err := json.Unmarshal(body, &request); err != nil {
@@ -240,7 +274,7 @@ func TestHTTPClientDiscoverMarksMergedFollowupStale(t *testing.T) {
 
 func TestHTTPClientDiscoverRejectsFollowupWithoutStateChecker(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		_ = json.NewEncoder(w).Encode(Task{Type: "followup-pr", ShouldRun: true, PullRequest: &PullRequest{Repo: "acme/widgets", Number: 42}})
+		_ = json.NewEncoder(w).Encode(Task{Type: "followup-pr", ShouldRun: true, PullRequest: &PullRequest{Repo: "acme/widgets", Number: 42}, PRFixItem: &PRFixItem{ID: "queue-item", Generation: 1}})
 	}))
 	defer server.Close()
 
@@ -337,72 +371,13 @@ func TestHTTPClientImplementNeedsHumanUsesBlockedStatus(t *testing.T) {
 	}
 }
 
-func TestHTTPClientFollowupClaimResolvesIssueIDWhenMissing(t *testing.T) {
-	var request map[string]any
+func TestHTTPClientLinkedFollowupLifecycleDoesNotCallIssueEndpoints(t *testing.T) {
+	var paths []string
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path == "/api/issues/state" {
-			_ = json.NewEncoder(w).Encode(issueState{IssueID: "opaque-issue"})
-			return
+		paths = append(paths, r.URL.Path)
+		if strings.HasPrefix(r.URL.Path, "/api/issues/") {
+			t.Fatalf("linked followup called issue endpoint %q", r.URL.Path)
 		}
-		if r.URL.Path != "/api/issues/claim" {
-			t.Fatalf("path = %q", r.URL.Path)
-		}
-		body, _ := io.ReadAll(r.Body)
-		if err := json.Unmarshal(body, &request); err != nil {
-			t.Fatal(err)
-		}
-		w.WriteHeader(http.StatusNoContent)
-	}))
-	defer server.Close()
-
-	client, err := NewClientWithLane(server.URL, "worker", "normal", "secret-token", time.Second)
-	if err != nil {
-		t.Fatal(err)
-	}
-	id := EncodeWorkID(Task{Type: "followup-pr", Issue: &Issue{Repo: "acme/widgets", Number: 41}, PullRequest: &PullRequest{Repo: "acme/widgets", Number: 42}})
-	if err := client.Claim(context.Background(), id); err != nil {
-		t.Fatal(err)
-	}
-	if request["issueId"] != "opaque-issue" {
-		t.Fatalf("request = %#v", request)
-	}
-}
-
-func TestHTTPClientFollowupStatusUsesIssueStatusEndpointWhenIssueIsKnown(t *testing.T) {
-	var requests []map[string]any
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		body, _ := io.ReadAll(r.Body)
-		var request map[string]any
-		if err := json.Unmarshal(body, &request); err != nil {
-			t.Fatal(err)
-		}
-		requests = append(requests, request)
-		w.WriteHeader(http.StatusNoContent)
-	}))
-	defer server.Close()
-
-	client, err := NewClientWithLane(server.URL, "worker", "normal", "secret-token", time.Second)
-	if err != nil {
-		t.Fatal(err)
-	}
-	id := EncodeWorkID(Task{Type: "followup-pr", Issue: &Issue{ID: "issue-id", Repo: "acme/widgets", Number: 41}, PullRequest: &PullRequest{Repo: "acme/widgets", Number: 42, URL: "https://github.com/acme/widgets/pull/42"}})
-	if err := client.SetStatus(context.Background(), id, "needs-human"); err != nil {
-		t.Fatal(err)
-	}
-	if len(requests) != 1 || requests[0]["status"] != "blocked" || requests[0]["issueId"] != "issue-id" {
-		t.Fatalf("requests = %#v", requests)
-	}
-}
-
-func TestHTTPClientResolveFollowupMarksDoneWithoutReporting(t *testing.T) {
-	var requests []map[string]any
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		body, _ := io.ReadAll(r.Body)
-		var request map[string]any
-		if err := json.Unmarshal(body, &request); err != nil {
-			t.Fatal(err)
-		}
-		requests = append(requests, request)
 		w.WriteHeader(http.StatusNoContent)
 	}))
 	defer server.Close()
@@ -416,11 +391,21 @@ func TestHTTPClientResolveFollowupMarksDoneWithoutReporting(t *testing.T) {
 		Issue:       &Issue{ID: "opaque-issue", Repo: "acme/widgets", Number: 41},
 		PullRequest: &PullRequest{Repo: "acme/widgets", Number: 42, URL: "https://github.com/acme/widgets/pull/42"},
 	})
-	if err := client.Resolve(context.Background(), id); err != nil {
+	ctx := context.Background()
+	if err := client.Claim(ctx, id); err != nil {
 		t.Fatal(err)
 	}
-	if len(requests) != 1 || requests[0]["status"] != "done" {
-		t.Fatalf("requests = %#v", requests)
+	if err := client.Release(ctx, id); err != nil {
+		t.Fatal(err)
+	}
+	if err := client.SetStatus(ctx, id, "needs-human"); err != nil {
+		t.Fatal(err)
+	}
+	if err := client.Resolve(ctx, id); err != nil {
+		t.Fatal(err)
+	}
+	if len(paths) != 0 {
+		t.Fatalf("linked followup made unexpected requests: %#v", paths)
 	}
 }
 
@@ -450,6 +435,80 @@ func TestHTTPClientReportMapsObservedPR(t *testing.T) {
 	}
 }
 
+func TestHTTPClientReportCarriesIdempotencyKey(t *testing.T) {
+	var request map[string]any
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/prefix/api/agents/worker/tasks/report" {
+			t.Fatalf("path = %q", r.URL.Path)
+		}
+		body, _ := io.ReadAll(r.Body)
+		if err := json.Unmarshal(body, &request); err != nil {
+			t.Fatal(err)
+		}
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer server.Close()
+	client, err := NewClientWithLane(server.URL+"/prefix/", "worker", "normal", "secret-token", time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	id := EncodeWorkID(Task{Type: "implement", Issue: &Issue{Repo: "acme/widgets", Number: 42}})
+	key := "coderun/default/run-1/needs-human"
+	if err := client.Report(context.Background(), id, source.Lifecycle{State: source.StateInReview, Result: source.ResultReady, PR: "https://github.com/acme/widgets/pull/77", IdempotencyKey: key}); err != nil {
+		t.Fatal(err)
+	}
+	if request["idempotencyKey"] != key {
+		t.Fatalf("request = %#v", request)
+	}
+}
+
+func TestHTTPClientReportOmitsEmptyIdempotencyKey(t *testing.T) {
+	var request map[string]any
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		if err := json.Unmarshal(body, &request); err != nil {
+			t.Fatal(err)
+		}
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer server.Close()
+	client, err := NewClientWithLane(server.URL, "worker", "normal", "secret-token", time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	id := EncodeWorkID(Task{Type: "implement", Issue: &Issue{Repo: "acme/widgets", Number: 42}})
+	if err := client.Report(context.Background(), id, source.Lifecycle{State: source.StateInReview, Result: source.ResultReady}); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := request["idempotencyKey"]; ok {
+		t.Fatalf("request unexpectedly included idempotencyKey: %#v", request)
+	}
+}
+
+func TestHTTPClientReportUsesTaskReportAndPRFixQueueOnlyForFollowups(t *testing.T) {
+	var requests []string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests = append(requests, r.URL.Path)
+		if r.URL.Path == "/api/issues/state" || strings.HasPrefix(r.URL.Path, "/api/issues/") {
+			t.Fatalf("followup report called issue endpoint %q", r.URL.Path)
+		}
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer server.Close()
+	client, err := NewClientWithLane(server.URL, "worker", "normal", "secret-token", time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	id := EncodeWorkID(Task{Type: "followup-pr", Issue: &Issue{ID: "issue-id", Repo: "acme/widgets", Number: 41}, PullRequest: &PullRequest{Repo: "acme/widgets", Number: 77}, PRFixItem: &PRFixItem{ID: "queue-item", Generation: 1}})
+	if err := client.Report(context.Background(), id, source.Lifecycle{Result: source.ResultBlocked, Error: "blocked"}); err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"/api/agents/worker/tasks/report", "/api/pr-fix-queue/mark"}
+	if !reflect.DeepEqual(requests, want) {
+		t.Fatalf("request paths = %#v, want %#v", requests, want)
+	}
+}
+
 func TestHTTPClientReportMapsBlockedAndFailed(t *testing.T) {
 	var requests []map[string]any
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -473,7 +532,7 @@ func TestHTTPClientReportMapsBlockedAndFailed(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	id := EncodeWorkID(Task{Type: "followup-pr", PullRequest: &PullRequest{Repo: "acme/widgets", Number: 77, URL: "https://github.com/acme/widgets/pull/77"}})
+	id := EncodeWorkID(Task{Type: "followup-pr", PullRequest: &PullRequest{Repo: "acme/widgets", Number: 77, URL: "https://github.com/acme/widgets/pull/77"}, PRFixItem: &PRFixItem{ID: "queue-item", Generation: 1}})
 	if err := client.Report(context.Background(), id, source.Lifecycle{State: source.StateNeedsHuman, Result: source.ResultBlocked, Error: "blocked"}); err != nil {
 		t.Fatal(err)
 	}

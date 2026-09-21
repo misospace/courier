@@ -21,6 +21,8 @@ executor:
     metricsURL: ""
 
 dispatch:
+  # Dispatch is optional. queueLane selects work in Dispatch; laneProfile is
+  # the Courier LaneProfile assigned to materialized CoderRuns.
   enabled: false
   baseURL: ""
   agentName: ""
