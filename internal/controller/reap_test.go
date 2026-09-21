@@ -77,24 +77,43 @@ func TestReapFreshDoneStartsRetention(t *testing.T) {
 	}
 }
 
-func TestReapDoneBeforeRetentionWaitsRemaining(t *testing.T) {
+func TestReapValidMarkerSkipsResolveBeforeRetention(t *testing.T) {
 	src := &admissionSource{}
-	c := phaseClient(t, withDoneAt(reapRun("young"), reapClock.Add(-3*time.Minute)))
+	c := phaseClient(t, withDoneAt(reapRun("waiting"), reapClock.Add(-3*time.Minute)))
 	reconciler := reapReconciler(c, src, reapClock)
 
-	result, err := reconciler.Reconcile(context.Background(), admissionRequest("young"))
+	result, err := reconciler.Reconcile(context.Background(), admissionRequest("waiting"))
 	if err != nil {
 		t.Fatalf("Reconcile() error = %v", err)
 	}
 	if result.RequeueAfter != 7*time.Minute {
 		t.Fatalf("RequeueAfter = %v, want the remaining 7m of the window", result.RequeueAfter)
 	}
-	if err := c.Get(context.Background(), admissionKey("young"), &courierv1alpha1.CoderRun{}); err != nil {
+	if len(src.resolved) != 0 {
+		t.Fatalf("resolved IDs = %#v, want none; a valid marker already proves the source resolved", src.resolved)
+	}
+	if err := c.Get(context.Background(), admissionKey("waiting"), &courierv1alpha1.CoderRun{}); err != nil {
 		t.Fatalf("get run: %v; a young Done run must not be deleted", err)
 	}
 }
 
-func TestReapDoneAfterRetentionDeletes(t *testing.T) {
+func TestReapRestartSkipsResolveOnPersistedMarker(t *testing.T) {
+	src := &admissionSource{}
+	c := phaseClient(t, withDoneAt(reapRun("carried"), reapClock.Add(-3*time.Minute)))
+	// A brand-new reconciler instance shares nothing with any predecessor
+	// except the API server: the persisted marker alone must stand in for the
+	// source resolve.
+	reconciler := reapReconciler(c, src, reapClock.Add(2*time.Minute))
+
+	if _, err := reconciler.Reconcile(context.Background(), admissionRequest("carried")); err != nil {
+		t.Fatalf("Reconcile() error = %v", err)
+	}
+	if len(src.resolved) != 0 {
+		t.Fatalf("resolved IDs = %#v, want none after restart on a persisted marker", src.resolved)
+	}
+}
+
+func TestReapDeleteSkipsResolve(t *testing.T) {
 	src := &admissionSource{}
 	c := phaseClient(t, withDoneAt(reapRun("spent"), reapClock.Add(-11*time.Minute)))
 	reconciler := reapReconciler(c, src, reapClock)
@@ -105,6 +124,9 @@ func TestReapDoneAfterRetentionDeletes(t *testing.T) {
 	err := c.Get(context.Background(), admissionKey("spent"), &courierv1alpha1.CoderRun{})
 	if !apierrors.IsNotFound(err) {
 		t.Fatalf("get spent run = %v, want NotFound after deletion", err)
+	}
+	if len(src.resolved) != 0 {
+		t.Fatalf("resolved IDs = %#v, want none; deletion must not re-resolve the source", src.resolved)
 	}
 	// Reconciling a deleted run is success, so a duplicate wake cannot error.
 	if _, err := reconciler.Reconcile(context.Background(), admissionRequest("spent")); err != nil {
@@ -212,6 +234,9 @@ func TestReapMalformedMarkerRestartsWindow(t *testing.T) {
 	var stored courierv1alpha1.CoderRun
 	if err := c.Get(context.Background(), admissionKey("corrupt"), &stored); err != nil {
 		t.Fatalf("get run: %v; a malformed marker must fail safe, not delete", err)
+	}
+	if len(src.resolved) != 1 {
+		t.Fatalf("resolved IDs = %#v, want one; a malformed marker proves nothing and must re-resolve", src.resolved)
 	}
 	if got := stored.Annotations[doneAtAnnotation]; got != reapClock.UTC().Format(time.RFC3339) {
 		t.Fatalf("done-at = %q, want the malformed value reset to %q", got, reapClock.UTC().Format(time.RFC3339))

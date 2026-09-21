@@ -273,16 +273,21 @@ func (r *CoderRunReconciler) releaseClaim(ctx context.Context, run *courierv1alp
 }
 
 // resolveCompleted closes the source work for a Done run and then applies the
-// reap policy. The source lifecycle must succeed before the retention clock
-// starts or deletion happens: a run whose source could not be resolved is
+// reap policy. A valid done-at marker proves Resolve succeeded on an earlier
+// reconcile — Courier writes the marker only afterwards — so a run inside its
+// retention window never mutates the source again. A missing or malformed
+// marker proves nothing: the source resolve must then succeed before the
+// retention clock starts, because a run whose source could not be resolved is
 // never reaped.
 func (r *CoderRunReconciler) resolveCompleted(ctx context.Context, run *courierv1alpha1.CoderRun) (ctrl.Result, error) {
-	adapter, item, err := r.adapterAndWorkItem(run)
-	if err != nil {
-		return ctrl.Result{}, err
-	}
-	if err := adapter.Resolve(ctx, item); err != nil {
-		return ctrl.Result{}, err
+	if _, ok := doneAtMarker(run); !ok {
+		adapter, item, err := r.adapterAndWorkItem(run)
+		if err != nil {
+			return ctrl.Result{}, err
+		}
+		if err := adapter.Resolve(ctx, item); err != nil {
+			return ctrl.Result{}, err
+		}
 	}
 	return r.reapDone(ctx, run)
 }
