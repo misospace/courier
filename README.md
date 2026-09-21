@@ -31,7 +31,8 @@ adopt a branch, launch the temporary OpenCode coordinator, and map the completed
 pod back to review/needs-human state. The resumable custom harness and liveness
 recovery remain later work. See [BOOTSTRAP.md](./BOOTSTRAP.md) for the temporary
 executor contract and a manual first-run example. Contributor conventions are
-in [AGENTS.md](./AGENTS.md).
+in [AGENTS.md](./AGENTS.md). Security issues should be reported privately; see
+[SECURITY.md](./SECURITY.md).
 
 ## Install
 
