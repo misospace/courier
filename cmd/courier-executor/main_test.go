@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -236,6 +237,181 @@ func TestReadConfigRequiresRemoteAndStatusBranch(t *testing.T) {
 	})
 	if err == nil || !strings.Contains(err.Error(), "COURIER_REPO_URL") {
 		t.Fatalf("readConfig error = %v, want missing remote URL", err)
+	}
+}
+
+// fake event-test secrets. Assertions never print these values or any output
+// line that could contain them; failures name the constant instead.
+const (
+	testGitToken   = "git-push-token-f4e3d2c1"
+	testGitHubTokn = "gh-api-token-b1b2b3b4"
+	testURLToken   = "url-userinfo-token-aa11bb22"
+)
+
+func TestRunEmitsRunScopedEventsWithoutDetail(t *testing.T) {
+	root := t.TempDir()
+	remote := remoteWithExistingBranch(t, root)
+
+	fakeOpenCode := filepath.Join(root, "opencode")
+	writeExecutable(t, fakeOpenCode, "#!/bin/sh\nprintf 'opencode ran\\n'\n")
+
+	// The branch exists on the remote and is orphaned: the adoption guard
+	// must see no pull requests and let the run proceed.
+	prServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `[]`)
+	}))
+	defer prServer.Close()
+
+	setResolveIssueEnv(t, root, remote, prServer.URL, fakeOpenCode)
+	t.Setenv("COURIER_GIT_TOKEN", testGitToken)
+	t.Setenv("GITHUB_TOKEN", testGitHubTokn)
+	t.Setenv("COURIER_RUN_NAME", "coderrun-it-7")
+	t.Setenv("COURIER_REF", "7")
+
+	var output bytes.Buffer
+	var errorsOut bytes.Buffer
+	if code := run(context.Background(), &output, &errorsOut); code != exitSuccess {
+		t.Fatalf("run exit code = %d, want 0; stderr=%q", code, errorsOut.String())
+	}
+
+	events := parseEvents(t, &output)
+	wantTypes := map[string]bool{
+		"run.start": false, "workspace.ready": false, "executor.start": false, "run.exit": false,
+	}
+	for _, event := range events {
+		eventType, _ := event["event"].(string)
+		if _, tracked := wantTypes[eventType]; !tracked {
+			t.Fatalf("unexpected event type %q", eventType)
+		}
+		wantTypes[eventType] = true
+		if event["run_id"] != "coderrun-it-7" {
+			t.Fatalf("event %s is missing the run scope", eventType)
+		}
+		if event["repo"] != "acme/widgets" || event["ref"] != float64(7) || event["mode"] != "resolve-issue" {
+			t.Fatalf("event %s is missing repo/ref/mode metadata", eventType)
+		}
+		if _, ok := event["detail"]; ok {
+			t.Fatalf("info-level event %s must not carry detail", eventType)
+		}
+	}
+	for eventType, seen := range wantTypes {
+		if !seen {
+			t.Fatalf("missing %s event", eventType)
+		}
+	}
+	exit := findEvent(t, events, "run.exit")
+	if exit["status"] != "ok" {
+		t.Fatalf("run.exit status = %v, want ok", exit["status"])
+	}
+	// The registered credentials are never used on this path and must never
+	// surface anywhere in the run's output.
+	for _, leaked := range []string{testGitToken, testGitHubTokn} {
+		if strings.Contains(output.String(), leaked) || strings.Contains(errorsOut.String(), leaked) {
+			t.Fatalf("output contains a fake credential (constant: %s)", secretConstantName(leaked))
+		}
+	}
+}
+
+func TestRunDebugLevelEmitsDetailAndStillRedacts(t *testing.T) {
+	root := t.TempDir()
+	// The remote embeds an unregistered credential in userinfo position, so
+	// the clone failure forces every exit path through redaction.
+	t.Setenv("COURIER_REPO_URL", "file://"+testURLToken+"@example.invalid/nonexistent.git")
+	t.Setenv("COURIER_WORKSPACE", filepath.Join(root, "workspace"))
+	t.Setenv("COURIER_BRANCH", "courier/resolve-issue/acme-widgets/7")
+	t.Setenv("COURIER_GOAL", "goal")
+	t.Setenv("COURIER_MODEL", "any-model/name")
+	t.Setenv("COURIER_RUN_NAME", "coderrun-it-7")
+	t.Setenv("COURIER_REF", "7")
+	t.Setenv("COURIER_REPO", "acme/widgets")
+	t.Setenv("COURIER_LOG_LEVEL", "debug")
+
+	var output bytes.Buffer
+	var errorsOut bytes.Buffer
+	if code := run(context.Background(), &output, &errorsOut); code != 1 {
+		t.Fatalf("run exit code = %d, want 1", code)
+	}
+
+	events := parseEvents(t, &output)
+	exit := findEvent(t, events, "run.exit")
+	if exit["status"] != "error" {
+		t.Fatalf("run.exit status = %v, want error", exit["status"])
+	}
+	detail, ok := exit["detail"].(map[string]any)
+	if !ok {
+		t.Fatal("debug-level run.exit must carry a detail object")
+	}
+	if _, ok := detail["exit_code"]; !ok {
+		t.Fatal("run.exit detail must carry the exit code")
+	}
+	reason, _ := detail["reason"].(string)
+	if !strings.Contains(reason, "[REDACTED]") {
+		t.Fatal("run.exit reason was not redacted")
+	}
+	if strings.Contains(output.String(), testURLToken) || strings.Contains(errorsOut.String(), testURLToken) {
+		t.Fatal("output contains the fake URL credential (constant: testURLToken)")
+	}
+}
+
+func TestRunConfigFailureKeepsRunScope(t *testing.T) {
+	t.Setenv("COURIER_RUN_NAME", "coderrun-it-7")
+	t.Setenv("COURIER_REPO", "acme/widgets")
+	t.Setenv("COURIER_REF", "7")
+	t.Setenv("COURIER_MODE", "resolve-issue")
+	// COURIER_REPO_URL is deliberately missing.
+
+	var output bytes.Buffer
+	var errorsOut bytes.Buffer
+	if code := run(context.Background(), &output, &errorsOut); code != 1 {
+		t.Fatalf("run exit code = %d, want 1", code)
+	}
+	exit := findEvent(t, parseEvents(t, &output), "run.exit")
+	if exit["run_id"] != "coderrun-it-7" || exit["status"] != "error" {
+		t.Fatalf("run.exit event lost run scope or status: run_id=%v status=%v", exit["run_id"], exit["status"])
+	}
+}
+
+// parseEvents decodes the JSON event lines among the run's output. Event
+// lines are the only JSON objects with an "event" field. Failures report
+// line indexes, never line contents.
+func parseEvents(t *testing.T, out *bytes.Buffer) []map[string]any {
+	t.Helper()
+	var events []map[string]any
+	for i, line := range strings.Split(strings.TrimSuffix(out.String(), "\n"), "\n") {
+		if !strings.HasPrefix(line, "{") {
+			continue
+		}
+		var event map[string]any
+		if err := json.Unmarshal([]byte(line), &event); err != nil {
+			t.Fatalf("line %d is not valid JSON: %v", i+1, err)
+		}
+		if _, ok := event["event"]; ok {
+			events = append(events, event)
+		}
+	}
+	return events
+}
+
+func findEvent(t *testing.T, events []map[string]any, eventType string) map[string]any {
+	t.Helper()
+	for _, event := range events {
+		if event["event"] == eventType {
+			return event
+		}
+	}
+	t.Fatalf("no %s event among %d events", eventType, len(events))
+	return nil
+}
+
+func secretConstantName(value string) string {
+	switch value {
+	case testGitToken:
+		return "testGitToken"
+	case testGitHubTokn:
+		return "testGitHubTokn"
+	default:
+		return "unknown-fake-credential"
 	}
 }
 

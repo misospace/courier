@@ -22,6 +22,7 @@ import (
 	"github.com/misospace/courier/internal/controller"
 	"github.com/misospace/courier/internal/executor"
 	couriergithub "github.com/misospace/courier/internal/github"
+	courierlog "github.com/misospace/courier/internal/log"
 	"github.com/misospace/courier/internal/source"
 	"github.com/misospace/courier/internal/source/manual"
 	"github.com/misospace/courier/internal/status"
@@ -120,6 +121,11 @@ func main() {
 	if githubObserver == nil {
 		setupLog.Info("GitHub observer disabled; no API credential Secret configured")
 	}
+	// Structured run events go to stdout as JSON lines alongside
+	// controller-runtime's ordinary operational logs; the deployment's log
+	// collection stack is the transport. COURIER_LOG_LEVEL raises verbosity,
+	// mirroring the per-run debug behavior of coordinator pods.
+	runEvents := courierlog.NewEmitter(os.Stdout, courierlog.ParseLevel(os.Getenv("COURIER_LOG_LEVEL")))
 	if err := (&controller.CoderRunReconciler{
 		Client: mgr.GetClient(),
 		Scheme: mgr.GetScheme(),
@@ -129,6 +135,7 @@ func main() {
 		}),
 		StatusWriter:   status.KubePatchWriter{Client: mgr.GetClient()},
 		Observer:       githubObserver,
+		Events:         runEvents,
 		PRHeadResolver: existingPRHeadResolver(githubObserver),
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "CoderRun")

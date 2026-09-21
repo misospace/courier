@@ -1,6 +1,11 @@
 // Command courier-executor is the executable bootstrap for the temporary
 // OpenCode runtime. It prepares the ephemeral git workspace, then delegates
 // the actual model run to headless OpenCode.
+//
+// The bootstrap owns the run's structured event log: one JSON event line per
+// lifecycle boundary (run start, workspace ready, executor start, run exit)
+// on stdout, redacted before emission, alongside the legacy
+// COURIER_TERMINATION line that records the terminal handoff.
 package main
 
 import (
@@ -12,11 +17,13 @@ import (
 	"net/url"
 	"os"
 	"os/exec"
+	"strconv"
 	"strings"
 
 	"github.com/misospace/courier/internal/executor"
 	"github.com/misospace/courier/internal/git"
 	"github.com/misospace/courier/internal/github"
+	courierlog "github.com/misospace/courier/internal/log"
 )
 
 const (
@@ -34,6 +41,8 @@ type config struct {
 	Branch          string
 	Repo            string
 	Mode            string
+	RunID           string
+	Ref             int
 	Goal            string
 	Model           string
 	Framing         string
@@ -66,6 +75,7 @@ func readConfig(getenv func(string) string) (config, error) {
 	if remoteURL == "" {
 		remoteURL = strings.TrimSpace(getenv("COURIER_REMOTE_URL"))
 	}
+	ref, _ := strconv.Atoi(strings.TrimSpace(getenv("COURIER_REF")))
 	cfg := config{
 		RemoteURL:       remoteURL,
 		Directory:       strings.TrimSpace(getenv("COURIER_WORKSPACE")),
@@ -76,6 +86,8 @@ func readConfig(getenv func(string) string) (config, error) {
 		Model:           strings.TrimSpace(getenv("COURIER_MODEL")),
 		Framing:         getenv("COURIER_FRAMING"),
 		Mode:            strings.TrimSpace(getenv("COURIER_MODE")),
+		RunID:           strings.TrimSpace(getenv("COURIER_RUN_NAME")),
+		Ref:             ref,
 		OpenCodeBinary:  strings.TrimSpace(getenv("COURIER_OPENCODE_BINARY")),
 		OpenCodeFormat:  strings.TrimSpace(getenv("COURIER_OPENCODE_FORMAT")),
 		OpenCodeAgent:   strings.TrimSpace(getenv("COURIER_OPENCODE_AGENT")),
@@ -124,16 +136,89 @@ func readConfig(getenv func(string) string) (config, error) {
 	return cfg, nil
 }
 
+// reporter emits the run's structured events and the terminal handoff. Every
+// externally visible reason passes through the redactor before it is written.
+type reporter struct {
+	stdout io.Writer
+	stderr io.Writer
+	events *courierlog.Emitter
+	red    *courierlog.Redactor
+	cfg    config
+}
+
+// newReporter builds the run's reporter and registers every credential the
+// process holds. Secret-shaped environment values (injected tokens and any
+// deployment-provided provider keys) are registered by name shape, so no
+// provider or deployment is special-cased here. The emitter level comes from
+// COURIER_LOG_LEVEL, which the operator sets from the run's spec.debug.
+func newReporter(stdout, stderr io.Writer, cfg config) reporter {
+	events := courierlog.NewEmitter(stdout, courierlog.ParseLevel(os.Getenv("COURIER_LOG_LEVEL")))
+	red := events.Redactor()
+	red.RegisterEnvironment(os.Environ())
+	red.Register(cfg.GitToken)
+	red.Register(cfg.GitHubToken)
+	return reporter{stdout: stdout, stderr: stderr, events: events, red: red, cfg: cfg}
+}
+
+// event writes one structured run event. Emission is best-effort: a failure
+// is noted on stderr and never fails the run. Events without run identity
+// are dropped by the emitter's contract.
+func (r reporter) event(eventType, status string, detail map[string]any) {
+	err := r.events.Emit(courierlog.Event{
+		Type:   eventType,
+		RunID:  r.cfg.RunID,
+		Repo:   r.cfg.Repo,
+		Ref:    r.cfg.Ref,
+		Mode:   r.cfg.Mode,
+		Model:  r.cfg.Model,
+		Status: status,
+		Detail: detail,
+	})
+	if err != nil {
+		fmt.Fprintf(r.stderr, "courier: dropped %s event: %v\n", eventType, err)
+	}
+}
+
+// terminate publishes the terminal handoff: the legacy COURIER_TERMINATION
+// line with a redacted reason, plus the run.exit event.
+func (r reporter) terminate(result termination) {
+	result.Reason = r.red.Redact(result.Reason)
+	emitTermination(r.stdout, r.cfg, result)
+	status := courierlog.StatusOK
+	switch result.Phase {
+	case "Failed":
+		status = courierlog.StatusError
+	case "NeedsHuman":
+		status = courierlog.StatusNeedsHuman
+	}
+	r.event(courierlog.EventRunExit, status, map[string]any{
+		"exit_code": result.ExitCode,
+		"phase":     result.Phase,
+		"reason":    result.Reason,
+	})
+}
+
 func run(ctx context.Context, stdout, stderr io.Writer) int {
 	cfg, err := readConfig(os.Getenv)
+	report := newReporter(stdout, stderr, cfg)
 	if err != nil {
-		emitTermination(stdout, cfg, termination{Phase: "Failed", Result: "failure", ExitCode: 1, Reason: err.Error()})
+		// Configuration failed before identity could be validated; fall back
+		// to the raw environment so the exit event still carries run scope.
+		report.cfg = envIdentity()
+		report.terminate(termination{Phase: "Failed", Result: "failure", ExitCode: 1, Reason: err.Error()})
 		return 1
 	}
 
+	report.event(courierlog.EventRunStart, courierlog.StatusOK, map[string]any{
+		"workspace": cfg.Directory,
+		"base":      cfg.Base,
+		"branch":    cfg.Branch,
+		"executor":  cfg.OpenCodeBinary,
+	})
+
 	askpassPath, err := os.Executable()
 	if err != nil {
-		emitTermination(stdout, cfg, termination{Phase: "Failed", Result: "failure", ExitCode: 1, Reason: "resolve executable: " + err.Error()})
+		report.terminate(termination{Phase: "Failed", Result: "failure", ExitCode: 1, Reason: "resolve executable: " + err.Error()})
 		return 1
 	}
 	restoreIdentity := installGitIdentity()
@@ -141,7 +226,7 @@ func run(ctx context.Context, stdout, stderr io.Writer) int {
 	restoreEnv := installAskpass(askpassPath)
 	defer restoreEnv()
 
-	if code := guardAdoption(ctx, cfg, stdout); code != 0 {
+	if code := report.guardAdoption(ctx); code != 0 {
 		return code
 	}
 
@@ -152,10 +237,14 @@ func run(ctx context.Context, stdout, stderr io.Writer) int {
 		Branch:    cfg.Branch,
 	})
 	if err != nil {
-		reason := redactCredentials(err.Error(), cfg)
-		emitTermination(stdout, cfg, termination{Phase: "Failed", Result: "failure", ExitCode: 1, Reason: reason})
+		report.terminate(termination{Phase: "Failed", Result: "failure", ExitCode: 1, Reason: err.Error()})
 		return 1
 	}
+	report.event(courierlog.EventWorkspaceReady, courierlog.StatusOK, map[string]any{
+		"adopted": workspace.Adopted,
+		"base":    cfg.Base,
+		"branch":  cfg.Branch,
+	})
 
 	runtime := executor.OpenCode{Binary: cfg.OpenCodeBinary, Format: cfg.OpenCodeFormat, Agent: cfg.OpenCodeAgent}
 	command := runtime.Command(executor.Invocation{
@@ -163,6 +252,10 @@ func run(ctx context.Context, stdout, stderr io.Writer) int {
 		Model:     cfg.Model,
 		Framing:   cfg.Framing,
 		Workspace: workspace.Directory,
+	})
+	report.event(courierlog.EventExecutorStart, courierlog.StatusOK, map[string]any{
+		"executor": runtime.Name(),
+		"format":   cfg.OpenCodeFormat,
 	})
 	process := exec.CommandContext(ctx, command.Binary, command.Args...)
 	process.Dir = workspace.Directory
@@ -174,15 +267,27 @@ func run(ctx context.Context, stdout, stderr io.Writer) int {
 			code = 1
 		}
 		if code == exitNeedsHuman {
-			emitTermination(stdout, cfg, termination{Phase: "NeedsHuman", Result: "needs-human", ExitCode: code, Reason: "opencode requested human attention"})
+			report.terminate(termination{Phase: "NeedsHuman", Result: "needs-human", ExitCode: code, Reason: "opencode requested human attention"})
 			return code
 		}
-		emitTermination(stdout, cfg, termination{Phase: "Failed", Result: "failure", ExitCode: code, Reason: redactCredentials(fmt.Sprintf("opencode exited with status %d", code), cfg)})
+		report.terminate(termination{Phase: "Failed", Result: "failure", ExitCode: code, Reason: fmt.Sprintf("opencode exited with status %d", code)})
 		return code
 	}
 
-	emitTermination(stdout, cfg, termination{Phase: "Verifying", Result: "success", ExitCode: exitSuccess, Reason: "opencode completed"})
+	report.terminate(termination{Phase: "Verifying", Result: "success", ExitCode: exitSuccess, Reason: "opencode completed"})
 	return exitSuccess
+}
+
+// envIdentity reconstructs run identity from the environment for exit paths
+// that run before configuration validation completed.
+func envIdentity() config {
+	ref, _ := strconv.Atoi(strings.TrimSpace(os.Getenv("COURIER_REF")))
+	return config{
+		RunID: os.Getenv("COURIER_RUN_NAME"),
+		Repo:  os.Getenv("COURIER_REPO"),
+		Ref:   ref,
+		Mode:  os.Getenv("COURIER_MODE"),
+	}
 }
 
 // guardAdoption enforces the resolve-issue invariant that a deterministic
@@ -190,40 +295,35 @@ func run(ctx context.Context, stdout, stderr io.Writer) int {
 // exists on the remote, no pull request may exist for that head; if one
 // does, a human decides, and the run stops before Prepare or OpenCode.
 // It returns 0 when the run may proceed.
-func guardAdoption(ctx context.Context, cfg config, stdout io.Writer) int {
-	if cfg.Mode != "resolve-issue" {
+func (r reporter) guardAdoption(ctx context.Context) int {
+	if r.cfg.Mode != "resolve-issue" {
 		return 0
 	}
-	exists, err := git.RemoteBranchExists(ctx, cfg.RemoteURL, cfg.Branch)
+	exists, err := git.RemoteBranchExists(ctx, r.cfg.RemoteURL, r.cfg.Branch)
 	if err != nil {
-		reason := redactCredentials(err.Error(), cfg)
-		emitTermination(stdout, cfg, termination{Phase: "Failed", Result: "failure", ExitCode: 1, Reason: reason})
+		r.terminate(termination{Phase: "Failed", Result: "failure", ExitCode: 1, Reason: err.Error()})
 		return 1
 	}
 	if !exists {
 		return 0
 	}
-	owner, name, ok := splitOwnerRepo(cfg.Repo)
+	owner, name, ok := splitOwnerRepo(r.cfg.Repo)
 	if !ok {
-		reason := "resolve branch already exists on the remote and COURIER_REPO does not name an owner/repo; refusing adoption"
-		emitTermination(stdout, cfg, termination{Phase: "Failed", Result: "failure", ExitCode: 1, Reason: reason})
+		r.terminate(termination{Phase: "Failed", Result: "failure", ExitCode: 1, Reason: "resolve branch already exists on the remote and COURIER_REPO does not name an owner/repo; refusing adoption"})
 		return 1
 	}
-	client, err := github.NewClient(cfg.GitHubAPIBase, cfg.GitHubToken)
+	client, err := github.NewClient(r.cfg.GitHubAPIBase, r.cfg.GitHubToken)
 	if err != nil {
-		reason := redactCredentials(err.Error(), cfg)
-		emitTermination(stdout, cfg, termination{Phase: "Failed", Result: "failure", ExitCode: 1, Reason: reason})
+		r.terminate(termination{Phase: "Failed", Result: "failure", ExitCode: 1, Reason: err.Error()})
 		return 1
 	}
-	pulls, err := client.PullRequestsForHead(ctx, owner, name, cfg.Branch)
+	pulls, err := client.PullRequestsForHead(ctx, owner, name, r.cfg.Branch)
 	if err != nil {
-		reason := redactCredentials(err.Error(), cfg)
-		emitTermination(stdout, cfg, termination{Phase: "Failed", Result: "failure", ExitCode: 1, Reason: reason})
+		r.terminate(termination{Phase: "Failed", Result: "failure", ExitCode: 1, Reason: err.Error()})
 		return 1
 	}
 	for _, pull := range pulls {
-		reason := fmt.Sprintf("resolve branch already has PR #%d (%s); refusing adoption", pull.Number, pull.State)
-		emitTermination(stdout, cfg, termination{Phase: "NeedsHuman", Result: "needs-human", ExitCode: exitNeedsHuman, Reason: reason})
+		r.terminate(termination{Phase: "NeedsHuman", Result: "needs-human", ExitCode: exitNeedsHuman, Reason: fmt.Sprintf("resolve branch already has PR #%d (%s); refusing adoption", pull.Number, pull.State)})
 		return exitNeedsHuman
 	}
 	return 0
@@ -325,16 +425,4 @@ func emitTermination(stdout io.Writer, cfg config, result termination) {
 	// never used for credentials and is replaced atomically enough for a single
 	// writer in the ephemeral workspace.
 	_ = os.WriteFile(cfg.TerminationFile, []byte(line), 0o600)
-}
-
-func redactCredentials(value string, cfg config) string {
-	value = redact(value, cfg.GitToken)
-	return redact(value, cfg.GitHubToken)
-}
-
-func redact(value, secret string) string {
-	if secret == "" {
-		return value
-	}
-	return strings.ReplaceAll(value, secret, "[REDACTED]")
 }

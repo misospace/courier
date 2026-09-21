@@ -15,6 +15,7 @@ import (
 
 	courierv1alpha1 "github.com/misospace/courier/api/v1alpha1"
 	"github.com/misospace/courier/internal/executor"
+	courierlog "github.com/misospace/courier/internal/log"
 	"github.com/misospace/courier/internal/source"
 	"github.com/misospace/courier/internal/status"
 )
@@ -50,6 +51,11 @@ type CoderRunReconciler struct {
 
 	// Observer reads the external pull request and CI state after a successful run.
 	Observer WorldObserver
+
+	// Events optionally emits structured run events as JSON lines for the
+	// deployment's log collection stack. Nil disables emission; a failed
+	// emission never fails reconciliation.
+	Events *courierlog.Emitter
 }
 
 // +kubebuilder:rbac:groups=courier.misospace.dev,resources=coderuns,verbs=get;list;watch;create;update;patch;delete
@@ -154,6 +160,7 @@ func (r *CoderRunReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 		if err := r.patchStatus(ctx, beforeLaunch, &run); err != nil {
 			return ctrl.Result{}, err
 		}
+		r.emitPhaseTransition(&run, courierv1alpha1.PhaseRunning, map[string]any{"branch": run.Status.Branch, "lane": run.Spec.Lane})
 	}
 
 	l.V(1).Info("run admitted", "phase", run.Status.Phase,
@@ -199,6 +206,7 @@ func (r *CoderRunReconciler) resumeClaimed(ctx context.Context, run *courierv1al
 	if err := r.patchStatus(ctx, beforeLaunch, run); err != nil {
 		return ctrl.Result{}, err
 	}
+	r.emitPhaseTransition(run, courierv1alpha1.PhaseRunning, map[string]any{"branch": run.Status.Branch, "lane": run.Spec.Lane})
 	return ctrl.Result{}, nil
 }
 
@@ -208,6 +216,24 @@ func (r *CoderRunReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		For(&courierv1alpha1.CoderRun{}).
 		Owns(&corev1.Pod{}).
 		Complete(r)
+}
+
+// emitPhaseTransition writes one phase.transition run event. Emission is
+// best-effort: a nil emitter or a write failure never affects reconciliation,
+// and the emitter drops events that lack run identity.
+func (r *CoderRunReconciler) emitPhaseTransition(run *courierv1alpha1.CoderRun, phase courierv1alpha1.Phase, detail map[string]any) {
+	if r == nil || r.Events == nil || run == nil {
+		return
+	}
+	_ = r.Events.Emit(courierlog.Event{
+		Type:   courierlog.EventPhaseTransition,
+		RunID:  run.Name,
+		Repo:   run.Spec.Repo,
+		Ref:    run.Spec.Ref,
+		Mode:   string(run.Spec.Mode),
+		Status: string(phase),
+		Detail: detail,
+	})
 }
 
 func (r *CoderRunReconciler) adapterAndWorkItem(run *courierv1alpha1.CoderRun) (source.Adapter, source.WorkItem, error) {
@@ -263,6 +289,7 @@ func (r *CoderRunReconciler) observeRunning(ctx context.Context, run *courierv1a
 			if err := r.patchStatus(ctx, before, run); err != nil {
 				return ctrl.Result{}, err
 			}
+			r.emitPhaseTransition(run, courierv1alpha1.PhaseVerifying, map[string]any{"exit_code": exitCode})
 			return ctrl.Result{Requeue: true}, nil
 		}
 		return r.transitionTerminal(ctx, run, phase, "")
@@ -336,6 +363,9 @@ func (r *CoderRunReconciler) transitionTerminal(ctx context.Context, run *courie
 		if err := r.patchStatus(ctx, before, run); err != nil {
 			return ctrl.Result{}, err
 		}
+	}
+	if run.Status.Phase != before.Status.Phase {
+		r.emitPhaseTransition(run, phase, map[string]any{"branch": run.Status.Branch, "pr": run.Status.PR})
 	}
 	return ctrl.Result{}, nil
 }
