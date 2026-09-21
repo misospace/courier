@@ -123,8 +123,10 @@ func main() {
 	}
 	// Structured run events go to stdout as JSON lines alongside
 	// controller-runtime's ordinary operational logs; the deployment's log
-	// collection stack is the transport. COURIER_LOG_LEVEL raises verbosity,
-	// mirroring the per-run debug behavior of coordinator pods.
+	// collection stack is the transport. Verbosity is per run: the
+	// reconciler marks each event with the run's own spec.debug flag
+	// (Event.Verbose), so one shared emitter never turns one run's debug
+	// setting into another run's noise.
 	runEvents := courierlog.NewEmitter(os.Stdout, courierlog.ParseLevel(os.Getenv("COURIER_LOG_LEVEL")))
 	if err := (&controller.CoderRunReconciler{
 		Client: mgr.GetClient(),

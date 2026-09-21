@@ -164,6 +164,45 @@ func TestEmitterInfoLevelSuppressesDetail(t *testing.T) {
 	}
 }
 
+func TestEmitterPerEventVerboseOverridesInfoLevel(t *testing.T) {
+	detail := map[string]any{"branch": "courier/resolve-issue/acme/widgets-7", "lane": "local"}
+	for _, test := range []struct {
+		name        string
+		verbose     bool
+		wantPresent bool
+	}{
+		{name: "verbose event carries detail at info level", verbose: true, wantPresent: true},
+		{name: "non-verbose event omits detail at info level", verbose: false, wantPresent: false},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			var out bytes.Buffer
+			// A process-wide info-level emitter serves runs of mixed
+			// verbosity: the event itself decides whether detail ships.
+			emitter := NewEmitter(&out, LevelInfo)
+			if err := emitter.Emit(Event{
+				Type:    EventPhaseTransition,
+				RunID:   "run-1",
+				Status:  "Running",
+				Verbose: test.verbose,
+				Detail:  detail,
+			}); err != nil {
+				t.Fatalf("Emit() error = %v", err)
+			}
+			events := parseEventLines(t, &out)
+			if len(events) != 1 {
+				t.Fatalf("emitted %d events, want 1", len(events))
+			}
+			emitted, ok := events[0]["detail"].(map[string]any)
+			if ok != test.wantPresent {
+				t.Fatalf("detail present = %t, want %t", ok, test.wantPresent)
+			}
+			if test.wantPresent && emitted["branch"] != detail["branch"] {
+				t.Fatal("verbose event lost its detail values")
+			}
+		})
+	}
+}
+
 func TestEmitterRedactsSecretsAtEveryLevel(t *testing.T) {
 	detail := map[string]any{
 		"authorization": "Bearer " + fakeBearerToken,

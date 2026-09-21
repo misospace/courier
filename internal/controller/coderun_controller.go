@@ -218,21 +218,25 @@ func (r *CoderRunReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		Complete(r)
 }
 
-// emitPhaseTransition writes one phase.transition run event. Emission is
-// best-effort: a nil emitter or a write failure never affects reconciliation,
-// and the emitter drops events that lack run identity.
+// emitPhaseTransition writes one phase.transition run event. Verbose detail
+// follows the run's own spec.debug flag — carried per event, not by a
+// process-global switch — so one run's debug setting never changes another
+// run's event verbosity. Emission is best-effort: a nil emitter or a write
+// failure never affects reconciliation, and the emitter drops events that
+// lack run identity.
 func (r *CoderRunReconciler) emitPhaseTransition(run *courierv1alpha1.CoderRun, phase courierv1alpha1.Phase, detail map[string]any) {
 	if r == nil || r.Events == nil || run == nil {
 		return
 	}
 	_ = r.Events.Emit(courierlog.Event{
-		Type:   courierlog.EventPhaseTransition,
-		RunID:  run.Name,
-		Repo:   run.Spec.Repo,
-		Ref:    run.Spec.Ref,
-		Mode:   string(run.Spec.Mode),
-		Status: string(phase),
-		Detail: detail,
+		Type:    courierlog.EventPhaseTransition,
+		RunID:   run.Name,
+		Repo:    run.Spec.Repo,
+		Ref:     run.Spec.Ref,
+		Mode:    string(run.Spec.Mode),
+		Status:  string(phase),
+		Verbose: run.Spec.Debug,
+		Detail:  detail,
 	})
 }
 

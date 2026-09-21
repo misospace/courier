@@ -105,8 +105,9 @@ func ParseLevel(value string) Level {
 
 // Event is one structured run event. RunID is required; the remaining
 // identity fields are filled from the run when the caller has them. Detail
-// is verbose diagnostic data: the emitter includes it only at LevelDebug and
-// redacts it at every level.
+// is verbose diagnostic data, included when the event marks itself Verbose
+// (per-run debug) or the emitter runs at LevelDebug, and redacted in every
+// case.
 type Event struct {
 	Type   string
 	RunID  string
@@ -117,7 +118,11 @@ type Event struct {
 	Role   string
 	Model  string
 	Status string
-	Detail map[string]any
+	// Verbose marks event detail as belonging to a debug run. Because the
+	// flag rides on the event, one process-wide emitter can serve runs of
+	// mixed verbosity without a global switch: each caller decides per run.
+	Verbose bool
+	Detail  map[string]any
 }
 
 // eventLine is the serialized shape of an event. Field order is the wire
@@ -206,7 +211,7 @@ func (e *Emitter) Emit(event Event) error {
 		Model:  e.redactor.Redact(event.Model),
 		Status: e.redactor.Redact(event.Status),
 	}
-	if event.Detail != nil && e.level == LevelDebug {
+	if event.Detail != nil && (event.Verbose || e.level == LevelDebug) {
 		// Serialize the detail as JSON, redact the JSON text, and keep the
 		// result raw: redaction therefore also covers detail keys, and the
 		// caller's map is never mutated.
