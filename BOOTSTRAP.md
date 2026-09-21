@@ -32,9 +32,10 @@ make docker-build-coordinator EXECUTOR_IMG=ghcr.io/misospace/courier-opencode:la
 ```
 
 Create `courier-github` in the operator namespace with `username` and `token`
-keys. The token needs branch push and pull-request permissions, but must not
-have administration or protected-branch bypass. The repository's default
-branch must require independent human approval.
+keys. The token needs branch push, pull-request read, Checks read, and commit-status
+read permissions, but must retain least privilege and must not have
+administration or protected-branch bypass. The repository's default branch must
+require independent human approval.
 
 Provider or gateway environment variables can be placed in another Secret and
 selected with `--executor-environment-secret`.

@@ -42,9 +42,16 @@ func (o Observer) Observe(ctx context.Context, repository, branch string) (contr
 		if err != nil {
 			return controller.PRObservation{}, err
 		}
+		statuses, err := o.Client.GetCommitStatuses(ctx, owner, repo, ref)
+		if err != nil {
+			return controller.PRObservation{}, err
+		}
 		observed := controller.PRObservation{PR: strconv.Itoa(pull.Number), Draft: pull.Draft}
 		for _, check := range checks.CheckRuns {
 			observed.Checks = append(observed.Checks, controller.CheckObservation{State: checkState(check.Status, check.Conclusion)})
+		}
+		for _, status := range statuses.Statuses {
+			observed.Checks = append(observed.Checks, controller.CheckObservation{State: commitStatusState(status.State)})
 		}
 		return observed, nil
 	}
@@ -87,6 +94,17 @@ func checkState(status, conclusion string) controller.CheckState {
 	}
 	switch strings.ToLower(conclusion) {
 	case "success", "skipped", "neutral":
+		return controller.CheckStatePassed
+	default:
+		return controller.CheckStateFailed
+	}
+}
+
+func commitStatusState(state string) controller.CheckState {
+	switch strings.ToLower(state) {
+	case "pending":
+		return controller.CheckStatePending
+	case "success":
 		return controller.CheckStatePassed
 	default:
 		return controller.CheckStateFailed

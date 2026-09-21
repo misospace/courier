@@ -142,6 +142,16 @@ type CheckRuns struct {
 	CheckRuns  []CheckRun `json:"check_runs"`
 }
 
+type CommitStatus struct {
+	State   string `json:"state"`
+	Context string `json:"context"`
+}
+
+type CommitStatuses struct {
+	TotalCount int            `json:"total_count"`
+	Statuses   []CommitStatus `json:"statuses"`
+}
+
 // APIError reports a non-2xx GitHub response. Body is retained for callers
 // that need the provider's diagnostic, but it is capped to avoid retaining a
 // huge response in a run's error path.
@@ -222,12 +232,60 @@ func headFilterQuery(owner, branch string) string {
 	return "head=" + url.QueryEscape(owner) + ":" + url.QueryEscape(branch) + "&state=all"
 }
 
-// GetCheckRuns reads CI checks for a commit, branch, or tag ref.
+// GetCheckRuns reads all CI checks for a commit, branch, or tag ref.
 func (c *Client) GetCheckRuns(ctx context.Context, owner, repo, ref string) (CheckRuns, error) {
-	var out CheckRuns
 	endpoint := repoEndpoint(owner, repo, "commits", ref, "check-runs")
-	err := c.doJSON(ctx, http.MethodGet, endpoint, nil, &out)
-	return out, err
+	var out CheckRuns
+	for page := 1; ; page++ {
+		var current CheckRuns
+		err := c.doJSONQuery(ctx, http.MethodGet, endpoint, pageQuery(page), nil, &current)
+		if err != nil {
+			return CheckRuns{}, err
+		}
+		if page == 1 {
+			out.TotalCount = current.TotalCount
+		}
+		if len(current.CheckRuns) == 0 && len(out.CheckRuns) < out.TotalCount {
+			return CheckRuns{}, fmt.Errorf("GitHub check-runs response ended after %d of %d checks", len(out.CheckRuns), out.TotalCount)
+		}
+		out.CheckRuns = append(out.CheckRuns, current.CheckRuns...)
+		if len(out.CheckRuns) > out.TotalCount {
+			return CheckRuns{}, fmt.Errorf("GitHub check-runs response returned %d of %d checks", len(out.CheckRuns), out.TotalCount)
+		}
+		if len(out.CheckRuns) == out.TotalCount {
+			return out, nil
+		}
+	}
+}
+
+// GetCommitStatuses reads all legacy statuses for a commit, branch, or tag ref.
+func (c *Client) GetCommitStatuses(ctx context.Context, owner, repo, ref string) (CommitStatuses, error) {
+	endpoint := repoEndpoint(owner, repo, "commits", ref, "status")
+	var out CommitStatuses
+	for page := 1; ; page++ {
+		var current CommitStatuses
+		err := c.doJSONQuery(ctx, http.MethodGet, endpoint, pageQuery(page), nil, &current)
+		if err != nil {
+			return CommitStatuses{}, err
+		}
+		if page == 1 {
+			out.TotalCount = current.TotalCount
+		}
+		if len(current.Statuses) == 0 && len(out.Statuses) < out.TotalCount {
+			return CommitStatuses{}, fmt.Errorf("GitHub commit-status response ended after %d of %d statuses", len(out.Statuses), out.TotalCount)
+		}
+		out.Statuses = append(out.Statuses, current.Statuses...)
+		if len(out.Statuses) > out.TotalCount {
+			return CommitStatuses{}, fmt.Errorf("GitHub commit-status response returned %d of %d statuses", len(out.Statuses), out.TotalCount)
+		}
+		if len(out.Statuses) == out.TotalCount {
+			return out, nil
+		}
+	}
+}
+
+func pageQuery(page int) string {
+	return "page=" + strconv.Itoa(page) + "&per_page=100"
 }
 
 // GetChecks is a concise alias for GetCheckRuns.
