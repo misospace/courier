@@ -83,6 +83,7 @@ type PullRequest struct {
 	Draft          bool   `json:"draft"`
 	Mergeable      *bool  `json:"mergeable"`
 	MergeableState string `json:"mergeable_state"`
+	MergedAt       string `json:"merged_at"`
 	Head           Ref    `json:"head"`
 	Base           Ref    `json:"base"`
 }

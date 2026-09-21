@@ -1,8 +1,12 @@
 // Package dispatch is Courier's first-party source adapter for Dispatch.
 //
-// Dispatch's transport and wire details are intentionally not specified by
-// Courier yet. Client is therefore an injected, fakeable boundary with only
-// the operations Courier needs: claim an opaque item ID and publish one of the
-// three lifecycle statuses. A production client can add HTTP, authentication,
-// retries, and response decoding without changing the source interface.
+// Dispatch's HTTP transport remains behind the injected Client boundary so the
+// source-agnostic package does not depend on Dispatch request or response types.
+// Implement tasks use Dispatch issue claim, release, status, and done endpoints.
+// Followup-pr tasks treat any linked issue as context only: their lifecycle uses
+// tasks/report and, when applicable, the PR-fix queue, never issue endpoints.
+//
+// Followup discovery treats both an upstream merged PR and a closed-unmerged PR
+// as terminal stale work. The stale queue notes deliberately distinguish those
+// states so an operator can tell why Dispatch declined the task.
 package dispatch

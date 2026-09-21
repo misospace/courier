@@ -12,12 +12,19 @@
 {{- if and (not $img.tag) (not $img.digest) }}
 {{- $_ := set $img "tag" .Chart.AppVersion }}
 {{- end }}
-{{- $args := $container.args | default (list) }}
+{{- $args := concat (list) ($container.args | default (list)) }}
 {{- $hasExecutorImage := false }}
 {{- $hasOpenCodeAgent := false }}
 {{- $hasGithubMCPURL := false }}
 {{- $hasContext7MCPURL := false }}
 {{- $hasMetricsMCPURL := false }}
+{{- $hasDispatchEnabled := false }}
+{{- $hasDispatchBaseURL := false }}
+{{- $hasDispatchAgentName := false }}
+{{- $hasDispatchQueueLane := false }}
+{{- $hasDispatchLane := false }}
+{{- $hasDispatchPollInterval := false }}
+{{- $hasDispatchHTTPTimeout := false }}
 {{- range $arg := $args }}
 {{- if hasPrefix "--executor-image=" $arg }}
 {{- $hasExecutorImage = true }}
@@ -33,6 +40,27 @@
 {{- end }}
 {{- if hasPrefix "--metrics-mcp-url=" $arg }}
 {{- $hasMetricsMCPURL = true }}
+{{- end }}
+{{- if or (eq $arg "--dispatch-enabled") (hasPrefix "--dispatch-enabled=" $arg) }}
+{{- $hasDispatchEnabled = true }}
+{{- end }}
+{{- if hasPrefix "--dispatch-base-url=" $arg }}
+{{- $hasDispatchBaseURL = true }}
+{{- end }}
+{{- if hasPrefix "--dispatch-agent-name=" $arg }}
+{{- $hasDispatchAgentName = true }}
+{{- end }}
+{{- if hasPrefix "--dispatch-queue-lane=" $arg }}
+{{- $hasDispatchQueueLane = true }}
+{{- end }}
+{{- if hasPrefix "--dispatch-lane=" $arg }}
+{{- $hasDispatchLane = true }}
+{{- end }}
+{{- if hasPrefix "--dispatch-poll-interval=" $arg }}
+{{- $hasDispatchPollInterval = true }}
+{{- end }}
+{{- if hasPrefix "--dispatch-http-timeout=" $arg }}
+{{- $hasDispatchHTTPTimeout = true }}
 {{- end }}
 {{- end }}
 {{- if not $hasExecutorImage }}
@@ -51,6 +79,22 @@
 {{- end }}
 {{- if and (not $hasMetricsMCPURL) $mcp.metricsURL }}
 {{- $args = append $args (printf "--metrics-mcp-url=%s" $mcp.metricsURL) }}
+{{- end }}
+{{- $dispatch := .Values.dispatch }}
+{{- if $dispatch.enabled }}
+{{- if or (not $dispatch.baseURL) (not $dispatch.agentName) (not $dispatch.queueLane) (not $dispatch.laneProfile) (not $dispatch.tokenSecret.name) (not $dispatch.tokenSecret.key) }}
+{{- fail "dispatch.enabled requires baseURL, agentName, queueLane, laneProfile, tokenSecret.name, and tokenSecret.key" }}
+{{- end }}
+{{- if not $hasDispatchEnabled }}{{- $args = append $args "--dispatch-enabled=true" }}{{- end }}
+{{- if not $hasDispatchBaseURL }}{{- $args = append $args (printf "--dispatch-base-url=%s" $dispatch.baseURL) }}{{- end }}
+{{- if not $hasDispatchAgentName }}{{- $args = append $args (printf "--dispatch-agent-name=%s" $dispatch.agentName) }}{{- end }}
+{{- if not $hasDispatchQueueLane }}{{- $args = append $args (printf "--dispatch-queue-lane=%s" $dispatch.queueLane) }}{{- end }}
+{{- if not $hasDispatchLane }}{{- $args = append $args (printf "--dispatch-lane=%s" $dispatch.laneProfile) }}{{- end }}
+{{- if not $hasDispatchPollInterval }}{{- $args = append $args (printf "--dispatch-poll-interval=%s" $dispatch.pollInterval) }}{{- end }}
+{{- if not $hasDispatchHTTPTimeout }}{{- $args = append $args (printf "--dispatch-http-timeout=%s" $dispatch.httpTimeout) }}{{- end }}
+{{- $env := deepCopy ($container.env | default (dict)) }}
+{{- $_ := set $env "DISPATCH_AGENT_TOKEN" (dict "valueFrom" (dict "secretKeyRef" (dict "name" $dispatch.tokenSecret.name "key" $dispatch.tokenSecret.key))) }}
+{{- $_ := set $container "env" $env }}
 {{- end }}
 {{- $_ := set $container "args" $args }}
 

@@ -20,6 +20,20 @@ executor:
     context7URL: ""
     metricsURL: ""
 
+dispatch:
+  # Dispatch is optional. queueLane selects work in Dispatch; laneProfile is
+  # the Courier LaneProfile assigned to materialized CoderRuns.
+  enabled: false
+  baseURL: ""
+  agentName: ""
+  queueLane: ""
+  laneProfile: ""
+  pollInterval: 30s
+  httpTimeout: 30s
+  tokenSecret:
+    name: ""
+    key: token
+
 controllers:
   main:
     replicas: 1

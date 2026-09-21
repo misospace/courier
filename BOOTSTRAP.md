@@ -43,6 +43,12 @@ remain with a human maintainer.
 Provider or gateway environment variables can be placed in another Secret and
 selected with `--executor-environment-secret`.
 
+To enable native Dispatch discovery, configure the chart's `dispatch` values and
+create the referenced Secret with the `DISPATCH_AGENT_TOKEN` value under the
+configured key. The queue lane selects Dispatch work; `laneProfile` selects the
+Courier `LaneProfile` for created runs. Dispatch uses the agent token for
+`next-task`, claim/status, unclaim, and task-report requests.
+
 ## Manual first run
 
 Install the chart, then apply a lane and a manual run:

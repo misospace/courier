@@ -6,8 +6,10 @@ import (
 	"testing"
 
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
@@ -16,10 +18,30 @@ import (
 )
 
 type admissionSource struct {
-	claimed     []string
-	released    []string
-	transitions []source.State
-	resolved    []string
+	claimed      []string
+	released     []string
+	transitions  []source.State
+	reports      []source.Lifecycle
+	events       []string
+	resolved     []string
+	preLaunchErr error
+	preLaunches  []string
+}
+
+// failingStatusWriter fails its first patches, then forwards to the fake
+// status writer.
+type failingStatusWriter struct {
+	fakeStatusWriter
+	failures int
+	calls    int
+}
+
+func (w *failingStatusWriter) PatchStatus(ctx context.Context, name types.NamespacedName, patch []byte) error {
+	w.calls++
+	if w.calls <= w.failures {
+		return errors.New("status patch failed")
+	}
+	return w.fakeStatusWriter.PatchStatus(ctx, name, patch)
 }
 
 type fakeWorldObserver struct {
@@ -46,7 +68,17 @@ func (s *admissionSource) Release(_ context.Context, item source.WorkItem) error
 }
 func (s *admissionSource) Transition(_ context.Context, _ source.WorkItem, state source.State) error {
 	s.transitions = append(s.transitions, state)
+	s.events = append(s.events, "transition:"+string(state))
 	return nil
+}
+func (s *admissionSource) Report(_ context.Context, _ source.WorkItem, lifecycle source.Lifecycle) error {
+	s.reports = append(s.reports, lifecycle)
+	s.events = append(s.events, "report:"+string(lifecycle.Result))
+	return nil
+}
+func (s *admissionSource) PreLaunch(_ context.Context, item source.WorkItem) error {
+	s.preLaunches = append(s.preLaunches, item.ID)
+	return s.preLaunchErr
 }
 func (s *admissionSource) Resolve(_ context.Context, item source.WorkItem) error {
 	s.resolved = append(s.resolved, item.ID)
@@ -126,7 +158,7 @@ func TestPendingClaimsBeforeBranchResolutionAndLaunch(t *testing.T) {
 	if _, err := reconciler.Reconcile(context.Background(), admissionRequest("fix")); err != nil {
 		t.Fatalf("Reconcile() error = %v", err)
 	}
-	if len(item.claimed) != 1 || len(order) != 2 || order[0] != "resolve" || order[1] != "launch" {
+	if len(item.claimed) != 1 || len(item.reports) != 0 || len(order) != 2 || order[0] != "resolve" || order[1] != "launch" {
 		t.Fatalf("claim/resolve/launch order = claim %#v, order %#v", item.claimed, order)
 	}
 	var updated courierv1alpha1.CoderRun
@@ -135,6 +167,89 @@ func TestPendingClaimsBeforeBranchResolutionAndLaunch(t *testing.T) {
 	}
 	if updated.Status.Branch != "feature/existing-pr" {
 		t.Fatalf("branch = %q, want existing PR head", updated.Status.Branch)
+	}
+}
+
+func TestPreLaunchStaleWorkReleasesClaimAndDeletesRun(t *testing.T) {
+	item := &admissionSource{preLaunchErr: source.ErrStaleWork}
+	launched := false
+	run := admissionRun("run", "local", courierv1alpha1.PhasePending)
+	client := phaseClient(t, admissionLane("local", 1), run)
+	reconciler := &CoderRunReconciler{
+		Client:       client,
+		Sources:      NewSourceRegistry(map[string]source.Adapter{"test": item}),
+		StatusWriter: fakeStatusWriter{client: client},
+		Launch: func(context.Context, *courierv1alpha1.CoderRun) error {
+			launched = true
+			return nil
+		},
+	}
+	if _, err := reconciler.Reconcile(context.Background(), admissionRequest("run")); err == nil {
+		t.Fatal("Reconcile() returned nil error, want guard error")
+	}
+	if launched || len(item.released) != 1 || len(item.preLaunches) != 1 || len(item.transitions) != 0 {
+		t.Fatalf("guard outcome = launched %t, released %#v, pre-launches %#v, transitions %#v", launched, item.released, item.preLaunches, item.transitions)
+	}
+	var updated courierv1alpha1.CoderRun
+	if err := client.Get(context.Background(), admissionKey("run"), &updated); !apierrors.IsNotFound(err) {
+		t.Fatalf("get run: %v, want CoderRun deleted after stale pre-launch", err)
+	}
+}
+
+func TestPreLaunchTransientFailureKeepsRunPending(t *testing.T) {
+	cause := errors.New("pre-launch revalidation failed")
+	item := &admissionSource{preLaunchErr: cause}
+	launched := false
+	run := admissionRun("run", "local", courierv1alpha1.PhasePending)
+	client := phaseClient(t, admissionLane("local", 1), run)
+	reconciler := &CoderRunReconciler{
+		Client:       client,
+		Sources:      NewSourceRegistry(map[string]source.Adapter{"test": item}),
+		StatusWriter: fakeStatusWriter{client: client},
+		Launch: func(context.Context, *courierv1alpha1.CoderRun) error {
+			launched = true
+			return nil
+		},
+	}
+	if _, err := reconciler.Reconcile(context.Background(), admissionRequest("run")); !errors.Is(err, cause) {
+		t.Fatalf("Reconcile() error = %v, want %v", err, cause)
+	}
+	if launched || len(item.released) != 1 || len(item.transitions) != 0 {
+		t.Fatalf("guard outcome = launched %t, released %#v, transitions %#v", launched, item.released, item.transitions)
+	}
+	var updated courierv1alpha1.CoderRun
+	if err := client.Get(context.Background(), admissionKey("run"), &updated); err != nil {
+		t.Fatalf("get run: %v", err)
+	}
+	if updated.Status.Phase != courierv1alpha1.PhasePending {
+		t.Fatalf("phase = %q, want Pending", updated.Status.Phase)
+	}
+}
+
+func TestPreLaunchStaleOnClaimedRunReleasesAndDeletes(t *testing.T) {
+	item := &admissionSource{preLaunchErr: source.ErrStaleWork}
+	launched := false
+	run := admissionRun("run", "local", courierv1alpha1.PhaseClaimed)
+	run.Status.Branch = "courier/acme/widgets/issue-1"
+	client := phaseClient(t, admissionLane("local", 1), run)
+	reconciler := &CoderRunReconciler{
+		Client:       client,
+		Sources:      NewSourceRegistry(map[string]source.Adapter{"test": item}),
+		StatusWriter: fakeStatusWriter{client: client},
+		Launch: func(context.Context, *courierv1alpha1.CoderRun) error {
+			launched = true
+			return nil
+		},
+	}
+	if _, err := reconciler.Reconcile(context.Background(), admissionRequest("run")); err == nil {
+		t.Fatal("Reconcile() returned nil error, want guard error")
+	}
+	if launched || len(item.released) != 1 || len(item.preLaunches) != 1 || len(item.transitions) != 0 {
+		t.Fatalf("resume outcome = launched %t, released %#v, pre-launches %#v, transitions %#v", launched, item.released, item.preLaunches, item.transitions)
+	}
+	var updated courierv1alpha1.CoderRun
+	if err := client.Get(context.Background(), admissionKey("run"), &updated); !apierrors.IsNotFound(err) {
+		t.Fatalf("get run: %v, want CoderRun deleted after stale pre-launch resume", err)
 	}
 }
 
@@ -247,6 +362,7 @@ func TestRunningPodExitMapsPhaseAndSourceState(t *testing.T) {
 			if calls != 0 {
 				t.Fatalf("observer calls = %d, want 0 before Verifying reconcile", calls)
 			}
+
 		})
 	}
 }
@@ -599,6 +715,98 @@ func greenObservation(head string, names ...string) PRObservation {
 		observation.Checks = append(observation.Checks, CheckObservation{Name: name, State: CheckStatePassed})
 	}
 	return observation
+}
+
+func TestTerminalLifecycleReportsToSource(t *testing.T) {
+	tests := []struct {
+		name        string
+		observation PRObservation
+		wantPhase   courierv1alpha1.Phase
+		wantReport  source.Lifecycle
+	}{
+		{
+			name:        "awaiting review",
+			observation: PRObservation{PR: "42", Head: "sha-1", Checks: []CheckObservation{{Name: "check", State: CheckStatePassed}}},
+			wantPhase:   courierv1alpha1.PhaseAwaitingReview,
+			wantReport:  source.Lifecycle{State: source.StateInReview, Result: source.ResultReady, PR: "42", IdempotencyKey: "coderun/default/run/AwaitingReview"},
+		},
+		{
+			name:        "needs human",
+			observation: PRObservation{PR: "42", Checks: []CheckObservation{{State: CheckStateFailed}}},
+			wantPhase:   courierv1alpha1.PhaseNeedsHuman,
+			wantReport:  source.Lifecycle{State: source.StateNeedsHuman, Result: source.ResultBlocked, PR: "42", Error: "run requires human intervention", IdempotencyKey: "coderun/default/run/NeedsHuman"},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			item := &admissionSource{}
+			run := admissionRun("run", "local", courierv1alpha1.PhaseVerifying)
+			run.Status.Branch = "courier/acme/widgets/issue-1"
+			client := phaseClient(t, run)
+			reconciler := &CoderRunReconciler{
+				Client:       client,
+				Sources:      NewSourceRegistry(map[string]source.Adapter{"test": item}),
+				StatusWriter: fakeStatusWriter{client: client},
+				Observer:     fakeWorldObserver{observation: tt.observation},
+			}
+			for attempt := 0; attempt < 2; attempt++ {
+				if _, err := reconciler.Reconcile(context.Background(), admissionRequest("run")); err != nil {
+					t.Fatalf("Reconcile() %d error = %v", attempt+1, err)
+				}
+			}
+			if len(item.reports) != 1 || item.reports[0] != tt.wantReport {
+				t.Fatalf("reports = %#v, want %#v", item.reports, []source.Lifecycle{tt.wantReport})
+			}
+			var updated courierv1alpha1.CoderRun
+			if err := client.Get(context.Background(), admissionKey("run"), &updated); err != nil {
+				t.Fatalf("get run: %v", err)
+			}
+			if updated.Status.Phase != tt.wantPhase || updated.Status.PR != "42" {
+				t.Fatalf("status = phase %q PR %q, want %q 42", updated.Status.Phase, updated.Status.PR, tt.wantPhase)
+			}
+		})
+	}
+}
+
+// TestTerminalLifecycleReportRetryReusesIdempotencyKey checks the retry-safe
+// ordering: the lifecycle report precedes the status patch, so a failed patch
+// leaves the phase unchanged and the next reconcile re-reports the same
+// lifecycle carrying the same idempotency key for the source to deduplicate.
+func TestTerminalLifecycleReportRetryReusesIdempotencyKey(t *testing.T) {
+	item := &admissionSource{}
+	run := admissionRun("run", "local", courierv1alpha1.PhaseVerifying)
+	run.Status.Branch = "courier/acme/widgets/issue-1"
+	client := phaseClient(t, run)
+	writer := &failingStatusWriter{fakeStatusWriter: fakeStatusWriter{client: client}, failures: 1}
+	reconciler := &CoderRunReconciler{
+		Client:       client,
+		Sources:      NewSourceRegistry(map[string]source.Adapter{"test": item}),
+		StatusWriter: writer,
+		Observer:     fakeWorldObserver{observation: PRObservation{PR: "42", Checks: []CheckObservation{{State: CheckStateFailed}}}},
+	}
+	if _, err := reconciler.Reconcile(context.Background(), admissionRequest("run")); err == nil {
+		t.Fatal("first Reconcile() error = nil, want status patch failure")
+	}
+	if _, err := reconciler.Reconcile(context.Background(), admissionRequest("run")); err != nil {
+		t.Fatalf("second Reconcile() error = %v", err)
+	}
+	if len(item.reports) != 2 {
+		t.Fatalf("reports = %#v, want one per attempt", item.reports)
+	}
+	want := lifecycleIdempotencyKey(run, courierv1alpha1.PhaseNeedsHuman)
+	if item.reports[0].IdempotencyKey != want {
+		t.Fatalf("first report key = %q, want %q", item.reports[0].IdempotencyKey, want)
+	}
+	if item.reports[1].IdempotencyKey != item.reports[0].IdempotencyKey {
+		t.Fatalf("retry report key = %q, want %q", item.reports[1].IdempotencyKey, item.reports[0].IdempotencyKey)
+	}
+	var updated courierv1alpha1.CoderRun
+	if err := client.Get(context.Background(), admissionKey("run"), &updated); err != nil {
+		t.Fatalf("get run: %v", err)
+	}
+	if updated.Status.Phase != courierv1alpha1.PhaseNeedsHuman {
+		t.Fatalf("phase = %q, want NeedsHuman", updated.Status.Phase)
+	}
 }
 
 func TestDoneRunResolvesSourceWorkItem(t *testing.T) {

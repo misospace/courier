@@ -2,10 +2,12 @@ package main
 
 import (
 	"context"
+	"errors"
 	"testing"
 
 	courierv1alpha1 "github.com/misospace/courier/api/v1alpha1"
 	"github.com/misospace/courier/internal/controller"
+	"github.com/misospace/courier/internal/source/dispatch"
 )
 
 type observerWithHeadResolver struct{}
@@ -16,6 +18,12 @@ func (observerWithHeadResolver) Observe(context.Context, string, string) (contro
 
 func (observerWithHeadResolver) ResolveHead(context.Context, *courierv1alpha1.CoderRun) (string, error) {
 	return "feature/existing", nil
+}
+
+func TestDispatchPRStateCheckerRequiresGitHubObserver(t *testing.T) {
+	if _, err := dispatchPRStateChecker(nil); !errors.Is(err, dispatch.ErrPRStateCheckerNeeded) {
+		t.Fatalf("dispatchPRStateChecker() error = %v, want checker-required", err)
+	}
 }
 
 func TestExistingPRHeadResolver(t *testing.T) {

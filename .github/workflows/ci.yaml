@@ -124,11 +124,21 @@ jobs:
     steps:
       - uses: actions/checkout@v7.0.1
 
+      - uses: actions/setup-go@v7.0.0
+        with:
+          go-version: "1.27.1"
+          cache: true
+
       - uses: azure/setup-helm@v5.0.1
+
+      - name: Configure chart repository
+        run: helm repo add bjw-s-labs https://bjw-s-labs.github.io/helm-charts
+
+      - name: Test chart rendering
+        run: go test ./charts/courier
 
       - name: Lint chart
         run: |
-          helm repo add bjw-s-labs https://bjw-s-labs.github.io/helm-charts
           helm dependency build charts/courier
           helm lint charts/courier
           helm template courier charts/courier --namespace courier-system > rendered.yaml
