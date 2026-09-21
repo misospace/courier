@@ -45,7 +45,7 @@ type CoderRunReconciler struct {
 	PRHeadResolver ExistingPRHeadResolver
 
 	// StatusWriter is the status transport used for operator-owned fields.
-	// Nil falls back to server-side apply through the reconciler's client.
+	// Nil falls back to a JSON merge patch through the reconciler's client.
 	StatusWriter status.PatchWriter
 
 	// Observer reads the external pull request and CI state after a successful run.
@@ -62,7 +62,8 @@ type CoderRunReconciler struct {
 //
 // Pending runs are admitted against the lane's current Claimed + Running
 // count. Claiming happens before launch so the claim itself reserves capacity;
-// a failed launch releases that reservation and leaves the run retryable.
+// a successful coordinator exits to Verifying, which does not reserve capacity;
+// a failed launch releases its reservation and leaves the run retryable.
 func (r *CoderRunReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	l := log.FromContext(ctx)
 
@@ -73,6 +74,9 @@ func (r *CoderRunReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 
 	if run.Status.Phase == courierv1alpha1.PhaseRunning {
 		return r.observeRunning(ctx, &run)
+	}
+	if run.Status.Phase == courierv1alpha1.PhaseVerifying {
+		return r.observeVerifying(ctx, &run)
 	}
 	if run.Status.Phase == courierv1alpha1.PhaseClaimed {
 		return r.resumeClaimed(ctx, &run)
@@ -239,10 +243,6 @@ func (r *CoderRunReconciler) resolveCompleted(ctx context.Context, run *courierv
 }
 
 func (r *CoderRunReconciler) observeRunning(ctx context.Context, run *courierv1alpha1.CoderRun) (ctrl.Result, error) {
-	adapter, item, err := r.adapterAndWorkItem(run)
-	if err != nil {
-		return ctrl.Result{}, err
-	}
 	var pods corev1.PodList
 	if err := r.List(ctx, &pods, client.InNamespace(run.Namespace)); err != nil {
 		return ctrl.Result{}, err
@@ -256,67 +256,81 @@ func (r *CoderRunReconciler) observeRunning(ctx context.Context, run *courierv1a
 		if !terminated {
 			continue
 		}
-		phase := terminalPhaseForExit(exitCode)
-		pr := ""
-		if phase == courierv1alpha1.PhaseAwaitingReview {
-			if r.Observer == nil {
-				phase = courierv1alpha1.PhaseNeedsHuman
-			} else {
-				observation, err := r.Observer.Observe(ctx, run.Spec.Repo, run.Status.Branch)
-				if err != nil {
-					return ctrl.Result{RequeueAfter: observationRequeueDelay}, nil
-				}
-				pr = observation.PR
-				state := observeState(observation)
-				switch state {
-				case observationPending:
-					before := run.DeepCopy()
-					if pr != "" {
-						run.Status.PR = pr
-					}
-					if run.Status.PR != before.Status.PR {
-						if err := r.patchStatus(ctx, before, run); err != nil {
-							return ctrl.Result{}, err
-						}
-					}
-					return ctrl.Result{RequeueAfter: observationRequeueDelay}, nil
-				case observationPassed:
-					phase = courierv1alpha1.PhaseAwaitingReview
-				default:
-					phase = courierv1alpha1.PhaseNeedsHuman
-				}
-			}
-		}
-		var transitionErr error
-		switch phase {
-		case courierv1alpha1.PhaseAwaitingReview:
-			transitionErr = adapter.Transition(ctx, item, source.StateInReview)
-		case courierv1alpha1.PhaseNeedsHuman, courierv1alpha1.PhaseFailed:
-			transitionErr = adapter.Transition(ctx, item, source.StateNeedsHuman)
-		}
-		if transitionErr != nil {
-			return ctrl.Result{}, transitionErr
-		}
-		before := run.DeepCopy()
-		run.Status.Phase = phase
-		if pr != "" {
-			run.Status.PR = pr
-		}
-		if run.Status.Phase != before.Status.Phase || run.Status.PR != before.Status.PR {
+		phase := phaseForExit(exitCode)
+		if phase == courierv1alpha1.PhaseVerifying {
+			before := run.DeepCopy()
+			run.Status.Phase = courierv1alpha1.PhaseVerifying
 			if err := r.patchStatus(ctx, before, run); err != nil {
 				return ctrl.Result{}, err
 			}
+			return ctrl.Result{Requeue: true}, nil
 		}
-		return ctrl.Result{}, nil
+		return r.transitionTerminal(ctx, run, phase, "")
 	}
 	return ctrl.Result{}, nil
 }
 
-// patchStatus writes only the operator-owned status fields that changed
-// between before and after, using server-side apply with the operator's field
-// manager. A full status Update would race with the harness
-// heartbeat/checkpoint writer and could overwrite fields the operator does
-// not own.
+func (r *CoderRunReconciler) observeVerifying(ctx context.Context, run *courierv1alpha1.CoderRun) (ctrl.Result, error) {
+	if r.Observer == nil {
+		return r.transitionTerminal(ctx, run, courierv1alpha1.PhaseNeedsHuman, "")
+	}
+	observation, err := r.Observer.Observe(ctx, run.Spec.Repo, run.Status.Branch)
+	if err != nil {
+		return ctrl.Result{RequeueAfter: observationRequeueDelay}, nil
+	}
+	pr := observation.PR
+	switch observeState(observation) {
+	case observationPending:
+		before := run.DeepCopy()
+		if pr != "" {
+			run.Status.PR = pr
+		}
+		if run.Status.PR != before.Status.PR {
+			if err := r.patchStatus(ctx, before, run); err != nil {
+				return ctrl.Result{}, err
+			}
+		}
+		return ctrl.Result{RequeueAfter: observationRequeueDelay}, nil
+	case observationPassed:
+		return r.transitionTerminal(ctx, run, courierv1alpha1.PhaseAwaitingReview, pr)
+	default:
+		return r.transitionTerminal(ctx, run, courierv1alpha1.PhaseNeedsHuman, pr)
+	}
+}
+
+func (r *CoderRunReconciler) transitionTerminal(ctx context.Context, run *courierv1alpha1.CoderRun, phase courierv1alpha1.Phase, pr string) (ctrl.Result, error) {
+	adapter, item, err := r.adapterAndWorkItem(run)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+	var state source.State
+	switch phase {
+	case courierv1alpha1.PhaseAwaitingReview:
+		state = source.StateInReview
+	case courierv1alpha1.PhaseNeedsHuman, courierv1alpha1.PhaseFailed:
+		state = source.StateNeedsHuman
+	}
+	if state != "" {
+		if err := adapter.Transition(ctx, item, state); err != nil {
+			return ctrl.Result{}, err
+		}
+	}
+	before := run.DeepCopy()
+	run.Status.Phase = phase
+	if pr != "" {
+		run.Status.PR = pr
+	}
+	if run.Status.Phase != before.Status.Phase || run.Status.PR != before.Status.PR {
+		if err := r.patchStatus(ctx, before, run); err != nil {
+			return ctrl.Result{}, err
+		}
+	}
+	return ctrl.Result{}, nil
+}
+
+// patchStatus writes a narrow JSON merge patch through the status subresource.
+// It includes only changed operator-owned fields, preserving harness-owned
+// fields that the patch omits.
 func (r *CoderRunReconciler) patchStatus(ctx context.Context, before, after *courierv1alpha1.CoderRun) error {
 	if before == nil || after == nil {
 		return errors.New("coderun controller: status patch requires a run")
@@ -367,10 +381,10 @@ func coordinatorExitCode(pod *corev1.Pod) (int32, bool) {
 	return 0, false
 }
 
-func terminalPhaseForExit(exitCode int32) courierv1alpha1.Phase {
+func phaseForExit(exitCode int32) courierv1alpha1.Phase {
 	switch exitCode {
 	case 0:
-		return courierv1alpha1.PhaseAwaitingReview
+		return courierv1alpha1.PhaseVerifying
 	case 2:
 		return courierv1alpha1.PhaseNeedsHuman
 	default:

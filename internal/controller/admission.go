@@ -16,7 +16,8 @@ type LaunchFunc func(context.Context, *courierv1alpha1.CoderRun) error
 
 // phaseConsumesCapacity reports whether a run has been admitted to a lane.
 // Claimed reserves capacity while the operator is launching the coordinator;
-// Running continues to reserve it until the run reaches a terminal phase.
+// Running continues to reserve it until the coordinator exits. Verifying has
+// no coordinator execution capacity to reserve.
 func phaseConsumesCapacity(phase courierv1alpha1.Phase) bool {
 	return phase == courierv1alpha1.PhaseClaimed || phase == courierv1alpha1.PhaseRunning
 }

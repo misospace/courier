@@ -72,10 +72,11 @@ func TestEnvtestResolveIssueLifecycle(t *testing.T) {
 			"manual": item,
 		}),
 		StatusWriter: status.KubePatchWriter{Client: envtestClient},
-		Observer: fakeWorldObserver{observation: PRObservation{
-			PR:     "42",
-			Checks: []CheckObservation{{State: CheckStatePassed}},
+		Observer: &sequenceWorldObserver{observations: []PRObservation{
+			{PR: "42", Checks: []CheckObservation{{State: CheckStatePending}}},
+			{PR: "42", Checks: []CheckObservation{{State: CheckStatePassed}}},
 		}},
+
 		Launch: func(ctx context.Context, run *courierv1alpha1.CoderRun) error {
 			var claimed courierv1alpha1.CoderRun
 			if err := envtestClient.Get(ctx, envtestKey(name), &claimed); err != nil {
@@ -121,16 +122,67 @@ func TestEnvtestResolveIssueLifecycle(t *testing.T) {
 	reconcile()
 	assertEnvtestPhase(t, name, courierv1alpha1.PhaseRunning)
 	reconcile()
+	assertEnvtestPhase(t, name, courierv1alpha1.PhaseVerifying)
+	var pending courierv1alpha1.CoderRun
+	if err := envtestClient.Get(ctx, envtestKey(name), &pending); err != nil {
+		t.Fatal(err)
+	}
+	if pending.Status.PR != "" {
+		t.Fatalf("pending PR = %q, want empty before PR registration", pending.Status.PR)
+	}
+	reconcile()
+	assertEnvtestPhase(t, name, courierv1alpha1.PhaseVerifying)
 	var updated courierv1alpha1.CoderRun
 	if err := envtestClient.Get(ctx, envtestKey(name), &updated); err != nil {
 		t.Fatal(err)
 	}
-	if updated.Status.Phase != courierv1alpha1.PhaseAwaitingReview || updated.Status.PR != "42" {
-		t.Fatalf("run status = phase %q PR %q, want AwaitingReview and 42", updated.Status.Phase, updated.Status.PR)
+	if updated.Status.PR != "42" {
+		t.Fatalf("run PR = %q, want 42", updated.Status.PR)
+	}
+	reconcile()
+	if err := envtestClient.Get(ctx, envtestKey(name), &updated); err != nil {
+		t.Fatal(err)
+	}
+	if updated.Status.Phase != courierv1alpha1.PhaseAwaitingReview {
+		t.Fatalf("run phase = %q, want AwaitingReview", updated.Status.Phase)
 	}
 	if len(item.transitions) != 2 || item.transitions[0] != source.StateInProgress || item.transitions[1] != source.StateInReview {
 		t.Fatalf("source transitions = %#v", item.transitions)
 	}
+}
+
+func TestEnvtestVerifyingRunDoesNotConsumeCapacity(t *testing.T) {
+	if envtestClient == nil {
+		t.Skip("KUBEBUILDER_ASSETS is not set")
+	}
+	ctx := context.Background()
+	laneName := "envtest-verifying-capacity"
+	firstName := "envtest-verifying-first"
+	secondName := "envtest-verifying-second"
+	lane := envtestLane(laneName)
+	first := envtestRun(firstName, laneName)
+	first.Status.Phase = courierv1alpha1.PhaseVerifying
+	second := envtestRun(secondName, laneName)
+	if err := envtestClient.Create(ctx, lane); err != nil {
+		t.Fatal(err)
+	}
+	if err := envtestClient.Create(ctx, first); err != nil {
+		t.Fatal(err)
+	}
+	if err := envtestClient.Create(ctx, second); err != nil {
+		t.Fatal(err)
+	}
+	reconciler := &CoderRunReconciler{
+		Client: envtestClient,
+		Sources: NewSourceRegistry(map[string]source.Adapter{
+			"manual": &admissionSource{},
+		}),
+		StatusWriter: status.KubePatchWriter{Client: envtestClient},
+	}
+	if _, err := reconciler.Reconcile(ctx, envtestRequest(secondName)); err != nil {
+		t.Fatal(err)
+	}
+	assertEnvtestPhase(t, secondName, courierv1alpha1.PhaseClaimed)
 }
 
 func TestEnvtestLaunchFailureReleasesClaim(t *testing.T) {
@@ -216,4 +268,18 @@ func assertEnvtestPhase(t *testing.T, name string, want courierv1alpha1.Phase) {
 	if run.Status.Phase != want {
 		t.Fatalf("phase = %q, want %q", run.Status.Phase, want)
 	}
+}
+
+type sequenceWorldObserver struct {
+	observations []PRObservation
+	calls        int
+}
+
+func (o *sequenceWorldObserver) Observe(context.Context, string, string) (PRObservation, error) {
+	if o.calls >= len(o.observations) {
+		return PRObservation{}, errors.New("unexpected observation")
+	}
+	observation := o.observations[o.calls]
+	o.calls++
+	return observation, nil
 }

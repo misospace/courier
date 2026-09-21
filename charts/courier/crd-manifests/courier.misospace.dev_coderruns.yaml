@@ -241,6 +241,7 @@ spec:
                 - Pending
                 - Claimed
                 - Running
+                - Verifying
                 - AwaitingReview
                 - NeedsHuman
                 - Done

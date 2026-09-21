@@ -38,7 +38,7 @@ func TestOpenCodeResultMapsEveryTermination(t *testing.T) {
 		err      error
 		phase    TerminalPhase
 	}{
-		{name: "success", exitCode: OpenCodeExitSuccess, phase: TerminalAwaitingReview},
+		{name: "success", exitCode: OpenCodeExitSuccess, phase: TerminalVerifying},
 		{name: "needs human", exitCode: OpenCodeExitNeedsHuman, phase: TerminalNeedsHuman},
 		{name: "other exit", exitCode: 1, phase: TerminalFailed},
 		{name: "process error", exitCode: 0, err: errors.New("backend unavailable"), phase: TerminalFailed},

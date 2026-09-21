@@ -75,8 +75,10 @@ spec:
 ```
 
 The operator derives the resolve branch, creates the coordinator pod, and
-observes its exit. Exit `0` moves the run to `AwaitingReview`; exit `2` moves it
-to `NeedsHuman`; any other exit moves it to `Failed`.
+observes its exit. Exit `0` moves the run to `Verifying`, where the operator
+polls the external PR and CI state until it reaches `AwaitingReview` or
+`NeedsHuman`; exit `2` moves it to `NeedsHuman`; any other exit moves it to
+`Failed`.
 
 The OpenCode shim does not survive pod/model restarts with conversational state.
 Git commits and the remote branch are its durable floor until the custom harness

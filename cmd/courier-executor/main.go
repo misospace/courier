@@ -179,7 +179,7 @@ func run(ctx context.Context, stdout, stderr io.Writer) int {
 		return code
 	}
 
-	emitTermination(stdout, cfg, termination{Phase: "AwaitingReview", Result: "success", ExitCode: exitSuccess, Reason: "opencode completed"})
+	emitTermination(stdout, cfg, termination{Phase: "Verifying", Result: "success", ExitCode: exitSuccess, Reason: "opencode completed"})
 	return exitSuccess
 }
 
