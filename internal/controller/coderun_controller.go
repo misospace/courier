@@ -56,6 +56,14 @@ type CoderRunReconciler struct {
 	// deployment's log collection stack. Nil disables emission; a failed
 	// emission never fails reconciliation.
 	Events *courierlog.Emitter
+
+	// DoneRetention is how long a resolved Done run is kept before deletion.
+	// Zero uses the package default.
+	DoneRetention time.Duration
+
+	// Now is the reconciler's time source, injectable so tests never sleep.
+	// Nil falls back to time.Now.
+	Now func() time.Time
 }
 
 // +kubebuilder:rbac:groups=courier.misospace.dev,resources=coderuns,verbs=get;list;watch;create;update;patch;delete
@@ -88,7 +96,7 @@ func (r *CoderRunReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 		return r.resumeClaimed(ctx, &run)
 	}
 	if run.Status.Phase == courierv1alpha1.PhaseDone {
-		return ctrl.Result{}, r.resolveCompleted(ctx, &run)
+		return r.resolveCompleted(ctx, &run)
 	}
 	// Status is initially empty on a newly-created CoderRun. Treat that zero
 	// value as Pending so a source does not need a second status write before
@@ -264,12 +272,19 @@ func (r *CoderRunReconciler) releaseClaim(ctx context.Context, run *courierv1alp
 	return errors.Join(cause, releaseErr, statusErr)
 }
 
-func (r *CoderRunReconciler) resolveCompleted(ctx context.Context, run *courierv1alpha1.CoderRun) error {
+// resolveCompleted closes the source work for a Done run and then applies the
+// reap policy. The source lifecycle must succeed before the retention clock
+// starts or deletion happens: a run whose source could not be resolved is
+// never reaped.
+func (r *CoderRunReconciler) resolveCompleted(ctx context.Context, run *courierv1alpha1.CoderRun) (ctrl.Result, error) {
 	adapter, item, err := r.adapterAndWorkItem(run)
 	if err != nil {
-		return err
+		return ctrl.Result{}, err
 	}
-	return adapter.Resolve(ctx, item)
+	if err := adapter.Resolve(ctx, item); err != nil {
+		return ctrl.Result{}, err
+	}
+	return r.reapDone(ctx, run)
 }
 
 func (r *CoderRunReconciler) observeRunning(ctx context.Context, run *courierv1alpha1.CoderRun) (ctrl.Result, error) {
