@@ -34,12 +34,13 @@ RUN apt-get update && \
 	apt-get install -y --no-install-recommends ca-certificates git && \
 	apt-get clean && rm -rf /var/lib/apt/lists/* && \
 	npm install -g opencode-ai@${OPENCODE_VERSION} && \
-	useradd --create-home --uid 65532 courier && \
+	groupadd --gid 65532 courier && \
+	useradd --create-home --uid 65532 --gid 65532 courier && \
 	mkdir -p /workspace && chown courier:courier /workspace
 
 COPY --from=builder /workspace/courier-executor /usr/local/bin/courier-executor
 
-USER courier
+USER 65532:65532
 ENV HOME=/home/courier
 WORKDIR /workspace
 

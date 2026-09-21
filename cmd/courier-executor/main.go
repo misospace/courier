@@ -225,6 +225,10 @@ func run(ctx context.Context, stdout, stderr io.Writer) int {
 	defer restoreIdentity()
 	restoreEnv := installAskpass(askpassPath)
 	defer restoreEnv()
+	if err := git.TrustDirectory(ctx, cfg.Directory); err != nil {
+		report.terminate(termination{Phase: "Failed", Result: "failure", ExitCode: 1, Reason: "trust workspace: " + err.Error()})
+		return 1
+	}
 
 	if code := report.guardAdoption(ctx); code != 0 {
 		return code

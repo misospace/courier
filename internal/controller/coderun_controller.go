@@ -67,9 +67,9 @@ type CoderRunReconciler struct {
 	Now func() time.Time
 }
 
-// +kubebuilder:rbac:groups=courier.misospace.dev,resources=coderuns,verbs=get;list;watch;create;update;patch;delete
-// +kubebuilder:rbac:groups=courier.misospace.dev,resources=coderuns/status,verbs=get;update;patch
-// +kubebuilder:rbac:groups=courier.misospace.dev,resources=coderuns/finalizers,verbs=update
+// +kubebuilder:rbac:groups=courier.misospace.dev,resources=coderruns,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups=courier.misospace.dev,resources=coderruns/status,verbs=get;update;patch
+// +kubebuilder:rbac:groups=courier.misospace.dev,resources=coderruns/finalizers,verbs=update
 // +kubebuilder:rbac:groups=courier.misospace.dev,resources=laneprofiles,verbs=get;list;watch
 // +kubebuilder:rbac:groups="",resources=pods,verbs=get;list;watch;create;delete
 

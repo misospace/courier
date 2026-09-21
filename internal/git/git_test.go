@@ -177,6 +177,27 @@ func TestRemoteBranchExists(t *testing.T) {
 	}
 }
 
+func TestTrustDirectoryAddsOnlyConfiguredPath(t *testing.T) {
+	t.Setenv("GIT_CONFIG_GLOBAL", filepath.Join(t.TempDir(), "gitconfig"))
+	directory := filepath.Join(t.TempDir(), "workspace")
+	if err := os.MkdirAll(directory, 0o755); err != nil {
+		t.Fatalf("create workspace: %v", err)
+	}
+	if err := TrustDirectory(context.Background(), directory); err != nil {
+		t.Fatalf("TrustDirectory: %v", err)
+	}
+	output, err := gitOutput(directory, "config", "--global", "--get-all", "safe.directory")
+	if err != nil {
+		t.Fatalf("read safe.directory: %v", err)
+	}
+	if got := strings.TrimSpace(string(output)); got != directory {
+		t.Fatalf("safe.directory = %q, want %q", got, directory)
+	}
+	if err := TrustDirectory(context.Background(), "*"); err == nil {
+		t.Fatal("TrustDirectory accepted a wildcard path")
+	}
+}
+
 func TestBranchNameRejectsMissingRef(t *testing.T) {
 	if _, err := BranchName("acme/widget", 0, "resolve-issue"); err == nil {
 		t.Fatal("BranchName accepted a missing ref")

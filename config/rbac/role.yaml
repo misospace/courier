@@ -17,7 +17,7 @@ rules:
 - apiGroups:
   - courier.misospace.dev
   resources:
-  - coderuns
+  - coderruns
   verbs:
   - create
   - delete
@@ -29,13 +29,13 @@ rules:
 - apiGroups:
   - courier.misospace.dev
   resources:
-  - coderuns/finalizers
+  - coderruns/finalizers
   verbs:
   - update
 - apiGroups:
   - courier.misospace.dev
   resources:
-  - coderuns/status
+  - coderruns/status
   verbs:
   - get
   - patch
