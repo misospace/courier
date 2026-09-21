@@ -23,6 +23,7 @@ func TestAdmittedCountOnlyCountsClaimedAndRunningOnLane(t *testing.T) {
 	runs := []courierv1alpha1.CoderRun{
 		{Spec: courierv1alpha1.CoderRunSpec{Lane: "local"}, Status: courierv1alpha1.CoderRunStatus{Phase: courierv1alpha1.PhaseClaimed}},
 		{Spec: courierv1alpha1.CoderRunSpec{Lane: "local"}, Status: courierv1alpha1.CoderRunStatus{Phase: courierv1alpha1.PhaseRunning}},
+		{Spec: courierv1alpha1.CoderRunSpec{Lane: "local"}, Status: courierv1alpha1.CoderRunStatus{Phase: courierv1alpha1.PhaseVerifying}},
 		{Spec: courierv1alpha1.CoderRunSpec{Lane: "local"}, Status: courierv1alpha1.CoderRunStatus{Phase: courierv1alpha1.PhasePending}},
 		{Spec: courierv1alpha1.CoderRunSpec{Lane: "local"}, Status: courierv1alpha1.CoderRunStatus{Phase: courierv1alpha1.PhaseAwaitingReview}},
 		{Spec: courierv1alpha1.CoderRunSpec{Lane: "local"}, Status: courierv1alpha1.CoderRunStatus{Phase: courierv1alpha1.PhaseNeedsHuman}},
@@ -32,7 +33,7 @@ func TestAdmittedCountOnlyCountsClaimedAndRunningOnLane(t *testing.T) {
 	}
 
 	if got := admittedCount(runs, "local"); got != 2 {
-		t.Fatalf("admittedCount(local) = %d, want 2", got)
+		t.Fatalf("admittedCount(local) = %d, want 2; Verifying must not consume capacity", got)
 	}
 	if !laneHasCapacity(runs, "local", 3) {
 		t.Fatal("laneHasCapacity(local, 3) = false, want true")
@@ -68,33 +69,17 @@ func TestReconcileLeavesNPlusOnePending(t *testing.T) {
 	}
 }
 
-func TestReconcileAdmitsNPlusOneAfterCapacityFrees(t *testing.T) {
+func TestReconcileAdmitsPendingRunWhenFirstRunVerifies(t *testing.T) {
 	client := admissionClient(t,
 		admissionLane("local", 1),
-		admissionRun("busy", "local", courierv1alpha1.PhaseRunning),
+		admissionRun("busy", "local", courierv1alpha1.PhaseVerifying),
 		admissionRun("next", "local", courierv1alpha1.PhasePending),
 	)
 	reconciler := admissionReconciler(client)
 
-	if result, err := reconciler.Reconcile(context.Background(), admissionRequest("next")); err != nil {
-		t.Fatalf("Reconcile() while full: %v", err)
-	} else if result.RequeueAfter != capacityRequeueDelay {
-		t.Fatalf("RequeueWhile full = %v, want %v", result.RequeueAfter, capacityRequeueDelay)
-	}
-
-	// The occupying run finishes, releasing its slot.
-	var busy courierv1alpha1.CoderRun
-	if err := client.Get(context.Background(), admissionKey("busy"), &busy); err != nil {
-		t.Fatalf("get busy run: %v", err)
-	}
-	busy.Status.Phase = courierv1alpha1.PhaseAwaitingReview
-	if err := client.Status().Update(context.Background(), &busy); err != nil {
-		t.Fatalf("mark busy run terminal: %v", err)
-	}
-
 	result, err := reconciler.Reconcile(context.Background(), admissionRequest("next"))
 	if err != nil {
-		t.Fatalf("Reconcile() after capacity freed: %v", err)
+		t.Fatalf("Reconcile() after first run became Verifying: %v", err)
 	}
 	if result.RequeueAfter != 0 {
 		t.Fatalf("RequeueAfter after admission = %v, want 0", result.RequeueAfter)
@@ -222,6 +207,7 @@ func (w fakeStatusWriter) PatchStatus(ctx context.Context, name types.Namespaced
 		Status struct {
 			Phase  courierv1alpha1.Phase `json:"phase,omitempty"`
 			Branch *string               `json:"branch,omitempty"`
+			PR     string                `json:"pr,omitempty"`
 		} `json:"status"`
 	}
 	if err := json.Unmarshal(patch, &document); err != nil {
@@ -236,6 +222,9 @@ func (w fakeStatusWriter) PatchStatus(ctx context.Context, name types.Namespaced
 	}
 	if document.Status.Branch != nil {
 		run.Status.Branch = *document.Status.Branch
+	}
+	if document.Status.PR != "" {
+		run.Status.PR = document.Status.PR
 	}
 	return w.client.Status().Update(ctx, &run)
 }

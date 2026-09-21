@@ -1,13 +1,19 @@
 package main
 
 import (
+	"context"
 	"flag"
+	"fmt"
 	"os"
+	"strings"
 
+	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/runtime"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/healthz"
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
 	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
@@ -15,6 +21,7 @@ import (
 	courierv1alpha1 "github.com/misospace/courier/api/v1alpha1"
 	"github.com/misospace/courier/internal/controller"
 	"github.com/misospace/courier/internal/executor"
+	couriergithub "github.com/misospace/courier/internal/github"
 	"github.com/misospace/courier/internal/source"
 	"github.com/misospace/courier/internal/source/manual"
 	"github.com/misospace/courier/internal/status"
@@ -83,18 +90,6 @@ func main() {
 		Scheme: mgr.GetScheme(),
 		Pod:    podConfig,
 	}
-	if err := (&controller.CoderRunReconciler{
-		Client: mgr.GetClient(),
-		Scheme: mgr.GetScheme(),
-		Launch: launcher.Launch,
-		Sources: controller.NewSourceRegistry(map[string]source.Adapter{
-			"manual": manual.Adapter{},
-		}),
-		StatusWriter: status.KubePatchWriter{Client: mgr.GetClient()},
-	}).SetupWithManager(mgr); err != nil {
-		setupLog.Error(err, "unable to create controller", "controller", "CoderRun")
-		os.Exit(1)
-	}
 
 	if err := mgr.AddHealthzCheck("healthz", healthz.Ping); err != nil {
 		setupLog.Error(err, "unable to set up health check")
@@ -105,9 +100,77 @@ func main() {
 		os.Exit(1)
 	}
 
+	githubObserver, err := githubObserver(context.Background(), mgr.GetAPIReader(), os.Getenv("POD_NAMESPACE"), githubCredentialSecret, githubTokenKey, gitCredentialSecret, gitTokenKey)
+	if err != nil {
+		setupLog.Error(err, "unable to configure GitHub observer")
+		os.Exit(1)
+	}
+	if githubObserver == nil {
+		setupLog.Info("GitHub observer disabled; no API credential Secret configured")
+	}
+	if err := (&controller.CoderRunReconciler{
+		Client: mgr.GetClient(),
+		Scheme: mgr.GetScheme(),
+		Launch: launcher.Launch,
+		Sources: controller.NewSourceRegistry(map[string]source.Adapter{
+			"manual": manual.Adapter{},
+		}),
+		StatusWriter:   status.KubePatchWriter{Client: mgr.GetClient()},
+		Observer:       githubObserver,
+		PRHeadResolver: existingPRHeadResolver(githubObserver),
+	}).SetupWithManager(mgr); err != nil {
+		setupLog.Error(err, "unable to create controller", "controller", "CoderRun")
+		os.Exit(1)
+	}
+
 	setupLog.Info("starting manager")
 	if err := mgr.Start(ctrl.SetupSignalHandler()); err != nil {
 		setupLog.Error(err, "problem running manager")
 		os.Exit(1)
 	}
+}
+
+func existingPRHeadResolver(observer controller.WorldObserver) controller.ExistingPRHeadResolver {
+	if observer == nil {
+		return nil
+	}
+	resolver, _ := observer.(controller.ExistingPRHeadResolver)
+	return resolver
+}
+
+func githubObserver(ctx context.Context, reader client.Reader, namespace, configuredSecret, configuredKey, gitSecret, gitKey string) (controller.WorldObserver, error) {
+	secretName := strings.TrimSpace(configuredSecret)
+	if secretName == "" {
+		secretName = strings.TrimSpace(gitSecret)
+	}
+	if secretName == "" {
+		return nil, nil
+	}
+	namespace = strings.TrimSpace(namespace)
+	if namespace == "" {
+		return nil, fmt.Errorf("POD_NAMESPACE is required when a GitHub credential Secret is configured")
+	}
+	secretKey := strings.TrimSpace(configuredKey)
+	if secretKey == "" {
+		secretKey = strings.TrimSpace(gitKey)
+	}
+	if secretKey == "" {
+		secretKey = "token"
+	}
+	var secret corev1.Secret
+	if err := reader.Get(ctx, client.ObjectKey{Namespace: namespace, Name: secretName}, &secret); err != nil {
+		if apierrors.IsNotFound(err) {
+			return nil, fmt.Errorf("GitHub credential Secret %s/%s: %w", namespace, secretName, err)
+		}
+		return nil, fmt.Errorf("read GitHub credential Secret %s/%s: %w", namespace, secretName, err)
+	}
+	token, ok := secret.Data[secretKey]
+	if !ok || strings.TrimSpace(string(token)) == "" {
+		return nil, fmt.Errorf("GitHub credential Secret %s/%s has no non-empty %q key", namespace, secretName, secretKey)
+	}
+	githubClient, err := couriergithub.New(string(token))
+	if err != nil {
+		return nil, err
+	}
+	return couriergithub.Observer{Client: githubClient}, nil
 }

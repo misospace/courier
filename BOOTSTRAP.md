@@ -32,9 +32,10 @@ make docker-build-coordinator EXECUTOR_IMG=ghcr.io/misospace/courier-opencode:la
 ```
 
 Create `courier-github` in the operator namespace with `username` and `token`
-keys. The token needs branch push and pull-request permissions, but must not
-have administration or protected-branch bypass. The repository's default
-branch must require independent human approval.
+keys. The token needs branch push, pull-request read, Checks read, and commit-status
+read permissions, but must retain least privilege and must not have
+administration or protected-branch bypass. The repository's default branch must
+require independent human approval.
 
 Provider or gateway environment variables can be placed in another Secret and
 selected with `--executor-environment-secret`.
@@ -75,8 +76,10 @@ spec:
 ```
 
 The operator derives the resolve branch, creates the coordinator pod, and
-observes its exit. Exit `0` moves the run to `AwaitingReview`; exit `2` moves it
-to `NeedsHuman`; any other exit moves it to `Failed`.
+observes its exit. Exit `0` moves the run to `Verifying`, where the operator
+polls the external PR and CI state until it reaches `AwaitingReview` or
+`NeedsHuman`; exit `2` moves it to `NeedsHuman`; any other exit moves it to
+`Failed`.
 
 The OpenCode shim does not survive pod/model restarts with conversational state.
 Git commits and the remote branch are its durable floor until the custom harness

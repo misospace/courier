@@ -14,13 +14,14 @@ const (
 )
 
 // Phase is the lifecycle phase of a CoderRun.
-// +kubebuilder:validation:Enum=Pending;Claimed;Running;AwaitingReview;NeedsHuman;Done;Failed
+// +kubebuilder:validation:Enum=Pending;Claimed;Running;Verifying;AwaitingReview;NeedsHuman;Done;Failed
 type Phase string
 
 const (
 	PhasePending        Phase = "Pending"
 	PhaseClaimed        Phase = "Claimed"
 	PhaseRunning        Phase = "Running"
+	PhaseVerifying      Phase = "Verifying"
 	PhaseAwaitingReview Phase = "AwaitingReview"
 	PhaseNeedsHuman     Phase = "NeedsHuman"
 	PhaseDone           Phase = "Done"

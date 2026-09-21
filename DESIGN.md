@@ -156,10 +156,11 @@ Two different problems, two different owners.
 
 **Cross-run** is the operator's job: a `LaneProfile` carries a `concurrency`
 limit (default 1 for a local lane). The operator admits at most that many
-`Running` runs on the lane. This is a plain count, not a slot object. Its real
-purpose is to guarantee there is exactly one controller reasoning about a given
-GPU at a time, so the within-run throttle below never has to reason about
-competing controllers.
+`Claimed` + `Running` runs on the lane. `Verifying` runs do not consume
+LaneProfile execution capacity because their coordinator pods have exited. This
+is a plain count, not a slot object. Its real purpose is to guarantee there is
+exactly one controller reasoning about a given GPU at a time, so the within-run
+throttle below never has to reason about competing controllers.
 
 **Within-run** is the coordinator's job, and it is *informed, not enforced*. The
 coordinator's framing tells it the reality ("single card, may queue behind a
@@ -311,7 +312,7 @@ spec:                       # set once by the source adapter, then immutable
   debug: false                     # per-run: bumps pod log level, nothing else
   # no attempts field — by design
 status:
-  phase: Pending | Claimed | Running | AwaitingReview | NeedsHuman | Done | Failed
+  phase: Pending | Claimed | Running | Verifying | AwaitingReview | NeedsHuman | Done | Failed
   branch: <derived resolve branch or adopted PR head>
   pr: <#/url>
   lastCommit: <sha>
@@ -330,7 +331,7 @@ that makes Courier portable.
 
 ```yaml
 spec:
-  concurrency: 1                   # max Running CoderRuns admitted on this lane
+  concurrency: 1                   # max Claimed + Running CoderRuns admitted on this lane
   roles:
     coordinator: <model>
     coder: <model>
@@ -359,13 +360,18 @@ it modest" with `concurrency: 1`. Same schema, no local assumption baked in.
 - **Running** — pod launches: ephemeral workspace, clone, **adopt the branch if it
   exists and base-sync first**, inject LaneProfile framing + roles, wire the MCP
   tools, set log level from `debug`. The pod heartbeats and checkpoints to
-  status and commits per brief. Exits to:
-  - **AwaitingReview** — PR open, CI green, coordinator ready. Source →
-    in-review. Slot released.
-  - **NeedsHuman** — coordinator declared stuck. `needs-human` on the PR/issue.
-    Slot released.
-  - **relaunch** — pod died or heartbeat stalled: `restarts++`; under N → resume
-    from checkpoint; at N → NeedsHuman (crashloop).
+  status and commits per brief. Exit `0` transitions to **Verifying** before
+  any external observation, releasing the lane capacity. Exit `2` transitions
+  to **NeedsHuman**; any other exit transitions to **Failed**. A pod death or
+  heartbeat stall relaunches/resumes it; a crashloop reaches NeedsHuman.
+- **Verifying** — no coordinator pod or liveness meaning. The operator polls
+  the external PR and CI world indefinitely, with a reconciliation cadence and
+  no deadline. Observer errors remain Verifying and requeue. A missing observer,
+  missing/draft PR, or failed check reaches **NeedsHuman**. A PR with no checks
+  or pending checks remains Verifying; the PR is persisted. A PR with all checks
+  passed transitions to **AwaitingReview** and the source becomes in-review.
+  Verifying does not consume LaneProfile execution capacity, and the source
+  remains in-progress throughout it.
 - **AwaitingReview** is terminal for this run. Human merges → operator marks
   **Done** and resolves the source; or feedback/conflict → the source spawns a
   fresh `fix-pr` run, and this one goes Done/archived.

@@ -63,11 +63,11 @@ func TestRunPreparesOrphanBranchAndInvokesOpenCodeWithExactContext(t *testing.T)
 	if !strings.Contains(output.String(), "Open a PR to address issue #7.") || !strings.Contains(output.String(), "any-model/name") || !strings.Contains(output.String(), "capacity is elastic; fan out freely") {
 		t.Fatalf("OpenCode did not receive exact goal/model/framing: %q", output.String())
 	}
-	if !strings.Contains(output.String(), `COURIER_TERMINATION {"phase":"AwaitingReview","result":"success","exit_code":0`) {
+	if !strings.Contains(output.String(), `COURIER_TERMINATION {"phase":"Verifying","result":"success","exit_code":0`) {
 		t.Fatalf("missing stable success termination: %q", output.String())
 	}
 	terminationOutput := string(mustRead(t, termination))
-	if !strings.Contains(terminationOutput, `"phase":"AwaitingReview"`) {
+	if !strings.Contains(terminationOutput, `"phase":"Verifying"`) {
 		t.Fatalf("termination file = %q", terminationOutput)
 	}
 }
@@ -133,7 +133,7 @@ func TestRunResolveIssueAdoptsBranchWithoutPullRequest(t *testing.T) {
 	if code != exitSuccess {
 		t.Fatalf("run exit code = %d, want 0; stderr=%q stdout=%q", code, errorsOut.String(), output.String())
 	}
-	if !strings.Contains(output.String(), `"phase":"AwaitingReview"`) {
+	if !strings.Contains(output.String(), `"phase":"Verifying"`) {
 		t.Fatalf("orphan adoption should proceed to success: %q", output.String())
 	}
 	if !strings.Contains(output.String(), "opencode argv") {

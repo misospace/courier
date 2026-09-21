@@ -18,13 +18,13 @@ import (
 type TerminalPhase string
 
 const (
-	TerminalAwaitingReview TerminalPhase = TerminalPhase(courierv1alpha1.PhaseAwaitingReview)
-	TerminalNeedsHuman     TerminalPhase = TerminalPhase(courierv1alpha1.PhaseNeedsHuman)
-	TerminalFailed         TerminalPhase = TerminalPhase(courierv1alpha1.PhaseFailed)
+	TerminalVerifying  TerminalPhase = TerminalPhase(courierv1alpha1.PhaseVerifying)
+	TerminalNeedsHuman TerminalPhase = TerminalPhase(courierv1alpha1.PhaseNeedsHuman)
+	TerminalFailed     TerminalPhase = TerminalPhase(courierv1alpha1.PhaseFailed)
 )
 
 // Outcome is the only result an executor returns after its process exits.
-// An exit code of zero is a successful handoff to the review phase; the
+// An exit code of zero is a successful handoff to external verification; the
 // temporary shim uses exit code 2 for a deliberate needs-human result and
 // treats all other failures as infrastructure/runtime failures.
 type Outcome struct {

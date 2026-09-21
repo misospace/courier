@@ -67,7 +67,7 @@ func (o OpenCode) Result(exitCode int, err error) Outcome {
 	}
 	switch exitCode {
 	case OpenCodeExitSuccess:
-		return Outcome{Phase: TerminalAwaitingReview, Reason: "opencode completed"}
+		return Outcome{Phase: TerminalVerifying, Reason: "opencode completed"}
 	case OpenCodeExitNeedsHuman:
 		return Outcome{Phase: TerminalNeedsHuman, Reason: "opencode requested human attention"}
 	default:
