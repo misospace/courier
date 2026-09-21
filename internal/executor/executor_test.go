@@ -32,6 +32,26 @@ func TestOpenCodeCommandInjectsGoalModelAndFraming(t *testing.T) {
 	}
 }
 
+func TestOpenCodeCommandIncludesConfiguredAgent(t *testing.T) {
+	invocation := Invocation{Goal: "goal", Model: "model"}
+	for _, test := range []struct {
+		name  string
+		agent string
+		want  []string
+	}{
+		{name: "trimmed lead", agent: " lead ", want: []string{"run", "--model", "model", "--agent", "lead", "goal"}},
+		{name: "arbitrary architect", agent: "architect", want: []string{"run", "--model", "model", "--agent", "architect", "goal"}},
+		{name: "empty", want: []string{"run", "--model", "model", "goal"}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			command := (OpenCode{Binary: "opencode", Agent: test.agent}).Command(invocation)
+			if !sameStrings(command.Args, test.want) {
+				t.Fatalf("command args = %#v, want %#v", command.Args, test.want)
+			}
+		})
+	}
+}
+
 func TestOpenCodeResultMapsEveryTermination(t *testing.T) {
 	runtime := DefaultOpenCode()
 	for _, test := range []struct {
@@ -150,18 +170,19 @@ func TestBuildCoordinatorPodInjectsRunContextAndEphemeralWorkspace(t *testing.T)
 		env[value.Name] = value.Value
 	}
 	for key, want := range map[string]string{
-		"COURIER_GOAL":        "Open a PR to address issue #7. Make sure CI is green and it's ready for review, and delegate as much as possible to keep your context clean.",
-		"COURIER_MODEL":       "litellm/qwen",
-		"COURIER_FRAMING":     "single GPU; keep parallelism modest",
-		"COURIER_LOG_LEVEL":   "debug",
-		"COURIER_REPO":        "acme/widgets",
-		"COURIER_BRANCH":      "courier/acme/widgets/issue-7",
-		"COURIER_WORKSPACE":   "/workspace",
-		"COURIER_BASE":        "main",
-		"GIT_AUTHOR_NAME":     "Courier",
-		"GIT_AUTHOR_EMAIL":    "courier@localhost",
-		"GIT_COMMITTER_NAME":  "Courier",
-		"GIT_COMMITTER_EMAIL": "courier@localhost",
+		"COURIER_GOAL":          "Open a PR to address issue #7. Make sure CI is green and it's ready for review, and delegate as much as possible to keep your context clean.",
+		"COURIER_MODEL":         "litellm/qwen",
+		"COURIER_OPENCODE_AGENT": "",
+		"COURIER_FRAMING":       "single GPU; keep parallelism modest",
+		"COURIER_LOG_LEVEL":     "debug",
+		"COURIER_REPO":          "acme/widgets",
+		"COURIER_BRANCH":        "courier/acme/widgets/issue-7",
+		"COURIER_WORKSPACE":     "/workspace",
+		"COURIER_BASE":          "main",
+		"GIT_AUTHOR_NAME":       "Courier",
+		"GIT_AUTHOR_EMAIL":      "courier@localhost",
+		"GIT_COMMITTER_NAME":    "Courier",
+		"GIT_COMMITTER_EMAIL":   "courier@localhost",
 	} {
 		if env[key] != want {
 			t.Fatalf("env %s = %q, want %q", key, env[key], want)
@@ -412,6 +433,7 @@ func TestBuildCoordinatorPodWiresRolesAndMCPConfig(t *testing.T) {
 		GitHubMCPURL:           "https://github-mcp.example/mcp",
 		Context7MCPURL:         "https://context7.example/mcp",
 		MetricsMCPURL:          "https://metrics.example/mcp",
+		OpenCode:               OpenCode{Binary: "opencode", Format: "json", Agent: "architect"},
 	})
 	if err != nil {
 		t.Fatalf("BuildCoordinatorPod() error = %v", err)
@@ -426,6 +448,9 @@ func TestBuildCoordinatorPodWiresRolesAndMCPConfig(t *testing.T) {
 	}
 	if env["COURIER_MODEL"] != "litellm/coordinator" {
 		t.Fatalf("COURIER_MODEL = %q, want the coordinator model", env["COURIER_MODEL"])
+	}
+	if env["COURIER_OPENCODE_AGENT"] != "architect" {
+		t.Fatalf("COURIER_OPENCODE_AGENT = %q, want architect independent of lane roles", env["COURIER_OPENCODE_AGENT"])
 	}
 
 	var roles map[string]string
@@ -471,13 +496,16 @@ func TestBuildCoordinatorPodWiresRolesAndMCPConfig(t *testing.T) {
 		"github_merge*":             "deny",
 	}
 	wantAgents := map[string]openCodeAgent{
-		"coordinator":  {Mode: "primary", Model: "litellm/coordinator", Permission: denyMerge},
-		"coder":        {Mode: "subagent", Model: "litellm/coder", Permission: denyMerge},
-		"reviewer":     {Mode: "subagent", Model: "litellm/reviewer", Permission: denyMerge},
-		"investigator": {Mode: "subagent", Model: "vendor/investigator", Permission: denyMerge},
+		"coordinator":  {Mode: "all", Model: "litellm/coordinator"},
+		"coder":        {Mode: "all", Model: "litellm/coder"},
+		"reviewer":     {Mode: "all", Model: "litellm/reviewer"},
+		"investigator": {Mode: "all", Model: "vendor/investigator"},
 	}
 	if !reflect.DeepEqual(cfg.Agents, wantAgents) {
 		t.Fatalf("opencode config agents = %#v, want %#v", cfg.Agents, wantAgents)
+	}
+	if !reflect.DeepEqual(cfg.Permission, denyMerge) {
+		t.Fatalf("opencode config permission = %#v, want %#v", cfg.Permission, denyMerge)
 	}
 
 	wantMCP := map[string]openCodeMCP{
@@ -485,12 +513,14 @@ func TestBuildCoordinatorPodWiresRolesAndMCPConfig(t *testing.T) {
 			Type:    "remote",
 			URL:     "https://github-mcp.example/mcp",
 			Enabled: true,
+			OAuth:   boolPtr(false),
 			Headers: map[string]string{"Authorization": "Bearer {env:GITHUB_TOKEN}"},
 		},
 		"context7": {
 			Type:    "remote",
 			URL:     "https://context7.example/mcp",
 			Enabled: true,
+			OAuth:   boolPtr(false),
 			Headers: map[string]string{"CONTEXT7_API_KEY": "{env:CONTEXT7_API_KEY}"},
 		},
 		"metrics": {
@@ -506,12 +536,43 @@ func TestBuildCoordinatorPodWiresRolesAndMCPConfig(t *testing.T) {
 		t.Fatal("opencode config does not reference credentials by environment placeholder")
 	}
 
-	for role, agent := range cfg.Agents {
-		if agent.Permission["github_merge_pull_request"] != "deny" || agent.Permission["github_merge*"] != "deny" {
-			t.Fatalf("opencode config agent %q permission = %#v, want github merge permissions denied", role, agent.Permission)
+	var rawConfig map[string]json.RawMessage
+	if err := json.Unmarshal([]byte(annotation), &rawConfig); err != nil {
+		t.Fatalf("raw opencode config = %q, not valid JSON: %v", annotation, err)
+	}
+	var rawAgents map[string]json.RawMessage
+	if err := json.Unmarshal(rawConfig["agent"], &rawAgents); err != nil {
+		t.Fatalf("raw opencode agents = %q, not valid JSON: %v", rawConfig["agent"], err)
+	}
+	for role, rawAgent := range rawAgents {
+		var fields map[string]json.RawMessage
+		if err := json.Unmarshal(rawAgent, &fields); err != nil {
+			t.Fatalf("raw opencode agent %q = %q, not valid JSON: %v", role, rawAgent, err)
+		}
+		if _, present := fields["permission"]; present {
+			t.Fatalf("opencode agent %q has agent-local permission", role)
 		}
 	}
-
+	var rawMCP map[string]json.RawMessage
+	if err := json.Unmarshal(rawConfig["mcp"], &rawMCP); err != nil {
+		t.Fatalf("raw opencode mcp = %q, not valid JSON: %v", rawConfig["mcp"], err)
+	}
+	for _, name := range []string{"github", "context7"} {
+		var fields map[string]json.RawMessage
+		if err := json.Unmarshal(rawMCP[name], &fields); err != nil {
+			t.Fatalf("raw %s mcp = %q, not valid JSON: %v", name, rawMCP[name], err)
+		}
+		if got := string(fields["oauth"]); got != "false" {
+			t.Fatalf("raw %s mcp oauth = %q, want false", name, got)
+		}
+	}
+	var metricsFields map[string]json.RawMessage
+	if err := json.Unmarshal(rawMCP["metrics"], &metricsFields); err != nil {
+		t.Fatalf("raw metrics mcp = %q, not valid JSON: %v", rawMCP["metrics"], err)
+	}
+	if _, present := metricsFields["oauth"]; present {
+		t.Fatal("raw metrics mcp contains oauth")
+	}
 	for _, mount := range container.VolumeMounts {
 		if mount.Name != "opencode-config" {
 			continue

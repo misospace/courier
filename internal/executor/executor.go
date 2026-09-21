@@ -153,13 +153,13 @@ func NewInvocation(run *courierv1alpha1.CoderRun, lane *courierv1alpha1.LaneProf
 // values are kept in environment variables rather than shell-expanded command
 // strings so repository names, framing, and goals cannot become shell syntax.
 func Environment(inv Invocation, executorName string) []EnvVar {
-	return EnvironmentWithConfig(inv, executorName, "", "", "", "", "")
+	return EnvironmentWithConfig(inv, executorName, "", "", "", "", "", "")
 }
 
 // EnvironmentWithConfig extends the run context with the deployment-specific
 // git and bootstrap settings needed by the executable shim. Secrets are wired
 // separately by the Pod builder as SecretKeyRef values.
-func EnvironmentWithConfig(inv Invocation, executorName, remoteURL, baseBranch, opencodeBinary, opencodeFormat, terminationFile string) []EnvVar {
+func EnvironmentWithConfig(inv Invocation, executorName, remoteURL, baseBranch, opencodeBinary, opencodeFormat, terminationFile, opencodeAgent string) []EnvVar {
 	level := "info"
 	if inv.Debug {
 		level = "debug"
@@ -186,6 +186,7 @@ func EnvironmentWithConfig(inv Invocation, executorName, remoteURL, baseBranch, 
 		{Name: "COURIER_BASE", Value: baseBranch},
 		{Name: "COURIER_OPENCODE_BINARY", Value: opencodeBinary},
 		{Name: "COURIER_OPENCODE_FORMAT", Value: opencodeFormat},
+		{Name: "COURIER_OPENCODE_AGENT", Value: opencodeAgent},
 		{Name: "COURIER_TERMINATION_FILE", Value: terminationFile},
 		// The coordinator commits completed work in the cloned repository. A
 		// fresh clone has no git identity, so provide a stable non-secret

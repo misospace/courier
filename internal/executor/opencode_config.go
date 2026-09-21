@@ -9,20 +9,21 @@ const (
 )
 
 type openCodeConfig struct {
-	Agents map[string]openCodeAgent `json:"agent"`
-	MCP    map[string]openCodeMCP   `json:"mcp,omitempty"`
+	Agents    map[string]openCodeAgent `json:"agent"`
+	Permission map[string]string       `json:"permission,omitempty"`
+	MCP       map[string]openCodeMCP   `json:"mcp,omitempty"`
 }
 
 type openCodeAgent struct {
-	Mode       string            `json:"mode"`
-	Model      string            `json:"model"`
-	Permission map[string]string `json:"permission"`
+	Mode  string `json:"mode"`
+	Model string `json:"model"`
 }
 
 type openCodeMCP struct {
 	Type    string            `json:"type"`
 	URL     string            `json:"url"`
 	Enabled bool              `json:"enabled"`
+	OAuth   *bool             `json:"oauth,omitempty"`
 	Headers map[string]string `json:"headers,omitempty"`
 }
 
@@ -33,14 +34,11 @@ func marshalOpenCodeConfig(roles map[string]string, githubURL, context7URL, metr
 	}
 	agents := make(map[string]openCodeAgent, len(roles))
 	for role, model := range roles {
-		mode := "subagent"
-		if role == "coordinator" {
-			mode = "primary"
-		}
-		agents[role] = openCodeAgent{Mode: mode, Model: model, Permission: denyMerge}
+		agents[role] = openCodeAgent{Mode: "all", Model: model}
 	}
 	config := openCodeConfig{
-		Agents: agents,
+		Agents:    agents,
+		Permission: denyMerge,
 	}
 	config.MCP = make(map[string]openCodeMCP)
 	if githubURL != "" {
@@ -48,6 +46,7 @@ func marshalOpenCodeConfig(roles map[string]string, githubURL, context7URL, metr
 			Type:    "remote",
 			URL:     githubURL,
 			Enabled: true,
+			OAuth:   boolPtr(false),
 			Headers: map[string]string{"Authorization": "Bearer {env:GITHUB_TOKEN}"},
 		}
 	}
@@ -56,6 +55,7 @@ func marshalOpenCodeConfig(roles map[string]string, githubURL, context7URL, metr
 			Type:    "remote",
 			URL:     context7URL,
 			Enabled: true,
+			OAuth:   boolPtr(false),
 			Headers: map[string]string{"CONTEXT7_API_KEY": "{env:CONTEXT7_API_KEY}"},
 		}
 	}

@@ -12,6 +12,14 @@
 crds:
   enabled: true
 
+executor:
+  openCode:
+    agent: coordinator
+  mcp:
+    githubURL: ""
+    context7URL: ""
+    metricsURL: ""
+
 controllers:
   main:
     replicas: 1

@@ -230,7 +230,7 @@ func podEnvironment(invocation Invocation, executorName string, config PodConfig
 		remoteURL = strings.Replace(remoteURL, "%s", escapedRepositoryPath(invocation.Repo), 1)
 	}
 	terminationFile := strings.TrimRight(config.WorkspacePath, "/") + "/termination"
-	values := toKubernetesEnv(EnvironmentWithConfig(invocation, executorName, remoteURL, config.BaseBranch, config.OpenCode.Binary, config.OpenCode.Format, terminationFile))
+	values := toKubernetesEnv(EnvironmentWithConfig(invocation, executorName, remoteURL, config.BaseBranch, config.OpenCode.Binary, config.OpenCode.Format, terminationFile, config.OpenCode.Agent))
 	values = append(values, corev1.EnvVar{
 		Name:  "OPENCODE_CONFIG",
 		Value: opencodeConfigMountPath + "/" + opencodeConfigFilename,

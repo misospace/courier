@@ -20,6 +20,7 @@ const (
 type OpenCode struct {
 	Binary          string
 	Format          string
+	Agent           string
 	BootstrapBinary string
 }
 
@@ -40,6 +41,9 @@ func (o OpenCode) Command(inv Invocation) Command {
 	args := []string{"run", "--model", inv.Model}
 	if format := strings.TrimSpace(o.Format); format != "" {
 		args = append(args, "--format", format)
+	}
+	if agent := strings.TrimSpace(o.Agent); agent != "" {
+		args = append(args, "--agent", agent)
 	}
 	args = append(args, prompt(inv))
 	return Command{Binary: binary, Args: args}
