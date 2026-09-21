@@ -3,7 +3,13 @@
 // example, source/dispatch).
 package source
 
-import "context"
+import (
+	"context"
+	"errors"
+)
+
+// ErrStaleWork indicates that claimed source work no longer needs a coordinator.
+var ErrStaleWork = errors.New("source: work item is stale")
 
 // WorkItem identifies work in a source. ID is intentionally opaque: sources
 // are free to choose their identifier format, and the core must not know about
@@ -58,6 +64,41 @@ const (
 	StateInReview   State = "in-review"
 	StateNeedsHuman State = "needs-human"
 )
+
+// Result identifies the outcome associated with a lifecycle publication.
+type Result string
+
+const (
+	// ResultStarted marks the transition into active work.
+	ResultStarted Result = "started"
+	// ResultReady marks work that reached source review state.
+	ResultReady Result = "ready"
+	// ResultBlocked marks work requiring human intervention.
+	ResultBlocked Result = "blocked"
+	// ResultFailed marks work that failed execution.
+	ResultFailed Result = "failed"
+)
+
+// Lifecycle contains source-neutral metadata for an optional lifecycle report.
+type Lifecycle struct {
+	State  State
+	Result Result
+	PR     string
+	Error  string
+}
+
+// Reporter optionally publishes lifecycle results in addition to ordinary
+// source state transitions.
+type Reporter interface {
+	Report(context.Context, WorkItem, Lifecycle) error
+}
+
+// PreLauncher optionally revalidates claimed work immediately before launch.
+// ErrStaleWork means the claim was released because the work no longer needs a
+// coordinator; other errors leave the run retryable.
+type PreLauncher interface {
+	PreLaunch(context.Context, WorkItem) error
+}
 
 // Adapter is the source boundary used by the operator. Claim is separate from
 // Transition because claiming commonly has compare-and-set semantics, while

@@ -136,7 +136,6 @@ func (r *CoderRunReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 	if err := adapter.Claim(ctx, item); err != nil {
 		return ctrl.Result{}, err
 	}
-
 	// Claimed is the admission reservation. Persist it before launching so a
 	// concurrent reconciliation cannot observe an unaccounted-for launch.
 	before := run.DeepCopy()
@@ -153,6 +152,11 @@ func (r *CoderRunReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 	run.Status.Branch = resolvedBranch
 	if err := r.patchStatus(ctx, before, &run); err != nil {
 		return ctrl.Result{}, r.releaseClaim(ctx, &run, adapter, item, err)
+	}
+	if r.Launch != nil {
+		if err := preLaunch(ctx, adapter, item); err != nil {
+			return ctrl.Result{}, r.rejectClaim(ctx, &run, adapter, item, err)
+		}
 	}
 
 	launched := r.Launch != nil
@@ -202,6 +206,9 @@ func (r *CoderRunReconciler) resumeClaimed(ctx context.Context, run *courierv1al
 		if err := r.patchStatus(ctx, before, run); err != nil {
 			return ctrl.Result{}, r.releaseClaim(ctx, run, adapter, item, err)
 		}
+	}
+	if err := preLaunch(ctx, adapter, item); err != nil {
+		return ctrl.Result{}, r.rejectClaim(ctx, run, adapter, item, err)
 	}
 	if err := adapter.Transition(ctx, item, source.StateInProgress); err != nil {
 		return ctrl.Result{}, err
@@ -258,6 +265,31 @@ func (r *CoderRunReconciler) adapterAndWorkItem(run *courierv1alpha1.CoderRun) (
 		return nil, source.WorkItem{}, err
 	}
 	return adapter, item, nil
+}
+
+func preLaunch(ctx context.Context, adapter source.Adapter, item source.WorkItem) error {
+	guard, ok := adapter.(source.PreLauncher)
+	if !ok {
+		return nil
+	}
+	return guard.PreLaunch(ctx, item)
+}
+
+// rejectClaim rolls back a failed admission. ErrStaleWork is terminal: the
+// source has marked the work stale, so the run is deleted instead of being
+// left Pending where it would be re-admitted into the same rejection. Any
+// other cause leaves the run retryable at Pending.
+func (r *CoderRunReconciler) rejectClaim(ctx context.Context, run *courierv1alpha1.CoderRun, adapter source.Adapter, item source.WorkItem, cause error) error {
+	releaseErr := adapter.Release(ctx, item)
+	if errors.Is(cause, source.ErrStaleWork) {
+		deleteErr := r.Delete(ctx, run)
+		return errors.Join(cause, releaseErr, deleteErr)
+	}
+	before := run.DeepCopy()
+	run.Status.Phase = courierv1alpha1.PhasePending
+	run.Status.Branch = ""
+	statusErr := r.patchStatus(ctx, before, run)
+	return errors.Join(cause, releaseErr, statusErr)
 }
 
 func (r *CoderRunReconciler) releaseClaim(ctx context.Context, run *courierv1alpha1.CoderRun, adapter source.Adapter, item source.WorkItem, cause error) error {
@@ -379,9 +411,15 @@ func (r *CoderRunReconciler) transitionTerminal(ctx context.Context, run *courie
 		}
 	}
 	before := run.DeepCopy()
+	phaseChanged := run.Status.Phase != phase
 	run.Status.Phase = phase
 	if pr != "" {
 		run.Status.PR = pr
+	}
+	if phaseChanged {
+		if err := reportLifecycle(ctx, adapter, item, lifecycleForPhase(phase, state, run.Status.PR)); err != nil {
+			return ctrl.Result{}, err
+		}
 	}
 	if run.Status.Phase != before.Status.Phase || run.Status.PR != before.Status.PR {
 		if err := r.patchStatus(ctx, before, run); err != nil {
@@ -392,6 +430,29 @@ func (r *CoderRunReconciler) transitionTerminal(ctx context.Context, run *courie
 		r.emitPhaseTransition(run, phase, map[string]any{"branch": run.Status.Branch, "pr": run.Status.PR})
 	}
 	return ctrl.Result{}, nil
+}
+
+func reportLifecycle(ctx context.Context, adapter source.Adapter, item source.WorkItem, lifecycle source.Lifecycle) error {
+	reporter, ok := adapter.(source.Reporter)
+	if !ok {
+		return nil
+	}
+	return reporter.Report(ctx, item, lifecycle)
+}
+
+func lifecycleForPhase(phase courierv1alpha1.Phase, state source.State, pr string) source.Lifecycle {
+	lifecycle := source.Lifecycle{State: state, PR: pr}
+	switch phase {
+	case courierv1alpha1.PhaseAwaitingReview:
+		lifecycle.Result = source.ResultReady
+	case courierv1alpha1.PhaseFailed:
+		lifecycle.Result = source.ResultFailed
+		lifecycle.Error = "coordinator failed"
+	case courierv1alpha1.PhaseNeedsHuman:
+		lifecycle.Result = source.ResultBlocked
+		lifecycle.Error = "run requires human intervention"
+	}
+	return lifecycle
 }
 
 // patchStatus writes a narrow JSON merge patch through the status subresource.

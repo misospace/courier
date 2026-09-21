@@ -20,6 +20,18 @@ executor:
     context7URL: ""
     metricsURL: ""
 
+dispatch:
+  enabled: false
+  baseURL: ""
+  agentName: ""
+  queueLane: ""
+  laneProfile: ""
+  pollInterval: 30s
+  httpTimeout: 30s
+  tokenSecret:
+    name: ""
+    key: token
+
 controllers:
   main:
     replicas: 1

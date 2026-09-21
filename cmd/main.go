@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"strings"
+	"time"
 
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -24,6 +25,7 @@ import (
 	couriergithub "github.com/misospace/courier/internal/github"
 	courierlog "github.com/misospace/courier/internal/log"
 	"github.com/misospace/courier/internal/source"
+	"github.com/misospace/courier/internal/source/dispatch"
 	"github.com/misospace/courier/internal/source/manual"
 	"github.com/misospace/courier/internal/status"
 )
@@ -53,6 +55,13 @@ func main() {
 	var githubMCPURL string
 	var context7MCPURL string
 	var metricsMCPURL string
+	var dispatchEnabled bool
+	var dispatchBaseURL string
+	var dispatchAgentName string
+	var dispatchQueueLane string
+	var dispatchLane string
+	var dispatchPollInterval time.Duration
+	var dispatchHTTPTimeout time.Duration
 	flag.StringVar(&metricsAddr, "metrics-bind-address", ":8080", "The address the metric endpoint binds to.")
 	flag.StringVar(&probeAddr, "health-probe-bind-address", ":8081", "The address the probe endpoint binds to.")
 	flag.BoolVar(&enableLeaderElection, "leader-elect", false, "Enable leader election for controller manager.")
@@ -68,6 +77,13 @@ func main() {
 	flag.StringVar(&githubMCPURL, "github-mcp-url", "", "Optional remote MCP endpoint for GitHub.")
 	flag.StringVar(&context7MCPURL, "context7-mcp-url", "", "Optional remote MCP endpoint for Context7.")
 	flag.StringVar(&metricsMCPURL, "metrics-mcp-url", "", "Optional remote MCP endpoint for metrics; absence is harmless.")
+	flag.BoolVar(&dispatchEnabled, "dispatch-enabled", false, "Enable Dispatch source discovery.")
+	flag.StringVar(&dispatchBaseURL, "dispatch-base-url", "", "Dispatch base URL.")
+	flag.StringVar(&dispatchAgentName, "dispatch-agent-name", "", "Dispatch agent name.")
+	flag.StringVar(&dispatchQueueLane, "dispatch-queue-lane", "", "Dispatch queue lane sent to next-task.")
+	flag.StringVar(&dispatchLane, "dispatch-lane", "", "LaneProfile assigned to discovered Dispatch work.")
+	flag.DurationVar(&dispatchPollInterval, "dispatch-poll-interval", 30*time.Second, "Dispatch discovery poll interval.")
+	flag.DurationVar(&dispatchHTTPTimeout, "dispatch-http-timeout", 30*time.Second, "Dispatch HTTP request timeout.")
 	opts := zap.Options{Development: true}
 	opts.BindFlags(flag.CommandLine)
 	flag.Parse()
@@ -128,13 +144,55 @@ func main() {
 	// (Event.Verbose), so one shared emitter never turns one run's debug
 	// setting into another run's noise.
 	runEvents := courierlog.NewEmitter(os.Stdout, courierlog.ParseLevel(os.Getenv("COURIER_LOG_LEVEL")))
+
+	sources := controller.NewSourceRegistry(map[string]source.Adapter{
+		"manual": manual.Adapter{},
+	})
+	if dispatchEnabled {
+		if strings.TrimSpace(dispatchBaseURL) == "" || strings.TrimSpace(dispatchAgentName) == "" || strings.TrimSpace(dispatchQueueLane) == "" || strings.TrimSpace(dispatchLane) == "" {
+			setupLog.Error(fmt.Errorf("dispatch requires base URL, agent name, queue lane, and LaneProfile"), "unable to configure Dispatch source")
+			os.Exit(1)
+		}
+		namespace := strings.TrimSpace(os.Getenv("POD_NAMESPACE"))
+		if namespace == "" {
+			setupLog.Error(fmt.Errorf("POD_NAMESPACE is empty"), "unable to configure Dispatch source")
+			os.Exit(1)
+		}
+		token := strings.TrimSpace(os.Getenv("DISPATCH_AGENT_TOKEN"))
+		if token == "" {
+			setupLog.Error(fmt.Errorf("DISPATCH_AGENT_TOKEN is empty"), "unable to configure Dispatch source")
+			os.Exit(1)
+		}
+		dispatchClient, err := dispatch.NewClientWithLane(dispatchBaseURL, dispatchAgentName, dispatchQueueLane, token, dispatchHTTPTimeout)
+		if err != nil {
+			setupLog.Error(err, "unable to configure Dispatch client")
+			os.Exit(1)
+		}
+		checker, err := dispatchPRStateChecker(githubObserver)
+		if err != nil {
+			setupLog.Error(err, "unable to configure Dispatch source: GitHub pull request state lookup is unavailable")
+			os.Exit(1)
+		}
+		dispatchClient.WithPullRequestStateChecker(checker)
+		dispatchAdapter := dispatch.New(dispatchClient)
+		sources.Register("dispatch", dispatchAdapter)
+		runner := source.NewRunner(mgr.GetClient(), dispatchAdapter, source.RunnerConfig{
+			Source:       "dispatch",
+			LaneProfile:  dispatchLane,
+			Namespace:    namespace,
+			PollInterval: dispatchPollInterval,
+		})
+		if err := mgr.Add(runner); err != nil {
+			setupLog.Error(err, "unable to add Dispatch discovery runner")
+			os.Exit(1)
+		}
+	}
+
 	if err := (&controller.CoderRunReconciler{
-		Client: mgr.GetClient(),
-		Scheme: mgr.GetScheme(),
-		Launch: launcher.Launch,
-		Sources: controller.NewSourceRegistry(map[string]source.Adapter{
-			"manual": manual.Adapter{},
-		}),
+		Client:         mgr.GetClient(),
+		Scheme:         mgr.GetScheme(),
+		Launch:         launcher.Launch,
+		Sources:        sources,
 		StatusWriter:   status.KubePatchWriter{Client: mgr.GetClient()},
 		Observer:       githubObserver,
 		Events:         runEvents,
@@ -157,6 +215,24 @@ func existingPRHeadResolver(observer controller.WorldObserver) controller.Existi
 	}
 	resolver, _ := observer.(controller.ExistingPRHeadResolver)
 	return resolver
+}
+
+func dispatchPRStateChecker(observer controller.WorldObserver) (dispatch.PullRequestStateChecker, error) {
+	githubObserver, ok := observer.(couriergithub.Observer)
+	if !ok || githubObserver.Client == nil {
+		return nil, dispatch.ErrPRStateCheckerNeeded
+	}
+	return dispatch.PullRequestStateCheckerFunc(func(ctx context.Context, repo string, number int) (dispatch.PullRequestState, error) {
+		parts := strings.Split(repo, "/")
+		if len(parts) != 2 || parts[0] == "" || parts[1] == "" {
+			return dispatch.PullRequestState{}, fmt.Errorf("invalid repository %q", repo)
+		}
+		pull, err := githubObserver.Client.GetPullRequest(ctx, parts[0], parts[1], number)
+		if err != nil {
+			return dispatch.PullRequestState{}, err
+		}
+		return dispatch.PullRequestState{State: pull.State, Merged: strings.TrimSpace(pull.MergedAt) != ""}, nil
+	}), nil
 }
 
 func githubObserver(ctx context.Context, reader client.Reader, namespace, configuredSecret, configuredKey, gitSecret, gitKey string) (controller.WorldObserver, error) {

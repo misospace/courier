@@ -24,13 +24,25 @@ var (
 // Client is the deliberately narrow seam to the Dispatch API. The concrete
 // HTTP client, authentication, endpoint paths, and request encoding are kept
 // outside Courier's source interface and can be supplied by the deployment.
-// A fake implementing these two methods is sufficient for adapter tests.
+// A fake implementing these methods is sufficient for adapter tests.
 type Client interface {
 	Discover(context.Context) ([]source.WorkItem, error)
 	Claim(context.Context, string) error
 	Release(context.Context, string) error
 	SetStatus(context.Context, string, string) error
 	Resolve(context.Context, string) error
+}
+
+// ReporterClient is the optional Dispatch API capability used for lifecycle
+// task reports.
+type ReporterClient interface {
+	Report(context.Context, string, source.Lifecycle) error
+}
+
+// PreLauncherClient is the optional Dispatch API capability used to revalidate
+// claimed work immediately before coordinator launch.
+type PreLauncherClient interface {
+	PreLaunch(context.Context, string) error
 }
 
 // API is an alias retained as a descriptive name for callers that think of
@@ -47,10 +59,10 @@ type Adapter struct {
 type DispatchAdapter = Adapter
 
 var _ source.Adapter = (*Adapter)(nil)
+var _ source.Reporter = (*Adapter)(nil)
+var _ source.PreLauncher = (*Adapter)(nil)
 
-// New creates a Dispatch adapter around an injected API client. The client is
-// intentionally not constructed here because the Dispatch transport and
-// authentication contract is outside this repository's design.
+// New creates a Dispatch adapter around an injected API client.
 func New(client Client) *Adapter {
 	return &Adapter{client: client}
 }
@@ -87,12 +99,23 @@ func (a *Adapter) Release(ctx context.Context, item source.WorkItem) error {
 	return a.client.Release(ctx, item.ID)
 }
 
+// PreLaunch revalidates claimed work before a coordinator is started.
+func (a *Adapter) PreLaunch(ctx context.Context, item source.WorkItem) error {
+	if err := a.validate(item); err != nil {
+		return err
+	}
+	checker, ok := a.client.(PreLauncherClient)
+	if !ok {
+		return nil
+	}
+	return checker.PreLaunch(ctx, item.ID)
+}
+
 // Transition publishes a generic Courier lifecycle state to Dispatch.
 func (a *Adapter) Transition(ctx context.Context, item source.WorkItem, state source.State) error {
 	if err := a.validate(item); err != nil {
 		return err
 	}
-
 	status, ok := dispatchStatus(state)
 	if !ok {
 		return fmt.Errorf("%w: %q", ErrUnsupportedState, state)
@@ -113,6 +136,18 @@ func (a *Adapter) InReview(ctx context.Context, item source.WorkItem) error {
 // NeedsHuman marks item as requiring human intervention.
 func (a *Adapter) NeedsHuman(ctx context.Context, item source.WorkItem) error {
 	return a.Transition(ctx, item, source.StateNeedsHuman)
+}
+
+// Report publishes lifecycle audit metadata to Dispatch.
+func (a *Adapter) Report(ctx context.Context, item source.WorkItem, lifecycle source.Lifecycle) error {
+	if err := a.validate(item); err != nil {
+		return err
+	}
+	reporter, ok := a.client.(ReporterClient)
+	if !ok {
+		return errors.New("dispatch source: client does not support lifecycle reports")
+	}
+	return reporter.Report(ctx, item.ID, lifecycle)
 }
 
 // Resolve closes successfully completed work in Dispatch.
