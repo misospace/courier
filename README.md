@@ -35,17 +35,30 @@ in [AGENTS.md](./AGENTS.md).
 
 ## Install
 
-Courier ships a Helm chart built on the
-[bjw-s common library](https://bjw-s-labs.github.io/helm-charts/) — consumable
-by any Helm workflow, including Argo CD:
+Published releases use the OCI chart `oci://ghcr.io/misospace/charts/courier`.
+Replace `0.1.0` with the release you want:
+
+```sh
+helm install courier oci://ghcr.io/misospace/charts/courier \
+  --version 0.1.0 \
+  --namespace courier-system --create-namespace
+```
+
+A clean install pulls only the published chart and its referenced manager and
+coordinator images. The chart defaults the manager image to
+`ghcr.io/misospace/courier:0.1.0` and the coordinator image to
+`ghcr.io/misospace/courier-opencode:0.1.0`; override the existing native values or
+manager args when deploying a different executor configuration.
+
+For local development, build the dependency and install from source instead:
 
 ```sh
 helm dependency build charts/courier
 helm install courier charts/courier --namespace courier-system --create-namespace
 ```
 
-The chart installs the `CoderRun`/`LaneProfile` CRDs, the manager's RBAC, and
-the Deployment. Deployment-specific choices — forge remote, credential secrets,
+The chart installs the `CoderRun`/`LaneProfile` CRDs, the manager's RBAC, and the
+Deployment. Deployment-specific choices — forge remote, credential secrets,
 coordinator image — are plain values in `charts/courier/values.yaml`; nothing
 assumes a particular cluster or GitOps tooling.
 

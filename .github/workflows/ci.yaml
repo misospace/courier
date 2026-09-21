@@ -52,10 +52,19 @@ jobs:
       - name: Test
         run: go test -race ./... -coverprofile cover.out
 
-      - name: Build images
-        run: |
-          docker build --target manager -t courier:ci .
-          docker build --target coordinator -t courier-coordinator:ci .
+      - name: Build manager image
+        run: docker build --target manager -t courier:ci .
+
+      - name: Validate manager image
+        run: docker run --rm courier:ci --help
+
+      - name: Build coordinator image
+        run: docker build --target coordinator -t courier-coordinator:ci .
+
+      - name: Validate coordinator image
+        run: >-
+          docker run --rm --entrypoint sh courier-coordinator:ci
+          -c 'test -x /usr/local/bin/courier-executor && opencode --help'
 
   vulnerability:
     runs-on: ubuntu-latest
@@ -83,7 +92,17 @@ jobs:
           helm dependency build charts/courier
           helm lint charts/courier
           helm template courier charts/courier --namespace courier-system > rendered.yaml
+          helm package charts/courier --destination "$RUNNER_TEMP"
           test "$(grep -c '^kind: CustomResourceDefinition' rendered.yaml)" -eq 2
+          app_version=$(awk '$1 == "appVersion:" { print $2; exit }' charts/courier/Chart.yaml)
+          test "$(grep -c -F "image: ghcr.io/misospace/courier:${app_version}" rendered.yaml)" -eq 1
+          test "$(grep -c -F -- "--executor-image=ghcr.io/misospace/courier-opencode:${app_version}" rendered.yaml)" -eq 1
+
+          helm template courier charts/courier --namespace courier-system \
+            --set 'controllers.main.containers.main.args={--leader-elect,--git-remote-template=https://github.com/%s.git,--git-credential-secret=courier-github,--executor-image=ghcr.io/example/custom:1.2.3}' \
+            > rendered-custom.yaml
+          test "$(grep -c -- '--executor-image=ghcr.io/example/custom:1.2.3' rendered-custom.yaml)" -eq 1
+
           if helm template courier charts/courier --namespace courier-system \
             --set crds.enabled=false | grep -q CustomResourceDefinition; then
             echo "crds.enabled=false still renders CRDs"
