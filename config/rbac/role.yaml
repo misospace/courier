@@ -15,12 +15,6 @@ rules:
   - list
   - watch
 - apiGroups:
-  - ""
-  resources:
-  - secrets
-  verbs:
-  - get
-- apiGroups:
   - courier.misospace.dev
   resources:
   - coderuns

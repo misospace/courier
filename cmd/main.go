@@ -115,8 +115,9 @@ func main() {
 		Sources: controller.NewSourceRegistry(map[string]source.Adapter{
 			"manual": manual.Adapter{},
 		}),
-		StatusWriter: status.KubePatchWriter{Client: mgr.GetClient()},
-		Observer:     githubObserver,
+		StatusWriter:   status.KubePatchWriter{Client: mgr.GetClient()},
+		Observer:       githubObserver,
+		PRHeadResolver: existingPRHeadResolver(githubObserver),
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "CoderRun")
 		os.Exit(1)
@@ -127,6 +128,14 @@ func main() {
 		setupLog.Error(err, "problem running manager")
 		os.Exit(1)
 	}
+}
+
+func existingPRHeadResolver(observer controller.WorldObserver) controller.ExistingPRHeadResolver {
+	if observer == nil {
+		return nil
+	}
+	resolver, _ := observer.(controller.ExistingPRHeadResolver)
+	return resolver
 }
 
 func githubObserver(ctx context.Context, reader client.Reader, namespace, configuredSecret, configuredKey, gitSecret, gitKey string) (controller.WorldObserver, error) {

@@ -2,12 +2,18 @@ package controller
 
 import "context"
 
-// CheckObservation is the controller-neutral result of one CI check.
+type CheckState string
+
+const (
+	CheckStatePending CheckState = "pending"
+	CheckStatePassed  CheckState = "passed"
+	CheckStateFailed  CheckState = "failed"
+)
+
 type CheckObservation struct {
-	Conclusion string
+	State CheckState
 }
 
-// PRObservation is the controller-neutral state of a pull request and its CI.
 type PRObservation struct {
 	PR     string
 	Draft  bool
@@ -19,16 +25,28 @@ type WorldObserver interface {
 	Observe(context.Context, string, string) (PRObservation, error)
 }
 
-func observationReady(observation PRObservation) bool {
+type observationState string
+
+const (
+	observationNeedsHuman observationState = "needs-human"
+	observationPending    observationState = "pending"
+	observationPassed     observationState = "passed"
+	observationFailed     observationState = "failed"
+)
+
+func observeState(observation PRObservation) observationState {
 	if observation.PR == "" || observation.Draft || len(observation.Checks) == 0 {
-		return false
+		return observationNeedsHuman
 	}
 	for _, check := range observation.Checks {
-		switch check.Conclusion {
-		case "success", "skipped", "neutral":
-		default:
-			return false
+		if check.State == CheckStatePending {
+			return observationPending
 		}
 	}
-	return true
+	for _, check := range observation.Checks {
+		if check.State != CheckStatePassed {
+			return observationFailed
+		}
+	}
+	return observationPassed
 }

@@ -6,6 +6,7 @@ import (
 	"strconv"
 	"strings"
 
+	courierv1alpha1 "github.com/misospace/courier/api/v1alpha1"
 	"github.com/misospace/courier/internal/controller"
 )
 
@@ -15,16 +16,17 @@ type Observer struct {
 }
 
 var _ controller.WorldObserver = Observer{}
+var _ controller.ExistingPRHeadResolver = Observer{}
 
 func (o Observer) Observe(ctx context.Context, repository, branch string) (controller.PRObservation, error) {
 	if o.Client == nil {
 		return controller.PRObservation{}, fmt.Errorf("GitHub observer: nil client")
 	}
-	parts := strings.Split(repository, "/")
-	if len(parts) != 2 || parts[0] == "" || parts[1] == "" {
-		return controller.PRObservation{}, fmt.Errorf("GitHub observer: invalid repository %q", repository)
+	owner, repo, err := splitRepository(repository)
+	if err != nil {
+		return controller.PRObservation{}, err
 	}
-	pulls, err := o.Client.PullRequestsForHead(ctx, parts[0], parts[1], branch)
+	pulls, err := o.Client.PullRequestsForHead(ctx, owner, repo, branch)
 	if err != nil {
 		return controller.PRObservation{}, err
 	}
@@ -36,15 +38,57 @@ func (o Observer) Observe(ctx context.Context, repository, branch string) (contr
 		if ref == "" {
 			ref = branch
 		}
-		checks, err := o.Client.GetCheckRuns(ctx, parts[0], parts[1], ref)
+		checks, err := o.Client.GetCheckRuns(ctx, owner, repo, ref)
 		if err != nil {
 			return controller.PRObservation{}, err
 		}
 		observed := controller.PRObservation{PR: strconv.Itoa(pull.Number), Draft: pull.Draft}
 		for _, check := range checks.CheckRuns {
-			observed.Checks = append(observed.Checks, controller.CheckObservation{Conclusion: check.Conclusion})
+			observed.Checks = append(observed.Checks, controller.CheckObservation{State: checkState(check.Status, check.Conclusion)})
 		}
 		return observed, nil
 	}
 	return controller.PRObservation{}, nil
+}
+
+func (o Observer) ResolveHead(ctx context.Context, run *courierv1alpha1.CoderRun) (string, error) {
+	if o.Client == nil {
+		return "", fmt.Errorf("GitHub observer: nil client")
+	}
+	if run == nil {
+		return "", fmt.Errorf("GitHub observer: nil run")
+	}
+	owner, repo, err := splitRepository(run.Spec.Repo)
+	if err != nil {
+		return "", err
+	}
+	pull, err := o.Client.GetPullRequest(ctx, owner, repo, run.Spec.Ref)
+	if err != nil {
+		return "", err
+	}
+	if strings.TrimSpace(pull.Head.Ref) == "" {
+		return "", fmt.Errorf("GitHub observer: pull request %d has no head ref", run.Spec.Ref)
+	}
+	return pull.Head.Ref, nil
+}
+
+func splitRepository(repository string) (string, string, error) {
+	parts := strings.Split(repository, "/")
+	if len(parts) != 2 || parts[0] == "" || parts[1] == "" {
+		return "", "", fmt.Errorf("GitHub observer: invalid repository %q", repository)
+	}
+	return parts[0], parts[1], nil
+}
+
+func checkState(status, conclusion string) controller.CheckState {
+	switch strings.ToLower(status) {
+	case "queued", "in_progress", "pending", "requested", "waiting":
+		return controller.CheckStatePending
+	}
+	switch strings.ToLower(conclusion) {
+	case "success", "skipped", "neutral":
+		return controller.CheckStatePassed
+	default:
+		return controller.CheckStateFailed
+	}
 }

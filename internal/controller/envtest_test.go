@@ -74,7 +74,7 @@ func TestEnvtestResolveIssueLifecycle(t *testing.T) {
 		StatusWriter: status.KubePatchWriter{Client: envtestClient},
 		Observer: fakeWorldObserver{observation: PRObservation{
 			PR:     "42",
-			Checks: []CheckObservation{{Conclusion: "success"}},
+			Checks: []CheckObservation{{State: CheckStatePassed}},
 		}},
 		Launch: func(ctx context.Context, run *courierv1alpha1.CoderRun) error {
 			var claimed courierv1alpha1.CoderRun

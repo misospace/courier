@@ -227,7 +227,7 @@ func TestRunningPodExitMapsPhaseAndSourceState(t *testing.T) {
 				Sources:      NewSourceRegistry(map[string]source.Adapter{"test": item}),
 				StatusWriter: fakeStatusWriter{client: client},
 				Observer: fakeWorldObserver{
-					observation: PRObservation{PR: "42", Checks: []CheckObservation{{Conclusion: "success"}}},
+					observation: PRObservation{PR: "42", Checks: []CheckObservation{{State: CheckStatePassed}}},
 					calls:       &calls,
 				},
 			}
@@ -263,11 +263,12 @@ func TestResolveIssueObservationGatesReview(t *testing.T) {
 	}{
 		{name: "observer missing", observerMissing: true, wantPhase: courierv1alpha1.PhaseNeedsHuman, wantTransition: source.StateNeedsHuman},
 		{name: "no PR", wantPhase: courierv1alpha1.PhaseNeedsHuman, wantTransition: source.StateNeedsHuman},
-		{name: "draft", observation: PRObservation{PR: "42", Draft: true, Checks: []CheckObservation{{Conclusion: "success"}}}, wantPhase: courierv1alpha1.PhaseNeedsHuman, wantTransition: source.StateNeedsHuman},
+		{name: "draft", observation: PRObservation{PR: "42", Draft: true, Checks: []CheckObservation{{State: CheckStatePassed}}}, wantPhase: courierv1alpha1.PhaseNeedsHuman, wantTransition: source.StateNeedsHuman},
 		{name: "no checks", observation: PRObservation{PR: "42"}, wantPhase: courierv1alpha1.PhaseNeedsHuman, wantTransition: source.StateNeedsHuman},
-		{name: "pending", observation: PRObservation{PR: "42", Checks: []CheckObservation{{Conclusion: ""}}}, wantPhase: courierv1alpha1.PhaseNeedsHuman, wantTransition: source.StateNeedsHuman},
-		{name: "failed", observation: PRObservation{PR: "42", Checks: []CheckObservation{{Conclusion: "failure"}}}, wantPhase: courierv1alpha1.PhaseNeedsHuman, wantTransition: source.StateNeedsHuman},
-		{name: "skipped and neutral", observation: PRObservation{PR: "42", Checks: []CheckObservation{{Conclusion: "skipped"}, {Conclusion: "neutral"}}}, wantPhase: courierv1alpha1.PhaseAwaitingReview, wantTransition: source.StateInReview},
+		{name: "pending", observation: PRObservation{PR: "42", Checks: []CheckObservation{{State: CheckStatePending}}}, wantPhase: courierv1alpha1.PhaseRunning, wantRequeue: true},
+		{name: "pending failure mix", observation: PRObservation{PR: "42", Checks: []CheckObservation{{State: CheckStateFailed}, {State: CheckStatePending}}}, wantPhase: courierv1alpha1.PhaseRunning, wantRequeue: true},
+		{name: "failed", observation: PRObservation{PR: "42", Checks: []CheckObservation{{State: CheckStateFailed}}}, wantPhase: courierv1alpha1.PhaseNeedsHuman, wantTransition: source.StateNeedsHuman},
+		{name: "skipped and neutral", observation: PRObservation{PR: "42", Checks: []CheckObservation{{State: CheckStatePassed}, {State: CheckStatePassed}}}, wantPhase: courierv1alpha1.PhaseAwaitingReview, wantTransition: source.StateInReview},
 		{name: "transient error", err: errors.New("GitHub unavailable"), wantPhase: courierv1alpha1.PhaseRunning, wantRequeue: true},
 	}
 	for _, tt := range tests {
@@ -320,7 +321,7 @@ func TestResolveIssueObservationGatesReview(t *testing.T) {
 				t.Fatalf("transitions = %#v, want %q", item.transitions, tt.wantTransition)
 			}
 			if tt.wantRequeue && len(item.transitions) != 0 {
-				t.Fatalf("transitions = %#v, want none on observation error", item.transitions)
+				t.Fatalf("transitions = %#v, want none while observation is pending", item.transitions)
 			}
 		})
 	}

@@ -57,7 +57,6 @@ type CoderRunReconciler struct {
 // +kubebuilder:rbac:groups=courier.misospace.dev,resources=coderuns/finalizers,verbs=update
 // +kubebuilder:rbac:groups=courier.misospace.dev,resources=laneprofiles,verbs=get;list;watch
 // +kubebuilder:rbac:groups="",resources=pods,verbs=get;list;watch;create;delete
-// +kubebuilder:rbac:groups="",resources=secrets,verbs=get
 
 // Reconcile is the CoderRun control loop.
 //
@@ -268,7 +267,12 @@ func (r *CoderRunReconciler) observeRunning(ctx context.Context, run *courierv1a
 					return ctrl.Result{RequeueAfter: observationRequeueDelay}, nil
 				}
 				pr = observation.PR
-				if !observationReady(observation) {
+				switch observeState(observation) {
+				case observationPending:
+					return ctrl.Result{RequeueAfter: observationRequeueDelay}, nil
+				case observationPassed:
+					phase = courierv1alpha1.PhaseAwaitingReview
+				default:
 					phase = courierv1alpha1.PhaseNeedsHuman
 				}
 			}

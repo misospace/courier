@@ -9,6 +9,9 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+
+	courierv1alpha1 "github.com/misospace/courier/api/v1alpha1"
+	"github.com/misospace/courier/internal/controller"
 )
 
 func TestPullRequestOperations(t *testing.T) {
@@ -141,6 +144,30 @@ func TestPullRequestsForHead(t *testing.T) {
 	}
 }
 
+func TestCheckStateMapsGitHubStatusAndConclusion(t *testing.T) {
+	tests := []struct {
+		name       string
+		status     string
+		conclusion string
+		want       controller.CheckState
+	}{
+		{name: "queued", status: "queued", want: controller.CheckStatePending},
+		{name: "in progress", status: "in_progress", want: controller.CheckStatePending},
+		{name: "success", status: "completed", conclusion: "success", want: controller.CheckStatePassed},
+		{name: "skipped", status: "completed", conclusion: "skipped", want: controller.CheckStatePassed},
+		{name: "neutral", status: "completed", conclusion: "neutral", want: controller.CheckStatePassed},
+		{name: "cancelled", status: "completed", conclusion: "cancelled", want: controller.CheckStateFailed},
+		{name: "unknown", status: "completed", conclusion: "future-result", want: controller.CheckStateFailed},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := checkState(tt.status, tt.conclusion); got != tt.want {
+				t.Fatalf("checkState(%q, %q) = %q, want %q", tt.status, tt.conclusion, got, tt.want)
+			}
+		})
+	}
+}
+
 func TestObserverReportsDraftPullRequest(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
@@ -165,6 +192,70 @@ func TestObserverReportsDraftPullRequest(t *testing.T) {
 	}
 	if observation.PR != "12" || !observation.Draft {
 		t.Fatalf("observation = %#v, want draft PR 12", observation)
+	}
+	if len(observation.Checks) != 1 || observation.Checks[0].State != controller.CheckStatePassed {
+		t.Fatalf("checks = %#v, want one passed generic check state", observation.Checks)
+	}
+}
+
+func TestObserverResolvesExistingPRHead(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/repos/acme/demo/pulls/12" {
+			http.NotFound(w, r)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"number":12,"head":{"ref":"feature/fix-pr"}}`)
+	}))
+	defer server.Close()
+
+	client, err := NewClient(server.URL, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	run := &courierv1alpha1.CoderRun{}
+	run.Spec.Repo = "acme/demo"
+	run.Spec.Ref = 12
+	got, err := (Observer{Client: client}).ResolveHead(context.Background(), run)
+	if err != nil {
+		t.Fatalf("ResolveHead() error = %v", err)
+	}
+	if got != "feature/fix-pr" {
+		t.Fatalf("ResolveHead() = %q, want feature/fix-pr", got)
+	}
+}
+
+func TestObserverResolveHeadRejectsInvalidRepository(t *testing.T) {
+	client, err := NewClient("http://invalid.example", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	run := &courierv1alpha1.CoderRun{}
+	run.Spec.Repo = "invalid"
+	run.Spec.Ref = 12
+	_, err = (Observer{Client: client}).ResolveHead(context.Background(), run)
+	if err == nil || !strings.Contains(err.Error(), "invalid repository") {
+		t.Fatalf("ResolveHead() error = %v, want invalid repository error", err)
+	}
+}
+
+func TestObserverResolveHeadRejectsEmptyHeadRef(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"number":12,"head":{}}`)
+	}))
+	defer server.Close()
+
+	client, err := NewClient(server.URL, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	run := &courierv1alpha1.CoderRun{}
+	run.Spec.Repo = "acme/demo"
+	run.Spec.Ref = 12
+	_, err = (Observer{Client: client}).ResolveHead(context.Background(), run)
+	if err == nil || !strings.Contains(err.Error(), "no head ref") {
+		t.Fatalf("ResolveHead() error = %v, want no head ref error", err)
 	}
 }
 
