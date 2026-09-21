@@ -170,19 +170,19 @@ func TestBuildCoordinatorPodInjectsRunContextAndEphemeralWorkspace(t *testing.T)
 		env[value.Name] = value.Value
 	}
 	for key, want := range map[string]string{
-		"COURIER_GOAL":          "Open a PR to address issue #7. Make sure CI is green and it's ready for review, and delegate as much as possible to keep your context clean.",
-		"COURIER_MODEL":         "litellm/qwen",
+		"COURIER_GOAL":           "Open a PR to address issue #7. Make sure CI is green and it's ready for review, and delegate as much as possible to keep your context clean.",
+		"COURIER_MODEL":          "litellm/qwen",
 		"COURIER_OPENCODE_AGENT": "",
-		"COURIER_FRAMING":       "single GPU; keep parallelism modest",
-		"COURIER_LOG_LEVEL":     "debug",
-		"COURIER_REPO":          "acme/widgets",
-		"COURIER_BRANCH":        "courier/acme/widgets/issue-7",
-		"COURIER_WORKSPACE":     "/workspace",
-		"COURIER_BASE":          "main",
-		"GIT_AUTHOR_NAME":       "Courier",
-		"GIT_AUTHOR_EMAIL":      "courier@localhost",
-		"GIT_COMMITTER_NAME":    "Courier",
-		"GIT_COMMITTER_EMAIL":   "courier@localhost",
+		"COURIER_FRAMING":        "single GPU; keep parallelism modest",
+		"COURIER_LOG_LEVEL":      "debug",
+		"COURIER_REPO":           "acme/widgets",
+		"COURIER_BRANCH":         "courier/acme/widgets/issue-7",
+		"COURIER_WORKSPACE":      "/workspace",
+		"COURIER_BASE":           "main",
+		"GIT_AUTHOR_NAME":        "Courier",
+		"GIT_AUTHOR_EMAIL":       "courier@localhost",
+		"GIT_COMMITTER_NAME":     "Courier",
+		"GIT_COMMITTER_EMAIL":    "courier@localhost",
 	} {
 		if env[key] != want {
 			t.Fatalf("env %s = %q, want %q", key, env[key], want)
@@ -418,10 +418,10 @@ func TestBuildCoordinatorPodWiresRolesAndMCPConfig(t *testing.T) {
 		ObjectMeta: metav1.ObjectMeta{Name: "local", Namespace: "courier-system"},
 		Spec: courierv1alpha1.LaneProfileSpec{
 			Roles: map[string]string{
-				"coordinator":    "litellm/coordinator",
-				"coder":          "litellm/coder",
-				"reviewer":       "litellm/reviewer",
-				"investigator":   "vendor/investigator",
+				"coordinator":  "litellm/coordinator",
+				"coder":        "litellm/coder",
+				"reviewer":     "litellm/reviewer",
+				"investigator": "vendor/investigator",
 			},
 		},
 	}
@@ -458,10 +458,10 @@ func TestBuildCoordinatorPodWiresRolesAndMCPConfig(t *testing.T) {
 		t.Fatalf("COURIER_ROLES_JSON = %q, not valid JSON: %v", env["COURIER_ROLES_JSON"], err)
 	}
 	wantRoles := map[string]string{
-		"coordinator":    "litellm/coordinator",
-		"coder":          "litellm/coder",
-		"reviewer":       "litellm/reviewer",
-		"investigator":   "vendor/investigator",
+		"coordinator":  "litellm/coordinator",
+		"coder":        "litellm/coder",
+		"reviewer":     "litellm/reviewer",
+		"investigator": "vendor/investigator",
 	}
 	if !reflect.DeepEqual(roles, wantRoles) {
 		t.Fatalf("COURIER_ROLES_JSON = %#v, want %#v", roles, wantRoles)
