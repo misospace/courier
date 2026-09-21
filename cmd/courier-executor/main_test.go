@@ -3,6 +3,8 @@ package main
 import (
 	"bytes"
 	"context"
+	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -11,6 +13,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	courierlog "github.com/misospace/courier/internal/log"
 )
 
 func TestRunPreparesOrphanBranchAndInvokesOpenCodeWithExactContext(t *testing.T) {
@@ -236,6 +240,286 @@ func TestReadConfigRequiresRemoteAndStatusBranch(t *testing.T) {
 	})
 	if err == nil || !strings.Contains(err.Error(), "COURIER_REPO_URL") {
 		t.Fatalf("readConfig error = %v, want missing remote URL", err)
+	}
+}
+
+// fake event-test secrets. Assertions never print these values or any output
+// line that could contain them; failures name the constant instead.
+const (
+	testGitToken   = "git-push-token-f4e3d2c1"
+	testGitHubTokn = "gh-api-token-b1b2b3b4"
+	testURLToken   = "url-userinfo-token-aa11bb22"
+)
+
+func TestRunEmitsRunScopedEventsWithoutDetail(t *testing.T) {
+	root := t.TempDir()
+	remote := remoteWithExistingBranch(t, root)
+
+	fakeOpenCode := filepath.Join(root, "opencode")
+	writeExecutable(t, fakeOpenCode, "#!/bin/sh\nprintf 'opencode ran\\n'\n")
+
+	// The branch exists on the remote and is orphaned: the adoption guard
+	// must see no pull requests and let the run proceed.
+	prServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `[]`)
+	}))
+	defer prServer.Close()
+
+	setResolveIssueEnv(t, root, remote, prServer.URL, fakeOpenCode)
+	t.Setenv("COURIER_GIT_TOKEN", testGitToken)
+	t.Setenv("GITHUB_TOKEN", testGitHubTokn)
+	t.Setenv("COURIER_RUN_NAME", "coderrun-it-7")
+	t.Setenv("COURIER_REF", "7")
+
+	var output bytes.Buffer
+	var errorsOut bytes.Buffer
+	if code := run(context.Background(), &output, &errorsOut); code != exitSuccess {
+		t.Fatalf("run exit code = %d, want 0; stderr=%q", code, errorsOut.String())
+	}
+
+	events := parseEvents(t, &output)
+	wantTypes := map[string]bool{
+		"run.start": false, "workspace.ready": false, "executor.start": false, "run.exit": false,
+	}
+	for _, event := range events {
+		eventType, _ := event["event"].(string)
+		if _, tracked := wantTypes[eventType]; !tracked {
+			t.Fatalf("unexpected event type %q", eventType)
+		}
+		wantTypes[eventType] = true
+		if event["run_id"] != "coderrun-it-7" {
+			t.Fatalf("event %s is missing the run scope", eventType)
+		}
+		if event["repo"] != "acme/widgets" || event["ref"] != float64(7) || event["mode"] != "resolve-issue" {
+			t.Fatalf("event %s is missing repo/ref/mode metadata", eventType)
+		}
+		if _, ok := event["detail"]; ok {
+			t.Fatalf("info-level event %s must not carry detail", eventType)
+		}
+	}
+	for eventType, seen := range wantTypes {
+		if !seen {
+			t.Fatalf("missing %s event", eventType)
+		}
+	}
+	exit := findEvent(t, events, "run.exit")
+	if exit["status"] != "ok" {
+		t.Fatalf("run.exit status = %v, want ok", exit["status"])
+	}
+	// The registered credentials are never used on this path and must never
+	// surface anywhere in the run's output.
+	for _, leaked := range []string{testGitToken, testGitHubTokn} {
+		if strings.Contains(output.String(), leaked) || strings.Contains(errorsOut.String(), leaked) {
+			t.Fatalf("output contains a fake credential (constant: %s)", secretConstantName(leaked))
+		}
+	}
+}
+
+func TestRunDebugLevelEmitsDetailAndStillRedacts(t *testing.T) {
+	root := t.TempDir()
+	// The remote embeds an unregistered credential in userinfo position, so
+	// the clone failure forces every exit path through redaction.
+	t.Setenv("COURIER_REPO_URL", "file://"+testURLToken+"@example.invalid/nonexistent.git")
+	t.Setenv("COURIER_WORKSPACE", filepath.Join(root, "workspace"))
+	t.Setenv("COURIER_BRANCH", "courier/resolve-issue/acme-widgets/7")
+	t.Setenv("COURIER_GOAL", "goal")
+	t.Setenv("COURIER_MODEL", "any-model/name")
+	t.Setenv("COURIER_RUN_NAME", "coderrun-it-7")
+	t.Setenv("COURIER_REF", "7")
+	t.Setenv("COURIER_REPO", "acme/widgets")
+	t.Setenv("COURIER_LOG_LEVEL", "debug")
+
+	var output bytes.Buffer
+	var errorsOut bytes.Buffer
+	if code := run(context.Background(), &output, &errorsOut); code != 1 {
+		t.Fatalf("run exit code = %d, want 1", code)
+	}
+
+	events := parseEvents(t, &output)
+	exit := findEvent(t, events, "run.exit")
+	if exit["status"] != "error" {
+		t.Fatalf("run.exit status = %v, want error", exit["status"])
+	}
+	detail, ok := exit["detail"].(map[string]any)
+	if !ok {
+		t.Fatal("debug-level run.exit must carry a detail object")
+	}
+	if _, ok := detail["exit_code"]; !ok {
+		t.Fatal("run.exit detail must carry the exit code")
+	}
+	reason, _ := detail["reason"].(string)
+	if !strings.Contains(reason, "[REDACTED]") {
+		t.Fatal("run.exit reason was not redacted")
+	}
+	if strings.Contains(output.String(), testURLToken) || strings.Contains(errorsOut.String(), testURLToken) {
+		t.Fatal("output contains the fake URL credential (constant: testURLToken)")
+	}
+}
+
+func TestRunConfigFailureKeepsRunScope(t *testing.T) {
+	t.Setenv("COURIER_RUN_NAME", "coderrun-it-7")
+	t.Setenv("COURIER_REPO", "acme/widgets")
+	t.Setenv("COURIER_REF", "7")
+	t.Setenv("COURIER_MODE", "resolve-issue")
+	// COURIER_REPO_URL is deliberately missing.
+
+	var output bytes.Buffer
+	var errorsOut bytes.Buffer
+	if code := run(context.Background(), &output, &errorsOut); code != 1 {
+		t.Fatalf("run exit code = %d, want 1", code)
+	}
+	exit := findEvent(t, parseEvents(t, &output), "run.exit")
+	if exit["run_id"] != "coderrun-it-7" || exit["status"] != "error" {
+		t.Fatalf("run.exit event lost run scope or status: run_id=%v status=%v", exit["run_id"], exit["status"])
+	}
+}
+
+// TestChildOutputIsRedactedBeforeStreams replaces OpenCode with a script that
+// prints registered credentials to both streams — one of them fragmented
+// across separate shell writes — and proves the redacting transport removed
+// every value while keeping ordinary output, stream separation, and the exit
+// code intact. Failure messages name constants, never values.
+func TestChildOutputIsRedactedBeforeStreams(t *testing.T) {
+	root := t.TempDir()
+	remote := remoteWithExistingBranch(t, root)
+
+	prServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `[]`)
+	}))
+	defer prServer.Close()
+
+	fragment1 := testGitToken[:9]
+	fragment2 := testGitToken[9:]
+	script := fmt.Sprintf(`#!/bin/sh
+printf 'stdout git token '
+printf '%s'
+printf '%s delivered\n'
+printf 'stdout plain line\n'
+printf 'stderr bearer ' >&2
+printf '%s\n' >&2
+printf 'stderr partial without newline ' >&2
+`, fragment1, fragment2, testGitHubTokn)
+	fakeOpenCode := filepath.Join(root, "opencode")
+	writeExecutable(t, fakeOpenCode, script)
+
+	setResolveIssueEnv(t, root, remote, prServer.URL, fakeOpenCode)
+	t.Setenv("COURIER_GIT_TOKEN", testGitToken)
+	t.Setenv("GITHUB_TOKEN", testGitHubTokn)
+	t.Setenv("COURIER_RUN_NAME", "coderrun-it-7")
+	t.Setenv("COURIER_REF", "7")
+
+	var output bytes.Buffer
+	var errorsOut bytes.Buffer
+	if code := run(context.Background(), &output, &errorsOut); code != exitSuccess {
+		t.Fatalf("run exit code = %d, want 0", code)
+	}
+
+	stdoutText := output.String()
+	stderrText := errorsOut.String()
+	for _, leaked := range []string{testGitToken, fragment1, fragment2} {
+		if strings.Contains(stdoutText, leaked) {
+			t.Fatalf("stdout contains a fake credential fragment (constant: %s)", secretConstantName(testGitToken))
+		}
+	}
+	if !strings.Contains(stdoutText, "stdout git token") || !strings.Contains(stdoutText, "delivered") || !strings.Contains(stdoutText, "stdout plain line") {
+		t.Fatal("stdout lost ordinary output around the redaction")
+	}
+	if !strings.Contains(stdoutText, courierlog.RedactedPlaceholder) {
+		t.Fatal("stdout credential was not replaced by the redaction placeholder")
+	}
+	if strings.Contains(stderrText, testGitHubTokn) {
+		t.Fatal("stderr contains a fake credential (constant: testGitHubTokn)")
+	}
+	if !strings.Contains(stderrText, "stderr bearer") || !strings.Contains(stderrText, "stderr partial without newline") {
+		t.Fatal("stderr lost ordinary output, including the flushed final partial line")
+	}
+	if !strings.Contains(stderrText, courierlog.RedactedPlaceholder) {
+		t.Fatal("stderr credential was not replaced by the redaction placeholder")
+	}
+}
+
+// TestChildOutputRedactedOnFailureExit keeps exit semantics and redaction on
+// a failing child: the exit code passes through and the child's final output
+// is flushed through the redactor before the termination handoff.
+func TestChildOutputRedactedOnFailureExit(t *testing.T) {
+	root := t.TempDir()
+	remote := remoteWithExistingBranch(t, root)
+
+	prServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `[]`)
+	}))
+	defer prServer.Close()
+
+	fakeOpenCode := filepath.Join(root, "opencode")
+	writeExecutable(t, fakeOpenCode, fmt.Sprintf(`#!/bin/sh
+printf 'failing run token %s\n'
+exit 3
+`, testGitToken))
+
+	setResolveIssueEnv(t, root, remote, prServer.URL, fakeOpenCode)
+	t.Setenv("COURIER_GIT_TOKEN", testGitToken)
+	t.Setenv("COURIER_RUN_NAME", "coderrun-it-7")
+	t.Setenv("COURIER_REF", "7")
+
+	var output bytes.Buffer
+	var errorsOut bytes.Buffer
+	if code := run(context.Background(), &output, &errorsOut); code != 3 {
+		t.Fatalf("run exit code = %d, want the child's exit code 3", code)
+	}
+	if strings.Contains(output.String(), testGitToken) {
+		t.Fatal("stdout contains a fake credential on the failure path (constant: testGitToken)")
+	}
+	if !strings.Contains(output.String(), "failing run token") || !strings.Contains(output.String(), courierlog.RedactedPlaceholder) {
+		t.Fatal("failure-path stdout lost ordinary output or the redaction placeholder")
+	}
+	if !strings.Contains(output.String(), `"phase":"Failed"`) {
+		t.Fatal("failure path lost the termination handoff")
+	}
+}
+
+// parseEvents decodes the JSON event lines among the run's output. Event
+// lines are the only JSON objects with an "event" field. Failures report
+// line indexes, never line contents.
+func parseEvents(t *testing.T, out *bytes.Buffer) []map[string]any {
+	t.Helper()
+	var events []map[string]any
+	for i, line := range strings.Split(strings.TrimSuffix(out.String(), "\n"), "\n") {
+		if !strings.HasPrefix(line, "{") {
+			continue
+		}
+		var event map[string]any
+		if err := json.Unmarshal([]byte(line), &event); err != nil {
+			t.Fatalf("line %d is not valid JSON: %v", i+1, err)
+		}
+		if _, ok := event["event"]; ok {
+			events = append(events, event)
+		}
+	}
+	return events
+}
+
+func findEvent(t *testing.T, events []map[string]any, eventType string) map[string]any {
+	t.Helper()
+	for _, event := range events {
+		if event["event"] == eventType {
+			return event
+		}
+	}
+	t.Fatalf("no %s event among %d events", eventType, len(events))
+	return nil
+}
+
+func secretConstantName(value string) string {
+	switch value {
+	case testGitToken:
+		return "testGitToken"
+	case testGitHubTokn:
+		return "testGitHubTokn"
+	default:
+		return "unknown-fake-credential"
 	}
 }
 
