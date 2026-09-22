@@ -163,7 +163,7 @@ jobs:
             --mount "type=bind,src=$runtime_workspace,dst=/workspace" \
             --workdir /workspace \
             ${{ env.TOOLCHAIN_IMAGE }}:${{ steps.version.outputs.version }} \
-            sh -ec 'cp -R /source/. /workspace/ && sh hack/verify-courier-go-runtime.sh'
+            sh -ec 'cp -R /source/. /workspace/ && rm -rf /workspace/.git && sh hack/verify-courier-go-runtime.sh'
 
       - name: Set up Helm
         uses: azure/setup-helm@v5.0.1
