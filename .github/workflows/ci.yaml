@@ -134,7 +134,7 @@ jobs:
             --mount "type=bind,src=$runtime_workspace,dst=/workspace" \
             --workdir /workspace \
             courier-go:ci \
-            sh -ec 'cp -R /source/. /workspace/ && chmod -R a+rwX /workspace && sh hack/verify-courier-go-runtime.sh'
+            sh -ec 'cp -R /source/. /workspace/ && sh hack/verify-courier-go-runtime.sh'
 
   vulnerability:
     runs-on: ubuntu-latest
