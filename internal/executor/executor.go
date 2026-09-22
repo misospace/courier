@@ -86,6 +86,17 @@ var (
 	ErrMissingCommandName = errors.New("executor: command name is required")
 )
 
+// forgeContract routes every forge read/write through Courier's configured forge
+// capability rather than a forge-specific CLI, so the same goal works on any
+// forge. (#90)
+const forgeContract = "Route every forge read and write through the configured forge capability, not a forge-specific CLI."
+
+// completionContract states that delegation covers bounded work, never the run's
+// terminal contract: the coordinator integrates and verifies delegated work,
+// pushes, and opens or updates the PR itself. A local commit or pushed branch
+// with no required PR is not completion. (#90)
+const completionContract = "Delegate implementation, research, and review to sub-agents, but you own completion: integrate and verify their work, push the branch, and open or update the pull request yourself — never stop at a local commit or branch when a pull request is required."
+
 // Goal returns the concise coordinator goal for a run. Lane framing is passed
 // separately so it remains context rather than becoming a hard-coded prompt
 // scaffold.
@@ -98,9 +109,9 @@ func Goal(run *courierv1alpha1.CoderRun) (string, error) {
 	}
 	switch run.Spec.Mode {
 	case courierv1alpha1.ModeResolveIssue:
-		return fmt.Sprintf("Open a PR to address issue #%d. Make sure CI is green and it's ready for review, and delegate as much as possible to keep your context clean.", run.Spec.Ref), nil
+		return fmt.Sprintf("Open a PR to address issue #%d and drive it to a review-ready state with CI green. %s %s", run.Spec.Ref, forgeContract, completionContract), nil
 	case courierv1alpha1.ModeFixPR:
-		return fmt.Sprintf("Take over PR #%d. Check why it's blocked (changes requested, conflicts, etc.) and get it back to a healthy state based on the feedback.", run.Spec.Ref), nil
+		return fmt.Sprintf("Take over PR #%d. Inspect the current pull request state, CI/checks, and review feedback to determine what's blocking it, then return it to a review-ready state. %s %s", run.Spec.Ref, forgeContract, completionContract), nil
 	default:
 		return "", fmt.Errorf("%w: %q", ErrInvalidMode, run.Spec.Mode)
 	}

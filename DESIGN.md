@@ -101,14 +101,25 @@ role.
 
 ### Modes
 
-- **resolve-issue** — "Open a PR to address {{issue}}. Make sure CI is green and
-  it's ready for review, and delegate as much as possible to keep your context
-  clean."
-- **fix-pr** — "Take over PR #{{pr}} for issue #{{issue}}. Check why it's blocked
-  (changes requested, conflicts, etc.) and get it back to a healthy state based
-  on the feedback."
+- **resolve-issue** — "Open a PR to address {{issue}} and drive it to a
+  review-ready state with CI green. Route every forge read and write through
+  the configured forge capability, not a forge-specific CLI. Delegate
+  implementation, research, and review to sub-agents, but you own completion:
+  integrate and verify their work, push the branch, and open or update the
+  pull request yourself — never stop at a local commit or branch when a pull
+  request is required."
+- **fix-pr** — "Take over PR #{{pr}}. Inspect the current pull request state,
+  CI/checks, and review feedback to determine what's blocking it, then return
+  it to a review-ready state. Route every forge read and write through the
+  configured forge capability, not a forge-specific CLI. Delegate
+  implementation, research, and review to sub-agents, but you own completion:
+  integrate and verify their work, push the branch, and open or update the
+  pull request yourself — never stop at a local commit or branch when a pull
+  request is required."
 
-Prompts are that short by design. Goal plus tools; the coordinator owns the how.
+Goals stay short — a goal plus tools — but each carries one non-negotiable
+contract: delegation covers bounded work, never the coordinator's ownership
+of completion and forge publication.
 
 ### Terminal states
 
@@ -491,6 +502,17 @@ A running log of architectural decisions and their reasoning, newest first. The
 body above describes the current architecture; this log preserves *why* and what
 was superseded.
 
+- **2026-09-22 — The coordinator owns completion and forge publication.** A
+  coordinator may delegate research, implementation, review, and tests, but
+  never the run's terminal contract: reading the work item, integrating
+  delegated work, verifying it, pushing the branch, and opening or updating
+  the PR stay the coordinator's, performed through the configured forge
+  capability rather than a forge-specific CLI. A local commit or pushed
+  branch with no required PR is not completion. The shipped OpenCode
+  bootstrap states this explicitly (the resolve-issue/fix-pr goals carry
+  it); the planned resumable harness (#8) will enforce it structurally by
+  granting forge-mutation and push tools only to the coordinator and no
+  merge capability to any autonomous role. (#90)
 - **2026-09-22 — Forge access is through a generic MCP, never a per-forge CLI.**
   The coordinator reads issues and opens/updates/comments on change requests via
   a forge MCP wired under a generic slot; the deployment selects the provider

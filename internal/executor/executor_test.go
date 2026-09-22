@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"reflect"
+	"regexp"
 	"strings"
 	"testing"
 
@@ -179,7 +180,6 @@ func TestBuildCoordinatorPodInjectsRunContextAndEphemeralWorkspace(t *testing.T)
 		env[value.Name] = value.Value
 	}
 	for key, want := range map[string]string{
-		"COURIER_GOAL":           "Open a PR to address issue #7. Make sure CI is green and it's ready for review, and delegate as much as possible to keep your context clean.",
 		"COURIER_MODEL":          "litellm/qwen",
 		"COURIER_OPENCODE_AGENT": "",
 		"COURIER_FRAMING":        "single GPU; keep parallelism modest",
@@ -196,6 +196,13 @@ func TestBuildCoordinatorPodInjectsRunContextAndEphemeralWorkspace(t *testing.T)
 		if env[key] != want {
 			t.Fatalf("env %s = %q, want %q", key, env[key], want)
 		}
+	}
+	wantGoal, err := Goal(run)
+	if err != nil {
+		t.Fatalf("Goal() error = %v", err)
+	}
+	if env["COURIER_GOAL"] != wantGoal {
+		t.Fatalf("COURIER_GOAL = %q, want %q (the Goal for the same run)", env["COURIER_GOAL"], wantGoal)
 	}
 	if len(pod.OwnerReferences) != 1 || pod.OwnerReferences[0].Name != run.Name {
 		t.Fatalf("owner references = %#v, want CoderRun owner", pod.OwnerReferences)
@@ -436,6 +443,64 @@ func TestGoalRejectsInvalidRuns(t *testing.T) {
 	run := &courierv1alpha1.CoderRun{Spec: courierv1alpha1.CoderRunSpec{Ref: 0}}
 	if _, err := Goal(run); !errors.Is(err, ErrInvalidReference) {
 		t.Fatalf("Goal(zero ref) error = %v, want %v", err, ErrInvalidReference)
+	}
+}
+
+// forgeCLINames matches a forge name or forge-specific CLI as a whole word so
+// ordinary words like "through" (which contains "gh") do not trip it.
+var forgeCLINames = regexp.MustCompile(`(?i)\b(gh|glab|tea|gitea|forgejo|hub|github)\b`)
+
+func TestGoalCarriesCoordinatorCompletionContract(t *testing.T) {
+	tests := []struct {
+		name    string
+		mode    courierv1alpha1.Mode
+		opening string
+		extra   []string
+	}{
+		{name: "resolve-issue", mode: courierv1alpha1.ModeResolveIssue, opening: "Open a PR", extra: []string{"drive it to a review-ready state with CI green"}},
+		{name: "fix-pr", mode: courierv1alpha1.ModeFixPR, opening: "Take over PR", extra: []string{"pull request state", "CI/checks", "review feedback", "determine what's blocking it", "return it to a review-ready state"}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			run := &courierv1alpha1.CoderRun{
+				Spec: courierv1alpha1.CoderRunSpec{
+					Mode: test.mode,
+					Ref:  7,
+				},
+			}
+			goal, err := Goal(run)
+			if err != nil {
+				t.Fatalf("Goal() error = %v", err)
+			}
+			for _, fragment := range []string{
+				"configured forge capability",
+				"not a forge-specific CLI",
+				"you own completion",
+				"push the branch",
+				"open or update the pull request",
+				"never stop at a local commit or branch when a pull request is required",
+				"7",
+				test.opening,
+			} {
+				if !strings.Contains(goal, fragment) {
+					t.Fatalf("goal %q missing fragment %q", goal, fragment)
+				}
+			}
+			for _, fragment := range test.extra {
+				if !strings.Contains(goal, fragment) {
+					t.Fatalf("goal %q missing fragment %q", goal, fragment)
+				}
+			}
+			if test.mode == courierv1alpha1.ModeResolveIssue && strings.Contains(goal, "determine what's blocking it") {
+				t.Fatalf("resolve-issue goal must not carry fix-pr blocker-diagnosis phrasing: %q", goal)
+			}
+			if strings.Contains(goal, "delegate as much as possible") {
+				t.Fatalf("goal %q retains the old delegation phrasing", goal)
+			}
+			if forgeCLINames.MatchString(goal) {
+				t.Fatalf("goal %q references a forge-specific CLI", goal)
+			}
+		})
 	}
 }
 
