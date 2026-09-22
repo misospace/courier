@@ -284,6 +284,78 @@ func TestRunnerPollPausesWhenLaneProfileDeleted(t *testing.T) {
 	}
 }
 
+func TestRunnerLaneWaitingStateTransitions(t *testing.T) {
+	adapter := &testAdapter{items: []WorkItem{{ID: "x", Mode: "resolve-issue", Repo: "a/b", Ref: 1}}}
+	kubeClient := newTestClient(t)
+	runner := NewRunner(kubeClient, adapter, RunnerConfig{Source: "dispatch", LaneProfile: "local", Namespace: "courier"})
+
+	// Poll 1: lane missing → waiting state entered (first log fires).
+	if err := runner.Poll(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if !runner.laneWaiting {
+		t.Fatal("expected laneWaiting=true after first poll with missing lane")
+	}
+
+	// Poll 2: lane still missing → waiting state maintained (log suppressed).
+	if err := runner.Poll(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if !runner.laneWaiting {
+		t.Fatal("expected laneWaiting=true after second poll with still-missing lane")
+	}
+	if adapter.discoverCalls != 0 {
+		t.Fatalf("discovery ran %d times while lane missing", adapter.discoverCalls)
+	}
+
+	// Lane appears → recovery logged, waiting state cleared.
+	if err := kubeClient.Create(context.Background(), testLane()); err != nil {
+		t.Fatal(err)
+	}
+	if err := runner.Poll(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if runner.laneWaiting {
+		t.Fatal("expected laneWaiting=false after lane appeared")
+	}
+	if adapter.discoverCalls != 1 {
+		t.Fatalf("discovery ran %d times after lane appeared, want 1", adapter.discoverCalls)
+	}
+
+	// Poll again: lane present → no spurious transition.
+	if err := runner.Poll(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if runner.laneWaiting {
+		t.Fatal("expected laneWaiting=false on steady-state poll with lane present")
+	}
+
+	// Lane deleted → new waiting transition (log fires again).
+	if err := kubeClient.Delete(context.Background(), testLane()); err != nil {
+		t.Fatal(err)
+	}
+	if err := runner.Poll(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if !runner.laneWaiting {
+		t.Fatal("expected laneWaiting=true after lane deleted")
+	}
+	if adapter.discoverCalls != 2 {
+		t.Fatalf("discovery ran %d times after deletion, want 2 (from polls 3 and 4)", adapter.discoverCalls)
+	}
+
+	// Poll again after deletion → suppressed.
+	if err := runner.Poll(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if !runner.laneWaiting {
+		t.Fatal("expected laneWaiting=true on sustained absence")
+	}
+	if adapter.discoverCalls != 2 {
+		t.Fatalf("discovery ran %d times on sustained absence, want 2", adapter.discoverCalls)
+	}
+}
+
 func TestRunnerValidation(t *testing.T) {
 	if err := (*Runner)(nil).Poll(context.Background()); err != ErrRunnerClientRequired {
 		t.Fatalf("nil runner error = %v", err)
