@@ -1,5 +1,27 @@
 # Changelog
 
+## [0.1.1](https://github.com/misospace/courier/compare/v0.1.0...v0.1.1) (2026-09-22)
+
+
+### Features
+
+* select lane-specific execution toolchains ([0b817e7](https://github.com/misospace/courier/commit/0b817e7bf4e94cc2632123f005d588781fc57d14))
+* select lane-specific execution toolchains ([f9a610d](https://github.com/misospace/courier/commit/f9a610d23f1c9559dee2e0e166bd18b73f76ea1e))
+
+
+### Bug Fixes
+
+* harden coordinator runtime contract ([51441df](https://github.com/misospace/courier/commit/51441df78454195ddebf7b18c0fd259dd3faac8f))
+* harden coordinator runtime contract ([77d7697](https://github.com/misospace/courier/commit/77d76979758fb67f753b53d333af4b1c28a57235))
+* preserve non-root workspace mount ([fa29919](https://github.com/misospace/courier/commit/fa29919d53009c429f2666034e3f7047b23806e6))
+* require local work before verification ([051270d](https://github.com/misospace/courier/commit/051270decd35f4f850072e13a80a1d97593be528))
+* require local work before verification ([7f3c2fe](https://github.com/misospace/courier/commit/7f3c2fea96e8c34d6a6e9755ff0b990d96ad0d9f))
+
+
+### Chores
+
+* reset release state to recut 0.1.1 instead of 0.2.0 ([4843cd7](https://github.com/misospace/courier/commit/4843cd71542b235a437e21a9c08ca19c01f077d1))
+
 ## 0.1.0 (2026-09-21)
 
 
