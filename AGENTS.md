@@ -4,6 +4,22 @@ Conventions for anyone — human or model — working in this repository. Read t
 and [DESIGN.md](./DESIGN.md) before starting. DESIGN.md is the north star; when
 code and DESIGN.md disagree, DESIGN.md wins unless an issue says otherwise.
 
+## Keeping DESIGN.md current
+
+DESIGN.md is a living document, not a one-time spec. Keep it in step with the
+code in the same change that moves it:
+
+- If a PR alters an architectural decision, or adds or removes a capability
+  DESIGN.md describes, **update DESIGN.md in that same PR.** A change that drifts
+  from the doc without updating it is incomplete.
+- When a decision is made, reversed, or superseded, add a dated entry (with the
+  *why*, and a linked issue) to the **Decisions** log at the end of DESIGN.md.
+  The body of the doc describes what is true now; the log preserves the
+  reasoning, and git history holds what was superseded — so edit the body freely
+  rather than accreting caveats.
+- Reviewers: check whether a change contradicts or extends DESIGN.md and whether
+  the doc was updated to match.
+
 ## What this is
 
 A Kubernetes operator (Go, controller-runtime) plus a coordinator harness. The
