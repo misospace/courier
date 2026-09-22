@@ -108,8 +108,9 @@ role.
   integrate and verify their work, push the branch, and open or update the
   pull request yourself — never stop at a local commit or branch when a pull
   request is required."
-- **fix-pr** — "Take over PR #{{pr}} and return it to a review-ready state
-  based on the review feedback. Route every forge read and write through the
+- **fix-pr** — "Take over PR #{{pr}}. Inspect the current pull request state,
+  CI/checks, and review feedback to determine what's blocking it, then return
+  it to a review-ready state. Route every forge read and write through the
   configured forge capability, not a forge-specific CLI. Delegate
   implementation, research, and review to sub-agents, but you own completion:
   integrate and verify their work, push the branch, and open or update the

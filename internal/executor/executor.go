@@ -111,7 +111,7 @@ func Goal(run *courierv1alpha1.CoderRun) (string, error) {
 	case courierv1alpha1.ModeResolveIssue:
 		return fmt.Sprintf("Open a PR to address issue #%d and drive it to a review-ready state with CI green. %s %s", run.Spec.Ref, forgeContract, completionContract), nil
 	case courierv1alpha1.ModeFixPR:
-		return fmt.Sprintf("Take over PR #%d and return it to a review-ready state based on the review feedback. %s %s", run.Spec.Ref, forgeContract, completionContract), nil
+		return fmt.Sprintf("Take over PR #%d. Inspect the current pull request state, CI/checks, and review feedback to determine what's blocking it, then return it to a review-ready state. %s %s", run.Spec.Ref, forgeContract, completionContract), nil
 	default:
 		return "", fmt.Errorf("%w: %q", ErrInvalidMode, run.Spec.Mode)
 	}

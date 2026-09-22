@@ -455,9 +455,10 @@ func TestGoalCarriesCoordinatorCompletionContract(t *testing.T) {
 		name    string
 		mode    courierv1alpha1.Mode
 		opening string
+		extra   []string
 	}{
-		{name: "resolve-issue", mode: courierv1alpha1.ModeResolveIssue, opening: "Open a PR"},
-		{name: "fix-pr", mode: courierv1alpha1.ModeFixPR, opening: "Take over PR"},
+		{name: "resolve-issue", mode: courierv1alpha1.ModeResolveIssue, opening: "Open a PR", extra: []string{"drive it to a review-ready state with CI green"}},
+		{name: "fix-pr", mode: courierv1alpha1.ModeFixPR, opening: "Take over PR", extra: []string{"pull request state", "CI/checks", "review feedback", "determine what's blocking it", "return it to a review-ready state"}},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
@@ -484,6 +485,14 @@ func TestGoalCarriesCoordinatorCompletionContract(t *testing.T) {
 				if !strings.Contains(goal, fragment) {
 					t.Fatalf("goal %q missing fragment %q", goal, fragment)
 				}
+			}
+			for _, fragment := range test.extra {
+				if !strings.Contains(goal, fragment) {
+					t.Fatalf("goal %q missing fragment %q", goal, fragment)
+				}
+			}
+			if test.mode == courierv1alpha1.ModeResolveIssue && strings.Contains(goal, "determine what's blocking it") {
+				t.Fatalf("resolve-issue goal must not carry fix-pr blocker-diagnosis phrasing: %q", goal)
 			}
 			if strings.Contains(goal, "delegate as much as possible") {
 				t.Fatalf("goal %q retains the old delegation phrasing", goal)
