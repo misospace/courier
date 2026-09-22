@@ -49,7 +49,10 @@ A clean install pulls only the published chart and its referenced manager and
 coordinator images. The chart defaults the manager image to
 `ghcr.io/misospace/courier:0.1.0` and the coordinator image to
 `ghcr.io/misospace/courier-opencode:0.1.0`; override the existing native values or
-manager args when deploying a different executor configuration.
+manager args when deploying a different executor configuration. A lane can
+select a repository-specific coordinator/toolchain image with
+`LaneProfile.spec.runtimeImage`; the optional published
+`ghcr.io/misospace/courier-go:0.1.0` image is the first Courier dogfood example.
 
 For local development, build the dependency and install from source instead:
 
@@ -82,8 +85,9 @@ checkpointing, liveness, contention, sources, and MCP surface.
 - **`CoderRun`** — one immutable attempt at one goal (resolve an issue or fix a
   PR). Carries its own resumable checkpoint in status; self-reaping.
 - **`LaneProfile`** — a reusable model ensemble (which models fill the
-  coordinator/coder/reviewer roles) plus concurrency and runtime framing. The
-  seam that keeps Courier model-agnostic.
+  coordinator/coder/reviewer roles), concurrency, runtime framing, and an
+  optional execution image. The seam that keeps Courier model- and
+  toolchain-agnostic.
 
 ## License
 

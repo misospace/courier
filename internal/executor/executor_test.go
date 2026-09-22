@@ -202,6 +202,33 @@ func TestBuildCoordinatorPodInjectsRunContextAndEphemeralWorkspace(t *testing.T)
 	}
 }
 
+func TestBuildCoordinatorPodUsesLaneRuntimeImage(t *testing.T) {
+	run := &courierv1alpha1.CoderRun{
+		ObjectMeta: metav1.ObjectMeta{Name: "run-runtime-image", Namespace: "courier-system"},
+		Spec: courierv1alpha1.CoderRunSpec{
+			Mode: courierv1alpha1.ModeResolveIssue,
+			Repo: "acme/widgets",
+			Ref:  7,
+			Lane: "go-dogfood",
+		},
+		Status: courierv1alpha1.CoderRunStatus{Branch: "courier/resolve-issue/acme-widgets/7"},
+	}
+	lane := &courierv1alpha1.LaneProfile{
+		ObjectMeta: metav1.ObjectMeta{Name: "go-dogfood", Namespace: "courier-system"},
+		Spec: courierv1alpha1.LaneProfileSpec{
+			Roles:        map[string]string{"coordinator": "any-model"},
+			RuntimeImage: "registry.example/courier-go:test",
+		},
+	}
+	pod, err := BuildCoordinatorPod(run, lane, PodConfig{Image: "registry.example/courier-opencode:test"})
+	if err != nil {
+		t.Fatalf("BuildCoordinatorPod() error = %v", err)
+	}
+	if got := pod.Spec.Containers[0].Image; got != lane.Spec.RuntimeImage {
+		t.Fatalf("coordinator image = %q, want lane runtime image %q", got, lane.Spec.RuntimeImage)
+	}
+}
+
 func TestBuildCoordinatorPodWiresGitSecretWithoutEmbeddingCredentials(t *testing.T) {
 	run := &courierv1alpha1.CoderRun{
 		ObjectMeta: metav1.ObjectMeta{Name: "run-secret", Namespace: "courier-system"},

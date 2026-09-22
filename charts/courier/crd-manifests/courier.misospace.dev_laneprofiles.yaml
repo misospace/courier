@@ -69,6 +69,12 @@ spec:
                   Roles maps a coordinator role (coordinator, coder, reviewer, ...) to a
                   model identifier understood by the configured model gateway.
                 type: object
+              runtimeImage:
+                description: |-
+                  RuntimeImage selects the coordinator runtime and repository toolchain for
+                  runs on this lane. Empty uses the deployment's default coordinator image;
+                  a lane may select any compatible image without changing Courier core.
+                type: string
             required:
             - concurrency
             - roles

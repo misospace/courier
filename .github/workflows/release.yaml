@@ -17,6 +17,7 @@ env:
   REGISTRY: ghcr.io
   MANAGER_IMAGE: ghcr.io/misospace/courier
   COORDINATOR_IMAGE: ghcr.io/misospace/courier-opencode
+  TOOLCHAIN_IMAGE: ghcr.io/misospace/courier-go
   CHART_REGISTRY: oci://ghcr.io/misospace/charts
 
 jobs:
@@ -79,6 +80,15 @@ jobs:
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
 
+      - name: Toolchain metadata
+        id: toolchain-meta
+        uses: docker/metadata-action@v6.2.0
+        with:
+          images: ${{ env.TOOLCHAIN_IMAGE }}
+          tags: |
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+
       - name: Build and push manager
         uses: docker/build-push-action@v7.4.0
         with:
@@ -101,10 +111,22 @@ jobs:
           cache-from: type=gha,scope=coordinator
           cache-to: type=gha,mode=max,scope=coordinator
 
+      - name: Build and push Go toolchain coordinator
+        uses: docker/build-push-action@v7.4.0
+        with:
+          context: .
+          target: coordinator-go
+          push: true
+          tags: ${{ steps.toolchain-meta.outputs.tags }}
+          labels: ${{ steps.toolchain-meta.outputs.labels }}
+          cache-from: type=gha,scope=coordinator-go
+          cache-to: type=gha,mode=max,scope=coordinator-go
+
       - name: Pull published images for validation
         run: |
           docker pull ${{ env.MANAGER_IMAGE }}:${{ steps.version.outputs.version }}
           docker pull ${{ env.COORDINATOR_IMAGE }}:${{ steps.version.outputs.version }}
+          docker pull ${{ env.TOOLCHAIN_IMAGE }}:${{ steps.version.outputs.version }}
 
       - name: Validate manager image
         run: docker run --rm ${{ env.MANAGER_IMAGE }}:${{ steps.version.outputs.version }} --help
@@ -116,6 +138,32 @@ jobs:
           -c 'test -x /usr/local/bin/courier-executor && opencode --help'
       - name: Validate coordinator identity
         run: test "$(docker inspect --format '{{.Config.User}}' ${{ env.COORDINATOR_IMAGE }}:${{ steps.version.outputs.version }})" = "65532:65532"
+      - name: Validate Go toolchain coordinator image
+        run: >-
+          docker run --rm --entrypoint sh
+          ${{ env.TOOLCHAIN_IMAGE }}:${{ steps.version.outputs.version }}
+          -c 'test "$(id -u)" = 65532 && go version && make --version >/dev/null && helm version --short >/dev/null && controller-gen --version >/dev/null && test ! -x "$(command -v gh || true)"'
+      - name: Validate Courier workflow in published Go toolchain image
+        run: |
+          runtime_workspace="$(mktemp -d)"
+          chmod 777 "$runtime_workspace"
+          cleanup_runtime_workspace() {
+            docker run --rm \
+              --user 0:0 \
+              --mount "type=bind,src=$runtime_workspace,dst=/workspace" \
+              ${{ env.TOOLCHAIN_IMAGE }}:${{ steps.version.outputs.version }} \
+              sh -ec 'rm -rf /workspace/* /workspace/.[!.]*' >/dev/null || true
+            rmdir "$runtime_workspace" 2>/dev/null || true
+          }
+          trap cleanup_runtime_workspace EXIT
+          test "$(docker inspect --format '{{.Config.User}}' ${{ env.TOOLCHAIN_IMAGE }}:${{ steps.version.outputs.version }})" = "65532:65532"
+          docker run --rm \
+            --user 65532:65532 \
+            --mount "type=bind,src=$GITHUB_WORKSPACE,dst=/source,readonly" \
+            --mount "type=bind,src=$runtime_workspace,dst=/workspace" \
+            --workdir /workspace \
+            ${{ env.TOOLCHAIN_IMAGE }}:${{ steps.version.outputs.version }} \
+            sh -ec 'cp -R /source/. /workspace/ && rm -rf /workspace/.git && sh hack/verify-courier-go-runtime.sh'
 
       - name: Set up Helm
         uses: azure/setup-helm@v5.0.1

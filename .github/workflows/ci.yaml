@@ -108,6 +108,42 @@ jobs:
       - name: Validate coordinator identity
         run: test "$(docker inspect --format '{{.Config.User}}' courier-coordinator:ci)" = "65532:65532"
 
+      - name: Build Go toolchain coordinator image
+        uses: docker/build-push-action@v7.4.0
+        with:
+          context: .
+          target: coordinator-go
+          tags: courier-go:ci
+          load: true
+          cache-from: type=gha,scope=coordinator-go
+          cache-to: type=gha,mode=max,scope=coordinator-go
+
+      - name: Validate Go toolchain coordinator image
+        run: >-
+          docker run --rm --entrypoint sh courier-go:ci
+          -c 'test "$(id -u)" = 65532 && go version && make --version >/dev/null && helm version --short >/dev/null && controller-gen --version >/dev/null && test ! -x "$(command -v gh || true)"'
+      - name: Validate Courier workflow in Go toolchain image
+        run: |
+          runtime_workspace="$(mktemp -d)"
+          chmod 777 "$runtime_workspace"
+          cleanup_runtime_workspace() {
+            docker run --rm \
+              --user 0:0 \
+              --mount "type=bind,src=$runtime_workspace,dst=/workspace" \
+              courier-go:ci \
+              sh -ec 'rm -rf /workspace/* /workspace/.[!.]*' >/dev/null || true
+            rmdir "$runtime_workspace" 2>/dev/null || true
+          }
+          trap cleanup_runtime_workspace EXIT
+          test "$(docker inspect --format '{{.Config.User}}' courier-go:ci)" = "65532:65532"
+          docker run --rm \
+            --user 65532:65532 \
+            --mount "type=bind,src=$GITHUB_WORKSPACE,dst=/source,readonly" \
+            --mount "type=bind,src=$runtime_workspace,dst=/workspace" \
+            --workdir /workspace \
+            courier-go:ci \
+            sh -ec 'cp -R /source/. /workspace/ && rm -rf /workspace/.git && sh hack/verify-courier-go-runtime.sh'
+
   vulnerability:
     runs-on: ubuntu-latest
     steps:

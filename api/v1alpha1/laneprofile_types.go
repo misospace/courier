@@ -6,6 +6,12 @@ import metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 // It is the seam that keeps Courier model-agnostic: roles may name cloud or
 // local models in any mix, and nothing about a lane is baked into the core.
 type LaneProfileSpec struct {
+	// RuntimeImage selects the coordinator runtime and repository toolchain for
+	// runs on this lane. Empty uses the deployment's default coordinator image;
+	// a lane may select any compatible image without changing Courier core.
+	// +optional
+	RuntimeImage string `json:"runtimeImage,omitempty"`
+
 	// Concurrency is the maximum number of Running CoderRuns admitted on this
 	// lane. A local lane is typically 1; a cloud lane can be much higher.
 	// +kubebuilder:default=1
