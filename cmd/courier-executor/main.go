@@ -244,6 +244,11 @@ func run(ctx context.Context, stdout, stderr io.Writer) int {
 		report.terminate(termination{Phase: "Failed", Result: "failure", ExitCode: 1, Reason: err.Error()})
 		return 1
 	}
+	startCommit, err := workspace.Head(ctx)
+	if err != nil {
+		report.terminate(termination{Phase: "Failed", Result: "failure", ExitCode: 1, Reason: "record workspace start: " + err.Error()})
+		return 1
+	}
 	report.event(courierlog.EventWorkspaceReady, courierlog.StatusOK, map[string]any{
 		"adopted": workspace.Adopted,
 		"base":    cfg.Base,
@@ -290,8 +295,22 @@ func run(ctx context.Context, stdout, stderr io.Writer) int {
 		return code
 	}
 
-	report.terminate(termination{Phase: "Verifying", Result: "success", ExitCode: exitSuccess, Reason: "opencode completed"})
-	return exitSuccess
+	workState, err := workspace.WorkState(ctx, startCommit)
+	if err != nil {
+		report.terminate(termination{Phase: "Failed", Result: "failure", ExitCode: 1, Reason: "inspect workspace result: " + err.Error()})
+		return 1
+	}
+	switch workState {
+	case git.WorkStateCommitted:
+		report.terminate(termination{Phase: "Verifying", Result: "success", ExitCode: exitSuccess, Reason: "opencode completed with committed work"})
+		return exitSuccess
+	case git.WorkStateDirty:
+		report.terminate(termination{Phase: "NeedsHuman", Result: "needs-human", ExitCode: exitNeedsHuman, Reason: "opencode exited successfully with uncommitted workspace changes"})
+		return exitNeedsHuman
+	default:
+		report.terminate(termination{Phase: "NeedsHuman", Result: "needs-human", ExitCode: exitNeedsHuman, Reason: "opencode exited successfully without producing a commit or workspace changes"})
+		return exitNeedsHuman
+	}
 }
 
 // envIdentity reconstructs run identity from the environment for exit paths

@@ -44,6 +44,15 @@ type Workspace struct {
 	Adopted    bool
 }
 
+// WorkState describes local evidence left by an executor after it exits.
+type WorkState string
+
+const (
+	WorkStateNone      WorkState = "none"
+	WorkStateDirty     WorkState = "dirty"
+	WorkStateCommitted WorkState = "committed"
+)
+
 // TrustDirectory adds only the configured workspace to Git's global
 // safe.directory list. Kubernetes volumes can be mounted with an owner that
 // differs from the process UID; this preserves Git's ownership protection
@@ -58,6 +67,50 @@ func TrustDirectory(ctx context.Context, directory string) error {
 	}
 	_, err := run(ctx, "", "config", "--global", "--add", "safe.directory", directory)
 	return err
+}
+
+// Head returns the current local commit at the workspace boundary.
+func (w *Workspace) Head(ctx context.Context) (string, error) {
+	if w == nil || strings.TrimSpace(w.Directory) == "" {
+		return "", errors.New("git head: workspace directory is required")
+	}
+	out, err := run(ctx, w.Directory, "rev-parse", "HEAD")
+	if err != nil {
+		return "", err
+	}
+	return strings.TrimSpace(string(out)), nil
+}
+
+// WorkState reports whether the executor left uncommitted changes, one or
+// more commits beyond startCommit, or no meaningful repository work. It does
+// not inspect a forge or remote branch.
+func (w *Workspace) WorkState(ctx context.Context, startCommit string) (WorkState, error) {
+	if w == nil || strings.TrimSpace(w.Directory) == "" {
+		return "", errors.New("git work state: workspace directory is required")
+	}
+	startCommit = strings.TrimSpace(startCommit)
+	if startCommit == "" {
+		return "", errors.New("git work state: starting commit is required")
+	}
+	dirty, err := run(ctx, w.Directory, "status", "--porcelain=v1", "--untracked-files=all", "--", ".")
+	if err != nil {
+		return "", err
+	}
+	if len(bytes.TrimSpace(dirty)) > 0 {
+		return WorkStateDirty, nil
+	}
+	countOutput, err := run(ctx, w.Directory, "rev-list", "--count", startCommit+"..HEAD")
+	if err != nil {
+		return "", err
+	}
+	count, err := strconv.Atoi(strings.TrimSpace(string(countOutput)))
+	if err != nil {
+		return "", fmt.Errorf("git work state: parse commit count: %w", err)
+	}
+	if count > 0 {
+		return WorkStateCommitted, nil
+	}
+	return WorkStateNone, nil
 }
 
 // Brief describes one completed delegation unit.  Objective and Outcome are

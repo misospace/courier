@@ -62,9 +62,11 @@ func (o OpenCode) BootstrapCommand(inv Invocation, binary string) Command {
 	return Command{Binary: binary}
 }
 
-// Result maps every process termination to an explicit terminal phase. A
-// context cancellation is an infrastructure failure, not a needs-human
-// declaration; the operator can decide whether to relaunch it.
+// Result maps the process termination itself to an explicit phase. Callers
+// must still inspect local workspace evidence before treating a zero exit as
+// eligible for Verifying. A context cancellation is an infrastructure
+// failure, not a needs-human declaration; the operator can decide whether to
+// relaunch it.
 func (o OpenCode) Result(exitCode int, err error) Outcome {
 	if err != nil {
 		return Outcome{Phase: TerminalFailed, Reason: "opencode process failed", Err: err}

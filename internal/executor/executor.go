@@ -24,10 +24,12 @@ const (
 	TerminalFailed     TerminalPhase = TerminalPhase(courierv1alpha1.PhaseFailed)
 )
 
-// Outcome is the only result an executor returns after its process exits.
-// An exit code of zero is a successful handoff to external verification; the
-// temporary shim uses exit code 2 for a deliberate needs-human result and
-// treats all other failures as infrastructure/runtime failures.
+// Outcome describes the process-level result an executor reports. A runtime
+// must combine a zero exit with local workspace evidence before handing work
+// to external verification; process success alone is not evidence that useful
+// work was produced. The temporary shim uses exit code 2 for a deliberate
+// needs-human result and treats all other failures as infrastructure/runtime
+// failures.
 type Outcome struct {
 	Phase  TerminalPhase
 	Reason string
