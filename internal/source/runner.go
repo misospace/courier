@@ -14,6 +14,7 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 )
@@ -83,6 +84,15 @@ func (r *Runner) Poll(ctx context.Context) error {
 	}
 	r.pollMu.Lock()
 	defer r.pollMu.Unlock()
+
+	lane := &courierv1alpha1.LaneProfile{}
+	if err := r.Get(ctx, types.NamespacedName{Namespace: r.Config.Namespace, Name: r.Config.LaneProfile}, lane); err != nil {
+		if apierrors.IsNotFound(err) {
+			log.FromContext(ctx).Info("waiting for LaneProfile before source discovery", "laneProfile", r.Config.LaneProfile, "namespace", r.Config.Namespace)
+			return nil
+		}
+		return fmt.Errorf("get LaneProfile %s/%s: %w", r.Config.Namespace, r.Config.LaneProfile, err)
+	}
 
 	items, err := r.Adapter.Discover(ctx)
 	if err != nil {
