@@ -147,7 +147,15 @@ jobs:
         run: |
           runtime_workspace="$(mktemp -d)"
           chmod 777 "$runtime_workspace"
-          trap 'rm -rf "$runtime_workspace"' EXIT
+          cleanup_runtime_workspace() {
+            docker run --rm \
+              --user 0:0 \
+              --mount "type=bind,src=$runtime_workspace,dst=/workspace" \
+              ${{ env.TOOLCHAIN_IMAGE }}:${{ steps.version.outputs.version }} \
+              sh -ec 'rm -rf /workspace/* /workspace/.[!.]*' >/dev/null || true
+            rmdir "$runtime_workspace" 2>/dev/null || true
+          }
+          trap cleanup_runtime_workspace EXIT
           test "$(docker inspect --format '{{.Config.User}}' ${{ env.TOOLCHAIN_IMAGE }}:${{ steps.version.outputs.version }})" = "65532:65532"
           docker run --rm \
             --user 65532:65532 \
