@@ -122,6 +122,19 @@ jobs:
         run: >-
           docker run --rm --entrypoint sh courier-go:ci
           -c 'test "$(id -u)" = 65532 && go version && make --version >/dev/null && helm version --short >/dev/null && controller-gen --version >/dev/null && test ! -x "$(command -v gh || true)"'
+      - name: Validate Courier workflow in Go toolchain image
+        run: |
+          runtime_workspace="$(mktemp -d)"
+          chmod 777 "$runtime_workspace"
+          trap 'rm -rf "$runtime_workspace"' EXIT
+          test "$(docker inspect --format '{{.Config.User}}' courier-go:ci)" = "65532:65532"
+          docker run --rm \
+            --user 65532:65532 \
+            --mount "type=bind,src=$GITHUB_WORKSPACE,dst=/source,readonly" \
+            --mount "type=bind,src=$runtime_workspace,dst=/workspace" \
+            --workdir /workspace \
+            courier-go:ci \
+            sh -ec 'cp -R /source/. /workspace/ && chmod -R a+rwX /workspace && sh hack/verify-courier-go-runtime.sh'
 
   vulnerability:
     runs-on: ubuntu-latest
