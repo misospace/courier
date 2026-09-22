@@ -7,6 +7,7 @@ import (
 	"time"
 
 	courierv1alpha1 "github.com/misospace/courier/api/v1alpha1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
@@ -18,7 +19,7 @@ func TestRunnerPollMaterializesAndDeduplicatesByOpaqueID(t *testing.T) {
 		{ID: "opaque-a", Mode: "resolve-issue", Repo: "acme/other", Ref: 99, Lane: "source-lane"},
 		{ID: "opaque-b", Mode: "fix-pr", Repo: "acme/widgets", Ref: 2, Lane: "source-lane"},
 	}}
-	kubeClient := fake.NewClientBuilder().WithScheme(testScheme()).Build()
+	kubeClient := newTestClient(t, testLane())
 	runner := NewRunner(kubeClient, adapter, RunnerConfig{Source: "dispatch", LaneProfile: "local", Namespace: "courier"})
 
 	if err := runner.Poll(context.Background()); err != nil {
@@ -52,7 +53,7 @@ func TestRunnerPollMaterializesAndDeduplicatesByOpaqueID(t *testing.T) {
 
 func TestRunnerCreatesFreshRunWhenWorkItemGenerationChanges(t *testing.T) {
 	adapter := &testAdapter{items: []WorkItem{{ID: "pr-fix/queue-item/generation-1", Mode: "fix-pr", Repo: "acme/widgets", Ref: 42}}}
-	kubeClient := fake.NewClientBuilder().WithScheme(testScheme()).Build()
+	kubeClient := newTestClient(t, testLane())
 	runner := NewRunner(kubeClient, adapter, RunnerConfig{Source: "dispatch", LaneProfile: "local", Namespace: "courier"})
 
 	if err := runner.Poll(context.Background()); err != nil {
@@ -81,7 +82,7 @@ func TestRunnerCreatesFreshRunWhenWorkItemGenerationChanges(t *testing.T) {
 
 func TestRunnerDoesNotClaimDuringDiscovery(t *testing.T) {
 	adapter := &testAdapter{items: []WorkItem{{ID: "opaque-a", Mode: "resolve-issue", Repo: "acme/widgets", Ref: 1}}}
-	kubeClient := fake.NewClientBuilder().WithScheme(testScheme()).Build()
+	kubeClient := newTestClient(t, testLane())
 	runner := NewRunner(kubeClient, adapter, RunnerConfig{Source: "dispatch", LaneProfile: "local", Namespace: "courier"})
 	if err := runner.Poll(context.Background()); err != nil {
 		t.Fatal(err)
@@ -94,7 +95,7 @@ func TestRunnerDoesNotClaimDuringDiscovery(t *testing.T) {
 func TestRunnerPollReturnsTransientDiscoveryFailure(t *testing.T) {
 	want := errors.New("temporary upstream failure")
 	adapter := &testAdapter{err: want}
-	kubeClient := fake.NewClientBuilder().WithScheme(testScheme()).Build()
+	kubeClient := newTestClient(t, testLane())
 	runner := NewRunner(kubeClient, adapter, RunnerConfig{Source: "test", LaneProfile: "local", Namespace: "courier"})
 	if err := runner.Poll(context.Background()); !errors.Is(err, want) {
 		t.Fatalf("Poll() error = %v, want %v", err, want)
@@ -105,7 +106,7 @@ func TestRunnerPollsAreSerialized(t *testing.T) {
 	discoverStarted := make(chan struct{}, 2)
 	releaseDiscover := make(chan struct{})
 	adapter := &testAdapter{discoverStarted: discoverStarted, releaseDiscover: releaseDiscover}
-	kubeClient := fake.NewClientBuilder().WithScheme(testScheme()).Build()
+	kubeClient := newTestClient(t, testLane())
 	runner := NewRunner(kubeClient, adapter, RunnerConfig{Source: "test", LaneProfile: "local", Namespace: "courier"})
 	firstDone := make(chan error, 1)
 	go func() { firstDone <- runner.Poll(context.Background()) }()
@@ -134,7 +135,7 @@ func TestRunnerPollHonorsContextCancellation(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 	adapter := &testAdapter{items: []WorkItem{{ID: "opaque-a", Mode: "resolve-issue", Repo: "acme/widgets", Ref: 1}}}
-	kubeClient := fake.NewClientBuilder().WithScheme(testScheme()).Build()
+	kubeClient := newTestClient(t, testLane())
 	runner := NewRunner(kubeClient, adapter, RunnerConfig{Source: "test", LaneProfile: "local", Namespace: "courier"})
 	if err := runner.Poll(ctx); !errors.Is(err, context.Canceled) {
 		t.Fatalf("Poll() error = %v, want context.Canceled", err)
@@ -147,7 +148,7 @@ func TestRunnerSkipsMalformedItemsAndCreatesValidItems(t *testing.T) {
 		{ID: "missing-repo", Mode: "resolve-issue", Ref: 1},
 		{ID: "valid", Mode: "resolve-issue", Repo: "acme/widgets", Ref: 1},
 	}}
-	kubeClient := fake.NewClientBuilder().WithScheme(testScheme()).Build()
+	kubeClient := newTestClient(t, testLane())
 	runner := NewRunner(kubeClient, adapter, RunnerConfig{Source: "test", LaneProfile: "local", Namespace: "courier"})
 	if err := runner.Poll(context.Background()); err != nil {
 		t.Fatal(err)
@@ -163,7 +164,7 @@ func TestRunnerSkipsMalformedItemsAndCreatesValidItems(t *testing.T) {
 
 func TestRunnerSkipsInvalidModeWithoutCreatingRun(t *testing.T) {
 	adapter := &testAdapter{items: []WorkItem{{ID: "opaque-a", Mode: "unknown", Repo: "acme/widgets", Ref: 1}}}
-	kubeClient := fake.NewClientBuilder().WithScheme(testScheme()).Build()
+	kubeClient := newTestClient(t, testLane())
 	runner := NewRunner(kubeClient, adapter, RunnerConfig{Source: "test", LaneProfile: "local", Namespace: "courier"})
 	if err := runner.Poll(context.Background()); err != nil {
 		t.Fatalf("Poll() error = %v, want nil", err)
@@ -177,11 +178,189 @@ func TestRunnerSkipsInvalidModeWithoutCreatingRun(t *testing.T) {
 	}
 }
 
+func TestRunnerPollSkipsDiscoveryWhenLaneProfileMissing(t *testing.T) {
+	adapter := &testAdapter{items: []WorkItem{{ID: "opaque-a", Mode: "resolve-issue", Repo: "acme/widgets", Ref: 1}}}
+	kubeClient := newTestClient(t)
+	runner := NewRunner(kubeClient, adapter, RunnerConfig{Source: "dispatch", LaneProfile: "local", Namespace: "courier"})
+
+	if err := runner.Poll(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if adapter.discoverCalls != 0 {
+		t.Fatalf("discovery ran %d times, want 0 while LaneProfile is missing", adapter.discoverCalls)
+	}
+	var runs courierv1alpha1.CoderRunList
+	if err := kubeClient.List(context.Background(), &runs, client.InNamespace("courier")); err != nil {
+		t.Fatal(err)
+	}
+	if len(runs.Items) != 0 {
+		t.Fatalf("created %d runs, want none", len(runs.Items))
+	}
+}
+
+func TestRunnerPollDiscoversWhenLaneProfileExists(t *testing.T) {
+	adapter := &testAdapter{items: []WorkItem{{ID: "opaque-a", Mode: "resolve-issue", Repo: "acme/widgets", Ref: 1}}}
+	kubeClient := newTestClient(t, testLane())
+	runner := NewRunner(kubeClient, adapter, RunnerConfig{Source: "dispatch", LaneProfile: "local", Namespace: "courier"})
+
+	if err := runner.Poll(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if adapter.discoverCalls != 1 {
+		t.Fatalf("discovery ran %d times, want 1", adapter.discoverCalls)
+	}
+	var runs courierv1alpha1.CoderRunList
+	if err := kubeClient.List(context.Background(), &runs, client.InNamespace("courier")); err != nil {
+		t.Fatal(err)
+	}
+	if len(runs.Items) != 1 {
+		t.Fatalf("created %d runs, want 1", len(runs.Items))
+	}
+}
+
+func TestRunnerPollResumesWhenLaneProfileAppears(t *testing.T) {
+	adapter := &testAdapter{items: []WorkItem{{ID: "opaque-a", Mode: "resolve-issue", Repo: "acme/widgets", Ref: 1}}}
+	kubeClient := newTestClient(t)
+	runner := NewRunner(kubeClient, adapter, RunnerConfig{Source: "dispatch", LaneProfile: "local", Namespace: "courier"})
+
+	if err := runner.Poll(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if adapter.discoverCalls != 0 {
+		t.Fatalf("discovery ran %d times before LaneProfile existed", adapter.discoverCalls)
+	}
+	if err := kubeClient.Create(context.Background(), testLane()); err != nil {
+		t.Fatal(err)
+	}
+	if err := runner.Poll(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if adapter.discoverCalls != 1 {
+		t.Fatalf("discovery ran %d times after LaneProfile appeared, want 1", adapter.discoverCalls)
+	}
+	var runs courierv1alpha1.CoderRunList
+	if err := kubeClient.List(context.Background(), &runs, client.InNamespace("courier")); err != nil {
+		t.Fatal(err)
+	}
+	if len(runs.Items) != 1 {
+		t.Fatalf("created %d runs, want 1", len(runs.Items))
+	}
+}
+
+func TestRunnerPollPausesWhenLaneProfileDeleted(t *testing.T) {
+	adapter := &testAdapter{items: []WorkItem{{ID: "opaque-a", Mode: "resolve-issue", Repo: "acme/widgets", Ref: 1}}}
+	lane := testLane()
+	kubeClient := newTestClient(t, lane)
+	runner := NewRunner(kubeClient, adapter, RunnerConfig{Source: "dispatch", LaneProfile: "local", Namespace: "courier"})
+
+	if err := runner.Poll(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if adapter.discoverCalls != 1 {
+		t.Fatalf("discovery ran %d times, want 1", adapter.discoverCalls)
+	}
+	var runs courierv1alpha1.CoderRunList
+	if err := kubeClient.List(context.Background(), &runs, client.InNamespace("courier")); err != nil {
+		t.Fatal(err)
+	}
+	if len(runs.Items) != 1 {
+		t.Fatalf("created %d runs, want 1", len(runs.Items))
+	}
+
+	if err := kubeClient.Delete(context.Background(), lane); err != nil {
+		t.Fatal(err)
+	}
+	if err := runner.Poll(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if adapter.discoverCalls != 1 {
+		t.Fatalf("discovery ran %d times after LaneProfile was deleted, want 1", adapter.discoverCalls)
+	}
+	if err := kubeClient.List(context.Background(), &runs, client.InNamespace("courier")); err != nil {
+		t.Fatal(err)
+	}
+	if len(runs.Items) != 1 {
+		t.Fatalf("runs = %d, want the previously created run left untouched", len(runs.Items))
+	}
+}
+
+func TestRunnerLaneWaitingStateTransitions(t *testing.T) {
+	adapter := &testAdapter{items: []WorkItem{{ID: "x", Mode: "resolve-issue", Repo: "a/b", Ref: 1}}}
+	kubeClient := newTestClient(t)
+	runner := NewRunner(kubeClient, adapter, RunnerConfig{Source: "dispatch", LaneProfile: "local", Namespace: "courier"})
+
+	// Poll 1: lane missing → waiting state entered (first log fires).
+	if err := runner.Poll(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if !runner.laneWaiting {
+		t.Fatal("expected laneWaiting=true after first poll with missing lane")
+	}
+
+	// Poll 2: lane still missing → waiting state maintained (log suppressed).
+	if err := runner.Poll(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if !runner.laneWaiting {
+		t.Fatal("expected laneWaiting=true after second poll with still-missing lane")
+	}
+	if adapter.discoverCalls != 0 {
+		t.Fatalf("discovery ran %d times while lane missing", adapter.discoverCalls)
+	}
+
+	// Lane appears → recovery logged, waiting state cleared.
+	if err := kubeClient.Create(context.Background(), testLane()); err != nil {
+		t.Fatal(err)
+	}
+	if err := runner.Poll(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if runner.laneWaiting {
+		t.Fatal("expected laneWaiting=false after lane appeared")
+	}
+	if adapter.discoverCalls != 1 {
+		t.Fatalf("discovery ran %d times after lane appeared, want 1", adapter.discoverCalls)
+	}
+
+	// Poll again: lane present → no spurious transition.
+	if err := runner.Poll(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if runner.laneWaiting {
+		t.Fatal("expected laneWaiting=false on steady-state poll with lane present")
+	}
+
+	// Lane deleted → new waiting transition (log fires again).
+	if err := kubeClient.Delete(context.Background(), testLane()); err != nil {
+		t.Fatal(err)
+	}
+	if err := runner.Poll(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if !runner.laneWaiting {
+		t.Fatal("expected laneWaiting=true after lane deleted")
+	}
+	if adapter.discoverCalls != 2 {
+		t.Fatalf("discovery ran %d times after deletion, want 2 (from polls 3 and 4)", adapter.discoverCalls)
+	}
+
+	// Poll again after deletion → suppressed.
+	if err := runner.Poll(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if !runner.laneWaiting {
+		t.Fatal("expected laneWaiting=true on sustained absence")
+	}
+	if adapter.discoverCalls != 2 {
+		t.Fatalf("discovery ran %d times on sustained absence, want 2", adapter.discoverCalls)
+	}
+}
+
 func TestRunnerValidation(t *testing.T) {
 	if err := (*Runner)(nil).Poll(context.Background()); err != ErrRunnerClientRequired {
 		t.Fatalf("nil runner error = %v", err)
 	}
-	kubeClient := fake.NewClientBuilder().WithScheme(testScheme()).Build()
+	kubeClient := newTestClient(t)
 	if err := NewRunner(kubeClient, nil, RunnerConfig{Source: "dispatch", Namespace: "courier"}).Poll(context.Background()); err != ErrRunnerAdapterRequired {
 		t.Fatalf("nil adapter error = %v", err)
 	}
@@ -196,12 +375,14 @@ func TestRunnerValidation(t *testing.T) {
 type testAdapter struct {
 	items           []WorkItem
 	claims          int
+	discoverCalls   int
 	err             error
 	discoverStarted chan<- struct{}
 	releaseDiscover <-chan struct{}
 }
 
 func (a *testAdapter) Discover(context.Context) ([]WorkItem, error) {
+	a.discoverCalls++
 	if a.discoverStarted != nil {
 		a.discoverStarted <- struct{}{}
 		<-a.releaseDiscover
@@ -212,6 +393,17 @@ func (a *testAdapter) Claim(context.Context, WorkItem) error             { a.cla
 func (a *testAdapter) Release(context.Context, WorkItem) error           { return nil }
 func (a *testAdapter) Transition(context.Context, WorkItem, State) error { return nil }
 func (a *testAdapter) Resolve(context.Context, WorkItem) error           { return nil }
+
+func newTestClient(t *testing.T, objs ...client.Object) client.Client {
+	t.Helper()
+	return fake.NewClientBuilder().WithScheme(testScheme()).WithObjects(objs...).Build()
+}
+
+func testLane() *courierv1alpha1.LaneProfile {
+	return &courierv1alpha1.LaneProfile{
+		ObjectMeta: metav1.ObjectMeta{Namespace: "courier", Name: "local"},
+	}
+}
 
 func testScheme() *runtime.Scheme {
 	scheme := runtime.NewScheme()

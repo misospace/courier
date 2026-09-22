@@ -14,6 +14,7 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 )
@@ -39,10 +40,11 @@ type RunnerConfig struct {
 // Runner polls a source and materializes source work as CoderRuns.
 type Runner struct {
 	client.Client
-	Scheme  *runtime.Scheme
-	Adapter Adapter
-	Config  RunnerConfig
-	pollMu  sync.Mutex
+	Scheme      *runtime.Scheme
+	Adapter     Adapter
+	Config      RunnerConfig
+	pollMu      sync.Mutex
+	laneWaiting bool
 }
 
 func NewRunner(c client.Client, adapter Adapter, config RunnerConfig) *Runner {
@@ -83,6 +85,22 @@ func (r *Runner) Poll(ctx context.Context) error {
 	}
 	r.pollMu.Lock()
 	defer r.pollMu.Unlock()
+
+	lane := &courierv1alpha1.LaneProfile{}
+	if err := r.Get(ctx, types.NamespacedName{Namespace: r.Config.Namespace, Name: r.Config.LaneProfile}, lane); err != nil {
+		if apierrors.IsNotFound(err) {
+			if !r.laneWaiting {
+				log.FromContext(ctx).Info("waiting for LaneProfile before source discovery", "laneProfile", r.Config.LaneProfile, "namespace", r.Config.Namespace)
+				r.laneWaiting = true
+			}
+			return nil
+		}
+		return fmt.Errorf("get LaneProfile %s/%s: %w", r.Config.Namespace, r.Config.LaneProfile, err)
+	}
+	if r.laneWaiting {
+		log.FromContext(ctx).Info("LaneProfile available, resuming source discovery", "laneProfile", r.Config.LaneProfile, "namespace", r.Config.Namespace)
+		r.laneWaiting = false
+	}
 
 	items, err := r.Adapter.Discover(ctx)
 	if err != nil {
