@@ -484,3 +484,25 @@ The coordinator pod gets:
   coordinator prompt and sub-agent bindings.
 - The web UI and CLI adapter surfaces.
 - The exact vLLM gauge for backpressure on the target model server.
+
+## Decisions
+
+A running log of architectural decisions and their reasoning, newest first. The
+body above describes the current architecture; this log preserves *why* and what
+was superseded.
+
+- **2026-09-22 — Forge access is through a generic MCP, never a per-forge CLI.**
+  The coordinator reads issues and opens/updates/comments on change requests via
+  a forge MCP wired under a generic slot; the deployment selects the provider
+  (GitHub / GitLab / Forgejo / Bitbucket). Installing `gh` (or `glab`, `tea`, …)
+  into the coordinator image was rejected: it hardcodes the forge into the one
+  place meant to be swappable. (#80, #87)
+- **2026-09-22 — Repository toolchains are per-lane runtime images, not baked
+  into one universal coordinator image.** A `LaneProfile.runtimeImage` selects a
+  coordinator image carrying the target repo's toolchain (e.g. `courier-go`
+  layers Go, make, controller-gen, and helm onto the bootstrap image). The
+  default coordinator image stays minimal. (#79)
+- **2026-09-22 — The run terminates honestly when nothing was produced.** The
+  executor exits a run as `NeedsHuman` when the coordinator produced no commit or
+  PR, rather than reporting success; the operator's world-verification (no PR →
+  NeedsHuman) is the backstop. (#81)
