@@ -62,6 +62,14 @@ type CoderRunReconciler struct {
 	// Zero uses the package default.
 	DoneRetention time.Duration
 
+	// LivenessWindow is how long a Running run may go without a heartbeat before
+	// it is considered wedged and reaped. Zero uses the package default.
+	LivenessWindow time.Duration
+
+	// MaxRestarts is the crashloop threshold: after this many infra relaunches a
+	// run transitions to NeedsHuman. Zero uses the package default.
+	MaxRestarts int
+
 	// Now is the reconciler's time source, injectable so tests never sleep.
 	// Nil falls back to time.Now.
 	Now func() time.Time
@@ -351,6 +359,10 @@ func (r *CoderRunReconciler) observeRunning(ctx context.Context, run *courierv1a
 		}
 		return r.transitionTerminal(ctx, run, phase, "")
 	}
+	result, handled, err := r.checkLiveness(ctx, run, pods.Items)
+	if handled {
+		return result, err
+	}
 	return ctrl.Result{}, nil
 }
 
@@ -491,6 +503,9 @@ func (r *CoderRunReconciler) patchStatus(ctx context.Context, before, after *cou
 	if before.Status.CheckFingerprint != after.Status.CheckFingerprint {
 		fingerprint := after.Status.CheckFingerprint
 		fields.CheckFingerprint = &fingerprint
+	}
+	if before.Status.Restarts != after.Status.Restarts {
+		fields.Restarts = after.Status.Restarts
 	}
 	if reflect.DeepEqual(fields, status.OperatorPatch{}) {
 		return nil
