@@ -505,7 +505,8 @@ func (r *CoderRunReconciler) patchStatus(ctx context.Context, before, after *cou
 		fields.CheckFingerprint = &fingerprint
 	}
 	if before.Status.Restarts != after.Status.Restarts {
-		fields.Restarts = after.Status.Restarts
+		restarts := after.Status.Restarts
+		fields.Restarts = &restarts
 	}
 	if reflect.DeepEqual(fields, status.OperatorPatch{}) {
 		return nil

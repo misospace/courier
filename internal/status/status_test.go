@@ -44,12 +44,13 @@ func TestStatusWritersOwnDisjointFields(t *testing.T) {
 	phase := courierv1alpha1.PhaseRunning
 	branch := "courier/issue-7"
 	fingerprint := "observed-check-set"
+	restarts := 2
 	if err := operator.Patch(context.Background(), name, OperatorPatch{
 		Phase:            phase,
 		Branch:           &branch,
 		PR:               "#42",
 		CheckFingerprint: &fingerprint,
-		Restarts:         2,
+		Restarts:         &restarts,
 		Conditions:       []metav1.Condition{{Type: "Ready", Status: metav1.ConditionTrue}},
 	}); err != nil {
 		t.Fatalf("operator patch: %v", err)
@@ -182,6 +183,66 @@ func TestMarshalPatchCarriesOnlyStatus(t *testing.T) {
 	}
 	if !reflect.DeepEqual(got, map[string]interface{}{"status": map[string]interface{}{}}) {
 		t.Fatalf("patch = %#v, want a status-only document", got)
+	}
+}
+
+// decodeRestartStatus decodes a status patch and returns the restarts field
+// (as a raw number) plus whether the key was present at all.
+func decodeRestartStatus(t *testing.T, patch []byte) (value float64, present bool) {
+	t.Helper()
+	var payload struct {
+		Status map[string]interface{} `json:"status"`
+	}
+	if err := json.Unmarshal(patch, &payload); err != nil {
+		t.Fatalf("decode patch: %v", err)
+	}
+	raw, ok := payload.Status["restarts"]
+	if !ok {
+		return 0, false
+	}
+	num, ok := raw.(float64)
+	if !ok {
+		t.Fatalf("restarts = %#v, want a JSON number", raw)
+	}
+	return num, true
+}
+
+func TestOperatorPatchNullableRestartsClearsToZero(t *testing.T) {
+	name := types.NamespacedName{Namespace: "default", Name: "run"}
+
+	zero := 0
+	two := 2
+
+	// A pointer to zero must be emitted, so the operator can clear the
+	// counter back to 0; omitempty on a plain int cannot express this.
+	patch, err := marshalPatch(name, OperatorPatch{Restarts: &zero})
+	if err != nil {
+		t.Fatalf("marshal zero patch: %v", err)
+	}
+	if value, present := decodeRestartStatus(t, patch); !present {
+		t.Fatal("restarts key omitted for a pointer to zero; a nullable counter must be able to clear to 0")
+	} else if value != 0 {
+		t.Fatalf("restarts = %v for a pointer to zero, want 0", value)
+	}
+
+	// A nil Restarts must omit the key entirely, leaving the field untouched.
+	patch, err = marshalPatch(name, OperatorPatch{Restarts: nil})
+	if err != nil {
+		t.Fatalf("marshal nil patch: %v", err)
+	}
+	if value, present := decodeRestartStatus(t, patch); present {
+		t.Fatalf("restarts = %v for a nil pointer, want the key omitted", value)
+	}
+
+	// A pointer to a nonzero value must emit that value.
+	patch, err = marshalPatch(name, OperatorPatch{Restarts: &two})
+	if err != nil {
+		t.Fatalf("marshal two patch: %v", err)
+	}
+	if value, present := decodeRestartStatus(t, patch); !present {
+		t.Fatal("restarts key omitted for a pointer to a nonzero value")
+	} else if value != 2 {
+		t.Fatalf("restarts = %v for a pointer to 2, want 2", value)
 	}
 }
 
