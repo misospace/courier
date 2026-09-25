@@ -175,23 +175,39 @@ func TestBuildCoordinatorPodInjectsRunContextAndEphemeralWorkspace(t *testing.T)
 	if !foundWorkspaceMount {
 		t.Fatal("workspace EmptyDir is not mounted at /workspace")
 	}
+	foundRuntimeVolume := false
+	for _, volume := range pod.Spec.Volumes {
+		if volume.Name == "runtime" && volume.EmptyDir != nil {
+			foundRuntimeVolume = true
+		}
+	}
+	foundRuntimeMount := false
+	for _, mount := range container.VolumeMounts {
+		if mount.Name == "runtime" && mount.MountPath == runtimePath {
+			foundRuntimeMount = true
+		}
+	}
+	if !foundRuntimeVolume || !foundRuntimeMount {
+		t.Fatal("termination runtime volume is not mounted outside the checkout")
+	}
 	env := make(map[string]string, len(container.Env))
 	for _, value := range container.Env {
 		env[value.Name] = value.Value
 	}
 	for key, want := range map[string]string{
-		"COURIER_MODEL":          "litellm/qwen",
-		"COURIER_OPENCODE_AGENT": "",
-		"COURIER_FRAMING":        "single GPU; keep parallelism modest",
-		"COURIER_LOG_LEVEL":      "debug",
-		"COURIER_REPO":           "acme/widgets",
-		"COURIER_BRANCH":         "courier/acme/widgets/issue-7",
-		"COURIER_WORKSPACE":      "/workspace",
-		"COURIER_BASE":           "main",
-		"GIT_AUTHOR_NAME":        "Courier",
-		"GIT_AUTHOR_EMAIL":       "courier@localhost",
-		"GIT_COMMITTER_NAME":     "Courier",
-		"GIT_COMMITTER_EMAIL":    "courier@localhost",
+		"COURIER_MODEL":            "litellm/qwen",
+		"COURIER_OPENCODE_AGENT":   "",
+		"COURIER_FRAMING":          "single GPU; keep parallelism modest",
+		"COURIER_LOG_LEVEL":        "debug",
+		"COURIER_REPO":             "acme/widgets",
+		"COURIER_BRANCH":           "courier/acme/widgets/issue-7",
+		"COURIER_WORKSPACE":        "/workspace",
+		"COURIER_TERMINATION_FILE": runtimePath + "/termination",
+		"COURIER_BASE":             "main",
+		"GIT_AUTHOR_NAME":          "Courier",
+		"GIT_AUTHOR_EMAIL":         "courier@localhost",
+		"GIT_COMMITTER_NAME":       "Courier",
+		"GIT_COMMITTER_EMAIL":      "courier@localhost",
 	} {
 		if env[key] != want {
 			t.Fatalf("env %s = %q, want %q", key, env[key], want)
