@@ -438,6 +438,14 @@ The coordinator pod gets:
 - **context7** — library documentation.
 - **metrics mini-MCP** — current model load.
 
+Availability is preflighted: before the goal runs, the bootstrap makes one
+bounded check of the configured servers using the run's own config and
+environment. A server that is configured but unreachable is named to the
+coordinator — in its framing, in a `capability.status` event, and in the
+no-work terminal reason — so the model knows the tool is absent instead of
+hunting for it. A failed optional capability never fails or gates the run; it
+only informs.
+
 ## Security and boundaries
 
 - The coordinator can read, push a branch, and open/update a PR. It cannot merge,
@@ -502,6 +510,17 @@ A running log of architectural decisions and their reasoning, newest first. The
 body above describes the current architecture; this log preserves *why* and what
 was superseded.
 
+- **2026-09-25 — The executor informs the coordinator of unreachable MCP
+  capabilities.** Before the goal runs, the bootstrap performs one
+  liveness-bounded (30s, never a run timeout) `mcp list` preflight against the
+  same config and environment as the run. Configured-but-unavailable servers are
+  named in the coordinator's framing, emitted as a structured
+  `capability.status` diagnostic (redacted; detail forced visible because the
+  point is non-debug visibility), and appended to the terminal reason when the
+  run produced no work. Probe output never reaches the run's streams or the
+  prompt unredacted, and every probe failure mode degrades to "no
+  information." Informing never constrains: an unavailable optional
+  capability never fails a run. (#101)
 - **2026-09-22 — The coordinator owns completion and forge publication.** A
   coordinator may delegate research, implementation, review, and tests, but
   never the run's terminal contract: reading the work item, integrating
