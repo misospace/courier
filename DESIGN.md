@@ -225,8 +225,21 @@ retry-stormed is active but not successful, and should be allowed to die.
 - The coordinator **self-declares stuck** (can't get CI green after real
   attempts, missing access, ambiguous ask) → `needs-human`.
 - A pod that dies (infra) or is reaped is relaunched and resumed. A **crashloop**
-  (N relaunches) → `needs-human`. This is the one counter that matters, and it is
-  death-detection, not work-retry.
+  — the relaunch counter *reaching* the ceiling (`restarts >= maxRestarts`) →
+  `needs-human` with the counter left at the ceiling, rather than one further
+  relaunch. This is the one counter that matters, and it is death-detection, not
+  work-retry.
+- The crashloop counter bounds a **consecutive** streak of wedges, not a lifetime
+  total: a run that demonstrates liveness — a fresh heartbeat within the window —
+  resets the streak to zero, so a relaunch long in the past cannot terminalize a
+  run that has since proven itself alive.
+- A just-relaunched pod gets a **startup grace** so it is not re-reaped on the
+  previous incarnation's stale heartbeat before it can send its first one: a pod
+  created within the window (or whose coordinator started within it) is never
+  reaped. Freshness is judged only on observable pod/run state — the operator
+  never writes the harness-owned heartbeat. A pod already terminating is neither
+  reapable nor counted, so a delete racing a reconcile cannot double-count a
+  single wedge.
 
 This heartbeat catches a *wedged* run but not a *spinning* one (busy-looping,
 streaming happily, converging on nothing). A conservative content-based
@@ -333,7 +346,7 @@ status:
     plan: <...>
     completedBriefs: [{id, summary, commit}]
   heartbeat: {at: <ts>, kind: stream | tool}
-  restarts: <n>                    # infra crashloop counter, not work-retry
+  restarts: <n>                    # consecutive infra crashloop counter, reset by a fresh heartbeat
   conditions: [...]
 ```
 
@@ -521,6 +534,21 @@ was superseded.
   prompt unredacted, and every probe failure mode degrades to "no
   information." Informing never constrains: an unavailable optional
   capability never fails a run. (#101)
+- **2026-09-24 — The crashloop counter bounds a consecutive streak, not a
+  lifetime total.** A reaped run's relaunch counter resets to zero whenever the
+  run demonstrates liveness — a fresh, in-window heartbeat — and reaching the
+  ceiling (`restarts >= maxRestarts`) hands the run to a human with the counter
+  at the ceiling instead of relaunching it once more. This bounds *stuck* (a run
+  that keeps wedging without ever proving itself alive) while a long-lived run
+  that recovered is not left one unrelated wedge away from `needs-human`. It
+  supersedes the lifetime-total reading and the first implementation's
+  `restarts > maxRestarts` (which allowed an N+1-th relaunch). Clearing the
+  counter to zero required `status.OperatorPatch.restarts` to become nullable,
+  since a JSON merge patch omits a zero-valued `int` — mirroring how
+  `branch`/`checkFingerprint` are nullable so the operator can clear them. The
+  startup grace for a just-relaunched pod is derived only from observable pod
+  state (creation time / container start), never by having the operator write the
+  harness-owned heartbeat. (#12, #100)
 - **2026-09-22 — The coordinator owns completion and forge publication.** A
   coordinator may delegate research, implementation, review, and tests, but
   never the run's terminal contract: reading the work item, integrating

@@ -234,6 +234,24 @@ func TestWorkStateDistinguishesNoWorkDirtyWorkAndCommits(t *testing.T) {
 	if state != WorkStateCommitted {
 		t.Fatalf("WorkState(committed) = %q, want %q", state, WorkStateCommitted)
 	}
+
+	writeFile(t, filepath.Join(root, "scratch.txt"), "temporary\n")
+	state, err = workspace.WorkState(context.Background(), start)
+	if err != nil || state != WorkStateCommitted {
+		t.Fatalf("WorkState(commit with scratch) = %q, %v; want committed", state, err)
+	}
+	writeFile(t, filepath.Join(root, "base.txt"), "edited\n")
+	state, err = workspace.WorkState(context.Background(), start)
+	if err != nil || state != WorkStateDirty {
+		t.Fatalf("WorkState(commit with tracked edit) = %q, %v; want dirty", state, err)
+	}
+	commit(t, root, "work: tracked edit")
+	writeFile(t, filepath.Join(root, "base.txt"), "staged\n")
+	git(t, root, "add", "base.txt")
+	state, err = workspace.WorkState(context.Background(), start)
+	if err != nil || state != WorkStateDirty {
+		t.Fatalf("WorkState(commit with staged edit) = %q, %v; want dirty", state, err)
+	}
 }
 
 func TestBranchNameRejectsMissingRef(t *testing.T) {

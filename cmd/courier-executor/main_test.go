@@ -19,6 +19,18 @@ import (
 	courierlog "github.com/misospace/courier/internal/log"
 )
 
+func TestMain(m *testing.M) {
+	// Tests supply their own run configuration; never inherit a live pod's
+	// termination path or other COURIER_* settings.
+	for _, entry := range os.Environ() {
+		name, _, _ := strings.Cut(entry, "=")
+		if strings.HasPrefix(name, "COURIER_") {
+			_ = os.Unsetenv(name)
+		}
+	}
+	os.Exit(m.Run())
+}
+
 func TestRunPreparesOrphanBranchAndInvokesOpenCodeWithExactContext(t *testing.T) {
 	root := t.TempDir()
 	remote := filepath.Join(root, "remote.git")
@@ -198,6 +210,30 @@ func TestRunExitZeroWithDirtyWorkBecomesNeedsHuman(t *testing.T) {
 	}
 	if !strings.Contains(output.String(), "uncommitted workspace changes") {
 		t.Fatalf("dirty-work reason = %q", output.String())
+	}
+}
+
+func TestRunCommitWithUntrackedScratchReachesVerifying(t *testing.T) {
+	root := t.TempDir()
+	remote := remoteWithExistingBranch(t, root)
+	fakeOpenCode := filepath.Join(root, "opencode")
+	writeExecutable(t, fakeOpenCode, "#!/bin/sh\nprintf 'completed\\n' > completed.txt\ngit add completed.txt\ngit commit -m 'test: completed work' >/dev/null\nprintf 'scratch\\n' > scratch.txt\n")
+	prServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `[]`)
+	}))
+	defer prServer.Close()
+	workspace := setResolveIssueEnv(t, root, remote, prServer.URL, fakeOpenCode)
+
+	var output, errorsOut bytes.Buffer
+	if code := run(context.Background(), &output, &errorsOut); code != exitSuccess {
+		t.Fatalf("run exit code = %d, want 0; stderr=%q stdout=%q", code, errorsOut.String(), output.String())
+	}
+	if !strings.Contains(output.String(), `"phase":"Verifying"`) {
+		t.Fatalf("missing Verifying termination: %q", output.String())
+	}
+	if _, err := os.Stat(filepath.Join(workspace, "scratch.txt")); err != nil {
+		t.Fatalf("untracked scratch missing: %v", err)
 	}
 }
 

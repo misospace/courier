@@ -92,7 +92,9 @@ func (w *Workspace) WorkState(ctx context.Context, startCommit string) (WorkStat
 	if startCommit == "" {
 		return "", errors.New("git work state: starting commit is required")
 	}
-	dirty, err := run(ctx, w.Directory, "status", "--porcelain=v1", "--untracked-files=all", "--", ".")
+	// Untracked scratch files cannot invalidate completed commits, but they
+	// also cannot turn a no-op into successful work.
+	dirty, err := run(ctx, w.Directory, "status", "--porcelain=v1", "--untracked-files=no", "--", ".")
 	if err != nil {
 		return "", err
 	}
@@ -109,6 +111,13 @@ func (w *Workspace) WorkState(ctx context.Context, startCommit string) (WorkStat
 	}
 	if count > 0 {
 		return WorkStateCommitted, nil
+	}
+	untracked, err := run(ctx, w.Directory, "ls-files", "--others", "--exclude-standard", "--", ".")
+	if err != nil {
+		return "", err
+	}
+	if len(untracked) > 0 {
+		return WorkStateDirty, nil
 	}
 	return WorkStateNone, nil
 }
