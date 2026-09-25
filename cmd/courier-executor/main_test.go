@@ -689,6 +689,7 @@ func TestRunHealthyCapabilityLeavesRunBehaviorUnchanged(t *testing.T) {
 
 	setResolveIssueEnv(t, root, remote, prServer.URL, fakeOpenCode)
 	t.Setenv("COURIER_FRAMING", "keep scope tight")
+	t.Setenv("COURIER_RUN_NAME", "coderrun-it-7")
 
 	var output bytes.Buffer
 	var errorsOut bytes.Buffer
