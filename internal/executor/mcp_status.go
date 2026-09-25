@@ -1,6 +1,9 @@
 package executor
 
-import "strings"
+import (
+	"strings"
+	"unicode"
+)
 
 // MCPCapability is the availability of one configured MCP server observed by a
 // bounded preflight using the run's own OpenCode config/environment. Reason is
@@ -15,6 +18,9 @@ type MCPCapability struct {
 
 // mcpReasonMaxRunes bounds a failure reason to a concise diagnostic.
 const mcpReasonMaxRunes = 200
+
+// mcpNameMaxRunes bounds a server name to a concise diagnostic.
+const mcpNameMaxRunes = 128
 
 var (
 	mcpSuccessGlyphs = []string{"✓", "✔", "+"}
@@ -43,14 +49,17 @@ func (o OpenCode) MCPStatusCommand() Command {
 // connected, ready, or enabled) or a failure signal (a leading glyph ✗, ✘, or
 // ×, or the word failed, error, or disabled), case-insensitively. When both a
 // success and a failure signal appear, the entry is a failure. The server name
-// is the first whitespace-delimited token with any leading status glyph and
-// surrounding punctuation removed, skipping tokens that are status words. For a failed entry, an
-// indented, non-empty line immediately following it supplies the reason. Lines
-// that cannot be classified (headers, blank lines, "no servers configured"
-// prose) are ignored. A repeated name keeps its last occurrence, and result
-// order follows first appearance. Reasons are capped at mcpReasonMaxRunes
-// runes. It never interprets or returns secrets; callers redact before
-// emission. It returns nil when nothing is recognized.
+// is the first whitespace-delimited token that is not a status word, with any
+// leading status glyph and surrounding punctuation removed; a server whose
+// name is itself a status word is preserved with its status, while a lone
+// status word with no name is treated as prose and ignored. For a failed
+// entry, an indented, non-empty line immediately following it supplies the
+// reason. Lines that cannot be classified (headers, blank lines, "no servers
+// configured" prose) are ignored. A repeated name keeps its last occurrence,
+// and result order follows first appearance. Names and reasons are stripped of
+// control characters; names are capped at mcpNameMaxRunes runes and reasons at
+// mcpReasonMaxRunes runes. It never interprets or returns secrets; callers
+// redact before emission. It returns nil when nothing is recognized.
 func ParseMCPStatus(output string) []MCPCapability {
 	lines := strings.Split(strings.ReplaceAll(output, "\r\n", "\n"), "\n")
 	positions := make(map[string]int)
@@ -95,18 +104,35 @@ func classifyMCPLine(line string) (MCPCapability, bool) {
 	if !success && !failure {
 		return MCPCapability{}, false
 	}
-	name := ""
+	hasGlyph := hasMCPGlyph(line, mcpStatusGlyphs)
+	firstNonStatus := ""
+	firstName := ""
+	nonEmpty := 0
 	for _, token := range tokens {
-		if token == "" || isMCPStatusWord(token) {
+		candidate := strings.Trim(stripMCPControl(token), mcpTokenPunctuation)
+		if candidate == "" {
 			continue
 		}
-		name = strings.Trim(token, mcpTokenPunctuation)
-		break
+		nonEmpty++
+		if firstName == "" {
+			firstName = candidate
+		}
+		if !isMCPStatusWord(candidate) {
+			firstNonStatus = candidate
+			break
+		}
+	}
+	name := firstNonStatus
+	if name == "" {
+		name = firstName
 	}
 	if name == "" {
 		return MCPCapability{}, false
 	}
-	return MCPCapability{Name: name, Available: success && !failure}, true
+	if firstNonStatus == "" && !hasGlyph && nonEmpty < 2 {
+		return MCPCapability{}, false
+	}
+	return MCPCapability{Name: capMCPName(name), Available: success && !failure}, true
 }
 
 // mcpStatusTokens splits line into whitespace-delimited tokens and removes any
@@ -164,8 +190,32 @@ func isIndentedMCPLine(line string) bool {
 	return strings.TrimSpace(line) != ""
 }
 
-// capMCPReason shortens reason to mcpReasonMaxRunes runes at a rune boundary.
+// stripMCPControl removes every control rune from s.
+func stripMCPControl(s string) string {
+	var b strings.Builder
+	for _, r := range s {
+		if !unicode.IsControl(r) {
+			b.WriteRune(r)
+		}
+	}
+	return b.String()
+}
+
+// capMCPName bounds name to mcpNameMaxRunes runes at a rune boundary. Control
+// characters and surrounding punctuation are removed earlier, when the name
+// candidate is chosen.
+func capMCPName(name string) string {
+	runes := []rune(name)
+	if len(runes) > mcpNameMaxRunes {
+		return string(runes[:mcpNameMaxRunes])
+	}
+	return name
+}
+
+// capMCPReason strips control runes and shortens reason to mcpReasonMaxRunes
+// runes at a rune boundary.
 func capMCPReason(reason string) string {
+	reason = stripMCPControl(reason)
 	runes := []rune(reason)
 	if len(runes) <= mcpReasonMaxRunes {
 		return reason

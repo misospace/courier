@@ -2,6 +2,7 @@ package executor
 
 import (
 	"reflect"
+	"strings"
 	"testing"
 )
 
@@ -83,6 +84,41 @@ func TestParseMCPStatus(t *testing.T) {
 			name:  "duplicate keeps last occurrence",
 			input: "✓ github connected\n✗ github failed\n    boom\n",
 			want:  []MCPCapability{{Name: "github", Available: false, Reason: "boom"}},
+		},
+		{
+			name:  "control chars in name",
+			input: "✓ go\x00vite connected\n",
+			want:  []MCPCapability{{Name: "govite", Available: true}},
+		},
+		{
+			name:  "name capped to max runes",
+			input: strings.Repeat("a", 200) + " connected\n",
+			want:  []MCPCapability{{Name: strings.Repeat("a", 128), Available: true}},
+		},
+		{
+			name:  "status-word name with glyph preserved",
+			input: "✗ error failed\n    boom\n",
+			want:  []MCPCapability{{Name: "error", Available: false, Reason: "boom"}},
+		},
+		{
+			name:  "status-word name glyph-less preserved",
+			input: "error failed\n    boom\n",
+			want:  []MCPCapability{{Name: "error", Available: false, Reason: "boom"}},
+		},
+		{
+			name:  "lone status word is noise",
+			input: "failed\n",
+			want:  nil,
+		},
+		{
+			name:  "all-control-char name is dropped",
+			input: "✓ \x00\n",
+			want:  nil,
+		},
+		{
+			name:  "control-only token skipped for real name",
+			input: "✓ \x00 srv connected\n",
+			want:  []MCPCapability{{Name: "srv", Available: true}},
 		},
 	}
 	for _, test := range tests {

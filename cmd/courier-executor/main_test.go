@@ -729,6 +729,30 @@ func TestPreflightCapabilitiesParsesStdoutStatus(t *testing.T) {
 	}
 }
 
+// Guards a null byte in the binary path: exec must reject it without a panic, a hang, or invented capabilities.
+func TestPreflightCapabilitiesHandlesInvalidBinaryPath(t *testing.T) {
+	caps := preflightCapabilities(context.Background(), executor.Command{Binary: "opencode\x00", Args: []string{"mcp", "list"}}, "")
+	if len(caps) != 0 {
+		t.Fatalf("preflightCapabilities() = %#v, want none from a null-byte binary path", caps)
+	}
+}
+
+// Guards a symlinked binary: the probe must resolve the link and parse the target's stdout.
+func TestPreflightCapabilitiesFollowsSymlinkedBinary(t *testing.T) {
+	dir := t.TempDir()
+	real := filepath.Join(dir, "real-opencode")
+	writeExecutable(t, real, "#!/bin/sh\ncase \"$1\" in mcp) printf '%s\\n' '✓ github connected'; exit 0;; esac\n")
+	link := filepath.Join(dir, "opencode")
+	if err := os.Symlink(real, link); err != nil {
+		t.Fatalf("os.Symlink() error = %v", err)
+	}
+	caps := preflightCapabilities(context.Background(), executor.Command{Binary: link, Args: []string{"mcp", "list"}}, dir)
+	want := []executor.MCPCapability{{Name: "github", Available: true}}
+	if !reflect.DeepEqual(caps, want) {
+		t.Fatalf("preflightCapabilities() = %#v, want %#v", caps, want)
+	}
+}
+
 // parseEvents decodes the JSON event lines among the run's output. Event
 // lines are the only JSON objects with an "event" field. Failures report
 // line indexes, never line contents.
