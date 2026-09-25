@@ -414,7 +414,8 @@ it modest" with `concurrency: 1`. Same schema, no local assumption baked in.
   execution capacity, and the source remains in-progress throughout it.
 - **AwaitingReview** is terminal for this run. Human merges → operator marks
   **Done** and resolves the source; or feedback/conflict → the source spawns a
-  fresh `fix-pr` run, and this one goes Done/archived.
+  fresh `fix-pr` run without reusing the previous run. The previous run remains
+  auditable; its completion does not settle later feedback.
 - **Reap:** Done runs are deleted (checkpoint dies with the CR). NeedsHuman runs
   are kept for inspection and deleted on request. Zero standing footprint between
   runs — a strict improvement over Foreman's ownerRef-less audit ConfigMaps,
@@ -438,6 +439,42 @@ Pluggable adapters over a generic interface. An adapter both *creates* runs and
 
 Dispatch is an adapter, not a dependency. Dispatch is a separate product; Courier
 (a coding executor) must never make dispatch features depend on it.
+
+### Dispatch follow-up attempts (#98)
+
+Dispatch owns the actionable attempt, not Courier's runner. A queue-backed
+`followup-pr` carries `prFixItem.{id,generation}`; the row ID identifies the PR
+queue item and its persisted integer generation identifies one dispatchable
+attempt. Additional evidence while that attempt is QUEUED belongs to the same
+attempt; a transition from a settled item back to QUEUED creates a new one.
+Courier's opaque `WorkItemID` includes both fields, so a retained
+`AwaitingReview` CoderRun deduplicates an exact repeat but cannot suppress a
+new generation. The CoderRun and its lifecycle report remain records of the
+*old* attempt, even if Dispatch observes newer feedback before the report
+arrives. Report retries use the run's stable idempotency key; a repeated report
+cannot apply settlement twice.
+
+The Dispatch settlement contract to implement is: bind settlement to the issued
+item ID and generation, and compare against the head SHA observed **at attempt
+start**, not the mutable head SHA on
+the queue row at report time. If the head did not advance, do not claim a fix;
+if new feedback or a new generation arrived, do not overwrite it. Status and
+history should agree in one conditional transition; a late report may be
+audited as stale but cannot settle or requeue newer work. The PR-fix queue,
+report handler, and head guard are Dispatch-owned. Courier's Dispatch adapter
+only transports the token and maps the outcome. A successful `fix-pr` report
+must not mark the linked issue done: only a verified merge can resolve it.
+Linked-issue associations from the queue must be checked before any issue
+mutation, never used as authority on their own.
+
+A linked-PR follow-up served from a recomputed issue-health flag has *no*
+`prFixItem` identity. Courier cannot infer a durable generation from PR head,
+reason strings, issue ID, or wall-clock time: unchanged-head new reviews and
+stale health snapshots defeat those heuristics. Until Dispatch gives this path
+persistent attempt identity and settlement semantics, Courier must not fabricate
+one. That separate Dispatch change is tracked by misospace/dispatch#1045; an
+adapter fallback/dedup change is conditional on its wire contract, not a generic
+core retry or a metadata-hash substitute.
 
 ## MCP surface
 
@@ -534,6 +571,16 @@ was superseded.
   prompt unredacted, and every probe failure mode degrades to "no
   information." Informing never constrains: an unavailable optional
   capability never fails a run. (#101)
+- **2026-09-25 — Dispatch owns follow-up attempt identity and settlement.**
+  A retained run is historical, not a lease on all future review rounds.
+  Queue-backed work already has a persisted `(id, generation)` identity;
+  Courier encodes it in the opaque work ID. A changed PR head or health reason
+  alone cannot identify a fresh review attempt, and a report for an older
+  generation cannot resolve new feedback. Dispatch must compare the issued
+  attempt against its start-head baseline and settle conditionally. The
+  generation-less linked-PR path requires its own persistent source identity
+  before Courier can distinguish new work from stale re-polls. (#98,
+  misospace/dispatch#1045)
 - **2026-09-24 — The crashloop counter bounds a consecutive streak, not a
   lifetime total.** A reaped run's relaunch counter resets to zero whenever the
   run demonstrates liveness — a fresh, in-window heartbeat — and reaching the
