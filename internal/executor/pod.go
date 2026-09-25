@@ -27,6 +27,7 @@ const (
 	LabelMode      = "courier.misospace.dev/mode"
 	LabelLane      = "courier.misospace.dev/lane"
 	LabelDebug     = "courier.misospace.dev/debug"
+	runtimePath    = "/courier-runtime"
 )
 
 // PodConfig controls runtime-specific details without putting provider or
@@ -197,6 +198,9 @@ func (b *PodBuilder) Build(run *courierv1alpha1.CoderRun, lane *courierv1alpha1.
 				Name:         "workspace",
 				VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{}},
 			}, {
+				Name:         "runtime",
+				VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{}},
+			}, {
 				Name: "opencode-config",
 				VolumeSource: corev1.VolumeSource{DownwardAPI: &corev1.DownwardAPIVolumeSource{Items: []corev1.DownwardAPIVolumeFile{{
 					Path:     "opencode.json",
@@ -215,6 +219,9 @@ func (b *PodBuilder) Build(run *courierv1alpha1.CoderRun, lane *courierv1alpha1.
 				VolumeMounts: []corev1.VolumeMount{{
 					Name:      "workspace",
 					MountPath: config.WorkspacePath,
+				}, {
+					Name:      "runtime",
+					MountPath: runtimePath,
 				}, {
 					Name:      "opencode-config",
 					MountPath: opencodeConfigMountPath,
@@ -240,7 +247,7 @@ func podEnvironment(invocation Invocation, executorName string, config PodConfig
 	if strings.Contains(remoteURL, "%s") {
 		remoteURL = strings.Replace(remoteURL, "%s", escapedRepositoryPath(invocation.Repo), 1)
 	}
-	terminationFile := strings.TrimRight(config.WorkspacePath, "/") + "/termination"
+	terminationFile := runtimePath + "/termination"
 	values := toKubernetesEnv(EnvironmentWithConfig(invocation, executorName, remoteURL, config.BaseBranch, config.OpenCode.Binary, config.OpenCode.Format, terminationFile, config.OpenCode.Agent))
 	values = append(values, corev1.EnvVar{
 		Name:  "OPENCODE_CONFIG",
