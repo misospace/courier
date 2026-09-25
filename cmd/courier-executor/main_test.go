@@ -11,9 +11,11 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 
+	"github.com/misospace/courier/internal/executor"
 	courierlog "github.com/misospace/courier/internal/log"
 )
 
@@ -695,6 +697,35 @@ func TestRunHealthyCapabilityLeavesRunBehaviorUnchanged(t *testing.T) {
 	}
 	if !strings.Contains(output.String(), `"phase":"Verifying"`) {
 		t.Fatalf("healthy run lost the Verifying termination: %q", output.String())
+	}
+}
+
+func TestPreflightCapabilitiesIgnoresStderrNoise(t *testing.T) {
+	// A binary that has no `mcp` subcommand prints an error to stderr and exits
+	// non-zero. The probe parses stdout only, so it must report no capabilities
+	// rather than inventing one from the stderr text.
+	dir := t.TempDir()
+	fake := filepath.Join(dir, "opencode")
+	writeExecutable(t, fake, "#!/bin/sh\nprintf '%s\\n' 'error: unknown command \"mcp\"' >&2\nexit 1\n")
+	caps := preflightCapabilities(context.Background(), executor.Command{Binary: fake, Args: []string{"mcp", "list"}}, dir)
+	if len(caps) != 0 {
+		t.Fatalf("preflightCapabilities() = %#v, want none from stderr-only noise", caps)
+	}
+}
+
+func TestPreflightCapabilitiesParsesStdoutStatus(t *testing.T) {
+	// A healthy server and a failed server printed on stdout (as `opencode mcp
+	// list` does) are parsed regardless of the process exit status.
+	dir := t.TempDir()
+	fake := filepath.Join(dir, "opencode")
+	writeExecutable(t, fake, "#!/bin/sh\nprintf '%s\\n' '\u2713 github connected'\nprintf '%s\\n' '\u2717 metrics failed'\nprintf '%s\\n' '    connection refused'\nexit 3\n")
+	caps := preflightCapabilities(context.Background(), executor.Command{Binary: fake, Args: []string{"mcp", "list"}}, dir)
+	want := []executor.MCPCapability{
+		{Name: "github", Available: true},
+		{Name: "metrics", Available: false, Reason: "connection refused"},
+	}
+	if !reflect.DeepEqual(caps, want) {
+		t.Fatalf("preflightCapabilities() = %#v, want %#v", caps, want)
 	}
 }
 
