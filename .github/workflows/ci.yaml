@@ -83,7 +83,7 @@ jobs:
         id: go-cache
         uses: actions/cache@v6.1.0
         with:
-          path: go-cache
+          path: ${{ runner.temp }}/go-cache
           key: go-mounts-manager-${{ github.sha }}
           restore-keys: go-mounts-manager-
 
@@ -92,7 +92,7 @@ jobs:
         with:
           builder: ${{ steps.buildx.outputs.name }}
           cache-map: |
-            {"go-cache/mod": "/go/pkg/mod", "go-cache/build": "/root/.cache/go-build"}
+            {"${{ runner.temp }}/go-cache/mod": "/go/pkg/mod", "${{ runner.temp }}/go-cache/build": "/root/.cache/go-build"}
           skip-extraction: ${{ steps.go-cache.outputs.cache-hit }}
 
       - name: Build manager image
@@ -125,7 +125,7 @@ jobs:
         id: go-cache
         uses: actions/cache@v6.1.0
         with:
-          path: go-cache
+          path: ${{ runner.temp }}/go-cache
           key: go-mounts-coordinator-${{ github.sha }}
           restore-keys: go-mounts-coordinator-
 
@@ -134,7 +134,7 @@ jobs:
         with:
           builder: ${{ steps.buildx.outputs.name }}
           cache-map: |
-            {"go-cache/mod": "/go/pkg/mod", "go-cache/build": "/root/.cache/go-build"}
+            {"${{ runner.temp }}/go-cache/mod": "/go/pkg/mod", "${{ runner.temp }}/go-cache/build": "/root/.cache/go-build"}
           skip-extraction: ${{ steps.go-cache.outputs.cache-hit }}
 
       - name: Build coordinator image
@@ -187,7 +187,7 @@ jobs:
         id: go-cache
         uses: actions/cache@v6.1.0
         with:
-          path: go-cache
+          path: ${{ runner.temp }}/go-cache
           key: go-mounts-coordinator-go-${{ github.sha }}
           restore-keys: go-mounts-coordinator-go-
 
@@ -196,7 +196,7 @@ jobs:
         with:
           builder: ${{ steps.buildx.outputs.name }}
           cache-map: |
-            {"go-cache/mod": "/go/pkg/mod", "go-cache/build": "/root/.cache/go-build"}
+            {"${{ runner.temp }}/go-cache/mod": "/go/pkg/mod", "${{ runner.temp }}/go-cache/build": "/root/.cache/go-build"}
           skip-extraction: ${{ steps.go-cache.outputs.cache-hit }}
 
       - name: Build Go toolchain coordinator image
