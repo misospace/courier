@@ -227,11 +227,11 @@ to die.
   tool is not liveness evidence, and the harness must not emit a heartbeat it
   has not earned — no fake heartbeat. Safe handling of the long silent tool is
   settled by #119 ([HARNESS.md](./HARNESS.md) §6): a harness-owned
-  **ActiveOperation record** (dispatched op ID, owning control-pod UID,
-  worker-pod UID, diagnostic dispatch time) is persisted *before* dispatch and
-  suppresses stale-heartbeat reaping only while the operator independently
-  observes the control pod present and the worker running. There is no duration
-  cap; a genuinely wedged tool (alive, silent) is not detected — the escape is
+  **active-operation set** (op IDs, owning control-pod UID, worker-pod UID,
+  diagnostic dispatch time) is persisted *before* dispatch. It suppresses
+  stale-heartbeat reaping only while the operator independently observes the
+  matching control and worker pods running. The heartbeat carries the
+  control-pod UID to fence old activity. There is no duration cap; a genuinely wedged tool (alive, silent) is not detected — the escape is
   manual `needs-human`. This is an intentional safety tradeoff (indefinite
   wedge over false reap), not a liveness proof. #102 stays blocked for
   production until #126 implements it and a production e2e proves the behavior.
@@ -612,11 +612,11 @@ was superseded.
   legitimate operation and a wedged one are observationally identical, so no
   design can both reap a wedged silent tool in finite time and never reap a
   legitimate one; the design chooses to never false-reap. A harness-owned
-  ActiveOperation record (dispatched op ID, owning control-pod UID,
-  worker-pod UID, diagnostic dispatch time) is persisted before dispatch and
-  suppresses stale-heartbeat reaping only while the operator independently
-  observes the control pod present and the worker running. There is no duration
-  cap; a wedged tool is not detected and the escape is manual `needs-human`.
+  active-operation set (op IDs, owning control-pod UID, worker-pod UID) is
+  persisted before dispatch and suppresses stale-heartbeat reaping only while
+  the operator independently observes those pods running. A
+  pod-UID-fenced heartbeat prevents prior activity from resetting the new
+  incarnation's crashloop streak. There is no duration cap; a wedged tool is not detected and the escape is manual `needs-human`.
   This is an intentional safety tradeoff, not a liveness proof; #102 now blocks
   on #126 implementation and a production e2e, not on the design.
   ([HARNESS.md](./HARNESS.md) §6) (#119, #102)
@@ -627,8 +627,8 @@ was superseded.
   earned (no fake heartbeat), so a wedged silent tool no longer looks alive.
   Safe handling of long silent tools — suppressing reap without a fake
   heartbeat — is designed in #119 ([HARNESS.md](./HARNESS.md) §6) as an
-  intentional safety tradeoff: a harness-owned ActiveOperation record suppresses
-  stale-heartbeat reaping while the operator observes the operation active,
+  intentional safety tradeoff: a harness-owned active-operation set suppresses
+  stale-heartbeat reaping while the operator observes a matching task running,
   with no duration cap and no wedge detection. #102 now blocks on #126
   implementation and a production e2e, not on the design. (#102, #119)
 - **2026-09-25 — Separate the target trust boundary from legacy MCP access.**
