@@ -526,6 +526,14 @@ Other possible tools include **context7** for library documentation and the
 optional **metrics mini-MCP** for current model load; neither grants forge
 authority.
 
+Availability is preflighted: before the goal runs, the bootstrap makes one
+bounded check of the configured servers using the run's own config and
+environment. A server that is configured but unreachable is named to the
+coordinator — in its framing, in a `capability.status` event, and in the
+no-work terminal reason — so the model knows the tool is absent instead of
+hunting for it. A failed optional capability never fails or gates the run; it
+only informs.
+
 ## Security and boundaries
 
 - **Current legacy mode is insecure:** the coordinator pod includes model-
@@ -653,6 +661,17 @@ was superseded.
   edits when its ephemeral pod is removed. Secure evidence storage, limits and
   retrieval need a separate design before implementation (#115). An explicit
   retry (#97) is a fresh attempt, not an implicit restoration.
+- **2026-09-25 — The executor informs the coordinator of unreachable MCP
+  capabilities.** Before the goal runs, the bootstrap performs one
+  liveness-bounded (30s, never a run timeout) `mcp list` preflight against the
+  same config and environment as the run. Configured-but-unavailable servers are
+  named in the coordinator's framing, emitted as a structured
+  `capability.status` diagnostic (redacted; detail forced visible because the
+  point is non-debug visibility), and appended to the terminal reason when the
+  run produced no work. Probe output never reaches the run's streams or the
+  prompt unredacted, and every probe failure mode degrades to "no
+  information." Informing never constrains: an unavailable optional
+  capability never fails a run. (#101)
 - **2026-09-25 — Dispatch owns follow-up attempt identity and settlement.**
   A retained run is historical, not a lease on all future review rounds.
   Queue-backed work already has a persisted `(id, generation)` identity;
