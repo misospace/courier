@@ -71,17 +71,29 @@ jobs:
       - name: Test
         run: go test -race ./... -coverprofile cover.out
 
-  images:
+  image-manager:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7.0.1
 
-      - uses: actions/setup-go@v7.0.0
-        with:
-          go-version: "1.27.1"
-          cache: true
-
       - uses: docker/setup-buildx-action@v4.4.1
+        id: buildx
+
+      - name: Cache Go build mounts
+        id: go-cache
+        uses: actions/cache@v6.1.0
+        with:
+          path: go-cache
+          key: go-mounts-manager-${{ github.sha }}
+          restore-keys: go-mounts-manager-
+
+      - name: Inject Go build mounts
+        uses: reproducible-containers/buildkit-cache-dance@v3.4.0
+        with:
+          builder: ${{ steps.buildx.outputs.name }}
+          cache-map: |
+            {"go-cache/mod": "/go/pkg/mod", "go-cache/build": "/root/.cache/go-build"}
+          skip-extraction: ${{ steps.go-cache.outputs.cache-hit }}
 
       - name: Build manager image
         uses: docker/build-push-action@v7.4.0
@@ -95,6 +107,35 @@ jobs:
 
       - name: Validate manager image
         run: docker run --rm courier:ci --help
+
+  image-coordinator:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7.0.1
+
+      - uses: actions/setup-go@v7.0.0
+        with:
+          go-version: "1.27.1"
+          cache: true
+
+      - uses: docker/setup-buildx-action@v4.4.1
+        id: buildx
+
+      - name: Cache Go build mounts
+        id: go-cache
+        uses: actions/cache@v6.1.0
+        with:
+          path: go-cache
+          key: go-mounts-coordinator-${{ github.sha }}
+          restore-keys: go-mounts-coordinator-
+
+      - name: Inject Go build mounts
+        uses: reproducible-containers/buildkit-cache-dance@v3.4.0
+        with:
+          builder: ${{ steps.buildx.outputs.name }}
+          cache-map: |
+            {"go-cache/mod": "/go/pkg/mod", "go-cache/build": "/root/.cache/go-build"}
+          skip-extraction: ${{ steps.go-cache.outputs.cache-hit }}
 
       - name: Build coordinator image
         uses: docker/build-push-action@v7.4.0
@@ -116,6 +157,48 @@ jobs:
       - name: Test coordinator scratch boundary (image)
         run: COURIER_COORDINATOR_IMAGE=courier-coordinator:ci go test -run 'ScratchBoundary|Scratch' ./internal/executor
 
+  image-coordinator-go:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read
+    steps:
+      - uses: actions/checkout@v7.0.1
+
+      - name: Detect runtime-affecting changes
+        id: changes
+        if: github.event_name == 'pull_request'
+        uses: dorny/paths-filter@v4.0.3
+        with:
+          filters: |
+            runtime:
+              - Dockerfile
+              - .dockerignore
+              - Makefile
+              - go.mod
+              - go.sum
+              - hack/**
+              - .github/workflows/ci.yaml
+
+      - uses: docker/setup-buildx-action@v4.4.1
+        id: buildx
+
+      - name: Cache Go build mounts
+        id: go-cache
+        uses: actions/cache@v6.1.0
+        with:
+          path: go-cache
+          key: go-mounts-coordinator-go-${{ github.sha }}
+          restore-keys: go-mounts-coordinator-go-
+
+      - name: Inject Go build mounts
+        uses: reproducible-containers/buildkit-cache-dance@v3.4.0
+        with:
+          builder: ${{ steps.buildx.outputs.name }}
+          cache-map: |
+            {"go-cache/mod": "/go/pkg/mod", "go-cache/build": "/root/.cache/go-build"}
+          skip-extraction: ${{ steps.go-cache.outputs.cache-hit }}
+
       - name: Build Go toolchain coordinator image
         uses: docker/build-push-action@v7.4.0
         with:
@@ -131,6 +214,7 @@ jobs:
           docker run --rm --entrypoint sh courier-go:ci
           -c 'test "$(id -u)" = 65532 && go version && make --version >/dev/null && helm version --short >/dev/null && controller-gen --version >/dev/null && test ! -x "$(command -v gh || true)"'
       - name: Validate Courier workflow in Go toolchain image
+        if: github.event_name != 'pull_request' || steps.changes.outputs.runtime == 'true'
         run: |
           runtime_workspace="$(mktemp -d)"
           chmod 777 "$runtime_workspace"
@@ -151,6 +235,17 @@ jobs:
             --workdir /workspace \
             courier-go:ci \
             sh -ec 'cp -R /source/. /workspace/ && rm -rf /workspace/.git && sh hack/verify-courier-go-runtime.sh'
+
+  images:
+    runs-on: ubuntu-latest
+    needs: [image-manager, image-coordinator, image-coordinator-go]
+    if: always()
+    steps:
+      - name: Require every image job to pass
+        run: |
+          test "${{ needs.image-manager.result }}" = success
+          test "${{ needs.image-coordinator.result }}" = success
+          test "${{ needs.image-coordinator-go.result }}" = success
 
   vulnerability:
     runs-on: ubuntu-latest
