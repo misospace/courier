@@ -233,19 +233,21 @@ func (c *Client) ReadPR(ctx context.Context, owner, repo string, number int) (Pu
 	return c.GetPullRequest(ctx, owner, repo, number)
 }
 
-// PullRequestsForHead lists every pull request whose head is owner:branch,
-// including merged and closed ones. state=all is deliberate: an adoption
-// guard must see pull requests in any state, not only open ones.
-func (c *Client) PullRequestsForHead(ctx context.Context, owner, repo, branch string) ([]PullRequest, error) {
+// PullRequestsForHead lists every pull request in owner/repo whose head is
+// headOwner:branch, including merged and closed ones. state=all is deliberate:
+// an adoption guard must see pull requests in any state, not only open ones.
+// owner and headOwner differ for a fork pull request: the pull request lives
+// on the base repository while its head lives on the fork.
+func (c *Client) PullRequestsForHead(ctx context.Context, owner, repo, headOwner, branch string) ([]PullRequest, error) {
 	var out []PullRequest
-	err := c.doJSONQuery(ctx, http.MethodGet, repoEndpoint(owner, repo, "pulls"), headFilterQuery(owner, branch), nil, &out)
+	err := c.doJSONQuery(ctx, http.MethodGet, repoEndpoint(owner, repo, "pulls"), headFilterQuery(headOwner, branch), nil, &out)
 	return out, err
 }
 
-// headFilterQuery builds the pulls-list query for a head ref owned by the
-// repository. GitHub requires the owner:branch form of the head filter.
-func headFilterQuery(owner, branch string) string {
-	return "head=" + url.QueryEscape(owner) + ":" + url.QueryEscape(branch) + "&state=all"
+// headFilterQuery builds the pulls-list query for a head ref owned by
+// headOwner. GitHub requires the owner:branch form of the head filter.
+func headFilterQuery(headOwner, branch string) string {
+	return "head=" + url.QueryEscape(headOwner) + ":" + url.QueryEscape(branch) + "&state=all"
 }
 
 // GetCheckRuns reads all CI checks for a commit, branch, or tag ref.

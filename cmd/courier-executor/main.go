@@ -38,6 +38,7 @@ const (
 
 type config struct {
 	RemoteURL       string
+	BaseRemoteURL   string
 	Directory       string
 	Base            string
 	Branch          string
@@ -82,6 +83,7 @@ func readConfig(getenv func(string) string) (config, error) {
 	ref, _ := strconv.Atoi(strings.TrimSpace(getenv("COURIER_REF")))
 	cfg := config{
 		RemoteURL:       remoteURL,
+		BaseRemoteURL:   strings.TrimSpace(getenv("COURIER_BASE_REPO_URL")),
 		Directory:       strings.TrimSpace(getenv("COURIER_WORKSPACE")),
 		Base:            strings.TrimSpace(getenv("COURIER_BASE")),
 		Branch:          strings.TrimSpace(getenv("COURIER_BRANCH")),
@@ -336,10 +338,11 @@ func run(ctx context.Context, stdout, stderr io.Writer) int {
 	}
 
 	workspace, err := git.Prepare(ctx, git.PrepareOptions{
-		RemoteURL: cfg.RemoteURL,
-		Directory: cfg.Directory,
-		Base:      cfg.Base,
-		Branch:    cfg.Branch,
+		RemoteURL:     cfg.RemoteURL,
+		BaseRemoteURL: cfg.BaseRemoteURL,
+		Directory:     cfg.Directory,
+		Base:          cfg.Base,
+		Branch:        cfg.Branch,
 	})
 	if err != nil {
 		report.terminate(termination{Phase: "Failed", Result: "failure", ExitCode: 1, Reason: err.Error()})
@@ -467,7 +470,7 @@ func (r reporter) guardAdoption(ctx context.Context) (int, bool) {
 		r.terminate(termination{Phase: "Failed", Result: "failure", ExitCode: 1, Reason: err.Error()})
 		return 1, true
 	}
-	pulls, err := client.PullRequestsForHead(ctx, owner, name, r.cfg.Branch)
+	pulls, err := client.PullRequestsForHead(ctx, owner, name, owner, r.cfg.Branch)
 	if err != nil {
 		r.terminate(termination{Phase: "Failed", Result: "failure", ExitCode: 1, Reason: err.Error()})
 		return 1, true

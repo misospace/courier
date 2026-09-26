@@ -578,7 +578,7 @@ type sequenceWorldObserver struct {
 	calls        int
 }
 
-func (o *sequenceWorldObserver) Observe(context.Context, string, string) (PRObservation, error) {
+func (o *sequenceWorldObserver) Observe(context.Context, string, HeadRef) (PRObservation, error) {
 	if o.calls >= len(o.observations) {
 		return PRObservation{}, errors.New("unexpected observation")
 	}

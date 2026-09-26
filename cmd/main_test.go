@@ -12,7 +12,7 @@ import (
 
 type observerWithHeadResolver struct{}
 
-func (observerWithHeadResolver) Observe(context.Context, string, string) (controller.PRObservation, error) {
+func (observerWithHeadResolver) Observe(context.Context, string, controller.HeadRef) (controller.PRObservation, error) {
 	return controller.PRObservation{}, nil
 }
 

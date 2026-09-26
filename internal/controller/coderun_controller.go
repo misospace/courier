@@ -156,6 +156,9 @@ func (r *CoderRunReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 
 	head, err := resolveRunBranch(ctx, &run, r.PRHeadResolver)
 	if err != nil {
+		if errors.Is(err, ErrHeadRepositoryGone) {
+			return ctrl.Result{}, r.terminateMissingHead(ctx, &run, err)
+		}
 		return ctrl.Result{}, r.releaseClaim(ctx, &run, adapter, item, err)
 	}
 	before = run.DeepCopy()
@@ -211,6 +214,9 @@ func (r *CoderRunReconciler) resumeClaimed(ctx context.Context, run *courierv1al
 	if strings.TrimSpace(run.Status.Branch) == "" {
 		head, err := resolveRunBranch(ctx, run, r.PRHeadResolver)
 		if err != nil {
+			if errors.Is(err, ErrHeadRepositoryGone) {
+				return ctrl.Result{}, r.terminateMissingHead(ctx, run, err)
+			}
 			return ctrl.Result{}, r.releaseClaim(ctx, run, adapter, item, err)
 		}
 		before := run.DeepCopy()
@@ -322,6 +328,27 @@ func (r *CoderRunReconciler) releaseClaim(ctx context.Context, run *courierv1alp
 	return errors.Join(cause, releaseErr, statusErr)
 }
 
+// terminateMissingHead ends a fix-pr run whose pull request head repository is
+// gone (a deleted fork). Unlike a transient resolution failure, the condition
+// cannot recover by re-claiming, so the claim is released and the run
+// terminalizes NeedsHuman rather than cycling claim and release on every
+// reconcile. The cause is handled here, so it is logged and not returned as a
+// reconcile error.
+func (r *CoderRunReconciler) terminateMissingHead(ctx context.Context, run *courierv1alpha1.CoderRun, cause error) error {
+	log.FromContext(ctx).Info("terminating fix-pr run: pull request head repository is missing",
+		"run", run.Name, "branch", run.Status.Branch, "cause", cause.Error())
+	adapter, item, err := r.adapterAndWorkItem(run)
+	if err != nil {
+		return err
+	}
+	releaseErr := adapter.Release(ctx, item)
+	run.Status.Branch = ""
+	run.Status.HeadRepo = ""
+	run.Status.HeadSHA = ""
+	_, terminalErr := r.transitionTerminal(ctx, run, courierv1alpha1.PhaseNeedsHuman, "")
+	return errors.Join(releaseErr, terminalErr)
+}
+
 // resolveCompleted closes the source work for a Done run and then applies the
 // reap policy. A valid done-at marker proves Resolve succeeded on an earlier
 // reconcile — Courier writes the marker only afterwards — so a run inside its
@@ -375,11 +402,19 @@ func (r *CoderRunReconciler) observeRunning(ctx context.Context, run *courierv1a
 	return ctrl.Result{}, nil
 }
 
+// controllerHeadRef reconstructs the run's resolved head identity from its
+// status. An empty status.headRepo means a same-repository head: the observer
+// treats the base repository as the head repository, which also preserves the
+// behavior of runs persisted before head identity was recorded.
+func controllerHeadRef(run *courierv1alpha1.CoderRun) HeadRef {
+	return HeadRef{Repo: run.Status.HeadRepo, Branch: run.Status.Branch, SHA: run.Status.HeadSHA}
+}
+
 func (r *CoderRunReconciler) observeVerifying(ctx context.Context, run *courierv1alpha1.CoderRun) (ctrl.Result, error) {
 	if r.Observer == nil {
 		return r.transitionTerminal(ctx, run, courierv1alpha1.PhaseNeedsHuman, "")
 	}
-	observation, err := r.Observer.Observe(ctx, run.Spec.Repo, run.Status.Branch)
+	observation, err := r.Observer.Observe(ctx, run.Spec.Repo, controllerHeadRef(run))
 	if err != nil {
 		return ctrl.Result{RequeueAfter: observationRequeueDelay}, nil
 	}
@@ -426,7 +461,7 @@ func (r *CoderRunReconciler) enrichTerminalPR(ctx context.Context, run *courierv
 	if r.Observer == nil || run.Status.Branch == "" {
 		return pr
 	}
-	observation, err := r.Observer.Observe(ctx, run.Spec.Repo, run.Status.Branch)
+	observation, err := r.Observer.Observe(ctx, run.Spec.Repo, controllerHeadRef(run))
 	if err != nil || observation.PR == "" {
 		return pr
 	}

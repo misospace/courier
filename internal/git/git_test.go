@@ -111,6 +111,73 @@ func TestPrepareAdoptsOrphanAndSyncsBaseBeforeWork(t *testing.T) {
 	}
 }
 
+// SyncToBase must merge the upstream base, not the fork's: a fork PR's origin
+// is the fork, whose base branch can be arbitrarily stale or divergent.
+func TestPrepareSyncsBaseFromUpstreamWhenOriginIsFork(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	root := t.TempDir()
+	upstream := filepath.Join(root, "upstream.git")
+	fork := filepath.Join(root, "fork.git")
+	source := filepath.Join(root, "source")
+	initBare(t, upstream)
+	initBare(t, fork)
+	initRepo(t, source)
+	writeFile(t, filepath.Join(source, "README.md"), "base one\n")
+	commit(t, source, "base: initial")
+	git(t, source, "branch", "-M", "main")
+	git(t, source, "remote", "add", "origin", upstream)
+	git(t, source, "push", "-u", "origin", "main")
+
+	// Fork the upstream, then create the PR head branch on the fork. The
+	// fork-seed clone may have no checked-out branch (an unborn HEAD when the
+	// fork's default branch name is guessed), so push the explicit refspec.
+	git(t, root, "clone", upstream, filepath.Join(root, "forkseed"))
+	git(t, filepath.Join(root, "forkseed"), "remote", "add", "fork", fork)
+	git(t, filepath.Join(root, "forkseed"), "push", "fork", "origin/main:refs/heads/main")
+	forkWork := filepath.Join(root, "forkwork")
+	git(t, root, "clone", fork, forkWork)
+	git(t, forkWork, "config", "user.name", "Courier Test")
+	git(t, forkWork, "config", "user.email", "courier-test@example.invalid")
+	git(t, forkWork, "checkout", "-b", "fix/pr-12", "origin/main")
+	writeFile(t, filepath.Join(forkWork, "work.txt"), "fork work\n")
+	commit(t, forkWork, "work: fork brief")
+	git(t, forkWork, "push", "origin", "HEAD:refs/heads/fix/pr-12")
+
+	// Both bases move after the work branch was created: upstream main gains
+	// the commit that must be merged, fork main gains one that must not be.
+	writeFile(t, filepath.Join(source, "upstream-base.txt"), "new upstream base\n")
+	commit(t, source, "base: upstream second revision")
+	git(t, source, "push", "origin", "main")
+	writeFile(t, filepath.Join(forkWork, "fork-main.txt"), "stale fork main\n")
+	git(t, forkWork, "checkout", "-B", "main", "origin/main")
+	commit(t, forkWork, "base: divergent fork main")
+	git(t, forkWork, "push", "origin", "main")
+
+	workspace, err := Prepare(ctx, PrepareOptions{
+		RemoteURL:     fork,
+		BaseRemoteURL: upstream,
+		Directory:     filepath.Join(root, "workspace"),
+		Base:          "main",
+		Branch:        "fix/pr-12",
+	})
+	if err != nil {
+		t.Fatalf("prepare: %v", err)
+	}
+	if !workspace.Adopted {
+		t.Fatal("expected existing fork branch to be adopted")
+	}
+	if _, err := os.Stat(filepath.Join(workspace.Directory, "upstream-base.txt")); err != nil {
+		t.Fatalf("upstream base was not merged into the fork work branch: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(workspace.Directory, "fork-main.txt")); !os.IsNotExist(err) {
+		t.Fatalf("fork's own main was merged instead of the upstream base")
+	}
+	if _, err := gitOutput(workspace.Directory, "merge-base", "--is-ancestor", "upstream/main", "HEAD"); err != nil {
+		t.Fatalf("upstream main is not an ancestor after adoption: %v", err)
+	}
+}
+
 func TestPrepareCreatesBranchFromBase(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()

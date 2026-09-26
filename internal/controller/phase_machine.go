@@ -17,6 +17,11 @@ var (
 	ErrMissingWorkItemID      = errors.New("coderun controller: work item ID is required")
 	ErrPRHeadResolverRequired = errors.New("coderun controller: fix-pr head resolver is required")
 	ErrEmptyResolvedBranch    = errors.New("coderun controller: branch resolver returned an empty branch")
+	// ErrHeadRepositoryGone reports that a fix-pr run's pull request no longer
+	// names a head repository — typically a fork deleted after the run was
+	// filed. The condition is permanent for the pull request's current head,
+	// so callers terminate NeedsHuman instead of cycling claim and release.
+	ErrHeadRepositoryGone = errors.New("coderun controller: pull request head repository is missing")
 )
 
 // SourceRegistry keeps source adapters behind the source name persisted in a
@@ -117,7 +122,7 @@ func resolveRunBranch(ctx context.Context, run *courierv1alpha1.CoderRun, resolv
 			return HeadRef{}, ErrEmptyResolvedBranch
 		}
 		if strings.TrimSpace(head.Repo) == "" {
-			return HeadRef{}, fmt.Errorf("%w: fix-pr head repository is empty", ErrEmptyResolvedBranch)
+			return HeadRef{}, fmt.Errorf("%w: fix-pr head repository is empty", ErrHeadRepositoryGone)
 		}
 		return head, nil
 	default:

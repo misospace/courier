@@ -35,8 +35,11 @@ type PRObservation struct {
 }
 
 // WorldObserver reads the pull request and CI state for a completed run.
+// base is the repository that hosts the pull request and reports its checks;
+// head carries the run's resolved head identity, whose repository may differ
+// from base for a fork pull request.
 type WorldObserver interface {
-	Observe(context.Context, string, string) (PRObservation, error)
+	Observe(context.Context, string, HeadRef) (PRObservation, error)
 }
 
 type observationState string

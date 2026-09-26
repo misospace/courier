@@ -359,6 +359,9 @@ func TestBuildCoordinatorPodBuildsRemoteURLFromForkHead(t *testing.T) {
 	if env["COURIER_HEAD_SHA"] != "abc123" {
 		t.Fatalf("COURIER_HEAD_SHA = %q, want the head SHA", env["COURIER_HEAD_SHA"])
 	}
+	if env["COURIER_BASE_REPO_URL"] != "https://git.example/acme/widgets.git" {
+		t.Fatalf("COURIER_BASE_REPO_URL = %q, want the base repo for base sync", env["COURIER_BASE_REPO_URL"])
+	}
 }
 
 func TestBuildCoordinatorPodKeepsBaseRemoteURLWhenHeadEqualsBase(t *testing.T) {
@@ -408,6 +411,9 @@ func TestBuildCoordinatorPodKeepsBaseRemoteURLWhenHeadEqualsBase(t *testing.T) {
 			}
 			if env["COURIER_REPO"] != "acme/widgets" {
 				t.Fatalf("COURIER_REPO = %q, want the base repo", env["COURIER_REPO"])
+			}
+			if env["COURIER_BASE_REPO_URL"] != "https://git.example/acme/widgets.git" {
+				t.Fatalf("COURIER_BASE_REPO_URL = %q, want the base repo (same as origin)", env["COURIER_BASE_REPO_URL"])
 			}
 		})
 	}

@@ -132,15 +132,15 @@ func TestPullRequestsForHead(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	pulls, err := client.PullRequestsForHead(context.Background(), "acme", "demo", "work")
+	pulls, err := client.PullRequestsForHead(context.Background(), "acme", "demo", "octocat", "work")
 	if err != nil {
 		t.Fatalf("PullRequestsForHead: %v", err)
 	}
 	if len(pulls) != 2 || pulls[0].Number != 12 || pulls[0].State != "open" || pulls[1].State != "merged" {
 		t.Fatalf("pulls = %#v, want an open and a merged PR", pulls)
 	}
-	if !strings.Contains(rawQuery, "head=acme:work") {
-		t.Fatalf("query %q does not filter on head=owner:branch", rawQuery)
+	if !strings.Contains(rawQuery, "head=octocat:work") {
+		t.Fatalf("query %q does not filter on head=headOwner:branch", rawQuery)
 	}
 	if !strings.Contains(rawQuery, "state=all") {
 		t.Fatalf("query %q must use state=all so closed and merged PRs are visible", rawQuery)
@@ -370,7 +370,7 @@ func TestObserverReportsDraftPullRequest(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	observation, err := (Observer{Client: client}).Observe(context.Background(), "acme/demo", "work")
+	observation, err := (Observer{Client: client}).Observe(context.Background(), "acme/demo", controller.HeadRef{Repo: "acme/demo", Branch: "work", SHA: "abc123"})
 	if err != nil {
 		t.Fatalf("Observe() error = %v", err)
 	}
@@ -401,7 +401,7 @@ func TestObserverCombinesChecksAndStatuses(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	observation, err := (Observer{Client: client}).Observe(context.Background(), "acme/demo", "work")
+	observation, err := (Observer{Client: client}).Observe(context.Background(), "acme/demo", controller.HeadRef{Repo: "acme/demo", Branch: "work", SHA: "abc123"})
 	if err != nil {
 		t.Fatalf("Observe() error = %v", err)
 	}
@@ -440,7 +440,7 @@ func TestObserverLaterPageFailureDoesNotPass(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	observation, err := (Observer{Client: client}).Observe(context.Background(), "acme/demo", "work")
+	observation, err := (Observer{Client: client}).Observe(context.Background(), "acme/demo", controller.HeadRef{Repo: "acme/demo", Branch: "work", SHA: "abc123"})
 	if err != nil {
 		t.Fatalf("Observe() error = %v", err)
 	}
@@ -473,7 +473,7 @@ func TestObserverLaterPagePendingDoesNotPass(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	observation, err := (Observer{Client: client}).Observe(context.Background(), "acme/demo", "work")
+	observation, err := (Observer{Client: client}).Observe(context.Background(), "acme/demo", controller.HeadRef{Repo: "acme/demo", Branch: "work", SHA: "abc123"})
 	if err != nil {
 		t.Fatalf("Observe() error = %v", err)
 	}
@@ -501,7 +501,7 @@ func TestObserverPendingStatusDoesNotPass(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	observation, err := (Observer{Client: client}).Observe(context.Background(), "acme/demo", "work")
+	observation, err := (Observer{Client: client}).Observe(context.Background(), "acme/demo", controller.HeadRef{Repo: "acme/demo", Branch: "work", SHA: "abc123"})
 	if err != nil {
 		t.Fatalf("Observe() error = %v", err)
 	}
@@ -529,12 +529,52 @@ func TestObserverStatusOnlySuccessIsPassed(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	observation, err := (Observer{Client: client}).Observe(context.Background(), "acme/demo", "work")
+	observation, err := (Observer{Client: client}).Observe(context.Background(), "acme/demo", controller.HeadRef{Repo: "acme/demo", Branch: "work", SHA: "abc123"})
 	if err != nil {
 		t.Fatalf("Observe() error = %v", err)
 	}
 	if observation.PR == "" || len(observation.Checks) != 1 || observation.Checks[0].State != controller.CheckStatePassed {
 		t.Fatalf("observation = %#v, want status-only passed observation", observation)
+	}
+}
+
+// A fork pull request is listed on the base repository but its head lives on
+// the fork, so the pulls query must carry the fork's owner while the pull
+// request, its check runs, and its commit statuses are all read from the base
+// repository for the head SHA.
+func TestObserverForkHeadQueriesBaseRepoWithForkOwner(t *testing.T) {
+	requests := map[string]int{}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		requests[r.URL.Path+"?"+r.URL.RawQuery]++
+		switch {
+		case r.URL.Path == "/repos/acme/demo/pulls" && r.URL.Query().Get("head") == "octocat:work":
+			_, _ = io.WriteString(w, `[{"number":12,"state":"open","head":{"ref":"work","repo":{"full_name":"octocat/widgets"},"sha":"abc123"}}]`)
+		case r.URL.Path == "/repos/acme/demo/commits/abc123/check-runs":
+			_, _ = io.WriteString(w, `{"total_count":1,"check_runs":[{"name":"build","status":"completed","conclusion":"success"}]}`)
+		case r.URL.Path == "/repos/acme/demo/commits/abc123/status":
+			_, _ = io.WriteString(w, `{"total_count":0,"statuses":[]}`)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+	client, err := NewClient(server.URL, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	observation, err := (Observer{Client: client}).Observe(context.Background(), "acme/demo", controller.HeadRef{Repo: "octocat/widgets", Branch: "work", SHA: "abc123"})
+	if err != nil {
+		t.Fatalf("Observe() error = %v", err)
+	}
+	if observation.PR != "12" {
+		t.Fatalf("observation = %#v, want fork PR 12", observation)
+	}
+	if _, ok := requests["/repos/acme/demo/pulls?head=octocat:work&state=all"]; !ok {
+		t.Fatalf("pulls requests = %#v, want a base-repo query filtered to the fork head owner", requests)
+	}
+	if _, ok := requests["/repos/acme/demo/commits/abc123/check-runs?page=1&per_page=100"]; !ok {
+		t.Fatalf("check-run requests = %#v, want check runs read from the base repo for the head SHA", requests)
 	}
 }
 
@@ -609,7 +649,7 @@ func TestPullRequestsForHeadAPIError(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	_, err = client.PullRequestsForHead(context.Background(), "acme", "demo", "work")
+	_, err = client.PullRequestsForHead(context.Background(), "acme", "demo", "acme", "work")
 	var apiErr *APIError
 	if !errors.As(err, &apiErr) || apiErr.StatusCode != http.StatusInternalServerError {
 		t.Fatalf("error = %v (%T), want a 500 APIError", err, err)

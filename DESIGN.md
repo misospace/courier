@@ -429,7 +429,11 @@ it modest" with `concurrency: 1`. Same schema, no local assumption baked in.
   in-progress.
 - **Running** — pod launches: ephemeral workspace, clone, **adopt the branch if it
   exists and base-sync first**, inject LaneProfile framing + roles, wire the MCP
-  tools, set log level from `debug`. The target harness commits per brief and
+  tools, set log level from `debug`. For a fork PR the workspace's `origin` is
+  the fork and base-sync fetches a second fetch-only `upstream` remote pointing
+  at the base repository, so the merge-before-work invariant always merges the
+  real base rather than the fork's possibly stale base branch. The target
+  harness commits per brief and
   writes heartbeat and checkpoint to status; the legacy bootstrap does not
   populate these fields (#102). Exit `0` transitions to **Verifying** before
   any external observation, releasing the lane capacity. Exit `2` transitions
@@ -631,7 +635,12 @@ was superseded.
   `status.headSHA` alongside `status.branch`. The coordinator pod builds its
   clone/push remote from the head repository, so `origin` is the fork and a
   colliding same-named base branch can never be adopted; `spec.repo` (the base)
-  stays the PR/publication target. Before preparing the workspace the executor
+  stays the PR/publication target and a fetch-only `upstream` remote keeps
+  base-sync merging the real base rather than the fork's. Observation queries
+  the base repository with the fork's owner as the head qualifier and reads
+  checks for the head SHA from the base. A deleted fork (`head.repo: null`)
+  terminalizes NeedsHuman instead of cycling claim and release. Before
+  preparing the workspace the executor
   verifies the head branch exists on the fork remote, and an unavailable or
   unwritable fork head is an actionable NeedsHuman — no reset, replacement
   branch, or force-push is introduced. Same-repository fix-pr runs are

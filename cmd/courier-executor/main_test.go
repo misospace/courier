@@ -375,13 +375,14 @@ func TestReadConfigGitHubTokenPrecedenceAndFallback(t *testing.T) {
 
 func TestReadConfigReadsHeadIdentity(t *testing.T) {
 	values := map[string]string{
-		"COURIER_REPO_URL":  "https://git.example/acme/widgets.git",
-		"COURIER_BRANCH":    "fix/pr-12",
-		"COURIER_GOAL":      "goal",
-		"COURIER_MODEL":     "model",
-		"COURIER_REPO":      "acme/widgets",
-		"COURIER_HEAD_REPO": "octocat/widgets",
-		"COURIER_HEAD_SHA":  "abc123",
+		"COURIER_REPO_URL":      "https://git.example/octocat/widgets.git",
+		"COURIER_BASE_REPO_URL": "https://git.example/acme/widgets.git",
+		"COURIER_BRANCH":        "fix/pr-12",
+		"COURIER_GOAL":          "goal",
+		"COURIER_MODEL":         "model",
+		"COURIER_REPO":          "acme/widgets",
+		"COURIER_HEAD_REPO":     "octocat/widgets",
+		"COURIER_HEAD_SHA":      "abc123",
 	}
 	cfg, err := readConfig(func(name string) string { return values[name] })
 	if err != nil {
@@ -395,6 +396,9 @@ func TestReadConfigReadsHeadIdentity(t *testing.T) {
 	}
 	if cfg.Repo != "acme/widgets" {
 		t.Fatalf("Repo = %q, want the base repo acme/widgets", cfg.Repo)
+	}
+	if cfg.BaseRemoteURL != "https://git.example/acme/widgets.git" {
+		t.Fatalf("BaseRemoteURL = %q, want the base repo for base sync", cfg.BaseRemoteURL)
 	}
 }
 
