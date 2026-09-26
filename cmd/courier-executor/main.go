@@ -40,6 +40,8 @@ type config struct {
 	Base            string
 	Branch          string
 	Repo            string
+	HeadRepo        string
+	HeadSHA         string
 	Mode            string
 	RunID           string
 	Ref             int
@@ -82,6 +84,8 @@ func readConfig(getenv func(string) string) (config, error) {
 		Base:            strings.TrimSpace(getenv("COURIER_BASE")),
 		Branch:          strings.TrimSpace(getenv("COURIER_BRANCH")),
 		Repo:            strings.TrimSpace(getenv("COURIER_REPO")),
+		HeadRepo:        strings.TrimSpace(getenv("COURIER_HEAD_REPO")),
+		HeadSHA:         strings.TrimSpace(getenv("COURIER_HEAD_SHA")),
 		Goal:            strings.TrimSpace(getenv("COURIER_GOAL")),
 		Model:           strings.TrimSpace(getenv("COURIER_MODEL")),
 		Framing:         getenv("COURIER_FRAMING"),
@@ -127,6 +131,9 @@ func readConfig(getenv func(string) string) (config, error) {
 		if required.value == "" {
 			return config{}, fmt.Errorf("%s is required", required.name)
 		}
+	}
+	if strings.EqualFold(cfg.Mode, "fix-pr") && cfg.HeadRepo == "" {
+		return config{}, errors.New("COURIER_HEAD_REPO is required for fix-pr runs")
 	}
 	if parsed, err := url.Parse(cfg.RemoteURL); err == nil && parsed.User != nil {
 		if _, hasPassword := parsed.User.Password(); hasPassword {
@@ -231,6 +238,10 @@ func run(ctx context.Context, stdout, stderr io.Writer) int {
 	}
 
 	if code := report.guardAdoption(ctx); code != 0 {
+		return code
+	}
+
+	if code := report.guardFixPRHead(ctx); code != 0 {
 		return code
 	}
 
@@ -359,6 +370,28 @@ func (r reporter) guardAdoption(ctx context.Context) int {
 	}
 	for _, pull := range pulls {
 		r.terminate(termination{Phase: "NeedsHuman", Result: "needs-human", ExitCode: exitNeedsHuman, Reason: fmt.Sprintf("resolve branch already has PR #%d (%s); refusing adoption", pull.Number, pull.State)})
+		return exitNeedsHuman
+	}
+	return 0
+}
+
+// guardFixPRHead enforces the fix-pr invariant that a run must operate on the
+// fork that owns the PR head. If the head branch is missing on that fork, the
+// run must stop and ask for a human; it must never adopt a same-named base
+// branch or force-push elsewhere. It returns 0 when the run may proceed. The
+// guard assumes pod.go points COURIER_REPO_URL at the head repo for fix-pr
+// runs; single-remote deployments without a %s placeholder are out of scope.
+func (r reporter) guardFixPRHead(ctx context.Context) int {
+	if r.cfg.Mode != "fix-pr" || r.cfg.HeadRepo == "" || strings.EqualFold(r.cfg.HeadRepo, r.cfg.Repo) {
+		return 0
+	}
+	exists, err := git.RemoteBranchExists(ctx, r.cfg.RemoteURL, r.cfg.Branch)
+	if err != nil {
+		r.terminate(termination{Phase: "Failed", Result: "failure", ExitCode: 1, Reason: err.Error()})
+		return 1
+	}
+	if !exists {
+		r.terminate(termination{Phase: "NeedsHuman", Result: "needs-human", ExitCode: exitNeedsHuman, Reason: fmt.Sprintf("PR head branch %s was not found on the fork head repo %s; refusing to fall back to a same-named base branch", r.cfg.Branch, r.cfg.HeadRepo)})
 		return exitNeedsHuman
 	}
 	return 0

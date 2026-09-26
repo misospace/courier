@@ -291,6 +291,64 @@ func TestReadConfigGitHubTokenPrecedenceAndFallback(t *testing.T) {
 	}
 }
 
+func TestReadConfigReadsHeadIdentity(t *testing.T) {
+	values := map[string]string{
+		"COURIER_REPO_URL":  "https://git.example/acme/widgets.git",
+		"COURIER_BRANCH":    "fix/pr-12",
+		"COURIER_GOAL":      "goal",
+		"COURIER_MODEL":     "model",
+		"COURIER_REPO":      "acme/widgets",
+		"COURIER_HEAD_REPO": "octocat/widgets",
+		"COURIER_HEAD_SHA":  "abc123",
+	}
+	cfg, err := readConfig(func(name string) string { return values[name] })
+	if err != nil {
+		t.Fatalf("readConfig() error = %v", err)
+	}
+	if cfg.HeadRepo != "octocat/widgets" {
+		t.Fatalf("HeadRepo = %q, want octocat/widgets", cfg.HeadRepo)
+	}
+	if cfg.HeadSHA != "abc123" {
+		t.Fatalf("HeadSHA = %q, want abc123", cfg.HeadSHA)
+	}
+	if cfg.Repo != "acme/widgets" {
+		t.Fatalf("Repo = %q, want the base repo acme/widgets", cfg.Repo)
+	}
+}
+
+func TestReadConfigHeadIdentityOptional(t *testing.T) {
+	values := map[string]string{
+		"COURIER_REPO_URL": "https://git.example/acme/widgets.git",
+		"COURIER_BRANCH":   "courier/acme/widgets/issue-7",
+		"COURIER_GOAL":     "goal",
+		"COURIER_MODEL":    "model",
+		"COURIER_REPO":     "acme/widgets",
+	}
+	cfg, err := readConfig(func(name string) string { return values[name] })
+	if err != nil {
+		t.Fatalf("readConfig() error = %v, want head identity optional", err)
+	}
+	if cfg.HeadRepo != "" || cfg.HeadSHA != "" {
+		t.Fatalf("head identity = %q/%q, want empty when unset", cfg.HeadRepo, cfg.HeadSHA)
+	}
+}
+
+func TestReadConfigFixPRRequiresHeadRepo(t *testing.T) {
+	values := map[string]string{
+		"COURIER_REPO_URL": "https://git.example/acme/widgets.git",
+		"COURIER_BRANCH":   "fix/pr-12",
+		"COURIER_GOAL":     "goal",
+		"COURIER_MODEL":    "model",
+		"COURIER_MODE":     "fix-pr",
+		"COURIER_REPO":     "acme/widgets",
+		// COURIER_HEAD_REPO is deliberately missing.
+	}
+	_, err := readConfig(func(name string) string { return values[name] })
+	if err == nil || !strings.Contains(err.Error(), "COURIER_HEAD_REPO") {
+		t.Fatalf("readConfig() error = %v, want missing COURIER_HEAD_REPO for fix-pr", err)
+	}
+}
+
 func TestRunResolveIssueFailsWhenGitHubErrors(t *testing.T) {
 	root := t.TempDir()
 	remote := remoteWithExistingBranch(t, root)
@@ -318,6 +376,104 @@ func TestRunResolveIssueFailsWhenGitHubErrors(t *testing.T) {
 	if strings.Contains(output.String(), "opencode argv") || code == 99 {
 		t.Fatalf("opencode was invoked despite a GitHub API error: %q", output.String())
 	}
+}
+
+func TestGuardFixPRHead(t *testing.T) {
+	// A bare remote standing in for the fork that owns the PR head: main plus
+	// one published work branch. A branch name that was never pushed is the
+	// missing-head case.
+	remote := gitRemoteWithBranch(t, t.TempDir(), "fix/existing")
+
+	for _, test := range []struct {
+		name     string
+		mode     string
+		repo     string
+		headRepo string
+		branch   string
+		want     int
+		wantOut  []string
+	}{
+		{
+			name:     "fork head branch missing is NeedsHuman",
+			mode:     "fix-pr",
+			repo:     "acme/widgets",
+			headRepo: "octocat/widgets",
+			branch:   "fix/missing",
+			want:     exitNeedsHuman,
+			wantOut:  []string{`"phase":"NeedsHuman"`, "octocat/widgets", "fix/missing"},
+		},
+		{
+			name:     "fork head branch present proceeds",
+			mode:     "fix-pr",
+			repo:     "acme/widgets",
+			headRepo: "octocat/widgets",
+			branch:   "fix/existing",
+			want:     0,
+		},
+		{
+			name:     "same-repo fix-pr is a no-op",
+			mode:     "fix-pr",
+			repo:     "acme/widgets",
+			headRepo: "acme/widgets",
+			branch:   "fix/missing",
+			want:     0,
+		},
+		{
+			name:     "resolve-issue is unaffected",
+			mode:     "resolve-issue",
+			repo:     "acme/widgets",
+			headRepo: "octocat/widgets",
+			branch:   "fix/missing",
+			want:     0,
+		},
+		{
+			name:     "head repo differing only by case is a no-op",
+			mode:     "fix-pr",
+			repo:     "acme/widgets",
+			headRepo: "Acme/widgets",
+			branch:   "fix/missing",
+			want:     0,
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			var output bytes.Buffer
+			var errorsOut bytes.Buffer
+			report := newReporter(&output, &errorsOut, config{
+				RemoteURL: remote,
+				Mode:      test.mode,
+				Repo:      test.repo,
+				HeadRepo:  test.headRepo,
+				Branch:    test.branch,
+			})
+			if code := report.guardFixPRHead(context.Background()); code != test.want {
+				t.Fatalf("guardFixPRHead exit code = %d, want %d; stdout=%q stderr=%q", code, test.want, output.String(), errorsOut.String())
+			}
+			for _, fragment := range test.wantOut {
+				if !strings.Contains(output.String(), fragment) {
+					t.Fatalf("output missing %q: %q", fragment, output.String())
+				}
+			}
+		})
+	}
+}
+
+// gitRemoteWithBranch builds a bare remote with main and the named branch
+// published, the state a fork head carries when the PR head is reachable.
+func gitRemoteWithBranch(t *testing.T, root, branch string) string {
+	t.Helper()
+	remote := filepath.Join(root, "remote.git")
+	source := filepath.Join(root, "source")
+	runGit(t, root, "init", "--bare", remote)
+	runGit(t, root, "init", source)
+	configureGit(t, source)
+	write(t, filepath.Join(source, "README.md"), "base one\n")
+	commit(t, source, "base: initial")
+	runGit(t, source, "branch", "-M", "main")
+	runGit(t, source, "remote", "add", "origin", remote)
+	runGit(t, source, "push", "-u", "origin", "main")
+	runGit(t, source, "branch", branch)
+	runGit(t, source, "push", "origin", branch)
+	return remote
 }
 
 func TestAskpassNeverLogsOrTakesCredentialsAsArguments(t *testing.T) {

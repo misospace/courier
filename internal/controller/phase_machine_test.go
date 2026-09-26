@@ -136,9 +136,9 @@ func TestOperatorStatusPatchesPreserveHarnessFields(t *testing.T) {
 func TestPendingClaimsBeforeBranchResolutionAndLaunch(t *testing.T) {
 	item := &admissionSource{}
 	var order []string
-	resolver := ExistingPRHeadResolverFunc(func(context.Context, *courierv1alpha1.CoderRun) (string, error) {
+	resolver := ExistingPRHeadResolverFunc(func(_ context.Context, run *courierv1alpha1.CoderRun) (HeadRef, error) {
 		order = append(order, "resolve")
-		return "feature/existing-pr", nil
+		return HeadRef{Repo: run.Spec.Repo, Branch: "feature/existing-pr", SHA: "abc123"}, nil
 	})
 	run := admissionRun("fix", "local", courierv1alpha1.PhasePending)
 	run.Spec.Mode = courierv1alpha1.ModeFixPR
@@ -165,8 +165,8 @@ func TestPendingClaimsBeforeBranchResolutionAndLaunch(t *testing.T) {
 	if err := client.Get(context.Background(), admissionKey("fix"), &updated); err != nil {
 		t.Fatalf("get run: %v", err)
 	}
-	if updated.Status.Branch != "feature/existing-pr" {
-		t.Fatalf("branch = %q, want existing PR head", updated.Status.Branch)
+	if updated.Status.Branch != "feature/existing-pr" || updated.Status.HeadRepo != "acme/widgets" || updated.Status.HeadSHA != "abc123" {
+		t.Fatalf("head = branch %q repo %q sha %q, want existing PR head", updated.Status.Branch, updated.Status.HeadRepo, updated.Status.HeadSHA)
 	}
 }
 
@@ -223,6 +223,9 @@ func TestPreLaunchTransientFailureKeepsRunPending(t *testing.T) {
 	}
 	if updated.Status.Phase != courierv1alpha1.PhasePending {
 		t.Fatalf("phase = %q, want Pending", updated.Status.Phase)
+	}
+	if updated.Status.HeadRepo != "" || updated.Status.HeadSHA != "" {
+		t.Fatalf("run after rejected claim = head repo %q sha %q, want empty", updated.Status.HeadRepo, updated.Status.HeadSHA)
 	}
 }
 
@@ -285,6 +288,9 @@ func TestLaunchFailureReleasesSourceAndCapacity(t *testing.T) {
 	}
 	if updated.Status.Phase != courierv1alpha1.PhasePending || updated.Status.Branch != "" {
 		t.Fatalf("run after failed launch = phase %q branch %q, want Pending and empty branch", updated.Status.Phase, updated.Status.Branch)
+	}
+	if updated.Status.HeadRepo != "" || updated.Status.HeadSHA != "" {
+		t.Fatalf("run after failed launch = head repo %q sha %q, want empty", updated.Status.HeadRepo, updated.Status.HeadSHA)
 	}
 }
 

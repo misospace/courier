@@ -227,6 +227,17 @@ spec:
                 x-kubernetes-list-map-keys:
                 - type
                 x-kubernetes-list-type: map
+              headRepo:
+                description: |-
+                  HeadRepo is the repository that owns the PR head branch for a fix-pr run.
+                  It equals Spec.Repo for same-repository PRs and resolve-issue runs.
+                type: string
+              headSHA:
+                description: |-
+                  HeadSHA is the PR head commit observed when the run resolved its head,
+                  recorded on the run for verification and resume. It is the observed
+                  head, not an enforced pre-push gate.
+                type: string
               heartbeat:
                 description: Heartbeat is the last successful coordinator activity.
                 properties:

@@ -545,7 +545,7 @@ func TestObserverResolvesExistingPRHead(t *testing.T) {
 			return
 		}
 		w.Header().Set("Content-Type", "application/json")
-		_, _ = io.WriteString(w, `{"number":12,"head":{"ref":"feature/fix-pr"}}`)
+		_, _ = io.WriteString(w, `{"number":12,"head":{"ref":"feature/fix-pr","sha":"abc123","label":"octo:feature/fix-pr","repo":{"owner":{"login":"octo"},"full_name":"octo/demo"}},"base":{"ref":"main","sha":"def456","label":"acme:main","repo":{"owner":{"login":"acme"},"full_name":"acme/demo"}}}`)
 	}))
 	defer server.Close()
 
@@ -560,8 +560,8 @@ func TestObserverResolvesExistingPRHead(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ResolveHead() error = %v", err)
 	}
-	if got != "feature/fix-pr" {
-		t.Fatalf("ResolveHead() = %q, want feature/fix-pr", got)
+	if got.Repo != "octo/demo" || got.Branch != "feature/fix-pr" || got.SHA != "abc123" {
+		t.Fatalf("ResolveHead() = %#v, want the fork head identity distinct from the base repo", got)
 	}
 }
 

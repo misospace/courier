@@ -243,9 +243,13 @@ func (b *PodBuilder) Build(run *courierv1alpha1.CoderRun, lane *courierv1alpha1.
 }
 
 func podEnvironment(invocation Invocation, executorName string, config PodConfig) []corev1.EnvVar {
+	repoForRemote := invocation.HeadRepo
+	if strings.TrimSpace(repoForRemote) == "" {
+		repoForRemote = invocation.Repo
+	}
 	remoteURL := config.GitRemoteURL
 	if strings.Contains(remoteURL, "%s") {
-		remoteURL = strings.Replace(remoteURL, "%s", escapedRepositoryPath(invocation.Repo), 1)
+		remoteURL = strings.Replace(remoteURL, "%s", escapedRepositoryPath(repoForRemote), 1)
 	}
 	terminationFile := runtimePath + "/termination"
 	values := toKubernetesEnv(EnvironmentWithConfig(invocation, executorName, remoteURL, config.BaseBranch, config.OpenCode.Binary, config.OpenCode.Format, terminationFile, config.OpenCode.Agent))

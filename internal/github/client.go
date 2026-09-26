@@ -90,8 +90,23 @@ type PullRequest struct {
 
 // Ref identifies a branch and its current commit in a pull request response.
 type Ref struct {
-	Ref string `json:"ref"`
-	SHA string `json:"sha"`
+	Ref   string  `json:"ref"`
+	SHA   string  `json:"sha"`
+	Label string  `json:"label,omitempty"`
+	Repo  RepoRef `json:"repo,omitempty"`
+}
+
+// RepoRef is the repository identity GitHub attaches to a pull request head
+// or base. It names the repository that owns the branch.
+type RepoRef struct {
+	Owner    RepoOwner `json:"owner,omitempty"`
+	FullName string    `json:"full_name,omitempty"`
+}
+
+// RepoOwner is the GitHub account that owns a pull request's head or base
+// repository.
+type RepoOwner struct {
+	Login string `json:"login,omitempty"`
 }
 
 // CreatePullRequestRequest is the payload for creating a pull request.

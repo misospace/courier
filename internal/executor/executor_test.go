@@ -200,6 +200,8 @@ func TestBuildCoordinatorPodInjectsRunContextAndEphemeralWorkspace(t *testing.T)
 		"COURIER_FRAMING":          "single GPU; keep parallelism modest",
 		"COURIER_LOG_LEVEL":        "debug",
 		"COURIER_REPO":             "acme/widgets",
+		"COURIER_HEAD_REPO":        "",
+		"COURIER_HEAD_SHA":         "",
 		"COURIER_BRANCH":           "courier/acme/widgets/issue-7",
 		"COURIER_WORKSPACE":        "/workspace",
 		"COURIER_TERMINATION_FILE": runtimePath + "/termination",
@@ -308,6 +310,105 @@ func TestBuildCoordinatorPodWiresGitSecretWithoutEmbeddingCredentials(t *testing
 	}
 	if envFrom := pod.Spec.Containers[0].EnvFrom; len(envFrom) != 1 || envFrom[0].SecretRef == nil || envFrom[0].SecretRef.Name != "courier-model" {
 		t.Fatalf("model environment secret = %#v", envFrom)
+	}
+}
+
+func TestBuildCoordinatorPodBuildsRemoteURLFromForkHead(t *testing.T) {
+	run := &courierv1alpha1.CoderRun{
+		ObjectMeta: metav1.ObjectMeta{Name: "run-fork-head", Namespace: "courier-system"},
+		Spec: courierv1alpha1.CoderRunSpec{
+			Mode: courierv1alpha1.ModeFixPR,
+			Repo: "acme/widgets",
+			Ref:  12,
+			Lane: "local",
+		},
+		Status: courierv1alpha1.CoderRunStatus{
+			Branch:   "fix/pr-12",
+			HeadRepo: "octocat/widgets",
+			HeadSHA:  "abc123",
+		},
+	}
+	lane := &courierv1alpha1.LaneProfile{
+		ObjectMeta: metav1.ObjectMeta{Name: "local", Namespace: "courier-system"},
+		Spec:       courierv1alpha1.LaneProfileSpec{Roles: map[string]string{"coordinator": "any-model"}},
+	}
+	pod, err := BuildCoordinatorPod(run, lane, PodConfig{
+		Image:         "registry.example/courier-opencode:test",
+		WorkspacePath: "/workspace",
+		GitRemoteURL:  "https://git.example/%s.git",
+	})
+	if err != nil {
+		t.Fatalf("BuildCoordinatorPod() error = %v", err)
+	}
+	env := make(map[string]string, len(pod.Spec.Containers[0].Env))
+	for _, value := range pod.Spec.Containers[0].Env {
+		if value.ValueFrom == nil {
+			env[value.Name] = value.Value
+		}
+	}
+	if env["COURIER_REPO_URL"] != "https://git.example/octocat/widgets.git" {
+		t.Fatalf("COURIER_REPO_URL = %q, want the fork head repo", env["COURIER_REPO_URL"])
+	}
+	if env["COURIER_REPO"] != "acme/widgets" {
+		t.Fatalf("COURIER_REPO = %q, want the base repo as the PR target", env["COURIER_REPO"])
+	}
+	if env["COURIER_HEAD_REPO"] != "octocat/widgets" {
+		t.Fatalf("COURIER_HEAD_REPO = %q, want the fork head repo", env["COURIER_HEAD_REPO"])
+	}
+	if env["COURIER_HEAD_SHA"] != "abc123" {
+		t.Fatalf("COURIER_HEAD_SHA = %q, want the head SHA", env["COURIER_HEAD_SHA"])
+	}
+}
+
+func TestBuildCoordinatorPodKeepsBaseRemoteURLWhenHeadEqualsBase(t *testing.T) {
+	for _, test := range []struct {
+		name     string
+		mode     courierv1alpha1.Mode
+		headRepo string
+	}{
+		{name: "same-repo fix-pr", mode: courierv1alpha1.ModeFixPR, headRepo: "acme/widgets"},
+		{name: "resolve-issue without head", mode: courierv1alpha1.ModeResolveIssue, headRepo: ""},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			run := &courierv1alpha1.CoderRun{
+				ObjectMeta: metav1.ObjectMeta{Name: "run-same-repo", Namespace: "courier-system"},
+				Spec: courierv1alpha1.CoderRunSpec{
+					Mode: test.mode,
+					Repo: "acme/widgets",
+					Ref:  12,
+					Lane: "local",
+				},
+				Status: courierv1alpha1.CoderRunStatus{
+					Branch:   "courier/acme/widgets/pr-12",
+					HeadRepo: test.headRepo,
+					HeadSHA:  "abc123",
+				},
+			}
+			lane := &courierv1alpha1.LaneProfile{
+				ObjectMeta: metav1.ObjectMeta{Name: "local", Namespace: "courier-system"},
+				Spec:       courierv1alpha1.LaneProfileSpec{Roles: map[string]string{"coordinator": "any-model"}},
+			}
+			pod, err := BuildCoordinatorPod(run, lane, PodConfig{
+				Image:         "registry.example/courier-opencode:test",
+				WorkspacePath: "/workspace",
+				GitRemoteURL:  "https://git.example/%s.git",
+			})
+			if err != nil {
+				t.Fatalf("BuildCoordinatorPod() error = %v", err)
+			}
+			env := make(map[string]string, len(pod.Spec.Containers[0].Env))
+			for _, value := range pod.Spec.Containers[0].Env {
+				if value.ValueFrom == nil {
+					env[value.Name] = value.Value
+				}
+			}
+			if env["COURIER_REPO_URL"] != "https://git.example/acme/widgets.git" {
+				t.Fatalf("COURIER_REPO_URL = %q, want the base repo unchanged", env["COURIER_REPO_URL"])
+			}
+			if env["COURIER_REPO"] != "acme/widgets" {
+				t.Fatalf("COURIER_REPO = %q, want the base repo", env["COURIER_REPO"])
+			}
+		})
 	}
 }
 
