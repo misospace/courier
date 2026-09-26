@@ -11,9 +11,11 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 
+	"github.com/misospace/courier/internal/executor"
 	courierlog "github.com/misospace/courier/internal/log"
 )
 
@@ -55,7 +57,7 @@ func TestRunPreparesOrphanBranchAndInvokesOpenCodeWithExactContext(t *testing.T)
 	runGit(t, source, "push", "origin", "main")
 
 	fakeOpenCode := filepath.Join(root, "opencode")
-	writeExecutable(t, fakeOpenCode, "#!/bin/sh\nprintf 'opencode argv: %s\\n' \"$*\"\nprintf 'completed\\n' > completed.txt\ngit add --all -- .\ngit commit -m 'test: completed work' >/dev/null\n")
+	writeExecutable(t, fakeOpenCode, "#!/bin/sh\ncase \"$1\" in mcp) exit 0;; esac\nprintf 'opencode argv: %s\\n' \"$*\"\nprintf 'completed\\n' > completed.txt\ngit add --all -- .\ngit commit -m 'test: completed work' >/dev/null\n")
 	workspace := filepath.Join(root, "workspace")
 	termination := filepath.Join(root, "termination")
 	t.Setenv("COURIER_REPO_URL", remote)
@@ -211,7 +213,7 @@ func TestRunResolveIssueAdoptsBranchWithoutPullRequest(t *testing.T) {
 	remote := remoteWithExistingBranch(t, root)
 
 	fakeOpenCode := filepath.Join(root, "opencode")
-	writeExecutable(t, fakeOpenCode, "#!/bin/sh\nprintf 'opencode argv: %s\\n' \"$*\"\nprintf 'completed\\n' > completed.txt\ngit add --all -- .\ngit commit -m 'test: completed work' >/dev/null\n")
+	writeExecutable(t, fakeOpenCode, "#!/bin/sh\ncase \"$1\" in mcp) exit 0;; esac\nprintf 'opencode argv: %s\\n' \"$*\"\nprintf 'completed\\n' > completed.txt\ngit add --all -- .\ngit commit -m 'test: completed work' >/dev/null\n")
 
 	const githubToken = "github-api-token"
 	const gitToken = "git-token"
@@ -251,7 +253,7 @@ func TestRunExitZeroWithoutLocalWorkBecomesNeedsHuman(t *testing.T) {
 	root := t.TempDir()
 	remote := remoteWithExistingBranch(t, root)
 	fakeOpenCode := filepath.Join(root, "opencode")
-	writeExecutable(t, fakeOpenCode, "#!/bin/sh\nexit 0\n")
+	writeExecutable(t, fakeOpenCode, "#!/bin/sh\ncase \"$1\" in mcp) exit 0;; esac\nexit 0\n")
 	prServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = io.WriteString(w, `[]`)
@@ -273,7 +275,7 @@ func TestRunExitZeroWithDirtyWorkBecomesNeedsHuman(t *testing.T) {
 	root := t.TempDir()
 	remote := remoteWithExistingBranch(t, root)
 	fakeOpenCode := filepath.Join(root, "opencode")
-	writeExecutable(t, fakeOpenCode, "#!/bin/sh\nprintf 'partial\\n' > partial.txt\nexit 0\n")
+	writeExecutable(t, fakeOpenCode, "#!/bin/sh\ncase \"$1\" in mcp) exit 0;; esac\nprintf 'partial\\n' > partial.txt\nexit 0\n")
 	prServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = io.WriteString(w, `[]`)
@@ -319,7 +321,7 @@ func TestRunPreservesExplicitNeedsHumanSignal(t *testing.T) {
 	root := t.TempDir()
 	remote := remoteWithExistingBranch(t, root)
 	fakeOpenCode := filepath.Join(root, "opencode")
-	writeExecutable(t, fakeOpenCode, "#!/bin/sh\nexit 2\n")
+	writeExecutable(t, fakeOpenCode, "#!/bin/sh\ncase \"$1\" in mcp) exit 0;; esac\nexit 2\n")
 	prServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = io.WriteString(w, `[]`)
@@ -438,7 +440,7 @@ func TestRunEmitsRunScopedEventsWithoutDetail(t *testing.T) {
 	remote := remoteWithExistingBranch(t, root)
 
 	fakeOpenCode := filepath.Join(root, "opencode")
-	writeExecutable(t, fakeOpenCode, "#!/bin/sh\nprintf 'opencode ran\\n'\nprintf 'completed\\n' > completed.txt\ngit add --all -- .\ngit commit -m 'test: completed work' >/dev/null\n")
+	writeExecutable(t, fakeOpenCode, "#!/bin/sh\ncase \"$1\" in mcp) exit 0;; esac\nprintf 'opencode ran\\n'\nprintf 'completed\\n' > completed.txt\ngit add --all -- .\ngit commit -m 'test: completed work' >/dev/null\n")
 
 	// The branch exists on the remote and is orphaned: the adoption guard
 	// must see no pull requests and let the run proceed.
@@ -575,6 +577,7 @@ func TestChildOutputIsRedactedBeforeStreams(t *testing.T) {
 	fragment1 := testGitToken[:9]
 	fragment2 := testGitToken[9:]
 	script := fmt.Sprintf(`#!/bin/sh
+case "$1" in mcp) exit 0;; esac
 printf 'stdout git token '
 printf '%s'
 printf '%s delivered\n'
@@ -640,6 +643,7 @@ func TestChildOutputRedactedOnFailureExit(t *testing.T) {
 
 	fakeOpenCode := filepath.Join(root, "opencode")
 	writeExecutable(t, fakeOpenCode, fmt.Sprintf(`#!/bin/sh
+case "$1" in mcp) exit 0;; esac
 printf 'failing run token %s\n'
 exit 3
 `, testGitToken))
@@ -662,6 +666,207 @@ exit 3
 	}
 	if !strings.Contains(output.String(), `"phase":"Failed"`) {
 		t.Fatal("failure path lost the termination handoff")
+	}
+}
+
+// TestRunSurfacesUnavailableCapabilityBeforeWork proves the bounded preflight
+// names an unreachable configured server to the model, emits a structured
+// capability.status diagnostic, and augments the no-work terminal reason,
+// while a registered credential stays out of every stream.
+func TestRunSurfacesUnavailableCapabilityBeforeWork(t *testing.T) {
+	root := t.TempDir()
+	remote := remoteWithExistingBranch(t, root)
+
+	fakeOpenCode := filepath.Join(root, "opencode")
+	writeExecutable(t, fakeOpenCode, "#!/bin/sh\ncase \"$1\" in\n  mcp) printf '%s\\n' '✗ github failed'; printf '%s\\n' '    SSE error: Non-200 status code (400)'; exit 0;;\nesac\nprintf 'opencode argv: %s\\n' \"$*\"\nexit 0\n")
+
+	prServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `[]`)
+	}))
+	defer prServer.Close()
+
+	setResolveIssueEnv(t, root, remote, prServer.URL, fakeOpenCode)
+	t.Setenv("COURIER_RUN_NAME", "coderrun-it-7")
+	t.Setenv("COURIER_REF", "7")
+	t.Setenv("COURIER_REPO", "acme/widgets")
+	t.Setenv("COURIER_MODE", "resolve-issue")
+
+	const capabilityProbeToken = "cap-probe-token-zz99"
+	t.Setenv("GITHUB_TOKEN", capabilityProbeToken)
+
+	var output bytes.Buffer
+	var errorsOut bytes.Buffer
+	code := run(context.Background(), &output, &errorsOut)
+	if code != exitNeedsHuman {
+		t.Fatalf("run exit code = %d, want %d; stderr=%q stdout=%q", code, exitNeedsHuman, errorsOut.String(), output.String())
+	}
+	if strings.Contains(output.String(), "✗") {
+		t.Fatal("run stdout contains a raw probe glyph; probe output must stay out of the run's streams")
+	}
+	if strings.Contains(errorsOut.String(), "✗") {
+		t.Fatal("run stderr contains raw probe output")
+	}
+
+	events := parseEvents(t, &output)
+	status := findEvent(t, events, "capability.status")
+	if status["status"] != "error" {
+		t.Fatalf("capability.status = %v, want error", status["status"])
+	}
+	detail, ok := status["detail"].(map[string]any)
+	if !ok {
+		t.Fatal("capability.status must carry a detail object")
+	}
+	servers, ok := detail["servers"].([]any)
+	if !ok || len(servers) == 0 {
+		t.Fatal("capability.status detail must carry the server list")
+	}
+	first, ok := servers[0].(map[string]any)
+	if !ok {
+		t.Fatal("first capability entry is not an object")
+	}
+	if first["name"] != "github" || first["available"] != false {
+		t.Fatalf("first capability = name %v available %v, want github unavailable", first["name"], first["available"])
+	}
+	if reason, _ := first["reason"].(string); !strings.Contains(reason, "Non-200") {
+		t.Fatal("first capability reason lost the connection error text")
+	}
+
+	start := strings.Index(output.String(), "opencode argv:")
+	if start < 0 {
+		t.Fatal("run output is missing the opencode argv echo")
+	}
+	argvText := output.String()[start:]
+	if !strings.Contains(argvText, "UNAVAILABLE") || !strings.Contains(argvText, "github (SSE error") {
+		t.Fatal("the model was not told the configured server is unavailable")
+	}
+	if strings.Contains(argvText, capabilityProbeToken) {
+		t.Fatal("opencode argv output contains a fake credential (constant: capabilityProbeToken)")
+	}
+	if strings.Contains(output.String(), capabilityProbeToken) || strings.Contains(errorsOut.String(), capabilityProbeToken) {
+		t.Fatal("output contains a fake credential (constant: capabilityProbeToken)")
+	}
+	if !strings.Contains(output.String(), "without producing a commit") || !strings.Contains(output.String(), "configured capability unavailable: github") {
+		t.Fatalf("terminal reason lost the no-work sentence or the unavailable capability: %q", output.String())
+	}
+}
+
+// TestRunHealthyCapabilityLeavesRunBehaviorUnchanged proves a preflight that
+// finds every configured server available adds no framing, reports an ok
+// capability.status, and changes nothing about the run's outcome.
+func TestRunHealthyCapabilityLeavesRunBehaviorUnchanged(t *testing.T) {
+	root := t.TempDir()
+	remote := remoteWithExistingBranch(t, root)
+
+	fakeOpenCode := filepath.Join(root, "opencode")
+	writeExecutable(t, fakeOpenCode, "#!/bin/sh\ncase \"$1\" in\n  mcp) printf '%s\\n' '✓ github connected'; exit 0;;\nesac\nprintf 'opencode argv: %s\\n' \"$*\"\nprintf 'completed\\n' > completed.txt\ngit add --all -- .\ngit commit -m 'test: completed work' >/dev/null\n")
+
+	prServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `[]`)
+	}))
+	defer prServer.Close()
+
+	setResolveIssueEnv(t, root, remote, prServer.URL, fakeOpenCode)
+	t.Setenv("COURIER_FRAMING", "keep scope tight")
+	t.Setenv("COURIER_RUN_NAME", "coderrun-it-7")
+
+	var output bytes.Buffer
+	var errorsOut bytes.Buffer
+	code := run(context.Background(), &output, &errorsOut)
+	if code != exitSuccess {
+		t.Fatalf("run exit code = %d, want 0; stderr=%q stdout=%q", code, errorsOut.String(), output.String())
+	}
+
+	events := parseEvents(t, &output)
+	status := findEvent(t, events, "capability.status")
+	if status["status"] != "ok" {
+		t.Fatalf("capability.status = %v, want ok", status["status"])
+	}
+	detail, ok := status["detail"].(map[string]any)
+	if !ok {
+		t.Fatal("capability.status must carry a detail object")
+	}
+	servers, ok := detail["servers"].([]any)
+	if !ok || len(servers) == 0 {
+		t.Fatal("capability.status detail must carry the server list")
+	}
+	first, ok := servers[0].(map[string]any)
+	if !ok || first["name"] != "github" || first["available"] != true {
+		t.Fatalf("first capability = %v, want github available", first)
+	}
+
+	start := strings.Index(output.String(), "opencode argv:")
+	if start < 0 {
+		t.Fatal("run output is missing the opencode argv echo")
+	}
+	argvText := output.String()[start:]
+	if !strings.Contains(argvText, "keep scope tight") {
+		t.Fatal("the model did not receive the configured framing")
+	}
+	if strings.Contains(argvText, "UNAVAILABLE") {
+		t.Fatal("healthy preflight must not add an unavailable-capability note")
+	}
+
+	exit := findEvent(t, events, "run.exit")
+	if exit["status"] != "ok" {
+		t.Fatalf("run.exit status = %v, want ok", exit["status"])
+	}
+	if !strings.Contains(output.String(), `"phase":"Verifying"`) {
+		t.Fatalf("healthy run lost the Verifying termination: %q", output.String())
+	}
+}
+
+func TestPreflightCapabilitiesIgnoresStderrNoise(t *testing.T) {
+	// A binary that has no `mcp` subcommand prints an error to stderr and exits
+	// non-zero. The probe parses stdout only, so it must report no capabilities
+	// rather than inventing one from the stderr text.
+	dir := t.TempDir()
+	fake := filepath.Join(dir, "opencode")
+	writeExecutable(t, fake, "#!/bin/sh\nprintf '%s\\n' 'error: unknown command \"mcp\"' >&2\nexit 1\n")
+	caps := preflightCapabilities(context.Background(), executor.Command{Binary: fake, Args: []string{"mcp", "list"}}, dir)
+	if len(caps) != 0 {
+		t.Fatalf("preflightCapabilities() = %#v, want none from stderr-only noise", caps)
+	}
+}
+
+func TestPreflightCapabilitiesParsesStdoutStatus(t *testing.T) {
+	// A healthy server and a failed server printed on stdout (as `opencode mcp
+	// list` does) are parsed regardless of the process exit status.
+	dir := t.TempDir()
+	fake := filepath.Join(dir, "opencode")
+	writeExecutable(t, fake, "#!/bin/sh\nprintf '%s\\n' '\u2713 github connected'\nprintf '%s\\n' '\u2717 metrics failed'\nprintf '%s\\n' '    connection refused'\nexit 3\n")
+	caps := preflightCapabilities(context.Background(), executor.Command{Binary: fake, Args: []string{"mcp", "list"}}, dir)
+	want := []executor.MCPCapability{
+		{Name: "github", Available: true},
+		{Name: "metrics", Available: false, Reason: "connection refused"},
+	}
+	if !reflect.DeepEqual(caps, want) {
+		t.Fatalf("preflightCapabilities() = %#v, want %#v", caps, want)
+	}
+}
+
+// Guards a null byte in the binary path: exec must reject it without a panic, a hang, or invented capabilities.
+func TestPreflightCapabilitiesHandlesInvalidBinaryPath(t *testing.T) {
+	caps := preflightCapabilities(context.Background(), executor.Command{Binary: "opencode\x00", Args: []string{"mcp", "list"}}, "")
+	if len(caps) != 0 {
+		t.Fatalf("preflightCapabilities() = %#v, want none from a null-byte binary path", caps)
+	}
+}
+
+// Guards a symlinked binary: the probe must resolve the link and parse the target's stdout.
+func TestPreflightCapabilitiesFollowsSymlinkedBinary(t *testing.T) {
+	dir := t.TempDir()
+	real := filepath.Join(dir, "real-opencode")
+	writeExecutable(t, real, "#!/bin/sh\ncase \"$1\" in mcp) printf '%s\\n' '✓ github connected'; exit 0;; esac\n")
+	link := filepath.Join(dir, "opencode")
+	if err := os.Symlink(real, link); err != nil {
+		t.Fatalf("os.Symlink() error = %v", err)
+	}
+	caps := preflightCapabilities(context.Background(), executor.Command{Binary: link, Args: []string{"mcp", "list"}}, dir)
+	want := []executor.MCPCapability{{Name: "github", Available: true}}
+	if !reflect.DeepEqual(caps, want) {
+		t.Fatalf("preflightCapabilities() = %#v, want %#v", caps, want)
 	}
 }
 
