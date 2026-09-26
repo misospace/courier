@@ -24,7 +24,7 @@ RUN --mount=type=cache,target=/go/pkg/mod \
 	go build -o manager cmd/main.go && \
 	go build -o courier-executor ./cmd/courier-executor
 
-FROM builder AS toolchain
+FROM golang:1.27.1@sha256:3680233e3204827fbdc66088528ae6d4b3d034f51d03a99d454f6de034888244 AS toolchain
 ARG CONTROLLER_TOOLS_VERSION=v0.16.5
 ARG HELM_VERSION=v3.18.6
 

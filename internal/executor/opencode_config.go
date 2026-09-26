@@ -10,7 +10,7 @@ const (
 
 type openCodeConfig struct {
 	Agents     map[string]openCodeAgent `json:"agent"`
-	Permission map[string]string        `json:"permission,omitempty"`
+	Permission map[string]any           `json:"permission,omitempty"`
 	MCP        map[string]openCodeMCP   `json:"mcp,omitempty"`
 }
 
@@ -28,9 +28,14 @@ type openCodeMCP struct {
 }
 
 func marshalOpenCodeConfig(roles map[string]string, githubURL, context7URL, metricsURL string) ([]byte, error) {
-	denyMerge := map[string]string{
+	// permission keeps the merge denies and allows only the scratch
+	// directory; every other external path stays at the default (ask).
+	permission := map[string]any{
 		"github_merge_pull_request": "deny",
 		"github_merge*":             "deny",
+		"external_directory": map[string]string{
+			scratchPath + "/**": "allow",
+		},
 	}
 	agents := make(map[string]openCodeAgent, len(roles))
 	for role, model := range roles {
@@ -38,7 +43,7 @@ func marshalOpenCodeConfig(roles map[string]string, githubURL, context7URL, metr
 	}
 	config := openCodeConfig{
 		Agents:     agents,
-		Permission: denyMerge,
+		Permission: permission,
 	}
 	config.MCP = make(map[string]openCodeMCP)
 	if githubURL != "" {

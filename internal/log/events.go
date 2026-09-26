@@ -16,10 +16,11 @@
 //	role    string  model role (coordinator, coder, reviewer), when applicable
 //	model   string  model binding, when applicable
 //	status  string  outcome: ok, error, needs-human, or a phase name
-//	detail  object  verbose diagnostic payload, debug runs only
+//	detail  object  verbose diagnostic payload, included at debug level or when the event marks itself Verbose
 //
 // Fixed fields are always safe to emit; detail is gated on the emitter's
-// level and redacted before serialization in both modes. The event classes
+// level, an event may opt in via its Verbose flag, and it is redacted
+// before serialization in both modes. The event classes
 // the future harness owns (model.call, tool.call, tool.result, brief.start,
 // brief.complete) are declared here as constants so richer emitters can
 // adopt the same contract without changing this package; the current
@@ -61,6 +62,9 @@ const (
 	EventBriefComplete = "brief.complete"
 	// EventPhaseTransition reports a CoderRun lifecycle phase change.
 	EventPhaseTransition = "phase.transition"
+	// EventCapabilityStatus reports a bounded preflight of configured MCP
+	// capability availability observed before the coordinator goal runs.
+	EventCapabilityStatus = "capability.status"
 )
 
 // Status values for the status field.
