@@ -120,12 +120,67 @@ func TestParseMCPStatus(t *testing.T) {
 			input: "✓ \x00 srv connected\n",
 			want:  []MCPCapability{{Name: "srv", Available: true}},
 		},
+		{
+			name: "real healthy box output",
+			input: "┌  MCP Servers\n" +
+				"│\n" +
+				"●  ✓ github \x1b[90mconnected\n" +
+				"│      \x1b[90mhttps://api.githubcopilot.com/mcp/\n" +
+				"│\n" +
+				"└  1 server(s)\n" +
+				"\n",
+			want: []MCPCapability{{Name: "github", Available: true}},
+		},
+		{
+			name: "real failed box output",
+			input: "┌  MCP Servers\n" +
+				"│\n" +
+				"●  ✗ github \x1b[90mfailed\n" +
+				"│      SSE error: Unable to connect. Is the computer able to access the url?\n" +
+				"│      \x1b[90mhttp://127.0.0.1:9/mcp\n" +
+				"│\n" +
+				"└  1 server(s)\n" +
+				"\n",
+			want: []MCPCapability{{Name: "github", Available: false, Reason: "SSE error: Unable to connect. Is the computer able to access the url?"}},
+		},
+		{
+			name:  "failed entry with color-coded indented reason",
+			input: "✗ github failed\n\x1b[90m    boom\n",
+			want:  []MCPCapability{{Name: "github", Available: false, Reason: "boom"}},
+		},
+		{
+			name:  "failed entry then lone frame line yields empty reason",
+			input: "✗ github failed\n│\n",
+			want:  []MCPCapability{{Name: "github", Available: false}},
+		},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			got := ParseMCPStatus(test.input)
 			if !reflect.DeepEqual(got, test.want) {
 				t.Fatalf("ParseMCPStatus() = %#v, want %#v", got, test.want)
+			}
+		})
+	}
+}
+
+func TestMCPStripHelpers(t *testing.T) {
+	if got := stripANSI("a\x1b[90mb\x1bZc"); got != "abc" {
+		t.Fatalf("stripANSI() = %q, want %q", got, "abc")
+	}
+	tests := []struct {
+		name  string
+		input string
+		want  string
+	}{
+		{name: "lone bar", input: "│", want: ""},
+		{name: "bullet entry", input: "●  ✓ x", want: "✓ x"},
+		{name: "indented stays", input: "    boom", want: "    boom"},
+	}
+	for _, test := range tests {
+		t.Run("stripMCPPrefix/"+test.name, func(t *testing.T) {
+			if got := stripMCPPrefix(test.input); got != test.want {
+				t.Fatalf("stripMCPPrefix() = %q, want %q", got, test.want)
 			}
 		})
 	}

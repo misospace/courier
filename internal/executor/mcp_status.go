@@ -44,34 +44,42 @@ func (o OpenCode) MCPStatusCommand() Command {
 }
 
 // ParseMCPStatus parses the textual `opencode mcp list` output into per-server
-// capability status. A line is a server entry when it starts at column 0 and
-// carries a success signal (a leading glyph ✓, ✔, or +, or the word
-// connected, ready, or enabled) or a failure signal (a leading glyph ✗, ✘, or
-// ×, or the word failed, error, or disabled), case-insensitively. When both a
-// success and a failure signal appear, the entry is a failure. The server name
-// is the first whitespace-delimited token that is not a status word, with any
-// leading status glyph and surrounding punctuation removed; a server whose
-// name is itself a status word is preserved with its status, while a lone
-// status word with no name is treated as prose and ignored. For a failed
-// entry, an indented, non-empty line immediately following it supplies the
-// reason. Lines that cannot be classified (headers, blank lines, "no servers
-// configured" prose) are ignored. A repeated name keeps its last occurrence,
-// and result order follows first appearance. Names and reasons are stripped of
-// control characters; names are capped at mcpNameMaxRunes runes and reasons at
-// mcpReasonMaxRunes runes. It never interprets or returns secrets; callers
-// redact before emission. It returns nil when nothing is recognized.
+// capability status. Each line is first stripped of ANSI escape sequences and
+// of a leading box-drawing/bullet frame rune (● │ ┌ └) with its following
+// spaces, and is then classified on that normalized content. A line is a
+// server entry when it carries a success signal (a leading glyph ✓, ✔, or +,
+// or the word connected, ready, or enabled) or a failure signal (a leading
+// glyph ✗, ✘, or ×, or the word failed, error, or disabled),
+// case-insensitively. When both a success and a failure signal appear, the
+// entry is a failure. The server name is the first whitespace-delimited token
+// that is not a status word, with any leading status glyph and surrounding
+// punctuation removed; a server whose name is itself a status word is
+// preserved with its status, while a lone status word with no name is treated
+// as prose and ignored. For a failed entry, a continuation line immediately
+// following it — one that is whitespace-indented, or that starts with a │
+// frame rune — supplies the reason. Lines that cannot be classified (headers,
+// blank lines, "no servers configured" prose) are ignored. A repeated name
+// keeps its last occurrence, and result order follows first appearance. Names
+// and reasons are stripped of control characters; names are capped at
+// mcpNameMaxRunes runes and reasons at mcpReasonMaxRunes runes. It never
+// interprets or returns secrets; callers redact before emission. It returns
+// nil when nothing is recognized.
 func ParseMCPStatus(output string) []MCPCapability {
 	lines := strings.Split(strings.ReplaceAll(output, "\r\n", "\n"), "\n")
 	positions := make(map[string]int)
 	var result []MCPCapability
 	for i := 0; i < len(lines); i++ {
-		capability, ok := classifyMCPLine(lines[i])
+		capability, ok := classifyMCPLine(stripMCPPrefix(stripANSI(lines[i])))
 		if !ok {
 			continue
 		}
-		if !capability.Available && i+1 < len(lines) && isIndentedMCPLine(lines[i+1]) {
-			capability.Reason = capMCPReason(strings.TrimSpace(lines[i+1]))
-			i++
+		if !capability.Available && i+1 < len(lines) {
+			next := stripANSI(lines[i+1])
+			reason := strings.TrimSpace(stripMCPPrefix(next))
+			if reason != "" && (isIndentedMCPLine(next) || strings.HasPrefix(next, "│")) {
+				capability.Reason = capMCPReason(reason)
+				i++
+			}
 		}
 		if index, seen := positions[capability.Name]; seen {
 			result[index] = capability
@@ -188,6 +196,59 @@ func isIndentedMCPLine(line string) bool {
 		return false
 	}
 	return strings.TrimSpace(line) != ""
+}
+
+// mcpFramePrefixes are the box-drawing/bullet runes that frame real
+// `opencode mcp list` output.
+var mcpFramePrefixes = []rune{'●', '│', '┌', '└'}
+
+// stripANSI removes ANSI/VT escape sequences from s. On an ESC byte it
+// consumes an escape sequence introduced by [ or ] through its final byte in
+// the 0x40-0x7E range, and a single following byte for any other introducer;
+// all other bytes are emitted verbatim.
+func stripANSI(s string) string {
+	var b strings.Builder
+	runes := []rune(s)
+	for i := 0; i < len(runes); i++ {
+		if runes[i] == 0x1b {
+			if i+1 < len(runes) {
+				if runes[i+1] == '[' || runes[i+1] == ']' {
+					i += 2
+					for i < len(runes) && (runes[i] < 0x40 || runes[i] > 0x7e) {
+						i++
+					}
+				} else {
+					i++
+				}
+			}
+			continue
+		}
+		b.WriteRune(runes[i])
+	}
+	return b.String()
+}
+
+// stripMCPPrefix removes a single leading box/bullet frame rune from
+// already-ANSI-stripped s, plus the spaces and tabs that follow it. A line
+// that does not start with a frame rune is returned unchanged, so indented
+// lines keep their indentation.
+func stripMCPPrefix(s string) string {
+	runes := []rune(s)
+	if len(runes) == 0 {
+		return s
+	}
+	leading := runes[0]
+	isPrefix := false
+	for _, p := range mcpFramePrefixes {
+		if leading == p {
+			isPrefix = true
+			break
+		}
+	}
+	if !isPrefix {
+		return s
+	}
+	return strings.TrimLeft(string(runes[1:]), " \t")
 }
 
 // stripMCPControl removes every control rune from s.
