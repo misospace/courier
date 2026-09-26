@@ -94,18 +94,57 @@ func TestRunPreparesOrphanBranchAndInvokesOpenCodeWithExactContext(t *testing.T)
 	}
 }
 
-func TestRunResolveIssueRefusesBranchWithOpenPullRequest(t *testing.T) {
+func TestRunResolveIssueWithExistingOpenPullRequestReportsForReview(t *testing.T) {
 	root := t.TempDir()
 	remote := remoteWithExistingBranch(t, root)
 
 	// A binary that fails loudly if it is ever executed: reaching it would mean
-	// the run ignored the existing PR.
+	// the run adopted the branch despite the open PR.
 	fakeOpenCode := filepath.Join(root, "opencode")
 	writeExecutable(t, fakeOpenCode, "#!/bin/sh\nexit 99\n")
 
 	prServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		_, _ = io.WriteString(w, `[{"number":12,"state":"open","head":{"ref":"feature/x"}}]`)
+		_, _ = io.WriteString(w, `[{"number":12,"state":"open","head":{"ref":"courier/resolve-issue/acme-widgets/7"}}]`)
+	}))
+	defer prServer.Close()
+
+	setResolveIssueEnv(t, root, remote, prServer.URL, fakeOpenCode)
+
+	var output bytes.Buffer
+	var errorsOut bytes.Buffer
+	code := run(context.Background(), &output, &errorsOut)
+	if code != exitSuccess {
+		t.Fatalf("run exit code = %d, want 0 (report for review); stderr=%q stdout=%q", code, errorsOut.String(), output.String())
+	}
+	if !strings.Contains(output.String(), `"phase":"Verifying"`) {
+		t.Fatalf("missing Verifying termination: %q", output.String())
+	}
+	if !strings.Contains(output.String(), "PR #12") {
+		t.Fatalf("termination should name the PR number: %q", output.String())
+	}
+	if strings.Contains(output.String(), `"phase":"NeedsHuman"`) || strings.Contains(output.String(), "refusing adoption") {
+		t.Fatalf("open PR should be reported for review, not handed to a human: %q", output.String())
+	}
+	for _, event := range parseEvents(t, &output) {
+		if name, _ := event["event"].(string); name == "workspace.ready" || name == "executor.start" {
+			t.Fatalf("run reached %s despite an existing PR: %v", name, event)
+		}
+	}
+}
+
+func TestRunResolveIssueRefusesBranchWithClosedPullRequest(t *testing.T) {
+	root := t.TempDir()
+	remote := remoteWithExistingBranch(t, root)
+
+	// A binary that fails loudly if it is ever executed: reaching it would mean
+	// the run adopted the branch despite the existing PR.
+	fakeOpenCode := filepath.Join(root, "opencode")
+	writeExecutable(t, fakeOpenCode, "#!/bin/sh\nexit 99\n")
+
+	prServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `[{"number":12,"state":"closed","head":{"ref":"courier/resolve-issue/acme-widgets/7"}}]`)
 	}))
 	defer prServer.Close()
 
@@ -120,11 +159,52 @@ func TestRunResolveIssueRefusesBranchWithOpenPullRequest(t *testing.T) {
 	if !strings.Contains(output.String(), `"phase":"NeedsHuman"`) {
 		t.Fatalf("missing NeedsHuman termination: %q", output.String())
 	}
+	if !strings.Contains(output.String(), "refusing adoption") {
+		t.Fatalf("termination should refuse adoption: %q", output.String())
+	}
 	if !strings.Contains(output.String(), "PR #12") {
 		t.Fatalf("termination should name the PR number: %q", output.String())
 	}
-	if strings.Contains(output.String(), "opencode argv") || code == 99 {
-		t.Fatalf("opencode was invoked despite an existing PR: %q", output.String())
+	for _, event := range parseEvents(t, &output) {
+		if name, _ := event["event"].(string); name == "workspace.ready" || name == "executor.start" {
+			t.Fatalf("run reached %s despite an existing PR: %v", name, event)
+		}
+	}
+}
+
+func TestRunResolveIssueWithMixedPullRequestsReportsOpenForReview(t *testing.T) {
+	root := t.TempDir()
+	remote := remoteWithExistingBranch(t, root)
+
+	// A binary that fails loudly if it is ever executed: reaching it would mean
+	// the run adopted the branch despite the open PR.
+	fakeOpenCode := filepath.Join(root, "opencode")
+	writeExecutable(t, fakeOpenCode, "#!/bin/sh\nexit 99\n")
+
+	prServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `[{"number":11,"state":"closed","head":{"ref":"courier/resolve-issue/acme-widgets/7"}},{"number":12,"state":"open","head":{"ref":"courier/resolve-issue/acme-widgets/7"}}]`)
+	}))
+	defer prServer.Close()
+
+	setResolveIssueEnv(t, root, remote, prServer.URL, fakeOpenCode)
+
+	var output bytes.Buffer
+	var errorsOut bytes.Buffer
+	code := run(context.Background(), &output, &errorsOut)
+	if code != exitSuccess {
+		t.Fatalf("run exit code = %d, want 0 (report for review); stderr=%q stdout=%q", code, errorsOut.String(), output.String())
+	}
+	if !strings.Contains(output.String(), `"phase":"Verifying"`) {
+		t.Fatalf("missing Verifying termination: %q", output.String())
+	}
+	if !strings.Contains(output.String(), "PR #12") {
+		t.Fatalf("termination should name the open PR number: %q", output.String())
+	}
+	for _, event := range parseEvents(t, &output) {
+		if name, _ := event["event"].(string); name == "workspace.ready" || name == "executor.start" {
+			t.Fatalf("run reached %s despite an existing PR: %v", name, event)
+		}
 	}
 }
 

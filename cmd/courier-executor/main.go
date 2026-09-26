@@ -320,7 +320,7 @@ func run(ctx context.Context, stdout, stderr io.Writer) int {
 		return 1
 	}
 
-	if code := report.guardAdoption(ctx); code != 0 {
+	if code, stop := report.guardAdoption(ctx); stop {
 		return code
 	}
 
@@ -427,42 +427,51 @@ func envIdentity() config {
 }
 
 // guardAdoption enforces the resolve-issue invariant that a deterministic
-// branch may be adopted only when it is orphaned. If the branch already
-// exists on the remote, no pull request may exist for that head; if one
-// does, a human decides, and the run stops before Prepare or OpenCode.
-// It returns 0 when the run may proceed.
-func (r reporter) guardAdoption(ctx context.Context) int {
+// branch may be adopted only when it is orphaned. If the branch already exists
+// on the remote with an open pull request, the run refuses to adopt it but
+// reports that PR for review by exiting 0, so the operator's world-verification
+// publishes the existing pull request to the source as in-review. A branch
+// whose only pull requests are closed or merged is handed to a human. It
+// returns (0, false) when the run may proceed to Prepare, or a terminal
+// (code, true) once it has emitted the run's handoff.
+func (r reporter) guardAdoption(ctx context.Context) (int, bool) {
 	if r.cfg.Mode != "resolve-issue" {
-		return 0
+		return 0, false
 	}
 	exists, err := git.RemoteBranchExists(ctx, r.cfg.RemoteURL, r.cfg.Branch)
 	if err != nil {
 		r.terminate(termination{Phase: "Failed", Result: "failure", ExitCode: 1, Reason: err.Error()})
-		return 1
+		return 1, true
 	}
 	if !exists {
-		return 0
+		return 0, false
 	}
 	owner, name, ok := splitOwnerRepo(r.cfg.Repo)
 	if !ok {
 		r.terminate(termination{Phase: "Failed", Result: "failure", ExitCode: 1, Reason: "resolve branch already exists on the remote and COURIER_REPO does not name an owner/repo; refusing adoption"})
-		return 1
+		return 1, true
 	}
 	client, err := github.NewClient(r.cfg.GitHubAPIBase, r.cfg.GitHubToken)
 	if err != nil {
 		r.terminate(termination{Phase: "Failed", Result: "failure", ExitCode: 1, Reason: err.Error()})
-		return 1
+		return 1, true
 	}
 	pulls, err := client.PullRequestsForHead(ctx, owner, name, r.cfg.Branch)
 	if err != nil {
 		r.terminate(termination{Phase: "Failed", Result: "failure", ExitCode: 1, Reason: err.Error()})
-		return 1
+		return 1, true
+	}
+	for _, pull := range pulls {
+		if pull.Head.Ref == r.cfg.Branch && strings.EqualFold(pull.State, "open") {
+			r.terminate(termination{Phase: "Verifying", Result: "success", ExitCode: exitSuccess, Reason: fmt.Sprintf("resolve branch already has open PR #%d; reporting the existing pull request to the source without adopting", pull.Number)})
+			return exitSuccess, true
+		}
 	}
 	for _, pull := range pulls {
 		r.terminate(termination{Phase: "NeedsHuman", Result: "needs-human", ExitCode: exitNeedsHuman, Reason: fmt.Sprintf("resolve branch already has PR #%d (%s); refusing adoption", pull.Number, pull.State)})
-		return exitNeedsHuman
+		return exitNeedsHuman, true
 	}
-	return 0
+	return 0, false
 }
 
 // splitOwnerRepo splits an owner/name repository identity on the final "/".
