@@ -367,6 +367,115 @@ func TestRunningPodExitMapsPhaseAndSourceState(t *testing.T) {
 	}
 }
 
+func TestRunningDirectTerminalEnrichesObservedPR(t *testing.T) {
+	tests := []struct {
+		name         string
+		exitCode     int32
+		priorPR      string
+		observer     WorldObserver
+		wantPhase    courierv1alpha1.Phase
+		wantPR       string
+		wantReportPR string
+	}{
+		{
+			name:         "needs human publishes observed PR",
+			exitCode:     2,
+			observer:     fakeWorldObserver{observation: PRObservation{PR: "42", Checks: []CheckObservation{{Name: "check", State: CheckStateFailed}}}},
+			wantPhase:    courierv1alpha1.PhaseNeedsHuman,
+			wantPR:       "42",
+			wantReportPR: "42",
+		},
+		{
+			name:         "failed retains already-observable PR",
+			exitCode:     17,
+			priorPR:      "42",
+			observer:     fakeWorldObserver{err: errors.New("github unavailable")},
+			wantPhase:    courierv1alpha1.PhaseFailed,
+			wantPR:       "42",
+			wantReportPR: "42",
+		},
+		{
+			name:         "observer error without prior PR still terminalizes",
+			exitCode:     2,
+			observer:     fakeWorldObserver{err: errors.New("github unavailable")},
+			wantPhase:    courierv1alpha1.PhaseNeedsHuman,
+			wantPR:       "",
+			wantReportPR: "",
+		},
+		{
+			name:         "no observer still terminalizes",
+			exitCode:     17,
+			observer:     nil,
+			wantPhase:    courierv1alpha1.PhaseFailed,
+			wantPR:       "",
+			wantReportPR: "",
+		},
+		{
+			name:         "no PR observed stays empty",
+			exitCode:     2,
+			observer:     fakeWorldObserver{observation: PRObservation{}},
+			wantPhase:    courierv1alpha1.PhaseNeedsHuman,
+			wantPR:       "",
+			wantReportPR: "",
+		},
+		{
+			name:         "failed publishes live observed PR",
+			exitCode:     17,
+			observer:     fakeWorldObserver{observation: PRObservation{PR: "42", Checks: []CheckObservation{{Name: "check", State: CheckStateFailed}}}},
+			wantPhase:    courierv1alpha1.PhaseFailed,
+			wantPR:       "42",
+			wantReportPR: "42",
+		},
+		{
+			name:         "all-green observation on terminal exit stays terminal",
+			exitCode:     2,
+			observer:     fakeWorldObserver{observation: PRObservation{PR: "42", Head: "sha-1", Checks: []CheckObservation{{Name: "check", State: CheckStatePassed}}}},
+			wantPhase:    courierv1alpha1.PhaseNeedsHuman,
+			wantPR:       "42",
+			wantReportPR: "42",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			item := &admissionSource{}
+			run := admissionRun("run", "local", courierv1alpha1.PhaseRunning)
+			run.Spec.Source = "test"
+			run.Spec.WorkItemID = "opaque-work-item"
+			run.Status.Branch = "courier/acme/widgets/issue-1"
+			run.Status.LastCommit = "abc123"
+			if tt.priorPR != "" {
+				run.Status.PR = tt.priorPR
+			}
+			client := phaseClient(t, run, coordinatorPod(run, tt.exitCode))
+			reconciler := &CoderRunReconciler{
+				Client:       client,
+				Sources:      NewSourceRegistry(map[string]source.Adapter{"test": item}),
+				StatusWriter: fakeStatusWriter{client: client},
+				Observer:     tt.observer,
+			}
+			if _, err := reconciler.Reconcile(context.Background(), admissionRequest("run")); err != nil {
+				t.Fatalf("Reconcile() error = %v", err)
+			}
+			var updated courierv1alpha1.CoderRun
+			if err := client.Get(context.Background(), admissionKey("run"), &updated); err != nil {
+				t.Fatalf("get run: %v", err)
+			}
+			if updated.Status.Phase != tt.wantPhase {
+				t.Fatalf("phase = %q, want %q", updated.Status.Phase, tt.wantPhase)
+			}
+			if updated.Status.PR != tt.wantPR {
+				t.Fatalf("PR = %q, want %q", updated.Status.PR, tt.wantPR)
+			}
+			if len(item.reports) != 1 || item.reports[0].PR != tt.wantReportPR || item.reports[0].State != source.StateNeedsHuman {
+				t.Fatalf("reports = %#v, want one report with PR %q and state %q", item.reports, tt.wantReportPR, source.StateNeedsHuman)
+			}
+			if updated.Status.LastCommit != "abc123" {
+				t.Fatalf("LastCommit = %q, want abc123", updated.Status.LastCommit)
+			}
+		})
+	}
+}
+
 func TestVerifyingObservationGatesReview(t *testing.T) {
 	tests := []struct {
 		name            string
