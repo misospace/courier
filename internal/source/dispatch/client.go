@@ -197,7 +197,7 @@ func (c *HTTPClient) Discover(ctx context.Context) ([]source.WorkItem, error) {
 		}
 		if state.Merged || strings.EqualFold(state.State, "closed") {
 			if task.PRFixItem != nil {
-				if err := c.markPRFixStale(ctx, task.PullRequest, state); err != nil {
+				if err := c.markPRFixStale(ctx, task.PullRequest, state, task.PRFixItem.Generation); err != nil {
 					return nil, err
 				}
 			}
@@ -287,14 +287,15 @@ func (c *HTTPClient) markPRFixBlocked(ctx context.Context, d workDescriptor, not
 		note = "Courier run requires human intervention"
 	}
 	return c.do(ctx, http.MethodPost, "/api/pr-fix-queue/mark", map[string]any{
-		"repo":   d.Repo,
-		"pr":     d.Number,
-		"status": "BLOCKED",
-		"note":   note,
+		"repo":       d.Repo,
+		"pr":         d.Number,
+		"status":     "BLOCKED",
+		"note":       note,
+		"generation": d.Generation,
 	}, nil)
 }
 
-func (c *HTTPClient) markPRFixStale(ctx context.Context, pullRequest *PullRequest, state PullRequestState) error {
+func (c *HTTPClient) markPRFixStale(ctx context.Context, pullRequest *PullRequest, state PullRequestState, generation int) error {
 	if pullRequest == nil {
 		return errors.New("dispatch client: cannot mark missing pull request stale")
 	}
@@ -303,10 +304,11 @@ func (c *HTTPClient) markPRFixStale(ctx context.Context, pullRequest *PullReques
 		note = "upstream pull request is merged"
 	}
 	return c.do(ctx, http.MethodPost, "/api/pr-fix-queue/mark", map[string]any{
-		"repo":   pullRequest.Repo,
-		"pr":     pullRequest.Number,
-		"status": "STALE",
-		"note":   note,
+		"repo":       pullRequest.Repo,
+		"pr":         pullRequest.Number,
+		"status":     "STALE",
+		"note":       note,
+		"generation": generation,
 	}, nil)
 }
 
@@ -329,6 +331,11 @@ func (c *HTTPClient) reportTaskWithPR(ctx context.Context, d workDescriptor, out
 	}
 	if d.Type == "followup-pr" && d.IssueNumber > 0 {
 		body["issueNumber"] = d.IssueNumber
+	}
+	// Dispatch settles a queue-backed follow-up only against the attempt it
+	// issued, so echo that token back; linked-PR follow-ups have none.
+	if d.Type == "followup-pr" && d.PRFixID != "" {
+		body["prFixItem"] = map[string]any{"id": d.PRFixID, "generation": d.Generation}
 	}
 	if number, rawURL := parsePullRequest(observedPR); number > 0 {
 		body["pullRequestNumber"] = number
@@ -381,7 +388,7 @@ func (c *HTTPClient) PreLaunch(ctx context.Context, id string) error {
 	}
 	if state.Merged || strings.EqualFold(state.State, "closed") {
 		if d.PRFixID != "" {
-			if err := c.markPRFixStale(ctx, pullRequest, state); err != nil {
+			if err := c.markPRFixStale(ctx, pullRequest, state, d.Generation); err != nil {
 				return err
 			}
 		}
