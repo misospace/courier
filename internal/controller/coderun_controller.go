@@ -406,7 +406,30 @@ func (r *CoderRunReconciler) observeVerifying(ctx context.Context, run *courierv
 	return ctrl.Result{RequeueAfter: observationRequeueDelay}, nil
 }
 
+// enrichTerminalPR best-effort refreshes the observed PR for a run that
+// reaches a NeedsHuman or Failed terminal state without passing through
+// Verifying, so a PR the coordinator opened is still published. It never
+// changes the run's phase and never blocks terminalization: with no observer,
+// no resolved branch, or an observation error it returns the run's
+// best-known PR, preserving any already-recorded value.
+func (r *CoderRunReconciler) enrichTerminalPR(ctx context.Context, run *courierv1alpha1.CoderRun) string {
+	pr := run.Status.PR
+	if r.Observer == nil || run.Status.Branch == "" {
+		return pr
+	}
+	observation, err := r.Observer.Observe(ctx, run.Spec.Repo, run.Status.Branch)
+	if err != nil || observation.PR == "" {
+		return pr
+	}
+	return observation.PR
+}
+
 func (r *CoderRunReconciler) transitionTerminal(ctx context.Context, run *courierv1alpha1.CoderRun, phase courierv1alpha1.Phase, pr string) (ctrl.Result, error) {
+	if phase == courierv1alpha1.PhaseNeedsHuman || phase == courierv1alpha1.PhaseFailed {
+		if pr == "" {
+			pr = r.enrichTerminalPR(ctx, run)
+		}
+	}
 	adapter, item, err := r.adapterAndWorkItem(run)
 	if err != nil {
 		return ctrl.Result{}, err
