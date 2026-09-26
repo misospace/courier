@@ -331,8 +331,11 @@ dead 12-hour run straight to Tier 3.
   step is always sync-to-base.
 
 Scope: **resolve-issue** adopts an orphaned branch only when a branch exists but
-no PR. **fix-pr** always adopts the existing PR's branch. A branch with a PR is
-never a resolve concern.
+no pull request points at it. When the deterministic branch already carries an
+**open** PR, the run refuses to adopt it and instead reports that PR to the
+source for review — a live PR means the work is in flight, not that a human is
+needed. A branch whose only PRs are closed or merged still refuses adoption and
+hands to a human. **fix-pr** always adopts the existing PR's branch.
 
 ## Observability and transcripts
 
@@ -703,3 +706,16 @@ was superseded.
   executor exits a run as `NeedsHuman` when the coordinator produced no commit or
   PR, rather than reporting success; the operator's world-verification (no PR →
   NeedsHuman) is the backstop. (#81)
+- **2026-09-26 — A resolve branch with an open PR is reported for review, not
+  blocked.** The adoption guard previously ended any resolve-issue run whose
+  deterministic branch already had a pull request as `NeedsHuman`, marking the
+  issue blocked while a PR (often a sibling `fix-pr` run started moments
+  earlier) was actively in flight. The guard now branches on state: an **open**
+  PR leaves the run refusing to adopt but exiting `0`, so the operator's
+  world-verification observes the real pull request and publishes it to the
+  source as `in-review` (`pr_opened`); a branch whose only PRs are closed or
+  merged still ends `NeedsHuman`, since a human must decide whether to reuse it.
+  This reuses the existing verify/observe path rather than adding a new terminal
+  state. Review-readiness is still the operator's to decide by re-reading the
+  world: a draft pull request or failing checks continues to hand the run to a
+  human. (#135)
