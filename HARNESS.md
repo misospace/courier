@@ -41,13 +41,17 @@ process convention can fix.
 
 ## 2. Target topology
 
-Three separate pods per run. There is no worker-to-broker or worker-to-forge
-network path.
+The trust boundaries are settled: trusted harness control and the untrusted
+shell worker occupy separate pods; the credential broker runs in a separate
+trusted pod or deployment, never in a pod with model-controlled processes. The diagram shows a per-run broker pod as one
+possible deployment; #120 selects per-run versus shared broker topology and
+run-bound identity. In either case there is no worker-to-broker or
+worker-to-forge network path.
 
 ```
                          CoderRun
        ┌───────────────────┼───────────────────┐
-       │ control / harness │ broker            │
+       │ control / harness │ broker (example)  │
        │ trusted           │ trusted           │
        │ model client,     │ forge + git creds,│
        │ orchestration,    │ typed APIs,       │
@@ -71,9 +75,12 @@ network path.
   code. The integration tree and coordinator state live here and are not
   mounted in the worker. Trusted code dispatches bounded tasks over the worker
   API and treats every response as untrusted.
-- **Broker pod:** trusted, owns forge/git credentials and the only run-scoped
-  Kubernetes status identity. It exposes typed APIs, not an arbitrary HTTP/MCP
-  proxy. It serves only its run's resolved repository policy.
+- **Broker service (separate trusted pod or pods):** owns forge/git credentials
+  and the only Kubernetes identity authorized to write harness-owned status.
+  It exposes typed APIs, not an arbitrary HTTP/MCP proxy. Every request is
+  bound to exactly one run's resolved repository policy. Whether its deployment
+  is per-run or shared is for #120 to decide; sharing must not allow cross-run
+  requests or broaden status-write authority.
 - **Sandbox worker pod:** untrusted model-controlled shell and tools. It has no
   certificate, service-account token, secret, host socket, or network egress;
   NetworkPolicy is pod-level defense in depth, not process isolation. The worker
@@ -163,10 +170,14 @@ default: a path scope binds only when the run's resolved policy explicitly
 declares one. The default is the repository's own layout, not a
 Courier-imposed subset (inform, don't constrain).
 
-- Reject an unexpected repository, foreign base, arbitrary URL, default or
-  protected branch, and any `fix-pr` target whose head points at the default or
-  protected branch, a fork, or any repository/ref other than the operator-
-  resolved PR head. Re-read live PR/repository state before publication.
+- Reject an unexpected repository, foreign base, arbitrary URL, or publication
+  to the base repository's default/protected refs. Reject any `fix-pr`
+  publication whose repository/ref no longer matches the operator-resolved PR
+  head identity. Re-read live PR/repository
+  state before publication. A fork head is not itself forbidden: preserve the
+  actual head repository/ref, never substitute a same-named base branch, and
+  return actionable `NeedsHuman` if the configured identity cannot write that
+  head (#94). #118 settles the exact fork writability and protected-head policy.
 - The harness publishes an integration commit as a bounded git bundle/artifact.
   The broker validates the objects and target ref, verifies the proposed update
   is a fast-forward from the live tip, and uses a provider-supported conditional
@@ -354,7 +365,8 @@ is.
   author trusted status. Keep legacy routing labeled insecure until replaced or
   until a bounded adapter is independently proven to preserve the isolation
   contract. No false flag-day promise.
-- **Secure replacement:** add the three-pod topology and native harness/worker
+- **Secure replacement:** add isolated harness/worker pods and the separately
+  deployed trusted broker selected by #120, plus the native harness/worker
   protocol. Preserve the coordinator, source, checkpoint, and publication
   contracts at their interfaces; route runs to the secure path only when the
   full boundary and evidence are implemented and tested.
@@ -375,8 +387,10 @@ and the acceptance tests below are satisfied.
   reach broker/forge/API/model gateway, and can return only untrusted artifacts.
   Tampered summaries and bundles are rejected or treated as data.
 - **Broker policy:** deny merge, force push, default/protected refs, foreign
-  base/repository, fork or unexpected `fix-pr` head, arbitrary URLs, comments
-  that trigger proxying, stale expected OIDs, and ref races. Verify semantic
+  base/repository, unexpected `fix-pr` head identity, arbitrary URLs, comments
+  that trigger proxying, stale expected OIDs, and ref races. Verify an allowed
+  writable fork head works without substituting a same-named base branch; an
+  unwritable fork returns actionable `NeedsHuman` (#94). Verify semantic
   validation on model-influenced requests, not just certificate checks.
 - **Publication:** validate artifacts before integration; publish only a
   non-force fast-forward, then observe the remote ref; concurrent update fails
@@ -405,7 +419,8 @@ and the acceptance tests below are satisfied.
    contract, including repo/base/PR-head pinning and provider capabilities.
 3. Define artifact format/size and validation (object/ref checks, base ancestry,
    path policy) without treating worker metadata as authority.
-4. Select workload-identity and per-run/shared broker deployment mechanisms.
+4. #120 selects workload identity and per-run versus shared broker deployment;
+   either choice must preserve run-scoped authorization and pod isolation.
 5. Define the narrow forge provider registration/configuration surface. It is
    deployment/control-plane configuration, not a `LaneProfile` field.
 6. Prove any OpenCode adapter's isolation and status guarantees before routing

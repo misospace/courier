@@ -531,9 +531,10 @@ authority.
   model-influenced operations; a separate trusted broker holds forge/git
   credentials and enforces the run's resolved repository and permitted-ref
   policy. The untrusted worker has no credentials, workload identity, or network
-  access. The three-pod boundary, semantic broker contract, and acceptance tests
-  are specified in [HARNESS.md](./HARNESS.md); they are not statements of current
-  implementation readiness.
+  access. The separated trust boundaries, semantic broker contract, and
+  acceptance tests are specified in [HARNESS.md](./HARNESS.md); #120 still
+  decides whether broker pods are per-run or shared. None of this is a claim
+  of current implementation readiness.
 - Merge remains a human gate. Neither the target broker nor autonomous roles may
   merge, mutate the queue, or access destinations outside the resolved policy.
   The target coordinator may request permitted publication, but cannot bypass
@@ -578,10 +579,12 @@ named items remain unresolved and must not be described as production-ready:
 - **#102 liveness:** production heartbeat/status evidence and safe handling of
   long silent tools remain unresolved; a stuck silent operation may remain
   wedged indefinitely.
-- **#80 broker policy:** specify operator-resolved run policy and race-safe
-  publication, including repository/base/PR-head pinning and provider semantics.
-- **#104 isolation:** select and prove workload identity and broker deployment;
-  implement and test the trusted-control/broker/untrusted-worker boundary.
+- **#80 broker policy:** #118 must specify operator-resolved run policy and
+  race-safe publication, including the actual writable fork head required by
+  #94, repository/base/PR-head pinning, and provider semantics.
+- **#104 isolation:** #120 must select and prove workload identity and per-run
+  versus shared broker deployment; implementation must test the separated
+  trusted-control/broker/untrusted-worker boundary.
 - **Artifact validation:** define artifact format/size and validate objects, refs,
   base ancestry, and policy without trusting worker metadata.
 - **Worker egress:** resolve legitimate dependency fetching without granting the
@@ -611,10 +614,11 @@ was superseded.
   OpenCode path exposes credentials to model-controlled processes and remains
   explicitly insecure. The settled target is trusted harness control, a trusted
   broker enforcing typed semantic forge/repository/ref policy, and an untrusted
-  isolated worker. This makes the executor/trust contract and division of
-  responsibilities explicit, while keeping implementation readiness honest;
-  #102 remains blocked until heartbeat/status evidence and long-silent-tool
-  liveness are resolved. [HARNESS.md](./HARNESS.md) is the detailed contract.
+  isolated worker. #120 selects the broker deployment topology; #118 settles
+  publication policy for the actual PR head, including writable forks (#94).
+  This makes the trust contract explicit without prematurely fixing those
+  decisions. #102 remains blocked until heartbeat/status evidence and
+  long-silent-tool liveness are resolved. [HARNESS.md](./HARNESS.md) is the detailed contract.
   This supersedes the 2026-09-22 generic-MCP-only decision below without
   changing its historical rationale. (#8, #80, #104, #102)
 - **2026-09-25 — Separate safe scratch from durable dirty-work recovery.**
