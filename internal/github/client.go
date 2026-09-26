@@ -110,6 +110,7 @@ type UpdatePullRequestRequest struct {
 	Body                string `json:"body,omitempty"`
 	State               string `json:"state,omitempty"`
 	Base                string `json:"base,omitempty"`
+	Draft               bool   `json:"draft,omitempty"`
 	MaintainerCanModify *bool  `json:"maintainer_can_modify,omitempty"`
 }
 
