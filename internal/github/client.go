@@ -120,6 +120,9 @@ type CreatePullRequestRequest struct {
 
 // UpdatePullRequestRequest is the payload for updating a pull request. A
 // field omitted from this value is left unchanged by GitHub.
+//
+// The draft state is not a field here on purpose: GitHub's PATCH endpoint
+// does not accept it, so draft is only set when a pull request is created.
 type UpdatePullRequestRequest struct {
 	Title               string `json:"title,omitempty"`
 	Body                string `json:"body,omitempty"`
