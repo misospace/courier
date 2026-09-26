@@ -892,6 +892,29 @@ func TestOpenCodeConfigScratchPermissionLeastPrivilege(t *testing.T) {
 	}
 }
 
+func TestOpenCodeConfigContinuesLoopOnDeny(t *testing.T) {
+	raw, err := marshalOpenCodeConfig(map[string]string{"coordinator": "litellm/qwen"}, "", "", "")
+	if err != nil {
+		t.Fatalf("marshalOpenCodeConfig() error = %v", err)
+	}
+
+	var config map[string]any
+	if err := json.Unmarshal(raw, &config); err != nil {
+		t.Fatalf("opencode config = %q, not valid JSON: %v", raw, err)
+	}
+
+	experimental, ok := config["experimental"].(map[string]any)
+	if !ok {
+		t.Fatalf("experimental = %#v, want an object; an unattended run needs continue_loop_on_deny", config["experimental"])
+	}
+	if experimental["continue_loop_on_deny"] != true {
+		t.Fatalf("experimental.continue_loop_on_deny = %#v, want true so a denied tool call does not end the run", experimental["continue_loop_on_deny"])
+	}
+	if _, ok := config["permission"].(map[string]any)["github_merge*"]; !ok {
+		t.Fatal("permission lost the merge deny; continuing after a denial must not loosen any permission")
+	}
+}
+
 func TestCoordinatorPromptIncludesScratchHint(t *testing.T) {
 	const scratchPath = "/var/tmp/courier-scratch"
 	const framing = "single GPU; keep parallelism modest"
