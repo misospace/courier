@@ -14,6 +14,10 @@ const (
 	OpenCodeExitNeedsHuman = 2
 )
 
+// scratchHint is a usability hint for temporary files, not the security
+// boundary; the boundary is the OpenCode permission config.
+var scratchHint = fmt.Sprintf("Use the Courier scratch directory at %s (also set as TMPDIR) for all temporary work, and tell any delegated sub-agents to do the same.", scratchPath)
+
 // OpenCode is the temporary headless executor. It intentionally only wraps
 // one non-interactive invocation; checkpointing and resume belong to the
 // custom harness that will replace it.
@@ -95,7 +99,7 @@ func prompt(inv Invocation) string {
 	goal := strings.TrimSpace(inv.Goal)
 	framing := strings.TrimSpace(inv.Framing)
 	if framing == "" {
-		return goal
+		return goal + "\n\n" + scratchHint
 	}
-	return goal + "\n\nLane framing:\n" + framing
+	return goal + "\n\nLane framing:\n" + framing + "\n\n" + scratchHint
 }

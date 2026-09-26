@@ -56,30 +56,43 @@ judgment, instead of boxing it in with gates, caps, and one-shot pods.
 
 ## Architecture
 
+The deployed legacy path is one pod in which OpenCode, model-controlled tools,
+and forge credentials share a trust boundary; it is explicitly insecure. The
+target path in [HARNESS.md](./HARNESS.md) separates trusted harness control,
+trusted broker, and untrusted worker. The target is a design, not a claim that
+all workers or isolation controls are implemented or ready.
+
 ```
- sources                      operator (Courier)                 coordinator pod
- ┌─────────┐   creates    ┌──────────────────────┐  launches   ┌───────────────┐
- │dispatch │─────────────▶│ reconcile CoderRun    │────────────▶│ harness       │
- │gh-label │              │  - admit (concurrency)│             │  coordinator  │
- │cron     │              │  - claim source       │  heartbeat  │   ├ coder     │
- │cli / web│◀─── status ──│  - launch / resume    │◀────────────│   └ reviewer  │
- └─────────┘  transitions │  - liveness / reap    │  checkpoint │  git · MCP    │
-                          └──────────────────────┘  (CR status) └───────────────┘
-                                                                  │ commits/PR
-                                                                  ▼
-                                                             GitHub (branch, PR, CI)
+ sources                       operator (Courier)                legacy: one pod
+ ┌─────────┐   creates    ┌───────────────────────┐  launches   ┌────────────────┐
+ │dispatch │─────────────▶│ reconcile CoderRun    │────────────▶│ OpenCode +     │
+ │gh-label │              │  - admit / claim      │             │ model tools    │
+ │cron     │              │  - launch / resume    │   status    │ + credentials  │
+ │cli / web│◀─── status ──│  - liveness / reap    │◀────────────│ insecure       │
+ └─────────┘              └───────────────────────┘             └────────────────┘
+                                    │ target: control / broker / worker
+                                    ▼
+                        trusted harness ──▶ trusted broker ──▶ forge/git
+                              │
+                              └──▶ untrusted, isolated worker
 ```
 
 - **Sources** create `CoderRun` objects. A source adapter is also how work-state
   flows back (claim, in-progress, in-review, needs-human).
 - **The operator** reconciles `CoderRun`s: admits under a lane's concurrency
-  limit, claims the work in its source, launches (or resumes) a coordinator pod,
-  watches liveness, and drives phase transitions.
-- **The coordinator pod** runs the harness: a coordinator model that plans and
-  delegates to coder/reviewer sub-agents, with git, a scoped GitHub credential,
-  and MCP tools. It commits per completed unit, checkpoints to the CR status,
-  and heartbeats.
-- **GitHub** holds the durable output: the branch, the commits, the PR, CI.
+  limit, claims the work in its source, launches (or resumes) the current legacy
+  pod or, when implemented, the target harness topology, watches liveness, and
+  drives phase transitions.
+- **Legacy coordinator pod (current):** OpenCode and model-controlled tools share
+  a pod with forge credentials. Prompt permissions, process separation, MCP, and
+  NetworkPolicy do not make this boundary secure.
+- **Target harness (designed, not yet established):** trusted control owns model
+  calls, orchestration, integration, and trusted status requests; a trusted broker
+  holds credentials and enforces semantic forge, git-repository, and ref policy;
+  an isolated untrusted worker runs model-controlled shell without credentials or
+  network access. See [HARNESS.md](./HARNESS.md) for the detailed contract,
+  blockers, and acceptance criteria.
+- **The forge and git** hold durable output: branches, commits, PRs, and CI.
 
 ## The coordinator
 
@@ -141,27 +154,14 @@ no attempt counter anywhere in the spec.
 
 ### Own harness, not headless opencode
 
-The coordinator ensemble already exists and is tuned in opencode. It is tempting
-to run opencode headless in the pod. We won't, for one disqualifying reason:
-**opencode needs a human to re-prompt it after a pod or backend-model restart.**
-An operator exists to run work unattended across restarts; an executor that
-requires a human to resume is structurally incompatible with that.
-
-So Courier builds its own harness. What is rebuilt is only the *executor* — an
-agent loop, a spawn-sub-agent tool, litellm model bindings, an MCP client, and
-resume-from-checkpoint. The expensive, tuned part — the delegation prompts — is
-just strings and ports over. The executor's headline capability, the thing
-opencode structurally lacks, is **durable, resumable run state** (see
-Checkpointing).
-
-> The harness executor is the largest single build and needs its own detailed
-> design pass. This document specifies its *contract* (heartbeat, checkpoint,
-> commit-per-brief, terminal signals); its internals are deferred.
-
-**V1 path:** to de-risk, V1 may wrap opencode as a stand-in executor to prove the
-operator, sources, and dispatch loop — accepting "manual re-prompt on restart" as
-a *known* V1 gap. V2 swaps in the resumable harness. The restart-resilience is
-exactly the V1→V2 delta, so it's a clean seam, not a rewrite.
+The coordinator method and prompts are proven in opencode, but the current
+single-pod OpenCode bootstrap is a legacy, explicitly insecure execution path:
+model-controlled processes can access credentials available in that pod, and
+prompt permissions do not establish isolation. The target is a native resumable
+harness with trusted control, a credential-holding policy-enforcing broker, and
+an untrusted isolated worker. Its contract and outstanding blockers are detailed
+in [HARNESS.md](./HARNESS.md); describing that target does not imply that its
+executor or worker isolation is implemented or production-ready.
 
 ## Contention and concurrency
 
@@ -210,18 +210,31 @@ added later.
 
 No wall-clock. Courier bounds *stuck*, never *duration*.
 
-The only safe progress signal is **successful model streaming or a completed/
-in-flight tool call** — real activity. Commits are unsafe (opencode-style runs
-commit late; a deep sub-agent has none for a long time) and CI state is unsafe
-for the same reason. "Successful" is load-bearing: a model that is down and being
-retry-stormed is active but not successful, and should be allowed to die.
+The only safe progress signal is **successful model streaming or a completed
+tool call** — real activity. Commits are unsafe (opencode-style runs commit
+late; a deep sub-agent has none for a long time) and CI state is unsafe for the
+same reason. A merely in-flight tool call does not count: counting it, and
+"keeping the heartbeat warm" on it, is the superseded design — a wedged silent
+tool would then look alive (#102). "Successful" is load-bearing: a model that is
+down and being retry-stormed is active but not successful, and should be allowed
+to die.
 
-- The harness writes an **activity heartbeat** to the CR status on successful
-  stream chunks and tool-call boundaries, and keeps it warm while a long tool
-  call (a big test suite) is in flight.
-- The operator **reaps on heartbeat stall** past a generous window — the run is
-  wedged. It does *not* parse logs to decide this; control decisions must not
-  depend on log-parsing, which is fragile exactly when a run is wedged.
+- The target harness writes an **activity heartbeat** to CR status on
+  successful stream chunks and verified tool boundaries. Production legacy pods
+  currently do not populate heartbeat, checkpoint, or `lastCommit` (#102).
+- **Superseded, and now designed:** the earlier design "kept the heartbeat
+  warm" while a long tool call (a big test suite) was in flight. An in-flight
+  tool is not liveness evidence, and the harness must not emit a heartbeat it
+  has not earned — no fake heartbeat. Safe handling of the long silent tool is
+  settled by #119 ([HARNESS.md](./HARNESS.md) §6): a harness-owned
+  **active-operation set** (op IDs, owning control-pod UID, worker-pod UID,
+  diagnostic dispatch time) is persisted *before* dispatch. It suppresses
+  stale-heartbeat reaping only while the operator independently observes the
+  matching control and worker pods running. The heartbeat carries the
+  control-pod UID to fence old activity. There is no duration cap; a genuinely wedged tool (alive, silent) is not detected — the escape is
+  manual `needs-human`. This is an intentional safety tradeoff (indefinite
+  wedge over false reap), not a liveness proof. #102 stays blocked for
+  production until #126 implements it and a production e2e proves the behavior.
 - The coordinator **self-declares stuck** (can't get CI green after real
   attempts, missing access, ambiguous ask) → `needs-human`.
 - A pod that dies (infra) or is reaped is relaunched and resumed. A **crashloop**
@@ -253,10 +266,13 @@ to false-kill genuinely slow, varied work.
 you.** Everything the world already knows is re-read fresh on resume, and the
 world wins on conflict.
 
-- **Checkpoint (CR status, kilobytes):** the plan, the ordered list of completed
-  briefs with their compact handoffs, the PR ref, the last-pushed commit, the
-  phase. This is the reasoning scaffolding, unrecoverable from the world. Compact
-  handoffs keep this well under etcd's ~1.5 MB object limit.
+- **Checkpoint (CR status, kilobytes):** only the plan and ordered completed
+  briefs with their compact handoffs (`id`, summary, commit). PR/phase state,
+  branch, and last-pushed commit belong to ordinary run status and are recovered
+  or verified from the external world where applicable; they are not checkpoint
+  fields. Compact handoffs keep this well under etcd's ~1.5 MB object limit.
+  The current `Checkpoint` type and trusted status contract are detailed in
+  [HARNESS.md](./HARNESS.md).
 - **Re-read on resume (the world):** git branch and commits, PR state, CI status,
   source/dispatch state. Never checkpointed; always looked up.
 - **Workspace: ephemeral `emptyDir`,** rebuilt from git on every start. Nothing
@@ -407,8 +423,9 @@ it modest" with `concurrency: 1`. Same schema, no local assumption baked in.
   in-progress.
 - **Running** — pod launches: ephemeral workspace, clone, **adopt the branch if it
   exists and base-sync first**, inject LaneProfile framing + roles, wire the MCP
-  tools, set log level from `debug`. The pod heartbeats and checkpoints to
-  status and commits per brief. Exit `0` transitions to **Verifying** before
+  tools, set log level from `debug`. The target harness commits per brief and
+  writes heartbeat and checkpoint to status; the legacy bootstrap does not
+  populate these fields (#102). Exit `0` transitions to **Verifying** before
   any external observation, releasing the lane capacity. Exit `2` transitions
   to **NeedsHuman**; any other exit transitions to **Failed**. A pod death or
   heartbeat stall relaunches/resumes it; a crashloop reaches NeedsHuman.
@@ -494,15 +511,17 @@ core retry or a metadata-hash substitute.
 
 ## MCP surface
 
-The coordinator pod gets:
+The legacy coordinator pod currently receives forge access through MCP, alongside
+model-controlled tools and credentials. MCP is a tool interface, not a trust or
+security boundary; this path is explicitly insecure. In the target architecture,
+model-influenced forge requests pass through trusted control code and a trusted
+broker that enforce semantic forge, repository, and ref policy. MCP may be used
+as a provider interface only where those same typed semantics are enforced. The
+MCP/provider contract and blockers are detailed in [HARNESS.md](./HARNESS.md).
 
-- **GitHub** — read (issues, PR feedback, code, CI/checks) **and** write for PR
-  operations (create, push, comment). **Not merge.** "The autonomous agent
-  cannot land code on its own" is the security property that matters; everything
-  short of merge is reviewable. The blast radius of a hallucinating coordinator
-  is "opened a bad PR."
-- **context7** — library documentation.
-- **metrics mini-MCP** — current model load.
+Other possible tools include **context7** for library documentation and the
+optional **metrics mini-MCP** for current model load; neither grants forge
+authority.
 
 Availability is preflighted: before the goal runs, the bootstrap makes one
 bounded check of the configured servers using the run's own config and
@@ -514,29 +533,33 @@ only informs.
 
 ## Security and boundaries
 
-- The coordinator can read, push a branch, and open/update a PR. It cannot merge,
-  cannot mutate the queue, cannot make an irreversible outward change.
-- **Deployment invariant:** the repository's default branch is protected so
-  merge remains a human-maintainer action, never a Courier one. The Courier
-  identity is not an administrator and has no bypass permission for branch
-  protection.
-  Courier's runtime push identity must be a dedicated GitHub App installation
-  token or a fine-grained PAT scoped to the work repository, with permission to
-  trigger the repository's workflows. It must not be an Actions
-  `GITHUB_TOKEN`, whose lifecycle and permissions are tied to an individual
-  workflow run.
-- A raw push credential can still write to any ref that the credential permits;
-  branch protection is therefore a required deployment control, not a property
-  supplied by the GitHub client. Scope the push credential to the work
-  repository and keep its permissions no broader than the coordinator needs.
-  The GitHub API credential may be separate from the push credential and should
-  be narrower when the deployment only needs PR, comment, and check-run access.
+- **Current legacy mode is insecure:** the coordinator pod includes model-
+  controlled processes and forge credentials, and its raw push credential may
+  write any ref the credential permits. MCP restrictions, process conventions,
+  and prompt-level merge denial do not contain a compromised or misbehaving
+  process. The existing deployment must rely on credential scope and protected
+  default-branch configuration as external mitigations, not as a semantic ref
+  boundary.
+- **Target boundary:** trusted harness control makes model calls and validates
+  model-influenced operations; a separate trusted broker holds forge/git
+  credentials and enforces the run's resolved repository and permitted-ref
+  policy. The untrusted worker has no credentials, workload identity, or network
+  access. The separated trust boundaries, semantic broker contract, and
+  acceptance tests are specified in [HARNESS.md](./HARNESS.md); #120 still
+  decides whether broker pods are per-run or shared. None of this is a claim
+  of current implementation readiness.
+- Merge remains a human gate. Neither the target broker nor autonomous roles may
+  merge, mutate the queue, or access destinations outside the resolved policy.
+  The target coordinator may request permitted publication, but cannot bypass
+  broker policy.
 - Source-state transitions (claim, in-review, needs-human, resolve) are the
   operator's, done by deterministic code — the one place non-determinism would be
   dangerous, kept mechanical.
-- The pod holds whatever provider credentials its lane needs — an Anthropic,
-  OpenAI, or MiniMax API token, a local endpoint's key, any combination. These
-  are a per-deployment secret concern; the core assumes no particular provider.
+- Provider credentials for model access are a per-deployment secret concern,
+  and the core assumes no particular provider. In legacy mode the pod itself
+  holds whatever its lane needs (an Anthropic, OpenAI, or MiniMax token, a
+  local endpoint's key, any combination); in the target design the provider key
+  belongs to trusted harness control, and workers do not call models directly.
 - Secrets are redacted from logs before stdout.
 - Dispatch is an adapter; the product boundary (dispatch is not Courier, Courier
   is not dispatch) is preserved in the interface.
@@ -561,10 +584,27 @@ only informs.
 - **The busy-loop (spinning) detector** — the conservative content-based V2
   described under Liveness.
 
-## Open questions
+## Open questions and blockers
 
-- The harness executor internals (agent loop, spawn-sub-agent tool,
-  resume-from-checkpoint) — needs its own design pass.
+The harness executor contract is settled in [HARNESS.md](./HARNESS.md); these
+named items remain unresolved and must not be described as production-ready:
+
+- **#102 liveness:** #119 settles safe handling of long silent tools in
+  [HARNESS.md](./HARNESS.md) §6; #126 still must implement the status path and
+  operator decision, then prove it in production e2e. A live wedged silent tool
+  may remain wedged indefinitely (an intentional safety tradeoff).
+- **#80 broker policy:** #118 must specify operator-resolved run policy and
+  race-safe publication, including the actual writable fork head required by
+  #94, repository/base/PR-head pinning, and provider semantics.
+- **#104 isolation:** #120 must select and prove workload identity and per-run
+  versus shared broker deployment; implementation must test the separated
+  trusted-control/broker/untrusted-worker boundary.
+- **Artifact validation:** define artifact format/size and validate objects, refs,
+  base ancestry, and policy without trusting worker metadata.
+- **Worker egress:** resolve legitimate dependency fetching without granting the
+  untrusted worker arbitrary network access.
+- **OpenCode adapter:** prove isolation and status guarantees before any secure
+  routing; otherwise retain it only as explicitly insecure legacy mode.
 - The exact mechanics of injecting `LaneProfile` framing + roles into the
   coordinator prompt and sub-agent bindings.
 - The web UI and CLI adapter surfaces.
@@ -576,6 +616,41 @@ A running log of architectural decisions and their reasoning, newest first. The
 body above describes the current architecture; this log preserves *why* and what
 was superseded.
 
+- **2026-09-25 — #119 settles the long-tool liveness design.** A silent
+  legitimate operation and a wedged one are observationally identical, so no
+  design can both reap a wedged silent tool in finite time and never reap a
+  legitimate one; the design chooses to never false-reap. A harness-owned
+  active-operation set (op IDs, owning control-pod UID, worker-pod UID) is
+  persisted before dispatch and suppresses stale-heartbeat reaping only while
+  the operator independently observes those pods running. A
+  pod-UID-fenced heartbeat prevents prior activity from resetting the new
+  incarnation's crashloop streak. There is no duration cap; a wedged tool is not detected and the escape is manual `needs-human`.
+  This is an intentional safety tradeoff, not a liveness proof; #102 now blocks
+  on #126 implementation and a production e2e, not on the design.
+  ([HARNESS.md](./HARNESS.md) §6) (#119, #102)
+- **2026-09-25 — A long in-flight tool call no longer keeps the heartbeat warm.**
+  The earlier liveness design treated a long in-flight tool call as activity and
+  "kept the heartbeat warm" through it. That is superseded: an in-flight tool is
+  not liveness evidence, and the harness must not emit a heartbeat it has not
+  earned (no fake heartbeat), so a wedged silent tool no longer looks alive.
+  Safe handling of long silent tools — suppressing reap without a fake
+  heartbeat — is designed in #119 ([HARNESS.md](./HARNESS.md) §6) as an
+  intentional safety tradeoff: a harness-owned active-operation set suppresses
+  stale-heartbeat reaping while the operator observes a matching task running,
+  with no duration cap and no wedge detection. #102 now blocks on #126
+  implementation and a production e2e, not on the design. (#102, #119)
+- **2026-09-25 — Separate the target trust boundary from legacy MCP access.**
+  MCP is a tool interface, not a security boundary: the current single-pod
+  OpenCode path exposes credentials to model-controlled processes and remains
+  explicitly insecure. The settled target is trusted harness control, a trusted
+  broker enforcing typed semantic forge/repository/ref policy, and an untrusted
+  isolated worker. #120 selects the broker deployment topology; #118 settles
+  publication policy for the actual PR head, including writable forks (#94).
+  This makes the trust contract explicit without prematurely fixing those
+  decisions. #102 remains blocked until heartbeat/status evidence and
+  long-silent-tool liveness are resolved. [HARNESS.md](./HARNESS.md) is the detailed contract.
+  This supersedes the 2026-09-22 generic-MCP-only decision below without
+  changing its historical rationale. (#8, #80, #104, #102)
 - **2026-09-25 — Separate safe scratch from durable dirty-work recovery.**
   A per-run scratch mount and narrow OpenCode permissions address unattended
   temp-file use without expanding access to `/tmp` or polluting the checkout
@@ -635,7 +710,9 @@ was superseded.
   a forge MCP wired under a generic slot; the deployment selects the provider
   (GitHub / GitLab / Forgejo / Bitbucket). Installing `gh` (or `glab`, `tea`, …)
   into the coordinator image was rejected: it hardcodes the forge into the one
-  place meant to be swappable. (#80, #87)
+  place meant to be swappable. This settled provider agnosticism, not a security
+  boundary; the 2026-09-25 decision above supersedes the MCP-only access model.
+  (#80, #87)
 - **2026-09-22 — Repository toolchains are per-lane runtime images, not baked
   into one universal coordinator image.** A `LaneProfile.runtimeImage` selects a
   coordinator image carrying the target repo's toolchain (e.g. `courier-go`
