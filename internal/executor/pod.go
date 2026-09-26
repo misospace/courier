@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"net/url"
+	"path"
 	"strings"
 
 	corev1 "k8s.io/api/core/v1"
@@ -28,6 +29,7 @@ const (
 	LabelLane      = "courier.misospace.dev/lane"
 	LabelDebug     = "courier.misospace.dev/debug"
 	runtimePath    = "/courier-runtime"
+	scratchPath    = "/var/tmp/courier-scratch"
 )
 
 // PodConfig controls runtime-specific details without putting provider or
@@ -206,6 +208,9 @@ func (b *PodBuilder) Build(run *courierv1alpha1.CoderRun, lane *courierv1alpha1.
 					Path:     "opencode.json",
 					FieldRef: &corev1.ObjectFieldSelector{FieldPath: "metadata.annotations['" + opencodeConfigAnnotation + "']"},
 				}}}},
+			}, {
+				Name:         "scratch",
+				VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{}},
 			}},
 			Containers: []corev1.Container{{
 				Name:            "coordinator",
@@ -226,6 +231,9 @@ func (b *PodBuilder) Build(run *courierv1alpha1.CoderRun, lane *courierv1alpha1.
 					Name:      "opencode-config",
 					MountPath: opencodeConfigMountPath,
 					ReadOnly:  true,
+				}, {
+					Name:      "scratch",
+					MountPath: scratchPath,
 				}},
 				SecurityContext: &corev1.SecurityContext{
 					AllowPrivilegeEscalation: boolPtr(false),
@@ -249,10 +257,16 @@ func podEnvironment(invocation Invocation, executorName string, config PodConfig
 	}
 	terminationFile := runtimePath + "/termination"
 	values := toKubernetesEnv(EnvironmentWithConfig(invocation, executorName, remoteURL, config.BaseBranch, config.OpenCode.Binary, config.OpenCode.Format, terminationFile, config.OpenCode.Agent))
-	values = append(values, corev1.EnvVar{
-		Name:  "OPENCODE_CONFIG",
-		Value: opencodeConfigMountPath + "/" + opencodeConfigFilename,
-	})
+	values = append(values,
+		corev1.EnvVar{
+			Name:  "OPENCODE_CONFIG",
+			Value: opencodeConfigMountPath + "/" + opencodeConfigFilename,
+		},
+		corev1.EnvVar{Name: "TMPDIR", Value: scratchPath},
+		corev1.EnvVar{Name: "TMP", Value: scratchPath},
+		corev1.EnvVar{Name: "TEMP", Value: scratchPath},
+		corev1.EnvVar{Name: "COURIER_SCRATCH_DIR", Value: scratchPath},
+	)
 	githubSecret := config.GitHubCredentialSecret
 	if githubSecret == "" {
 		githubSecret = config.GitCredentialSecret
@@ -368,5 +382,19 @@ func (c PodConfig) Validate() error {
 	if strings.TrimSpace(c.WorkspacePath) == "" || !strings.HasPrefix(c.WorkspacePath, "/") {
 		return fmt.Errorf("executor: workspace path must be absolute: %q", c.WorkspacePath)
 	}
+	if pathsOverlap(c.WorkspacePath, scratchPath) {
+		return errors.New("executor: workspace path must not overlap the scratch path")
+	}
 	return nil
+}
+
+// pathsOverlap reports whether two absolute paths are equal or one is a
+// path-segment ancestor of the other.
+func pathsOverlap(a, b string) bool {
+	a = path.Clean(a)
+	b = path.Clean(b)
+	if a == b {
+		return true
+	}
+	return strings.HasPrefix(a, b+"/") || strings.HasPrefix(b, a+"/")
 }
