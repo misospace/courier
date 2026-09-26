@@ -9,6 +9,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -19,6 +20,7 @@ import (
 	"os/exec"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/misospace/courier/internal/executor"
 	"github.com/misospace/courier/internal/git"
@@ -198,6 +200,94 @@ func (r reporter) terminate(result termination) {
 	})
 }
 
+const mcpPreflightTimeout = 30 * time.Second
+
+// preflightCapabilities runs a bounded `opencode mcp list` with the run's
+// OpenCode binary and environment and returns parsed capability status. It
+// never fails the run: on exec error, non-zero exit, timeout, or unparsable
+// output it returns what it could parse (often nil). Probe stderr is
+// discarded and only stdout is parsed, so unrelated CLI error text is never
+// parsed as a capability; nothing is routed to the run's streams, so raw
+// tool output stays out of the run log and away from the model.
+func preflightCapabilities(ctx context.Context, command executor.Command, dir string) []executor.MCPCapability {
+	probeCtx, cancel := context.WithTimeout(ctx, mcpPreflightTimeout)
+	defer cancel()
+	probe := exec.CommandContext(probeCtx, command.Binary, command.Args...)
+	// Bound waiting for a grandchild that holds the output pipe after the
+	// context is done.
+	probe.WaitDelay = 5 * time.Second
+	if strings.TrimSpace(dir) != "" {
+		probe.Dir = dir
+	}
+	var out bytes.Buffer
+	probe.Stdout = &out
+	probe.Stderr = io.Discard
+	_ = probe.Run()
+	return executor.ParseMCPStatus(out.String())
+}
+
+// unavailableCapabilities returns the names of capabilities found configured
+// but unavailable.
+func unavailableCapabilities(caps []executor.MCPCapability) []string {
+	var names []string
+	for _, c := range caps {
+		if !c.Available {
+			names = append(names, c.Name)
+		}
+	}
+	return names
+}
+
+// capabilityNote composes a concise, safe framing note for unavailable
+// capabilities, or "" when none. Names are configuration identifiers and
+// reasons are connection-error text, never config or credentials.
+func capabilityNote(caps []executor.MCPCapability) string {
+	var items []string
+	for _, c := range caps {
+		if c.Available {
+			continue
+		}
+		if reason := strings.TrimSpace(c.Reason); reason != "" {
+			items = append(items, c.Name+" ("+reason+")")
+		} else {
+			items = append(items, c.Name)
+		}
+	}
+	if len(items) == 0 {
+		return ""
+	}
+	return "Capability status: these configured tool servers are UNAVAILABLE: " + strings.Join(items, ", ") + ". Do not probe the environment or config to find their tools; if the goal cannot proceed without them, report that the run is blocked on the missing capability instead of improvising."
+}
+
+// emitCapabilityStatus reports the preflight as a structured diagnostic.
+// Status is error when any configured capability is unavailable, else ok.
+// Detail carries each server's name, availability, and safe reason and is
+// marked Verbose so it is visible on non-debug runs; the emitter redacts it.
+func (r reporter) emitCapabilityStatus(caps []executor.MCPCapability) {
+	status := courierlog.StatusOK
+	servers := make([]map[string]any, 0, len(caps))
+	for _, c := range caps {
+		if !c.Available {
+			status = courierlog.StatusError
+		}
+		servers = append(servers, map[string]any{"name": c.Name, "available": c.Available, "reason": c.Reason})
+	}
+	err := r.events.Emit(courierlog.Event{
+		Type:    courierlog.EventCapabilityStatus,
+		RunID:   r.cfg.RunID,
+		Repo:    r.cfg.Repo,
+		Ref:     r.cfg.Ref,
+		Mode:    r.cfg.Mode,
+		Model:   r.cfg.Model,
+		Status:  status,
+		Verbose: true,
+		Detail:  map[string]any{"servers": servers},
+	})
+	if err != nil {
+		fmt.Fprintf(r.stderr, "courier: dropped %s event: %v\n", courierlog.EventCapabilityStatus, err)
+	}
+}
+
 func run(ctx context.Context, stdout, stderr io.Writer) int {
 	cfg, err := readConfig(os.Getenv)
 	report := newReporter(stdout, stderr, cfg)
@@ -230,7 +320,7 @@ func run(ctx context.Context, stdout, stderr io.Writer) int {
 		return 1
 	}
 
-	if code := report.guardAdoption(ctx); code != 0 {
+	if code, stop := report.guardAdoption(ctx); stop {
 		return code
 	}
 
@@ -256,6 +346,13 @@ func run(ctx context.Context, stdout, stderr io.Writer) int {
 	})
 
 	runtime := executor.OpenCode{Binary: cfg.OpenCodeBinary, Format: cfg.OpenCodeFormat, Agent: cfg.OpenCodeAgent}
+	caps := preflightCapabilities(ctx, runtime.MCPStatusCommand(), workspace.Directory)
+	if len(caps) > 0 {
+		report.emitCapabilityStatus(caps)
+	}
+	if note := capabilityNote(caps); note != "" {
+		cfg.Framing = strings.TrimSpace(cfg.Framing + "\n\n" + report.red.Redact(note))
+	}
 	command := runtime.Command(executor.Invocation{
 		Goal:      cfg.Goal,
 		Model:     cfg.Model,
@@ -308,7 +405,11 @@ func run(ctx context.Context, stdout, stderr io.Writer) int {
 		report.terminate(termination{Phase: "NeedsHuman", Result: "needs-human", ExitCode: exitNeedsHuman, Reason: "opencode exited successfully with uncommitted workspace changes"})
 		return exitNeedsHuman
 	default:
-		report.terminate(termination{Phase: "NeedsHuman", Result: "needs-human", ExitCode: exitNeedsHuman, Reason: "opencode exited successfully without producing a commit or workspace changes"})
+		reason := "opencode exited successfully without producing a commit or workspace changes"
+		if names := unavailableCapabilities(caps); len(names) > 0 {
+			reason += "; configured capability unavailable: " + strings.Join(names, ", ")
+		}
+		report.terminate(termination{Phase: "NeedsHuman", Result: "needs-human", ExitCode: exitNeedsHuman, Reason: reason})
 		return exitNeedsHuman
 	}
 }
@@ -326,42 +427,51 @@ func envIdentity() config {
 }
 
 // guardAdoption enforces the resolve-issue invariant that a deterministic
-// branch may be adopted only when it is orphaned. If the branch already
-// exists on the remote, no pull request may exist for that head; if one
-// does, a human decides, and the run stops before Prepare or OpenCode.
-// It returns 0 when the run may proceed.
-func (r reporter) guardAdoption(ctx context.Context) int {
+// branch may be adopted only when it is orphaned. If the branch already exists
+// on the remote with an open pull request, the run refuses to adopt it but
+// reports that PR for review by exiting 0, so the operator's world-verification
+// publishes the existing pull request to the source as in-review. A branch
+// whose only pull requests are closed or merged is handed to a human. It
+// returns (0, false) when the run may proceed to Prepare, or a terminal
+// (code, true) once it has emitted the run's handoff.
+func (r reporter) guardAdoption(ctx context.Context) (int, bool) {
 	if r.cfg.Mode != "resolve-issue" {
-		return 0
+		return 0, false
 	}
 	exists, err := git.RemoteBranchExists(ctx, r.cfg.RemoteURL, r.cfg.Branch)
 	if err != nil {
 		r.terminate(termination{Phase: "Failed", Result: "failure", ExitCode: 1, Reason: err.Error()})
-		return 1
+		return 1, true
 	}
 	if !exists {
-		return 0
+		return 0, false
 	}
 	owner, name, ok := splitOwnerRepo(r.cfg.Repo)
 	if !ok {
 		r.terminate(termination{Phase: "Failed", Result: "failure", ExitCode: 1, Reason: "resolve branch already exists on the remote and COURIER_REPO does not name an owner/repo; refusing adoption"})
-		return 1
+		return 1, true
 	}
 	client, err := github.NewClient(r.cfg.GitHubAPIBase, r.cfg.GitHubToken)
 	if err != nil {
 		r.terminate(termination{Phase: "Failed", Result: "failure", ExitCode: 1, Reason: err.Error()})
-		return 1
+		return 1, true
 	}
 	pulls, err := client.PullRequestsForHead(ctx, owner, name, r.cfg.Branch)
 	if err != nil {
 		r.terminate(termination{Phase: "Failed", Result: "failure", ExitCode: 1, Reason: err.Error()})
-		return 1
+		return 1, true
+	}
+	for _, pull := range pulls {
+		if pull.Head.Ref == r.cfg.Branch && strings.EqualFold(pull.State, "open") {
+			r.terminate(termination{Phase: "Verifying", Result: "success", ExitCode: exitSuccess, Reason: fmt.Sprintf("resolve branch already has open PR #%d; reporting the existing pull request to the source without adopting", pull.Number)})
+			return exitSuccess, true
+		}
 	}
 	for _, pull := range pulls {
 		r.terminate(termination{Phase: "NeedsHuman", Result: "needs-human", ExitCode: exitNeedsHuman, Reason: fmt.Sprintf("resolve branch already has PR #%d (%s); refusing adoption", pull.Number, pull.State)})
-		return exitNeedsHuman
+		return exitNeedsHuman, true
 	}
-	return 0
+	return 0, false
 }
 
 // splitOwnerRepo splits an owner/name repository identity on the final "/".

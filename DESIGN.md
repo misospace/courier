@@ -331,8 +331,11 @@ dead 12-hour run straight to Tier 3.
   step is always sync-to-base.
 
 Scope: **resolve-issue** adopts an orphaned branch only when a branch exists but
-no PR. **fix-pr** always adopts the existing PR's branch. A branch with a PR is
-never a resolve concern.
+no pull request points at it. When the deterministic branch already carries an
+**open** PR, the run refuses to adopt it and instead reports that PR to the
+source for review — a live PR means the work is in flight, not that a human is
+needed. A branch whose only PRs are closed or merged still refuses adoption and
+hands to a human. **fix-pr** always adopts the existing PR's branch.
 
 ## Observability and transcripts
 
@@ -523,6 +526,14 @@ Other possible tools include **context7** for library documentation and the
 optional **metrics mini-MCP** for current model load; neither grants forge
 authority.
 
+Availability is preflighted: before the goal runs, the bootstrap makes one
+bounded check of the configured servers using the run's own config and
+environment. A server that is configured but unreachable is named to the
+coordinator — in its framing, in a `capability.status` event, and in the
+no-work terminal reason — so the model knows the tool is absent instead of
+hunting for it. A failed optional capability never fails or gates the run; it
+only informs.
+
 ## Security and boundaries
 
 - **Current legacy mode is insecure:** the coordinator pod includes model-
@@ -650,6 +661,17 @@ was superseded.
   edits when its ephemeral pod is removed. Secure evidence storage, limits and
   retrieval need a separate design before implementation (#115). An explicit
   retry (#97) is a fresh attempt, not an implicit restoration.
+- **2026-09-25 — The executor informs the coordinator of unreachable MCP
+  capabilities.** Before the goal runs, the bootstrap performs one
+  liveness-bounded (30s, never a run timeout) `mcp list` preflight against the
+  same config and environment as the run. Configured-but-unavailable servers are
+  named in the coordinator's framing, emitted as a structured
+  `capability.status` diagnostic (redacted; detail forced visible because the
+  point is non-debug visibility), and appended to the terminal reason when the
+  run produced no work. Probe output never reaches the run's streams or the
+  prompt unredacted, and every probe failure mode degrades to "no
+  information." Informing never constrains: an unavailable optional
+  capability never fails a run. (#101)
 - **2026-09-25 — Dispatch owns follow-up attempt identity and settlement.**
   A retained run is historical, not a lease on all future review rounds.
   Queue-backed work already has a persisted `(id, generation)` identity;
@@ -703,3 +725,16 @@ was superseded.
   executor exits a run as `NeedsHuman` when the coordinator produced no commit or
   PR, rather than reporting success; the operator's world-verification (no PR →
   NeedsHuman) is the backstop. (#81)
+- **2026-09-26 — A resolve branch with an open PR is reported for review, not
+  blocked.** The adoption guard previously ended any resolve-issue run whose
+  deterministic branch already had a pull request as `NeedsHuman`, marking the
+  issue blocked while a PR (often a sibling `fix-pr` run started moments
+  earlier) was actively in flight. The guard now branches on state: an **open**
+  PR leaves the run refusing to adopt but exiting `0`, so the operator's
+  world-verification observes the real pull request and publishes it to the
+  source as `in-review` (`pr_opened`); a branch whose only PRs are closed or
+  merged still ends `NeedsHuman`, since a human must decide whether to reuse it.
+  This reuses the existing verify/observe path rather than adding a new terminal
+  state. Review-readiness is still the operator's to decide by re-reading the
+  world: a draft pull request or failing checks continues to hand the run to a
+  human. (#135)
