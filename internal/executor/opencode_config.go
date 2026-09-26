@@ -9,9 +9,18 @@ const (
 )
 
 type openCodeConfig struct {
-	Agents     map[string]openCodeAgent `json:"agent"`
-	Permission map[string]any           `json:"permission,omitempty"`
-	MCP        map[string]openCodeMCP   `json:"mcp,omitempty"`
+	Agents       map[string]openCodeAgent `json:"agent"`
+	Permission   map[string]any           `json:"permission,omitempty"`
+	MCP          map[string]openCodeMCP   `json:"mcp,omitempty"`
+	Experimental *openCodeExperimental    `json:"experimental,omitempty"`
+}
+
+// openCodeExperimental carries OpenCode's experimental switches. An unattended
+// run auto-rejects any permission prompt, and by default a rejection ends the
+// agent loop; continuing returns the denial to the model as a tool error
+// instead, so one denied probe does not cost the whole run.
+type openCodeExperimental struct {
+	ContinueLoopOnDeny bool `json:"continue_loop_on_deny"`
 }
 
 type openCodeAgent struct {
@@ -42,8 +51,9 @@ func marshalOpenCodeConfig(roles map[string]string, githubURL, context7URL, metr
 		agents[role] = openCodeAgent{Mode: "all", Model: model}
 	}
 	config := openCodeConfig{
-		Agents:     agents,
-		Permission: permission,
+		Agents:       agents,
+		Permission:   permission,
+		Experimental: &openCodeExperimental{ContinueLoopOnDeny: true},
 	}
 	config.MCP = make(map[string]openCodeMCP)
 	if githubURL != "" {
