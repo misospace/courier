@@ -264,45 +264,156 @@ The trusted integration tree and coordinator implementation must not be
 shell-accessible. A worker may receive another sanitized snapshot for a later
 task; it never receives the control pod's writable tree or credentials.
 
-## 6. Liveness and #102
+## 6. Long-tool liveness contract (#119)
 
-Do not use expiring in-flight leases or a wall-clock deadline to reap
-legitimate long-running work. Two distinct signals must not be conflated:
+**Limit of observation.** A legitimate silent build and an indefinitely wedged
+live build can have identical Kubernetes state, model-stream events, and tool
+results: a running worker, a quiet heartbeat, and no terminal event. With no
+independent progress oracle, no algorithm can both reap every wedged build in
+finite time and never reap a legitimate one. We choose safety: an acknowledged
+in-flight operation can suppress *heartbeat-stall* reaping for any duration.
+This does not make it live. A confirmed infrastructure death, explicit trusted
+cancellation, or a human decision still ends it. There is no operation-age
+limit, periodic keepalive, arbitrary-stdout heartbeat, process-alive heartbeat,
+or failed-model-retry heartbeat. #12 consequently detects stalls only where no
+valid in-flight operation protects them; a silent live wedge can hold lane
+capacity until a human intervenes. Expose that diagnostic and a manual
+`NeedsHuman` path rather than claiming automatic wedge detection.
 
-- **Heartbeat** — only independent, verifiable milestones: a successful
-  model-stream event, or a tool boundary that trusted control has verified.
-  Failed attempts, retries, and raw stdout are not milestones and never keep
-  a run alive.
-- **Active-operation record** — trusted control persists the dispatched tool
-  identity and brief in a harness-owned status field via the broker, so the
-  operator can observe it after a restart. It is cleared on trusted completion,
-  cancellation, or observed worker death. A stale record from a prior control
-  incarnation cannot suppress reaping of the new one; the operator binds it to
-  the pod UID and verifies that pod still exists. This is dispatch evidence,
-  not evidence of progress; #119 owns the exact schema and stall policy.
+### Target status and authority
 
-The long-tool dilemma resolves as follows. While an operation is recorded
-active and no verifiable milestone exists (a long silent build or test), the
-operator **cannot safely reap on a stale heartbeat** — the heartbeat is quiet
-by construction, not because the run is dead. Reaping is therefore
-**suppressed for the duration of the recorded active operation**, resuming
-only on an explicit trusted-supervisor terminal (the tool returned, complete
-or failed) or an infrastructure death signal (pod gone, node lost, OOM kill).
-A genuinely wedged tool process — alive, silent, making no progress — stays
-wedged indefinitely until the OS or Kubernetes reliably detects its death.
+#126 adds the following **new** harness-owned CR-status state and regenerates
+the CRD/deepcopy. It does not already exist in `CoderRunStatus` or
+`status.HarnessPatch`:
 
-This is an intentional safety tradeoff, not a proven-safe mechanism: it
-accepts an indefinite wedge over a false reap of legitimate long work. It is
-the current best answer and it is not liveness proof. **It does not resolve
-#102, which remains an open liveness problem / production blocker** (see
-§11).
+- `heartbeat` gains `coordinatorPodUID` alongside existing `at` and `kind`.
+  A stream chunk from *any* role-bound model session is an earned `stream`
+  heartbeat; a trusted completed tool boundary is an earned `tool` heartbeat.
+  Coalesce as today; retries, raw output, dispatch, cancellation, or a claimed
+  terminal result are not successful activity. Only a heartbeat whose UID
+  matches the **current** coordinator pod may reset the consecutive restart
+  streak or count as fresh for its incarnation.
+- `activeOperations` is a map keyed by a harness-generated `opID` unique within
+  the run, including across retries and pod restarts, for each concurrently
+  dispatched tool/subagent operation. Retries reuse that ID until the original
+  execution is conclusively completed or cancelled; brief IDs identify work
+  units, not transport attempts. Each value contains `briefID`,
+  `coordinatorPodUID`, `workerPodUID`, and `dispatchedAt` (diagnostic only).
+  This is dispatch evidence, **not** liveness or a checkpoint. No `preparing`
+  phase or time-based expiry exists. A single slot would falsely reap another
+  parallel subagent when one finishes; a set is required. The trusted control
+  process alone may request broker status patches for these fields; the worker
+  cannot write or impersonate them. The broker serializes per-run writes and
+  uses resource-version-conditional status updates (retry conflict after a
+  fresh read) so clearing one op cannot drop another op or another
+  incarnation's state. Ordinary unconditional merge patches are insufficient.
 
-No periodic timers and no fake heartbeats: the harness must not emit a
-heartbeat merely to look alive while a tool runs silently, and the
-active-operation record is a suppression signal, not a heartbeat. The
-crashloop/reaper behavior and status schema are not changed by this document
-alone; in particular, no new exit-code interpretation is wired into the
-operator here.
+The broker checks the run and current coordinator pod UID on each write, and
+refuses stale incarnations. A stale map entry is **ignored**, not trusted or
+silently adopted, after restart; new control rereads the world and starts its
+own operations with its own UID. Neither the operator nor a model writes the
+harness-owned heartbeat or map. No full transcript or running child process
+is treated as durable checkpoint state.
+
+### Start, finish, and failure ordering
+
+1. Obtain a run-owned worker pod (reusable or per-task) and observe its UID
+   and running shell container **before** starting a task. Multiple operations
+   may use one worker if its task API supports concurrency; each still has a
+   separate op ID and terminal observation. Worker provisioning is not an
+   active operation and does not suppress reap. A worker that is merely Pending
+   is not eligible for dispatch. Existing startup grace protects the control
+   pod while worker provisioning is in progress, but a provisioning hang after
+   that grace remains a control-side stall, not a protected long-running task.
+2. Persist the new map entry via the authenticated broker **before** sending
+   the task. If the write fails, do not dispatch. The broker write must be
+   acknowledged before dispatch; an uncertain acknowledgment is re-read.
+3. Dispatch the uniquely identified operation. If transport reports failure
+   ambiguously, do **not** clear merely because the RPC failed: the worker may
+   have accepted the task. Cancel it and observe its termination (or worker
+   death) before clearing. Redelivery of the same ID must not start a second
+   execution; only trusted control may retry with a reconciled result.
+4. On independently observed terminal completion, remove only that entry and
+   write the earned tool heartbeat **in the same conditional status update**.
+   On verified cancellation or death, remove only that entry **without** a success
+   heartbeat. If the clear fails, retain the entry and retry/reconcile; never
+   claim it cleared while an operation may still be executing. A late
+   completion from a fenced pod is ignored. Resuming ordinary stale-heartbeat
+   reaping after a clear is allowed (cancellation is not progress).
+5. A dead worker ends its operations as infrastructure failure; trusted
+   control cancels/reconciles remaining tasks and removes their entries. If
+   control itself dies, the operator's independent pod observation supersedes
+   those entries. Do not wait forever for a dead control process to clear
+   status. Relaunch may reconstruct reasoning from checkpoint and the world,
+   but not a dead in-flight tool's process memory.
+
+### Reap decision
+
+Before any destructive liveness decision, use an **uncached API read** for the
+run status and the run-owned control/worker pods (not just `r.Get`/`r.List` on
+the current controller-runtime cached client); #126 must wire a direct API
+reader for this decision. Read errors, uncertain identity, or contradictory
+observations mean **do not reap; requeue and retry observation** with a
+structured diagnostic, not a successful run heartbeat. If phase, resource
+version, or pod UID changes before deletion, re-evaluate. Delete with a
+Kubernetes UID precondition on the observed pod, never by name alone. The
+current `checkLiveness` implementation does neither and must change in #126.
+Persistent API unavailability is an infrastructure incident requiring human
+intervention, not proof the run is healthy.
+
+An entry protects only its matching control incarnation when that pod exists
+and is not terminating, and its recorded run-owned worker UID exists, is not
+terminating, and has a running worker shell container. Match pod owner UID and run
+identity as well as pod UID; a same-name replacement, another brief's pod, or an
+unrelated pod does not qualify. Any valid entry suppresses *stale-heartbeat*
+reaping of the control pod, regardless of age; an unrelated active operation
+cannot supply a heartbeat. Invalid or stale entries are ignored for
+suppression. A dead/missing control or worker triggers operator-owned
+infrastructure recovery after authoritative confirmation, including when
+heartbeat is nil;
+#126 must observe worker pod termination in `observeRunning` and fence stale
+entries. The operator ignores old entries rather than patching harness-owned
+fields; the new control incarnation may clear them via the broker after
+reconciling the world. No entry protects a dead pod.
+
+In the absence of valid entries, retain #12's behavior: a **nil heartbeat is
+not stall evidence**, a fresh current-incarnation heartbeat resets the
+crashloop streak, a stale current-incarnation heartbeat permits reap outside
+the existing observable-pod startup grace, and terminating pods are not
+re-deleted or double-counted. A previous incarnation's heartbeat can never
+reset the streak or be used to declare the new pod live. The existing
+`livenessWindow` governs heartbeat staleness and startup grace, **not** how
+long a tool may run. Do not infer an old timestamp belongs to the new pod.
+
+| Observation (authoritative) | Decision |
+|---|---|
+| Valid entry, control and worker running, heartbeat stale, even for hours | Suppress stall reap; report active operation and last earned activity. |
+| Valid entry, live worker silently wedged | Same decision; manual `NeedsHuman` intervention, no automatic wedge claim. |
+| Worker terminated/missing or control terminated/missing | No suppression; recover infrastructure independently of heartbeat, fence old UID. |
+| Only stale/foreign entries | Ignore entries; apply normal heartbeat and startup-grace rules to current incarnation. |
+| No valid entry; nil heartbeat | No heartbeat-stall reap; separately detect confirmed pod death. |
+| No valid entry; stale current heartbeat; startup grace ended | Reap observed control UID once, resume from world/checkpoint; crashloop backstop. |
+| Any status/pod observation fails or changes during decision | Defer action and re-observe; never use a stale cached snapshot to authorize deletion. |
+
+**Replayable acceptance tests (#126):** a long silent build stays protected
+beyond repeated liveness windows; an equally silent wedged live worker is
+*not* automatically detected and can be handed to a human; failed model
+streams and raw stdout never refresh heartbeat; two parallel operations
+remain protected when one completes; failed or ambiguous dispatch cannot
+clear a possibly running task; status-write failure prevents dispatch or
+retains an active entry until reconciled; a terminated worker and orphaned
+control recover without trusting worker assertions; prior-incarnation entries
+and heartbeat cannot shield a new pod or reset its streak; informer lag,
+concurrent status patches, and delete/recreate between read and reap never
+cause a wrong-UID deletion. Tests need fake clock, conflicting patches and
+real API-backed pod observations, not just prompt or log assertions. These
+are target tests once the isolated worker and broker exist, not tests the
+legacy single-pod executor can satisfy.
+
+#119 settles the design tradeoff and test contract. #102 remains blocked
+until #126 implements it and production e2e proves earned heartbeats, safe
+suppression, checkpoint/recovery and published `lastCommit`; no test can prove
+finite detection of an observationally indistinguishable live wedge.
 
 ## 7. Checkpoint, heartbeat, and publication ordering
 
@@ -398,23 +509,30 @@ and the acceptance tests below are satisfied.
   retry is idempotent. No test assumes forge push and status are atomic.
 - **Resume/status:** only trusted control writes status; checkpoint is not a
   world mirror; conflict recovery rereads git/PR/CI and follows the world.
-- **Liveness:** prove the exact successful stream/tool evidence path. Test
-  supervisor loss and silent operations; with a dispatch record showing an
-  operation active, verify a stale heartbeat does not trigger reap. No
-  lease-expiry or hidden timeout test may stand in for evidence; unresolved
-  cases block production #102.
+- **Liveness:** prove the exact successful stream/tool evidence path and the
+  §6 decision table. A valid active record (control pod present, worker
+  observed running, UIDs matching) suppresses stale-heartbeat reaping with
+  no duration cap; an invalid or absent record (control pod gone, worker
+  missing/terminated/UID-mismatched, or stale after a relaunch) does not.
+  A wedged live worker (valid record, silent) stays wedged — no automatic
+  terminal, manual `NeedsHuman` only. Test supervisor loss, silent
+  operations, retries that do not refresh the heartbeat, status-write errors
+  (persist fails → no dispatch; dispatch fails → record cleared; clear fails
+  → suppression stays until reconciled), and cache races (live re-read plus
+  startup grace prevent a false reap). No lease-expiry or hidden timeout
+  test may stand in for evidence; the wedge is not detected, so #102 stays
+  blocked for production until the §12 gates are met.
 - **Failure semantics:** workload failure and infrastructure failure are
   distinguishable from trusted evidence; operator exit-code mapping remains
   unchanged until its own approved change.
 
 ## 11. Open blockers
 
-1. Long-tool liveness: the chosen resolution (suppress reap while a dispatch
-   record shows an operation active) is an intentional safety tradeoff, not a
-   proof. A wedged tool process stays stuck indefinitely until the
-   OS/Kubernetes detects its death; nothing yet proves a silent in-flight
-   operation safe or detects a wedge. Until stronger evidence exists,
-   silent-tool liveness is unresolved.
+1. The long-tool safety policy is settled in #119 (§6), but no progress oracle
+   exists for a silent live wedge. It can persist indefinitely; human
+   intervention remains the escape. #126 must implement and test the
+   active-operation set, UID fencing, and API-backed operator decisions before
+   #102 moves.
 2. Specify the operator-resolved run policy schema and race-safe publication
    contract, including repo/base/PR-head pinning and provider capabilities.
 3. Define artifact format/size and validation (object/ref checks, base ancestry,
@@ -433,10 +551,12 @@ and the acceptance tests below are satisfied.
 
 ## 12. Issue map and gates
 
-Design follow-ups #118 (run publication policy), #119 (long-tool liveness),
-and #120 (workload identity and dependency egress) are ready for bounded design
-work once this document lands. Implementation issues stay blocked until their
-named dependencies are settled and merged:
+Design follow-ups #118 (run publication policy) and #120 (workload identity
+and dependency egress) are ready for bounded design work once this document
+lands. #119 (long-tool liveness) is a **satisfied design gate**: its exact
+schema, ordering, record-validity rules, decision table, and tests are
+settled in §6 above. Implementation issues stay blocked until their named
+dependencies are settled and merged:
 
 | Issue | Seam | Depends on |
 |---|---|---|
@@ -445,13 +565,18 @@ named dependencies are settled and merged:
 | #123 | trusted control/broker/untrusted worker pods | #120, #122 |
 | #124 | model streams, role grants, brief protocol | #121, #123 |
 | #125 | validate artifacts, integrate/publish briefs | #122, #123, #124 |
-| #126 | authenticated status, recovery, liveness | #119, #122-#125 |
+| #126 | authenticated status, recovery, liveness | #119 (satisfied), #122-#125 |
 | #127 | native terminal result and operator verification | #124-#126 |
 
 #80 is consumed by #118/#121/#122; #104 by #120/#122/#123. #101 stays a
 separate, temporary OpenCode capability preflight, not a security boundary.
-#102 stays blocked until #119 and #126 are complete **and** a production e2e
-proves authenticated heartbeat, meaningful checkpoint, confirmed `lastCommit`,
-long-running tool behavior, and resume. The operator-side #12 reaper is
-implemented but cannot complete its production promise until that evidence
-exists. #8 records the design; it is not a claim the secure path has landed.
+#102 readiness is exactly after its prereqs: #119 (**satisfied** — design
+settled in §6), #126 (still **blocked** until #122-#125 are settled and
+merged), and a production e2e proving authenticated heartbeat, meaningful
+checkpoint, confirmed `lastCommit`, long-running tool behavior per the §6
+decision table, and resume. That e2e proves the suppression and
+no-false-reap behavior; it does not — and this design does not promise —
+that a wedge is ever *detected*. The operator-side #12 reaper is implemented
+but, per §6, is limited to runs with no valid active operation and cannot
+complete its production promise until that evidence exists. #8 records the
+design; it is not a claim the secure path has landed.
