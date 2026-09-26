@@ -86,12 +86,16 @@ all workers or isolation controls are implemented or ready.
 - **Legacy coordinator pod (current):** OpenCode and model-controlled tools share
   a pod with forge credentials. Prompt permissions, process separation, MCP, and
   NetworkPolicy do not make this boundary secure.
-- **Target harness (designed, not yet established):** trusted control owns model
-  calls, orchestration, integration, and trusted status requests; a trusted broker
-  holds credentials and enforces semantic forge, git-repository, and ref policy;
-  an isolated untrusted worker runs model-controlled shell without credentials or
-  network access. See [HARNESS.md](./HARNESS.md) for the detailed contract,
-  blockers, and acceptance criteria.
+- **Target harness (designed, not yet established):** each run has trusted
+  control, a dedicated trusted broker behind a run-specific Service, and an
+  isolated untrusted worker. Control owns model calls, orchestration, integration,
+  and signed worker tasks; the broker holds credentials and enforces semantic
+  forge, git-repository, ref, and trusted-status policy. The worker has no
+  credentials or workload identity and can reach only an administrator-populated
+  Go module cache, without worker DNS, not the broker or forge. Secure mode requires
+  enforced network policy, live deny probes, and fail-closed preflight before
+  workload exposure. See [HARNESS.md](./HARNESS.md) for the detailed contract,
+  remaining implementation blockers, and acceptance criteria.
 - **The forge and git** hold durable output: branches, commits, PRs, and CI.
 
 ## The coordinator
@@ -532,14 +536,22 @@ authority.
   process. The existing deployment must rely on credential scope and protected
   default-branch configuration as external mitigations, not as a semantic ref
   boundary.
-- **Target boundary:** trusted harness control makes model calls and validates
-  model-influenced operations; a separate trusted broker holds forge/git
-  credentials and enforces the run's resolved repository and permitted-ref
-  policy. The untrusted worker has no credentials, workload identity, or network
-  access. The separated trust boundaries, semantic broker contract, and
-  acceptance tests are specified in [HARNESS.md](./HARNESS.md); #120 still
-  decides whether broker pods are per-run or shared. None of this is a claim
-  of current implementation readiness.
+- **Target boundary (designed, not implemented):** trusted harness control makes
+  model calls and validates model-influenced operations; one trusted broker per
+  run holds forge/git credentials, enforces resolved repository/ref policy, and
+  writes only that run's harness-owned status. Control authenticates with a
+  projected, pod-bound 600-second `courier-broker` audience token; the broker
+  TokenReviews every request and checks the authenticated service-account UID
+  and current control-pod incarnation. Control-to-worker tasks use signed
+  run/incarnation-bound envelopes; the worker has no secret, service-account
+  token, or signing key. Worker network access is limited to the dedicated Go
+  module/checksum cache and no DNS, never broker or forge. Enforced
+  network policy, live deny probes, and secure preflight fail closed before
+  workload exposure; the preflight separates static admission/spec checks from
+  live probes, and neither proves a privileged cluster actor cannot create or
+  mutate pods outside those controls — a stated residual risk, not a closed
+  hole. [HARNESS.md](./HARNESS.md) specifies the contract and the
+  implementation blockers; none of this claims current implementation readiness.
 - Merge remains a human gate. Neither the target broker nor autonomous roles may
   merge, mutate the queue, or access destinations outside the resolved policy.
   The target coordinator may request permitted publication, but cannot bypass
@@ -588,13 +600,14 @@ named items remain unresolved and must not be described as production-ready:
 - **#80 broker policy:** #118 must specify operator-resolved run policy and
   race-safe publication, including the actual writable fork head required by
   #94, repository/base/PR-head pinning, and provider semantics.
-- **#104 isolation:** #120 must select and prove workload identity and per-run
-  versus shared broker deployment; implementation must test the separated
-  trusted-control/broker/untrusted-worker boundary.
+- **#104 isolation:** #120 settles the per-run broker, pod-bound workload
+  identity, signed control-to-worker protocol, and network boundary. The isolated
+  topology and secure preflight still need implementation and acceptance tests.
 - **Artifact validation:** define artifact format/size and validate objects, refs,
   base ancestry, and policy without trusting worker metadata.
-- **Worker egress:** resolve legitimate dependency fetching without granting the
-  untrusted worker arbitrary network access.
+- **Worker egress:** the first supported slice is an administrator-populated Go module/checksum
+  cache (#136). Worker requests never trigger upstream access; arbitrary worker
+  network access remains prohibited.
 - **OpenCode adapter:** prove isolation and status guarantees before any secure
   routing; otherwise retain it only as explicitly insecure legacy mode.
 - The exact mechanics of injecting `LaneProfile` framing + roles into the
@@ -631,18 +644,32 @@ was superseded.
   stale-heartbeat reaping while the operator observes a matching task running,
   with no duration cap and no wedge detection. #102 now blocks on #126
   implementation and a production e2e, not on the design. (#102, #119)
-- **2026-09-25 — Separate the target trust boundary from legacy MCP access.**
-  MCP is a tool interface, not a security boundary: the current single-pod
-  OpenCode path exposes credentials to model-controlled processes and remains
-  explicitly insecure. The settled target is trusted harness control, a trusted
-  broker enforcing typed semantic forge/repository/ref policy, and an untrusted
-  isolated worker. #120 selects the broker deployment topology; #118 settles
-  publication policy for the actual PR head, including writable forks (#94).
-  This makes the trust contract explicit without prematurely fixing those
-  decisions. #102 remains blocked until heartbeat/status evidence and
-  long-silent-tool liveness are resolved. [HARNESS.md](./HARNESS.md) is the detailed contract.
-  This supersedes the 2026-09-22 generic-MCP-only decision below without
-  changing its historical rationale. (#8, #80, #104, #102)
+- **2026-09-26 — #120 settles the isolated per-run trust topology.** Each run
+  gets trusted control, a dedicated broker and run-specific Service, plus a
+  named per-run Role limited to that run's status subresource, and an untrusted
+  worker. Control uses a pod-bound projected 600-second
+  `courier-broker` audience token; the broker TokenReviews every request and
+  checks authenticated service-account UID plus the current pod/run incarnation.
+  Control-to-worker tasks are signed and incarnation-bound, with no worker
+  secret, service-account token, or signing key. Worker egress is limited to a
+  administrator-populated Go module/checksum cache and no DNS; arbitrary URLs,
+  proxies, broker, forge, and other cluster access stay blocked. The separate Go
+  cache remains to be implemented; approved cache request keys retain a bounded
+  information-leakage risk. Secure mode requires enforced network
+  policy, live deny probes, and fail-closed preflight before exposing workloads.
+  The preflight separates static admission/spec checks (the cluster enforces the
+  required admission; the operator's own rendered specs are clean) from live
+  probes, and the broker's no-extra-grants RBAC property is guaranteed by
+  provisioning and verified by reading the Role/RoleBinding objects — an
+  access review proves a grant exists, never that no extra grant does. The
+  cache is a read-only pre-populated store: no upstream I/O on worker demand,
+  `GOSUMDB=off` checksums, IP-literal addressing. A privileged cluster actor
+  who can bypass RBAC and admission is an explicit residual risk.
+  This resolves #120's design choices, not their implementation or readiness;
+  #123 and a separate cache issue #136 still own implementation. MCP remains an
+  interface, not a security boundary, and the legacy single-pod path remains
+  explicitly insecure. [HARNESS.md](./HARNESS.md) holds the detailed contract.
+  (#120, #104)
 - **2026-09-25 — Separate safe scratch from durable dirty-work recovery.**
   A per-run scratch mount and narrow OpenCode permissions address unattended
   temp-file use without expanding access to `/tmp` or polluting the checkout
