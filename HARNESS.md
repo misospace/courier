@@ -298,40 +298,147 @@ raw REST, or generic MCP passthrough. Forge credentials stay in the broker.
 Model-originated intent is not authorization: the trusted control API validates
 each operation against the run's resolved policy before the broker acts.
 
-### Git policy and publication
+### Git policy and publication (#118)
 
-The operator resolves an immutable run policy at admission: expected repository,
-base ref/OID, permitted work ref, and—on `fix-pr`—the expected PR and head
-repository/ref. The broker pins all operations to that policy; it does not trust
-model-supplied repo/ref/URL values. The broker applies no path filters by
-default: a path scope binds only when the run's resolved policy explicitly
-declares one. The default is the repository's own layout, not a
-Courier-imposed subset (inform, don't constrain).
+The operator owns one immutable, run-UID-bound publication policy. It resolves
+and durably binds this policy at admission from the immutable `CoderRun` spec,
+trusted provider configuration, and live provider reads; a broker must verify
+the same policy on restart, not reconstruct it from model input or mutable
+`status.branch`. Forge credentials come only from administrator-configured provider
+credentials, never the run or lane; the per-run Kubernetes broker identity is
+separate (§3). The existing branch-only
+`ExistingPRHeadResolver` and GitHub `Ref` are insufficient: #94/#121/#122 must
+carry the actual PR head repository/ref/OID and persist the resolved policy
+before secure publication can be enabled. No legacy fallback is authorized.
 
-- Reject an unexpected repository, foreign base, arbitrary URL, or publication
-  to the base repository's default/protected refs. Reject any `fix-pr`
-  publication whose repository/ref no longer matches the operator-resolved PR
-  head identity. Re-read live PR/repository
-  state before publication. A fork head is not itself forbidden: preserve the
-  actual head repository/ref, never substitute a same-named base branch, and
-  return actionable `NeedsHuman` if the configured identity cannot write that
-  head (#94). #118 settles the exact fork writability and protected-head policy.
-- The harness publishes an integration commit as a bounded git bundle/artifact.
-  The broker validates the objects and target ref, verifies the proposed update
-  is a fast-forward from the live tip, and uses a provider-supported conditional
-  update where available or a normal non-force git push followed by a fresh
-  remote observation. Never use `--force` or `--force-with-lease`; a competing
-  update must fail safely or be re-observed before declaring success. On a race, reject and let
-  trusted control reread the world and reconcile; do not claim branch/status
-  atomicity that the forge does not provide.
-- Git reads use a sanitized, read-only repository pack/bundle or workspace
-  supplied to the worker. The worker has no remote access. Returned commit
-  bundles are untrusted artifacts: control validates repository/object format,
-  base, refs, ancestry, and permitted paths/policy before integration and
-  publication.
-- PR creation/update and comments use typed forge methods bound to the same
-  resolved repo/ref/PR policy. Comments cannot carry instructions that cause
-  arbitrary URL fetches, merges, or broker proxying.
+| Immutable field | Admission source and meaning |
+|---|---|
+| `provider` | registered provider configuration, including canonical forge endpoint and credential reference (broker-only) |
+| `baseRepo`, `baseRef`, `baseOID` | provider-canonical repository resolved from `spec.repo`; `resolve-issue` uses its live default branch, `fix-pr` the existing PR's live target branch; record that ref's tip OID, and require the PR base repository/ref to match on later reads |
+| `workRepo`, `workRef` | `resolve-issue`: `baseRepo` and `courier/<owner>/<repo>/issue-<number>` derived by the operator from the canonical repository and issue number; `fix-pr`: the live PR's *actual* head repository and ref, including a fork |
+| `prNumber`, `headAnchorOID` | `fix-pr` only: `spec.ref` and the live PR head OID at admission; `resolve-issue` has no existing PR or head anchor |
+
+The provider returns canonical stable repository identities, exact branch refs
+and opaque git OIDs (including SHA-256 repositories); broker and operator
+compare repository identities using that provider's rules and ref/OID bytes
+exactly. Admission checks the effective protection and broker credential write access
+for the pinned destination in both repositories (once if identical).
+Missing/deleted/ambiguous repository, base, head, ref, protection
+information, or insufficient read permission denies admission rather than
+assuming a branch is safe. No arbitrary clone URL or forge endpoint is
+accepted from the model. `baseOID` is an admission snapshot, not a permanent
+fence: ordinary movement of the pinned base ref requires control to re-sync
+before publishing work against the new base; it neither changes the pinned
+base identity nor alone causes `NeedsHuman`. A changed/deleted base identity
+or a PR retargeted to a different base ref/repository does.
+
+For `resolve-issue`, the pinned destination is the base repository's derived
+work ref. A ref absent at admission is recorded as initially absent; a ref
+already present needs an explicit live tip at admission. A new ref racing into
+existence is a foreign tip unless it equals the exact proposed OID; never
+accept an arbitrary occupant of the same ref as this run's publication. The adoption guard must search for an existing PR by the *full*
+head repository/ref: an open PR is reported for review without adoption or
+publication; a closed/merged PR on that head requires `NeedsHuman`. A PR from
+a fork with the same branch name is not this run's PR. Creation is permitted
+only with pinned base and work identities after confirming the run's proposed
+OID is the live head and no existing PR has the pinned head identity. Re-read
+the *returned PR number* and verify its live base and full head repo/ref/OID
+before claiming success. A concurrent duplicate PR or divergent head requires
+`NeedsHuman`; do not claim someone else's PR as the run's own.
+For `fix-pr`, publication always goes to the pinned actual PR head repository
+and ref; a same-name base-repository branch is never a fallback (#94). PR
+updates may change only title/body/draft and comments on the pinned PR;
+creating or retargeting a `fix-pr` PR is denied. Both modes deny merge, close,
+force push, raw REST/MCP passthrough, arbitrary destinations and URL proxying.
+Any path scope, if present, must also be operator-resolved, never model-supplied.
+
+A default or effectively protected ref in **either** repository is not a
+publication destination. Protection includes provider rulesets and branch
+policies that apply to this ref and credential, not merely a list of explicitly
+protected branch names. The broker obtains authoritative live effective
+protection and work-repository write permission immediately before every
+push; it does not infer writability from a successful read or from a rule
+bypass credential. A writable unprotected fork head is allowed. If protection
+cannot be established reliably or the credential cannot write the actual fork
+head, deny with actionable `NeedsHuman`, never create a replacement branch.
+The broker credential must have no protected-ref bypass grant: the provider
+must reject a write that becomes protected between the live read and push.
+Post-push observation detects a policy change but cannot undo a completed
+write; this is a required provider-side safety property, not a claimed atomic
+read/push transaction. If it cannot be guaranteed, secure admission fails
+closed.
+
+**Normal non-force publication, including crashes and races:**
+
+1. Trusted control validates the untrusted artifact (objects, ancestry,
+   repository and any operator-resolved path policy), integrates it in its
+   private tree, and supplies the proposed commit OID and the expected work
+   tip from a fresh observation. Broker independently checks even authenticated control request values
+   against its persisted policy and fresh git observation; control must not
+   forward model-provided destinations or tip assertions as authority. For a new resolve work ref,
+   the expected tip is absent; only creation of that exact absent ref is
+   permitted. Otherwise the candidate must fast-forward the expected tip.
+2. Broker re-reads live base identity/tip, full `fix-pr` PR base and head
+   repo/ref/OID, work tip and both repositories' effective protection and
+   write access. It refuses a mismatch with the expected tip, a foreign PR
+   head, a protected destination or a changed base identity. A base tip that
+   moved requires control to re-sync; it never authorizes a new destination.
+3. Broker uses only an ordinary git push of the proposed commit to the pinned
+   work ref (never force or force-with-lease). The pre-read is not atomic with
+   the push: a concurrent fast-forward may win, in which case the push fails
+   non-fast-forward; even a concurrent advancement that remains an ancestor
+   of the candidate is not adopted without re-observation. No provider-side
+   conditional ref update is required or used as a substitute for this push.
+4. Whether the push succeeded, failed or its outcome was lost, broker re-reads
+   the work tip, effective protections, and (for fix-pr) the live PR base and
+   full head repo/ref/OID. It confirms publication only if the tip equals the
+   exact proposed OID, the PR still points to that pinned head and OID, and
+   the base/protection checks still pass. If the tip has moved again, do not
+   claim success even if this run's commit is an ancestor. Re-observe and
+   classify the new world; never silently push over it.
+
+A `fix-pr` run recognizes as its own prior head only the admission anchor or
+a proposed OID confirmed at the live remote for this run. A broker-confirmed
+`status.lastCommit` is one OID, not a chain: recheck exact equality against
+the live work tip and PR head on resume. A pending proposed OID after an
+interrupted push may be recovered only from the run-UID-bound trusted control
+integration tree or a trusted checkpoint written before pushing, and confirmed
+by *exact* live equality before status advances. If neither survives a crash,
+return `NeedsHuman` rather than infer ownership from ancestry or retry an
+uncertain push. Any other tip is foreign, including a descendant of a run commit
+advanced by another actor, and requires `NeedsHuman` rather than an automatic
+rebase. The live world always wins over a checkpoint. A repeated OID is an
+idempotent no-op only while the live tip and (on `fix-pr`) PR head still
+equal it. The broker rereads live state before each status attempt and
+uses Kubernetes `metadata.resourceVersion` compare-and-swap against the
+current named CoderRun, checking its UID and current control-pod incarnation;
+a conflict restarts world verification, and a stale confirmation is
+dropped. A failed/uncertain push advances neither the completed-brief checkpoint nor `lastCommit`. There is no atomic
+forge/status transaction.
+
+| Condition after live re-observation | Outcome |
+|---|---|
+| Temporary read/push transport failure, rate limit or provider outage, with no evidence of a changed identity | Retry with same immutable policy; first re-read world, no checkpoint advance |
+| Base tip advances on the same pinned ref | Re-sync trusted integration with live base and retry; never mutate the policy |
+| Pre-push tip differs from expected, non-fast-forward or post-push tip differs from proposal | Re-observe; exact confirmed proposed OID is idempotent success; an unchanged own anchor/confirmed tip permits retry from that exact tip; otherwise foreign/ambiguous tip is `NeedsHuman` |
+| PR base/head repo/ref changes, or PR head OID is not the anchor, confirmed own tip or exact pending proposal | `NeedsHuman` with actual and pinned PR identities; never follow the moved head |
+| Work ref deleted after admission, or pinned base ref/repository disappears | `NeedsHuman`; only an initially absent resolve work ref may be created |
+| Work ref becomes default/protected in either repository; protection or writability cannot be verified | `NeedsHuman` identifying repo/ref and missing or conflicting capability |
+| Actual fork head is unwritable by broker-configured credential | `NeedsHuman` identifying fork repo/ref and missing write grant (#94) |
+| Provider lacks required head/base/ref reads, effective protection/write checks, normal git push or post-push observations | `NeedsHuman` at admission with missing capability; no raw fallback |
+
+Provider adapters translate these semantic reads and errors without exposing
+provider-specific verbs to core. The current GitHub client does **not** yet
+expose full head-repo identity or effective protection; it is not a secure
+broker implementation. #121 provides the typed provider contract and #122
+must implement its enforcement; unsupported providers fail closed rather than
+silently dropping a check. Terminal `NeedsHuman` diagnostics name the pinned
+and observed identities and required human action without leaking credentials.
+
+The broker supplies the worker only a sanitized, read-only repository pack or
+workspace, never network access. Trusted control validates worker artifacts
+before integration; the broker independently enforces the policy at every
+git/forge mutation. Comments are data, never instructions to fetch URLs.
 
 ### Trusted status operations
 
@@ -748,16 +855,34 @@ and the acceptance tests below are satisfied.
 - **Revocation:** the CoderRun finalizer is idempotent — a rerun after partial
   failure (operator crash mid-sequence) resumes the ordered revocation,
   already-removed objects are treated as done, and no grant is re-provisioned.
-- **Broker policy:** deny merge, force push, default/protected refs, foreign
-  base/repository, unexpected `fix-pr` head identity, arbitrary URLs, comments
-  that trigger proxying, stale expected OIDs, and ref races. Verify an allowed
+- **Broker policy:** deny merge, force push, default/protected refs in **both**
+  the base and the work repository, foreign base/repository, an arbitrary
+  destination, unexpected `fix-pr` head identity, arbitrary URLs, comments that
+  trigger proxying, stale expected OIDs, and ref races. Verify an allowed
   writable fork head works without substituting a same-named base branch; an
-  unwritable fork returns actionable `NeedsHuman` (#94). Verify semantic
-  validation on model-influenced requests, not just certificate checks.
-- **Publication:** validate artifacts before integration; publish only a
-  non-force fast-forward, then observe the remote ref; concurrent update fails
-  safely or triggers reconciliation;
-  retry is idempotent. No test assumes forge push and status are atomic.
+  unwritable fork returns actionable `NeedsHuman` naming the missing write
+  grant (#94); a same-named branch in the base repository is a different
+  identity and is never selected. Verify semantic validation on model-influenced
+  requests, not just certificate checks.
+- **Publication policy (#118):** the operator resolves the full policy from the
+  `CoderRun` spec plus a live provider read at admission, and the broker pins
+  every operation to it with no model input entering the policy. Pre-push
+  revalidation reads the live tip, PR head identity, base ref, and both live
+  protected sets; the post-push observation — not the push's exit status —
+  declares success. A base-OID test advances the live base past the admission
+  OID and sees the run re-sync and publish, never a denial. A head-anchor test
+  confirms the run's own pushes advance past the anchor and are recognized on
+  resume, while a foreign head (neither anchor nor published) stops publication
+  and reaches `NeedsHuman`. Each row of the §4 failure matrix is exercised:
+  transient errors requeue without mutating the policy; a competing tip is
+  classified by exact own-OID equality, and a foreign tip reaches
+  `NeedsHuman`; a protected-ref target, a
+  deleted work ref, a deleted base ref, an unwritable fork, and a
+  capability-missing provider each produce the classified actionable
+  `NeedsHuman`, and an unsupported provider fails closed at admission.
+  `lastCommit` confirms are idempotent only while the live tip still matches:
+  a repeat is a no-op then, but a stale confirm is dropped, and a world conflict follows the world. No test assumes forge
+  push and status are atomic.
 - **Resume/status:** only trusted control writes status; checkpoint is not a
   world mirror; conflict recovery rereads git/PR/CI and follows the world.
 - **Liveness:** prove the exact successful stream/tool evidence path and the
@@ -784,8 +909,12 @@ and the acceptance tests below are satisfied.
    intervention remains the escape. #126 must implement and test the
    active-operation set, UID fencing, and API-backed operator decisions before
    #102 moves.
-2. Specify the operator-resolved run policy schema and race-safe publication
-   contract, including repo/base/PR-head pinning and provider capabilities.
+2. Settled in #118 (§4): the immutable run publication policy schema, the
+   operator-resolved admission inputs, pre/post-push live revalidation, the
+   `NeedsHuman`/retryable matrix, and provider-neutral semantics with
+   fail-closed unsupported providers, including the writable fork head required
+   by #94. Remaining work is broker implementation (#122) and the provider
+   registration surface (#121).
 3. Define artifact format/size and validation (object/ref checks, base ancestry,
    path policy) without treating worker metadata as authority.
 4. #120 settles per-run broker topology, workload identity, worker signing,
@@ -826,13 +955,16 @@ egress) is settled by this document. The Go cache remains a separate
 implementation issue (#136); #123 covers pod/protocol wiring, not the cache. #119
 (long-tool liveness) is a **satisfied design gate**: its exact schema, ordering,
 record-validity rules, decision table, and tests are settled in §6 above.
-Implementation issues stay blocked until their named dependencies are settled
-and merged:
+#118 (run publication policy) is a **satisfied design gate**: its exact
+schema, operator-resolved admission inputs, pre/post-push live revalidation,
+`NeedsHuman`/retryable matrix, and provider-neutral semantics are settled in
+§4 above. Implementation issues stay blocked until their named dependencies
+are settled and merged:
 
 | Issue | Seam | Depends on |
 |---|---|---|
-| #121 | semantic forge provider contract | #118 |
-| #122 | credential broker and git/forge enforcement | #118, #120, #121 |
+| #121 | semantic forge provider contract | #118 (satisfied) |
+| #122 | credential broker and git/forge enforcement | #118 (satisfied), #120, #121 |
 | #123 | trusted control/broker/untrusted worker pods and protocol | #120, #122 |
 | #136 | dedicated Go module/checksum cache and constrained egress | #120, #123 |
 | #124 | model streams, role grants, brief protocol | #121, #123 |
@@ -840,7 +972,7 @@ and merged:
 | #126 | authenticated status, recovery, liveness | #119 (satisfied), #122-#125 |
 | #127 | native terminal result and operator verification | #124-#126 |
 
-#80 is consumed by #118/#121/#122; #104 by #120/#122/#123. #101 stays a
+#80 is consumed by #121/#122; #104 by #120/#122/#123. #101 stays a
 separate, temporary OpenCode capability preflight, not a security boundary.
 #102 readiness is exactly after its prereqs: #119 (**satisfied** — design
 settled in §6), #126 (still **blocked** until #122-#125 are settled and

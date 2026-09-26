@@ -608,9 +608,13 @@ named items remain unresolved and must not be described as production-ready:
   [HARNESS.md](./HARNESS.md) §6; #126 still must implement the status path and
   operator decision, then prove it in production e2e. A live wedged silent tool
   may remain wedged indefinitely (an intentional safety tradeoff).
-- **#80 broker policy:** #118 must specify operator-resolved run policy and
-  race-safe publication, including the actual writable fork head required by
-  #94, repository/base/PR-head pinning, and provider semantics.
+- **#80 broker policy:** #118 settles the operator-resolved immutable run
+  publication policy and race-safe publication in
+  [HARNESS.md](./HARNESS.md) §4 — the full policy schema, admission inputs,
+  pre/post-push live revalidation, the `NeedsHuman`/retryable matrix, and
+  provider-neutral semantics with fail-closed unsupported providers, including
+  the actual writable fork head required by #94. What remains is broker
+  implementation (#121/#122).
 - **#104 isolation:** #120 settles the per-run broker, pod-bound workload
   identity, signed control-to-worker protocol, and network boundary. The isolated
   topology and secure preflight still need implementation and acceptance tests.
@@ -632,6 +636,24 @@ A running log of architectural decisions and their reasoning, newest first. The
 body above describes the current architecture; this log preserves *why* and what
 was superseded.
 
+- **2026-09-26 — #118 settles the run publication policy.** The operator
+  resolves and persists an immutable run-UID-bound policy from the spec,
+  provider configuration, and live reads: canonical base repo/ref/OID,
+  work repo/ref, and for `fix-pr` the actual PR number and head repo/ref/OID,
+  including a writable fork. The base OID is a snapshot; movement on the
+  same base ref calls for re-sync, not a change of destination. The head OID
+  is an admission anchor, not a frozen tip: confirmed own pushes advance it;
+  foreign heads stop publication. Every publication compares a fresh expected
+  tip and rechecks PR identity, base identity, protection and write permission,
+  uses only ordinary non-force git push, then re-observes the exact proposed
+  OID and PR head before recording `lastCommit`. No status/forge atomicity is
+  assumed; uncertain outcomes require exact live confirmation, not inference
+  from ancestry. Both base and work default/protected refs are excluded,
+  including a fork's; provider-side protection must reject races, with no
+  broker credential bypass. Missing provider semantics fail closed. No model
+  policy derivation, same-name branch substitution, arbitrary destination,
+  merge, or force push. This is a design contract, not shipped broker support.
+  ([HARNESS.md](./HARNESS.md) §4) (#118, #94, #80)
 - **2026-09-25 — #119 settles the long-tool liveness design.** A silent
   legitimate operation and a wedged one are observationally identical, so no
   design can both reap a wedged silent tool in finite time and never reap a
