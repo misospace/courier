@@ -222,14 +222,19 @@ to die.
 - The target harness writes an **activity heartbeat** to CR status on
   successful stream chunks and verified tool boundaries. Production legacy pods
   currently do not populate heartbeat, checkpoint, or `lastCommit` (#102).
-- **Superseded:** the earlier design "kept the heartbeat warm" while a long
-  tool call (a big test suite) was in flight. An in-flight tool is not liveness
-  evidence, and the harness must not emit a heartbeat it has not earned — no
-  fake heartbeat. The stale-heartbeat reaper is therefore not sufficient for a
-  long silent tool: suppressing reap while a tool is in flight can leave a
-  wedged tool unresolved indefinitely. Liveness evidence and this silent-tool
-  case remain unresolved; #102 is blocked for production. See
-  [HARNESS.md](./HARNESS.md).
+- **Superseded, and now designed:** the earlier design "kept the heartbeat
+  warm" while a long tool call (a big test suite) was in flight. An in-flight
+  tool is not liveness evidence, and the harness must not emit a heartbeat it
+  has not earned — no fake heartbeat. Safe handling of the long silent tool is
+  settled by #119 ([HARNESS.md](./HARNESS.md) §6): a harness-owned
+  **ActiveOperation record** (dispatched op ID, owning control-pod UID,
+  worker-pod UID, diagnostic dispatch time) is persisted *before* dispatch and
+  suppresses stale-heartbeat reaping only while the operator independently
+  observes the control pod present and the worker running. There is no duration
+  cap; a genuinely wedged tool (alive, silent) is not detected — the escape is
+  manual `needs-human`. This is an intentional safety tradeoff (indefinite
+  wedge over false reap), not a liveness proof. #102 stays blocked for
+  production until #126 implements it and a production e2e proves the behavior.
 - The coordinator **self-declares stuck** (can't get CI green after real
   attempts, missing access, ambiguous ask) → `needs-human`.
 - A pod that dies (infra) or is reaped is relaunched and resumed. A **crashloop**
@@ -576,9 +581,10 @@ authority.
 The harness executor contract is settled in [HARNESS.md](./HARNESS.md); these
 named items remain unresolved and must not be described as production-ready:
 
-- **#102 liveness:** production heartbeat/status evidence and safe handling of
-  long silent tools remain unresolved; a stuck silent operation may remain
-  wedged indefinitely.
+- **#102 liveness:** #119 settles safe handling of long silent tools in
+  [HARNESS.md](./HARNESS.md) §6; #126 still must implement the status path and
+  operator decision, then prove it in production e2e. A live wedged silent tool
+  may remain wedged indefinitely (an intentional safety tradeoff).
 - **#80 broker policy:** #118 must specify operator-resolved run policy and
   race-safe publication, including the actual writable fork head required by
   #94, repository/base/PR-head pinning, and provider semantics.
@@ -602,13 +608,29 @@ A running log of architectural decisions and their reasoning, newest first. The
 body above describes the current architecture; this log preserves *why* and what
 was superseded.
 
+- **2026-09-25 — #119 settles the long-tool liveness design.** A silent
+  legitimate operation and a wedged one are observationally identical, so no
+  design can both reap a wedged silent tool in finite time and never reap a
+  legitimate one; the design chooses to never false-reap. A harness-owned
+  ActiveOperation record (dispatched op ID, owning control-pod UID,
+  worker-pod UID, diagnostic dispatch time) is persisted before dispatch and
+  suppresses stale-heartbeat reaping only while the operator independently
+  observes the control pod present and the worker running. There is no duration
+  cap; a wedged tool is not detected and the escape is manual `needs-human`.
+  This is an intentional safety tradeoff, not a liveness proof; #102 now blocks
+  on #126 implementation and a production e2e, not on the design.
+  ([HARNESS.md](./HARNESS.md) §6) (#119, #102)
 - **2026-09-25 — A long in-flight tool call no longer keeps the heartbeat warm.**
   The earlier liveness design treated a long in-flight tool call as activity and
   "kept the heartbeat warm" through it. That is superseded: an in-flight tool is
   not liveness evidence, and the harness must not emit a heartbeat it has not
   earned (no fake heartbeat), so a wedged silent tool no longer looks alive.
-  Safe handling of long silent tools — suppressing reap without a fake heartbeat
-  — is open and blocks #102 for production. (#102)
+  Safe handling of long silent tools — suppressing reap without a fake
+  heartbeat — is designed in #119 ([HARNESS.md](./HARNESS.md) §6) as an
+  intentional safety tradeoff: a harness-owned ActiveOperation record suppresses
+  stale-heartbeat reaping while the operator observes the operation active,
+  with no duration cap and no wedge detection. #102 now blocks on #126
+  implementation and a production e2e, not on the design. (#102, #119)
 - **2026-09-25 — Separate the target trust boundary from legacy MCP access.**
   MCP is a tool interface, not a security boundary: the current single-pod
   OpenCode path exposes credentials to model-controlled processes and remains
