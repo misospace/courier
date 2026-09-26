@@ -617,6 +617,20 @@ was superseded.
   (GitHub / GitLab / Forgejo / Bitbucket). Installing `gh` (or `glab`, `tea`, …)
   into the coordinator image was rejected: it hardcodes the forge into the one
   place meant to be swappable. (#80, #87)
+- **2026-09-26 — The forge boundary is a typed, capability-advertised contract.**
+   `internal/forge` defines the forge-agnostic interface the core uses to read
+   work items and change requests and to create/update/comment on them; concrete
+   forges live in sibling packages (`internal/github` is the first). The contract
+   makes **merge and raw passthrough unrepresentable** — there is no merge or
+   raw/do verb and no capability can be registered for them — so the human merge
+   gate cannot be bypassed and a provider cannot smuggle forge-specific behavior
+   past the core. Providers advertise operations through a `Capabilities` set and
+   decline the rest with `ErrUnsupported`, and unavailability diagnostics are
+   redacted so a failure reason can never leak a credential. `ProviderConfig`
+   carries only an endpoint, a name, and a credential *reference* that the broker
+   resolves, and it stays independent of `LaneProfile` (which describes lanes,
+   never the forge or its credentials). The GitHub adapter implements only covered
+   operations. Source adapters and broker transport remain out of scope. (#121, #80)
 - **2026-09-22 — Repository toolchains are per-lane runtime images, not baked
   into one universal coordinator image.** A `LaneProfile.runtimeImage` selects a
   coordinator image carrying the target repo's toolchain (e.g. `courier-go`
