@@ -16,8 +16,8 @@ func (observerWithHeadResolver) Observe(context.Context, string, string) (contro
 	return controller.PRObservation{}, nil
 }
 
-func (observerWithHeadResolver) ResolveHead(context.Context, *courierv1alpha1.CoderRun) (string, error) {
-	return "feature/existing", nil
+func (observerWithHeadResolver) ResolveHead(context.Context, *courierv1alpha1.CoderRun) (controller.HeadRef, error) {
+	return controller.HeadRef{Repo: "acme/demo", Branch: "feature/existing"}, nil
 }
 
 func TestDispatchPRStateCheckerRequiresGitHubObserver(t *testing.T) {

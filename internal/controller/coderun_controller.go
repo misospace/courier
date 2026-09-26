@@ -42,8 +42,9 @@ type CoderRunReconciler struct {
 	// passed through unchanged for every claim/release/transition call.
 	Sources *SourceRegistry
 
-	// PRHeadResolver is required for fix-pr runs. It returns the branch attached
-	// to the existing PR; no branch is synthesized from the PR number.
+	// PRHeadResolver is required for fix-pr runs. It resolves the PR head —
+	// the repository, branch, and commit attached to the existing PR; no
+	// branch is synthesized from the PR number.
 	PRHeadResolver ExistingPRHeadResolver
 
 	// StatusWriter is the status transport used for operator-owned fields.
@@ -153,12 +154,14 @@ func (r *CoderRunReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 		return ctrl.Result{}, errors.Join(err, adapter.Release(ctx, item))
 	}
 
-	resolvedBranch, err := resolveRunBranch(ctx, &run, r.PRHeadResolver)
+	head, err := resolveRunBranch(ctx, &run, r.PRHeadResolver)
 	if err != nil {
 		return ctrl.Result{}, r.releaseClaim(ctx, &run, adapter, item, err)
 	}
 	before = run.DeepCopy()
-	run.Status.Branch = resolvedBranch
+	run.Status.Branch = head.Branch
+	run.Status.HeadRepo = head.Repo
+	run.Status.HeadSHA = head.SHA
 	if err := r.patchStatus(ctx, before, &run); err != nil {
 		return ctrl.Result{}, r.releaseClaim(ctx, &run, adapter, item, err)
 	}
@@ -206,12 +209,14 @@ func (r *CoderRunReconciler) resumeClaimed(ctx context.Context, run *courierv1al
 		return ctrl.Result{}, nil
 	}
 	if strings.TrimSpace(run.Status.Branch) == "" {
-		branchName, err := resolveRunBranch(ctx, run, r.PRHeadResolver)
+		head, err := resolveRunBranch(ctx, run, r.PRHeadResolver)
 		if err != nil {
 			return ctrl.Result{}, r.releaseClaim(ctx, run, adapter, item, err)
 		}
 		before := run.DeepCopy()
-		run.Status.Branch = branchName
+		run.Status.Branch = head.Branch
+		run.Status.HeadRepo = head.Repo
+		run.Status.HeadSHA = head.SHA
 		if err := r.patchStatus(ctx, before, run); err != nil {
 			return ctrl.Result{}, r.releaseClaim(ctx, run, adapter, item, err)
 		}
@@ -297,6 +302,8 @@ func (r *CoderRunReconciler) rejectClaim(ctx context.Context, run *courierv1alph
 	before := run.DeepCopy()
 	run.Status.Phase = courierv1alpha1.PhasePending
 	run.Status.Branch = ""
+	run.Status.HeadRepo = ""
+	run.Status.HeadSHA = ""
 	statusErr := r.patchStatus(ctx, before, run)
 	return errors.Join(cause, releaseErr, statusErr)
 }
@@ -309,6 +316,8 @@ func (r *CoderRunReconciler) releaseClaim(ctx context.Context, run *courierv1alp
 	before := run.DeepCopy()
 	run.Status.Phase = courierv1alpha1.PhasePending
 	run.Status.Branch = ""
+	run.Status.HeadRepo = ""
+	run.Status.HeadSHA = ""
 	statusErr := r.patchStatus(ctx, before, run)
 	return errors.Join(cause, releaseErr, statusErr)
 }
@@ -496,6 +505,14 @@ func (r *CoderRunReconciler) patchStatus(ctx context.Context, before, after *cou
 	if before.Status.Branch != after.Status.Branch {
 		branch := after.Status.Branch
 		fields.Branch = &branch
+	}
+	if before.Status.HeadRepo != after.Status.HeadRepo {
+		headRepo := after.Status.HeadRepo
+		fields.HeadRepo = &headRepo
+	}
+	if before.Status.HeadSHA != after.Status.HeadSHA {
+		headSHA := after.Status.HeadSHA
+		fields.HeadSHA = &headSHA
 	}
 	if before.Status.PR != after.Status.PR {
 		fields.PR = after.Status.PR

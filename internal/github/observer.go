@@ -58,25 +58,25 @@ func (o Observer) Observe(ctx context.Context, repository, branch string) (contr
 	return controller.PRObservation{}, nil
 }
 
-func (o Observer) ResolveHead(ctx context.Context, run *courierv1alpha1.CoderRun) (string, error) {
+func (o Observer) ResolveHead(ctx context.Context, run *courierv1alpha1.CoderRun) (controller.HeadRef, error) {
 	if o.Client == nil {
-		return "", fmt.Errorf("GitHub observer: nil client")
+		return controller.HeadRef{}, fmt.Errorf("GitHub observer: nil client")
 	}
 	if run == nil {
-		return "", fmt.Errorf("GitHub observer: nil run")
+		return controller.HeadRef{}, fmt.Errorf("GitHub observer: nil run")
 	}
 	owner, repo, err := splitRepository(run.Spec.Repo)
 	if err != nil {
-		return "", err
+		return controller.HeadRef{}, err
 	}
 	pull, err := o.Client.GetPullRequest(ctx, owner, repo, run.Spec.Ref)
 	if err != nil {
-		return "", err
+		return controller.HeadRef{}, err
 	}
 	if strings.TrimSpace(pull.Head.Ref) == "" {
-		return "", fmt.Errorf("GitHub observer: pull request %d has no head ref", run.Spec.Ref)
+		return controller.HeadRef{}, fmt.Errorf("GitHub observer: pull request %d has no head ref", run.Spec.Ref)
 	}
-	return pull.Head.Ref, nil
+	return controller.HeadRef{Repo: pull.Head.Repo.FullName, Branch: pull.Head.Ref, SHA: pull.Head.SHA}, nil
 }
 
 func splitRepository(repository string) (string, string, error) {

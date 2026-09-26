@@ -315,8 +315,9 @@ dead 12-hour run straight to Tier 3.
   step is always sync-to-base.
 
 Scope: **resolve-issue** adopts an orphaned branch only when a branch exists but
-no PR. **fix-pr** always adopts the existing PR's branch. A branch with a PR is
-never a resolve concern.
+no PR. **fix-pr** always adopts the existing PR's head repository and branch
+(fork-aware), keeping the base repo as the PR/publication target. A branch with
+a PR is never a resolve concern.
 
 ## Observability and transcripts
 
@@ -356,6 +357,8 @@ spec:                       # set once by the source adapter, then immutable
 status:
   phase: Pending | Claimed | Running | Verifying | AwaitingReview | NeedsHuman | Done | Failed
   branch: <derived resolve branch or adopted PR head>
+  headRepo: <PR head repo; spec.repo for a same-repo PR, the fork's owner/name for a fork PR>
+  headSHA: <head commit SHA>
   pr: <#/url>
   lastCommit: <sha>
   checkpoint:
@@ -568,6 +571,20 @@ A running log of architectural decisions and their reasoning, newest first. The
 body above describes the current architecture; this log preserves *why* and what
 was superseded.
 
+- **2026-09-26 — fix-pr adopts the PR head's repository, not just its branch name.**
+  A `fix-pr` run previously resolved only the PR head's branch name, so the
+  executor cloned and pushed the base repository and could fail to find the real
+  fork branch — or worse, adopt a same-named branch in the base repo. The GitHub
+  observer now resolves full head identity (head repository, branch, commit SHA)
+  and the controller persists it on the run as `status.headRepo` and
+  `status.headSHA` alongside `status.branch`. The coordinator pod builds its
+  clone/push remote from the head repository, so `origin` is the fork and a
+  colliding same-named base branch can never be adopted; `spec.repo` (the base)
+  stays the PR/publication target. Before preparing the workspace the executor
+  verifies the head branch exists on the fork remote, and an unavailable or
+  unwritable fork head is an actionable NeedsHuman — no reset, replacement
+  branch, or force-push is introduced. Same-repository fix-pr runs are
+  unchanged: `status.headRepo` equals `spec.repo`. (#94)
 - **2026-09-25 — Separate safe scratch from durable dirty-work recovery.**
   A per-run scratch mount and narrow OpenCode permissions address unattended
   temp-file use without expanding access to `/tmp` or polluting the checkout

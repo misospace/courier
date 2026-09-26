@@ -110,6 +110,17 @@ type CoderRunStatus struct {
 	// +optional
 	Branch string `json:"branch,omitempty"`
 
+	// HeadRepo is the repository that owns the PR head branch for a fix-pr run.
+	// It equals Spec.Repo for same-repository PRs and resolve-issue runs.
+	// +optional
+	HeadRepo string `json:"headRepo,omitempty"`
+
+	// HeadSHA is the PR head commit observed when the run resolved its head,
+	// recorded on the run for verification and resume. It is the observed
+	// head, not an enforced pre-push gate.
+	// +optional
+	HeadSHA string `json:"headSHA,omitempty"`
+
 	// PR is the pull request opened by this run (number or URL).
 	// +optional
 	PR string `json:"pr,omitempty"`

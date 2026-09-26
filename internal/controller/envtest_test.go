@@ -339,8 +339,8 @@ func TestEnvtestDispatchRunnerLifecycle(t *testing.T) {
 		Client:       envtestClient,
 		Sources:      NewSourceRegistry(map[string]source.Adapter{"dispatch": adapter}),
 		StatusWriter: status.KubePatchWriter{Client: envtestClient},
-		PRHeadResolver: ExistingPRHeadResolverFunc(func(context.Context, *courierv1alpha1.CoderRun) (string, error) {
-			return "feature/existing-pr-head", nil
+		PRHeadResolver: ExistingPRHeadResolverFunc(func(_ context.Context, run *courierv1alpha1.CoderRun) (HeadRef, error) {
+			return HeadRef{Repo: run.Spec.Repo, Branch: "feature/existing-pr-head", SHA: "abc123"}, nil
 		}),
 		Launch: envtestLaunch(t, adapter, false),
 	}
@@ -351,8 +351,8 @@ func TestEnvtestDispatchRunnerLifecycle(t *testing.T) {
 	if err := envtestClient.Get(ctx, followupKey, &followup); err != nil {
 		t.Fatal(err)
 	}
-	if followup.Status.Branch != "feature/existing-pr-head" {
-		t.Fatalf("followup branch = %q, want existing PR head", followup.Status.Branch)
+	if followup.Status.Branch != "feature/existing-pr-head" || followup.Status.HeadRepo != "acme/widgets" || followup.Status.HeadSHA != "abc123" {
+		t.Fatalf("followup head = branch %q repo %q sha %q, want existing PR head", followup.Status.Branch, followup.Status.HeadRepo, followup.Status.HeadSHA)
 	}
 	if followup.Spec.Mode != courierv1alpha1.ModeFixPR || followup.Spec.WorkItemID != adapter.items[1].ID || followup.Spec.Ref != 42 {
 		t.Fatalf("followup spec = %#v, want fix-pr with opaque ID and PR ref", followup.Spec)

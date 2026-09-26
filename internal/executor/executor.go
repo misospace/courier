@@ -44,6 +44,8 @@ type Invocation struct {
 	Repo      string
 	Ref       int
 	Branch    string
+	HeadRepo  string
+	HeadSHA   string
 	Goal      string
 	Model     string
 	Roles     map[string]string
@@ -153,6 +155,8 @@ func NewInvocation(run *courierv1alpha1.CoderRun, lane *courierv1alpha1.LaneProf
 		Repo:      run.Spec.Repo,
 		Ref:       run.Spec.Ref,
 		Branch:    run.Status.Branch,
+		HeadRepo:  run.Status.HeadRepo,
+		HeadSHA:   run.Status.HeadSHA,
 		Goal:      goal,
 		Model:     model,
 		Roles:     roles,
@@ -187,6 +191,8 @@ func EnvironmentWithConfig(inv Invocation, executorName, remoteURL, baseBranch, 
 		{Name: "COURIER_RUN_NAMESPACE", Value: inv.Namespace},
 		{Name: "COURIER_MODE", Value: string(inv.Mode)},
 		{Name: "COURIER_REPO", Value: inv.Repo},
+		{Name: "COURIER_HEAD_REPO", Value: inv.HeadRepo},
+		{Name: "COURIER_HEAD_SHA", Value: inv.HeadSHA},
 		{Name: "COURIER_REF", Value: strconv.Itoa(inv.Ref)},
 		{Name: "COURIER_BRANCH", Value: inv.Branch},
 		{Name: "COURIER_GOAL", Value: inv.Goal},
