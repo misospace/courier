@@ -262,6 +262,22 @@ world wins on conflict.
 - **Workspace: ephemeral `emptyDir`,** rebuilt from git on every start. Nothing
   durable lives on disk, so there is no workspace PVC to sprawl.
 
+### Uncommitted failure work (#109)
+
+The shipped bootstrap keeps its termination handoff in a separate runtime
+`emptyDir`, but does not yet provide OpenCode a permitted scratch directory.
+#114 owns the bounded scratch fix: a per-run mount outside the checkout, temp
+environment and framing, and narrowly verified permissions for the pinned
+OpenCode runtime and delegates. Scratch is disposable, not a checkpoint.
+
+A terminal `NeedsHuman` or `Failed` run may still have uncommitted edits in its
+checkout. Those edits are **not durable**: when the pod is removed, the emptyDir
+and its dirty work disappear. Logs and status are not a recoverable patch.
+#115 owns the separate design of secure, bounded, operator-retrievable failure
+evidence before any preservation implementation. Until that mechanism is
+reviewed, do not push incomplete work, persist raw diffs in logs or CR status,
+or treat a fresh retry (#97) as recovery of the old checkout.
+
 ### Commit cadence
 
 Commit at **completed-brief boundaries** — not mid-thought (a foot-gun for a long
@@ -560,6 +576,13 @@ A running log of architectural decisions and their reasoning, newest first. The
 body above describes the current architecture; this log preserves *why* and what
 was superseded.
 
+- **2026-09-25 — Separate safe scratch from durable dirty-work recovery.**
+  A per-run scratch mount and narrow OpenCode permissions address unattended
+  temp-file use without expanding access to `/tmp` or polluting the checkout
+  (#109, #114). Scratch is not recovery: the bootstrap still loses uncommitted
+  edits when its ephemeral pod is removed. Secure evidence storage, limits and
+  retrieval need a separate design before implementation (#115). An explicit
+  retry (#97) is a fresh attempt, not an implicit restoration.
 - **2026-09-25 — The executor informs the coordinator of unreachable MCP
   capabilities.** Before the goal runs, the bootstrap performs one
   liveness-bounded (30s, never a run timeout) `mcp list` preflight against the
