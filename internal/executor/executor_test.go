@@ -35,14 +35,15 @@ func TestOpenCodeCommandInjectsGoalModelAndFraming(t *testing.T) {
 
 func TestOpenCodeCommandIncludesConfiguredAgent(t *testing.T) {
 	invocation := Invocation{Goal: "goal", Model: "model"}
+	wantPrompt := "goal\n\nUse the Courier scratch directory at /var/tmp/courier-scratch (also set as TMPDIR) for all temporary work, and tell any delegated sub-agents to do the same."
 	for _, test := range []struct {
 		name  string
 		agent string
 		want  []string
 	}{
-		{name: "trimmed lead", agent: " lead ", want: []string{"run", "--model", "model", "--agent", "lead", "goal"}},
-		{name: "arbitrary architect", agent: "architect", want: []string{"run", "--model", "model", "--agent", "architect", "goal"}},
-		{name: "empty", want: []string{"run", "--model", "model", "goal"}},
+		{name: "trimmed lead", agent: " lead ", want: []string{"run", "--model", "model", "--agent", "lead", wantPrompt}},
+		{name: "arbitrary architect", agent: "architect", want: []string{"run", "--model", "model", "--agent", "architect", wantPrompt}},
+		{name: "empty", want: []string{"run", "--model", "model", wantPrompt}},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			command := (OpenCode{Binary: "opencode", Agent: test.agent}).Command(invocation)
@@ -608,9 +609,12 @@ func TestBuildCoordinatorPodWiresRolesAndMCPConfig(t *testing.T) {
 		t.Fatalf("opencode config annotation = %q, not valid JSON: %v", annotation, err)
 	}
 
-	denyMerge := map[string]string{
+	wantPermission := map[string]any{
 		"github_merge_pull_request": "deny",
 		"github_merge*":             "deny",
+		"external_directory": map[string]any{
+			"/var/tmp/courier-scratch/**": "allow",
+		},
 	}
 	wantAgents := map[string]openCodeAgent{
 		"coordinator":  {Mode: "all", Model: "litellm/coordinator"},
@@ -621,8 +625,8 @@ func TestBuildCoordinatorPodWiresRolesAndMCPConfig(t *testing.T) {
 	if !reflect.DeepEqual(cfg.Agents, wantAgents) {
 		t.Fatalf("opencode config agents = %#v, want %#v", cfg.Agents, wantAgents)
 	}
-	if !reflect.DeepEqual(cfg.Permission, denyMerge) {
-		t.Fatalf("opencode config permission = %#v, want %#v", cfg.Permission, denyMerge)
+	if !reflect.DeepEqual(cfg.Permission, wantPermission) {
+		t.Fatalf("opencode config permission = %#v, want %#v", cfg.Permission, wantPermission)
 	}
 
 	wantMCP := map[string]openCodeMCP{
@@ -751,6 +755,193 @@ func TestBuildCoordinatorPodOmitsMetricsMCPWhenUnconfigured(t *testing.T) {
 	}
 	if got, ok := cfg.MCP["context7"]; !ok || got.URL != "https://context7.example/mcp" {
 		t.Fatalf("context7 mcp = %#v, want the configured context7 URL", got)
+	}
+}
+
+func TestBuildCoordinatorPodProvisionsScratch(t *testing.T) {
+	run := &courierv1alpha1.CoderRun{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "run-scratch",
+			Namespace: "courier-system",
+			UID:       "run-uid",
+		},
+		Spec: courierv1alpha1.CoderRunSpec{
+			Mode: courierv1alpha1.ModeResolveIssue,
+			Repo: "acme/widgets",
+			Ref:  7,
+			Lane: "local",
+		},
+		Status: courierv1alpha1.CoderRunStatus{Branch: "courier/acme/widgets/issue-7"},
+	}
+	lane := &courierv1alpha1.LaneProfile{
+		ObjectMeta: metav1.ObjectMeta{Name: "local", Namespace: "courier-system"},
+		Spec:       courierv1alpha1.LaneProfileSpec{Roles: map[string]string{"coordinator": "litellm/qwen"}},
+	}
+
+	const scratchMountPath = "/var/tmp/courier-scratch"
+
+	pod, err := BuildCoordinatorPod(run, lane, DefaultPodConfig())
+	if err != nil {
+		t.Fatalf("BuildCoordinatorPod() error = %v", err)
+	}
+
+	foundScratchVolume := false
+	for _, volume := range pod.Spec.Volumes {
+		if volume.Name != "scratch" {
+			continue
+		}
+		if volume.EmptyDir == nil {
+			t.Fatal("scratch volume is not an EmptyDir; give the scratch volume an EmptyDir source in BuildCoordinatorPod")
+		}
+		foundScratchVolume = true
+		break
+	}
+	if !foundScratchVolume {
+		t.Fatal("scratch EmptyDir volume is missing; add a volume named \"scratch\" in BuildCoordinatorPod")
+	}
+
+	container := pod.Spec.Containers[0]
+
+	foundScratchMount := false
+	for _, mount := range container.VolumeMounts {
+		if mount.Name != "scratch" {
+			continue
+		}
+		if mount.MountPath != scratchMountPath {
+			t.Fatalf("scratch mount path = %q, want %q", mount.MountPath, scratchMountPath)
+		}
+		if mount.ReadOnly {
+			t.Fatal("scratch volume mount is read-only; the coordinator must write to it")
+		}
+		foundScratchMount = true
+		break
+	}
+	if !foundScratchMount {
+		t.Fatal("scratch volume mount is missing; mount the scratch volume at /var/tmp/courier-scratch")
+	}
+
+	env := make(map[string]string, len(container.Env))
+	for _, value := range container.Env {
+		env[value.Name] = value.Value
+	}
+	for _, key := range []string{"TMPDIR", "TMP", "TEMP", "COURIER_SCRATCH_DIR"} {
+		if env[key] != scratchMountPath {
+			t.Fatalf("env %s = %q, want %q", key, env[key], scratchMountPath)
+		}
+	}
+
+	if scratchMountPath == container.WorkingDir {
+		t.Fatalf("scratch mount path %q collides with the workspace mount path", scratchMountPath)
+	}
+	if scratchMountPath == "/courier-runtime" {
+		t.Fatalf("scratch mount path %q collides with the runtime mount path", scratchMountPath)
+	}
+}
+
+func TestOpenCodeConfigScratchPermissionLeastPrivilege(t *testing.T) {
+	roles := map[string]string{
+		"coordinator": "litellm/qwen",
+		"coder":       "litellm/coder",
+	}
+	raw, err := marshalOpenCodeConfig(roles, "", "", "")
+	if err != nil {
+		t.Fatalf("marshalOpenCodeConfig() error = %v", err)
+	}
+
+	var config map[string]any
+	if err := json.Unmarshal(raw, &config); err != nil {
+		t.Fatalf("opencode config = %q, not valid JSON: %v", raw, err)
+	}
+
+	permission, ok := config["permission"].(map[string]any)
+	if !ok {
+		t.Fatalf("permission = %#v, want an object; emit a permission object from marshalOpenCodeConfig", config["permission"])
+	}
+
+	const scratchAllow = "/var/tmp/courier-scratch/**"
+
+	for _, key := range []string{"github_merge_pull_request", "github_merge*"} {
+		if permission[key] != "deny" {
+			t.Fatalf("permission %q = %v, want \"deny\" (retained merge denial)", key, permission[key])
+		}
+	}
+
+	externalDirectory, ok := permission["external_directory"].(map[string]any)
+	if !ok {
+		t.Fatalf("permission.external_directory = %#v, want an object mapping the scratch path to a permission", permission["external_directory"])
+	}
+	if len(externalDirectory) != 1 {
+		t.Fatalf("permission.external_directory = %#v, want exactly one key; narrow it to the per-run scratch path", externalDirectory)
+	}
+	for key, value := range externalDirectory {
+		if key != scratchAllow {
+			t.Fatalf("permission.external_directory key = %q, want %q", key, scratchAllow)
+		}
+		if value != "allow" {
+			t.Fatalf("permission.external_directory[%q] = %v, want \"allow\"", key, value)
+		}
+		if key == "*" || key == "/*" {
+			t.Fatalf("permission.external_directory uses the wildcard key %q; scope it to the scratch path", key)
+		}
+		if strings.HasPrefix(key, "/tmp") {
+			t.Fatalf("permission.external_directory allows a path beginning /tmp: %q; scope it to the scratch path", key)
+		}
+		if strings.Contains(key, "~") || strings.Contains(key, "$HOME") || strings.Contains(key, "root") {
+			t.Fatalf("permission.external_directory references a home/config path: %q", key)
+		}
+	}
+}
+
+func TestCoordinatorPromptIncludesScratchHint(t *testing.T) {
+	const scratchPath = "/var/tmp/courier-scratch"
+	const framing = "single GPU; keep parallelism modest"
+	tests := []struct {
+		name    string
+		goal    string
+		framing string
+	}{
+		{name: "with lane framing", goal: "Open a PR for issue #7.", framing: framing},
+		{name: "without lane framing", goal: "Open a PR for issue #7.", framing: ""},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			invocation := Invocation{Goal: test.goal, Framing: test.framing}
+			got := prompt(invocation)
+			if !strings.Contains(got, scratchPath) {
+				t.Fatalf("prompt = %q, missing the scratch dir hint %q", got, scratchPath)
+			}
+			if test.framing != "" && !strings.Contains(got, test.framing) {
+				t.Fatalf("prompt = %q, missing the lane framing %q", got, test.framing)
+			}
+		})
+	}
+}
+
+func TestPodConfigValidateScratchOverlap(t *testing.T) {
+	base := DefaultPodConfig()
+	for _, test := range []struct {
+		name    string
+		path    string
+		wantErr bool
+	}{
+		{name: "workspace", path: "/workspace", wantErr: false},
+		{name: "sibling", path: "/var/tmp/other", wantErr: false},
+		{name: "ancestor", path: "/var/tmp", wantErr: true},
+		{name: "higher ancestor", path: "/var", wantErr: true},
+		{name: "equal", path: "/var/tmp/courier-scratch", wantErr: true},
+		{name: "descendant", path: "/var/tmp/courier-scratch/sub", wantErr: true},
+		{name: "trailing-slash equal", path: "/var/tmp/courier-scratch/", wantErr: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			base.WorkspacePath = test.path
+			err := base.Validate()
+			if test.wantErr && err == nil {
+				t.Fatalf("Validate() for workspace path %q = nil, want an overlap error", test.path)
+			}
+			if !test.wantErr && err != nil {
+				t.Fatalf("Validate() for workspace path %q = %v, want no error", test.path, err)
+			}
+		})
 	}
 }
 
