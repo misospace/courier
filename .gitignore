@@ -16,3 +16,4 @@ vendor/
 # Helm dependency tarballs (rebuilt from Chart.lock)
 charts/*/charts/
 charts/**/*.tgz
+dist/

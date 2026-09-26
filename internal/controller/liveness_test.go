@@ -191,6 +191,38 @@ func TestLivenessCrashloopTransitionsToNeedsHuman(t *testing.T) {
 	}
 }
 
+func TestLivenessCeilingEnrichesObservedPR(t *testing.T) {
+	src := &admissionSource{}
+	run := admissionRun("run", "local", courierv1alpha1.PhaseRunning)
+	withHeartbeat(run, livenessClock.Add(-10*time.Minute))
+	run.Status.Restarts = 3
+	// A run can open a PR and then wedge before Verifying ever observes
+	// it: the ceiling path must still publish the PR the world shows.
+	run.Status.Branch = "courier/acme/widgets/issue-1"
+	pod := runningCoordinatorPod(run)
+	pod.Status.ContainerStatuses[0].State.Running.StartedAt = metav1.NewTime(livenessClock.Add(-10 * time.Minute))
+	client := phaseClient(t, run, pod)
+	reconciler := livenessReconciler(client, src, livenessClock)
+	reconciler.Observer = fakeWorldObserver{observation: PRObservation{PR: "42", Checks: []CheckObservation{{Name: "check", State: CheckStateFailed}}}}
+
+	if _, err := reconciler.Reconcile(context.Background(), admissionRequest("run")); err != nil {
+		t.Fatalf("Reconcile() error = %v", err)
+	}
+	var updated courierv1alpha1.CoderRun
+	if err := client.Get(context.Background(), admissionKey("run"), &updated); err != nil {
+		t.Fatalf("get run: %v", err)
+	}
+	if updated.Status.Phase != courierv1alpha1.PhaseNeedsHuman {
+		t.Fatalf("phase = %q, want NeedsHuman", updated.Status.Phase)
+	}
+	if updated.Status.PR != "42" {
+		t.Fatalf("PR = %q, want 42", updated.Status.PR)
+	}
+	if len(src.reports) != 1 || src.reports[0].PR != "42" || src.reports[0].State != source.StateNeedsHuman {
+		t.Fatalf("reports = %#v, want one report with PR 42 and state %q", src.reports, source.StateNeedsHuman)
+	}
+}
+
 func TestLivenessJustBelowCeilingRelaunches(t *testing.T) {
 	src := &admissionSource{}
 	run := admissionRun("run", "local", courierv1alpha1.PhaseRunning)
