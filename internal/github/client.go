@@ -21,8 +21,9 @@ import (
 )
 
 const (
-	defaultBaseURL = "https://api.github.com/"
-	apiVersion     = "2022-11-28"
+	defaultBaseURL      = "https://api.github.com/"
+	apiVersion          = "2022-11-28"
+	maxPullRequestPages = 1000
 )
 
 // HTTPDoer is the part of http.Client used by Client. Keeping it small makes
@@ -316,10 +317,35 @@ func (c *Client) PullRequestsForHead(ctx context.Context, owner, repo, headOwner
 	return out, err
 }
 
+// PullRequestsForHeadAllPages paginates the all-state GitHub head query. The
+// legacy PullRequestsForHead remains a one-page operation for existing callers.
+func (c *Client) PullRequestsForHeadAllPages(ctx context.Context, owner, repo, headOwner, branch string) ([]PullRequest, error) {
+	endpoint := repoEndpoint(owner, repo, "pulls")
+	var out []PullRequest
+	for page := 1; ; page++ {
+		var current []PullRequest
+		err := c.doJSONQuery(ctx, http.MethodGet, endpoint, headFilterPageQuery(headOwner, branch, page), nil, &current)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, current...)
+		if len(current) < 100 {
+			return out, nil
+		}
+		if page == maxPullRequestPages {
+			return nil, fmt.Errorf("GitHub pull-request response exceeded %d pages", maxPullRequestPages)
+		}
+	}
+}
+
 // headFilterQuery builds the pulls-list query for a head ref owned by
 // headOwner. GitHub requires the owner:branch form of the head filter.
 func headFilterQuery(headOwner, branch string) string {
 	return "head=" + url.QueryEscape(headOwner) + ":" + url.QueryEscape(branch) + "&state=all"
+}
+
+func headFilterPageQuery(headOwner, branch string, page int) string {
+	return headFilterQuery(headOwner, branch) + "&page=" + strconv.Itoa(page) + "&per_page=100"
 }
 
 // GetCheckRuns reads all CI checks for a commit, branch, or tag ref.

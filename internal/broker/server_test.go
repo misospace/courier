@@ -7,6 +7,7 @@ import (
 	"crypto/rand"
 	"crypto/x509"
 	"crypto/x509/pkix"
+	"encoding/hex"
 	"encoding/pem"
 	"math/big"
 	"net/http"
@@ -27,6 +28,15 @@ type testAuthenticator struct {
 }
 type serverObserver struct{}
 
+type importTestObserver struct{ serverObserver }
+
+func (importTestObserver) Repository(_ context.Context, repo, ref string) (RepositoryState, error) {
+	if ref == "main" {
+		return RepositoryState{Repo: repo, Ref: ref, Exists: true, OID: strings.Repeat("a", 40)}, nil
+	}
+	return RepositoryState{Repo: repo, Ref: ref, ProtectionKnown: true, WriteKnown: true, Writable: true}, nil
+}
+
 func (serverObserver) Repository(context.Context, string, string) (RepositoryState, error) {
 	return RepositoryState{}, nil
 }
@@ -42,6 +52,25 @@ func (serverObserver) CreatePullRequest(context.Context, CreatePullRequest) (int
 func (serverObserver) UpdatePullRequest(context.Context, int, UpdatePullRequest) error { return nil }
 
 type serverPusher struct{}
+type serverImporter struct {
+	calls    int
+	path     string
+	proposed string
+	expected string
+	err      error
+}
+
+func (i *serverImporter) ImportBundle(ctx context.Context, path, proposed, expected string) error {
+	i.calls++
+	i.path, i.proposed, i.expected = path, proposed, expected
+	if _, err := os.Stat(path); err != nil {
+		return err
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	return i.err
+}
 
 func (serverPusher) IsAncestor(context.Context, string, string, string) (bool, error) {
 	return false, nil
@@ -61,12 +90,12 @@ func (a *testAuthenticator) Authenticate(_ context.Context, token string) (Ident
 func serverForTest(t *testing.T) (*Server, *testAuthenticator) {
 	t.Helper()
 	cert, key := testTLSFiles(t)
-	engine, err := NewPolicyEngine(Policy{RunUID: "run-uid", Mode: ModeResolveIssue, Provider: "test", BaseRepo: "org/repo", BaseRef: "main", BaseOID: "base", WorkRepo: "org/repo", WorkRef: "courier/org/repo/issue-1", WorkInitiallyAbsent: true}, serverObserver{}, serverPusher{})
+	engine, err := NewPolicyEngine(Policy{RunUID: "run-uid", Mode: ModeResolveIssue, Provider: "test", BaseRepo: "org/repo", BaseRef: "main", BaseOID: strings.Repeat("a", 40), WorkRepo: "org/repo", WorkRef: "courier/org/repo/issue-1", WorkInitiallyAbsent: true}, importTestObserver{}, serverPusher{})
 	if err != nil {
 		t.Fatal(err)
 	}
 	auth := &testAuthenticator{}
-	s, err := NewServer(ServerConfig{Policy: engine, Authenticator: auth, TLSCertFile: cert, TLSKeyFile: key})
+	s, err := NewServer(ServerConfig{Policy: engine, Authenticator: auth, Importer: &serverImporter{}, ScratchDir: t.TempDir(), TLSCertFile: cert, TLSKeyFile: key})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -119,6 +148,45 @@ func TestServerRejectsWrongRunIdentity(t *testing.T) {
 	}
 }
 
+func TestServerImportsBundleFromPrivateScratch(t *testing.T) {
+	s, _ := serverForTest(t)
+	importer := s.importer.(*serverImporter)
+	reqBody := `{"expectedTip":"","proposedOID":"` + strings.Repeat("b", 40) + `","bundle":"` + hex.EncodeToString([]byte("pack bytes")) + `"}`
+	req := httptest.NewRequest(http.MethodPost, PathImportBundle, strings.NewReader(reqBody))
+	req.Header.Set("Authorization", "Bearer valid-token")
+	w := httptest.NewRecorder()
+	s.Handler().ServeHTTP(w, req)
+	if w.Code != http.StatusOK || importer.calls != 1 {
+		t.Fatalf("status=%d calls=%d body=%s", w.Code, importer.calls, w.Body.String())
+	}
+	if !strings.HasPrefix(importer.path, s.scratchDir+string(os.PathSeparator)) || importer.proposed != strings.Repeat("b", 40) || importer.expected != "" {
+		t.Fatalf("unexpected importer args: %#v", importer)
+	}
+	if _, err := os.Stat(importer.path); !os.IsNotExist(err) {
+		t.Fatalf("temporary bundle remains after import: err=%v", err)
+	}
+}
+
+func TestServerRejectsInvalidBundleRequests(t *testing.T) {
+	for _, body := range []string{
+		`{"expectedTip":"","proposedOID":"` + strings.Repeat("b", 40) + `","bundle":""}`,
+		`{"expectedTip":"","proposedOID":"bad","bundle":"00"}`,
+		`{"expectedTip":"","proposedOID":"` + strings.Repeat("b", 40) + `","bundle":"not-hex"}`,
+		`{"expectedTip":"","proposedOID":"` + strings.Repeat("b", 40) + `","bundle":"00","path":"/tmp/x"}`,
+		`{"expectedTip":"` + strings.Repeat("c", 40) + `","proposedOID":"` + strings.Repeat("b", 40) + `","bundle":"00"}`,
+	} {
+		s, _ := serverForTest(t)
+		importer := s.importer.(*serverImporter)
+		req := httptest.NewRequest(http.MethodPost, PathImportBundle, strings.NewReader(body))
+		req.Header.Set("Authorization", "Bearer valid-token")
+		w := httptest.NewRecorder()
+		s.Handler().ServeHTTP(w, req)
+		if w.Code < 400 || importer.calls != 0 {
+			t.Fatalf("body=%s status=%d importer calls=%d", body, w.Code, importer.calls)
+		}
+	}
+}
+
 func TestNewServerFailsClosed(t *testing.T) {
 	cert, key := testTLSFiles(t)
 	auth := &testAuthenticator{}
@@ -126,6 +194,7 @@ func TestNewServerFailsClosed(t *testing.T) {
 		{Authenticator: auth, TLSCertFile: cert, TLSKeyFile: key},
 		{Policy: &PolicyEngine{}, TLSCertFile: cert, TLSKeyFile: key},
 		{Policy: &PolicyEngine{}, Authenticator: auth},
+		{Policy: &PolicyEngine{}, Authenticator: auth, Importer: &serverImporter{}, TLSCertFile: cert, TLSKeyFile: key},
 	} {
 		if _, err := NewServer(config); err == nil {
 			t.Fatalf("NewServer(%+v) unexpectedly succeeded", config)

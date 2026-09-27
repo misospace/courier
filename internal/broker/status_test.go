@@ -72,6 +72,38 @@ func TestStatusWriterRequiresLiveValidatorForLastCommit(t *testing.T) {
 	}
 }
 
+func TestStatusWriterRejectsUnlabeledDuplicateControlPod(t *testing.T) {
+	w, c, identity := statusFixture(t)
+	controller := true
+	duplicate := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{
+		Namespace: testNamespace,
+		Name:      "control-duplicate",
+		UID:       "pod-uid-duplicate",
+		OwnerReferences: []metav1.OwnerReference{{
+			APIVersion: courier.GroupVersion.String(),
+			Kind:       "CoderRun",
+			Name:       testRunName,
+			UID:        identity.RunUID,
+			Controller: &controller,
+		}},
+	}, Spec: corev1.PodSpec{ServiceAccountName: identity.ControlServiceAccount}}
+	if err := c.Create(context.Background(), duplicate); err != nil {
+		t.Fatal(err)
+	}
+
+	checkpoint := &courier.Checkpoint{Plan: "must-not-write"}
+	if err := w.Write(context.Background(), identity, HarnessPatch{Checkpoint: checkpoint}, nil); err == nil {
+		t.Fatal("expected unlabeled duplicate control pod to make identity ambiguous")
+	}
+	got := &courier.CoderRun{}
+	if err := c.Get(context.Background(), client.ObjectKey{Namespace: testNamespace, Name: testRunName}, got); err != nil {
+		t.Fatal(err)
+	}
+	if got.Status.Checkpoint != nil {
+		t.Fatalf("ambiguous control pod identity modified run status: %#v", got.Status)
+	}
+}
+
 func TestStatusWriterRejectsStaleControlPod(t *testing.T) {
 	w, c, identity := statusFixture(t)
 	pod := &corev1.Pod{}

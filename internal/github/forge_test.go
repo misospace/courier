@@ -315,3 +315,43 @@ func TestProviderUnsupportedOperations(t *testing.T) {
 		t.Fatalf("ListComments() error = %v, want ErrUnsupported", err)
 	}
 }
+func TestProviderListsPullRequestsByFullHeadAcrossPages(t *testing.T) {
+	var pages []string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		pages = append(pages, r.URL.Query().Get("page"))
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Query().Get("page") {
+		case "1":
+			items := make([]byte, 0, 12000)
+			items = append(items, '[')
+			for i := 1; i <= 100; i++ {
+				if i > 1 {
+					items = append(items, ',')
+				}
+				items = append(items, []byte(fmt.Sprintf(`{"number":%d,"state":"closed","head":{"ref":"work","sha":"head","repo":{"full_name":"octo/other"}},"base":{"ref":"main","sha":"base","repo":{"full_name":"acme/demo"}}}`, i))...)
+			}
+			items = append(items, ']')
+			_, _ = w.Write(items)
+		case "2":
+			_, _ = io.WriteString(w, `[{"number":101,"state":"open","head":{"ref":"work","sha":"head2","repo":{"full_name":"octo/widgets"}},"base":{"ref":"main","sha":"base","repo":{"full_name":"acme/demo"}}}]`)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+	client, err := NewClient(server.URL, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	provider := NewProvider(forge.ProviderConfig{Name: "github"}, client)
+	got, err := provider.ListPullRequestsByHead(context.Background(), forge.PullRequestRef{Repo: "acme/demo"}, "octo/widgets", "work")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 || got[0].Number != 101 || got[0].HeadRepo != "octo/widgets" {
+		t.Fatalf("matches = %#v", got)
+	}
+	if len(pages) != 2 || pages[0] != "1" || pages[1] != "2" {
+		t.Fatalf("pages = %v, want [1 2]", pages)
+	}
+}

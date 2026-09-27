@@ -147,6 +147,62 @@ func TestPullRequestsForHead(t *testing.T) {
 	}
 }
 
+func TestPullRequestsForHeadAllPagesPaginate(t *testing.T) {
+	var pages []string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		pages = append(pages, r.URL.Query().Get("page"))
+		w.Header().Set("Content-Type", "application/json")
+		if r.URL.Query().Get("page") == "1" {
+			pulls := make([]PullRequest, 100)
+			for i := range pulls {
+				pulls[i].Number = i + 1
+			}
+			_ = json.NewEncoder(w).Encode(pulls)
+			return
+		}
+		_, _ = io.WriteString(w, `[{"number":101}]`)
+	}))
+	defer server.Close()
+	client, err := NewClient(server.URL, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	pulls, err := client.PullRequestsForHeadAllPages(context.Background(), "acme", "demo", "acme", "work")
+	if err != nil || len(pulls) != 101 {
+		t.Fatalf("pulls = %d, %v; want 101 pull requests", len(pulls), err)
+	}
+	if got := strings.Join(pages, ","); got != "1,2" {
+		t.Fatalf("pages = %q, want 1,2", got)
+	}
+}
+
+func TestPullRequestsForHeadAllPagesStopsAtCeiling(t *testing.T) {
+	requests := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests++
+		w.Header().Set("Content-Type", "application/json")
+		pulls := make([]PullRequest, 100)
+		for i := range pulls {
+			pulls[i].Number = i + 1
+		}
+		_ = json.NewEncoder(w).Encode(pulls)
+	}))
+	defer server.Close()
+	client, err := NewClient(server.URL, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	_, err = client.PullRequestsForHeadAllPages(context.Background(), "acme", "demo", "acme", "work")
+	if err == nil || !strings.Contains(err.Error(), "exceeded 1000 pages") {
+		t.Fatalf("error = %v, want page-ceiling error", err)
+	}
+	if requests != maxPullRequestPages {
+		t.Fatalf("requests = %d, want %d", requests, maxPullRequestPages)
+	}
+}
+
 func TestGetCheckRunsAndCommitStatusesPaginate(t *testing.T) {
 	var requests []string
 	var pages []string

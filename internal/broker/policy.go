@@ -98,11 +98,13 @@ type PublicationResult struct {
 }
 
 type PolicyEngine struct {
-	mu        sync.Mutex
-	policy    Policy
-	observer  Observer
-	pusher    Pusher
-	confirmed map[string]struct{}
+	mu       sync.Mutex
+	policy   Policy
+	observer Observer
+	pusher   Pusher
+	// confirmed is the single exact tip confirmed by this process. It is not
+	// durable evidence: after restart, only the admission anchor is trusted.
+	confirmed string
 }
 
 // NewPolicyEngine fails closed when any required provider capability is absent.
@@ -113,11 +115,7 @@ func NewPolicyEngine(policy Policy, observer Observer, pusher Pusher) (*PolicyEn
 	if err := validatePolicy(policy); err != nil {
 		return nil, err
 	}
-	confirmed := make(map[string]struct{})
-	if policy.WorkAnchorOID != "" {
-		confirmed[policy.WorkAnchorOID] = struct{}{}
-	}
-	return &PolicyEngine{policy: policy, observer: observer, pusher: pusher, confirmed: confirmed}, nil
+	return &PolicyEngine{policy: policy, observer: observer, pusher: pusher}, nil
 }
 
 func validatePolicy(p Policy) error {
@@ -143,7 +141,9 @@ func validatePolicy(p Policy) error {
 }
 
 // Publish performs fresh preflight, one ordinary push, and mandatory postflight.
-// An uncertain push is idempotent only when the live ref equals this exact OID.
+// The push's own success/failure report never decides the outcome: an uncertain
+// push is confirmed idempotently only when the live ref equals this exact
+// proposed OID and every policy check still passes, and rejected otherwise.
 func (e *PolicyEngine) Publish(ctx context.Context, req PublicationRequest) (PublicationResult, error) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
@@ -164,12 +164,12 @@ func (e *PolicyEngine) Publish(ctx context.Context, req PublicationRequest) (Pub
 	if err = e.checkDestination(work); err != nil {
 		return PublicationResult{}, err
 	}
-	if err = e.checkPR(pr, work.OID); err != nil {
+	if err = e.checkPR(pr, work.OID, ""); err != nil {
 		return PublicationResult{}, err
 	}
 
 	if work.Exists {
-		_, confirmed := e.confirmed[work.OID]
+		confirmed := e.confirmed == work.OID
 		anchor := p.WorkAnchorOID
 		if p.Mode == ModeFixPR {
 			anchor = p.HeadAnchorOID
@@ -179,13 +179,18 @@ func (e *PolicyEngine) Publish(ctx context.Context, req PublicationRequest) (Pub
 		}
 	}
 	if work.Exists && work.OID == req.ProposedOID {
+		// A live OID alone cannot establish run ownership after a restart. Only
+		// this process's post-push confirmation may make it idempotent.
+		if e.confirmed != work.OID {
+			return PublicationResult{}, errors.New("publication denied: exact live proposal lacks trusted run evidence")
+		}
 		if pr != nil && pr.HeadOID != work.OID {
 			return PublicationResult{}, errors.New("publication denied: pull request head differs from live work tip")
 		}
 		if !p.WorkInitiallyAbsent && work.OID == p.WorkAnchorOID {
 			return PublicationResult{}, errors.New("publication denied: proposed OID is the admitted anchor, not a new publication")
 		}
-		e.confirmed[work.OID] = struct{}{}
+		e.confirmed = work.OID
 		return PublicationResult{OID: req.ProposedOID, AlreadyPublished: true}, nil
 	}
 	if req.ExpectedWorkOID == "" {
@@ -216,34 +221,50 @@ func (e *PolicyEngine) Publish(ctx context.Context, req PublicationRequest) (Pub
 		return PublicationResult{}, errors.New("publication denied: proposed commit is not a fast-forward")
 	}
 
+	// A failed postflight must not leave an older in-process confirmation usable
+	// as evidence for the newly observed world.
+	e.confirmed = ""
 	pushErr := e.pusher.Push(ctx, p.WorkRepo, p.WorkRef, req.ProposedOID)
 	// Re-read everything whether push returned success, failure, or uncertainty.
 	base, work, pr, observeErr := e.observe(ctx)
 	if observeErr != nil {
+		e.confirmed = ""
 		return PublicationResult{}, errors.New("post-push observation failed; publication outcome is unconfirmed")
 	}
 	if err = e.checkBase(base); err != nil {
+		e.confirmed = ""
 		return PublicationResult{}, fmt.Errorf("post-push policy check: %w", err)
 	}
 	if err = e.checkDestination(work); err != nil {
+		e.confirmed = ""
 		return PublicationResult{}, errors.New("post-push policy check failed")
 	}
 	if !work.Exists || work.OID != req.ProposedOID {
+		e.confirmed = ""
 		if pushErr != nil {
 			return PublicationResult{}, errors.New("push failed or was uncertain and exact proposed OID is not live")
 		}
 		return PublicationResult{}, errors.New("publication denied: live work tip does not equal proposed OID")
 	}
-	e.confirmed[req.ProposedOID] = struct{}{}
-	if err = e.checkPR(pr, work.OID); err != nil {
-		delete(e.confirmed, req.ProposedOID)
+	// The exact proposed OID is live, so publication is confirmed idempotently.
+	// The transport's own report does not decide this: whether Push returned
+	// success, failure or an uncertain outcome, the mandatory post-push
+	// observation and the policy checks above decide. This call holds trusted
+	// pre-push evidence — the proposal was imported into the broker store and
+	// passed ancestry checks against the expected work tip and live base — so an
+	// exact live match is sufficient to confirm. A fresh broker after a crash
+	// never reaches here for a caller-supplied OID: the pre-push equality check
+	// above rejects that without trusted in-process confirmation.
+	if err = e.checkPR(pr, work.OID, req.ProposedOID); err != nil {
+		e.confirmed = ""
 		return PublicationResult{}, errors.New("post-push PR identity check failed")
 	}
 	baseIncluded, err = e.pusher.IsAncestor(ctx, p.BaseRepo, base.OID, req.ProposedOID)
 	if err != nil || !baseIncluded {
-		delete(e.confirmed, req.ProposedOID)
+		e.confirmed = ""
 		return PublicationResult{}, errors.New("post-push proposed commit does not include the live base tip")
 	}
+	e.confirmed = req.ProposedOID
 	return PublicationResult{OID: req.ProposedOID, AlreadyPublished: pushErr != nil}, nil
 }
 
@@ -301,7 +322,7 @@ func (e *PolicyEngine) checkDestination(s RepositoryState) error {
 	return nil
 }
 
-func (e *PolicyEngine) checkPR(pr *PullRequestState, workOID string) error {
+func (e *PolicyEngine) checkPR(pr *PullRequestState, workOID, trustedTip string) error {
 	p := e.policy
 	if p.Mode != ModeFixPR {
 		return nil
@@ -315,7 +336,7 @@ func (e *PolicyEngine) checkPR(pr *PullRequestState, workOID string) error {
 	if workOID == "" || pr.HeadOID != workOID {
 		return errors.New("publication denied: pull request head differs from exact live work tip")
 	}
-	if _, owned := e.confirmed[pr.HeadOID]; !owned && pr.HeadOID != p.HeadAnchorOID {
+	if e.confirmed != pr.HeadOID && trustedTip != pr.HeadOID && pr.HeadOID != p.HeadAnchorOID {
 		return errors.New("publication denied: pull request head is not an admitted or previously confirmed run tip")
 	}
 	return nil
@@ -343,8 +364,7 @@ func (e *PolicyEngine) CreatePullRequest(ctx context.Context, oid, title, body s
 	if !work.Exists || oid == "" || work.OID != oid {
 		return PullRequestState{}, errors.New("publication denied: proposed OID is not the exact live head")
 	}
-	_, confirmed := e.confirmed[oid]
-	if !confirmed && oid != p.WorkAnchorOID {
+	if e.confirmed != oid && oid != p.WorkAnchorOID {
 		return PullRequestState{}, errors.New("publication denied: pull request head is not an admitted or previously confirmed run tip")
 	}
 	pulls, err := e.observer.FindPullRequest(ctx, p.WorkRepo, p.WorkRef)
@@ -376,6 +396,25 @@ func (e *PolicyEngine) CreatePullRequest(ctx context.Context, oid, title, body s
 	if !matchesPR(p, created, oid) {
 		return PullRequestState{}, errors.New("publication denied: created pull request identity or head differs from pinned policy")
 	}
+	// Close the create race: a provider may return one PR while another matching
+	// PR is created concurrently. Confirm the complete pinned head list again.
+	pulls, err = e.observer.FindPullRequest(ctx, p.WorkRepo, p.WorkRef)
+	if err != nil {
+		return PullRequestState{}, errors.New("recheck pull requests after create failed")
+	}
+	found := false
+	for _, candidate := range pulls {
+		if candidate.Number == number && matchesPR(p, candidate, oid) {
+			found = true
+			continue
+		}
+		if candidate.HeadRepo == p.WorkRepo && candidate.HeadRef == p.WorkRef {
+			return PullRequestState{}, errors.New("publication denied: concurrent pull request exists for pinned head")
+		}
+	}
+	if !found {
+		return PullRequestState{}, errors.New("publication denied: created pull request is absent from pinned head recheck")
+	}
 	return created, nil
 }
 
@@ -403,7 +442,7 @@ func (e *PolicyEngine) UpdateFixPR(ctx context.Context, update UpdatePullRequest
 	// checkPR enforces the exact live head (pr.HeadOID == work.OID) and that the
 	// head is an admitted or previously confirmed run tip, which is sufficient for
 	// metadata: a tip this run published is admitted, a foreign tip is not.
-	if err = e.checkPR(pr, work.OID); err != nil {
+	if err = e.checkPR(pr, work.OID, e.confirmed); err != nil {
 		return err
 	}
 	if err = e.observer.UpdatePullRequest(ctx, p.PRNumber, update); err != nil {
@@ -419,7 +458,7 @@ func (e *PolicyEngine) UpdateFixPR(ctx context.Context, update UpdatePullRequest
 	if err = e.checkDestination(live); err != nil {
 		return errors.New("post-update work policy check failed")
 	}
-	if err = e.checkPR(livePR, live.OID); err != nil {
+	if err = e.checkPR(livePR, live.OID, e.confirmed); err != nil {
 		return errors.New("post-update pull request identity check failed")
 	}
 	return nil

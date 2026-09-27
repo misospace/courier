@@ -14,6 +14,12 @@ import (
 
 // Broker owns a private bare repository used to validate and publish worker
 // bundles. Create it with NewBroker; its directory should be private to a run.
+const (
+	askpassScript    = "#!/bin/sh\ncase \"$1\" in *Username*) printf \"%s\\n\" \"$COURIER_GIT_USERNAME\" ;; *) printf \"%s\\n\" \"$COURIER_GIT_TOKEN\" ;; esac\n"
+	askpassEnvPrefix = "GIT_ASKPASS="
+	sshAskpassPrefix = "SSH_ASKPASS="
+)
+
 type Broker struct {
 	directory string
 }
@@ -64,6 +70,15 @@ func (b *Broker) ImportBundle(ctx context.Context, bundlePath, proposedOID, expe
 	if bundlePath == "." || !filepath.IsAbs(bundlePath) || hasControl(bundlePath) {
 		return errors.New("git broker: bundle path must be an absolute local path")
 	}
+	bundleParent, err := filepath.EvalSymlinks(filepath.Dir(bundlePath))
+	if err != nil {
+		return errors.New("git broker: bundle path is unavailable")
+	}
+	bundlePath = filepath.Join(bundleParent, filepath.Base(bundlePath))
+	bundleInfo, err := os.Lstat(bundlePath)
+	if err != nil || !bundleInfo.Mode().IsRegular() {
+		return errors.New("git broker: bundle must be a regular non-symlink file")
+	}
 	if err := validOID(proposedOID); err != nil {
 		return errors.New("git broker: invalid proposed commit OID")
 	}
@@ -102,10 +117,45 @@ func (b *Broker) ImportBundle(ctx context.Context, bundlePath, proposedOID, expe
 	return nil
 }
 
+// IsAncestor reports whether ancestor is an ancestor of descendant among
+// commits already imported into the broker's private repository.
+func (b *Broker) IsAncestor(ctx context.Context, ancestor, descendant string) (bool, error) {
+	if b == nil || b.directory == "" {
+		return false, errors.New("git broker: repository is unavailable")
+	}
+	ancestorCommit, err := b.resolveCommit(ctx, ancestor)
+	if err != nil {
+		return false, errors.New("git broker: ancestor is not an imported commit")
+	}
+	descendantCommit, err := b.resolveCommit(ctx, descendant)
+	if err != nil {
+		return false, errors.New("git broker: descendant is not an imported commit")
+	}
+	err = brokerGitExit(ctx, b.directory, "merge-base", "--is-ancestor", ancestorCommit, descendantCommit)
+	if err == nil {
+		return true, nil
+	}
+	var exitErr *exec.ExitError
+	if errors.As(err, &exitErr) && exitErr.ExitCode() == 1 {
+		return false, nil
+	}
+	return false, errors.New("git broker: ancestry check failed")
+}
+
 // Push publishes an imported commit to exactly the supplied pinned remote URL
 // and branch ref. It uses a normal, non-force push; server-side fast-forward
 // checks remain authoritative if the remote changes after observation.
 func (b *Broker) Push(ctx context.Context, remoteURL, ref, proposedOID string) error {
+	return b.push(ctx, remoteURL, ref, proposedOID, "", "")
+}
+
+// PushWithCredentials uses a private askpass helper. Credentials are supplied
+// only through the child environment and never through argv, URL, or errors.
+func (b *Broker) PushWithCredentials(ctx context.Context, remoteURL, ref, proposedOID, username, token string) error {
+	return b.push(ctx, remoteURL, ref, proposedOID, username, token)
+}
+
+func (b *Broker) push(ctx context.Context, remoteURL, ref, proposedOID, username, token string) error {
 	if b == nil || b.directory == "" {
 		return errors.New("git broker: repository is unavailable")
 	}
@@ -123,6 +173,26 @@ func (b *Broker) Push(ctx context.Context, remoteURL, ref, proposedOID string) e
 		return errors.New("git broker: proposed OID is not an imported commit")
 	}
 	refspec := commit + ":refs/heads/" + ref
+	if username != "" || token != "" {
+		if username == "" || token == "" || hasControl(username) || hasControl(token) {
+			return errors.New("git broker: invalid transport credentials")
+		}
+		askpass, err := writeAskpassHelper(filepath.Dir(b.directory))
+		if err != nil {
+			return errors.New("git broker: cannot initialize credential helper")
+		}
+		defer os.Remove(askpass)
+		env := []string{
+			askpassEnvPrefix + askpass,
+			sshAskpassPrefix + askpass,
+			"COURIER_GIT_USERNAME=" + username,
+			"COURIER_GIT_TOKEN=" + token,
+		}
+		if _, err := brokerGitRun(ctx, b.directory, env, "-c", "protocol.ext.allow=never", "push", "--porcelain", "--", remoteURL, refspec); err != nil {
+			return errors.New("git broker: push failed")
+		}
+		return nil
+	}
 	if _, err := brokerGit(ctx, b.directory, "-c", "protocol.ext.allow=never", "push", "--porcelain", "--", remoteURL, refspec); err != nil {
 		return errors.New("git broker: push failed")
 	}
@@ -170,11 +240,19 @@ func resolveCommitIn(ctx context.Context, directory, oid string) (string, error)
 }
 
 func brokerGit(ctx context.Context, directory string, args ...string) ([]byte, error) {
+	return brokerGitRun(ctx, directory, nil, args...)
+}
+
+// brokerGitRun accepts only internally assembled Git arguments. Callers validate
+// every remote URL, ref, and object ID before constructing args; no request text
+// or model-controlled string may be passed through this variadic boundary.
+func brokerGitRun(ctx context.Context, directory string, env []string, args ...string) ([]byte, error) {
 	cmd := exec.CommandContext(ctx, "git", args...)
 	if directory != "" {
 		cmd.Dir = directory
 	}
 	cmd.Env = []string{"PATH=" + os.Getenv("PATH"), "HOME=" + os.DevNull, "GIT_TERMINAL_PROMPT=0", "GIT_CONFIG_NOSYSTEM=1", "GIT_CONFIG_GLOBAL=" + os.DevNull, "GIT_CONFIG_COUNT=0", "GIT_OPTIONAL_LOCKS=0"}
+	cmd.Env = append(cmd.Env, env...)
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout, cmd.Stderr = &stdout, &stderr
 	if err := cmd.Run(); err != nil {
@@ -182,6 +260,40 @@ func brokerGit(ctx context.Context, directory string, args ...string) ([]byte, e
 		return nil, errors.New("git command failed")
 	}
 	return stdout.Bytes(), nil
+}
+
+func brokerGitExit(ctx context.Context, directory string, args ...string) error {
+	cmd := exec.CommandContext(ctx, "git", args...)
+	if directory != "" {
+		cmd.Dir = directory
+	}
+	cmd.Env = []string{"PATH=" + os.Getenv("PATH"), "HOME=" + os.DevNull, "GIT_TERMINAL_PROMPT=0", "GIT_CONFIG_NOSYSTEM=1", "GIT_CONFIG_GLOBAL=" + os.DevNull, "GIT_CONFIG_COUNT=0", "GIT_OPTIONAL_LOCKS=0"}
+	cmd.Stdout = &bytes.Buffer{}
+	cmd.Stderr = &bytes.Buffer{}
+	return cmd.Run()
+}
+
+func writeAskpassHelper(parent string) (string, error) {
+	file, err := os.CreateTemp(parent, "git-askpass-")
+	if err != nil {
+		return "", err
+	}
+	name := file.Name()
+	if _, err := file.WriteString(askpassScript); err != nil {
+		_ = file.Close()
+		_ = os.Remove(name)
+		return "", err
+	}
+	if err := file.Chmod(0o700); err != nil {
+		_ = file.Close()
+		_ = os.Remove(name)
+		return "", err
+	}
+	if err := file.Close(); err != nil {
+		_ = os.Remove(name)
+		return "", err
+	}
+	return name, nil
 }
 
 func validOID(oid string) error {
