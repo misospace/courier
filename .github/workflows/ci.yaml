@@ -71,8 +71,33 @@ jobs:
       - name: Test
         run: go test -race ./... -coverprofile cover.out
 
+  images-classify:
+    runs-on: ubuntu-latest
+    outputs:
+      images_required: ${{ steps.classify.outputs.images_required }}
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          fetch-depth: 0
+
+      - name: Run image-gating truth table
+        run: bash hack/test-ci-images-gating.sh
+
+      - name: Classify image relevance
+        id: classify
+        env:
+          BASE_REF: ${{ github.base_ref }}
+        run: |
+          if [ "$GITHUB_EVENT_NAME" = "pull_request" ]; then
+            bash hack/ci-change-classifier.sh --base-ref "origin/$BASE_REF"
+          else
+            echo "images_required=true" | tee -a "$GITHUB_OUTPUT"
+          fi
+
   image-manager:
     runs-on: ubuntu-latest
+    needs: images-classify
+    if: needs.images-classify.outputs.images_required == 'true'
     steps:
       - uses: actions/checkout@v7.0.1
 
@@ -125,6 +150,8 @@ jobs:
 
   image-coordinator:
     runs-on: ubuntu-latest
+    needs: images-classify
+    if: needs.images-classify.outputs.images_required == 'true'
     steps:
       - uses: actions/checkout@v7.0.1
 
@@ -184,6 +211,8 @@ jobs:
 
   image-coordinator-go:
     runs-on: ubuntu-latest
+    needs: images-classify
+    if: needs.images-classify.outputs.images_required == 'true'
     permissions:
       contents: read
       pull-requests: read
@@ -278,14 +307,19 @@ jobs:
 
   images:
     runs-on: ubuntu-latest
-    needs: [image-manager, image-coordinator, image-coordinator-go]
+    needs: [images-classify, image-manager, image-coordinator, image-coordinator-go]
     if: ${{ !cancelled() }}
     steps:
-      - name: Require every image job to pass
+      - uses: actions/checkout@v7.0.1
+
+      - name: Require image validation outcomes
         run: |
-          test "${{ needs.image-manager.result }}" = success
-          test "${{ needs.image-coordinator.result }}" = success
-          test "${{ needs.image-coordinator-go.result }}" = success
+          bash hack/ci-images-aggregate.sh \
+            '${{ needs.images-classify.result }}' \
+            '${{ needs.images-classify.outputs.images_required }}' \
+            '${{ needs.image-manager.result }}' \
+            '${{ needs.image-coordinator.result }}' \
+            '${{ needs.image-coordinator-go.result }}'
 
   vulnerability:
     runs-on: ubuntu-latest
