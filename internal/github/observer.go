@@ -79,6 +79,13 @@ func (o Observer) Observe(ctx context.Context, base string, head controller.Head
 		}
 		return observed, nil
 	}
+	// No open PR. A merged one means the work already shipped, which is
+	// different from a branch that never had a PR.
+	for _, pull := range pulls {
+		if pull.Head.Ref == head.Branch && strings.TrimSpace(pull.MergedAt) != "" {
+			return controller.PRObservation{PR: strconv.Itoa(pull.Number), Merged: true}, nil
+		}
+	}
 	return controller.PRObservation{}, nil
 }
 

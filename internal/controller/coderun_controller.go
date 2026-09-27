@@ -420,6 +420,12 @@ func (r *CoderRunReconciler) observeVerifying(ctx context.Context, run *courierv
 	}
 	pr := observation.PR
 	state := observeState(observation)
+	if state == observationMerged {
+		// Someone merged the PR while this run was working: the work shipped.
+		// Done resolves the source and applies the reap policy; it is not a
+		// case for a human.
+		return r.transitionTerminal(ctx, run, courierv1alpha1.PhaseDone, pr)
+	}
 	if state == observationNeedsHuman || state == observationFailed {
 		return r.transitionTerminal(ctx, run, courierv1alpha1.PhaseNeedsHuman, pr)
 	}
