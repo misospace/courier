@@ -141,7 +141,9 @@ func validatePolicy(p Policy) error {
 }
 
 // Publish performs fresh preflight, one ordinary push, and mandatory postflight.
-// An uncertain push is idempotent only when the live ref equals this exact OID.
+// The push's own success/failure report never decides the outcome: an uncertain
+// push is confirmed idempotently only when the live ref equals this exact
+// proposed OID and every policy check still passes, and rejected otherwise.
 func (e *PolicyEngine) Publish(ctx context.Context, req PublicationRequest) (PublicationResult, error) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
@@ -244,10 +246,17 @@ func (e *PolicyEngine) Publish(ctx context.Context, req PublicationRequest) (Pub
 		}
 		return PublicationResult{}, errors.New("publication denied: live work tip does not equal proposed OID")
 	}
-	if pushErr != nil {
-		return PublicationResult{}, errors.New("push outcome is uncertain; exact live OID lacks trusted pre-push evidence")
-	}
+	// The exact proposed OID is live, so publication is confirmed idempotently.
+	// The transport's own report does not decide this: whether Push returned
+	// success, failure or an uncertain outcome, the mandatory post-push
+	// observation and the policy checks above decide. This call holds trusted
+	// pre-push evidence — the proposal was imported into the broker store and
+	// passed ancestry checks against the expected work tip and live base — so an
+	// exact live match is sufficient to confirm. A fresh broker after a crash
+	// never reaches here for a caller-supplied OID: the pre-push equality check
+	// above rejects that without trusted in-process confirmation.
 	if err = e.checkPR(pr, work.OID, req.ProposedOID); err != nil {
+		e.confirmed = ""
 		return PublicationResult{}, errors.New("post-push PR identity check failed")
 	}
 	baseIncluded, err = e.pusher.IsAncestor(ctx, p.BaseRepo, base.OID, req.ProposedOID)
@@ -256,9 +265,7 @@ func (e *PolicyEngine) Publish(ctx context.Context, req PublicationRequest) (Pub
 		return PublicationResult{}, errors.New("post-push proposed commit does not include the live base tip")
 	}
 	e.confirmed = req.ProposedOID
-	// pushErr was already handled above: an uncertain push returns an error and
-	// does not reach this point, so a returned result is always a confirmed push.
-	return PublicationResult{OID: req.ProposedOID, AlreadyPublished: false}, nil
+	return PublicationResult{OID: req.ProposedOID, AlreadyPublished: pushErr != nil}, nil
 }
 
 func (e *PolicyEngine) observe(ctx context.Context) (RepositoryState, RepositoryState, *PullRequestState, error) {

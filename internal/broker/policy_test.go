@@ -196,42 +196,139 @@ func TestPublishRejectsForkHeadAndPRHeadRace(t *testing.T) {
 		}
 	}
 }
-func TestRestartDoesNotRecoverFromCallerOIDOrAncestry(t *testing.T) {
-	o := goodObserver(ModeFixPR)
-	w := &fakePusher{ancestor: true}
-	first := engine(t, goodPolicy(ModeFixPR), o, w)
-	w.afterPush = func() { o.work.OID = "new"; o.pr.HeadOID = "new" }
-	if _, err := first.Publish(context.Background(), PublicationRequest{RunUID: "uid-1", ExpectedWorkOID: "old", ProposedOID: "new"}); err != nil {
-		t.Fatal(err)
-	}
 
-	// A fresh broker process has no durable trusted evidence. The caller can
-	// repeat the same OID and ancestry still does not establish ownership.
-	restarted := engine(t, goodPolicy(ModeFixPR), o, w)
-	if _, err := restarted.Publish(context.Background(), PublicationRequest{RunUID: "uid-1", ExpectedWorkOID: "new", ProposedOID: "next"}); err == nil {
-		t.Fatal("accepted foreign descendant after restart")
-	}
-	if _, err := restarted.Publish(context.Background(), PublicationRequest{RunUID: "uid-1", ExpectedWorkOID: "new", ProposedOID: "new"}); err == nil {
-		t.Fatal("accepted caller-proposed OID as restart evidence")
+// TestRestartDoesNotRecoverFromCallerOIDOrAncestry is the crash half of the
+// uncertain-push contract. A previous process may have confirmed this exact OID
+// in memory — via a successful push or via an uncertain push confirmed by exact
+// live equality — but in-memory confirmation is not durable evidence. A fresh
+// broker rejects a caller-supplied OID/ancestry that only the caller asserts.
+func TestRestartDoesNotRecoverFromCallerOIDOrAncestry(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		pushErr error
+	}{
+		{"after-successful-push", nil},
+		{"after-confirmed-uncertain-push", errors.New("transport read-back failed")},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			o := goodObserver(ModeFixPR)
+			w := &fakePusher{ancestor: true, pushErr: tc.pushErr}
+			first := engine(t, goodPolicy(ModeFixPR), o, w)
+			w.afterPush = func() { o.work.OID = "new"; o.pr.HeadOID = "new" }
+			got, err := first.Publish(context.Background(), PublicationRequest{RunUID: "uid-1", ExpectedWorkOID: "old", ProposedOID: "new"})
+			if err != nil {
+				t.Fatalf("first publish failed: %v", err)
+			}
+			if first.confirmed != "new" {
+				t.Fatalf("first process did not confirm exact tip: %q", first.confirmed)
+			}
+			if got.AlreadyPublished != (tc.pushErr != nil) {
+				t.Fatalf("unexpected AlreadyPublished: %#v", got)
+			}
+
+			// A fresh broker process has no durable trusted evidence. The caller
+			// can repeat the same OID and ancestry still does not establish
+			// ownership.
+			restarted := engine(t, goodPolicy(ModeFixPR), o, w)
+			if _, err := restarted.Publish(context.Background(), PublicationRequest{RunUID: "uid-1", ExpectedWorkOID: "new", ProposedOID: "next"}); err == nil {
+				t.Fatal("accepted foreign descendant after restart")
+			}
+			if _, err := restarted.Publish(context.Background(), PublicationRequest{RunUID: "uid-1", ExpectedWorkOID: "new", ProposedOID: "new"}); err == nil {
+				t.Fatal("accepted caller-proposed OID as restart evidence")
+			}
+			if restarted.confirmed != "" {
+				t.Fatalf("rejected caller OID still advanced confirmation: %q", restarted.confirmed)
+			}
+		})
 	}
 }
 
-func TestPublishDoesNotRecoverUncertainPushFromCallerOID(t *testing.T) {
+// TestPublishConfirmsUncertainPushWhenExactOIDIsLive covers the same-call case:
+// the transport reports an uncertain push, but the mandatory post-push
+// observation proves the exact proposed OID is live and every policy check
+// passes. Full postflight confirms publication idempotently rather than failing.
+func TestPublishConfirmsUncertainPushWhenExactOIDIsLive(t *testing.T) {
 	o := goodObserver(ModeFixPR)
-	w := &fakePusher{ancestor: true, pushErr: errors.New("secret token")}
+	w := &fakePusher{ancestor: true, pushErr: errors.New("transport read-back failed")}
 	e := engine(t, goodPolicy(ModeFixPR), o, w)
 	w.afterPush = func() { o.work.OID = "new"; o.pr.HeadOID = "new" }
 	got, err := e.Publish(context.Background(), PublicationRequest{RunUID: "uid-1", ExpectedWorkOID: "old", ProposedOID: "new"})
-	if err == nil || got.OID != "" {
-		t.Fatalf("recovered uncertain push from caller-provided OID: %#v %v", got, err)
+	if err != nil {
+		t.Fatalf("uncertain push with exact live OID rejected: %v", err)
+	}
+	if got.OID != "new" || !got.AlreadyPublished {
+		t.Fatalf("uncertain push not confirmed idempotently: %#v", got)
+	}
+	if e.confirmed != "new" {
+		t.Fatalf("confirmed tip not advanced to exact live OID: %q", e.confirmed)
+	}
+	// The confirmed exact tip is now admitted, so a follow-on publication from
+	// it proceeds without re-supplying trusted evidence.
+	w.pushErr = nil
+	w.afterPush = func() { o.work.OID = "next"; o.pr.HeadOID = "next" }
+	if _, err := e.Publish(context.Background(), PublicationRequest{RunUID: "uid-1", ExpectedWorkOID: "new", ProposedOID: "next"}); err != nil {
+		t.Fatalf("confirmed tip not admitted for follow-on publication: %v", err)
+	}
+}
+
+// TestPublishConfirmsUncertainPushForNewResolveRef is the resolve-issue,
+// initially-absent variant of the same-call case: the confirmation rule is
+// mode-agnostic and must not depend on a pre-existing work ref.
+func TestPublishConfirmsUncertainPushForNewResolveRef(t *testing.T) {
+	p := goodPolicy(ModeResolveIssue)
+	p.WorkInitiallyAbsent = true
+	p.WorkAnchorOID = ""
+	o := goodObserver(ModeResolveIssue)
+	o.work.Exists = false
+	o.work.OID = ""
+	w := &fakePusher{ancestor: true, pushErr: errors.New("transport read-back failed")}
+	e := engine(t, p, o, w)
+	w.afterPush = func() { o.work.Exists = true; o.work.OID = "new" }
+	got, err := e.Publish(context.Background(), PublicationRequest{RunUID: "uid-1", ProposedOID: "new"})
+	if err != nil {
+		t.Fatalf("uncertain push creating a new resolve ref rejected: %v", err)
+	}
+	if got.OID != "new" || !got.AlreadyPublished {
+		t.Fatalf("uncertain push not confirmed idempotently: %#v", got)
+	}
+	if e.confirmed != "new" {
+		t.Fatalf("confirmed tip not advanced to exact live OID: %q", e.confirmed)
+	}
+}
+
+// TestPublishDropsConfirmationWhenPostPushPRCheckFails covers an abnormal
+// postflight: the work ref advances to the proposal but the pinned PR head does
+// not follow, so publication must fail and no in-process confirmation may
+// survive to be reused as evidence for the next observation.
+func TestPublishDropsConfirmationWhenPostPushPRCheckFails(t *testing.T) {
+	o := goodObserver(ModeFixPR)
+	w := &fakePusher{ancestor: true}
+	e := engine(t, goodPolicy(ModeFixPR), o, w)
+	w.afterPush = func() { o.work.OID = "new" } // PR head stays at "old"
+	if _, err := e.Publish(context.Background(), PublicationRequest{RunUID: "uid-1", ExpectedWorkOID: "old", ProposedOID: "new"}); err == nil {
+		t.Fatal("accepted post-push PR head mismatch")
+	}
+	if e.confirmed != "" {
+		t.Fatalf("failed postflight left in-process confirmation: %q", e.confirmed)
+	}
+}
+
+// TestPublishRejectsUncertainPushWithoutExactLiveOID is the negative half: an
+// uncertain push whose exact proposed OID is not live must still fail closed and
+// leave no in-process confirmation behind.
+func TestPublishRejectsUncertainPushWithoutExactLiveOID(t *testing.T) {
+	o := goodObserver(ModeFixPR)
+	w := &fakePusher{ancestor: true, pushErr: errors.New("transport read-back failed")}
+	e := engine(t, goodPolicy(ModeFixPR), o, w)
+	w.afterPush = func() { o.work.OID = "foreign"; o.pr.HeadOID = "foreign" }
+	if _, err := e.Publish(context.Background(), PublicationRequest{RunUID: "uid-1", ExpectedWorkOID: "old", ProposedOID: "new"}); err == nil {
+		t.Fatal("confirmed an uncertain push whose exact proposed OID is not live")
 	}
 	if e.confirmed != "" {
 		t.Fatalf("uncertain push advanced in-memory confirmed tip: %q", e.confirmed)
 	}
-	o.work.OID = "foreign"
-	o.pr.HeadOID = "foreign"
-	_, err = e.Publish(context.Background(), PublicationRequest{RunUID: "uid-1", ExpectedWorkOID: "new", ProposedOID: "next"})
-	if err == nil {
+	// The unconfirmed foreign head is not admitted: the next attempt fails.
+	if _, err := e.Publish(context.Background(), PublicationRequest{RunUID: "uid-1", ExpectedWorkOID: "foreign", ProposedOID: "next"}); err == nil {
 		t.Fatal("accepted unconfirmed head")
 	}
 }
