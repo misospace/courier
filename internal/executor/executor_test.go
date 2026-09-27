@@ -35,7 +35,7 @@ func TestOpenCodeCommandInjectsGoalModelAndFraming(t *testing.T) {
 
 func TestOpenCodeCommandIncludesConfiguredAgent(t *testing.T) {
 	invocation := Invocation{Goal: "goal", Model: "model"}
-	wantPrompt := "goal\n\nUse the Courier scratch directory at /var/tmp/courier-scratch (also set as TMPDIR) for all temporary work, and tell any delegated sub-agents to do the same."
+	wantPrompt := "goal\n\nUse the Courier scratch directory at /var/tmp/courier-scratch (also set as TMPDIR) for all temporary work, and tell any delegated sub-agents to do the same.\n\nThe lane may mount toolchain reference sources (module and toolchain caches) read-only at /courier-toolchain (also set as COURIER_TOOLCHAIN_DIR); when present, inspect them there instead of reaching for paths outside the checkout."
 	for _, test := range []struct {
 		name  string
 		agent string
@@ -763,6 +763,10 @@ func TestBuildCoordinatorPodWiresRolesAndMCPConfig(t *testing.T) {
 		"github_merge*":             "deny",
 		"external_directory": map[string]any{
 			"/var/tmp/courier-scratch/**": "allow",
+			"/courier-toolchain/**":       "allow",
+		},
+		"edit": map[string]any{
+			"/courier-toolchain/**": "deny",
 		},
 	}
 	wantAgents := map[string]openCodeAgent{
@@ -987,6 +991,90 @@ func TestBuildCoordinatorPodProvisionsScratch(t *testing.T) {
 	}
 }
 
+func TestBuildCoordinatorPodToolchainReferenceMount(t *testing.T) {
+	run := &courierv1alpha1.CoderRun{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "run-toolchain",
+			Namespace: "courier-system",
+			UID:       "run-uid",
+		},
+		Spec: courierv1alpha1.CoderRunSpec{
+			Mode: courierv1alpha1.ModeResolveIssue,
+			Repo: "acme/widgets",
+			Ref:  7,
+			Lane: "local",
+		},
+		Status: courierv1alpha1.CoderRunStatus{Branch: "courier/acme/widgets/issue-7"},
+	}
+	lane := &courierv1alpha1.LaneProfile{
+		ObjectMeta: metav1.ObjectMeta{Name: "local", Namespace: "courier-system"},
+		Spec:       courierv1alpha1.LaneProfileSpec{Roles: map[string]string{"coordinator": "litellm/qwen"}},
+	}
+
+	const cacheMountPath = "/courier-toolchain-cache"
+	const referenceMountPath = "/courier-toolchain"
+
+	pod, err := BuildCoordinatorPod(run, lane, DefaultPodConfig())
+	if err != nil {
+		t.Fatalf("BuildCoordinatorPod() error = %v", err)
+	}
+
+	foundCacheVolume := false
+	for _, volume := range pod.Spec.Volumes {
+		if volume.Name != "toolchain-cache" {
+			continue
+		}
+		if volume.EmptyDir == nil {
+			t.Fatal("toolchain-cache volume is not an EmptyDir; give the toolchain-cache volume an EmptyDir source in BuildCoordinatorPod")
+		}
+		foundCacheVolume = true
+		break
+	}
+	if !foundCacheVolume {
+		t.Fatal("toolchain-cache EmptyDir volume is missing; add a volume named \"toolchain-cache\" in BuildCoordinatorPod")
+	}
+
+	container := pod.Spec.Containers[0]
+
+	foundCacheMount := false
+	foundReferenceMount := false
+	for _, mount := range container.VolumeMounts {
+		if mount.Name != "toolchain-cache" {
+			continue
+		}
+		switch mount.MountPath {
+		case cacheMountPath:
+			if mount.ReadOnly {
+				t.Fatal("toolchain cache volume mount is read-only; the lane toolchain must write to it")
+			}
+			foundCacheMount = true
+		case referenceMountPath:
+			if !mount.ReadOnly {
+				t.Fatal("toolchain reference volume mount is not read-only")
+			}
+			foundReferenceMount = true
+		}
+	}
+	if !foundCacheMount {
+		t.Fatalf("toolchain-cache mount at %q is missing; mount the toolchain-cache volume there", cacheMountPath)
+	}
+	if !foundReferenceMount {
+		t.Fatalf("toolchain-cache mount at %q is missing; mount the toolchain-cache volume there read-only", referenceMountPath)
+	}
+
+	env := make(map[string]string, len(container.Env))
+	for _, value := range container.Env {
+		env[value.Name] = value.Value
+	}
+	if env["COURIER_TOOLCHAIN_DIR"] != referenceMountPath {
+		t.Fatalf("env COURIER_TOOLCHAIN_DIR = %q, want %q", env["COURIER_TOOLCHAIN_DIR"], referenceMountPath)
+	}
+
+	if referenceMountPath == container.WorkingDir {
+		t.Fatalf("toolchain reference mount path %q collides with the workspace mount path", referenceMountPath)
+	}
+}
+
 func TestOpenCodeConfigScratchPermissionLeastPrivilege(t *testing.T) {
 	roles := map[string]string{
 		"coordinator": "litellm/qwen",
@@ -1008,6 +1096,8 @@ func TestOpenCodeConfigScratchPermissionLeastPrivilege(t *testing.T) {
 	}
 
 	const scratchAllow = "/var/tmp/courier-scratch/**"
+	const toolchainAllow = "/courier-toolchain/**"
+	var allowedExternal = map[string]bool{scratchAllow: true, toolchainAllow: true}
 
 	for _, key := range []string{"github_merge_pull_request", "github_merge*"} {
 		if permission[key] != "deny" {
@@ -1017,26 +1107,53 @@ func TestOpenCodeConfigScratchPermissionLeastPrivilege(t *testing.T) {
 
 	externalDirectory, ok := permission["external_directory"].(map[string]any)
 	if !ok {
-		t.Fatalf("permission.external_directory = %#v, want an object mapping the scratch path to a permission", permission["external_directory"])
+		t.Fatalf("permission.external_directory = %#v, want an object mapping the allowed external paths to permissions", permission["external_directory"])
 	}
-	if len(externalDirectory) != 1 {
-		t.Fatalf("permission.external_directory = %#v, want exactly one key; narrow it to the per-run scratch path", externalDirectory)
+	if len(externalDirectory) != 2 {
+		t.Fatalf("permission.external_directory = %#v, want exactly two keys; narrow it to the per-run scratch path and the read-only toolchain reference", externalDirectory)
 	}
 	for key, value := range externalDirectory {
-		if key != scratchAllow {
-			t.Fatalf("permission.external_directory key = %q, want %q", key, scratchAllow)
+		if !allowedExternal[key] {
+			t.Fatalf("permission.external_directory key = %q, want %q or %q", key, scratchAllow, toolchainAllow)
 		}
 		if value != "allow" {
 			t.Fatalf("permission.external_directory[%q] = %v, want \"allow\"", key, value)
 		}
 		if key == "*" || key == "/*" {
-			t.Fatalf("permission.external_directory uses the wildcard key %q; scope it to the scratch path", key)
+			t.Fatalf("permission.external_directory uses the wildcard key %q; scope it to the scratch and toolchain reference paths", key)
 		}
 		if strings.HasPrefix(key, "/tmp") {
-			t.Fatalf("permission.external_directory allows a path beginning /tmp: %q; scope it to the scratch path", key)
+			t.Fatalf("permission.external_directory allows a path beginning /tmp: %q; scope it to the scratch and toolchain reference paths", key)
 		}
 		if strings.Contains(key, "~") || strings.Contains(key, "$HOME") || strings.Contains(key, "root") {
 			t.Fatalf("permission.external_directory references a home/config path: %q", key)
+		}
+	}
+	for _, key := range []string{scratchAllow, toolchainAllow} {
+		if externalDirectory[key] != "allow" {
+			t.Fatalf("permission.external_directory[%q] missing, want \"allow\"", key)
+		}
+	}
+
+	edit, ok := permission["edit"].(map[string]any)
+	if !ok {
+		t.Fatalf("permission.edit = %#v, want an object denying edits to the read-only toolchain reference", permission["edit"])
+	}
+	if len(edit) != 1 {
+		t.Fatalf("permission.edit = %#v, want exactly one key; scope it to the read-only toolchain reference", edit)
+	}
+	for key, value := range edit {
+		if key != toolchainAllow {
+			t.Fatalf("permission.edit key = %q, want %q", key, toolchainAllow)
+		}
+		if value != "deny" {
+			t.Fatalf("permission.edit[%q] = %v, want \"deny\"", key, value)
+		}
+		if key == "*" || key == "/*" {
+			t.Fatalf("permission.edit uses the wildcard key %q; scope it to the toolchain reference", key)
+		}
+		if strings.HasPrefix(key, "/tmp") {
+			t.Fatalf("permission.edit references a path beginning /tmp: %q", key)
 		}
 	}
 }
@@ -1082,6 +1199,9 @@ func TestCoordinatorPromptIncludesScratchHint(t *testing.T) {
 			if !strings.Contains(got, scratchPath) {
 				t.Fatalf("prompt = %q, missing the scratch dir hint %q", got, scratchPath)
 			}
+			if !strings.Contains(got, "/courier-toolchain") {
+				t.Fatalf("prompt = %q, missing the read-only toolchain reference hint", got)
+			}
 			if test.framing != "" && !strings.Contains(got, test.framing) {
 				t.Fatalf("prompt = %q, missing the lane framing %q", got, test.framing)
 			}
@@ -1109,6 +1229,34 @@ func TestPodConfigValidateScratchOverlap(t *testing.T) {
 			err := base.Validate()
 			if test.wantErr && err == nil {
 				t.Fatalf("Validate() for workspace path %q = nil, want an overlap error", test.path)
+			}
+			if !test.wantErr && err != nil {
+				t.Fatalf("Validate() for workspace path %q = %v, want no error", test.path, err)
+			}
+		})
+	}
+}
+
+func TestPodConfigValidateToolchainOverlap(t *testing.T) {
+	base := DefaultPodConfig()
+	for _, test := range []struct {
+		name    string
+		path    string
+		wantErr bool
+	}{
+		{name: "workspace", path: "/workspace", wantErr: false},
+		{name: "reference", path: "/courier-toolchain", wantErr: true},
+		{name: "cache", path: "/courier-toolchain-cache", wantErr: true},
+		{name: "cache descendant", path: "/courier-toolchain-cache/gomod", wantErr: true},
+		{name: "reference descendant", path: "/courier-toolchain/gomod", wantErr: true},
+		{name: "sibling prefix", path: "/courier-toolchain-cache-x", wantErr: false},
+		{name: "sibling prefix reference", path: "/courier-toolchain-x", wantErr: false},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			base.WorkspacePath = test.path
+			err := base.Validate()
+			if test.wantErr && err == nil {
+				t.Fatalf("Validate() for workspace path %q = nil, want a toolchain overlap error", test.path)
 			}
 			if !test.wantErr && err != nil {
 				t.Fatalf("Validate() for workspace path %q = %v, want no error", test.path, err)

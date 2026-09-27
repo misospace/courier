@@ -291,10 +291,10 @@ world wins on conflict.
 ### Uncommitted failure work (#109)
 
 The shipped bootstrap keeps its termination handoff in a separate runtime
-`emptyDir`, but does not yet provide OpenCode a permitted scratch directory.
-#114 owns the bounded scratch fix: a per-run mount outside the checkout, temp
-environment and framing, and narrowly verified permissions for the pinned
-OpenCode runtime and delegates. Scratch is disposable, not a checkpoint.
+`emptyDir` and provides the per-run scratch mount outside the checkout with
+narrowly permitted OpenCode access: temp environment and framing, and
+narrowly verified permissions for the pinned OpenCode runtime and delegates
+(#114, shipped). Scratch is disposable, not a checkpoint.
 
 A terminal `NeedsHuman` or `Failed` run may still have uncommitted edits in its
 checkout. Those edits are **not durable**: when the pod is removed, the emptyDir
@@ -303,6 +303,23 @@ and its dirty work disappear. Logs and status are not a recoverable patch.
 evidence before any preservation implementation. Until that mechanism is
 reviewed, do not push incomplete work, persist raw diffs in logs or CR status,
 or treat a fresh retry (#97) as recovery of the old checkout.
+
+### Toolchain reference for bootstrap lanes (#153)
+
+Repository toolchains (Go today) keep their module and build caches on
+writable storage, but the bootstrap contract grants OpenCode no broad home or
+`/tmp` access. The coordinator pod therefore mounts one per-run `emptyDir`
+`toolchain-cache` volume **read-write at `/courier-toolchain-cache`** — where
+the runtime image pins its toolchain caches (`GOMODCACHE`, `GOCACHE`) — and
+**read-only at `/courier-toolchain`**. OpenCode's `external_directory`
+permission allows reads of the scratch mount plus the read-only reference and
+denies edits there; because the reference mount is genuinely read-only, a
+write also fails at the filesystem level. The read-write twin is written only
+by lane-toolchain child processes (e.g. `go mod download`); the model's own
+tool calls that target it stay gated as for any external path, and
+unparsed-bash reachability matches the pre-change baseline (no new hole).
+This is bootstrap ergonomics for the pinned runtime, distinct from the #136
+secure dependency cache.
 
 ### Commit cadence
 
@@ -656,6 +673,15 @@ A running log of architectural decisions and their reasoning, newest first. The
 body above describes the current architecture; this log preserves *why* and what
 was superseded.
 
+- **2026-09-27 — Read-only toolchain reference for bootstrap lanes (#153).**
+  OpenCode's `external_directory` permission cannot distinguish a read from a
+  write, so the toolchain's writable cache directory was not allowed wholesale.
+  The coordinator pod mounts the per-run `toolchain-cache` `emptyDir`
+  read-write at `/courier-toolchain-cache` (where runtime images pin
+  `GOMODCACHE`/`GOCACHE`) and again read-only at `/courier-toolchain`, so the
+  reference stays readable while writes are denied at the filesystem level.
+  This is bootstrap ergonomics for the pinned runtime, distinct from the #136
+  secure dependency cache.
 - **2026-09-26 — #118 settles the run publication policy.** The operator
   resolves and persists an immutable run-UID-bound policy from the spec,
   provider configuration, and live reads: canonical base repo/ref/OID,

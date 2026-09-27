@@ -37,13 +37,18 @@ type openCodeMCP struct {
 }
 
 func marshalOpenCodeConfig(roles map[string]string, githubURL, context7URL, metricsURL string) ([]byte, error) {
-	// permission keeps the merge denies and allows only the scratch
-	// directory; every other external path stays at the default (ask).
+	// permission keeps the merge denies; external reads are allowed only for
+	// the scratch directory and the read-only toolchain reference, and edits
+	// to the reference are denied on top of the read-only mount.
 	permission := map[string]any{
 		"github_merge_pull_request": "deny",
 		"github_merge*":             "deny",
 		"external_directory": map[string]string{
-			scratchPath + "/**": "allow",
+			scratchPath + "/**":            "allow",
+			toolchainReferencePath + "/**": "allow",
+		},
+		"edit": map[string]string{
+			toolchainReferencePath + "/**": "deny",
 		},
 	}
 	agents := make(map[string]openCodeAgent, len(roles))
