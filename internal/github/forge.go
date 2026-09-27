@@ -23,6 +23,7 @@ type Provider struct {
 
 var _ forge.Provider = (*Provider)(nil)
 var _ forge.RepositoryPolicyProvider = (*Provider)(nil)
+var _ forge.PullRequestHeadLister = (*Provider)(nil)
 
 // redactedError is an error whose string form was sanitized with
 // forge.RedactDetail before it crossed the forge boundary. It unwraps to the
@@ -176,6 +177,35 @@ func (p *Provider) ReadPullRequest(ctx context.Context, ref forge.PullRequestRef
 	return toForgePR(pr)
 }
 
+// ListPullRequestsByHead returns all PRs queried by head owner and branch, then
+// filters exact repository and ref identities locally. GitHub's head filter is
+// only owner:branch, so repository identity must be checked in the response.
+func (p *Provider) ListPullRequestsByHead(ctx context.Context, base forge.PullRequestRef, headRepo, headRef string) ([]forge.PullRequest, error) {
+	baseOwner, baseName, err := splitRepository(base.Repo)
+	if err != nil {
+		return nil, err
+	}
+	headOwner, _, err := splitRepository(headRepo)
+	if err != nil {
+		return nil, err
+	}
+	pulls, err := p.client.PullRequestsForHeadAllPages(ctx, baseOwner, baseName, headOwner, headRef)
+	if err != nil {
+		return nil, boundaryError(err)
+	}
+	var matches []forge.PullRequest
+	for _, raw := range pulls {
+		pr, err := toForgePR(raw)
+		if err != nil {
+			return nil, err
+		}
+		if pr.BaseRepo == base.Repo && pr.HeadRepo == headRepo && pr.HeadRef == headRef {
+			matches = append(matches, pr)
+		}
+	}
+	return matches, nil
+}
+
 // ListReviews is not covered by this client.
 func (p *Provider) ListReviews(ctx context.Context, ref forge.PullRequestRef) ([]forge.Review, error) {
 	return nil, forge.ErrUnsupported
@@ -213,9 +243,22 @@ func (p *Provider) CreatePullRequest(ctx context.Context, in forge.CreatePullReq
 	if err != nil {
 		return forge.PullRequest{}, err
 	}
+	head := in.Head
+	if in.HeadRepo != "" || in.HeadRef != "" {
+		if in.HeadRepo == "" || in.HeadRef == "" {
+			return forge.PullRequest{}, fmt.Errorf("GitHub pull request head repository and ref must both be set")
+		}
+		headOwner, _, err := splitRepository(in.HeadRepo)
+		if err != nil {
+			return forge.PullRequest{}, err
+		}
+		// Ignore Head when full trusted identity is supplied; it is a legacy
+		// selector and may be caller-controlled.
+		head = headOwner + ":" + in.HeadRef
+	}
 	pr, err := p.client.CreatePullRequest(ctx, owner, repo, CreatePullRequestRequest{
 		Title: in.Title,
-		Head:  in.Head,
+		Head:  head,
 		Base:  in.Base,
 		Body:  in.Body,
 		Draft: in.Draft,

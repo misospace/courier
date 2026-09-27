@@ -29,7 +29,9 @@ type Identity struct {
 }
 
 // Authenticator verifies pod-bound control tokens against live Kubernetes state.
-// The supplied controller-runtime client must be uncached (not a manager cache).
+// The supplied controller-runtime Reader must read live API state, not a manager
+// cache. This cannot be proven from the Reader interface; callers must provide
+// an uncached client (and tests use a direct fake client).
 type Authenticator struct {
 	reader        ctrlclient.Reader
 	tokens        kubernetes.Interface
@@ -97,7 +99,7 @@ func (a *Authenticator) Authenticate(ctx context.Context, token string) (Identit
 	if err := a.reader.Get(ctx, types.NamespacedName{Namespace: a.namespace, Name: podName}, pod); err != nil {
 		return Identity{}, fmt.Errorf("read authenticated control pod: %w", err)
 	}
-	if pod.DeletionTimestamp != nil || string(pod.UID) != podUID || pod.Spec.ServiceAccountName != a.controlSAName {
+	if pod.DeletionTimestamp != nil || string(pod.UID) != podUID || pod.Spec.ServiceAccountName != a.controlSAName || pod.Labels["courier.misospace.dev/coderrun"] != a.runName || pod.Labels["courier.misospace.dev/component"] != "coordinator" {
 		return Identity{}, fmt.Errorf("authenticated control pod is stale, terminating, or uses another service account")
 	}
 	runName, runUID, ok := controllerRunOwner(pod)
@@ -111,8 +113,9 @@ func (a *Authenticator) Authenticate(ctx context.Context, token string) (Identit
 	if run.UID != a.runUID || run.DeletionTimestamp != nil {
 		return Identity{}, fmt.Errorf("broker CoderRun incarnation is no longer live")
 	}
-	// A run may have only one live control incarnation; require the reviewed pod
-	// to be that sole non-terminating run-owned pod, not merely an old pod owner.
+	// A run may have only one live control incarnation. Scan the namespace and
+	// classify by owner UID + service account, not labels: labels are mutable and
+	// an unlabeled duplicate must still make authorization ambiguous.
 	pods := &corev1.PodList{}
 	if err := a.reader.List(ctx, pods, ctrlclient.InNamespace(a.namespace)); err != nil {
 		return Identity{}, fmt.Errorf("list current run pods: %w", err)
@@ -136,8 +139,9 @@ func (a *Authenticator) Authenticate(ctx context.Context, token string) (Identit
 	if err := a.reader.Get(ctx, types.NamespacedName{Namespace: a.namespace, Name: a.brokerPodName}, broker); err != nil {
 		return Identity{}, fmt.Errorf("read current broker pod: %w", err)
 	}
-	if broker.UID != a.brokerPodUID || broker.DeletionTimestamp != nil {
-		return Identity{}, fmt.Errorf("broker pod incarnation is no longer live")
+	brokerRunName, brokerRunUID, brokerOwned := controllerRunOwner(broker)
+	if broker.UID != a.brokerPodUID || broker.DeletionTimestamp != nil || !brokerOwned || brokerRunName != a.runName || brokerRunUID != a.runUID {
+		return Identity{}, fmt.Errorf("broker pod incarnation or owner is no longer live")
 	}
 	return Identity{RunUID: a.runUID, RunName: a.runName, Namespace: a.namespace, ControlPod: podName, ControlPodUID: pod.UID, ServiceAccount: a.controlSAName, ServiceAccountUID: user.UID}, nil
 }

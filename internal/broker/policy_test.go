@@ -196,14 +196,37 @@ func TestPublishRejectsForkHeadAndPRHeadRace(t *testing.T) {
 		}
 	}
 }
-func TestPublishRequiresPostPushExactOIDAndHandlesUncertainIdempotently(t *testing.T) {
+func TestRestartDoesNotRecoverFromCallerOIDOrAncestry(t *testing.T) {
+	o := goodObserver(ModeFixPR)
+	w := &fakePusher{ancestor: true}
+	first := engine(t, goodPolicy(ModeFixPR), o, w)
+	w.afterPush = func() { o.work.OID = "new"; o.pr.HeadOID = "new" }
+	if _, err := first.Publish(context.Background(), PublicationRequest{RunUID: "uid-1", ExpectedWorkOID: "old", ProposedOID: "new"}); err != nil {
+		t.Fatal(err)
+	}
+
+	// A fresh broker process has no durable trusted evidence. The caller can
+	// repeat the same OID and ancestry still does not establish ownership.
+	restarted := engine(t, goodPolicy(ModeFixPR), o, w)
+	if _, err := restarted.Publish(context.Background(), PublicationRequest{RunUID: "uid-1", ExpectedWorkOID: "new", ProposedOID: "next"}); err == nil {
+		t.Fatal("accepted foreign descendant after restart")
+	}
+	if _, err := restarted.Publish(context.Background(), PublicationRequest{RunUID: "uid-1", ExpectedWorkOID: "new", ProposedOID: "new"}); err == nil {
+		t.Fatal("accepted caller-proposed OID as restart evidence")
+	}
+}
+
+func TestPublishDoesNotRecoverUncertainPushFromCallerOID(t *testing.T) {
 	o := goodObserver(ModeFixPR)
 	w := &fakePusher{ancestor: true, pushErr: errors.New("secret token")}
 	e := engine(t, goodPolicy(ModeFixPR), o, w)
 	w.afterPush = func() { o.work.OID = "new"; o.pr.HeadOID = "new" }
 	got, err := e.Publish(context.Background(), PublicationRequest{RunUID: "uid-1", ExpectedWorkOID: "old", ProposedOID: "new"})
-	if err != nil || !got.AlreadyPublished {
-		t.Fatalf("exact uncertain push not recovered: %#v %v", got, err)
+	if err == nil || got.OID != "" {
+		t.Fatalf("recovered uncertain push from caller-provided OID: %#v %v", got, err)
+	}
+	if e.confirmed != "" {
+		t.Fatalf("uncertain push advanced in-memory confirmed tip: %q", e.confirmed)
 	}
 	o.work.OID = "foreign"
 	o.pr.HeadOID = "foreign"

@@ -231,12 +231,14 @@ type Check struct {
 // CreatePullRequestInput is the provider-neutral request to open a pull
 // request.
 type CreatePullRequestInput struct {
-	Repo  string
-	Title string
-	Head  string
-	Base  string
-	Body  string
-	Draft bool
+	Repo     string
+	Title    string
+	Head     string // Legacy provider-native head selector.
+	HeadRepo string
+	HeadRef  string
+	Base     string
+	Body     string
+	Draft    bool
 }
 
 // UpdatePullRequestInput is the provider-neutral request to update a pull
@@ -300,6 +302,12 @@ type RepositoryPolicyProvider interface {
 	ReadRef(context.Context, Repository, string) (RefState, error)
 	ReadEffectiveProtection(context.Context, Repository, string) (Protection, error)
 	CanWriteRepository(context.Context, Repository) (bool, error)
+}
+
+// PullRequestHeadLister lists all pull requests that may share a head branch.
+// Implementations must include every state; callers compare full head identity.
+type PullRequestHeadLister interface {
+	ListPullRequestsByHead(context.Context, PullRequestRef, string, string) ([]PullRequest, error)
 }
 
 // Provider interface remains the model-influenced forge surface.
