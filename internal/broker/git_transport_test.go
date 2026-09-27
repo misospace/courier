@@ -220,3 +220,59 @@ func gitTransportCommand(t *testing.T, dir string, args ...string) []byte {
 	}
 	return out
 }
+
+func TestValidatePinnedEndpointLocalPathSafety(t *testing.T) {
+	root := t.TempDir()
+	dir := filepath.Join(root, "repo.git")
+	if err := os.Mkdir(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	file := filepath.Join(root, "afile")
+	if err := os.WriteFile(file, []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(root, "link.git")
+	if err := os.Symlink(dir, link); err != nil {
+		t.Fatal(err)
+	}
+
+	parent, err := filepath.EvalSymlinks(filepath.Dir(dir))
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := filepath.Join(parent, filepath.Base(dir))
+	if got, err := validatePinnedEndpoint(dir); err != nil || got != want {
+		t.Fatalf("valid non-symlink directory endpoint = %q, %v; want %q", got, err, want)
+	}
+
+	for _, tc := range []struct {
+		name, in string
+	}{
+		{"symlink directory", link},
+		{"file endpoint symlink", "file://" + link},
+		{"regular file", file},
+		{"missing path", filepath.Join(root, "missing.git")},
+		{"null byte", dir + "\x00"},
+		{"carriage return", dir + "\r"},
+		{"newline", dir + "\n"},
+		{"leading whitespace", " " + dir},
+		{"option-like", "-oProxyCommand=bad"},
+		{"userinfo", "https://user:secret@example.invalid/repo.git"},
+		{"query", "https://example.invalid/repo.git?x=1"},
+		{"fragment", "https://example.invalid/repo.git#x"},
+		{"unsupported scheme", "ext::sh -c evil"},
+		{"file remote host", "file://elsewhere/tmp/x"},
+		{"relative path", "relative/path"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if _, err := validatePinnedEndpoint(tc.in); err == nil {
+				t.Fatalf("accepted unsafe endpoint %q", tc.in)
+			}
+		})
+	}
+
+	valid := "https://example.invalid/repo.git"
+	if got, err := validatePinnedEndpoint(valid); err != nil || got != valid {
+		t.Fatalf("valid https endpoint = %q, %v", got, err)
+	}
+}

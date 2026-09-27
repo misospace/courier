@@ -191,6 +191,8 @@ func (a *ForgeAdapter) CreatePullRequest(ctx context.Context, in CreatePullReque
 	if created.BaseRepo != base.Canonical || created.BaseRef != in.BaseRef || created.HeadRepo != work.Canonical || created.HeadRef != in.HeadRef || created.HeadSHA == "" {
 		return 0, errors.New("forge adapter: created pull request does not match pinned full identity")
 	}
+	// Register the exact result of this create so the read-back below and any
+	// later PolicyEngine verification may observe it; nothing else may.
 	a.mu.Lock()
 	a.created[created.Number] = struct{}{}
 	a.mu.Unlock()
@@ -212,11 +214,6 @@ func (a *ForgeAdapter) CreatePullRequest(ctx context.Context, in CreatePullReque
 	if len(matches) != 1 || matches[0].Number != created.Number {
 		return 0, errors.New("forge adapter: duplicate or mismatched pull request appeared during creation")
 	}
-	// Register only the exact result of this create operation so PolicyEngine can
-	// immediately read it back and independently verify all pinned identities.
-	a.mu.Lock()
-	a.created[created.Number] = struct{}{}
-	a.mu.Unlock()
 	return created.Number, nil
 }
 
