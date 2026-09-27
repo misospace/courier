@@ -96,6 +96,14 @@ type Reporter interface {
 	Report(context.Context, WorkItem, Lifecycle) error
 }
 
+// WorkIdentifier optionally maps a work item ID to the identity that decides
+// whether two items are the same work. An opaque ID can carry incidental
+// metadata (a URL, say) that changes between offers of the same work; the
+// runner dedupes on this identity when an adapter provides one.
+type WorkIdentifier interface {
+	WorkIdentity(workItemID string) string
+}
+
 // PreLauncher optionally revalidates claimed work immediately before launch.
 // ErrStaleWork means the claim was released because the work no longer needs a
 // coordinator; other errors leave the run retryable.

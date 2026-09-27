@@ -18,6 +18,9 @@ spec:
     - jsonPath: .spec.concurrency
       name: Concurrency
       type: integer
+    - jsonPath: .metadata.annotations.courier\.misospace\.dev/suspend
+      name: Suspended
+      type: string
     - jsonPath: .metadata.creationTimestamp
       name: Age
       type: date

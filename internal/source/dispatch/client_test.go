@@ -544,6 +544,46 @@ func TestHTTPClientReportMapsBlockedAndFailed(t *testing.T) {
 	}
 }
 
+func TestWorkIdentityIgnoresTaskURLForQueueBackedFollowups(t *testing.T) {
+	attempt := func(url string, generation int) string {
+		return EncodeWorkID(Task{Type: "followup-pr", Issue: &Issue{Repo: "acme/widgets", Number: 111}, PullRequest: &PullRequest{Repo: "acme/widgets", Number: 113, URL: url}, PRFixItem: &PRFixItem{ID: "queue-item", Generation: generation}})
+	}
+	viaPR := attempt("https://api.github.com/repos/acme/widgets/pulls/113", 1)
+	viaJob := attempt("https://github.com/acme/widgets/actions/runs/36320266950/job/108622630814", 1)
+	if viaPR == viaJob {
+		t.Fatal("test setup: expected the two offers to encode differently")
+	}
+	if WorkIdentity(viaPR) != WorkIdentity(viaJob) {
+		t.Fatalf("same attempt has different identities: %q vs %q", WorkIdentity(viaPR), WorkIdentity(viaJob))
+	}
+	if WorkIdentity(attempt("https://api.github.com/repos/acme/widgets/pulls/113", 2)) == WorkIdentity(viaPR) {
+		t.Fatal("a new generation must be a new identity")
+	}
+
+	linked := EncodeWorkID(Task{Type: "followup-pr", Issue: &Issue{Repo: "acme/widgets", Number: 41}, PullRequest: &PullRequest{Repo: "acme/widgets", Number: 77}})
+	if WorkIdentity(linked) != linked {
+		t.Fatalf("linked-PR follow-up identity = %q, want its opaque ID", WorkIdentity(linked))
+	}
+	implement := EncodeWorkID(Task{Type: "implement", Issue: &Issue{ID: "issue-id", Repo: "acme/widgets", Number: 42}})
+	if WorkIdentity(implement) != implement {
+		t.Fatalf("implement identity = %q, want its opaque ID", WorkIdentity(implement))
+	}
+	if WorkIdentity("not-a-dispatch-id") != "not-a-dispatch-id" {
+		t.Fatal("an undecodable ID must keep itself as its identity")
+	}
+}
+
+func TestEncodeWorkIDDropsNonPullRequestURLs(t *testing.T) {
+	id := EncodeWorkID(Task{Type: "followup-pr", PullRequest: &PullRequest{Repo: "acme/widgets", Number: 113, URL: "https://github.com/acme/widgets/actions/runs/1/job/2"}, PRFixItem: &PRFixItem{ID: "queue-item", Generation: 1}})
+	d, err := decodeWorkID(id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if d.PRURL != "" {
+		t.Fatalf("PRURL = %q, want a CI job URL dropped so it is never reported as pullRequestUrl", d.PRURL)
+	}
+}
+
 func TestHTTPClientQueueBackedFollowupEchoesAttemptToken(t *testing.T) {
 	var reports, marks []map[string]any
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

@@ -1,5 +1,29 @@
 # Changelog
 
+## [0.1.3](https://github.com/misospace/courier/compare/v0.1.2...v0.1.3) (2026-09-27)
+
+
+### Features
+
+* add semantic forge provider contract ([2f0592c](https://github.com/misospace/courier/commit/2f0592c7f5326e692c300c4a90df0897fb89d265))
+* add semantic forge provider contract ([29a82a9](https://github.com/misospace/courier/commit/29a82a9f6e883adfe66cbda59baa33c36f2e7d7a))
+* suspend a lane without stopping work in flight ([7064e6e](https://github.com/misospace/courier/commit/7064e6ef59b2037030fd1b9b65d887e639070d6f))
+* suspend a lane without stopping work in flight ([e8b7cf5](https://github.com/misospace/courier/commit/e8b7cf5c23393ba05230c784ae7f5dd043d283d5))
+
+
+### Bug Fixes
+
+* **dispatch:** dedupe follow-up runs on the PR-fix attempt, not the task URL ([36e5d6f](https://github.com/misospace/courier/commit/36e5d6f0df834fd038352299e41a5112a7eb4de3))
+* **dispatch:** dedupe follow-up runs on the PR-fix attempt, not the task URL ([42fb5ad](https://github.com/misospace/courier/commit/42fb5ad3cc5da355a658dbb81532bbe2c14208ca))
+* **forge:** keep draft updates off github patch ([f4f9222](https://github.com/misospace/courier/commit/f4f922225b8522a4d8bcec3a572cb2ddd9ae377e))
+* **forge:** retain live pr repository identity ([d6c28da](https://github.com/misospace/courier/commit/d6c28da1c21dc8d4b991e0878613342e721f1c16))
+
+
+### Chores
+
+* release 0.1.3 ([a5bd9c9](https://github.com/misospace/courier/commit/a5bd9c9d920033967cf10bfc9d0959416731370a))
+* release 0.1.3 ([0cac14f](https://github.com/misospace/courier/commit/0cac14fd5eba92fc028d8aa3b70d4f09aecb2718))
+
 ## [0.1.2](https://github.com/misospace/courier/compare/v0.1.1...v0.1.2) (2026-09-27)
 
 

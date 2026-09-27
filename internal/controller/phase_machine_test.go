@@ -256,6 +256,31 @@ func TestPreLaunchStaleOnClaimedRunReleasesAndDeletes(t *testing.T) {
 	}
 }
 
+func TestSuspendedLaneStillLaunchesClaimedRun(t *testing.T) {
+	item := &admissionSource{}
+	launched := false
+	lane := admissionLane("local", 1)
+	lane.Annotations = map[string]string{courierv1alpha1.SuspendAnnotation: "true"}
+	run := admissionRun("run", "local", courierv1alpha1.PhaseClaimed)
+	run.Status.Branch = "courier/acme/widgets/issue-1"
+	client := phaseClient(t, lane, run)
+	reconciler := &CoderRunReconciler{
+		Client:       client,
+		Sources:      NewSourceRegistry(map[string]source.Adapter{"test": item}),
+		StatusWriter: fakeStatusWriter{client: client},
+		Launch: func(context.Context, *courierv1alpha1.CoderRun) error {
+			launched = true
+			return nil
+		},
+	}
+	if _, err := reconciler.Reconcile(context.Background(), admissionRequest("run")); err != nil {
+		t.Fatalf("Reconcile() error = %v", err)
+	}
+	if !launched {
+		t.Fatal("a run admitted before the lane was suspended must still launch")
+	}
+}
+
 func TestFixPRRequiresInjectedHeadResolver(t *testing.T) {
 	run := admissionRun("fix", "local", courierv1alpha1.PhasePending)
 	run.Spec.Mode = courierv1alpha1.ModeFixPR

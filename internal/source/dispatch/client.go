@@ -450,7 +450,11 @@ func EncodeWorkID(task Task) string {
 	if task.PullRequest != nil {
 		d.Repo = task.PullRequest.Repo
 		d.Number = task.PullRequest.Number
-		d.PRURL = task.PullRequest.URL
+		// Dispatch can hand out a CI job URL here; only a pull request URL
+		// belongs in the report's pullRequestUrl.
+		if strings.Contains(task.PullRequest.URL, "/pull") {
+			d.PRURL = task.PullRequest.URL
+		}
 	}
 	payload, _ := json.Marshal(d)
 	return base64.RawURLEncoding.EncodeToString(payload)
@@ -478,6 +482,17 @@ func (c *HTTPClient) resolveIssue(ctx context.Context, id string) (workDescripto
 	}
 	d.IssueID = state.IssueID
 	return d, nil
+}
+
+// WorkIdentity is the dedupe identity of a Dispatch work ID. A queue-backed
+// follow-up is one attempt per PR-fix item generation, whatever URL Dispatch
+// attached to the offer; everything else keeps its opaque ID.
+func WorkIdentity(id string) string {
+	d, err := decodeWorkID(id)
+	if err != nil || d.Type != "followup-pr" || d.PRFixID == "" {
+		return id
+	}
+	return fmt.Sprintf("followup-pr/%s#%d/%s@%d", d.Repo, d.Number, d.PRFixID, d.Generation)
 }
 
 func decodeWorkID(id string) (workDescriptor, error) {

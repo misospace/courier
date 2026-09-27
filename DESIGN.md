@@ -682,6 +682,14 @@ was superseded.
   reference stays readable while writes are denied at the filesystem level.
   This is bootstrap ergonomics for the pinned runtime, distinct from the #136
   secure dependency cache.
+- **2026-09-27 — A lane can be suspended without stopping work in flight.**
+  Setting `courier.misospace.dev/suspend: "true"` on a LaneProfile pauses that
+  lane: its source runner stops discovering work and the operator stops
+  admitting its Pending runs, while Claimed, Running and Verifying runs finish
+  normally. This frees a lane's models without killing anything. It is an
+  annotation rather than a spec field, so an operator can toggle it with
+  `kubectl annotate` without fighting the manifest's owner, and a suspended
+  lane shows in the LaneProfile's Suspended column. (#162)
 - **2026-09-26 — #118 settles the run publication policy.** The operator
   resolves and persists an immutable run-UID-bound policy from the spec,
   provider configuration, and live reads: canonical base repo/ref/OID,
