@@ -85,8 +85,7 @@ func (w *StatusWriter) Write(ctx context.Context, identity StatusIdentity, patch
 			return fmt.Errorf("authenticated control pod is stale or is not owned by this CoderRun")
 		}
 		pods := &corev1.PodList{}
-		selector := ctrlclient.MatchingLabels{"courier.misospace.dev/coderrun": w.runName, "courier.misospace.dev/component": "coordinator"}
-		if err := w.reader.List(ctx, pods, selector, ctrlclient.InNamespace(w.namespace)); err != nil {
+		if err := w.reader.List(ctx, pods, ctrlclient.InNamespace(w.namespace)); err != nil {
 			return fmt.Errorf("list current control pods: %w", err)
 		}
 		current := 0

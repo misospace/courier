@@ -12,16 +12,16 @@ import (
 // provider configuration selected by trusted startup configuration. Provider is
 // the registered configuration name, not its credential reference. This function
 // validates persisted pins against the immutable spec where derivation is
-// possible; its caller must use the trusted provider to resolve spec.repo and
-// verify that its canonical identity matches the pinned BaseRepo. Do not use
-// mutable status.branch/headRepo as policy input: live provider observations
-// determine world state, while these fields are neither authority nor fences.
-func PolicyFromRun(run *v1alpha1.CoderRun, providerConfigRef string) (Policy, error) {
+// possible; its caller supplies the trusted provider's canonical identity for
+// spec.repo, which must match the persisted BaseRepo. Do not use mutable
+// status.branch/headRepo as policy input: live provider observations determine
+// world state, while these fields are neither authority nor fences.
+func PolicyFromRun(run *v1alpha1.CoderRun, providerConfigRef, canonicalSpecRepo string) (Policy, error) {
 	if run == nil {
 		return Policy{}, errors.New("broker binding: run is required")
 	}
-	if providerConfigRef == "" {
-		return Policy{}, errors.New("broker binding: trusted provider config ref is required")
+	if providerConfigRef == "" || canonicalSpecRepo == "" {
+		return Policy{}, errors.New("broker binding: trusted provider config ref and canonical spec repository are required")
 	}
 	persisted := run.Status.PublicationPolicy
 	if persisted == nil {
@@ -40,6 +40,9 @@ func PolicyFromRun(run *v1alpha1.CoderRun, providerConfigRef string) (Policy, er
 	}
 	if run.Spec.Repo == "" || run.Spec.Ref < 1 {
 		return Policy{}, errors.New("broker binding: run spec repository and positive ref are required")
+	}
+	if persisted.BaseRepo == "" || persisted.BaseRepo != canonicalSpecRepo {
+		return Policy{}, errors.New("broker binding: persisted base repository does not match canonical spec repository")
 	}
 	if persisted.BaseRepo == "" || persisted.BaseRef == "" || persisted.BaseOID == "" ||
 		persisted.WorkRepo == "" || persisted.WorkRef == "" {
