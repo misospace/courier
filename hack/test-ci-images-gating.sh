@@ -2,6 +2,8 @@
 
 set -euo pipefail
 
+export GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1
+
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 classifier="$script_dir/ci-change-classifier.sh"
 aggregator="$script_dir/ci-images-aggregate.sh"
@@ -119,6 +121,8 @@ check_classifier_gitmode() {
 check_classifier "README.md" "images_required=false" "README.md"
 check_classifier "docs plus nested README" "images_required=false" "docs/repository-settings.md
 internal/foo/README.md"
+check_classifier "nested non-README markdown" "images_required=true" "internal/prompt/system.md"
+check_classifier "top-level markdown" "images_required=false" "DESIGN.md"
 check_classifier "docs to code rename" "images_required=true" "docs/a.md
 x.go"
 check_classifier "Dockerfile" "images_required=true" "Dockerfile"

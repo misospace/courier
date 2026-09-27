@@ -64,7 +64,12 @@ while IFS= read -r line || [ -n "$line" ]; do
   fi
   count=$((count + 1))
   case "$line" in
-    *.md | docs/*)
+    docs/* | */README.md)
+      ;;
+    */*)
+      value="true"
+      ;;
+    *.md)
       ;;
     *)
       value="true"
