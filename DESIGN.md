@@ -634,7 +634,9 @@ named items remain unresolved and must not be described as production-ready:
   pre/post-push live revalidation, the `NeedsHuman`/retryable matrix, and
   provider-neutral semantics with fail-closed unsupported providers, including
   the actual writable fork head required by #94. What remains is broker
-  implementation (#121/#122).
+  implementation (#122); #121 supplies the typed forge contract. Broker policy,
+  auth, and status primitives from #122 are not a secure deployment until the
+  per-run pod wiring, credential delivery, and isolation preflight in #123 land.
 - **#104 isolation:** #120 settles the per-run broker, pod-bound workload
   identity, signed control-to-worker protocol, and network boundary. The isolated
   topology and secure preflight still need implementation and acceptance tests.
