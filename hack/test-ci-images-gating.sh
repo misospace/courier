@@ -82,12 +82,28 @@ git_setup() {
   git -C "$repo" rev-parse HEAD~1
 }
 
+git_setup_code() {
+  local repo="$1"
+  git init -q "$repo"
+  git -C "$repo" config user.email "ci@localhost"
+  git -C "$repo" config user.name "ci"
+  mkdir -p "$repo/docs"
+  printf 'readme\n' > "$repo/README.md"
+  printf 'ok\n' > "$repo/docs/ok.md"
+  git -C "$repo" add -A
+  git -C "$repo" commit -q -m "docs baseline"
+  printf 'package main\n' > "$repo/main.go"
+  git -C "$repo" add -A
+  git -C "$repo" commit -q -m "code change"
+  git -C "$repo" rev-parse HEAD~1
+}
+
 check_classifier_gitmode() {
-  local desc="$1" expected="$2"
+  local desc="$1" expected="$2" setup="${3:-git_setup}"
   case_n=$((case_n + 1))
   local repo base out rc
   repo="$work/gitrepo-$case_n"
-  base="$(git_setup "$repo" 2>"$work/err-gitmode-$case_n.log")" && rc=0 || rc=$?
+  base="$("$setup" "$repo" 2>"$work/err-gitmode-$case_n.log")" && rc=0 || rc=$?
   if [ "$rc" -ne 0 ]; then
     report FAIL "classifier git-mode: $desc" "git setup rc=$rc"
     return
@@ -114,6 +130,9 @@ check_classifier "hack script" "images_required=true" "hack/verify-courier-go-ru
 check_classifier "chart values" "images_required=true" "charts/courier/values.yaml"
 check_classifier "unknown path" "images_required=true" "src/some/new/unknown/path.txt"
 check_classifier "empty file" "images_required=true" ""
+check_classifier "blank line fails closed" "images_required=true" "docs/ok.md
+
+"
 check_classifier "path with space" "images_required=false" "docs/my notes.md"
 
 check_classifier_error "unreadable files-from" --files-from /nonexistent/missing
@@ -122,6 +141,7 @@ check_classifier_error "unresolvable base-ref" --base-ref refs/heads/nope-nope
 check_classifier_error "both mode flags" --base-ref main --files-from "$work/nonrepo/both.txt"
 
 check_classifier_gitmode "non-ascii docs-only" "images_required=false"
+check_classifier_gitmode "code change fails closed" "images_required=true" git_setup_code
 
 gh_out="$work/github_output.txt"
 gh_files="$work/gh-files.txt"
@@ -141,7 +161,11 @@ check_aggregator "coordinator failed" 1 success true success failure success
 check_aggregator "coordinator-go skipped" 1 success true success success skipped
 check_aggregator "manager ran, skip expected" 1 success false skipped success skipped
 check_aggregator "jobs ran, skip expected" 1 success false success success success
+check_aggregator "not required, job neutral" 1 success false neutral skipped skipped
+check_aggregator "not required, job cancelled" 1 success false skipped cancelled skipped
 check_aggregator "empty images_required" 1 success "" skipped skipped skipped
+check_aggregator "unknown images_required value" 1 success TRUE skipped skipped skipped
+check_aggregator "nonsense images_required value" 1 success yes skipped skipped skipped
 check_aggregator "classify cancelled" 1 cancelled true skipped skipped skipped
 check_aggregator "classify skipped" 1 skipped false skipped skipped skipped
 check_aggregator "required, job neutral" 1 success true success neutral success
@@ -152,6 +176,14 @@ if [ "$agg_rc" -ne 0 ]; then
   report PASS "aggregator: wrong arg count"
 else
   report FAIL "aggregator: wrong arg count" "rc=$agg_rc"
+fi
+
+agg_rc=0
+bash "$aggregator" success true success success success success >/dev/null 2>&1 || agg_rc=$?
+if [ "$agg_rc" -ne 0 ]; then
+  report PASS "aggregator: too many args"
+else
+  report FAIL "aggregator: too many args" "rc=$agg_rc"
 fi
 
 echo
