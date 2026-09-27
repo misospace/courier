@@ -321,6 +321,93 @@ func TestWorkStateDistinguishesNoWorkDirtyWorkAndCommits(t *testing.T) {
 	}
 }
 
+func TestCurrentBranchDistinguishesAttachedAndDetached(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	initRepo(t, root)
+	writeFile(t, filepath.Join(root, "base.txt"), "base\n")
+	commit(t, root, "base: initial")
+	git(t, root, "checkout", "-b", "feature/work")
+
+	workspace := &Workspace{Directory: root}
+	got, err := workspace.CurrentBranch(ctx)
+	if err != nil {
+		t.Fatalf("CurrentBranch(attached): %v", err)
+	}
+	if got != "feature/work" {
+		t.Fatalf("CurrentBranch(attached) = %q, want %q", got, "feature/work")
+	}
+
+	git(t, root, "checkout", "--detach", "HEAD")
+	got, err = workspace.CurrentBranch(ctx)
+	if err != nil {
+		t.Fatalf("CurrentBranch(detached): %v", err)
+	}
+	if got != "" {
+		t.Fatalf("CurrentBranch(detached) = %q, want empty", got)
+	}
+
+	if _, err := (&Workspace{}).CurrentBranch(ctx); err == nil {
+		t.Fatal("CurrentBranch with an empty directory succeeded, want an error")
+	}
+}
+
+func TestCommitsOnBranchSince(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	initRepo(t, root)
+	writeFile(t, filepath.Join(root, "base.txt"), "base\n")
+	commit(t, root, "base: initial")
+	git(t, root, "checkout", "-b", "feature/work")
+
+	workspace := &Workspace{Directory: root}
+	start, err := workspace.Head(ctx)
+	if err != nil {
+		t.Fatalf("Head: %v", err)
+	}
+
+	// A commit made while on the branch advances the branch ref.
+	writeFile(t, filepath.Join(root, "work.txt"), "work\n")
+	commit(t, root, "work: on branch")
+	count, err := workspace.CommitsOnBranchSince(ctx, "feature/work", start)
+	if err != nil {
+		t.Fatalf("CommitsOnBranchSince(advanced branch): %v", err)
+	}
+	if count < 1 {
+		t.Fatalf("CommitsOnBranchSince(advanced branch) = %d, want >= 1", count)
+	}
+
+	// A commit made from a detached HEAD does not advance the branch ref, so
+	// the count measured from the branch's own tip stays at zero.
+	tip, err := workspace.Head(ctx)
+	if err != nil {
+		t.Fatalf("Head(branch tip): %v", err)
+	}
+	git(t, root, "checkout", "--detach")
+	writeFile(t, filepath.Join(root, "detached.txt"), "detached\n")
+	commit(t, root, "work: on detached head")
+	count, err = workspace.CommitsOnBranchSince(ctx, "feature/work", tip)
+	if err != nil {
+		t.Fatalf("CommitsOnBranchSince(after detach): %v", err)
+	}
+	if count != 0 {
+		t.Fatalf("CommitsOnBranchSince(after detach) = %d, want 0 (branch ref did not advance)", count)
+	}
+
+	// A branch name that does not exist reports zero without an error.
+	count, err = workspace.CommitsOnBranchSince(ctx, "feature/missing", tip)
+	if err != nil {
+		t.Fatalf("CommitsOnBranchSince(missing branch): %v", err)
+	}
+	if count != 0 {
+		t.Fatalf("CommitsOnBranchSince(missing branch) = %d, want 0", count)
+	}
+
+	if _, err := (&Workspace{}).CommitsOnBranchSince(ctx, "feature/work", tip); err == nil {
+		t.Fatal("CommitsOnBranchSince with an empty directory succeeded, want an error")
+	}
+}
+
 func TestBranchNameRejectsMissingRef(t *testing.T) {
 	if _, err := BranchName("acme/widget", 0, "resolve-issue"); err == nil {
 		t.Fatal("BranchName accepted a missing ref")

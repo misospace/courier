@@ -628,6 +628,48 @@ func TestGoalCarriesCoordinatorCompletionContract(t *testing.T) {
 	}
 }
 
+func TestGoalNamesRunBranchAsOnlyPublicationTarget(t *testing.T) {
+	run := &courierv1alpha1.CoderRun{
+		Spec: courierv1alpha1.CoderRunSpec{
+			Mode: courierv1alpha1.ModeResolveIssue,
+			Ref:  7,
+		},
+		Status: courierv1alpha1.CoderRunStatus{Branch: "courier/acme/widgets/issue-7"},
+	}
+	goal, err := Goal(run)
+	if err != nil {
+		t.Fatalf("Goal() error = %v", err)
+	}
+	for _, fragment := range []string{
+		"courier/acme/widgets/issue-7",
+		"Publish only to the run branch",
+		"The run branch is courier/acme/widgets/issue-7.",
+		"you own completion",
+		"open or update the pull request",
+	} {
+		if !strings.Contains(goal, fragment) {
+			t.Fatalf("goal %q missing fragment %q", goal, fragment)
+		}
+	}
+	if forgeCLINames.MatchString(goal) {
+		t.Fatalf("goal %q references a forge-specific CLI", goal)
+	}
+
+	noBranch := &courierv1alpha1.CoderRun{
+		Spec: courierv1alpha1.CoderRunSpec{
+			Mode: courierv1alpha1.ModeResolveIssue,
+			Ref:  7,
+		},
+	}
+	goal, err = Goal(noBranch)
+	if err != nil {
+		t.Fatalf("Goal() error = %v", err)
+	}
+	if strings.Contains(goal, "The run branch is") {
+		t.Fatalf("goal %q names a run branch when none is set", goal)
+	}
+}
+
 func TestBuildCoordinatorPodWiresRolesAndMCPConfig(t *testing.T) {
 	run := &courierv1alpha1.CoderRun{
 		ObjectMeta: metav1.ObjectMeta{Name: "run-mcp", Namespace: "courier-system"},
@@ -996,6 +1038,29 @@ func TestOpenCodeConfigScratchPermissionLeastPrivilege(t *testing.T) {
 		if strings.Contains(key, "~") || strings.Contains(key, "$HOME") || strings.Contains(key, "root") {
 			t.Fatalf("permission.external_directory references a home/config path: %q", key)
 		}
+	}
+}
+
+func TestOpenCodeConfigContinuesLoopOnDeny(t *testing.T) {
+	raw, err := marshalOpenCodeConfig(map[string]string{"coordinator": "litellm/qwen"}, "", "", "")
+	if err != nil {
+		t.Fatalf("marshalOpenCodeConfig() error = %v", err)
+	}
+
+	var config map[string]any
+	if err := json.Unmarshal(raw, &config); err != nil {
+		t.Fatalf("opencode config = %q, not valid JSON: %v", raw, err)
+	}
+
+	experimental, ok := config["experimental"].(map[string]any)
+	if !ok {
+		t.Fatalf("experimental = %#v, want an object; an unattended run needs continue_loop_on_deny", config["experimental"])
+	}
+	if experimental["continue_loop_on_deny"] != true {
+		t.Fatalf("experimental.continue_loop_on_deny = %#v, want true so a denied tool call does not end the run", experimental["continue_loop_on_deny"])
+	}
+	if _, ok := config["permission"].(map[string]any)["github_merge*"]; !ok {
+		t.Fatal("permission lost the merge deny; continuing after a denial must not loosen any permission")
 	}
 }
 

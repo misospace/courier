@@ -3,6 +3,11 @@
 # (`crane digest <image:tag>`, or the gcr.io web UI for distroless) and
 # replace the digest. Never retag to a different version.
 
+# BINARIES selects where the manager and executor binaries come from: builder
+# compiles them here (release builds), prebuilt copies them from dist/ (CI builds
+# them on the runner, where the Go build cache persists between runs).
+ARG BINARIES=builder
+
 # Build the manager and executor binaries.
 FROM golang:1.27.1@sha256:3680233e3204827fbdc66088528ae6d4b3d034f51d03a99d454f6de034888244 AS builder
 ARG TARGETOS
@@ -23,6 +28,13 @@ RUN --mount=type=cache,target=/go/pkg/mod \
 	CGO_ENABLED=0 GOOS=${TARGETOS:-linux} GOARCH=${TARGETARCH} \
 	go build -o manager cmd/main.go && \
 	go build -o courier-executor ./cmd/courier-executor
+
+FROM builder AS binaries-builder
+
+FROM scratch AS binaries-prebuilt
+COPY dist/manager dist/courier-executor /workspace/
+
+FROM binaries-${BINARIES} AS binaries
 
 FROM golang:1.27.1@sha256:3680233e3204827fbdc66088528ae6d4b3d034f51d03a99d454f6de034888244 AS toolchain
 ARG CONTROLLER_TOOLS_VERSION=v0.16.5
@@ -48,7 +60,7 @@ RUN apt-get update && \
 	useradd --create-home --uid 65532 --gid 65532 courier && \
 	mkdir -p /workspace && chown courier:courier /workspace
 
-COPY --from=builder /workspace/courier-executor /usr/local/bin/courier-executor
+COPY --from=binaries /workspace/courier-executor /usr/local/bin/courier-executor
 
 USER 65532:65532
 ENV HOME=/home/courier
@@ -64,7 +76,7 @@ RUN apt-get update && \
 	apt-get install -y --no-install-recommends make && \
 	apt-get clean && rm -rf /var/lib/apt/lists/*
 
-COPY --from=builder /usr/local/go /usr/local/go
+COPY --from=toolchain /usr/local/go /usr/local/go
 COPY --from=toolchain /out/controller-gen /usr/local/bin/controller-gen
 COPY --from=toolchain /out/helm /usr/local/bin/helm
 
@@ -79,7 +91,7 @@ USER 65532:65532
 # --target explicitly.
 FROM gcr.io/distroless/static:nonroot@sha256:e2e927ec666bae08560abb3c55d0659eceabb657f56b6782ab500a9fc7f555e3 AS manager
 WORKDIR /
-COPY --from=builder /workspace/manager .
+COPY --from=binaries /workspace/manager .
 USER 65532:65532
 
 ENTRYPOINT ["/manager"]

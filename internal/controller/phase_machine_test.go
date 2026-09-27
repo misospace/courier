@@ -447,7 +447,7 @@ func TestRunningDirectTerminalEnrichesObservedPR(t *testing.T) {
 			wantReportPR: "42",
 		},
 		{
-			name:         "failed retains already-observable PR",
+			name:         "failed retains prior PR on observer error",
 			exitCode:     17,
 			priorPR:      "42",
 			observer:     fakeWorldObserver{err: errors.New("github unavailable")},
