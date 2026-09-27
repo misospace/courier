@@ -207,6 +207,8 @@ func (w fakeStatusWriter) PatchStatus(ctx context.Context, name types.Namespaced
 		Status struct {
 			Phase            courierv1alpha1.Phase `json:"phase,omitempty"`
 			Branch           *string               `json:"branch,omitempty"`
+			HeadRepo         *string               `json:"headRepo,omitempty"`
+			HeadSHA          *string               `json:"headSHA,omitempty"`
 			PR               string                `json:"pr,omitempty"`
 			CheckFingerprint *string               `json:"checkFingerprint,omitempty"`
 			Restarts         *int                  `json:"restarts,omitempty"`
@@ -224,6 +226,12 @@ func (w fakeStatusWriter) PatchStatus(ctx context.Context, name types.Namespaced
 	}
 	if document.Status.Branch != nil {
 		run.Status.Branch = *document.Status.Branch
+	}
+	if document.Status.HeadRepo != nil {
+		run.Status.HeadRepo = *document.Status.HeadRepo
+	}
+	if document.Status.HeadSHA != nil {
+		run.Status.HeadSHA = *document.Status.HeadSHA
 	}
 	if document.Status.PR != "" {
 		run.Status.PR = document.Status.PR

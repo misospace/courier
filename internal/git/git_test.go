@@ -111,6 +111,73 @@ func TestPrepareAdoptsOrphanAndSyncsBaseBeforeWork(t *testing.T) {
 	}
 }
 
+// SyncToBase must merge the upstream base, not the fork's: a fork PR's origin
+// is the fork, whose base branch can be arbitrarily stale or divergent.
+func TestPrepareSyncsBaseFromUpstreamWhenOriginIsFork(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	root := t.TempDir()
+	upstream := filepath.Join(root, "upstream.git")
+	fork := filepath.Join(root, "fork.git")
+	source := filepath.Join(root, "source")
+	initBare(t, upstream)
+	initBare(t, fork)
+	initRepo(t, source)
+	writeFile(t, filepath.Join(source, "README.md"), "base one\n")
+	commit(t, source, "base: initial")
+	git(t, source, "branch", "-M", "main")
+	git(t, source, "remote", "add", "origin", upstream)
+	git(t, source, "push", "-u", "origin", "main")
+
+	// Fork the upstream, then create the PR head branch on the fork. The
+	// fork-seed clone may have no checked-out branch (an unborn HEAD when the
+	// fork's default branch name is guessed), so push the explicit refspec.
+	git(t, root, "clone", upstream, filepath.Join(root, "forkseed"))
+	git(t, filepath.Join(root, "forkseed"), "remote", "add", "fork", fork)
+	git(t, filepath.Join(root, "forkseed"), "push", "fork", "origin/main:refs/heads/main")
+	forkWork := filepath.Join(root, "forkwork")
+	git(t, root, "clone", fork, forkWork)
+	git(t, forkWork, "config", "user.name", "Courier Test")
+	git(t, forkWork, "config", "user.email", "courier-test@example.invalid")
+	git(t, forkWork, "checkout", "-b", "fix/pr-12", "origin/main")
+	writeFile(t, filepath.Join(forkWork, "work.txt"), "fork work\n")
+	commit(t, forkWork, "work: fork brief")
+	git(t, forkWork, "push", "origin", "HEAD:refs/heads/fix/pr-12")
+
+	// Both bases move after the work branch was created: upstream main gains
+	// the commit that must be merged, fork main gains one that must not be.
+	writeFile(t, filepath.Join(source, "upstream-base.txt"), "new upstream base\n")
+	commit(t, source, "base: upstream second revision")
+	git(t, source, "push", "origin", "main")
+	writeFile(t, filepath.Join(forkWork, "fork-main.txt"), "stale fork main\n")
+	git(t, forkWork, "checkout", "-B", "main", "origin/main")
+	commit(t, forkWork, "base: divergent fork main")
+	git(t, forkWork, "push", "origin", "main")
+
+	workspace, err := Prepare(ctx, PrepareOptions{
+		RemoteURL:     fork,
+		BaseRemoteURL: upstream,
+		Directory:     filepath.Join(root, "workspace"),
+		Base:          "main",
+		Branch:        "fix/pr-12",
+	})
+	if err != nil {
+		t.Fatalf("prepare: %v", err)
+	}
+	if !workspace.Adopted {
+		t.Fatal("expected existing fork branch to be adopted")
+	}
+	if _, err := os.Stat(filepath.Join(workspace.Directory, "upstream-base.txt")); err != nil {
+		t.Fatalf("upstream base was not merged into the fork work branch: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(workspace.Directory, "fork-main.txt")); !os.IsNotExist(err) {
+		t.Fatalf("fork's own main was merged instead of the upstream base")
+	}
+	if _, err := gitOutput(workspace.Directory, "merge-base", "--is-ancestor", "upstream/main", "HEAD"); err != nil {
+		t.Fatalf("upstream main is not an ancestor after adoption: %v", err)
+	}
+}
+
 func TestPrepareCreatesBranchFromBase(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
@@ -251,6 +318,93 @@ func TestWorkStateDistinguishesNoWorkDirtyWorkAndCommits(t *testing.T) {
 	state, err = workspace.WorkState(context.Background(), start)
 	if err != nil || state != WorkStateDirty {
 		t.Fatalf("WorkState(commit with staged edit) = %q, %v; want dirty", state, err)
+	}
+}
+
+func TestCurrentBranchDistinguishesAttachedAndDetached(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	initRepo(t, root)
+	writeFile(t, filepath.Join(root, "base.txt"), "base\n")
+	commit(t, root, "base: initial")
+	git(t, root, "checkout", "-b", "feature/work")
+
+	workspace := &Workspace{Directory: root}
+	got, err := workspace.CurrentBranch(ctx)
+	if err != nil {
+		t.Fatalf("CurrentBranch(attached): %v", err)
+	}
+	if got != "feature/work" {
+		t.Fatalf("CurrentBranch(attached) = %q, want %q", got, "feature/work")
+	}
+
+	git(t, root, "checkout", "--detach", "HEAD")
+	got, err = workspace.CurrentBranch(ctx)
+	if err != nil {
+		t.Fatalf("CurrentBranch(detached): %v", err)
+	}
+	if got != "" {
+		t.Fatalf("CurrentBranch(detached) = %q, want empty", got)
+	}
+
+	if _, err := (&Workspace{}).CurrentBranch(ctx); err == nil {
+		t.Fatal("CurrentBranch with an empty directory succeeded, want an error")
+	}
+}
+
+func TestCommitsOnBranchSince(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	initRepo(t, root)
+	writeFile(t, filepath.Join(root, "base.txt"), "base\n")
+	commit(t, root, "base: initial")
+	git(t, root, "checkout", "-b", "feature/work")
+
+	workspace := &Workspace{Directory: root}
+	start, err := workspace.Head(ctx)
+	if err != nil {
+		t.Fatalf("Head: %v", err)
+	}
+
+	// A commit made while on the branch advances the branch ref.
+	writeFile(t, filepath.Join(root, "work.txt"), "work\n")
+	commit(t, root, "work: on branch")
+	count, err := workspace.CommitsOnBranchSince(ctx, "feature/work", start)
+	if err != nil {
+		t.Fatalf("CommitsOnBranchSince(advanced branch): %v", err)
+	}
+	if count < 1 {
+		t.Fatalf("CommitsOnBranchSince(advanced branch) = %d, want >= 1", count)
+	}
+
+	// A commit made from a detached HEAD does not advance the branch ref, so
+	// the count measured from the branch's own tip stays at zero.
+	tip, err := workspace.Head(ctx)
+	if err != nil {
+		t.Fatalf("Head(branch tip): %v", err)
+	}
+	git(t, root, "checkout", "--detach")
+	writeFile(t, filepath.Join(root, "detached.txt"), "detached\n")
+	commit(t, root, "work: on detached head")
+	count, err = workspace.CommitsOnBranchSince(ctx, "feature/work", tip)
+	if err != nil {
+		t.Fatalf("CommitsOnBranchSince(after detach): %v", err)
+	}
+	if count != 0 {
+		t.Fatalf("CommitsOnBranchSince(after detach) = %d, want 0 (branch ref did not advance)", count)
+	}
+
+	// A branch name that does not exist reports zero without an error.
+	count, err = workspace.CommitsOnBranchSince(ctx, "feature/missing", tip)
+	if err != nil {
+		t.Fatalf("CommitsOnBranchSince(missing branch): %v", err)
+	}
+	if count != 0 {
+		t.Fatalf("CommitsOnBranchSince(missing branch) = %d, want 0", count)
+	}
+
+	if _, err := (&Workspace{}).CommitsOnBranchSince(ctx, "feature/work", tip); err == nil {
+		t.Fatal("CommitsOnBranchSince with an empty directory succeeded, want an error")
 	}
 }
 

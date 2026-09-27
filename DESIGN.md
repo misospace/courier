@@ -124,7 +124,9 @@ role.
   implementation, research, and review to sub-agents, but you own completion:
   integrate and verify their work, push the branch, and open or update the
   pull request yourself — never stop at a local commit or branch when a pull
-  request is required."
+  request is required. Publish only to the run branch {{branch}}: commit on,
+  push, and open or update the pull request from that single branch, and never
+  create or publish work from any other branch."
 - **fix-pr** — "Take over PR #{{pr}}. Inspect the current pull request state,
   CI/checks, and review feedback to determine what's blocking it, then return
   it to a review-ready state. Route every forge read and write through the
@@ -132,11 +134,15 @@ role.
   implementation, research, and review to sub-agents, but you own completion:
   integrate and verify their work, push the branch, and open or update the
   pull request yourself — never stop at a local commit or branch when a pull
-  request is required."
+  request is required. Publish only to the run branch {{branch}}: commit on,
+  push, and open or update the pull request from that single branch, and never
+  create or publish work from any other branch."
 
 Goals stay short — a goal plus tools — but each carries one non-negotiable
 contract: delegation covers bounded work, never the coordinator's ownership
-of completion and forge publication.
+of completion and forge publication. The publication hint names the run branch
+as the single place work may land; it informs rather than constrains (a cheap
+nudge, enforced only at exit, below).
 
 ### Terminal states
 
@@ -339,7 +345,8 @@ no pull request points at it. When the deterministic branch already carries an
 **open** PR, the run refuses to adopt it and instead reports that PR to the
 source for review — a live PR means the work is in flight, not that a human is
 needed. A branch whose only PRs are closed or merged still refuses adoption and
-hands to a human. **fix-pr** always adopts the existing PR's branch.
+hands to a human. **fix-pr** always adopts the existing PR's head repository and
+branch (fork-aware), keeping the base repo as the PR/publication target.
 
 ## Observability and transcripts
 
@@ -379,6 +386,8 @@ spec:                       # set once by the source adapter, then immutable
 status:
   phase: Pending | Claimed | Running | Verifying | AwaitingReview | NeedsHuman | Done | Failed
   branch: <derived resolve branch or adopted PR head>
+  headRepo: <PR head repo; spec.repo for a same-repo PR, the fork's owner/name for a fork PR>
+  headSHA: <head commit SHA>
   pr: <#/url>
   lastCommit: <sha>
   checkpoint:
@@ -430,12 +439,21 @@ it modest" with `concurrency: 1`. Same schema, no local assumption baked in.
   in-progress.
 - **Running** — pod launches: ephemeral workspace, clone, **adopt the branch if it
   exists and base-sync first**, inject LaneProfile framing + roles, wire the MCP
-  tools, set log level from `debug`. The target harness commits per brief and
+  tools, set log level from `debug`. For a fork PR the workspace's `origin` is
+  the fork and base-sync fetches a second fetch-only `upstream` remote pointing
+  at the base repository, so the merge-before-work invariant always merges the
+  real base rather than the fork's possibly stale base branch. The target
+  harness commits per brief and
   writes heartbeat and checkpoint to status; the legacy bootstrap does not
   populate these fields (#102). Exit `0` transitions to **Verifying** before
-  any external observation, releasing the lane capacity. Exit `2` transitions
-  to **NeedsHuman**; any other exit transitions to **Failed**. A pod death or
-  heartbeat stall relaunches/resumes it; a crashloop reaches NeedsHuman.
+  any external observation, releasing the lane capacity — but only when the
+  committed work is actually on the run branch: the bootstrap reads the run
+  branch's own ref (not wherever HEAD happens to point), and committed work
+  that is not on the run branch transitions to **NeedsHuman** with a specific
+  reason rather than a later operator read of an empty branch as "no work"
+  (#134). Exit `2` transitions to **NeedsHuman**; any other exit transitions to
+  **Failed**. A pod death or heartbeat stall relaunches/resumes it; a crashloop
+  reaches NeedsHuman.
 - **Verifying** — no coordinator pod or liveness meaning. The operator polls
   the external PR and CI world indefinitely, with a reconciliation cadence and
   no deadline. Observer errors remain Verifying and requeue. A missing observer,
@@ -654,6 +672,25 @@ was superseded.
   policy derivation, same-name branch substitution, arbitrary destination,
   merge, or force push. This is a design contract, not shipped broker support.
   ([HARNESS.md](./HARNESS.md) §4) (#118, #94, #80)
+- **2026-09-26 — fix-pr adopts the PR head's repository, not just its branch name.**
+  A `fix-pr` run previously resolved only the PR head's branch name, so the
+  executor cloned and pushed the base repository and could fail to find the real
+  fork branch — or worse, adopt a same-named branch in the base repo. The GitHub
+  observer now resolves full head identity (head repository, branch, commit SHA)
+  and the controller persists it on the run as `status.headRepo` and
+  `status.headSHA` alongside `status.branch`. The coordinator pod builds its
+  clone/push remote from the head repository, so `origin` is the fork and a
+  colliding same-named base branch can never be adopted; `spec.repo` (the base)
+  stays the PR/publication target and a fetch-only `upstream` remote keeps
+  base-sync merging the real base rather than the fork's. Observation queries
+  the base repository with the fork's owner as the head qualifier and reads
+  checks for the head SHA from the base. A deleted fork (`head.repo: null`)
+  terminalizes NeedsHuman instead of cycling claim and release. Before
+  preparing the workspace the executor
+  verifies the head branch exists on the fork remote, and an unavailable or
+  unwritable fork head is an actionable NeedsHuman — no reset, replacement
+  branch, or force-push is introduced. Same-repository fix-pr runs are
+  unchanged: `status.headRepo` equals `spec.repo`. (#94)
 - **2026-09-25 — #119 settles the long-tool liveness design.** A silent
   legitimate operation and a wedged one are observationally identical, so no
   design can both reap a wedged silent tool in finite time and never reap a
@@ -787,3 +824,17 @@ was superseded.
   state. Review-readiness is still the operator's to decide by re-reading the
   world: a draft pull request or failing checks continues to hand the run to a
   human. (#135)
+- **2026-09-27 — Committed work must be on the run branch, checked against the
+  branch ref.** A coordinator or delegate could open its PR from a branch other
+  than the run's, so the operator — which observes only the run branch — read
+  an empty branch as "no work" and handed a finished issue to a human. Two
+  changes close the gap. The goals name the run branch as the single place work
+  may be committed, pushed, and opened from (a hint that informs, not a hard
+  gate). At exit the bootstrap inspects the run branch's own ref for commits
+  ahead of the workspace start, not wherever HEAD happens to point — the world
+  wins over the current checkout — and reports `NeedsHuman` with a specific
+  reason when committed work is absent from the run branch, instead of
+  `Verifying`. Checking HEAD alone was rejected: it falsely downgrades work
+  that landed on the run branch while HEAD moved elsewhere. The durable fix —
+  a broker that publishes only to the pinned work ref — is (#122); this is the
+  interim detection plus framing. (#134)

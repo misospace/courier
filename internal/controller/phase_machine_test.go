@@ -50,7 +50,7 @@ type fakeWorldObserver struct {
 	calls       *int
 }
 
-func (o fakeWorldObserver) Observe(context.Context, string, string) (PRObservation, error) {
+func (o fakeWorldObserver) Observe(context.Context, string, HeadRef) (PRObservation, error) {
 	if o.calls != nil {
 		*o.calls = *o.calls + 1
 	}
@@ -136,9 +136,9 @@ func TestOperatorStatusPatchesPreserveHarnessFields(t *testing.T) {
 func TestPendingClaimsBeforeBranchResolutionAndLaunch(t *testing.T) {
 	item := &admissionSource{}
 	var order []string
-	resolver := ExistingPRHeadResolverFunc(func(context.Context, *courierv1alpha1.CoderRun) (string, error) {
+	resolver := ExistingPRHeadResolverFunc(func(_ context.Context, run *courierv1alpha1.CoderRun) (HeadRef, error) {
 		order = append(order, "resolve")
-		return "feature/existing-pr", nil
+		return HeadRef{Repo: run.Spec.Repo, Branch: "feature/existing-pr", SHA: "abc123"}, nil
 	})
 	run := admissionRun("fix", "local", courierv1alpha1.PhasePending)
 	run.Spec.Mode = courierv1alpha1.ModeFixPR
@@ -165,8 +165,8 @@ func TestPendingClaimsBeforeBranchResolutionAndLaunch(t *testing.T) {
 	if err := client.Get(context.Background(), admissionKey("fix"), &updated); err != nil {
 		t.Fatalf("get run: %v", err)
 	}
-	if updated.Status.Branch != "feature/existing-pr" {
-		t.Fatalf("branch = %q, want existing PR head", updated.Status.Branch)
+	if updated.Status.Branch != "feature/existing-pr" || updated.Status.HeadRepo != "acme/widgets" || updated.Status.HeadSHA != "abc123" {
+		t.Fatalf("head = branch %q repo %q sha %q, want existing PR head", updated.Status.Branch, updated.Status.HeadRepo, updated.Status.HeadSHA)
 	}
 }
 
@@ -224,6 +224,9 @@ func TestPreLaunchTransientFailureKeepsRunPending(t *testing.T) {
 	if updated.Status.Phase != courierv1alpha1.PhasePending {
 		t.Fatalf("phase = %q, want Pending", updated.Status.Phase)
 	}
+	if updated.Status.HeadRepo != "" || updated.Status.HeadSHA != "" {
+		t.Fatalf("run after rejected claim = head repo %q sha %q, want empty", updated.Status.HeadRepo, updated.Status.HeadSHA)
+	}
 }
 
 func TestPreLaunchStaleOnClaimedRunReleasesAndDeletes(t *testing.T) {
@@ -262,6 +265,61 @@ func TestFixPRRequiresInjectedHeadResolver(t *testing.T) {
 	}
 }
 
+func TestFixPREmptyHeadRepositoryIsGone(t *testing.T) {
+	run := admissionRun("fix", "local", courierv1alpha1.PhasePending)
+	run.Spec.Mode = courierv1alpha1.ModeFixPR
+	resolver := ExistingPRHeadResolverFunc(func(context.Context, *courierv1alpha1.CoderRun) (HeadRef, error) {
+		// A deleted fork: GitHub returns head.repo = null, so the resolved
+		// head carries a branch but no repository.
+		return HeadRef{Branch: "fix/pr-12"}, nil
+	})
+	_, err := resolveRunBranch(context.Background(), run, resolver)
+	if !errors.Is(err, ErrHeadRepositoryGone) {
+		t.Fatalf("resolveRunBranch() error = %v, want ErrHeadRepositoryGone", err)
+	}
+}
+
+func TestDeletedForkHeadTerminatesNeedsHumanWithoutReclaim(t *testing.T) {
+	item := &admissionSource{}
+	run := admissionRun("fix", "local", courierv1alpha1.PhasePending)
+	run.Spec.Mode = courierv1alpha1.ModeFixPR
+	client := phaseClient(t, admissionLane("local", 1), run)
+	reconciler := &CoderRunReconciler{
+		Client:  client,
+		Sources: NewSourceRegistry(map[string]source.Adapter{"test": item}),
+		PRHeadResolver: ExistingPRHeadResolverFunc(func(context.Context, *courierv1alpha1.CoderRun) (HeadRef, error) {
+			return HeadRef{Branch: "fix/pr-12"}, nil
+		}),
+		StatusWriter: fakeStatusWriter{client: client},
+		Launch: func(context.Context, *courierv1alpha1.CoderRun) error {
+			t.Error("launch must not run for a missing head repository")
+			return nil
+		},
+	}
+	if _, err := reconciler.Reconcile(context.Background(), admissionRequest("fix")); err != nil {
+		t.Fatalf("Reconcile() error = %v", err)
+	}
+	var updated courierv1alpha1.CoderRun
+	if err := client.Get(context.Background(), admissionKey("fix"), &updated); err != nil {
+		t.Fatalf("get run: %v", err)
+	}
+	if updated.Status.Phase != courierv1alpha1.PhaseNeedsHuman {
+		t.Fatalf("run after missing head repository = phase %q, want NeedsHuman (not a re-claimable Pending)", updated.Status.Phase)
+	}
+	if updated.Status.HeadRepo != "" || updated.Status.HeadSHA != "" || updated.Status.Branch != "" {
+		t.Fatalf("run after missing head repository = branch %q repo %q sha %q, want empty", updated.Status.Branch, updated.Status.HeadRepo, updated.Status.HeadSHA)
+	}
+	if len(item.released) != 1 || item.released[0] != "fix" {
+		t.Fatalf("released IDs = %#v, want the claim released exactly once", item.released)
+	}
+	if len(item.claimed) != 1 {
+		t.Fatalf("claimed IDs = %#v, want a single claim", item.claimed)
+	}
+	if len(item.transitions) != 1 || item.transitions[0] != source.StateNeedsHuman {
+		t.Fatalf("transitions = %#v, want NeedsHuman reported to the source", item.transitions)
+	}
+}
+
 func TestLaunchFailureReleasesSourceAndCapacity(t *testing.T) {
 	item := &admissionSource{}
 	wantErr := errors.New("pod launch failed")
@@ -285,6 +343,9 @@ func TestLaunchFailureReleasesSourceAndCapacity(t *testing.T) {
 	}
 	if updated.Status.Phase != courierv1alpha1.PhasePending || updated.Status.Branch != "" {
 		t.Fatalf("run after failed launch = phase %q branch %q, want Pending and empty branch", updated.Status.Phase, updated.Status.Branch)
+	}
+	if updated.Status.HeadRepo != "" || updated.Status.HeadSHA != "" {
+		t.Fatalf("run after failed launch = head repo %q sha %q, want empty", updated.Status.HeadRepo, updated.Status.HeadSHA)
 	}
 }
 
@@ -386,7 +447,7 @@ func TestRunningDirectTerminalEnrichesObservedPR(t *testing.T) {
 			wantReportPR: "42",
 		},
 		{
-			name:         "failed retains already-observable PR",
+			name:         "failed retains prior PR on observer error",
 			exitCode:     17,
 			priorPR:      "42",
 			observer:     fakeWorldObserver{err: errors.New("github unavailable")},

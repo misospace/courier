@@ -29,6 +29,11 @@ type PrepareOptions struct {
 	Directory string
 	Base      string
 	Branch    string
+	// BaseRemoteURL optionally names the repository that owns Base. It is
+	// needed when RemoteURL points at a fork: Base lives upstream, so syncing
+	// against origin would merge the fork's (possibly stale) base branch.
+	// Empty, or equal to RemoteURL, means Base lives on RemoteURL.
+	BaseRemoteURL string
 	// RemoteName is normally left empty for origin.  It is configurable so the
 	// package remains useful with repositories that use another remote name.
 	RemoteName string
@@ -36,12 +41,53 @@ type PrepareOptions struct {
 
 // Workspace is a checked-out coordinator workspace.
 type Workspace struct {
-	Directory  string
-	RemoteURL  string
-	RemoteName string
-	Base       string
-	Branch     string
-	Adopted    bool
+	Directory     string
+	RemoteURL     string
+	RemoteName    string
+	BaseRemoteURL string
+	Base          string
+	Branch        string
+	Adopted       bool
+}
+
+// baseRemoteName is the remote that owns Base. It is a dedicated fetch-only
+// remote whenever Base lives somewhere other than the work-branch remote.
+const baseRemoteName = "upstream"
+
+func (w *Workspace) baseRemote() string {
+	if w.BaseRemoteURL != "" && w.BaseRemoteURL != w.RemoteURL {
+		return baseRemoteName
+	}
+	return w.remoteName()
+}
+
+// remoteName is the configured work-branch remote, defaulting to origin.
+func (w *Workspace) remoteName() string {
+	if w.RemoteName == "" {
+		return defaultRemote
+	}
+	return w.RemoteName
+}
+
+func (w *Workspace) baseRemoteRef(ref string) string {
+	return w.baseRemote() + "/" + ref
+}
+
+// ensureBaseRemote adds the base remote when Base does not live on the
+// work-branch remote. An existing remote is updated, so re-preparing a
+// workspace is idempotent.
+func (w *Workspace) ensureBaseRemote(ctx context.Context) error {
+	_, err := run(ctx, w.Directory, "remote", "get-url", baseRemoteName)
+	if err == nil {
+		_, err = run(ctx, w.Directory, "remote", "set-url", baseRemoteName, "--", w.BaseRemoteURL)
+		return err
+	}
+	var commandErr *CommandError
+	if !errors.As(err, &commandErr) {
+		return err
+	}
+	_, err = run(ctx, w.Directory, "remote", "add", baseRemoteName, "--", w.BaseRemoteURL)
+	return err
 }
 
 // WorkState describes local evidence left by an executor after it exits.
@@ -120,6 +166,54 @@ func (w *Workspace) WorkState(ctx context.Context, startCommit string) (WorkStat
 		return WorkStateDirty, nil
 	}
 	return WorkStateNone, nil
+}
+
+// CurrentBranch returns the short name of the branch checked out at HEAD, or
+// "" when HEAD is detached. A missing or unreadable ref is an error.
+func (w *Workspace) CurrentBranch(ctx context.Context) (string, error) {
+	if w == nil || strings.TrimSpace(w.Directory) == "" {
+		return "", errors.New("git current branch: workspace directory is required")
+	}
+	out, err := run(ctx, w.Directory, "symbolic-ref", "--quiet", "--short", "HEAD")
+	if err != nil {
+		var commandErr *CommandError
+		if errors.As(err, &commandErr) && commandErr.ExitCode() == 1 {
+			return "", nil
+		}
+		return "", err
+	}
+	return strings.TrimSpace(string(out)), nil
+}
+
+// CommitsOnBranchSince reports how many commits are reachable from the local
+// branch ref but not from startCommit. A branch ref that cannot be resolved
+// (e.g. it does not exist) reports 0 with no error, because the absence of
+// the ref means no work landed on that branch. Any other failure is an error.
+func (w *Workspace) CommitsOnBranchSince(ctx context.Context, branch, startCommit string) (int, error) {
+	if w == nil || strings.TrimSpace(w.Directory) == "" {
+		return 0, errors.New("git commits on branch: workspace directory is required")
+	}
+	branch = strings.TrimSpace(branch)
+	if branch == "" {
+		return 0, errors.New("git commits on branch: branch is required")
+	}
+	startCommit = strings.TrimSpace(startCommit)
+	if startCommit == "" {
+		return 0, errors.New("git commits on branch: starting commit is required")
+	}
+	out, err := run(ctx, w.Directory, "rev-list", "--count", startCommit+".."+branch)
+	if err != nil {
+		var commandErr *CommandError
+		if errors.As(err, &commandErr) && commandErr.ExitCode() == 128 {
+			return 0, nil
+		}
+		return 0, err
+	}
+	count, err := strconv.Atoi(strings.TrimSpace(string(out)))
+	if err != nil {
+		return 0, fmt.Errorf("git commits on branch: parse commit count: %w", err)
+	}
+	return count, nil
 }
 
 // Brief describes one completed delegation unit.  Objective and Outcome are
@@ -237,11 +331,17 @@ func Prepare(ctx context.Context, options PrepareOptions) (*Workspace, error) {
 		return nil, err
 	}
 	workspace := &Workspace{
-		Directory:  options.Directory,
-		RemoteURL:  options.RemoteURL,
-		RemoteName: remoteName,
-		Base:       options.Base,
-		Branch:     options.Branch,
+		Directory:     options.Directory,
+		RemoteURL:     options.RemoteURL,
+		RemoteName:    remoteName,
+		BaseRemoteURL: strings.TrimSpace(options.BaseRemoteURL),
+		Base:          options.Base,
+		Branch:        options.Branch,
+	}
+	if workspace.BaseRemoteURL != "" && workspace.BaseRemoteURL != options.RemoteURL {
+		if err := workspace.ensureBaseRemote(ctx); err != nil {
+			return nil, err
+		}
 	}
 	if err := workspace.fetch(ctx); err != nil {
 		return nil, err
@@ -258,7 +358,7 @@ func Prepare(ctx context.Context, options PrepareOptions) (*Workspace, error) {
 		return workspace, nil
 	}
 
-	if _, err := run(ctx, workspace.Directory, "checkout", "-b", workspace.Branch, workspace.remoteRef(workspace.Base)); err != nil {
+	if _, err := run(ctx, workspace.Directory, "checkout", "-b", workspace.Branch, workspace.baseRemoteRef(workspace.Base)); err != nil {
 		return nil, err
 	}
 	return workspace, nil
@@ -320,15 +420,21 @@ func (w *Workspace) remoteBranchExists(ctx context.Context) (bool, error) {
 
 // SyncToBase fetches Base and merges it into the current work branch.  A merge
 // preserves the remote branch's ancestry, allowing a normal push after
-// adoption; callers never need an unadvertised force-push.
+// adoption; callers never need an unadvertised force-push. Base is fetched
+// from the remote that owns it: the upstream remote when the work-branch
+// remote is a fork, origin otherwise.
 func (w *Workspace) SyncToBase(ctx context.Context) error {
 	if err := validateRef(w.Base, "base"); err != nil {
 		return err
 	}
-	if err := w.fetch(ctx); err != nil {
+	if w.baseRemote() != w.remoteName() {
+		if _, err := run(ctx, w.Directory, "fetch", "--prune", w.baseRemote()); err != nil {
+			return err
+		}
+	} else if err := w.fetch(ctx); err != nil {
 		return err
 	}
-	_, err := run(ctx, w.Directory, "merge", "--no-edit", w.remoteRef(w.Base))
+	_, err := run(ctx, w.Directory, "merge", "--no-edit", w.baseRemoteRef(w.Base))
 	return err
 }
 

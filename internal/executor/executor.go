@@ -44,6 +44,8 @@ type Invocation struct {
 	Repo      string
 	Ref       int
 	Branch    string
+	HeadRepo  string
+	HeadSHA   string
 	Goal      string
 	Model     string
 	Roles     map[string]string
@@ -97,6 +99,11 @@ const forgeContract = "Route every forge read and write through the configured f
 // with no required PR is not completion. (#90)
 const completionContract = "Delegate implementation, research, and review to sub-agents, but you own completion: integrate and verify their work, push the branch, and open or update the pull request yourself — never stop at a local commit or branch when a pull request is required."
 
+// publicationContract names the run branch as the only place work may be
+// published, so a coordinator or delegate never opens or pushes work from a
+// different branch than the run's. (#134)
+const publicationContract = "Publish only to the run branch: commit on, push, and open or update the pull request from that single branch, and never create or publish work from any other branch."
+
 // Goal returns the concise coordinator goal for a run. Lane framing is passed
 // separately so it remains context rather than becoming a hard-coded prompt
 // scaffold.
@@ -107,11 +114,16 @@ func Goal(run *courierv1alpha1.CoderRun) (string, error) {
 	if run.Spec.Ref < 1 {
 		return "", ErrInvalidReference
 	}
+	branch := strings.TrimSpace(run.Status.Branch)
+	publication := ""
+	if branch != "" {
+		publication = " " + publicationContract + " The run branch is " + branch + "."
+	}
 	switch run.Spec.Mode {
 	case courierv1alpha1.ModeResolveIssue:
-		return fmt.Sprintf("Open a PR to address issue #%d and drive it to a review-ready state with CI green. %s %s", run.Spec.Ref, forgeContract, completionContract), nil
+		return fmt.Sprintf("Open a PR to address issue #%d and drive it to a review-ready state with CI green. %s %s%s", run.Spec.Ref, forgeContract, completionContract, publication), nil
 	case courierv1alpha1.ModeFixPR:
-		return fmt.Sprintf("Take over PR #%d. Inspect the current pull request state, CI/checks, and review feedback to determine what's blocking it, then return it to a review-ready state. %s %s", run.Spec.Ref, forgeContract, completionContract), nil
+		return fmt.Sprintf("Take over PR #%d. Inspect the current pull request state, CI/checks, and review feedback to determine what's blocking it, then return it to a review-ready state. %s %s%s", run.Spec.Ref, forgeContract, completionContract, publication), nil
 	default:
 		return "", fmt.Errorf("%w: %q", ErrInvalidMode, run.Spec.Mode)
 	}
@@ -153,6 +165,8 @@ func NewInvocation(run *courierv1alpha1.CoderRun, lane *courierv1alpha1.LaneProf
 		Repo:      run.Spec.Repo,
 		Ref:       run.Spec.Ref,
 		Branch:    run.Status.Branch,
+		HeadRepo:  run.Status.HeadRepo,
+		HeadSHA:   run.Status.HeadSHA,
 		Goal:      goal,
 		Model:     model,
 		Roles:     roles,
@@ -166,13 +180,16 @@ func NewInvocation(run *courierv1alpha1.CoderRun, lane *courierv1alpha1.LaneProf
 // values are kept in environment variables rather than shell-expanded command
 // strings so repository names, framing, and goals cannot become shell syntax.
 func Environment(inv Invocation, executorName string) []EnvVar {
-	return EnvironmentWithConfig(inv, executorName, "", "", "", "", "", "")
+	return EnvironmentWithConfig(inv, executorName, "", "", "", "", "", "", "")
 }
 
 // EnvironmentWithConfig extends the run context with the deployment-specific
 // git and bootstrap settings needed by the executable shim. Secrets are wired
-// separately by the Pod builder as SecretKeyRef values.
-func EnvironmentWithConfig(inv Invocation, executorName, remoteURL, baseBranch, opencodeBinary, opencodeFormat, terminationFile, opencodeAgent string) []EnvVar {
+// separately by the Pod builder as SecretKeyRef values. remoteURL points at
+// the head repository for a fix-pr run; baseRemoteURL always points at the
+// repository that owns the base branch, so a fork workspace can sync against
+// upstream while pushing to the fork.
+func EnvironmentWithConfig(inv Invocation, executorName, remoteURL, baseRemoteURL, baseBranch, opencodeBinary, opencodeFormat, terminationFile, opencodeAgent string) []EnvVar {
 	level := "info"
 	if inv.Debug {
 		level = "debug"
@@ -187,6 +204,8 @@ func EnvironmentWithConfig(inv Invocation, executorName, remoteURL, baseBranch, 
 		{Name: "COURIER_RUN_NAMESPACE", Value: inv.Namespace},
 		{Name: "COURIER_MODE", Value: string(inv.Mode)},
 		{Name: "COURIER_REPO", Value: inv.Repo},
+		{Name: "COURIER_HEAD_REPO", Value: inv.HeadRepo},
+		{Name: "COURIER_HEAD_SHA", Value: inv.HeadSHA},
 		{Name: "COURIER_REF", Value: strconv.Itoa(inv.Ref)},
 		{Name: "COURIER_BRANCH", Value: inv.Branch},
 		{Name: "COURIER_GOAL", Value: inv.Goal},
@@ -196,6 +215,7 @@ func EnvironmentWithConfig(inv Invocation, executorName, remoteURL, baseBranch, 
 		{Name: "COURIER_WORKSPACE", Value: inv.Workspace},
 		{Name: "COURIER_LOG_LEVEL", Value: level},
 		{Name: "COURIER_REPO_URL", Value: remoteURL},
+		{Name: "COURIER_BASE_REPO_URL", Value: baseRemoteURL},
 		{Name: "COURIER_BASE", Value: baseBranch},
 		{Name: "COURIER_OPENCODE_BINARY", Value: opencodeBinary},
 		{Name: "COURIER_OPENCODE_FORMAT", Value: opencodeFormat},
