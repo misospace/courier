@@ -97,6 +97,11 @@ const forgeContract = "Route every forge read and write through the configured f
 // with no required PR is not completion. (#90)
 const completionContract = "Delegate implementation, research, and review to sub-agents, but you own completion: integrate and verify their work, push the branch, and open or update the pull request yourself — never stop at a local commit or branch when a pull request is required."
 
+// publicationContract names the run branch as the only place work may be
+// published, so a coordinator or delegate never opens or pushes work from a
+// different branch than the run's. (#134)
+const publicationContract = "Publish only to the run branch: commit on, push, and open or update the pull request from that single branch, and never create or publish work from any other branch."
+
 // Goal returns the concise coordinator goal for a run. Lane framing is passed
 // separately so it remains context rather than becoming a hard-coded prompt
 // scaffold.
@@ -107,11 +112,16 @@ func Goal(run *courierv1alpha1.CoderRun) (string, error) {
 	if run.Spec.Ref < 1 {
 		return "", ErrInvalidReference
 	}
+	branch := strings.TrimSpace(run.Status.Branch)
+	publication := ""
+	if branch != "" {
+		publication = " " + publicationContract + " The run branch is " + branch + "."
+	}
 	switch run.Spec.Mode {
 	case courierv1alpha1.ModeResolveIssue:
-		return fmt.Sprintf("Open a PR to address issue #%d and drive it to a review-ready state with CI green. %s %s", run.Spec.Ref, forgeContract, completionContract), nil
+		return fmt.Sprintf("Open a PR to address issue #%d and drive it to a review-ready state with CI green. %s %s%s", run.Spec.Ref, forgeContract, completionContract, publication), nil
 	case courierv1alpha1.ModeFixPR:
-		return fmt.Sprintf("Take over PR #%d. Inspect the current pull request state, CI/checks, and review feedback to determine what's blocking it, then return it to a review-ready state. %s %s", run.Spec.Ref, forgeContract, completionContract), nil
+		return fmt.Sprintf("Take over PR #%d. Inspect the current pull request state, CI/checks, and review feedback to determine what's blocking it, then return it to a review-ready state. %s %s%s", run.Spec.Ref, forgeContract, completionContract, publication), nil
 	default:
 		return "", fmt.Errorf("%w: %q", ErrInvalidMode, run.Spec.Mode)
 	}

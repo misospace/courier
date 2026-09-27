@@ -122,6 +122,54 @@ func (w *Workspace) WorkState(ctx context.Context, startCommit string) (WorkStat
 	return WorkStateNone, nil
 }
 
+// CurrentBranch returns the short name of the branch checked out at HEAD, or
+// "" when HEAD is detached. A missing or unreadable ref is an error.
+func (w *Workspace) CurrentBranch(ctx context.Context) (string, error) {
+	if w == nil || strings.TrimSpace(w.Directory) == "" {
+		return "", errors.New("git current branch: workspace directory is required")
+	}
+	out, err := run(ctx, w.Directory, "symbolic-ref", "--quiet", "--short", "HEAD")
+	if err != nil {
+		var commandErr *CommandError
+		if errors.As(err, &commandErr) && commandErr.ExitCode() == 1 {
+			return "", nil
+		}
+		return "", err
+	}
+	return strings.TrimSpace(string(out)), nil
+}
+
+// CommitsOnBranchSince reports how many commits are reachable from the local
+// branch ref but not from startCommit. A branch ref that cannot be resolved
+// (e.g. it does not exist) reports 0 with no error, because the absence of
+// the ref means no work landed on that branch. Any other failure is an error.
+func (w *Workspace) CommitsOnBranchSince(ctx context.Context, branch, startCommit string) (int, error) {
+	if w == nil || strings.TrimSpace(w.Directory) == "" {
+		return 0, errors.New("git commits on branch: workspace directory is required")
+	}
+	branch = strings.TrimSpace(branch)
+	if branch == "" {
+		return 0, errors.New("git commits on branch: branch is required")
+	}
+	startCommit = strings.TrimSpace(startCommit)
+	if startCommit == "" {
+		return 0, errors.New("git commits on branch: starting commit is required")
+	}
+	out, err := run(ctx, w.Directory, "rev-list", "--count", startCommit+".."+branch)
+	if err != nil {
+		var commandErr *CommandError
+		if errors.As(err, &commandErr) && commandErr.ExitCode() == 128 {
+			return 0, nil
+		}
+		return 0, err
+	}
+	count, err := strconv.Atoi(strings.TrimSpace(string(out)))
+	if err != nil {
+		return 0, fmt.Errorf("git commits on branch: parse commit count: %w", err)
+	}
+	return count, nil
+}
+
 // Brief describes one completed delegation unit.  Objective and Outcome are
 // both included in the commit message so the log remains useful if a status
 // checkpoint is lost.
