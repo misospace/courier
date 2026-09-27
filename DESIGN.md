@@ -838,8 +838,11 @@ was superseded.
   `ProviderConfig`
   carries only an endpoint, a name, and a credential *reference* that the broker
   resolves, and it stays independent of `LaneProfile` (which describes lanes,
-  never the forge or its credentials). The GitHub adapter implements only covered
-  operations. Source adapters and broker transport remain out of scope. (#121, #80)
+  never the forge or its credentials). Forge-provider pull request reads carry
+  the live base repository/ref/OID and actual head repository/ref/OID, including fork heads;
+  missing repository identity is not replaced with a same-named base branch.
+  The GitHub adapter implements only covered operations. Source adapters and
+  broker transport remain out of scope. (#121, #80, #118)
 - **2026-09-22 — Repository toolchains are per-lane runtime images, not baked
   into one universal coordinator image.** A `LaneProfile.runtimeImage` selects a
   coordinator image carrying the target repo's toolchain (e.g. `courier-go`

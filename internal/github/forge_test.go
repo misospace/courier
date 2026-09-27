@@ -35,14 +35,14 @@ func TestProviderCoveredOperations(t *testing.T) {
 		w.Header().Set("Content-Type", "application/json")
 		switch {
 		case r.Method == http.MethodPost && r.URL.Path == "/repos/acme/demo/pulls":
-			_, _ = io.WriteString(w, `{"number":7,"state":"open","title":"t","body":"b","draft":false,"html_url":"https://github.com/acme/demo/pull/7","head":{"ref":"work","sha":"abc"},"base":{"ref":"main"}}`)
+			_, _ = io.WriteString(w, `{"number":7,"state":"open","title":"t","body":"b","draft":false,"html_url":"https://github.com/acme/demo/pull/7","head":{"ref":"work","sha":"abc","repo":{"full_name":"acme/demo"}},"base":{"ref":"main","sha":"base123","repo":{"full_name":"acme/demo"}}}`)
 		case r.Method == http.MethodPatch && r.URL.Path == "/repos/acme/demo/pulls/7":
 			patchBody, _ = io.ReadAll(r.Body)
-			_, _ = io.WriteString(w, `{"number":7,"state":"open","title":"updated","body":"b","draft":false,"html_url":"https://github.com/acme/demo/pull/7","head":{"ref":"work","sha":"abc"},"base":{"ref":"main"}}`)
+			_, _ = io.WriteString(w, `{"number":7,"state":"open","title":"updated","body":"b","draft":false,"html_url":"https://github.com/acme/demo/pull/7","head":{"ref":"work","sha":"abc","repo":{"full_name":"acme/demo"}},"base":{"ref":"main","sha":"base123","repo":{"full_name":"acme/demo"}}}`)
 		case r.Method == http.MethodPost && r.URL.Path == "/repos/acme/demo/issues/7/comments":
 			_, _ = io.WriteString(w, `{"id":9,"body":"looks good","html_url":"https://github.com/acme/demo/pull/7#issuecomment-9"}`)
 		case r.Method == http.MethodGet && r.URL.Path == "/repos/acme/demo/pulls/7":
-			_, _ = io.WriteString(w, `{"number":7,"state":"open","title":"t","body":"b","draft":false,"html_url":"https://github.com/acme/demo/pull/7","head":{"ref":"work","sha":"abc"},"base":{"ref":"main"}}`)
+			_, _ = io.WriteString(w, `{"number":7,"state":"open","title":"t","body":"b","draft":false,"html_url":"https://github.com/acme/demo/pull/7","head":{"ref":"work","sha":"abc","repo":{"full_name":"acme/demo"}},"base":{"ref":"main","sha":"base123","repo":{"full_name":"acme/demo"}}}`)
 		case r.Method == http.MethodGet && r.URL.Path == "/repos/acme/demo/commits/abc/check-runs":
 			_, _ = io.WriteString(w, `{"total_count":1,"check_runs":[{"name":"ci","status":"completed","conclusion":"success","html_url":"https://github.com/acme/demo/check/1"}]}`)
 		default:
@@ -71,8 +71,8 @@ func TestProviderCoveredOperations(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ReadPullRequest() error = %v", err)
 	}
-	if got.State != "open" || got.HeadRef != "work" || got.HeadSHA != "abc" {
-		t.Fatalf("ReadPullRequest() = %#v, want open PR with head work at abc", got)
+	if got.State != "open" || got.Repo != "acme/demo" || got.BaseRepo != "acme/demo" || got.BaseRef != "main" || got.BaseSHA != "base123" || got.HeadRepo != "acme/demo" || got.HeadRef != "work" || got.HeadSHA != "abc" {
+		t.Fatalf("ReadPullRequest() = %#v, want full base and head identity", got)
 	}
 
 	checks, err := p.ReadChecks(ctx, ref, "abc")
@@ -176,6 +176,59 @@ type urlDoer struct{}
 
 func (urlDoer) Do(req *http.Request) (*http.Response, error) {
 	return nil, fmt.Errorf("Get %q: dial tcp: connection refused", req.URL.String())
+}
+
+func TestProviderForkIdentity(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet || r.URL.Path != "/repos/acme/demo/pulls/7" {
+			http.NotFound(w, r)
+			return
+		}
+		_, _ = io.WriteString(w, `{"number":7,"head":{"ref":"work","sha":"fork123","repo":{"full_name":"other/demo"}},"base":{"ref":"work","sha":"base123","repo":{"full_name":"acme/demo"}}}`)
+	}))
+	defer server.Close()
+	client, err := NewClient(server.URL, "token")
+	if err != nil {
+		t.Fatal(err)
+	}
+	p := NewProvider(forge.ProviderConfig{Name: "gh", Endpoint: server.URL}, client)
+	got, err := p.ReadPullRequest(context.Background(), forge.PullRequestRef{Repo: "acme/demo", Number: 7})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Repo != "acme/demo" || got.BaseRepo != "acme/demo" || got.BaseRef != "work" || got.BaseSHA != "base123" || got.HeadRepo != "other/demo" || got.HeadRef != "work" || got.HeadSHA != "fork123" {
+		t.Fatalf("fork identity lost across provider boundary: %#v", got)
+	}
+}
+
+func TestProviderMissingBaseRepository(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.WriteString(w, `{"number":7,"head":{"ref":"work","sha":"fork123","repo":{"full_name":"other/demo"}},"base":{"ref":"main","sha":"base123","repo":null}}`)
+	}))
+	defer server.Close()
+	client, err := NewClient(server.URL, "token")
+	if err != nil {
+		t.Fatal(err)
+	}
+	p := NewProvider(forge.ProviderConfig{Name: "gh", Endpoint: server.URL}, client)
+	if _, err := p.ReadPullRequest(context.Background(), forge.PullRequestRef{Repo: "acme/demo", Number: 7}); err == nil || !strings.Contains(err.Error(), "missing the base repository identity") {
+		t.Fatalf("ReadPullRequest() error = %v, want missing base repository", err)
+	}
+}
+
+func TestProviderMissingHeadRepository(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.WriteString(w, `{"number":7,"head":{"ref":"work","sha":"fork123","repo":null},"base":{"ref":"main","sha":"base123","repo":{"full_name":"acme/demo"}}}`)
+	}))
+	defer server.Close()
+	client, err := NewClient(server.URL, "token")
+	if err != nil {
+		t.Fatal(err)
+	}
+	p := NewProvider(forge.ProviderConfig{Name: "gh", Endpoint: server.URL}, client)
+	if _, err := p.ReadPullRequest(context.Background(), forge.PullRequestRef{Repo: "acme/demo", Number: 7}); err == nil || !strings.Contains(err.Error(), "missing the head repository identity") {
+		t.Fatalf("ReadPullRequest() error = %v, want missing head repository", err)
+	}
 }
 
 func TestProviderUnsupportedOperations(t *testing.T) {

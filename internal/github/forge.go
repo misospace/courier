@@ -2,6 +2,7 @@ package github
 
 import (
 	"context"
+	"fmt"
 	"strconv"
 
 	"github.com/misospace/courier/internal/forge"
@@ -87,7 +88,7 @@ func (p *Provider) ReadPullRequest(ctx context.Context, ref forge.PullRequestRef
 	if err != nil {
 		return forge.PullRequest{}, boundaryError(err)
 	}
-	return toForgePR(ref.Repo, pr), nil
+	return toForgePR(pr)
 }
 
 // ListReviews is not covered by this client.
@@ -137,7 +138,7 @@ func (p *Provider) CreatePullRequest(ctx context.Context, in forge.CreatePullReq
 	if err != nil {
 		return forge.PullRequest{}, boundaryError(err)
 	}
-	return toForgePR(in.Repo, pr), nil
+	return toForgePR(pr)
 }
 
 // UpdatePullRequest applies the non-zero fields of in to a pull request.
@@ -154,7 +155,7 @@ func (p *Provider) UpdatePullRequest(ctx context.Context, ref forge.PullRequestR
 	if err != nil {
 		return forge.PullRequest{}, boundaryError(err)
 	}
-	return toForgePR(ref.Repo, pr), nil
+	return toForgePR(pr)
 }
 
 // CommentPullRequest adds a comment to a pull request.
@@ -170,20 +171,35 @@ func (p *Provider) CommentPullRequest(ctx context.Context, ref forge.PullRequest
 	return forge.Comment{ID: strconv.FormatInt(c.ID, 10), Body: c.Body, URL: c.HTMLURL}, nil
 }
 
-// toForgePR maps a GitHub pull request to the forge-agnostic shape, stamping
-// the repository the request was made against.
-func toForgePR(repo string, pr PullRequest) forge.PullRequest {
-	return forge.PullRequest{
-		Number:  pr.Number,
-		Repo:    repo,
-		Title:   pr.Title,
-		Body:    pr.Body,
-		State:   pr.State,
-		Draft:   pr.Draft,
-		HeadSHA: pr.Head.SHA,
-		HeadRef: pr.Head.Ref,
-		BaseRef: pr.Base.Ref,
-		URL:     pr.HTMLURL,
-		Merged:  pr.MergedAt != "",
+// toForgePR maps a GitHub pull request to the provider-neutral shape. The
+// base and head repository identities come from the forge response itself —
+// the head may be a fork distinct from the base — and are never substituted
+// from the repository the request was made against. A missing head (for
+// example a deleted fork) or base repository identity is an error, so
+// incomplete API data stays detectable rather than being silently backfilled.
+func toForgePR(pr PullRequest) (forge.PullRequest, error) {
+	baseRepo := pr.Base.Repo.FullName
+	if baseRepo == "" {
+		return forge.PullRequest{}, fmt.Errorf("pull request %d: response is missing the base repository identity", pr.Number)
 	}
+	headRepo := pr.Head.Repo.FullName
+	if headRepo == "" {
+		return forge.PullRequest{}, fmt.Errorf("pull request %d: response is missing the head repository identity", pr.Number)
+	}
+	return forge.PullRequest{
+		Number:   pr.Number,
+		Repo:     baseRepo,
+		BaseRepo: baseRepo,
+		BaseRef:  pr.Base.Ref,
+		BaseSHA:  pr.Base.SHA,
+		HeadRepo: headRepo,
+		HeadRef:  pr.Head.Ref,
+		HeadSHA:  pr.Head.SHA,
+		Title:    pr.Title,
+		Body:     pr.Body,
+		State:    pr.State,
+		Draft:    pr.Draft,
+		URL:      pr.HTMLURL,
+		Merged:   pr.MergedAt != "",
+	}, nil
 }

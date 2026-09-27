@@ -179,18 +179,28 @@ type WorkItem struct {
 }
 
 // PullRequest is a provider-neutral pull/merge request.
+//
+// Repo is an alias of BaseRepo (the repository the request is filed against),
+// retained for the original contract. HeadRepo owns the source branch. For a pull request opened from a
+// fork the two differ: Repo stays the base and HeadRepo names the fork. Both
+// are reported by the forge and are never substituted from the repository the
+// request was made against, so a missing identity (for example a deleted fork)
+// stays detectable.
 type PullRequest struct {
-	Number  int
-	Repo    string
-	Title   string
-	Body    string
-	State   string
-	Draft   bool
-	HeadSHA string
-	HeadRef string
-	BaseRef string
-	URL     string
-	Merged  bool
+	Number   int
+	Repo     string // Base repository; kept for existing consumers.
+	BaseRepo string
+	BaseRef  string
+	BaseSHA  string
+	HeadRepo string
+	HeadRef  string
+	HeadSHA  string
+	Title    string
+	Body     string
+	State    string
+	Draft    bool
+	URL      string
+	Merged   bool
 }
 
 // Review is a provider-neutral review on a pull request.
