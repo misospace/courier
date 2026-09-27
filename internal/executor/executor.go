@@ -44,6 +44,8 @@ type Invocation struct {
 	Repo      string
 	Ref       int
 	Branch    string
+	HeadRepo  string
+	HeadSHA   string
 	Goal      string
 	Model     string
 	Roles     map[string]string
@@ -163,6 +165,8 @@ func NewInvocation(run *courierv1alpha1.CoderRun, lane *courierv1alpha1.LaneProf
 		Repo:      run.Spec.Repo,
 		Ref:       run.Spec.Ref,
 		Branch:    run.Status.Branch,
+		HeadRepo:  run.Status.HeadRepo,
+		HeadSHA:   run.Status.HeadSHA,
 		Goal:      goal,
 		Model:     model,
 		Roles:     roles,
@@ -176,13 +180,16 @@ func NewInvocation(run *courierv1alpha1.CoderRun, lane *courierv1alpha1.LaneProf
 // values are kept in environment variables rather than shell-expanded command
 // strings so repository names, framing, and goals cannot become shell syntax.
 func Environment(inv Invocation, executorName string) []EnvVar {
-	return EnvironmentWithConfig(inv, executorName, "", "", "", "", "", "")
+	return EnvironmentWithConfig(inv, executorName, "", "", "", "", "", "", "")
 }
 
 // EnvironmentWithConfig extends the run context with the deployment-specific
 // git and bootstrap settings needed by the executable shim. Secrets are wired
-// separately by the Pod builder as SecretKeyRef values.
-func EnvironmentWithConfig(inv Invocation, executorName, remoteURL, baseBranch, opencodeBinary, opencodeFormat, terminationFile, opencodeAgent string) []EnvVar {
+// separately by the Pod builder as SecretKeyRef values. remoteURL points at
+// the head repository for a fix-pr run; baseRemoteURL always points at the
+// repository that owns the base branch, so a fork workspace can sync against
+// upstream while pushing to the fork.
+func EnvironmentWithConfig(inv Invocation, executorName, remoteURL, baseRemoteURL, baseBranch, opencodeBinary, opencodeFormat, terminationFile, opencodeAgent string) []EnvVar {
 	level := "info"
 	if inv.Debug {
 		level = "debug"
@@ -197,6 +204,8 @@ func EnvironmentWithConfig(inv Invocation, executorName, remoteURL, baseBranch, 
 		{Name: "COURIER_RUN_NAMESPACE", Value: inv.Namespace},
 		{Name: "COURIER_MODE", Value: string(inv.Mode)},
 		{Name: "COURIER_REPO", Value: inv.Repo},
+		{Name: "COURIER_HEAD_REPO", Value: inv.HeadRepo},
+		{Name: "COURIER_HEAD_SHA", Value: inv.HeadSHA},
 		{Name: "COURIER_REF", Value: strconv.Itoa(inv.Ref)},
 		{Name: "COURIER_BRANCH", Value: inv.Branch},
 		{Name: "COURIER_GOAL", Value: inv.Goal},
@@ -206,6 +215,7 @@ func EnvironmentWithConfig(inv Invocation, executorName, remoteURL, baseBranch, 
 		{Name: "COURIER_WORKSPACE", Value: inv.Workspace},
 		{Name: "COURIER_LOG_LEVEL", Value: level},
 		{Name: "COURIER_REPO_URL", Value: remoteURL},
+		{Name: "COURIER_BASE_REPO_URL", Value: baseRemoteURL},
 		{Name: "COURIER_BASE", Value: baseBranch},
 		{Name: "COURIER_OPENCODE_BINARY", Value: opencodeBinary},
 		{Name: "COURIER_OPENCODE_FORMAT", Value: opencodeFormat},

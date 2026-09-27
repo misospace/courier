@@ -12,12 +12,12 @@ import (
 
 type observerWithHeadResolver struct{}
 
-func (observerWithHeadResolver) Observe(context.Context, string, string) (controller.PRObservation, error) {
+func (observerWithHeadResolver) Observe(context.Context, string, controller.HeadRef) (controller.PRObservation, error) {
 	return controller.PRObservation{}, nil
 }
 
-func (observerWithHeadResolver) ResolveHead(context.Context, *courierv1alpha1.CoderRun) (string, error) {
-	return "feature/existing", nil
+func (observerWithHeadResolver) ResolveHead(context.Context, *courierv1alpha1.CoderRun) (controller.HeadRef, error) {
+	return controller.HeadRef{Repo: "acme/demo", Branch: "feature/existing"}, nil
 }
 
 func TestDispatchPRStateCheckerRequiresGitHubObserver(t *testing.T) {

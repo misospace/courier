@@ -68,16 +68,19 @@ func (w KubePatchWriter) PatchStatus(ctx context.Context, name types.NamespacedN
 // OperatorPatch contains only fields owned by the operator: lifecycle and
 // observed-world fields. Empty values are omitted, which is appropriate for
 // additive observed status and avoids clearing harness-owned fields or
-// previously published operator fields. Branch, CheckFingerprint, and
-// Restarts are pointers because the operator must be able to clear them back
-// to their zero values — a failed launch discards a stale resolved branch, a
-// pending or reshaped check observation discards stale green evidence, and a
-// run that demonstrates liveness resets its consecutive-crashloop counter to
-// 0 — which omitempty on a plain string or int cannot express: omitempty on
-// a pointer omits only nil, so a pointer to zero is still emitted.
+// previously published operator fields. Branch, HeadRepo, HeadSHA,
+// CheckFingerprint, and Restarts are pointers because the operator must be
+// able to clear them back to their zero values — a failed launch discards a
+// stale resolved branch and head identity, a pending or reshaped check
+// observation discards stale green evidence, and a run that demonstrates
+// liveness resets its consecutive-crashloop counter to 0 — which omitempty on
+// a plain string or int cannot express: omitempty on a pointer omits only
+// nil, so a pointer to zero is still emitted.
 type OperatorPatch struct {
 	Phase            courierv1alpha1.Phase `json:"phase,omitempty"`
 	Branch           *string               `json:"branch,omitempty"`
+	HeadRepo         *string               `json:"headRepo,omitempty"`
+	HeadSHA          *string               `json:"headSHA,omitempty"`
 	PR               string                `json:"pr,omitempty"`
 	CheckFingerprint *string               `json:"checkFingerprint,omitempty"`
 	Restarts         *int                  `json:"restarts,omitempty"`

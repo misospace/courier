@@ -42,8 +42,9 @@ type CoderRunReconciler struct {
 	// passed through unchanged for every claim/release/transition call.
 	Sources *SourceRegistry
 
-	// PRHeadResolver is required for fix-pr runs. It returns the branch attached
-	// to the existing PR; no branch is synthesized from the PR number.
+	// PRHeadResolver is required for fix-pr runs. It resolves the PR head —
+	// the repository, branch, and commit attached to the existing PR; no
+	// branch is synthesized from the PR number.
 	PRHeadResolver ExistingPRHeadResolver
 
 	// StatusWriter is the status transport used for operator-owned fields.
@@ -153,12 +154,17 @@ func (r *CoderRunReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 		return ctrl.Result{}, errors.Join(err, adapter.Release(ctx, item))
 	}
 
-	resolvedBranch, err := resolveRunBranch(ctx, &run, r.PRHeadResolver)
+	head, err := resolveRunBranch(ctx, &run, r.PRHeadResolver)
 	if err != nil {
+		if errors.Is(err, ErrHeadRepositoryGone) {
+			return ctrl.Result{}, r.terminateMissingHead(ctx, &run, err)
+		}
 		return ctrl.Result{}, r.releaseClaim(ctx, &run, adapter, item, err)
 	}
 	before = run.DeepCopy()
-	run.Status.Branch = resolvedBranch
+	run.Status.Branch = head.Branch
+	run.Status.HeadRepo = head.Repo
+	run.Status.HeadSHA = head.SHA
 	if err := r.patchStatus(ctx, before, &run); err != nil {
 		return ctrl.Result{}, r.releaseClaim(ctx, &run, adapter, item, err)
 	}
@@ -206,12 +212,17 @@ func (r *CoderRunReconciler) resumeClaimed(ctx context.Context, run *courierv1al
 		return ctrl.Result{}, nil
 	}
 	if strings.TrimSpace(run.Status.Branch) == "" {
-		branchName, err := resolveRunBranch(ctx, run, r.PRHeadResolver)
+		head, err := resolveRunBranch(ctx, run, r.PRHeadResolver)
 		if err != nil {
+			if errors.Is(err, ErrHeadRepositoryGone) {
+				return ctrl.Result{}, r.terminateMissingHead(ctx, run, err)
+			}
 			return ctrl.Result{}, r.releaseClaim(ctx, run, adapter, item, err)
 		}
 		before := run.DeepCopy()
-		run.Status.Branch = branchName
+		run.Status.Branch = head.Branch
+		run.Status.HeadRepo = head.Repo
+		run.Status.HeadSHA = head.SHA
 		if err := r.patchStatus(ctx, before, run); err != nil {
 			return ctrl.Result{}, r.releaseClaim(ctx, run, adapter, item, err)
 		}
@@ -297,6 +308,8 @@ func (r *CoderRunReconciler) rejectClaim(ctx context.Context, run *courierv1alph
 	before := run.DeepCopy()
 	run.Status.Phase = courierv1alpha1.PhasePending
 	run.Status.Branch = ""
+	run.Status.HeadRepo = ""
+	run.Status.HeadSHA = ""
 	statusErr := r.patchStatus(ctx, before, run)
 	return errors.Join(cause, releaseErr, statusErr)
 }
@@ -309,8 +322,31 @@ func (r *CoderRunReconciler) releaseClaim(ctx context.Context, run *courierv1alp
 	before := run.DeepCopy()
 	run.Status.Phase = courierv1alpha1.PhasePending
 	run.Status.Branch = ""
+	run.Status.HeadRepo = ""
+	run.Status.HeadSHA = ""
 	statusErr := r.patchStatus(ctx, before, run)
 	return errors.Join(cause, releaseErr, statusErr)
+}
+
+// terminateMissingHead ends a fix-pr run whose pull request head repository is
+// gone (a deleted fork). Unlike a transient resolution failure, the condition
+// cannot recover by re-claiming, so the claim is released and the run
+// terminalizes NeedsHuman rather than cycling claim and release on every
+// reconcile. The cause is handled here, so it is logged and not returned as a
+// reconcile error.
+func (r *CoderRunReconciler) terminateMissingHead(ctx context.Context, run *courierv1alpha1.CoderRun, cause error) error {
+	log.FromContext(ctx).Info("terminating fix-pr run: pull request head repository is missing",
+		"run", run.Name, "branch", run.Status.Branch, "cause", cause.Error())
+	adapter, item, err := r.adapterAndWorkItem(run)
+	if err != nil {
+		return err
+	}
+	releaseErr := adapter.Release(ctx, item)
+	run.Status.Branch = ""
+	run.Status.HeadRepo = ""
+	run.Status.HeadSHA = ""
+	_, terminalErr := r.transitionTerminal(ctx, run, courierv1alpha1.PhaseNeedsHuman, "")
+	return errors.Join(releaseErr, terminalErr)
 }
 
 // resolveCompleted closes the source work for a Done run and then applies the
@@ -366,11 +402,19 @@ func (r *CoderRunReconciler) observeRunning(ctx context.Context, run *courierv1a
 	return ctrl.Result{}, nil
 }
 
+// controllerHeadRef reconstructs the run's resolved head identity from its
+// status. An empty status.headRepo means a same-repository head: the observer
+// treats the base repository as the head repository, which also preserves the
+// behavior of runs persisted before head identity was recorded.
+func controllerHeadRef(run *courierv1alpha1.CoderRun) HeadRef {
+	return HeadRef{Repo: run.Status.HeadRepo, Branch: run.Status.Branch, SHA: run.Status.HeadSHA}
+}
+
 func (r *CoderRunReconciler) observeVerifying(ctx context.Context, run *courierv1alpha1.CoderRun) (ctrl.Result, error) {
 	if r.Observer == nil {
 		return r.transitionTerminal(ctx, run, courierv1alpha1.PhaseNeedsHuman, "")
 	}
-	observation, err := r.Observer.Observe(ctx, run.Spec.Repo, run.Status.Branch)
+	observation, err := r.Observer.Observe(ctx, run.Spec.Repo, controllerHeadRef(run))
 	if err != nil {
 		return ctrl.Result{RequeueAfter: observationRequeueDelay}, nil
 	}
@@ -417,7 +461,7 @@ func (r *CoderRunReconciler) enrichTerminalPR(ctx context.Context, run *courierv
 	if r.Observer == nil || run.Status.Branch == "" {
 		return pr
 	}
-	observation, err := r.Observer.Observe(ctx, run.Spec.Repo, run.Status.Branch)
+	observation, err := r.Observer.Observe(ctx, run.Spec.Repo, controllerHeadRef(run))
 	if err != nil {
 		log.FromContext(ctx).V(1).Info("terminal PR enrichment skipped; observation failed",
 			"repo", run.Spec.Repo, "branch", run.Status.Branch, "pr", pr, "error", err.Error())
@@ -524,6 +568,14 @@ func (r *CoderRunReconciler) patchStatus(ctx context.Context, before, after *cou
 	if before.Status.Branch != after.Status.Branch {
 		branch := after.Status.Branch
 		fields.Branch = &branch
+	}
+	if before.Status.HeadRepo != after.Status.HeadRepo {
+		headRepo := after.Status.HeadRepo
+		fields.HeadRepo = &headRepo
+	}
+	if before.Status.HeadSHA != after.Status.HeadSHA {
+		headSHA := after.Status.HeadSHA
+		fields.HeadSHA = &headSHA
 	}
 	if before.Status.PR != after.Status.PR {
 		fields.PR = after.Status.PR
