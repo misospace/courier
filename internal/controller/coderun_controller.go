@@ -125,6 +125,13 @@ func (r *CoderRunReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 	if err := r.Get(ctx, client.ObjectKey{Namespace: run.Namespace, Name: run.Spec.Lane}, &lane); err != nil {
 		return ctrl.Result{}, err
 	}
+	// A suspended lane admits nothing new. Only Pending runs reach this point,
+	// so runs already claimed or running finish normally. Requeue like a full
+	// lane, since lifting the annotation does not reconcile Pending runs.
+	if lane.Suspended() {
+		l.V(1).Info("lane suspended, run waits", "lane", run.Spec.Lane)
+		return ctrl.Result{RequeueAfter: capacityRequeueDelay}, nil
+	}
 
 	var runs courierv1alpha1.CoderRunList
 	if err := r.List(ctx, &runs, client.InNamespace(run.Namespace)); err != nil {
