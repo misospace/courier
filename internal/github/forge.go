@@ -2,7 +2,9 @@ package github
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"net/http"
 	"strconv"
 
 	"github.com/misospace/courier/internal/forge"
@@ -20,6 +22,8 @@ type Provider struct {
 }
 
 var _ forge.Provider = (*Provider)(nil)
+var _ forge.RepositoryPolicyProvider = (*Provider)(nil)
+var _ forge.PullRequestHeadLister = (*Provider)(nil)
 
 // redactedError is an error whose string form was sanitized with
 // forge.RedactDetail before it crossed the forge boundary. It unwraps to the
@@ -73,6 +77,88 @@ func (p *Provider) Config() forge.ProviderConfig { return p.cfg }
 // Capabilities reports the operations this provider registers.
 func (p *Provider) Capabilities() forge.Capabilities { return p.caps.Clone() }
 
+// ResolveRepository returns GitHub's canonical identity and default branch.
+func (p *Provider) ResolveRepository(ctx context.Context, name string) (forge.Repository, error) {
+	owner, repo, err := splitRepository(name)
+	if err != nil {
+		return forge.Repository{}, err
+	}
+	got, err := p.client.GetRepository(ctx, owner, repo)
+	if err != nil {
+		return forge.Repository{}, boundaryError(err)
+	}
+	if got.ID == 0 || got.FullName == "" || got.DefaultBranch == "" {
+		return forge.Repository{}, fmt.Errorf("GitHub repository response is missing canonical identity or default branch")
+	}
+	return forge.Repository{ID: strconv.FormatInt(got.ID, 10), Canonical: got.FullName, DefaultRef: got.DefaultBranch}, nil
+}
+
+// ReadRef returns the exact current branch OID, or Exists=false for an
+// authoritative 404. Other API failures remain errors.
+func (p *Provider) ReadRef(ctx context.Context, repository forge.Repository, branch string) (forge.RefState, error) {
+	owner, repo, err := splitRepository(repository.Canonical)
+	if err != nil {
+		return forge.RefState{}, err
+	}
+	got, err := p.client.GetBranchRef(ctx, owner, repo, branch)
+	if err != nil {
+		var apiErr *APIError
+		if errors.As(err, &apiErr) && apiErr.StatusCode == http.StatusNotFound {
+			return forge.RefState{Ref: branch, Exists: false}, nil
+		}
+		return forge.RefState{}, boundaryError(err)
+	}
+	if got.Ref == "" || got.Object.SHA == "" {
+		return forge.RefState{}, fmt.Errorf("GitHub branch ref response is incomplete")
+	}
+	return forge.RefState{Ref: branch, OID: got.Object.SHA, Exists: true}, nil
+}
+
+// ReadEffectiveProtection fails closed when GitHub cannot authoritatively
+// evaluate all rules applying to the ref. Bypass eligibility is unreported by
+// GitHub's endpoint, so any applicable ruleset is conservatively protected.
+func (p *Provider) ReadEffectiveProtection(ctx context.Context, repository forge.Repository, branch string) (forge.Protection, error) {
+	owner, repo, err := splitRepository(repository.Canonical)
+	if err != nil {
+		return forge.Protection{}, err
+	}
+	rules, err := p.client.GetEffectiveBranchRules(ctx, owner, repo, branch)
+	if err != nil {
+		return forge.Protection{}, boundaryError(err)
+	}
+	if len(rules) != 0 {
+		return forge.Protection{Protected: true}, nil
+	}
+	if _, err := p.client.GetBranchProtection(ctx, owner, repo, branch); err != nil {
+		var apiErr *APIError
+		if errors.As(err, &apiErr) && apiErr.StatusCode == http.StatusNotFound {
+			// GitHub's classic protection endpoint uses 404 for an unprotected
+			// branch. The rules endpoint has already succeeded and reported no
+			// applicable rulesets, so together these establish no effective rule.
+			return forge.Protection{Protected: false}, nil
+		}
+		return forge.Protection{}, boundaryError(err)
+	}
+	return forge.Protection{}, fmt.Errorf("GitHub API cannot authoritatively establish effective protection and bypass status for this ref")
+}
+
+// CanWriteRepository reports GitHub's token-derived push permission. An
+// absent permission object is not evidence of write access.
+func (p *Provider) CanWriteRepository(ctx context.Context, repository forge.Repository) (bool, error) {
+	owner, repo, err := splitRepository(repository.Canonical)
+	if err != nil {
+		return false, err
+	}
+	got, err := p.client.GetRepository(ctx, owner, repo)
+	if err != nil {
+		return false, boundaryError(err)
+	}
+	if got.Permissions == nil {
+		return false, fmt.Errorf("GitHub repository response is missing credential permissions")
+	}
+	return got.Permissions.Push, nil
+}
+
 // ReadWorkItem is not covered by this client.
 func (p *Provider) ReadWorkItem(ctx context.Context, ref forge.WorkItemRef) (forge.WorkItem, error) {
 	return forge.WorkItem{}, forge.ErrUnsupported
@@ -89,6 +175,35 @@ func (p *Provider) ReadPullRequest(ctx context.Context, ref forge.PullRequestRef
 		return forge.PullRequest{}, boundaryError(err)
 	}
 	return toForgePR(pr)
+}
+
+// ListPullRequestsByHead returns all PRs queried by head owner and branch, then
+// filters exact repository and ref identities locally. GitHub's head filter is
+// only owner:branch, so repository identity must be checked in the response.
+func (p *Provider) ListPullRequestsByHead(ctx context.Context, base forge.PullRequestRef, headRepo, headRef string) ([]forge.PullRequest, error) {
+	baseOwner, baseName, err := splitRepository(base.Repo)
+	if err != nil {
+		return nil, err
+	}
+	headOwner, _, err := splitRepository(headRepo)
+	if err != nil {
+		return nil, err
+	}
+	pulls, err := p.client.PullRequestsForHeadAllPages(ctx, baseOwner, baseName, headOwner, headRef)
+	if err != nil {
+		return nil, boundaryError(err)
+	}
+	var matches []forge.PullRequest
+	for _, raw := range pulls {
+		pr, err := toForgePR(raw)
+		if err != nil {
+			return nil, err
+		}
+		if pr.BaseRepo == base.Repo && pr.HeadRepo == headRepo && pr.HeadRef == headRef {
+			matches = append(matches, pr)
+		}
+	}
+	return matches, nil
 }
 
 // ListReviews is not covered by this client.
@@ -128,9 +243,22 @@ func (p *Provider) CreatePullRequest(ctx context.Context, in forge.CreatePullReq
 	if err != nil {
 		return forge.PullRequest{}, err
 	}
+	head := in.Head
+	if in.HeadRepo != "" || in.HeadRef != "" {
+		if in.HeadRepo == "" || in.HeadRef == "" {
+			return forge.PullRequest{}, fmt.Errorf("GitHub pull request head repository and ref must both be set")
+		}
+		headOwner, _, err := splitRepository(in.HeadRepo)
+		if err != nil {
+			return forge.PullRequest{}, err
+		}
+		// Ignore Head when full trusted identity is supplied; it is a legacy
+		// selector and may be caller-controlled.
+		head = headOwner + ":" + in.HeadRef
+	}
 	pr, err := p.client.CreatePullRequest(ctx, owner, repo, CreatePullRequestRequest{
 		Title: in.Title,
-		Head:  in.Head,
+		Head:  head,
 		Base:  in.Base,
 		Body:  in.Body,
 		Draft: in.Draft,

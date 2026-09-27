@@ -231,12 +231,14 @@ type Check struct {
 // CreatePullRequestInput is the provider-neutral request to open a pull
 // request.
 type CreatePullRequestInput struct {
-	Repo  string
-	Title string
-	Head  string
-	Base  string
-	Body  string
-	Draft bool
+	Repo     string
+	Title    string
+	Head     string // Legacy provider-native head selector.
+	HeadRepo string
+	HeadRef  string
+	Base     string
+	Body     string
+	Draft    bool
 }
 
 // UpdatePullRequestInput is the provider-neutral request to update a pull
@@ -271,6 +273,44 @@ type ProviderConfig struct {
 //
 // A provider implements the operations it supports and returns ErrUnsupported
 // for the rest; Capabilities advertises which are usable up front.
+// Repository is a provider-canonical repository identity and its default ref.
+type Repository struct {
+	ID         string
+	Canonical  string
+	DefaultRef string
+}
+
+// RefState is the live state of an exact branch ref. Exists distinguishes an
+// absent ref from a read that could not establish its state.
+type RefState struct {
+	Ref    string
+	OID    string
+	Exists bool
+}
+
+// Protection describes whether the provider can authoritatively establish
+// effective write protection for a ref and credential.
+type Protection struct {
+	Protected bool
+}
+
+// RepositoryPolicyProvider exposes the typed reads needed to resolve and
+// validate publication policy. It is separate from Provider so existing forge
+// adapters need not claim semantics they cannot support.
+type RepositoryPolicyProvider interface {
+	ResolveRepository(context.Context, string) (Repository, error)
+	ReadRef(context.Context, Repository, string) (RefState, error)
+	ReadEffectiveProtection(context.Context, Repository, string) (Protection, error)
+	CanWriteRepository(context.Context, Repository) (bool, error)
+}
+
+// PullRequestHeadLister lists all pull requests that may share a head branch.
+// Implementations must include every state; callers compare full head identity.
+type PullRequestHeadLister interface {
+	ListPullRequestsByHead(context.Context, PullRequestRef, string, string) ([]PullRequest, error)
+}
+
+// Provider interface remains the model-influenced forge surface.
 type Provider interface {
 	// Config returns the provider's forge-agnostic configuration. It never
 	// includes a resolved credential.

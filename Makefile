@@ -52,6 +52,10 @@ govulncheck: ## Run the Go vulnerability scanner.
 	go install golang.org/x/vuln/cmd/govulncheck@latest
 	govulncheck ./...
 
+.PHONY: ci-gating-test
+ci-gating-test: ## Run the image-gating classifier/aggregator truth table.
+	bash hack/test-ci-images-gating.sh
+
 ##@ Build
 
 .PHONY: build

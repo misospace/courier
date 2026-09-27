@@ -650,8 +650,13 @@ named items remain unresolved and must not be described as production-ready:
   [HARNESS.md](./HARNESS.md) §4 — the full policy schema, admission inputs,
   pre/post-push live revalidation, the `NeedsHuman`/retryable matrix, and
   provider-neutral semantics with fail-closed unsupported providers, including
-  the actual writable fork head required by #94. What remains is broker
-  implementation (#121/#122).
+  the actual writable fork head required by #94. #121 supplies the typed forge
+  contract, and #122 has landed the broker primitive layer: the pinned ordinary
+  git transport, the typed forge observer adapter, the authenticated
+  bundle-import endpoint, the separate trusted status handler, and the immutable
+  run-UID-bound policy engine with race-safe publication. Those primitives are
+  not a secure deployment until the per-run pod wiring, credential delivery, and
+  isolation preflight in #123 land.
 - **#104 isolation:** #120 settles the per-run broker, pod-bound workload
   identity, signed control-to-worker protocol, and network boundary. The isolated
   topology and secure preflight still need implementation and acceptance tests.
@@ -673,6 +678,22 @@ A running log of architectural decisions and their reasoning, newest first. The
 body above describes the current architecture; this log preserves *why* and what
 was superseded.
 
+- **2026-09-27 — #122 lands the broker publication primitives.** The broker owns
+  the whole publication path: a pinned, non-force git transport to one explicit
+  ref, a typed forge observer (never raw forge calls), an authenticated
+  bundle-import endpoint that validates imported objects before publication, a
+  separate trusted status handler, and an immutable run-UID-bound policy engine.
+  The engine re-reads the live world before and after a single ordinary push and
+  decides publication solely on that observation: the push's own success,
+  failure or lost report never decides the outcome. An uncertain push is
+  confirmed idempotently when the exact proposed OID is live and every base,
+  protection and PR check still passes; a fresh broker after a crash cannot
+  infer ownership from a caller-supplied OID or ancestry, because in-memory
+  confirmation is not durable and the admission anchor is the only trusted
+  restart evidence. These primitives are landed, but they are not a secure
+  deployment: the per-run pod wiring, credential delivery and isolation
+  preflight in #123 are still required before the broker is safe to expose.
+  ([HARNESS.md](./HARNESS.md) §4) (#122, #118, #80, #123)
 - **2026-09-27 — Read-only toolchain reference for bootstrap lanes (#153).**
   OpenCode's `external_directory` permission cannot distinguish a read from a
   write, so the toolchain's writable cache directory was not allowed wholesale.

@@ -21,8 +21,9 @@ import (
 )
 
 const (
-	defaultBaseURL = "https://api.github.com/"
-	apiVersion     = "2022-11-28"
+	defaultBaseURL      = "https://api.github.com/"
+	apiVersion          = "2022-11-28"
+	maxPullRequestPages = 1000
 )
 
 // HTTPDoer is the part of http.Client used by Client. Keeping it small makes
@@ -109,6 +110,24 @@ type RepoRef struct {
 // repository.
 type RepoOwner struct {
 	Login string `json:"login,omitempty"`
+}
+
+// Repository is the authoritative repository metadata GitHub returns.
+type Repository struct {
+	ID            int64  `json:"id"`
+	FullName      string `json:"full_name"`
+	DefaultBranch string `json:"default_branch"`
+	Permissions   *struct {
+		Push bool `json:"push"`
+	} `json:"permissions"`
+}
+
+// GitRef is a branch ref returned by GitHub's git database API.
+type GitRef struct {
+	Ref    string `json:"ref"`
+	Object struct {
+		SHA string `json:"sha"`
+	} `json:"object"`
 }
 
 // CreatePullRequestRequest is the payload for creating a pull request.
@@ -230,6 +249,52 @@ func (c *Client) CommentPR(ctx context.Context, owner, repo string, number int, 
 }
 
 // GetPullRequest reads the current pull request from GitHub.
+func (c *Client) GetRepository(ctx context.Context, owner, repo string) (Repository, error) {
+	var out Repository
+	err := c.doJSON(ctx, http.MethodGet, repoEndpoint(owner, repo), nil, &out)
+	if err != nil {
+		return Repository{}, err
+	}
+	return out, nil
+}
+
+// GetBranchRef reads an exact branch ref and its current object OID.
+func (c *Client) GetBranchRef(ctx context.Context, owner, repo, branch string) (GitRef, error) {
+	var out GitRef
+	err := c.doJSON(ctx, http.MethodGet, repoEndpoint(owner, repo, "git", "ref", "heads", branch), nil, &out)
+	if err != nil {
+		return GitRef{}, err
+	}
+	return out, nil
+}
+
+// GetEffectiveBranchRules reads GitHub's computed rules for a branch. The
+// branch-rules endpoint includes classic branch protection and applicable
+// rulesets; unlike querying only branch protection, it does not silently miss
+// rulesets. A 404 means no effective rules only on GitHub versions that expose
+// this endpoint; callers treat all other failures as unknown.
+func (c *Client) GetEffectiveBranchRules(ctx context.Context, owner, repo, branch string) ([]json.RawMessage, error) {
+	var out []json.RawMessage
+	err := c.doJSON(ctx, http.MethodGet, repoEndpoint(owner, repo, "rules", "branches", branch), nil, &out)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+// GetBranchProtection reads classic branch protection. GitHub returns 404 both
+// for an unprotected branch and for inaccessible resources, so callers must
+// not interpret that response as proof of no protection.
+func (c *Client) GetBranchProtection(ctx context.Context, owner, repo, branch string) (json.RawMessage, error) {
+	var out json.RawMessage
+	err := c.doJSON(ctx, http.MethodGet, repoEndpoint(owner, repo, "branches", branch, "protection"), nil, &out)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+// GetPullRequest reads the current pull request from GitHub.
 func (c *Client) GetPullRequest(ctx context.Context, owner, repo string, number int) (PullRequest, error) {
 	var out PullRequest
 	err := c.doJSON(ctx, http.MethodGet, repoEndpoint(owner, repo, "pulls", strconv.Itoa(number)), nil, &out)
@@ -252,10 +317,35 @@ func (c *Client) PullRequestsForHead(ctx context.Context, owner, repo, headOwner
 	return out, err
 }
 
+// PullRequestsForHeadAllPages paginates the all-state GitHub head query. The
+// legacy PullRequestsForHead remains a one-page operation for existing callers.
+func (c *Client) PullRequestsForHeadAllPages(ctx context.Context, owner, repo, headOwner, branch string) ([]PullRequest, error) {
+	endpoint := repoEndpoint(owner, repo, "pulls")
+	var out []PullRequest
+	for page := 1; ; page++ {
+		var current []PullRequest
+		err := c.doJSONQuery(ctx, http.MethodGet, endpoint, headFilterPageQuery(headOwner, branch, page), nil, &current)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, current...)
+		if len(current) < 100 {
+			return out, nil
+		}
+		if page == maxPullRequestPages {
+			return nil, fmt.Errorf("GitHub pull-request response exceeded %d pages", maxPullRequestPages)
+		}
+	}
+}
+
 // headFilterQuery builds the pulls-list query for a head ref owned by
 // headOwner. GitHub requires the owner:branch form of the head filter.
 func headFilterQuery(headOwner, branch string) string {
 	return "head=" + url.QueryEscape(headOwner) + ":" + url.QueryEscape(branch) + "&state=all"
+}
+
+func headFilterPageQuery(headOwner, branch string, page int) string {
+	return headFilterQuery(headOwner, branch) + "&page=" + strconv.Itoa(page) + "&per_page=100"
 }
 
 // GetCheckRuns reads all CI checks for a commit, branch, or tag ref.

@@ -29,6 +29,11 @@ required checks must be green before merge:
 - `static`, `test`, `images`, `vulnerability`, `chart`, and `Analyze (go)`
   (CodeQL). Saffron's AI PR review also runs on every pull request, but it is
   advisory: input to the maintainer's merge decision, never a gate on it.
+  `images` remains the stable required context even when its expensive child
+  image-build jobs are intentionally skipped after a successful docs-only
+  classification, so no branch-protection migration is needed: the check name
+  never changes. A classification failure or any required image-job failure
+  keeps `images` red, and pushes to `main` always run full image validation.
 - Branch freshness is not enforced: a PR whose own required checks are green
   does not need a rebase just because `main` advanced. Maintainers update
   branches when there is meaningful integration risk, not mechanically.
