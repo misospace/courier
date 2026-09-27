@@ -32,6 +32,9 @@ type PRObservation struct {
 	// a different head as a different check set.
 	Head   string
 	Checks []CheckObservation
+	// Merged reports that the branch has no open pull request because its
+	// pull request was merged; the work shipped and there is nothing to verify.
+	Merged bool
 }
 
 // WorldObserver reads the pull request and CI state for a completed run.
@@ -49,9 +52,13 @@ const (
 	observationPending    observationState = "pending"
 	observationPassed     observationState = "passed"
 	observationFailed     observationState = "failed"
+	observationMerged     observationState = "merged"
 )
 
 func observeState(observation PRObservation) observationState {
+	if observation.Merged {
+		return observationMerged
+	}
 	if observation.PR == "" || observation.Draft {
 		return observationNeedsHuman
 	}

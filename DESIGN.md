@@ -681,6 +681,12 @@ was superseded.
   contain the base (an abandoned merge) ends the run `NeedsHuman`, so an
   unsynced branch is never reported ready. Non-conflict git failures still fail
   closed. (#96)
+- **2026-09-26 — A PR merged during a run ends it Done, not NeedsHuman.** The
+  observer used to match only open PRs, so a run whose PR someone else merged
+  while it worked looked like a run with no PR and blocked its source item for
+  shipped work (#107 and #108 did this). A merged PR on the run branch now moves
+  a Verifying run to Done, which resolves the source and applies the reap
+  policy. A PR closed without merging still needs a human. (#146)
 - **2026-09-25 — #119 settles the long-tool liveness design.** A silent
   legitimate operation and a wedged one are observationally identical, so no
   design can both reap a wedged silent tool in finite time and never reap a
