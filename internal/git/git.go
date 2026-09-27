@@ -48,6 +48,21 @@ type Workspace struct {
 	Base          string
 	Branch        string
 	Adopted       bool
+	// Conflict is set when adoption's base sync stopped on merge conflicts.
+	// The merge is left in progress so the coordinator can resolve it; the
+	// branch is adopted but not yet synchronized with Base.
+	Conflict *MergeConflictError
+}
+
+// MergeConflictError reports a base sync that stopped on conflicting paths.
+// It is actionable work for the coordinator, not a setup failure.
+type MergeConflictError struct {
+	Base  string
+	Paths []string
+}
+
+func (e *MergeConflictError) Error() string {
+	return fmt.Sprintf("merge of %s stopped on conflicts in %d path(s): %s", e.Base, len(e.Paths), strings.Join(e.Paths, ", "))
 }
 
 // baseRemoteName is the remote that owns Base. It is a dedicated fetch-only
@@ -367,7 +382,9 @@ func Prepare(ctx context.Context, options PrepareOptions) (*Workspace, error) {
 // Adopt checks out an existing remote work branch and synchronizes it with the
 // configured base before returning.  It is separate from Prepare so resume
 // code can make the adoption step explicit, while Prepare remains the normal
-// clone-and-prepare entry point.
+// clone-and-prepare entry point.  A base sync that stops on conflicts is not
+// an error: the branch stays checked out with the merge in progress and the
+// conflict recorded on w.Conflict for the coordinator to resolve.
 func (w *Workspace) Adopt(ctx context.Context) error {
 	if err := validateRef(w.Base, "base"); err != nil {
 		return err
@@ -391,7 +408,11 @@ func (w *Workspace) Adopt(ctx context.Context) error {
 	// This order is intentional: adoption always synchronizes to base before
 	// a coordinator can inspect or change the worktree.
 	if err := w.SyncToBase(ctx); err != nil {
-		return err
+		var conflict *MergeConflictError
+		if !errors.As(err, &conflict) {
+			return err
+		}
+		w.Conflict = conflict
 	}
 	w.Adopted = true
 	return nil
@@ -435,7 +456,57 @@ func (w *Workspace) SyncToBase(ctx context.Context) error {
 		return err
 	}
 	_, err := run(ctx, w.Directory, "merge", "--no-edit", w.baseRemoteRef(w.Base))
-	return err
+	if err == nil {
+		return nil
+	}
+	// A conflicted merge leaves unmerged paths; anything else is a real
+	// failure and fails closed.
+	paths, pathsErr := w.UnmergedPaths(ctx)
+	if pathsErr != nil || len(paths) == 0 {
+		return err
+	}
+	return &MergeConflictError{Base: w.baseRemoteRef(w.Base), Paths: paths}
+}
+
+// UnmergedPaths lists the paths git still considers conflicted.
+func (w *Workspace) UnmergedPaths(ctx context.Context) ([]string, error) {
+	out, err := run(ctx, w.Directory, "diff", "--name-only", "--diff-filter=U")
+	if err != nil {
+		return nil, err
+	}
+	var paths []string
+	for _, line := range strings.Split(string(out), "\n") {
+		if line = strings.TrimSpace(line); line != "" {
+			paths = append(paths, line)
+		}
+	}
+	return paths, nil
+}
+
+// MergeInProgress reports whether a merge is still pending (MERGE_HEAD set).
+func (w *Workspace) MergeInProgress(ctx context.Context) (bool, error) {
+	_, err := run(ctx, w.Directory, "rev-parse", "--quiet", "--verify", "MERGE_HEAD")
+	if err == nil {
+		return true, nil
+	}
+	var commandErr *CommandError
+	if errors.As(err, &commandErr) && commandErr.ExitCode() == 1 {
+		return false, nil
+	}
+	return false, err
+}
+
+// ContainsBase reports whether HEAD already includes the fetched Base.
+func (w *Workspace) ContainsBase(ctx context.Context) (bool, error) {
+	_, err := run(ctx, w.Directory, "merge-base", "--is-ancestor", w.baseRemoteRef(w.Base), "HEAD")
+	if err == nil {
+		return true, nil
+	}
+	var commandErr *CommandError
+	if errors.As(err, &commandErr) && commandErr.ExitCode() == 1 {
+		return false, nil
+	}
+	return false, err
 }
 
 // SyncToBase synchronizes a checked-out work branch with a remote base branch.

@@ -3,10 +3,12 @@ package git
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 )
@@ -175,6 +177,95 @@ func TestPrepareSyncsBaseFromUpstreamWhenOriginIsFork(t *testing.T) {
 	}
 	if _, err := gitOutput(workspace.Directory, "merge-base", "--is-ancestor", "upstream/main", "HEAD"); err != nil {
 		t.Fatalf("upstream main is not an ancestor after adoption: %v", err)
+	}
+}
+
+func TestPrepareHandsConflictedBaseSyncToCoordinator(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	root := t.TempDir()
+	remote := filepath.Join(root, "remote.git")
+	source := filepath.Join(root, "source")
+	initBare(t, remote)
+	initRepo(t, source)
+	writeFile(t, filepath.Join(source, "README.md"), "base one\n")
+	commit(t, source, "base: initial")
+	git(t, source, "branch", "-M", "main")
+	git(t, source, "remote", "add", "origin", remote)
+	git(t, source, "push", "-u", "origin", "main")
+
+	const branch = "courier/fix-pr/acme-widget/12"
+	work := filepath.Join(root, "work")
+	git(t, root, "clone", remote, work)
+	git(t, work, "config", "user.name", "Courier Test")
+	git(t, work, "config", "user.email", "courier-test@example.invalid")
+	git(t, work, "checkout", "-b", branch, "origin/main")
+	writeFile(t, filepath.Join(work, "README.md"), "branch edit\n")
+	commit(t, work, "work: edit readme")
+	git(t, work, "push", "origin", "HEAD:refs/heads/"+branch)
+
+	writeFile(t, filepath.Join(source, "README.md"), "base edit\n")
+	commit(t, source, "base: edit readme")
+	git(t, source, "push", "origin", "main")
+
+	workspaceDir := filepath.Join(root, "workspace")
+	workspace, err := Prepare(ctx, PrepareOptions{RemoteURL: remote, Directory: workspaceDir, Base: "main", Branch: branch})
+	if err != nil {
+		t.Fatalf("prepare on a conflicting branch must hand off, not fail: %v", err)
+	}
+	if !workspace.Adopted {
+		t.Fatal("conflicting branch should still be adopted")
+	}
+	if workspace.Conflict == nil || workspace.Conflict.Base != "origin/main" || !reflect.DeepEqual(workspace.Conflict.Paths, []string{"README.md"}) {
+		t.Fatalf("conflict = %#v, want README.md against origin/main", workspace.Conflict)
+	}
+	if current, err := workspace.CurrentBranch(ctx); err != nil || current != branch {
+		t.Fatalf("current branch = %q, %v; want the PR branch kept checked out", current, err)
+	}
+	if pending, err := workspace.MergeInProgress(ctx); err != nil || !pending {
+		t.Fatalf("merge in progress = %v, %v; want the merge left for the coordinator", pending, err)
+	}
+	if merged, err := workspace.ContainsBase(ctx); err != nil || merged {
+		t.Fatalf("contains base = %v, %v; want false until the merge is committed", merged, err)
+	}
+
+	writeFile(t, filepath.Join(workspaceDir, "README.md"), "branch edit\nbase edit\n")
+	git(t, workspaceDir, "add", "README.md")
+	git(t, workspaceDir, "commit", "--no-edit")
+	if pending, err := workspace.MergeInProgress(ctx); err != nil || pending {
+		t.Fatalf("merge in progress after commit = %v, %v", pending, err)
+	}
+	if merged, err := workspace.ContainsBase(ctx); err != nil || !merged {
+		t.Fatalf("contains base after resolution = %v, %v", merged, err)
+	}
+}
+
+func TestSyncToBaseNonConflictFailureFailsClosed(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	root := t.TempDir()
+	remote := filepath.Join(root, "remote.git")
+	source := filepath.Join(root, "source")
+	initBare(t, remote)
+	initRepo(t, source)
+	writeFile(t, filepath.Join(source, "README.md"), "base one\n")
+	commit(t, source, "base: initial")
+	git(t, source, "branch", "-M", "main")
+	git(t, source, "remote", "add", "origin", remote)
+	git(t, source, "push", "-u", "origin", "main")
+
+	workspace, err := Prepare(ctx, PrepareOptions{RemoteURL: remote, Directory: filepath.Join(root, "workspace"), Base: "main", Branch: "courier/resolve-issue/acme-widget/3"})
+	if err != nil {
+		t.Fatalf("prepare: %v", err)
+	}
+	workspace.Base = "no-such-base"
+	err = workspace.SyncToBase(ctx)
+	if err == nil {
+		t.Fatal("sync to a missing base succeeded")
+	}
+	var conflict *MergeConflictError
+	if errors.As(err, &conflict) {
+		t.Fatalf("a non-conflict failure was reported as a conflict: %v", err)
 	}
 }
 

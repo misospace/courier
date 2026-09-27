@@ -539,14 +539,15 @@ func TestRunningDirectTerminalEnrichesObservedPR(t *testing.T) {
 
 func TestVerifyingObservationGatesReview(t *testing.T) {
 	tests := []struct {
-		name            string
-		observation     PRObservation
-		err             error
-		observerMissing bool
-		wantPhase       courierv1alpha1.Phase
-		wantRequeue     bool
-		wantPR          string
-		wantTransition  source.State
+		name             string
+		observation      PRObservation
+		err              error
+		observerMissing  bool
+		wantPhase        courierv1alpha1.Phase
+		wantRequeue      bool
+		wantPR           string
+		wantTransition   source.State
+		wantNoTransition bool
 	}{
 		{name: "observer missing", observerMissing: true, wantPhase: courierv1alpha1.PhaseNeedsHuman, wantTransition: source.StateNeedsHuman},
 		{name: "no PR", wantPhase: courierv1alpha1.PhaseNeedsHuman, wantTransition: source.StateNeedsHuman},
@@ -557,6 +558,7 @@ func TestVerifyingObservationGatesReview(t *testing.T) {
 		{name: "failed", observation: PRObservation{PR: "42", Checks: []CheckObservation{{State: CheckStateFailed}}}, wantPhase: courierv1alpha1.PhaseNeedsHuman, wantTransition: source.StateNeedsHuman},
 		{name: "single green observation", observation: PRObservation{PR: "42", Checks: []CheckObservation{{State: CheckStatePassed}, {State: CheckStatePassed}}}, wantPhase: courierv1alpha1.PhaseVerifying, wantRequeue: true, wantPR: "42"},
 		{name: "transient error", err: errors.New("GitHub unavailable"), wantPhase: courierv1alpha1.PhaseVerifying, wantRequeue: true},
+		{name: "merged mid-run", observation: PRObservation{PR: "42", Merged: true}, wantPhase: courierv1alpha1.PhaseDone, wantPR: "42", wantNoTransition: true},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -603,6 +605,9 @@ func TestVerifyingObservationGatesReview(t *testing.T) {
 			}
 			if tt.wantTransition != "" && (len(item.transitions) != 1 || item.transitions[0] != tt.wantTransition) {
 				t.Fatalf("transitions = %#v, want %q", item.transitions, tt.wantTransition)
+			}
+			if tt.wantNoTransition && len(item.transitions) != 0 {
+				t.Fatalf("transitions = %#v, want none: shipped work is not a case for a human", item.transitions)
 			}
 			if tt.wantRequeue && len(item.transitions) != 0 {
 				t.Fatalf("transitions = %#v, want none while observation is pending", item.transitions)

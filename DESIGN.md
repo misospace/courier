@@ -338,7 +338,9 @@ dead 12-hour run straight to Tier 3.
 - **Base-sync on adoption (landmine):** when a run adopts an existing branch
   (Tier 2, or any fix-pr takeover), main may have moved. Sync to base *first*, or
   the eventual PR reverts what landed on main in the meantime. Adoption's first
-  step is always sync-to-base.
+  step is always sync-to-base. A sync that stops on conflicts is handed to the
+  coordinator mid-merge, with the base and conflicted paths in its goal; the run
+  cannot leave a success phase until the base is merged into HEAD.
 
 Scope: **resolve-issue** adopts an orphaned branch only when a branch exists but
 no pull request points at it. When the deterministic branch already carries an
@@ -691,6 +693,22 @@ was superseded.
   unwritable fork head is an actionable NeedsHuman — no reset, replacement
   branch, or force-push is introduced. Same-repository fix-pr runs are
   unchanged: `status.headRepo` equals `spec.repo`. (#94)
+- **2026-09-26 — Base-sync conflicts are the coordinator's work, not a setup
+  failure.** Adoption previously treated any nonzero `git merge` as fatal, so a
+  fix-pr run on a conflicting PR ended `Failed` before OpenCode started, and
+  conflicted PRs could never be fixed by Courier. A conflict is now left in
+  progress on the checked-out branch and named in the coordinator goal (base and
+  paths); resolving it comes before any other change. After the coordinator
+  exits, a pending merge, remaining unmerged paths, or a HEAD that does not
+  contain the base (an abandoned merge) ends the run `NeedsHuman`, so an
+  unsynced branch is never reported ready. Non-conflict git failures still fail
+  closed. (#96)
+- **2026-09-26 — A PR merged during a run ends it Done, not NeedsHuman.** The
+  observer used to match only open PRs, so a run whose PR someone else merged
+  while it worked looked like a run with no PR and blocked its source item for
+  shipped work (#107 and #108 did this). A merged PR on the run branch now moves
+  a Verifying run to Done, which resolves the source and applies the reap
+  policy. A PR closed without merging still needs a human. (#146)
 - **2026-09-25 — #119 settles the long-tool liveness design.** A silent
   legitimate operation and a wedged one are observationally identical, so no
   design can both reap a wedged silent tool in finite time and never reap a
