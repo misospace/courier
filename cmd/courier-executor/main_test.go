@@ -28,7 +28,27 @@ func TestMain(m *testing.M) {
 			_ = os.Unsetenv(name)
 		}
 	}
-	os.Exit(m.Run())
+	// Run writes safe.directory into git's global config, so point that at a
+	// throwaway file and keep workstation settings such as commit.gpgsign out.
+	home, err := os.MkdirTemp("", "courier-executor-test-")
+	if err != nil {
+		panic(err)
+	}
+	for key, value := range map[string]string{
+		"GIT_CONFIG_GLOBAL":   filepath.Join(home, "gitconfig"),
+		"GIT_CONFIG_NOSYSTEM": "1",
+		"GIT_AUTHOR_NAME":     "Courier Test",
+		"GIT_AUTHOR_EMAIL":    "courier-test@example.invalid",
+		"GIT_COMMITTER_NAME":  "Courier Test",
+		"GIT_COMMITTER_EMAIL": "courier-test@example.invalid",
+	} {
+		if err := os.Setenv(key, value); err != nil {
+			panic(err)
+		}
+	}
+	code := m.Run()
+	_ = os.RemoveAll(home)
+	os.Exit(code)
 }
 
 func TestRunPreparesOrphanBranchAndInvokesOpenCodeWithExactContext(t *testing.T) {

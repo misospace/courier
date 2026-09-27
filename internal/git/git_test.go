@@ -13,11 +13,18 @@ import (
 	"testing"
 )
 
-// TestMain pins a committer identity for the whole package: Prepare runs git
-// merges inside workspaces it clones itself, and CI runners have no global
-// git config to borrow one from.
+// TestMain isolates git from the developer's global and system config and pins
+// a committer identity for the whole package: Prepare runs git merges inside
+// workspaces it clones itself, TrustDirectory writes the global config, and
+// settings such as commit.gpgsign must not leak in from a workstation.
 func TestMain(m *testing.M) {
+	home, err := os.MkdirTemp("", "courier-git-test-")
+	if err != nil {
+		panic(err)
+	}
 	for key, value := range map[string]string{
+		"GIT_CONFIG_GLOBAL":   filepath.Join(home, "gitconfig"),
+		"GIT_CONFIG_NOSYSTEM": "1",
 		"GIT_AUTHOR_NAME":     "Courier Test",
 		"GIT_AUTHOR_EMAIL":    "courier-test@example.invalid",
 		"GIT_COMMITTER_NAME":  "Courier Test",
@@ -27,7 +34,9 @@ func TestMain(m *testing.M) {
 			panic(err)
 		}
 	}
-	os.Exit(m.Run())
+	code := m.Run()
+	_ = os.RemoveAll(home)
+	os.Exit(code)
 }
 
 func TestPrepareAdoptsOrphanAndSyncsBaseBeforeWork(t *testing.T) {
