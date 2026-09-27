@@ -66,6 +66,40 @@ check_aggregator() {
   fi
 }
 
+git_setup() {
+  local repo="$1"
+  git init -q "$repo"
+  git -C "$repo" config user.email "ci@localhost"
+  git -C "$repo" config user.name "ci"
+  mkdir -p "$repo/docs"
+  printf 'readme\n' > "$repo/README.md"
+  printf 'ok\n' > "$repo/docs/ok.md"
+  git -C "$repo" add -A
+  git -C "$repo" commit -q -m "docs baseline"
+  printf 'cafe\n' > "$repo/docs/café.md"
+  git -C "$repo" add -A
+  git -C "$repo" commit -q -m "non-ascii docs"
+  git -C "$repo" rev-parse HEAD~1
+}
+
+check_classifier_gitmode() {
+  local desc="$1" expected="$2"
+  case_n=$((case_n + 1))
+  local repo base out rc
+  repo="$work/gitrepo-$case_n"
+  base="$(git_setup "$repo" 2>"$work/err-gitmode-$case_n.log")" && rc=0 || rc=$?
+  if [ "$rc" -ne 0 ]; then
+    report FAIL "classifier git-mode: $desc" "git setup rc=$rc"
+    return
+  fi
+  out="$(cd "$repo" && env -u GITHUB_OUTPUT bash "$classifier" --base-ref "$base" 2>"$work/err-gitmode-$case_n.log")" && rc=0 || rc=$?
+  if [ "$rc" -eq 0 ] && [ "$out" = "$expected" ]; then
+    report PASS "classifier git-mode: $desc"
+  else
+    report FAIL "classifier git-mode: $desc" "rc=$rc out=[$out] want=[$expected]"
+  fi
+}
+
 check_classifier "README.md" "images_required=false" "README.md"
 check_classifier "docs plus nested README" "images_required=false" "docs/repository-settings.md
 internal/foo/README.md"
@@ -87,6 +121,8 @@ check_classifier_error "no mode flag"
 check_classifier_error "unresolvable base-ref" --base-ref refs/heads/nope-nope
 check_classifier_error "both mode flags" --base-ref main --files-from "$work/nonrepo/both.txt"
 
+check_classifier_gitmode "non-ascii docs-only" "images_required=false"
+
 gh_out="$work/github_output.txt"
 gh_files="$work/gh-files.txt"
 printf '%s\n' "README.md" > "$gh_files"
@@ -107,6 +143,8 @@ check_aggregator "manager ran, skip expected" 1 success false skipped success sk
 check_aggregator "jobs ran, skip expected" 1 success false success success success
 check_aggregator "empty images_required" 1 success "" skipped skipped skipped
 check_aggregator "classify cancelled" 1 cancelled true skipped skipped skipped
+check_aggregator "classify skipped" 1 skipped false skipped skipped skipped
+check_aggregator "required, job neutral" 1 success true success neutral success
 
 agg_rc=0
 bash "$aggregator" success true success success >/dev/null 2>&1 || agg_rc=$?

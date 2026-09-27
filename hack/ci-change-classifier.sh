@@ -51,7 +51,7 @@ else
   fi
   paths_file="$(mktemp)"
   trap 'rm -f "$paths_file"' EXIT
-  git diff --name-only --no-renames "${arg}...HEAD" > "$paths_file"
+  git -c core.quotePath=false diff --name-only --no-renames "${arg}...HEAD" > "$paths_file"
 fi
 
 value="false"
