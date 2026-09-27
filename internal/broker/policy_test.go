@@ -212,6 +212,33 @@ func TestPublishRequiresPostPushExactOIDAndHandlesUncertainIdempotently(t *testi
 		t.Fatal("accepted unconfirmed head")
 	}
 }
+func TestUpdateFixPRGuardsPinnedIdentity(t *testing.T) {
+	o := goodObserver(ModeFixPR)
+	e := engine(t, goodPolicy(ModeFixPR), o, &fakePusher{})
+	if err := e.UpdateFixPR(context.Background(), UpdatePullRequest{Title: "reviewed"}); err != nil {
+		t.Fatalf("allowed metadata update rejected: %v", err)
+	}
+	if o.updated.Title != "reviewed" {
+		t.Fatal("pinned PR was not updated")
+	}
+	for _, mutate := range []func(*fakeObserver){
+		func(o *fakeObserver) { o.pr.HeadRepo = "foreign/repo" },
+		func(o *fakeObserver) { o.work.OID = "foreign" },
+	} {
+		candidate := goodObserver(ModeFixPR)
+		mutate(candidate)
+		if err := engine(t, goodPolicy(ModeFixPR), candidate, &fakePusher{}).UpdateFixPR(context.Background(), UpdatePullRequest{Body: "body"}); err == nil {
+			t.Fatal("accepted foreign PR identity or head")
+		}
+	}
+	if err := e.UpdateFixPR(context.Background(), UpdatePullRequest{}); err == nil {
+		t.Fatal("accepted empty update")
+	}
+	if err := engine(t, goodPolicy(ModeResolveIssue), goodObserver(ModeResolveIssue), &fakePusher{}).UpdateFixPR(context.Background(), UpdatePullRequest{Title: "bad"}); err == nil {
+		t.Fatal("resolve-issue updated a PR")
+	}
+}
+
 func TestNewEngineFailsClosedOnMissingCapabilityAndBadPolicy(t *testing.T) {
 	if _, err := NewPolicyEngine(goodPolicy(ModeFixPR), goodObserver(ModeFixPR), nil); err == nil {
 		t.Fatal("missing pusher accepted")

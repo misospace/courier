@@ -16,11 +16,14 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"k8s.io/apimachinery/pkg/types"
 )
 
 type testAuthenticator struct {
-	calls int
-	fail  bool
+	calls  int
+	fail   bool
+	runUID string
 }
 type serverObserver struct{}
 
@@ -48,6 +51,9 @@ func (a *testAuthenticator) Authenticate(_ context.Context, token string) (Ident
 	a.calls++
 	if a.fail || token != "valid-token" {
 		return Identity{}, context.Canceled
+	}
+	if a.runUID != "" {
+		return Identity{RunUID: types.UID(a.runUID)}, nil
 	}
 	return Identity{RunUID: "run-uid"}, nil
 }
@@ -98,6 +104,18 @@ func TestServerTypedRoutesAndAuthentication(t *testing.T) {
 	}
 	if auth.calls == 0 {
 		t.Fatal("expected authentication to run")
+	}
+}
+
+func TestServerRejectsWrongRunIdentity(t *testing.T) {
+	s, auth := serverForTest(t)
+	auth.runUID = "other-run"
+	req := httptest.NewRequest("POST", PathPublish, strings.NewReader(`{"proposedOID":"new"}`))
+	req.Header.Set("Authorization", "Bearer valid-token")
+	w := httptest.NewRecorder()
+	s.Handler().ServeHTTP(w, req)
+	if w.Code != http.StatusUnauthorized {
+		t.Fatalf("status = %d, want unauthorized", w.Code)
 	}
 }
 

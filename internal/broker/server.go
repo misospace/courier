@@ -87,7 +87,7 @@ func (s *Server) authenticate(w http.ResponseWriter, r *http.Request) (Identity,
 		return Identity{}, false
 	}
 	identity, err := s.authenticator.Authenticate(r.Context(), strings.TrimPrefix(value, "Bearer "))
-	if err != nil {
+	if err != nil || identity.RunUID == "" || string(identity.RunUID) != s.policy.policy.RunUID {
 		http.Error(w, "unauthorized", http.StatusUnauthorized)
 		return Identity{}, false
 	}
