@@ -132,6 +132,11 @@ func (s *Server) importBundle(w http.ResponseWriter, r *http.Request) {
 	if _, ok := s.authenticate(w, r); !ok {
 		return
 	}
+	info, err := os.Lstat(s.scratchDir)
+	if err != nil || !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
+		http.Error(w, "bundle import unavailable", http.StatusInternalServerError)
+		return
+	}
 	if r.URL.RawQuery != "" || r.ContentLength == 0 || r.ContentLength > maxBundleRequestBytes {
 		http.Error(w, "invalid request", http.StatusBadRequest)
 		return
@@ -175,6 +180,11 @@ func (s *Server) importBundle(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "request canceled", http.StatusRequestTimeout)
 		return
 	}
+	info, err = os.Lstat(s.scratchDir)
+	if err != nil || !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
+		http.Error(w, "bundle import unavailable", http.StatusInternalServerError)
+		return
+	}
 	file, err := os.CreateTemp(s.scratchDir, "bundle-*")
 	if err != nil {
 		http.Error(w, "bundle import failed", http.StatusInternalServerError)
@@ -188,6 +198,12 @@ func (s *Server) importBundle(w http.ResponseWriter, r *http.Request) {
 	closeErr := file.Close()
 	if err != nil || closeErr != nil {
 		http.Error(w, "bundle import failed", http.StatusUnprocessableEntity)
+		return
+	}
+	// Re-observe while serialized with other imports so an admitted tip cannot
+	// change between the initial check and importing the worker bundle.
+	if !s.validImportTip(r.Context(), req.ExpectedTip) {
+		http.Error(w, "import denied", http.StatusUnprocessableEntity)
 		return
 	}
 	if err = s.importer.ImportBundle(r.Context(), path, req.ProposedOID, req.ExpectedTip); err != nil {
@@ -222,15 +238,6 @@ func (s *Server) validImportTip(ctx context.Context, expected string) bool {
 		return false
 	}
 	return expected == p.WorkAnchorOID || expected == p.HeadAnchorOID || expected == s.policy.confirmed
-}
-
-func hasControl(value string) bool {
-	for _, r := range value {
-		if r < 0x20 || r == 0x7f {
-			return true
-		}
-	}
-	return false
 }
 
 func validObjectID(oid string) bool {

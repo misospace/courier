@@ -256,7 +256,9 @@ func (e *PolicyEngine) Publish(ctx context.Context, req PublicationRequest) (Pub
 		return PublicationResult{}, errors.New("post-push proposed commit does not include the live base tip")
 	}
 	e.confirmed = req.ProposedOID
-	return PublicationResult{OID: req.ProposedOID, AlreadyPublished: pushErr != nil}, nil
+	// pushErr was already handled above: an uncertain push returns an error and
+	// does not reach this point, so a returned result is always a confirmed push.
+	return PublicationResult{OID: req.ProposedOID, AlreadyPublished: false}, nil
 }
 
 func (e *PolicyEngine) observe(ctx context.Context) (RepositoryState, RepositoryState, *PullRequestState, error) {

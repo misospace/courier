@@ -14,6 +14,12 @@ import (
 
 // Broker owns a private bare repository used to validate and publish worker
 // bundles. Create it with NewBroker; its directory should be private to a run.
+const (
+	askpassScript    = "#!/bin/sh\ncase \"$1\" in *Username*) printf \"%s\\n\" \"$COURIER_GIT_USERNAME\" ;; *) printf \"%s\\n\" \"$COURIER_GIT_TOKEN\" ;; esac\n"
+	askpassEnvPrefix = "GIT_ASKPASS="
+	sshAskpassPrefix = "SSH_ASKPASS="
+)
+
 type Broker struct {
 	directory string
 }
@@ -177,8 +183,8 @@ func (b *Broker) push(ctx context.Context, remoteURL, ref, proposedOID, username
 		}
 		defer os.Remove(askpass)
 		env := []string{
-			"GIT_ASKPASS=" + askpass,
-			"SSH_ASKPASS=" + askpass,
+			askpassEnvPrefix + askpass,
+			sshAskpassPrefix + askpass,
 			"COURIER_GIT_USERNAME=" + username,
 			"COURIER_GIT_TOKEN=" + token,
 		}
@@ -237,6 +243,9 @@ func brokerGit(ctx context.Context, directory string, args ...string) ([]byte, e
 	return brokerGitRun(ctx, directory, nil, args...)
 }
 
+// brokerGitRun accepts only internally assembled Git arguments. Callers validate
+// every remote URL, ref, and object ID before constructing args; no request text
+// or model-controlled string may be passed through this variadic boundary.
 func brokerGitRun(ctx context.Context, directory string, env []string, args ...string) ([]byte, error) {
 	cmd := exec.CommandContext(ctx, "git", args...)
 	if directory != "" {
@@ -270,7 +279,7 @@ func writeAskpassHelper(parent string) (string, error) {
 		return "", err
 	}
 	name := file.Name()
-	if _, err := file.WriteString("#!/bin/sh\ncase \"$1\" in *Username*) printf '%s\\n' \"$COURIER_GIT_USERNAME\" ;; *) printf '%s\\n' \"$COURIER_GIT_TOKEN\" ;; esac\n"); err != nil {
+	if _, err := file.WriteString(askpassScript); err != nil {
 		_ = file.Close()
 		_ = os.Remove(name)
 		return "", err

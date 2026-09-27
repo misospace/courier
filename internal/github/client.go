@@ -21,8 +21,9 @@ import (
 )
 
 const (
-	defaultBaseURL = "https://api.github.com/"
-	apiVersion     = "2022-11-28"
+	defaultBaseURL      = "https://api.github.com/"
+	apiVersion          = "2022-11-28"
+	maxPullRequestPages = 1000
 )
 
 // HTTPDoer is the part of http.Client used by Client. Keeping it small makes
@@ -330,6 +331,9 @@ func (c *Client) PullRequestsForHeadAllPages(ctx context.Context, owner, repo, h
 		out = append(out, current...)
 		if len(current) < 100 {
 			return out, nil
+		}
+		if page == maxPullRequestPages {
+			return nil, fmt.Errorf("GitHub pull-request response exceeded %d pages", maxPullRequestPages)
 		}
 	}
 }
