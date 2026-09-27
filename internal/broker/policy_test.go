@@ -45,12 +45,22 @@ func (f *fakeObserver) UpdatePullRequest(_ context.Context, _ int, in UpdatePull
 type fakePusher struct {
 	observer                         *fakeObserver
 	ancestor                         bool
+	ancestorSeq                      []bool
+	ancestorCalls                    int
 	pushErr                          error
 	pushedRepo, pushedRef, pushedOID string
 	afterPush                        func()
 }
 
 func (f *fakePusher) IsAncestor(_ context.Context, _, ancestor, descendant string) (bool, error) {
+	if f.ancestorSeq != nil {
+		answer := f.ancestor
+		if f.ancestorCalls < len(f.ancestorSeq) {
+			answer = f.ancestorSeq[f.ancestorCalls]
+		}
+		f.ancestorCalls++
+		return answer, nil
+	}
 	return f.ancestor, nil
 }
 func (f *fakePusher) Push(_ context.Context, repo, ref, oid string) error {
@@ -307,6 +317,25 @@ func TestPublishDropsConfirmationWhenPostPushPRCheckFails(t *testing.T) {
 	w.afterPush = func() { o.work.OID = "new" } // PR head stays at "old"
 	if _, err := e.Publish(context.Background(), PublicationRequest{RunUID: "uid-1", ExpectedWorkOID: "old", ProposedOID: "new"}); err == nil {
 		t.Fatal("accepted post-push PR head mismatch")
+	}
+	if e.confirmed != "" {
+		t.Fatalf("failed postflight left in-process confirmation: %q", e.confirmed)
+	}
+}
+
+// TestPublishDropsConfirmationWhenPostPushBaseAncestryFails covers the other
+// abnormal postflight branch: the exact OID is live and the PR identity is
+// intact, but the proposal no longer includes the live base tip. Publication
+// must fail and, like the PR-check branch, clear any in-process confirmation.
+func TestPublishDropsConfirmationWhenPostPushBaseAncestryFails(t *testing.T) {
+	o := goodObserver(ModeResolveIssue)
+	// Pre-push base-inclusion and fast-forward checks pass; the post-push
+	// base-inclusion recheck fails.
+	w := &fakePusher{ancestorSeq: []bool{true, true, false}}
+	e := engine(t, goodPolicy(ModeResolveIssue), o, w)
+	w.afterPush = func() { o.work.OID = "new" }
+	if _, err := e.Publish(context.Background(), PublicationRequest{RunUID: "uid-1", ExpectedWorkOID: "old", ProposedOID: "new"}); err == nil {
+		t.Fatal("accepted post-push base ancestry failure")
 	}
 	if e.confirmed != "" {
 		t.Fatalf("failed postflight left in-process confirmation: %q", e.confirmed)

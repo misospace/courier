@@ -96,6 +96,13 @@ func (a *ForgeAdapter) PullRequest(ctx context.Context, number int) (PullRequest
 	if number <= 0 || (a.p.Mode == ModeFixPR && number != a.p.PRNumber) || (a.p.Mode == ModeResolveIssue && !createdByAdapter) {
 		return PullRequestState{}, errors.New("forge adapter: pull request is outside pinned policy")
 	}
+	return a.readPullRequest(ctx, number)
+}
+
+// readPullRequest performs the pinned read-and-verify of one pull request. The
+// caller owns the policy gate that authorizes the number; this never consults
+// a.created, so a create can verify its own result before registering it.
+func (a *ForgeAdapter) readPullRequest(ctx context.Context, number int) (PullRequestState, error) {
 	base, err := a.checkedRepository(ctx, a.base)
 	if err != nil {
 		return PullRequestState{}, err
@@ -191,12 +198,9 @@ func (a *ForgeAdapter) CreatePullRequest(ctx context.Context, in CreatePullReque
 	if created.BaseRepo != base.Canonical || created.BaseRef != in.BaseRef || created.HeadRepo != work.Canonical || created.HeadRef != in.HeadRef || created.HeadSHA == "" {
 		return 0, errors.New("forge adapter: created pull request does not match pinned full identity")
 	}
-	// Register the exact result of this create so the read-back below and any
-	// later PolicyEngine verification may observe it; nothing else may.
-	a.mu.Lock()
-	a.created[created.Number] = struct{}{}
-	a.mu.Unlock()
-	if _, err := a.PullRequest(ctx, created.Number); err != nil {
+	// Verify the create through the same pinned read path before registering it,
+	// so a.created only ever holds numbers this adapter fully verified.
+	if _, err := a.readPullRequest(ctx, created.Number); err != nil {
 		return 0, err
 	}
 	// Resolve identities again after creation; repository replacement during the
@@ -214,6 +218,11 @@ func (a *ForgeAdapter) CreatePullRequest(ctx context.Context, in CreatePullReque
 	if len(matches) != 1 || matches[0].Number != created.Number {
 		return 0, errors.New("forge adapter: duplicate or mismatched pull request appeared during creation")
 	}
+	// Register only the exact result of this create, now fully verified, so
+	// PolicyEngine can read it back and independently verify all pinned identities.
+	a.mu.Lock()
+	a.created[created.Number] = struct{}{}
+	a.mu.Unlock()
 	return created.Number, nil
 }
 
