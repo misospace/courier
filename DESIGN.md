@@ -820,6 +820,29 @@ was superseded.
   place meant to be swappable. This settled provider agnosticism, not a security
   boundary; the 2026-09-25 decision above supersedes the MCP-only access model.
   (#80, #87)
+- **2026-09-26 — The forge boundary is a typed, capability-advertised contract.**
+  `internal/forge` defines the forge-agnostic interface the core uses to read
+  work items and change requests and to create/update/comment on them; concrete
+  forges live in sibling packages (`internal/github` is the first). The contract
+  makes **merge and raw passthrough unrepresentable** — there is no merge or
+  raw/do verb, and the capability vocabulary is closed: `Capabilities.Register`
+  refuses any capability outside the defined constants, so no capability can be
+  registered for them. The interface cannot expose merge or raw operations to
+  the core, preserving the human merge gate. Providers
+  advertise operations through a `Capabilities` set and decline the rest with
+  `ErrUnsupported`. Diagnostics and provider errors are passed through
+  `RedactDetail`, a minimal last-line guard (URL userinfo, bearer tokens), not
+  a guarantee that an arbitrary credential is removed: providers must keep
+  secrets out of diagnostic detail, and the GitHub adapter sanitizes API error
+  responses and boundary errors the same way, with the typed error preserved.
+  `ProviderConfig`
+  carries only an endpoint, a name, and a credential *reference* that the broker
+  resolves, and it stays independent of `LaneProfile` (which describes lanes,
+  never the forge or its credentials). Forge-provider pull request reads carry
+  the live base repository/ref/OID and actual head repository/ref/OID, including fork heads;
+  missing repository identity is not replaced with a same-named base branch.
+  The GitHub adapter implements only covered operations. Source adapters and
+  broker transport remain out of scope. (#121, #80, #118)
 - **2026-09-22 — Repository toolchains are per-lane runtime images, not baked
   into one universal coordinator image.** A `LaneProfile.runtimeImage` selects a
   coordinator image carrying the target repo's toolchain (e.g. `courier-go`
