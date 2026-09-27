@@ -21,8 +21,10 @@ var ErrUnsupported = errors.New("forge: operation not supported by provider")
 
 // Capability names one operation a forge provider can register support for.
 //
-// The vocabulary deliberately contains no merge and no raw-passthrough
-// capability. A capability cannot be registered for them, so those verbs are
+// The vocabulary is deliberately closed and contains no merge and no
+// raw-passthrough capability. Capabilities.Register refuses any capability
+// outside the constants below, so a provider can never advertise a verb that
+// has no corresponding method on Provider: the forbidden verbs are
 // unrepresentable.
 type Capability string
 
@@ -37,9 +39,29 @@ const (
 	CapabilityComment           Capability = "comment"
 )
 
-// Availability is the safe, redacted result of asking whether a capability is
-// usable. Detail explains unavailability in one short line and must never
-// contain a credential or endpoint secret; empty when available.
+// knownCapabilities is the closed capability vocabulary. Register accepts
+// only a capability present here, which is what keeps merge and
+// raw-passthrough unrepresentable: they have no constant and therefore
+// cannot be registered.
+var knownCapabilities = map[Capability]struct{}{
+	CapabilityReadWorkItem:      {},
+	CapabilityReadPullRequest:   {},
+	CapabilityListReviews:       {},
+	CapabilityListComments:      {},
+	CapabilityReadChecks:        {},
+	CapabilityCreatePullRequest: {},
+	CapabilityUpdatePullRequest: {},
+	CapabilityComment:           {},
+}
+
+// Availability is the diagnostic for a capability. Detail explains
+// unavailability in one short line and is empty by convention when the
+// capability is available.
+//
+// Detail must not carry a credential: Register passes it through RedactDetail,
+// which is a minimal last-line guard over the common leak shapes (URL
+// userinfo, bearer tokens), not a guarantee that an arbitrary secret is
+// removed. Providers keep secrets out of Detail; the redaction is a backstop.
 type Availability struct {
 	Available bool   `json:"available"`
 	Detail    string `json:"detail,omitempty"`
@@ -49,8 +71,8 @@ type Availability struct {
 func available() Availability { return Availability{Available: true} }
 
 // unavailable is the diagnostic for a capability that cannot be used now.
-// detail is passed through RedactDetail before it is returned so a caller can
-// never learn a secret from an unavailability reason.
+// detail is passed through RedactDetail before it is returned, so the common
+// credential shapes (URL userinfo, bearer tokens) do not pass through.
 func unavailable(detail string) Availability {
 	return Availability{Available: false, Detail: RedactDetail(detail)}
 }
@@ -67,7 +89,8 @@ type Capabilities struct {
 	entries map[Capability]Availability
 }
 
-// NewCapabilities registers the given capabilities as available.
+// NewCapabilities registers the given capabilities as available. Capabilities
+// outside the closed vocabulary are ignored by Register.
 func NewCapabilities(caps ...Capability) Capabilities {
 	c := Capabilities{entries: make(map[Capability]Availability, len(caps))}
 	for _, capability := range caps {
@@ -79,13 +102,19 @@ func NewCapabilities(caps ...Capability) Capabilities {
 // Register adds or replaces the diagnostic for one capability. Registering a
 // capability does not make an operation exist on the interface; it only
 // advertises support and readiness.
+//
+// A capability outside the closed vocabulary is not registered, so the
+// registry can never advertise a verb the Provider interface does not define
+// (for example a forged "merge" or "raw"). The diagnostic Detail is passed
+// through RedactDetail whether or not the capability is available.
 func (c *Capabilities) Register(capability Capability, a Availability) {
+	if _, ok := knownCapabilities[capability]; !ok {
+		return
+	}
 	if c.entries == nil {
 		c.entries = make(map[Capability]Availability)
 	}
-	if !a.Available {
-		a.Detail = RedactDetail(a.Detail)
-	}
+	a.Detail = RedactDetail(a.Detail)
 	c.entries[capability] = a
 }
 
@@ -204,7 +233,7 @@ type CreatePullRequestInput struct {
 // request. A field left at its zero value is left unchanged by the provider.
 //
 // Draft state is deliberately not part of this contract: it is set at
-// creation time, and providers such as GitHub do not accept a draft change
+// creation time, and providers such as GitHub do not support draft mutation
 // through their update endpoint.
 type UpdatePullRequestInput struct {
 	Title string

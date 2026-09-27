@@ -825,11 +825,17 @@ was superseded.
   work items and change requests and to create/update/comment on them; concrete
   forges live in sibling packages (`internal/github` is the first). The contract
   makes **merge and raw passthrough unrepresentable** — there is no merge or
-  raw/do verb and no capability can be registered for them — so the human merge
-  gate cannot be bypassed and a provider cannot smuggle forge-specific behavior
-  past the core. Providers advertise operations through a `Capabilities` set and
-  decline the rest with `ErrUnsupported`, and unavailability diagnostics are
-  redacted so a failure reason can never leak a credential. `ProviderConfig`
+  raw/do verb, and the capability vocabulary is closed: `Capabilities.Register`
+  refuses any capability outside the defined constants, so no capability can be
+  registered for them. The interface cannot expose merge or raw operations to
+  the core, preserving the human merge gate. Providers
+  advertise operations through a `Capabilities` set and decline the rest with
+  `ErrUnsupported`. Diagnostics and provider errors are passed through
+  `RedactDetail`, a minimal last-line guard (URL userinfo, bearer tokens), not
+  a guarantee that an arbitrary credential is removed: providers must keep
+  secrets out of diagnostic detail, and the GitHub adapter sanitizes API error
+  responses and boundary errors the same way, with the typed error preserved.
+  `ProviderConfig`
   carries only an endpoint, a name, and a credential *reference* that the broker
   resolves, and it stays independent of `LaneProfile` (which describes lanes,
   never the forge or its credentials). The GitHub adapter implements only covered

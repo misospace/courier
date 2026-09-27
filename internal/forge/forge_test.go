@@ -221,6 +221,24 @@ func TestRegisterRedactsRawDetail(t *testing.T) {
 	}
 }
 
+// Register redacts Detail whether or not the capability is available, so a
+// stray secret in an available capability's detail cannot survive.
+func TestRegisterRedactsDetailWhenAvailable(t *testing.T) {
+	var c Capabilities
+	c.Register(CapabilityReadChecks,
+		Availability{Available: true, Detail: "endpoint https://user:hunter2@internal.example/api"})
+	a := c.Available(CapabilityReadChecks)
+	if !a.Available {
+		t.Fatal("Available = false, want true")
+	}
+	if strings.Contains(a.Detail, "hunter2") {
+		t.Fatalf("Detail leaks credential: %q", a.Detail)
+	}
+	if !strings.Contains(a.Detail, "[REDACTED]") {
+		t.Fatalf("Detail = %q, want [REDACTED]", a.Detail)
+	}
+}
+
 func TestCapabilitiesListSorted(t *testing.T) {
 	c := NewCapabilities(CapabilityComment, CapabilityReadWorkItem, CapabilityReadChecks)
 	got := c.List()
@@ -282,8 +300,11 @@ func TestRedactDetail(t *testing.T) {
 	}
 }
 
-// Unrepresentability is enforced by the interface shape; this test only guards against a future forbidden capability entering the vocabulary.
-func TestCapabilityVocabularyExcludesMergeAndRaw(t *testing.T) {
+// The capability vocabulary is closed: the exported constants are exactly
+// what Register accepts, and a forged capability string (a "merge" or "raw"
+// verb, a typo) can never be registered, so the registry can never advertise
+// a verb the Provider interface does not define.
+func TestCapabilityVocabularyIsClosed(t *testing.T) {
 	all := []Capability{
 		CapabilityReadWorkItem,
 		CapabilityReadPullRequest,
@@ -294,13 +315,31 @@ func TestCapabilityVocabularyExcludesMergeAndRaw(t *testing.T) {
 		CapabilityUpdatePullRequest,
 		CapabilityComment,
 	}
-	forbidden := []string{"merge", "raw", "exec", "passthrough", "do"}
+	// Every exported constant is in the closed vocabulary.
 	for _, cap := range all {
-		for _, f := range forbidden {
-			if string(cap) == f {
-				t.Errorf("capability %q is a forbidden verb", cap)
-			}
+		var c Capabilities
+		c.Register(cap, available())
+		if !c.Has(cap) {
+			t.Errorf("Register dropped known capability %q", cap)
 		}
+	}
+	// No forged capability string registers, through Register or
+	// NewCapabilities.
+	forged := []Capability{"merge", "raw", "exec", "passthrough", "do", "read-pull-request-typo"}
+	var c Capabilities
+	for _, cap := range forged {
+		c.Register(cap, available())
+	}
+	for _, cap := range forged {
+		if c.Has(cap) {
+			t.Errorf("Has(%q) = true, want false: the vocabulary is closed", cap)
+		}
+		if a := c.Available(cap); a.Available {
+			t.Errorf("Available(%q).Available = true, want false", cap)
+		}
+	}
+	if nc := NewCapabilities(CapabilityReadPullRequest, Capability("merge")); !nc.Has(CapabilityReadPullRequest) || nc.Has(Capability("merge")) {
+		t.Fatalf("NewCapabilities = %v, want only the known capability", nc.List())
 	}
 }
 

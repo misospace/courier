@@ -20,6 +20,33 @@ type Provider struct {
 
 var _ forge.Provider = (*Provider)(nil)
 
+// redactedError is an error whose string form was sanitized with
+// forge.RedactDetail before it crossed the forge boundary. It unwraps to the
+// original, so typed errors (for example *APIError) stay reachable through
+// errors.As.
+type redactedError struct {
+	original error
+	message  string
+}
+
+func (e *redactedError) Error() string { return e.message }
+func (e *redactedError) Unwrap() error { return e.original }
+
+// boundaryError returns err with its string form passed through
+// forge.RedactDetail, so the common credential shapes (a URL with embedded
+// userinfo, a bearer token in an error message) do not reach the core in a
+// provider error. It is a minimal guard, not a general secrets scanner, and
+// it preserves the original error for typed inspection.
+func boundaryError(err error) error {
+	if err == nil {
+		return nil
+	}
+	if redacted := forge.RedactDetail(err.Error()); redacted != err.Error() {
+		return &redactedError{original: err, message: redacted}
+	}
+	return err
+}
+
 // NewProvider builds a forge.Provider over a GitHub client. cfg carries the
 // endpoint, name, and a credential *reference* (never a resolved credential);
 // the caller is responsible for constructing client with a broker-resolved
@@ -58,7 +85,7 @@ func (p *Provider) ReadPullRequest(ctx context.Context, ref forge.PullRequestRef
 	}
 	pr, err := p.client.GetPullRequest(ctx, owner, repo, ref.Number)
 	if err != nil {
-		return forge.PullRequest{}, err
+		return forge.PullRequest{}, boundaryError(err)
 	}
 	return toForgePR(ref.Repo, pr), nil
 }
@@ -81,7 +108,7 @@ func (p *Provider) ReadChecks(ctx context.Context, ref forge.PullRequestRef, hea
 	}
 	runs, err := p.client.GetCheckRuns(ctx, owner, repo, headSHA)
 	if err != nil {
-		return nil, err
+		return nil, boundaryError(err)
 	}
 	checks := make([]forge.Check, 0, len(runs.CheckRuns))
 	for _, run := range runs.CheckRuns {
@@ -108,7 +135,7 @@ func (p *Provider) CreatePullRequest(ctx context.Context, in forge.CreatePullReq
 		Draft: in.Draft,
 	})
 	if err != nil {
-		return forge.PullRequest{}, err
+		return forge.PullRequest{}, boundaryError(err)
 	}
 	return toForgePR(in.Repo, pr), nil
 }
@@ -125,7 +152,7 @@ func (p *Provider) UpdatePullRequest(ctx context.Context, ref forge.PullRequestR
 		State: in.State,
 	})
 	if err != nil {
-		return forge.PullRequest{}, err
+		return forge.PullRequest{}, boundaryError(err)
 	}
 	return toForgePR(ref.Repo, pr), nil
 }
@@ -138,7 +165,7 @@ func (p *Provider) CommentPullRequest(ctx context.Context, ref forge.PullRequest
 	}
 	c, err := p.client.AddComment(ctx, owner, repo, ref.Number, body)
 	if err != nil {
-		return forge.Comment{}, err
+		return forge.Comment{}, boundaryError(err)
 	}
 	return forge.Comment{ID: strconv.FormatInt(c.ID, 10), Body: c.Body, URL: c.HTMLURL}, nil
 }

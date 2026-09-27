@@ -16,6 +16,8 @@ import (
 	"path"
 	"strconv"
 	"strings"
+
+	"github.com/misospace/courier/internal/forge"
 )
 
 const (
@@ -122,7 +124,8 @@ type CreatePullRequestRequest struct {
 // field omitted from this value is left unchanged by GitHub.
 //
 // The draft state is not a field here on purpose: GitHub's PATCH endpoint
-// does not accept it, so draft is only set when a pull request is created.
+// does not support changing a pull request's draft state, so draft is only
+// set when a pull request is created.
 type UpdatePullRequestRequest struct {
 	Title               string `json:"title,omitempty"`
 	Body                string `json:"body,omitempty"`
@@ -171,9 +174,11 @@ type CommitStatuses struct {
 	Statuses   []CommitStatus `json:"statuses"`
 }
 
-// APIError reports a non-2xx GitHub response. Body is retained for callers
-// that need the provider's diagnostic, but it is capped to avoid retaining a
-// huge response in a run's error path.
+// APIError reports a non-2xx GitHub response. Message and Body are retained
+// for callers that need the provider's diagnostic, but both are passed
+// through forge.RedactDetail so a credential in the provider's error
+// response (for example a bearer token in the message) cannot be read back
+// out of the typed error.
 type APIError struct {
 	StatusCode int
 	Message    string
@@ -400,12 +405,12 @@ func (c *Client) doJSONQuery(ctx context.Context, method, relative, query string
 		return fmt.Errorf("read GitHub response: %w", err)
 	}
 	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
-		apiErr := &APIError{StatusCode: resp.StatusCode, Body: string(data)}
+		apiErr := &APIError{StatusCode: resp.StatusCode, Body: forge.RedactDetail(string(data))}
 		var payload struct {
 			Message string `json:"message"`
 		}
 		if json.Unmarshal(data, &payload) == nil {
-			apiErr.Message = payload.Message
+			apiErr.Message = forge.RedactDetail(payload.Message)
 		}
 		return apiErr
 	}

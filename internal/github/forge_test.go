@@ -3,6 +3,7 @@ package github
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -89,8 +90,9 @@ func TestProviderCoveredOperations(t *testing.T) {
 	if updated.Title != "updated" {
 		t.Fatalf("UpdatePullRequest() = %#v, want title updated", updated)
 	}
-	// GitHub's PATCH endpoint does not accept a draft field, so the provider
-	// must never send one on update; draft is only set at creation time.
+	// GitHub's PATCH endpoint does not support draft mutation, so the
+	// provider must never send a draft field on update; draft is only set
+	// at creation time.
 	if strings.Contains(string(patchBody), "draft") {
 		t.Fatalf("recorded PATCH body %q, must not contain a draft field", patchBody)
 	}
@@ -108,6 +110,72 @@ func TestProviderCoveredOperations(t *testing.T) {
 			t.Fatalf("recorded request path %q touches a merge endpoint", path)
 		}
 	}
+}
+
+// A credential in an API error must not cross the provider boundary: the
+// error string and the typed *APIError fields are sanitized, and the typed
+// error itself survives the sanitization.
+func TestProviderRedactsCredentialInAPIError(t *testing.T) {
+	t.Run("error response message", func(t *testing.T) {
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusUnauthorized)
+			_, _ = io.WriteString(w, `{"message":"bad credentials: bearer abcdef123456"}`)
+		}))
+		defer server.Close()
+
+		client, err := NewClient(server.URL, "token")
+		if err != nil {
+			t.Fatal(err)
+		}
+		p := NewProvider(forge.ProviderConfig{Name: "gh", Endpoint: server.URL, CredentialRef: "secret/gh"}, client)
+		_, err = p.ReadPullRequest(context.Background(), forge.PullRequestRef{Repo: "acme/demo", Number: 7})
+		if err == nil {
+			t.Fatal("ReadPullRequest() error = nil, want an API error")
+		}
+		if strings.Contains(err.Error(), "abcdef123456") {
+			t.Fatalf("error leaks credential: %q", err)
+		}
+		if !strings.Contains(err.Error(), "[REDACTED]") {
+			t.Fatalf("error = %q, want [REDACTED]", err)
+		}
+		var apiErr *APIError
+		if !errors.As(err, &apiErr) {
+			t.Fatalf("errors.As(*APIError) = false, want the typed error preserved: %v", err)
+		}
+		if apiErr.StatusCode != http.StatusUnauthorized {
+			t.Fatalf("APIError.StatusCode = %d, want 401", apiErr.StatusCode)
+		}
+		if strings.Contains(apiErr.Message, "abcdef123456") || strings.Contains(apiErr.Body, "abcdef123456") {
+			t.Fatalf("APIError fields leak credential: message=%q body=%q", apiErr.Message, apiErr.Body)
+		}
+	})
+
+	t.Run("transport error with URL userinfo", func(t *testing.T) {
+		client, err := NewClient("https://user:secrettoken@gh.example.com/", "token", urlDoer{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		p := NewProvider(forge.ProviderConfig{Name: "gh"}, client)
+		_, err = p.ReadPullRequest(context.Background(), forge.PullRequestRef{Repo: "acme/demo", Number: 7})
+		if err == nil {
+			t.Fatal("ReadPullRequest() error = nil, want a transport error")
+		}
+		if strings.Contains(err.Error(), "secrettoken") {
+			t.Fatalf("error leaks credential: %q", err)
+		}
+		if !strings.Contains(err.Error(), "[REDACTED]") {
+			t.Fatalf("error = %q, want [REDACTED]", err)
+		}
+	})
+}
+
+// urlDoer fails every request with the request URL in the error, like a real
+// transport failure (for example a dial error) does.
+type urlDoer struct{}
+
+func (urlDoer) Do(req *http.Request) (*http.Response, error) {
+	return nil, fmt.Errorf("Get %q: dial tcp: connection refused", req.URL.String())
 }
 
 func TestProviderUnsupportedOperations(t *testing.T) {
