@@ -249,6 +249,61 @@ func TestRunResolveIssueAdoptsBranchWithoutPullRequest(t *testing.T) {
 	}
 }
 
+func runConflictedAdoption(t *testing.T, openCodeScript string) (int, string) {
+	t.Helper()
+	root := t.TempDir()
+	remote := remoteWithConflictingBranch(t, root)
+	fakeOpenCode := filepath.Join(root, "opencode")
+	writeExecutable(t, fakeOpenCode, "#!/bin/sh\ncase \"$1\" in mcp) exit 0;; esac\nprintf 'opencode argv: %s\\n' \"$*\"\n"+openCodeScript)
+	prServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `[]`)
+	}))
+	defer prServer.Close()
+	setResolveIssueEnv(t, root, remote, prServer.URL, fakeOpenCode)
+
+	var output bytes.Buffer
+	var errorsOut bytes.Buffer
+	code := run(context.Background(), &output, &errorsOut)
+	return code, output.String() + errorsOut.String()
+}
+
+func TestRunConflictedAdoptionReachesCoordinatorAndResolves(t *testing.T) {
+	code, output := runConflictedAdoption(t, "printf 'branch edit\\nbase edit\\n' > README.md\ngit add README.md\ngit commit --no-edit >/dev/null\n")
+	if code != exitSuccess {
+		t.Fatalf("run exit code = %d, want 0 after the coordinator commits the merge; output=%q", code, output)
+	}
+	if !strings.Contains(output, "opencode argv") {
+		t.Fatalf("a conflicting branch must reach the coordinator, not fail during setup: %q", output)
+	}
+	if !strings.Contains(output, "stopped on conflicts in README.md") {
+		t.Fatalf("the coordinator goal should name the conflicted path: %q", output)
+	}
+	if !strings.Contains(output, `"phase":"Verifying"`) {
+		t.Fatalf("a resolved and committed merge should verify: %q", output)
+	}
+}
+
+func TestRunUnresolvedConflictBecomesNeedsHuman(t *testing.T) {
+	code, output := runConflictedAdoption(t, "exit 0\n")
+	if code != exitNeedsHuman {
+		t.Fatalf("run exit code = %d, want %d; output=%q", code, exitNeedsHuman, output)
+	}
+	if !strings.Contains(output, "still unresolved; conflicts remain in README.md") {
+		t.Fatalf("unresolved-merge reason = %q", output)
+	}
+}
+
+func TestRunAbandonedConflictMergeBecomesNeedsHuman(t *testing.T) {
+	code, output := runConflictedAdoption(t, "git merge --abort\nprintf 'other\\n' > other.txt\ngit add other.txt\ngit commit -m 'test: unrelated work' >/dev/null\n")
+	if code != exitNeedsHuman {
+		t.Fatalf("run exit code = %d, want %d; output=%q", code, exitNeedsHuman, output)
+	}
+	if !strings.Contains(output, "does not contain origin/main") {
+		t.Fatalf("abandoned-merge reason = %q", output)
+	}
+}
+
 func TestRunExitZeroWithoutLocalWorkBecomesNeedsHuman(t *testing.T) {
 	root := t.TempDir()
 	remote := remoteWithExistingBranch(t, root)
@@ -1172,6 +1227,23 @@ func remoteWithExistingBranch(t *testing.T, root string) string {
 	write(t, filepath.Join(orphan, "work.txt"), "previous brief\n")
 	commit(t, orphan, "work: previous brief")
 	runGit(t, orphan, "push", "origin", "HEAD:refs/heads/courier/resolve-issue/acme-widgets/7")
+	return remote
+}
+
+// remoteWithConflictingBranch is remoteWithExistingBranch where the work
+// branch and a later base commit edit the same line, so adoption's base sync
+// stops on a conflict in README.md.
+func remoteWithConflictingBranch(t *testing.T, root string) string {
+	t.Helper()
+	remote := remoteWithExistingBranch(t, root)
+	orphan := filepath.Join(root, "orphan")
+	write(t, filepath.Join(orphan, "README.md"), "branch edit\n")
+	commit(t, orphan, "work: edit readme")
+	runGit(t, orphan, "push", "origin", "HEAD:refs/heads/courier/resolve-issue/acme-widgets/7")
+	source := filepath.Join(root, "source")
+	write(t, filepath.Join(source, "README.md"), "base edit\n")
+	commit(t, source, "base: edit readme")
+	runGit(t, source, "push", "origin", "main")
 	return remote
 }
 

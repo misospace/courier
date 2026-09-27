@@ -353,11 +353,16 @@ func run(ctx context.Context, stdout, stderr io.Writer) int {
 		report.terminate(termination{Phase: "Failed", Result: "failure", ExitCode: 1, Reason: "record workspace start: " + err.Error()})
 		return 1
 	}
-	report.event(courierlog.EventWorkspaceReady, courierlog.StatusOK, map[string]any{
+	ready := map[string]any{
 		"adopted": workspace.Adopted,
 		"base":    cfg.Base,
 		"branch":  cfg.Branch,
-	})
+	}
+	if workspace.Conflict != nil {
+		ready["conflicted_paths"] = len(workspace.Conflict.Paths)
+		cfg.Goal = strings.TrimSpace(cfg.Goal + "\n\n" + conflictNote(workspace.Conflict))
+	}
+	report.event(courierlog.EventWorkspaceReady, courierlog.StatusOK, ready)
 
 	runtime := executor.OpenCode{Binary: cfg.OpenCodeBinary, Format: cfg.OpenCodeFormat, Agent: cfg.OpenCodeAgent}
 	caps := preflightCapabilities(ctx, runtime.MCPStatusCommand(), workspace.Directory)
@@ -406,6 +411,13 @@ func run(ctx context.Context, stdout, stderr io.Writer) int {
 		return code
 	}
 
+	if workspace.Conflict != nil {
+		if reason := unresolvedBaseSync(ctx, workspace); reason != "" {
+			report.terminate(termination{Phase: "NeedsHuman", Result: "needs-human", ExitCode: exitNeedsHuman, Reason: reason})
+			return exitNeedsHuman
+		}
+	}
+
 	workState, err := workspace.WorkState(ctx, startCommit)
 	if err != nil {
 		report.terminate(termination{Phase: "Failed", Result: "failure", ExitCode: 1, Reason: "inspect workspace result: " + err.Error()})
@@ -442,6 +454,47 @@ func run(ctx context.Context, stdout, stderr io.Writer) int {
 		report.terminate(termination{Phase: "NeedsHuman", Result: "needs-human", ExitCode: exitNeedsHuman, Reason: reason})
 		return exitNeedsHuman
 	}
+}
+
+// maxConflictNotePaths bounds how many conflicted paths the goal lists.
+const maxConflictNotePaths = 20
+
+// conflictNote tells the coordinator that adoption stopped mid-merge and that
+// resolving it comes before any other work.
+func conflictNote(conflict *git.MergeConflictError) string {
+	paths := conflict.Paths
+	more := ""
+	if len(paths) > maxConflictNotePaths {
+		more = fmt.Sprintf(" (and %d more)", len(paths)-maxConflictNotePaths)
+		paths = paths[:maxConflictNotePaths]
+	}
+	return fmt.Sprintf("The run branch is mid-merge: syncing it with %s stopped on conflicts in %s%s. Resolve those conflicts, run the tests, and commit the merge before any other change or push. Keep the branch's existing work: never reset, rebase, force-push, or discard it. If you cannot resolve the conflicts safely, stop and report that the run needs a human.", conflict.Base, strings.Join(paths, ", "), more)
+}
+
+// unresolvedBaseSync returns why a conflicted base sync is still unfinished
+// after the coordinator exits, or "" once the base is merged into HEAD. Any
+// doubt keeps the run out of a success phase.
+func unresolvedBaseSync(ctx context.Context, workspace *git.Workspace) string {
+	base := workspace.Conflict.Base
+	pending, err := workspace.MergeInProgress(ctx)
+	if err != nil {
+		return "could not verify the base-sync merge with " + base + ": " + err.Error()
+	}
+	if pending {
+		paths, _ := workspace.UnmergedPaths(ctx)
+		if len(paths) > 0 {
+			return fmt.Sprintf("the merge of %s is still unresolved; conflicts remain in %s", base, strings.Join(paths, ", "))
+		}
+		return "the merge of " + base + " was resolved but never committed"
+	}
+	merged, err := workspace.ContainsBase(ctx)
+	if err != nil {
+		return "could not verify the base-sync merge with " + base + ": " + err.Error()
+	}
+	if !merged {
+		return "the run branch does not contain " + base + "; the conflicted base-sync merge was abandoned instead of resolved"
+	}
+	return ""
 }
 
 // envIdentity reconstructs run identity from the environment for exit paths
