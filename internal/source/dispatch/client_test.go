@@ -166,7 +166,7 @@ func TestHTTPClientPreLaunchRejectsClosedFollowup(t *testing.T) {
 	if err := client.PreLaunch(context.Background(), id); !errors.Is(err, source.ErrStaleWork) {
 		t.Fatalf("PreLaunch() error = %v, want ErrStaleWork", err)
 	}
-	if request["repo"] != "acme/widgets" || request["pr"] != float64(42) || request["status"] != "STALE" {
+	if request["repo"] != "acme/widgets" || request["pr"] != float64(42) || request["status"] != "STALE" || request["generation"] != float64(1) {
 		t.Fatalf("stale request = %#v", request)
 	}
 }
@@ -196,7 +196,7 @@ func TestHTTPClientPreLaunchRejectsMergedFollowup(t *testing.T) {
 	if err := client.PreLaunch(context.Background(), id); !errors.Is(err, source.ErrStaleWork) {
 		t.Fatalf("PreLaunch() error = %v, want ErrStaleWork", err)
 	}
-	if request["repo"] != "acme/widgets" || request["pr"] != float64(42) || request["status"] != "STALE" || request["note"] != "upstream pull request is merged" {
+	if request["repo"] != "acme/widgets" || request["pr"] != float64(42) || request["status"] != "STALE" || request["note"] != "upstream pull request is merged" || request["generation"] != float64(1) {
 		t.Fatalf("stale request = %#v", request)
 	}
 }
@@ -267,7 +267,7 @@ func TestHTTPClientDiscoverMarksMergedFollowupStale(t *testing.T) {
 	if len(items) != 0 {
 		t.Fatalf("items = %#v, want no work", items)
 	}
-	if request["repo"] != "acme/widgets" || request["pr"] != float64(42) || request["status"] != "STALE" {
+	if request["repo"] != "acme/widgets" || request["pr"] != float64(42) || request["status"] != "STALE" || request["generation"] != float64(1) {
 		t.Fatalf("stale request = %#v", request)
 	}
 }
@@ -541,6 +541,78 @@ func TestHTTPClientReportMapsBlockedAndFailed(t *testing.T) {
 	}
 	if len(requests) != 4 || requests[0]["taskType"] != "followup-pr" || requests[0]["outcome"] != "blocked" || requests[0]["error"] != "blocked" || requests[1]["status"] != "BLOCKED" || requests[1]["repo"] != "acme/widgets" || requests[1]["pr"] != float64(77) || requests[2]["taskType"] != "followup-pr" || requests[2]["outcome"] != "failed" || requests[2]["error"] != "failed" || requests[3]["status"] != "BLOCKED" || requests[3]["repo"] != "acme/widgets" || requests[3]["pr"] != float64(77) {
 		t.Fatalf("requests = %#v", requests)
+	}
+}
+
+func TestHTTPClientQueueBackedFollowupEchoesAttemptToken(t *testing.T) {
+	var reports, marks []map[string]any
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		var request map[string]any
+		if err := json.Unmarshal(body, &request); err != nil {
+			t.Fatal(err)
+		}
+		switch r.URL.Path {
+		case "/api/agents/worker/tasks/report":
+			reports = append(reports, request)
+		case "/api/pr-fix-queue/mark":
+			marks = append(marks, request)
+		default:
+			t.Fatalf("unexpected request path %q", r.URL.Path)
+		}
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer server.Close()
+	client, err := NewClientWithLane(server.URL, "worker", "normal", "secret-token", time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	id := EncodeWorkID(Task{Type: "followup-pr", PullRequest: &PullRequest{Repo: "acme/widgets", Number: 77}, PRFixItem: &PRFixItem{ID: "queue-item", Generation: 3}})
+	for _, result := range []source.Result{source.ResultReady, source.ResultBlocked, source.ResultFailed} {
+		if err := client.Report(context.Background(), id, source.Lifecycle{Result: result, Error: "why", IdempotencyKey: "run-1/" + string(result)}); err != nil {
+			t.Fatalf("Report(%s) error = %v", result, err)
+		}
+	}
+
+	want := map[string]any{"id": "queue-item", "generation": float64(3)}
+	if len(reports) != 3 {
+		t.Fatalf("reports = %#v, want one per result", reports)
+	}
+	for _, report := range reports {
+		if !reflect.DeepEqual(report["prFixItem"], want) {
+			t.Fatalf("report prFixItem = %#v, want %#v", report["prFixItem"], want)
+		}
+	}
+	if len(marks) != 2 {
+		t.Fatalf("marks = %#v, want one per blocked/failed result", marks)
+	}
+	for _, mark := range marks {
+		if mark["generation"] != float64(3) {
+			t.Fatalf("mark generation = %#v, want 3", mark["generation"])
+		}
+	}
+}
+
+func TestHTTPClientLinkedFollowupReportOmitsAttemptToken(t *testing.T) {
+	var request map[string]any
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		if err := json.Unmarshal(body, &request); err != nil {
+			t.Fatal(err)
+		}
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer server.Close()
+	client, err := NewClientWithLane(server.URL, "worker", "normal", "secret-token", time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	id := EncodeWorkID(Task{Type: "followup-pr", Issue: &Issue{ID: "issue-id", Repo: "acme/widgets", Number: 41}, PullRequest: &PullRequest{Repo: "acme/widgets", Number: 77}})
+	if err := client.Report(context.Background(), id, source.Lifecycle{Result: source.ResultReady}); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := request["prFixItem"]; ok {
+		t.Fatalf("linked-PR follow-up has no issued attempt, but report included prFixItem: %#v", request)
 	}
 }
 
