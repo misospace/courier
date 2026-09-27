@@ -273,9 +273,9 @@ type ProviderConfig struct {
 // for the rest; Capabilities advertises which are usable up front.
 // Repository is a provider-canonical repository identity and its default ref.
 type Repository struct {
-	ID           string
-	Canonical    string
-	DefaultRef   string
+	ID         string
+	Canonical  string
+	DefaultRef string
 }
 
 // RefState is the live state of an exact branch ref. Exists distinguishes an
