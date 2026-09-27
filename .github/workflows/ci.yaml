@@ -73,6 +73,8 @@ jobs:
 
   images-classify:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     outputs:
       images_required: ${{ steps.classify.outputs.images_required }}
     steps:
