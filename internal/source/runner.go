@@ -135,7 +135,7 @@ func (r *Runner) Poll(ctx context.Context) error {
 	for i := range runs.Items {
 		run := &runs.Items[i]
 		if run.Spec.Source == r.Config.Source && strings.TrimSpace(run.Spec.WorkItemID) != "" {
-			existing[workKey(run.Spec.Source, run.Spec.WorkItemID)] = struct{}{}
+			existing[workKey(run.Spec.Source, r.identity(run.Spec.WorkItemID))] = struct{}{}
 		}
 	}
 
@@ -147,7 +147,7 @@ func (r *Runner) Poll(ctx context.Context) error {
 		if strings.TrimSpace(item.ID) == "" {
 			continue
 		}
-		key := workKey(r.Config.Source, item.ID)
+		key := workKey(r.Config.Source, r.identity(item.ID))
 		if _, ok := existing[key]; ok {
 			continue
 		}
@@ -201,6 +201,17 @@ func (r *Runner) validate() error {
 		return errors.New("source runner: LaneProfile is required")
 	}
 	return nil
+}
+
+// identity is the dedupe identity of a work item ID: the adapter's, when it
+// defines one, otherwise the opaque ID itself.
+func (r *Runner) identity(workItemID string) string {
+	if identifier, ok := r.Adapter.(WorkIdentifier); ok {
+		if id := identifier.WorkIdentity(workItemID); id != "" {
+			return id
+		}
+	}
+	return workItemID
 }
 
 func workKey(sourceName, workItemID string) string {
