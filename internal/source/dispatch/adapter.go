@@ -61,6 +61,7 @@ type DispatchAdapter = Adapter
 var _ source.Adapter = (*Adapter)(nil)
 var _ source.Reporter = (*Adapter)(nil)
 var _ source.PreLauncher = (*Adapter)(nil)
+var _ source.WorkIdentifier = (*Adapter)(nil)
 
 // New creates a Dispatch adapter around an injected API client.
 func New(client Client) *Adapter {
@@ -75,6 +76,11 @@ func NewAdapter(client Client) *Adapter {
 
 // Discover returns Dispatch work that the operator can materialize as
 // CoderRuns. Discovery does not claim anything.
+// WorkIdentity implements source.WorkIdentifier.
+func (a *Adapter) WorkIdentity(workItemID string) string {
+	return WorkIdentity(workItemID)
+}
+
 func (a *Adapter) Discover(ctx context.Context) ([]source.WorkItem, error) {
 	if err := a.validateClient(); err != nil {
 		return nil, err
