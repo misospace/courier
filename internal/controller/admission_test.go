@@ -121,6 +121,58 @@ func TestReconcileAdmitsPendingRunAndClaimConsumesCapacity(t *testing.T) {
 	}
 }
 
+func TestReconcileSuspendedLaneAdmitsNothingNew(t *testing.T) {
+	lane := admissionLane("local", 2)
+	lane.Annotations = map[string]string{courierv1alpha1.SuspendAnnotation: "true"}
+	client := admissionClient(t, lane, admissionRun("waiting", "local", courierv1alpha1.PhasePending))
+	reconciler := admissionReconciler(client)
+
+	result, err := reconciler.Reconcile(context.Background(), admissionRequest("waiting"))
+	if err != nil {
+		t.Fatalf("Reconcile() error = %v", err)
+	}
+	if result.RequeueAfter != capacityRequeueDelay {
+		t.Fatalf("RequeueAfter = %v, want %v so the run is re-checked after the lane resumes", result.RequeueAfter, capacityRequeueDelay)
+	}
+	var run courierv1alpha1.CoderRun
+	if err := client.Get(context.Background(), admissionKey("waiting"), &run); err != nil {
+		t.Fatalf("get run: %v", err)
+	}
+	if run.Status.Phase != courierv1alpha1.PhasePending {
+		t.Fatalf("phase = %q, want Pending on a suspended lane", run.Status.Phase)
+	}
+
+	// Lifting the annotation lets the same run through.
+	if err := client.Get(context.Background(), admissionKey("local"), lane); err != nil {
+		t.Fatalf("get lane: %v", err)
+	}
+	lane.Annotations = nil
+	if err := client.Update(context.Background(), lane); err != nil {
+		t.Fatalf("resume lane: %v", err)
+	}
+	if _, err := reconciler.Reconcile(context.Background(), admissionRequest("waiting")); err != nil {
+		t.Fatalf("Reconcile() after resume error = %v", err)
+	}
+	if err := client.Get(context.Background(), admissionKey("waiting"), &run); err != nil {
+		t.Fatalf("get run: %v", err)
+	}
+	if run.Status.Phase != courierv1alpha1.PhaseClaimed {
+		t.Fatalf("phase after resume = %q, want Claimed", run.Status.Phase)
+	}
+}
+
+func TestLaneSuspendedOnlyForTrue(t *testing.T) {
+	for value, want := range map[string]bool{"true": true, " TRUE ": true, "false": false, "": false, "yes": false} {
+		lane := &courierv1alpha1.LaneProfile{ObjectMeta: metav1.ObjectMeta{Annotations: map[string]string{courierv1alpha1.SuspendAnnotation: value}}}
+		if got := lane.Suspended(); got != want {
+			t.Errorf("Suspended() with %q = %v, want %v", value, got, want)
+		}
+	}
+	if (&courierv1alpha1.LaneProfile{}).Suspended() {
+		t.Error("a lane without the annotation must not be suspended")
+	}
+}
+
 func TestReconcileTreatsEmptyPhaseAsPending(t *testing.T) {
 	client := admissionClient(t,
 		admissionLane("local", 1),

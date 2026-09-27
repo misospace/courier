@@ -89,6 +89,13 @@ checkpointing, liveness, contention, sources, and MCP surface.
   optional execution image. The seam that keeps Courier model- and
   toolchain-agnostic.
 
+To free a lane's models without killing work in progress, suspend it:
+
+```sh
+kubectl annotate laneprofile local courier.misospace.dev/suspend=true   # finish in-flight runs, take nothing new
+kubectl annotate laneprofile local courier.misospace.dev/suspend-        # resume
+```
+
 ## License
 
 Apache-2.0. See [LICENSE](./LICENSE).

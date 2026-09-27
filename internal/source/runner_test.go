@@ -124,6 +124,48 @@ func (a *identityAdapter) WorkIdentity(workItemID string) string {
 	return identity
 }
 
+func TestRunnerSkipsDiscoveryWhileLaneSuspended(t *testing.T) {
+	adapter := &testAdapter{items: []WorkItem{{ID: "opaque-a", Mode: "resolve-issue", Repo: "acme/widgets", Ref: 1}}}
+	lane := testLane()
+	lane.Annotations = map[string]string{courierv1alpha1.SuspendAnnotation: "true"}
+	kubeClient := newTestClient(t, lane)
+	runner := NewRunner(kubeClient, adapter, RunnerConfig{Source: "dispatch", LaneProfile: "local", Namespace: "courier"})
+
+	if err := runner.Poll(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if adapter.discoverCalls != 0 {
+		t.Fatalf("discover called %d times on a suspended lane, want 0", adapter.discoverCalls)
+	}
+	var runs courierv1alpha1.CoderRunList
+	if err := kubeClient.List(context.Background(), &runs, client.InNamespace("courier")); err != nil {
+		t.Fatal(err)
+	}
+	if len(runs.Items) != 0 {
+		t.Fatalf("created %d runs on a suspended lane, want 0", len(runs.Items))
+	}
+
+	if err := kubeClient.Get(context.Background(), client.ObjectKeyFromObject(lane), lane); err != nil {
+		t.Fatal(err)
+	}
+	delete(lane.Annotations, courierv1alpha1.SuspendAnnotation)
+	if err := kubeClient.Update(context.Background(), lane); err != nil {
+		t.Fatal(err)
+	}
+	if err := runner.Poll(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if adapter.discoverCalls != 1 {
+		t.Fatalf("discover called %d times after resume, want 1", adapter.discoverCalls)
+	}
+	if err := kubeClient.List(context.Background(), &runs, client.InNamespace("courier")); err != nil {
+		t.Fatal(err)
+	}
+	if len(runs.Items) != 1 {
+		t.Fatalf("created %d runs after resume, want 1", len(runs.Items))
+	}
+}
+
 func TestRunnerDoesNotClaimDuringDiscovery(t *testing.T) {
 	adapter := &testAdapter{items: []WorkItem{{ID: "opaque-a", Mode: "resolve-issue", Repo: "acme/widgets", Ref: 1}}}
 	kubeClient := newTestClient(t, testLane())

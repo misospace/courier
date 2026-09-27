@@ -1,6 +1,16 @@
 package v1alpha1
 
-import metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+import (
+	"strings"
+
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+)
+
+// SuspendAnnotation suspends a lane when set to "true" on its LaneProfile: the
+// lane's source runner takes no new work and its Pending runs wait, while runs
+// already admitted finish normally. It is an annotation so an operator can
+// toggle it with kubectl without contending with the manifest's owner.
+const SuspendAnnotation = "courier.misospace.dev/suspend"
 
 // LaneProfileSpec defines a reusable model ensemble and its runtime framing.
 // It is the seam that keeps Courier model-agnostic: roles may name cloud or
@@ -30,6 +40,7 @@ type LaneProfileSpec struct {
 
 // +kubebuilder:object:root=true
 // +kubebuilder:printcolumn:name="Concurrency",type=integer,JSONPath=`.spec.concurrency`
+// +kubebuilder:printcolumn:name="Suspended",type=string,JSONPath=`.metadata.annotations.courier\.misospace\.dev/suspend`
 // +kubebuilder:printcolumn:name="Age",type=date,JSONPath=`.metadata.creationTimestamp`
 
 // LaneProfile is a reusable model ensemble + framing referenced by CoderRuns.
@@ -51,4 +62,9 @@ type LaneProfileList struct {
 
 func init() {
 	SchemeBuilder.Register(&LaneProfile{}, &LaneProfileList{})
+}
+
+// Suspended reports whether the lane is suspended by SuspendAnnotation.
+func (l *LaneProfile) Suspended() bool {
+	return l != nil && strings.EqualFold(strings.TrimSpace(l.Annotations[SuspendAnnotation]), "true")
 }

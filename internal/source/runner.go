@@ -40,11 +40,12 @@ type RunnerConfig struct {
 // Runner polls a source and materializes source work as CoderRuns.
 type Runner struct {
 	client.Client
-	Scheme      *runtime.Scheme
-	Adapter     Adapter
-	Config      RunnerConfig
-	pollMu      sync.Mutex
-	laneWaiting bool
+	Scheme        *runtime.Scheme
+	Adapter       Adapter
+	Config        RunnerConfig
+	pollMu        sync.Mutex
+	laneWaiting   bool
+	laneSuspended bool
 }
 
 func NewRunner(c client.Client, adapter Adapter, config RunnerConfig) *Runner {
@@ -100,6 +101,18 @@ func (r *Runner) Poll(ctx context.Context) error {
 	if r.laneWaiting {
 		log.FromContext(ctx).Info("LaneProfile available, resuming source discovery", "laneProfile", r.Config.LaneProfile, "namespace", r.Config.Namespace)
 		r.laneWaiting = false
+	}
+	// A suspended lane takes no new work; runs it already admitted carry on.
+	if lane.Suspended() {
+		if !r.laneSuspended {
+			log.FromContext(ctx).Info("lane suspended, pausing source discovery", "laneProfile", r.Config.LaneProfile, "annotation", courierv1alpha1.SuspendAnnotation)
+			r.laneSuspended = true
+		}
+		return nil
+	}
+	if r.laneSuspended {
+		log.FromContext(ctx).Info("lane resumed, resuming source discovery", "laneProfile", r.Config.LaneProfile)
+		r.laneSuspended = false
 	}
 
 	items, err := r.Adapter.Discover(ctx)
