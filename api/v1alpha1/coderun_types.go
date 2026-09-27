@@ -106,9 +106,6 @@ type PublicationPolicy struct {
 	RunUID string `json:"runUID"`
 	// ProviderConfigRef identifies the administrator-configured forge provider.
 	ProviderConfigRef string `json:"providerConfigRef"`
-	// ControlPodUID binds trusted status/publication requests to the admitting
-	// control-pod incarnation.
-	ControlPodUID string `json:"controlPodUID"`
 	// BaseRepo is the provider-canonical repository receiving the pull request.
 	BaseRepo string `json:"baseRepo"`
 	// BaseRef is the exact base branch ref.

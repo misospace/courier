@@ -400,11 +400,11 @@ func (e *PolicyEngine) UpdateFixPR(ctx context.Context, update UpdatePullRequest
 	if err = e.checkDestination(work); err != nil {
 		return err
 	}
+	// checkPR enforces the exact live head (pr.HeadOID == work.OID) and that the
+	// head is an admitted or previously confirmed run tip, which is sufficient for
+	// metadata: a tip this run published is admitted, a foreign tip is not.
 	if err = e.checkPR(pr, work.OID); err != nil {
 		return err
-	}
-	if work.OID != p.HeadAnchorOID {
-		return errors.New("publication denied: PR metadata update requires the unchanged admitted head")
 	}
 	if err = e.observer.UpdatePullRequest(ctx, p.PRNumber, update); err != nil {
 		return errors.New("update pinned pull request failed")

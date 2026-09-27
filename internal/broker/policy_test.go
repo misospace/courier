@@ -239,6 +239,30 @@ func TestUpdateFixPRGuardsPinnedIdentity(t *testing.T) {
 	}
 }
 
+func TestUpdateFixPRAllowsConfirmedHeadAfterPublishAndRejectsForeignTip(t *testing.T) {
+	o := goodObserver(ModeFixPR)
+	w := &fakePusher{ancestor: true}
+	e := engine(t, goodPolicy(ModeFixPR), o, w)
+	// A successful publish advances the PR and work tips to "new" and confirms it.
+	w.afterPush = func() { o.work.OID = "new"; o.pr.HeadOID = "new" }
+	if _, err := e.Publish(context.Background(), PublicationRequest{RunUID: "uid-1", ExpectedWorkOID: "old", ProposedOID: "new"}); err != nil {
+		t.Fatalf("publish old->new failed: %v", err)
+	}
+	// Metadata update at the exact new PR/work tip must now succeed.
+	if err := e.UpdateFixPR(context.Background(), UpdatePullRequest{Title: "t2", Body: "b2"}); err != nil {
+		t.Fatalf("metadata update at confirmed new tip rejected: %v", err)
+	}
+	if o.updated.Title != "t2" || o.updated.Body != "b2" {
+		t.Fatalf("pinned PR was not updated: %#v", o.updated)
+	}
+	// A foreign tip this run never published is not admitted.
+	o.work.OID = "foreign"
+	o.pr.HeadOID = "foreign"
+	if err := e.UpdateFixPR(context.Background(), UpdatePullRequest{Title: "x"}); err == nil {
+		t.Fatal("accepted foreign head for metadata update")
+	}
+}
+
 func TestNewEngineFailsClosedOnMissingCapabilityAndBadPolicy(t *testing.T) {
 	if _, err := NewPolicyEngine(goodPolicy(ModeFixPR), goodObserver(ModeFixPR), nil); err == nil {
 		t.Fatal("missing pusher accepted")

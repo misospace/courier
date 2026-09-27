@@ -286,11 +286,6 @@ spec:
                     description: BaseRepo is the provider-canonical repository receiving
                       the pull request.
                     type: string
-                  controlPodUID:
-                    description: |-
-                      ControlPodUID binds trusted status/publication requests to the admitting
-                      control-pod incarnation.
-                    type: string
                   headAnchorOID:
                     description: |-
                       HeadAnchorOID is the fix-pr head OID observed at admission. It is an
@@ -325,7 +320,6 @@ spec:
                 - baseOID
                 - baseRef
                 - baseRepo
-                - controlPodUID
                 - providerConfigRef
                 - runUID
                 - workInitiallyAbsent
