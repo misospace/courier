@@ -399,6 +399,22 @@ func run(ctx context.Context, stdout, stderr io.Writer) int {
 	}
 	switch workState {
 	case git.WorkStateCommitted:
+		// The run branch's own ref, not where HEAD happens to point, is the
+		// world: committed work counts only when it is reachable from the run
+		// branch. A branch-read error must not fail the run: liveness over
+		// strictness, so an unreadable ref falls through to the success path.
+		ahead, branchErr := workspace.CommitsOnBranchSince(ctx, cfg.Branch, startCommit)
+		if branchErr == nil && ahead == 0 {
+			// Committed work is not on the run branch. Report it specifically so the
+			// operator does not later read an empty run branch as "no work".
+			whereClause := "a detached HEAD"
+			if cb, err := workspace.CurrentBranch(ctx); err == nil && cb != "" {
+				whereClause = fmt.Sprintf("branch %q", cb)
+			}
+			reason := fmt.Sprintf("opencode committed work that is not on the run branch %q (HEAD is on %s); the run branch has no new commits", cfg.Branch, whereClause)
+			report.terminate(termination{Phase: "NeedsHuman", Result: "needs-human", ExitCode: exitNeedsHuman, Reason: reason})
+			return exitNeedsHuman
+		}
 		report.terminate(termination{Phase: "Verifying", Result: "success", ExitCode: exitSuccess, Reason: "opencode completed with committed work"})
 		return exitSuccess
 	case git.WorkStateDirty:

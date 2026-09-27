@@ -521,6 +521,48 @@ func TestGoalCarriesCoordinatorCompletionContract(t *testing.T) {
 	}
 }
 
+func TestGoalNamesRunBranchAsOnlyPublicationTarget(t *testing.T) {
+	run := &courierv1alpha1.CoderRun{
+		Spec: courierv1alpha1.CoderRunSpec{
+			Mode: courierv1alpha1.ModeResolveIssue,
+			Ref:  7,
+		},
+		Status: courierv1alpha1.CoderRunStatus{Branch: "courier/acme/widgets/issue-7"},
+	}
+	goal, err := Goal(run)
+	if err != nil {
+		t.Fatalf("Goal() error = %v", err)
+	}
+	for _, fragment := range []string{
+		"courier/acme/widgets/issue-7",
+		"Publish only to the run branch",
+		"The run branch is courier/acme/widgets/issue-7.",
+		"you own completion",
+		"open or update the pull request",
+	} {
+		if !strings.Contains(goal, fragment) {
+			t.Fatalf("goal %q missing fragment %q", goal, fragment)
+		}
+	}
+	if forgeCLINames.MatchString(goal) {
+		t.Fatalf("goal %q references a forge-specific CLI", goal)
+	}
+
+	noBranch := &courierv1alpha1.CoderRun{
+		Spec: courierv1alpha1.CoderRunSpec{
+			Mode: courierv1alpha1.ModeResolveIssue,
+			Ref:  7,
+		},
+	}
+	goal, err = Goal(noBranch)
+	if err != nil {
+		t.Fatalf("Goal() error = %v", err)
+	}
+	if strings.Contains(goal, "The run branch is") {
+		t.Fatalf("goal %q names a run branch when none is set", goal)
+	}
+}
+
 func TestBuildCoordinatorPodWiresRolesAndMCPConfig(t *testing.T) {
 	run := &courierv1alpha1.CoderRun{
 		ObjectMeta: metav1.ObjectMeta{Name: "run-mcp", Namespace: "courier-system"},
