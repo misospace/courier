@@ -1,5 +1,79 @@
 # Changelog
 
+## [0.1.2](https://github.com/misospace/courier/compare/v0.1.1...v0.1.2) (2026-09-27)
+
+
+### Features
+
+* add liveness reap and crashloop backstop ([47cdc48](https://github.com/misospace/courier/commit/47cdc48af9fa7fc5747508017aabfb987788bae7))
+* add liveness reap and crashloop backstop ([9328efb](https://github.com/misospace/courier/commit/9328efbac0920ab805aca86e1cc8ccc5a7f115b9))
+
+
+### Bug Fixes
+
+* bound crashloop counter to consecutive wedges and harden liveness reap ([f726390](https://github.com/misospace/courier/commit/f7263902ddbe98b4e56ee347fa7ef2870bb5dcdc))
+* continue the coordinator loop when a tool call is denied ([e4a05c5](https://github.com/misospace/courier/commit/e4a05c58db1f72036f6f1f5aa431d8307a49c8aa))
+* continue the coordinator loop when a tool call is denied ([a4817c1](https://github.com/misospace/courier/commit/a4817c1f867fea9306ed226ef44a03cd369c725c))
+* **deps:** update kubernetes monorepo (v0.37.0 → v0.37.1) ([a4937a1](https://github.com/misospace/courier/commit/a4937a17ddbbc948e86fe4be1a617f8eceb106f4))
+* **deps:** update kubernetes monorepo (v0.37.0 → v0.37.1) ([a0793d4](https://github.com/misospace/courier/commit/a0793d4e733948f2dd52ca108a3d1c4678eea8bb))
+* **dispatch:** echo the issued PR-fix attempt token in reports and marks ([34eb300](https://github.com/misospace/courier/commit/34eb3007e27cacadbabb631d15111119bf29658a))
+* **dispatch:** echo the issued PR-fix attempt token in reports and marks ([14a9268](https://github.com/misospace/courier/commit/14a9268fceb77c7f631ee04ec65f247e0b4866e7))
+* end a run Done when its PR is merged mid-run ([9f6bb9f](https://github.com/misospace/courier/commit/9f6bb9f33acdec130d1254dfe75a0267010508a1))
+* end a run Done when its PR is merged mid-run ([10067ef](https://github.com/misospace/courier/commit/10067efebc94458e904175949165162ef5faaee0))
+* finish fork head handling in fix-pr runs ([88e74ab](https://github.com/misospace/courier/commit/88e74ab23d0d39cbcfdaf19ecf14f79a0f71d23c))
+* gate source discovery on LaneProfile readiness ([fa11e9d](https://github.com/misospace/courier/commit/fa11e9de6aab86061c71a6db31251efa896ce262))
+* gate source discovery on LaneProfile readiness ([7cf9c0c](https://github.com/misospace/courier/commit/7cf9c0c96deedf571f248e1657142bbf407968cc))
+* hand base-sync merge conflicts to the coordinator ([32d5d33](https://github.com/misospace/courier/commit/32d5d3381896de1764a3d48b15cccb5791f310ae))
+* hand base-sync merge conflicts to the coordinator ([cbbf4ae](https://github.com/misospace/courier/commit/cbbf4ae62e348afdae30184eda25602a8bb0909c))
+* honor fork head repositories in fix-pr checkouts ([64a0520](https://github.com/misospace/courier/commit/64a05200fec2c88747c95dd1b86433c8507c7e79))
+* honor fork head repositories in fix-pr checkouts ([f248752](https://github.com/misospace/courier/commit/f248752474485f0424cea6c42f96f244a4500836))
+* keep runtime artifacts out of checkout and classify committed work ([39d5fd7](https://github.com/misospace/courier/commit/39d5fd7ca4ccd3376c44313142da0bd933c34c84))
+* keep runtime artifacts out of checkout and classify committed work ([f4fc19e](https://github.com/misospace/courier/commit/f4fc19eb8eaabd811ca2e428e0d18a7e1bf8fc77))
+* log terminal PR enrichment misses and clarify test name ([8842a86](https://github.com/misospace/courier/commit/8842a86745dd24431823dd96fc67c9d85bfcc8cf))
+* log terminal PR enrichment misses and clarify test name ([8cd7dea](https://github.com/misospace/courier/commit/8cd7deaef444c385e669924ee3eda77142233980))
+* parse real opencode mcp list output in capability preflight ([cfef5d3](https://github.com/misospace/courier/commit/cfef5d30c95343452d66806c367539398034c3bf))
+* provision narrowly permitted per-run scratch for OpenCode ([a3df7be](https://github.com/misospace/courier/commit/a3df7be1b09a9f5b37fcc6a85c4bd5cb97fb9acc))
+* provision narrowly permitted per-run scratch for OpenCode ([1b21579](https://github.com/misospace/courier/commit/1b21579c7446874d73da768c4946a171c6fad54b))
+* reconcile observed PR into terminal CoderRun status ([96b5966](https://github.com/misospace/courier/commit/96b59664b3ff4057e1a8ead0d068ab0472bb48f1))
+* reconcile observed PR into terminal CoderRun status ([2696dae](https://github.com/misospace/courier/commit/2696dae0ef60b0606c1a66bc55d00d77df688aab)), closes [#103](https://github.com/misospace/courier/issues/103)
+* report an existing open PR for review instead of blocking ([1020b42](https://github.com/misospace/courier/commit/1020b42e2197416110e26aff583c86a667efb641))
+* report an existing open PR for review instead of blocking ([516260c](https://github.com/misospace/courier/commit/516260cf470972446dc9cd52ad3a10c93515d0a5)), closes [#135](https://github.com/misospace/courier/issues/135)
+* report work committed off the run branch as needs-human ([aa357c9](https://github.com/misospace/courier/commit/aa357c9b7a221ad2a4e44c4c8854b00db8cf38bc))
+* report work committed off the run branch as needs-human ([a4ae503](https://github.com/misospace/courier/commit/a4ae503ebc09b1d1d1b5bfebed64b6cb0c3625b7))
+* restore blocker diagnosis in fix-pr goal ([d2d6036](https://github.com/misospace/courier/commit/d2d60367c50d2331295e19f879bbc9a7bcc3c989))
+* retain coordinator ownership of completion and forge publication ([4f6045f](https://github.com/misospace/courier/commit/4f6045f33c1f3a55f5b9bb1ca898ee3b413437e6))
+* retain coordinator ownership of completion and forge publication ([51d7e5b](https://github.com/misospace/courier/commit/51d7e5b3570b5767c0d3bf936235161b257f42c3)), closes [#90](https://github.com/misospace/courier/issues/90)
+* sanitize MCP capability names and preserve status-word servers ([e999f3b](https://github.com/misospace/courier/commit/e999f3ba93bfc08bb73db2df51bfa348fba855c7))
+* **source:** edge-trigger lane-waiting log to prevent steady-state noise ([d108fb7](https://github.com/misospace/courier/commit/d108fb71ae72fd08879ed42e8db089e0d3b486ed))
+* surface configured MCP servers that fail to connect at coordinator start ([f6955c9](https://github.com/misospace/courier/commit/f6955c97ae3626081ff13a76ff41605d4f3d94d5))
+* surface configured MCP servers that fail to connect at coordinator start ([17a86d0](https://github.com/misospace/courier/commit/17a86d0a975ab94da745351fe3df38e2ac18eee1)), closes [#101](https://github.com/misospace/courier/issues/101)
+
+
+### Chores
+
+* release 0.1.2 ([783991d](https://github.com/misospace/courier/commit/783991d7b1f437188a3d9f45177201140166bbcd))
+* release 0.1.2 ([2528cb1](https://github.com/misospace/courier/commit/2528cb1ab1c1c363673ecf00b45cd72083131fea))
+
+
+### Documentation
+
+* decompose [#109](https://github.com/misospace/courier/issues/109) into scratch and recovery work ([0dbf96b](https://github.com/misospace/courier/commit/0dbf96b884742e62c584ec42beede85d5b62001e))
+* define Dispatch follow-up attempt ownership ([6915baa](https://github.com/misospace/courier/commit/6915baac7576907e37d00298578c3bb4d1a09bed))
+* **harness:** define trusted run boundary ([92830fd](https://github.com/misospace/courier/commit/92830fd1aa9baa78a415820c12275db00aba803c))
+* **harness:** define trusted run boundary ([6254ece](https://github.com/misospace/courier/commit/6254ece3e06b04c75ada86d69d28eb14fcae953e))
+* **harness:** fence concurrent tool activity ([318a70e](https://github.com/misospace/courier/commit/318a70e53e22fcfcd024fd6521c7c59716367a9f))
+* **harness:** pin run publication policy ([bd0d41c](https://github.com/misospace/courier/commit/bd0d41c664ee85a0b14d7d9d4fff51d162d2bd18))
+* **harness:** pin run publication policy ([123a7a0](https://github.com/misospace/courier/commit/123a7a0237a3c2aa1d912b6f1ee0b1fa7023ab57))
+* **harness:** preserve fork and broker choices ([b817bd3](https://github.com/misospace/courier/commit/b817bd3e064e5ba7bc44cb428c18de944aefdf03))
+* **harness:** settle [#119](https://github.com/misospace/courier/issues/119) long-tool liveness design ([5e2b03d](https://github.com/misospace/courier/commit/5e2b03d3e4003ecb33c1d36b63c1b43dda26a11b))
+* **harness:** settle long-tool liveness contract ([7e10dc0](https://github.com/misospace/courier/commit/7e10dc07144fc53b314dc39a0273857701d98ada))
+* **harness:** settle run identity and egress ([8809b5f](https://github.com/misospace/courier/commit/8809b5f9e3848ad851559540f2ce5cfec83a704b))
+* **harness:** settle run identity and egress ([57284fa](https://github.com/misospace/courier/commit/57284fa1ac7481e0f7f35a630361e165401e44bb))
+* keep DESIGN.md current + seed a Decisions log ([e2e02e3](https://github.com/misospace/courier/commit/e2e02e307d69da805cbaa598602679670769dbb0))
+* keep DESIGN.md current + seed a Decisions log ([894c8ab](https://github.com/misospace/courier/commit/894c8abd9b908d57e8eb2383ded03c18a22eb6b4))
+* settle Dispatch follow-up attempt lifecycle ([#98](https://github.com/misospace/courier/issues/98)) ([74ccfaf](https://github.com/misospace/courier/commit/74ccfaf14504a3b384a32cc04e04b003c3ea1421))
+* split scratch permission fix from failure recovery design ([29df9b1](https://github.com/misospace/courier/commit/29df9b163da5773010ce785402adc89fc90d6542))
+
 ## [0.1.1](https://github.com/misospace/courier/compare/v0.1.0...v0.1.1) (2026-09-22)
 
 
