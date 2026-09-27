@@ -111,6 +111,24 @@ type RepoOwner struct {
 	Login string `json:"login,omitempty"`
 }
 
+// Repository is the authoritative repository metadata GitHub returns.
+type Repository struct {
+	ID            int64  `json:"id"`
+	FullName      string `json:"full_name"`
+	DefaultBranch string `json:"default_branch"`
+	Permissions   *struct {
+		Push bool `json:"push"`
+	} `json:"permissions"`
+}
+
+// GitRef is a branch ref returned by GitHub's git database API.
+type GitRef struct {
+	Ref    string `json:"ref"`
+	Object struct {
+		SHA string `json:"sha"`
+	} `json:"object"`
+}
+
 // CreatePullRequestRequest is the payload for creating a pull request.
 type CreatePullRequestRequest struct {
 	Title string `json:"title"`
@@ -227,6 +245,52 @@ func (c *Client) AddComment(ctx context.Context, owner, repo string, number int,
 // CommentPR is a short alias for AddComment.
 func (c *Client) CommentPR(ctx context.Context, owner, repo string, number int, body string) (Comment, error) {
 	return c.AddComment(ctx, owner, repo, number, body)
+}
+
+// GetPullRequest reads the current pull request from GitHub.
+func (c *Client) GetRepository(ctx context.Context, owner, repo string) (Repository, error) {
+	var out Repository
+	err := c.doJSON(ctx, http.MethodGet, repoEndpoint(owner, repo), nil, &out)
+	if err != nil {
+		return Repository{}, err
+	}
+	return out, nil
+}
+
+// GetBranchRef reads an exact branch ref and its current object OID.
+func (c *Client) GetBranchRef(ctx context.Context, owner, repo, branch string) (GitRef, error) {
+	var out GitRef
+	err := c.doJSON(ctx, http.MethodGet, repoEndpoint(owner, repo, "git", "ref", "heads", branch), nil, &out)
+	if err != nil {
+		return GitRef{}, err
+	}
+	return out, nil
+}
+
+// GetEffectiveBranchRules reads GitHub's computed rules for a branch. The
+// branch-rules endpoint includes classic branch protection and applicable
+// rulesets; unlike querying only branch protection, it does not silently miss
+// rulesets. A 404 means no effective rules only on GitHub versions that expose
+// this endpoint; callers treat all other failures as unknown.
+func (c *Client) GetEffectiveBranchRules(ctx context.Context, owner, repo, branch string) ([]json.RawMessage, error) {
+	var out []json.RawMessage
+	err := c.doJSON(ctx, http.MethodGet, repoEndpoint(owner, repo, "rules", "branches", branch), nil, &out)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+// GetBranchProtection reads classic branch protection. GitHub returns 404 both
+// for an unprotected branch and for inaccessible resources, so callers must
+// not interpret that response as proof of no protection.
+func (c *Client) GetBranchProtection(ctx context.Context, owner, repo, branch string) (json.RawMessage, error) {
+	var out json.RawMessage
+	err := c.doJSON(ctx, http.MethodGet, repoEndpoint(owner, repo, "branches", branch, "protection"), nil, &out)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
 }
 
 // GetPullRequest reads the current pull request from GitHub.

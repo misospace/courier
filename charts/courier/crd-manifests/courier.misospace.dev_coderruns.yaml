@@ -271,6 +271,61 @@ spec:
                 description: PR is the pull request opened by this run (number or
                   URL).
                 type: string
+              publicationPolicy:
+                description: |-
+                  PublicationPolicy is the immutable destination resolved by the operator
+                  before launch. Its RunUID must match this object's current UID.
+                properties:
+                  baseOID:
+                    description: BaseOID is the base ref tip observed at admission.
+                    type: string
+                  baseRef:
+                    description: BaseRef is the exact base branch ref.
+                    type: string
+                  baseRepo:
+                    description: BaseRepo is the provider-canonical repository receiving
+                      the pull request.
+                    type: string
+                  headAnchorOID:
+                    description: |-
+                      HeadAnchorOID is the fix-pr head OID observed at admission. It is an
+                      ownership anchor, not a frozen tip.
+                    type: string
+                  prNumber:
+                    description: PRNumber is set for fix-pr runs only.
+                    type: integer
+                  providerConfigRef:
+                    description: ProviderConfigRef identifies the administrator-configured
+                      forge provider.
+                    type: string
+                  runUID:
+                    description: RunUID binds this policy to one CoderRun incarnation.
+                    type: string
+                  workInitiallyAbsent:
+                    description: WorkInitiallyAbsent distinguishes an absent ref from
+                      one with a tip at admission.
+                    type: boolean
+                  workOID:
+                    description: WorkOID is the admission tip when the work ref already
+                      existed.
+                    type: string
+                  workRef:
+                    description: WorkRef is the exact publication branch ref.
+                    type: string
+                  workRepo:
+                    description: WorkRepo is the provider-canonical repository that
+                      owns the writable ref.
+                    type: string
+                required:
+                - baseOID
+                - baseRef
+                - baseRepo
+                - providerConfigRef
+                - runUID
+                - workInitiallyAbsent
+                - workRef
+                - workRepo
+                type: object
               restarts:
                 description: |-
                   Restarts counts infra relaunches (the crashloop backstop), not work

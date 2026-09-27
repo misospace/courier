@@ -99,11 +99,47 @@ type Heartbeat struct {
 	Kind string `json:"kind"`
 }
 
+// PublicationPolicy is the operator-resolved destination for one run. It is
+// bound to the CoderRun UID and must not be reconstructed from mutable status.
+type PublicationPolicy struct {
+	// RunUID binds this policy to one CoderRun incarnation.
+	RunUID string `json:"runUID"`
+	// ProviderConfigRef identifies the administrator-configured forge provider.
+	ProviderConfigRef string `json:"providerConfigRef"`
+	// BaseRepo is the provider-canonical repository receiving the pull request.
+	BaseRepo string `json:"baseRepo"`
+	// BaseRef is the exact base branch ref.
+	BaseRef string `json:"baseRef"`
+	// BaseOID is the base ref tip observed at admission.
+	BaseOID string `json:"baseOID"`
+	// WorkRepo is the provider-canonical repository that owns the writable ref.
+	WorkRepo string `json:"workRepo"`
+	// WorkRef is the exact publication branch ref.
+	WorkRef string `json:"workRef"`
+	// WorkInitiallyAbsent distinguishes an absent ref from one with a tip at admission.
+	WorkInitiallyAbsent bool `json:"workInitiallyAbsent"`
+	// WorkOID is the admission tip when the work ref already existed.
+	// +optional
+	WorkOID string `json:"workOID,omitempty"`
+	// PRNumber is set for fix-pr runs only.
+	// +optional
+	PRNumber int `json:"prNumber,omitempty"`
+	// HeadAnchorOID is the fix-pr head OID observed at admission. It is an
+	// ownership anchor, not a frozen tip.
+	// +optional
+	HeadAnchorOID string `json:"headAnchorOID,omitempty"`
+}
+
 // CoderRunStatus is the observed state of a CoderRun.
 type CoderRunStatus struct {
 	// Phase is the current lifecycle phase.
 	// +optional
 	Phase Phase `json:"phase,omitempty"`
+
+	// PublicationPolicy is the immutable destination resolved by the operator
+	// before launch. Its RunUID must match this object's current UID.
+	// +optional
+	PublicationPolicy *PublicationPolicy `json:"publicationPolicy,omitempty"`
 
 	// Branch is the observed work branch. Resolve-issue runs derive it from the
 	// repository and issue; fix-pr runs adopt the branch attached to the PR.

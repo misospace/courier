@@ -231,6 +231,77 @@ func TestProviderMissingHeadRepository(t *testing.T) {
 	}
 }
 
+func TestProviderRepositoryPolicyReadsFailClosed(t *testing.T) {
+	var paths []string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		paths = append(paths, r.URL.Path)
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/repos/acme/demo", "/repos/Acme/Demo":
+			_, _ = io.WriteString(w, `{"id":123,"full_name":"Acme/Demo","default_branch":"main","permissions":{"push":true}}`)
+		case "/repos/Acme/Demo/git/ref/heads/main":
+			_, _ = io.WriteString(w, `{"ref":"refs/heads/main","object":{"sha":"deadbeef"}}`)
+		case "/repos/Acme/Demo/rules/branches/main":
+			_, _ = io.WriteString(w, `[{"type":"required_status_checks"}]`)
+		case "/repos/Acme/Demo/branches/main/protection":
+			_, _ = io.WriteString(w, `{}`)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+	client, err := NewClient(server.URL, "secret")
+	if err != nil {
+		t.Fatal(err)
+	}
+	p := NewProvider(forge.ProviderConfig{}, client)
+	ctx := context.Background()
+	repository, err := p.ResolveRepository(ctx, "acme/demo")
+	if err != nil || repository.ID != "123" || repository.Canonical != "Acme/Demo" || repository.DefaultRef != "main" {
+		t.Fatalf("ResolveRepository() = %#v, %v", repository, err)
+	}
+	ref, err := p.ReadRef(ctx, repository, "main")
+	if err != nil || !ref.Exists || ref.OID != "deadbeef" || ref.Ref != "main" {
+		t.Fatalf("ReadRef() = %#v, %v (requests %v)", ref, err, paths)
+	}
+	protection, err := p.ReadEffectiveProtection(ctx, repository, "main")
+	if err != nil || !protection.Protected {
+		t.Fatalf("ReadEffectiveProtection() = %#v, %v", protection, err)
+	}
+	writable, err := p.CanWriteRepository(ctx, repository)
+	if err != nil || !writable {
+		t.Fatalf("CanWriteRepository() = %v, %v", writable, err)
+	}
+	if len(paths) != 4 {
+		t.Fatalf("requests = %v, want repository, ref, rules, and permissions reads", paths)
+	}
+}
+
+func TestProviderProtectionEstablishesUnprotectedOnlyFromBothAPIs(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/repos/acme/demo/rules/branches/main":
+			_, _ = io.WriteString(w, `[]`)
+		case "/repos/acme/demo/branches/main/protection":
+			w.WriteHeader(http.StatusNotFound)
+			_, _ = io.WriteString(w, `{"message":"Not Found"}`)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+	client, err := NewClient(server.URL, "token")
+	if err != nil {
+		t.Fatal(err)
+	}
+	p := NewProvider(forge.ProviderConfig{}, client)
+	_, err = p.ReadEffectiveProtection(context.Background(), forge.Repository{Canonical: "acme/demo"}, "main")
+	if err != nil {
+		t.Fatalf("ReadEffectiveProtection() error = %v, want authoritative unprotected result", err)
+	}
+}
+
 func TestProviderUnsupportedOperations(t *testing.T) {
 	p := NewProvider(forge.ProviderConfig{Name: "gh"}, nil)
 	ctx := context.Background()
