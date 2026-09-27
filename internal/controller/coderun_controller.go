@@ -418,7 +418,12 @@ func (r *CoderRunReconciler) enrichTerminalPR(ctx context.Context, run *courierv
 		return pr
 	}
 	observation, err := r.Observer.Observe(ctx, run.Spec.Repo, run.Status.Branch)
-	if err != nil || observation.PR == "" {
+	if err != nil {
+		log.FromContext(ctx).V(1).Info("terminal PR enrichment skipped; observation failed",
+			"repo", run.Spec.Repo, "branch", run.Status.Branch, "pr", pr, "error", err.Error())
+		return pr
+	}
+	if observation.PR == "" {
 		return pr
 	}
 	return observation.PR
