@@ -412,6 +412,10 @@ func TestRunningPodExitMapsPhaseAndSourceState(t *testing.T) {
 	}{
 		{name: "success", exitCode: 0, wantPhase: courierv1alpha1.PhaseVerifying},
 		{name: "needs-human", exitCode: 2, wantPhase: courierv1alpha1.PhaseNeedsHuman, wantSource: source.StateNeedsHuman},
+		// no_change_needed (issue #169): the coordinator declared the work
+		// already done, so the run is Done. Like the merged mid-run case, Done
+		// records no source Transition — the source is resolved later.
+		{name: "no-change-needed", exitCode: 3, wantPhase: courierv1alpha1.PhaseDone},
 		{name: "failure", exitCode: 17, wantPhase: courierv1alpha1.PhaseFailed, wantSource: source.StateNeedsHuman},
 	}
 	for _, tt := range tests {
@@ -1020,6 +1024,41 @@ func TestDoneRunResolvesSourceWorkItem(t *testing.T) {
 	}
 	if _, err := reconciler.Reconcile(context.Background(), admissionRequest("run")); err != nil {
 		t.Fatalf("Reconcile() error = %v", err)
+	}
+	if len(item.resolved) != 1 || item.resolved[0] != "run" {
+		t.Fatalf("resolved IDs = %#v, want run", item.resolved)
+	}
+}
+
+// TestExit3NoChangeNeededResolvesSourceWorkItem checks the full no_change_needed
+// path (issue #169): a coordinator that exits 3 terminalizes the run Done with
+// no source Transition, and the follow-up reconcile resolves the source work
+// item.
+func TestExit3NoChangeNeededResolvesSourceWorkItem(t *testing.T) {
+	item := &admissionSource{}
+	run := admissionRun("run", "local", courierv1alpha1.PhaseRunning)
+	client := phaseClient(t, run, coordinatorPod(run, 3))
+	reconciler := &CoderRunReconciler{
+		Client:       client,
+		Sources:      NewSourceRegistry(map[string]source.Adapter{"test": item}),
+		StatusWriter: fakeStatusWriter{client: client},
+	}
+	if _, err := reconciler.Reconcile(context.Background(), admissionRequest("run")); err != nil {
+		t.Fatalf("Reconcile() error = %v", err)
+	}
+	var done courierv1alpha1.CoderRun
+	if err := client.Get(context.Background(), admissionKey("run"), &done); err != nil {
+		t.Fatalf("get run: %v", err)
+	}
+	if done.Status.Phase != courierv1alpha1.PhaseDone {
+		t.Fatalf("phase = %q, want Done", done.Status.Phase)
+	}
+	if len(item.transitions) != 0 {
+		t.Fatalf("source transitions = %#v, want none: no_change_needed is not a case for a human", item.transitions)
+	}
+	// The follow-up reconcile resolves the source work item for the Done run.
+	if _, err := reconciler.Reconcile(context.Background(), admissionRequest("run")); err != nil {
+		t.Fatalf("second Reconcile() error = %v", err)
 	}
 	if len(item.resolved) != 1 || item.resolved[0] != "run" {
 		t.Fatalf("resolved IDs = %#v, want run", item.resolved)

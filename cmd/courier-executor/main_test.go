@@ -13,6 +13,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/misospace/courier/internal/executor"
@@ -324,7 +325,7 @@ func TestRunAbandonedConflictMergeBecomesNeedsHuman(t *testing.T) {
 	}
 }
 
-func TestRunExitZeroWithoutLocalWorkBecomesNeedsHuman(t *testing.T) {
+func TestRunExitZeroWithoutLocalWorkBecomesFailed(t *testing.T) {
 	root := t.TempDir()
 	remote := remoteWithExistingBranch(t, root)
 	fakeOpenCode := filepath.Join(root, "opencode")
@@ -338,15 +339,58 @@ func TestRunExitZeroWithoutLocalWorkBecomesNeedsHuman(t *testing.T) {
 
 	var output bytes.Buffer
 	var errorsOut bytes.Buffer
-	if code := run(context.Background(), &output, &errorsOut); code != exitNeedsHuman {
-		t.Fatalf("run exit code = %d, want %d; stderr=%q stdout=%q", code, exitNeedsHuman, errorsOut.String(), output.String())
+	if code := run(context.Background(), &output, &errorsOut); code != exitFailed {
+		t.Fatalf("run exit code = %d, want %d; stderr=%q stdout=%q", code, exitFailed, errorsOut.String(), output.String())
 	}
-	if !strings.Contains(output.String(), "without producing a commit or workspace changes") {
+	if !strings.Contains(output.String(), `"phase":"Failed"`) {
+		t.Fatalf("no-op phase = %q", output.String())
+	}
+	if !strings.Contains(output.String(), "without declaring an outcome and produced no commit or workspace changes") {
 		t.Fatalf("no-op reason = %q", output.String())
 	}
 }
 
-func TestRunExitZeroWithDirtyWorkBecomesNeedsHuman(t *testing.T) {
+// TestRunStaleCommittedOutcomeBecomesFailed is the adopted-branch case: the
+// work branch already carries a committed .courier/outcome.json from an
+// earlier run. The slate reset must drop it, so a coordinator that declares
+// nothing and produces no work ends Failed, not Done on the stale file.
+func TestRunStaleCommittedOutcomeBecomesFailed(t *testing.T) {
+	root := t.TempDir()
+	remote := remoteWithExistingBranch(t, root)
+	orphan := filepath.Join(root, "orphan")
+	if err := os.MkdirAll(filepath.Join(orphan, ".courier"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	write(t, filepath.Join(orphan, ".courier", "outcome.json"), `{"outcome":"no_change_needed","evidence":"stale"}`)
+	commit(t, orphan, "work: stale declaration")
+	runGit(t, orphan, "push", "origin", "HEAD:refs/heads/courier/resolve-issue/acme-widgets/7")
+
+	fakeOpenCode := filepath.Join(root, "opencode")
+	writeExecutable(t, fakeOpenCode, "#!/bin/sh\ncase \"$1\" in mcp) exit 0;; esac\nexit 0\n")
+	prServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `[]`)
+	}))
+	defer prServer.Close()
+	setResolveIssueEnv(t, root, remote, prServer.URL, fakeOpenCode)
+
+	var output bytes.Buffer
+	var errorsOut bytes.Buffer
+	if code := run(context.Background(), &output, &errorsOut); code != exitFailed {
+		t.Fatalf("run exit code = %d, want %d; stderr=%q stdout=%q", code, exitFailed, errorsOut.String(), output.String())
+	}
+	if !strings.Contains(output.String(), `"phase":"Failed"`) {
+		t.Fatalf("stale-declaration phase = %q", output.String())
+	}
+	if !strings.Contains(output.String(), "without declaring an outcome") {
+		t.Fatalf("stale-declaration reason = %q", output.String())
+	}
+	if strings.Contains(output.String(), `"phase":"Done"`) {
+		t.Fatalf("stale committed declaration must not end the run Done: %q", output.String())
+	}
+}
+
+func TestRunExitZeroWithDirtyWorkBecomesFailed(t *testing.T) {
 	root := t.TempDir()
 	remote := remoteWithExistingBranch(t, root)
 	fakeOpenCode := filepath.Join(root, "opencode")
@@ -360,15 +404,18 @@ func TestRunExitZeroWithDirtyWorkBecomesNeedsHuman(t *testing.T) {
 
 	var output bytes.Buffer
 	var errorsOut bytes.Buffer
-	if code := run(context.Background(), &output, &errorsOut); code != exitNeedsHuman {
-		t.Fatalf("run exit code = %d, want %d; stderr=%q stdout=%q", code, exitNeedsHuman, errorsOut.String(), output.String())
+	if code := run(context.Background(), &output, &errorsOut); code != exitFailed {
+		t.Fatalf("run exit code = %d, want %d; stderr=%q stdout=%q", code, exitFailed, errorsOut.String(), output.String())
+	}
+	if !strings.Contains(output.String(), `"phase":"Failed"`) {
+		t.Fatalf("dirty-work phase = %q", output.String())
 	}
 	if !strings.Contains(output.String(), "uncommitted workspace changes") {
 		t.Fatalf("dirty-work reason = %q", output.String())
 	}
 }
 
-func TestRunCommittedWorkOnWrongBranchBecomesNeedsHuman(t *testing.T) {
+func TestRunCommittedWorkOnWrongBranchBecomesFailed(t *testing.T) {
 	root := t.TempDir()
 	remote := remoteWithExistingBranch(t, root)
 	fakeOpenCode := filepath.Join(root, "opencode")
@@ -382,8 +429,11 @@ func TestRunCommittedWorkOnWrongBranchBecomesNeedsHuman(t *testing.T) {
 
 	var output bytes.Buffer
 	var errorsOut bytes.Buffer
-	if code := run(context.Background(), &output, &errorsOut); code != exitNeedsHuman {
-		t.Fatalf("run exit code = %d, want %d; stderr=%q stdout=%q", code, exitNeedsHuman, errorsOut.String(), output.String())
+	if code := run(context.Background(), &output, &errorsOut); code != exitFailed {
+		t.Fatalf("run exit code = %d, want %d; stderr=%q stdout=%q", code, exitFailed, errorsOut.String(), output.String())
+	}
+	if !strings.Contains(output.String(), `"phase":"Failed"`) {
+		t.Fatalf("wrong-branch phase = %q", output.String())
 	}
 	if !strings.Contains(output.String(), "not on the run branch") {
 		t.Fatalf("wrong-branch reason = %q", output.String())
@@ -393,7 +443,7 @@ func TestRunCommittedWorkOnWrongBranchBecomesNeedsHuman(t *testing.T) {
 	}
 }
 
-func TestRunDetachedHeadCommitBecomesNeedsHuman(t *testing.T) {
+func TestRunDetachedHeadCommitBecomesFailed(t *testing.T) {
 	root := t.TempDir()
 	remote := remoteWithExistingBranch(t, root)
 	fakeOpenCode := filepath.Join(root, "opencode")
@@ -407,14 +457,268 @@ func TestRunDetachedHeadCommitBecomesNeedsHuman(t *testing.T) {
 
 	var output bytes.Buffer
 	var errorsOut bytes.Buffer
-	if code := run(context.Background(), &output, &errorsOut); code != exitNeedsHuman {
-		t.Fatalf("run exit code = %d, want %d; stderr=%q stdout=%q", code, exitNeedsHuman, errorsOut.String(), output.String())
+	if code := run(context.Background(), &output, &errorsOut); code != exitFailed {
+		t.Fatalf("run exit code = %d, want %d; stderr=%q stdout=%q", code, exitFailed, errorsOut.String(), output.String())
+	}
+	if !strings.Contains(output.String(), `"phase":"Failed"`) {
+		t.Fatalf("detached-HEAD phase = %q", output.String())
 	}
 	if !strings.Contains(output.String(), "detached HEAD") {
 		t.Fatalf("detached-HEAD reason = %q", output.String())
 	}
 	if !strings.Contains(output.String(), "not on the run branch") {
 		t.Fatalf("detached-HEAD reason should name the run branch: %q", output.String())
+	}
+}
+
+func TestRunDeclaredChangesVerifiedReachesVerifying(t *testing.T) {
+	root := t.TempDir()
+	remote := remoteWithExistingBranch(t, root)
+	fakeOpenCode := filepath.Join(root, "opencode")
+	writeExecutable(t, fakeOpenCode, "#!/bin/sh\ncase \"$1\" in mcp) exit 0;; esac\nprintf 'completed\\n' > completed.txt\ngit add --all -- .\ngit commit -m 'test: completed work' >/dev/null\nmkdir -p .courier\nprintf '{\"outcome\":\"changes\"}' > .courier/outcome.json\nexit 0\n")
+	prServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `[]`)
+	}))
+	defer prServer.Close()
+	setResolveIssueEnv(t, root, remote, prServer.URL, fakeOpenCode)
+	t.Setenv("COURIER_RUN_NAME", "coderrun-it-7")
+
+	var output bytes.Buffer
+	var errorsOut bytes.Buffer
+	if code := run(context.Background(), &output, &errorsOut); code != exitSuccess {
+		t.Fatalf("run exit code = %d, want 0; stderr=%q stdout=%q", code, errorsOut.String(), output.String())
+	}
+	if !strings.Contains(output.String(), `"phase":"Verifying"`) || !strings.Contains(output.String(), `"outcome":"changes"`) {
+		t.Fatalf("declared-changes verification = %q", output.String())
+	}
+	if !strings.Contains(output.String(), `"event":"outcome.declared"`) {
+		t.Fatalf("missing outcome.declared event: %q", output.String())
+	}
+}
+
+func TestRunDeclaredNoChangeNeededReachesDoneAndComments(t *testing.T) {
+	root := t.TempDir()
+	remote := remoteWithExistingBranch(t, root)
+	fakeOpenCode := filepath.Join(root, "opencode")
+	writeExecutable(t, fakeOpenCode, "#!/bin/sh\ncase \"$1\" in mcp) exit 0;; esac\nmkdir -p .courier\nprintf '{\"outcome\":\"no_change_needed\",\"evidence\":\"already fixed in v2\"}' > .courier/outcome.json\nexit 0\n")
+
+	var mu sync.Mutex
+	var comments []string
+	api := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/comments") {
+			body, _ := io.ReadAll(r.Body)
+			mu.Lock()
+			comments = append(comments, string(body))
+			mu.Unlock()
+			_, _ = w.Write([]byte(`{"id":1}`))
+			return
+		}
+		_, _ = io.WriteString(w, `[]`)
+	}))
+	defer api.Close()
+	setResolveIssueEnv(t, root, remote, api.URL, fakeOpenCode)
+	t.Setenv("COURIER_REF", "7")
+	t.Setenv("COURIER_RUN_NAME", "coderrun-it-7")
+	t.Setenv("GITHUB_TOKEN", "test-token")
+
+	var output bytes.Buffer
+	var errorsOut bytes.Buffer
+	if code := run(context.Background(), &output, &errorsOut); code != exitDone {
+		t.Fatalf("run exit code = %d, want %d; stderr=%q stdout=%q", code, exitDone, errorsOut.String(), output.String())
+	}
+	if !strings.Contains(output.String(), `"phase":"Done"`) {
+		t.Fatalf("no-change-needed phase = %q", output.String())
+	}
+	if !strings.Contains(output.String(), `"outcome":"no_change_needed"`) {
+		t.Fatalf("termination missing outcome: %q", output.String())
+	}
+	if !strings.Contains(output.String(), "opencode declared no change needed: already fixed in v2") {
+		t.Fatalf("no-change-needed reason = %q", output.String())
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if len(comments) != 1 {
+		t.Fatalf("comments = %d, want 1", len(comments))
+	}
+	if !strings.Contains(comments[0], "already addressed") || !strings.Contains(comments[0], "already fixed in v2") {
+		t.Fatalf("comment = %q", comments[0])
+	}
+}
+
+func TestRunDeclaredNeedsDecisionReachesNeedsHumanAndComments(t *testing.T) {
+	root := t.TempDir()
+	remote := remoteWithExistingBranch(t, root)
+	fakeOpenCode := filepath.Join(root, "opencode")
+	writeExecutable(t, fakeOpenCode, "#!/bin/sh\ncase \"$1\" in mcp) exit 0;; esac\nmkdir -p .courier\nprintf '{\"outcome\":\"needs_decision\",\"question\":\"Which payment provider should the run use?\"}' > .courier/outcome.json\nexit 0\n")
+
+	var mu sync.Mutex
+	var comments []string
+	api := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/comments") {
+			body, _ := io.ReadAll(r.Body)
+			mu.Lock()
+			comments = append(comments, string(body))
+			mu.Unlock()
+			_, _ = w.Write([]byte(`{"id":1}`))
+			return
+		}
+		_, _ = io.WriteString(w, `[]`)
+	}))
+	defer api.Close()
+	setResolveIssueEnv(t, root, remote, api.URL, fakeOpenCode)
+	t.Setenv("COURIER_REF", "7")
+	t.Setenv("COURIER_RUN_NAME", "coderrun-it-7")
+	t.Setenv("GITHUB_TOKEN", "test-token")
+
+	var output bytes.Buffer
+	var errorsOut bytes.Buffer
+	if code := run(context.Background(), &output, &errorsOut); code != exitNeedsHuman {
+		t.Fatalf("run exit code = %d, want %d; stderr=%q stdout=%q", code, exitNeedsHuman, errorsOut.String(), output.String())
+	}
+	if !strings.Contains(output.String(), `"phase":"NeedsHuman"`) {
+		t.Fatalf("needs-decision phase = %q", output.String())
+	}
+	if !strings.Contains(output.String(), `"outcome":"needs_decision"`) {
+		t.Fatalf("termination missing outcome: %q", output.String())
+	}
+	if !strings.Contains(output.String(), "coordinator needs a decision: Which payment provider should the run use?") {
+		t.Fatalf("needs-decision reason = %q", output.String())
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if len(comments) != 1 {
+		t.Fatalf("comments = %d, want 1", len(comments))
+	}
+	if !strings.Contains(comments[0], "needs a decision") || !strings.Contains(comments[0], "Which payment provider") {
+		t.Fatalf("comment = %q", comments[0])
+	}
+}
+
+func TestRunDeclaredBlockedExternalBecomesFailed(t *testing.T) {
+	root := t.TempDir()
+	remote := remoteWithExistingBranch(t, root)
+	fakeOpenCode := filepath.Join(root, "opencode")
+	writeExecutable(t, fakeOpenCode, "#!/bin/sh\ncase \"$1\" in mcp) exit 0;; esac\nmkdir -p .courier\nprintf '{\"outcome\":\"blocked_external\",\"missing\":\"secrets/prod-keys\"}' > .courier/outcome.json\nexit 0\n")
+	prServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `[]`)
+	}))
+	defer prServer.Close()
+	setResolveIssueEnv(t, root, remote, prServer.URL, fakeOpenCode)
+
+	var output bytes.Buffer
+	var errorsOut bytes.Buffer
+	if code := run(context.Background(), &output, &errorsOut); code != exitFailed {
+		t.Fatalf("run exit code = %d, want %d; stderr=%q stdout=%q", code, exitFailed, errorsOut.String(), output.String())
+	}
+	if !strings.Contains(output.String(), `"phase":"Failed"`) {
+		t.Fatalf("blocked-external phase = %q", output.String())
+	}
+	if !strings.Contains(output.String(), "opencode is blocked on an external prerequisite: secrets/prod-keys") {
+		t.Fatalf("blocked-external reason = %q", output.String())
+	}
+}
+
+func TestRunDeclaredChangesButDirtyBecomesFailed(t *testing.T) {
+	root := t.TempDir()
+	remote := remoteWithExistingBranch(t, root)
+	fakeOpenCode := filepath.Join(root, "opencode")
+	writeExecutable(t, fakeOpenCode, "#!/bin/sh\ncase \"$1\" in mcp) exit 0;; esac\nprintf 'partial\\n' > partial.txt\nmkdir -p .courier\nprintf '{\"outcome\":\"changes\"}' > .courier/outcome.json\nexit 0\n")
+	prServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `[]`)
+	}))
+	defer prServer.Close()
+	setResolveIssueEnv(t, root, remote, prServer.URL, fakeOpenCode)
+
+	var output bytes.Buffer
+	var errorsOut bytes.Buffer
+	if code := run(context.Background(), &output, &errorsOut); code != exitFailed {
+		t.Fatalf("run exit code = %d, want %d; stderr=%q stdout=%q", code, exitFailed, errorsOut.String(), output.String())
+	}
+	if !strings.Contains(output.String(), `"phase":"Failed"`) {
+		t.Fatalf("declared-changes-dirty phase = %q", output.String())
+	}
+	if !strings.Contains(output.String(), "opencode declared changes but left uncommitted workspace changes") {
+		t.Fatalf("declared-changes-dirty reason = %q", output.String())
+	}
+}
+
+func TestRunDeclaredChangesButNoCommitBecomesFailed(t *testing.T) {
+	root := t.TempDir()
+	remote := remoteWithExistingBranch(t, root)
+	fakeOpenCode := filepath.Join(root, "opencode")
+	writeExecutable(t, fakeOpenCode, "#!/bin/sh\ncase \"$1\" in mcp) exit 0;; esac\nmkdir -p .courier\nprintf '{\"outcome\":\"changes\"}' > .courier/outcome.json\nexit 0\n")
+	prServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `[]`)
+	}))
+	defer prServer.Close()
+	setResolveIssueEnv(t, root, remote, prServer.URL, fakeOpenCode)
+
+	var output bytes.Buffer
+	var errorsOut bytes.Buffer
+	if code := run(context.Background(), &output, &errorsOut); code != exitFailed {
+		t.Fatalf("run exit code = %d, want %d; stderr=%q stdout=%q", code, exitFailed, errorsOut.String(), output.String())
+	}
+	if !strings.Contains(output.String(), `"phase":"Failed"`) {
+		t.Fatalf("declared-changes-none phase = %q", output.String())
+	}
+	if !strings.Contains(output.String(), "opencode declared changes but produced no commit") {
+		t.Fatalf("declared-changes-none reason = %q", output.String())
+	}
+}
+
+func TestRunDeclaredNoChangeNeededButCommittedBecomesFailed(t *testing.T) {
+	root := t.TempDir()
+	remote := remoteWithExistingBranch(t, root)
+	fakeOpenCode := filepath.Join(root, "opencode")
+	writeExecutable(t, fakeOpenCode, "#!/bin/sh\ncase \"$1\" in mcp) exit 0;; esac\nprintf 'completed\\n' > completed.txt\ngit add --all -- .\ngit commit -m 'test: completed work' >/dev/null\nmkdir -p .courier\nprintf '{\"outcome\":\"no_change_needed\",\"evidence\":\"thought it was done\"}' > .courier/outcome.json\nexit 0\n")
+	prServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `[]`)
+	}))
+	defer prServer.Close()
+	setResolveIssueEnv(t, root, remote, prServer.URL, fakeOpenCode)
+
+	var output bytes.Buffer
+	var errorsOut bytes.Buffer
+	if code := run(context.Background(), &output, &errorsOut); code != exitFailed {
+		t.Fatalf("run exit code = %d, want %d; stderr=%q stdout=%q", code, exitFailed, errorsOut.String(), output.String())
+	}
+	if !strings.Contains(output.String(), `"phase":"Failed"`) {
+		t.Fatalf("no-change-needed-committed phase = %q", output.String())
+	}
+	if !strings.Contains(output.String(), "opencode declared no change needed but the workspace has new commits or uncommitted changes") {
+		t.Fatalf("no-change-needed-committed reason = %q", output.String())
+	}
+}
+
+func TestRunInvalidOutcomeDeclarationBecomesFailed(t *testing.T) {
+	root := t.TempDir()
+	remote := remoteWithExistingBranch(t, root)
+	fakeOpenCode := filepath.Join(root, "opencode")
+	writeExecutable(t, fakeOpenCode, "#!/bin/sh\ncase \"$1\" in mcp) exit 0;; esac\nmkdir -p .courier\nprintf 'not json' > .courier/outcome.json\nexit 0\n")
+	prServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `[]`)
+	}))
+	defer prServer.Close()
+	setResolveIssueEnv(t, root, remote, prServer.URL, fakeOpenCode)
+
+	var output bytes.Buffer
+	var errorsOut bytes.Buffer
+	if code := run(context.Background(), &output, &errorsOut); code != exitFailed {
+		t.Fatalf("run exit code = %d, want %d; stderr=%q stdout=%q", code, exitFailed, errorsOut.String(), output.String())
+	}
+	if !strings.Contains(output.String(), `"phase":"Failed"`) {
+		t.Fatalf("invalid-declaration phase = %q", output.String())
+	}
+	if !strings.Contains(output.String(), "opencode wrote an invalid outcome declaration") {
+		t.Fatalf("invalid-declaration reason = %q", output.String())
 	}
 }
 
@@ -468,7 +772,7 @@ func TestRunCommitWithUntrackedScratchReachesVerifying(t *testing.T) {
 	}
 }
 
-func TestRunPreservesExplicitNeedsHumanSignal(t *testing.T) {
+func TestRunChildExitTwoBecomesFailed(t *testing.T) {
 	root := t.TempDir()
 	remote := remoteWithExistingBranch(t, root)
 	fakeOpenCode := filepath.Join(root, "opencode")
@@ -482,11 +786,14 @@ func TestRunPreservesExplicitNeedsHumanSignal(t *testing.T) {
 
 	var output bytes.Buffer
 	var errorsOut bytes.Buffer
-	if code := run(context.Background(), &output, &errorsOut); code != exitNeedsHuman {
-		t.Fatalf("run exit code = %d, want %d; stderr=%q stdout=%q", code, exitNeedsHuman, errorsOut.String(), output.String())
+	if code := run(context.Background(), &output, &errorsOut); code != 2 {
+		t.Fatalf("run exit code = %d, want 2; stderr=%q stdout=%q", code, errorsOut.String(), output.String())
 	}
-	if !strings.Contains(output.String(), "requested human attention") {
-		t.Fatalf("explicit needs-human reason = %q", output.String())
+	if !strings.Contains(output.String(), `"phase":"Failed"`) {
+		t.Fatalf("child-exit-2 phase = %q", output.String())
+	}
+	if !strings.Contains(output.String(), "opencode exited with status 2") {
+		t.Fatalf("child-exit-2 reason = %q", output.String())
 	}
 }
 
@@ -1009,8 +1316,8 @@ func TestRunSurfacesUnavailableCapabilityBeforeWork(t *testing.T) {
 	var output bytes.Buffer
 	var errorsOut bytes.Buffer
 	code := run(context.Background(), &output, &errorsOut)
-	if code != exitNeedsHuman {
-		t.Fatalf("run exit code = %d, want %d; stderr=%q stdout=%q", code, exitNeedsHuman, errorsOut.String(), output.String())
+	if code != exitFailed {
+		t.Fatalf("run exit code = %d, want %d; stderr=%q stdout=%q", code, exitFailed, errorsOut.String(), output.String())
 	}
 	if strings.Contains(output.String(), "✗") {
 		t.Fatal("run stdout contains a raw probe glyph; probe output must stay out of the run's streams")
@@ -1057,7 +1364,7 @@ func TestRunSurfacesUnavailableCapabilityBeforeWork(t *testing.T) {
 	if strings.Contains(output.String(), capabilityProbeToken) || strings.Contains(errorsOut.String(), capabilityProbeToken) {
 		t.Fatal("output contains a fake credential (constant: capabilityProbeToken)")
 	}
-	if !strings.Contains(output.String(), "without producing a commit") || !strings.Contains(output.String(), "configured capability unavailable: github") {
+	if !strings.Contains(output.String(), "without declaring an outcome and produced no commit") || !strings.Contains(output.String(), "configured capability unavailable: github") {
 		t.Fatalf("terminal reason lost the no-work sentence or the unavailable capability: %q", output.String())
 	}
 }

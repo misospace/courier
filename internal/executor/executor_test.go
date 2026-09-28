@@ -604,6 +604,9 @@ func TestGoalCarriesCoordinatorCompletionContract(t *testing.T) {
 				"open or update the pull request",
 				"never stop at a local commit or branch when a pull request is required",
 				"7",
+				"declaring an outcome",
+				".courier/outcome.json",
+				"Never commit the outcome file",
 				test.opening,
 			} {
 				if !strings.Contains(goal, fragment) {

@@ -104,6 +104,13 @@ const completionContract = "Delegate implementation, research, and review to sub
 // different branch than the run's. (#134)
 const publicationContract = "Publish only to the run branch: commit on, push, and open or update the pull request from that single branch, and never create or publish work from any other branch."
 
+// outcomeContract tells the coordinator to declare how the run ended in an
+// outcome file the executor reads, so the run's ending comes from the
+// coordinator's own declaration rather than inference from git state (#169).
+// Only a genuine needs_decision declaration may end the run in a
+// human-attention state; every other way the run can end must be declared.
+const outcomeContract = "End the run by declaring an outcome: write JSON to .courier/outcome.json — {\"outcome\":\"changes\"} once your work is committed and pushed to the run branch; {\"outcome\":\"no_change_needed\",\"evidence\":\"...\"} when the work is already done, citing the evidence; {\"outcome\":\"needs_decision\",\"question\":\"...\"} only for a decision you cannot make yourself; {\"outcome\":\"blocked_external\",\"missing\":\"...\"} when something outside this run is missing. Never commit the outcome file; a run that ends without a valid declaration fails as incomplete."
+
 // Goal returns the concise coordinator goal for a run. Lane framing is passed
 // separately so it remains context rather than becoming a hard-coded prompt
 // scaffold.
@@ -121,9 +128,9 @@ func Goal(run *courierv1alpha1.CoderRun) (string, error) {
 	}
 	switch run.Spec.Mode {
 	case courierv1alpha1.ModeResolveIssue:
-		return fmt.Sprintf("Open a PR to address issue #%d and drive it to a review-ready state with CI green. %s %s%s", run.Spec.Ref, forgeContract, completionContract, publication), nil
+		return fmt.Sprintf("Open a PR to address issue #%d and drive it to a review-ready state with CI green. %s %s%s %s", run.Spec.Ref, forgeContract, completionContract, publication, outcomeContract), nil
 	case courierv1alpha1.ModeFixPR:
-		return fmt.Sprintf("Take over PR #%d. Inspect the current pull request state, CI/checks, and review feedback to determine what's blocking it, then return it to a review-ready state. %s %s%s", run.Spec.Ref, forgeContract, completionContract, publication), nil
+		return fmt.Sprintf("Take over PR #%d. Inspect the current pull request state, CI/checks, and review feedback to determine what's blocking it, then return it to a review-ready state. %s %s%s %s", run.Spec.Ref, forgeContract, completionContract, publication, outcomeContract), nil
 	default:
 		return "", fmt.Errorf("%w: %q", ErrInvalidMode, run.Spec.Mode)
 	}

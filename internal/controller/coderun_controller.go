@@ -636,12 +636,19 @@ func coordinatorExitCode(pod *corev1.Pod) (int32, bool) {
 	return 0, false
 }
 
+// phaseForExit maps the coordinator's exit code to the run's next phase. 0
+// sends the run to Verifying; 2 means the coordinator needs a human; 3 means
+// the coordinator declared the work already done (no_change_needed, issue
+// #169), so the run is Done and its source is resolved; any other code is a
+// failure.
 func phaseForExit(exitCode int32) courierv1alpha1.Phase {
 	switch exitCode {
 	case 0:
 		return courierv1alpha1.PhaseVerifying
 	case 2:
 		return courierv1alpha1.PhaseNeedsHuman
+	case 3:
+		return courierv1alpha1.PhaseDone
 	default:
 		return courierv1alpha1.PhaseFailed
 	}

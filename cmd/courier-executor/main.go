@@ -18,6 +18,7 @@ import (
 	"net/url"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
@@ -30,7 +31,9 @@ import (
 
 const (
 	exitSuccess    = 0
+	exitFailed     = 1
 	exitNeedsHuman = 2
+	exitDone       = 3
 	defaultBase    = "main"
 	defaultWork    = "/workspace"
 	defaultFormat  = "json"
@@ -66,6 +69,10 @@ type termination struct {
 	Result   string `json:"result"`
 	ExitCode int    `json:"exit_code"`
 	Reason   string `json:"reason"`
+	// Outcome carries the coordinator's declared outcome kind when a valid
+	// declaration drove the ending (#169); empty when classified from the
+	// world alone.
+	Outcome string `json:"outcome,omitempty"`
 }
 
 func main() {
@@ -353,6 +360,14 @@ func run(ctx context.Context, stdout, stderr io.Writer) int {
 		report.terminate(termination{Phase: "Failed", Result: "failure", ExitCode: 1, Reason: "record workspace start: " + err.Error()})
 		return 1
 	}
+
+	// Start from a clean declaration slate: a committed outcome file from an
+	// adopted branch describes an earlier run, and removeOutcomeDir's
+	// tracked-copy restore would read it back as this run's declaration.
+	// Drop it outright and recreate the directory for the coordinator to
+	// declare in (#169).
+	_ = os.RemoveAll(filepath.Join(workspace.Directory, ".courier"))
+	_ = os.MkdirAll(filepath.Join(workspace.Directory, ".courier"), 0o755)
 	ready := map[string]any{
 		"adopted": workspace.Adopted,
 		"base":    cfg.Base,
@@ -401,12 +416,10 @@ func run(ctx context.Context, stdout, stderr io.Writer) int {
 	if err != nil {
 		code := processExitCode(err)
 		if code < 0 {
-			code = 1
+			code = exitFailed
 		}
-		if code == exitNeedsHuman {
-			report.terminate(termination{Phase: "NeedsHuman", Result: "needs-human", ExitCode: code, Reason: "opencode requested human attention"})
-			return code
-		}
+		// A non-zero child exit is a failure, never a human-attention signal:
+		// only a coordinator-declared needs_decision may end the run that way.
 		report.terminate(termination{Phase: "Failed", Result: "failure", ExitCode: code, Reason: fmt.Sprintf("opencode exited with status %d", code)})
 		return code
 	}
@@ -418,42 +431,226 @@ func run(ctx context.Context, stdout, stderr io.Writer) int {
 		}
 	}
 
+	// Read the coordinator's outcome declaration, then restore the tree so the
+	// declaration itself never reads back as workspace work (#169).
+	decl, declared, declErr := readOutcome(cfg.Directory)
+	removeOutcomeDir(ctx, workspace.Directory)
+
 	workState, err := workspace.WorkState(ctx, startCommit)
 	if err != nil {
-		report.terminate(termination{Phase: "Failed", Result: "failure", ExitCode: 1, Reason: "inspect workspace result: " + err.Error()})
-		return 1
+		report.terminate(termination{Phase: "Failed", Result: "failure", ExitCode: exitFailed, Reason: "inspect workspace result: " + err.Error()})
+		return exitFailed
 	}
-	switch workState {
-	case git.WorkStateCommitted:
-		// The run branch's own ref, not where HEAD happens to point, is the
-		// world: committed work counts only when it is reachable from the run
-		// branch. A branch-read error must not fail the run: liveness over
-		// strictness, so an unreadable ref falls through to the success path.
-		ahead, branchErr := workspace.CommitsOnBranchSince(ctx, cfg.Branch, startCommit)
-		if branchErr == nil && ahead == 0 {
-			// Committed work is not on the run branch. Report it specifically so the
-			// operator does not later read an empty run branch as "no work".
-			whereClause := "a detached HEAD"
-			if cb, err := workspace.CurrentBranch(ctx); err == nil && cb != "" {
-				whereClause = fmt.Sprintf("branch %q", cb)
-			}
-			reason := fmt.Sprintf("opencode committed work that is not on the run branch %q (HEAD is on %s); the run branch has no new commits", cfg.Branch, whereClause)
-			report.terminate(termination{Phase: "NeedsHuman", Result: "needs-human", ExitCode: exitNeedsHuman, Reason: reason})
-			return exitNeedsHuman
+	result := report.classify(ctx, workspace, cfg.Branch, startCommit, workState, decl, declared, declErr, caps)
+	report.terminate(result)
+	return result.ExitCode
+}
+
+// The outcome kinds the coordinator may declare (#169).
+const (
+	outcomeChanges         = "changes"
+	outcomeNoChangeNeeded  = "no_change_needed"
+	outcomeNeedsDecision   = "needs_decision"
+	outcomeBlockedExternal = "blocked_external"
+)
+
+// outcomeDeclaration is the coordinator's declared run ending, read from
+// .courier/outcome.json. Only the field matching the outcome kind is
+// required; the executor validates that per kind.
+type outcomeDeclaration struct {
+	Outcome  string `json:"outcome"`
+	Evidence string `json:"evidence"`
+	Question string `json:"question"`
+	Missing  string `json:"missing"`
+}
+
+// outcomeFile is the coordinator's declaration path inside the workspace.
+func outcomeFile(dir string) string {
+	return filepath.Join(dir, ".courier", "outcome.json")
+}
+
+// readOutcome reads and validates the coordinator's outcome declaration from
+// dir. A missing file returns (zero, false, nil): the run was simply
+// undeclared. Any read error, unparsable JSON, or a declaration that fails
+// its per-outcome field rule returns (zero, true, err) describing the
+// invalid declaration.
+func readOutcome(dir string) (outcomeDeclaration, bool, error) {
+	data, err := os.ReadFile(outcomeFile(dir))
+	if os.IsNotExist(err) {
+		return outcomeDeclaration{}, false, nil
+	}
+	if err != nil {
+		return outcomeDeclaration{}, true, err
+	}
+	var decl outcomeDeclaration
+	if err := json.Unmarshal(data, &decl); err != nil {
+		return outcomeDeclaration{}, true, err
+	}
+	switch strings.TrimSpace(decl.Outcome) {
+	case outcomeChanges:
+	case outcomeNoChangeNeeded:
+		if strings.TrimSpace(decl.Evidence) == "" {
+			return decl, true, errors.New("evidence is required for outcome no_change_needed")
 		}
-		report.terminate(termination{Phase: "Verifying", Result: "success", ExitCode: exitSuccess, Reason: "opencode completed with committed work"})
-		return exitSuccess
-	case git.WorkStateDirty:
-		report.terminate(termination{Phase: "NeedsHuman", Result: "needs-human", ExitCode: exitNeedsHuman, Reason: "opencode exited successfully with uncommitted workspace changes"})
-		return exitNeedsHuman
+	case outcomeNeedsDecision:
+		if strings.TrimSpace(decl.Question) == "" {
+			return decl, true, errors.New("question is required for outcome needs_decision")
+		}
+	case outcomeBlockedExternal:
+		if strings.TrimSpace(decl.Missing) == "" {
+			return decl, true, errors.New("missing is required for outcome blocked_external")
+		}
 	default:
-		reason := "opencode exited successfully without producing a commit or workspace changes"
+		return decl, true, fmt.Errorf("unknown outcome %q", decl.Outcome)
+	}
+	return decl, true, nil
+}
+
+// removeOutcomeDir drops the coordinator's declaration directory and then
+// restores any tracked copy from HEAD, so a written (or wrongly committed)
+// outcome file never reads back as workspace work. The checkout is best-effort
+// and its failure ignored: it recreates nothing when the path was untracked.
+func removeOutcomeDir(ctx context.Context, dir string) {
+	_ = os.RemoveAll(filepath.Join(dir, ".courier"))
+	restore := exec.CommandContext(ctx, "git", "checkout", "HEAD", "--", ".courier")
+	restore.Dir = dir
+	_ = restore.Run()
+}
+
+// failed builds a Failed termination with the standard failure exit code.
+func failed(reason string) termination {
+	return termination{Phase: "Failed", Result: "failure", ExitCode: exitFailed, Reason: reason}
+}
+
+// classify decides the run's terminal outcome from the coordinator's
+// declaration (when present) and the verified world state. It is the single
+// place the run's ending is decided, so every way the run can end is spelled
+// out here (#169).
+func (r reporter) classify(ctx context.Context, workspace *git.Workspace, branch, startCommit string, workState git.WorkState, decl outcomeDeclaration, declared bool, declErr error, caps []executor.MCPCapability) termination {
+	if declErr != nil {
+		// An invalid declaration is a failed run, never a human-attention
+		// signal: the world does not say the coordinator asked for a decision.
+		return failed("opencode wrote an invalid outcome declaration: " + declErr.Error())
+	}
+	if declared {
+		return r.classifyDeclared(ctx, workspace, branch, startCommit, workState, decl, caps)
+	}
+	return r.classifyUndeclared(ctx, workspace, branch, startCommit, workState, caps)
+}
+
+// classifyDeclared resolves a valid coordinator declaration. A declared
+// changes ending is confirmed against the world: it succeeds only when the
+// #134 verification shows committed work reachable from the run branch.
+func (r reporter) classifyDeclared(ctx context.Context, workspace *git.Workspace, branch, startCommit string, workState git.WorkState, decl outcomeDeclaration, caps []executor.MCPCapability) termination {
+	switch strings.TrimSpace(decl.Outcome) {
+	case outcomeChanges:
+		r.emitOutcomeDeclared(outcomeChanges)
+		switch workState {
+		case git.WorkStateDirty:
+			return failed("opencode declared changes but left uncommitted workspace changes")
+		case git.WorkStateNone:
+			return failed("opencode declared changes but produced no commit")
+		default:
+			// The run branch's own ref, not where HEAD points, is the world:
+			// committed work counts only when reachable from the run branch. A
+			// branch-read error must not fail the run, so an unreadable ref
+			// falls through to the success path.
+			ahead, branchErr := workspace.CommitsOnBranchSince(ctx, branch, startCommit)
+			if branchErr == nil && ahead == 0 {
+				return failed(r.offBranchReason(ctx, workspace, branch) + "; the run branch has no new commits")
+			}
+			return termination{Phase: "Verifying", Result: "success", ExitCode: exitSuccess, Reason: "opencode completed with committed work", Outcome: outcomeChanges}
+		}
+	case outcomeNoChangeNeeded:
+		r.emitOutcomeDeclared(outcomeNoChangeNeeded)
+		if workState == git.WorkStateNone {
+			r.postOutcomeComment(ctx, "**Courier: already addressed** (run "+r.cfg.RunID+")\n\n"+decl.Evidence)
+			return termination{Phase: "Done", Result: "success", ExitCode: exitDone, Reason: "opencode declared no change needed: " + decl.Evidence, Outcome: outcomeNoChangeNeeded}
+		}
+		return failed("opencode declared no change needed but the workspace has new commits or uncommitted changes")
+	case outcomeNeedsDecision:
+		r.emitOutcomeDeclared(outcomeNeedsDecision)
+		r.postOutcomeComment(ctx, "**Courier needs a decision** (run "+r.cfg.RunID+")\n\n"+decl.Question)
+		return termination{Phase: "NeedsHuman", Result: "needs-human", ExitCode: exitNeedsHuman, Reason: "coordinator needs a decision: " + decl.Question, Outcome: outcomeNeedsDecision}
+	case outcomeBlockedExternal:
+		r.emitOutcomeDeclared(outcomeBlockedExternal)
+		return failed("opencode is blocked on an external prerequisite: " + decl.Missing)
+	}
+	// Unreachable: readOutcome rejects any unknown outcome kind above.
+	return failed("opencode wrote an invalid outcome declaration: unknown outcome")
+}
+
+// classifyUndeclared resolves a run the coordinator ended without a valid
+// declaration. Only a genuine decision may ask for a human, so none of these
+// endings is NeedsHuman: they fail as incomplete. (Issue #170 turns these
+// recoverable endings into session continuations instead of failures.)
+func (r reporter) classifyUndeclared(ctx context.Context, workspace *git.Workspace, branch, startCommit string, workState git.WorkState, caps []executor.MCPCapability) termination {
+	switch workState {
+	case git.WorkStateDirty:
+		return failed("opencode exited successfully without declaring an outcome and left uncommitted workspace changes")
+	case git.WorkStateCommitted:
+		ahead, branchErr := workspace.CommitsOnBranchSince(ctx, branch, startCommit)
+		if branchErr == nil && ahead == 0 {
+			return failed(r.offBranchReason(ctx, workspace, branch) + "; no outcome was declared")
+		}
+		// The world shows verified work on the run branch; that ending stands
+		// on its own, declaration or not.
+		return termination{Phase: "Verifying", Result: "success", ExitCode: exitSuccess, Reason: "opencode completed with committed work"}
+	default:
+		reason := "opencode exited successfully without declaring an outcome and produced no commit or workspace changes"
 		if names := unavailableCapabilities(caps); len(names) > 0 {
 			reason += "; configured capability unavailable: " + strings.Join(names, ", ")
 		}
-		report.terminate(termination{Phase: "NeedsHuman", Result: "needs-human", ExitCode: exitNeedsHuman, Reason: reason})
-		return exitNeedsHuman
+		return failed(reason)
 	}
+}
+
+// offBranchReason names where committed work actually landed when it is not
+// reachable from the run branch.
+func (r reporter) offBranchReason(ctx context.Context, workspace *git.Workspace, branch string) string {
+	whereClause := "a detached HEAD"
+	if cb, err := workspace.CurrentBranch(ctx); err == nil && cb != "" {
+		whereClause = fmt.Sprintf("branch %q", cb)
+	}
+	return fmt.Sprintf("opencode committed work that is not on the run branch %q (HEAD is on %s)", branch, whereClause)
+}
+
+// emitOutcomeDeclared records that a valid declaration classified the ending.
+// Emission is best-effort like every other event.
+func (r reporter) emitOutcomeDeclared(kind string) {
+	status := courierlog.StatusOK
+	switch kind {
+	case outcomeBlockedExternal:
+		status = courierlog.StatusError
+	case outcomeNeedsDecision:
+		status = courierlog.StatusNeedsHuman
+	}
+	r.event(courierlog.EventOutcomeDeclared, status, map[string]any{"outcome": kind})
+}
+
+// postOutcomeComment posts a terminal outcome's explanation onto the run's
+// issue or pull request. It is best-effort: a failure is recorded as an
+// outcome.comment error event and never changes the run's ending. Runs with
+// no positive reference to comment on are skipped silently.
+func (r reporter) postOutcomeComment(ctx context.Context, body string) {
+	if r.cfg.Ref < 1 {
+		return
+	}
+	owner, name, ok := splitOwnerRepo(r.cfg.Repo)
+	if !ok {
+		r.event(courierlog.EventOutcomeComment, courierlog.StatusError, map[string]any{"status": "error", "reason": "no owner/repo to comment on"})
+		return
+	}
+	client, err := github.NewClient(r.cfg.GitHubAPIBase, r.cfg.GitHubToken)
+	if err != nil {
+		r.event(courierlog.EventOutcomeComment, courierlog.StatusError, map[string]any{"status": "error", "reason": err.Error()})
+		return
+	}
+	if err := client.CreateComment(ctx, owner, name, r.cfg.Ref, body); err != nil {
+		r.event(courierlog.EventOutcomeComment, courierlog.StatusError, map[string]any{"status": "error", "reason": err.Error()})
+		return
+	}
+	r.event(courierlog.EventOutcomeComment, courierlog.StatusOK, map[string]any{"status": "ok"})
 }
 
 // maxConflictNotePaths bounds how many conflicted paths the goal lists.

@@ -142,7 +142,9 @@ Goals stay short — a goal plus tools — but each carries one non-negotiable
 contract: delegation covers bounded work, never the coordinator's ownership
 of completion and forge publication. The publication hint names the run branch
 as the single place work may land; it informs rather than constrains (a cheap
-nudge, enforced only at exit, below).
+nudge, enforced only at exit, below). Each goal also names the outcome
+declaration: the coordinator declares how the run ended, and the run's ending
+is classified from that declaration rather than inferred from git state.
 
 ### Terminal states
 
@@ -153,8 +155,30 @@ A run ends at exactly one of:
   no merge capability; merging is an explicit human-maintainer action, or an
   auto-merge a maintainer enabled (see
   [docs/repository-settings.md](./docs/repository-settings.md)).
-- **needs-human** → the coordinator (or the operator, on crashloop) could not
-  reach a healthy state and labels the PR/issue for a human.
+- **needs-human** → the coordinator asked for a decision (see below), or the
+  operator (on crashloop) could not reach a healthy state and labels the
+  PR/issue for a human.
+
+The coordinator declares its ending by writing `.courier/outcome.json` in the
+workspace, and the executor classifies from that declaration verified against
+the world — not from git state, which misread "the work is already done" as a
+human problem (#169):
+
+- **`changes`** — work is committed and pushed; confirmed the old way (commits
+  reachable from the run branch) → **Verifying**.
+- **`no_change_needed`** — nothing to do, with evidence; the executor posts the
+  evidence to the issue/PR and the run ends **Done**, resolving the source
+  (the Dispatch `already_addressed` settlement is the source-side companion).
+- **`needs_decision`** — a real design question; the executor posts the
+  question to the issue/PR and the run ends **NeedsHuman**. This is the *only*
+  coordinator-originated NeedsHuman.
+- **`blocked_external`** — something outside the run is missing; the run ends
+  **Failed** naming what is missing.
+
+An undeclared zero-exit ending is never NeedsHuman: committed work verified on
+the run branch still stands as **Verifying**, everything else fails as
+incomplete until the continuation loop (#170) resumes the session instead of
+terminalizing.
 
 Feedback or a merge conflict does not reopen the run. It spawns a **fresh
 `fix-pr` `CoderRun`** (via the source — dispatch's pr-fix queue, or a
@@ -447,15 +471,17 @@ it modest" with `concurrency: 1`. Same schema, no local assumption baked in.
   real base rather than the fork's possibly stale base branch. The target
   harness commits per brief and
   writes heartbeat and checkpoint to status; the legacy bootstrap does not
-  populate these fields (#102). Exit `0` transitions to **Verifying** before
-  any external observation, releasing the lane capacity — but only when the
-  committed work is actually on the run branch: the bootstrap reads the run
-  branch's own ref (not wherever HEAD happens to point), and committed work
-  that is not on the run branch transitions to **NeedsHuman** with a specific
-  reason rather than a later operator read of an empty branch as "no work"
-  (#134). Exit `2` transitions to **NeedsHuman**; any other exit transitions to
-  **Failed**. A pod death or heartbeat stall relaunches/resumes it; a crashloop
-  reaches NeedsHuman.
+populate these fields (#102). Exit `0` transitions to **Verifying** before
+   any external observation, releasing the lane capacity — but only when the
+   committed work is actually on the run branch: the bootstrap reads the run
+   branch's own ref (not wherever HEAD happens to point), and work that fails
+   this verification ends **Failed** naming where it actually landed, rather
+   than a later operator read of an empty branch as "no work" or a NeedsHuman
+   the coordinator never asked for (#134, reclassified by #169). Exit `2` (a
+   declared `needs_decision`) transitions to **NeedsHuman**; exit `3` (a
+   declared `no_change_needed`) transitions to **Done**, resolving the source;
+   any other exit transitions to **Failed**. A pod death or heartbeat stall
+   relaunches/resumes it; a crashloop reaches NeedsHuman.
 - **Verifying** — no coordinator pod or liveness meaning. The operator polls
   the external PR and CI world indefinitely, with a reconciliation cadence and
   no deadline. Observer errors remain Verifying and requeue. A missing observer,
@@ -661,6 +687,27 @@ A running log of architectural decisions and their reasoning, newest first. The
 body above describes the current architecture; this log preserves *why* and what
 was superseded.
 
+- **2026-09-28 — Run endings are classified from a coordinator-declared outcome.**
+  NeedsHuman was inferred from workspace state, so every odd ending escalated:
+  of 65 runs in one deployment's five days, 19 ended NeedsHuman and not one was
+  the coordinator asking for anything — the largest class was simply the
+  coordinator deciding the work was already done. The coordinator now declares
+  its ending in `.courier/outcome.json` — `changes`, `no_change_needed` (with
+  evidence), `needs_decision` (with the question), `blocked_external` (with
+  what is missing) — and the executor classifies from the declaration verified
+  against the world: `changes` still requires commits reachable from the run
+  branch; `no_change_needed` posts the evidence to the issue/PR and exits to
+  **Done** (exit code 3), resolving the source; `needs_decision` posts the
+  question and is the **only** coordinator-originated NeedsHuman;
+  `blocked_external` fails naming the missing prerequisite. An undeclared
+  zero-exit ending never terminates NeedsHuman directly — verified commits on
+  the run branch still stand as Verifying, everything else fails as incomplete
+  until #170's continuation loop resumes the session instead. Work committed
+  off the run branch is Failed, not NeedsHuman: the specific reason is the
+  inform, and the operator's world-read still decides what is real. The child's
+  own exit 2 is no longer a human-attention signal (#169; companions #170,
+  #171, #172, and dispatch's `already_addressed` settlement). This supersedes
+  the NeedsHuman reading of the #134 off-branch case.
 - **2026-09-27 — #122 lands the broker publication primitives.** The broker owns
   the whole publication path: a pinned, non-force git transport to one explicit
   ref, a typed forge observer (never raw forge calls), an authenticated
