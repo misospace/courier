@@ -497,6 +497,36 @@ func TestRunDeclaredChangesVerifiedReachesVerifying(t *testing.T) {
 	}
 }
 
+// TestRunCommittedDeclarationWithWorkStaysVerifying is the tracked-copy case:
+// the coordinator commits the declaration file together with its real work, so
+// HEAD tracks .courier/outcome.json after the run. The end-of-run restore must
+// bring the tracked copy back to a clean state, never read it back as
+// uncommitted work.
+func TestRunCommittedDeclarationWithWorkStaysVerifying(t *testing.T) {
+	root := t.TempDir()
+	remote := remoteWithExistingBranch(t, root)
+	fakeOpenCode := filepath.Join(root, "opencode")
+	writeExecutable(t, fakeOpenCode, "#!/bin/sh\ncase \"$1\" in mcp) exit 0;; esac\nprintf 'completed\\n' > completed.txt\nmkdir -p .courier\nprintf '{\"outcome\":\"changes\"}' > .courier/outcome.json\ngit add --all -- .\ngit commit -m 'test: completed work' >/dev/null\nexit 0\n")
+	prServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `[]`)
+	}))
+	defer prServer.Close()
+	setResolveIssueEnv(t, root, remote, prServer.URL, fakeOpenCode)
+
+	var output bytes.Buffer
+	var errorsOut bytes.Buffer
+	if code := run(context.Background(), &output, &errorsOut); code != exitSuccess {
+		t.Fatalf("run exit code = %d, want 0; stderr=%q stdout=%q", code, errorsOut.String(), output.String())
+	}
+	if !strings.Contains(output.String(), `"phase":"Verifying"`) {
+		t.Fatalf("committed declaration must not falsify the work state: %q", output.String())
+	}
+	if !strings.Contains(output.String(), `"outcome":"changes"`) {
+		t.Fatalf("declared-changes verification = %q", output.String())
+	}
+}
+
 func TestRunDeclaredNoChangeNeededReachesDoneAndComments(t *testing.T) {
 	root := t.TempDir()
 	remote := remoteWithExistingBranch(t, root)
@@ -594,6 +624,107 @@ func TestRunDeclaredNeedsDecisionReachesNeedsHumanAndComments(t *testing.T) {
 	}
 	if !strings.Contains(comments[0], "needs a decision") || !strings.Contains(comments[0], "Which payment provider") {
 		t.Fatalf("comment = %q", comments[0])
+	}
+}
+
+// TestRunOutcomeCommentIsRedactedBeforeForge registers a fake secret via the
+// environment (the name shape is what RegisterEnvironment picks up), has the
+// coordinator embed it in a needs_decision question, and proves the comment
+// posted to the forge is scrubbed while the run still ends NeedsHuman.
+func TestRunOutcomeCommentIsRedactedBeforeForge(t *testing.T) {
+	root := t.TempDir()
+	remote := remoteWithExistingBranch(t, root)
+	fakeOpenCode := filepath.Join(root, "opencode")
+	writeExecutable(t, fakeOpenCode, fmt.Sprintf(`#!/bin/sh
+case "$1" in mcp) exit 0;; esac
+mkdir -p .courier
+printf '{"outcome":"needs_decision","question":"Which payment provider should the run use? The staging key is %s."}' > .courier/outcome.json
+exit 0
+`, testForgeSecret))
+
+	var mu sync.Mutex
+	var comments []string
+	api := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/comments") {
+			body, _ := io.ReadAll(r.Body)
+			mu.Lock()
+			comments = append(comments, string(body))
+			mu.Unlock()
+			_, _ = w.Write([]byte(`{"id":1}`))
+			return
+		}
+		_, _ = io.WriteString(w, `[]`)
+	}))
+	defer api.Close()
+	setResolveIssueEnv(t, root, remote, api.URL, fakeOpenCode)
+	t.Setenv("COURIER_REF", "7")
+	t.Setenv("COURIER_RUN_NAME", "coderrun-it-7")
+	t.Setenv("COURIER_FORGE_SECRET", testForgeSecret)
+	t.Setenv("GITHUB_TOKEN", "test-token")
+
+	var output bytes.Buffer
+	var errorsOut bytes.Buffer
+	if code := run(context.Background(), &output, &errorsOut); code != exitNeedsHuman {
+		t.Fatalf("run exit code = %d, want %d; stderr=%q stdout=%q", code, exitNeedsHuman, errorsOut.String(), output.String())
+	}
+	if !strings.Contains(output.String(), `"phase":"NeedsHuman"`) {
+		t.Fatalf("needs-decision phase = %q", output.String())
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if len(comments) != 1 {
+		t.Fatalf("comments = %d, want 1", len(comments))
+	}
+	if strings.Contains(comments[0], testForgeSecret) {
+		t.Fatal("comment contains a fake credential (constant: testForgeSecret)")
+	}
+	if !strings.Contains(comments[0], courierlog.RedactedPlaceholder) {
+		t.Fatalf("comment credential was not replaced by the redaction placeholder: %q", comments[0])
+	}
+	if !strings.Contains(comments[0], "Which payment provider") {
+		t.Fatalf("comment lost the question around the redaction: %q", comments[0])
+	}
+}
+
+// TestRunMissingRefOutcomeCommentEmitsErrorEvent proves a terminal outcome that
+// wants to comment without a positive reference is not skipped silently: an
+// outcome.comment error event names the missing reference, and the run's
+// ending is unchanged.
+func TestRunMissingRefOutcomeCommentEmitsErrorEvent(t *testing.T) {
+	root := t.TempDir()
+	remote := remoteWithExistingBranch(t, root)
+	fakeOpenCode := filepath.Join(root, "opencode")
+	writeExecutable(t, fakeOpenCode, "#!/bin/sh\ncase \"$1\" in mcp) exit 0;; esac\nmkdir -p .courier\nprintf '{\"outcome\":\"needs_decision\",\"question\":\"Which payment provider should the run use?\"}' > .courier/outcome.json\nexit 0\n")
+	prServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `[]`)
+	}))
+	defer prServer.Close()
+	setResolveIssueEnv(t, root, remote, prServer.URL, fakeOpenCode)
+	// No COURIER_REF: the run has no issue/PR to comment on.
+	t.Setenv("COURIER_LOG_LEVEL", "debug")
+	t.Setenv("COURIER_RUN_NAME", "coderrun-it-7")
+
+	var output bytes.Buffer
+	var errorsOut bytes.Buffer
+	if code := run(context.Background(), &output, &errorsOut); code != exitNeedsHuman {
+		t.Fatalf("run exit code = %d, want %d; stderr=%q stdout=%q", code, exitNeedsHuman, errorsOut.String(), output.String())
+	}
+	if !strings.Contains(output.String(), `"phase":"NeedsHuman"`) {
+		t.Fatalf("needs-decision phase = %q", output.String())
+	}
+	events := parseEvents(t, &output)
+	comment := findEvent(t, events, "outcome.comment")
+	if comment["status"] != "error" {
+		t.Fatalf("outcome.comment status = %v, want error", comment["status"])
+	}
+	detail, ok := comment["detail"].(map[string]any)
+	if !ok {
+		t.Fatal("outcome.comment must carry a detail object")
+	}
+	if reason, _ := detail["reason"].(string); !strings.Contains(reason, "reference") {
+		t.Fatalf("outcome.comment reason does not name the missing reference: %q", reason)
 	}
 }
 
@@ -786,14 +917,45 @@ func TestRunChildExitTwoBecomesFailed(t *testing.T) {
 
 	var output bytes.Buffer
 	var errorsOut bytes.Buffer
-	if code := run(context.Background(), &output, &errorsOut); code != 2 {
-		t.Fatalf("run exit code = %d, want 2; stderr=%q stdout=%q", code, errorsOut.String(), output.String())
+	if code := run(context.Background(), &output, &errorsOut); code != exitFailed {
+		t.Fatalf("run exit code = %d, want %d (the child's code must not pass through); stderr=%q stdout=%q", code, exitFailed, errorsOut.String(), output.String())
 	}
 	if !strings.Contains(output.String(), `"phase":"Failed"`) {
 		t.Fatalf("child-exit-2 phase = %q", output.String())
 	}
 	if !strings.Contains(output.String(), "opencode exited with status 2") {
 		t.Fatalf("child-exit-2 reason = %q", output.String())
+	}
+}
+
+// TestRunChildExitThreeBecomesFailed is the symmetric guard for the operator's
+// Done code: a child that exits 3 without a declaration must fail the run with
+// the standard failure code, never end it Done.
+func TestRunChildExitThreeBecomesFailed(t *testing.T) {
+	root := t.TempDir()
+	remote := remoteWithExistingBranch(t, root)
+	fakeOpenCode := filepath.Join(root, "opencode")
+	writeExecutable(t, fakeOpenCode, "#!/bin/sh\ncase \"$1\" in mcp) exit 0;; esac\nexit 3\n")
+	prServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `[]`)
+	}))
+	defer prServer.Close()
+	setResolveIssueEnv(t, root, remote, prServer.URL, fakeOpenCode)
+
+	var output bytes.Buffer
+	var errorsOut bytes.Buffer
+	if code := run(context.Background(), &output, &errorsOut); code != exitFailed {
+		t.Fatalf("run exit code = %d, want %d; stderr=%q stdout=%q", code, exitFailed, errorsOut.String(), output.String())
+	}
+	if !strings.Contains(output.String(), `"phase":"Failed"`) {
+		t.Fatalf("child-exit-3 phase = %q", output.String())
+	}
+	if !strings.Contains(output.String(), "opencode exited with status 3") {
+		t.Fatalf("child-exit-3 reason = %q", output.String())
+	}
+	if strings.Contains(output.String(), `"phase":"Done"`) {
+		t.Fatalf("child exit 3 must never end the run Done: %q", output.String())
 	}
 }
 
@@ -1048,9 +1210,10 @@ func TestReadConfigRequiresRemoteAndStatusBranch(t *testing.T) {
 // fake event-test secrets. Assertions never print these values or any output
 // line that could contain them; failures name the constant instead.
 const (
-	testGitToken   = "git-push-token-f4e3d2c1"
-	testGitHubTokn = "gh-api-token-b1b2b3b4"
-	testURLToken   = "url-userinfo-token-aa11bb22"
+	testGitToken    = "git-push-token-f4e3d2c1"
+	testGitHubTokn  = "gh-api-token-b1b2b3b4"
+	testURLToken    = "url-userinfo-token-aa11bb22"
+	testForgeSecret = "forge-decision-secret-7c9d2e1f"
 )
 
 func TestRunEmitsRunScopedEventsWithoutDetail(t *testing.T) {
@@ -1246,9 +1409,10 @@ git commit -m 'test: completed work' >/dev/null
 	}
 }
 
-// TestChildOutputRedactedOnFailureExit keeps exit semantics and redaction on
-// a failing child: the exit code passes through and the child's final output
-// is flushed through the redactor before the termination handoff.
+// TestChildOutputRedactedOnFailureExit keeps failure-exit semantics and
+// redaction on a failing child: the run exits with the standard failure code
+// (the child's code rides in the termination reason) and the child's final
+// output is flushed through the redactor before the termination handoff.
 func TestChildOutputRedactedOnFailureExit(t *testing.T) {
 	root := t.TempDir()
 	remote := remoteWithExistingBranch(t, root)
@@ -1273,8 +1437,11 @@ exit 3
 
 	var output bytes.Buffer
 	var errorsOut bytes.Buffer
-	if code := run(context.Background(), &output, &errorsOut); code != 3 {
-		t.Fatalf("run exit code = %d, want the child's exit code 3", code)
+	if code := run(context.Background(), &output, &errorsOut); code != exitFailed {
+		t.Fatalf("run exit code = %d, want %d (the child's code must not pass through)", code, exitFailed)
+	}
+	if !strings.Contains(output.String(), "opencode exited with status 3") {
+		t.Fatalf("failure reason should keep the child's exit code: %q", output.String())
 	}
 	if strings.Contains(output.String(), testGitToken) {
 		t.Fatal("stdout contains a fake credential on the failure path (constant: testGitToken)")

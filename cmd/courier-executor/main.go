@@ -365,8 +365,12 @@ func run(ctx context.Context, stdout, stderr io.Writer) int {
 	// adopted branch describes an earlier run, and removeOutcomeDir's
 	// tracked-copy restore would read it back as this run's declaration.
 	// Drop it outright and recreate the directory for the coordinator to
-	// declare in (#169).
+	// declare in (#169). The best-effort cache drop keeps the stale file out
+	// of the index, so a mid-run `git restore .` cannot resurrect it.
 	_ = os.RemoveAll(filepath.Join(workspace.Directory, ".courier"))
+	dropStaged := exec.CommandContext(ctx, "git", "rm", "-r", "--cached", "--ignore-unmatch", "--", ".courier")
+	dropStaged.Dir = workspace.Directory
+	_ = dropStaged.Run()
 	_ = os.MkdirAll(filepath.Join(workspace.Directory, ".courier"), 0o755)
 	ready := map[string]any{
 		"adopted": workspace.Adopted,
@@ -420,8 +424,11 @@ func run(ctx context.Context, stdout, stderr io.Writer) int {
 		}
 		// A non-zero child exit is a failure, never a human-attention signal:
 		// only a coordinator-declared needs_decision may end the run that way.
-		report.terminate(termination{Phase: "Failed", Result: "failure", ExitCode: code, Reason: fmt.Sprintf("opencode exited with status %d", code)})
-		return code
+		// The child's raw code must not pass through: the operator maps 2 to
+		// NeedsHuman and 3 to Done, so terminate with the standard failure
+		// code and keep the child's code in the reason.
+		report.terminate(termination{Phase: "Failed", Result: "failure", ExitCode: exitFailed, Reason: fmt.Sprintf("opencode exited with status %d", code)})
+		return exitFailed
 	}
 
 	if workspace.Conflict != nil {
@@ -433,7 +440,7 @@ func run(ctx context.Context, stdout, stderr io.Writer) int {
 
 	// Read the coordinator's outcome declaration, then restore the tree so the
 	// declaration itself never reads back as workspace work (#169).
-	decl, declared, declErr := readOutcome(cfg.Directory)
+	decl, declared, declErr := readOutcome(workspace.Directory)
 	removeOutcomeDir(ctx, workspace.Directory)
 
 	workState, err := workspace.WorkState(ctx, startCommit)
@@ -471,9 +478,10 @@ func outcomeFile(dir string) string {
 
 // readOutcome reads and validates the coordinator's outcome declaration from
 // dir. A missing file returns (zero, false, nil): the run was simply
-// undeclared. Any read error, unparsable JSON, or a declaration that fails
-// its per-outcome field rule returns (zero, true, err) describing the
-// invalid declaration.
+// undeclared. A read error or unparsable JSON returns (zero, true, err). A
+// declaration that fails its per-outcome field rule, or names an unknown
+// outcome kind, returns the parsed declaration with (decl, true, err)
+// describing the invalid declaration.
 func readOutcome(dir string) (outcomeDeclaration, bool, error) {
 	data, err := os.ReadFile(outcomeFile(dir))
 	if os.IsNotExist(err) {
@@ -506,12 +514,17 @@ func readOutcome(dir string) (outcomeDeclaration, bool, error) {
 	return decl, true, nil
 }
 
-// removeOutcomeDir drops the coordinator's declaration directory and then
-// restores any tracked copy from HEAD, so a written (or wrongly committed)
-// outcome file never reads back as workspace work. The checkout is best-effort
-// and its failure ignored: it recreates nothing when the path was untracked.
+// removeOutcomeDir drops the coordinator's declaration directory, clears any
+// index entries the coordinator staged, and then restores any tracked copy
+// from HEAD, so a written, staged, or (wrongly) committed outcome file never
+// reads back as workspace work. Every step is best-effort and its failure
+// ignored: the cache drop is a no-op when the index holds no entry, and the
+// checkout recreates nothing when the path was untracked.
 func removeOutcomeDir(ctx context.Context, dir string) {
 	_ = os.RemoveAll(filepath.Join(dir, ".courier"))
+	dropStaged := exec.CommandContext(ctx, "git", "rm", "-r", "--cached", "--ignore-unmatch", "--", ".courier")
+	dropStaged.Dir = dir
+	_ = dropStaged.Run()
 	restore := exec.CommandContext(ctx, "git", "checkout", "HEAD", "--", ".courier")
 	restore.Dir = dir
 	_ = restore.Run()
@@ -533,7 +546,7 @@ func (r reporter) classify(ctx context.Context, workspace *git.Workspace, branch
 		return failed("opencode wrote an invalid outcome declaration: " + declErr.Error())
 	}
 	if declared {
-		return r.classifyDeclared(ctx, workspace, branch, startCommit, workState, decl, caps)
+		return r.classifyDeclared(ctx, workspace, branch, startCommit, workState, decl)
 	}
 	return r.classifyUndeclared(ctx, workspace, branch, startCommit, workState, caps)
 }
@@ -541,7 +554,7 @@ func (r reporter) classify(ctx context.Context, workspace *git.Workspace, branch
 // classifyDeclared resolves a valid coordinator declaration. A declared
 // changes ending is confirmed against the world: it succeeds only when the
 // #134 verification shows committed work reachable from the run branch.
-func (r reporter) classifyDeclared(ctx context.Context, workspace *git.Workspace, branch, startCommit string, workState git.WorkState, decl outcomeDeclaration, caps []executor.MCPCapability) termination {
+func (r reporter) classifyDeclared(ctx context.Context, workspace *git.Workspace, branch, startCommit string, workState git.WorkState, decl outcomeDeclaration) termination {
 	switch strings.TrimSpace(decl.Outcome) {
 	case outcomeChanges:
 		r.emitOutcomeDeclared(outcomeChanges)
@@ -630,12 +643,15 @@ func (r reporter) emitOutcomeDeclared(kind string) {
 
 // postOutcomeComment posts a terminal outcome's explanation onto the run's
 // issue or pull request. It is best-effort: a failure is recorded as an
-// outcome.comment error event and never changes the run's ending. Runs with
-// no positive reference to comment on are skipped silently.
+// outcome.comment error event and never changes the run's ending. The body is
+// model-authored and passes through the redactor before it leaves the
+// process, like every other external path.
 func (r reporter) postOutcomeComment(ctx context.Context, body string) {
 	if r.cfg.Ref < 1 {
+		r.event(courierlog.EventOutcomeComment, courierlog.StatusError, map[string]any{"status": "error", "reason": "no issue/PR reference to comment on"})
 		return
 	}
+	body = r.red.Redact(body)
 	owner, name, ok := splitOwnerRepo(r.cfg.Repo)
 	if !ok {
 		r.event(courierlog.EventOutcomeComment, courierlog.StatusError, map[string]any{"status": "error", "reason": "no owner/repo to comment on"})

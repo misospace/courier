@@ -170,8 +170,11 @@ human problem (#169):
   evidence to the issue/PR and the run ends **Done**, resolving the source
   (the Dispatch `already_addressed` settlement is the source-side companion).
 - **`needs_decision`** — a real design question; the executor posts the
-  question to the issue/PR and the run ends **NeedsHuman**. This is the *only*
-  coordinator-originated NeedsHuman.
+  question to the issue/PR and the run ends **NeedsHuman**. This is the only
+  NeedsHuman a coordinator declaration can produce; the deterministic
+  bootstrap guards (refusing adoption of a branch whose PRs are closed, an
+  abandoned base-sync merge) may still hand a run to a human, because no
+  coordinator decision was involved.
 - **`blocked_external`** — something outside the run is missing; the run ends
   **Failed** naming what is missing.
 
@@ -698,7 +701,8 @@ was superseded.
   against the world: `changes` still requires commits reachable from the run
   branch; `no_change_needed` posts the evidence to the issue/PR and exits to
   **Done** (exit code 3), resolving the source; `needs_decision` posts the
-  question and is the **only** coordinator-originated NeedsHuman;
+  question and is the only NeedsHuman a declaration can produce (the
+  deterministic bootstrap guards may still hand a run to a human);
   `blocked_external` fails naming the missing prerequisite. An undeclared
   zero-exit ending never terminates NeedsHuman directly — verified commits on
   the run branch still stand as Verifying, everything else fails as incomplete
