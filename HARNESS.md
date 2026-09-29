@@ -901,7 +901,7 @@ and the acceptance tests below are satisfied.
   startup grace prevent a false reap). No lease-expiry or hidden timeout
   test may stand in for evidence; the wedge is not detected, so #102 stays
   blocked for production until the §12 gates are met.
- - **Failure semantics:** workload failure and infrastructure failure are
+- **Failure semantics:** workload failure and infrastructure failure are
   distinguishable from trusted evidence; the operator's exit-code mapping
   follows DESIGN.md's exit contract.
 

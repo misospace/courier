@@ -505,7 +505,7 @@ it modest" with `concurrency: 1`. Same schema, no local assumption baked in.
   it the same way. A partial snapshot cannot pass. The source becomes
   in-review with the transition. Verifying does not consume LaneProfile
   execution capacity, and the source remains in-progress throughout it.
- - **AwaitingReview** is terminal for this run. Human merges → operator marks
+- **AwaitingReview** is terminal for this run. Human merges → operator marks
   **Done** and resolves the source; a `no_change_needed` ending arrives here
   with no PR, settled by the human reviewing the posted evidence; or
   feedback/conflict → the source spawns a fresh `fix-pr` run without reusing
@@ -718,7 +718,7 @@ was superseded.
   what is missing) — and the executor classifies from the declaration verified
   against the world: `changes` still requires commits reachable from the run
   branch; `no_change_needed` posts the evidence to the issue/PR and exits to
-   **Done** (exit code 3), resolving the source (source settlement revised
+  **Done** (exit code 3), resolving the source (source settlement revised
   2026-09-29, above); `needs_decision` posts the question and is the only
   NeedsHuman a declaration can produce (the deterministic bootstrap guards
   may still hand a run to a human);
