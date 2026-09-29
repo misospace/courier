@@ -200,6 +200,25 @@ func (w *Workspace) CurrentBranch(ctx context.Context) (string, error) {
 	return strings.TrimSpace(string(out)), nil
 }
 
+// StatusPorcelain lists the workspace's current changes in porcelain v1
+// form, including untracked files. An empty result is a clean worktree.
+func (w *Workspace) StatusPorcelain(ctx context.Context) ([]string, error) {
+	if w == nil || strings.TrimSpace(w.Directory) == "" {
+		return nil, errors.New("git status: workspace directory is required")
+	}
+	out, err := run(ctx, w.Directory, "status", "--porcelain=v1", "--untracked-files=all", "--", ".")
+	if err != nil {
+		return nil, err
+	}
+	var paths []string
+	for _, line := range strings.Split(string(out), "\n") {
+		if line = strings.TrimSpace(line); line != "" {
+			paths = append(paths, line)
+		}
+	}
+	return paths, nil
+}
+
 // CommitsOnBranchSince reports how many commits are reachable from the local
 // branch ref but not from startCommit. A branch ref that cannot be resolved
 // (e.g. it does not exist) reports 0 with no error, because the absence of

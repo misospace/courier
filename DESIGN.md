@@ -265,10 +265,13 @@ to die.
   single wedge.
 
 This heartbeat catches a *wedged* run but not a *spinning* one (busy-looping,
-streaming happily, converging on nothing). A conservative content-based
-loop-detector — the same tool call, same args, same result, N times — is a
-possible **V2** addition; it is orthogonal to the heartbeat and must be tuned not
-to false-kill genuinely slow, varied work.
+streaming happily, converging on nothing). #170 implemented a bounded,
+executor-level no-progress guard — the same workspace-state fingerprint and the
+same last assistant message twice, or the continuation cap — that terminates a
+stuck run as `NeedsHuman` with reason `looping`. A broader conservative
+content-based loop-detector — the same tool call, same args, same result, N
+times — remains a possible **V2** addition; it is orthogonal to the heartbeat
+and must be tuned not to false-kill genuinely slow, varied work.
 
 ## State and checkpointing
 
@@ -451,11 +454,18 @@ it modest" with `concurrency: 1`. Same schema, no local assumption baked in.
   any external observation, releasing the lane capacity — but only when the
   committed work is actually on the run branch: the bootstrap reads the run
   branch's own ref (not wherever HEAD happens to point), and committed work
-  that is not on the run branch transitions to **NeedsHuman** with a specific
-  reason rather than a later operator read of an empty branch as "no work"
-  (#134). Exit `2` transitions to **NeedsHuman**; any other exit transitions to
-  **Failed**. A pod death or heartbeat stall relaunches/resumes it; a crashloop
-  reaches NeedsHuman.
+  that is not on the run branch is a recoverable ending, reported with a
+  specific reason, rather than a later operator read of an empty branch as
+  "no work" (#134). Recoverable endings — uncommitted changes, commits off the
+  run branch, no commit and no declared outcome — do not terminate the run:
+  the executor resumes the same session with a short state message built from
+  world facts, up to `COURIER_MAX_CONTINUATIONS` times (default 3); a
+  no-progress guard (the same workspace-state fingerprint and the same last
+  assistant message twice) terminates earlier as **NeedsHuman** with reason
+  `looping` and the state history. A crash (a non-zero exit that is not 2)
+  resumes the session with exponential backoff before the run transitions to
+  **Failed**. Exit `2` transitions to **NeedsHuman** immediately. A pod death
+  or heartbeat stall relaunches/resumes it; a crashloop reaches NeedsHuman.
 - **Verifying** — no coordinator pod or liveness meaning. The operator polls
   the external PR and CI world indefinitely, with a reconciliation cadence and
   no deadline. Observer errors remain Verifying and requeue. A missing observer,
@@ -661,6 +671,19 @@ A running log of architectural decisions and their reasoning, newest first. The
 body above describes the current architecture; this log preserves *why* and what
 was superseded.
 
+- **2026-09-29 — Resume the coordinator session on recoverable endings.** A
+  run that ends recoverably — uncommitted changes, commits off the run branch,
+  no commit and no declared outcome — and a run whose session crashed, no longer
+  terminates at once. The executor resumes the same session with a short state
+  message built from world facts, up to `COURIER_MAX_CONTINUATIONS` times
+  (default 3); a no-progress guard — the same workspace-state fingerprint and
+  the same last assistant message twice — terminates earlier as `NeedsHuman`
+  with reason `looping` and the state history. A crash resumes with exponential
+  backoff before the run fails. Exit `2` remains an immediate `NeedsHuman`
+  passthrough. This extends the 2026-09-22 honest-termination decision (#81) and
+  the 2026-09-27 run-branch decision (#134), and follows the "inform, don't
+  constrain" principle: the model gets the facts and decides, and the harness
+  only stops genuinely stuck runs. (#170)
 - **2026-09-27 — #122 lands the broker publication primitives.** The broker owns
   the whole publication path: a pinned, non-force git transport to one explicit
   ref, a typed forge observer (never raw forge calls), an authenticated

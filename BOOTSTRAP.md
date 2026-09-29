@@ -107,9 +107,14 @@ spec:
 The operator derives the resolve branch, creates the coordinator pod, and
 observes its exit. Exit `0` moves the run to `Verifying`, where the operator
 polls the external PR and CI state until it reaches `AwaitingReview` or
-`NeedsHuman`; exit `2` moves it to `NeedsHuman`; any other exit moves it to
-`Failed`.
+`NeedsHuman`. Recoverable endings — uncommitted changes, commits off the run
+branch, no commit and no declared outcome — resume the same session with a short
+state message, up to `COURIER_MAX_CONTINUATIONS` times (default 3); a
+no-progress guard (the same workspace state and the same last assistant message
+twice) ends the run `NeedsHuman` with reason `looping`. A crash resumes the
+session with backoff before the run moves to `Failed`. Exit `2` moves it to
+`NeedsHuman` immediately.
 
-The OpenCode shim does not survive pod/model restarts with conversational state.
-Git commits and the remote branch are its durable floor until the custom harness
-replaces it.
+The OpenCode shim resumes a run's session only inside the running pod; it does
+not survive pod/model restarts with conversational state. Git commits and the
+remote branch are its durable floor until the custom harness replaces it.

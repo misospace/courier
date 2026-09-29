@@ -50,6 +50,7 @@ type Invocation struct {
 	Model     string
 	Roles     map[string]string
 	Framing   string
+	Session   string
 	Workspace string
 	Debug     bool
 }

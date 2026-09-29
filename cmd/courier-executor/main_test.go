@@ -14,6 +14,7 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/misospace/courier/internal/executor"
 	courierlog "github.com/misospace/courier/internal/log"
@@ -324,7 +325,10 @@ func TestRunAbandonedConflictMergeBecomesNeedsHuman(t *testing.T) {
 	}
 }
 
-func TestRunExitZeroWithoutLocalWorkBecomesNeedsHuman(t *testing.T) {
+// TestRunExitZeroWithoutLocalWorkLoopsToNeedsHuman is the no-work case under
+// resume: the script leaves the same empty state twice, so the run resumes once
+// and then the loop guard stops it as NeedsHuman with a looping reason.
+func TestRunExitZeroWithoutLocalWorkLoopsToNeedsHuman(t *testing.T) {
 	root := t.TempDir()
 	remote := remoteWithExistingBranch(t, root)
 	fakeOpenCode := filepath.Join(root, "opencode")
@@ -335,18 +339,25 @@ func TestRunExitZeroWithoutLocalWorkBecomesNeedsHuman(t *testing.T) {
 	}))
 	defer prServer.Close()
 	setResolveIssueEnv(t, root, remote, prServer.URL, fakeOpenCode)
+	t.Setenv("COURIER_RESUME_BACKOFF_SECONDS", "0")
 
 	var output bytes.Buffer
 	var errorsOut bytes.Buffer
 	if code := run(context.Background(), &output, &errorsOut); code != exitNeedsHuman {
 		t.Fatalf("run exit code = %d, want %d; stderr=%q stdout=%q", code, exitNeedsHuman, errorsOut.String(), output.String())
 	}
-	if !strings.Contains(output.String(), "without producing a commit or workspace changes") {
-		t.Fatalf("no-op reason = %q", output.String())
+	if !strings.Contains(output.String(), `"phase":"NeedsHuman"`) {
+		t.Fatalf("no-op reason lost the NeedsHuman phase: %q", output.String())
+	}
+	if !strings.Contains(output.String(), "looping") {
+		t.Fatalf("no-op reason = %q, want a looping reason", output.String())
 	}
 }
 
-func TestRunExitZeroWithDirtyWorkBecomesNeedsHuman(t *testing.T) {
+// TestRunExitZeroWithDirtyWorkLoopsToNeedsHuman is the dirty-work case under
+// resume: the script leaves the same uncommitted file twice, so the run resumes
+// once and then the loop guard stops it as NeedsHuman with a looping reason.
+func TestRunExitZeroWithDirtyWorkLoopsToNeedsHuman(t *testing.T) {
 	root := t.TempDir()
 	remote := remoteWithExistingBranch(t, root)
 	fakeOpenCode := filepath.Join(root, "opencode")
@@ -357,18 +368,25 @@ func TestRunExitZeroWithDirtyWorkBecomesNeedsHuman(t *testing.T) {
 	}))
 	defer prServer.Close()
 	setResolveIssueEnv(t, root, remote, prServer.URL, fakeOpenCode)
+	t.Setenv("COURIER_RESUME_BACKOFF_SECONDS", "0")
 
 	var output bytes.Buffer
 	var errorsOut bytes.Buffer
 	if code := run(context.Background(), &output, &errorsOut); code != exitNeedsHuman {
 		t.Fatalf("run exit code = %d, want %d; stderr=%q stdout=%q", code, exitNeedsHuman, errorsOut.String(), output.String())
 	}
-	if !strings.Contains(output.String(), "uncommitted workspace changes") {
-		t.Fatalf("dirty-work reason = %q", output.String())
+	if !strings.Contains(output.String(), `"phase":"NeedsHuman"`) {
+		t.Fatalf("dirty-work reason lost the NeedsHuman phase: %q", output.String())
+	}
+	if !strings.Contains(output.String(), "looping") {
+		t.Fatalf("dirty-work reason = %q, want a looping reason", output.String())
 	}
 }
 
-func TestRunCommittedWorkOnWrongBranchBecomesNeedsHuman(t *testing.T) {
+// TestRunCommittedWorkOnWrongBranchLoopsToNeedsHuman is the off-branch case
+// under resume: the script commits on a side branch twice, so the run resumes
+// once and then the loop guard stops it as NeedsHuman with a looping reason.
+func TestRunCommittedWorkOnWrongBranchLoopsToNeedsHuman(t *testing.T) {
 	root := t.TempDir()
 	remote := remoteWithExistingBranch(t, root)
 	fakeOpenCode := filepath.Join(root, "opencode")
@@ -379,21 +397,26 @@ func TestRunCommittedWorkOnWrongBranchBecomesNeedsHuman(t *testing.T) {
 	}))
 	defer prServer.Close()
 	setResolveIssueEnv(t, root, remote, prServer.URL, fakeOpenCode)
+	t.Setenv("COURIER_RESUME_BACKOFF_SECONDS", "0")
 
 	var output bytes.Buffer
 	var errorsOut bytes.Buffer
 	if code := run(context.Background(), &output, &errorsOut); code != exitNeedsHuman {
 		t.Fatalf("run exit code = %d, want %d; stderr=%q stdout=%q", code, exitNeedsHuman, errorsOut.String(), output.String())
 	}
-	if !strings.Contains(output.String(), "not on the run branch") {
-		t.Fatalf("wrong-branch reason = %q", output.String())
+	if !strings.Contains(output.String(), `"phase":"NeedsHuman"`) {
+		t.Fatalf("wrong-branch reason lost the NeedsHuman phase: %q", output.String())
 	}
-	if !strings.Contains(output.String(), "fix/elsewhere") {
-		t.Fatalf("wrong-branch reason should name the wrong branch: %q", output.String())
+	if !strings.Contains(output.String(), "looping") {
+		t.Fatalf("wrong-branch reason = %q, want a looping reason", output.String())
 	}
 }
 
-func TestRunDetachedHeadCommitBecomesNeedsHuman(t *testing.T) {
+// TestRunDetachedHeadCommitLoopsToNeedsHuman is the detached-HEAD off-branch
+// case under resume: the script commits on a detached HEAD twice, so the run
+// resumes once and then the loop guard stops it as NeedsHuman with a looping
+// reason.
+func TestRunDetachedHeadCommitLoopsToNeedsHuman(t *testing.T) {
 	root := t.TempDir()
 	remote := remoteWithExistingBranch(t, root)
 	fakeOpenCode := filepath.Join(root, "opencode")
@@ -404,17 +427,18 @@ func TestRunDetachedHeadCommitBecomesNeedsHuman(t *testing.T) {
 	}))
 	defer prServer.Close()
 	setResolveIssueEnv(t, root, remote, prServer.URL, fakeOpenCode)
+	t.Setenv("COURIER_RESUME_BACKOFF_SECONDS", "0")
 
 	var output bytes.Buffer
 	var errorsOut bytes.Buffer
 	if code := run(context.Background(), &output, &errorsOut); code != exitNeedsHuman {
 		t.Fatalf("run exit code = %d, want %d; stderr=%q stdout=%q", code, exitNeedsHuman, errorsOut.String(), output.String())
 	}
-	if !strings.Contains(output.String(), "detached HEAD") {
-		t.Fatalf("detached-HEAD reason = %q", output.String())
+	if !strings.Contains(output.String(), `"phase":"NeedsHuman"`) {
+		t.Fatalf("detached-HEAD reason lost the NeedsHuman phase: %q", output.String())
 	}
-	if !strings.Contains(output.String(), "not on the run branch") {
-		t.Fatalf("detached-HEAD reason should name the run branch: %q", output.String())
+	if !strings.Contains(output.String(), "looping") {
+		t.Fatalf("detached-HEAD reason = %q, want a looping reason", output.String())
 	}
 }
 
@@ -490,6 +514,401 @@ func TestRunPreservesExplicitNeedsHumanSignal(t *testing.T) {
 	}
 }
 
+// TestRunUncommittedWorkResumesAndSucceeds proves a recoverable dirty exit
+// resumes the same session with an uncommitted state message, and a second
+// turn that commits the work lands the run in Verifying.
+func TestRunUncommittedWorkResumesAndSucceeds(t *testing.T) {
+	root := t.TempDir()
+	remote := remoteWithExistingBranch(t, root)
+	fakeOpenCode := filepath.Join(root, "opencode")
+	writeExecutable(t, fakeOpenCode, `#!/bin/sh
+case "$1" in mcp) exit 0;; esac
+printf '%s\n' "$(printf '%s' "$*" | tr '\n' ' ')" >> "$COURIER_FAKE_STATE/argv.log"
+SESSION=
+for a in "$@"; do
+  case "$a" in --session) SESSION=1;; esac
+done
+if [ -n "$SESSION" ]; then
+  git add --all -- .
+  git commit -m 'test: committed the partial work' >/dev/null
+  exit 0
+fi
+printf '{"type":"text","sessionID":"ses_resume1","part":{"type":"text","text":"partial work"}}\n'
+printf 'partial\n' > partial.txt
+exit 0
+`)
+	prServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `[]`)
+	}))
+	defer prServer.Close()
+	setContinuationEnv(t, root, remote, prServer.URL, fakeOpenCode)
+
+	var output bytes.Buffer
+	var errorsOut bytes.Buffer
+	if code := run(context.Background(), &output, &errorsOut); code != exitSuccess {
+		t.Fatalf("run exit code = %d, want 0; stderr=%q stdout=%q", code, errorsOut.String(), output.String())
+	}
+	if !strings.Contains(output.String(), `"phase":"Verifying"`) {
+		t.Fatalf("missing Verifying termination: %q", output.String())
+	}
+
+	events := parseEvents(t, &output)
+	if n := countEvents(t, events, "executor.continuation"); n != 1 {
+		t.Fatalf("executor.continuation count = %d, want 1", n)
+	}
+	detail := eventDetail(t, findEvent(t, events, "executor.continuation"))
+	if detail["kind"] != "uncommitted" {
+		t.Fatalf("continuation kind = %v, want uncommitted", detail["kind"])
+	}
+	if detail["continuation"] != float64(1) {
+		t.Fatalf("continuation number = %v, want 1", detail["continuation"])
+	}
+
+	calls := readArgvLog(t, filepath.Join(root, "fakestate"))
+	if len(calls) != 2 {
+		t.Fatalf("fake script invoked %d times, want 2: %q", len(calls), calls)
+	}
+	if !strings.Contains(calls[1], "--session ses_resume1") {
+		t.Fatalf("resumed call did not carry --session ses_resume1: %q", calls[1])
+	}
+	if !strings.Contains(calls[1], "uncommitted changes in") || !strings.Contains(calls[1], "partial.txt") {
+		t.Fatalf("resumed call lost the uncommitted state message: %q", calls[1])
+	}
+}
+
+// TestRunNoWorkResumesAndSucceeds proves a recoverable no-work exit resumes
+// the same session with a no-work state message, and a second turn that commits
+// lands the run in Verifying.
+func TestRunNoWorkResumesAndSucceeds(t *testing.T) {
+	root := t.TempDir()
+	remote := remoteWithExistingBranch(t, root)
+	fakeOpenCode := filepath.Join(root, "opencode")
+	writeExecutable(t, fakeOpenCode, `#!/bin/sh
+case "$1" in mcp) exit 0;; esac
+printf '%s\n' "$(printf '%s' "$*" | tr '\n' ' ')" >> "$COURIER_FAKE_STATE/argv.log"
+SESSION=
+for a in "$@"; do
+  case "$a" in --session) SESSION=1;; esac
+done
+if [ -n "$SESSION" ]; then
+  printf 'done\n' > done.txt
+  git add --all -- .
+  git commit -m 'test: produced the work' >/dev/null
+  exit 0
+fi
+printf '{"type":"text","sessionID":"ses_nowork1","part":{"type":"text","text":"nothing yet"}}\n'
+exit 0
+`)
+	prServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `[]`)
+	}))
+	defer prServer.Close()
+	setContinuationEnv(t, root, remote, prServer.URL, fakeOpenCode)
+
+	var output bytes.Buffer
+	var errorsOut bytes.Buffer
+	if code := run(context.Background(), &output, &errorsOut); code != exitSuccess {
+		t.Fatalf("run exit code = %d, want 0; stderr=%q stdout=%q", code, errorsOut.String(), output.String())
+	}
+	if !strings.Contains(output.String(), `"phase":"Verifying"`) {
+		t.Fatalf("missing Verifying termination: %q", output.String())
+	}
+
+	events := parseEvents(t, &output)
+	if n := countEvents(t, events, "executor.continuation"); n != 1 {
+		t.Fatalf("executor.continuation count = %d, want 1", n)
+	}
+	detail := eventDetail(t, findEvent(t, events, "executor.continuation"))
+	if detail["kind"] != "no-work" {
+		t.Fatalf("continuation kind = %v, want no-work", detail["kind"])
+	}
+	if detail["continuation"] != float64(1) {
+		t.Fatalf("continuation number = %v, want 1", detail["continuation"])
+	}
+
+	calls := readArgvLog(t, filepath.Join(root, "fakestate"))
+	if len(calls) != 2 {
+		t.Fatalf("fake script invoked %d times, want 2: %q", len(calls), calls)
+	}
+	if !strings.Contains(calls[1], "--session ses_nowork1") {
+		t.Fatalf("resumed call did not carry --session ses_nowork1: %q", calls[1])
+	}
+	if !strings.Contains(calls[1], "without producing a commit or workspace changes") {
+		t.Fatalf("resumed call lost the no-work state message: %q", calls[1])
+	}
+}
+
+// TestRunOffBranchResumesAndSucceeds proves a recoverable off-branch exit
+// resumes the same session with an off-branch state message, and a second turn
+// that moves the commit onto the run branch lands the run in Verifying.
+func TestRunOffBranchResumesAndSucceeds(t *testing.T) {
+	root := t.TempDir()
+	remote := remoteWithExistingBranch(t, root)
+	fakeOpenCode := filepath.Join(root, "opencode")
+	writeExecutable(t, fakeOpenCode, `#!/bin/sh
+case "$1" in mcp) exit 0;; esac
+printf '%s\n' "$(printf '%s' "$*" | tr '\n' ' ')" >> "$COURIER_FAKE_STATE/argv.log"
+SESSION=
+for a in "$@"; do
+  case "$a" in --session) SESSION=1;; esac
+done
+if [ -n "$SESSION" ]; then
+  git branch -f "$COURIER_BRANCH" HEAD
+  exit 0
+fi
+git checkout -b side/branch
+printf 'side\n' > side.txt
+git add --all -- .
+git commit -m 'test: work on a side branch' >/dev/null
+printf '{"type":"text","sessionID":"ses_offbranch1","part":{"type":"text","text":"committed off branch"}}\n'
+exit 0
+`)
+	prServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `[]`)
+	}))
+	defer prServer.Close()
+	setContinuationEnv(t, root, remote, prServer.URL, fakeOpenCode)
+
+	var output bytes.Buffer
+	var errorsOut bytes.Buffer
+	if code := run(context.Background(), &output, &errorsOut); code != exitSuccess {
+		t.Fatalf("run exit code = %d, want 0; stderr=%q stdout=%q", code, errorsOut.String(), output.String())
+	}
+	if !strings.Contains(output.String(), `"phase":"Verifying"`) {
+		t.Fatalf("missing Verifying termination: %q", output.String())
+	}
+
+	events := parseEvents(t, &output)
+	if n := countEvents(t, events, "executor.continuation"); n != 1 {
+		t.Fatalf("executor.continuation count = %d, want 1", n)
+	}
+	detail := eventDetail(t, findEvent(t, events, "executor.continuation"))
+	if detail["kind"] != "off-branch" {
+		t.Fatalf("continuation kind = %v, want off-branch", detail["kind"])
+	}
+	if detail["continuation"] != float64(1) {
+		t.Fatalf("continuation number = %v, want 1", detail["continuation"])
+	}
+
+	calls := readArgvLog(t, filepath.Join(root, "fakestate"))
+	if len(calls) != 2 {
+		t.Fatalf("fake script invoked %d times, want 2: %q", len(calls), calls)
+	}
+	if !strings.Contains(calls[1], "--session ses_offbranch1") {
+		t.Fatalf("resumed call did not carry --session ses_offbranch1: %q", calls[1])
+	}
+	if !strings.Contains(calls[1], "not on the run branch") {
+		t.Fatalf("resumed call lost the off-branch state message: %q", calls[1])
+	}
+}
+
+// TestRunLoopGuardStopsOnRepeatedState proves a run that leaves the identical
+// dirty state on every turn resumes once and then the loop guard stops it,
+// naming the repeated uncommitted state in the reason.
+func TestRunLoopGuardStopsOnRepeatedState(t *testing.T) {
+	root := t.TempDir()
+	remote := remoteWithExistingBranch(t, root)
+	fakeOpenCode := filepath.Join(root, "opencode")
+	writeExecutable(t, fakeOpenCode, `#!/bin/sh
+case "$1" in mcp) exit 0;; esac
+printf '%s\n' "$(printf '%s' "$*" | tr '\n' ' ')" >> "$COURIER_FAKE_STATE/argv.log"
+printf '{"type":"text","sessionID":"ses_loop1","part":{"type":"text","text":"same text"}}\n'
+printf 'partial\n' > partial.txt
+exit 0
+`)
+	prServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `[]`)
+	}))
+	defer prServer.Close()
+	setContinuationEnv(t, root, remote, prServer.URL, fakeOpenCode)
+
+	var output bytes.Buffer
+	var errorsOut bytes.Buffer
+	if code := run(context.Background(), &output, &errorsOut); code != exitNeedsHuman {
+		t.Fatalf("run exit code = %d, want %d; stderr=%q stdout=%q", code, exitNeedsHuman, errorsOut.String(), output.String())
+	}
+	if !strings.Contains(output.String(), "looping:") {
+		t.Fatalf("reason = %q, want a looping: reason", output.String())
+	}
+	if !strings.Contains(output.String(), "uncommitted [") {
+		t.Fatalf("reason = %q, want the uncommitted summary in the looping history", output.String())
+	}
+
+	events := parseEvents(t, &output)
+	if n := countEvents(t, events, "executor.continuation"); n != 1 {
+		t.Fatalf("executor.continuation count = %d, want 1 (first classification resumes once, second identical loops)", n)
+	}
+}
+
+// TestRunLoopGuardStopsAtContinuationCap proves a run whose state keeps
+// changing (so the no-progress guard never fires) is still stopped once it
+// exhausts the continuation budget, reporting the budget and each numbered
+// continuation.
+func TestRunLoopGuardStopsAtContinuationCap(t *testing.T) {
+	root := t.TempDir()
+	remote := remoteWithExistingBranch(t, root)
+	fakeOpenCode := filepath.Join(root, "opencode")
+	writeExecutable(t, fakeOpenCode, `#!/bin/sh
+case "$1" in mcp) exit 0;; esac
+printf '%s\n' "$(printf '%s' "$*" | tr '\n' ' ')" >> "$COURIER_FAKE_STATE/argv.log"
+N=$(cat "$COURIER_FAKE_STATE/count" 2>/dev/null || echo 0)
+N=$((N+1))
+echo "$N" > "$COURIER_FAKE_STATE/count"
+printf '{"type":"text","sessionID":"ses_cap1","part":{"type":"text","text":"unique text turn %s"}}\n' "$N"
+exit 0
+`)
+	prServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `[]`)
+	}))
+	defer prServer.Close()
+	setContinuationEnv(t, root, remote, prServer.URL, fakeOpenCode)
+	t.Setenv("COURIER_MAX_CONTINUATIONS", "2")
+
+	var output bytes.Buffer
+	var errorsOut bytes.Buffer
+	if code := run(context.Background(), &output, &errorsOut); code != exitNeedsHuman {
+		t.Fatalf("run exit code = %d, want %d; stderr=%q stdout=%q", code, exitNeedsHuman, errorsOut.String(), output.String())
+	}
+	if !strings.Contains(output.String(), "looping after 2 continuations:") {
+		t.Fatalf("reason = %q, want the continuation-cap reason", output.String())
+	}
+
+	events := parseEvents(t, &output)
+	if n := countEvents(t, events, "executor.continuation"); n != 2 {
+		t.Fatalf("executor.continuation count = %d, want 2", n)
+	}
+	if got := eventDetail(t, findEvent(t, events, "executor.continuation"))["continuation"]; got != float64(1) {
+		t.Fatalf("first continuation number = %v, want 1", got)
+	}
+	var sawTwo bool
+	for _, event := range events {
+		if event["event"] != "executor.continuation" {
+			continue
+		}
+		if d, ok := event["detail"].(map[string]any); ok && d["continuation"] == float64(2) {
+			sawTwo = true
+		}
+	}
+	if !sawTwo {
+		t.Fatalf("no continuation numbered 2 among events: %q", output.String())
+	}
+}
+
+// TestRunCrashResumesAndSucceeds proves a crashing turn (non-zero, non-2)
+// that captured a session id is resumed with a crash state message, and a
+// second turn that commits lands the run in Verifying.
+func TestRunCrashResumesAndSucceeds(t *testing.T) {
+	root := t.TempDir()
+	remote := remoteWithExistingBranch(t, root)
+	fakeOpenCode := filepath.Join(root, "opencode")
+	writeExecutable(t, fakeOpenCode, `#!/bin/sh
+case "$1" in mcp) exit 0;; esac
+printf '%s\n' "$(printf '%s' "$*" | tr '\n' ' ')" >> "$COURIER_FAKE_STATE/argv.log"
+SESSION=
+for a in "$@"; do
+  case "$a" in --session) SESSION=1;; esac
+done
+if [ -n "$SESSION" ]; then
+  printf 'recovered\n' > recovered.txt
+  git add --all -- .
+  git commit -m 'test: recovered after crash' >/dev/null
+  exit 0
+fi
+printf '{"type":"text","sessionID":"ses_crash1","part":{"type":"text","text":"about to crash"}}\n'
+exit 1
+`)
+	prServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `[]`)
+	}))
+	defer prServer.Close()
+	setContinuationEnv(t, root, remote, prServer.URL, fakeOpenCode)
+
+	var output bytes.Buffer
+	var errorsOut bytes.Buffer
+	if code := run(context.Background(), &output, &errorsOut); code != exitSuccess {
+		t.Fatalf("run exit code = %d, want 0; stderr=%q stdout=%q", code, errorsOut.String(), output.String())
+	}
+	if !strings.Contains(output.String(), `"phase":"Verifying"`) {
+		t.Fatalf("missing Verifying termination: %q", output.String())
+	}
+
+	events := parseEvents(t, &output)
+	if n := countEvents(t, events, "executor.continuation"); n != 1 {
+		t.Fatalf("executor.continuation count = %d, want 1", n)
+	}
+	detail := eventDetail(t, findEvent(t, events, "executor.continuation"))
+	if detail["kind"] != "crash" {
+		t.Fatalf("continuation kind = %v, want crash", detail["kind"])
+	}
+	if detail["code"] != float64(1) {
+		t.Fatalf("continuation code = %v, want 1", detail["code"])
+	}
+	if detail["continuation"] != float64(1) {
+		t.Fatalf("continuation number = %v, want 1", detail["continuation"])
+	}
+
+	calls := readArgvLog(t, filepath.Join(root, "fakestate"))
+	if len(calls) != 2 {
+		t.Fatalf("fake script invoked %d times, want 2: %q", len(calls), calls)
+	}
+	if !strings.Contains(calls[1], "--session ses_crash1") {
+		t.Fatalf("resumed call did not carry --session ses_crash1: %q", calls[1])
+	}
+}
+
+// TestRunCrashFailsAfterBudget proves a run that keeps crashing exhausts the
+// continuation budget and then fails with the child's exit code, reporting the
+// number of continuations.
+func TestRunCrashFailsAfterBudget(t *testing.T) {
+	root := t.TempDir()
+	remote := remoteWithExistingBranch(t, root)
+	fakeOpenCode := filepath.Join(root, "opencode")
+	writeExecutable(t, fakeOpenCode, `#!/bin/sh
+case "$1" in mcp) exit 0;; esac
+printf '%s\n' "$(printf '%s' "$*" | tr '\n' ' ')" >> "$COURIER_FAKE_STATE/argv.log"
+printf '{"type":"text","sessionID":"ses_crashfail","part":{"type":"text","text":"crashing again"}}\n'
+exit 1
+`)
+	prServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `[]`)
+	}))
+	defer prServer.Close()
+	setContinuationEnv(t, root, remote, prServer.URL, fakeOpenCode)
+	t.Setenv("COURIER_MAX_CONTINUATIONS", "2")
+
+	var output bytes.Buffer
+	var errorsOut bytes.Buffer
+	if code := run(context.Background(), &output, &errorsOut); code != 1 {
+		t.Fatalf("run exit code = %d, want the child's code 1; stderr=%q stdout=%q", code, errorsOut.String(), output.String())
+	}
+	if !strings.Contains(output.String(), `"phase":"Failed"`) {
+		t.Fatalf("missing Failed termination: %q", output.String())
+	}
+	if !strings.Contains(output.String(), "opencode exited with status 1 after 2 continuations") {
+		t.Fatalf("failure reason = %q, want the budget-exhausted reason", output.String())
+	}
+
+	events := parseEvents(t, &output)
+	if n := countEvents(t, events, "executor.continuation"); n != 2 {
+		t.Fatalf("executor.continuation count = %d, want 2", n)
+	}
+	for _, event := range events {
+		if event["event"] != "executor.continuation" {
+			continue
+		}
+		if d := eventDetail(t, event); d["kind"] != "crash" {
+			t.Fatalf("continuation kind = %v, want crash", d["kind"])
+		}
+	}
+}
+
 func TestReadConfigGitHubTokenPrecedenceAndFallback(t *testing.T) {
 	base := map[string]string{
 		"COURIER_REPO_URL": "https://git.example/acme/widgets.git",
@@ -519,6 +938,56 @@ func TestReadConfigGitHubTokenPrecedenceAndFallback(t *testing.T) {
 			}
 			if cfg.GitHubToken != test.wantGitHub {
 				t.Fatalf("GitHub token = %q, want %q", cfg.GitHubToken, test.wantGitHub)
+			}
+		})
+	}
+}
+
+// TestReadConfigContinuationDefaults proves the continuation budget and resume
+// backoff parse their env vars and fall back to defaults on bad values.
+func TestReadConfigContinuationDefaults(t *testing.T) {
+	base := map[string]string{
+		"COURIER_REPO_URL": "https://git.example/acme/widgets.git",
+		"COURIER_BRANCH":   "feature/7",
+		"COURIER_GOAL":     "goal",
+		"COURIER_MODEL":    "model",
+	}
+	for _, test := range []struct {
+		name        string
+		maxCont     string
+		backoff     string
+		wantMax     int
+		wantBackoff time.Duration
+	}{
+		{name: "defaults when unset", wantMax: 3, wantBackoff: 5 * time.Second},
+		{name: "valid max continuations", maxCont: "5", wantMax: 5, wantBackoff: 5 * time.Second},
+		{name: "unparseable max continuations", maxCont: "abc", wantMax: 3, wantBackoff: 5 * time.Second},
+		{name: "zero max continuations", maxCont: "0", wantMax: 3, wantBackoff: 5 * time.Second},
+		{name: "valid resume backoff", backoff: "2.5", wantMax: 3, wantBackoff: 2500 * time.Millisecond},
+		{name: "unparseable resume backoff", backoff: "abc", wantMax: 3, wantBackoff: 5 * time.Second},
+		{name: "negative resume backoff", backoff: "-1", wantMax: 3, wantBackoff: 5 * time.Second},
+		{name: "zero resume backoff", backoff: "0", wantMax: 3, wantBackoff: 0},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			values := make(map[string]string, len(base)+2)
+			for key, value := range base {
+				values[key] = value
+			}
+			if test.maxCont != "" {
+				values["COURIER_MAX_CONTINUATIONS"] = test.maxCont
+			}
+			if test.backoff != "" {
+				values["COURIER_RESUME_BACKOFF_SECONDS"] = test.backoff
+			}
+			cfg, err := readConfig(func(name string) string { return values[name] })
+			if err != nil {
+				t.Fatalf("readConfig() error = %v", err)
+			}
+			if cfg.MaxContinuations != test.wantMax {
+				t.Fatalf("MaxContinuations = %d, want %d", cfg.MaxContinuations, test.wantMax)
+			}
+			if cfg.ResumeBackoff != test.wantBackoff {
+				t.Fatalf("ResumeBackoff = %v, want %v", cfg.ResumeBackoff, test.wantBackoff)
 			}
 		})
 	}
@@ -1213,6 +1682,30 @@ func findEvent(t *testing.T, events []map[string]any, eventType string) map[stri
 	return nil
 }
 
+// countEvents reports how many events of a type are present, for assertions
+// that a continuation fired exactly N times.
+func countEvents(t *testing.T, events []map[string]any, eventType string) int {
+	t.Helper()
+	n := 0
+	for _, event := range events {
+		if event["event"] == eventType {
+			n++
+		}
+	}
+	return n
+}
+
+// eventDetail returns the decoded detail object of an event, failing the test
+// when the event carries no detail (e.g. emitted at a non-debug level).
+func eventDetail(t *testing.T, event map[string]any) map[string]any {
+	t.Helper()
+	detail, ok := event["detail"].(map[string]any)
+	if !ok {
+		t.Fatalf("event %v carries no detail object", event["event"])
+	}
+	return detail
+}
+
 func secretConstantName(value string) string {
 	switch value {
 	case testGitToken:
@@ -1285,6 +1778,39 @@ func setResolveIssueEnv(t *testing.T, root, remote, githubBase, openCodeBinary s
 	t.Setenv("COURIER_OPENCODE_BINARY", openCodeBinary)
 	t.Setenv("COURIER_TERMINATION_FILE", termination)
 	return workspace
+}
+
+// setContinuationEnv configures a resolve-issue run for the resume and loop
+// tests: zero resume backoff so a crash resume never sleeps, debug event detail
+// so the executor.continuation payload is present, and a fake-script state dir
+// OUTSIDE the workspace (exported as COURIER_FAKE_STATE) so the script's argv
+// log and counters cannot pollute the workspace's WorkState.
+func setContinuationEnv(t *testing.T, root, remote, githubBase, openCodeBinary string) string {
+	t.Helper()
+	stateDir := filepath.Join(root, "fakestate")
+	if err := os.MkdirAll(stateDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	workspace := setResolveIssueEnv(t, root, remote, githubBase, openCodeBinary)
+	// Run identity is required or the emitter drops every event line.
+	t.Setenv("COURIER_RUN_NAME", "coderrun-it-7")
+	t.Setenv("COURIER_REF", "7")
+	t.Setenv("COURIER_RESUME_BACKOFF_SECONDS", "0")
+	t.Setenv("COURIER_LOG_LEVEL", "debug")
+	t.Setenv("COURIER_FAKE_STATE", stateDir)
+	return workspace
+}
+
+// readArgvLog returns the argv lines the fake script recorded, one per
+// invocation, in order. The first line is the initial call; any later line is
+// a resume.
+func readArgvLog(t *testing.T, stateDir string) []string {
+	t.Helper()
+	data, err := os.ReadFile(filepath.Join(stateDir, "argv.log"))
+	if err != nil {
+		t.Fatalf("read fake-script argv log: %v", err)
+	}
+	return strings.Split(strings.TrimSuffix(string(data), "\n"), "\n")
 }
 
 func configureGit(t *testing.T, directory string) {
