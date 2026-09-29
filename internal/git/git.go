@@ -200,23 +200,60 @@ func (w *Workspace) CurrentBranch(ctx context.Context) (string, error) {
 	return strings.TrimSpace(string(out)), nil
 }
 
-// StatusPorcelain lists the workspace's current changes in porcelain v1
+// StatusPorcelain lists the workspace's current change paths in porcelain v1
 // form, including untracked files. An empty result is a clean worktree.
 func (w *Workspace) StatusPorcelain(ctx context.Context) ([]string, error) {
 	if w == nil || strings.TrimSpace(w.Directory) == "" {
 		return nil, errors.New("git status: workspace directory is required")
 	}
-	out, err := run(ctx, w.Directory, "status", "--porcelain=v1", "--untracked-files=all", "--", ".")
+	out, err := run(ctx, w.Directory, "status", "--porcelain=v1", "-z", "--untracked-files=all", "--", ".")
 	if err != nil {
 		return nil, err
 	}
+	// With -z each entry is NUL-separated: "XY path", and a rename or copy
+	// (R/C status) is followed by the origin path as its own record, which is
+	// not a change of its own.
 	var paths []string
-	for _, line := range strings.Split(string(out), "\n") {
-		if line = strings.TrimSpace(line); line != "" {
-			paths = append(paths, line)
+	records := strings.Split(string(out), "\x00")
+	for i := 0; i < len(records); i++ {
+		record := records[i]
+		if len(record) < 4 {
+			continue
 		}
+		if isRenameStatus(record[:2]) {
+			i++
+		}
+		paths = append(paths, unquoteCPath(record[3:]))
 	}
 	return paths, nil
+}
+
+// isRenameStatus reports whether a porcelain v1 status pair is a rename (R)
+// or copy (C) entry whose next NUL record is the origin path.
+func isRenameStatus(status string) bool {
+	return status[0] == 'R' || status[0] == 'C'
+}
+
+// unquoteCPath strips C-style quoting from a git path: surrounding quotes and
+// backslash escapes.
+func unquoteCPath(path string) string {
+	if len(path) < 2 || path[0] != '"' || path[len(path)-1] != '"' {
+		return path
+	}
+	inner := path[1 : len(path)-1]
+	if !strings.Contains(inner, "\\") {
+		return inner
+	}
+	var b strings.Builder
+	for i := 0; i < len(inner); i++ {
+		if inner[i] == '\\' && i+1 < len(inner) {
+			i++
+			b.WriteByte(inner[i])
+			continue
+		}
+		b.WriteByte(inner[i])
+	}
+	return b.String()
 }
 
 // CommitsOnBranchSince reports how many commits are reachable from the local

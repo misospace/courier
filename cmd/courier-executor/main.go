@@ -15,10 +15,11 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"net/url"
 	"os"
 	"os/exec"
-	"sort"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -92,7 +93,7 @@ func readConfig(getenv func(string) string) (config, error) {
 		maxContinuations = defaultMaxContinuations
 	}
 	resumeBackoff, err := strconv.ParseFloat(strings.TrimSpace(getenv("COURIER_RESUME_BACKOFF_SECONDS")), 64)
-	if err != nil || resumeBackoff < 0 {
+	if err != nil || math.IsNaN(resumeBackoff) || math.IsInf(resumeBackoff, 0) || resumeBackoff < 0 {
 		resumeBackoff = defaultResumeBackoff.Seconds()
 	}
 	cfg := config{
@@ -324,7 +325,8 @@ const tapLastTextLimit = 200
 // sessionTap is a pass-through stdout transport that scans the child's
 // newline-delimited JSON event lines while they pass. It captures the first
 // sessionID and the last assistant text part so a recoverable exit can
-// resume the same session; it never alters the bytes it forwards.
+// resume the same session; it never alters the bytes it forwards. lastText
+// intentionally persists across resumed turns when a new turn emits no text.
 type sessionTap struct {
 	w         io.Writer
 	pending   []byte
@@ -486,12 +488,7 @@ func run(ctx context.Context, stdout, stderr io.Writer) int {
 	)
 
 	for {
-		invocation := executor.Invocation{
-			Goal:      cfg.Goal,
-			Model:     cfg.Model,
-			Framing:   cfg.Framing,
-			Workspace: workspace.Directory,
-		}
+		var invocation executor.Invocation
 		if stateMessage != "" {
 			invocation = executor.Invocation{
 				Goal:      stateMessage,
@@ -499,11 +496,19 @@ func run(ctx context.Context, stdout, stderr io.Writer) int {
 				Workspace: workspace.Directory,
 				Session:   tap.sessionID,
 			}
+		} else {
+			invocation = executor.Invocation{
+				Goal:      cfg.Goal,
+				Model:     cfg.Model,
+				Framing:   cfg.Framing,
+				Workspace: workspace.Directory,
+			}
 		}
 		command := runtime.Command(invocation)
 		report.event(courierlog.EventExecutorStart, courierlog.StatusOK, map[string]any{
 			"executor": runtime.Name(),
 			"format":   cfg.OpenCodeFormat,
+			"resumed":  stateMessage != "",
 		})
 		process := exec.CommandContext(ctx, command.Binary, command.Args...)
 		process.Dir = workspace.Directory
@@ -534,7 +539,15 @@ func run(ctx context.Context, stdout, stderr io.Writer) int {
 					"code":         code,
 					"continuation": continuations,
 				})
-				time.Sleep(cfg.ResumeBackoff * time.Duration(1<<(crashes-1)))
+				d := cfg.ResumeBackoff * time.Duration(1<<min(crashes-1, 10))
+				select {
+				case <-time.After(d):
+				case <-ctx.Done():
+				}
+				if ctx.Err() != nil {
+					report.terminate(termination{Phase: "Failed", Result: "failure", ExitCode: code, Reason: fmt.Sprintf("opencode exited with status %d and the context was canceled", code)})
+					return code
+				}
 				stateMessage = fmt.Sprintf("Your previous turn ended unexpectedly (opencode exited with status %d). Continue working toward the goal.", code)
 				continue
 			}
@@ -561,10 +574,13 @@ func run(ctx context.Context, stdout, stderr io.Writer) int {
 
 		// The fingerprint and the state message are read from the world on
 		// every pass; a read failure degrades them, never the run.
-		head, _ := workspace.Head(ctx)
-		branch, _ := workspace.CurrentBranch(ctx)
-		dirty, _ := workspace.StatusPorcelain(ctx)
-		sort.Strings(dirty)
+		head, headErr := workspace.Head(ctx)
+		branch, branchErr := workspace.CurrentBranch(ctx)
+		dirty, dirtyErr := workspace.StatusPorcelain(ctx)
+		slices.Sort(dirty)
+		// A failed world read degrades the fingerprint and the state message,
+		// never the run: with a captured session the run still resumes.
+		worldReadFailed := headErr != nil || branchErr != nil || dirtyErr != nil
 
 		var kind, message, summary string
 		switch workState {
@@ -573,30 +589,40 @@ func run(ctx context.Context, stdout, stderr io.Writer) int {
 			// world: committed work counts only when it is reachable from the run
 			// branch. A branch-read error must not fail the run: liveness over
 			// strictness, so an unreadable ref falls through to the success path.
-			ahead, branchErr := workspace.CommitsOnBranchSince(ctx, cfg.Branch, startCommit)
-			if branchErr != nil || ahead > 0 {
+			ahead, branchReadErr := workspace.CommitsOnBranchSince(ctx, cfg.Branch, startCommit)
+			if branchReadErr != nil || ahead > 0 {
 				report.terminate(termination{Phase: "Verifying", Result: "success", ExitCode: exitSuccess, Reason: "opencode completed with committed work"})
 				return exitSuccess
 			}
 			whereClause := "a detached HEAD"
-			if branch != "" {
+			if branchErr != nil {
+				whereClause = "an unknown branch"
+			} else if branch != "" {
 				whereClause = fmt.Sprintf("branch %q", branch)
 			}
 			kind = "off-branch"
 			message = fmt.Sprintf("You committed work that is not on the run branch %q (HEAD is on %s). Move your commits onto %q and push, or exit with code 2 to request human attention.", cfg.Branch, whereClause, cfg.Branch)
-			summary = fmt.Sprintf("off-branch (head %s, last message %q)", head, tap.lastText)
+			summary = stateSummary(kind, head, tap.lastText, nil)
 		case git.WorkStateDirty:
 			listed := dirty
+			more := ""
 			if len(listed) > maxContinuationPaths {
+				more = fmt.Sprintf(" (and %d more)", len(listed)-maxContinuationPaths)
 				listed = listed[:maxContinuationPaths]
 			}
 			kind = "uncommitted"
-			message = fmt.Sprintf("You ended with uncommitted changes in %s; commit and push them to %q, or discard them and exit with code 2 explaining why.", strings.Join(listed, ", "), cfg.Branch)
-			summary = fmt.Sprintf("uncommitted [%s] (head %s, last message %q)", strings.Join(listed, ", "), head, tap.lastText)
+			if dirtyErr != nil {
+				// The change list is unknown; say so rather than quoting an
+				// empty list as if the worktree were clean.
+				message = fmt.Sprintf("You ended with uncommitted changes; commit and push them to %q, or discard them and exit with code 2 explaining why.", cfg.Branch)
+			} else {
+				message = fmt.Sprintf("You ended with uncommitted changes in %s%s; commit and push them to %q, or discard them and exit with code 2 explaining why.", strings.Join(listed, ", "), more, cfg.Branch)
+			}
+			summary = stateSummary(kind, head, tap.lastText, listed)
 		default:
 			kind = "no-work"
 			message = fmt.Sprintf("You ended without producing a commit or workspace changes and did not declare an outcome. Continue the work and push it to %q, or exit with code 2 to request human attention.", cfg.Branch)
-			summary = fmt.Sprintf("no-work (head %s, last message %q)", head, tap.lastText)
+			summary = stateSummary(kind, head, tap.lastText, nil)
 			if names := unavailableCapabilities(caps); len(names) > 0 {
 				suffix := "; configured capability unavailable: " + strings.Join(names, ", ")
 				message += suffix
@@ -604,16 +630,26 @@ func run(ctx context.Context, stdout, stderr io.Writer) int {
 			}
 		}
 
+		if tap.sessionID == "" {
+			// Nothing to resume: a recoverable ending without a captured
+			// session terminates with the specific pre-resume reason, not a
+			// new session whose whole prompt is the state message.
+			report.terminate(termination{Phase: "NeedsHuman", Result: "needs-human", ExitCode: exitNeedsHuman, Reason: recoverableReason(kind, cfg.Branch, branch, caps)})
+			return exitNeedsHuman
+		}
+
 		fingerprint := strings.Join([]string{
 			string(workState), branch, head, strings.Join(dirty, ","), tap.lastText,
 		}, "|")
 
-		if prevFingerprint != "" && fingerprint == prevFingerprint {
-			// Include the state that re-triggered the guard, so the history
-			// names the exact state the run is looping on.
-			history = append(history, summary)
-			report.terminate(termination{Phase: "NeedsHuman", Result: "needs-human", ExitCode: exitNeedsHuman, Reason: "looping: " + summarizeHistory(history)})
-			return exitNeedsHuman
+		if !worldReadFailed {
+			if prevFingerprint != "" && fingerprint == prevFingerprint {
+				// Include the state that re-triggered the guard, so the
+				// history names the exact state the run is looping on.
+				history = append(history, summary)
+				report.terminate(termination{Phase: "NeedsHuman", Result: "needs-human", ExitCode: exitNeedsHuman, Reason: "looping: " + summarizeHistory(history)})
+				return exitNeedsHuman
+			}
 		}
 		if continuations >= cfg.MaxContinuations {
 			// Same: the state that hit the budget belongs in the history.
@@ -628,7 +664,12 @@ func run(ctx context.Context, stdout, stderr io.Writer) int {
 			"continuation": continuations,
 		})
 		history = append(history, summary)
-		prevFingerprint = fingerprint
+		if worldReadFailed {
+			// A mangled fingerprint must not arm the guard: forget it.
+			prevFingerprint = ""
+		} else {
+			prevFingerprint = fingerprint
+		}
 		stateMessage = message
 	}
 }
@@ -686,6 +727,42 @@ func summarizeHistory(history []string) string {
 		entries[i] = fmt.Sprintf("%d) %s", i+1, entry)
 	}
 	return strings.Join(entries, "; ")
+}
+
+// stateSummary renders a loop-guard history entry, keeping it sane when a
+// degraded world read left a value empty.
+func stateSummary(kind, head, lastText string, paths []string) string {
+	summary := kind
+	if kind == "uncommitted" {
+		summary += " [" + strings.Join(paths, ", ") + "]"
+	}
+	details := make([]string, 0, 2)
+	if head != "" {
+		details = append(details, "head "+head)
+	}
+	details = append(details, "last message "+strconv.Quote(lastText))
+	return summary + " (" + strings.Join(details, ", ") + ")"
+}
+
+// recoverableReason returns the pre-resume termination reason for a
+// recoverable ending classified without a captured session id, keeping the
+// specific wording the run used before continuations existed.
+func recoverableReason(kind, runBranch, headBranch string, caps []executor.MCPCapability) string {
+	switch kind {
+	case "uncommitted":
+		return "opencode exited successfully with uncommitted workspace changes"
+	case "off-branch":
+		whereClause := "a detached HEAD"
+		if headBranch != "" {
+			whereClause = fmt.Sprintf("branch %q", headBranch)
+		}
+		return fmt.Sprintf("opencode committed work that is not on the run branch %q (HEAD is on %s); the run branch has no new commits", runBranch, whereClause)
+	}
+	reason := "opencode exited successfully without producing a commit or workspace changes"
+	if names := unavailableCapabilities(caps); len(names) > 0 {
+		reason += "; configured capability unavailable: " + strings.Join(names, ", ")
+	}
+	return reason
 }
 
 // envIdentity reconstructs run identity from the environment for exit paths

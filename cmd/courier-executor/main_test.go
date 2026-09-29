@@ -325,10 +325,7 @@ func TestRunAbandonedConflictMergeBecomesNeedsHuman(t *testing.T) {
 	}
 }
 
-// TestRunExitZeroWithoutLocalWorkLoopsToNeedsHuman is the no-work case under
-// resume: the script leaves the same empty state twice, so the run resumes once
-// and then the loop guard stops it as NeedsHuman with a looping reason.
-func TestRunExitZeroWithoutLocalWorkLoopsToNeedsHuman(t *testing.T) {
+func TestRunExitZeroWithoutLocalWorkBecomesNeedsHuman(t *testing.T) {
 	root := t.TempDir()
 	remote := remoteWithExistingBranch(t, root)
 	fakeOpenCode := filepath.Join(root, "opencode")
@@ -339,25 +336,18 @@ func TestRunExitZeroWithoutLocalWorkLoopsToNeedsHuman(t *testing.T) {
 	}))
 	defer prServer.Close()
 	setResolveIssueEnv(t, root, remote, prServer.URL, fakeOpenCode)
-	t.Setenv("COURIER_RESUME_BACKOFF_SECONDS", "0")
 
 	var output bytes.Buffer
 	var errorsOut bytes.Buffer
 	if code := run(context.Background(), &output, &errorsOut); code != exitNeedsHuman {
 		t.Fatalf("run exit code = %d, want %d; stderr=%q stdout=%q", code, exitNeedsHuman, errorsOut.String(), output.String())
 	}
-	if !strings.Contains(output.String(), `"phase":"NeedsHuman"`) {
-		t.Fatalf("no-op reason lost the NeedsHuman phase: %q", output.String())
-	}
-	if !strings.Contains(output.String(), "looping") {
-		t.Fatalf("no-op reason = %q, want a looping reason", output.String())
+	if !strings.Contains(output.String(), "without producing a commit or workspace changes") {
+		t.Fatalf("no-op reason = %q", output.String())
 	}
 }
 
-// TestRunExitZeroWithDirtyWorkLoopsToNeedsHuman is the dirty-work case under
-// resume: the script leaves the same uncommitted file twice, so the run resumes
-// once and then the loop guard stops it as NeedsHuman with a looping reason.
-func TestRunExitZeroWithDirtyWorkLoopsToNeedsHuman(t *testing.T) {
+func TestRunExitZeroWithDirtyWorkBecomesNeedsHuman(t *testing.T) {
 	root := t.TempDir()
 	remote := remoteWithExistingBranch(t, root)
 	fakeOpenCode := filepath.Join(root, "opencode")
@@ -368,25 +358,18 @@ func TestRunExitZeroWithDirtyWorkLoopsToNeedsHuman(t *testing.T) {
 	}))
 	defer prServer.Close()
 	setResolveIssueEnv(t, root, remote, prServer.URL, fakeOpenCode)
-	t.Setenv("COURIER_RESUME_BACKOFF_SECONDS", "0")
 
 	var output bytes.Buffer
 	var errorsOut bytes.Buffer
 	if code := run(context.Background(), &output, &errorsOut); code != exitNeedsHuman {
 		t.Fatalf("run exit code = %d, want %d; stderr=%q stdout=%q", code, exitNeedsHuman, errorsOut.String(), output.String())
 	}
-	if !strings.Contains(output.String(), `"phase":"NeedsHuman"`) {
-		t.Fatalf("dirty-work reason lost the NeedsHuman phase: %q", output.String())
-	}
-	if !strings.Contains(output.String(), "looping") {
-		t.Fatalf("dirty-work reason = %q, want a looping reason", output.String())
+	if !strings.Contains(output.String(), "uncommitted workspace changes") {
+		t.Fatalf("dirty-work reason = %q", output.String())
 	}
 }
 
-// TestRunCommittedWorkOnWrongBranchLoopsToNeedsHuman is the off-branch case
-// under resume: the script commits on a side branch twice, so the run resumes
-// once and then the loop guard stops it as NeedsHuman with a looping reason.
-func TestRunCommittedWorkOnWrongBranchLoopsToNeedsHuman(t *testing.T) {
+func TestRunCommittedWorkOnWrongBranchBecomesNeedsHuman(t *testing.T) {
 	root := t.TempDir()
 	remote := remoteWithExistingBranch(t, root)
 	fakeOpenCode := filepath.Join(root, "opencode")
@@ -397,26 +380,21 @@ func TestRunCommittedWorkOnWrongBranchLoopsToNeedsHuman(t *testing.T) {
 	}))
 	defer prServer.Close()
 	setResolveIssueEnv(t, root, remote, prServer.URL, fakeOpenCode)
-	t.Setenv("COURIER_RESUME_BACKOFF_SECONDS", "0")
 
 	var output bytes.Buffer
 	var errorsOut bytes.Buffer
 	if code := run(context.Background(), &output, &errorsOut); code != exitNeedsHuman {
 		t.Fatalf("run exit code = %d, want %d; stderr=%q stdout=%q", code, exitNeedsHuman, errorsOut.String(), output.String())
 	}
-	if !strings.Contains(output.String(), `"phase":"NeedsHuman"`) {
-		t.Fatalf("wrong-branch reason lost the NeedsHuman phase: %q", output.String())
+	if !strings.Contains(output.String(), "not on the run branch") {
+		t.Fatalf("wrong-branch reason = %q", output.String())
 	}
-	if !strings.Contains(output.String(), "looping") {
-		t.Fatalf("wrong-branch reason = %q, want a looping reason", output.String())
+	if !strings.Contains(output.String(), "fix/elsewhere") {
+		t.Fatalf("wrong-branch reason should name the wrong branch: %q", output.String())
 	}
 }
 
-// TestRunDetachedHeadCommitLoopsToNeedsHuman is the detached-HEAD off-branch
-// case under resume: the script commits on a detached HEAD twice, so the run
-// resumes once and then the loop guard stops it as NeedsHuman with a looping
-// reason.
-func TestRunDetachedHeadCommitLoopsToNeedsHuman(t *testing.T) {
+func TestRunDetachedHeadCommitBecomesNeedsHuman(t *testing.T) {
 	root := t.TempDir()
 	remote := remoteWithExistingBranch(t, root)
 	fakeOpenCode := filepath.Join(root, "opencode")
@@ -427,18 +405,17 @@ func TestRunDetachedHeadCommitLoopsToNeedsHuman(t *testing.T) {
 	}))
 	defer prServer.Close()
 	setResolveIssueEnv(t, root, remote, prServer.URL, fakeOpenCode)
-	t.Setenv("COURIER_RESUME_BACKOFF_SECONDS", "0")
 
 	var output bytes.Buffer
 	var errorsOut bytes.Buffer
 	if code := run(context.Background(), &output, &errorsOut); code != exitNeedsHuman {
 		t.Fatalf("run exit code = %d, want %d; stderr=%q stdout=%q", code, exitNeedsHuman, errorsOut.String(), output.String())
 	}
-	if !strings.Contains(output.String(), `"phase":"NeedsHuman"`) {
-		t.Fatalf("detached-HEAD reason lost the NeedsHuman phase: %q", output.String())
+	if !strings.Contains(output.String(), "detached HEAD") {
+		t.Fatalf("detached-HEAD reason = %q", output.String())
 	}
-	if !strings.Contains(output.String(), "looping") {
-		t.Fatalf("detached-HEAD reason = %q, want a looping reason", output.String())
+	if !strings.Contains(output.String(), "not on the run branch") {
+		t.Fatalf("detached-HEAD reason should name the run branch: %q", output.String())
 	}
 }
 
@@ -909,6 +886,81 @@ exit 1
 	}
 }
 
+// TestRunNoWorkResumeCarriesCapabilitySuffix proves a resumed no-work state
+// message ends with the capability-unavailable suffix when the preflight
+// finds a configured capability down.
+func TestRunNoWorkResumeCarriesCapabilitySuffix(t *testing.T) {
+	root := t.TempDir()
+	remote := remoteWithExistingBranch(t, root)
+	fakeOpenCode := filepath.Join(root, "opencode")
+	writeExecutable(t, fakeOpenCode, `#!/bin/sh
+case "$1" in mcp) printf 'metrics failed\n    connection refused\n'; exit 0;; esac
+printf '%s\n' "$(printf '%s' "$*" | tr '\n' ' ')" >> "$COURIER_FAKE_STATE/argv.log"
+SESSION=
+for a in "$@"; do
+  case "$a" in --session) SESSION=1;; esac
+done
+if [ -n "$SESSION" ]; then
+  printf 'done\n' > done.txt
+  git add --all -- .
+  git commit -m 'test: produced the work' >/dev/null
+  exit 0
+fi
+printf '{"type":"text","sessionID":"ses_cap1","part":{"type":"text","text":"nothing yet"}}\n'
+exit 0
+`)
+	prServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `[]`)
+	}))
+	defer prServer.Close()
+	setContinuationEnv(t, root, remote, prServer.URL, fakeOpenCode)
+
+	var output bytes.Buffer
+	var errorsOut bytes.Buffer
+	if code := run(context.Background(), &output, &errorsOut); code != exitSuccess {
+		t.Fatalf("run exit code = %d, want 0; stderr=%q stdout=%q", code, errorsOut.String(), output.String())
+	}
+
+	calls := readArgvLog(t, filepath.Join(root, "fakestate"))
+	if len(calls) != 2 {
+		t.Fatalf("fake script invoked %d times, want 2: %q", len(calls), calls)
+	}
+	want := "request human attention.; configured capability unavailable: metrics"
+	if !strings.Contains(calls[1], want) {
+		t.Fatalf("resumed no-work state message = %q, want it to end with %q", calls[1], want)
+	}
+}
+
+// TestRunCrashWithoutSessionFailsImmediately proves a child that exits with a
+// crash code before printing any sessionID fails the run with that code and
+// emits no continuation event: there is no session to resume.
+func TestRunCrashWithoutSessionFailsImmediately(t *testing.T) {
+	root := t.TempDir()
+	remote := remoteWithExistingBranch(t, root)
+	fakeOpenCode := filepath.Join(root, "opencode")
+	writeExecutable(t, fakeOpenCode, "#!/bin/sh\ncase \"$1\" in mcp) exit 0;; esac\nexit 3\n")
+	prServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `[]`)
+	}))
+	defer prServer.Close()
+	setContinuationEnv(t, root, remote, prServer.URL, fakeOpenCode)
+
+	var output bytes.Buffer
+	var errorsOut bytes.Buffer
+	if code := run(context.Background(), &output, &errorsOut); code != 3 {
+		t.Fatalf("run exit code = %d, want the child's code 3; stderr=%q stdout=%q", code, errorsOut.String(), output.String())
+	}
+	if !strings.Contains(output.String(), `"phase":"Failed"`) {
+		t.Fatalf("missing Failed termination: %q", output.String())
+	}
+	events := parseEvents(t, &output)
+	if n := countEvents(t, events, "executor.continuation"); n != 0 {
+		t.Fatalf("executor.continuation count = %d, want 0 (no session to resume)", n)
+	}
+}
+
 func TestReadConfigGitHubTokenPrecedenceAndFallback(t *testing.T) {
 	base := map[string]string{
 		"COURIER_REPO_URL": "https://git.example/acme/widgets.git",
@@ -966,6 +1018,8 @@ func TestReadConfigContinuationDefaults(t *testing.T) {
 		{name: "valid resume backoff", backoff: "2.5", wantMax: 3, wantBackoff: 2500 * time.Millisecond},
 		{name: "unparseable resume backoff", backoff: "abc", wantMax: 3, wantBackoff: 5 * time.Second},
 		{name: "negative resume backoff", backoff: "-1", wantMax: 3, wantBackoff: 5 * time.Second},
+		{name: "non-finite resume backoff", backoff: "Inf", wantMax: 3, wantBackoff: 5 * time.Second},
+		{name: "NaN resume backoff", backoff: "NaN", wantMax: 3, wantBackoff: 5 * time.Second},
 		{name: "zero resume backoff", backoff: "0", wantMax: 3, wantBackoff: 0},
 	} {
 		t.Run(test.name, func(t *testing.T) {

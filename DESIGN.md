@@ -463,8 +463,10 @@ it modest" with `concurrency: 1`. Same schema, no local assumption baked in.
   no-progress guard (the same workspace-state fingerprint and the same last
   assistant message twice) terminates earlier as **NeedsHuman** with reason
   `looping` and the state history. A crash (a non-zero exit that is not 2)
-  resumes the session with exponential backoff before the run transitions to
-  **Failed**. Exit `2` transitions to **NeedsHuman** immediately. A pod death
+  resumes the session with exponential backoff, sharing the
+  `COURIER_MAX_CONTINUATIONS` budget, before the run transitions to **Failed**;
+  a crash before any session id is observed transitions to **Failed**
+  immediately. Exit `2` transitions to **NeedsHuman** immediately. A pod death
   or heartbeat stall relaunches/resumes it; a crashloop reaches NeedsHuman.
 - **Verifying** — no coordinator pod or liveness meaning. The operator polls
   the external PR and CI world indefinitely, with a reconciliation cadence and
