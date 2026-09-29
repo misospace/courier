@@ -109,7 +109,7 @@ const publicationContract = "Publish only to the run branch: commit on, push, an
 // coordinator's own declaration rather than inference from git state (#169).
 // Only a genuine needs_decision declaration may end the run in a
 // human-attention state; every other way the run can end must be declared.
-const outcomeContract = "End the run by declaring an outcome: write JSON to .courier/outcome.json — {\"outcome\":\"changes\"} once your work is committed and pushed to the run branch; {\"outcome\":\"no_change_needed\",\"evidence\":\"...\"} when the work is already done, citing the evidence; {\"outcome\":\"needs_decision\",\"question\":\"...\"} only for a decision you cannot make yourself; {\"outcome\":\"blocked_external\",\"missing\":\"...\"} when something outside this run is missing. Never commit the outcome file; a run that ends without a valid declaration fails as incomplete."
+const outcomeContract = "You own this run's completion end to end, and you exercise it by declaring an outcome: write JSON to .courier/outcome.json — {\"outcome\":\"changes\"} once your work is committed and pushed to the run branch; {\"outcome\":\"no_change_needed\",\"evidence\":\"...\"} when the work is already done, citing the evidence; {\"outcome\":\"needs_decision\",\"question\":\"...\"} only for a decision you cannot make yourself; {\"outcome\":\"blocked_external\",\"missing\":\"...\"} when something outside this run is missing. Never commit the outcome file; a run that ends without a valid declaration fails as incomplete."
 
 // Goal returns the concise coordinator goal for a run. Lane framing is passed
 // separately so it remains context rather than becoming a hard-coded prompt

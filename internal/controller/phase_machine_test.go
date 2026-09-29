@@ -405,13 +405,14 @@ func TestClaimedRunRetriesLaunchAfterPartialAdmission(t *testing.T) {
 
 func TestRunningPodExitMapsPhaseAndSourceState(t *testing.T) {
 	tests := []struct {
-		name       string
-		mode       courierv1alpha1.Mode
-		exitCode   int32
-		wantPhase  courierv1alpha1.Phase
-		wantSource source.State
-		wantReport bool
-		wantResult source.Result
+		name             string
+		mode             courierv1alpha1.Mode
+		exitCode         int32
+		wantPhase        courierv1alpha1.Phase
+		wantSource       source.State
+		wantReport       bool
+		wantResult       source.Result
+		wantWakeReviewer bool
 	}{
 		{name: "success", exitCode: 0, wantPhase: courierv1alpha1.PhaseVerifying},
 		{name: "needs-human", exitCode: 2, wantPhase: courierv1alpha1.PhaseNeedsHuman, wantSource: source.StateNeedsHuman, wantReport: true, wantResult: source.ResultBlocked},
@@ -421,7 +422,9 @@ func TestRunningPodExitMapsPhaseAndSourceState(t *testing.T) {
 		// accepts an explicit already-addressed settlement
 		// (misospace/dispatch#1121).
 		{name: "no-change-needed resolve-issue", mode: courierv1alpha1.ModeResolveIssue, exitCode: 3, wantPhase: courierv1alpha1.PhaseAwaitingReview, wantSource: source.StateInReview, wantReport: true},
-		{name: "no-change-needed fix-pr", mode: courierv1alpha1.ModeFixPR, exitCode: 3, wantPhase: courierv1alpha1.PhaseNeedsHuman, wantSource: source.StateNeedsHuman, wantReport: true, wantResult: source.ResultBlocked},
+		// A no_change_needed fix-pr run settles the attempt and wakes the
+		// reviewer; the queue item is not parked for a human.
+		{name: "no-change-needed fix-pr", mode: courierv1alpha1.ModeFixPR, exitCode: 3, wantPhase: courierv1alpha1.PhaseNeedsHuman, wantSource: source.StateNeedsHuman, wantReport: true, wantResult: source.ResultBlocked, wantWakeReviewer: true},
 		{name: "failure", exitCode: 17, wantPhase: courierv1alpha1.PhaseFailed, wantSource: source.StateNeedsHuman, wantReport: true, wantResult: source.ResultFailed},
 	}
 	for _, tt := range tests {
@@ -462,8 +465,8 @@ func TestRunningPodExitMapsPhaseAndSourceState(t *testing.T) {
 				if len(item.reports) != 0 {
 					t.Fatalf("lifecycle reports = %#v, want none", item.reports)
 				}
-			} else if len(item.reports) != 1 || item.reports[0].Result != tt.wantResult {
-				t.Fatalf("lifecycle reports = %#v, want one with result %q", item.reports, tt.wantResult)
+			} else if len(item.reports) != 1 || item.reports[0].Result != tt.wantResult || item.reports[0].WakeReviewer != tt.wantWakeReviewer {
+				t.Fatalf("lifecycle reports = %#v, want one with result %q and wakeReviewer %t", item.reports, tt.wantResult, tt.wantWakeReviewer)
 			}
 			if calls != 0 {
 				t.Fatalf("observer calls = %d, want 0 before Verifying reconcile", calls)
@@ -1053,11 +1056,12 @@ func TestDoneRunResolvesSourceWorkItem(t *testing.T) {
 // on a follow-up reconcile.
 func TestExit3NoChangeNeededSettlesNothingDirectly(t *testing.T) {
 	tests := []struct {
-		name       string
-		mode       courierv1alpha1.Mode
-		wantPhase  courierv1alpha1.Phase
-		wantSource source.State
-		wantResult source.Result
+		name             string
+		mode             courierv1alpha1.Mode
+		wantPhase        courierv1alpha1.Phase
+		wantSource       source.State
+		wantResult       source.Result
+		wantWakeReviewer bool
 	}{
 		{
 			name:       "resolve-issue awaits human review",
@@ -1066,11 +1070,12 @@ func TestExit3NoChangeNeededSettlesNothingDirectly(t *testing.T) {
 			wantSource: source.StateInReview,
 		},
 		{
-			name:       "fix-pr needs human",
-			mode:       courierv1alpha1.ModeFixPR,
-			wantPhase:  courierv1alpha1.PhaseNeedsHuman,
-			wantSource: source.StateNeedsHuman,
-			wantResult: source.ResultBlocked,
+			name:             "fix-pr needs human",
+			mode:             courierv1alpha1.ModeFixPR,
+			wantPhase:        courierv1alpha1.PhaseNeedsHuman,
+			wantSource:       source.StateNeedsHuman,
+			wantResult:       source.ResultBlocked,
+			wantWakeReviewer: true,
 		},
 	}
 	for _, tt := range tests {
@@ -1097,8 +1102,8 @@ func TestExit3NoChangeNeededSettlesNothingDirectly(t *testing.T) {
 			if len(item.transitions) != 1 || item.transitions[0] != tt.wantSource {
 				t.Fatalf("source transitions = %#v, want %#v", item.transitions, []source.State{tt.wantSource})
 			}
-			if len(item.reports) != 1 || item.reports[0].Result != tt.wantResult {
-				t.Fatalf("lifecycle reports = %#v, want one with result %q", item.reports, tt.wantResult)
+			if len(item.reports) != 1 || item.reports[0].Result != tt.wantResult || item.reports[0].WakeReviewer != tt.wantWakeReviewer {
+				t.Fatalf("lifecycle reports = %#v, want one with result %q and wakeReviewer %t", item.reports, tt.wantResult, tt.wantWakeReviewer)
 			}
 			// The terminal phase is stable: a follow-up reconcile must not
 			// settle the source.

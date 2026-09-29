@@ -352,7 +352,7 @@ func (r *CoderRunReconciler) terminateMissingHead(ctx context.Context, run *cour
 	run.Status.Branch = ""
 	run.Status.HeadRepo = ""
 	run.Status.HeadSHA = ""
-	_, terminalErr := r.transitionTerminal(ctx, run, courierv1alpha1.PhaseNeedsHuman, "")
+	_, terminalErr := r.transitionTerminal(ctx, run, courierv1alpha1.PhaseNeedsHuman, "", false)
 	return errors.Join(releaseErr, terminalErr)
 }
 
@@ -400,7 +400,7 @@ func (r *CoderRunReconciler) observeRunning(ctx context.Context, run *courierv1a
 			r.emitPhaseTransition(run, courierv1alpha1.PhaseVerifying, map[string]any{"exit_code": exitCode})
 			return ctrl.Result{Requeue: true}, nil
 		}
-		return r.transitionTerminal(ctx, run, phase, "")
+		return r.transitionTerminal(ctx, run, phase, "", exitCode == 3)
 	}
 	result, handled, err := r.checkLiveness(ctx, run, pods.Items)
 	if handled {
@@ -419,7 +419,7 @@ func controllerHeadRef(run *courierv1alpha1.CoderRun) HeadRef {
 
 func (r *CoderRunReconciler) observeVerifying(ctx context.Context, run *courierv1alpha1.CoderRun) (ctrl.Result, error) {
 	if r.Observer == nil {
-		return r.transitionTerminal(ctx, run, courierv1alpha1.PhaseNeedsHuman, "")
+		return r.transitionTerminal(ctx, run, courierv1alpha1.PhaseNeedsHuman, "", false)
 	}
 	observation, err := r.Observer.Observe(ctx, run.Spec.Repo, controllerHeadRef(run))
 	if err != nil {
@@ -431,10 +431,10 @@ func (r *CoderRunReconciler) observeVerifying(ctx context.Context, run *courierv
 		// Someone merged the PR while this run was working: the work shipped.
 		// Done resolves the source and applies the reap policy; it is not a
 		// case for a human.
-		return r.transitionTerminal(ctx, run, courierv1alpha1.PhaseDone, pr)
+		return r.transitionTerminal(ctx, run, courierv1alpha1.PhaseDone, pr, false)
 	}
 	if state == observationNeedsHuman || state == observationFailed {
-		return r.transitionTerminal(ctx, run, courierv1alpha1.PhaseNeedsHuman, pr)
+		return r.transitionTerminal(ctx, run, courierv1alpha1.PhaseNeedsHuman, pr, false)
 	}
 	// status.checkFingerprint is the prior all-green candidate: the identity
 	// of the last poll on which every observed check passed. Green settles
@@ -458,7 +458,7 @@ func (r *CoderRunReconciler) observeVerifying(ctx context.Context, run *courierv
 		return ctrl.Result{}, err
 	}
 	if settled {
-		return r.transitionTerminal(ctx, run, courierv1alpha1.PhaseAwaitingReview, pr)
+		return r.transitionTerminal(ctx, run, courierv1alpha1.PhaseAwaitingReview, pr, false)
 	}
 	return ctrl.Result{RequeueAfter: observationRequeueDelay}, nil
 }
@@ -486,7 +486,7 @@ func (r *CoderRunReconciler) enrichTerminalPR(ctx context.Context, run *courierv
 	return observation.PR
 }
 
-func (r *CoderRunReconciler) transitionTerminal(ctx context.Context, run *courierv1alpha1.CoderRun, phase courierv1alpha1.Phase, pr string) (ctrl.Result, error) {
+func (r *CoderRunReconciler) transitionTerminal(ctx context.Context, run *courierv1alpha1.CoderRun, phase courierv1alpha1.Phase, pr string, wakeReviewer bool) (ctrl.Result, error) {
 	if phase == courierv1alpha1.PhaseNeedsHuman || phase == courierv1alpha1.PhaseFailed {
 		if pr == "" {
 			pr = r.enrichTerminalPR(ctx, run)
@@ -515,7 +515,7 @@ func (r *CoderRunReconciler) transitionTerminal(ctx context.Context, run *courie
 		run.Status.PR = pr
 	}
 	if phaseChanged {
-		lifecycle := lifecycleForPhase(phase, state, run.Status.PR)
+		lifecycle := lifecycleForPhase(phase, state, run.Status.PR, wakeReviewer)
 		lifecycle.IdempotencyKey = lifecycleIdempotencyKey(run, phase)
 		if err := reportLifecycle(ctx, adapter, item, lifecycle); err != nil {
 			return ctrl.Result{}, err
@@ -552,7 +552,11 @@ func reportLifecycle(ctx context.Context, adapter source.Adapter, item source.Wo
 	return reporter.Report(ctx, item, lifecycle)
 }
 
-func lifecycleForPhase(phase courierv1alpha1.Phase, state source.State, pr string) source.Lifecycle {
+// lifecycleForPhase maps a terminal phase to the source lifecycle report it
+// publishes. wakeReviewer marks the no_change_needed ending on a queue-backed
+// item: the blocked report settles the attempt and wakes the reviewer instead
+// of parking the item for a human.
+func lifecycleForPhase(phase courierv1alpha1.Phase, state source.State, pr string, wakeReviewer bool) source.Lifecycle {
 	lifecycle := source.Lifecycle{State: state, PR: pr}
 	switch phase {
 	case courierv1alpha1.PhaseAwaitingReview:
@@ -565,6 +569,7 @@ func lifecycleForPhase(phase courierv1alpha1.Phase, state source.State, pr strin
 	case courierv1alpha1.PhaseNeedsHuman:
 		lifecycle.Result = source.ResultBlocked
 		lifecycle.Error = "run requires human intervention"
+		lifecycle.WakeReviewer = wakeReviewer
 	}
 	return lifecycle
 }

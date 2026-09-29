@@ -169,7 +169,9 @@ human problem (#169):
 - **`no_change_needed`** — nothing to do, with evidence; the executor posts the
   evidence to the issue/PR and the run never resolves the source on the
   coordinator's word — a resolve-issue run's source moves to `in-review` for a
-  human to settle, and a fix-pr run ends **NeedsHuman** until Dispatch accepts
+  human to settle, and a fix-pr run ends **NeedsHuman** — its blocked report
+  settles the PR-fix attempt and wakes the reviewer rather than parking the
+  queue item — until Dispatch accepts
   an explicit `already_addressed` settlement (#1121 companion).
 - **`needs_decision`** — a real design question; the executor posts the
   question to the issue/PR and the run ends **NeedsHuman**. This is the only
@@ -704,7 +706,9 @@ was superseded.
   an issue a wrong 'already done' silently dropped work with nothing verifying
   the claim. Interim, a `no_change_needed` ending maps a resolve-issue run to
   `in-review` with the evidence comment posted, for a human to settle; a
-  fix-pr run ends `NeedsHuman`, until dispatch#1121 lands an explicit
+  fix-pr run ends `NeedsHuman`, its blocked report settling the PR-fix
+  attempt and waking the reviewer rather than parking the queue item, until
+  dispatch#1121 lands an explicit
   `already_addressed`/`already_done` settlement. Done — and therefore a source
   resolve — now comes only from the world: the merged-mid-run observation.
   (#169, review on PR #175)

@@ -137,7 +137,7 @@ func (r *CoderRunReconciler) checkLiveness(ctx context.Context, run *courierv1al
 		// The ceiling is reached: hand the run to a human instead of
 		// relaunching it again. The counter is already at the ceiling, so
 		// it is left untouched.
-		result, err := r.transitionTerminal(ctx, run, courierv1alpha1.PhaseNeedsHuman, "")
+		result, err := r.transitionTerminal(ctx, run, courierv1alpha1.PhaseNeedsHuman, "", false)
 		return result, true, err
 	}
 	before := run.DeepCopy()
