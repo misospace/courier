@@ -84,7 +84,11 @@ type OperatorPatch struct {
 	PR               string                `json:"pr,omitempty"`
 	CheckFingerprint *string               `json:"checkFingerprint,omitempty"`
 	Restarts         *int                  `json:"restarts,omitempty"`
-	Conditions       []metav1.Condition    `json:"conditions,omitempty"`
+	// Conditions is the operator-owned condition set. The operator is the only
+	// writer of a CoderRun's conditions, so a merge patch carrying them replaces
+	// the array wholesale; a second writer must extend this field rather than
+	// patch a disjoint list.
+	Conditions []metav1.Condition `json:"conditions,omitempty"`
 }
 
 // HarnessPatch contains only fields owned by the coordinator harness: its

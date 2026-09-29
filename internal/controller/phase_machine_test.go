@@ -2,7 +2,6 @@ package controller
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"testing"
@@ -12,12 +11,12 @@ import (
 	apimeta "k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
-	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
 	courierv1alpha1 "github.com/misospace/courier/api/v1alpha1"
 	"github.com/misospace/courier/internal/source"
+	"github.com/misospace/courier/internal/status"
 )
 
 type admissionSource struct {
@@ -31,37 +30,6 @@ type admissionSource struct {
 	preLaunches   []string
 	transitionErr error
 	reportErr     error
-}
-
-// conditionStatusWriter is a fakeStatusWriter that also applies the
-// conditions field of an operator patch, so tests can observe the
-// LifecycleReported condition recorded on terminal runs. It interprets only
-// phase and conditions; the tests using it exercise no other operator fields.
-type conditionStatusWriter struct {
-	client client.Client
-}
-
-func (w conditionStatusWriter) PatchStatus(ctx context.Context, name types.NamespacedName, patch []byte) error {
-	var document struct {
-		Status struct {
-			Phase      courierv1alpha1.Phase `json:"phase,omitempty"`
-			Conditions []metav1.Condition    `json:"conditions"`
-		} `json:"status"`
-	}
-	if err := json.Unmarshal(patch, &document); err != nil {
-		return err
-	}
-	var run courierv1alpha1.CoderRun
-	if err := w.client.Get(ctx, name, &run); err != nil {
-		return err
-	}
-	if document.Status.Phase != "" {
-		run.Status.Phase = document.Status.Phase
-	}
-	if len(document.Status.Conditions) > 0 {
-		run.Status.Conditions = document.Status.Conditions
-	}
-	return w.client.Status().Update(ctx, &run)
 }
 
 type fakeWorldObserver struct {
@@ -1001,7 +969,7 @@ func TestTerminalLifecycleReportRetryReusesIdempotencyKey(t *testing.T) {
 	reconciler := &CoderRunReconciler{
 		Client:       client,
 		Sources:      NewSourceRegistry(map[string]source.Adapter{"test": item}),
-		StatusWriter: conditionStatusWriter{client: client},
+		StatusWriter: status.KubePatchWriter{Client: client},
 		Observer:     fakeWorldObserver{observation: PRObservation{PR: "42", Checks: []CheckObservation{{State: CheckStateFailed}}}},
 	}
 	if _, err := reconciler.Reconcile(context.Background(), admissionRequest("run")); err != nil {
@@ -1099,7 +1067,7 @@ func TestTransitionSupersededReportCompletesTerminalAndDrops(t *testing.T) {
 	reconciler := &CoderRunReconciler{
 		Client:       client,
 		Sources:      NewSourceRegistry(map[string]source.Adapter{"test": item}),
-		StatusWriter: conditionStatusWriter{client: client},
+		StatusWriter: status.KubePatchWriter{Client: client},
 	}
 	if _, err := reconciler.Reconcile(context.Background(), admissionRequest("run")); err != nil {
 		t.Fatalf("Reconcile() error = %v, want nil (a superseded report is dropped, not an error)", err)
@@ -1129,7 +1097,7 @@ func TestTransientReportKeepsRunTerminalAndRetriesSeparately(t *testing.T) {
 	reconciler := &CoderRunReconciler{
 		Client:       client,
 		Sources:      NewSourceRegistry(map[string]source.Adapter{"test": item}),
-		StatusWriter: conditionStatusWriter{client: client},
+		StatusWriter: status.KubePatchWriter{Client: client},
 	}
 	result, err := reconciler.Reconcile(context.Background(), admissionRequest("run"))
 	if err != nil {
@@ -1173,6 +1141,64 @@ func TestTransientReportKeepsRunTerminalAndRetriesSeparately(t *testing.T) {
 	}
 }
 
+// TestTransientTransitionKeepsRunTerminalAndRetriesReport proves phase-first
+// holds when the source transition itself fails: the terminal phase and a
+// durable pending marker are persisted together, the report is never attempted
+// behind the failed transition, and a later reconcile retries it once the
+// source recovers.
+func TestTransientTransitionKeepsRunTerminalAndRetriesReport(t *testing.T) {
+	item := &admissionSource{transitionErr: errors.New("source unavailable")}
+	run := admissionRun("run", "local", courierv1alpha1.PhaseRunning)
+	run.Spec.Source = "test"
+	run.Spec.WorkItemID = "opaque-work-item"
+	client := phaseClient(t, run, coordinatorPod(run, 2))
+	reconciler := &CoderRunReconciler{
+		Client:       client,
+		Sources:      NewSourceRegistry(map[string]source.Adapter{"test": item}),
+		StatusWriter: status.KubePatchWriter{Client: client},
+	}
+	result, err := reconciler.Reconcile(context.Background(), admissionRequest("run"))
+	if err != nil {
+		t.Fatalf("first Reconcile() error = %v, want nil (the phase must not depend on the source transition)", err)
+	}
+	if result.RequeueAfter <= 0 {
+		t.Fatalf("first RequeueAfter = %v, want a bounded retry delay", result.RequeueAfter)
+	}
+	var updated courierv1alpha1.CoderRun
+	if err := client.Get(context.Background(), admissionKey("run"), &updated); err != nil {
+		t.Fatalf("get run: %v", err)
+	}
+	if updated.Status.Phase != courierv1alpha1.PhaseNeedsHuman {
+		t.Fatalf("phase = %q, want NeedsHuman (terminal immediately)", updated.Status.Phase)
+	}
+	cond := apimeta.FindStatusCondition(updated.Status.Conditions, lifecycleReportedCondition)
+	if cond == nil || cond.Status != metav1.ConditionFalse || cond.Reason != "Pending" {
+		t.Fatalf("LifecycleReported = %#v, want False Pending", cond)
+	}
+	if len(item.reports) != 0 {
+		t.Fatalf("reports = %#v, want none: a failed transition must not attempt the report", item.reports)
+	}
+	// The source recovers: a later reconcile retries the report.
+	item.transitionErr = nil
+	result, err = reconciler.Reconcile(context.Background(), admissionRequest("run"))
+	if err != nil {
+		t.Fatalf("second Reconcile() error = %v", err)
+	}
+	if result.RequeueAfter != 0 || result.Requeue {
+		t.Fatalf("second Reconcile() result = %#v, want no requeue once the report is published", result)
+	}
+	if len(item.reports) != 1 {
+		t.Fatalf("reports = %#v, want the retry to publish the report", item.reports)
+	}
+	if err := client.Get(context.Background(), admissionKey("run"), &updated); err != nil {
+		t.Fatalf("get run: %v", err)
+	}
+	cond = apimeta.FindStatusCondition(updated.Status.Conditions, lifecycleReportedCondition)
+	if cond == nil || cond.Status != metav1.ConditionTrue || cond.Reason != "Published" {
+		t.Fatalf("LifecycleReported = %#v, want True Published", cond)
+	}
+}
+
 func TestSupersededReportFreesLaneForNextRun(t *testing.T) {
 	item := &admissionSource{reportErr: fmt.Errorf("%w: generation mismatch", source.ErrSuperseded)}
 	stuck := admissionRun("stuck", "local", courierv1alpha1.PhaseRunning)
@@ -1183,7 +1209,7 @@ func TestSupersededReportFreesLaneForNextRun(t *testing.T) {
 	reconciler := &CoderRunReconciler{
 		Client:       client,
 		Sources:      NewSourceRegistry(map[string]source.Adapter{"test": item}),
-		StatusWriter: fakeStatusWriter{client: client},
+		StatusWriter: status.KubePatchWriter{Client: client},
 	}
 	if _, err := reconciler.Reconcile(context.Background(), admissionRequest("stuck")); err != nil {
 		t.Fatalf("Reconcile(stuck) error = %v", err)

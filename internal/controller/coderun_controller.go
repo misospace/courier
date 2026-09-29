@@ -25,13 +25,15 @@ import (
 
 // capacityRequeueDelay bounds how long a Pending run can wait behind a full
 // lane before checking again.
-const lifecycleReportedCondition = "LifecycleReported"
-
 const (
 	capacityRequeueDelay        = 15 * time.Second
 	observationRequeueDelay     = 5 * time.Second
 	lifecycleReportRequeueDelay = 30 * time.Second
 )
+
+// lifecycleReportedCondition tracks whether a terminal run's source lifecycle
+// report has been published; a False status means a later reconcile retries it.
+const lifecycleReportedCondition = "LifecycleReported"
 
 // CoderRunReconciler reconciles a CoderRun object.
 type CoderRunReconciler struct {
@@ -512,6 +514,12 @@ func (r *CoderRunReconciler) transitionTerminal(ctx context.Context, run *courie
 	if pr != "" {
 		run.Status.PR = pr
 	}
+	if phaseChanged {
+		// Record a durable pending marker with the phase itself, so a crash or a
+		// failed report patch after this point still retries the report instead of
+		// silently abandoning it. publishTerminalLifecycle flips it when done.
+		r.setLifecycleReport(run, false, "Pending", "")
+	}
 	// Write the terminal phase first so the run stops holding lane capacity
 	// regardless of whether the source lifecycle report below succeeds. The
 	// run's own terminalization must never depend on the source.
@@ -582,11 +590,10 @@ func stateForTerminalPhase(phase courierv1alpha1.Phase) source.State {
 	}
 }
 
-// markLifecycleReported records whether the terminal lifecycle report for the
-// run's current phase has been published. Published means done or intentionally
-// dropped (superseded); False means a later reconcile must retry it.
-func (r *CoderRunReconciler) markLifecycleReported(ctx context.Context, run *courierv1alpha1.CoderRun, published bool, reason, message string) error {
-	before := run.DeepCopy()
+// setLifecycleReport records the terminal lifecycle-report condition on the run
+// in memory; callers persist it through patchStatus. The operator is the only
+// writer of a run's conditions.
+func (r *CoderRunReconciler) setLifecycleReport(run *courierv1alpha1.CoderRun, published bool, reason, message string) {
 	statusValue := metav1.ConditionTrue
 	if !published {
 		statusValue = metav1.ConditionFalse
@@ -598,6 +605,14 @@ func (r *CoderRunReconciler) markLifecycleReported(ctx context.Context, run *cou
 		Message:            message,
 		LastTransitionTime: metav1.NewTime(r.clock()),
 	})
+}
+
+// markLifecycleReported records whether the terminal lifecycle report for the
+// run's current phase has been published. Published means done or intentionally
+// dropped (superseded); False means a later reconcile must retry it.
+func (r *CoderRunReconciler) markLifecycleReported(ctx context.Context, run *courierv1alpha1.CoderRun, published bool, reason, message string) error {
+	before := run.DeepCopy()
+	r.setLifecycleReport(run, published, reason, message)
 	return r.patchStatus(ctx, before, run)
 }
 
