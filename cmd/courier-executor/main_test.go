@@ -1911,3 +1911,77 @@ func runGit(t *testing.T, directory string, args ...string) {
 		t.Fatalf("git %s: %v (%s)", strings.Join(args, " "), err, output)
 	}
 }
+
+// TestRunContinuationDetailIsRedacted proves the fingerprint and the terminal
+// reason stay redacted when the session tap captured a registered secret in
+// the child's raw, pre-redaction output: the no-progress guard fires on the
+// repeated state, and neither the executor.continuation fingerprint detail
+// nor the COURIER_TERMINATION reason leaks the secret — both carry the
+// redaction placeholder.
+func TestRunContinuationDetailIsRedacted(t *testing.T) {
+	root := t.TempDir()
+	remote := remoteWithExistingBranch(t, root)
+	fakeOpenCode := filepath.Join(root, "opencode")
+	writeExecutable(t, fakeOpenCode, `#!/bin/sh
+case "$1" in mcp) exit 0;; esac
+printf '%s\n' "$(printf '%s' "$*" | tr '\n' ' ')" >> "$COURIER_FAKE_STATE/argv.log"
+printf '{"type":"text","sessionID":"ses_redact1","part":{"type":"text","text":"echo sekrit-token-value-42 done"}}\n'
+printf 'partial\n' > partial.txt
+exit 0
+`)
+	prServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `[]`)
+	}))
+	defer prServer.Close()
+	setContinuationEnv(t, root, remote, prServer.URL, fakeOpenCode)
+
+	const secretValue = "sekrit-token-value-42"
+	// Name shaped like a credential so newReporter's RegisterEnvironment
+	// picks it up and registers the value with the run's redactor.
+	t.Setenv("COURIER_FAKE_TOKEN", secretValue)
+
+	var output bytes.Buffer
+	var errorsOut bytes.Buffer
+	if code := run(context.Background(), &output, &errorsOut); code != exitNeedsHuman {
+		t.Fatalf("run exit code = %d, want %d; stderr=%q stdout=%q", code, exitNeedsHuman, errorsOut.String(), output.String())
+	}
+	if strings.Contains(output.String(), secretValue) {
+		t.Fatal("run stdout leaked the raw secret")
+	}
+	if !strings.Contains(output.String(), "looping:") {
+		t.Fatalf("reason = %q, want a looping: reason", output.String())
+	}
+
+	events := parseEvents(t, &output)
+	if n := countEvents(t, events, "executor.continuation"); n != 1 {
+		t.Fatalf("executor.continuation count = %d, want 1 (first classification resumes once, second identical loops)", n)
+	}
+	cont := findEvent(t, events, "executor.continuation")
+	detail := eventDetail(t, cont)
+	fingerprint, ok := detail["fingerprint"].(string)
+	if !ok {
+		t.Fatal("executor.continuation detail must carry a fingerprint string")
+	}
+	if strings.Contains(fingerprint, secretValue) {
+		t.Fatal("fingerprint detail leaked the raw secret")
+	}
+	if !strings.Contains(fingerprint, "[REDACTED]") {
+		t.Fatal("fingerprint detail lost the redaction placeholder")
+	}
+
+	start := strings.Index(output.String(), "COURIER_TERMINATION")
+	if start < 0 {
+		t.Fatal("missing the COURIER_TERMINATION line")
+	}
+	terminationLine := output.String()[start:]
+	if !strings.Contains(terminationLine, `"phase":"NeedsHuman"`) {
+		t.Fatalf("termination line = %q, want the NeedsHuman phase", terminationLine)
+	}
+	if strings.Contains(terminationLine, secretValue) {
+		t.Fatal("termination reason leaked the raw secret")
+	}
+	if !strings.Contains(terminationLine, "[REDACTED]") {
+		t.Fatal("termination reason lost the redaction placeholder")
+	}
+}
