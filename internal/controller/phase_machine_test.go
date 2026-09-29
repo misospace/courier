@@ -406,17 +406,23 @@ func TestClaimedRunRetriesLaunchAfterPartialAdmission(t *testing.T) {
 func TestRunningPodExitMapsPhaseAndSourceState(t *testing.T) {
 	tests := []struct {
 		name       string
+		mode       courierv1alpha1.Mode
 		exitCode   int32
 		wantPhase  courierv1alpha1.Phase
 		wantSource source.State
+		wantReport bool
+		wantResult source.Result
 	}{
 		{name: "success", exitCode: 0, wantPhase: courierv1alpha1.PhaseVerifying},
-		{name: "needs-human", exitCode: 2, wantPhase: courierv1alpha1.PhaseNeedsHuman, wantSource: source.StateNeedsHuman},
-		// no_change_needed (issue #169): the coordinator declared the work
-		// already done, so the run is Done. Like the merged mid-run case, Done
-		// records no source Transition — the source is resolved later.
-		{name: "no-change-needed", exitCode: 3, wantPhase: courierv1alpha1.PhaseDone},
-		{name: "failure", exitCode: 17, wantPhase: courierv1alpha1.PhaseFailed, wantSource: source.StateNeedsHuman},
+		{name: "needs-human", exitCode: 2, wantPhase: courierv1alpha1.PhaseNeedsHuman, wantSource: source.StateNeedsHuman, wantReport: true, wantResult: source.ResultBlocked},
+		// no_change_needed (issue #169) never settles the source directly: a
+		// resolve-issue run lands in AwaitingReview for a human to review the
+		// posted evidence; a fix-pr run lands in NeedsHuman until Dispatch
+		// accepts an explicit already-addressed settlement
+		// (misospace/dispatch#1121).
+		{name: "no-change-needed resolve-issue", mode: courierv1alpha1.ModeResolveIssue, exitCode: 3, wantPhase: courierv1alpha1.PhaseAwaitingReview, wantSource: source.StateInReview, wantReport: true},
+		{name: "no-change-needed fix-pr", mode: courierv1alpha1.ModeFixPR, exitCode: 3, wantPhase: courierv1alpha1.PhaseNeedsHuman, wantSource: source.StateNeedsHuman, wantReport: true, wantResult: source.ResultBlocked},
+		{name: "failure", exitCode: 17, wantPhase: courierv1alpha1.PhaseFailed, wantSource: source.StateNeedsHuman, wantReport: true, wantResult: source.ResultFailed},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -424,6 +430,9 @@ func TestRunningPodExitMapsPhaseAndSourceState(t *testing.T) {
 			run := admissionRun("run", "local", courierv1alpha1.PhaseRunning)
 			run.Spec.Source = "test"
 			run.Spec.WorkItemID = "opaque-work-item"
+			if tt.mode != "" {
+				run.Spec.Mode = tt.mode
+			}
 			client := phaseClient(t, run, coordinatorPod(run, tt.exitCode))
 			calls := 0
 			reconciler := &CoderRunReconciler{
@@ -449,10 +458,16 @@ func TestRunningPodExitMapsPhaseAndSourceState(t *testing.T) {
 			} else if len(item.transitions) != 1 || item.transitions[0] != tt.wantSource {
 				t.Fatalf("source transitions = %#v, want %#v", item.transitions, []source.State{tt.wantSource})
 			}
+			if !tt.wantReport {
+				if len(item.reports) != 0 {
+					t.Fatalf("lifecycle reports = %#v, want none", item.reports)
+				}
+			} else if len(item.reports) != 1 || item.reports[0].Result != tt.wantResult {
+				t.Fatalf("lifecycle reports = %#v, want one with result %q", item.reports, tt.wantResult)
+			}
 			if calls != 0 {
 				t.Fatalf("observer calls = %d, want 0 before Verifying reconcile", calls)
 			}
-
 		})
 	}
 }
@@ -1030,38 +1045,77 @@ func TestDoneRunResolvesSourceWorkItem(t *testing.T) {
 	}
 }
 
-// TestExit3NoChangeNeededResolvesSourceWorkItem checks the full no_change_needed
-// path (issue #169): a coordinator that exits 3 terminalizes the run Done with
-// no source Transition, and the follow-up reconcile resolves the source work
-// item.
-func TestExit3NoChangeNeededResolvesSourceWorkItem(t *testing.T) {
-	item := &admissionSource{}
-	run := admissionRun("run", "local", courierv1alpha1.PhaseRunning)
-	client := phaseClient(t, run, coordinatorPod(run, 3))
-	reconciler := &CoderRunReconciler{
-		Client:       client,
-		Sources:      NewSourceRegistry(map[string]source.Adapter{"test": item}),
-		StatusWriter: fakeStatusWriter{client: client},
+// TestExit3NoChangeNeededSettlesNothingDirectly checks the no_change_needed
+// path (issue #169) behind the human review gate: a coordinator that exits 3
+// never settles the source directly. A resolve-issue run ends AwaitingReview
+// with the source transitioned to in-review; a fix-pr run ends NeedsHuman
+// with a blocked lifecycle report. Neither resolves the work item, not even
+// on a follow-up reconcile.
+func TestExit3NoChangeNeededSettlesNothingDirectly(t *testing.T) {
+	tests := []struct {
+		name       string
+		mode       courierv1alpha1.Mode
+		wantPhase  courierv1alpha1.Phase
+		wantSource source.State
+		wantResult source.Result
+	}{
+		{
+			name:       "resolve-issue awaits human review",
+			mode:       courierv1alpha1.ModeResolveIssue,
+			wantPhase:  courierv1alpha1.PhaseAwaitingReview,
+			wantSource: source.StateInReview,
+		},
+		{
+			name:       "fix-pr needs human",
+			mode:       courierv1alpha1.ModeFixPR,
+			wantPhase:  courierv1alpha1.PhaseNeedsHuman,
+			wantSource: source.StateNeedsHuman,
+			wantResult: source.ResultBlocked,
+		},
 	}
-	if _, err := reconciler.Reconcile(context.Background(), admissionRequest("run")); err != nil {
-		t.Fatalf("Reconcile() error = %v", err)
-	}
-	var done courierv1alpha1.CoderRun
-	if err := client.Get(context.Background(), admissionKey("run"), &done); err != nil {
-		t.Fatalf("get run: %v", err)
-	}
-	if done.Status.Phase != courierv1alpha1.PhaseDone {
-		t.Fatalf("phase = %q, want Done", done.Status.Phase)
-	}
-	if len(item.transitions) != 0 {
-		t.Fatalf("source transitions = %#v, want none: no_change_needed is not a case for a human", item.transitions)
-	}
-	// The follow-up reconcile resolves the source work item for the Done run.
-	if _, err := reconciler.Reconcile(context.Background(), admissionRequest("run")); err != nil {
-		t.Fatalf("second Reconcile() error = %v", err)
-	}
-	if len(item.resolved) != 1 || item.resolved[0] != "run" {
-		t.Fatalf("resolved IDs = %#v, want run", item.resolved)
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			item := &admissionSource{}
+			run := admissionRun("run", "local", courierv1alpha1.PhaseRunning)
+			run.Spec.Mode = tt.mode
+			client := phaseClient(t, run, coordinatorPod(run, 3))
+			reconciler := &CoderRunReconciler{
+				Client:       client,
+				Sources:      NewSourceRegistry(map[string]source.Adapter{"test": item}),
+				StatusWriter: fakeStatusWriter{client: client},
+			}
+			if _, err := reconciler.Reconcile(context.Background(), admissionRequest("run")); err != nil {
+				t.Fatalf("Reconcile() error = %v", err)
+			}
+			var updated courierv1alpha1.CoderRun
+			if err := client.Get(context.Background(), admissionKey("run"), &updated); err != nil {
+				t.Fatalf("get run: %v", err)
+			}
+			if updated.Status.Phase != tt.wantPhase {
+				t.Fatalf("phase = %q, want %q", updated.Status.Phase, tt.wantPhase)
+			}
+			if len(item.transitions) != 1 || item.transitions[0] != tt.wantSource {
+				t.Fatalf("source transitions = %#v, want %#v", item.transitions, []source.State{tt.wantSource})
+			}
+			if len(item.reports) != 1 || item.reports[0].Result != tt.wantResult {
+				t.Fatalf("lifecycle reports = %#v, want one with result %q", item.reports, tt.wantResult)
+			}
+			// The terminal phase is stable: a follow-up reconcile must not
+			// settle the source.
+			if _, err := reconciler.Reconcile(context.Background(), admissionRequest("run")); err != nil {
+				t.Fatalf("second Reconcile() error = %v", err)
+			}
+			if len(item.resolved) != 0 {
+				t.Fatalf("resolved IDs = %#v, want none: no_change_needed never resolves the source", item.resolved)
+			}
+			var settled courierv1alpha1.CoderRun
+			if err := client.Get(context.Background(), admissionKey("run"), &settled); err != nil {
+				t.Fatalf("get run: %v", err)
+			}
+			if settled.Status.Phase != tt.wantPhase {
+				t.Fatalf("phase after follow-up = %q, want %q", settled.Status.Phase, tt.wantPhase)
+			}
+		})
 	}
 }
 

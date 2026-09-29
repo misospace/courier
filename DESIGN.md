@@ -167,8 +167,10 @@ human problem (#169):
 - **`changes`** — work is committed and pushed; confirmed the old way (commits
   reachable from the run branch) → **Verifying**.
 - **`no_change_needed`** — nothing to do, with evidence; the executor posts the
-  evidence to the issue/PR and the run ends **Done**, resolving the source
-  (the Dispatch `already_addressed` settlement is the source-side companion).
+  evidence to the issue/PR and the run never resolves the source on the
+  coordinator's word — a resolve-issue run's source moves to `in-review` for a
+  human to settle, and a fix-pr run ends **NeedsHuman** until Dispatch accepts
+  an explicit `already_addressed` settlement (#1121 companion).
 - **`needs_decision`** — a real design question; the executor posts the
   question to the issue/PR and the run ends **NeedsHuman**. This is the only
   NeedsHuman a coordinator declaration can produce; the deterministic
@@ -474,17 +476,19 @@ it modest" with `concurrency: 1`. Same schema, no local assumption baked in.
   real base rather than the fork's possibly stale base branch. The target
   harness commits per brief and
   writes heartbeat and checkpoint to status; the legacy bootstrap does not
-populate these fields (#102). Exit `0` transitions to **Verifying** before
-   any external observation, releasing the lane capacity — but only when the
-   committed work is actually on the run branch: the bootstrap reads the run
-   branch's own ref (not wherever HEAD happens to point), and work that fails
-   this verification ends **Failed** naming where it actually landed, rather
-   than a later operator read of an empty branch as "no work" or a NeedsHuman
-   the coordinator never asked for (#134, reclassified by #169). Exit `2` (a
-   declared `needs_decision`) transitions to **NeedsHuman**; exit `3` (a
-   declared `no_change_needed`) transitions to **Done**, resolving the source;
-   any other exit transitions to **Failed**. A pod death or heartbeat stall
-   relaunches/resumes it; a crashloop reaches NeedsHuman.
+  populate these fields (#102). Exit `0` transitions to **Verifying** before
+  any external observation, releasing the lane capacity — but only when the
+  committed work is actually on the run branch: the bootstrap reads the run
+  branch's own ref (not wherever HEAD happens to point), and work that fails
+  this verification ends **Failed** naming where it actually landed, rather
+  than a later operator read of an empty branch as "no work" or a NeedsHuman
+  the coordinator never asked for (#134, reclassified by #169). Exit `2` (a
+  declared `needs_decision`) transitions to **NeedsHuman**; exit `3` (a
+  declared `no_change_needed`) transitions to **AwaitingReview** (source
+  `in-review`) for resolve-issue runs and **NeedsHuman** for fix-pr runs,
+  never resolving the source; Done/resolution comes only from the merged
+  observation. Any other exit transitions to **Failed**. A pod death or
+  heartbeat stall relaunches/resumes it; a crashloop reaches NeedsHuman.
 - **Verifying** — no coordinator pod or liveness meaning. The operator polls
   the external PR and CI world indefinitely, with a reconciliation cadence and
   no deadline. Observer errors remain Verifying and requeue. A missing observer,
@@ -501,10 +505,12 @@ populate these fields (#102). Exit `0` transitions to **Verifying** before
   it the same way. A partial snapshot cannot pass. The source becomes
   in-review with the transition. Verifying does not consume LaneProfile
   execution capacity, and the source remains in-progress throughout it.
-- **AwaitingReview** is terminal for this run. Human merges → operator marks
-  **Done** and resolves the source; or feedback/conflict → the source spawns a
-  fresh `fix-pr` run without reusing the previous run. The previous run remains
-  auditable; its completion does not settle later feedback.
+ - **AwaitingReview** is terminal for this run. Human merges → operator marks
+  **Done** and resolves the source; a `no_change_needed` ending arrives here
+  with no PR, settled by the human reviewing the posted evidence; or
+  feedback/conflict → the source spawns a fresh `fix-pr` run without reusing
+  the previous run. The previous run remains auditable; its completion does
+  not settle later feedback.
 - **Reap:** Done runs are deleted (checkpoint dies with the CR). NeedsHuman runs
   are kept for inspection and deleted on request. Zero standing footprint between
   runs — a strict improvement over Foreman's ownerRef-less audit ConfigMaps,
@@ -690,6 +696,18 @@ A running log of architectural decisions and their reasoning, newest first. The
 body above describes the current architecture; this log preserves *why* and what
 was superseded.
 
+- **2026-09-29 — A declared `no_change_needed` no longer settles the source.**
+  A declared `no_change_needed` now posts its evidence to the issue/PR but no
+  longer resolves the source on the coordinator's word. The revision came from
+  two failure shapes: for a followup-pr item a Resolve is a no-op, so the
+  Dispatch item stayed queued and the lane kept re-offering the same task; for
+  an issue a wrong 'already done' silently dropped work with nothing verifying
+  the claim. Interim, a `no_change_needed` ending maps a resolve-issue run to
+  `in-review` with the evidence comment posted, for a human to settle; a
+  fix-pr run ends `NeedsHuman`, until dispatch#1121 lands an explicit
+  `already_addressed`/`already_done` settlement. Done — and therefore a source
+  resolve — now comes only from the world: the merged-mid-run observation.
+  (#169, review on PR #175)
 - **2026-09-28 — Run endings are classified from a coordinator-declared outcome.**
   NeedsHuman was inferred from workspace state, so every odd ending escalated:
   of 65 runs in one deployment's five days, 19 ended NeedsHuman and not one was
@@ -700,9 +718,10 @@ was superseded.
   what is missing) — and the executor classifies from the declaration verified
   against the world: `changes` still requires commits reachable from the run
   branch; `no_change_needed` posts the evidence to the issue/PR and exits to
-  **Done** (exit code 3), resolving the source; `needs_decision` posts the
-  question and is the only NeedsHuman a declaration can produce (the
-  deterministic bootstrap guards may still hand a run to a human);
+   **Done** (exit code 3), resolving the source (source settlement revised
+  2026-09-29, above); `needs_decision` posts the question and is the only
+  NeedsHuman a declaration can produce (the deterministic bootstrap guards
+  may still hand a run to a human);
   `blocked_external` fails naming the missing prerequisite. An undeclared
   zero-exit ending never terminates NeedsHuman directly — verified commits on
   the run branch still stand as Verifying, everything else fails as incomplete

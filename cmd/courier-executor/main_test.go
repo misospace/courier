@@ -353,7 +353,8 @@ func TestRunExitZeroWithoutLocalWorkBecomesFailed(t *testing.T) {
 // TestRunStaleCommittedOutcomeBecomesFailed is the adopted-branch case: the
 // work branch already carries a committed .courier/outcome.json from an
 // earlier run. The slate reset must drop it, so a coordinator that declares
-// nothing and produces no work ends Failed, not Done on the stale file.
+// nothing and produces no work ends Failed, not with the no_change_needed
+// exit, on the stale file.
 func TestRunStaleCommittedOutcomeBecomesFailed(t *testing.T) {
 	root := t.TempDir()
 	remote := remoteWithExistingBranch(t, root)
@@ -385,8 +386,8 @@ func TestRunStaleCommittedOutcomeBecomesFailed(t *testing.T) {
 	if !strings.Contains(output.String(), "without declaring an outcome") {
 		t.Fatalf("stale-declaration reason = %q", output.String())
 	}
-	if strings.Contains(output.String(), `"phase":"Done"`) {
-		t.Fatalf("stale committed declaration must not end the run Done: %q", output.String())
+	if strings.Contains(output.String(), `"phase":"NoChangeNeeded"`) {
+		t.Fatalf("stale committed declaration must not end the run with the no_change_needed exit: %q", output.String())
 	}
 }
 
@@ -527,7 +528,7 @@ func TestRunCommittedDeclarationWithWorkStaysVerifying(t *testing.T) {
 	}
 }
 
-func TestRunDeclaredNoChangeNeededReachesDoneAndComments(t *testing.T) {
+func TestRunDeclaredNoChangeNeededExitsThreeAndComments(t *testing.T) {
 	root := t.TempDir()
 	remote := remoteWithExistingBranch(t, root)
 	fakeOpenCode := filepath.Join(root, "opencode")
@@ -555,10 +556,10 @@ func TestRunDeclaredNoChangeNeededReachesDoneAndComments(t *testing.T) {
 
 	var output bytes.Buffer
 	var errorsOut bytes.Buffer
-	if code := run(context.Background(), &output, &errorsOut); code != exitDone {
-		t.Fatalf("run exit code = %d, want %d; stderr=%q stdout=%q", code, exitDone, errorsOut.String(), output.String())
+	if code := run(context.Background(), &output, &errorsOut); code != exitNoChangeNeeded {
+		t.Fatalf("run exit code = %d, want %d; stderr=%q stdout=%q", code, exitNoChangeNeeded, errorsOut.String(), output.String())
 	}
-	if !strings.Contains(output.String(), `"phase":"Done"`) {
+	if !strings.Contains(output.String(), `"phase":"NoChangeNeeded"`) {
 		t.Fatalf("no-change-needed phase = %q", output.String())
 	}
 	if !strings.Contains(output.String(), `"outcome":"no_change_needed"`) {
@@ -928,9 +929,10 @@ func TestRunChildExitTwoBecomesFailed(t *testing.T) {
 	}
 }
 
-// TestRunChildExitThreeBecomesFailed is the symmetric guard for the operator's
-// Done code: a child that exits 3 without a declaration must fail the run with
-// the standard failure code, never end it Done.
+// TestRunChildExitThreeBecomesFailed is the symmetric guard for the
+// no_change_needed exit: a child that exits 3 without a declaration must fail
+// the run with the standard failure code, never end it with the no-change-
+// needed termination.
 func TestRunChildExitThreeBecomesFailed(t *testing.T) {
 	root := t.TempDir()
 	remote := remoteWithExistingBranch(t, root)
@@ -954,8 +956,8 @@ func TestRunChildExitThreeBecomesFailed(t *testing.T) {
 	if !strings.Contains(output.String(), "opencode exited with status 3") {
 		t.Fatalf("child-exit-3 reason = %q", output.String())
 	}
-	if strings.Contains(output.String(), `"phase":"Done"`) {
-		t.Fatalf("child exit 3 must never end the run Done: %q", output.String())
+	if strings.Contains(output.String(), `"phase":"NoChangeNeeded"`) {
+		t.Fatalf("child exit 3 must never end the run with the no_change_needed exit: %q", output.String())
 	}
 }
 

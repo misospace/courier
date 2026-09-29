@@ -750,7 +750,10 @@ Use idempotent retries and reconciliation.
 
 The operator's current mapping is: exit `0` → `Verifying` (the operator then
 verifies the world — the PR exists and checks are observed — before the run is
-done), exit `2` → `NeedsHuman`, any other nonzero exit → `Failed`. This design
+done), exit `2` → `NeedsHuman`, exit `3` (a declared `no_change_needed`) →
+`AwaitingReview` (source `in-review`) for resolve-issue runs and `NeedsHuman`
+for fix-pr runs, never settling the source, any other nonzero exit → `Failed`
+(DESIGN.md's exit contract is the authority for this mapping). This design
 preserves that mapping; a separately reviewed operator change may update it,
 and this document does not.
 
@@ -898,9 +901,9 @@ and the acceptance tests below are satisfied.
   startup grace prevent a false reap). No lease-expiry or hidden timeout
   test may stand in for evidence; the wedge is not detected, so #102 stays
   blocked for production until the §12 gates are met.
-- **Failure semantics:** workload failure and infrastructure failure are
-  distinguishable from trusted evidence; operator exit-code mapping remains
-  unchanged until its own approved change.
+ - **Failure semantics:** workload failure and infrastructure failure are
+  distinguishable from trusted evidence; the operator's exit-code mapping
+  follows DESIGN.md's exit contract.
 
 ## 11. Open blockers
 

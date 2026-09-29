@@ -30,13 +30,13 @@ import (
 )
 
 const (
-	exitSuccess    = 0
-	exitFailed     = 1
-	exitNeedsHuman = 2
-	exitDone       = 3
-	defaultBase    = "main"
-	defaultWork    = "/workspace"
-	defaultFormat  = "json"
+	exitSuccess        = 0
+	exitFailed         = 1
+	exitNeedsHuman     = 2
+	exitNoChangeNeeded = 3
+	defaultBase        = "main"
+	defaultWork        = "/workspace"
+	defaultFormat      = "json"
 )
 
 type config struct {
@@ -425,8 +425,9 @@ func run(ctx context.Context, stdout, stderr io.Writer) int {
 		// A non-zero child exit is a failure, never a human-attention signal:
 		// only a coordinator-declared needs_decision may end the run that way.
 		// The child's raw code must not pass through: the operator maps 2 to
-		// NeedsHuman and 3 to Done, so terminate with the standard failure
-		// code and keep the child's code in the reason.
+		// NeedsHuman and 3 to AwaitingReview or NeedsHuman by run mode, so
+		// terminate with the standard failure code and keep the child's code
+		// in the reason.
 		report.terminate(termination{Phase: "Failed", Result: "failure", ExitCode: exitFailed, Reason: fmt.Sprintf("opencode exited with status %d", code)})
 		return exitFailed
 	}
@@ -578,7 +579,7 @@ func (r reporter) classifyDeclared(ctx context.Context, workspace *git.Workspace
 		r.emitOutcomeDeclared(outcomeNoChangeNeeded)
 		if workState == git.WorkStateNone {
 			r.postOutcomeComment(ctx, "**Courier: already addressed** (run "+r.cfg.RunID+")\n\n"+decl.Evidence)
-			return termination{Phase: "Done", Result: "success", ExitCode: exitDone, Reason: "opencode declared no change needed: " + decl.Evidence, Outcome: outcomeNoChangeNeeded}
+			return termination{Phase: "NoChangeNeeded", Result: "success", ExitCode: exitNoChangeNeeded, Reason: "opencode declared no change needed: " + decl.Evidence, Outcome: outcomeNoChangeNeeded}
 		}
 		return failed("opencode declared no change needed but the workspace has new commits or uncommitted changes")
 	case outcomeNeedsDecision:

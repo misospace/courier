@@ -485,6 +485,26 @@ func TestHTTPClientReportOmitsEmptyIdempotencyKey(t *testing.T) {
 	}
 }
 
+func TestHTTPClientReportIgnoresLifecycleWithoutResult(t *testing.T) {
+	var paths []string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		paths = append(paths, r.URL.Path)
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer server.Close()
+	client, err := NewClientWithLane(server.URL, "worker", "normal", "secret-token", time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	id := EncodeWorkID(Task{Type: "implement", Issue: &Issue{Repo: "acme/widgets", Number: 42}})
+	if err := client.Report(context.Background(), id, source.Lifecycle{State: source.StateInReview}); err != nil {
+		t.Fatal(err)
+	}
+	if len(paths) != 0 {
+		t.Fatalf("Report made unexpected requests: %#v", paths)
+	}
+}
+
 func TestHTTPClientReportUsesTaskReportAndPRFixQueueOnlyForFollowups(t *testing.T) {
 	var requests []string
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

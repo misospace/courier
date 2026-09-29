@@ -390,7 +390,7 @@ func (r *CoderRunReconciler) observeRunning(ctx context.Context, run *courierv1a
 		if !terminated {
 			continue
 		}
-		phase := phaseForExit(exitCode)
+		phase := phaseForExit(run.Spec.Mode, exitCode)
 		if phase == courierv1alpha1.PhaseVerifying {
 			before := run.DeepCopy()
 			run.Status.Phase = courierv1alpha1.PhaseVerifying
@@ -556,7 +556,9 @@ func lifecycleForPhase(phase courierv1alpha1.Phase, state source.State, pr strin
 	lifecycle := source.Lifecycle{State: state, PR: pr}
 	switch phase {
 	case courierv1alpha1.PhaseAwaitingReview:
-		lifecycle.Result = source.ResultReady
+		if pr != "" {
+			lifecycle.Result = source.ResultReady
+		}
 	case courierv1alpha1.PhaseFailed:
 		lifecycle.Result = source.ResultFailed
 		lifecycle.Error = "coordinator failed"
@@ -637,18 +639,23 @@ func coordinatorExitCode(pod *corev1.Pod) (int32, bool) {
 }
 
 // phaseForExit maps the coordinator's exit code to the run's next phase. 0
-// sends the run to Verifying; 2 means the coordinator needs a human; 3 means
-// the coordinator declared the work already done (no_change_needed, issue
-// #169), so the run is Done and its source is resolved; any other code is a
-// failure.
-func phaseForExit(exitCode int32) courierv1alpha1.Phase {
+// sends the run to Verifying; 2 means the coordinator needs a human; 3 is the
+// declared no_change_needed outcome (#169): it never resolves the source
+// directly — a resolve-issue run lands in AwaitingReview so a human reviews
+// the posted evidence, a fix-pr run lands in NeedsHuman until Dispatch
+// accepts an explicit already-addressed settlement
+// (misospace/dispatch#1121). Any other code is a failure.
+func phaseForExit(mode courierv1alpha1.Mode, exitCode int32) courierv1alpha1.Phase {
 	switch exitCode {
 	case 0:
 		return courierv1alpha1.PhaseVerifying
 	case 2:
 		return courierv1alpha1.PhaseNeedsHuman
 	case 3:
-		return courierv1alpha1.PhaseDone
+		if mode == courierv1alpha1.ModeFixPR {
+			return courierv1alpha1.PhaseNeedsHuman
+		}
+		return courierv1alpha1.PhaseAwaitingReview
 	default:
 		return courierv1alpha1.PhaseFailed
 	}
