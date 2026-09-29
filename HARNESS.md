@@ -753,9 +753,9 @@ verifies the world — the PR exists and checks are observed — before the run 
 done), exit `2` → `NeedsHuman`, exit `3` (a declared `no_change_needed`) →
 `AwaitingReview` (source `in-review`) for resolve-issue runs and `NeedsHuman`
 for fix-pr runs, never settling the source, any other nonzero exit → `Failed`
-(DESIGN.md's exit contract is the authority for this mapping). This design
-preserves that mapping; a separately reviewed operator change may update it,
-and this document does not.
+(DESIGN.md's exit contract is the shared authority for this mapping). The
+native harness's structured result carries the declared outcome, and its
+process exit reflects it: 0 changes, 2 needs_decision, 3 no_change_needed.
 
 The native harness adds an explicit result contract on top of the exit code:
 a structured terminal result (outcome + reason) written by trusted control

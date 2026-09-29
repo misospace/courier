@@ -488,8 +488,10 @@ it modest" with `concurrency: 1`. Same schema, no local assumption baked in.
   declared `needs_decision`) transitions to **NeedsHuman**; exit `3` (a
   declared `no_change_needed`) transitions to **AwaitingReview** (source
   `in-review`) for resolve-issue runs and **NeedsHuman** for fix-pr runs,
-  never resolving the source; Done/resolution comes only from the merged
-  observation. Any other exit transitions to **Failed**. A pod death or
+  never resolving the source; the operator reaches **Done** only through the
+  merged-mid-run observation, while a `no_change_needed` ending leaves the
+  source's resolution to the human it escalates to. Any other exit transitions
+  to **Failed**. A pod death or
   heartbeat stall relaunches/resumes it; a crashloop reaches NeedsHuman.
 - **Verifying** — no coordinator pod or liveness meaning. The operator polls
   the external PR and CI world indefinitely, with a reconciliation cadence and

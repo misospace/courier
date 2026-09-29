@@ -400,7 +400,7 @@ func (r *CoderRunReconciler) observeRunning(ctx context.Context, run *courierv1a
 			r.emitPhaseTransition(run, courierv1alpha1.PhaseVerifying, map[string]any{"exit_code": exitCode})
 			return ctrl.Result{Requeue: true}, nil
 		}
-		return r.transitionTerminal(ctx, run, phase, "", exitCode == 3)
+		return r.transitionTerminal(ctx, run, phase, "", exitCode == exitDeclaredNoChange && phase == courierv1alpha1.PhaseNeedsHuman)
 	}
 	result, handled, err := r.checkLiveness(ctx, run, pods.Items)
 	if handled {
@@ -643,12 +643,16 @@ func coordinatorExitCode(pod *corev1.Pod) (int32, bool) {
 	return 0, false
 }
 
+// exitDeclaredNoChange is the executor's exit for a verified no_change_needed declaration (#169).
+const exitDeclaredNoChange = 3
+
 // phaseForExit maps the coordinator's exit code to the run's next phase. 0
 // sends the run to Verifying; 2 means the coordinator needs a human; 3 is the
 // declared no_change_needed outcome (#169): it never resolves the source
 // directly — a resolve-issue run lands in AwaitingReview so a human reviews
-// the posted evidence, a fix-pr run lands in NeedsHuman until Dispatch
-// accepts an explicit already-addressed settlement
+// the posted evidence, a fix-pr run lands in NeedsHuman with a
+// wake-reviewer blocked report that settles the PR-fix attempt for re-review,
+// until Dispatch accepts an explicit already-addressed settlement
 // (misospace/dispatch#1121). Any other code is a failure.
 func phaseForExit(mode courierv1alpha1.Mode, exitCode int32) courierv1alpha1.Phase {
 	switch exitCode {
@@ -656,7 +660,7 @@ func phaseForExit(mode courierv1alpha1.Mode, exitCode int32) courierv1alpha1.Pha
 		return courierv1alpha1.PhaseVerifying
 	case 2:
 		return courierv1alpha1.PhaseNeedsHuman
-	case 3:
+	case exitDeclaredNoChange:
 		if mode == courierv1alpha1.ModeFixPR {
 			return courierv1alpha1.PhaseNeedsHuman
 		}
