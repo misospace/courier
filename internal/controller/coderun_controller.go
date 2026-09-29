@@ -643,7 +643,9 @@ func coordinatorExitCode(pod *corev1.Pod) (int32, bool) {
 	return 0, false
 }
 
-// exitDeclaredNoChange is the executor's exit for a verified no_change_needed declaration (#169).
+// exitDeclaredNoChange is the executor's exit for a verified no_change_needed
+// declaration (#169); it mirrors exitNoChangeNeeded in cmd/courier-executor,
+// with DESIGN.md's reconcile exit contract as the authority.
 const exitDeclaredNoChange = 3
 
 // phaseForExit maps the coordinator's exit code to the run's next phase. 0

@@ -30,9 +30,11 @@ import (
 )
 
 const (
-	exitSuccess        = 0
-	exitFailed         = 1
-	exitNeedsHuman     = 2
+	exitSuccess    = 0
+	exitFailed     = 1
+	exitNeedsHuman = 2
+	// The operator decodes this exit in phaseForExit (internal/controller);
+	// DESIGN.md's exit contract is the authority.
 	exitNoChangeNeeded = 3
 	defaultBase        = "main"
 	defaultWork        = "/workspace"
