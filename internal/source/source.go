@@ -85,9 +85,10 @@ type Lifecycle struct {
 	Result Result
 	PR     string
 	Error  string
-	// WakeReviewer marks a blocked ending that settles the attempt and wakes
-	// the reviewer instead of parking a queue-backed item for a human. Only
-	// meaningful with ResultBlocked; adapters without queue semantics ignore it.
+	// WakeReviewer qualifies a blocked lifecycle Result: the ending settles
+	// the source's task attempt and wakes the reviewer rather than parking a
+	// queue-backed item for a human. Meaningful only alongside
+	// Result ResultBlocked; adapters without queue semantics ignore it.
 	WakeReviewer bool
 	// IdempotencyKey identifies the publication so a source can deduplicate a
 	// retry of the same report. Empty means the source has no deduplication.
