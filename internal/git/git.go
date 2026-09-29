@@ -223,7 +223,7 @@ func (w *Workspace) StatusPorcelain(ctx context.Context) ([]string, error) {
 		if isRenameStatus(record[:2]) {
 			i++
 		}
-		paths = append(paths, unquoteCPath(record[3:]))
+		paths = append(paths, record[3:])
 	}
 	return paths, nil
 }
@@ -232,28 +232,6 @@ func (w *Workspace) StatusPorcelain(ctx context.Context) ([]string, error) {
 // or copy (C) entry whose next NUL record is the origin path.
 func isRenameStatus(status string) bool {
 	return status[0] == 'R' || status[0] == 'C'
-}
-
-// unquoteCPath strips C-style quoting from a git path: surrounding quotes and
-// backslash escapes.
-func unquoteCPath(path string) string {
-	if len(path) < 2 || path[0] != '"' || path[len(path)-1] != '"' {
-		return path
-	}
-	inner := path[1 : len(path)-1]
-	if !strings.Contains(inner, "\\") {
-		return inner
-	}
-	var b strings.Builder
-	for i := 0; i < len(inner); i++ {
-		if inner[i] == '\\' && i+1 < len(inner) {
-			i++
-			b.WriteByte(inner[i])
-			continue
-		}
-		b.WriteByte(inner[i])
-	}
-	return b.String()
 }
 
 // CommitsOnBranchSince reports how many commits are reachable from the local

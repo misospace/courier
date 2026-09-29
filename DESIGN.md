@@ -462,9 +462,12 @@ it modest" with `concurrency: 1`. Same schema, no local assumption baked in.
   world facts, up to `COURIER_MAX_CONTINUATIONS` times (default 3); a
   no-progress guard (the same workspace-state fingerprint and the same last
   assistant message twice) terminates earlier as **NeedsHuman** with reason
-  `looping` and the state history. A crash (a non-zero exit that is not 2)
-  resumes the session with exponential backoff, sharing the
-  `COURIER_MAX_CONTINUATIONS` budget, before the run transitions to **Failed**;
+  `looping` and the state history; reaching the continuation cap also
+  terminates the run as **NeedsHuman** with reason `looping after N
+  continuations` plus the state history. A crash (a non-zero exit that is not
+  2) resumes the session with exponential backoff (default 5s,
+  `COURIER_RESUME_BACKOFF_SECONDS`), sharing the `COURIER_MAX_CONTINUATIONS`
+  budget, before the run transitions to **Failed**;
   a crash before any session id is observed transitions to **Failed**
   immediately. Exit `2` transitions to **NeedsHuman** immediately. A pod death
   or heartbeat stall relaunches/resumes it; a crashloop reaches NeedsHuman.

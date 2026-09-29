@@ -39,6 +39,7 @@ const (
 
 	defaultMaxContinuations = 3
 	defaultResumeBackoff    = 5 * time.Second
+	maxResumeBackoffSeconds = 3600
 )
 
 type config struct {
@@ -95,6 +96,11 @@ func readConfig(getenv func(string) string) (config, error) {
 	resumeBackoff, err := strconv.ParseFloat(strings.TrimSpace(getenv("COURIER_RESUME_BACKOFF_SECONDS")), 64)
 	if err != nil || math.IsNaN(resumeBackoff) || math.IsInf(resumeBackoff, 0) || resumeBackoff < 0 {
 		resumeBackoff = defaultResumeBackoff.Seconds()
+	}
+	// Cap the backoff so an absurd value (e.g. 1e300) cannot overflow the
+	// float->int64 conversion into a negative duration.
+	if resumeBackoff > maxResumeBackoffSeconds {
+		resumeBackoff = maxResumeBackoffSeconds
 	}
 	cfg := config{
 		RemoteURL:        remoteURL,

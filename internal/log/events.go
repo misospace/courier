@@ -51,7 +51,8 @@ const (
 	// EventExecutorStart reports an executor process invocation.
 	EventExecutorStart = "executor.start"
 	// EventExecutorContinuation reports a recoverable executor exit that
-	// resumed the same session with a short state message.
+	// resumed the same session with a short state message. It also marks a
+	// crash resume; the detail carries a kind distinguishing the two.
 	EventExecutorContinuation = "executor.continuation"
 	// EventModelCall reports one model invocation (future harness).
 	EventModelCall = "model.call"

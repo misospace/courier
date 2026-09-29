@@ -1021,6 +1021,7 @@ func TestReadConfigContinuationDefaults(t *testing.T) {
 		{name: "non-finite resume backoff", backoff: "Inf", wantMax: 3, wantBackoff: 5 * time.Second},
 		{name: "NaN resume backoff", backoff: "NaN", wantMax: 3, wantBackoff: 5 * time.Second},
 		{name: "zero resume backoff", backoff: "0", wantMax: 3, wantBackoff: 0},
+		{name: "oversized resume backoff clamped", backoff: "1e300", wantMax: 3, wantBackoff: 3600 * time.Second},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			values := make(map[string]string, len(base)+2)
