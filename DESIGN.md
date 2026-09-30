@@ -481,6 +481,16 @@ it modest" with `concurrency: 1`. Same schema, no local assumption baked in.
   runs — a strict improvement over Foreman's ownerRef-less audit ConfigMaps,
   which require an external sweeper.
 
+**Terminalization writes the run's own phase before it reports to the source.**
+A rejected or failed source report never holds a run in `Running`: the phase is
+written first, which releases lane capacity, and only then is the lifecycle
+report published — on its own, retried via a bounded requeue and deduplicated by
+the run's stable idempotency key. A Dispatch generation-mismatch conflict means
+this attempt was superseded by a newer generation of the same work, so the report
+is dropped rather than retried (the newer generation belongs to another run) and
+the run still terminalizes; a transient report failure leaves the run in its
+terminal phase with the report retried on a later reconcile. (#178)
+
 ## Sources
 
 Pluggable adapters over a generic interface. An adapter both *creates* runs and
@@ -661,6 +671,21 @@ A running log of architectural decisions and their reasoning, newest first. The
 body above describes the current architecture; this log preserves *why* and what
 was superseded.
 
+- **2026-09-29 — #178: a run's own terminal phase is never gated on a source
+  report.** `transitionTerminal` used to publish the source transition and
+  lifecycle report before writing the phase, so a rejected report kept the run
+  `Running` and holding lane capacity while it retried on backoff. A real case: a
+  `fix-pr` run whose settle was rejected with Dispatch's generation-mismatch 409
+  (the queue item had advanced to a newer attempt) sat `Running` for hours behind
+  a concurrency-1 lane, starving every other run. The reconcile now writes the
+  terminal phase first — capacity frees regardless of the source — then publishes
+  the report on its own, retried via a bounded requeue and deduplicated by the
+  run's idempotency key. A generation mismatch is mapped in the Dispatch adapter
+  to a typed superseded error the controller recognizes and *drops*: the report is
+  a record of the old attempt and the newer generation belongs to another run,
+  matching the #98 settlement contract. A retry cap was deliberately not added —
+  it would be a governor on a harmless idempotent retry, and the run itself is
+  never held. (#178)
 - **2026-09-27 — #122 lands the broker publication primitives.** The broker owns
   the whole publication path: a pinned, non-force git transport to one explicit
   ref, a typed forge observer (never raw forge calls), an authenticated
