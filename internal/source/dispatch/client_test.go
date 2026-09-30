@@ -485,6 +485,26 @@ func TestHTTPClientReportOmitsEmptyIdempotencyKey(t *testing.T) {
 	}
 }
 
+func TestHTTPClientReportIgnoresLifecycleWithoutResult(t *testing.T) {
+	var paths []string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		paths = append(paths, r.URL.Path)
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer server.Close()
+	client, err := NewClientWithLane(server.URL, "worker", "normal", "secret-token", time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	id := EncodeWorkID(Task{Type: "implement", Issue: &Issue{Repo: "acme/widgets", Number: 42}})
+	if err := client.Report(context.Background(), id, source.Lifecycle{State: source.StateInReview}); err != nil {
+		t.Fatal(err)
+	}
+	if len(paths) != 0 {
+		t.Fatalf("Report made unexpected requests: %#v", paths)
+	}
+}
+
 func TestHTTPClientReportUsesTaskReportAndPRFixQueueOnlyForFollowups(t *testing.T) {
 	var requests []string
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -506,6 +526,37 @@ func TestHTTPClientReportUsesTaskReportAndPRFixQueueOnlyForFollowups(t *testing.
 	want := []string{"/api/agents/worker/tasks/report", "/api/pr-fix-queue/mark"}
 	if !reflect.DeepEqual(requests, want) {
 		t.Fatalf("request paths = %#v, want %#v", requests, want)
+	}
+}
+
+func TestHTTPClientReportBlockedBlockedReportParksPRFix(t *testing.T) {
+	var requests []map[string]any
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/api/pr-fix-queue/mark" {
+			t.Fatalf("skip-queue-mark blocked report made a queue request: %s", r.URL.Path)
+		}
+		if r.Method != http.MethodPost || r.URL.Path != "/api/agents/worker/tasks/report" {
+			t.Fatalf("request = %s %s, want POST /api/agents/worker/tasks/report", r.Method, r.URL.Path)
+		}
+		body, _ := io.ReadAll(r.Body)
+		var request map[string]any
+		if err := json.Unmarshal(body, &request); err != nil {
+			t.Fatal(err)
+		}
+		requests = append(requests, request)
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer server.Close()
+	client, err := NewClientWithLane(server.URL, "worker", "normal", "secret-token", time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	id := EncodeWorkID(Task{Type: "followup-pr", Issue: &Issue{ID: "issue-id", Repo: "acme/widgets", Number: 41}, PullRequest: &PullRequest{Repo: "acme/widgets", Number: 77}, PRFixItem: &PRFixItem{ID: "queue-item", Generation: 1}})
+	if err := client.Report(context.Background(), id, source.Lifecycle{Result: source.ResultBlocked, Error: "blocked", BlockedReportParksPRFix: true}); err != nil {
+		t.Fatal(err)
+	}
+	if len(requests) != 1 || requests[0]["taskType"] != "followup-pr" || requests[0]["outcome"] != "blocked" || requests[0]["error"] != "blocked" {
+		t.Fatalf("requests = %#v, want exactly one blocked task report", requests)
 	}
 }
 
@@ -696,6 +747,86 @@ func TestHTTPClientRedactsTokenFromAPIError(t *testing.T) {
 	_, err = client.Discover(context.Background())
 	if err == nil || strings.Contains(err.Error(), "secret-token") || !strings.Contains(err.Error(), "redacted") {
 		t.Fatalf("error = %v", err)
+	}
+}
+
+func TestHTTPClientReportMapsPRFixGenerationMismatchToSuperseded(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/api/agents/worker/tasks/report" {
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		if r.URL.Path != "/api/pr-fix-queue/mark" {
+			t.Fatalf("path = %q", r.URL.Path)
+		}
+		w.WriteHeader(http.StatusConflict)
+		_, _ = w.Write([]byte(`{"error":"PR fix queue item generation mismatch: expected generation 3 did not match the item's current generation"}`))
+	}))
+	defer server.Close()
+
+	client, err := NewClientWithLane(server.URL, "worker", "normal", "secret-token", time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	id := EncodeWorkID(Task{Type: "followup-pr", PullRequest: &PullRequest{Repo: "acme/widgets", Number: 77}, PRFixItem: &PRFixItem{ID: "queue-item", Generation: 3}})
+	if err := client.Report(context.Background(), id, source.Lifecycle{State: source.StateNeedsHuman, Result: source.ResultBlocked, Error: "blocked"}); !errors.Is(err, source.ErrSuperseded) {
+		t.Fatalf("Report() error = %v, want ErrSuperseded", err)
+	}
+}
+
+func TestHTTPClientReportOtherConflictIsNotSuperseded(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/api/agents/worker/tasks/report" {
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		if r.URL.Path != "/api/pr-fix-queue/mark" {
+			t.Fatalf("path = %q", r.URL.Path)
+		}
+		w.WriteHeader(http.StatusConflict)
+		_, _ = w.Write([]byte(`{"error":"some other conflict"}`))
+	}))
+	defer server.Close()
+
+	client, err := NewClientWithLane(server.URL, "worker", "normal", "secret-token", time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	id := EncodeWorkID(Task{Type: "followup-pr", PullRequest: &PullRequest{Repo: "acme/widgets", Number: 77}, PRFixItem: &PRFixItem{ID: "queue-item", Generation: 3}})
+	err = client.Report(context.Background(), id, source.Lifecycle{State: source.StateNeedsHuman, Result: source.ResultBlocked, Error: "blocked"})
+	if err == nil {
+		t.Fatal("Report() error = nil, want a non-superseded error")
+	}
+	if errors.Is(err, source.ErrSuperseded) {
+		t.Fatalf("Report() error = %v, a non-mismatch 409 must not map to ErrSuperseded", err)
+	}
+}
+
+func TestHTTPClientReportServerErrorIsNotSuperseded(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/api/agents/worker/tasks/report" {
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		if r.URL.Path != "/api/pr-fix-queue/mark" {
+			t.Fatalf("path = %q", r.URL.Path)
+		}
+		w.WriteHeader(http.StatusBadGateway)
+		_, _ = w.Write([]byte(`{"error":"PR fix queue item generation mismatch"}`))
+	}))
+	defer server.Close()
+
+	client, err := NewClientWithLane(server.URL, "worker", "normal", "secret-token", time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	id := EncodeWorkID(Task{Type: "followup-pr", PullRequest: &PullRequest{Repo: "acme/widgets", Number: 77}, PRFixItem: &PRFixItem{ID: "queue-item", Generation: 3}})
+	err = client.Report(context.Background(), id, source.Lifecycle{State: source.StateNeedsHuman, Result: source.ResultBlocked, Error: "blocked"})
+	if err == nil {
+		t.Fatal("Report() error = nil, want a non-superseded error")
+	}
+	if errors.Is(err, source.ErrSuperseded) {
+		t.Fatalf("Report() error = %v, a 5xx must not map to ErrSuperseded", err)
 	}
 }
 

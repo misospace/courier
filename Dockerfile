@@ -9,7 +9,7 @@
 ARG BINARIES=builder
 
 # Build the manager and executor binaries.
-FROM golang:1.27.1@sha256:3680233e3204827fbdc66088528ae6d4b3d034f51d03a99d454f6de034888244 AS builder
+FROM golang:1.27.1@sha256:e0174e51e81218523251d85d248a90d24c3d5e81543b4f07a5d66229397db190 AS builder
 ARG TARGETOS
 ARG TARGETARCH
 
@@ -36,7 +36,7 @@ COPY dist/manager dist/courier-executor /workspace/
 
 FROM binaries-${BINARIES} AS binaries
 
-FROM golang:1.27.1@sha256:3680233e3204827fbdc66088528ae6d4b3d034f51d03a99d454f6de034888244 AS toolchain
+FROM golang:1.27.1@sha256:e0174e51e81218523251d85d248a90d24c3d5e81543b4f07a5d66229397db190 AS toolchain
 ARG CONTROLLER_TOOLS_VERSION=v0.16.5
 ARG HELM_VERSION=v3.18.6
 
@@ -74,7 +74,8 @@ FROM coordinator AS coordinator-go
 USER root
 RUN apt-get update && \
 	apt-get install -y --no-install-recommends make && \
-	apt-get clean && rm -rf /var/lib/apt/lists/*
+	apt-get clean && rm -rf /var/lib/apt/lists/* && \
+	mkdir -p /courier-toolchain-cache && chown 65532:65532 /courier-toolchain-cache
 
 COPY --from=toolchain /usr/local/go /usr/local/go
 COPY --from=toolchain /out/controller-gen /usr/local/bin/controller-gen
@@ -82,6 +83,8 @@ COPY --from=toolchain /out/helm /usr/local/bin/helm
 
 ENV PATH=/usr/local/go/bin:${PATH} \
 	CONTROLLER_GEN=/usr/local/bin/controller-gen \
+	GOMODCACHE=/courier-toolchain-cache/go-mod \
+	GOCACHE=/courier-toolchain-cache/go-build \
 	GOTOOLCHAIN=local
 
 USER 65532:65532

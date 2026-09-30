@@ -105,18 +105,29 @@ spec:
 ```
 
 The operator derives the resolve branch, creates the coordinator pod, and
-observes its exit. Exit `0` moves the run to `Verifying`, where the operator
-polls the external PR and CI state until it reaches `AwaitingReview` or
-`NeedsHuman`. Recoverable endings — uncommitted changes, commits off the run
-branch, no commit and no declared outcome — resume the same session with a short
-state message, up to `COURIER_MAX_CONTINUATIONS` times (default 3); a
-no-progress guard (the same workspace state and the same last assistant message
-twice) ends the run `NeedsHuman` with reason `looping`; reaching the
-continuation cap also ends it `NeedsHuman` with reason `looping after N
-continuations` plus the state history. A crash resumes the session with
-exponential backoff (default 5s, `COURIER_RESUME_BACKOFF_SECONDS`), sharing the
-`COURIER_MAX_CONTINUATIONS` budget, before the run moves to `Failed`; a crash
-before any session id is observed moves it to `Failed` immediately. Exit `2` moves it to `NeedsHuman` immediately.
+observes its exit. The goal gives the coordinator the exact outcome-file path in
+executor-owned per-run scratch outside the checkout. Exit `0` (`changes`) moves
+the run to `Verifying` only after committed work is verified on the run branch;
+the operator then polls the external PR and CI state until it reaches
+`AwaitingReview` or `NeedsHuman`. Exit `2` (`needs_decision` or
+`blocked_external`) moves the run to `NeedsHuman`. Exit `3` (`no_change_needed`)
+moves a resolve-issue run to `AwaitingReview` with the source `in-review`, and a
+fix-pr run to `NeedsHuman`, never settling the source; its blocked lifecycle
+report parks the PR-fix item as `BLOCKED`/needs-human. The evidence, question,
+or missing explanation is posted in full after redaction; only the separate
+termination reason is bounded and redacted. Comment posting is best-effort:
+failures are logged as `outcome.comment` and do not change the ending.
+
+When no outcome is declared, recoverable endings — uncommitted changes, commits
+off the run branch, or no commit and no workspace changes — resume the same
+session with a short state message, up to `COURIER_MAX_CONTINUATIONS` times
+(default 3). Without a captured session, these undeclared endings fail as
+incomplete. A no-progress guard ends the run as `NeedsHuman` with reason
+`looping`; reaching the continuation cap also ends it as `NeedsHuman` with the
+state history. A crash resumes the session with exponential backoff (default 5s,
+`COURIER_RESUME_BACKOFF_SECONDS`), sharing the same continuation budget, before
+the run moves to `Failed`; a crash before any session ID is observed moves it to
+`Failed` immediately. A child exit code alone is not a declared outcome.
 
 The OpenCode shim resumes a run's session only inside the running pod; it does
 not survive pod/model restarts with conversational state. Git commits and the

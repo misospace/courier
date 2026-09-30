@@ -2,6 +2,7 @@ package controller
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"reflect"
@@ -9,6 +10,8 @@ import (
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
+	apimeta "k8s.io/apimachinery/pkg/api/meta"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -24,9 +27,24 @@ import (
 // capacityRequeueDelay bounds how long a Pending run can wait behind a full
 // lane before checking again.
 const (
-	capacityRequeueDelay    = 15 * time.Second
-	observationRequeueDelay = 5 * time.Second
+	capacityRequeueDelay        = 15 * time.Second
+	observationRequeueDelay     = 5 * time.Second
+	lifecycleReportRequeueDelay = 30 * time.Second
 )
+
+// lifecycleReportedCondition tracks whether a terminal run's source lifecycle
+// report has been published; a False status means a later reconcile retries it.
+const (
+	lifecycleReportedCondition                          = "LifecycleReported"
+	lifecycleReportPendingReason                        = "Pending"
+	lifecycleReportPendingBlockedReportParksPRFixReason = "PendingBlockedReportParksPRFix"
+	lifecycleReportPendingWithErrorReason               = "PendingWithError"
+)
+
+type terminalLifecycleIntent struct {
+	skipPRFixQueueMark bool
+	error              string
+}
 
 // CoderRunReconciler reconciles a CoderRun object.
 type CoderRunReconciler struct {
@@ -110,8 +128,13 @@ func (r *CoderRunReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 	}
 	// Status is initially empty on a newly-created CoderRun. Treat that zero
 	// value as Pending so a source does not need a second status write before
-	// admission can begin. Other terminal phases are left unchanged.
+	// admission can begin. A terminal run normally does nothing, except when its
+	// lifecycle report is still pending: then the report alone is retried, since
+	// the run already reached its phase and freed capacity.
 	if run.Status.Phase != "" && run.Status.Phase != courierv1alpha1.PhasePending {
+		if lifecycleReportPending(&run) {
+			return r.retryTerminalLifecycle(ctx, &run)
+		}
 		l.V(1).Info("reconcile", "phase", run.Status.Phase)
 		return ctrl.Result{}, nil
 	}
@@ -164,7 +187,7 @@ func (r *CoderRunReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 	head, err := resolveRunBranch(ctx, &run, r.PRHeadResolver)
 	if err != nil {
 		if errors.Is(err, ErrHeadRepositoryGone) {
-			return ctrl.Result{}, r.terminateMissingHead(ctx, &run, err)
+			return r.terminateMissingHead(ctx, &run, err)
 		}
 		return ctrl.Result{}, r.releaseClaim(ctx, &run, adapter, item, err)
 	}
@@ -222,7 +245,7 @@ func (r *CoderRunReconciler) resumeClaimed(ctx context.Context, run *courierv1al
 		head, err := resolveRunBranch(ctx, run, r.PRHeadResolver)
 		if err != nil {
 			if errors.Is(err, ErrHeadRepositoryGone) {
-				return ctrl.Result{}, r.terminateMissingHead(ctx, run, err)
+				return r.terminateMissingHead(ctx, run, err)
 			}
 			return ctrl.Result{}, r.releaseClaim(ctx, run, adapter, item, err)
 		}
@@ -341,19 +364,19 @@ func (r *CoderRunReconciler) releaseClaim(ctx context.Context, run *courierv1alp
 // terminalizes NeedsHuman rather than cycling claim and release on every
 // reconcile. The cause is handled here, so it is logged and not returned as a
 // reconcile error.
-func (r *CoderRunReconciler) terminateMissingHead(ctx context.Context, run *courierv1alpha1.CoderRun, cause error) error {
+func (r *CoderRunReconciler) terminateMissingHead(ctx context.Context, run *courierv1alpha1.CoderRun, cause error) (ctrl.Result, error) {
 	log.FromContext(ctx).Info("terminating fix-pr run: pull request head repository is missing",
 		"run", run.Name, "branch", run.Status.Branch, "cause", cause.Error())
 	adapter, item, err := r.adapterAndWorkItem(run)
 	if err != nil {
-		return err
+		return ctrl.Result{}, err
 	}
 	releaseErr := adapter.Release(ctx, item)
 	run.Status.Branch = ""
 	run.Status.HeadRepo = ""
 	run.Status.HeadSHA = ""
-	_, terminalErr := r.transitionTerminal(ctx, run, courierv1alpha1.PhaseNeedsHuman, "")
-	return errors.Join(releaseErr, terminalErr)
+	terminalResult, terminalErr := r.transitionTerminal(ctx, run, courierv1alpha1.PhaseNeedsHuman, "", terminalLifecycleIntent{})
+	return terminalResult, errors.Join(releaseErr, terminalErr)
 }
 
 // resolveCompleted closes the source work for a Done run and then applies the
@@ -386,11 +409,11 @@ func (r *CoderRunReconciler) observeRunning(ctx context.Context, run *courierv1a
 		if !podBelongsToRun(pod, run) {
 			continue
 		}
-		exitCode, terminated := coordinatorExitCode(pod)
+		exitCode, terminationReason, terminationOutcome, terminated := coordinatorTermination(pod)
 		if !terminated {
 			continue
 		}
-		phase := phaseForExit(exitCode)
+		phase := phaseForExit(run.Spec.Mode, exitCode)
 		if phase == courierv1alpha1.PhaseVerifying {
 			before := run.DeepCopy()
 			run.Status.Phase = courierv1alpha1.PhaseVerifying
@@ -400,7 +423,13 @@ func (r *CoderRunReconciler) observeRunning(ctx context.Context, run *courierv1a
 			r.emitPhaseTransition(run, courierv1alpha1.PhaseVerifying, map[string]any{"exit_code": exitCode})
 			return ctrl.Result{Requeue: true}, nil
 		}
-		return r.transitionTerminal(ctx, run, phase, "")
+		intent := terminalLifecycleIntent{
+			skipPRFixQueueMark: exitCode == exitDeclaredNoChange && run.Spec.Mode == courierv1alpha1.ModeFixPR,
+		}
+		if exitCode == 2 && phase == courierv1alpha1.PhaseNeedsHuman && terminationOutcome == "blocked_external" {
+			intent.error = terminationReason
+		}
+		return r.transitionTerminal(ctx, run, phase, "", intent)
 	}
 	result, handled, err := r.checkLiveness(ctx, run, pods.Items)
 	if handled {
@@ -419,7 +448,7 @@ func controllerHeadRef(run *courierv1alpha1.CoderRun) HeadRef {
 
 func (r *CoderRunReconciler) observeVerifying(ctx context.Context, run *courierv1alpha1.CoderRun) (ctrl.Result, error) {
 	if r.Observer == nil {
-		return r.transitionTerminal(ctx, run, courierv1alpha1.PhaseNeedsHuman, "")
+		return r.transitionTerminal(ctx, run, courierv1alpha1.PhaseNeedsHuman, "", terminalLifecycleIntent{})
 	}
 	observation, err := r.Observer.Observe(ctx, run.Spec.Repo, controllerHeadRef(run))
 	if err != nil {
@@ -431,10 +460,10 @@ func (r *CoderRunReconciler) observeVerifying(ctx context.Context, run *courierv
 		// Someone merged the PR while this run was working: the work shipped.
 		// Done resolves the source and applies the reap policy; it is not a
 		// case for a human.
-		return r.transitionTerminal(ctx, run, courierv1alpha1.PhaseDone, pr)
+		return r.transitionTerminal(ctx, run, courierv1alpha1.PhaseDone, pr, terminalLifecycleIntent{})
 	}
 	if state == observationNeedsHuman || state == observationFailed {
-		return r.transitionTerminal(ctx, run, courierv1alpha1.PhaseNeedsHuman, pr)
+		return r.transitionTerminal(ctx, run, courierv1alpha1.PhaseNeedsHuman, pr, terminalLifecycleIntent{})
 	}
 	// status.checkFingerprint is the prior all-green candidate: the identity
 	// of the last poll on which every observed check passed. Green settles
@@ -458,7 +487,7 @@ func (r *CoderRunReconciler) observeVerifying(ctx context.Context, run *courierv
 		return ctrl.Result{}, err
 	}
 	if settled {
-		return r.transitionTerminal(ctx, run, courierv1alpha1.PhaseAwaitingReview, pr)
+		return r.transitionTerminal(ctx, run, courierv1alpha1.PhaseAwaitingReview, pr, terminalLifecycleIntent{})
 	}
 	return ctrl.Result{RequeueAfter: observationRequeueDelay}, nil
 }
@@ -486,7 +515,7 @@ func (r *CoderRunReconciler) enrichTerminalPR(ctx context.Context, run *courierv
 	return observation.PR
 }
 
-func (r *CoderRunReconciler) transitionTerminal(ctx context.Context, run *courierv1alpha1.CoderRun, phase courierv1alpha1.Phase, pr string) (ctrl.Result, error) {
+func (r *CoderRunReconciler) transitionTerminal(ctx context.Context, run *courierv1alpha1.CoderRun, phase courierv1alpha1.Phase, pr string, intent terminalLifecycleIntent) (ctrl.Result, error) {
 	if phase == courierv1alpha1.PhaseNeedsHuman || phase == courierv1alpha1.PhaseFailed {
 		if pr == "" {
 			pr = r.enrichTerminalPR(ctx, run)
@@ -496,31 +525,20 @@ func (r *CoderRunReconciler) transitionTerminal(ctx context.Context, run *courie
 	if err != nil {
 		return ctrl.Result{}, err
 	}
-	var state source.State
-	switch phase {
-	case courierv1alpha1.PhaseAwaitingReview:
-		state = source.StateInReview
-	case courierv1alpha1.PhaseNeedsHuman, courierv1alpha1.PhaseFailed:
-		state = source.StateNeedsHuman
-	}
-	if state != "" {
-		if err := adapter.Transition(ctx, item, state); err != nil {
-			return ctrl.Result{}, err
-		}
-	}
-	before := run.DeepCopy()
 	phaseChanged := run.Status.Phase != phase
+	before := run.DeepCopy()
 	run.Status.Phase = phase
 	if pr != "" {
 		run.Status.PR = pr
 	}
 	if phaseChanged {
-		lifecycle := lifecycleForPhase(phase, state, run.Status.PR)
-		lifecycle.IdempotencyKey = lifecycleIdempotencyKey(run, phase)
-		if err := reportLifecycle(ctx, adapter, item, lifecycle); err != nil {
-			return ctrl.Result{}, err
-		}
+		// Persist report intent with the phase so retries can reproduce the same
+		// lifecycle without extending the CRD status schema.
+		r.setLifecycleReport(run, false, pendingLifecycleReason(intent), intent.error)
 	}
+	// Write the terminal phase first so the run stops holding lane capacity
+	// regardless of whether the source lifecycle report below succeeds. The
+	// run's own terminalization must never depend on the source.
 	if run.Status.Phase != before.Status.Phase || run.Status.PR != before.Status.PR {
 		if err := r.patchStatus(ctx, before, run); err != nil {
 			return ctrl.Result{}, err
@@ -529,7 +547,138 @@ func (r *CoderRunReconciler) transitionTerminal(ctx context.Context, run *courie
 	if run.Status.Phase != before.Status.Phase {
 		r.emitPhaseTransition(run, phase, map[string]any{"branch": run.Status.Branch, "pr": run.Status.PR})
 	}
-	return ctrl.Result{}, nil
+	if !phaseChanged {
+		// Already in this terminal phase; the lifecycle was published (or
+		// dropped) on the reconcile that entered it.
+		return ctrl.Result{}, nil
+	}
+	return r.publishTerminalLifecycle(ctx, run, adapter, item, phase, intent)
+}
+
+// pendingLifecycleReason stores retry intent in the standard condition reason;
+// its message preserves a coordinator explanation across report retries.
+func pendingLifecycleReason(intent terminalLifecycleIntent) string {
+	if intent.skipPRFixQueueMark {
+		return lifecycleReportPendingBlockedReportParksPRFixReason
+	}
+	if intent.error != "" {
+		return lifecycleReportPendingWithErrorReason
+	}
+	return lifecycleReportPendingReason
+}
+
+func pendingLifecycleIntent(run *courierv1alpha1.CoderRun) terminalLifecycleIntent {
+	cond := apimeta.FindStatusCondition(run.Status.Conditions, lifecycleReportedCondition)
+	if cond == nil || cond.Status != metav1.ConditionFalse {
+		return terminalLifecycleIntent{}
+	}
+	return terminalLifecycleIntent{
+		skipPRFixQueueMark: cond.Reason == lifecycleReportPendingBlockedReportParksPRFixReason,
+		error:              cond.Message,
+	}
+}
+
+// publishTerminalLifecycle reports the terminal lifecycle to the source and
+// records the outcome on the run's LifecycleReported condition. The run is
+// already in its terminal phase, so no outcome here blocks terminalization.
+// A superseded rejection means this attempt was replaced by a newer generation
+// of the same work: the report is dropped, not retried. A transient failure
+// leaves a pending report that a later reconcile retries; the source's
+// idempotency key makes the retry safe. A permanent failure retries at the
+// bounded interval, mirroring how waiting-for-capacity requeues work — the run
+// itself is never held by the report.
+func (r *CoderRunReconciler) publishTerminalLifecycle(ctx context.Context, run *courierv1alpha1.CoderRun, adapter source.Adapter, item source.WorkItem, phase courierv1alpha1.Phase, intent terminalLifecycleIntent) (ctrl.Result, error) {
+	err := r.publishSourceLifecycle(ctx, run, adapter, item, phase, intent)
+	switch {
+	case err == nil:
+		return ctrl.Result{}, r.markLifecycleReported(ctx, run, true, "Published", "")
+	case errors.Is(err, source.ErrSuperseded):
+		log.FromContext(ctx).Info("dropping superseded source lifecycle report",
+			"run", run.Name, "phase", phase, "error", err.Error())
+		return ctrl.Result{}, r.markLifecycleReported(ctx, run, true, "Superseded", err.Error())
+	default:
+		log.FromContext(ctx).Info("terminal lifecycle report failed; will retry",
+			"run", run.Name, "phase", phase, "error", err.Error())
+		// Keep the explanation in the pending condition so a declared block's
+		// lifecycle report can be reproduced exactly on every retry.
+		return ctrl.Result{RequeueAfter: lifecycleReportRequeueDelay}, r.markLifecycleReported(ctx, run, false, pendingLifecycleReason(intent), intent.error)
+	}
+}
+
+func (r *CoderRunReconciler) publishSourceLifecycle(ctx context.Context, run *courierv1alpha1.CoderRun, adapter source.Adapter, item source.WorkItem, phase courierv1alpha1.Phase, intent terminalLifecycleIntent) error {
+	state := stateForTerminalPhase(phase)
+	if state != "" {
+		if err := adapter.Transition(ctx, item, state); err != nil {
+			return err
+		}
+	}
+	lifecycle := lifecycleForPhase(phase, state, run.Status.PR, intent)
+	lifecycle.IdempotencyKey = lifecycleIdempotencyKey(run, phase)
+	return reportLifecycle(ctx, adapter, item, lifecycle)
+}
+
+// stateForTerminalPhase is the source state published for a terminal phase.
+// Only phases reached through transitionTerminal carry a state; everything else
+// publishes none.
+func stateForTerminalPhase(phase courierv1alpha1.Phase) source.State {
+	switch phase {
+	case courierv1alpha1.PhaseAwaitingReview:
+		return source.StateInReview
+	case courierv1alpha1.PhaseNeedsHuman, courierv1alpha1.PhaseFailed:
+		return source.StateNeedsHuman
+	default:
+		return ""
+	}
+}
+
+// setLifecycleReport records the terminal lifecycle-report condition on the run
+// in memory; callers persist it through patchStatus. The operator is the only
+// writer of a run's conditions.
+func (r *CoderRunReconciler) setLifecycleReport(run *courierv1alpha1.CoderRun, published bool, reason, message string) {
+	statusValue := metav1.ConditionTrue
+	if !published {
+		statusValue = metav1.ConditionFalse
+	}
+	apimeta.SetStatusCondition(&run.Status.Conditions, metav1.Condition{
+		Type:               lifecycleReportedCondition,
+		Status:             statusValue,
+		Reason:             reason,
+		Message:            message,
+		LastTransitionTime: metav1.NewTime(r.clock()),
+	})
+}
+
+// markLifecycleReported records whether the terminal lifecycle report for the
+// run's current phase has been published. Published means done or intentionally
+// dropped (superseded); False means a later reconcile must retry it.
+func (r *CoderRunReconciler) markLifecycleReported(ctx context.Context, run *courierv1alpha1.CoderRun, published bool, reason, message string) error {
+	before := run.DeepCopy()
+	r.setLifecycleReport(run, published, reason, message)
+	return r.patchStatus(ctx, before, run)
+}
+
+// lifecycleReportPending reports a terminal run whose lifecycle report has not
+// yet been published and must be retried. Runs that reached a terminal phase
+// through another path, or that predate this condition, are not pending.
+func lifecycleReportPending(run *courierv1alpha1.CoderRun) bool {
+	switch run.Status.Phase {
+	case courierv1alpha1.PhaseAwaitingReview, courierv1alpha1.PhaseNeedsHuman, courierv1alpha1.PhaseFailed:
+	default:
+		return false
+	}
+	cond := apimeta.FindStatusCondition(run.Status.Conditions, lifecycleReportedCondition)
+	return cond != nil && cond.Status == metav1.ConditionFalse
+}
+
+// retryTerminalLifecycle re-attempts a terminal run's pending source report on
+// a later reconcile. The phase is already durable, so this only ever touches the
+// report and its condition.
+func (r *CoderRunReconciler) retryTerminalLifecycle(ctx context.Context, run *courierv1alpha1.CoderRun) (ctrl.Result, error) {
+	adapter, item, err := r.adapterAndWorkItem(run)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+	return r.publishTerminalLifecycle(ctx, run, adapter, item, run.Status.Phase, pendingLifecycleIntent(run))
 }
 
 // lifecycleIdempotencyKey derives the publication identity from the run's
@@ -552,17 +701,24 @@ func reportLifecycle(ctx context.Context, adapter source.Adapter, item source.Wo
 	return reporter.Report(ctx, item, lifecycle)
 }
 
-func lifecycleForPhase(phase courierv1alpha1.Phase, state source.State, pr string) source.Lifecycle {
+// lifecycleForPhase maps a terminal phase to its source lifecycle report.
+func lifecycleForPhase(phase courierv1alpha1.Phase, state source.State, pr string, intent terminalLifecycleIntent) source.Lifecycle {
 	lifecycle := source.Lifecycle{State: state, PR: pr}
 	switch phase {
 	case courierv1alpha1.PhaseAwaitingReview:
-		lifecycle.Result = source.ResultReady
+		if pr != "" {
+			lifecycle.Result = source.ResultReady
+		}
 	case courierv1alpha1.PhaseFailed:
 		lifecycle.Result = source.ResultFailed
 		lifecycle.Error = "coordinator failed"
 	case courierv1alpha1.PhaseNeedsHuman:
 		lifecycle.Result = source.ResultBlocked
-		lifecycle.Error = "run requires human intervention"
+		lifecycle.Error = intent.error
+		if lifecycle.Error == "" {
+			lifecycle.Error = "run requires human intervention"
+		}
+		lifecycle.BlockedReportParksPRFix = intent.skipPRFixQueueMark
 	}
 	return lifecycle
 }
@@ -601,6 +757,9 @@ func (r *CoderRunReconciler) patchStatus(ctx context.Context, before, after *cou
 		restarts := after.Status.Restarts
 		fields.Restarts = &restarts
 	}
+	if !reflect.DeepEqual(before.Status.Conditions, after.Status.Conditions) {
+		fields.Conditions = after.Status.Conditions
+	}
 	if reflect.DeepEqual(fields, status.OperatorPatch{}) {
 		return nil
 	}
@@ -627,21 +786,62 @@ func podBelongsToRun(pod *corev1.Pod, run *courierv1alpha1.CoderRun) bool {
 	return pod.Labels[executor.LabelRun] == run.Name
 }
 
-func coordinatorExitCode(pod *corev1.Pod) (int32, bool) {
-	for _, status := range pod.Status.ContainerStatuses {
-		if status.Name == "coordinator" && status.State.Terminated != nil {
-			return status.State.Terminated.ExitCode, true
-		}
-	}
-	return 0, false
+type terminationMessage struct {
+	Phase    string `json:"phase"`
+	Result   string `json:"result"`
+	ExitCode int32  `json:"exit_code"`
+	Reason   string `json:"reason"`
+	Outcome  string `json:"outcome"`
 }
 
-func phaseForExit(exitCode int32) courierv1alpha1.Phase {
+func validTerminationPhaseResult(exitCode int32, phase, result string) bool {
+	switch exitCode {
+	case 0:
+		return phase == "Verifying" && result == "success"
+	case 2:
+		return phase == "NeedsHuman" && result == "needs-human"
+	case exitDeclaredNoChange:
+		return phase == "NoChangeNeeded" && result == "success"
+	default:
+		return phase == "Failed" && result == "failure"
+	}
+}
+
+func coordinatorTermination(pod *corev1.Pod) (int32, string, string, bool) {
+	for _, status := range pod.Status.ContainerStatuses {
+		if status.Name != "coordinator" || status.State.Terminated == nil {
+			continue
+		}
+		terminated := status.State.Terminated
+		code, reason, outcome := terminated.ExitCode, "", ""
+		var message terminationMessage
+		rawMessage := strings.TrimSpace(terminated.Message)
+		const handoffPrefix = "COURIER_TERMINATION "
+		if payload, ok := strings.CutPrefix(rawMessage, handoffPrefix); ok && json.Unmarshal([]byte(payload), &message) == nil && message.ExitCode == code && validTerminationPhaseResult(code, message.Phase, message.Result) {
+			reason, outcome = strings.TrimSpace(message.Reason), strings.TrimSpace(message.Outcome)
+		}
+		return code, reason, outcome, true
+	}
+	return 0, "", "", false
+}
+
+// exitDeclaredNoChange is the executor's verified no_change_needed exit.
+const exitDeclaredNoChange = 3
+
+// phaseForExit maps the executor's exit code to the run's next phase. A
+// no-change declaration is reviewable in resolve-issue mode; fix-pr remains
+// NeedsHuman until Dispatch supports an explicit already-addressed settlement.
+func phaseForExit(mode courierv1alpha1.Mode, exitCode int32) courierv1alpha1.Phase {
 	switch exitCode {
 	case 0:
 		return courierv1alpha1.PhaseVerifying
 	case 2:
 		return courierv1alpha1.PhaseNeedsHuman
+	case exitDeclaredNoChange:
+		if mode == courierv1alpha1.ModeFixPR {
+			return courierv1alpha1.PhaseNeedsHuman
+		}
+		return courierv1alpha1.PhaseAwaitingReview
 	default:
 		return courierv1alpha1.PhaseFailed
 	}

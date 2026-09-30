@@ -209,7 +209,7 @@ jobs:
         run: test "$(docker inspect --format '{{.Config.User}}' courier-coordinator:ci)" = "65532:65532"
 
       - name: Test coordinator scratch boundary (image)
-        run: COURIER_COORDINATOR_IMAGE=courier-coordinator:ci go test -run 'ScratchBoundary|Scratch' ./internal/executor
+        run: COURIER_COORDINATOR_IMAGE=courier-coordinator:ci go test -run 'Scratch|Toolchain' ./internal/executor
 
   image-coordinator-go:
     runs-on: ubuntu-latest
@@ -283,7 +283,7 @@ jobs:
       - name: Validate Go toolchain coordinator image
         run: >-
           docker run --rm --entrypoint sh courier-go:ci
-          -c 'test "$(id -u)" = 65532 && go version && make --version >/dev/null && helm version --short >/dev/null && controller-gen --version >/dev/null && test ! -x "$(command -v gh || true)"'
+          -c 'test "$(id -u)" = 65532 && go version && make --version >/dev/null && helm version --short >/dev/null && controller-gen --version >/dev/null && test ! -x "$(command -v gh || true)" && test "$(go env GOMODCACHE)" = /courier-toolchain-cache/go-mod && mkdir -p "$(go env GOMODCACHE)" && test -w "$(go env GOMODCACHE)"'
       - name: Validate Courier workflow in Go toolchain image
         if: github.event_name != 'pull_request' || steps.changes.outputs.runtime == 'true'
         run: |

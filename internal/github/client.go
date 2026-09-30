@@ -248,6 +248,13 @@ func (c *Client) CommentPR(ctx context.Context, owner, repo string, number int, 
 	return c.AddComment(ctx, owner, repo, number, body)
 }
 
+// CreateComment posts a comment to an issue or pull request conversation,
+// using the issue-comments endpoint that serves both.
+func (c *Client) CreateComment(ctx context.Context, owner, repo string, number int, body string) error {
+	_, err := c.AddComment(ctx, owner, repo, number, body)
+	return err
+}
+
 // GetPullRequest reads the current pull request from GitHub.
 func (c *Client) GetRepository(ctx context.Context, owner, repo string) (Repository, error) {
 	var out Repository

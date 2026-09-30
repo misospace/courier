@@ -163,6 +163,171 @@ func TestEnvtestResolveIssueLifecycle(t *testing.T) {
 	}
 }
 
+func TestEnvtestNoChangeNeededResolveIssueEndsInReview(t *testing.T) {
+	if envtestClient == nil {
+		t.Skip("KUBEBUILDER_ASSETS is not set")
+	}
+	ctx := context.Background()
+	name := "no-change-resolve"
+	item := &admissionSource{}
+	run := envtestRun(name, "envtest-no-change-resolve")
+	lane := envtestLane("envtest-no-change-resolve")
+	if err := envtestClient.Create(ctx, lane); err != nil {
+		t.Fatal(err)
+	}
+	if err := envtestClient.Create(ctx, run); err != nil {
+		t.Fatal(err)
+	}
+
+	reconciler := &CoderRunReconciler{
+		Client: envtestClient,
+		Sources: NewSourceRegistry(map[string]source.Adapter{
+			"manual": item,
+		}),
+		StatusWriter: status.KubePatchWriter{Client: envtestClient},
+		Launch: func(ctx context.Context, run *courierv1alpha1.CoderRun) error {
+			var claimed courierv1alpha1.CoderRun
+			if err := envtestClient.Get(ctx, envtestKey(name), &claimed); err != nil {
+				t.Fatal(err)
+			}
+			if claimed.Status.Phase != courierv1alpha1.PhaseClaimed {
+				t.Fatalf("phase during launch = %q, want Claimed", claimed.Status.Phase)
+			}
+			controller := true
+			pod := &corev1.Pod{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      run.Name + "-coordinator",
+					Namespace: run.Namespace,
+					Labels:    map[string]string{executor.LabelRun: run.Name},
+					OwnerReferences: []metav1.OwnerReference{{
+						APIVersion: courierv1alpha1.GroupVersion.String(),
+						Kind:       "CoderRun",
+						Name:       run.Name,
+						UID:        run.UID,
+						Controller: &controller,
+					}},
+				},
+				Spec: corev1.PodSpec{Containers: []corev1.Container{{Name: "coordinator", Image: "example/test"}}},
+			}
+			if err := envtestClient.Create(ctx, pod); err != nil {
+				return err
+			}
+			pod.Status.ContainerStatuses = []corev1.ContainerStatus{{
+				Name:  "coordinator",
+				State: corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{ExitCode: 3}},
+			}}
+			return envtestClient.Status().Update(ctx, pod)
+		},
+	}
+
+	reconcile := func() {
+		t.Helper()
+		if _, err := reconciler.Reconcile(ctx, envtestRequest(name)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	reconcile()
+	assertEnvtestPhase(t, name, courierv1alpha1.PhaseRunning)
+	reconcile()
+	assertEnvtestPhase(t, name, courierv1alpha1.PhaseAwaitingReview)
+	// Exactly one in-review transition: the launch's in-progress plus the
+	// no_change_needed ending. The source must never be resolved.
+	if len(item.transitions) != 2 || item.transitions[0] != source.StateInProgress || item.transitions[1] != source.StateInReview {
+		t.Fatalf("source transitions = %#v, want in-progress then in-review", item.transitions)
+	}
+	if len(item.resolved) != 0 {
+		t.Fatalf("source resolves = %#v, want none", item.resolved)
+	}
+}
+
+func TestEnvtestNoChangeNeededFixPREndsNeedsHuman(t *testing.T) {
+	if envtestClient == nil {
+		t.Skip("KUBEBUILDER_ASSETS is not set")
+	}
+	ctx := context.Background()
+	name := "no-change-fixpr"
+	item := &admissionSource{}
+	run := envtestRun(name, "envtest-no-change-fixpr")
+	run.Spec.Mode = courierv1alpha1.ModeFixPR
+	lane := envtestLane("envtest-no-change-fixpr")
+	if err := envtestClient.Create(ctx, lane); err != nil {
+		t.Fatal(err)
+	}
+	if err := envtestClient.Create(ctx, run); err != nil {
+		t.Fatal(err)
+	}
+
+	reconciler := &CoderRunReconciler{
+		Client: envtestClient,
+		Sources: NewSourceRegistry(map[string]source.Adapter{
+			"manual": item,
+		}),
+		StatusWriter: status.KubePatchWriter{Client: envtestClient},
+		PRHeadResolver: ExistingPRHeadResolverFunc(func(_ context.Context, run *courierv1alpha1.CoderRun) (HeadRef, error) {
+			return HeadRef{Repo: run.Spec.Repo, Branch: "feature/existing-pr-head", SHA: "abc123"}, nil
+		}),
+		Launch: func(ctx context.Context, run *courierv1alpha1.CoderRun) error {
+			var claimed courierv1alpha1.CoderRun
+			if err := envtestClient.Get(ctx, envtestKey(name), &claimed); err != nil {
+				t.Fatal(err)
+			}
+			if claimed.Status.Phase != courierv1alpha1.PhaseClaimed {
+				t.Fatalf("phase during launch = %q, want Claimed", claimed.Status.Phase)
+			}
+			controller := true
+			pod := &corev1.Pod{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      run.Name + "-coordinator",
+					Namespace: run.Namespace,
+					Labels:    map[string]string{executor.LabelRun: run.Name},
+					OwnerReferences: []metav1.OwnerReference{{
+						APIVersion: courierv1alpha1.GroupVersion.String(),
+						Kind:       "CoderRun",
+						Name:       run.Name,
+						UID:        run.UID,
+						Controller: &controller,
+					}},
+				},
+				Spec: corev1.PodSpec{Containers: []corev1.Container{{Name: "coordinator", Image: "example/test"}}},
+			}
+			if err := envtestClient.Create(ctx, pod); err != nil {
+				return err
+			}
+			pod.Status.ContainerStatuses = []corev1.ContainerStatus{{
+				Name:  "coordinator",
+				State: corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{ExitCode: 3}},
+			}}
+			return envtestClient.Status().Update(ctx, pod)
+		},
+	}
+
+	reconcile := func() {
+		t.Helper()
+		if _, err := reconciler.Reconcile(ctx, envtestRequest(name)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	reconcile()
+	assertEnvtestPhase(t, name, courierv1alpha1.PhaseRunning)
+	var admitted courierv1alpha1.CoderRun
+	if err := envtestClient.Get(ctx, envtestKey(name), &admitted); err != nil {
+		t.Fatal(err)
+	}
+	if admitted.Status.Branch != "feature/existing-pr-head" || admitted.Status.HeadRepo != "acme/widgets" || admitted.Status.HeadSHA != "abc123" {
+		t.Fatalf("admitted head = branch %q repo %q sha %q, want existing PR head", admitted.Status.Branch, admitted.Status.HeadRepo, admitted.Status.HeadSHA)
+	}
+	reconcile()
+	assertEnvtestPhase(t, name, courierv1alpha1.PhaseNeedsHuman)
+	// Exactly one needs-human transition: the launch's in-progress plus the
+	// no_change_needed ending. The source must never be resolved.
+	if len(item.transitions) != 2 || item.transitions[0] != source.StateInProgress || item.transitions[1] != source.StateNeedsHuman {
+		t.Fatalf("source transitions = %#v, want in-progress then needs-human", item.transitions)
+	}
+	if len(item.resolved) != 0 {
+		t.Fatalf("source resolves = %#v, want none", item.resolved)
+	}
+}
+
 func TestEnvtestVerifyingRunDoesNotConsumeCapacity(t *testing.T) {
 	if envtestClient == nil {
 		t.Skip("KUBEBUILDER_ASSETS is not set")

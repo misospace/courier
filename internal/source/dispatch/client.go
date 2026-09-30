@@ -279,6 +279,22 @@ func (c *HTTPClient) checkPullRequestState(ctx context.Context, pullRequest *Pul
 	return c.prStateChecker.CheckPullRequestState(ctx, pullRequest.Repo, pullRequest.Number)
 }
 
+// asSuperseded reports a Dispatch generation-mismatch conflict as a
+// source.ErrSuperseded. Dispatch answers a stale settle to
+// /api/pr-fix-queue/mark with HTTP 409 and a "generation mismatch" body when a
+// newer attempt took the item between this run's read and write. That is a
+// permanent outcome the controller must not retry, so it is mapped to the
+// source-agnostic superseded signal while preserving the underlying error.
+func asSuperseded(err error) error {
+	var apiErr *APIError
+	if errors.As(err, &apiErr) &&
+		apiErr.StatusCode == http.StatusConflict &&
+		strings.Contains(strings.ToLower(apiErr.Message), "generation mismatch") {
+		return fmt.Errorf("%w: %w", source.ErrSuperseded, err)
+	}
+	return err
+}
+
 func (c *HTTPClient) markPRFixBlocked(ctx context.Context, d workDescriptor, note string) error {
 	if d.Type != "followup-pr" || d.PRFixID == "" {
 		return nil
@@ -286,13 +302,13 @@ func (c *HTTPClient) markPRFixBlocked(ctx context.Context, d workDescriptor, not
 	if strings.TrimSpace(note) == "" {
 		note = "Courier run requires human intervention"
 	}
-	return c.do(ctx, http.MethodPost, "/api/pr-fix-queue/mark", map[string]any{
+	return asSuperseded(c.do(ctx, http.MethodPost, "/api/pr-fix-queue/mark", map[string]any{
 		"repo":       d.Repo,
 		"pr":         d.Number,
 		"status":     "BLOCKED",
 		"note":       note,
 		"generation": d.Generation,
-	}, nil)
+	}, nil))
 }
 
 func (c *HTTPClient) markPRFixStale(ctx context.Context, pullRequest *PullRequest, state PullRequestState, generation int) error {
@@ -411,6 +427,9 @@ func (c *HTTPClient) Report(ctx context.Context, id string, lifecycle source.Lif
 		return c.reportTaskWithPR(ctx, d, outcome, "", lifecycle.PR, lifecycle.IdempotencyKey)
 	case source.ResultBlocked:
 		reportErr := c.reportTaskWithPR(ctx, d, "blocked", lifecycle.Error, lifecycle.PR, lifecycle.IdempotencyKey)
+		if lifecycle.BlockedReportParksPRFix {
+			return reportErr
+		}
 		return errors.Join(reportErr, c.markPRFixBlocked(ctx, d, lifecycle.Error))
 	case source.ResultFailed:
 		reportErr := c.reportTaskWithPR(ctx, d, "failed", lifecycle.Error, lifecycle.PR, lifecycle.IdempotencyKey)

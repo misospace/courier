@@ -142,7 +142,11 @@ Goals stay short — a goal plus tools — but each carries one non-negotiable
 contract: delegation covers bounded work, never the coordinator's ownership
 of completion and forge publication. The publication hint names the run branch
 as the single place work may land; it informs rather than constrains (a cheap
-nudge, enforced only at exit, below).
+nudge, enforced only at exit, below). Each goal also names the exact outcome
+file path under executor-owned, per-run scratch outside the target worktree.
+The coordinator writes its declaration there; it is control metadata, not a
+repository file. This avoids stale declarations without wiping `.courier` or
+manipulating the git index. Scratch is disposable, not a checkpoint.
 
 ### Terminal states
 
@@ -153,8 +157,46 @@ A run ends at exactly one of:
   no merge capability; merging is an explicit human-maintainer action, or an
   auto-merge a maintainer enabled (see
   [docs/repository-settings.md](./docs/repository-settings.md)).
-- **needs-human** → the coordinator (or the operator, on crashloop) could not
-  reach a healthy state and labels the PR/issue for a human.
+- **needs-human** → a declared decision or external block, or an operator
+  condition such as a crashloop, requires a human. Coordinator-declared blocks
+  include a redacted issue/PR comment and a blocked source report.
+
+The coordinator declares its ending in the executor-provided outcome file,
+whose exact path is in the goal. The executor validates the declaration against
+the world: git state remains authoritative for whether declared changes exist
+on the run branch; the declaration never substitutes for that check (#169):
+
+- **`changes`** — work is committed and pushed; verified commits reachable from
+  the run branch → exit `0`, **Verifying**. Work committed only elsewhere is not
+  run success.
+- **`no_change_needed`** — nothing to do, with evidence. The executor posts the
+  complete evidence as a redacted issue/PR comment, then exits `3`: a
+  resolve-issue run ends in **AwaitingReview** and moves the source to
+  `in-review` for a human to settle; a fix-pr run ends **NeedsHuman** and sends
+  a blocked lifecycle report. That report parks the PR-fix item as
+  `BLOCKED`/needs-human. Its `BlockedReportParksPRFix` flag suppresses only the
+  redundant follow-up queue mark; it does not wake a reviewer or request
+  another review. Neither mode resolves the source on the coordinator's word.
+- **`needs_decision`** — a real decision the coordinator cannot make. The
+  executor posts the complete question as a redacted issue/PR comment and exits
+  `2` to **NeedsHuman** with a blocked source report.
+- **`blocked_external`** — an external prerequisite is missing. The executor
+  posts the complete `missing` explanation as a redacted issue/PR comment and
+  exits `2` to **NeedsHuman** with a blocked source report. This is not a
+  retryable **Failed** run.
+
+Comments preserve the full declared evidence, question, or missing explanation
+after redaction; they are not shortened to the termination reason. Comment
+posting is best-effort: failures are logged as `outcome.comment` and do not change
+the run ending. The separate termination reason is bounded and redacted before it
+is published. An undeclared ending is not interpreted as a coordinator's human
+request. Verified
+commits on the run branch may proceed to **Verifying**; otherwise, when a
+session was captured, recoverable workspace states resume that session with a
+short state message under the #170 continuation budget and no-progress guard.
+Without a session to resume, undeclared dirty, off-branch, or no-work endings
+fail as incomplete. Crash recovery uses the same budget and backoff described
+below.
 
 Feedback or a merge conflict does not reopen the run. It spawns a **fresh
 `fix-pr` `CoderRun`** (via the source — dispatch's pr-fix queue, or a
@@ -294,10 +336,10 @@ world wins on conflict.
 ### Uncommitted failure work (#109)
 
 The shipped bootstrap keeps its termination handoff in a separate runtime
-`emptyDir`, but does not yet provide OpenCode a permitted scratch directory.
-#114 owns the bounded scratch fix: a per-run mount outside the checkout, temp
-environment and framing, and narrowly verified permissions for the pinned
-OpenCode runtime and delegates. Scratch is disposable, not a checkpoint.
+`emptyDir` and provides the per-run scratch mount outside the checkout with
+narrowly permitted OpenCode access: temp environment and framing, and
+narrowly verified permissions for the pinned OpenCode runtime and delegates
+(#114, shipped). Scratch is disposable, not a checkpoint.
 
 A terminal `NeedsHuman` or `Failed` run may still have uncommitted edits in its
 checkout. Those edits are **not durable**: when the pod is removed, the emptyDir
@@ -306,6 +348,23 @@ and its dirty work disappear. Logs and status are not a recoverable patch.
 evidence before any preservation implementation. Until that mechanism is
 reviewed, do not push incomplete work, persist raw diffs in logs or CR status,
 or treat a fresh retry (#97) as recovery of the old checkout.
+
+### Toolchain reference for bootstrap lanes (#153)
+
+Repository toolchains (Go today) keep their module and build caches on
+writable storage, but the bootstrap contract grants OpenCode no broad home or
+`/tmp` access. The coordinator pod therefore mounts one per-run `emptyDir`
+`toolchain-cache` volume **read-write at `/courier-toolchain-cache`** — where
+the runtime image pins its toolchain caches (`GOMODCACHE`, `GOCACHE`) — and
+**read-only at `/courier-toolchain`**. OpenCode's `external_directory`
+permission allows reads of the scratch mount plus the read-only reference and
+denies edits there; because the reference mount is genuinely read-only, a
+write also fails at the filesystem level. The read-write twin is written only
+by lane-toolchain child processes (e.g. `go mod download`); the model's own
+tool calls that target it stay gated as for any external path, and
+unparsed-bash reachability matches the pre-change baseline (no new hole).
+This is bootstrap ergonomics for the pinned runtime, distinct from the #136
+secure dependency cache.
 
 ### Commit cadence
 
@@ -450,27 +509,25 @@ it modest" with `concurrency: 1`. Same schema, no local assumption baked in.
   real base rather than the fork's possibly stale base branch. The target
   harness commits per brief and
   writes heartbeat and checkpoint to status; the legacy bootstrap does not
-  populate these fields (#102). Exit `0` transitions to **Verifying** before
-  any external observation, releasing the lane capacity — but only when the
-  committed work is actually on the run branch: the bootstrap reads the run
-  branch's own ref (not wherever HEAD happens to point), and committed work
-  that is not on the run branch is a recoverable ending, reported with a
-  specific reason, rather than a later operator read of an empty branch as
-  "no work" (#134). Recoverable endings — uncommitted changes, commits off the
-  run branch, no commit and no declared outcome — do not terminate the run:
-  the executor resumes the same session with a short state message built from
-  world facts, up to `COURIER_MAX_CONTINUATIONS` times (default 3); a
-  no-progress guard (the same workspace-state fingerprint and the same last
-  assistant message twice) terminates earlier as **NeedsHuman** with reason
-  `looping` and the state history; reaching the continuation cap also
-  terminates the run as **NeedsHuman** with reason `looping after N
-  continuations` plus the state history. A crash (a non-zero exit that is not
-  2) resumes the session with exponential backoff (default 5s,
-  `COURIER_RESUME_BACKOFF_SECONDS`), sharing the `COURIER_MAX_CONTINUATIONS`
-  budget, before the run transitions to **Failed**;
-  a crash before any session id is observed transitions to **Failed**
-  immediately. Exit `2` transitions to **NeedsHuman** immediately. A pod death
-  or heartbeat stall relaunches/resumes it; a crashloop reaches NeedsHuman.
+  populate these fields (#102). The executor classifies its declaration against
+  the world before the run terminalizes: exit `0` (`changes`) reaches
+  **Verifying** only when committed work is reachable from the run branch, and
+  work committed elsewhere is not success. Exit `2` (`needs_decision` or
+  `blocked_external`) reaches **NeedsHuman**; exit `3` (`no_change_needed`)
+  reaches **AwaitingReview** for resolve-issue and **NeedsHuman** for fix-pr.
+  Other failure exits reach **Failed**. When no outcome is declared, recoverable
+  endings — uncommitted changes, commits off the run branch, or no commit and no
+  workspace changes — resume the same session with a short state message, up to
+  `COURIER_MAX_CONTINUATIONS` times (default 3). A no-progress guard terminates
+  earlier as **NeedsHuman** with reason `looping` and the state history; reaching
+  the continuation cap also terminates as **NeedsHuman** with reason `looping
+  after N continuations` plus the state history. Without a captured session,
+  undeclared endings fail as incomplete. A crash resumes the session
+  with exponential backoff (default 5s, `COURIER_RESUME_BACKOFF_SECONDS`),
+  sharing the same budget, before the run transitions to **Failed**; a crash
+  before any session ID is observed transitions to **Failed** immediately. A
+  child exit code alone is not a declared outcome. A pod death or heartbeat
+  stall relaunches/resumes it; a crashloop reaches NeedsHuman.
 - **Verifying** — no coordinator pod or liveness meaning. The operator polls
   the external PR and CI world indefinitely, with a reconciliation cadence and
   no deadline. Observer errors remain Verifying and requeue. A missing observer,
@@ -487,14 +544,26 @@ it modest" with `concurrency: 1`. Same schema, no local assumption baked in.
   it the same way. A partial snapshot cannot pass. The source becomes
   in-review with the transition. Verifying does not consume LaneProfile
   execution capacity, and the source remains in-progress throughout it.
-- **AwaitingReview** is terminal for this run. Human merges → operator marks
-  **Done** and resolves the source; or feedback/conflict → the source spawns a
-  fresh `fix-pr` run without reusing the previous run. The previous run remains
-  auditable; its completion does not settle later feedback.
+- **AwaitingReview** is terminal for this run. For a PR, human merges → operator
+  marks **Done** and resolves the source; feedback/conflict → the source spawns a
+  fresh `fix-pr` run without reusing the previous run. A `no_change_needed`
+  resolve-issue run also waits here with its evidence posted for human review;
+  Courier does not resolve that source from the coordinator's declaration. The
+  previous run remains auditable; its completion does not settle later feedback.
 - **Reap:** Done runs are deleted (checkpoint dies with the CR). NeedsHuman runs
   are kept for inspection and deleted on request. Zero standing footprint between
   runs — a strict improvement over Foreman's ownerRef-less audit ConfigMaps,
   which require an external sweeper.
+
+**Terminalization writes the run's own phase before it reports to the source.**
+A rejected or failed source report never holds a run in `Running`: the phase is
+written first, which releases lane capacity, and only then is the lifecycle
+report published — on its own, retried via a bounded requeue and deduplicated by
+the run's stable idempotency key. A Dispatch generation-mismatch conflict means
+this attempt was superseded by a newer generation of the same work, so the report
+is dropped rather than retried (the newer generation belongs to another run) and
+the run still terminalizes; a transient report failure leaves the run in its
+terminal phase with the report retried on a later reconcile. (#178)
 
 ## Sources
 
@@ -676,6 +745,41 @@ A running log of architectural decisions and their reasoning, newest first. The
 body above describes the current architecture; this log preserves *why* and what
 was superseded.
 
+- **2026-09-30 — #169/#175: declare outcomes outside the worktree; never settle
+  from a declaration alone.** #169 replaced inference of coordinator intent from
+  workspace state with explicit `changes`, `no_change_needed`, `needs_decision`,
+  and `blocked_external` declarations, checked against the world. Review on #175
+  corrected the handoff boundary: the exact per-run outcome file is under
+  executor-owned scratch outside the target worktree, so stale declarations are
+  avoided without deleting `.courier` or manipulating the git index. `changes`
+  still requires commits reachable from the run branch. `no_change_needed` posts
+  its complete redacted evidence and exits `3`: resolve-issue waits in
+  `AwaitingReview`/`in-review`, while fix-pr ends `NeedsHuman`; the blocked report
+  itself parks the PR-fix item as `BLOCKED`/needs-human, and
+  `BlockedReportParksPRFix` skips only the redundant queue-mark call — it does not
+  wake a reviewer. Neither outcome resolves the source. `needs_decision` and
+  `blocked_external` post the complete redacted question or missing explanation
+  and exit `2` to `NeedsHuman` with a blocked report. Only the distinct
+  termination reason is bounded before publication. The controller carries the
+  bounded blocked-external reason into the source lifecycle report and preserves
+  it across durable report retries. The earlier #169 contract resolved
+  `no_change_needed` and treated `blocked_external` as retryable `Failed`; both
+  are superseded. (#169, #175)
+- **2026-09-29 — #178: a run's own terminal phase is never gated on a source
+  report.** `transitionTerminal` used to publish the source transition and
+  lifecycle report before writing the phase, so a rejected report kept the run
+  `Running` and holding lane capacity while it retried on backoff. A real case: a
+  `fix-pr` run whose settle was rejected with Dispatch's generation-mismatch 409
+  (the queue item had advanced to a newer attempt) sat `Running` for hours behind
+  a concurrency-1 lane, starving every other run. The reconcile now writes the
+  terminal phase first — capacity frees regardless of the source — then publishes
+  the report on its own, retried via a bounded requeue and deduplicated by the
+  run's idempotency key. A generation mismatch is mapped in the Dispatch adapter
+  to a typed superseded error the controller recognizes and *drops*: the report
+  is a record of the old attempt and the newer generation belongs to another run,
+  matching the #98 settlement contract. A retry cap was deliberately not added —
+  it would be a governor on a harmless idempotent retry, and the run itself is
+  never held. (#178)
 - **2026-09-29 — Resume the coordinator session on recoverable endings.** A
   run that ends recoverably — uncommitted changes, commits off the run branch,
   no commit and no declared outcome — and a run whose session crashed, no longer
@@ -685,7 +789,9 @@ was superseded.
   the same last assistant message twice — terminates earlier as `NeedsHuman`
   with reason `looping` and the state history. A crash resumes with exponential
   backoff before the run fails. Exit `2` remains an immediate `NeedsHuman`
-  passthrough. This extends the 2026-09-22 honest-termination decision (#81) and
+  passthrough only for an explicit declaration; a raw child exit `2` remains a
+  failure, and a recoverable ending without a captured session fails as
+  incomplete. This extends the 2026-09-22 honest-termination decision (#81) and
   the 2026-09-27 run-branch decision (#134), and follows the "inform, don't
   constrain" principle: the model gets the facts and decides, and the harness
   only stops genuinely stuck runs. (#170)
@@ -705,6 +811,15 @@ was superseded.
   deployment: the per-run pod wiring, credential delivery and isolation
   preflight in #123 are still required before the broker is safe to expose.
   ([HARNESS.md](./HARNESS.md) §4) (#122, #118, #80, #123)
+- **2026-09-27 — Read-only toolchain reference for bootstrap lanes (#153).**
+  OpenCode's `external_directory` permission cannot distinguish a read from a
+  write, so the toolchain's writable cache directory was not allowed wholesale.
+  The coordinator pod mounts the per-run `toolchain-cache` `emptyDir`
+  read-write at `/courier-toolchain-cache` (where runtime images pin
+  `GOMODCACHE`/`GOCACHE`) and again read-only at `/courier-toolchain`, so the
+  reference stays readable while writes are denied at the filesystem level.
+  This is bootstrap ergonomics for the pinned runtime, distinct from the #136
+  secure dependency cache.
 - **2026-09-27 — A lane can be suspended without stopping work in flight.**
   Setting `courier.misospace.dev/suspend: "true"` on a LaneProfile pauses that
   lane: its source runner stops discovering work and the operator stops

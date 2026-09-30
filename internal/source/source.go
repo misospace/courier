@@ -11,6 +11,11 @@ import (
 // ErrStaleWork indicates that claimed source work no longer needs a coordinator.
 var ErrStaleWork = errors.New("source: work item is stale")
 
+// ErrSuperseded indicates that this attempt was superseded by a newer
+// generation of the same source work. A lifecycle report carrying it must be
+// dropped rather than retried: the newer generation belongs to another run.
+var ErrSuperseded = errors.New("source: work item superseded")
+
 // WorkItem identifies work in a source. ID is intentionally opaque: sources
 // are free to choose their identifier format, and the core must not know about
 // a source's queue or API types.
@@ -85,6 +90,11 @@ type Lifecycle struct {
 	Result Result
 	PR     string
 	Error  string
+	// BlockedReportParksPRFix suppresses the separate PR-fix queue mark after a
+	// blocked task report. The report itself still parks the item as
+	// BLOCKED/needs-human; this flag does not wake a reviewer. Meaningful only
+	// alongside Result ResultBlocked; adapters without queue semantics ignore it.
+	BlockedReportParksPRFix bool
 	// IdempotencyKey identifies the publication so a source can deduplicate a
 	// retry of the same report. Empty means the source has no deduplication.
 	IdempotencyKey string

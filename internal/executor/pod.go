@@ -21,15 +21,17 @@ const (
 	CoordinatorUID int64 = 65532
 	CoordinatorGID int64 = 65532
 
-	LabelRun       = "courier.misospace.dev/coderrun"
-	LabelComponent = "courier.misospace.dev/component"
-	LabelExecutor  = "courier.misospace.dev/executor"
-	LabelRepo      = "courier.misospace.dev/repo"
-	LabelMode      = "courier.misospace.dev/mode"
-	LabelLane      = "courier.misospace.dev/lane"
-	LabelDebug     = "courier.misospace.dev/debug"
-	runtimePath    = "/courier-runtime"
-	scratchPath    = "/var/tmp/courier-scratch"
+	LabelRun               = "courier.misospace.dev/coderrun"
+	LabelComponent         = "courier.misospace.dev/component"
+	LabelExecutor          = "courier.misospace.dev/executor"
+	LabelRepo              = "courier.misospace.dev/repo"
+	LabelMode              = "courier.misospace.dev/mode"
+	LabelLane              = "courier.misospace.dev/lane"
+	LabelDebug             = "courier.misospace.dev/debug"
+	runtimePath            = "/courier-runtime"
+	scratchPath            = "/var/tmp/courier-scratch"
+	toolchainCachePath     = "/courier-toolchain-cache" // read-write; lane toolchain caches (GOMODCACHE etc.) live here, path pinned by the runtime image
+	toolchainReferencePath = "/courier-toolchain"       // same volume, read-only; the coordinator's inspection entry point
 )
 
 // PodConfig controls runtime-specific details without putting provider or
@@ -211,16 +213,21 @@ func (b *PodBuilder) Build(run *courierv1alpha1.CoderRun, lane *courierv1alpha1.
 			}, {
 				Name:         "scratch",
 				VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{}},
+			}, {
+				Name:         "toolchain-cache",
+				VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{}},
 			}},
 			Containers: []corev1.Container{{
-				Name:            "coordinator",
-				Image:           config.Image,
-				ImagePullPolicy: config.ImagePullPolicy,
-				Command:         []string{command.Binary},
-				Args:            append([]string(nil), command.Args...),
-				WorkingDir:      config.WorkspacePath,
-				Env:             podEnvironment(invocation, executorImpl.Name(), config),
-				Resources:       config.Resources,
+				Name:                     "coordinator",
+				Image:                    config.Image,
+				ImagePullPolicy:          config.ImagePullPolicy,
+				TerminationMessagePath:   runtimePath + "/termination",
+				TerminationMessagePolicy: corev1.TerminationMessageReadFile,
+				Command:                  []string{command.Binary},
+				Args:                     append([]string(nil), command.Args...),
+				WorkingDir:               config.WorkspacePath,
+				Env:                      podEnvironment(invocation, executorImpl.Name(), config),
+				Resources:                config.Resources,
 				VolumeMounts: []corev1.VolumeMount{{
 					Name:      "workspace",
 					MountPath: config.WorkspacePath,
@@ -234,6 +241,13 @@ func (b *PodBuilder) Build(run *courierv1alpha1.CoderRun, lane *courierv1alpha1.
 				}, {
 					Name:      "scratch",
 					MountPath: scratchPath,
+				}, {
+					Name:      "toolchain-cache",
+					MountPath: toolchainCachePath,
+				}, {
+					Name:      "toolchain-cache",
+					MountPath: toolchainReferencePath,
+					ReadOnly:  true,
 				}},
 				SecurityContext: &corev1.SecurityContext{
 					AllowPrivilegeEscalation: boolPtr(false),
@@ -277,6 +291,7 @@ func podEnvironment(invocation Invocation, executorName string, config PodConfig
 		corev1.EnvVar{Name: "TMP", Value: scratchPath},
 		corev1.EnvVar{Name: "TEMP", Value: scratchPath},
 		corev1.EnvVar{Name: "COURIER_SCRATCH_DIR", Value: scratchPath},
+		corev1.EnvVar{Name: "COURIER_TOOLCHAIN_DIR", Value: toolchainReferencePath},
 	)
 	githubSecret := config.GitHubCredentialSecret
 	if githubSecret == "" {
@@ -395,6 +410,12 @@ func (c PodConfig) Validate() error {
 	}
 	if pathsOverlap(c.WorkspacePath, scratchPath) {
 		return errors.New("executor: workspace path must not overlap the scratch path")
+	}
+	if pathsOverlap(c.WorkspacePath, toolchainCachePath) {
+		return errors.New("executor: workspace path must not overlap the toolchain cache path")
+	}
+	if pathsOverlap(c.WorkspacePath, toolchainReferencePath) {
+		return errors.New("executor: workspace path must not overlap the toolchain reference path")
 	}
 	return nil
 }

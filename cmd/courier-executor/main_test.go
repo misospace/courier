@@ -13,8 +13,10 @@ import (
 	"path/filepath"
 	"reflect"
 	"strings"
+	"sync"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"github.com/misospace/courier/internal/executor"
 	courierlog "github.com/misospace/courier/internal/log"
@@ -78,14 +80,20 @@ func TestRunPreparesOrphanBranchAndInvokesOpenCodeWithExactContext(t *testing.T)
 	runGit(t, source, "push", "origin", "main")
 
 	fakeOpenCode := filepath.Join(root, "opencode")
-	writeExecutable(t, fakeOpenCode, "#!/bin/sh\ncase \"$1\" in mcp) exit 0;; esac\nprintf 'opencode argv: %s\\n' \"$*\"\nprintf 'completed\\n' > completed.txt\ngit add --all -- .\ngit commit -m 'test: completed work' >/dev/null\n")
+	scratchDirectory := filepath.Join(root, "scratch dir")
+	writeExecutable(t, fakeOpenCode, "#!/bin/sh\ncase \"$1\" in mcp) exit 0;; esac\nif [ -e \"$COURIER_SCRATCH_DIR/outcome.json\" ]; then exit 9; fi\nprintf 'scratch dir: %s\\n' \"$COURIER_SCRATCH_DIR\"\nprintf 'opencode argv: %s\\n' \"$*\"\nprintf 'completed\\n' > completed.txt\ngit add --all -- .\ngit commit -m 'test: completed work' >/dev/null\nmkdir -p \"$COURIER_SCRATCH_DIR\"\nprintf '{\"outcome\":\"changes\"}' > \"$COURIER_SCRATCH_DIR/outcome.json\"\n")
 	workspace := filepath.Join(root, "workspace")
+	if err := os.MkdirAll(scratchDirectory, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	write(t, filepath.Join(scratchDirectory, "outcome.json"), `{"outcome":"no_change_needed","evidence":"stale"}`)
 	termination := filepath.Join(root, "termination")
 	t.Setenv("COURIER_REPO_URL", remote)
 	t.Setenv("COURIER_WORKSPACE", workspace)
+	t.Setenv("COURIER_SCRATCH_DIR", scratchDirectory)
 	t.Setenv("COURIER_BASE", "main")
 	t.Setenv("COURIER_BRANCH", "courier/resolve-issue/acme-widgets/7")
-	t.Setenv("COURIER_GOAL", "Open a PR to address issue #7.")
+	t.Setenv("COURIER_GOAL", "Open a PR to address issue #7. Declare the outcome at "+filepath.Join(defaultScratchDirectory, defaultOutcomeFilename)+".")
 	t.Setenv("COURIER_MODEL", "any-model/name")
 	t.Setenv("COURIER_OPENCODE_AGENT", "architect")
 	t.Setenv("COURIER_FRAMING", "capacity is elastic; fan out freely")
@@ -103,11 +111,18 @@ func TestRunPreparesOrphanBranchAndInvokesOpenCodeWithExactContext(t *testing.T)
 	if !strings.Contains(output.String(), "Open a PR to address issue #7.") || !strings.Contains(output.String(), "any-model/name") || !strings.Contains(output.String(), "capacity is elastic; fan out freely") {
 		t.Fatalf("OpenCode did not receive exact goal/model/framing: %q", output.String())
 	}
+	wantOutcomePath := filepath.Join(scratchDirectory, "outcome.json")
+	if !strings.Contains(output.String(), "scratch dir: "+scratchDirectory) || !strings.Contains(output.String(), "Open a PR to address issue #7. Declare the outcome at "+wantOutcomePath) {
+		t.Fatalf("child scratch path and actual goal declaration path disagree: %q", output.String())
+	}
 	if !strings.Contains(output.String(), "--agent architect") {
 		t.Fatalf("OpenCode did not receive configured agent: %q", output.String())
 	}
 	if !strings.Contains(output.String(), `COURIER_TERMINATION {"phase":"Verifying","result":"success","exit_code":0`) {
 		t.Fatalf("missing stable success termination: %q", output.String())
+	}
+	if !strings.Contains(output.String(), `"outcome":"changes"`) {
+		t.Fatalf("runtime did not read the child's changes declaration at %q: %q", wantOutcomePath, output.String())
 	}
 	terminationOutput := string(mustRead(t, termination))
 	if !strings.Contains(terminationOutput, `"phase":"Verifying"`) {
@@ -325,7 +340,7 @@ func TestRunAbandonedConflictMergeBecomesNeedsHuman(t *testing.T) {
 	}
 }
 
-func TestRunExitZeroWithoutLocalWorkBecomesNeedsHuman(t *testing.T) {
+func TestRunExitZeroWithoutLocalWorkBecomesFailed(t *testing.T) {
 	root := t.TempDir()
 	remote := remoteWithExistingBranch(t, root)
 	fakeOpenCode := filepath.Join(root, "opencode")
@@ -339,15 +354,50 @@ func TestRunExitZeroWithoutLocalWorkBecomesNeedsHuman(t *testing.T) {
 
 	var output bytes.Buffer
 	var errorsOut bytes.Buffer
-	if code := run(context.Background(), &output, &errorsOut); code != exitNeedsHuman {
-		t.Fatalf("run exit code = %d, want %d; stderr=%q stdout=%q", code, exitNeedsHuman, errorsOut.String(), output.String())
+	if code := run(context.Background(), &output, &errorsOut); code != exitFailed {
+		t.Fatalf("run exit code = %d, want %d; stderr=%q stdout=%q", code, exitFailed, errorsOut.String(), output.String())
 	}
-	if !strings.Contains(output.String(), "without producing a commit or workspace changes") {
+	if !strings.Contains(output.String(), `"phase":"Failed"`) {
+		t.Fatalf("no-op phase = %q", output.String())
+	}
+	if !strings.Contains(output.String(), "without declaring an outcome and produced no commit or workspace changes") {
 		t.Fatalf("no-op reason = %q", output.String())
 	}
 }
 
-func TestRunExitZeroWithDirtyWorkBecomesNeedsHuman(t *testing.T) {
+// TestRunTrackedCourierDataSurvivesGitAddAll verifies executor setup and
+// cleanup preserve tracked .courier content on an adopted work branch.
+func TestRunTrackedCourierDataSurvivesGitAddAll(t *testing.T) {
+	root := t.TempDir()
+	remote := remoteWithExistingBranch(t, root)
+	orphan := filepath.Join(root, "orphan")
+	if err := os.MkdirAll(filepath.Join(orphan, ".courier"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	write(t, filepath.Join(orphan, ".courier", "tracked.txt"), "tracked user data\n")
+	commit(t, orphan, "work: stale declaration")
+	runGit(t, orphan, "push", "origin", "HEAD:refs/heads/courier/resolve-issue/acme-widgets/7")
+
+	fakeOpenCode := filepath.Join(root, "opencode")
+	writeExecutable(t, fakeOpenCode, "#!/bin/sh\ncase \"$1\" in mcp) exit 0;; esac\nprintf 'working tree should preserve tracked data\\n' >> .courier/tracked.txt\ngit add -A\ngit commit -m 'test: preserve courier data' >/dev/null\nmkdir -p \"$COURIER_SCRATCH_DIR\"\nprintf '{\"outcome\":\"changes\"}' > \"$COURIER_SCRATCH_DIR/outcome.json\"\nexit 0\n")
+	prServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `[]`)
+	}))
+	defer prServer.Close()
+	workspace := setResolveIssueEnv(t, root, remote, prServer.URL, fakeOpenCode)
+
+	var output bytes.Buffer
+	var errorsOut bytes.Buffer
+	if code := run(context.Background(), &output, &errorsOut); code != exitSuccess {
+		t.Fatalf("run exit code = %d, want %d; stderr=%q stdout=%q", code, exitSuccess, errorsOut.String(), output.String())
+	}
+	if got := string(mustRead(t, filepath.Join(workspace, ".courier", "tracked.txt"))); got != "tracked user data\nworking tree should preserve tracked data\n" {
+		t.Fatalf("tracked courier data = %q, want preserved modifications", got)
+	}
+}
+
+func TestRunExitZeroWithDirtyWorkBecomesFailed(t *testing.T) {
 	root := t.TempDir()
 	remote := remoteWithExistingBranch(t, root)
 	fakeOpenCode := filepath.Join(root, "opencode")
@@ -361,15 +411,18 @@ func TestRunExitZeroWithDirtyWorkBecomesNeedsHuman(t *testing.T) {
 
 	var output bytes.Buffer
 	var errorsOut bytes.Buffer
-	if code := run(context.Background(), &output, &errorsOut); code != exitNeedsHuman {
-		t.Fatalf("run exit code = %d, want %d; stderr=%q stdout=%q", code, exitNeedsHuman, errorsOut.String(), output.String())
+	if code := run(context.Background(), &output, &errorsOut); code != exitFailed {
+		t.Fatalf("run exit code = %d, want %d; stderr=%q stdout=%q", code, exitFailed, errorsOut.String(), output.String())
+	}
+	if !strings.Contains(output.String(), `"phase":"Failed"`) {
+		t.Fatalf("dirty-work phase = %q", output.String())
 	}
 	if !strings.Contains(output.String(), "uncommitted workspace changes") {
 		t.Fatalf("dirty-work reason = %q", output.String())
 	}
 }
 
-func TestRunCommittedWorkOnWrongBranchBecomesNeedsHuman(t *testing.T) {
+func TestRunCommittedWorkOnWrongBranchBecomesFailed(t *testing.T) {
 	root := t.TempDir()
 	remote := remoteWithExistingBranch(t, root)
 	fakeOpenCode := filepath.Join(root, "opencode")
@@ -383,8 +436,11 @@ func TestRunCommittedWorkOnWrongBranchBecomesNeedsHuman(t *testing.T) {
 
 	var output bytes.Buffer
 	var errorsOut bytes.Buffer
-	if code := run(context.Background(), &output, &errorsOut); code != exitNeedsHuman {
-		t.Fatalf("run exit code = %d, want %d; stderr=%q stdout=%q", code, exitNeedsHuman, errorsOut.String(), output.String())
+	if code := run(context.Background(), &output, &errorsOut); code != exitFailed {
+		t.Fatalf("run exit code = %d, want %d; stderr=%q stdout=%q", code, exitFailed, errorsOut.String(), output.String())
+	}
+	if !strings.Contains(output.String(), `"phase":"Failed"`) {
+		t.Fatalf("wrong-branch phase = %q", output.String())
 	}
 	if !strings.Contains(output.String(), "not on the run branch") {
 		t.Fatalf("wrong-branch reason = %q", output.String())
@@ -394,7 +450,7 @@ func TestRunCommittedWorkOnWrongBranchBecomesNeedsHuman(t *testing.T) {
 	}
 }
 
-func TestRunDetachedHeadCommitBecomesNeedsHuman(t *testing.T) {
+func TestRunDetachedHeadCommitBecomesFailed(t *testing.T) {
 	root := t.TempDir()
 	remote := remoteWithExistingBranch(t, root)
 	fakeOpenCode := filepath.Join(root, "opencode")
@@ -408,14 +464,421 @@ func TestRunDetachedHeadCommitBecomesNeedsHuman(t *testing.T) {
 
 	var output bytes.Buffer
 	var errorsOut bytes.Buffer
-	if code := run(context.Background(), &output, &errorsOut); code != exitNeedsHuman {
-		t.Fatalf("run exit code = %d, want %d; stderr=%q stdout=%q", code, exitNeedsHuman, errorsOut.String(), output.String())
+	if code := run(context.Background(), &output, &errorsOut); code != exitFailed {
+		t.Fatalf("run exit code = %d, want %d; stderr=%q stdout=%q", code, exitFailed, errorsOut.String(), output.String())
+	}
+	if !strings.Contains(output.String(), `"phase":"Failed"`) {
+		t.Fatalf("detached-HEAD phase = %q", output.String())
 	}
 	if !strings.Contains(output.String(), "detached HEAD") {
 		t.Fatalf("detached-HEAD reason = %q", output.String())
 	}
 	if !strings.Contains(output.String(), "not on the run branch") {
 		t.Fatalf("detached-HEAD reason should name the run branch: %q", output.String())
+	}
+}
+
+func TestRunDeclaredChangesVerifiedReachesVerifying(t *testing.T) {
+	root := t.TempDir()
+	remote := remoteWithExistingBranch(t, root)
+	fakeOpenCode := filepath.Join(root, "opencode")
+	writeExecutable(t, fakeOpenCode, "#!/bin/sh\ncase \"$1\" in mcp) exit 0;; esac\nprintf 'completed\\n' > completed.txt\ngit add --all -- .\ngit commit -m 'test: completed work' >/dev/null\nmkdir -p \"$COURIER_SCRATCH_DIR\"\nprintf '{\"outcome\":\"changes\"}' > \"$COURIER_SCRATCH_DIR/outcome.json\"\nexit 0\n")
+	prServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `[]`)
+	}))
+	defer prServer.Close()
+	setResolveIssueEnv(t, root, remote, prServer.URL, fakeOpenCode)
+	t.Setenv("COURIER_RUN_NAME", "coderrun-it-7")
+
+	var output bytes.Buffer
+	var errorsOut bytes.Buffer
+	if code := run(context.Background(), &output, &errorsOut); code != exitSuccess {
+		t.Fatalf("run exit code = %d, want 0; stderr=%q stdout=%q", code, errorsOut.String(), output.String())
+	}
+	if !strings.Contains(output.String(), `"phase":"Verifying"`) || !strings.Contains(output.String(), `"outcome":"changes"`) {
+		t.Fatalf("declared-changes verification = %q", output.String())
+	}
+	if !strings.Contains(output.String(), `"event":"outcome.declared"`) {
+		t.Fatalf("missing outcome.declared event: %q", output.String())
+	}
+}
+
+// TestRunCommittedDeclarationWithWorkStaysVerifying confirms a declaration in
+// per-run scratch does not become workspace work when the coordinator commits
+// its real changes.
+func TestRunCommittedDeclarationWithWorkStaysVerifying(t *testing.T) {
+	root := t.TempDir()
+	remote := remoteWithExistingBranch(t, root)
+	fakeOpenCode := filepath.Join(root, "opencode")
+	writeExecutable(t, fakeOpenCode, "#!/bin/sh\ncase \"$1\" in mcp) exit 0;; esac\nprintf 'completed\\n' > completed.txt\nmkdir -p \"$COURIER_SCRATCH_DIR\"\nprintf '{\"outcome\":\"changes\"}' > \"$COURIER_SCRATCH_DIR/outcome.json\"\ngit add --all -- .\ngit commit -m 'test: completed work' >/dev/null\nexit 0\n")
+	prServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `[]`)
+	}))
+	defer prServer.Close()
+	setResolveIssueEnv(t, root, remote, prServer.URL, fakeOpenCode)
+
+	var output bytes.Buffer
+	var errorsOut bytes.Buffer
+	if code := run(context.Background(), &output, &errorsOut); code != exitSuccess {
+		t.Fatalf("run exit code = %d, want 0; stderr=%q stdout=%q", code, errorsOut.String(), output.String())
+	}
+	if !strings.Contains(output.String(), `"phase":"Verifying"`) {
+		t.Fatalf("committed declaration must not falsify the work state: %q", output.String())
+	}
+	if !strings.Contains(output.String(), `"outcome":"changes"`) {
+		t.Fatalf("declared-changes verification = %q", output.String())
+	}
+}
+
+func TestRunDeclaredNoChangeNeededExitsThreeAndComments(t *testing.T) {
+	root := t.TempDir()
+	remote := remoteWithExistingBranch(t, root)
+	fakeOpenCode := filepath.Join(root, "opencode")
+	writeExecutable(t, fakeOpenCode, "#!/bin/sh\ncase \"$1\" in mcp) exit 0;; esac\nmkdir -p \"$COURIER_SCRATCH_DIR\"\nprintf '{\"outcome\":\"no_change_needed\",\"evidence\":\"already fixed in v2\"}' > \"$COURIER_SCRATCH_DIR/outcome.json\"\nexit 0\n")
+
+	var mu sync.Mutex
+	var comments []string
+	api := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/comments") {
+			body, _ := io.ReadAll(r.Body)
+			mu.Lock()
+			comments = append(comments, string(body))
+			mu.Unlock()
+			_, _ = w.Write([]byte(`{"id":1}`))
+			return
+		}
+		_, _ = io.WriteString(w, `[]`)
+	}))
+	defer api.Close()
+	setResolveIssueEnv(t, root, remote, api.URL, fakeOpenCode)
+	t.Setenv("COURIER_REF", "7")
+	t.Setenv("COURIER_RUN_NAME", "coderrun-it-7")
+	t.Setenv("GITHUB_TOKEN", "test-token")
+
+	var output bytes.Buffer
+	var errorsOut bytes.Buffer
+	if code := run(context.Background(), &output, &errorsOut); code != exitNoChangeNeeded {
+		t.Fatalf("run exit code = %d, want %d; stderr=%q stdout=%q", code, exitNoChangeNeeded, errorsOut.String(), output.String())
+	}
+	if !strings.Contains(output.String(), `"phase":"NoChangeNeeded"`) {
+		t.Fatalf("no-change-needed phase = %q", output.String())
+	}
+	if !strings.Contains(output.String(), `"outcome":"no_change_needed"`) {
+		t.Fatalf("termination missing outcome: %q", output.String())
+	}
+	if !strings.Contains(output.String(), "opencode declared no change needed: already fixed in v2") {
+		t.Fatalf("no-change-needed reason = %q", output.String())
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if len(comments) != 1 {
+		t.Fatalf("comments = %d, want 1", len(comments))
+	}
+	if !strings.Contains(comments[0], "already addressed") || !strings.Contains(comments[0], "already fixed in v2") {
+		t.Fatalf("comment = %q", comments[0])
+	}
+}
+
+func TestRunDeclaredNeedsDecisionReachesNeedsHumanAndComments(t *testing.T) {
+	root := t.TempDir()
+	remote := remoteWithExistingBranch(t, root)
+	fakeOpenCode := filepath.Join(root, "opencode")
+	writeExecutable(t, fakeOpenCode, "#!/bin/sh\ncase \"$1\" in mcp) exit 0;; esac\nmkdir -p \"$COURIER_SCRATCH_DIR\"\nprintf '{\"outcome\":\"needs_decision\",\"question\":\"Which payment provider should the run use?\"}' > \"$COURIER_SCRATCH_DIR/outcome.json\"\nexit 0\n")
+
+	var mu sync.Mutex
+	var comments []string
+	api := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/comments") {
+			body, _ := io.ReadAll(r.Body)
+			mu.Lock()
+			comments = append(comments, string(body))
+			mu.Unlock()
+			_, _ = w.Write([]byte(`{"id":1}`))
+			return
+		}
+		_, _ = io.WriteString(w, `[]`)
+	}))
+	defer api.Close()
+	setResolveIssueEnv(t, root, remote, api.URL, fakeOpenCode)
+	t.Setenv("COURIER_REF", "7")
+	t.Setenv("COURIER_RUN_NAME", "coderrun-it-7")
+	t.Setenv("GITHUB_TOKEN", "test-token")
+
+	var output bytes.Buffer
+	var errorsOut bytes.Buffer
+	if code := run(context.Background(), &output, &errorsOut); code != exitNeedsHuman {
+		t.Fatalf("run exit code = %d, want %d; stderr=%q stdout=%q", code, exitNeedsHuman, errorsOut.String(), output.String())
+	}
+	if !strings.Contains(output.String(), `"phase":"NeedsHuman"`) {
+		t.Fatalf("needs-decision phase = %q", output.String())
+	}
+	if !strings.Contains(output.String(), `"outcome":"needs_decision"`) {
+		t.Fatalf("termination missing outcome: %q", output.String())
+	}
+	if !strings.Contains(output.String(), "coordinator needs a decision: Which payment provider should the run use?") {
+		t.Fatalf("needs-decision reason = %q", output.String())
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if len(comments) != 1 {
+		t.Fatalf("comments = %d, want 1", len(comments))
+	}
+	if !strings.Contains(comments[0], "needs a decision") || !strings.Contains(comments[0], "Which payment provider") {
+		t.Fatalf("comment = %q", comments[0])
+	}
+}
+
+// TestRunOutcomeCommentIsRedactedBeforeForge registers a fake secret via the
+// environment (the name shape is what RegisterEnvironment picks up), has the
+// coordinator embed it in a needs_decision question, and proves the comment
+// posted to the forge is scrubbed while the run still ends NeedsHuman.
+func TestRunOutcomeCommentIsRedactedBeforeForge(t *testing.T) {
+	root := t.TempDir()
+	remote := remoteWithExistingBranch(t, root)
+	fakeOpenCode := filepath.Join(root, "opencode")
+	writeExecutable(t, fakeOpenCode, fmt.Sprintf(`#!/bin/sh
+case "$1" in mcp) exit 0;; esac
+mkdir -p "$COURIER_SCRATCH_DIR"
+printf '{"outcome":"needs_decision","question":"Which payment provider should the run use? The staging key is %s."}' > "$COURIER_SCRATCH_DIR/outcome.json"
+exit 0
+`, testForgeSecret))
+
+	var mu sync.Mutex
+	var comments []string
+	api := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/comments") {
+			body, _ := io.ReadAll(r.Body)
+			mu.Lock()
+			comments = append(comments, string(body))
+			mu.Unlock()
+			_, _ = w.Write([]byte(`{"id":1}`))
+			return
+		}
+		_, _ = io.WriteString(w, `[]`)
+	}))
+	defer api.Close()
+	setResolveIssueEnv(t, root, remote, api.URL, fakeOpenCode)
+	t.Setenv("COURIER_REF", "7")
+	t.Setenv("COURIER_RUN_NAME", "coderrun-it-7")
+	t.Setenv("COURIER_FORGE_SECRET", testForgeSecret)
+	t.Setenv("GITHUB_TOKEN", "test-token")
+
+	var output bytes.Buffer
+	var errorsOut bytes.Buffer
+	if code := run(context.Background(), &output, &errorsOut); code != exitNeedsHuman {
+		t.Fatalf("run exit code = %d, want %d; stderr=%q stdout=%q", code, exitNeedsHuman, errorsOut.String(), output.String())
+	}
+	if !strings.Contains(output.String(), `"phase":"NeedsHuman"`) {
+		t.Fatalf("needs-decision phase = %q", output.String())
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if len(comments) != 1 {
+		t.Fatalf("comments = %d, want 1", len(comments))
+	}
+	if strings.Contains(comments[0], testForgeSecret) {
+		t.Fatal("comment contains a fake credential (constant: testForgeSecret)")
+	}
+	if !strings.Contains(comments[0], courierlog.RedactedPlaceholder) {
+		t.Fatalf("comment credential was not replaced by the redaction placeholder: %q", comments[0])
+	}
+	if !strings.Contains(comments[0], "Which payment provider") {
+		t.Fatalf("comment lost the question around the redaction: %q", comments[0])
+	}
+}
+
+// TestRunMissingRefOutcomeCommentEmitsErrorEvent proves a terminal outcome that
+// wants to comment without a positive reference is not skipped silently: an
+// outcome.comment error event names the missing reference, and the run's
+// ending is unchanged.
+func TestRunMissingRefOutcomeCommentEmitsErrorEvent(t *testing.T) {
+	root := t.TempDir()
+	remote := remoteWithExistingBranch(t, root)
+	fakeOpenCode := filepath.Join(root, "opencode")
+	writeExecutable(t, fakeOpenCode, "#!/bin/sh\ncase \"$1\" in mcp) exit 0;; esac\nmkdir -p \"$COURIER_SCRATCH_DIR\"\nprintf '{\"outcome\":\"needs_decision\",\"question\":\"Which payment provider should the run use?\"}' > \"$COURIER_SCRATCH_DIR/outcome.json\"\nexit 0\n")
+	prServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `[]`)
+	}))
+	defer prServer.Close()
+	setResolveIssueEnv(t, root, remote, prServer.URL, fakeOpenCode)
+	// No COURIER_REF: the run has no issue/PR to comment on.
+	t.Setenv("COURIER_LOG_LEVEL", "debug")
+	t.Setenv("COURIER_RUN_NAME", "coderrun-it-7")
+
+	var output bytes.Buffer
+	var errorsOut bytes.Buffer
+	if code := run(context.Background(), &output, &errorsOut); code != exitNeedsHuman {
+		t.Fatalf("run exit code = %d, want %d; stderr=%q stdout=%q", code, exitNeedsHuman, errorsOut.String(), output.String())
+	}
+	if !strings.Contains(output.String(), `"phase":"NeedsHuman"`) {
+		t.Fatalf("needs-decision phase = %q", output.String())
+	}
+	events := parseEvents(t, &output)
+	comment := findEvent(t, events, "outcome.comment")
+	if comment["status"] != "error" {
+		t.Fatalf("outcome.comment status = %v, want error", comment["status"])
+	}
+	detail, ok := comment["detail"].(map[string]any)
+	if !ok {
+		t.Fatal("outcome.comment must carry a detail object")
+	}
+	if reason, _ := detail["reason"].(string); !strings.Contains(reason, "reference") {
+		t.Fatalf("outcome.comment reason does not name the missing reference: %q", reason)
+	}
+}
+
+func TestRunDeclaredBlockedExternalReachesNeedsHumanAndComments(t *testing.T) {
+	root := t.TempDir()
+	remote := remoteWithExistingBranch(t, root)
+	fakeOpenCode := filepath.Join(root, "opencode")
+	missing := "secrets/prod-keys; ask the platform team to provision access before retry with token " + testForgeSecret
+	t.Setenv("COURIER_TEST_MISSING", missing)
+	t.Setenv("COURIER_FORGE_SECRET", testForgeSecret)
+	writeExecutable(t, fakeOpenCode, `#!/bin/sh
+case "$1" in mcp) exit 0;; esac
+printf '{"outcome":"blocked_external","missing":"%s"}' "$COURIER_TEST_MISSING" > "$COURIER_SCRATCH_DIR/outcome.json"
+exit 0
+`)
+	var comments []string
+	prServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/comments") {
+			body, _ := io.ReadAll(r.Body)
+			comments = append(comments, string(body))
+			_, _ = w.Write([]byte(`{"id":1}`))
+			return
+		}
+		_, _ = io.WriteString(w, `[]`)
+	}))
+	defer prServer.Close()
+	setResolveIssueEnv(t, root, remote, prServer.URL, fakeOpenCode)
+	t.Setenv("COURIER_REF", "7")
+	t.Setenv("GITHUB_TOKEN", "test-token")
+
+	var output bytes.Buffer
+	var errorsOut bytes.Buffer
+	if code := run(context.Background(), &output, &errorsOut); code != exitNeedsHuman {
+		t.Fatalf("run exit code = %d, want %d; stderr=%q stdout=%q", code, exitNeedsHuman, errorsOut.String(), output.String())
+	}
+	if !strings.Contains(output.String(), `"phase":"NeedsHuman"`) || !strings.Contains(output.String(), `"outcome":"blocked_external"`) {
+		t.Fatalf("blocked-external termination = %q", output.String())
+	}
+	if !strings.Contains(output.String(), "coordinator is blocked on an external prerequisite: secrets/prod-keys; ask the platform team to provision access before retry with token "+courierlog.RedactedPlaceholder) {
+		t.Fatalf("blocked-external reason did not preserve the redacted explanation: %q", output.String())
+	}
+	if strings.Contains(output.String(), testForgeSecret) {
+		t.Fatal("termination output contains a fake credential (constant: testForgeSecret)")
+	}
+	if len(comments) != 1 || !strings.Contains(comments[0], "secrets/prod-keys; ask the platform team to provision access before retry with token "+courierlog.RedactedPlaceholder) {
+		t.Fatalf("blocked-external comment = %#v, want full redacted missing explanation", comments)
+	}
+	if strings.Contains(comments[0], testForgeSecret) {
+		t.Fatal("blocked-external comment contains a fake credential (constant: testForgeSecret)")
+	}
+}
+func TestRunDeclaredChangesButDirtyBecomesFailed(t *testing.T) {
+	root := t.TempDir()
+	remote := remoteWithExistingBranch(t, root)
+	fakeOpenCode := filepath.Join(root, "opencode")
+	writeExecutable(t, fakeOpenCode, "#!/bin/sh\ncase \"$1\" in mcp) exit 0;; esac\nprintf 'partial\\n' > partial.txt\nmkdir -p \"$COURIER_SCRATCH_DIR\"\nprintf '{\"outcome\":\"changes\"}' > \"$COURIER_SCRATCH_DIR/outcome.json\"\nexit 0\n")
+	prServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `[]`)
+	}))
+	defer prServer.Close()
+	setResolveIssueEnv(t, root, remote, prServer.URL, fakeOpenCode)
+
+	var output bytes.Buffer
+	var errorsOut bytes.Buffer
+	if code := run(context.Background(), &output, &errorsOut); code != exitFailed {
+		t.Fatalf("run exit code = %d, want %d; stderr=%q stdout=%q", code, exitFailed, errorsOut.String(), output.String())
+	}
+	if !strings.Contains(output.String(), `"phase":"Failed"`) {
+		t.Fatalf("declared-changes-dirty phase = %q", output.String())
+	}
+	if !strings.Contains(output.String(), "opencode declared changes but left uncommitted workspace changes") {
+		t.Fatalf("declared-changes-dirty reason = %q", output.String())
+	}
+}
+
+func TestRunDeclaredChangesButNoCommitBecomesFailed(t *testing.T) {
+	root := t.TempDir()
+	remote := remoteWithExistingBranch(t, root)
+	fakeOpenCode := filepath.Join(root, "opencode")
+	writeExecutable(t, fakeOpenCode, "#!/bin/sh\ncase \"$1\" in mcp) exit 0;; esac\nmkdir -p \"$COURIER_SCRATCH_DIR\"\nprintf '{\"outcome\":\"changes\"}' > \"$COURIER_SCRATCH_DIR/outcome.json\"\nexit 0\n")
+	prServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `[]`)
+	}))
+	defer prServer.Close()
+	setResolveIssueEnv(t, root, remote, prServer.URL, fakeOpenCode)
+
+	var output bytes.Buffer
+	var errorsOut bytes.Buffer
+	if code := run(context.Background(), &output, &errorsOut); code != exitFailed {
+		t.Fatalf("run exit code = %d, want %d; stderr=%q stdout=%q", code, exitFailed, errorsOut.String(), output.String())
+	}
+	if !strings.Contains(output.String(), `"phase":"Failed"`) {
+		t.Fatalf("declared-changes-none phase = %q", output.String())
+	}
+	if !strings.Contains(output.String(), "opencode declared changes but produced no commit") {
+		t.Fatalf("declared-changes-none reason = %q", output.String())
+	}
+}
+
+func TestRunDeclaredNoChangeNeededButCommittedBecomesFailed(t *testing.T) {
+	root := t.TempDir()
+	remote := remoteWithExistingBranch(t, root)
+	fakeOpenCode := filepath.Join(root, "opencode")
+	writeExecutable(t, fakeOpenCode, "#!/bin/sh\ncase \"$1\" in mcp) exit 0;; esac\nprintf 'completed\\n' > completed.txt\ngit add --all -- .\ngit commit -m 'test: completed work' >/dev/null\nmkdir -p \"$COURIER_SCRATCH_DIR\"\nprintf '{\"outcome\":\"no_change_needed\",\"evidence\":\"thought it was done\"}' > \"$COURIER_SCRATCH_DIR/outcome.json\"\nexit 0\n")
+	prServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `[]`)
+	}))
+	defer prServer.Close()
+	setResolveIssueEnv(t, root, remote, prServer.URL, fakeOpenCode)
+
+	var output bytes.Buffer
+	var errorsOut bytes.Buffer
+	if code := run(context.Background(), &output, &errorsOut); code != exitFailed {
+		t.Fatalf("run exit code = %d, want %d; stderr=%q stdout=%q", code, exitFailed, errorsOut.String(), output.String())
+	}
+	if !strings.Contains(output.String(), `"phase":"Failed"`) {
+		t.Fatalf("no-change-needed-committed phase = %q", output.String())
+	}
+	if !strings.Contains(output.String(), "opencode declared no change needed but the workspace has new commits or uncommitted changes") {
+		t.Fatalf("no-change-needed-committed reason = %q", output.String())
+	}
+}
+
+func TestRunInvalidOutcomeDeclarationBecomesFailed(t *testing.T) {
+	root := t.TempDir()
+	remote := remoteWithExistingBranch(t, root)
+	fakeOpenCode := filepath.Join(root, "opencode")
+	writeExecutable(t, fakeOpenCode, "#!/bin/sh\ncase \"$1\" in mcp) exit 0;; esac\nmkdir -p \"$COURIER_SCRATCH_DIR\"\nprintf 'not json' > \"$COURIER_SCRATCH_DIR/outcome.json\"\nexit 0\n")
+	prServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `[]`)
+	}))
+	defer prServer.Close()
+	setResolveIssueEnv(t, root, remote, prServer.URL, fakeOpenCode)
+
+	var output bytes.Buffer
+	var errorsOut bytes.Buffer
+	if code := run(context.Background(), &output, &errorsOut); code != exitFailed {
+		t.Fatalf("run exit code = %d, want %d; stderr=%q stdout=%q", code, exitFailed, errorsOut.String(), output.String())
+	}
+	if !strings.Contains(output.String(), `"phase":"Failed"`) {
+		t.Fatalf("invalid-declaration phase = %q", output.String())
+	}
+	if !strings.Contains(output.String(), "opencode wrote an invalid outcome declaration") {
+		t.Fatalf("invalid-declaration reason = %q", output.String())
 	}
 }
 
@@ -449,7 +912,7 @@ func TestRunCommitWithUntrackedScratchReachesVerifying(t *testing.T) {
 	root := t.TempDir()
 	remote := remoteWithExistingBranch(t, root)
 	fakeOpenCode := filepath.Join(root, "opencode")
-	writeExecutable(t, fakeOpenCode, "#!/bin/sh\nprintf 'completed\\n' > completed.txt\ngit add completed.txt\ngit commit -m 'test: completed work' >/dev/null\nprintf 'scratch\\n' > scratch.txt\n")
+	writeExecutable(t, fakeOpenCode, "#!/bin/sh\ncase \"$1\" in mcp) exit 0;; esac\nprintf 'completed\\n' > completed.txt\ngit add completed.txt\ngit commit -m 'test: completed work' >/dev/null\nprintf 'scratch\\n' > scratch.txt\n")
 	prServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = io.WriteString(w, `[]`)
@@ -469,7 +932,25 @@ func TestRunCommitWithUntrackedScratchReachesVerifying(t *testing.T) {
 	}
 }
 
-func TestRunPreservesExplicitNeedsHumanSignal(t *testing.T) {
+func TestTruncateTerminationReasonRespectsByteLimitAndUTF8(t *testing.T) {
+	long := strings.Repeat("a", maxTerminationReasonBytes-len(terminationTruncationSuffix)-1) + "é" + strings.Repeat("b", 20)
+	got := truncateTerminationReason(long)
+	if len(got) > maxTerminationReasonBytes {
+		t.Fatalf("truncated reason is %d bytes, want <= %d", len(got), maxTerminationReasonBytes)
+	}
+	if !utf8.ValidString(got) {
+		t.Fatalf("truncated reason is not valid UTF-8: %q", got)
+	}
+	if !strings.HasSuffix(got, terminationTruncationSuffix) {
+		t.Fatalf("truncated reason = %q, want truncation suffix", got)
+	}
+	short := "short reason"
+	if got := truncateTerminationReason(short); got != short {
+		t.Fatalf("short reason = %q, want unchanged %q", got, short)
+	}
+}
+
+func TestRunChildExitTwoBecomesFailed(t *testing.T) {
 	root := t.TempDir()
 	remote := remoteWithExistingBranch(t, root)
 	fakeOpenCode := filepath.Join(root, "opencode")
@@ -483,11 +964,63 @@ func TestRunPreservesExplicitNeedsHumanSignal(t *testing.T) {
 
 	var output bytes.Buffer
 	var errorsOut bytes.Buffer
-	if code := run(context.Background(), &output, &errorsOut); code != exitNeedsHuman {
-		t.Fatalf("run exit code = %d, want %d; stderr=%q stdout=%q", code, exitNeedsHuman, errorsOut.String(), output.String())
+	if code := run(context.Background(), &output, &errorsOut); code != exitFailed {
+		t.Fatalf("run exit code = %d, want %d (the child's code must not pass through); stderr=%q stdout=%q", code, exitFailed, errorsOut.String(), output.String())
 	}
-	if !strings.Contains(output.String(), "requested human attention") {
-		t.Fatalf("explicit needs-human reason = %q", output.String())
+	if !strings.Contains(output.String(), `"phase":"Failed"`) {
+		t.Fatalf("child-exit-2 phase = %q", output.String())
+	}
+	if !strings.Contains(output.String(), "opencode exited with status 2") {
+		t.Fatalf("child-exit-2 reason = %q", output.String())
+	}
+}
+
+// TestRunChildExitThreeBecomesFailed is the symmetric guard for the
+// no_change_needed exit: a child that exits 3 without a declaration must fail
+// the run with the standard failure code, never end it with the no-change-
+// needed termination.
+func TestRunChildExitThreeBecomesFailed(t *testing.T) {
+	root := t.TempDir()
+	remote := remoteWithExistingBranch(t, root)
+	fakeOpenCode := filepath.Join(root, "opencode")
+	writeExecutable(t, fakeOpenCode, "#!/bin/sh\ncase \"$1\" in mcp) exit 0;; esac\nexit 3\n")
+	prServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `[]`)
+	}))
+	defer prServer.Close()
+	setResolveIssueEnv(t, root, remote, prServer.URL, fakeOpenCode)
+
+	var output bytes.Buffer
+	var errorsOut bytes.Buffer
+	if code := run(context.Background(), &output, &errorsOut); code != exitFailed {
+		t.Fatalf("run exit code = %d, want %d; stderr=%q stdout=%q", code, exitFailed, errorsOut.String(), output.String())
+	}
+	if !strings.Contains(output.String(), `"phase":"Failed"`) {
+		t.Fatalf("child-exit-3 phase = %q", output.String())
+	}
+	if !strings.Contains(output.String(), "opencode exited with status 3") {
+		t.Fatalf("child-exit-3 reason = %q", output.String())
+	}
+	if strings.Contains(output.String(), `"phase":"NoChangeNeeded"`) {
+		t.Fatalf("child exit 3 must never end the run with the no_change_needed exit: %q", output.String())
+	}
+}
+
+func TestReadConfigDefaultsScratchDirectoryOutsideWorkspace(t *testing.T) {
+	values := map[string]string{
+		"COURIER_REPO_URL":  "https://git.example/acme/widgets.git",
+		"COURIER_BRANCH":    "feature/7",
+		"COURIER_GOAL":      "write to /var/tmp/courier-scratch/outcome.json",
+		"COURIER_MODEL":     "model",
+		"COURIER_WORKSPACE": "/workspace",
+	}
+	cfg, err := readConfig(func(name string) string { return values[name] })
+	if err != nil {
+		t.Fatalf("readConfig() error = %v", err)
+	}
+	if cfg.ScratchDirectory != defaultScratchDirectory {
+		t.Fatalf("scratch directory = %q, want %q", cfg.ScratchDirectory, defaultScratchDirectory)
 	}
 }
 
@@ -926,15 +1459,15 @@ exit 0
 	if len(calls) != 2 {
 		t.Fatalf("fake script invoked %d times, want 2: %q", len(calls), calls)
 	}
-	want := "request human attention.; configured capability unavailable: metrics"
+	want := "needs_decision or blocked_external if a human is needed.; configured capability unavailable: metrics"
 	if !strings.Contains(calls[1], want) {
 		t.Fatalf("resumed no-work state message = %q, want it to end with %q", calls[1], want)
 	}
 }
 
 // TestRunCrashWithoutSessionFailsImmediately proves a child that exits with a
-// crash code before printing any sessionID fails the run with that code and
-// emits no continuation event: there is no session to resume.
+// crash code before printing any sessionID fails with the standard failure
+// code and emits no continuation event: there is no session to resume.
 func TestRunCrashWithoutSessionFailsImmediately(t *testing.T) {
 	root := t.TempDir()
 	remote := remoteWithExistingBranch(t, root)
@@ -949,8 +1482,8 @@ func TestRunCrashWithoutSessionFailsImmediately(t *testing.T) {
 
 	var output bytes.Buffer
 	var errorsOut bytes.Buffer
-	if code := run(context.Background(), &output, &errorsOut); code != 3 {
-		t.Fatalf("run exit code = %d, want the child's code 3; stderr=%q stdout=%q", code, errorsOut.String(), output.String())
+	if code := run(context.Background(), &output, &errorsOut); code != exitFailed {
+		t.Fatalf("run exit code = %d, want %d; stderr=%q stdout=%q", code, exitFailed, errorsOut.String(), output.String())
 	}
 	if !strings.Contains(output.String(), `"phase":"Failed"`) {
 		t.Fatalf("missing Failed termination: %q", output.String())
@@ -1265,9 +1798,10 @@ func TestReadConfigRequiresRemoteAndStatusBranch(t *testing.T) {
 // fake event-test secrets. Assertions never print these values or any output
 // line that could contain them; failures name the constant instead.
 const (
-	testGitToken   = "git-push-token-f4e3d2c1"
-	testGitHubTokn = "gh-api-token-b1b2b3b4"
-	testURLToken   = "url-userinfo-token-aa11bb22"
+	testGitToken    = "git-push-token-f4e3d2c1"
+	testGitHubTokn  = "gh-api-token-b1b2b3b4"
+	testURLToken    = "url-userinfo-token-aa11bb22"
+	testForgeSecret = "forge-decision-secret-7c9d2e1f"
 )
 
 func TestRunEmitsRunScopedEventsWithoutDetail(t *testing.T) {
@@ -1463,9 +1997,10 @@ git commit -m 'test: completed work' >/dev/null
 	}
 }
 
-// TestChildOutputRedactedOnFailureExit keeps exit semantics and redaction on
-// a failing child: the exit code passes through and the child's final output
-// is flushed through the redactor before the termination handoff.
+// TestChildOutputRedactedOnFailureExit keeps failure-exit semantics and
+// redaction on a failing child: the run exits with the standard failure code
+// (the child's code rides in the termination reason) and the child's final
+// output is flushed through the redactor before the termination handoff.
 func TestChildOutputRedactedOnFailureExit(t *testing.T) {
 	root := t.TempDir()
 	remote := remoteWithExistingBranch(t, root)
@@ -1490,8 +2025,11 @@ exit 3
 
 	var output bytes.Buffer
 	var errorsOut bytes.Buffer
-	if code := run(context.Background(), &output, &errorsOut); code != 3 {
-		t.Fatalf("run exit code = %d, want the child's exit code 3", code)
+	if code := run(context.Background(), &output, &errorsOut); code != exitFailed {
+		t.Fatalf("run exit code = %d, want %d (the child's code must not pass through)", code, exitFailed)
+	}
+	if !strings.Contains(output.String(), "opencode exited with status 3") {
+		t.Fatalf("failure reason should keep the child's exit code: %q", output.String())
 	}
 	if strings.Contains(output.String(), testGitToken) {
 		t.Fatal("stdout contains a fake credential on the failure path (constant: testGitToken)")
@@ -1533,8 +2071,8 @@ func TestRunSurfacesUnavailableCapabilityBeforeWork(t *testing.T) {
 	var output bytes.Buffer
 	var errorsOut bytes.Buffer
 	code := run(context.Background(), &output, &errorsOut)
-	if code != exitNeedsHuman {
-		t.Fatalf("run exit code = %d, want %d; stderr=%q stdout=%q", code, exitNeedsHuman, errorsOut.String(), output.String())
+	if code != exitFailed {
+		t.Fatalf("run exit code = %d, want %d; stderr=%q stdout=%q", code, exitFailed, errorsOut.String(), output.String())
 	}
 	if strings.Contains(output.String(), "✗") {
 		t.Fatal("run stdout contains a raw probe glyph; probe output must stay out of the run's streams")
@@ -1581,7 +2119,7 @@ func TestRunSurfacesUnavailableCapabilityBeforeWork(t *testing.T) {
 	if strings.Contains(output.String(), capabilityProbeToken) || strings.Contains(errorsOut.String(), capabilityProbeToken) {
 		t.Fatal("output contains a fake credential (constant: capabilityProbeToken)")
 	}
-	if !strings.Contains(output.String(), "without producing a commit") || !strings.Contains(output.String(), "configured capability unavailable: github") {
+	if !strings.Contains(output.String(), "without declaring an outcome and produced no commit") || !strings.Contains(output.String(), "configured capability unavailable: github") {
 		t.Fatalf("terminal reason lost the no-work sentence or the unavailable capability: %q", output.String())
 	}
 }
@@ -1820,18 +2358,19 @@ func remoteWithConflictingBranch(t *testing.T, root string) string {
 func setResolveIssueEnv(t *testing.T, root, remote, githubBase, openCodeBinary string) string {
 	t.Helper()
 	workspace := filepath.Join(root, "workspace")
-	termination := filepath.Join(root, "termination")
+	scratch := filepath.Join(root, "scratch")
 	t.Setenv("COURIER_REPO_URL", remote)
 	t.Setenv("COURIER_WORKSPACE", workspace)
+	t.Setenv("COURIER_SCRATCH_DIR", scratch)
 	t.Setenv("COURIER_BASE", "main")
 	t.Setenv("COURIER_BRANCH", "courier/resolve-issue/acme-widgets/7")
-	t.Setenv("COURIER_GOAL", "Open a PR to address issue #7.")
+	t.Setenv("COURIER_GOAL", "Open a PR to address issue #7. Declare the outcome at "+filepath.Join(defaultScratchDirectory, defaultOutcomeFilename)+".")
 	t.Setenv("COURIER_MODEL", "any-model/name")
 	t.Setenv("COURIER_MODE", "resolve-issue")
 	t.Setenv("COURIER_REPO", "acme/widgets")
 	t.Setenv("COURIER_GITHUB_API_BASE", githubBase)
 	t.Setenv("COURIER_OPENCODE_BINARY", openCodeBinary)
-	t.Setenv("COURIER_TERMINATION_FILE", termination)
+	t.Setenv("COURIER_TERMINATION_FILE", filepath.Join(root, "termination"))
 	return workspace
 }
 

@@ -748,11 +748,28 @@ Use idempotent retries and reconciliation.
 
 ## 8. Failure classification
 
-The operator's current mapping is: exit `0` → `Verifying` (the operator then
-verifies the world — the PR exists and checks are observed — before the run is
-done), exit `2` → `NeedsHuman`, any other nonzero exit → `Failed`. This design
-preserves that mapping; a separately reviewed operator change may update it,
-and this document does not.
+The coordinator declares its outcome in the exact file path supplied in its
+goal. That file lives in executor-owned per-run scratch outside the target
+worktree; it is control metadata, not a repository file. The executor validates
+the declaration against the world before terminalizing: exit `0` (`changes`)
+reaches `Verifying` only when commits are reachable from the run branch; exit
+`2` (`needs_decision` or `blocked_external`) reaches `NeedsHuman`; exit `3`
+(`no_change_needed`) reaches `AwaitingReview` with source `in-review` for
+resolve-issue runs and `NeedsHuman` for fix-pr runs; every other exit is
+`Failed` under the current contract. Session recovery for undeclared recoverable
+endings is shipped: with a captured session, dirty, off-branch, and no-work
+states resume under the #170 continuation budget and no-progress guard; without
+a captured session, those endings fail as incomplete. This does not change the
+declared-outcome exit mapping above. A `no_change_needed` result never resolves
+the source. For fix-pr, its blocked lifecycle report parks the PR-fix
+item as `BLOCKED`/needs-human; `BlockedReportParksPRFix` skips only the redundant
+queue-mark call and does not wake a reviewer or request another review.
+
+Outcome comments carry the full declared evidence, question, or missing
+explanation after redaction. They are not shortened to the termination reason;
+that separate reason is bounded and redacted before publication. Comment posting
+is best-effort: failures are logged as `outcome.comment` and do not change the
+run ending.
 
 The native harness adds an explicit result contract on top of the exit code:
 a structured terminal result (outcome + reason) written by trusted control
@@ -899,8 +916,8 @@ and the acceptance tests below are satisfied.
   test may stand in for evidence; the wedge is not detected, so #102 stays
   blocked for production until the §12 gates are met.
 - **Failure semantics:** workload failure and infrastructure failure are
-  distinguishable from trusted evidence; operator exit-code mapping remains
-  unchanged until its own approved change.
+  distinguishable from trusted evidence; the operator's exit-code mapping
+  follows DESIGN.md's exit contract.
 
 ## 11. Open blockers
 
