@@ -74,7 +74,8 @@ FROM coordinator AS coordinator-go
 USER root
 RUN apt-get update && \
 	apt-get install -y --no-install-recommends make && \
-	apt-get clean && rm -rf /var/lib/apt/lists/*
+	apt-get clean && rm -rf /var/lib/apt/lists/* && \
+	mkdir -p /courier-toolchain-cache && chown 65532:65532 /courier-toolchain-cache
 
 COPY --from=toolchain /usr/local/go /usr/local/go
 COPY --from=toolchain /out/controller-gen /usr/local/bin/controller-gen
@@ -82,6 +83,8 @@ COPY --from=toolchain /out/helm /usr/local/bin/helm
 
 ENV PATH=/usr/local/go/bin:${PATH} \
 	CONTROLLER_GEN=/usr/local/bin/controller-gen \
+	GOMODCACHE=/courier-toolchain-cache/go-mod \
+	GOCACHE=/courier-toolchain-cache/go-build \
 	GOTOOLCHAIN=local
 
 USER 65532:65532
