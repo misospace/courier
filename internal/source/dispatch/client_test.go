@@ -529,7 +529,7 @@ func TestHTTPClientReportUsesTaskReportAndPRFixQueueOnlyForFollowups(t *testing.
 	}
 }
 
-func TestHTTPClientReportBlockedBlockedReportParksPRFix(t *testing.T) {
+func TestHTTPClientReportBlockedSkipRedundantPRFixQueueMark(t *testing.T) {
 	var requests []map[string]any
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/api/pr-fix-queue/mark" {
@@ -552,7 +552,7 @@ func TestHTTPClientReportBlockedBlockedReportParksPRFix(t *testing.T) {
 		t.Fatal(err)
 	}
 	id := EncodeWorkID(Task{Type: "followup-pr", Issue: &Issue{ID: "issue-id", Repo: "acme/widgets", Number: 41}, PullRequest: &PullRequest{Repo: "acme/widgets", Number: 77}, PRFixItem: &PRFixItem{ID: "queue-item", Generation: 1}})
-	if err := client.Report(context.Background(), id, source.Lifecycle{Result: source.ResultBlocked, Error: "blocked", BlockedReportParksPRFix: true}); err != nil {
+	if err := client.Report(context.Background(), id, source.Lifecycle{Result: source.ResultBlocked, Error: "blocked", SkipRedundantPRFixQueueMark: true}); err != nil {
 		t.Fatal(err)
 	}
 	if len(requests) != 1 || requests[0]["taskType"] != "followup-pr" || requests[0]["outcome"] != "blocked" || requests[0]["error"] != "blocked" {

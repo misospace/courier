@@ -35,15 +35,15 @@ const (
 // lifecycleReportedCondition tracks whether a terminal run's source lifecycle
 // report has been published; a False status means a later reconcile retries it.
 const (
-	lifecycleReportedCondition                          = "LifecycleReported"
-	lifecycleReportPendingReason                        = "Pending"
-	lifecycleReportPendingBlockedReportParksPRFixReason = "PendingBlockedReportParksPRFix"
-	lifecycleReportPendingWithErrorReason               = "PendingWithError"
+	lifecycleReportedCondition                              = "LifecycleReported"
+	lifecycleReportPendingReason                            = "Pending"
+	lifecycleReportPendingSkipRedundantPRFixQueueMarkReason = "PendingBlockedReportParksPRFix"
+	lifecycleReportPendingWithErrorReason                   = "PendingWithError"
 )
 
 type terminalLifecycleIntent struct {
-	skipPRFixQueueMark bool
-	error              string
+	skipRedundantPRFixQueueMark bool
+	error                       string
 }
 
 // CoderRunReconciler reconciles a CoderRun object.
@@ -424,7 +424,7 @@ func (r *CoderRunReconciler) observeRunning(ctx context.Context, run *courierv1a
 			return ctrl.Result{Requeue: true}, nil
 		}
 		intent := terminalLifecycleIntent{
-			skipPRFixQueueMark: exitCode == exitDeclaredNoChange && run.Spec.Mode == courierv1alpha1.ModeFixPR,
+			skipRedundantPRFixQueueMark: exitCode == exitDeclaredNoChange && run.Spec.Mode == courierv1alpha1.ModeFixPR,
 		}
 		if exitCode == 2 && phase == courierv1alpha1.PhaseNeedsHuman && terminationOutcome == "blocked_external" {
 			intent.error = terminationReason
@@ -555,11 +555,11 @@ func (r *CoderRunReconciler) transitionTerminal(ctx context.Context, run *courie
 	return r.publishTerminalLifecycle(ctx, run, adapter, item, phase, intent)
 }
 
-// pendingLifecycleReason stores retry intent in the standard condition reason;
-// its message preserves a coordinator explanation across report retries.
+// pendingLifecycleReason stores retry intent in the condition reason; its
+// message preserves a coordinator explanation across report retries.
 func pendingLifecycleReason(intent terminalLifecycleIntent) string {
-	if intent.skipPRFixQueueMark {
-		return lifecycleReportPendingBlockedReportParksPRFixReason
+	if intent.skipRedundantPRFixQueueMark {
+		return lifecycleReportPendingSkipRedundantPRFixQueueMarkReason
 	}
 	if intent.error != "" {
 		return lifecycleReportPendingWithErrorReason
@@ -573,8 +573,8 @@ func pendingLifecycleIntent(run *courierv1alpha1.CoderRun) terminalLifecycleInte
 		return terminalLifecycleIntent{}
 	}
 	return terminalLifecycleIntent{
-		skipPRFixQueueMark: cond.Reason == lifecycleReportPendingBlockedReportParksPRFixReason,
-		error:              cond.Message,
+		skipRedundantPRFixQueueMark: cond.Reason == lifecycleReportPendingSkipRedundantPRFixQueueMarkReason,
+		error:                       cond.Message,
 	}
 }
 
@@ -718,7 +718,7 @@ func lifecycleForPhase(phase courierv1alpha1.Phase, state source.State, pr strin
 		if lifecycle.Error == "" {
 			lifecycle.Error = "run requires human intervention"
 		}
-		lifecycle.BlockedReportParksPRFix = intent.skipPRFixQueueMark
+		lifecycle.SkipRedundantPRFixQueueMark = intent.skipRedundantPRFixQueueMark
 	}
 	return lifecycle
 }

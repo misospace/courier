@@ -174,9 +174,10 @@ on the run branch; the declaration never substitutes for that check (#169):
   resolve-issue run ends in **AwaitingReview** and moves the source to
   `in-review` for a human to settle; a fix-pr run ends **NeedsHuman** and sends
   a blocked lifecycle report. That report parks the PR-fix item as
-  `BLOCKED`/needs-human. Its `BlockedReportParksPRFix` flag suppresses only the
-  redundant follow-up queue mark; it does not wake a reviewer or request
-  another review. Neither mode resolves the source on the coordinator's word.
+  `BLOCKED`/needs-human. Its `SkipRedundantPRFixQueueMark` flag skips only the
+  redundant follow-up queue mark; the blocked report still parks the item, and
+  no reviewer wake or review request occurs. Neither mode resolves the source on
+  the coordinator's word.
 - **`needs_decision`** — a real decision the coordinator cannot make. The
   executor posts the complete question as a redacted issue/PR comment and exits
   `2` to **NeedsHuman** with a blocked source report.
@@ -739,8 +740,9 @@ was superseded.
   its complete redacted evidence and exits `3`: resolve-issue waits in
   `AwaitingReview`/`in-review`, while fix-pr ends `NeedsHuman`; the blocked report
   itself parks the PR-fix item as `BLOCKED`/needs-human, and
-  `BlockedReportParksPRFix` skips only the redundant queue-mark call — it does not wake
-  a reviewer. Neither outcome resolves the source. `needs_decision` and
+  `SkipRedundantPRFixQueueMark` skips only the redundant queue-mark call; the
+  blocked report still parks the item and does not wake or request a reviewer.
+  Neither outcome resolves the source. `needs_decision` and
   `blocked_external` post the complete redacted question or missing explanation
   and exit `2` to `NeedsHuman` with a blocked report. Only the distinct
   termination reason is bounded before publication. The controller carries the

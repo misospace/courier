@@ -364,8 +364,8 @@ func TestRunExitZeroWithoutLocalWorkBecomesFailed(t *testing.T) {
 	}
 }
 
-// TestRunTrackedCourierDataSurvivesGitAddAll verifies executor setup and
-// cleanup preserve tracked .courier content on an adopted work branch.
+// TestRunTrackedCourierDataSurvivesGitAddAll verifies an outcome declaration
+// does not modify tracked .courier content on an adopted work branch.
 func TestRunTrackedCourierDataSurvivesGitAddAll(t *testing.T) {
 	root := t.TempDir()
 	remote := remoteWithExistingBranch(t, root)
@@ -374,11 +374,11 @@ func TestRunTrackedCourierDataSurvivesGitAddAll(t *testing.T) {
 		t.Fatal(err)
 	}
 	write(t, filepath.Join(orphan, ".courier", "tracked.txt"), "tracked user data\n")
-	commit(t, orphan, "work: stale declaration")
+	commit(t, orphan, "work: tracked courier data")
 	runGit(t, orphan, "push", "origin", "HEAD:refs/heads/courier/resolve-issue/acme-widgets/7")
 
 	fakeOpenCode := filepath.Join(root, "opencode")
-	writeExecutable(t, fakeOpenCode, "#!/bin/sh\ncase \"$1\" in mcp) exit 0;; esac\nprintf 'working tree should preserve tracked data\\n' >> .courier/tracked.txt\ngit add -A\ngit commit -m 'test: preserve courier data' >/dev/null\nmkdir -p \"$COURIER_SCRATCH_DIR\"\nprintf '{\"outcome\":\"changes\"}' > \"$COURIER_SCRATCH_DIR/outcome.json\"\nexit 0\n")
+	writeExecutable(t, fakeOpenCode, "#!/bin/sh\ncase \"$1\" in mcp) exit 0;; esac\nprintf 'completed\\n' > completed.txt\ngit add -A\ngit commit -m 'test: preserve courier data' >/dev/null\ntest \"$(git show HEAD:.courier/tracked.txt)\" = 'tracked user data' || exit 8\nmkdir -p \"$COURIER_SCRATCH_DIR\"\nprintf '{\"outcome\":\"changes\"}' > \"$COURIER_SCRATCH_DIR/outcome.json\"\nexit 0\n")
 	prServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = io.WriteString(w, `[]`)
@@ -391,8 +391,11 @@ func TestRunTrackedCourierDataSurvivesGitAddAll(t *testing.T) {
 	if code := run(context.Background(), &output, &errorsOut); code != exitSuccess {
 		t.Fatalf("run exit code = %d, want %d; stderr=%q stdout=%q", code, exitSuccess, errorsOut.String(), output.String())
 	}
-	if got := string(mustRead(t, filepath.Join(workspace, ".courier", "tracked.txt"))); got != "tracked user data\nworking tree should preserve tracked data\n" {
-		t.Fatalf("tracked courier data = %q, want preserved modifications", got)
+	if got := string(mustRead(t, filepath.Join(workspace, ".courier", "tracked.txt"))); got != "tracked user data\n" {
+		t.Fatalf("tracked courier data = %q, want unchanged tracked content", got)
+	}
+	if got := string(mustRead(t, filepath.Join(workspace, "completed.txt"))); got != "completed\n" {
+		t.Fatalf("completed work = %q, want committed output", got)
 	}
 }
 
@@ -578,6 +581,64 @@ func TestRunDeclaredNoChangeNeededExitsThreeAndComments(t *testing.T) {
 	}
 	if !strings.Contains(comments[0], "already addressed") || !strings.Contains(comments[0], "already fixed in v2") {
 		t.Fatalf("comment = %q", comments[0])
+	}
+}
+
+func TestRunBoundsNeedsDecisionTerminationReasonButKeepsFullComment(t *testing.T) {
+	root := t.TempDir()
+	remote := remoteWithExistingBranch(t, root)
+	secret := "declared-secret-value"
+	longEvidence := strings.Repeat("evidence-", 300)
+	t.Setenv("COURIER_TEST_LONG_EVIDENCE", longEvidence+secret)
+	t.Setenv("COURIER_FORGE_SECRET", secret)
+	fakeOpenCode := filepath.Join(root, "opencode")
+	writeExecutable(t, fakeOpenCode, `#!/bin/sh
+case "$1" in mcp) exit 0;; esac
+printf '{"outcome":"needs_decision","question":"%s"}' "$COURIER_TEST_LONG_EVIDENCE" > "$COURIER_SCRATCH_DIR/outcome.json"
+exit 0
+`)
+	var comments []string
+	api := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/comments") {
+			body, _ := io.ReadAll(r.Body)
+			comments = append(comments, string(body))
+			_, _ = w.Write([]byte(`{"id":1}`))
+			return
+		}
+		_, _ = io.WriteString(w, `[]`)
+	}))
+	defer api.Close()
+	setResolveIssueEnv(t, root, remote, api.URL, fakeOpenCode)
+	t.Setenv("COURIER_REF", "7")
+	t.Setenv("GITHUB_TOKEN", "test-token")
+
+	var output, errorsOut bytes.Buffer
+	if code := run(context.Background(), &output, &errorsOut); code != exitNeedsHuman {
+		t.Fatalf("run exit code = %d, want %d; stderr=%q stdout=%q", code, exitNeedsHuman, errorsOut.String(), output.String())
+	}
+	var handoff struct {
+		Reason string `json:"reason"`
+	}
+	for _, line := range strings.Split(output.String(), "\n") {
+		payload, ok := strings.CutPrefix(line, "COURIER_TERMINATION ")
+		if ok {
+			if err := json.Unmarshal([]byte(payload), &handoff); err != nil {
+				t.Fatalf("decode termination handoff: %v", err)
+			}
+			break
+		}
+	}
+	if handoff.Reason == "" || len(handoff.Reason) > maxTerminationReasonBytes || !strings.HasSuffix(handoff.Reason, terminationTruncationSuffix) {
+		t.Fatalf("termination reason length=%d reason=%q, want bounded reason ending %q", len(handoff.Reason), handoff.Reason, terminationTruncationSuffix)
+	}
+	if strings.Contains(handoff.Reason, secret) {
+		t.Fatal("termination reason contains an unredacted secret")
+	}
+	if len(comments) != 1 || !strings.Contains(comments[0], courierlog.RedactedPlaceholder) || !strings.Contains(comments[0], longEvidence) {
+		t.Fatalf("comment does not preserve full redacted question: count=%d", len(comments))
+	}
+	if strings.Contains(comments[0], secret) {
+		t.Fatal("outcome comment contains an unredacted secret")
 	}
 }
 

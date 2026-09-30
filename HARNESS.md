@@ -759,8 +759,9 @@ resolve-issue runs and `NeedsHuman` for fix-pr runs; every other exit is
 `Failed` under the current contract. Continuation behavior is future #170 work
 and is separate from this exit mapping. A `no_change_needed` result never
 resolves the source. For fix-pr, its blocked lifecycle report parks the PR-fix
-item as `BLOCKED`/needs-human; `BlockedReportParksPRFix` skips only the redundant
-queue-mark call and does not wake a reviewer or request another review.
+item as `BLOCKED`/needs-human; `SkipRedundantPRFixQueueMark` skips only the
+redundant queue-mark call. The blocked report still parks the item; it does not
+wake or request a reviewer.
 
 Outcome comments carry the full declared evidence, question, or missing
 explanation after redaction. They are not shortened to the termination reason;
