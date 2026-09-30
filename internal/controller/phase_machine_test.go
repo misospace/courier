@@ -3,45 +3,33 @@ package controller
 import (
 	"context"
 	"errors"
+	"fmt"
 	"testing"
 
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	apimeta "k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
-	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
 	courierv1alpha1 "github.com/misospace/courier/api/v1alpha1"
 	"github.com/misospace/courier/internal/source"
+	"github.com/misospace/courier/internal/status"
 )
 
 type admissionSource struct {
-	claimed      []string
-	released     []string
-	transitions  []source.State
-	reports      []source.Lifecycle
-	events       []string
-	resolved     []string
-	preLaunchErr error
-	preLaunches  []string
-}
-
-// failingStatusWriter fails its first patches, then forwards to the fake
-// status writer.
-type failingStatusWriter struct {
-	fakeStatusWriter
-	failures int
-	calls    int
-}
-
-func (w *failingStatusWriter) PatchStatus(ctx context.Context, name types.NamespacedName, patch []byte) error {
-	w.calls++
-	if w.calls <= w.failures {
-		return errors.New("status patch failed")
-	}
-	return w.fakeStatusWriter.PatchStatus(ctx, name, patch)
+	claimed       []string
+	released      []string
+	transitions   []source.State
+	reports       []source.Lifecycle
+	events        []string
+	resolved      []string
+	preLaunchErr  error
+	preLaunches   []string
+	transitionErr error
+	reportErr     error
 }
 
 type fakeWorldObserver struct {
@@ -69,12 +57,12 @@ func (s *admissionSource) Release(_ context.Context, item source.WorkItem) error
 func (s *admissionSource) Transition(_ context.Context, _ source.WorkItem, state source.State) error {
 	s.transitions = append(s.transitions, state)
 	s.events = append(s.events, "transition:"+string(state))
-	return nil
+	return s.transitionErr
 }
 func (s *admissionSource) Report(_ context.Context, _ source.WorkItem, lifecycle source.Lifecycle) error {
 	s.reports = append(s.reports, lifecycle)
 	s.events = append(s.events, "report:"+string(lifecycle.Result))
-	return nil
+	return s.reportErr
 }
 func (s *admissionSource) PreLaunch(_ context.Context, item source.WorkItem) error {
 	s.preLaunches = append(s.preLaunches, item.ID)
@@ -991,24 +979,28 @@ func TestTerminalLifecycleReportsToSource(t *testing.T) {
 }
 
 // TestTerminalLifecycleReportRetryReusesIdempotencyKey checks the retry-safe
-// ordering: the lifecycle report precedes the status patch, so a failed patch
-// leaves the phase unchanged and the next reconcile re-reports the same
-// lifecycle carrying the same idempotency key for the source to deduplicate.
+// ordering: the terminal phase is written before the lifecycle report, so a
+// failed report leaves the run in its terminal phase and the next reconcile
+// re-reports the same lifecycle carrying the same idempotency key for the
+// source to deduplicate.
 func TestTerminalLifecycleReportRetryReusesIdempotencyKey(t *testing.T) {
-	item := &admissionSource{}
+	item := &admissionSource{reportErr: errors.New("report unavailable")}
 	run := admissionRun("run", "local", courierv1alpha1.PhaseVerifying)
 	run.Status.Branch = "courier/acme/widgets/issue-1"
 	client := phaseClient(t, run)
-	writer := &failingStatusWriter{fakeStatusWriter: fakeStatusWriter{client: client}, failures: 1}
 	reconciler := &CoderRunReconciler{
 		Client:       client,
 		Sources:      NewSourceRegistry(map[string]source.Adapter{"test": item}),
-		StatusWriter: writer,
+		StatusWriter: status.KubePatchWriter{Client: client},
 		Observer:     fakeWorldObserver{observation: PRObservation{PR: "42", Checks: []CheckObservation{{State: CheckStateFailed}}}},
 	}
-	if _, err := reconciler.Reconcile(context.Background(), admissionRequest("run")); err == nil {
-		t.Fatal("first Reconcile() error = nil, want status patch failure")
+	if _, err := reconciler.Reconcile(context.Background(), admissionRequest("run")); err != nil {
+		t.Fatalf("first Reconcile() error = %v, want nil (a failed report must not block terminalization)", err)
 	}
+	if len(item.reports) != 1 {
+		t.Fatalf("reports = %#v, want one before the retry", item.reports)
+	}
+	item.reportErr = nil
 	if _, err := reconciler.Reconcile(context.Background(), admissionRequest("run")); err != nil {
 		t.Fatalf("second Reconcile() error = %v", err)
 	}
@@ -1163,3 +1155,178 @@ func coordinatorPod(run *courierv1alpha1.CoderRun, exitCode int32) *corev1.Pod {
 }
 
 const executorRunLabel = "courier.misospace.dev/coderrun"
+
+func TestTransitionSupersededReportCompletesTerminalAndDrops(t *testing.T) {
+	item := &admissionSource{reportErr: fmt.Errorf("%w: generation mismatch", source.ErrSuperseded)}
+	run := admissionRun("run", "local", courierv1alpha1.PhaseRunning)
+	run.Spec.Source = "test"
+	run.Spec.WorkItemID = "opaque-work-item"
+	client := phaseClient(t, run, coordinatorPod(run, 2))
+	reconciler := &CoderRunReconciler{
+		Client:       client,
+		Sources:      NewSourceRegistry(map[string]source.Adapter{"test": item}),
+		StatusWriter: status.KubePatchWriter{Client: client},
+	}
+	if _, err := reconciler.Reconcile(context.Background(), admissionRequest("run")); err != nil {
+		t.Fatalf("Reconcile() error = %v, want nil (a superseded report is dropped, not an error)", err)
+	}
+	var updated courierv1alpha1.CoderRun
+	if err := client.Get(context.Background(), admissionKey("run"), &updated); err != nil {
+		t.Fatalf("get run: %v", err)
+	}
+	if updated.Status.Phase != courierv1alpha1.PhaseNeedsHuman {
+		t.Fatalf("phase = %q, want NeedsHuman (terminal despite the dropped report)", updated.Status.Phase)
+	}
+	cond := apimeta.FindStatusCondition(updated.Status.Conditions, lifecycleReportedCondition)
+	if cond == nil {
+		t.Fatal("LifecycleReported condition = nil, want a condition")
+	}
+	if cond.Status != metav1.ConditionTrue || cond.Reason != "Superseded" {
+		t.Fatalf("LifecycleReported = %s %q, want True Superseded", cond.Status, cond.Reason)
+	}
+}
+
+func TestTransientReportKeepsRunTerminalAndRetriesSeparately(t *testing.T) {
+	item := &admissionSource{reportErr: errors.New("dispatch unavailable")}
+	run := admissionRun("run", "local", courierv1alpha1.PhaseRunning)
+	run.Spec.Source = "test"
+	run.Spec.WorkItemID = "opaque-work-item"
+	client := phaseClient(t, run, coordinatorPod(run, 2))
+	reconciler := &CoderRunReconciler{
+		Client:       client,
+		Sources:      NewSourceRegistry(map[string]source.Adapter{"test": item}),
+		StatusWriter: status.KubePatchWriter{Client: client},
+	}
+	result, err := reconciler.Reconcile(context.Background(), admissionRequest("run"))
+	if err != nil {
+		t.Fatalf("first Reconcile() error = %v, want nil (the phase must not depend on the report)", err)
+	}
+	if result.RequeueAfter <= 0 {
+		t.Fatalf("first RequeueAfter = %v, want a bounded retry delay", result.RequeueAfter)
+	}
+	var updated courierv1alpha1.CoderRun
+	if err := client.Get(context.Background(), admissionKey("run"), &updated); err != nil {
+		t.Fatalf("get run: %v", err)
+	}
+	if updated.Status.Phase != courierv1alpha1.PhaseNeedsHuman {
+		t.Fatalf("phase = %q, want NeedsHuman (terminal immediately)", updated.Status.Phase)
+	}
+	cond := apimeta.FindStatusCondition(updated.Status.Conditions, lifecycleReportedCondition)
+	if cond == nil || cond.Status != metav1.ConditionFalse || cond.Reason != "Pending" {
+		t.Fatalf("LifecycleReported = %#v, want False Pending", cond)
+	}
+	if len(item.reports) != 1 {
+		t.Fatalf("reports = %#v, want exactly one so far", item.reports)
+	}
+	// The source recovers: a later reconcile retries only the report.
+	item.reportErr = nil
+	result, err = reconciler.Reconcile(context.Background(), admissionRequest("run"))
+	if err != nil {
+		t.Fatalf("second Reconcile() error = %v", err)
+	}
+	if result.RequeueAfter != 0 || result.Requeue {
+		t.Fatalf("second Reconcile() result = %#v, want no requeue once the report is published", result)
+	}
+	if len(item.reports) != 2 {
+		t.Fatalf("reports = %#v, want the retry to add a second report", item.reports)
+	}
+	if err := client.Get(context.Background(), admissionKey("run"), &updated); err != nil {
+		t.Fatalf("get run: %v", err)
+	}
+	cond = apimeta.FindStatusCondition(updated.Status.Conditions, lifecycleReportedCondition)
+	if cond == nil || cond.Status != metav1.ConditionTrue || cond.Reason != "Published" {
+		t.Fatalf("LifecycleReported = %#v, want True Published", cond)
+	}
+}
+
+// TestTransientTransitionKeepsRunTerminalAndRetriesReport proves phase-first
+// holds when the source transition itself fails: the terminal phase and a
+// durable pending marker are persisted together, the report is never attempted
+// behind the failed transition, and a later reconcile retries it once the
+// source recovers.
+func TestTransientTransitionKeepsRunTerminalAndRetriesReport(t *testing.T) {
+	item := &admissionSource{transitionErr: errors.New("source unavailable")}
+	run := admissionRun("run", "local", courierv1alpha1.PhaseRunning)
+	run.Spec.Source = "test"
+	run.Spec.WorkItemID = "opaque-work-item"
+	client := phaseClient(t, run, coordinatorPod(run, 2))
+	reconciler := &CoderRunReconciler{
+		Client:       client,
+		Sources:      NewSourceRegistry(map[string]source.Adapter{"test": item}),
+		StatusWriter: status.KubePatchWriter{Client: client},
+	}
+	result, err := reconciler.Reconcile(context.Background(), admissionRequest("run"))
+	if err != nil {
+		t.Fatalf("first Reconcile() error = %v, want nil (the phase must not depend on the source transition)", err)
+	}
+	if result.RequeueAfter <= 0 {
+		t.Fatalf("first RequeueAfter = %v, want a bounded retry delay", result.RequeueAfter)
+	}
+	var updated courierv1alpha1.CoderRun
+	if err := client.Get(context.Background(), admissionKey("run"), &updated); err != nil {
+		t.Fatalf("get run: %v", err)
+	}
+	if updated.Status.Phase != courierv1alpha1.PhaseNeedsHuman {
+		t.Fatalf("phase = %q, want NeedsHuman (terminal immediately)", updated.Status.Phase)
+	}
+	cond := apimeta.FindStatusCondition(updated.Status.Conditions, lifecycleReportedCondition)
+	if cond == nil || cond.Status != metav1.ConditionFalse || cond.Reason != "Pending" {
+		t.Fatalf("LifecycleReported = %#v, want False Pending", cond)
+	}
+	if len(item.reports) != 0 {
+		t.Fatalf("reports = %#v, want none: a failed transition must not attempt the report", item.reports)
+	}
+	// The source recovers: a later reconcile retries the report.
+	item.transitionErr = nil
+	result, err = reconciler.Reconcile(context.Background(), admissionRequest("run"))
+	if err != nil {
+		t.Fatalf("second Reconcile() error = %v", err)
+	}
+	if result.RequeueAfter != 0 || result.Requeue {
+		t.Fatalf("second Reconcile() result = %#v, want no requeue once the report is published", result)
+	}
+	if len(item.reports) != 1 {
+		t.Fatalf("reports = %#v, want the retry to publish the report", item.reports)
+	}
+	if err := client.Get(context.Background(), admissionKey("run"), &updated); err != nil {
+		t.Fatalf("get run: %v", err)
+	}
+	cond = apimeta.FindStatusCondition(updated.Status.Conditions, lifecycleReportedCondition)
+	if cond == nil || cond.Status != metav1.ConditionTrue || cond.Reason != "Published" {
+		t.Fatalf("LifecycleReported = %#v, want True Published", cond)
+	}
+}
+
+func TestSupersededReportFreesLaneForNextRun(t *testing.T) {
+	item := &admissionSource{reportErr: fmt.Errorf("%w: generation mismatch", source.ErrSuperseded)}
+	stuck := admissionRun("stuck", "local", courierv1alpha1.PhaseRunning)
+	next := admissionRun("next", "local", courierv1alpha1.PhasePending)
+	next.Spec.Source = "test"
+	next.Spec.WorkItemID = "next"
+	client := phaseClient(t, admissionLane("local", 1), stuck, next, coordinatorPod(stuck, 2))
+	reconciler := &CoderRunReconciler{
+		Client:       client,
+		Sources:      NewSourceRegistry(map[string]source.Adapter{"test": item}),
+		StatusWriter: status.KubePatchWriter{Client: client},
+	}
+	if _, err := reconciler.Reconcile(context.Background(), admissionRequest("stuck")); err != nil {
+		t.Fatalf("Reconcile(stuck) error = %v", err)
+	}
+	var updatedStuck courierv1alpha1.CoderRun
+	if err := client.Get(context.Background(), admissionKey("stuck"), &updatedStuck); err != nil {
+		t.Fatalf("get stuck run: %v", err)
+	}
+	if updatedStuck.Status.Phase != courierv1alpha1.PhaseNeedsHuman {
+		t.Fatalf("stuck phase = %q, want NeedsHuman", updatedStuck.Status.Phase)
+	}
+	if _, err := reconciler.Reconcile(context.Background(), admissionRequest("next")); err != nil {
+		t.Fatalf("Reconcile(next) error = %v", err)
+	}
+	var updatedNext courierv1alpha1.CoderRun
+	if err := client.Get(context.Background(), admissionKey("next"), &updatedNext); err != nil {
+		t.Fatalf("get next run: %v", err)
+	}
+	if updatedNext.Status.Phase != courierv1alpha1.PhaseClaimed {
+		t.Fatalf("next phase = %q, want Claimed (a dropped report must not hold the lane)", updatedNext.Status.Phase)
+	}
+}

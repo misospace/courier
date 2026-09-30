@@ -9,6 +9,8 @@ import (
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
+	apimeta "k8s.io/apimachinery/pkg/api/meta"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -24,9 +26,14 @@ import (
 // capacityRequeueDelay bounds how long a Pending run can wait behind a full
 // lane before checking again.
 const (
-	capacityRequeueDelay    = 15 * time.Second
-	observationRequeueDelay = 5 * time.Second
+	capacityRequeueDelay        = 15 * time.Second
+	observationRequeueDelay     = 5 * time.Second
+	lifecycleReportRequeueDelay = 30 * time.Second
 )
+
+// lifecycleReportedCondition tracks whether a terminal run's source lifecycle
+// report has been published; a False status means a later reconcile retries it.
+const lifecycleReportedCondition = "LifecycleReported"
 
 // CoderRunReconciler reconciles a CoderRun object.
 type CoderRunReconciler struct {
@@ -110,8 +117,13 @@ func (r *CoderRunReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 	}
 	// Status is initially empty on a newly-created CoderRun. Treat that zero
 	// value as Pending so a source does not need a second status write before
-	// admission can begin. Other terminal phases are left unchanged.
+	// admission can begin. A terminal run normally does nothing, except when its
+	// lifecycle report is still pending: then the report alone is retried, since
+	// the run already reached its phase and freed capacity.
 	if run.Status.Phase != "" && run.Status.Phase != courierv1alpha1.PhasePending {
+		if lifecycleReportPending(&run) {
+			return r.retryTerminalLifecycle(ctx, &run)
+		}
 		l.V(1).Info("reconcile", "phase", run.Status.Phase)
 		return ctrl.Result{}, nil
 	}
@@ -164,7 +176,7 @@ func (r *CoderRunReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 	head, err := resolveRunBranch(ctx, &run, r.PRHeadResolver)
 	if err != nil {
 		if errors.Is(err, ErrHeadRepositoryGone) {
-			return ctrl.Result{}, r.terminateMissingHead(ctx, &run, err)
+			return r.terminateMissingHead(ctx, &run, err)
 		}
 		return ctrl.Result{}, r.releaseClaim(ctx, &run, adapter, item, err)
 	}
@@ -222,7 +234,7 @@ func (r *CoderRunReconciler) resumeClaimed(ctx context.Context, run *courierv1al
 		head, err := resolveRunBranch(ctx, run, r.PRHeadResolver)
 		if err != nil {
 			if errors.Is(err, ErrHeadRepositoryGone) {
-				return ctrl.Result{}, r.terminateMissingHead(ctx, run, err)
+				return r.terminateMissingHead(ctx, run, err)
 			}
 			return ctrl.Result{}, r.releaseClaim(ctx, run, adapter, item, err)
 		}
@@ -341,19 +353,19 @@ func (r *CoderRunReconciler) releaseClaim(ctx context.Context, run *courierv1alp
 // terminalizes NeedsHuman rather than cycling claim and release on every
 // reconcile. The cause is handled here, so it is logged and not returned as a
 // reconcile error.
-func (r *CoderRunReconciler) terminateMissingHead(ctx context.Context, run *courierv1alpha1.CoderRun, cause error) error {
+func (r *CoderRunReconciler) terminateMissingHead(ctx context.Context, run *courierv1alpha1.CoderRun, cause error) (ctrl.Result, error) {
 	log.FromContext(ctx).Info("terminating fix-pr run: pull request head repository is missing",
 		"run", run.Name, "branch", run.Status.Branch, "cause", cause.Error())
 	adapter, item, err := r.adapterAndWorkItem(run)
 	if err != nil {
-		return err
+		return ctrl.Result{}, err
 	}
 	releaseErr := adapter.Release(ctx, item)
 	run.Status.Branch = ""
 	run.Status.HeadRepo = ""
 	run.Status.HeadSHA = ""
-	_, terminalErr := r.transitionTerminal(ctx, run, courierv1alpha1.PhaseNeedsHuman, "", false)
-	return errors.Join(releaseErr, terminalErr)
+	terminalResult, terminalErr := r.transitionTerminal(ctx, run, courierv1alpha1.PhaseNeedsHuman, "", false)
+	return terminalResult, errors.Join(releaseErr, terminalErr)
 }
 
 // resolveCompleted closes the source work for a Done run and then applies the
@@ -496,31 +508,21 @@ func (r *CoderRunReconciler) transitionTerminal(ctx context.Context, run *courie
 	if err != nil {
 		return ctrl.Result{}, err
 	}
-	var state source.State
-	switch phase {
-	case courierv1alpha1.PhaseAwaitingReview:
-		state = source.StateInReview
-	case courierv1alpha1.PhaseNeedsHuman, courierv1alpha1.PhaseFailed:
-		state = source.StateNeedsHuman
-	}
-	if state != "" {
-		if err := adapter.Transition(ctx, item, state); err != nil {
-			return ctrl.Result{}, err
-		}
-	}
-	before := run.DeepCopy()
 	phaseChanged := run.Status.Phase != phase
+	before := run.DeepCopy()
 	run.Status.Phase = phase
 	if pr != "" {
 		run.Status.PR = pr
 	}
 	if phaseChanged {
-		lifecycle := lifecycleForPhase(phase, state, run.Status.PR, wakeReviewer)
-		lifecycle.IdempotencyKey = lifecycleIdempotencyKey(run, phase)
-		if err := reportLifecycle(ctx, adapter, item, lifecycle); err != nil {
-			return ctrl.Result{}, err
-		}
+		// Record a durable pending marker with the phase itself, so a crash or a
+		// failed report patch after this point still retries the report instead of
+		// silently abandoning it. publishTerminalLifecycle flips it when done.
+		r.setLifecycleReport(run, false, "Pending", "")
 	}
+	// Write the terminal phase first so the run stops holding lane capacity
+	// regardless of whether the source lifecycle report below succeeds. The
+	// run's own terminalization must never depend on the source.
 	if run.Status.Phase != before.Status.Phase || run.Status.PR != before.Status.PR {
 		if err := r.patchStatus(ctx, before, run); err != nil {
 			return ctrl.Result{}, err
@@ -529,7 +531,113 @@ func (r *CoderRunReconciler) transitionTerminal(ctx context.Context, run *courie
 	if run.Status.Phase != before.Status.Phase {
 		r.emitPhaseTransition(run, phase, map[string]any{"branch": run.Status.Branch, "pr": run.Status.PR})
 	}
-	return ctrl.Result{}, nil
+	if !phaseChanged {
+		// Already in this terminal phase; the lifecycle was published (or
+		// dropped) on the reconcile that entered it.
+		return ctrl.Result{}, nil
+	}
+	return r.publishTerminalLifecycle(ctx, run, adapter, item, phase, wakeReviewer)
+}
+
+// publishTerminalLifecycle reports the terminal lifecycle to the source and
+// records the outcome on the run's LifecycleReported condition. The run is
+// already in its terminal phase, so no outcome here blocks terminalization.
+// A superseded rejection means this attempt was replaced by a newer generation
+// of the same work: the report is dropped, not retried. A transient failure
+// leaves a pending report that a later reconcile retries; the source's
+// idempotency key makes the retry safe. A permanent failure retries at the
+// bounded interval, mirroring how waiting-for-capacity requeues work — the run
+// itself is never held by the report.
+func (r *CoderRunReconciler) publishTerminalLifecycle(ctx context.Context, run *courierv1alpha1.CoderRun, adapter source.Adapter, item source.WorkItem, phase courierv1alpha1.Phase, wakeReviewer bool) (ctrl.Result, error) {
+	err := r.publishSourceLifecycle(ctx, run, adapter, item, phase, wakeReviewer)
+	switch {
+	case err == nil:
+		return ctrl.Result{}, r.markLifecycleReported(ctx, run, true, "Published", "")
+	case errors.Is(err, source.ErrSuperseded):
+		log.FromContext(ctx).Info("dropping superseded source lifecycle report",
+			"run", run.Name, "phase", phase, "error", err.Error())
+		return ctrl.Result{}, r.markLifecycleReported(ctx, run, true, "Superseded", err.Error())
+	default:
+		log.FromContext(ctx).Info("terminal lifecycle report failed; will retry",
+			"run", run.Name, "phase", phase, "error", err.Error())
+		return ctrl.Result{RequeueAfter: lifecycleReportRequeueDelay}, r.markLifecycleReported(ctx, run, false, "Pending", err.Error())
+	}
+}
+
+func (r *CoderRunReconciler) publishSourceLifecycle(ctx context.Context, run *courierv1alpha1.CoderRun, adapter source.Adapter, item source.WorkItem, phase courierv1alpha1.Phase, wakeReviewer bool) error {
+	state := stateForTerminalPhase(phase)
+	if state != "" {
+		if err := adapter.Transition(ctx, item, state); err != nil {
+			return err
+		}
+	}
+	lifecycle := lifecycleForPhase(phase, state, run.Status.PR, wakeReviewer)
+	lifecycle.IdempotencyKey = lifecycleIdempotencyKey(run, phase)
+	return reportLifecycle(ctx, adapter, item, lifecycle)
+}
+
+// stateForTerminalPhase is the source state published for a terminal phase.
+// Only phases reached through transitionTerminal carry a state; everything else
+// publishes none.
+func stateForTerminalPhase(phase courierv1alpha1.Phase) source.State {
+	switch phase {
+	case courierv1alpha1.PhaseAwaitingReview:
+		return source.StateInReview
+	case courierv1alpha1.PhaseNeedsHuman, courierv1alpha1.PhaseFailed:
+		return source.StateNeedsHuman
+	default:
+		return ""
+	}
+}
+
+// setLifecycleReport records the terminal lifecycle-report condition on the run
+// in memory; callers persist it through patchStatus. The operator is the only
+// writer of a run's conditions.
+func (r *CoderRunReconciler) setLifecycleReport(run *courierv1alpha1.CoderRun, published bool, reason, message string) {
+	statusValue := metav1.ConditionTrue
+	if !published {
+		statusValue = metav1.ConditionFalse
+	}
+	apimeta.SetStatusCondition(&run.Status.Conditions, metav1.Condition{
+		Type:               lifecycleReportedCondition,
+		Status:             statusValue,
+		Reason:             reason,
+		Message:            message,
+		LastTransitionTime: metav1.NewTime(r.clock()),
+	})
+}
+
+// markLifecycleReported records whether the terminal lifecycle report for the
+// run's current phase has been published. Published means done or intentionally
+// dropped (superseded); False means a later reconcile must retry it.
+func (r *CoderRunReconciler) markLifecycleReported(ctx context.Context, run *courierv1alpha1.CoderRun, published bool, reason, message string) error {
+	before := run.DeepCopy()
+	r.setLifecycleReport(run, published, reason, message)
+	return r.patchStatus(ctx, before, run)
+}
+
+// lifecycleReportPending reports a terminal run whose lifecycle report has not
+// yet been published and must be retried. Runs that reached a terminal phase
+// through another path, or that predate this condition, are not pending.
+func lifecycleReportPending(run *courierv1alpha1.CoderRun) bool {
+	switch run.Status.Phase {
+	case courierv1alpha1.PhaseAwaitingReview, courierv1alpha1.PhaseNeedsHuman, courierv1alpha1.PhaseFailed:
+	default:
+		return false
+	}
+	cond := apimeta.FindStatusCondition(run.Status.Conditions, lifecycleReportedCondition)
+	return cond != nil && cond.Status == metav1.ConditionFalse
+}
+
+// retryTerminalLifecycle re-attempts a terminal run's pending source report on
+// a later reconcile. The phase is already durable, so this only ever touches the
+// report and its condition.
+func (r *CoderRunReconciler) retryTerminalLifecycle(ctx context.Context, run *courierv1alpha1.CoderRun) (ctrl.Result, error) {
+	adapter, item, err := r.adapterAndWorkItem(run)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+	return r.publishTerminalLifecycle(ctx, run, adapter, item, run.Status.Phase, false)
 }
 
 // lifecycleIdempotencyKey derives the publication identity from the run's
@@ -552,10 +660,9 @@ func reportLifecycle(ctx context.Context, adapter source.Adapter, item source.Wo
 	return reporter.Report(ctx, item, lifecycle)
 }
 
-// lifecycleForPhase maps a terminal phase to the source lifecycle report it
-// publishes. wakeReviewer marks the no_change_needed ending on a queue-backed
-// item: the blocked report settles the attempt and wakes the reviewer instead
-// of parking the item for a human.
+// lifecycleForPhase maps a terminal phase to its source lifecycle report.
+// wakeReviewer marks the no_change_needed fix-pr ending so Dispatch does not
+// redundantly park a queue item already settled by the blocked report.
 func lifecycleForPhase(phase courierv1alpha1.Phase, state source.State, pr string, wakeReviewer bool) source.Lifecycle {
 	lifecycle := source.Lifecycle{State: state, PR: pr}
 	switch phase {
@@ -608,6 +715,9 @@ func (r *CoderRunReconciler) patchStatus(ctx context.Context, before, after *cou
 		restarts := after.Status.Restarts
 		fields.Restarts = &restarts
 	}
+	if !reflect.DeepEqual(before.Status.Conditions, after.Status.Conditions) {
+		fields.Conditions = after.Status.Conditions
+	}
 	if reflect.DeepEqual(fields, status.OperatorPatch{}) {
 		return nil
 	}
@@ -643,19 +753,12 @@ func coordinatorExitCode(pod *corev1.Pod) (int32, bool) {
 	return 0, false
 }
 
-// exitDeclaredNoChange is the executor's exit for a verified no_change_needed
-// declaration (#169); it mirrors exitNoChangeNeeded in cmd/courier-executor,
-// with DESIGN.md's reconcile exit contract as the authority.
+// exitDeclaredNoChange is the executor's verified no_change_needed exit.
 const exitDeclaredNoChange = 3
 
-// phaseForExit maps the coordinator's exit code to the run's next phase. 0
-// sends the run to Verifying; 2 means the coordinator needs a human; 3 is the
-// declared no_change_needed outcome (#169): it never resolves the source
-// directly — a resolve-issue run lands in AwaitingReview so a human reviews
-// the posted evidence, a fix-pr run lands in NeedsHuman with a
-// wake-reviewer blocked report that settles the PR-fix attempt for re-review,
-// until Dispatch accepts an explicit already-addressed settlement
-// (misospace/dispatch#1121). Any other code is a failure.
+// phaseForExit maps the executor's exit code to the run's next phase. A
+// no-change declaration is reviewable in resolve-issue mode; fix-pr remains
+// NeedsHuman until Dispatch supports an explicit already-addressed settlement.
 func phaseForExit(mode courierv1alpha1.Mode, exitCode int32) courierv1alpha1.Phase {
 	switch exitCode {
 	case 0:

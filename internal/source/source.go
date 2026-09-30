@@ -11,6 +11,11 @@ import (
 // ErrStaleWork indicates that claimed source work no longer needs a coordinator.
 var ErrStaleWork = errors.New("source: work item is stale")
 
+// ErrSuperseded indicates that this attempt was superseded by a newer
+// generation of the same source work. A lifecycle report carrying it must be
+// dropped rather than retried: the newer generation belongs to another run.
+var ErrSuperseded = errors.New("source: work item superseded")
+
 // WorkItem identifies work in a source. ID is intentionally opaque: sources
 // are free to choose their identifier format, and the core must not know about
 // a source's queue or API types.

@@ -142,9 +142,7 @@ Goals stay short — a goal plus tools — but each carries one non-negotiable
 contract: delegation covers bounded work, never the coordinator's ownership
 of completion and forge publication. The publication hint names the run branch
 as the single place work may land; it informs rather than constrains (a cheap
-nudge, enforced only at exit, below). Each goal also names the outcome
-declaration: the coordinator declares how the run ended, and the run's ending
-is classified from that declaration rather than inferred from git state.
+nudge, enforced only at exit, below).
 
 ### Terminal states
 
@@ -155,37 +153,8 @@ A run ends at exactly one of:
   no merge capability; merging is an explicit human-maintainer action, or an
   auto-merge a maintainer enabled (see
   [docs/repository-settings.md](./docs/repository-settings.md)).
-- **needs-human** → the coordinator asked for a decision (see below), or the
-  operator (on crashloop) could not reach a healthy state and labels the
-  PR/issue for a human.
-
-The coordinator declares its ending by writing `.courier/outcome.json` in the
-workspace, and the executor classifies from that declaration verified against
-the world — not from git state, which misread "the work is already done" as a
-human problem (#169):
-
-- **`changes`** — work is committed and pushed; confirmed the old way (commits
-  reachable from the run branch) → **Verifying**.
-- **`no_change_needed`** — nothing to do, with evidence; the executor posts the
-  evidence to the issue/PR and the run never resolves the source on the
-  coordinator's word — a resolve-issue run's source moves to `in-review` for a
-  human to settle, and a fix-pr run ends **NeedsHuman** — its blocked report
-  settles the PR-fix attempt and wakes the reviewer rather than parking the
-  queue item — until Dispatch accepts
-  an explicit `already_addressed` settlement (#1121 companion).
-- **`needs_decision`** — a real design question; the executor posts the
-  question to the issue/PR and the run ends **NeedsHuman**. This is the only
-  NeedsHuman a coordinator declaration can produce; the deterministic
-  bootstrap guards (refusing adoption of a branch whose PRs are closed, an
-  abandoned base-sync merge) may still hand a run to a human, because no
-  coordinator decision was involved.
-- **`blocked_external`** — something outside the run is missing; the run ends
-  **Failed** naming what is missing.
-
-An undeclared zero-exit ending is never NeedsHuman: committed work verified on
-the run branch still stands as **Verifying**, everything else fails as
-incomplete until the continuation loop (#170) resumes the session instead of
-terminalizing.
+- **needs-human** → the coordinator (or the operator, on crashloop) could not
+  reach a healthy state and labels the PR/issue for a human.
 
 Feedback or a merge conflict does not reopen the run. It spawns a **fresh
 `fix-pr` `CoderRun`** (via the source — dispatch's pr-fix queue, or a
@@ -322,10 +291,10 @@ world wins on conflict.
 ### Uncommitted failure work (#109)
 
 The shipped bootstrap keeps its termination handoff in a separate runtime
-`emptyDir`, but does not yet provide OpenCode a permitted scratch directory.
-#114 owns the bounded scratch fix: a per-run mount outside the checkout, temp
-environment and framing, and narrowly verified permissions for the pinned
-OpenCode runtime and delegates. Scratch is disposable, not a checkpoint.
+`emptyDir` and provides the per-run scratch mount outside the checkout with
+narrowly permitted OpenCode access: temp environment and framing, and
+narrowly verified permissions for the pinned OpenCode runtime and delegates
+(#114, shipped). Scratch is disposable, not a checkpoint.
 
 A terminal `NeedsHuman` or `Failed` run may still have uncommitted edits in its
 checkout. Those edits are **not durable**: when the pod is removed, the emptyDir
@@ -334,6 +303,23 @@ and its dirty work disappear. Logs and status are not a recoverable patch.
 evidence before any preservation implementation. Until that mechanism is
 reviewed, do not push incomplete work, persist raw diffs in logs or CR status,
 or treat a fresh retry (#97) as recovery of the old checkout.
+
+### Toolchain reference for bootstrap lanes (#153)
+
+Repository toolchains (Go today) keep their module and build caches on
+writable storage, but the bootstrap contract grants OpenCode no broad home or
+`/tmp` access. The coordinator pod therefore mounts one per-run `emptyDir`
+`toolchain-cache` volume **read-write at `/courier-toolchain-cache`** — where
+the runtime image pins its toolchain caches (`GOMODCACHE`, `GOCACHE`) — and
+**read-only at `/courier-toolchain`**. OpenCode's `external_directory`
+permission allows reads of the scratch mount plus the read-only reference and
+denies edits there; because the reference mount is genuinely read-only, a
+write also fails at the filesystem level. The read-write twin is written only
+by lane-toolchain child processes (e.g. `go mod download`); the model's own
+tool calls that target it stay gated as for any external path, and
+unparsed-bash reachability matches the pre-change baseline (no new hole).
+This is bootstrap ergonomics for the pinned runtime, distinct from the #136
+secure dependency cache.
 
 ### Commit cadence
 
@@ -481,18 +467,12 @@ it modest" with `concurrency: 1`. Same schema, no local assumption baked in.
   populate these fields (#102). Exit `0` transitions to **Verifying** before
   any external observation, releasing the lane capacity — but only when the
   committed work is actually on the run branch: the bootstrap reads the run
-  branch's own ref (not wherever HEAD happens to point), and work that fails
-  this verification ends **Failed** naming where it actually landed, rather
-  than a later operator read of an empty branch as "no work" or a NeedsHuman
-  the coordinator never asked for (#134, reclassified by #169). Exit `2` (a
-  declared `needs_decision`) transitions to **NeedsHuman**; exit `3` (a
-  declared `no_change_needed`) transitions to **AwaitingReview** (source
-  `in-review`) for resolve-issue runs and **NeedsHuman** for fix-pr runs,
-  never resolving the source; the operator reaches **Done** only through the
-  merged-mid-run observation, while a `no_change_needed` ending leaves the
-  source's resolution to the human it escalates to. Any other exit transitions
-  to **Failed**. A pod death or
-  heartbeat stall relaunches/resumes it; a crashloop reaches NeedsHuman.
+  branch's own ref (not wherever HEAD happens to point), and committed work
+  that is not on the run branch transitions to **NeedsHuman** with a specific
+  reason rather than a later operator read of an empty branch as "no work"
+  (#134). Exit `2` transitions to **NeedsHuman**; any other exit transitions to
+  **Failed**. A pod death or heartbeat stall relaunches/resumes it; a crashloop
+  reaches NeedsHuman.
 - **Verifying** — no coordinator pod or liveness meaning. The operator polls
   the external PR and CI world indefinitely, with a reconciliation cadence and
   no deadline. Observer errors remain Verifying and requeue. A missing observer,
@@ -510,15 +490,23 @@ it modest" with `concurrency: 1`. Same schema, no local assumption baked in.
   in-review with the transition. Verifying does not consume LaneProfile
   execution capacity, and the source remains in-progress throughout it.
 - **AwaitingReview** is terminal for this run. Human merges → operator marks
-  **Done** and resolves the source; a `no_change_needed` ending arrives here
-  with no PR, settled by the human reviewing the posted evidence; or
-  feedback/conflict → the source spawns a fresh `fix-pr` run without reusing
-  the previous run. The previous run remains auditable; its completion does
-  not settle later feedback.
+  **Done** and resolves the source; or feedback/conflict → the source spawns a
+  fresh `fix-pr` run without reusing the previous run. The previous run remains
+  auditable; its completion does not settle later feedback.
 - **Reap:** Done runs are deleted (checkpoint dies with the CR). NeedsHuman runs
   are kept for inspection and deleted on request. Zero standing footprint between
   runs — a strict improvement over Foreman's ownerRef-less audit ConfigMaps,
   which require an external sweeper.
+
+**Terminalization writes the run's own phase before it reports to the source.**
+A rejected or failed source report never holds a run in `Running`: the phase is
+written first, which releases lane capacity, and only then is the lifecycle
+report published — on its own, retried via a bounded requeue and deduplicated by
+the run's stable idempotency key. A Dispatch generation-mismatch conflict means
+this attempt was superseded by a newer generation of the same work, so the report
+is dropped rather than retried (the newer generation belongs to another run) and
+the run still terminalizes; a transient report failure leaves the run in its
+terminal phase with the report retried on a later reconcile. (#178)
 
 ## Sources
 
@@ -700,43 +688,21 @@ A running log of architectural decisions and their reasoning, newest first. The
 body above describes the current architecture; this log preserves *why* and what
 was superseded.
 
-- **2026-09-29 — A declared `no_change_needed` no longer settles the source.**
-  A declared `no_change_needed` now posts its evidence to the issue/PR but no
-  longer resolves the source on the coordinator's word. The revision came from
-  two failure shapes: for a followup-pr item a Resolve is a no-op, so the
-  Dispatch item stayed queued and the lane kept re-offering the same task; for
-  an issue a wrong 'already done' silently dropped work with nothing verifying
-  the claim. Interim, a `no_change_needed` ending maps a resolve-issue run to
-  `in-review` with the evidence comment posted, for a human to settle; a
-  fix-pr run ends `NeedsHuman`, its blocked report settling the PR-fix
-  attempt and waking the reviewer rather than parking the queue item, until
-  dispatch#1121 lands an explicit
-  `already_addressed`/`already_done` settlement. Done — and therefore a source
-  resolve — now comes only from the world: the merged-mid-run observation.
-  (#169, review on PR #175)
-- **2026-09-28 — Run endings are classified from a coordinator-declared outcome.**
-  NeedsHuman was inferred from workspace state, so every odd ending escalated:
-  of 65 runs in one deployment's five days, 19 ended NeedsHuman and not one was
-  the coordinator asking for anything — the largest class was simply the
-  coordinator deciding the work was already done. The coordinator now declares
-  its ending in `.courier/outcome.json` — `changes`, `no_change_needed` (with
-  evidence), `needs_decision` (with the question), `blocked_external` (with
-  what is missing) — and the executor classifies from the declaration verified
-  against the world: `changes` still requires commits reachable from the run
-  branch; `no_change_needed` posts the evidence to the issue/PR and exits to
-  **Done** (exit code 3), resolving the source (source settlement revised
-  2026-09-29, above); `needs_decision` posts the question and is the only
-  NeedsHuman a declaration can produce (the deterministic bootstrap guards
-  may still hand a run to a human);
-  `blocked_external` fails naming the missing prerequisite. An undeclared
-  zero-exit ending never terminates NeedsHuman directly — verified commits on
-  the run branch still stand as Verifying, everything else fails as incomplete
-  until #170's continuation loop resumes the session instead. Work committed
-  off the run branch is Failed, not NeedsHuman: the specific reason is the
-  inform, and the operator's world-read still decides what is real. The child's
-  own exit 2 is no longer a human-attention signal (#169; companions #170,
-  #171, #172, and dispatch's `already_addressed` settlement). This supersedes
-  the NeedsHuman reading of the #134 off-branch case.
+- **2026-09-29 — #178: a run's own terminal phase is never gated on a source
+  report.** `transitionTerminal` used to publish the source transition and
+  lifecycle report before writing the phase, so a rejected report kept the run
+  `Running` and holding lane capacity while it retried on backoff. A real case: a
+  `fix-pr` run whose settle was rejected with Dispatch's generation-mismatch 409
+  (the queue item had advanced to a newer attempt) sat `Running` for hours behind
+  a concurrency-1 lane, starving every other run. The reconcile now writes the
+  terminal phase first — capacity frees regardless of the source — then publishes
+  the report on its own, retried via a bounded requeue and deduplicated by the
+  run's idempotency key. A generation mismatch is mapped in the Dispatch adapter
+  to a typed superseded error the controller recognizes and *drops*: the report is
+  a record of the old attempt and the newer generation belongs to another run,
+  matching the #98 settlement contract. A retry cap was deliberately not added —
+  it would be a governor on a harmless idempotent retry, and the run itself is
+  never held. (#178)
 - **2026-09-27 — #122 lands the broker publication primitives.** The broker owns
   the whole publication path: a pinned, non-force git transport to one explicit
   ref, a typed forge observer (never raw forge calls), an authenticated
@@ -753,6 +719,15 @@ was superseded.
   deployment: the per-run pod wiring, credential delivery and isolation
   preflight in #123 are still required before the broker is safe to expose.
   ([HARNESS.md](./HARNESS.md) §4) (#122, #118, #80, #123)
+- **2026-09-27 — Read-only toolchain reference for bootstrap lanes (#153).**
+  OpenCode's `external_directory` permission cannot distinguish a read from a
+  write, so the toolchain's writable cache directory was not allowed wholesale.
+  The coordinator pod mounts the per-run `toolchain-cache` `emptyDir`
+  read-write at `/courier-toolchain-cache` (where runtime images pin
+  `GOMODCACHE`/`GOCACHE`) and again read-only at `/courier-toolchain`, so the
+  reference stays readable while writes are denied at the filesystem level.
+  This is bootstrap ergonomics for the pinned runtime, distinct from the #136
+  secure dependency cache.
 - **2026-09-27 — A lane can be suspended without stopping work in flight.**
   Setting `courier.misospace.dev/suspend: "true"` on a LaneProfile pauses that
   lane: its source runner stops discovering work and the operator stops
