@@ -264,6 +264,7 @@ func (w fakeStatusWriter) PatchStatus(ctx context.Context, name types.Namespaced
 			PR               string                `json:"pr,omitempty"`
 			CheckFingerprint *string               `json:"checkFingerprint,omitempty"`
 			Restarts         *int                  `json:"restarts,omitempty"`
+			Conditions       []metav1.Condition    `json:"conditions,omitempty"`
 		} `json:"status"`
 	}
 	if err := json.Unmarshal(patch, &document); err != nil {
@@ -293,6 +294,9 @@ func (w fakeStatusWriter) PatchStatus(ctx context.Context, name types.Namespaced
 	}
 	if document.Status.Restarts != nil {
 		run.Status.Restarts = *document.Status.Restarts
+	}
+	if document.Status.Conditions != nil {
+		run.Status.Conditions = document.Status.Conditions
 	}
 	return w.client.Status().Update(ctx, &run)
 }

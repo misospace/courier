@@ -427,6 +427,9 @@ func (c *HTTPClient) Report(ctx context.Context, id string, lifecycle source.Lif
 		return c.reportTaskWithPR(ctx, d, outcome, "", lifecycle.PR, lifecycle.IdempotencyKey)
 	case source.ResultBlocked:
 		reportErr := c.reportTaskWithPR(ctx, d, "blocked", lifecycle.Error, lifecycle.PR, lifecycle.IdempotencyKey)
+		if lifecycle.BlockedReportParksPRFix {
+			return reportErr
+		}
 		return errors.Join(reportErr, c.markPRFixBlocked(ctx, d, lifecycle.Error))
 	case source.ResultFailed:
 		reportErr := c.reportTaskWithPR(ctx, d, "failed", lifecycle.Error, lifecycle.PR, lifecycle.IdempotencyKey)

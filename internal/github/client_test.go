@@ -86,6 +86,61 @@ func TestPullRequestOperations(t *testing.T) {
 	}
 }
 
+func TestCreateComment(t *testing.T) {
+	t.Parallel()
+	var method, reqPath, auth string
+	var body map[string]any
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		data, _ := io.ReadAll(r.Body)
+		if len(data) > 0 {
+			if err := json.Unmarshal(data, &body); err != nil {
+				t.Errorf("decode request: %v", err)
+			}
+		}
+		method, reqPath, auth = r.Method, r.URL.Path, r.Header.Get("Authorization")
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"id":9,"body":"looks good"}`)
+	}))
+	defer server.Close()
+
+	client, err := NewClient(server.URL, "secret")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := client.CreateComment(context.Background(), "acme", "demo", 7, "looks good"); err != nil {
+		t.Fatalf("CreateComment: %v", err)
+	}
+	if method != http.MethodPost || reqPath != "/repos/acme/demo/issues/7/comments" {
+		t.Fatalf("request = %s %s, want POST /repos/acme/demo/issues/7/comments", method, reqPath)
+	}
+	if body["body"] != "looks good" {
+		t.Fatalf("body = %#v, want the comment body", body)
+	}
+	if auth != "Bearer secret" {
+		t.Fatalf("authorization = %q, want the client token", auth)
+	}
+}
+
+func TestCreateCommentAPIError(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusForbidden)
+		_, _ = io.WriteString(w, `{"documentation_url":"https://docs.github.com/rest"}`)
+	}))
+	defer server.Close()
+	client, err := NewClient(server.URL, "secret")
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = client.CreateComment(context.Background(), "acme", "demo", 7, "nope")
+	var apiErr *APIError
+	if !errors.As(err, &apiErr) || apiErr.StatusCode != http.StatusForbidden {
+		t.Fatalf("error = %v (%T), want a 403 APIError", err, err)
+	}
+	if !strings.Contains(err.Error(), "403") {
+		t.Fatalf("error = %q, want the status in the message", err)
+	}
+}
+
 func TestReadPullRequestAndChecks(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")

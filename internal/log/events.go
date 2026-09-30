@@ -65,6 +65,14 @@ const (
 	// EventCapabilityStatus reports a bounded preflight of configured MCP
 	// capability availability observed before the coordinator goal runs.
 	EventCapabilityStatus = "capability.status"
+	// EventOutcomeDeclared reports that a valid coordinator outcome
+	// declaration classified the run's ending (#169). The declared kind rides
+	// in the detail.
+	EventOutcomeDeclared = "outcome.declared"
+	// EventOutcomeComment reports the best-effort issue/PR comment a terminal
+	// outcome posts (#169). A failed comment is an error event, never a run
+	// failure.
+	EventOutcomeComment = "outcome.comment"
 )
 
 // Status values for the status field.

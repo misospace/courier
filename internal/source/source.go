@@ -90,6 +90,11 @@ type Lifecycle struct {
 	Result Result
 	PR     string
 	Error  string
+	// BlockedReportParksPRFix suppresses the separate PR-fix queue mark after a
+	// blocked task report. The report itself still parks the item as
+	// BLOCKED/needs-human; this flag does not wake a reviewer. Meaningful only
+	// alongside Result ResultBlocked; adapters without queue semantics ignore it.
+	BlockedReportParksPRFix bool
 	// IdempotencyKey identifies the publication so a source can deduplicate a
 	// retry of the same report. Empty means the source has no deduplication.
 	IdempotencyKey string

@@ -105,10 +105,20 @@ spec:
 ```
 
 The operator derives the resolve branch, creates the coordinator pod, and
-observes its exit. Exit `0` moves the run to `Verifying`, where the operator
-polls the external PR and CI state until it reaches `AwaitingReview` or
-`NeedsHuman`; exit `2` moves it to `NeedsHuman`; any other exit moves it to
-`Failed`.
+observes its exit. The goal gives the coordinator the exact outcome-file path in
+executor-owned per-run scratch outside the checkout. Exit `0` (`changes`) moves
+the run to `Verifying` only after committed work is verified on the run branch;
+the operator then polls the external PR and CI state until it reaches
+`AwaitingReview` or `NeedsHuman`. Exit `2` (`needs_decision` or
+`blocked_external`) moves the run to `NeedsHuman`. Exit `3` (`no_change_needed`)
+moves a resolve-issue run to `AwaitingReview` with the source `in-review`, and a
+fix-pr run to `NeedsHuman`, never settling the source; its blocked lifecycle
+report parks the PR-fix item as `BLOCKED`/needs-human. The evidence, question,
+or missing explanation is posted in full after redaction; only the separate
+termination reason is bounded and redacted. Comment posting is best-effort:
+failures are logged as `outcome.comment` and do not change the ending. Any other
+exit moves it to `Failed`; continuation behavior is future #170 work and is
+outside this mapping.
 
 The OpenCode shim does not survive pod/model restarts with conversational state.
 Git commits and the remote branch are its durable floor until the custom harness
