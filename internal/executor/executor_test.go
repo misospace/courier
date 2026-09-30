@@ -605,8 +605,8 @@ func TestGoalCarriesCoordinatorCompletionContract(t *testing.T) {
 				"never stop at a local commit or branch when a pull request is required",
 				"7",
 				"declaring an outcome",
-				".courier/outcome.json",
-				"Never commit the outcome file",
+				"/var/tmp/courier-scratch/outcome.json",
+				"blocked_external",
 				test.opening,
 			} {
 				if !strings.Contains(goal, fragment) {
@@ -957,6 +957,9 @@ func TestBuildCoordinatorPodProvisionsScratch(t *testing.T) {
 	}
 
 	container := pod.Spec.Containers[0]
+	if container.TerminationMessagePath != runtimePath+"/termination" || container.TerminationMessagePolicy != corev1.TerminationMessageReadFile {
+		t.Fatalf("termination handoff = path %q policy %q, want %q with ReadFile", container.TerminationMessagePath, container.TerminationMessagePolicy, runtimePath+"/termination")
+	}
 
 	foundScratchMount := false
 	for _, mount := range container.VolumeMounts {

@@ -748,14 +748,25 @@ Use idempotent retries and reconciliation.
 
 ## 8. Failure classification
 
-The operator's current mapping is: exit `0` → `Verifying` (the operator then
-verifies the world — the PR exists and checks are observed — before the run is
-done), exit `2` → `NeedsHuman`, exit `3` (a declared `no_change_needed`) →
-`AwaitingReview` (source `in-review`) for resolve-issue runs and `NeedsHuman`
-for fix-pr runs, never settling the source, any other nonzero exit → `Failed`
-(DESIGN.md's exit contract is the shared authority for this mapping). The
-native harness's structured result carries the declared outcome, and its
-process exit reflects it: 0 changes, 2 needs_decision, 3 no_change_needed.
+The coordinator declares its outcome in the exact file path supplied in its
+goal. That file lives in executor-owned per-run scratch outside the target
+worktree; it is control metadata, not a repository file. The executor validates
+the declaration against the world before terminalizing: exit `0` (`changes`)
+reaches `Verifying` only when commits are reachable from the run branch; exit
+`2` (`needs_decision` or `blocked_external`) reaches `NeedsHuman`; exit `3`
+(`no_change_needed`) reaches `AwaitingReview` with source `in-review` for
+resolve-issue runs and `NeedsHuman` for fix-pr runs; every other exit is
+`Failed` under the current contract. Continuation behavior is future #170 work
+and is separate from this exit mapping. A `no_change_needed` result never
+resolves the source. For fix-pr, its blocked lifecycle report parks the PR-fix
+item as `BLOCKED`/needs-human; `BlockedReportParksPRFix` skips only the redundant
+queue-mark call and does not wake a reviewer or request another review.
+
+Outcome comments carry the full declared evidence, question, or missing
+explanation after redaction. They are not shortened to the termination reason;
+that separate reason is bounded and redacted before publication. Comment posting
+is best-effort: failures are logged as `outcome.comment` and do not change the
+run ending.
 
 The native harness adds an explicit result contract on top of the exit code:
 a structured terminal result (outcome + reason) written by trusted control

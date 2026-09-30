@@ -142,7 +142,11 @@ Goals stay short — a goal plus tools — but each carries one non-negotiable
 contract: delegation covers bounded work, never the coordinator's ownership
 of completion and forge publication. The publication hint names the run branch
 as the single place work may land; it informs rather than constrains (a cheap
-nudge, enforced only at exit, below).
+nudge, enforced only at exit, below). Each goal also names the exact outcome
+file path under executor-owned, per-run scratch outside the target worktree.
+The coordinator writes its declaration there; it is control metadata, not a
+repository file. This avoids stale declarations without wiping `.courier` or
+manipulating the git index. Scratch is disposable, not a checkpoint.
 
 ### Terminal states
 
@@ -153,8 +157,43 @@ A run ends at exactly one of:
   no merge capability; merging is an explicit human-maintainer action, or an
   auto-merge a maintainer enabled (see
   [docs/repository-settings.md](./docs/repository-settings.md)).
-- **needs-human** → the coordinator (or the operator, on crashloop) could not
-  reach a healthy state and labels the PR/issue for a human.
+- **needs-human** → a declared decision or external block, or an operator
+  condition such as a crashloop, requires a human. Coordinator-declared blocks
+  include a redacted issue/PR comment and a blocked source report.
+
+The coordinator declares its ending in the executor-provided outcome file,
+whose exact path is in the goal. The executor validates the declaration against
+the world: git state remains authoritative for whether declared changes exist
+on the run branch; the declaration never substitutes for that check (#169):
+
+- **`changes`** — work is committed and pushed; verified commits reachable from
+  the run branch → exit `0`, **Verifying**. Work committed only elsewhere is not
+  run success.
+- **`no_change_needed`** — nothing to do, with evidence. The executor posts the
+  complete evidence as a redacted issue/PR comment, then exits `3`: a
+  resolve-issue run ends in **AwaitingReview** and moves the source to
+  `in-review` for a human to settle; a fix-pr run ends **NeedsHuman** and sends
+  a blocked lifecycle report. That report parks the PR-fix item as
+  `BLOCKED`/needs-human. Its `BlockedReportParksPRFix` flag suppresses only the
+  redundant follow-up queue mark; it does not wake a reviewer or request
+  another review. Neither mode resolves the source on the coordinator's word.
+- **`needs_decision`** — a real decision the coordinator cannot make. The
+  executor posts the complete question as a redacted issue/PR comment and exits
+  `2` to **NeedsHuman** with a blocked source report.
+- **`blocked_external`** — an external prerequisite is missing. The executor
+  posts the complete `missing` explanation as a redacted issue/PR comment and
+  exits `2` to **NeedsHuman** with a blocked source report. This is not a
+  retryable **Failed** run.
+
+Comments preserve the full declared evidence, question, or missing explanation
+after redaction; they are not shortened to the termination reason. Comment
+posting is best-effort: failures are logged as `outcome.comment` and do not change
+the run ending. The separate termination reason is bounded and redacted before it
+is published. An
+undeclared ending is not interpreted as a human request: verified commits on
+the run branch may still proceed to **Verifying**; otherwise the ending is
+incomplete and fails under the current contract. Continuation behavior is
+future #170 work and is separate from this exit mapping.
 
 Feedback or a merge conflict does not reopen the run. It spawns a **fresh
 `fix-pr` `CoderRun`** (via the source — dispatch's pr-fix queue, or a
@@ -464,15 +503,14 @@ it modest" with `concurrency: 1`. Same schema, no local assumption baked in.
   real base rather than the fork's possibly stale base branch. The target
   harness commits per brief and
   writes heartbeat and checkpoint to status; the legacy bootstrap does not
-  populate these fields (#102). Exit `0` transitions to **Verifying** before
-  any external observation, releasing the lane capacity — but only when the
-  committed work is actually on the run branch: the bootstrap reads the run
-  branch's own ref (not wherever HEAD happens to point), and committed work
-  that is not on the run branch transitions to **NeedsHuman** with a specific
-  reason rather than a later operator read of an empty branch as "no work"
-  (#134). Exit `2` transitions to **NeedsHuman**; any other exit transitions to
-  **Failed**. A pod death or heartbeat stall relaunches/resumes it; a crashloop
-  reaches NeedsHuman.
+  populate these fields (#102). The executor classifies its declaration against
+  the world before the run terminalizes: exit `0` (`changes`) reaches
+  **Verifying** only when committed work is reachable from the run branch, and
+  work committed elsewhere is not success; exit `2` (`needs_decision` or
+  `blocked_external`) reaches **NeedsHuman**; exit `3` (`no_change_needed`)
+  reaches **AwaitingReview** for resolve-issue and **NeedsHuman** for fix-pr.
+  Other failure exits reach **Failed**. A pod death or heartbeat stall
+  relaunches/resumes it; a crashloop reaches NeedsHuman.
 - **Verifying** — no coordinator pod or liveness meaning. The operator polls
   the external PR and CI world indefinitely, with a reconciliation cadence and
   no deadline. Observer errors remain Verifying and requeue. A missing observer,
@@ -489,10 +527,12 @@ it modest" with `concurrency: 1`. Same schema, no local assumption baked in.
   it the same way. A partial snapshot cannot pass. The source becomes
   in-review with the transition. Verifying does not consume LaneProfile
   execution capacity, and the source remains in-progress throughout it.
-- **AwaitingReview** is terminal for this run. Human merges → operator marks
-  **Done** and resolves the source; or feedback/conflict → the source spawns a
-  fresh `fix-pr` run without reusing the previous run. The previous run remains
-  auditable; its completion does not settle later feedback.
+- **AwaitingReview** is terminal for this run. For a PR, human merges → operator
+  marks **Done** and resolves the source; feedback/conflict → the source spawns a
+  fresh `fix-pr` run without reusing the previous run. A `no_change_needed`
+  resolve-issue run also waits here with its evidence posted for human review;
+  Courier does not resolve that source from the coordinator's declaration. The
+  previous run remains auditable; its completion does not settle later feedback.
 - **Reap:** Done runs are deleted (checkpoint dies with the CR). NeedsHuman runs
   are kept for inspection and deleted on request. Zero standing footprint between
   runs — a strict improvement over Foreman's ownerRef-less audit ConfigMaps,
@@ -688,6 +728,26 @@ A running log of architectural decisions and their reasoning, newest first. The
 body above describes the current architecture; this log preserves *why* and what
 was superseded.
 
+- **2026-09-30 — #169/#175: declare outcomes outside the worktree; never settle
+  from a declaration alone.** #169 replaced inference of coordinator intent from
+  workspace state with explicit `changes`, `no_change_needed`, `needs_decision`,
+  and `blocked_external` declarations, checked against the world. Review on #175
+  corrected the handoff boundary: the exact per-run outcome file is under
+  executor-owned scratch outside the target worktree, so stale declarations are
+  avoided without deleting `.courier` or manipulating the git index. `changes`
+  still requires commits reachable from the run branch. `no_change_needed` posts
+  its complete redacted evidence and exits `3`: resolve-issue waits in
+  `AwaitingReview`/`in-review`, while fix-pr ends `NeedsHuman`; the blocked report
+  itself parks the PR-fix item as `BLOCKED`/needs-human, and
+  `BlockedReportParksPRFix` skips only the redundant queue-mark call — it does not wake
+  a reviewer. Neither outcome resolves the source. `needs_decision` and
+  `blocked_external` post the complete redacted question or missing explanation
+  and exit `2` to `NeedsHuman` with a blocked report. Only the distinct
+  termination reason is bounded before publication. The controller carries the
+  bounded blocked-external reason into the source lifecycle report and preserves
+  it across durable report retries. The earlier #169 contract
+  resolved `no_change_needed` and treated `blocked_external` as retryable
+  `Failed`; both are superseded. (#169, #175)
 - **2026-09-29 — #178: a run's own terminal phase is never gated on a source
   report.** `transitionTerminal` used to publish the source transition and
   lifecycle report before writing the phase, so a rejected report kept the run

@@ -22,6 +22,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/misospace/courier/internal/executor"
 	"github.com/misospace/courier/internal/git"
@@ -35,35 +36,40 @@ const (
 	exitNeedsHuman = 2
 	// The operator decodes this exit in phaseForExit (internal/controller);
 	// DESIGN.md's exit contract is the authority.
-	exitNoChangeNeeded = 3
-	defaultBase        = "main"
-	defaultWork        = "/workspace"
-	defaultFormat      = "json"
+	exitNoChangeNeeded          = 3
+	defaultBase                 = "main"
+	defaultWork                 = "/workspace"
+	defaultScratchDirectory     = "/var/tmp/courier-scratch"
+	defaultOutcomeFilename      = "outcome.json"
+	maxTerminationReasonBytes   = 1024
+	terminationTruncationSuffix = "... [truncated]"
+	defaultFormat               = "json"
 )
 
 type config struct {
-	RemoteURL       string
-	BaseRemoteURL   string
-	Directory       string
-	Base            string
-	Branch          string
-	Repo            string
-	HeadRepo        string
-	HeadSHA         string
-	Mode            string
-	RunID           string
-	Ref             int
-	Goal            string
-	Model           string
-	Framing         string
-	GitHubAPIBase   string
-	OpenCodeBinary  string
-	OpenCodeFormat  string
-	OpenCodeAgent   string
-	TerminationFile string
-	GitUsername     string
-	GitToken        string
-	GitHubToken     string
+	RemoteURL        string
+	BaseRemoteURL    string
+	Directory        string
+	ScratchDirectory string
+	Base             string
+	Branch           string
+	Repo             string
+	HeadRepo         string
+	HeadSHA          string
+	Mode             string
+	RunID            string
+	Ref              int
+	Goal             string
+	Model            string
+	Framing          string
+	GitHubAPIBase    string
+	OpenCodeBinary   string
+	OpenCodeFormat   string
+	OpenCodeAgent    string
+	TerminationFile  string
+	GitUsername      string
+	GitToken         string
+	GitHubToken      string
 }
 
 type termination struct {
@@ -91,34 +97,52 @@ func readConfig(getenv func(string) string) (config, error) {
 	}
 	ref, _ := strconv.Atoi(strings.TrimSpace(getenv("COURIER_REF")))
 	cfg := config{
-		RemoteURL:       remoteURL,
-		BaseRemoteURL:   strings.TrimSpace(getenv("COURIER_BASE_REPO_URL")),
-		Directory:       strings.TrimSpace(getenv("COURIER_WORKSPACE")),
-		Base:            strings.TrimSpace(getenv("COURIER_BASE")),
-		Branch:          strings.TrimSpace(getenv("COURIER_BRANCH")),
-		Repo:            strings.TrimSpace(getenv("COURIER_REPO")),
-		HeadRepo:        strings.TrimSpace(getenv("COURIER_HEAD_REPO")),
-		HeadSHA:         strings.TrimSpace(getenv("COURIER_HEAD_SHA")),
-		Goal:            strings.TrimSpace(getenv("COURIER_GOAL")),
-		Model:           strings.TrimSpace(getenv("COURIER_MODEL")),
-		Framing:         getenv("COURIER_FRAMING"),
-		Mode:            strings.TrimSpace(getenv("COURIER_MODE")),
-		RunID:           strings.TrimSpace(getenv("COURIER_RUN_NAME")),
-		Ref:             ref,
-		OpenCodeBinary:  strings.TrimSpace(getenv("COURIER_OPENCODE_BINARY")),
-		OpenCodeFormat:  strings.TrimSpace(getenv("COURIER_OPENCODE_FORMAT")),
-		OpenCodeAgent:   strings.TrimSpace(getenv("COURIER_OPENCODE_AGENT")),
-		TerminationFile: strings.TrimSpace(getenv("COURIER_TERMINATION_FILE")),
-		GitUsername:     getenv("COURIER_GIT_USERNAME"),
-		GitToken:        getenv("COURIER_GIT_TOKEN"),
-		GitHubToken:     getenv("GITHUB_TOKEN"),
-		GitHubAPIBase:   strings.TrimSpace(getenv("COURIER_GITHUB_API_BASE")),
+		RemoteURL:        remoteURL,
+		BaseRemoteURL:    strings.TrimSpace(getenv("COURIER_BASE_REPO_URL")),
+		Directory:        strings.TrimSpace(getenv("COURIER_WORKSPACE")),
+		ScratchDirectory: strings.TrimSpace(getenv("COURIER_SCRATCH_DIR")),
+		Base:             strings.TrimSpace(getenv("COURIER_BASE")),
+		Branch:           strings.TrimSpace(getenv("COURIER_BRANCH")),
+		Repo:             strings.TrimSpace(getenv("COURIER_REPO")),
+		HeadRepo:         strings.TrimSpace(getenv("COURIER_HEAD_REPO")),
+		HeadSHA:          strings.TrimSpace(getenv("COURIER_HEAD_SHA")),
+		Goal:             strings.TrimSpace(getenv("COURIER_GOAL")),
+		Model:            strings.TrimSpace(getenv("COURIER_MODEL")),
+		Framing:          getenv("COURIER_FRAMING"),
+		Mode:             strings.TrimSpace(getenv("COURIER_MODE")),
+		RunID:            strings.TrimSpace(getenv("COURIER_RUN_NAME")),
+		Ref:              ref,
+		OpenCodeBinary:   strings.TrimSpace(getenv("COURIER_OPENCODE_BINARY")),
+		OpenCodeFormat:   strings.TrimSpace(getenv("COURIER_OPENCODE_FORMAT")),
+		OpenCodeAgent:    strings.TrimSpace(getenv("COURIER_OPENCODE_AGENT")),
+		TerminationFile:  strings.TrimSpace(getenv("COURIER_TERMINATION_FILE")),
+		GitUsername:      getenv("COURIER_GIT_USERNAME"),
+		GitToken:         getenv("COURIER_GIT_TOKEN"),
+		GitHubToken:      getenv("GITHUB_TOKEN"),
+		GitHubAPIBase:    strings.TrimSpace(getenv("COURIER_GITHUB_API_BASE")),
 	}
 	if strings.TrimSpace(cfg.GitHubToken) == "" {
 		cfg.GitHubToken = cfg.GitToken
 	}
 	if cfg.Directory == "" {
 		cfg.Directory = defaultWork
+	}
+	if cfg.ScratchDirectory == "" {
+		cfg.ScratchDirectory = defaultScratchDirectory
+	}
+	if !filepath.IsAbs(cfg.Directory) {
+		absolute, err := filepath.Abs(cfg.Directory)
+		if err != nil {
+			return config{}, fmt.Errorf("resolve COURIER_WORKSPACE: %w", err)
+		}
+		cfg.Directory = absolute
+	}
+	if !filepath.IsAbs(cfg.ScratchDirectory) {
+		absolute, err := filepath.Abs(cfg.ScratchDirectory)
+		if err != nil {
+			return config{}, fmt.Errorf("resolve COURIER_SCRATCH_DIR: %w", err)
+		}
+		cfg.ScratchDirectory = absolute
 	}
 	if cfg.Base == "" {
 		cfg.Base = defaultBase
@@ -147,6 +171,13 @@ func readConfig(getenv func(string) string) (config, error) {
 	}
 	if strings.EqualFold(cfg.Mode, "fix-pr") && cfg.HeadRepo == "" {
 		return config{}, errors.New("COURIER_HEAD_REPO is required for fix-pr runs")
+	}
+	scratchRelative, err := filepath.Rel(cfg.Directory, cfg.ScratchDirectory)
+	if err != nil {
+		return config{}, fmt.Errorf("compare scratch and workspace paths: %w", err)
+	}
+	if scratchRelative == "." || (scratchRelative != ".." && !strings.HasPrefix(scratchRelative, ".."+string(filepath.Separator))) {
+		return config{}, errors.New("COURIER_SCRATCH_DIR must be outside COURIER_WORKSPACE")
 	}
 	if parsed, err := url.Parse(cfg.RemoteURL); err == nil && parsed.User != nil {
 		if _, hasPassword := parsed.User.Password(); hasPassword {
@@ -202,7 +233,7 @@ func (r reporter) event(eventType, status string, detail map[string]any) {
 // terminate publishes the terminal handoff: the legacy COURIER_TERMINATION
 // line with a redacted reason, plus the run.exit event.
 func (r reporter) terminate(result termination) {
-	result.Reason = r.red.Redact(result.Reason)
+	result.Reason = truncateTerminationReason(r.red.Redact(result.Reason))
 	emitTermination(r.stdout, r.cfg, result)
 	status := courierlog.StatusOK
 	switch result.Phase {
@@ -363,17 +394,16 @@ func run(ctx context.Context, stdout, stderr io.Writer) int {
 		return 1
 	}
 
-	// Start from a clean declaration slate: a committed outcome file from an
-	// adopted branch describes an earlier run, and removeOutcomeDir's
-	// tracked-copy restore would read it back as this run's declaration.
-	// Drop it outright and recreate the directory for the coordinator to
-	// declare in (#169). The best-effort cache drop keeps the stale file out
-	// of the index, so a mid-run `git restore .` cannot resurrect it.
-	_ = os.RemoveAll(filepath.Join(workspace.Directory, ".courier"))
-	dropStaged := exec.CommandContext(ctx, "git", "rm", "-r", "--cached", "--ignore-unmatch", "--", ".courier")
-	dropStaged.Dir = workspace.Directory
-	_ = dropStaged.Run()
-	_ = os.MkdirAll(filepath.Join(workspace.Directory, ".courier"), 0o755)
+	outcomePath := filepath.Join(cfg.ScratchDirectory, defaultOutcomeFilename)
+	if err := os.MkdirAll(cfg.ScratchDirectory, 0o700); err != nil {
+		report.terminate(failed("prepare run scratch directory: " + err.Error()))
+		return exitFailed
+	}
+	if err := os.Remove(outcomePath); err != nil && !os.IsNotExist(err) {
+		report.terminate(failed("clear stale outcome declaration: " + err.Error()))
+		return exitFailed
+	}
+	cfg.Goal = strings.ReplaceAll(cfg.Goal, filepath.Join(defaultScratchDirectory, defaultOutcomeFilename), outcomePath)
 	ready := map[string]any{
 		"adopted": workspace.Adopted,
 		"base":    cfg.Base,
@@ -424,8 +454,7 @@ func run(ctx context.Context, stdout, stderr io.Writer) int {
 		if code < 0 {
 			code = exitFailed
 		}
-		// A non-zero child exit is a failure, never a human-attention signal:
-		// only a coordinator-declared needs_decision may end the run that way.
+		// A non-zero child exit is a failure, never a human-attention signal.
 		// The child's raw code must not pass through: the operator maps 2 to
 		// NeedsHuman and 3 to AwaitingReview or NeedsHuman by run mode, so
 		// terminate with the standard failure code and keep the child's code
@@ -441,10 +470,12 @@ func run(ctx context.Context, stdout, stderr io.Writer) int {
 		}
 	}
 
-	// Read the coordinator's outcome declaration, then restore the tree so the
-	// declaration itself never reads back as workspace work (#169).
-	decl, declared, declErr := readOutcome(workspace.Directory)
-	removeOutcomeDir(ctx, workspace.Directory)
+	// The declaration lives outside the workspace, so it can never read back as
+	// workspace work (#169).
+	decl, declared, declErr := readOutcome(outcomePath)
+	if err := os.Remove(outcomePath); err != nil && !os.IsNotExist(err) {
+		fmt.Fprintf(report.stderr, "courier: could not remove outcome declaration: %s\n", report.red.Redact(err.Error()))
+	}
 
 	workState, err := workspace.WorkState(ctx, startCommit)
 	if err != nil {
@@ -464,9 +495,9 @@ const (
 	outcomeBlockedExternal = "blocked_external"
 )
 
-// outcomeDeclaration is the coordinator's declared run ending, read from
-// .courier/outcome.json. Only the field matching the outcome kind is
-// required; the executor validates that per kind.
+// outcomeDeclaration is the coordinator's declared run ending, read from the
+// per-run scratch file outside the checkout. Only the field matching the
+// outcome kind is required; the executor validates that per kind.
 type outcomeDeclaration struct {
 	Outcome  string `json:"outcome"`
 	Evidence string `json:"evidence"`
@@ -474,19 +505,14 @@ type outcomeDeclaration struct {
 	Missing  string `json:"missing"`
 }
 
-// outcomeFile is the coordinator's declaration path inside the workspace.
-func outcomeFile(dir string) string {
-	return filepath.Join(dir, ".courier", "outcome.json")
-}
-
 // readOutcome reads and validates the coordinator's outcome declaration from
-// dir. A missing file returns (zero, false, nil): the run was simply
-// undeclared. A read error or unparsable JSON returns (zero, true, err). A
-// declaration that fails its per-outcome field rule, or names an unknown
-// outcome kind, returns the parsed declaration with (decl, true, err)
+// its per-run scratch path. A missing file returns (zero, false, nil): the run
+// was simply undeclared. A read error or unparsable JSON returns (zero, true,
+// err). A declaration that fails its per-outcome field rule, or names an
+// unknown outcome kind, returns the parsed declaration with (decl, true, err)
 // describing the invalid declaration.
-func readOutcome(dir string) (outcomeDeclaration, bool, error) {
-	data, err := os.ReadFile(outcomeFile(dir))
+func readOutcome(path string) (outcomeDeclaration, bool, error) {
+	data, err := os.ReadFile(path)
 	if os.IsNotExist(err) {
 		return outcomeDeclaration{}, false, nil
 	}
@@ -517,20 +543,17 @@ func readOutcome(dir string) (outcomeDeclaration, bool, error) {
 	return decl, true, nil
 }
 
-// removeOutcomeDir drops the coordinator's declaration directory, clears any
-// index entries the coordinator staged, and then restores any tracked copy
-// from HEAD, so a written, staged, or (wrongly) committed outcome file never
-// reads back as workspace work. Every step is best-effort and its failure
-// ignored: the cache drop is a no-op when the index holds no entry, and the
-// checkout recreates nothing when the path was untracked.
-func removeOutcomeDir(ctx context.Context, dir string) {
-	_ = os.RemoveAll(filepath.Join(dir, ".courier"))
-	dropStaged := exec.CommandContext(ctx, "git", "rm", "-r", "--cached", "--ignore-unmatch", "--", ".courier")
-	dropStaged.Dir = dir
-	_ = dropStaged.Run()
-	restore := exec.CommandContext(ctx, "git", "checkout", "HEAD", "--", ".courier")
-	restore.Dir = dir
-	_ = restore.Run()
+// truncateTerminationReason applies the Kubernetes handoff bound after
+// redaction, preserving UTF-8 and reserving room for the truncation marker.
+func truncateTerminationReason(reason string) string {
+	if len(reason) <= maxTerminationReasonBytes {
+		return reason
+	}
+	limit := maxTerminationReasonBytes - len(terminationTruncationSuffix)
+	for limit > 0 && !utf8.ValidString(reason[:limit]) {
+		limit--
+	}
+	return reason[:limit] + terminationTruncationSuffix
 }
 
 // failed builds a Failed termination with the standard failure exit code.
@@ -590,7 +613,8 @@ func (r reporter) classifyDeclared(ctx context.Context, workspace *git.Workspace
 		return termination{Phase: "NeedsHuman", Result: "needs-human", ExitCode: exitNeedsHuman, Reason: "coordinator needs a decision: " + decl.Question, Outcome: outcomeNeedsDecision}
 	case outcomeBlockedExternal:
 		r.emitOutcomeDeclared(outcomeBlockedExternal)
-		return failed("opencode is blocked on an external prerequisite: " + decl.Missing)
+		r.postOutcomeComment(ctx, "**Courier is blocked on an external prerequisite** (run "+r.cfg.RunID+")\n\n"+decl.Missing)
+		return termination{Phase: "NeedsHuman", Result: "needs-human", ExitCode: exitNeedsHuman, Reason: "coordinator is blocked on an external prerequisite: " + decl.Missing, Outcome: outcomeBlockedExternal}
 	}
 	// Unreachable: readOutcome rejects any unknown outcome kind above.
 	return failed("opencode wrote an invalid outcome declaration: unknown outcome")
