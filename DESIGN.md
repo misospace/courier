@@ -518,10 +518,12 @@ it modest" with `concurrency: 1`. Same schema, no local assumption baked in.
   Other failure exits reach **Failed**. When no outcome is declared, recoverable
   endings — uncommitted changes, commits off the run branch, or no commit and no
   workspace changes — resume the same session with a short state message, up to
-  `COURIER_MAX_CONTINUATIONS` times (default 3). A no-progress guard terminates
-  earlier as **NeedsHuman** with reason `looping` and the state history; reaching
-  the continuation cap also terminates as **NeedsHuman** with reason `looping
-  after N continuations` plus the state history. Without a captured session,
+  `COURIER_MAX_CONTINUATIONS` times (default 3). Invalid, zero, or negative
+  values use the default; any positive value, including 1, is accepted. A
+  no-progress guard terminates earlier as **NeedsHuman** with reason `looping`
+  and the state history; reaching the continuation cap also terminates as
+  **NeedsHuman** with reason `looping after N continuations` plus the state
+  history. Without a captured session,
   undeclared endings fail as incomplete. A crash resumes the session
   with exponential backoff (default 5s, `COURIER_RESUME_BACKOFF_SECONDS`),
   sharing the same budget, before the run transitions to **Failed**; a crash
@@ -745,6 +747,11 @@ A running log of architectural decisions and their reasoning, newest first. The
 body above describes the current architecture; this log preserves *why* and what
 was superseded.
 
+- **2026-09-30 — #170: preserve continuation-state boundaries in loop fingerprints.**
+  Delimiter-joined fields can collide when paths or other values contain those
+  delimiters. Hashing typed JSON preserves field boundaries and keeps raw paths
+  and assistant text out of continuation events; termination history remains
+  separately redacted. (#170)
 - **2026-09-30 — #169/#175: declare outcomes outside the worktree; never settle
   from a declaration alone.** #169 replaced inference of coordinator intent from
   workspace state with explicit `changes`, `no_change_needed`, `needs_decision`,

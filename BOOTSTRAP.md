@@ -121,9 +121,10 @@ failures are logged as `outcome.comment` and do not change the ending.
 When no outcome is declared, recoverable endings — uncommitted changes, commits
 off the run branch, or no commit and no workspace changes — resume the same
 session with a short state message, up to `COURIER_MAX_CONTINUATIONS` times
-(default 3). Without a captured session, these undeclared endings fail as
-incomplete. A no-progress guard ends the run as `NeedsHuman` with reason
-`looping`; reaching the continuation cap also ends it as `NeedsHuman` with the
+(default 3). Invalid, zero, or negative values use the default; any positive
+value, including 1, is accepted. Without a captured session, these undeclared
+endings fail as incomplete. A no-progress guard ends the run as `NeedsHuman` with
+reason `looping`; reaching the continuation cap also ends it as `NeedsHuman` with
 state history. A crash resumes the session with exponential backoff (default 5s,
 `COURIER_RESUME_BACKOFF_SECONDS`), sharing the same continuation budget, before
 the run moves to `Failed`; a crash before any session ID is observed moves it to

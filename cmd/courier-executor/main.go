@@ -11,6 +11,8 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -694,9 +696,11 @@ func run(ctx context.Context, stdout, stderr io.Writer) int {
 			return result.ExitCode
 		}
 
-		fingerprint := strings.Join([]string{
-			string(workState), branch, head, strings.Join(dirty, ","), tap.lastText,
-		}, "|")
+		fingerprint, err := continuationFingerprint(workState, branch, head, dirty, tap.lastText)
+		if err != nil {
+			report.terminate(failed("fingerprint workspace state: " + err.Error()))
+			return exitFailed
+		}
 		if !worldReadFailed && prevFingerprint != "" && fingerprint == prevFingerprint {
 			history = append(history, summary)
 			report.terminate(termination{Phase: "NeedsHuman", Result: "needs-human", ExitCode: exitNeedsHuman, Reason: "looping: " + summarizeHistory(history)})
@@ -984,6 +988,29 @@ func summarizeHistory(history []string) string {
 		entries[i] = fmt.Sprintf("%d) %s", i+1, entry)
 	}
 	return strings.Join(entries, "; ")
+}
+
+type continuationFingerprintState struct {
+	WorkState git.WorkState `json:"work_state"`
+	Branch    string        `json:"branch"`
+	Head      string        `json:"head"`
+	Dirty     []string      `json:"dirty"`
+	LastText  string        `json:"last_text"`
+}
+
+func continuationFingerprint(workState git.WorkState, branch, head string, dirty []string, lastText string) (string, error) {
+	encoded, err := json.Marshal(continuationFingerprintState{
+		WorkState: workState,
+		Branch:    branch,
+		Head:      head,
+		Dirty:     dirty,
+		LastText:  lastText,
+	})
+	if err != nil {
+		return "", err
+	}
+	digest := sha256.Sum256(encoded)
+	return hex.EncodeToString(digest[:]), nil
 }
 
 func stateSummary(kind, head, lastText string, paths []string) string {

@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -19,6 +20,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/misospace/courier/internal/executor"
+	"github.com/misospace/courier/internal/git"
 	courierlog "github.com/misospace/courier/internal/log"
 )
 
@@ -1546,8 +1548,10 @@ func TestReadConfigContinuationDefaults(t *testing.T) {
 	}{
 		{name: "defaults when unset", wantMax: 3, wantBackoff: 5 * time.Second},
 		{name: "valid max continuations", maxCont: "5", wantMax: 5, wantBackoff: 5 * time.Second},
+		{name: "one max continuation", maxCont: "1", wantMax: 1, wantBackoff: 5 * time.Second},
 		{name: "unparseable max continuations", maxCont: "abc", wantMax: 3, wantBackoff: 5 * time.Second},
 		{name: "zero max continuations", maxCont: "0", wantMax: 3, wantBackoff: 5 * time.Second},
+		{name: "negative max continuations", maxCont: "-1", wantMax: 3, wantBackoff: 5 * time.Second},
 		{name: "valid resume backoff", backoff: "2.5", wantMax: 3, wantBackoff: 2500 * time.Millisecond},
 		{name: "unparseable resume backoff", backoff: "abc", wantMax: 3, wantBackoff: 5 * time.Second},
 		{name: "negative resume backoff", backoff: "-1", wantMax: 3, wantBackoff: 5 * time.Second},
@@ -1578,6 +1582,58 @@ func TestReadConfigContinuationDefaults(t *testing.T) {
 				t.Fatalf("ResumeBackoff = %v, want %v", cfg.ResumeBackoff, test.wantBackoff)
 			}
 		})
+	}
+}
+
+func TestContinuationFingerprintIsUnambiguousAndStable(t *testing.T) {
+	first, err := continuationFingerprint(git.WorkStateDirty, "branch|one", "head", []string{"a,b"}, "last|text")
+	if err != nil {
+		t.Fatalf("continuationFingerprint() error = %v", err)
+	}
+	second, err := continuationFingerprint(git.WorkStateDirty, "branch|one", "head", []string{"a", "b"}, "last|text")
+	if err != nil {
+		t.Fatalf("continuationFingerprint() error = %v", err)
+	}
+	if first == second {
+		t.Fatal("distinct dirty-path lists produced the same fingerprint")
+	}
+
+	third, err := continuationFingerprint(git.WorkStateDirty, "branch", "head|a", []string{"b"}, "last|text")
+	if err != nil {
+		t.Fatalf("continuationFingerprint() error = %v", err)
+	}
+	fourth, err := continuationFingerprint(git.WorkStateDirty, "branch|head", "a", []string{"b"}, "last|text")
+	if err != nil {
+		t.Fatalf("continuationFingerprint() error = %v", err)
+	}
+	if third == fourth {
+		t.Fatal("pipe-bearing branch and head fields produced the same fingerprint")
+	}
+
+	fifth, err := continuationFingerprint(git.WorkStateDirty, "branch", "head", []string{"a|b"}, "c")
+	if err != nil {
+		t.Fatalf("continuationFingerprint() error = %v", err)
+	}
+	sixth, err := continuationFingerprint(git.WorkStateDirty, "branch", "head", []string{"a"}, "b|c")
+	if err != nil {
+		t.Fatalf("continuationFingerprint() error = %v", err)
+	}
+	if fifth == sixth {
+		t.Fatal("pipe-bearing dirty path and last-text fields produced the same fingerprint")
+	}
+
+	repeated, err := continuationFingerprint(git.WorkStateDirty, "branch|one", "head", []string{"a,b"}, "last|text")
+	if err != nil {
+		t.Fatalf("continuationFingerprint() error = %v", err)
+	}
+	if first != repeated {
+		t.Fatalf("identical state fingerprint changed: %q != %q", first, repeated)
+	}
+	if len(first) != 64 {
+		t.Fatalf("fingerprint length = %d, want 64 hex characters", len(first))
+	}
+	if _, err := hex.DecodeString(first); err != nil {
+		t.Fatalf("fingerprint is not hexadecimal: %v", err)
 	}
 }
 
@@ -2451,12 +2507,9 @@ func runGit(t *testing.T, directory string, args ...string) {
 	}
 }
 
-// TestRunContinuationDetailIsRedacted proves the fingerprint and the terminal
-// reason stay redacted when the session tap captured a registered secret in
-// the child's raw, pre-redaction output: the no-progress guard fires on the
-// repeated state, and neither the executor.continuation fingerprint detail
-// nor the COURIER_TERMINATION reason leaks the secret — both carry the
-// redaction placeholder.
+// TestRunContinuationDetailIsRedacted proves the opaque fingerprint does not
+// expose a registered secret captured in the child's raw output, while the
+// no-progress termination history still carries its redaction placeholder.
 func TestRunContinuationDetailIsRedacted(t *testing.T) {
 	root := t.TempDir()
 	remote := remoteWithExistingBranch(t, root)
@@ -2505,8 +2558,14 @@ exit 0
 	if strings.Contains(fingerprint, secretValue) {
 		t.Fatal("fingerprint detail leaked the raw secret")
 	}
-	if !strings.Contains(fingerprint, "[REDACTED]") {
-		t.Fatal("fingerprint detail lost the redaction placeholder")
+	if len(fingerprint) != 64 {
+		t.Fatalf("fingerprint length = %d, want 64 hex characters", len(fingerprint))
+	}
+	if _, err := hex.DecodeString(fingerprint); err != nil {
+		t.Fatalf("fingerprint is not hexadecimal: %v", err)
+	}
+	if strings.Contains(fingerprint, "[REDACTED]") || strings.Contains(fingerprint, "echo") || strings.Contains(fingerprint, "done") {
+		t.Fatalf("fingerprint exposed raw state text: %q", fingerprint)
 	}
 
 	start := strings.Index(output.String(), "COURIER_TERMINATION")
@@ -2522,5 +2581,8 @@ exit 0
 	}
 	if !strings.Contains(terminationLine, "[REDACTED]") {
 		t.Fatal("termination reason lost the redaction placeholder")
+	}
+	if !strings.Contains(terminationLine, "last message") {
+		t.Fatal("termination reason lost the state history")
 	}
 }
