@@ -3,10 +3,18 @@
 // event lines and produces a rich log Summary plus a compact RunTelemetry. The
 // executor consumes it; only the compact form crosses into CoderRun.status and
 // the source report, via the terminal handoff.
+//
+// OpenCode re-emits the same line for the same part id as a part evolves (a
+// tool part at start and again at completion, a step-finish part more than
+// once). The tracker is therefore an idempotent projection over the LATEST
+// view of each unique part id, not an increment-per-line tally: re-emissions
+// of a part id collapse to one entry, so tool calls, subagent calls, runtime,
+// and tokens are never double-counted.
 package telemetry
 
 import (
 	"encoding/json"
+	"fmt"
 	"sort"
 
 	courierv1alpha1 "github.com/misospace/courier/api/v1alpha1"
@@ -38,9 +46,14 @@ type SessionStat struct {
 	DurationMillis int64                      `json:"duration_millis"`
 }
 
-// maxSubagents bounds the subagent list in the compact status form so it
-// cannot blow the pod termination-message budget.
+// maxSubagents bounds the subagent list in the compact status form by count.
 const maxSubagents = 24
+
+// maxCompactBytes bounds the whole compact form by serialized size so it can
+// never push the COURIER_TERMINATION line past the 4 KiB termination-message
+// budget on its own. 3072 leaves headroom for the reason (capped at 1024)
+// plus phase/result/exit/overhead, under 4096.
+const maxCompactBytes = 3072
 
 // openCodeEvent is the subset of an OpenCode stdout event line the tracker
 // consumes. Every event carries a top-level sessionID; the part carries the
@@ -51,6 +64,7 @@ type openCodeEvent struct {
 }
 
 type part struct {
+	ID     string      `json:"id"`   // stable part id; re-emissions share it
 	Type   string      `json:"type"` // e.g. "step-finish", "tool", "text"; not branched on
 	Tool   string      `json:"tool"` // tool name, present on tool_use parts
 	Tokens *partTokens `json:"tokens"`
@@ -94,15 +108,33 @@ type partState struct {
 	Metadata *partMetadata `json:"metadata"`
 }
 
-// sessionState is one top-level session's observed activity.
-type sessionState struct {
-	modelCalls int
-	toolCalls  int
-	tokens     courierv1alpha1.TokenUsage
-	maxContext int64
-	minStartMs float64
-	maxEndMs   float64
-	sawTime    bool
+// partKind is the stable kind of a part, fixed at first sight. A part is
+// either a model step (carries tokens) or a tool call (carries a tool name);
+// the two never co-occur.
+type partKind int
+
+const (
+	kindUnknown partKind = iota
+	kindModel
+	kindTool
+)
+
+// partView is the latest observed view of one unique part id. Observe
+// upserts it in place; Summary and Compact project over the set of views, so
+// re-emissions of a part id contribute exactly once.
+type partView struct {
+	kind      partKind
+	sessionID string
+	toolName  string
+	tokens    courierv1alpha1.TokenUsage // latest tokens, for model parts
+	status    string
+	sawTime   bool
+	startMs   float64
+	endMs     float64
+	// task-tool subagent identity
+	agent      string
+	model      string
+	subSession string
 }
 
 // subagentKey is the (agent, model) pair of a `task` tool call.
@@ -111,26 +143,21 @@ type subagentKey struct {
 	model string
 }
 
-type subagentState struct {
-	calls     int
-	errors    int
-	runtimeMs float64
-}
-
 // Tracker tallies one run's event stream.
 type Tracker struct {
-	modelCalls int
-	toolCalls  int
-	toolByName map[string]int
-	tokens     courierv1alpha1.TokenUsage
-	maxContext int64
-
-	sessions         map[string]*sessionState
-	topSessions      map[string]struct{} // distinct non-empty top-level session ids
-	coordinator      string              // first non-empty top-level session id
-	subagentSessions map[string]struct{} // distinct subagent task metadata.sessionId
-
-	subagents map[subagentKey]*subagentState
+	// parts is the latest view per unique part id; the single source of
+	// truth every tally is projected from.
+	parts map[string]*partView
+	// sessionIDs is the single deduped set of every distinct session id
+	// seen: top-level event sessionIDs plus subagent task metadata
+	// sessionIds. It drives the Sessions total.
+	sessionIDs map[string]struct{}
+	// coordinator is the first non-empty top-level session id.
+	coordinator string
+	// idless is a monotonic counter minting unique keys for id-less
+	// emissions, so each is distinct (preserving prior per-line behavior
+	// for fixtures that omit part ids).
+	idless int
 
 	continuations int
 }
@@ -138,11 +165,8 @@ type Tracker struct {
 // New returns an empty Tracker.
 func New() *Tracker {
 	return &Tracker{
-		toolByName:       make(map[string]int),
-		sessions:         make(map[string]*sessionState),
-		topSessions:      make(map[string]struct{}),
-		subagentSessions: make(map[string]struct{}),
-		subagents:        make(map[subagentKey]*subagentState),
+		parts:      make(map[string]*partView),
+		sessionIDs: make(map[string]struct{}),
 	}
 }
 
@@ -150,6 +174,11 @@ func New() *Tracker {
 // newline). Lines that are not valid JSON or that do not match a
 // recognized event shape are silently ignored. Observe never errors and
 // never retains the line bytes.
+//
+// It upserts the part's view keyed by part id (or a synthesized unique key
+// when the part has no id) and records the session id in the deduped set.
+// It does not maintain any global counters: those are derived in Summary and
+// Compact by projecting over the part views.
 func (t *Tracker) Observe(line []byte) {
 	var ev openCodeEvent
 	if err := json.Unmarshal(line, &ev); err != nil {
@@ -159,16 +188,67 @@ func (t *Tracker) Observe(line []byte) {
 		if t.coordinator == "" {
 			t.coordinator = ev.SessionID
 		}
-		t.topSessions[ev.SessionID] = struct{}{}
+		t.sessionIDs[ev.SessionID] = struct{}{}
 	}
 	if ev.Part == nil {
 		return
 	}
-	if ev.Part.Tokens != nil {
-		t.observeModelStep(ev.SessionID, ev.Part.Tokens)
+	p := ev.Part
+	// A recognized part carries tokens (a model step) or a tool name (a
+	// tool call); anything else is not tallied.
+	if p.Tokens == nil && p.Tool == "" {
+		return
 	}
-	if ev.Part.Tool != "" {
-		t.observeTool(ev.SessionID, ev.Part)
+
+	key := p.ID
+	if key == "" {
+		t.idless++
+		key = fmt.Sprintf("idless-%d", t.idless)
+	}
+	pv := t.parts[key]
+	if pv == nil {
+		pv = &partView{}
+		t.parts[key] = pv
+		if p.Tokens != nil {
+			pv.kind = kindModel
+		} else {
+			pv.kind = kindTool
+		}
+	}
+
+	// Latest wins: refresh every field this emission carries.
+	pv.sessionID = ev.SessionID
+	if p.Tokens != nil {
+		pv.tokens = tokensToUsage(p.Tokens)
+	}
+	if p.Tool != "" {
+		pv.toolName = p.Tool
+	}
+	if p.State != nil {
+		if p.State.Status != "" {
+			pv.status = p.State.Status
+		}
+		if p.State.Time != nil {
+			pv.sawTime = true
+			if p.State.Time.Start != 0 {
+				pv.startMs = p.State.Time.Start
+			}
+			if p.State.Time.End != 0 {
+				pv.endMs = p.State.Time.End
+			}
+		}
+		if p.Tool == "task" {
+			pv.agent = p.State.Input.SubagentType
+			if p.State.Metadata != nil {
+				if p.State.Metadata.Model != nil {
+					pv.model = p.State.Metadata.Model.ModelID
+				}
+				if p.State.Metadata.SessionID != "" {
+					pv.subSession = p.State.Metadata.SessionID
+					t.sessionIDs[p.State.Metadata.SessionID] = struct{}{}
+				}
+			}
+		}
 	}
 }
 
@@ -177,35 +257,141 @@ func (t *Tracker) SetContinuations(n int) {
 	t.continuations = n
 }
 
+// sessAgg accumulates one session's projection over its part views.
+type sessAgg struct {
+	modelCalls int
+	toolCalls  int
+	tokens     courierv1alpha1.TokenUsage
+	maxContext int64
+	minStartMs float64
+	maxEndMs   float64
+	sawTime    bool
+}
+
+// subAgg accumulates one (agent, model) subagent group's projection.
+type subAgg struct {
+	calls   int
+	errors  int
+	runtime float64
+}
+
+// agg is the single-pass projection over the part views that Summary and
+// Compact both consume.
+type agg struct {
+	modelCalls int
+	toolCalls  int
+	toolByName map[string]int
+	tokens     courierv1alpha1.TokenUsage
+	maxContext int64
+	sessions   map[string]*sessAgg
+	subagents  map[subagentKey]*subAgg
+	coordDur   int64
+}
+
+// aggregate projects the run tallies over the latest view of each part.
+func (t *Tracker) aggregate() agg {
+	a := agg{
+		toolByName: make(map[string]int),
+		sessions:   make(map[string]*sessAgg),
+		subagents:  make(map[subagentKey]*subAgg),
+	}
+	for _, pv := range t.parts {
+		switch pv.kind {
+		case kindModel:
+			a.modelCalls++
+			addTokens(&a.tokens, pv.tokens)
+			if ctx := pv.tokens.Input + pv.tokens.CacheRead + pv.tokens.CacheWrite; ctx > a.maxContext {
+				a.maxContext = ctx
+			}
+		case kindTool:
+			a.toolCalls++
+			a.toolByName[pv.toolName]++
+			if pv.toolName == "task" {
+				k := subagentKey{agent: pv.agent, model: pv.model}
+				st := a.subagents[k]
+				if st == nil {
+					st = &subAgg{}
+					a.subagents[k] = st
+				}
+				st.calls++
+				if pv.status == "error" {
+					st.errors++
+				}
+				if pv.sawTime {
+					st.runtime += pv.endMs - pv.startMs
+				}
+			}
+		}
+		if pv.sessionID != "" {
+			s := a.sessions[pv.sessionID]
+			if s == nil {
+				s = &sessAgg{}
+				a.sessions[pv.sessionID] = s
+			}
+			switch pv.kind {
+			case kindModel:
+				s.modelCalls++
+				addTokens(&s.tokens, pv.tokens)
+				if ctx := pv.tokens.Input + pv.tokens.CacheRead + pv.tokens.CacheWrite; ctx > s.maxContext {
+					s.maxContext = ctx
+				}
+			case kindTool:
+				s.toolCalls++
+			}
+			if pv.sawTime {
+				if !s.sawTime {
+					s.minStartMs = pv.startMs
+					s.maxEndMs = pv.endMs
+					s.sawTime = true
+				} else {
+					if pv.startMs < s.minStartMs {
+						s.minStartMs = pv.startMs
+					}
+					if pv.endMs > s.maxEndMs {
+						s.maxEndMs = pv.endMs
+					}
+				}
+			}
+		}
+	}
+	if t.coordinator != "" {
+		if s, ok := a.sessions[t.coordinator]; ok && s.sawTime {
+			a.coordDur = int64(s.maxEndMs - s.minStartMs)
+		}
+	}
+	return a
+}
+
 // Summary returns the full summary for the log event.
 func (t *Tracker) Summary() Summary {
-	stats := make([]SessionStat, 0, len(t.sessions))
-	for id, s := range t.sessions {
+	a := t.aggregate()
+
+	stats := make([]SessionStat, 0, len(a.sessions))
+	for id, s := range a.sessions {
+		var dur int64
+		if s.sawTime {
+			dur = int64(s.maxEndMs - s.minStartMs)
+		}
 		stats = append(stats, SessionStat{
 			SessionID:      id,
 			ModelCalls:     s.modelCalls,
 			ToolCalls:      s.toolCalls,
 			MaxContext:     s.maxContext,
 			Tokens:         s.tokens,
-			DurationMillis: s.durationMillis(),
+			DurationMillis: dur,
 		})
 	}
 	sort.Slice(stats, func(i, j int) bool { return stats[i].SessionID < stats[j].SessionID })
 
-	toolByName := make(map[string]int, len(t.toolByName))
-	for name, n := range t.toolByName {
-		toolByName[name] = n
-	}
-
 	return Summary{
-		ModelCalls:      t.modelCalls,
-		ToolCalls:       t.toolCalls,
-		ToolCallsByName: toolByName,
-		Tokens:          t.tokens,
-		MaxContext:      t.maxContext,
+		ModelCalls:      a.modelCalls,
+		ToolCalls:       a.toolCalls,
+		ToolCallsByName: a.toolByName,
+		Tokens:          a.tokens,
+		MaxContext:      a.maxContext,
 		Sessions:        stats,
-		Subagents:       t.sortedSubagents(),
-		DurationMillis:  t.coordinatorDurationMillis(),
+		Subagents:       sortedSubagents(a.subagents),
+		DurationMillis:  a.coordDur,
 		Continuations:   t.continuations,
 	}
 }
@@ -214,39 +400,54 @@ func (t *Tracker) Summary() Summary {
 // run recorded no activity at all (no model steps and no tool steps), so
 // callers can omit an empty summary.
 func (t *Tracker) Compact() *courierv1alpha1.RunTelemetry {
-	if t.modelCalls == 0 && t.toolCalls == 0 {
+	a := t.aggregate()
+	if a.modelCalls == 0 && a.toolCalls == 0 {
 		return nil
 	}
-	subagents := t.sortedSubagents()
+	subagents := sortedSubagents(a.subagents)
 	if len(subagents) > maxSubagents {
 		subagents = subagents[:maxSubagents]
 	}
 	rt := &courierv1alpha1.RunTelemetry{
-		ModelCalls:     t.modelCalls,
-		ToolCalls:      t.toolCalls,
-		Sessions:       len(t.topSessions) + len(t.subagentSessions),
-		MaxContext:     t.maxContext,
+		ModelCalls:     a.modelCalls,
+		ToolCalls:      a.toolCalls,
+		Sessions:       len(t.sessionIDs),
+		MaxContext:     a.maxContext,
 		Subagents:      subagents,
-		DurationMillis: t.coordinatorDurationMillis(),
+		DurationMillis: a.coordDur,
 		Continuations:  t.continuations,
 	}
 	// Omit the token object entirely on tool-only runs: every field is
 	// zero and carries omitempty, so an empty Tokens would serialize as a
 	// useless "tokens":{} on the size-bounded termination path.
-	if t.tokens != (courierv1alpha1.TokenUsage{}) {
-		tokens := t.tokens
+	if a.tokens != (courierv1alpha1.TokenUsage{}) {
+		tokens := a.tokens
 		rt.Tokens = &tokens
+	}
+	// Bound the whole form by serialized bytes too: the count cap alone
+	// cannot stop a few very long agent/model strings from blowing the
+	// termination budget. Drop the lowest-runtime subagent entries until it
+	// fits; the scalar fields alone are tiny, so an empty subagent list
+	// always fits.
+	for {
+		b, err := json.Marshal(rt)
+		if err != nil || len(b) <= maxCompactBytes || len(rt.Subagents) == 0 {
+			break
+		}
+		rt.Subagents = rt.Subagents[:len(rt.Subagents)-1]
 	}
 	return rt
 }
 
-func (t *Tracker) observeModelStep(sessionID string, tok *partTokens) {
+// tokensToUsage flattens a part's token block into the shared TokenUsage,
+// computing the part's total.
+func tokensToUsage(tok *partTokens) courierv1alpha1.TokenUsage {
 	var cacheRead, cacheWrite int64
 	if tok.Cache != nil {
 		cacheRead = tok.Cache.Read
 		cacheWrite = tok.Cache.Write
 	}
-	stepTokens := courierv1alpha1.TokenUsage{
+	return courierv1alpha1.TokenUsage{
 		Input:      tok.Input,
 		Output:     tok.Output,
 		Reasoning:  tok.Reasoning,
@@ -254,113 +455,17 @@ func (t *Tracker) observeModelStep(sessionID string, tok *partTokens) {
 		CacheWrite: cacheWrite,
 		Total:      tok.Input + tok.Output + tok.Reasoning + cacheRead + cacheWrite,
 	}
-	stepContext := tok.Input + cacheRead + cacheWrite
-
-	t.modelCalls++
-	addTokens(&t.tokens, stepTokens)
-	if stepContext > t.maxContext {
-		t.maxContext = stepContext
-	}
-	if sessionID != "" {
-		s := t.session(sessionID)
-		s.modelCalls++
-		addTokens(&s.tokens, stepTokens)
-		if stepContext > s.maxContext {
-			s.maxContext = stepContext
-		}
-	}
 }
 
-func (t *Tracker) observeTool(sessionID string, p *part) {
-	t.toolCalls++
-	t.toolByName[p.Tool]++
-	if sessionID != "" {
-		t.session(sessionID).toolCalls++
-	}
-	if p.State != nil && p.State.Time != nil && sessionID != "" {
-		s := t.session(sessionID)
-		if !s.sawTime {
-			s.minStartMs = p.State.Time.Start
-			s.maxEndMs = p.State.Time.End
-			s.sawTime = true
-		} else {
-			if p.State.Time.Start < s.minStartMs {
-				s.minStartMs = p.State.Time.Start
-			}
-			if p.State.Time.End > s.maxEndMs {
-				s.maxEndMs = p.State.Time.End
-			}
-		}
-	}
-	if p.Tool != "task" {
-		return
-	}
-
-	// Subagent call: per (agent, model) accounting.
-	var agent, model string
-	var st *subagentState
-	if p.State != nil {
-		agent = p.State.Input.SubagentType
-		if p.State.Metadata != nil && p.State.Metadata.Model != nil {
-			model = p.State.Metadata.Model.ModelID
-		}
-	}
-	key := subagentKey{agent: agent, model: model}
-	st = t.subagents[key]
-	if st == nil {
-		st = &subagentState{}
-		t.subagents[key] = st
-	}
-	st.calls++
-	if p.State != nil {
-		if p.State.Status == "error" {
-			st.errors++
-		}
-		if p.State.Time != nil {
-			st.runtimeMs += p.State.Time.End - p.State.Time.Start
-		}
-		if p.State.Metadata != nil && p.State.Metadata.SessionID != "" {
-			t.subagentSessions[p.State.Metadata.SessionID] = struct{}{}
-		}
-	}
-}
-
-func (t *Tracker) session(id string) *sessionState {
-	s, ok := t.sessions[id]
-	if !ok {
-		s = &sessionState{}
-		t.sessions[id] = s
-	}
-	return s
-}
-
-func (t *Tracker) coordinatorDurationMillis() int64 {
-	if t.coordinator == "" {
-		return 0
-	}
-	s, ok := t.sessions[t.coordinator]
-	if !ok {
-		return 0
-	}
-	return s.durationMillis()
-}
-
-func (s *sessionState) durationMillis() int64 {
-	if !s.sawTime {
-		return 0
-	}
-	return int64(s.maxEndMs - s.minStartMs)
-}
-
-func (t *Tracker) sortedSubagents() []courierv1alpha1.SubagentTally {
-	out := make([]courierv1alpha1.SubagentTally, 0, len(t.subagents))
-	for k, st := range t.subagents {
+func sortedSubagents(subs map[subagentKey]*subAgg) []courierv1alpha1.SubagentTally {
+	out := make([]courierv1alpha1.SubagentTally, 0, len(subs))
+	for k, st := range subs {
 		out = append(out, courierv1alpha1.SubagentTally{
 			Agent:         k.agent,
 			Model:         k.model,
 			Calls:         st.calls,
 			Errors:        st.errors,
-			RuntimeMillis: int64(st.runtimeMs),
+			RuntimeMillis: int64(st.runtime),
 		})
 	}
 	sort.Slice(out, func(i, j int) bool {
