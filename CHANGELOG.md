@@ -1,5 +1,64 @@
 # Changelog
 
+## [0.1.4](https://github.com/misospace/courier/compare/v0.1.3...v0.1.4) (2026-10-01)
+
+
+### Features
+
+* **broker:** add guarded publication primitives ([#156](https://github.com/misospace/courier/issues/156)) ([e50635e](https://github.com/misospace/courier/commit/e50635ee65d2098abdaffba489c0842ffbac080f))
+* **broker:** complete [#122](https://github.com/misospace/courier/issues/122) primitive enforcement layer ([a990d58](https://github.com/misospace/courier/commit/a990d58c4e1d4dee0444b9b9f6f560b9043bf91a))
+* **broker:** complete [#122](https://github.com/misospace/courier/issues/122) primitive enforcement layer ([07288c6](https://github.com/misospace/courier/commit/07288c63098da440a23b538e7a8e71870ce99c4d))
+* **deps:** update module github.com/prometheus/common (v0.71.0 → v0.72.0) ([26d87eb](https://github.com/misospace/courier/commit/26d87ebc41643ac1e3560227274ccd6f5945b77b))
+* **deps:** update module github.com/prometheus/common (v0.71.0 → v0.72.0) ([f392ba4](https://github.com/misospace/courier/commit/f392ba4b19ccee488f0da77b74c91bbabed988b2))
+* **executor:** classify run endings from a coordinator-declared outcome ([ad2ca1f](https://github.com/misospace/courier/commit/ad2ca1fef039eef91f35f276a45d88b8a627a28b))
+* **executor:** classify run endings from a coordinator-declared outcome ([38abef1](https://github.com/misospace/courier/commit/38abef1bc079e5c7df2efed6413e44af07781d92))
+* **executor:** resume coordinator session on recoverable endings ([58b18a6](https://github.com/misospace/courier/commit/58b18a6220bbc501dea69b8c04666e4e30256d12))
+* **executor:** resume coordinator session on recoverable endings ([0fbd648](https://github.com/misospace/courier/commit/0fbd64822b6aa8a0bd833a4c98658409fa2a67ce)), closes [#170](https://github.com/misospace/courier/issues/170)
+
+
+### Bug Fixes
+
+* **broker:** close import race window and harden git transport ([ac09236](https://github.com/misospace/courier/commit/ac092368aec37ec8f1b7b905684b30f7986614fb))
+* **broker:** confirm uncertain push on exact live OID ([63e4789](https://github.com/misospace/courier/commit/63e47897cde46459c1fd1a57dc786c6a4cb78733))
+* **broker:** fail closed on unlabeled duplicate and non-canonical spec repo ([a1a5972](https://github.com/misospace/courier/commit/a1a597283108fb83dedf9e7626bfe171d232bcd1))
+* **controller:** keep a declared no_change_needed from settling the source ([6aa35fb](https://github.com/misospace/courier/commit/6aa35fb55b00b5bdb0a2d1be4e508b5375633234))
+* **controller:** never block a run's terminal phase on a source report ([e7005e3](https://github.com/misospace/courier/commit/e7005e3664fc7bcad542f405c23ad751d5c319f6))
+* **controller:** persist the pending report marker with the terminal phase ([da29e21](https://github.com/misospace/courier/commit/da29e21eec2ac394b5339fe8bd1536bc24d97ca5))
+* **controller:** terminalize the run before reporting to the source ([0adb844](https://github.com/misospace/courier/commit/0adb84473c3613f0467ad4c6cb4a98e9c6a94c80))
+* **deps:** update module sigs.k8s.io/controller-runtime (v0.25.1 → v0.25.2) ([d90e8be](https://github.com/misospace/courier/commit/d90e8be33a8504bc7307c9514ece1fc07107d662))
+* **deps:** update module sigs.k8s.io/controller-runtime (v0.25.1 → v0.25.2) ([8c081a3](https://github.com/misospace/courier/commit/8c081a39c9089b4e563899f60b75c5aba3da7997))
+* **executor:** close exit-code passthrough and declaration resurrection gaps ([2c1efac](https://github.com/misospace/courier/commit/2c1efac647cd7eba5790b5b0882de82b0b8fcc52))
+* **executor:** correct declared outcome handoffs ([d9afa44](https://github.com/misospace/courier/commit/d9afa447e28cda2dc6a02c3fba16f61596c7736a))
+* **executor:** drop dead path unquoting, clamp resume backoff, finish docs ([c26ac8a](https://github.com/misospace/courier/commit/c26ac8a6524299605841aa26f84249bb8c99e32f))
+* **executor:** harden session resume per review ([c07fb8e](https://github.com/misospace/courier/commit/c07fb8e2d6cdbf16c28222fc2b6affe2690d72b8))
+* **executor:** hash structured continuation state ([3a10794](https://github.com/misospace/courier/commit/3a10794ba896eaf00e667403a1f615fbe1b6e69c))
+* **executor:** resolve main merge conflicts ([18a4aa2](https://github.com/misospace/courier/commit/18a4aa2a25d8ef73d35d274dca7db8eed21647ab))
+* inspect lane toolchain sources through a read-only reference mount ([540eeed](https://github.com/misospace/courier/commit/540eeedf59b0c5b5180692952ed307876be9b02b))
+* **source:** settle the PR-fix attempt without parking for no_change_needed ([ecf879d](https://github.com/misospace/courier/commit/ecf879d72d17126cd5592997e48da49ed8c3cec4))
+
+
+### Chores
+
+* add CODEOWNERS ([42c38ff](https://github.com/misospace/courier/commit/42c38ff6f4f767eec722c92322f1093cbb6db4aa))
+* add CODEOWNERS ([461b179](https://github.com/misospace/courier/commit/461b179a8d07b35e0dc0c7480b80beae08e7b688))
+* **container:** update image golang (3680233 → e0174e5) ([8b5d4c4](https://github.com/misospace/courier/commit/8b5d4c41b204c66aace8f5d5d2c4aab945f848e7))
+* **container:** update image golang (3680233 → e0174e5) ([fda0b1d](https://github.com/misospace/courier/commit/fda0b1d0a411db10db65188ef39a9a5e806fe3c6))
+* **release:** keep feat bumps at patch until 1.0 ([fea01ff](https://github.com/misospace/courier/commit/fea01ff3c5f54d35354de905ed4de2d6de771486))
+* **release:** keep feat bumps at patch until 1.0 ([80d1e5f](https://github.com/misospace/courier/commit/80d1e5f6e518d53a2037a736966445899739388a))
+
+
+### Documentation
+
+* cross-reference the exit-3 contract on both sides ([ea7f09f](https://github.com/misospace/courier/commit/ea7f09fae6219b13b2241b1582448642413e7d38))
+* drop stray leading spaces on outcome-list bullets ([4bc2296](https://github.com/misospace/courier/commit/4bc2296bf88a9d96ab210b4128cdf6f2477c714c))
+* **source:** pin WakeReviewer to the blocked Result in its comment ([168b4ef](https://github.com/misospace/courier/commit/168b4efd1922cdf3b17040e8e7df9c32b74bfc18))
+
+
+### Refactors
+
+* **broker:** register a created PR only after full verification ([1cd9dca](https://github.com/misospace/courier/commit/1cd9dca3494e61d15cbb26f1240a9e0b96440032))
+* **controller:** name the no_change_needed exit and align harness docs ([017d91f](https://github.com/misospace/courier/commit/017d91ff53135153ceb6f58e60633211f8281471))
+
 ## [0.1.3](https://github.com/misospace/courier/compare/v0.1.2...v0.1.3) (2026-09-27)
 
 
