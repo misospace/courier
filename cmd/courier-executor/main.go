@@ -28,10 +28,12 @@ import (
 	"time"
 	"unicode/utf8"
 
+	courierv1alpha1 "github.com/misospace/courier/api/v1alpha1"
 	"github.com/misospace/courier/internal/executor"
 	"github.com/misospace/courier/internal/git"
 	"github.com/misospace/courier/internal/github"
 	courierlog "github.com/misospace/courier/internal/log"
+	"github.com/misospace/courier/internal/telemetry"
 )
 
 const (
@@ -90,6 +92,9 @@ type termination struct {
 	// declaration drove the ending (#169); empty when classified from the
 	// world alone.
 	Outcome string `json:"outcome,omitempty"`
+	// Summary is the compact per-run telemetry tallied from the OpenCode event
+	// stream (#172). Omitted when the run recorded no activity.
+	Summary *courierv1alpha1.RunTelemetry `json:"summary,omitempty"`
 }
 
 func main() {
@@ -216,6 +221,7 @@ type reporter struct {
 	stderr io.Writer
 	events *courierlog.Emitter
 	red    *courierlog.Redactor
+	tel    *telemetry.Tracker
 	cfg    config
 }
 
@@ -230,7 +236,7 @@ func newReporter(stdout, stderr io.Writer, cfg config) reporter {
 	red.RegisterEnvironment(os.Environ())
 	red.Register(cfg.GitToken)
 	red.Register(cfg.GitHubToken)
-	return reporter{stdout: stdout, stderr: stderr, events: events, red: red, cfg: cfg}
+	return reporter{stdout: stdout, stderr: stderr, events: events, red: red, tel: telemetry.New(), cfg: cfg}
 }
 
 // event writes one structured run event. Emission is best-effort: a failure
@@ -255,6 +261,12 @@ func (r reporter) event(eventType, status string, detail map[string]any) {
 // terminate publishes the terminal handoff: the legacy COURIER_TERMINATION
 // line with a redacted reason, plus the run.exit event.
 func (r reporter) terminate(result termination) {
+	if r.tel != nil {
+		if compact := r.tel.Compact(); compact != nil {
+			result.Summary = compact
+			r.emitRunSummary(r.tel.Summary())
+		}
+	}
 	result.Reason = truncateTerminationReason(r.red.Redact(result.Reason))
 	emitTermination(r.stdout, r.cfg, result)
 	status := courierlog.StatusOK
@@ -359,6 +371,26 @@ func (r reporter) emitCapabilityStatus(caps []executor.MCPCapability) {
 	}
 }
 
+// emitRunSummary reports the run's tallied telemetry as a structured event.
+// The summary detail is always included (Verbose) so it reaches the log store
+// on every finished run, not only on debug runs; the emitter redacts it.
+func (r reporter) emitRunSummary(s telemetry.Summary) {
+	err := r.events.Emit(courierlog.Event{
+		Type:    courierlog.EventRunSummary,
+		RunID:   r.cfg.RunID,
+		Repo:    r.cfg.Repo,
+		Ref:     r.cfg.Ref,
+		Mode:    r.cfg.Mode,
+		Model:   r.cfg.Model,
+		Status:  courierlog.StatusOK,
+		Verbose: true,
+		Detail:  map[string]any{"summary": s},
+	})
+	if err != nil {
+		fmt.Fprintf(r.stderr, "courier: dropped %s event: %v\n", courierlog.EventRunSummary, err)
+	}
+}
+
 // tapMaxLine bounds the session tap's buffer for an unfinished line, so a
 // child emitting one enormous line cannot grow it without limit.
 const tapMaxLine = 1 << 20
@@ -377,6 +409,7 @@ type sessionTap struct {
 	pending   []byte
 	sessionID string
 	lastText  string
+	tel       *telemetry.Tracker
 }
 
 func newSessionTap(w io.Writer) *sessionTap {
@@ -412,6 +445,9 @@ func (t *sessionTap) Flush() error {
 // scan extracts the session id and assistant text from one JSON event line.
 // Lines that are not JSON events are ignored.
 func (t *sessionTap) scan(line []byte) {
+	if t.tel != nil {
+		t.tel.Observe(line)
+	}
 	var event struct {
 		SessionID string `json:"sessionID"`
 		Part      *struct {
@@ -529,6 +565,7 @@ func run(ctx context.Context, stdout, stderr io.Writer) int {
 	stdoutRedacted := courierlog.NewRedactingWriter(stdout, report.red)
 	stderrTransport := courierlog.NewRedactingWriter(stderr, report.red)
 	tap := newSessionTap(stdoutRedacted)
+	tap.tel = report.tel
 
 	// Recoverable workspace endings and crashes share one continuation budget.
 	continuations, crashes := 0, 0
@@ -539,6 +576,7 @@ func run(ctx context.Context, stdout, stderr io.Writer) int {
 	)
 
 	for {
+		report.tel.SetContinuations(continuations)
 		if continuations > 0 {
 			// A declaration belongs to one completed turn; never let a stale
 			// declaration from an earlier turn decide the resumed run.

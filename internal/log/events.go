@@ -77,6 +77,11 @@ const (
 	// outcome posts (#169). A failed comment is an error event, never a run
 	// failure.
 	EventOutcomeComment = "outcome.comment"
+	// EventRunSummary reports the compact per-run telemetry tallied from the
+	// coordinator's OpenCode event stream (#172), emitted next to the terminal
+	// handoff. Its detail is always included (Verbose) so the summary reaches
+	// the log store on every finished run, not only on debug runs.
+	EventRunSummary = "run.summary"
 )
 
 // Status values for the status field.
