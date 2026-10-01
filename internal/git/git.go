@@ -200,6 +200,40 @@ func (w *Workspace) CurrentBranch(ctx context.Context) (string, error) {
 	return strings.TrimSpace(string(out)), nil
 }
 
+// StatusPorcelain lists the workspace's current change paths in porcelain v1
+// form, including untracked files. An empty result is a clean worktree.
+func (w *Workspace) StatusPorcelain(ctx context.Context) ([]string, error) {
+	if w == nil || strings.TrimSpace(w.Directory) == "" {
+		return nil, errors.New("git status: workspace directory is required")
+	}
+	out, err := run(ctx, w.Directory, "status", "--porcelain=v1", "-z", "--untracked-files=all", "--", ".")
+	if err != nil {
+		return nil, err
+	}
+	// With -z each entry is NUL-separated: "XY path", and a rename or copy
+	// (R/C status) is followed by the origin path as its own record, which is
+	// not a change of its own.
+	var paths []string
+	records := strings.Split(string(out), "\x00")
+	for i := 0; i < len(records); i++ {
+		record := records[i]
+		if len(record) < 4 {
+			continue
+		}
+		if isRenameStatus(record[:2]) {
+			i++
+		}
+		paths = append(paths, record[3:])
+	}
+	return paths, nil
+}
+
+// isRenameStatus reports whether a porcelain v1 status pair is a rename (R)
+// or copy (C) entry whose next NUL record is the origin path.
+func isRenameStatus(status string) bool {
+	return status[0] == 'R' || status[0] == 'C'
+}
+
 // CommitsOnBranchSince reports how many commits are reachable from the local
 // branch ref but not from startCommit. A branch ref that cannot be resolved
 // (e.g. it does not exist) reports 0 with no error, because the absence of

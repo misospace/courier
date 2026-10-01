@@ -38,7 +38,8 @@ func DefaultOpenCode() OpenCode {
 func (o OpenCode) Name() string { return "opencode" }
 
 // Command returns an argument-vector command suitable for exec.Command. The
-// goal and lane framing are one prompt, while model selection is explicit.
+// goal and lane framing are one prompt, while model selection is explicit. A
+// non-empty Session resumes that session instead of starting a new one.
 func (o OpenCode) Command(inv Invocation) Command {
 	binary := strings.TrimSpace(o.Binary)
 	if binary == "" {
@@ -50,6 +51,9 @@ func (o OpenCode) Command(inv Invocation) Command {
 	}
 	if agent := strings.TrimSpace(o.Agent); agent != "" {
 		args = append(args, "--agent", agent)
+	}
+	if session := strings.TrimSpace(inv.Session); session != "" {
+		args = append(args, "--session", session)
 	}
 	args = append(args, prompt(inv))
 	return Command{Binary: binary, Args: args}

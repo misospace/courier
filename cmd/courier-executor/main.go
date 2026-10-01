@@ -11,14 +11,18 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -44,6 +48,9 @@ const (
 	maxTerminationReasonBytes   = 1024
 	terminationTruncationSuffix = "... [truncated]"
 	defaultFormat               = "json"
+	defaultMaxContinuations     = 3
+	defaultResumeBackoff        = 5 * time.Second
+	maxResumeBackoffSeconds     = 3600
 )
 
 type config struct {
@@ -66,6 +73,8 @@ type config struct {
 	OpenCodeBinary   string
 	OpenCodeFormat   string
 	OpenCodeAgent    string
+	MaxContinuations int
+	ResumeBackoff    time.Duration
 	TerminationFile  string
 	GitUsername      string
 	GitToken         string
@@ -96,6 +105,17 @@ func readConfig(getenv func(string) string) (config, error) {
 		remoteURL = strings.TrimSpace(getenv("COURIER_REMOTE_URL"))
 	}
 	ref, _ := strconv.Atoi(strings.TrimSpace(getenv("COURIER_REF")))
+	maxContinuations, _ := strconv.Atoi(strings.TrimSpace(getenv("COURIER_MAX_CONTINUATIONS")))
+	if maxContinuations < 1 {
+		maxContinuations = defaultMaxContinuations
+	}
+	resumeBackoff, err := strconv.ParseFloat(strings.TrimSpace(getenv("COURIER_RESUME_BACKOFF_SECONDS")), 64)
+	if err != nil || math.IsNaN(resumeBackoff) || math.IsInf(resumeBackoff, 0) || resumeBackoff < 0 {
+		resumeBackoff = defaultResumeBackoff.Seconds()
+	}
+	if resumeBackoff > maxResumeBackoffSeconds {
+		resumeBackoff = maxResumeBackoffSeconds
+	}
 	cfg := config{
 		RemoteURL:        remoteURL,
 		BaseRemoteURL:    strings.TrimSpace(getenv("COURIER_BASE_REPO_URL")),
@@ -115,6 +135,8 @@ func readConfig(getenv func(string) string) (config, error) {
 		OpenCodeBinary:   strings.TrimSpace(getenv("COURIER_OPENCODE_BINARY")),
 		OpenCodeFormat:   strings.TrimSpace(getenv("COURIER_OPENCODE_FORMAT")),
 		OpenCodeAgent:    strings.TrimSpace(getenv("COURIER_OPENCODE_AGENT")),
+		MaxContinuations: maxContinuations,
+		ResumeBackoff:    time.Duration(resumeBackoff * float64(time.Second)),
 		TerminationFile:  strings.TrimSpace(getenv("COURIER_TERMINATION_FILE")),
 		GitUsername:      getenv("COURIER_GIT_USERNAME"),
 		GitToken:         getenv("COURIER_GIT_TOKEN"),
@@ -337,6 +359,85 @@ func (r reporter) emitCapabilityStatus(caps []executor.MCPCapability) {
 	}
 }
 
+// tapMaxLine bounds the session tap's buffer for an unfinished line, so a
+// child emitting one enormous line cannot grow it without limit.
+const tapMaxLine = 1 << 20
+
+// tapLastTextLimit bounds how much of the last assistant text part the tap
+// keeps, in runes.
+const tapLastTextLimit = 200
+
+// sessionTap is a pass-through stdout transport that scans the child's
+// newline-delimited JSON event lines while they pass. It captures the first
+// sessionID and the last assistant text part so a recoverable exit can
+// resume the same session; it never alters the bytes it forwards. lastText
+// intentionally persists across resumed turns when a new turn emits no text.
+type sessionTap struct {
+	w         io.Writer
+	pending   []byte
+	sessionID string
+	lastText  string
+}
+
+func newSessionTap(w io.Writer) *sessionTap {
+	return &sessionTap{w: w}
+}
+
+func (t *sessionTap) Write(p []byte) (int, error) {
+	n, err := t.w.Write(p)
+	t.pending = append(t.pending, p...)
+	for {
+		idx := bytes.IndexByte(t.pending, '\n')
+		if idx < 0 {
+			break
+		}
+		t.scan(t.pending[:idx])
+		t.pending = t.pending[idx+1:]
+	}
+	if len(t.pending) > tapMaxLine {
+		t.pending = nil
+	}
+	return n, err
+}
+
+// Flush scans a trailing partial line after the child exits.
+func (t *sessionTap) Flush() error {
+	if len(t.pending) > 0 {
+		t.scan(t.pending)
+		t.pending = nil
+	}
+	return nil
+}
+
+// scan extracts the session id and assistant text from one JSON event line.
+// Lines that are not JSON events are ignored.
+func (t *sessionTap) scan(line []byte) {
+	var event struct {
+		SessionID string `json:"sessionID"`
+		Part      *struct {
+			Type string `json:"type"`
+			Text string `json:"text"`
+		} `json:"part"`
+	}
+	if err := json.Unmarshal(line, &event); err != nil {
+		return
+	}
+	if event.SessionID != "" && t.sessionID == "" {
+		t.sessionID = event.SessionID
+	}
+	if event.Part != nil && event.Part.Type == "text" {
+		t.lastText = truncatedRunes(event.Part.Text, tapLastTextLimit)
+	}
+}
+
+func truncatedRunes(value string, limit int) string {
+	runes := []rune(value)
+	if len(runes) <= limit {
+		return value
+	}
+	return string(runes[:limit])
+}
+
 func run(ctx context.Context, stdout, stderr io.Writer) int {
 	cfg, err := readConfig(os.Getenv)
 	report := newReporter(stdout, stderr, cfg)
@@ -423,68 +524,208 @@ func run(ctx context.Context, stdout, stderr io.Writer) int {
 	if note := capabilityNote(caps); note != "" {
 		cfg.Framing = strings.TrimSpace(cfg.Framing + "\n\n" + report.red.Redact(note))
 	}
-	command := runtime.Command(executor.Invocation{
-		Goal:      cfg.Goal,
-		Model:     cfg.Model,
-		Framing:   cfg.Framing,
-		Workspace: workspace.Directory,
-	})
-	report.event(courierlog.EventExecutorStart, courierlog.StatusOK, map[string]any{
-		"executor": runtime.Name(),
-		"format":   cfg.OpenCodeFormat,
-	})
-	// The child's output is untrusted verbose tool I/O: route both streams
-	// through the run's redactor before they reach the real stdout/stderr
-	// (DESIGN.md: redact before stdout). The transport is transparent — no
-	// semantic parsing, ordering and stream separation preserved. Lines
-	// buffered across Write chunks are flushed after the child exits.
-	stdoutTransport := courierlog.NewRedactingWriter(stdout, report.red)
+	// Child output is redacted before it reaches the run streams. The session tap
+	// observes OpenCode's JSON events without changing their bytes.
+	stdoutRedacted := courierlog.NewRedactingWriter(stdout, report.red)
 	stderrTransport := courierlog.NewRedactingWriter(stderr, report.red)
-	process := exec.CommandContext(ctx, command.Binary, command.Args...)
-	process.Dir = workspace.Directory
-	process.Stdout = stdoutTransport
-	process.Stderr = stderrTransport
-	err = process.Run()
-	// Release whatever the child left as a final partial line before the
-	// outcome is reported, so output ordering stays faithful.
-	_ = stdoutTransport.Flush()
-	_ = stderrTransport.Flush()
-	if err != nil {
-		code := processExitCode(err)
-		if code < 0 {
-			code = exitFailed
-		}
-		// A non-zero child exit is a failure, never a human-attention signal.
-		// The child's raw code must not pass through: the operator maps 2 to
-		// NeedsHuman and 3 to AwaitingReview or NeedsHuman by run mode, so
-		// terminate with the standard failure code and keep the child's code
-		// in the reason.
-		report.terminate(termination{Phase: "Failed", Result: "failure", ExitCode: exitFailed, Reason: fmt.Sprintf("opencode exited with status %d", code)})
-		return exitFailed
-	}
+	tap := newSessionTap(stdoutRedacted)
 
-	if workspace.Conflict != nil {
-		if reason := unresolvedBaseSync(ctx, workspace); reason != "" {
-			report.terminate(termination{Phase: "NeedsHuman", Result: "needs-human", ExitCode: exitNeedsHuman, Reason: reason})
+	// Recoverable workspace endings and crashes share one continuation budget.
+	continuations, crashes := 0, 0
+	var (
+		stateMessage    string
+		prevFingerprint string
+		history         []string
+	)
+
+	for {
+		if continuations > 0 {
+			// A declaration belongs to one completed turn; never let a stale
+			// declaration from an earlier turn decide the resumed run.
+			if err := os.Remove(outcomePath); err != nil && !os.IsNotExist(err) {
+				report.terminate(failed("clear stale outcome declaration: " + err.Error()))
+				return exitFailed
+			}
+		}
+
+		invocation := executor.Invocation{
+			Goal:      cfg.Goal,
+			Model:     cfg.Model,
+			Framing:   cfg.Framing,
+			Workspace: workspace.Directory,
+		}
+		if stateMessage != "" {
+			invocation = executor.Invocation{
+				Goal:      stateMessage,
+				Model:     cfg.Model,
+				Workspace: workspace.Directory,
+				Session:   tap.sessionID,
+			}
+		}
+		command := runtime.Command(invocation)
+		report.event(courierlog.EventExecutorStart, courierlog.StatusOK, map[string]any{
+			"executor": runtime.Name(),
+			"format":   cfg.OpenCodeFormat,
+			"resumed":  stateMessage != "",
+		})
+		process := exec.CommandContext(ctx, command.Binary, command.Args...)
+		process.Dir = workspace.Directory
+		process.Stdout = tap
+		process.Stderr = stderrTransport
+		processErr := process.Run()
+		_ = tap.Flush()
+		_ = stdoutRedacted.Flush()
+		_ = stderrTransport.Flush()
+
+		if processErr != nil {
+			code := processExitCode(processErr)
+			if code < 0 {
+				code = exitFailed
+			}
+			// Raw child exit 2 is not a declaration; only the verified outcome
+			// handoff may request NeedsHuman.
+			if code == exitNeedsHuman {
+				report.terminate(failed(fmt.Sprintf("opencode exited with status %d", code)))
+				return exitFailed
+			}
+			if tap.sessionID != "" && ctx.Err() == nil && continuations < cfg.MaxContinuations {
+				continuations++
+				crashes++
+				report.event(courierlog.EventExecutorContinuation, courierlog.StatusOK, map[string]any{
+					"kind":         "crash",
+					"code":         code,
+					"continuation": continuations,
+				})
+				delay := cfg.ResumeBackoff * time.Duration(1<<min(crashes-1, 10))
+				select {
+				case <-time.After(delay):
+				case <-ctx.Done():
+				}
+				if ctx.Err() != nil {
+					report.terminate(failed(fmt.Sprintf("opencode exited with status %d and the context was canceled", code)))
+					return exitFailed
+				}
+				stateMessage = fmt.Sprintf("Your previous turn ended unexpectedly (opencode exited with status %d). Continue working toward the goal.", code)
+				continue
+			}
+			reason := fmt.Sprintf("opencode exited with status %d", code)
+			if continuations > 0 {
+				reason += fmt.Sprintf(" after %d continuations", continuations)
+			}
+			report.terminate(failed(reason))
+			return exitFailed
+		}
+
+		if workspace.Conflict != nil {
+			if reason := unresolvedBaseSync(ctx, workspace); reason != "" {
+				report.terminate(termination{Phase: "NeedsHuman", Result: "needs-human", ExitCode: exitNeedsHuman, Reason: reason})
+				return exitNeedsHuman
+			}
+		}
+
+		decl, declared, declErr := readOutcome(outcomePath)
+		if err := os.Remove(outcomePath); err != nil && !os.IsNotExist(err) {
+			fmt.Fprintf(report.stderr, "courier: could not remove outcome declaration: %s\n", report.red.Redact(err.Error()))
+		}
+		workState, err := workspace.WorkState(ctx, startCommit)
+		if err != nil {
+			report.terminate(failed("inspect workspace result: " + err.Error()))
+			return exitFailed
+		}
+		if declErr != nil || declared {
+			result := report.classify(ctx, workspace, cfg.Branch, startCommit, workState, decl, declared, declErr, caps)
+			report.terminate(result)
+			return result.ExitCode
+		}
+
+		// With no explicit declaration, the verified git state decides whether
+		// the turn succeeded or needs another opportunity in the same session.
+		head, headErr := workspace.Head(ctx)
+		branch, branchErr := workspace.CurrentBranch(ctx)
+		dirty, dirtyErr := workspace.StatusPorcelain(ctx)
+		slices.Sort(dirty)
+		worldReadFailed := headErr != nil || branchErr != nil || dirtyErr != nil
+
+		var kind, message, summary string
+		switch workState {
+		case git.WorkStateCommitted:
+			ahead, branchReadErr := workspace.CommitsOnBranchSince(ctx, cfg.Branch, startCommit)
+			if branchReadErr != nil || ahead > 0 {
+				report.terminate(termination{Phase: "Verifying", Result: "success", ExitCode: exitSuccess, Reason: "opencode completed with committed work"})
+				return exitSuccess
+			}
+			whereClause := "a detached HEAD"
+			if branchErr != nil {
+				whereClause = "an unknown branch"
+			} else if branch != "" {
+				whereClause = fmt.Sprintf("branch %q", branch)
+			}
+			kind = "off-branch"
+			message = fmt.Sprintf("You committed work that is not on the run branch %q (HEAD is on %s). Move your commits onto %q and push, or declare needs_decision or blocked_external if a human is needed.", cfg.Branch, whereClause, cfg.Branch)
+			summary = stateSummary(kind, head, tap.lastText, nil)
+		case git.WorkStateDirty:
+			listed := dirty
+			more := ""
+			if len(listed) > maxContinuationPaths {
+				more = fmt.Sprintf(" (and %d more)", len(listed)-maxContinuationPaths)
+				listed = listed[:maxContinuationPaths]
+			}
+			kind = "uncommitted"
+			if dirtyErr != nil {
+				message = fmt.Sprintf("You ended with uncommitted changes; commit and push them to %q, or discard them and declare needs_decision or blocked_external if a human is needed.", cfg.Branch)
+			} else {
+				message = fmt.Sprintf("You ended with uncommitted changes in %s%s; commit and push them to %q, or discard them and declare needs_decision or blocked_external if a human is needed.", strings.Join(listed, ", "), more, cfg.Branch)
+			}
+			summary = stateSummary(kind, head, tap.lastText, listed)
+		default:
+			kind = "no-work"
+			message = fmt.Sprintf("You ended without producing a commit or workspace changes and did not declare an outcome. Continue the work and push it to %q, or declare needs_decision or blocked_external if a human is needed.", cfg.Branch)
+			summary = stateSummary(kind, head, tap.lastText, nil)
+			if names := unavailableCapabilities(caps); len(names) > 0 {
+				suffix := "; configured capability unavailable: " + strings.Join(names, ", ")
+				message += suffix
+				summary += suffix
+			}
+		}
+
+		if tap.sessionID == "" {
+			// Without a captured session there is nothing to resume; apply the
+			// ordinary undeclared-outcome contract to the verified world state.
+			result := report.classifyUndeclared(ctx, workspace, cfg.Branch, startCommit, workState, caps)
+			report.terminate(result)
+			return result.ExitCode
+		}
+
+		fingerprint, err := continuationFingerprint(workState, branch, head, dirty, tap.lastText)
+		if err != nil {
+			report.terminate(failed("fingerprint workspace state: " + err.Error()))
+			return exitFailed
+		}
+		if !worldReadFailed && prevFingerprint != "" && fingerprint == prevFingerprint {
+			history = append(history, summary)
+			report.terminate(termination{Phase: "NeedsHuman", Result: "needs-human", ExitCode: exitNeedsHuman, Reason: "looping: " + summarizeHistory(history)})
 			return exitNeedsHuman
 		}
+		if continuations >= cfg.MaxContinuations {
+			history = append(history, summary)
+			report.terminate(termination{Phase: "NeedsHuman", Result: "needs-human", ExitCode: exitNeedsHuman, Reason: fmt.Sprintf("looping after %d continuations: %s", continuations, summarizeHistory(history))})
+			return exitNeedsHuman
+		}
+		continuations++
+		report.event(courierlog.EventExecutorContinuation, courierlog.StatusOK, map[string]any{
+			"kind":         kind,
+			"fingerprint":  fingerprint,
+			"continuation": continuations,
+		})
+		history = append(history, summary)
+		if worldReadFailed {
+			prevFingerprint = ""
+		} else {
+			prevFingerprint = fingerprint
+		}
+		stateMessage = message
 	}
 
-	// The declaration lives outside the workspace, so it can never read back as
-	// workspace work (#169).
-	decl, declared, declErr := readOutcome(outcomePath)
-	if err := os.Remove(outcomePath); err != nil && !os.IsNotExist(err) {
-		fmt.Fprintf(report.stderr, "courier: could not remove outcome declaration: %s\n", report.red.Redact(err.Error()))
-	}
-
-	workState, err := workspace.WorkState(ctx, startCommit)
-	if err != nil {
-		report.terminate(termination{Phase: "Failed", Result: "failure", ExitCode: exitFailed, Reason: "inspect workspace result: " + err.Error()})
-		return exitFailed
-	}
-	result := report.classify(ctx, workspace, cfg.Branch, startCommit, workState, decl, declared, declErr, caps)
-	report.terminate(result)
-	return result.ExitCode
 }
 
 // The outcome kinds the coordinator may declare (#169).
@@ -735,6 +976,54 @@ func unresolvedBaseSync(ctx context.Context, workspace *git.Workspace) string {
 		return "the run branch does not contain " + base + "; the conflicted base-sync merge was abandoned instead of resolved"
 	}
 	return ""
+}
+
+// maxContinuationPaths bounds the number of dirty paths included in a resume message.
+const maxContinuationPaths = 20
+
+// summarizeHistory numbers each recorded state for a looping termination reason.
+func summarizeHistory(history []string) string {
+	entries := make([]string, len(history))
+	for i, entry := range history {
+		entries[i] = fmt.Sprintf("%d) %s", i+1, entry)
+	}
+	return strings.Join(entries, "; ")
+}
+
+type continuationFingerprintState struct {
+	WorkState git.WorkState `json:"work_state"`
+	Branch    string        `json:"branch"`
+	Head      string        `json:"head"`
+	Dirty     []string      `json:"dirty"`
+	LastText  string        `json:"last_text"`
+}
+
+func continuationFingerprint(workState git.WorkState, branch, head string, dirty []string, lastText string) (string, error) {
+	encoded, err := json.Marshal(continuationFingerprintState{
+		WorkState: workState,
+		Branch:    branch,
+		Head:      head,
+		Dirty:     dirty,
+		LastText:  lastText,
+	})
+	if err != nil {
+		return "", err
+	}
+	digest := sha256.Sum256(encoded)
+	return hex.EncodeToString(digest[:]), nil
+}
+
+func stateSummary(kind, head, lastText string, paths []string) string {
+	summary := kind
+	if kind == "uncommitted" {
+		summary += " [" + strings.Join(paths, ", ") + "]"
+	}
+	details := make([]string, 0, 2)
+	if head != "" {
+		details = append(details, "head "+head)
+	}
+	details = append(details, "last message "+strconv.Quote(lastText))
+	return summary + " (" + strings.Join(details, ", ") + ")"
 }
 
 // envIdentity reconstructs run identity from the environment for exit paths

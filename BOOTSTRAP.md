@@ -116,10 +116,20 @@ fix-pr run to `NeedsHuman`, never settling the source; its blocked lifecycle
 report parks the PR-fix item as `BLOCKED`/needs-human. The evidence, question,
 or missing explanation is posted in full after redaction; only the separate
 termination reason is bounded and redacted. Comment posting is best-effort:
-failures are logged as `outcome.comment` and do not change the ending. Any other
-exit moves it to `Failed`; continuation behavior is future #170 work and is
-outside this mapping.
+failures are logged as `outcome.comment` and do not change the ending.
 
-The OpenCode shim does not survive pod/model restarts with conversational state.
-Git commits and the remote branch are its durable floor until the custom harness
-replaces it.
+When no outcome is declared, recoverable endings — uncommitted changes, commits
+off the run branch, or no commit and no workspace changes — resume the same
+session with a short state message, up to `COURIER_MAX_CONTINUATIONS` times
+(default 3). Invalid, zero, or negative values use the default; any positive
+value, including 1, is accepted. Without a captured session, these undeclared
+endings fail as incomplete. A no-progress guard ends the run as `NeedsHuman` with
+reason `looping`; reaching the continuation cap also ends it as `NeedsHuman` with
+state history. A crash resumes the session with exponential backoff (default 5s,
+`COURIER_RESUME_BACKOFF_SECONDS`), sharing the same continuation budget, before
+the run moves to `Failed`; a crash before any session ID is observed moves it to
+`Failed` immediately. A child exit code alone is not a declared outcome.
+
+The OpenCode shim resumes a run's session only inside the running pod; it does
+not survive pod/model restarts with conversational state. Git commits and the
+remote branch are its durable floor until the custom harness replaces it.

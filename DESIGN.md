@@ -189,11 +189,14 @@ Comments preserve the full declared evidence, question, or missing explanation
 after redaction; they are not shortened to the termination reason. Comment
 posting is best-effort: failures are logged as `outcome.comment` and do not change
 the run ending. The separate termination reason is bounded and redacted before it
-is published. An
-undeclared ending is not interpreted as a human request: verified commits on
-the run branch may still proceed to **Verifying**; otherwise the ending is
-incomplete and fails under the current contract. Continuation behavior is
-future #170 work and is separate from this exit mapping.
+is published. An undeclared ending is not interpreted as a coordinator's human
+request. Verified
+commits on the run branch may proceed to **Verifying**; otherwise, when a
+session was captured, recoverable workspace states resume that session with a
+short state message under the #170 continuation budget and no-progress guard.
+Without a session to resume, undeclared dirty, off-branch, or no-work endings
+fail as incomplete. Crash recovery uses the same budget and backoff described
+below.
 
 Feedback or a merge conflict does not reopen the run. It spawns a **fresh
 `fix-pr` `CoderRun`** (via the source — dispatch's pr-fix queue, or a
@@ -304,10 +307,13 @@ to die.
   single wedge.
 
 This heartbeat catches a *wedged* run but not a *spinning* one (busy-looping,
-streaming happily, converging on nothing). A conservative content-based
-loop-detector — the same tool call, same args, same result, N times — is a
-possible **V2** addition; it is orthogonal to the heartbeat and must be tuned not
-to false-kill genuinely slow, varied work.
+streaming happily, converging on nothing). #170 implemented a bounded,
+executor-level no-progress guard — the same workspace-state fingerprint and the
+same last assistant message twice, or the continuation cap — that terminates a
+stuck run as `NeedsHuman` with reason `looping`. A broader conservative
+content-based loop-detector — the same tool call, same args, same result, N
+times — remains a possible **V2** addition; it is orthogonal to the heartbeat
+and must be tuned not to false-kill genuinely slow, varied work.
 
 ## State and checkpointing
 
@@ -506,11 +512,24 @@ it modest" with `concurrency: 1`. Same schema, no local assumption baked in.
   populate these fields (#102). The executor classifies its declaration against
   the world before the run terminalizes: exit `0` (`changes`) reaches
   **Verifying** only when committed work is reachable from the run branch, and
-  work committed elsewhere is not success; exit `2` (`needs_decision` or
+  work committed elsewhere is not success. Exit `2` (`needs_decision` or
   `blocked_external`) reaches **NeedsHuman**; exit `3` (`no_change_needed`)
   reaches **AwaitingReview** for resolve-issue and **NeedsHuman** for fix-pr.
-  Other failure exits reach **Failed**. A pod death or heartbeat stall
-  relaunches/resumes it; a crashloop reaches NeedsHuman.
+  Other failure exits reach **Failed**. When no outcome is declared, recoverable
+  endings — uncommitted changes, commits off the run branch, or no commit and no
+  workspace changes — resume the same session with a short state message, up to
+  `COURIER_MAX_CONTINUATIONS` times (default 3). Invalid, zero, or negative
+  values use the default; any positive value, including 1, is accepted. A
+  no-progress guard terminates earlier as **NeedsHuman** with reason `looping`
+  and the state history; reaching the continuation cap also terminates as
+  **NeedsHuman** with reason `looping after N continuations` plus the state
+  history. Without a captured session,
+  undeclared endings fail as incomplete. A crash resumes the session
+  with exponential backoff (default 5s, `COURIER_RESUME_BACKOFF_SECONDS`),
+  sharing the same budget, before the run transitions to **Failed**; a crash
+  before any session ID is observed transitions to **Failed** immediately. A
+  child exit code alone is not a declared outcome. A pod death or heartbeat
+  stall relaunches/resumes it; a crashloop reaches NeedsHuman.
 - **Verifying** — no coordinator pod or liveness meaning. The operator polls
   the external PR and CI world indefinitely, with a reconciliation cadence and
   no deadline. Observer errors remain Verifying and requeue. A missing observer,
@@ -728,6 +747,11 @@ A running log of architectural decisions and their reasoning, newest first. The
 body above describes the current architecture; this log preserves *why* and what
 was superseded.
 
+- **2026-09-30 — #170: preserve continuation-state boundaries in loop fingerprints.**
+  Delimiter-joined fields can collide when paths or other values contain those
+  delimiters. Hashing typed JSON preserves field boundaries and keeps raw paths
+  and assistant text out of continuation events; termination history remains
+  separately redacted. (#170)
 - **2026-09-30 — #169/#175: declare outcomes outside the worktree; never settle
   from a declaration alone.** #169 replaced inference of coordinator intent from
   workspace state with explicit `changes`, `no_change_needed`, `needs_decision`,
@@ -739,15 +763,15 @@ was superseded.
   its complete redacted evidence and exits `3`: resolve-issue waits in
   `AwaitingReview`/`in-review`, while fix-pr ends `NeedsHuman`; the blocked report
   itself parks the PR-fix item as `BLOCKED`/needs-human, and
-  `BlockedReportParksPRFix` skips only the redundant queue-mark call — it does not wake
-  a reviewer. Neither outcome resolves the source. `needs_decision` and
+  `BlockedReportParksPRFix` skips only the redundant queue-mark call — it does not
+  wake a reviewer. Neither outcome resolves the source. `needs_decision` and
   `blocked_external` post the complete redacted question or missing explanation
   and exit `2` to `NeedsHuman` with a blocked report. Only the distinct
   termination reason is bounded before publication. The controller carries the
   bounded blocked-external reason into the source lifecycle report and preserves
-  it across durable report retries. The earlier #169 contract
-  resolved `no_change_needed` and treated `blocked_external` as retryable
-  `Failed`; both are superseded. (#169, #175)
+  it across durable report retries. The earlier #169 contract resolved
+  `no_change_needed` and treated `blocked_external` as retryable `Failed`; both
+  are superseded. (#169, #175)
 - **2026-09-29 — #178: a run's own terminal phase is never gated on a source
   report.** `transitionTerminal` used to publish the source transition and
   lifecycle report before writing the phase, so a rejected report kept the run
@@ -758,11 +782,26 @@ was superseded.
   terminal phase first — capacity frees regardless of the source — then publishes
   the report on its own, retried via a bounded requeue and deduplicated by the
   run's idempotency key. A generation mismatch is mapped in the Dispatch adapter
-  to a typed superseded error the controller recognizes and *drops*: the report is
-  a record of the old attempt and the newer generation belongs to another run,
+  to a typed superseded error the controller recognizes and *drops*: the report
+  is a record of the old attempt and the newer generation belongs to another run,
   matching the #98 settlement contract. A retry cap was deliberately not added —
   it would be a governor on a harmless idempotent retry, and the run itself is
   never held. (#178)
+- **2026-09-29 — Resume the coordinator session on recoverable endings.** A
+  run that ends recoverably — uncommitted changes, commits off the run branch,
+  no commit and no declared outcome — and a run whose session crashed, no longer
+  terminates at once. The executor resumes the same session with a short state
+  message built from world facts, up to `COURIER_MAX_CONTINUATIONS` times
+  (default 3); a no-progress guard — the same workspace-state fingerprint and
+  the same last assistant message twice — terminates earlier as `NeedsHuman`
+  with reason `looping` and the state history. A crash resumes with exponential
+  backoff before the run fails. Exit `2` remains an immediate `NeedsHuman`
+  passthrough only for an explicit declaration; a raw child exit `2` remains a
+  failure, and a recoverable ending without a captured session fails as
+  incomplete. This extends the 2026-09-22 honest-termination decision (#81) and
+  the 2026-09-27 run-branch decision (#134), and follows the "inform, don't
+  constrain" principle: the model gets the facts and decides, and the harness
+  only stops genuinely stuck runs. (#170)
 - **2026-09-27 — #122 lands the broker publication primitives.** The broker owns
   the whole publication path: a pinned, non-force git transport to one explicit
   ref, a typed forge observer (never raw forge calls), an authenticated

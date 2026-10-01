@@ -54,6 +54,15 @@ func TestOpenCodeCommandIncludesConfiguredAgent(t *testing.T) {
 	}
 }
 
+func TestOpenCodeCommandResumesSession(t *testing.T) {
+	invocation := Invocation{Goal: "continue the work", Model: "model", Session: "ses_123"}
+	command := (OpenCode{Binary: "opencode", Format: "json"}).Command(invocation)
+	want := []string{"run", "--model", "model", "--format", "json", "--session", "ses_123", "continue the work\n\nUse the Courier scratch directory at /var/tmp/courier-scratch (also set as TMPDIR) for all temporary work, and tell any delegated sub-agents to do the same.\n\nThe lane may mount toolchain reference sources (module and toolchain caches) read-only at /courier-toolchain (also set as COURIER_TOOLCHAIN_DIR); when present, inspect them there instead of reaching for paths outside the checkout."}
+	if !sameStrings(command.Args, want) {
+		t.Fatalf("command args = %#v, want %#v", command.Args, want)
+	}
+}
+
 func TestOpenCodeResultMapsEveryTermination(t *testing.T) {
 	runtime := DefaultOpenCode()
 	for _, test := range []struct {

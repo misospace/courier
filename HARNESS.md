@@ -756,9 +756,12 @@ reaches `Verifying` only when commits are reachable from the run branch; exit
 `2` (`needs_decision` or `blocked_external`) reaches `NeedsHuman`; exit `3`
 (`no_change_needed`) reaches `AwaitingReview` with source `in-review` for
 resolve-issue runs and `NeedsHuman` for fix-pr runs; every other exit is
-`Failed` under the current contract. Continuation behavior is future #170 work
-and is separate from this exit mapping. A `no_change_needed` result never
-resolves the source. For fix-pr, its blocked lifecycle report parks the PR-fix
+`Failed` under the current contract. Session recovery for undeclared recoverable
+endings is shipped: with a captured session, dirty, off-branch, and no-work
+states resume under the #170 continuation budget and no-progress guard; without
+a captured session, those endings fail as incomplete. This does not change the
+declared-outcome exit mapping above. A `no_change_needed` result never resolves
+the source. For fix-pr, its blocked lifecycle report parks the PR-fix
 item as `BLOCKED`/needs-human; `BlockedReportParksPRFix` skips only the redundant
 queue-mark call and does not wake a reviewer or request another review.
 

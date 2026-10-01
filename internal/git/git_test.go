@@ -9,6 +9,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"reflect"
+	"slices"
 	"strings"
 	"testing"
 )
@@ -418,6 +419,31 @@ func TestWorkStateDistinguishesNoWorkDirtyWorkAndCommits(t *testing.T) {
 	state, err = workspace.WorkState(context.Background(), start)
 	if err != nil || state != WorkStateDirty {
 		t.Fatalf("WorkState(commit with staged edit) = %q, %v; want dirty", state, err)
+	}
+}
+
+func TestStatusPorcelainReturnsChangePathsNotRawLines(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	initRepo(t, root)
+	writeFile(t, filepath.Join(root, "tracked.txt"), "base\n")
+	writeFile(t, filepath.Join(root, "moved.txt"), "move me\n")
+	commit(t, root, "base: initial")
+	workspace := &Workspace{Directory: root}
+
+	// A modified tracked file, an untracked file, and a rename.
+	writeFile(t, filepath.Join(root, "tracked.txt"), "edited\n")
+	writeFile(t, filepath.Join(root, "untracked.txt"), "new\n")
+	git(t, root, "mv", "moved.txt", "renamed.txt")
+
+	paths, err := workspace.StatusPorcelain(ctx)
+	if err != nil {
+		t.Fatalf("StatusPorcelain: %v", err)
+	}
+	slices.Sort(paths)
+	want := []string{"renamed.txt", "tracked.txt", "untracked.txt"}
+	if !reflect.DeepEqual(paths, want) {
+		t.Fatalf("StatusPorcelain() = %v, want %v (paths, not porcelain lines; a rename reports the new name, not the origin)", paths, want)
 	}
 }
 
