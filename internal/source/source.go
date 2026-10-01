@@ -6,6 +6,7 @@ package source
 import (
 	"context"
 	"errors"
+	"time"
 )
 
 // ErrStaleWork indicates that claimed source work no longer needs a coordinator.
@@ -98,6 +99,9 @@ type Lifecycle struct {
 	// IdempotencyKey identifies the publication so a source can deduplicate a
 	// retry of the same report. Empty means the source has no deduplication.
 	IdempotencyKey string
+	// StartedAt is the coordinator container start time, reported so sources
+	// can record real run durations; optional.
+	StartedAt *time.Time
 }
 
 // Reporter optionally publishes lifecycle results in addition to ordinary

@@ -453,6 +453,11 @@ status:
   headRepo: <PR head repo; spec.repo for a same-repo PR, the fork's owner/name for a fork PR>
   headSHA: <head commit SHA>
   pr: <#/url>
+  admittedAt: <ts>                 # set-once: left Pending past the lane gate
+  startedAt: <ts>                  # set-once: observed from the coordinator container status
+  finishedAt: <ts>                 # set-once: the run's own execution ended (any terminal phase)
+  waitDuration: <Go duration>      # derived once: creation to start, the Waited column
+  runDuration: <Go duration>       # derived once: start to finish, the Ran column
   lastCommit: <sha>
   checkpoint:
     plan: <...>
@@ -747,6 +752,14 @@ A running log of architectural decisions and their reasoning, newest first. The
 body above describes the current architecture; this log preserves *why* and what
 was superseded.
 
+- **2026-10-01 — #167: record run timing on CoderRun status.** AdmittedAt,
+  StartedAt, and FinishedAt are set-once status timestamps, with Waited/Ran
+  printer columns derived from them. StartedAt is read from the coordinator
+  pod's container status (the world), not the reconciler clock. FinishedAt
+  records the run's own terminal transition, so AwaitingReview carries run time
+  even though merge-settling is human-gated; a later operator-marked Done never
+  moves it. StartedAt also rides the Dispatch lifecycle report so sources can
+  record real AgentRun durations. (#167)
 - **2026-09-30 — #170: preserve continuation-state boundaries in loop fingerprints.**
   Delimiter-joined fields can collide when paths or other values contain those
   delimiters. Hashing typed JSON preserves field boundaries and keeps raw paths

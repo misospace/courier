@@ -142,6 +142,18 @@ func (in *CoderRunStatus) DeepCopyInto(out *CoderRunStatus) {
 		*out = new(PublicationPolicy)
 		**out = **in
 	}
+	if in.AdmittedAt != nil {
+		in, out := &in.AdmittedAt, &out.AdmittedAt
+		*out = (*in).DeepCopy()
+	}
+	if in.StartedAt != nil {
+		in, out := &in.StartedAt, &out.StartedAt
+		*out = (*in).DeepCopy()
+	}
+	if in.FinishedAt != nil {
+		in, out := &in.FinishedAt, &out.FinishedAt
+		*out = (*in).DeepCopy()
+	}
 	if in.Checkpoint != nil {
 		in, out := &in.Checkpoint, &out.Checkpoint
 		*out = new(Checkpoint)
