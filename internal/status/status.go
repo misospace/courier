@@ -84,6 +84,10 @@ type OperatorPatch struct {
 	PR               string                `json:"pr,omitempty"`
 	CheckFingerprint *string               `json:"checkFingerprint,omitempty"`
 	Restarts         *int                  `json:"restarts,omitempty"`
+	// Telemetry is the compact per-run summary the operator persists from
+	// the coordinator's termination handoff (#172). Pointer so it is emitted
+	// only when set and cleared only by an explicit write.
+	Telemetry *courierv1alpha1.RunTelemetry `json:"telemetry,omitempty"`
 	// Conditions is the operator-owned condition set. The operator is the only
 	// writer of a CoderRun's conditions, so a merge patch carrying them replaces
 	// the array wholesale; a second writer must extend this field rather than

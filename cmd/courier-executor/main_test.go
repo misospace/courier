@@ -2586,3 +2586,130 @@ exit 0
 		t.Fatal("termination reason lost the state history")
 	}
 }
+
+// TestRunEmitsTelemetry proves the run tallies the coordinator's OpenCode
+// event stream: a run.summary event carries the rich summary next to the
+// terminal handoff, and the COURIER_TERMINATION line carries the compact form.
+func TestRunEmitsTelemetry(t *testing.T) {
+	root := t.TempDir()
+	remote := filepath.Join(root, "remote.git")
+	source := filepath.Join(root, "source")
+	runGit(t, root, "init", "--bare", remote)
+	runGit(t, root, "init", source)
+	configureGit(t, source)
+	write(t, filepath.Join(source, "README.md"), "base one\n")
+	commit(t, source, "base: initial")
+	runGit(t, source, "branch", "-M", "main")
+	runGit(t, source, "remote", "add", "origin", remote)
+	runGit(t, source, "push", "-u", "origin", "main")
+
+	orphan := filepath.Join(root, "orphan")
+	runGit(t, root, "clone", remote, orphan)
+	configureGit(t, orphan)
+	runGit(t, orphan, "checkout", "-b", "courier/resolve-issue/acme-widgets/7", "origin/main")
+	write(t, filepath.Join(orphan, "work.txt"), "previous brief\n")
+	commit(t, orphan, "work: previous brief")
+	runGit(t, orphan, "push", "origin", "HEAD:refs/heads/courier/resolve-issue/acme-widgets/7")
+
+	write(t, filepath.Join(source, "base.txt"), "moved base\n")
+	commit(t, source, "base: moved")
+	runGit(t, source, "push", "origin", "main")
+
+	fakeOpenCode := filepath.Join(root, "opencode")
+	scratchDirectory := filepath.Join(root, "scratch dir")
+	writeExecutable(t, fakeOpenCode, `#!/bin/sh
+case "$1" in mcp) exit 0;; esac
+if [ -e "$COURIER_SCRATCH_DIR/outcome.json" ]; then exit 9; fi
+printf 'scratch dir: %s\n' "$COURIER_SCRATCH_DIR"
+printf 'opencode argv: %s\n' "$*"
+printf 'completed\n' > completed.txt
+git add --all -- .
+git commit -m 'test: completed work' >/dev/null
+mkdir -p "$COURIER_SCRATCH_DIR"
+printf '{"outcome":"changes"}' > "$COURIER_SCRATCH_DIR/outcome.json"
+printf '{"sessionID":"ses_exec","part":{"type":"step-finish","tokens":{"input":100,"output":20,"reasoning":0,"cache":{"read":500,"write":10}}}}\n'
+printf '{"sessionID":"ses_exec","part":{"type":"tool","tool":"bash","state":{"status":"completed","time":{"start":1000,"end":2000}}}}\n'
+printf '{"sessionID":"ses_exec","part":{"type":"tool","tool":"task","state":{"status":"completed","time":{"start":2000,"end":7000},"input":{"subagent_type":"coder-local"},"metadata":{"model":{"modelID":"litellm/x"},"sessionId":"ses_sub"}}}}\n'
+`)
+	workspace := filepath.Join(root, "workspace")
+	if err := os.MkdirAll(scratchDirectory, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	write(t, filepath.Join(scratchDirectory, "outcome.json"), `{"outcome":"no_change_needed","evidence":"stale"}`)
+	termination := filepath.Join(root, "termination")
+	t.Setenv("COURIER_REPO_URL", remote)
+	t.Setenv("COURIER_WORKSPACE", workspace)
+	t.Setenv("COURIER_SCRATCH_DIR", scratchDirectory)
+	t.Setenv("COURIER_BASE", "main")
+	t.Setenv("COURIER_BRANCH", "courier/resolve-issue/acme-widgets/7")
+	t.Setenv("COURIER_GOAL", "Open a PR to address issue #7. Declare the outcome at "+filepath.Join(defaultScratchDirectory, defaultOutcomeFilename)+".")
+	t.Setenv("COURIER_MODEL", "any-model/name")
+	t.Setenv("COURIER_OPENCODE_AGENT", "architect")
+	t.Setenv("COURIER_FRAMING", "capacity is elastic; fan out freely")
+	t.Setenv("COURIER_OPENCODE_BINARY", fakeOpenCode)
+	t.Setenv("COURIER_TERMINATION_FILE", termination)
+	// Run identity is required or the emitter drops the run.summary event.
+	t.Setenv("COURIER_RUN_NAME", "coderrun-it-7")
+
+	var output bytes.Buffer
+	var errorsOut bytes.Buffer
+	if code := run(context.Background(), &output, &errorsOut); code != 0 {
+		t.Fatalf("run exit code = %d, stderr=%q, stdout=%q", code, errorsOut.String(), output.String())
+	}
+	if _, err := os.Stat(filepath.Join(workspace, "base.txt")); err != nil {
+		t.Fatalf("adopted branch was not synchronized to base: %v", err)
+	}
+	if !strings.Contains(output.String(), "Open a PR to address issue #7.") || !strings.Contains(output.String(), "any-model/name") || !strings.Contains(output.String(), "capacity is elastic; fan out freely") {
+		t.Fatalf("OpenCode did not receive exact goal/model/framing: %q", output.String())
+	}
+	wantOutcomePath := filepath.Join(scratchDirectory, "outcome.json")
+	if !strings.Contains(output.String(), "scratch dir: "+scratchDirectory) || !strings.Contains(output.String(), "Open a PR to address issue #7. Declare the outcome at "+wantOutcomePath) {
+		t.Fatalf("child scratch path and actual goal declaration path disagree: %q", output.String())
+	}
+	if !strings.Contains(output.String(), "--agent architect") {
+		t.Fatalf("OpenCode did not receive configured agent: %q", output.String())
+	}
+	if !strings.Contains(output.String(), `COURIER_TERMINATION {"phase":"Verifying","result":"success","exit_code":0`) {
+		t.Fatalf("missing stable success termination: %q", output.String())
+	}
+	if !strings.Contains(output.String(), `"outcome":"changes"`) {
+		t.Fatalf("runtime did not read the child's changes declaration at %q: %q", wantOutcomePath, output.String())
+	}
+	terminationOutput := string(mustRead(t, termination))
+	if !strings.Contains(terminationOutput, `"phase":"Verifying"`) {
+		t.Fatalf("termination file = %q", terminationOutput)
+	}
+
+	summary := findEvent(t, parseEvents(t, &output), "run.summary")
+	detail := eventDetail(t, summary)
+	tallied, ok := detail["summary"].(map[string]any)
+	if !ok {
+		t.Fatalf("run.summary detail carries no summary object: %v", detail)
+	}
+	if tallied["model_calls"] != float64(1) {
+		t.Fatalf("summary model_calls = %v, want 1", tallied["model_calls"])
+	}
+	if tallied["tool_calls"] != float64(2) {
+		t.Fatalf("summary tool_calls = %v, want 2", tallied["tool_calls"])
+	}
+	subagents, ok := tallied["subagents"].([]any)
+	if !ok || len(subagents) != 1 {
+		t.Fatalf("summary subagents = %v, want one entry", tallied["subagents"])
+	}
+	first, ok := subagents[0].(map[string]any)
+	if !ok {
+		t.Fatalf("first subagent entry is not an object: %v", subagents[0])
+	}
+	if first["calls"] != float64(1) {
+		t.Fatalf("subagent calls = %v, want 1", first["calls"])
+	}
+
+	start := strings.Index(output.String(), "COURIER_TERMINATION ")
+	if start < 0 {
+		t.Fatal("missing the COURIER_TERMINATION line")
+	}
+	terminationLine := output.String()[start:]
+	if !strings.Contains(terminationLine, `"summary":{"modelCalls":1,"toolCalls":2`) {
+		t.Fatalf("termination line missing the compact telemetry: %q", terminationLine)
+	}
+}
