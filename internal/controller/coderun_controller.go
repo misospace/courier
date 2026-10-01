@@ -801,11 +801,11 @@ func podBelongsToRun(pod *corev1.Pod, run *courierv1alpha1.CoderRun) bool {
 }
 
 type terminationMessage struct {
-	Phase    string `json:"phase"`
-	Result   string `json:"result"`
-	ExitCode int32  `json:"exit_code"`
-	Reason   string `json:"reason"`
-	Outcome  string `json:"outcome"`
+	Phase    string                        `json:"phase"`
+	Result   string                        `json:"result"`
+	ExitCode int32                         `json:"exit_code"`
+	Reason   string                        `json:"reason"`
+	Outcome  string                        `json:"outcome"`
 	Summary  *courierv1alpha1.RunTelemetry `json:"summary"`
 }
 
