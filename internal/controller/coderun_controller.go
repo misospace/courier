@@ -180,6 +180,9 @@ func (r *CoderRunReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 	// concurrent reconciliation cannot observe an unaccounted-for launch.
 	before := run.DeepCopy()
 	run.Status.Phase = courierv1alpha1.PhaseClaimed
+	if run.Status.AdmittedAt == nil {
+		run.Status.AdmittedAt = &metav1.Time{Time: r.clock().UTC()}
+	}
 	if err := r.patchStatus(ctx, before, &run); err != nil {
 		return ctrl.Result{}, errors.Join(err, adapter.Release(ctx, item))
 	}
@@ -409,6 +412,23 @@ func (r *CoderRunReconciler) observeRunning(ctx context.Context, run *courierv1a
 		if !podBelongsToRun(pod, run) {
 			continue
 		}
+		// The world, not the operator's clock, knows when the coordinator
+		// started: record the container's own start time, once, from whatever
+		// state the pod is in. Recording a terminated pod's start before
+		// transitionTerminal lets the terminal patch pair a RunDuration with
+		// it in the same reconcile.
+		if run.Status.StartedAt == nil {
+			if start := coordinatorContainerStart(pod); !start.IsZero() {
+				before := run.DeepCopy()
+				run.Status.StartedAt = &metav1.Time{Time: start}
+				if run.Status.WaitDuration == "" {
+					run.Status.WaitDuration = durationString(start.Sub(run.CreationTimestamp.Time))
+				}
+				if err := r.patchStatus(ctx, before, run); err != nil {
+					return ctrl.Result{}, err
+				}
+			}
+		}
 		exitCode, terminationReason, terminationOutcome, terminated := coordinatorTermination(pod)
 		if !terminated {
 			continue
@@ -532,6 +552,16 @@ func (r *CoderRunReconciler) transitionTerminal(ctx context.Context, run *courie
 		run.Status.PR = pr
 	}
 	if phaseChanged {
+		// finishedAt marks when the run's own execution ended: it is
+		// recorded on every terminal transition, set-once, so a later
+		// operator-marked Done (post-merge, currently unimplemented) never
+		// moves it.
+		if run.Status.FinishedAt == nil {
+			run.Status.FinishedAt = &metav1.Time{Time: r.clock().UTC()}
+			if run.Status.StartedAt != nil && run.Status.RunDuration == "" {
+				run.Status.RunDuration = durationString(run.Status.FinishedAt.Time.Sub(run.Status.StartedAt.Time))
+			}
+		}
 		// Persist report intent with the phase so retries can reproduce the same
 		// lifecycle without extending the CRD status schema.
 		r.setLifecycleReport(run, false, pendingLifecycleReason(intent), intent.error)
@@ -612,7 +642,15 @@ func (r *CoderRunReconciler) publishSourceLifecycle(ctx context.Context, run *co
 			return err
 		}
 	}
-	lifecycle := lifecycleForPhase(phase, state, run.Status.PR, intent)
+	var startedAt *time.Time
+	if run.Status.StartedAt != nil {
+		// Copy the time to a local before taking its address: the lifecycle
+		// report must carry the observed start, not a pointer into the run's
+		// live status that a later mutation could move.
+		t := run.Status.StartedAt.Time
+		startedAt = &t
+	}
+	lifecycle := lifecycleForPhase(phase, state, run.Status.PR, startedAt, intent)
 	lifecycle.IdempotencyKey = lifecycleIdempotencyKey(run, phase)
 	return reportLifecycle(ctx, adapter, item, lifecycle)
 }
@@ -702,8 +740,10 @@ func reportLifecycle(ctx context.Context, adapter source.Adapter, item source.Wo
 }
 
 // lifecycleForPhase maps a terminal phase to its source lifecycle report.
-func lifecycleForPhase(phase courierv1alpha1.Phase, state source.State, pr string, intent terminalLifecycleIntent) source.Lifecycle {
-	lifecycle := source.Lifecycle{State: state, PR: pr}
+// startedAt is the recorded coordinator start, so sources can report real run
+// durations; nil when the run never reached a recorded start.
+func lifecycleForPhase(phase courierv1alpha1.Phase, state source.State, pr string, startedAt *time.Time, intent terminalLifecycleIntent) source.Lifecycle {
+	lifecycle := source.Lifecycle{State: state, PR: pr, StartedAt: startedAt}
 	switch phase {
 	case courierv1alpha1.PhaseAwaitingReview:
 		if pr != "" {
@@ -748,6 +788,23 @@ func (r *CoderRunReconciler) patchStatus(ctx context.Context, before, after *cou
 	}
 	if before.Status.PR != after.Status.PR {
 		fields.PR = after.Status.PR
+	}
+	// Set-once fields: emitted only on the empty-to-set transition, so a
+	// patch can never clear a recorded timestamp.
+	if before.Status.AdmittedAt == nil && after.Status.AdmittedAt != nil {
+		fields.AdmittedAt = after.Status.AdmittedAt
+	}
+	if before.Status.StartedAt == nil && after.Status.StartedAt != nil {
+		fields.StartedAt = after.Status.StartedAt
+	}
+	if before.Status.FinishedAt == nil && after.Status.FinishedAt != nil {
+		fields.FinishedAt = after.Status.FinishedAt
+	}
+	if before.Status.WaitDuration == "" && after.Status.WaitDuration != "" {
+		fields.WaitDuration = after.Status.WaitDuration
+	}
+	if before.Status.RunDuration == "" && after.Status.RunDuration != "" {
+		fields.RunDuration = after.Status.RunDuration
 	}
 	if before.Status.CheckFingerprint != after.Status.CheckFingerprint {
 		fingerprint := after.Status.CheckFingerprint
@@ -805,6 +862,34 @@ func validTerminationPhaseResult(exitCode int32, phase, result string) bool {
 	default:
 		return phase == "Failed" && result == "failure"
 	}
+}
+
+// coordinatorContainerStart returns the coordinator container's start time as
+// the pod's status records it: the Running state while the container is up,
+// the Terminated state once it has exited. A zero result means the pod never
+// reached a recorded start, which leaves StartedAt unset.
+func coordinatorContainerStart(pod *corev1.Pod) time.Time {
+	for _, cs := range pod.Status.ContainerStatuses {
+		if cs.Name != "coordinator" {
+			continue
+		}
+		if cs.State.Running != nil {
+			return cs.State.Running.StartedAt.Time
+		}
+		if cs.State.Terminated != nil {
+			return cs.State.Terminated.StartedAt.Time
+		}
+	}
+	return time.Time{}
+}
+
+// durationString renders a duration in Go format, clamping a negative value
+// (clock skew between the kubelet and the apiserver) to zero.
+func durationString(d time.Duration) string {
+	if d < 0 {
+		d = 0
+	}
+	return d.Round(time.Second).String()
 }
 
 func coordinatorTermination(pod *corev1.Pod) (int32, string, string, bool) {

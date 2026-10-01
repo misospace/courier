@@ -262,6 +262,11 @@ func (w fakeStatusWriter) PatchStatus(ctx context.Context, name types.Namespaced
 			HeadRepo         *string               `json:"headRepo,omitempty"`
 			HeadSHA          *string               `json:"headSHA,omitempty"`
 			PR               string                `json:"pr,omitempty"`
+			AdmittedAt       *metav1.Time          `json:"admittedAt,omitempty"`
+			StartedAt        *metav1.Time          `json:"startedAt,omitempty"`
+			FinishedAt       *metav1.Time          `json:"finishedAt,omitempty"`
+			WaitDuration     string                `json:"waitDuration,omitempty"`
+			RunDuration      string                `json:"runDuration,omitempty"`
 			CheckFingerprint *string               `json:"checkFingerprint,omitempty"`
 			Restarts         *int                  `json:"restarts,omitempty"`
 			Conditions       []metav1.Condition    `json:"conditions,omitempty"`
@@ -288,6 +293,21 @@ func (w fakeStatusWriter) PatchStatus(ctx context.Context, name types.Namespaced
 	}
 	if document.Status.PR != "" {
 		run.Status.PR = document.Status.PR
+	}
+	if document.Status.AdmittedAt != nil {
+		run.Status.AdmittedAt = document.Status.AdmittedAt
+	}
+	if document.Status.StartedAt != nil {
+		run.Status.StartedAt = document.Status.StartedAt
+	}
+	if document.Status.FinishedAt != nil {
+		run.Status.FinishedAt = document.Status.FinishedAt
+	}
+	if document.Status.WaitDuration != "" {
+		run.Status.WaitDuration = document.Status.WaitDuration
+	}
+	if document.Status.RunDuration != "" {
+		run.Status.RunDuration = document.Status.RunDuration
 	}
 	if document.Status.CheckFingerprint != nil {
 		run.Status.CheckFingerprint = *document.Status.CheckFingerprint

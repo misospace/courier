@@ -33,6 +33,12 @@ spec:
     - jsonPath: .status.phase
       name: Phase
       type: string
+    - jsonPath: .status.waitDuration
+      name: Waited
+      type: string
+    - jsonPath: .status.runDuration
+      name: Ran
+      type: string
     - jsonPath: .status.pr
       name: PR
       type: string
@@ -121,6 +127,13 @@ spec:
           status:
             description: CoderRunStatus is the observed state of a CoderRun.
             properties:
+              admittedAt:
+                description: |-
+                  AdmittedAt is when the run first left Pending past the lane
+                  capacity/suspend gate. It is set exactly once and never overwritten: a
+                  released claim that is re-admitted keeps its original admitted time.
+                format: date-time
+                type: string
               branch:
                 description: |-
                   Branch is the observed work branch. Resolve-issue runs derive it from the
@@ -227,6 +240,14 @@ spec:
                 x-kubernetes-list-map-keys:
                 - type
                 x-kubernetes-list-type: map
+              finishedAt:
+                description: |-
+                  FinishedAt is when the run's execution ended (the transition to a
+                  terminal phase: AwaitingReview, NeedsHuman, Done, or Failed). It is set
+                  exactly once and never overwritten; a later transition (e.g.
+                  AwaitingReview -> Done) does not move it.
+                format: date-time
+                type: string
               headRepo:
                 description: |-
                   HeadRepo is the repository that owns the PR head branch for a fix-pr run.
@@ -331,6 +352,23 @@ spec:
                   Restarts counts infra relaunches (the crashloop backstop), not work
                   retries.
                 type: integer
+              runDuration:
+                description: |-
+                  RunDuration is the human-readable time between StartedAt and FinishedAt,
+                  in Go duration format. Written once when FinishedAt is recorded.
+                type: string
+              startedAt:
+                description: |-
+                  StartedAt is when the coordinator container first reached Running.
+                  Set once, never overwritten.
+                format: date-time
+                type: string
+              waitDuration:
+                description: |-
+                  WaitDuration is the human-readable time between creation and StartedAt,
+                  in Go duration format (e.g. "3m5s"). Written once when StartedAt is
+                  recorded.
+                type: string
             type: object
         type: object
     served: true

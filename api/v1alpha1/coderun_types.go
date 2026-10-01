@@ -161,6 +161,35 @@ type CoderRunStatus struct {
 	// +optional
 	PR string `json:"pr,omitempty"`
 
+	// AdmittedAt is when the run first left Pending past the lane
+	// capacity/suspend gate. It is set exactly once and never overwritten: a
+	// released claim that is re-admitted keeps its original admitted time.
+	// +optional
+	AdmittedAt *metav1.Time `json:"admittedAt,omitempty"`
+
+	// StartedAt is when the coordinator container first reached Running.
+	// Set once, never overwritten.
+	// +optional
+	StartedAt *metav1.Time `json:"startedAt,omitempty"`
+
+	// FinishedAt is when the run's execution ended (the transition to a
+	// terminal phase: AwaitingReview, NeedsHuman, Done, or Failed). It is set
+	// exactly once and never overwritten; a later transition (e.g.
+	// AwaitingReview -> Done) does not move it.
+	// +optional
+	FinishedAt *metav1.Time `json:"finishedAt,omitempty"`
+
+	// WaitDuration is the human-readable time between creation and StartedAt,
+	// in Go duration format (e.g. "3m5s"). Written once when StartedAt is
+	// recorded.
+	// +optional
+	WaitDuration string `json:"waitDuration,omitempty"`
+
+	// RunDuration is the human-readable time between StartedAt and FinishedAt,
+	// in Go duration format. Written once when FinishedAt is recorded.
+	// +optional
+	RunDuration string `json:"runDuration,omitempty"`
+
 	// LastCommit is the last commit pushed to the work branch.
 	// +optional
 	LastCommit string `json:"lastCommit,omitempty"`
@@ -202,6 +231,8 @@ type CoderRunStatus struct {
 // +kubebuilder:printcolumn:name="Lane",type=string,JSONPath=`.spec.lane`
 // +kubebuilder:printcolumn:name="Branch",type=string,JSONPath=`.status.branch`
 // +kubebuilder:printcolumn:name="Phase",type=string,JSONPath=`.status.phase`
+// +kubebuilder:printcolumn:name="Waited",type=string,JSONPath=`.status.waitDuration`
+// +kubebuilder:printcolumn:name="Ran",type=string,JSONPath=`.status.runDuration`
 // +kubebuilder:printcolumn:name="PR",type=string,JSONPath=`.status.pr`
 // +kubebuilder:printcolumn:name="Age",type=date,JSONPath=`.metadata.creationTimestamp`
 

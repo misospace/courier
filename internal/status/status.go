@@ -75,15 +75,29 @@ func (w KubePatchWriter) PatchStatus(ctx context.Context, name types.NamespacedN
 // observation discards stale green evidence, and a run that demonstrates
 // liveness resets its consecutive-crashloop counter to 0 — which omitempty on
 // a plain string or int cannot express: omitempty on a pointer omits only
-// nil, so a pointer to zero is still emitted.
+// nil, so a pointer to zero is still emitted. AdmittedAt, StartedAt,
+// FinishedAt, WaitDuration, and RunDuration are set-once: they are emitted
+// only on the transition from empty to set, so a nil or empty value is
+// omitted and a patch can never clear a recorded timestamp.
 type OperatorPatch struct {
-	Phase            courierv1alpha1.Phase `json:"phase,omitempty"`
-	Branch           *string               `json:"branch,omitempty"`
-	HeadRepo         *string               `json:"headRepo,omitempty"`
-	HeadSHA          *string               `json:"headSHA,omitempty"`
-	PR               string                `json:"pr,omitempty"`
-	CheckFingerprint *string               `json:"checkFingerprint,omitempty"`
-	Restarts         *int                  `json:"restarts,omitempty"`
+	Phase    courierv1alpha1.Phase `json:"phase,omitempty"`
+	Branch   *string               `json:"branch,omitempty"`
+	HeadRepo *string               `json:"headRepo,omitempty"`
+	HeadSHA  *string               `json:"headSHA,omitempty"`
+	PR       string                `json:"pr,omitempty"`
+	// AdmittedAt is set once, when the run leaves Pending past the lane
+	// capacity/suspend gate.
+	AdmittedAt *metav1.Time `json:"admittedAt,omitempty"`
+	// StartedAt is set once, when the coordinator container first ran.
+	StartedAt *metav1.Time `json:"startedAt,omitempty"`
+	// FinishedAt is set once, when the run reaches a terminal phase.
+	FinishedAt *metav1.Time `json:"finishedAt,omitempty"`
+	// WaitDuration is set once, when StartedAt is recorded.
+	WaitDuration string `json:"waitDuration,omitempty"`
+	// RunDuration is set once, when FinishedAt is recorded.
+	RunDuration      string  `json:"runDuration,omitempty"`
+	CheckFingerprint *string `json:"checkFingerprint,omitempty"`
+	Restarts         *int    `json:"restarts,omitempty"`
 	// Conditions is the operator-owned condition set. The operator is the only
 	// writer of a CoderRun's conditions, so a merge patch carrying them replaces
 	// the array wholesale; a second writer must extend this field rather than
