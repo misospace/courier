@@ -138,6 +138,165 @@ func runHelmOutput(t *testing.T, chartDir string, args ...string) (string, error
 	return string(output), err
 }
 
+func TestServiceMonitorOptional(t *testing.T) {
+	if _, err := exec.LookPath("helm"); err != nil {
+		t.Skip("helm is not installed")
+	}
+
+	chartDir := copyChart(t)
+	if err := exec.Command("helm", "repo", "add", "bjw-s-labs", "https://bjw-s-labs.github.io/helm-charts").Run(); err != nil {
+		t.Fatalf("configure chart repository: %v", err)
+	}
+	runHelm(t, chartDir, "dependency", "build")
+
+	// Off by default: no ServiceMonitor and no metrics Service.
+	disabled := runHelm(t, chartDir, "template", "courier", ".")
+	for _, unwanted := range []string{
+		"kind: ServiceMonitor",
+		"courier-metrics",
+	} {
+		if strings.Contains(disabled, unwanted) {
+			t.Fatalf("ServiceMonitor-disabled chart output unexpectedly contains %q", unwanted)
+		}
+	}
+
+	// Enabled: a ServiceMonitor and a Service exposing port 8080.
+	enabled := runHelm(t, chartDir, "template", "courier", ".",
+		"--set", "serviceMonitor.enabled=true",
+	)
+	for _, want := range []string{
+		"kind: ServiceMonitor",
+		"apiVersion: monitoring.coreos.com/v1",
+		"kind: Service",
+		"name: courier-metrics",
+		"port: 8080",
+		"path: /metrics",
+		"interval: 30s",
+		"scrapeTimeout: 10s",
+	} {
+		if !strings.Contains(enabled, want) {
+			t.Fatalf("ServiceMonitor-enabled chart output is missing %q", want)
+		}
+	}
+
+	// The metrics Service's selector must exactly equal the controller
+	// Deployment's pod selector (spec.selector.matchLabels) so the Service
+	// tracks the controller pods and nothing else.
+	service := findDocument(t, enabled, "kind: Service", "name: courier-metrics")
+	deployment := findDocument(t, enabled, "kind: Deployment", "name: courier")
+	selector := blockLines(t, service, "selector:", 0)
+	podSelector := deploymentPodSelector(t, deployment)
+	if len(selector) == 0 {
+		t.Fatal("metrics Service has no selector labels")
+	}
+	if !sameLabelSet(selector, podSelector) {
+		t.Fatalf("metrics Service selector %v does not exactly equal the controller Deployment pod selector %v", selector, podSelector)
+	}
+
+	// The ServiceMonitor's selector must match labels actually present on
+	// the metrics Service, or Prometheus would discover nothing to scrape.
+	monitor := findDocument(t, enabled, "kind: ServiceMonitor", "name: courier-metrics")
+	serviceLabels := blockLines(t, service, "labels:", 0)
+	monitorSelector := blockLines(t, monitor, "matchLabels:", 0)
+	if len(monitorSelector) == 0 {
+		t.Fatal("ServiceMonitor has no selector matchLabels")
+	}
+	have := make(map[string]bool, len(serviceLabels))
+	for _, label := range serviceLabels {
+		have[label] = true
+	}
+	for _, label := range monitorSelector {
+		if !have[label] {
+			t.Fatalf("ServiceMonitor selector label %q is not set on the metrics Service (%v)", label, serviceLabels)
+		}
+	}
+}
+
+// findDocument returns the YAML document (a block of the multi-doc helm
+// output separated by ---) that contains a line equal to kindLine and a
+// line equal to nameLine.
+func findDocument(t *testing.T, output, kindLine, nameLine string) string {
+	t.Helper()
+	for _, doc := range strings.Split(output, "\n---") {
+		hasKind, hasName := false, false
+		for _, line := range strings.Split(doc, "\n") {
+			switch strings.TrimSpace(line) {
+			case kindLine:
+				hasKind = true
+			case nameLine:
+				hasName = true
+			}
+		}
+		if hasKind && hasName {
+			return doc
+		}
+	}
+	t.Fatalf("no document with a line %q and a line %q", kindLine, nameLine)
+	return ""
+}
+
+// deploymentPodSelector returns the "key: value" lines of the controller
+// Deployment's spec.selector.matchLabels (its pod selector).
+func deploymentPodSelector(t *testing.T, doc string) []string {
+	t.Helper()
+	return blockLines(t, doc, "matchLabels:", 0)
+}
+
+// sameLabelSet reports whether a and b hold the same label lines, regardless
+// of order or duplication.
+func sameLabelSet(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	counts := make(map[string]int, len(a))
+	for _, label := range a {
+		counts[label]++
+	}
+	for _, label := range b {
+		counts[label]--
+	}
+	for _, n := range counts {
+		if n != 0 {
+			return false
+		}
+	}
+	return true
+}
+
+// blockLines returns the "key: value" lines in the indented block that
+// follows the first line equal to header at or after line fromLine.
+func blockLines(t *testing.T, doc, header string, fromLine int) []string {
+	t.Helper()
+	lines := strings.Split(doc, "\n")
+	start := -1
+	for i := fromLine; i < len(lines); i++ {
+		if strings.TrimSpace(lines[i]) == header {
+			start = i
+			break
+		}
+	}
+	if start < 0 {
+		t.Fatalf("header %q not found in document", header)
+	}
+	headerIndent := leadingSpaces(lines[start])
+	var out []string
+	for i := start + 1; i < len(lines); i++ {
+		line := lines[i]
+		if strings.TrimSpace(line) == "" {
+			continue
+		}
+		if leadingSpaces(line) <= headerIndent {
+			break
+		}
+		out = append(out, strings.TrimSpace(line))
+	}
+	return out
+}
+
+func leadingSpaces(line string) int {
+	return len(line) - len(strings.TrimLeft(line, " "))
+}
+
 func TestChartRendersMultipleLaneBindings(t *testing.T) {
 	if _, err := exec.LookPath("helm"); err != nil {
 		t.Skip("helm is not installed")

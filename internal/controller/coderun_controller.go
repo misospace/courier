@@ -92,6 +92,20 @@ type CoderRunReconciler struct {
 	// Now is the reconciler's time source, injectable so tests never sleep.
 	// Nil falls back to time.Now.
 	Now func() time.Time
+
+	// Metrics records terminal-phase observations (run duration, queue wait,
+	// totals). Nil falls back to the process-default recorder on the
+	// controller-runtime metrics registry.
+	Metrics *RunRecorder
+}
+
+// metrics returns the run recorder to use, defaulting to the process-wide
+// recorder on the controller-runtime metrics registry.
+func (r *CoderRunReconciler) metrics() *RunRecorder {
+	if r.Metrics != nil {
+		return r.Metrics
+	}
+	return processRunRecorder()
 }
 
 // +kubebuilder:rbac:groups=courier.misospace.dev,resources=coderruns,verbs=get;list;watch;create;update;patch;delete
@@ -582,6 +596,9 @@ func (r *CoderRunReconciler) transitionTerminal(ctx context.Context, run *courie
 		// dropped) on the reconcile that entered it.
 		return ctrl.Result{}, nil
 	}
+	// The terminal phase is final, so only the reconcile that changes into it
+	// records the run's metrics; re-reconciles return above.
+	r.metrics().ObserveTerminal(run)
 	return r.publishTerminalLifecycle(ctx, run, adapter, item, phase, intent)
 }
 
