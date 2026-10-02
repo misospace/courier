@@ -40,6 +40,18 @@ func init() {
 	utilruntime.Must(courierv1alpha1.AddToScheme(scheme))
 }
 
+// stringSliceValue appends each occurrence of a repeatable flag to a slice.
+type stringSliceValue []string
+
+func (v *stringSliceValue) String() string {
+	return strings.Join(*v, ",")
+}
+
+func (v *stringSliceValue) Set(value string) error {
+	*v = append(*v, value)
+	return nil
+}
+
 func main() {
 	var metricsAddr string
 	var probeAddr string
@@ -60,6 +72,7 @@ func main() {
 	var dispatchAgentName string
 	var dispatchQueueLane string
 	var dispatchLane string
+	var dispatchLaneBindings stringSliceValue
 	var dispatchPollInterval time.Duration
 	var dispatchHTTPTimeout time.Duration
 	flag.StringVar(&metricsAddr, "metrics-bind-address", ":8080", "The address the metric endpoint binds to.")
@@ -82,6 +95,7 @@ func main() {
 	flag.StringVar(&dispatchAgentName, "dispatch-agent-name", "", "Dispatch agent name.")
 	flag.StringVar(&dispatchQueueLane, "dispatch-queue-lane", "", "Dispatch queue lane sent to next-task.")
 	flag.StringVar(&dispatchLane, "dispatch-lane", "", "LaneProfile assigned to discovered Dispatch work.")
+	flag.Var(&dispatchLaneBindings, "dispatch-lane-binding", "Repeatable Dispatch lane binding <queueLane>:<laneProfile>; one discovery runner per binding.")
 	flag.DurationVar(&dispatchPollInterval, "dispatch-poll-interval", 30*time.Second, "Dispatch discovery poll interval.")
 	flag.DurationVar(&dispatchHTTPTimeout, "dispatch-http-timeout", 30*time.Second, "Dispatch HTTP request timeout.")
 	opts := zap.Options{Development: true}
@@ -149,8 +163,17 @@ func main() {
 		"manual": manual.Adapter{},
 	})
 	if dispatchEnabled {
-		if strings.TrimSpace(dispatchBaseURL) == "" || strings.TrimSpace(dispatchAgentName) == "" || strings.TrimSpace(dispatchQueueLane) == "" || strings.TrimSpace(dispatchLane) == "" {
-			setupLog.Error(fmt.Errorf("dispatch requires base URL, agent name, queue lane, and LaneProfile"), "unable to configure Dispatch source")
+		if strings.TrimSpace(dispatchBaseURL) == "" || strings.TrimSpace(dispatchAgentName) == "" {
+			setupLog.Error(fmt.Errorf("dispatch requires base URL and agent name"), "unable to configure Dispatch source")
+			os.Exit(1)
+		}
+		bindings, err := resolveDispatchBindings(dispatchQueueLane, dispatchLane, dispatchLaneBindings)
+		if err != nil {
+			setupLog.Error(err, "unable to configure Dispatch source")
+			os.Exit(1)
+		}
+		if len(bindings) == 0 {
+			setupLog.Error(fmt.Errorf("dispatch requires base URL, agent name, and at least one queue-lane/LaneProfile binding"), "unable to configure Dispatch source")
 			os.Exit(1)
 		}
 		namespace := strings.TrimSpace(os.Getenv("POD_NAMESPACE"))
@@ -163,28 +186,36 @@ func main() {
 			setupLog.Error(fmt.Errorf("DISPATCH_AGENT_TOKEN is empty"), "unable to configure Dispatch source")
 			os.Exit(1)
 		}
-		dispatchClient, err := dispatch.NewClientWithLane(dispatchBaseURL, dispatchAgentName, dispatchQueueLane, token, dispatchHTTPTimeout)
-		if err != nil {
-			setupLog.Error(err, "unable to configure Dispatch client")
-			os.Exit(1)
-		}
 		checker, err := dispatchPRStateChecker(githubObserver)
 		if err != nil {
 			setupLog.Error(err, "unable to configure Dispatch source: GitHub pull request state lookup is unavailable")
 			os.Exit(1)
 		}
-		dispatchClient.WithPullRequestStateChecker(checker)
-		dispatchAdapter := dispatch.New(dispatchClient)
-		sources.Register("dispatch", dispatchAdapter)
-		runner := source.NewRunner(mgr.GetClient(), dispatchAdapter, source.RunnerConfig{
-			Source:       "dispatch",
-			LaneProfile:  dispatchLane,
-			Namespace:    namespace,
-			PollInterval: dispatchPollInterval,
-		})
-		if err := mgr.Add(runner); err != nil {
-			setupLog.Error(err, "unable to add Dispatch discovery runner")
+		// Lifecycle calls are lane-agnostic; per-binding runners do lane-scoped discovery.
+		dispatchClient, err := dispatch.NewClient(dispatchBaseURL, dispatchAgentName, token, dispatchHTTPTimeout)
+		if err != nil {
+			setupLog.Error(err, "unable to configure Dispatch client")
 			os.Exit(1)
+		}
+		dispatchClient.WithPullRequestStateChecker(checker)
+		sources.Register("dispatch", dispatch.New(dispatchClient))
+		for _, binding := range bindings {
+			runnerClient, err := dispatch.NewClientWithLane(dispatchBaseURL, dispatchAgentName, binding.queueLane, token, dispatchHTTPTimeout)
+			if err != nil {
+				setupLog.Error(err, "unable to configure Dispatch client")
+				os.Exit(1)
+			}
+			runnerClient.WithPullRequestStateChecker(checker)
+			runner := source.NewRunner(mgr.GetClient(), dispatch.New(runnerClient), source.RunnerConfig{
+				Source:       "dispatch",
+				LaneProfile:  binding.laneProfile,
+				Namespace:    namespace,
+				PollInterval: dispatchPollInterval,
+			})
+			if err := mgr.Add(runner); err != nil {
+				setupLog.Error(err, "unable to add Dispatch discovery runner")
+				os.Exit(1)
+			}
 		}
 	}
 
@@ -215,6 +246,52 @@ func existingPRHeadResolver(observer controller.WorldObserver) controller.Existi
 	}
 	resolver, _ := observer.(controller.ExistingPRHeadResolver)
 	return resolver
+}
+
+// dispatchBinding pairs one Dispatch queue lane with one Courier LaneProfile.
+type dispatchBinding struct {
+	queueLane   string
+	laneProfile string
+}
+
+// resolveDispatchBindings normalizes the single-binding shorthand and the
+// repeatable bindings into the final list, rejecting ambiguous input and
+// duplicate queue lanes.
+func resolveDispatchBindings(queueLane, laneProfile string, repeated []string) ([]dispatchBinding, error) {
+	shorthandSet := strings.TrimSpace(queueLane) != "" || strings.TrimSpace(laneProfile) != ""
+	if len(repeated) > 0 && shorthandSet {
+		return nil, fmt.Errorf("dispatch: --dispatch-queue-lane/--dispatch-lane cannot be combined with --dispatch-lane-binding")
+	}
+	bindings := make([]dispatchBinding, 0, 1+len(repeated))
+	if shorthandSet {
+		if strings.TrimSpace(queueLane) == "" || strings.TrimSpace(laneProfile) == "" {
+			return nil, fmt.Errorf("dispatch: both --dispatch-queue-lane and --dispatch-lane are required for a single binding")
+		}
+		bindings = append(bindings, dispatchBinding{
+			queueLane:   strings.TrimSpace(queueLane),
+			laneProfile: strings.TrimSpace(laneProfile),
+		})
+	}
+	seenLanes := make(map[string]struct{}, len(bindings)+len(repeated))
+	for _, binding := range bindings {
+		seenLanes[binding.queueLane] = struct{}{}
+	}
+	for _, value := range repeated {
+		parts := strings.SplitN(value, ":", 2)
+		if len(parts) != 2 || strings.TrimSpace(parts[0]) == "" || strings.TrimSpace(parts[1]) == "" {
+			return nil, fmt.Errorf("dispatch: invalid lane binding %q: want <queueLane>:<laneProfile>", value)
+		}
+		binding := dispatchBinding{
+			queueLane:   strings.TrimSpace(parts[0]),
+			laneProfile: strings.TrimSpace(parts[1]),
+		}
+		if _, ok := seenLanes[binding.queueLane]; ok {
+			return nil, fmt.Errorf("dispatch: duplicate queue lane %q", binding.queueLane)
+		}
+		seenLanes[binding.queueLane] = struct{}{}
+		bindings = append(bindings, binding)
+	}
+	return bindings, nil
 }
 
 func dispatchPRStateChecker(observer controller.WorldObserver) (dispatch.PullRequestStateChecker, error) {

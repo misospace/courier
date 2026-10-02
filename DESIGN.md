@@ -591,6 +591,15 @@ Pluggable adapters over a generic interface. An adapter both *creates* runs and
 Dispatch is an adapter, not a dependency. Dispatch is a separate product; Courier
 (a coding executor) must never make dispatch features depend on it.
 
+### Lane bindings (#173)
+
+One deployment binds one or more Dispatch queue lanes to Courier LaneProfiles;
+each binding runs its own discovery runner polling `next-task` with its lane.
+Discovery is the only lane-scoped call — claim, status, and reports are
+addressed by issue identity, so bindings share them. Two bindings never admit
+the same work item because CoderRun dedupe keys on source plus work identity,
+not lane. Suspending or capacitating one LaneProfile affects only that profile.
+
 ### Dispatch follow-up attempts (#98)
 
 Dispatch owns the actionable attempt, not Courier's runner. A queue-backed
@@ -752,6 +761,11 @@ A running log of architectural decisions and their reasoning, newest first. The
 body above describes the current architecture; this log preserves *why* and what
 was superseded.
 
+- **2026-10-02 — One deployment can serve multiple Dispatch lane bindings.**
+  It pairs each Dispatch queue lane with a LaneProfile, with one discovery
+  runner per binding, so a Deployment can serve an escalation lane without a
+  second manager reconciling the same CoderRuns. Lifecycle stays
+  lane-agnostic. (#173)
 - **2026-10-01 — #167: record run timing on CoderRun status.** AdmittedAt,
   StartedAt, and FinishedAt are set-once status timestamps, with Waited/Ran
   printer columns derived from them. StartedAt is read from the coordinator
