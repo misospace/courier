@@ -897,3 +897,32 @@ func TestNewClientValidation(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+func TestHTTPClientClaimOmitsLaneQuery(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/api/issues/state" {
+			_ = json.NewEncoder(w).Encode(issueState{IssueID: "opaque-issue"})
+			return
+		}
+		if r.URL.Path != "/api/issues/claim" && r.URL.Path != "/api/issues/status" {
+			t.Fatalf("path = %q", r.URL.Path)
+		}
+		if lane := r.URL.Query().Get("lane"); lane != "" {
+			t.Fatalf("%s query = %s, want no lane parameter", r.URL.Path, r.URL.RawQuery)
+		}
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer server.Close()
+
+	client, err := NewClientWithLane(server.URL, "worker", "normal", "secret-token", time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	id := EncodeWorkID(Task{Type: "implement", Issue: &Issue{ID: "stale-client-id", Repo: "acme/widgets", Number: 42}})
+	if err := client.Claim(context.Background(), id); err != nil {
+		t.Fatal(err)
+	}
+	if err := client.SetStatus(context.Background(), id, "in-progress"); err != nil {
+		t.Fatal(err)
+	}
+}

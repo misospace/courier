@@ -23,6 +23,7 @@
 {{- $hasDispatchAgentName := false }}
 {{- $hasDispatchQueueLane := false }}
 {{- $hasDispatchLane := false }}
+{{- $hasDispatchLaneBinding := false }}
 {{- $hasDispatchPollInterval := false }}
 {{- $hasDispatchHTTPTimeout := false }}
 {{- range $arg := $args }}
@@ -56,6 +57,9 @@
 {{- if hasPrefix "--dispatch-lane=" $arg }}
 {{- $hasDispatchLane = true }}
 {{- end }}
+{{- if hasPrefix "--dispatch-lane-binding=" $arg }}
+{{- $hasDispatchLaneBinding = true }}
+{{- end }}
 {{- if hasPrefix "--dispatch-poll-interval=" $arg }}
 {{- $hasDispatchPollInterval = true }}
 {{- end }}
@@ -81,15 +85,44 @@
 {{- $args = append $args (printf "--metrics-mcp-url=%s" $mcp.metricsURL) }}
 {{- end }}
 {{- $dispatch := .Values.dispatch }}
+{{- $lanes := $dispatch.lanes | default (list) }}
 {{- if $dispatch.enabled }}
-{{- if or (not $dispatch.baseURL) (not $dispatch.agentName) (not $dispatch.queueLane) (not $dispatch.laneProfile) (not $dispatch.tokenSecret.name) (not $dispatch.tokenSecret.key) }}
-{{- fail "dispatch.enabled requires baseURL, agentName, queueLane, laneProfile, tokenSecret.name, and tokenSecret.key" }}
+{{- if or (not $dispatch.baseURL) (not $dispatch.agentName) (not $dispatch.tokenSecret.name) (not $dispatch.tokenSecret.key) }}
+{{- fail "dispatch.enabled requires baseURL, agentName, tokenSecret.name, and tokenSecret.key" }}
+{{- end }}
+{{- if $lanes }}
+{{- if or $dispatch.queueLane $dispatch.laneProfile }}
+{{- fail "dispatch.lanes cannot be combined with dispatch.queueLane or dispatch.laneProfile" }}
+{{- end }}
+{{- $seen := dict }}
+{{- range $binding := $lanes }}
+{{- if or (not $binding.queueLane) (not $binding.laneProfile) }}
+{{- fail "each dispatch.lanes entry requires queueLane and laneProfile" }}
+{{- end }}
+{{- if hasKey $seen $binding.queueLane }}
+{{- fail (printf "duplicate queueLane %q in dispatch.lanes" $binding.queueLane) }}
+{{- end }}
+{{- $_ := set $seen $binding.queueLane true }}
+{{- if or (contains ":" $binding.queueLane) (contains ":" $binding.laneProfile) }}
+{{- fail (printf "queueLane and laneProfile must not contain a colon (got %q)" $binding.queueLane) }}
+{{- end }}
+{{- end }}
+{{- else if or (not $dispatch.queueLane) (not $dispatch.laneProfile) }}
+{{- fail "dispatch.enabled requires dispatch.lanes or both dispatch.queueLane and dispatch.laneProfile" }}
 {{- end }}
 {{- if not $hasDispatchEnabled }}{{- $args = append $args "--dispatch-enabled=true" }}{{- end }}
 {{- if not $hasDispatchBaseURL }}{{- $args = append $args (printf "--dispatch-base-url=%s" $dispatch.baseURL) }}{{- end }}
 {{- if not $hasDispatchAgentName }}{{- $args = append $args (printf "--dispatch-agent-name=%s" $dispatch.agentName) }}{{- end }}
+{{- if $lanes }}
+{{- if not $hasDispatchLaneBinding }}
+{{- range $binding := $lanes }}
+{{- $args = append $args (printf "--dispatch-lane-binding=%s:%s" $binding.queueLane $binding.laneProfile) }}
+{{- end }}
+{{- end }}
+{{- else }}
 {{- if not $hasDispatchQueueLane }}{{- $args = append $args (printf "--dispatch-queue-lane=%s" $dispatch.queueLane) }}{{- end }}
 {{- if not $hasDispatchLane }}{{- $args = append $args (printf "--dispatch-lane=%s" $dispatch.laneProfile) }}{{- end }}
+{{- end }}
 {{- if not $hasDispatchPollInterval }}{{- $args = append $args (printf "--dispatch-poll-interval=%s" $dispatch.pollInterval) }}{{- end }}
 {{- if not $hasDispatchHTTPTimeout }}{{- $args = append $args (printf "--dispatch-http-timeout=%s" $dispatch.httpTimeout) }}{{- end }}
 {{- $env := deepCopy ($container.env | default (dict)) }}

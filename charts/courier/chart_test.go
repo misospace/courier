@@ -129,3 +129,116 @@ func runHelm(t *testing.T, chartDir string, args ...string) string {
 	}
 	return string(output)
 }
+
+func runHelmOutput(t *testing.T, chartDir string, args ...string) (string, error) {
+	t.Helper()
+	command := exec.Command("helm", args...)
+	command.Dir = chartDir
+	output, err := command.CombinedOutput()
+	return string(output), err
+}
+
+func TestChartRendersMultipleLaneBindings(t *testing.T) {
+	if _, err := exec.LookPath("helm"); err != nil {
+		t.Skip("helm is not installed")
+	}
+
+	chartDir := copyChart(t)
+	if err := exec.Command("helm", "repo", "add", "bjw-s-labs", "https://bjw-s-labs.github.io/helm-charts").Run(); err != nil {
+		t.Fatalf("configure chart repository: %v", err)
+	}
+	runHelm(t, chartDir, "dependency", "build")
+
+	out := runHelm(t, chartDir, "template", "courier", ".",
+		"--set", "dispatch.enabled=true",
+		"--set", "dispatch.baseURL=https://dispatch.example.test",
+		"--set", "dispatch.agentName=example-agent",
+		"--set", "dispatch.tokenSecret.name=dispatch-token-secret",
+		"--set", "dispatch.lanes[0].queueLane=normal",
+		"--set", "dispatch.lanes[0].laneProfile=default",
+		"--set", "dispatch.lanes[1].queueLane=escalated",
+		"--set", "dispatch.lanes[1].laneProfile=escalation",
+	)
+	for _, want := range []string{
+		"--dispatch-lane-binding=normal:default",
+		"--dispatch-lane-binding=escalated:escalation",
+		"DISPATCH_AGENT_TOKEN",
+	} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("multi-lane chart output is missing %q", want)
+		}
+	}
+	for _, unwanted := range []string{
+		"--dispatch-queue-lane=",
+		"--dispatch-lane=",
+	} {
+		if strings.Contains(out, unwanted) {
+			t.Fatalf("multi-lane chart output unexpectedly contains %q", unwanted)
+		}
+	}
+}
+
+func TestChartRejectsAmbiguousDispatchLaneValues(t *testing.T) {
+	if _, err := exec.LookPath("helm"); err != nil {
+		t.Skip("helm is not installed")
+	}
+
+	chartDir := copyChart(t)
+	runHelm(t, chartDir, "dependency", "build")
+
+	out, err := runHelmOutput(t, chartDir, "template", "courier", ".",
+		"--set", "dispatch.enabled=true",
+		"--set", "dispatch.baseURL=https://dispatch.example.test",
+		"--set", "dispatch.agentName=example-agent",
+		"--set", "dispatch.tokenSecret.name=dispatch-token-secret",
+		"--set", "dispatch.queueLane=queue-x",
+		"--set", "dispatch.lanes[0].queueLane=normal",
+		"--set", "dispatch.lanes[0].laneProfile=default",
+	)
+	if err == nil {
+		t.Fatalf("expected helm template to fail, but it succeeded:\n%s", out)
+	}
+	if !strings.Contains(out, "cannot be combined") {
+		t.Fatalf("helm template failed without the expected message:\n%s", out)
+	}
+}
+
+func TestChartRejectsInvalidLaneBindings(t *testing.T) {
+	if _, err := exec.LookPath("helm"); err != nil {
+		t.Skip("helm is not installed")
+	}
+
+	chartDir := copyChart(t)
+	runHelm(t, chartDir, "dependency", "build")
+
+	out, err := runHelmOutput(t, chartDir, "template", "courier", ".",
+		"--set", "dispatch.enabled=true",
+		"--set", "dispatch.baseURL=https://dispatch.example.test",
+		"--set", "dispatch.agentName=example-agent",
+		"--set", "dispatch.tokenSecret.name=dispatch-token-secret",
+		"--set", "dispatch.lanes[0].queueLane=normal",
+		"--set", "dispatch.lanes[0].laneProfile=default",
+		"--set", "dispatch.lanes[1].queueLane=normal",
+		"--set", "dispatch.lanes[1].laneProfile=escalation",
+	)
+	if err == nil {
+		t.Fatalf("expected helm template to fail for duplicate queueLane, but it succeeded:\n%s", out)
+	}
+	if !strings.Contains(out, "duplicate queueLane") {
+		t.Fatalf("helm template failed without the expected duplicate queueLane message:\n%s", out)
+	}
+
+	out, err = runHelmOutput(t, chartDir, "template", "courier", ".",
+		"--set", "dispatch.enabled=true",
+		"--set", "dispatch.baseURL=https://dispatch.example.test",
+		"--set", "dispatch.agentName=example-agent",
+		"--set", "dispatch.tokenSecret.name=dispatch-token-secret",
+		"--set", "dispatch.lanes[0].queueLane=normal",
+	)
+	if err == nil {
+		t.Fatalf("expected helm template to fail for an incomplete lane binding, but it succeeded:\n%s", out)
+	}
+	if !strings.Contains(out, "requires queueLane and laneProfile") {
+		t.Fatalf("helm template failed without the expected message:\n%s", out)
+	}
+}

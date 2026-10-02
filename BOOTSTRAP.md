@@ -65,8 +65,15 @@ selected with `--executor-environment-secret`.
 To enable native Dispatch discovery, configure the chart's `dispatch` values and
 create the referenced Secret with the `DISPATCH_AGENT_TOKEN` value under the
 configured key. The queue lane selects Dispatch work; `laneProfile` selects the
-Courier `LaneProfile` for created runs. Dispatch uses the agent token for
-`next-task`, claim/status, unclaim, and task-report requests.
+Courier `LaneProfile` for created runs. A single deployment can serve several
+bindings through `dispatch.lanes`, each pairing a Dispatch `queueLane` with a
+Courier `laneProfile` and running its own discovery runner. Each binding admits
+into its own LaneProfile, so an escalation lane can use a different profile
+(e.g. larger hosted models) without taking capacity from the default lane.
+Several bindings may share one `laneProfile`, in which case they share that
+profile's concurrency and suspend gate. `queueLane`/`laneProfile` remain the
+single-binding shorthand and cannot be combined with `lanes`. Dispatch uses the
+agent token for `next-task`, claim/status, unclaim, and task-report requests.
 
 ## Manual first run
 
