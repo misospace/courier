@@ -17,6 +17,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/healthz"
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
+	crmetrics "sigs.k8s.io/controller-runtime/pkg/metrics"
 	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
 
 	courierv1alpha1 "github.com/misospace/courier/api/v1alpha1"
@@ -115,6 +116,10 @@ func main() {
 		setupLog.Error(err, "unable to start manager")
 		os.Exit(1)
 	}
+
+	// Per-lane capacity and suspension gauges are read from the live cluster
+	// at scrape time, so they need only the manager's client.
+	crmetrics.Registry.MustRegister(controller.NewLaneCollector(mgr.GetClient()))
 
 	podConfig := executor.DefaultPodConfig()
 	podConfig.Image = executorImage

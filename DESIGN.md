@@ -430,6 +430,18 @@ job.
 - The same activity events inform the liveness heartbeat, but the heartbeat is an
   explicit CR-status write, **not** the operator parsing logs.
 
+The operator also exports run metrics on the controller-runtime `:8080`
+endpoint. Run durations are histograms
+(`courier_coderun_run_duration_seconds`, `courier_coderun_queue_wait_seconds`)
+and total runs a counter (`courier_coderuns_total`); all three carry only
+`lane`, `mode`, and terminal-phase labels, never `repo` or `issue`, so
+cardinality stays bounded. `courier_coderuns_in_flight` and
+`courier_lane_suspended` are gauges read live from the cluster at scrape time
+rather than pushed counters, so they survive an operator restart and always match
+the world. `courier_metrics_scrape_errors_total` counts scrape failures. Scraping
+is opt-in: the chart's `serviceMonitor.enabled` renders a metrics `Service` and a
+Prometheus Operator `ServiceMonitor`, off by default.
+
 ## Custom resources
 
 ### `CoderRun`
@@ -763,6 +775,18 @@ A running log of architectural decisions and their reasoning, newest first. The
 body above describes the current architecture; this log preserves *why* and what
 was superseded.
 
+- **2026-10-02 — #168: export run metrics; scraping is an opt-in chart flag.**
+  Run metrics were ad-hoc `kubectl` and log archaeology, so the operator now
+  exposes them on the controller-runtime `:8080` endpoint. Labels are limited to
+  `lane`, `mode`, and terminal phase to bound cardinality — never `repo` or
+  `issue`. The run and queue-wait duration histograms derive from the #167
+  set-once status timestamps. The in-flight and lane-suspended gauges read the
+  world live at scrape time rather than being push counters, so they survive an
+  operator restart and match the world-is-source-of-truth principle. Terminal
+  totals count a run once, at its terminal transition, so a future post-merge
+  `AwaitingReview`→`Done` edge must not double-count it. Scraping is opt-in via
+  the chart's `serviceMonitor.enabled`, which renders a metrics `Service` and a
+  `ServiceMonitor` (off by default). (#168)
 - **2026-10-02 — One deployment can serve multiple Dispatch lane bindings.**
   It pairs each Dispatch queue lane with a LaneProfile, with one discovery
   runner per binding, so a Deployment can serve an escalation lane without a

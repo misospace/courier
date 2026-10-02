@@ -1,0 +1,69 @@
+{{- /*
+  Optional Prometheus Operator ServiceMonitor for the controller's metrics
+  endpoint. Rendered from this chart (rather than the common library's
+  serviceMonitor entries) so it can be toggled with a single
+  serviceMonitor.enabled flag. The Service selector uses the common
+  library's shared selector labels so it tracks the controller pods.
+*/}}
+{{- if .Values.serviceMonitor.enabled }}
+{{- /* Initialize the merged common-library values so its label helpers work. */}}
+{{- include "bjw-s.common.loader.init" . }}
+{{- $name := printf "%s-metrics" .Release.Name }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ $name }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app.kubernetes.io/service: {{ $name }}
+    {{- include "bjw-s.common.lib.metadata.allLabels" . | trim | nindent 4 }}
+    {{- range $label := .Values.serviceMonitor.labels | default (list) }}
+    {{- $kv := splitList "=" $label }}
+    {{- if eq (len $kv) 2 }}
+    {{ index $kv 0 }}: {{ index $kv 1 | quote }}
+    {{- else }}
+    {{- fail (printf "serviceMonitor.labels entry %q must be a single key=value pair" $label) }}
+    {{- end }}
+    {{- end }}
+spec:
+  type: ClusterIP
+  ports:
+    - name: metrics
+      port: 8080
+      targetPort: 8080
+      protocol: TCP
+  selector:
+    {{- include "bjw-s.common.lib.metadata.selectorLabels" . | nindent 4 }}
+    app.kubernetes.io/controller: main
+---
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: {{ $name }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "bjw-s.common.lib.metadata.allLabels" . | trim | nindent 4 }}
+    {{- range $label := .Values.serviceMonitor.labels | default (list) }}
+    {{- $kv := splitList "=" $label }}
+    {{- if eq (len $kv) 2 }}
+    {{ index $kv 0 }}: {{ index $kv 1 | quote }}
+    {{- else }}
+    {{- fail (printf "serviceMonitor.labels entry %q must be a single key=value pair" $label) }}
+    {{- end }}
+    {{- end }}
+spec:
+  jobLabel: app.kubernetes.io/name
+  namespaceSelector:
+    matchNames:
+      - {{ .Release.Namespace }}
+  selector:
+    matchLabels:
+      app.kubernetes.io/service: {{ $name }}
+      {{- include "bjw-s.common.lib.metadata.selectorLabels" . | nindent 6 }}
+  endpoints:
+    - port: metrics
+      path: /metrics
+      interval: {{ .Values.serviceMonitor.interval }}
+      scrapeTimeout: {{ .Values.serviceMonitor.scrapeTimeout }}
+{{- end }}

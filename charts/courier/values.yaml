@@ -37,6 +37,17 @@ dispatch:
     name: ""
     key: token
 
+# -- Optional Prometheus Operator ServiceMonitor for the controller's
+# metrics endpoint (port 8080). When enabled, renders a `<release>-metrics`
+# Service and a ServiceMonitor that scrapes `/metrics` on it. `labels` is a
+# list of "key=value" strings, not a map, because the common library
+# reserves `serviceMonitor.<key>` for its own ServiceMonitor entries.
+serviceMonitor:
+  enabled: false
+  interval: 30s
+  scrapeTimeout: 10s
+  labels: []
+
 controllers:
   main:
     replicas: 1
