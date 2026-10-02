@@ -105,9 +105,9 @@ func TestResolveDispatchBindings(t *testing.T) {
 			wantErr:  true,
 		},
 		{
-			name:     "repeated colon in lane profile kept verbatim",
+			name:     "extra colon in lane profile rejected",
 			repeated: []string{"queue-a:lane:a"},
-			want:     []dispatchBinding{{queueLane: "queue-a", laneProfile: "lane:a"}},
+			wantErr:  true,
 		},
 		{
 			name:      "whitespace-only shorthand rejected",

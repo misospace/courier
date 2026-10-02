@@ -278,8 +278,8 @@ func resolveDispatchBindings(queueLane, laneProfile string, repeated []string) (
 	}
 	for _, value := range repeated {
 		parts := strings.SplitN(value, ":", 2)
-		if len(parts) != 2 || strings.TrimSpace(parts[0]) == "" || strings.TrimSpace(parts[1]) == "" {
-			return nil, fmt.Errorf("dispatch: invalid lane binding %q: want <queueLane>:<laneProfile>", value)
+		if len(parts) != 2 || strings.TrimSpace(parts[0]) == "" || strings.TrimSpace(parts[1]) == "" || (len(parts) == 2 && strings.Contains(parts[1], ":")) {
+			return nil, fmt.Errorf("dispatch: invalid lane binding %q: want <queueLane>:<laneProfile> with no colons in either half", value)
 		}
 		binding := dispatchBinding{
 			queueLane:   strings.TrimSpace(parts[0]),
