@@ -598,7 +598,9 @@ each binding runs its own discovery runner polling `next-task` with its lane.
 Discovery is the only lane-scoped call — claim, status, and reports are
 addressed by issue identity, so bindings share them. Two bindings never admit
 the same work item because CoderRun dedupe keys on source plus work identity,
-not lane. Suspending or capacitating one LaneProfile affects only that profile.
+not lane. Suspending or capacitating one LaneProfile affects only that
+profile; several bindings may share a LaneProfile, and then they share its
+suspend gate and capacity.
 
 ### Dispatch follow-up attempts (#98)
 

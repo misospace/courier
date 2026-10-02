@@ -70,9 +70,10 @@ bindings through `dispatch.lanes`, each pairing a Dispatch `queueLane` with a
 Courier `laneProfile` and running its own discovery runner. Each binding admits
 into its own LaneProfile, so an escalation lane can use a different profile
 (e.g. larger hosted models) without taking capacity from the default lane.
-`queueLane`/`laneProfile` remain the single-binding shorthand and cannot be
-combined with `lanes`. Dispatch uses the agent token for `next-task`,
-claim/status, unclaim, and task-report requests.
+Several bindings may share one `laneProfile`, in which case they share that
+profile's concurrency and suspend gate. `queueLane`/`laneProfile` remain the
+single-binding shorthand and cannot be combined with `lanes`. Dispatch uses the
+agent token for `next-task`, claim/status, unclaim, and task-report requests.
 
 ## Manual first run
 

@@ -202,3 +202,43 @@ func TestChartRejectsAmbiguousDispatchLaneValues(t *testing.T) {
 		t.Fatalf("helm template failed without the expected message:\n%s", out)
 	}
 }
+
+func TestChartRejectsInvalidLaneBindings(t *testing.T) {
+	if _, err := exec.LookPath("helm"); err != nil {
+		t.Skip("helm is not installed")
+	}
+
+	chartDir := copyChart(t)
+	runHelm(t, chartDir, "dependency", "build")
+
+	out, err := runHelmOutput(t, chartDir, "template", "courier", ".",
+		"--set", "dispatch.enabled=true",
+		"--set", "dispatch.baseURL=https://dispatch.example.test",
+		"--set", "dispatch.agentName=example-agent",
+		"--set", "dispatch.tokenSecret.name=dispatch-token-secret",
+		"--set", "dispatch.lanes[0].queueLane=normal",
+		"--set", "dispatch.lanes[0].laneProfile=default",
+		"--set", "dispatch.lanes[1].queueLane=normal",
+		"--set", "dispatch.lanes[1].laneProfile=escalation",
+	)
+	if err == nil {
+		t.Fatalf("expected helm template to fail for duplicate queueLane, but it succeeded:\n%s", out)
+	}
+	if !strings.Contains(out, "duplicate queueLane") {
+		t.Fatalf("helm template failed without the expected duplicate queueLane message:\n%s", out)
+	}
+
+	out, err = runHelmOutput(t, chartDir, "template", "courier", ".",
+		"--set", "dispatch.enabled=true",
+		"--set", "dispatch.baseURL=https://dispatch.example.test",
+		"--set", "dispatch.agentName=example-agent",
+		"--set", "dispatch.tokenSecret.name=dispatch-token-secret",
+		"--set", "dispatch.lanes[0].queueLane=normal",
+	)
+	if err == nil {
+		t.Fatalf("expected helm template to fail for an incomplete lane binding, but it succeeded:\n%s", out)
+	}
+	if !strings.Contains(out, "requires queueLane and laneProfile") {
+		t.Fatalf("helm template failed without the expected message:\n%s", out)
+	}
+}

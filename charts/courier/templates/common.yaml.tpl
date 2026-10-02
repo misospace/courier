@@ -94,9 +94,17 @@
 {{- if or $dispatch.queueLane $dispatch.laneProfile }}
 {{- fail "dispatch.lanes cannot be combined with dispatch.queueLane or dispatch.laneProfile" }}
 {{- end }}
+{{- $seen := dict }}
 {{- range $binding := $lanes }}
 {{- if or (not $binding.queueLane) (not $binding.laneProfile) }}
 {{- fail "each dispatch.lanes entry requires queueLane and laneProfile" }}
+{{- end }}
+{{- if hasKey $seen $binding.queueLane }}
+{{- fail (printf "duplicate queueLane %q in dispatch.lanes" $binding.queueLane) }}
+{{- end }}
+{{- $_ := set $seen $binding.queueLane true }}
+{{- if or (contains ":" $binding.queueLane) (contains ":" $binding.laneProfile) }}
+{{- fail (printf "queueLane and laneProfile must not contain a colon (got %q)" $binding.queueLane) }}
 {{- end }}
 {{- end }}
 {{- else if or (not $dispatch.queueLane) (not $dispatch.laneProfile) }}

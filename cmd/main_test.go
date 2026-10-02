@@ -100,6 +100,21 @@ func TestResolveDispatchBindings(t *testing.T) {
 			want:     []dispatchBinding{{queueLane: "queue-a", laneProfile: "lane-a"}},
 		},
 		{
+			name:     "repeated whitespace-only rejected",
+			repeated: []string{" "},
+			wantErr:  true,
+		},
+		{
+			name:     "repeated colon in lane profile kept verbatim",
+			repeated: []string{"queue-a:lane:a"},
+			want:     []dispatchBinding{{queueLane: "queue-a", laneProfile: "lane:a"}},
+		},
+		{
+			name:      "whitespace-only shorthand rejected",
+			queueLane: " ",
+			wantErr:   true,
+		},
+		{
 			name: "all empty",
 			want: []dispatchBinding{},
 		},

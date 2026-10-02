@@ -28,9 +28,8 @@ dispatch:
   agentName: ""
   queueLane: ""
   laneProfile: ""
-  # -- Optional list of lane bindings, one discovery runner per entry. Each
-  # entry needs queueLane and laneProfile. When set, queueLane and laneProfile
-  # above must be empty.
+  # -- Optional list of lane bindings; each entry pairs a Dispatch queueLane
+  #    with a Courier laneProfile, one discovery runner per entry.
   lanes: []
   pollInterval: 30s
   httpTimeout: 30s

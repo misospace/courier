@@ -202,7 +202,7 @@ func main() {
 		for _, binding := range bindings {
 			runnerClient, err := dispatch.NewClientWithLane(dispatchBaseURL, dispatchAgentName, binding.queueLane, token, dispatchHTTPTimeout)
 			if err != nil {
-				setupLog.Error(err, "unable to configure Dispatch client")
+				setupLog.Error(err, "unable to configure Dispatch client", "queueLane", binding.queueLane, "laneProfile", binding.laneProfile)
 				os.Exit(1)
 			}
 			runnerClient.WithPullRequestStateChecker(checker)
@@ -258,7 +258,7 @@ type dispatchBinding struct {
 // repeatable bindings into the final list, rejecting ambiguous input and
 // duplicate queue lanes.
 func resolveDispatchBindings(queueLane, laneProfile string, repeated []string) ([]dispatchBinding, error) {
-	shorthandSet := strings.TrimSpace(queueLane) != "" || strings.TrimSpace(laneProfile) != ""
+	shorthandSet := queueLane != "" || laneProfile != ""
 	if len(repeated) > 0 && shorthandSet {
 		return nil, fmt.Errorf("dispatch: --dispatch-queue-lane/--dispatch-lane cannot be combined with --dispatch-lane-binding")
 	}
