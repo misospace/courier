@@ -1,5 +1,30 @@
 # Changelog
 
+## [0.1.5](https://github.com/misospace/courier/compare/v0.1.4...v0.1.5) (2026-10-03)
+
+
+### Features
+
+* export CoderRun duration, queue-wait and outcome metrics ([#194](https://github.com/misospace/courier/issues/194)) ([96b8435](https://github.com/misospace/courier/commit/96b84351803637d1f94c409a6b1dad530ef7e45d))
+* record admitted/started/finished timestamps on CoderRun status ([#187](https://github.com/misospace/courier/issues/187)) ([5d35267](https://github.com/misospace/courier/commit/5d3526754ea52a9c9b586179d0a86f0fafc21e3a))
+* support multiple Dispatch lane bindings in one deployment ([#193](https://github.com/misospace/courier/issues/193)) ([0892e9a](https://github.com/misospace/courier/commit/0892e9ae8b03cb219bea686aa1f3387a49d32204))
+
+
+### Bug Fixes
+
+* **deps:** update module github.com/prometheus/client_golang (v1.24.0 → v1.24.1) ([#195](https://github.com/misospace/courier/issues/195)) ([a83b1ee](https://github.com/misospace/courier/commit/a83b1ee768bde715d4eb423f7b3ca1ed4391416f))
+
+
+### Chores
+
+* **ai-review:** upgrade reviewer to v3.2.0 ([#196](https://github.com/misospace/courier/issues/196)) ([0c9ab2f](https://github.com/misospace/courier/commit/0c9ab2f52ec136c26734535e5f9263bdb7f05f98))
+
+
+### Documentation
+
+* **harness:** settle provider registration and worker artifact contracts ([#205](https://github.com/misospace/courier/issues/205)) ([085957f](https://github.com/misospace/courier/commit/085957f3dae0c38b9ed10033d2e10190a93f4e0f))
+* settle durable failure evidence design for dirty runs ([#115](https://github.com/misospace/courier/issues/115)) ([#203](https://github.com/misospace/courier/issues/203)) ([bead1a1](https://github.com/misospace/courier/commit/bead1a131f59fbf88327154fdba1acd20e66f71c))
+
 ## [0.1.4](https://github.com/misospace/courier/compare/v0.1.3...v0.1.4) (2026-10-01)
 
 
