@@ -1005,7 +1005,11 @@ only informs.
   writes only that run's harness-owned status. Control authenticates with a
   projected, pod-bound 600-second `courier-broker` audience token; the broker
   TokenReviews every request and checks the authenticated service-account UID
-  and current control-pod incarnation. Control-to-worker tasks use signed
+  and current control-pod incarnation. Runs live in a namespace dedicated to
+  that purpose where no subject other than the operator can create, patch, or
+  delete pods: a clean-spec pod copy in the run namespace could otherwise
+  present itself to the broker as control, because no namespace-resident
+  material distinguishes it. Control-to-worker tasks use signed
   run/incarnation-bound envelopes; the worker has no secret, service-account
   token, or signing key. Worker network access is limited to the dedicated Go
   module/checksum cache and no DNS, never broker or forge. Enforced
@@ -1086,12 +1090,18 @@ named items remain unresolved and must not be described as production-ready:
   bundle-import endpoint, the separate trusted status handler, and the immutable
   run-UID-bound policy engine with race-safe publication. Those primitives are
   not a secure deployment until the per-run pod wiring, credential delivery, and
-  isolation preflight in #123 land.
+  isolation preflight in #123 land. The forge provider registration surface is
+  settled in [HARNESS.md](./HARNESS.md) §4: one deployment-level registry file
+  loaded by the operator, pattern-based run selection with fail-closed
+  ambiguity, canonical-identity enforcement, and a single-provider broker
+  projection.
 - **#104 isolation:** #120 settles the per-run broker, pod-bound workload
   identity, signed control-to-worker protocol, and network boundary. The isolated
   topology and secure preflight still need implementation and acceptance tests.
-- **Artifact validation:** define artifact format/size and validate objects, refs,
-  base ancestry, and policy without trusting worker metadata.
+- **Artifact validation:** settled in [HARNESS.md](./HARNESS.md) §5 — git
+  bundle only, exact base-tip ancestry binding, fixed size/object bounds, exact
+  ref-set equality, and operator-resolved path scope; worker metadata is never
+  authority. #125 implements and tests it.
 - **Worker egress:** the first supported slice is an administrator-populated Go module/checksum
   cache (#136). Worker requests never trigger upstream access; arbitrary worker
   network access remains prohibited.
@@ -1108,6 +1118,34 @@ A running log of architectural decisions and their reasoning, newest first. The
 body above describes the current architecture; this log preserves *why* and what
 was superseded.
 
+- **2026-10-03 — #80/#8: settle the forge provider registration surface and
+  the worker artifact contract; last open HARNESS.md design blockers.** The
+  registry is one deployment-level configuration file loaded by the operator
+  (`--forge-providers-file`, chart-rendered, references only), not flags (no
+  per-provider expressiveness) and not a CRD (new API surface and a reconciler
+  for administrator-static config). Runs select their provider by
+  case-insensitive `owner/name` patterns over `spec.repo`; zero or multiple
+  matches fail closed, and the selected provider's canonical repository
+  identity — never the raw spec string — is what every later comparison binds,
+  so selection and enforcement cannot disagree. Per-run broker pods receive a
+  projection of exactly the one pinned registration with credential references
+  as env `SecretKeyRef`s; capabilities come from the implementation's typed
+  surface and cannot be configured into existence. The worker artifact contract
+  accepts git bundles only — never patches — with exact base-tip ancestry
+  binding to the snapshot control dispatched, fixed size/object bounds, exact
+  ref-set equality, and operator-resolved path scope, so a hostile worker can
+  neither smuggle history nor have its metadata treated as authority. #123
+  consumes the registry in the operator wiring; #125 implements the artifact
+  contract ([HARNESS.md](./HARNESS.md) §4/§5/§10). An adversarial pass over the
+  merged #104 design also amended it: the isolation assumption now explicitly
+  covers clean-spec pod creation (runs live in a dedicated namespace where only
+  the operator creates or mutates pods, preflight-verified to the extent RBAC
+  review allows), credential-bound write checks moved from operator admission
+  into the broker's own startup preflight, push endpoints must derive from the
+  same registration as the identity/protection reads, interrupted-push
+  recovery is bounded to one control incarnation, the protected-ref no-bypass
+  property is a provisioning attestation rather than a verified fact, and
+  legacy mode may not share a provider credential with secure runs.
 - **2026-10-02 — #115: preserve bounded failure evidence; capture in the
   executor, persist by the operator.** After the #109 production loss of six
   uncommitted files, the design settles preservation rather than accepting the

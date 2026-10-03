@@ -252,12 +252,25 @@ selected topology, not a configurable shared-broker fallback.
   or bypass admission or NetworkPolicy. That assumption rests on cluster RBAC
   (the `ephemeralcontainers` subresource and run-pod mutation denied to every
   subject but the operator) plus the admission controls, which are
-  cluster-level guarantees, not per-pod ones. A privileged cluster actor — a
-  node administrator, a `cluster-admin` subject, or direct etcd access — can
-  do all of these and defeats the design; that is an explicit residual risk
-  stated in §12, not a closed hole. The cache may use DNS to reach its own
-  configured upstreams during administrator-controlled population, never on
-  worker demand. No generic proxy and no arbitrary MCP forwarding.
+  cluster-level guarantees, not per-pod ones.
+  The assumption must also cover **clean-spec** pod creation, because the API
+  cannot distinguish an operator-created control pod from a copy: any principal
+  that can create a pod in a run's namespace can reference that namespace's
+  Secrets and run service accounts by name, mint a pod-bound `courier-broker`
+  token, replicate the control pod's labels and owner reference, and present
+  itself to the broker as control during a relaunch window. No possession proof
+  can substitute inside one namespace — such a principal can mount any
+  namespace-resident Secret, so no namespace-resident material distinguishes a
+  forged pod. Runs therefore live in a namespace dedicated to that purpose
+  where no subject other than the operator can create, patch, or delete pods or
+  workload-referencing specs; preflight verifies that namespace RBAC boundary
+  to the extent reviews allow (a grant's existence is provable, its absence is
+  not). A privileged cluster actor — a node administrator, a `cluster-admin`
+  subject, or direct etcd access — can do all of these and defeats the design;
+  that is an explicit residual risk stated in §12, not a closed hole. The cache
+  may use DNS to reach its own configured upstreams during
+  administrator-controlled population, never on worker demand. No generic proxy
+  and no arbitrary MCP forwarding.
 - No forge or git credential appears in control/worker env, argv, files,
   annotations, DownwardAPI volumes, logs, or tool responses. The provider key
   belongs to the trusted harness only; workers do not call models directly.
@@ -290,6 +303,89 @@ that created the run and receives work-state transitions is an operator
 concern. A deployment may use different providers for the two, and a run never
 conflates them.
 
+### Provider registration surface
+
+The registry is one deployment-level configuration file loaded by the operator
+at startup (`--forge-providers-file`), rendered by the chart from values. A
+file rather than flags or a CRD: flags cannot express several providers, a CRD
+would add API surface and a reconciler for administrator-static configuration,
+and a file stays inside the trusted control plane and projects unchanged into
+per-run broker pods. The registry is deliberately **not** an API object: a
+namespaced registration that broader subjects could create would let them
+shadow a provider with their own endpoint and credential reference, and the
+broker's byte-exact `ProviderConfigRef` check would pass. The file is rendered
+with the deployment and changes only through that deployment's configuration
+path. The file carries **references only** — credential values never appear in
+chart values, the rendered file, logs, or diagnostics.
+
+Each registration carries:
+
+- `name` — the registry key; the exact string `PublicationPolicy.ProviderConfigRef`
+  persists, and the broker requires equality with its own projection (the
+  binding check in `PolicyFromRun`).
+- `type` — the implementation selector; `github` is the first. Capabilities are
+  **not** configurable: they come from the implementation's typed surface, and
+  an admission that needs a policy read the implementation does not provide
+  fails closed (§4). Configuration cannot invent a capability.
+- `endpoint` — the canonical API base. No request ever names an endpoint. The
+  registration is also the sole source of the **git push endpoint**: the
+  endpoint used to push each pinned repository is derived from the same
+  registration that serves the identity and protection reads, and the broker
+  refuses to push when the resolved endpoint is not that registration's git
+  endpoint for the canonical repository. Reads and writes therefore always
+  happen in the same provider world; request- or model-supplied URLs are never
+  endpoints.
+- `credentials` — purpose → `{secretName, key}` references, purposes `forge-api`
+  and `git`; `git` defaults to the `forge-api` reference when omitted. Both
+  resolve only inside the broker pod.
+- `serves` — match patterns over the `owner/name`-shaped `spec.repo` (for
+  example `misospace/*`), case-insensitive because hosting providers treat
+  repository case as insignificant. Patterns are administrator configuration,
+  not policy: they select which registration resolves a run, they never
+  widen a destination.
+
+**Selection.** At admission the operator selects the unique registration whose
+`serves` patterns match the run's immutable `spec.repo`; zero matches or more
+than one is `NeedsHuman` naming the absent or ambiguous selection. No spec
+field, source header, or model input names a provider. The selected provider's
+`ResolveRepository` then canonicalizes the repository identity, and every later
+comparison — persisted policy, broker binding, publication — uses the canonical
+form, never the raw spec string. Selection and enforcement can therefore never
+disagree about which provider serves a run: the broker's projection is pinned
+at pod creation from the same registration the operator selected.
+
+**Startup validation.** A structurally invalid registry — duplicate names,
+unknown `type`, missing endpoint, malformed credential references — fails
+operator startup outright. Semantic problems such as an unreachable endpoint or
+a missing Secret are admission-time failures: fail closed with an actionable
+`NeedsHuman`, never a silent fallback to another provider or to legacy
+injection. A healthy registry feeds §5's capability health, so an unavailable
+provider is named, not silently dropped.
+
+**Broker projection.** The operator renders each per-run broker pod with
+exactly the one registration the run's policy pins — name, type, endpoint,
+credential references as env `SecretKeyRef`s through the existing git
+credential seam — never the whole registry. The projection is frozen at pod
+creation and is configuration, not request state: no request can add a
+provider, change an endpoint, or substitute a credential reference. The
+persisted policy records enough of the registration — at minimum its endpoint
+and credential-reference digest — for the broker to verify its projection
+against the policy it binds and refuse service on mismatch, so selection and
+enforcement are provably the same record even across broker replacement.
+
+**Rotation.** Registry changes apply on operator restart to future admissions
+only; a running run's policy never mutates (§4). Credential rotation is a
+Secret content change plus broker-pod replacement — a fresh pod UID that
+revalidates the full identity chain per §3 — because env-captured credentials
+do not hot-reload. Run GC never deletes a Secret shared with other runs or with
+legacy mode.
+
+**Legacy mapping.** Today's `--git-credential-secret`,
+`--github-credential-secret`, and `--github-mcp-url` flags remain legacy-mode
+configuration and are untouched until §9's migration removes the model-readable
+injection. The registry is the secure path's only provider source; legacy mode
+does not read it.
+
 ### Model-influenced forge operations
 
 Expose registered semantic reads and writes (issue/PR/review/comment/check
@@ -321,8 +417,14 @@ before secure publication can be enabled. No legacy fallback is authorized.
 The provider returns canonical stable repository identities, exact branch refs
 and opaque git OIDs (including SHA-256 repositories); broker and operator
 compare repository identities using that provider's rules and ref/OID bytes
-exactly. Admission checks the effective protection and broker credential write access
-for the pinned destination in both repositories (once if identical).
+exactly. Admission checks the effective protection for the pinned destination
+in both repositories (once if identical). Every credential-bound check — write
+access and protection-under-credential — runs in the **broker's own startup
+preflight**, the only component that resolves the credential: the broker
+verifies the configured credential can write the pinned destinations before it
+serves, and a broker that cannot is the §5 capability-health failure path
+(`NeedsHuman`), not a degraded launch. The operator never resolves a provider
+credential.
 Missing/deleted/ambiguous repository, base, head, ref, protection
 information, or insufficient read permission denies admission rather than
 assuming a branch is safe. No arbitrary clone URL or forge endpoint is
@@ -365,8 +467,12 @@ The broker credential must have no protected-ref bypass grant: the provider
 must reject a write that becomes protected between the live read and push.
 Post-push observation detects a policy change but cannot undo a completed
 write; this is a required provider-side safety property, not a claimed atomic
-read/push transaction. If it cannot be guaranteed, secure admission fails
-closed.
+read/push transaction. No provider API can prove the *absence* of a bypass
+grant, so the property is a provisioning attestation, not a verified fact: the
+deployment must provision the broker's provider credential as a dedicated,
+non-administrative machine identity whose scope excludes bypass, and a
+deployment that cannot provision such a credential fails closed. That
+attestation is a stated residual risk in §12.
 
 **Normal non-force publication, including crashes and races:**
 
@@ -403,9 +509,13 @@ a proposed OID confirmed at the live remote for this run. A broker-confirmed
 the live work tip and PR head on resume. A pending proposed OID after an
 interrupted push may be recovered only from the run-UID-bound trusted control
 integration tree or a trusted checkpoint written before pushing, and confirmed
-by *exact* live equality before status advances. If neither survives a crash,
-return `NeedsHuman` rather than infer ownership from ancestry or retry an
-uncertain push. Any other tip is foreign, including a descendant of a run commit
+by *exact* live equality before status advances. That recovery is bounded to
+one control incarnation: the §7 checkpoint type has no pending-OID field by
+design, and the integration tree is pod-local, so a replaced control pod or a
+replaced broker cannot reconstruct a pending OID. An interrupted push that
+survives neither is terminal `NeedsHuman` — it fails closed rather than
+inferring ownership from ancestry or retrying an uncertain push. Any other tip
+is foreign, including a descendant of a run commit
 advanced by another actor, and requires `NeedsHuman` rather than an automatic
 rebase. The live world always wins over a checkpoint. A repeated OID is an
 idempotent no-op only while the live tip and (on `fix-pr`) PR head still
@@ -435,7 +545,8 @@ must implement its enforcement; unsupported providers fail closed rather than
 silently dropping a check. Terminal `NeedsHuman` diagnostics name the pinned
 and observed identities and required human action without leaking credentials.
 
-The broker supplies the worker only a sanitized, read-only repository pack or
+Trusted control relays to the worker only a sanitized, read-only repository
+pack or
 workspace, never network access. Trusted control validates worker artifacts
 before integration; the broker independently enforces the policy at every
 git/forge mutation. Comments are data, never instructions to fetch URLs.
@@ -511,6 +622,60 @@ branch and checkpoint. Publication reconciles the remote ref before retrying.
 Forge writes use a provider idempotency key where supported or re-read the live
 PR/comment before retrying; if duplicate comments cannot be ruled out, surface
 the uncertainty rather than blindly replaying them. Subagents cannot publish.
+
+### Worker artifact contract
+
+The only accepted artifact is a **git bundle** produced inside the worker's
+sanitized snapshot — never patches, diffs, or worker-computed text to re-apply —
+so integration consumes git's hash-verified objects rather than re-deriving
+work from worker-authored text. The bundle carries exactly one result ref,
+whose name control derives from the `briefID` (for example
+`refs/courier/briefs/<briefID>`); its head commit's ancestry must contain the
+exact base tip of the snapshot control dispatched. Control knows that OID
+because it rendered the snapshot, so a bundle built on any other base is
+rejected without interpretation.
+
+Validation runs in trusted control, in order, before any integration:
+
+1. `git bundle verify` against control's private tree: every prerequisite is
+   present and the object closure is intact under git's own hash checks.
+2. **Bounds**, as fixed numeric constants the implementation does not derive
+   from model or worker input: total bundle size, unpacked size, unpacked
+   object count, and per-blob size (initially 64 MiB bundle, 64 MiB unpacked,
+   10⁵ objects, 16 MiB per blob). A bundle over any bound is rejected whole,
+   never truncated; objects beyond the result ref's closure are ignored and
+   never integrated, and bounds apply regardless.
+3. Ref-set equality: the bundle advertises exactly the expected result ref —
+   no extra refs, no unexpected names, no ref outside the `refs/courier/`
+   namespace. The import is **refless**: control fetches exactly the expected
+   OID and never applies the bundle's own ref declarations, so no
+   worker-supplied ref name can enter the private tree.
+4. Ancestry: the result head reaches the dispatched base tip.
+5. **Path policy**: when the operator-resolved policy scopes paths, the
+   changed-path set of the result commit against the base must lie entirely
+   inside that scope; absent an explicit scope, the whole repository is in
+   scope for the pinned work ref. Path policy evaluates changed diff paths: a
+   new or modified symlink is a change to its own path only; gitlinks
+   (submodule pointers) are permitted as inert tree data, and the changed
+   gitlink path counts against the scope. Path scope is operator-resolved
+   (§4), never brief- or worker-supplied.
+
+Integration and every inspection of worker-supplied objects run with the same
+hostile-repository git hardening the broker uses — a scrubbed environment, no
+system or repository config trust, no hooks, no attribute-defined filters or
+drivers, no submodule initialization or fetch, `protocol.*.allow=never` — and
+artifact content is data that is never executed. Control materializes
+integration trees without following artifact-supplied symlinks.
+
+Worker-declared metadata — summaries, file lists, claimed test results, exit
+claims — is never validation input; only bundle contents checked against
+control's own record of the dispatch. A rejected artifact is untrusted data:
+the brief fails, control may re-dispatch a corrected brief, and repeated
+rejection is a workload signal under §8, not infrastructure failure. Accepted
+bundles are fetched into the private tree, integrated per the brief, committed
+at §7's cadence, and published only through the broker's independent §4
+enforcement. Nothing in the artifact path publishes, writes status, or mutates
+policy.
 
 **Capability health at start.** At run start the harness probes each semantic
 capability it depends on — model bindings per role, broker forge operations,
@@ -791,7 +956,11 @@ is.
 - **Legacy mode (current):** OpenCode and model-controlled tools share a pod
   containing credentials. Label it insecure; do not describe it as protected by
   prompt permissions, process boundaries, or NetworkPolicy. It may remain
-  available as a stopgap, with its known risks explicit.
+  available as a stopgap, with its known risks explicit. A credential exposed
+  to any legacy pod is tainted for provider-scope purposes: it must not be
+  referenced by any broker registration or secure run, because one legacy run
+  otherwise defeats the isolation every secure run sharing that credential
+  claims.
 - **Phase 1:** establish the broker and typed policy APIs, but do not claim the
   existing OpenCode shim is secure merely by routing calls through a broker. It
   still cannot safely run model-controlled tools in the trusted harness pod or
@@ -835,7 +1004,10 @@ and the acceptance tests below are satisfied.
   path) confirm the operator's own specs are clean and the configured admission
   rejects the bad patterns; a dry-run of the operator's own spec does not prove
   an arbitrary actor cannot create an unauthorized pod, so the RBAC/admission
-  assumption of §3 is stated, not assumed away. Inspect env, argv, image pull
+  assumption of §3 is stated, not assumed away. The dedicated run namespace is
+  part of that verification: preflight checks the namespace boundary under
+  which only the operator creates or mutates pods, to the extent RBAC review
+  allows. Inspect env, argv, image pull
   configuration, volumes, and running `/proc` as well as rendered pod specs.
 - **Worker protocol:** tampering with signed fields/payload, replayed sequence or
   nonce, wrong incarnation, and expired admission are rejected. Test cancellation
@@ -868,10 +1040,35 @@ and the acceptance tests below are satisfied.
   exfiltration channel.
 - **Worker boundary:** worker accepts tasks only from trusted control and can
   return only untrusted artifacts. Tampered summaries and bundles are rejected
-  or treated as data.
+  or treated as data. The artifact contract (§5) is exercised directly: a
+  bundle built on any base other than the dispatched snapshot tip is rejected
+  without interpretation; a bundle over any bound (bundle size, unpacked size,
+  object count, blob size) is rejected whole; extra refs, unexpected ref
+  names, or refs outside the `refs/courier/` namespace are rejected, and
+  bundle-declared refs are never applied to the private tree (refless import);
+  a changed-path set outside the operator-resolved path scope is rejected,
+  including a symlink counted at its own path; artifacts carrying hostile
+  repository config — hooks, attribute-defined filters, `.gitmodules`
+  initialization, `protocol.ext` transport — are integrated only under the
+  hardened git environment and the hostile surfaces are inert; and valid
+  worker-declared metadata never changes a validation outcome. An honest
+  bundle on the expected base with in-scope changes integrates and publishes
+  through §4 enforcement.
 - **Revocation:** the CoderRun finalizer is idempotent — a rerun after partial
   failure (operator crash mid-sequence) resumes the ordered revocation,
   already-removed objects are treated as done, and no grant is re-provisioned.
+- **Provider registry (§4):** a run whose `spec.repo` matches zero or more
+  than one registration fails closed at admission with an actionable
+  `NeedsHuman`; selection is case-insensitive on `owner/name`; the persisted
+  policy and the broker projection carry the canonical identity and the same
+  registration name, and a `ProviderConfigRef` mismatch refuses service; a
+  projection whose endpoint or credential-reference digest does not match the
+  persisted policy refuses service; a push endpoint not derived from the
+  pinned registration's git endpoint is refused; a broker pod's projection
+  holds exactly one provider and no request can add, swap, or re-endpoint it;
+  structurally invalid registries fail operator startup; an unreachable
+  endpoint or missing Secret is an admission-time fail-closed `NeedsHuman`,
+  never a fallback.
 - **Broker policy:** deny merge, force push, default/protected refs in **both**
   the base and the work repository, foreign base/repository, an arbitrary
   destination, unexpected `fix-pr` head identity, arbitrary URLs, comments that
@@ -930,16 +1127,21 @@ and the acceptance tests below are satisfied.
    operator-resolved admission inputs, pre/post-push live revalidation, the
    `NeedsHuman`/retryable matrix, and provider-neutral semantics with
    fail-closed unsupported providers, including the writable fork head required
-   by #94. Remaining work is broker implementation (#122) and the provider
-   registration surface (#121).
-3. Define artifact format/size and validation (object/ref checks, base ancestry,
-   path policy) without treating worker metadata as authority.
+   by #94. #122's broker enforcement layer has landed; the remaining work is
+   the per-run pod wiring and admission resolution in #123.
+3. Settled in §5: the worker artifact contract — git bundle only, exact
+   base-tip ancestry binding, fixed size/object bounds, exact ref-set
+   equality, operator-resolved path scope, and worker metadata as never
+   authority. #125 implements and tests it.
 4. #120 settles per-run broker topology, workload identity, worker signing,
    network policy, and the first dependency-egress slice. #123 wires the isolated
    pods/protocol but does not implement the Go cache; create a separate bounded
    implementation issue #136 for that capability before claiming dependency egress is
    ready. The residual sanctioned-path source-exfiltration risk remains explicit.
-5. Define the narrow forge provider registration/configuration surface. It is
+5. Settled in §4: the provider registration surface — one deployment-level
+   registry file loaded by the operator, pattern-based run selection with
+   fail-closed ambiguity, canonical-identity enforcement, and a single-provider
+   broker projection. #123 consumes it in the operator wiring; it is
    deployment/control-plane configuration, not a `LaneProfile` field.
 6. Prove any OpenCode adapter's isolation and status guarantees before routing
    runs through it as secure; otherwise it remains legacy insecure mode.
@@ -965,6 +1167,8 @@ system and cannot defend against node/cluster administrators.
 | Shared broker bug mixes run identities | Prevented by not sharing a broker; reused provider credentials can still span runs and remain an explicitly accepted provider-scope risk. |
 | NetworkPolicy missing, ineffective or drifts | Refuse launch on unsupported/failed multi-node probes; runtime failures stop dispatch and flag isolation loss. Probes cannot prove future enforcement: a CNI regression remains a residual risk. |
 | Privileged cluster actor (node admin, `cluster-admin` RBAC, etcd) mutates a run pod spec, adds an ephemeral container, mounts a secret, or disables policy | Explicit residual risk: admission, RBAC, and NetworkPolicy bind subjects acting through the API under RBAC; an actor who can bypass them defeats the design. Preflight verifies the enforcement is present, not that no actor can override it. |
+| Namespace-local principal with pod-create in a run namespace forges a control, worker, or broker pod (same SA, labels, owner reference; mounts namespace Secrets by name; mints its own `courier-broker` token) | Deployment requirement (§3): runs live in a namespace dedicated to that purpose where no subject other than the operator can create, patch, or delete pods or workload-referencing specs; preflight verifies that boundary to the extent RBAC review allows — a grant's existence is provable, its absence is not. Where the boundary cannot be proven, this is a residual risk, not a closed hole. |
+| Broker provider credential carries a protected-ref bypass grant | Not verifiable through provider APIs (§4); the deployment attests it by provisioning a dedicated non-administrative machine identity, and secure admission fails closed when it cannot. Residual where the attestation is wrong. |
 | Pod recreated with new UID or stale task arrives after replacement | Broker rejects old pod-bound token/current-UID mismatch; operator rotates signing key and replaces worker, signed envelopes bind both UIDs. Control reconciles old operation against live pods/status rather than re-dispatching blindly. |
 
 #120 (workload identity, per-run broker, signed worker protocol, and dependency
@@ -989,7 +1193,9 @@ are settled and merged:
 | #126 | authenticated status, recovery, liveness | #119 (satisfied), #122-#125 |
 | #127 | native terminal result and operator verification | #124-#126 |
 
-#80 is consumed by #121/#122; #104 by #120/#122/#123. #101 stays a
+#80 is consumed by #121/#122, and its last open design question — the
+provider registration surface — is settled in §4 and consumed by #123's
+operator wiring. #104 by #120/#122/#123. #101 stays a
 separate, temporary OpenCode capability preflight, not a security boundary.
 #102 readiness is exactly after its prereqs: #119 (**satisfied** — design
 settled in §6), #126 (still **blocked** until #122-#125 are settled and
