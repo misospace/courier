@@ -69,7 +69,11 @@ failed run's unrecoverable workspace state — uncommitted edits, local commits
 not on the run branch — as Kubernetes Secrets owned by the `CoderRun`. The
 mechanism is invisible when disabled.
 
-Enable it with three settings on the operator:
+This section documents the designed behavior; it lands with the #197–#202
+implementation issues and nothing here exists until they ship. The design
+contract is in DESIGN.md § "Failure evidence for dirty runs (#115)".
+
+Enable it with three settings on the operator (all not yet implemented):
 
 - `--evidence-intake-bind` (for example `:8082`): binds the write-only intake
   listener. Empty disables evidence capture entirely. The chart renders the
