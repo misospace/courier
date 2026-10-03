@@ -642,3 +642,74 @@ func containsString(values []string, want string) bool {
 
 var _ = ctrl.Result{}
 var _ = strings.TrimSpace
+
+func TestProbePodsAreExcludedFromWorkloadLookups(t *testing.T) {
+	control, c := secureControl(t)
+	run := secureRun("probe-exclude")
+	if err := c.Create(context.Background(), run); err != nil {
+		t.Fatal(err)
+	}
+	// A leftover probe pod from a crashed preflight pass: worker labels, but
+	// marked as a probe.
+	probe := topology.ProbePod(run, "node-a", "busybox:test", "true")
+	if probe.Labels[topology.LabelProbe] != "true" {
+		t.Fatal("probe pods must carry the probe label")
+	}
+	if err := c.Create(context.Background(), probe); err != nil {
+		t.Fatal(err)
+	}
+	if pod, err := control.pod(context.Background(), run, topology.ComponentWorker); err != nil || pod != nil {
+		t.Fatalf("a probe pod must not satisfy the worker lookup, got %v, %v", pod, err)
+	}
+	if control.topologyPodsExist(context.Background(), run) {
+		t.Fatal("probe pods must not make the topology look provisioned")
+	}
+	// The real worker is still found.
+	if err := c.Create(context.Background(), healthyPod(run.Name, topology.ComponentWorker)); err != nil {
+		t.Fatal(err)
+	}
+	pod, err := control.pod(context.Background(), run, topology.ComponentWorker)
+	if err != nil || pod == nil {
+		t.Fatalf("real worker lookup failed: %v, %v", pod, err)
+	}
+}
+
+func TestProbeCoverageIsIncompleteWithoutEveryNode(t *testing.T) {
+	control, c := secureControl(t)
+	run := secureRun("probe-coverage")
+	if err := c.Create(context.Background(), run); err != nil {
+		t.Fatal(err)
+	}
+	// Two eligible nodes; only node-a produced a complete result set (two
+	// checks), node-b's probe crashed without a readable result.
+	for _, node := range []string{"node-a", "node-b"} {
+		if err := c.Create(context.Background(), topology.ProbePod(run, node, "busybox:test", "true")); err != nil {
+			t.Fatal(err)
+		}
+	}
+	a := topology.ProbePod(run, "node-a", "busybox:test", "true")
+	a.Status.Phase = corev1.PodSucceeded
+	a.Status.ContainerStatuses = []corev1.ContainerStatus{{
+		Name:  "probe",
+		State: corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{Message: "{\"name\":\"api-server\",\"got\":\"deny\"}\n{\"name\":\"cluster-dns\",\"got\":\"deny\"}\n"}},
+	}}
+	if err := c.Status().Update(context.Background(), a); err != nil {
+		t.Fatal(err)
+	}
+	b := topology.ProbePod(run, "node-b", "busybox:test", "true")
+	b.Status.Phase = corev1.PodFailed
+	b.Status.ContainerStatuses = []corev1.ContainerStatus{{
+		Name:  "probe",
+		State: corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{Message: ""}},
+	}}
+	if err := c.Status().Update(context.Background(), b); err != nil {
+		t.Fatal(err)
+	}
+	_, pending, err := control.collectProbeResults(context.Background(), run, []string{"node-a", "node-b"}, 2)
+	if err == nil {
+		t.Fatal("incomplete probe coverage must not be treated as evidence")
+	}
+	if pending {
+		t.Fatal("both probes are terminal, so nothing is pending")
+	}
+}

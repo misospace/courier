@@ -112,8 +112,12 @@ func NetworkPolicies(run *courier.CoderRun, cache *CachePin, gateway *GatewayPin
 		{
 			To: []networkingv1.NetworkPolicyPeer{{
 				IPBlock: &networkingv1.IPBlock{
-					CIDR:   "0.0.0.0/0",
-					Except: []string{"169.254.0.0/16", "127.0.0.0/8"},
+					CIDR: "0.0.0.0/0",
+					Except: []string{
+						"169.254.0.0/16",     // link-local metadata (AWS/GCP/Azure)
+						"127.0.0.0/8",        // loopback
+						"100.100.100.200/32", // Alibaba Cloud metadata
+					},
 				},
 			}},
 			Ports: []networkingv1.NetworkPolicyPort{{Protocol: &protocolTCP, Port: intOr(443)}},
@@ -122,7 +126,7 @@ func NetworkPolicies(run *courier.CoderRun, cache *CachePin, gateway *GatewayPin
 			To: []networkingv1.NetworkPolicyPeer{{
 				IPBlock: &networkingv1.IPBlock{
 					CIDR:   "::/0",
-					Except: []string{"fe80::/10"},
+					Except: []string{"fe80::/10", "fd00:ec2::254/128"}, // link-local and AWS IPv6 metadata
 				},
 			}},
 			Ports: []networkingv1.NetworkPolicyPort{{Protocol: &protocolTCP, Port: intOr(443)}},

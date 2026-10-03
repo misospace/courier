@@ -105,7 +105,9 @@ func (s *SecureControl) LaunchSecure(ctx context.Context, run *courier.CoderRun)
 
 	// Worker and control are provisioned as one incarnation round. The worker
 	// carries the round's incarnation identifier and public key; control
-	// carries the worker's live pod UID.
+	// carries the worker's live pod UID. Replacing either side rotates the
+	// signing key and re-provisions both, so envelopes signed by a previous
+	// incarnation are rejected by construction (§3).
 	workerPod, err := s.pod(ctx, run, topology.ComponentWorker)
 	if err != nil {
 		return ctrl.Result{}, err
@@ -120,6 +122,7 @@ func (s *SecureControl) LaunchSecure(ctx context.Context, run *courier.CoderRun)
 	if controlPod != nil && controlPod.DeletionTimestamp != nil {
 		return ctrl.Result{RequeueAfter: secureRequeueDelay}, nil
 	}
+	workerCreated := false
 	if workerPod == nil {
 		if controlPod != nil {
 			// A control pod without its paired worker is a broken round:
@@ -155,15 +158,24 @@ func (s *SecureControl) LaunchSecure(ctx context.Context, run *courier.CoderRun)
 		if err := s.Client.Get(ctx, types.NamespacedName{Namespace: workerPod.Namespace, Name: workerPod.Name}, workerPod); err != nil {
 			return ctrl.Result{}, err
 		}
+		workerCreated = true
 	}
 	if controlPod == nil {
+		if !workerCreated {
+			// The surviving worker belongs to a previous control incarnation.
+			// Replacing control rotates the key and fences its worker, so the
+			// whole round is re-provisioned instead of reusing old material.
+			if err := s.Fence(ctx, run); err != nil {
+				return ctrl.Result{}, err
+			}
+			return ctrl.Result{RequeueAfter: secureRequeueDelay}, nil
+		}
 		controlSA, err := s.serviceAccount(ctx, run, topology.ControlSAName(run.Name))
 		if err != nil {
 			return ctrl.Result{}, err
 		}
 		incarnation := workerEnvValue(workerPod, topology.EnvControlPodUID)
 		if incarnation == "" {
-			// The worker predates incarnation binding: fence the round.
 			if err := s.Fence(ctx, run); err != nil {
 				return ctrl.Result{}, err
 			}
@@ -199,6 +211,9 @@ func (s *SecureControl) ObserveTopology(ctx context.Context, run *courier.CoderR
 	}
 	var control, worker, broker *corev1.Pod
 	for i := range pods {
+		if pods[i].Labels[topology.LabelProbe] == "true" {
+			continue
+		}
 		switch pods[i].Labels["courier.misospace.dev/component"] {
 		case topology.ComponentCoordinator:
 			control = &pods[i]
@@ -627,6 +642,8 @@ func (s *SecureControl) ensureObject(ctx context.Context, object client.Object) 
 }
 
 // pod returns the run's live pod for one component, or nil when absent.
+// Preflight probe pods carry the worker's component label (so the worker's
+// own NetworkPolicy applies to them) and are excluded by the probe label.
 func (s *SecureControl) pod(ctx context.Context, run *courier.CoderRun, component string) (*corev1.Pod, error) {
 	var pods corev1.PodList
 	if err := s.Client.List(ctx, &pods, client.InNamespace(run.Namespace)); err != nil {
@@ -634,6 +651,9 @@ func (s *SecureControl) pod(ctx context.Context, run *courier.CoderRun, componen
 	}
 	for i := range pods.Items {
 		pod := &pods.Items[i]
+		if pod.Labels[topology.LabelProbe] == "true" {
+			continue
+		}
 		if pod.Labels[topology.LabelRun] == run.Name && pod.Labels["courier.misospace.dev/component"] == component {
 			return pod, nil
 		}
@@ -659,6 +679,8 @@ func (s *SecureControl) serviceAccount(ctx context.Context, run *courier.CoderRu
 	return sa, nil
 }
 
+// workerEnvValue reads one env value from the pod's single container. Used
+// only for values the operator itself provisioned (the incarnation binding).
 func workerEnvValue(pod *corev1.Pod, name string) string {
 	if pod == nil {
 		return ""
@@ -686,14 +708,25 @@ func (s *SecureControl) transitionNeedsHuman(ctx context.Context, run *courier.C
 		return ctrl.Result{}, errors.New("secure topology: no reconciler wired for terminalization")
 	}
 	patcher := s.Patcher
-	run.Status.Conditions = append(run.Status.Conditions, metav1.Condition{
+	condition := metav1.Condition{
 		Type:               "SecurePreflightFailed",
-		Status:             metav1.ConditionFalse,
+		Status:             metav1.ConditionTrue,
 		ObservedGeneration: run.Generation,
 		LastTransitionTime: metav1.NewTime(s.now().UTC()),
 		Reason:             "TopologyFailed",
 		Message:            detail,
-	})
+	}
+	replaced := false
+	for i := range run.Status.Conditions {
+		if run.Status.Conditions[i].Type == "SecurePreflightFailed" {
+			run.Status.Conditions[i] = condition
+			replaced = true
+			break
+		}
+	}
+	if !replaced {
+		run.Status.Conditions = append(run.Status.Conditions, condition)
+	}
 	return patcher.transitionTerminal(ctx, run, courier.PhaseNeedsHuman, "", terminalLifecycleIntent{error: detail})
 }
 

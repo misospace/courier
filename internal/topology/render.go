@@ -155,9 +155,21 @@ func BrokerRole(run *courier.CoderRun) *rbacv1.Role {
 				Verbs:         []string{"get", "patch", "update"},
 			},
 			{
+				// Named pod reads for current-incarnation checks (§3): the
+				// three topology pods have deterministic names.
+				APIGroups:     []string{""},
+				Resources:     []string{"pods"},
+				ResourceNames: []string{ControlPodName(run.Name), WorkerPodName(run.Name), BrokerPodName(run.Name)},
+				Verbs:         []string{"get"},
+			},
+			{
+				// List is required by the authenticator's
+				// exactly-one-live-control scan; RBAC cannot name-scope a
+				// list. The run namespace is dedicated, so this scan only
+				// ever sees this run's pods.
 				APIGroups: []string{""},
 				Resources: []string{"pods"},
-				Verbs:     []string{"get", "list"},
+				Verbs:     []string{"list"},
 			},
 		},
 	}
@@ -579,12 +591,18 @@ func ControlPod(run *courier.CoderRun, in ControlInputs) (*corev1.Pod, error) {
 	}, nil
 }
 
+// LabelProbe marks disposable preflight probe pods. Probe pods deliberately
+// carry the worker's component label so the worker's own NetworkPolicy — not
+// a special exception — is what the probe exercises; this extra label lets
+// the operator's workload lookups distinguish them.
+const LabelProbe = "courier.misospace.dev/probe"
+
 // ProbePod renders one disposable identity-less network probe pod pinned to a
 // node. It carries the worker's labels so the worker's own NetworkPolicy —
 // not a special exception — is what the probe exercises.
 func ProbePod(run *courier.CoderRun, node, image, script string) *corev1.Pod {
 	suffix := "-probe-" + nodeNameTag(node)
-	return &corev1.Pod{
+	pod := &corev1.Pod{
 		ObjectMeta: objectMeta(run, resourceName(run.Name, suffix), ComponentWorker),
 		Spec: corev1.PodSpec{
 			NodeName:                     node,
@@ -602,6 +620,8 @@ func ProbePod(run *courier.CoderRun, node, image, script string) *corev1.Pod {
 			}},
 		},
 	}
+	pod.Labels[LabelProbe] = "true"
+	return pod
 }
 
 // nodeNameTag produces a short DNS-safe tag for a node name.

@@ -251,7 +251,7 @@ func registrationFixture() *forge.Registration {
 func TestBrokerRoleIsExactlyTheNamedGrants(t *testing.T) {
 	run := testRun("rbac")
 	role := BrokerRole(run)
-	if len(role.Rules) != 3 {
+	if len(role.Rules) != 4 {
 		t.Fatalf("broker role rules = %+v", role.Rules)
 	}
 	for _, rule := range role.Rules {
@@ -264,9 +264,23 @@ func TestBrokerRoleIsExactlyTheNamedGrants(t *testing.T) {
 			if len(rule.ResourceNames) != 1 || rule.ResourceNames[0] != run.Name {
 				t.Fatalf("status grant must be name-scoped: %+v", rule)
 			}
-		case contains(rule.Resources, "pods"):
-			if len(rule.Verbs) != 2 || !contains(rule.Verbs, "get") || !contains(rule.Verbs, "list") {
-				t.Fatalf("pod grant must be read-only: %+v", rule)
+		case contains(rule.Resources, "pods") && contains(rule.Verbs, "get"):
+			// Named pod reads only: the three topology pods.
+			want := []string{ControlPodName(run.Name), WorkerPodName(run.Name), BrokerPodName(run.Name)}
+			if len(rule.ResourceNames) != 3 {
+				t.Fatalf("pod get must be name-scoped: %+v", rule)
+			}
+			for _, name := range want {
+				if !contains(rule.ResourceNames, name) {
+					t.Fatalf("pod get missing named pod %q: %+v", name, rule.ResourceNames)
+				}
+			}
+		case contains(rule.Resources, "pods") && contains(rule.Verbs, "list"):
+			// The authenticator's exactly-one-live-control scan needs a
+			// namespace list; RBAC cannot name-scope it. The run namespace
+			// is dedicated, so it only ever sees this run's pods.
+			if len(rule.ResourceNames) != 0 {
+				t.Fatalf("pod list carries no resourceNames: %+v", rule)
 			}
 		default:
 			t.Fatalf("unexpected rule resource: %+v", rule.Resources)

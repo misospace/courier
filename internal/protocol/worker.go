@@ -211,19 +211,21 @@ func (w *Worker) verifySigned(wr http.ResponseWriter, r *http.Request, wantKind 
 	return req.Envelope, req.Payload, true
 }
 
-// consumeNonce records an envelope nonce exactly once. Replay is rejected
-// and the bounded set never forgets earlier nonces.
-func (w *Worker) consumeNonce(envelope Envelope) bool {
+// consumeNonce records an envelope nonce exactly once. The bounded set never
+// forgets earlier nonces: replay is rejected with 401, and exhaustion is
+// reported separately so control can distinguish a wedged worker from an
+// attack.
+func (w *Worker) consumeNonce(envelope Envelope) (accepted, exhausted bool) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	if _, seen := w.nonces[envelope.Nonce]; seen {
-		return false
+		return false, false
 	}
 	if len(w.nonces) >= maxNonces {
-		return false
+		return false, true
 	}
 	w.nonces[envelope.Nonce] = struct{}{}
-	return true
+	return true, false
 }
 
 func (w *Worker) handleDispatch(wr http.ResponseWriter, r *http.Request) {
@@ -240,8 +242,15 @@ func (w *Worker) handleDispatch(wr http.ResponseWriter, r *http.Request) {
 		http.Error(wr, "dispatch payload requires a command", http.StatusBadRequest)
 		return
 	}
-	if !w.consumeNonce(envelope) {
-		http.Error(wr, "nonce replay or replay state exhausted", http.StatusUnauthorized)
+	accepted, exhausted := w.consumeNonce(envelope)
+	if exhausted {
+		// Fail closed and loud: a worker whose replay state is full accepts
+		// nothing further and must be treated as infrastructure failure.
+		http.Error(wr, "replay state exhausted; worker must be replaced", http.StatusServiceUnavailable)
+		return
+	}
+	if !accepted {
+		http.Error(wr, "nonce replay rejected", http.StatusUnauthorized)
 		return
 	}
 
@@ -256,19 +265,14 @@ func (w *Worker) handleDispatch(wr http.ResponseWriter, r *http.Request) {
 		http.Error(wr, "operation is already registered; redelivery never starts a second execution", http.StatusConflict)
 		return
 	}
-	op := &operation{envelope: envelope, wait: make(chan struct{})}
+	// The cancellable context is created before the operation becomes visible
+	// in the map, so a cancellation racing this dispatch can never observe a
+	// nil cancel function.
+	ctx, cancel := context.WithCancel(context.WithoutCancel(r.Context()))
+	op := &operation{envelope: envelope, cancel: cancel, wait: make(chan struct{})}
 	w.ops[envelope.OpID] = op
 	w.mu.Unlock()
 
-	w.start(r.Context(), op, task)
-	w.respondStatus(wr, envelope.OpID, http.StatusAccepted)
-}
-
-// start runs the task. The operation runs under its own cancellable context
-// so the HTTP request returning never terminates the task.
-func (w *Worker) start(parent context.Context, op *operation, task Task) {
-	ctx, cancel := context.WithCancel(context.WithoutCancel(parent))
-	op.cancel = cancel
 	go func() {
 		defer close(op.wait)
 		result := w.runTask(ctx, task)
@@ -276,6 +280,7 @@ func (w *Worker) start(parent context.Context, op *operation, task Task) {
 		op.result = result
 		w.mu.Unlock()
 	}()
+	w.respondStatus(wr, envelope.OpID, http.StatusAccepted)
 }
 
 func (w *Worker) runTask(ctx context.Context, task Task) *Result {
@@ -356,8 +361,13 @@ func (w *Worker) handleCancel(wr http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	if !w.consumeNonce(envelope) {
-		http.Error(wr, "nonce replay or replay state exhausted", http.StatusUnauthorized)
+	accepted, exhausted := w.consumeNonce(envelope)
+	if exhausted {
+		http.Error(wr, "replay state exhausted; worker must be replaced", http.StatusServiceUnavailable)
+		return
+	}
+	if !accepted {
+		http.Error(wr, "nonce replay rejected", http.StatusUnauthorized)
 		return
 	}
 

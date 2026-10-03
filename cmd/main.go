@@ -12,7 +12,9 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/runtime"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
+	"k8s.io/client-go/kubernetes"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
+	"k8s.io/client-go/rest"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/healthz"
@@ -261,6 +263,7 @@ func main() {
 			legacyGitSecret: gitCredentialSecret,
 			legacyAPISecret: githubCredentialSecret,
 			operatorNS:      os.Getenv("POD_NAMESPACE"),
+			restConfig:      mgr.GetConfig(),
 		})
 		if err != nil {
 			setupLog.Error(err, "unable to configure secure mode")
@@ -403,6 +406,7 @@ type secureConfig struct {
 	legacyGitSecret string
 	legacyAPISecret string
 	operatorNS      string
+	restConfig      *rest.Config
 }
 
 const (
@@ -446,6 +450,13 @@ func buildSecureControl(config secureConfig) (*controller.SecureControl, error) 
 	if !ok || observer.Client == nil {
 		return nil, fmt.Errorf("secure mode requires a GitHub observer credential for admission-time provider reads")
 	}
+	if config.restConfig == nil {
+		return nil, fmt.Errorf("secure mode requires an API server connection for access reviews")
+	}
+	clientset, err := kubernetes.NewForConfig(config.restConfig)
+	if err != nil {
+		return nil, fmt.Errorf("build access-review client: %w", err)
+	}
 	harnessImage := strings.TrimSpace(config.harnessImage)
 	if harnessImage == "" {
 		harnessImage = defaultsHarnessImage
@@ -463,6 +474,7 @@ func buildSecureControl(config secureConfig) (*controller.SecureControl, error) 
 			CacheService:      strings.TrimSpace(config.cacheService),
 			CachePort:         int32(config.cachePort),
 			LiveProbes:        true,
+			Kubernetes:        clientset,
 			OperatorNamespace: strings.TrimSpace(config.operatorNS),
 			Providers: func(ctx context.Context, registration *forge.Registration) (controller.AdmissionProvider, error) {
 				// Admission reads use the operator's own read identity. The

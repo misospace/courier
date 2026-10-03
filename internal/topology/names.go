@@ -118,7 +118,7 @@ const (
 	brokerScratchPath  = "/var/tmp/courier-broker"
 	brokerAPIAddr      = ":8443"
 	brokerStatusAddr   = ":8444"
-	brokerTokenPath    = "/var/run/secrets/kubernetes.io/serviceaccount/token"
+	brokerTokenPath    = "/var/run/secrets/tokens/api/token"
 	brokerKubeCAPath   = "/var/run/secrets/kubernetes.io/serviceaccount/ca.crt"
 	brokerPortName     = "https"
 	brokerStatusPortNm = "https-status"

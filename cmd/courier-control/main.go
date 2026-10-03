@@ -17,6 +17,7 @@ import (
 	"flag"
 	"fmt"
 	"net/http"
+	"net/url"
 	"os"
 	"time"
 
@@ -210,12 +211,11 @@ func unavailableDetails(caps []capability) string {
 }
 
 func hostOnly(rawURL string) string {
-	for i := 0; i < len(rawURL); i++ {
-		if rawURL[i] == '/' {
-			return rawURL[:i]
-		}
+	parsed, err := url.Parse(rawURL)
+	if err != nil || parsed.Host == "" {
+		return rawURL
 	}
-	return rawURL
+	return parsed.Hostname()
 }
 
 func declareNeedsHuman(reason string, caps []capability) error {

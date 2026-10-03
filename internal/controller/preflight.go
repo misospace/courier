@@ -273,6 +273,17 @@ func (s *SecureControl) checkDryRuns(ctx context.Context, run *courier.CoderRun,
 		mutate(p)
 		return p
 	}
+	// A pod that would mount the run's credentials into an extra container.
+	credentialMount := bad(func(p *corev1.Pod) {
+		p.Spec.Volumes = append(p.Spec.Volumes, corev1.Volume{
+			Name: "stolen-creds",
+			VolumeSource: corev1.VolumeSource{Secret: &corev1.SecretVolumeSource{
+				SecretName: topology.CredentialsSecretName(run.Name),
+			}},
+		})
+		p.Spec.Containers[0].VolumeMounts = append(p.Spec.Containers[0].VolumeMounts,
+			corev1.VolumeMount{Name: "stolen-creds", MountPath: "/stolen-creds"})
+	})
 	badSpecs := []*corev1.Pod{
 		bad(func(p *corev1.Pod) {
 			p.Spec.Volumes = append(p.Spec.Volumes, corev1.Volume{
@@ -291,14 +302,30 @@ func (s *SecureControl) checkDryRuns(ctx context.Context, run *courier.CoderRun,
 		bad(func(p *corev1.Pod) {
 			p.Spec.HostNetwork = true
 		}),
+		// An added sidecar, itself carrying a credential mount: rejects both
+		// unauthorized sidecars and credential mounts in one probe.
+		func(p *corev1.Pod) *corev1.Pod {
+			credentialMount.Spec.Containers = append(credentialMount.Spec.Containers, corev1.Container{
+				Name:  "injected",
+				Image: "busybox:test",
+				VolumeMounts: []corev1.VolumeMount{{
+					Name:      "stolen-creds",
+					MountPath: "/stolen-creds",
+				}},
+			})
+			return credentialMount
+		}(nil),
 	}
 	for _, pod := range badSpecs {
 		err := s.Client.Create(ctx, pod, ctrlclient.DryRunAll)
 		if err == nil {
 			return secureNeedsHuman("AdmissionBroken",
-				"the cluster API admitted a known-bad pod spec (%s); secure mode requires enforced restricted admission", pod.Name)
+				"the cluster API admitted a known-bad pod spec (%s); secure mode requires enforced restricted admission plus policy controls that reject sidecars and credential mounts", pod.Name)
 		}
 	}
+	// Ephemeral-container injection is a subresource write, not a pod create:
+	// its denial rests on the §3 RBAC assumption (no subject but the operator
+	// may patch run pods) and cannot be proven by a dry-run.
 	return nil
 }
 
@@ -379,7 +406,7 @@ func (s *SecureControl) runLiveProbes(ctx context.Context, run *courier.CoderRun
 
 	deadline := time.Now().Add(timeout)
 	for {
-		outcomes, pending, err := s.collectProbeResults(ctx, run, eligible)
+		outcomes, pending, err := s.collectProbeResults(ctx, run, eligible, len(checks))
 		if err != nil {
 			return err
 		}
@@ -429,7 +456,7 @@ func findCheck(checks []probeCheck, name string) *probeCheck {
 
 // collectProbeResults reads every probe pod's termination message. It returns
 // the outcomes and whether any probe is still pending.
-func (s *SecureControl) collectProbeResults(ctx context.Context, run *courier.CoderRun, nodes []string) ([]probeOutcome, bool, error) {
+func (s *SecureControl) collectProbeResults(ctx context.Context, run *courier.CoderRun, nodes []string, checkCount int) ([]probeOutcome, bool, error) {
 	var outcomes []probeOutcome
 	pending := false
 	for _, node := range nodes {
@@ -452,6 +479,7 @@ func (s *SecureControl) collectProbeResults(ctx context.Context, run *courier.Co
 				message = cs.State.Terminated.Message
 			}
 		}
+		nodeOutcomes := 0
 		for _, line := range strings.Split(strings.TrimSpace(message), "\n") {
 			line = strings.TrimSpace(line)
 			if line == "" {
@@ -462,6 +490,13 @@ func (s *SecureControl) collectProbeResults(ctx context.Context, run *courier.Co
 				return nil, false, fmt.Errorf("secure preflight: probe on %s produced an unreadable result: %w", node, err)
 			}
 			outcomes = append(outcomes, outcome)
+			nodeOutcomes++
+		}
+		if nodeOutcomes < checkCount {
+			// A crashed or truncated probe proves nothing about this node:
+			// requeue rather than pass on partial coverage.
+			return nil, false, fmt.Errorf("secure preflight: probe on node %s reported %d of %d checks; coverage is incomplete",
+				node, nodeOutcomes, checkCount)
 		}
 	}
 	sort.Slice(outcomes, func(i, j int) bool { return outcomes[i].Name < outcomes[j].Name })
