@@ -115,7 +115,9 @@ kubectl -n courier-system get secret courier-evidence-<run>-<inc> \
 kubectl -n courier-system get secret courier-evidence-<run>-<inc> \
   -o jsonpath='{.data.bundle\.tar\.gz}' | base64 -d | tar -tzf -
 
-# extract OUTSIDE any checkout, never as root
+# extract OUTSIDE any checkout, never as root. This command is safe only
+# because the intake already rejected absolute and `..` entry paths and
+# symlink members — never generalize it to arbitrary untrusted tars
 kubectl -n courier-system get secret courier-evidence-<run>-<inc> \
   -o jsonpath='{.data.bundle\.tar\.gz}' | base64 -d | tar -xzf - -C /tmp/evidence-<run>
 ```
