@@ -106,6 +106,18 @@ type PublicationPolicy struct {
 	RunUID string `json:"runUID"`
 	// ProviderConfigRef identifies the administrator-configured forge provider.
 	ProviderConfigRef string `json:"providerConfigRef"`
+	// ProviderEndpoint is the canonical API base of the pinned registration.
+	// The broker verifies its projection against it and refuses service on
+	// mismatch, so selection and enforcement stay the same record across
+	// broker replacement.
+	// +optional
+	ProviderEndpoint string `json:"providerEndpoint,omitempty"`
+	// CredentialRefDigest is the SHA-256 identity of the projected broker
+	// registration: name, type, endpoint, git endpoint template, and every
+	// credential reference. The broker recomputes it from its own projection
+	// and refuses service on mismatch. It never contains a credential value.
+	// +optional
+	CredentialRefDigest string `json:"credentialRefDigest,omitempty"`
 	// BaseRepo is the provider-canonical repository receiving the pull request.
 	BaseRepo string `json:"baseRepo"`
 	// BaseRef is the exact base branch ref.

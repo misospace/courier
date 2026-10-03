@@ -37,6 +37,31 @@ dispatch:
     name: ""
     key: token
 
+# -- Secure topology (HARNESS.md). Disabled by default: the legacy
+# single-pod coordinator remains explicitly insecure. When enabled, every
+# run is provisioned as one trusted control pod, one untrusted worker pod,
+# and one per-run trusted broker pod behind a run-specific Service, in the
+# dedicated run namespace. `providers` is the deployment-level forge provider
+# registry, rendered into a ConfigMap the operator reads at startup; it
+# carries references only — credential values never appear here.
+secure:
+  enabled: false
+  # -- The namespace dedicated to secure runs. Required when enabled.
+  runNamespace: ""
+  # -- Registry of forge provider registrations. Each entry: name, type
+  #    (github), endpoint (https API base), optional gitEndpoint template
+  #    (one %s), optional gitUsername, credentials (purpose forge-api, and
+  #    optional git: {secretName, key} — secretNames must reference Secrets
+  #    in the operator's namespace that are NOT injected into legacy pods),
+  #    and serves (case-insensitive owner/name patterns, e.g. misospace/*).
+  providers: []
+  harnessImage:
+    repository: ghcr.io/misospace/courier-harness
+    tag: ""
+  probeImage: busybox:1.36
+  dependencyCacheService: ""
+  dependencyCachePort: 0
+
 # -- Optional Prometheus Operator ServiceMonitor for the controller's
 # metrics endpoint (port 8080). When enabled, renders a `<release>-metrics`
 # Service and a ServiceMonitor that scrapes `/metrics` on it. `labels` is a
@@ -142,6 +167,36 @@ rbac:
         - apiGroups: [""]
           resources: [pods]
           verbs: [create, delete, get, list, watch]
+        - apiGroups: [""]
+          resources: [secrets]
+          verbs: [create, delete, get, list]
+        - apiGroups: [""]
+          resources: [serviceaccounts]
+          verbs: [create, delete, get, list]
+        - apiGroups: [""]
+          resources: [services]
+          verbs: [create, delete, get, list]
+        - apiGroups: [""]
+          resources: [nodes]
+          verbs: [get, list]
+        - apiGroups: [""]
+          resources: [namespaces]
+          verbs: [get]
+        - apiGroups: [networking.k8s.io]
+          resources: [networkpolicies]
+          verbs: [create, delete, get, list]
+        - apiGroups: [rbac.authorization.k8s.io]
+          resources: [roles]
+          verbs: [create, delete, get, list]
+        - apiGroups: [rbac.authorization.k8s.io]
+          resources: [rolebindings]
+          verbs: [create, delete, get, list]
+        - apiGroups: [rbac.authorization.k8s.io]
+          resources: [clusterrolebindings]
+          verbs: [create, delete, get, list]
+        - apiGroups: [authorization.k8s.io]
+          resources: [subjectaccessreviews, selfsubjectaccessreviews]
+          verbs: [create]
         - apiGroups: [courier.misospace.dev]
           resources: [coderruns]
           verbs: [create, delete, get, list, patch, update, watch]

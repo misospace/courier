@@ -2,6 +2,7 @@
 
 IMG ?= ghcr.io/misospace/courier:latest
 EXECUTOR_IMG ?= ghcr.io/misospace/courier-opencode:latest
+HARNESS_IMG ?= ghcr.io/misospace/courier-harness:latest
 TOOLCHAIN_IMG ?= ghcr.io/misospace/courier-go:latest
 OPENCODE_VERSION ?= 1.18.31
 
@@ -77,6 +78,10 @@ docker-build-coordinator: ## Build the bootstrap coordinator image (courier-exec
 .PHONY: docker-build-coordinator-go
 docker-build-coordinator-go: ## Build the Go-capable dogfood coordinator image.
 	docker build --target coordinator-go --build-arg OPENCODE_VERSION=$(OPENCODE_VERSION) -t $(TOOLCHAIN_IMG) .
+
+.PHONY: docker-build-harness
+docker-build-harness: ## Build the secure harness image (courier-control + courier-worker + courier-broker).
+	docker build --target harness -t $(HARNESS_IMG) .
 
 ##@ Dependencies
 

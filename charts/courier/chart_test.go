@@ -401,3 +401,56 @@ func TestChartRejectsInvalidLaneBindings(t *testing.T) {
 		t.Fatalf("helm template failed without the expected message:\n%s", out)
 	}
 }
+
+func TestChartRendersSecureTopologyConfiguration(t *testing.T) {
+	if _, err := exec.LookPath("helm"); err != nil {
+		t.Skip("helm is not installed")
+	}
+
+	chartDir := copyChart(t)
+	if err := exec.Command("helm", "repo", "add", "bjw-s-labs", "https://bjw-s-labs.github.io/helm-charts").Run(); err != nil {
+		t.Fatalf("configure chart repository: %v", err)
+	}
+	runHelm(t, chartDir, "dependency", "build")
+
+	enabled := runHelm(t, chartDir, "template", "courier", ".",
+		"--set", "secure.enabled=true",
+		"--set", "secure.runNamespace=courier-runs",
+		"--set", "secure.providers[0].name=github",
+		"--set", "secure.providers[0].type=github",
+		"--set", "secure.providers[0].endpoint=https://api.github.com/",
+		"--set", "secure.providers[0].credentials.forge-api.secretName=forge-creds",
+		"--set", "secure.providers[0].credentials.forge-api.key=token",
+		"--set", "secure.providers[0].serves[0]=misospace/*",
+		"--set", "secure.dependencyCacheService=cache-system/go-cache",
+	)
+	for _, want := range []string{
+		"--secure-mode=true",
+		"--forge-providers-file=/etc/courier/forge-providers.json",
+		"--run-namespace=courier-runs",
+		"--dependency-cache-service=cache-system/go-cache",
+		"name: courier-forge-providers",
+		"courier-broker-tokenreview",
+		"mountPath: /etc/courier",
+	} {
+		if !strings.Contains(enabled, want) {
+			t.Fatalf("secure-enabled chart output is missing %q", want)
+		}
+	}
+	if !strings.Contains(enabled, "\"serves\": [") && !strings.Contains(enabled, "\"serves\":") {
+		t.Fatalf("providers ConfigMap does not carry the serves patterns")
+	}
+
+	disabled := runHelm(t, chartDir, "template", "courier", ".")
+	for _, unwanted := range []string{
+		"--secure-mode",
+		"--forge-providers-file",
+		"--run-namespace",
+		"courier-forge-providers",
+		"courier-broker-tokenreview",
+	} {
+		if strings.Contains(disabled, unwanted) {
+			t.Fatalf("secure-disabled chart output unexpectedly contains %q", unwanted)
+		}
+	}
+}
