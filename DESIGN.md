@@ -351,9 +351,9 @@ checkout.
 
 ### Failure evidence for dirty runs (#115)
 
-Committed, branch-reachable work is in the world and is never duplicated.
-Unrecoverable state — uncommitted edits, local commits not reachable from the
-run branch — is what evidence preserves, in bounded form. The division of labor
+Committed, remote-held work is in the world and is never duplicated.
+Unrecoverable state — uncommitted edits, local commits the remote run branch
+does not hold — is what evidence preserves, in bounded form. The division of labor
 is the design: **the executor captures** (only it has the git context and the
 timing), **the operator persists** (the legacy pod is explicitly insecure, so
 anything it can write must be narrowly scoped). The pod gains no Kubernetes
@@ -386,13 +386,16 @@ The invariants the mechanism must hold:
    evidence.
 7. Retrieval and application are human actions; no run or retry ever adopts,
    publishes, or implies publication of evidence.
-8. Evidence exists only for states the world cannot recover; committed,
-   branch-reachable work is never duplicated, and stored evidence is deleted
-   when the world proves the work landed (Verifying).
+8. Evidence exists only for states the world cannot recover; remote-held work
+   is never duplicated, and stored evidence is deleted when the world proves
+   the work landed (AwaitingReview, Done).
 
 **Capture moments** (`internal/evidence`, `cmd/courier-executor/main.go`).
 Every moment is gated on the verified worktree showing unrecoverable state —
-dirty, local-only commits, or a failed world read that leaves the state unknown.
+uncommitted changes, local commits the **remote** run branch does not hold
+(checked with one bounded fetch-and-compare, since the world is the remote, not
+the local ref — a commit pushed nowhere is as unrecoverable as an uncommitted
+edit), or a failed world read that leaves the state unknown.
 A clean or fully-pushed worktree never captures, from any incarnation: a
 relaunched pod starts from a fresh clone, finds nothing unrecoverable, and
 cannot overwrite the previous incarnation's evidence with an empty bundle.
@@ -402,8 +405,12 @@ cannot overwrite the previous incarnation's evidence with an empty bundle.
    inspection and capture before either resuming or terminalizing, so a run
    that crashes dirty is not uncovered.
 2. **Terminal classification.** `Failed`/`NeedsHuman` endings capture before
-   exiting. `Verifying` endings never capture: committed work is in the world,
-   and untracked residue alongside committed work is the known #93
+   exiting. Endings classified `Verifying` capture nothing, because the gate's
+   remote check has confirmed the run branch's commits are held — a
+   `Verifying`-classified ending whose commits are confirmed only locally does
+   not satisfy the gate and captures, with the operator deleting the evidence
+   when its own world observation confirms the PR. Untracked residue alongside
+   remote-confirmed committed work is the known #93
    classification, accepted as lost-with-the-pod.
 3. **Cancellation.** On pod deletion (liveness reap/relaunch) the executor
    traps SIGTERM **by cancelling the run context only** — never by capturing
@@ -472,8 +479,12 @@ overflow rule above.
 
 The intake's credential set comes from the pod builder, not from hope: kubelet,
 not the operator, resolves the run's credential env, so one shared pod-builder
-function produces the `(env name, SecretKeyRef)` pairs — the single source of
-truth for what the executor receives and what the intake re-scans against. The
+function produces the `(env name, SecretKeyRef)` pairs for the per-key
+credential refs — the single source of truth for what the executor receives
+and what the intake re-scans against. The executor environment Secret arrives
+by a different route — `envFrom`, which maps each Secret key 1:1 to an env
+name the builder never enumerates — so the intake adds that Secret's keys
+directly, under the same shape rule. The
 intake resolves those refs at persist time and registers the values whose env
 names are secret-shaped (the shape rule tests env names, never Secret keys, so
 a custom `--git-token-key` is not silently skipped; over-registering a
@@ -503,10 +514,13 @@ name-shape redactor registration covers it), and the intake validates with
 `hmac.Equal` after recomputing the HMAC from an **uncached** live read of the
 run (the standard HARNESS.md §6 sets for operator decisions). The phase gate is
 an allowlist, not "not terminal": the intake accepts `Running`, `Failed`, and
-`NeedsHuman` — a crashloop-ceiling reap writes `NeedsHuman` before SIGTERM is
-even delivered, and the grace capture is the only coverage for that wedged
-pod's work — and rejects `Verifying`, `AwaitingReview`, and `Done`, where the
-world provably holds the work. A recreated same-name run's new UID rejects old
+`NeedsHuman` — a crashloop-ceiling reap deletes the pod and writes
+`NeedsHuman` in the same reconcile, and SIGTERM delivery races that status
+write rather than following it, so the allowlist admits `NeedsHuman` instead of
+betting on read ordering; the grace capture is the only coverage for that
+wedged pod's work — and rejects `Verifying`, `AwaitingReview`, and `Done`,
+whose pods have already exited with their capture window closed. A recreated
+same-name run's new UID rejects old
 tokens; a deleted run fails the live read. A stolen token can write only its
 own incarnation's slot — strictly narrower than the git push credential the
 legacy pod already holds. Persist is synchronous: a 2xx response means the
@@ -528,8 +542,10 @@ each Secret stays well under the 1 MiB API limit; the bound is `maxRestarts +
 1` Secrets per run. Retention: the owner reference
 deletes evidence with the run (Done reaping, operator deletion, #97
 delete-as-retry) — no sweeper, no separate clock, zero standing footprint; the
-operator additionally deletes a run's evidence Secrets when the run transitions
-to **Verifying**, because the world then provably holds the work (Invariant 8).
+operator additionally deletes a run's evidence Secrets when the run reaches
+**AwaitingReview or Done** — the states where the operator's own world
+observation has proven the work landed (Invariant 8). A `Verifying` run that
+falls to `NeedsHuman` keeps its evidence: its world proof never arrived.
 A capture validated while the run was still `Running` but persisted after that
 deletion can briefly resurrect a Secret — a stated race, bounded by the
 run's own GC. Access control is namespace RBAC: the operator gains
@@ -579,8 +595,9 @@ documented. A run deleted mid-POST rejects the POST harmlessly. Same-name
 recreation gets new UIDs and fresh nonces while the old Secret is GC'd
 asynchronously — harmless because slot names are nonce-derived and unique. A
 run reaching
-Verifying after a continuation capture has its evidence deleted; the world
-holds the work (a capture validated while `Running` but persisted after that
+AwaitingReview or Done after a continuation capture has its evidence deleted;
+the world holds the work, and a `Verifying` run that falls to `NeedsHuman`
+keeps it (a capture validated while `Running` but persisted after that
 deletion can briefly resurrect a Secret — stated race, bounded by the run's
 own GC).
 

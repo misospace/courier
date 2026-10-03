@@ -90,7 +90,9 @@ DESIGN.md, Security and boundaries, for what that grant means). Evidence
 Secrets carry the label
 `courier.misospace.dev/evidence: <run>`, one per coordinator pod incarnation,
 and are garbage-collected with the run; the operator also deletes them when a
-run reaches `Verifying`, because committed work is then in the world. A
+run reaches `AwaitingReview` or `Done` — the states where its own world
+observation has proven the work landed — while a `Verifying` run that falls to
+`NeedsHuman` keeps its evidence. A
 terminal run with any evidence Secret shows the `EvidenceCaptured` condition;
 the condition is informational — retrieve by label, never by condition.
 
