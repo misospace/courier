@@ -15,6 +15,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
 	courierv1alpha1 "github.com/misospace/courier/api/v1alpha1"
@@ -22,6 +23,7 @@ import (
 	courierlog "github.com/misospace/courier/internal/log"
 	"github.com/misospace/courier/internal/source"
 	"github.com/misospace/courier/internal/status"
+	"github.com/misospace/courier/internal/topology"
 )
 
 // capacityRequeueDelay bounds how long a Pending run can wait behind a full
@@ -97,6 +99,13 @@ type CoderRunReconciler struct {
 	// totals). Nil falls back to the process-default recorder on the
 	// controller-runtime metrics registry.
 	Metrics *RunRecorder
+
+	// Secure, when set, routes runs through the isolated control/broker/
+	// worker topology instead of the legacy single-pod coordinator. It owns
+	// admission policy resolution, preflight, provisioning, and revocation.
+	// Nil means the deployment runs legacy mode only, which stays explicitly
+	// insecure.
+	Secure *SecureControl
 }
 
 // metrics returns the run recorder to use, defaulting to the process-wide
@@ -120,12 +129,35 @@ func (r *CoderRunReconciler) metrics() *RunRecorder {
 // count. Claiming happens before launch so the claim itself reserves capacity;
 // a successful coordinator exits to Verifying, which does not reserve capacity;
 // a failed launch releases its reservation and leaves the run retryable.
+// secureTopologyFinalizer is the CoderRun finalizer for ordered revocation of
+// the per-run secure topology.
+const secureTopologyFinalizer = topology.FinalizerName
+
 func (r *CoderRunReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	l := log.FromContext(ctx)
 
 	var run courierv1alpha1.CoderRun
 	if err := r.Get(ctx, req.NamespacedName, &run); err != nil {
 		return ctrl.Result{}, client.IgnoreNotFound(err)
+	}
+
+	// A deleting secure run finishes ordered revocation before its finalizer
+	// is released; legacy runs have no topology to revoke.
+	if !run.DeletionTimestamp.IsZero() && r.Secure != nil &&
+		controllerutil.ContainsFinalizer(&run, secureTopologyFinalizer) {
+		done, err := r.Secure.Revoke(ctx, &run)
+		if err != nil {
+			return ctrl.Result{}, err
+		}
+		if !done {
+			return ctrl.Result{RequeueAfter: secureRequeueDelay}, nil
+		}
+		if err := r.Secure.RemoveFinalizer(ctx, &run); err != nil {
+			return ctrl.Result{}, err
+		}
+	}
+	if !run.DeletionTimestamp.IsZero() {
+		return ctrl.Result{}, nil
 	}
 
 	if run.Status.Phase == courierv1alpha1.PhaseRunning {
@@ -221,13 +253,36 @@ func (r *CoderRunReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 		}
 	}
 
+	// Secure admission resolves and persists the immutable publication policy
+	// before any topology is provisioned: selection is fail-closed, and a
+	// permanent admission failure terminalizes the run instead of cycling
+	// claim and release.
+	if r.Secure != nil {
+		if err := r.resolvePersistSecurePolicy(ctx, &run); err != nil {
+			if permanent := (*SecureNeedsHumanError)(nil); errors.As(err, &permanent) {
+				return r.Secure.transitionNeedsHuman(ctx, &run, permanent.Detail)
+			}
+			return ctrl.Result{}, r.releaseClaim(ctx, &run, adapter, item, err)
+		}
+	}
+
 	launched := r.Launch != nil
 	if launched {
 		if err := adapter.Transition(ctx, item, source.StateInProgress); err != nil {
 			return ctrl.Result{}, r.releaseClaim(ctx, &run, adapter, item, err)
 		}
 		beforeLaunch := run.DeepCopy()
-		if err := r.Launch(ctx, &run); err != nil {
+		if r.Secure != nil {
+			result, err := r.Secure.LaunchSecure(ctx, &run)
+			if err != nil {
+				return ctrl.Result{}, r.releaseClaim(ctx, &run, adapter, item, err)
+			}
+			if result.Requeue || result.RequeueAfter > 0 {
+				// Provisioning is in flight; the run stays Claimed and the
+				// next reconcile resumes it.
+				return result, nil
+			}
+		} else if err := r.Launch(ctx, &run); err != nil {
 			return ctrl.Result{}, r.releaseClaim(ctx, &run, adapter, item, err)
 		}
 		run.Status.Phase = courierv1alpha1.PhaseRunning
@@ -281,7 +336,15 @@ func (r *CoderRunReconciler) resumeClaimed(ctx context.Context, run *courierv1al
 		return ctrl.Result{}, err
 	}
 	beforeLaunch := run.DeepCopy()
-	if err := r.Launch(ctx, run); err != nil {
+	if r.Secure != nil {
+		result, err := r.Secure.LaunchSecure(ctx, run)
+		if err != nil {
+			return ctrl.Result{}, r.releaseClaim(ctx, run, adapter, item, err)
+		}
+		if result.Requeue || result.RequeueAfter > 0 {
+			return result, nil
+		}
+	} else if err := r.Launch(ctx, run); err != nil {
 		return ctrl.Result{}, r.releaseClaim(ctx, run, adapter, item, err)
 	}
 	run.Status.Phase = courierv1alpha1.PhaseRunning
@@ -290,6 +353,37 @@ func (r *CoderRunReconciler) resumeClaimed(ctx context.Context, run *courierv1al
 	}
 	r.emitPhaseTransition(run, courierv1alpha1.PhaseRunning, map[string]any{"branch": run.Status.Branch, "lane": run.Spec.Lane})
 	return ctrl.Result{}, nil
+}
+
+// resolvePersistSecurePolicy resolves the run's immutable publication policy
+// once and persists it set-once. A persisted policy is never rewritten: a
+// later reconcile re-verifies it against the live run incarnation instead.
+func (r *CoderRunReconciler) resolvePersistSecurePolicy(ctx context.Context, run *courierv1alpha1.CoderRun) error {
+	if run.Status.PublicationPolicy != nil {
+		policy, err := VerifyPersistedPolicy(run)
+		if err != nil {
+			return secureNeedsHuman("PolicyCorrupt", "%v", err)
+		}
+		// Re-verify the registry still selects the same registration with
+		// the same projection: a changed registry applies to future
+		// admissions only, and this run's policy must stay coherent with it.
+		registration, err := r.Secure.Config.Registry.Select(run.Spec.Repo)
+		if err != nil || registration.Name != policy.ProviderConfigRef || registration.Endpoint != policy.ProviderEndpoint {
+			return secureNeedsHuman("PolicyConflict",
+				"the provider registry no longer matches this run's persisted policy")
+		}
+		return nil
+	}
+	_, policy, err := r.Secure.ResolveAdmission(ctx, run)
+	if err != nil {
+		return err
+	}
+	before := run.DeepCopy()
+	run.Status.PublicationPolicy = policy
+	if err := r.patchStatus(ctx, before, run); err != nil {
+		return err
+	}
+	return nil
 }
 
 // SetupWithManager registers the controller with the manager.
@@ -464,6 +558,21 @@ func (r *CoderRunReconciler) observeRunning(ctx context.Context, run *courierv1a
 			intent.error = terminationReason
 		}
 		return r.transitionTerminal(ctx, run, phase, "", intent)
+	}
+	// The secure topology adds operator-owned infrastructure observation:
+	// a terminated control fences its worker, and a dead worker or broker is
+	// infrastructure failure that relaunches the round through Claimed.
+	if r.Secure != nil {
+		securePods := make([]corev1.Pod, 0, len(pods.Items))
+		for i := range pods.Items {
+			if podBelongsToRun(&pods.Items[i], run) {
+				securePods = append(securePods, pods.Items[i])
+			}
+		}
+		result, handled, err := r.Secure.ObserveTopology(ctx, run, securePods)
+		if err != nil || handled {
+			return result, err
+		}
 	}
 	result, handled, err := r.checkLiveness(ctx, run, pods.Items)
 	if handled {

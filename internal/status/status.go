@@ -98,6 +98,12 @@ type OperatorPatch struct {
 	RunDuration      string  `json:"runDuration,omitempty"`
 	CheckFingerprint *string `json:"checkFingerprint,omitempty"`
 	Restarts         *int    `json:"restarts,omitempty"`
+	// PublicationPolicy is the operator-resolved immutable publication
+	// destination, persisted once at secure admission. The caller enforces
+	// set-once semantics: the operator only emits the field when the run's
+	// status has no policy yet, and never mutates a persisted one.
+	// +optional
+	PublicationPolicy *courierv1alpha1.PublicationPolicy `json:"publicationPolicy,omitempty"`
 	// Conditions is the operator-owned condition set. The operator is the only
 	// writer of a CoderRun's conditions, so a merge patch carrying them replaces
 	// the array wholesale; a second writer must extend this field rather than

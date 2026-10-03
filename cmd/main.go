@@ -23,6 +23,7 @@ import (
 	courierv1alpha1 "github.com/misospace/courier/api/v1alpha1"
 	"github.com/misospace/courier/internal/controller"
 	"github.com/misospace/courier/internal/executor"
+	"github.com/misospace/courier/internal/forge"
 	couriergithub "github.com/misospace/courier/internal/github"
 	courierlog "github.com/misospace/courier/internal/log"
 	"github.com/misospace/courier/internal/source"
@@ -76,6 +77,13 @@ func main() {
 	var dispatchLaneBindings stringSliceValue
 	var dispatchPollInterval time.Duration
 	var dispatchHTTPTimeout time.Duration
+	var secureMode bool
+	var forgeProvidersFile string
+	var runNamespace string
+	var harnessImage string
+	var dependencyCacheService string
+	var dependencyCachePort int
+	var probeImage string
 	flag.StringVar(&metricsAddr, "metrics-bind-address", ":8080", "The address the metric endpoint binds to.")
 	flag.StringVar(&probeAddr, "health-probe-bind-address", ":8081", "The address the probe endpoint binds to.")
 	flag.BoolVar(&enableLeaderElection, "leader-elect", false, "Enable leader election for controller manager.")
@@ -91,6 +99,13 @@ func main() {
 	flag.StringVar(&githubMCPURL, "github-mcp-url", "", "Optional remote MCP endpoint for GitHub.")
 	flag.StringVar(&context7MCPURL, "context7-mcp-url", "", "Optional remote MCP endpoint for Context7.")
 	flag.StringVar(&metricsMCPURL, "metrics-mcp-url", "", "Optional remote MCP endpoint for metrics; absence is harmless.")
+	flag.BoolVar(&secureMode, "secure-mode", false, "Route runs through the isolated control/broker/worker topology; legacy stays the default and remains explicitly insecure.")
+	flag.StringVar(&forgeProvidersFile, "forge-providers-file", "", "Secure mode: provider registry file carrying references only.")
+	flag.StringVar(&runNamespace, "run-namespace", "", "Secure mode: the namespace dedicated to run workloads.")
+	flag.StringVar(&harnessImage, "harness-image", defaultsHarnessImage, "Secure mode: image carrying courier-control, courier-worker, and courier-broker.")
+	flag.StringVar(&dependencyCacheService, "dependency-cache-service", "", "Secure mode: namespace/name of the approved read-only dependency cache Service; empty means workers have no egress.")
+	flag.IntVar(&dependencyCachePort, "dependency-cache-port", 0, "Secure mode: cache port override; empty uses the Service's first port.")
+	flag.StringVar(&probeImage, "probe-image", defaultsProbeImage, "Secure mode: image for disposable network-probe pods.")
 	flag.BoolVar(&dispatchEnabled, "dispatch-enabled", false, "Enable Dispatch source discovery.")
 	flag.StringVar(&dispatchBaseURL, "dispatch-base-url", "", "Dispatch base URL.")
 	flag.StringVar(&dispatchAgentName, "dispatch-agent-name", "", "Dispatch agent name.")
@@ -224,7 +239,7 @@ func main() {
 		}
 	}
 
-	if err := (&controller.CoderRunReconciler{
+	reconciler := &controller.CoderRunReconciler{
 		Client:         mgr.GetClient(),
 		Scheme:         mgr.GetScheme(),
 		Launch:         launcher.Launch,
@@ -233,7 +248,29 @@ func main() {
 		Observer:       githubObserver,
 		Events:         runEvents,
 		PRHeadResolver: existingPRHeadResolver(githubObserver),
-	}).SetupWithManager(mgr); err != nil {
+	}
+	if secureMode {
+		secure, err := buildSecureControl(secureConfig{
+			providersFile:   forgeProvidersFile,
+			runNamespace:    runNamespace,
+			harnessImage:    harnessImage,
+			probeImage:      probeImage,
+			cacheService:    dependencyCacheService,
+			cachePort:       dependencyCachePort,
+			observer:        githubObserver,
+			legacyGitSecret: gitCredentialSecret,
+			legacyAPISecret: githubCredentialSecret,
+			operatorNS:      os.Getenv("POD_NAMESPACE"),
+		})
+		if err != nil {
+			setupLog.Error(err, "unable to configure secure mode")
+			os.Exit(1)
+		}
+		secure.Client = mgr.GetClient()
+		secure.Patcher = reconciler
+		reconciler.Secure = secure
+	}
+	if err := reconciler.SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "CoderRun")
 		os.Exit(1)
 	}
@@ -352,4 +389,89 @@ func githubObserver(ctx context.Context, reader client.Reader, namespace, config
 		return nil, err
 	}
 	return couriergithub.Observer{Client: githubClient}, nil
+}
+
+// secureConfig carries the parsed secure-mode flags into buildSecureControl.
+type secureConfig struct {
+	providersFile   string
+	runNamespace    string
+	harnessImage    string
+	probeImage      string
+	cacheService    string
+	cachePort       int
+	observer        controller.WorldObserver
+	legacyGitSecret string
+	legacyAPISecret string
+	operatorNS      string
+}
+
+const (
+	defaultsHarnessImage = "ghcr.io/misospace/courier-harness:latest"
+	defaultsProbeImage   = "busybox:1.36"
+)
+
+// buildSecureControl loads and validates the provider registry, rejects
+// registrations that reference a credential exposed to legacy pods (the §9
+// taint rule, enforced where the deployment configuration is knowable), and
+// assembles the secure control.
+func buildSecureControl(config secureConfig) (*controller.SecureControl, error) {
+	if strings.TrimSpace(config.providersFile) == "" {
+		return nil, fmt.Errorf("secure mode requires --forge-providers-file")
+	}
+	if strings.TrimSpace(config.runNamespace) == "" {
+		return nil, fmt.Errorf("secure mode requires --run-namespace")
+	}
+	data, err := os.ReadFile(config.providersFile)
+	if err != nil {
+		return nil, fmt.Errorf("read forge providers file: %w", err)
+	}
+	registry, err := forge.Load(data, "github")
+	if err != nil {
+		return nil, err
+	}
+	tainted := map[string]bool{
+		strings.TrimSpace(config.legacyGitSecret): true,
+		strings.TrimSpace(config.legacyAPISecret): true,
+	}
+	for _, registration := range registry.Registrations() {
+		for purpose, ref := range registration.Credentials {
+			if tainted[ref.SecretName] {
+				return nil, fmt.Errorf(
+					"provider %q credential purpose %q references Secret %q, which is exposed to legacy coordinator pods: a credential exposed to any legacy pod is tainted and must not back a secure registration",
+					registration.Name, purpose, ref.SecretName)
+			}
+		}
+	}
+	observer, ok := config.observer.(couriergithub.Observer)
+	if !ok || observer.Client == nil {
+		return nil, fmt.Errorf("secure mode requires a GitHub observer credential for admission-time provider reads")
+	}
+	harnessImage := strings.TrimSpace(config.harnessImage)
+	if harnessImage == "" {
+		harnessImage = defaultsHarnessImage
+	}
+	probeImage := strings.TrimSpace(config.probeImage)
+	if probeImage == "" {
+		probeImage = defaultsProbeImage
+	}
+	return &controller.SecureControl{
+		Config: controller.SecureConfig{
+			RunNamespace:      strings.TrimSpace(config.runNamespace),
+			Registry:          registry,
+			HarnessImage:      harnessImage,
+			ProbeImage:        probeImage,
+			CacheService:      strings.TrimSpace(config.cacheService),
+			CachePort:         int32(config.cachePort),
+			LiveProbes:        true,
+			OperatorNamespace: strings.TrimSpace(config.operatorNS),
+			Providers: func(ctx context.Context, registration *forge.Registration) (controller.AdmissionProvider, error) {
+				// Admission reads use the operator's own read identity. The
+				// registration's credential reference is never resolved here.
+				provider := couriergithub.NewProvider(
+					forge.ProviderConfig{Name: registration.Name, Endpoint: registration.Endpoint},
+					observer.Client)
+				return controller.AdmissionProvider{Provider: provider, Policy: provider, HeadLister: provider}, nil
+			},
+		},
+	}, nil
 }

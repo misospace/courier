@@ -356,3 +356,38 @@ type fakeClock struct {
 }
 
 func (c *fakeClock) Now() time.Time { return c.now }
+
+func TestOperatorWriterCarriesPublicationPolicy(t *testing.T) {
+	patcher := &fakePatcher{}
+	writer := NewOperatorWriter(patcher)
+	policy := &courierv1alpha1.PublicationPolicy{
+		RunUID:              "run-uid",
+		ProviderConfigRef:   "github",
+		ProviderEndpoint:    "https://api.github.com/",
+		CredentialRefDigest: "abc",
+		BaseRepo:            "a/b",
+		BaseRef:             "main",
+		BaseOID:             "oid",
+		WorkRepo:            "a/b",
+		WorkRef:             "courier/a/b/issue-1",
+		WorkInitiallyAbsent: true,
+	}
+	err := writer.Patch(context.Background(), types.NamespacedName{Namespace: "ns", Name: "run"}, OperatorPatch{PublicationPolicy: policy})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(patcher.patches) != 1 {
+		t.Fatalf("patches = %d", len(patcher.patches))
+	}
+	var document struct {
+		Status struct {
+			PublicationPolicy *courierv1alpha1.PublicationPolicy `json:"publicationPolicy"`
+		} `json:"status"`
+	}
+	if err := json.Unmarshal(patcher.patches[0].patch, &document); err != nil {
+		t.Fatal(err)
+	}
+	if document.Status.PublicationPolicy == nil || document.Status.PublicationPolicy.ProviderConfigRef != "github" {
+		t.Fatalf("patched policy = %+v", document.Status.PublicationPolicy)
+	}
+}
