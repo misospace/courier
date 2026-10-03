@@ -405,18 +405,22 @@ cannot overwrite the previous incarnation's evidence with an empty bundle.
    inspection and capture before either resuming or terminalizing, so a run
    that crashes dirty is not uncovered.
 2. **Terminal classification.** `Failed`/`NeedsHuman` endings capture before
-   exiting. Endings classified `Verifying` capture nothing, because the gate's
-   remote check has confirmed the run branch's commits are held — a
-   `Verifying`-classified ending whose commits are confirmed only locally does
-   not satisfy the gate and captures, with the operator deleting the evidence
-   when its own world observation confirms the PR. Untracked residue alongside
+   exiting. The classification label itself never decides — the gate's remote
+   check does. Endings classified `Verifying` therefore capture nothing when
+   the remote run branch holds the commits (the ordinary case), and capture
+   when they are confirmed only locally, with the operator deleting that
+   evidence at AwaitingReview/Done if the world then confirms the PR.
+   Untracked residue alongside
    remote-confirmed committed work is the known #93
    classification, accepted as lost-with-the-pod.
 3. **Cancellation.** On pod deletion (liveness reap/relaunch) the executor
    traps SIGTERM **by cancelling the run context only** — never by capturing
    in a signal-handler goroutine, which `os.Exit` would race. The context
-   cancellation kills the model child's whole process group (a plain child
-   kill would leave grandchildren writing into the snapshot), `process.Run`
+   cancellation kills the model child's whole process group — new behavior the
+   executor must add deliberately (`SysProcAttr` with `Setpgid` at child
+   start, process-group signal on cancellation): today's
+   `exec.CommandContext` kills only the direct child, which would leave
+   grandchildren writing into the snapshot. `process.Run`
    returns into the existing crash/terminal code paths, and those call sites —
    the one capture family — check the gate and capture within the termination
    grace period. Git lock contention or read failure degrades to the manifest
@@ -515,14 +519,18 @@ name-shape redactor registration covers it), and the intake validates with
 run (the same uncached-read discipline HARNESS.md §6 applies to destructive
 liveness decisions, adopted here because a persist is hard to take back). The
 phase gate is
-an allowlist, not "not terminal": the intake accepts `Running`, `Failed`, and
-`NeedsHuman` — a crashloop-ceiling reap deletes the pod and writes
-`NeedsHuman` in the same reconcile, and SIGTERM delivery races that status
-write rather than following it, so the allowlist admits `NeedsHuman` instead of
-betting on read ordering; the grace capture is the only coverage for that
-wedged pod's work — and rejects `Verifying`, `AwaitingReview`, and `Done`,
-whose pods have already exited with their capture window closed. A recreated
-same-name run's new UID rejects old
+an allowlist over **non-resolved versus resolved**: the intake accepts
+`Pending`, `Claimed`, `Running`, `Failed`, and `NeedsHuman`, and rejects
+`Verifying`, `AwaitingReview`, and `Done`. The admitted set is broad because
+the operator moves runs around a dying pod: an ordinary liveness reap deletes
+the pod and writes `Claimed` in the same reconcile (and a failed relaunch can
+reach `Pending`) while the previous pod's SIGTERM grace capture is still in
+flight, and a crashloop-ceiling reap writes `NeedsHuman` the same way —
+betting on read ordering would defeat the grace capture, which is the only
+coverage for a wedged pod's work. The rejected phases are resolved ones:
+`AwaitingReview` and `Done` are world-proven, and a `Verifying` pod has
+exited with its capture window closed. A recreated same-name run's new UID
+rejects old
 tokens; a deleted run fails the live read. A stolen token can write only its
 own incarnation's slot — strictly narrower than the git push credential the
 legacy pod already holds. Persist is synchronous: a 2xx response means the
