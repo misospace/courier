@@ -410,7 +410,11 @@ cannot overwrite the previous incarnation's evidence with an empty bundle.
    the remote run branch holds the commits (the ordinary case), and capture
    when they are confirmed only locally, with the operator deleting that
    evidence at AwaitingReview/Done if the world then confirms the PR.
-   Untracked residue alongside
+   Ordering is by construction: the capture and its synchronous persist
+   complete before the executor exits, and the operator writes `Verifying`
+   only after observing the container exited — so the phase gate can never
+   reject a locally-confirmed `Verifying`-classified capture. Untracked
+   residue alongside
    remote-confirmed committed work is the known #93
    classification, accepted as lost-with-the-pod.
 3. **Cancellation.** On pod deletion (liveness reap/relaunch) the executor
@@ -1026,8 +1030,8 @@ only informs.
   and holds namespaced Secret CRUD to persist evidence bundles. This is a real
   authority expansion: `resourceNames` cannot express a name prefix, so the
   grant covers every Secret in the operator's namespaces — previously the
-  operator held no Secret authority at all (it reads only the one credential
-  Secret its observer needs). A compromised operator can read every Secret in
+  operator held no Secret authority beyond reading the one credential Secret
+  its observer needs. A compromised operator can read every Secret in
   scope; deployments that cannot accept this should not enable evidence
   capture, and reject-preservation remains the named fallback in the #115
   design. Evidence content itself is model-authored untrusted data stored
