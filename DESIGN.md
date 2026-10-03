@@ -565,9 +565,12 @@ falls to `NeedsHuman` keeps its evidence: its world proof never arrived.
 A capture validated while the run was still `Running` but persisted after that
 deletion can briefly resurrect a Secret — a stated race, bounded by the
 run's own GC. Access control is namespace RBAC: the operator gains
-`create/get/list/patch/delete` on `secrets` (`list` is required by the
-condition derivation and the Verifying cleanup; both use uncached API-reader
-lists) — a real authority expansion, see
+`create/get/list/patch/delete` on `secrets` through a namespaced
+Role/RoleBinding rendered by the chart — deliberately not the generated
+operator ClusterRole, whose ClusterRoleBinding would widen the grant
+cluster-wide (`list` is required by the
+condition derivation and the AwaitingReview/Done cleanup; both use uncached
+API-reader lists) — see
 Security and boundaries. Encryption at rest is the deployment's cluster
 configuration; Courier recommends enabling it. Status carries one condition,
 `EvidenceCaptured`, derived by the reconcile loop from the world through an
@@ -1027,13 +1030,16 @@ only informs.
 - Secrets are redacted from logs before stdout.
 - **Failure-evidence surfaces (#115):** the operator serves an authenticated,
   write-only evidence intake listener (in-cluster, token-gated, no read path)
-  and holds namespaced Secret CRUD to persist evidence bundles. This is a real
-  authority expansion: `resourceNames` cannot express a name prefix, so the
-  grant covers every Secret in the operator's namespaces — previously the
-  operator held no Secret authority beyond reading the one credential Secret
-  its observer needs. A compromised operator can read every Secret in
-  scope; deployments that cannot accept this should not enable evidence
-  capture, and reject-preservation remains the named fallback in the #115
+  and holds namespaced Secret CRUD to persist evidence bundles. The evidence
+  verbs are provisioned as a namespaced Role/RoleBinding in the chart,
+  deliberately never inside the generated operator ClusterRole, whose
+  ClusterRoleBinding would widen them cluster-wide. The authority expansion is
+  real but bounded: the chart's namespaced `credential-reader` Role already
+  grants the operator's service account `get` on every Secret in the namespace
+  (no `resourceNames`), so the evidence grant's marginal authority is `list`
+  and the mutating `create/patch/delete`. Deployments that cannot accept
+  Secret mutation should not enable evidence capture, and
+  reject-preservation remains the named fallback in the #115
   design. Evidence content itself is model-authored untrusted data stored
   inert in run-owned Secrets: never executed, never consumed by tooling,
   applied only by reviewed human action.
