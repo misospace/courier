@@ -228,6 +228,9 @@ jobs:
       - name: Build harness binaries
         run: |
           mkdir -p dist
+          # The harness stage builds on the coordinator stage, whose contract
+          # includes the executor binary.
+          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o dist/courier-executor ./cmd/courier-executor
           CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o dist/courier-control ./cmd/courier-control
           CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o dist/courier-worker ./cmd/courier-worker
           CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o dist/courier-broker ./cmd/courier-broker
