@@ -106,7 +106,8 @@ kubectl -n courier-system get secrets -l courier.misospace.dev/evidence=<run>
 kubectl -n courier-system get secret courier-evidence-<run>-<inc> \
   -o jsonpath='{.data.manifest\.json}' | base64 -d
 
-# list entry paths first — the bundle is untrusted content
+# list entry paths first — the bundle is untrusted content and contains no
+# symlink members, so extraction cannot create links
 kubectl -n courier-system get secret courier-evidence-<run>-<inc> \
   -o jsonpath='{.data.bundle\.tar\.gz}' | base64 -d | tar -tzf -
 

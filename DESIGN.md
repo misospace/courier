@@ -451,8 +451,10 @@ content stays recoverable from git history). Over-limit files and **binary
 files** are metadata-only — unscannable content cannot be proven secret-free,
 so it is never stored (fail closed); the manifest marks them
 present-but-not-preserved, and a manifest alone is never claimed to be a
-recoverable patch. Symlinks record the link target, are never followed, and
-escaping targets are flagged. Local-only commits ride along as `git
+recoverable patch. Symlinks are never stored as tar members —
+the manifest records the path and link target (never followed, escaping
+targets flagged), so extraction can never create links. Local-only commits
+ride along as `git
 format-patch` output (non-binary stubbing; messages scanned like content) under
 the same caps. The manifest is a normative cross-component contract: run
 identity (name, namespace, run UID, pod UID), workspace identity (base repo,
@@ -643,8 +645,10 @@ mode the model can read the evidence token and nonce and tamper with its own
 worktree before capture; the token's blast radius is its own incarnation's
 slot, evidence was never tamper-proof, and integrity rests on human review.
 Evidence content is
-stored inert and applied only by reviewed human action. `Verifying` endings
-never capture, so #93-class untracked residue dies with the pod.
+stored inert and applied only by reviewed human action. Untracked residue
+alongside remote-confirmed committed work (the #93 class) is what a
+`Verifying` ending leaves uncaptured — the remote check, not the label, draws
+that line — and it dies with the pod.
 
 **Decomposition.** Implementation is split into bounded, dependency-ordered,
 file-scoped issues, none scheduled `status/ready` until this design lands:
