@@ -62,6 +62,60 @@ remain with a human maintainer.
 Provider or gateway environment variables can be placed in another Secret and
 selected with `--executor-environment-secret`.
 
+## Failure evidence (#115)
+
+When evidence capture is enabled, the operator persists a bounded snapshot of a
+failed run's unrecoverable workspace state — uncommitted edits, local commits
+not on the run branch — as Kubernetes Secrets owned by the `CoderRun`. The
+mechanism is invisible when disabled.
+
+Enable it with three settings on the operator:
+
+- `--evidence-intake-bind` (for example `:8082`): binds the write-only intake
+  listener. Empty disables evidence capture entirely. The chart renders the
+  `courier-evidence` ClusterIP Service that coordinator pods reach it on;
+  optionally restrict its ingress to coordinator pods with a NetworkPolicy.
+- `--evidence-intake-key-secret`: name of a Secret in the operator namespace
+  whose key holds a random HMAC key (for example
+  `openssl rand -hex 32`). The operator derives each run's evidence token from
+  this key, the run's identity, and a per-incarnation nonce, so a token is
+  valid only for the incarnation it was minted for; rotating the key
+  invalidates tokens of runs in flight until their next relaunch.
+- `--evidence-intake-service` (optional override): the URL coordinators are
+  told to POST to, derived from the chart Service by default.
+
+The operator requires `create/get/list/patch/delete` on `secrets` in its
+namespaces to persist bundles and derive the `EvidenceCaptured` condition (see
+DESIGN.md, Security and boundaries, for what that grant means). Evidence
+Secrets carry the label
+`courier.misospace.dev/evidence: <run>`, one per coordinator pod incarnation,
+and are garbage-collected with the run; the operator also deletes them when a
+run reaches `Verifying`, because committed work is then in the world. A
+terminal run with any evidence Secret shows the `EvidenceCaptured` condition;
+the condition is informational — retrieve by label, never by condition.
+
+Retrieval and application are manual, and the content is model-authored
+untrusted data — treat it like a patch from an untrusted contributor:
+
+```sh
+# one Secret per pod incarnation; the manifest names what was captured and
+# what was withheld (secrets, binary, over-limit content is never stored)
+kubectl -n courier-system get secrets -l courier.misospace.dev/evidence=<run>
+kubectl -n courier-system get secret courier-evidence-<run>-<inc> \
+  -o jsonpath='{.data.manifest\.json}' | base64 -d
+
+# extract OUTSIDE any checkout; inspect entry paths before extracting;
+# never extract as root
+kubectl -n courier-system get secret courier-evidence-<run>-<inc> \
+  -o jsonpath='{.data.bundle\.tar\.gz}' | base64 -d | tar -xzf - -C /tmp/evidence-<run>
+```
+
+Review the extracted files, apply the chosen ones to a fresh checkout with
+`git apply`, and publish through normal human review. Evidence is never
+adopted automatically: a #97 retry is a fresh attempt, never a restoration of
+the old checkout, and deleting a `NeedsHuman` run deletes its evidence —
+retrieve before deleting.
+
 To enable native Dispatch discovery, configure the chart's `dispatch` values and
 create the referenced Secret with the `DISPATCH_AGENT_TOKEN` value under the
 configured key. The queue lane selects Dispatch work; `laneProfile` selects the
