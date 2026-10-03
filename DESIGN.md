@@ -512,7 +512,9 @@ namespace/name/run-UID/nonce))`: the launcher generates the nonce at pod build
 and nonce as env (the token's name ends in `TOKEN`, so the executor's
 name-shape redactor registration covers it), and the intake validates with
 `hmac.Equal` after recomputing the HMAC from an **uncached** live read of the
-run (the standard HARNESS.md §6 sets for operator decisions). The phase gate is
+run (the same uncached-read discipline HARNESS.md §6 applies to destructive
+liveness decisions, adopted here because a persist is hard to take back). The
+phase gate is
 an allowlist, not "not terminal": the intake accepts `Running`, `Failed`, and
 `NeedsHuman` — a crashloop-ceiling reap deletes the pod and writes
 `NeedsHuman` in the same reconcile, and SIGTERM delivery races that status

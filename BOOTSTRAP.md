@@ -106,8 +106,11 @@ kubectl -n courier-system get secrets -l courier.misospace.dev/evidence=<run>
 kubectl -n courier-system get secret courier-evidence-<run>-<inc> \
   -o jsonpath='{.data.manifest\.json}' | base64 -d
 
-# extract OUTSIDE any checkout; inspect entry paths before extracting;
-# never extract as root
+# list entry paths first — the bundle is untrusted content
+kubectl -n courier-system get secret courier-evidence-<run>-<inc> \
+  -o jsonpath='{.data.bundle\.tar\.gz}' | base64 -d | tar -tzf -
+
+# extract OUTSIDE any checkout, never as root
 kubectl -n courier-system get secret courier-evidence-<run>-<inc> \
   -o jsonpath='{.data.bundle\.tar\.gz}' | base64 -d | tar -xzf - -C /tmp/evidence-<run>
 ```
