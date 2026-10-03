@@ -342,12 +342,330 @@ narrowly verified permissions for the pinned OpenCode runtime and delegates
 (#114, shipped). Scratch is disposable, not a checkpoint.
 
 A terminal `NeedsHuman` or `Failed` run may still have uncommitted edits in its
-checkout. Those edits are **not durable**: when the pod is removed, the emptyDir
-and its dirty work disappear. Logs and status are not a recoverable patch.
-#115 owns the separate design of secure, bounded, operator-retrievable failure
-evidence before any preservation implementation. Until that mechanism is
-reviewed, do not push incomplete work, persist raw diffs in logs or CR status,
-or treat a fresh retry (#97) as recovery of the old checkout.
+checkout. Those edits are **not durable** in the workspace itself: when the pod
+is removed, the emptyDir and its dirty work disappear. Logs and status are not
+a recoverable patch. The evidence mechanism below (#115) makes that state
+recoverable within bounded limits; do not push incomplete work, persist raw
+diffs in logs or CR status, or treat a fresh retry (#97) as recovery of the old
+checkout.
+
+### Failure evidence for dirty runs (#115)
+
+Committed, remote-held work is in the world and is never duplicated.
+Unrecoverable state — uncommitted edits, local commits the remote run branch
+does not hold — is what evidence preserves, in bounded form. The division of labor
+is the design: **the executor captures** (only it has the git context and the
+timing), **the operator persists** (the legacy pod is explicitly insecure, so
+anything it can write must be narrowly scoped). The pod gains no Kubernetes
+identity and no new credential scope: the executor POSTs a bounded bundle to an
+operator-hosted intake listener, authenticated by a stateless per-incarnation
+token valid only for that incarnation's evidence slot. Retrieval and
+application are human actions. This is bootstrap-scoped; the native harness
+(#123+) may replace both capture and storage.
+
+The invariants the mechanism must hold:
+
+1. Evidence is operator-owned durable data in the run's namespace, GC'd with
+   the run; it never appears in logs, stdout, CR status content, git, or the
+   forge.
+2. The coordinator pod gains no Kubernetes identity and no credential scope
+   beyond a token that can write only its own incarnation's slot, to a
+   listener with no read path.
+3. Nothing matching the scan is ever persisted, per entry, by one symmetric
+   rule at both trust levels; a withheld entry exists only in the manifest,
+   never in the stored tar; structural violations are rejected wholesale
+   against bounds the intake enforces itself.
+4. Unscannable (binary) and over-limit content is never stored; it is named in
+   the manifest as present-but-not-preserved, and a manifest alone is never
+   claimed to be a recoverable patch.
+5. Capture is best-effort and bounded; it never changes an ending's phase,
+   exit code, or lifecycle report, and never delays termination beyond its
+   20-second operation deadline inside the 45-second grace.
+6. Evidence is per-incarnation and slot names are intake-derived; no capture
+   — gated, clean, or stolen-token — can destroy another incarnation's
+   evidence.
+7. Retrieval and application are human actions; no run or retry ever adopts,
+   publishes, or implies publication of evidence.
+8. Evidence exists only for states the world cannot recover; remote-held work
+   is never duplicated, and stored evidence is deleted when the world proves
+   the work landed (AwaitingReview, Done).
+
+**Capture moments** (`internal/evidence`, `cmd/courier-executor/main.go`).
+Every moment is gated on the verified worktree showing unrecoverable state —
+uncommitted changes, local commits the **remote** run branch does not hold
+(checked with one bounded fetch-and-compare, since the world is the remote, not
+the local ref — a commit pushed nowhere is as unrecoverable as an uncommitted
+edit), or a failed world read that leaves the state unknown.
+A clean or fully-pushed worktree never captures, from any incarnation: a
+relaunched pod starts from a fresh clone, finds nothing unrecoverable, and
+cannot overwrite the previous incarnation's evidence with an empty bundle.
+
+1. **Continuation-point inspections.** The #170 loop inspects the world at
+   every successful child exit; the crash-continuation branch gains the same
+   inspection and capture before either resuming or terminalizing, so a run
+   that crashes dirty is not uncovered.
+2. **Terminal classification.** `Failed`/`NeedsHuman` endings capture before
+   exiting. The classification label itself never decides — the gate's remote
+   check does. Endings classified `Verifying` therefore capture nothing when
+   the remote run branch holds the commits (the ordinary case), and capture
+   when they are confirmed only locally, with the operator deleting that
+   evidence at AwaitingReview/Done if the world then confirms the PR.
+   Ordering is by construction: the capture and its synchronous persist
+   complete before the executor exits, and the operator writes `Verifying`
+   only after observing the container exited — so the phase gate can never
+   reject a locally-confirmed `Verifying`-classified capture. Untracked
+   residue alongside
+   remote-confirmed committed work is the known #93
+   classification, accepted as lost-with-the-pod.
+3. **Cancellation.** On pod deletion (liveness reap/relaunch) the executor
+   traps SIGTERM **by cancelling the run context only** — never by capturing
+   in a signal-handler goroutine, which `os.Exit` would race. The context
+   cancellation kills the model child's whole process group — new behavior the
+   executor must add deliberately (`SysProcAttr` with `Setpgid` at child
+   start, process-group signal on cancellation): today's
+   `exec.CommandContext` kills only the direct child, which would leave
+   grandchildren writing into the snapshot. `process.Run`
+   returns into the existing crash/terminal code paths, and those call sites —
+   the one capture family — check the gate and capture within the termination
+   grace period. Git lock contention or read failure degrades to the manifest
+   alone. SIGKILL, OOM, and node loss defeat this; the relaunch proceeds
+   regardless of the capture's outcome.
+
+Capture runs under a 20-second bounded operation deadline (an operation bound,
+not a run wall-clock — the same kind of bound as the 30s MCP preflight); over
+deadline the bundle degrades to the manifest alone. The pod sets
+`terminationGracePeriodSeconds: 45` when capture is enabled, sized to fit the
+deadline plus the child-kill wait plus exit margin. Delivery allows at most two
+attempts inside the deadline, then stops — no cross-reconcile retry, no
+requeue; loss is recorded in a redacted `evidence.capture` event. Capture never
+changes a phase, exit code, or lifecycle report.
+
+**Bundle, bounds, manifest.** One gzip'd tar plus a JSON manifest; the manifest
+is always present, content is best-effort within constants (these bound storage
+and untrusted input, not model behavior): total uncompressed ≤ 512 KiB, per
+file ≤ 64 KiB, ≤ 256 content entries, ≤ 2,000 manifest entries with a 128 KiB
+manifest budget. When the entry list does not fit the budget — a worktree full
+of untracked build artifacts hits this easily — entries beyond it collapse into
+one synthetic `omitted-manifest-budget` entry; `totals` remain authoritative,
+so overflow is visible instead of a structural reject. *Text* means no NUL byte
+in the first 8 KiB and valid UTF-8.
+Tracked modified/staged/deleted and untracked files are included when text,
+under the caps, and scanned clean; deletions are recorded as deletions (their
+content stays recoverable from git history). Over-limit files and **binary
+files** are metadata-only — unscannable content cannot be proven secret-free,
+so it is never stored (fail closed); the manifest marks them
+present-but-not-preserved, and a manifest alone is never claimed to be a
+recoverable patch. Symlinks are never stored as tar members —
+the manifest records the path and link target (never followed, escaping
+targets flagged), so extraction can never create links. Local-only commits
+ride along as `git
+format-patch` output (non-binary stubbing; messages scanned like content) under
+the same caps. The manifest is a normative cross-component contract: run
+identity (name, namespace, run UID, pod UID), workspace identity (base repo,
+head repo for fork fix-pr, branch, start SHA, head SHA), capture time, trigger
+(`continuation | crash | terminal | cancellation`), per-entry
+class/disposition, and totals. The `evidence.capture` event carries totals and
+outcome only — never paths or content.
+
+**Secret policy — fail closed, per entry, symmetric.** One rule at both trust
+levels, over every string and content the bundle carries (file content, commit
+messages, patch text, manifest paths, symlink targets): the scan uses the run's
+registered credentials plus the log redactor's defensive pattern table, and a
+match **withholds the entry** — and a withheld entry exists only in the
+manifest: **the tar contains admitted entries only**. The executor builds the
+tar after scanning; when the intake's re-scan finds something the untrusted
+executor scan missed, the intake rebuilds the bundle (decompress, drop the
+entries, recompute, recompress) rather than persisting the POST verbatim — the
+persisted manifest and its totals are intake-authored. A matching
+metadata-only string (a path or symlink target that itself matches) is
+substituted with `[REDACTED]` in the manifest, since metadata is not evidence
+and substitution corrupts nothing. Content is never redacted in place:
+substitution would corrupt the evidence and imply a sanitization guarantee the
+pattern table cannot make. Structural violations are the whole-request
+rejects: body or decompressed stream over the caps, entry count over the cap,
+absolute or `..` tar entry paths (tar-slip), truncated or unparsable
+tar/manifest, or manifest totals disagreeing with the entries under the
+overflow rule above.
+
+The intake's credential set comes from the pod builder, not from hope: kubelet,
+not the operator, resolves the run's credential env, so one shared pod-builder
+function produces the `(env name, SecretKeyRef)` pairs for the per-key
+credential refs — the single source of truth for what the executor receives
+and what the intake re-scans against. The executor environment Secret arrives
+by a different route — `envFrom`, which maps each Secret key 1:1 to an env
+name the builder never enumerates — so the intake adds that Secret's keys
+directly, under the same shape rule. The
+intake resolves those refs at persist time and registers the values whose env
+names are secret-shaped (the shape rule tests env names, never Secret keys, so
+a custom `--git-token-key` is not silently skipped; over-registering a
+harmless value only costs a substitution). The git username is not
+secret-shaped and is unregistered on both sides. A referenced Secret that the
+builder actually injects and that is missing or unreadable at scan time fails
+the persist (what cannot be verified is not stored). Residual: credentials
+delivered outside those Secrets (image-baked env, tokens embedded in MCP URLs)
+are invisible to the intake and covered only by the executor's own untrusted
+scan; a credential Secret deleted mid-run makes every persist fail while the
+executor keeps working with its cached env.
+
+**Transport** (`cmd/main.go`). The operator process serves a small write-only
+intake listener (own bind address, empty disables; chart renders a ClusterIP
+Service, optionally ingress-restricted to coordinator pods). HTTP with a bearer
+token follows the in-cluster transport convention settled by #120's
+dependency-cache design: plain HTTP, network-boundary + token authentication,
+no CA in clients. Validation is stateless and the persist idempotent, and the
+listener runnable declares `NeedLeaderElection() → false`, so with leader
+election every replica serves — without that, standbys would refuse POSTs the
+Service load-balances onto them and exhaust the executor's two-attempt budget.
+The per-run, per-incarnation token is `base64(nonce ‖ HMAC-SHA256(key,
+namespace/name/run-UID/nonce))`: the launcher generates the nonce at pod build
+(the pod UID is not assigned yet, so it cannot be the binding), injects token
+and nonce as env (the token's name ends in `TOKEN`, so the executor's
+name-shape redactor registration covers it), and the intake validates with
+`hmac.Equal` after recomputing the HMAC from an **uncached** live read of the
+run (the same uncached-read discipline HARNESS.md §6 applies to destructive
+liveness decisions, adopted here because a persist is hard to take back). The
+phase gate is
+an allowlist over **non-resolved versus resolved**: the intake accepts
+`Pending`, `Claimed`, `Running`, `Failed`, and `NeedsHuman`, and rejects
+`Verifying`, `AwaitingReview`, and `Done`. The admitted set is broad because
+the operator moves runs around a dying pod: an ordinary liveness reap deletes
+the pod and writes `Claimed` in the same reconcile (and a failed relaunch can
+reach `Pending`) while the previous pod's SIGTERM grace capture is still in
+flight, and a crashloop-ceiling reap writes `NeedsHuman` the same way —
+betting on read ordering would defeat the grace capture, which is the only
+coverage for a wedged pod's work. The rejected phases are resolved ones:
+`AwaitingReview` and `Done` are world-proven, and a `Verifying` pod has
+exited with its capture window closed. A recreated same-name run's new UID
+rejects old
+tokens; a deleted run fails the live read. A stolen token can write only its
+own incarnation's slot — strictly narrower than the git push credential the
+legacy pod already holds. Persist is synchronous: a 2xx response means the
+Secret write has landed.
+
+**Storage** (intake persist path). The **intake derives the slot identity from
+the validated token** — the nonce in the token names the incarnation's Secret,
+so a compromised executor cannot address another incarnation's slot by
+guessing its name. The Secret is `courier-evidence-<run>-<nonce8>` (name
+truncated and hash-suffixed exactly like `podName` when long), labeled
+`courier.misospace.dev/evidence: <run>`, owner-referenced to the CoderRun. The
+manifest's real pod UID (downward API) is carried for human correlation, and a
+manifest whose run name/namespace/UID disagrees with the validated token is
+rejected. Per-incarnation keying is a correctness decision:
+cross-incarnation overwrites are structurally impossible — a relaunched clean
+clone captures nothing (the gate), and even a stolen token cannot address a
+previous incarnation's slot — the delete-recreate GC-lag race disappears, and
+each Secret stays well under the 1 MiB API limit; the bound is `maxRestarts +
+1` Secrets per run. Retention: the owner reference
+deletes evidence with the run (Done reaping, operator deletion, #97
+delete-as-retry) — no sweeper, no separate clock, zero standing footprint; the
+operator additionally deletes a run's evidence Secrets when the run reaches
+**AwaitingReview or Done** — the states where the operator's own world
+observation has proven the work landed (Invariant 8). A `Verifying` run that
+falls to `NeedsHuman` keeps its evidence: its world proof never arrived.
+A capture validated while the run was still `Running` but persisted after that
+deletion can briefly resurrect a Secret — a stated race, bounded by the
+run's own GC. Access control is namespace RBAC: the operator gains
+`create/get/list/patch/delete` on `secrets` through a namespaced
+Role/RoleBinding rendered by the chart — deliberately not the generated
+operator ClusterRole, whose ClusterRoleBinding would widen the grant
+cluster-wide (`list` is required by the
+condition derivation and the AwaitingReview/Done cleanup; both use uncached
+API-reader lists) — see
+Security and boundaries. Encryption at rest is the deployment's cluster
+configuration; Courier recommends enabling it. Status carries one condition,
+`EvidenceCaptured`, derived by the reconcile loop from the world through an
+**uncached** list (terminal runs rarely reconcile again, so a cached informer
+read could race its own lag and leave the condition absent forever): any
+evidence Secret → `True/Captured`; no Secret → no condition. The condition is
+informational — a grace capture can land after the terminal reconcile, so
+absence is never proof of absence, and retrieval is always by label, never
+condition-driven. The conditions array is operator-owned and patched
+wholesale, so the intake handler never writes it. No condition ever changes a
+phase, exit, or lifecycle report.
+
+**Recovery.** The operator lists a run's evidence Secrets by label, reads the
+manifest, extracts to a scratch directory outside any checkout with
+traversal-safe tooling, reviews the content, and applies chosen files onto a
+branch of a fresh checkout through normal human review. Evidence is
+model-authored untrusted data: read it before applying it, never execute it,
+never let a tool apply it unattended. Retrieve before deleting the run —
+deletion is the moment evidence dies with it. No run, retry, or automation
+ever adopts, publishes, or implies publication of evidence (#97: a retry is a
+fresh attempt, never a restoration of the old checkout; old run history stays
+distinct from new attempts).
+
+**Failure and race semantics.** A graceful `Failed`/`NeedsHuman` ending with
+unrecoverable state captures and persists before exit. A crash stores the last
+inspection's bundle; work after it is lost with the pod. A wedged pod's
+SIGTERM capture races nothing (the child's process group is terminated first)
+and never delays the relaunch. A relaunched clean worktree captures nothing. A
+crashloop-ceiling reap writes `NeedsHuman` before the grace capture runs, and
+the intake's phase allowlist admits it — that capture is the only coverage for
+a wedged pod's work. OOM, SIGKILL, and node
+loss capture nothing — the standing residual. Intake unreachability,
+deadline misses, and structural rejects are bounded, evented, and never alter
+the ending; executor-side per-entry withholds persist the rest of the bundle;
+intake-side withholds do the same at persist (the intake rebuilds the bundle).
+The newest capture per incarnation is stored; superseded bundles are replaced,
+and a failed replacement leaves the older bundle in place. An operator restart
+may lose one
+in-flight POST; the bounded retry may cover it, otherwise the loss is
+documented. A run deleted mid-POST rejects the POST harmlessly. Same-name
+recreation gets new UIDs and fresh nonces while the old Secret is GC'd
+asynchronously — harmless because slot names are nonce-derived and unique. A
+run reaching
+AwaitingReview or Done after a continuation capture has its evidence deleted;
+the world holds the work, and a `Verifying` run that falls to `NeedsHuman`
+keeps it (a capture validated while `Running` but persisted after that
+deletion can briefly resurrect a Secret — stated race, bounded by the run's
+own GC).
+
+**Rejected alternatives.** Raw diffs in logs/stdout: redaction is not content
+safety and logs hold partial fragments — precisely what failed in #109.
+Patches in CR status or the termination message: kilobyte bounds, etcd
+pressure, secrets-in-status, forbidden on its face. Automatic push to the
+forge (quarantine refs, an evidence repo): world-visible evidence, hard to
+expire (git GC, forks, caches), unsafe by default, a violation of the broker
+publication policy's pinned destinations and of world-truth (#134: off-branch
+refs are the confusion to avoid) — and in legacy mode the model holds the push
+credential and could spoof evidence. Per-run PVC: the storage sprawl this
+design rejected for checkpoints, provisioner-dependent, heavier GC, no
+security gain. Executor-written Secrets: requires API identity in a
+model-controlled pod — a strict regression against removing identity from
+coordinator pods, and a model-controlled Secret-creation channel is an
+exfiltration primitive. Operator-side pull (exec/`kubectl cp`): impossible for
+the graceful ending — the #109 class — where the container has exited and no
+exec path exists; a standing `pods/exec` grant buys nothing but surface.
+Transcript/session recovery: OpenCode sessions are in-pod conversational
+state, not worktree evidence. Rejecting preservation entirely remains the
+named fallback for deployments that cannot accept the Secret-authority
+expansion; #109 shows the graceful-dirty class is real and recurring, so the
+mechanism above is the default.
+
+**Residual risks.** Hard kills and node loss lose work since the last
+inspection. Novel pattern-unmatched secrets can pass both scans, as can
+credentials split across fields or base64/URL-encoded in content, and weak or
+short registered values inflate the `withheld` counts (deployment hygiene is
+the mitigation) — the same residual family as log redaction, with higher
+stakes because storage persists. In legacy
+mode the model can read the evidence token and nonce and tamper with its own
+worktree before capture; the token's blast radius is its own incarnation's
+slot, evidence was never tamper-proof, and integrity rests on human review.
+Evidence content is
+stored inert and applied only by reviewed human action. Untracked residue
+alongside remote-confirmed committed work (the #93 class) is what a
+`Verifying` ending leaves uncaptured — the remote check, not the label, draws
+that line — and it dies with the pod.
+
+**Decomposition.** Implementation is split into bounded, dependency-ordered,
+file-scoped issues, none scheduled `status/ready` until this design lands:
+capture core (#197), executor triggers (#198), pod wiring (#199), intake +
+persistence + RBAC (#200), operator runbook (#201), and an envtest end-to-end
+(#202). The issue's required test classes
+map as: secret-bearing diffs → capture core, intake, envtest;
+oversized/binary/untracked → capture core, executor triggers; abrupt pod loss →
+executor triggers, envtest; duplicate capture → executor triggers;
+cleanup/expiry → intake, envtest; retrieval/application → runbook, envtest.
 
 ### Toolchain reference for bootstrap lanes (#153)
 
@@ -710,6 +1028,21 @@ only informs.
   local endpoint's key, any combination); in the target design the provider key
   belongs to trusted harness control, and workers do not call models directly.
 - Secrets are redacted from logs before stdout.
+- **Failure-evidence surfaces (#115):** the operator serves an authenticated,
+  write-only evidence intake listener (in-cluster, token-gated, no read path)
+  and holds namespaced Secret CRUD to persist evidence bundles. The evidence
+  verbs are provisioned as a namespaced Role/RoleBinding in the chart,
+  deliberately never inside the generated operator ClusterRole, whose
+  ClusterRoleBinding would widen them cluster-wide. The authority expansion is
+  real but bounded: the chart's namespaced `credential-reader` Role already
+  grants the operator's service account `get` on every Secret in the namespace
+  (no `resourceNames`), so the evidence grant's marginal authority is `list`
+  and the mutating `create/patch/delete`. Deployments that cannot accept
+  Secret mutation should not enable evidence capture, and
+  reject-preservation remains the named fallback in the #115
+  design. Evidence content itself is model-authored untrusted data stored
+  inert in run-owned Secrets: never executed, never consumed by tooling,
+  applied only by reviewed human action.
 - Dispatch is an adapter; the product boundary (dispatch is not Courier, Courier
   is not dispatch) is preserved in the interface.
 
@@ -775,6 +1108,30 @@ A running log of architectural decisions and their reasoning, newest first. The
 body above describes the current architecture; this log preserves *why* and what
 was superseded.
 
+- **2026-10-02 — #115: preserve bounded failure evidence; capture in the
+  executor, persist by the operator.** After the #109 production loss of six
+  uncommitted files, the design settles preservation rather than accepting the
+  loss: the executor captures a bounded, fail-closed-scanned bundle whenever
+  the verified worktree shows unrecoverable state (continuation points, crash
+  branches, terminal `Failed`/`NeedsHuman` classifications, and a SIGTERM trap
+  during operator-initiated deletion), and the operator persists it through an
+  authenticated write-only intake listener into per-incarnation, run-owned
+  Secrets GC'd with the run. The trust split is load-bearing: the legacy pod
+  is model-controlled and must gain no Kubernetes identity, so persistence
+  cannot live in the pod; conversely only the pod can read the worktree at the
+  moment it dies. Per-incarnation keying makes cross-incarnation overwrites
+  structurally impossible — a relaunched clean clone can never destroy the
+  evidence of the work it replaced. Secrets are excluded per entry before
+  storage (never redacted in place), binary and over-limit content is named
+  but never stored, and retrieval/application stay human actions so evidence
+  is never adopted, published, or implied published by a run or a #97 retry.
+  The accepted cost is a namespaced Secret-CRUD authority expansion on the
+  operator (not narrowable by `resourceNames`), stated in Security and
+  boundaries with reject-preservation as the named fallback for deployments
+  that cannot accept it. Rejected: log/stdout/status/termination-message
+  carriers, forge pushes (quarantine refs or evidence repos), per-run PVCs,
+  executor-held API identity, and operator-side exec pull (impossible once
+  the container has exited — the #109 class). (#115, #109)
 - **2026-10-02 — #168: export run metrics; scraping is an opt-in chart flag.**
   Run metrics were ad-hoc `kubectl` and log archaeology, so the operator now
   exposes them on the controller-runtime `:8080` endpoint. Labels are limited to
