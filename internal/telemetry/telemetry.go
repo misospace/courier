@@ -49,10 +49,11 @@ type SessionStat struct {
 // maxSubagents bounds the subagent list in the compact status form by count.
 const maxSubagents = 24
 
-// maxCompactBytes bounds the whole compact form by serialized size so it can
-// never push the COURIER_TERMINATION line past the 4 KiB termination-message
-// budget on its own. 3072 leaves headroom for the reason (capped at 1024)
-// plus phase/result/exit/overhead, under 4096.
+// maxCompactBytes is a pre-shrink bound keeping the compact summary
+// proportionate inside the termination line, not the authoritative size
+// limit: an escape-heavy reason serializes to far more than its raw bytes, so
+// the executor's fitTerminationLine budgets the whole emitted line against the
+// 4 KiB termination-message budget.
 const maxCompactBytes = 3072
 
 // openCodeEvent is the subset of an OpenCode stdout event line the tracker
@@ -132,9 +133,8 @@ type partView struct {
 	startMs   float64
 	endMs     float64
 	// task-tool subagent identity
-	agent      string
-	model      string
-	subSession string
+	agent string
+	model string
 }
 
 // subagentKey is the (agent, model) pair of a `task` tool call.
@@ -244,7 +244,6 @@ func (t *Tracker) Observe(line []byte) {
 					pv.model = p.State.Metadata.Model.ModelID
 				}
 				if p.State.Metadata.SessionID != "" {
-					pv.subSession = p.State.Metadata.SessionID
 					t.sessionIDs[p.State.Metadata.SessionID] = struct{}{}
 				}
 			}
