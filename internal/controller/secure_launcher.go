@@ -329,17 +329,37 @@ func (s *SecureControl) Revoke(ctx context.Context, run *courier.CoderRun) (bool
 	if err != nil {
 		return false, err
 	}
-	if brokerPod != nil {
-		// Disable broker ingress first: the Service stops routing before the
-		// pod stops serving.
+	// Disable broker ingress first: the Service stops routing before the pod
+	// stops serving and before any run-only material is removed. The Service
+	// is deleted on every pass until it is confirmed gone, whether or not the
+	// broker pod survives — a partial pass must never report done with broker
+	// ingress still routed.
+	service := &corev1.Service{}
+	err = s.Client.Get(ctx, types.NamespacedName{Namespace: run.Namespace, Name: topology.BrokerServiceName(run.Name)}, service)
+	serviceDeleted := false
+	switch {
+	case err == nil:
 		if err := s.Client.Delete(ctx, topology.BrokerService(run)); client.IgnoreNotFound(err) != nil {
 			return false, err
 		}
+		serviceDeleted = true
+	case apierrors.IsNotFound(err):
+		// Already gone: ingress is disabled.
+	default:
+		return false, err
+	}
+	if brokerPod != nil {
 		if brokerPod.DeletionTimestamp == nil {
 			if err := s.Client.Delete(ctx, brokerPod); client.IgnoreNotFound(err) != nil {
 				return false, err
 			}
 		}
+		return false, nil
+	}
+	if serviceDeleted {
+		// Ingress is disabled but its removal is not yet confirmed; the next
+		// pass resumes from live object state before run-only material is
+		// removed.
 		return false, nil
 	}
 

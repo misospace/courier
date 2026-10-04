@@ -24,6 +24,7 @@ import (
 
 	courier "github.com/misospace/courier/api/v1alpha1"
 	"github.com/misospace/courier/internal/forge"
+	"github.com/misospace/courier/internal/status"
 	"github.com/misospace/courier/internal/topology"
 )
 
@@ -539,6 +540,11 @@ func TestRevokeIsOrderedAndIdempotent(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
+	// The broker Service exists with the pod: revocation must delete it
+	// before the pod (ingress first).
+	if err := c.Create(context.Background(), topology.BrokerService(run)); err != nil {
+		t.Fatal(err)
+	}
 
 	done, err := control.Revoke(context.Background(), run)
 	if err != nil {
@@ -711,5 +717,126 @@ func TestProbeCoverageIsIncompleteWithoutEveryNode(t *testing.T) {
 	}
 	if pending {
 		t.Fatal("both probes are terminal, so nothing is pending")
+	}
+}
+
+// TestPublicationPolicyPersistsEmptyToSetOnly drives resolvePersistSecurePolicy
+// through the real production patch path — patchStatus into a
+// status.KubePatchWriter issuing a JSON merge patch against the API client,
+// exactly as cmd/main.go wires it — and proves the set-once property: a
+// persisted policy is never rewritten or cleared by a later patch.
+func TestPublicationPolicyPersistsEmptyToSetOnly(t *testing.T) {
+	scheme := runtime.NewScheme()
+	for _, add := range []func(*runtime.Scheme) error{courier.AddToScheme, corev1.AddToScheme, rbacv1.AddToScheme, networkingv1.AddToScheme} {
+		if err := add(scheme); err != nil {
+			t.Fatal(err)
+		}
+	}
+	c := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(&courier.CoderRun{}).Build()
+	control, _ := secureControl(t)
+	reconciler := &CoderRunReconciler{
+		Client:       c,
+		Secure:       control,
+		StatusWriter: status.KubePatchWriter{Client: c},
+	}
+	run := secureRun("policy-persist")
+	if err := c.Create(context.Background(), run); err != nil {
+		t.Fatal(err)
+	}
+
+	// Empty→set: the resolved policy persists through the production writer.
+	if err := reconciler.resolvePersistSecurePolicy(context.Background(), run); err != nil {
+		t.Fatalf("resolvePersistSecurePolicy: %v", err)
+	}
+	var persisted courier.CoderRun
+	if err := c.Get(context.Background(), client.ObjectKeyFromObject(run), &persisted); err != nil {
+		t.Fatal(err)
+	}
+	if persisted.Status.PublicationPolicy == nil {
+		t.Fatal("publication policy was never persisted")
+	}
+	if persisted.Status.PublicationPolicy.ProviderConfigRef != "github" || persisted.Status.PublicationPolicy.RunUID != string(run.UID) {
+		t.Fatalf("persisted policy = %+v", persisted.Status.PublicationPolicy)
+	}
+
+	// Set→mutated: a later patch carrying a different policy must not
+	// rewrite the persisted one.
+	before := persisted.DeepCopy()
+	mutated := persisted.DeepCopy()
+	mutated.Status.PublicationPolicy = &courier.PublicationPolicy{
+		RunUID:            string(run.UID),
+		ProviderConfigRef: "evil-provider",
+		ProviderEndpoint:  "https://evil.example.test/",
+		BaseRepo:          "Acme/Widgets",
+	}
+	if err := reconciler.patchStatus(context.Background(), before, mutated); err != nil {
+		t.Fatalf("patchStatus with a mutated policy: %v", err)
+	}
+	if err := c.Get(context.Background(), client.ObjectKeyFromObject(run), &persisted); err != nil {
+		t.Fatal(err)
+	}
+	if persisted.Status.PublicationPolicy.ProviderConfigRef != "github" {
+		t.Fatalf("persisted policy was rewritten to %q", persisted.Status.PublicationPolicy.ProviderConfigRef)
+	}
+
+	// Set→cleared: a patch that drops the in-memory policy must not clear it.
+	before = persisted.DeepCopy()
+	cleared := persisted.DeepCopy()
+	cleared.Status.PublicationPolicy = nil
+	if err := reconciler.patchStatus(context.Background(), before, cleared); err != nil {
+		t.Fatalf("patchStatus with a cleared policy: %v", err)
+	}
+	if err := c.Get(context.Background(), client.ObjectKeyFromObject(run), &persisted); err != nil {
+		t.Fatal(err)
+	}
+	if persisted.Status.PublicationPolicy == nil {
+		t.Fatal("persisted policy was cleared")
+	}
+
+	// Re-resolving a persisted run verifies it instead of rewriting it.
+	if err := reconciler.resolvePersistSecurePolicy(context.Background(), &persisted); err != nil {
+		t.Fatalf("re-resolve of a persisted policy: %v", err)
+	}
+	if err := c.Get(context.Background(), client.ObjectKeyFromObject(run), &persisted); err != nil {
+		t.Fatal(err)
+	}
+	if persisted.Status.PublicationPolicy.ProviderConfigRef != "github" {
+		t.Fatalf("re-resolve rewrote the persisted policy to %q", persisted.Status.PublicationPolicy.ProviderConfigRef)
+	}
+}
+
+// TestRevokeDeletesBrokerServiceWhenBrokerPodIsGone covers the pod-absent
+// regression: a partial pass that removed every pod but left the broker
+// Service must not report done while broker ingress is still routed.
+func TestRevokeDeletesBrokerServiceWhenBrokerPodIsGone(t *testing.T) {
+	control, c := secureControl(t)
+	run := secureRun("orphan-service")
+	now := metav1.Now()
+	run.DeletionTimestamp = &now
+	if err := c.Create(context.Background(), run); err != nil {
+		t.Fatal(err)
+	}
+	// Every pod is already gone; only the broker Service survived.
+	if err := c.Create(context.Background(), topology.BrokerService(run)); err != nil {
+		t.Fatal(err)
+	}
+
+	done, err := control.Revoke(context.Background(), run)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if done {
+		t.Fatal("revocation must not report done on the pass that deletes the broker Service")
+	}
+	var service corev1.Service
+	err = c.Get(context.Background(), types.NamespacedName{Namespace: run.Namespace, Name: topology.BrokerServiceName(run.Name)}, &service)
+	if !apierrors.IsNotFound(err) {
+		t.Fatalf("broker Service must be deleted, got %v", err)
+	}
+
+	// The next pass confirms it gone and completes.
+	done, err = control.Revoke(context.Background(), run)
+	if err != nil || !done {
+		t.Fatalf("second pass = done=%v err=%v", done, err)
 	}
 }

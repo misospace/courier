@@ -940,6 +940,13 @@ func (r *CoderRunReconciler) patchStatus(ctx context.Context, before, after *cou
 		restarts := after.Status.Restarts
 		fields.Restarts = &restarts
 	}
+	// PublicationPolicy is set-once: emitted only on the empty-to-set
+	// transition, like the timestamps above, so a persisted policy can never
+	// be rewritten or cleared by a later patch — including one carrying a
+	// mutated in-memory copy.
+	if before.Status.PublicationPolicy == nil && after.Status.PublicationPolicy != nil {
+		fields.PublicationPolicy = after.Status.PublicationPolicy
+	}
 	if !reflect.DeepEqual(before.Status.Conditions, after.Status.Conditions) {
 		fields.Conditions = after.Status.Conditions
 	}
