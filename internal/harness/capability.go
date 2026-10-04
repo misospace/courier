@@ -13,9 +13,11 @@ import (
 	"time"
 )
 
-// Capability states (HARNESS.md §5): configured (declared and in use, not
-// probed — never emitted for a required capability), healthy (probed and
-// working), unavailable (probed and not usable).
+// Capability states (HARNESS.md §5): healthy (probed and working) and
+// unavailable (probed and not usable) are what today's probes emit.
+// Configured (declared and in use but not probed) is the third state of the
+// settled vocabulary, reserved for a capability this build does not probe;
+// no probe emits it, and the gate never treats it as healthy.
 const (
 	StateConfigured  = "configured"
 	StateHealthy     = "healthy"

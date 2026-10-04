@@ -304,8 +304,6 @@ func (i *controlIdentity) brokerProber() *harness.BrokerProbeClient {
 }
 
 // probeWorker exercises the signed worker protocol end to end: snapshot
-// upload, dispatch, and a verified result. The probe task is inert.
-// probeWorker exercises the signed worker protocol end to end: snapshot
 // upload, dispatch, and a verified result. The probe task is inert. Every
 // failure is transient-class: the worker pod is fresh infrastructure the
 // operator fences on death, so re-probing after a wait can succeed.

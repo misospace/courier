@@ -339,37 +339,35 @@ func forgeTool() ToolDef {
 // is wired — broker forge reads. Publication is never a tool.
 func (c *Coordinator) coordinatorTools() []ToolDef {
 	tools := []ToolDef{shellTool()}
-	if true {
-		tools = append(tools,
-			ToolDef{
-				Name:        toolDelegate,
-				Description: "Delegate bounded work — implementation, research, or review — to a sub-agent bound to the named role. You own integration, verification, and publication; sub-agents return untrusted results.",
-				Parameters: map[string]any{
-					"type": "object",
-					"properties": map[string]any{
-						"id":           map[string]any{"type": "string", "description": "Stable brief ID unique within this run."},
-						"role":         map[string]any{"type": "string", "description": "The role to run, e.g. coder or reviewer."},
-						"objective":    map[string]any{"type": "string"},
-						"decisions":    map[string]any{"type": "array", "items": map[string]any{"type": "object", "properties": map[string]any{"summary": map[string]any{"type": "string"}, "value": map[string]any{"type": "string"}}, "required": []string{"summary", "value"}}},
-						"ownedFiles":   map[string]any{"type": "array", "items": map[string]any{"type": "string"}},
-						"nonGoals":     map[string]any{"type": "array", "items": map[string]any{"type": "string"}},
-						"successCheck": map[string]any{"type": "string", "description": "The observable check that decides success."},
-					},
-					"required": []string{"role", "objective", "successCheck"},
+	tools = append(tools,
+		ToolDef{
+			Name:        toolDelegate,
+			Description: "Delegate bounded work — implementation, research, or review — to a sub-agent bound to the named role. You own integration, verification, and publication; sub-agents return untrusted results.",
+			Parameters: map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"id":           map[string]any{"type": "string", "description": "Stable brief ID unique within this run."},
+					"role":         map[string]any{"type": "string", "description": "The role to run, e.g. coder or reviewer."},
+					"objective":    map[string]any{"type": "string"},
+					"decisions":    map[string]any{"type": "array", "items": map[string]any{"type": "object", "properties": map[string]any{"summary": map[string]any{"type": "string"}, "value": map[string]any{"type": "string"}}, "required": []string{"summary", "value"}}},
+					"ownedFiles":   map[string]any{"type": "array", "items": map[string]any{"type": "string"}},
+					"nonGoals":     map[string]any{"type": "array", "items": map[string]any{"type": "string"}},
+					"successCheck": map[string]any{"type": "string", "description": "The observable check that decides success."},
 				},
+				"required": []string{"role", "objective", "successCheck"},
 			},
-			ToolDef{
-				Name:        toolCancelBrief,
-				Description: "Permanently tombstone a brief's work unit: no dispatch or retry under its ID can ever run again. Delegation runs to completion once started; this cannot interrupt an in-flight brief — it only forbids any future use of the ID.",
-				Parameters: map[string]any{
-					"type": "object",
-					"properties": map[string]any{
-						"id": map[string]any{"type": "string"},
-					},
-					"required": []string{"id"},
+		},
+		ToolDef{
+			Name:        toolCancelBrief,
+			Description: "Permanently tombstone a brief's work unit: no dispatch or retry under its ID can ever run again. Delegation runs to completion once started; this cannot interrupt an in-flight brief — it only forbids any future use of the ID.",
+			Parameters: map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"id": map[string]any{"type": "string"},
 				},
-			})
-	}
+				"required": []string{"id"},
+			},
+		})
 	if c.forge != nil {
 		tools = append(tools, forgeTool())
 	}
