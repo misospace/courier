@@ -24,6 +24,7 @@ import (
 
 	courier "github.com/misospace/courier/api/v1alpha1"
 	"github.com/misospace/courier/internal/forge"
+	"github.com/misospace/courier/internal/source"
 	"github.com/misospace/courier/internal/status"
 	"github.com/misospace/courier/internal/topology"
 )
@@ -838,5 +839,68 @@ func TestRevokeDeletesBrokerServiceWhenBrokerPodIsGone(t *testing.T) {
 	done, err = control.Revoke(context.Background(), run)
 	if err != nil || !done {
 		t.Fatalf("second pass = done=%v err=%v", done, err)
+	}
+}
+
+// TestReconcileFencesWorkerWhenControlTerminates is the reconcile-level
+// regression for fence placement: the legacy coordinator-termination handler
+// must not bypass the secure topology's teardown, or the untrusted worker and
+// the credentialed broker outlive their supervisor — terminal runs are never
+// reaped, so a later-reconcile fence would never run at all.
+func TestReconcileFencesWorkerWhenControlTerminates(t *testing.T) {
+	control, c := secureControl(t)
+	run := secureRun("fence-reconcile")
+	run.Status.Phase = courier.PhaseRunning
+	if err := c.Create(context.Background(), run); err != nil {
+		t.Fatal(err)
+	}
+	controlPod := healthyPod(run.Name, topology.ComponentCoordinator)
+	controlPod.Spec.Containers[0].Name = topology.ControlContainerName
+	controlPod.Status.ContainerStatuses = []corev1.ContainerStatus{{
+		Name: topology.ControlContainerName,
+		State: corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{
+			ExitCode: 2,
+			Message:  `COURIER_TERMINATION {"phase":"NeedsHuman","result":"needs-human","exit_code":2,"reason":"capability probe failed"}`,
+		}},
+	}}
+	workerPod := healthyPod(run.Name, topology.ComponentWorker)
+	brokerPod := healthyPod(run.Name, topology.ComponentBroker)
+	for _, pod := range []*corev1.Pod{controlPod, workerPod, brokerPod} {
+		if err := c.Create(context.Background(), pod); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := c.Create(context.Background(), topology.BrokerService(run)); err != nil {
+		t.Fatal(err)
+	}
+
+	reconciler := &CoderRunReconciler{
+		Client:       c,
+		Sources:      NewSourceRegistry(map[string]source.Adapter{"manual": &admissionSource{}}),
+		StatusWriter: fakeStatusWriter{client: c},
+		Secure:       control,
+	}
+	if _, err := reconciler.Reconcile(context.Background(), ctrl.Request{NamespacedName: client.ObjectKeyFromObject(run)}); err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+
+	var worker corev1.Pod
+	if err := c.Get(context.Background(), types.NamespacedName{Namespace: run.Namespace, Name: topology.WorkerPodName(run.Name)}, &worker); !apierrors.IsNotFound(err) {
+		t.Fatalf("worker must be fenced in the same reconcile that terminalizes the run, got %v", err)
+	}
+	var broker corev1.Pod
+	if err := c.Get(context.Background(), types.NamespacedName{Namespace: run.Namespace, Name: topology.BrokerPodName(run.Name)}, &broker); !apierrors.IsNotFound(err) {
+		t.Fatalf("broker pod must be torn down with its control incarnation, got %v", err)
+	}
+	var service corev1.Service
+	if err := c.Get(context.Background(), types.NamespacedName{Namespace: run.Namespace, Name: topology.BrokerServiceName(run.Name)}, &service); !apierrors.IsNotFound(err) {
+		t.Fatalf("broker ingress must be disabled with its control incarnation, got %v", err)
+	}
+	var updated courier.CoderRun
+	if err := c.Get(context.Background(), client.ObjectKeyFromObject(run), &updated); err != nil {
+		t.Fatal(err)
+	}
+	if updated.Status.Phase != courier.PhaseNeedsHuman {
+		t.Fatalf("phase = %q, want NeedsHuman from the control exit code", updated.Status.Phase)
 	}
 }

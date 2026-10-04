@@ -368,7 +368,7 @@ func (r *CoderRunReconciler) resolvePersistSecurePolicy(ctx context.Context, run
 		// the same projection: a changed registry applies to future
 		// admissions only, and this run's policy must stay coherent with it.
 		registration, err := r.Secure.Config.Registry.Select(run.Spec.Repo)
-		if err != nil || registration.Name != policy.ProviderConfigRef || registration.Endpoint != policy.ProviderEndpoint {
+		if err != nil || registration.Name != policy.ProviderConfigRef || registration.Endpoint != policy.ProviderEndpoint || registration.Projection().Digest != policy.CredentialRefDigest {
 			return secureNeedsHuman("PolicyConflict",
 				"the provider registry no longer matches this run's persisted policy")
 		}
@@ -515,6 +515,24 @@ func (r *CoderRunReconciler) observeRunning(ctx context.Context, run *courierv1a
 	if err := r.List(ctx, &pods, client.InNamespace(run.Namespace)); err != nil {
 		return ctrl.Result{}, err
 	}
+	// The secure topology's operator-owned observation runs before the
+	// coordinator-termination handler below: a terminated control pod must
+	// fence its worker and take the broker down in the same reconcile that
+	// terminalizes the run. Terminal runs are never reaped, so fencing left
+	// to a later reconcile would never run at all — the untrusted executor
+	// and the credentialed broker would outlive their supervisor.
+	if r.Secure != nil {
+		securePods := make([]corev1.Pod, 0, len(pods.Items))
+		for i := range pods.Items {
+			if podBelongsToRun(&pods.Items[i], run) {
+				securePods = append(securePods, pods.Items[i])
+			}
+		}
+		result, handled, err := r.Secure.ObserveTopology(ctx, run, securePods)
+		if err != nil || handled {
+			return result, err
+		}
+	}
 	for i := range pods.Items {
 		pod := &pods.Items[i]
 		if !podBelongsToRun(pod, run) {
@@ -558,21 +576,6 @@ func (r *CoderRunReconciler) observeRunning(ctx context.Context, run *courierv1a
 			intent.error = terminationReason
 		}
 		return r.transitionTerminal(ctx, run, phase, "", intent)
-	}
-	// The secure topology adds operator-owned infrastructure observation:
-	// a terminated control fences its worker, and a dead worker or broker is
-	// infrastructure failure that relaunches the round through Claimed.
-	if r.Secure != nil {
-		securePods := make([]corev1.Pod, 0, len(pods.Items))
-		for i := range pods.Items {
-			if podBelongsToRun(&pods.Items[i], run) {
-				securePods = append(securePods, pods.Items[i])
-			}
-		}
-		result, handled, err := r.Secure.ObserveTopology(ctx, run, securePods)
-		if err != nil || handled {
-			return result, err
-		}
 	}
 	result, handled, err := r.checkLiveness(ctx, run, pods.Items)
 	if handled {

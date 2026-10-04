@@ -229,10 +229,21 @@ func (s *SecureControl) ObserveTopology(ctx context.Context, run *courier.CoderR
 	}
 	if controlTerminated(control) {
 		// The control incarnation is over: fence its worker so no untrusted
-		// executor outlives its supervisor. The normal exit-code mapping
-		// decides the run's phase.
+		// executor outlives its supervisor, and take the broker's ingress and
+		// pod down with it — the broker holds the run's copied credentials and
+		// terminal runs are never reaped. Run-only material is removed by the
+		// ordered finalizer when the CoderRun is deleted. The caller proceeds
+		// to the exit-code mapping, which decides the run's phase.
 		if worker.DeletionTimestamp == nil {
 			if err := s.Client.Delete(ctx, worker); client.IgnoreNotFound(err) != nil {
+				return ctrl.Result{}, true, err
+			}
+		}
+		if err := s.Client.Delete(ctx, topology.BrokerService(run)); client.IgnoreNotFound(err) != nil {
+			return ctrl.Result{}, true, err
+		}
+		if broker.DeletionTimestamp == nil {
+			if err := s.Client.Delete(ctx, broker); client.IgnoreNotFound(err) != nil {
 				return ctrl.Result{}, true, err
 			}
 		}

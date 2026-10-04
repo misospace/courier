@@ -364,6 +364,37 @@ func TestWorkerArtifactGuards(t *testing.T) {
 		time.Sleep(10 * time.Millisecond)
 	}
 
+	// A symlink inside the workspace is rejected at its own path: Lstat sees
+	// the link, so nothing outside the workspace is followed.
+	if err := os.Symlink("/etc/hostname", filepath.Join(worker.config.WorkspaceDir, "link.txt")); err != nil {
+		t.Fatal(err)
+	}
+	symlink := `{"command":["true"],"artifactPath":"link.txt"}`
+	envSym := env
+	envSym.OpID = "op-3"
+	envSym.PayloadDigest = PayloadDigestOf([]byte(symlink))
+	envSym.Nonce = "artifact-symlink-nonce-1"
+	if _, err := client.Dispatch(ctx, priv, envSym, []byte(symlink)); err != nil {
+		t.Fatalf("symlink dispatch: %v", err)
+	}
+	deadline = time.Now().Add(5 * time.Second)
+	for {
+		state, err := client.Result(ctx, "op-3")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if state.Status == ResultFailed {
+			if state.Result != nil && state.Result.Artifact != nil {
+				t.Fatal("a symlinked artifact must never be returned")
+			}
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("symlinked artifact must fail the operation")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
 	missing := `{"command":["true"],"artifactPath":"does-not-exist.bin"}`
 	env2 := env
 	env2.OpID = "op-2"

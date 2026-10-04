@@ -229,10 +229,12 @@ func declareNeedsHuman(reason string, caps []capability) error {
 		return err
 	}
 	// The operator's contract: the structured handoff on stdout and in the
-	// termination message file, exit code 2.
+	// termination message file with the COURIER_TERMINATION prefix the
+	// operator's parser requires, exit code 2.
 	fmt.Printf("COURIER_TERMINATION %s\n", payload)
 	if path := os.Getenv("COURIER_TERMINATION_FILE"); path != "" {
-		if err := os.WriteFile(path, payload, 0o600); err != nil {
+		prefixed := append([]byte("COURIER_TERMINATION "), payload...)
+		if err := os.WriteFile(path, prefixed, 0o600); err != nil {
 			return fmt.Errorf("courier-control: write termination file: %w", err)
 		}
 	}
