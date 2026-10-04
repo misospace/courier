@@ -11,6 +11,8 @@ package main
 import (
 	"context"
 	"crypto/ed25519"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -319,13 +321,20 @@ func (i *controlIdentity) probeWorker(ctx context.Context) harness.Capability {
 	if err != nil {
 		return unavailable("task encoding failed")
 	}
+	// The probe mints a fresh operation ID per attempt: the worker keeps
+	// replay state in process memory, and a fixed ID would conflict (409) on
+	// every re-probe round, making transient recovery impossible.
+	nonce := make([]byte, 8)
+	if _, err := rand.Read(nonce); err != nil {
+		return unavailable("probe entropy unavailable")
+	}
 	env := protocol.NewEnvelope(time.Now(), 5*time.Minute, task)
 	env.Kind = protocol.KindDispatch
 	env.RunUID = i.runUID
 	env.ControlPodUID = i.controlUID
 	env.WorkerPodUID = i.workerUID
 	env.BriefID = "capability-probe"
-	env.OpID = "capability-probe"
+	env.OpID = "capability-probe." + hex.EncodeToString(nonce)
 	if _, err := client.Dispatch(ctx, ed25519.PrivateKey(i.signingKey), env, task); err != nil {
 		return unavailable("dispatch failed")
 	}

@@ -1,11 +1,17 @@
 package main
 
 import (
+	"context"
 	"errors"
+	"fmt"
+	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/misospace/courier/internal/executor"
+	"github.com/misospace/courier/internal/harness"
+	"github.com/misospace/courier/internal/protocol"
 	"github.com/misospace/courier/internal/topology"
 )
 
@@ -65,5 +71,41 @@ func TestBoundReason(t *testing.T) {
 	got := boundReason(long)
 	if len(got) > maxTerminationReasonBytes+20 || !strings.HasSuffix(got, "[truncated]") {
 		t.Fatalf("boundReason did not bound the reason: %d bytes", len(got))
+	}
+}
+
+// The probe must mint a fresh operation ID per attempt: the worker keeps
+// replay state in process memory, so a fixed probe opID would conflict (409)
+// on every re-probe round and transient recovery would be impossible.
+func TestProbeWorkerSurvivesRepeatedProbes(t *testing.T) {
+	pub, priv, err := protocol.GenerateKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	uid := fmt.Sprintf("worker-%d", time.Now().UnixNano())
+	realWorker, err := protocol.NewWorker(protocol.WorkerConfig{
+		RunUID: "run", ControlPodUID: "control", WorkerPodUID: uid, PublicKey: pub,
+		WorkspaceDir: t.TempDir(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	server := httptest.NewServer(realWorker.Handler())
+	defer server.Close()
+	identity := &controlIdentity{
+		runUID:      "run",
+		controlUID:  "control",
+		workerUID:   uid,
+		workerURL:   server.URL,
+		brokerURL:   "https://broker:8443",
+		signingKey:  priv,
+		brokerToken: []byte("token"),
+		brokerCA:    []byte("ca"),
+	}
+	for attempt := 0; attempt < 3; attempt++ {
+		capability := identity.probeWorker(context.Background())
+		if capability.State != harness.StateHealthy {
+			t.Fatalf("probe attempt %d = %+v, want healthy (a fixed opID conflicts on the second probe)", attempt, capability)
+		}
 	}
 }

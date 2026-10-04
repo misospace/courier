@@ -360,7 +360,7 @@ func (c *Coordinator) coordinatorTools() []ToolDef {
 			},
 			ToolDef{
 				Name:        toolCancelBrief,
-				Description: "Mark a brief's work unit cancelled so no dispatch or retry under its ID can ever run again. Cancellation is final for that brief ID.",
+				Description: "Permanently tombstone a brief's work unit: no dispatch or retry under its ID can ever run again. Delegation runs to completion once started; this cannot interrupt an in-flight brief — it only forbids any future use of the ID.",
 				Parameters: map[string]any{
 					"type": "object",
 					"properties": map[string]any{
@@ -498,15 +498,18 @@ func (c *Coordinator) runDelegate(ctx context.Context, call ToolCall, result Too
 		NonGoals:     args.NonGoals,
 		SuccessCheck: args.SuccessCheck,
 	}
+	// The role binding is validated before registration: a delegation the
+	// harness cannot run must not burn the stable brief ID, so the model can
+	// re-delegate the same work unit with a corrected request.
+	if c.bindings.Model(brief.Role) == "" {
+		result.IsError = true
+		result.Content = fmt.Sprintf("no model is bound to role %q", brief.Role)
+		return result
+	}
 	registered, err := c.briefs.Register(brief)
 	if err != nil {
 		result.IsError = true
 		result.Content = safeToolError(err)
-		return result
-	}
-	if c.bindings.Model(registered.Role) == "" {
-		result.IsError = true
-		result.Content = fmt.Sprintf("no model is bound to role %q", registered.Role)
 		return result
 	}
 	summary := c.runBrief(ctx, registered)

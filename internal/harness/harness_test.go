@@ -1473,3 +1473,53 @@ func TestToolResultEventsAreEmitted(t *testing.T) {
 		t.Fatal("the emitted tool result carries no content")
 	}
 }
+
+// An unbound role must not burn the stable brief ID: the binding is
+// validated before registration, so the model can re-delegate the same work
+// unit with a corrected request.
+func TestUnboundRoleDoesNotBurnBriefID(t *testing.T) {
+	worker, delegator, cleanupWorker := testWorkerAndDelegator(t)
+	defer cleanupWorker()
+	worker.completeAll = true
+	gateway, _, cleanup := gatewayFor(
+		// Coordinator delegates to a role no model is bound to.
+		gatewayResponse{body: sse(
+			toolCallChunk(0, "call-1", toolDelegate, `{"id":"b1","role":"reviewer","objective":"Work","successCheck":"ok"}`),
+			finishChunk("tool_calls"),
+		)},
+		// Coordinator re-delegates the SAME ID with a bound role.
+		gatewayResponse{body: sse(
+			toolCallChunk(0, "call-2", toolDelegate, `{"id":"b1","role":"coder","objective":"Work","successCheck":"ok"}`),
+			finishChunk("tool_calls"),
+		)},
+		// Coder runs shell.
+		gatewayResponse{body: sse(
+			toolCallChunk(0, "call-3", toolShell, `{"command":"echo hi"}`),
+			finishChunk("tool_calls"),
+		)},
+		// Coder finishes.
+		gatewayResponse{body: sse(contentChunk("done"), finishChunk("stop"))},
+		gatewayResponse{body: sse(contentChunk(`{"outcome":"blocked_external","missing":"x"}`), finishChunk("stop"))},
+	)
+	defer cleanup()
+	coordinator, err := NewCoordinator(CoordinatorConfig{
+		Gateway:  gateway,
+		Bindings: testBindings(), // coordinator + coder bound; reviewer is not
+		Worker:   delegator,
+		Snapshot: func(context.Context) ([]byte, error) { return []byte("s"), nil },
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	result := coordinator.Run(context.Background(), testInvocation())
+	if result.Outcome != executor.OutcomeBlockedExternal {
+		t.Fatalf("outcome = %q (%v)", result.Outcome, result.Err)
+	}
+	briefs := coordinator.Briefs().BriefIDs()
+	if len(briefs) != 1 || briefs[0] != "b1" {
+		t.Fatalf("brief ledger = %v, want exactly the re-delegated b1", briefs)
+	}
+	if worker.dispatchCount() != 1 {
+		t.Fatalf("worker dispatches = %d, want the corrected delegation's shell work", worker.dispatchCount())
+	}
+}
