@@ -26,13 +26,15 @@ import (
 	"github.com/misospace/courier/internal/topology"
 )
 
-// termination is the operator's exit-contract handoff (the same shape the
-// legacy executor writes to its termination message path).
+// termination mirrors the operator's terminationMessage contract: the
+// phase/result pair must satisfy validTerminationPhaseResult for the exit
+// code, and the declared outcome travels in Outcome.
 type termination struct {
 	Phase    string `json:"phase"`
 	Result   string `json:"result"`
 	ExitCode int32  `json:"exit_code"`
 	Reason   string `json:"reason"`
+	Outcome  string `json:"outcome,omitempty"`
 }
 
 // Probe retry rounds and delay are bounded infrastructure retries covering a
@@ -161,42 +163,58 @@ func runArgs(args []string) error {
 // written to the termination file in every case — the exit code alone is
 // never the classification.
 func declare(result executor.HarnessResult) error {
+	return handoff(terminationFor(result))
+}
+
+// terminationFor renders the operator handoff payload. Its phase/result pair
+// must satisfy validTerminationPhaseResult for the exit code — the operator
+// discards the trusted reason and outcome otherwise — and the coordinator's
+// own declared outcome travels in Outcome.
+func terminationFor(result executor.HarnessResult) termination {
 	reason := result.Reason
 	exit := int32(1)
 	phase := "Failed"
-	declared := "undeclared"
+	handoffResult := "failure"
+	outcome := ""
 	switch {
 	case result.Err != nil && result.Outcome == executor.OutcomeChanges:
 		// Declared changes, publication failed: infrastructure failure that
 		// a relaunch reconciles against the world.
-		declared = string(result.Outcome)
+		outcome = string(result.Outcome)
 		reason = result.Err.Error()
 	case result.Err != nil:
 		reason = result.Err.Error()
 	case result.Outcome == executor.OutcomeChanges:
-		exit, phase, declared = 0, "Verifying", string(result.Outcome)
+		exit, phase, handoffResult, outcome = 0, "Verifying", "success", string(result.Outcome)
 	case result.Outcome == executor.OutcomeNoChangeNeeded:
-		exit, phase, declared = 3, "AwaitingReview", string(result.Outcome)
+		exit, phase, handoffResult, outcome = 3, "NoChangeNeeded", "success", string(result.Outcome)
 	case result.Outcome == executor.OutcomeNeedsDecision, result.Outcome == executor.OutcomeBlockedExternal:
-		exit, phase, declared = 2, "NeedsHuman", string(result.Outcome)
+		exit, phase, handoffResult, outcome = 2, "NeedsHuman", "needs-human", string(result.Outcome)
 	}
-	payload, err := json.Marshal(termination{
+	return termination{
 		Phase:    phase,
-		Result:   declared,
+		Result:   handoffResult,
 		ExitCode: exit,
 		Reason:   boundReason(reason),
-	})
+		Outcome:  outcome,
+	}
+}
+
+// handoff writes the structured termination payload to stdout and the
+// termination file, then exits with the payload's exit code.
+func handoff(payload termination) error {
+	data, err := json.Marshal(payload)
 	if err != nil {
 		return err
 	}
-	fmt.Printf("COURIER_TERMINATION %s\n", payload)
+	fmt.Printf("COURIER_TERMINATION %s\n", data)
 	if path := os.Getenv("COURIER_TERMINATION_FILE"); path != "" {
-		prefixed := append([]byte("COURIER_TERMINATION "), payload...)
+		prefixed := append([]byte("COURIER_TERMINATION "), data...)
 		if err := os.WriteFile(path, prefixed, 0o600); err != nil {
 			return fmt.Errorf("courier-control: write termination file: %w", err)
 		}
 	}
-	os.Exit(int(exit))
+	os.Exit(int(payload.ExitCode))
 	return nil
 }
 
@@ -204,26 +222,14 @@ func declare(result executor.HarnessResult) error {
 // capability table as the reason, then exits 2 — the operator's fail-closed
 // contract for a run that cannot proceed.
 func declareNeedsHuman(reason string, caps []harness.Capability) error {
-	payload, err := json.Marshal(termination{
+	table, _ := json.Marshal(caps)
+	fmt.Printf("capability health: %s\n", table)
+	return handoff(termination{
 		Phase:    "NeedsHuman",
 		Result:   "needs-human",
 		ExitCode: 2,
 		Reason:   boundReason(reason),
 	})
-	if err != nil {
-		return err
-	}
-	fmt.Printf("COURIER_TERMINATION %s\n", payload)
-	if path := os.Getenv("COURIER_TERMINATION_FILE"); path != "" {
-		prefixed := append([]byte("COURIER_TERMINATION "), payload...)
-		if err := os.WriteFile(path, prefixed, 0o600); err != nil {
-			return fmt.Errorf("courier-control: write termination file: %w", err)
-		}
-	}
-	table, _ := json.Marshal(caps)
-	fmt.Printf("capability health: %s\n", table)
-	os.Exit(2)
-	return nil
 }
 
 func mustJSON(value any) string {
@@ -297,16 +303,21 @@ func (i *controlIdentity) brokerProber() *harness.BrokerProbeClient {
 
 // probeWorker exercises the signed worker protocol end to end: snapshot
 // upload, dispatch, and a verified result. The probe task is inert.
+// probeWorker exercises the signed worker protocol end to end: snapshot
+// upload, dispatch, and a verified result. The probe task is inert. Every
+// failure is transient-class: the worker pod is fresh infrastructure the
+// operator fences on death, so re-probing after a wait can succeed.
 func (i *controlIdentity) probeWorker(ctx context.Context) harness.Capability {
+	unavailable := func(detail string) harness.Capability {
+		return harness.Capability{Name: "worker-protocol", State: harness.StateUnavailable, Detail: detail, Required: true, Retryable: true}
+	}
 	client := &protocol.Client{BaseURL: i.workerURL}
 	if err := client.UploadSnapshot(ctx, []byte("courier-control capability probe")); err != nil {
-		capability := harness.Capability{Name: "worker-protocol", State: harness.StateUnavailable, Detail: "snapshot upload failed", Required: true}
-		capability.Retryable = true
-		return capability
+		return unavailable("snapshot upload failed")
 	}
 	task, err := json.Marshal(protocol.Task{Command: []string{"git", "--version"}})
 	if err != nil {
-		return harness.Capability{Name: "worker-protocol", State: harness.StateUnavailable, Detail: "task encoding failed", Required: true}
+		return unavailable("task encoding failed")
 	}
 	env := protocol.NewEnvelope(time.Now(), 5*time.Minute, task)
 	env.Kind = protocol.KindDispatch
@@ -316,22 +327,22 @@ func (i *controlIdentity) probeWorker(ctx context.Context) harness.Capability {
 	env.BriefID = "capability-probe"
 	env.OpID = "capability-probe"
 	if _, err := client.Dispatch(ctx, ed25519.PrivateKey(i.signingKey), env, task); err != nil {
-		return harness.Capability{Name: "worker-protocol", State: harness.StateUnavailable, Detail: "dispatch failed", Required: true}
+		return unavailable("dispatch failed")
 	}
 	deadline := time.Now().Add(30 * time.Second)
 	for {
 		state, err := client.Result(ctx, env.OpID)
 		if err != nil {
-			return harness.Capability{Name: "worker-protocol", State: harness.StateUnavailable, Detail: "result poll failed", Required: true}
+			return unavailable("result poll failed")
 		}
 		if state.Status == protocol.ResultCompleted {
 			return harness.Capability{Name: "worker-protocol", State: harness.StateHealthy, Required: true}
 		}
 		if state.Status == protocol.ResultFailed || state.Status == protocol.ResultCancelled {
-			return harness.Capability{Name: "worker-protocol", State: harness.StateUnavailable, Detail: "probe task did not complete", Required: true}
+			return unavailable("probe task did not complete")
 		}
 		if time.Now().After(deadline) {
-			return harness.Capability{Name: "worker-protocol", State: harness.StateUnavailable, Detail: "probe task timed out", Required: true}
+			return unavailable("probe task timed out")
 		}
 		time.Sleep(200 * time.Millisecond)
 	}
@@ -349,10 +360,6 @@ func probeModel(ctx context.Context, gateway *harness.Gateway, model string) err
 	}
 	for _, event := range events {
 		if event.Kind == harness.KindError {
-			var gatewayErr *harness.GatewayError
-			if errors.As(event.Err, &gatewayErr) && gatewayErr.Status >= 500 {
-				return &harness.ProbeRetryable{Err: event.Err}
-			}
 			return event.Err
 		}
 	}

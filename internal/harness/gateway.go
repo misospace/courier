@@ -139,7 +139,7 @@ func (g *Gateway) StreamChat(ctx context.Context, req ChatRequest) ([]Event, err
 	}
 	resp, err := g.client().Do(httpReq)
 	if err != nil {
-		return []Event{{Kind: KindError, Err: fmt.Errorf("harness: gateway transport failed: %w", err)}}, nil
+		return []Event{{Kind: KindError, Err: &GatewayTransportError{Err: err}}}, nil
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
@@ -155,6 +155,17 @@ func (g *Gateway) StreamChat(ctx context.Context, req ChatRequest) ([]Event, err
 func gatewayStatusError(status int) error {
 	return &GatewayError{Status: status}
 }
+
+// GatewayTransportError is a transport-class gateway failure: dial, reset,
+// EOF, or a mid-stream read error. Retrying and re-probing can succeed, so
+// both the session retry loop and the probe classifier treat it as transient.
+type GatewayTransportError struct{ Err error }
+
+func (e *GatewayTransportError) Error() string {
+	return fmt.Sprintf("harness: gateway transport failed: %v", e.Err)
+}
+
+func (e *GatewayTransportError) Unwrap() error { return e.Err }
 
 // GatewayError is a redacted gateway failure. It carries only the status and
 // a fixed category — never a provider response body.
@@ -301,7 +312,7 @@ func normalizeStream(body io.Reader) ([]Event, error) {
 		}
 	}
 	if err := scanner.Err(); err != nil {
-		return streamError(events, fmt.Errorf("harness: provider stream read failed"))
+		return streamError(events, &GatewayTransportError{Err: err})
 	}
 	if finish == "" {
 		// A turn with no finish reason never terminalized: no content

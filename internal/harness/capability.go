@@ -87,6 +87,10 @@ func isProbeRetryable(err error) bool {
 	if errors.As(err, &retryable) {
 		return true
 	}
+	var transportErr *GatewayTransportError
+	if errors.As(err, &transportErr) {
+		return true
+	}
 	var gatewayErr *GatewayError
 	if errors.As(err, &gatewayErr) {
 		return isTransientGatewayStatus(gatewayErr.Status)

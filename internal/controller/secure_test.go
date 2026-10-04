@@ -670,6 +670,16 @@ func TestRevokeIsOrderedAndIdempotent(t *testing.T) {
 	if err := c.Create(context.Background(), topology.BrokerService(run)); err != nil {
 		t.Fatal(err)
 	}
+	// The per-run gateway credential copy exists: revocation must remove it
+	// with the rest of the run-only material — a model-provider credential
+	// may never outlive the run.
+	gatewaySecret, err := topology.GatewaySecret(run, []byte("gw-secret-value"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := c.Create(context.Background(), gatewaySecret); err != nil {
+		t.Fatal(err)
+	}
 
 	done, err := control.Revoke(context.Background(), run)
 	if err != nil {
@@ -715,6 +725,11 @@ func TestRevokeIsOrderedAndIdempotent(t *testing.T) {
 	}
 	if len(services.Items) != 0 {
 		t.Fatalf("services survived revocation: %d", len(services.Items))
+	}
+	// The model-provider gateway credential copy must be gone with the rest
+	// of the run-only material.
+	if err := c.Get(context.Background(), client.ObjectKey{Namespace: run.Namespace, Name: topology.GatewaySecretName(run.Name)}, &corev1.Secret{}); !apierrors.IsNotFound(err) {
+		t.Fatalf("gateway credential copy survived revocation: %v", err)
 	}
 	if done, err := control.Revoke(context.Background(), run); err != nil || !done {
 		t.Fatalf("rerun of a completed revocation = done=%v err=%v", done, err)

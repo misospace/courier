@@ -7,10 +7,12 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -1072,6 +1074,19 @@ func TestToolDeclarationsMatchSessionContext(t *testing.T) {
 	if contains(subagentTools, toolDelegate) || contains(subagentTools, toolCancelBrief) {
 		t.Fatalf("subagent toolset leaks privileged tools: %v", subagentTools)
 	}
+	// The subagent receives the bounded delegate framing, never the
+	// coordinator's terminal-ownership framing.
+	subagentBody := mocker.calls[1].rawBody
+	if !strings.Contains(subagentBody, "bounded delegate") {
+		t.Fatal("the subagent session does not carry the delegate framing")
+	}
+	if strings.Contains(subagentBody, "You are the trusted coordinator") {
+		t.Fatal("the subagent session carries the coordinator framing")
+	}
+	coordinatorBody := mocker.calls[0].rawBody
+	if !strings.Contains(coordinatorBody, "You are the trusted coordinator") {
+		t.Fatal("the coordinator session lost its trusted framing")
+	}
 }
 
 func contains(values []string, want string) bool {
@@ -1250,4 +1265,211 @@ func TestOversizedArtifactIsNotInlined(t *testing.T) {
 		return
 	}
 	t.Fatal("oversized artifact was inlined into the transcript")
+}
+
+// --- human-review regressions ----------------------------------------------
+
+// A prompt-injected subagent emitting the forge tool name gets a refusal,
+// never a broker call through trusted control.
+func TestSubagentCannotCallForge(t *testing.T) {
+	forge := &countingForge{}
+	coordinator, err := NewCoordinator(CoordinatorConfig{
+		Gateway:  &Gateway{BaseURL: "http://unused.invalid"},
+		Bindings: testBindings(),
+		Forge:    forge,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Subagent context (briefID set): refused even when the forge seam is
+	// configured; the coordinator context (briefID empty) goes through.
+	result := coordinator.runTool(context.Background(), ToolCall{ID: "c1", Name: toolForge, Arguments: `{"operation":"read-work-item"}`}, "b1")
+	if !result.IsError || !strings.Contains(result.Content, "not available to sub-agents") {
+		t.Fatalf("subagent forge result = %+v", result)
+	}
+	if forge.calls != 0 {
+		t.Fatal("a subagent forge request must never reach the forge seam")
+	}
+	coordinatorResult := coordinator.runTool(context.Background(), ToolCall{ID: "c2", Name: toolForge, Arguments: `{"operation":"read-work-item"}`}, "")
+	if coordinatorResult.IsError {
+		t.Fatalf("coordinator forge result = %+v", coordinatorResult)
+	}
+	if forge.calls != 1 {
+		t.Fatalf("forge calls = %d, want 1", forge.calls)
+	}
+}
+
+type countingForge struct{ calls int }
+
+func (f *countingForge) Call(_ context.Context, _, _ string) (string, error) {
+	f.calls++
+	return "{}", nil
+}
+
+// The delegate toolset never offers forge reads, delegation, or
+// cancellation, even when the forge seam is configured.
+func TestSubagentToolsetExcludesForge(t *testing.T) {
+	forge := &countingForge{}
+	coordinator, err := NewCoordinator(CoordinatorConfig{
+		Gateway:  &Gateway{BaseURL: "http://unused.invalid"},
+		Bindings: testBindings(),
+		Forge:    forge,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	coordinatorToolset := coordinator.coordinatorTools()
+	if !containsTool(coordinatorToolset, toolForge) {
+		t.Fatal("the coordinator toolset must offer forge reads when wired")
+	}
+	subagentToolset := coordinator.subagentTools()
+	for _, forbidden := range []string{toolForge, toolDelegate, toolCancelBrief} {
+		if containsTool(subagentToolset, forbidden) {
+			t.Fatalf("subagent toolset leaks %q", forbidden)
+		}
+	}
+}
+
+func containsTool(tools []ToolDef, name string) bool {
+	for _, tool := range tools {
+		if tool.Name == name {
+			return true
+		}
+	}
+	return false
+}
+
+// A real transport failure (connection refused) is retried by the session
+// loop and classified retryable by the probe machinery.
+func TestTransportFailureIsRetriedAndClassifiedRetryable(t *testing.T) {
+	var connections atomic.Int32
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	server := &http.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		connections.Add(1)
+		// Close mid-response: a transport-class failure, not a status.
+		panic(http.ErrAbortHandler)
+	})}
+	go func() { _ = server.Serve(listener) }()
+	defer func() { _ = server.Close() }()
+
+	gateway := &Gateway{BaseURL: "http://" + listener.Addr().String()}
+	session, err := NewSession(gateway, testBindings(), RoleCoordinator, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	events := session.Turn(context.Background(), nil)
+	if last := events[len(events)-1]; last.Kind != KindError {
+		t.Fatalf("terminal event = %+v, want error", last)
+	}
+	var transportErr *GatewayTransportError
+	if !errors.As(lastErr(events), &transportErr) {
+		t.Fatalf("terminal error = %v, want GatewayTransportError", lastErr(events))
+	}
+	if !isProbeRetryable(lastErr(events)) {
+		t.Fatal("a transport failure must classify as retryable for probes")
+	}
+	if got := connections.Load(); got < 2 {
+		t.Fatalf("connections = %d, want the transport failure retried", got)
+	}
+}
+
+func lastErr(events []Event) error {
+	for i := len(events) - 1; i >= 0; i-- {
+		if events[i].Kind == KindError {
+			return events[i].Err
+		}
+	}
+	return nil
+}
+
+// The delegate's actual result is retained under its brief ID and is what
+// publication planning consumes — never a fabricated objective.
+func TestBriefResultRetention(t *testing.T) {
+	worker, delegator, cleanupWorker := testWorkerAndDelegator(t)
+	defer cleanupWorker()
+	worker.completeAll = true
+	gateway, _, cleanup := gatewayFor(
+		gatewayResponse{body: sse(
+			toolCallChunk(0, "call-1", toolDelegate, `{"id":"b1","role":"coder","objective":"ORIGINAL OBJECTIVE","successCheck":"ok"}`),
+			finishChunk("tool_calls"),
+		)},
+		gatewayResponse{body: sse(
+			toolCallChunk(0, "call-2", toolShell, `{"command":"echo hi"}`),
+			finishChunk("tool_calls"),
+		)},
+		gatewayResponse{body: sse(contentChunk("the actual delegate summary"), finishChunk("stop"))},
+		gatewayResponse{body: sse(contentChunk(`{"outcome":"changes"}`), finishChunk("stop"))},
+	)
+	defer cleanup()
+	publisher := &mockPublisher{}
+	coordinator, err := NewCoordinator(CoordinatorConfig{
+		Gateway:   gateway,
+		Bindings:  testBindings(),
+		Worker:    delegator,
+		Snapshot:  func(context.Context) ([]byte, error) { return []byte("s"), nil },
+		Publisher: publisher,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	result := coordinator.Run(context.Background(), testInvocation())
+	if result.Outcome != executor.OutcomeChanges {
+		t.Fatalf("outcome = %q (%v)", result.Outcome, result.Err)
+	}
+	if len(publisher.plans) != 1 || len(publisher.plans[0].Briefs) != 1 {
+		t.Fatalf("published plan = %+v", publisher.plans)
+	}
+	retained := publisher.plans[0].Briefs[0]
+	if retained.BriefID != "b1" || retained.Summary != "the actual delegate summary" {
+		t.Fatalf("retained result = %+v, want the delegate's actual summary", retained)
+	}
+}
+
+// Verified tool completions are emitted as KindToolResult events — the §5
+// vocabulary is real, not declared-but-dead.
+func TestToolResultEventsAreEmitted(t *testing.T) {
+	worker, delegator, cleanupWorker := testWorkerAndDelegator(t)
+	defer cleanupWorker()
+	worker.completeAll = true
+	gateway, _, cleanup := gatewayFor(
+		gatewayResponse{body: sse(
+			toolCallChunk(0, "call-1", toolDelegate, `{"id":"b1","role":"coder","objective":"Work","successCheck":"ok"}`),
+			finishChunk("tool_calls"),
+		)},
+		gatewayResponse{body: sse(
+			toolCallChunk(0, "call-2", toolShell, `{"command":"echo hi"}`),
+			finishChunk("tool_calls"),
+		)},
+		gatewayResponse{body: sse(contentChunk("done"), finishChunk("stop"))},
+		gatewayResponse{body: sse(contentChunk(`{"outcome":"blocked_external","missing":"x"}`), finishChunk("stop"))},
+	)
+	defer cleanup()
+	coordinator, err := NewCoordinator(CoordinatorConfig{
+		Gateway:  gateway,
+		Bindings: testBindings(),
+		Worker:   delegator,
+		Snapshot: func(context.Context) ([]byte, error) { return []byte("s"), nil },
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Drive the coordinator loop; the pump emits tool-result events for the
+	// shell execution and the coordinator turn.
+	session, err := NewSession(gateway, testBindings(), RoleCoordinator, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	turn := coordinator.pump(context.Background(), session, "", coordinator.coordinatorTools())
+	if turn.streamErr != nil || turn.final {
+		t.Fatalf("first turn = %+v", turn)
+	}
+	if len(turn.toolResults) != 1 || turn.toolResults[0].Kind != KindToolResult {
+		t.Fatalf("tool-result events = %+v, want one emitted KindToolResult", turn.toolResults)
+	}
+	if turn.toolResults[0].Result.Content == "" {
+		t.Fatal("the emitted tool result carries no content")
+	}
 }

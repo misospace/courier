@@ -466,6 +466,7 @@ func (s *SecureControl) Revoke(ctx context.Context, run *courier.CoderRun) (bool
 		secretObject(namespace, topology.SigningSecretName(runName)),
 		secretObject(namespace, topology.PolicySecretName(runName)),
 		secretObject(namespace, topology.CredentialsSecretName(runName)),
+		secretObject(namespace, topology.GatewaySecretName(runName)),
 		topology.WorkerService(run),
 		saObject(namespace, topology.ControlSAName(runName)),
 		saObject(namespace, topology.BrokerSAName(runName)),

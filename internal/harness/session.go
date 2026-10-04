@@ -119,8 +119,7 @@ func (s *Session) Turn(ctx context.Context, tools []ToolDef) []Event {
 			s.recordActivity(events)
 			return events
 		}
-		var gatewayErr *GatewayError
-		if !errors.As(terminal.Err, &gatewayErr) || !isTransientGatewayStatus(gatewayErr.Status) || attempt >= maxStreamRetries {
+		if !retryableTurnError(terminal.Err) || attempt >= maxStreamRetries {
 			return events
 		}
 		// Infra retry backoff: bounded, transport-class, not a model cap.
@@ -130,6 +129,17 @@ func (s *Session) Turn(ctx context.Context, tools []ToolDef) []Event {
 		case <-time.After(retryBackoff):
 		}
 	}
+}
+
+// retryableTurnError reports whether a terminal stream error is transient:
+// transport-class failures and retryable gateway statuses.
+func retryableTurnError(err error) bool {
+	var transportErr *GatewayTransportError
+	if errors.As(err, &transportErr) {
+		return true
+	}
+	var gatewayErr *GatewayError
+	return errors.As(err, &gatewayErr) && isTransientGatewayStatus(gatewayErr.Status)
 }
 
 // recordActivity marks earned stream activity once per successful turn that

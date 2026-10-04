@@ -109,18 +109,41 @@ func isBriefID(id string) bool {
 // execution per brief ID, cancellation final — any later dispatch or retry
 // with a cancelled ID is rejected regardless of what any worker saw.
 type BriefRegistry struct {
-	mu     sync.Mutex
-	briefs map[string]Brief
-	order  []string
-	tombs  map[string]struct{}
+	mu      sync.Mutex
+	briefs  map[string]Brief
+	order   []string
+	tombs   map[string]struct{}
+	results map[string]BriefResult
 }
 
 // NewBriefRegistry returns an empty ledger.
 func NewBriefRegistry() *BriefRegistry {
 	return &BriefRegistry{
-		briefs: make(map[string]Brief),
-		tombs:  make(map[string]struct{}),
+		briefs:  make(map[string]Brief),
+		tombs:   make(map[string]struct{}),
+		results: make(map[string]BriefResult),
 	}
+}
+
+// RecordResult binds the delegate's actual result to its stable brief ID.
+// The result is untrusted data retained for the coordinator's own
+// publication plan; recording it never advances any status.
+func (r *BriefRegistry) RecordResult(briefID string, result BriefResult) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if _, ok := r.briefs[briefID]; !ok {
+		return
+	}
+	result.BriefID = briefID
+	r.results[briefID] = result
+}
+
+// Result returns the recorded result for a brief, if any.
+func (r *BriefRegistry) Result(briefID string) (BriefResult, bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	result, ok := r.results[briefID]
+	return result, ok
 }
 
 // Register records a new brief. A duplicate ID is rejected without any
