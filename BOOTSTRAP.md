@@ -150,6 +150,14 @@ helm dependency build charts/courier
 helm install courier charts/courier --namespace courier-system --create-namespace
 ```
 
+Applying the LaneProfile directly works once the CRD is established; the
+GitOps-safe path is the manager's bootstrap config file
+(`--bootstrap-lane-profiles-file`, with profiles labeled
+`courier.misospace.dev/bootstrap-managed`), which the manager creates and
+updates itself after install. Chart plumbing for the file lands with
+follow-up work (#74). A bad config file at startup prevents the manager from
+starting; a bad edit afterwards is logged and retried on the next pass.
+
 ```yaml
 apiVersion: courier.misospace.dev/v1alpha1
 kind: LaneProfile
