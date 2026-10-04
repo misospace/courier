@@ -36,12 +36,50 @@ func (g *Gateway) client() *http.Client {
 
 // Message is one conversation message in the normalized transcript. Role is
 // the OpenAI-compatible role vocabulary; tool results ride in Role "tool"
-// with ToolCallID set.
+// with ToolCallID set, and an assistant's own tool requests ride in
+// ToolCalls. Messages are never marshaled directly: toWireMessages renders
+// them in the OpenAI-compatible request shape.
 type Message struct {
-	Role       string     `json:"role"`
-	Content    string     `json:"content,omitempty"`
+	Role    string `json:"role"`
+	Content string `json:"content,omitempty"`
+	// ToolCallID links a Role "tool" message to the request it answers.
 	ToolCallID string     `json:"tool_call_id,omitempty"`
-	ToolCalls  []ToolCall `json:"toolCalls,omitempty"`
+	ToolCalls  []ToolCall `json:"-"`
+}
+
+// wireMessage is the OpenAI-compatible request shape of one transcript
+// message. Assistant tool requests serialize as tool_calls with function
+// objects — the shape every OpenAI-compatible gateway accepts — and tool
+// results carry tool_call_id.
+type wireMessage struct {
+	Role       string                  `json:"role"`
+	Content    string                  `json:"content,omitempty"`
+	ToolCallID string                  `json:"tool_call_id,omitempty"`
+	ToolCalls  []wireAssistantToolCall `json:"tool_calls,omitempty"`
+}
+
+type wireAssistantToolCall struct {
+	ID       string `json:"id"`
+	Type     string `json:"type"`
+	Function struct {
+		Name      string `json:"name"`
+		Arguments string `json:"arguments"`
+	} `json:"function"`
+}
+
+func toWireMessages(messages []Message) []wireMessage {
+	out := make([]wireMessage, 0, len(messages))
+	for _, message := range messages {
+		wire := wireMessage{Role: message.Role, Content: message.Content, ToolCallID: message.ToolCallID}
+		for _, call := range message.ToolCalls {
+			entry := wireAssistantToolCall{ID: call.ID, Type: "function"}
+			entry.Function.Name = call.Name
+			entry.Function.Arguments = call.Arguments
+			wire.ToolCalls = append(wire.ToolCalls, entry)
+		}
+		out = append(out, wire)
+	}
+	return out
 }
 
 // ToolDef declares one tool the model may request. Only trusted control
@@ -62,10 +100,10 @@ type ChatRequest struct {
 }
 
 type wireRequest struct {
-	Model    string     `json:"model"`
-	Messages []Message  `json:"messages"`
-	Tools    []wireTool `json:"tools,omitempty"`
-	Stream   bool       `json:"stream"`
+	Model    string        `json:"model"`
+	Messages []wireMessage `json:"messages"`
+	Tools    []wireTool    `json:"tools,omitempty"`
+	Stream   bool          `json:"stream"`
 }
 
 type wireTool struct {
@@ -83,7 +121,7 @@ type wireTool struct {
 func (g *Gateway) StreamChat(ctx context.Context, req ChatRequest) ([]Event, error) {
 	body, err := json.Marshal(wireRequest{
 		Model:    req.Model,
-		Messages: req.Messages,
+		Messages: toWireMessages(req.Messages),
 		Tools:    toolsToWire(req.Tools),
 		Stream:   true,
 	})
@@ -146,11 +184,11 @@ func httpStatusCategory(status int) string {
 }
 
 // isTransientGatewayStatus reports whether a gateway status is worth
-// retrying in-process. Client-class rejections are configuration problems
-// that retrying cannot fix; the rest are gateway-side and transient.
+// retrying in-process: gateway-side failures (5xx) and the two explicitly
+// retryable client statuses (request timeout, rate limit). Every other 4xx
+// is a configuration or request-shape problem that retrying cannot fix.
 func isTransientGatewayStatus(status int) bool {
-	return status != http.StatusUnauthorized && status != http.StatusForbidden &&
-		status != http.StatusNotFound && status != http.StatusBadRequest
+	return status >= 500 || status == http.StatusRequestTimeout || status == http.StatusTooManyRequests
 }
 
 func toolsToWire(tools []ToolDef) []wireTool {
@@ -235,9 +273,9 @@ func normalizeStream(body io.Reader) ([]Event, error) {
 			return streamError(events, fmt.Errorf("harness: gateway reported stream error (%s)", strings.TrimSpace(chunk.Error.Type)))
 		}
 		for _, choice := range chunk.Choices {
-			if choice.Index > 0 {
-				// Requests carry n=1 implicitly; an extra choice is a wire
-				// shape this normalizer does not represent. Fail closed.
+			if choice.Index != 0 {
+				// Requests carry n=1 implicitly; any other choice index is a
+				// wire shape this normalizer does not represent. Fail closed.
 				return streamError(events, fmt.Errorf("harness: unexpected stream choice index %d", choice.Index))
 			}
 			if choice.Delta.Content != "" {

@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -21,8 +22,9 @@ import (
 // --- scripted model gateway ----------------------------------------------
 
 type chatRecord struct {
-	model    string
-	messages []Message
+	model     string
+	rawBody   string
+	toolNames []string
 }
 
 type gatewayResponse struct {
@@ -39,12 +41,21 @@ type mockGateway struct {
 func (m *mockGateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	raw, err := io.ReadAll(r.Body)
+	if err != nil {
+		http.Error(w, "unreadable", http.StatusBadRequest)
+		return
+	}
 	var req wireRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	if err := json.Unmarshal(raw, &req); err != nil {
 		http.Error(w, "bad request", http.StatusBadRequest)
 		return
 	}
-	m.calls = append(m.calls, chatRecord{model: req.Model, messages: req.Messages})
+	var toolNames []string
+	for _, tool := range req.Tools {
+		toolNames = append(toolNames, tool.Function.Name)
+	}
+	m.calls = append(m.calls, chatRecord{model: req.Model, rawBody: string(raw), toolNames: toolNames})
 	if len(m.script) == 0 {
 		http.Error(w, "unexpected call", http.StatusInternalServerError)
 		return
@@ -125,7 +136,10 @@ type mockWorker struct {
 	// or not: after an ambiguous failure the question is whether the worker
 	// saw a second attempt.
 	dispatchRequests int
-	results          map[string]protocol.ResultState
+	// resultFailures makes that many result polls fail with 503 before the
+	// scripted state is served.
+	resultFailures int
+	results        map[string]protocol.ResultState
 }
 
 func (m *mockWorker) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -206,9 +220,15 @@ func (m *mockWorker) handleCancel(w http.ResponseWriter, r *http.Request) {
 }
 
 func (m *mockWorker) handleResult(w http.ResponseWriter, r *http.Request) {
-	opID := strings.TrimSuffix(strings.TrimPrefix(r.URL.Path, "/v1/tasks/"), "/result")
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	if m.resultFailures > 0 {
+		m.resultFailures--
+		w.WriteHeader(http.StatusServiceUnavailable)
+		fmt.Fprint(w, "poll failed transiently")
+		return
+	}
+	opID := strings.TrimSuffix(strings.TrimPrefix(r.URL.Path, "/v1/tasks/"), "/result")
 	state, ok := m.results[opID]
 	if !ok {
 		http.NotFound(w, r)
@@ -293,7 +313,7 @@ func shellCall(command string) ToolCall {
 	return ToolCall{ID: "call-shell", Name: toolShell, Arguments: fmt.Sprintf(`{"command":%q}`, command)}
 }
 
-func testWorkerAndDelegator(t *testing.T, scriptResults bool) (*mockWorker, *Delegator, func()) {
+func testWorkerAndDelegator(t *testing.T) (*mockWorker, *Delegator, func()) {
 	t.Helper()
 	pub, priv, err := protocol.GenerateKey()
 	if err != nil {
@@ -307,7 +327,6 @@ func testWorkerAndDelegator(t *testing.T, scriptResults bool) (*mockWorker, *Del
 	if err != nil {
 		t.Fatal(err)
 	}
-	_ = scriptResults
 	return worker, delegator, server.Close
 }
 
@@ -491,19 +510,26 @@ func TestDuplicateBriefIsRejectedWithoutWorkerContact(t *testing.T) {
 	)}
 	gateway, _, cleanup := gatewayFor(
 		delegateOK,
+		// The first brief really executes: its subagent runs one shell task.
+		gatewayResponse{body: sse(
+			toolCallChunk(0, "call-2", toolShell, `{"command":"echo work"}`),
+			finishChunk("tool_calls"),
+		)},
 		gatewayResponse{body: sse(contentChunk("work done"), finishChunk("stop"))},
 		delegateOK, // duplicate brief ID
 		gatewayResponse{body: sse(contentChunk(`{"outcome":"blocked_external","missing":"x"}`), finishChunk("stop"))},
 	)
 	defer cleanup()
-	worker, delegator, cleanupWorker := testWorkerAndDelegator(t, false)
+	worker, delegator, cleanupWorker := testWorkerAndDelegator(t)
 	defer cleanupWorker()
+	worker.completeAll = true
 	publisher := &mockPublisher{}
 	coordinator, err := NewCoordinator(CoordinatorConfig{
 		Gateway:   gateway,
 		Bindings:  testBindings(),
 		Worker:    delegator,
 		Publisher: publisher,
+		Snapshot:  func(context.Context) ([]byte, error) { return []byte("s"), nil },
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -512,10 +538,13 @@ func TestDuplicateBriefIsRejectedWithoutWorkerContact(t *testing.T) {
 	if result.Outcome != executor.OutcomeBlockedExternal {
 		t.Fatalf("outcome = %q (%v)", result.Outcome, result.Err)
 	}
-	// The duplicate was refused at the ledger before any worker contact, and
-	// the ledger holds exactly one entry.
-	if got := worker.dispatchCount(); got != 0 {
-		t.Fatalf("worker dispatches = %d, want 0", got)
+	// The first brief's shell dispatched exactly once; the duplicate was
+	// refused at the ledger before any second worker contact.
+	if got := worker.dispatchCount(); got != 1 {
+		t.Fatalf("worker dispatches = %d, want 1", got)
+	}
+	if got := worker.dispatchRequests; got != 1 {
+		t.Fatalf("worker dispatch requests = %d, want 1", got)
 	}
 	briefs := coordinator.Briefs().BriefIDs()
 	if len(briefs) != 1 || briefs[0] != "b1" {
@@ -744,6 +773,7 @@ func TestOptionalRoleDegradedDoesNotGate(t *testing.T) {
 			return nil
 		},
 		PublicationPresent: true,
+		SnapshotPresent:    true,
 	}
 	caps := ProbeCapabilities(context.Background(), deps)
 	if _, err := Gate(caps); err != nil {
@@ -771,7 +801,7 @@ func findCapability(caps []Capability, name string) (Capability, bool) {
 // --- coordinator: subagents route through the worker and cannot publish ----
 
 func TestSubagentShellRoutesThroughWorkerAndOnlyControlPublishes(t *testing.T) {
-	worker, delegator, cleanupWorker := testWorkerAndDelegator(t, true)
+	worker, delegator, cleanupWorker := testWorkerAndDelegator(t)
 	defer cleanupWorker()
 	worker.completeAll = true
 
@@ -846,7 +876,7 @@ func TestSubagentShellRoutesThroughWorkerAndOnlyControlPublishes(t *testing.T) {
 }
 
 func TestWorkerPublicationClaimWithoutDeclaredChangesNeverPublishes(t *testing.T) {
-	worker, delegator, cleanupWorker := testWorkerAndDelegator(t, true)
+	worker, delegator, cleanupWorker := testWorkerAndDelegator(t)
 	defer cleanupWorker()
 	worker.completeAll = true
 	gateway, _, cleanup := gatewayFor(
@@ -953,4 +983,271 @@ func TestDelegatorEndToEndWithRealWorker(t *testing.T) {
 	if _, err := delegator.Dispatch(ctx, opID, "b1", protocol.Task{Command: []string{"true"}}); err == nil {
 		t.Fatal("redispatch of a live opID must be rejected")
 	}
+}
+
+// --- review-round regressions ----------------------------------------------
+
+// The outbound transcript must serialize assistant tool requests in the
+// OpenAI-compatible tool_calls shape; a wrong shape loses the
+// request/result linkage at real gateways and is invisible to a mock that
+// decodes into the same Go structs.
+func TestOutboundToolCallsUseOpenAIWireShape(t *testing.T) {
+	gateway, mocker, cleanup := gatewayFor(
+		gatewayResponse{body: sse(
+			toolCallChunk(0, "call-1", "shell", `{"command":"ls"}`),
+			finishChunk("tool_calls"),
+		)},
+		gatewayResponse{body: sse(contentChunk(`{"outcome":"blocked_external","missing":"x"}`), finishChunk("stop"))},
+	)
+	defer cleanup()
+	// Drive one turn by hand so the transcript contains an assistant turn
+	// with tool requests followed by a tool result.
+	session, err := NewSession(gateway, testBindings(), RoleCoordinator, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	events := session.Turn(context.Background(), nil)
+	var calls []ToolCall
+	for _, event := range events {
+		if event.Kind == KindToolRequest {
+			calls = append(calls, event.Tool)
+		}
+	}
+	session.Append(AssistantMessage("working", calls))
+	session.Append(ToolResultMessage(ToolResult{ToolCallID: "call-1", Name: "shell", Content: "out"}))
+	session.Turn(context.Background(), nil)
+
+	if len(mocker.calls) != 2 {
+		t.Fatalf("gateway requests = %d, want 2", len(mocker.calls))
+	}
+	body := mocker.calls[1].rawBody
+	if !strings.Contains(body, `"tool_calls":[{"id":"call-1","type":"function","function":{"name":"shell"`) {
+		t.Fatalf("second request does not carry the OpenAI tool_calls shape: %s", body)
+	}
+	if !strings.Contains(body, `"tool_call_id":"call-1"`) {
+		t.Fatalf("tool result message lost its tool_call_id linkage: %s", body)
+	}
+	if strings.Contains(body, `"toolCalls"`) {
+		t.Fatalf("request leaks the internal toolCalls field: %s", body)
+	}
+}
+
+// The coordinator declares delegation tools; subagent sessions must not.
+func TestToolDeclarationsMatchSessionContext(t *testing.T) {
+	worker, delegator, cleanupWorker := testWorkerAndDelegator(t)
+	defer cleanupWorker()
+	worker.completeAll = true
+	gateway, mocker, cleanup := gatewayFor(
+		// Coordinator: delegate.
+		gatewayResponse{body: sse(
+			toolCallChunk(0, "call-1", toolDelegate, `{"id":"b1","role":"coder","objective":"Work","successCheck":"ok"}`),
+			finishChunk("tool_calls"),
+		)},
+		// Coder: shell.
+		gatewayResponse{body: sse(
+			toolCallChunk(0, "call-2", toolShell, `{"command":"echo hi"}`),
+			finishChunk("tool_calls"),
+		)},
+		// Coder: done.
+		gatewayResponse{body: sse(contentChunk("done"), finishChunk("stop"))},
+		// Coordinator: undeclared ending is fine; the assertions below are
+		// about declarations.
+		gatewayResponse{body: sse(contentChunk(`{"outcome":"blocked_external","missing":"x"}`), finishChunk("stop"))},
+	)
+	defer cleanup()
+	coordinator, err := NewCoordinator(CoordinatorConfig{
+		Gateway: gateway, Bindings: testBindings(), Worker: delegator,
+		Snapshot: func(context.Context) ([]byte, error) { return []byte("s"), nil },
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	coordinator.Run(context.Background(), testInvocation())
+
+	coordinatorTools := mocker.calls[0].toolNames
+	if !contains(coordinatorTools, toolDelegate) || !contains(coordinatorTools, toolCancelBrief) || !contains(coordinatorTools, toolShell) {
+		t.Fatalf("coordinator toolset = %v, want delegate, cancel_brief, shell", coordinatorTools)
+	}
+	subagentTools := mocker.calls[1].toolNames
+	if contains(subagentTools, toolDelegate) || contains(subagentTools, toolCancelBrief) {
+		t.Fatalf("subagent toolset leaks privileged tools: %v", subagentTools)
+	}
+}
+
+func contains(values []string, want string) bool {
+	for _, value := range values {
+		if value == want {
+			return true
+		}
+	}
+	return false
+}
+
+// A prompt-injected subagent emitting privileged tool names gets refusals,
+// never nested delegation or cross-brief tombstones.
+func TestSubagentCannotDelegateOrCancel(t *testing.T) {
+	coordinator, err := NewCoordinator(CoordinatorConfig{
+		Gateway:  &Gateway{BaseURL: "http://unused.invalid"},
+		Bindings: testBindings(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := coordinator.briefs.Register(Brief{ID: "b1", Role: "coder", Objective: "o", SuccessCheck: "s"}); err != nil {
+		t.Fatal(err)
+	}
+	delegateResult := coordinator.runTool(context.Background(), delegateCall("b2", "coder"), "b1")
+	if !delegateResult.IsError || !strings.Contains(delegateResult.Content, "not available to sub-agents") {
+		t.Fatalf("subagent delegate result = %+v", delegateResult)
+	}
+	cancelResult := coordinator.runTool(context.Background(), ToolCall{ID: "c2", Name: toolCancelBrief, Arguments: `{"id":"b1"}`}, "b1")
+	if !cancelResult.IsError || !strings.Contains(cancelResult.Content, "not available to sub-agents") {
+		t.Fatalf("subagent cancel result = %+v", cancelResult)
+	}
+	if coordinator.Briefs().Cancelled("b1") {
+		t.Fatal("a subagent must not be able to tombstone a brief")
+	}
+	if len(coordinator.Briefs().BriefIDs()) != 1 {
+		t.Fatal("a subagent must not be able to register a brief")
+	}
+}
+
+// A stream that emitted deltas and then failed is a failed stream: it earns
+// no activity, and its transient retry does not either.
+func TestFailedStreamWithPartialDeltasEarnsNoActivity(t *testing.T) {
+	gateway, _, cleanup := gatewayFor(
+		gatewayResponse{body: sse(contentChunk("partial thought"), contentChunk(" more"), contentChunk(" still more"))},
+		gatewayResponse{body: sse(contentChunk("done"), finishChunk("stop"))},
+	)
+	defer cleanup()
+	activity := &recordingActivity{}
+	session, err := NewSession(gateway, testBindings(), RoleCoordinator, activity)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The first stream truncates (no finish reason): deltas arrived but the
+	// turn failed.
+	events := session.Turn(context.Background(), nil)
+	if last := events[len(events)-1]; last.Kind != KindError {
+		t.Fatalf("terminal event = %+v, want error", last)
+	}
+	if activity.count("stream") != 0 {
+		t.Fatalf("a failed stream with partial deltas earned activity %d times", activity.count("stream"))
+	}
+	events = session.Turn(context.Background(), nil)
+	if last := events[len(events)-1]; last.Kind != KindFinal {
+		t.Fatalf("terminal event = %+v, want final", last)
+	}
+	if activity.count("stream") != 1 {
+		t.Fatalf("the successful retry earned %d stream events, want 1", activity.count("stream"))
+	}
+}
+
+// A result poll that fails transiently must not abandon a live operation:
+// control reconciles through cancellation before giving up.
+func TestResultPollFailureReconciles(t *testing.T) {
+	pub, priv, err := protocol.GenerateKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	worker := &mockWorker{
+		key:            pub,
+		completeAll:    true,
+		resultFailures: 1,
+		results:        map[string]protocol.ResultState{},
+	}
+	server := httptest.NewServer(worker)
+	defer server.Close()
+	delegator, err := NewDelegator(&protocol.Client{BaseURL: server.URL}, WorkerIdentity{
+		RunUID: "run", ControlPodUID: "control", WorkerPodUID: "worker", Key: priv,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	coordinator, err := NewCoordinator(CoordinatorConfig{
+		Gateway:  &Gateway{BaseURL: "http://unused.invalid"},
+		Bindings: testBindings(),
+		Worker:   delegator,
+		Snapshot: func(context.Context) ([]byte, error) { return []byte("s"), nil },
+		Activity: &recordingActivity{},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := coordinator.dispatchAndAwait(context.Background(), "shell.b1.test", "b1", protocol.Task{Command: []string{"true"}})
+	if err != nil {
+		t.Fatalf("dispatchAndAwait after a failed poll = %v", err)
+	}
+	if result.ExitCode != 0 {
+		t.Fatalf("reconciled result = %+v", result)
+	}
+	if got := worker.cancelCount(); got != 1 {
+		t.Fatalf("reconciling cancels = %d, want 1", got)
+	}
+}
+
+// A transient snapshot upload failure must not be cached for the pod's life:
+// the next task retries the upload and proceeds.
+func TestSnapshotTransientFailureIsRetried(t *testing.T) {
+	worker, delegator, cleanupWorker := testWorkerAndDelegator(t)
+	defer cleanupWorker()
+	worker.completeAll = true
+	gateway, _, cleanup := gatewayFor(
+		// Coordinator: shell; snapshot upload fails once, then succeeds.
+		gatewayResponse{body: sse(
+			toolCallChunk(0, "call-1", toolShell, `{"command":"echo one"}`),
+			finishChunk("tool_calls"),
+		)},
+		gatewayResponse{body: sse(
+			toolCallChunk(0, "call-2", toolShell, `{"command":"echo two"}`),
+			finishChunk("tool_calls"),
+		)},
+		gatewayResponse{body: sse(contentChunk(`{"outcome":"blocked_external","missing":"x"}`), finishChunk("stop"))},
+	)
+	defer cleanup()
+	attempts := 0
+	coordinator, err := NewCoordinator(CoordinatorConfig{
+		Gateway:  gateway,
+		Bindings: testBindings(),
+		Worker:   delegator,
+		Snapshot: func(context.Context) ([]byte, error) {
+			attempts++
+			if attempts == 1 {
+				return nil, errors.New("snapshot render failed transiently")
+			}
+			return []byte("snapshot"), nil
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	result := coordinator.Run(context.Background(), testInvocation())
+	if result.Outcome != executor.OutcomeBlockedExternal {
+		t.Fatalf("outcome = %q (%v)", result.Outcome, result.Err)
+	}
+	// The first shell failed at the snapshot and dispatched nothing; the
+	// second retried the upload and dispatched — the failure was not cached.
+	if worker.dispatchCount() != 1 {
+		t.Fatalf("worker dispatches = %d, want 1 (the second task retried the snapshot)", worker.dispatchCount())
+	}
+	if worker.snapshots != 1 {
+		t.Fatalf("snapshot uploads = %d, want 1", worker.snapshots)
+	}
+}
+
+// Oversized artifacts are bounded at the transcript boundary; bulk artifact
+// handling stays with trusted validation (#125).
+func TestOversizedArtifactIsNotInlined(t *testing.T) {
+	result := workerResultToTool(protocol.Result{
+		Status:   protocol.ResultCompleted,
+		ExitCode: 0,
+		Artifact: make([]byte, maxInlineArtifactBytes+1),
+	}, ToolResult{ToolCallID: "c", Name: toolShell})
+	if result.IsError {
+		t.Fatal("a successful task with a large artifact is not an error")
+	}
+	if strings.Contains(result.Content, "not inlined") {
+		return
+	}
+	t.Fatal("oversized artifact was inlined into the transcript")
 }

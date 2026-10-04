@@ -35,6 +35,28 @@ type termination struct {
 	Reason   string `json:"reason"`
 }
 
+// Probe retry rounds and delay are bounded infrastructure retries covering a
+// dependency that is still starting (the broker pod is created before
+// control). They are not run-duration limits: persistent failure after the
+// rounds declares NeedsHuman with the capability table.
+const (
+	probeRetryRounds = 5
+	probeRetryDelay  = 10 * time.Second
+)
+
+// maxTerminationReasonBytes bounds the termination reason. The kubelet caps
+// termination message files, and an oversized payload would truncate the
+// structured result; the reason carries names, categories, and short
+// diagnostics, never full model output.
+const maxTerminationReasonBytes = 1200
+
+func boundReason(reason string) string {
+	if len(reason) <= maxTerminationReasonBytes {
+		return reason
+	}
+	return reason[:maxTerminationReasonBytes] + "…[truncated]"
+}
+
 func main() {
 	if err := runArgs(os.Args[1:]); err != nil {
 		fmt.Fprintf(os.Stderr, "courier-control: %v\n", err)
@@ -73,27 +95,46 @@ func runArgs(args []string) error {
 
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
 	defer cancel()
-	probeCtx, cancelProbe := context.WithTimeout(ctx, probeTimeout)
-	defer cancelProbe()
 
 	// Startup capability health (§5): every semantic capability the harness
 	// depends on is probed and named. Required and unavailable fails closed
 	// before any model work starts; optional capabilities proceed degraded.
-	caps := harness.ProbeCapabilities(probeCtx, harness.ProbeDeps{
+	// Transient probe failures (a broker pod still starting, one gateway
+	// hiccup) are re-probed for bounded rounds before declaring, so a
+	// slow-to-start dependency does not park the run with a human.
+	deps := harness.ProbeDeps{
 		Gateway:            gateway,
 		Bindings:           bindings,
 		Broker:             identity.brokerProber(),
 		Mode:               string(invocation.Mode),
 		PublicationPresent: false, // the publisher lands with #125
+		SnapshotPresent:    false, // the snapshot provider lands with #125
 		ProbeWorker: func(probeCtx context.Context) harness.Capability {
 			return identity.probeWorker(probeCtx)
 		},
 		ModelProbe: func(probeCtx context.Context, model string) error {
 			return probeModel(probeCtx, gateway, model)
 		},
-	})
-	if _, err := harness.Gate(caps); err != nil {
-		return declareNeedsHuman(err.Error(), caps)
+	}
+	var caps []harness.Capability
+	for attempt := 0; ; attempt++ {
+		probeCtx, cancelProbe := context.WithTimeout(ctx, probeTimeout)
+		caps = harness.ProbeCapabilities(probeCtx, deps)
+		cancelProbe()
+		_, err := harness.Gate(caps)
+		if err == nil {
+			break
+		}
+		var gateErr *harness.GateError
+		if !errors.As(err, &gateErr) || !gateErr.AllRetryable() || attempt >= probeRetryRounds {
+			return declareNeedsHuman(gateErr.Error(), caps)
+		}
+		fmt.Printf("transient capability failure, re-probing: %s\n", gateErr)
+		select {
+		case <-ctx.Done():
+			return declareNeedsHuman(gateErr.Error(), caps)
+		case <-time.After(probeRetryDelay):
+		}
 	}
 	fmt.Printf("capability health: %s\n", mustJSON(caps))
 
@@ -143,7 +184,7 @@ func declare(result executor.HarnessResult) error {
 		Phase:    phase,
 		Result:   declared,
 		ExitCode: exit,
-		Reason:   reason,
+		Reason:   boundReason(reason),
 	})
 	if err != nil {
 		return err
@@ -167,7 +208,7 @@ func declareNeedsHuman(reason string, caps []harness.Capability) error {
 		Phase:    "NeedsHuman",
 		Result:   "needs-human",
 		ExitCode: 2,
-		Reason:   reason,
+		Reason:   boundReason(reason),
 	})
 	if err != nil {
 		return err
@@ -259,7 +300,9 @@ func (i *controlIdentity) brokerProber() *harness.BrokerProbeClient {
 func (i *controlIdentity) probeWorker(ctx context.Context) harness.Capability {
 	client := &protocol.Client{BaseURL: i.workerURL}
 	if err := client.UploadSnapshot(ctx, []byte("courier-control capability probe")); err != nil {
-		return harness.Capability{Name: "worker-protocol", State: harness.StateUnavailable, Detail: "snapshot upload failed", Required: true}
+		capability := harness.Capability{Name: "worker-protocol", State: harness.StateUnavailable, Detail: "snapshot upload failed", Required: true}
+		capability.Retryable = true
+		return capability
 	}
 	task, err := json.Marshal(protocol.Task{Command: []string{"git", "--version"}})
 	if err != nil {
@@ -306,6 +349,10 @@ func probeModel(ctx context.Context, gateway *harness.Gateway, model string) err
 	}
 	for _, event := range events {
 		if event.Kind == harness.KindError {
+			var gatewayErr *harness.GatewayError
+			if errors.As(event.Err, &gatewayErr) && gatewayErr.Status >= 500 {
+				return &harness.ProbeRetryable{Err: event.Err}
+			}
 			return event.Err
 		}
 	}

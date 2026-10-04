@@ -83,10 +83,15 @@ func (b Brief) Validate() error {
 	return nil
 }
 
+// maxBriefIDLength caps brief IDs so composed operation IDs
+// ("<kind>.<briefID>.<nonce>") stay within the worker protocol's 128-byte
+// single path segment bound: "shell." (6) + 96 + "." (1) + 16 hex = 119.
+const maxBriefIDLength = 96
+
 // isBriefID reports whether the ID is a non-empty single URL path segment
-// from a conservative alphabet.
+// from a conservative alphabet, short enough to compose into operation IDs.
 func isBriefID(id string) bool {
-	if id == "" || len(id) > 128 {
+	if id == "" || len(id) > maxBriefIDLength {
 		return false
 	}
 	for _, r := range id {

@@ -13,8 +13,9 @@ import (
 	"time"
 )
 
-// Capability states (HARNESS.md §5): configured (declared and in use),
-// healthy (probed and working), unavailable (probed and not usable).
+// Capability states (HARNESS.md §5): configured (declared and in use, not
+// probed — never emitted for a required capability), healthy (probed and
+// working), unavailable (probed and not usable).
 const (
 	StateConfigured  = "configured"
 	StateHealthy     = "healthy"
@@ -33,6 +34,10 @@ type Capability struct {
 	// the run proceeds degraded — capability health never silently drops a
 	// degraded state, and never hard-gates an optional tool.
 	Required bool `json:"required"`
+	// Retryable marks an unavailable state caused by a transient transport
+	// or availability failure (a broker still starting, one gateway hiccup):
+	// re-probing can fix it. Non-retryable unavailability is configuration.
+	Retryable bool `json:"retryable,omitempty"`
 }
 
 // healthy/unavailable helpers keep state spellings in one place.
@@ -42,6 +47,55 @@ func healthy(name string, required bool) Capability {
 
 func unavailable(name string, required bool, detail string) Capability {
 	return Capability{Name: name, State: StateUnavailable, Detail: detail, Required: required}
+}
+
+func unavailableRetryable(name string, required bool, detail string) Capability {
+	return Capability{Name: name, State: StateUnavailable, Detail: detail, Required: required, Retryable: true}
+}
+
+// unavailableClassified emits an unavailable required capability carrying the
+// probe's retryability class.
+func unavailableClassified(name, detail string, retryable bool) Capability {
+	capability := unavailable(name, true, detail)
+	capability.Retryable = retryable
+	return capability
+}
+
+// BrokerProbeError carries a capability-read failure class. Transport-class
+// failures are retryable; identity and request-shape failures are not.
+type BrokerProbeError struct {
+	Msg       string
+	Retryable bool
+}
+
+func (e *BrokerProbeError) Error() string { return e.Msg }
+
+// ProbeRetryable marks a probe error as transient: re-probing can succeed.
+type ProbeRetryable struct{ Err error }
+
+func (e *ProbeRetryable) Error() string { return e.Err.Error() }
+func (e *ProbeRetryable) Unwrap() error { return e.Err }
+
+// isProbeRetryable classifies a probe error. A transient GatewayError or an
+// explicit ProbeRetryable wrapper is retryable; everything else is
+// configuration the operator must fix.
+func isProbeRetryable(err error) bool {
+	if err == nil {
+		return false
+	}
+	var retryable *ProbeRetryable
+	if errors.As(err, &retryable) {
+		return true
+	}
+	var gatewayErr *GatewayError
+	if errors.As(err, &gatewayErr) {
+		return isTransientGatewayStatus(gatewayErr.Status)
+	}
+	var brokerErr *BrokerProbeError
+	if errors.As(err, &brokerErr) {
+		return brokerErr.Retryable
+	}
+	return false
 }
 
 // BrokerProbeClient reaches the run's broker's typed API over TLS with the
@@ -72,13 +126,14 @@ type BrokerCapabilities struct {
 }
 
 // Capabilities fetches the broker's capability report. Every response class
-// maps to a fixed, safe diagnostic.
+// maps to a fixed, safe diagnostic; transport-class failures are marked
+// retryable.
 func (b *BrokerProbeClient) Capabilities(ctx context.Context) (*BrokerCapabilities, error) {
 	transport := b.HTTP
 	if transport == nil {
 		pool := x509.NewCertPool()
 		if !pool.AppendCertsFromPEM(b.CA) {
-			return nil, errors.New("broker CA is unreadable")
+			return nil, &BrokerProbeError{Msg: "broker CA is unreadable"}
 		}
 		serverName := hostOnly(b.BaseURL)
 		transport = &http.Client{
@@ -88,24 +143,27 @@ func (b *BrokerProbeClient) Capabilities(ctx context.Context) (*BrokerCapabiliti
 	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, trimSuffix(b.BaseURL, "/")+"/v1/capabilities", nil)
 	if err != nil {
-		return nil, errors.New("broker capabilities request is malformed")
+		return nil, &BrokerProbeError{Msg: "broker capabilities request is malformed"}
 	}
 	req.Header.Set("Authorization", "Bearer "+string(b.Token))
 	resp, err := transport.Do(req)
 	if err != nil {
-		return nil, errors.New("broker is unreachable")
+		return nil, &BrokerProbeError{Msg: "broker is unreachable", Retryable: true}
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("broker rejected the authenticated capabilities read with status %d", resp.StatusCode)
+		return nil, &BrokerProbeError{
+			Msg:       fmt.Sprintf("broker rejected the authenticated capabilities read with status %d", resp.StatusCode),
+			Retryable: resp.StatusCode >= 500,
+		}
 	}
 	body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 	if err != nil {
-		return nil, errors.New("broker capabilities response is unreadable")
+		return nil, &BrokerProbeError{Msg: "broker capabilities response is unreadable", Retryable: true}
 	}
 	var report BrokerCapabilities
 	if err := json.Unmarshal(body, &report); err != nil {
-		return nil, errors.New("broker capabilities response is malformed")
+		return nil, &BrokerProbeError{Msg: "broker capabilities response is malformed"}
 	}
 	return &report, nil
 }
@@ -140,6 +198,9 @@ type ProbeDeps struct {
 	// PublicationPresent reports whether this build ships a publisher. The
 	// native harness reports the seam honestly rather than pretending.
 	PublicationPresent bool
+	// SnapshotPresent reports whether the workspace snapshot seam is wired.
+	// Without it, worker execution has no workspace to run against.
+	SnapshotPresent bool
 	// ProbeWorker optionally probes the signed worker protocol end to end.
 	// The probe task is inert; a nil probe skips the capability.
 	ProbeWorker func(context.Context) Capability
@@ -171,8 +232,18 @@ func ProbeCapabilities(ctx context.Context, deps ProbeDeps) []Capability {
 	}
 	caps = append(caps, probeForge(ctx, deps)...)
 	caps = append(caps, probeModelBindings(ctx, deps)...)
-	caps = append(caps, probePublication(deps))
+	caps = append(caps, probeSnapshot(deps), probePublication(deps))
 	return caps
+}
+
+// probeSnapshot reports the workspace-snapshot seam honestly: without a
+// snapshot provider, worker execution has no workspace, and the table must
+// not say the worker path is usable when it is not.
+func probeSnapshot(deps ProbeDeps) Capability {
+	if deps.SnapshotPresent {
+		return healthy("workspace-snapshot", true)
+	}
+	return unavailable("workspace-snapshot", true, "the snapshot provider is provisioned with #125 and is not part of this build")
 }
 
 // probeForge probes broker forge operations and the git remote through one
@@ -188,9 +259,10 @@ func probeForge(ctx context.Context, deps ProbeDeps) []Capability {
 	}
 	report, err := deps.Broker.Capabilities(ctx)
 	if err != nil {
+		retryable := isProbeRetryable(err)
 		return []Capability{
-			unavailable("forge-operations", true, fmt.Sprintf("provider %s: %v", "unknown", err)),
-			unavailable("git-remote", true, err.Error()),
+			unavailableClassified("forge-operations", err.Error(), retryable),
+			unavailableClassified("git-remote", err.Error(), retryable),
 		}
 	}
 	required := requiredForgeOperations(deps.Mode)
@@ -245,7 +317,9 @@ func probeModelBindings(ctx context.Context, deps ProbeDeps) []Capability {
 	}
 	for _, role := range deps.Bindings.Roles() {
 		if err := deps.ModelProbe(ctx, deps.Bindings.Model(role)); err != nil {
-			caps = append(caps, unavailable("model-binding:"+role, role == RoleCoordinator, err.Error()))
+			capability := unavailable("model-binding:"+role, role == RoleCoordinator, err.Error())
+			capability.Retryable = isProbeRetryable(err)
+			caps = append(caps, capability)
 			continue
 		}
 		caps = append(caps, healthy("model-binding:"+role, role == RoleCoordinator))
@@ -283,14 +357,28 @@ func (e *GateError) Error() string {
 	return "required capabilities are unavailable: " + detail
 }
 
+// AllRetryable reports whether every failed capability's unavailability is
+// transient (transport, availability): re-probing after a short wait can
+// clear the gate. A single permanent failure makes the whole gate permanent.
+func (e *GateError) AllRetryable() bool {
+	for _, capability := range e.Failed {
+		if !capability.Retryable {
+			return false
+		}
+	}
+	return true
+}
+
 // Gate fails closed when a required capability is unavailable and reports
 // which optional capabilities the run will proceed without. A run proceeds
 // degraded whenever only optional capabilities are down (HARNESS.md §5:
-// "a run that can proceed does, degraded capabilities and all").
+// "a run that can proceed does, degraded capabilities and all"). A required
+// capability that is merely configured — declared but never probed — never
+// exists: probes either mark required capabilities healthy or unavailable.
 func Gate(caps []Capability) ([]Capability, error) {
 	var failed []Capability
 	for _, capability := range caps {
-		if capability.Required && capability.State != StateHealthy {
+		if capability.Required && capability.State == StateUnavailable {
 			failed = append(failed, capability)
 		}
 	}

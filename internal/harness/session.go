@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"sort"
 	"strings"
+	"time"
 )
 
 // RoleCoordinator is the one role a lane must bind: the coordinator owns the
@@ -71,6 +72,9 @@ type ActivitySink interface {
 // operator's crashloop backstop takes over, which is where stuckness belongs.
 const maxStreamRetries = 3
 
+// retryBackoff spaces out in-process infra retries.
+const retryBackoff = 250 * time.Millisecond
+
 // Session is one role-bound model conversation. It owns the normalized
 // transcript and turns provider streams into events; every message it
 // accepts or produces is data.
@@ -97,9 +101,11 @@ func (s *Session) Append(message Message) {
 
 // Turn performs one model turn: it sends the transcript with the given tool
 // declarations and returns the normalized events. Transient gateway failures
-// are retried in-process with the same transcript — a retried request is not
-// activity and never reaches the activity sink. The returned events always
-// end with a terminal event (final, tool requests, or error).
+// are retried in-process with the same transcript; a retried or failed turn
+// never reaches the activity sink — only a successfully terminalized stream
+// (final or tool requests) earns its chunks as activity (HARNESS.md §6:
+// retries are active, not alive). The returned events always end with a
+// terminal event (final, tool requests, or error).
 func (s *Session) Turn(ctx context.Context, tools []ToolDef) []Event {
 	for attempt := 0; ; attempt++ {
 		events, err := s.gateway.StreamChat(ctx, ChatRequest{Model: s.binding, Messages: s.Messages, Tools: tools})
@@ -108,23 +114,29 @@ func (s *Session) Turn(ctx context.Context, tools []ToolDef) []Event {
 			// gateway's; report it once without retry theater.
 			return []Event{{Kind: KindError, Err: err}}
 		}
-		events = s.recordActivity(events)
 		terminal := events[len(events)-1]
 		if terminal.Kind != KindError {
+			s.recordActivity(events)
 			return events
 		}
 		var gatewayErr *GatewayError
 		if !errors.As(terminal.Err, &gatewayErr) || !isTransientGatewayStatus(gatewayErr.Status) || attempt >= maxStreamRetries {
 			return events
 		}
+		// Infra retry backoff: bounded, transport-class, not a model cap.
+		select {
+		case <-ctx.Done():
+			return events
+		case <-time.After(retryBackoff):
+		}
 	}
 }
 
 // recordActivity marks earned stream activity once per successful turn that
-// produced content. Retries and errors never reach the sink.
-func (s *Session) recordActivity(events []Event) []Event {
+// produced content. Failed attempts and retries never reach the sink.
+func (s *Session) recordActivity(events []Event) {
 	if s.activity == nil {
-		return events
+		return
 	}
 	for _, event := range events {
 		if event.Kind == KindDelta {
@@ -132,7 +144,6 @@ func (s *Session) recordActivity(events []Event) []Event {
 			break
 		}
 	}
-	return events
 }
 
 // ToolResultMessage renders a normalized tool result as the transcript

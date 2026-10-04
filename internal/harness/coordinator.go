@@ -69,9 +69,9 @@ type Coordinator struct {
 	worker   *Delegator
 	forge    ForgeOps
 
-	snapshot     SnapshotProvider
-	snapshotOnce sync.Once
-	snapshotErr  error
+	snapshot      SnapshotProvider
+	snapshotMu    sync.Mutex
+	snapshotReady bool
 
 	publisher Publisher
 	activity  ActivitySink
@@ -145,7 +145,9 @@ func (c *Coordinator) Run(ctx context.Context, inv executor.Invocation) executor
 
 	clarifications := 0
 	for {
-		events := session.Turn(ctx, c.tools(false))
+		// The coordinator session gets the full trusted toolset, including
+		// delegation; subagent sessions (runBrief) never do.
+		events := session.Turn(ctx, c.tools(true))
 		var text strings.Builder
 		var calls []ToolCall
 		final := false
@@ -164,7 +166,11 @@ func (c *Coordinator) Run(ctx context.Context, inv executor.Invocation) executor
 		session.Append(AssistantMessage(text.String(), calls))
 		if !final {
 			for _, call := range calls {
-				session.Append(ToolResultMessage(c.runTool(ctx, call, "")))
+				result := c.runTool(ctx, call, "")
+				// The completed tool boundary is a normalized tool-result
+				// event: trusted control produced it after verified
+				// termination, and the transcript consumes it as data.
+				session.Append(ToolResultMessage(result))
 			}
 			continue
 		}
@@ -312,7 +318,7 @@ func (c *Coordinator) tools(coordinator bool) []ToolDef {
 			},
 			ToolDef{
 				Name:        toolCancelBrief,
-				Description: "Cancel one delegated brief. Cancellation is final for that brief ID.",
+				Description: "Mark a brief's work unit cancelled so no dispatch or retry under its ID can ever run again. Cancellation is final for that brief ID.",
 				Parameters: map[string]any{
 					"type": "object",
 					"properties": map[string]any{
@@ -331,15 +337,29 @@ func (c *Coordinator) tools(coordinator bool) []ToolDef {
 // runTool routes one tool request through its trusted implementation.
 // The request is data; nothing here executes model-controlled commands
 // locally — worker commands travel over the signed protocol, and the
-// coordinator pod has no execution path for them.
+// coordinator pod has no execution path for them. The context is enforced,
+// not just the declared toolset: a subagent (briefID set) can never delegate
+// or cancel, no matter what it emits, so untrusted output can neither spawn
+// nested sessions nor tombstone sibling work units.
 func (c *Coordinator) runTool(ctx context.Context, call ToolCall, briefID string) ToolResult {
 	result := ToolResult{ToolCallID: call.ID, Name: call.Name}
+	subagent := briefID != ""
 	switch call.Name {
 	case toolShell:
 		return c.runShell(ctx, call, briefID, result)
 	case toolDelegate:
+		if subagent {
+			result.IsError = true
+			result.Content = "delegation is not available to sub-agents"
+			return result
+		}
 		return c.runDelegate(ctx, call, result)
 	case toolCancelBrief:
+		if subagent {
+			result.IsError = true
+			result.Content = "cancellation is not available to sub-agents"
+			return result
+		}
 		return c.runCancelBrief(ctx, call, result)
 	case toolForge:
 		return c.runForge(ctx, call, result)
@@ -462,6 +482,10 @@ func (c *Coordinator) runBrief(ctx context.Context, brief Brief) string {
 			case KindFinal:
 				final = true
 			case KindError:
+				// Deliberate: a subagent stream failure becomes tool-visible
+				// data for the coordinator, which owns the brief's fate; the
+				// coordinator's own next turn surfaces a gateway outage as
+				// the §8 infrastructure failure.
 				return "sub-agent stream failed: " + safeToolError(event.Err)
 			}
 		}
@@ -555,15 +579,20 @@ func (c *Coordinator) dispatchAndAwait(ctx context.Context, opID, briefID string
 		if reconcileErr != nil {
 			return protocol.Result{}, fmt.Errorf("dispatch of %s failed and reconciliation failed: dispatch: %v; reconcile: %w", opID, err, reconcileErr)
 		}
-		if state.Result == nil {
-			return protocol.Result{}, fmt.Errorf("dispatch of %s failed ambiguously; reconciliation observed status %q", opID, state.Status)
-		}
-		return *state.Result, nil
+		return c.reconciledResult(opID, state)
 	}
 	for {
 		state, err := c.worker.Result(ctx, opID)
 		if err != nil {
-			return protocol.Result{}, fmt.Errorf("result poll for %s failed: %w", opID, err)
+			// A failed poll leaves the operation unobserved — it may still
+			// be running. Reconcile through cancellation so termination is
+			// proven (or observed absence) before this call gives up;
+			// abandoning the op here would orphan live work.
+			reconciled, reconcileErr := c.worker.ReconcileAmbiguous(ctx, opID, briefID)
+			if reconcileErr != nil {
+				return protocol.Result{}, fmt.Errorf("result poll for %s failed and reconciliation failed: poll: %v; reconcile: %w", opID, err, reconcileErr)
+			}
+			return c.reconciledResult(opID, reconciled)
 		}
 		switch state.Status {
 		case protocol.ResultCompleted, protocol.ResultFailed, protocol.ResultCancelled:
@@ -587,23 +616,48 @@ func (c *Coordinator) dispatchAndAwait(ctx context.Context, opID, briefID string
 	}
 }
 
-// ensureSnapshot uploads the sanitized workspace snapshot before the first
-// worker task of this incarnation.
-func (c *Coordinator) ensureSnapshot(ctx context.Context) error {
-	c.snapshotOnce.Do(func() {
-		if c.snapshot == nil {
-			c.snapshotErr = errors.New("no snapshot provider is configured in this build")
-			return
-		}
-		data, err := c.snapshot(ctx)
-		if err != nil {
-			c.snapshotErr = err
-			return
-		}
-		c.snapshotErr = c.worker.client.UploadSnapshot(ctx, data)
-	})
-	return c.snapshotErr
+// reconciledResult renders a reconciled observation as an execution result.
+// A cancelled observation is a verified termination by cancel, not a
+// completion; the caller surfaces it as a tool error either way. A completed
+// observation is a verified completion and earns its tool boundary.
+func (c *Coordinator) reconciledResult(opID string, state protocol.ResultState) (protocol.Result, error) {
+	if state.Result == nil {
+		return protocol.Result{}, fmt.Errorf("reconciliation of %s observed status %q without a result", opID, state.Status)
+	}
+	if state.Status == protocol.ResultCompleted && c.activity != nil {
+		c.activity.ToolBoundary()
+	}
+	return *state.Result, nil
 }
+
+// ensureSnapshot uploads the sanitized workspace snapshot before the first
+// worker task of this incarnation. A transient upload failure is retried on
+// the next task rather than cached: only a successful upload is sticky.
+func (c *Coordinator) ensureSnapshot(ctx context.Context) error {
+	c.snapshotMu.Lock()
+	defer c.snapshotMu.Unlock()
+	if c.snapshotReady {
+		return nil
+	}
+	if c.snapshot == nil {
+		return errors.New("no snapshot provider is configured in this build")
+	}
+	data, err := c.snapshot(ctx)
+	if err != nil {
+		return err
+	}
+	if err := c.worker.client.UploadSnapshot(ctx, data); err != nil {
+		return err
+	}
+	c.snapshotReady = true
+	return nil
+}
+
+// maxInlineArtifactBytes bounds the artifact bytes inlined into the model
+// transcript. It is a transport resource bound (same class as
+// maxStreamLineBytes), not a work limit: bulk artifacts stay worker-side
+// data that #125 validates and integrates as git bundles.
+const maxInlineArtifactBytes = 64 << 10
 
 func workerResultToTool(result protocol.Result, tool ToolResult) ToolResult {
 	var b strings.Builder
@@ -618,7 +672,11 @@ func workerResultToTool(result protocol.Result, tool ToolResult) ToolResult {
 		b.WriteString("stderr:\n" + result.StderrTail + "\n")
 	}
 	if len(result.Artifact) > 0 {
-		b.WriteString("artifact:\n" + string(result.Artifact) + "\n")
+		if len(result.Artifact) > maxInlineArtifactBytes {
+			fmt.Fprintf(&b, "artifact: %d bytes, not inlined; trusted control validates and integrates bulk artifacts (#125)\n", len(result.Artifact))
+		} else {
+			b.WriteString("artifact:\n" + string(result.Artifact) + "\n")
+		}
 	}
 	tool.Content = b.String()
 	return tool
