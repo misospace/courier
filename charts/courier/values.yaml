@@ -58,7 +58,7 @@ secure:
   harnessImage:
     repository: ghcr.io/misospace/courier-harness
     tag: ""
-  probeImage: busybox:1.36
+  probeImage: busybox:1.38
   dependencyCacheService: ""
   dependencyCachePort: 0
 
