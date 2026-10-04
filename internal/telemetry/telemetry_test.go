@@ -354,3 +354,25 @@ func TestCompactBoundedToBudget(t *testing.T) {
 		t.Errorf("lowest surviving runtime %d not greater than highest dropped runtime %d", minSurvived, maxDropped)
 	}
 }
+
+// TestCompactOmitsTokensForToolOnlyRun proves a run with tool calls but no
+// model step carrying part tokens compacts with the Tokens field left nil,
+// while the tool call is still tallied.
+func TestCompactOmitsTokensForToolOnlyRun(t *testing.T) {
+	tr := observeAll(t,
+		`{"sessionID":"ses_c","part":{"id":"prt_b","type":"tool","tool":"bash","state":{"status":"completed","time":{"start":1000,"end":4000}}}}`,
+	)
+	c := tr.Compact()
+	if c == nil {
+		t.Fatal("Compact() = nil, want non-nil")
+	}
+	if c.Tokens != nil {
+		t.Errorf("Compact.Tokens = %+v, want nil for tool-only run", *c.Tokens)
+	}
+	if c.ModelCalls != 0 {
+		t.Errorf("Compact.ModelCalls = %d, want 0 (tool-only run)", c.ModelCalls)
+	}
+	if c.ToolCalls != 1 {
+		t.Errorf("Compact.ToolCalls = %d, want 1", c.ToolCalls)
+	}
+}
