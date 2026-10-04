@@ -5,6 +5,7 @@ package source
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"time"
 )
@@ -99,6 +100,11 @@ type Lifecycle struct {
 	// IdempotencyKey identifies the publication so a source can deduplicate a
 	// retry of the same report. Empty means the source has no deduplication.
 	IdempotencyKey string
+	// Telemetry is optional per-run telemetry to include in a lifecycle
+	// report (#172). It is opaque to the source-neutral interface: source-
+	// specific renderers (e.g. the Dispatch report) embed it verbatim when
+	// non-empty. Absent telemetry is simply omitted.
+	Telemetry json.RawMessage
 	// StartedAt is the coordinator container start time, reported so sources
 	// can record real run durations; optional.
 	StartedAt *time.Time

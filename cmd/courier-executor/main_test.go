@@ -19,6 +19,7 @@ import (
 	"time"
 	"unicode/utf8"
 
+	courierv1alpha1 "github.com/misospace/courier/api/v1alpha1"
 	"github.com/misospace/courier/internal/executor"
 	"github.com/misospace/courier/internal/git"
 	courierlog "github.com/misospace/courier/internal/log"
@@ -950,6 +951,381 @@ func TestTruncateTerminationReasonRespectsByteLimitAndUTF8(t *testing.T) {
 	if got := truncateTerminationReason(short); got != short {
 		t.Fatalf("short reason = %q, want unchanged %q", got, short)
 	}
+}
+
+// TestEmitTerminationStaysWithinTerminationBudget proves the handoff line never
+// exceeds the 4 KiB pod termination-message budget. A 1024-byte reason built
+// from every JSON-escaping character (which expands under escaping) plus a
+// full 24-subagent summary is shrunk by dropping subagent entries
+// lowest-runtime first — and, if still over, the whole summary — while
+// phase/result/exit_code/outcome and the reason always survive.
+func TestEmitTerminationStaysWithinTerminationBudget(t *testing.T) {
+	// Eight-byte unit covering all six escaping characters: the two quotes,
+	// two backslashes and newline double in length, while <, > and & expand to
+	// six-byte \uXXXX escapes. 128 units make exactly 1024 raw bytes.
+	unit := `"` + `"` + `\` + `\` + "\n" + "<>&"
+	if len(unit) != 8 {
+		t.Fatalf("test unit is %d bytes, want 8", len(unit))
+	}
+	reason := strings.Repeat(unit, maxTerminationReasonBytes/len(unit))
+	if len(reason) != maxTerminationReasonBytes {
+		t.Fatalf("reason is %d bytes, want %d", len(reason), maxTerminationReasonBytes)
+	}
+
+	// The maximum subagent count, each with a long agent and model name, so
+	// the unshrunk line is well over the budget and the summary must give ground.
+	const numSubagents = 24
+	subagents := make([]courierv1alpha1.SubagentTally, 0, numSubagents)
+	for i := 0; i < numSubagents; i++ {
+		subagents = append(subagents, courierv1alpha1.SubagentTally{
+			Agent:         "agent-" + strings.Repeat("x", 64),
+			Model:         "model-" + strings.Repeat("y", 32),
+			Calls:         1,
+			RuntimeMillis: int64((numSubagents - i) * 10),
+		})
+	}
+	summary := &courierv1alpha1.RunTelemetry{
+		ModelCalls: 1,
+		ToolCalls:  numSubagents,
+		Sessions:   1,
+		Subagents:  subagents,
+	}
+
+	var out bytes.Buffer
+	emitTermination(&out, config{}, termination{
+		Phase:    "Failed",
+		Result:   "failure",
+		ExitCode: exitFailed,
+		Outcome:  "changes",
+		Reason:   reason,
+		Summary:  summary,
+	})
+
+	line := out.String()
+	if len(line) > maxTerminationLineBytes {
+		t.Fatalf("termination line is %d bytes, want <= %d", len(line), maxTerminationLineBytes)
+	}
+
+	var parsed struct {
+		Phase    string `json:"phase"`
+		Result   string `json:"result"`
+		ExitCode int    `json:"exit_code"`
+		Outcome  string `json:"outcome"`
+		Reason   string `json:"reason"`
+	}
+	body := strings.TrimPrefix(line, terminationLinePrefix)
+	if err := json.Unmarshal([]byte(body), &parsed); err != nil {
+		t.Fatalf("termination line is not valid JSON: %v: %q", err, body)
+	}
+	if parsed.Phase != "Failed" {
+		t.Fatalf("phase = %q, want %q", parsed.Phase, "Failed")
+	}
+	if parsed.Result != "failure" {
+		t.Fatalf("result = %q, want %q", parsed.Result, "failure")
+	}
+	if parsed.ExitCode != exitFailed {
+		t.Fatalf("exit_code = %d, want %d", parsed.ExitCode, exitFailed)
+	}
+	if parsed.Outcome != "changes" {
+		t.Fatalf("outcome = %q, want %q", parsed.Outcome, "changes")
+	}
+	if parsed.Reason == "" {
+		t.Fatal("reason was dropped from the termination line")
+	}
+}
+
+// TestEmitTerminationTrimsEscapeHeavyReasonWithoutSummary is the worst case the
+// summary-only shrinking cannot cover: a 1024-byte reason of a single
+// JSON-escaping character (& -> \u0026, six bytes each) with no summary. The
+// raw-byte truncation in terminate leaves the reason at its 1024-byte bound,
+// but the escaped payload pushes the line to 6144 bytes. With the summary
+// already empty, the line can only fit by cutting the reason itself; the
+// handoff must stay within budget with phase/result/exit_code/outcome intact
+// and a non-empty reason.
+func TestEmitTerminationTrimsEscapeHeavyReasonWithoutSummary(t *testing.T) {
+	reason := strings.Repeat("&", maxTerminationReasonBytes)
+	if len(reason) != maxTerminationReasonBytes {
+		t.Fatalf("reason is %d bytes, want %d", len(reason), maxTerminationReasonBytes)
+	}
+
+	var out bytes.Buffer
+	emitTermination(&out, config{}, termination{
+		Phase:    "Failed",
+		Result:   "failure",
+		ExitCode: exitFailed,
+		Outcome:  "changes",
+		Reason:   reason,
+	})
+
+	line := out.String()
+	if len(line) > maxTerminationLineBytes {
+		t.Fatalf("termination line is %d bytes, want <= %d", len(line), maxTerminationLineBytes)
+	}
+
+	var parsed struct {
+		Phase    string `json:"phase"`
+		Result   string `json:"result"`
+		ExitCode int    `json:"exit_code"`
+		Outcome  string `json:"outcome"`
+		Reason   string `json:"reason"`
+	}
+	body := strings.TrimPrefix(line, terminationLinePrefix)
+	if err := json.Unmarshal([]byte(body), &parsed); err != nil {
+		t.Fatalf("termination line is not valid JSON: %v: %q", err, body)
+	}
+	if parsed.Phase != "Failed" {
+		t.Fatalf("phase = %q, want %q", parsed.Phase, "Failed")
+	}
+	if parsed.Result != "failure" {
+		t.Fatalf("result = %q, want %q", parsed.Result, "failure")
+	}
+	if parsed.ExitCode != exitFailed {
+		t.Fatalf("exit_code = %d, want %d", parsed.ExitCode, exitFailed)
+	}
+	if parsed.Outcome != "changes" {
+		t.Fatalf("outcome = %q, want %q", parsed.Outcome, "changes")
+	}
+	if parsed.Reason == "" {
+		t.Fatal("reason was emptied by the last-resort trim")
+	}
+}
+
+// TestEmitTerminationFitsEscapeHeavyReasonWithFullSummary is the combined worst
+// case: a 1024-byte &-only reason (marshalling to 6144 bytes) alongside a full
+// 24-subagent summary. The summary gives ground first and is fully dropped,
+// then the reason is cut as a last resort; the line must still fit the budget
+// with phase/result/exit_code/outcome intact and a non-empty reason.
+func TestEmitTerminationFitsEscapeHeavyReasonWithFullSummary(t *testing.T) {
+	reason := strings.Repeat("&", maxTerminationReasonBytes)
+	if len(reason) != maxTerminationReasonBytes {
+		t.Fatalf("reason is %d bytes, want %d", len(reason), maxTerminationReasonBytes)
+	}
+
+	const numSubagents = 24
+	subagents := make([]courierv1alpha1.SubagentTally, 0, numSubagents)
+	for i := 0; i < numSubagents; i++ {
+		subagents = append(subagents, courierv1alpha1.SubagentTally{
+			Agent:         "agent-" + strings.Repeat("x", 64),
+			Model:         "model-" + strings.Repeat("y", 32),
+			Calls:         1,
+			RuntimeMillis: int64((numSubagents - i) * 10),
+		})
+	}
+	summary := &courierv1alpha1.RunTelemetry{
+		ModelCalls: 1,
+		ToolCalls:  numSubagents,
+		Sessions:   1,
+		Subagents:  subagents,
+	}
+
+	var out bytes.Buffer
+	emitTermination(&out, config{}, termination{
+		Phase:    "Failed",
+		Result:   "failure",
+		ExitCode: exitFailed,
+		Outcome:  "changes",
+		Reason:   reason,
+		Summary:  summary,
+	})
+
+	line := out.String()
+	if len(line) > maxTerminationLineBytes {
+		t.Fatalf("termination line is %d bytes, want <= %d", len(line), maxTerminationLineBytes)
+	}
+
+	var parsed struct {
+		Phase    string `json:"phase"`
+		Result   string `json:"result"`
+		ExitCode int    `json:"exit_code"`
+		Outcome  string `json:"outcome"`
+		Reason   string `json:"reason"`
+	}
+	body := strings.TrimPrefix(line, terminationLinePrefix)
+	if err := json.Unmarshal([]byte(body), &parsed); err != nil {
+		t.Fatalf("termination line is not valid JSON: %v: %q", err, body)
+	}
+	if parsed.Phase != "Failed" {
+		t.Fatalf("phase = %q, want %q", parsed.Phase, "Failed")
+	}
+	if parsed.Result != "failure" {
+		t.Fatalf("result = %q, want %q", parsed.Result, "failure")
+	}
+	if parsed.ExitCode != exitFailed {
+		t.Fatalf("exit_code = %d, want %d", parsed.ExitCode, exitFailed)
+	}
+	if parsed.Outcome != "changes" {
+		t.Fatalf("outcome = %q, want %q", parsed.Outcome, "changes")
+	}
+	if parsed.Reason == "" {
+		t.Fatal("reason was emptied by the last-resort trim")
+	}
+}
+
+// TestEmitTerminationDropsLowestRuntimeSubagentsFirst pins the drop ORDER when
+// a full summary overruns the budget with an ordinary (non-escaping) reason:
+// subagent entries are dropped lowest-runtime first, so the survivors are a
+// prefix of the input list (built descending-runtime, the survivors are the
+// highest-runtime). Scalar summary fields survive, and the line stays within
+// the budget.
+func TestEmitTerminationDropsLowestRuntimeSubagentsFirst(t *testing.T) {
+	// 24 subagents, highest-runtime first, with long names so the unshrunk
+	// line is well over the 4 KiB budget and the summary must give ground.
+	const numSubagents = 24
+	subagents := make([]courierv1alpha1.SubagentTally, 0, numSubagents)
+	for i := 0; i < numSubagents; i++ {
+		subagents = append(subagents, courierv1alpha1.SubagentTally{
+			Agent:         "agent-" + strings.Repeat("x", 80),
+			Model:         "model-" + strings.Repeat("y", 48),
+			Calls:         1,
+			RuntimeMillis: int64((numSubagents - i) * 10),
+		})
+	}
+	summary := &courierv1alpha1.RunTelemetry{
+		ModelCalls: 7,
+		ToolCalls:  numSubagents,
+		Sessions:   2,
+		Subagents:  subagents,
+	}
+	// A plain ASCII reason: no escaping, so only the summary gives ground.
+	reason := strings.Repeat("r", 300)
+
+	var out bytes.Buffer
+	emitTermination(&out, config{}, termination{
+		Phase:    "Failed",
+		Result:   "failure",
+		ExitCode: exitFailed,
+		Reason:   reason,
+		Summary:  summary,
+	})
+
+	line := out.String()
+	if len(line) > maxTerminationLineBytes {
+		t.Fatalf("termination line is %d bytes, want <= %d", len(line), maxTerminationLineBytes)
+	}
+
+	var parsed struct {
+		Reason  string `json:"reason"`
+		Summary *struct {
+			ModelCalls int                             `json:"modelCalls"`
+			ToolCalls  int                             `json:"toolCalls"`
+			Sessions   int                             `json:"sessions"`
+			Subagents  []courierv1alpha1.SubagentTally `json:"subagents"`
+		} `json:"summary"`
+	}
+	body := strings.TrimPrefix(line, terminationLinePrefix)
+	if err := json.Unmarshal([]byte(body), &parsed); err != nil {
+		t.Fatalf("termination line is not valid JSON: %v: %q", err, body)
+	}
+	if parsed.Summary == nil {
+		t.Fatal("summary was dropped entirely; some subagents should survive")
+	}
+	if got := len(parsed.Summary.Subagents); got == 0 {
+		t.Fatal("no subagents survived the shrink")
+	} else if got == numSubagents {
+		t.Fatalf("all %d subagents survived; the summary should have given ground", numSubagents)
+	}
+	// The survivors are a prefix of the input list: built descending-runtime,
+	// the kept entries are the highest-runtime.
+	for i, kept := range parsed.Summary.Subagents {
+		if kept != subagents[i] {
+			t.Fatalf("survivor %d = %+v, want the input's %d-th entry %+v (drops are lowest-runtime first)", i, kept, i, subagents[i])
+		}
+	}
+	// Scalar fields survive the shrink.
+	if parsed.Summary.ModelCalls != 7 {
+		t.Fatalf("modelCalls = %d, want 7", parsed.Summary.ModelCalls)
+	}
+	if parsed.Summary.ToolCalls != numSubagents {
+		t.Fatalf("toolCalls = %d, want %d", parsed.Summary.ToolCalls, numSubagents)
+	}
+	if parsed.Summary.Sessions != 2 {
+		t.Fatalf("sessions = %d, want 2", parsed.Summary.Sessions)
+	}
+	if parsed.Reason != reason {
+		t.Fatalf("reason was altered; only the summary should give ground: %q", parsed.Reason)
+	}
+}
+
+// TestEmitTerminationKeepsUTF8ReasonOnLastResortShrink is the UTF-8 boundary
+// case for the last-resort reason cut: a long multi-byte (CJK) reason with no
+// summary overruns the budget, so the reason is cut; the cut must land on a
+// rune boundary, leaving a valid-UTF-8, non-empty reason ending with the
+// truncation marker, and the line stays within the budget.
+func TestEmitTerminationKeepsUTF8ReasonOnLastResortShrink(t *testing.T) {
+	// CJK is three UTF-8 bytes per rune and is not escaped by the JSON
+	// marshaler, so a long run of it overruns the budget in raw bytes and
+	// forces the last-resort reason cut to fire.
+	reason := strings.Repeat("你", 1500)
+	if len(reason) != 4500 {
+		t.Fatalf("reason is %d bytes, want 4500", len(reason))
+	}
+
+	var out bytes.Buffer
+	emitTermination(&out, config{}, termination{
+		Phase:    "Failed",
+		Result:   "failure",
+		ExitCode: exitFailed,
+		Reason:   reason,
+	})
+
+	line := out.String()
+	if len(line) > maxTerminationLineBytes {
+		t.Fatalf("termination line is %d bytes, want <= %d", len(line), maxTerminationLineBytes)
+	}
+
+	var parsed struct {
+		Reason string `json:"reason"`
+	}
+	body := strings.TrimPrefix(line, terminationLinePrefix)
+	if err := json.Unmarshal([]byte(body), &parsed); err != nil {
+		t.Fatalf("termination line is not valid JSON: %v: %q", err, body)
+	}
+	if parsed.Reason == "" {
+		t.Fatal("reason was emptied by the last-resort trim")
+	}
+	if !utf8.ValidString(parsed.Reason) {
+		t.Fatalf("trimmed reason is not valid UTF-8 (the cut split a rune): %q", parsed.Reason)
+	}
+	if !strings.HasSuffix(parsed.Reason, terminationTruncationSuffix) {
+		t.Fatalf("trimmed reason = %q, want the truncation marker", parsed.Reason)
+	}
+}
+
+// TestShrinkTerminationReason pins the last-resort reason cut: it removes
+// exactly the overflow (plus the marker) bytes, leaves a reason at the marker
+// floor unchanged, and does not double-count a marker the content already ends
+// with.
+func TestShrinkTerminationReason(t *testing.T) {
+	t.Run("closes a one-byte overflow", func(t *testing.T) {
+		reason := strings.Repeat("a", 100)
+		got := shrinkTerminationReason(reason, 1)
+		want := strings.Repeat("a", 84) + terminationTruncationSuffix
+		if got != want {
+			t.Fatalf("shrinkTerminationReason() = %q (%d bytes), want %q (%d bytes)", got, len(got), want, len(want))
+		}
+	})
+
+	t.Run("reason at the marker floor is unchanged", func(t *testing.T) {
+		reason := strings.Repeat("a", len(terminationTruncationSuffix))
+		got := shrinkTerminationReason(reason, 1)
+		if got != reason {
+			t.Fatalf("shrinkTerminationReason() = %q, want unchanged %q", got, reason)
+		}
+	})
+
+	t.Run("content ending in the marker is not double-counted", func(t *testing.T) {
+		reason := strings.Repeat("a", 50) + terminationTruncationSuffix
+		got := shrinkTerminationReason(reason, 1)
+		// The trailing marker is stripped before measuring, so the cut applies
+		// to the 50-byte content and the marker is appended exactly once.
+		want := strings.Repeat("a", 34) + terminationTruncationSuffix
+		if got != want {
+			t.Fatalf("shrinkTerminationReason() = %q (%d bytes), want %q (%d bytes)", got, len(got), want, len(want))
+		}
+		if strings.HasSuffix(got, terminationTruncationSuffix+terminationTruncationSuffix) {
+			t.Fatalf("shrinkTerminationReason() double-appended the marker: %q", got)
+		}
+	})
 }
 
 func TestRunChildExitTwoBecomesFailed(t *testing.T) {
@@ -2584,5 +2960,132 @@ exit 0
 	}
 	if !strings.Contains(terminationLine, "last message") {
 		t.Fatal("termination reason lost the state history")
+	}
+}
+
+// TestRunEmitsTelemetry proves the run tallies the coordinator's OpenCode
+// event stream: a run.summary event carries the rich summary next to the
+// terminal handoff, and the COURIER_TERMINATION line carries the compact form.
+func TestRunEmitsTelemetry(t *testing.T) {
+	root := t.TempDir()
+	remote := filepath.Join(root, "remote.git")
+	source := filepath.Join(root, "source")
+	runGit(t, root, "init", "--bare", remote)
+	runGit(t, root, "init", source)
+	configureGit(t, source)
+	write(t, filepath.Join(source, "README.md"), "base one\n")
+	commit(t, source, "base: initial")
+	runGit(t, source, "branch", "-M", "main")
+	runGit(t, source, "remote", "add", "origin", remote)
+	runGit(t, source, "push", "-u", "origin", "main")
+
+	orphan := filepath.Join(root, "orphan")
+	runGit(t, root, "clone", remote, orphan)
+	configureGit(t, orphan)
+	runGit(t, orphan, "checkout", "-b", "courier/resolve-issue/acme-widgets/7", "origin/main")
+	write(t, filepath.Join(orphan, "work.txt"), "previous brief\n")
+	commit(t, orphan, "work: previous brief")
+	runGit(t, orphan, "push", "origin", "HEAD:refs/heads/courier/resolve-issue/acme-widgets/7")
+
+	write(t, filepath.Join(source, "base.txt"), "moved base\n")
+	commit(t, source, "base: moved")
+	runGit(t, source, "push", "origin", "main")
+
+	fakeOpenCode := filepath.Join(root, "opencode")
+	scratchDirectory := filepath.Join(root, "scratch dir")
+	writeExecutable(t, fakeOpenCode, `#!/bin/sh
+case "$1" in mcp) exit 0;; esac
+if [ -e "$COURIER_SCRATCH_DIR/outcome.json" ]; then exit 9; fi
+printf 'scratch dir: %s\n' "$COURIER_SCRATCH_DIR"
+printf 'opencode argv: %s\n' "$*"
+printf 'completed\n' > completed.txt
+git add --all -- .
+git commit -m 'test: completed work' >/dev/null
+mkdir -p "$COURIER_SCRATCH_DIR"
+printf '{"outcome":"changes"}' > "$COURIER_SCRATCH_DIR/outcome.json"
+printf '{"sessionID":"ses_exec","part":{"type":"step-finish","tokens":{"input":100,"output":20,"reasoning":0,"cache":{"read":500,"write":10}}}}\n'
+printf '{"sessionID":"ses_exec","part":{"type":"tool","tool":"bash","state":{"status":"completed","time":{"start":1000,"end":2000}}}}\n'
+printf '{"sessionID":"ses_exec","part":{"type":"tool","tool":"task","state":{"status":"completed","time":{"start":2000,"end":7000},"input":{"subagent_type":"coder-local"},"metadata":{"model":{"modelID":"litellm/x"},"sessionId":"ses_sub"}}}}\n'
+`)
+	workspace := filepath.Join(root, "workspace")
+	if err := os.MkdirAll(scratchDirectory, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	write(t, filepath.Join(scratchDirectory, "outcome.json"), `{"outcome":"no_change_needed","evidence":"stale"}`)
+	termination := filepath.Join(root, "termination")
+	t.Setenv("COURIER_REPO_URL", remote)
+	t.Setenv("COURIER_WORKSPACE", workspace)
+	t.Setenv("COURIER_SCRATCH_DIR", scratchDirectory)
+	t.Setenv("COURIER_BASE", "main")
+	t.Setenv("COURIER_BRANCH", "courier/resolve-issue/acme-widgets/7")
+	t.Setenv("COURIER_GOAL", "Open a PR to address issue #7. Declare the outcome at "+filepath.Join(defaultScratchDirectory, defaultOutcomeFilename)+".")
+	t.Setenv("COURIER_MODEL", "any-model/name")
+	t.Setenv("COURIER_OPENCODE_AGENT", "architect")
+	t.Setenv("COURIER_FRAMING", "capacity is elastic; fan out freely")
+	t.Setenv("COURIER_OPENCODE_BINARY", fakeOpenCode)
+	t.Setenv("COURIER_TERMINATION_FILE", termination)
+	// Run identity is required or the emitter drops the run.summary event.
+	t.Setenv("COURIER_RUN_NAME", "coderrun-it-7")
+
+	var output bytes.Buffer
+	var errorsOut bytes.Buffer
+	if code := run(context.Background(), &output, &errorsOut); code != 0 {
+		t.Fatalf("run exit code = %d, stderr=%q, stdout=%q", code, errorsOut.String(), output.String())
+	}
+	if _, err := os.Stat(filepath.Join(workspace, "base.txt")); err != nil {
+		t.Fatalf("adopted branch was not synchronized to base: %v", err)
+	}
+	if !strings.Contains(output.String(), "Open a PR to address issue #7.") || !strings.Contains(output.String(), "any-model/name") || !strings.Contains(output.String(), "capacity is elastic; fan out freely") {
+		t.Fatalf("OpenCode did not receive exact goal/model/framing: %q", output.String())
+	}
+	wantOutcomePath := filepath.Join(scratchDirectory, "outcome.json")
+	if !strings.Contains(output.String(), "scratch dir: "+scratchDirectory) || !strings.Contains(output.String(), "Open a PR to address issue #7. Declare the outcome at "+wantOutcomePath) {
+		t.Fatalf("child scratch path and actual goal declaration path disagree: %q", output.String())
+	}
+	if !strings.Contains(output.String(), "--agent architect") {
+		t.Fatalf("OpenCode did not receive configured agent: %q", output.String())
+	}
+	if !strings.Contains(output.String(), `COURIER_TERMINATION {"phase":"Verifying","result":"success","exit_code":0`) {
+		t.Fatalf("missing stable success termination: %q", output.String())
+	}
+	if !strings.Contains(output.String(), `"outcome":"changes"`) {
+		t.Fatalf("runtime did not read the child's changes declaration at %q: %q", wantOutcomePath, output.String())
+	}
+	terminationOutput := string(mustRead(t, termination))
+	if !strings.Contains(terminationOutput, `"phase":"Verifying"`) {
+		t.Fatalf("termination file = %q", terminationOutput)
+	}
+
+	summary := findEvent(t, parseEvents(t, &output), "run.summary")
+	detail := eventDetail(t, summary)
+	tallied, ok := detail["summary"].(map[string]any)
+	if !ok {
+		t.Fatalf("run.summary detail carries no summary object: %v", detail)
+	}
+	if tallied["model_calls"] != float64(1) {
+		t.Fatalf("summary model_calls = %v, want 1", tallied["model_calls"])
+	}
+	if tallied["tool_calls"] != float64(2) {
+		t.Fatalf("summary tool_calls = %v, want 2", tallied["tool_calls"])
+	}
+	subagents, ok := tallied["subagents"].([]any)
+	if !ok || len(subagents) != 1 {
+		t.Fatalf("summary subagents = %v, want one entry", tallied["subagents"])
+	}
+	first, ok := subagents[0].(map[string]any)
+	if !ok {
+		t.Fatalf("first subagent entry is not an object: %v", subagents[0])
+	}
+	if first["calls"] != float64(1) {
+		t.Fatalf("subagent calls = %v, want 1", first["calls"])
+	}
+
+	start := strings.Index(output.String(), "COURIER_TERMINATION ")
+	if start < 0 {
+		t.Fatal("missing the COURIER_TERMINATION line")
+	}
+	terminationLine := output.String()[start:]
+	if !strings.Contains(terminationLine, `"summary":{"modelCalls":1,"toolCalls":2`) {
+		t.Fatalf("termination line missing the compact telemetry: %q", terminationLine)
 	}
 }

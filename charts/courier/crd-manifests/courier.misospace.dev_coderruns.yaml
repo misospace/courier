@@ -377,6 +377,74 @@ spec:
                   Set once, never overwritten.
                 format: date-time
                 type: string
+              telemetry:
+                description: |-
+                  Telemetry is the compact per-run summary tallied from the
+                  coordinator's OpenCode event stream (#172). Best-effort: absent for
+                  runs that ended before the event stream could be tallied.
+                properties:
+                  continuations:
+                    type: integer
+                  durationMillis:
+                    format: int64
+                    type: integer
+                  maxContext:
+                    format: int64
+                    type: integer
+                  modelCalls:
+                    type: integer
+                  sessions:
+                    type: integer
+                  subagents:
+                    items:
+                      description: |-
+                        SubagentTally is the per (agent, model) accounting of `task` tool calls.
+                        It records calls, errors, and aggregate wall time; subagent tokens are
+                        not observable from the coordinator's stdout and are deliberately absent.
+                      properties:
+                        agent:
+                          type: string
+                        calls:
+                          type: integer
+                        errors:
+                          type: integer
+                        model:
+                          type: string
+                        runtimeMillis:
+                          format: int64
+                          type: integer
+                      required:
+                      - agent
+                      type: object
+                    type: array
+                  tokens:
+                    description: |-
+                      TokenUsage is a per-run token tally summed over the coordinator's own
+                      model steps. Subagent steps are not observable from the coordinator's
+                      stdout, so they are not included.
+                    properties:
+                      cacheRead:
+                        format: int64
+                        type: integer
+                      cacheWrite:
+                        format: int64
+                        type: integer
+                      input:
+                        format: int64
+                        type: integer
+                      output:
+                        format: int64
+                        type: integer
+                      reasoning:
+                        format: int64
+                        type: integer
+                      total:
+                        format: int64
+                        type: integer
+                    type: object
+                  toolCalls:
+                    type: integer
+                type: object
               waitDuration:
                 description: |-
                   WaitDuration is the human-readable time between creation and StartedAt,

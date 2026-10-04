@@ -761,6 +761,25 @@ the world. `courier_metrics_scrape_errors_total` counts scrape failures. Scrapin
 is opt-in: the chart's `serviceMonitor.enabled` renders a metrics `Service` and a
 Prometheus Operator `ServiceMonitor`, off by default.
 
+### Per-run telemetry (#172)
+
+The executor already relays the coordinator's stdout through a pass-through tap,
+so it tallies the OpenCode JSON event stream as it passes and reports it three
+ways on a finished run — a `run.summary` event logged next to the
+`COURIER_TERMINATION` handoff, a compact `status.telemetry` on the `CoderRun`,
+and the source (Dispatch) lifecycle report body. Tallied per session and for the
+run: model calls (step-finish), tool calls by name, tokens (input, output,
+reasoning, cache read/write, total), peak context (`input + cache.read +
+cache.write`), wall time from tool timings, and `task`-call subagents tallied by
+(agent, model) with calls, errors, and runtime. Subagent sessions do not stream
+their own steps to the coordinator's stdout, so subagent **tokens** are not
+derivable here — only their calls/errors/runtime; run token totals come from the
+coordinator's own steps. The compact status/report form is integers and small (a
+bounded per-agent list): it rides the pod termination-message budget alongside
+the reason, and durations are milliseconds so the CRD stays float-free. Only the
+rich form reaches the (uncapped) log. Continuations are counted from the
+executor's own counter; metrics export lands with #168.
+
 ## Custom resources
 
 ### `CoderRun`
@@ -1220,6 +1239,18 @@ was superseded.
   even though merge-settling is human-gated; a later operator-marked Done never
   moves it. StartedAt also rides the Dispatch lifecycle report so sources can
   record real AgentRun durations. (#167)
+- **2026-10-01 — #172: tally run telemetry in the executor, publish compact-only to
+  status and source.** The OpenCode event stream already passes the executor's
+  stdout tap, so the tally rides it rather than adding a new collector. The full
+  summary is logged (`run.summary`, always-on detail) but only a compact integer
+  form crosses into `CoderRun.status` and the Dispatch report, because that
+  payload shares the pod's 4 KiB termination-message budget. Durations are
+  milliseconds (integers) so the CRD needs no `float` (which controller-gen
+  rejects). Subagent **tokens** are deliberately absent: subagent sessions do not
+  stream their own steps to the coordinator, so only their task-call
+  counts/errors/runtime are observable here; run token totals come from the
+  coordinator's own steps. Metrics export is deferred to #168 and richer
+  continuation accounting to the companion continuation issue. (#172)
 - **2026-09-30 — #170: preserve continuation-state boundaries in loop fingerprints.**
   Delimiter-joined fields can collide when paths or other values contain those
   delimiters. Hashing typed JSON preserves field boundaries and keeps raw paths

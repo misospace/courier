@@ -228,6 +228,12 @@ type CoderRunStatus struct {
 	// +optional
 	Restarts int `json:"restarts,omitempty"`
 
+	// Telemetry is the compact per-run summary tallied from the
+	// coordinator's OpenCode event stream (#172). Best-effort: absent for
+	// runs that ended before the event stream could be tallied.
+	// +optional
+	Telemetry *RunTelemetry `json:"telemetry,omitempty"`
+
 	// Conditions is the standard condition set.
 	// +optional
 	// +listType=map

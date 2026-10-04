@@ -28,10 +28,12 @@ import (
 	"time"
 	"unicode/utf8"
 
+	courierv1alpha1 "github.com/misospace/courier/api/v1alpha1"
 	"github.com/misospace/courier/internal/executor"
 	"github.com/misospace/courier/internal/git"
 	"github.com/misospace/courier/internal/github"
 	courierlog "github.com/misospace/courier/internal/log"
+	"github.com/misospace/courier/internal/telemetry"
 )
 
 const (
@@ -47,10 +49,16 @@ const (
 	defaultOutcomeFilename      = "outcome.json"
 	maxTerminationReasonBytes   = 1024
 	terminationTruncationSuffix = "... [truncated]"
-	defaultFormat               = "json"
-	defaultMaxContinuations     = 3
-	defaultResumeBackoff        = 5 * time.Second
-	maxResumeBackoffSeconds     = 3600
+	// terminationLinePrefix is the fixed prefix of the legacy handoff line.
+	terminationLinePrefix = "COURIER_TERMINATION "
+	// maxTerminationLineBytes is the Kubernetes pod termination-message budget.
+	// The whole handoff line must stay at or under it, or the controller loses
+	// the entire handoff to truncation.
+	maxTerminationLineBytes = 4096
+	defaultFormat           = "json"
+	defaultMaxContinuations = 3
+	defaultResumeBackoff    = 5 * time.Second
+	maxResumeBackoffSeconds = 3600
 )
 
 type config struct {
@@ -90,6 +98,9 @@ type termination struct {
 	// declaration drove the ending (#169); empty when classified from the
 	// world alone.
 	Outcome string `json:"outcome,omitempty"`
+	// Summary is the compact per-run telemetry tallied from the OpenCode event
+	// stream (#172). Omitted when the run recorded no activity.
+	Summary *courierv1alpha1.RunTelemetry `json:"summary,omitempty"`
 }
 
 func main() {
@@ -216,6 +227,7 @@ type reporter struct {
 	stderr io.Writer
 	events *courierlog.Emitter
 	red    *courierlog.Redactor
+	tel    *telemetry.Tracker
 	cfg    config
 }
 
@@ -230,7 +242,7 @@ func newReporter(stdout, stderr io.Writer, cfg config) reporter {
 	red.RegisterEnvironment(os.Environ())
 	red.Register(cfg.GitToken)
 	red.Register(cfg.GitHubToken)
-	return reporter{stdout: stdout, stderr: stderr, events: events, red: red, cfg: cfg}
+	return reporter{stdout: stdout, stderr: stderr, events: events, red: red, tel: telemetry.New(), cfg: cfg}
 }
 
 // event writes one structured run event. Emission is best-effort: a failure
@@ -255,6 +267,12 @@ func (r reporter) event(eventType, status string, detail map[string]any) {
 // terminate publishes the terminal handoff: the legacy COURIER_TERMINATION
 // line with a redacted reason, plus the run.exit event.
 func (r reporter) terminate(result termination) {
+	if r.tel != nil {
+		if compact := r.tel.Compact(); compact != nil {
+			result.Summary = compact
+			r.emitRunSummary(r.tel.Summary())
+		}
+	}
 	result.Reason = truncateTerminationReason(r.red.Redact(result.Reason))
 	emitTermination(r.stdout, r.cfg, result)
 	status := courierlog.StatusOK
@@ -359,6 +377,26 @@ func (r reporter) emitCapabilityStatus(caps []executor.MCPCapability) {
 	}
 }
 
+// emitRunSummary reports the run's tallied telemetry as a structured event.
+// The summary detail is always included (Verbose) so it reaches the log store
+// on every finished run, not only on debug runs; the emitter redacts it.
+func (r reporter) emitRunSummary(s telemetry.Summary) {
+	err := r.events.Emit(courierlog.Event{
+		Type:    courierlog.EventRunSummary,
+		RunID:   r.cfg.RunID,
+		Repo:    r.cfg.Repo,
+		Ref:     r.cfg.Ref,
+		Mode:    r.cfg.Mode,
+		Model:   r.cfg.Model,
+		Status:  courierlog.StatusOK,
+		Verbose: true,
+		Detail:  map[string]any{"summary": s},
+	})
+	if err != nil {
+		fmt.Fprintf(r.stderr, "courier: dropped %s event: %v\n", courierlog.EventRunSummary, err)
+	}
+}
+
 // tapMaxLine bounds the session tap's buffer for an unfinished line, so a
 // child emitting one enormous line cannot grow it without limit.
 const tapMaxLine = 1 << 20
@@ -377,6 +415,7 @@ type sessionTap struct {
 	pending   []byte
 	sessionID string
 	lastText  string
+	tel       *telemetry.Tracker
 }
 
 func newSessionTap(w io.Writer) *sessionTap {
@@ -412,6 +451,9 @@ func (t *sessionTap) Flush() error {
 // scan extracts the session id and assistant text from one JSON event line.
 // Lines that are not JSON events are ignored.
 func (t *sessionTap) scan(line []byte) {
+	if t.tel != nil {
+		t.tel.Observe(line)
+	}
 	var event struct {
 		SessionID string `json:"sessionID"`
 		Part      *struct {
@@ -529,6 +571,7 @@ func run(ctx context.Context, stdout, stderr io.Writer) int {
 	stdoutRedacted := courierlog.NewRedactingWriter(stdout, report.red)
 	stderrTransport := courierlog.NewRedactingWriter(stderr, report.red)
 	tap := newSessionTap(stdoutRedacted)
+	tap.tel = report.tel
 
 	// Recoverable workspace endings and crashes share one continuation budget.
 	continuations, crashes := 0, 0
@@ -539,6 +582,7 @@ func run(ctx context.Context, stdout, stderr io.Writer) int {
 	)
 
 	for {
+		report.tel.SetContinuations(continuations)
 		if continuations > 0 {
 			// A declaration belongs to one completed turn; never let a stale
 			// declaration from an earlier turn decide the resumed run.
@@ -1190,12 +1234,19 @@ func askpass(args []string, username, token string, stdout io.Writer) int {
 	return 0
 }
 
+// emitTermination writes the legacy COURIER_TERMINATION line to stdout (and to
+// cfg.TerminationFile when set). The whole line is bounded by the Kubernetes
+// pod termination-message budget: when the marshalled payload would push the
+// line past maxTerminationLineBytes, the compact telemetry summary is shrunk
+// — subagent entries dropped lowest-runtime first, then the summary key
+// itself — so phase, result, exit_code, outcome and reason always survive.
 func emitTermination(stdout io.Writer, cfg config, result termination) {
-	payload, err := json.Marshal(result)
-	if err != nil {
+	line := fitTerminationLine(result)
+	if line == "" {
+		// A marshal failure leaves no handoff line; write nothing rather than
+		// an empty handoff that would truncate the termination file.
 		return
 	}
-	line := "COURIER_TERMINATION " + string(payload) + "\n"
 	_, _ = io.WriteString(stdout, line)
 	if cfg.TerminationFile == "" {
 		return
@@ -1204,4 +1255,86 @@ func emitTermination(stdout io.Writer, cfg config, result termination) {
 	// never used for credentials and is replaced atomically enough for a single
 	// writer in the ephemeral workspace.
 	_ = os.WriteFile(cfg.TerminationFile, []byte(line), 0o600)
+}
+
+// fitTerminationLine renders the handoff line, shrinking the telemetry summary
+// until the line fits the termination-message budget, and — only once the
+// summary is fully gone — shrinking the reason as a last resort. The summary
+// always gives ground first; the reason is cut last and only as much as
+// needed to fit, and it is kept non-empty. phase/result/exit_code/outcome are
+// never touched. It may shrink result.Summary and result.Reason in place: a
+// caller must not reuse the passed Summary pointer expecting the untouched
+// payload.
+func fitTerminationLine(result termination) string {
+	line := marshalTerminationLine(result)
+	for len(line) > maxTerminationLineBytes && result.Summary != nil {
+		if len(result.Summary.Subagents) > 0 {
+			// Subagents are ordered highest-runtime first, so the final entry
+			// is the lowest-runtime; drop it and re-measure.
+			result.Summary.Subagents = result.Summary.Subagents[:len(result.Summary.Subagents)-1]
+		} else {
+			// The scalar summary fields alone are tiny; with an empty subagent
+			// list the summary earns no place in the budget.
+			result.Summary = nil
+		}
+		line = marshalTerminationLine(result)
+	}
+	// Last resort: the summary is gone yet the line still overruns the budget.
+	// An escape-heavy reason marshals to far more bytes than its raw length
+	// (each <, > or & becomes a six-byte \uXXXX escape), so the raw-byte
+	// truncation in terminate cannot see the overrun. Cut the reason until the
+	// line fits; it is the only field left allowed to give ground and it always
+	// stays non-empty.
+	for len(line) > maxTerminationLineBytes {
+		shrunk := shrinkTerminationReason(result.Reason, len(line)-maxTerminationLineBytes)
+		if shrunk == result.Reason {
+			// The reason is at its floor and cannot give more ground. The
+			// remaining overrun (if any) belongs to the fixed fields, which we
+			// never touch; stop rather than spin.
+			break
+		}
+		result.Reason = shrunk
+		line = marshalTerminationLine(result)
+	}
+	return line
+}
+
+// shrinkTerminationReason cuts raw reason bytes so the re-marshaled handoff
+// line drops back within the termination-message budget. overflow is how many
+// bytes the current line exceeds maxTerminationLineBytes by. Each removed raw
+// byte shrinks the escaped form by at least one byte, so removing overflow
+// bytes (plus the truncation marker) closes the gap; a UTF-8-safe cut and the
+// marker keep the reason non-empty and the cut visible. It returns the reason
+// unchanged when it is already at the marker floor, so the caller can stop.
+func shrinkTerminationReason(reason string, overflow int) string {
+	const floor = len(terminationTruncationSuffix)
+	if len(reason) <= floor {
+		return reason
+	}
+	// Drop a marker a previous cut left at the tail so it is not counted as
+	// content; it is re-appended below, so the length never inflates.
+	base := reason
+	if strings.HasSuffix(base, terminationTruncationSuffix) {
+		base = base[:len(base)-floor]
+	}
+	cut := overflow + floor
+	limit := len(base) - cut
+	if limit < 0 {
+		limit = 0
+	}
+	// Never split a multi-byte rune: back off only over the UTF-8
+	// continuation bytes at the cut point.
+	for limit > 0 && base[limit]&0xC0 == 0x80 {
+		limit--
+	}
+	return base[:limit] + terminationTruncationSuffix
+}
+
+// marshalTerminationLine renders the handoff line for a fixed termination.
+func marshalTerminationLine(result termination) string {
+	payload, err := json.Marshal(result)
+	if err != nil {
+		return ""
+	}
+	return terminationLinePrefix + string(payload) + "\n"
 }

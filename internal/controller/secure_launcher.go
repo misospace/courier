@@ -730,7 +730,7 @@ func workerEnvValue(pod *corev1.Pod, name string) string {
 // coderun_controller.go's package with a narrow writer interface.
 type statusPatcher interface {
 	patchStatus(ctx context.Context, before, after *courier.CoderRun) error
-	transitionTerminal(ctx context.Context, run *courier.CoderRun, phase courier.Phase, pr string, intent terminalLifecycleIntent) (ctrl.Result, error)
+	transitionTerminal(ctx context.Context, run *courier.CoderRun, phase courier.Phase, pr string, intent terminalLifecycleIntent, telemetry *courier.RunTelemetry) (ctrl.Result, error)
 	emitPhaseTransition(run *courier.CoderRun, phase courier.Phase, detail map[string]any)
 }
 
@@ -758,7 +758,7 @@ func (s *SecureControl) transitionNeedsHuman(ctx context.Context, run *courier.C
 	if !replaced {
 		run.Status.Conditions = append(run.Status.Conditions, condition)
 	}
-	return patcher.transitionTerminal(ctx, run, courier.PhaseNeedsHuman, "", terminalLifecycleIntent{error: detail})
+	return patcher.transitionTerminal(ctx, run, courier.PhaseNeedsHuman, "", terminalLifecycleIntent{error: detail}, nil)
 }
 
 func secretObject(namespace, name string) *corev1.Secret {

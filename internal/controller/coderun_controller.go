@@ -486,7 +486,7 @@ func (r *CoderRunReconciler) terminateMissingHead(ctx context.Context, run *cour
 	run.Status.Branch = ""
 	run.Status.HeadRepo = ""
 	run.Status.HeadSHA = ""
-	terminalResult, terminalErr := r.transitionTerminal(ctx, run, courierv1alpha1.PhaseNeedsHuman, "", terminalLifecycleIntent{})
+	terminalResult, terminalErr := r.transitionTerminal(ctx, run, courierv1alpha1.PhaseNeedsHuman, "", terminalLifecycleIntent{}, nil)
 	return terminalResult, errors.Join(releaseErr, terminalErr)
 }
 
@@ -555,7 +555,7 @@ func (r *CoderRunReconciler) observeRunning(ctx context.Context, run *courierv1a
 				}
 			}
 		}
-		exitCode, terminationReason, terminationOutcome, terminated := coordinatorTermination(pod)
+		exitCode, terminationReason, terminationOutcome, terminationSummary, terminated := coordinatorTermination(pod)
 		if !terminated {
 			continue
 		}
@@ -563,6 +563,9 @@ func (r *CoderRunReconciler) observeRunning(ctx context.Context, run *courierv1a
 		if phase == courierv1alpha1.PhaseVerifying {
 			before := run.DeepCopy()
 			run.Status.Phase = courierv1alpha1.PhaseVerifying
+			if terminationSummary != nil {
+				run.Status.Telemetry = terminationSummary
+			}
 			if err := r.patchStatus(ctx, before, run); err != nil {
 				return ctrl.Result{}, err
 			}
@@ -575,7 +578,7 @@ func (r *CoderRunReconciler) observeRunning(ctx context.Context, run *courierv1a
 		if exitCode == 2 && phase == courierv1alpha1.PhaseNeedsHuman && terminationOutcome == "blocked_external" {
 			intent.error = terminationReason
 		}
-		return r.transitionTerminal(ctx, run, phase, "", intent)
+		return r.transitionTerminal(ctx, run, phase, "", intent, terminationSummary)
 	}
 	result, handled, err := r.checkLiveness(ctx, run, pods.Items)
 	if handled {
@@ -594,7 +597,7 @@ func controllerHeadRef(run *courierv1alpha1.CoderRun) HeadRef {
 
 func (r *CoderRunReconciler) observeVerifying(ctx context.Context, run *courierv1alpha1.CoderRun) (ctrl.Result, error) {
 	if r.Observer == nil {
-		return r.transitionTerminal(ctx, run, courierv1alpha1.PhaseNeedsHuman, "", terminalLifecycleIntent{})
+		return r.transitionTerminal(ctx, run, courierv1alpha1.PhaseNeedsHuman, "", terminalLifecycleIntent{}, nil)
 	}
 	observation, err := r.Observer.Observe(ctx, run.Spec.Repo, controllerHeadRef(run))
 	if err != nil {
@@ -606,10 +609,10 @@ func (r *CoderRunReconciler) observeVerifying(ctx context.Context, run *courierv
 		// Someone merged the PR while this run was working: the work shipped.
 		// Done resolves the source and applies the reap policy; it is not a
 		// case for a human.
-		return r.transitionTerminal(ctx, run, courierv1alpha1.PhaseDone, pr, terminalLifecycleIntent{})
+		return r.transitionTerminal(ctx, run, courierv1alpha1.PhaseDone, pr, terminalLifecycleIntent{}, nil)
 	}
 	if state == observationNeedsHuman || state == observationFailed {
-		return r.transitionTerminal(ctx, run, courierv1alpha1.PhaseNeedsHuman, pr, terminalLifecycleIntent{})
+		return r.transitionTerminal(ctx, run, courierv1alpha1.PhaseNeedsHuman, pr, terminalLifecycleIntent{}, nil)
 	}
 	// status.checkFingerprint is the prior all-green candidate: the identity
 	// of the last poll on which every observed check passed. Green settles
@@ -633,7 +636,7 @@ func (r *CoderRunReconciler) observeVerifying(ctx context.Context, run *courierv
 		return ctrl.Result{}, err
 	}
 	if settled {
-		return r.transitionTerminal(ctx, run, courierv1alpha1.PhaseAwaitingReview, pr, terminalLifecycleIntent{})
+		return r.transitionTerminal(ctx, run, courierv1alpha1.PhaseAwaitingReview, pr, terminalLifecycleIntent{}, nil)
 	}
 	return ctrl.Result{RequeueAfter: observationRequeueDelay}, nil
 }
@@ -661,7 +664,7 @@ func (r *CoderRunReconciler) enrichTerminalPR(ctx context.Context, run *courierv
 	return observation.PR
 }
 
-func (r *CoderRunReconciler) transitionTerminal(ctx context.Context, run *courierv1alpha1.CoderRun, phase courierv1alpha1.Phase, pr string, intent terminalLifecycleIntent) (ctrl.Result, error) {
+func (r *CoderRunReconciler) transitionTerminal(ctx context.Context, run *courierv1alpha1.CoderRun, phase courierv1alpha1.Phase, pr string, intent terminalLifecycleIntent, telemetry *courierv1alpha1.RunTelemetry) (ctrl.Result, error) {
 	if phase == courierv1alpha1.PhaseNeedsHuman || phase == courierv1alpha1.PhaseFailed {
 		if pr == "" {
 			pr = r.enrichTerminalPR(ctx, run)
@@ -676,6 +679,9 @@ func (r *CoderRunReconciler) transitionTerminal(ctx context.Context, run *courie
 	run.Status.Phase = phase
 	if pr != "" {
 		run.Status.PR = pr
+	}
+	if telemetry != nil {
+		run.Status.Telemetry = telemetry
 	}
 	if phaseChanged {
 		// finishedAt marks when the run's own execution ended: it is
@@ -695,7 +701,7 @@ func (r *CoderRunReconciler) transitionTerminal(ctx context.Context, run *courie
 	// Write the terminal phase first so the run stops holding lane capacity
 	// regardless of whether the source lifecycle report below succeeds. The
 	// run's own terminalization must never depend on the source.
-	if run.Status.Phase != before.Status.Phase || run.Status.PR != before.Status.PR {
+	if run.Status.Phase != before.Status.Phase || run.Status.PR != before.Status.PR || !reflect.DeepEqual(run.Status.Telemetry, before.Status.Telemetry) {
 		if err := r.patchStatus(ctx, before, run); err != nil {
 			return ctrl.Result{}, err
 		}
@@ -781,6 +787,11 @@ func (r *CoderRunReconciler) publishSourceLifecycle(ctx context.Context, run *co
 	}
 	lifecycle := lifecycleForPhase(phase, state, run.Status.PR, startedAt, intent)
 	lifecycle.IdempotencyKey = lifecycleIdempotencyKey(run, phase)
+	if run.Status.Telemetry != nil {
+		if raw, err := json.Marshal(run.Status.Telemetry); err == nil {
+			lifecycle.Telemetry = raw
+		}
+	}
 	return reportLifecycle(ctx, adapter, item, lifecycle)
 }
 
@@ -953,6 +964,9 @@ func (r *CoderRunReconciler) patchStatus(ctx context.Context, before, after *cou
 	if !reflect.DeepEqual(before.Status.Conditions, after.Status.Conditions) {
 		fields.Conditions = after.Status.Conditions
 	}
+	if !reflect.DeepEqual(before.Status.Telemetry, after.Status.Telemetry) {
+		fields.Telemetry = after.Status.Telemetry
+	}
 	if reflect.DeepEqual(fields, status.OperatorPatch{}) {
 		return nil
 	}
@@ -980,11 +994,12 @@ func podBelongsToRun(pod *corev1.Pod, run *courierv1alpha1.CoderRun) bool {
 }
 
 type terminationMessage struct {
-	Phase    string `json:"phase"`
-	Result   string `json:"result"`
-	ExitCode int32  `json:"exit_code"`
-	Reason   string `json:"reason"`
-	Outcome  string `json:"outcome"`
+	Phase    string                        `json:"phase"`
+	Result   string                        `json:"result"`
+	ExitCode int32                         `json:"exit_code"`
+	Reason   string                        `json:"reason"`
+	Outcome  string                        `json:"outcome"`
+	Summary  *courierv1alpha1.RunTelemetry `json:"summary"`
 }
 
 func validTerminationPhaseResult(exitCode int32, phase, result string) bool {
@@ -1028,22 +1043,24 @@ func durationString(d time.Duration) string {
 	return d.Round(time.Second).String()
 }
 
-func coordinatorTermination(pod *corev1.Pod) (int32, string, string, bool) {
+func coordinatorTermination(pod *corev1.Pod) (int32, string, string, *courierv1alpha1.RunTelemetry, bool) {
 	for _, status := range pod.Status.ContainerStatuses {
 		if status.Name != "coordinator" || status.State.Terminated == nil {
 			continue
 		}
 		terminated := status.State.Terminated
 		code, reason, outcome := terminated.ExitCode, "", ""
+		var summary *courierv1alpha1.RunTelemetry
 		var message terminationMessage
 		rawMessage := strings.TrimSpace(terminated.Message)
 		const handoffPrefix = "COURIER_TERMINATION "
 		if payload, ok := strings.CutPrefix(rawMessage, handoffPrefix); ok && json.Unmarshal([]byte(payload), &message) == nil && message.ExitCode == code && validTerminationPhaseResult(code, message.Phase, message.Result) {
 			reason, outcome = strings.TrimSpace(message.Reason), strings.TrimSpace(message.Outcome)
+			summary = message.Summary
 		}
-		return code, reason, outcome, true
+		return code, reason, outcome, summary, true
 	}
-	return 0, "", "", false
+	return 0, "", "", nil, false
 }
 
 // exitDeclaredNoChange is the executor's verified no_change_needed exit.

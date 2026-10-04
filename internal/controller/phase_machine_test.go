@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"reflect"
 	"testing"
 
 	corev1 "k8s.io/api/core/v1"
@@ -1005,7 +1006,7 @@ func TestTerminalLifecycleReportsToSource(t *testing.T) {
 					t.Fatalf("Reconcile() %d error = %v", attempt+1, err)
 				}
 			}
-			if len(item.reports) != 1 || item.reports[0] != tt.wantReport {
+			if len(item.reports) != 1 || !reflect.DeepEqual(item.reports[0], tt.wantReport) {
 				t.Fatalf("reports = %#v, want %#v", item.reports, []source.Lifecycle{tt.wantReport})
 			}
 			var updated courierv1alpha1.CoderRun
@@ -1214,27 +1215,34 @@ func coordinatorPodWithOutcome(run *courierv1alpha1.CoderRun, exitCode int32, ou
 func TestCoordinatorTerminationReadsOutcomeOnlyFromMatchingHandoff(t *testing.T) {
 	run := admissionRun("run", "local", courierv1alpha1.PhaseRunning)
 	pod := coordinatorPodWithOutcome(run, 2, "blocked_external", "missing prerequisite")
-	if code, reason, outcome, terminated := coordinatorTermination(pod); !terminated || code != 2 || reason != "missing prerequisite" || outcome != "blocked_external" {
-		t.Fatalf("coordinatorTermination() = (%d, %q, %q, %t), want the trusted handoff", code, reason, outcome, terminated)
+	if code, reason, outcome, summary, terminated := coordinatorTermination(pod); !terminated || code != 2 || reason != "missing prerequisite" || outcome != "blocked_external" || summary != nil {
+		t.Fatalf("coordinatorTermination() = (%d, %q, %q, %#v, %t), want the trusted handoff", code, reason, outcome, summary, terminated)
 	}
 
 	pod.Status.ContainerStatuses[0].State.Terminated.ExitCode = 1
-	if code, reason, outcome, terminated := coordinatorTermination(pod); !terminated || code != 1 || reason != "" || outcome != "" {
-		t.Fatalf("mismatched handoff = (%d, %q, %q, %t), want exit code only", code, reason, outcome, terminated)
+	if code, reason, outcome, summary, terminated := coordinatorTermination(pod); !terminated || code != 1 || reason != "" || outcome != "" || summary != nil {
+		t.Fatalf("mismatched handoff = (%d, %q, %q, %#v, %t), want exit code only", code, reason, outcome, summary, terminated)
 	}
 
 	pod = coordinatorPod(run, 2)
 	pod.Status.ContainerStatuses[0].State.Terminated.Message = `{"phase":"NeedsHuman","result":"needs-human","exit_code":2,"outcome":"blocked_external","reason":"untrusted"}`
-	if code, reason, outcome, terminated := coordinatorTermination(pod); !terminated || code != 2 || reason != "" || outcome != "" {
-		t.Fatalf("unprefixed handoff = (%d, %q, %q, %t), want exit code only", code, reason, outcome, terminated)
+	if code, reason, outcome, summary, terminated := coordinatorTermination(pod); !terminated || code != 2 || reason != "" || outcome != "" || summary != nil {
+		t.Fatalf("unprefixed handoff = (%d, %q, %q, %#v, %t), want exit code only", code, reason, outcome, summary, terminated)
 	}
 	pod.Status.ContainerStatuses[0].State.Terminated.Message = `COURIER_TERMINATION {"phase":"","result":"","exit_code":2,"outcome":"blocked_external","reason":"untrusted"}`
-	if code, reason, outcome, terminated := coordinatorTermination(pod); !terminated || code != 2 || reason != "" || outcome != "" {
-		t.Fatalf("prefixed untrusted payload = (%d, %q, %q, %t), want exit code only", code, reason, outcome, terminated)
+	if code, reason, outcome, summary, terminated := coordinatorTermination(pod); !terminated || code != 2 || reason != "" || outcome != "" || summary != nil {
+		t.Fatalf("prefixed untrusted payload = (%d, %q, %q, %#v, %t), want exit code only", code, reason, outcome, summary, terminated)
 	}
 	pod.Status.ContainerStatuses[0].State.Terminated.Message = `COURIER_TERMINATION {"phase":"Failed","result":"failure","exit_code":2,"outcome":"blocked_external","reason":"untrusted"}`
-	if code, reason, outcome, terminated := coordinatorTermination(pod); !terminated || code != 2 || reason != "" || outcome != "" {
-		t.Fatalf("phase/result mismatch = (%d, %q, %q, %t), want exit code only", code, reason, outcome, terminated)
+	if code, reason, outcome, summary, terminated := coordinatorTermination(pod); !terminated || code != 2 || reason != "" || outcome != "" || summary != nil {
+		t.Fatalf("phase/result mismatch = (%d, %q, %q, %#v, %t), want exit code only", code, reason, outcome, summary, terminated)
+	}
+
+	// A trusted handoff may carry a per-run telemetry summary.
+	pod = coordinatorPod(run, 0)
+	pod.Status.ContainerStatuses[0].State.Terminated.Message = `COURIER_TERMINATION {"phase":"Verifying","result":"success","exit_code":0,"summary":{"modelCalls":3,"toolCalls":5,"maxContext":12345,"durationMillis":65500,"continuations":1}}`
+	if code, _, _, summary, terminated := coordinatorTermination(pod); !terminated || code != 0 || summary == nil || summary.ModelCalls != 3 || summary.ToolCalls != 5 || summary.Continuations != 1 {
+		t.Fatalf("coordinatorTermination() summary = %#v, want the parsed handoff summary", summary)
 	}
 }
 

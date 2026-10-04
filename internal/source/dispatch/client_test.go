@@ -485,6 +485,67 @@ func TestHTTPClientReportOmitsEmptyIdempotencyKey(t *testing.T) {
 	}
 }
 
+func TestHTTPClientReportEmbedsTelemetry(t *testing.T) {
+	var request map[string]any
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/prefix/api/agents/worker/tasks/report" {
+			t.Fatalf("path = %q", r.URL.Path)
+		}
+		body, _ := io.ReadAll(r.Body)
+		if err := json.Unmarshal(body, &request); err != nil {
+			t.Fatal(err)
+		}
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer server.Close()
+	client, err := NewClientWithLane(server.URL+"/prefix/", "worker", "normal", "secret-token", time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	id := EncodeWorkID(Task{Type: "implement", Issue: &Issue{Repo: "acme/widgets", Number: 42}})
+	telemetry, err := json.Marshal(map[string]any{"modelCalls": 3})
+	if err != nil {
+		t.Fatal(err)
+	}
+	lifecycle := source.Lifecycle{State: source.StateInReview, Result: source.ResultReady, PR: "https://github.com/acme/widgets/pull/77", Telemetry: telemetry}
+	if err := client.Report(context.Background(), id, lifecycle); err != nil {
+		t.Fatal(err)
+	}
+	embedded, ok := request["telemetry"].(map[string]any)
+	if !ok {
+		t.Fatalf("request telemetry = %#v, want an embedded telemetry object", request["telemetry"])
+	}
+	if embedded["modelCalls"] != float64(3) {
+		t.Fatalf("request telemetry = %#v, want modelCalls 3", embedded)
+	}
+}
+
+func TestHTTPClientReportOmitsAbsentTelemetry(t *testing.T) {
+	var request map[string]any
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/prefix/api/agents/worker/tasks/report" {
+			t.Fatalf("path = %q", r.URL.Path)
+		}
+		body, _ := io.ReadAll(r.Body)
+		if err := json.Unmarshal(body, &request); err != nil {
+			t.Fatal(err)
+		}
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer server.Close()
+	client, err := NewClientWithLane(server.URL+"/prefix/", "worker", "normal", "secret-token", time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	id := EncodeWorkID(Task{Type: "implement", Issue: &Issue{Repo: "acme/widgets", Number: 42}})
+	if err := client.Report(context.Background(), id, source.Lifecycle{State: source.StateInReview, Result: source.ResultReady, PR: "https://github.com/acme/widgets/pull/77"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := request["telemetry"]; ok {
+		t.Fatalf("request unexpectedly included telemetry: %#v", request)
+	}
+}
+
 func TestHTTPClientReportCarriesStartedAt(t *testing.T) {
 	var request map[string]any
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
