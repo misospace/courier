@@ -1,26 +1,27 @@
-// Command courier-control is the trusted control pod's entrypoint. In the
-// #123 build it bootstraps the control identity, probes the semantic
-// capabilities the harness depends on (the worker protocol, the broker
-// identity chain), and declares the run NeedsHuman with an actionable reason:
-// the native model client — planning, delegation, integration, publication —
-// is the #124 build and is deliberately absent here. There is no silent
-// fallback to the legacy OpenCode shim.
+// Command courier-control is the trusted control pod's entrypoint: the
+// native coordinator harness (HARNESS.md §5). It bootstraps the control
+// identity, probes the semantic capabilities the harness depends on, and —
+// when the required capabilities are healthy — runs the coordinator loop:
+// model sessions normalized in trusted control, delegation to the untrusted
+// worker over the signed protocol, and the terminal outcome declaration.
+// A capability gate failure declares the run NeedsHuman with the redacted
+// capability table. There is no silent fallback to the legacy OpenCode shim.
 package main
 
 import (
 	"context"
 	"crypto/ed25519"
-	"crypto/tls"
-	"crypto/x509"
 	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
-	"net/http"
-	"net/url"
 	"os"
+	"os/signal"
+	"syscall"
 	"time"
 
+	"github.com/misospace/courier/internal/executor"
+	"github.com/misospace/courier/internal/harness"
 	"github.com/misospace/courier/internal/protocol"
 	"github.com/misospace/courier/internal/topology"
 )
@@ -32,12 +33,6 @@ type termination struct {
 	Result   string `json:"result"`
 	ExitCode int32  `json:"exit_code"`
 	Reason   string `json:"reason"`
-}
-
-type capability struct {
-	Name   string `json:"name"`
-	State  string `json:"state"` // configured | healthy | unavailable
-	Detail string `json:"detail,omitempty"`
 }
 
 func main() {
@@ -59,55 +54,172 @@ func runArgs(args []string) error {
 	if err != nil {
 		return err
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), probeTimeout)
-	defer cancel()
-
-	caps := probeCapabilities(ctx, identity)
-	caps = append(caps, capability{
-		Name:   "model-bindings",
-		State:  "unavailable",
-		Detail: "the native model harness is not part of this build; secure runs require the #124 coordinator",
-	})
-
-	// The honest terminal declaration: without the model client the run
-	// cannot proceed, and failing closed is the contract. A human sees the
-	// capability table in the termination reason.
-	reason := "secure topology is healthy but the native model harness is not implemented in this build"
-	if detail := unavailableDetails(caps); detail != "" {
-		reason = detail
+	invocation, err := executor.InvocationFromEnv(os.Getenv)
+	if err != nil {
+		return fmt.Errorf("courier-control: run context: %w", err)
 	}
-	return declareNeedsHuman(reason, caps)
+	bindings, err := harness.BindRoles(invocation.Roles)
+	if err != nil {
+		return fmt.Errorf("courier-control: lane roles: %w", err)
+	}
+	gateway := &harness.Gateway{BaseURL: os.Getenv(topology.EnvGatewayURL)}
+	if keyFile := os.Getenv(topology.EnvGatewayKeyFile); keyFile != "" {
+		key, err := os.ReadFile(keyFile)
+		if err != nil || len(key) == 0 {
+			return errors.New("courier-control: projected model gateway key is missing")
+		}
+		gateway.APIKey = string(key)
+	}
+
+	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
+	defer cancel()
+	probeCtx, cancelProbe := context.WithTimeout(ctx, probeTimeout)
+	defer cancelProbe()
+
+	// Startup capability health (§5): every semantic capability the harness
+	// depends on is probed and named. Required and unavailable fails closed
+	// before any model work starts; optional capabilities proceed degraded.
+	caps := harness.ProbeCapabilities(probeCtx, harness.ProbeDeps{
+		Gateway:            gateway,
+		Bindings:           bindings,
+		Broker:             identity.brokerProber(),
+		Mode:               string(invocation.Mode),
+		PublicationPresent: false, // the publisher lands with #125
+		ProbeWorker: func(probeCtx context.Context) harness.Capability {
+			return identity.probeWorker(probeCtx)
+		},
+		ModelProbe: func(probeCtx context.Context, model string) error {
+			return probeModel(probeCtx, gateway, model)
+		},
+	})
+	if _, err := harness.Gate(caps); err != nil {
+		return declareNeedsHuman(err.Error(), caps)
+	}
+	fmt.Printf("capability health: %s\n", mustJSON(caps))
+
+	// The coordinator loop. It is interrupted by pod termination (context),
+	// not by any wall-clock run limit.
+	coordinator, err := harness.NewCoordinator(harness.CoordinatorConfig{
+		Gateway:  gateway,
+		Bindings: bindings,
+		Worker:   identity.delegator(),
+		Activity: nil, // earned-activity status wiring is #126's seam
+	})
+	if err != nil {
+		return fmt.Errorf("courier-control: %w", err)
+	}
+	result := coordinator.Run(ctx, invocation)
+	return declare(result)
+}
+
+// declare maps the harness result onto the operator's exit contract:
+// changes exits 0 (Verifying), no_change_needed exits 3 (AwaitingReview),
+// needs_decision and blocked_external exit 2 (NeedsHuman), and an
+// infrastructure failure or undeclared ending exits 1 so the operator's
+// relaunch and crashloop backstop own the recovery. The structured result is
+// written to the termination file in every case — the exit code alone is
+// never the classification.
+func declare(result executor.HarnessResult) error {
+	reason := result.Reason
+	exit := int32(1)
+	phase := "Failed"
+	declared := "undeclared"
+	switch {
+	case result.Err != nil && result.Outcome == executor.OutcomeChanges:
+		// Declared changes, publication failed: infrastructure failure that
+		// a relaunch reconciles against the world.
+		declared = string(result.Outcome)
+		reason = result.Err.Error()
+	case result.Err != nil:
+		reason = result.Err.Error()
+	case result.Outcome == executor.OutcomeChanges:
+		exit, phase, declared = 0, "Verifying", string(result.Outcome)
+	case result.Outcome == executor.OutcomeNoChangeNeeded:
+		exit, phase, declared = 3, "AwaitingReview", string(result.Outcome)
+	case result.Outcome == executor.OutcomeNeedsDecision, result.Outcome == executor.OutcomeBlockedExternal:
+		exit, phase, declared = 2, "NeedsHuman", string(result.Outcome)
+	}
+	payload, err := json.Marshal(termination{
+		Phase:    phase,
+		Result:   declared,
+		ExitCode: exit,
+		Reason:   reason,
+	})
+	if err != nil {
+		return err
+	}
+	fmt.Printf("COURIER_TERMINATION %s\n", payload)
+	if path := os.Getenv("COURIER_TERMINATION_FILE"); path != "" {
+		prefixed := append([]byte("COURIER_TERMINATION "), payload...)
+		if err := os.WriteFile(path, prefixed, 0o600); err != nil {
+			return fmt.Errorf("courier-control: write termination file: %w", err)
+		}
+	}
+	os.Exit(int(exit))
+	return nil
+}
+
+// declareNeedsHuman writes the structured NeedsHuman handoff with the
+// capability table as the reason, then exits 2 — the operator's fail-closed
+// contract for a run that cannot proceed.
+func declareNeedsHuman(reason string, caps []harness.Capability) error {
+	payload, err := json.Marshal(termination{
+		Phase:    "NeedsHuman",
+		Result:   "needs-human",
+		ExitCode: 2,
+		Reason:   reason,
+	})
+	if err != nil {
+		return err
+	}
+	fmt.Printf("COURIER_TERMINATION %s\n", payload)
+	if path := os.Getenv("COURIER_TERMINATION_FILE"); path != "" {
+		prefixed := append([]byte("COURIER_TERMINATION "), payload...)
+		if err := os.WriteFile(path, prefixed, 0o600); err != nil {
+			return fmt.Errorf("courier-control: write termination file: %w", err)
+		}
+	}
+	table, _ := json.Marshal(caps)
+	fmt.Printf("capability health: %s\n", table)
+	os.Exit(2)
+	return nil
+}
+
+func mustJSON(value any) string {
+	data, err := json.Marshal(value)
+	if err != nil {
+		return "{}"
+	}
+	return string(data)
 }
 
 type controlIdentity struct {
-	runUID          string
-	controlUID      string
-	workerUID       string
-	workerURL       string
-	brokerURL       string
-	brokerStatusURL string
-	signingKey      ed25519.PrivateKey
-	brokerToken     []byte
-	brokerCA        []byte
+	runUID      string
+	controlUID  string
+	workerUID   string
+	workerURL   string
+	brokerURL   string
+	signingKey  []byte
+	brokerToken []byte
+	brokerCA    []byte
 }
 
 func loadIdentity() (*controlIdentity, error) {
 	out := &controlIdentity{
-		runUID:          os.Getenv(topology.EnvRunUID),
-		controlUID:      os.Getenv(topology.EnvControlPodUID),
-		workerUID:       os.Getenv(topology.EnvWorkerPodUID),
-		workerURL:       os.Getenv(topology.EnvWorkerURL),
-		brokerURL:       os.Getenv(topology.EnvBrokerURL),
-		brokerStatusURL: os.Getenv(topology.EnvBrokerStatusURL),
+		runUID:     os.Getenv(topology.EnvRunUID),
+		controlUID: os.Getenv(topology.EnvControlPodUID),
+		workerUID:  os.Getenv(topology.EnvWorkerPodUID),
+		workerURL:  os.Getenv(topology.EnvWorkerURL),
+		brokerURL:  os.Getenv(topology.EnvBrokerURL),
 	}
 	if out.runUID == "" || out.controlUID == "" || out.workerUID == "" || out.workerURL == "" || out.brokerURL == "" {
 		return nil, errors.New("courier-control: identity environment is incomplete")
 	}
 	key, err := os.ReadFile(os.Getenv(topology.EnvSigningKeyFile))
-	if err != nil || len(key) != ed25519.PrivateKeySize {
+	if err != nil || len(key) != 64 {
 		return nil, errors.New("courier-control: signing key is missing or unusable")
 	}
-	out.signingKey = ed25519.PrivateKey(key)
+	out.signingKey = key
 	out.brokerToken, err = os.ReadFile(os.Getenv(topology.EnvBrokerTokenFile))
 	if err != nil || len(out.brokerToken) == 0 {
 		return nil, errors.New("courier-control: projected broker token is missing")
@@ -119,127 +231,83 @@ func loadIdentity() (*controlIdentity, error) {
 	return out, nil
 }
 
-func probeCapabilities(ctx context.Context, identity *controlIdentity) []capability {
-	caps := make([]capability, 0, 2)
-	caps = append(caps, probeWorker(ctx, identity))
-	caps = append(caps, probeBroker(ctx, identity))
-	return caps
+// delegator wires the signed worker protocol for the harness.
+func (i *controlIdentity) delegator() *harness.Delegator {
+	key := make(ed25519.PrivateKey, ed25519.PrivateKeySize)
+	copy(key, i.signingKey)
+	delegator, err := harness.NewDelegator(&protocol.Client{BaseURL: i.workerURL}, harness.WorkerIdentity{
+		RunUID:        i.runUID,
+		ControlPodUID: i.controlUID,
+		WorkerPodUID:  i.workerUID,
+		Key:           key,
+	})
+	if err != nil {
+		// Identity was validated at load; this is unreachable in practice
+		// and failing closed here is correct if it ever happens.
+		panic("courier-control: worker delegator rejected identity: " + err.Error())
+	}
+	return delegator
+}
+
+// brokerProber reaches the broker's typed capability report over TLS.
+func (i *controlIdentity) brokerProber() *harness.BrokerProbeClient {
+	return &harness.BrokerProbeClient{BaseURL: i.brokerURL, Token: i.brokerToken, CA: i.brokerCA}
 }
 
 // probeWorker exercises the signed worker protocol end to end: snapshot
 // upload, dispatch, and a verified result. The probe task is inert.
-func probeWorker(ctx context.Context, identity *controlIdentity) capability {
-	client := &protocol.Client{BaseURL: identity.workerURL}
+func (i *controlIdentity) probeWorker(ctx context.Context) harness.Capability {
+	client := &protocol.Client{BaseURL: i.workerURL}
 	if err := client.UploadSnapshot(ctx, []byte("courier-control capability probe")); err != nil {
-		return capability{Name: "worker-protocol", State: "unavailable", Detail: "snapshot upload failed"}
+		return harness.Capability{Name: "worker-protocol", State: harness.StateUnavailable, Detail: "snapshot upload failed", Required: true}
 	}
 	task, err := json.Marshal(protocol.Task{Command: []string{"git", "--version"}})
 	if err != nil {
-		return capability{Name: "worker-protocol", State: "unavailable", Detail: "task encoding failed"}
+		return harness.Capability{Name: "worker-protocol", State: harness.StateUnavailable, Detail: "task encoding failed", Required: true}
 	}
 	env := protocol.NewEnvelope(time.Now(), 5*time.Minute, task)
 	env.Kind = protocol.KindDispatch
-	env.RunUID = identity.runUID
-	env.ControlPodUID = identity.controlUID
-	env.WorkerPodUID = identity.workerUID
+	env.RunUID = i.runUID
+	env.ControlPodUID = i.controlUID
+	env.WorkerPodUID = i.workerUID
 	env.BriefID = "capability-probe"
 	env.OpID = "capability-probe"
-	if _, err := client.Dispatch(ctx, identity.signingKey, env, task); err != nil {
-		return capability{Name: "worker-protocol", State: "unavailable", Detail: "dispatch failed"}
+	if _, err := client.Dispatch(ctx, ed25519.PrivateKey(i.signingKey), env, task); err != nil {
+		return harness.Capability{Name: "worker-protocol", State: harness.StateUnavailable, Detail: "dispatch failed", Required: true}
 	}
 	deadline := time.Now().Add(30 * time.Second)
 	for {
 		state, err := client.Result(ctx, env.OpID)
 		if err != nil {
-			return capability{Name: "worker-protocol", State: "unavailable", Detail: "result poll failed"}
+			return harness.Capability{Name: "worker-protocol", State: harness.StateUnavailable, Detail: "result poll failed", Required: true}
 		}
 		if state.Status == protocol.ResultCompleted {
-			return capability{Name: "worker-protocol", State: "healthy"}
+			return harness.Capability{Name: "worker-protocol", State: harness.StateHealthy, Required: true}
 		}
 		if state.Status == protocol.ResultFailed || state.Status == protocol.ResultCancelled {
-			return capability{Name: "worker-protocol", State: "unavailable", Detail: "probe task did not complete"}
+			return harness.Capability{Name: "worker-protocol", State: harness.StateUnavailable, Detail: "probe task did not complete", Required: true}
 		}
 		if time.Now().After(deadline) {
-			return capability{Name: "worker-protocol", State: "unavailable", Detail: "probe task timed out"}
+			return harness.Capability{Name: "worker-protocol", State: harness.StateUnavailable, Detail: "probe task timed out", Required: true}
 		}
 		time.Sleep(200 * time.Millisecond)
 	}
 }
 
-// probeBroker verifies the broker identity chain: a TLS connection anchored
-// in the run's CA plus a TokenReview-authenticated call to the trusted status
-// path. A 400 (schema rejection) proves authentication passed; a 401 means
-// the identity chain failed.
-func probeBroker(ctx context.Context, identity *controlIdentity) capability {
-	pool := x509.NewCertPool()
-	if !pool.AppendCertsFromPEM(identity.brokerCA) {
-		return capability{Name: "broker-identity", State: "unavailable", Detail: "broker CA is unreadable"}
-	}
-	host := hostOnly(identity.brokerStatusURL)
-	transport := &http.Transport{TLSClientConfig: &tls.Config{RootCAs: pool, ServerName: host, MinVersion: tls.VersionTLS13}}
-	client := &http.Client{Transport: transport, Timeout: 30 * time.Second}
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, identity.brokerStatusURL+"/trusted/v1/status", nil)
-	if err != nil {
-		return capability{Name: "broker-identity", State: "unavailable", Detail: "request build failed"}
-	}
-	req.Header.Set("Authorization", "Bearer "+string(identity.brokerToken))
-	resp, err := client.Do(req)
-	if err != nil {
-		return capability{Name: "broker-identity", State: "unavailable", Detail: "broker unreachable"}
-	}
-	defer resp.Body.Close()
-	switch resp.StatusCode {
-	case http.StatusBadRequest, http.StatusUnprocessableEntity:
-		// Authenticated, then rejected on schema — the identity chain works.
-		return capability{Name: "broker-identity", State: "healthy"}
-	default:
-		return capability{Name: "broker-identity", State: "unavailable",
-			Detail: fmt.Sprintf("broker rejected the authenticated probe with status %d", resp.StatusCode)}
-	}
-}
-
-func unavailableDetails(caps []capability) string {
-	for _, c := range caps {
-		if c.Name == "model-bindings" {
-			continue
-		}
-		if c.State != "healthy" {
-			return fmt.Sprintf("capability %q is %s: %s", c.Name, c.State, c.Detail)
-		}
-	}
-	return ""
-}
-
-func hostOnly(rawURL string) string {
-	parsed, err := url.Parse(rawURL)
-	if err != nil || parsed.Host == "" {
-		return rawURL
-	}
-	return parsed.Hostname()
-}
-
-func declareNeedsHuman(reason string, caps []capability) error {
-	payload, err := json.Marshal(termination{
-		Phase:    "NeedsHuman",
-		Result:   "needs-human",
-		ExitCode: 2,
-		Reason:   reason,
+// probeModel performs one cheap completion probe for a role binding. The
+// diagnostic is a fixed category: provider response bodies are never echoed.
+func probeModel(ctx context.Context, gateway *harness.Gateway, model string) error {
+	events, err := gateway.StreamChat(ctx, harness.ChatRequest{
+		Model:    model,
+		Messages: []harness.Message{{Role: "user", Content: "Reply with the single word: ready"}},
 	})
 	if err != nil {
-		return err
+		return errors.New("model probe request could not be built")
 	}
-	// The operator's contract: the structured handoff on stdout and in the
-	// termination message file with the COURIER_TERMINATION prefix the
-	// operator's parser requires, exit code 2.
-	fmt.Printf("COURIER_TERMINATION %s\n", payload)
-	if path := os.Getenv("COURIER_TERMINATION_FILE"); path != "" {
-		prefixed := append([]byte("COURIER_TERMINATION "), payload...)
-		if err := os.WriteFile(path, prefixed, 0o600); err != nil {
-			return fmt.Errorf("courier-control: write termination file: %w", err)
+	for _, event := range events {
+		if event.Kind == harness.KindError {
+			return event.Err
 		}
 	}
-	table, _ := json.Marshal(caps)
-	fmt.Printf("capability health: %s\n", table)
-	os.Exit(2)
 	return nil
 }
