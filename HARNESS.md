@@ -1127,17 +1127,19 @@ and the acceptance tests below are satisfied.
    operator-resolved admission inputs, pre/post-push live revalidation, the
    `NeedsHuman`/retryable matrix, and provider-neutral semantics with
    fail-closed unsupported providers, including the writable fork head required
-   by #94. #122's broker enforcement layer has landed; the remaining work is
-   the per-run pod wiring and admission resolution in #123.
+   by #94. #122's broker enforcement layer and #123's per-run pod wiring and
+   admission resolution have landed (deployment-level secure mode); the native
+   model client remains #124.
 3. Settled in §5: the worker artifact contract — git bundle only, exact
    base-tip ancestry binding, fixed size/object bounds, exact ref-set
    equality, operator-resolved path scope, and worker metadata as never
    authority. #125 implements and tests it.
 4. #120 settles per-run broker topology, workload identity, worker signing,
-   network policy, and the first dependency-egress slice. #123 wires the isolated
-   pods/protocol but does not implement the Go cache; create a separate bounded
-   implementation issue #136 for that capability before claiming dependency egress is
-   ready. The residual sanctioned-path source-exfiltration risk remains explicit.
+   network policy, and the first dependency-egress slice. #123's isolated
+   pod/protocol wiring has landed but does not implement the Go cache; #136 is
+   that separate bounded implementation issue, and dependency egress is not
+   ready until it lands. The residual sanctioned-path source-exfiltration risk
+   remains explicit.
 5. Settled in §4: the provider registration surface — one deployment-level
    registry file loaded by the operator, pattern-based run selection with
    fail-closed ambiguity, canonical-identity enforcement, and a single-provider

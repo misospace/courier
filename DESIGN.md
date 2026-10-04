@@ -86,7 +86,8 @@ all workers or isolation controls are implemented or ready.
 - **Legacy coordinator pod (current):** OpenCode and model-controlled tools share
   a pod with forge credentials. Prompt permissions, process separation, MCP, and
   NetworkPolicy do not make this boundary secure.
-- **Target harness (designed, not yet established):** each run has trusted
+- **Target harness (designed; the isolation wiring is implemented as opt-in
+  secure mode, the model-facing harness is #124+):** each run has trusted
   control, a dedicated trusted broker behind a run-specific Service, and an
   isolated untrusted worker. Control owns model calls, orchestration, integration,
   and signed worker tasks; the broker holds credentials and enforces semantic
@@ -999,7 +1000,9 @@ only informs.
   process. The existing deployment must rely on credential scope and protected
   default-branch configuration as external mitigations, not as a semantic ref
   boundary.
-- **Target boundary (designed, not implemented):** trusted harness control makes
+- **Target boundary (designed; implemented for the isolation slice as opt-in
+  deployment-level secure mode — the legacy coordinator remains the default
+  and is explicitly insecure, and the model-facing harness is #124+):** trusted harness control makes
   model calls and validates model-influenced operations; one trusted broker per
   run holds forge/git credentials, enforces resolved repository/ref policy, and
   writes only that run's harness-owned status. Control authenticates with a
@@ -1017,8 +1020,11 @@ only informs.
   workload exposure; the preflight separates static admission/spec checks from
   live probes, and neither proves a privileged cluster actor cannot create or
   mutate pods outside those controls — a stated residual risk, not a closed
-  hole. [HARNESS.md](./HARNESS.md) specifies the contract and the
-  implementation blockers; none of this claims current implementation readiness.
+  hole. [HARNESS.md](./HARNESS.md) specifies the contract; the isolation wiring
+  (pods, broker, signed worker protocol, preflight, revocation) is implemented
+  behind secure mode, while the native model client, artifact integration, and
+  authenticated status semantics land in #124-#126 and real-cluster e2e
+  acceptance remains outstanding.
 - Merge remains a human gate. Neither the target broker nor autonomous roles may
   merge, mutate the queue, or access destinations outside the resolved policy.
   The target coordinator may request permitted publication, but cannot bypass
@@ -1088,9 +1094,12 @@ named items remain unresolved and must not be described as production-ready:
   contract, and #122 has landed the broker primitive layer: the pinned ordinary
   git transport, the typed forge observer adapter, the authenticated
   bundle-import endpoint, the separate trusted status handler, and the immutable
-  run-UID-bound policy engine with race-safe publication. Those primitives are
-  not a secure deployment until the per-run pod wiring, credential delivery, and
-  isolation preflight in #123 land. The forge provider registration surface is
+  run-UID-bound policy engine with race-safe publication. Those primitives
+  become a secure deployment through the per-run pod wiring, credential
+  delivery, and isolation preflight, which #123 has landed as opt-in
+  deployment-level secure mode; the native model client (#124) and the
+  authenticated status semantics (#126) remain outstanding. The forge provider
+  registration surface is
   settled in [HARNESS.md](./HARNESS.md) §4: one deployment-level registry file
   loaded by the operator, pattern-based run selection with fail-closed
   ambiguity, canonical-identity enforcement, and a single-provider broker
@@ -1113,6 +1122,22 @@ named items remain unresolved and must not be described as production-ready:
 - The exact vLLM gauge for backpressure on the target model server.
 
 ## Decisions
+
+- **2026-10-03 — #123: the secure-topology wiring is implemented as opt-in
+  deployment-level secure mode; legacy remains the default and is explicitly
+  insecure.** The operator provisions and garbage-collects, per run, one
+  trusted control pod, one untrusted worker pod, and one trusted broker pod
+  behind a run-specific Service, with the deployment-level provider registry
+  (`--forge-providers-file`), fail-closed preflight (static admission checks
+  plus multi-node live deny/allow probes), the signed worker protocol, the
+  set-once persisted publication policy, and ordered idempotent revocation.
+  The decision recorded here is the rollout shape: secure mode is deployment
+  configuration (`--secure-mode`), never a per-run or per-lane choice, and the
+  legacy single-pod coordinator keeps running unchanged until the native model
+  client (#124) and the remaining harness slices land — the control binary
+  currently declares `NeedsHuman` rather than silently falling back. Real
+  cluster e2e acceptance remains outstanding before secure mode is enabled in
+  any deployment. ([HARNESS.md](./HARNESS.md) §2-§5) (#123)
 
 A running log of architectural decisions and their reasoning, newest first. The
 body above describes the current architecture; this log preserves *why* and what

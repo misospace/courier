@@ -129,6 +129,69 @@
 {{- $_ := set $env "DISPATCH_AGENT_TOKEN" (dict "valueFrom" (dict "secretKeyRef" (dict "name" $dispatch.tokenSecret.name "key" $dispatch.tokenSecret.key))) }}
 {{- $_ := set $container "env" $env }}
 {{- end }}
+{{- $secure := .Values.secure }}
+{{- if $secure.enabled }}
+{{- if not $secure.runNamespace }}
+{{- fail "secure.enabled requires secure.runNamespace" }}
+{{- end }}
+{{- if not $secure.providers }}
+{{- fail "secure.enabled requires at least one entry in secure.providers" }}
+{{- end }}
+{{- $seenProviders := dict }}
+{{- range $registration := $secure.providers }}
+{{- if or (not $registration.name) (not $registration.type) (not $registration.endpoint) }}
+{{- fail "each secure.providers entry requires name, type, and endpoint" }}
+{{- end }}
+{{- if hasKey $seenProviders $registration.name }}
+{{- fail (printf "duplicate provider name %q in secure.providers" $registration.name) }}
+{{- end }}
+{{- $_ := set $seenProviders $registration.name true }}
+{{- if not $registration.serves }}
+{{- fail (printf "provider %q requires at least one serves pattern" $registration.name) }}
+{{- end }}
+{{- if or (not $registration.credentials) (not (index $registration.credentials "forge-api")) }}
+{{- fail (printf "provider %q requires credentials.forge-api with secretName and key" $registration.name) }}
+{{- end }}
+{{- end }}
+{{- $hasSecureMode := false }}
+{{- $hasProvidersFile := false }}
+{{- $hasRunNamespace := false }}
+{{- $hasHarnessImage := false }}
+{{- $hasProbeImage := false }}
+{{- $hasCacheService := false }}
+{{- $hasCachePort := false }}
+{{- range $arg := $args }}
+{{- if hasPrefix "--secure-mode=" $arg }}{{- $hasSecureMode = true }}{{- end }}
+{{- if hasPrefix "--forge-providers-file=" $arg }}{{- $hasProvidersFile = true }}{{- end }}
+{{- if hasPrefix "--run-namespace=" $arg }}{{- $hasRunNamespace = true }}{{- end }}
+{{- if hasPrefix "--harness-image=" $arg }}{{- $hasHarnessImage = true }}{{- end }}
+{{- if hasPrefix "--probe-image=" $arg }}{{- $hasProbeImage = true }}{{- end }}
+{{- if hasPrefix "--dependency-cache-service=" $arg }}{{- $hasCacheService = true }}{{- end }}
+{{- if hasPrefix "--dependency-cache-port=" $arg }}{{- $hasCachePort = true }}{{- end }}
+{{- end }}
+{{- if not $hasSecureMode }}{{- $args = append $args "--secure-mode=true" }}{{- end }}
+{{- if not $hasProvidersFile }}{{- $args = append $args "--forge-providers-file=/etc/courier/forge-providers.json" }}{{- end }}
+{{- if not $hasRunNamespace }}{{- $args = append $args (printf "--run-namespace=%s" $secure.runNamespace) }}{{- end }}
+{{- $harnessRepository := $secure.harnessImage.repository }}
+{{- $harnessTag := $secure.harnessImage.tag }}
+{{- if not $harnessTag }}{{- $harnessTag = .Chart.AppVersion }}{{- end }}
+{{- if not $hasHarnessImage }}{{- $args = append $args (printf "--harness-image=%s:%s" $harnessRepository $harnessTag) }}{{- end }}
+{{- if not $hasProbeImage }}{{- $args = append $args (printf "--probe-image=%s" $secure.probeImage) }}{{- end }}
+{{- if $secure.dependencyCacheService }}
+{{- if not $hasCacheService }}{{- $args = append $args (printf "--dependency-cache-service=%s" $secure.dependencyCacheService) }}{{- end }}
+{{- if $secure.dependencyCachePort }}
+{{- if not $hasCachePort }}{{- $args = append $args (printf "--dependency-cache-port=%d" (int $secure.dependencyCachePort)) }}{{- end }}
+{{- end }}
+{{- end }}
+{{- end }}
+{{- if $secure.enabled }}
+{{- $persistence := deepCopy (.Values.persistence | default dict) }}
+{{- $_ := set $persistence "forge-providers" (dict
+  "type" "configMap"
+  "name" (printf "%s-forge-providers" .Release.Name)
+  "globalMounts" (list (dict "path" "/etc/courier" "readOnly" true))) }}
+{{- $_ := set .Values "persistence" $persistence }}
+{{- end }}
 {{- $_ := set $container "args" $args }}
 
 {{- include "bjw-s.common.loader.generate" . }}

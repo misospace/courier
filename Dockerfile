@@ -27,12 +27,17 @@ RUN --mount=type=cache,target=/go/pkg/mod \
 	--mount=type=cache,target=/root/.cache/go-build \
 	CGO_ENABLED=0 GOOS=${TARGETOS:-linux} GOARCH=${TARGETARCH} \
 	go build -o manager cmd/main.go && \
-	go build -o courier-executor ./cmd/courier-executor
+	go build -o courier-executor ./cmd/courier-executor && \
+	go build -o courier-control ./cmd/courier-control && \
+	go build -o courier-worker ./cmd/courier-worker && \
+	go build -o courier-broker ./cmd/courier-broker
 
 FROM builder AS binaries-builder
 
 FROM scratch AS binaries-prebuilt
-COPY dist/manager dist/courier-executor /workspace/
+# Each image job populates dist/ with only the binaries it needs; the
+# directory copy is tolerant of that.
+COPY dist/ /workspace/
 
 FROM binaries-${BINARIES} AS binaries
 
@@ -86,6 +91,17 @@ ENV PATH=/usr/local/go/bin:${PATH} \
 	GOMODCACHE=/courier-toolchain-cache/go-mod \
 	GOCACHE=/courier-toolchain-cache/go-build \
 	GOTOOLCHAIN=local
+
+USER 65532:65532
+
+# Harness image: the secure topology's control, worker, and broker binaries
+# on the coordinator base (git + ca-certificates; no opencode usage). One
+# image for all three components keeps the release unit single.
+FROM coordinator AS harness
+
+COPY --from=binaries /workspace/courier-control /usr/local/bin/courier-control
+COPY --from=binaries /workspace/courier-worker /usr/local/bin/courier-worker
+COPY --from=binaries /workspace/courier-broker /usr/local/bin/courier-broker
 
 USER 65532:65532
 

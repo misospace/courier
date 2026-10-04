@@ -211,6 +211,54 @@ jobs:
       - name: Test coordinator scratch boundary (image)
         run: COURIER_COORDINATOR_IMAGE=courier-coordinator:ci go test -run 'Scratch|Toolchain' ./internal/executor
 
+  image-harness:
+    runs-on: ubuntu-latest
+    needs: images-classify
+    if: needs.images-classify.outputs.images_required == 'true'
+    permissions:
+      contents: read
+      pull-requests: read
+    steps:
+      - uses: actions/checkout@v7.0.1
+
+      - uses: actions/setup-go@v6.0.0
+        with:
+          go-version-file: go.mod
+
+      - name: Build harness binaries
+        run: |
+          mkdir -p dist
+          # The harness stage builds on the coordinator stage, whose contract
+          # includes the executor binary.
+          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o dist/courier-executor ./cmd/courier-executor
+          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o dist/courier-control ./cmd/courier-control
+          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o dist/courier-worker ./cmd/courier-worker
+          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o dist/courier-broker ./cmd/courier-broker
+
+      - uses: docker/setup-buildx-action@v4.4.1
+
+      - name: Build harness image
+        uses: docker/build-push-action@v7.4.0
+        with:
+          context: .
+          target: harness
+          build-args: BINARIES=prebuilt
+          tags: courier-harness:ci
+          load: true
+          cache-from: type=gha,scope=harness
+          cache-to: type=gha,mode=max,scope=harness
+
+      - name: Validate harness image
+        run: >-
+          docker run --rm --entrypoint sh courier-harness:ci
+          -c 'test -x /usr/local/bin/courier-control && test -x /usr/local/bin/courier-worker && test -x /usr/local/bin/courier-broker'
+      - name: Validate harness identity
+        run: test "$(docker inspect --format '{{.Config.User}}' courier-harness:ci)" = "65532:65532"
+      - name: Validate broker fail-closed startup
+        run: >-
+          docker run --rm courier-harness:ci /usr/local/bin/courier-broker 2>&1
+          | grep -q "requires address"
+
   image-coordinator-go:
     runs-on: ubuntu-latest
     needs: images-classify

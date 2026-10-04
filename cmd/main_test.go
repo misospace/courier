@@ -3,7 +3,10 @@ package main
 import (
 	"context"
 	"errors"
+	"os"
+	"path/filepath"
 	"reflect"
+	"strings"
 	"testing"
 
 	courierv1alpha1 "github.com/misospace/courier/api/v1alpha1"
@@ -135,5 +138,39 @@ func TestResolveDispatchBindings(t *testing.T) {
 				t.Fatalf("resolveDispatchBindings() = %#v, want %#v", got, test.want)
 			}
 		})
+	}
+}
+
+func TestBuildSecureControlRejectsTaintedLegacyCredential(t *testing.T) {
+	registryFile := filepath.Join(t.TempDir(), "providers.json")
+	providers := `{"providers":[{"name":"github","type":"github","endpoint":"https://api.github.com/","credentials":{"forge-api":{"secretName":"courier-github","key":"token"}},"serves":["*"]}]}`
+	if err := os.WriteFile(registryFile, []byte(providers), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	_, err := buildSecureControl(secureConfig{
+		providersFile:   registryFile,
+		runNamespace:    "runs",
+		harnessImage:    "harness:test",
+		probeImage:      "busybox:test",
+		legacyGitSecret: "courier-github",
+		observer:        observerWithHeadResolver{},
+		operatorNS:      "courier-system",
+	})
+	if err == nil || !strings.Contains(err.Error(), "tainted") {
+		t.Fatalf("a registration referencing a legacy-exposed Secret must fail startup, got %v", err)
+	}
+}
+
+func TestBuildSecureControlRequiresObserverCredential(t *testing.T) {
+	registryFile := filepath.Join(t.TempDir(), "providers.json")
+	providers := `{"providers":[{"name":"github","type":"github","endpoint":"https://api.github.com/","credentials":{"forge-api":{"secretName":"forge-creds","key":"token"}},"serves":["*"]}]}`
+	if err := os.WriteFile(registryFile, []byte(providers), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := buildSecureControl(secureConfig{
+		providersFile: registryFile,
+		runNamespace:  "runs",
+	}); err == nil || !strings.Contains(err.Error(), "observer") {
+		t.Fatalf("secure mode without an admission-read identity must fail startup, got %v", err)
 	}
 }
