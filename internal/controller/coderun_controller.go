@@ -15,6 +15,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
 	courierv1alpha1 "github.com/misospace/courier/api/v1alpha1"
@@ -22,6 +23,7 @@ import (
 	courierlog "github.com/misospace/courier/internal/log"
 	"github.com/misospace/courier/internal/source"
 	"github.com/misospace/courier/internal/status"
+	"github.com/misospace/courier/internal/topology"
 )
 
 // capacityRequeueDelay bounds how long a Pending run can wait behind a full
@@ -92,6 +94,27 @@ type CoderRunReconciler struct {
 	// Now is the reconciler's time source, injectable so tests never sleep.
 	// Nil falls back to time.Now.
 	Now func() time.Time
+
+	// Metrics records terminal-phase observations (run duration, queue wait,
+	// totals). Nil falls back to the process-default recorder on the
+	// controller-runtime metrics registry.
+	Metrics *RunRecorder
+
+	// Secure, when set, routes runs through the isolated control/broker/
+	// worker topology instead of the legacy single-pod coordinator. It owns
+	// admission policy resolution, preflight, provisioning, and revocation.
+	// Nil means the deployment runs legacy mode only, which stays explicitly
+	// insecure.
+	Secure *SecureControl
+}
+
+// metrics returns the run recorder to use, defaulting to the process-wide
+// recorder on the controller-runtime metrics registry.
+func (r *CoderRunReconciler) metrics() *RunRecorder {
+	if r.Metrics != nil {
+		return r.Metrics
+	}
+	return processRunRecorder()
 }
 
 // +kubebuilder:rbac:groups=courier.misospace.dev,resources=coderruns,verbs=get;list;watch;create;update;patch;delete
@@ -106,12 +129,35 @@ type CoderRunReconciler struct {
 // count. Claiming happens before launch so the claim itself reserves capacity;
 // a successful coordinator exits to Verifying, which does not reserve capacity;
 // a failed launch releases its reservation and leaves the run retryable.
+// secureTopologyFinalizer is the CoderRun finalizer for ordered revocation of
+// the per-run secure topology.
+const secureTopologyFinalizer = topology.FinalizerName
+
 func (r *CoderRunReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	l := log.FromContext(ctx)
 
 	var run courierv1alpha1.CoderRun
 	if err := r.Get(ctx, req.NamespacedName, &run); err != nil {
 		return ctrl.Result{}, client.IgnoreNotFound(err)
+	}
+
+	// A deleting secure run finishes ordered revocation before its finalizer
+	// is released; legacy runs have no topology to revoke.
+	if !run.DeletionTimestamp.IsZero() && r.Secure != nil &&
+		controllerutil.ContainsFinalizer(&run, secureTopologyFinalizer) {
+		done, err := r.Secure.Revoke(ctx, &run)
+		if err != nil {
+			return ctrl.Result{}, err
+		}
+		if !done {
+			return ctrl.Result{RequeueAfter: secureRequeueDelay}, nil
+		}
+		if err := r.Secure.RemoveFinalizer(ctx, &run); err != nil {
+			return ctrl.Result{}, err
+		}
+	}
+	if !run.DeletionTimestamp.IsZero() {
+		return ctrl.Result{}, nil
 	}
 
 	if run.Status.Phase == courierv1alpha1.PhaseRunning {
@@ -180,6 +226,9 @@ func (r *CoderRunReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 	// concurrent reconciliation cannot observe an unaccounted-for launch.
 	before := run.DeepCopy()
 	run.Status.Phase = courierv1alpha1.PhaseClaimed
+	if run.Status.AdmittedAt == nil {
+		run.Status.AdmittedAt = &metav1.Time{Time: r.clock().UTC()}
+	}
 	if err := r.patchStatus(ctx, before, &run); err != nil {
 		return ctrl.Result{}, errors.Join(err, adapter.Release(ctx, item))
 	}
@@ -204,13 +253,36 @@ func (r *CoderRunReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 		}
 	}
 
+	// Secure admission resolves and persists the immutable publication policy
+	// before any topology is provisioned: selection is fail-closed, and a
+	// permanent admission failure terminalizes the run instead of cycling
+	// claim and release.
+	if r.Secure != nil {
+		if err := r.resolvePersistSecurePolicy(ctx, &run); err != nil {
+			if permanent := (*SecureNeedsHumanError)(nil); errors.As(err, &permanent) {
+				return r.Secure.transitionNeedsHuman(ctx, &run, permanent.Detail)
+			}
+			return ctrl.Result{}, r.releaseClaim(ctx, &run, adapter, item, err)
+		}
+	}
+
 	launched := r.Launch != nil
 	if launched {
 		if err := adapter.Transition(ctx, item, source.StateInProgress); err != nil {
 			return ctrl.Result{}, r.releaseClaim(ctx, &run, adapter, item, err)
 		}
 		beforeLaunch := run.DeepCopy()
-		if err := r.Launch(ctx, &run); err != nil {
+		if r.Secure != nil {
+			result, err := r.Secure.LaunchSecure(ctx, &run)
+			if err != nil {
+				return ctrl.Result{}, r.releaseClaim(ctx, &run, adapter, item, err)
+			}
+			if result.Requeue || result.RequeueAfter > 0 {
+				// Provisioning is in flight; the run stays Claimed and the
+				// next reconcile resumes it.
+				return result, nil
+			}
+		} else if err := r.Launch(ctx, &run); err != nil {
 			return ctrl.Result{}, r.releaseClaim(ctx, &run, adapter, item, err)
 		}
 		run.Status.Phase = courierv1alpha1.PhaseRunning
@@ -264,7 +336,15 @@ func (r *CoderRunReconciler) resumeClaimed(ctx context.Context, run *courierv1al
 		return ctrl.Result{}, err
 	}
 	beforeLaunch := run.DeepCopy()
-	if err := r.Launch(ctx, run); err != nil {
+	if r.Secure != nil {
+		result, err := r.Secure.LaunchSecure(ctx, run)
+		if err != nil {
+			return ctrl.Result{}, r.releaseClaim(ctx, run, adapter, item, err)
+		}
+		if result.Requeue || result.RequeueAfter > 0 {
+			return result, nil
+		}
+	} else if err := r.Launch(ctx, run); err != nil {
 		return ctrl.Result{}, r.releaseClaim(ctx, run, adapter, item, err)
 	}
 	run.Status.Phase = courierv1alpha1.PhaseRunning
@@ -273,6 +353,37 @@ func (r *CoderRunReconciler) resumeClaimed(ctx context.Context, run *courierv1al
 	}
 	r.emitPhaseTransition(run, courierv1alpha1.PhaseRunning, map[string]any{"branch": run.Status.Branch, "lane": run.Spec.Lane})
 	return ctrl.Result{}, nil
+}
+
+// resolvePersistSecurePolicy resolves the run's immutable publication policy
+// once and persists it set-once. A persisted policy is never rewritten: a
+// later reconcile re-verifies it against the live run incarnation instead.
+func (r *CoderRunReconciler) resolvePersistSecurePolicy(ctx context.Context, run *courierv1alpha1.CoderRun) error {
+	if run.Status.PublicationPolicy != nil {
+		policy, err := VerifyPersistedPolicy(run)
+		if err != nil {
+			return secureNeedsHuman("PolicyCorrupt", "%v", err)
+		}
+		// Re-verify the registry still selects the same registration with
+		// the same projection: a changed registry applies to future
+		// admissions only, and this run's policy must stay coherent with it.
+		registration, err := r.Secure.Config.Registry.Select(run.Spec.Repo)
+		if err != nil || registration.Name != policy.ProviderConfigRef || registration.Endpoint != policy.ProviderEndpoint || registration.Projection().Digest != policy.CredentialRefDigest {
+			return secureNeedsHuman("PolicyConflict",
+				"the provider registry no longer matches this run's persisted policy")
+		}
+		return nil
+	}
+	_, policy, err := r.Secure.ResolveAdmission(ctx, run)
+	if err != nil {
+		return err
+	}
+	before := run.DeepCopy()
+	run.Status.PublicationPolicy = policy
+	if err := r.patchStatus(ctx, before, run); err != nil {
+		return err
+	}
+	return nil
 }
 
 // SetupWithManager registers the controller with the manager.
@@ -404,10 +515,45 @@ func (r *CoderRunReconciler) observeRunning(ctx context.Context, run *courierv1a
 	if err := r.List(ctx, &pods, client.InNamespace(run.Namespace)); err != nil {
 		return ctrl.Result{}, err
 	}
+	// The secure topology's operator-owned observation runs before the
+	// coordinator-termination handler below: a terminated control pod must
+	// fence its worker and take the broker down in the same reconcile that
+	// terminalizes the run. Terminal runs are never reaped, so fencing left
+	// to a later reconcile would never run at all — the untrusted executor
+	// and the credentialed broker would outlive their supervisor.
+	if r.Secure != nil {
+		securePods := make([]corev1.Pod, 0, len(pods.Items))
+		for i := range pods.Items {
+			if podBelongsToRun(&pods.Items[i], run) {
+				securePods = append(securePods, pods.Items[i])
+			}
+		}
+		result, handled, err := r.Secure.ObserveTopology(ctx, run, securePods)
+		if err != nil || handled {
+			return result, err
+		}
+	}
 	for i := range pods.Items {
 		pod := &pods.Items[i]
 		if !podBelongsToRun(pod, run) {
 			continue
+		}
+		// The world, not the operator's clock, knows when the coordinator
+		// started: record the container's own start time, once, from whatever
+		// state the pod is in. Recording a terminated pod's start before
+		// transitionTerminal lets the terminal patch pair a RunDuration with
+		// it in the same reconcile.
+		if run.Status.StartedAt == nil {
+			if start := coordinatorContainerStart(pod); !start.IsZero() {
+				before := run.DeepCopy()
+				run.Status.StartedAt = &metav1.Time{Time: start}
+				if run.Status.WaitDuration == "" {
+					run.Status.WaitDuration = durationString(start.Sub(run.CreationTimestamp.Time))
+				}
+				if err := r.patchStatus(ctx, before, run); err != nil {
+					return ctrl.Result{}, err
+				}
+			}
 		}
 		exitCode, terminationReason, terminationOutcome, terminationSummary, terminated := coordinatorTermination(pod)
 		if !terminated {
@@ -538,6 +684,16 @@ func (r *CoderRunReconciler) transitionTerminal(ctx context.Context, run *courie
 		run.Status.Telemetry = telemetry
 	}
 	if phaseChanged {
+		// finishedAt marks when the run's own execution ended: it is
+		// recorded on every terminal transition, set-once, so a later
+		// operator-marked Done (post-merge, currently unimplemented) never
+		// moves it.
+		if run.Status.FinishedAt == nil {
+			run.Status.FinishedAt = &metav1.Time{Time: r.clock().UTC()}
+			if run.Status.StartedAt != nil && run.Status.RunDuration == "" {
+				run.Status.RunDuration = durationString(run.Status.FinishedAt.Time.Sub(run.Status.StartedAt.Time))
+			}
+		}
 		// Persist report intent with the phase so retries can reproduce the same
 		// lifecycle without extending the CRD status schema.
 		r.setLifecycleReport(run, false, pendingLifecycleReason(intent), intent.error)
@@ -558,6 +714,9 @@ func (r *CoderRunReconciler) transitionTerminal(ctx context.Context, run *courie
 		// dropped) on the reconcile that entered it.
 		return ctrl.Result{}, nil
 	}
+	// The terminal phase is final, so only the reconcile that changes into it
+	// records the run's metrics; re-reconciles return above.
+	r.metrics().ObserveTerminal(run)
 	return r.publishTerminalLifecycle(ctx, run, adapter, item, phase, intent)
 }
 
@@ -618,7 +777,15 @@ func (r *CoderRunReconciler) publishSourceLifecycle(ctx context.Context, run *co
 			return err
 		}
 	}
-	lifecycle := lifecycleForPhase(phase, state, run.Status.PR, intent)
+	var startedAt *time.Time
+	if run.Status.StartedAt != nil {
+		// Copy the time to a local before taking its address: the lifecycle
+		// report must carry the observed start, not a pointer into the run's
+		// live status that a later mutation could move.
+		t := run.Status.StartedAt.Time
+		startedAt = &t
+	}
+	lifecycle := lifecycleForPhase(phase, state, run.Status.PR, startedAt, intent)
 	lifecycle.IdempotencyKey = lifecycleIdempotencyKey(run, phase)
 	if run.Status.Telemetry != nil {
 		if raw, err := json.Marshal(run.Status.Telemetry); err == nil {
@@ -713,8 +880,10 @@ func reportLifecycle(ctx context.Context, adapter source.Adapter, item source.Wo
 }
 
 // lifecycleForPhase maps a terminal phase to its source lifecycle report.
-func lifecycleForPhase(phase courierv1alpha1.Phase, state source.State, pr string, intent terminalLifecycleIntent) source.Lifecycle {
-	lifecycle := source.Lifecycle{State: state, PR: pr}
+// startedAt is the recorded coordinator start, so sources can report real run
+// durations; nil when the run never reached a recorded start.
+func lifecycleForPhase(phase courierv1alpha1.Phase, state source.State, pr string, startedAt *time.Time, intent terminalLifecycleIntent) source.Lifecycle {
+	lifecycle := source.Lifecycle{State: state, PR: pr, StartedAt: startedAt}
 	switch phase {
 	case courierv1alpha1.PhaseAwaitingReview:
 		if pr != "" {
@@ -760,6 +929,23 @@ func (r *CoderRunReconciler) patchStatus(ctx context.Context, before, after *cou
 	if before.Status.PR != after.Status.PR {
 		fields.PR = after.Status.PR
 	}
+	// Set-once fields: emitted only on the empty-to-set transition, so a
+	// patch can never clear a recorded timestamp.
+	if before.Status.AdmittedAt == nil && after.Status.AdmittedAt != nil {
+		fields.AdmittedAt = after.Status.AdmittedAt
+	}
+	if before.Status.StartedAt == nil && after.Status.StartedAt != nil {
+		fields.StartedAt = after.Status.StartedAt
+	}
+	if before.Status.FinishedAt == nil && after.Status.FinishedAt != nil {
+		fields.FinishedAt = after.Status.FinishedAt
+	}
+	if before.Status.WaitDuration == "" && after.Status.WaitDuration != "" {
+		fields.WaitDuration = after.Status.WaitDuration
+	}
+	if before.Status.RunDuration == "" && after.Status.RunDuration != "" {
+		fields.RunDuration = after.Status.RunDuration
+	}
 	if before.Status.CheckFingerprint != after.Status.CheckFingerprint {
 		fingerprint := after.Status.CheckFingerprint
 		fields.CheckFingerprint = &fingerprint
@@ -767,6 +953,13 @@ func (r *CoderRunReconciler) patchStatus(ctx context.Context, before, after *cou
 	if before.Status.Restarts != after.Status.Restarts {
 		restarts := after.Status.Restarts
 		fields.Restarts = &restarts
+	}
+	// PublicationPolicy is set-once: emitted only on the empty-to-set
+	// transition, like the timestamps above, so a persisted policy can never
+	// be rewritten or cleared by a later patch — including one carrying a
+	// mutated in-memory copy.
+	if before.Status.PublicationPolicy == nil && after.Status.PublicationPolicy != nil {
+		fields.PublicationPolicy = after.Status.PublicationPolicy
 	}
 	if !reflect.DeepEqual(before.Status.Conditions, after.Status.Conditions) {
 		fields.Conditions = after.Status.Conditions
@@ -820,6 +1013,34 @@ func validTerminationPhaseResult(exitCode int32, phase, result string) bool {
 	default:
 		return phase == "Failed" && result == "failure"
 	}
+}
+
+// coordinatorContainerStart returns the coordinator container's start time as
+// the pod's status records it: the Running state while the container is up,
+// the Terminated state once it has exited. A zero result means the pod never
+// reached a recorded start, which leaves StartedAt unset.
+func coordinatorContainerStart(pod *corev1.Pod) time.Time {
+	for _, cs := range pod.Status.ContainerStatuses {
+		if cs.Name != "coordinator" {
+			continue
+		}
+		if cs.State.Running != nil {
+			return cs.State.Running.StartedAt.Time
+		}
+		if cs.State.Terminated != nil {
+			return cs.State.Terminated.StartedAt.Time
+		}
+	}
+	return time.Time{}
+}
+
+// durationString renders a duration in Go format, clamping a negative value
+// (clock skew between the kubelet and the apiserver) to zero.
+func durationString(d time.Duration) string {
+	if d < 0 {
+		d = 0
+	}
+	return d.Round(time.Second).String()
 }
 
 func coordinatorTermination(pod *corev1.Pod) (int32, string, string, *courierv1alpha1.RunTelemetry, bool) {

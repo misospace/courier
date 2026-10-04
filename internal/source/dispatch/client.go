@@ -328,7 +328,7 @@ func (c *HTTPClient) markPRFixStale(ctx context.Context, pullRequest *PullReques
 	}, nil)
 }
 
-func (c *HTTPClient) reportTaskWithPR(ctx context.Context, d workDescriptor, outcome, failure, observedPR, idempotencyKey string, telemetry json.RawMessage) error {
+func (c *HTTPClient) reportTaskWithPR(ctx context.Context, d workDescriptor, outcome, failure, observedPR, idempotencyKey string, telemetry json.RawMessage, startedAt *time.Time) error {
 	body := map[string]any{
 		"taskType":     d.Type,
 		"outcome":      outcome,
@@ -336,6 +336,9 @@ func (c *HTTPClient) reportTaskWithPR(ctx context.Context, d workDescriptor, out
 	}
 	if idempotencyKey != "" {
 		body["idempotencyKey"] = idempotencyKey
+	}
+	if startedAt != nil {
+		body["startedAt"] = *startedAt
 	}
 	if d.Type == "followup-pr" {
 		body["pullRequestNumber"] = d.Number
@@ -427,15 +430,15 @@ func (c *HTTPClient) Report(ctx context.Context, id string, lifecycle source.Lif
 		if d.Type == "implement" {
 			outcome = "pr_opened"
 		}
-		return c.reportTaskWithPR(ctx, d, outcome, "", lifecycle.PR, lifecycle.IdempotencyKey, lifecycle.Telemetry)
+		return c.reportTaskWithPR(ctx, d, outcome, "", lifecycle.PR, lifecycle.IdempotencyKey, lifecycle.Telemetry, lifecycle.StartedAt)
 	case source.ResultBlocked:
-		reportErr := c.reportTaskWithPR(ctx, d, "blocked", lifecycle.Error, lifecycle.PR, lifecycle.IdempotencyKey, lifecycle.Telemetry)
+		reportErr := c.reportTaskWithPR(ctx, d, "blocked", lifecycle.Error, lifecycle.PR, lifecycle.IdempotencyKey, lifecycle.Telemetry, lifecycle.StartedAt)
 		if lifecycle.BlockedReportParksPRFix {
 			return reportErr
 		}
 		return errors.Join(reportErr, c.markPRFixBlocked(ctx, d, lifecycle.Error))
 	case source.ResultFailed:
-		reportErr := c.reportTaskWithPR(ctx, d, "failed", lifecycle.Error, lifecycle.PR, lifecycle.IdempotencyKey, lifecycle.Telemetry)
+		reportErr := c.reportTaskWithPR(ctx, d, "failed", lifecycle.Error, lifecycle.PR, lifecycle.IdempotencyKey, lifecycle.Telemetry, lifecycle.StartedAt)
 		return errors.Join(reportErr, c.markPRFixBlocked(ctx, d, lifecycle.Error))
 	default:
 		return nil

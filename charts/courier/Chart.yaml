@@ -4,8 +4,8 @@ description: >-
   Kubernetes operator that runs autonomous coding coordinators in pods and
   leaves reviewable pull requests for a human to merge.
 type: application
-version: 0.1.3
-appVersion: 0.1.3
+version: 0.1.4
+appVersion: 0.1.4
 home: https://github.com/misospace/courier
 sources:
   - https://github.com/misospace/courier

@@ -75,15 +75,35 @@ func (w KubePatchWriter) PatchStatus(ctx context.Context, name types.NamespacedN
 // observation discards stale green evidence, and a run that demonstrates
 // liveness resets its consecutive-crashloop counter to 0 — which omitempty on
 // a plain string or int cannot express: omitempty on a pointer omits only
-// nil, so a pointer to zero is still emitted.
+// nil, so a pointer to zero is still emitted. AdmittedAt, StartedAt,
+// FinishedAt, WaitDuration, and RunDuration are set-once: they are emitted
+// only on the transition from empty to set, so a nil or empty value is
+// omitted and a patch can never clear a recorded timestamp.
 type OperatorPatch struct {
-	Phase            courierv1alpha1.Phase `json:"phase,omitempty"`
-	Branch           *string               `json:"branch,omitempty"`
-	HeadRepo         *string               `json:"headRepo,omitempty"`
-	HeadSHA          *string               `json:"headSHA,omitempty"`
-	PR               string                `json:"pr,omitempty"`
-	CheckFingerprint *string               `json:"checkFingerprint,omitempty"`
-	Restarts         *int                  `json:"restarts,omitempty"`
+	Phase    courierv1alpha1.Phase `json:"phase,omitempty"`
+	Branch   *string               `json:"branch,omitempty"`
+	HeadRepo *string               `json:"headRepo,omitempty"`
+	HeadSHA  *string               `json:"headSHA,omitempty"`
+	PR       string                `json:"pr,omitempty"`
+	// AdmittedAt is set once, when the run leaves Pending past the lane
+	// capacity/suspend gate.
+	AdmittedAt *metav1.Time `json:"admittedAt,omitempty"`
+	// StartedAt is set once, when the coordinator container first ran.
+	StartedAt *metav1.Time `json:"startedAt,omitempty"`
+	// FinishedAt is set once, when the run reaches a terminal phase.
+	FinishedAt *metav1.Time `json:"finishedAt,omitempty"`
+	// WaitDuration is set once, when StartedAt is recorded.
+	WaitDuration string `json:"waitDuration,omitempty"`
+	// RunDuration is set once, when FinishedAt is recorded.
+	RunDuration      string  `json:"runDuration,omitempty"`
+	CheckFingerprint *string `json:"checkFingerprint,omitempty"`
+	Restarts         *int    `json:"restarts,omitempty"`
+	// PublicationPolicy is the operator-resolved immutable publication
+	// destination, persisted once at secure admission. The caller enforces
+	// set-once semantics: the operator only emits the field when the run's
+	// status has no policy yet, and never mutates a persisted one.
+	// +optional
+	PublicationPolicy *courierv1alpha1.PublicationPolicy `json:"publicationPolicy,omitempty"`
 	// Telemetry is the compact per-run summary the operator persists from
 	// the coordinator's termination handoff (#172). Pointer so it is emitted
 	// only when set and cleared only by an explicit write.

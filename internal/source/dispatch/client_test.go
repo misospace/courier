@@ -546,6 +546,56 @@ func TestHTTPClientReportOmitsAbsentTelemetry(t *testing.T) {
 	}
 }
 
+func TestHTTPClientReportCarriesStartedAt(t *testing.T) {
+	var request map[string]any
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/prefix/api/agents/worker/tasks/report" {
+			t.Fatalf("path = %q", r.URL.Path)
+		}
+		body, _ := io.ReadAll(r.Body)
+		if err := json.Unmarshal(body, &request); err != nil {
+			t.Fatal(err)
+		}
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer server.Close()
+	client, err := NewClientWithLane(server.URL+"/prefix/", "worker", "normal", "secret-token", time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	id := EncodeWorkID(Task{Type: "implement", Issue: &Issue{Repo: "acme/widgets", Number: 42}})
+	startedAt := time.Date(2026, 10, 1, 12, 34, 56, 789000000, time.UTC)
+	if err := client.Report(context.Background(), id, source.Lifecycle{State: source.StateInReview, Result: source.ResultReady, PR: "https://github.com/acme/widgets/pull/77", StartedAt: &startedAt}); err != nil {
+		t.Fatal(err)
+	}
+	if want := startedAt.Format(time.RFC3339Nano); request["startedAt"] != want {
+		t.Fatalf("request startedAt = %q, want %q", request["startedAt"], want)
+	}
+}
+
+func TestHTTPClientReportOmitsStartedAtWhenNil(t *testing.T) {
+	var request map[string]any
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		if err := json.Unmarshal(body, &request); err != nil {
+			t.Fatal(err)
+		}
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer server.Close()
+	client, err := NewClientWithLane(server.URL, "worker", "normal", "secret-token", time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	id := EncodeWorkID(Task{Type: "implement", Issue: &Issue{Repo: "acme/widgets", Number: 42}})
+	if err := client.Report(context.Background(), id, source.Lifecycle{State: source.StateInReview, Result: source.ResultReady}); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := request["startedAt"]; ok {
+		t.Fatalf("request unexpectedly included startedAt: %#v", request)
+	}
+}
+
 func TestHTTPClientReportIgnoresLifecycleWithoutResult(t *testing.T) {
 	var paths []string
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -905,6 +955,35 @@ func TestNewClientValidation(t *testing.T) {
 		})
 	}
 	if _, err := NewClientWithLane("http://example.test", "worker", "normal", "token", 0); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestHTTPClientClaimOmitsLaneQuery(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/api/issues/state" {
+			_ = json.NewEncoder(w).Encode(issueState{IssueID: "opaque-issue"})
+			return
+		}
+		if r.URL.Path != "/api/issues/claim" && r.URL.Path != "/api/issues/status" {
+			t.Fatalf("path = %q", r.URL.Path)
+		}
+		if lane := r.URL.Query().Get("lane"); lane != "" {
+			t.Fatalf("%s query = %s, want no lane parameter", r.URL.Path, r.URL.RawQuery)
+		}
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer server.Close()
+
+	client, err := NewClientWithLane(server.URL, "worker", "normal", "secret-token", time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	id := EncodeWorkID(Task{Type: "implement", Issue: &Issue{ID: "stale-client-id", Repo: "acme/widgets", Number: 42}})
+	if err := client.Claim(context.Background(), id); err != nil {
+		t.Fatal(err)
+	}
+	if err := client.SetStatus(context.Background(), id, "in-progress"); err != nil {
 		t.Fatal(err)
 	}
 }

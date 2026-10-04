@@ -18,6 +18,7 @@ env:
   MANAGER_IMAGE: ghcr.io/misospace/courier
   COORDINATOR_IMAGE: ghcr.io/misospace/courier-opencode
   TOOLCHAIN_IMAGE: ghcr.io/misospace/courier-go
+  HARNESS_IMAGE: ghcr.io/misospace/courier-harness
   CHART_REGISTRY: oci://ghcr.io/misospace/charts
 
 jobs:
@@ -89,6 +90,15 @@ jobs:
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
 
+      - name: Harness metadata
+        id: harness-meta
+        uses: docker/metadata-action@v6.2.0
+        with:
+          images: ${{ env.HARNESS_IMAGE }}
+          tags: |
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+
       - name: Build and push manager
         uses: docker/build-push-action@v7.4.0
         with:
@@ -122,11 +132,23 @@ jobs:
           cache-from: type=gha,scope=coordinator-go
           cache-to: type=gha,mode=max,scope=coordinator-go
 
+      - name: Build and push harness
+        uses: docker/build-push-action@v7.4.0
+        with:
+          context: .
+          target: harness
+          push: true
+          tags: ${{ steps.harness-meta.outputs.tags }}
+          labels: ${{ steps.harness-meta.outputs.labels }}
+          cache-from: type=gha,scope=harness
+          cache-to: type=gha,mode=max,scope=harness
+
       - name: Pull published images for validation
         run: |
           docker pull ${{ env.MANAGER_IMAGE }}:${{ steps.version.outputs.version }}
           docker pull ${{ env.COORDINATOR_IMAGE }}:${{ steps.version.outputs.version }}
           docker pull ${{ env.TOOLCHAIN_IMAGE }}:${{ steps.version.outputs.version }}
+          docker pull ${{ env.HARNESS_IMAGE }}:${{ steps.version.outputs.version }}
 
       - name: Validate manager image
         run: docker run --rm ${{ env.MANAGER_IMAGE }}:${{ steps.version.outputs.version }} --help

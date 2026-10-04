@@ -12,16 +12,20 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/runtime"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
+	"k8s.io/client-go/kubernetes"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
+	"k8s.io/client-go/rest"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/healthz"
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
+	crmetrics "sigs.k8s.io/controller-runtime/pkg/metrics"
 	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
 
 	courierv1alpha1 "github.com/misospace/courier/api/v1alpha1"
 	"github.com/misospace/courier/internal/controller"
 	"github.com/misospace/courier/internal/executor"
+	"github.com/misospace/courier/internal/forge"
 	couriergithub "github.com/misospace/courier/internal/github"
 	courierlog "github.com/misospace/courier/internal/log"
 	"github.com/misospace/courier/internal/source"
@@ -38,6 +42,18 @@ var (
 func init() {
 	utilruntime.Must(clientgoscheme.AddToScheme(scheme))
 	utilruntime.Must(courierv1alpha1.AddToScheme(scheme))
+}
+
+// stringSliceValue appends each occurrence of a repeatable flag to a slice.
+type stringSliceValue []string
+
+func (v *stringSliceValue) String() string {
+	return strings.Join(*v, ",")
+}
+
+func (v *stringSliceValue) Set(value string) error {
+	*v = append(*v, value)
+	return nil
 }
 
 func main() {
@@ -60,8 +76,16 @@ func main() {
 	var dispatchAgentName string
 	var dispatchQueueLane string
 	var dispatchLane string
+	var dispatchLaneBindings stringSliceValue
 	var dispatchPollInterval time.Duration
 	var dispatchHTTPTimeout time.Duration
+	var secureMode bool
+	var forgeProvidersFile string
+	var runNamespace string
+	var harnessImage string
+	var dependencyCacheService string
+	var dependencyCachePort int
+	var probeImage string
 	flag.StringVar(&metricsAddr, "metrics-bind-address", ":8080", "The address the metric endpoint binds to.")
 	flag.StringVar(&probeAddr, "health-probe-bind-address", ":8081", "The address the probe endpoint binds to.")
 	flag.BoolVar(&enableLeaderElection, "leader-elect", false, "Enable leader election for controller manager.")
@@ -77,11 +101,19 @@ func main() {
 	flag.StringVar(&githubMCPURL, "github-mcp-url", "", "Optional remote MCP endpoint for GitHub.")
 	flag.StringVar(&context7MCPURL, "context7-mcp-url", "", "Optional remote MCP endpoint for Context7.")
 	flag.StringVar(&metricsMCPURL, "metrics-mcp-url", "", "Optional remote MCP endpoint for metrics; absence is harmless.")
+	flag.BoolVar(&secureMode, "secure-mode", false, "Route runs through the isolated control/broker/worker topology; legacy stays the default and remains explicitly insecure.")
+	flag.StringVar(&forgeProvidersFile, "forge-providers-file", "", "Secure mode: provider registry file carrying references only.")
+	flag.StringVar(&runNamespace, "run-namespace", "", "Secure mode: the namespace dedicated to run workloads.")
+	flag.StringVar(&harnessImage, "harness-image", defaultsHarnessImage, "Secure mode: image carrying courier-control, courier-worker, and courier-broker.")
+	flag.StringVar(&dependencyCacheService, "dependency-cache-service", "", "Secure mode: namespace/name of the approved read-only dependency cache Service; empty means workers have no egress.")
+	flag.IntVar(&dependencyCachePort, "dependency-cache-port", 0, "Secure mode: cache port override; empty uses the Service's first port.")
+	flag.StringVar(&probeImage, "probe-image", defaultsProbeImage, "Secure mode: image for disposable network-probe pods.")
 	flag.BoolVar(&dispatchEnabled, "dispatch-enabled", false, "Enable Dispatch source discovery.")
 	flag.StringVar(&dispatchBaseURL, "dispatch-base-url", "", "Dispatch base URL.")
 	flag.StringVar(&dispatchAgentName, "dispatch-agent-name", "", "Dispatch agent name.")
 	flag.StringVar(&dispatchQueueLane, "dispatch-queue-lane", "", "Dispatch queue lane sent to next-task.")
 	flag.StringVar(&dispatchLane, "dispatch-lane", "", "LaneProfile assigned to discovered Dispatch work.")
+	flag.Var(&dispatchLaneBindings, "dispatch-lane-binding", "Repeatable Dispatch lane binding <queueLane>:<laneProfile>; one discovery runner per binding.")
 	flag.DurationVar(&dispatchPollInterval, "dispatch-poll-interval", 30*time.Second, "Dispatch discovery poll interval.")
 	flag.DurationVar(&dispatchHTTPTimeout, "dispatch-http-timeout", 30*time.Second, "Dispatch HTTP request timeout.")
 	opts := zap.Options{Development: true}
@@ -101,6 +133,10 @@ func main() {
 		setupLog.Error(err, "unable to start manager")
 		os.Exit(1)
 	}
+
+	// Per-lane capacity and suspension gauges are read from the live cluster
+	// at scrape time, so they need only the manager's client.
+	crmetrics.Registry.MustRegister(controller.NewLaneCollector(mgr.GetClient()))
 
 	podConfig := executor.DefaultPodConfig()
 	podConfig.Image = executorImage
@@ -149,8 +185,17 @@ func main() {
 		"manual": manual.Adapter{},
 	})
 	if dispatchEnabled {
-		if strings.TrimSpace(dispatchBaseURL) == "" || strings.TrimSpace(dispatchAgentName) == "" || strings.TrimSpace(dispatchQueueLane) == "" || strings.TrimSpace(dispatchLane) == "" {
-			setupLog.Error(fmt.Errorf("dispatch requires base URL, agent name, queue lane, and LaneProfile"), "unable to configure Dispatch source")
+		if strings.TrimSpace(dispatchBaseURL) == "" || strings.TrimSpace(dispatchAgentName) == "" {
+			setupLog.Error(fmt.Errorf("dispatch requires base URL and agent name"), "unable to configure Dispatch source")
+			os.Exit(1)
+		}
+		bindings, err := resolveDispatchBindings(dispatchQueueLane, dispatchLane, dispatchLaneBindings)
+		if err != nil {
+			setupLog.Error(err, "unable to configure Dispatch source")
+			os.Exit(1)
+		}
+		if len(bindings) == 0 {
+			setupLog.Error(fmt.Errorf("dispatch requires base URL, agent name, and at least one queue-lane/LaneProfile binding"), "unable to configure Dispatch source")
 			os.Exit(1)
 		}
 		namespace := strings.TrimSpace(os.Getenv("POD_NAMESPACE"))
@@ -163,32 +208,40 @@ func main() {
 			setupLog.Error(fmt.Errorf("DISPATCH_AGENT_TOKEN is empty"), "unable to configure Dispatch source")
 			os.Exit(1)
 		}
-		dispatchClient, err := dispatch.NewClientWithLane(dispatchBaseURL, dispatchAgentName, dispatchQueueLane, token, dispatchHTTPTimeout)
-		if err != nil {
-			setupLog.Error(err, "unable to configure Dispatch client")
-			os.Exit(1)
-		}
 		checker, err := dispatchPRStateChecker(githubObserver)
 		if err != nil {
 			setupLog.Error(err, "unable to configure Dispatch source: GitHub pull request state lookup is unavailable")
 			os.Exit(1)
 		}
-		dispatchClient.WithPullRequestStateChecker(checker)
-		dispatchAdapter := dispatch.New(dispatchClient)
-		sources.Register("dispatch", dispatchAdapter)
-		runner := source.NewRunner(mgr.GetClient(), dispatchAdapter, source.RunnerConfig{
-			Source:       "dispatch",
-			LaneProfile:  dispatchLane,
-			Namespace:    namespace,
-			PollInterval: dispatchPollInterval,
-		})
-		if err := mgr.Add(runner); err != nil {
-			setupLog.Error(err, "unable to add Dispatch discovery runner")
+		// Lifecycle calls are lane-agnostic; per-binding runners do lane-scoped discovery.
+		dispatchClient, err := dispatch.NewClient(dispatchBaseURL, dispatchAgentName, token, dispatchHTTPTimeout)
+		if err != nil {
+			setupLog.Error(err, "unable to configure Dispatch client")
 			os.Exit(1)
+		}
+		dispatchClient.WithPullRequestStateChecker(checker)
+		sources.Register("dispatch", dispatch.New(dispatchClient))
+		for _, binding := range bindings {
+			runnerClient, err := dispatch.NewClientWithLane(dispatchBaseURL, dispatchAgentName, binding.queueLane, token, dispatchHTTPTimeout)
+			if err != nil {
+				setupLog.Error(err, "unable to configure Dispatch client", "queueLane", binding.queueLane, "laneProfile", binding.laneProfile)
+				os.Exit(1)
+			}
+			runnerClient.WithPullRequestStateChecker(checker)
+			runner := source.NewRunner(mgr.GetClient(), dispatch.New(runnerClient), source.RunnerConfig{
+				Source:       "dispatch",
+				LaneProfile:  binding.laneProfile,
+				Namespace:    namespace,
+				PollInterval: dispatchPollInterval,
+			})
+			if err := mgr.Add(runner); err != nil {
+				setupLog.Error(err, "unable to add Dispatch discovery runner")
+				os.Exit(1)
+			}
 		}
 	}
 
-	if err := (&controller.CoderRunReconciler{
+	reconciler := &controller.CoderRunReconciler{
 		Client:         mgr.GetClient(),
 		Scheme:         mgr.GetScheme(),
 		Launch:         launcher.Launch,
@@ -197,7 +250,30 @@ func main() {
 		Observer:       githubObserver,
 		Events:         runEvents,
 		PRHeadResolver: existingPRHeadResolver(githubObserver),
-	}).SetupWithManager(mgr); err != nil {
+	}
+	if secureMode {
+		secure, err := buildSecureControl(secureConfig{
+			providersFile:   forgeProvidersFile,
+			runNamespace:    runNamespace,
+			harnessImage:    harnessImage,
+			probeImage:      probeImage,
+			cacheService:    dependencyCacheService,
+			cachePort:       dependencyCachePort,
+			observer:        githubObserver,
+			legacyGitSecret: gitCredentialSecret,
+			legacyAPISecret: githubCredentialSecret,
+			operatorNS:      os.Getenv("POD_NAMESPACE"),
+			restConfig:      mgr.GetConfig(),
+		})
+		if err != nil {
+			setupLog.Error(err, "unable to configure secure mode")
+			os.Exit(1)
+		}
+		secure.Client = mgr.GetClient()
+		secure.Patcher = reconciler
+		reconciler.Secure = secure
+	}
+	if err := reconciler.SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "CoderRun")
 		os.Exit(1)
 	}
@@ -215,6 +291,52 @@ func existingPRHeadResolver(observer controller.WorldObserver) controller.Existi
 	}
 	resolver, _ := observer.(controller.ExistingPRHeadResolver)
 	return resolver
+}
+
+// dispatchBinding pairs one Dispatch queue lane with one Courier LaneProfile.
+type dispatchBinding struct {
+	queueLane   string
+	laneProfile string
+}
+
+// resolveDispatchBindings normalizes the single-binding shorthand and the
+// repeatable bindings into the final list, rejecting ambiguous input and
+// duplicate queue lanes.
+func resolveDispatchBindings(queueLane, laneProfile string, repeated []string) ([]dispatchBinding, error) {
+	shorthandSet := queueLane != "" || laneProfile != ""
+	if len(repeated) > 0 && shorthandSet {
+		return nil, fmt.Errorf("dispatch: --dispatch-queue-lane/--dispatch-lane cannot be combined with --dispatch-lane-binding")
+	}
+	bindings := make([]dispatchBinding, 0, 1+len(repeated))
+	if shorthandSet {
+		if strings.TrimSpace(queueLane) == "" || strings.TrimSpace(laneProfile) == "" {
+			return nil, fmt.Errorf("dispatch: both --dispatch-queue-lane and --dispatch-lane are required for a single binding")
+		}
+		bindings = append(bindings, dispatchBinding{
+			queueLane:   strings.TrimSpace(queueLane),
+			laneProfile: strings.TrimSpace(laneProfile),
+		})
+	}
+	seenLanes := make(map[string]struct{}, len(bindings)+len(repeated))
+	for _, binding := range bindings {
+		seenLanes[binding.queueLane] = struct{}{}
+	}
+	for _, value := range repeated {
+		parts := strings.SplitN(value, ":", 2)
+		if len(parts) != 2 || strings.TrimSpace(parts[0]) == "" || strings.TrimSpace(parts[1]) == "" || (len(parts) == 2 && strings.Contains(parts[1], ":")) {
+			return nil, fmt.Errorf("dispatch: invalid lane binding %q: want <queueLane>:<laneProfile> with no colons in either half", value)
+		}
+		binding := dispatchBinding{
+			queueLane:   strings.TrimSpace(parts[0]),
+			laneProfile: strings.TrimSpace(parts[1]),
+		}
+		if _, ok := seenLanes[binding.queueLane]; ok {
+			return nil, fmt.Errorf("dispatch: duplicate queue lane %q", binding.queueLane)
+		}
+		seenLanes[binding.queueLane] = struct{}{}
+		bindings = append(bindings, binding)
+	}
+	return bindings, nil
 }
 
 func dispatchPRStateChecker(observer controller.WorldObserver) (dispatch.PullRequestStateChecker, error) {
@@ -270,4 +392,98 @@ func githubObserver(ctx context.Context, reader client.Reader, namespace, config
 		return nil, err
 	}
 	return couriergithub.Observer{Client: githubClient}, nil
+}
+
+// secureConfig carries the parsed secure-mode flags into buildSecureControl.
+type secureConfig struct {
+	providersFile   string
+	runNamespace    string
+	harnessImage    string
+	probeImage      string
+	cacheService    string
+	cachePort       int
+	observer        controller.WorldObserver
+	legacyGitSecret string
+	legacyAPISecret string
+	operatorNS      string
+	restConfig      *rest.Config
+}
+
+const (
+	defaultsHarnessImage = "ghcr.io/misospace/courier-harness:latest"
+	defaultsProbeImage   = "busybox:1.36"
+)
+
+// buildSecureControl loads and validates the provider registry, rejects
+// registrations that reference a credential exposed to legacy pods (the §9
+// taint rule, enforced where the deployment configuration is knowable), and
+// assembles the secure control.
+func buildSecureControl(config secureConfig) (*controller.SecureControl, error) {
+	if strings.TrimSpace(config.providersFile) == "" {
+		return nil, fmt.Errorf("secure mode requires --forge-providers-file")
+	}
+	if strings.TrimSpace(config.runNamespace) == "" {
+		return nil, fmt.Errorf("secure mode requires --run-namespace")
+	}
+	data, err := os.ReadFile(config.providersFile)
+	if err != nil {
+		return nil, fmt.Errorf("read forge providers file: %w", err)
+	}
+	registry, err := forge.Load(data, "github")
+	if err != nil {
+		return nil, err
+	}
+	tainted := map[string]bool{
+		strings.TrimSpace(config.legacyGitSecret): true,
+		strings.TrimSpace(config.legacyAPISecret): true,
+	}
+	for _, registration := range registry.Registrations() {
+		for purpose, ref := range registration.Credentials {
+			if tainted[ref.SecretName] {
+				return nil, fmt.Errorf(
+					"provider %q credential purpose %q references Secret %q, which is exposed to legacy coordinator pods: a credential exposed to any legacy pod is tainted and must not back a secure registration",
+					registration.Name, purpose, ref.SecretName)
+			}
+		}
+	}
+	observer, ok := config.observer.(couriergithub.Observer)
+	if !ok || observer.Client == nil {
+		return nil, fmt.Errorf("secure mode requires a GitHub observer credential for admission-time provider reads")
+	}
+	if config.restConfig == nil {
+		return nil, fmt.Errorf("secure mode requires an API server connection for access reviews")
+	}
+	clientset, err := kubernetes.NewForConfig(config.restConfig)
+	if err != nil {
+		return nil, fmt.Errorf("build access-review client: %w", err)
+	}
+	harnessImage := strings.TrimSpace(config.harnessImage)
+	if harnessImage == "" {
+		harnessImage = defaultsHarnessImage
+	}
+	probeImage := strings.TrimSpace(config.probeImage)
+	if probeImage == "" {
+		probeImage = defaultsProbeImage
+	}
+	return &controller.SecureControl{
+		Config: controller.SecureConfig{
+			RunNamespace:      strings.TrimSpace(config.runNamespace),
+			Registry:          registry,
+			HarnessImage:      harnessImage,
+			ProbeImage:        probeImage,
+			CacheService:      strings.TrimSpace(config.cacheService),
+			CachePort:         int32(config.cachePort),
+			LiveProbes:        true,
+			Kubernetes:        clientset,
+			OperatorNamespace: strings.TrimSpace(config.operatorNS),
+			Providers: func(ctx context.Context, registration *forge.Registration) (controller.AdmissionProvider, error) {
+				// Admission reads use the operator's own read identity. The
+				// registration's credential reference is never resolved here.
+				provider := couriergithub.NewProvider(
+					forge.ProviderConfig{Name: registration.Name, Endpoint: registration.Endpoint},
+					observer.Client)
+				return controller.AdmissionProvider{Provider: provider, Policy: provider, HeadLister: provider}, nil
+			},
+		},
+	}, nil
 }

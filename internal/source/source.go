@@ -7,6 +7,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"time"
 )
 
 // ErrStaleWork indicates that claimed source work no longer needs a coordinator.
@@ -104,6 +105,9 @@ type Lifecycle struct {
 	// specific renderers (e.g. the Dispatch report) embed it verbatim when
 	// non-empty. Absent telemetry is simply omitted.
 	Telemetry json.RawMessage
+	// StartedAt is the coordinator container start time, reported so sources
+	// can record real run durations; optional.
+	StartedAt *time.Time
 }
 
 // Reporter optionally publishes lifecycle results in addition to ordinary

@@ -257,14 +257,20 @@ type fakeStatusWriter struct {
 func (w fakeStatusWriter) PatchStatus(ctx context.Context, name types.NamespacedName, patch []byte) error {
 	var document struct {
 		Status struct {
-			Phase            courierv1alpha1.Phase `json:"phase,omitempty"`
-			Branch           *string               `json:"branch,omitempty"`
-			HeadRepo         *string               `json:"headRepo,omitempty"`
-			HeadSHA          *string               `json:"headSHA,omitempty"`
-			PR               string                `json:"pr,omitempty"`
-			CheckFingerprint *string               `json:"checkFingerprint,omitempty"`
-			Restarts         *int                  `json:"restarts,omitempty"`
-			Conditions       []metav1.Condition    `json:"conditions,omitempty"`
+			Phase             courierv1alpha1.Phase              `json:"phase,omitempty"`
+			Branch            *string                            `json:"branch,omitempty"`
+			HeadRepo          *string                            `json:"headRepo,omitempty"`
+			HeadSHA           *string                            `json:"headSHA,omitempty"`
+			PR                string                             `json:"pr,omitempty"`
+			AdmittedAt        *metav1.Time                       `json:"admittedAt,omitempty"`
+			StartedAt         *metav1.Time                       `json:"startedAt,omitempty"`
+			FinishedAt        *metav1.Time                       `json:"finishedAt,omitempty"`
+			WaitDuration      string                             `json:"waitDuration,omitempty"`
+			RunDuration       string                             `json:"runDuration,omitempty"`
+			CheckFingerprint  *string                            `json:"checkFingerprint,omitempty"`
+			Restarts          *int                               `json:"restarts,omitempty"`
+			Conditions        []metav1.Condition                 `json:"conditions,omitempty"`
+			PublicationPolicy *courierv1alpha1.PublicationPolicy `json:"publicationPolicy,omitempty"`
 		} `json:"status"`
 	}
 	if err := json.Unmarshal(patch, &document); err != nil {
@@ -289,6 +295,21 @@ func (w fakeStatusWriter) PatchStatus(ctx context.Context, name types.Namespaced
 	if document.Status.PR != "" {
 		run.Status.PR = document.Status.PR
 	}
+	if document.Status.AdmittedAt != nil {
+		run.Status.AdmittedAt = document.Status.AdmittedAt
+	}
+	if document.Status.StartedAt != nil {
+		run.Status.StartedAt = document.Status.StartedAt
+	}
+	if document.Status.FinishedAt != nil {
+		run.Status.FinishedAt = document.Status.FinishedAt
+	}
+	if document.Status.WaitDuration != "" {
+		run.Status.WaitDuration = document.Status.WaitDuration
+	}
+	if document.Status.RunDuration != "" {
+		run.Status.RunDuration = document.Status.RunDuration
+	}
 	if document.Status.CheckFingerprint != nil {
 		run.Status.CheckFingerprint = *document.Status.CheckFingerprint
 	}
@@ -297,6 +318,9 @@ func (w fakeStatusWriter) PatchStatus(ctx context.Context, name types.Namespaced
 	}
 	if document.Status.Conditions != nil {
 		run.Status.Conditions = document.Status.Conditions
+	}
+	if document.Status.PublicationPolicy != nil {
+		run.Status.PublicationPolicy = document.Status.PublicationPolicy
 	}
 	return w.client.Status().Update(ctx, &run)
 }

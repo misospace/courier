@@ -496,3 +496,178 @@ func testScheme() *runtime.Scheme {
 	_ = courierv1alpha1.AddToScheme(scheme)
 	return scheme
 }
+
+func TestRunnerPollSkipsWorkThatAlreadyHasARun(t *testing.T) {
+	existing := &courierv1alpha1.CoderRun{
+		ObjectMeta: metav1.ObjectMeta{Namespace: "courier", Name: "courier-existing"},
+		Spec: courierv1alpha1.CoderRunSpec{
+			Mode:       courierv1alpha1.ModeResolveIssue,
+			Source:     "dispatch",
+			WorkItemID: "opaque-a",
+			Repo:       "acme/widgets",
+			Ref:        1,
+			Lane:       "local",
+		},
+	}
+	adapter := &testAdapter{items: []WorkItem{
+		{ID: "opaque-a", Mode: "resolve-issue", Repo: "acme/widgets", Ref: 1},
+		{ID: "opaque-b", Mode: "resolve-issue", Repo: "acme/widgets", Ref: 2},
+	}}
+	kubeClient := newTestClient(t, testLane(), existing)
+	runner := NewRunner(kubeClient, adapter, RunnerConfig{Source: "dispatch", LaneProfile: "local", Namespace: "courier"})
+
+	if err := runner.Poll(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	var runs courierv1alpha1.CoderRunList
+	if err := kubeClient.List(context.Background(), &runs, client.InNamespace("courier")); err != nil {
+		t.Fatal(err)
+	}
+	if len(runs.Items) != 2 {
+		t.Fatalf("created %d runs, want the pre-existing run plus one for the new item", len(runs.Items))
+	}
+	newRuns := 0
+	for _, run := range runs.Items {
+		if run.Spec.WorkItemID == "opaque-b" {
+			newRuns++
+		}
+	}
+	if newRuns != 1 {
+		t.Fatalf("found %d runs for the new item, want 1", newRuns)
+	}
+
+	if err := runner.Poll(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if err := kubeClient.List(context.Background(), &runs, client.InNamespace("courier")); err != nil {
+		t.Fatal(err)
+	}
+	if len(runs.Items) != 2 {
+		t.Fatalf("second poll created %d runs, want none new", len(runs.Items))
+	}
+}
+
+func TestRunnerBindingsDedupeIndependently(t *testing.T) {
+	laneA := testLane()
+	laneA.Name = "default"
+	laneB := testLane()
+	laneB.Name = "escalation"
+	kubeClient := newTestClient(t, laneA, laneB)
+	adapterA := &testAdapter{items: []WorkItem{{ID: "item-a", Mode: "resolve-issue", Repo: "acme/widgets", Ref: 1}}}
+	adapterB := &testAdapter{items: []WorkItem{{ID: "item-b", Mode: "resolve-issue", Repo: "acme/widgets", Ref: 2}}}
+	runnerA := NewRunner(kubeClient, adapterA, RunnerConfig{Source: "dispatch", LaneProfile: "default", Namespace: "courier"})
+	runnerB := NewRunner(kubeClient, adapterB, RunnerConfig{Source: "dispatch", LaneProfile: "escalation", Namespace: "courier"})
+
+	ctx := context.Background()
+	if err := runnerA.Poll(ctx); err != nil {
+		t.Fatal(err)
+	}
+	var runs courierv1alpha1.CoderRunList
+	if err := kubeClient.List(ctx, &runs, client.InNamespace("courier")); err != nil {
+		t.Fatal(err)
+	}
+	if len(runs.Items) != 1 {
+		t.Fatalf("created %d runs, want 1", len(runs.Items))
+	}
+	if runs.Items[0].Spec.Lane != "default" {
+		t.Fatalf("run lane = %q, want default", runs.Items[0].Spec.Lane)
+	}
+
+	if err := runnerB.Poll(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := kubeClient.List(ctx, &runs, client.InNamespace("courier")); err != nil {
+		t.Fatal(err)
+	}
+	if len(runs.Items) != 2 {
+		t.Fatalf("created %d runs, want 2 (one per binding)", len(runs.Items))
+	}
+	lanes := map[string]int{}
+	for _, run := range runs.Items {
+		lanes[run.Spec.Lane]++
+	}
+	if lanes["default"] != 1 || lanes["escalation"] != 1 {
+		t.Fatalf("run lanes = %#v, want one default and one escalation", lanes)
+	}
+
+	if err := runnerA.Poll(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := runnerB.Poll(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := kubeClient.List(ctx, &runs, client.InNamespace("courier")); err != nil {
+		t.Fatal(err)
+	}
+	if len(runs.Items) != 2 {
+		t.Fatalf("re-poll of both bindings created %d runs, want 2", len(runs.Items))
+	}
+
+	// The same work item offered through both bindings is one CoderRun.
+	adapterB.items = []WorkItem{{ID: "item-a", Mode: "resolve-issue", Repo: "acme/widgets", Ref: 1}}
+	if err := runnerB.Poll(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := kubeClient.List(ctx, &runs, client.InNamespace("courier")); err != nil {
+		t.Fatal(err)
+	}
+	if len(runs.Items) != 2 {
+		t.Fatalf("same item across bindings created %d runs, want 2", len(runs.Items))
+	}
+	lanes = map[string]int{}
+	for _, run := range runs.Items {
+		lanes[run.Spec.Lane]++
+	}
+	if lanes["default"] != 1 || lanes["escalation"] != 1 {
+		t.Fatalf("run lanes = %#v, want the existing default-lane run kept, not re-created on escalation", lanes)
+	}
+}
+
+func TestRunnerBindingsSuspendIndependently(t *testing.T) {
+	laneA := testLane()
+	laneA.Name = "default"
+	laneA.Annotations = map[string]string{courierv1alpha1.SuspendAnnotation: "true"}
+	laneB := testLane()
+	laneB.Name = "escalation"
+	kubeClient := newTestClient(t, laneA, laneB)
+	adapterA := &testAdapter{items: []WorkItem{{ID: "susp-a", Mode: "resolve-issue", Repo: "acme/widgets", Ref: 1}}}
+	adapterB := &testAdapter{items: []WorkItem{{ID: "susp-b", Mode: "resolve-issue", Repo: "acme/widgets", Ref: 2}}}
+	runnerA := NewRunner(kubeClient, adapterA, RunnerConfig{Source: "dispatch", LaneProfile: "default", Namespace: "courier"})
+	runnerB := NewRunner(kubeClient, adapterB, RunnerConfig{Source: "dispatch", LaneProfile: "escalation", Namespace: "courier"})
+
+	ctx := context.Background()
+	if err := runnerA.Poll(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := runnerB.Poll(ctx); err != nil {
+		t.Fatal(err)
+	}
+	var runs courierv1alpha1.CoderRunList
+	if err := kubeClient.List(ctx, &runs, client.InNamespace("courier")); err != nil {
+		t.Fatal(err)
+	}
+	if len(runs.Items) != 1 {
+		t.Fatalf("created %d runs, want 1 (the suspended binding discovers nothing)", len(runs.Items))
+	}
+	if runs.Items[0].Spec.Lane != "escalation" {
+		t.Fatalf("run lane = %q, want escalation", runs.Items[0].Spec.Lane)
+	}
+
+	var laneProfile courierv1alpha1.LaneProfile
+	if err := kubeClient.Get(ctx, client.ObjectKeyFromObject(laneA), &laneProfile); err != nil {
+		t.Fatal(err)
+	}
+	laneProfile.Annotations[courierv1alpha1.SuspendAnnotation] = "false"
+	if err := kubeClient.Update(ctx, &laneProfile); err != nil {
+		t.Fatal(err)
+	}
+	if err := runnerA.Poll(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := kubeClient.List(ctx, &runs, client.InNamespace("courier")); err != nil {
+		t.Fatal(err)
+	}
+	if len(runs.Items) != 2 {
+		t.Fatalf("created %d runs after resume, want 2", len(runs.Items))
+	}
+}
