@@ -45,14 +45,15 @@ type Decision struct {
 	Value   string `json:"value"`
 }
 
-// BriefResult is the outcome of one brief. Everything in it is untrusted
-// worker/agent output: a summary is a claim, and an artifact is data that
-// trusted validation (#125) must verify before integration. A result can
-// never publish anything.
+// BriefResult is the outcome of one brief. The summary is untrusted
+// worker/agent output — a claim, never validation input. Commit is the
+// trusted local integration commit recorded after the artifact passed §5
+// validation and the broker confirmed publication; it is empty when the
+// brief integrated no changes. A result can never publish anything.
 type BriefResult struct {
-	BriefID  string `json:"briefID"`
-	Summary  string `json:"summary"`
-	Artifact []byte `json:"artifact,omitempty"`
+	BriefID string `json:"briefID"`
+	Summary string `json:"summary"`
+	Commit  string `json:"commit,omitempty"`
 }
 
 // Validate checks a brief's structural invariants before registration: a

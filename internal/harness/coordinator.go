@@ -14,12 +14,6 @@ import (
 	"github.com/misospace/courier/internal/protocol"
 )
 
-// SnapshotProvider supplies the sanitized read-only workspace snapshot
-// uploaded to the worker before its first task. The integration tree that
-// renders real snapshots is #125's seam; without one, worker execution is
-// unavailable and the coordinator is told so in data.
-type SnapshotProvider func(context.Context) ([]byte, error)
-
 // ForgeOps is the trusted seam for model-influenced forge reads. It routes
 // through the run's broker, which enforces the resolved policy; it is never
 // reachable from the worker or a brief. #125 wires the typed broker calls.
@@ -28,26 +22,6 @@ type ForgeOps interface {
 	// arguments are model data; the implementation validates them against
 	// the run's policy before the broker acts.
 	Call(ctx context.Context, operation string, arguments string) (string, error)
-}
-
-// Publisher is the trusted publication seam: only the coordinator's own
-// control path may publish, through the run's broker, under the resolved
-// publication policy. It is deliberately unreachable from a BriefResult, a
-// worker result, or any delegate: subagents return untrusted artifacts and
-// cannot publish (HARNESS.md §5). #125 implements publication; until then
-// the capability gate fails closed before any model work starts.
-type Publisher interface {
-	Publish(ctx context.Context, plan Plan) error
-}
-
-// Plan is the coordinator's completed-work record at publication time. It is
-// trusted control state — no worker or model assertion rides into
-// publication as authority.
-type Plan struct {
-	Goal    string        `json:"goal"`
-	Branch  string        `json:"branch,omitempty"`
-	Briefs  []BriefResult `json:"briefs,omitempty"`
-	Summary string        `json:"summary,omitempty"`
 }
 
 // Tool names are the model's view of the trusted tools. The toolset carries
@@ -72,6 +46,7 @@ type Coordinator struct {
 	snapshot      SnapshotProvider
 	snapshotMu    sync.Mutex
 	snapshotReady bool
+	snapshotTip   string
 
 	publisher Publisher
 	activity  ActivitySink
@@ -231,8 +206,10 @@ func (c *Coordinator) pump(ctx context.Context, session *Session, briefID string
 
 // finish applies the declared outcome. Publication is the coordinator's own
 // trusted act, never the model's: the declared "changes" outcome reaches the
-// publisher only here, and a publish failure is an infrastructure failure
-// for the operator to relaunch, not a model verdict.
+// publisher only here, and a publish failure classifies the run — a blocked
+// world is NeedsHuman, transport failure is an infrastructure failure for
+// the operator to relaunch, and a declared-changes-with-no-work ending is a
+// workload failure.
 func (c *Coordinator) finish(ctx context.Context, inv executor.Invocation, outcome executor.DeclaredOutcome, summary string) executor.HarnessResult {
 	switch outcome {
 	case executor.OutcomeChanges:
@@ -242,27 +219,32 @@ func (c *Coordinator) finish(ctx context.Context, inv executor.Invocation, outco
 				Err:    errors.New("harness: publication is not configured"),
 			}
 		}
-		if err := c.publisher.Publish(ctx, c.plan(inv, summary)); err != nil {
+		publication, err := c.publisher.Publish(ctx)
+		if err != nil {
+			if errors.Is(err, ErrNothingToPublish) {
+				return executor.HarnessResult{
+					Reason: "the coordinator declared changes but no work was integrated or published in this incarnation: " + err.Error(),
+				}
+			}
+			var blocked *PublicationBlockedError
+			if errors.As(err, &blocked) {
+				return executor.HarnessResult{
+					Outcome: executor.OutcomeBlockedExternal,
+					Reason:  blocked.Error(),
+				}
+			}
 			return executor.HarnessResult{Outcome: outcome, Err: fmt.Errorf("harness: publication failed: %w", err)}
 		}
-		return executor.HarnessResult{Outcome: outcome, Reason: "published through the broker"}
+		reason := "published through the broker"
+		if publication.AlreadyPublished {
+			reason = "publication already confirmed at " + publication.OID
+		}
+		return executor.HarnessResult{Outcome: outcome, Reason: reason}
 	case executor.OutcomeNoChangeNeeded, executor.OutcomeNeedsDecision, executor.OutcomeBlockedExternal:
 		return executor.HarnessResult{Outcome: outcome, Reason: summary}
 	default:
 		return executor.HarnessResult{Reason: fmt.Sprintf("undeclared outcome %q", outcome)}
 	}
-}
-
-func (c *Coordinator) plan(inv executor.Invocation, summary string) Plan {
-	plan := Plan{Goal: inv.Goal, Branch: inv.Branch, Summary: summary}
-	// Only the delegate's actual retained result enters the publication
-	// plan; a brief without a recorded result is not completed work.
-	for _, id := range c.briefs.BriefIDs() {
-		if result, ok := c.briefs.Result(id); ok {
-			plan.Briefs = append(plan.Briefs, result)
-		}
-	}
-	return plan
 }
 
 // parseOutcome parses the model's final message as the outcome declaration.
@@ -466,9 +448,12 @@ func (c *Coordinator) runShell(ctx context.Context, call ToolCall, briefID strin
 	return workerResultToTool(workerResult, result)
 }
 
-// runDelegate registers and runs one brief on a sub-agent session. The
-// sub-agent's shell commands reach the same worker; its result is untrusted
-// and publication stays unreachable from it.
+// runDelegate registers and runs one brief on a sub-agent session, then
+// closes the brief's terminal chain: pack the worker's committed state,
+// validate and integrate it as one local commit, and publish through the
+// broker. The sub-agent's shell commands reach the worker; its result is
+// untrusted and publication stays unreachable from it — integration and
+// publication happen here, in trusted control.
 func (c *Coordinator) runDelegate(ctx context.Context, call ToolCall, result ToolResult) ToolResult {
 	var args struct {
 		ID           string     `json:"id"`
@@ -484,9 +469,6 @@ func (c *Coordinator) runDelegate(ctx context.Context, call ToolCall, result Too
 		result.Content = "delegate arguments must be a JSON object"
 		return result
 	}
-	if strings.TrimSpace(args.ID) == "" {
-		args.ID = newOpID("brief", "")
-	}
 	brief := Brief{
 		ID:           args.ID,
 		Role:         args.Role,
@@ -496,9 +478,14 @@ func (c *Coordinator) runDelegate(ctx context.Context, call ToolCall, result Too
 		NonGoals:     args.NonGoals,
 		SuccessCheck: args.SuccessCheck,
 	}
-	// The role binding is validated before registration: a delegation the
-	// harness cannot run must not burn the stable brief ID, so the model can
-	// re-delegate the same work unit with a corrected request.
+	// Structural validation and the role binding are checked before the
+	// snapshot prepare: a delegation the harness cannot run must neither
+	// burn the stable brief ID nor pay for a snapshot render.
+	if err := brief.Validate(); err != nil {
+		result.IsError = true
+		result.Content = safeToolError(err)
+		return result
+	}
 	if c.bindings.Model(brief.Role) == "" {
 		result.IsError = true
 		result.Content = fmt.Sprintf("no model is bound to role %q", brief.Role)
@@ -506,25 +493,106 @@ func (c *Coordinator) runDelegate(ctx context.Context, call ToolCall, result Too
 	}
 	registered, err := c.briefs.Register(brief)
 	if err != nil {
+		// The ledger rejects duplicates and tombstoned IDs before any
+		// worker contact, so a repeated ID consumes nothing.
 		result.IsError = true
 		result.Content = safeToolError(err)
 		return result
 	}
-	summary := c.runBrief(ctx, registered)
-	// The delegate's actual result is retained under the stable brief ID;
-	// publication planning consumes only recorded results.
-	c.briefs.RecordResult(registered.ID, BriefResult{BriefID: registered.ID, Summary: summary})
-	result.Content = summary
+	// The brief's own fresh snapshot: it must carry every integrated but
+	// possibly unpublished brief, so delegates never reuse a stale
+	// workspace. A transient failure here fails the brief; the model
+	// re-delegates the work under a fresh ID.
+	dispatchedTip, err := c.prepareSnapshot(ctx, brief.ID)
+	if err != nil {
+		result.IsError = true
+		result.Content = "workspace snapshot could not be prepared: " + safeToolError(err)
+		return result
+	}
+	summary, completed := c.runBrief(ctx, registered)
+	if !completed {
+		// A brief that never reached its final result has no outcome to
+		// integrate: its partial commits stay untrusted worker data and
+		// never reach pack, integration, or publication. The failure is the
+		// tool-visible result, the brief ID is spent, and corrected work
+		// re-delegates under a fresh ID.
+		result.IsError = true
+		result.Content = summary
+		return result
+	}
+	integration, err := c.packAndIntegrate(ctx, registered, dispatchedTip, summary)
+	if err != nil {
+		// A rejected artifact is untrusted data and the brief fails; the
+		// fixed rejection category is the tool-visible result. The registry
+		// keeps the ID spent, so corrected work re-delegates under a new ID.
+		result.IsError = true
+		result.Content = safeToolError(err)
+		return result
+	}
+	outcome := summary + "\n[no committed changes; nothing integrated]"
+	if integration.Changed {
+		outcome = fmt.Sprintf("%s\n[integrated as %s and published]", summary, integration.Commit)
+	}
+	// The delegate's actual outcome is retained under the stable brief ID;
+	// the recorded commit is the local integration commit, and publication
+	// of it has already been confirmed by the broker.
+	c.briefs.RecordResult(registered.ID, BriefResult{BriefID: registered.ID, Summary: outcome, Commit: integration.Commit})
+	result.Content = outcome
 	return result
 }
 
-// runBrief drives one sub-agent session for a registered brief and returns
-// the untrusted summary. The brief result is data for the coordinator: it
-// can never publish, write status, or mutate policy.
-func (c *Coordinator) runBrief(ctx context.Context, brief Brief) string {
+// packAndIntegrate closes one brief: dispatch the fixed pack task that
+// renders the workspace's committed state as the brief's result bundle, then
+// validate and integrate it, then publish the integration head through the
+// broker (§7's commit-per-brief cadence). An artifact with no committed
+// changes integrates nothing and is not an error.
+func (c *Coordinator) packAndIntegrate(ctx context.Context, brief Brief, dispatchedTip, summary string) (Integration, error) {
+	if c.publisher == nil {
+		return Integration{}, errors.New("no integration path is configured in this build")
+	}
+	task := protocol.Task{
+		Command:      []string{"sh", "-c", workerPackScript(brief.ID, dispatchedTip)},
+		ArtifactPath: "artifact." + brief.ID + ".bundle",
+	}
+	workerResult, err := c.dispatchAndAwait(ctx, newOpID("pack", brief.ID), brief.ID, task)
+	if err != nil {
+		return Integration{}, err
+	}
+	if workerResult.ExitCode != 0 {
+		return Integration{}, errors.New("artifact packing failed on the worker")
+	}
+	if len(workerResult.Artifact) == 0 {
+		return Integration{Changed: false}, nil
+	}
+	integration, err := c.publisher.Integrate(ctx, IntegrationRequest{
+		BriefID:       brief.ID,
+		DispatchedTip: dispatchedTip,
+		Bundle:        workerResult.Artifact,
+		Brief:         brief,
+		Summary:       summary,
+	})
+	if err != nil {
+		return Integration{}, err
+	}
+	if !integration.Changed {
+		return integration, nil
+	}
+	if _, err := c.publisher.Publish(ctx); err != nil {
+		return Integration{}, err
+	}
+	return integration, nil
+}
+
+// runBrief drives one sub-agent session. It reports whether the brief
+// reached a terminal final result: only a completed session's summary may
+// enter the artifact chain. A failed or truncated session returns the
+// failure as data with completed=false — whatever the worker committed
+// before the failure is partial work that must never be packed,
+// integrated, or published (§7's cadence is per completed unit).
+func (c *Coordinator) runBrief(ctx context.Context, brief Brief) (summary string, completed bool) {
 	session, err := NewSession(c.gateway, c.bindings, brief.Role, c.activity)
 	if err != nil {
-		return safeToolError(err)
+		return safeToolError(err), false
 	}
 	session.Append(Message{Role: "system", Content: briefText(brief) + "\n\n" + subagentFraming})
 	for {
@@ -534,13 +602,13 @@ func (c *Coordinator) runBrief(ctx context.Context, brief Brief) string {
 			// data for the coordinator, which owns the brief's fate; the
 			// coordinator's own next turn surfaces a gateway outage as
 			// the §8 infrastructure failure.
-			return "sub-agent stream failed: " + safeToolError(turn.streamErr)
+			return "sub-agent stream failed: " + safeToolError(turn.streamErr), false
 		}
 		if turn.final {
-			return turn.text
+			return turn.text, true
 		}
 		if turn.toolResults == nil {
-			return "sub-agent ended without a result"
+			return "sub-agent ended without a result", false
 		}
 	}
 }
@@ -674,26 +742,110 @@ func (c *Coordinator) reconciledResult(opID string, state protocol.ResultState) 
 }
 
 // ensureSnapshot uploads the sanitized workspace snapshot before the first
-// worker task of this incarnation. A transient upload failure is retried on
-// the next task rather than cached: only a successful upload is sticky.
+// worker task of this incarnation. A transient failure is retried on the
+// next task rather than cached: only a successful prepare is sticky. Plain
+// coordinator shell tasks share the last prepared workspace; each delegate
+// brief prepares its own fresh snapshot (see prepareSnapshot).
 func (c *Coordinator) ensureSnapshot(ctx context.Context) error {
 	c.snapshotMu.Lock()
 	defer c.snapshotMu.Unlock()
 	if c.snapshotReady {
 		return nil
 	}
+	_, err := c.prepareSnapshotLocked(ctx, "control")
+	return err
+}
+
+// prepareSnapshot renders the sanitized snapshot, uploads it to the worker,
+// and dispatches the fixed unpack task that materializes the worker's
+// ephemeral workspace at the snapshot tip. It returns the exact tip the
+// snapshot was built from: the base tip every artifact of the named work
+// unit must reach. Delegate briefs always prepare fresh — the snapshot must
+// carry every integrated-but-possibly-unpublished brief — while plain
+// coordinator shell reuse the existing workspace through ensureSnapshot.
+func (c *Coordinator) prepareSnapshot(ctx context.Context, briefID string) (string, error) {
+	c.snapshotMu.Lock()
+	defer c.snapshotMu.Unlock()
+	return c.prepareSnapshotLocked(ctx, briefID)
+}
+
+func (c *Coordinator) prepareSnapshotLocked(ctx context.Context, briefID string) (string, error) {
+	if c.worker == nil {
+		return "", errors.New("no worker is configured in this build")
+	}
 	if c.snapshot == nil {
-		return errors.New("no snapshot provider is configured in this build")
+		return "", errors.New("no snapshot provider is configured in this build")
 	}
-	data, err := c.snapshot(ctx)
+	snap, err := c.snapshot(ctx)
 	if err != nil {
-		return err
+		return "", err
 	}
-	if err := c.worker.client.UploadSnapshot(ctx, data); err != nil {
-		return err
+	if err := c.worker.client.UploadSnapshot(ctx, snap.Data); err != nil {
+		return "", err
+	}
+	// The unpack is trusted control's own fixed script: it materializes the
+	// snapshot bundle into the worker's ephemeral workspace at the snapshot
+	// tip with a throwaway identity. It is dispatched over the signed
+	// protocol like any task, under the work unit's own brief ID.
+	task := protocol.Task{Command: []string{"sh", "-c", workerUnpackScript()}}
+	result, err := c.dispatchAndAwait(ctx, newOpID("snapshot", briefID), briefID, task)
+	if err != nil {
+		return "", err
+	}
+	if result.ExitCode != 0 {
+		return "", errors.New("workspace snapshot unpack failed")
+	}
+	// The unpack echoes the tip it materialized. On the honest path it must
+	// equal the dispatched tip; a mismatch means the workspace does not hold
+	// the snapshot control dispatched, and nothing may be dispatched
+	// against it.
+	if strings.TrimSpace(result.StdoutTail) != snap.Tip {
+		return "", errors.New("worker workspace does not match the dispatched snapshot tip")
 	}
 	c.snapshotReady = true
-	return nil
+	c.snapshotTip = snap.Tip
+	return snap.Tip, nil
+}
+
+// workerUnpackScript materializes the uploaded snapshot bundle as the
+// worker's ephemeral workspace: the fixed snapshot work ref becomes the
+// local work branch, the worktree is reset to it, and untracked leftovers
+// of earlier tasks are removed. No brief- or model-supplied value enters
+// this script.
+func workerUnpackScript() string {
+	return strings.Join([]string{
+		"set -eu",
+		"git init -q --initial-branch=integration .",
+		"git config user.name courier",
+		"git config user.email courier@invalid",
+		"git fetch -q --no-tags snapshot.pack +refs/courier/snapshot/work:refs/heads/work",
+		"git symbolic-ref HEAD refs/heads/work",
+		"git reset -q --hard refs/heads/work",
+		"git clean -qfdx",
+		"git rev-parse HEAD",
+	}, "\n")
+}
+
+// workerPackScript is the fixed per-brief artifact task: it captures the
+// workspace's committed state as the brief's result ref and renders the
+// self-contained bundle control validates. When the workspace carries no
+// committed work beyond the dispatched tip it says so and produces no
+// artifact — an honest research brief integrates nothing. The brief ID is
+// already validated to the ref- and filename-safe alphabet.
+func workerPackScript(briefID, dispatchedTip string) string {
+	bundle := "artifact." + briefID + ".bundle"
+	return strings.Join([]string{
+		"set -eu",
+		`head="$(git rev-parse HEAD)"`,
+		`if [ "$head" = "` + dispatchedTip + `" ]; then`,
+		`  echo "no committed changes beyond the dispatched snapshot tip"`,
+		"  exit 0",
+		"fi",
+		"git update-ref " + ResultRefPrefix + briefID + ` "$head"`,
+		"rm -f " + bundle,
+		"git bundle create " + bundle + " " + ResultRefPrefix + briefID,
+		"git bundle list-heads " + bundle,
+	}, "\n")
 }
 
 // maxInlineArtifactBytes bounds the artifact bytes inlined into the model
@@ -716,7 +868,7 @@ func workerResultToTool(result protocol.Result, tool ToolResult) ToolResult {
 	}
 	if len(result.Artifact) > 0 {
 		if len(result.Artifact) > maxInlineArtifactBytes {
-			fmt.Fprintf(&b, "artifact: %d bytes, not inlined; trusted control validates and integrates bulk artifacts (#125)\n", len(result.Artifact))
+			fmt.Fprintf(&b, "artifact: %d bytes, not inlined (display bound; brief artifacts integrate only through the pack flow)\n", len(result.Artifact))
 		} else {
 			b.WriteString("artifact:\n" + string(result.Artifact) + "\n")
 		}

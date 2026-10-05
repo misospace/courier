@@ -132,6 +132,11 @@ const (
 	brokerStatusPortNm = "https-status"
 	// worker
 	workerWorkspacePath = "/workspace"
+
+	// WorkerWorkspacePath is the untrusted worker's ephemeral workspace.
+	// Trusted control composes the snapshot unpack and artifact pack task
+	// scripts against it; it is never mounted into the control pod.
+	WorkerWorkspacePath = workerWorkspacePath
 	// WorkerPort is the task-listener port; keep in sync with the protocol
 	// package's WorkerPort.
 	WorkerPort     = 8080
