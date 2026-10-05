@@ -183,6 +183,23 @@
 {{- if not $hasCachePort }}{{- $args = append $args (printf "--dependency-cache-port=%d" (int $secure.dependencyCachePort)) }}{{- end }}
 {{- end }}
 {{- end }}
+{{- if $secure.modelGateway }}
+{{- if $secure.modelGateway.url }}
+{{- $args = append $args (printf "--model-gateway-url=%s" $secure.modelGateway.url) }}
+{{- if $secure.modelGateway.keySecret }}
+{{- $args = append $args (printf "--model-gateway-key-secret=%s" $secure.modelGateway.keySecret) }}
+{{- if $secure.modelGateway.keySecretKey }}
+{{- $args = append $args (printf "--model-gateway-key-name=%s" $secure.modelGateway.keySecretKey) }}
+{{- end }}
+{{- end }}
+{{- end }}
+{{- if $secure.modelGateway.cidr }}
+{{- $args = append $args (printf "--model-gateway-cidr=%s" $secure.modelGateway.cidr) }}
+{{- if $secure.modelGateway.port }}
+{{- $args = append $args (printf "--model-gateway-port=%d" (int $secure.modelGateway.port)) }}
+{{- end }}
+{{- end }}
+{{- end }}
 {{- end }}
 {{- if $secure.enabled }}
 {{- $persistence := deepCopy (.Values.persistence | default dict) }}

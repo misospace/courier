@@ -88,6 +88,11 @@ func main() {
 	var dependencyCachePort int
 	var probeImage string
 	var bootstrapLaneProfilesFile string
+	var modelGatewayURL string
+	var modelGatewayKeySecret string
+	var modelGatewayKeyName string
+	var modelGatewayCIDR string
+	var modelGatewayPort int
 	flag.StringVar(&metricsAddr, "metrics-bind-address", ":8080", "The address the metric endpoint binds to.")
 	flag.StringVar(&probeAddr, "health-probe-bind-address", ":8081", "The address the probe endpoint binds to.")
 	flag.BoolVar(&enableLeaderElection, "leader-elect", false, "Enable leader election for controller manager.")
@@ -111,6 +116,11 @@ func main() {
 	flag.IntVar(&dependencyCachePort, "dependency-cache-port", 0, "Secure mode: cache port override; empty uses the Service's first port.")
 	flag.StringVar(&probeImage, "probe-image", defaultsProbeImage, "Secure mode: image for disposable network-probe pods.")
 	flag.StringVar(&bootstrapLaneProfilesFile, "bootstrap-lane-profiles-file", "", "Path to a YAML file of deployment-managed bootstrap LaneProfiles; empty disables bootstrap lane management.")
+	flag.StringVar(&modelGatewayURL, "model-gateway-url", "", "Secure mode: OpenAI-compatible model gateway API root (for example http://litellm:4000/v1); empty means the native harness fails closed on the model-bindings capability.")
+	flag.StringVar(&modelGatewayKeySecret, "model-gateway-key-secret", "", "Secure mode: namespace/name of the deployment's model-gateway key Secret; copied per run into trusted control only.")
+	flag.StringVar(&modelGatewayKeyName, "model-gateway-key-name", "key", "Secure mode: key within the model-gateway key Secret.")
+	flag.StringVar(&modelGatewayCIDR, "model-gateway-cidr", "", "Secure mode: CIDR of the model gateway for control egress policy; empty means no gateway egress slot.")
+	flag.IntVar(&modelGatewayPort, "model-gateway-port", 0, "Secure mode: model gateway port for control egress policy.")
 	flag.BoolVar(&dispatchEnabled, "dispatch-enabled", false, "Enable Dispatch source discovery.")
 	flag.StringVar(&dispatchBaseURL, "dispatch-base-url", "", "Dispatch base URL.")
 	flag.StringVar(&dispatchAgentName, "dispatch-agent-name", "", "Dispatch agent name.")
@@ -279,17 +289,22 @@ func main() {
 	}
 	if secureMode {
 		secure, err := buildSecureControl(secureConfig{
-			providersFile:   forgeProvidersFile,
-			runNamespace:    runNamespace,
-			harnessImage:    harnessImage,
-			probeImage:      probeImage,
-			cacheService:    dependencyCacheService,
-			cachePort:       dependencyCachePort,
-			observer:        githubObserver,
-			legacyGitSecret: gitCredentialSecret,
-			legacyAPISecret: githubCredentialSecret,
-			operatorNS:      os.Getenv("POD_NAMESPACE"),
-			restConfig:      mgr.GetConfig(),
+			providersFile:    forgeProvidersFile,
+			runNamespace:     runNamespace,
+			harnessImage:     harnessImage,
+			probeImage:       probeImage,
+			cacheService:     dependencyCacheService,
+			cachePort:        dependencyCachePort,
+			gatewayURL:       modelGatewayURL,
+			gatewayKeySecret: modelGatewayKeySecret,
+			gatewayKeyName:   modelGatewayKeyName,
+			gatewayCIDR:      modelGatewayCIDR,
+			gatewayPort:      modelGatewayPort,
+			observer:         githubObserver,
+			legacyGitSecret:  gitCredentialSecret,
+			legacyAPISecret:  githubCredentialSecret,
+			operatorNS:       os.Getenv("POD_NAMESPACE"),
+			restConfig:       mgr.GetConfig(),
 		})
 		if err != nil {
 			setupLog.Error(err, "unable to configure secure mode")
@@ -422,17 +437,22 @@ func githubObserver(ctx context.Context, reader client.Reader, namespace, config
 
 // secureConfig carries the parsed secure-mode flags into buildSecureControl.
 type secureConfig struct {
-	providersFile   string
-	runNamespace    string
-	harnessImage    string
-	probeImage      string
-	cacheService    string
-	cachePort       int
-	observer        controller.WorldObserver
-	legacyGitSecret string
-	legacyAPISecret string
-	operatorNS      string
-	restConfig      *rest.Config
+	providersFile    string
+	runNamespace     string
+	harnessImage     string
+	probeImage       string
+	cacheService     string
+	cachePort        int
+	gatewayURL       string
+	gatewayKeySecret string
+	gatewayKeyName   string
+	gatewayCIDR      string
+	gatewayPort      int
+	observer         controller.WorldObserver
+	legacyGitSecret  string
+	legacyAPISecret  string
+	operatorNS       string
+	restConfig       *rest.Config
 }
 
 const (
@@ -499,6 +519,11 @@ func buildSecureControl(config secureConfig) (*controller.SecureControl, error) 
 			ProbeImage:        probeImage,
 			CacheService:      strings.TrimSpace(config.cacheService),
 			CachePort:         int32(config.cachePort),
+			GatewayCIDR:       strings.TrimSpace(config.gatewayCIDR),
+			GatewayPort:       int32(config.gatewayPort),
+			GatewayURL:        strings.TrimSpace(config.gatewayURL),
+			GatewayKeySecret:  strings.TrimSpace(config.gatewayKeySecret),
+			GatewayKeyName:    strings.TrimSpace(config.gatewayKeyName),
 			LiveProbes:        true,
 			Kubernetes:        clientset,
 			OperatorNamespace: strings.TrimSpace(config.operatorNS),

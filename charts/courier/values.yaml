@@ -61,6 +61,19 @@ secure:
   probeImage: busybox:1.38
   dependencyCacheService: ""
   dependencyCachePort: 0
+  # -- Model gateway for the native harness control pod (#124). url is the
+  #    OpenAI-compatible API root (for example http://litellm:4000/v1);
+  #    keySecret names a Secret in the operator's namespace whose key holds
+  #    the gateway key (the operator copies it per run into trusted control
+  #    only); cidr/port optionally pin the control egress slot for the
+  #    gateway. An empty url means secure runs fail closed on the
+  #    model-bindings capability.
+  modelGateway:
+    url: ""
+    keySecret: ""
+    keySecretKey: "key"
+    cidr: ""
+    port: 0
 
 # -- Optional Prometheus Operator ServiceMonitor for the controller's
 # metrics endpoint (port 8080). When enabled, renders a `<release>-metrics`

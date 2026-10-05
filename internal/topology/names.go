@@ -64,6 +64,10 @@ func BrokerTLSSecretName(runName string) string { return resourceName(runName, "
 
 func SigningSecretName(runName string) string { return resourceName(runName, "-control-signing") }
 
+// GatewaySecretName is the per-run copy of the deployment's model-gateway
+// key, created by the operator and mounted only into trusted control.
+func GatewaySecretName(runName string) string { return resourceName(runName, "-gateway") }
+
 func PolicySecretName(runName string) string { return resourceName(runName, "-broker-policy") }
 
 func CredentialsSecretName(runName string) string { return resourceName(runName, "-provider-creds") }
@@ -111,6 +115,10 @@ const (
 	controlTokenPath      = "/var/run/secrets/tokens/broker-token"
 	controlRuntimePath    = "/courier-runtime"
 	controlWorkspacePath  = "/workspace"
+	// ControlWorkspacePath is the control pod's private integration tree.
+	// It is never mounted into the worker.
+	ControlWorkspacePath  = controlWorkspacePath
+	controlGatewayKeyPath = "/var/run/courier/gateway/key"
 	// broker
 	brokerPolicyPath   = "/var/run/courier/broker/policy.json"
 	brokerTLSCertPath  = "/var/run/courier/tls/tls.crt"
@@ -149,6 +157,12 @@ const (
 	EnvBrokerCAFile    = "COURIER_BROKER_CA"
 	EnvSigningKeyFile  = "COURIER_SIGNING_KEY"
 	EnvBrokerTokenFile = "COURIER_BROKER_TOKEN"
+
+	// EnvGatewayURL and EnvGatewayKeyFile carry the deployment-level model
+	// gateway configuration into trusted control (HARNESS.md §5). The key is
+	// a mounted Secret value, never an environment value.
+	EnvGatewayURL     = "COURIER_GATEWAY_URL"
+	EnvGatewayKeyFile = "COURIER_GATEWAY_KEY_FILE"
 
 	EnvControlSA    = "COURIER_CONTROL_SA"
 	EnvControlSAUID = "COURIER_CONTROL_SA_UID"

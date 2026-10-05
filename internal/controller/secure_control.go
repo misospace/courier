@@ -73,10 +73,14 @@ type SecureConfig struct {
 	// read-only dependency cache Service; its ClusterIP is pinned per launch.
 	CacheService string
 	CachePort    int32
-	// Gateway optionally pins model-gateway egress for control. Empty until
-	// the native model client (#124) supplies its configuration.
-	GatewayCIDR string
-	GatewayPort int32
+	// Gateway optionally pins model-gateway egress for control. The CIDR/port
+	// slot feeds the control NetworkPolicy; URL and key secret are the
+	// deployment-level model configuration the control pod renders (#124).
+	GatewayCIDR      string
+	GatewayPort      int32
+	GatewayURL       string
+	GatewayKeySecret string
+	GatewayKeyName   string
 	// LiveProbes enables the multi-node live deny/allow probe phase. Tests
 	// against envtest opt out explicitly; production defaults to true.
 	LiveProbes bool

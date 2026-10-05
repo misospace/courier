@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
@@ -15,6 +16,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 
 	courier "github.com/misospace/courier/api/v1alpha1"
+	"github.com/misospace/courier/internal/executor"
 	"github.com/misospace/courier/internal/forge"
 	"github.com/misospace/courier/internal/topology"
 )
@@ -181,8 +183,19 @@ func (s *SecureControl) LaunchSecure(ctx context.Context, run *courier.CoderRun)
 			}
 			return ctrl.Result{RequeueAfter: secureRequeueDelay}, nil
 		}
+		invocation, err := s.controlInvocation(ctx, run)
+		if err != nil {
+			return ctrl.Result{}, err
+		}
+		gateway, err := s.gatewayConfig(ctx, run)
+		if err != nil {
+			return ctrl.Result{}, err
+		}
 		pod, err := topology.ControlPod(run, topology.ControlInputs{
 			Image:                 s.Config.HarnessImage,
+			Run:                   invocation,
+			GatewayURL:            gateway.url,
+			GatewayKeyMounted:     gateway.keyMounted,
 			ControlSAUID:          string(controlSA.UID),
 			WorkerPodUID:          string(workerPod.UID),
 			ControlIncarnationUID: incarnation,
@@ -198,6 +211,78 @@ func (s *SecureControl) LaunchSecure(ctx context.Context, run *courier.CoderRun)
 		}
 	}
 	return ctrl.Result{}, nil
+}
+
+// controlInvocation assembles the run context the control pod carries: the
+// same executor.Invocation a process executor would receive, built from the
+// immutable spec, the current status, and the lane's roles and framing.
+func (s *SecureControl) controlInvocation(ctx context.Context, run *courier.CoderRun) (executor.Invocation, error) {
+	lane := &courier.LaneProfile{}
+	if err := s.Client.Get(ctx, types.NamespacedName{Namespace: run.Namespace, Name: run.Spec.Lane}, lane); err != nil {
+		return executor.Invocation{}, fmt.Errorf("secure topology: read lane profile %q: %w", run.Spec.Lane, err)
+	}
+	return executor.NewInvocation(run, lane, topology.ControlWorkspacePath)
+}
+
+type gatewayConfig struct {
+	url        string
+	keyMounted bool
+}
+
+// gatewayConfig resolves the deployment-level model-gateway configuration
+// for one run's control pod. The URL is configuration; the key travels as a
+// per-run Secret copy the operator creates from the deployment's key Secret,
+// touching the value only to copy it between Secrets.
+func (s *SecureControl) gatewayConfig(ctx context.Context, run *courier.CoderRun) (gatewayConfig, error) {
+	out := gatewayConfig{url: s.Config.GatewayURL}
+	if out.url == "" {
+		return out, nil
+	}
+	if strings.TrimSpace(s.Config.GatewayKeySecret) != "" {
+		if err := s.ensureGatewayKeyCopy(ctx, run); err != nil {
+			return out, err
+		}
+		out.keyMounted = true
+	}
+	return out, nil
+}
+
+// ensureGatewayKeyCopy copies the deployment's model-gateway key into the
+// per-run Secret only trusted control mounts. Values move between Secrets
+// and are never logged or exposed.
+func (s *SecureControl) ensureGatewayKeyCopy(ctx context.Context, run *courier.CoderRun) error {
+	existing := &corev1.Secret{}
+	err := s.Client.Get(ctx, types.NamespacedName{Namespace: run.Namespace, Name: topology.GatewaySecretName(run.Name)}, existing)
+	if err == nil {
+		return nil
+	}
+	if !apierrors.IsNotFound(err) {
+		return fmt.Errorf("secure topology: read gateway key copy: %w", err)
+	}
+	parts := strings.SplitN(s.Config.GatewayKeySecret, "/", 2)
+	if len(parts) != 2 || parts[0] == "" || parts[1] == "" {
+		return fmt.Errorf("secure topology: --model-gateway-key-secret must be namespace/name, got %q", s.Config.GatewayKeySecret)
+	}
+	keyName := s.Config.GatewayKeyName
+	if keyName == "" {
+		keyName = "key"
+	}
+	source := &corev1.Secret{}
+	if err := s.Client.Get(ctx, types.NamespacedName{Namespace: parts[0], Name: parts[1]}, source); err != nil {
+		return fmt.Errorf("secure topology: read gateway key Secret %s: %w", s.Config.GatewayKeySecret, err)
+	}
+	value, ok := source.Data[keyName]
+	if !ok || len(value) == 0 {
+		return fmt.Errorf("gateway key Secret %s has no %q key", s.Config.GatewayKeySecret, keyName)
+	}
+	secret, err := topology.GatewaySecret(run, value)
+	if err != nil {
+		return err
+	}
+	if err := s.Client.Create(ctx, secret); err != nil && !apierrors.IsAlreadyExists(err) {
+		return fmt.Errorf("secure topology: create gateway key copy: %w", err)
+	}
+	return nil
 }
 
 // ObserveTopology applies the secure topology's operator-owned observation:
@@ -381,6 +466,7 @@ func (s *SecureControl) Revoke(ctx context.Context, run *courier.CoderRun) (bool
 		secretObject(namespace, topology.SigningSecretName(runName)),
 		secretObject(namespace, topology.PolicySecretName(runName)),
 		secretObject(namespace, topology.CredentialsSecretName(runName)),
+		secretObject(namespace, topology.GatewaySecretName(runName)),
 		topology.WorkerService(run),
 		saObject(namespace, topology.ControlSAName(runName)),
 		saObject(namespace, topology.BrokerSAName(runName)),

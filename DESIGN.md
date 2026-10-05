@@ -86,8 +86,9 @@ all workers or isolation controls are implemented or ready.
 - **Legacy coordinator pod (current):** OpenCode and model-controlled tools share
   a pod with forge credentials. Prompt permissions, process separation, MCP, and
   NetworkPolicy do not make this boundary secure.
-- **Target harness (designed; the isolation wiring is implemented as opt-in
-  secure mode, the model-facing harness is #124+):** each run has trusted
+- **Target harness (the isolation wiring and model-facing harness are
+  implemented as opt-in secure mode; artifact integration and authenticated
+  status are #125/#126):** each run has trusted
   control, a dedicated trusted broker behind a run-specific Service, and an
   isolated untrusted worker. Control owns model calls, orchestration, integration,
   and signed worker tasks; the broker holds credentials and enforces semantic
@@ -1050,10 +1051,11 @@ only informs.
   live probes, and neither proves a privileged cluster actor cannot create or
   mutate pods outside those controls — a stated residual risk, not a closed
   hole. [HARNESS.md](./HARNESS.md) specifies the contract; the isolation wiring
-  (pods, broker, signed worker protocol, preflight, revocation) is implemented
-  behind secure mode, while the native model client, artifact integration, and
-  authenticated status semantics land in #124-#126 and real-cluster e2e
-  acceptance remains outstanding.
+  (pods, broker, signed worker protocol, preflight, revocation) and the native
+  model client (stream normalization, role binding, brief delegation,
+  capability health) are implemented behind secure mode, while artifact
+  integration and publication (#125), authenticated status semantics (#126),
+  and real-cluster e2e acceptance remain outstanding.
 - Merge remains a human gate. Neither the target broker nor autonomous roles may
   merge, mutate the queue, or access destinations outside the resolved policy.
   The target coordinator may request permitted publication, but cannot bypass
@@ -1152,6 +1154,25 @@ named items remain unresolved and must not be described as production-ready:
 
 ## Decisions
 
+- **2026-10-04 — #124: the native model client is implemented in
+  `internal/harness`; publication and artifact integration remain #125.**
+  Trusted control normalizes every provider stream into the fixed §5
+  vocabulary (`delta`, `tool-request`, `tool-result`, `final`, `error`) in
+  one OpenAI-compatible gateway client, binds LaneProfile roles to gateway
+  models, delegates through typed briefs with stable IDs (duplicate IDs
+  rejected, cancellation tombstones final, ambiguous dispatch reconciled via
+  cancel — never redelivered), and reports startup capability health with
+  redacted reasons: required capabilities fail closed before model work,
+  optional ones proceed degraded. The gateway endpoint and key are
+  deployment configuration (`--model-gateway-*` flags, chart
+  `secure.modelGateway`); the key is a per-run Secret copy mounted only into
+  trusted control. The coordinator's tool router dispatches model-controlled
+  commands only to the untrusted worker over the signed protocol — the
+  control pod has no local execution path for them — and the `Publisher`
+  seam is reachable only from the coordinator's own finish path, so subagent
+  results can never publish. Until #125 lands, secure runs report
+  `publication` unavailable and exit NeedsHuman before consuming model
+  tokens. (#124, #123)
 - **2026-10-04 — Deployment-managed LaneProfiles are bootstrapped by the
   manager, not applied beside the release.** A GitOps consumer cannot safely
   put a LaneProfile in the same apply/render set that installs Courier's CRD —
@@ -1164,7 +1185,6 @@ named items remain unresolved and must not be described as production-ready:
   overwrite. Deletion is a conservative MVP — removal from the config leaves
   the CR in place, and the RBAC carries write verbs only (create, update,
   patch), no delete, because active runs reference lanes. (#73)
-
 - **2026-10-03 — #123: the secure-topology wiring is implemented as opt-in
   deployment-level secure mode; legacy remains the default and is explicitly
   insecure.** The operator provisions and garbage-collects, per run, one
