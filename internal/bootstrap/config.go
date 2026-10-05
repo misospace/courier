@@ -46,7 +46,7 @@ func Parse(data []byte) ([]Profile, error) {
 			return nil, fmt.Errorf("bootstrap profile %d: name is required", i)
 		}
 		if labelErrs := utilvalidation.IsDNS1123Label(name); len(labelErrs) > 0 {
-			return nil, fmt.Errorf("bootstrap profile %d: name %q must be a valid DNS-1123 label (lowercase alphanumeric, '-', or '.', starting and ending with an alphanumeric); got: %s", i, name, strings.Join(labelErrs, ", "))
+			return nil, fmt.Errorf("bootstrap profile %d: name %q must be a valid DNS-1123 label (lowercase alphanumeric or '-', starting and ending with an alphanumeric); got: %s", i, name, strings.Join(labelErrs, ", "))
 		}
 		if first, ok := seen[name]; ok {
 			return nil, fmt.Errorf("bootstrap profile %d: duplicate name %q, first defined at profile %d", i, name, first)

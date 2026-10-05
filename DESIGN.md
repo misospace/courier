@@ -1183,8 +1183,8 @@ named items remain unresolved and must not be described as production-ready:
   explicit adoption guard: a same-name profile without it is never touched, so
   a name collision surfaces as an actionable error instead of a silent
   overwrite. Deletion is a conservative MVP — removal from the config leaves
-  the CR in place, and the RBAC carries write verbs only (create, update,
-  patch), no delete, because active runs reference lanes. (#73)
+  the CR in place, and the RBAC carries write verbs only (create, update),
+  no delete, because active runs reference lanes. (#73)
 - **2026-10-03 — #123: the secure-topology wiring is implemented as opt-in
   deployment-level secure mode; legacy remains the default and is explicitly
   insecure.** The operator provisions and garbage-collects, per run, one

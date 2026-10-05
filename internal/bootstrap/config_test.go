@@ -168,11 +168,19 @@ func TestParseRejectsInvalidNameShapes(t *testing.T) {
     roles:
       coder: gpt-5
 `,
+		`profiles:
+  - name: lane.beta
+    roles:
+      coder: gpt-5
+`,
 	}
 	for _, data := range dnsCases {
 		_, err := Parse([]byte(data))
 		if err == nil || !strings.Contains(err.Error(), "DNS-1123") {
 			t.Fatalf("error = %v, want a DNS-1123 label requirement", err)
+		}
+		if strings.Contains(err.Error(), "or '.'") {
+			t.Fatalf("error = %v, want no guidance that dots are valid", err)
 		}
 	}
 	// Empty-after-trim: caught by the name-is-required check.
