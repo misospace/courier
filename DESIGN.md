@@ -894,6 +894,16 @@ a mix. A cloud lane's `framing` reads more like "capacity is elastic, fan out
 freely" and it sets `concurrency` high; a local lane's reads "single card, keep
 it modest" with `concurrency: 1`. Same schema, no local assumption baked in.
 
+The manager can create and update deployment-managed LaneProfiles itself:
+`internal/bootstrap` reconciles profiles from a YAML config file given by
+`--bootstrap-lane-profiles-file`, labeling what it owns with
+`courier.misospace.dev/bootstrap-managed: "true"`. This lets a GitOps installer
+supply lanes without applying LaneProfile CRs beside the Helm release, where the
+CRD may not be established when the CR is rendered. A same-name profile without
+the label is never adopted or overwritten — the name collision surfaces as an
+actionable error. Removal from the config intentionally leaves the CR in place;
+there is no delete verb because active runs reference lanes. (#73)
+
 ## Reconcile loop
 
 - **Pending** — created by a source. The operator checks the lane's `concurrency`
@@ -1209,6 +1219,18 @@ named items remain unresolved and must not be described as production-ready:
   results can never publish. Until #125 lands, secure runs report
   `publication` unavailable and exit NeedsHuman before consuming model
   tokens. (#124, #123)
+- **2026-10-04 — Deployment-managed LaneProfiles are bootstrapped by the
+  manager, not applied beside the release.** A GitOps consumer cannot safely
+  put a LaneProfile in the same apply/render set that installs Courier's CRD —
+  discovery may reject the CR before the CRD is established — so the manager
+  creates and updates the profiles itself from a YAML config file
+  (`--bootstrap-lane-profiles-file`), labeling each one it owns with
+  `courier.misospace.dev/bootstrap-managed: "true"`. That label is the
+  explicit adoption guard: a same-name profile without it is never touched, so
+  a name collision surfaces as an actionable error instead of a silent
+  overwrite. Deletion is a conservative MVP — removal from the config leaves
+  the CR in place, and the RBAC carries write verbs only (create, update),
+  no delete, because active runs reference lanes. (#73)
 - **2026-10-03 — #123: the secure-topology wiring is implemented as opt-in
   deployment-level secure mode; legacy remains the default and is explicitly
   insecure.** The operator provisions and garbage-collects, per run, one

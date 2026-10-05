@@ -221,7 +221,7 @@ rbac:
           verbs: [get, patch, update]
         - apiGroups: [courier.misospace.dev]
           resources: [laneprofiles]
-          verbs: [get, list, watch]
+          verbs: [create, get, list, update, watch]
     credential-reader:
       type: Role
       rules:

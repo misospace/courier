@@ -52,6 +52,9 @@ spec:
               LaneProfileSpec defines a reusable model ensemble and its runtime framing.
               It is the seam that keeps Courier model-agnostic: roles may name cloud or
               local models in any mix, and nothing about a lane is baked into the core.
+              When a field is added or removed here, mirror it in bootstrap.Profile
+              (internal/bootstrap/config.go), which carries the portable spec for
+              manager-bootstrapped profiles.
             properties:
               concurrency:
                 default: 1
