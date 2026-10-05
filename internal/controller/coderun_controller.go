@@ -61,8 +61,10 @@ type CoderRunReconciler struct {
 	// The pod-loss backstop uses it to confirm a missing coordinator really is
 	// gone before charging a relaunch: a cache that has not caught up must not
 	// be mistaken for infrastructure loss, and infrastructure loss must not be
-	// hidden by a cache that never delivers the pod. Nil falls back to the
-	// cached client.
+	// hidden by a cache that never delivers the pod. It is required in
+	// production — SetupWithManager rejects a nil reader so the pod-loss
+	// confirmation can never fall back to cached state; the reader()
+	// fallback serves only direct-construction tests.
 	APIReader client.Reader
 
 	// Launch is injected by the coordinator launcher. It is optional while
@@ -400,6 +402,9 @@ func (r *CoderRunReconciler) resolvePersistSecurePolicy(ctx context.Context, run
 
 // SetupWithManager registers the controller with the manager.
 func (r *CoderRunReconciler) SetupWithManager(mgr ctrl.Manager) error {
+	if r.APIReader == nil {
+		return errors.New("coderun controller: APIReader is required so the pod-loss confirmation reads the API server directly and never falls back to cached state")
+	}
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&courierv1alpha1.CoderRun{}).
 		Owns(&corev1.Pod{}).
@@ -602,12 +607,13 @@ func (r *CoderRunReconciler) observeRunning(ctx context.Context, run *courierv1a
 	// Liveness reaps a live pod whose activity went silent, and its requeue
 	// (the stuck-terminating case) is propagated, not dropped. Pod loss needs
 	// no heartbeat at all: there is no pod left to heartbeat from, so the
-	// missing coordinator is checked independently of the heartbeat's state
-	// — legacy pods never write one.
+	// backstop is checked independently of the heartbeat's state — legacy
+	// pods never write one. The backstop covers both a missing coordinator
+	// and one the cache can only see as an unobservable dead object.
 	if result.RequeueAfter > 0 || result.Requeue {
 		return result, nil
 	}
-	if coordinatorPodOf(pods.Items, run) == nil {
+	if coordinator := coordinatorPodOf(pods.Items, run); coordinator == nil || coordinatorPodUnrecoverable(coordinator) {
 		return r.observeMissingCoordinator(ctx, run)
 	}
 	return ctrl.Result{}, nil
@@ -1001,7 +1007,9 @@ func (r *CoderRunReconciler) patchStatus(ctx context.Context, before, after *cou
 }
 
 // reader returns the reader world reads go through, preferring the injected
-// API reader and falling back to the cached client.
+// API reader and falling back to the cached client. SetupWithManager requires
+// APIReader in production, so the fallback serves only direct-construction
+// tests and the pod-loss confirmation never runs against cached state.
 func (r *CoderRunReconciler) reader() client.Reader {
 	if r.APIReader != nil {
 		return r.APIReader
@@ -1046,6 +1054,21 @@ func coordinatorPodOf(pods []corev1.Pod, run *courierv1alpha1.CoderRun) *corev1.
 		return pod
 	}
 	return nil
+}
+
+// coordinatorPodUnrecoverable reports whether pod is a terminal-phase object
+// (Failed or Succeeded) that records no coordinator termination status — an
+// Evicted pod or one that failed scheduling, the shapes Kubernetes leaves
+// when it never started or never reported the container. No exit code was
+// ever reported, so no model outcome can be inferred from such an object:
+// it is an unobservable dead coordinator, the same infrastructure loss as a
+// vanished pod.
+func coordinatorPodUnrecoverable(pod *corev1.Pod) bool {
+	if pod.Status.Phase != corev1.PodFailed && pod.Status.Phase != corev1.PodSucceeded {
+		return false
+	}
+	_, _, _, _, terminated := coordinatorTermination(pod)
+	return !terminated
 }
 
 func podBelongsToRun(pod *corev1.Pod, run *courierv1alpha1.CoderRun) bool {

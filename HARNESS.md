@@ -850,7 +850,8 @@ reconciling the world. No entry protects a dead pod.
 
 In the absence of valid entries, retain #12's behavior: a **nil heartbeat is
 not stall evidence**, a fresh current-incarnation heartbeat resets the
-crashloop streak, a stale current-incarnation heartbeat permits reap outside
+crashloop streak while a recoverable coordinator is observable, a stale
+current-incarnation heartbeat permits reap outside
 the existing observable-pod startup grace, and terminating pods are not
 re-deleted or double-counted. A previous incarnation's heartbeat can never
 reset the streak or be used to declare the new pod live. The existing
