@@ -23,6 +23,7 @@ import (
 	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
 
 	courierv1alpha1 "github.com/misospace/courier/api/v1alpha1"
+	"github.com/misospace/courier/internal/bootstrap"
 	"github.com/misospace/courier/internal/controller"
 	"github.com/misospace/courier/internal/executor"
 	"github.com/misospace/courier/internal/forge"
@@ -86,6 +87,7 @@ func main() {
 	var dependencyCacheService string
 	var dependencyCachePort int
 	var probeImage string
+	var bootstrapLaneProfilesFile string
 	var modelGatewayURL string
 	var modelGatewayKeySecret string
 	var modelGatewayKeyName string
@@ -113,6 +115,7 @@ func main() {
 	flag.StringVar(&dependencyCacheService, "dependency-cache-service", "", "Secure mode: namespace/name of the approved read-only dependency cache Service; empty means workers have no egress.")
 	flag.IntVar(&dependencyCachePort, "dependency-cache-port", 0, "Secure mode: cache port override; empty uses the Service's first port.")
 	flag.StringVar(&probeImage, "probe-image", defaultsProbeImage, "Secure mode: image for disposable network-probe pods.")
+	flag.StringVar(&bootstrapLaneProfilesFile, "bootstrap-lane-profiles-file", "", "Path to a YAML file of deployment-managed bootstrap LaneProfiles; empty disables bootstrap lane management.")
 	flag.StringVar(&modelGatewayURL, "model-gateway-url", "", "Secure mode: OpenAI-compatible model gateway API root (for example http://litellm:4000/v1); empty means the native harness fails closed on the model-bindings capability.")
 	flag.StringVar(&modelGatewayKeySecret, "model-gateway-key-secret", "", "Secure mode: namespace/name of the deployment's model-gateway key Secret; copied per run into trusted control only.")
 	flag.StringVar(&modelGatewayKeyName, "model-gateway-key-name", "key", "Secure mode: key within the model-gateway key Secret.")
@@ -147,6 +150,29 @@ func main() {
 	// Per-lane capacity and suspension gauges are read from the live cluster
 	// at scrape time, so they need only the manager's client.
 	crmetrics.Registry.MustRegister(controller.NewLaneCollector(mgr.GetClient()))
+
+	bootstrapProfilesFile := strings.TrimSpace(bootstrapLaneProfilesFile)
+	if bootstrapProfilesFile != "" {
+		podNamespace := strings.TrimSpace(os.Getenv("POD_NAMESPACE"))
+		if podNamespace == "" {
+			setupLog.Error(fmt.Errorf("POD_NAMESPACE is empty"), "unable to configure bootstrap LaneProfiles")
+			os.Exit(1)
+		}
+		profiles, err := bootstrap.LoadFile(bootstrapProfilesFile)
+		if err != nil {
+			setupLog.Error(err, "unable to load bootstrap LaneProfiles")
+			os.Exit(1)
+		}
+		if err := mgr.Add(&bootstrap.Reconciler{
+			Client:    mgr.GetClient(),
+			Namespace: podNamespace,
+			Provider:  &bootstrap.FileProvider{Path: bootstrapProfilesFile},
+		}); err != nil {
+			setupLog.Error(err, "unable to add bootstrap LaneProfile reconciler")
+			os.Exit(1)
+		}
+		setupLog.Info("bootstrap LaneProfiles configured", "profiles", len(profiles), "namespace", podNamespace)
+	}
 
 	podConfig := executor.DefaultPodConfig()
 	podConfig.Image = executorImage
