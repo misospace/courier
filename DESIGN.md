@@ -296,10 +296,56 @@ to die.
   `needs-human` with the counter left at the ceiling, rather than one further
   relaunch. This is the one counter that matters, and it is death-detection, not
   work-retry.
+- A pod's **disappearance** — no coordinator pod **object** at all — is
+  infrastructure loss on its own terms, detected without any heartbeat,
+  because there is no pod left to heartbeat from. A pod whose coordinator exit
+  state is observable is not pod loss: the recorded exit goes through the
+  exit-code mapping like any other termination. The cache is not trusted for
+  the loss judgement, so the absence of a coordinator is confirmed **against
+  the API server** with a live read and no recorded state — one confirmation
+  rule for the disappearance signal: a coordinator pod found live means the
+  cache lagged and nothing is charged, a coordinator pod whose deletion is
+  already in flight is neither live nor a confirmed loss and the run is
+  re-observed, a failed read is re-observed the same way, and only an API
+  server with no coordinator pod for the run charges the bounded relaunch
+  with its restart ceiling. A `Running` run with a confirmed loss returns to
+  `Claimed` and resumes the **retained** branch, never one recreated from
+  base. Pod loss and a reaped wedge share one ceiling and one relaunch path.
+  A lost **control** pod is loss even while the worker and broker survive;
+  the replacement round is fenced and re-provisioned by the existing launch
+  path. An orphan with no pod to watch recovers on the next reconcile — for
+  a run with no events at all, the controller's periodic resync; the manager
+  configures no cache resync, so that recovery rides controller-runtime's
+  default ~10-hour periodic resync.
+- An **unobservable dead coordinator** — a coordinator pod in a terminal
+  phase with no recorded coordinator termination status — is pod loss on the
+  same terms. Kubernetes can transition a pod to **Failed** (eviction, failed
+  scheduling) without ever recording container statuses, and no model outcome
+  may be inferred from a state Kubernetes never reported. The disappearance
+  backstop confirms it with the same live read, and the confirmed dead object
+  is deleted so the run's deterministic pod name is free for the replacement —
+  except at the restart ceiling, where it survives as the `NeedsHuman`
+  hand-off's only record of the cause. Below the ceiling the charge is
+  deferred until a live read shows the deleted object gone on **both** delete
+  paths — the disappearance backstop and the wedge's reap of a dead
+  coordinator — so one physical loss is charged once and the replacement can
+   never attach to a dying object the launcher would tolerate. A
+   stale-heartbeat run whose cache already shows such a pod is reaped by the
+   wedge path first; its charge is deferred the same way only when the
+   post-delete live read finds a surviving coordinator object — a reap whose
+   delete completes synchronously charges in place with the generic message —
+   and a deferred charge is left to the disappearance backstop, which
+   confirms the loss against the API server and charges it with its pod-loss
+   cause; at the ceiling the wedge preserves the inert object exactly like the
+   backstop.
 - The crashloop counter bounds a **consecutive** streak of wedges, not a lifetime
-  total: a run that demonstrates liveness — a fresh heartbeat within the window —
-  resets the streak to zero, so a relaunch long in the past cannot terminalize a
-  run that has since proven itself alive.
+  total: a run that demonstrates liveness — a fresh heartbeat within the window
+  while a recoverable coordinator is observable — resets the streak to zero, so
+  a relaunch long in the past cannot terminalize a run that has since proven
+  itself alive. The reset suspends while the coordinator is gone or
+  unobservable: the last heartbeat is then evidence of the recent past, not of
+  current liveness, and a detection must not reset the counter it is about to
+  charge.
 - A just-relaunched pod gets a **startup grace** so it is not re-reaped on the
   previous incarnation's stale heartbeat before it can send its first one: a pod
   created within the window (or whose coordinator started within it) is never
@@ -814,7 +860,7 @@ status:
     plan: <...>
     completedBriefs: [{id, summary, commit}]
   heartbeat: {at: <ts>, kind: stream | tool}
-  restarts: <n>                    # consecutive infra crashloop counter, reset by a fresh heartbeat
+  restarts: <n>                    # consecutive infra crashloop counter, reset by a fresh heartbeat while a coordinator is observable
   conditions: [...]
 ```
 
@@ -1605,3 +1651,57 @@ was superseded.
   that landed on the run branch while HEAD moved elsewhere. The durable fix —
   a broker that publishes only to the pinned work ref — is (#122); this is the
   interim detection plus framing. (#134)
+- **2026-10-04 — Pod disappearance is infrastructure loss, distinct from the
+  #12 heartbeat wedge.** No pod means no heartbeat can exist, so requiring one
+  would leave an evicted run `Running` forever — which is what happened in
+  production. The live read of the API server is the sole confirmation of
+  every charge for a missing coordinator — one rule for both the disappearance
+  and the stale-heartbeat signals — with no timer and no recorded state: a
+  coordinator found live means the cache lagged and nothing is charged, a
+  terminating coordinator is re-observed, and only an API server with no
+  coordinator pod for the run charges the relaunch — which is also what lets a
+  run that was already orphaned before this backstop existed recover. The
+  **retained** branch is adopted, never recreated from base. Pod loss and a
+  reaped wedge share one ceiling and one relaunch path. (#106, #12)
+- **2026-10-05 — A terminal-phase coordinator pod without container statuses
+  is pod loss, not an exit.** Kubernetes can transition a coordinator pod to a
+  terminal phase (eviction, failed scheduling) without ever recording container
+  statuses, and no model exit code is inferred from a state Kubernetes never
+  reported. Such a pod is an unobservable dead coordinator: it is confirmed by
+  the same live read as a disappearance, its inert object is deleted so the
+  deterministic pod name is free for the replacement, and the relaunch is
+  charged as pod loss against the shared ceiling — except at the ceiling
+  itself, where the inert object survives as the `NeedsHuman` hand-off's only
+  record of the cause. A fresh heartbeat resets the crashloop streak only
+  while a recoverable coordinator is observable: an eviction detected inside
+  the window must not reset the counter the same reconcile charges. Eviction
+  is exactly the class #106 must repair. (#106)
+- **2026-10-05 — The ceiling evidence-preservation rule now covers both
+  infra-loss hand-offs.** A stale-heartbeat run whose cached coordinator is an
+  unobservable dead object is reaped by the wedge path before the
+  disappearance backstop can route it, and the wedge path deleted that inert
+  object before the restart ceiling was even consulted — so at the ceiling the
+  `NeedsHuman` hand-off lost the only record of the cause the backstop
+  deliberately preserves. The wedge path now applies the same rule: an
+  unrecoverable coordinator is preserved, not deleted, at the ceiling,
+  mirroring the backstop — the hand-off must keep the only record of the
+  cause regardless of which path detected the loss, and no replacement needs
+  the name. Below the ceiling the object is still deleted so the
+  deterministic pod name stays free. (#106)
+- **2026-10-05 — The pod-loss charge now fires only after the live read
+  confirms the deleted dead object is gone.** A delete is not a
+  disappearance: a confirmed dead object can still be terminating, held by a
+  finalizer (deletionTimestamp set, object persists), and the relaunch path
+  tolerates an existing object — so a replacement could attach to the dying
+  object and the same physical loss be charged a second time when it finally
+   vanishes. The re-confirmation now guards both legacy delete paths that can
+   remove a dead coordinator — the disappearance backstop and the wedge's
+   reap; the secure path's equivalent is #223. The disappearance backstop
+   re-confirms with one more live read after the delete and before the
+   relaunch is charged, and the wedge's reap of a dead coordinator below the
+   ceiling defers the charge the same way — any surviving coordinator object
+   defers it, so the deterministic name is provably free before the relaunch.
+   The deferred wedge charge is then taken by the disappearance backstop,
+   which confirms the loss against the API server and charges it with its
+   pod-loss reason — one physical loss, one ceiling charge, found in AI review
+   of PR #218. (#106)

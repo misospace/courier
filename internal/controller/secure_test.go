@@ -1043,3 +1043,123 @@ func TestReconcileFencesWorkerWhenControlTerminates(t *testing.T) {
 		t.Fatalf("phase = %q, want NeedsHuman from the control exit code", updated.Status.Phase)
 	}
 }
+
+// TestReconcileControlLossReturnsToClaimed is the secure-topology mirror of
+// the legacy pod-loss backstop: a vanished control pod with the worker and
+// broker of the round still running is coordinator loss, so the run returns
+// to Claimed for a relaunch from its checkpoint.
+func TestReconcileControlLossReturnsToClaimed(t *testing.T) {
+	control, c := secureControl(t)
+	run := secureRun("control-loss")
+	run.Status.Phase = courier.PhaseRunning
+	if err := c.Create(context.Background(), run); err != nil {
+		t.Fatal(err)
+	}
+	// The control pod is gone from both readers; the worker and broker of
+	// the round survive.
+	workerPod := healthyPod(run.Name, topology.ComponentWorker)
+	brokerPod := healthyPod(run.Name, topology.ComponentBroker)
+	for _, pod := range []*corev1.Pod{workerPod, brokerPod} {
+		if err := c.Create(context.Background(), pod); err != nil {
+			t.Fatal(err)
+		}
+	}
+	reconciler := &CoderRunReconciler{
+		Client:       c,
+		APIReader:    c,
+		Sources:      NewSourceRegistry(map[string]source.Adapter{"manual": &admissionSource{}}),
+		StatusWriter: fakeStatusWriter{client: c},
+		Secure:       control,
+	}
+	result, err := reconciler.Reconcile(context.Background(), ctrl.Request{NamespacedName: client.ObjectKeyFromObject(run)})
+	if err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	if !result.Requeue {
+		t.Fatalf("Requeue = false, want true; a lost control pod must relaunch the round")
+	}
+	var updated courier.CoderRun
+	if err := c.Get(context.Background(), client.ObjectKeyFromObject(run), &updated); err != nil {
+		t.Fatal(err)
+	}
+	if updated.Status.Phase != courier.PhaseClaimed {
+		t.Fatalf("phase = %q, want Claimed", updated.Status.Phase)
+	}
+	if updated.Status.Restarts != 1 {
+		t.Fatalf("restarts = %d, want 1", updated.Status.Restarts)
+	}
+	// Fencing the surviving worker and broker on the detection reconcile is
+	// #215's task, not this path's.
+	for _, name := range []string{topology.WorkerPodName(run.Name), topology.BrokerPodName(run.Name)} {
+		var pod corev1.Pod
+		if err := c.Get(context.Background(), types.NamespacedName{Namespace: run.Namespace, Name: name}, &pod); err != nil {
+			t.Fatalf("pod %q must survive the control-loss relaunch: %v", name, err)
+		}
+	}
+}
+
+// TestReconcileControlLossWithoutStatusReturnsToClaimed is the secure mirror
+// of the unobservable-dead-coordinator backstop: a control pod evicted
+// without ever reporting container statuses is coordinator loss. The inert
+// object is deleted so the replacement control pod can carry the run's name,
+// while the surviving round's fence is #215's.
+func TestReconcileControlLossWithoutStatusReturnsToClaimed(t *testing.T) {
+	control, c := secureControl(t)
+	run := secureRun("control-no-status")
+	run.Status.Phase = courier.PhaseRunning
+	if err := c.Create(context.Background(), run); err != nil {
+		t.Fatal(err)
+	}
+	workerPod := healthyPod(run.Name, topology.ComponentWorker)
+	brokerPod := healthyPod(run.Name, topology.ComponentBroker)
+	// The control pod exists but is terminal with no container statuses: the
+	// eviction left no exit state to observe.
+	controlPod := healthyPod(run.Name, topology.ComponentCoordinator)
+	controlPod.Spec.Containers[0].Name = topology.ControlContainerName
+	controlPod.Status = corev1.PodStatus{
+		Phase:   corev1.PodFailed,
+		Reason:  "Evicted",
+		Message: "The node was low on resource: ephemeral-storage.",
+	}
+	for _, pod := range []*corev1.Pod{controlPod, workerPod, brokerPod} {
+		if err := c.Create(context.Background(), pod); err != nil {
+			t.Fatal(err)
+		}
+	}
+	reconciler := &CoderRunReconciler{
+		Client:       c,
+		APIReader:    c,
+		Sources:      NewSourceRegistry(map[string]source.Adapter{"manual": &admissionSource{}}),
+		StatusWriter: fakeStatusWriter{client: c},
+		Secure:       control,
+	}
+	result, err := reconciler.Reconcile(context.Background(), ctrl.Request{NamespacedName: client.ObjectKeyFromObject(run)})
+	if err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	if !result.Requeue {
+		t.Fatalf("Requeue = false, want true; an unobservable dead control pod must relaunch the round")
+	}
+	var updated courier.CoderRun
+	if err := c.Get(context.Background(), client.ObjectKeyFromObject(run), &updated); err != nil {
+		t.Fatal(err)
+	}
+	if updated.Status.Phase != courier.PhaseClaimed {
+		t.Fatalf("phase = %q, want Claimed", updated.Status.Phase)
+	}
+	if updated.Status.Restarts != 1 {
+		t.Fatalf("restarts = %d, want 1", updated.Status.Restarts)
+	}
+	// The inert object is gone so the replacement control pod can carry the
+	// run's name; the surviving worker and broker are untouched.
+	var lost corev1.Pod
+	if err := c.Get(context.Background(), types.NamespacedName{Namespace: run.Namespace, Name: topology.ControlPodName(run.Name)}, &lost); !apierrors.IsNotFound(err) {
+		t.Fatalf("control pod must be deleted so the name is free for the replacement, got %v", err)
+	}
+	for _, name := range []string{topology.WorkerPodName(run.Name), topology.BrokerPodName(run.Name)} {
+		var pod corev1.Pod
+		if err := c.Get(context.Background(), types.NamespacedName{Namespace: run.Namespace, Name: name}, &pod); err != nil {
+			t.Fatalf("pod %q must survive the control-loss relaunch: %v", name, err)
+		}
+	}
+}

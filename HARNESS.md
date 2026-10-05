@@ -822,7 +822,9 @@ process is treated as durable checkpoint state.
 Before any destructive liveness decision, use an **uncached API read** for the
 run status and the run-owned control/worker pods (not just `r.Get`/`r.List` on
 the current controller-runtime cached client); #126 must wire a direct API
-reader for this decision. Read errors, uncertain identity, or contradictory
+reader for this decision (the operator now has a direct API reader the
+pod-disappearance backstop uses; this reap decision is still that task's
+own). Read errors, uncertain identity, or contradictory
 observations mean **do not reap; requeue and retry observation** with a
 structured diagnostic, not a successful run heartbeat. If phase, resource
 version, or pod UID changes before deletion, re-evaluate. Delete with a
@@ -848,7 +850,8 @@ reconciling the world. No entry protects a dead pod.
 
 In the absence of valid entries, retain #12's behavior: a **nil heartbeat is
 not stall evidence**, a fresh current-incarnation heartbeat resets the
-crashloop streak, a stale current-incarnation heartbeat permits reap outside
+crashloop streak while a recoverable coordinator is observable, a stale
+current-incarnation heartbeat permits reap outside
 the existing observable-pod startup grace, and terminating pods are not
 re-deleted or double-counted. A previous incarnation's heartbeat can never
 reset the streak or be used to declare the new pod live. The existing
