@@ -4,6 +4,7 @@
 package executor
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -76,6 +77,45 @@ type Executor interface {
 // forge/model-agnostic executors can continue to provide their own command.
 type Bootstrapper interface {
 	BootstrapCommand(Invocation, string) Command
+}
+
+// DeclaredOutcome is the terminal declaration a coordinator makes about the
+// work itself. The vocabulary matches the legacy outcome contract; the
+// operator maps it to phases through the existing exit-code contract.
+type DeclaredOutcome string
+
+const (
+	// OutcomeChanges: work was committed and pushed to the run branch.
+	OutcomeChanges DeclaredOutcome = "changes"
+	// OutcomeNoChangeNeeded: the work was already done, with evidence.
+	OutcomeNoChangeNeeded DeclaredOutcome = "no_change_needed"
+	// OutcomeNeedsDecision: a human decision the run cannot make is required.
+	OutcomeNeedsDecision DeclaredOutcome = "needs_decision"
+	// OutcomeBlockedExternal: something outside the run is missing.
+	OutcomeBlockedExternal DeclaredOutcome = "blocked_external"
+)
+
+// HarnessResult is what a native harness reports when its execution ends.
+// Outcome carries the coordinator's own declaration; Err carries an
+// infrastructure failure (pod, gateway, status path) that the operator
+// relaunches under the crashloop backstop — it is never a verdict on the work.
+type HarnessResult struct {
+	Outcome DeclaredOutcome
+	Reason  string
+	Err     error
+}
+
+// Harness is the native secure-mode runtime seam (#124): the trusted control
+// pod's in-process coordinator. It consumes the same Invocation context a
+// process executor receives and reports the same terminal vocabulary. Unlike
+// Executor, a Harness owns the model client and delegation itself; it must
+// never execute model-controlled commands locally — every model-requested
+// command is dispatched to the untrusted worker over the signed protocol, and
+// publication is reachable only from the harness's own trusted control path,
+// never from a delegated brief.
+type Harness interface {
+	Name() string
+	Run(context.Context, Invocation) HarnessResult
 }
 
 var (
@@ -185,20 +225,11 @@ func NewInvocation(run *courierv1alpha1.CoderRun, lane *courierv1alpha1.LaneProf
 	}, nil
 }
 
-// Environment returns the run context a coordinator container receives. The
-// values are kept in environment variables rather than shell-expanded command
-// strings so repository names, framing, and goals cannot become shell syntax.
-func Environment(inv Invocation, executorName string) []EnvVar {
-	return EnvironmentWithConfig(inv, executorName, "", "", "", "", "", "", "")
-}
-
-// EnvironmentWithConfig extends the run context with the deployment-specific
-// git and bootstrap settings needed by the executable shim. Secrets are wired
-// separately by the Pod builder as SecretKeyRef values. remoteURL points at
-// the head repository for a fix-pr run; baseRemoteURL always points at the
-// repository that owns the base branch, so a fork workspace can sync against
-// upstream while pushing to the fork.
-func EnvironmentWithConfig(inv Invocation, executorName, remoteURL, baseRemoteURL, baseBranch, opencodeBinary, opencodeFormat, terminationFile, opencodeAgent string) []EnvVar {
+// RunContextEnvironment returns the run-context subset of the coordinator
+// environment contract: the values both a process executor and the native
+// control pod need to reconstruct an Invocation. Secrets, runtime-specific
+// values, and remote URLs are wired separately by the Pod builder.
+func RunContextEnvironment(inv Invocation) []EnvVar {
 	level := "info"
 	if inv.Debug {
 		level = "debug"
@@ -207,8 +238,7 @@ func EnvironmentWithConfig(inv Invocation, executorName, remoteURL, baseRemoteUR
 	if err != nil {
 		rolesJSON = []byte("{}")
 	}
-	values := []EnvVar{
-		{Name: "COURIER_EXECUTOR", Value: executorName},
+	return []EnvVar{
 		{Name: "COURIER_RUN_NAME", Value: inv.RunName},
 		{Name: "COURIER_RUN_NAMESPACE", Value: inv.Namespace},
 		{Name: "COURIER_MODE", Value: string(inv.Mode)},
@@ -223,21 +253,41 @@ func EnvironmentWithConfig(inv Invocation, executorName, remoteURL, baseRemoteUR
 		{Name: "COURIER_FRAMING", Value: inv.Framing},
 		{Name: "COURIER_WORKSPACE", Value: inv.Workspace},
 		{Name: "COURIER_LOG_LEVEL", Value: level},
-		{Name: "COURIER_REPO_URL", Value: remoteURL},
-		{Name: "COURIER_BASE_REPO_URL", Value: baseRemoteURL},
-		{Name: "COURIER_BASE", Value: baseBranch},
-		{Name: "COURIER_OPENCODE_BINARY", Value: opencodeBinary},
-		{Name: "COURIER_OPENCODE_FORMAT", Value: opencodeFormat},
-		{Name: "COURIER_OPENCODE_AGENT", Value: opencodeAgent},
-		{Name: "COURIER_TERMINATION_FILE", Value: terminationFile},
+	}
+}
+
+// Environment returns the run context a coordinator container receives. The
+// values are kept in environment variables rather than shell-expanded command
+// strings so repository names, framing, and goals cannot become shell syntax.
+func Environment(inv Invocation, executorName string) []EnvVar {
+	return EnvironmentWithConfig(inv, executorName, "", "", "", "", "", "", "")
+}
+
+// EnvironmentWithConfig extends the run context with the deployment-specific
+// git and bootstrap settings needed by the executable shim. Secrets are wired
+// separately by the Pod builder as SecretKeyRef values. remoteURL points at
+// the head repository for a fix-pr run; baseRemoteURL always points at the
+// repository that owns the base branch, so a fork workspace can sync against
+// upstream while pushing to the fork.
+func EnvironmentWithConfig(inv Invocation, executorName, remoteURL, baseRemoteURL, baseBranch, opencodeBinary, opencodeFormat, terminationFile, opencodeAgent string) []EnvVar {
+	values := []EnvVar{{Name: "COURIER_EXECUTOR", Value: executorName}}
+	values = append(values, RunContextEnvironment(inv)...)
+	values = append(values,
+		EnvVar{Name: "COURIER_REPO_URL", Value: remoteURL},
+		EnvVar{Name: "COURIER_BASE_REPO_URL", Value: baseRemoteURL},
+		EnvVar{Name: "COURIER_BASE", Value: baseBranch},
+		EnvVar{Name: "COURIER_OPENCODE_BINARY", Value: opencodeBinary},
+		EnvVar{Name: "COURIER_OPENCODE_FORMAT", Value: opencodeFormat},
+		EnvVar{Name: "COURIER_OPENCODE_AGENT", Value: opencodeAgent},
+		EnvVar{Name: "COURIER_TERMINATION_FILE", Value: terminationFile},
 		// The coordinator commits completed work in the cloned repository. A
 		// fresh clone has no git identity, so provide a stable non-secret
 		// identity without requiring mutable image configuration.
-		{Name: "GIT_AUTHOR_NAME", Value: "Courier"},
-		{Name: "GIT_AUTHOR_EMAIL", Value: "courier@localhost"},
-		{Name: "GIT_COMMITTER_NAME", Value: "Courier"},
-		{Name: "GIT_COMMITTER_EMAIL", Value: "courier@localhost"},
-	}
+		EnvVar{Name: "GIT_AUTHOR_NAME", Value: "Courier"},
+		EnvVar{Name: "GIT_AUTHOR_EMAIL", Value: "courier@localhost"},
+		EnvVar{Name: "GIT_COMMITTER_NAME", Value: "Courier"},
+		EnvVar{Name: "GIT_COMMITTER_EMAIL", Value: "courier@localhost"},
+	)
 	return values
 }
 
@@ -246,4 +296,56 @@ func EnvironmentWithConfig(inv Invocation, executorName, remoteURL, baseRemoteUR
 type EnvVar struct {
 	Name  string
 	Value string
+}
+
+// InvocationFromEnv reconstructs an Invocation from the run-context
+// environment contract written by RunContextEnvironment. It is the adapter
+// seam the native harness control binary uses: the operator renders one
+// Invocation per run, and the trusted control pod reconstructs the same
+// values from its environment. get is the environment accessor, so tests can
+// supply a map.
+func InvocationFromEnv(get func(string) string) (Invocation, error) {
+	inv := Invocation{
+		RunName:   get("COURIER_RUN_NAME"),
+		Namespace: get("COURIER_RUN_NAMESPACE"),
+		Repo:      get("COURIER_REPO"),
+		HeadRepo:  get("COURIER_HEAD_REPO"),
+		HeadSHA:   get("COURIER_HEAD_SHA"),
+		Branch:    get("COURIER_BRANCH"),
+		Goal:      get("COURIER_GOAL"),
+		Model:     get("COURIER_MODEL"),
+		Framing:   get("COURIER_FRAMING"),
+		Workspace: get("COURIER_WORKSPACE"),
+		Debug:     get("COURIER_LOG_LEVEL") == "debug",
+	}
+	inv.Mode = courierv1alpha1.Mode(get("COURIER_MODE"))
+	switch inv.Mode {
+	case courierv1alpha1.ModeResolveIssue, courierv1alpha1.ModeFixPR:
+	default:
+		return Invocation{}, fmt.Errorf("%w: %q", ErrInvalidMode, inv.Mode)
+	}
+	ref, err := strconv.Atoi(get("COURIER_REF"))
+	if err != nil || ref < 1 {
+		return Invocation{}, ErrInvalidReference
+	}
+	inv.Ref = ref
+	rolesJSON := get("COURIER_ROLES_JSON")
+	if strings.TrimSpace(rolesJSON) != "" {
+		if err := json.Unmarshal([]byte(rolesJSON), &inv.Roles); err != nil {
+			return Invocation{}, fmt.Errorf("executor: decode COURIER_ROLES_JSON: %w", err)
+		}
+	}
+	switch {
+	case inv.RunName == "":
+		return Invocation{}, ErrMissingRunName
+	case inv.Namespace == "":
+		return Invocation{}, ErrMissingNamespace
+	case inv.Workspace == "":
+		return Invocation{}, ErrMissingWorkspace
+	case inv.Goal == "":
+		return Invocation{}, errors.New("executor: goal is required")
+	case inv.Model == "":
+		return Invocation{}, ErrMissingModel
+	}
+	return inv, nil
 }

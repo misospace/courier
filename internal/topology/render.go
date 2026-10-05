@@ -17,8 +17,13 @@ import (
 	"k8s.io/apimachinery/pkg/util/intstr"
 
 	courier "github.com/misospace/courier/api/v1alpha1"
+	"github.com/misospace/courier/internal/executor"
 	"github.com/misospace/courier/internal/forge"
 )
+
+// GatewayKeyName is the fixed key of the per-run gateway Secret the operator
+// copies from the deployment's model-gateway key Secret.
+const GatewayKeyName = "key"
 
 // CoordinatorUID is the non-root identity every secure pod runs as, matching
 // the executor's identity contract.
@@ -271,6 +276,20 @@ type BrokerPolicyDocument struct {
 	Provider          forge.Projection           `json:"provider"`
 }
 
+// GatewaySecret renders the per-run copy of the deployment's model-gateway
+// key. The launcher copies the value from the deployment's key Secret; run GC
+// deletes the copy and never a shared source. Only trusted control mounts it.
+func GatewaySecret(run *courier.CoderRun, key []byte) (*corev1.Secret, error) {
+	if len(key) == 0 {
+		return nil, errors.New("topology: gateway key copy requires a key value")
+	}
+	return &corev1.Secret{
+		ObjectMeta: objectMeta(run, GatewaySecretName(run.Name), ComponentCoordinator),
+		Type:       corev1.SecretTypeOpaque,
+		Data:       map[string][]byte{GatewayKeyName: key},
+	}, nil
+}
+
 // CredentialsSecret renders the per-run copy of the selected registration's
 // credential values under the fixed key contract. The launcher resolves the
 // referenced values from the deployment's Secrets; run GC deletes the copy
@@ -492,11 +511,16 @@ func BrokerPod(run *courier.CoderRun, image string, projection forge.Projection,
 	}, nil
 }
 
-// ControlInputs carries the values only the launcher can resolve after the
-// rest of the topology exists: the control SA UID, the live worker pod UID,
-// and the operator-minted control incarnation identifier.
+// ControlInputs carries everything the control pod needs: the run-context
+// invocation the operator assembled for the run, the resolved identity and
+// addresses of this incarnation round, and the optional model-gateway
+// configuration. The gateway key arrives through the per-run gateway Secret;
+// GatewayKeyMounted reports whether that Secret was provisioned.
 type ControlInputs struct {
 	Image                 string
+	Run                   executor.Invocation
+	GatewayURL            string
+	GatewayKeyMounted     bool
 	ControlSAUID          string
 	WorkerPodUID          string
 	ControlIncarnationUID string
@@ -510,10 +534,91 @@ type ControlInputs struct {
 // contract applies unchanged, and it carries the component label the broker's
 // authenticator expects. It mounts the signing private key, the broker CA,
 // and its projected 600-second pod-bound broker-audience token — and no
-// forge or git credential of any kind.
+// forge or git credential of any kind. It is the only pod that holds the
+// model-provider key, and that key is mounted as a file, not an env value.
 func ControlPod(run *courier.CoderRun, in ControlInputs) (*corev1.Pod, error) {
 	if in.ControlSAUID == "" || in.WorkerPodUID == "" || in.ControlIncarnationUID == "" || in.WorkerURL == "" || in.BrokerURL == "" {
 		return nil, errors.New("topology: control pod requires resolved identity and addresses")
+	}
+	if in.GatewayURL == "" && in.GatewayKeyMounted {
+		return nil, errors.New("topology: control pod renders a gateway key Secret without a gateway URL")
+	}
+	volumes := []corev1.Volume{
+		{
+			Name:         "workspace",
+			VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{}},
+		},
+		{
+			Name:         "runtime",
+			VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{}},
+		},
+		{
+			Name: "signing-key",
+			VolumeSource: corev1.VolumeSource{Secret: &corev1.SecretVolumeSource{
+				SecretName: SigningSecretName(run.Name),
+				Items:      []corev1.KeyToPath{{Key: "signing.key", Path: "signing.key"}},
+			}},
+		},
+		{
+			Name: "broker-ca",
+			VolumeSource: corev1.VolumeSource{Secret: &corev1.SecretVolumeSource{
+				SecretName: BrokerTLSSecretName(run.Name),
+				Items:      []corev1.KeyToPath{{Key: "ca.crt", Path: "ca.crt"}},
+			}},
+		},
+		{
+			Name: "broker-token",
+			VolumeSource: corev1.VolumeSource{Projected: &corev1.ProjectedVolumeSource{
+				Sources: []corev1.VolumeProjection{{
+					ServiceAccountToken: &corev1.ServiceAccountTokenProjection{
+						Audience:          BrokerAudience,
+						ExpirationSeconds: int64Ptr(ControlTokenSeconds),
+						Path:              "broker-token",
+					},
+				}},
+			}},
+		},
+	}
+	mounts := []corev1.VolumeMount{
+		{Name: "workspace", MountPath: controlWorkspacePath},
+		{Name: "runtime", MountPath: controlRuntimePath},
+		{Name: "signing-key", MountPath: "/var/run/courier/signing", ReadOnly: true},
+		{Name: "broker-ca", MountPath: "/var/run/courier/broker", ReadOnly: true},
+		{Name: "broker-token", MountPath: "/var/run/secrets/tokens", ReadOnly: true},
+	}
+	env := []corev1.EnvVar{
+		{Name: EnvPodNamespace, Value: run.Namespace},
+		{Name: EnvRunUID, Value: string(run.UID)},
+		{Name: EnvControlPodUID, Value: in.ControlIncarnationUID},
+		{Name: EnvWorkerPodUID, Value: in.WorkerPodUID},
+		{Name: EnvWorkerURL, Value: in.WorkerURL},
+		{Name: EnvBrokerURL, Value: in.BrokerURL},
+		{Name: EnvBrokerStatusURL, Value: in.BrokerStatusURL},
+		{Name: EnvBrokerCAFile, Value: controlBrokerCAPath},
+		{Name: EnvSigningKeyFile, Value: controlSigningKeyPath},
+		{Name: EnvBrokerTokenFile, Value: controlTokenPath},
+		{Name: "COURIER_TERMINATION_FILE", Value: controlRuntimePath + "/termination"},
+	}
+	if in.GatewayURL != "" && in.GatewayKeyMounted {
+		volumes = append(volumes, corev1.Volume{
+			Name: "gateway-key",
+			VolumeSource: corev1.VolumeSource{Secret: &corev1.SecretVolumeSource{
+				SecretName: GatewaySecretName(run.Name),
+				Items:      []corev1.KeyToPath{{Key: GatewayKeyName, Path: "key"}},
+			}},
+		})
+		mounts = append(mounts, corev1.VolumeMount{Name: "gateway-key", MountPath: "/var/run/courier/gateway", ReadOnly: true})
+		env = append(env,
+			corev1.EnvVar{Name: EnvGatewayURL, Value: in.GatewayURL},
+			corev1.EnvVar{Name: EnvGatewayKeyFile, Value: controlGatewayKeyPath},
+		)
+	} else if in.GatewayURL != "" {
+		// An unauthenticated gateway is a deployment choice: the URL is
+		// still rendered, no key material exists.
+		env = append(env, corev1.EnvVar{Name: EnvGatewayURL, Value: in.GatewayURL})
+	}
+	for _, runEnv := range executor.RunContextEnvironment(in.Run) {
+		env = append(env, corev1.EnvVar{Name: runEnv.Name, Value: runEnv.Value})
 	}
 	return &corev1.Pod{
 		ObjectMeta: objectMeta(run, ControlPodName(run.Name), ComponentCoordinator),
@@ -522,42 +627,7 @@ func ControlPod(run *courier.CoderRun, in ControlInputs) (*corev1.Pod, error) {
 			AutomountServiceAccountToken: boolPtr(false),
 			RestartPolicy:                corev1.RestartPolicyNever,
 			SecurityContext:              podSecurityContext(),
-			Volumes: []corev1.Volume{
-				{
-					Name:         "workspace",
-					VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{}},
-				},
-				{
-					Name:         "runtime",
-					VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{}},
-				},
-				{
-					Name: "signing-key",
-					VolumeSource: corev1.VolumeSource{Secret: &corev1.SecretVolumeSource{
-						SecretName: SigningSecretName(run.Name),
-						Items:      []corev1.KeyToPath{{Key: "signing.key", Path: "signing.key"}},
-					}},
-				},
-				{
-					Name: "broker-ca",
-					VolumeSource: corev1.VolumeSource{Secret: &corev1.SecretVolumeSource{
-						SecretName: BrokerTLSSecretName(run.Name),
-						Items:      []corev1.KeyToPath{{Key: "ca.crt", Path: "ca.crt"}},
-					}},
-				},
-				{
-					Name: "broker-token",
-					VolumeSource: corev1.VolumeSource{Projected: &corev1.ProjectedVolumeSource{
-						Sources: []corev1.VolumeProjection{{
-							ServiceAccountToken: &corev1.ServiceAccountTokenProjection{
-								Audience:          BrokerAudience,
-								ExpirationSeconds: int64Ptr(ControlTokenSeconds),
-								Path:              "broker-token",
-							},
-						}},
-					}},
-				},
-			},
+			Volumes:                      volumes,
 			Containers: []corev1.Container{{
 				Name:                     ControlContainerName,
 				Image:                    in.Image,
@@ -565,27 +635,9 @@ func ControlPod(run *courier.CoderRun, in ControlInputs) (*corev1.Pod, error) {
 				WorkingDir:               controlWorkspacePath,
 				TerminationMessagePath:   controlRuntimePath + "/termination",
 				TerminationMessagePolicy: corev1.TerminationMessageReadFile,
-				Env: []corev1.EnvVar{
-					{Name: EnvPodNamespace, Value: run.Namespace},
-					{Name: EnvRunUID, Value: string(run.UID)},
-					{Name: EnvControlPodUID, Value: in.ControlIncarnationUID},
-					{Name: EnvWorkerPodUID, Value: in.WorkerPodUID},
-					{Name: EnvWorkerURL, Value: in.WorkerURL},
-					{Name: EnvBrokerURL, Value: in.BrokerURL},
-					{Name: EnvBrokerStatusURL, Value: in.BrokerStatusURL},
-					{Name: EnvBrokerCAFile, Value: controlBrokerCAPath},
-					{Name: EnvSigningKeyFile, Value: controlSigningKeyPath},
-					{Name: EnvBrokerTokenFile, Value: controlTokenPath},
-					{Name: "COURIER_TERMINATION_FILE", Value: controlRuntimePath + "/termination"},
-				},
-				VolumeMounts: []corev1.VolumeMount{
-					{Name: "workspace", MountPath: controlWorkspacePath},
-					{Name: "runtime", MountPath: controlRuntimePath},
-					{Name: "signing-key", MountPath: "/var/run/courier/signing", ReadOnly: true},
-					{Name: "broker-ca", MountPath: "/var/run/courier/broker", ReadOnly: true},
-					{Name: "broker-token", MountPath: "/var/run/secrets/tokens", ReadOnly: true},
-				},
-				SecurityContext: containerSecurityContext(),
+				Env:                      env,
+				VolumeMounts:             mounts,
+				SecurityContext:          containerSecurityContext(),
 			}},
 		},
 	}, nil
