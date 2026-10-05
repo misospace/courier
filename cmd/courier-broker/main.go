@@ -182,6 +182,13 @@ func run(ctx context.Context, config runConfig) error {
 		ScratchDir:    config.scratchDir,
 		TLSCertFile:   config.certFile,
 		TLSKeyFile:    config.keyFile,
+		Capabilities: pinnedCapabilities{
+			name:       document.Provider.Name,
+			provider:   document.Provider.Type,
+			endpoint:   document.Provider.Endpoint,
+			git:        document.Provider.GitTemplate,
+			operations: provider.Capabilities(),
+		},
 	})
 	if err != nil {
 		return fmt.Errorf("courier-broker: server rejected its configuration: %w", err)
@@ -218,6 +225,37 @@ type brokerEnv struct {
 	gitUsername    string
 	gitToken       string
 	apiTokenFile   string
+}
+
+// pinnedCapabilities is the immutable capability report captured at broker
+// startup from the projected registration and the provider's own typed
+// surface. It exposes configuration data only: names, endpoints, the closed
+// capability vocabulary, and the already-redacted diagnostics. The git
+// endpoint is the registration's own template, which carries no secret; the
+// ready flag records that this process's startup preflight verified the
+// credential-bound policy before serving.
+type pinnedCapabilities struct {
+	name       string
+	provider   string
+	endpoint   string
+	git        string
+	operations forge.Capabilities
+}
+
+func (p pinnedCapabilities) CapabilityReport() broker.CapabilityReport {
+	report := broker.CapabilityReport{
+		Provider: broker.ProviderReport{Name: p.name, Type: p.provider, Endpoint: p.endpoint},
+		Git:      broker.GitReport{Endpoint: p.git, Ready: true},
+	}
+	for _, capability := range p.operations.List() {
+		availability := p.operations.Available(capability)
+		report.Operations = append(report.Operations, broker.OperationReport{
+			Name:      string(capability),
+			Available: availability.Available,
+			Detail:    availability.Detail,
+		})
+	}
+	return report
 }
 
 func loadEnv() (*brokerEnv, error) {

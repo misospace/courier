@@ -1129,9 +1129,14 @@ and the acceptance tests below are satisfied.
    operator-resolved admission inputs, pre/post-push live revalidation, the
    `NeedsHuman`/retryable matrix, and provider-neutral semantics with
    fail-closed unsupported providers, including the writable fork head required
-   by #94. #122's broker enforcement layer and #123's per-run pod wiring and
-   admission resolution have landed (deployment-level secure mode); the native
-   model client remains #124.
+   by #94. #122's broker enforcement layer, #123's per-run pod wiring and
+   admission resolution, and #124's native model client — stream
+   normalization, LaneProfile role binding over the gateway, brief
+   delegation with cancellation/retry dedupe, and startup capability
+   health — have landed (deployment-level secure mode); #125's artifact
+   validation, integration, and publication remain, and until then the
+   control pod's capability gate reports publication as unavailable and
+   fails closed before model work starts.
 3. Settled in §5: the worker artifact contract — git bundle only, exact
    base-tip ancestry binding, fixed size/object bounds, exact ref-set
    equality, operator-resolved path scope, and worker metadata as never

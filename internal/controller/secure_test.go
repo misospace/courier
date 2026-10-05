@@ -173,6 +173,18 @@ func secureControl(t *testing.T, objects ...client.Object) (*SecureControl, clie
 			t.Fatal(err)
 		}
 	}
+	// The lane every test run names; the launcher builds the control pod's
+	// run context from it.
+	lane := &courier.LaneProfile{
+		ObjectMeta: metav1.ObjectMeta{Namespace: secureTestNamespace, Name: "local"},
+		Spec: courier.LaneProfileSpec{
+			Roles: map[string]string{
+				"coordinator": "test/coordinator",
+				"coder":       "test/coder",
+			},
+		},
+	}
+	objects = append([]client.Object{lane}, objects...)
 	c := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(&courier.CoderRun{}).
 		WithObjects(objects...).
 		WithInterceptorFuncs(interceptor.Funcs{
@@ -459,6 +471,118 @@ func TestLaunchSecureProvisionsTopology(t *testing.T) {
 	if err != nil {
 		t.Fatalf("idempotent relaunch: %v", err)
 	}
+	// The control pod carries the run context the native harness reconstructs.
+	foundGoal := false
+	for _, env := range controlPod.Spec.Containers[0].Env {
+		if env.Name == "COURIER_GOAL" && env.Value != "" {
+			foundGoal = true
+		}
+	}
+	if !foundGoal {
+		t.Fatal("control pod carries no run-context goal")
+	}
+}
+
+// The deployment-level model gateway is rendered into trusted control only:
+// the URL is env, the key is a per-run Secret copy mounted as a file, and
+// runs without gateway configuration carry no gateway material at all.
+func TestLaunchSecureRendersModelGateway(t *testing.T) {
+	newLaunch := func(t *testing.T, control *SecureControl, c client.Client, name string) *corev1.Pod {
+		t.Helper()
+		run := secureRun(name)
+		run.Status.Phase = courier.PhaseClaimed
+		run.Status.PublicationPolicy = &courier.PublicationPolicy{
+			RunUID:              string(run.UID),
+			ProviderConfigRef:   "github",
+			ProviderEndpoint:    "https://api.github.com/",
+			CredentialRefDigest: secureRegistry().Registrations()[0].Projection().Digest,
+			BaseRepo:            "Acme/Widgets",
+			BaseRef:             "main",
+			BaseOID:             "baseoid",
+			WorkRepo:            "Acme/Widgets",
+			WorkRef:             "courier/Acme/Widgets/issue-7",
+			WorkInitiallyAbsent: true,
+		}
+		if err := c.Create(context.Background(), run); err != nil {
+			t.Fatal(err)
+		}
+		if err := c.Create(context.Background(), &corev1.Namespace{
+			ObjectMeta: metav1.ObjectMeta{Name: secureTestNamespace, Labels: map[string]string{"pod-security.kubernetes.io/enforce": "restricted"}},
+		}); err != nil {
+			t.Fatal(err)
+		}
+		if err := c.Create(context.Background(), &corev1.Secret{
+			ObjectMeta: metav1.ObjectMeta{Namespace: "courier-system", Name: "forge-creds"},
+			Data:       map[string][]byte{"token": []byte("tok-123")},
+		}); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := control.LaunchSecure(context.Background(), run); err != nil {
+			t.Fatalf("LaunchSecure: %v", err)
+		}
+		pods := &corev1.PodList{}
+		if err := c.List(context.Background(), pods, client.InNamespace(secureTestNamespace)); err != nil {
+			t.Fatal(err)
+		}
+		for i := range pods.Items {
+			if pods.Items[i].Labels["courier.misospace.dev/component"] == topology.ComponentCoordinator {
+				return &pods.Items[i]
+			}
+		}
+		t.Fatal("no control pod provisioned")
+		return nil
+	}
+
+	t.Run("gateway configured", func(t *testing.T) {
+		control, c := secureControl(t)
+		control.Config.GatewayURL = "http://gateway:4000/v1"
+		control.Config.GatewayKeySecret = "courier-system/gateway-key"
+		if err := c.Create(context.Background(), &corev1.Secret{
+			ObjectMeta: metav1.ObjectMeta{Namespace: "courier-system", Name: "gateway-key"},
+			Data:       map[string][]byte{"key": []byte("gw-secret-value")},
+		}); err != nil {
+			t.Fatal(err)
+		}
+		controlPod := newLaunch(t, control, c, "gateway")
+		url, keyFile := "", ""
+		for _, env := range controlPod.Spec.Containers[0].Env {
+			switch env.Name {
+			case topology.EnvGatewayURL:
+				url = env.Value
+			case topology.EnvGatewayKeyFile:
+				keyFile = env.Value
+			}
+		}
+		if url != "http://gateway:4000/v1" || keyFile == "" {
+			t.Fatalf("gateway env = url %q key file %q", url, keyFile)
+		}
+		gatewaySecret := &corev1.Secret{}
+		if err := c.Get(context.Background(), client.ObjectKey{Namespace: secureTestNamespace, Name: topology.GatewaySecretName("gateway")}, gatewaySecret); err != nil {
+			t.Fatalf("per-run gateway key copy missing: %v", err)
+		}
+		if string(gatewaySecret.Data[topology.GatewayKeyName]) != "gw-secret-value" {
+			t.Fatal("gateway key copy does not carry the deployment key value")
+		}
+	})
+
+	t.Run("gateway unconfigured", func(t *testing.T) {
+		control, c := secureControl(t)
+		controlPod := newLaunch(t, control, c, "nogateway")
+		for _, env := range controlPod.Spec.Containers[0].Env {
+			if env.Name == topology.EnvGatewayURL {
+				t.Fatal("gateway URL must be absent without gateway configuration")
+			}
+		}
+		secrets := &corev1.SecretList{}
+		if err := c.List(context.Background(), secrets, client.InNamespace(secureTestNamespace)); err != nil {
+			t.Fatal(err)
+		}
+		for i := range secrets.Items {
+			if secrets.Items[i].Name == topology.GatewaySecretName("nogateway") {
+				t.Fatal("no gateway key copy may be provisioned without gateway configuration")
+			}
+		}
+	})
 }
 
 func TestObserveTopologyFencesBrokenWorker(t *testing.T) {
@@ -546,6 +670,16 @@ func TestRevokeIsOrderedAndIdempotent(t *testing.T) {
 	if err := c.Create(context.Background(), topology.BrokerService(run)); err != nil {
 		t.Fatal(err)
 	}
+	// The per-run gateway credential copy exists: revocation must remove it
+	// with the rest of the run-only material — a model-provider credential
+	// may never outlive the run.
+	gatewaySecret, err := topology.GatewaySecret(run, []byte("gw-secret-value"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := c.Create(context.Background(), gatewaySecret); err != nil {
+		t.Fatal(err)
+	}
 
 	done, err := control.Revoke(context.Background(), run)
 	if err != nil {
@@ -591,6 +725,11 @@ func TestRevokeIsOrderedAndIdempotent(t *testing.T) {
 	}
 	if len(services.Items) != 0 {
 		t.Fatalf("services survived revocation: %d", len(services.Items))
+	}
+	// The model-provider gateway credential copy must be gone with the rest
+	// of the run-only material.
+	if err := c.Get(context.Background(), client.ObjectKey{Namespace: run.Namespace, Name: topology.GatewaySecretName(run.Name)}, &corev1.Secret{}); !apierrors.IsNotFound(err) {
+		t.Fatalf("gateway credential copy survived revocation: %v", err)
 	}
 	if done, err := control.Revoke(context.Background(), run); err != nil || !done {
 		t.Fatalf("rerun of a completed revocation = done=%v err=%v", done, err)

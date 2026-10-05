@@ -44,6 +44,9 @@ type ServerConfig struct {
 	ScratchDir    string
 	TLSCertFile   string
 	TLSKeyFile    string
+	// Capabilities optionally serves the read-only capability report. It is
+	// captured at construction and never changes per request.
+	Capabilities CapabilityReporter
 }
 
 type Server struct {
@@ -51,6 +54,7 @@ type Server struct {
 	authenticator RequestAuthenticator
 	importer      BundleImporter
 	scratchDir    string
+	capabilities  CapabilityReporter
 	importMu      sync.Mutex
 	handler       http.Handler
 }
@@ -80,11 +84,14 @@ func NewServer(config ServerConfig) (*Server, error) {
 	if _, err := tls.LoadX509KeyPair(config.TLSCertFile, config.TLSKeyFile); err != nil {
 		return nil, fmt.Errorf("load broker TLS identity: %w", err)
 	}
-	s := &Server{policy: config.Policy, authenticator: config.Authenticator, importer: config.Importer, scratchDir: config.ScratchDir}
+	s := &Server{policy: config.Policy, authenticator: config.Authenticator, importer: config.Importer, scratchDir: config.ScratchDir, capabilities: config.Capabilities}
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST "+PathPublish, s.publish)
 	if s.importer != nil {
 		mux.HandleFunc("POST "+PathImportBundle, s.importBundle)
+	}
+	if s.capabilities != nil {
+		mux.HandleFunc("GET "+PathCapabilities, s.capabilityHandler)
 	}
 	mux.HandleFunc("POST "+PathCreatePR, s.createPR)
 	mux.HandleFunc("PATCH "+PathUpdatePR, s.updatePR)
