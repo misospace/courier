@@ -325,7 +325,8 @@ to die.
   except at the restart ceiling, where it survives as the `NeedsHuman`
   hand-off's only record of the cause. A stale-heartbeat run whose cache
   already shows such a pod is reaped by the wedge path first, which keeps the
-  generic message like any reaped coordinator.
+  generic message like any reaped coordinator and, at the ceiling, preserves
+  the inert object exactly like the backstop.
 - The crashloop counter bounds a **consecutive** streak of wedges, not a lifetime
   total: a run that demonstrates liveness — a fresh heartbeat within the window
   while a recoverable coordinator is observable — resets the streak to zero, so
@@ -1642,3 +1643,15 @@ was superseded.
   while a recoverable coordinator is observable: an eviction detected inside
   the window must not reset the counter the same reconcile charges. Eviction
   is exactly the class #106 must repair. (#106)
+- **2026-10-05 — The ceiling evidence-preservation rule now covers both
+  infra-loss hand-offs.** A stale-heartbeat run whose cached coordinator is an
+  unobservable dead object is reaped by the wedge path before the
+  disappearance backstop can route it, and the wedge path deleted that inert
+  object before the restart ceiling was even consulted — so at the ceiling the
+  `NeedsHuman` hand-off lost the only record of the cause the backstop
+  deliberately preserves. The wedge path now applies the same rule: an
+  unrecoverable coordinator is preserved, not deleted, at the ceiling,
+  mirroring the backstop — the hand-off must keep the only record of the
+  cause regardless of which path detected the loss, and no replacement needs
+  the name. Below the ceiling the object is still deleted so the
+  deterministic pod name stays free. (#106)

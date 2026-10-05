@@ -274,6 +274,91 @@ func TestLivenessCrashloopTransitionsToNeedsHuman(t *testing.T) {
 	}
 }
 
+func TestWedgeCeilingPreservesUnrecoverableCoordinator(t *testing.T) {
+	for _, tc := range []struct {
+		name          string
+		restarts      int
+		wantPreserved bool
+	}{
+		{name: "below ceiling", restarts: 0},
+		{name: "at ceiling", restarts: 3, wantPreserved: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			src := &admissionSource{}
+			run := admissionRun("run", "local", courierv1alpha1.PhaseRunning)
+			// A stale heartbeat and a cached evicted coordinator: the wedge
+			// path reaps it before the disappearance backstop can route it.
+			withHeartbeat(run, livenessClock.Add(-10*time.Minute))
+			run.Status.Restarts = tc.restarts
+			pod := evictedCoordinatorPod(run)
+			// The pod is old (2 hours ago, past the liveness window), so no
+			// freshness grace applies.
+			pod.CreationTimestamp = metav1.NewTime(livenessClock.Add(-2 * time.Hour))
+			client := phaseClient(t, run, pod)
+			reconciler := livenessReconciler(client, src, livenessClock)
+
+			result, err := reconciler.Reconcile(context.Background(), admissionRequest("run"))
+			if err != nil {
+				t.Fatalf("Reconcile() error = %v", err)
+			}
+			var updated courierv1alpha1.CoderRun
+			if err := client.Get(context.Background(), admissionKey("run"), &updated); err != nil {
+				t.Fatalf("get run: %v", err)
+			}
+			var got corev1.Pod
+			podKey := types.NamespacedName{Name: "run-coordinator", Namespace: "default"}
+			err = client.Get(context.Background(), podKey, &got)
+			if !tc.wantPreserved {
+				if !result.Requeue {
+					t.Fatalf("Requeue = false, want true; a run below the ceiling must relaunch")
+				}
+				if !apierrors.IsNotFound(err) {
+					t.Fatalf("get pod: %v, want NotFound; the inert object must be deleted so the pod name is free for the replacement", err)
+				}
+				if updated.Status.Restarts != 1 {
+					t.Fatalf("restarts = %d, want 1", updated.Status.Restarts)
+				}
+				if updated.Status.Phase != courierv1alpha1.PhaseClaimed {
+					t.Fatalf("phase = %q, want Claimed", updated.Status.Phase)
+				}
+				if len(src.transitions) != 0 {
+					t.Fatalf("transitions = %#v, want none; a relaunch is not a terminal publish", src.transitions)
+				}
+				if len(src.reports) != 0 {
+					t.Fatalf("reports = %#v, want none; a relaunch is not a terminal publish", src.reports)
+				}
+				return
+			}
+			// At the ceiling the inert object survives — the NeedsHuman
+			// hand-off keeps the only record of the cause.
+			if result.Requeue || result.RequeueAfter != 0 {
+				t.Fatalf("result = %#v, want no requeue; the terminal hand-off takes no requeue", result)
+			}
+			if apierrors.IsNotFound(err) {
+				t.Fatal("get pod: NotFound, want the inert object to survive at the ceiling; the NeedsHuman hand-off keeps the only record of the cause")
+			}
+			if got.Status.Reason != "Evicted" {
+				t.Fatalf("pod reason = %q, want Evicted; the surviving object is the only record of the cause", got.Status.Reason)
+			}
+			if updated.Status.Restarts != 3 {
+				t.Fatalf("restarts = %d, want 3 (the ceiling is not re-incremented)", updated.Status.Restarts)
+			}
+			if updated.Status.Phase != courierv1alpha1.PhaseNeedsHuman {
+				t.Fatalf("phase = %q, want NeedsHuman", updated.Status.Phase)
+			}
+			if len(src.transitions) != 1 || src.transitions[0] != source.StateNeedsHuman {
+				t.Fatalf("transitions = %#v, want [needs-human]", src.transitions)
+			}
+			if len(src.reports) != 1 || src.reports[0].Result != source.ResultBlocked {
+				t.Fatalf("reports = %#v, want one blocked report", src.reports)
+			}
+			if src.reports[0].Error != "run requires human intervention" {
+				t.Fatalf("reported error = %q, want the generic needs-human message; a reaped wedge is not pod loss", src.reports[0].Error)
+			}
+		})
+	}
+}
+
 func TestFreshHeartbeatLostCoordinatorAtCeilingStillNeedsHuman(t *testing.T) {
 	src := &admissionSource{}
 	run := admissionRun("run", "local", courierv1alpha1.PhaseRunning)

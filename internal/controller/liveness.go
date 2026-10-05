@@ -75,10 +75,13 @@ func (r *CoderRunReconciler) maxRestarts() int {
 // A confirmed reap increments the crashloop counter, with one exception:
 // once the counter has reached the threshold (Restarts >= maxRestarts) the
 // run transitions to NeedsHuman with the counter left at the ceiling,
-// instead of relaunched again. Below the ceiling the run returns to Claimed
-// so the next reconcile relaunches and resumes it. The second return value
-// reports whether liveness took action, so the caller can stop further pod
-// observation.
+// instead of relaunched again. At the ceiling an unrecoverable coordinator —
+// a terminal-phase object with no recorded termination status — is
+// preserved, not deleted: the NeedsHuman hand-off keeps the only record of
+// the cause, exactly as the disappearance backstop. Below the ceiling the
+// run returns to Claimed so the next reconcile relaunches and resumes it.
+// The second return value reports whether liveness took action, so the
+// caller can stop further pod observation.
 func (r *CoderRunReconciler) checkLiveness(ctx context.Context, run *courierv1alpha1.CoderRun, pods []corev1.Pod) (ctrl.Result, bool, error) {
 	if run.Status.Heartbeat == nil {
 		return ctrl.Result{}, false, nil
@@ -124,8 +127,13 @@ func (r *CoderRunReconciler) checkLiveness(ctx context.Context, run *courierv1al
 		}
 	}
 
+	// The ceiling is judged once, before the loop: a pod skipped at the
+	// ceiling is preserved as evidence, not deleted, so the run must still
+	// terminalize in this reconcile.
+	atCeiling := run.Status.Restarts >= r.maxRestarts()
 	missing := true
 	deleted := false
+	preserved := false
 	for i := range pods {
 		pod := &pods[i]
 		if !podBelongsToRun(pod, run) {
@@ -136,6 +144,17 @@ func (r *CoderRunReconciler) checkLiveness(ctx context.Context, run *courierv1al
 		// flight, and re-counting it would double the crashloop counter for
 		// a single wedge.
 		if pod.DeletionTimestamp != nil {
+			continue
+		}
+		// At the restart ceiling an unrecoverable coordinator is inert
+		// evidence, not a wedge: skip the delete so the NeedsHuman hand-off
+		// keeps the only record of the cause, mirroring the disappearance
+		// backstop. No replacement needs the name. Only the run's
+		// coordinator object counts: a worker or broker pod in a terminal
+		// phase records no coordinator termination, and the preserved
+		// evidence is the run's coordinator.
+		if atCeiling && hasCoordinatorContainer(pod) && coordinatorPodUnrecoverable(pod) {
+			preserved = true
 			continue
 		}
 		if err := client.IgnoreNotFound(r.Delete(ctx, pod)); err != nil {
@@ -150,13 +169,14 @@ func (r *CoderRunReconciler) checkLiveness(ctx context.Context, run *courierv1al
 		// relaunch.
 		return ctrl.Result{}, false, nil
 	}
-	if !deleted {
-		// Every wedged coordinator pod is already terminating: a sibling
-		// reconcile is finishing this reap. Take no further action. The
-		// deletion's watch event normally wakes the relaunch, but a pod can
-		// stay terminating (e.g. held by a finalizer) long enough that the
-		// event never arrives, so the bounded re-observation delay below
-		// covers the stuck-terminating case instead of the event alone.
+	if !deleted && !preserved {
+		// Every wedged coordinator pod is already terminating, and none was
+		// deliberately preserved at the ceiling: a sibling reconcile is
+		// finishing this reap. Take no further action. The deletion's watch
+		// event normally wakes the relaunch, but a pod can stay terminating
+		// (e.g. held by a finalizer) long enough that the event never
+		// arrives, so the bounded re-observation delay below covers the
+		// stuck-terminating case instead of the event alone.
 		return ctrl.Result{RequeueAfter: observationRequeueDelay}, false, nil
 	}
 
