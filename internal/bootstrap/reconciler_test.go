@@ -53,9 +53,10 @@ func TestReconcileAllCreatesMissingProfileWithOwnerLabel(t *testing.T) {
 func TestReconcileAllRestoresDriftedManagedProfile(t *testing.T) {
 	drifted := &courierv1alpha1.LaneProfile{
 		ObjectMeta: metav1.ObjectMeta{
-			Namespace: "courier",
-			Name:      "local",
-			Labels:    map[string]string{OwnerLabelKey: OwnerLabelValue},
+			Namespace:   "courier",
+			Name:        "local",
+			Labels:      map[string]string{OwnerLabelKey: OwnerLabelValue},
+			Annotations: map[string]string{courierv1alpha1.SuspendAnnotation: "true"},
 		},
 		Spec: courierv1alpha1.LaneProfileSpec{
 			Concurrency: 1,
@@ -89,6 +90,9 @@ func TestReconcileAllRestoresDriftedManagedProfile(t *testing.T) {
 	}
 	if got.Spec.Framing != "Restore the framing when any spec field drifts.\n" {
 		t.Fatalf("framing = %q, want the framing round-tripped on restore", got.Spec.Framing)
+	}
+	if got.Annotations[courierv1alpha1.SuspendAnnotation] != "true" {
+		t.Fatalf("suspend annotation = %q, want it preserved through a drift restore", got.Annotations[courierv1alpha1.SuspendAnnotation])
 	}
 }
 
