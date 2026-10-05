@@ -314,7 +314,9 @@ to die.
   A lost **control** pod is loss even while the worker and broker survive;
   the replacement round is fenced and re-provisioned by the existing launch
   path. An orphan with no pod to watch recovers on the next reconcile — for
-  a run with no events at all, the controller's periodic resync.
+  a run with no events at all, the controller's periodic resync; the manager
+  configures no cache resync, so that recovery rides controller-runtime's
+  default ~10-hour periodic resync.
 - An **unobservable dead coordinator** — a coordinator pod in a terminal
   phase with no recorded coordinator termination status — is pod loss on the
   same terms. Kubernetes can transition a pod to **Failed** (eviction, failed
@@ -323,7 +325,10 @@ to die.
   backstop confirms it with the same live read, and the confirmed dead object
   is deleted so the run's deterministic pod name is free for the replacement —
   except at the restart ceiling, where it survives as the `NeedsHuman`
-  hand-off's only record of the cause. A stale-heartbeat run whose cache
+  hand-off's only record of the cause. Below the ceiling the charge is
+  deferred until a live read shows the deleted object gone, so one physical
+  loss is charged once and the replacement can never attach to a dying object
+  the launcher would tolerate. A stale-heartbeat run whose cache
   already shows such a pod is reaped by the wedge path first, which keeps the
   generic message like any reaped coordinator and, at the ceiling, preserves
   the inert object exactly like the backstop.
@@ -1655,3 +1660,14 @@ was superseded.
   cause regardless of which path detected the loss, and no replacement needs
   the name. Below the ceiling the object is still deleted so the
   deterministic pod name stays free. (#106)
+- **2026-10-05 — The pod-loss charge now fires only after the live read
+  confirms the deleted dead object is gone.** A delete is not a
+  disappearance: a confirmed dead object can still be terminating, held by a
+  finalizer (deletionTimestamp set, object persists), and the relaunch path
+  tolerates an existing object — so a replacement could attach to the dying
+  object and the same physical loss be charged a second time when it finally
+  vanishes. The disappearance backstop now re-confirms with one more live
+  read after the delete and before the relaunch is charged: any surviving
+  coordinator object defers the charge, so the deterministic name is provably
+   free before the relaunch — one physical loss, one ceiling charge, found in
+   AI review of PR #218. (#106)

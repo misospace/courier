@@ -205,12 +205,16 @@ func (r *CoderRunReconciler) checkLiveness(ctx context.Context, run *courierv1al
 // live read: its inert object is deleted so the run's deterministic pod name
 // is free for the replacement, except at the restart ceiling, where it
 // survives as the NeedsHuman hand-off's only record of the cause, and the
-// relaunch is charged as pod loss against the shared ceiling. A coordinator
-// pod whose deletion is already in flight is neither a live coordinator nor
-// a confirmed loss, so the run is re-observed. A read that fails is not
-// evidence of a loss either, and defers the same way. Only an API server
-// with no live coordinator for the run charges the bounded relaunch with its
-// restart ceiling.
+// relaunch is charged as pod loss against the shared ceiling. Below the
+// ceiling the charge is deferred until a live read shows the deleted object
+// is gone, so the deterministic pod name is provably free before the relaunch
+// is charged — one physical loss is charged exactly once, and a replacement
+// can never attach to a dying object the launcher would tolerate. A
+// coordinator pod whose deletion is already in flight is neither a live
+// coordinator nor a confirmed loss, so the run is re-observed. A read that
+// fails is not evidence of a loss either, and defers the same way. Only an
+// API server with no live coordinator for the run charges the bounded
+// relaunch with its restart ceiling.
 func (r *CoderRunReconciler) observeMissingCoordinator(ctx context.Context, run *courierv1alpha1.CoderRun) (ctrl.Result, error) {
 	var pods corev1.PodList
 	if err := r.reader().List(ctx, &pods,
@@ -248,6 +252,36 @@ func (r *CoderRunReconciler) observeMissingCoordinator(ctx context.Context, run 
 			if err := client.IgnoreNotFound(r.Delete(ctx, &dead[i])); err != nil {
 				// A failed delete is not evidence of a loss either.
 				return ctrl.Result{}, err
+			}
+		}
+		if len(dead) > 0 {
+			// A delete is not a disappearance: the deleted object can still
+			// be terminating, held by a finalizer (deletionTimestamp set,
+			// object persists), and the relaunch path tolerates an existing
+			// object, so a replacement could attach to the dying object and
+			// the same physical loss be charged a second time when it finally
+			// vanishes. Re-confirm with one more live read that no
+			// coordinator object for the run survives before the relaunch is
+			// charged: a survivor — terminating or not — defers the charge so
+			// the deterministic name is provably free first. A failed read is
+			// not evidence the name is free either.
+			var remaining corev1.PodList
+			if err := r.reader().List(ctx, &remaining,
+				client.InNamespace(run.Namespace),
+				client.MatchingLabels{executor.LabelRun: executor.RunLabelValue(run.Name)},
+			); err != nil {
+				// A failed read is not evidence the name is free.
+				return ctrl.Result{RequeueAfter: observationRequeueDelay}, nil
+			}
+			for i := range remaining.Items {
+				pod := &remaining.Items[i]
+				if podBelongsToRun(pod, run) && hasCoordinatorContainer(pod) {
+					// A coordinator object for the run still exists in the world
+					// — terminating after our delete, or otherwise — so the name
+					// is not yet free and the charge is deferred: the run stays
+					// Running and the next reconcile re-observes.
+					return ctrl.Result{RequeueAfter: observationRequeueDelay}, nil
+				}
 			}
 		}
 	}
