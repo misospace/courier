@@ -405,7 +405,9 @@ func TestStreamTruncatedIsAnError(t *testing.T) {
 }
 
 func TestStreamErrorChunkIsRedacted(t *testing.T) {
-	gateway, _, cleanup := gatewayFor(gatewayResponse{body: "data: " + `{"error":{"message":"secret-key sk-abc","type":"server_error"}}` + "\n\n"})
+	// Both halves of the provider error object are provider-controlled body
+	// data; neither may appear in the trusted error string.
+	gateway, _, cleanup := gatewayFor(gatewayResponse{body: "data: " + `{"error":{"message":"secret-key sk-abc","type":"sentinel-provider-type-x9"}}` + "\n\n"})
 	defer cleanup()
 	events, err := gateway.StreamChat(context.Background(), ChatRequest{Model: "m"})
 	if err != nil {
@@ -415,8 +417,10 @@ func TestStreamErrorChunkIsRedacted(t *testing.T) {
 	if last.Kind != KindError {
 		t.Fatalf("terminal event = %+v", last)
 	}
-	if strings.Contains(last.Err.Error(), "secret-key") || strings.Contains(last.Err.Error(), "sk-abc") {
-		t.Fatalf("error echoed provider payload: %v", last.Err)
+	for _, leaked := range []string{"secret-key", "sk-abc", "sentinel-provider-type-x9"} {
+		if strings.Contains(last.Err.Error(), leaked) {
+			t.Fatalf("error echoed provider payload %q: %v", leaked, last.Err)
+		}
 	}
 }
 

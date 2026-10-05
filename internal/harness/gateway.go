@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -281,7 +282,10 @@ func normalizeStream(body io.Reader) ([]Event, error) {
 			return streamError(events, fmt.Errorf("harness: undecodable stream chunk"))
 		}
 		if chunk.Error != nil {
-			return streamError(events, fmt.Errorf("harness: gateway reported stream error (%s)", strings.TrimSpace(chunk.Error.Type)))
+			// The error object is provider-controlled body data; its type and
+			// message never reach the trusted error string, which can flow
+			// into capability diagnostics and termination reasons.
+			return streamError(events, errors.New("harness: gateway reported a stream error"))
 		}
 		for _, choice := range chunk.Choices {
 			if choice.Index != 0 {
