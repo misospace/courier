@@ -295,6 +295,27 @@ to die.
   `needs-human` with the counter left at the ceiling, rather than one further
   relaunch. This is the one counter that matters, and it is death-detection, not
   work-retry.
+- A pod's **disappearance** — no coordinator pod **object** at all — is
+  infrastructure loss on its own terms, detected without any heartbeat,
+  because there is no pod left to heartbeat from. A pod that still exists is
+  not pod loss: a terminated coordinator (including an **Evicted** pod that
+  survives as a Failed object) is handled by the exit-code mapping like any
+   other termination, and a pod that exists but has not scheduled is the pod's
+   own story. The cache is not trusted for the loss judgement, so the absence
+   of a coordinator is confirmed **against the API server** with a live read
+   and no recorded state — one confirmation rule for both the stale-heartbeat
+   and the disappearance signals: a coordinator pod found live means the
+   cache lagged and nothing is charged, a coordinator pod whose deletion is
+   already in flight is neither live nor a confirmed loss and the run is
+   re-observed, and only an API server with no coordinator pod for the run
+   charges the bounded relaunch with its restart ceiling. A `Running` run with
+   a confirmed loss returns to `Claimed` and resumes the **retained** branch,
+   never one recreated from base. Pod loss and a reaped wedge share one
+   ceiling and one relaunch path. A lost **control** pod is loss even while
+   the worker and broker survive; the replacement round is fenced and
+   re-provisioned by the existing launch path. An orphan with no pod to watch
+   recovers on the next reconcile — for a run with no events at all, the
+   controller's periodic resync.
 - The crashloop counter bounds a **consecutive** streak of wedges, not a lifetime
   total: a run that demonstrates liveness — a fresh heartbeat within the window —
   resets the streak to zero, so a relaunch long in the past cannot terminalize a
@@ -1562,3 +1583,15 @@ was superseded.
   that landed on the run branch while HEAD moved elsewhere. The durable fix —
   a broker that publishes only to the pinned work ref — is (#122); this is the
   interim detection plus framing. (#134)
+- **2026-10-04 — Pod disappearance is infrastructure loss, distinct from the
+  #12 heartbeat wedge.** No pod means no heartbeat can exist, so requiring one
+  would leave an evicted run `Running` forever — which is what happened in
+  production. The live read of the API server is the sole confirmation of
+  every charge for a missing coordinator — one rule for both the disappearance
+  and the stale-heartbeat signals — with no timer and no recorded state: a
+  coordinator found live means the cache lagged and nothing is charged, a
+  terminating coordinator is re-observed, and only an API server with no
+  coordinator pod for the run charges the relaunch — which is also what lets a
+  run that was already orphaned before this backstop existed recover. The
+  **retained** branch is adopted, never recreated from base. Pod loss and a
+  reaped wedge share one ceiling and one relaunch path. (#106, #12)

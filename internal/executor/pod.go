@@ -365,6 +365,12 @@ func podName(runName string) string {
 	return base + suffix
 }
 
+// RunLabelValue is the value the run label (LabelRun) is written with, so a
+// reader selecting on it matches the pods the operator creates.
+func RunLabelValue(name string) string {
+	return labelValue(name)
+}
+
 func labelValue(value string) string {
 	value = strings.ToLower(strings.TrimSpace(value))
 	var b strings.Builder

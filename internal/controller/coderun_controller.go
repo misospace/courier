@@ -34,6 +34,10 @@ const (
 	lifecycleReportRequeueDelay = 30 * time.Second
 )
 
+// coordinatorContainerName is the coordinator's container name, shared by the
+// legacy single-pod topology and the secure topology's control pod.
+const coordinatorContainerName = "coordinator"
+
 // lifecycleReportedCondition tracks whether a terminal run's source lifecycle
 // report has been published; a False status means a later reconcile retries it.
 const (
@@ -52,6 +56,14 @@ type terminalLifecycleIntent struct {
 type CoderRunReconciler struct {
 	client.Client
 	Scheme *runtime.Scheme
+
+	// APIReader reads the API server directly, bypassing the informer cache.
+	// The pod-loss backstop uses it to confirm a missing coordinator really is
+	// gone before charging a relaunch: a cache that has not caught up must not
+	// be mistaken for infrastructure loss, and infrastructure loss must not be
+	// hidden by a cache that never delivers the pod. Nil falls back to the
+	// cached client.
+	APIReader client.Reader
 
 	// Launch is injected by the coordinator launcher. It is optional while
 	// launch support is being assembled; admission still reserves capacity by
@@ -581,8 +593,22 @@ func (r *CoderRunReconciler) observeRunning(ctx context.Context, run *courierv1a
 		return r.transitionTerminal(ctx, run, phase, "", intent, terminationSummary)
 	}
 	result, handled, err := r.checkLiveness(ctx, run, pods.Items)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
 	if handled {
-		return result, err
+		return result, nil
+	}
+	// Liveness reaps a live pod whose activity went silent, and its requeue
+	// (the stuck-terminating case) is propagated, not dropped. Pod loss needs
+	// no heartbeat at all: there is no pod left to heartbeat from, so the
+	// missing coordinator is checked independently of the heartbeat's state
+	// — legacy pods never write one.
+	if result.RequeueAfter > 0 || result.Requeue {
+		return result, nil
+	}
+	if coordinatorPodOf(pods.Items, run) == nil {
+		return r.observeMissingCoordinator(ctx, run)
 	}
 	return ctrl.Result{}, nil
 }
@@ -974,11 +1000,52 @@ func (r *CoderRunReconciler) patchStatus(ctx context.Context, before, after *cou
 	return writer.Patch(ctx, client.ObjectKeyFromObject(after), fields)
 }
 
+// reader returns the reader world reads go through, preferring the injected
+// API reader and falling back to the cached client.
+func (r *CoderRunReconciler) reader() client.Reader {
+	if r.APIReader != nil {
+		return r.APIReader
+	}
+	return r.Client
+}
+
 func (r *CoderRunReconciler) statusWriter() status.PatchWriter {
 	if r.StatusWriter != nil {
 		return r.StatusWriter
 	}
 	return status.KubePatchWriter{Client: r.Client}
+}
+
+// hasCoordinatorContainer reports whether pod declares the coordinator
+// container. The legacy coordinator pod and the secure topology's control pod
+// both name it that way, while its worker and broker pods do not.
+func hasCoordinatorContainer(pod *corev1.Pod) bool {
+	for _, container := range pod.Spec.Containers {
+		if container.Name == coordinatorContainerName {
+			return true
+		}
+	}
+	return false
+}
+
+// coordinatorPodOf returns the run's coordinator pod among pods: a pod owned
+// by, or labeled for, the run that carries the coordinator container. A run
+// whose control pod vanished is therefore recognized even while the rest of a
+// secure topology survives. A coordinator that is being deleted is neither
+// the live coordinator nor a confirmed loss, so the caller hands the
+// judgement to the backstop's live read.
+func coordinatorPodOf(pods []corev1.Pod, run *courierv1alpha1.CoderRun) *corev1.Pod {
+	for i := range pods {
+		pod := &pods[i]
+		if !podBelongsToRun(pod, run) || !hasCoordinatorContainer(pod) {
+			continue
+		}
+		if pod.DeletionTimestamp != nil {
+			continue
+		}
+		return pod
+	}
+	return nil
 }
 
 func podBelongsToRun(pod *corev1.Pod, run *courierv1alpha1.CoderRun) bool {
@@ -1021,7 +1088,7 @@ func validTerminationPhaseResult(exitCode int32, phase, result string) bool {
 // reached a recorded start, which leaves StartedAt unset.
 func coordinatorContainerStart(pod *corev1.Pod) time.Time {
 	for _, cs := range pod.Status.ContainerStatuses {
-		if cs.Name != "coordinator" {
+		if cs.Name != coordinatorContainerName {
 			continue
 		}
 		if cs.State.Running != nil {
@@ -1045,7 +1112,7 @@ func durationString(d time.Duration) string {
 
 func coordinatorTermination(pod *corev1.Pod) (int32, string, string, *courierv1alpha1.RunTelemetry, bool) {
 	for _, status := range pod.Status.ContainerStatuses {
-		if status.Name != "coordinator" || status.State.Terminated == nil {
+		if status.Name != coordinatorContainerName || status.State.Terminated == nil {
 			continue
 		}
 		terminated := status.State.Terminated

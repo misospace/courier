@@ -244,6 +244,7 @@ func main() {
 	reconciler := &controller.CoderRunReconciler{
 		Client:         mgr.GetClient(),
 		Scheme:         mgr.GetScheme(),
+		APIReader:      mgr.GetAPIReader(),
 		Launch:         launcher.Launch,
 		Sources:        sources,
 		StatusWriter:   status.KubePatchWriter{Client: mgr.GetClient()},
