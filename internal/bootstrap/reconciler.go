@@ -46,13 +46,17 @@ type Reconciler struct {
 	Provider  Provider
 	Interval  time.Duration
 
-	// collisionMu guards collidingNames and passCollidingNames. A collision
+	// collisionMu guards collidingNames and passEvaluatedNames. A collision
 	// (an unmanaged same-name profile) is a steady-state condition, so the
 	// transition is logged once per direction (the source runner's laneWaiting
 	// precedent) rather than on every pass.
-	collisionMu        sync.Mutex
-	collidingNames     map[string]bool
-	passCollidingNames map[string]bool
+	collisionMu    sync.Mutex
+	collidingNames map[string]bool
+	// passEvaluatedNames is seeded each pass with the configured profile
+	// names; a name is dropped when its evaluation hits a transient/error
+	// path. A persisted collision settles only when its name was evaluated
+	// without error this pass, or vanished from config.
+	passEvaluatedNames map[string]bool
 }
 
 // Start validates the reconciler, runs one immediate pass, then runs a pass
@@ -121,6 +125,17 @@ func (r *Reconciler) ReconcileAll(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("bootstrap provider: %w", err)
 	}
+	r.collisionMu.Lock()
+	r.passEvaluatedNames = make(map[string]bool, len(profiles))
+	for i := range profiles {
+		r.passEvaluatedNames[profiles[i].Name] = true
+	}
+	// Colliding names no longer in config are seeded too, so their removal
+	// from config settles them.
+	for name := range r.collidingNames {
+		r.passEvaluatedNames[name] = true
+	}
+	r.collisionMu.Unlock()
 	if len(profiles) == 0 {
 		r.settleCollisions(ctx)
 		return nil
@@ -129,6 +144,9 @@ func (r *Reconciler) ReconcileAll(ctx context.Context) error {
 	for i := range profiles {
 		if err := r.ensure(ctx, &profiles[i]); err != nil {
 			passErrors = append(passErrors, err)
+			r.collisionMu.Lock()
+			delete(r.passEvaluatedNames, profiles[i].Name)
+			r.collisionMu.Unlock()
 		}
 	}
 	r.settleCollisions(ctx)
@@ -158,6 +176,7 @@ func (r *Reconciler) ensure(ctx context.Context, profile *Profile) error {
 			}
 			return fmt.Errorf("create LaneProfile %s/%s: %w", r.Namespace, profile.Name, err)
 		}
+		log.FromContext(ctx).Info("Created bootstrap-managed LaneProfile", "name", profile.Name, "namespace", r.Namespace)
 		return nil
 	}
 	if err != nil {
@@ -199,12 +218,8 @@ func (r *Reconciler) logCollision(ctx context.Context, name string, err error) {
 	if r.collidingNames == nil {
 		r.collidingNames = map[string]bool{}
 	}
-	if r.passCollidingNames == nil {
-		r.passCollidingNames = map[string]bool{}
-	}
 	first := !r.collidingNames[name]
 	r.collidingNames[name] = true
-	r.passCollidingNames[name] = true
 	r.collisionMu.Unlock()
 	if first {
 		log.FromContext(ctx).Error(err, "LaneProfile is blocked by an unmanaged same-name profile", "name", name, "namespace", r.Namespace)
@@ -213,26 +228,20 @@ func (r *Reconciler) logCollision(ctx context.Context, name string, err error) {
 	}
 }
 
-// settleCollisions logs Info for names that were in the collision state on a
-// previous pass but no longer are (they stopped erroring or disappeared from
-// config) and clears their state. It runs at the end of every successful
-// pass.
+// settleCollisions logs Info for names whose persisted collision no longer
+// holds and clears their state. It runs at the end of every pass where the
+// provider call succeeded; removal from config resolves a collision, and a
+// transiently failed name keeps its collision state.
 func (r *Reconciler) settleCollisions(ctx context.Context) {
 	r.collisionMu.Lock()
-	if r.passCollidingNames == nil {
-		r.passCollidingNames = map[string]bool{}
-	}
 	resolved := make([]string, 0)
 	for name := range r.collidingNames {
-		if !r.passCollidingNames[name] {
+		if r.passEvaluatedNames[name] {
 			resolved = append(resolved, name)
 			delete(r.collidingNames, name)
 		}
 	}
-	for name := range r.passCollidingNames {
-		r.collidingNames[name] = true
-	}
-	r.passCollidingNames = map[string]bool{}
+	r.passEvaluatedNames = map[string]bool{}
 	r.collisionMu.Unlock()
 	for _, name := range resolved {
 		log.FromContext(ctx).Info("LaneProfile collision resolved", "name", name, "namespace", r.Namespace)

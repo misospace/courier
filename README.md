@@ -67,7 +67,9 @@ coordinator image — are plain values in `charts/courier/values.yaml`; nothing
 assumes a particular cluster or GitOps tooling. Lanes can be supplied to the
 manager as bootstrap config, and the manager creates and updates those
 LaneProfiles itself, so installers never need to apply LaneProfile CRs beside
-the release.
+the release. The manager-side support is in place; the chart wiring (config
+file mount and `--bootstrap-lane-profiles-file` flag) lands with follow-up
+work (#74), so no values key exists yet.
 
 ## Design
 

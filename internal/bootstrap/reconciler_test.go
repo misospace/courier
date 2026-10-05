@@ -361,6 +361,65 @@ func TestReconcileAllCollisionDedupKeepsReturningError(t *testing.T) {
 	}
 }
 
+func TestReconcileAllTransientGetErrorKeepsCollisionState(t *testing.T) {
+	existing := &courierv1alpha1.LaneProfile{
+		ObjectMeta: metav1.ObjectMeta{Namespace: "courier", Name: "local"},
+		Spec: courierv1alpha1.LaneProfileSpec{
+			Concurrency: 7,
+			Roles:       map[string]string{"coder": "gpt-5"},
+		},
+	}
+	// Only the pass-2 Get is intercepted; it fails transiently (neither
+	// NotFound nor a collision), then flows through to the fake client.
+	getFailing := false
+	kubeClient := fake.NewClientBuilder().
+		WithScheme(bootstrapScheme()).
+		WithObjects(existing).
+		WithInterceptorFuncs(interceptor.Funcs{
+			Get: func(ctx context.Context, c client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+				if getFailing {
+					return errors.New("transient get failure")
+				}
+				return c.Get(ctx, key, obj, opts...)
+			},
+		}).
+		Build()
+	provider := &staticProvider{profiles: []Profile{{
+		Name: "local", Concurrency: 1, Roles: map[string]string{"coder": "claude-sonnet-4-5"},
+	}}}
+	r := &Reconciler{Client: kubeClient, Namespace: "courier", Provider: provider}
+
+	// Pass 1: the unmanaged same-name profile collides.
+	err := r.ReconcileAll(context.Background())
+	if !errors.Is(err, ErrProfileUnmanaged) {
+		t.Fatalf("pass 1: error = %v, want ErrProfileUnmanaged", err)
+	}
+	if !collidingName(r, "local") {
+		t.Fatal("pass 1: name not marked colliding")
+	}
+
+	// Pass 2: a transient Get failure must not settle the collision.
+	getFailing = true
+	if err := r.ReconcileAll(context.Background()); err == nil {
+		t.Fatal("pass 2: expected the transient get error")
+	} else if errors.Is(err, ErrProfileUnmanaged) {
+		t.Fatalf("pass 2: error = %v, want the transient get error", err)
+	}
+	if !collidingName(r, "local") {
+		t.Fatal("pass 2: transient get failure settled the collision")
+	}
+
+	// Pass 3: the collision persists and the dedup state is intact.
+	getFailing = false
+	err = r.ReconcileAll(context.Background())
+	if !errors.Is(err, ErrProfileUnmanaged) {
+		t.Fatalf("pass 3: error = %v, want ErrProfileUnmanaged", err)
+	}
+	if !collidingName(r, "local") {
+		t.Fatal("pass 3: collision state was lost")
+	}
+}
+
 type staticProvider struct {
 	profiles []Profile
 	err      error
@@ -368,6 +427,14 @@ type staticProvider struct {
 
 func (p *staticProvider) Profiles(context.Context) ([]Profile, error) {
 	return p.profiles, p.err
+}
+
+// collidingName reports whether name is in the collision state, under the
+// reconciler's mutex.
+func collidingName(r *Reconciler, name string) bool {
+	r.collisionMu.Lock()
+	defer r.collisionMu.Unlock()
+	return r.collidingNames[name]
 }
 
 func newBootstrapClient(t *testing.T, objs ...client.Object) client.Client {
