@@ -359,6 +359,127 @@ func TestWedgeCeilingPreservesUnrecoverableCoordinator(t *testing.T) {
 	}
 }
 
+func TestWedgeChargeDeferredUntilDeadObjectIsGone(t *testing.T) {
+	src := &admissionSource{}
+	run := admissionRun("run", "local", courierv1alpha1.PhaseRunning)
+	// A stale heartbeat and a cached unobservable dead coordinator: the wedge
+	// path reaps it before the disappearance backstop can route it.
+	withHeartbeat(run, livenessClock.Add(-10*time.Minute))
+	pod := evictedCoordinatorPod(run)
+	// The pod is old (2 hours ago, past the liveness window), so no
+	// freshness grace applies.
+	pod.CreationTimestamp = metav1.NewTime(livenessClock.Add(-2 * time.Hour))
+	// A finalizer is what keeps the deleted object alive as a terminating
+	// object on the fake client, so the wedge's delete is in flight rather
+	// than a disappearance.
+	pod.Finalizers = []string{"courier.misospace.dev/test"}
+	// One client serves both the reconciler's cached client and its API
+	// reader, so the wedge's post-delete re-confirmation reads the same store
+	// the delete wrote to.
+	c := phaseClient(t, run, pod)
+	reconciler := livenessReconciler(c, src, livenessClock)
+	reconciler.APIReader = c
+	var eventsOut bytes.Buffer
+	reconciler.Events = courierlog.NewEmitter(&eventsOut, courierlog.LevelDebug)
+
+	result, err := reconciler.Reconcile(context.Background(), admissionRequest("run"))
+	if err != nil {
+		t.Fatalf("Reconcile() error = %v", err)
+	}
+	if result.Requeue {
+		t.Fatalf("Requeue = true, want false; a still-terminating dead object defers the relaunch")
+	}
+	if result.RequeueAfter != observationRequeueDelay {
+		t.Fatalf("RequeueAfter = %v, want %v; the charge is deferred until the dead object is gone", result.RequeueAfter, observationRequeueDelay)
+	}
+	var updated courierv1alpha1.CoderRun
+	if err := c.Get(context.Background(), admissionKey("run"), &updated); err != nil {
+		t.Fatalf("get run: %v", err)
+	}
+	if updated.Status.Phase != courierv1alpha1.PhaseRunning {
+		t.Fatalf("phase = %q, want Running; a deferred charge must not transition the run", updated.Status.Phase)
+	}
+	if updated.Status.Restarts != 0 {
+		t.Fatalf("restarts = %d, want 0; a still-terminating dead object must not be charged", updated.Status.Restarts)
+	}
+	if len(src.transitions) != 0 {
+		t.Fatalf("transitions = %#v, want none; a deferred charge is not a terminal publish", src.transitions)
+	}
+	if len(src.reports) != 0 {
+		t.Fatalf("reports = %#v, want none; a deferred charge is not a terminal publish", src.reports)
+	}
+	if out := eventsOut.String(); out != "" {
+		t.Fatalf("events = %q, want none; a deferred charge emits no relaunch event", out)
+	}
+	// The dead object must now be terminating (deletionTimestamp set), not
+	// gone: the finalizer holds it while the delete is in flight.
+	var got corev1.Pod
+	podKey := types.NamespacedName{Name: "run-coordinator", Namespace: "default"}
+	if err := c.Get(context.Background(), podKey, &got); err != nil {
+		t.Fatalf("get pod: %v, want the deleted object to survive as terminating", err)
+	}
+	if got.DeletionTimestamp == nil {
+		t.Fatal("deletionTimestamp = nil, want set; the finalizer must keep the deleted object terminating")
+	}
+
+	// A second reconcile while the finalizer still holds the object defers
+	// the same way: the deletion is in flight, so nothing is charged.
+	result, err = reconciler.Reconcile(context.Background(), admissionRequest("run"))
+	if err != nil {
+		t.Fatalf("Reconcile() in-flight pass error = %v", err)
+	}
+	if result.Requeue {
+		t.Fatalf("Requeue = true, want false; an in-flight delete defers the relaunch")
+	}
+	if result.RequeueAfter != observationRequeueDelay {
+		t.Fatalf("RequeueAfter = %v, want %v; an in-flight delete is re-observed", result.RequeueAfter, observationRequeueDelay)
+	}
+	var inFlight courierv1alpha1.CoderRun
+	if err := c.Get(context.Background(), admissionKey("run"), &inFlight); err != nil {
+		t.Fatalf("get run: %v", err)
+	}
+	if inFlight.Status.Phase != courierv1alpha1.PhaseRunning {
+		t.Fatalf("phase = %q, want Running; an in-flight delete must not transition the run", inFlight.Status.Phase)
+	}
+	if inFlight.Status.Restarts != 0 {
+		t.Fatalf("restarts = %d, want 0; an in-flight delete must not be charged", inFlight.Status.Restarts)
+	}
+
+	// Release the finalizer so the object is gone, then reconcile again: once
+	// the object is gone the cached coordinator is absent, the wedge finds no
+	// pod, and the disappearance backstop takes the charge with its pod-loss
+	// cause — the deferred wedge charge lands on the backstop, the path that
+	// confirms against the API server.
+	got.Finalizers = nil
+	if err := c.Update(context.Background(), &got); err != nil {
+		t.Fatalf("release finalizer: %v", err)
+	}
+	if err := c.Get(context.Background(), podKey, &got); !apierrors.IsNotFound(err) {
+		t.Fatalf("get pod after finalizer release: %v, want NotFound; the object must be gone", err)
+	}
+
+	result, err = reconciler.Reconcile(context.Background(), admissionRequest("run"))
+	if err != nil {
+		t.Fatalf("Reconcile() final pass error = %v", err)
+	}
+	if !result.Requeue {
+		t.Fatalf("Requeue = false, want true; a confirmed-gone loss must relaunch from its checkpoint")
+	}
+	var after courierv1alpha1.CoderRun
+	if err := c.Get(context.Background(), admissionKey("run"), &after); err != nil {
+		t.Fatalf("get run final pass: %v", err)
+	}
+	if after.Status.Phase != courierv1alpha1.PhaseClaimed {
+		t.Fatalf("phase = %q, want Claimed; the loss is charged once the dead object is gone", after.Status.Phase)
+	}
+	if after.Status.Restarts != 1 {
+		t.Fatalf("restarts = %d, want 1; one physical loss is charged exactly once", after.Status.Restarts)
+	}
+	if reason := eventReason(t, &eventsOut, string(courierv1alpha1.PhaseClaimed)); reason != podLostEventReason {
+		t.Fatalf("relaunch event reason = %q, want %q; the backstop charges the deferred loss with the pod-loss cause", reason, podLostEventReason)
+	}
+}
+
 func TestFreshHeartbeatLostCoordinatorAtCeilingStillNeedsHuman(t *testing.T) {
 	src := &admissionSource{}
 	run := admissionRun("run", "local", courierv1alpha1.PhaseRunning)

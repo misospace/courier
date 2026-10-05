@@ -134,6 +134,7 @@ func (r *CoderRunReconciler) checkLiveness(ctx context.Context, run *courierv1al
 	missing := true
 	deleted := false
 	preserved := false
+	deletedUnrecoverableCoordinator := false
 	for i := range pods {
 		pod := &pods[i]
 		if !podBelongsToRun(pod, run) {
@@ -161,6 +162,8 @@ func (r *CoderRunReconciler) checkLiveness(ctx context.Context, run *courierv1al
 			return ctrl.Result{}, false, err
 		}
 		deleted = true
+		deletedUnrecoverableCoordinator = deletedUnrecoverableCoordinator ||
+			hasCoordinatorContainer(pod) && coordinatorPodUnrecoverable(pod)
 	}
 	if missing {
 		// No pod belongs to the run at all. The absence is not decided here:
@@ -168,6 +171,17 @@ func (r *CoderRunReconciler) checkLiveness(ctx context.Context, run *courierv1al
 		// the API server with a live read and takes the same ceiling-bounded
 		// relaunch.
 		return ctrl.Result{}, false, nil
+	}
+	// A delete is not a disappearance here either: when the wedged pod was
+	// an unobservable dead coordinator, the charge waits for the live read
+	// to show the name free; the deferred loss is then charged by the
+	// disappearance backstop, which confirms it against the API server and
+	// carries its pod-loss cause.
+	if deletedUnrecoverableCoordinator {
+		present, err := r.coordinatorObjectPresentLive(ctx, run)
+		if err != nil || present {
+			return ctrl.Result{RequeueAfter: observationRequeueDelay}, true, nil
+		}
 	}
 	if !deleted && !preserved {
 		// Every wedged coordinator pod is already terminating, and none was
@@ -188,6 +202,27 @@ func (r *CoderRunReconciler) checkLiveness(ctx context.Context, run *courierv1al
 	// stream and the ceiling hand-off.
 	result, err := r.relaunchAfterInfraLoss(ctx, run, "", "")
 	return result, true, err
+}
+
+// coordinatorObjectPresentLive reports whether any coordinator object for the
+// run still exists on the API server — a survivor means the deterministic pod
+// name is not free; a failed read is not evidence the name is free (callers
+// treat err as defer).
+func (r *CoderRunReconciler) coordinatorObjectPresentLive(ctx context.Context, run *courierv1alpha1.CoderRun) (bool, error) {
+	var pods corev1.PodList
+	if err := r.reader().List(ctx, &pods,
+		client.InNamespace(run.Namespace),
+		client.MatchingLabels{executor.LabelRun: executor.RunLabelValue(run.Name)},
+	); err != nil {
+		return false, err
+	}
+	for i := range pods.Items {
+		pod := &pods.Items[i]
+		if podBelongsToRun(pod, run) && hasCoordinatorContainer(pod) {
+			return true, nil
+		}
+	}
+	return false, nil
 }
 
 // observeMissingCoordinator is the disappearance backstop for a Running run
@@ -265,23 +300,9 @@ func (r *CoderRunReconciler) observeMissingCoordinator(ctx context.Context, run 
 			// charged: a survivor — terminating or not — defers the charge so
 			// the deterministic name is provably free first. A failed read is
 			// not evidence the name is free either.
-			var remaining corev1.PodList
-			if err := r.reader().List(ctx, &remaining,
-				client.InNamespace(run.Namespace),
-				client.MatchingLabels{executor.LabelRun: executor.RunLabelValue(run.Name)},
-			); err != nil {
-				// A failed read is not evidence the name is free.
+			present, err := r.coordinatorObjectPresentLive(ctx, run)
+			if err != nil || present {
 				return ctrl.Result{RequeueAfter: observationRequeueDelay}, nil
-			}
-			for i := range remaining.Items {
-				pod := &remaining.Items[i]
-				if podBelongsToRun(pod, run) && hasCoordinatorContainer(pod) {
-					// A coordinator object for the run still exists in the world
-					// — terminating after our delete, or otherwise — so the name
-					// is not yet free and the charge is deferred: the run stays
-					// Running and the next reconcile re-observes.
-					return ctrl.Result{RequeueAfter: observationRequeueDelay}, nil
-				}
 			}
 		}
 	}

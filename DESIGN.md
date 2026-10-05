@@ -326,12 +326,18 @@ to die.
   is deleted so the run's deterministic pod name is free for the replacement —
   except at the restart ceiling, where it survives as the `NeedsHuman`
   hand-off's only record of the cause. Below the ceiling the charge is
-  deferred until a live read shows the deleted object gone, so one physical
-  loss is charged once and the replacement can never attach to a dying object
-  the launcher would tolerate. A stale-heartbeat run whose cache
-  already shows such a pod is reaped by the wedge path first, which keeps the
-  generic message like any reaped coordinator and, at the ceiling, preserves
-  the inert object exactly like the backstop.
+  deferred until a live read shows the deleted object gone on **both** delete
+  paths — the disappearance backstop and the wedge's reap of a dead
+  coordinator — so one physical loss is charged once and the replacement can
+   never attach to a dying object the launcher would tolerate. A
+   stale-heartbeat run whose cache already shows such a pod is reaped by the
+   wedge path first; its charge is deferred the same way only when the
+   post-delete live read finds a surviving coordinator object — a reap whose
+   delete completes synchronously charges in place with the generic message —
+   and a deferred charge is left to the disappearance backstop, which
+   confirms the loss against the API server and charges it with its pod-loss
+   cause; at the ceiling the wedge preserves the inert object exactly like the
+   backstop.
 - The crashloop counter bounds a **consecutive** streak of wedges, not a lifetime
   total: a run that demonstrates liveness — a fresh heartbeat within the window
   while a recoverable coordinator is observable — resets the streak to zero, so
@@ -1666,8 +1672,14 @@ was superseded.
   finalizer (deletionTimestamp set, object persists), and the relaunch path
   tolerates an existing object — so a replacement could attach to the dying
   object and the same physical loss be charged a second time when it finally
-  vanishes. The disappearance backstop now re-confirms with one more live
-  read after the delete and before the relaunch is charged: any surviving
-  coordinator object defers the charge, so the deterministic name is provably
-   free before the relaunch — one physical loss, one ceiling charge, found in
-   AI review of PR #218. (#106)
+   vanishes. The re-confirmation now guards both legacy delete paths that can
+   remove a dead coordinator — the disappearance backstop and the wedge's
+   reap; the secure path's equivalent is #223. The disappearance backstop
+   re-confirms with one more live read after the delete and before the
+   relaunch is charged, and the wedge's reap of a dead coordinator below the
+   ceiling defers the charge the same way — any surviving coordinator object
+   defers it, so the deterministic name is provably free before the relaunch.
+   The deferred wedge charge is then taken by the disappearance backstop,
+   which confirms the loss against the API server and charges it with its
+   pod-loss reason — one physical loss, one ceiling charge, found in AI review
+   of PR #218. (#106)
