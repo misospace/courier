@@ -590,6 +590,7 @@ func ControlPod(run *courier.CoderRun, in ControlInputs) (*corev1.Pod, error) {
 		{Name: EnvPodNamespace, Value: run.Namespace},
 		{Name: EnvRunUID, Value: string(run.UID)},
 		{Name: EnvControlPodUID, Value: in.ControlIncarnationUID},
+		{Name: EnvControlKubeUID, ValueFrom: fieldRef("metadata.uid")},
 		{Name: EnvWorkerPodUID, Value: in.WorkerPodUID},
 		{Name: EnvWorkerURL, Value: in.WorkerURL},
 		{Name: EnvBrokerURL, Value: in.BrokerURL},

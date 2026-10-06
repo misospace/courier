@@ -213,6 +213,8 @@ type Heartbeat struct {
 	clock   Clock
 	cadence time.Duration
 
+	coordinatorPodUID string
+
 	mu          sync.Mutex
 	lastWritten time.Time
 	pending     *courierv1alpha1.Heartbeat
@@ -245,8 +247,9 @@ func (h *Heartbeat) Record(ctx context.Context, kind string) error {
 	}
 	now := h.clock.Now()
 	heartbeat := &courierv1alpha1.Heartbeat{
-		At:   metav1.NewTime(now),
-		Kind: kind,
+		At:                metav1.NewTime(now),
+		Kind:              kind,
+		CoordinatorPodUID: h.coordinatorPodUID,
 	}
 
 	h.mu.Lock()

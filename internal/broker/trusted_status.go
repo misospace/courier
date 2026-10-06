@@ -43,7 +43,7 @@ func (h *trustedStatusHandler) ServeHTTP(w http.ResponseWriter, r *http.Request)
 	if !decodeJSON(w, r, &patch) {
 		return
 	}
-	if patch.Heartbeat != nil && (patch.Heartbeat.At.IsZero() || (patch.Heartbeat.Kind != "stream" && patch.Heartbeat.Kind != "tool")) {
+	if patch.Heartbeat != nil && (patch.Heartbeat.At.IsZero() || (patch.Heartbeat.Kind != "stream" && patch.Heartbeat.Kind != "tool") || patch.Heartbeat.CoordinatorPodUID == "") {
 		http.Error(w, "invalid request", http.StatusBadRequest)
 		return
 	}
@@ -51,6 +51,19 @@ func (h *trustedStatusHandler) ServeHTTP(w http.ResponseWriter, r *http.Request)
 		RunUID: identity.RunUID, ControlPod: identity.ControlPod,
 		ControlPodUID: identity.ControlPodUID, ControlServiceAccount: identity.ServiceAccount,
 	}, patch, h.validate); err != nil {
+		// Contention and backend unavailability are transient, not denial:
+		// 503 lets the caller's own retry machinery treat them as retryable,
+		// while a definite identity or live-world mismatch stays 422.
+		var conflict *StatusConflictError
+		var unavailable *StatusUnavailableError
+		if errors.As(err, &conflict) {
+			http.Error(w, "status update conflicted", http.StatusServiceUnavailable)
+			return
+		}
+		if errors.As(err, &unavailable) {
+			http.Error(w, "status update unavailable", http.StatusServiceUnavailable)
+			return
+		}
 		http.Error(w, "status update denied", http.StatusUnprocessableEntity)
 		return
 	}

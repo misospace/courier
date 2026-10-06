@@ -10,6 +10,7 @@ import (
 	"sync"
 	"time"
 
+	courierv1alpha1 "github.com/misospace/courier/api/v1alpha1"
 	"github.com/misospace/courier/internal/executor"
 	"github.com/misospace/courier/internal/protocol"
 )
@@ -51,11 +52,13 @@ type Coordinator struct {
 	publisher Publisher
 	activity  ActivitySink
 	briefs    *BriefRegistry
+	status    *StatusReporter
 }
 
 // CoordinatorConfig assembles the harness. Worker, snapshot, forge, and
 // publisher may be absent; each absence is surfaced as data to the model or
-// named by capability health, never a silent fallback.
+// named by capability health, never a silent fallback. Status, when present,
+// persists earned heartbeats and dispatch evidence through the run's broker.
 type CoordinatorConfig struct {
 	Gateway   *Gateway
 	Bindings  Bindings
@@ -64,6 +67,7 @@ type CoordinatorConfig struct {
 	Forge     ForgeOps
 	Publisher Publisher
 	Activity  ActivitySink
+	Status    *StatusReporter
 }
 
 // NewCoordinator fails closed on an unusable model configuration: without a
@@ -84,6 +88,7 @@ func NewCoordinator(config CoordinatorConfig) (*Coordinator, error) {
 		publisher: config.Publisher,
 		activity:  config.Activity,
 		briefs:    NewBriefRegistry(),
+		status:    config.Status,
 	}, nil
 }
 
@@ -211,6 +216,21 @@ func (c *Coordinator) pump(ctx context.Context, session *Session, briefID string
 // the operator to relaunch, and a declared-changes-with-no-work ending is a
 // workload failure.
 func (c *Coordinator) finish(ctx context.Context, inv executor.Invocation, outcome executor.DeclaredOutcome, summary string) executor.HarnessResult {
+	// The run is ending: opportunistically flush retained operation clears so
+	// a cleanly ended run does not leave suppression evidence behind. A
+	// failure never changes the declared outcome — the operator supersedes
+	// this incarnation's entries regardless.
+	_ = c.status.Flush(ctx)
+	// A completed unit whose durable status record never landed can never be
+	// turned into a successful ending by a model declaration: the debt is
+	// reconciled here, in trusted control, before any declared outcome is
+	// honored (§7). The broker revalidates the recorded OID against the live
+	// work ref on the retry, so the recovery half re-checks the world; a
+	// persistent failure is an infrastructure failure for the operator to
+	// relaunch, which resumes remote-first.
+	if err := c.status.ReconcileDebt(ctx); err != nil {
+		return executor.HarnessResult{Err: fmt.Errorf("harness: a completed brief lacks a durable status record: %w", err)}
+	}
 	switch outcome {
 	case executor.OutcomeChanges:
 		if c.publisher == nil {
@@ -545,6 +565,24 @@ func (c *Coordinator) runDelegate(ctx context.Context, call ToolCall, result Too
 	// the recorded commit is the local integration commit, and publication
 	// of it has already been confirmed by the broker.
 	c.briefs.RecordResult(registered.ID, BriefResult{BriefID: registered.ID, Summary: outcome, Commit: integration.Commit})
+	// §7: the completed brief — and, when the broker confirmed the remote
+	// publication, that confirmed OID as lastCommit — is recorded through the
+	// trusted status path. The unit is not acknowledged complete until the
+	// write is durable; a persistent write failure fails the brief even
+	// though its work is on the branch, because an unacknowledged unit is
+	// re-read from the world first on resume.
+	if c.status != nil {
+		lastCommit := ""
+		if integration.Changed {
+			lastCommit = integration.Commit
+		}
+		checkpoint := &courierv1alpha1.Checkpoint{CompletedBriefs: c.briefs.CompletedBriefs()}
+		if err := c.status.CheckpointPublished(ctx, checkpoint, lastCommit); err != nil {
+			result.IsError = true
+			result.Content = "completed brief could not be recorded durably: " + safeToolError(err)
+			return result
+		}
+	}
 	result.Content = outcome
 	return result
 }
@@ -682,14 +720,25 @@ func (c *Coordinator) runForge(ctx context.Context, call ToolCall, result ToolRe
 	return result
 }
 
-// dispatchAndAwait dispatches one task and polls it to termination. An
-// ambiguous transport failure is reconciled through cancellation — never
-// automatic redelivery — and the observed state is returned either way.
+// dispatchAndAwait dispatches one operation and polls it to termination. The
+// operation's active-operation entry is persisted through the trusted status
+// path before the task is sent (§6: persist before dispatch), and cleared
+// only on independently observed termination — a verified completion also
+// writes the earned tool heartbeat in the same update; a verified
+// cancellation or death clears without one. An ambiguous transport failure is
+// reconciled through cancellation — never automatic redelivery — and the
+// observed state is returned either way; a reconciliation that cannot prove
+// termination retains the entry, because an operation that may still be
+// executing is never claimed cleared.
 func (c *Coordinator) dispatchAndAwait(ctx context.Context, opID, briefID string, task protocol.Task) (protocol.Result, error) {
+	if err := c.status.BeginOperation(ctx, opID, briefID); err != nil {
+		return protocol.Result{}, fmt.Errorf("operation %s was not dispatched because its status entry could not be persisted: %w", opID, err)
+	}
 	if _, err := c.worker.Dispatch(ctx, opID, briefID, task); err != nil {
 		if definiteWorkerRejection(err) {
 			// The worker answered with a definite rejection: the operation
 			// is not running, and no redelivery or cancel theater applies.
+			c.closeOperation(ctx, opID, false)
 			return protocol.Result{}, err
 		}
 		// Ambiguous transport: the worker may have accepted the task.
@@ -698,7 +747,7 @@ func (c *Coordinator) dispatchAndAwait(ctx context.Context, opID, briefID string
 		if reconcileErr != nil {
 			return protocol.Result{}, fmt.Errorf("dispatch of %s failed and reconciliation failed: dispatch: %v; reconcile: %w", opID, err, reconcileErr)
 		}
-		return c.reconciledResult(opID, state)
+		return c.verifiedResult(ctx, opID, state)
 	}
 	for {
 		state, err := c.worker.Result(ctx, opID)
@@ -711,42 +760,67 @@ func (c *Coordinator) dispatchAndAwait(ctx context.Context, opID, briefID string
 			if reconcileErr != nil {
 				return protocol.Result{}, fmt.Errorf("result poll for %s failed and reconciliation failed: poll: %v; reconcile: %w", opID, err, reconcileErr)
 			}
-			return c.reconciledResult(opID, reconciled)
+			return c.verifiedResult(ctx, opID, reconciled)
 		}
 		switch state.Status {
 		case protocol.ResultCompleted, protocol.ResultFailed, protocol.ResultCancelled:
 			if state.Result == nil {
+				c.closeOperation(ctx, opID, false)
 				return protocol.Result{}, fmt.Errorf("operation %s ended as %s without a result", opID, state.Status)
 			}
-			if state.Status == protocol.ResultCompleted && c.activity != nil {
-				c.activity.ToolBoundary()
-			}
-			return *state.Result, nil
+			return c.verifiedResult(ctx, opID, state)
 		case "":
+			// The worker definitively does not know the operation: it is not
+			// running, and the entry says otherwise only because the worker
+			// lost its in-process state.
+			c.closeOperation(ctx, opID, false)
 			return protocol.Result{}, fmt.Errorf("operation %s is unknown to the worker", opID)
 		}
 		// Still running: keep polling. Polling is observation, not a
 		// heartbeat and not a duration limit.
 		select {
 		case <-ctx.Done():
+			// The context is gone but the operation may still be executing:
+			// its entry is left in place and is superseded by the operator's
+			// own pod observation when this incarnation ends.
 			return protocol.Result{}, ctx.Err()
 		case <-time.After(200 * time.Millisecond):
 		}
 	}
 }
 
-// reconciledResult renders a reconciled observation as an execution result.
-// A cancelled observation is a verified termination by cancel, not a
-// completion; the caller surfaces it as a tool error either way. A completed
-// observation is a verified completion and earns its tool boundary.
-func (c *Coordinator) reconciledResult(opID string, state protocol.ResultState) (protocol.Result, error) {
+// verifiedResult renders an independently observed terminal state as an
+// execution result. It clears the operation's entry — with the earned tool
+// heartbeat on a verified completion, without one on a verified cancellation
+// or failure — before the result travels.
+func (c *Coordinator) verifiedResult(ctx context.Context, opID string, state protocol.ResultState) (protocol.Result, error) {
 	if state.Result == nil {
+		// Reconciliation observed the operation's definitive non-execution —
+		// a cancelled or unknown observation carries no result. That is a
+		// verified termination, so the entry is cleared without a heartbeat
+		// exactly as the poll loop clears it (§6 step 3); retaining it here
+		// would leave suppression evidence with nothing live behind it.
+		c.closeOperation(ctx, opID, false)
 		return protocol.Result{}, fmt.Errorf("reconciliation of %s observed status %q without a result", opID, state.Status)
 	}
-	if state.Status == protocol.ResultCompleted && c.activity != nil {
+	c.closeOperation(ctx, opID, state.Status == protocol.ResultCompleted)
+	return *state.Result, nil
+}
+
+// closeOperation clears one operation entry after verified termination and
+// records the earned tool boundary on a verified completion. A clear failure
+// is retained inside the status reporter and never fails an already-verified
+// outcome: the operation is over, and the entry errs toward suppression until
+// a later flush clears it.
+func (c *Coordinator) closeOperation(ctx context.Context, opID string, completed bool) {
+	if err := c.status.EndOperation(ctx, opID, completed); err != nil {
+		_ = err // retained; flushed opportunistically and on the finish path
+	}
+	if completed && c.activity != nil {
+		// When the reporter is also the activity sink this coalesces to a
+		// no-op: EndOperation already wrote the same earned heartbeat.
 		c.activity.ToolBoundary()
 	}
-	return *state.Result, nil
 }
 
 // ensureSnapshot uploads the sanitized workspace snapshot before the first

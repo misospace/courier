@@ -308,8 +308,11 @@ func (s *SecureControl) ObserveTopology(ctx context.Context, run *courier.CoderR
 			broker = &pods[i]
 		}
 	}
-	if control == nil || worker == nil || broker == nil {
-		// Provisioning is still in flight; the launch path reconciles it.
+	if control == nil {
+		// No control pod: provisioning is still in flight (the launch path
+		// reconciles it) or the control is missing, which the disappearance
+		// backstop confirms against the API server. Either way the launch
+		// and liveness paths own the decision, not this observation.
 		return ctrl.Result{}, false, nil
 	}
 	if controlTerminated(control) {
@@ -318,8 +321,11 @@ func (s *SecureControl) ObserveTopology(ctx context.Context, run *courier.CoderR
 		// pod down with it — the broker holds the run's copied credentials and
 		// terminal runs are never reaped. Run-only material is removed by the
 		// ordered finalizer when the CoderRun is deleted. The caller proceeds
-		// to the exit-code mapping, which decides the run's phase.
-		if worker.DeletionTimestamp == nil {
+		// to the exit-code mapping, which decides the run's phase. The worker
+		// or broker may already be gone in the same observation (the guard
+		// above requires only the control pod) — an absent pod needs no
+		// fencing, which keeps this branch nil-safe.
+		if worker != nil && worker.DeletionTimestamp == nil {
 			if err := s.Client.Delete(ctx, worker); client.IgnoreNotFound(err) != nil {
 				return ctrl.Result{}, true, err
 			}
@@ -327,7 +333,7 @@ func (s *SecureControl) ObserveTopology(ctx context.Context, run *courier.CoderR
 		if err := s.Client.Delete(ctx, topology.BrokerService(run)); client.IgnoreNotFound(err) != nil {
 			return ctrl.Result{}, true, err
 		}
-		if broker.DeletionTimestamp == nil {
+		if broker != nil && broker.DeletionTimestamp == nil {
 			if err := s.Client.Delete(ctx, broker); client.IgnoreNotFound(err) != nil {
 				return ctrl.Result{}, true, err
 			}
@@ -336,6 +342,19 @@ func (s *SecureControl) ObserveTopology(ctx context.Context, run *courier.CoderR
 	}
 	if control.DeletionTimestamp != nil {
 		return ctrl.Result{}, false, nil
+	}
+	// With a live control, a worker or broker that is gone or being removed
+	// is infrastructure loss the operator owns (§6): the worker death ends
+	// the run's operations, the control cannot work without its worker or
+	// publish without its broker, and recovery happens independently of any
+	// heartbeat. The round is fenced and relaunched against the crashloop
+	// ceiling exactly like a broken pod. This is only reachable after
+	// provisioning: ObserveTopology runs for Running runs, and the phase
+	// reaches Running only after the launch path has created all three pods,
+	// so a missing component here is a post-launch vanishing, not a window
+	// the launch path is still filling.
+	if worker == nil || broker == nil || worker.DeletionTimestamp != nil || broker.DeletionTimestamp != nil {
+		return s.fenceAndRelaunch(ctx, run)
 	}
 	if topologyBroken(worker) || topologyBroken(broker) {
 		return s.fenceAndRelaunch(ctx, run)

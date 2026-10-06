@@ -4,12 +4,17 @@ import (
 	"context"
 	"time"
 
+	"k8s.io/apimachinery/pkg/types"
+
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/log"
 
 	courierv1alpha1 "github.com/misospace/courier/api/v1alpha1"
 	"github.com/misospace/courier/internal/executor"
+	"github.com/misospace/courier/internal/topology"
 )
 
 // defaultLivenessWindow is how long a Running run may go without a heartbeat
@@ -63,6 +68,32 @@ func (r *CoderRunReconciler) maxRestarts() int {
 // recent past, not of current liveness. The backstop bounds a continuous
 // streak of relaunches, not a lifetime total.
 //
+// The reap decision is destructive, so it is made against the API server's
+// own view, never the informer cache (§6): a lagging cache must not reap a
+// live pod, and a stale snapshot must not authorize a deletion. Read errors,
+// an incarnation change, or a phase that is no longer Running defer the
+// decision to a re-observation with a diagnostic — they are never evidence
+// of a wedge and never of health. The delete carries the observed pod's UID
+// as a precondition, so a delete/recreate race can only fail with a conflict
+// and be re-observed, never delete a replacement by name.
+//
+// A heartbeat is evidence only for the incarnation whose UID it carries
+// (§6): only a heartbeat whose coordinatorPodUID matches the current
+// coordinator pod may reset the consecutive-restart streak or count as fresh
+// for that incarnation, and a nil or unattributable heartbeat is not stall
+// evidence. A valid active-operation entry — one whose recorded control
+// incarnation is this run's live, non-terminating coordinator and whose
+// recorded worker still runs its shell — suppresses stale-heartbeat reaping
+// regardless of age: an acknowledged in-flight operation can suppress
+// heartbeat-stall reaping for any duration, because a legitimate silent
+// build and a wedged live build are observationally indistinguishable and
+// the design chooses safety. Stale or foreign entries are ignored, never
+// adopted and never patched — the operator does not write harness-owned
+// status; the operator ignores old entries, and a new control incarnation
+// reconciles them through the broker. A silent live wedge can hold lane
+// capacity until a human intervenes; the diagnostic names the suppression
+// and the manual NeedsHuman path remains.
+//
 // A coordinator pod is fresh, and so must not be reaped, while it is not
 // terminating and either it was created within the liveness window (covering
 // the image-pull, container-creating, and informer-cache lag of a
@@ -88,18 +119,41 @@ func (r *CoderRunReconciler) maxRestarts() int {
 // to Claimed so the next reconcile relaunches and resumes it. The second
 // return value reports whether liveness took action, so the caller can stop
 // further pod observation.
-func (r *CoderRunReconciler) checkLiveness(ctx context.Context, run *courierv1alpha1.CoderRun, pods []corev1.Pod) (ctrl.Result, bool, error) {
-	if run.Status.Heartbeat == nil {
+func (r *CoderRunReconciler) checkLiveness(ctx context.Context, run *courierv1alpha1.CoderRun, cachedPods []corev1.Pod) (ctrl.Result, bool, error) {
+	l := log.FromContext(ctx)
+	var fresh courierv1alpha1.CoderRun
+	if err := r.reader().Get(ctx, client.ObjectKeyFromObject(run), &fresh); err != nil {
+		// A failed live read is not evidence of a wedge or of health: defer
+		// and re-observe.
+		l.Info("liveness: live run read failed; deferring the reap decision", "error", err.Error())
+		return ctrl.Result{RequeueAfter: observationRequeueDelay}, true, nil
+	}
+	var pods corev1.PodList
+	if err := r.reader().List(ctx, &pods,
+		client.InNamespace(run.Namespace),
+		client.MatchingLabels{executor.LabelRun: executor.RunLabelValue(run.Name)},
+	); err != nil {
+		l.Info("liveness: live pod read failed; deferring the reap decision", "error", err.Error())
+		return ctrl.Result{RequeueAfter: observationRequeueDelay}, true, nil
+	}
+	if fresh.UID != run.UID || fresh.Status.Phase != courierv1alpha1.PhaseRunning {
+		// The world changed under this reconcile; the next one re-observes.
 		return ctrl.Result{}, false, nil
 	}
-	if r.clock().Sub(run.Status.Heartbeat.At.Time) <= r.livenessWindow() {
-		// A fresh heartbeat demonstrates liveness: the run is alive, so its
-		// consecutive-crashloop counter resets. A nil heartbeat (no liveness
-		// data) and a fresh pod (not yet demonstrated) never reach this
-		// branch, so neither resets the counter. A missing or unobservable
-		// coordinator suspends the reset: otherwise every eviction detection
-		// would reset the counter it is about to charge.
-		if coordinator := coordinatorPodOf(pods, run); coordinator != nil && !coordinatorPodUnrecoverable(coordinator) {
+	run = &fresh
+	livePods := pods.Items
+	atCeiling := run.Status.Restarts >= r.maxRestarts()
+	heartbeat := run.Status.Heartbeat
+	coordinator := coordinatorPodOf(livePods, run)
+	uidMatched := heartbeat != nil && coordinator != nil &&
+		heartbeat.CoordinatorPodUID != "" && heartbeat.CoordinatorPodUID == string(coordinator.UID)
+	if heartbeat != nil && r.clock().Sub(heartbeat.At.Time) <= r.livenessWindow() {
+		// A fresh heartbeat demonstrates liveness — but only for the
+		// incarnation its UID names — so the run's consecutive-crashloop
+		// counter resets. A nil heartbeat, an unattributable one, and a
+		// fresh pod (not yet demonstrated) never reach the reset, so neither
+		// resets the counter.
+		if uidMatched && !coordinatorPodUnrecoverable(coordinator) {
 			if run.Status.Restarts != 0 {
 				before := run.DeepCopy()
 				run.Status.Restarts = 0
@@ -110,14 +164,61 @@ func (r *CoderRunReconciler) checkLiveness(ctx context.Context, run *courierv1al
 		}
 		return ctrl.Result{}, false, nil
 	}
+	if coordinator == nil {
+		if cached := coordinatorPodOf(cachedPods, run); cached != nil && !coordinatorPodUnrecoverable(cached) {
+			// The cached view still shows a live coordinator the API server
+			// does not have: the views disagree, and a destructive decision
+			// on either would act on a world that may not exist (§6). The
+			// informer catches up and the next reconcile re-observes; the
+			// disappearance backstop takes the charge once both views agree
+			// the coordinator is gone. At the ceiling nothing defers: the
+			// hand-off for a wedge whose live object is already gone
+			// completes in this reconcile — nothing is left to delete and no
+			// charge is left to take. The live read confirmed the object's
+			// absence, so the hand-off carries the pod-loss cause a human
+			// needs, exactly as the disappearance backstop would.
+			if atCeiling {
+				result, err := r.relaunchAfterInfraLoss(ctx, run, podLostReason, podLostEventReason)
+				return result, true, err
+			}
+			return ctrl.Result{RequeueAfter: observationRequeueDelay}, true, nil
+		}
+		// A coordinator whose deletion is already in flight is neither live
+		// nor a confirmed loss: re-observe on the bounded delay instead of
+		// deciding mid-transition. At the ceiling nothing defers.
+		if !atCeiling {
+			for i := range livePods {
+				pod := &livePods[i]
+				if podBelongsToRun(pod, run) && hasCoordinatorContainer(pod) && pod.DeletionTimestamp != nil {
+					return ctrl.Result{RequeueAfter: observationRequeueDelay}, true, nil
+				}
+			}
+		}
+	}
+	if valid, count := validActiveOperations(run, livePods); valid {
+		// An acknowledged in-flight operation suppresses stale-heartbeat
+		// reaping regardless of age. This does not make the run live: a
+		// silent live wedge holds lane capacity until a human intervenes,
+		// and the diagnostic names the suppression for exactly that path.
+		l.Info("liveness: active operation suppresses stall reap",
+			"validOperations", count,
+			"heartbeatAge", r.clock().Sub(heartbeatAt(heartbeat)).Round(time.Second).String(),
+		)
+		return ctrl.Result{}, false, nil
+	}
+	if !uidMatched {
+		// A nil or unattributable heartbeat is not stall evidence. Confirmed
+		// pod death is detected separately, without any heartbeat.
+		return ctrl.Result{}, false, nil
+	}
 
 	// A just-relaunched pod has not had a chance to heartbeat yet. Its
 	// coordinator may not be running at all, and may not even be in the
 	// informer cache, so freshness is judged on observable pod state, not on
 	// the container's running state alone. A pod already terminating is
 	// never fresh.
-	for i := range pods {
-		pod := &pods[i]
+	for i := range livePods {
+		pod := &livePods[i]
 		if !podBelongsToRun(pod, run) || pod.DeletionTimestamp != nil {
 			continue
 		}
@@ -136,12 +237,11 @@ func (r *CoderRunReconciler) checkLiveness(ctx context.Context, run *courierv1al
 	// The ceiling is judged once, before the loop: a pod skipped at the
 	// ceiling is preserved as evidence, not deleted, so the run must still
 	// terminalize in this reconcile.
-	atCeiling := run.Status.Restarts >= r.maxRestarts()
 	missing := true
 	deleted := false
 	preserved := false
-	for i := range pods {
-		pod := &pods[i]
+	for i := range livePods {
+		pod := &livePods[i]
 		if !podBelongsToRun(pod, run) {
 			continue
 		}
@@ -163,7 +263,14 @@ func (r *CoderRunReconciler) checkLiveness(ctx context.Context, run *courierv1al
 			preserved = true
 			continue
 		}
-		if err := client.IgnoreNotFound(r.Delete(ctx, pod)); err != nil {
+		if err := r.deleteObservedPod(ctx, pod); err != nil {
+			if apierrors.IsConflict(err) {
+				// The pod changed between the live read and the delete —
+				// the decision was made on a world that no longer exists,
+				// so re-observe instead of acting on it. A replacement is
+				// never deleted by name.
+				return ctrl.Result{RequeueAfter: observationRequeueDelay}, true, nil
+			}
 			return ctrl.Result{}, false, err
 		}
 		deleted = true
@@ -214,6 +321,96 @@ func (r *CoderRunReconciler) checkLiveness(ctx context.Context, run *courierv1al
 	// arrives with the backstop's pod-loss cause.
 	result, err := r.relaunchAfterInfraLoss(ctx, run, "", "")
 	return result, true, err
+}
+
+// deleteObservedPod deletes the pod exactly as it was observed, carrying the
+// observed UID as a precondition (§6): a pod replaced between observation and
+// deletion conflicts instead of being deleted by name.
+func (r *CoderRunReconciler) deleteObservedPod(ctx context.Context, pod *corev1.Pod) error {
+	return client.IgnoreNotFound(r.Delete(ctx, pod, client.Preconditions{UID: &pod.UID}))
+}
+
+// validActiveOperations reports whether any of the run's active-operation
+// entries is dispatch evidence for the current world, and how many are. An
+// entry is valid when its recorded control incarnation is the run's live,
+// non-terminating coordinator pod (matched by UID and run identity, so a
+// same-name replacement or an unrelated pod does not qualify) and its
+// recorded worker exists, is not terminating, and runs its worker shell.
+// Stale or foreign entries are ignored: they neither suppress reaping nor
+// are patched — the operator does not write harness-owned status.
+func validActiveOperations(run *courierv1alpha1.CoderRun, pods []corev1.Pod) (bool, int) {
+	valid := 0
+	for _, entry := range run.Status.ActiveOperations {
+		if activeOperationValid(run, entry, pods) {
+			valid++
+		}
+	}
+	return valid > 0, valid
+}
+
+func activeOperationValid(run *courierv1alpha1.CoderRun, entry courierv1alpha1.ActiveOperation, pods []corev1.Pod) bool {
+	if entry.CoordinatorPodUID == "" || entry.WorkerPodUID == "" {
+		return false
+	}
+	control, worker := false, false
+	for i := range pods {
+		pod := &pods[i]
+		if !podBelongsToRun(pod, run) || podPhaseTerminal(pod.Status.Phase) {
+			continue
+		}
+		// §6: match the pod owner's UID as well as run identity, so a
+		// same-name replacement or an unrelated pod can never qualify.
+		if !podOwnedByRunUID(pod, run.UID) {
+			continue
+		}
+		if !control && pod.DeletionTimestamp == nil &&
+			string(pod.UID) == entry.CoordinatorPodUID && hasCoordinatorContainer(pod) {
+			control = true
+		}
+		if !worker && pod.DeletionTimestamp == nil &&
+			string(pod.UID) == entry.WorkerPodUID && workerShellRunning(pod) {
+			worker = true
+		}
+	}
+	return control && worker
+}
+
+// podOwnedByRunUID reports whether the pod's controller owner reference
+// names the run by UID — the immutable incarnation identity, not the mutable
+// name or label.
+func podOwnedByRunUID(pod *corev1.Pod, runUID types.UID) bool {
+	for _, owner := range pod.OwnerReferences {
+		if owner.Controller != nil && *owner.Controller && owner.UID == runUID {
+			return true
+		}
+	}
+	return false
+}
+
+// podPhaseTerminal reports a pod object whose lifecycle has ended (evicted,
+// failed scheduling, completed): a terminated control or worker is never
+// dispatch evidence, whatever its container statuses still record.
+func podPhaseTerminal(phase corev1.PodPhase) bool {
+	return phase == corev1.PodFailed || phase == corev1.PodSucceeded
+}
+
+// workerShellRunning reports whether the pod carries its worker shell
+// container in the Running state — the only worker shape that may protect an
+// in-flight operation from stall reaping.
+func workerShellRunning(pod *corev1.Pod) bool {
+	for _, cs := range pod.Status.ContainerStatuses {
+		if cs.Name == topology.WorkerContainerName && cs.State.Running != nil {
+			return true
+		}
+	}
+	return false
+}
+
+func heartbeatAt(heartbeat *courierv1alpha1.Heartbeat) time.Time {
+	if heartbeat == nil {
+		return time.Time{}
+	}
+	return heartbeat.At.Time
 }
 
 // coordinatorObjectPresentLive reports whether any coordinator object for the

@@ -1,13 +1,20 @@
 package broker
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 
 	courier "github.com/misospace/courier/api/v1alpha1"
 	corev1 "k8s.io/api/core/v1"
@@ -184,5 +191,145 @@ func TestTrustedStatusAcceptsConditionalHarnessPatch(t *testing.T) {
 	}
 	if got.Status.Checkpoint == nil || got.Status.Checkpoint.Plan != "keep going" || got.Status.LastCommit != "remote-sha" {
 		t.Fatalf("harness patch not persisted: %#v", got.Status)
+	}
+}
+
+// alwaysConflictWriter makes every status update lose the resourceVersion
+// CAS race, no matter how many times the writer retries.
+type alwaysConflictWriter struct {
+	client.Client
+}
+
+func (w alwaysConflictWriter) Status() client.SubResourceWriter {
+	return alwaysConflictStatus{SubResourceWriter: w.Client.Status()}
+}
+
+type alwaysConflictStatus struct {
+	client.SubResourceWriter
+}
+
+func (w alwaysConflictStatus) Update(ctx context.Context, obj client.Object, opts ...client.SubResourceUpdateOption) error {
+	_ = w.SubResourceWriter.Update(ctx, obj, opts...)
+	return apierrors.NewConflict(schema.GroupResource{Group: courier.GroupVersion.Group, Resource: "coderruns"}, testRunName, errors.New("simulated sustained contention"))
+}
+
+// TestTrustedStatusConflictIsTransientClassifies an exhausted CAS race as
+// 503, so the caller's retry machinery treats status contention as
+// transient rather than failing the dispatch as a definite denial.
+func TestTrustedStatusConflictIsTransientClassifies(t *testing.T) {
+	_, _, c, identity := trustedHandlerFixture(t, func(context.Context, *courier.CoderRun, *corev1.Pod, HarnessPatch) error {
+		return nil
+	})
+	writer, err := NewStatusWriter(c, alwaysConflictWriter{Client: c}, testNamespace, testRunName)
+	if err != nil {
+		t.Fatal(err)
+	}
+	handler, err := NewTrustedStatusHandler(&trustedTestAuthenticator{identity: Identity{
+		RunUID: identity.RunUID, RunName: testRunName, Namespace: testNamespace,
+		ControlPod: identity.ControlPod, ControlPodUID: identity.ControlPodUID,
+		ServiceAccount: identity.ControlServiceAccount,
+	}}, writer, func(context.Context, *courier.CoderRun, *corev1.Pod, HarnessPatch) error {
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	patch := HarnessPatch{Heartbeat: &courier.Heartbeat{At: metav1.Now(), Kind: "tool", CoordinatorPodUID: string(identity.ControlPodUID)}}
+	body, err := json.Marshal(patch)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req := httptest.NewRequest(http.MethodPost, PathTrustedStatus, bytes.NewReader(body))
+	req.Header.Set("Authorization", "Bearer trusted-token")
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want 503; an exhausted CAS race is contention, not denial", rec.Code)
+	}
+}
+
+// trustedHandlerWithValidator builds a handler whose validator returns the
+// given error, on the standard fixture identity.
+func trustedHandlerWithValidator(t *testing.T, c client.Client, identity StatusIdentity, validate StatusValidator) http.Handler {
+	t.Helper()
+	writer, err := NewStatusWriter(c, c, testNamespace, testRunName)
+	if err != nil {
+		t.Fatal(err)
+	}
+	handler, err := NewTrustedStatusHandler(&trustedTestAuthenticator{identity: Identity{
+		RunUID: identity.RunUID, RunName: testRunName, Namespace: testNamespace,
+		ControlPod: identity.ControlPod, ControlPodUID: identity.ControlPodUID,
+		ServiceAccount: identity.ControlServiceAccount,
+	}}, writer, validate)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return handler
+}
+
+func postStatusPatch(t *testing.T, handler http.Handler, identity StatusIdentity, patch HarnessPatch) int {
+	t.Helper()
+	body, err := json.Marshal(patch)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req := httptest.NewRequest(http.MethodPost, PathTrustedStatus, bytes.NewReader(body))
+	req.Header.Set("Authorization", "Bearer trusted-token")
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+	return rec.Code
+}
+
+// TestTrustedStatusBackendFailureIsRetryable pins the availability split: a
+// validator whose provider read failed without an answer is transient
+// availability (503), so the harness's retry machinery treats it as
+// retryable instead of failing a dispatch as a definite denial.
+func TestTrustedStatusBackendFailureIsRetryable(t *testing.T) {
+	_, _, c, identity := trustedHandlerFixture(t, func(context.Context, *courier.CoderRun, *corev1.Pod, HarnessPatch) error {
+		return &StatusUnavailableError{Err: errors.New("live work ref read failed: provider unavailable")}
+	})
+	handler := trustedHandlerWithValidator(t, c, identity, func(context.Context, *courier.CoderRun, *corev1.Pod, HarnessPatch) error {
+		return &StatusUnavailableError{Err: errors.New("live work ref read failed: provider unavailable")}
+	})
+	code := postStatusPatch(t, handler, identity, HarnessPatch{
+		LastCommit: stringPtr("published-sha"),
+		Heartbeat:  &courier.Heartbeat{At: metav1.Now(), Kind: "tool", CoordinatorPodUID: string(identity.ControlPodUID)},
+	})
+	if code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want 503; a backend read failure without an answer is availability, not denial", code)
+	}
+}
+
+// TestTrustedStatusDefiniteMismatchIsNonRetryable pins the other half: a
+// definite live-world mismatch stays a definite 4xx denial.
+func TestTrustedStatusDefiniteMismatchIsNonRetryable(t *testing.T) {
+	_, _, c, identity := trustedHandlerFixture(t, func(context.Context, *courier.CoderRun, *corev1.Pod, HarnessPatch) error {
+		return errors.New("lastCommit does not match the live work ref tip")
+	})
+	handler := trustedHandlerWithValidator(t, c, identity, func(context.Context, *courier.CoderRun, *corev1.Pod, HarnessPatch) error {
+		return errors.New("lastCommit does not match the live work ref tip")
+	})
+	code := postStatusPatch(t, handler, identity, HarnessPatch{
+		LastCommit: stringPtr("published-sha"),
+		Heartbeat:  &courier.Heartbeat{At: metav1.Now(), Kind: "tool", CoordinatorPodUID: string(identity.ControlPodUID)},
+	})
+	if code != http.StatusUnprocessableEntity {
+		t.Fatalf("status = %d, want 422; a definite live-world mismatch is a denial, not availability", code)
+	}
+}
+
+func stringPtr(v string) *string { return &v }
+
+// TestStatusWriterBackendReadFailureIsTyped pins the writer-level split: an
+// API-server read that fails without an answer is StatusUnavailableError
+// (transient), while a missing run is a definite error.
+func TestStatusWriterBackendReadFailureIsTyped(t *testing.T) {
+	w, c, identity := statusFixture(t)
+	w.reader = failingListReader{Client: c}
+	err := w.Write(context.Background(), identity, HarnessPatch{ClearOperation: "shell.b1.aaaa"}, nil)
+	var unavailable *StatusUnavailableError
+	if !errors.As(err, &unavailable) {
+		t.Fatalf("error = %v, want StatusUnavailableError for a failing backend read", err)
 	}
 }

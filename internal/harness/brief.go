@@ -7,6 +7,8 @@ import (
 	"fmt"
 	"strings"
 	"sync"
+
+	courierv1alpha1 "github.com/misospace/courier/api/v1alpha1"
 )
 
 // ErrDuplicateBrief reports a dispatch of a briefID that already exists in
@@ -196,6 +198,23 @@ func (r *BriefRegistry) BriefIDs() []string {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	return append([]string(nil), r.order...)
+}
+
+// CompletedBriefs renders the durable checkpoint record (§7): every brief
+// with a recorded result, in registration order. The summary is the untrusted
+// outcome text retained for recovery; the commit is the integration commit
+// whose publication the broker confirmed. It is exactly the existing
+// Checkpoint shape — plan plus ordered completedBriefs — with no new fields.
+func (r *BriefRegistry) CompletedBriefs() []courierv1alpha1.Brief {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	var out []courierv1alpha1.Brief
+	for _, id := range r.order {
+		if result, ok := r.results[id]; ok {
+			out = append(out, courierv1alpha1.Brief{ID: id, Summary: result.Summary, Commit: result.Commit})
+		}
+	}
+	return out
 }
 
 // newOpID mints a fresh operation ID: unique within the run across retries

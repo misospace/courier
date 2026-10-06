@@ -97,6 +97,32 @@ type Heartbeat struct {
 	At metav1.Time `json:"at"`
 	// Kind is the activity kind: "stream" or "tool".
 	Kind string `json:"kind"`
+	// CoordinatorPodUID fences this heartbeat to one control incarnation.
+	// Only a heartbeat whose UID matches the current coordinator pod may
+	// reset the consecutive-restart streak or count as fresh for that
+	// incarnation; a previous incarnation's heartbeat is never evidence
+	// about the replacement pod.
+	// +kubebuilder:validation:MinLength=1
+	CoordinatorPodUID string `json:"coordinatorPodUID"`
+}
+
+// ActiveOperation is one concurrently dispatched tool/subagent operation in
+// the run's active-operation set. It is dispatch evidence for liveness
+// suppression — not liveness itself, not a checkpoint — and only a heartbeat
+// from the matching control incarnation is earned activity.
+type ActiveOperation struct {
+	// BriefID identifies the work unit the operation belongs to ("control"
+	// for coordinator-level work). Brief IDs identify work units, not
+	// transport attempts.
+	BriefID string `json:"briefID"`
+	// CoordinatorPodUID is the control incarnation that dispatched it.
+	CoordinatorPodUID string `json:"coordinatorPodUID"`
+	// WorkerPodUID is the worker pod executing it.
+	WorkerPodUID string `json:"workerPodUID"`
+	// DispatchedAt is when trusted control dispatched the operation. It is
+	// diagnostic only: no liveness or timeout semantics attach to it, and
+	// there is no operation-age limit.
+	DispatchedAt metav1.Time `json:"dispatchedAt"`
 }
 
 // PublicationPolicy is the operator-resolved destination for one run. It is
@@ -222,6 +248,16 @@ type CoderRunStatus struct {
 	// Heartbeat is the last successful coordinator activity.
 	// +optional
 	Heartbeat *Heartbeat `json:"heartbeat,omitempty"`
+
+	// ActiveOperations is the set of currently dispatched tool/subagent
+	// operations, keyed by a harness-generated operation ID unique within the
+	// run across retries and pod restarts. Entries persist before dispatch and
+	// clear only on verified completion or cancellation; a valid entry
+	// suppresses stale-heartbeat reaping of its control incarnation. The
+	// trusted broker is the only writer.
+	// +optional
+	// +kubebuilder:validation:MaxProperties=64
+	ActiveOperations map[string]ActiveOperation `json:"activeOperations,omitempty"`
 
 	// Restarts counts infra relaunches (the crashloop backstop), not work
 	// retries.

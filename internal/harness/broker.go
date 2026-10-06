@@ -16,11 +16,13 @@ import (
 
 // Control-side broker API paths. They mirror internal/broker's routes; the
 // client is transport only — every semantic check happens broker-side against
-// the persisted policy, and control supplies OIDs it derived itself.
+// the persisted policy, and control supplies OIDs it derived itself. The
+// status path is served by the broker's separate trusted listener.
 const (
 	brokerPathSnapshot = "/v1/git/snapshot"
 	brokerPathImport   = "/v1/bundles/import"
 	brokerPathPublish  = "/v1/publication"
+	brokerPathStatus   = "/trusted/v1/status"
 )
 
 // Broker API header names.
@@ -122,11 +124,17 @@ func (b *BrokerClient) do(ctx context.Context, method, path string, headers map[
 	if err != nil {
 		return nil, brokerTransportError()
 	}
-	if resp.StatusCode != http.StatusOK {
+	if !okStatus(resp.StatusCode) {
 		resp.Body.Close()
 		return nil, brokerStatusError(resp.StatusCode)
 	}
 	return resp, nil
+}
+
+// okStatus reports a successful typed-API response. Every typed endpoint
+// answers 200 with a body; the trusted status route answers 204 on write.
+func okStatus(status int) bool {
+	return status == http.StatusOK || status == http.StatusNoContent
 }
 
 // Snapshot fetches the broker's live world observation and the seed bundle
@@ -167,6 +175,23 @@ func (b *BrokerClient) ImportBundle(ctx context.Context, bundle []byte, proposed
 		headerProposedOID: proposedOID,
 		headerExpectedTip: expectedTip,
 	}, bundle)
+	if err != nil {
+		return err
+	}
+	resp.Body.Close()
+	return nil
+}
+
+// PostStatus sends one trusted status patch to the broker's separate status
+// listener. The broker validates the patch against the authenticated control
+// incarnation and applies it under resourceVersion CAS; its response, never
+// the transport outcome, decides whether the write happened.
+func (b *BrokerClient) PostStatus(ctx context.Context, patch StatusPatch) error {
+	body, err := json.Marshal(patch)
+	if err != nil {
+		return &BrokerCallError{Category: "status request is malformed"}
+	}
+	resp, err := b.do(ctx, http.MethodPost, brokerPathStatus, map[string]string{"Content-Type": "application/json"}, body)
 	if err != nil {
 		return err
 	}

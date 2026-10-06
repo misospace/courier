@@ -3,6 +3,7 @@ package broker
 import (
 	"context"
 	"errors"
+	"fmt"
 	"testing"
 
 	corev1 "k8s.io/api/core/v1"
@@ -216,4 +217,172 @@ func TestStatusWriterOnlyChangesRequestedHarnessFields(t *testing.T) {
 	if got.Status.Checkpoint.Plan != "new" || got.Status.Phase != courier.PhaseRunning || got.Status.Branch != "operator-branch" || got.Status.LastCommit != "old" {
 		t.Fatalf("status fields unexpectedly changed: %#v", got.Status)
 	}
+}
+
+func activeOpFixture(opID string, coordinatorUID string) OperationAddition {
+	return OperationAddition{
+		OpID: opID,
+		Operation: courier.ActiveOperation{
+			BriefID:           "brief-1",
+			CoordinatorPodUID: coordinatorUID,
+			WorkerPodUID:      "worker-uid-a",
+			DispatchedAt:      metav1.NewTime(metav1.Now().Rfc3339Copy().Time),
+		},
+	}
+}
+
+func TestStatusWriterAppliesAndClearsOperationEntries(t *testing.T) {
+	w, c, identity := statusFixture(t)
+	key := client.ObjectKey{Namespace: testNamespace, Name: testRunName}
+
+	first := activeOpFixture("shell.brief-1.aaaa", string(identity.ControlPodUID))
+	second := activeOpFixture("shell.brief-2.bbbb", string(identity.ControlPodUID))
+	if err := w.Write(context.Background(), identity, HarnessPatch{AddOperation: &first}, nil); err != nil {
+		t.Fatal(err)
+	}
+	// An identical re-add is idempotent: an uncertain acknowledgment is
+	// resolved by re-sending the same entry.
+	if err := w.Write(context.Background(), identity, HarnessPatch{AddOperation: &first}, nil); err != nil {
+		t.Fatalf("identical re-add refused: %v", err)
+	}
+	if err := w.Write(context.Background(), identity, HarnessPatch{AddOperation: &second}, nil); err != nil {
+		t.Fatal(err)
+	}
+	got := &courier.CoderRun{}
+	if err := c.Get(context.Background(), key, got); err != nil {
+		t.Fatal(err)
+	}
+	if len(got.Status.ActiveOperations) != 2 {
+		t.Fatalf("activeOperations = %#v, want two entries", got.Status.ActiveOperations)
+	}
+	// Clearing one entry must never drop the other.
+	if err := w.Write(context.Background(), identity, HarnessPatch{ClearOperation: first.OpID}, nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.Get(context.Background(), key, got); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := got.Status.ActiveOperations[second.OpID]; !ok {
+		t.Fatalf("clearing %s dropped %s: %#v", first.OpID, second.OpID, got.Status.ActiveOperations)
+	}
+	if _, ok := got.Status.ActiveOperations[first.OpID]; ok {
+		t.Fatalf("cleared entry %s survived: %#v", first.OpID, got.Status.ActiveOperations)
+	}
+	// Clearing an absent ID succeeds: clears are retried idempotently.
+	if err := w.Write(context.Background(), identity, HarnessPatch{ClearOperation: first.OpID}, nil); err != nil {
+		t.Fatalf("idempotent clear refused: %v", err)
+	}
+}
+
+func TestStatusWriterRefusesConflictingReAdd(t *testing.T) {
+	w, c, identity := statusFixture(t)
+	addition := activeOpFixture("shell.brief-1.aaaa", string(identity.ControlPodUID))
+	if err := w.Write(context.Background(), identity, HarnessPatch{AddOperation: &addition}, nil); err != nil {
+		t.Fatal(err)
+	}
+	conflicting := addition
+	conflicting.Operation.WorkerPodUID = "worker-uid-other"
+	if err := w.Write(context.Background(), identity, HarnessPatch{AddOperation: &conflicting}, nil); err == nil {
+		t.Fatal("expected a conflicting re-add of the same operation ID to be refused")
+	}
+	got := &courier.CoderRun{}
+	if err := c.Get(context.Background(), client.ObjectKey{Namespace: testNamespace, Name: testRunName}, got); err != nil {
+		t.Fatal(err)
+	}
+	if got.Status.ActiveOperations[addition.OpID].WorkerPodUID != "worker-uid-a" {
+		t.Fatalf("conflicting re-add overwrote dispatch evidence: %#v", got.Status.ActiveOperations)
+	}
+}
+
+func TestStatusWriterFencesOperationAndHeartbeatIdentity(t *testing.T) {
+	w, _, identity := statusFixture(t)
+	foreign := activeOpFixture("shell.brief-1.aaaa", "pod-uid-previous-incarnation")
+	if err := w.Write(context.Background(), identity, HarnessPatch{AddOperation: &foreign}, nil); err == nil {
+		t.Fatal("expected an operation attributing itself to another control incarnation to be refused")
+	}
+	emptyWorker := activeOpFixture("shell.brief-1.aaaa", string(identity.ControlPodUID))
+	emptyWorker.Operation.WorkerPodUID = ""
+	if err := w.Write(context.Background(), identity, HarnessPatch{AddOperation: &emptyWorker}, nil); err == nil {
+		t.Fatal("expected an operation without a worker UID to be refused")
+	}
+	malformed := activeOpFixture("shell/brief-1/aaaa", string(identity.ControlPodUID))
+	if err := w.Write(context.Background(), identity, HarnessPatch{AddOperation: &malformed}, nil); err == nil {
+		t.Fatal("expected a malformed operation ID to be refused")
+	}
+	foreignHeartbeat := &courier.Heartbeat{At: metav1.Now(), Kind: "tool", CoordinatorPodUID: "pod-uid-previous"}
+	if err := w.Write(context.Background(), identity, HarnessPatch{Heartbeat: foreignHeartbeat}, nil); err == nil {
+		t.Fatal("expected a heartbeat for another control incarnation to be refused")
+	}
+	unattributed := &courier.Heartbeat{At: metav1.Now(), Kind: "tool"}
+	if err := w.Write(context.Background(), identity, HarnessPatch{Heartbeat: unattributed}, nil); err == nil {
+		t.Fatal("expected an unattributed heartbeat to be refused")
+	}
+}
+
+func TestStatusWriterReconcileOperationsDropsEveryEntry(t *testing.T) {
+	w, c, identity := statusFixture(t)
+	key := client.ObjectKey{Namespace: testNamespace, Name: testRunName}
+	own := activeOpFixture("shell.brief-1.aaaa", string(identity.ControlPodUID))
+	stale := activeOpFixture("shell.brief-0.0000", "pod-uid-previous-incarnation")
+	if err := w.Write(context.Background(), identity, HarnessPatch{AddOperation: &own}, nil); err != nil {
+		t.Fatal(err)
+	}
+	// The stale-incarnation entry cannot be added through the fence; write it
+	// directly to model a set persisted by a previous incarnation.
+	live := &courier.CoderRun{}
+	if err := c.Get(context.Background(), key, live); err != nil {
+		t.Fatal(err)
+	}
+	live.Status.ActiveOperations = map[string]courier.ActiveOperation{
+		own.OpID:   own.Operation,
+		stale.OpID: stale.Operation,
+	}
+	if err := c.Status().Update(context.Background(), live); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.Write(context.Background(), identity, HarnessPatch{ReconcileOperations: true}, nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.Get(context.Background(), key, live); err != nil {
+		t.Fatal(err)
+	}
+	if len(live.Status.ActiveOperations) != 0 {
+		t.Fatalf("reconcile left entries behind: %#v", live.Status.ActiveOperations)
+	}
+}
+
+func TestStatusWriterBoundsOperationSet(t *testing.T) {
+	w, _, identity := statusFixture(t)
+	for i := 0; i < maxActiveOperations; i++ {
+		addition := activeOpIDFixture(i, string(identity.ControlPodUID))
+		if err := w.Write(context.Background(), identity, HarnessPatch{AddOperation: &addition}, nil); err != nil {
+			t.Fatalf("entry %d refused: %v", i, err)
+		}
+	}
+	overflow := activeOpIDFixture(maxActiveOperations, string(identity.ControlPodUID))
+	if err := w.Write(context.Background(), identity, HarnessPatch{AddOperation: &overflow}, nil); err == nil {
+		t.Fatal("expected the bounded set to refuse another entry")
+	}
+}
+
+func activeOpIDFixture(i int, coordinatorUID string) OperationAddition {
+	return OperationAddition{
+		OpID: "shell.brief-" + fmt.Sprint(i) + ".aaaa",
+		Operation: courier.ActiveOperation{
+			BriefID:           "brief-1",
+			CoordinatorPodUID: coordinatorUID,
+			WorkerPodUID:      "worker-uid-a",
+			DispatchedAt:      metav1.NewTime(metav1.Now().Rfc3339Copy().Time),
+		},
+	}
+}
+
+// failingListReader fails every pod list, standing in for an API server
+// that cannot answer the exactly-one-live-control scan.
+type failingListReader struct {
+	client.Client
+}
+
+func (failingListReader) List(context.Context, client.ObjectList, ...client.ListOption) error {
+	return errors.New("api server unavailable")
 }
