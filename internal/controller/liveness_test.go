@@ -134,7 +134,9 @@ func TestLivenessStaleHeartbeatReapsAndRelaunches(t *testing.T) {
 		t.Fatalf("phase = %q, want Claimed", updated.Status.Phase)
 	}
 	// A reaped live coordinator relaunches with the generic event, no
-	// pod-loss reason.
+	// pod-loss reason: the charge is taken in place, because the fake
+	// delete completes synchronously; a charge the live read defers
+	// arrives with the disappearance backstop's pod-loss reason.
 	if reason := eventReason(t, &eventsOut, string(courierv1alpha1.PhaseClaimed)); reason != "" {
 		t.Fatalf("relaunch event reason = %q, want none; a reaped live coordinator relaunches with the generic event, no pod-loss reason", reason)
 	}
@@ -477,6 +479,250 @@ func TestWedgeChargeDeferredUntilDeadObjectIsGone(t *testing.T) {
 	}
 	if reason := eventReason(t, &eventsOut, string(courierv1alpha1.PhaseClaimed)); reason != podLostEventReason {
 		t.Fatalf("relaunch event reason = %q, want %q; the backstop charges the deferred loss with the pod-loss cause", reason, podLostEventReason)
+	}
+}
+
+func TestWedgeChargeDeferredWhenCacheLagsBehindTermination(t *testing.T) {
+	src := &admissionSource{}
+	run := admissionRun("run", "local", courierv1alpha1.PhaseRunning)
+	withHeartbeat(run, livenessClock.Add(-10*time.Minute))
+	pod := runningCoordinatorPod(run)
+	// The cached pod is old (past the liveness window) with no deletion
+	// timestamp: a sibling reconcile's delete has not reached this
+	// reconcile's cache yet.
+	pod.CreationTimestamp = metav1.NewTime(livenessClock.Add(-2 * time.Hour))
+	pod.Status.ContainerStatuses[0].State.Running.StartedAt = metav1.NewTime(livenessClock.Add(-10 * time.Minute))
+	cached := phaseClient(t, run, pod)
+	// The API server already shows the object terminating: a finalizer is
+	// what keeps it alive there past the sibling's delete, and the fake
+	// client refuses a DeletionTimestamp without one.
+	apiPod := runningCoordinatorPod(run)
+	apiPod.CreationTimestamp = pod.CreationTimestamp
+	apiPod.Status.ContainerStatuses[0].State.Running.StartedAt = pod.Status.ContainerStatuses[0].State.Running.StartedAt
+	apiPod.Finalizers = []string{"courier.misospace.dev/test"}
+	apiPod.DeletionTimestamp = &metav1.Time{Time: livenessClock.Add(-time.Minute)}
+	api := phaseClient(t, run, apiPod)
+	reconciler := livenessReconciler(cached, src, livenessClock)
+	reconciler.APIReader = api
+	var eventsOut bytes.Buffer
+	reconciler.Events = courierlog.NewEmitter(&eventsOut, courierlog.LevelDebug)
+
+	result, err := reconciler.Reconcile(context.Background(), admissionRequest("run"))
+	if err != nil {
+		t.Fatalf("Reconcile() error = %v", err)
+	}
+	if result.Requeue {
+		t.Fatalf("Requeue = true, want false; a coordinator surviving the live read defers the relaunch")
+	}
+	if result.RequeueAfter != observationRequeueDelay {
+		t.Fatalf("RequeueAfter = %v, want %v; a cached view that missed a sibling's delete must not count a second wedge", result.RequeueAfter, observationRequeueDelay)
+	}
+	var updated courierv1alpha1.CoderRun
+	if err := cached.Get(context.Background(), admissionKey("run"), &updated); err != nil {
+		t.Fatalf("get run: %v", err)
+	}
+	if updated.Status.Phase != courierv1alpha1.PhaseRunning {
+		t.Fatalf("phase = %q, want Running; a deferred charge must not transition the run", updated.Status.Phase)
+	}
+	if updated.Status.Restarts != 0 {
+		t.Fatalf("restarts = %d, want 0; a cached view that missed a sibling's delete must not count a second wedge", updated.Status.Restarts)
+	}
+	if len(src.transitions) != 0 {
+		t.Fatalf("transitions = %#v, want none; a deferred charge is not a terminal publish", src.transitions)
+	}
+	if len(src.reports) != 0 {
+		t.Fatalf("reports = %#v, want none; a deferred charge is not a terminal publish", src.reports)
+	}
+	if out := eventsOut.String(); out != "" {
+		t.Fatalf("events = %q, want none; a deferred charge emits no relaunch event", out)
+	}
+}
+
+func TestWedgeChargedWhenLiveReadConfirmsObjectGone(t *testing.T) {
+	src := &admissionSource{}
+	run := admissionRun("run", "local", courierv1alpha1.PhaseRunning)
+	withHeartbeat(run, livenessClock.Add(-10*time.Minute))
+	pod := runningCoordinatorPod(run)
+	// The cached pod is old (past the liveness window): a genuine wedge.
+	pod.CreationTimestamp = metav1.NewTime(livenessClock.Add(-2 * time.Hour))
+	pod.Status.ContainerStatuses[0].State.Running.StartedAt = metav1.NewTime(livenessClock.Add(-10 * time.Minute))
+	cached := phaseClient(t, run, pod)
+	// The API server shows no coordinator: the post-delete re-confirmation
+	// finds the name free, so the charge is taken in place.
+	api := phaseClient(t, run)
+	reconciler := livenessReconciler(cached, src, livenessClock)
+	reconciler.APIReader = api
+	var eventsOut bytes.Buffer
+	reconciler.Events = courierlog.NewEmitter(&eventsOut, courierlog.LevelDebug)
+
+	result, err := reconciler.Reconcile(context.Background(), admissionRequest("run"))
+	if err != nil {
+		t.Fatalf("Reconcile() error = %v", err)
+	}
+	if !result.Requeue {
+		t.Fatalf("Requeue = false, want true; a reaped run must relaunch from its checkpoint")
+	}
+	var got corev1.Pod
+	podKey := types.NamespacedName{Name: "run-coordinator", Namespace: "default"}
+	if err := cached.Get(context.Background(), podKey, &got); !apierrors.IsNotFound(err) {
+		t.Fatalf("get pod: %v, want NotFound after reap", err)
+	}
+	var updated courierv1alpha1.CoderRun
+	if err := cached.Get(context.Background(), admissionKey("run"), &updated); err != nil {
+		t.Fatalf("get run: %v", err)
+	}
+	if updated.Status.Phase != courierv1alpha1.PhaseClaimed {
+		t.Fatalf("phase = %q, want Claimed", updated.Status.Phase)
+	}
+	if updated.Status.Restarts != 1 {
+		t.Fatalf("restarts = %d, want 1; one physical loss is charged exactly once", updated.Status.Restarts)
+	}
+	// A charge taken in place keeps the generic event, no pod-loss reason.
+	if reason := eventReason(t, &eventsOut, string(courierv1alpha1.PhaseClaimed)); reason != "" {
+		t.Fatalf("relaunch event reason = %q, want none; a charge taken in place keeps the generic message", reason)
+	}
+}
+
+func TestWedgeChargeDeferredWhenLiveReadFails(t *testing.T) {
+	src := &admissionSource{}
+	run := admissionRun("run", "local", courierv1alpha1.PhaseRunning)
+	withHeartbeat(run, livenessClock.Add(-10*time.Minute))
+	// An aged, wedged coordinator: a genuine wedge.
+	pod := runningCoordinatorPod(run)
+	pod.CreationTimestamp = metav1.NewTime(livenessClock.Add(-2 * time.Hour))
+	pod.Status.ContainerStatuses[0].State.Running.StartedAt = metav1.NewTime(livenessClock.Add(-10 * time.Minute))
+	c := phaseClient(t, run, pod)
+	reconciler := livenessReconciler(c, src, livenessClock)
+	// The live read fails: the delete is re-confirmed against the API
+	// server, and a failed read is not evidence the name is free.
+	reconciler.APIReader = failingAPIReader{}
+	var eventsOut bytes.Buffer
+	reconciler.Events = courierlog.NewEmitter(&eventsOut, courierlog.LevelDebug)
+
+	result, err := reconciler.Reconcile(context.Background(), admissionRequest("run"))
+	if err != nil {
+		t.Fatalf("Reconcile() error = %v", err)
+	}
+	if result.Requeue {
+		t.Fatalf("Requeue = true, want false; a failed live read defers the relaunch")
+	}
+	if result.RequeueAfter != observationRequeueDelay {
+		t.Fatalf("RequeueAfter = %v, want %v; a failed live read is not evidence the name is free", result.RequeueAfter, observationRequeueDelay)
+	}
+	var updated courierv1alpha1.CoderRun
+	if err := c.Get(context.Background(), admissionKey("run"), &updated); err != nil {
+		t.Fatalf("get run: %v", err)
+	}
+	if updated.Status.Phase != courierv1alpha1.PhaseRunning {
+		t.Fatalf("phase = %q, want Running; a deferred charge must not transition the run", updated.Status.Phase)
+	}
+	if updated.Status.Restarts != 0 {
+		t.Fatalf("restarts = %d, want 0; a failed live read is not evidence the name is free", updated.Status.Restarts)
+	}
+	if out := eventsOut.String(); out != "" {
+		t.Fatalf("events = %q, want none; a deferred charge emits no relaunch event", out)
+	}
+}
+
+func TestWorkerReapDeferredWhileCoordinatorSurvivesLive(t *testing.T) {
+	src := &admissionSource{}
+	run := admissionRun("run", "local", courierv1alpha1.PhaseRunning)
+	withHeartbeat(run, livenessClock.Add(-10*time.Minute))
+	// The cached client holds an aged, running worker pod: it belongs to
+	// the run, but it is not the coordinator.
+	worker := runningCoordinatorPod(run)
+	worker.Name = "run-worker"
+	worker.Spec.Containers[0].Name = "worker"
+	worker.Status.ContainerStatuses[0].Name = "worker"
+	worker.CreationTimestamp = metav1.NewTime(livenessClock.Add(-2 * time.Hour))
+	worker.Status.ContainerStatuses[0].State.Running.StartedAt = metav1.NewTime(livenessClock.Add(-10 * time.Minute))
+	cached := phaseClient(t, run, worker)
+	// The API server shows the real coordinator terminating: a finalizer
+	// is what keeps it alive there, and the fake client refuses a
+	// DeletionTimestamp without one.
+	apiPod := runningCoordinatorPod(run)
+	apiPod.CreationTimestamp = worker.CreationTimestamp
+	apiPod.Status.ContainerStatuses[0].State.Running.StartedAt = worker.Status.ContainerStatuses[0].State.Running.StartedAt
+	apiPod.Finalizers = []string{"courier.misospace.dev/test"}
+	apiPod.DeletionTimestamp = &metav1.Time{Time: livenessClock.Add(-time.Minute)}
+	api := phaseClient(t, run, apiPod)
+	reconciler := livenessReconciler(cached, src, livenessClock)
+	reconciler.APIReader = api
+	var eventsOut bytes.Buffer
+	reconciler.Events = courierlog.NewEmitter(&eventsOut, courierlog.LevelDebug)
+
+	result, err := reconciler.Reconcile(context.Background(), admissionRequest("run"))
+	if err != nil {
+		t.Fatalf("Reconcile() error = %v", err)
+	}
+	if result.Requeue {
+		t.Fatalf("Requeue = true, want false; a coordinator surviving the live read defers the relaunch")
+	}
+	if result.RequeueAfter != observationRequeueDelay {
+		t.Fatalf("RequeueAfter = %v, want %v; a worker delete must not charge the ceiling while a coordinator survives the live read", result.RequeueAfter, observationRequeueDelay)
+	}
+	var updated courierv1alpha1.CoderRun
+	if err := cached.Get(context.Background(), admissionKey("run"), &updated); err != nil {
+		t.Fatalf("get run: %v", err)
+	}
+	if updated.Status.Phase != courierv1alpha1.PhaseRunning {
+		t.Fatalf("phase = %q, want Running; a deferred charge must not transition the run", updated.Status.Phase)
+	}
+	if updated.Status.Restarts != 0 {
+		t.Fatalf("restarts = %d, want 0; a worker delete must not charge the ceiling while a coordinator survives the live read", updated.Status.Restarts)
+	}
+	if out := eventsOut.String(); out != "" {
+		t.Fatalf("events = %q, want none; a deferred charge emits no relaunch event", out)
+	}
+}
+
+func TestWedgeAtCeilingTerminalizesWithoutLiveReConfirmation(t *testing.T) {
+	src := &admissionSource{}
+	run := admissionRun("run", "local", courierv1alpha1.PhaseRunning)
+	withHeartbeat(run, livenessClock.Add(-10*time.Minute))
+	// The run is already at the crashloop ceiling.
+	run.Status.Restarts = 3
+	pod := runningCoordinatorPod(run)
+	pod.CreationTimestamp = metav1.NewTime(livenessClock.Add(-2 * time.Hour))
+	pod.Status.ContainerStatuses[0].State.Running.StartedAt = metav1.NewTime(livenessClock.Add(-10 * time.Minute))
+	cached := phaseClient(t, run, pod)
+	// The API server still shows the pod terminating: at the ceiling there
+	// is no charge to defer, so the hand-off must not wait for it.
+	apiPod := runningCoordinatorPod(run)
+	apiPod.CreationTimestamp = pod.CreationTimestamp
+	apiPod.Status.ContainerStatuses[0].State.Running.StartedAt = pod.Status.ContainerStatuses[0].State.Running.StartedAt
+	apiPod.Finalizers = []string{"courier.misospace.dev/test"}
+	apiPod.DeletionTimestamp = &metav1.Time{Time: livenessClock.Add(-time.Minute)}
+	api := phaseClient(t, run, apiPod)
+	reconciler := livenessReconciler(cached, src, livenessClock)
+	reconciler.APIReader = api
+
+	if _, err := reconciler.Reconcile(context.Background(), admissionRequest("run")); err != nil {
+		t.Fatalf("Reconcile() error = %v", err)
+	}
+	var got corev1.Pod
+	podKey := types.NamespacedName{Name: "run-coordinator", Namespace: "default"}
+	if err := cached.Get(context.Background(), podKey, &got); !apierrors.IsNotFound(err) {
+		t.Fatalf("get pod: %v, want NotFound after reap", err)
+	}
+	var updated courierv1alpha1.CoderRun
+	if err := cached.Get(context.Background(), admissionKey("run"), &updated); err != nil {
+		t.Fatalf("get run: %v", err)
+	}
+	if updated.Status.Restarts != 3 {
+		t.Fatalf("restarts = %d, want 3 (the ceiling is not re-incremented)", updated.Status.Restarts)
+	}
+	if updated.Status.Phase != courierv1alpha1.PhaseNeedsHuman {
+		t.Fatalf("phase = %q, want NeedsHuman; at the ceiling the hand-off completes in this reconcile", updated.Status.Phase)
+	}
+	if len(src.transitions) != 1 || src.transitions[0] != source.StateNeedsHuman {
+		t.Fatalf("transitions = %#v, want [needs-human]", src.transitions)
+	}
+	if len(src.reports) != 1 || src.reports[0].Result != source.ResultBlocked {
+		t.Fatalf("reports = %#v, want one blocked report", src.reports)
+	}
+	if src.reports[0].Error != "run requires human intervention" {
+		t.Fatalf("reported error = %q, want the generic needs-human message; a reaped wedge is not pod loss", src.reports[0].Error)
 	}
 }
 

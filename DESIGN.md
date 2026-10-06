@@ -327,17 +327,20 @@ to die.
   except at the restart ceiling, where it survives as the `NeedsHuman`
   hand-off's only record of the cause. Below the ceiling the charge is
   deferred until a live read shows the deleted object gone on **both** delete
-  paths — the disappearance backstop and the wedge's reap of a dead
-  coordinator — so one physical loss is charged once and the replacement can
+  paths — the disappearance backstop and every delete of the wedge's reap —
+  so one physical loss is charged once and the replacement can
    never attach to a dying object the launcher would tolerate. A
    stale-heartbeat run whose cache already shows such a pod is reaped by the
-   wedge path first; its charge is deferred the same way only when the
-   post-delete live read finds a surviving coordinator object — a reap whose
-   delete completes synchronously charges in place with the generic message —
-   and a deferred charge is left to the disappearance backstop, which
-   confirms the loss against the API server and charges it with its pod-loss
-   cause; at the ceiling the wedge preserves the inert object exactly like the
-   backstop.
+   wedge path first, and below the ceiling **every** wedge-path delete is
+   re-confirmed the same way (#105): a cached view can lag the API server's
+   deletion timestamp, and deleting an already-terminating object succeeds
+   without deleting anything, so a no-op delete must not charge a second
+   wedge for one physical loss. A reap whose live re-confirmation finds the
+   object gone charges in place with the generic message; a deferred charge
+   is left to the disappearance backstop, which confirms the loss against
+   the API server and charges it with its pod-loss cause. At the ceiling
+   there is no charge to defer: the wedge preserves the inert unrecoverable
+   object exactly like the backstop and terminalizes in the same reconcile.
 - The crashloop counter bounds a **consecutive** streak of wedges, not a lifetime
   total: a run that demonstrates liveness — a fresh heartbeat within the window
   while a recoverable coordinator is observable — resets the streak to zero, so
@@ -351,8 +354,11 @@ to die.
   created within the window (or whose coordinator started within it) is never
   reaped. Freshness is judged only on observable pod/run state — the operator
   never writes the harness-owned heartbeat. A pod already terminating is neither
-  reapable nor counted, so a delete racing a reconcile cannot double-count a
-  single wedge.
+  reapable nor counted, and the wedge-path charge re-confirms every delete
+  against the API server, so a delete racing a reconcile cannot double-count a
+  single wedge through pod-cache lag (#105); the residual window — a cached run
+  status lagging a sibling's already-charged patch — is a charge-proof problem
+  reserved for #126's uncached-read rule.
 
 This heartbeat catches a *wedged* run but not a *spinning* one (busy-looping,
 streaming happily, converging on nothing). #170 implemented a bounded,
@@ -1705,3 +1711,17 @@ was superseded.
    which confirms the loss against the API server and charges it with its
    pod-loss reason — one physical loss, one ceiling charge, found in AI review
    of PR #218. (#106)
+- **2026-10-05 — #105: the wedge-path charge re-confirms every delete, not
+  just the dead-object one.** `checkLiveness` charged the crashloop counter
+  immediately after a `Delete` returned, so a sibling reconcile whose cached
+  view had not yet caught up with a terminating object could count a no-op
+  delete as a second wedge for one physical loss. The post-delete live
+  re-confirmation (`coordinatorObjectPresentLive`) now guards every wedge-path
+  delete below the ceiling, mirroring the rule #106 established for
+  dead-object deletes: a surviving coordinator object defers the charge and
+  the disappearance backstop takes the deferred loss with its pod-loss cause.
+  At the ceiling there is no charge to defer and the hand-off terminalizes in
+  the same reconcile. The counter stays bound to *observed* wedges; no timer
+  and no duration bound was introduced. The window it does not close — a
+  cached run status lagging a sibling's already-charged status patch — needs
+  charge-proof writes and stays with #126. (#105)
