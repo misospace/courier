@@ -54,7 +54,7 @@ RUN --mount=type=cache,target=/go/pkg/mod \
 # Coordinator image: the bootstrap OpenCode runtime. The executor contract
 # (BOOTSTRAP.md) requires courier-executor, git, and opencode in one image.
 # Debian (not alpine) because the opencode npm package ships glibc binaries.
-FROM node:24-bookworm-slim@sha256:0e0ff40c39bc087845bfb27465a0df4ea419520094bc35842ff83dd8cbe6f9b6 AS coordinator
+FROM node:24-bookworm-slim@sha256:d6aa754f16b3197301076f047b5def2f02ea1dbbc2ca920407d46d7ec7f87b20 AS coordinator
 ARG OPENCODE_VERSION=1.18.31
 
 RUN apt-get update && \
