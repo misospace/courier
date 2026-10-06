@@ -584,7 +584,7 @@ only the per-role model identifiers.
 plan, integrate, locally validate, publish, and hand off. Delegation covers
 bounded work only — implementation, research, review — never the terminal
 contract. The coordinator validates delegated results against the integrated
-work and runs relevant local checks itself, fixing failures before publication.
+work and runs relevant local checks itself, fixing failures before declaring completion.
 Once local validation passes and publication succeeds, the operator owns external
 verification of the pull request and CI. The coordinator publishes
 through the broker, never through a worker.
@@ -718,9 +718,18 @@ access, an ambiguous ask, a capability that will not come back) self-declares
 needs-human and exits 2; a run that can proceed does, degraded capabilities
 and all.
 
-The harness supplies the worker a sanitized read-only repo snapshot (for
-example, a git bundle unpacked into an ephemeral workspace), plus only the
-task inputs. The worker executes shell and returns a summary, evidence, and
+The harness supplies the worker a sanitized read-only repo snapshot — a git
+bundle unpacked into an ephemeral workspace — plus only the task inputs.
+Control's private integration tree is the source of every snapshot: the tree
+is seeded once per control incarnation through the broker's typed snapshot
+endpoint (the broker renders a bundle from the pinned work ref it observes
+live, or the pinned base ref when the work ref was admitted absent), and
+each brief's snapshot is then rendered locally from the integrated tree, so
+a snapshot always carries every integrated — and possibly still unpublished
+— brief. The worker's unpack and pack tasks are control-composed fixed
+scripts over that bundle: unpack materializes the snapshot work ref as the
+workspace; pack captures the workspace's committed state as the brief's
+`refs/courier/briefs/<briefID>` bundle. The worker executes shell and returns a summary, evidence, and
 artifact bundle. Its server is a minimal run-bound signed-protocol listener, not
 a trusted security boundary: a compromised worker may inspect or interfere
 with the verifier and fabricate results. Neither it nor the shell has private
@@ -949,7 +958,7 @@ a structured terminal result (outcome + reason) written by trusted control
 before process exit. The operator classifies from that trusted evidence plus
 its own world verification, keeping two failure kinds distinct:
 
-- **Workload failure** — local validation fails before publication. The
+- **Workload failure** — local validation fails before completion. The
   coordinator uses its bounded run to address it or reports a genuine human
   decision; after publication, CI is observed by the operator and a failed check
   reaches `Failed` for the source to handle.
@@ -1137,17 +1146,21 @@ and the acceptance tests below are satisfied.
    `NeedsHuman`/retryable matrix, and provider-neutral semantics with
    fail-closed unsupported providers, including the writable fork head required
    by #94. #122's broker enforcement layer, #123's per-run pod wiring and
-   admission resolution, and #124's native model client — stream
+   admission resolution, #124's native model client — stream
    normalization, LaneProfile role binding over the gateway, brief
    delegation with cancellation/retry dedupe, and startup capability
-   health — have landed (deployment-level secure mode); #125's artifact
-   validation, integration, and publication remain, and until then the
-   control pod's capability gate reports publication as unavailable and
-   fails closed before model work starts.
-3. Settled in §5: the worker artifact contract — git bundle only, exact
-   base-tip ancestry binding, fixed size/object bounds, exact ref-set
-   equality, operator-resolved path scope, and worker metadata as never
-   authority. #125 implements and tests it.
+   health — and #125's worker-artifact validation, integration, and
+   broker-mediated publication have landed (deployment-level secure mode).
+   The native path's forge reads (`ForgeOps`) and pull-request
+   creation/update are not yet wired to the broker's typed API; until they
+   are, a published native run reaches `Verifying` without opening its PR —
+   that wiring belongs to the terminal-result slice (#127), and the model
+   client's forge tool stays unwired in the meantime.
+3. Settled in §5 and implemented in #125: the worker artifact contract —
+   git bundle only, exact base-tip ancestry binding, fixed size/object
+   bounds, exact ref-set equality, operator-resolved path scope (none is
+   resolved yet, so the whole repository is in scope), and worker metadata
+   as never authority.
 4. #120 settles per-run broker topology, workload identity, worker signing,
    network policy, and the first dependency-egress slice. #123's isolated
    pod/protocol wiring has landed but does not implement the Go cache; #136 is

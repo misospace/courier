@@ -615,7 +615,7 @@ func TestGoalCarriesCoordinatorCompletionContract(t *testing.T) {
 				"run relevant local validation",
 				"Before declaring changes complete, run relevant local validation against the integrated work",
 				"delegated checks alone do not replace this",
-				"If the validation fails, fix the failures before publishing",
+				"If the validation fails, fix the failures before declaring completion",
 				"report needs_decision only for an actual decision that requires a human",
 				"finish when the work is published",
 				"do not wait for external verification, CI/checks, human review, or AI review",

@@ -142,7 +142,7 @@ const completionContract = "Delegate implementation, research, and review to sub
 
 // localValidationContract makes clear that the handoff does not reduce
 // validation of the integrated changes to an optional delegated check.
-const localValidationContract = "Before declaring changes complete, run relevant local validation against the integrated work; delegated checks alone do not replace this. If the validation fails, fix the failures before publishing; report needs_decision only for an actual decision that requires a human."
+const localValidationContract = "Before declaring changes complete, run relevant local validation against the integrated work; delegated checks alone do not replace this. If the validation fails, fix the failures before declaring completion; report needs_decision only for an actual decision that requires a human."
 
 // publicationContract names the run branch as the only place work may be
 // published, so a coordinator or delegate never opens or pushes work from a

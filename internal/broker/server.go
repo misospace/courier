@@ -3,7 +3,6 @@ package broker
 import (
 	"context"
 	"crypto/tls"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -14,11 +13,14 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+
+	couriergit "github.com/misospace/courier/internal/git"
 )
 
 const (
 	PathPublish       = "/v1/publication"
 	PathImportBundle  = "/v1/bundles/import"
+	PathSnapshot      = "/v1/git/snapshot"
 	PathCreatePR      = "/v1/pull-requests"
 	PathUpdatePR      = "/v1/pull-requests/update"
 	PathTrustedStatus = "/trusted/v1/status"
@@ -37,10 +39,16 @@ type BundleImporter interface {
 	ImportBundle(ctx context.Context, bundlePath, proposedOID, expectedTip string) error
 }
 
+// SnapshotHandler serves the seed-snapshot read for trusted control.
+type SnapshotHandler interface {
+	SnapshotForControl(ctx context.Context) (EngineSnapshot, error)
+}
+
 type ServerConfig struct {
 	Policy        *PolicyEngine
 	Authenticator RequestAuthenticator
 	Importer      BundleImporter
+	Snapshot      SnapshotHandler
 	ScratchDir    string
 	TLSCertFile   string
 	TLSKeyFile    string
@@ -53,6 +61,7 @@ type Server struct {
 	policy        *PolicyEngine
 	authenticator RequestAuthenticator
 	importer      BundleImporter
+	snapshot      SnapshotHandler
 	scratchDir    string
 	capabilities  CapabilityReporter
 	importMu      sync.Mutex
@@ -84,11 +93,14 @@ func NewServer(config ServerConfig) (*Server, error) {
 	if _, err := tls.LoadX509KeyPair(config.TLSCertFile, config.TLSKeyFile); err != nil {
 		return nil, fmt.Errorf("load broker TLS identity: %w", err)
 	}
-	s := &Server{policy: config.Policy, authenticator: config.Authenticator, importer: config.Importer, scratchDir: config.ScratchDir, capabilities: config.Capabilities}
+	s := &Server{policy: config.Policy, authenticator: config.Authenticator, importer: config.Importer, snapshot: config.Snapshot, scratchDir: config.ScratchDir, capabilities: config.Capabilities}
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST "+PathPublish, s.publish)
 	if s.importer != nil {
 		mux.HandleFunc("POST "+PathImportBundle, s.importBundle)
+	}
+	if s.snapshot != nil {
+		mux.HandleFunc("GET "+PathSnapshot, s.snapshotForControl)
 	}
 	if s.capabilities != nil {
 		mux.HandleFunc("GET "+PathCapabilities, s.capabilityHandler)
@@ -148,23 +160,17 @@ func (s *Server) importBundle(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "invalid request", http.StatusBadRequest)
 		return
 	}
-	var req struct {
-		ExpectedTip string `json:"expectedTip"`
-		ProposedOID string `json:"proposedOID"`
-		Bundle      string `json:"bundle"`
+	// The proposed and expected OIDs travel in headers and the bundle bytes
+	// form the raw body: the settled §5 bundle bound must be expressible on
+	// the wire, and a text envelope would double it.
+	req := struct {
+		ExpectedTip string
+		ProposedOID string
+	}{
+		ExpectedTip: r.Header.Get("X-Courier-Expected-Tip"),
+		ProposedOID: r.Header.Get("X-Courier-Proposed-OID"),
 	}
-	dec := json.NewDecoder(http.MaxBytesReader(w, r.Body, maxBundleRequestBytes))
-	dec.DisallowUnknownFields()
-	if err := dec.Decode(&req); err != nil || req.Bundle == "" {
-		http.Error(w, "invalid request", http.StatusBadRequest)
-		return
-	}
-	var extra any
-	if err := dec.Decode(&extra); err != io.EOF {
-		http.Error(w, "invalid request", http.StatusBadRequest)
-		return
-	}
-	bundle, err := hex.DecodeString(req.Bundle)
+	bundle, err := io.ReadAll(http.MaxBytesReader(w, r.Body, maxBundleRequestBytes))
 	if err != nil || len(bundle) == 0 {
 		http.Error(w, "invalid request", http.StatusBadRequest)
 		return
@@ -247,13 +253,38 @@ func (s *Server) validImportTip(ctx context.Context, expected string) bool {
 	return expected == p.WorkAnchorOID || expected == p.HeadAnchorOID || expected == s.policy.confirmed
 }
 
-func validObjectID(oid string) bool {
-	if len(oid) != 40 && len(oid) != 64 {
-		return false
+// snapshotForControl serves the seed snapshot: the live observed tips in
+// headers and the bundle as the raw body. Only authenticated control reads
+// it, and the bundle is broker-authored from the pinned refs it observed.
+func (s *Server) snapshotForControl(w http.ResponseWriter, r *http.Request) {
+	if _, ok := s.authenticate(w, r); !ok {
+		return
 	}
-	_, err := hex.DecodeString(oid)
-	return err == nil
+	if r.URL.RawQuery != "" || r.Body != nil && r.ContentLength != 0 {
+		http.Error(w, "invalid request", http.StatusBadRequest)
+		return
+	}
+	snap, err := s.snapshot.SnapshotForControl(r.Context())
+	if err != nil {
+		if errors.Is(err, ErrSnapshotTipMoved) {
+			http.Error(w, "snapshot race, retry", http.StatusServiceUnavailable)
+			return
+		}
+		http.Error(w, "operation denied", http.StatusUnprocessableEntity)
+		return
+	}
+	w.Header().Set("Content-Type", "application/octet-stream")
+	w.Header().Set("X-Courier-Snapshot-Tip", snap.Tip)
+	w.Header().Set("X-Courier-Snapshot-Base-Tip", snap.BaseTip)
+	w.Header().Set("X-Courier-Snapshot-Work-Ref-Exists", fmt.Sprintf("%t", snap.WorkRefExists))
+	w.Header().Set("X-Courier-Snapshot-At-Anchor", fmt.Sprintf("%t", snap.AtAnchor))
+	w.WriteHeader(http.StatusOK)
+	if _, err := w.Write(snap.Data); err != nil {
+		return
+	}
 }
+
+func validObjectID(oid string) bool { return couriergit.ValidOID(oid) }
 
 func (s *Server) publish(w http.ResponseWriter, r *http.Request) {
 	if _, ok := s.authenticate(w, r); !ok {

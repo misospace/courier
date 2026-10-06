@@ -47,8 +47,9 @@ type gitTransport struct {
 
 // NewGitPusher resolves and pins only the policy's base and work repositories.
 // Local/file endpoints are allowed only when explicitly returned by the trusted
-// resolver; arbitrary caller/model URLs are never accepted.
-func NewGitPusher(ctx context.Context, config GitTransportConfig) (Pusher, error) {
+// resolver; arbitrary caller/model URLs are never accepted. The returned
+// transport implements both Pusher and Snapshotter.
+func NewGitPusher(ctx context.Context, config GitTransportConfig) (*gitTransport, error) {
 	if config.Git == nil || config.Git.Directory() == "" || config.Resolver == nil {
 		return nil, errors.New("broker git transport: git broker and trusted endpoint resolver are required")
 	}
