@@ -55,10 +55,10 @@ func TestReconcilerEmitsRunScopedPhaseTransitionEvents(t *testing.T) {
 			wantPhase:    courierv1alpha1.PhaseAwaitingReview,
 		},
 		{
-			name:      "failed checks transition to NeedsHuman",
+			name:      "failed checks transition to retryable Failed",
 			phase:     courierv1alpha1.PhaseVerifying,
 			observer:  &failedObserver,
-			wantPhase: courierv1alpha1.PhaseNeedsHuman,
+			wantPhase: courierv1alpha1.PhaseFailed,
 		},
 	}
 	for _, tt := range tests {

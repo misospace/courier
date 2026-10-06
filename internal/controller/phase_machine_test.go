@@ -428,7 +428,7 @@ func TestRunningPodExitMapsPhaseAndSourceState(t *testing.T) {
 		// The blocked task report parks the item; skip only the redundant
 		// follow-up PR-fix queue mark.
 		{name: "no-change-needed fix-pr", mode: courierv1alpha1.ModeFixPR, exitCode: 3, wantPhase: courierv1alpha1.PhaseNeedsHuman, wantSource: source.StateNeedsHuman, wantReport: true, wantResult: source.ResultBlocked, wantBlockedReportParksPRFix: true},
-		{name: "failure", exitCode: 17, wantPhase: courierv1alpha1.PhaseFailed, wantSource: source.StateNeedsHuman, wantReport: true, wantResult: source.ResultFailed},
+		{name: "failure", exitCode: 17, wantPhase: courierv1alpha1.PhaseFailed, wantSource: source.StateInProgress, wantReport: true, wantResult: source.ResultFailed},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -512,11 +512,13 @@ func TestRunningDirectTerminalEnrichesObservedPR(t *testing.T) {
 		priorPR      string
 		observer     WorldObserver
 		wantPhase    courierv1alpha1.Phase
+		wantSource   source.State
 		wantPR       string
 		wantReportPR string
 	}{
 		{
 			name:         "needs human publishes observed PR",
+			wantSource:   source.StateNeedsHuman,
 			exitCode:     2,
 			observer:     fakeWorldObserver{observation: PRObservation{PR: "42", Checks: []CheckObservation{{Name: "check", State: CheckStateFailed}}}},
 			wantPhase:    courierv1alpha1.PhaseNeedsHuman,
@@ -525,6 +527,7 @@ func TestRunningDirectTerminalEnrichesObservedPR(t *testing.T) {
 		},
 		{
 			name:         "failed retains prior PR on observer error",
+			wantSource:   source.StateInProgress,
 			exitCode:     17,
 			priorPR:      "42",
 			observer:     fakeWorldObserver{err: errors.New("github unavailable")},
@@ -534,6 +537,7 @@ func TestRunningDirectTerminalEnrichesObservedPR(t *testing.T) {
 		},
 		{
 			name:         "observer error without prior PR still terminalizes",
+			wantSource:   source.StateNeedsHuman,
 			exitCode:     2,
 			observer:     fakeWorldObserver{err: errors.New("github unavailable")},
 			wantPhase:    courierv1alpha1.PhaseNeedsHuman,
@@ -542,6 +546,7 @@ func TestRunningDirectTerminalEnrichesObservedPR(t *testing.T) {
 		},
 		{
 			name:         "no observer still terminalizes",
+			wantSource:   source.StateInProgress,
 			exitCode:     17,
 			observer:     nil,
 			wantPhase:    courierv1alpha1.PhaseFailed,
@@ -550,6 +555,7 @@ func TestRunningDirectTerminalEnrichesObservedPR(t *testing.T) {
 		},
 		{
 			name:         "no PR observed stays empty",
+			wantSource:   source.StateNeedsHuman,
 			exitCode:     2,
 			observer:     fakeWorldObserver{observation: PRObservation{}},
 			wantPhase:    courierv1alpha1.PhaseNeedsHuman,
@@ -558,6 +564,7 @@ func TestRunningDirectTerminalEnrichesObservedPR(t *testing.T) {
 		},
 		{
 			name:         "failed publishes live observed PR",
+			wantSource:   source.StateInProgress,
 			exitCode:     17,
 			observer:     fakeWorldObserver{observation: PRObservation{PR: "42", Checks: []CheckObservation{{Name: "check", State: CheckStateFailed}}}},
 			wantPhase:    courierv1alpha1.PhaseFailed,
@@ -566,6 +573,7 @@ func TestRunningDirectTerminalEnrichesObservedPR(t *testing.T) {
 		},
 		{
 			name:         "all-green observation on terminal exit stays terminal",
+			wantSource:   source.StateNeedsHuman,
 			exitCode:     2,
 			observer:     fakeWorldObserver{observation: PRObservation{PR: "42", Head: "sha-1", Checks: []CheckObservation{{Name: "check", State: CheckStatePassed}}}},
 			wantPhase:    courierv1alpha1.PhaseNeedsHuman,
@@ -604,8 +612,8 @@ func TestRunningDirectTerminalEnrichesObservedPR(t *testing.T) {
 			if updated.Status.PR != tt.wantPR {
 				t.Fatalf("PR = %q, want %q", updated.Status.PR, tt.wantPR)
 			}
-			if len(item.reports) != 1 || item.reports[0].PR != tt.wantReportPR || item.reports[0].State != source.StateNeedsHuman {
-				t.Fatalf("reports = %#v, want one report with PR %q and state %q", item.reports, tt.wantReportPR, source.StateNeedsHuman)
+			if len(item.reports) != 1 || item.reports[0].PR != tt.wantReportPR || item.reports[0].State != tt.wantSource {
+				t.Fatalf("reports = %#v, want one report with PR %q and state %q", item.reports, tt.wantReportPR, tt.wantSource)
 			}
 			if updated.Status.LastCommit != "abc123" {
 				t.Fatalf("LastCommit = %q, want abc123", updated.Status.LastCommit)
@@ -632,7 +640,7 @@ func TestVerifyingObservationGatesReview(t *testing.T) {
 		{name: "no checks", observation: PRObservation{PR: "42"}, wantPhase: courierv1alpha1.PhaseVerifying, wantRequeue: true, wantPR: "42"},
 		{name: "pending", observation: PRObservation{PR: "42", Checks: []CheckObservation{{State: CheckStatePending}}}, wantPhase: courierv1alpha1.PhaseVerifying, wantRequeue: true, wantPR: "42"},
 		{name: "pending failure mix", observation: PRObservation{PR: "42", Checks: []CheckObservation{{State: CheckStateFailed}, {State: CheckStatePending}}}, wantPhase: courierv1alpha1.PhaseVerifying, wantRequeue: true, wantPR: "42"},
-		{name: "failed", observation: PRObservation{PR: "42", Checks: []CheckObservation{{State: CheckStateFailed}}}, wantPhase: courierv1alpha1.PhaseNeedsHuman, wantTransition: source.StateNeedsHuman},
+		{name: "failed checks return for a fresh attempt", observation: PRObservation{PR: "42", Checks: []CheckObservation{{State: CheckStateFailed}}}, wantPhase: courierv1alpha1.PhaseFailed, wantTransition: source.StateInProgress},
 		{name: "single green observation", observation: PRObservation{PR: "42", Checks: []CheckObservation{{State: CheckStatePassed}, {State: CheckStatePassed}}}, wantPhase: courierv1alpha1.PhaseVerifying, wantRequeue: true, wantPR: "42"},
 		{name: "transient error", err: errors.New("GitHub unavailable"), wantPhase: courierv1alpha1.PhaseVerifying, wantRequeue: true},
 		{name: "merged mid-run", observation: PRObservation{PR: "42", Merged: true}, wantPhase: courierv1alpha1.PhaseDone, wantPR: "42", wantNoTransition: true},
@@ -900,7 +908,7 @@ func TestVerifyingNewHeadResetsSettle(t *testing.T) {
 	}
 }
 
-func TestVerifyingFailureSkipsSettle(t *testing.T) {
+func TestVerifyingFailureUsesRetryableLifecycle(t *testing.T) {
 	item := &admissionSource{}
 	run := admissionRun("run", "local", courierv1alpha1.PhaseVerifying)
 	run.Spec.Source = "manual"
@@ -928,11 +936,14 @@ func TestVerifyingFailureSkipsSettle(t *testing.T) {
 	if err := client.Get(context.Background(), admissionKey("run"), &updated); err != nil {
 		t.Fatalf("get run: %v", err)
 	}
-	if updated.Status.Phase != courierv1alpha1.PhaseNeedsHuman {
-		t.Fatalf("phase = %q, want NeedsHuman without waiting for a stable observation", updated.Status.Phase)
+	if updated.Status.Phase != courierv1alpha1.PhaseFailed {
+		t.Fatalf("phase = %q, want Failed without waiting for a stable observation", updated.Status.Phase)
 	}
-	if len(item.transitions) != 1 || item.transitions[0] != source.StateNeedsHuman {
-		t.Fatalf("transitions = %#v, want exactly one needs-human", item.transitions)
+	if len(item.transitions) != 1 || item.transitions[0] != source.StateInProgress {
+		t.Fatalf("transitions = %#v, want exactly one retryable in-progress state", item.transitions)
+	}
+	if len(item.reports) != 1 || item.reports[0].Result != source.ResultFailed || item.reports[0].State != source.StateInProgress || item.reports[0].PR != "42" || item.reports[0].Error != "coordinator failed" {
+		t.Fatalf("reports = %#v, want one failed report for PR 42", item.reports)
 	}
 }
 
@@ -983,10 +994,10 @@ func TestTerminalLifecycleReportsToSource(t *testing.T) {
 			wantReport:  source.Lifecycle{State: source.StateInReview, Result: source.ResultReady, PR: "42", IdempotencyKey: "coderun/default/run/AwaitingReview"},
 		},
 		{
-			name:        "needs human",
+			name:        "failed checks",
 			observation: PRObservation{PR: "42", Checks: []CheckObservation{{State: CheckStateFailed}}},
-			wantPhase:   courierv1alpha1.PhaseNeedsHuman,
-			wantReport:  source.Lifecycle{State: source.StateNeedsHuman, Result: source.ResultBlocked, PR: "42", Error: "run requires human intervention", IdempotencyKey: "coderun/default/run/NeedsHuman"},
+			wantPhase:   courierv1alpha1.PhaseFailed,
+			wantReport:  source.Lifecycle{State: source.StateInProgress, Result: source.ResultFailed, PR: "42", Error: "coordinator failed", IdempotencyKey: "coderun/default/run/Failed"},
 		},
 	}
 	for _, tt := range tests {
@@ -1049,7 +1060,7 @@ func TestTerminalLifecycleReportRetryReusesIdempotencyKey(t *testing.T) {
 	if len(item.reports) != 2 {
 		t.Fatalf("reports = %#v, want one per attempt", item.reports)
 	}
-	want := lifecycleIdempotencyKey(run, courierv1alpha1.PhaseNeedsHuman)
+	want := lifecycleIdempotencyKey(run, courierv1alpha1.PhaseFailed)
 	if item.reports[0].IdempotencyKey != want {
 		t.Fatalf("first report key = %q, want %q", item.reports[0].IdempotencyKey, want)
 	}
@@ -1060,8 +1071,8 @@ func TestTerminalLifecycleReportRetryReusesIdempotencyKey(t *testing.T) {
 	if err := client.Get(context.Background(), admissionKey("run"), &updated); err != nil {
 		t.Fatalf("get run: %v", err)
 	}
-	if updated.Status.Phase != courierv1alpha1.PhaseNeedsHuman {
-		t.Fatalf("phase = %q, want NeedsHuman", updated.Status.Phase)
+	if updated.Status.Phase != courierv1alpha1.PhaseFailed {
+		t.Fatalf("phase = %q, want Failed", updated.Status.Phase)
 	}
 }
 

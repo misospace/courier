@@ -675,7 +675,7 @@ func TestHTTPClientReportMapsBlockedAndFailed(t *testing.T) {
 	var requests []map[string]any
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		wantPath := "/api/agents/worker/tasks/report"
-		if len(requests)%2 == 1 {
+		if len(requests) == 1 {
 			wantPath = "/api/pr-fix-queue/mark"
 		}
 		if r.Method != http.MethodPost || r.URL.Path != wantPath {
@@ -695,14 +695,15 @@ func TestHTTPClientReportMapsBlockedAndFailed(t *testing.T) {
 		t.Fatal(err)
 	}
 	id := EncodeWorkID(Task{Type: "followup-pr", PullRequest: &PullRequest{Repo: "acme/widgets", Number: 77, URL: "https://github.com/acme/widgets/pull/77"}, PRFixItem: &PRFixItem{ID: "queue-item", Generation: 1}})
+	failedID := EncodeWorkID(Task{Type: "implement", Issue: &Issue{ID: "issue-id", Repo: "acme/widgets", Number: 42}})
 	if err := client.Report(context.Background(), id, source.Lifecycle{State: source.StateNeedsHuman, Result: source.ResultBlocked, Error: "blocked"}); err != nil {
 		t.Fatal(err)
 	}
-	if err := client.Report(context.Background(), id, source.Lifecycle{State: source.StateNeedsHuman, Result: source.ResultFailed, Error: "failed"}); err != nil {
+	if err := client.Report(context.Background(), failedID, source.Lifecycle{State: source.StateInProgress, Result: source.ResultFailed, Error: "failed"}); err != nil {
 		t.Fatal(err)
 	}
-	if len(requests) != 4 || requests[0]["taskType"] != "followup-pr" || requests[0]["outcome"] != "blocked" || requests[0]["error"] != "blocked" || requests[1]["status"] != "BLOCKED" || requests[1]["repo"] != "acme/widgets" || requests[1]["pr"] != float64(77) || requests[2]["taskType"] != "followup-pr" || requests[2]["outcome"] != "failed" || requests[2]["error"] != "failed" || requests[3]["status"] != "BLOCKED" || requests[3]["repo"] != "acme/widgets" || requests[3]["pr"] != float64(77) {
-		t.Fatalf("requests = %#v", requests)
+	if len(requests) != 3 || requests[0]["taskType"] != "followup-pr" || requests[0]["outcome"] != "blocked" || requests[0]["error"] != "blocked" || requests[1]["status"] != "BLOCKED" || requests[1]["repo"] != "acme/widgets" || requests[1]["pr"] != float64(77) || requests[2]["taskType"] != "implement" || requests[2]["outcome"] != "failed" || requests[2]["error"] != "failed" || requests[2]["issueNumber"] != float64(42) || requests[2]["pullRequestNumber"] != nil || requests[2]["prFixItem"] != nil {
+		t.Fatalf("requests = %#v, want blocked report + queue mark, then an issue-work failed report without a queue mark", requests)
 	}
 }
 
@@ -785,8 +786,8 @@ func TestHTTPClientQueueBackedFollowupEchoesAttemptToken(t *testing.T) {
 			t.Fatalf("report prFixItem = %#v, want %#v", report["prFixItem"], want)
 		}
 	}
-	if len(marks) != 2 {
-		t.Fatalf("marks = %#v, want one per blocked/failed result", marks)
+	if len(marks) != 1 {
+		t.Fatalf("marks = %#v, want one for the blocked result; failed reports handle retry policy", marks)
 	}
 	for _, mark := range marks {
 		if mark["generation"] != float64(3) {

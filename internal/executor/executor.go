@@ -135,11 +135,14 @@ var (
 // forge. (#90)
 const forgeContract = "Route every forge read and write through the configured forge capability, not a forge-specific CLI."
 
-// completionContract states that delegation covers bounded work, never the run's
-// terminal contract: the coordinator integrates and verifies delegated work,
-// pushes, and opens or updates the PR itself. A local commit or pushed branch
-// with no required PR is not completion. (#90)
-const completionContract = "Delegate implementation, research, and review to sub-agents, but you own completion: integrate and verify their work, push the branch, and open or update the pull request yourself — never stop at a local commit or branch when a pull request is required."
+// completionContract states that the coordinator owns local validation and
+// publication, while external verification remains operator-owned after the
+// coordinator exits. (#90)
+const completionContract = "Delegate implementation, research, and review to sub-agents, but you own completion: integrate their work, run relevant local validation, commit and push the run branch, and open or update the pull request yourself. Once local validation passes, finish when the work is published; do not wait for external verification, CI/checks, human review, or AI review — the operator observes the pull request after you exit. Never stop at a local commit or branch when a pull request is required."
+
+// localValidationContract makes clear that the handoff does not reduce
+// validation of the integrated changes to an optional delegated check.
+const localValidationContract = "Before declaring changes complete, run relevant local validation against the integrated work; delegated checks alone do not replace this. If the validation fails, fix the failures before publishing; report needs_decision only for an actual decision that requires a human."
 
 // publicationContract names the run branch as the only place work may be
 // published, so a coordinator or delegate never opens or pushes work from a
@@ -170,9 +173,9 @@ func Goal(run *courierv1alpha1.CoderRun) (string, error) {
 	}
 	switch run.Spec.Mode {
 	case courierv1alpha1.ModeResolveIssue:
-		return fmt.Sprintf("Open a PR to address issue #%d and drive it to a review-ready state with CI green. %s %s%s %s", run.Spec.Ref, forgeContract, completionContract, publication, fmt.Sprintf(outcomeContract, outcomeFile)), nil
+		return fmt.Sprintf("Open a PR to address issue #%d. %s %s %s%s %s", run.Spec.Ref, forgeContract, completionContract, localValidationContract, publication, fmt.Sprintf(outcomeContract, outcomeFile)), nil
 	case courierv1alpha1.ModeFixPR:
-		return fmt.Sprintf("Take over PR #%d. Inspect the current pull request state, CI/checks, and review feedback to determine what's blocking it, then return it to a review-ready state. %s %s%s %s", run.Spec.Ref, forgeContract, completionContract, publication, fmt.Sprintf(outcomeContract, outcomeFile)), nil
+		return fmt.Sprintf("Take over PR #%d. Inspect the current pull request state, CI/checks, and existing review feedback to determine what work is needed; address feedback already present without repeatedly searching for new reviews. %s %s %s%s %s", run.Spec.Ref, forgeContract, completionContract, localValidationContract, publication, fmt.Sprintf(outcomeContract, outcomeFile)), nil
 	default:
 		return "", fmt.Errorf("%w: %q", ErrInvalidMode, run.Spec.Mode)
 	}

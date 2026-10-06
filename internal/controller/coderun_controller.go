@@ -644,7 +644,12 @@ func (r *CoderRunReconciler) observeVerifying(ctx context.Context, run *courierv
 		// case for a human.
 		return r.transitionTerminal(ctx, run, courierv1alpha1.PhaseDone, pr, terminalLifecycleIntent{}, nil)
 	}
-	if state == observationNeedsHuman || state == observationFailed {
+	if state == observationFailed {
+		// CI failure is retryable source work, not a human-blocked run. The
+		// source adapter applies its retry policy to the failed lifecycle report.
+		return r.transitionTerminal(ctx, run, courierv1alpha1.PhaseFailed, pr, terminalLifecycleIntent{}, nil)
+	}
+	if state == observationNeedsHuman {
 		return r.transitionTerminal(ctx, run, courierv1alpha1.PhaseNeedsHuman, pr, terminalLifecycleIntent{}, nil)
 	}
 	// status.checkFingerprint is the prior all-green candidate: the identity
@@ -835,8 +840,10 @@ func stateForTerminalPhase(phase courierv1alpha1.Phase) source.State {
 	switch phase {
 	case courierv1alpha1.PhaseAwaitingReview:
 		return source.StateInReview
-	case courierv1alpha1.PhaseNeedsHuman, courierv1alpha1.PhaseFailed:
+	case courierv1alpha1.PhaseNeedsHuman:
 		return source.StateNeedsHuman
+	case courierv1alpha1.PhaseFailed:
+		return source.StateInProgress
 	default:
 		return ""
 	}

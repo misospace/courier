@@ -1395,7 +1395,7 @@ func TestBriefResultRetention(t *testing.T) {
 	worker, delegator, cleanupWorker := testWorkerAndDelegator(t)
 	defer cleanupWorker()
 	worker.completeAll = true
-	gateway, _, cleanup := gatewayFor(
+	gateway, mocker, cleanup := gatewayFor(
 		gatewayResponse{body: sse(
 			toolCallChunk(0, "call-1", toolDelegate, `{"id":"b1","role":"coder","objective":"ORIGINAL OBJECTIVE","successCheck":"ok"}`),
 			finishChunk("tool_calls"),
@@ -1422,6 +1422,9 @@ func TestBriefResultRetention(t *testing.T) {
 	result := coordinator.Run(context.Background(), testInvocation())
 	if result.Outcome != executor.OutcomeChanges {
 		t.Fatalf("outcome = %q (%v)", result.Outcome, result.Err)
+	}
+	if len(mocker.calls) != 4 || !strings.Contains(mocker.calls[0].rawBody, "run relevant local validation against the integrated changes yourself") || !strings.Contains(mocker.calls[0].rawBody, "Fix local validation failures before publishing") || !strings.Contains(mocker.calls[0].rawBody, "without waiting for external verification") {
+		t.Fatalf("coordinator prompt does not carry the executor-neutral handoff contract: calls=%d prompt=%q", len(mocker.calls), mocker.calls[0].rawBody)
 	}
 	if len(publisher.plans) != 1 || len(publisher.plans[0].Briefs) != 1 {
 		t.Fatalf("published plan = %+v", publisher.plans)
