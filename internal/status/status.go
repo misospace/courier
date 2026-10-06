@@ -213,9 +213,20 @@ type Heartbeat struct {
 	clock   Clock
 	cadence time.Duration
 
+	coordinatorPodUID string
+
 	mu          sync.Mutex
 	lastWritten time.Time
 	pending     *courierv1alpha1.Heartbeat
+}
+
+// WithCoordinatorPodUID fences every recorded heartbeat to one control
+// incarnation (§6): only a heartbeat whose UID matches the current
+// coordinator pod may reset the consecutive-restart streak or count as fresh
+// for that incarnation.
+func (h *Heartbeat) WithCoordinatorPodUID(uid string) *Heartbeat {
+	h.coordinatorPodUID = uid
+	return h
 }
 
 // NewHeartbeat constructs a coalescing heartbeat reporter. A non-positive
@@ -245,8 +256,9 @@ func (h *Heartbeat) Record(ctx context.Context, kind string) error {
 	}
 	now := h.clock.Now()
 	heartbeat := &courierv1alpha1.Heartbeat{
-		At:   metav1.NewTime(now),
-		Kind: kind,
+		At:                metav1.NewTime(now),
+		Kind:              kind,
+		CoordinatorPodUID: h.coordinatorPodUID,
 	}
 
 	h.mu.Lock()

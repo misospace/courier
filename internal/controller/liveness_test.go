@@ -12,6 +12,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
@@ -83,17 +84,23 @@ func livenessReconciler(c client.Client, src *admissionSource, now time.Time) *C
 
 func withHeartbeat(run *courierv1alpha1.CoderRun, at time.Time) *courierv1alpha1.CoderRun {
 	run.Status.Heartbeat = &courierv1alpha1.Heartbeat{
-		At:   metav1.NewTime(at),
-		Kind: "stream",
+		At:                metav1.NewTime(at),
+		Kind:              "stream",
+		CoordinatorPodUID: run.Name + "-coordinator",
 	}
 	return run
 }
 
 // failingAPIReader is the smallest client.Reader for the live-read failure
-// case: it fails every list, so a missing coordinator must be re-observed,
-// not relaunched.
+// case: it fails every read, so the reap decision and the disappearance
+// backstop must both defer — a failed API read is not evidence of a wedge,
+// of health, or of a loss.
 type failingAPIReader struct {
 	client.Client
+}
+
+func (failingAPIReader) Get(context.Context, client.ObjectKey, client.Object, ...client.GetOption) error {
+	return errors.New("api server unavailable")
 }
 
 func (failingAPIReader) List(context.Context, client.ObjectList, ...client.ListOption) error {
@@ -538,17 +545,18 @@ func TestWedgeChargeDeferredWhenCacheLagsBehindTermination(t *testing.T) {
 	}
 }
 
-func TestWedgeChargedWhenLiveReadConfirmsObjectGone(t *testing.T) {
+func TestWedgeChargeDeferredWhenLiveWorldDisagreesWithCache(t *testing.T) {
 	src := &admissionSource{}
 	run := admissionRun("run", "local", courierv1alpha1.PhaseRunning)
 	withHeartbeat(run, livenessClock.Add(-10*time.Minute))
 	pod := runningCoordinatorPod(run)
-	// The cached pod is old (past the liveness window): a genuine wedge.
+	// The cached pod is old (past the liveness window): the cache calls it a
+	// genuine wedge.
 	pod.CreationTimestamp = metav1.NewTime(livenessClock.Add(-2 * time.Hour))
 	pod.Status.ContainerStatuses[0].State.Running.StartedAt = metav1.NewTime(livenessClock.Add(-10 * time.Minute))
 	cached := phaseClient(t, run, pod)
-	// The API server shows no coordinator: the post-delete re-confirmation
-	// finds the name free, so the charge is taken in place.
+	// The API server shows no coordinator at all: the live world and the
+	// cache disagree about the pod this reconcile would reap.
 	api := phaseClient(t, run)
 	reconciler := livenessReconciler(cached, src, livenessClock)
 	reconciler.APIReader = api
@@ -559,27 +567,56 @@ func TestWedgeChargedWhenLiveReadConfirmsObjectGone(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Reconcile() error = %v", err)
 	}
-	if !result.Requeue {
-		t.Fatalf("Requeue = false, want true; a reaped run must relaunch from its checkpoint")
+	if result.Requeue {
+		t.Fatalf("Requeue = true, want false; a contradictory observation defers, it does not act")
 	}
-	var got corev1.Pod
-	podKey := types.NamespacedName{Name: "run-coordinator", Namespace: "default"}
-	if err := cached.Get(context.Background(), podKey, &got); !apierrors.IsNotFound(err) {
-		t.Fatalf("get pod: %v, want NotFound after reap", err)
+	if result.RequeueAfter != observationRequeueDelay {
+		t.Fatalf("RequeueAfter = %v, want %v; a stale cached snapshot must not authorize a deletion, and the live view alone must not charge a loss the cache has not caught up with", result.RequeueAfter, observationRequeueDelay)
 	}
 	var updated courierv1alpha1.CoderRun
 	if err := cached.Get(context.Background(), admissionKey("run"), &updated); err != nil {
 		t.Fatalf("get run: %v", err)
 	}
-	if updated.Status.Phase != courierv1alpha1.PhaseClaimed {
-		t.Fatalf("phase = %q, want Claimed", updated.Status.Phase)
+	if updated.Status.Phase != courierv1alpha1.PhaseRunning {
+		t.Fatalf("phase = %q, want Running; a contradictory observation must not transition the run", updated.Status.Phase)
 	}
-	if updated.Status.Restarts != 1 {
-		t.Fatalf("restarts = %d, want 1; one physical loss is charged exactly once", updated.Status.Restarts)
+	if updated.Status.Restarts != 0 {
+		t.Fatalf("restarts = %d, want 0; a contradictory observation must not be charged", updated.Status.Restarts)
 	}
-	// A charge taken in place keeps the generic event, no pod-loss reason.
-	if reason := eventReason(t, &eventsOut, string(courierv1alpha1.PhaseClaimed)); reason != "" {
-		t.Fatalf("relaunch event reason = %q, want none; a charge taken in place keeps the generic message", reason)
+	if len(src.transitions) != 0 || len(src.reports) != 0 {
+		t.Fatalf("transitions = %#v, reports = %#v, want none; a deferred decision publishes nothing", src.transitions, src.reports)
+	}
+	if out := eventsOut.String(); out != "" {
+		t.Fatalf("events = %q, want none; a deferred decision emits no relaunch event", out)
+	}
+
+	// Once the informer catches up — both views agree the coordinator is
+	// gone — the disappearance backstop takes the confirmed loss with its
+	// pod-loss cause.
+	caughtUp := phaseClient(t, run)
+	settled := livenessReconciler(caughtUp, src, livenessClock)
+	settled.APIReader = caughtUp
+	settled.Events = reconciler.Events
+
+	result, err = settled.Reconcile(context.Background(), admissionRequest("run"))
+	if err != nil {
+		t.Fatalf("Reconcile() after cache catch-up error = %v", err)
+	}
+	if !result.Requeue {
+		t.Fatalf("Requeue = false, want true; a confirmed-gone loss must relaunch from its checkpoint")
+	}
+	var after courierv1alpha1.CoderRun
+	if err := caughtUp.Get(context.Background(), admissionKey("run"), &after); err != nil {
+		t.Fatalf("get run after cache catch-up: %v", err)
+	}
+	if after.Status.Phase != courierv1alpha1.PhaseClaimed {
+		t.Fatalf("phase = %q, want Claimed; the loss is charged once both views agree", after.Status.Phase)
+	}
+	if after.Status.Restarts != 1 {
+		t.Fatalf("restarts = %d, want 1; one physical loss is charged exactly once", after.Status.Restarts)
+	}
+	if reason := eventReason(t, &eventsOut, string(courierv1alpha1.PhaseClaimed)); reason != podLostEventReason {
+		t.Fatalf("relaunch event reason = %q, want %q; the backstop charges the deferred loss with the pod-loss cause", reason, podLostEventReason)
 	}
 }
 
@@ -700,10 +737,17 @@ func TestWedgeAtCeilingTerminalizesWithoutLiveReConfirmation(t *testing.T) {
 	if _, err := reconciler.Reconcile(context.Background(), admissionRequest("run")); err != nil {
 		t.Fatalf("Reconcile() error = %v", err)
 	}
-	var got corev1.Pod
+	// At the ceiling nothing defers, and nothing is deleted either: the live
+	// object's deletion is already in flight, so the hand-off completes
+	// without re-deleting it. The informer-held cached object is the cache's
+	// artifact, not the operator's target.
+	var surviving corev1.Pod
 	podKey := types.NamespacedName{Name: "run-coordinator", Namespace: "default"}
-	if err := cached.Get(context.Background(), podKey, &got); !apierrors.IsNotFound(err) {
-		t.Fatalf("get pod: %v, want NotFound after reap", err)
+	if err := api.Get(context.Background(), podKey, &surviving); err != nil {
+		t.Fatalf("get pod on the API server: %v, want the terminating object to survive; at the ceiling the hand-off completes without a delete", err)
+	}
+	if surviving.DeletionTimestamp == nil {
+		t.Fatal("deletionTimestamp = nil, want set; the surviving object is the deletion already in flight")
 	}
 	var updated courierv1alpha1.CoderRun
 	if err := cached.Get(context.Background(), admissionKey("run"), &updated); err != nil {
@@ -721,8 +765,8 @@ func TestWedgeAtCeilingTerminalizesWithoutLiveReConfirmation(t *testing.T) {
 	if len(src.reports) != 1 || src.reports[0].Result != source.ResultBlocked {
 		t.Fatalf("reports = %#v, want one blocked report", src.reports)
 	}
-	if src.reports[0].Error != "run requires human intervention" {
-		t.Fatalf("reported error = %q, want the generic needs-human message; a reaped wedge is not pod loss", src.reports[0].Error)
+	if !strings.Contains(src.reports[0].Error, "pod lost") {
+		t.Fatalf("reported error = %q, want the pod-loss cause; the live read confirmed the coordinator object is gone or terminating", src.reports[0].Error)
 	}
 }
 
@@ -1549,4 +1593,364 @@ func eventReason(t *testing.T, eventsOut *bytes.Buffer, phase string) string {
 	}
 	t.Fatalf("no phase.transition event to %q found in %q", phase, eventsOut.String())
 	return ""
+}
+
+// --- §6 decision table: active-operation suppression -----------------------
+
+func workerPodFor(run *courierv1alpha1.CoderRun) *corev1.Pod {
+	worker := runningCoordinatorPod(run)
+	worker.Name = run.Name + "-worker"
+	worker.UID = types.UID(run.Name + "-worker")
+	worker.Spec.Containers[0].Name = "worker"
+	worker.Status.ContainerStatuses[0].Name = "worker"
+	return worker
+}
+
+func withOperation(run *courierv1alpha1.CoderRun, opID, controlUID, workerUID string) *courierv1alpha1.CoderRun {
+	if run.Status.ActiveOperations == nil {
+		run.Status.ActiveOperations = map[string]courierv1alpha1.ActiveOperation{}
+	}
+	run.Status.ActiveOperations[opID] = courierv1alpha1.ActiveOperation{
+		BriefID:           "b1",
+		CoordinatorPodUID: controlUID,
+		WorkerPodUID:      workerUID,
+		DispatchedAt:      metav1.NewTime(livenessClock.Add(-time.Hour)),
+	}
+	return run
+}
+
+func assertNotReaped(t *testing.T, c client.Client, src *admissionSource) {
+	t.Helper()
+	var pod corev1.Pod
+	if err := c.Get(context.Background(), types.NamespacedName{Namespace: "default", Name: "run-coordinator"}, &pod); err != nil {
+		t.Fatalf("get pod: %v, want the coordinator pod to survive; a valid in-flight operation suppresses stall reaping", err)
+	}
+	var updated courierv1alpha1.CoderRun
+	if err := c.Get(context.Background(), admissionKey("run"), &updated); err != nil {
+		t.Fatal(err)
+	}
+	if updated.Status.Phase != courierv1alpha1.PhaseRunning {
+		t.Fatalf("phase = %q, want Running; suppression never transitions the run", updated.Status.Phase)
+	}
+	if updated.Status.Restarts != 0 {
+		t.Fatalf("restarts = %d, want 0; suppression never charges the ceiling", updated.Status.Restarts)
+	}
+	if len(src.transitions) != 0 || len(src.reports) != 0 {
+		t.Fatalf("transitions = %#v, reports = %#v, want none; suppression is not a lifecycle event", src.transitions, src.reports)
+	}
+}
+
+func TestActiveOperationSuppressesStaleHeartbeatReap(t *testing.T) {
+	src := &admissionSource{}
+	run := admissionRun("run", "local", courierv1alpha1.PhaseRunning)
+	// A silent build three hours into a heartbeat-stale run: no stream, no
+	// tool boundary, but one acknowledged in-flight operation.
+	withHeartbeat(run, livenessClock.Add(-3*time.Hour))
+	withOperation(run, "shell.b1.aaaa", "run-coordinator", "run-worker")
+	coordinator := runningCoordinatorPod(run)
+	coordinator.CreationTimestamp = metav1.NewTime(livenessClock.Add(-3 * time.Hour))
+	coordinator.Status.ContainerStatuses[0].State.Running.StartedAt = metav1.NewTime(livenessClock.Add(-3 * time.Hour))
+	worker := workerPodFor(run)
+	worker.CreationTimestamp = coordinator.CreationTimestamp
+	client := phaseClient(t, run, coordinator, worker)
+	reconciler := livenessReconciler(client, src, livenessClock)
+	reconciler.APIReader = client
+
+	result, err := reconciler.Reconcile(context.Background(), admissionRequest("run"))
+	if err != nil {
+		t.Fatalf("Reconcile() error = %v", err)
+	}
+	if result.Requeue || result.RequeueAfter > 0 {
+		t.Fatalf("result = %#v, want no requeue; a valid entry suppresses stall reaping for any duration", result)
+	}
+	assertNotReaped(t, client, src)
+}
+
+func TestInvalidOperationEntriesDoNotSuppressReap(t *testing.T) {
+	for _, tc := range []struct {
+		name        string
+		controlUID  string
+		workerUID   string
+		workerState func(*corev1.Pod)
+	}{
+		{
+			name:       "foreign control incarnation",
+			controlUID: "previous-incarnation-uid",
+			workerUID:  "run-worker",
+		},
+		{
+			name:       "dead worker",
+			controlUID: "run-coordinator",
+			workerUID:  "run-worker",
+			workerState: func(p *corev1.Pod) {
+				p.Status.Phase = corev1.PodFailed
+			},
+		},
+		{
+			name:       "terminating worker",
+			controlUID: "run-coordinator",
+			workerUID:  "run-worker",
+			workerState: func(p *corev1.Pod) {
+				p.Finalizers = []string{"courier.misospace.dev/test"}
+				p.DeletionTimestamp = &metav1.Time{Time: livenessClock.Add(-time.Minute)}
+			},
+		},
+		{
+			name:       "worker shell not running",
+			controlUID: "run-coordinator",
+			workerUID:  "run-worker",
+			workerState: func(p *corev1.Pod) {
+				p.Status.ContainerStatuses[0].State = corev1.ContainerState{
+					Terminated: &corev1.ContainerStateTerminated{ExitCode: 137},
+				}
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			src := &admissionSource{}
+			run := admissionRun("run", "local", courierv1alpha1.PhaseRunning)
+			withHeartbeat(run, livenessClock.Add(-3*time.Hour))
+			withOperation(run, "shell.b1.aaaa", tc.controlUID, tc.workerUID)
+			coordinator := runningCoordinatorPod(run)
+			coordinator.CreationTimestamp = metav1.NewTime(livenessClock.Add(-3 * time.Hour))
+			coordinator.Status.ContainerStatuses[0].State.Running.StartedAt = metav1.NewTime(livenessClock.Add(-3 * time.Hour))
+			worker := workerPodFor(run)
+			worker.CreationTimestamp = coordinator.CreationTimestamp
+			worker.Status.ContainerStatuses[0].State.Running.StartedAt = metav1.NewTime(livenessClock.Add(-3 * time.Hour))
+			if tc.workerState != nil {
+				tc.workerState(worker)
+			}
+			client := phaseClient(t, run, coordinator, worker)
+			reconciler := livenessReconciler(client, src, livenessClock)
+			reconciler.APIReader = client
+
+			result, err := reconciler.Reconcile(context.Background(), admissionRequest("run"))
+			if err != nil {
+				t.Fatalf("Reconcile() error = %v", err)
+			}
+			if !result.Requeue {
+				t.Fatalf("Requeue = false, want true; an invalid entry must not suppress the stale-heartbeat reap")
+			}
+			var updated courierv1alpha1.CoderRun
+			if err := client.Get(context.Background(), admissionKey("run"), &updated); err != nil {
+				t.Fatal(err)
+			}
+			if updated.Status.Restarts != 1 || updated.Status.Phase != courierv1alpha1.PhaseClaimed {
+				t.Fatalf("state = phase %q restarts %d, want the reap charged exactly once", updated.Status.Phase, updated.Status.Restarts)
+			}
+		})
+	}
+}
+
+func TestForeignHeartbeatNeitherResetsNorReaps(t *testing.T) {
+	src := &admissionSource{}
+	run := admissionRun("run", "local", courierv1alpha1.PhaseRunning)
+	run.Status.Restarts = 2
+	// The heartbeat is fresh, but it belongs to the previous incarnation: it
+	// must not reset the streak, and — being stale for this pod — must not
+	// authorize a reap either.
+	run.Status.Heartbeat = &courierv1alpha1.Heartbeat{
+		At:                metav1.NewTime(livenessClock.Add(-2 * time.Minute)),
+		Kind:              "stream",
+		CoordinatorPodUID: "previous-incarnation-uid",
+	}
+	pod := runningCoordinatorPod(run)
+	pod.CreationTimestamp = metav1.NewTime(livenessClock.Add(-3 * time.Hour))
+	pod.Status.ContainerStatuses[0].State.Running.StartedAt = metav1.NewTime(livenessClock.Add(-3 * time.Hour))
+	client := phaseClient(t, run, pod)
+	reconciler := livenessReconciler(client, src, livenessClock)
+	reconciler.APIReader = client
+
+	if _, err := reconciler.Reconcile(context.Background(), admissionRequest("run")); err != nil {
+		t.Fatalf("Reconcile() error = %v", err)
+	}
+	var updated courierv1alpha1.CoderRun
+	if err := client.Get(context.Background(), admissionKey("run"), &updated); err != nil {
+		t.Fatal(err)
+	}
+	if updated.Status.Restarts != 2 {
+		t.Fatalf("restarts = %d, want 2; a previous incarnation's heartbeat never resets the streak", updated.Status.Restarts)
+	}
+	var survived corev1.Pod
+	if err := client.Get(context.Background(), types.NamespacedName{Namespace: "default", Name: "run-coordinator"}, &survived); err != nil {
+		t.Fatalf("get pod: %v, want the current pod to survive; an unattributable heartbeat is not stall evidence", err)
+	}
+}
+
+// --- §6: the delete carries the observed pod's UID -------------------------
+
+// uidRewriteReader models an API server whose coordinator pod still carries
+// the UID this reconcile observed.
+type uidRewriteReader struct {
+	client.Client
+	visibleUID types.UID
+}
+
+func (r uidRewriteReader) Get(ctx context.Context, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+	if err := r.Client.Get(ctx, key, obj, opts...); err != nil {
+		return err
+	}
+	r.rewrite(obj)
+	return nil
+}
+
+func (r uidRewriteReader) List(ctx context.Context, list client.ObjectList, opts ...client.ListOption) error {
+	if err := r.Client.List(ctx, list, opts...); err != nil {
+		return err
+	}
+	if pods, ok := list.(*corev1.PodList); ok {
+		for i := range pods.Items {
+			r.rewrite(&pods.Items[i])
+		}
+	}
+	return nil
+}
+
+func (r uidRewriteReader) rewrite(obj client.Object) {
+	pod, ok := obj.(*corev1.Pod)
+	if !ok || !hasCoordinatorContainer(pod) {
+		return
+	}
+	pod.UID = r.visibleUID
+}
+
+// uidEnforcingClient models the API server's delete-time UID check: a delete
+// whose precondition names a UID the live object no longer has conflicts
+// instead of deleting by name.
+type uidEnforcingClient struct {
+	client.Client
+	preconditions []types.UID
+}
+
+func (c *uidEnforcingClient) Delete(ctx context.Context, obj client.Object, opts ...client.DeleteOption) error {
+	for _, opt := range opts {
+		pre, ok := opt.(client.Preconditions)
+		if !ok || pre.UID == nil {
+			continue
+		}
+		c.preconditions = append(c.preconditions, *pre.UID)
+		stored := &corev1.Pod{}
+		if err := c.Client.Get(ctx, client.ObjectKeyFromObject(obj), stored); err == nil && stored.UID != *pre.UID {
+			return apierrors.NewConflict(schema.GroupResource{Resource: "pods"}, obj.GetName(), errors.New("the pod was replaced between observation and deletion"))
+		}
+	}
+	return c.Client.Delete(ctx, obj, opts...)
+}
+
+func TestReapDeleteConflictsWhenPodWasReplaced(t *testing.T) {
+	src := &admissionSource{}
+	run := admissionRun("run", "local", courierv1alpha1.PhaseRunning)
+	withHeartbeat(run, livenessClock.Add(-3*time.Hour))
+	// The store holds the replacement pod (delete/recreate already happened);
+	// the live read this reconcile makes still observes the old UID.
+	replaced := runningCoordinatorPod(run)
+	replaced.UID = "replacement-uid"
+	replaced.CreationTimestamp = metav1.NewTime(livenessClock.Add(-3 * time.Hour))
+	replaced.Status.ContainerStatuses[0].State.Running.StartedAt = metav1.NewTime(livenessClock.Add(-3 * time.Hour))
+	store := phaseClient(t, run, replaced)
+	enforcing := &uidEnforcingClient{Client: store}
+	reconciler := livenessReconciler(enforcing, src, livenessClock)
+	reconciler.APIReader = uidRewriteReader{Client: store, visibleUID: "run-coordinator"}
+
+	result, err := reconciler.Reconcile(context.Background(), admissionRequest("run"))
+	if err != nil {
+		t.Fatalf("Reconcile() error = %v", err)
+	}
+	if result.Requeue {
+		t.Fatal("Requeue = true, want a bounded re-observation after the conflict")
+	}
+	if result.RequeueAfter != observationRequeueDelay {
+		t.Fatalf("RequeueAfter = %v, want %v; a conflicted delete re-observes instead of acting", result.RequeueAfter, observationRequeueDelay)
+	}
+	if len(enforcing.preconditions) == 0 {
+		t.Fatal("the reap delete carried no UID precondition; a pod must never be deleted by name alone")
+	}
+	var updated courierv1alpha1.CoderRun
+	if err := store.Get(context.Background(), admissionKey("run"), &updated); err != nil {
+		t.Fatal(err)
+	}
+	if updated.Status.Restarts != 0 || updated.Status.Phase != courierv1alpha1.PhaseRunning {
+		t.Fatalf("state = phase %q restarts %d, want no charge; the decision was made on a world that no longer exists", updated.Status.Phase, updated.Status.Restarts)
+	}
+	var survived corev1.Pod
+	if err := store.Get(context.Background(), types.NamespacedName{Namespace: "default", Name: "run-coordinator"}, &survived); err != nil {
+		t.Fatalf("get pod: %v, want the replacement pod to survive the stale decision", err)
+	}
+	if survived.UID != "replacement-uid" {
+		t.Fatalf("pod UID = %q, want the store's own object untouched by the stale decision", survived.UID)
+	}
+}
+
+func TestParallelOperationsRemainProtectedWhenOneCompletes(t *testing.T) {
+	src := &admissionSource{}
+	run := admissionRun("run", "local", courierv1alpha1.PhaseRunning)
+	withHeartbeat(run, livenessClock.Add(-3*time.Hour))
+	// Two parallel subagent operations: one has completed (its entry
+	// cleared), the other is still dispatched. The surviving sibling alone
+	// suppresses stall reaping — a completed sibling's cleared entry neither
+	// protects nor un-protects the run.
+	withOperation(run, "shell.b1.aaaa", "run-coordinator", "run-worker")
+	withOperation(run, "shell.b2.bbbb", "run-coordinator", "run-worker")
+	delete(run.Status.ActiveOperations, "shell.b1.aaaa")
+	coordinator := runningCoordinatorPod(run)
+	coordinator.CreationTimestamp = metav1.NewTime(livenessClock.Add(-3 * time.Hour))
+	coordinator.Status.ContainerStatuses[0].State.Running.StartedAt = metav1.NewTime(livenessClock.Add(-3 * time.Hour))
+	worker := workerPodFor(run)
+	worker.CreationTimestamp = coordinator.CreationTimestamp
+	client := phaseClient(t, run, coordinator, worker)
+	reconciler := livenessReconciler(client, src, livenessClock)
+	reconciler.APIReader = client
+
+	result, err := reconciler.Reconcile(context.Background(), admissionRequest("run"))
+	if err != nil {
+		t.Fatalf("Reconcile() error = %v", err)
+	}
+	if result.Requeue || result.RequeueAfter > 0 {
+		t.Fatalf("result = %#v, want no requeue; the surviving operation suppresses stall reaping", result)
+	}
+	assertNotReaped(t, client, src)
+}
+
+// TestCacheDisagreementAtCeilingHandsOffWithPodLossCause pins the at-ceiling
+// branch of the cache-disagreement defer: the API server confirms the
+// coordinator object is gone while the cache still shows it live, so the
+// NeedsHuman hand-off completes in this reconcile carrying the pod-loss
+// cause — and nothing is deleted, because there is nothing left to delete.
+func TestCacheDisagreementAtCeilingHandsOffWithPodLossCause(t *testing.T) {
+	src := &admissionSource{}
+	run := admissionRun("run", "local", courierv1alpha1.PhaseRunning)
+	withHeartbeat(run, livenessClock.Add(-3*time.Hour))
+	run.Status.Restarts = 3
+	// The cache still holds a live-looking coordinator; the API server has
+	// no coordinator at all: the live world wins and the object is gone.
+	pod := runningCoordinatorPod(run)
+	pod.CreationTimestamp = metav1.NewTime(livenessClock.Add(-3 * time.Hour))
+	pod.Status.ContainerStatuses[0].State.Running.StartedAt = metav1.NewTime(livenessClock.Add(-3 * time.Hour))
+	cached := phaseClient(t, run, pod)
+	api := phaseClient(t, run)
+	reconciler := livenessReconciler(cached, src, livenessClock)
+	reconciler.APIReader = api
+
+	if _, err := reconciler.Reconcile(context.Background(), admissionRequest("run")); err != nil {
+		t.Fatalf("Reconcile() error = %v", err)
+	}
+	var updated courierv1alpha1.CoderRun
+	if err := cached.Get(context.Background(), admissionKey("run"), &updated); err != nil {
+		t.Fatal(err)
+	}
+	if updated.Status.Phase != courierv1alpha1.PhaseNeedsHuman {
+		t.Fatalf("phase = %q, want NeedsHuman; at the ceiling the hand-off completes without deferring", updated.Status.Phase)
+	}
+	if updated.Status.Restarts != 3 {
+		t.Fatalf("restarts = %d, want 3 (the ceiling is not re-incremented)", updated.Status.Restarts)
+	}
+	if len(src.transitions) != 1 || src.transitions[0] != source.StateNeedsHuman {
+		t.Fatalf("transitions = %#v, want [needs-human]", src.transitions)
+	}
+	if len(src.reports) != 1 || src.reports[0].Result != source.ResultBlocked {
+		t.Fatalf("reports = %#v, want one blocked report", src.reports)
+	}
+	if !strings.Contains(src.reports[0].Error, "pod lost") {
+		t.Fatalf("reported error = %q, want the pod-loss cause; the live read confirmed the coordinator object is gone", src.reports[0].Error)
+	}
 }

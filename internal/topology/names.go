@@ -148,12 +148,20 @@ const (
 const (
 	EnvPodNamespace = "POD_NAMESPACE"
 
-	EnvRunUID        = "COURIER_RUN_UID"
+	EnvRunUID = "COURIER_RUN_UID"
+	// EnvControlPodUID carries the minted control-incarnation identifier that
+	// the signed worker protocol binds envelopes to. It is not the pod's
+	// Kubernetes UID.
 	EnvControlPodUID = "COURIER_CONTROL_POD_UID"
-	EnvWorkerPodUID  = "COURIER_WORKER_POD_UID"
-	EnvWorkerPodName = "COURIER_WORKER_POD_NAME"
-	EnvBrokerPodName = "COURIER_BROKER_POD_NAME"
-	EnvBrokerPodUID  = "COURIER_BROKER_POD_UID"
+	// EnvControlKubeUID carries the control pod's own Kubernetes UID via
+	// downward API. It fences every trusted status write: the broker compares
+	// it against the TokenReview's pod UID, and the operator compares it
+	// against the live coordinator pod's UID.
+	EnvControlKubeUID = "COURIER_CONTROL_POD_KUBE_UID"
+	EnvWorkerPodUID   = "COURIER_WORKER_POD_UID"
+	EnvWorkerPodName  = "COURIER_WORKER_POD_NAME"
+	EnvBrokerPodName  = "COURIER_BROKER_POD_NAME"
+	EnvBrokerPodUID   = "COURIER_BROKER_POD_UID"
 
 	EnvWorkerPublicKey = "COURIER_WORKER_PUBLIC_KEY"
 	EnvWorkerURL       = "COURIER_WORKER_URL"
