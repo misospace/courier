@@ -871,7 +871,6 @@ func stateForTerminalPhase(phase courierv1alpha1.Phase, runMode courierv1alpha1.
 	default:
 		return ""
 	}
-	return ""
 }
 
 // setLifecycleReport records the terminal lifecycle-report condition on the run
