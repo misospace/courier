@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"os"
@@ -12,6 +13,10 @@ import (
 	courierv1alpha1 "github.com/misospace/courier/api/v1alpha1"
 	"github.com/misospace/courier/internal/controller"
 	"github.com/misospace/courier/internal/source/dispatch"
+	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
+	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 )
 
 type observerWithHeadResolver struct{}
@@ -172,5 +177,99 @@ func TestBuildSecureControlRequiresObserverCredential(t *testing.T) {
 		runNamespace:  "runs",
 	}); err == nil || !strings.Contains(err.Error(), "observer") {
 		t.Fatalf("secure mode without an admission-read identity must fail startup, got %v", err)
+	}
+}
+
+func TestLoadEvidenceKey(t *testing.T) {
+	const keyValue = "a-test-hmac-key-of-some-length"
+
+	tests := []struct {
+		name       string
+		namespace  string
+		secretName string
+		data       map[string][]byte // nil: no Secret in the namespace
+		want       []byte
+		wantErr    string // substring required in the error
+	}{
+		{
+			name:       "happy path",
+			namespace:  "courier-system",
+			secretName: "courier-evidence-key",
+			data:       map[string][]byte{"key": []byte(keyValue)},
+			want:       []byte(keyValue),
+		},
+		{
+			name:       "secret missing",
+			namespace:  "courier-system",
+			secretName: "courier-evidence-key",
+			wantErr:    "not found",
+		},
+		{
+			name:       "no key entry",
+			namespace:  "courier-system",
+			secretName: "courier-evidence-key",
+			data:       map[string][]byte{"other": []byte("not-the-key")},
+			wantErr:    `no non-empty "key" entry`,
+		},
+		{
+			name:       "whitespace-only key",
+			namespace:  "courier-system",
+			secretName: "courier-evidence-key",
+			data:       map[string][]byte{"key": []byte("   ")},
+			wantErr:    `no non-empty "key" entry`,
+		},
+		{
+			name:       "empty namespace",
+			namespace:  "",
+			secretName: "courier-evidence-key",
+			data:       map[string][]byte{"key": []byte(keyValue)},
+			wantErr:    "POD_NAMESPACE",
+		},
+		{
+			name:       "empty name",
+			namespace:  "courier-system",
+			secretName: "",
+			data:       map[string][]byte{"key": []byte(keyValue)},
+			wantErr:    "name is required",
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			scheme := runtime.NewScheme()
+			if err := corev1.AddToScheme(scheme); err != nil {
+				t.Fatalf("add core scheme: %v", err)
+			}
+			builder := fake.NewClientBuilder().WithScheme(scheme)
+			if test.data != nil {
+				builder = builder.WithRuntimeObjects(&corev1.Secret{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:      "courier-evidence-key",
+						Namespace: "courier-system",
+					},
+					Data: test.data,
+				})
+			}
+			fakeClient := builder.Build()
+
+			got, err := loadEvidenceKey(context.Background(), fakeClient, test.namespace, test.secretName)
+			if test.wantErr != "" {
+				if err == nil {
+					t.Fatalf("loadEvidenceKey() error = nil, want error mentioning %q", test.wantErr)
+				}
+				if !strings.Contains(err.Error(), test.wantErr) {
+					t.Fatalf("loadEvidenceKey() error = %q, want it to mention %q", err, test.wantErr)
+				}
+				if strings.Contains(err.Error(), keyValue) {
+					t.Fatalf("loadEvidenceKey() error = %q must not contain the key value", err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("loadEvidenceKey() error = %v", err)
+			}
+			if !bytes.Equal(got, test.want) {
+				t.Fatalf("loadEvidenceKey() = %q, want %q", got, test.want)
+			}
+		})
 	}
 }

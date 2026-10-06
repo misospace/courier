@@ -69,24 +69,34 @@ failed run's unrecoverable workspace state — uncommitted edits, local commits
 not on the run branch — as Kubernetes Secrets owned by the `CoderRun`. The
 mechanism is invisible when disabled.
 
-This section documents the designed behavior; it lands with the #197–#202
-implementation issues and nothing here exists until they ship. The design
-contract is in DESIGN.md § "Failure evidence for dirty runs (#115)".
+The design contract is in DESIGN.md § "Failure evidence for dirty runs
+(#115)". The coordinator-pod wiring (#199) is implemented: with the intake
+key and service configured, coordinator pods receive the evidence URL, a
+per-incarnation token and nonce, their pod UID, and a 45-second termination
+grace. The intake listener (#200) and executor capture (#197/#198) are not
+implemented, so nothing is persisted until they ship; with either setting
+empty the mechanism is invisible.
 
-Enable it with three settings on the operator (all not yet implemented):
+Enable it with three settings on the operator:
 
 - `--evidence-intake-bind` (for example `:8082`): binds the write-only intake
   listener. Empty disables evidence capture entirely. The chart renders the
   `courier-evidence` ClusterIP Service that coordinator pods reach it on;
   optionally restrict its ingress to coordinator pods with a NetworkPolicy.
+  Lands with #200.
 - `--evidence-intake-key-secret`: name of a Secret in the operator namespace
-  whose key holds a random HMAC key (for example
-  `openssl rand -hex 32`). The operator derives each run's evidence token from
-  this key, the run's identity, and a per-incarnation nonce, so a token is
-  valid only for the incarnation it was minted for; rotating the key
-  invalidates tokens of runs in flight until their next relaunch.
-- `--evidence-intake-service` (optional override): the URL coordinators are
-  told to POST to, derived from the chart Service by default.
+  whose `key` entry holds a random HMAC key (for example
+  `openssl rand -hex 32`). The operator derives each run's evidence token
+  from this key, the run's identity, and a per-incarnation nonce, so a token
+  is valid only for the incarnation it was minted for; rotating the key
+  invalidates tokens of runs in flight until their next relaunch. The operator
+  loads the key once at startup, so a rotation takes effect when the operator
+  restarts. The operator fails closed at startup when this is configured and
+  the Secret or its `key` entry is missing.
+- `--evidence-intake-service`: the URL coordinators are told to POST to.
+  Wiring coordinator pods requires it together with
+  `--evidence-intake-key-secret`; deriving a default from the chart Service
+  lands with #200.
 
 The operator requires `create/get/list/patch/delete` on `secrets` in its
 namespaces to persist bundles and derive the `EvidenceCaptured` condition (see

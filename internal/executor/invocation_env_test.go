@@ -71,7 +71,7 @@ func TestInvocationFromEnvRejectsBrokenContext(t *testing.T) {
 // same values either way, so the env contract stays one contract.
 func TestEnvironmentWithConfigCarriesRunContext(t *testing.T) {
 	inv := Invocation{RunName: "r", Namespace: "n", Ref: 1, Goal: "g", Model: "m", Workspace: "/w", Mode: courierv1alpha1.ModeResolveIssue}
-	full := EnvironmentWithConfig(inv, "opencode", "url", "base", "main", "bin", "json", "term", "agent")
+	full := EnvironmentWithConfig(inv, "opencode", "url", "base", "main", "bin", "json", "term", "agent", "", "")
 	seen := map[string]string{}
 	for _, env := range full {
 		seen[env.Name] = env.Value
