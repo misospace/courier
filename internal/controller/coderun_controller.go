@@ -605,11 +605,12 @@ func (r *CoderRunReconciler) observeRunning(ctx context.Context, run *courierv1a
 		return result, nil
 	}
 	// Liveness reaps a live pod whose activity went silent, and its requeue
-	// (the stuck-terminating case) is propagated, not dropped. Pod loss needs
-	// no heartbeat at all: there is no pod left to heartbeat from, so the
-	// backstop is checked independently of the heartbeat's state — legacy
-	// pods never write one. The backstop covers both a missing coordinator
-	// and one the cache can only see as an unobservable dead object.
+	// (the stuck-terminating and deferred-charge cases) is propagated, not
+	// dropped. Pod loss needs no heartbeat at all: there is no pod left to
+	// heartbeat from, so the backstop is checked independently of the
+	// heartbeat's state — legacy pods never write one. The backstop covers
+	// both a missing coordinator and one the cache can only see as an
+	// unobservable dead object.
 	if result.RequeueAfter > 0 || result.Requeue {
 		return result, nil
 	}

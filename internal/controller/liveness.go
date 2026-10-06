@@ -72,16 +72,22 @@ func (r *CoderRunReconciler) maxRestarts() int {
 // server before it charges the same ceiling-bounded relaunch. A pod that
 // exists and went silent is reaped here.
 //
-// A confirmed reap increments the crashloop counter, with one exception:
-// once the counter has reached the threshold (Restarts >= maxRestarts) the
-// run transitions to NeedsHuman with the counter left at the ceiling,
-// instead of relaunched again. At the ceiling an unrecoverable coordinator —
-// a terminal-phase object with no recorded termination status — is
-// preserved, not deleted: the NeedsHuman hand-off keeps the only record of
-// the cause, exactly as the disappearance backstop. Below the ceiling the
-// run returns to Claimed so the next reconcile relaunches and resumes it.
-// The second return value reports whether liveness took action, so the
-// caller can stop further pod observation.
+// A confirmed reap increments the crashloop counter, with two exceptions.
+// Below the ceiling every delete is re-confirmed against the API server
+// before the counter is charged: a reap whose re-confirmation finds the
+// object gone charges in place, and a coordinator object that survives the
+// live read defers the charge, which the disappearance backstop takes once
+// the name is provably free, carrying its pod-loss cause. At the ceiling
+// nothing defers: the hand-off completes in this reconcile. Once the
+// counter has reached the threshold (Restarts >= maxRestarts) the run
+// transitions to NeedsHuman with the counter left at the ceiling, instead of
+// relaunched again. At the ceiling an unrecoverable coordinator — a
+// terminal-phase object with no recorded termination status — is preserved,
+// not deleted: the NeedsHuman hand-off keeps the only record of the cause,
+// exactly as the disappearance backstop. Below the ceiling the run returns
+// to Claimed so the next reconcile relaunches and resumes it. The second
+// return value reports whether liveness took action, so the caller can stop
+// further pod observation.
 func (r *CoderRunReconciler) checkLiveness(ctx context.Context, run *courierv1alpha1.CoderRun, pods []corev1.Pod) (ctrl.Result, bool, error) {
 	if run.Status.Heartbeat == nil {
 		return ctrl.Result{}, false, nil
@@ -134,7 +140,6 @@ func (r *CoderRunReconciler) checkLiveness(ctx context.Context, run *courierv1al
 	missing := true
 	deleted := false
 	preserved := false
-	deletedUnrecoverableCoordinator := false
 	for i := range pods {
 		pod := &pods[i]
 		if !podBelongsToRun(pod, run) {
@@ -162,8 +167,6 @@ func (r *CoderRunReconciler) checkLiveness(ctx context.Context, run *courierv1al
 			return ctrl.Result{}, false, err
 		}
 		deleted = true
-		deletedUnrecoverableCoordinator = deletedUnrecoverableCoordinator ||
-			hasCoordinatorContainer(pod) && coordinatorPodUnrecoverable(pod)
 	}
 	if missing {
 		// No pod belongs to the run at all. The absence is not decided here:
@@ -172,12 +175,20 @@ func (r *CoderRunReconciler) checkLiveness(ctx context.Context, run *courierv1al
 		// relaunch.
 		return ctrl.Result{}, false, nil
 	}
-	// A delete is not a disappearance here either: when the wedged pod was
-	// an unobservable dead coordinator, the charge waits for the live read
-	// to show the name free; the deferred loss is then charged by the
-	// disappearance backstop, which confirms it against the API server and
-	// carries its pod-loss cause.
-	if deletedUnrecoverableCoordinator {
+	// A delete is not a disappearance: below the ceiling every delete here
+	// is re-confirmed against the API server before the wedge is counted.
+	// The cached view can lag the server's write: a coordinator a sibling
+	// reconcile already deleted (and already charged) can still be visible
+	// with no deletion timestamp, and Delete on a terminating object
+	// succeeds without deleting anything — so a no-op delete must not
+	// charge a second wedge for one physical loss. A coordinator object
+	// that survives the live read, terminating or not, defers the charge:
+	// the disappearance backstop takes the deferred loss once the name is
+	// provably free, confirming against the API server and carrying its
+	// pod-loss cause. A failed read is not evidence the name is free and
+	// defers the same way. At the ceiling there is no charge to defer: the
+	// hand-off terminalizes in this reconcile.
+	if deleted && !atCeiling {
 		present, err := r.coordinatorObjectPresentLive(ctx, run)
 		if err != nil || present {
 			return ctrl.Result{RequeueAfter: observationRequeueDelay}, true, nil
@@ -196,10 +207,11 @@ func (r *CoderRunReconciler) checkLiveness(ctx context.Context, run *courierv1al
 
 	// A confirmed wedge is the same infrastructure loss as a vanished pod,
 	// so it takes the shared relaunch path and its restart ceiling. A reaped
-	// wedge carries no reason: the pod-loss cause is published only by the
-	// disappearance backstop, which confirms the loss against the API
-	// server, so a reaped wedge keeps the generic message in both the event
-	// stream and the ceiling hand-off.
+	// wedge charged in place carries no reason: the pod-loss cause is
+	// published only by the disappearance backstop, which confirms the loss
+	// against the API server, so a reaped wedge keeps the generic message in
+	// both the event stream and the ceiling hand-off; a deferred charge
+	// arrives with the backstop's pod-loss cause.
 	result, err := r.relaunchAfterInfraLoss(ctx, run, "", "")
 	return result, true, err
 }
@@ -317,7 +329,9 @@ func (r *CoderRunReconciler) observeMissingCoordinator(ctx context.Context, run 
 // The relaunch event carries the caller's event reason when it is
 // non-empty, so a pod loss and a reaped wedge are distinguishable in the
 // event stream: the event reason names the event, the ceiling error names
-// the accumulation.
+// the accumulation. A deferred wedge charge arrives through the
+// disappearance backstop and carries its pod-loss reason; only a wedge
+// charged in place keeps the generic event.
 func (r *CoderRunReconciler) relaunchAfterInfraLoss(ctx context.Context, run *courierv1alpha1.CoderRun, reason, eventReason string) (ctrl.Result, error) {
 	if run.Status.Restarts >= r.maxRestarts() {
 		// The ceiling is reached: hand the run to a human instead of
