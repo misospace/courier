@@ -587,7 +587,10 @@ contract. The coordinator validates delegated results against the integrated
 work and runs relevant local checks itself, fixing failures before declaring completion.
 Once local validation passes and publication succeeds, the operator owns external
 verification of the pull request and CI. The coordinator publishes
-through the broker, never through a worker.
+through the broker, never through a worker. Completed briefs may publish before
+control returns; local validation therefore runs on a freshly materialized
+snapshot of the published integration head before declaring completion, not as
+a claim that every publication was preceded by coordinator validation.
 
 **Spawn brief schema and authenticated worker protocol.** Each delegation is a
 typed brief carrying a stable `briefID` (unique within the run), objective,

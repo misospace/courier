@@ -966,8 +966,10 @@ there is no delete verb because active runs reference lanes. (#73)
 - **Verifying** — no coordinator pod or liveness meaning. The operator polls
   the external PR and CI world indefinitely, with a reconciliation cadence and
   no deadline. Observer errors remain Verifying and requeue. A missing observer
-  or missing/draft PR reaches **NeedsHuman**; a failed check reaches **Failed**
-  so sources can apply their failure policy. Queue-backed PR-fix sources issue
+  or missing/draft PR reaches **NeedsHuman**. A failed check on a fix-pr run
+  reaches **Failed** so its source can apply its retry policy. Resolve-issue
+  runs remain **Verifying** on red checks so the original issue can still reach
+  review after a follow-up repairs the PR. Queue-backed PR-fix sources issue
   another attempt under their existing cap. A PR with no checks or pending
   checks remains **Verifying**; the PR is persisted. Green is declared
   only from **two consecutive all-green observations of the same check set**:
@@ -981,8 +983,8 @@ there is no delete verb because active runs reference lanes. (#73)
   it the same way. A partial snapshot cannot pass. The source becomes
   `in-review` with the transition. Verifying does not consume LaneProfile
   execution capacity; the source remains `in-progress` while polling, publishes
-  `in-review` after stable green observations, and receives `failed` if checks
-  turn red.
+  `in-review` after stable green observations. Fix-pr attempts receive `failed`
+  if checks turn red; initial issue observers remain active without lane capacity.
 - **AwaitingReview** is terminal for this run. For a PR, human merges → operator
   marks **Done** and resolves the source; feedback/conflict → the source spawns a
   fresh `fix-pr` run without reusing the previous run. A `no_change_needed`
@@ -1412,8 +1414,9 @@ was superseded.
 - **2026-10-06 — external verification belongs to the operator.** A coordinator
   validates integrated work locally, publishes it, and completes; CI and review
   observation remain in the operator's `Verifying` phase. A red CI observation
-  ends the run as `Failed` instead of parking it as `NeedsHuman`; sources apply
-  their own failure policy. Dispatch's failed report performs the retry/cap
+  ends a fix-pr attempt as `Failed` instead of parking it as `NeedsHuman`;
+  initial issue runs keep observing so later repairs can advance the original
+  issue. Sources apply their own failure policy. Dispatch's failed report performs the retry/cap
   decision for queue-backed PR-fix work, so Courier must not send a second
   `BLOCKED` mark for the same now-advanced generation.
 - **2026-09-30 — #169/#175: declare outcomes outside the worktree; never settle
