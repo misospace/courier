@@ -150,7 +150,7 @@ func run(ctx context.Context, config runConfig) error {
 	if err != nil {
 		return fmt.Errorf("courier-broker: git transport rejected the pinned policy: %w", err)
 	}
-	engine, err := broker.NewPolicyEngine(policy, adapter, pusher)
+	engine, err := broker.NewPolicyEngineWithSnapshotter(policy, adapter, pusher, pusher)
 	if err != nil {
 		return fmt.Errorf("courier-broker: policy engine rejected the pinned policy: %w", err)
 	}
@@ -179,6 +179,7 @@ func run(ctx context.Context, config runConfig) error {
 		Policy:        engine,
 		Authenticator: authenticator,
 		Importer:      gitBroker,
+		Snapshot:      engine,
 		ScratchDir:    config.scratchDir,
 		TLSCertFile:   config.certFile,
 		TLSKeyFile:    config.keyFile,

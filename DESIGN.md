@@ -1206,6 +1206,47 @@ named items remain unresolved and must not be described as production-ready:
 
 ## Decisions
 
+- **2026-10-05 — #125: worker artifacts are validated and integrated in
+  trusted control, and publication flows through the broker.** The §5
+  contract is implemented as written: a returned artifact is a git bundle
+  validated in order — `bundle verify` against the private tree, fixed
+  bounds (64 MiB bundle, 64 MiB unpacked, 10⁵ objects, 16 MiB per blob)
+  applied to every delivered object in a quarantine object dir, exact
+  ref-set equality on `refs/courier/briefs/<briefID>`, refless import,
+  exact dispatched-base-tip ancestry, and the operator-resolved path scope
+  (none is resolved yet, so the whole repository is in scope). Integration
+  commits exactly one control-authored commit per brief; publication sends
+  a full-closure bundle to the broker's `/v1/bundles/import` (now a raw
+  body with OID headers, so the settled 64 MiB bound fits the wire) and
+  then `/v1/publication`, whose independent policy enforcement and
+  post-push observation decide the outcome. Remote-claimed OIDs (broker
+  headers, bundle advertisements, model data) never reach a git argument
+  as raw request data: every tip that enters a trusted git call is either
+  resolved locally from hash-verified objects or rebuilt byte-by-byte
+  from verified hex at the git boundary (`git.canonicalOID`), and claimed
+  values are otherwise only cross-checked against those local facts. The worker's sanitized snapshot is rendered from
+  control's integration tree, seeded per
+  incarnation through a new broker snapshot endpoint (the broker bundles
+  the live pinned work ref — or the base ref when the work ref was admitted
+  absent), so crash recovery reconstructs from the remote and a crash after
+  a confirmed push is an idempotent no-op, never a duplicate publication. A
+  foreign work tip is classified NeedsHuman and never adopted or rebased
+  onto; a base advance is re-synced with a merge and retried. The brief
+  failure path stays fail-closed in both directions: only a sub-agent
+  session that reached its terminal final result enters the pack,
+  integrate, and publish chain (a failed or truncated session's partial
+  commits stay untrusted worker data and the failure is the tool-visible
+  result), a rejected artifact burns the brief ID, the fixed rejection
+  category is the only tool-visible diagnostic. A declared-changes outcome
+  with nothing integrated beyond the seed-time tip is classified by world
+  evidence, never by the live OID: a seed at the admission anchor (or a
+  work ref absent at seed) is no-work, a seed beyond the anchor is the
+  crash-after-push case that the broker confirms idempotently without a
+  duplicate push while it holds the trusted evidence, and a broker that
+  cannot vouch for the seeded tip blocks the run — ownership is never
+  inferred from the live world.
+  Forge reads and PR creation are still unwired on the native path (#127's
+  terminal contract); CR status wiring remains #126. (#125)
 - **2026-10-04 — #124: the native model client is implemented in
   `internal/harness`; publication and artifact integration remain #125.**
   Trusted control normalizes every provider stream into the fixed §5
@@ -1222,9 +1263,7 @@ named items remain unresolved and must not be described as production-ready:
   commands only to the untrusted worker over the signed protocol — the
   control pod has no local execution path for them — and the `Publisher`
   seam is reachable only from the coordinator's own finish path, so subagent
-  results can never publish. Until #125 lands, secure runs report
-  `publication` unavailable and exit NeedsHuman before consuming model
-  tokens. (#124, #123)
+  results can never publish. (#124, #123)
 - **2026-10-04 — Deployment-managed LaneProfiles are bootstrapped by the
   manager, not applied beside the release.** A GitOps consumer cannot safely
   put a LaneProfile in the same apply/render set that installs Courier's CRD —

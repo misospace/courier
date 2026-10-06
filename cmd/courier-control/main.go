@@ -19,6 +19,7 @@ import (
 	"fmt"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"syscall"
 	"time"
 
@@ -111,8 +112,8 @@ func runArgs(args []string) error {
 		Bindings:           bindings,
 		Broker:             identity.brokerProber(),
 		Mode:               string(invocation.Mode),
-		PublicationPresent: false, // the publisher lands with #125
-		SnapshotPresent:    false, // the snapshot provider lands with #125
+		PublicationPresent: true, // the publisher is wired below (#125)
+		SnapshotPresent:    true, // the snapshot provider is wired below (#125)
 		ProbeWorker: func(probeCtx context.Context) harness.Capability {
 			return identity.probeWorker(probeCtx)
 		},
@@ -142,13 +143,28 @@ func runArgs(args []string) error {
 	}
 	fmt.Printf("capability health: %s\n", mustJSON(caps))
 
+	// The trusted integration tree and publication engine (#125): the tree
+	// lives in the control pod's private workspace, is seeded from the
+	// broker's live observation, and owns the one-commit-per-brief cadence.
+	// The scope is the operator-resolved path policy; absent an operator
+	// resolution the whole repository is in scope — there are no default
+	// path filters.
+	integrator := harness.NewIntegrator(
+		filepath.Join(topology.ControlWorkspacePath, "integration"), nil)
+	engine, err := harness.NewPublicationEngine(identity.brokerClient(), integrator)
+	if err != nil {
+		return fmt.Errorf("courier-control: publication engine: %w", err)
+	}
+
 	// The coordinator loop. It is interrupted by pod termination (context),
 	// not by any wall-clock run limit.
 	coordinator, err := harness.NewCoordinator(harness.CoordinatorConfig{
-		Gateway:  gateway,
-		Bindings: bindings,
-		Worker:   identity.delegator(),
-		Activity: nil, // earned-activity status wiring is #126's seam
+		Gateway:   gateway,
+		Bindings:  bindings,
+		Worker:    identity.delegator(),
+		Snapshot:  engine.PrepareSnapshot,
+		Publisher: engine,
+		Activity:  nil, // earned-activity status wiring is #126's seam
 	})
 	if err != nil {
 		return fmt.Errorf("courier-control: %w", err)
@@ -301,6 +317,11 @@ func (i *controlIdentity) delegator() *harness.Delegator {
 // brokerProber reaches the broker's typed capability report over TLS.
 func (i *controlIdentity) brokerProber() *harness.BrokerProbeClient {
 	return &harness.BrokerProbeClient{BaseURL: i.brokerURL, Token: i.brokerToken, CA: i.brokerCA}
+}
+
+// brokerClient reaches the broker's typed publication API over TLS.
+func (i *controlIdentity) brokerClient() *harness.BrokerClient {
+	return &harness.BrokerClient{BaseURL: i.brokerURL, Token: i.brokerToken, CA: i.brokerCA}
 }
 
 // probeWorker exercises the signed worker protocol end to end: snapshot

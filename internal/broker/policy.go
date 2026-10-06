@@ -98,24 +98,40 @@ type PublicationResult struct {
 }
 
 type PolicyEngine struct {
-	mu       sync.Mutex
-	policy   Policy
-	observer Observer
-	pusher   Pusher
+	mu          sync.Mutex
+	policy      Policy
+	observer    Observer
+	pusher      Pusher
+	snapshotter Snapshotter
 	// confirmed is the single exact tip confirmed by this process. It is not
 	// durable evidence: after restart, only the admission anchor is trusted.
 	confirmed string
 }
 
 // NewPolicyEngine fails closed when any required provider capability is absent.
+// The snapshotter is optional at construction; a snapshot request without one
+// fails closed at request time.
 func NewPolicyEngine(policy Policy, observer Observer, pusher Pusher) (*PolicyEngine, error) {
+	return newPolicyEngine(policy, observer, pusher, nil)
+}
+
+// NewPolicyEngineWithSnapshotter wires the seed-snapshot capability beside
+// the publication engine.
+func NewPolicyEngineWithSnapshotter(policy Policy, observer Observer, pusher Pusher, snapshotter Snapshotter) (*PolicyEngine, error) {
+	if snapshotter == nil {
+		return nil, errors.New("publication policy: snapshotter is required")
+	}
+	return newPolicyEngine(policy, observer, pusher, snapshotter)
+}
+
+func newPolicyEngine(policy Policy, observer Observer, pusher Pusher, snapshotter Snapshotter) (*PolicyEngine, error) {
 	if observer == nil || pusher == nil {
 		return nil, errors.New("publication policy: observer and normal pusher capabilities are required")
 	}
 	if err := validatePolicy(policy); err != nil {
 		return nil, err
 	}
-	return &PolicyEngine{policy: policy, observer: observer, pusher: pusher}, nil
+	return &PolicyEngine{policy: policy, observer: observer, pusher: pusher, snapshotter: snapshotter}, nil
 }
 
 func validatePolicy(p Policy) error {
@@ -466,4 +482,76 @@ func (e *PolicyEngine) UpdateFixPR(ctx context.Context, update UpdatePullRequest
 
 func matchesPR(p Policy, pr PullRequestState, oid string) bool {
 	return pr.Number > 0 && pr.State == "open" && pr.BaseRepo == p.BaseRepo && pr.BaseRef == p.BaseRef && pr.HeadRepo == p.WorkRepo && pr.HeadRef == p.WorkRef && pr.HeadOID == oid
+}
+
+// EngineSnapshot is one fresh world observation plus the seed bundle
+// rendered from it for trusted control.
+type EngineSnapshot struct {
+	Tip           string
+	BaseTip       string
+	WorkRefExists bool
+	// AtAnchor reports whether the observed work tip is the admission
+	// anchor: world truth a relaying control cannot derive itself, and the
+	// distinction between "no work was integrated or published" and "the
+	// seed tip may be this run's own unconfirmed publication".
+	AtAnchor bool
+	Data     []byte
+}
+
+// snapshotRenderRounds bounds the re-observe/re-render loop when a pinned
+// ref moves between observation and fetch. It is a race-recovery bound, not
+// a duration limit.
+const snapshotRenderRounds = 3
+
+// SnapshotForControl renders the sanitized seed snapshot for trusted
+// control: the pinned work tip when the work ref exists, the pinned base
+// tip when it was admitted absent, the base tip, and a self-contained
+// bundle of both. The world is observed fresh under the engine lock and the
+// fetches are verified against the observation, so a racing remote is
+// re-observed instead of guessed.
+func (e *PolicyEngine) SnapshotForControl(ctx context.Context) (EngineSnapshot, error) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	p := e.policy
+	if e.snapshotter == nil {
+		return EngineSnapshot{}, errors.New("publication policy: snapshot capability is not configured")
+	}
+	for attempt := 0; attempt < snapshotRenderRounds; attempt++ {
+		base, work, _, err := e.observe(ctx)
+		if err != nil {
+			return EngineSnapshot{}, errors.New("publication denied: observe pinned refs for snapshot failed")
+		}
+		if err = e.checkBase(base); err != nil {
+			return EngineSnapshot{}, err
+		}
+		workExists := work.Exists
+		if workExists && (work.Repo != p.WorkRepo || work.Ref != p.WorkRef || work.OID == "") {
+			return EngineSnapshot{}, errors.New("publication denied: observer returned a different work repository or ref")
+		}
+		if !workExists && !p.WorkInitiallyAbsent {
+			return EngineSnapshot{}, errors.New("publication denied: admitted work ref was deleted")
+		}
+		tip := base.OID
+		if workExists {
+			tip = work.OID
+		}
+		data, err := e.snapshotter.Snapshot(ctx, SnapshotRequest{
+			WorkRepo: p.WorkRepo, WorkRef: p.WorkRef, WorkOID: work.OID, WorkExists: workExists,
+			BaseRepo: p.BaseRepo, BaseRef: p.BaseRef, BaseOID: base.OID,
+		})
+		if errors.Is(err, ErrSnapshotTipMoved) {
+			continue
+		}
+		if err != nil {
+			return EngineSnapshot{}, err
+		}
+		return EngineSnapshot{
+			Tip:           tip,
+			BaseTip:       base.OID,
+			WorkRefExists: workExists,
+			AtAnchor:      workExists && tip == p.WorkAnchorOID,
+			Data:          data,
+		}, nil
+	}
+	return EngineSnapshot{}, fmt.Errorf("publication denied: pinned refs kept moving while rendering the snapshot (%d attempts): %w", snapshotRenderRounds, ErrSnapshotTipMoved)
 }
