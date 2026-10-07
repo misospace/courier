@@ -65,6 +65,13 @@ func (l *CoordinatorLauncher) Launch(ctx context.Context, run *courierv1alpha1.C
 	if (intakeURL != "" || l.EvidenceKey != nil) && (intakeURL == "" || len(l.EvidenceKey) == 0) {
 		return ErrEvidenceConfiguration
 	}
+	// A malformed intake URL would only surface when the run's evidence is
+	// POSTed, so reject it before any cluster read or pod creation.
+	if intakeURL != "" {
+		if err := executor.ValidateEvidenceURL(intakeURL); err != nil {
+			return err
+		}
+	}
 	var lane courierv1alpha1.LaneProfile
 	if err := l.Client.Get(ctx, client.ObjectKey{Namespace: run.Namespace, Name: run.Spec.Lane}, &lane); err != nil {
 		return err

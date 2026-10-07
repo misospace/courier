@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/hex"
 	"errors"
+	"strings"
 	"testing"
 
 	corev1 "k8s.io/api/core/v1"
@@ -331,5 +332,44 @@ func TestCoordinatorLauncherTrimsSurroundingWhitespaceFromEvidenceURL(t *testing
 	env := podEnvironmentByName(t, &podPod)
 	if got, ok := env[executor.EnvEvidenceURL]; !ok || got.Value != "http://courier-evidence.courier-system:8082" {
 		t.Fatalf("%s = %+v, want the intake URL trimmed of surrounding whitespace", executor.EnvEvidenceURL, got)
+	}
+}
+
+func TestCoordinatorLauncherRejectsMalformedEvidenceURL(t *testing.T) {
+	run := &courierv1alpha1.CoderRun{
+		ObjectMeta: metav1.ObjectMeta{Name: "run-1", Namespace: "default", UID: types.UID("run-uid")},
+		Spec: courierv1alpha1.CoderRunSpec{
+			Mode: courierv1alpha1.ModeResolveIssue,
+			Repo: "acme/widgets",
+			Ref:  1,
+			Lane: "local",
+		},
+		Status: courierv1alpha1.CoderRunStatus{Phase: courierv1alpha1.PhaseClaimed},
+	}
+	lane := &courierv1alpha1.LaneProfile{
+		ObjectMeta: metav1.ObjectMeta{Name: "local", Namespace: "default"},
+		Spec:       courierv1alpha1.LaneProfileSpec{Roles: map[string]string{"coordinator": "test-model"}},
+	}
+	fakeClient := fake.NewClientBuilder().
+		WithScheme(launcherScheme(t)).
+		WithStatusSubresource(&courierv1alpha1.CoderRun{}).
+		WithRuntimeObjects(run, lane).
+		Build()
+	launcher := &CoordinatorLauncher{
+		Client:      fakeClient,
+		Pod:         executor.PodConfig{Image: "example/opencode:test"},
+		EvidenceURL: "not-a-url",
+		EvidenceKey: []byte("a-test-hmac-key-of-some-length"),
+	}
+	err := launcher.Launch(context.Background(), run)
+	if err == nil {
+		t.Fatal("Launch() = nil, want an error for a malformed intake URL")
+	}
+	if !strings.Contains(err.Error(), "evidence intake URL") {
+		t.Fatalf("Launch() error = %q, want it to mention the intake URL shape rule", err)
+	}
+	var podPod corev1.Pod
+	if err := fakeClient.Get(context.Background(), client.ObjectKey{Namespace: "default", Name: "run-1-coordinator"}, &podPod); !apierrors.IsNotFound(err) {
+		t.Fatalf("coordinator pod present after a malformed intake URL: %v", err)
 	}
 }

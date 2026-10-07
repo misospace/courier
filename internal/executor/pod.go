@@ -492,6 +492,9 @@ func (c PodConfig) Validate() error {
 	if set != 0 && set != 3 {
 		return errors.New("executor: evidence capture is partially configured: EvidenceURL, EvidenceToken, and EvidenceNonce must all be set or all empty")
 	}
+	if strings.TrimSpace(c.EvidenceURL) != "" {
+		return ValidateEvidenceURL(c.EvidenceURL)
+	}
 	return nil
 }
 

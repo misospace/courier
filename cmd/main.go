@@ -203,6 +203,10 @@ func main() {
 		os.Exit(1)
 	}
 	if evidenceSecretSet {
+		if err := executor.ValidateEvidenceURL(evidenceIntakeService); err != nil {
+			setupLog.Error(err, "unable to configure evidence capture")
+			os.Exit(1)
+		}
 		podNamespace := strings.TrimSpace(os.Getenv("POD_NAMESPACE"))
 		key, err := loadEvidenceKey(context.Background(), mgr.GetAPIReader(), podNamespace, evidenceIntakeKeySecret)
 		if err != nil {

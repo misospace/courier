@@ -6,6 +6,9 @@ import (
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/hex"
+	"errors"
+	"net/url"
+	"strings"
 )
 
 // The environment names the pod builder writes for failure-evidence capture
@@ -59,4 +62,29 @@ func EvidenceToken(key []byte, namespace, name, runUID string, nonce []byte) str
 	mac := hmac.New(sha256.New, key)
 	mac.Write([]byte(namespace + "/" + name + "/" + runUID + "/" + hex.EncodeToString(nonce)))
 	return base64.StdEncoding.EncodeToString(mac.Sum(nonce))
+}
+
+// ValidateEvidenceURL checks the shape of an evidence intake endpoint: an
+// absolute http or https URL with a host and no userinfo. This is the single
+// place the intake-URL shape rule lives; it is enforced at operator startup
+// (cmd/main.go), at pod launch (controller.CoordinatorLauncher.Launch), and in
+// PodConfig.Validate (hence PodBuilder.Build), so a malformed URL fails before
+// a run is admitted instead of dead-ending at delivery. An empty value is
+// legal here — it disables capture; the all-or-nothing evidence-set check
+// lives in the caller. Errors are prefixed "executor: evidence intake URL "
+// and name the violated rule rather than echoing the value: a malformed URL
+// can embed a credential in its userinfo, and that must not reach the logs.
+func ValidateEvidenceURL(raw string) error {
+	value := strings.TrimSpace(raw)
+	if value == "" {
+		return nil
+	}
+	parsed, err := url.Parse(value)
+	if err != nil || (parsed.Scheme != "http" && parsed.Scheme != "https") || parsed.Host == "" {
+		return errors.New("executor: evidence intake URL must be an absolute http or https URL with a host")
+	}
+	if parsed.User != nil {
+		return errors.New("executor: evidence intake URL must not contain userinfo")
+	}
+	return nil
 }
