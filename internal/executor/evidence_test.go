@@ -20,7 +20,11 @@ func TestValidateEvidenceURL(t *testing.T) {
 		{name: "other scheme", url: "ftp://intake:8082", wantErr: "absolute http or https URL with a host"},
 		{name: "no host", url: "http://", wantErr: "absolute http or https URL with a host"},
 		{name: "empty authority", url: "http:///evidence", wantErr: "absolute http or https URL with a host"},
+		{name: "control character cr-lf", url: "http://intake:8082\r\nX-Evil: 1", wantErr: "absolute http or https URL with a host"},
+		{name: "control character lf", url: "http://intake:8082\n", wantErr: "absolute http or https URL with a host"},
 		{name: "userinfo", url: "http://user:pass@intake:8082", wantErr: "must not contain userinfo"},
+		{name: "port out of range", url: "http://intake:99999999", wantErr: "must have a valid port"},
+		{name: "port not an integer", url: "http://intake:notaport", wantErr: "must have a valid port"},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			err := ValidateEvidenceURL(test.url)
@@ -39,7 +43,7 @@ func TestValidateEvidenceURL(t *testing.T) {
 			if !strings.Contains(err.Error(), test.wantErr) {
 				t.Fatalf("ValidateEvidenceURL(%q) error = %q, want it to name the violated rule %q", test.url, err, test.wantErr)
 			}
-			if strings.Contains(err.Error(), "user:pass") {
+			if strings.Contains(err.Error(), strings.TrimSpace(test.url)) {
 				t.Fatalf("ValidateEvidenceURL(%q) error = %q, must not echo the value", test.url, err)
 			}
 		})
@@ -95,5 +99,34 @@ func TestPodConfigValidateChecksEvidenceURLShape(t *testing.T) {
 				t.Fatalf("Validate() = %v, want no error", err)
 			}
 		})
+	}
+}
+
+// The pod builder is a caller that can bypass the launcher's trim, so it must
+// trim the intake URL itself: a padded flag value must not reach the pod env.
+func TestPodBuilderTrimsEvidenceURLInCoordinatorEnv(t *testing.T) {
+	pod, err := BuildCoordinatorPod(evidenceTestRun("run-trim"), evidenceTestLane(), PodConfig{
+		Image:         "registry.example/courier-opencode:test",
+		WorkspacePath: "/workspace",
+		EvidenceURL:   "  http://intake.courier-system.svc:8082  ",
+		EvidenceToken: "a-very-long-evidence-token-value-for-testing-0123456789",
+		EvidenceNonce: "0123456789abcdef",
+	})
+	if err != nil {
+		t.Fatalf("BuildCoordinatorPod() error = %v", err)
+	}
+	got := ""
+	found := false
+	for _, env := range pod.Spec.Containers[0].Env {
+		if env.Name == EnvEvidenceURL {
+			found = true
+			got = env.Value
+		}
+	}
+	if !found {
+		t.Fatalf("%s missing from the coordinator env", EnvEvidenceURL)
+	}
+	if got != "http://intake.courier-system.svc:8082" {
+		t.Fatalf("%s = %q, want the intake URL trimmed of surrounding whitespace", EnvEvidenceURL, got)
 	}
 }

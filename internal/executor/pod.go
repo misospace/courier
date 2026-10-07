@@ -342,7 +342,10 @@ func podEnvironment(invocation Invocation, executorName string, config PodConfig
 		baseRemoteURL = strings.Replace(baseRemoteURL, "%s", escapedRepositoryPath(invocation.Repo), 1)
 	}
 	terminationFile := runtimePath + "/termination"
-	values := toKubernetesEnv(EnvironmentWithConfig(invocation, executorName, remoteURL, baseRemoteURL, config.BaseBranch, config.OpenCode.Binary, config.OpenCode.Format, terminationFile, config.OpenCode.Agent, config.EvidenceURL, config.EvidenceNonce))
+	// Validate and the launcher both check the trimmed URL, so the pod env
+	// must carry the trimmed value too: a caller that bypasses the launcher
+	// must not be able to pad the intake URL with whitespace.
+	values := toKubernetesEnv(EnvironmentWithConfig(invocation, executorName, remoteURL, baseRemoteURL, config.BaseBranch, config.OpenCode.Binary, config.OpenCode.Format, terminationFile, config.OpenCode.Agent, strings.TrimSpace(config.EvidenceURL), config.EvidenceNonce))
 	values = append(values,
 		corev1.EnvVar{
 			Name:  "OPENCODE_CONFIG",

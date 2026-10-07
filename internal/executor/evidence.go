@@ -8,6 +8,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"net/url"
+	"strconv"
 	"strings"
 )
 
@@ -65,8 +66,9 @@ func EvidenceToken(key []byte, namespace, name, runUID string, nonce []byte) str
 }
 
 // ValidateEvidenceURL checks the shape of an evidence intake endpoint: an
-// absolute http or https URL with a host and no userinfo. This is the single
-// place the intake-URL shape rule lives; it is enforced at operator startup
+// absolute http or https URL with a host and no userinfo, and — when a port is
+// present — a port that is an integer in 1-65535. This is the single place the
+// intake-URL shape rule lives; it is enforced at operator startup
 // (cmd/main.go), at pod launch (controller.CoordinatorLauncher.Launch), and in
 // PodConfig.Validate (hence PodBuilder.Build), so a malformed URL fails before
 // a run is admitted instead of dead-ending at delivery. An empty value is
@@ -75,16 +77,39 @@ func EvidenceToken(key []byte, namespace, name, runUID string, nonce []byte) str
 // and name the violated rule rather than echoing the value: a malformed URL
 // can embed a credential in its userinfo, and that must not reach the logs.
 func ValidateEvidenceURL(raw string) error {
-	value := strings.TrimSpace(raw)
-	if value == "" {
+	// A whitespace-only value disables capture.
+	if strings.TrimSpace(raw) == "" {
 		return nil
 	}
+	// Trim only surrounding spaces, not control characters. Spaces are the
+	// accidental padding a flag value picks up; a CR or LF in the value is a
+	// CRLF-injection red flag, so it is left for url.Parse to reject rather
+	// than rescued by a trim.
+	value := strings.Trim(raw, " ")
 	parsed, err := url.Parse(value)
-	if err != nil || (parsed.Scheme != "http" && parsed.Scheme != "https") || parsed.Host == "" {
+	if err != nil {
+		// url.Parse rejects a non-numeric port (for example "notaport")
+		// before any shape check can run, so a bad port would otherwise be
+		// misread as a missing scheme or host. Name the port rule instead.
+		if strings.Contains(err.Error(), "invalid port") {
+			return errors.New("executor: evidence intake URL must have a valid port")
+		}
+		return errors.New("executor: evidence intake URL must be an absolute http or https URL with a host")
+	}
+	if parsed.Scheme != "http" && parsed.Scheme != "https" {
+		return errors.New("executor: evidence intake URL must be an absolute http or https URL with a host")
+	}
+	if parsed.Host == "" {
 		return errors.New("executor: evidence intake URL must be an absolute http or https URL with a host")
 	}
 	if parsed.User != nil {
 		return errors.New("executor: evidence intake URL must not contain userinfo")
+	}
+	if port := parsed.Port(); port != "" {
+		n, aerr := strconv.Atoi(port)
+		if aerr != nil || n < 1 || n > 65535 {
+			return errors.New("executor: evidence intake URL must have a valid port")
+		}
 	}
 	return nil
 }

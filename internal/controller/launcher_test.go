@@ -346,14 +346,15 @@ func TestCoordinatorLauncherRejectsMalformedEvidenceURL(t *testing.T) {
 		},
 		Status: courierv1alpha1.CoderRunStatus{Phase: courierv1alpha1.PhaseClaimed},
 	}
-	lane := &courierv1alpha1.LaneProfile{
-		ObjectMeta: metav1.ObjectMeta{Name: "local", Namespace: "default"},
-		Spec:       courierv1alpha1.LaneProfileSpec{Roles: map[string]string{"coordinator": "test-model"}},
-	}
+	// The lane is deliberately not loaded into the fake client. Launch validates
+	// the intake URL before it reads the lane, so a malformed URL fails with the
+	// URL rule no matter what. If that check ever regressed to after the lane
+	// read, the absent lane would surface as a NotFound instead and the
+	// assertions below would catch the ordering slip.
 	fakeClient := fake.NewClientBuilder().
 		WithScheme(launcherScheme(t)).
 		WithStatusSubresource(&courierv1alpha1.CoderRun{}).
-		WithRuntimeObjects(run, lane).
+		WithRuntimeObjects(run).
 		Build()
 	launcher := &CoordinatorLauncher{
 		Client:      fakeClient,
