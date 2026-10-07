@@ -2,16 +2,19 @@ package evidence
 
 import (
 	"sort"
+	"strings"
 
 	"github.com/misospace/courier/internal/log"
 )
 
-// CredentialRef is the portable form of one pod-builder credential mapping:
-// the env var name the executor receives and the Secret key that supplies it.
-// It is the single source of truth shared with the pod builder (which
-// translates it to corev1.EnvVar{ValueFrom.SecretKeyRef}) and the intake
-// (which re-scans against the same set). The evidence package MUST NOT import
-// Kubernetes types; this plain struct is that shared contract.
+// CredentialRef is the portable, Kubernetes-free form of one pod-builder
+// credential mapping: the env var name the executor receives and the Secret
+// key that supplies it. It is the credential contract INTENDED to be shared
+// with the pod builder (which will translate it to
+// corev1.EnvVar{ValueFrom.SecretKeyRef}) and the intake (which re-scans
+// against the same set); those wirings land in issue #199/#228 and issue
+// #200 respectively and do not exist on this head. The evidence package MUST
+// NOT import Kubernetes types; this plain struct is that portable contract.
 type CredentialRef struct {
 	EnvName    string
 	SecretName string
@@ -23,6 +26,11 @@ type CredentialRef struct {
 // variable name shape and the defensive pattern table always applies.
 type Scanner struct {
 	red *log.Redactor
+	// literals retains non-empty resolved values under secret-shaped env
+	// names as-is (no trimming), including the 1-7 byte values the shared
+	// Redactor's length guard would silently drop, so the evidence scan
+	// fails closed for short credentials.
+	literals []string
 }
 
 // NewScanner returns a Scanner with no registered credentials; only the
@@ -32,10 +40,13 @@ func NewScanner() *Scanner {
 }
 
 // RegisterCredentials registers resolved credential values so the scan withholds
-// them. values maps CredentialRef.EnvName -> resolved secret value; only values
-// whose ENV NAME is secret-shaped (internal/log's rule) are registered — a value
-// reached through a non-secret-shaped env name (e.g. COURIER_GIT_USERNAME) is
-// deliberately NOT registered, and the Secret KEY is never consulted.
+// them. values maps CredentialRef.EnvName -> resolved secret value. Values whose
+// ENV NAME is secret-shaped (internal/log's rule) are registered with the shared
+// Redactor — a value reached through a non-secret-shaped env name (e.g.
+// COURIER_GIT_USERNAME) is deliberately NOT registered, and the Secret KEY is
+// never consulted. In addition, every non-empty value under a secret-shaped name
+// is retained as-is (no trimming) so short 1-7 byte values the Redactor's length
+// guard would drop still match, keeping the evidence scan fail closed.
 func (s *Scanner) RegisterCredentials(values map[string]string) {
 	names := make([]string, 0, len(values))
 	for name := range values {
@@ -47,12 +58,53 @@ func (s *Scanner) RegisterCredentials(values map[string]string) {
 		environ = append(environ, name+"="+values[name])
 	}
 	s.red.RegisterEnvironment(environ)
+
+	// The shared Redactor drops values shorter than its length guard, which
+	// is a log-volume heuristic, not a safety boundary. For durable evidence
+	// that is a fail-open hole, so retain every non-empty value whose env
+	// name is secret-shaped, as-is, regardless of length.
+	seen := make(map[string]bool, len(values))
+	for _, name := range names {
+		value := values[name]
+		if value == "" || !isSecretEnvName(name) || seen[value] {
+			continue
+		}
+		seen[value] = true
+		s.literals = append(s.literals, value)
+	}
 }
 
-// Matched reports whether v contains a registered credential or a
-// pattern-table credential shape. Fail closed: any match is a match.
+// isSecretEnvName reports whether an environment variable name is shaped like
+// a credential. It mirrors internal/log's private isSecretEnvName (kept in
+// sync by a sync test) because internal/log's copy is unexported and must not
+// change; the evidence package needs the same shape check to retain short
+// values the shared Redactor's length guard would drop.
+func isSecretEnvName(name string) bool {
+	name = strings.ToUpper(strings.TrimSpace(name))
+	for _, suffix := range []string{
+		"TOKEN", "SECRET", "PASSWORD", "PASSWD", "PASS",
+		"API_KEY", "APIKEY", "KEY", "CREDENTIAL", "CREDENTIALS",
+	} {
+		if strings.HasSuffix(name, suffix) {
+			return true
+		}
+	}
+	return false
+}
+
+// Matched reports whether v contains a registered credential, a retained
+// short literal, or a pattern-table credential shape. Fail closed: any match
+// is a match.
 func (s *Scanner) Matched(v string) bool {
-	return s.red.Redact(v) != v
+	if s.red.Redact(v) != v {
+		return true
+	}
+	for _, lit := range s.literals {
+		if strings.Contains(v, lit) {
+			return true
+		}
+	}
+	return false
 }
 
 // RedactMetadata returns log.RedactedPlaceholder when v matches, else v
