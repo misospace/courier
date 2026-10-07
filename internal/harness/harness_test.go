@@ -146,6 +146,7 @@ type mockWorker struct {
 	// bundle the scripted pack task returns (empty artifact = no changes).
 	snapshotTip  string
 	packArtifact []byte
+	snapshotTips []string
 }
 
 func isWorkerUnpackTask(task protocol.Task) bool {
@@ -211,9 +212,14 @@ func (m *mockWorker) handleDispatch(w http.ResponseWriter, r *http.Request) {
 	// fields: the unpack echoes the tip, the pack returns the bundle.
 	switch {
 	case isWorkerUnpackTask(task):
+		tip := m.snapshotTip
+		if len(m.snapshotTips) > 0 {
+			tip = m.snapshotTips[0]
+			m.snapshotTips = m.snapshotTips[1:]
+		}
 		m.results[req.Envelope.OpID] = protocol.ResultState{
 			Status: protocol.ResultCompleted,
-			Result: &protocol.Result{Status: protocol.ResultCompleted, ExitCode: 0, StdoutTail: m.snapshotTip},
+			Result: &protocol.Result{Status: protocol.ResultCompleted, ExitCode: 0, StdoutTail: tip},
 		}
 	case isWorkerPackTask(task):
 		m.results[req.Envelope.OpID] = protocol.ResultState{
@@ -404,6 +410,21 @@ func (p *mockPublisher) count() int {
 func snapshotProvider(tip string) SnapshotProvider {
 	return func(context.Context) (Snapshot, error) {
 		return Snapshot{Data: []byte("snapshot"), Tip: tip}, nil
+	}
+}
+
+func sequenceSnapshotProvider(tips ...string) SnapshotProvider {
+	var next atomic.Int32
+	return func(context.Context) (Snapshot, error) {
+		index := int(next.Add(1) - 1)
+		if index >= len(tips) {
+			index = len(tips) - 1
+		}
+		if index < 0 {
+			return Snapshot{}, errors.New("sequence snapshot provider requires at least one tip")
+		}
+		tip := tips[index]
+		return Snapshot{Data: []byte("snapshot-" + tip), Tip: tip}, nil
 	}
 }
 
@@ -1481,7 +1502,7 @@ func TestBriefResultRetention(t *testing.T) {
 	worker, delegator, cleanupWorker := testWorkerAndDelegator(t)
 	defer cleanupWorker()
 	worker.completeAll = true
-	gateway, _, cleanup := gatewayFor(
+	gateway, mocker, cleanup := gatewayFor(
 		gatewayResponse{body: sse(
 			toolCallChunk(0, "call-1", toolDelegate, `{"id":"b1","role":"coder","objective":"ORIGINAL OBJECTIVE","successCheck":"ok"}`),
 			finishChunk("tool_calls"),
@@ -1511,6 +1532,9 @@ func TestBriefResultRetention(t *testing.T) {
 	if result.Outcome != executor.OutcomeChanges {
 		t.Fatalf("outcome = %q (%v)", result.Outcome, result.Err)
 	}
+	if len(mocker.calls) != 4 || !strings.Contains(mocker.calls[0].rawBody, "run relevant local validation against a fresh snapshot of the integrated and published head yourself") || !strings.Contains(mocker.calls[0].rawBody, "fix local validation failures before declaring completion") || !strings.Contains(mocker.calls[0].rawBody, "without waiting for external verification") {
+		t.Fatalf("coordinator prompt does not carry the executor-neutral handoff contract: calls=%d prompt=%q", len(mocker.calls), mocker.calls[0].rawBody)
+	}
 	if len(publisher.integrated) != 1 {
 		t.Fatalf("integrations = %+v", publisher.integrated)
 	}
@@ -1529,6 +1553,66 @@ func TestBriefResultRetention(t *testing.T) {
 	}
 	if publisher.count() != 2 {
 		t.Fatalf("publisher calls = %d, want 2 (per-brief + finish)", publisher.count())
+	}
+}
+
+func TestCoordinatorShellRefreshesPublishedIntegrationSnapshot(t *testing.T) {
+	worker, delegator, cleanupWorker := testWorkerAndDelegator(t)
+	defer cleanupWorker()
+	worker.completeAll = true
+	worker.snapshotTips = []string{"brief-base", "published-head", "published-head"}
+	worker.snapshotTip = "published-head"
+	worker.packArtifact = []byte("bundle-bytes")
+	gateway, _, cleanup := gatewayFor(
+		gatewayResponse{body: sse(
+			toolCallChunk(0, "delegate", toolDelegate, `{"id":"b1","role":"coder","objective":"Implement","successCheck":"tests pass"}`),
+			finishChunk("tool_calls"),
+		)},
+		gatewayResponse{body: sse(
+			toolCallChunk(0, "brief-shell", toolShell, `{"command":"echo implement"}`),
+			finishChunk("tool_calls"),
+		)},
+		gatewayResponse{body: sse(contentChunk("implemented"), finishChunk("stop"))},
+		gatewayResponse{body: sse(
+			toolCallChunk(0, "validate", toolShell, `{"command":"go test ./..."}`),
+			finishChunk("tool_calls"),
+		)},
+		gatewayResponse{body: sse(contentChunk(`{"outcome":"changes"}`), finishChunk("stop"))},
+	)
+	defer cleanup()
+	publisher := &mockPublisher{}
+	coordinator, err := NewCoordinator(CoordinatorConfig{
+		Gateway: gateway, Bindings: testBindings(), Worker: delegator,
+		Snapshot:  sequenceSnapshotProvider("brief-base", "published-head", "published-head"),
+		Publisher: publisher,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	result := coordinator.Run(context.Background(), testInvocation())
+	if result.Outcome != executor.OutcomeChanges || result.Err != nil {
+		t.Fatalf("harness result = %+v, want published changes", result)
+	}
+	if len(worker.dispatches) != 5 {
+		t.Fatalf("worker dispatches = %d, want brief unpack/shell/pack and control unpack/validation", len(worker.dispatches))
+	}
+	if !isWorkerUnpackTask(worker.dispatches[0].task) || worker.dispatches[0].envelope.BriefID != "b1" {
+		t.Fatalf("brief unpack = %+v", worker.dispatches[0])
+	}
+	if !isWorkerPackTask(worker.dispatches[2].task) || worker.dispatches[2].envelope.BriefID != "b1" {
+		t.Fatalf("brief pack = %+v", worker.dispatches[2])
+	}
+	if !isWorkerUnpackTask(worker.dispatches[3].task) || worker.dispatches[3].envelope.BriefID != "control" {
+		t.Fatalf("control refresh = %+v", worker.dispatches[3])
+	}
+	if got := strings.Join(worker.dispatches[4].task.Command, " "); got != "sh -c go test ./..." || worker.dispatches[4].envelope.BriefID != "control" {
+		t.Fatalf("validation dispatch = %+v, want validation on control snapshot", worker.dispatches[4])
+	}
+	if worker.snapshots != 2 {
+		t.Fatalf("snapshot uploads = %d, want brief base and a fresh published head", worker.snapshots)
+	}
+	if len(publisher.integrated) != 1 || publisher.integrated[0].DispatchedTip != "brief-base" {
+		t.Fatalf("integration requests = %+v, want artifact anchored to brief-base", publisher.integrated)
 	}
 }
 

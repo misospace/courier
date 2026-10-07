@@ -438,8 +438,10 @@ func (c *HTTPClient) Report(ctx context.Context, id string, lifecycle source.Lif
 		}
 		return errors.Join(reportErr, c.markPRFixBlocked(ctx, d, lifecycle.Error))
 	case source.ResultFailed:
-		reportErr := c.reportTaskWithPR(ctx, d, "failed", lifecycle.Error, lifecycle.PR, lifecycle.IdempotencyKey, lifecycle.Telemetry, lifecycle.StartedAt)
-		return errors.Join(reportErr, c.markPRFixBlocked(ctx, d, lifecycle.Error))
+		// Dispatch's failed report requeues eligible PR-fix work under its
+		// existing attempt cap. A separate BLOCKED mark can target a stale
+		// generation after the report advances the queue item.
+		return c.reportTaskWithPR(ctx, d, "failed", lifecycle.Error, lifecycle.PR, lifecycle.IdempotencyKey, lifecycle.Telemetry, lifecycle.StartedAt)
 	default:
 		return nil
 	}
