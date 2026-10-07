@@ -364,7 +364,12 @@ func isBinary(data []byte) bool {
 }
 
 // symlinkEscapes reports whether a symlink target resolves outside the
-// repository root, without ever following the link.
+// repository root, without ever following the link. Resolution is lexical
+// (no EvalSymlinks; intermediate symlinks in the target path are not
+// resolved), so an indirectly escaping target can be mislabeled as
+// non-escaping. That is an accepted bound: symlinks are metadata-only,
+// never followed or stored as tar members, so a mislabel is a
+// classification artifact, not a write/escape hole.
 func symlinkEscapes(dir, linkPath, target string) bool {
 	var abs string
 	if filepath.IsAbs(target) {
