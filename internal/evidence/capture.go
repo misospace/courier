@@ -237,7 +237,8 @@ func localCommitEntries(ctx context.Context, dir string, opts Options, scanner *
 			// Deliberate: a patch already over MaxFileBytes is classified
 			// omitted-over-limit WITHOUT a content scan, so it is never kept
 			// whole; the message fetch is skipped too. Bytes reports the
-			// bounded prefix read before the cap, not the full patch size.
+			// bounded prefix (up to MaxFileBytes+1) read before the cap was
+			// hit, not the full patch size.
 			totals.OmittedOverLimit++
 			out = append(out, Entry{
 				Path:        fmt.Sprintf("commits/%04d-%s.patch", i+1, short),
@@ -521,8 +522,9 @@ func runGit(ctx context.Context, dir string, args ...string) ([]byte, error) {
 // stdout while the child produces output. If the output exceeds the limit the
 // child is killed and overLimit is set with the bounded prefix returned, so a
 // run that would otherwise buffer an unbounded result stops at the cap.
-// A failing or cancelled command returns a wrapped error (with the command's
-// trimmed stderr), never overLimit.
+// A failing command returns a wrapped error (with the command's trimmed
+// stderr). A canceled context returns its own error and never overLimit, even
+// when the output had already exceeded the limit before the cancellation.
 func runGitCapped(ctx context.Context, dir string, limit int, args ...string) (out []byte, overLimit bool, err error) {
 	cmd := exec.CommandContext(ctx, "git", args...)
 	cmd.Dir = dir
@@ -540,6 +542,9 @@ func runGitCapped(ctx context.Context, dir string, limit int, args ...string) (o
 	if len(out) > limit {
 		_ = cmd.Process.Kill()
 		_ = cmd.Wait()
+		if ctx.Err() != nil {
+			return nil, false, ctx.Err()
+		}
 		return out, true, nil
 	}
 	if err := cmd.Wait(); err != nil {

@@ -62,8 +62,12 @@ func (s *Scanner) RegisterCredentials(values map[string]string) {
 	// The shared Redactor drops values shorter than its length guard, which
 	// is a log-volume heuristic, not a safety boundary. For durable evidence
 	// that is a fail-open hole, so retain every non-empty value whose env
-	// name is secret-shaped, as-is, regardless of length.
-	seen := make(map[string]bool, len(values))
+	// name is secret-shaped, as-is, regardless of length. A value already
+	// retained by an earlier call is not appended again.
+	seen := make(map[string]bool, len(values)+len(s.literals))
+	for _, existing := range s.literals {
+		seen[existing] = true
+	}
 	for _, name := range names {
 		value := values[name]
 		if value == "" || !isSecretEnvName(name) || seen[value] {

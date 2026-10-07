@@ -159,6 +159,23 @@ func TestNonSecretShapedShortValueNotMatched(t *testing.T) {
 	}
 }
 
+func TestRegisterCredentialsDedupesAcrossCalls(t *testing.T) {
+	const value = "abc1234" // 7 bytes, below the Redactor's length guard
+	s := NewScanner()
+	s.RegisterCredentials(map[string]string{"DB_PASSWORD": value})
+	s.RegisterCredentials(map[string]string{"DB_PASSWORD": value})
+
+	count := 0
+	for _, lit := range s.literals {
+		if lit == value {
+			count++
+		}
+	}
+	if count != 1 {
+		t.Errorf("literals contains %q %d times, want 1", value, count)
+	}
+}
+
 func TestIsSecretEnvNameSyncWithLog(t *testing.T) {
 	// Sync test between the local predicate and internal/log's observable
 	// behavior: registering an 8+ byte value under a name and checking whether
@@ -171,9 +188,17 @@ func TestIsSecretEnvNameSyncWithLog(t *testing.T) {
 		"FOO_PASSWD", "BAR_PASS", "MY_API_KEY", "MY_APIKEY",
 		"AZURE_CREDENTIAL", "AWS_CREDENTIALS", "SIGNING_KEY",
 	}
+	// nonSecretShaped also carries plausible future secret-suffix names that
+	// neither implementation treats as secret today. The sync test only
+	// observes internal/log's CURRENT suffixes: it catches a removal or change
+	// of an existing suffix, but not a suffix ADDED there. If a future change
+	// adds e.g. an "AUTH" suffix to internal/log, MY_AUTH becomes
+	// observable-secret while the local predicate still returns non-secret,
+	// and this test fails — making the addition observable.
 	nonSecretShaped := []string{
 		"COURIER_GIT_USERNAME", "PATH", "MODEL_NAME", "HOME", "RUN_NAMESPACE",
 		"GITHUB_REPO", "COURIER_INSTANCE", "LANG", "WORKDIR",
+		"MY_AUTH", "SESSION_ID",
 	}
 
 	for _, name := range append(append([]string{}, secretShaped...), nonSecretShaped...) {
