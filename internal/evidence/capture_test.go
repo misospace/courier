@@ -284,15 +284,27 @@ func TestCaptureAcceptance(t *testing.T) {
 			},
 		},
 		{
+			// A substantially-oversized text commit: the patch is capped
+			// while it is being produced, so neither the file content nor the
+			// commit message may reach the archive or the manifest, and no
+			// commit member is admitted.
 			name: "local commit over MaxFileBytes patch size is omitted",
 			setup: func(t *testing.T, dir string) *Scanner {
-				writeFile(t, filepath.Join(dir, "huge.txt"), strings.Repeat("x", MaxFileBytes+2))
-				commit(t, dir, "feat: enormous file")
+				writeFile(t, filepath.Join(dir, "huge.txt"), "COMMIT-OVER-CAP-NEEDLE-"+strings.Repeat("x", MaxFileBytes+2))
+				commit(t, dir, "feat: enormous file COMMIT-OVER-CAP-MSG-NEEDLE")
 				return nil
 			},
-			want:       wantEntry{class: ClassCommit, dispo: DispositionOmittedOverLimit},
+			want:       wantEntry{class: ClassCommit, dispo: DispositionOmittedOverLimit, bytes: int64(MaxFileBytes) + 1, bytesSet: true},
 			wantTar:    map[string]string{},
 			wantTotals: Totals{Commits: 1, OmittedOverLimit: 1},
+			wantAbsent: []string{"COMMIT-OVER-CAP-NEEDLE", "COMMIT-OVER-CAP-MSG-NEEDLE"},
+			check: func(t *testing.T, bundle *Bundle, members map[string]string) {
+				for name := range members {
+					if strings.HasPrefix(name, "commits/") {
+						t.Errorf("archive carries commit member %q for a capped patch", name)
+					}
+				}
+			},
 		},
 		{
 			name: "local commit adding a binary file is stubbed as text",
@@ -548,6 +560,58 @@ func TestCaptureAcceptance(t *testing.T) {
 				tc.check(t, bundle, members)
 			}
 		})
+	}
+}
+
+// TestRunGitCapped drives the bounded pipe reader directly: a
+// substantially-oversized patch stops at exactly the cap with overLimit set,
+// a small patch is returned in full, and a failing command wraps its stderr
+// like runGit.
+func TestRunGitCapped(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+
+	dir := newRepo(t)
+	writeFile(t, filepath.Join(dir, "big.txt"), strings.Repeat("a", 512*1024))
+	commit(t, dir, "feat: oversized text file")
+	bigSHA := headSHA(t, dir)
+
+	out, over, err := runGitCapped(ctx, dir, MaxFileBytes, "format-patch", "--stdout", "--no-binary", "-1", bigSHA)
+	if err != nil {
+		t.Fatalf("runGitCapped (oversized): %v", err)
+	}
+	if !over {
+		t.Errorf("over = false, want true for a ~512 KiB patch")
+	}
+	if len(out) != MaxFileBytes+1 {
+		t.Errorf("len(out) = %d, want exactly MaxFileBytes+1 = %d", len(out), MaxFileBytes+1)
+	}
+
+	smallDir := newRepo(t)
+	writeFile(t, filepath.Join(smallDir, "small.txt"), "hello\n")
+	commit(t, smallDir, "feat: small change")
+	smallSHA := headSHA(t, smallDir)
+	full, err := runGit(ctx, smallDir, "format-patch", "--stdout", "--no-binary", "-1", smallSHA)
+	if err != nil {
+		t.Fatalf("runGit (small): %v", err)
+	}
+	out, over, err = runGitCapped(ctx, smallDir, MaxFileBytes, "format-patch", "--stdout", "--no-binary", "-1", smallSHA)
+	if err != nil {
+		t.Fatalf("runGitCapped (small): %v", err)
+	}
+	if over {
+		t.Errorf("over = true, want false for a small patch")
+	}
+	if string(out) != string(full) {
+		t.Errorf("capped output = %d bytes, want the full patch (%d bytes)", len(out), len(full))
+	}
+
+	if _, over, err := runGitCapped(ctx, smallDir, MaxFileBytes, "format-patch", "--stdout", "--no-binary", "-1", "not-a-sha"); err == nil {
+		t.Errorf("runGitCapped with a bad sha: want an error, got none (over=%v)", over)
+	} else {
+		if over {
+			t.Errorf("failing command reported over-limit, want false")
+		}
 	}
 }
 
@@ -860,6 +924,15 @@ func git(t *testing.T, directory string, args ...string) {
 	if _, err := gitOutput(directory, args...); err != nil {
 		t.Fatalf("git %s: %v", strings.Join(args, " "), err)
 	}
+}
+
+func headSHA(t *testing.T, dir string) string {
+	t.Helper()
+	out, err := gitOutput(dir, "rev-parse", "HEAD")
+	if err != nil {
+		t.Fatal(err)
+	}
+	return strings.TrimSpace(string(out))
 }
 
 func gitOutput(directory string, args ...string) ([]byte, error) {

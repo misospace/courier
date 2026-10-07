@@ -225,21 +225,37 @@ func localCommitEntries(ctx context.Context, dir string, opts Options, scanner *
 		shas[i], shas[j] = shas[j], shas[i]
 	}
 	for i, sha := range shas {
-		patch, err := runGit(ctx, dir, "format-patch", "--stdout", "--no-binary", "-1", sha)
+		short := sha
+		if len(short) > 7 {
+			short = short[:7]
+		}
+		patch, overLimit, err := runGitCapped(ctx, dir, MaxFileBytes, "format-patch", "--stdout", "--no-binary", "-1", sha)
 		if err != nil {
 			return out, err
+		}
+		if overLimit {
+			// Deliberate: a patch already over MaxFileBytes is classified
+			// omitted-over-limit WITHOUT a content scan, so it is never kept
+			// whole; the message fetch is skipped too. Bytes reports the
+			// bounded prefix read before the cap, not the full patch size.
+			totals.OmittedOverLimit++
+			out = append(out, Entry{
+				Path:        fmt.Sprintf("commits/%04d-%s.patch", i+1, short),
+				Class:       ClassCommit,
+				CommitSHA:   sha,
+				Disposition: DispositionOmittedOverLimit,
+				Bytes:       int64(len(patch)),
+			})
+			continue
 		}
 		// format-patch on a merge commit prints nothing; skip it.
 		if len(bytes.TrimSpace(patch)) == 0 {
 			continue
 		}
+		// Safe: the message is fully contained in the <= MaxFileBytes patch that passed the cap.
 		message, err := runGit(ctx, dir, "show", "-s", "--format=%B", sha)
 		if err != nil {
 			return out, err
-		}
-		short := sha
-		if len(short) > 7 {
-			short = short[:7]
 		}
 		storedPath := fmt.Sprintf("commits/%04d-%s.patch", i+1, short)
 		entry := Entry{Path: storedPath, Class: ClassCommit, CommitSHA: sha}
@@ -485,6 +501,60 @@ func runGit(ctx context.Context, dir string, args ...string) ([]byte, error) {
 		return nil, fmt.Errorf("git %s: %w: %s", strings.Join(args, " "), err, strings.TrimSpace(stderr.String()))
 	}
 	return stdout.Bytes(), nil
+}
+
+// runGitCapped runs a git command in dir, reading at most limit bytes from
+// stdout while the child produces output. If the output exceeds the limit the
+// child is killed and overLimit is set with the bounded prefix returned, so a
+// run that would otherwise buffer an unbounded result stops at the cap.
+// A failing or cancelled command returns a wrapped error (with the command's
+// trimmed stderr), never overLimit.
+func runGitCapped(ctx context.Context, dir string, limit int, args ...string) (out []byte, overLimit bool, err error) {
+	cmd := exec.CommandContext(ctx, "git", args...)
+	cmd.Dir = dir
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		return nil, false, fmt.Errorf("git %s: %w", strings.Join(args, " "), err)
+	}
+	var stderr cappedBuffer
+	stderr.limit = stderrLimit
+	cmd.Stderr = &stderr
+	if err := cmd.Start(); err != nil {
+		return nil, false, fmt.Errorf("git %s: %w: %s", strings.Join(args, " "), err, strings.TrimSpace(string(stderr.data)))
+	}
+	out, _ = io.ReadAll(io.LimitReader(stdout, int64(limit)+1))
+	if len(out) > limit {
+		_ = cmd.Process.Kill()
+		_ = cmd.Wait()
+		return out, true, nil
+	}
+	if err := cmd.Wait(); err != nil {
+		return nil, false, fmt.Errorf("git %s: %w: %s", strings.Join(args, " "), err, strings.TrimSpace(string(stderr.data)))
+	}
+	return out, false, nil
+}
+
+// stderrLimit bounds the child stderr captured by runGitCapped so a verbose
+// or failing git cannot allocate unbounded memory there either.
+const stderrLimit = 4 * 1024
+
+// cappedBuffer is an io.Writer that keeps at most its limit bytes, silently
+// discarding anything written beyond them.
+type cappedBuffer struct {
+	limit int
+	data  []byte
+}
+
+func (b *cappedBuffer) Write(p []byte) (int, error) {
+	room := b.limit - len(b.data)
+	if room <= 0 {
+		return len(p), nil
+	}
+	if room < len(p) {
+		p = p[:room]
+	}
+	b.data = append(b.data, p...)
+	return len(p), nil
 }
 
 // splitLines splits command output into non-empty trimmed lines.

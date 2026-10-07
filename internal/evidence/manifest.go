@@ -115,7 +115,9 @@ type Entry struct {
 	StoredPath  string `json:"storedPath,omitempty"`
 	// Bytes records the underlying content size for stored, omitted-binary,
 	// and omitted-over-limit entries; it is 0 for deleted, symlink, and
-	// withheld entries.
+	// withheld entries. For a local-commit entry capped during capture, it is
+	// the bounded prefix read before the limit was hit (the underlying patch
+	// is at least that large), not the full patch size.
 	Bytes int64 `json:"bytes,omitempty"`
 }
 
