@@ -721,7 +721,7 @@ func TestCollapseToBudgetEntryCap(t *testing.T) {
 		Entries:       entries,
 	}
 
-	collapseToBudget(manifest)
+	collapseToBudget(context.Background(), manifest)
 
 	if len(manifest.Entries) > MaxManifestEntries {
 		t.Errorf("len(entries) = %d, want <= %d", len(manifest.Entries), MaxManifestEntries)
@@ -738,6 +738,138 @@ func TestCollapseToBudgetEntryCap(t *testing.T) {
 	kept := len(manifest.Entries) - 1
 	if manifest.Totals.OmittedByBudget != total-kept {
 		t.Errorf("totals.omittedByBudget = %d, want %d", manifest.Totals.OmittedByBudget, total-kept)
+	}
+}
+
+// TestCollapseToBudgetOmittedCountBoundary is the regression for probing with
+// a stale omittedByBudget: the fixture is tuned so the largest candidate that
+// fits when probed with omittedByBudget=0 busts ManifestBudgetBytes once its
+// real (three-digit) omitted count is serialized. collapseToBudget must settle
+// one entry lower and still emit a budget-sized manifest with an authoritative
+// omitted count.
+func TestCollapseToBudgetOmittedCountBoundary(t *testing.T) {
+	t.Parallel()
+
+	const (
+		pathPad = 900
+		total   = 400
+	)
+	entries := make([]Entry, 0, total)
+	for i := range total {
+		entries = append(entries, Entry{
+			Path:        fmt.Sprintf("artifacts/%s/%04d.dat", strings.Repeat("p", pathPad), i),
+			Class:       ClassUntracked,
+			Disposition: DispositionStored,
+		})
+	}
+	manifest := &Manifest{
+		SchemaVersion: SchemaVersion,
+		Trigger:       strings.Repeat("t", 131),
+		Entries:       entries,
+	}
+
+	candidateFits := func(keep, omitted int) bool {
+		t.Helper()
+		candidate := append(append([]Entry(nil), entries[:keep]...), Entry{Disposition: DispositionOmittedBudget})
+		fits, err := manifestFits(manifest, candidate, omitted)
+		if err != nil {
+			t.Fatalf("manifestFits(keep=%d, omitted=%d): %v", keep, omitted, err)
+		}
+		return fits
+	}
+
+	// Pin down the largest keep that fits with a stale omittedByBudget of 0
+	// and require the SAME candidate to NOT fit with its real omitted count,
+	// so the fixture cannot decay into a vacuous no-op.
+	kmax := -1
+	for k := min(total, MaxManifestEntries-1); k >= 0; k-- {
+		if candidateFits(k, 0) {
+			kmax = k
+			break
+		}
+	}
+	if kmax < 0 {
+		t.Fatal("fixture: no candidate fits with omittedByBudget=0")
+	}
+	if candidateFits(kmax, total-kmax) {
+		t.Fatalf("fixture: candidate with keep=%d and real omitted count %d still fits; the budget boundary is not straddled", kmax, total-kmax)
+	}
+	if !candidateFits(kmax, 0) {
+		t.Fatalf("fixture: candidate with keep=%d does not fit with omittedByBudget=0", kmax)
+	}
+
+	collapseToBudget(context.Background(), manifest)
+
+	if len(manifest.Entries) > MaxManifestEntries {
+		t.Errorf("len(entries) = %d, want <= %d", len(manifest.Entries), MaxManifestEntries)
+	}
+	if got := manifest.Entries[len(manifest.Entries)-1].Disposition; got != DispositionOmittedBudget {
+		t.Errorf("last entry disposition = %q, want %q", got, DispositionOmittedBudget)
+	}
+	kept := len(manifest.Entries) - 1
+	if manifest.Totals.OmittedByBudget != total-kept {
+		t.Errorf("totals.omittedByBudget = %d, want %d", manifest.Totals.OmittedByBudget, total-kept)
+	}
+	serialized, err := manifest.MarshalCanonical()
+	if err != nil {
+		t.Fatalf("marshal manifest: %v", err)
+	}
+	if len(serialized) > ManifestBudgetBytes {
+		t.Errorf("serialized manifest = %d bytes, want <= %d", len(serialized), ManifestBudgetBytes)
+	}
+}
+
+// TestCollapseToBudgetCanceledContext checks that a canceled capture still
+// completes with a budget-enforcing manifest instead of rejecting: with the
+// context already canceled the search settles immediately, leaving at most the
+// real prefix plus the synthetic entry, an authoritative omitted count, and a
+// manifest within budget.
+func TestCollapseToBudgetCanceledContext(t *testing.T) {
+	t.Parallel()
+
+	const total = 500
+	entries := make([]Entry, 0, total)
+	for i := range total {
+		entries = append(entries, Entry{
+			Path:        fmt.Sprintf("artifacts/%s/%04d.dat", strings.Repeat("q", 600), i),
+			Class:       ClassUntracked,
+			Disposition: DispositionStored,
+		})
+	}
+	manifest := &Manifest{
+		SchemaVersion: SchemaVersion,
+		Entries:       entries,
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	collapseToBudget(ctx, manifest)
+
+	if len(manifest.Entries) == 0 {
+		t.Fatal("collapsed manifest holds no entries")
+	}
+	if len(manifest.Entries) > total+1 {
+		t.Errorf("len(entries) = %d, want at most total %d plus the synthetic entry", len(manifest.Entries), total)
+	}
+	budget := 0
+	for _, entry := range manifest.Entries {
+		if entry.Disposition == DispositionOmittedBudget {
+			budget++
+		}
+	}
+	if budget != 1 {
+		t.Errorf("entries with disposition %q = %d, want exactly 1", DispositionOmittedBudget, budget)
+	}
+	kept := len(manifest.Entries) - 1
+	if manifest.Totals.OmittedByBudget != total-kept {
+		t.Errorf("totals.omittedByBudget = %d, want %d", manifest.Totals.OmittedByBudget, total-kept)
+	}
+	serialized, err := manifest.MarshalCanonical()
+	if err != nil {
+		t.Fatalf("marshal manifest: %v", err)
+	}
+	if len(serialized) > ManifestBudgetBytes {
+		t.Errorf("serialized manifest = %d bytes, want <= %d", len(serialized), ManifestBudgetBytes)
 	}
 }
 

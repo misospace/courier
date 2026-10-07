@@ -196,7 +196,7 @@ func Capture(ctx context.Context, opts Options) (*Bundle, error) {
 		Entries:       entries,
 		Totals:        totals,
 	}
-	collapseToBudget(&manifest)
+	collapseToBudget(ctx, &manifest)
 	return &Bundle{Manifest: manifest, Archive: archive}, nil
 }
 
@@ -452,36 +452,50 @@ func buildTar(items []tarItem) ([]byte, error) {
 // keeping the leading entries that fit and collapsing every remaining real
 // entry into one synthetic omitted-manifest-budget record. Totals stay
 // authoritative; a budget overflow never rejects the capture, even when only
-// the synthetic entry fits.
-func collapseToBudget(manifest *Manifest) {
+// the synthetic entry fits. Each probe carries the candidate's real
+// omittedByBudget count so a candidate picked near the budget boundary cannot
+// exceed it once the authoritative count is serialized. The largest fitting
+// keep is found by binary search — monotone, because one more real entry adds
+// more serialized bytes than the shrinking omittedByBudget value can remove.
+// If ctx is canceled mid-search, collapse settles for the largest keep already
+// known to fit (0 if none), so a canceled capture still completes with a
+// budget-enforcing manifest.
+func collapseToBudget(ctx context.Context, manifest *Manifest) {
 	entries := manifest.Entries
 	if len(entries) == 0 {
 		return
 	}
-	if fits, err := manifestFits(manifest, entries); err == nil && fits && len(entries) <= MaxManifestEntries {
+	if fits, err := manifestFits(manifest, entries, 0); err == nil && fits && len(entries) <= MaxManifestEntries {
 		return
 	}
-	keep := len(entries)
-	if keep > MaxManifestEntries-1 {
-		keep = MaxManifestEntries - 1
+	keep := 0
+	lo, hi := 0, len(entries)
+	if hi > MaxManifestEntries-1 {
+		hi = MaxManifestEntries - 1
 	}
-	for ; keep > 0; keep-- {
-		candidate := append([]Entry(nil), entries[:keep]...)
-		candidate = append(candidate, Entry{Disposition: DispositionOmittedBudget})
-		manifest.Entries = candidate
-		if fits, err := manifestFits(manifest, candidate); err == nil && fits {
+	for lo <= hi {
+		if ctx.Err() != nil {
 			break
+		}
+		mid := lo + (hi-lo)/2
+		candidate := append(append([]Entry(nil), entries[:mid]...), Entry{Disposition: DispositionOmittedBudget})
+		if fits, err := manifestFits(manifest, candidate, len(entries)-mid); err == nil && fits {
+			keep = mid
+			lo = mid + 1
+		} else {
+			hi = mid - 1
 		}
 	}
 	manifest.Entries = append(append([]Entry(nil), entries[:keep]...), Entry{Disposition: DispositionOmittedBudget})
 	manifest.Totals.OmittedByBudget = len(entries) - keep
 }
 
-// manifestFits reports whether the manifest with the given entries serializes
-// within ManifestBudgetBytes.
-func manifestFits(manifest *Manifest, entries []Entry) (bool, error) {
+// manifestFits reports whether the manifest with the given entries and
+// omittedByBudget count serializes within ManifestBudgetBytes.
+func manifestFits(manifest *Manifest, entries []Entry, omittedByBudget int) (bool, error) {
 	probe := *manifest
 	probe.Entries = entries
+	probe.Totals.OmittedByBudget = omittedByBudget
 	data, err := probe.MarshalCanonical()
 	if err != nil {
 		return false, err
