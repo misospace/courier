@@ -513,7 +513,10 @@ func lastCommitValidator(adapter *broker.ForgeAdapter, policy broker.Policy) bro
 		}
 		state, err := adapter.Repository(ctx, policy.WorkRepo, policy.WorkRef)
 		if err != nil {
-			return fmt.Errorf("live work ref read failed: %w", err)
+			// A provider read that failed without an answer is availability,
+			// not a mismatch: the caller must retry it, not treat the OID as
+			// unconfirmed.
+			return &broker.StatusUnavailableError{Err: fmt.Errorf("live work ref read failed: %w", err)}
 		}
 		if !state.Exists || state.OID != *patch.LastCommit {
 			return errors.New("lastCommit does not match the live work ref tip")

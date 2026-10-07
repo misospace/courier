@@ -158,13 +158,27 @@ func runArgs(args []string) error {
 
 	// The coordinator loop. It is interrupted by pod termination (context),
 	// not by any wall-clock run limit.
+	//
+	// The status reporter is the harness's only path to the run's status: it
+	// asks the broker's trusted status listener, which alone holds the
+	// status-write identity (§6). Earned heartbeats and dispatch evidence
+	// travel through it; the worker has no path to any of it.
+	reporter := harness.NewStatusReporter(identity.brokerStatusClient(), identity.controlKubeUID, identity.workerUID, 0)
+	if err := reporter.ReconcileOperations(ctx); err != nil {
+		// Best-effort hygiene: a fresh process holds no in-flight operations,
+		// and stale entries are ignored by the operator's validity rules. A
+		// broker that refuses status writes fails closed at the first
+		// persist-before-dispatch instead.
+		fmt.Printf("active-operation reconcile failed (continuing): %v\n", err)
+	}
 	coordinator, err := harness.NewCoordinator(harness.CoordinatorConfig{
 		Gateway:   gateway,
 		Bindings:  bindings,
 		Worker:    identity.delegator(),
 		Snapshot:  engine.PrepareSnapshot,
 		Publisher: engine,
-		Activity:  nil, // earned-activity status wiring is #126's seam
+		Activity:  reporter,
+		Status:    reporter,
 	})
 	if err != nil {
 		return fmt.Errorf("courier-control: %w", err)
@@ -259,25 +273,33 @@ func mustJSON(value any) string {
 }
 
 type controlIdentity struct {
-	runUID      string
-	controlUID  string
-	workerUID   string
-	workerURL   string
-	brokerURL   string
-	signingKey  []byte
-	brokerToken []byte
-	brokerCA    []byte
+	runUID string
+	// controlUID is the minted control-incarnation identifier the signed
+	// worker protocol binds envelopes to.
+	controlUID string
+	// controlKubeUID is this pod's Kubernetes UID; it is the only value the
+	// broker accepts as the fencing UID of a trusted status write.
+	controlKubeUID string
+	workerUID      string
+	workerURL      string
+	brokerURL      string
+	statusURL      string
+	signingKey     []byte
+	brokerToken    []byte
+	brokerCA       []byte
 }
 
 func loadIdentity() (*controlIdentity, error) {
 	out := &controlIdentity{
-		runUID:     os.Getenv(topology.EnvRunUID),
-		controlUID: os.Getenv(topology.EnvControlPodUID),
-		workerUID:  os.Getenv(topology.EnvWorkerPodUID),
-		workerURL:  os.Getenv(topology.EnvWorkerURL),
-		brokerURL:  os.Getenv(topology.EnvBrokerURL),
+		runUID:         os.Getenv(topology.EnvRunUID),
+		controlUID:     os.Getenv(topology.EnvControlPodUID),
+		controlKubeUID: os.Getenv(topology.EnvControlKubeUID),
+		workerUID:      os.Getenv(topology.EnvWorkerPodUID),
+		workerURL:      os.Getenv(topology.EnvWorkerURL),
+		brokerURL:      os.Getenv(topology.EnvBrokerURL),
+		statusURL:      os.Getenv(topology.EnvBrokerStatusURL),
 	}
-	if out.runUID == "" || out.controlUID == "" || out.workerUID == "" || out.workerURL == "" || out.brokerURL == "" {
+	if out.runUID == "" || out.controlUID == "" || out.controlKubeUID == "" || out.workerUID == "" || out.workerURL == "" || out.brokerURL == "" || out.statusURL == "" {
 		return nil, errors.New("courier-control: identity environment is incomplete")
 	}
 	key, err := os.ReadFile(os.Getenv(topology.EnvSigningKeyFile))
@@ -322,6 +344,14 @@ func (i *controlIdentity) brokerProber() *harness.BrokerProbeClient {
 // brokerClient reaches the broker's typed publication API over TLS.
 func (i *controlIdentity) brokerClient() *harness.BrokerClient {
 	return &harness.BrokerClient{BaseURL: i.brokerURL, Token: i.brokerToken, CA: i.brokerCA}
+}
+
+// brokerStatusClient reaches the broker's separate trusted status listener
+// over TLS. It is part of the control identity: without it the harness can
+// neither earn heartbeats nor persist dispatch evidence, so a missing URL
+// fails the launch.
+func (i *controlIdentity) brokerStatusClient() *harness.BrokerClient {
+	return &harness.BrokerClient{BaseURL: i.statusURL, Token: i.brokerToken, CA: i.brokerCA}
 }
 
 // probeWorker exercises the signed worker protocol end to end: snapshot

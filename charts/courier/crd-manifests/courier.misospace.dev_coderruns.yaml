@@ -127,6 +127,49 @@ spec:
           status:
             description: CoderRunStatus is the observed state of a CoderRun.
             properties:
+              activeOperations:
+                additionalProperties:
+                  description: |-
+                    ActiveOperation is one concurrently dispatched tool/subagent operation in
+                    the run's active-operation set. It is dispatch evidence for liveness
+                    suppression — not liveness itself, not a checkpoint — and only a heartbeat
+                    from the matching control incarnation is earned activity.
+                  properties:
+                    briefID:
+                      description: |-
+                        BriefID identifies the work unit the operation belongs to ("control"
+                        for coordinator-level work). Brief IDs identify work units, not
+                        transport attempts.
+                      type: string
+                    coordinatorPodUID:
+                      description: CoordinatorPodUID is the control incarnation that
+                        dispatched it.
+                      type: string
+                    dispatchedAt:
+                      description: |-
+                        DispatchedAt is when trusted control dispatched the operation. It is
+                        diagnostic only: no liveness or timeout semantics attach to it, and
+                        there is no operation-age limit.
+                      format: date-time
+                      type: string
+                    workerPodUID:
+                      description: WorkerPodUID is the worker pod executing it.
+                      type: string
+                  required:
+                  - briefID
+                  - coordinatorPodUID
+                  - dispatchedAt
+                  - workerPodUID
+                  type: object
+                description: |-
+                  ActiveOperations is the set of currently dispatched tool/subagent
+                  operations, keyed by a harness-generated operation ID unique within the
+                  run across retries and pod restarts. Entries persist before dispatch and
+                  clear only on verified completion or cancellation; a valid entry
+                  suppresses stale-heartbeat reaping of its control incarnation. The
+                  trusted broker is the only writer.
+                maxProperties: 64
+                type: object
               admittedAt:
                 description: |-
                   AdmittedAt is when the run first left Pending past the lane
@@ -266,11 +309,21 @@ spec:
                     description: At is when the last successful activity occurred.
                     format: date-time
                     type: string
+                  coordinatorPodUID:
+                    description: |-
+                      CoordinatorPodUID fences this heartbeat to one control incarnation.
+                      Only a heartbeat whose UID matches the current coordinator pod may
+                      reset the consecutive-restart streak or count as fresh for that
+                      incarnation; a previous incarnation's heartbeat is never evidence
+                      about the replacement pod.
+                    minLength: 1
+                    type: string
                   kind:
                     description: 'Kind is the activity kind: "stream" or "tool".'
                     type: string
                 required:
                 - at
+                - coordinatorPodUID
                 - kind
                 type: object
               lastCommit:

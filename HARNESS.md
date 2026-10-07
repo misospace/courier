@@ -34,7 +34,11 @@ Observed in the current tree:
 - `internal/status/status.go` has writer/heartbeat primitives, but production
   pods have no Kube identity and do not populate heartbeat, checkpoint, or
   `lastCommit` (#102). The operator reaper is consequently inert for these
-  runs.
+  runs. Secure mode closes this for its own runs (#126): trusted control
+  writes earned heartbeats, dispatch evidence, the completed-brief
+  checkpoint, and the confirmed `lastCommit` through the broker's trusted
+  status path, and the operator's reap decision honors them. Legacy
+  single-pod runs remain inert.
 
 These are real credential and status-boundary failures, not issues a prompt or
 process convention can fix.
@@ -764,9 +768,8 @@ capacity until a human intervenes. Expose that diagnostic and a manual
 
 ### Target status and authority
 
-#126 adds the following **new** harness-owned CR-status state and regenerates
-the CRD/deepcopy. It does not already exist in `CoderRunStatus` or
-`status.HarnessPatch`:
+#126 implements the following **harness-owned CR-status state** and ships the
+regenerated CRD/deepcopy:
 
 - `heartbeat` gains `coordinatorPodUID` alongside existing `at` and `kind`.
   A stream chunk from *any* role-bound model session is an earned `stream`
@@ -843,8 +846,10 @@ own). Read errors, uncertain identity, or contradictory
 observations mean **do not reap; requeue and retry observation** with a
 structured diagnostic, not a successful run heartbeat. If phase, resource
 version, or pod UID changes before deletion, re-evaluate. Delete with a
-Kubernetes UID precondition on the observed pod, never by name alone. The
-current `checkLiveness` implementation does neither and must change in #126.
+Kubernetes UID precondition on the observed pod, never by name alone.
+`checkLiveness` reads the run and the run's pods through the direct API
+reader for the whole decision, and its reap delete carries the observed
+pod's UID precondition; a conflicted delete re-observes instead of acting.
 Persistent API unavailability is an infrastructure incident requiring human
 intervention, not proof the run is healthy.
 
@@ -858,10 +863,13 @@ cannot supply a heartbeat. Invalid or stale entries are ignored for
 suppression. A dead/missing control or worker triggers operator-owned
 infrastructure recovery after authoritative confirmation, including when
 heartbeat is nil;
-#126 must observe worker pod termination in `observeRunning` and fence stale
-entries. The operator ignores old entries rather than patching harness-owned
-fields; the new control incarnation may clear them via the broker after
-reconciling the world. No entry protects a dead pod.
+`observeRunning` observes worker pod termination through the topology
+observation — a worker or broker that is gone or terminating while control
+still runs fences the round and relaunches against the crashloop ceiling —
+and the reap decision's entry-validity rules fence stale entries by ignoring
+them. The operator ignores old entries rather than patching harness-owned
+fields; the new control incarnation clears them via the broker at process
+start after reconciling the world. No entry protects a dead pod.
 
 In the absence of valid entries, retain #12's behavior: a **nil heartbeat is
 not stall evidence**, a fresh current-incarnation heartbeat resets the
@@ -880,6 +888,7 @@ long a tool may run. Do not infer an old timestamp belongs to the new pod.
 | Worker terminated/missing or control terminated/missing | No suppression; recover infrastructure independently of heartbeat, fence old UID. |
 | Only stale/foreign entries | Ignore entries; apply normal heartbeat and startup-grace rules to current incarnation. |
 | No valid entry; nil heartbeat | No heartbeat-stall reap; separately detect confirmed pod death. |
+| No valid entry; heartbeat present but not attributable to the current coordinator pod (prior incarnation); startup grace ended | No heartbeat-stall reap — the timestamp is not evidence for this pod; the pod-death backstop still acts. |
 | No valid entry; stale current heartbeat; startup grace ended | Reap observed control UID once, resume from world/checkpoint; crashloop backstop. |
 | Any status/pod observation fails or changes during decision | Defer action and re-observe; never use a stale cached snapshot to authorize deletion. |
 
@@ -917,7 +926,14 @@ trusted status path. The local commit is a work product; only a
 broker-confirmed remote OID is recorded as `lastCommit`. A local commit is not
 a published commit, and a failed push advances no checkpoint. If the status
 write fails, retry idempotently and do not acknowledge the unit complete
-until it is durable.
+until it is durable. The durability gate is mechanical, not
+model-respected: a status write that failed through its retry budget is
+retained as status debt in trusted control, and the run's terminal path
+reconciles that debt before honoring any declared outcome — a model
+declaration can never turn an unpersisted completed unit into a successful
+run ending. The reconciliation retry revalidates the recorded OID against
+the live work ref; a persistent failure is an infrastructure failure for
+the operator to relaunch, which resumes remote-first.
 
 **Heartbeat.** The harness writes the activity heartbeat only on successful
 model-stream activity and verified tool boundaries, coalescing writes to at

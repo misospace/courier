@@ -1227,6 +1227,39 @@ named items remain unresolved and must not be described as production-ready:
 
 ## Decisions
 
+- **2026-10-05 — #126: harness status is authenticated through the broker and
+  liveness is fenced by UID.** The broker alone holds the status-write
+  identity: trusted control asks the broker's trusted status listener, which
+  re-reviews every token, re-reads the live run and control pod, and applies
+  typed patches (heartbeat, checkpoint, `lastCommit`, active-operation
+  add/clear/reconcile) under resourceVersion CAS against a fresh read —
+  clearing one operation can never drop another entry or another
+  incarnation's state. The worker has no path to status. Heartbeats carry the
+  dispatching control pod's UID and are earned only by successful model
+  streams and verified tool boundaries, coalesced per cadence; a UID that
+  does not match the current coordinator pod is never evidence for it. Each
+  dispatched operation is persisted as an active-operation entry before its
+  task is sent — a write failure prevents dispatch — and cleared only on
+  independently observed termination, with the earned tool heartbeat in the
+  same update; an uncertain reconciliation retains the entry, and a fresh
+  control incarnation reconciles the whole set at process start. A completed
+  brief is acknowledged only after its checkpoint and the broker-confirmed
+  remote OID are durable, and that gate is mechanical: a failed checkpoint
+  write becomes status debt in trusted control, and the terminal path
+  reconciles the debt (with live-OID revalidation) before honoring any
+  declared outcome — a model declaration can never turn an unpersisted
+  completed unit into a successful ending. Transient status-backend
+  failures (API-server reads, provider reads inside live-world validation)
+  surface as retryable 503, distinct from definite identity or live-world
+  mismatches. The operator's reap decision reads the run and the
+  run's pods through the direct API reader, deletes only under the observed
+  pod's UID precondition (a conflict re-observes), suppresses
+  stale-heartbeat reaping only for entries whose control and worker pods are
+  alive, and treats a nil, unattributable, or foreign heartbeat as no
+  evidence; a vanished or terminating worker or broker under a live control
+  fences the round as infrastructure loss. A silent live wedge still holds
+  lane capacity until a human intervenes — no finite wedge detection is
+  promised. (#126, #119)
 - **2026-10-05 — #125: worker artifacts are validated and integrated in
   trusted control, and publication flows through the broker.** The §5
   contract is implemented as written: a returned artifact is a git bundle

@@ -1163,3 +1163,74 @@ func TestReconcileControlLossWithoutStatusReturnsToClaimed(t *testing.T) {
 		}
 	}
 }
+
+func TestObserveTopologyFencesRoundWhenWorkerVanishes(t *testing.T) {
+	control, c := secureControl(t)
+	run := secureRun("vanish")
+	run.Status.Phase = courier.PhaseRunning
+	if err := c.Create(context.Background(), run); err != nil {
+		t.Fatal(err)
+	}
+	// A live control whose worker is gone (deleted post-launch): the worker
+	// death ends the run's operations, and recovery is the operator's own
+	// infrastructure decision, independent of any heartbeat.
+	controlPod := healthyPod(run.Name, topology.ComponentCoordinator)
+	brokerPod := healthyPod(run.Name, topology.ComponentBroker)
+	for _, pod := range []*corev1.Pod{controlPod, brokerPod} {
+		if err := c.Create(context.Background(), pod); err != nil {
+			t.Fatal(err)
+		}
+	}
+	_, handled, err := control.ObserveTopology(context.Background(), run, listRunPods(t, c, run))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !handled {
+		t.Fatal("a vanished worker with a live control must be handled as infrastructure failure")
+	}
+	var updated courier.CoderRun
+	if err := c.Get(context.Background(), client.ObjectKeyFromObject(run), &updated); err != nil {
+		t.Fatal(err)
+	}
+	if updated.Status.Phase != courier.PhaseClaimed || updated.Status.Restarts != 1 {
+		t.Fatalf("fence relaunch state = phase %q restarts %d", updated.Status.Phase, updated.Status.Restarts)
+	}
+}
+
+// TestObserveTopologyTerminatedControlWithVanishedWorkerIsNilSafe pins the
+// ordering guard: a terminated control can coexist with an already-vanished
+// worker or broker in one pods snapshot (worker eviction, then control
+// exit, both landing between reconciles). The fence must treat an absent
+// pod as nothing-to-delete, never dereference it.
+func TestObserveTopologyTerminatedControlWithVanishedWorkerIsNilSafe(t *testing.T) {
+	control, c := secureControl(t)
+	run := secureRun("vanishterm")
+	run.Status.Phase = courier.PhaseRunning
+	if err := c.Create(context.Background(), run); err != nil {
+		t.Fatal(err)
+	}
+	// The control container has exited; the worker pod is absent entirely.
+	controlPod := healthyPod(run.Name, topology.ComponentCoordinator)
+	controlPod.Status.ContainerStatuses = []corev1.ContainerStatus{{
+		Name:  topology.ControlContainerName,
+		State: corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{ExitCode: 1}},
+	}}
+	brokerPod := healthyPod(run.Name, topology.ComponentBroker)
+	for _, pod := range []*corev1.Pod{controlPod, brokerPod} {
+		if err := c.Create(context.Background(), pod); err != nil {
+			t.Fatal(err)
+		}
+	}
+	_, handled, err := control.ObserveTopology(context.Background(), run, listRunPods(t, c, run))
+	if err != nil {
+		t.Fatalf("ObserveTopology() error = %v; a vanished worker must not panic the fence", err)
+	}
+	if handled {
+		t.Fatal("handled = true, want the exit-code mapping to proceed")
+	}
+	// The broker and its ingress were still fenced.
+	var updated corev1.Pod
+	if err := c.Get(context.Background(), client.ObjectKeyFromObject(brokerPod), &updated); err == nil && updated.DeletionTimestamp == nil {
+		t.Fatal("broker pod survived with no deletion in flight; the terminated control must fence it")
+	}
+}
