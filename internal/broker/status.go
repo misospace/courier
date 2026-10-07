@@ -229,15 +229,6 @@ type StatusConflictError struct{ Err error }
 func (e *StatusConflictError) Error() string { return e.Err.Error() }
 func (e *StatusConflictError) Unwrap() error { return e.Err }
 
-// WriteErr classifies one Write failure for the transport layer.
-func WriteErr(err error) error {
-	var conflict *StatusConflictError
-	if errors.As(err, &conflict) {
-		return conflict
-	}
-	return err
-}
-
 // sameOperationEvidence reports whether two records of one operation carry
 // identical evidence. Timestamps compare as instants, not as struct values:
 // a re-acknowledged write may carry a different clock representation of the

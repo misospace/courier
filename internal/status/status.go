@@ -220,6 +220,15 @@ type Heartbeat struct {
 	pending     *courierv1alpha1.Heartbeat
 }
 
+// WithCoordinatorPodUID fences every recorded heartbeat to one control
+// incarnation (§6): only a heartbeat whose UID matches the current
+// coordinator pod may reset the consecutive-restart streak or count as fresh
+// for that incarnation.
+func (h *Heartbeat) WithCoordinatorPodUID(uid string) *Heartbeat {
+	h.coordinatorPodUID = uid
+	return h
+}
+
 // NewHeartbeat constructs a coalescing heartbeat reporter. A non-positive
 // cadence uses DefaultHeartbeatCadence.
 func NewHeartbeat(writer *HarnessWriter, name types.NamespacedName, clock Clock, cadence time.Duration) *Heartbeat {
