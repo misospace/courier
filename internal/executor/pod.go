@@ -58,6 +58,13 @@ type PodConfig struct {
 	BootstrapBinary        string
 	OpenCode               OpenCode
 	Resources              corev1.ResourceRequirements
+	// EvidenceURL, EvidenceToken, and EvidenceNonce enable bounded
+	// failure-evidence capture. Capture is all-or-nothing: all three must be
+	// set together, and leaving them empty keeps the pod on the kubelet's
+	// default termination grace period.
+	EvidenceURL   string
+	EvidenceToken string
+	EvidenceNonce string
 }
 
 // DefaultPodConfig is suitable for the temporary OpenCode shim image. The
@@ -256,12 +263,66 @@ func (b *PodBuilder) Build(run *courierv1alpha1.CoderRun, lane *courierv1alpha1.
 			}},
 		},
 	}
+	// A 45-second grace only exists to fit the evidence capture deadline; a
+	// run that does not capture keeps the kubelet's default.
+	if config.EvidenceEnabled() {
+		pod.Spec.TerminationGracePeriodSeconds = int64Ptr(EvidenceTerminationGracePeriodSeconds)
+	}
 	if strings.TrimSpace(config.EnvironmentSecret) != "" {
 		pod.Spec.Containers[0].EnvFrom = []corev1.EnvFromSource{{
 			SecretRef: &corev1.SecretEnvSource{LocalObjectReference: corev1.LocalObjectReference{Name: config.EnvironmentSecret}},
 		}}
 	}
 	return pod, nil
+}
+
+// CredentialEnvRef is one per-key credential environment variable the Pod
+// builder injects by SecretKeyRef.
+type CredentialEnvRef struct {
+	Name   string
+	Secret string
+	Key    string
+}
+
+// CredentialEnvRefs returns the (env name, Secret, key) triples the builder
+// injects key-by-key. It is the single source of truth for what the executor
+// receives and what the evidence intake (#200) re-scans against: one shared
+// function produces the per-key credential references so the pod builder and
+// the intake can never enumerate the same Secret keys differently. The
+// envFrom environment Secret (--executor-environment-secret) is deliberately
+// excluded: kubelet maps its keys 1:1 to env names the builder never
+// enumerates, so the intake registers it by a different route.
+func CredentialEnvRefs(config PodConfig) []CredentialEnvRef {
+	var refs []CredentialEnvRef
+	if strings.TrimSpace(config.GitCredentialSecret) != "" {
+		usernameKey := config.GitUsernameKey
+		if usernameKey == "" {
+			usernameKey = "username"
+		}
+		tokenKey := config.GitTokenKey
+		if tokenKey == "" {
+			tokenKey = "token"
+		}
+		refs = append(refs,
+			CredentialEnvRef{Name: "COURIER_GIT_USERNAME", Secret: config.GitCredentialSecret, Key: usernameKey},
+			CredentialEnvRef{Name: "COURIER_GIT_TOKEN", Secret: config.GitCredentialSecret, Key: tokenKey},
+		)
+	}
+	githubSecret := config.GitHubCredentialSecret
+	if githubSecret == "" {
+		githubSecret = config.GitCredentialSecret
+	}
+	if strings.TrimSpace(githubSecret) != "" {
+		githubTokenKey := config.GitHubTokenKey
+		if githubTokenKey == "" {
+			githubTokenKey = config.GitTokenKey
+		}
+		if githubTokenKey == "" {
+			githubTokenKey = "token"
+		}
+		refs = append(refs, CredentialEnvRef{Name: "GITHUB_TOKEN", Secret: githubSecret, Key: githubTokenKey})
+	}
+	return refs
 }
 
 func podEnvironment(invocation Invocation, executorName string, config PodConfig) []corev1.EnvVar {
@@ -281,7 +342,10 @@ func podEnvironment(invocation Invocation, executorName string, config PodConfig
 		baseRemoteURL = strings.Replace(baseRemoteURL, "%s", escapedRepositoryPath(invocation.Repo), 1)
 	}
 	terminationFile := runtimePath + "/termination"
-	values := toKubernetesEnv(EnvironmentWithConfig(invocation, executorName, remoteURL, baseRemoteURL, config.BaseBranch, config.OpenCode.Binary, config.OpenCode.Format, terminationFile, config.OpenCode.Agent))
+	// Validate and the launcher both check the trimmed URL, so the pod env
+	// must carry the trimmed value too: a caller that bypasses the launcher
+	// must not be able to pad the intake URL with whitespace.
+	values := toKubernetesEnv(EnvironmentWithConfig(invocation, executorName, remoteURL, baseRemoteURL, config.BaseBranch, config.OpenCode.Binary, config.OpenCode.Format, terminationFile, config.OpenCode.Agent, strings.TrimSpace(config.EvidenceURL), config.EvidenceNonce))
 	values = append(values,
 		corev1.EnvVar{
 			Name:  "OPENCODE_CONFIG",
@@ -293,45 +357,28 @@ func podEnvironment(invocation Invocation, executorName string, config PodConfig
 		corev1.EnvVar{Name: "COURIER_SCRATCH_DIR", Value: scratchPath},
 		corev1.EnvVar{Name: "COURIER_TOOLCHAIN_DIR", Value: toolchainReferencePath},
 	)
-	githubSecret := config.GitHubCredentialSecret
-	if githubSecret == "" {
-		githubSecret = config.GitCredentialSecret
+	// Per-key credential references come from the shared helper so the pod
+	// builder and the evidence intake can never enumerate the same Secret keys
+	// differently.
+	for _, ref := range CredentialEnvRefs(config) {
+		values = append(values, corev1.EnvVar{
+			Name: ref.Name,
+			ValueFrom: &corev1.EnvVarSource{SecretKeyRef: &corev1.SecretKeySelector{
+				LocalObjectReference: corev1.LocalObjectReference{Name: ref.Secret}, Key: ref.Key,
+			}},
+		})
 	}
-	if strings.TrimSpace(config.GitCredentialSecret) == "" && strings.TrimSpace(githubSecret) == "" {
-		return values
-	}
-	env := values
-	if strings.TrimSpace(config.GitCredentialSecret) != "" {
-		usernameKey := config.GitUsernameKey
-		if usernameKey == "" {
-			usernameKey = "username"
-		}
-		tokenKey := config.GitTokenKey
-		if tokenKey == "" {
-			tokenKey = "token"
-		}
-		env = append(env,
-			corev1.EnvVar{Name: "COURIER_GIT_USERNAME", ValueFrom: &corev1.EnvVarSource{SecretKeyRef: &corev1.SecretKeySelector{
-				LocalObjectReference: corev1.LocalObjectReference{Name: config.GitCredentialSecret}, Key: usernameKey,
-			}}},
-			corev1.EnvVar{Name: "COURIER_GIT_TOKEN", ValueFrom: &corev1.EnvVarSource{SecretKeyRef: &corev1.SecretKeySelector{
-				LocalObjectReference: corev1.LocalObjectReference{Name: config.GitCredentialSecret}, Key: tokenKey,
+	// Evidence env is appended independently of the credential logic so a
+	// capture is wired even on a run with no git secrets.
+	if config.EvidenceEnabled() {
+		values = append(values,
+			corev1.EnvVar{Name: EnvEvidenceToken, Value: config.EvidenceToken},
+			corev1.EnvVar{Name: EnvPodUID, ValueFrom: &corev1.EnvVarSource{FieldRef: &corev1.ObjectFieldSelector{
+				FieldPath: "metadata.uid",
 			}}},
 		)
 	}
-	if strings.TrimSpace(githubSecret) != "" {
-		githubTokenKey := config.GitHubTokenKey
-		if githubTokenKey == "" {
-			githubTokenKey = config.GitTokenKey
-			if githubTokenKey == "" {
-				githubTokenKey = "token"
-			}
-		}
-		env = append(env, corev1.EnvVar{Name: "GITHUB_TOKEN", ValueFrom: &corev1.EnvVarSource{SecretKeyRef: &corev1.SecretKeySelector{
-			LocalObjectReference: corev1.LocalObjectReference{Name: githubSecret}, Key: githubTokenKey,
-		}}})
-	}
-	return env
+	return values
 }
 
 // escapedRepositoryPath keeps repository components in the configured URL's
@@ -404,6 +451,15 @@ func stringPtr(value string) *string {
 	return &value
 }
 
+// EvidenceEnabled reports whether failure-evidence capture is enabled for this
+// configuration. Capture is all-or-nothing: the intake URL and the token must
+// both be present. A partially configured setup is rejected in Validate rather
+// than silently degrading, so this gate is only reached once the three fields
+// are consistent.
+func (c PodConfig) EvidenceEnabled() bool {
+	return strings.TrimSpace(c.EvidenceURL) != "" && strings.TrimSpace(c.EvidenceToken) != ""
+}
+
 // Validate checks the deployment-facing parts of a PodConfig before a caller
 // starts creating Pods. Build performs the same checks while constructing the
 // actual object.
@@ -422,6 +478,25 @@ func (c PodConfig) Validate() error {
 	}
 	if pathsOverlap(c.WorkspacePath, toolchainReferencePath) {
 		return errors.New("executor: workspace path must not overlap the toolchain reference path")
+	}
+	// Capture is all-or-nothing. A half-configured evidence setup (for example
+	// a nonce without the URL and token) would hand the intake a token it
+	// cannot route, so fail closed instead of wiring a partial env.
+	set := 0
+	if strings.TrimSpace(c.EvidenceURL) != "" {
+		set++
+	}
+	if strings.TrimSpace(c.EvidenceToken) != "" {
+		set++
+	}
+	if strings.TrimSpace(c.EvidenceNonce) != "" {
+		set++
+	}
+	if set != 0 && set != 3 {
+		return errors.New("executor: evidence capture is partially configured: EvidenceURL, EvidenceToken, and EvidenceNonce must all be set or all empty")
+	}
+	if strings.TrimSpace(c.EvidenceURL) != "" {
+		return ValidateEvidenceURL(c.EvidenceURL)
 	}
 	return nil
 }

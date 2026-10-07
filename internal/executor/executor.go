@@ -263,7 +263,7 @@ func RunContextEnvironment(inv Invocation) []EnvVar {
 // values are kept in environment variables rather than shell-expanded command
 // strings so repository names, framing, and goals cannot become shell syntax.
 func Environment(inv Invocation, executorName string) []EnvVar {
-	return EnvironmentWithConfig(inv, executorName, "", "", "", "", "", "", "")
+	return EnvironmentWithConfig(inv, executorName, "", "", "", "", "", "", "", "", "")
 }
 
 // EnvironmentWithConfig extends the run context with the deployment-specific
@@ -271,8 +271,10 @@ func Environment(inv Invocation, executorName string) []EnvVar {
 // separately by the Pod builder as SecretKeyRef values. remoteURL points at
 // the head repository for a fix-pr run; baseRemoteURL always points at the
 // repository that owns the base branch, so a fork workspace can sync against
-// upstream while pushing to the fork.
-func EnvironmentWithConfig(inv Invocation, executorName, remoteURL, baseRemoteURL, baseBranch, opencodeBinary, opencodeFormat, terminationFile, opencodeAgent string) []EnvVar {
+// upstream while pushing to the fork. evidenceURL and evidenceNonce are set
+// only when failure-evidence capture is enabled, and each empty argument
+// omits its own environment name.
+func EnvironmentWithConfig(inv Invocation, executorName, remoteURL, baseRemoteURL, baseBranch, opencodeBinary, opencodeFormat, terminationFile, opencodeAgent, evidenceURL, evidenceNonce string) []EnvVar {
 	values := []EnvVar{{Name: "COURIER_EXECUTOR", Value: executorName}}
 	values = append(values, RunContextEnvironment(inv)...)
 	values = append(values,
@@ -291,6 +293,12 @@ func EnvironmentWithConfig(inv Invocation, executorName, remoteURL, baseRemoteUR
 		EnvVar{Name: "GIT_COMMITTER_NAME", Value: "Courier"},
 		EnvVar{Name: "GIT_COMMITTER_EMAIL", Value: "courier@localhost"},
 	)
+	if strings.TrimSpace(evidenceURL) != "" {
+		values = append(values, EnvVar{Name: EnvEvidenceURL, Value: evidenceURL})
+	}
+	if strings.TrimSpace(evidenceNonce) != "" {
+		values = append(values, EnvVar{Name: EnvEvidenceNonce, Value: evidenceNonce})
+	}
 	return values
 }
 
