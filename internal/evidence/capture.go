@@ -214,6 +214,8 @@ func localCommitEntries(ctx context.Context, dir string, opts Options, scanner *
 			return out, nil
 		}
 	}
+	// rev-list is read in full: its size is bounded by the commit count ahead
+	// of ref, which the per-commit content caps bound downstream.
 	list, err := runGit(ctx, dir, "rev-list", ref+"..HEAD")
 	if err != nil {
 		return out, err
@@ -299,6 +301,8 @@ func refResolvable(ctx context.Context, dir, ref string) bool {
 // XY pair. A rename or copy record is followed by its origin path, which is
 // consumed as part of the same entry.
 func listChanges(ctx context.Context, dir string) ([]change, error) {
+	// The porcelain change set is read in full: its size is bounded by the
+	// number of worktree changes the capture must walk, not a single artifact.
 	out, err := runGit(ctx, dir, "status", "--porcelain=v1", "-z", "--untracked-files=all", "--", ".")
 	if err != nil {
 		return nil, err
@@ -460,7 +464,9 @@ func buildTar(items []tarItem) ([]byte, error) {
 // more serialized bytes than the shrinking omittedByBudget value can remove.
 // If ctx is canceled mid-search, collapse settles for the largest keep already
 // known to fit (0 if none), so a canceled capture still completes with a
-// budget-enforcing manifest.
+// budget-enforcing manifest. The budget bounds entries and content; a
+// keep=0 manifest is the accepted floor, whose only remaining size is
+// caller-provided identity, not content.
 func collapseToBudget(ctx context.Context, manifest *Manifest) {
 	entries := manifest.Entries
 	if len(entries) == 0 {
