@@ -198,9 +198,12 @@ spec:
 The operator derives the resolve branch, creates the coordinator pod, and
 observes its exit. The goal gives the coordinator the exact outcome-file path in
 executor-owned per-run scratch outside the checkout. Exit `0` (`changes`) moves
-the run to `Verifying` only after committed work is verified on the run branch;
-the operator then polls the external PR and CI state until it reaches
-`AwaitingReview` or `NeedsHuman`. Exit `2` (`needs_decision` or
+the run to `Verifying` only after the coordinator validates the integrated work
+locally, fixes any failures, and committed work is verified on the run branch;
+the operator then polls the external PR and CI state. Stable green observations
+reach `AwaitingReview`; a failed check reaches `Failed` and is handled by the
+source's failure policy, while missing or draft PR state reaches `NeedsHuman`.
+Exit `2` (`needs_decision` or
 `blocked_external`) moves the run to `NeedsHuman`. Exit `3` (`no_change_needed`)
 moves a resolve-issue run to `AwaitingReview` with the source `in-review`, and a
 fix-pr run to `NeedsHuman`, never settling the source; its blocked lifecycle

@@ -22,6 +22,7 @@ func TestReconcilerEmitsRunScopedPhaseTransitionEvents(t *testing.T) {
 		phase    courierv1alpha1.Phase
 		objects  func(run *courierv1alpha1.CoderRun) []runtime.Object
 		observer *fakeWorldObserver
+		mode     courierv1alpha1.Mode
 		launch   bool
 		// settledGreen presets status.checkFingerprint so the single
 		// all-green observation matches the prior candidate and settles
@@ -55,15 +56,19 @@ func TestReconcilerEmitsRunScopedPhaseTransitionEvents(t *testing.T) {
 			wantPhase:    courierv1alpha1.PhaseAwaitingReview,
 		},
 		{
-			name:      "failed checks transition to NeedsHuman",
+			name:      "failed fix-pr checks transition to Failed",
 			phase:     courierv1alpha1.PhaseVerifying,
 			observer:  &failedObserver,
-			wantPhase: courierv1alpha1.PhaseNeedsHuman,
+			mode:      courierv1alpha1.ModeFixPR,
+			wantPhase: courierv1alpha1.PhaseFailed,
 		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			run := admissionRun("run", "local", tt.phase)
+			if tt.mode != "" {
+				run.Spec.Mode = tt.mode
+			}
 			if tt.settledGreen {
 				run.Status.CheckFingerprint = checkSetFingerprint(tt.observer.observation)
 			}
@@ -113,7 +118,11 @@ func TestReconcilerEmitsRunScopedPhaseTransitionEvents(t *testing.T) {
 			if event["status"] != string(tt.wantPhase) {
 				t.Fatalf("transition status = %v, want %v", event["status"], tt.wantPhase)
 			}
-			if event["repo"] != "acme/widgets" || event["ref"] != float64(1) || event["mode"] != "resolve-issue" {
+			wantMode := string(tt.mode)
+			if wantMode == "" {
+				wantMode = string(courierv1alpha1.ModeResolveIssue)
+			}
+			if event["repo"] != "acme/widgets" || event["ref"] != float64(1) || event["mode"] != wantMode {
 				t.Fatalf("event lost repo/ref/mode metadata: %v", event)
 			}
 		})

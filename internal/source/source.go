@@ -82,7 +82,8 @@ const (
 	ResultReady Result = "ready"
 	// ResultBlocked marks work requiring human intervention.
 	ResultBlocked Result = "blocked"
-	// ResultFailed marks work that failed execution.
+	// ResultFailed marks work that failed execution. Sources own the policy for
+	// handling it; some may issue a fresh attempt while others only record it.
 	ResultFailed Result = "failed"
 )
 

@@ -1,7 +1,6 @@
 package git
 
 import (
-	"bytes"
 	"context"
 	"encoding/hex"
 	"errors"
@@ -79,11 +78,13 @@ func (b *Broker) ImportBundle(ctx context.Context, bundlePath, proposedOID, expe
 	if err != nil || !bundleInfo.Mode().IsRegular() {
 		return errors.New("git broker: bundle must be a regular non-symlink file")
 	}
-	if err := validOID(proposedOID); err != nil {
+	proposedOID, ok := canonicalOID(proposedOID)
+	if !ok {
 		return errors.New("git broker: invalid proposed commit OID")
 	}
 	if expectedTip != "" {
-		if err := validOID(expectedTip); err != nil {
+		var ok bool
+		if expectedTip, ok = canonicalOID(expectedTip); !ok {
 			return errors.New("git broker: invalid expected tip OID")
 		}
 	}
@@ -122,6 +123,14 @@ func (b *Broker) ImportBundle(ctx context.Context, bundlePath, proposedOID, expe
 func (b *Broker) IsAncestor(ctx context.Context, ancestor, descendant string) (bool, error) {
 	if b == nil || b.directory == "" {
 		return false, errors.New("git broker: repository is unavailable")
+	}
+	ancestor, ok := canonicalOID(ancestor)
+	if !ok {
+		return false, errors.New("git broker: invalid ancestor object ID")
+	}
+	descendant, ok = canonicalOID(descendant)
+	if !ok {
+		return false, errors.New("git broker: invalid descendant object ID")
 	}
 	ancestorCommit, err := b.resolveCommit(ctx, ancestor)
 	if err != nil {
@@ -165,7 +174,8 @@ func (b *Broker) push(ctx context.Context, remoteURL, ref, proposedOID, username
 	if err := validateRef(ref, "branch"); err != nil {
 		return errors.New("git broker: invalid destination ref")
 	}
-	if err := validOID(proposedOID); err != nil {
+	proposedOID, ok := canonicalOID(proposedOID)
+	if !ok {
 		return errors.New("git broker: invalid proposed commit OID")
 	}
 	commit, err := b.resolveCommit(ctx, proposedOID)
@@ -228,6 +238,10 @@ func (b *Broker) resolveCommit(ctx context.Context, oid string) (string, error) 
 }
 
 func resolveCommitIn(ctx context.Context, directory, oid string) (string, error) {
+	oid, ok := canonicalOID(oid)
+	if !ok {
+		return "", errInvalid
+	}
 	out, err := brokerGit(ctx, directory, "rev-parse", "--verify", oid+"^{commit}")
 	if err != nil {
 		return "", err
@@ -247,30 +261,16 @@ func brokerGit(ctx context.Context, directory string, args ...string) ([]byte, e
 // every remote URL, ref, and object ID before constructing args; no request text
 // or model-controlled string may be passed through this variadic boundary.
 func brokerGitRun(ctx context.Context, directory string, env []string, args ...string) ([]byte, error) {
-	cmd := exec.CommandContext(ctx, "git", args...)
-	if directory != "" {
-		cmd.Dir = directory
-	}
-	cmd.Env = []string{"PATH=" + os.Getenv("PATH"), "HOME=" + os.DevNull, "GIT_TERMINAL_PROMPT=0", "GIT_CONFIG_NOSYSTEM=1", "GIT_CONFIG_GLOBAL=" + os.DevNull, "GIT_CONFIG_COUNT=0", "GIT_OPTIONAL_LOCKS=0"}
-	cmd.Env = append(cmd.Env, env...)
-	var stdout, stderr bytes.Buffer
-	cmd.Stdout, cmd.Stderr = &stdout, &stderr
-	if err := cmd.Run(); err != nil {
+	stdout, _, err := hardened(ctx, directory, env, args)
+	if err != nil {
 		// Never propagate Git's stderr: transports routinely echo credentialed URLs.
 		return nil, errors.New("git command failed")
 	}
-	return stdout.Bytes(), nil
+	return stdout, nil
 }
 
 func brokerGitExit(ctx context.Context, directory string, args ...string) error {
-	cmd := exec.CommandContext(ctx, "git", args...)
-	if directory != "" {
-		cmd.Dir = directory
-	}
-	cmd.Env = []string{"PATH=" + os.Getenv("PATH"), "HOME=" + os.DevNull, "GIT_TERMINAL_PROMPT=0", "GIT_CONFIG_NOSYSTEM=1", "GIT_CONFIG_GLOBAL=" + os.DevNull, "GIT_CONFIG_COUNT=0", "GIT_OPTIONAL_LOCKS=0"}
-	cmd.Stdout = &bytes.Buffer{}
-	cmd.Stderr = &bytes.Buffer{}
-	return cmd.Run()
+	return HardenedExit(ctx, directory, args...)
 }
 
 func writeAskpassHelper(parent string) (string, error) {
@@ -297,14 +297,39 @@ func writeAskpassHelper(parent string) (string, error) {
 }
 
 func validOID(oid string) error {
+	if _, ok := canonicalOID(oid); !ok {
+		return errInvalid
+	}
+	return nil
+}
+
+var errInvalid = errors.New("invalid object ID")
+
+// canonicalOID normalizes a claimed object ID to the exact form used in git
+// arguments, reporting invalid input. The returned string is constructed
+// byte-by-byte from verified hex bytes only: it is the single choke point
+// that stands between any remote- or request-claimed OID and a git argv
+// element, so an argv value can never carry option syntax, separators, or
+// any non-hex byte.
+func canonicalOID(oid string) (string, bool) {
 	if (len(oid) != 40 && len(oid) != 64) || strings.TrimSpace(oid) != oid {
-		return errors.New("invalid object ID")
+		return "", false
 	}
 	decoded, err := hex.DecodeString(oid)
 	if err != nil || len(decoded)*2 != len(oid) {
-		return errors.New("invalid object ID")
+		return "", false
 	}
-	return nil
+	encoded := strings.ToLower(hex.EncodeToString(decoded))
+	var built strings.Builder
+	built.Grow(len(encoded))
+	for i := 0; i < len(encoded); i++ {
+		c := encoded[i]
+		if (c < '0' || c > '9') && (c < 'a' || c > 'f') {
+			return "", false
+		}
+		built.WriteByte(c)
+	}
+	return built.String(), true
 }
 
 func hasControl(value string) bool {
@@ -341,3 +366,7 @@ func validateBrokerURL(raw string) error {
 	}
 	return nil
 }
+
+// ValidOID reports whether an object ID is syntactically valid (40 or 64
+// lowercase-or-uppercase hex digits).
+func ValidOID(oid string) bool { return validOID(oid) == nil }

@@ -9,7 +9,7 @@
 ARG BINARIES=builder
 
 # Build the manager and executor binaries.
-FROM golang:1.27.1@sha256:e0174e51e81218523251d85d248a90d24c3d5e81543b4f07a5d66229397db190 AS builder
+FROM golang:1.27.1@sha256:162be5298a40ed317005c8339c6de4d10d3eef336d66dc8e9259b03ab9d3a6d2 AS builder
 ARG TARGETOS
 ARG TARGETARCH
 
@@ -41,7 +41,7 @@ COPY dist/ /workspace/
 
 FROM binaries-${BINARIES} AS binaries
 
-FROM golang:1.27.1@sha256:e0174e51e81218523251d85d248a90d24c3d5e81543b4f07a5d66229397db190 AS toolchain
+FROM golang:1.27.1@sha256:162be5298a40ed317005c8339c6de4d10d3eef336d66dc8e9259b03ab9d3a6d2 AS toolchain
 ARG CONTROLLER_TOOLS_VERSION=v0.16.5
 ARG HELM_VERSION=v3.18.6
 
@@ -54,7 +54,7 @@ RUN --mount=type=cache,target=/go/pkg/mod \
 # Coordinator image: the bootstrap OpenCode runtime. The executor contract
 # (BOOTSTRAP.md) requires courier-executor, git, and opencode in one image.
 # Debian (not alpine) because the opencode npm package ships glibc binaries.
-FROM node:24-bookworm-slim@sha256:0e0ff40c39bc087845bfb27465a0df4ea419520094bc35842ff83dd8cbe6f9b6 AS coordinator
+FROM node:24-bookworm-slim@sha256:d6aa754f16b3197301076f047b5def2f02ea1dbbc2ca920407d46d7ec7f87b20 AS coordinator
 ARG OPENCODE_VERSION=1.18.31
 
 RUN apt-get update && \

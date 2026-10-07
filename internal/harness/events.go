@@ -8,7 +8,8 @@
 // Delegation is typed: briefs carry a stable ID, settled decisions, owned
 // files, non-goals, and an observable success check; results are untrusted
 // and can never publish. The coordinator owns the run's terminal contract —
-// plan, integrate, verify, publish — through trusted code paths only.
+// plan, integrate, locally validate, publish — through trusted code paths only;
+// external verification remains with the operator.
 package harness
 
 import "errors"
