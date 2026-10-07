@@ -2,9 +2,9 @@
 
 Courier is a Kubernetes operator that runs autonomous coding *coordinators* in
 pods. You feed it an issue (or a PR with feedback); it runs a coordinator that
-plans, delegates to model sub-agents, opens a PR, drives CI green, and leaves it
-in a mergeable state — then hands control back to a human to merge or to send
-back with feedback.
+plans, delegates to model sub-agents, locally validates and publishes a change,
+then hands control back to the operator to observe CI and a human to merge or
+send back with feedback.
 
 It replaces [Foreman](https://github.com/llmkube) as the executor for a
 self-hosted coding loop, and it subsumes the scheduled "cronjob" work that
@@ -17,14 +17,14 @@ dogfoods itself: Courier develops Courier.
 Foreman kneecaps local models. It runs each task in a narrow pod, gives the
 coder no feedback mid-run, and treats a reviewer NO-GO as a reason to kill the
 workload rather than to let the coder *fix the thing*. But local models do their
-best work exactly when they can iterate: open a PR, watch CI, read the failures,
-get a second opinion, and converge over many turns. That is how an opencode
-session left running for hours turns out a clean PR, and it is the loop Foreman
-structurally prevents.
+best work exactly when they can iterate locally: delegate, integrate, run
+relevant checks, and converge over many turns before publishing. That is how an
+opencode session left running for hours turns out a locally validated PR, and it
+is the loop Foreman structurally prevents.
 
-The result is model-agnostic — the same iterate-to-green loop serves cloud
+The result is model-agnostic — the same local-iteration loop serves cloud
 models just as well. Local is simply the case that needed it most, and the case
-most executors ignore.
+most executors ignore; the operator owns external verification after handoff.
 
 Courier inverts Foreman's stance. Its guiding principle:
 
@@ -102,13 +102,13 @@ all workers or isolation controls are implemented or ready.
 
 ## The coordinator
 
-The coordinator role method is the one proven in the opencode `coordinator-local`
-agent (its *reference*, not its required configuration): **plan, delegate,
-integrate, verify — do not implement yourself.** It settles the design and owns integration and
-verification; it hands small, file-scoped briefs to a coder sub-agent (objective,
-settled decisions with exact values, owned files, out-of-scope, an observable
-success check) and asks for a compact handoff. It runs an independent,
-different-family reviewer pass over the diff before declaring done.
+The coordinator role method is **plan, delegate, integrate, locally validate,
+and publish — do not implement yourself.** It settles the design and owns
+integration and local validation; it hands small, file-scoped briefs to a
+bounded delegate (objective, settled decisions with exact values, owned files,
+out-of-scope, an observable success check) and asks for a compact handoff. A
+review pass may be useful, but the coordinator does not wait for review or
+external CI before handing published work to the operator.
 
 That method is **agnostic** and lives in a static role skeleton. The specifics —
 which models fill the coordinator/coder/reviewer roles, which provider they're on
@@ -120,25 +120,29 @@ role.
 
 ### Modes
 
-- **resolve-issue** — "Open a PR to address {{issue}} and drive it to a
-  review-ready state with CI green. Route every forge read and write through
-  the configured forge capability, not a forge-specific CLI. Delegate
-  implementation, research, and review to sub-agents, but you own completion:
-  integrate and verify their work, push the branch, and open or update the
-  pull request yourself — never stop at a local commit or branch when a pull
-  request is required. Publish only to the run branch {{branch}}: commit on,
-  push, and open or update the pull request from that single branch, and never
-  create or publish work from any other branch."
+- **resolve-issue** — "Open a PR to address {{issue}}. Run relevant local
+  validation, publish the change, and hand off for external verification. Route
+  every forge read and write through the configured forge capability, not a
+  forge-specific CLI. Delegate implementation, research, and review to
+  sub-agents, but you own completion: integrate and validate their work, then
+  run relevant local validation against the integrated changes yourself before
+  declaring completion and fix failures before declaring completion. Commit and push the run branch,
+  and open or update the pull request yourself — never stop at a local commit or
+  branch when a pull request is required. Publish only to the run branch
+  {{branch}} and never create or publish work from any other branch."
 - **fix-pr** — "Take over PR #{{pr}}. Inspect the current pull request state,
-  CI/checks, and review feedback to determine what's blocking it, then return
-  it to a review-ready state. Route every forge read and write through the
-  configured forge capability, not a forge-specific CLI. Delegate
-  implementation, research, and review to sub-agents, but you own completion:
-  integrate and verify their work, push the branch, and open or update the
-  pull request yourself — never stop at a local commit or branch when a pull
-  request is required. Publish only to the run branch {{branch}}: commit on,
-  push, and open or update the pull request from that single branch, and never
-  create or publish work from any other branch."
+  CI/checks, and existing review feedback to determine what work is needed;
+  address feedback already present without repeatedly searching for new reviews.
+  Run relevant local validation, publish the change, and hand off for external
+  verification. Route every forge read and write through the configured forge
+  capability, not a forge-specific CLI. Delegate implementation, research, and
+  review to sub-agents, but you own completion: integrate and validate their
+  work, then run relevant local validation against the integrated changes
+  yourself before declaring completion and fix failures before declaring completion. Commit and
+  push the run branch, and open or update the pull request yourself — never stop
+  at a local commit or branch when a pull request is required. Publish only to
+  the run branch {{branch}} and never create or publish work from any other
+  branch."
 
 Goals stay short — a goal plus tools — but each carries one non-negotiable
 contract: delegation covers bounded work, never the coordinator's ownership
@@ -152,25 +156,32 @@ manipulating the git index. Scratch is disposable, not a checkpoint.
 
 ### Terminal states
 
-A run ends at exactly one of:
+A coordinator run ends after one of:
 
-- **PR open, CI green, coordinator declares ready** → the run is done. What
-  happens next is human-gated: merge it, or add feedback. The coordinator has
-  no merge capability; merging is an explicit human-maintainer action, or an
-  auto-merge a maintainer enabled (see
-  [docs/repository-settings.md](./docs/repository-settings.md)).
-- **needs-human** → a declared decision or external block, or an operator
-  condition such as a crashloop, requires a human. Coordinator-declared blocks
-  include a redacted issue/PR comment and a blocked source report.
+- **Locally validated work is published** → the coordinator is done. The
+  operator keeps the run in **Verifying** and owns external PR/CI observation;
+  subsequent review and merge remain human-gated. The coordinator has no merge
+  capability (see [docs/repository-settings.md](./docs/repository-settings.md)).
+- **needs-human** → a declared decision or external prerequisite for doing the
+  work, or an operator condition such as a crashloop, requires a human.
+  Coordinator-declared blocks include a redacted issue/PR comment and a blocked
+  source report.
+
+External verification can later reach a separate outcome: stable green advances
+**Verifying** to **AwaitingReview**; a red check ends the run as **Failed** and
+emits a failed lifecycle result. The source decides how to handle that failure;
+queue-backed PR-fix work follows its existing retry policy.
 
 The coordinator declares its ending in the executor-provided outcome file,
 whose exact path is in the goal. The executor validates the declaration against
 the world: git state remains authoritative for whether declared changes exist
 on the run branch; the declaration never substitutes for that check (#169):
 
-- **`changes`** — work is committed and pushed; verified commits reachable from
-  the run branch → exit `0`, **Verifying**. Work committed only elsewhere is not
-  run success.
+- **`changes`** — the coordinator runs relevant local validation against the
+  integrated changes itself and fixes failures before declaring completion; then work is
+  committed and pushed and the pull request is opened or updated. Verified
+  commits reachable from the run branch → exit `0`, **Verifying**. Work committed
+  only elsewhere is not run success.
 - **`no_change_needed`** — nothing to do, with evidence. The executor posts the
   complete evidence as a redacted issue/PR comment, then exits `3`: a
   resolve-issue run ends in **AwaitingReview** and moves the source to
@@ -182,10 +193,11 @@ on the run branch; the declaration never substitutes for that check (#169):
 - **`needs_decision`** — a real decision the coordinator cannot make. The
   executor posts the complete question as a redacted issue/PR comment and exits
   `2` to **NeedsHuman** with a blocked source report.
-- **`blocked_external`** — an external prerequisite is missing. The executor
-  posts the complete `missing` explanation as a redacted issue/PR comment and
-  exits `2` to **NeedsHuman** with a blocked source report. This is not a
-  retryable **Failed** run.
+- **`blocked_external`** — an external prerequisite needed to perform the work
+  is missing. The executor posts the complete `missing` explanation as a
+  redacted issue/PR comment and exits `2` to **NeedsHuman** with a blocked source
+  report. A CI failure discovered after publication is not this outcome: it
+  follows the operator's verification and source failure policy.
 
 Comments preserve the full declared evidence, question, or missing explanation
 after redaction; they are not shortened to the termination reason. Comment
@@ -289,8 +301,9 @@ to die.
   manual `needs-human`. This is an intentional safety tradeoff (indefinite
   wedge over false reap), not a liveness proof. #102 stays blocked for
   production until #126 implements it and a production e2e proves the behavior.
-- The coordinator **self-declares stuck** (can't get CI green after real
-  attempts, missing access, ambiguous ask) → `needs-human`.
+- The coordinator **identifies a human decision or external blocker** (missing
+  access, ambiguous ask) → `needs-human`. CI failure after publication is an
+  operator-observed verification outcome reported to the source as `Failed`.
 - A pod that dies (infra) or is reaped is relaunched and resumed. A **crashloop**
   — the relaunch counter *reaching* the ceiling (`restarts >= maxRestarts`) →
   `needs-human` with the counter left at the ceiling, rather than one further
@@ -929,9 +942,11 @@ there is no delete verb because active runs reference lanes. (#73)
   writes heartbeat and checkpoint to status; the legacy bootstrap does not
   populate these fields (#102). The executor classifies its declaration against
   the world before the run terminalizes: exit `0` (`changes`) reaches
-  **Verifying** only when committed work is reachable from the run branch, and
-  work committed elsewhere is not success. Exit `2` (`needs_decision` or
-  `blocked_external`) reaches **NeedsHuman**; exit `3` (`no_change_needed`)
+  **Verifying** only when the coordinator validates integrated work locally,
+  fixes failures, and committed work is reachable from the run branch; work
+  committed elsewhere is not success.
+  Exit `2` (`needs_decision` or `blocked_external`) reaches **NeedsHuman**;
+  exit `3` (`no_change_needed`)
   reaches **AwaitingReview** for resolve-issue and **NeedsHuman** for fix-pr.
   Other failure exits reach **Failed**. When no outcome is declared, recoverable
   endings — uncommitted changes, commits off the run branch, or no commit and no
@@ -950,9 +965,13 @@ there is no delete verb because active runs reference lanes. (#73)
   stall relaunches/resumes it; a crashloop reaches NeedsHuman.
 - **Verifying** — no coordinator pod or liveness meaning. The operator polls
   the external PR and CI world indefinitely, with a reconciliation cadence and
-  no deadline. Observer errors remain Verifying and requeue. A missing observer,
-  missing/draft PR, or failed check reaches **NeedsHuman**. A PR with no checks
-  or pending checks remains Verifying; the PR is persisted. Green is declared
+  no deadline. Observer errors remain Verifying and requeue. A missing observer
+  or missing/draft PR reaches **NeedsHuman**. A failed check on a fix-pr run
+  reaches **Failed** so its source can apply its retry policy. Resolve-issue
+  runs remain **Verifying** on red checks so the original issue can still reach
+  review after a follow-up repairs the PR. Queue-backed PR-fix sources issue
+  another attempt under their existing cap. A PR with no checks or pending
+  checks remains **Verifying**; the PR is persisted. Green is declared
   only from **two consecutive all-green observations of the same check set**:
   every all-green observation records a compact fingerprint of the check
   identities (head commit plus sorted check names) on the run status, and an
@@ -962,8 +981,10 @@ there is no delete verb because active runs reference lanes. (#73)
   yet can still appear at any later poll, so a pending observation can never
   pre-settle an identity — and a changed set (a new check, a new push) resets
   it the same way. A partial snapshot cannot pass. The source becomes
-  in-review with the transition. Verifying does not consume LaneProfile
-  execution capacity, and the source remains in-progress throughout it.
+  `in-review` with the transition. Verifying does not consume LaneProfile
+  execution capacity; the source remains `in-progress` while polling, publishes
+  `in-review` after stable green observations. Fix-pr attempts receive `failed`
+  if checks turn red; initial issue observers remain active without lane capacity.
 - **AwaitingReview** is terminal for this run. For a PR, human merges → operator
   marks **Done** and resolves the source; feedback/conflict → the source spawns a
   fresh `fix-pr` run without reusing the previous run. A `no_change_needed`
@@ -1390,6 +1411,14 @@ was superseded.
   delimiters. Hashing typed JSON preserves field boundaries and keeps raw paths
   and assistant text out of continuation events; termination history remains
   separately redacted. (#170)
+- **2026-10-06 — external verification belongs to the operator.** A coordinator
+  validates integrated work locally, publishes it, and completes; CI and review
+  observation remain in the operator's `Verifying` phase. A red CI observation
+  ends a fix-pr attempt as `Failed` instead of parking it as `NeedsHuman`;
+  initial issue runs keep observing so later repairs can advance the original
+  issue. Sources apply their own failure policy. Dispatch's failed report performs the retry/cap
+  decision for queue-backed PR-fix work, so Courier must not send a second
+  `BLOCKED` mark for the same now-advanced generation.
 - **2026-09-30 — #169/#175: declare outcomes outside the worktree; never settle
   from a declaration alone.** #169 replaced inference of coordinator intent from
   workspace state with explicit `changes`, `no_change_needed`, `needs_decision`,
@@ -1397,8 +1426,9 @@ was superseded.
   corrected the handoff boundary: the exact per-run outcome file is under
   executor-owned scratch outside the target worktree, so stale declarations are
   avoided without deleting `.courier` or manipulating the git index. `changes`
-  still requires commits reachable from the run branch. `no_change_needed` posts
-  its complete redacted evidence and exits `3`: resolve-issue waits in
+  requires relevant local validation of the integrated work and commits
+  reachable from the run branch. `no_change_needed` posts its complete redacted
+  evidence and exits `3`: resolve-issue waits in
   `AwaitingReview`/`in-review`, while fix-pr ends `NeedsHuman`; the blocked report
   itself parks the PR-fix item as `BLOCKED`/needs-human, and
   `BlockedReportParksPRFix` skips only the redundant queue-mark call — it does not
@@ -1407,9 +1437,13 @@ was superseded.
   and exit `2` to `NeedsHuman` with a blocked report. Only the distinct
   termination reason is bounded before publication. The controller carries the
   bounded blocked-external reason into the source lifecycle report and preserves
-  it across durable report retries. The earlier #169 contract resolved
-  `no_change_needed` and treated `blocked_external` as retryable `Failed`; both
-  are superseded. (#169, #175)
+  it across durable report retries. A red external CI observation after
+  publication ends in `Failed`; Dispatch's failed report advances a queue-backed
+  PR-fix attempt or routes it to a human at the existing cap. If the report is
+  skipped because the queue generation has already moved, Courier does not issue
+  a separate queue mark against that generation. The earlier #169 contract
+  resolved `no_change_needed` and treated `blocked_external` as retryable
+  `Failed`; both are superseded. (#169, #175)
 - **2026-09-29 — #178: a run's own terminal phase is never gated on a source
   report.** `transitionTerminal` used to publish the source transition and
   lifecycle report before writing the phase, so a rejected report kept the run
@@ -1618,6 +1652,14 @@ was superseded.
   startup grace for a just-relaunched pod is derived only from observable pod
   state (creation time / container start), never by having the operator write the
   harness-owned heartbeat. (#12, #100)
+- **2026-10-06 — External verification is an operator handoff.** Supersedes
+  the 2026-09-22 coordinator-completion boundary below: the coordinator owns
+  local validation of integrated work, publication, and opening/updating the PR,
+  but does not wait for external CI or review. The operator retains `Verifying`;
+  stable green moves to review, while red CI follows the source's retry policy.
+  For Dispatch's queue-backed PR-fix work, the failed report itself advances the
+  attempt or applies the existing cap, so Courier does not send a second
+  `BLOCKED` queue mark after a generation change.
 - **2026-09-22 — The coordinator owns completion and forge publication.** A
   coordinator may delegate research, implementation, review, and tests, but
   never the run's terminal contract: reading the work item, integrating

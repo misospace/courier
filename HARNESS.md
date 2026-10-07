@@ -279,7 +279,7 @@ Role grants, precisely:
 
 | Role | Pod | May | May not |
 |---|---|---|---|
-| Coordinator (harness) | control | call models under all role bindings; plan, integrate, verify; dispatch and cancel briefs; write trusted status; request publication | run model-controlled shell; merge; read broker credentials |
+| Coordinator (harness) | control | call models under all role bindings; plan, integrate, locally validate, publish; dispatch and cancel briefs; write trusted status; request publication | run model-controlled shell; merge; read broker credentials |
 | Coder | worker | run shell/tools on sanitized snapshots; read approved dependency artifacts; return untrusted artifacts | credentials, arbitrary network, broker, forge, model calls, status |
 | Reviewer | control (model role) | read integrated diffs; run read-only checks through the worker | forge writes; merge; anything beyond its verdict |
 | Broker | broker | typed forge/git operations under the run's resolved policy | merge; raw REST; generic MCP passthrough; destinations outside the pinned policy |
@@ -581,10 +581,16 @@ configuration, not hardware specifics in `LaneProfile`; the profile supplies
 only the per-role model identifiers.
 
 **Coordinator ownership.** The coordinator owns the run's terminal contract:
-plan, integrate, verify, push, and open/update the PR. Delegation covers
+plan, integrate, locally validate, publish, and hand off. Delegation covers
 bounded work only — implementation, research, review — never the terminal
-contract. The coordinator publishes through the broker, never through a
-worker.
+contract. The coordinator validates delegated results against the integrated
+work and runs relevant local checks itself, fixing failures before declaring completion.
+Once local validation passes and publication succeeds, the operator owns external
+verification of the pull request and CI. The coordinator publishes
+through the broker, never through a worker. Completed briefs may publish before
+control returns; local validation therefore runs on a freshly materialized
+snapshot of the published integration head before declaring completion, not as
+a claim that every publication was preceded by coordinator validation.
 
 **Spawn brief schema and authenticated worker protocol.** Each delegation is a
 typed brief carrying a stable `briefID` (unique within the run), objective,
@@ -929,11 +935,13 @@ The coordinator declares its outcome in the exact file path supplied in its
 goal. That file lives in executor-owned per-run scratch outside the target
 worktree; it is control metadata, not a repository file. The executor validates
 the declaration against the world before terminalizing: exit `0` (`changes`)
-reaches `Verifying` only when commits are reachable from the run branch; exit
-`2` (`needs_decision` or `blocked_external`) reaches `NeedsHuman`; exit `3`
+reaches `Verifying` only when the coordinator validates integrated work locally,
+fixes failures, and commits are reachable from the run branch; exit `2`
+(`needs_decision` or `blocked_external`) reaches `NeedsHuman`; exit `3`
 (`no_change_needed`) reaches `AwaitingReview` with source `in-review` for
-resolve-issue runs and `NeedsHuman` for fix-pr runs; every other exit is
-`Failed` under the current contract. Session recovery for undeclared recoverable
+resolve-issue runs and `NeedsHuman` for fix-pr runs; an externally observed
+failed check reaches `Failed` and follows the source's failure policy, while
+other nonzero exits also reach `Failed`. Session recovery for undeclared recoverable
 endings is shipped: with a captured session, dirty, off-branch, and no-work
 states resume under the #170 continuation budget and no-progress guard; without
 a captured session, those endings fail as incomplete. This does not change the
@@ -953,9 +961,10 @@ a structured terminal result (outcome + reason) written by trusted control
 before process exit. The operator classifies from that trusted evidence plus
 its own world verification, keeping two failure kinds distinct:
 
-- **Workload failure** — tests failing, CI red, a plan that does not converge.
-  This is the work, not a harness fault: the coordinator iterates, and a
-  coordinator that cannot get there self-declares needs-human (exit 2).
+- **Workload failure** — local validation fails before completion. The
+  coordinator uses its bounded run to address it or reports a genuine human
+  decision; after publication, CI is observed by the operator and a failed check
+  reaches `Failed` for the source to handle.
 - **Infrastructure failure** — pod crash, OOM, model gateway down, a status
   write that will not land. This is the relaunch/resume case bounded by the
   crashloop counter, not a terminal verdict on the work.

@@ -2,19 +2,20 @@
 
 Courier is a Kubernetes operator that runs autonomous coding *coordinators* in
 pods. You feed it an issue (or a PR with feedback); it runs a coordinator that
-plans, delegates to model sub-agents, opens a PR, drives CI green, and leaves it
-mergeable — then hands control back to a human to merge or send back with
-feedback.
+plans, delegates to model sub-agents, locally validates and publishes a change,
+then hands control back to the operator to observe CI, and a human to merge or
+send back with feedback. A failed check follows the source's failure policy.
 
 It is **model-agnostic** (run any models — cloud APIs, local servers, or a mix)
 and **source-agnostic** (dispatch, GitHub labels, cron, CLI, and a web UI are all
 adapters, none a dependency). It is **local-capable, not local-constrained**:
-built so consumer-hardware local models can iterate their way to a good PR, but
-equally happy driving cloud models.
+built so consumer-hardware local models can iterate their way to a locally
+validated published PR, but equally happy driving cloud models.
 
 Courier replaces a narrow one-shot executor with a long-lived, resumable
-coordinator that can watch CI, take feedback, and iterate — the loop that lets a
-model actually converge on a mergeable change.
+coordinator that can take feedback and iterate locally, then hand published work
+to the operator for external verification — the loop that helps a model converge
+on a change ready for human review.
 
 Courier is designed as general infrastructure that anyone can run, not as a
 system scoped to one operator's problems. Its core does not require a particular

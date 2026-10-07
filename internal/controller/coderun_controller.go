@@ -41,14 +41,17 @@ const coordinatorContainerName = "coordinator"
 // lifecycleReportedCondition tracks whether a terminal run's source lifecycle
 // report has been published; a False status means a later reconcile retries it.
 const (
-	lifecycleReportedCondition                          = "LifecycleReported"
-	lifecycleReportPendingReason                        = "Pending"
-	lifecycleReportPendingBlockedReportParksPRFixReason = "PendingBlockedReportParksPRFix"
-	lifecycleReportPendingWithErrorReason               = "PendingWithError"
+	lifecycleReportedCondition                              = "LifecycleReported"
+	lifecycleReportPendingReason                            = "Pending"
+	lifecycleReportPendingBlockedReportParksPRFixReason     = "PendingBlockedReportParksPRFix"
+	lifecycleReportPendingWithErrorReason                   = "PendingWithError"
+	lifecycleReportPendingExternalVerificationFailureReason = "PendingExternalVerificationFailure"
+	externalVerificationFailureReason                       = "external verification failed"
 )
 
 type terminalLifecycleIntent struct {
 	skipPRFixQueueMark bool
+	ciFailure          bool
 	error              string
 }
 
@@ -644,7 +647,24 @@ func (r *CoderRunReconciler) observeVerifying(ctx context.Context, run *courierv
 		// case for a human.
 		return r.transitionTerminal(ctx, run, courierv1alpha1.PhaseDone, pr, terminalLifecycleIntent{}, nil)
 	}
-	if state == observationNeedsHuman || state == observationFailed {
+	if state == observationFailed {
+		// Queue-backed fix-pr work has a source-owned retry policy. Keep
+		// resolve-issue observers alive so this run can carry the original issue
+		// to review after the PR is repaired by a later run.
+		if run.Spec.Mode != courierv1alpha1.ModeFixPR {
+			before := run.DeepCopy()
+			if pr != "" {
+				run.Status.PR = pr
+			}
+			run.Status.CheckFingerprint = ""
+			if err := r.patchStatus(ctx, before, run); err != nil {
+				return ctrl.Result{}, err
+			}
+			return ctrl.Result{RequeueAfter: observationRequeueDelay}, nil
+		}
+		return r.transitionTerminal(ctx, run, courierv1alpha1.PhaseFailed, pr, terminalLifecycleIntent{ciFailure: true}, nil)
+	}
+	if state == observationNeedsHuman {
 		return r.transitionTerminal(ctx, run, courierv1alpha1.PhaseNeedsHuman, pr, terminalLifecycleIntent{}, nil)
 	}
 	// status.checkFingerprint is the prior all-green candidate: the identity
@@ -756,6 +776,9 @@ func (r *CoderRunReconciler) transitionTerminal(ctx context.Context, run *courie
 // pendingLifecycleReason stores retry intent in the standard condition reason;
 // its message preserves a coordinator explanation across report retries.
 func pendingLifecycleReason(intent terminalLifecycleIntent) string {
+	if intent.ciFailure {
+		return lifecycleReportPendingExternalVerificationFailureReason
+	}
 	if intent.skipPRFixQueueMark {
 		return lifecycleReportPendingBlockedReportParksPRFixReason
 	}
@@ -772,6 +795,7 @@ func pendingLifecycleIntent(run *courierv1alpha1.CoderRun) terminalLifecycleInte
 	}
 	return terminalLifecycleIntent{
 		skipPRFixQueueMark: cond.Reason == lifecycleReportPendingBlockedReportParksPRFixReason,
+		ciFailure:          cond.Reason == lifecycleReportPendingExternalVerificationFailureReason,
 		error:              cond.Message,
 	}
 }
@@ -804,7 +828,7 @@ func (r *CoderRunReconciler) publishTerminalLifecycle(ctx context.Context, run *
 }
 
 func (r *CoderRunReconciler) publishSourceLifecycle(ctx context.Context, run *courierv1alpha1.CoderRun, adapter source.Adapter, item source.WorkItem, phase courierv1alpha1.Phase, intent terminalLifecycleIntent) error {
-	state := stateForTerminalPhase(phase)
+	state := stateForTerminalPhase(phase, run.Spec.Mode, intent)
 	if state != "" {
 		if err := adapter.Transition(ctx, item, state); err != nil {
 			return err
@@ -831,11 +855,18 @@ func (r *CoderRunReconciler) publishSourceLifecycle(ctx context.Context, run *co
 // stateForTerminalPhase is the source state published for a terminal phase.
 // Only phases reached through transitionTerminal carry a state; everything else
 // publishes none.
-func stateForTerminalPhase(phase courierv1alpha1.Phase) source.State {
+func stateForTerminalPhase(phase courierv1alpha1.Phase, runMode courierv1alpha1.Mode, intent terminalLifecycleIntent) source.State {
+	// Only a fix-pr external-check failure is retryable by its source. Other
+	// terminal failures are parked for human attention rather than left active.
 	switch phase {
 	case courierv1alpha1.PhaseAwaitingReview:
 		return source.StateInReview
-	case courierv1alpha1.PhaseNeedsHuman, courierv1alpha1.PhaseFailed:
+	case courierv1alpha1.PhaseNeedsHuman:
+		return source.StateNeedsHuman
+	case courierv1alpha1.PhaseFailed:
+		if runMode == courierv1alpha1.ModeFixPR && intent.ciFailure {
+			return source.StateInProgress
+		}
 		return source.StateNeedsHuman
 	default:
 		return ""
@@ -923,8 +954,15 @@ func lifecycleForPhase(phase courierv1alpha1.Phase, state source.State, pr strin
 			lifecycle.Result = source.ResultReady
 		}
 	case courierv1alpha1.PhaseFailed:
-		lifecycle.Result = source.ResultFailed
-		lifecycle.Error = "coordinator failed"
+		if intent.ciFailure {
+			lifecycle.Result = source.ResultFailed
+			lifecycle.Error = externalVerificationFailureReason
+		} else {
+			// Coordinator failures are not an external CI attempt. Park the
+			// source for human attention rather than triggering queue retries.
+			lifecycle.Result = source.ResultBlocked
+			lifecycle.Error = "coordinator failed"
+		}
 	case courierv1alpha1.PhaseNeedsHuman:
 		lifecycle.Result = source.ResultBlocked
 		lifecycle.Error = intent.error

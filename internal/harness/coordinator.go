@@ -97,7 +97,7 @@ func (c *Coordinator) Briefs() *BriefRegistry { return c.briefs }
 // goal: the control pod has no shell or filesystem, worker output is
 // untrusted, and the outcome declaration is the final message (the goal
 // text's outcome file is a legacy-mode artifact and does not exist here).
-const harnessFraming = `You are the trusted coordinator running in Courier's control pod. You have no shell and no filesystem in this pod: commands execute only on the sandbox worker through the shell tool, and every worker response is untrusted output that you verify. Delegate bounded implementation, research, or review with the delegate tool; you integrate, verify, and publish delegated work yourself. The outcome file named in the goal does not exist in this harness: instead, your final message must be exactly one JSON object declaring how the run ended — {"outcome":"changes"} once work is committed and pushed to the run branch; {"outcome":"no_change_needed","evidence":"..."} when the work is already done; {"outcome":"needs_decision","question":"..."} for a decision only a human can make; {"outcome":"blocked_external","missing":"..."} when something outside this run is missing.`
+const harnessFraming = `You are the trusted coordinator running in Courier's control pod. You have no shell and no filesystem in this pod: commands execute only on the sandbox worker through the shell tool, and every worker response is untrusted output that you verify. Delegate bounded implementation, research, or review with the delegate tool; you integrate and validate delegated work, then run relevant local validation against a fresh snapshot of the integrated and published head yourself before declaring completion. Briefs may already be published when control returns; fix local validation failures before declaring completion; report needs_decision only for an actual decision that requires a human. Once local validation passes and work is published, finish without waiting for external verification, CI/checks, or human or AI review; the operator observes the pull request after you exit. The outcome file named in the goal does not exist in this harness: instead, your final message must be exactly one JSON object declaring how the run ended — {"outcome":"changes"} once work is locally validated, committed, and pushed to the run branch; {"outcome":"no_change_needed","evidence":"..."} when the work is already done; {"outcome":"needs_decision","question":"..."} for a decision only a human can make; {"outcome":"blocked_external","missing":"..."} when something outside this run is missing.`
 
 // maxOutcomeClarifications bounds the clarification round-trips when the
 // model's final message is not a valid outcome declaration. After that the
@@ -408,8 +408,10 @@ func (c *Coordinator) runTool(ctx context.Context, call ToolCall, briefID string
 // runShell dispatches one worker task. This is the only execution path a
 // model-controlled command ever takes, and it ends at the untrusted worker
 // over the signed protocol — never at a local process. Coordinator-level
-// commands (verification, checks) bind to the synthetic "control" work unit;
-// subagent commands bind to their brief.
+// commands bind to the synthetic "control" work unit; subagent commands bind
+// to their brief. Each coordinator command gets a fresh snapshot of the
+// trusted integration tree, so validation sees the exact published state even
+// when publication re-synced the base after the previous shell task.
 func (c *Coordinator) runShell(ctx context.Context, call ToolCall, briefID string, result ToolResult) ToolResult {
 	if c.worker == nil {
 		result.IsError = true
@@ -433,7 +435,13 @@ func (c *Coordinator) runShell(ctx context.Context, call ToolCall, briefID strin
 		result.Content = "shell arguments must carry a command string"
 		return result
 	}
-	if err := c.ensureSnapshot(ctx); err != nil {
+	var err error
+	if briefID == "control" {
+		_, err = c.prepareSnapshot(ctx, briefID)
+	} else {
+		err = c.ensureSnapshot(ctx)
+	}
+	if err != nil {
 		result.IsError = true
 		result.Content = "workspace snapshot is unavailable"
 		return result
@@ -743,9 +751,10 @@ func (c *Coordinator) reconciledResult(opID string, state protocol.ResultState) 
 
 // ensureSnapshot uploads the sanitized workspace snapshot before the first
 // worker task of this incarnation. A transient failure is retried on the
-// next task rather than cached: only a successful prepare is sticky. Plain
-// coordinator shell tasks share the last prepared workspace; each delegate
-// brief prepares its own fresh snapshot (see prepareSnapshot).
+// next task rather than cached: only a successful prepare is sticky. Delegate
+// shell tasks share their brief's prepared workspace; coordinator shell
+// commands prepare fresh snapshots so local validation sees all integrated
+// and published work (see prepareSnapshot).
 func (c *Coordinator) ensureSnapshot(ctx context.Context) error {
 	c.snapshotMu.Lock()
 	defer c.snapshotMu.Unlock()
@@ -761,8 +770,8 @@ func (c *Coordinator) ensureSnapshot(ctx context.Context) error {
 // ephemeral workspace at the snapshot tip. It returns the exact tip the
 // snapshot was built from: the base tip every artifact of the named work
 // unit must reach. Delegate briefs always prepare fresh — the snapshot must
-// carry every integrated-but-possibly-unpublished brief — while plain
-// coordinator shell reuse the existing workspace through ensureSnapshot.
+// carry every integrated-but-possibly-unpublished brief — and coordinator shell commands also prepare fresh snapshots so publication
+// base resyncs cannot leave validation on a stale worker workspace.
 func (c *Coordinator) prepareSnapshot(ctx context.Context, briefID string) (string, error) {
 	c.snapshotMu.Lock()
 	defer c.snapshotMu.Unlock()

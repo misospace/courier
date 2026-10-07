@@ -590,8 +590,8 @@ func TestGoalCarriesCoordinatorCompletionContract(t *testing.T) {
 		opening string
 		extra   []string
 	}{
-		{name: "resolve-issue", mode: courierv1alpha1.ModeResolveIssue, opening: "Open a PR", extra: []string{"drive it to a review-ready state with CI green"}},
-		{name: "fix-pr", mode: courierv1alpha1.ModeFixPR, opening: "Take over PR", extra: []string{"pull request state", "CI/checks", "review feedback", "determine what's blocking it", "return it to a review-ready state"}},
+		{name: "resolve-issue", mode: courierv1alpha1.ModeResolveIssue, opening: "Open a PR"},
+		{name: "fix-pr", mode: courierv1alpha1.ModeFixPR, opening: "Take over PR", extra: []string{"pull request state", "CI/checks", "existing review feedback", "address feedback already present", "without repeatedly searching for new reviews"}},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
@@ -609,9 +609,17 @@ func TestGoalCarriesCoordinatorCompletionContract(t *testing.T) {
 				"configured forge capability",
 				"not a forge-specific CLI",
 				"you own completion",
-				"push the branch",
+				"commit and push the run branch",
 				"open or update the pull request",
-				"never stop at a local commit or branch when a pull request is required",
+				"Never stop at a local commit or branch when a pull request is required",
+				"run relevant local validation",
+				"Before declaring changes complete, run relevant local validation against the integrated work",
+				"delegated checks alone do not replace this",
+				"If the validation fails, fix the failures before declaring completion",
+				"report needs_decision only for an actual decision that requires a human",
+				"finish when the work is published",
+				"do not wait for external verification, CI/checks, human review, or AI review",
+				"the operator observes the pull request after you exit",
 				"7",
 				"declaring an outcome",
 				"/var/tmp/courier-scratch/outcome.json",

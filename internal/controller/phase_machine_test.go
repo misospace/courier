@@ -428,7 +428,7 @@ func TestRunningPodExitMapsPhaseAndSourceState(t *testing.T) {
 		// The blocked task report parks the item; skip only the redundant
 		// follow-up PR-fix queue mark.
 		{name: "no-change-needed fix-pr", mode: courierv1alpha1.ModeFixPR, exitCode: 3, wantPhase: courierv1alpha1.PhaseNeedsHuman, wantSource: source.StateNeedsHuman, wantReport: true, wantResult: source.ResultBlocked, wantBlockedReportParksPRFix: true},
-		{name: "failure", exitCode: 17, wantPhase: courierv1alpha1.PhaseFailed, wantSource: source.StateNeedsHuman, wantReport: true, wantResult: source.ResultFailed},
+		{name: "failure", exitCode: 17, wantPhase: courierv1alpha1.PhaseFailed, wantSource: source.StateNeedsHuman, wantReport: true, wantResult: source.ResultBlocked},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -500,8 +500,8 @@ func TestBlockedExternalOutcomeDoesNotOverrideFailureExit(t *testing.T) {
 	if updated.Status.Phase != courierv1alpha1.PhaseFailed {
 		t.Fatalf("phase = %q, want Failed from exit-code mapping", updated.Status.Phase)
 	}
-	if len(item.reports) != 1 || item.reports[0].Result != source.ResultFailed || item.reports[0].Error != "coordinator failed" {
-		t.Fatalf("lifecycle reports = %#v, want ordinary failed report", item.reports)
+	if len(item.reports) != 1 || item.reports[0].Result != source.ResultBlocked || item.reports[0].State != source.StateNeedsHuman || item.reports[0].Error != "coordinator failed" {
+		t.Fatalf("lifecycle reports = %#v, want human-blocked coordinator failure", item.reports)
 	}
 }
 
@@ -512,11 +512,13 @@ func TestRunningDirectTerminalEnrichesObservedPR(t *testing.T) {
 		priorPR      string
 		observer     WorldObserver
 		wantPhase    courierv1alpha1.Phase
+		wantSource   source.State
 		wantPR       string
 		wantReportPR string
 	}{
 		{
 			name:         "needs human publishes observed PR",
+			wantSource:   source.StateNeedsHuman,
 			exitCode:     2,
 			observer:     fakeWorldObserver{observation: PRObservation{PR: "42", Checks: []CheckObservation{{Name: "check", State: CheckStateFailed}}}},
 			wantPhase:    courierv1alpha1.PhaseNeedsHuman,
@@ -525,6 +527,7 @@ func TestRunningDirectTerminalEnrichesObservedPR(t *testing.T) {
 		},
 		{
 			name:         "failed retains prior PR on observer error",
+			wantSource:   source.StateNeedsHuman,
 			exitCode:     17,
 			priorPR:      "42",
 			observer:     fakeWorldObserver{err: errors.New("github unavailable")},
@@ -534,6 +537,7 @@ func TestRunningDirectTerminalEnrichesObservedPR(t *testing.T) {
 		},
 		{
 			name:         "observer error without prior PR still terminalizes",
+			wantSource:   source.StateNeedsHuman,
 			exitCode:     2,
 			observer:     fakeWorldObserver{err: errors.New("github unavailable")},
 			wantPhase:    courierv1alpha1.PhaseNeedsHuman,
@@ -542,6 +546,7 @@ func TestRunningDirectTerminalEnrichesObservedPR(t *testing.T) {
 		},
 		{
 			name:         "no observer still terminalizes",
+			wantSource:   source.StateNeedsHuman,
 			exitCode:     17,
 			observer:     nil,
 			wantPhase:    courierv1alpha1.PhaseFailed,
@@ -550,6 +555,7 @@ func TestRunningDirectTerminalEnrichesObservedPR(t *testing.T) {
 		},
 		{
 			name:         "no PR observed stays empty",
+			wantSource:   source.StateNeedsHuman,
 			exitCode:     2,
 			observer:     fakeWorldObserver{observation: PRObservation{}},
 			wantPhase:    courierv1alpha1.PhaseNeedsHuman,
@@ -558,6 +564,7 @@ func TestRunningDirectTerminalEnrichesObservedPR(t *testing.T) {
 		},
 		{
 			name:         "failed publishes live observed PR",
+			wantSource:   source.StateNeedsHuman,
 			exitCode:     17,
 			observer:     fakeWorldObserver{observation: PRObservation{PR: "42", Checks: []CheckObservation{{Name: "check", State: CheckStateFailed}}}},
 			wantPhase:    courierv1alpha1.PhaseFailed,
@@ -566,6 +573,7 @@ func TestRunningDirectTerminalEnrichesObservedPR(t *testing.T) {
 		},
 		{
 			name:         "all-green observation on terminal exit stays terminal",
+			wantSource:   source.StateNeedsHuman,
 			exitCode:     2,
 			observer:     fakeWorldObserver{observation: PRObservation{PR: "42", Head: "sha-1", Checks: []CheckObservation{{Name: "check", State: CheckStatePassed}}}},
 			wantPhase:    courierv1alpha1.PhaseNeedsHuman,
@@ -604,8 +612,8 @@ func TestRunningDirectTerminalEnrichesObservedPR(t *testing.T) {
 			if updated.Status.PR != tt.wantPR {
 				t.Fatalf("PR = %q, want %q", updated.Status.PR, tt.wantPR)
 			}
-			if len(item.reports) != 1 || item.reports[0].PR != tt.wantReportPR || item.reports[0].State != source.StateNeedsHuman {
-				t.Fatalf("reports = %#v, want one report with PR %q and state %q", item.reports, tt.wantReportPR, source.StateNeedsHuman)
+			if len(item.reports) != 1 || item.reports[0].PR != tt.wantReportPR || item.reports[0].State != tt.wantSource {
+				t.Fatalf("reports = %#v, want one report with PR %q and state %q", item.reports, tt.wantReportPR, tt.wantSource)
 			}
 			if updated.Status.LastCommit != "abc123" {
 				t.Fatalf("LastCommit = %q, want abc123", updated.Status.LastCommit)
@@ -617,6 +625,7 @@ func TestRunningDirectTerminalEnrichesObservedPR(t *testing.T) {
 func TestVerifyingObservationGatesReview(t *testing.T) {
 	tests := []struct {
 		name             string
+		mode             courierv1alpha1.Mode
 		observation      PRObservation
 		err              error
 		observerMissing  bool
@@ -632,7 +641,8 @@ func TestVerifyingObservationGatesReview(t *testing.T) {
 		{name: "no checks", observation: PRObservation{PR: "42"}, wantPhase: courierv1alpha1.PhaseVerifying, wantRequeue: true, wantPR: "42"},
 		{name: "pending", observation: PRObservation{PR: "42", Checks: []CheckObservation{{State: CheckStatePending}}}, wantPhase: courierv1alpha1.PhaseVerifying, wantRequeue: true, wantPR: "42"},
 		{name: "pending failure mix", observation: PRObservation{PR: "42", Checks: []CheckObservation{{State: CheckStateFailed}, {State: CheckStatePending}}}, wantPhase: courierv1alpha1.PhaseVerifying, wantRequeue: true, wantPR: "42"},
-		{name: "failed", observation: PRObservation{PR: "42", Checks: []CheckObservation{{State: CheckStateFailed}}}, wantPhase: courierv1alpha1.PhaseNeedsHuman, wantTransition: source.StateNeedsHuman},
+		{name: "failed resolve-issue checks keep observing", observation: PRObservation{PR: "42", Checks: []CheckObservation{{State: CheckStateFailed}}}, wantPhase: courierv1alpha1.PhaseVerifying, wantRequeue: true, wantPR: "42"},
+		{name: "failed fix-pr checks return for a fresh attempt", mode: courierv1alpha1.ModeFixPR, observation: PRObservation{PR: "42", Checks: []CheckObservation{{State: CheckStateFailed}}}, wantPhase: courierv1alpha1.PhaseFailed, wantTransition: source.StateInProgress},
 		{name: "single green observation", observation: PRObservation{PR: "42", Checks: []CheckObservation{{State: CheckStatePassed}, {State: CheckStatePassed}}}, wantPhase: courierv1alpha1.PhaseVerifying, wantRequeue: true, wantPR: "42"},
 		{name: "transient error", err: errors.New("GitHub unavailable"), wantPhase: courierv1alpha1.PhaseVerifying, wantRequeue: true},
 		{name: "merged mid-run", observation: PRObservation{PR: "42", Merged: true}, wantPhase: courierv1alpha1.PhaseDone, wantPR: "42", wantNoTransition: true},
@@ -641,6 +651,9 @@ func TestVerifyingObservationGatesReview(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			item := &admissionSource{}
 			run := admissionRun("run", "local", courierv1alpha1.PhaseVerifying)
+			if tt.mode != "" {
+				run.Spec.Mode = tt.mode
+			}
 			run.Spec.Source = "manual"
 			run.Status.Branch = "courier/acme/widgets/issue-1"
 			run.Status.Checkpoint = &courierv1alpha1.Checkpoint{Plan: "preserve"}
@@ -900,9 +913,10 @@ func TestVerifyingNewHeadResetsSettle(t *testing.T) {
 	}
 }
 
-func TestVerifyingFailureSkipsSettle(t *testing.T) {
+func TestVerifyingFailureUsesRetryableLifecycle(t *testing.T) {
 	item := &admissionSource{}
 	run := admissionRun("run", "local", courierv1alpha1.PhaseVerifying)
+	run.Spec.Mode = courierv1alpha1.ModeFixPR
 	run.Spec.Source = "manual"
 	run.Status.Branch = "courier/acme/widgets/issue-1"
 	client := phaseClient(t, run)
@@ -928,11 +942,62 @@ func TestVerifyingFailureSkipsSettle(t *testing.T) {
 	if err := client.Get(context.Background(), admissionKey("run"), &updated); err != nil {
 		t.Fatalf("get run: %v", err)
 	}
-	if updated.Status.Phase != courierv1alpha1.PhaseNeedsHuman {
-		t.Fatalf("phase = %q, want NeedsHuman without waiting for a stable observation", updated.Status.Phase)
+	if updated.Status.Phase != courierv1alpha1.PhaseFailed {
+		t.Fatalf("phase = %q, want Failed without waiting for a stable observation", updated.Status.Phase)
 	}
-	if len(item.transitions) != 1 || item.transitions[0] != source.StateNeedsHuman {
-		t.Fatalf("transitions = %#v, want exactly one needs-human", item.transitions)
+	if len(item.transitions) != 1 || item.transitions[0] != source.StateInProgress {
+		t.Fatalf("transitions = %#v, want exactly one retryable in-progress state", item.transitions)
+	}
+	if len(item.reports) != 1 || item.reports[0].Result != source.ResultFailed || item.reports[0].State != source.StateInProgress || item.reports[0].PR != "42" || item.reports[0].Error != externalVerificationFailureReason {
+		t.Fatalf("reports = %#v, want one redacted external-verification failure report for PR 42", item.reports)
+	}
+}
+
+func TestResolveIssueRedCIObserverReachesReviewAfterRepair(t *testing.T) {
+	item := &admissionSource{}
+	run := admissionRun("resolve", "local", courierv1alpha1.PhaseVerifying)
+	run.Spec.Mode = courierv1alpha1.ModeResolveIssue
+	run.Spec.Source = "dispatch"
+	run.Status.Branch = "courier/acme/widgets/issue-1"
+	client := phaseClient(t, run)
+	observer := &sequenceWorldObserver{observations: []PRObservation{
+		{PR: "42", Head: "head-red", Checks: []CheckObservation{{Name: "test", State: CheckStateFailed}}},
+		greenObservation("head-fixed", "test"),
+		greenObservation("head-fixed", "test"),
+	}}
+	reconciler := &CoderRunReconciler{
+		Client:       client,
+		Sources:      NewSourceRegistry(map[string]source.Adapter{"dispatch": item}),
+		StatusWriter: fakeStatusWriter{client: client},
+		Observer:     observer,
+	}
+	for i, wantPhase := range []courierv1alpha1.Phase{
+		courierv1alpha1.PhaseVerifying,
+		courierv1alpha1.PhaseVerifying,
+		courierv1alpha1.PhaseAwaitingReview,
+	} {
+		if _, err := reconciler.Reconcile(context.Background(), admissionRequest("resolve")); err != nil {
+			t.Fatalf("Reconcile() %d error = %v", i+1, err)
+		}
+		var updated courierv1alpha1.CoderRun
+		if err := client.Get(context.Background(), admissionKey("resolve"), &updated); err != nil {
+			t.Fatalf("get run: %v", err)
+		}
+		if updated.Status.Phase != wantPhase {
+			t.Fatalf("phase after observation %d = %q, want %q", i+1, updated.Status.Phase, wantPhase)
+		}
+		if updated.Status.Phase == courierv1alpha1.PhaseVerifying && len(item.reports) != 0 {
+			t.Fatalf("reports before stable green = %#v, want none", item.reports)
+		}
+	}
+	if observer.calls != 3 {
+		t.Fatalf("observer calls = %d, want 3", observer.calls)
+	}
+	if len(item.transitions) != 1 || item.transitions[0] != source.StateInReview {
+		t.Fatalf("transitions = %#v, want only the final in-review transition", item.transitions)
+	}
+	if len(item.reports) != 1 || item.reports[0].Result != source.ResultReady || item.reports[0].State != source.StateInReview || item.reports[0].PR != "42" {
+		t.Fatalf("reports = %#v, want one ready report for PR 42", item.reports)
 	}
 }
 
@@ -972,6 +1037,7 @@ func greenObservation(head string, names ...string) PRObservation {
 func TestTerminalLifecycleReportsToSource(t *testing.T) {
 	tests := []struct {
 		name        string
+		mode        courierv1alpha1.Mode
 		observation PRObservation
 		wantPhase   courierv1alpha1.Phase
 		wantReport  source.Lifecycle
@@ -983,16 +1049,25 @@ func TestTerminalLifecycleReportsToSource(t *testing.T) {
 			wantReport:  source.Lifecycle{State: source.StateInReview, Result: source.ResultReady, PR: "42", IdempotencyKey: "coderun/default/run/AwaitingReview"},
 		},
 		{
-			name:        "needs human",
+			name:        "failed fix-pr checks",
+			mode:        courierv1alpha1.ModeFixPR,
 			observation: PRObservation{PR: "42", Checks: []CheckObservation{{State: CheckStateFailed}}},
-			wantPhase:   courierv1alpha1.PhaseNeedsHuman,
-			wantReport:  source.Lifecycle{State: source.StateNeedsHuman, Result: source.ResultBlocked, PR: "42", Error: "run requires human intervention", IdempotencyKey: "coderun/default/run/NeedsHuman"},
+			wantPhase:   courierv1alpha1.PhaseFailed,
+			wantReport:  source.Lifecycle{State: source.StateInProgress, Result: source.ResultFailed, PR: "42", Error: externalVerificationFailureReason, IdempotencyKey: "coderun/default/run/Failed"},
+		},
+		{
+			name:        "failed resolve-issue checks stay nonterminal",
+			mode:        courierv1alpha1.ModeResolveIssue,
+			observation: PRObservation{PR: "42", Checks: []CheckObservation{{State: CheckStateFailed}}},
 		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			item := &admissionSource{}
 			run := admissionRun("run", "local", courierv1alpha1.PhaseVerifying)
+			if tt.mode != "" {
+				run.Spec.Mode = tt.mode
+			}
 			run.Status.Branch = "courier/acme/widgets/issue-1"
 			client := phaseClient(t, run)
 			reconciler := &CoderRunReconciler{
@@ -1006,12 +1081,18 @@ func TestTerminalLifecycleReportsToSource(t *testing.T) {
 					t.Fatalf("Reconcile() %d error = %v", attempt+1, err)
 				}
 			}
-			if len(item.reports) != 1 || !reflect.DeepEqual(item.reports[0], tt.wantReport) {
-				t.Fatalf("reports = %#v, want %#v", item.reports, []source.Lifecycle{tt.wantReport})
-			}
 			var updated courierv1alpha1.CoderRun
 			if err := client.Get(context.Background(), admissionKey("run"), &updated); err != nil {
 				t.Fatalf("get run: %v", err)
+			}
+			if tt.wantPhase == "" {
+				if updated.Status.Phase != courierv1alpha1.PhaseVerifying || len(item.reports) != 0 || len(item.transitions) != 0 {
+					t.Fatalf("red resolve-issue observation settled unexpectedly: phase=%q reports=%#v transitions=%#v", updated.Status.Phase, item.reports, item.transitions)
+				}
+				return
+			}
+			if len(item.reports) != 1 || !reflect.DeepEqual(item.reports[0], tt.wantReport) {
+				t.Fatalf("reports = %#v, want %#v", item.reports, []source.Lifecycle{tt.wantReport})
 			}
 			if updated.Status.Phase != tt.wantPhase || updated.Status.PR != "42" {
 				t.Fatalf("status = phase %q PR %q, want %q 42", updated.Status.Phase, updated.Status.PR, tt.wantPhase)
@@ -1028,6 +1109,7 @@ func TestTerminalLifecycleReportsToSource(t *testing.T) {
 func TestTerminalLifecycleReportRetryReusesIdempotencyKey(t *testing.T) {
 	item := &admissionSource{reportErr: errors.New("report unavailable")}
 	run := admissionRun("run", "local", courierv1alpha1.PhaseVerifying)
+	run.Spec.Mode = courierv1alpha1.ModeFixPR
 	run.Status.Branch = "courier/acme/widgets/issue-1"
 	client := phaseClient(t, run)
 	reconciler := &CoderRunReconciler{
@@ -1049,7 +1131,7 @@ func TestTerminalLifecycleReportRetryReusesIdempotencyKey(t *testing.T) {
 	if len(item.reports) != 2 {
 		t.Fatalf("reports = %#v, want one per attempt", item.reports)
 	}
-	want := lifecycleIdempotencyKey(run, courierv1alpha1.PhaseNeedsHuman)
+	want := lifecycleIdempotencyKey(run, courierv1alpha1.PhaseFailed)
 	if item.reports[0].IdempotencyKey != want {
 		t.Fatalf("first report key = %q, want %q", item.reports[0].IdempotencyKey, want)
 	}
@@ -1060,8 +1142,8 @@ func TestTerminalLifecycleReportRetryReusesIdempotencyKey(t *testing.T) {
 	if err := client.Get(context.Background(), admissionKey("run"), &updated); err != nil {
 		t.Fatalf("get run: %v", err)
 	}
-	if updated.Status.Phase != courierv1alpha1.PhaseNeedsHuman {
-		t.Fatalf("phase = %q, want NeedsHuman", updated.Status.Phase)
+	if updated.Status.Phase != courierv1alpha1.PhaseFailed {
+		t.Fatalf("phase = %q, want Failed", updated.Status.Phase)
 	}
 }
 
@@ -1331,6 +1413,51 @@ func TestTransientReportKeepsRunTerminalAndRetriesSeparately(t *testing.T) {
 	cond = apimeta.FindStatusCondition(updated.Status.Conditions, lifecycleReportedCondition)
 	if cond == nil || cond.Status != metav1.ConditionTrue || cond.Reason != "Published" {
 		t.Fatalf("LifecycleReported = %#v, want True Published", cond)
+	}
+}
+
+func TestFixPRCIFailureReportRetryPreservesQueueSettlementIntent(t *testing.T) {
+	item := &admissionSource{reportErr: errors.New("dispatch unavailable")}
+	run := admissionRun("run", "local", courierv1alpha1.PhaseVerifying)
+	run.Spec.Mode = courierv1alpha1.ModeFixPR
+	run.Spec.Source = "test"
+	run.Spec.WorkItemID = "opaque-work-item"
+	run.Status.Branch = "courier/acme/widgets/pr-42"
+	client := phaseClient(t, run)
+	reconciler := &CoderRunReconciler{
+		Client:       client,
+		Sources:      NewSourceRegistry(map[string]source.Adapter{"test": item}),
+		StatusWriter: fakeStatusWriter{client: client},
+		Observer: fakeWorldObserver{observation: PRObservation{
+			PR: "42", Checks: []CheckObservation{{Name: "test", State: CheckStateFailed}},
+		}},
+	}
+	if _, err := reconciler.Reconcile(context.Background(), admissionRequest("run")); err != nil {
+		t.Fatalf("first Reconcile() error = %v", err)
+	}
+	if len(item.transitions) != 1 || item.transitions[0] != source.StateInProgress {
+		t.Fatalf("first transitions = %#v, want retryable in-progress", item.transitions)
+	}
+	if len(item.reports) != 1 || item.reports[0].Result != source.ResultFailed || item.reports[0].Error != externalVerificationFailureReason {
+		t.Fatalf("first reports = %#v, want external verification failure", item.reports)
+	}
+	var pending courierv1alpha1.CoderRun
+	if err := client.Get(context.Background(), admissionKey("run"), &pending); err != nil {
+		t.Fatalf("get pending run: %v", err)
+	}
+	cond := apimeta.FindStatusCondition(pending.Status.Conditions, lifecycleReportedCondition)
+	if cond == nil || cond.Reason != lifecycleReportPendingExternalVerificationFailureReason {
+		t.Fatalf("LifecycleReported = %#v, want durable external-verification retry intent", cond)
+	}
+	item.reportErr = nil
+	if _, err := reconciler.Reconcile(context.Background(), admissionRequest("run")); err != nil {
+		t.Fatalf("retry Reconcile() error = %v", err)
+	}
+	if len(item.transitions) != 2 || item.transitions[1] != source.StateInProgress {
+		t.Fatalf("retry transitions = %#v, want the original retryable transition", item.transitions)
+	}
+	if len(item.reports) != 2 || item.reports[1].Result != source.ResultFailed || item.reports[1].Error != externalVerificationFailureReason {
+		t.Fatalf("retry reports = %#v, want preserved external-verification failure", item.reports)
 	}
 }
 
