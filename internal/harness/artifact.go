@@ -168,7 +168,7 @@ func validateAndImportArtifact(ctx context.Context, tree *Integrator, briefID, d
 	if err := os.MkdirAll(objectsDir, 0o700); err != nil {
 		return "", fmt.Errorf("harness: quarantine unavailable: %w", err)
 	}
-	if err := couriergit.Unbundle(ctx, tree.Dir, objectsDir, path); err != nil {
+	if err := couriergit.Unbundle(ctx, objectsDir, path); err != nil {
 		return "", rejected(rejectMalformed)
 	}
 	inventory, err := couriergit.InventoryObjects(ctx, tree.Dir, objectsDir)

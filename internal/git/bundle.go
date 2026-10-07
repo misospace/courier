@@ -59,17 +59,29 @@ func BundleHeads(ctx context.Context, bundlePath string) ([]BundleRef, error) {
 	return heads, nil
 }
 
-// Unbundle unpacks every object the bundle carries into objectDir. The
-// directory must be empty or dedicated: objects beyond any result ref's
-// closure land there too, because bounds apply to the whole delivered set.
-// Prerequisites are resolved against repoDir.
-func Unbundle(ctx context.Context, repoDir, objectDir, bundlePath string) error {
+// Unbundle unpacks every object the bundle carries into objectDir in
+// isolation: the unbundle runs in a freshly-initialized empty repository
+// that this function creates and removes, so no caller repository's object
+// store or refdb is ever consulted. Prerequisites are not resolved, so only
+// self-contained bundles unpack; a prerequisite-bearing bundle fails, which
+// is intended. The directory must be empty or dedicated: objects beyond any
+// result ref's closure land there too, because bounds apply to the whole
+// delivered set.
+func Unbundle(ctx context.Context, objectDir, bundlePath string) error {
 	path, err := localBundlePath(bundlePath)
 	if err != nil {
 		return err
 	}
+	scratch, err := os.MkdirTemp(filepath.Dir(objectDir), "courier-unbundle-")
+	if err != nil {
+		return fmt.Errorf("git bundle unbundle: %w", err)
+	}
+	defer os.RemoveAll(scratch)
+	if _, err := Hardened(ctx, "", "init", "--quiet", "--bare", scratch); err != nil {
+		return fmt.Errorf("git bundle unbundle: %w", err)
+	}
 	env := []string{"GIT_OBJECT_DIRECTORY=" + objectDir}
-	if _, err := HardenedWithEnv(ctx, repoDir, env, "bundle", "unbundle", path); err != nil {
+	if _, err := HardenedWithEnv(ctx, scratch, env, "bundle", "unbundle", path); err != nil {
 		return fmt.Errorf("git bundle unbundle: %w", err)
 	}
 	return nil

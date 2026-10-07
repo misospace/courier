@@ -75,7 +75,7 @@ func TestBundleCreateHeadsVerifyInventory(t *testing.T) {
 	// The inventory covers exactly the delivered object set: two commits,
 	// two trees, two blobs.
 	quarantine := t.TempDir()
-	if err := Unbundle(ctx, fresh, quarantine, bundle); err != nil {
+	if err := Unbundle(ctx, quarantine, bundle); err != nil {
 		t.Fatal(err)
 	}
 	inventory, err := InventoryObjects(ctx, fresh, quarantine)
