@@ -142,6 +142,20 @@ type mockWorker struct {
 	// scripted state is served.
 	resultFailures int
 	results        map[string]protocol.ResultState
+	// snapshotTip is echoed by the scripted unpack task; packArtifact is the
+	// bundle the scripted pack task returns (empty artifact = no changes).
+	snapshotTip  string
+	packArtifact []byte
+}
+
+func isWorkerUnpackTask(task protocol.Task) bool {
+	return len(task.Command) == 3 && task.Command[0] == "sh" && task.Command[1] == "-c" &&
+		strings.Contains(task.Command[2], "refs/courier/snapshot/work:refs/heads/work")
+}
+
+func isWorkerPackTask(task protocol.Task) bool {
+	return len(task.Command) == 3 && task.Command[0] == "sh" && task.Command[1] == "-c" &&
+		strings.Contains(task.Command[2], "refs/courier/briefs/")
 }
 
 func (m *mockWorker) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -190,7 +204,23 @@ func (m *mockWorker) handleDispatch(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	m.dispatches = append(m.dispatches, dispatchRecord{envelope: req.Envelope, task: task})
-	if m.completeAll {
+	if m.results == nil {
+		m.results = map[string]protocol.ResultState{}
+	}
+	// The fixed unpack and pack tasks are answered from their scripted
+	// fields: the unpack echoes the tip, the pack returns the bundle.
+	switch {
+	case isWorkerUnpackTask(task):
+		m.results[req.Envelope.OpID] = protocol.ResultState{
+			Status: protocol.ResultCompleted,
+			Result: &protocol.Result{Status: protocol.ResultCompleted, ExitCode: 0, StdoutTail: m.snapshotTip},
+		}
+	case isWorkerPackTask(task):
+		m.results[req.Envelope.OpID] = protocol.ResultState{
+			Status: protocol.ResultCompleted,
+			Result: &protocol.Result{Status: protocol.ResultCompleted, ExitCode: 0, Artifact: m.packArtifact},
+		}
+	case m.completeAll:
 		m.results[req.Envelope.OpID] = protocol.ResultState{
 			Status: protocol.ResultCompleted,
 			Result: &protocol.Result{
@@ -333,21 +363,48 @@ func testWorkerAndDelegator(t *testing.T) (*mockWorker, *Delegator, func()) {
 }
 
 type mockPublisher struct {
-	mu    sync.Mutex
-	plans []Plan
+	mu         sync.Mutex
+	integrated []IntegrationRequest
+	publishes  int
+	commits    int
+
+	integrateErr error
+	publishErr   error
 }
 
-func (p *mockPublisher) Publish(_ context.Context, plan Plan) error {
+func (p *mockPublisher) Integrate(_ context.Context, req IntegrationRequest) (Integration, error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	p.plans = append(p.plans, plan)
-	return nil
+	if p.integrateErr != nil {
+		return Integration{}, p.integrateErr
+	}
+	p.commits++
+	p.integrated = append(p.integrated, req)
+	return Integration{Commit: fmt.Sprintf("commit-%d", p.commits), Changed: true}, nil
+}
+
+func (p *mockPublisher) Publish(_ context.Context) (Publication, error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.publishErr != nil {
+		return Publication{}, p.publishErr
+	}
+	p.publishes++
+	return Publication{OID: fmt.Sprintf("remote-%d", p.publishes)}, nil
 }
 
 func (p *mockPublisher) count() int {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	return len(p.plans)
+	return p.publishes
+}
+
+// snapshotProvider returns a snapshot seam stub that always serves the same
+// tip; the mock worker's unpack task echoes it back.
+func snapshotProvider(tip string) SnapshotProvider {
+	return func(context.Context) (Snapshot, error) {
+		return Snapshot{Data: []byte("snapshot"), Tip: tip}, nil
+	}
 }
 
 // --- stream normalization --------------------------------------------------
@@ -529,13 +586,15 @@ func TestDuplicateBriefIsRejectedWithoutWorkerContact(t *testing.T) {
 	worker, delegator, cleanupWorker := testWorkerAndDelegator(t)
 	defer cleanupWorker()
 	worker.completeAll = true
+	worker.snapshotTip = "snap-tip"
+	worker.packArtifact = []byte("bundle-bytes")
 	publisher := &mockPublisher{}
 	coordinator, err := NewCoordinator(CoordinatorConfig{
 		Gateway:   gateway,
 		Bindings:  testBindings(),
 		Worker:    delegator,
 		Publisher: publisher,
-		Snapshot:  func(context.Context) ([]byte, error) { return []byte("s"), nil },
+		Snapshot:  snapshotProvider("snap-tip"),
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -544,13 +603,14 @@ func TestDuplicateBriefIsRejectedWithoutWorkerContact(t *testing.T) {
 	if result.Outcome != executor.OutcomeBlockedExternal {
 		t.Fatalf("outcome = %q (%v)", result.Outcome, result.Err)
 	}
-	// The first brief's shell dispatched exactly once; the duplicate was
-	// refused at the ledger before any second worker contact.
-	if got := worker.dispatchCount(); got != 1 {
-		t.Fatalf("worker dispatches = %d, want 1", got)
+	// The first brief ran its full chain — unpack, shell, pack — exactly
+	// once; the duplicate was refused at the ledger before any second
+	// worker contact.
+	if got := worker.dispatchCount(); got != 3 {
+		t.Fatalf("worker dispatches = %d, want 3 (unpack, shell, pack)", got)
 	}
-	if got := worker.dispatchRequests; got != 1 {
-		t.Fatalf("worker dispatch requests = %d, want 1", got)
+	if got := worker.dispatchRequests; got != 3 {
+		t.Fatalf("worker dispatch requests = %d, want 3", got)
 	}
 	briefs := coordinator.Briefs().BriefIDs()
 	if len(briefs) != 1 || briefs[0] != "b1" {
@@ -655,10 +715,12 @@ func TestAmbiguousDispatchReconcilesWithoutRedelivery(t *testing.T) {
 		t.Fatal(err)
 	}
 	worker := &mockWorker{
-		key: pub,
-		// First dispatch: transport-class failure (5xx, not a definite 4xx
-		// rejection); the worker may or may not have accepted.
-		dispatchPlan: []int{http.StatusServiceUnavailable},
+		key:         pub,
+		snapshotTip: "snap-tip",
+		// The unpack dispatch succeeds; the shell dispatch is a
+		// transport-class failure (5xx, not a definite 4xx rejection): the
+		// worker may or may not have accepted.
+		dispatchPlan: []int{0, http.StatusServiceUnavailable},
 	}
 	server := httptest.NewServer(worker)
 	defer server.Close()
@@ -672,20 +734,21 @@ func TestAmbiguousDispatchReconcilesWithoutRedelivery(t *testing.T) {
 		Gateway:  &Gateway{BaseURL: "http://unused.invalid"},
 		Bindings: testBindings(),
 		Worker:   delegator,
-		Snapshot: func(context.Context) ([]byte, error) { return []byte("s"), nil },
+		Snapshot: snapshotProvider("snap-tip"),
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
 	// Drive the shell path directly: the outcome is a tool error carrying
-	// the reconciled observation, and the worker saw exactly one dispatch —
-	// no automatic redelivery — plus the reconciling cancel.
+	// the reconciled observation, and the shell was dispatched exactly once
+	// (the unpack ran first) — no automatic redelivery — plus the
+	// reconciling cancel.
 	result := coordinator.runShell(context.Background(), shellCall("echo hi"), "b1", ToolResult{ToolCallID: "c1", Name: toolShell})
 	if !result.IsError {
 		t.Fatalf("shell result after ambiguous dispatch = %+v, want tool error", result)
 	}
-	if got := worker.dispatchRequests; got != 1 {
-		t.Fatalf("worker dispatch requests = %d, want exactly 1 (no redelivery)", got)
+	if got := worker.dispatchRequests; got != 2 {
+		t.Fatalf("worker dispatch requests = %d, want 2 (unpack + shell, no redelivery)", got)
 	}
 	if got := worker.cancelCount(); got != 1 {
 		t.Fatalf("worker cancels = %d, want the reconciling cancel", got)
@@ -810,6 +873,8 @@ func TestSubagentShellRoutesThroughWorkerAndOnlyControlPublishes(t *testing.T) {
 	worker, delegator, cleanupWorker := testWorkerAndDelegator(t)
 	defer cleanupWorker()
 	worker.completeAll = true
+	worker.snapshotTip = "snap-tip"
+	worker.packArtifact = []byte("bundle-bytes")
 
 	gateway, _, cleanup := gatewayFor(
 		// Coordinator: delegate to coder.
@@ -837,7 +902,7 @@ func TestSubagentShellRoutesThroughWorkerAndOnlyControlPublishes(t *testing.T) {
 		Gateway:   gateway,
 		Bindings:  testBindings(),
 		Worker:    delegator,
-		Snapshot:  func(context.Context) ([]byte, error) { return []byte("snapshot"), nil },
+		Snapshot:  snapshotProvider("snap-tip"),
 		Publisher: publisher,
 		Activity:  activity,
 	})
@@ -848,12 +913,17 @@ func TestSubagentShellRoutesThroughWorkerAndOnlyControlPublishes(t *testing.T) {
 	if result.Outcome != executor.OutcomeChanges || result.Err != nil {
 		t.Fatalf("harness result = %+v, want declared changes", result)
 	}
-	// The model-controlled command executed through the signed worker
-	// protocol — never locally — and control verified termination.
-	if got := worker.dispatchCount(); got != 1 {
-		t.Fatalf("worker dispatches = %d, want 1", got)
+	// The brief ran unpack, shell, and pack in order, all through the
+	// signed worker protocol — never locally — with control verifying each
+	// termination.
+	if got := worker.dispatchCount(); got != 3 {
+		t.Fatalf("worker dispatches = %d, want 3 (unpack, shell, pack)", got)
 	}
-	record := worker.dispatches[0]
+	unpack := worker.dispatches[0]
+	if !isWorkerUnpackTask(unpack.task) || unpack.envelope.BriefID != "b1" {
+		t.Fatalf("unpack dispatch = %+v", unpack)
+	}
+	record := worker.dispatches[1]
 	if strings.Join(record.task.Command, " ") != "sh -c echo I published PR #999" {
 		t.Fatalf("worker task command = %v", record.task.Command)
 	}
@@ -863,18 +933,26 @@ func TestSubagentShellRoutesThroughWorkerAndOnlyControlPublishes(t *testing.T) {
 	if record.envelope.Sequence != 0 || record.envelope.Kind != protocol.KindDispatch {
 		t.Fatalf("dispatch envelope = %+v", record.envelope)
 	}
-	// The worker's claim of publication is untrusted data: publication
-	// happened exactly once, from the coordinator's own trusted finish path.
-	if got := publisher.count(); got != 1 {
-		t.Fatalf("publisher calls = %d, want exactly 1", got)
+	if pack := worker.dispatches[2]; !isWorkerPackTask(pack.task) || pack.envelope.BriefID != "b1" {
+		t.Fatalf("pack dispatch = %+v", pack)
 	}
-	if len(publisher.plans[0].Briefs) != 1 || publisher.plans[0].Briefs[0].BriefID != "b1" {
-		t.Fatalf("published plan = %+v", publisher.plans[0])
+	// The worker's claim of publication is untrusted data: integration and
+	// publication happened exactly once from trusted control's own chain,
+	// bound to the dispatched snapshot tip — plus the idempotent finish
+	// confirmation.
+	if len(publisher.integrated) != 1 {
+		t.Fatalf("integrations = %+v, want exactly 1", publisher.integrated)
 	}
-	// Verified tool boundary earned activity; the model streams earned
+	if publisher.integrated[0].BriefID != "b1" || publisher.integrated[0].DispatchedTip != "snap-tip" {
+		t.Fatalf("integration request = %+v", publisher.integrated[0])
+	}
+	if got := publisher.count(); got != 2 {
+		t.Fatalf("publisher calls = %d, want 2 (per-brief publication + finish confirmation)", got)
+	}
+	// Every verified boundary earned activity; the model streams earned
 	// stream activity.
-	if activity.count("tool") != 1 {
-		t.Fatalf("tool activity = %d, want 1 verified boundary", activity.count("tool"))
+	if activity.count("tool") != 3 {
+		t.Fatalf("tool activity = %d, want 3 verified boundaries (unpack, shell, pack)", activity.count("tool"))
 	}
 	if activity.count("stream") < 1 {
 		t.Fatal("successful model streams must earn stream activity")
@@ -885,6 +963,9 @@ func TestWorkerPublicationClaimWithoutDeclaredChangesNeverPublishes(t *testing.T
 	worker, delegator, cleanupWorker := testWorkerAndDelegator(t)
 	defer cleanupWorker()
 	worker.completeAll = true
+	worker.snapshotTip = "snap-tip"
+	// No packArtifact: the brief produced no committed work, so nothing
+	// integrates and nothing publishes — whoever claims otherwise.
 	gateway, _, cleanup := gatewayFor(
 		// Coordinator: delegate.
 		gatewayResponse{body: sse(
@@ -905,7 +986,7 @@ func TestWorkerPublicationClaimWithoutDeclaredChangesNeverPublishes(t *testing.T
 	publisher := &mockPublisher{}
 	coordinator, err := NewCoordinator(CoordinatorConfig{
 		Gateway: gateway, Bindings: testBindings(), Worker: delegator,
-		Snapshot:  func(context.Context) ([]byte, error) { return []byte("s"), nil },
+		Snapshot:  snapshotProvider("snap-tip"),
 		Publisher: publisher,
 	})
 	if err != nil {
@@ -1043,6 +1124,7 @@ func TestToolDeclarationsMatchSessionContext(t *testing.T) {
 	worker, delegator, cleanupWorker := testWorkerAndDelegator(t)
 	defer cleanupWorker()
 	worker.completeAll = true
+	worker.snapshotTip = "snap-tip"
 	gateway, mocker, cleanup := gatewayFor(
 		// Coordinator: delegate.
 		gatewayResponse{body: sse(
@@ -1063,7 +1145,7 @@ func TestToolDeclarationsMatchSessionContext(t *testing.T) {
 	defer cleanup()
 	coordinator, err := NewCoordinator(CoordinatorConfig{
 		Gateway: gateway, Bindings: testBindings(), Worker: delegator,
-		Snapshot: func(context.Context) ([]byte, error) { return []byte("s"), nil },
+		Snapshot: snapshotProvider("snap-tip"),
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -1170,8 +1252,10 @@ func TestResultPollFailureReconciles(t *testing.T) {
 		t.Fatal(err)
 	}
 	worker := &mockWorker{
-		key:            pub,
-		completeAll:    true,
+		key:         pub,
+		completeAll: true,
+		// The failure is scripted for the shell's own poll; the snapshot
+		// prepare is skipped below so the unpack dispatch never happens.
 		resultFailures: 1,
 		results:        map[string]protocol.ResultState{},
 	}
@@ -1187,7 +1271,7 @@ func TestResultPollFailureReconciles(t *testing.T) {
 		Gateway:  &Gateway{BaseURL: "http://unused.invalid"},
 		Bindings: testBindings(),
 		Worker:   delegator,
-		Snapshot: func(context.Context) ([]byte, error) { return []byte("s"), nil },
+		Snapshot: snapshotProvider("snap-tip"),
 		Activity: &recordingActivity{},
 	})
 	if err != nil {
@@ -1225,16 +1309,17 @@ func TestSnapshotTransientFailureIsRetried(t *testing.T) {
 	)
 	defer cleanup()
 	attempts := 0
+	worker.snapshotTip = "snap-tip"
 	coordinator, err := NewCoordinator(CoordinatorConfig{
 		Gateway:  gateway,
 		Bindings: testBindings(),
 		Worker:   delegator,
-		Snapshot: func(context.Context) ([]byte, error) {
+		Snapshot: func(context.Context) (Snapshot, error) {
 			attempts++
 			if attempts == 1 {
-				return nil, errors.New("snapshot render failed transiently")
+				return Snapshot{}, errors.New("snapshot render failed transiently")
 			}
-			return []byte("snapshot"), nil
+			return Snapshot{Data: []byte("snapshot"), Tip: "snap-tip"}, nil
 		},
 	})
 	if err != nil {
@@ -1245,9 +1330,10 @@ func TestSnapshotTransientFailureIsRetried(t *testing.T) {
 		t.Fatalf("outcome = %q (%v)", result.Outcome, result.Err)
 	}
 	// The first shell failed at the snapshot and dispatched nothing; the
-	// second retried the upload and dispatched — the failure was not cached.
-	if worker.dispatchCount() != 1 {
-		t.Fatalf("worker dispatches = %d, want 1 (the second task retried the snapshot)", worker.dispatchCount())
+	// second retried the upload, ran the unpack, and dispatched its task —
+	// the failure was not cached.
+	if worker.dispatchCount() != 2 {
+		t.Fatalf("worker dispatches = %d, want 2 (unpack + the retried task)", worker.dispatchCount())
 	}
 	if worker.snapshots != 1 {
 		t.Fatalf("snapshot uploads = %d, want 1", worker.snapshots)
@@ -1408,12 +1494,14 @@ func TestBriefResultRetention(t *testing.T) {
 		gatewayResponse{body: sse(contentChunk(`{"outcome":"changes"}`), finishChunk("stop"))},
 	)
 	defer cleanup()
+	worker.snapshotTip = "snap-tip"
+	worker.packArtifact = []byte("bundle-bytes")
 	publisher := &mockPublisher{}
 	coordinator, err := NewCoordinator(CoordinatorConfig{
 		Gateway:   gateway,
 		Bindings:  testBindings(),
 		Worker:    delegator,
-		Snapshot:  func(context.Context) ([]byte, error) { return []byte("s"), nil },
+		Snapshot:  snapshotProvider("snap-tip"),
 		Publisher: publisher,
 	})
 	if err != nil {
@@ -1423,12 +1511,24 @@ func TestBriefResultRetention(t *testing.T) {
 	if result.Outcome != executor.OutcomeChanges {
 		t.Fatalf("outcome = %q (%v)", result.Outcome, result.Err)
 	}
-	if len(publisher.plans) != 1 || len(publisher.plans[0].Briefs) != 1 {
-		t.Fatalf("published plan = %+v", publisher.plans)
+	if len(publisher.integrated) != 1 {
+		t.Fatalf("integrations = %+v", publisher.integrated)
 	}
-	retained := publisher.plans[0].Briefs[0]
-	if retained.BriefID != "b1" || retained.Summary != "the actual delegate summary" {
+	if publisher.integrated[0].BriefID != "b1" || publisher.integrated[0].DispatchedTip != "snap-tip" {
+		t.Fatalf("integration request = %+v", publisher.integrated[0])
+	}
+	retained, ok := coordinator.Briefs().Result("b1")
+	if !ok {
+		t.Fatal("brief b1 recorded no result")
+	}
+	if !strings.Contains(retained.Summary, "the actual delegate summary") {
 		t.Fatalf("retained result = %+v, want the delegate's actual summary", retained)
+	}
+	if retained.Commit != "commit-1" {
+		t.Fatalf("retained commit = %q, want the integration commit", retained.Commit)
+	}
+	if publisher.count() != 2 {
+		t.Fatalf("publisher calls = %d, want 2 (per-brief + finish)", publisher.count())
 	}
 }
 
@@ -1455,7 +1555,7 @@ func TestToolResultEventsAreEmitted(t *testing.T) {
 		Gateway:  gateway,
 		Bindings: testBindings(),
 		Worker:   delegator,
-		Snapshot: func(context.Context) ([]byte, error) { return []byte("s"), nil },
+		Snapshot: snapshotProvider("snap-tip"),
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -1510,7 +1610,7 @@ func TestUnboundRoleDoesNotBurnBriefID(t *testing.T) {
 		Gateway:  gateway,
 		Bindings: testBindings(), // coordinator + coder bound; reviewer is not
 		Worker:   delegator,
-		Snapshot: func(context.Context) ([]byte, error) { return []byte("s"), nil },
+		Snapshot: snapshotProvider("snap-tip"),
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -1523,7 +1623,7 @@ func TestUnboundRoleDoesNotBurnBriefID(t *testing.T) {
 	if len(briefs) != 1 || briefs[0] != "b1" {
 		t.Fatalf("brief ledger = %v, want exactly the re-delegated b1", briefs)
 	}
-	if worker.dispatchCount() != 1 {
-		t.Fatalf("worker dispatches = %d, want the corrected delegation's shell work", worker.dispatchCount())
+	if worker.dispatchCount() != 2 {
+		t.Fatalf("worker dispatches = %d, want 2 (the corrected delegation's unpack and shell)", worker.dispatchCount())
 	}
 }
