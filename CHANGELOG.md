@@ -1,5 +1,47 @@
 # Changelog
 
+## [0.1.5](https://github.com/misospace/courier/compare/v0.1.4...v0.1.5) (2026-10-08)
+
+
+### Features
+
+* authenticate harness status and recover resume ([#236](https://github.com/misospace/courier/issues/236)) ([703df12](https://github.com/misospace/courier/commit/703df12439b63b39547dc0a8509b55ba00283fe6))
+* **container:** update image busybox (1.36 → 1.38) ([#208](https://github.com/misospace/courier/issues/208)) ([7afb06e](https://github.com/misospace/courier/commit/7afb06e27fd8bb76653a91c6869d11b4b82f15da))
+* **deps:** update module github.com/prometheus/client_golang (v1.24.1 → v1.25.0) ([#242](https://github.com/misospace/courier/issues/242)) ([5b2317f](https://github.com/misospace/courier/commit/5b2317ffe408139f73c1f9b87d8c1019c0f0cd98))
+* **evidence:** bounded, fail-closed worktree evidence capture core ([#197](https://github.com/misospace/courier/issues/197)) ([#230](https://github.com/misospace/courier/issues/230)) ([a5e1c3a](https://github.com/misospace/courier/commit/a5e1c3acae1f39a428738c36e12c963d595b0755))
+* export CoderRun duration, queue-wait and outcome metrics ([#194](https://github.com/misospace/courier/issues/194)) ([96b8435](https://github.com/misospace/courier/commit/96b84351803637d1f94c409a6b1dad530ef7e45d))
+* **harness:** authenticate status writes and fence liveness by UID ([#233](https://github.com/misospace/courier/issues/233)) ([195a4b4](https://github.com/misospace/courier/commit/195a4b4f10f431fe51d3592173d0067e97c2d736))
+* **harness:** normalize model streams and delegate briefs ([#213](https://github.com/misospace/courier/issues/213)) ([84b8cbe](https://github.com/misospace/courier/commit/84b8cbefd56368573a4c89563c2a5069bb03f752))
+* **harness:** validate worker artifacts and publish briefs ([#225](https://github.com/misospace/courier/issues/225)) ([07718c1](https://github.com/misospace/courier/commit/07718c1d1e1b698ac676b0f3a090b24071cdcf14))
+* isolate trusted harness and shell pods ([#206](https://github.com/misospace/courier/issues/206)) ([6b1709c](https://github.com/misospace/courier/commit/6b1709c915983f36e3243e60936a7d8bcba03ae5))
+* per-run telemetry from opencode events ([#172](https://github.com/misospace/courier/issues/172)) ([#188](https://github.com/misospace/courier/issues/188)) ([ceef16a](https://github.com/misospace/courier/commit/ceef16aff73c25b642669ecb494bf04ce9552622))
+* reconcile deployment-managed bootstrap LaneProfiles ([#212](https://github.com/misospace/courier/issues/212)) ([3fed8be](https://github.com/misospace/courier/commit/3fed8befe955db7278fd26ef3504a8e2aef3b107))
+* record admitted/started/finished timestamps on CoderRun status ([#187](https://github.com/misospace/courier/issues/187)) ([5d35267](https://github.com/misospace/courier/commit/5d3526754ea52a9c9b586179d0a86f0fafc21e3a))
+* support multiple Dispatch lane bindings in one deployment ([#193](https://github.com/misospace/courier/issues/193)) ([0892e9a](https://github.com/misospace/courier/commit/0892e9ae8b03cb219bea686aa1f3387a49d32204))
+
+
+### Bug Fixes
+
+* **courier:** hand off external CI verification ([#232](https://github.com/misospace/courier/issues/232)) ([2f2d8f0](https://github.com/misospace/courier/commit/2f2d8f0bfce0fbc1c23b3e094cf8abb948a16328))
+* **deps:** update module github.com/prometheus/client_golang (v1.24.0 → v1.24.1) ([#195](https://github.com/misospace/courier/issues/195)) ([a83b1ee](https://github.com/misospace/courier/commit/a83b1ee768bde715d4eb423f7b3ca1ed4391416f))
+* **harness:** unbundle worker artifacts in an isolated repository ([#239](https://github.com/misospace/courier/issues/239)) ([6b5bfe6](https://github.com/misospace/courier/commit/6b5bfe67183c8ef51a1ea4cb8bfc1ec8bb7aeccb))
+* re-confirm every wedge-path delete before charging the crashloop counter ([#224](https://github.com/misospace/courier/issues/224)) ([e0c2a06](https://github.com/misospace/courier/commit/e0c2a06de47cec94619282e599c641ac9cdd9df5)), closes [#105](https://github.com/misospace/courier/issues/105)
+* relaunch Running runs whose coordinator pod disappears ([#218](https://github.com/misospace/courier/issues/218)) ([b5f75f9](https://github.com/misospace/courier/commit/b5f75f953366b18250f6e7ac1d2a36d5da69511a))
+
+
+### Chores
+
+* **ai-review:** upgrade reviewer to v3.2.0 ([#196](https://github.com/misospace/courier/issues/196)) ([0c9ab2f](https://github.com/misospace/courier/commit/0c9ab2f52ec136c26734535e5f9263bdb7f05f98))
+* **container:** update image golang (1e93e00 → 162be52) ([#231](https://github.com/misospace/courier/issues/231)) ([f301153](https://github.com/misospace/courier/commit/f301153dcf329d8044ac7c7ec62bc1c24a1e2850))
+* **container:** update image golang (e0174e5 → 1e93e00) ([#227](https://github.com/misospace/courier/issues/227)) ([49dcba5](https://github.com/misospace/courier/commit/49dcba59816fc60ceea947abec3e74969659b846))
+* **container:** update image node (0e0ff40 → d6aa754) ([#226](https://github.com/misospace/courier/issues/226)) ([e31fe75](https://github.com/misospace/courier/commit/e31fe751dee2bc7dbde43938ad5108fca5994097))
+
+
+### Documentation
+
+* **harness:** settle provider registration and worker artifact contracts ([#205](https://github.com/misospace/courier/issues/205)) ([085957f](https://github.com/misospace/courier/commit/085957f3dae0c38b9ed10033d2e10190a93f4e0f))
+* settle durable failure evidence design for dirty runs ([#115](https://github.com/misospace/courier/issues/115)) ([#203](https://github.com/misospace/courier/issues/203)) ([bead1a1](https://github.com/misospace/courier/commit/bead1a131f59fbf88327154fdba1acd20e66f71c))
+
 ## [0.1.4](https://github.com/misospace/courier/compare/v0.1.3...v0.1.4) (2026-10-01)
 
 
