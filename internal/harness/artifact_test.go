@@ -278,6 +278,29 @@ func TestArtifactRejectsWrongRefSets(t *testing.T) {
 	requireRejected(t, err, rejectRefSet)
 }
 
+// A prerequisite-bearing bundle: the worker excludes the dispatched tip, so
+// the bundle declares a prerequisite. It verifies against the private tree
+// (which holds the tip) but cannot unpack in isolation — it is rejected as
+// not self-contained.
+func TestArtifactRejectsPrerequisiteBundle(t *testing.T) {
+	w := newArtifactWorld(t, nil)
+	workspace := w.simulateWorkerWorkspace("b1", func(dir string) {
+		writeFile(t, filepath.Join(dir, "c.txt"), "work\n")
+		gitCmd(t, dir, "add", "c.txt")
+		gitCommit(t, dir, "work")
+	})
+	ref := ResultRefPrefix + "b1"
+	gitCmd(t, workspace, "update-ref", ref, "HEAD")
+	bundlePath := filepath.Join(t.TempDir(), "prereq.bundle")
+	gitCmd(t, workspace, "bundle", "create", bundlePath, ref, "^"+w.tip)
+	data, err := os.ReadFile(bundlePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = w.integrate("b1", data, "summary")
+	requireRejected(t, err, rejectMalformed)
+}
+
 func TestArtifactRejectsOversizedBlob(t *testing.T) {
 	w := newArtifactWorld(t, nil)
 	big := make([]byte, MaxArtifactBlobBytes+1)

@@ -1,6 +1,10 @@
 package executor
 
 import (
+	"crypto/hmac"
+	"crypto/sha256"
+	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"reflect"
@@ -12,6 +16,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	courierv1alpha1 "github.com/misospace/courier/api/v1alpha1"
+	courierlog "github.com/misospace/courier/internal/log"
 )
 
 func TestOpenCodeCommandInjectsGoalModelAndFraming(t *testing.T) {
@@ -1283,6 +1288,282 @@ func TestPodConfigValidateToolchainOverlap(t *testing.T) {
 			}
 			if !test.wantErr && err != nil {
 				t.Fatalf("Validate() for workspace path %q = %v, want no error", test.path, err)
+			}
+		})
+	}
+}
+
+func evidenceTestRun(name string) *courierv1alpha1.CoderRun {
+	return &courierv1alpha1.CoderRun{
+		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: "courier-system"},
+		Spec: courierv1alpha1.CoderRunSpec{
+			Mode: courierv1alpha1.ModeResolveIssue,
+			Repo: "acme/widgets",
+			Ref:  7,
+			Lane: "local",
+		},
+		Status: courierv1alpha1.CoderRunStatus{Branch: "courier/acme/widgets/issue-7"},
+	}
+}
+
+func evidenceTestLane() *courierv1alpha1.LaneProfile {
+	return &courierv1alpha1.LaneProfile{
+		ObjectMeta: metav1.ObjectMeta{Name: "local", Namespace: "courier-system"},
+		Spec:       courierv1alpha1.LaneProfileSpec{Roles: map[string]string{"coordinator": "any-model"}},
+	}
+}
+
+func TestBuildCoordinatorPodWiresEvidenceWhenConfigured(t *testing.T) {
+	pod, err := BuildCoordinatorPod(evidenceTestRun("run-evidence"), evidenceTestLane(), PodConfig{
+		Image:         "registry.example/courier-opencode:test",
+		WorkspacePath: "/workspace",
+		EvidenceURL:   "http://intake.courier-system.svc",
+		EvidenceToken: "a-very-long-evidence-token-value-for-testing-0123456789",
+		EvidenceNonce: "0123456789abcdef",
+	})
+	if err != nil {
+		t.Fatalf("BuildCoordinatorPod() error = %v", err)
+	}
+	env := map[string]*corev1.EnvVar{}
+	for i := range pod.Spec.Containers[0].Env {
+		env[pod.Spec.Containers[0].Env[i].Name] = &pod.Spec.Containers[0].Env[i]
+	}
+	if got := env[EnvEvidenceURL]; got == nil || got.Value != "http://intake.courier-system.svc" {
+		t.Fatalf("evidence URL env = %#v, want the configured URL", got)
+	}
+	if got := env[EnvEvidenceNonce]; got == nil || got.Value != "0123456789abcdef" {
+		t.Fatalf("evidence nonce env = %#v, want the configured nonce", got)
+	}
+	if got := env[EnvEvidenceToken]; got == nil || got.ValueFrom != nil || got.Value != "a-very-long-evidence-token-value-for-testing-0123456789" {
+		t.Fatalf("evidence token env = %#v, want a literal value with no valueFrom", got)
+	}
+	if got := env[EnvPodUID]; got == nil || got.ValueFrom == nil || got.ValueFrom.FieldRef == nil || got.ValueFrom.FieldRef.FieldPath != "metadata.uid" {
+		t.Fatalf("pod UID env = %#v, want a downward-API metadata.uid fieldRef", got)
+	}
+	if got := pod.Spec.TerminationGracePeriodSeconds; got == nil || *got != EvidenceTerminationGracePeriodSeconds {
+		t.Fatalf("terminationGracePeriodSeconds = %v, want %d", got, EvidenceTerminationGracePeriodSeconds)
+	}
+}
+
+func TestBuildCoordinatorPodOmitsEvidenceWhenNotConfigured(t *testing.T) {
+	pod, err := BuildCoordinatorPod(evidenceTestRun("run-no-evidence"), evidenceTestLane(), PodConfig{
+		Image:         "registry.example/courier-opencode:test",
+		WorkspacePath: "/workspace",
+	})
+	if err != nil {
+		t.Fatalf("BuildCoordinatorPod() error = %v", err)
+	}
+	for _, name := range []string{EnvEvidenceURL, EnvEvidenceToken, EnvEvidenceNonce, EnvPodUID} {
+		for _, env := range pod.Spec.Containers[0].Env {
+			if env.Name == name {
+				t.Fatalf("evidence env %q is present when capture is not configured", name)
+			}
+		}
+	}
+	if got := pod.Spec.TerminationGracePeriodSeconds; got != nil {
+		t.Fatalf("terminationGracePeriodSeconds = %d, want the kubelet default (nil)", *got)
+	}
+}
+
+func TestEnvironmentWithConfigOmitsEvidenceWhenNotSet(t *testing.T) {
+	inv := Invocation{RunName: "r", Namespace: "n", Ref: 1, Goal: "g", Model: "m", Workspace: "/w", Mode: courierv1alpha1.ModeResolveIssue}
+	names := map[string]bool{}
+	for _, env := range EnvironmentWithConfig(inv, "opencode", "url", "base", "main", "bin", "json", "term", "agent", "", "") {
+		names[env.Name] = true
+	}
+	if names[EnvEvidenceURL] || names[EnvEvidenceNonce] {
+		t.Fatalf("evidence env names are present when the evidence args are empty")
+	}
+	values := map[string]string{}
+	for _, env := range EnvironmentWithConfig(inv, "opencode", "url", "base", "main", "bin", "json", "term", "agent", "http://intake", "deadbeef") {
+		values[env.Name] = env.Value
+	}
+	if values[EnvEvidenceURL] != "http://intake" {
+		t.Fatalf("COURIER_EVIDENCE_URL = %q, want the supplied URL", values[EnvEvidenceURL])
+	}
+	if values[EnvEvidenceNonce] != "deadbeef" {
+		t.Fatalf("COURIER_EVIDENCE_NONCE = %q, want the supplied nonce", values[EnvEvidenceNonce])
+	}
+}
+
+func TestEvidenceTokenConstructionAndNonceUniqueness(t *testing.T) {
+	key := []byte("intake-hmac-key")
+	nonce1, err := NewEvidenceNonce()
+	if err != nil {
+		t.Fatalf("NewEvidenceNonce() error = %v", err)
+	}
+	nonce2, err := NewEvidenceNonce()
+	if err != nil {
+		t.Fatalf("NewEvidenceNonce() error = %v", err)
+	}
+	if len(nonce1) != EvidenceNonceBytes {
+		t.Fatalf("nonce length = %d, want %d", len(nonce1), EvidenceNonceBytes)
+	}
+	if string(nonce1) == string(nonce2) {
+		t.Fatalf("NewEvidenceNonce() returned the same nonce twice: %x", nonce1)
+	}
+	if EvidenceToken(key, "ns", "name", "uid", nonce1) == EvidenceToken(key, "ns", "name", "uid", nonce2) {
+		t.Fatal("EvidenceToken did not vary with the nonce")
+	}
+	// Recompute the documented construction independently, so a change to the
+	// token layout breaks loudly here rather than silently in the intake.
+	mac := hmac.New(sha256.New, key)
+	mac.Write([]byte("ns/name/uid/" + hex.EncodeToString(nonce1)))
+	want := base64.StdEncoding.EncodeToString(mac.Sum(nonce1))
+	if got := EvidenceToken(key, "ns", "name", "uid", nonce1); got != want {
+		t.Fatalf("EvidenceToken = %q, want the documented construction %q", got, want)
+	}
+}
+
+func TestEvidenceTokenNameShapeIsRedacted(t *testing.T) {
+	token := strings.Repeat("a", 40)
+	redactor := courierlog.NewRedactor()
+	redactor.RegisterEnvironment([]string{EnvEvidenceToken + "=" + token})
+	want := "capturing " + courierlog.RedactedPlaceholder
+	if got := redactor.Redact("capturing " + token); got != want {
+		t.Fatalf("Redact = %q, want %q; the TOKEN suffix is what makes the name-shape registration cover it", got, want)
+	}
+}
+
+func TestRenderedPodContainsEvidenceTokenExactlyOnce(t *testing.T) {
+	token := "aB3dE6gH9jK2mN5pQ8rT0vWx+Za/cEfHiJkLmNoPqRsTuVwXyZ012345678"
+	nonce := "fedcba9876543210"
+	pod, err := BuildCoordinatorPod(evidenceTestRun("run-leak"), evidenceTestLane(), PodConfig{
+		Image:                  "registry.example/courier-opencode:test",
+		WorkspacePath:          "/workspace",
+		GitRemoteURL:           "https://git.example/%s.git",
+		GitCredentialSecret:    "courier-git",
+		GitHubCredentialSecret: "courier-github-api",
+		EnvironmentSecret:      "courier-model",
+		EvidenceURL:            "http://intake.courier-system.svc",
+		EvidenceToken:          token,
+		EvidenceNonce:          nonce,
+	})
+	if err != nil {
+		t.Fatalf("BuildCoordinatorPod() error = %v", err)
+	}
+	rendered, err := json.Marshal(pod)
+	if err != nil {
+		t.Fatalf("json.Marshal(pod) error = %v", err)
+	}
+	if got := strings.Count(string(rendered), token); got != 1 {
+		t.Fatalf("evidence token occurs %d times in the rendered pod, want exactly 1 (the coordinator env)", got)
+	}
+	envMatches := 0
+	for _, env := range pod.Spec.Containers[0].Env {
+		if env.Value == token {
+			envMatches++
+		}
+	}
+	if envMatches != 1 {
+		t.Fatalf("evidence token appears as %d coordinator container env values, want exactly 1", envMatches)
+	}
+	for key, value := range pod.Annotations {
+		if strings.Contains(value, token) {
+			t.Fatalf("evidence token leaked into annotation %q", key)
+		}
+	}
+	for key, value := range pod.Labels {
+		if strings.Contains(value, token) {
+			t.Fatalf("evidence token leaked into label %q", key)
+		}
+	}
+	if got := strings.Count(string(rendered), nonce); got != 1 {
+		t.Fatalf("evidence nonce occurs %d times in the rendered pod, want exactly 1 (the coordinator env)", got)
+	}
+	if !strings.Contains(string(rendered), `"terminationGracePeriodSeconds":45`) {
+		t.Fatal("rendered pod is missing terminationGracePeriodSeconds:45")
+	}
+}
+
+func TestCredentialEnvRefsMatchRenderedPodSecretRefs(t *testing.T) {
+	for _, test := range []struct {
+		name   string
+		config PodConfig
+		want   []CredentialEnvRef
+	}{
+		{
+			name:   "git only",
+			config: PodConfig{GitCredentialSecret: "courier-git"},
+			want: []CredentialEnvRef{
+				{Name: "COURIER_GIT_USERNAME", Secret: "courier-git", Key: "username"},
+				{Name: "COURIER_GIT_TOKEN", Secret: "courier-git", Key: "token"},
+				{Name: "GITHUB_TOKEN", Secret: "courier-git", Key: "token"},
+			},
+		},
+		{
+			name:   "git plus distinct github",
+			config: PodConfig{GitCredentialSecret: "courier-git", GitTokenKey: "git-token", GitHubCredentialSecret: "courier-github-api", GitHubTokenKey: "api-token"},
+			want: []CredentialEnvRef{
+				{Name: "COURIER_GIT_USERNAME", Secret: "courier-git", Key: "username"},
+				{Name: "COURIER_GIT_TOKEN", Secret: "courier-git", Key: "git-token"},
+				{Name: "GITHUB_TOKEN", Secret: "courier-github-api", Key: "api-token"},
+			},
+		},
+		{
+			name:   "api-only github secret",
+			config: PodConfig{GitHubCredentialSecret: "courier-github-api", GitHubTokenKey: "api-token"},
+			want:   []CredentialEnvRef{{Name: "GITHUB_TOKEN", Secret: "courier-github-api", Key: "api-token"}},
+		},
+		{name: "neither", config: PodConfig{}, want: nil},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			refs := CredentialEnvRefs(test.config)
+			if !reflect.DeepEqual(refs, test.want) {
+				t.Fatalf("CredentialEnvRefs() = %#v, want %#v", refs, test.want)
+			}
+			pod, err := BuildCoordinatorPod(evidenceTestRun("run-refs"), evidenceTestLane(), test.config)
+			if err != nil {
+				t.Fatalf("BuildCoordinatorPod() error = %v", err)
+			}
+			got := map[string]CredentialEnvRef{}
+			for _, env := range pod.Spec.Containers[0].Env {
+				if env.ValueFrom != nil && env.ValueFrom.SecretKeyRef != nil {
+					got[env.Name] = CredentialEnvRef{Name: env.Name, Secret: env.ValueFrom.SecretKeyRef.Name, Key: env.ValueFrom.SecretKeyRef.Key}
+				}
+			}
+			want := map[string]CredentialEnvRef{}
+			for _, ref := range refs {
+				want[ref.Name] = ref
+			}
+			if !reflect.DeepEqual(got, want) {
+				t.Fatalf("rendered pod SecretKeyRef env = %#v, want the helper's set %#v", got, want)
+			}
+		})
+	}
+}
+
+func TestPodConfigValidateRejectsPartialEvidence(t *testing.T) {
+	base := func() PodConfig {
+		return PodConfig{Image: "registry.example/courier-opencode:test", WorkspacePath: "/workspace"}
+	}
+	for _, test := range []struct {
+		name    string
+		mutate  func(*PodConfig)
+		wantErr bool
+	}{
+		{name: "url only", mutate: func(c *PodConfig) { c.EvidenceURL = "http://intake" }, wantErr: true},
+		{name: "url and token without nonce", mutate: func(c *PodConfig) { c.EvidenceURL = "http://intake"; c.EvidenceToken = "a-token" }, wantErr: true},
+		{name: "nonce only", mutate: func(c *PodConfig) { c.EvidenceNonce = "0123456789abcdef" }, wantErr: true},
+		{name: "all set", mutate: func(c *PodConfig) {
+			c.EvidenceURL = "http://intake"
+			c.EvidenceToken = "a-token"
+			c.EvidenceNonce = "0123456789abcdef"
+		}, wantErr: false},
+		{name: "all empty", mutate: func(c *PodConfig) {}, wantErr: false},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			config := base()
+			test.mutate(&config)
+			err := config.Validate()
+			if test.wantErr && err == nil {
+				t.Fatalf("Validate() = nil, want a partial-evidence error for %s", test.name)
+			}
+			if test.wantErr && err != nil && !strings.Contains(err.Error(), "evidence") {
+				t.Fatalf("Validate() error = %q, want it to mention evidence", err)
+			}
+			if !test.wantErr && err != nil {
+				t.Fatalf("Validate() = %v, want no error for %s", err, test.name)
 			}
 		})
 	}

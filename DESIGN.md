@@ -584,8 +584,10 @@ listener runnable declares `NeedLeaderElection() → false`, so with leader
 election every replica serves — without that, standbys would refuse POSTs the
 Service load-balances onto them and exhaust the executor's two-attempt budget.
 The per-run, per-incarnation token is `base64(nonce ‖ HMAC-SHA256(key,
-namespace/name/run-UID/nonce))`: the launcher generates the nonce at pod build
-(the pod UID is not assigned yet, so it cannot be the binding), injects token
+namespace/name/run-UID/hex(nonce)))` (here `hex` is lowercase hex of the nonce;
+the token carries the raw nonce bytes ahead of the MAC, and the Secret slot name
+comes from the first 8 hex characters): the launcher generates the nonce at pod
+build (the pod UID is not assigned yet, so it cannot be the binding), injects token
 and nonce as env (the token's name ends in `TOKEN`, so the executor's
 name-shape redactor registration covers it), and the intake validates with
 `hmac.Equal` after recomputing the HMAC from an **uncached** live read of the

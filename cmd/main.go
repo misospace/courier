@@ -80,6 +80,8 @@ func main() {
 	var dispatchLaneBindings stringSliceValue
 	var dispatchPollInterval time.Duration
 	var dispatchHTTPTimeout time.Duration
+	var evidenceIntakeKeySecret string
+	var evidenceIntakeService string
 	var secureMode bool
 	var forgeProvidersFile string
 	var runNamespace string
@@ -129,6 +131,8 @@ func main() {
 	flag.Var(&dispatchLaneBindings, "dispatch-lane-binding", "Repeatable Dispatch lane binding <queueLane>:<laneProfile>; one discovery runner per binding.")
 	flag.DurationVar(&dispatchPollInterval, "dispatch-poll-interval", 30*time.Second, "Dispatch discovery poll interval.")
 	flag.DurationVar(&dispatchHTTPTimeout, "dispatch-http-timeout", 30*time.Second, "Dispatch HTTP request timeout.")
+	flag.StringVar(&evidenceIntakeKeySecret, "evidence-intake-key-secret", "", "Name of the Secret in the operator namespace holding the evidence intake HMAC key under the \"key\" entry; empty with no --evidence-intake-service disables evidence wiring.")
+	flag.StringVar(&evidenceIntakeService, "evidence-intake-service", "", "URL coordinator pods POST failure evidence to; required with --evidence-intake-key-secret.")
 	opts := zap.Options{Development: true}
 	opts.BindFlags(flag.CommandLine)
 	flag.Parse()
@@ -190,6 +194,28 @@ func main() {
 		Client: mgr.GetClient(),
 		Scheme: mgr.GetScheme(),
 		Pod:    podConfig,
+	}
+
+	evidenceSecretSet := strings.TrimSpace(evidenceIntakeKeySecret) != ""
+	evidenceServiceSet := strings.TrimSpace(evidenceIntakeService) != ""
+	if evidenceSecretSet != evidenceServiceSet {
+		setupLog.Error(fmt.Errorf("evidence intake requires both --evidence-intake-key-secret and --evidence-intake-service"), "unable to configure evidence capture")
+		os.Exit(1)
+	}
+	if evidenceSecretSet {
+		if err := executor.ValidateEvidenceURL(evidenceIntakeService); err != nil {
+			setupLog.Error(err, "unable to configure evidence capture")
+			os.Exit(1)
+		}
+		podNamespace := strings.TrimSpace(os.Getenv("POD_NAMESPACE"))
+		key, err := loadEvidenceKey(context.Background(), mgr.GetAPIReader(), podNamespace, evidenceIntakeKeySecret)
+		if err != nil {
+			setupLog.Error(err, "unable to configure evidence capture")
+			os.Exit(1)
+		}
+		launcher.EvidenceURL = strings.TrimSpace(evidenceIntakeService)
+		launcher.EvidenceKey = key
+		setupLog.Info("evidence capture wiring configured", "namespace", podNamespace, "secret", strings.TrimSpace(evidenceIntakeKeySecret))
 	}
 
 	if err := mgr.AddHealthzCheck("healthz", healthz.Ping); err != nil {
@@ -434,6 +460,34 @@ func githubObserver(ctx context.Context, reader client.Reader, namespace, config
 		return nil, err
 	}
 	return couriergithub.Observer{Client: githubClient}, nil
+}
+
+// loadEvidenceKey reads the evidence intake HMAC key from the named Secret in
+// the operator namespace. It fails closed: the intake and the launcher must
+// agree on one key, so a missing or empty key is a startup error rather than a
+// run that can never persist evidence. The key value never appears in any
+// error.
+func loadEvidenceKey(ctx context.Context, reader client.Reader, namespace, name string) ([]byte, error) {
+	secretName := strings.TrimSpace(name)
+	if secretName == "" {
+		return nil, fmt.Errorf("evidence intake key Secret name is required")
+	}
+	namespace = strings.TrimSpace(namespace)
+	if namespace == "" {
+		return nil, fmt.Errorf("POD_NAMESPACE is required when an evidence intake key Secret is configured")
+	}
+	var secret corev1.Secret
+	if err := reader.Get(ctx, client.ObjectKey{Namespace: namespace, Name: secretName}, &secret); err != nil {
+		if apierrors.IsNotFound(err) {
+			return nil, fmt.Errorf("evidence intake key Secret %s/%s not found: %w", namespace, secretName, err)
+		}
+		return nil, fmt.Errorf("read evidence intake key Secret %s/%s: %w", namespace, secretName, err)
+	}
+	key, ok := secret.Data["key"]
+	if !ok || strings.TrimSpace(string(key)) == "" {
+		return nil, fmt.Errorf("evidence intake key Secret %s/%s has no non-empty %q entry", namespace, secretName, "key")
+	}
+	return key, nil
 }
 
 // secureConfig carries the parsed secure-mode flags into buildSecureControl.
