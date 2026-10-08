@@ -212,7 +212,7 @@ func (realClock) Now() time.Time { return time.Now() }
 // §6 trusted path in internal/harness is the only writer that supplies
 // one. The run API requires a non-empty value (CRD minLength=1), so its
 // writes are rejected; the reporter is inert against the CRD and exists
-// only for this package's own tests until a future adopter sets the field.
+// only for this package's own tests.
 type Heartbeat struct {
 	writer  *HarnessWriter
 	name    types.NamespacedName
