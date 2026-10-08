@@ -207,6 +207,12 @@ func (realClock) Now() time.Time { return time.Now() }
 // status patch per cadence. The caller should invoke Record only after a
 // successful model stream chunk or tool boundary; failed attempts must not
 // keep a run alive.
+//
+// This legacy reporter always records an empty coordinatorPodUID: the
+// §6 trusted path in internal/harness is the only writer that supplies
+// one. The run API requires a non-empty value (CRD minLength=1), so its
+// writes are rejected; the reporter is inert against the CRD and exists
+// only for this package's own tests.
 type Heartbeat struct {
 	writer  *HarnessWriter
 	name    types.NamespacedName
@@ -218,15 +224,6 @@ type Heartbeat struct {
 	mu          sync.Mutex
 	lastWritten time.Time
 	pending     *courierv1alpha1.Heartbeat
-}
-
-// WithCoordinatorPodUID fences every recorded heartbeat to one control
-// incarnation (§6): only a heartbeat whose UID matches the current
-// coordinator pod may reset the consecutive-restart streak or count as fresh
-// for that incarnation.
-func (h *Heartbeat) WithCoordinatorPodUID(uid string) *Heartbeat {
-	h.coordinatorPodUID = uid
-	return h
 }
 
 // NewHeartbeat constructs a coalescing heartbeat reporter. A non-positive

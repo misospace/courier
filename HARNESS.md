@@ -839,10 +839,9 @@ process is treated as durable checkpoint state.
 
 Before any destructive liveness decision, use an **uncached API read** for the
 run status and the run-owned control/worker pods (not just `r.Get`/`r.List` on
-the current controller-runtime cached client); #126 must wire a direct API
-reader for this decision (the operator now has a direct API reader the
-pod-disappearance backstop uses; this reap decision is still that task's
-own). Read errors, uncertain identity, or contradictory
+the current controller-runtime cached client); #126 wires a direct API
+reader for this decision, and the reap decision reads the live API. Read
+errors, uncertain identity, or contradictory
 observations mean **do not reap; requeue and retry observation** with a
 structured diagnostic, not a successful run heartbeat. If phase, resource
 version, or pod UID changes before deletion, re-evaluate. Delete with a
@@ -1157,9 +1156,9 @@ and the acceptance tests below are satisfied.
 
 1. The long-tool safety policy is settled in #119 (§6), but no progress oracle
    exists for a silent live wedge. It can persist indefinitely; human
-   intervention remains the escape. #126 must implement and test the
-   active-operation set, UID fencing, and API-backed operator decisions before
-   #102 moves.
+   intervention remains the escape. #126 implements and tests the
+   active-operation set, UID fencing, and API-backed operator decisions;
+   #102 moves once the §12 gates are met.
 2. Settled in #118 (§4): the immutable run publication policy schema, the
    operator-resolved admission inputs, pre/post-push live revalidation, the
    `NeedsHuman`/retryable matrix, and provider-neutral semantics with
@@ -1246,12 +1245,14 @@ provider registration surface — is settled in §4 and consumed by #123's
 operator wiring. #104 by #120/#122/#123. #101 stays a
 separate, temporary OpenCode capability preflight, not a security boundary.
 #102 readiness is exactly after its prereqs: #119 (**satisfied** — design
-settled in §6), #126 (still **blocked** until #122-#125 are settled and
-merged), and a production e2e proving authenticated heartbeat, meaningful
-checkpoint, confirmed `lastCommit`, long-running tool behavior per the §6
-decision table, and resume. That e2e proves the suppression and
-no-false-reap behavior; it does not — and this design does not promise —
-that a wedge is ever *detected*. The operator-side #12 reaper is implemented
-but, per §6, is limited to runs with no valid active operation and cannot
-complete its production promise until that evidence exists. #8 records the
-design; it is not a claim the secure path has landed.
+settled in §6), #126 (**landed** — authenticated status writes, the
+active-operation set, and direct-API-reader liveness with
+UID-preconditioned deletes), and a production e2e proving authenticated
+heartbeat, meaningful checkpoint, confirmed `lastCommit`, long-running
+tool behavior per the §6 decision table, and resume. That e2e proves the
+suppression and no-false-reap behavior; it does not — and this design
+does not promise — that a wedge is ever *detected*. The operator-side #12
+reaper is implemented but, per §6, is limited to runs with no valid active
+operation and cannot complete its production promise until that evidence
+exists. #8 records the design; it is not a claim the secure path has
+landed.
