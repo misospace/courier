@@ -568,6 +568,35 @@ status fields or worker status calls. Checkpoint contents are limited to
 reasoning not recoverable from the world; on resume re-read git, PR, CI, and
 source state and let the world win on conflict.
 
+### Operator control request and soft-stop (#238)
+
+The controller translates the human ingress annotation
+`courier.misospace.dev/soft-stop` into operator-owned
+`CoderRun.status.controlRequest`. The annotation value is a non-empty, bounded
+opaque request ID; clearing or changing it clears or replaces the record. The
+record contains `id`, `kind` (closed to `soft-stop` in v1), `targetPodUID`, and
+`requestedAt`.
+
+`CoderRun.status.controlRequestAck` is harness-owned and contains `id` and `at`.
+Trusted control writes it through the existing trusted status path after the
+request is served and before setting the stop latch. The broker validates it as
+harness-owned and rejects an acknowledgement for an ID it did not serve to the
+live incarnation.
+
+Trusted control polls an authenticated GET route such as
+`/trusted/v1/control-request` on the same listener as `/trusted/v1/status`. The
+broker returns the operator record only when the run UID matches and
+`targetPodUID` equals the live control pod UID; otherwise it returns 404. The
+broker's existing `get` access to the named run and control pod is sufficient;
+no new broker or operator RBAC is needed.
+
+Stop ordering is serve, durable acknowledgement, stop dispatching new briefs,
+let in-flight briefs reach terminal and integrate and publish, end the model
+loop, then reconcile status debt, flush active operations, declare the outcome,
+and exit. `ctx` cancellation (SIGTERM) remains a separate path and is never
+conflated with soft-stop. The stop boundary preserves per-brief publication and
+never deletes the pod (#238).
+
 ## 5. Native harness and worker protocol
 
 The harness is the only model client. Every provider stream is normalized in

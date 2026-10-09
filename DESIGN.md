@@ -382,6 +382,88 @@ content-based loop-detector — the same tool call, same args, same result, N
 times — remains a possible **V2** addition; it is orthogonal to the heartbeat
 and must be tuned not to false-kill genuinely slow, varied work.
 
+## Operator-initiated soft-stop (#238)
+
+**Problem.** A Running coordinator has no supported way to receive an operator
+message. Suspending a lane only lets the run finish normally; suspension never
+implies takeover. The other choice is to let it run to completion. Pod deletion is
+the only outside signal that reaches an in-flight coordinator, but it cancels the
+session and loses in-flight work — the fix-pr #988 / issue #975 case required
+capturing a 105 KB dirty patch by hand.
+
+**One channel.** Human ingress is the `CoderRun` annotation
+`courier.misospace.dev/soft-stop`; its non-empty, bounded value is an opaque
+request ID. The controller alone translates it into the operator-owned
+`status.controlRequest` record `{id, kind: "soft-stop", targetPodUID,
+requestedAt}`. The v1 action vocabulary is closed to `soft-stop`. Trusted control
+never reads the annotation or `CoderRun` directly: at a step boundary it pulls
+the record from the broker over the authenticated trusted-control path, using the
+same run-bound identity, TokenReview, and control-pod-incarnation path as the
+trusted status listener. This is the only transport: no exec/attach,
+control-pod HTTP server, direct annotation read, or broker push/stream.
+Exec/attach races the coordinator and exists only on legacy; a control-pod server
+adds a reachable surface and cannot authenticate an external caller; direct
+annotation reads lack operator validation and fencing; a broker stream is
+machinery a boundary poll does not need. See [HARNESS.md](./HARNESS.md) for the
+wire contract.
+
+**Trusted writer identity.** Only the operator writes
+`status.controlRequest`; it already owns lifecycle and condition status fields
+under #126's split. The broker's trusted status listener accepts only the
+harness-owned schema — checkpoint, heartbeat, `lastCommit`, active operations,
+and the new acknowledgement — so trusted control, the worker, and a forge
+cannot forge an operator request. The model and worker have no path to status,
+and a model-authored tool request cannot reach either the request field or the
+read route.
+
+**UID and incarnation fencing.** The operator stamps `targetPodUID` from the
+live coordinator pod it observes, the same UID that fences heartbeats and active
+operations (#126). The broker serves the record only when the run UID matches
+and `targetPodUID` equals the live control pod UID; otherwise it is absent (404).
+A request addressed to a dead incarnation is void, never handed to its
+replacement: graceful handoff is not rescue, and crash/liveness recovery remains
+the fallback. The operator surfaces a stale or unacknowledged request as a
+condition rather than silently re-targeting; re-targeting requires a new
+annotation value.
+
+**Acknowledgement and idempotency.** Each request has an opaque ID. Control
+keeps an in-memory consumed set per incarnation. On accepting a matching request
+it first durably writes the harness-owned `controlRequestAck {id, at}` through
+the broker's trusted status path (resourceVersion CAS, as for other status
+writes), then flips the stop latch. A request is never consumed without a
+durable acknowledgement, mirroring persist-before-dispatch. Redelivery of the
+same ID to the same incarnation is a no-op; the broker rejects an acknowledgement
+for an ID it did not serve to the live incarnation. The operator treats the
+request as settled on observing the acknowledgement or terminalization. A crash
+between read and acknowledgement drops the request: it is fenced and void,
+consistent with the crash-fallback non-goal.
+
+**Checkpoint-safe stop boundary.** A soft-stop never cancels the session or
+deletes the pod. On acceptance, the coordinator stops dispatching new briefs
+and lets every in-flight brief reach terminal, integrate, and publish, preserving
+live partial work in each per-brief commit. After the last in-flight brief
+integrates, it stops the model turn loop, then runs the normal finish path:
+reconcile status debt, flush active operations, declare the outcome (`changes`
+when published work exists, otherwise `no_change_needed` or `blocked_external`),
+and exit. The request is also injected once as a trusted control turn: a
+bounded, redacted, provenance-marked control-plane note, never merged into model
+text, so the model can wind down and publish its own final commit and PR. The
+latch, not the model, enforces exit. The boundary is checked between model turns
+and inside the brief-wait loop. Legacy SIGTERM pod deletion remains unchanged
+and distinct; this protocol targets the native secure harness, while legacy
+OpenCode retains only SIGTERM/relaunch.
+
+**What it cannot do.** The control turn cannot mutate run policy: publication
+policy, branch, and merge gate remain operator/forge-owned and set-once. A
+soft-stop is not a merge, and the coordinator still cannot merge. The existing
+recovery ladder still governs data loss; this feature bounds only a reachable
+run's remaining work.
+
+**Decomposition.** The single implementing child is #255, split into file-scoped
+slices for API types, `internal/status`, broker status read/ack routes, harness
+latch/injection/ack, `cmd/courier-control`, and controller annotation
+translation. It remains `status/blocked` until this design lands.
+
 ## State and checkpointing
 
 **Git is the durable floor. The checkpoint stores only what the world can't tell
@@ -1228,6 +1310,18 @@ named items remain unresolved and must not be described as production-ready:
 - The exact vLLM gauge for backpressure on the target model server.
 
 ## Decisions
+
+- **2026-10-09 — #238: operator soft-stop is one broker-mediated control
+  request with a checkpoint-safe stop boundary.** One channel — annotation
+  ingress translated by the operator into a fenced status record and served by
+  the broker to trusted control — keeps human intent out of model-controlled
+  paths; operator-only writer identity prevents trusted control, the worker, or a
+  forge from forging requests. UID fencing voids requests for stale incarnations
+  rather than redirecting them, and a durable acknowledgement precedes the latch
+  flip so consumed requests survive status observation. In-flight briefs finish
+  and integrate before exit, preserving published partial work without pod
+  deletion; suspension remains distinct from takeover. The single implementation
+  child is #255. (#238, #126)
 
 - **2026-10-05 — #126: harness status is authenticated through the broker and
   liveness is fenced by UID.** The broker alone holds the status-write
