@@ -111,10 +111,8 @@ func TestResolveDispatchBindings(t *testing.T) {
 			want:     []dispatchBinding{{queueLane: "queue-a", laneProfile: "lane-x", agentName: "courier-queue-a", sourceAgent: "courier-queue-a"}, {queueLane: "queue-b", laneProfile: "lane-x", agentName: "courier-queue-b", sourceAgent: "courier-queue-b"}},
 		},
 		{
-			// Multi-binding derivation: each binding gets a distinct agent identity
-			// so a sibling binding polling the same Dispatch lane does not see
-			// the in-flight lease of the other. This is the Aug-2026 design that
-			// makes "courier" + "courier-minimax" safely share work.
+			// Multi-binding derivation preserves the established distinct identity
+			// default; explicit third segments can instead share a queue safely.
 			name:     "multi-binding derives per-binding agent name",
 			repeated: []string{"local:local", "minimax:minimax", "escalated:frontier"},
 			want: []dispatchBinding{
