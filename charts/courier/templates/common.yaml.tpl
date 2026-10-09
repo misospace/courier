@@ -98,6 +98,7 @@
 {{- $multiple := gt (len $lanes) 1 }}
 {{- $queueCounts := dict }}
 {{- range $binding := $lanes }}
+{{- if not $binding.queueLane }}{{- fail "each dispatch.lanes entry requires queueLane and laneProfile" }}{{- end }}
 {{- $_ := set $queueCounts $binding.queueLane (add (index $queueCounts $binding.queueLane | default 0) 1) }}
 {{- end }}
 {{- range $binding := $lanes }}
