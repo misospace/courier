@@ -209,6 +209,23 @@
   "globalMounts" (list (dict "path" "/etc/courier" "readOnly" true))) }}
 {{- $_ := set .Values "persistence" $persistence }}
 {{- end }}
+{{- $evidence := .Values.evidence }}
+{{- if $evidence.enabled }}
+{{- if not $evidence.keySecret }}
+{{- fail "evidence.enabled requires evidence.keySecret" }}
+{{- end }}
+{{- $hasEvidenceKeySecret := false }}
+{{- $hasEvidenceBind := false }}
+{{- $hasEvidenceService := false }}
+{{- range $arg := $args }}
+{{- if hasPrefix "--evidence-intake-key-secret=" $arg }}{{- $hasEvidenceKeySecret = true }}{{- end }}
+{{- if hasPrefix "--evidence-intake-bind=" $arg }}{{- $hasEvidenceBind = true }}{{- end }}
+{{- if hasPrefix "--evidence-intake-service=" $arg }}{{- $hasEvidenceService = true }}{{- end }}
+{{- end }}
+{{- if not $hasEvidenceKeySecret }}{{- $args = append $args (printf "--evidence-intake-key-secret=%s" $evidence.keySecret) }}{{- end }}
+{{- if not $hasEvidenceBind }}{{- $args = append $args (printf "--evidence-intake-bind=:%d" (int $evidence.port)) }}{{- end }}
+{{- if not $hasEvidenceService }}{{- $args = append $args (printf "--evidence-intake-service=http://%s-evidence.%s.svc" .Release.Name .Release.Namespace) }}{{- end }}
+{{- end }}
 {{- $_ := set $container "args" $args }}
 
 {{- include "bjw-s.common.loader.generate" . }}

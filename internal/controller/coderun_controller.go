@@ -91,6 +91,14 @@ type CoderRunReconciler struct {
 	// Observer reads the external pull request and CI state after a successful run.
 	Observer WorldObserver
 
+	// Evidence reconciles the run's failure-evidence Secrets at the terminal
+	// boundary the operator can prove: a world-verified success (AwaitingReview,
+	// Done) has its evidence deleted, and a dirty terminal (Failed, NeedsHuman)
+	// run gains the informational EvidenceCaptured condition when evidence is
+	// present in the world. It never touches the phase and is a no-op when nil;
+	// production wires it to the controller-runtime-managed EvidenceIntake.
+	Evidence *EvidenceIntake
+
 	// Events optionally emits structured run events as JSON lines for the
 	// deployment's log collection stack. Nil disables emission; a failed
 	// emission never fails reconciliation.
@@ -175,6 +183,14 @@ func (r *CoderRunReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 	}
 	if !run.DeletionTimestamp.IsZero() {
 		return ctrl.Result{}, nil
+	}
+
+	// Evidence lifecycle runs for every non-deleting run ahead of the phase
+	// dispatch, so a terminal run the dispatch leaves untouched still has its
+	// evidence reconciled. It is a no-op when the intake is disabled or the
+	// phase carries no evidence action; a transient failure requeues.
+	if err := r.reconcileEvidence(ctx, &run); err != nil {
+		return ctrl.Result{}, err
 	}
 
 	if run.Status.Phase == courierv1alpha1.PhaseRunning {
@@ -910,6 +926,60 @@ func lifecycleReportPending(run *courierv1alpha1.CoderRun) bool {
 	}
 	cond := apimeta.FindStatusCondition(run.Status.Conditions, lifecycleReportedCondition)
 	return cond != nil && cond.Status == metav1.ConditionFalse
+}
+
+// reconcileEvidence owns the run's failure-evidence lifecycle at the terminal
+// boundary the operator can prove. A run the operator has world-verified as
+// landed (AwaitingReview, Done) has its evidence Secrets deleted; a dirty
+// terminal (Failed, NeedsHuman) run gains the informational EvidenceCaptured
+// condition when its evidence is present in the world. It never touches the
+// phase: the intake is the only writer of the evidence Secrets and the
+// condition is derived from the world, so a nil intake or a phase with no
+// evidence action is a no-op, and a transient API failure requeues.
+func (r *CoderRunReconciler) reconcileEvidence(ctx context.Context, run *courierv1alpha1.CoderRun) error {
+	if r.Evidence == nil {
+		return nil
+	}
+	switch run.Status.Phase {
+	case courierv1alpha1.PhaseAwaitingReview, courierv1alpha1.PhaseDone:
+		// The operator's own world observation proved the work landed, so the
+		// evidence it captured is no longer needed. The delete is idempotent: a
+		// run with no Secret simply lists nothing and leaves nothing to delete.
+		return r.Evidence.DeleteEvidenceForRun(ctx, run)
+	case courierv1alpha1.PhaseFailed, courierv1alpha1.PhaseNeedsHuman:
+		secrets, err := r.Evidence.ListEvidenceForRun(ctx, run)
+		if err != nil {
+			return err
+		}
+		if len(secrets) == 0 {
+			// No Secret in the world. The condition is informational, and
+			// absence of a Secret is never proof of absence, so neither set nor
+			// remove it: a terminal run that already captured keeps its mark.
+			return nil
+		}
+		before := run.DeepCopy()
+		if !r.setEvidenceCaptured(run) {
+			// The condition already carries this exact state; a terminal run
+			// must not emit a redundant status patch on every reconcile.
+			return nil
+		}
+		return r.patchStatus(ctx, before, run)
+	}
+	return nil
+}
+
+// setEvidenceCaptured records the informational EvidenceCaptured condition on
+// the run in memory; the caller persists it through patchStatus. It reports
+// whether the condition changed, so an unchanged terminal run skips the write.
+func (r *CoderRunReconciler) setEvidenceCaptured(run *courierv1alpha1.CoderRun) bool {
+	return apimeta.SetStatusCondition(&run.Status.Conditions, metav1.Condition{
+		Type:               EvidenceConditionType,
+		Status:             metav1.ConditionTrue,
+		Reason:             EvidenceReasonCaptured,
+		Message:            fmt.Sprintf("failure evidence Secrets exist; retrieve by label %s=%s", EvidenceLabelKey, evidenceLabelValue(run.Name)),
+		ObservedGeneration: run.Generation,
+		LastTransitionTime: metav1.NewTime(r.clock()),
+	})
 }
 
 // retryTerminalLifecycle re-attempts a terminal run's pending source report on

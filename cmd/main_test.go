@@ -180,6 +180,69 @@ func TestBuildSecureControlRequiresObserverCredential(t *testing.T) {
 	}
 }
 
+func TestValidateEvidenceFlags(t *testing.T) {
+	tests := []struct {
+		name      string
+		keySecret string
+		service   string
+		bind      string
+		wantErr   string // substring required in the error; empty means no error
+	}{
+		{
+			name: "all empty disables wiring",
+		},
+		{
+			name:      "key secret and service pair",
+			keySecret: "courier-evidence-key",
+			service:   "http://evidence-intake:8443",
+		},
+		{
+			name:      "key secret, service, and bind",
+			keySecret: "courier-evidence-key",
+			service:   "http://evidence-intake:8443",
+			bind:      "0.0.0.0:8443",
+		},
+		{
+			name:      "key secret without service",
+			keySecret: "courier-evidence-key",
+			wantErr:   "both --evidence-intake-key-secret and --evidence-intake-service",
+		},
+		{
+			name:    "service without key secret",
+			service: "http://evidence-intake:8443",
+			wantErr: "both --evidence-intake-key-secret and --evidence-intake-service",
+		},
+		{
+			name:    "bind without key secret",
+			bind:    "0.0.0.0:8443",
+			wantErr: "--evidence-intake-bind requires --evidence-intake-key-secret",
+		},
+		{
+			name:      "whitespace-only bind ignored",
+			keySecret: "courier-evidence-key",
+			service:   "http://evidence-intake:8443",
+			bind:      "   ",
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			err := validateEvidenceFlags(test.keySecret, test.service, test.bind)
+			if test.wantErr != "" {
+				if err == nil {
+					t.Fatalf("validateEvidenceFlags() error = nil, want error mentioning %q", test.wantErr)
+				}
+				if !strings.Contains(err.Error(), test.wantErr) {
+					t.Fatalf("validateEvidenceFlags() error = %q, want it to mention %q", err, test.wantErr)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("validateEvidenceFlags() error = %v, want none", err)
+			}
+		})
+	}
+}
+
 func TestLoadEvidenceKey(t *testing.T) {
 	const keyValue = "a-test-hmac-key-of-some-length"
 
