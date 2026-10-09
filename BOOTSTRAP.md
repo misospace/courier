@@ -100,11 +100,13 @@ Enable it with three settings on the operator:
   `--evidence-intake-key-secret`; the chart derives a default from the
   `courier-evidence` Service when it is not set.
 
-The operator's Role grants `create`, `get`, `list`, and `delete` on `secrets`,
-scoped to the operator's own namespaces (a namespaced grant, not a cluster-wide
-one) to persist bundles and derive the `EvidenceCaptured` condition (see
-DESIGN.md, Security and boundaries, for what that grant means). Evidence
-Secrets carry the label
+The operator's Role grants `create`, `get`, `list`, `patch`, and `delete` on
+`secrets`, scoped to the operator's own namespaces (a namespaced grant, not a
+cluster-wide one) to persist bundles and derive the `EvidenceCaptured` condition
+(see DESIGN.md, Security and boundaries, for what that grant means). The chart
+renders that Role only when `evidence.enabled` is true, so passing
+`--evidence-intake-*` args by hand with `evidence.enabled=false` starts the
+intake without the RBAC it needs. Evidence Secrets carry the label
 `courier.misospace.dev/evidence: <run>`, one per coordinator pod incarnation,
 and are garbage-collected with the run; the operator also deletes them when a
 run reaches `AwaitingReview` or `Done` — the states where its own world

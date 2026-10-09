@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"compress/gzip"
 	"context"
+	"crypto/sha256"
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
@@ -353,6 +354,49 @@ func TestEvidenceIntakeRejectsOversizedBody(t *testing.T) {
 		t.Fatalf("code = %d, want 413; body = %s", rec.Code, rec.Body.String())
 	}
 	requireNoSecret(t, i, run.Name, run.Namespace, testNonce())
+}
+
+func TestEvidenceIntakeRejectsChunkedOversizedBody(t *testing.T) {
+	t.Parallel()
+	run := newIntakeRun("run-1", "default", "uid-1", courierv1alpha1.PhaseFailed)
+	i, _ := newIntake(t, testKey, run, executor.PodConfig{})
+	nonce := testNonce()
+	token := executor.EvidenceToken(testKey, run.Namespace, run.Name, string(run.UID), nonce)
+
+	// A well-formed multipart opening — the boundary and the manifest part's
+	// headers, with no terminating boundary — followed by an unbounded stream.
+	// The part therefore never ends, so the read is bounded only by the caps.
+	var prefix bytes.Buffer
+	mw := multipart.NewWriter(&prefix)
+	if _, err := mw.CreateFormFile("manifest", "manifest.json"); err != nil {
+		t.Fatalf("create manifest part: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/intake", nil)
+	// Chunked by construction: the body is a reader whose length the transport
+	// cannot compute, and ContentLength is -1, so the declared-length
+	// pre-check cannot fire and only the read cap is left.
+	req.ContentLength = -1
+	req.Body = io.NopCloser(io.MultiReader(bytes.NewReader(prefix.Bytes()), endlessReader{}))
+	req.Header.Set("Content-Type", mw.FormDataContentType())
+	req.Header.Set("Authorization", "Bearer "+token)
+
+	if rec := doIntake(i, req); rec.Code != http.StatusRequestEntityTooLarge {
+		t.Fatalf("code = %d, want 413; body = %s", rec.Code, rec.Body.String())
+	}
+	requireNoSecret(t, i, run.Name, run.Namespace, nonce)
+}
+
+// endlessReader is an unbounded filler stream, standing in for a chunked upload
+// that carries no length for the transport to compute. Every read is satisfied,
+// so only a cap stops the consumer.
+type endlessReader struct{}
+
+func (endlessReader) Read(p []byte) (int, error) {
+	for i := range p {
+		p[i] = 'a'
+	}
+	return len(p), nil
 }
 
 func TestEvidenceIntakeRejectsMissingManifestPart(t *testing.T) {
@@ -1228,6 +1272,52 @@ func TestEvidenceIntakeRescanMissingCredentialSecret(t *testing.T) {
 	requireNoSecret(t, i, run.Name, run.Namespace, testNonce())
 }
 
+// TestEvidenceIntakeRejectsRebuiltTotalsDisagreement is the crafted-input case
+// the rebuild's own consistency check exists for: two visible stored entries
+// claim the SAME storedPath, and a positive omittedByBudget (with its synthetic
+// entry) skips the unclaimed-member reverse check, so stage 10 lets it through
+// and stage 11 cannot tell. The re-scan then flips BOTH entries to withheld
+// while the one member they share drops once, so the intake-authored totals no
+// longer describe the entries the intake itself wrote. Nothing may persist.
+func TestEvidenceIntakeRejectsRebuiltTotalsDisagreement(t *testing.T) {
+	t.Parallel()
+	const cred = "supersecrettoken123"
+	run := newIntakeRun("run-1", "default", "uid-1", courierv1alpha1.PhaseFailed)
+	envSecret := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{Name: "exec-env", Namespace: "default"},
+		Data:       map[string][]byte{"MY_TOKEN": []byte(cred)},
+	}
+	pod := executor.PodConfig{EnvironmentSecret: "exec-env"}
+	i, _ := newIntake(t, testKey, run, pod, envSecret)
+
+	const shared = "src/leak.go"
+	dirty := []byte("token = " + cred + "\n")
+	m := &evidence.Manifest{
+		SchemaVersion: evidence.SchemaVersion,
+		Run:           evidence.RunIdentity{Name: run.Name, Namespace: run.Namespace, RunUID: string(run.UID), PodUID: "pod-1"},
+		Workspace:     evidence.WorkspaceIdentity{BaseRepo: "acme/widgets", Branch: "courier/x", StartSHA: "00000000", HeadSHA: "11111111"},
+		CapturedAt:    time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC),
+		Trigger:       evidence.TriggerTerminal,
+		Entries: []evidence.Entry{
+			{Path: "src/a.go", Class: evidence.ClassModified, Disposition: evidence.DispositionStored, StoredPath: shared, Bytes: int64(len(dirty))},
+			{Path: "src/b.go", Class: evidence.ClassModified, Disposition: evidence.DispositionStored, StoredPath: shared, Bytes: int64(len(dirty))},
+			{Disposition: evidence.DispositionOmittedBudget},
+		},
+		Totals: evidence.Totals{Files: 2, Stored: 2, StoredBytes: int64(len(dirty)), OmittedByBudget: 1},
+	}
+	// One member, claimed twice, whose content matches the registered credential.
+	req, _ := intakeRequest(t, testKey, run, m, map[string][]byte{shared: dirty}, testNonce())
+
+	rec := doIntake(i, req)
+	if rec.Code == http.StatusOK {
+		t.Fatalf("code = %d, want a rejection; body = %s", rec.Code, rec.Body.String())
+	}
+	if rec.Code != http.StatusBadRequest || !strings.Contains(rec.Body.String(), "totals disagree after re-scan") {
+		t.Fatalf("code = %d, want the 400 rebuilt-totals reject; body = %s", rec.Code, rec.Body.String())
+	}
+	requireNoSecret(t, i, run.Name, run.Namespace, testNonce())
+}
+
 func TestEvidenceIntakeListAndDelete(t *testing.T) {
 	t.Parallel()
 	run := newIntakeRun("run-1", "default", "uid-1", courierv1alpha1.PhaseFailed)
@@ -1318,11 +1408,17 @@ func TestEvidenceLabelValue(t *testing.T) {
 	}
 	long := strings.Repeat("r", 100)
 	got := evidenceLabelValue(long)
-	if len(got) > 63 {
-		t.Errorf("long label length = %d, want <= 63", len(got))
+	// A long name is truncated to make room for a "-" and the first 8 hex
+	// characters of the name's own SHA-256, so two runs sharing the truncated
+	// prefix cannot collide in the label selector. The hash is computed here
+	// rather than read back off the value under test.
+	digest := sha256.Sum256([]byte(long))
+	want := strings.TrimRight(long[:54], "-") + "-" + hex.EncodeToString(digest[:])[:8]
+	if got != want {
+		t.Errorf("long label = %q, want %q", got, want)
 	}
-	if !strings.HasSuffix(got, got[len(got)-9:]) {
-		t.Error("long label should be hash-suffixed")
+	if len(got) != 63 {
+		t.Errorf("long label length = %d, want exactly 63 (the DNS-label cap)", len(got))
 	}
 	// Sanitization: lowercased, with the label-legal set (alphanumerics,
 	// '-', '_', '.') kept verbatim and everything else hyphenated. An

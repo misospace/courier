@@ -67,16 +67,30 @@ const (
 )
 
 // maxRequestBodyBytes bounds the raw multipart body: the manifest budget plus
-// the admitted-content cap, the largest a legitimate bundle can be. Bodies
-// above it are rejected before any parse, so a huge upload cannot exhaust
-// memory.
-const maxRequestBodyBytes = int64(evidence.ManifestBudgetBytes + evidence.MaxTotalBytes)
+// the archive part's own cap (the admitted-content cap and its 1/64 gzip
+// slack) plus framing slack for the multipart headers and boundaries. Every
+// part must fit inside the body cap, so the body cap is the sum of the part
+// caps and the framing, never just one of them. Bodies above it are rejected
+// before any parse, so a huge upload cannot exhaust memory.
+//
+// Issue #200 sizes the intake's body bound at 768 KiB as the outer expectation;
+// this expression is the tighter figure the code actually enforces (~652 KiB),
+// so the bound holds with room to spare.
+const maxRequestBodyBytes = int64(evidence.ManifestBudgetBytes + evidence.MaxTotalBytes + evidence.MaxTotalBytes/64 + 4096)
 
 // Sentinels for intake request-shape errors. The handler maps each to a status
 // code; their messages are safe to surface (they name no secrets or tokens).
 var (
 	errIntakeMultipart = errors.New("evidence intake requires a well-formed multipart body with a manifest part")
 	errPartTooLarge    = errors.New("evidence intake request part exceeds its size cap")
+	// errRebuiltTotals is the re-scan's own fail-closed sentinel: the re-scan
+	// rewrote the entry list and re-derived the totals, and the two disagree
+	// afterwards. A genuine capture cannot produce that (the intake derives both
+	// from one walk of one archive), so it is crafted input — the manifest's
+	// entries and totals were internally consistent only by accident. Nothing is
+	// persisted, so the handler maps it to 400 rather than to the 500 a genuine
+	// internal failure gets.
+	errRebuiltTotals = errors.New("evidence intake: manifest totals disagree after re-scan")
 )
 
 // EvidenceIntake receives a run's final evidence bundle, re-verifies and
@@ -178,8 +192,12 @@ func (i *EvidenceIntake) Handler() http.Handler {
 //
 // 10. archive           structural, cross-referenced  (400)
 // 11. totals            internally consistent         (400)
-// 12. re-scan           credential set, rebuild       (500 if unreadable)
+// 12. re-scan           credential set, rebuild       (400/500)
 // 13. persist           idempotent create-or-update   (500 on failure)
+//
+// Stage 12 fails 500 when the credential set cannot be read (an internal
+// failure) and 400 when the rebuild's own totals disagree with its rebuilt
+// entry list (crafted input, nothing persisted).
 //
 // Stages 5 and 10 also enforce the design's whole-request count bounds: a
 // manifest over the manifest-entry cap and an archive over the content-entry
@@ -306,6 +324,10 @@ func (i *EvidenceIntake) handle(w http.ResponseWriter, r *http.Request) {
 	// than persisting the POST verbatim: the executor's scan is untrusted.
 	persistManifest, persistArchive, err := i.rescanAndRebuild(r.Context(), run, manifest, members)
 	if err != nil {
+		if errors.Is(err, errRebuiltTotals) {
+			writeIntakeError(w, http.StatusBadRequest, errRebuiltTotals.Error())
+			return
+		}
 		writeIntakeError(w, http.StatusInternalServerError, "evidence intake could not verify the credential set")
 		return
 	}
@@ -515,6 +537,10 @@ func readSecretKey(ctx context.Context, r client.Reader, namespace, name, key st
 // collapse drops entries but not their admitted content), so the re-scan walks
 // the whole archive, not the visible list: the guarantee is that no matching
 // content or name is persisted, regardless of how the manifest describes it.
+//
+// It then re-checks the rebuilt manifest's internal consistency and fails
+// closed if the totals disagree with the rebuilt entries: nothing is persisted,
+// because the intake cannot prove which of the two is the lie.
 func (i *EvidenceIntake) rescanAndRebuild(ctx context.Context, run *courierv1alpha1.CoderRun, manifest *evidence.Manifest, members map[string][]byte) ([]byte, []byte, error) {
 	scanner, err := i.credentialScanner(ctx, run)
 	if err != nil {
@@ -582,6 +608,18 @@ func (i *EvidenceIntake) rescanAndRebuild(ctx context.Context, run *courierv1alp
 	t.Withheld += dropped
 	t.StoredBytes = subNonNeg64(t.StoredBytes, droppedBytes)
 	manifest.Totals = t
+
+	// Fail closed if the rebuild left the manifest internally inconsistent.
+	// The totals above move by dropped MEMBERS, while the entry loop above
+	// reclassifies VISIBLE ENTRIES, and those are only the same count when each
+	// dropped member had exactly one visible entry claiming it — which an
+	// untrusted manifest can violate (two entries claiming one storedPath, with
+	// the reverse unclaimed-member check skipped by a positive omittedByBudget).
+	// A genuine capture pairs one entry with one member, so it always agrees; an
+	// inconsistent rebuild is persisted nowhere.
+	if !totalsConsistent(manifest) {
+		return nil, nil, errRebuiltTotals
+	}
 
 	manifestBytes, err := manifest.MarshalCanonical()
 	if err != nil {
