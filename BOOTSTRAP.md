@@ -40,7 +40,7 @@ selection seam, so another repository can select a different image without a
 Courier code change.
 
 Courier publishes `ghcr.io/misospace/courier-go:0.1.0` as the first dogfood
-runtime. It layers Go 1.27.1, `make`, `controller-gen`, and Helm onto the
+runtime. It layers Go 1.27.2, `make`, `controller-gen`, and Helm onto the
 bootstrap image. It is an optional lane image, not part of the universal
 coordinator contract:
 
