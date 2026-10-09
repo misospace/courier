@@ -94,17 +94,29 @@
 {{- if or $dispatch.queueLane $dispatch.laneProfile }}
 {{- fail "dispatch.lanes cannot be combined with dispatch.queueLane or dispatch.laneProfile" }}
 {{- end }}
-{{- $seen := dict }}
+{{- $seenAgents := dict }}
+{{- $multiple := gt (len $lanes) 1 }}
+{{- $queueCounts := dict }}
+{{- range $binding := $lanes }}
+{{- $_ := set $queueCounts $binding.queueLane (add (index $queueCounts $binding.queueLane | default 0) 1) }}
+{{- end }}
 {{- range $binding := $lanes }}
 {{- if or (not $binding.queueLane) (not $binding.laneProfile) }}
 {{- fail "each dispatch.lanes entry requires queueLane and laneProfile" }}
 {{- end }}
-{{- if hasKey $seen $binding.queueLane }}
-{{- fail (printf "duplicate queueLane %q in dispatch.lanes" $binding.queueLane) }}
-{{- end }}
-{{- $_ := set $seen $binding.queueLane true }}
 {{- if or (contains ":" $binding.queueLane) (contains ":" $binding.laneProfile) }}
-{{- fail (printf "queueLane and laneProfile must not contain a colon (got %q)" $binding.queueLane) }}
+{{- fail "queueLane and laneProfile must not contain a colon" }}
+{{- end }}
+{{- $agent := $binding.agentName | default (ternary (printf "%s-%s" $dispatch.agentName $binding.queueLane) $dispatch.agentName $multiple) }}
+{{- if or (contains ":" $agent) (regexMatch `[^A-Za-z0-9._-]` $agent) }}
+{{- fail (printf "invalid dispatch agentName %q" $agent) }}
+{{- end }}
+{{- if hasKey $seenAgents $agent }}
+{{- fail (printf "duplicate agentName %q in dispatch.lanes" $agent) }}
+{{- end }}
+{{- $_ := set $seenAgents $agent true }}
+{{- if and (gt (index $queueCounts $binding.queueLane) 1) (not $binding.agentName) }}
+{{- fail (printf "repeated queueLane %q requires explicit distinct agentName values" $binding.queueLane) }}
 {{- end }}
 {{- end }}
 {{- else if or (not $dispatch.queueLane) (not $dispatch.laneProfile) }}
@@ -116,7 +128,9 @@
 {{- if $lanes }}
 {{- if not $hasDispatchLaneBinding }}
 {{- range $binding := $lanes }}
-{{- $args = append $args (printf "--dispatch-lane-binding=%s:%s" $binding.queueLane $binding.laneProfile) }}
+{{- $bindingArg := printf "%s:%s" $binding.queueLane $binding.laneProfile }}
+{{- if $binding.agentName }}{{- $bindingArg = printf "%s:%s" $bindingArg $binding.agentName }}{{- end }}
+{{- $args = append $args (printf "--dispatch-lane-binding=%s" $bindingArg) }}
 {{- end }}
 {{- end }}
 {{- else }}

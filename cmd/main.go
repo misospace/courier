@@ -128,7 +128,7 @@ func main() {
 	flag.StringVar(&dispatchAgentName, "dispatch-agent-name", "", "Dispatch agent name.")
 	flag.StringVar(&dispatchQueueLane, "dispatch-queue-lane", "", "Dispatch queue lane sent to next-task.")
 	flag.StringVar(&dispatchLane, "dispatch-lane", "", "LaneProfile assigned to discovered Dispatch work.")
-	flag.Var(&dispatchLaneBindings, "dispatch-lane-binding", "Repeatable Dispatch lane binding <queueLane>:<laneProfile>; one discovery runner per binding.")
+	flag.Var(&dispatchLaneBindings, "dispatch-lane-binding", "Repeatable Dispatch binding <queueLane>:<laneProfile>[:<agentName>]; one discovery runner per binding.")
 	flag.DurationVar(&dispatchPollInterval, "dispatch-poll-interval", 30*time.Second, "Dispatch discovery poll interval.")
 	flag.DurationVar(&dispatchHTTPTimeout, "dispatch-http-timeout", 30*time.Second, "Dispatch HTTP request timeout.")
 	flag.StringVar(&evidenceIntakeKeySecret, "evidence-intake-key-secret", "", "Name of the Secret in the operator namespace holding the evidence intake HMAC key under the \"key\" entry; empty with no --evidence-intake-service disables evidence wiring.")
@@ -275,11 +275,15 @@ func main() {
 			setupLog.Error(err, "unable to configure Dispatch source: GitHub pull request state lookup is unavailable")
 			os.Exit(1)
 		}
-		// Each binding is a distinct Dispatch source: discovery, claim, settle
-		// and report all use the per-binding agent name so sibling bindings
-		// polling the same lane are excluded by Dispatch's lease check
-		// (other-agent filter). The single-binding shorthand uses the bare
-		// agent name, which preserves the legacy single-agent identity.
+		// The bare adapter remains registered for lifecycle compatibility with
+		// retained runs created before source-agent routing was introduced.
+		legacyClient, err := dispatch.NewClientWithLane(dispatchBaseURL, strings.TrimSpace(dispatchAgentName), "", token, dispatchHTTPTimeout)
+		if err != nil {
+			setupLog.Error(err, "unable to configure legacy Dispatch client")
+			os.Exit(1)
+		}
+		legacyClient.WithPullRequestStateChecker(checker)
+		sources.Register("dispatch", dispatch.New(legacyClient))
 		for _, binding := range bindings {
 			bindingClient, err := dispatch.NewClientWithLane(dispatchBaseURL, binding.agentName, binding.queueLane, token, dispatchHTTPTimeout)
 			if err != nil {
@@ -288,10 +292,12 @@ func main() {
 			}
 			bindingClient.WithPullRequestStateChecker(checker)
 			adapter := dispatch.New(bindingClient)
-			sourceName := "dispatch:" + binding.queueLane
-			sources.Register(sourceName, adapter)
+			if binding.sourceAgent != "" {
+				sources.Register("dispatch:"+binding.sourceAgent, adapter)
+			}
 			runner := source.NewRunner(mgr.GetClient(), adapter, source.RunnerConfig{
-				Source:       sourceName,
+				Source:       "dispatch",
+				SourceAgent:  binding.sourceAgent,
 				LaneProfile:  binding.laneProfile,
 				Namespace:    namespace,
 				PollInterval: dispatchPollInterval,
@@ -373,61 +379,66 @@ type dispatchBinding struct {
 	queueLane   string
 	laneProfile string
 	agentName   string
+	sourceAgent string
 }
 
-// resolveDispatchBindings normalizes the single-binding shorthand and the
-// repeatable bindings into the final list, rejecting ambiguous input and
-// duplicate queue lanes. With more than one binding, per-binding agent
-// names are auto-derived as <base>-<queueLane> so a binding claiming issue
-// #N as agent `courier-local` does not collide with a sibling polling the
-// same lane as `courier`. The single-binding shorthand preserves the legacy
-// bare-name behaviour.
+// resolveDispatchBindings normalizes the single-binding shorthand and repeated
+// bindings. Multiple bindings retain the historical <base>-<queue> default;
+// an explicit third segment lets deployments choose a stable agent identity.
 func resolveDispatchBindings(baseAgentName, queueLane, laneProfile string, repeated []string) ([]dispatchBinding, error) {
 	shorthandSet := queueLane != "" || laneProfile != ""
 	if len(repeated) > 0 && shorthandSet {
 		return nil, fmt.Errorf("dispatch: --dispatch-queue-lane/--dispatch-lane cannot be combined with --dispatch-lane-binding")
 	}
 	bindings := make([]dispatchBinding, 0, 1+len(repeated))
-	// Per-binding agent-name derivation only kicks in when more than one
-	// binding is declared. A single binding keeps the legacy global
-	// identity so existing deploys (which used --dispatch-queue-lane/--dispatch-lane
-	// shorthand) are byte-compatible.
 	derive := len(repeated) > 1
 	if shorthandSet {
 		if strings.TrimSpace(queueLane) == "" || strings.TrimSpace(laneProfile) == "" {
 			return nil, fmt.Errorf("dispatch: both --dispatch-queue-lane and --dispatch-lane are required for a single binding")
 		}
-		bindings = append(bindings, dispatchBinding{
-			queueLane:   strings.TrimSpace(queueLane),
-			laneProfile: strings.TrimSpace(laneProfile),
-			agentName:   strings.TrimSpace(baseAgentName),
-		})
+		bindings = append(bindings, dispatchBinding{queueLane: strings.TrimSpace(queueLane), laneProfile: strings.TrimSpace(laneProfile), agentName: strings.TrimSpace(baseAgentName)})
 	}
-	seenLanes := make(map[string]struct{}, len(bindings)+len(repeated))
+	seenAgents := make(map[string]struct{}, len(repeated)+len(bindings))
 	for _, binding := range bindings {
-		seenLanes[binding.queueLane] = struct{}{}
+		seenAgents[binding.agentName] = struct{}{}
 	}
 	for _, value := range repeated {
-		parts := strings.SplitN(value, ":", 2)
-		if len(parts) != 2 || strings.TrimSpace(parts[0]) == "" || strings.TrimSpace(parts[1]) == "" || (len(parts) == 2 && strings.Contains(parts[1], ":")) {
-			return nil, fmt.Errorf("dispatch: invalid lane binding %q: want <queueLane>:<laneProfile> with no colons in either half", value)
+		parts := strings.Split(value, ":")
+		if (len(parts) != 2 && len(parts) != 3) || strings.TrimSpace(parts[0]) == "" || strings.TrimSpace(parts[1]) == "" || (len(parts) == 3 && strings.TrimSpace(parts[2]) == "") {
+			return nil, fmt.Errorf("dispatch: invalid lane binding %q: want <queueLane>:<laneProfile>[:<agentName>]", value)
 		}
-		binding := dispatchBinding{
-			queueLane:   strings.TrimSpace(parts[0]),
-			laneProfile: strings.TrimSpace(parts[1]),
-		}
-		if derive {
+		binding := dispatchBinding{queueLane: strings.TrimSpace(parts[0]), laneProfile: strings.TrimSpace(parts[1])}
+		if len(parts) == 3 {
+			binding.agentName = strings.TrimSpace(parts[2])
+			binding.sourceAgent = binding.agentName
+		} else if derive {
 			binding.agentName = strings.TrimSpace(baseAgentName) + "-" + binding.queueLane
+			binding.sourceAgent = binding.agentName
 		} else {
 			binding.agentName = strings.TrimSpace(baseAgentName)
 		}
-		if _, ok := seenLanes[binding.queueLane]; ok {
-			return nil, fmt.Errorf("dispatch: duplicate queue lane %q", binding.queueLane)
+		if !validDispatchAgentName(binding.agentName) {
+			return nil, fmt.Errorf("dispatch: invalid agent name %q: use letters, digits, dot, underscore, or hyphen", binding.agentName)
 		}
-		seenLanes[binding.queueLane] = struct{}{}
+		if _, ok := seenAgents[binding.agentName]; ok {
+			return nil, fmt.Errorf("dispatch: duplicate agent identity %q", binding.agentName)
+		}
+		seenAgents[binding.agentName] = struct{}{}
 		bindings = append(bindings, binding)
 	}
 	return bindings, nil
+}
+
+func validDispatchAgentName(name string) bool {
+	if name == "" {
+		return false
+	}
+	for _, r := range name {
+		if !(r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z' || r >= '0' && r <= '9' || r == '.' || r == '_' || r == '-') {
+			return false
+		}
+	}
+	return true
 }
 
 func dispatchPRStateChecker(observer controller.WorldObserver) (dispatch.PullRequestStateChecker, error) {

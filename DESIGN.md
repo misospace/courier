@@ -753,7 +753,20 @@ unparsed-bash reachability matches the pre-change baseline (no new hole).
 This is bootstrap ergonomics for the pinned runtime, distinct from the #136
 secure dependency cache.
 
-### Commit cadence
+#### Dispatch binding identity
+
+Dispatch discovery bindings all persist `spec.source: dispatch`; the optional,
+immutable `spec.sourceAgent` identifies the Dispatch agent used for lifecycle
+calls. The operator registers qualified adapters as `dispatch:<agentName>` and
+resolves non-empty identities only through that exact key (never falling back
+to the bare adapter). The bare `dispatch` adapter is retained for old runs
+whose `sourceAgent` is empty. Keeping source stable means deterministic run
+names and Kubernetes `Create` remain the atomic dedupe boundary across runners
+and retained runs; Dispatch lease observations are not atomic and do not prevent
+duplicate materialization. The CRD must be installed before an operator that
+writes `sourceAgent` is rolled out.
+
+## Commit cadence
 
 Commit at **completed-brief boundaries** — not mid-thought (a foot-gun for a long
 sub-agent), not only at the very end (loses everything on a mid-run death). A
@@ -859,6 +872,7 @@ status and dies with the CR).
 spec:                       # set once by the source adapter, then immutable
   mode: resolve-issue | fix-pr
   source: dispatch | github-label | cron | cli | web
+  sourceAgent: <optional stable identity for a qualified source binding>
   workItemID: <opaque ID understood by the source adapter>
   repo: owner/name
   ref: <issue# or pr#>

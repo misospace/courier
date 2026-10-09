@@ -52,6 +52,59 @@ func TestRunnerPollMaterializesAndDeduplicatesByOpaqueID(t *testing.T) {
 	}
 }
 
+func TestRunnersWithDifferentBindingsMaterializeOneAtomicRun(t *testing.T) {
+	item := WorkItem{ID: "queue-item/generation-1", Mode: "fix-pr", Repo: "acme/widgets", Ref: 42}
+	kubeClient := newTestClient(t, testLane())
+	first := NewRunner(kubeClient, &testAdapter{items: []WorkItem{item}}, RunnerConfig{Source: "dispatch", SourceAgent: "courier-local", LaneProfile: "local", Namespace: "courier"})
+	second := NewRunner(kubeClient, &testAdapter{items: []WorkItem{item}}, RunnerConfig{Source: "dispatch", SourceAgent: "courier-cloud", LaneProfile: "local", Namespace: "courier"})
+	if err := first.Poll(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if err := second.Poll(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	var runs courierv1alpha1.CoderRunList
+	if err := kubeClient.List(context.Background(), &runs, client.InNamespace("courier")); err != nil {
+		t.Fatal(err)
+	}
+	if len(runs.Items) != 1 {
+		t.Fatalf("created %d runs across bindings, want atomic single run", len(runs.Items))
+	}
+}
+
+func TestRunnerPreservesRetainedLegacyDispatchRun(t *testing.T) {
+	item := WorkItem{ID: "opaque-a", Mode: "resolve-issue", Repo: "acme/widgets", Ref: 1}
+	legacy := &courierv1alpha1.CoderRun{ObjectMeta: metav1.ObjectMeta{Name: runName("dispatch:local", item.ID), Namespace: "courier"}, Spec: courierv1alpha1.CoderRunSpec{Source: "dispatch:local", WorkItemID: item.ID, Mode: courierv1alpha1.ModeResolveIssue, Repo: item.Repo, Ref: item.Ref, Lane: "local"}}
+	kubeClient := newTestClient(t, testLane(), legacy)
+	runner := NewRunner(kubeClient, &testAdapter{items: []WorkItem{item}}, RunnerConfig{Source: "dispatch", SourceAgent: "courier-local", LaneProfile: "local", Namespace: "courier"})
+	if err := runner.Poll(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	var runs courierv1alpha1.CoderRunList
+	if err := kubeClient.List(context.Background(), &runs, client.InNamespace("courier")); err != nil {
+		t.Fatal(err)
+	}
+	if len(runs.Items) != 1 || runs.Items[0].Spec.Source != "dispatch:local" {
+		t.Fatalf("retained dispatch run was duplicated: %#v", runs.Items)
+	}
+}
+
+func TestRunnerPersistsSourceAgentWithoutChangingSourceIdentity(t *testing.T) {
+	adapter := &testAdapter{items: []WorkItem{{ID: "opaque-a", Mode: "resolve-issue", Repo: "acme/widgets", Ref: 1}}}
+	kubeClient := newTestClient(t, testLane())
+	runner := NewRunner(kubeClient, adapter, RunnerConfig{Source: "dispatch", SourceAgent: "courier-local", LaneProfile: "local", Namespace: "courier"})
+	if err := runner.Poll(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	var runs courierv1alpha1.CoderRunList
+	if err := kubeClient.List(context.Background(), &runs, client.InNamespace("courier")); err != nil {
+		t.Fatal(err)
+	}
+	if len(runs.Items) != 1 || runs.Items[0].Spec.Source != "dispatch" || runs.Items[0].Spec.SourceAgent != "courier-local" {
+		t.Fatalf("materialized identity = %#v, want dispatch/courier-local", runs.Items)
+	}
+}
+
 func TestRunnerCreatesFreshRunWhenWorkItemGenerationChanges(t *testing.T) {
 	adapter := &testAdapter{items: []WorkItem{{ID: "pr-fix/queue-item/generation-1", Mode: "fix-pr", Repo: "acme/widgets", Ref: 42}}}
 	kubeClient := newTestClient(t, testLane())
