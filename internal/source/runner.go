@@ -41,12 +41,13 @@ type RunnerConfig struct {
 // Runner polls a source and materializes source work as CoderRuns.
 type Runner struct {
 	client.Client
-	Scheme        *runtime.Scheme
-	Adapter       Adapter
-	Config        RunnerConfig
-	pollMu        sync.Mutex
-	laneWaiting   bool
-	laneSuspended bool
+	Scheme         *runtime.Scheme
+	Adapter        Adapter
+	Config         RunnerConfig
+	pollMu         sync.Mutex
+	laneWaiting    bool
+	laneSuspended  bool
+	laneAtCapacity bool
 }
 
 func NewRunner(c client.Client, adapter Adapter, config RunnerConfig) *Runner {
@@ -116,6 +117,27 @@ func (r *Runner) Poll(ctx context.Context) error {
 		r.laneSuspended = false
 	}
 
+	var runs courierv1alpha1.CoderRunList
+	if err := r.List(ctx, &runs, client.InNamespace(r.Config.Namespace)); err != nil {
+		return fmt.Errorf("list CoderRuns: %w", err)
+	}
+	capacity := lane.Spec.Concurrency
+	if capacity <= 0 {
+		capacity = 1
+	}
+	reserved := laneCapacityReservations(runs.Items, r.Config.LaneProfile)
+	if reserved >= capacity {
+		if !r.laneAtCapacity {
+			log.FromContext(ctx).Info("lane at capacity, pausing source discovery", "laneProfile", r.Config.LaneProfile, "capacity", capacity, "reserved", reserved)
+			r.laneAtCapacity = true
+		}
+		return nil
+	}
+	if r.laneAtCapacity {
+		log.FromContext(ctx).Info("lane capacity available, resuming source discovery", "laneProfile", r.Config.LaneProfile, "capacity", capacity, "reserved", reserved)
+		r.laneAtCapacity = false
+	}
+
 	items, err := r.Adapter.Discover(ctx)
 	if err != nil {
 		return err
@@ -141,10 +163,6 @@ func (r *Runner) Poll(ctx context.Context) error {
 	}
 	items = validItems
 
-	var runs courierv1alpha1.CoderRunList
-	if err := r.List(ctx, &runs, client.InNamespace(r.Config.Namespace)); err != nil {
-		return fmt.Errorf("list CoderRuns: %w", err)
-	}
 	existing := make(map[string]struct{}, len(runs.Items))
 	legacyIdentities := make(map[string]struct{})
 	for i := range runs.Items {
@@ -241,6 +259,22 @@ func (r *Runner) identity(workItemID string) string {
 		}
 	}
 	return workItemID
+}
+
+// laneCapacityReservations mirrors operator admission: Pending, Claimed, Running,
+// and the initial empty phase reserve slots; verification and later phases do not.
+func laneCapacityReservations(runs []courierv1alpha1.CoderRun, lane string) int {
+	reserved := 0
+	for i := range runs {
+		if runs[i].Spec.Lane != lane {
+			continue
+		}
+		switch runs[i].Status.Phase {
+		case "", courierv1alpha1.PhasePending, courierv1alpha1.PhaseClaimed, courierv1alpha1.PhaseRunning:
+			reserved++
+		}
+	}
+	return reserved
 }
 
 func workKey(sourceName, workItemID string) string {

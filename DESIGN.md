@@ -1156,7 +1156,16 @@ identity, not lane. The run name hashes that same identity so concurrent creates
 remain atomic even when incidental metadata makes the opaque IDs differ; the
 winning run still stores its original `WorkItemID` for lifecycle calls. Suspending
 or capacitating one LaneProfile affects only that profile; several bindings may
-share a LaneProfile, and then they share its suspend gate and capacity.
+share a LaneProfile, and then they share its suspend gate and capacity. Before
+Dispatch discovery, each runner counts empty-phase, Pending, Claimed, and Running
+CoderRuns on its profile and pauses discovery when those reservations meet
+`spec.concurrency`; Verifying and later phases release execution capacity, matching
+operator admission. This discovery-side guard is not Dispatch queue exclusion: a
+Pending run for an already-discovered head can still leave that head visible to a
+free sibling profile, which requires a separate Dispatch contract. While discovery
+is paused, Dispatch `next-task` and stale-item bookkeeping are also deferred until
+a later poll. Capacity is checked once per poll and does not bound multi-item
+sources that return batches.
 
 ### Dispatch follow-up attempts (#98)
 
