@@ -572,30 +572,46 @@ source state and let the world win on conflict.
 
 The controller translates the human ingress annotation
 `courier.misospace.dev/soft-stop` into operator-owned
-`CoderRun.status.controlRequest`. The annotation value is a non-empty, bounded
-opaque request ID; clearing or changing it clears or replaces the record. The
-record contains `id`, `kind` (closed to `soft-stop` in v1), `targetPodUID`, and
+`CoderRun.status.controlRequest`. It reads the annotation in `observeRunning`
+(where the live coordinator pod is already resolved) and writes the record
+through the existing status patch path when the value differs from the recorded
+`id`; the field is **not** set-once, unlike the lifecycle timestamps and the
+publication policy. The annotation value is a non-empty, bounded opaque request
+ID; clearing or changing it clears or replaces the record. The record contains
+`id`, `kind` (CRD enum closed to `soft-stop` in v1), `targetPodUID`, and
 `requestedAt`.
 
-`CoderRun.status.controlRequestAck` is harness-owned and contains `id` and `at`.
-Trusted control writes it through the existing trusted status path after the
-request is served and before setting the stop latch. The broker validates it as
-harness-owned and rejects an acknowledgement for an ID it did not serve to the
-live incarnation.
+`CoderRun.status.controlRequestAck` is harness-owned and contains `id` and `at`,
+added to the harness-owned patch set. Trusted control writes it through the
+existing trusted status path after the request is served and before setting the
+stop latch. Inside the CAS update, the broker requires a live
+`status.controlRequest`, its `id` equal to the acknowledgement ID, and its
+`targetPodUID` equal to the authenticated live control pod UID; otherwise it
+returns 422.
 
-Trusted control polls an authenticated GET route such as
-`/trusted/v1/control-request` on the same listener as `/trusted/v1/status`. The
-broker returns the operator record only when the run UID matches and
-`targetPodUID` equals the live control pod UID; otherwise it returns 404. The
+The route constant is `PathControlRequest = "/trusted/v1/control-request"`,
+with a canonical-path check mirroring the status route. An authenticated GET on
+the same listener as `/trusted/v1/status` returns `200` with
+`{id, kind, targetPodUID, requestedAt}` iff the run UID matches and
+`targetPodUID` equals the live control pod UID; otherwise it returns `404`. The
 broker's existing `get` access to the named run and control pod is sufficient;
 no new broker or operator RBAC is needed.
 
-Stop ordering is serve, durable acknowledgement, stop dispatching new briefs,
-let in-flight briefs reach terminal and integrate and publish, end the model
-loop, then reconcile status debt, flush active operations, declare the outcome,
-and exit. `ctx` cancellation (SIGTERM) remains a separate path and is never
-conflated with soft-stop. The stop boundary preserves per-brief publication and
-never deletes the pod (#238).
+The harness keeps a mutex-guarded consumed set per incarnation and adds an ID
+only after the ack write succeeds; a consumed ID delivered again emits no second
+ack or control turn. `BriefRegistry.HasInFlight()` — registered briefs with no
+recorded terminal result, including one still integrating — gates exit. The
+latch stops new `runDelegate` calls only; the request is polled at step
+boundaries and inside the existing per-operation brief-wait poll, with no new
+timer, busy loop, or wall-clock bound. Stop ordering is serve, durable ack,
+stop new briefs, let in-flight briefs reach terminal and integrate and publish,
+end the model loop, reconcile status debt, flush active operations, derive the
+outcome, and exit. The soft-stop finish derives `changes`, `no_change_needed`,
+or `blocked_external` from the work-ref snapshot beyond the admission anchor
+via the existing broker snapshot, not from a model declaration. `ctx`
+cancellation (SIGTERM) remains a separate path and is never conflated with
+soft-stop; the boundary preserves per-brief publication and never deletes the
+pod (#238).
 
 ## 5. Native harness and worker protocol
 

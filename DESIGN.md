@@ -395,7 +395,8 @@ capturing a 105 KB dirty patch by hand.
 `courier.misospace.dev/soft-stop`; its non-empty, bounded value is an opaque
 request ID. The controller alone translates it into the operator-owned
 `status.controlRequest` record `{id, kind: "soft-stop", targetPodUID,
-requestedAt}`. The v1 action vocabulary is closed to `soft-stop`. Trusted control
+requestedAt}`. `ControlRequest.kind` is CRD-enum-closed to `soft-stop` (admission
+refuses any other value), and `id` is bounded (max 128 characters). Trusted control
 never reads the annotation or `CoderRun` directly: at a step boundary it pulls
 the record from the broker over the authenticated trusted-control path, using the
 same run-bound identity, TokenReview, and control-pod-incarnation path as the
@@ -416,42 +417,61 @@ cannot forge an operator request. The model and worker have no path to status,
 and a model-authored tool request cannot reach either the request field or the
 read route.
 
-**UID and incarnation fencing.** The operator stamps `targetPodUID` from the
-live coordinator pod it observes, the same UID that fences heartbeats and active
+**UID and incarnation fencing.** The controller stamps a request only for a
+Running run; other phases stamp nothing. It takes `targetPodUID` from the live
+coordinator pod it observes, the same UID that fences heartbeats and active
 operations (#126). The broker serves the record only when the run UID matches
 and `targetPodUID` equals the live control pod UID; otherwise it is absent (404).
 A request addressed to a dead incarnation is void, never handed to its
 replacement: graceful handoff is not rescue, and crash/liveness recovery remains
-the fallback. The operator surfaces a stale or unacknowledged request as a
-condition rather than silently re-targeting; re-targeting requires a new
-annotation value.
+the fallback. On relaunch the controller clears `status.controlRequest` and
+surfaces `SoftStopObserved`, reason `Unacknowledged`, for a request the named
+incarnation never acknowledged; the condition clears on a fresh annotation or
+acknowledgement, and the operator drops `status.controlRequest` when the run
+reaches a terminal phase. Re-targeting requires a new annotation value.
 
-**Acknowledgement and idempotency.** Each request has an opaque ID. Control
-keeps an in-memory consumed set per incarnation. On accepting a matching request
-it first durably writes the harness-owned `controlRequestAck {id, at}` through
-the broker's trusted status path (resourceVersion CAS, as for other status
-writes), then flips the stop latch. A request is never consumed without a
-durable acknowledgement, mirroring persist-before-dispatch. Redelivery of the
-same ID to the same incarnation is a no-op; the broker rejects an acknowledgement
-for an ID it did not serve to the live incarnation. The operator treats the
-request as settled on observing the acknowledgement or terminalization. A crash
-between read and acknowledgement drops the request: it is fenced and void,
-consistent with the crash-fallback non-goal.
+**Acknowledgement and idempotency.** The annotation value is the opaque request
+ID. If `status.controlRequest.id` already equals the current annotation value,
+the operator does not re-stamp it. Control keeps a mutex-guarded consumed set
+per incarnation. On accepting a matching request it first durably writes the
+harness-owned `controlRequestAck {id, at}` through the broker's trusted status
+path (resourceVersion CAS, as for other status writes), then adds the ID to the
+set and flips the stop latch. A request is never consumed without a durable
+acknowledgement, mirroring persist-before-dispatch. Redelivery of a consumed ID
+to the same incarnation is a no-op: no second acknowledgement or control turn.
+The broker rejects an acknowledgement for an ID it did not serve to the live
+incarnation. The operator treats the request as settled on observing the
+acknowledgement or terminalization. A crash between read and acknowledgement
+drops the request: it is fenced and void, consistent with the crash-fallback
+non-goal.
 
 **Checkpoint-safe stop boundary.** A soft-stop never cancels the session or
-deletes the pod. On acceptance, the coordinator stops dispatching new briefs
-and lets every in-flight brief reach terminal, integrate, and publish, preserving
-live partial work in each per-brief commit. After the last in-flight brief
-integrates, it stops the model turn loop, then runs the normal finish path:
-reconcile status debt, flush active operations, declare the outcome (`changes`
-when published work exists, otherwise `no_change_needed` or `blocked_external`),
-and exit. The request is also injected once as a trusted control turn: a
-bounded, redacted, provenance-marked control-plane note, never merged into model
-text, so the model can wind down and publish its own final commit and PR. The
-latch, not the model, enforces exit. The boundary is checked between model turns
-and inside the brief-wait loop. Legacy SIGTERM pod deletion remains unchanged
-and distinct; this protocol targets the native secure harness, while legacy
-OpenCode retains only SIGTERM/relaunch.
+deletes the pod. On acceptance, the latch blocks new brief dispatches only;
+shell, brief cancellation, and forge tools stay available so the model can run
+final local validation, commit, and declare `changes`. Every in-flight brief
+reaches terminal, integrates, and publishes, preserving live partial work in
+each per-brief commit. After the last in-flight brief integrates, the model turn
+loop ends, then a dedicated soft-stop finish path reconciles status debt, flushes
+active operations, and derives the outcome from the world rather than trusting a
+model declaration: `changes` iff the run's work ref holds a tip beyond the
+admission anchor, then republish through the broker (whose re-confirm is
+idempotent); otherwise `no_change_needed`. A broker publication block promotes
+the outcome to `blocked_external`. The latch, not the model, owns this decision
+and enforces exit.
+
+The request injects exactly once per consumed request ID as a `system`-role
+control turn: a 512-byte-capped, redacted note marked
+`[courier-control, control-plane]` that carries only the fixed marker and its
+instruction — never the request ID, `targetPodUID`, the run name, or a pod
+UID — telling the model to stop new work, let
+in-flight briefs finish, publish, and reply with valid outcome JSON. It must not
+quote or reference the note in model text, tool arguments, or tool results. The
+boundary is checked between model turns and inside the brief-wait loop. SIGTERM
+during soft-stop wind-down takes precedence: the harness returns the
+stream-cancelled error and the run ends `Failed`; the operator clears the request
+on the next reconcile. Legacy SIGTERM pod deletion remains distinct; this
+protocol targets the native secure harness, while legacy OpenCode retains only
+SIGTERM/relaunch.
 
 **What it cannot do.** The control turn cannot mutate run policy: publication
 policy, branch, and merge gate remain operator/forge-owned and set-once. A
