@@ -223,6 +223,14 @@ func TestValidateEvidenceFlags(t *testing.T) {
 			service:   "http://evidence-intake:8443",
 			bind:      "   ",
 		},
+		{
+			// Settled decision: key+service without bind stays legal so
+			// deployments that predate --evidence-intake-bind keep starting.
+			// main() logs that capture POSTs will be refused.
+			name:      "key secret and service without bind stays valid",
+			keySecret: "courier-evidence-key",
+			service:   "http://evidence-intake:8443",
+		},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {

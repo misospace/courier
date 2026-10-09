@@ -228,4 +228,10 @@
 {{- end }}
 {{- $_ := set $container "args" $args }}
 
+{{- /* The namespaced evidence Secret authority renders only when the intake is enabled. */}}
+{{- if not $evidence.enabled }}
+{{- if hasKey .Values.rbac.roles "evidence" }}{{- $_ := unset .Values.rbac.roles "evidence" }}{{- end }}
+{{- if hasKey .Values.rbac.bindings "evidence" }}{{- $_ := unset .Values.rbac.bindings "evidence" }}{{- end }}
+{{- end }}
+
 {{- include "bjw-s.common.loader.generate" . }}

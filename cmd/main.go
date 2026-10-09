@@ -134,7 +134,7 @@ func main() {
 	flag.DurationVar(&dispatchHTTPTimeout, "dispatch-http-timeout", 30*time.Second, "Dispatch HTTP request timeout.")
 	flag.StringVar(&evidenceIntakeKeySecret, "evidence-intake-key-secret", "", "Name of the Secret in the operator namespace holding the evidence intake HMAC key under the \"key\" entry; empty with no --evidence-intake-service disables evidence wiring.")
 	flag.StringVar(&evidenceIntakeService, "evidence-intake-service", "", "URL coordinator pods POST failure evidence to; required with --evidence-intake-key-secret.")
-	flag.StringVar(&evidenceIntakeBind, "evidence-intake-bind", "", "Address the operator's own evidence-intake server binds to in-process (for example 0.0.0.0:8443); the chart derives the matching --evidence-intake-service URL. Empty leaves the operator-side intake off, and a non-empty value requires --evidence-intake-key-secret.")
+	flag.StringVar(&evidenceIntakeBind, "evidence-intake-bind", "", "Address the operator's own evidence-intake server binds to in-process (for example :8082); the chart derives the matching --evidence-intake-service URL. Empty leaves the operator-side intake off, and a non-empty value requires --evidence-intake-key-secret.")
 	opts := zap.Options{Development: true}
 	opts.BindFlags(flag.CommandLine)
 	flag.Parse()
@@ -230,6 +230,10 @@ func main() {
 			setupLog.Info("evidence intake server enabled", "bind", strings.TrimSpace(evidenceIntakeBind), "service", strings.TrimSpace(evidenceIntakeService))
 		} else {
 			setupLog.Info("evidence capture wiring configured", "namespace", podNamespace, "secret", strings.TrimSpace(evidenceIntakeKeySecret))
+			// Legal but inert: the URL still reaches coordinator pods while no
+			// listener answers, so every capture would spend its delivery
+			// attempts on nothing. Say so plainly at startup.
+			setupLog.Info("evidence intake listener disabled: --evidence-intake-bind is empty, coordinator capture POSTs will be refused", "service", strings.TrimSpace(evidenceIntakeService))
 		}
 	}
 

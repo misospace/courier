@@ -124,8 +124,12 @@ func (i *EvidenceIntake) Start(ctx context.Context) error {
 	}
 	srv := &http.Server{
 		// No request wall-clock timeout: a large-but-valid bundle may take time
-		// to re-scan, and the body cap already bounds memory, not time.
+		// to re-scan, and the body cap already bounds memory, not time. The
+		// timeouts below bound connections, never run duration.
 		ReadHeaderTimeout: 10 * time.Second,
+		ReadTimeout:       60 * time.Second,
+		WriteTimeout:      30 * time.Second,
+		IdleTimeout:       120 * time.Second,
 		Handler:           i.Handler(),
 	}
 	errCh := make(chan error, 1)
@@ -177,6 +181,10 @@ func (i *EvidenceIntake) Handler() http.Handler {
 // 12. re-scan           credential set, rebuild       (500 if unreadable)
 // 13. persist           idempotent create-or-update   (500 on failure)
 //
+// Stages 5 and 10 also enforce the design's whole-request count bounds: a
+// manifest over the manifest-entry cap and an archive over the content-entry
+// cap are structural rejects (400), not persisted bundles.
+//
 // The handler deliberately holds no request wall-clock timeout: a bundle within
 // the size cap that takes long to re-scan is still valid, and the body cap
 // bounds memory, not time.
@@ -213,6 +221,10 @@ func (i *EvidenceIntake) handle(w http.ResponseWriter, r *http.Request) {
 		writeIntakeError(w, http.StatusRequestEntityTooLarge, "evidence intake request exceeds the size cap")
 		return
 	}
+	// ContentLength is only a claim: a chunked upload reports -1. Bound the
+	// read itself so every byte that enters the handler is capped, not just
+	// the ones the client declared.
+	r.Body = http.MaxBytesReader(w, r.Body, maxRequestBodyBytes)
 
 	// Stage 5. Read the manifest and archive parts.
 	manifestBytes, archiveBytes, err := readIntakeRequest(r)
@@ -220,6 +232,11 @@ func (i *EvidenceIntake) handle(w http.ResponseWriter, r *http.Request) {
 		code := http.StatusBadRequest
 		if errors.Is(err, errPartTooLarge) {
 			code = http.StatusRequestEntityTooLarge
+		} else {
+			var maxBytesErr *http.MaxBytesError
+			if errors.As(err, &maxBytesErr) {
+				code = http.StatusRequestEntityTooLarge
+			}
 		}
 		writeIntakeError(w, code, err.Error())
 		return
@@ -237,7 +254,7 @@ func (i *EvidenceIntake) handle(w http.ResponseWriter, r *http.Request) {
 	run := &courierv1alpha1.CoderRun{}
 	if err := i.APIReader.Get(r.Context(), client.ObjectKey{Namespace: manifest.Run.Namespace, Name: manifest.Run.Name}, run); err != nil {
 		if apierrors.IsNotFound(err) {
-			writeIntakeError(w, http.StatusUnauthorized, "evidence intake cannot resolve the run")
+			writeIntakeError(w, http.StatusUnauthorized, "evidence intake could not authenticate the capture")
 			return
 		}
 		writeIntakeError(w, http.StatusInternalServerError, "evidence intake could not read the run")
@@ -249,7 +266,9 @@ func (i *EvidenceIntake) handle(w http.ResponseWriter, r *http.Request) {
 	mac := hmac.New(sha256.New, i.Key)
 	mac.Write([]byte(manifest.Run.Namespace + "/" + manifest.Run.Name + "/" + string(run.UID) + "/" + hex.EncodeToString(nonce)))
 	if !hmac.Equal(presentedMAC, mac.Sum(nil)) {
-		writeIntakeError(w, http.StatusUnauthorized, "evidence intake token does not verify")
+		// Same message as the unresolvable-run branch above: a pre-auth response
+		// must not tell an unauthenticated caller whether the run exists.
+		writeIntakeError(w, http.StatusUnauthorized, "evidence intake could not authenticate the capture")
 		return
 	}
 
@@ -328,11 +347,21 @@ func (i *EvidenceIntake) persist(ctx context.Context, run *courierv1alpha1.Coder
 		if err := i.APIReader.Get(ctx, client.ObjectKey{Namespace: secret.Namespace, Name: secret.Name}, existing); err != nil {
 			return fmt.Errorf("evidence intake: re-reading secret %s: %w", secret.Name, err)
 		}
+		// The name is a hash of the run and the nonce, so a name collision
+		// with a foreign secret must not let the intake overwrite it: only a
+		// secret the intake itself labelled is supersedable.
+		if _, ok := existing.Labels[EvidenceLabelKey]; !ok {
+			return fmt.Errorf("evidence intake: refusing to overwrite non-evidence secret %s/%s", existing.Namespace, existing.Name)
+		}
+		base := existing.DeepCopy()
 		existing.Data = secret.Data
 		existing.Labels = secret.Labels
 		existing.OwnerReferences = secret.OwnerReferences
-		if err := i.Client.Update(ctx, existing); err != nil {
-			return fmt.Errorf("evidence intake: updating secret %s: %w", secret.Name, err)
+		// Patch, not update: the intake's namespaced Role grants
+		// create/get/list/patch/delete and not update, so the supersede path
+		// must patch.
+		if err := i.Client.Patch(ctx, existing, client.MergeFrom(base)); err != nil {
+			return fmt.Errorf("evidence intake: patching secret %s: %w", secret.Name, err)
 		}
 	}
 	return nil
@@ -466,46 +495,77 @@ func readSecretKey(ctx context.Context, r client.Reader, namespace, name, key st
 	return string(value), nil
 }
 
-// rescanAndRebuild re-scans every admitted member against the credential
-// scanner, reclassifies matching stored entries to withheld, redacts metadata
-// (paths, symlink targets) that contain a credential, drops matching members
-// from the archive, re-derives the authoritative totals, and rebuilds the
-// canonical manifest and archive. The manifest and archive are returned in the
-// form the intake will persist — never the POST as received.
+// rescanAndRebuild re-scans every string the bundle carries against the
+// credential scanner — admitted content AND the names it is stored under —
+// reclassifies matching stored entries to withheld, redacts metadata (paths,
+// symlink targets) that contain a credential, drops matching members from the
+// archive, re-derives the authoritative totals, and rebuilds the canonical
+// manifest and archive. The manifest and archive are returned in the form the
+// intake will persist — never the POST as received.
+//
+// The re-scan is symmetric with the capture side: capture withholds an entry
+// when its content OR its path matches (and scans commit message and patch text
+// like content), so a matching name withholds here exactly like a matching
+// content. Both persisted artifacts are covered: a name match drops the tar
+// member (whose name is the string that matched) and clears the entry's
+// storedPath, and the path itself is redacted, so no matching string survives
+// in manifest.json or in the bundle's member names.
 //
 // The archive can contain members with no visible manifest entry (a budget
 // collapse drops entries but not their admitted content), so the re-scan walks
 // the whole archive, not the visible list: the guarantee is that no matching
-// content is persisted, regardless of how the manifest describes it.
+// content or name is persisted, regardless of how the manifest describes it.
 func (i *EvidenceIntake) rescanAndRebuild(ctx context.Context, run *courierv1alpha1.CoderRun, manifest *evidence.Manifest, members map[string][]byte) ([]byte, []byte, error) {
 	scanner, err := i.credentialScanner(ctx, run)
 	if err != nil {
 		return nil, nil, err
 	}
 
+	// withheldMembers records the members whose visible entry was reclassified
+	// above, so the drop loop removes exactly those and the totals move in
+	// lockstep with the reclassification.
+	withheldMembers := make(map[string]bool)
+
 	// Redact metadata across the entry list and reclassify visible stored
-	// entries whose admitted content matches.
+	// entries whose admitted content or name matches. The name test runs BEFORE
+	// redaction, which would otherwise hide the match behind the placeholder and
+	// leave the entry — and the member named with the credential — in place.
 	for idx := range manifest.Entries {
 		e := &manifest.Entries[idx]
+		nameMatched := scanner.Matched(e.Path) || scanner.Matched(e.StoredPath)
 		e.Path = scanner.RedactMetadata(e.Path)
 		if e.LinkTarget != "" {
 			e.LinkTarget = scanner.RedactMetadata(e.LinkTarget)
 		}
-		if e.Disposition == evidence.DispositionStored {
-			if scanner.Matched(string(members[e.StoredPath])) {
-				e.Disposition = evidence.DispositionWithheld
+		if e.Disposition != evidence.DispositionStored {
+			// A non-stored entry carries no content, but an untrusted manifest can
+			// still pair it with a storedPath: that string would ride into the
+			// persisted manifest, so a matching one is dropped.
+			if e.StoredPath != "" && scanner.Matched(e.StoredPath) {
 				e.StoredPath = ""
 			}
+			continue
 		}
+		storedPath := e.StoredPath
+		// The tar member name and the entry's storedPath are the same string, so
+		// either match withholds the same way a content match does.
+		if !nameMatched && !scanner.Matched(string(members[storedPath])) {
+			continue
+		}
+		e.Disposition = evidence.DispositionWithheld
+		e.StoredPath = ""
+		e.Bytes = 0
+		withheldMembers[storedPath] = true
 	}
 
-	// Drop every matching member; the archive holds only admitted (stored)
-	// content, so each dropped member is one stored file now withheld.
+	// Drop every matching member — by content, by name, or because the visible
+	// entry that claimed it was withheld above. The archive holds only admitted
+	// (stored) content, so each dropped member is one stored file now withheld.
 	kept := make(map[string][]byte, len(members))
 	var dropped int
 	var droppedBytes int64
 	for name, content := range members {
-		if scanner.Matched(string(content)) {
+		if withheldMembers[name] || scanner.Matched(name) || scanner.Matched(string(content)) {
 			dropped++
 			droppedBytes += int64(len(content))
 			continue
@@ -590,18 +650,26 @@ func buildArchive(members map[string][]byte) ([]byte, error) {
 //     containing a parent-directory segment) — a tar-slip guard;
 //   - a member that is not a regular file (symlinks, dirs, devices);
 //   - a member over the per-file cap;
-//   - an archive whose total content exceeds the total cap;
+//   - an archive whose member count or total content exceeds the caps;
 //   - a manifest that references admitted content absent from the archive
-//     (every visible stored entry must have its member present).
+//     (every visible stored entry must have its member present);
+//   - when the manifest is NOT budget-collapsed, a member no stored entry
+//     claims (or claims more than one) — the other direction of the same
+//     cross-reference.
 //
-// It does NOT reject archive members that lack a visible manifest entry: a
-// budget collapse can leave admitted content with no visible entry, and the
-// intake re-scans the whole archive regardless.
+// The second (manifest → archive) direction is unconditional. The reverse
+// (archive → manifest) direction applies only when the manifest is not
+// budget-collapsed: a collapse drops entries but keeps their admitted content, so
+// a collapsed manifest legitimately carries members with no visible entry. When
+// totals.omittedByBudget is zero the entry list IS the full discovery, so an
+// unclaimed member (content the manifest never accounts for) or two entries
+// claiming one member are structural mismatches a genuine capture cannot produce.
 func validateArchive(manifest *evidence.Manifest, data []byte) (map[string][]byte, error) {
 	members, err := parseArchive(data)
 	if err != nil {
 		return nil, err
 	}
+	claims := make(map[string]int, len(manifest.Entries))
 	for _, e := range manifest.Entries {
 		if e.Disposition != evidence.DispositionStored {
 			continue
@@ -611,6 +679,14 @@ func validateArchive(manifest *evidence.Manifest, data []byte) (map[string][]byt
 		}
 		if _, ok := members[e.StoredPath]; !ok {
 			return nil, fmt.Errorf("evidence intake: manifest references admitted content %q absent from the archive", safeDisplay(e.StoredPath))
+		}
+		claims[e.StoredPath]++
+	}
+	if manifest.Totals.OmittedByBudget == 0 {
+		for name := range members {
+			if claims[name] != 1 {
+				return nil, fmt.Errorf("evidence intake: archive member %q is claimed by %d stored entries, want exactly 1", safeDisplay(name), claims[name])
+			}
 		}
 	}
 	return members, nil
@@ -630,6 +706,7 @@ func parseArchive(data []byte) (map[string][]byte, error) {
 	}
 	defer gz.Close()
 	tr := tar.NewReader(gz)
+	var count int
 	var total int64
 	for {
 		hdr, err := tr.Next()
@@ -644,6 +721,18 @@ func parseArchive(data []byte) (map[string][]byte, error) {
 		}
 		if hdr.Typeflag != tar.TypeReg {
 			return nil, fmt.Errorf("evidence intake: archive member %q is not a regular file", safeDisplay(hdr.Name))
+		}
+		// Cap on members, counted as they are parsed and checked before the
+		// member's content is read, so an over-cap archive stops at the
+		// offending member instead of buffering all of it first. The cap is the
+		// capture's own content-entry bound: local commits ride along under the
+		// same cap, so every member of a genuine bundle is a content entry the
+		// capture would itself have capped. Enforcing it here makes "entry count
+		// over the cap" a whole-request structural reject on the intake side too
+		// rather than something only the (untrusted) capture side bounds.
+		count++
+		if count > evidence.MaxContentEntries {
+			return nil, fmt.Errorf("evidence intake: archive carries more than the %d-entry content cap", evidence.MaxContentEntries)
 		}
 		if hdr.Size > evidence.MaxFileBytes {
 			return nil, fmt.Errorf("evidence intake: archive member %q exceeds the per-file cap", safeDisplay(hdr.Name))
@@ -835,7 +924,10 @@ func readIntakeRequest(r *http.Request) (manifest, archive []byte, err error) {
 			}
 			seenManifest = true
 		case "archive":
-			archive, err = readPart(part, evidence.MaxTotalBytes)
+			// Slack of 1/64 over the content cap: gzip of incompressible content
+			// runs slightly past the uncompressed size. The decompressed bound
+			// stays exactly MaxTotalBytes (parseArchive enforces it).
+			archive, err = readPart(part, evidence.MaxTotalBytes+evidence.MaxTotalBytes/64)
 			if err != nil {
 				return nil, nil, err
 			}
@@ -896,7 +988,10 @@ func splitToken(token string) (nonce, mac []byte, ok bool) {
 	return raw[:executor.EvidenceNonceBytes], raw[executor.EvidenceNonceBytes:], true
 }
 
-// decodeManifest parses and validates the manifest's schema version.
+// decodeManifest parses and validates the manifest's schema version and its
+// entry count. An entry count over the cap is a whole-request structural reject:
+// the capture side bounds it, but the manifest is untrusted input here, so the
+// intake enforces the same bound itself.
 func decodeManifest(data []byte) (*evidence.Manifest, error) {
 	var m evidence.Manifest
 	if err := json.Unmarshal(data, &m); err != nil {
@@ -905,19 +1000,23 @@ func decodeManifest(data []byte) (*evidence.Manifest, error) {
 	if m.SchemaVersion != evidence.SchemaVersion {
 		return nil, fmt.Errorf("evidence intake: unsupported manifest schema version %d", m.SchemaVersion)
 	}
+	if len(m.Entries) > evidence.MaxManifestEntries {
+		return nil, fmt.Errorf("evidence intake: manifest carries %d entries, over the %d-entry cap", len(m.Entries), evidence.MaxManifestEntries)
+	}
 	return &m, nil
 }
 
 // evidenceSecretName builds the run's evidence secret name: a stable prefix,
-// the run's name, and a hex slice of the incarnation nonce. It fits within the
+// the run's name, and the first 8 hex characters of the incarnation nonce (the
+// DESIGN wire contract). It fits within the
 // 253-character Kubernetes object-name cap by truncating and hash-sufficing the
 // run's name (exactly like the pod name), so long run names stay short and
 // unique per incarnation.
 func evidenceSecretName(runName string, nonce []byte) string {
 	const prefix = "courier-evidence-"
 	const hashLen = 8
-	// A slice of the nonce, hex-encoded: 16 characters from up to 8 bytes.
-	nonceHex := hex.EncodeToString(nonce[:min(len(nonce), 8)])
+	// The wire contract: the first 8 characters of the hex-encoded nonce.
+	nonceHex := hex.EncodeToString(nonce)[:8]
 	base := strings.Trim(strings.ToLower(runName), "-")
 	// The long form is prefix + base[:K] + "-" + hash + "-" + nonceHex. Solve
 	// for the largest K that keeps the whole name <= 253.

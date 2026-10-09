@@ -276,6 +276,14 @@ func TestChartRendersEvidenceIntake(t *testing.T) {
 		}
 	}
 
+	// Disabled evidence must not render the namespaced Secret authority, even
+	// though values.yaml defines it statically.
+	for _, kind := range []string{"kind: Role", "kind: RoleBinding"} {
+		for _, doc := range missingDocuments(disabled, kind, "name: courier-evidence") {
+			t.Fatalf("Evidence-disabled chart output rendered a document with %q and %q:\n%s", kind, "name: courier-evidence", doc)
+		}
+	}
+
 	// Enabled: the intake flags and a ClusterIP Service exposing port 80 to
 	// the listener's port. helm template without --namespace uses "default"
 	// for Release.Namespace, so the service URL is the default-namespace one.
@@ -296,6 +304,11 @@ func TestChartRendersEvidenceIntake(t *testing.T) {
 			t.Fatalf("Evidence-enabled chart output is missing %q", want)
 		}
 	}
+
+	// Enabled evidence carries the namespaced Secret authority: a Role and a
+	// RoleBinding that bjw-s names "<release>-<identifier>", so "courier-evidence".
+	findDocument(t, enabled, "kind: Role", "name: courier-evidence")
+	findDocument(t, enabled, "kind: RoleBinding", "name: courier-evidence")
 
 	// The evidence Service's selector must exactly equal the controller
 	// Deployment's pod selector so the Service tracks the controller pods
@@ -344,6 +357,29 @@ func findDocument(t *testing.T, output, kindLine, nameLine string) string {
 	}
 	t.Fatalf("no document with a line %q and a line %q", kindLine, nameLine)
 	return ""
+}
+
+// missingDocuments returns every document (a block of the multi-doc helm
+// output separated by ---) that contains a line equal to kindLine and a line
+// equal to nameLine. It is the inverse of findDocument: an empty result is the
+// expected outcome for an assertion that a resource must not be rendered.
+func missingDocuments(output, kindLine, nameLine string) []string {
+	var matches []string
+	for _, doc := range strings.Split(output, "\n---") {
+		hasKind, hasName := false, false
+		for _, line := range strings.Split(doc, "\n") {
+			switch strings.TrimSpace(line) {
+			case kindLine:
+				hasKind = true
+			case nameLine:
+				hasName = true
+			}
+		}
+		if hasKind && hasName {
+			matches = append(matches, doc)
+		}
+	}
+	return matches
 }
 
 // deploymentPodSelector returns the "key: value" lines of the controller
