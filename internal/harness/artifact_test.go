@@ -52,6 +52,9 @@ func newArtifactWorld(t *testing.T, scope PathScope) *artifactWorld {
 	if err != nil {
 		t.Fatalf("seed integration tree: %v", err)
 	}
+	// Keep Git's background housekeeping from racing TempDir cleanup.
+	gitCmd(t, integrator.Dir, "config", "gc.auto", "0")
+	gitCmd(t, integrator.Dir, "config", "maintenance.auto", "false")
 	if tip != work {
 		t.Fatalf("seeded tip = %s, want the snapshot work tip %s", tip, work)
 	}
