@@ -72,6 +72,58 @@ func TestRunnersWithDifferentBindingsMaterializeOneAtomicRun(t *testing.T) {
 	}
 }
 
+func TestConcurrentBindingsDeduplicateByCanonicalIdentity(t *testing.T) {
+	itemA := WorkItem{ID: "raw-pr-url", Mode: "fix-pr", Repo: "acme/widgets", Ref: 42}
+	itemB := WorkItem{ID: "raw-ci-job-url", Mode: "fix-pr", Repo: "acme/widgets", Ref: 42}
+	baseClient := newTestClient(t, testLane())
+	createBarrier := make(chan struct{})
+	barrierClient := &createBarrierClient{Client: baseClient, arrived: make(chan struct{}, 2), release: createBarrier}
+	first := NewRunner(barrierClient, &mappedIdentityAdapter{testAdapter: testAdapter{items: []WorkItem{itemA}}, identity: "prfix:queue-item:1"}, RunnerConfig{Source: "dispatch", SourceAgent: "agent-a", LaneProfile: "local", Namespace: "courier"})
+	second := NewRunner(barrierClient, &mappedIdentityAdapter{testAdapter: testAdapter{items: []WorkItem{itemB}}, identity: "prfix:queue-item:1"}, RunnerConfig{Source: "dispatch", SourceAgent: "agent-b", LaneProfile: "local", Namespace: "courier"})
+
+	results := make(chan error, 2)
+	go func() { results <- first.Poll(context.Background()) }()
+	go func() { results <- second.Poll(context.Background()) }()
+	<-barrierClient.arrived
+	<-barrierClient.arrived
+	close(createBarrier)
+	for range 2 {
+		if err := <-results; err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	var runs courierv1alpha1.CoderRunList
+	if err := baseClient.List(context.Background(), &runs, client.InNamespace("courier")); err != nil {
+		t.Fatal(err)
+	}
+	if len(runs.Items) != 1 {
+		t.Fatalf("created %d runs for one canonical identity, want 1", len(runs.Items))
+	}
+	run := runs.Items[0]
+	if run.Spec.SourceAgent != "agent-a" && run.Spec.SourceAgent != "agent-b" {
+		t.Fatalf("sourceAgent = %q, want one of the competing bindings", run.Spec.SourceAgent)
+	}
+	if run.Spec.WorkItemID != itemA.ID && run.Spec.WorkItemID != itemB.ID {
+		t.Fatalf("workItemID = %q, want the original opaque ID from the winning binding", run.Spec.WorkItemID)
+	}
+	if (run.Spec.SourceAgent == "agent-a" && run.Spec.WorkItemID != itemA.ID) || (run.Spec.SourceAgent == "agent-b" && run.Spec.WorkItemID != itemB.ID) {
+		t.Fatalf("winner fields do not match: sourceAgent=%q workItemID=%q", run.Spec.SourceAgent, run.Spec.WorkItemID)
+	}
+}
+
+type createBarrierClient struct {
+	client.Client
+	arrived chan struct{}
+	release <-chan struct{}
+}
+
+func (c *createBarrierClient) Create(ctx context.Context, obj client.Object, opts ...client.CreateOption) error {
+	c.arrived <- struct{}{}
+	<-c.release
+	return c.Client.Create(ctx, obj, opts...)
+}
+
 func TestRunnerPreservesRetainedLegacyDispatchRun(t *testing.T) {
 	item := WorkItem{ID: "opaque-a", Mode: "resolve-issue", Repo: "acme/widgets", Ref: 1}
 	legacy := &courierv1alpha1.CoderRun{ObjectMeta: metav1.ObjectMeta{Name: runName("dispatch:local", item.ID), Namespace: "courier"}, Spec: courierv1alpha1.CoderRunSpec{Source: "dispatch:local", WorkItemID: item.ID, Mode: courierv1alpha1.ModeResolveIssue, Repo: item.Repo, Ref: item.Ref, Lane: "local"}}
@@ -171,6 +223,13 @@ func TestRunnerDeduplicatesByAdapterWorkIdentity(t *testing.T) {
 type identityAdapter struct {
 	testAdapter
 }
+
+type mappedIdentityAdapter struct {
+	testAdapter
+	identity string
+}
+
+func (a *mappedIdentityAdapter) WorkIdentity(string) string { return a.identity }
 
 func (a *identityAdapter) WorkIdentity(workItemID string) string {
 	identity, _, _ := strings.Cut(workItemID, "|")

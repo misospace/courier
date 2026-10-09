@@ -204,7 +204,7 @@ func (r *Runner) Poll(ctx context.Context) error {
 				Debug:       spec.Debug,
 			},
 		}
-		run.Name = runName(r.Config.Source, item.ID)
+		run.Name = runName(r.Config.Source, itemIdentity)
 		if err := r.Create(ctx, run); err != nil && !apierrors.IsAlreadyExists(err) {
 			return fmt.Errorf("create CoderRun for %q: %w", item.ID, err)
 		}
