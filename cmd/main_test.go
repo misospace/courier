@@ -61,6 +61,11 @@ func TestResolveDispatchBindings(t *testing.T) {
 			want:      []dispatchBinding{{queueLane: "queue-a", laneProfile: "lane-a", agentName: "courier"}},
 		},
 		{
+			name:     "single repeated binding preserves bare identity",
+			repeated: []string{"queue-a:lane-a"},
+			want:     []dispatchBinding{{queueLane: "queue-a", laneProfile: "lane-a", agentName: "courier"}},
+		},
+		{
 			name:     "repeated only",
 			repeated: []string{"queue-a:lane-a", "queue-b:lane-b"},
 			want:     []dispatchBinding{{queueLane: "queue-a", laneProfile: "lane-a", agentName: "courier-queue-a", sourceAgent: "courier-queue-a"}, {queueLane: "queue-b", laneProfile: "lane-b", agentName: "courier-queue-b", sourceAgent: "courier-queue-b"}},

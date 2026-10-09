@@ -385,6 +385,8 @@ type dispatchBinding struct {
 // resolveDispatchBindings normalizes the single-binding shorthand and repeated
 // bindings. Multiple bindings retain the historical <base>-<queue> default;
 // an explicit third segment lets deployments choose a stable agent identity.
+// A one-binding repeated form leaves SourceAgent empty, preserving the legacy
+// bare source identity just like the shorthand.
 func resolveDispatchBindings(baseAgentName, queueLane, laneProfile string, repeated []string) ([]dispatchBinding, error) {
 	shorthandSet := queueLane != "" || laneProfile != ""
 	if len(repeated) > 0 && shorthandSet {

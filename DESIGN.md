@@ -763,8 +763,10 @@ to the bare adapter). The bare `dispatch` adapter is retained for old runs
 whose `sourceAgent` is empty. Keeping source stable means deterministic run
 names and Kubernetes `Create` remain the atomic dedupe boundary across runners
 and retained runs; Dispatch lease observations are not atomic and do not prevent
-duplicate materialization. The CRD must be installed before an operator that
-writes `sourceAgent` is rolled out.
+duplicate materialization. At rollout, runners also recognize prior
+`dispatch:<queueLane>` runs so retained work is not recreated under the new
+identity. The CRD must be installed before an operator that writes
+`sourceAgent` is rolled out.
 
 ## Commit cadence
 
