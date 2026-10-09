@@ -78,12 +78,13 @@ func (s *admissionSource) Resolve(_ context.Context, item source.WorkItem) error
 func TestSourceRegistryUsesSpecSourceAndDurableWorkItemID(t *testing.T) {
 	first := &admissionSource{}
 	second := &admissionSource{}
-	registry := NewSourceRegistry(map[string]source.Adapter{"first": first, "second": second})
-	if got, err := registry.lookup("first"); err != nil || got != first {
+	registry := NewSourceRegistry(map[string]source.Adapter{"first:worker": first, "second": second})
+	if got, err := registry.lookup("first:worker"); err != nil || got != first {
 		t.Fatalf("lookup(first) = %v, %v; want first adapter", got, err)
 	}
 	run := admissionRun("run", "local", courierv1alpha1.PhasePending)
 	run.Spec.Source = "first"
+	run.Spec.SourceAgent = "worker"
 	run.Spec.WorkItemID = "opaque/source/id"
 	client := phaseClient(t, admissionLane("local", 1), run)
 	reconciler := &CoderRunReconciler{Client: client, Sources: registry, StatusWriter: fakeStatusWriter{client: client}}
@@ -95,6 +96,21 @@ func TestSourceRegistryUsesSpecSourceAndDurableWorkItemID(t *testing.T) {
 	}
 	if len(second.claimed) != 0 {
 		t.Fatalf("wrong adapter claimed work: %#v", second.claimed)
+	}
+}
+
+func TestSourceRegistryQualifiedIdentityFailsClosedAndLegacyRemainsBare(t *testing.T) {
+	legacy := &admissionSource{}
+	qualified := &admissionSource{}
+	registry := NewSourceRegistry(map[string]source.Adapter{"dispatch": legacy, "dispatch:courier-local": qualified})
+	if got, err := registry.lookupRun(&courierv1alpha1.CoderRun{Spec: courierv1alpha1.CoderRunSpec{Source: "dispatch", SourceAgent: "courier-local"}}); err != nil || got != qualified {
+		t.Fatalf("qualified lookup = %v, %v; want qualified adapter", got, err)
+	}
+	if _, err := registry.lookupRun(&courierv1alpha1.CoderRun{Spec: courierv1alpha1.CoderRunSpec{Source: "dispatch", SourceAgent: "missing"}}); !errors.Is(err, ErrUnknownSource) {
+		t.Fatalf("unknown qualified lookup error = %v, want fail-closed unknown source", err)
+	}
+	if got, err := registry.lookupRun(&courierv1alpha1.CoderRun{Spec: courierv1alpha1.CoderRunSpec{Source: "dispatch"}}); err != nil || got != legacy {
+		t.Fatalf("legacy lookup = %v, %v; want bare adapter", got, err)
 	}
 }
 

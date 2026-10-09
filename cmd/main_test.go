@@ -58,12 +58,17 @@ func TestResolveDispatchBindings(t *testing.T) {
 			name:      "shorthand only",
 			queueLane: "queue-a",
 			lane:      "lane-a",
-			want:      []dispatchBinding{{queueLane: "queue-a", laneProfile: "lane-a"}},
+			want:      []dispatchBinding{{queueLane: "queue-a", laneProfile: "lane-a", agentName: "courier"}},
+		},
+		{
+			name:     "single repeated binding preserves bare identity",
+			repeated: []string{"queue-a:lane-a"},
+			want:     []dispatchBinding{{queueLane: "queue-a", laneProfile: "lane-a", agentName: "courier"}},
 		},
 		{
 			name:     "repeated only",
 			repeated: []string{"queue-a:lane-a", "queue-b:lane-b"},
-			want:     []dispatchBinding{{queueLane: "queue-a", laneProfile: "lane-a"}, {queueLane: "queue-b", laneProfile: "lane-b"}},
+			want:     []dispatchBinding{{queueLane: "queue-a", laneProfile: "lane-a", agentName: "courier-queue-a", sourceAgent: "courier-queue-a"}, {queueLane: "queue-b", laneProfile: "lane-b", agentName: "courier-queue-b", sourceAgent: "courier-queue-b"}},
 		},
 		{
 			name:      "shorthand and repeated mix rejected",
@@ -93,19 +98,47 @@ func TestResolveDispatchBindings(t *testing.T) {
 			wantErr:  true,
 		},
 		{
-			name:     "duplicate queue lane rejected",
-			repeated: []string{"queue-a:lane-a", "queue-a:lane-b"},
+			name:     "duplicate queue with explicit agents accepted",
+			repeated: []string{"queue-a:lane-a:courier-local", "queue-a:lane-b:courier-cloud"},
+			want: []dispatchBinding{
+				{queueLane: "queue-a", laneProfile: "lane-a", agentName: "courier-local", sourceAgent: "courier-local"},
+				{queueLane: "queue-a", laneProfile: "lane-b", agentName: "courier-cloud", sourceAgent: "courier-cloud"},
+			},
+		},
+		{
+			name:     "duplicate identity rejected",
+			repeated: []string{"queue-a:lane-a:worker", "queue-b:lane-b:worker"},
 			wantErr:  true,
 		},
 		{
 			name:     "duplicate lane profile accepted",
 			repeated: []string{"queue-a:lane-x", "queue-b:lane-x"},
-			want:     []dispatchBinding{{queueLane: "queue-a", laneProfile: "lane-x"}, {queueLane: "queue-b", laneProfile: "lane-x"}},
+			want:     []dispatchBinding{{queueLane: "queue-a", laneProfile: "lane-x", agentName: "courier-queue-a", sourceAgent: "courier-queue-a"}, {queueLane: "queue-b", laneProfile: "lane-x", agentName: "courier-queue-b", sourceAgent: "courier-queue-b"}},
+		},
+		{
+			name:     "two shared queue bindings and explicit third identity",
+			repeated: []string{"local:local:courier-local", "local:minimax:courier-cloud", "escalated:frontier:courier-frontier"},
+			want: []dispatchBinding{
+				{queueLane: "local", laneProfile: "local", agentName: "courier-local", sourceAgent: "courier-local"},
+				{queueLane: "local", laneProfile: "minimax", agentName: "courier-cloud", sourceAgent: "courier-cloud"},
+				{queueLane: "escalated", laneProfile: "frontier", agentName: "courier-frontier", sourceAgent: "courier-frontier"},
+			},
+		},
+		{
+			// Multi-binding derivation preserves the established distinct identity
+			// default; explicit third segments can instead share a queue safely.
+			name:     "multi-binding derives per-binding agent name",
+			repeated: []string{"local:local", "minimax:minimax", "escalated:frontier"},
+			want: []dispatchBinding{
+				{queueLane: "local", laneProfile: "local", agentName: "courier-local", sourceAgent: "courier-local"},
+				{queueLane: "minimax", laneProfile: "minimax", agentName: "courier-minimax", sourceAgent: "courier-minimax"},
+				{queueLane: "escalated", laneProfile: "frontier", agentName: "courier-escalated", sourceAgent: "courier-escalated"},
+			},
 		},
 		{
 			name:     "whitespace trimmed",
 			repeated: []string{" queue-a : lane-a "},
-			want:     []dispatchBinding{{queueLane: "queue-a", laneProfile: "lane-a"}},
+			want:     []dispatchBinding{{queueLane: "queue-a", laneProfile: "lane-a", agentName: "courier"}},
 		},
 		{
 			name:     "repeated whitespace-only rejected",
@@ -114,7 +147,7 @@ func TestResolveDispatchBindings(t *testing.T) {
 		},
 		{
 			name:     "extra colon in lane profile rejected",
-			repeated: []string{"queue-a:lane:a"},
+			repeated: []string{"queue-a:lane:a:b"},
 			wantErr:  true,
 		},
 		{
@@ -129,7 +162,7 @@ func TestResolveDispatchBindings(t *testing.T) {
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			got, err := resolveDispatchBindings(test.queueLane, test.lane, test.repeated)
+			got, err := resolveDispatchBindings("courier", test.queueLane, test.lane, test.repeated)
 			if test.wantErr {
 				if err == nil {
 					t.Fatalf("resolveDispatchBindings() error = nil, want error")

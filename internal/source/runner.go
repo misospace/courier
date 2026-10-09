@@ -32,6 +32,7 @@ const defaultPollInterval = 30 * time.Second
 // the Courier LaneProfile assigned to every discovered item.
 type RunnerConfig struct {
 	Source       string
+	SourceAgent  string
 	LaneProfile  string
 	Namespace    string
 	PollInterval time.Duration
@@ -145,10 +146,20 @@ func (r *Runner) Poll(ctx context.Context) error {
 		return fmt.Errorf("list CoderRuns: %w", err)
 	}
 	existing := make(map[string]struct{}, len(runs.Items))
+	legacyIdentities := make(map[string]struct{})
 	for i := range runs.Items {
 		run := &runs.Items[i]
-		if run.Spec.Source == r.Config.Source && strings.TrimSpace(run.Spec.WorkItemID) != "" {
-			existing[workKey(run.Spec.Source, r.identity(run.Spec.WorkItemID))] = struct{}{}
+		if strings.TrimSpace(run.Spec.WorkItemID) == "" {
+			continue
+		}
+		identity := r.identity(run.Spec.WorkItemID)
+		if run.Spec.Source == r.Config.Source {
+			existing[workKey(run.Spec.Source, identity)] = struct{}{}
+		}
+		// Previous Dispatch bindings encoded queue lanes in Source. Keep those
+		// retained runs from being rematerialized during the identity rollout.
+		if run.Spec.Source == "dispatch" || strings.HasPrefix(run.Spec.Source, "dispatch:") {
+			legacyIdentities[identity] = struct{}{}
 		}
 	}
 
@@ -160,7 +171,11 @@ func (r *Runner) Poll(ctx context.Context) error {
 		if strings.TrimSpace(item.ID) == "" {
 			continue
 		}
-		key := workKey(r.Config.Source, r.identity(item.ID))
+		itemIdentity := r.identity(item.ID)
+		key := workKey(r.Config.Source, itemIdentity)
+		if _, ok := legacyIdentities[itemIdentity]; ok {
+			continue
+		}
 		if _, ok := existing[key]; ok {
 			continue
 		}
@@ -179,16 +194,17 @@ func (r *Runner) Poll(ctx context.Context) error {
 		run := &courierv1alpha1.CoderRun{
 			ObjectMeta: metav1.ObjectMeta{Namespace: r.Config.Namespace},
 			Spec: courierv1alpha1.CoderRunSpec{
-				Mode:       courierv1alpha1.Mode(spec.Mode),
-				Source:     spec.Source,
-				WorkItemID: spec.WorkItemID,
-				Repo:       spec.Repo,
-				Ref:        spec.Ref,
-				Lane:       spec.Lane,
-				Debug:      spec.Debug,
+				Mode:        courierv1alpha1.Mode(spec.Mode),
+				Source:      spec.Source,
+				SourceAgent: r.Config.SourceAgent,
+				WorkItemID:  spec.WorkItemID,
+				Repo:        spec.Repo,
+				Ref:         spec.Ref,
+				Lane:        spec.Lane,
+				Debug:       spec.Debug,
 			},
 		}
-		run.Name = runName(r.Config.Source, item.ID)
+		run.Name = runName(r.Config.Source, itemIdentity)
 		if err := r.Create(ctx, run); err != nil && !apierrors.IsAlreadyExists(err) {
 			return fmt.Errorf("create CoderRun for %q: %w", item.ID, err)
 		}
