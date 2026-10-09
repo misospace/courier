@@ -251,7 +251,7 @@ func main() {
 			setupLog.Error(fmt.Errorf("dispatch requires base URL and agent name"), "unable to configure Dispatch source")
 			os.Exit(1)
 		}
-		bindings, err := resolveDispatchBindings(dispatchQueueLane, dispatchLane, dispatchLaneBindings)
+		bindings, err := resolveDispatchBindings(dispatchAgentName, dispatchQueueLane, dispatchLane, dispatchLaneBindings)
 		if err != nil {
 			setupLog.Error(err, "unable to configure Dispatch source")
 			os.Exit(1)
@@ -275,31 +275,32 @@ func main() {
 			setupLog.Error(err, "unable to configure Dispatch source: GitHub pull request state lookup is unavailable")
 			os.Exit(1)
 		}
-		// Lifecycle calls are lane-agnostic; per-binding runners do lane-scoped discovery.
-		dispatchClient, err := dispatch.NewClient(dispatchBaseURL, dispatchAgentName, token, dispatchHTTPTimeout)
-		if err != nil {
-			setupLog.Error(err, "unable to configure Dispatch client")
-			os.Exit(1)
-		}
-		dispatchClient.WithPullRequestStateChecker(checker)
-		sources.Register("dispatch", dispatch.New(dispatchClient))
+		// Each binding is a distinct Dispatch source: discovery, claim, settle
+		// and report all use the per-binding agent name so sibling bindings
+		// polling the same lane are excluded by Dispatch's lease check
+		// (other-agent filter). The single-binding shorthand uses the bare
+		// agent name, which preserves the legacy single-agent identity.
 		for _, binding := range bindings {
-			runnerClient, err := dispatch.NewClientWithLane(dispatchBaseURL, dispatchAgentName, binding.queueLane, token, dispatchHTTPTimeout)
+			bindingClient, err := dispatch.NewClientWithLane(dispatchBaseURL, binding.agentName, binding.queueLane, token, dispatchHTTPTimeout)
 			if err != nil {
-				setupLog.Error(err, "unable to configure Dispatch client", "queueLane", binding.queueLane, "laneProfile", binding.laneProfile)
+				setupLog.Error(err, "unable to configure Dispatch client", "queueLane", binding.queueLane, "laneProfile", binding.laneProfile, "agentName", binding.agentName)
 				os.Exit(1)
 			}
-			runnerClient.WithPullRequestStateChecker(checker)
-			runner := source.NewRunner(mgr.GetClient(), dispatch.New(runnerClient), source.RunnerConfig{
-				Source:       "dispatch",
+			bindingClient.WithPullRequestStateChecker(checker)
+			adapter := dispatch.New(bindingClient)
+			sourceName := "dispatch:" + binding.queueLane
+			sources.Register(sourceName, adapter)
+			runner := source.NewRunner(mgr.GetClient(), adapter, source.RunnerConfig{
+				Source:       sourceName,
 				LaneProfile:  binding.laneProfile,
 				Namespace:    namespace,
 				PollInterval: dispatchPollInterval,
 			})
 			if err := mgr.Add(runner); err != nil {
-				setupLog.Error(err, "unable to add Dispatch discovery runner")
+				setupLog.Error(err, "unable to add Dispatch discovery runner", "queueLane", binding.queueLane)
 				os.Exit(1)
 			}
+			setupLog.Info("registered Dispatch binding", "queueLane", binding.queueLane, "laneProfile", binding.laneProfile, "agentName", binding.agentName)
 		}
 	}
 
@@ -362,20 +363,36 @@ func existingPRHeadResolver(observer controller.WorldObserver) controller.Existi
 }
 
 // dispatchBinding pairs one Dispatch queue lane with one Courier LaneProfile.
+// agentName is the per-binding Dispatch identity. It defaults to the global
+// --dispatch-agent-name in single-binding shorthand and is auto-derived per
+// binding as <global>-<queueLane> in the list form, so distinct bindings do
+// not share an agent identity in Dispatch and the lease-exclusion check
+// (`findLeasedIssueIds(agentName).where.agentName != agentName`) actually
+// excludes a worker's own in-flight work from its sibling pollers.
 type dispatchBinding struct {
 	queueLane   string
 	laneProfile string
+	agentName   string
 }
 
 // resolveDispatchBindings normalizes the single-binding shorthand and the
 // repeatable bindings into the final list, rejecting ambiguous input and
-// duplicate queue lanes.
-func resolveDispatchBindings(queueLane, laneProfile string, repeated []string) ([]dispatchBinding, error) {
+// duplicate queue lanes. With more than one binding, per-binding agent
+// names are auto-derived as <base>-<queueLane> so a binding claiming issue
+// #N as agent `courier-local` does not collide with a sibling polling the
+// same lane as `courier`. The single-binding shorthand preserves the legacy
+// bare-name behaviour.
+func resolveDispatchBindings(baseAgentName, queueLane, laneProfile string, repeated []string) ([]dispatchBinding, error) {
 	shorthandSet := queueLane != "" || laneProfile != ""
 	if len(repeated) > 0 && shorthandSet {
 		return nil, fmt.Errorf("dispatch: --dispatch-queue-lane/--dispatch-lane cannot be combined with --dispatch-lane-binding")
 	}
 	bindings := make([]dispatchBinding, 0, 1+len(repeated))
+	// Per-binding agent-name derivation only kicks in when more than one
+	// binding is declared. A single binding keeps the legacy global
+	// identity so existing deploys (which used --dispatch-queue-lane/--dispatch-lane
+	// shorthand) are byte-compatible.
+	derive := len(repeated) > 1
 	if shorthandSet {
 		if strings.TrimSpace(queueLane) == "" || strings.TrimSpace(laneProfile) == "" {
 			return nil, fmt.Errorf("dispatch: both --dispatch-queue-lane and --dispatch-lane are required for a single binding")
@@ -383,6 +400,7 @@ func resolveDispatchBindings(queueLane, laneProfile string, repeated []string) (
 		bindings = append(bindings, dispatchBinding{
 			queueLane:   strings.TrimSpace(queueLane),
 			laneProfile: strings.TrimSpace(laneProfile),
+			agentName:   strings.TrimSpace(baseAgentName),
 		})
 	}
 	seenLanes := make(map[string]struct{}, len(bindings)+len(repeated))
@@ -397,6 +415,11 @@ func resolveDispatchBindings(queueLane, laneProfile string, repeated []string) (
 		binding := dispatchBinding{
 			queueLane:   strings.TrimSpace(parts[0]),
 			laneProfile: strings.TrimSpace(parts[1]),
+		}
+		if derive {
+			binding.agentName = strings.TrimSpace(baseAgentName) + "-" + binding.queueLane
+		} else {
+			binding.agentName = strings.TrimSpace(baseAgentName)
 		}
 		if _, ok := seenLanes[binding.queueLane]; ok {
 			return nil, fmt.Errorf("dispatch: duplicate queue lane %q", binding.queueLane)
