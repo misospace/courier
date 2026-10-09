@@ -283,6 +283,14 @@ spec:
                 x-kubernetes-list-map-keys:
                 - type
                 x-kubernetes-list-type: map
+              failedCheckFingerprint:
+                description: FailedCheckFingerprint is the compact identity (head
+                  plus sorted check names) of the last fully-failed CI observation
+                  while Verifying. A resolve-issue run hands off only when two consecutive
+                  fully-failed observations carry the same fingerprint; a pending
+                  or empty observation clears it, a changed set resets it, and fix-pr
+                  does not use it.
+                type: string
               finishedAt:
                 description: |-
                   FinishedAt is when the run's execution ended (the transition to a
@@ -337,6 +345,7 @@ spec:
                 - Running
                 - Verifying
                 - AwaitingReview
+                - HandedOff
                 - NeedsHuman
                 - Done
                 - Failed

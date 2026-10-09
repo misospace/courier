@@ -442,6 +442,11 @@ func (c *HTTPClient) Report(ctx context.Context, id string, lifecycle source.Lif
 		// existing attempt cap. A separate BLOCKED mark can target a stale
 		// generation after the report advances the queue item.
 		return c.reportTaskWithPR(ctx, d, "failed", lifecycle.Error, lifecycle.PR, lifecycle.IdempotencyKey, lifecycle.Telemetry, lifecycle.StartedAt)
+	case source.ResultHandedOff:
+		// This is truthful, non-parking evidence; Dispatch discovers red checks
+		// through its own PR-followup sync. It must not be Ready (green) or
+		// BLOCKED (which parks the issue).
+		return c.reportTaskWithPR(ctx, d, "handed-off", lifecycle.Error, lifecycle.PR, lifecycle.IdempotencyKey, lifecycle.Telemetry, lifecycle.StartedAt)
 	default:
 		return nil
 	}

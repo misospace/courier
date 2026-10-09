@@ -652,13 +652,19 @@ func (r *CoderRunReconciler) observeVerifying(ctx context.Context, run *courierv
 		// resolve-issue observers alive so this run can carry the original issue
 		// to review after the PR is repaired by a later run.
 		if run.Spec.Mode != courierv1alpha1.ModeFixPR {
+			fingerprint := checkSetFingerprint(observation)
+			settled := fingerprint != "" && fingerprint == run.Status.FailedCheckFingerprint
 			before := run.DeepCopy()
 			if pr != "" {
 				run.Status.PR = pr
 			}
 			run.Status.CheckFingerprint = ""
+			run.Status.FailedCheckFingerprint = fingerprint
 			if err := r.patchStatus(ctx, before, run); err != nil {
 				return ctrl.Result{}, err
+			}
+			if settled {
+				return r.transitionTerminal(ctx, run, courierv1alpha1.PhaseHandedOff, pr, terminalLifecycleIntent{}, nil)
 			}
 			return ctrl.Result{RequeueAfter: observationRequeueDelay}, nil
 		}
@@ -673,8 +679,9 @@ func (r *CoderRunReconciler) observeVerifying(ctx context.Context, run *courierv
 	// observations of the same check set. A pending or empty observation
 	// clears the candidate, because checks that have not registered yet can
 	// still appear at any later poll; a changed identity resets it the same
-	// way. A real failure is recognized immediately and skips the settle; it
-	// needs no second observation.
+	// way. A fix-pr red observation is recognized immediately and skips the
+	// green settle; a resolve-issue red observation waits for a second
+	// consecutive identical fully-failed observation before handing off.
 	fingerprint := ""
 	if state == observationPassed {
 		fingerprint = checkSetFingerprint(observation)
@@ -685,6 +692,7 @@ func (r *CoderRunReconciler) observeVerifying(ctx context.Context, run *courierv
 		run.Status.PR = pr
 	}
 	run.Status.CheckFingerprint = fingerprint
+	run.Status.FailedCheckFingerprint = ""
 	if err := r.patchStatus(ctx, before, run); err != nil {
 		return ctrl.Result{}, err
 	}
@@ -904,7 +912,7 @@ func (r *CoderRunReconciler) markLifecycleReported(ctx context.Context, run *cou
 // through another path, or that predate this condition, are not pending.
 func lifecycleReportPending(run *courierv1alpha1.CoderRun) bool {
 	switch run.Status.Phase {
-	case courierv1alpha1.PhaseAwaitingReview, courierv1alpha1.PhaseNeedsHuman, courierv1alpha1.PhaseFailed:
+	case courierv1alpha1.PhaseAwaitingReview, courierv1alpha1.PhaseHandedOff, courierv1alpha1.PhaseNeedsHuman, courierv1alpha1.PhaseFailed:
 	default:
 		return false
 	}
@@ -963,6 +971,9 @@ func lifecycleForPhase(phase courierv1alpha1.Phase, state source.State, pr strin
 			lifecycle.Result = source.ResultBlocked
 			lifecycle.Error = "coordinator failed"
 		}
+	case courierv1alpha1.PhaseHandedOff:
+		lifecycle.Result = source.ResultHandedOff
+		lifecycle.Error = externalVerificationFailureReason
 	case courierv1alpha1.PhaseNeedsHuman:
 		lifecycle.Result = source.ResultBlocked
 		lifecycle.Error = intent.error
@@ -1020,6 +1031,10 @@ func (r *CoderRunReconciler) patchStatus(ctx context.Context, before, after *cou
 	if before.Status.CheckFingerprint != after.Status.CheckFingerprint {
 		fingerprint := after.Status.CheckFingerprint
 		fields.CheckFingerprint = &fingerprint
+	}
+	if before.Status.FailedCheckFingerprint != after.Status.FailedCheckFingerprint {
+		fingerprint := after.Status.FailedCheckFingerprint
+		fields.FailedCheckFingerprint = &fingerprint
 	}
 	if before.Status.Restarts != after.Status.Restarts {
 		restarts := after.Status.Restarts
