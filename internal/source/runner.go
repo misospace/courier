@@ -158,7 +158,7 @@ func (r *Runner) Poll(ctx context.Context) error {
 		}
 		// Previous Dispatch bindings encoded queue lanes in Source. Keep those
 		// retained runs from being rematerialized during the identity rollout.
-		if r.Config.Source == "dispatch" && (run.Spec.Source == "dispatch" || strings.HasPrefix(run.Spec.Source, "dispatch:")) {
+		if run.Spec.Source == "dispatch" || strings.HasPrefix(run.Spec.Source, "dispatch:") {
 			legacyIdentities[identity] = struct{}{}
 		}
 	}

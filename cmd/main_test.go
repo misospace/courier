@@ -111,6 +111,15 @@ func TestResolveDispatchBindings(t *testing.T) {
 			want:     []dispatchBinding{{queueLane: "queue-a", laneProfile: "lane-x", agentName: "courier-queue-a", sourceAgent: "courier-queue-a"}, {queueLane: "queue-b", laneProfile: "lane-x", agentName: "courier-queue-b", sourceAgent: "courier-queue-b"}},
 		},
 		{
+			name:     "two shared queue bindings and explicit third identity",
+			repeated: []string{"local:local:courier-local", "local:minimax:courier-cloud", "escalated:frontier:courier-frontier"},
+			want: []dispatchBinding{
+				{queueLane: "local", laneProfile: "local", agentName: "courier-local", sourceAgent: "courier-local"},
+				{queueLane: "local", laneProfile: "minimax", agentName: "courier-cloud", sourceAgent: "courier-cloud"},
+				{queueLane: "escalated", laneProfile: "frontier", agentName: "courier-frontier", sourceAgent: "courier-frontier"},
+			},
+		},
+		{
 			// Multi-binding derivation preserves the established distinct identity
 			// default; explicit third segments can instead share a queue safely.
 			name:     "multi-binding derives per-binding agent name",
