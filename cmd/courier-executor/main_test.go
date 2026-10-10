@@ -3089,3 +3089,316 @@ printf '{"sessionID":"ses_exec","part":{"type":"tool","tool":"task","state":{"st
 		t.Fatalf("termination line missing the compact telemetry: %q", terminationLine)
 	}
 }
+
+// TestRunResolveIssuePublishedPRWithVagueBodyNeedsHuman exercises the legacy
+// handoff's authoritative-linkage check (#248) on a published PR whose body
+// uses the original-dogfood's vague "Addresses" form. The model declared
+// changes; the live PR body disagrees with the trusted source identity, so
+// the run ends as NeedsHuman with the precise rejection and a changes
+// outcome tag. A forge read failure is not a run failure, so the
+// continuation path stays scoped to a real body mismatch.
+func TestRunResolveIssuePublishedPRWithVagueBodyNeedsHuman(t *testing.T) {
+	root := t.TempDir()
+	remote := filepath.Join(root, "remote.git")
+	source := filepath.Join(root, "source")
+	runGit(t, root, "init", "--bare", remote)
+	runGit(t, root, "init", source)
+	configureGit(t, source)
+	write(t, filepath.Join(source, "README.md"), "base\n")
+	commit(t, source, "base: initial")
+	runGit(t, source, "branch", "-M", "main")
+	runGit(t, source, "remote", "add", "origin", remote)
+	runGit(t, source, "push", "-u", "origin", "main")
+
+	fakeOpenCode := filepath.Join(root, "opencode")
+	scratchDirectory := filepath.Join(root, "scratch")
+	writeExecutable(t, fakeOpenCode, "#!/bin/sh\ncase \"$1\" in mcp) exit 0;; esac\nprintf 'completed\\n' > completed.txt\ngit add --all -- .\ngit commit -m 'test: completed work' >/dev/null\nmkdir -p \"$COURIER_SCRATCH_DIR\"\nprintf '{\"outcome\":\"changes\"}' > \"$COURIER_SCRATCH_DIR/outcome.json\"\nexit 0\n")
+
+	prServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Match either the /pulls (head query) or /pulls/{n} (post-create read).
+		if strings.HasSuffix(r.URL.Path, "/pulls") && r.URL.RawQuery != "" {
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = io.WriteString(w, `[{"number":12,"state":"open","head":{"ref":"courier/resolve-issue/acme-widgets/7","sha":"deadbeef"},"body":"Addresses #7. Just bundling changes."}]`)
+			return
+		}
+		w.WriteHeader(http.StatusNotFound)
+	}))
+	defer prServer.Close()
+
+	workspace := filepath.Join(root, "workspace")
+	if err := os.MkdirAll(scratchDirectory, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	termination := filepath.Join(root, "termination")
+	t.Setenv("COURIER_REPO_URL", remote)
+	t.Setenv("COURIER_WORKSPACE", workspace)
+	t.Setenv("COURIER_SCRATCH_DIR", scratchDirectory)
+	t.Setenv("COURIER_BASE", "main")
+	t.Setenv("COURIER_BRANCH", "courier/resolve-issue/acme-widgets/7")
+	t.Setenv("COURIER_GOAL", "Open a PR to address issue #7. Declare the outcome at "+filepath.Join(defaultScratchDirectory, defaultOutcomeFilename)+".")
+	t.Setenv("COURIER_MODEL", "any-model/name")
+	t.Setenv("COURIER_MODE", "resolve-issue")
+	t.Setenv("COURIER_REPO", "acme/widgets")
+	t.Setenv("COURIER_REF", "7")
+	t.Setenv("COURIER_GITHUB_API_BASE", prServer.URL)
+	t.Setenv("COURIER_OPENCODE_BINARY", fakeOpenCode)
+	t.Setenv("COURIER_TERMINATION_FILE", termination)
+	t.Setenv("COURIER_RESUME_BACKOFF_SECONDS", "0")
+	t.Setenv("COURIER_RUN_NAME", "coderrun-linkage-needs-human")
+
+	var output bytes.Buffer
+	var errorsOut bytes.Buffer
+	code := run(context.Background(), &output, &errorsOut)
+	if code != exitNeedsHuman {
+		t.Fatalf("run exit code = %d, want %d (NeedsHuman); stderr=%q stdout=%q", code, exitNeedsHuman, errorsOut.String(), output.String())
+	}
+	if !strings.Contains(output.String(), `"phase":"NeedsHuman"`) {
+		t.Fatalf("missing NeedsHuman termination: %q", output.String())
+	}
+	// The reason must name the precise failure mode so a human can
+	// settle the run. The trusted source identity is part of the
+	// reason; the body's vague form ("Addresses #7") is reported
+	// as a rejected closing reference even when the validator did
+	// not find a supported keyword, so the test asserts the
+	// expected source identity and the linkage failure marker.
+	if !strings.Contains(output.String(), "acme/widgets#7") {
+		t.Fatalf("NeedsHuman reason should name the trusted source identity: %q", output.String())
+	}
+	if !strings.Contains(output.String(), "trusted source-issue linkage") {
+		t.Fatalf("NeedsHuman reason should describe the linkage failure: %q", output.String())
+	}
+}
+
+// TestRunResolveIssuePublishedPRWithCorrectLinkageVerifying proves the
+// positive path: a body that names the trusted source issue with a
+// supported closing keyword passes the legacy linkage check and the run
+// ends as Verifying.
+func TestRunResolveIssuePublishedPRWithCorrectLinkageVerifying(t *testing.T) {
+	root := t.TempDir()
+	remote := filepath.Join(root, "remote.git")
+	source := filepath.Join(root, "source")
+	runGit(t, root, "init", "--bare", remote)
+	runGit(t, root, "init", source)
+	configureGit(t, source)
+	write(t, filepath.Join(source, "README.md"), "base\n")
+	commit(t, source, "base: initial")
+	runGit(t, source, "branch", "-M", "main")
+	runGit(t, source, "remote", "add", "origin", remote)
+	runGit(t, source, "push", "-u", "origin", "main")
+
+	fakeOpenCode := filepath.Join(root, "opencode")
+	scratchDirectory := filepath.Join(root, "scratch")
+	writeExecutable(t, fakeOpenCode, "#!/bin/sh\ncase \"$1\" in mcp) exit 0;; esac\nprintf 'completed\\n' > completed.txt\ngit add --all -- .\ngit commit -m 'test: completed work' >/dev/null\nmkdir -p \"$COURIER_SCRATCH_DIR\"\nprintf '{\"outcome\":\"changes\"}' > \"$COURIER_SCRATCH_DIR/outcome.json\"\nexit 0\n")
+
+	prServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasSuffix(r.URL.Path, "/pulls") && r.URL.RawQuery != "" {
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = io.WriteString(w, `[{"number":12,"state":"open","head":{"ref":"courier/resolve-issue/acme-widgets/7","sha":"deadbeef"},"body":"Closes #7. This PR resolves the icon assets gap."}]`)
+			return
+		}
+		w.WriteHeader(http.StatusNotFound)
+	}))
+	defer prServer.Close()
+
+	workspace := filepath.Join(root, "workspace")
+	if err := os.MkdirAll(scratchDirectory, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	termination := filepath.Join(root, "termination")
+	t.Setenv("COURIER_REPO_URL", remote)
+	t.Setenv("COURIER_WORKSPACE", workspace)
+	t.Setenv("COURIER_SCRATCH_DIR", scratchDirectory)
+	t.Setenv("COURIER_BASE", "main")
+	t.Setenv("COURIER_BRANCH", "courier/resolve-issue/acme-widgets/7")
+	t.Setenv("COURIER_GOAL", "Open a PR to address issue #7. Declare the outcome at "+filepath.Join(defaultScratchDirectory, defaultOutcomeFilename)+".")
+	t.Setenv("COURIER_MODEL", "any-model/name")
+	t.Setenv("COURIER_MODE", "resolve-issue")
+	t.Setenv("COURIER_REPO", "acme/widgets")
+	t.Setenv("COURIER_REF", "7")
+	t.Setenv("COURIER_GITHUB_API_BASE", prServer.URL)
+	t.Setenv("COURIER_OPENCODE_BINARY", fakeOpenCode)
+	t.Setenv("COURIER_TERMINATION_FILE", termination)
+	t.Setenv("COURIER_RESUME_BACKOFF_SECONDS", "0")
+	t.Setenv("COURIER_RUN_NAME", "coderrun-pos")
+
+	var output bytes.Buffer
+	var errorsOut bytes.Buffer
+	code := run(context.Background(), &output, &errorsOut)
+	if code != exitSuccess {
+		t.Fatalf("run exit code = %d, want 0; stderr=%q stdout=%q", code, errorsOut.String(), output.String())
+	}
+	if !strings.Contains(output.String(), `"phase":"Verifying"`) {
+		t.Fatalf("missing Verifying termination: %q", output.String())
+	}
+	if !strings.Contains(output.String(), `"outcome":"changes"`) {
+		t.Fatalf("Verifying termination should carry the declared changes outcome: %q", output.String())
+	}
+	if strings.Contains(output.String(), "linkage-repair") || strings.Contains(output.String(), "NeedsHuman") {
+		t.Fatalf("correct linkage should not surface any linkage note: %q", output.String())
+	}
+}
+
+// TestRunResolveIssueUndeclaredVerifyingTriggersLinkageRepair exercises
+// the undeclared-Verifying path's continuation. The model finishes
+// without writing an outcome declaration; the legacy executor sees
+// committed work, looks up the live PR, finds a body with the wrong
+// source-issue number, and feeds a precise repair message to the
+// captured session under the bounded continuation budget.
+func TestRunResolveIssueUndeclaredVerifyingTriggersLinkageRepair(t *testing.T) {
+	root := t.TempDir()
+	remote := filepath.Join(root, "remote.git")
+	source := filepath.Join(root, "source")
+	runGit(t, root, "init", "--bare", remote)
+	runGit(t, root, "init", source)
+	configureGit(t, source)
+	write(t, filepath.Join(source, "README.md"), "base\n")
+	commit(t, source, "base: initial")
+	runGit(t, source, "branch", "-M", "main")
+	runGit(t, source, "remote", "add", "origin", remote)
+	runGit(t, source, "push", "-u", "origin", "main")
+
+	stateDir := filepath.Join(root, "fakestate")
+	if err := os.MkdirAll(stateDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	// A two-turn script: the first turn emits a session ID and a
+	// "not done yet" text, so the executor offers a continuation.
+	// The second turn declares changes, so the run ends as
+	// Verifying if the body is fixed; otherwise the linkage check
+	// keeps firing until the budget is exhausted. We arrange the
+	// body to remain wrong across both turns so the run ends as
+	// NeedsHuman — this proves the undeclared path applies the
+	// same linkage contract as the declared path.
+	fakeOpenCode := filepath.Join(root, "opencode")
+	scratchDirectory := filepath.Join(root, "scratch")
+	if err := os.MkdirAll(scratchDirectory, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	argvLog := filepath.Join(stateDir, "argv.log")
+	writeExecutable(t, fakeOpenCode, "#!/bin/sh\ncase \"$1\" in mcp) exit 0;; esac\necho \"$*\" >> \""+argvLog+"\"\n# Reuse the resume session id so a captured session exists.\necho '{\"sessionID\":\"ses_linkage\"}'\nprintf 'not done yet\\n'\nprintf 'completed\\n' > completed.txt\ngit add --all -- .\ngit commit -m 'test: completed work' >/dev/null\n# Never declare an outcome; the legacy path must keep the run\n# on the undeclared-Verifying track and the linkage check must\n# keep firing.\nexit 0\n")
+
+	prServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasSuffix(r.URL.Path, "/pulls") && r.URL.RawQuery != "" {
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = io.WriteString(w, `[{"number":12,"state":"open","head":{"ref":"courier/resolve-issue/acme-widgets/7","sha":"deadbeef"},"body":"Closes #999. Wrong issue number."}]`)
+			return
+		}
+		w.WriteHeader(http.StatusNotFound)
+	}))
+	defer prServer.Close()
+
+	workspace := filepath.Join(root, "workspace")
+	termination := filepath.Join(root, "termination")
+	t.Setenv("COURIER_REPO_URL", remote)
+	t.Setenv("COURIER_WORKSPACE", workspace)
+	t.Setenv("COURIER_SCRATCH_DIR", scratchDirectory)
+	t.Setenv("COURIER_BASE", "main")
+	t.Setenv("COURIER_BRANCH", "courier/resolve-issue/acme-widgets/7")
+	t.Setenv("COURIER_GOAL", "Open a PR to address issue #7. Declare the outcome at "+filepath.Join(defaultScratchDirectory, defaultOutcomeFilename)+".")
+	t.Setenv("COURIER_MODEL", "any-model/name")
+	t.Setenv("COURIER_MODE", "resolve-issue")
+	t.Setenv("COURIER_REPO", "acme/widgets")
+	t.Setenv("COURIER_REF", "7")
+	t.Setenv("COURIER_GITHUB_API_BASE", prServer.URL)
+	t.Setenv("COURIER_OPENCODE_BINARY", fakeOpenCode)
+	t.Setenv("COURIER_TERMINATION_FILE", termination)
+	t.Setenv("COURIER_RESUME_BACKOFF_SECONDS", "0")
+	t.Setenv("COURIER_MAX_CONTINUATIONS", "2")
+	t.Setenv("COURIER_FAKE_STATE", stateDir)
+	t.Setenv("COURIER_RUN_NAME", "coderrun-linkage-7")
+	t.Setenv("COURIER_LOG_LEVEL", "debug")
+
+	var output bytes.Buffer
+	var errorsOut bytes.Buffer
+	code := run(context.Background(), &output, &errorsOut)
+	if code != exitNeedsHuman {
+		t.Fatalf("run exit code = %d, want %d (NeedsHuman after exhausting linkage repair budget); stderr=%q stdout=%q", code, exitNeedsHuman, errorsOut.String(), output.String())
+	}
+	// The undeclared path's repair flow must have run at least
+	// one linkage-repair continuation before the budget is
+	// exhausted. The instruction is logged as the verbose
+	// continuation detail so the operator can audit what the
+	// model was told to fix.
+	if !strings.Contains(output.String(), `"kind":"linkage-repair"`) {
+		t.Fatalf("expected a linkage-repair continuation in the event log: %q", output.String())
+	}
+	if !strings.Contains(output.String(), "acme/widgets#7") {
+		t.Fatalf("repair message should name the trusted source identity: %q", output.String())
+	}
+	if !strings.Contains(output.String(), `"pr":12`) {
+		t.Fatalf("repair message should name the existing PR number: %q", output.String())
+	}
+	// The repair message must name the supported closing keywords
+	// and the trusted source identity so the model can repair the
+	// body without re-deriving the contract.
+	if !strings.Contains(output.String(), "Closes") || !strings.Contains(output.String(), "Fixes") {
+		t.Fatalf("repair message should name the supported closing keywords: %q", output.String())
+	}
+}
+
+// TestRunResolveIssueLinkageReadFailureIsNonFatal proves the executor
+// does not fail the run when the GitHub API is unreachable. The world
+// is the source of truth; a transient forge read failure is logged
+// and the run proceeds to its ordinary Verifying handoff.
+func TestRunResolveIssueLinkageReadFailureIsNonFatal(t *testing.T) {
+	root := t.TempDir()
+	remote := filepath.Join(root, "remote.git")
+	source := filepath.Join(root, "source")
+	runGit(t, root, "init", "--bare", remote)
+	runGit(t, root, "init", source)
+	configureGit(t, source)
+	write(t, filepath.Join(source, "README.md"), "base\n")
+	commit(t, source, "base: initial")
+	runGit(t, source, "branch", "-M", "main")
+	runGit(t, source, "remote", "add", "origin", remote)
+	runGit(t, source, "push", "-u", "origin", "main")
+
+	fakeOpenCode := filepath.Join(root, "opencode")
+	scratchDirectory := filepath.Join(root, "scratch")
+	if err := os.MkdirAll(scratchDirectory, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	writeExecutable(t, fakeOpenCode, "#!/bin/sh\ncase \"$1\" in mcp) exit 0;; esac\nprintf 'completed\\n' > completed.txt\ngit add --all -- .\ngit commit -m 'test: completed work' >/dev/null\nmkdir -p \"$COURIER_SCRATCH_DIR\"\nprintf '{\"outcome\":\"changes\"}' > \"$COURIER_SCRATCH_DIR/outcome.json\"\nexit 0\n")
+
+	// A GitHub server that always 500s: a transient forge outage
+	// must not fail the run; the executor must log the read
+	// failure and proceed to Verifying.
+	prServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	defer prServer.Close()
+
+	workspace := filepath.Join(root, "workspace")
+	termination := filepath.Join(root, "termination")
+	t.Setenv("COURIER_REPO_URL", remote)
+	t.Setenv("COURIER_WORKSPACE", workspace)
+	t.Setenv("COURIER_SCRATCH_DIR", scratchDirectory)
+	t.Setenv("COURIER_BASE", "main")
+	t.Setenv("COURIER_BRANCH", "courier/resolve-issue/acme-widgets/7")
+	t.Setenv("COURIER_GOAL", "Open a PR to address issue #7. Declare the outcome at "+filepath.Join(defaultScratchDirectory, defaultOutcomeFilename)+".")
+	t.Setenv("COURIER_MODEL", "any-model/name")
+	t.Setenv("COURIER_MODE", "resolve-issue")
+	t.Setenv("COURIER_REPO", "acme/widgets")
+	t.Setenv("COURIER_REF", "7")
+	t.Setenv("COURIER_GITHUB_API_BASE", prServer.URL)
+	t.Setenv("COURIER_OPENCODE_BINARY", fakeOpenCode)
+	t.Setenv("COURIER_TERMINATION_FILE", termination)
+	t.Setenv("COURIER_RESUME_BACKOFF_SECONDS", "0")
+	t.Setenv("COURIER_RUN_NAME", "coderrun-linkage-read-error")
+
+	var output bytes.Buffer
+	var errorsOut bytes.Buffer
+	code := run(context.Background(), &output, &errorsOut)
+	if code != exitSuccess {
+		t.Fatalf("run exit code = %d, want 0; stderr=%q stdout=%q", code, errorsOut.String(), output.String())
+	}
+	if !strings.Contains(output.String(), `"phase":"Verifying"`) {
+		t.Fatalf("expected Verifying handoff on forge read failure: %q", output.String())
+	}
+	if !strings.Contains(output.String(), `"linkage.read.failed"`) {
+		t.Fatalf("expected the linkage read failure to be logged: %q", output.String())
+	}
+	if !strings.Contains(output.String(), "500") {
+		t.Fatalf("expected the linkage read failure detail to name the forge error: %q", output.String())
+	}
+}

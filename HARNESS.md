@@ -398,6 +398,70 @@ raw REST, or generic MCP passthrough. Forge credentials stay in the broker.
 Model-originated intent is not authorization: the trusted control API validates
 each operation against the run's resolved policy before the broker acts.
 
+### Authoritative source-issue linkage (#248)
+
+Both active publication paths enforce one shared, machine-readable source-issue
+linkage contract: the PR body must carry a closing-keyword reference to the
+trusted source issue, never a vague "Addresses" or substring match, and a
+model cannot pick a different issue than the operator admitted. The native
+broker validates linkage before `CreatePullRequest`; the legacy executor
+validates the live PR body before claiming a successful handoff. The
+validator is a single pure function in `internal/broker/linkage.go` with a
+test table both paths consume; the table is the source of truth, and the
+paths share acceptance, not implementation.
+
+- **Trusted identity.** The broker binding resolves
+  `Policy.SourceIssue{Owner, Name, Number}` from the immutable
+  `CoderRun` spec at admission (`spec.Repo` is the canonical source
+  repository; `spec.Ref` is the issue number). The legacy executor
+  derives the same identity from `COURIER_REPO` and `COURIER_REF`. A
+  model cannot influence either value.
+- **Accepted closing keywords.** GitHub's documented set —
+  `close`, `closes`, `closed`, `fix`, `fixes`, `fixed`, `resolve`,
+  `resolves`, `resolved` — matched as a word-bounded token. The bare
+  form is `Closes #<N>`; the cross-repo form is
+  `Closes <owner>/<name>#<N>` and is accepted only when the
+  cross-repo owner/name matches the trusted identity.
+- **Rejected forms.** `Addresses`, `See also`, `Refs`, `Part of`, and
+  any other non-keyword reference. Substring matches (e.g. `discloses`,
+  `closer`) are not closing references: a leading and trailing
+  word boundary is the only thing that protects against them. An
+  ambiguous body with multiple closing references that disagree is
+  also rejected; the model cannot silence a correct reference with
+  an incorrect sibling.
+- **Native path.** `PolicyEngine.CreatePullRequest` runs the
+  validator under the engine lock, before the observer's
+  `CreatePullRequest` is reached. A model that names a wrong
+  issue, a wrong repository, an ambiguous body, or no supported
+  closing keyword never gets to create a PR; the engine returns
+  the structured `*LinkageError` so the caller (and the
+  observability surface) can see the precise mismatch.
+- **Legacy path.** Before the `Verifying` handoff — declared or
+  undeclared — the executor reads the live PR for the run branch
+  through the GitHub `PullRequestsForHead` call (the same forge
+  capability every other legacy forge read uses; never a
+  forge-specific CLI). On a missing or unreadable PR the check
+  is best-effort: a forge read failure is logged as a verbose
+  `linkage.read.failed` event and the run proceeds, because the
+  world is the source of truth and the operator re-reads the PR.
+  On a published PR with a body that disagrees with the trusted
+  identity, the declared `changes` path refuses the handoff as
+  `NeedsHuman` with the precise rejection; the undeclared path
+  asks the captured OpenCode session to repair the body or open
+  the PR under the bounded continuation budget (#170) and only
+  escalates to `NeedsHuman` when the budget is exhausted. The
+  repair instruction names the trusted identity, the supported
+  closing keywords, the bare and cross-repo forms, and the
+  existing PR number so the model can fix the body
+  deterministically rather than re-derive the requirement.
+- **Shared truth table.** `internal/broker/linkage_test.go`
+  covers the accepted keyword vocabulary, vague and substring
+  rejections, the wrong-number and wrong-repository failure
+  modes, the cross-repo form, redundant cross-repo references,
+  and ambiguous multiple references. The legacy executor's
+  repair-message tests assert the same vocabulary, so a
+  regression in the validator fails both paths simultaneously.
+
 ### Git policy and publication (#118)
 
 The operator owns one immutable, run-UID-bound publication policy. It resolves

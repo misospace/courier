@@ -87,7 +87,7 @@ func TestForgeAdapterResolveCreateAndVerifyPullRequest(t *testing.T) {
 	base := forge.Repository{ID: "1", Canonical: "org/repo", DefaultRef: "main"}
 	work := forge.Repository{ID: "1", Canonical: "org/repo", DefaultRef: "main"}
 	provider := &adapterForge{cfg: forge.ProviderConfig{Name: "test"}}
-	policy := Policy{RunUID: "uid", Mode: ModeResolveIssue, Provider: "test", BaseRepo: base.Canonical, BaseRef: "main", BaseOID: "base-oid", WorkRepo: work.Canonical, WorkRef: "courier/issue-1", WorkInitiallyAbsent: false, WorkAnchorOID: "work-oid"}
+	policy := Policy{RunUID: "uid", Mode: ModeResolveIssue, Provider: "test", BaseRepo: base.Canonical, BaseRef: "main", BaseOID: "base-oid", WorkRepo: work.Canonical, WorkRef: "courier/issue-1", WorkInitiallyAbsent: false, WorkAnchorOID: "work-oid", SourceIssue: SourceIssue{Owner: "org", Name: "repo", Number: 1}}
 	repos := adapterRepos{repos: map[string]forge.Repository{base.Canonical: base}}
 	adapter, err := NewForgeAdapter(policy, provider, repos, base, work)
 	if err != nil {
@@ -97,7 +97,7 @@ func TestForgeAdapterResolveCreateAndVerifyPullRequest(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	created, err := engine.CreatePullRequest(ctx, "work-oid", "title", "body", false)
+	created, err := engine.CreatePullRequest(ctx, "work-oid", "title", "Closes org/repo#1", false)
 	if err != nil {
 		t.Fatalf("CreatePullRequest: %v", err)
 	}

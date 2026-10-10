@@ -1349,6 +1349,25 @@ named items remain unresolved and must not be described as production-ready:
 
 ## Decisions
 
+- **2026-10-10 — #248: authoritative source-issue linkage is enforced in
+  both publication paths against one shared behavioral truth table.**
+  Resolved-issue PR bodies must carry a supported closing-keyword
+  reference to the trusted source issue, never a vague "Addresses" or
+  substring match, and a model cannot pick a different issue than the
+  operator admitted. The native broker validates the body before
+  `CreatePullRequest` runs; the legacy executor validates the live PR
+  body before claiming a successful handoff and asks the captured
+  OpenCode session to repair the body or open the PR under the
+  bounded continuation budget, escalating to `NeedsHuman` only when
+  the budget is exhausted. Both paths consume the same pure
+  `ValidateLinkage` function in `internal/broker/linkage.go`; the
+  test table there is the source of truth, and divergent accepted
+  linkage rules between paths would be a correctness regression. The
+  trusted source identity is resolved at admission from the
+  immutable `CoderRun` spec (broker) or from `COURIER_REPO` and
+  `COURIER_REF` (executor) — never from a model input. (#248, #204,
+  #126)
+
 - **2026-10-09 — #238: operator soft-stop is one broker-mediated control
   request with a checkpoint-safe stop boundary.** One channel — annotation
   ingress translated by the operator into a fenced status record and served by

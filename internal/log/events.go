@@ -77,6 +77,12 @@ const (
 	// outcome posts (#169). A failed comment is an error event, never a run
 	// failure.
 	EventOutcomeComment = "outcome.comment"
+	// EventLinkageReadFailed reports a forge read failure during the legacy
+	// executor's authoritative-linkage check (#248). The check is
+	// best-effort: a transient forge read failure is logged and the run
+	// proceeds to its ordinary handoff. The event is verbose so the
+	// reason rides every non-debug run.
+	EventLinkageReadFailed = "linkage.read.failed"
 	// EventRunSummary reports the compact per-run telemetry tallied from the
 	// coordinator's OpenCode event stream (#172), emitted next to the terminal
 	// handoff. Its detail is always included (Verbose) so the summary reaches

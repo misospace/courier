@@ -30,6 +30,14 @@ type Policy struct {
 	WorkAnchorOID       string
 	PRNumber            int
 	HeadAnchorOID       string
+	// SourceIssue is the trusted source-side issue identity for
+	// resolve-issue runs. It is resolved at admission from the
+	// immutable CoderRun spec, never from a model input, and the
+	// engine refuses a resolve-issue create whose PR body does not
+	// carry a closing reference to this exact identity. fix-pr
+	// runs leave it zero because the existing PR's identity is
+	// already pinned through PRNumber and HeadAnchorOID.
+	SourceIssue SourceIssue
 }
 
 // RepositoryState is a complete live observation. Unknown protection or write
@@ -145,6 +153,20 @@ func validatePolicy(p Policy) error {
 	case ModeResolveIssue:
 		if p.PRNumber != 0 || p.HeadAnchorOID != "" || (!p.WorkInitiallyAbsent && p.WorkAnchorOID == "") {
 			return errors.New("publication policy: invalid resolve-issue anchors")
+		}
+		// A resolve-issue create must enforce authoritative
+		// source-issue linkage. Without SourceIssue the engine
+		// cannot prove the PR body references the same issue the
+		// operator admitted; admission refusing to set it is a
+		// configuration error, not a model-error recovery path.
+		if p.SourceIssue.IsZero() {
+			return errors.New("publication policy: resolve-issue requires a trusted source-issue identity for PR linkage")
+		}
+		if p.SourceIssue.Number <= 0 {
+			return errors.New("publication policy: resolve-issue source-issue number must be positive")
+		}
+		if p.SourceIssue.Canonical() != p.BaseRepo {
+			return fmt.Errorf("publication policy: resolve-issue source-issue repository %q does not match base repository %q", p.SourceIssue.Canonical(), p.BaseRepo)
 		}
 	case ModeFixPR:
 		if p.PRNumber <= 0 || p.HeadAnchorOID == "" || p.WorkInitiallyAbsent || p.WorkAnchorOID != p.HeadAnchorOID {
@@ -360,12 +382,23 @@ func (e *PolicyEngine) checkPR(pr *PullRequestState, workOID, trustedTip string)
 
 // CreatePullRequest is resolve-issue-only and adopts no existing head, including
 // a same-name fork PR. The returned PR is re-read and fully verified.
+//
+// The body must carry a closing-keyword reference to the trusted source issue
+// (validatePolicy rejects a policy with an unset SourceIssue for resolve-issue
+// runs). The check runs before the forge write so a model that picks the wrong
+// issue number, a different repository, or no closing reference at all never
+// gets to create a PR. Both the cross-repo form ("Closes owner/repo#N") and
+// the bare form ("Closes #N") are accepted when the trusted source identity
+// matches.
 func (e *PolicyEngine) CreatePullRequest(ctx context.Context, oid, title, body string, draft bool) (PullRequestState, error) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	p := e.policy
 	if p.Mode != ModeResolveIssue {
 		return PullRequestState{}, errors.New("publication denied: fix-pr cannot create or retarget a pull request")
+	}
+	if err := ValidateLinkage(body, p.SourceIssue); err != nil {
+		return PullRequestState{}, fmt.Errorf("publication denied: %w", err)
 	}
 	base, work, _, err := e.observe(ctx)
 	if err != nil {
