@@ -82,6 +82,7 @@ func goodPolicy(mode Mode) Policy {
 	p := Policy{RunUID: "uid-1", Mode: mode, Provider: "gh", BaseRepo: "org/repo", BaseRef: "main", BaseOID: "base1", WorkRepo: "org/repo", WorkRef: "courier/work", WorkAnchorOID: "old"}
 	if mode == ModeResolveIssue {
 		p.WorkInitiallyAbsent = false
+		p.SourceIssue = SourceIssue{Owner: "org", Name: "repo", Number: 502}
 	} else {
 		p.PRNumber = 7
 		p.HeadAnchorOID = "old"
@@ -427,13 +428,105 @@ func TestCreatePRGuardsPinnedHeadAndReturnedIdentity(t *testing.T) {
 	o.work.OID = "candidate"
 	w := &fakePusher{}
 	e := engine(t, goodPolicy(ModeResolveIssue), o, w)
+	// The body must satisfy linkage before the engine ever touches
+	// the work ref; "body" by itself is rejected before the head
+	// guard runs, so the first error is the linkage rejection. Use
+	// a body with valid linkage to exercise the head guard.
 	if _, err := e.CreatePullRequest(context.Background(), "candidate", "title", "body", false); err == nil {
+		t.Fatal("create accepted with missing linkage")
+	}
+	if _, err := e.CreatePullRequest(context.Background(), "candidate", "title", "Closes org/repo#502", false); err == nil {
 		t.Fatal("create accepted without exact pinned work tip")
 	}
 	o.work.Exists = false
 	o.work.OID = ""
 	o.pulls = []PullRequestState{{Number: 9, HeadRepo: "fork/repo", HeadRef: "courier/work"}}
-	if _, err := e.CreatePullRequest(context.Background(), "candidate", "title", "body", false); err == nil {
+	if _, err := e.CreatePullRequest(context.Background(), "candidate", "title", "Closes org/repo#502", false); err == nil {
 		t.Fatal("ignored same-name fork PR")
+	}
+}
+
+// TestCreatePREnforcesSourceIssueLinkageBeforeForgeWrite is the broker half
+// of the resolve-issue linkage contract. The linkage check runs first, so a
+// body that names the wrong issue, a different source repository, an
+// ambiguous multiple-match body, or no supported closing keyword at all is
+// rejected before the broker calls CreatePullRequest on the underlying
+// observer. The observer's CreatePullRequest is therefore never reached for
+// an invalid body.
+func TestCreatePREnforcesSourceIssueLinkageBeforeForgeWrite(t *testing.T) {
+	o := goodObserver(ModeResolveIssue)
+	o.work.OID = "candidate"
+	w := &fakePusher{}
+	e := engine(t, goodPolicy(ModeResolveIssue), o, w)
+	cases := []struct {
+		name string
+		body string
+	}{
+		{"no-closing-reference", "This change ships the icon assets and updates the manifest."},
+		{"vague-addresses", "Addresses #502"},
+		{"wrong-issue-number", "Closes #999"},
+		{"wrong-source-repository", "Closes other/repo#502"},
+		{"ambiguous-multiple", "Closes #502. Closes #503."},
+		{"substring-fake", "discloses #502"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if _, err := e.CreatePullRequest(context.Background(), "candidate", "title", tc.body, false); err == nil {
+				t.Fatalf("create accepted body %q without valid linkage", tc.body)
+			}
+			if o.created.Body != "" {
+				t.Fatalf("observer CreatePullRequest called with body %q despite invalid linkage", o.created.Body)
+			}
+		})
+	}
+}
+
+func TestCreatePRAcceptsValidLinkage(t *testing.T) {
+	o := goodObserver(ModeResolveIssue)
+	w := &fakePusher{}
+	e := engine(t, goodPolicy(ModeResolveIssue), o, w)
+	// For a body that satisfies linkage, the linkage check must
+	// not be the cause of any error. The fake observer's identity
+	// does not match the pinned policy, so CreatePullRequest will
+	// fail at the post-create identity check; that is fine — the
+	// test only proves the failure is not a linkage rejection. The
+	// observer is reached (o.created is set) once linkage has
+	// passed and the head guards have accepted "old" as the
+	// admitted anchor, so an empty created body indicates a
+	// non-linkage guard rejected before the forge write.
+	for _, body := range []string{
+		"Closes #502",
+		"Fixes #502",
+		"Closes org/repo#502",
+		"This change ships the icon assets. Closes #502.\n",
+	} {
+		o.created = CreatePullRequest{}
+		_, err := e.CreatePullRequest(context.Background(), "old", "title", body, false)
+		if err != nil {
+			var le *LinkageError
+			if errors.As(err, &le) {
+				t.Fatalf("body %q rejected by linkage: %v", body, err)
+			}
+			continue
+		}
+		if o.created.Body == "" {
+			t.Fatalf("body %q: accepted without reaching the observer", body)
+		}
+	}
+}
+
+func TestValidatePolicyRejectsResolveIssueWithoutSourceIssue(t *testing.T) {
+	p := goodPolicy(ModeResolveIssue)
+	p.SourceIssue = SourceIssue{}
+	if _, err := NewPolicyEngine(p, goodObserver(ModeResolveIssue), &fakePusher{}); err == nil {
+		t.Fatal("resolve-issue policy without SourceIssue accepted")
+	}
+}
+
+func TestValidatePolicyRejectsResolveIssueWithMismatchedSourceRepo(t *testing.T) {
+	p := goodPolicy(ModeResolveIssue)
+	p.SourceIssue = SourceIssue{Owner: "other", Name: "repo", Number: 502}
+	if _, err := NewPolicyEngine(p, goodObserver(ModeResolveIssue), &fakePusher{}); err == nil {
+		t.Fatal("resolve-issue policy with mismatched source repository accepted")
 	}
 }

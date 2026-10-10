@@ -3,10 +3,24 @@ package broker
 import (
 	"errors"
 	"fmt"
+	"strings"
 
 	"github.com/misospace/courier/api/v1alpha1"
 	"github.com/misospace/courier/internal/branch"
 )
+
+// splitOwnerRepo splits a "owner/name" repository identity on the
+// final separator. Empty parts, a leading separator, or a trailing
+// separator fail. The function is local to the broker package to keep
+// the helper near the binding code that needs it.
+func splitOwnerRepo(value string) (owner, name string, ok bool) {
+	value = strings.TrimSpace(value)
+	idx := strings.LastIndex(value, "/")
+	if idx <= 0 || idx == len(value)-1 {
+		return "", "", false
+	}
+	return value[:idx], value[idx+1:], true
+}
 
 // PolicyFromRun binds broker policy to the live run and to the registered
 // provider configuration selected by trusted startup configuration. Provider is
@@ -77,6 +91,17 @@ func PolicyFromRun(run *v1alpha1.CoderRun, providerConfigRef, canonicalSpecRepo 
 			!persisted.WorkInitiallyAbsent && persisted.WorkOID == "" {
 			return Policy{}, errors.New("broker binding: resolve-issue policy has inconsistent initial work tip")
 		}
+		// The trusted source-issue identity comes from the immutable
+		// spec, never from a model input. Spec.Repo is the canonical
+		// source repository (already validated against the provider
+		// identity above) and Spec.Ref is the issue number. Wiring
+		// it here means the broker is the only component that
+		// reasons about PR-body linkage against this identity.
+		owner, name, ok := splitOwnerRepo(persisted.BaseRepo)
+		if !ok {
+			return Policy{}, fmt.Errorf("broker binding: persisted base repository %q is not an owner/name", persisted.BaseRepo)
+		}
+		policy.SourceIssue = SourceIssue{Owner: owner, Name: name, Number: run.Spec.Ref}
 	case ModeFixPR:
 		if persisted.PRNumber != run.Spec.Ref || persisted.HeadAnchorOID == "" {
 			return Policy{}, errors.New("broker binding: fix-pr policy does not match the requested PR and head anchor")

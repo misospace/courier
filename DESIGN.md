@@ -1369,6 +1369,25 @@ named items remain unresolved and must not be described as production-ready:
 
 ## Decisions
 
+- **2026-10-10 — #248: authoritative source-issue linkage is enforced in
+  both publication paths against one shared behavioral truth table.**
+  Resolved-issue PR bodies must carry a supported closing-keyword
+  reference to the trusted source issue, never a vague "Addresses" or
+  substring match, and a model cannot pick a different issue than the
+  operator admitted. The native broker validates the body before
+  `CreatePullRequest` runs; the legacy executor validates the live PR
+  body before claiming a successful handoff and asks the captured
+  OpenCode session to repair the body or open the PR under the
+  bounded continuation budget, escalating to `NeedsHuman` only when
+  the budget is exhausted. Both paths consume the same pure
+  `ValidateLinkage` function in `internal/broker/linkage.go`; the
+  test table there is the source of truth, and divergent accepted
+  linkage rules between paths would be a correctness regression. The
+  trusted source identity is resolved at admission from the
+  immutable `CoderRun` spec (broker) or from `COURIER_REPO` and
+  `COURIER_REF` (executor) — never from a model input. (#248, #204,
+  #126)
+
 - **2026-10-10 — Dispatch discovery reserves pending work conservatively.**
   Each LaneProfile runner gates discovery on one pre-discovery CoderRun list,
   counting empty-phase and Pending alongside Claimed and Running. This is
@@ -2018,3 +2037,23 @@ was superseded.
   and no duration bound was introduced. The window it does not close — a
   cached run status lagging a sibling's already-charged status patch — needs
   charge-proof writes and stays with #126. (#105)
+
+- **2026-10-10 — #248 follow-up: legacy linkage check is fail-closed on forge
+  read errors, and the declared-changes path routes through the bounded
+  repair budget.** The legacy executor's `checkPRLinkage` previously logged a
+  `linkage.read.failed` event and handed off as `Verifying` on a forge read
+  error, and `classifyDeclared` returned `NeedsHuman` immediately on a bad
+  PR body without consulting the captured session's continuation budget.
+  Both paths now route through one shared `applyLinkagePlan` helper: a forge
+  read failure is consumed by the bounded continuation budget (one retry
+  with `linkageRepairMessage`, then `NeedsHuman` with the precise forge
+  error as the reason); a published PR whose body disagrees with the trusted
+  source issue is consumed by the same bounded repair on both the declared
+  and undeclared paths. A run that never opened a PR for the branch remains
+  the operator's world-check concern, not a linkage violation — missing PR
+  returns `Pass` from the helper on both paths, preserving the pre-#248
+  contract. The captured session's `MaxContinuations` (#170) is the single
+  budget the helper consults, so escalation happens only when the budget is
+  exhausted or no captured session exists. No wall-clock timeout was added;
+  the fail-closed path is bounded by liveness (stuck iteration), not by
+  duration. (#248)

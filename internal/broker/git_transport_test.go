@@ -57,7 +57,7 @@ func TestGitPusherUsesOnlyPinnedEndpointAndExactRef(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	policy := Policy{RunUID: "run", Mode: ModeResolveIssue, Provider: "test", BaseRepo: "org/project", BaseRef: "main", BaseOID: base, WorkRepo: "org/project", WorkRef: "courier/org/project/issue-1", WorkInitiallyAbsent: true}
+	policy := Policy{RunUID: "run", Mode: ModeResolveIssue, Provider: "test", BaseRepo: "org/project", BaseRef: "main", BaseOID: base, WorkRepo: "org/project", WorkRef: "courier/org/project/issue-1", WorkInitiallyAbsent: true, SourceIssue: SourceIssue{Owner: "org", Name: "project", Number: 1}}
 	resolver := staticGitEndpoints{"org/project": remote}
 	pusher, err := NewGitPusher(ctx, GitTransportConfig{Policy: policy, Git: gitBroker, Resolver: resolver})
 	if err != nil {
@@ -115,7 +115,7 @@ func TestGitPusherRejectsHostilePinsAndNonFastForward(t *testing.T) {
 	if err := gb.ImportBundle(ctx, bundle, proposed, base); err != nil {
 		t.Fatalf("ImportBundle with observed tip: %v", err)
 	}
-	policy := Policy{RunUID: "run", Mode: ModeResolveIssue, Provider: "test", BaseRepo: "org/project", BaseRef: "main", BaseOID: base, WorkRepo: "org/project", WorkRef: "work", WorkInitiallyAbsent: false, WorkAnchorOID: base}
+	policy := Policy{RunUID: "run", Mode: ModeResolveIssue, Provider: "test", BaseRepo: "org/project", BaseRef: "main", BaseOID: base, WorkRepo: "org/project", WorkRef: "work", WorkInitiallyAbsent: false, WorkAnchorOID: base, SourceIssue: SourceIssue{Owner: "org", Name: "project", Number: 1}}
 	for _, endpoint := range []string{"https://user:secret@example.invalid/repo.git", "ext::sh -c evil", "-oProxyCommand=bad"} {
 		if _, err := NewGitPusher(ctx, GitTransportConfig{Policy: policy, Git: gb, Resolver: staticGitEndpoints{"org/project": endpoint}}); err == nil {
 			t.Errorf("accepted endpoint %q", endpoint)
@@ -193,7 +193,7 @@ func TestGitPusherIgnoresInheritedGitEnvironment(t *testing.T) {
 	if err := gb.ImportBundle(ctx, bundle, proposed, base); err != nil {
 		t.Fatal(err)
 	}
-	policy := Policy{RunUID: "run", Mode: ModeResolveIssue, Provider: "test", BaseRepo: "org/project", BaseRef: "main", BaseOID: base, WorkRepo: "org/project", WorkRef: "work", WorkInitiallyAbsent: true}
+	policy := Policy{RunUID: "run", Mode: ModeResolveIssue, Provider: "test", BaseRepo: "org/project", BaseRef: "main", BaseOID: base, WorkRepo: "org/project", WorkRef: "work", WorkInitiallyAbsent: true, SourceIssue: SourceIssue{Owner: "org", Name: "project", Number: 1}}
 	pusher, err := NewGitPusher(ctx, GitTransportConfig{Policy: policy, Git: gb, Resolver: staticGitEndpoints{"org/project": remote}})
 	if err != nil {
 		t.Fatal(err)
