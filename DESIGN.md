@@ -2037,3 +2037,23 @@ was superseded.
   and no duration bound was introduced. The window it does not close — a
   cached run status lagging a sibling's already-charged status patch — needs
   charge-proof writes and stays with #126. (#105)
+
+- **2026-10-10 — #248 follow-up: legacy linkage check is fail-closed on forge
+  read errors, and the declared-changes path routes through the bounded
+  repair budget.** The legacy executor's `checkPRLinkage` previously logged a
+  `linkage.read.failed` event and handed off as `Verifying` on a forge read
+  error, and `classifyDeclared` returned `NeedsHuman` immediately on a bad
+  PR body without consulting the captured session's continuation budget.
+  Both paths now route through one shared `applyLinkagePlan` helper: a forge
+  read failure is consumed by the bounded continuation budget (one retry
+  with `linkageRepairMessage`, then `NeedsHuman` with the precise forge
+  error as the reason); a published PR whose body disagrees with the trusted
+  source issue is consumed by the same bounded repair on both the declared
+  and undeclared paths. A run that never opened a PR for the branch remains
+  the operator's world-check concern, not a linkage violation — missing PR
+  returns `Pass` from the helper on both paths, preserving the pre-#248
+  contract. The captured session's `MaxContinuations` (#170) is the single
+  budget the helper consults, so escalation happens only when the budget is
+  exhausted or no captured session exists. No wall-clock timeout was added;
+  the fail-closed path is bounded by liveness (stuck iteration), not by
+  duration. (#248)
