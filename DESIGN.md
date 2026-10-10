@@ -606,8 +606,10 @@ deadline the bundle degrades to the manifest alone. The pod sets
 `terminationGracePeriodSeconds: 45` when capture is enabled, sized to fit the
 deadline plus the child-kill wait plus exit margin. Delivery allows at most two
 attempts inside the deadline, then stops — no cross-reconcile retry, no
-requeue; loss is recorded in a redacted `evidence.capture` event. Capture never
-changes a phase, exit code, or lifecycle report.
+requeue; loss is recorded in a redacted `evidence.capture` event. A capture the
+deadline itself aborts earns one fresh five-second manifest-only delivery
+window inside the grace (2026-10-09 decision); a stalled intake does not.
+Capture never changes a phase, exit code, or lifecycle report.
 
 **Bundle, bounds, manifest.** One gzip'd tar plus a JSON manifest; the manifest
 is always present, content is best-effort within constants (these bound storage
@@ -681,7 +683,11 @@ intake listener (own bind address, empty disables; chart renders a ClusterIP
 Service, optionally ingress-restricted to coordinator pods). HTTP with a bearer
 token follows the in-cluster transport convention settled by #120's
 dependency-cache design: plain HTTP, network-boundary + token authentication,
-no CA in clients. Validation is stateless and the persist idempotent, and the
+no CA in clients. The executor's delivery request shape is settled by #198: a
+POST of `multipart/form-data` carrying a file part named `manifest` (the
+canonical manifest JSON) and, only when the capture admitted content, a file
+part named `archive` (the gzip'd tar); the intake dispatches on part name,
+never on the parts' stamped Content-Type. Validation is stateless and the persist idempotent, and the
 listener runnable declares `NeedLeaderElection() → false`, so with leader
 election every replica serves — without that, standbys would refuse POSTs the
 Service load-balances onto them and exhaust the executor's two-attempt budget.
@@ -1375,6 +1381,18 @@ named items remain unresolved and must not be described as production-ready:
   over-materialize. Nor can it hide an already-visible Pending queue head from a
   free sibling; that requires Dispatch-side exclusion. Pausing discovery also
   defers next-task and stale-item bookkeeping until a later poll. (#260)
+
+- **2026-10-09 — #198: a deadline-expired capture still delivers the manifest.**
+  Issue #198 bounds delivery attempts inside the 20-second operation deadline,
+  while this section promises "over deadline the bundle degrades to the
+  manifest alone." When the deadline itself is what aborts the snapshot, an
+  attempt budget bound by that same expired deadline would silently void the
+  promise. The executor therefore gives the manifest-only bundle one fresh
+  five-second window (still inside the pod's 45-second grace) after an
+  operation-deadline abort; a stalled *intake* never earns this — it is for
+  the capture failure alone. Rejected: dropping the manifest (breaks the
+  degradation guarantee and hides that a capture was attempted) and a longer
+  window (stacks against the grace with the 10-second child-kill wait).
 
 - **2026-10-09 — #238: operator soft-stop is one broker-mediated control
   request with a checkpoint-safe stop boundary.** One channel — annotation
