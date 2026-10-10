@@ -32,6 +32,7 @@ const defaultPollInterval = 30 * time.Second
 // the Courier LaneProfile assigned to every discovered item.
 type RunnerConfig struct {
 	Source       string
+	SourceAgent  string
 	LaneProfile  string
 	Namespace    string
 	PollInterval time.Duration
@@ -40,12 +41,13 @@ type RunnerConfig struct {
 // Runner polls a source and materializes source work as CoderRuns.
 type Runner struct {
 	client.Client
-	Scheme        *runtime.Scheme
-	Adapter       Adapter
-	Config        RunnerConfig
-	pollMu        sync.Mutex
-	laneWaiting   bool
-	laneSuspended bool
+	Scheme         *runtime.Scheme
+	Adapter        Adapter
+	Config         RunnerConfig
+	pollMu         sync.Mutex
+	laneWaiting    bool
+	laneSuspended  bool
+	laneAtCapacity bool
 }
 
 func NewRunner(c client.Client, adapter Adapter, config RunnerConfig) *Runner {
@@ -115,6 +117,27 @@ func (r *Runner) Poll(ctx context.Context) error {
 		r.laneSuspended = false
 	}
 
+	var runs courierv1alpha1.CoderRunList
+	if err := r.List(ctx, &runs, client.InNamespace(r.Config.Namespace)); err != nil {
+		return fmt.Errorf("list CoderRuns: %w", err)
+	}
+	capacity := lane.Spec.Concurrency
+	if capacity <= 0 {
+		capacity = 1
+	}
+	reserved := laneCapacityReservations(runs.Items, r.Config.LaneProfile)
+	if reserved >= capacity {
+		if !r.laneAtCapacity {
+			log.FromContext(ctx).Info("lane at capacity, pausing source discovery", "laneProfile", r.Config.LaneProfile, "capacity", capacity, "reserved", reserved)
+			r.laneAtCapacity = true
+		}
+		return nil
+	}
+	if r.laneAtCapacity {
+		log.FromContext(ctx).Info("lane capacity available, resuming source discovery", "laneProfile", r.Config.LaneProfile, "capacity", capacity, "reserved", reserved)
+		r.laneAtCapacity = false
+	}
+
 	items, err := r.Adapter.Discover(ctx)
 	if err != nil {
 		return err
@@ -140,15 +163,21 @@ func (r *Runner) Poll(ctx context.Context) error {
 	}
 	items = validItems
 
-	var runs courierv1alpha1.CoderRunList
-	if err := r.List(ctx, &runs, client.InNamespace(r.Config.Namespace)); err != nil {
-		return fmt.Errorf("list CoderRuns: %w", err)
-	}
 	existing := make(map[string]struct{}, len(runs.Items))
+	legacyIdentities := make(map[string]struct{})
 	for i := range runs.Items {
 		run := &runs.Items[i]
-		if run.Spec.Source == r.Config.Source && strings.TrimSpace(run.Spec.WorkItemID) != "" {
-			existing[workKey(run.Spec.Source, r.identity(run.Spec.WorkItemID))] = struct{}{}
+		if strings.TrimSpace(run.Spec.WorkItemID) == "" {
+			continue
+		}
+		identity := r.identity(run.Spec.WorkItemID)
+		if run.Spec.Source == r.Config.Source {
+			existing[workKey(run.Spec.Source, identity)] = struct{}{}
+		}
+		// Previous Dispatch bindings encoded queue lanes in Source. Keep those
+		// retained runs from being rematerialized during the identity rollout.
+		if run.Spec.Source == "dispatch" || strings.HasPrefix(run.Spec.Source, "dispatch:") {
+			legacyIdentities[identity] = struct{}{}
 		}
 	}
 
@@ -160,7 +189,11 @@ func (r *Runner) Poll(ctx context.Context) error {
 		if strings.TrimSpace(item.ID) == "" {
 			continue
 		}
-		key := workKey(r.Config.Source, r.identity(item.ID))
+		itemIdentity := r.identity(item.ID)
+		key := workKey(r.Config.Source, itemIdentity)
+		if _, ok := legacyIdentities[itemIdentity]; ok {
+			continue
+		}
 		if _, ok := existing[key]; ok {
 			continue
 		}
@@ -179,16 +212,17 @@ func (r *Runner) Poll(ctx context.Context) error {
 		run := &courierv1alpha1.CoderRun{
 			ObjectMeta: metav1.ObjectMeta{Namespace: r.Config.Namespace},
 			Spec: courierv1alpha1.CoderRunSpec{
-				Mode:       courierv1alpha1.Mode(spec.Mode),
-				Source:     spec.Source,
-				WorkItemID: spec.WorkItemID,
-				Repo:       spec.Repo,
-				Ref:        spec.Ref,
-				Lane:       spec.Lane,
-				Debug:      spec.Debug,
+				Mode:        courierv1alpha1.Mode(spec.Mode),
+				Source:      spec.Source,
+				SourceAgent: r.Config.SourceAgent,
+				WorkItemID:  spec.WorkItemID,
+				Repo:        spec.Repo,
+				Ref:         spec.Ref,
+				Lane:        spec.Lane,
+				Debug:       spec.Debug,
 			},
 		}
-		run.Name = runName(r.Config.Source, item.ID)
+		run.Name = runName(r.Config.Source, itemIdentity)
 		if err := r.Create(ctx, run); err != nil && !apierrors.IsAlreadyExists(err) {
 			return fmt.Errorf("create CoderRun for %q: %w", item.ID, err)
 		}
@@ -225,6 +259,23 @@ func (r *Runner) identity(workItemID string) string {
 		}
 	}
 	return workItemID
+}
+
+// laneCapacityReservations conservatively counts empty-phase and Pending runs as
+// discovery reservations, in addition to the Claimed and Running phases admitted
+// by the operator. Verifying and later phases reserve no discovery capacity.
+func laneCapacityReservations(runs []courierv1alpha1.CoderRun, lane string) int {
+	reserved := 0
+	for i := range runs {
+		if runs[i].Spec.Lane != lane {
+			continue
+		}
+		switch runs[i].Status.Phase {
+		case "", courierv1alpha1.PhasePending, courierv1alpha1.PhaseClaimed, courierv1alpha1.PhaseRunning:
+			reserved++
+		}
+	}
+	return reserved
 }
 
 func workKey(sourceName, workItemID string) string {

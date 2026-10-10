@@ -73,9 +73,10 @@ The design contract is in DESIGN.md § "Failure evidence for dirty runs
 (#115)". The coordinator-pod wiring (#199) is implemented: with the intake
 key and service configured, coordinator pods receive the evidence URL, a
 per-incarnation token and nonce, their pod UID, and a 45-second termination
-grace. The intake listener (#200) and executor capture (#197/#198) are not
-implemented, so nothing is persisted until they ship; with either setting
-empty the mechanism is invisible.
+grace. The executor capture (#197 capture core, #198 executor triggers) is
+implemented: armed runs capture and POST gated failure evidence. The intake
+listener (#200) is not implemented yet, so nothing is persisted until it
+ships; with either setting empty the mechanism is invisible.
 
 Enable it with three settings on the operator:
 
@@ -143,13 +144,29 @@ create the referenced Secret with the `DISPATCH_AGENT_TOKEN` value under the
 configured key. The queue lane selects Dispatch work; `laneProfile` selects the
 Courier `LaneProfile` for created runs. A single deployment can serve several
 bindings through `dispatch.lanes`, each pairing a Dispatch `queueLane` with a
-Courier `laneProfile` and running its own discovery runner. Each binding admits
-into its own LaneProfile, so an escalation lane can use a different profile
-(e.g. larger hosted models) without taking capacity from the default lane.
-Several bindings may share one `laneProfile`, in which case they share that
-profile's concurrency and suspend gate. `queueLane`/`laneProfile` remain the
-single-binding shorthand and cannot be combined with `lanes`. Dispatch uses the
-agent token for `next-task`, claim/status, unclaim, and task-report requests.
+Courier `laneProfile` and running its own discovery runner. Add an optional
+`agentName` when distinct bindings must share one queue; for example:
+
+```yaml
+dispatch:
+  lanes:
+    - { queueLane: local, laneProfile: local, agentName: courier-local }
+    - { queueLane: local, laneProfile: minimax, agentName: courier-cloud }
+    - { queueLane: escalated, laneProfile: frontier, agentName: courier-frontier }
+```
+
+Repeated queue lanes require distinct explicit identities. Without explicit
+names, multiple bindings retain the historical `<base agentName>-<queueLane>`
+default; a single binding and the `queueLane`/`laneProfile` shorthand retain
+the base agent identity. Shorthand cannot be combined with `lanes`. All runners
+materialize `spec.source: dispatch`; immutable `spec.sourceAgent` routes later
+claim, release, and report calls to the same agent. The base Dispatch adapter
+remains registered for retained legacy runs with an empty `sourceAgent`. Deploy
+the CRD update before the operator/chart update so the API server accepts
+`sourceAgent` on newly materialized runs. Each binding admits into its own
+LaneProfile; bindings sharing a profile share its concurrency and suspend gate.
+Dispatch uses the agent token for `next-task`, claim/status, unclaim, and
+task-report requests.
 
 ## Manual first run
 

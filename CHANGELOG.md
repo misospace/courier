@@ -1,5 +1,26 @@
 # Changelog
 
+## [0.1.7](https://github.com/misospace/courier/compare/v0.1.6...v0.1.7) (2026-10-10)
+
+
+### Bug Fixes
+
+* gate source discovery on lane capacity ([#260](https://github.com/misospace/courier/issues/260)) ([b8b47b3](https://github.com/misospace/courier/commit/b8b47b3e8469b3ef49a3ae5cdbeda688ef2d71fa))
+
+## [0.1.6](https://github.com/misospace/courier/compare/v0.1.5...v0.1.6) (2026-10-09)
+
+
+### Bug Fixes
+
+* **container:** update image golang (1.27.1 → 1.27.2) ([#244](https://github.com/misospace/courier/issues/244)) ([f41a29c](https://github.com/misospace/courier/commit/f41a29cf0d6b6e21828cbe616d6491a7683a5d0a))
+* **courier:** route Dispatch runs by agent identity ([#253](https://github.com/misospace/courier/issues/253)) ([4cd159e](https://github.com/misospace/courier/commit/4cd159e518f431fa8279c908b886591a37055556))
+* patch Go security vulnerabilities ([#254](https://github.com/misospace/courier/issues/254)) ([36f755f](https://github.com/misospace/courier/commit/36f755ffcd46501171d8f8bbde02c00ea9946474))
+
+
+### Documentation
+
+* settle operator soft-stop design ([#238](https://github.com/misospace/courier/issues/238)) ([#256](https://github.com/misospace/courier/issues/256)) ([62a566b](https://github.com/misospace/courier/commit/62a566b4fc2805d1d2e46e70ea9b7723d144a8fc))
+
 ## [0.1.5](https://github.com/misospace/courier/compare/v0.1.4...v0.1.5) (2026-10-08)
 
 
