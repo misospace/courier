@@ -440,17 +440,30 @@ paths share acceptance, not implementation.
   undeclared — the executor reads the live PR for the run branch
   through the GitHub `PullRequestsForHead` call (the same forge
   capability every other legacy forge read uses; never a
-  forge-specific CLI). On a missing or unreadable PR the check
-  is best-effort: a forge read failure is logged as a verbose
-  `linkage.read.failed` event and the run proceeds, because the
-  world is the source of truth and the operator re-reads the PR.
-  On a published PR with a body that disagrees with the trusted
-  identity, the declared `changes` path refuses the handoff as
-  `NeedsHuman` with the precise rejection; the undeclared path
-  asks the captured OpenCode session to repair the body or open
-  the PR under the bounded continuation budget (#170) and only
-  escalates to `NeedsHuman` when the budget is exhausted. The
-  repair instruction names the trusted identity, the supported
+  forge-specific CLI). Both paths share one `applyLinkagePlan`
+  helper so the linkage check behaves identically regardless of
+  how the run reached `Verifying`:
+  - On a published PR with a body that disagrees with the trusted
+    identity, the run asks the captured OpenCode session to
+    repair the body or open the PR under the bounded
+    continuation budget (#170) and only escalates to
+    `NeedsHuman` when the budget is exhausted, or escalates
+    immediately when no captured session exists.
+  - On a forge read failure the check is fail-closed: a verbose
+    `linkage.read.failed` event is logged and the run either
+    retries the read inside the captured session's bounded
+    continuation budget (one retry with the same repair
+    instruction) or escalates to `NeedsHuman` with the precise
+    forge error as the reason. A transient outage cannot quietly
+    become a `Verifying` success; the existing PR observer does
+    not perform this linkage check, so the legacy executor owns
+    it.
+  - On a run that never opened a PR for the branch the check
+    returns `Pass`: the absence is the operator's world-check
+    concern, not a linkage violation, and the legacy executor
+    hands off as `Verifying` once the rest of the world agrees
+    (this preserves the pre-#248 contract).
+  The repair instruction names the trusted identity, the supported
   closing keywords, the bare and cross-repo forms, and the
   existing PR number so the model can fix the body
   deterministically rather than re-derive the requirement.
