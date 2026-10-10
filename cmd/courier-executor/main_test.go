@@ -298,11 +298,7 @@ func runConflictedAdoption(t *testing.T, openCodeScript string) (int, string) {
 	remote := remoteWithConflictingBranch(t, root)
 	fakeOpenCode := filepath.Join(root, "opencode")
 	writeExecutable(t, fakeOpenCode, "#!/bin/sh\ncase \"$1\" in mcp) exit 0;; esac\nprintf 'opencode argv: %s\\n' \"$*\"\n"+openCodeScript)
-	prServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		_, _ = io.WriteString(w, `[]`)
-	}))
-	defer prServer.Close()
+	prServer := fakeLinkedPRServer(t)
 	setResolveIssueEnv(t, root, remote, prServer.URL, fakeOpenCode)
 
 	var output bytes.Buffer
@@ -352,11 +348,7 @@ func TestRunExitZeroWithoutLocalWorkBecomesFailed(t *testing.T) {
 	remote := remoteWithExistingBranch(t, root)
 	fakeOpenCode := filepath.Join(root, "opencode")
 	writeExecutable(t, fakeOpenCode, "#!/bin/sh\ncase \"$1\" in mcp) exit 0;; esac\nexit 0\n")
-	prServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		_, _ = io.WriteString(w, `[]`)
-	}))
-	defer prServer.Close()
+	prServer := fakeLinkedPRServer(t)
 	setResolveIssueEnv(t, root, remote, prServer.URL, fakeOpenCode)
 
 	var output bytes.Buffer
@@ -387,11 +379,7 @@ func TestRunTrackedCourierDataSurvivesGitAddAll(t *testing.T) {
 
 	fakeOpenCode := filepath.Join(root, "opencode")
 	writeExecutable(t, fakeOpenCode, "#!/bin/sh\ncase \"$1\" in mcp) exit 0;; esac\nprintf 'working tree should preserve tracked data\\n' >> .courier/tracked.txt\ngit add -A\ngit commit -m 'test: preserve courier data' >/dev/null\nmkdir -p \"$COURIER_SCRATCH_DIR\"\nprintf '{\"outcome\":\"changes\"}' > \"$COURIER_SCRATCH_DIR/outcome.json\"\nexit 0\n")
-	prServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		_, _ = io.WriteString(w, `[]`)
-	}))
-	defer prServer.Close()
+	prServer := fakeLinkedPRServer(t)
 	workspace := setResolveIssueEnv(t, root, remote, prServer.URL, fakeOpenCode)
 
 	var output bytes.Buffer
@@ -409,11 +397,7 @@ func TestRunExitZeroWithDirtyWorkBecomesFailed(t *testing.T) {
 	remote := remoteWithExistingBranch(t, root)
 	fakeOpenCode := filepath.Join(root, "opencode")
 	writeExecutable(t, fakeOpenCode, "#!/bin/sh\ncase \"$1\" in mcp) exit 0;; esac\nprintf 'partial\\n' > partial.txt\nexit 0\n")
-	prServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		_, _ = io.WriteString(w, `[]`)
-	}))
-	defer prServer.Close()
+	prServer := fakeLinkedPRServer(t)
 	setResolveIssueEnv(t, root, remote, prServer.URL, fakeOpenCode)
 
 	var output bytes.Buffer
@@ -434,11 +418,7 @@ func TestRunCommittedWorkOnWrongBranchBecomesFailed(t *testing.T) {
 	remote := remoteWithExistingBranch(t, root)
 	fakeOpenCode := filepath.Join(root, "opencode")
 	writeExecutable(t, fakeOpenCode, "#!/bin/sh\ncase \"$1\" in mcp) exit 0;; esac\ngit checkout -b fix/elsewhere\nprintf 'elsewhere\\n' > elsewhere.txt\ngit add --all -- .\ngit commit -m 'test: work on wrong branch' >/dev/null\nexit 0\n")
-	prServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		_, _ = io.WriteString(w, `[]`)
-	}))
-	defer prServer.Close()
+	prServer := fakeLinkedPRServer(t)
 	setResolveIssueEnv(t, root, remote, prServer.URL, fakeOpenCode)
 
 	var output bytes.Buffer
@@ -462,11 +442,7 @@ func TestRunDetachedHeadCommitBecomesFailed(t *testing.T) {
 	remote := remoteWithExistingBranch(t, root)
 	fakeOpenCode := filepath.Join(root, "opencode")
 	writeExecutable(t, fakeOpenCode, "#!/bin/sh\ncase \"$1\" in mcp) exit 0;; esac\ngit checkout --detach\nprintf 'detached\\n' > detached.txt\ngit add --all -- .\ngit commit -m 'test: work on detached head' >/dev/null\nexit 0\n")
-	prServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		_, _ = io.WriteString(w, `[]`)
-	}))
-	defer prServer.Close()
+	prServer := fakeLinkedPRServer(t)
 	setResolveIssueEnv(t, root, remote, prServer.URL, fakeOpenCode)
 
 	var output bytes.Buffer
@@ -490,11 +466,7 @@ func TestRunDeclaredChangesVerifiedReachesVerifying(t *testing.T) {
 	remote := remoteWithExistingBranch(t, root)
 	fakeOpenCode := filepath.Join(root, "opencode")
 	writeExecutable(t, fakeOpenCode, "#!/bin/sh\ncase \"$1\" in mcp) exit 0;; esac\nprintf 'completed\\n' > completed.txt\ngit add --all -- .\ngit commit -m 'test: completed work' >/dev/null\nmkdir -p \"$COURIER_SCRATCH_DIR\"\nprintf '{\"outcome\":\"changes\"}' > \"$COURIER_SCRATCH_DIR/outcome.json\"\nexit 0\n")
-	prServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		_, _ = io.WriteString(w, `[]`)
-	}))
-	defer prServer.Close()
+	prServer := fakeLinkedPRServer(t)
 	setResolveIssueEnv(t, root, remote, prServer.URL, fakeOpenCode)
 	t.Setenv("COURIER_RUN_NAME", "coderrun-it-7")
 
@@ -519,11 +491,7 @@ func TestRunCommittedDeclarationWithWorkStaysVerifying(t *testing.T) {
 	remote := remoteWithExistingBranch(t, root)
 	fakeOpenCode := filepath.Join(root, "opencode")
 	writeExecutable(t, fakeOpenCode, "#!/bin/sh\ncase \"$1\" in mcp) exit 0;; esac\nprintf 'completed\\n' > completed.txt\nmkdir -p \"$COURIER_SCRATCH_DIR\"\nprintf '{\"outcome\":\"changes\"}' > \"$COURIER_SCRATCH_DIR/outcome.json\"\ngit add --all -- .\ngit commit -m 'test: completed work' >/dev/null\nexit 0\n")
-	prServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		_, _ = io.WriteString(w, `[]`)
-	}))
-	defer prServer.Close()
+	prServer := fakeLinkedPRServer(t)
 	setResolveIssueEnv(t, root, remote, prServer.URL, fakeOpenCode)
 
 	var output bytes.Buffer
@@ -708,11 +676,7 @@ func TestRunMissingRefOutcomeCommentEmitsErrorEvent(t *testing.T) {
 	remote := remoteWithExistingBranch(t, root)
 	fakeOpenCode := filepath.Join(root, "opencode")
 	writeExecutable(t, fakeOpenCode, "#!/bin/sh\ncase \"$1\" in mcp) exit 0;; esac\nmkdir -p \"$COURIER_SCRATCH_DIR\"\nprintf '{\"outcome\":\"needs_decision\",\"question\":\"Which payment provider should the run use?\"}' > \"$COURIER_SCRATCH_DIR/outcome.json\"\nexit 0\n")
-	prServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		_, _ = io.WriteString(w, `[]`)
-	}))
-	defer prServer.Close()
+	prServer := fakeLinkedPRServer(t)
 	setResolveIssueEnv(t, root, remote, prServer.URL, fakeOpenCode)
 	// No COURIER_REF: the run has no issue/PR to comment on.
 	t.Setenv("COURIER_LOG_LEVEL", "debug")
@@ -794,11 +758,7 @@ func TestRunDeclaredChangesButDirtyBecomesFailed(t *testing.T) {
 	remote := remoteWithExistingBranch(t, root)
 	fakeOpenCode := filepath.Join(root, "opencode")
 	writeExecutable(t, fakeOpenCode, "#!/bin/sh\ncase \"$1\" in mcp) exit 0;; esac\nprintf 'partial\\n' > partial.txt\nmkdir -p \"$COURIER_SCRATCH_DIR\"\nprintf '{\"outcome\":\"changes\"}' > \"$COURIER_SCRATCH_DIR/outcome.json\"\nexit 0\n")
-	prServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		_, _ = io.WriteString(w, `[]`)
-	}))
-	defer prServer.Close()
+	prServer := fakeLinkedPRServer(t)
 	setResolveIssueEnv(t, root, remote, prServer.URL, fakeOpenCode)
 
 	var output bytes.Buffer
@@ -819,11 +779,7 @@ func TestRunDeclaredChangesButNoCommitBecomesFailed(t *testing.T) {
 	remote := remoteWithExistingBranch(t, root)
 	fakeOpenCode := filepath.Join(root, "opencode")
 	writeExecutable(t, fakeOpenCode, "#!/bin/sh\ncase \"$1\" in mcp) exit 0;; esac\nmkdir -p \"$COURIER_SCRATCH_DIR\"\nprintf '{\"outcome\":\"changes\"}' > \"$COURIER_SCRATCH_DIR/outcome.json\"\nexit 0\n")
-	prServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		_, _ = io.WriteString(w, `[]`)
-	}))
-	defer prServer.Close()
+	prServer := fakeLinkedPRServer(t)
 	setResolveIssueEnv(t, root, remote, prServer.URL, fakeOpenCode)
 
 	var output bytes.Buffer
@@ -844,11 +800,7 @@ func TestRunDeclaredNoChangeNeededButCommittedBecomesFailed(t *testing.T) {
 	remote := remoteWithExistingBranch(t, root)
 	fakeOpenCode := filepath.Join(root, "opencode")
 	writeExecutable(t, fakeOpenCode, "#!/bin/sh\ncase \"$1\" in mcp) exit 0;; esac\nprintf 'completed\\n' > completed.txt\ngit add --all -- .\ngit commit -m 'test: completed work' >/dev/null\nmkdir -p \"$COURIER_SCRATCH_DIR\"\nprintf '{\"outcome\":\"no_change_needed\",\"evidence\":\"thought it was done\"}' > \"$COURIER_SCRATCH_DIR/outcome.json\"\nexit 0\n")
-	prServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		_, _ = io.WriteString(w, `[]`)
-	}))
-	defer prServer.Close()
+	prServer := fakeLinkedPRServer(t)
 	setResolveIssueEnv(t, root, remote, prServer.URL, fakeOpenCode)
 
 	var output bytes.Buffer
@@ -869,11 +821,7 @@ func TestRunInvalidOutcomeDeclarationBecomesFailed(t *testing.T) {
 	remote := remoteWithExistingBranch(t, root)
 	fakeOpenCode := filepath.Join(root, "opencode")
 	writeExecutable(t, fakeOpenCode, "#!/bin/sh\ncase \"$1\" in mcp) exit 0;; esac\nmkdir -p \"$COURIER_SCRATCH_DIR\"\nprintf 'not json' > \"$COURIER_SCRATCH_DIR/outcome.json\"\nexit 0\n")
-	prServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		_, _ = io.WriteString(w, `[]`)
-	}))
-	defer prServer.Close()
+	prServer := fakeLinkedPRServer(t)
 	setResolveIssueEnv(t, root, remote, prServer.URL, fakeOpenCode)
 
 	var output bytes.Buffer
@@ -898,11 +846,7 @@ func TestRunCommittedWorkStillOnRunBranchStaysVerifying(t *testing.T) {
 	remote := remoteWithExistingBranch(t, root)
 	fakeOpenCode := filepath.Join(root, "opencode")
 	writeExecutable(t, fakeOpenCode, "#!/bin/sh\ncase \"$1\" in mcp) exit 0;; esac\nprintf 'completed\\n' > completed.txt\ngit add --all -- .\ngit commit -m 'test: completed work' >/dev/null\ngit checkout -b review/after\nexit 0\n")
-	prServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		_, _ = io.WriteString(w, `[]`)
-	}))
-	defer prServer.Close()
+	prServer := fakeLinkedPRServer(t)
 	setResolveIssueEnv(t, root, remote, prServer.URL, fakeOpenCode)
 
 	var output bytes.Buffer
@@ -920,11 +864,7 @@ func TestRunCommitWithUntrackedScratchReachesVerifying(t *testing.T) {
 	remote := remoteWithExistingBranch(t, root)
 	fakeOpenCode := filepath.Join(root, "opencode")
 	writeExecutable(t, fakeOpenCode, "#!/bin/sh\ncase \"$1\" in mcp) exit 0;; esac\nprintf 'completed\\n' > completed.txt\ngit add completed.txt\ngit commit -m 'test: completed work' >/dev/null\nprintf 'scratch\\n' > scratch.txt\n")
-	prServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		_, _ = io.WriteString(w, `[]`)
-	}))
-	defer prServer.Close()
+	prServer := fakeLinkedPRServer(t)
 	workspace := setResolveIssueEnv(t, root, remote, prServer.URL, fakeOpenCode)
 
 	var output, errorsOut bytes.Buffer
@@ -1337,11 +1277,7 @@ func TestRunChildExitTwoBecomesFailed(t *testing.T) {
 	remote := remoteWithExistingBranch(t, root)
 	fakeOpenCode := filepath.Join(root, "opencode")
 	writeExecutable(t, fakeOpenCode, "#!/bin/sh\ncase \"$1\" in mcp) exit 0;; esac\nexit 2\n")
-	prServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		_, _ = io.WriteString(w, `[]`)
-	}))
-	defer prServer.Close()
+	prServer := fakeLinkedPRServer(t)
 	setResolveIssueEnv(t, root, remote, prServer.URL, fakeOpenCode)
 
 	var output bytes.Buffer
@@ -1366,11 +1302,7 @@ func TestRunChildExitThreeBecomesFailed(t *testing.T) {
 	remote := remoteWithExistingBranch(t, root)
 	fakeOpenCode := filepath.Join(root, "opencode")
 	writeExecutable(t, fakeOpenCode, "#!/bin/sh\ncase \"$1\" in mcp) exit 0;; esac\nexit 3\n")
-	prServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		_, _ = io.WriteString(w, `[]`)
-	}))
-	defer prServer.Close()
+	prServer := fakeLinkedPRServer(t)
 	setResolveIssueEnv(t, root, remote, prServer.URL, fakeOpenCode)
 
 	var output bytes.Buffer
@@ -1429,11 +1361,7 @@ printf '{"type":"text","sessionID":"ses_resume1","part":{"type":"text","text":"p
 printf 'partial\n' > partial.txt
 exit 0
 `)
-	prServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		_, _ = io.WriteString(w, `[]`)
-	}))
-	defer prServer.Close()
+	prServer := fakeLinkedPRServer(t)
 	setContinuationEnv(t, root, remote, prServer.URL, fakeOpenCode)
 
 	var output bytes.Buffer
@@ -1492,11 +1420,7 @@ fi
 printf '{"type":"text","sessionID":"ses_nowork1","part":{"type":"text","text":"nothing yet"}}\n'
 exit 0
 `)
-	prServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		_, _ = io.WriteString(w, `[]`)
-	}))
-	defer prServer.Close()
+	prServer := fakeLinkedPRServer(t)
 	setContinuationEnv(t, root, remote, prServer.URL, fakeOpenCode)
 
 	var output bytes.Buffer
@@ -1557,11 +1481,7 @@ git commit -m 'test: work on a side branch' >/dev/null
 printf '{"type":"text","sessionID":"ses_offbranch1","part":{"type":"text","text":"committed off branch"}}\n'
 exit 0
 `)
-	prServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		_, _ = io.WriteString(w, `[]`)
-	}))
-	defer prServer.Close()
+	prServer := fakeLinkedPRServer(t)
 	setContinuationEnv(t, root, remote, prServer.URL, fakeOpenCode)
 
 	var output bytes.Buffer
@@ -1611,11 +1531,7 @@ printf '{"type":"text","sessionID":"ses_loop1","part":{"type":"text","text":"sam
 printf 'partial\n' > partial.txt
 exit 0
 `)
-	prServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		_, _ = io.WriteString(w, `[]`)
-	}))
-	defer prServer.Close()
+	prServer := fakeLinkedPRServer(t)
 	setContinuationEnv(t, root, remote, prServer.URL, fakeOpenCode)
 
 	var output bytes.Buffer
@@ -1653,11 +1569,7 @@ echo "$N" > "$COURIER_FAKE_STATE/count"
 printf '{"type":"text","sessionID":"ses_cap1","part":{"type":"text","text":"unique text turn %s"}}\n' "$N"
 exit 0
 `)
-	prServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		_, _ = io.WriteString(w, `[]`)
-	}))
-	defer prServer.Close()
+	prServer := fakeLinkedPRServer(t)
 	setContinuationEnv(t, root, remote, prServer.URL, fakeOpenCode)
 	t.Setenv("COURIER_MAX_CONTINUATIONS", "2")
 
@@ -1714,11 +1626,7 @@ fi
 printf '{"type":"text","sessionID":"ses_crash1","part":{"type":"text","text":"about to crash"}}\n'
 exit 1
 `)
-	prServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		_, _ = io.WriteString(w, `[]`)
-	}))
-	defer prServer.Close()
+	prServer := fakeLinkedPRServer(t)
 	setContinuationEnv(t, root, remote, prServer.URL, fakeOpenCode)
 
 	var output bytes.Buffer
@@ -1767,11 +1675,7 @@ printf '%s\n' "$(printf '%s' "$*" | tr '\n' ' ')" >> "$COURIER_FAKE_STATE/argv.l
 printf '{"type":"text","sessionID":"ses_crashfail","part":{"type":"text","text":"crashing again"}}\n'
 exit 1
 `)
-	prServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		_, _ = io.WriteString(w, `[]`)
-	}))
-	defer prServer.Close()
+	prServer := fakeLinkedPRServer(t)
 	setContinuationEnv(t, root, remote, prServer.URL, fakeOpenCode)
 	t.Setenv("COURIER_MAX_CONTINUATIONS", "2")
 
@@ -1824,11 +1728,7 @@ fi
 printf '{"type":"text","sessionID":"ses_cap1","part":{"type":"text","text":"nothing yet"}}\n'
 exit 0
 `)
-	prServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		_, _ = io.WriteString(w, `[]`)
-	}))
-	defer prServer.Close()
+	prServer := fakeLinkedPRServer(t)
 	setContinuationEnv(t, root, remote, prServer.URL, fakeOpenCode)
 
 	var output bytes.Buffer
@@ -1855,11 +1755,7 @@ func TestRunCrashWithoutSessionFailsImmediately(t *testing.T) {
 	remote := remoteWithExistingBranch(t, root)
 	fakeOpenCode := filepath.Join(root, "opencode")
 	writeExecutable(t, fakeOpenCode, "#!/bin/sh\ncase \"$1\" in mcp) exit 0;; esac\nexit 3\n")
-	prServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		_, _ = io.WriteString(w, `[]`)
-	}))
-	defer prServer.Close()
+	prServer := fakeLinkedPRServer(t)
 	setContinuationEnv(t, root, remote, prServer.URL, fakeOpenCode)
 
 	var output bytes.Buffer
@@ -2249,11 +2145,7 @@ func TestRunEmitsRunScopedEventsWithoutDetail(t *testing.T) {
 
 	// The branch exists on the remote and is orphaned: the adoption guard
 	// must see no pull requests and let the run proceed.
-	prServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		_, _ = io.WriteString(w, `[]`)
-	}))
-	defer prServer.Close()
+	prServer := fakeLinkedPRServer(t)
 
 	setResolveIssueEnv(t, root, remote, prServer.URL, fakeOpenCode)
 	t.Setenv("COURIER_GIT_TOKEN", testGitToken)
@@ -2373,11 +2265,7 @@ func TestChildOutputIsRedactedBeforeStreams(t *testing.T) {
 	root := t.TempDir()
 	remote := remoteWithExistingBranch(t, root)
 
-	prServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		_, _ = io.WriteString(w, `[]`)
-	}))
-	defer prServer.Close()
+	prServer := fakeLinkedPRServer(t)
 
 	fragment1 := testGitToken[:9]
 	fragment2 := testGitToken[9:]
@@ -2441,11 +2329,7 @@ func TestChildOutputRedactedOnFailureExit(t *testing.T) {
 	root := t.TempDir()
 	remote := remoteWithExistingBranch(t, root)
 
-	prServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		_, _ = io.WriteString(w, `[]`)
-	}))
-	defer prServer.Close()
+	prServer := fakeLinkedPRServer(t)
 
 	fakeOpenCode := filepath.Join(root, "opencode")
 	writeExecutable(t, fakeOpenCode, fmt.Sprintf(`#!/bin/sh
@@ -2489,11 +2373,7 @@ func TestRunSurfacesUnavailableCapabilityBeforeWork(t *testing.T) {
 	fakeOpenCode := filepath.Join(root, "opencode")
 	writeExecutable(t, fakeOpenCode, "#!/bin/sh\ncase \"$1\" in\n  mcp) printf '%s\\n' '✗ github failed'; printf '%s\\n' '    SSE error: Non-200 status code (400)'; exit 0;;\nesac\nprintf 'opencode argv: %s\\n' \"$*\"\nexit 0\n")
 
-	prServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		_, _ = io.WriteString(w, `[]`)
-	}))
-	defer prServer.Close()
+	prServer := fakeLinkedPRServer(t)
 
 	setResolveIssueEnv(t, root, remote, prServer.URL, fakeOpenCode)
 	t.Setenv("COURIER_RUN_NAME", "coderrun-it-7")
@@ -2570,11 +2450,7 @@ func TestRunHealthyCapabilityLeavesRunBehaviorUnchanged(t *testing.T) {
 	fakeOpenCode := filepath.Join(root, "opencode")
 	writeExecutable(t, fakeOpenCode, "#!/bin/sh\ncase \"$1\" in\n  mcp) printf '%s\\n' '✓ github connected'; exit 0;;\nesac\nprintf 'opencode argv: %s\\n' \"$*\"\nprintf 'completed\\n' > completed.txt\ngit add --all -- .\ngit commit -m 'test: completed work' >/dev/null\n")
 
-	prServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		_, _ = io.WriteString(w, `[]`)
-	}))
-	defer prServer.Close()
+	prServer := fakeLinkedPRServer(t)
 
 	setResolveIssueEnv(t, root, remote, prServer.URL, fakeOpenCode)
 	t.Setenv("COURIER_FRAMING", "keep scope tight")
@@ -2831,6 +2707,27 @@ func setContinuationEnv(t *testing.T, root, remote, githubBase, openCodeBinary s
 	return workspace
 }
 
+// fakeLinkedPRServer stands up the minimal httptest fixture for resolve-issue
+// tests that do not themselves exercise the linkage check (#248) or the
+// adoption short-circuit. The endpoint answers the run-branch pull request
+// query with a single open PR whose head ref names a side branch and whose
+// body closes the trusted source issue. The side-branch head ref is what
+// `PullRequestsForHead` filters on, so neither guardAdoption nor
+// fetchRunBranchPR match it to the run branch: adoption therefore proceeds
+// to the model run, and the linkage check sees no PR for the run branch
+// (a permitted outcome that is the operator's own world check concern, not
+// a linkage violation). Tests that need missing or bad linkage on the run
+// branch set up their own server instead.
+func fakeLinkedPRServer(t *testing.T) *httptest.Server {
+	t.Helper()
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `[]`)
+	}))
+	t.Cleanup(server.Close)
+	return server
+}
+
 // readArgvLog returns the argv lines the fake script recorded, one per
 // invocation, in order. The first line is the initial call; any later line is
 // a resume.
@@ -2901,11 +2798,7 @@ printf '{"type":"text","sessionID":"ses_redact1","part":{"type":"text","text":"e
 printf 'partial\n' > partial.txt
 exit 0
 `)
-	prServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		_, _ = io.WriteString(w, `[]`)
-	}))
-	defer prServer.Close()
+	prServer := fakeLinkedPRServer(t)
 	setContinuationEnv(t, root, remote, prServer.URL, fakeOpenCode)
 
 	const secretValue = "sekrit-token-value-42"
@@ -3340,11 +3233,14 @@ func TestRunResolveIssueUndeclaredVerifyingTriggersLinkageRepair(t *testing.T) {
 	}
 }
 
-// TestRunResolveIssueLinkageReadFailureIsNonFatal proves the executor
-// does not fail the run when the GitHub API is unreachable. The world
-// is the source of truth; a transient forge read failure is logged
-// and the run proceeds to its ordinary Verifying handoff.
-func TestRunResolveIssueLinkageReadFailureIsNonFatal(t *testing.T) {
+// TestRunResolveIssueLinkageReadFailureFailsClosed proves the executor
+// is fail-closed on a forge read failure (#248 follow-up): an unverifiable
+// PR body cannot quietly become a Verifying success. The run has no
+// captured session (the model exited 0), so the bounded retry has nothing
+// to resume; the run escalates to NeedsHuman with the precise forge
+// error as the reason, and the linkage.read.failed event carries the
+// original error. The declared-changes outcome tag is preserved.
+func TestRunResolveIssueLinkageReadFailureFailsClosed(t *testing.T) {
 	root := t.TempDir()
 	remote := filepath.Join(root, "remote.git")
 	source := filepath.Join(root, "source")
@@ -3364,9 +3260,10 @@ func TestRunResolveIssueLinkageReadFailureIsNonFatal(t *testing.T) {
 	}
 	writeExecutable(t, fakeOpenCode, "#!/bin/sh\ncase \"$1\" in mcp) exit 0;; esac\nprintf 'completed\\n' > completed.txt\ngit add --all -- .\ngit commit -m 'test: completed work' >/dev/null\nmkdir -p \"$COURIER_SCRATCH_DIR\"\nprintf '{\"outcome\":\"changes\"}' > \"$COURIER_SCRATCH_DIR/outcome.json\"\nexit 0\n")
 
-	// A GitHub server that always 500s: a transient forge outage
-	// must not fail the run; the executor must log the read
-	// failure and proceed to Verifying.
+	// A GitHub server that always 500s: the legacy executor cannot
+	// prove the PR body satisfies authoritative source-issue linkage
+	// when the forge is unreachable, so the run fails closed instead
+	// of becoming a Verifying success on an unverifiable world.
 	prServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusInternalServerError)
 	}))
@@ -3393,17 +3290,310 @@ func TestRunResolveIssueLinkageReadFailureIsNonFatal(t *testing.T) {
 	var output bytes.Buffer
 	var errorsOut bytes.Buffer
 	code := run(context.Background(), &output, &errorsOut)
-	if code != exitSuccess {
-		t.Fatalf("run exit code = %d, want 0; stderr=%q stdout=%q", code, errorsOut.String(), output.String())
+	if code != exitNeedsHuman {
+		t.Fatalf("run exit code = %d, want %d (NeedsHuman on fail-closed forge read failure); stderr=%q stdout=%q", code, exitNeedsHuman, errorsOut.String(), output.String())
 	}
-	if !strings.Contains(output.String(), `"phase":"Verifying"`) {
-		t.Fatalf("expected Verifying handoff on forge read failure: %q", output.String())
+	if !strings.Contains(output.String(), `"phase":"NeedsHuman"`) {
+		t.Fatalf("expected NeedsHuman handoff on forge read failure: %q", output.String())
 	}
 	if !strings.Contains(output.String(), `"linkage.read.failed"`) {
 		t.Fatalf("expected the linkage read failure to be logged: %q", output.String())
 	}
+	if !strings.Contains(output.String(), `"outcome":"changes"`) {
+		t.Fatalf("declared outcome tag should be preserved on fail-closed NeedsHuman: %q", output.String())
+	}
+	if !strings.Contains(output.String(), "acme/widgets#7") {
+		t.Fatalf("NeedsHuman reason should name the trusted source identity: %q", output.String())
+	}
 	if !strings.Contains(output.String(), "500") {
-		t.Fatalf("expected the linkage read failure detail to name the forge error: %q", output.String())
+		t.Fatalf("NeedsHuman reason should name the forge read error: %q", output.String())
+	}
+}
+
+// TestRunResolveIssueLinkageReadFailureRetriesInsideBudget exercises
+// the bounded retry/fail-closed mechanism (#248 follow-up) on the
+// declared-changes path: a forge read failure that is recoverable
+// inside the captured session's continuation budget must route
+// through the linkage-repair continuation, exactly the way the
+// undeclared-Verifying path does. The body remains unread, so the
+// retry message preserves the missing-PR text the shared helper
+// composes. The fake's first turn declares changes; the second
+// turn never declares an outcome — so the run ends mid-budget
+// without exhausting it, after the linkage-repair continuation
+// fires at least once.
+func TestRunResolveIssueLinkageReadFailureRetriesInsideBudget(t *testing.T) {
+	root := t.TempDir()
+	remote := filepath.Join(root, "remote.git")
+	source := filepath.Join(root, "source")
+	runGit(t, root, "init", "--bare", remote)
+	runGit(t, root, "init", source)
+	configureGit(t, source)
+	write(t, filepath.Join(source, "README.md"), "base\n")
+	commit(t, source, "base: initial")
+	runGit(t, source, "branch", "-M", "main")
+	runGit(t, source, "remote", "add", "origin", remote)
+	runGit(t, source, "push", "-u", "origin", "main")
+
+	stateDir := filepath.Join(root, "fakestate")
+	if err := os.MkdirAll(stateDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	fakeOpenCode := filepath.Join(root, "opencode")
+	scratchDirectory := filepath.Join(root, "scratch")
+	if err := os.MkdirAll(scratchDirectory, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	argvLog := filepath.Join(stateDir, "argv.log")
+	// Two turns: turn 1 declares changes against committed work; turn
+	// 2 (after the linkage-repair continuation fires) does not declare an
+	// outcome and exits 0, so the run is classified as undeclared mid-
+	// budget. The shared helper's retry path must run at least once on
+	// turn 1's classified Verifying candidate.
+	writeExecutable(t, fakeOpenCode, "#!/bin/sh\ncase \"$1\" in mcp) exit 0;; esac\necho \"$*\" >> \""+argvLog+"\"\necho '{\"sessionID\":\"ses_forge_retry\"}'\nmkdir -p \"$COURIER_SCRATCH_DIR\"\nprintf 'completed\\n' > completed.txt\ngit add --all -- .\ngit commit -m 'test: completed work' >/dev/null\nif [ -e \"$COURIER_SCRATCH_DIR/turn1\" ]; then\n  exit 0\nfi\ntouch \"$COURIER_SCRATCH_DIR/turn1\"\nprintf '{\"outcome\":\"changes\"}' > \"$COURIER_SCRATCH_DIR/outcome.json\"\nexit 0\n")
+
+	// A GitHub server that always 500s: the linkage check cannot read
+	// the PR body, so the executor's shared repair/budget helper must
+	// route the declared-changes Verifying candidate through the same
+	// repair continuation the undeclared path uses.
+	prServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	defer prServer.Close()
+
+	workspace := filepath.Join(root, "workspace")
+	termination := filepath.Join(root, "termination")
+	t.Setenv("COURIER_REPO_URL", remote)
+	t.Setenv("COURIER_WORKSPACE", workspace)
+	t.Setenv("COURIER_SCRATCH_DIR", scratchDirectory)
+	t.Setenv("COURIER_BASE", "main")
+	t.Setenv("COURIER_BRANCH", "courier/resolve-issue/acme-widgets/7")
+	t.Setenv("COURIER_GOAL", "Open a PR to address issue #7. Declare the outcome at "+filepath.Join(defaultScratchDirectory, defaultOutcomeFilename)+".")
+	t.Setenv("COURIER_MODEL", "any-model/name")
+	t.Setenv("COURIER_MODE", "resolve-issue")
+	t.Setenv("COURIER_REPO", "acme/widgets")
+	t.Setenv("COURIER_REF", "7")
+	t.Setenv("COURIER_GITHUB_API_BASE", prServer.URL)
+	t.Setenv("COURIER_OPENCODE_BINARY", fakeOpenCode)
+	t.Setenv("COURIER_TERMINATION_FILE", termination)
+	t.Setenv("COURIER_RESUME_BACKOFF_SECONDS", "0")
+	t.Setenv("COURIER_MAX_CONTINUATIONS", "2")
+	t.Setenv("COURIER_FAKE_STATE", stateDir)
+	t.Setenv("COURIER_RUN_NAME", "coderrun-linkage-forge-retry")
+	t.Setenv("COURIER_LOG_LEVEL", "debug")
+
+	var output bytes.Buffer
+	var errorsOut bytes.Buffer
+	code := run(context.Background(), &output, &errorsOut)
+	// After the linkage-repair continuation fires, the next turn does
+	// not declare an outcome. The undeclared path then re-reads the
+	// forge — which is still 500-ing — and only one of the two budget
+	// slots is consumed by that retry. The run ends undeclared-Verifying
+	// (success) only if the path mistakenly fell through; the correct
+	// fail-closed path needs a captured session that re-declares. The
+	// fake does not re-declare, so the run ends NeedsHuman after the
+	// budget is exhausted by re-invoking the helper on the undeclared
+	// path. The code is therefore exitNeedsHuman, and the captured-
+	// session budget has been consumed at least once by a linkage-
+	// repair continuation.
+	if code != exitNeedsHuman {
+		t.Fatalf("run exit code = %d, want %d (fail-closed on forge read failure); stderr=%q stdout=%q", code, exitNeedsHuman, errorsOut.String(), output.String())
+	}
+	if !strings.Contains(output.String(), `"kind":"linkage-repair"`) {
+		t.Fatalf("expected the shared helper to fire a linkage-repair continuation: %q", output.String())
+	}
+	if !strings.Contains(output.String(), `"linkage.read.failed"`) {
+		t.Fatalf("expected the linkage read failure event: %q", output.String())
+	}
+	if !strings.Contains(output.String(), "acme/widgets#7") {
+		t.Fatalf("repair message should name the trusted source identity: %q", output.String())
+	}
+}
+
+// TestRunResolveIssueDeclaredChangesLinkageFailureUsesBoundedRepair
+// proves the declared-changes Verifying candidate participates in the
+// same bounded continuation/repair mechanism as the undeclared path
+// (#248 follow-up): when the model has declared changes and the live
+// PR body disagrees with the trusted source issue, the legacy executor
+// must ask the captured session to repair the body, escalate to
+// NeedsHuman only after the bounded budget is exhausted, and preserve
+// the declared changes outcome tag on the terminal handoff.
+func TestRunResolveIssueDeclaredChangesLinkageFailureUsesBoundedRepair(t *testing.T) {
+	root := t.TempDir()
+	remote := filepath.Join(root, "remote.git")
+	source := filepath.Join(root, "source")
+	runGit(t, root, "init", "--bare", remote)
+	runGit(t, root, "init", source)
+	configureGit(t, source)
+	write(t, filepath.Join(source, "README.md"), "base\n")
+	commit(t, source, "base: initial")
+	runGit(t, source, "branch", "-M", "main")
+	runGit(t, source, "remote", "add", "origin", remote)
+	runGit(t, source, "push", "-u", "origin", "main")
+
+	stateDir := filepath.Join(root, "fakestate")
+	if err := os.MkdirAll(stateDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	fakeOpenCode := filepath.Join(root, "opencode")
+	scratchDirectory := filepath.Join(root, "scratch")
+	if err := os.MkdirAll(scratchDirectory, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	argvLog := filepath.Join(stateDir, "argv.log")
+	// Both turns declare changes against committed work; the body
+	// never gets corrected, so the bounded budget is exhausted and
+	// the run escalates to NeedsHuman, not to a forged Verifying
+	// success. The model never repairs the body because the fake
+	// only declares changes — the linkage check on each turn will
+	// fire again, consume one continuation, and so on.
+	writeExecutable(t, fakeOpenCode, "#!/bin/sh\ncase \"$1\" in mcp) exit 0;; esac\necho \"$*\" >> \""+argvLog+"\"\necho '{\"sessionID\":\"ses_decl_repair\"}'\nmkdir -p \"$COURIER_SCRATCH_DIR\"\nprintf 'completed\\n' > completed.txt\ngit add --all -- .\ngit commit -m 'test: completed work' >/dev/null\nprintf '{\"outcome\":\"changes\"}' > \"$COURIER_SCRATCH_DIR/outcome.json\"\nexit 0\n")
+
+	// Match either the /pulls (head query) or /pulls/{n} (post-create read).
+	prServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasSuffix(r.URL.Path, "/pulls") && r.URL.RawQuery != "" {
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = io.WriteString(w, `[{"number":12,"state":"open","head":{"ref":"courier/resolve-issue/acme-widgets/7","sha":"deadbeef"},"body":"Addresses #7. Just bundling changes."}]`)
+			return
+		}
+		w.WriteHeader(http.StatusNotFound)
+	}))
+	defer prServer.Close()
+
+	workspace := filepath.Join(root, "workspace")
+	termination := filepath.Join(root, "termination")
+	t.Setenv("COURIER_REPO_URL", remote)
+	t.Setenv("COURIER_WORKSPACE", workspace)
+	t.Setenv("COURIER_SCRATCH_DIR", scratchDirectory)
+	t.Setenv("COURIER_BASE", "main")
+	t.Setenv("COURIER_BRANCH", "courier/resolve-issue/acme-widgets/7")
+	t.Setenv("COURIER_GOAL", "Open a PR to address issue #7. Declare the outcome at "+filepath.Join(defaultScratchDirectory, defaultOutcomeFilename)+".")
+	t.Setenv("COURIER_MODEL", "any-model/name")
+	t.Setenv("COURIER_MODE", "resolve-issue")
+	t.Setenv("COURIER_REPO", "acme/widgets")
+	t.Setenv("COURIER_REF", "7")
+	t.Setenv("COURIER_GITHUB_API_BASE", prServer.URL)
+	t.Setenv("COURIER_OPENCODE_BINARY", fakeOpenCode)
+	t.Setenv("COURIER_TERMINATION_FILE", termination)
+	t.Setenv("COURIER_RESUME_BACKOFF_SECONDS", "0")
+	t.Setenv("COURIER_MAX_CONTINUATIONS", "1")
+	t.Setenv("COURIER_FAKE_STATE", stateDir)
+	t.Setenv("COURIER_RUN_NAME", "coderrun-decl-linkage-repair")
+	t.Setenv("COURIER_LOG_LEVEL", "debug")
+
+	var output bytes.Buffer
+	var errorsOut bytes.Buffer
+	code := run(context.Background(), &output, &errorsOut)
+	if code != exitNeedsHuman {
+		t.Fatalf("run exit code = %d, want %d (declared NeedsHuman after bounded repair budget); stderr=%q stdout=%q", code, exitNeedsHuman, errorsOut.String(), output.String())
+	}
+	if !strings.Contains(output.String(), `"phase":"NeedsHuman"`) {
+		t.Fatalf("expected NeedsHuman termination: %q", output.String())
+	}
+	if !strings.Contains(output.String(), `"outcome":"changes"`) {
+		t.Fatalf("NeedsHuman should preserve the declared changes outcome tag: %q", output.String())
+	}
+	if !strings.Contains(output.String(), `"kind":"linkage-repair"`) {
+		t.Fatalf("expected the declared-changes linkage failure to use the bounded repair continuation: %q", output.String())
+	}
+	if !strings.Contains(output.String(), "acme/widgets#7") {
+		t.Fatalf("repair message and exhausted-budget reason should name the trusted source identity: %q", output.String())
+	}
+	if !strings.Contains(output.String(), `"pr":12`) {
+		t.Fatalf("linkage-repair continuation should record the offending PR number: %q", output.String())
+	}
+}
+
+// TestRunResolveIssueUndeclaredLinkageReadFailureFailsClosed proves the
+// undeclared-Verifying path is fail-closed on a forge read failure (#248
+// follow-up): a transient GitHub outage during the authoritative
+// linkage check cannot quietly become a Verifying success even when
+// the coordinator never declared an outcome. The fake leaves the work
+// committed without writing an outcome declaration, so the run takes
+// the undeclared-Verifying route; the GitHub server answers every
+// pull request query with HTTP 500, so the shared repair helper
+// exhausts its bounded budget across the captured session's
+// continuations and the run ends NeedsHuman with the precise forge
+// error as the reason.
+func TestRunResolveIssueUndeclaredLinkageReadFailureFailsClosed(t *testing.T) {
+	root := t.TempDir()
+	remote := filepath.Join(root, "remote.git")
+	source := filepath.Join(root, "source")
+	runGit(t, root, "init", "--bare", remote)
+	runGit(t, root, "init", source)
+	configureGit(t, source)
+	write(t, filepath.Join(source, "README.md"), "base\n")
+	commit(t, source, "base: initial")
+	runGit(t, source, "branch", "-M", "main")
+	runGit(t, source, "remote", "add", "origin", remote)
+	runGit(t, source, "push", "-u", "origin", "main")
+
+	stateDir := filepath.Join(root, "fakestate")
+	if err := os.MkdirAll(stateDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	fakeOpenCode := filepath.Join(root, "opencode")
+	scratchDirectory := filepath.Join(root, "scratch")
+	if err := os.MkdirAll(scratchDirectory, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	argvLog := filepath.Join(stateDir, "argv.log")
+	// Two turns: turn 1 prints text + session id, commits work, and
+	// intentionally never declares an outcome so the run takes the
+	// undeclared-Verifying route. Turn 2 does the same so the
+	// shared linkage-repair helper exhausts the bounded budget
+	// across continuations and the run escalates to NeedsHuman.
+	writeExecutable(t, fakeOpenCode, "#!/bin/sh\ncase \"$1\" in mcp) exit 0;; esac\necho \"$*\" >> \""+argvLog+"\"\nmkdir -p \"$COURIER_SCRATCH_DIR\"\nif [ ! -e \"$COURIER_SCRATCH_DIR/undecl_turn1\" ]; then\n  touch \"$COURIER_SCRATCH_DIR/undecl_turn1\"\n  echo '{\"sessionID\":\"ses_undeclared_forge\"}'\n  printf 'partial work\\n'\n  printf 'completed\\n' > completed.txt\n  git add --all -- .\n  git commit -m 'test: completed work' >/dev/null\n  exit 0\nfi\nprintf 'still no outcome\\n'\nexit 0\n")
+
+	// A GitHub server that always 500s: the undeclared-Verifying
+	// path's shared linkage check sees a forge read error on every
+	// iteration. The bounded budget plus a captured session are
+	// required to fail closed without becoming a Verifying success.
+	prServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	defer prServer.Close()
+
+	workspace := filepath.Join(root, "workspace")
+	termination := filepath.Join(root, "termination")
+	t.Setenv("COURIER_REPO_URL", remote)
+	t.Setenv("COURIER_WORKSPACE", workspace)
+	t.Setenv("COURIER_SCRATCH_DIR", scratchDirectory)
+	t.Setenv("COURIER_BASE", "main")
+	t.Setenv("COURIER_BRANCH", "courier/resolve-issue/acme-widgets/7")
+	t.Setenv("COURIER_GOAL", "Open a PR to address issue #7. Declare the outcome at "+filepath.Join(defaultScratchDirectory, defaultOutcomeFilename)+".")
+	t.Setenv("COURIER_MODEL", "any-model/name")
+	t.Setenv("COURIER_MODE", "resolve-issue")
+	t.Setenv("COURIER_REPO", "acme/widgets")
+	t.Setenv("COURIER_REF", "7")
+	t.Setenv("COURIER_GITHUB_API_BASE", prServer.URL)
+	t.Setenv("COURIER_OPENCODE_BINARY", fakeOpenCode)
+	t.Setenv("COURIER_TERMINATION_FILE", termination)
+	t.Setenv("COURIER_RESUME_BACKOFF_SECONDS", "0")
+	t.Setenv("COURIER_MAX_CONTINUATIONS", "1")
+	t.Setenv("COURIER_FAKE_STATE", stateDir)
+	t.Setenv("COURIER_RUN_NAME", "coderrun-undeclared-forge-read-fails")
+	t.Setenv("COURIER_LOG_LEVEL", "debug")
+
+	var output bytes.Buffer
+	var errorsOut bytes.Buffer
+	code := run(context.Background(), &output, &errorsOut)
+	if code != exitNeedsHuman {
+		t.Fatalf("run exit code = %d, want %d (NeedsHuman on fail-closed undeclared forge read failure); stderr=%q stdout=%q", code, exitNeedsHuman, errorsOut.String(), output.String())
+	}
+	if !strings.Contains(output.String(), `"phase":"NeedsHuman"`) {
+		t.Fatalf("expected NeedsHuman handoff on undeclared forge read failure: %q", output.String())
+	}
+	if strings.Contains(output.String(), `"phase":"Verifying"`) {
+		t.Fatalf("undeclared-Verifying must not be handed off as Verifying on a forge read error: %q", output.String())
+	}
+	if !strings.Contains(output.String(), `"kind":"linkage-repair"`) {
+		t.Fatalf("expected the undeclared path to fire a linkage-repair continuation before exhausting the budget: %q", output.String())
+	}
+	if !strings.Contains(output.String(), `"linkage.read.failed"`) {
+		t.Fatalf("expected the linkage read failure event: %q", output.String())
+	}
+	if !strings.Contains(output.String(), "acme/widgets#7") {
+		t.Fatalf("NeedsHuman reason should name the trusted source identity: %q", output.String())
 	}
 }
 

@@ -1109,6 +1109,40 @@ func run(ctx context.Context, stdout, stderr io.Writer) int {
 		}
 		if declErr != nil || declared {
 			result := report.classify(ctx, workspace, cfg.Branch, startCommit, workState, decl, declared, declErr, caps)
+			// Authoritative source-issue linkage is a run-ending contract
+			// (#248) regardless of how the run was declared: a Verifying
+			// candidate must satisfy the same shared repair/budget
+			// mechanism the undeclared-Verifying path uses. The declared
+			// path therefore participates in the same continuation/repair
+			// loop as the undeclared path — without losing the declared
+			// outcome tag, which applyLinkagePlan preserves on the
+			// terminating terminal. This keeps the legacy executor from
+			// forcing NeedsHuman on a declared run whose captured
+			// session still has unused continuation budget.
+			if result.Phase == "Verifying" {
+				head, headErr := workspace.Head(ctx)
+				_ = headErr
+				verdict := report.applyLinkagePlan(ctx, continuations, cfg.MaxContinuations, tap.sessionID, ctx.Err())
+				if verdict.ContinueMsg != "" {
+					continuations++
+					stateMessage = verdict.ContinueMsg
+					detail := map[string]any{
+						"kind":         "linkage-repair",
+						"continuation": continuations,
+						"instruction":  stateMessage,
+					}
+					if verdict.PRNumber > 0 {
+						detail["pr"] = verdict.PRNumber
+					}
+					report.eventVerbose(courierlog.EventExecutorContinuation, courierlog.StatusOK, detail)
+					history = append(history, stateSummary("linkage-repair", head, tap.lastText, nil))
+					continue
+				}
+				if verdict.FailReason != "" {
+					report.terminateCaptured(ctx, workspace, startCommit, termination{Phase: "NeedsHuman", Result: "needs-human", ExitCode: exitNeedsHuman, Reason: verdict.FailReason, Outcome: result.Outcome})
+					return exitNeedsHuman
+				}
+			}
 			report.terminateCaptured(ctx, workspace, startCommit, result)
 			return result.ExitCode
 		}
@@ -1130,41 +1164,32 @@ func run(ctx context.Context, stdout, stderr io.Writer) int {
 				// the Verifying handoff, but the legacy executor must
 				// still enforce authoritative source-issue linkage
 				// before claiming success (#248) when a published
-				// PR exists. The check is gated on a real PR: a
-				// resolve-issue run that never opened a PR is not
-				// handed off as correctly linked, but the model
-				// also did not publish a PR, so the linkage
-				// question is moot and the operator observes the
-				// absence through its own world check.
-				if linkOutcome, linkErr := report.checkPRLinkage(ctx); linkErr != nil {
-					// A forge read failure must not fail the
-					// run: the world is the source of truth,
-					// and the operator re-reads the PR. We
-					// log the read failure as a verbose
-					// event so the reason survives the
-					// non-debug emitter, and proceed.
-					report.eventVerbose(courierlog.EventLinkageReadFailed, courierlog.StatusError, map[string]any{"error": linkErr.Error()})
-				} else if linkOutcome != nil && linkOutcome.pr != nil {
-					// Published PR exists with bad linkage:
-					// ask the captured OpenCode session to
-					// repair the body within the bounded
-					// continuation budget. Out-of-budget
-					// runs are handed to a human with the
-					// precise rejection so the operator can
-					// settle the run.
-					if continuations < cfg.MaxContinuations && tap.sessionID != "" && ctx.Err() == nil {
-						continuations++
-						stateMessage = linkageRepairMessage(report.sourceIssue(), linkOutcome, continuations)
-						report.eventVerbose(courierlog.EventExecutorContinuation, courierlog.StatusOK, map[string]any{
-							"kind":         "linkage-repair",
-							"continuation": continuations,
-							"pr":           linkOutcome.pr.Number,
-							"instruction":  stateMessage,
-						})
-						history = append(history, stateSummary("linkage-repair", head, tap.lastText, nil))
-						continue
+				// PR exists. The shared applyLinkagePlan helper is
+				// the single repair/budget mechanism for both
+				// declared and undeclared Verifying paths: a valid
+				// body passes, invalid or missing ones retry inside
+				// the captured session's bounded continuation
+				// budget, and an exhausted budget — or an
+				// unverifiable forge read — escalates to
+				// NeedsHuman.
+				verdict := report.applyLinkagePlan(ctx, continuations, cfg.MaxContinuations, tap.sessionID, ctx.Err())
+				if verdict.ContinueMsg != "" {
+					continuations++
+					stateMessage = verdict.ContinueMsg
+					detail := map[string]any{
+						"kind":         "linkage-repair",
+						"continuation": continuations,
+						"instruction":  stateMessage,
 					}
-					report.terminateCaptured(ctx, workspace, startCommit, termination{Phase: "NeedsHuman", Result: "needs-human", ExitCode: exitNeedsHuman, Reason: report.linkageExhaustedReason(linkOutcome)})
+					if verdict.PRNumber > 0 {
+						detail["pr"] = verdict.PRNumber
+					}
+					report.eventVerbose(courierlog.EventExecutorContinuation, courierlog.StatusOK, detail)
+					history = append(history, stateSummary("linkage-repair", head, tap.lastText, nil))
+					continue
+				}
+				if verdict.FailReason != "" {
+					report.terminateCaptured(ctx, workspace, startCommit, termination{Phase: "NeedsHuman", Result: "needs-human", ExitCode: exitNeedsHuman, Reason: verdict.FailReason})
 					return exitNeedsHuman
 				}
 				report.terminateCaptured(ctx, workspace, startCommit, termination{Phase: "Verifying", Result: "success", ExitCode: exitSuccess, Reason: "opencode completed with committed work"})
@@ -1339,9 +1364,13 @@ func (r reporter) classify(ctx context.Context, workspace *git.Workspace, branch
 
 // classifyDeclared resolves a valid coordinator declaration. A declared
 // changes ending is confirmed against the world: it succeeds only when the
-// #134 verification shows committed work reachable from the run branch
-// and the live PR body carries an authoritative closing reference to the
-// trusted source issue (#248).
+// #134 verification shows committed work reachable from the run branch.
+// The shared authoritative-linkage check runs separately, after
+// classify, so the declared path participates in the same bounded
+// continuation/repair mechanism (#248) as the undeclared-Verifying path;
+// classifyDeclared itself must not refuse the handoff on linkage alone,
+// because a refused declared handoff bypasses the model's last repair
+// opportunity inside the captured session (#170).
 func (r reporter) classifyDeclared(ctx context.Context, workspace *git.Workspace, branch, startCommit string, workState git.WorkState, decl outcomeDeclaration) termination {
 	switch strings.TrimSpace(decl.Outcome) {
 	case outcomeChanges:
@@ -1359,24 +1388,6 @@ func (r reporter) classifyDeclared(ctx context.Context, workspace *git.Workspace
 			ahead, branchErr := workspace.CommitsOnBranchSince(ctx, branch, startCommit)
 			if branchErr == nil && ahead == 0 {
 				return failed(r.offBranchReason(ctx, workspace, branch) + "; the run branch has no new commits")
-			}
-			// Authoritative source-issue linkage is a run-ending
-			// contract, not a model preference (#248). The model
-			// declared it is done; we then read the live PR body
-			// and refuse the handoff when the body disagrees with
-			// the trusted source issue. The declared path does
-			// not continue the captured session — the model said
-			// it was done — so a missing or wrong linkage is
-			// NeedsHuman with the precise rejection. The check
-			// is gated on a real PR: a run that never opened a
-			// PR is the operator's concern, not a linkage
-			// violation. A forge read failure is also not a
-			// run failure: the operator re-reads the PR through
-			// its own world check.
-			if linkOutcome, linkErr := r.checkPRLinkage(ctx); linkErr != nil {
-				r.eventVerbose(courierlog.EventLinkageReadFailed, courierlog.StatusError, map[string]any{"error": linkErr.Error()})
-			} else if linkOutcome != nil && linkOutcome.pr != nil {
-				return termination{Phase: "NeedsHuman", Result: "needs-human", ExitCode: exitNeedsHuman, Reason: r.linkageExhaustedReason(linkOutcome), Outcome: outcomeChanges}
 			}
 			return termination{Phase: "Verifying", Result: "success", ExitCode: exitSuccess, Reason: "opencode completed with committed work", Outcome: outcomeChanges}
 		}
@@ -1835,6 +1846,84 @@ func (r reporter) linkageExhaustedReason(outcome *linkageCheckOutcome) string {
 		return fmt.Sprintf("the published pull request body did not satisfy the trusted source-issue linkage to %s after the bounded repair budget (model wrote: %s): %s", target, observed, outcome.err.Error())
 	}
 	return fmt.Sprintf("the published pull request body did not satisfy the trusted source-issue linkage to %s; the run needs a human", target)
+}
+
+// linkageForgeFailureReason composes the human-readable NeedsHuman reason
+// when the live PR body could not be read from the forge at all — the
+// verifier cannot prove linkage on an unverifiable world (#248), so the
+// run escalates to a human rather than being handed off as Verifying.
+func (r reporter) linkageForgeFailureReason(err error) string {
+	source := r.sourceIssue()
+	target := source.Canonical() + "#" + strconv.Itoa(source.Number)
+	return fmt.Sprintf("the live pull request body could not be read from the forge to verify authoritative source-issue linkage to %s: %s; the run needs a human", target, err.Error())
+}
+
+// linkageVerdict is the legacy executor's authoritative-linkage decision
+// for a Verifying candidate. Pass and FailReason are mutually exclusive
+// with ContinueMsg: the run loop interprets exactly one signal at a time.
+// Pass means the linkage check satisfied the contract (or found no PR
+// for the branch, which the operator's own world check covers) and the
+// run may hand off as Verifying. ContinueMsg names the bounded repair
+// instruction the next continuation should feed the captured session;
+// PRNumber names the PR observed during the check, for audit detail on
+// the continuation event. FailReason names the precise NeedsHuman reason
+// when the bounded budget is exhausted or there is no captured session
+// to resume (#248).
+type linkageVerdict struct {
+	Pass        bool
+	ContinueMsg string
+	PRNumber    int
+	FailReason  string
+}
+
+// applyLinkagePlan runs the authoritative-source-issue linkage check and
+// returns the verdict the run loop should follow. It is shared by the
+// declared (post-classify) and the undeclared-Verifying paths so both
+// routes share one bounded retry/budget mechanism (#248). The shared
+// mechanism treats a forge read error as a fail-closed problem on both
+// paths (a transient GitHub outage cannot quietly become a Verifying
+// success, and the existing PR observer does not perform the linkage
+// check), and treats a published PR body that disagrees with the
+// trusted source issue as a bounded repair opportunity on both paths
+// (the declared-changes path used to skip the repair budget, which
+// #248 does not allow). A run that never opened a PR for the branch
+// is not a linkage violation on either path — the operator's world
+// check observes the missing PR through its own read, and the legacy
+// executor hands off as Verifying once the rest of the world agrees
+// (this matches the pre-#248 contract the design preserves). The
+// call site signals the budget consumed so far through continuations
+// (so the helper consumes one slot when it asks for a continue);
+// ctxErr is the run context's current error (non-nil when the run is
+// shutting down) and sessionID gates the resume path.
+func (r reporter) applyLinkagePlan(ctx context.Context, continuations int, maxContinuations int, sessionID string, ctxErr error) linkageVerdict {
+	linkOutcome, linkErr := r.checkPRLinkage(ctx)
+	if linkErr != nil {
+		r.eventVerbose(courierlog.EventLinkageReadFailed, courierlog.StatusError, map[string]any{"error": linkErr.Error()})
+		if continuations >= maxContinuations || sessionID == "" || ctxErr != nil {
+			return linkageVerdict{FailReason: r.linkageForgeFailureReason(linkErr)}
+		}
+		// The verifier could not reach GitHub at all. Fail closed
+		// (#248 follow-up): the next iteration retries the read once
+		// the captured session has had a chance to act on its own;
+		// using the same "open with authoritative closing reference"
+		// message keeps the model's contract crisp and the operator's
+		// audit simpler.
+		next := continuations + 1
+		return linkageVerdict{ContinueMsg: linkageRepairMessage(r.sourceIssue(), &linkageCheckOutcome{missing: true}, next)}
+	}
+	if linkOutcome == nil || linkOutcome.missing {
+		// A run that never opened a PR is the operator's concern, not
+		// a linkage violation: the operator's own world check observes
+		// the absence on its read. The legacy executor's only linkage
+		// contract is "if a PR is published, its body must authorize
+		// the trusted source" — matches the pre-#248 design.
+		return linkageVerdict{Pass: true}
+	}
+	if continuations >= maxContinuations || sessionID == "" || ctxErr != nil {
+		return linkageVerdict{PRNumber: linkOutcome.pr.Number, FailReason: r.linkageExhaustedReason(linkOutcome)}
+	}
+	next := continuations + 1
+	return linkageVerdict{ContinueMsg: linkageRepairMessage(r.sourceIssue(), linkOutcome, next), PRNumber: linkOutcome.pr.Number}
 }
 
 func installGitIdentity() func() {
