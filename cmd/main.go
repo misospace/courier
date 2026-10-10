@@ -82,6 +82,7 @@ func main() {
 	var dispatchHTTPTimeout time.Duration
 	var evidenceIntakeKeySecret string
 	var evidenceIntakeService string
+	var evidenceIntakeBind string
 	var secureMode bool
 	var forgeProvidersFile string
 	var runNamespace string
@@ -133,6 +134,7 @@ func main() {
 	flag.DurationVar(&dispatchHTTPTimeout, "dispatch-http-timeout", 30*time.Second, "Dispatch HTTP request timeout.")
 	flag.StringVar(&evidenceIntakeKeySecret, "evidence-intake-key-secret", "", "Name of the Secret in the operator namespace holding the evidence intake HMAC key under the \"key\" entry; empty with no --evidence-intake-service disables evidence wiring.")
 	flag.StringVar(&evidenceIntakeService, "evidence-intake-service", "", "URL coordinator pods POST failure evidence to; required with --evidence-intake-key-secret.")
+	flag.StringVar(&evidenceIntakeBind, "evidence-intake-bind", "", "Address the operator's own evidence-intake server binds to in-process (for example :8082); the chart derives the matching --evidence-intake-service URL. Empty leaves the operator-side intake off, and a non-empty value requires --evidence-intake-key-secret.")
 	opts := zap.Options{Development: true}
 	opts.BindFlags(flag.CommandLine)
 	flag.Parse()
@@ -197,11 +199,12 @@ func main() {
 	}
 
 	evidenceSecretSet := strings.TrimSpace(evidenceIntakeKeySecret) != ""
-	evidenceServiceSet := strings.TrimSpace(evidenceIntakeService) != ""
-	if evidenceSecretSet != evidenceServiceSet {
-		setupLog.Error(fmt.Errorf("evidence intake requires both --evidence-intake-key-secret and --evidence-intake-service"), "unable to configure evidence capture")
+	evidenceBindSet := strings.TrimSpace(evidenceIntakeBind) != ""
+	if err := validateEvidenceFlags(evidenceIntakeKeySecret, evidenceIntakeService, evidenceIntakeBind); err != nil {
+		setupLog.Error(err, "unable to configure evidence intake")
 		os.Exit(1)
 	}
+	var evidenceIntake *controller.EvidenceIntake
 	if evidenceSecretSet {
 		if err := executor.ValidateEvidenceURL(evidenceIntakeService); err != nil {
 			setupLog.Error(err, "unable to configure evidence capture")
@@ -215,7 +218,23 @@ func main() {
 		}
 		launcher.EvidenceURL = strings.TrimSpace(evidenceIntakeService)
 		launcher.EvidenceKey = key
-		setupLog.Info("evidence capture wiring configured", "namespace", podNamespace, "secret", strings.TrimSpace(evidenceIntakeKeySecret))
+		evidenceIntake = &controller.EvidenceIntake{
+			Client:    mgr.GetClient(),
+			APIReader: mgr.GetAPIReader(),
+			Scheme:    mgr.GetScheme(),
+			Key:       key,
+			Pod:       podConfig,
+			Bind:      strings.TrimSpace(evidenceIntakeBind),
+		}
+		if evidenceBindSet {
+			setupLog.Info("evidence intake server enabled", "bind", strings.TrimSpace(evidenceIntakeBind), "service", strings.TrimSpace(evidenceIntakeService))
+		} else {
+			setupLog.Info("evidence capture wiring configured", "namespace", podNamespace, "secret", strings.TrimSpace(evidenceIntakeKeySecret))
+			// Legal but inert: the URL still reaches coordinator pods while no
+			// listener answers, so every capture would spend its delivery
+			// attempts on nothing. Say so plainly at startup.
+			setupLog.Info("evidence intake listener disabled: --evidence-intake-bind is empty, coordinator capture POSTs will be refused", "service", strings.TrimSpace(evidenceIntakeService))
+		}
 	}
 
 	if err := mgr.AddHealthzCheck("healthz", healthz.Ping); err != nil {
@@ -319,6 +338,7 @@ func main() {
 		StatusWriter:   status.KubePatchWriter{Client: mgr.GetClient()},
 		Observer:       githubObserver,
 		Events:         runEvents,
+		Evidence:       evidenceIntake,
 		PRHeadResolver: existingPRHeadResolver(githubObserver),
 	}
 	if secureMode {
@@ -353,6 +373,16 @@ func main() {
 		os.Exit(1)
 	}
 
+	// The operator's own intake server runs in-process on every replica (it
+	// takes no leader election): it persists the evidence a coordinator
+	// POSTs, and the same intake drives the reconciler's evidence lifecycle.
+	if evidenceBindSet {
+		if err := mgr.Add(evidenceIntake); err != nil {
+			setupLog.Error(err, "unable to add evidence intake server")
+			os.Exit(1)
+		}
+	}
+
 	setupLog.Info("starting manager")
 	if err := mgr.Start(ctrl.SetupSignalHandler()); err != nil {
 		setupLog.Error(err, "problem running manager")
@@ -366,6 +396,24 @@ func existingPRHeadResolver(observer controller.WorldObserver) controller.Existi
 	}
 	resolver, _ := observer.(controller.ExistingPRHeadResolver)
 	return resolver
+}
+
+// validateEvidenceFlags reports a clear error when the evidence intake flags
+// are inconsistent. The key Secret and the service URL come as a pair (one is
+// useless without the other), and the operator's own intake listener (bind)
+// cannot run without the HMAC key Secret it authenticates with. All three
+// empty means evidence wiring is disabled, which is valid.
+func validateEvidenceFlags(keySecret, service, bind string) error {
+	secretSet := strings.TrimSpace(keySecret) != ""
+	serviceSet := strings.TrimSpace(service) != ""
+	bindSet := strings.TrimSpace(bind) != ""
+	if secretSet != serviceSet {
+		return fmt.Errorf("evidence intake requires both --evidence-intake-key-secret and --evidence-intake-service")
+	}
+	if bindSet && !secretSet {
+		return fmt.Errorf("--evidence-intake-bind requires --evidence-intake-key-secret")
+	}
+	return nil
 }
 
 // dispatchBinding pairs one Dispatch queue lane with one Courier LaneProfile.

@@ -74,17 +74,20 @@ The design contract is in DESIGN.md § "Failure evidence for dirty runs
 key and service configured, coordinator pods receive the evidence URL, a
 per-incarnation token and nonce, their pod UID, and a 45-second termination
 grace. The executor capture (#197 capture core, #198 executor triggers) is
-implemented: armed runs capture and POST gated failure evidence. The intake
-listener (#200) is not implemented yet, so nothing is persisted until it
-ships; with either setting empty the mechanism is invisible.
+implemented: armed runs capture and POST gated failure evidence. The
+operator's intake listener (#200) is implemented: with the bind configured,
+the operator runs its own in-process listener that re-verifies a POSTed
+bundle and persists it as a Secret. The settings gate the mechanism together:
+with the bind empty nothing is persisted, and with the key or service empty
+runs are never armed.
 
 Enable it with three settings on the operator:
 
-- `--evidence-intake-bind` (for example `:8082`): binds the write-only intake
-  listener. Empty disables evidence capture entirely. The chart renders the
-  `courier-evidence` ClusterIP Service that coordinator pods reach it on;
-  optionally restrict its ingress to coordinator pods with a NetworkPolicy.
-  Lands with #200.
+- `--evidence-intake-bind` (for example `:8082`): binds the operator's own
+  write-only intake listener in-process. Empty leaves the listener off, so
+  nothing is captured. The chart renders the `courier-evidence` ClusterIP
+  Service that coordinator pods reach it on; optionally restrict its ingress to
+  coordinator pods with a NetworkPolicy.
 - `--evidence-intake-key-secret`: name of a Secret in the operator namespace
   whose `key` entry holds a random HMAC key (for example
   `openssl rand -hex 32`). The operator derives each run's evidence token
@@ -96,13 +99,16 @@ Enable it with three settings on the operator:
   the Secret or its `key` entry is missing.
 - `--evidence-intake-service`: the URL coordinators are told to POST to.
   Wiring coordinator pods requires it together with
-  `--evidence-intake-key-secret`; deriving a default from the chart Service
-  lands with #200.
+  `--evidence-intake-key-secret`; the chart derives a default from the
+  `courier-evidence` Service when it is not set.
 
-The operator requires `create/get/list/patch/delete` on `secrets` in its
-namespaces to persist bundles and derive the `EvidenceCaptured` condition (see
-DESIGN.md, Security and boundaries, for what that grant means). Evidence
-Secrets carry the label
+The operator's Role grants `create`, `get`, `list`, `patch`, and `delete` on
+`secrets`, scoped to the operator's own namespaces (a namespaced grant, not a
+cluster-wide one) to persist bundles and derive the `EvidenceCaptured` condition
+(see DESIGN.md, Security and boundaries, for what that grant means). The chart
+renders that Role only when `evidence.enabled` is true, so passing
+`--evidence-intake-*` args by hand with `evidence.enabled=false` starts the
+intake without the RBAC it needs. Evidence Secrets carry the label
 `courier.misospace.dev/evidence: <run>`, one per coordinator pod incarnation,
 and are garbage-collected with the run; the operator also deletes them when a
 run reaches `AwaitingReview` or `Done` — the states where its own world

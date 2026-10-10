@@ -1047,7 +1047,10 @@ func TestReconcileFencesWorkerWhenControlTerminates(t *testing.T) {
 // TestReconcileControlLossReturnsToClaimed is the secure-topology mirror of
 // the legacy pod-loss backstop: a vanished control pod with the worker and
 // broker of the round still running is coordinator loss, so the run returns
-// to Claimed for a relaunch from its checkpoint.
+// to Claimed for a relaunch from its checkpoint. The detection reconcile
+// must also fence the surviving round — delete the worker, disable broker
+// ingress, delete the broker pod — so the untrusted executor and the
+// credentialed broker never outlive the missing supervisor. (#215)
 func TestReconcileControlLossReturnsToClaimed(t *testing.T) {
 	control, c := secureControl(t)
 	run := secureRun("control-loss")
@@ -1056,13 +1059,19 @@ func TestReconcileControlLossReturnsToClaimed(t *testing.T) {
 		t.Fatal(err)
 	}
 	// The control pod is gone from both readers; the worker and broker of
-	// the round survive.
+	// the round survive at the detection reconcile.
 	workerPod := healthyPod(run.Name, topology.ComponentWorker)
 	brokerPod := healthyPod(run.Name, topology.ComponentBroker)
 	for _, pod := range []*corev1.Pod{workerPod, brokerPod} {
 		if err := c.Create(context.Background(), pod); err != nil {
 			t.Fatal(err)
 		}
+	}
+	// Broker ingress is a Service in front of the broker pod; it must be
+	// torn down before the broker pod so the Service stops routing before
+	// the pod stops serving (HARNESS.md §3).
+	if err := c.Create(context.Background(), topology.BrokerService(run)); err != nil {
+		t.Fatal(err)
 	}
 	reconciler := &CoderRunReconciler{
 		Client:       c,
@@ -1088,13 +1097,20 @@ func TestReconcileControlLossReturnsToClaimed(t *testing.T) {
 	if updated.Status.Restarts != 1 {
 		t.Fatalf("restarts = %d, want 1", updated.Status.Restarts)
 	}
-	// Fencing the surviving worker and broker on the detection reconcile is
-	// #215's task, not this path's.
-	for _, name := range []string{topology.WorkerPodName(run.Name), topology.BrokerPodName(run.Name)} {
-		var pod corev1.Pod
-		if err := c.Get(context.Background(), types.NamespacedName{Namespace: run.Namespace, Name: name}, &pod); err != nil {
-			t.Fatalf("pod %q must survive the control-loss relaunch: %v", name, err)
-		}
+	// The surviving round was fenced in the detection reconcile, so the
+	// next Claimed reconcile re-provisions rather than tolerating a
+	// surviving worker and broker from a missing supervisor.
+	var worker corev1.Pod
+	if err := c.Get(context.Background(), types.NamespacedName{Namespace: run.Namespace, Name: topology.WorkerPodName(run.Name)}, &worker); !apierrors.IsNotFound(err) {
+		t.Fatalf("worker must be fenced on control-loss detection, got %v", err)
+	}
+	var service corev1.Service
+	if err := c.Get(context.Background(), types.NamespacedName{Namespace: run.Namespace, Name: topology.BrokerServiceName(run.Name)}, &service); !apierrors.IsNotFound(err) {
+		t.Fatalf("broker ingress Service must be disabled on control-loss detection, got %v", err)
+	}
+	var broker corev1.Pod
+	if err := c.Get(context.Background(), types.NamespacedName{Namespace: run.Namespace, Name: topology.BrokerPodName(run.Name)}, &broker); !apierrors.IsNotFound(err) {
+		t.Fatalf("broker pod must be torn down with its missing control on detection, got %v", err)
 	}
 }
 
@@ -1102,7 +1118,10 @@ func TestReconcileControlLossReturnsToClaimed(t *testing.T) {
 // of the unobservable-dead-coordinator backstop: a control pod evicted
 // without ever reporting container statuses is coordinator loss. The inert
 // object is deleted so the replacement control pod can carry the run's name,
-// while the surviving round's fence is #215's.
+// and the detection reconcile also fences the surviving round — delete the
+// worker, disable broker ingress, delete the broker pod — so a replacement
+// cannot attach to a surviving broker carrying the old incarnation's
+// credentials. (#215)
 func TestReconcileControlLossWithoutStatusReturnsToClaimed(t *testing.T) {
 	control, c := secureControl(t)
 	run := secureRun("control-no-status")
@@ -1125,6 +1144,9 @@ func TestReconcileControlLossWithoutStatusReturnsToClaimed(t *testing.T) {
 		if err := c.Create(context.Background(), pod); err != nil {
 			t.Fatal(err)
 		}
+	}
+	if err := c.Create(context.Background(), topology.BrokerService(run)); err != nil {
+		t.Fatal(err)
 	}
 	reconciler := &CoderRunReconciler{
 		Client:       c,
@@ -1150,17 +1172,91 @@ func TestReconcileControlLossWithoutStatusReturnsToClaimed(t *testing.T) {
 	if updated.Status.Restarts != 1 {
 		t.Fatalf("restarts = %d, want 1", updated.Status.Restarts)
 	}
-	// The inert object is gone so the replacement control pod can carry the
-	// run's name; the surviving worker and broker are untouched.
+	// The inert coordinator object is gone so the replacement control pod
+	// can carry the run's name; the surviving round is fenced the same
+	// reconcile so the untrusted worker and the credentialed broker never
+	// outlive the missing supervisor.
 	var lost corev1.Pod
 	if err := c.Get(context.Background(), types.NamespacedName{Namespace: run.Namespace, Name: topology.ControlPodName(run.Name)}, &lost); !apierrors.IsNotFound(err) {
 		t.Fatalf("control pod must be deleted so the name is free for the replacement, got %v", err)
 	}
-	for _, name := range []string{topology.WorkerPodName(run.Name), topology.BrokerPodName(run.Name)} {
-		var pod corev1.Pod
-		if err := c.Get(context.Background(), types.NamespacedName{Namespace: run.Namespace, Name: name}, &pod); err != nil {
-			t.Fatalf("pod %q must survive the control-loss relaunch: %v", name, err)
+	var worker corev1.Pod
+	if err := c.Get(context.Background(), types.NamespacedName{Namespace: run.Namespace, Name: topology.WorkerPodName(run.Name)}, &worker); !apierrors.IsNotFound(err) {
+		t.Fatalf("worker must be fenced on control-loss detection, got %v", err)
+	}
+	var service corev1.Service
+	if err := c.Get(context.Background(), types.NamespacedName{Namespace: run.Namespace, Name: topology.BrokerServiceName(run.Name)}, &service); !apierrors.IsNotFound(err) {
+		t.Fatalf("broker ingress Service must be disabled on control-loss detection, got %v", err)
+	}
+	var broker corev1.Pod
+	if err := c.Get(context.Background(), types.NamespacedName{Namespace: run.Namespace, Name: topology.BrokerPodName(run.Name)}, &broker); !apierrors.IsNotFound(err) {
+		t.Fatalf("broker pod must be torn down with its dead control on detection, got %v", err)
+	}
+}
+
+// TestReconcileControlLossAtCeilingFencesThenNeedsHuman pins the at-ceiling
+// arm of #215: when the control loss lands on a run whose restart counter
+// has already reached the ceiling, the detection reconcile still fences the
+// surviving round before terminalizing to NeedsHuman. Terminal runs are
+// never reaped, so a fence deferred past the detection reconcile would
+// never run, and the run's hand-off must keep the only intact objects of
+// the round safe from the missing supervisor.
+func TestReconcileControlLossAtCeilingFencesThenNeedsHuman(t *testing.T) {
+	control, c := secureControl(t)
+	run := secureRun("control-loss-ceiling")
+	run.Status.Phase = courier.PhaseRunning
+	run.Status.Restarts = 3 // matches defaultMaxRestarts; the next pod loss hands off to a human.
+	if err := c.Create(context.Background(), run); err != nil {
+		t.Fatal(err)
+	}
+	workerPod := healthyPod(run.Name, topology.ComponentWorker)
+	brokerPod := healthyPod(run.Name, topology.ComponentBroker)
+	for _, pod := range []*corev1.Pod{workerPod, brokerPod} {
+		if err := c.Create(context.Background(), pod); err != nil {
+			t.Fatal(err)
 		}
+	}
+	if err := c.Create(context.Background(), topology.BrokerService(run)); err != nil {
+		t.Fatal(err)
+	}
+	reconciler := &CoderRunReconciler{
+		Client:       c,
+		APIReader:    c,
+		Sources:      NewSourceRegistry(map[string]source.Adapter{"manual": &admissionSource{}}),
+		StatusWriter: fakeStatusWriter{client: c},
+		Secure:       control,
+	}
+	result, err := reconciler.Reconcile(context.Background(), ctrl.Request{NamespacedName: client.ObjectKeyFromObject(run)})
+	if err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	if result.Requeue || result.RequeueAfter != 0 {
+		t.Fatalf("result = %#v, want no requeue; the ceiling hand-off terminalizes in this reconcile", result)
+	}
+	var updated courier.CoderRun
+	if err := c.Get(context.Background(), client.ObjectKeyFromObject(run), &updated); err != nil {
+		t.Fatal(err)
+	}
+	if updated.Status.Phase != courier.PhaseNeedsHuman {
+		t.Fatalf("phase = %q, want NeedsHuman from the ceiling", updated.Status.Phase)
+	}
+	if updated.Status.Restarts != 3 {
+		t.Fatalf("restarts = %d, want 3 (ceiling is preserved, not incremented)", updated.Status.Restarts)
+	}
+	// Fence still happens — the NeedsHuman hand-off keeps no replacement
+	// running, so a surviving worker/broker would dangle past the human
+	// decision the run is waiting on.
+	var worker corev1.Pod
+	if err := c.Get(context.Background(), types.NamespacedName{Namespace: run.Namespace, Name: topology.WorkerPodName(run.Name)}, &worker); !apierrors.IsNotFound(err) {
+		t.Fatalf("worker must be fenced on the ceiling reconcile, got %v", err)
+	}
+	var service corev1.Service
+	if err := c.Get(context.Background(), types.NamespacedName{Namespace: run.Namespace, Name: topology.BrokerServiceName(run.Name)}, &service); !apierrors.IsNotFound(err) {
+		t.Fatalf("broker ingress Service must be disabled on the ceiling reconcile, got %v", err)
+	}
+	var broker corev1.Pod
+	if err := c.Get(context.Background(), types.NamespacedName{Namespace: run.Namespace, Name: topology.BrokerPodName(run.Name)}, &broker); !apierrors.IsNotFound(err) {
+		t.Fatalf("broker pod must be torn down on the ceiling reconcile, got %v", err)
 	}
 }
 
