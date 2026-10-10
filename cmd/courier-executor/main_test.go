@@ -7,6 +7,7 @@ import (
 	"context"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -23,6 +24,7 @@ import (
 	"unicode/utf8"
 
 	courierv1alpha1 "github.com/misospace/courier/api/v1alpha1"
+	"github.com/misospace/courier/internal/broker"
 	"github.com/misospace/courier/internal/evidence"
 	"github.com/misospace/courier/internal/executor"
 	"github.com/misospace/courier/internal/git"
@@ -5132,5 +5134,116 @@ printf '{"outcome":"changes"}' > "$COURIER_SCRATCH_DIR/outcome.json"
 	detail := eventDetail(t, findEvent(t, events, "evidence.capture"))
 	if detail["outcome"] != "degraded" {
 		t.Fatalf("event outcome = %v, want degraded", detail["outcome"])
+	}
+}
+
+// TestLinkageRepairMessage pins the exact shape of the bounded repair
+// instruction the legacy executor feeds to the captured session (#248):
+// the trusted source identity, the supported closing keywords, the
+// offending PR number when the check observed one, and the continuation
+// number.
+func TestLinkageRepairMessage(t *testing.T) {
+	source := broker.SourceIssue{Owner: "misospace", Name: "miso-gallery", Number: 502}
+
+	cases := []struct {
+		name         string
+		outcome      *linkageCheckOutcome
+		continuation int
+		want         string
+	}{
+		{
+			name:         "missing PR asks for one to be opened",
+			outcome:      &linkageCheckOutcome{missing: true},
+			continuation: 1,
+			want:         "Courier refused the handoff: no open pull request exists for the run branch yet, so the run cannot be handed off as Verifying. Open a pull request through the forge capability whose body carries an authoritative closing reference to misospace/miso-gallery#502. Use a supported closing keyword (Closes, Fixes, or Resolves) followed by #502, or the cross-repo form misospace/miso-gallery#502 when the trusted source repository differs from the PR base. Then re-declare the same outcome. (continuation 1)",
+		},
+		{
+			name:         "published PR names the offending number",
+			outcome:      &linkageCheckOutcome{pr: &prLinkageObservation{Number: 12, State: "open", Body: "Addresses #502"}},
+			continuation: 2,
+			want:         "Courier refused the handoff: PR #12's body does not carry an authoritative closing reference to misospace/miso-gallery#502. Update the PR body through the forge capability so it carries a supported closing keyword (Closes, Fixes, or Resolves) followed by #502, or the cross-repo form misospace/miso-gallery#502 when the trusted source repository differs from the PR base. Then re-declare the same outcome. (continuation 2)",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := linkageRepairMessage(source, tc.outcome, tc.continuation); got != tc.want {
+				t.Fatalf("linkageRepairMessage = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
+// TestLinkageExhaustedReason pins the exact NeedsHuman reason the legacy
+// executor records when the bounded repair budget is exhausted (#248):
+// the trusted source identity and, when the validator saw any, the
+// model's attempted references as rendered by
+// broker.FormatLinkageObservations.
+func TestLinkageExhaustedReason(t *testing.T) {
+	var output, errorsOut bytes.Buffer
+	report := newReporter(&output, &errorsOut, config{
+		Mode: "resolve-issue",
+		Repo: "misospace/miso-gallery",
+		Ref:  502,
+	})
+	source := report.sourceIssue()
+
+	linkErr := broker.ValidateLinkage("Closes #999. Wrong issue number.", source)
+
+	wrongNumber, ok := linkErr.(*broker.LinkageError)
+	if !ok {
+		t.Fatalf("ValidateLinkage = %T (%v), want *broker.LinkageError", linkErr, linkErr)
+	}
+	missingRef := &broker.LinkageError{Reason: broker.ErrLinkageMissing.Error()}
+
+	cases := []struct {
+		name    string
+		outcome *linkageCheckOutcome
+		want    string
+	}{
+		{
+			name:    "missing PR",
+			outcome: &linkageCheckOutcome{missing: true},
+			want:    "the model never opened a pull request for the run branch, so the handoff was refused; the run needs a human to open one with the trusted source-issue linkage to misospace/miso-gallery#502",
+		},
+		{
+			name:    "wrong issue number reports the model's attempted reference",
+			outcome: &linkageCheckOutcome{pr: &prLinkageObservation{Number: 12, State: "open"}, err: wrongNumber},
+			want:    "the published pull request body did not satisfy the trusted source-issue linkage to misospace/miso-gallery#502 after the bounded repair budget (model wrote: Closes #999): publication denied: pull request body names a different source issue number than admitted (expected misospace/miso-gallery#502, found Closes #999)",
+		},
+		{
+			name:    "no supported reference names the missing-reference rejection",
+			outcome: &linkageCheckOutcome{pr: &prLinkageObservation{Number: 12, State: "open"}, err: missingRef},
+			want:    "the published pull request body did not satisfy the trusted source-issue linkage to misospace/miso-gallery#502 after the bounded repair budget: " + broker.ErrLinkageMissing.Error(),
+		},
+		{
+			name:    "no structured error keeps the generic handoff marker",
+			outcome: &linkageCheckOutcome{pr: &prLinkageObservation{Number: 12, State: "open"}},
+			want:    "the published pull request body did not satisfy the trusted source-issue linkage to misospace/miso-gallery#502; the run needs a human",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := report.linkageExhaustedReason(tc.outcome); got != tc.want {
+				t.Fatalf("linkageExhaustedReason = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
+// TestLinkageForgeFailureReason pins the exact NeedsHuman reason for a
+// forge read failure (#248): the trusted source identity, the forge's
+// error text verbatim, and the human handoff marker.
+func TestLinkageForgeFailureReason(t *testing.T) {
+	var output, errorsOut bytes.Buffer
+	report := newReporter(&output, &errorsOut, config{
+		Mode: "resolve-issue",
+		Repo: "misospace/miso-gallery",
+		Ref:  502,
+	})
+	forgeErr := errors.New("GitHub request: GET https://api.example.com/repos/misospace/miso-gallery/pulls?per_page=100: 500 Internal Server Error")
+	want := "the live pull request body could not be read from the forge to verify authoritative source-issue linkage to misospace/miso-gallery#502: " +
+		forgeErr.Error() + "; the run needs a human"
+	if got := report.linkageForgeFailureReason(forgeErr); got != want {
+		t.Fatalf("linkageForgeFailureReason = %q, want %q", got, want)
 	}
 }

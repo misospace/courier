@@ -66,10 +66,15 @@ func TestValidateLinkageAcceptsCrossRepoFormWhenOwnerMatches(t *testing.T) {
 	}
 }
 
-func TestValidateLinkageRejectsVagueAndSubstringMatches(t *testing.T) {
+// TestValidateLinkageRejectsVagueAndSubstringMatchesDogfood502PR505 is
+// the regression fixture for the miso-gallery dogfood: issue #502 (the
+// trusted source) and the published PR #505 whose vague body was the
+// original bug.
+func TestValidateLinkageRejectsVagueAndSubstringMatchesDogfood502PR505(t *testing.T) {
 	source := trustedIssue()
 	cases := []string{
-		// Vague references that the original dogfood PR used.
+		// Vague references that the original dogfood PR used
+		// (dogfood: misospace/miso-gallery issue #502, published PR #505).
 		"Addresses #502",
 		"addresses #502",
 		"See also #502",
