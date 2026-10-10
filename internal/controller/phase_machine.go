@@ -62,6 +62,16 @@ func (r *SourceRegistry) lookup(name string) (source.Adapter, error) {
 	return adapter, nil
 }
 
+func (r *SourceRegistry) lookupRun(run *courierv1alpha1.CoderRun) (source.Adapter, error) {
+	if run == nil {
+		return nil, fmt.Errorf("%w: nil run", ErrUnknownSource)
+	}
+	if run.Spec.SourceAgent != "" {
+		return r.lookup(run.Spec.Source + ":" + run.Spec.SourceAgent)
+	}
+	return r.lookup(run.Spec.Source)
+}
+
 // HeadRef identifies the exact head of a pull request: the repository that
 // owns the branch, the branch itself, and the head commit. A fix-pr run must
 // prepare from this identity rather than resolving a branch by name alone.

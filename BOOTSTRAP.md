@@ -40,7 +40,7 @@ selection seam, so another repository can select a different image without a
 Courier code change.
 
 Courier publishes `ghcr.io/misospace/courier-go:0.1.0` as the first dogfood
-runtime. It layers Go 1.27.1, `make`, `controller-gen`, and Helm onto the
+runtime. It layers Go 1.27.2, `make`, `controller-gen`, and Helm onto the
 bootstrap image. It is an optional lane image, not part of the universal
 coordinator contract:
 
@@ -144,13 +144,29 @@ create the referenced Secret with the `DISPATCH_AGENT_TOKEN` value under the
 configured key. The queue lane selects Dispatch work; `laneProfile` selects the
 Courier `LaneProfile` for created runs. A single deployment can serve several
 bindings through `dispatch.lanes`, each pairing a Dispatch `queueLane` with a
-Courier `laneProfile` and running its own discovery runner. Each binding admits
-into its own LaneProfile, so an escalation lane can use a different profile
-(e.g. larger hosted models) without taking capacity from the default lane.
-Several bindings may share one `laneProfile`, in which case they share that
-profile's concurrency and suspend gate. `queueLane`/`laneProfile` remain the
-single-binding shorthand and cannot be combined with `lanes`. Dispatch uses the
-agent token for `next-task`, claim/status, unclaim, and task-report requests.
+Courier `laneProfile` and running its own discovery runner. Add an optional
+`agentName` when distinct bindings must share one queue; for example:
+
+```yaml
+dispatch:
+  lanes:
+    - { queueLane: local, laneProfile: local, agentName: courier-local }
+    - { queueLane: local, laneProfile: minimax, agentName: courier-cloud }
+    - { queueLane: escalated, laneProfile: frontier, agentName: courier-frontier }
+```
+
+Repeated queue lanes require distinct explicit identities. Without explicit
+names, multiple bindings retain the historical `<base agentName>-<queueLane>`
+default; a single binding and the `queueLane`/`laneProfile` shorthand retain
+the base agent identity. Shorthand cannot be combined with `lanes`. All runners
+materialize `spec.source: dispatch`; immutable `spec.sourceAgent` routes later
+claim, release, and report calls to the same agent. The base Dispatch adapter
+remains registered for retained legacy runs with an empty `sourceAgent`. Deploy
+the CRD update before the operator/chart update so the API server accepts
+`sourceAgent` on newly materialized runs. Each binding admits into its own
+LaneProfile; bindings sharing a profile share its concurrency and suspend gate.
+Dispatch uses the agent token for `next-task`, claim/status, unclaim, and
+task-report requests.
 
 ## Manual first run
 

@@ -106,6 +106,12 @@ spec:
                   (dispatch, github-label, cron, cli, web).
                 minLength: 1
                 type: string
+              sourceAgent:
+                description: |-
+                  SourceAgent identifies the source-side agent binding for lifecycle calls.
+                  Empty preserves the source's legacy, unqualified identity.
+                pattern: ^[A-Za-z0-9._-]*$
+                type: string
               workItemID:
                 description: |-
                   WorkItemID is the opaque identifier assigned by the source adapter. It
