@@ -52,9 +52,351 @@ func TestRunnerPollMaterializesAndDeduplicatesByOpaqueID(t *testing.T) {
 	}
 }
 
+func TestRunnerSkipsDiscoveryWhenLaneCapacityIsFull(t *testing.T) {
+	item := WorkItem{ID: "queue-item/generation-1", Mode: "fix-pr", Repo: "acme/widgets", Ref: 42}
+	localLane := testLane()
+	localLane.Spec.Concurrency = 1
+	minimaxLane := testLane()
+	minimaxLane.Name = "minimax"
+	minimaxLane.Spec.Concurrency = 1
+	occupied := &courierv1alpha1.CoderRun{
+		ObjectMeta: metav1.ObjectMeta{Name: "local-running", Namespace: "courier"},
+		Spec:       courierv1alpha1.CoderRunSpec{Source: "dispatch", WorkItemID: "other-item", Lane: "local"},
+		Status:     courierv1alpha1.CoderRunStatus{Phase: courierv1alpha1.PhaseRunning},
+	}
+	kubeClient := newTestClient(t, localLane, minimaxLane, occupied)
+	localAdapter := &testAdapter{items: []WorkItem{item}}
+	cloudAdapter := &testAdapter{items: []WorkItem{item}}
+	local := NewRunner(kubeClient, localAdapter, RunnerConfig{Source: "dispatch", SourceAgent: "courier-local", LaneProfile: "local", Namespace: "courier"})
+	cloud := NewRunner(kubeClient, cloudAdapter, RunnerConfig{Source: "dispatch", SourceAgent: "courier-cloud", LaneProfile: "minimax", Namespace: "courier"})
+
+	// The full local binding polls first; it must not claim the shared queue item
+	// by materializing it before the cloud binding gets its turn.
+	if err := local.Poll(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if err := cloud.Poll(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if localAdapter.discoverCalls != 0 || cloudAdapter.discoverCalls != 1 {
+		t.Fatalf("Discover() calls local/cloud = %d/%d, want 0/1", localAdapter.discoverCalls, cloudAdapter.discoverCalls)
+	}
+	var runs courierv1alpha1.CoderRunList
+	if err := kubeClient.List(context.Background(), &runs, client.InNamespace("courier")); err != nil {
+		t.Fatal(err)
+	}
+	if len(runs.Items) != 2 {
+		t.Fatalf("found %d runs, want the occupied local run plus one new run", len(runs.Items))
+	}
+	for _, run := range runs.Items {
+		if run.Spec.WorkItemID == item.ID && (run.Spec.Lane != "minimax" || run.Spec.SourceAgent != "courier-cloud") {
+			t.Fatalf("new run binding = lane %q, agent %q; want minimax/courier-cloud", run.Spec.Lane, run.Spec.SourceAgent)
+		}
+	}
+}
+
+func TestRunnerSkipsDiscoveryWhenPendingRunReservesLaneCapacity(t *testing.T) {
+	item := WorkItem{ID: "queue-item/generation-2", Mode: "fix-pr", Repo: "acme/widgets", Ref: 43}
+	localLane := testLane()
+	localLane.Spec.Concurrency = 1
+	minimaxLane := testLane()
+	minimaxLane.Name = "minimax"
+	minimaxLane.Spec.Concurrency = 1
+	reserved := &courierv1alpha1.CoderRun{
+		ObjectMeta: metav1.ObjectMeta{Name: "local-pending", Namespace: "courier"},
+		Spec:       courierv1alpha1.CoderRunSpec{Source: "dispatch", WorkItemID: "reserved-item", Lane: "local"},
+		Status:     courierv1alpha1.CoderRunStatus{Phase: courierv1alpha1.PhasePending},
+	}
+	kubeClient := newTestClient(t, localLane, minimaxLane, reserved)
+	localAdapter := &testAdapter{items: []WorkItem{item}}
+	cloudAdapter := &testAdapter{items: []WorkItem{item}}
+	local := NewRunner(kubeClient, localAdapter, RunnerConfig{Source: "dispatch", SourceAgent: "courier-local", LaneProfile: "local", Namespace: "courier"})
+	cloud := NewRunner(kubeClient, cloudAdapter, RunnerConfig{Source: "dispatch", SourceAgent: "courier-cloud", LaneProfile: "minimax", Namespace: "courier"})
+
+	if err := local.Poll(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if err := cloud.Poll(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if localAdapter.discoverCalls != 0 || cloudAdapter.discoverCalls != 1 {
+		t.Fatalf("Discover() calls local/cloud = %d/%d, want 0/1", localAdapter.discoverCalls, cloudAdapter.discoverCalls)
+	}
+
+	var runs courierv1alpha1.CoderRunList
+	if err := kubeClient.List(context.Background(), &runs, client.InNamespace("courier")); err != nil {
+		t.Fatal(err)
+	}
+	if len(runs.Items) != 2 {
+		t.Fatalf("found %d runs, want pending local reservation plus one cloud run", len(runs.Items))
+	}
+	for _, run := range runs.Items {
+		if run.Spec.WorkItemID == item.ID && (run.Spec.Lane != "minimax" || run.Spec.SourceAgent != "courier-cloud") {
+			t.Fatalf("new run binding = lane %q, agent %q; want minimax/courier-cloud", run.Spec.Lane, run.Spec.SourceAgent)
+		}
+	}
+}
+
+func TestRunnerCapacityGateUsesAdmissionReservations(t *testing.T) {
+	for _, phase := range []courierv1alpha1.Phase{
+		"",
+		courierv1alpha1.PhasePending,
+		courierv1alpha1.PhaseClaimed,
+		courierv1alpha1.PhaseRunning,
+	} {
+		t.Run(string(phase), func(t *testing.T) {
+			lane := testLane()
+			lane.Spec.Concurrency = 1
+			occupied := &courierv1alpha1.CoderRun{
+				ObjectMeta: metav1.ObjectMeta{Name: "reserved", Namespace: "courier"},
+				Spec:       courierv1alpha1.CoderRunSpec{Lane: "local"},
+				Status:     courierv1alpha1.CoderRunStatus{Phase: phase},
+			}
+			adapter := &testAdapter{items: []WorkItem{{ID: "new", Mode: "fix-pr", Repo: "acme/widgets", Ref: 1}}}
+			runner := NewRunner(newTestClient(t, lane, occupied), adapter, RunnerConfig{Source: "dispatch", LaneProfile: "local", Namespace: "courier"})
+			if err := runner.Poll(context.Background()); err != nil {
+				t.Fatal(err)
+			}
+			if adapter.discoverCalls != 0 {
+				t.Fatalf("Discover() calls = %d, want 0 while phase %q reserves capacity", adapter.discoverCalls, phase)
+			}
+		})
+	}
+}
+
+func TestRunnerCapacityGateIgnoresNonAdmissionPhasesAndResumes(t *testing.T) {
+	for _, phase := range []courierv1alpha1.Phase{
+		courierv1alpha1.PhaseVerifying,
+		courierv1alpha1.PhaseAwaitingReview,
+		courierv1alpha1.PhaseDone,
+		courierv1alpha1.PhaseFailed,
+		courierv1alpha1.PhaseNeedsHuman,
+	} {
+		t.Run(string(phase), func(t *testing.T) {
+			lane := testLane()
+			lane.Spec.Concurrency = 1
+			oldRun := &courierv1alpha1.CoderRun{
+				ObjectMeta: metav1.ObjectMeta{Name: "old", Namespace: "courier"},
+				Spec:       courierv1alpha1.CoderRunSpec{Lane: "local"},
+				Status:     courierv1alpha1.CoderRunStatus{Phase: phase},
+			}
+			adapter := &testAdapter{items: []WorkItem{{ID: "new", Mode: "fix-pr", Repo: "acme/widgets", Ref: 1}}}
+			kubeClient := newTestClient(t, lane, oldRun)
+			runner := NewRunner(kubeClient, adapter, RunnerConfig{Source: "dispatch", LaneProfile: "local", Namespace: "courier"})
+			if err := runner.Poll(context.Background()); err != nil {
+				t.Fatal(err)
+			}
+			if adapter.discoverCalls != 1 {
+				t.Fatalf("Discover() calls = %d, want 1 for non-capacity phase %q", adapter.discoverCalls, phase)
+			}
+		})
+	}
+}
+
+func TestRunnerCapacityGateResumesAfterCapacityFrees(t *testing.T) {
+	lane := testLane()
+	lane.Spec.Concurrency = 1
+	occupied := &courierv1alpha1.CoderRun{
+		ObjectMeta: metav1.ObjectMeta{Name: "running", Namespace: "courier"},
+		Spec:       courierv1alpha1.CoderRunSpec{Lane: "local"},
+		Status:     courierv1alpha1.CoderRunStatus{Phase: courierv1alpha1.PhaseRunning},
+	}
+	adapter := &testAdapter{items: []WorkItem{{ID: "new", Mode: "fix-pr", Repo: "acme/widgets", Ref: 1}}}
+	kubeClient := newTestClient(t, lane, occupied)
+	runner := NewRunner(kubeClient, adapter, RunnerConfig{Source: "dispatch", LaneProfile: "local", Namespace: "courier"})
+	if err := runner.Poll(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if adapter.discoverCalls != 0 {
+		t.Fatalf("Discover() calls while full = %d, want 0", adapter.discoverCalls)
+	}
+	if err := kubeClient.Delete(context.Background(), occupied); err != nil {
+		t.Fatal(err)
+	}
+	if err := runner.Poll(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if adapter.discoverCalls != 1 {
+		t.Fatalf("Discover() calls after capacity freed = %d, want 1", adapter.discoverCalls)
+	}
+}
+
+func TestRunnerCapacityGateAllowsConfiguredConcurrency(t *testing.T) {
+	lane := testLane()
+	lane.Spec.Concurrency = 2
+	occupied := &courierv1alpha1.CoderRun{
+		ObjectMeta: metav1.ObjectMeta{Name: "running", Namespace: "courier"},
+		Spec:       courierv1alpha1.CoderRunSpec{Lane: "local"},
+		Status:     courierv1alpha1.CoderRunStatus{Phase: courierv1alpha1.PhaseRunning},
+	}
+	pending := &courierv1alpha1.CoderRun{
+		ObjectMeta: metav1.ObjectMeta{Name: "pending", Namespace: "courier"},
+		Spec:       courierv1alpha1.CoderRunSpec{Lane: "local"},
+		Status:     courierv1alpha1.CoderRunStatus{Phase: courierv1alpha1.PhasePending},
+	}
+	adapter := &testAdapter{items: []WorkItem{{ID: "new", Mode: "fix-pr", Repo: "acme/widgets", Ref: 1}}}
+	kubeClient := newTestClient(t, lane, occupied, pending)
+	runner := NewRunner(kubeClient, adapter, RunnerConfig{Source: "dispatch", LaneProfile: "local", Namespace: "courier"})
+	if err := runner.Poll(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if adapter.discoverCalls != 0 {
+		t.Fatalf("Discover() calls = %d, want 0 with two reservations at concurrency 2", adapter.discoverCalls)
+	}
+}
+
+func TestRunnersSharingLaneProfileShareCapacityGate(t *testing.T) {
+	lane := testLane()
+	lane.Spec.Concurrency = 1
+	occupied := &courierv1alpha1.CoderRun{
+		ObjectMeta: metav1.ObjectMeta{Name: "running", Namespace: "courier"},
+		Spec:       courierv1alpha1.CoderRunSpec{Lane: "local"},
+		Status:     courierv1alpha1.CoderRunStatus{Phase: courierv1alpha1.PhaseRunning},
+	}
+	adapterA := &testAdapter{items: []WorkItem{{ID: "same", Mode: "fix-pr", Repo: "acme/widgets", Ref: 1}}}
+	adapterB := &testAdapter{items: []WorkItem{{ID: "same", Mode: "fix-pr", Repo: "acme/widgets", Ref: 1}}}
+	kubeClient := newTestClient(t, lane, occupied)
+	runnerA := NewRunner(kubeClient, adapterA, RunnerConfig{Source: "dispatch", SourceAgent: "courier-local", LaneProfile: "local", Namespace: "courier"})
+	runnerB := NewRunner(kubeClient, adapterB, RunnerConfig{Source: "dispatch", SourceAgent: "courier-cloud", LaneProfile: "local", Namespace: "courier"})
+	if err := runnerA.Poll(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if err := runnerB.Poll(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if adapterA.discoverCalls != 0 || adapterB.discoverCalls != 0 {
+		t.Fatalf("Discover() calls for shared profile = %d/%d, want 0/0", adapterA.discoverCalls, adapterB.discoverCalls)
+	}
+}
+
+func TestRunnerSkipsDiscoveryWhenLaneConcurrencyIsZero(t *testing.T) {
+	lane := testLane()
+	lane.Spec.Concurrency = 0
+	occupied := &courierv1alpha1.CoderRun{
+		ObjectMeta: metav1.ObjectMeta{Name: "running", Namespace: "courier"},
+		Spec:       courierv1alpha1.CoderRunSpec{Lane: "local"},
+		Status:     courierv1alpha1.CoderRunStatus{Phase: courierv1alpha1.PhaseRunning},
+	}
+	adapter := &testAdapter{items: []WorkItem{{ID: "new", Mode: "fix-pr", Repo: "acme/widgets", Ref: 1}}}
+	runner := NewRunner(newTestClient(t, lane, occupied), adapter, RunnerConfig{Source: "dispatch", LaneProfile: "local", Namespace: "courier"})
+	if err := runner.Poll(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if adapter.discoverCalls != 0 {
+		t.Fatalf("Discover() calls = %d, want 0 with default concurrency one", adapter.discoverCalls)
+	}
+}
+
+func TestRunnersWithDifferentBindingsMaterializeOneAtomicRun(t *testing.T) {
+	item := WorkItem{ID: "queue-item/generation-1", Mode: "fix-pr", Repo: "acme/widgets", Ref: 42}
+	kubeClient := newTestClient(t, testLane())
+	first := NewRunner(kubeClient, &testAdapter{items: []WorkItem{item}}, RunnerConfig{Source: "dispatch", SourceAgent: "courier-local", LaneProfile: "local", Namespace: "courier"})
+	second := NewRunner(kubeClient, &testAdapter{items: []WorkItem{item}}, RunnerConfig{Source: "dispatch", SourceAgent: "courier-cloud", LaneProfile: "local", Namespace: "courier"})
+	if err := first.Poll(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if err := second.Poll(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	var runs courierv1alpha1.CoderRunList
+	if err := kubeClient.List(context.Background(), &runs, client.InNamespace("courier")); err != nil {
+		t.Fatal(err)
+	}
+	if len(runs.Items) != 1 {
+		t.Fatalf("created %d runs across bindings, want atomic single run", len(runs.Items))
+	}
+}
+
+func TestConcurrentBindingsDeduplicateByCanonicalIdentity(t *testing.T) {
+	itemA := WorkItem{ID: "raw-pr-url", Mode: "fix-pr", Repo: "acme/widgets", Ref: 42}
+	itemB := WorkItem{ID: "raw-ci-job-url", Mode: "fix-pr", Repo: "acme/widgets", Ref: 42}
+	baseClient := newTestClient(t, testLane())
+	createBarrier := make(chan struct{})
+	barrierClient := &createBarrierClient{Client: baseClient, arrived: make(chan struct{}, 2), release: createBarrier}
+	first := NewRunner(barrierClient, &mappedIdentityAdapter{testAdapter: testAdapter{items: []WorkItem{itemA}}, identity: "prfix:queue-item:1"}, RunnerConfig{Source: "dispatch", SourceAgent: "agent-a", LaneProfile: "local", Namespace: "courier"})
+	second := NewRunner(barrierClient, &mappedIdentityAdapter{testAdapter: testAdapter{items: []WorkItem{itemB}}, identity: "prfix:queue-item:1"}, RunnerConfig{Source: "dispatch", SourceAgent: "agent-b", LaneProfile: "local", Namespace: "courier"})
+
+	results := make(chan error, 2)
+	go func() { results <- first.Poll(context.Background()) }()
+	go func() { results <- second.Poll(context.Background()) }()
+	<-barrierClient.arrived
+	<-barrierClient.arrived
+	close(createBarrier)
+	for range 2 {
+		if err := <-results; err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	var runs courierv1alpha1.CoderRunList
+	if err := baseClient.List(context.Background(), &runs, client.InNamespace("courier")); err != nil {
+		t.Fatal(err)
+	}
+	if len(runs.Items) != 1 {
+		t.Fatalf("created %d runs for one canonical identity, want 1", len(runs.Items))
+	}
+	run := runs.Items[0]
+	if run.Spec.SourceAgent != "agent-a" && run.Spec.SourceAgent != "agent-b" {
+		t.Fatalf("sourceAgent = %q, want one of the competing bindings", run.Spec.SourceAgent)
+	}
+	if run.Spec.WorkItemID != itemA.ID && run.Spec.WorkItemID != itemB.ID {
+		t.Fatalf("workItemID = %q, want the original opaque ID from the winning binding", run.Spec.WorkItemID)
+	}
+	if (run.Spec.SourceAgent == "agent-a" && run.Spec.WorkItemID != itemA.ID) || (run.Spec.SourceAgent == "agent-b" && run.Spec.WorkItemID != itemB.ID) {
+		t.Fatalf("winner fields do not match: sourceAgent=%q workItemID=%q", run.Spec.SourceAgent, run.Spec.WorkItemID)
+	}
+}
+
+type createBarrierClient struct {
+	client.Client
+	arrived chan struct{}
+	release <-chan struct{}
+}
+
+func (c *createBarrierClient) Create(ctx context.Context, obj client.Object, opts ...client.CreateOption) error {
+	c.arrived <- struct{}{}
+	<-c.release
+	return c.Client.Create(ctx, obj, opts...)
+}
+
+func TestRunnerPreservesRetainedLegacyDispatchRun(t *testing.T) {
+	item := WorkItem{ID: "opaque-a", Mode: "resolve-issue", Repo: "acme/widgets", Ref: 1}
+	legacy := &courierv1alpha1.CoderRun{ObjectMeta: metav1.ObjectMeta{Name: runName("dispatch:local", item.ID), Namespace: "courier"}, Spec: courierv1alpha1.CoderRunSpec{Source: "dispatch:local", WorkItemID: item.ID, Mode: courierv1alpha1.ModeResolveIssue, Repo: item.Repo, Ref: item.Ref, Lane: "local"}}
+	kubeClient := newTestClient(t, testLane(), legacy)
+	runner := NewRunner(kubeClient, &testAdapter{items: []WorkItem{item}}, RunnerConfig{Source: "dispatch", SourceAgent: "courier-local", LaneProfile: "local", Namespace: "courier"})
+	if err := runner.Poll(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	var runs courierv1alpha1.CoderRunList
+	if err := kubeClient.List(context.Background(), &runs, client.InNamespace("courier")); err != nil {
+		t.Fatal(err)
+	}
+	if len(runs.Items) != 1 || runs.Items[0].Spec.Source != "dispatch:local" {
+		t.Fatalf("retained dispatch run was duplicated: %#v", runs.Items)
+	}
+}
+
+func TestRunnerPersistsSourceAgentWithoutChangingSourceIdentity(t *testing.T) {
+	adapter := &testAdapter{items: []WorkItem{{ID: "opaque-a", Mode: "resolve-issue", Repo: "acme/widgets", Ref: 1}}}
+	kubeClient := newTestClient(t, testLane())
+	runner := NewRunner(kubeClient, adapter, RunnerConfig{Source: "dispatch", SourceAgent: "courier-local", LaneProfile: "local", Namespace: "courier"})
+	if err := runner.Poll(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	var runs courierv1alpha1.CoderRunList
+	if err := kubeClient.List(context.Background(), &runs, client.InNamespace("courier")); err != nil {
+		t.Fatal(err)
+	}
+	if len(runs.Items) != 1 || runs.Items[0].Spec.Source != "dispatch" || runs.Items[0].Spec.SourceAgent != "courier-local" {
+		t.Fatalf("materialized identity = %#v, want dispatch/courier-local", runs.Items)
+	}
+}
+
 func TestRunnerCreatesFreshRunWhenWorkItemGenerationChanges(t *testing.T) {
 	adapter := &testAdapter{items: []WorkItem{{ID: "pr-fix/queue-item/generation-1", Mode: "fix-pr", Repo: "acme/widgets", Ref: 42}}}
-	kubeClient := newTestClient(t, testLane())
+	lane := testLane()
+	lane.Spec.Concurrency = 2
+	kubeClient := newTestClient(t, lane)
 	runner := NewRunner(kubeClient, adapter, RunnerConfig{Source: "dispatch", LaneProfile: "local", Namespace: "courier"})
 
 	if err := runner.Poll(context.Background()); err != nil {
@@ -83,7 +425,9 @@ func TestRunnerCreatesFreshRunWhenWorkItemGenerationChanges(t *testing.T) {
 
 func TestRunnerDeduplicatesByAdapterWorkIdentity(t *testing.T) {
 	adapter := &identityAdapter{testAdapter: testAdapter{items: []WorkItem{{ID: "attempt-1|via-pr-url", Mode: "fix-pr", Repo: "acme/widgets", Ref: 42}}}}
-	kubeClient := newTestClient(t, testLane())
+	lane := testLane()
+	lane.Spec.Concurrency = 2
+	kubeClient := newTestClient(t, lane)
 	runner := NewRunner(kubeClient, adapter, RunnerConfig{Source: "dispatch", LaneProfile: "local", Namespace: "courier"})
 
 	if err := runner.Poll(context.Background()); err != nil {
@@ -118,6 +462,13 @@ func TestRunnerDeduplicatesByAdapterWorkIdentity(t *testing.T) {
 type identityAdapter struct {
 	testAdapter
 }
+
+type mappedIdentityAdapter struct {
+	testAdapter
+	identity string
+}
+
+func (a *mappedIdentityAdapter) WorkIdentity(string) string { return a.identity }
 
 func (a *identityAdapter) WorkIdentity(workItemID string) string {
 	identity, _, _ := strings.Cut(workItemID, "|")
@@ -395,7 +746,9 @@ func TestRunnerLaneWaitingStateTransitions(t *testing.T) {
 	}
 
 	// Lane appears → recovery logged, waiting state cleared.
-	if err := kubeClient.Create(context.Background(), testLane()); err != nil {
+	lane := testLane()
+	lane.Spec.Concurrency = 2
+	if err := kubeClient.Create(context.Background(), lane); err != nil {
 		t.Fatal(err)
 	}
 	if err := runner.Poll(context.Background()); err != nil {
@@ -417,7 +770,7 @@ func TestRunnerLaneWaitingStateTransitions(t *testing.T) {
 	}
 
 	// Lane deleted → new waiting transition (log fires again).
-	if err := kubeClient.Delete(context.Background(), testLane()); err != nil {
+	if err := kubeClient.Delete(context.Background(), lane); err != nil {
 		t.Fatal(err)
 	}
 	if err := runner.Poll(context.Background()); err != nil {
@@ -513,7 +866,9 @@ func TestRunnerPollSkipsWorkThatAlreadyHasARun(t *testing.T) {
 		{ID: "opaque-a", Mode: "resolve-issue", Repo: "acme/widgets", Ref: 1},
 		{ID: "opaque-b", Mode: "resolve-issue", Repo: "acme/widgets", Ref: 2},
 	}}
-	kubeClient := newTestClient(t, testLane(), existing)
+	lane := testLane()
+	lane.Spec.Concurrency = 2
+	kubeClient := newTestClient(t, lane, existing)
 	runner := NewRunner(kubeClient, adapter, RunnerConfig{Source: "dispatch", LaneProfile: "local", Namespace: "courier"})
 
 	if err := runner.Poll(context.Background()); err != nil {

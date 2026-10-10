@@ -42,6 +42,12 @@ type CoderRunSpec struct {
 	// +kubebuilder:validation:MinLength=1
 	Source string `json:"source"`
 
+	// SourceAgent identifies the source-side agent binding for lifecycle calls.
+	// Empty preserves the source's legacy, unqualified identity.
+	// +optional
+	// +kubebuilder:validation:Pattern=`^[A-Za-z0-9._-]*$`
+	SourceAgent string `json:"sourceAgent,omitempty"`
+
 	// WorkItemID is the opaque identifier assigned by the source adapter. It
 	// is persisted so lifecycle calls never need to infer source identity from
 	// the Kubernetes name or the numeric ref.

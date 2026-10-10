@@ -462,12 +462,14 @@ func TestChartRendersMultipleLaneBindings(t *testing.T) {
 		"--set", "dispatch.tokenSecret.name=dispatch-token-secret",
 		"--set", "dispatch.lanes[0].queueLane=normal",
 		"--set", "dispatch.lanes[0].laneProfile=default",
-		"--set", "dispatch.lanes[1].queueLane=escalated",
-		"--set", "dispatch.lanes[1].laneProfile=escalation",
+		"--set", "dispatch.lanes[0].agentName=courier-local",
+		"--set", "dispatch.lanes[1].queueLane=normal",
+		"--set", "dispatch.lanes[1].laneProfile=cloud",
+		"--set", "dispatch.lanes[1].agentName=courier-cloud",
 	)
 	for _, want := range []string{
-		"--dispatch-lane-binding=normal:default",
-		"--dispatch-lane-binding=escalated:escalation",
+		"--dispatch-lane-binding=normal:default:courier-local",
+		"--dispatch-lane-binding=normal:cloud:courier-cloud",
 		"DISPATCH_AGENT_TOKEN",
 	} {
 		if !strings.Contains(out, want) {
@@ -509,7 +511,7 @@ func TestChartRejectsAmbiguousDispatchLaneValues(t *testing.T) {
 	}
 }
 
-func TestChartRejectsInvalidLaneBindings(t *testing.T) {
+func TestChartRejectsDuplicateDispatchAgentIdentity(t *testing.T) {
 	if _, err := exec.LookPath("helm"); err != nil {
 		t.Skip("helm is not installed")
 	}
@@ -524,14 +526,16 @@ func TestChartRejectsInvalidLaneBindings(t *testing.T) {
 		"--set", "dispatch.tokenSecret.name=dispatch-token-secret",
 		"--set", "dispatch.lanes[0].queueLane=normal",
 		"--set", "dispatch.lanes[0].laneProfile=default",
+		"--set", "dispatch.lanes[0].agentName=worker",
 		"--set", "dispatch.lanes[1].queueLane=normal",
 		"--set", "dispatch.lanes[1].laneProfile=escalation",
+		"--set", "dispatch.lanes[1].agentName=worker",
 	)
 	if err == nil {
-		t.Fatalf("expected helm template to fail for duplicate queueLane, but it succeeded:\n%s", out)
+		t.Fatalf("expected helm template to fail for duplicate agentName, but it succeeded:\n%s", out)
 	}
-	if !strings.Contains(out, "duplicate queueLane") {
-		t.Fatalf("helm template failed without the expected duplicate queueLane message:\n%s", out)
+	if !strings.Contains(out, "duplicate agentName") {
+		t.Fatalf("helm template failed without the expected duplicate agentName message:\n%s", out)
 	}
 
 	out, err = runHelmOutput(t, chartDir, "template", "courier", ".",

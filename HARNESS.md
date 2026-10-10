@@ -568,6 +568,51 @@ status fields or worker status calls. Checkpoint contents are limited to
 reasoning not recoverable from the world; on resume re-read git, PR, CI, and
 source state and let the world win on conflict.
 
+### Operator control request and soft-stop (#238)
+
+The controller translates the human ingress annotation
+`courier.misospace.dev/soft-stop` into operator-owned
+`CoderRun.status.controlRequest`. It reads the annotation in `observeRunning`
+(where the live coordinator pod is already resolved) and writes the record
+through the existing status patch path when the value differs from the recorded
+`id`; the field is **not** set-once, unlike the lifecycle timestamps and the
+publication policy. The annotation value is a non-empty, bounded opaque request
+ID; clearing or changing it clears or replaces the record. The record contains
+`id`, `kind` (CRD enum closed to `soft-stop` in v1), `targetPodUID`, and
+`requestedAt`.
+
+`CoderRun.status.controlRequestAck` is harness-owned and contains `id` and `at`,
+added to the harness-owned patch set. Trusted control writes it through the
+existing trusted status path after the request is served and before setting the
+stop latch. Inside the CAS update, the broker requires a live
+`status.controlRequest`, its `id` equal to the acknowledgement ID, and its
+`targetPodUID` equal to the authenticated live control pod UID; otherwise it
+returns 422.
+
+The route constant is `PathControlRequest = "/trusted/v1/control-request"`,
+with a canonical-path check mirroring the status route. An authenticated GET on
+the same listener as `/trusted/v1/status` returns `200` with
+`{id, kind, targetPodUID, requestedAt}` iff the run UID matches and
+`targetPodUID` equals the live control pod UID; otherwise it returns `404`. The
+broker's existing `get` access to the named run and control pod is sufficient;
+no new broker or operator RBAC is needed.
+
+The harness keeps a mutex-guarded consumed set per incarnation and adds an ID
+only after the ack write succeeds; a consumed ID delivered again emits no second
+ack or control turn. `BriefRegistry.HasInFlight()` — registered briefs with no
+recorded terminal result, including one still integrating — gates exit. The
+latch stops new `runDelegate` calls only; the request is polled at step
+boundaries and inside the existing per-operation brief-wait poll, with no new
+timer, busy loop, or wall-clock bound. Stop ordering is serve, durable ack,
+stop new briefs, let in-flight briefs reach terminal and integrate and publish,
+end the model loop, reconcile status debt, flush active operations, derive the
+outcome, and exit. The soft-stop finish derives `changes`, `no_change_needed`,
+or `blocked_external` from the work-ref snapshot beyond the admission anchor
+via the existing broker snapshot, not from a model declaration. `ctx`
+cancellation (SIGTERM) remains a separate path and is never conflated with
+soft-stop; the boundary preserves per-brief publication and never deletes the
+pod (#238).
+
 ## 5. Native harness and worker protocol
 
 The harness is the only model client. Every provider stream is normalized in

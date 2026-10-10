@@ -382,6 +382,108 @@ content-based loop-detector — the same tool call, same args, same result, N
 times — remains a possible **V2** addition; it is orthogonal to the heartbeat
 and must be tuned not to false-kill genuinely slow, varied work.
 
+## Operator-initiated soft-stop (#238)
+
+**Problem.** A Running coordinator has no supported way to receive an operator
+message. Suspending a lane only lets the run finish normally; suspension never
+implies takeover. The other choice is to let it run to completion. Pod deletion is
+the only outside signal that reaches an in-flight coordinator, but it cancels the
+session and loses in-flight work — the fix-pr #988 / issue #975 case required
+capturing a 105 KB dirty patch by hand.
+
+**One channel.** Human ingress is the `CoderRun` annotation
+`courier.misospace.dev/soft-stop`; its non-empty, bounded value is an opaque
+request ID. The controller alone translates it into the operator-owned
+`status.controlRequest` record `{id, kind: "soft-stop", targetPodUID,
+requestedAt}`. `ControlRequest.kind` is CRD-enum-closed to `soft-stop` (admission
+refuses any other value), and `id` is bounded (max 128 characters). Trusted control
+never reads the annotation or `CoderRun` directly: at a step boundary it pulls
+the record from the broker over the authenticated trusted-control path, using the
+same run-bound identity, TokenReview, and control-pod-incarnation path as the
+trusted status listener. This is the only transport: no exec/attach,
+control-pod HTTP server, direct annotation read, or broker push/stream.
+Exec/attach races the coordinator and exists only on legacy; a control-pod server
+adds a reachable surface and cannot authenticate an external caller; direct
+annotation reads lack operator validation and fencing; a broker stream is
+machinery a boundary poll does not need. See [HARNESS.md](./HARNESS.md) for the
+wire contract.
+
+**Trusted writer identity.** Only the operator writes
+`status.controlRequest`; it already owns lifecycle and condition status fields
+under #126's split. The broker's trusted status listener accepts only the
+harness-owned schema — checkpoint, heartbeat, `lastCommit`, active operations,
+and the new acknowledgement — so trusted control, the worker, and a forge
+cannot forge an operator request. The model and worker have no path to status,
+and a model-authored tool request cannot reach either the request field or the
+read route.
+
+**UID and incarnation fencing.** The controller stamps a request only for a
+Running run; other phases stamp nothing. It takes `targetPodUID` from the live
+coordinator pod it observes, the same UID that fences heartbeats and active
+operations (#126). The broker serves the record only when the run UID matches
+and `targetPodUID` equals the live control pod UID; otherwise it is absent (404).
+A request addressed to a dead incarnation is void, never handed to its
+replacement: graceful handoff is not rescue, and crash/liveness recovery remains
+the fallback. On relaunch the controller clears `status.controlRequest` and
+surfaces `SoftStopObserved`, reason `Unacknowledged`, for a request the named
+incarnation never acknowledged; the condition clears on a fresh annotation or
+acknowledgement, and the operator drops `status.controlRequest` when the run
+reaches a terminal phase. Re-targeting requires a new annotation value.
+
+**Acknowledgement and idempotency.** The annotation value is the opaque request
+ID. If `status.controlRequest.id` already equals the current annotation value,
+the operator does not re-stamp it. Control keeps a mutex-guarded consumed set
+per incarnation. On accepting a matching request it first durably writes the
+harness-owned `controlRequestAck {id, at}` through the broker's trusted status
+path (resourceVersion CAS, as for other status writes), then adds the ID to the
+set and flips the stop latch. A request is never consumed without a durable
+acknowledgement, mirroring persist-before-dispatch. Redelivery of a consumed ID
+to the same incarnation is a no-op: no second acknowledgement or control turn.
+The broker rejects an acknowledgement for an ID it did not serve to the live
+incarnation. The operator treats the request as settled on observing the
+acknowledgement or terminalization. A crash between read and acknowledgement
+drops the request: it is fenced and void, consistent with the crash-fallback
+non-goal.
+
+**Checkpoint-safe stop boundary.** A soft-stop never cancels the session or
+deletes the pod. On acceptance, the latch blocks new brief dispatches only;
+shell, brief cancellation, and forge tools stay available so the model can run
+final local validation, commit, and declare `changes`. Every in-flight brief
+reaches terminal, integrates, and publishes, preserving live partial work in
+each per-brief commit. After the last in-flight brief integrates, the model turn
+loop ends, then a dedicated soft-stop finish path reconciles status debt, flushes
+active operations, and derives the outcome from the world rather than trusting a
+model declaration: `changes` iff the run's work ref holds a tip beyond the
+admission anchor, then republish through the broker (whose re-confirm is
+idempotent); otherwise `no_change_needed`. A broker publication block promotes
+the outcome to `blocked_external`. The latch, not the model, owns this decision
+and enforces exit.
+
+The request injects exactly once per consumed request ID as a `system`-role
+control turn: a 512-byte-capped, redacted note marked
+`[courier-control, control-plane]` that carries only the fixed marker and its
+instruction — never the request ID, `targetPodUID`, the run name, or a pod
+UID — telling the model to stop new work, let
+in-flight briefs finish, publish, and reply with valid outcome JSON. It must not
+quote or reference the note in model text, tool arguments, or tool results. The
+boundary is checked between model turns and inside the brief-wait loop. SIGTERM
+during soft-stop wind-down takes precedence: the harness returns the
+stream-cancelled error and the run ends `Failed`; the operator clears the request
+on the next reconcile. Legacy SIGTERM pod deletion remains distinct; this
+protocol targets the native secure harness, while legacy OpenCode retains only
+SIGTERM/relaunch.
+
+**What it cannot do.** The control turn cannot mutate run policy: publication
+policy, branch, and merge gate remain operator/forge-owned and set-once. A
+soft-stop is not a merge, and the coordinator still cannot merge. The existing
+recovery ladder still governs data loss; this feature bounds only a reachable
+run's remaining work.
+
+**Decomposition.** The single implementing child is #255, split into file-scoped
+slices for API types, `internal/status`, broker status read/ack routes, harness
+latch/injection/ack, `cmd/courier-control`, and controller annotation
+translation. It remains `status/blocked` until this design lands.
+
 ## State and checkpointing
 
 **Git is the durable floor. The checkpoint stores only what the world can't tell
@@ -504,8 +606,10 @@ deadline the bundle degrades to the manifest alone. The pod sets
 `terminationGracePeriodSeconds: 45` when capture is enabled, sized to fit the
 deadline plus the child-kill wait plus exit margin. Delivery allows at most two
 attempts inside the deadline, then stops — no cross-reconcile retry, no
-requeue; loss is recorded in a redacted `evidence.capture` event. Capture never
-changes a phase, exit code, or lifecycle report.
+requeue; loss is recorded in a redacted `evidence.capture` event. A capture the
+deadline itself aborts earns one fresh five-second manifest-only delivery
+window inside the grace (2026-10-09 decision); a stalled intake does not.
+Capture never changes a phase, exit code, or lifecycle report.
 
 **Bundle, bounds, manifest.** One gzip'd tar plus a JSON manifest; the manifest
 is always present, content is best-effort within constants (these bound storage
@@ -579,7 +683,11 @@ intake listener (own bind address, empty disables; chart renders a ClusterIP
 Service, optionally ingress-restricted to coordinator pods). HTTP with a bearer
 token follows the in-cluster transport convention settled by #120's
 dependency-cache design: plain HTTP, network-boundary + token authentication,
-no CA in clients. Validation is stateless and the persist idempotent, and the
+no CA in clients. The executor's delivery request shape is settled by #198: a
+POST of `multipart/form-data` carrying a file part named `manifest` (the
+canonical manifest JSON) and, only when the capture admitted content, a file
+part named `archive` (the gzip'd tar); the intake dispatches on part name,
+never on the parts' stamped Content-Type. Validation is stateless and the persist idempotent, and the
 listener runnable declares `NeedLeaderElection() → false`, so with leader
 election every replica serves — without that, standbys would refuse POSTs the
 Service load-balances onto them and exhaust the executor's two-attempt budget.
@@ -753,7 +861,22 @@ unparsed-bash reachability matches the pre-change baseline (no new hole).
 This is bootstrap ergonomics for the pinned runtime, distinct from the #136
 secure dependency cache.
 
-### Commit cadence
+#### Dispatch binding identity
+
+Dispatch discovery bindings all persist `spec.source: dispatch`; the optional,
+immutable `spec.sourceAgent` identifies the Dispatch agent used for lifecycle
+calls. The operator registers qualified adapters as `dispatch:<agentName>` and
+resolves non-empty identities only through that exact key (never falling back
+to the bare adapter). The bare `dispatch` adapter is retained for old runs
+whose `sourceAgent` is empty. Keeping source stable means deterministic run
+names and Kubernetes `Create` remain the atomic dedupe boundary across runners
+and retained runs; Dispatch lease observations are not atomic and do not prevent
+duplicate materialization. At rollout, runners also recognize prior
+`dispatch:<queueLane>` runs so retained work is not recreated under the new
+identity. The CRD must be installed before an operator that writes
+`sourceAgent` is rolled out.
+
+## Commit cadence
 
 Commit at **completed-brief boundaries** — not mid-thought (a foot-gun for a long
 sub-agent), not only at the very end (loses everything on a mid-run death). A
@@ -859,6 +982,7 @@ status and dies with the CR).
 spec:                       # set once by the source adapter, then immutable
   mode: resolve-issue | fix-pr
   source: dispatch | github-label | cron | cli | web
+  sourceAgent: <optional stable identity for a qualified source binding>
   workItemID: <opaque ID understood by the source adapter>
   repo: owner/name
   ref: <issue# or pr#>
@@ -1033,10 +1157,26 @@ One deployment binds one or more Dispatch queue lanes to Courier LaneProfiles;
 each binding runs its own discovery runner polling `next-task` with its lane.
 Discovery is the only lane-scoped call — claim, status, and reports are
 addressed by issue identity, so bindings share them. Two bindings never admit
-the same work item because CoderRun dedupe keys on source plus work identity,
-not lane. Suspending or capacitating one LaneProfile affects only that
-profile; several bindings may share a LaneProfile, and then they share its
-suspend gate and capacity.
+the same work item because CoderRun dedupe keys on source plus canonical work
+identity, not lane. The run name hashes that same identity so concurrent creates
+remain atomic even when incidental metadata makes the opaque IDs differ; the
+winning run still stores its original `WorkItemID` for lifecycle calls. Suspending
+or capacitating one LaneProfile affects only that profile; several bindings may
+share a LaneProfile, and then they share its suspend gate and capacity. Before
+Dispatch discovery, each runner counts empty-phase, Pending, Claimed, and Running
+CoderRuns on its profile and pauses discovery when those reservations meet
+`spec.concurrency`. This is deliberately more conservative than operator admission,
+which counts only Claimed and Running: Pending and empty-phase runs represent
+already-materialized but not-yet-admitted work, and reserving them prevents a
+binding from hoarding more Dispatch items while it waits. Do not extend this
+predicate to operator admission: a Pending run at concurrency one would count
+itself and block its own admission. Verifying and later phases do not reserve
+execution capacity. The gate uses one pre-discovery list snapshot, not an atomic
+capacity lease, and checks only once per poll; stale reads or a source returning a
+batch may still materialize work beyond available slots. It also cannot make
+Dispatch hide an already-discovered Pending head from a free sibling profile;
+that needs Dispatch-side queue exclusion. While discovery is paused, Dispatch
+`next-task` and stale-item bookkeeping are deferred until a later poll.
 
 ### Dispatch follow-up attempts (#98)
 
@@ -1228,6 +1368,43 @@ named items remain unresolved and must not be described as production-ready:
 - The exact vLLM gauge for backpressure on the target model server.
 
 ## Decisions
+
+- **2026-10-10 — Dispatch discovery reserves pending work conservatively.**
+  Each LaneProfile runner gates discovery on one pre-discovery CoderRun list,
+  counting empty-phase and Pending alongside Claimed and Running. This is
+  intentionally stricter than operator admission, which counts only Claimed and
+  Running: once work is materialized, the binding should stop fetching more while
+  that work awaits a slot, so a free sibling binding can discover other work.
+  Admission must not count Pending against its own concurrency or a Pending run
+  could never advance. This is a poll-level heuristic, not an atomic capacity
+  lease: one stale snapshot or a multi-item discovery response can still
+  over-materialize. Nor can it hide an already-visible Pending queue head from a
+  free sibling; that requires Dispatch-side exclusion. Pausing discovery also
+  defers next-task and stale-item bookkeeping until a later poll. (#260)
+
+- **2026-10-09 — #198: a deadline-expired capture still delivers the manifest.**
+  Issue #198 bounds delivery attempts inside the 20-second operation deadline,
+  while this section promises "over deadline the bundle degrades to the
+  manifest alone." When the deadline itself is what aborts the snapshot, an
+  attempt budget bound by that same expired deadline would silently void the
+  promise. The executor therefore gives the manifest-only bundle one fresh
+  five-second window (still inside the pod's 45-second grace) after an
+  operation-deadline abort; a stalled *intake* never earns this — it is for
+  the capture failure alone. Rejected: dropping the manifest (breaks the
+  degradation guarantee and hides that a capture was attempted) and a longer
+  window (stacks against the grace with the 10-second child-kill wait).
+
+- **2026-10-09 — #238: operator soft-stop is one broker-mediated control
+  request with a checkpoint-safe stop boundary.** One channel — annotation
+  ingress translated by the operator into a fenced status record and served by
+  the broker to trusted control — keeps human intent out of model-controlled
+  paths; operator-only writer identity prevents trusted control, the worker, or a
+  forge from forging requests. UID fencing voids requests for stale incarnations
+  rather than redirecting them, and a durable acknowledgement precedes the latch
+  flip so consumed requests survive status observation. In-flight briefs finish
+  and integrate before exit, preserving published partial work without pod
+  deletion; suspension remains distinct from takeover. The single implementation
+  child is #255. (#238, #126)
 
 - **2026-10-05 — #126: harness status is authenticated through the broker and
   liveness is fenced by UID.** The broker alone holds the status-write

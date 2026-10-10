@@ -453,7 +453,7 @@ func (r *CoderRunReconciler) emitPhaseTransition(run *courierv1alpha1.CoderRun, 
 }
 
 func (r *CoderRunReconciler) adapterAndWorkItem(run *courierv1alpha1.CoderRun) (source.Adapter, source.WorkItem, error) {
-	adapter, err := r.Sources.lookup(run.Spec.Source)
+	adapter, err := r.Sources.lookupRun(run)
 	if err != nil {
 		return nil, source.WorkItem{}, err
 	}
