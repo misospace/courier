@@ -1,5 +1,19 @@
 # Changelog
 
+## [0.1.8](https://github.com/misospace/courier/compare/v0.1.7...v0.1.8) (2026-10-10)
+
+
+### Features
+
+* **executor:** capture failure evidence at gated moments ([#257](https://github.com/misospace/courier/issues/257)) ([2e379ae](https://github.com/misospace/courier/commit/2e379ae7aa2cbb95eb0c50241271870427fa7326)), closes [#198](https://github.com/misospace/courier/issues/198)
+* **helm:** update chart common (5.2.1 → 5.3.0) ([#266](https://github.com/misospace/courier/issues/266)) ([1c6a83c](https://github.com/misospace/courier/commit/1c6a83c31cc9a4a8cf8e6cd43c20439c8b7c3ba2))
+* **operator:** evidence intake listener, run-owned persistence, and RBAC ([#259](https://github.com/misospace/courier/issues/259)) ([7a16947](https://github.com/misospace/courier/commit/7a169477521bc293b739406e9ba4a2e0a3622867))
+
+
+### Bug Fixes
+
+* **operator:** fence worker and broker on control-pod loss detection ([#265](https://github.com/misospace/courier/issues/265)) ([ba7d0c6](https://github.com/misospace/courier/commit/ba7d0c62d861299891562283fda675dbb6ece685))
+
 ## [0.1.7](https://github.com/misospace/courier/compare/v0.1.6...v0.1.7) (2026-10-10)
 
 
