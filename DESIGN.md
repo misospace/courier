@@ -325,8 +325,15 @@ to die.
   `Claimed` and resumes the **retained** branch, never one recreated from
   base. Pod loss and a reaped wedge share one ceiling and one relaunch path.
   A lost **control** pod is loss even while the worker and broker survive;
-  the replacement round is fenced and re-provisioned by the existing launch
-  path. An orphan with no pod to watch recovers on the next reconcile — for
+  on the detection reconcile the surviving round is fenced — the worker is
+  deleted, broker ingress is disabled before the broker pod (HARNESS.md §3),
+  and the broker pod is deleted — so the untrusted executor and the
+  credentialed broker cannot outlive the missing supervisor. At the
+  crashloop ceiling the same fence runs before the `NeedsHuman` hand-off
+  terminalizes the run, because a fence deferred past the detection
+  reconcile would never run on a terminal run; the replacement round that
+  follows a below-ceiling detection is then re-provisioned by the existing
+  launch path. (#215) An orphan with no pod to watch recovers on the next reconcile — for
   a run with no events at all, the controller's periodic resync; the manager
   configures no cache resync, so that recovery rides controller-runtime's
   default ~10-hour periodic resync.
@@ -2074,3 +2081,25 @@ was superseded.
   and no duration bound was introduced. The window it does not close — a
   cached run status lagging a sibling's already-charged status patch — needs
   charge-proof writes and stays with #126. (#105)
+- **2026-10-10 — #215: the control-loss detection reconcile now fences the
+  surviving round, not the relaunch reconcile.** Before this, a `Running`
+  secure run whose control pod had been confirmed lost by the live read
+  returned to `Claimed` with the worker and broker of the round still
+  running; the `Claimed` reconcile's `LaunchSecure` would then fence them
+  with its "surviving worker belongs to a previous control incarnation"
+  branch, but if that reconcile kept failing preflight or provisioning,
+  the untrusted executor and the credentialed broker outlived their
+  supervisor indefinitely. `SecureControl.ObserveTopology` already
+  established the opposite precedent for a terminated control pod — it
+  fences its worker and takes the broker's ingress and pod down in the
+  same reconcile that terminalizes the run, because terminal runs are
+  never reaped and a fence deferred to a later reconcile would never
+  run. The control-loss backstop now applies the same pattern: a
+  `Running` secure run whose control pod is confirmed gone calls
+  `SecureControl.Fence` on the detection reconcile, before either
+  returning to `Claimed` (below the ceiling) or terminalizing
+  `NeedsHuman` (at the ceiling). `Fence` deletes the worker pod,
+  disables broker ingress by deleting its `Service` before the broker
+  pod, and deletes the broker pod, matching the `Revoke` ordering and
+  the terminated-control branch of `ObserveTopology`. Legacy
+  (non-secure) relaunch behavior is unchanged. (#215)
