@@ -88,6 +88,10 @@ const (
 	// handoff. Its detail is always included (Verbose) so the summary reaches
 	// the log store on every finished run, not only on debug runs.
 	EventRunSummary = "run.summary"
+	// EventEvidenceCapture reports the best-effort failure-evidence capture
+	// taken at a gated moment (#198). It carries trigger, totals, and outcome
+	// only — never paths or content (#198).
+	EventEvidenceCapture = "evidence.capture"
 )
 
 // Status values for the status field.

@@ -73,9 +73,10 @@ The design contract is in DESIGN.md § "Failure evidence for dirty runs
 (#115)". The coordinator-pod wiring (#199) is implemented: with the intake
 key and service configured, coordinator pods receive the evidence URL, a
 per-incarnation token and nonce, their pod UID, and a 45-second termination
-grace. The intake listener (#200) and executor capture (#197/#198) are not
-implemented, so nothing is persisted until they ship; with either setting
-empty the mechanism is invisible.
+grace. The executor capture (#197 capture core, #198 executor triggers) is
+implemented: armed runs capture and POST gated failure evidence. The intake
+listener (#200) is not implemented yet, so nothing is persisted until it
+ships; with either setting empty the mechanism is invisible.
 
 Enable it with three settings on the operator:
 
