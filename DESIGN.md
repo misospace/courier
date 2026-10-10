@@ -1159,13 +1159,18 @@ or capacitating one LaneProfile affects only that profile; several bindings may
 share a LaneProfile, and then they share its suspend gate and capacity. Before
 Dispatch discovery, each runner counts empty-phase, Pending, Claimed, and Running
 CoderRuns on its profile and pauses discovery when those reservations meet
-`spec.concurrency`; Verifying and later phases release execution capacity, matching
-operator admission. This discovery-side guard is not Dispatch queue exclusion: a
-Pending run for an already-discovered head can still leave that head visible to a
-free sibling profile, which requires a separate Dispatch contract. While discovery
-is paused, Dispatch `next-task` and stale-item bookkeeping are also deferred until
-a later poll. Capacity is checked once per poll and does not bound multi-item
-sources that return batches.
+`spec.concurrency`. This is deliberately more conservative than operator admission,
+which counts only Claimed and Running: Pending and empty-phase runs represent
+already-materialized but not-yet-admitted work, and reserving them prevents a
+binding from hoarding more Dispatch items while it waits. Do not extend this
+predicate to operator admission: a Pending run at concurrency one would count
+itself and block its own admission. Verifying and later phases do not reserve
+execution capacity. The gate uses one pre-discovery list snapshot, not an atomic
+capacity lease, and checks only once per poll; stale reads or a source returning a
+batch may still materialize work beyond available slots. It also cannot make
+Dispatch hide an already-discovered Pending head from a free sibling profile;
+that needs Dispatch-side queue exclusion. While discovery is paused, Dispatch
+`next-task` and stale-item bookkeeping are deferred until a later poll.
 
 ### Dispatch follow-up attempts (#98)
 
@@ -1357,6 +1362,19 @@ named items remain unresolved and must not be described as production-ready:
 - The exact vLLM gauge for backpressure on the target model server.
 
 ## Decisions
+
+- **2026-10-10 — Dispatch discovery reserves pending work conservatively.**
+  Each LaneProfile runner gates discovery on one pre-discovery CoderRun list,
+  counting empty-phase and Pending alongside Claimed and Running. This is
+  intentionally stricter than operator admission, which counts only Claimed and
+  Running: once work is materialized, the binding should stop fetching more while
+  that work awaits a slot, so a free sibling binding can discover other work.
+  Admission must not count Pending against its own concurrency or a Pending run
+  could never advance. This is a poll-level heuristic, not an atomic capacity
+  lease: one stale snapshot or a multi-item discovery response can still
+  over-materialize. Nor can it hide an already-visible Pending queue head from a
+  free sibling; that requires Dispatch-side exclusion. Pausing discovery also
+  defers next-task and stale-item bookkeeping until a later poll. (#260)
 
 - **2026-10-09 — #238: operator soft-stop is one broker-mediated control
   request with a checkpoint-safe stop boundary.** One channel — annotation

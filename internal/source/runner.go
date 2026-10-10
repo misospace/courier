@@ -261,8 +261,9 @@ func (r *Runner) identity(workItemID string) string {
 	return workItemID
 }
 
-// laneCapacityReservations mirrors operator admission: Pending, Claimed, Running,
-// and the initial empty phase reserve slots; verification and later phases do not.
+// laneCapacityReservations conservatively counts empty-phase and Pending runs as
+// discovery reservations, in addition to the Claimed and Running phases admitted
+// by the operator. Verifying and later phases reserve no discovery capacity.
 func laneCapacityReservations(runs []courierv1alpha1.CoderRun, lane string) int {
 	reserved := 0
 	for i := range runs {
