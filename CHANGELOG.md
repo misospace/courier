@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.7](https://github.com/misospace/courier/compare/v0.1.6...v0.1.7) (2026-10-10)
+
+
+### Bug Fixes
+
+* gate source discovery on lane capacity ([#260](https://github.com/misospace/courier/issues/260)) ([b8b47b3](https://github.com/misospace/courier/commit/b8b47b3e8469b3ef49a3ae5cdbeda688ef2d71fa))
+
 ## [0.1.6](https://github.com/misospace/courier/compare/v0.1.5...v0.1.6) (2026-10-09)
 
 
