@@ -14,7 +14,7 @@ const (
 )
 
 // Phase is the lifecycle phase of a CoderRun.
-// +kubebuilder:validation:Enum=Pending;Claimed;Running;Verifying;AwaitingReview;NeedsHuman;Done;Failed
+// +kubebuilder:validation:Enum=Pending;Claimed;Running;Verifying;AwaitingReview;HandedOff;NeedsHuman;Done;Failed
 type Phase string
 
 const (
@@ -23,9 +23,11 @@ const (
 	PhaseRunning        Phase = "Running"
 	PhaseVerifying      Phase = "Verifying"
 	PhaseAwaitingReview Phase = "AwaitingReview"
-	PhaseNeedsHuman     Phase = "NeedsHuman"
-	PhaseDone           Phase = "Done"
-	PhaseFailed         Phase = "Failed"
+	// PhaseHandedOff marks stable, confirmed red checks on a published resolve-issue PR; it is explicitly non-successful, not AwaitingReview, NeedsHuman, or Failed.
+	PhaseHandedOff  Phase = "HandedOff"
+	PhaseNeedsHuman Phase = "NeedsHuman"
+	PhaseDone       Phase = "Done"
+	PhaseFailed     Phase = "Failed"
 )
 
 // CoderRunSpec is set once by a source adapter and is then immutable.
@@ -246,6 +248,10 @@ type CoderRunStatus struct {
 	// check set resets it, so checks that are still registering cannot pass.
 	// +optional
 	CheckFingerprint string `json:"checkFingerprint,omitempty"`
+
+	// FailedCheckFingerprint is the compact identity (head plus sorted check names) of the last fully-failed CI observation while Verifying. A resolve-issue run hands off only when two consecutive fully-failed observations carry the same fingerprint; a pending or empty observation clears it, a changed set resets it, and fix-pr does not use it.
+	// +optional
+	FailedCheckFingerprint string `json:"failedCheckFingerprint,omitempty"`
 
 	// Checkpoint is the compact resumable state written by the harness.
 	// +optional

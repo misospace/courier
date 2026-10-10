@@ -707,6 +707,78 @@ func TestHTTPClientReportMapsBlockedAndFailed(t *testing.T) {
 	}
 }
 
+func TestHTTPClientReportHandedOffDoesNotParkPRFix(t *testing.T) {
+	var reports []map[string]any
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/api/pr-fix-queue/mark" {
+			t.Fatalf("handed-off report made a queue request: %s", r.URL.Path)
+		}
+		if r.Method != http.MethodPost || r.URL.Path != "/api/agents/worker/tasks/report" {
+			t.Fatalf("request = %s %s, want POST /api/agents/worker/tasks/report", r.Method, r.URL.Path)
+		}
+		body, _ := io.ReadAll(r.Body)
+		var request map[string]any
+		if err := json.Unmarshal(body, &request); err != nil {
+			t.Fatal(err)
+		}
+		reports = append(reports, request)
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer server.Close()
+	client, err := NewClientWithLane(server.URL, "worker", "normal", "secret-token", time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	id := EncodeWorkID(Task{Type: "followup-pr", PullRequest: &PullRequest{Repo: "acme/widgets", Number: 77}, PRFixItem: &PRFixItem{ID: "queue-item", Generation: 1}})
+	if err := client.Report(context.Background(), id, source.Lifecycle{Result: source.ResultHandedOff, PR: "88", Error: "external verification failed"}); err != nil {
+		t.Fatal(err)
+	}
+	if len(reports) != 1 {
+		t.Fatalf("reports = %#v, want exactly one handed-off task report", reports)
+	}
+	if reports[0]["outcome"] != "handed-off" || reports[0]["error"] != "external verification failed" || reports[0]["pullRequestNumber"] != float64(88) {
+		t.Fatalf("report = %#v, want handed-off outcome, error, and echoed PR 88", reports[0])
+	}
+}
+
+func TestHTTPClientReportHandedOffImplementDoesNotParkPRFix(t *testing.T) {
+	var reports []map[string]any
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/api/pr-fix-queue/mark" {
+			t.Fatalf("handed-off implement report made a queue request: %s", r.URL.Path)
+		}
+		if r.Method != http.MethodPost || r.URL.Path != "/api/agents/worker/tasks/report" {
+			t.Fatalf("request = %s %s, want POST /api/agents/worker/tasks/report", r.Method, r.URL.Path)
+		}
+		body, _ := io.ReadAll(r.Body)
+		var request map[string]any
+		if err := json.Unmarshal(body, &request); err != nil {
+			t.Fatal(err)
+		}
+		reports = append(reports, request)
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer server.Close()
+	client, err := NewClientWithLane(server.URL, "worker", "normal", "secret-token", time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	id := EncodeWorkID(Task{Type: "implement", Issue: &Issue{ID: "issue-1", Repo: "acme/widgets", Number: 42}})
+	if err := client.Report(context.Background(), id, source.Lifecycle{Result: source.ResultHandedOff, PR: "77", Error: "external verification failed"}); err != nil {
+		t.Fatal(err)
+	}
+	if len(reports) != 1 {
+		t.Fatalf("reports = %#v, want exactly one handed-off task report", reports)
+	}
+	report := reports[0]
+	if report["taskType"] != "implement" || report["outcome"] != "handed-off" || report["issueNumber"] != float64(42) || report["pullRequestNumber"] != float64(77) || report["error"] != "external verification failed" {
+		t.Fatalf("report = %#v, want an implement handed-off report for issue 42 PR 77", report)
+	}
+	if _, ok := report["prFixItem"]; ok {
+		t.Fatalf("implement handed-off report included prFixItem: %#v", report)
+	}
+}
+
 func TestWorkIdentityIgnoresTaskURLForQueueBackedFollowups(t *testing.T) {
 	attempt := func(url string, generation int) string {
 		return EncodeWorkID(Task{Type: "followup-pr", Issue: &Issue{Repo: "acme/widgets", Number: 111}, PullRequest: &PullRequest{Repo: "acme/widgets", Number: 113, URL: url}, PRFixItem: &PRFixItem{ID: "queue-item", Generation: generation}})

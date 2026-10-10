@@ -69,7 +69,7 @@ func (w KubePatchWriter) PatchStatus(ctx context.Context, name types.NamespacedN
 // observed-world fields. Empty values are omitted, which is appropriate for
 // additive observed status and avoids clearing harness-owned fields or
 // previously published operator fields. Branch, HeadRepo, HeadSHA,
-// CheckFingerprint, and Restarts are pointers because the operator must be
+// CheckFingerprint, FailedCheckFingerprint, and Restarts are pointers because the operator must be
 // able to clear them back to their zero values — a failed launch discards a
 // stale resolved branch and head identity, a pending or reshaped check
 // observation discards stale green evidence, and a run that demonstrates
@@ -95,9 +95,10 @@ type OperatorPatch struct {
 	// WaitDuration is set once, when StartedAt is recorded.
 	WaitDuration string `json:"waitDuration,omitempty"`
 	// RunDuration is set once, when FinishedAt is recorded.
-	RunDuration      string  `json:"runDuration,omitempty"`
-	CheckFingerprint *string `json:"checkFingerprint,omitempty"`
-	Restarts         *int    `json:"restarts,omitempty"`
+	RunDuration            string  `json:"runDuration,omitempty"`
+	CheckFingerprint       *string `json:"checkFingerprint,omitempty"`
+	FailedCheckFingerprint *string `json:"failedCheckFingerprint,omitempty"`
+	Restarts               *int    `json:"restarts,omitempty"`
 	// PublicationPolicy is the operator-resolved immutable publication
 	// destination, persisted once at secure admission. The caller enforces
 	// set-once semantics: the operator only emits the field when the run's

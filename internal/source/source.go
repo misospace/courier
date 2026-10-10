@@ -85,6 +85,8 @@ const (
 	// ResultFailed marks work that failed execution. Sources own the policy for
 	// handling it; some may issue a fresh attempt while others only record it.
 	ResultFailed Result = "failed"
+	// ResultHandedOff means the PR was published but external verification did not pass; the source must not treat it as ready or blocked, and its independent PR-repair mechanism takes over using the carried PR identity.
+	ResultHandedOff Result = "handed-off"
 )
 
 // Lifecycle contains source-neutral metadata for an optional lifecycle report.

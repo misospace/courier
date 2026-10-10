@@ -1017,6 +1017,276 @@ func TestResolveIssueRedCIObserverReachesReviewAfterRepair(t *testing.T) {
 	}
 }
 
+func TestResolveIssueStableRedChecksHandOff(t *testing.T) {
+	item := &admissionSource{}
+	run := admissionRun("run", "local", courierv1alpha1.PhaseVerifying)
+	run.Spec.Mode = courierv1alpha1.ModeResolveIssue
+	run.Spec.Source = "manual"
+	run.Status.Branch = "courier/acme/widgets/issue-1"
+	run.Status.HeadRepo = "acme/widgets"
+	run.Status.HeadSHA = "head-abc"
+	client := phaseClient(t, run)
+	reconciler := &CoderRunReconciler{
+		Client:       client,
+		Sources:      NewSourceRegistry(map[string]source.Adapter{"manual": item}),
+		StatusWriter: fakeStatusWriter{client: client},
+		Observer: &sequenceWorldObserver{observations: []PRObservation{
+			redObservation("sha-red", "test"),
+			redObservation("sha-red", "test"),
+		}},
+	}
+	if _, err := reconciler.Reconcile(context.Background(), admissionRequest("run")); err != nil {
+		t.Fatalf("first Reconcile() error = %v", err)
+	}
+	var verifying courierv1alpha1.CoderRun
+	if err := client.Get(context.Background(), admissionKey("run"), &verifying); err != nil {
+		t.Fatalf("get run: %v", err)
+	}
+	if verifying.Status.Phase != courierv1alpha1.PhaseVerifying {
+		t.Fatalf("phase after first red observation = %q, want Verifying", verifying.Status.Phase)
+	}
+	if verifying.Status.FailedCheckFingerprint == "" {
+		t.Fatal("failedCheckFingerprint after first red observation = empty, want the recorded red set")
+	}
+	if len(item.reports) != 0 || len(item.transitions) != 0 {
+		t.Fatalf("first red observation settled early: reports=%#v transitions=%#v", item.reports, item.transitions)
+	}
+	if _, err := reconciler.Reconcile(context.Background(), admissionRequest("run")); err != nil {
+		t.Fatalf("second Reconcile() error = %v", err)
+	}
+	var settled courierv1alpha1.CoderRun
+	if err := client.Get(context.Background(), admissionKey("run"), &settled); err != nil {
+		t.Fatalf("get run: %v", err)
+	}
+	if settled.Status.Phase != courierv1alpha1.PhaseHandedOff {
+		t.Fatalf("phase after stable red observation = %q, want HandedOff", settled.Status.Phase)
+	}
+	if settled.Status.PR != "42" {
+		t.Fatalf("PR after handoff = %q, want 42 preserved", settled.Status.PR)
+	}
+	if settled.Status.HeadRepo != "acme/widgets" || settled.Status.HeadSHA != "head-abc" {
+		t.Fatalf("head identity after handoff = repo %q sha %q, want preserved", settled.Status.HeadRepo, settled.Status.HeadSHA)
+	}
+	if len(item.transitions) != 0 {
+		t.Fatalf("transitions = %#v, want none: a handoff publishes no source state", item.transitions)
+	}
+	if len(item.reports) != 1 || item.reports[0].Result != source.ResultHandedOff || item.reports[0].PR != "42" || item.reports[0].Error != externalVerificationFailureReason {
+		t.Fatalf("reports = %#v, want one handed-off report for PR 42", item.reports)
+	}
+}
+
+func TestResolveIssuePendingRedDoesNotSettle(t *testing.T) {
+	item := &admissionSource{}
+	run := admissionRun("run", "local", courierv1alpha1.PhaseVerifying)
+	run.Spec.Mode = courierv1alpha1.ModeResolveIssue
+	run.Spec.Source = "manual"
+	run.Status.Branch = "courier/acme/widgets/issue-1"
+	// Pre-seed a prior red candidate: the mixed observation must clear it
+	// rather than let it pair with a later fully-failed set.
+	run.Status.FailedCheckFingerprint = checkSetFingerprint(redObservation("sha-red", "test"))
+	client := phaseClient(t, run)
+	mixed := PRObservation{PR: "42", Head: "sha-red", Checks: []CheckObservation{
+		{Name: "test", State: CheckStateFailed},
+		{Name: "lint", State: CheckStatePending},
+	}}
+	reconciler := &CoderRunReconciler{
+		Client:       client,
+		Sources:      NewSourceRegistry(map[string]source.Adapter{"manual": item}),
+		StatusWriter: fakeStatusWriter{client: client},
+		Observer: &sequenceWorldObserver{observations: []PRObservation{
+			mixed,
+			mixed,
+			redObservation("sha-red", "test", "lint"),
+			redObservation("sha-red", "test", "lint"),
+		}},
+	}
+	for i, want := range []courierv1alpha1.Phase{
+		courierv1alpha1.PhaseVerifying,
+		courierv1alpha1.PhaseVerifying,
+		courierv1alpha1.PhaseVerifying,
+		courierv1alpha1.PhaseHandedOff,
+	} {
+		if _, err := reconciler.Reconcile(context.Background(), admissionRequest("run")); err != nil {
+			t.Fatalf("Reconcile() %d error = %v", i+1, err)
+		}
+		var updated courierv1alpha1.CoderRun
+		if err := client.Get(context.Background(), admissionKey("run"), &updated); err != nil {
+			t.Fatalf("get run: %v", err)
+		}
+		if updated.Status.Phase != want {
+			t.Fatalf("phase after observation %d = %q, want %q", i+1, updated.Status.Phase, want)
+		}
+		if i < 2 && updated.Status.FailedCheckFingerprint != "" {
+			t.Fatalf("failedCheckFingerprint after pending+red observation = %q, want cleared", updated.Status.FailedCheckFingerprint)
+		}
+	}
+	if len(item.transitions) != 0 {
+		t.Fatalf("transitions = %#v, want none: a pending observation never transitions", item.transitions)
+	}
+	if len(item.reports) != 1 || item.reports[0].Result != source.ResultHandedOff {
+		t.Fatalf("reports = %#v, want exactly one handed-off report", item.reports)
+	}
+}
+
+func TestResolveIssueRedThenGreenBeforeSettlement(t *testing.T) {
+	item := &admissionSource{}
+	run := admissionRun("run", "local", courierv1alpha1.PhaseVerifying)
+	run.Spec.Mode = courierv1alpha1.ModeResolveIssue
+	run.Spec.Source = "manual"
+	run.Status.Branch = "courier/acme/widgets/issue-1"
+	client := phaseClient(t, run)
+	reconciler := &CoderRunReconciler{
+		Client:       client,
+		Sources:      NewSourceRegistry(map[string]source.Adapter{"manual": item}),
+		StatusWriter: fakeStatusWriter{client: client},
+		Observer: &sequenceWorldObserver{observations: []PRObservation{
+			redObservation("sha-red", "test"),
+			greenObservation("sha-green", "test"),
+			greenObservation("sha-green", "test"),
+		}},
+	}
+	for i, want := range []courierv1alpha1.Phase{
+		courierv1alpha1.PhaseVerifying,
+		courierv1alpha1.PhaseVerifying,
+		courierv1alpha1.PhaseAwaitingReview,
+	} {
+		if _, err := reconciler.Reconcile(context.Background(), admissionRequest("run")); err != nil {
+			t.Fatalf("Reconcile() %d error = %v", i+1, err)
+		}
+		var updated courierv1alpha1.CoderRun
+		if err := client.Get(context.Background(), admissionKey("run"), &updated); err != nil {
+			t.Fatalf("get run: %v", err)
+		}
+		if updated.Status.Phase != want {
+			t.Fatalf("phase after observation %d = %q, want %q", i+1, updated.Status.Phase, want)
+		}
+	}
+	if len(item.transitions) != 1 || item.transitions[0] != source.StateInReview {
+		t.Fatalf("transitions = %#v, want exactly one in-review", item.transitions)
+	}
+	if len(item.reports) != 1 || item.reports[0].Result != source.ResultReady {
+		t.Fatalf("reports = %#v, want exactly one ready report", item.reports)
+	}
+}
+
+func TestHandoffReportRetryReusesIdempotencyKey(t *testing.T) {
+	item := &admissionSource{reportErr: errors.New("report unavailable")}
+	run := admissionRun("run", "local", courierv1alpha1.PhaseVerifying)
+	run.Spec.Mode = courierv1alpha1.ModeResolveIssue
+	run.Spec.Source = "manual"
+	run.Status.Branch = "courier/acme/widgets/issue-1"
+	observation := redObservation("sha-red", "test")
+	run.Status.FailedCheckFingerprint = checkSetFingerprint(observation)
+	client := phaseClient(t, run)
+	reconciler := &CoderRunReconciler{
+		Client:       client,
+		Sources:      NewSourceRegistry(map[string]source.Adapter{"manual": item}),
+		StatusWriter: fakeStatusWriter{client: client},
+		Observer:     fakeWorldObserver{observation: observation},
+	}
+	if _, err := reconciler.Reconcile(context.Background(), admissionRequest("run")); err != nil {
+		t.Fatalf("first Reconcile() error = %v, want nil (a failed report must not block terminalization)", err)
+	}
+	if len(item.reports) != 1 {
+		t.Fatalf("reports = %#v, want one before the retry", item.reports)
+	}
+	var handedOff courierv1alpha1.CoderRun
+	if err := client.Get(context.Background(), admissionKey("run"), &handedOff); err != nil {
+		t.Fatalf("get run: %v", err)
+	}
+	if handedOff.Status.Phase != courierv1alpha1.PhaseHandedOff {
+		t.Fatalf("phase = %q, want HandedOff", handedOff.Status.Phase)
+	}
+	item.reportErr = nil
+	if _, err := reconciler.Reconcile(context.Background(), admissionRequest("run")); err != nil {
+		t.Fatalf("second Reconcile() error = %v", err)
+	}
+	if len(item.reports) != 2 {
+		t.Fatalf("reports = %#v, want one per attempt", item.reports)
+	}
+	want := lifecycleIdempotencyKey(run, courierv1alpha1.PhaseHandedOff)
+	if item.reports[0].IdempotencyKey != want {
+		t.Fatalf("first report key = %q, want %q", item.reports[0].IdempotencyKey, want)
+	}
+	if item.reports[1].IdempotencyKey != item.reports[0].IdempotencyKey {
+		t.Fatalf("retry report key = %q, want %q", item.reports[1].IdempotencyKey, item.reports[0].IdempotencyKey)
+	}
+	if _, err := reconciler.Reconcile(context.Background(), admissionRequest("run")); err != nil {
+		t.Fatalf("third Reconcile() error = %v", err)
+	}
+	if len(item.reports) != 2 {
+		t.Fatalf("reports after publish = %#v, want no additional report", item.reports)
+	}
+	if len(item.resolved) != 0 {
+		t.Fatalf("resolved IDs = %#v, want none: a handoff never resolves the source", item.resolved)
+	}
+}
+
+func TestResolveIssueLostObserverDoesNotHandOff(t *testing.T) {
+	item := &admissionSource{}
+	run := admissionRun("run", "local", courierv1alpha1.PhaseVerifying)
+	run.Spec.Mode = courierv1alpha1.ModeResolveIssue
+	run.Spec.Source = "manual"
+	run.Status.Branch = "courier/acme/widgets/issue-1"
+	client := phaseClient(t, run)
+	reconciler := &CoderRunReconciler{
+		Client:       client,
+		Sources:      NewSourceRegistry(map[string]source.Adapter{"manual": item}),
+		StatusWriter: fakeStatusWriter{client: client},
+		Observer:     nil,
+	}
+	if _, err := reconciler.Reconcile(context.Background(), admissionRequest("run")); err != nil {
+		t.Fatalf("Reconcile() error = %v", err)
+	}
+	var updated courierv1alpha1.CoderRun
+	if err := client.Get(context.Background(), admissionKey("run"), &updated); err != nil {
+		t.Fatalf("get run: %v", err)
+	}
+	if updated.Status.Phase != courierv1alpha1.PhaseNeedsHuman {
+		t.Fatalf("phase = %q, want NeedsHuman without an observer", updated.Status.Phase)
+	}
+	for _, report := range item.reports {
+		if report.Result == source.ResultHandedOff {
+			t.Fatalf("reports = %#v, want no handoff without an observer", item.reports)
+		}
+	}
+}
+
+func TestResolveIssueHandoffIsSourceAgnostic(t *testing.T) {
+	item := &admissionSource{}
+	run := admissionRun("run", "local", courierv1alpha1.PhaseVerifying)
+	run.Spec.Mode = courierv1alpha1.ModeResolveIssue
+	run.Spec.Source = "custom"
+	run.Status.Branch = "courier/acme/widgets/issue-1"
+	client := phaseClient(t, run)
+	reconciler := &CoderRunReconciler{
+		Client:       client,
+		Sources:      NewSourceRegistry(map[string]source.Adapter{"custom": item}),
+		StatusWriter: fakeStatusWriter{client: client},
+		Observer: &sequenceWorldObserver{observations: []PRObservation{
+			redObservation("sha-red", "test"),
+			redObservation("sha-red", "test"),
+		}},
+	}
+	for i := 0; i < 2; i++ {
+		if _, err := reconciler.Reconcile(context.Background(), admissionRequest("run")); err != nil {
+			t.Fatalf("Reconcile() %d error = %v", i+1, err)
+		}
+	}
+	want := source.Lifecycle{
+		Result:         source.ResultHandedOff,
+		PR:             "42",
+		Error:          externalVerificationFailureReason,
+		IdempotencyKey: lifecycleIdempotencyKey(run, courierv1alpha1.PhaseHandedOff),
+	}
+	if len(item.reports) != 1 || !reflect.DeepEqual(item.reports[0], want) {
+		t.Fatalf("reports = %#v, want exactly one source-agnostic handoff %#v", item.reports, want)
+	}
+	if len(item.transitions) != 0 {
+		t.Fatalf("transitions = %#v, want none: the handoff carries no source state", item.transitions)
+	}
+}
+
 func TestCheckSetFingerprintRepresentsIdentity(t *testing.T) {
 	passed := func(name string) CheckObservation { return CheckObservation{Name: name, State: CheckStatePassed} }
 	pending := func(name string) CheckObservation { return CheckObservation{Name: name, State: CheckStatePending} }
@@ -1050,13 +1320,23 @@ func greenObservation(head string, names ...string) PRObservation {
 	return observation
 }
 
+// redObservation builds an all-red observation over the named checks.
+func redObservation(head string, names ...string) PRObservation {
+	observation := PRObservation{PR: "42", Head: head}
+	for _, name := range names {
+		observation.Checks = append(observation.Checks, CheckObservation{Name: name, State: CheckStateFailed})
+	}
+	return observation
+}
+
 func TestTerminalLifecycleReportsToSource(t *testing.T) {
 	tests := []struct {
-		name        string
-		mode        courierv1alpha1.Mode
-		observation PRObservation
-		wantPhase   courierv1alpha1.Phase
-		wantReport  source.Lifecycle
+		name             string
+		mode             courierv1alpha1.Mode
+		observation      PRObservation
+		wantPhase        courierv1alpha1.Phase
+		wantReport       source.Lifecycle
+		wantNoTransition bool
 	}{
 		{
 			name:        "awaiting review",
@@ -1072,9 +1352,12 @@ func TestTerminalLifecycleReportsToSource(t *testing.T) {
 			wantReport:  source.Lifecycle{State: source.StateInProgress, Result: source.ResultFailed, PR: "42", Error: externalVerificationFailureReason, IdempotencyKey: "coderun/default/run/Failed"},
 		},
 		{
-			name:        "failed resolve-issue checks stay nonterminal",
-			mode:        courierv1alpha1.ModeResolveIssue,
-			observation: PRObservation{PR: "42", Checks: []CheckObservation{{State: CheckStateFailed}}},
+			name:             "failed resolve-issue checks hand off",
+			mode:             courierv1alpha1.ModeResolveIssue,
+			observation:      PRObservation{PR: "42", Checks: []CheckObservation{{State: CheckStateFailed}}},
+			wantPhase:        courierv1alpha1.PhaseHandedOff,
+			wantReport:       source.Lifecycle{Result: source.ResultHandedOff, PR: "42", Error: externalVerificationFailureReason, IdempotencyKey: "coderun/default/run/HandedOff"},
+			wantNoTransition: true,
 		},
 	}
 	for _, tt := range tests {
@@ -1112,6 +1395,9 @@ func TestTerminalLifecycleReportsToSource(t *testing.T) {
 			}
 			if updated.Status.Phase != tt.wantPhase || updated.Status.PR != "42" {
 				t.Fatalf("status = phase %q PR %q, want %q 42", updated.Status.Phase, updated.Status.PR, tt.wantPhase)
+			}
+			if tt.wantNoTransition && len(item.transitions) != 0 {
+				t.Fatalf("transitions = %#v, want none: a handoff publishes no source state", item.transitions)
 			}
 		})
 	}
