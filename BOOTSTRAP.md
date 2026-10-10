@@ -77,8 +77,9 @@ grace. The executor capture (#197 capture core, #198 executor triggers) is
 implemented: armed runs capture and POST gated failure evidence. The
 operator's intake listener (#200) is implemented: with the bind configured,
 the operator runs its own in-process listener that re-verifies a POSTed
-bundle and persists it as a Secret; with either setting empty the mechanism
-is invisible.
+bundle and persists it as a Secret. The settings gate the mechanism together:
+with the bind empty nothing is persisted, and with the key or service empty
+runs are never armed.
 
 Enable it with three settings on the operator:
 
