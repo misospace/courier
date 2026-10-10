@@ -100,6 +100,24 @@ func sampleIntakeManifest(run *courierv1alpha1.CoderRun, content string) *eviden
 	}
 }
 
+// senderStyleIntakeManifest is what PR #257's executor sender actually writes:
+// it has no CoderRun UID (the pod cannot read it), so the bearer HMAC is
+// authoritative. The intake accepts the empty RunUID and stamps the live
+// run's UID into the persisted manifest.
+func senderStyleIntakeManifest(run *courierv1alpha1.CoderRun, content string) *evidence.Manifest {
+	return &evidence.Manifest{
+		SchemaVersion: evidence.SchemaVersion,
+		Run:           evidence.RunIdentity{Name: run.Name, Namespace: run.Namespace, RunUID: "", PodUID: "pod-1"},
+		Workspace:     evidence.WorkspaceIdentity{BaseRepo: "acme/widgets", Branch: "courier/x", StartSHA: "00000000", HeadSHA: "11111111"},
+		CapturedAt:    time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC),
+		Trigger:       evidence.TriggerTerminal,
+		Entries: []evidence.Entry{
+			{Path: "src/a.go", Class: evidence.ClassModified, Disposition: evidence.DispositionStored, StoredPath: "src/a.go", Bytes: int64(len(content))},
+		},
+		Totals: evidence.Totals{Files: 1, Stored: 1, StoredBytes: int64(len(content))},
+	}
+}
+
 // intakeRequest builds a valid multipart intake POST (manifest + optional
 // archive) signed with key against run's live UID, returning the request and
 // the bearer token it carried.
@@ -615,12 +633,272 @@ func TestEvidenceIntakeRejectsManifestUIDMismatch(t *testing.T) {
 	i, _ := newIntake(t, testKey, run, executor.PodConfig{})
 
 	// Token is valid (signed against the live UID), but the manifest claims a
-	// different run UID, so the identity check fails after the HMAC passes.
+	// different non-empty run UID, so the identity check fails after the HMAC
+	// passes.
 	m := sampleIntakeManifest(run, "benign")
 	m.Run.RunUID = "wrong-uid"
 	req, _ := intakeRequest(t, testKey, run, m, map[string][]byte{"src/a.go": []byte("benign")}, testNonce())
 	if rec := doIntake(i, req); rec.Code != http.StatusBadRequest {
 		t.Fatalf("code = %d, want 400; body = %s", rec.Code, rec.Body.String())
+	}
+	requireNoSecret(t, i, run.Name, run.Namespace, testNonce())
+}
+
+// TestEvidenceIntakeAcceptsSenderStyleEmptyRunUID is the cross-component
+// interoperability regression for PR #257: the executor sender cannot read the
+// CoderRun UID, so it sets manifest.Run.RunUID = "" and treats the bearer
+// HMAC as authoritative. The intake must accept the empty sender UID, stamp
+// the live run's UID into the persisted manifest, set the ownerRef to the
+// live UID, and return 2xx — a non-empty RunUID that does not match is still
+// rejected.
+func TestEvidenceIntakeAcceptsSenderStyleEmptyRunUID(t *testing.T) {
+	t.Parallel()
+	run := newIntakeRun("run-1", "default", "uid-1", courierv1alpha1.PhaseFailed)
+	i, _ := newIntake(t, testKey, run, executor.PodConfig{})
+
+	content := "benign content, no secrets"
+	m := senderStyleIntakeManifest(run, content)
+	req, _ := intakeRequest(t, testKey, run, m, map[string][]byte{"src/a.go": []byte(content)}, testNonce())
+
+	if rec := doIntake(i, req); rec.Code != http.StatusOK {
+		t.Fatalf("code = %d, want 200; body = %s", rec.Code, rec.Body.String())
+	}
+
+	secret := getSecret(t, i, evidenceSecretName("run-1", testNonce()))
+	pm := persistedManifest(t, secret)
+	if pm.Run.RunUID != string(run.UID) {
+		t.Errorf("persisted RunUID = %q, want stamped live UID %q", pm.Run.RunUID, string(run.UID))
+	}
+	if len(secret.OwnerReferences) != 1 {
+		t.Fatalf("owner refs = %d, want 1", len(secret.OwnerReferences))
+	}
+	if or := secret.OwnerReferences[0]; or.UID != run.UID {
+		t.Errorf("owner ref UID = %q, want live UID %q", or.UID, run.UID)
+	}
+	if bytes.Contains(secret.Data[evidenceManifestKey], []byte(`"runUID":""`)) {
+		t.Error("persisted manifest still carries the sender's empty RunUID")
+	}
+}
+
+// TestEvidenceIntakeRejectsBearerInArchiveContent is the bearer-token
+// registration half of the credential re-scan: the intake registers the
+// presented bearer as a credential (a sender that smuggles its own valid
+// capture token into the bundle must not have it persisted), and a stored
+// member whose content contains the bearer is withheld.
+func TestEvidenceIntakeRejectsBearerInArchiveContent(t *testing.T) {
+	t.Parallel()
+	run := newIntakeRun("run-1", "default", "uid-1", courierv1alpha1.PhaseFailed)
+	i, _ := newIntake(t, testKey, run, executor.PodConfig{})
+
+	nonce := testNonce()
+	token := executor.EvidenceToken(testKey, run.Namespace, run.Name, string(run.UID), nonce)
+
+	// The token is embedded in the content of one of two stored members.
+	dirty := []byte("authorization: Bearer " + token + "\n")
+	clean := []byte("package clean\n")
+	m := &evidence.Manifest{
+		SchemaVersion: evidence.SchemaVersion,
+		Run:           evidence.RunIdentity{Name: run.Name, Namespace: run.Namespace, RunUID: string(run.UID), PodUID: "pod-1"},
+		Workspace:     evidence.WorkspaceIdentity{BaseRepo: "acme/widgets", Branch: "courier/x", StartSHA: "00000000", HeadSHA: "11111111"},
+		CapturedAt:    time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC),
+		Trigger:       evidence.TriggerTerminal,
+		Entries: []evidence.Entry{
+			{Path: "src/clean.go", Class: evidence.ClassModified, Disposition: evidence.DispositionStored, StoredPath: "src/clean.go", Bytes: int64(len(clean))},
+			{Path: "src/leaked.go", Class: evidence.ClassModified, Disposition: evidence.DispositionStored, StoredPath: "src/leaked.go", Bytes: int64(len(dirty))},
+		},
+		Totals: evidence.Totals{Files: 2, Stored: 2, StoredBytes: int64(len(clean) + len(dirty))},
+	}
+	req, _ := intakeRequest(t, testKey, run, m, map[string][]byte{"src/clean.go": clean, "src/leaked.go": dirty}, nonce)
+	if rec := doIntake(i, req); rec.Code != http.StatusOK {
+		t.Fatalf("code = %d, want 200; body = %s", rec.Code, rec.Body.String())
+	}
+
+	secret := getSecret(t, i, evidenceSecretName("run-1", nonce))
+	pm := persistedManifest(t, secret)
+	if pm.Entries[1].Disposition != evidence.DispositionWithheld {
+		t.Errorf("bearer-bearing entry disposition = %q, want withheld", pm.Entries[1].Disposition)
+	}
+	if bytes.Contains(secret.Data[evidenceBundleKey], []byte(token)) {
+		t.Error("persisted bundle.tar.gz still contains the bearer token")
+	}
+	if bytes.Contains(secret.Data[evidenceManifestKey], []byte(token)) {
+		t.Error("persisted manifest.json still contains the bearer token")
+	}
+}
+
+// TestEvidenceIntakeRejectsCredentialInWorkspaceMetadata is the
+// untrusted-manifest-field half of the credential re-scan: a Secret-derived
+// credential (COURIER_GIT_TOKEN) embedded only in Workspace.Branch (or any
+// other persistable manifest metadata field) is rejected outright — the
+// redaction that works for an entry path would mutate the recorded
+// repository state and imply a sanitization guarantee the artifact cannot
+// keep.
+func TestEvidenceIntakeRejectsCredentialInWorkspaceMetadata(t *testing.T) {
+	t.Parallel()
+	const cred = "supersecrettoken123"
+	cases := []struct {
+		name  string
+		munge func(*evidence.Manifest)
+	}{
+		{"branch", func(m *evidence.Manifest) { m.Workspace.Branch = "courier/" + cred }},
+		{"headRepo", func(m *evidence.Manifest) { m.Workspace.HeadRepo = "https://u:" + cred + "@github.com/acme/fork" }},
+		{"startSHA", func(m *evidence.Manifest) { m.Workspace.StartSHA = cred }},
+		{"headSHA", func(m *evidence.Manifest) { m.Workspace.HeadSHA = cred }},
+		{"podUID", func(m *evidence.Manifest) { m.Run.PodUID = cred }},
+		{"trigger", func(m *evidence.Manifest) { m.Trigger = cred }},
+		{"commitSHA", func(m *evidence.Manifest) {
+			m.Entries = append(m.Entries, evidence.Entry{Path: "commits/0001-x.patch", Class: evidence.ClassCommit, Disposition: evidence.DispositionStored, StoredPath: "commits/0001-x.patch", CommitSHA: cred, Bytes: 1})
+			m.Totals.Commits = 1
+			m.Totals.Stored++
+			m.Totals.StoredBytes++
+		}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			run := newIntakeRun("run-1", "default", "uid-1", courierv1alpha1.PhaseFailed)
+			gitSecret := &corev1.Secret{
+				ObjectMeta: metav1.ObjectMeta{Name: "git-cred", Namespace: "default"},
+				Data:       map[string][]byte{"username": []byte("octocat"), "token": []byte(cred)},
+			}
+			pod := executor.PodConfig{GitCredentialSecret: "git-cred", GitTokenKey: "token"}
+			i, _ := newIntake(t, testKey, run, pod, gitSecret)
+
+			content := "benign"
+			m := sampleIntakeManifest(run, content)
+			tc.munge(m)
+			// Keep the manifest in budget — these strings can be long, and
+			// the test fails on the first violation, so a budget reject
+			// would mask the credential check.
+			if size, err := m.MarshalCanonical(); err == nil && len(size) > evidence.ManifestBudgetBytes {
+				t.Fatalf("test manifest is %d bytes, over the %d-byte budget", len(size), evidence.ManifestBudgetBytes)
+			}
+
+			members := map[string][]byte{"src/a.go": []byte(content)}
+			if tc.name == "commitSHA" {
+				members["commits/0001-x.patch"] = []byte("p")
+			}
+
+			req, _ := intakeRequest(t, testKey, run, m, members, testNonce())
+			rec := doIntake(i, req)
+			if rec.Code != http.StatusBadRequest {
+				t.Fatalf("code = %d, want 400; body = %s", rec.Code, rec.Body.String())
+			}
+			if !strings.Contains(rec.Body.String(), "credential in an untrusted string field") {
+				t.Errorf("body = %s, want the untrusted-field reject", rec.Body.String())
+			}
+			requireNoSecret(t, i, run.Name, run.Namespace, testNonce())
+		})
+	}
+}
+
+// TestEvidenceIntakeAcceptsBearerFreeBundle is the companion to the bearer
+// rejection test: a legitimate capture whose bundle carries no bearer is
+// unaffected by the new bearer registration. The presented token has length
+// 64 (base64(nonce‖HMAC)); a normal capture's stored content is well under
+// that, so registration is silent.
+func TestEvidenceIntakeAcceptsBearerFreeBundle(t *testing.T) {
+	t.Parallel()
+	run := newIntakeRun("run-1", "default", "uid-1", courierv1alpha1.PhaseFailed)
+	i, _ := newIntake(t, testKey, run, executor.PodConfig{})
+
+	content := "benign content, no secrets"
+	m := sampleIntakeManifest(run, content)
+	req, _ := intakeRequest(t, testKey, run, m, map[string][]byte{"src/a.go": []byte(content)}, testNonce())
+	if rec := doIntake(i, req); rec.Code != http.StatusOK {
+		t.Fatalf("code = %d, want 200; body = %s", rec.Code, rec.Body.String())
+	}
+}
+
+// TestEvidenceIntakeRejectsPersistAfterRunDeleted is the pre-persist re-read
+// regression: a run that moved to AwaitingReview (or was deleted) between
+// Stage 6 and the persist would have its evidence Secret survive the
+// AwaitingReview cleanup only to be silently re-created by the in-flight
+// POST. The Stage-13 uncached re-read catches the deletion and rejects the
+// POST, so no Secret is written after the operator has already proven the
+// work landed.
+func TestEvidenceIntakeRejectsPersistAfterRunDeleted(t *testing.T) {
+	t.Parallel()
+	run := newIntakeRun("run-1", "default", "uid-1", courierv1alpha1.PhaseFailed)
+	i, fc := newIntake(t, testKey, run, executor.PodConfig{})
+
+	content := "benign content"
+	m := sampleIntakeManifest(run, content)
+	req, _ := intakeRequest(t, testKey, run, m, map[string][]byte{"src/a.go": []byte(content)}, testNonce())
+
+	// Delete the run between Stage 6 and the Stage-13 re-read. The handler
+	// already passed HMAC + identity + phase + archive + totals; the
+	// pre-persist re-read must now observe the missing run and refuse.
+	// The fake client serves the same object to both reads; mutating it
+	// after the first Get is enough because Get is uncached from the
+	// caller's perspective.
+	if err := fc.Delete(context.Background(), run); err != nil {
+		t.Fatalf("delete run: %v", err)
+	}
+
+	rec := doIntake(i, req)
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("code = %d, want 401; body = %s", rec.Code, rec.Body.String())
+	}
+	requireNoSecret(t, i, run.Name, run.Namespace, testNonce())
+}
+
+// TestEvidenceIntakeRejectsPersistAfterRunPhaseChanged covers the same
+// interleaving the design calls out: a run the operator has just proven
+// landed (AwaitingReview) is not a phase the intake accepts captures in,
+// and the re-read refuses to write a Secret for a phase the operator has
+// already world-proven as resolved.
+func TestEvidenceIntakeRejectsPersistAfterRunPhaseChanged(t *testing.T) {
+	t.Parallel()
+	run := newIntakeRun("run-1", "default", "uid-1", courierv1alpha1.PhaseFailed)
+	i, fc := newIntake(t, testKey, run, executor.PodConfig{})
+
+	content := "benign content"
+	m := sampleIntakeManifest(run, content)
+	req, _ := intakeRequest(t, testKey, run, m, map[string][]byte{"src/a.go": []byte(content)}, testNonce())
+
+	// Move the run to AwaitingReview between Stage 6 and the persist.
+	fresh := &courierv1alpha1.CoderRun{}
+	if err := fc.Get(context.Background(), client.ObjectKey{Namespace: run.Namespace, Name: run.Name}, fresh); err != nil {
+		t.Fatalf("read run: %v", err)
+	}
+	fresh.Status.Phase = courierv1alpha1.PhaseAwaitingReview
+	if err := fc.Status().Update(context.Background(), fresh); err != nil {
+		t.Fatalf("update run phase: %v", err)
+	}
+
+	rec := doIntake(i, req)
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("code = %d, want 403; body = %s", rec.Code, rec.Body.String())
+	}
+	requireNoSecret(t, i, run.Name, run.Namespace, testNonce())
+}
+
+// TestEvidenceIntakeRejectsPersistAfterRunRecreated is the third form of
+// the same interleaving: a recreated same-name run in the persist window
+// gets a new UID; the token is for the old incarnation, so the re-read's
+// UID check refuses the POST and the new run's slot is left untouched.
+func TestEvidenceIntakeRejectsPersistAfterRunRecreated(t *testing.T) {
+	t.Parallel()
+	run := newIntakeRun("run-1", "default", "uid-1", courierv1alpha1.PhaseFailed)
+	i, fc := newIntake(t, testKey, run, executor.PodConfig{})
+
+	content := "benign content"
+	m := sampleIntakeManifest(run, content)
+	req, _ := intakeRequest(t, testKey, run, m, map[string][]byte{"src/a.go": []byte(content)}, testNonce())
+
+	// Recreate the run with a new UID between Stage 6 and the persist.
+	if err := fc.Delete(context.Background(), run); err != nil {
+		t.Fatalf("delete old run: %v", err)
+	}
+	replacement := newIntakeRun(run.Name, run.Namespace, "uid-2", courierv1alpha1.PhaseFailed)
+	if err := fc.Create(context.Background(), replacement); err != nil {
+		t.Fatalf("create replacement: %v", err)
+	}
+
+	rec := doIntake(i, req)
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("code = %d, want 401; body = %s", rec.Code, rec.Body.String())
 	}
 	requireNoSecret(t, i, run.Name, run.Namespace, testNonce())
 }

@@ -670,13 +670,29 @@ intake resolves those refs at persist time and registers the values whose env
 names are secret-shaped (the shape rule tests env names, never Secret keys, so
 a custom `--git-token-key` is not silently skipped; over-registering a
 harmless value only costs a substitution). The git username is not
-secret-shaped and is unregistered on both sides. A referenced Secret that the
-builder actually injects and that is missing or unreadable at scan time fails
+secret-shaped and is unregistered on both sides. The **presented bearer
+token itself is registered as `COURIER_EVIDENCE_TOKEN`** so a sender that
+smuggles its own valid capture credential into the bundle has it withheld
+the same way any other credential would: the per-incarnation capability
+that authenticated the POST cannot be persisted in the body it
+authenticated. A referenced Secret that
+the builder actually injects and that is missing or unreadable at scan time fails
 the persist (what cannot be verified is not stored). Residual: credentials
 delivered outside those Secrets (image-baked env, tokens embedded in MCP URLs)
 are invisible to the intake and covered only by the executor's own untrusted
 scan; a credential Secret deleted mid-run makes every persist fail while the
 executor keeps working with its cached env.
+
+The re-scan covers every string the bundle carries. Per-entry `Path`,
+`StoredPath`, and `LinkTarget` are redacted in place — a matching
+storedPath drops the tar member, a matching Path or LinkTarget becomes
+`[REDACTED]`, and the totals move in lockstep. Manifest metadata that
+the executor controls but the persisted manifest must preserve
+(`Workspace.*`, `Trigger`, `Run.PodUID`, `Entry.CommitSHA`) is checked
+as a whole-request reject: redacting a branch or a SHA would mutate the
+recorded repository state and imply a sanitization guarantee the
+artifact cannot keep, so a credential in any of those fields fails the
+POST with no Secret written.
 
 **Transport** (`cmd/main.go`). The operator process serves a small write-only
 intake listener (own bind address, empty disables; chart renders a ClusterIP
@@ -701,6 +717,12 @@ name-shape redactor registration covers it), and the intake validates with
 `hmac.Equal` after recomputing the HMAC from an **uncached** live read of the
 run (the same uncached-read discipline HARNESS.md §6 applies to destructive
 liveness decisions, adopted here because a persist is hard to take back). The
+**CoderRun UID is not in the sender's reach** — the downward API cannot
+expose it — so the executor sets `manifest.Run.RunUID = ""` and the
+bearer HMAC is the run's identity. The intake accepts the empty sender
+UID, stamps the live run's UID into the intake-authored persisted
+manifest, and rejects a non-empty sender UID that does not match the
+live run as a forged identity. The
 phase gate is
 an allowlist over **non-resolved versus resolved**: the intake accepts
 `Pending`, `Claimed`, `Running`, `Failed`, and `NeedsHuman`, and rejects
@@ -719,6 +741,13 @@ own incarnation's slot — strictly narrower than the git push credential the
 legacy pod already holds. Persist is synchronous: a 2xx response means the
 Secret write has landed.
 
+The intake re-reads the run uncached immediately before the persist: a
+run that moved to `AwaitingReview` or `Done` (or was deleted) since the
+initial authentication read has its deletion pending, and a Secret
+written now would briefly resurrect evidence the operator has already
+proven landed. A phase change or a UID change in that window fails the
+persist; the world is the source of truth at the moment of write.
+
 **Storage** (intake persist path). The **intake derives the slot identity from
 the validated token** — the nonce in the token names the incarnation's Secret,
 so a compromised executor cannot address another incarnation's slot by
@@ -726,8 +755,9 @@ guessing its name. The Secret is `courier-evidence-<run>-<nonce8>` (name
 truncated and hash-suffixed exactly like `podName` when long), labeled
 `courier.misospace.dev/evidence: <run>`, owner-referenced to the CoderRun. The
 manifest's real pod UID (downward API) is carried for human correlation, and a
-manifest whose run name/namespace/UID disagrees with the validated token is
-rejected. Per-incarnation keying is a correctness decision:
+manifest whose run name/namespace disagrees with the validated token is
+rejected; the run UID is stamped from the live read because the sender
+cannot supply it. Per-incarnation keying is a correctness decision:
 cross-incarnation overwrites are structurally impossible — a relaunched clean
 clone captures nothing (the gate), and even a stolen token cannot address a
 previous incarnation's slot — the delete-recreate GC-lag race disappears, and
@@ -739,9 +769,11 @@ operator additionally deletes a run's evidence Secrets when the run reaches
 **AwaitingReview or Done** — the states where the operator's own world
 observation has proven the work landed (Invariant 8). A `Verifying` run that
 falls to `NeedsHuman` keeps its evidence: its world proof never arrived.
-A capture validated while the run was still `Running` but persisted after that
-deletion can briefly resurrect a Secret — a stated race, bounded by the
-run's own GC. Access control is namespace RBAC: the operator gains
+The pre-persist uncached re-read covers the brief window between
+authentication and write: a run that moved to `AwaitingReview` or `Done`
+in that window has its evidence already cleaned, and the re-read refuses
+to write a Secret for a phase the operator has world-proven as resolved.
+Access control is namespace RBAC: the operator gains
 `create/get/list/patch/delete` on `secrets` through a namespaced
 Role/RoleBinding rendered by the chart — deliberately not the generated
 operator ClusterRole, whose ClusterRoleBinding would widen the grant
@@ -1368,6 +1400,30 @@ named items remain unresolved and must not be described as production-ready:
 - The exact vLLM gauge for backpressure on the target model server.
 
 ## Decisions
+
+- **2026-10-10 — #259: intake accepts the sender's empty RunUID and stamps
+  the live UID; the bearer itself is a credential; untrusted manifest
+  metadata is whole-request rejected; the run is re-read uncached
+  immediately before persist.** The PR #257 executor sender cannot read
+  the CoderRun UID (the downward API does not expose it), so it sets
+  `manifest.Run.RunUID = ""` and treats the bearer HMAC as authoritative.
+  Rejecting empty sender UIDs would 400 every real capture. The fix:
+  accept the empty sender UID, stamp the live run's UID into the
+  intake-authored persisted manifest, and reject only a non-empty sender
+  UID that does not match. The same review also caught a credential
+  re-scan gap: the presented bearer was not registered (so a sender
+  that smuggled its own valid capture credential into the bundle
+  persisted a reusable capability), and untrusted manifest metadata
+  (`Workspace.*`, `Trigger`, `Run.PodUID`, `Entry.CommitSHA`) was
+  written through to the persisted manifest without scanning. The
+  bearer is now registered as `COURIER_EVIDENCE_TOKEN`; the metadata
+  fields are checked as a whole-request reject because redacting a
+  branch or a SHA would imply a sanitization guarantee the artifact
+  cannot keep. The pre-persist uncached re-read closes the
+  AwaitingReview / Done / recreated-UID window between authentication
+  and write: a Secret would have briefly resurrected evidence the
+  operator has already proven landed. (#259, PR #257 review
+  #5477066262)
 
 - **2026-10-10 — Dispatch discovery reserves pending work conservatively.**
   Each LaneProfile runner gates discovery on one pre-discovery CoderRun list,

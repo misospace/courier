@@ -91,6 +91,13 @@ var (
 	// persisted, so the handler maps it to 400 rather than to the 500 a genuine
 	// internal failure gets.
 	errRebuiltTotals = errors.New("evidence intake: manifest totals disagree after re-scan")
+	// errCredentialInMetadata is the untrusted-manifest-field sentinel: a
+	// credential (Secret-derived or the bearer itself) appeared in a string
+	// field the manifest author controls but the persisted manifest must
+	// preserve (Workspace.*, Trigger, Run.PodUID, Entry.CommitSHA). Redacting
+	// would mutate the recorded repository state and imply a sanitization
+	// guarantee the artifact cannot keep, so the request is rejected instead.
+	errCredentialInMetadata = errors.New("evidence intake: manifest contains a credential in an untrusted string field")
 )
 
 // EvidenceIntake receives a run's final evidence bundle, re-verifies and
@@ -187,17 +194,34 @@ func (i *EvidenceIntake) Handler() http.Handler {
 //  5. manifest part     present, parseable, schema    (400)
 //  6. live run read     exists (uncached)             (401/500)
 //  7. HMAC verify       against the run's live UID    (401)
-//  8. manifest identity RunUID matches the run        (400)
+//  8. manifest identity RunUID empty or matches       (400)
 //  9. phase allow-list  capture is admissible         (403)
 //
 // 10. archive           structural, cross-referenced  (400)
 // 11. totals            internally consistent         (400)
 // 12. re-scan           credential set, rebuild       (400/500)
-// 13. persist           idempotent create-or-update   (500 on failure)
+// 13. persist re-read   run still exists, UID/phase   (401/403)
+// 14. persist           idempotent create-or-update   (500 on failure)
+//
+// Stage 8 accepts the sender's intentionally empty RunUID (the pod cannot
+// resolve the CoderRun UID, so the bearer HMAC is authoritative). A non-empty
+// RunUID that does not match the live run is rejected. The authoritative UID
+// is then stamped into the intake-authored persisted manifest, so the
+// operator's own record names the same identity the HMAC bound.
 //
 // Stage 12 fails 500 when the credential set cannot be read (an internal
-// failure) and 400 when the rebuild's own totals disagree with its rebuilt
-// entry list (crafted input, nothing persisted).
+// failure), 400 when the rebuild's own totals disagree with its rebuilt
+// entry list (crafted input, nothing persisted), and 400 when an untrusted
+// manifest string field (Run.PodUID, Workspace.*, Trigger, Entry.CommitSHA)
+// or an archive member contains a registered credential: a credential does
+// not survive in the persisted manifest or bundle. The presented bearer
+// token is itself registered as a credential so a sender-supplied bundle
+// cannot smuggle the very token that authenticated it.
+//
+// Stage 13 re-reads the run uncached immediately before the persist: a run
+// that moved to AwaitingReview or Done (or was deleted) since stage 6 has
+// the deletion pending, and a Secret written now would briefly resurrect
+// evidence the operator has already proven landed.
 //
 // Stages 5 and 10 also enforce the design's whole-request count bounds: a
 // manifest over the manifest-entry cap and an archive over the content-entry
@@ -290,11 +314,18 @@ func (i *EvidenceIntake) handle(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Stage 8. The manifest's claimed run identity must match the live run.
-	if manifest.Run.RunUID != string(run.UID) {
-		writeIntakeError(w, http.StatusBadRequest, "evidence intake manifest identity does not match the run")
+	// Stage 8. Manifest identity vs. the live run. The pod cannot resolve the
+	// CoderRun UID, so the sender sets manifest.Run.RunUID = "" and the bearer
+	// HMAC is authoritative. An empty sender UID is therefore accepted; a
+	// non-empty one must match the live run's UID, and any other non-empty
+	// claim is rejected as a forged identity. The authoritative UID is then
+	// stamped into the intake-authored manifest before persistence, so the
+	// stored record names the same identity the HMAC bound.
+	if manifest.Run.RunUID != "" && manifest.Run.RunUID != string(run.UID) {
+		writeIntakeError(w, http.StatusBadRequest, "evidence intake manifest RunUID does not match the run")
 		return
 	}
+	manifest.Run.RunUID = string(run.UID)
 
 	// Stage 9. The capture is only admissible from a phase the allow-list
 	// covers. Verifying/AwaitingReview/Done are not admissible, and neither is
@@ -322,18 +353,51 @@ func (i *EvidenceIntake) handle(w http.ResponseWriter, r *http.Request) {
 	// Stage 12. The intake re-scans the whole archive against the same
 	// credential set the pod builder injects, and rebuilds the bundle rather
 	// than persisting the POST verbatim: the executor's scan is untrusted.
-	persistManifest, persistArchive, err := i.rescanAndRebuild(r.Context(), run, manifest, members)
+	// The presented bearer token is itself registered as a credential so a
+	// sender that smuggles its own valid token into the bundle has it
+	// withheld.
+	persistManifest, persistArchive, err := i.rescanAndRebuild(r.Context(), run, manifest, members, token)
 	if err != nil {
 		if errors.Is(err, errRebuiltTotals) {
 			writeIntakeError(w, http.StatusBadRequest, errRebuiltTotals.Error())
+			return
+		}
+		if errors.Is(err, errCredentialInMetadata) {
+			writeIntakeError(w, http.StatusBadRequest, errCredentialInMetadata.Error())
 			return
 		}
 		writeIntakeError(w, http.StatusInternalServerError, "evidence intake could not verify the credential set")
 		return
 	}
 
-	// Stage 13. Persist idempotently as a Secret owned by the run.
-	if err := i.persist(r.Context(), run, nonce, persistManifest, persistArchive); err != nil {
+	// Stage 13. Re-read the run uncached immediately before persistence. A run
+	// that moved to AwaitingReview or Done — or was deleted — since stage 6
+	// has its deletion pending; a Secret written now would briefly resurrect
+	// evidence the operator has already proven landed. A phase change or a
+	// UID change in that window fails the persist; the world is the source of
+	// truth at the moment of write.
+	fresh := &courierv1alpha1.CoderRun{}
+	if err := i.APIReader.Get(r.Context(), client.ObjectKey{Namespace: run.Namespace, Name: run.Name}, fresh); err != nil {
+		if apierrors.IsNotFound(err) {
+			writeIntakeError(w, http.StatusUnauthorized, "evidence intake could not authenticate the capture")
+			return
+		}
+		writeIntakeError(w, http.StatusInternalServerError, "evidence intake could not read the run")
+		return
+	}
+	if fresh.UID != run.UID {
+		// A recreated same-name run in the same window gets a new UID: the
+		// token is for the old incarnation, not the new one.
+		writeIntakeError(w, http.StatusUnauthorized, "evidence intake could not authenticate the capture")
+		return
+	}
+	if !evidencePhaseAdmitted(fresh.Status.Phase) {
+		writeIntakeError(w, http.StatusForbidden, "evidence intake does not accept captures in this phase")
+		return
+	}
+
+	// Stage 14. Persist idempotently as a Secret owned by the run.
+	if err := i.persist(r.Context(), fresh, nonce, persistManifest, persistArchive); err != nil {
 		writeIntakeError(w, http.StatusInternalServerError, "evidence intake could not persist the bundle")
 		return
 	}
@@ -465,10 +529,12 @@ func evidencePhaseAdmitted(phase courierv1alpha1.Phase) bool {
 // credentialScanner assembles the re-scan credential set: the same per-key
 // references the pod builder injects (CredentialEnvRefs), plus the
 // EnvironmentSecret's keys (envFrom, where the executor could not tell key
-// from value). Each is read uncached. A missing or unreadable credential
-// secret is a hard error: the intake cannot prove the bundle is clean, so it
-// fails closed. The scanner never logs credential values.
-func (i *EvidenceIntake) credentialScanner(ctx context.Context, run *courierv1alpha1.CoderRun) (*evidence.Scanner, error) {
+// from value), plus the presented bearer token itself (so a sender cannot
+// smuggle its own valid capture credential into the bundle). Each Secret is
+// read uncached. A missing or unreadable credential secret is a hard error:
+// the intake cannot prove the bundle is clean, so it fails closed. The
+// scanner never logs credential values.
+func (i *EvidenceIntake) credentialScanner(ctx context.Context, run *courierv1alpha1.CoderRun, token string) (*evidence.Scanner, error) {
 	scanner := evidence.NewScanner()
 
 	// Per-key references: only the named key of each secret is a credential.
@@ -491,6 +557,15 @@ func (i *EvidenceIntake) credentialScanner(ctx context.Context, run *courierv1al
 			values[key] = string(val)
 		}
 		scanner.RegisterCredentials(values)
+	}
+
+	// The presented bearer is itself a credential of this capture: a sender
+	// that smuggles its own valid token into the bundle has it withheld the
+	// same way any other credential would. Registered under the same env
+	// name the pod builder uses, so the scanner's secret-shaped name check
+	// retains the value fail-closed regardless of length.
+	if token != "" {
+		scanner.RegisterCredentials(map[string]string{executor.EnvEvidenceToken: token})
 	}
 	return scanner, nil
 }
@@ -538,13 +613,40 @@ func readSecretKey(ctx context.Context, r client.Reader, namespace, name, key st
 // the whole archive, not the visible list: the guarantee is that no matching
 // content or name is persisted, regardless of how the manifest describes it.
 //
+// Persistable metadata strings the manifest author controls but the
+// intake must preserve (Workspace.*, Trigger, Run.PodUID, Entry.CommitSHA)
+// are checked before anything else: a credential match there is a
+// 400 reject, not a silent redaction, because mutating the recorded
+// repository state would imply a sanitization guarantee the artifact
+// cannot keep.
+//
 // It then re-checks the rebuilt manifest's internal consistency and fails
 // closed if the totals disagree with the rebuilt entries: nothing is persisted,
 // because the intake cannot prove which of the two is the lie.
-func (i *EvidenceIntake) rescanAndRebuild(ctx context.Context, run *courierv1alpha1.CoderRun, manifest *evidence.Manifest, members map[string][]byte) ([]byte, []byte, error) {
-	scanner, err := i.credentialScanner(ctx, run)
+func (i *EvidenceIntake) rescanAndRebuild(ctx context.Context, run *courierv1alpha1.CoderRun, manifest *evidence.Manifest, members map[string][]byte, token string) ([]byte, []byte, error) {
+	scanner, err := i.credentialScanner(ctx, run, token)
 	if err != nil {
 		return nil, nil, err
+	}
+
+	// Reject the request when a credential leaks into an untrusted but
+	// persistable string field. Per-entry Path / StoredPath / LinkTarget
+	// can be redacted safely; these fields cannot — redacting a SHA or a
+	// branch would produce a manifest whose repository state disagrees with
+	// the bundle, and a Trigger of "[REDACTED]" is not evidence.
+	if scanner.Matched(manifest.Run.PodUID) ||
+		scanner.Matched(manifest.Workspace.BaseRepo) ||
+		scanner.Matched(manifest.Workspace.HeadRepo) ||
+		scanner.Matched(manifest.Workspace.Branch) ||
+		scanner.Matched(manifest.Workspace.StartSHA) ||
+		scanner.Matched(manifest.Workspace.HeadSHA) ||
+		scanner.Matched(manifest.Trigger) {
+		return nil, nil, errCredentialInMetadata
+	}
+	for idx := range manifest.Entries {
+		if scanner.Matched(manifest.Entries[idx].CommitSHA) {
+			return nil, nil, errCredentialInMetadata
+		}
 	}
 
 	// withheldMembers records the members whose visible entry was reclassified
