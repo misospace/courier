@@ -165,8 +165,10 @@ func (s *SecureControl) LaunchSecure(ctx context.Context, run *courier.CoderRun)
 	if controlPod == nil {
 		if !workerCreated {
 			// The surviving worker belongs to a previous control incarnation.
-			// Replacing control rotates the key and fences its worker, so the
-			// whole round is re-provisioned instead of reusing old material.
+			// Replacing control rotates the key and re-provisions the round;
+			// Fence tears down the surviving worker and the credentialed
+			// broker so the next LaunchSecure pass lands a clean round
+			// instead of reusing stale material.
 			if err := s.Fence(ctx, run); err != nil {
 				return ctrl.Result{}, err
 			}
@@ -178,6 +180,10 @@ func (s *SecureControl) LaunchSecure(ctx context.Context, run *courier.CoderRun)
 		}
 		incarnation := workerEnvValue(workerPod, topology.EnvControlPodUID)
 		if incarnation == "" {
+			// The freshly minted worker was provisioned without the
+			// incarnation binding the control pod would replay; fence the
+			// surviving round and requeue so a new worker lands from
+			// scratch on the next LaunchSecure pass.
 			if err := s.Fence(ctx, run); err != nil {
 				return ctrl.Result{}, err
 			}
@@ -384,6 +390,18 @@ func topologyBroken(pod *corev1.Pod) bool {
 // fenceAndRelaunch deletes the run's topology pods and returns the run to
 // Claimed for relaunch, honoring the crashloop ceiling exactly like liveness.
 func (s *SecureControl) fenceAndRelaunch(ctx context.Context, run *courier.CoderRun) (ctrl.Result, bool, error) {
+	// Fence leaves the control pod in place (see its doc); relaunch needs
+	// every component torn down so the next LaunchSecure pass produces a
+	// fresh round with a freshly minted signing key.
+	controlPod, err := s.pod(ctx, run, topology.ComponentCoordinator)
+	if err != nil {
+		return ctrl.Result{}, true, err
+	}
+	if controlPod != nil {
+		if err := s.Client.Delete(ctx, controlPod); client.IgnoreNotFound(err) != nil {
+			return ctrl.Result{}, true, err
+		}
+	}
 	if err := s.Fence(ctx, run); err != nil {
 		return ctrl.Result{}, true, err
 	}
@@ -400,17 +418,47 @@ func (s *SecureControl) fenceAndRelaunch(ctx context.Context, run *courier.Coder
 	return ctrl.Result{Requeue: true}, true, nil
 }
 
-// Fence deletes the run's control and worker pods. It is idempotent.
+// Fence tears the worker and the credentialed broker of the round down:
+// the worker pod is deleted, the broker's ingress Service is deleted
+// before the broker pod (HARNESS.md §3), and the broker pod is deleted.
+// The control pod is intentionally left in place — at the ceiling the
+// inert coordinator object is the only record of the cause the
+// `NeedsHuman` hand-off keeps (#106), and below the ceiling the relaunch's
+// `LaunchSecure` reproduces a fresh control from the persisted policy.
+// Callers that are about to re-provision a fresh control pod must delete
+// it themselves before invoking Fence (matching `ObserveTopology`'s
+// control-terminated branch, which fences the worker and the broker but
+// leaves the control pod as the run's last record). It is idempotent: a
+// missing or already-deleting object is a no-op.
+//
+// This is the primitive the operator reaches for whenever the run's
+// supervisor is gone or terminal — including the control-loss backstop
+// (#215), where the detection reconcile must not leave the untrusted
+// executor and the credentialed broker alive just because a later relaunch
+// reconcile may never run. Terminal runs are never reaped, so a fence
+// deferred past the detection reconcile never runs at all.
 func (s *SecureControl) Fence(ctx context.Context, run *courier.CoderRun) error {
-	for _, component := range []string{topology.ComponentCoordinator, topology.ComponentWorker} {
-		pod, err := s.pod(ctx, run, component)
-		if err != nil {
+	workerPod, err := s.pod(ctx, run, topology.ComponentWorker)
+	if err != nil {
+		return err
+	}
+	if workerPod != nil {
+		if err := s.Client.Delete(ctx, workerPod); client.IgnoreNotFound(err) != nil {
 			return err
 		}
-		if pod == nil {
-			continue
-		}
-		if err := s.Client.Delete(ctx, pod); client.IgnoreNotFound(err) != nil {
+	}
+	// Disable broker ingress before the broker pod: the Service stops
+	// routing before the pod stops serving, mirroring the ordering in
+	// Revoke and in ObserveTopology's control-terminated branch.
+	if err := s.Client.Delete(ctx, topology.BrokerService(run)); client.IgnoreNotFound(err) != nil {
+		return err
+	}
+	brokerPod, err := s.pod(ctx, run, topology.ComponentBroker)
+	if err != nil {
+		return err
+	}
+	if brokerPod != nil {
+		if err := s.Client.Delete(ctx, brokerPod); client.IgnoreNotFound(err) != nil {
 			return err
 		}
 	}
