@@ -87,6 +87,18 @@ serviceMonitor:
   scrapeTimeout: 10s
   labels: []
 
+evidence:
+  # -- Failure-evidence intake (#115). Disabled by default. When enabled the
+  #    manager serves the write-only intake listener on its bind port and the
+  #    chart renders the ClusterIP Service coordinator pods POST bundles to.
+  enabled: false
+  # -- Name of a Secret in the operator namespace whose "key" entry holds the
+  #    HMAC signing key (see BOOTSTRAP.md). Required when enabled.
+  keySecret: ""
+  # -- Port the intake listener binds to inside the manager container; the
+  #    rendered Service routes port 80 to it.
+  port: 8082
+
 controllers:
   main:
     replicas: 1
@@ -229,6 +241,12 @@ rbac:
         - apiGroups: [""]
           resources: [secrets]
           verbs: [get]
+    evidence:
+      type: Role
+      rules:
+        - apiGroups: [""]
+          resources: [secrets]
+          verbs: [create, get, list, patch, delete]
     leader-election:
       type: Role
       rules:
@@ -249,6 +267,12 @@ rbac:
       type: RoleBinding
       roleRef:
         identifier: credential-reader
+      subjects:
+        - identifier: main
+    evidence:
+      type: RoleBinding
+      roleRef:
+        identifier: evidence
       subjects:
         - identifier: main
     leader-election:
