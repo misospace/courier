@@ -89,6 +89,48 @@ func TestRBACResourceNamesMatchCoderunCRD(t *testing.T) {
 			t.Fatalf("%s still contains the stale coderuns resource name", content.name)
 		}
 	}
+
+	// The failure-evidence intake (#115) grants the operator
+	// create/get/list/patch/delete on secrets through a namespaced Role in the
+	// chart, deliberately not through the generated operator ClusterRole.
+	const evidenceRole = `    evidence:
+      type: Role
+      rules:
+        - apiGroups: [""]
+          resources: [secrets]
+          verbs: [create, get, list, patch, delete]`
+	if !strings.Contains(values, evidenceRole) {
+		t.Fatal("chart values is missing the namespaced evidence Role with verbs [create, get, list, patch, delete] on secrets")
+	}
+	const evidenceBinding = `    evidence:
+      type: RoleBinding
+      roleRef:
+        identifier: evidence
+      subjects:
+        - identifier: main`
+	if !strings.Contains(values, evidenceBinding) {
+		t.Fatal("chart values is missing the evidence RoleBinding to the main service account")
+	}
+
+	// The generated operator ClusterRole's secrets grant must stay
+	// create/delete/get/list — no patch — so the namespaced grant never
+	// widens the cluster-wide operator ClusterRole.
+	secretsIdx := strings.Index(generated, "- secrets")
+	if secretsIdx < 0 {
+		t.Fatal("generated RBAC has no secrets resource")
+	}
+	secretsBlock := generated[secretsIdx:]
+	if next := strings.Index(secretsBlock, "\n- apiGroups:"); next >= 0 {
+		secretsBlock = secretsBlock[:next]
+	}
+	for _, want := range []string{"- create", "- delete", "- get", "- list"} {
+		if !strings.Contains(secretsBlock, want) {
+			t.Fatalf("generated RBAC secrets block is missing verb %q", want)
+		}
+	}
+	if strings.Contains(secretsBlock, "- patch") {
+		t.Fatal("generated RBAC secrets block must not carry the patch verb")
+	}
 }
 
 func copyChart(t *testing.T) string {
@@ -212,6 +254,88 @@ func TestServiceMonitorOptional(t *testing.T) {
 	}
 }
 
+func TestChartRendersEvidenceIntake(t *testing.T) {
+	if _, err := exec.LookPath("helm"); err != nil {
+		t.Skip("helm is not installed")
+	}
+
+	chartDir := copyChart(t)
+	if err := exec.Command("helm", "repo", "add", "bjw-s-labs", "https://bjw-s-labs.github.io/helm-charts").Run(); err != nil {
+		t.Fatalf("configure chart repository: %v", err)
+	}
+	runHelm(t, chartDir, "dependency", "build")
+
+	// Off by default: no intake flags and no evidence Service.
+	disabled := runHelm(t, chartDir, "template", "courier", ".")
+	for _, unwanted := range []string{
+		"--evidence-intake",
+		"courier-evidence",
+	} {
+		if strings.Contains(disabled, unwanted) {
+			t.Fatalf("Evidence-disabled chart output unexpectedly contains %q", unwanted)
+		}
+	}
+
+	// Disabled evidence must not render the namespaced Secret authority, even
+	// though values.yaml defines it statically.
+	for _, kind := range []string{"kind: Role", "kind: RoleBinding"} {
+		for _, doc := range missingDocuments(disabled, kind, "name: courier-evidence") {
+			t.Fatalf("Evidence-disabled chart output rendered a document with %q and %q:\n%s", kind, "name: courier-evidence", doc)
+		}
+	}
+
+	// Enabled: the intake flags and a ClusterIP Service exposing port 80 to
+	// the listener's port. helm template without --namespace uses "default"
+	// for Release.Namespace, so the service URL is the default-namespace one.
+	enabled := runHelm(t, chartDir, "template", "courier", ".",
+		"--set", "evidence.enabled=true",
+		"--set", "evidence.keySecret=evidence-key",
+	)
+	for _, want := range []string{
+		"--evidence-intake-key-secret=evidence-key",
+		"--evidence-intake-bind=:8082",
+		"--evidence-intake-service=http://courier-evidence.default.svc",
+		"kind: Service",
+		"name: courier-evidence",
+		"port: 80",
+		"targetPort: 8082",
+	} {
+		if !strings.Contains(enabled, want) {
+			t.Fatalf("Evidence-enabled chart output is missing %q", want)
+		}
+	}
+
+	// Enabled evidence carries the namespaced Secret authority: a Role and a
+	// RoleBinding that bjw-s names "<release>-<identifier>", so "courier-evidence".
+	findDocument(t, enabled, "kind: Role", "name: courier-evidence")
+	findDocument(t, enabled, "kind: RoleBinding", "name: courier-evidence")
+
+	// The evidence Service's selector must exactly equal the controller
+	// Deployment's pod selector so the Service tracks the controller pods
+	// and nothing else.
+	service := findDocument(t, enabled, "kind: Service", "name: courier-evidence")
+	deployment := findDocument(t, enabled, "kind: Deployment", "name: courier")
+	selector := blockLines(t, service, "selector:", 0)
+	podSelector := deploymentPodSelector(t, deployment)
+	if len(selector) == 0 {
+		t.Fatal("evidence Service has no selector labels")
+	}
+	if !sameLabelSet(selector, podSelector) {
+		t.Fatalf("evidence Service selector %v does not exactly equal the controller Deployment pod selector %v", selector, podSelector)
+	}
+
+	// Enabled without the key secret fails the render.
+	out, err := runHelmOutput(t, chartDir, "template", "courier", ".",
+		"--set", "evidence.enabled=true",
+	)
+	if err == nil {
+		t.Fatalf("expected helm template to fail without evidence.keySecret, but it succeeded:\n%s", out)
+	}
+	if !strings.Contains(out, "requires evidence.keySecret") {
+		t.Fatalf("helm template failed without the expected message:\n%s", out)
+	}
+}
+
 // findDocument returns the YAML document (a block of the multi-doc helm
 // output separated by ---) that contains a line equal to kindLine and a
 // line equal to nameLine.
@@ -233,6 +357,29 @@ func findDocument(t *testing.T, output, kindLine, nameLine string) string {
 	}
 	t.Fatalf("no document with a line %q and a line %q", kindLine, nameLine)
 	return ""
+}
+
+// missingDocuments returns every document (a block of the multi-doc helm
+// output separated by ---) that contains a line equal to kindLine and a line
+// equal to nameLine. It is the inverse of findDocument: an empty result is the
+// expected outcome for an assertion that a resource must not be rendered.
+func missingDocuments(output, kindLine, nameLine string) []string {
+	var matches []string
+	for _, doc := range strings.Split(output, "\n---") {
+		hasKind, hasName := false, false
+		for _, line := range strings.Split(doc, "\n") {
+			switch strings.TrimSpace(line) {
+			case kindLine:
+				hasKind = true
+			case nameLine:
+				hasName = true
+			}
+		}
+		if hasKind && hasName {
+			matches = append(matches, doc)
+		}
+	}
+	return matches
 }
 
 // deploymentPodSelector returns the "key: value" lines of the controller

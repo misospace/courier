@@ -515,6 +515,20 @@ func (r *CoderRunReconciler) observeMissingCoordinator(ctx context.Context, run 
 			}
 		}
 	}
+	// For secure runs the surviving round — the untrusted worker and the
+	// credentialed broker — must not outlive the missing supervisor: the
+	// loss is now confirmed, and a fence deferred to the next Claimed
+	// reconcile would never run if that reconcile keeps failing preflight
+	// or provisioning. ObserveTopology already establishes this pattern at
+	// control termination (HARNESS.md §3, #123's invariant); apply it here
+	// too, on the detection reconcile, before returning the run to Claimed
+	// (or handing it to a human at the ceiling, which terminalizes the
+	// run so the fence must complete in this reconcile). (#215)
+	if r.Secure != nil {
+		if err := r.Secure.Fence(ctx, run); err != nil {
+			return ctrl.Result{}, err
+		}
+	}
 	return r.relaunchAfterInfraLoss(ctx, run, podLostReason, podLostEventReason)
 }
 
