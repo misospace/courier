@@ -1354,7 +1354,7 @@ func TestTerminalLifecycleReportsToSource(t *testing.T) {
 		{
 			name:             "failed resolve-issue checks hand off",
 			mode:             courierv1alpha1.ModeResolveIssue,
-			observation:      PRObservation{PR: "42", Checks: []CheckObservation{{State: CheckStateFailed}}},
+			observation:      redObservation("sha-red", "test", "lint"),
 			wantPhase:        courierv1alpha1.PhaseHandedOff,
 			wantReport:       source.Lifecycle{Result: source.ResultHandedOff, PR: "42", Error: externalVerificationFailureReason, IdempotencyKey: "coderun/default/run/HandedOff"},
 			wantNoTransition: true,
