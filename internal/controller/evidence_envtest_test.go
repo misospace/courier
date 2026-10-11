@@ -435,11 +435,14 @@ func TestEvidenceEnvtestCleanTerminalNoEvidence(t *testing.T) {
 
 // TestEvidenceEnvtestWithheldEntryPersistsRestAndInvalidBundlesPersistNothing
 // (a) Bundle with an entry the intake withholds: other members persist;
-//     withheld member is ABSENT from the stored bundle.tar.gz; persistedManifest
-//     records that entry with disposition "withheld", StoredPath "", consistent totals.
+//
+//	withheld member is ABSENT from the stored bundle.tar.gz; persistedManifest
+//	records that entry with disposition "withheld", StoredPath "", consistent totals.
+//
 // (b) Structurally invalid bundles — oversize part, gzip bomb, tar-slip member name —
-//     each rejected with 413/400 and requireNoSecret for its nonce; final label-list
-//     shows zero evidence Secrets in the namespace.
+//
+//	each rejected with 413/400 and requireNoSecret for its nonce; final label-list
+//	shows zero evidence Secrets in the namespace.
 func TestEvidenceEnvtestWithheldEntryPersistsRestAndInvalidBundlesPersistNothing(t *testing.T) {
 	if envtestClient == nil {
 		t.Skip("KUBEBUILDER_ASSETS is not set")
@@ -699,7 +702,7 @@ func TestEvidenceEnvtestWithheldEntryPersistsRestAndInvalidBundlesPersistNothing
 	requireNoSecret(t, intake, runName, namespace, nonceB4)
 
 	// Final label-list: the only evidence Secret that exists is (a)'s accepted
-// slot; every rejected POST persisted nothing.
+	// slot; every rejected POST persisted nothing.
 	var secrets corev1.SecretList
 	if err := envtestClient.List(ctx, &secrets, client.InNamespace(namespace), client.MatchingLabels{EvidenceLabelKey: evidenceLabelValue(runName)}); err != nil {
 		t.Fatal(err)
@@ -723,4 +726,577 @@ func runGit(t *testing.T, dir string, args ...string) error {
 		return fmt.Errorf("git %s: %v: %s", strings.Join(args, " "), err, strings.TrimSpace(string(out)))
 	}
 	return nil
+}
+
+// TestEvidenceEnvtestGraceCapturePhaseAcceptance verifies the intake's phase
+// allow-list: NeedsHuman admits (grace capture for crashloop ceiling),
+// Verifying and Done reject with 403 and persist nothing.
+func TestEvidenceEnvtestGraceCapturePhaseAcceptance(t *testing.T) {
+	if envtestClient == nil {
+		t.Skip("KUBEBUILDER_ASSETS is not set")
+	}
+	ctx := context.Background()
+
+	runNames := []string{
+		"evidence-grace-needshuman",
+		"evidence-grace-verifying",
+		"evidence-grace-done",
+	}
+	phases := []courierv1alpha1.Phase{
+		courierv1alpha1.PhaseNeedsHuman,
+		courierv1alpha1.PhaseVerifying,
+		courierv1alpha1.PhaseDone,
+	}
+	laneName := "evidence-grace-phases"
+	namespace := "default"
+
+	lane := envtestLaneInNamespace(laneName, namespace)
+	if err := envtestClient.Create(ctx, lane); err != nil {
+		t.Fatal(err)
+	}
+
+	var runs []*courierv1alpha1.CoderRun
+	for _, name := range runNames {
+		run := envtestRunInNamespace(name, laneName, namespace)
+		if err := envtestClient.Create(ctx, run); err != nil {
+			t.Fatal(err)
+		}
+		runs = append(runs, run)
+	}
+
+	t.Cleanup(func() {
+		for _, run := range runs {
+			var secrets corev1.SecretList
+			if err := envtestClient.List(ctx, &secrets, client.InNamespace(namespace), client.MatchingLabels{EvidenceLabelKey: evidenceLabelValue(run.Name)}); err == nil {
+				for _, s := range secrets.Items {
+					_ = envtestClient.Delete(ctx, &s)
+				}
+			}
+			_ = envtestClient.Delete(ctx, run)
+		}
+		_ = envtestClient.Delete(ctx, lane)
+	})
+
+	// Pin each run to its target phase via the status subresource.
+	for i, run := range runs {
+		if err := envtestClient.Get(ctx, envtestKey(run.Name), run); err != nil {
+			t.Fatal(err)
+		}
+		run.Status.Phase = phases[i]
+		if err := envtestClient.Status().Update(ctx, run); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// Build an intake with no credential secrets (benign bundle).
+	intake := &EvidenceIntake{
+		Client:    envtestClient,
+		APIReader: envtestClient,
+		Scheme:    envtestScheme(),
+		Key:       testKey,
+		Pod:       executor.PodConfig{},
+	}
+
+	// POST a valid bundle to each run with a distinct nonce.
+	for i, run := range runs {
+		nonce := make([]byte, executor.EvidenceNonceBytes)
+		if _, err := rand.Read(nonce); err != nil {
+			t.Fatalf("generate nonce for %s: %v", run.Name, err)
+		}
+
+		m := sampleIntakeManifest(run, "benign content")
+		req, _ := intakeRequest(t, testKey, run, m, map[string][]byte{"src/a.go": []byte("benign content")}, nonce)
+		rec := doIntake(intake, req)
+
+		wantCode := http.StatusOK
+		if phases[i] != courierv1alpha1.PhaseNeedsHuman {
+			wantCode = http.StatusForbidden
+		}
+
+		if rec.Code != wantCode {
+			t.Errorf("%s (phase %s): intake POST code = %d, want %d; body = %s", run.Name, phases[i], rec.Code, wantCode, rec.Body.String())
+		}
+
+		if wantCode == http.StatusOK {
+			// NeedsHuman: secret must exist.
+			wantName := evidenceSecretName(run.Name, nonce)
+			secret := &corev1.Secret{}
+			if err := envtestClient.Get(ctx, client.ObjectKey{Namespace: namespace, Name: wantName}, secret); err != nil {
+				t.Errorf("%s: evidence secret %s not found: %v", run.Name, wantName, err)
+			}
+		} else {
+			// Verifying/Done: no secret must exist.
+			requireNoSecret(t, intake, run.Name, namespace, nonce)
+		}
+	}
+}
+
+// TestEvidenceEnvtestOperatorDeletesAtLandedKeepsAtNeedsHuman verifies the
+// reconcile loop's evidence lifecycle: evidence is deleted when a run lands
+// (AwaitingReview/Done) and retained at NeedsHuman. It also checks that a run
+// in Verifying with pre-seeded evidence keeps it while Verifying, and still
+// keeps it after transitioning to NeedsHuman. The ownerRef contract is asserted
+// to confirm production GC cascade behavior.
+func TestEvidenceEnvtestOperatorDeletesAtLandedKeepsAtNeedsHuman(t *testing.T) {
+	if envtestClient == nil {
+		t.Skip("KUBEBUILDER_ASSETS is not set")
+	}
+	ctx := context.Background()
+
+	// Run A: NeedsHuman -> POST -> reconcile -> kept + condition.
+	// Then phase -> Done -> reconcile -> deleted (idempotent).
+	runAName := "evidence-op-needshuman-to-done"
+	laneName := "evidence-op-lifecycle"
+	namespace := "default"
+
+	lane := envtestLaneInNamespace(laneName, namespace)
+	if err := envtestClient.Create(ctx, lane); err != nil {
+		t.Fatal(err)
+	}
+	runA := envtestRunInNamespace(runAName, laneName, namespace)
+	if err := envtestClient.Create(ctx, runA); err != nil {
+		t.Fatal(err)
+	}
+
+	// Pin to NeedsHuman.
+	if err := envtestClient.Get(ctx, envtestKey(runAName), runA); err != nil {
+		t.Fatal(err)
+	}
+	runA.Status.Phase = courierv1alpha1.PhaseNeedsHuman
+	if err := envtestClient.Status().Update(ctx, runA); err != nil {
+		t.Fatal(err)
+	}
+
+	t.Cleanup(func() {
+		var secrets corev1.SecretList
+		if err := envtestClient.List(ctx, &secrets, client.InNamespace(namespace), client.MatchingLabels{EvidenceLabelKey: evidenceLabelValue(runAName)}); err == nil {
+			for _, s := range secrets.Items {
+				_ = envtestClient.Delete(ctx, &s)
+			}
+		}
+		_ = envtestClient.Delete(ctx, runA)
+		_ = envtestClient.Delete(ctx, lane)
+	})
+
+	intake := &EvidenceIntake{
+		Client:    envtestClient,
+		APIReader: envtestClient,
+		Scheme:    envtestScheme(),
+		Key:       testKey,
+		Pod:       executor.PodConfig{},
+	}
+
+	item := &admissionSource{}
+	reconciler := &CoderRunReconciler{
+		Client:       envtestClient,
+		APIReader:    envtestClient,
+		Sources:      NewSourceRegistry(map[string]source.Adapter{"manual": item}),
+		StatusWriter: status.KubePatchWriter{Client: envtestClient},
+		Evidence:     intake,
+		Launch: func(ctx context.Context, run *courierv1alpha1.CoderRun) error {
+			var claimed courierv1alpha1.CoderRun
+			if err := envtestClient.Get(ctx, envtestKey(runAName), &claimed); err != nil {
+				return err
+			}
+			if claimed.Status.Phase != courierv1alpha1.PhaseClaimed {
+				return fmt.Errorf("phase during launch = %q, want Claimed", claimed.Status.Phase)
+			}
+			controller := true
+			pod := &corev1.Pod{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      run.Name + "-coordinator",
+					Namespace: run.Namespace,
+					Labels:    map[string]string{executor.LabelRun: run.Name},
+					OwnerReferences: []metav1.OwnerReference{{
+						APIVersion: courierv1alpha1.GroupVersion.String(),
+						Kind:       "CoderRun",
+						Name:       run.Name,
+						UID:        run.UID,
+						Controller: &controller,
+					}},
+				},
+				Spec: corev1.PodSpec{Containers: []corev1.Container{{Name: "coordinator", Image: "example/test"}}},
+			}
+			if err := envtestClient.Create(ctx, pod); err != nil {
+				return err
+			}
+			pod.Status.ContainerStatuses = []corev1.ContainerStatus{{
+				Name:  "coordinator",
+				State: corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{ExitCode: 0}},
+			}}
+			return envtestClient.Status().Update(ctx, pod)
+		},
+	}
+
+	reconcile := func() {
+		t.Helper()
+		if _, err := reconciler.Reconcile(ctx, envtestRequest(runAName)); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// POST evidence to run A while it is NeedsHuman.
+	nonceA := make([]byte, executor.EvidenceNonceBytes)
+	if _, err := rand.Read(nonceA); err != nil {
+		t.Fatalf("generate nonce: %v", err)
+	}
+	m := sampleIntakeManifest(runA, "benign content")
+	reqA, _ := intakeRequest(t, testKey, runA, m, map[string][]byte{"src/a.go": []byte("benign content")}, nonceA)
+	recA := doIntake(intake, reqA)
+	if recA.Code != http.StatusOK {
+		t.Fatalf("run A intake POST code = %d, want 200; body = %s", recA.Code, recA.Body.String())
+	}
+
+	// Reconcile: evidence should be kept and condition set.
+	reconcile()
+	var updatedRunA courierv1alpha1.CoderRun
+	if err := envtestClient.Get(ctx, envtestKey(runAName), &updatedRunA); err != nil {
+		t.Fatal(err)
+	}
+	cond := apimeta.FindStatusCondition(updatedRunA.Status.Conditions, EvidenceConditionType)
+	if cond == nil || cond.Status != metav1.ConditionTrue || cond.Reason != EvidenceReasonCaptured {
+		t.Errorf("run A condition = %+v, want True/%s", cond, EvidenceReasonCaptured)
+	}
+
+	// Verify secret exists with correct ownerRef (BlockOwnerDeletion=true, Controller=false).
+	// This ownerRef is what makes production GC cascade when the run is deleted.
+	secretA := getSecret(t, intake, evidenceSecretName(runAName, nonceA))
+	if len(secretA.OwnerReferences) != 1 {
+		t.Fatalf("run A secret owner refs = %d, want 1", len(secretA.OwnerReferences))
+	}
+	or := secretA.OwnerReferences[0]
+	if or.Kind != "CoderRun" || or.Name != runAName || or.UID != runA.UID {
+		t.Errorf("run A owner ref = %+v, want CoderRun/%s/%s", or, runAName, runA.UID)
+	}
+	if or.BlockOwnerDeletion == nil || !*or.BlockOwnerDeletion || or.Controller != nil && *or.Controller {
+		t.Errorf("run A owner ref flags: BlockOwnerDeletion=%v, Controller=%v, want true/false", or.BlockOwnerDeletion, or.Controller)
+	}
+
+	// Now move run A to Done via Status().Update and reconcile.
+	if err := envtestClient.Get(ctx, envtestKey(runAName), &updatedRunA); err != nil {
+		t.Fatal(err)
+	}
+	updatedRunA.Status.Phase = courierv1alpha1.PhaseDone
+	if err := envtestClient.Status().Update(ctx, &updatedRunA); err != nil {
+		t.Fatal(err)
+	}
+	reconcile()
+
+	// Evidence should be deleted (label-list empty).
+	var secretsA corev1.SecretList
+	if err := envtestClient.List(ctx, &secretsA, client.InNamespace(namespace), client.MatchingLabels{EvidenceLabelKey: evidenceLabelValue(runAName)}); err != nil {
+		t.Fatal(err)
+	}
+	if len(secretsA.Items) != 0 {
+		t.Errorf("run A after Done: found %d evidence secrets, want 0", len(secretsA.Items))
+	}
+
+	// Second reconcile is idempotent (no error, still empty).
+	reconcile()
+	if err := envtestClient.List(ctx, &secretsA, client.InNamespace(namespace), client.MatchingLabels{EvidenceLabelKey: evidenceLabelValue(runAName)}); err != nil {
+		t.Fatal(err)
+	}
+	if len(secretsA.Items) != 0 {
+		t.Errorf("run A after second reconcile: found %d evidence secrets, want 0", len(secretsA.Items))
+	}
+
+	// Run B: Verifying with pre-seeded evidence -> reconcile (kept) ->
+	// phase -> NeedsHuman -> reconcile (still kept).
+	runBName := "evidence-op-verifying-to-needshuman"
+	runB := envtestRunInNamespace(runBName, laneName, namespace)
+	if err := envtestClient.Create(ctx, runB); err != nil {
+		t.Fatal(err)
+	}
+	// Pin to Verifying.
+	if err := envtestClient.Get(ctx, envtestKey(runBName), runB); err != nil {
+		t.Fatal(err)
+	}
+	runB.Status.Phase = courierv1alpha1.PhaseVerifying
+	if err := envtestClient.Status().Update(ctx, runB); err != nil {
+		t.Fatal(err)
+	}
+
+	t.Cleanup(func() {
+		var secrets corev1.SecretList
+		if err := envtestClient.List(ctx, &secrets, client.InNamespace(namespace), client.MatchingLabels{EvidenceLabelKey: evidenceLabelValue(runBName)}); err == nil {
+			for _, s := range secrets.Items {
+				_ = envtestClient.Delete(ctx, &s)
+			}
+		}
+		_ = envtestClient.Delete(ctx, runB)
+	})
+
+	// Pre-seed an evidence secret for run B (like coderun_evidence_test.go's testEvidenceSecret
+	// but via envtestClient). The secret must have the evidence label and an ownerRef.
+	nonceB := make([]byte, executor.EvidenceNonceBytes)
+	if _, err := rand.Read(nonceB); err != nil {
+		t.Fatalf("generate nonce B: %v", err)
+	}
+	secretB := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      evidenceSecretName(runBName, nonceB),
+			Namespace: namespace,
+			Labels:    map[string]string{EvidenceLabelKey: evidenceLabelValue(runBName)},
+			OwnerReferences: []metav1.OwnerReference{{
+				APIVersion:         courierv1alpha1.GroupVersion.String(),
+				Kind:               "CoderRun",
+				Name:               runBName,
+				UID:                runB.UID,
+				BlockOwnerDeletion: boolPtr(true),
+				Controller:         boolPtr(false),
+			}},
+		},
+		Data: map[string][]byte{
+			evidenceManifestKey: []byte(`{"schema_version":1,"run":{"name":"` + runBName + `","namespace":"` + namespace + `","runUID":"` + string(runB.UID) + `","podUID":"pod-1"},"workspace":{"baseRepo":"acme/widgets","headRepo":"acme/widgets","branch":"courier/x","startSHA":"00000000","headSHA":"11111111"},"captured_at":"2026-01-01T00:00:00Z","trigger":"terminal","entries":[],"totals":{"files":0,"stored":0,"stored_bytes":0}}`),
+			evidenceBundleKey:   []byte{},
+		},
+	}
+	if err := envtestClient.Create(ctx, secretB); err != nil {
+		t.Fatalf("create pre-seeded secret for run B: %v", err)
+	}
+
+	// Build a reconciler for run B (no Launch needed; we only test evidence lifecycle).
+	reconcilerB := &CoderRunReconciler{
+		Client:       envtestClient,
+		APIReader:    envtestClient,
+		Sources:      NewSourceRegistry(map[string]source.Adapter{"manual": &admissionSource{}}),
+		StatusWriter: status.KubePatchWriter{Client: envtestClient},
+		Evidence:     intake,
+	}
+
+	reconcileB := func() {
+		t.Helper()
+		if _, err := reconcilerB.Reconcile(ctx, envtestRequest(runBName)); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// First reconcile while Verifying: evidence should be kept (no condition set in Verifying).
+	reconcileB()
+	var runBUpdated courierv1alpha1.CoderRun
+	if err := envtestClient.Get(ctx, envtestKey(runBName), &runBUpdated); err != nil {
+		t.Fatal(err)
+	}
+	condB := apimeta.FindStatusCondition(runBUpdated.Status.Conditions, EvidenceConditionType)
+	if condB != nil {
+		t.Errorf("run B (Verifying) condition = %+v, want none (reconcileEvidence is no-op in Verifying)", condB)
+	}
+	// Secret should still exist.
+	secretCheck := &corev1.Secret{}
+	if err := envtestClient.Get(ctx, client.ObjectKey{Namespace: namespace, Name: secretB.Name}, secretCheck); err != nil {
+		t.Errorf("run B (Verifying) secret deleted: %v", err)
+	}
+
+	// Transition to NeedsHuman and reconcile again: evidence should still be kept, condition set.
+	if err := envtestClient.Get(ctx, envtestKey(runBName), &runBUpdated); err != nil {
+		t.Fatal(err)
+	}
+	runBUpdated.Status.Phase = courierv1alpha1.PhaseNeedsHuman
+	if err := envtestClient.Status().Update(ctx, &runBUpdated); err != nil {
+		t.Fatal(err)
+	}
+	reconcileB()
+	if err := envtestClient.Get(ctx, envtestKey(runBName), &runBUpdated); err != nil {
+		t.Fatal(err)
+	}
+	condB2 := apimeta.FindStatusCondition(runBUpdated.Status.Conditions, EvidenceConditionType)
+	if condB2 == nil || condB2.Status != metav1.ConditionTrue || condB2.Reason != EvidenceReasonCaptured {
+		t.Errorf("run B (NeedsHuman) condition = %+v, want True/%s", condB2, EvidenceReasonCaptured)
+	}
+	secretCheck2 := &corev1.Secret{}
+	if err := envtestClient.Get(ctx, client.ObjectKey{Namespace: namespace, Name: secretB.Name}, secretCheck2); err != nil {
+		t.Errorf("run B (NeedsHuman) secret deleted: %v", err)
+	}
+}
+
+// TestEvidenceEnvtestStaleEvidenceFencing verifies the intake fences against
+// stale tokens: (a) a recreated same-name run has a new UID and rejects the old
+// token; (b) a cross-run token replay is rejected by the HMAC binding.
+func TestEvidenceEnvtestStaleEvidenceFencing(t *testing.T) {
+	if envtestClient == nil {
+		t.Skip("KUBEBUILDER_ASSETS is not set")
+	}
+	ctx := context.Background()
+
+	namespace := "default"
+	laneName := "evidence-stale-fencing"
+
+	lane := envtestLaneInNamespace(laneName, namespace)
+	if err := envtestClient.Create(ctx, lane); err != nil {
+		t.Fatal(err)
+	}
+
+	// ---- (a) Old UID rejection ----
+	runXName := "evidence-stale-run-x"
+	runX := envtestRunInNamespace(runXName, laneName, namespace)
+	if err := envtestClient.Create(ctx, runX); err != nil {
+		t.Fatal(err)
+	}
+	// Pin to Failed.
+	if err := envtestClient.Get(ctx, envtestKey(runXName), runX); err != nil {
+		t.Fatal(err)
+	}
+	runX.Status.Phase = courierv1alpha1.PhaseFailed
+	if err := envtestClient.Status().Update(ctx, runX); err != nil {
+		t.Fatal(err)
+	}
+	oldUID := runX.UID
+
+	t.Cleanup(func() {
+		var secrets corev1.SecretList
+		if err := envtestClient.List(ctx, &secrets, client.InNamespace(namespace), client.MatchingLabels{EvidenceLabelKey: evidenceLabelValue(runXName)}); err == nil {
+			for _, s := range secrets.Items {
+				_ = envtestClient.Delete(ctx, &s)
+			}
+		}
+		_ = envtestClient.Delete(ctx, runX)
+	})
+
+	intake := &EvidenceIntake{
+		Client:    envtestClient,
+		APIReader: envtestClient,
+		Scheme:    envtestScheme(),
+		Key:       testKey,
+		Pod:       executor.PodConfig{},
+	}
+
+	// POST with nonce n1 -> 200.
+	nonce1 := make([]byte, executor.EvidenceNonceBytes)
+	if _, err := rand.Read(nonce1); err != nil {
+		t.Fatalf("generate nonce1: %v", err)
+	}
+	mX := sampleIntakeManifest(runX, "content for run X")
+	req1, _ := intakeRequest(t, testKey, runX, mX, map[string][]byte{"src/a.go": []byte("content for run X")}, nonce1)
+	rec1 := doIntake(intake, req1)
+	if rec1.Code != http.StatusOK {
+		t.Fatalf("run X first POST: code = %d, want 200; body = %s", rec1.Code, rec1.Body.String())
+	}
+
+	// Verify secret exists.
+	secretName1 := evidenceSecretName(runXName, nonce1)
+	secret1 := &corev1.Secret{}
+	if err := envtestClient.Get(ctx, client.ObjectKey{Namespace: namespace, Name: secretName1}, secret1); err != nil {
+		t.Fatalf("run X secret %s not found: %v", secretName1, err)
+	}
+
+	// Delete the run.
+	if err := envtestClient.Delete(ctx, runX); err != nil {
+		t.Fatalf("delete run X: %v", err)
+	}
+
+	// Recreate SAME name/namespace.
+	runXNew := envtestRunInNamespace(runXName, laneName, namespace)
+	if err := envtestClient.Create(ctx, runXNew); err != nil {
+		t.Fatal(err)
+	}
+	// Verify new UID differs.
+	if runXNew.UID == oldUID {
+		t.Fatalf("recreated run UID = %s, want different from old %s", runXNew.UID, oldUID)
+	}
+
+	// Pin new run to Failed so intake admits.
+	if err := envtestClient.Get(ctx, envtestKey(runXName), runXNew); err != nil {
+		t.Fatal(err)
+	}
+	runXNew.Status.Phase = courierv1alpha1.PhaseFailed
+	if err := envtestClient.Status().Update(ctx, runXNew); err != nil {
+		t.Fatal(err)
+	}
+
+	// Replay the OLD token (bound to old UID) with a FRESH nonce n2 -> 401.
+	nonce2 := make([]byte, executor.EvidenceNonceBytes)
+	if _, err := rand.Read(nonce2); err != nil {
+		t.Fatalf("generate nonce2: %v", err)
+	}
+	// The old token was minted with oldUID. We construct it manually since the
+	// helper would use the new run's UID.
+	oldToken := executor.EvidenceToken(testKey, namespace, runXName, string(oldUID), nonce2)
+	mXNew := sampleIntakeManifest(runXNew, "content for run X new")
+	manifestBytes, _ := mXNew.MarshalCanonical()
+	var buf bytes.Buffer
+	mw := multipart.NewWriter(&buf)
+	mp, _ := mw.CreateFormFile("manifest", "manifest.json")
+	_, _ = mp.Write(manifestBytes)
+	_ = mw.Close()
+	req2 := httptest.NewRequest(http.MethodPost, "/intake", &buf)
+	req2.Header.Set("Content-Type", mw.FormDataContentType())
+	req2.Header.Set("Authorization", "Bearer "+oldToken)
+	rec2 := doIntake(intake, req2)
+	if rec2.Code != http.StatusUnauthorized {
+		t.Errorf("replay old token to new run: code = %d, want 401; body = %s", rec2.Code, rec2.Body.String())
+	}
+	requireNoSecret(t, intake, runXName, namespace, nonce2)
+
+	// ---- (b) Cross-run token replay ----
+	// Run Y (target), pin Failed.
+	runYName := "evidence-stale-run-y"
+	runY := envtestRunInNamespace(runYName, laneName, namespace)
+	if err := envtestClient.Create(ctx, runY); err != nil {
+		t.Fatal(err)
+	}
+	if err := envtestClient.Get(ctx, envtestKey(runYName), runY); err != nil {
+		t.Fatal(err)
+	}
+	runY.Status.Phase = courierv1alpha1.PhaseFailed
+	if err := envtestClient.Status().Update(ctx, runY); err != nil {
+		t.Fatal(err)
+	}
+
+	// Run X (third run, any phase) - create and pin Failed for token minting.
+	runX2Name := "evidence-stale-run-x2"
+	runX2 := envtestRunInNamespace(runX2Name, laneName, namespace)
+	if err := envtestClient.Create(ctx, runX2); err != nil {
+		t.Fatal(err)
+	}
+	if err := envtestClient.Get(ctx, envtestKey(runX2Name), runX2); err != nil {
+		t.Fatal(err)
+	}
+	runX2.Status.Phase = courierv1alpha1.PhaseFailed
+	if err := envtestClient.Status().Update(ctx, runX2); err != nil {
+		t.Fatal(err)
+	}
+
+	t.Cleanup(func() {
+		for _, name := range []string{runYName, runX2Name} {
+			var secrets corev1.SecretList
+			if err := envtestClient.List(ctx, &secrets, client.InNamespace(namespace), client.MatchingLabels{EvidenceLabelKey: evidenceLabelValue(name)}); err == nil {
+				for _, s := range secrets.Items {
+					_ = envtestClient.Delete(ctx, &s)
+				}
+			}
+			_ = envtestClient.Delete(ctx, &courierv1alpha1.CoderRun{ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: namespace}})
+		}
+	})
+
+	// Mint a token for run X2, but POST a manifest locating run Y.
+	nonceY := make([]byte, executor.EvidenceNonceBytes)
+	if _, err := rand.Read(nonceY); err != nil {
+		t.Fatalf("generate nonceY: %v", err)
+	}
+	crossToken := executor.EvidenceToken(testKey, namespace, runX2Name, string(runX2.UID), nonceY)
+	mY := sampleIntakeManifest(runY, "content for run Y")
+	manifestBytesY, _ := mY.MarshalCanonical()
+	var bufY bytes.Buffer
+	mwY := multipart.NewWriter(&bufY)
+	mpY, _ := mwY.CreateFormFile("manifest", "manifest.json")
+	_, _ = mpY.Write(manifestBytesY)
+	_ = mwY.Close()
+	reqY := httptest.NewRequest(http.MethodPost, "/intake", &bufY)
+	reqY.Header.Set("Content-Type", mwY.FormDataContentType())
+	reqY.Header.Set("Authorization", "Bearer "+crossToken)
+	recY := doIntake(intake, reqY)
+	if recY.Code != http.StatusUnauthorized {
+		t.Errorf("cross-run token replay: code = %d, want 401; body = %s", recY.Code, recY.Body.String())
+	}
+	// Y's slot (by nonceY) must not exist, and Y's label-list must be empty.
+	requireNoSecret(t, intake, runYName, namespace, nonceY)
+	var secretsY corev1.SecretList
+	if err := envtestClient.List(ctx, &secretsY, client.InNamespace(namespace), client.MatchingLabels{EvidenceLabelKey: evidenceLabelValue(runYName)}); err != nil {
+		t.Fatal(err)
+	}
+	if len(secretsY.Items) != 0 {
+		t.Errorf("run Y label-list after cross-run replay: found %d secrets, want 0", len(secretsY.Items))
+	}
+
+	_ = envtestClient.Delete(ctx, lane)
 }
