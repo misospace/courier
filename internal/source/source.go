@@ -18,6 +18,11 @@ var ErrStaleWork = errors.New("source: work item is stale")
 // dropped rather than retried: the newer generation belongs to another run.
 var ErrSuperseded = errors.New("source: work item superseded")
 
+// ErrUnsupportedOutcome means the source does not accept a lifecycle result.
+// The report intent stays pending, but automatic retries stop until an
+// operator supplies a new explicit retry token on the CoderRun.
+var ErrUnsupportedOutcome = errors.New("source: unsupported lifecycle outcome")
+
 // WorkItem identifies work in a source. ID is intentionally opaque: sources
 // are free to choose their identifier format, and the core must not know about
 // a source's queue or API types.

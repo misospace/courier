@@ -343,6 +343,12 @@ spec:
               lastCommit:
                 description: LastCommit is the last commit pushed to the work branch.
                 type: string
+              lifecycleReportRetryToken:
+                description: LifecycleReportRetryToken records the last explicit retry
+                  token handled for an unsupported lifecycle result; it is an opaque,
+                  non-secret value.
+                maxLength: 128
+                type: string
               phase:
                 description: Phase is the current lifecycle phase.
                 enum:

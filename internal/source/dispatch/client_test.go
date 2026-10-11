@@ -707,6 +707,39 @@ func TestHTTPClientReportMapsBlockedAndFailed(t *testing.T) {
 	}
 }
 
+func TestHTTPClientClassifiesOnlyInvalidOutcomeBadRequestAsUnsupported(t *testing.T) {
+	for _, tt := range []struct {
+		name        string
+		statusCode  int
+		body        string
+		unsupported bool
+	}{
+		{name: "invalid outcome", statusCode: http.StatusBadRequest, body: `{"error":"Invalid outcome. Must be one of: pr_opened, failed"}`, unsupported: true},
+		{name: "other bad request", statusCode: http.StatusBadRequest, body: `{"error":"invalid task schema"}`},
+		{name: "server error", statusCode: http.StatusInternalServerError, body: `{"error":"Invalid outcome. Must be one of: pr_opened"}`},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				w.WriteHeader(tt.statusCode)
+				_, _ = w.Write([]byte(tt.body))
+			}))
+			defer server.Close()
+			client, err := NewClient(server.URL, "worker", "secret-token", time.Second)
+			if err != nil {
+				t.Fatal(err)
+			}
+			id := EncodeWorkID(Task{Type: "implement", Issue: &Issue{ID: "issue-1", Repo: "acme/widgets", Number: 42}})
+			err = client.Report(context.Background(), id, source.Lifecycle{Result: source.ResultHandedOff, PR: "42"})
+			if got := errors.Is(err, source.ErrUnsupportedOutcome); got != tt.unsupported {
+				t.Fatalf("errors.Is(ErrUnsupportedOutcome) = %t, error %v; want %t", got, err, tt.unsupported)
+			}
+			if err == nil {
+				t.Fatal("Report() error = nil, want API error")
+			}
+		})
+	}
+}
+
 func TestHTTPClientReportHandedOffDoesNotParkPRFix(t *testing.T) {
 	var reports []map[string]any
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

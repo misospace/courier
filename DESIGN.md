@@ -1726,6 +1726,7 @@ was superseded.
   issue. Sources apply their own failure policy. Dispatch's failed report performs the retry/cap
   decision for queue-backed PR-fix work, so Courier must not send a second
   `BLOCKED` mark for the same now-advanced generation.
+- **2026-10-11 — #246: unsupported lifecycle reports stop retrying until explicit request.** Dispatch's current outcome allowlist rejects `handed-off`, and automatic retries at the normal lifecycle interval cannot make that source contract change. Courier now preserves the truthful pending lifecycle condition, stops retrying only this typed unsupported case, and allows an operator to request another attempt with a new bounded annotation token. Transient source errors still retry as before.
 - **2026-10-09 — #246: a resolve-issue run hands off a published PR with stable
   red checks.** Supersedes the resolve-issue half of the 2026-10-06 decision
   above: a resolve-issue run sat in `Verifying` indefinitely on red CI, waiting
@@ -1746,14 +1747,17 @@ was superseded.
   and is not a success like `AwaitingReview`. On settle it publishes no source
   `State` transition and exactly one idempotent `handed-off` lifecycle report
   under `coderun/<namespace>/<name>/HandedOff` (with the run UID appended when
-  set); a failed report is retried
-  on a later reconcile with the same key. Dispatch's acceptance of
-  `handed-off` — mapping it to a task report and not marking the PR-fix queue
-  `BLOCKED`, because it discovers the red checks through its own
-  `pr-followup/sync` — is the companion change's required behavior and is
-  still pending on misospace/dispatch; until it lands Courier's `handed-off`
-  lifecycle report is rejected (HTTP 400) and retried, and the link will be
-  added here when it lands. Fix-pr's immediate red path (`Failed` plus a
+  set). Transient report failures retry with the same key. If the source
+  rejects the outcome as unsupported, Courier records `LifecycleReported=False`
+  with reason `UnsupportedOutcome` and preserves the pending intent without
+  retrying automatically. An operator can request a retry by setting the
+  `courier.misospace.dev/retry-lifecycle-report` annotation to a new opaque
+  token (up to 128 characters); the processed token is persisted in status, and
+  the same idempotency key is reused. Dispatch currently rejects `handed-off`
+  with HTTP 400; Courier identifies only its explicit invalid-outcome response
+  as unsupported, while unrelated client and server errors remain transient.
+  The report remains truthful and source-neutral; no source `State` transition
+  is published. Fix-pr's immediate red path (`Failed` plus a
   retryable failed report) and the missing/draft-PR path (`NeedsHuman`) are
   unchanged. (#246, #171)
 - **2026-09-30 — #169/#175: declare outcomes outside the worktree; never settle

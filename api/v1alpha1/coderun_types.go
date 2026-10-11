@@ -253,6 +253,11 @@ type CoderRunStatus struct {
 	// +optional
 	FailedCheckFingerprint string `json:"failedCheckFingerprint,omitempty"`
 
+	// LifecycleReportRetryToken records the last explicit retry token handled for an unsupported lifecycle result; it is an opaque, non-secret value.
+	// +optional
+	// +kubebuilder:validation:MaxLength=128
+	LifecycleReportRetryToken string `json:"lifecycleReportRetryToken,omitempty"`
+
 	// Checkpoint is the compact resumable state written by the harness.
 	// +optional
 	Checkpoint *Checkpoint `json:"checkpoint,omitempty"`

@@ -368,7 +368,22 @@ func (c *HTTPClient) reportTaskWithPR(ctx context.Context, d workDescriptor, out
 	if len(telemetry) > 0 {
 		body["telemetry"] = telemetry
 	}
-	return c.do(ctx, http.MethodPost, "/api/agents/"+url.PathEscape(c.agentName)+"/tasks/report", body, nil)
+	err := c.do(ctx, http.MethodPost, "/api/agents/"+url.PathEscape(c.agentName)+"/tasks/report", body, nil)
+	var apiErr *APIError
+	if errors.As(err, &apiErr) && apiErr.StatusCode == http.StatusBadRequest && isInvalidOutcomeResponse(apiErr.Message) {
+		return fmt.Errorf("%w: %w", source.ErrUnsupportedOutcome, apiErr)
+	}
+	return err
+}
+
+func isInvalidOutcomeResponse(message string) bool {
+	var response struct {
+		Error string `json:"error"`
+	}
+	if err := json.Unmarshal([]byte(message), &response); err != nil {
+		return false
+	}
+	return strings.HasPrefix(strings.TrimSpace(response.Error), "Invalid outcome. Must be one of:")
 }
 
 func parsePullRequest(value string) (int, string) {
