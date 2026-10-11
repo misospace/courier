@@ -435,56 +435,142 @@ func TestHTTPClientReportMapsObservedPR(t *testing.T) {
 	}
 }
 
-// TestHTTPClientReportBlockedExternalIsRetryableFailure pins issue #267: a
-// recoverable dependency block reuses Dispatch's retryable failure report and
-// must never issue the human BLOCKED queue mark. Both task types are covered:
-// a follow-up PR carries the queue mark path, an implement task does not.
-func TestHTTPClientReportBlockedExternalIsRetryableFailure(t *testing.T) {
-	tests := []struct {
-		name string
-		task Task
-	}{
-		{
-			name: "followup-pr",
-			task: Task{Type: "followup-pr", PullRequest: &PullRequest{Repo: "acme/widgets", Number: 42}, PRFixItem: &PRFixItem{ID: "item-1", Generation: 3}},
-		},
-		{
-			name: "implement",
-			task: Task{Type: "implement", Issue: &Issue{Repo: "acme/widgets", Number: 42}},
-		},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
+// TestHTTPClientReportBlockedExternalIsWaitingExternal pins issue #267: a
+// recoverable dependency block must not be reported as a regular Dispatch
+// failure (which would advance the PR-fix generation and burn fixAttempts on
+// a prerequisite Courier cannot satisfy). Instead it sends a dedicated
+// "waiting-external" outcome, and a queue-backed follow-up is also marked
+// "WAITING_EXTERNAL" so the issued generation stays current without surfacing
+// a human block. An implement task has no PR-fix item, so it sends only the
+// task report. See DESIGN.md §267 for the cross-repo contract.
+func TestHTTPClientReportBlockedExternalIsWaitingExternal(t *testing.T) {
+	t.Run("followup-pr", func(t *testing.T) {
+		var reports, marks []map[string]any
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			body, _ := io.ReadAll(r.Body)
 			var request map[string]any
-			var paths []string
-			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-				paths = append(paths, r.URL.Path)
-				if r.URL.Path != "/prefix/api/agents/worker/tasks/report" {
-					t.Errorf("unexpected path %q", r.URL.Path)
-					w.WriteHeader(http.StatusBadRequest)
-					return
-				}
-				body, _ := io.ReadAll(r.Body)
-				if err := json.Unmarshal(body, &request); err != nil {
-					t.Fatal(err)
-				}
-				w.WriteHeader(http.StatusNoContent)
-			}))
-			defer server.Close()
-			client, err := NewClientWithLane(server.URL+"/prefix/", "worker", "normal", "secret-token", time.Second)
-			if err != nil {
+			if err := json.Unmarshal(body, &request); err != nil {
 				t.Fatal(err)
 			}
-			if err := client.Report(context.Background(), EncodeWorkID(tt.task), source.Lifecycle{State: source.StateInProgress, Result: source.ResultBlockedExternal, Error: "missing prerequisite: secrets/prod"}); err != nil {
+			switch r.URL.Path {
+			case "/api/agents/worker/tasks/report":
+				reports = append(reports, request)
+			case "/api/pr-fix-queue/mark":
+				marks = append(marks, request)
+			default:
+				t.Errorf("unexpected path %q", r.URL.Path)
+				w.WriteHeader(http.StatusBadRequest)
+				return
+			}
+			w.WriteHeader(http.StatusNoContent)
+		}))
+		defer server.Close()
+		client, err := NewClientWithLane(server.URL, "worker", "normal", "secret-token", time.Second)
+		if err != nil {
+			t.Fatal(err)
+		}
+		id := EncodeWorkID(Task{Type: "followup-pr", PullRequest: &PullRequest{Repo: "acme/widgets", Number: 42}, PRFixItem: &PRFixItem{ID: "item-1", Generation: 3}})
+		if err := client.Report(context.Background(), id, source.Lifecycle{State: source.StateInProgress, Result: source.ResultBlockedExternal, Error: "missing prerequisite: secrets/prod"}); err != nil {
+			t.Fatal(err)
+		}
+		if len(reports) != 1 {
+			t.Fatalf("reports = %#v, want exactly one task report (not a failed report)", reports)
+		}
+		report := reports[0]
+		if report["outcome"] != "waiting-external" {
+			t.Fatalf("report outcome = %v, want waiting-external so Dispatch's failed-attempt accounting does not fire", report["outcome"])
+		}
+		if report["error"] != "missing prerequisite: secrets/prod" {
+			t.Fatalf("report error = %v, want the missing prerequisite reason", report["error"])
+		}
+		if report["taskType"] != "followup-pr" {
+			t.Fatalf("report taskType = %v, want followup-pr", report["taskType"])
+		}
+		if got := report["prFixItem"]; got == nil {
+			t.Fatalf("report must echo the prFixItem so Dispatch settles the issued attempt, got %#v", got)
+		}
+		if len(marks) != 1 {
+			t.Fatalf("marks = %#v, want exactly one WAITING_EXTERNAL queue mark", marks)
+		}
+		mark := marks[0]
+		if mark["status"] != "WAITING_EXTERNAL" {
+			t.Fatalf("mark status = %v, want WAITING_EXTERNAL (never BLOCKED for a human)", mark["status"])
+		}
+		if mark["repo"] != "acme/widgets" || mark["pr"] != float64(42) {
+			t.Fatalf("mark target = %#v, want repo acme/widgets pr 42", mark)
+		}
+		if mark["generation"] != float64(3) {
+			t.Fatalf("mark generation = %v, want 3 (must not advance)", mark["generation"])
+		}
+		if mark["note"] != "missing prerequisite: secrets/prod" {
+			t.Fatalf("mark note = %v, want the missing prerequisite reason", mark["note"])
+		}
+	})
+
+	t.Run("implement", func(t *testing.T) {
+		var reports []map[string]any
+		var paths []string
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			paths = append(paths, r.URL.Path)
+			body, _ := io.ReadAll(r.Body)
+			var request map[string]any
+			if err := json.Unmarshal(body, &request); err != nil {
 				t.Fatal(err)
 			}
-			if request["outcome"] != "failed" || request["error"] != "missing prerequisite: secrets/prod" {
-				t.Fatalf("request = %#v, want a retryable failed report with the missing reason", request)
+			reports = append(reports, request)
+			w.WriteHeader(http.StatusNoContent)
+		}))
+		defer server.Close()
+		client, err := NewClientWithLane(server.URL, "worker", "normal", "secret-token", time.Second)
+		if err != nil {
+			t.Fatal(err)
+		}
+		id := EncodeWorkID(Task{Type: "implement", Issue: &Issue{Repo: "acme/widgets", Number: 42}})
+		if err := client.Report(context.Background(), id, source.Lifecycle{State: source.StateInProgress, Result: source.ResultBlockedExternal, Error: "missing prerequisite: secrets/prod"}); err != nil {
+			t.Fatal(err)
+		}
+		if len(reports) != 1 {
+			t.Fatalf("reports = %#v, want exactly one task report", reports)
+		}
+		if reports[0]["outcome"] != "waiting-external" {
+			t.Fatalf("report outcome = %v, want waiting-external", reports[0]["outcome"])
+		}
+		if reports[0]["error"] != "missing prerequisite: secrets/prod" {
+			t.Fatalf("report error = %v, want the missing prerequisite reason", reports[0]["error"])
+		}
+		if len(paths) != 1 || paths[0] != "/api/agents/worker/tasks/report" {
+			t.Fatalf("paths = %#v, want only the task report (no queue mark for an implement task)", paths)
+		}
+	})
+}
+
+// TestHTTPClientReportWaitingExternalNoBlockedMark guards the failure mode
+// issue #267 review flagged: the queue mark must use a recoverable, generation-
+// fenced WAITING_EXTERNAL status and never reach for the BLOCKED human park
+// that ResultBlocked would issue. A regression here would silently convert a
+// recoverable external wait into a human block at the cap.
+func TestHTTPClientReportWaitingExternalNoBlockedMark(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/api/pr-fix-queue/mark" {
+			body, _ := io.ReadAll(r.Body)
+			var request map[string]any
+			if err := json.Unmarshal(body, &request); err != nil {
+				t.Fatal(err)
 			}
-			if len(paths) != 1 || paths[0] != "/prefix/api/agents/worker/tasks/report" {
-				t.Fatalf("paths = %#v, want only the task report (no BLOCKED queue mark)", paths)
+			if request["status"] == "BLOCKED" {
+				t.Errorf("waiting-external mark must not be BLOCKED: %#v", request)
 			}
-		})
+		}
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer server.Close()
+	client, err := NewClientWithLane(server.URL, "worker", "normal", "secret-token", time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	id := EncodeWorkID(Task{Type: "followup-pr", PullRequest: &PullRequest{Repo: "acme/widgets", Number: 42}, PRFixItem: &PRFixItem{ID: "item-1", Generation: 7}})
+	if err := client.Report(context.Background(), id, source.Lifecycle{State: source.StateInProgress, Result: source.ResultBlockedExternal, Error: "missing prerequisite: secrets/prod"}); err != nil {
+		t.Fatal(err)
 	}
 }
 

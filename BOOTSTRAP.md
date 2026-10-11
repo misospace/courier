@@ -229,7 +229,12 @@ source's failure policy, while missing or draft PR state reaches `NeedsHuman`.
 Exit `2` (`needs_decision`) moves the run to `NeedsHuman`, and
 `blocked_external` moves it to the terminal, recoverable `BlockedExternal`
 phase, keeping the source item active and reporting a recoverable result so the
-source can re-issue the work once the prerequisite is satisfied. Exit `3`
+source can re-issue the work once the prerequisite is satisfied. The
+recoverable signal must reach the source in a form it cannot mistake for a
+normal failure: the Dispatch adapter publishes a dedicated `waiting-external`
+task outcome and, for queue-backed follow-ups, a generation-fenced
+`WAITING_EXTERNAL` queue mark, so the prerequisite wait does not advance the
+issued generation or burn fix-attempt budget. Exit `3`
 (`no_change_needed`) moves a resolve-issue run to `AwaitingReview` with the
 source `in-review`, and settles a fix-pr run against the world through
 `Verifying` (`Done` only on a merged/already-addressed pull request,

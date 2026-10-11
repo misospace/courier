@@ -1013,7 +1013,11 @@ incomplete. This does not change the declared-outcome exit mapping above. A
 alone. A `blocked_external` result keeps the source item active (`in-progress`)
 and reports a recoverable lifecycle result, so the source can re-issue the work
 once the prerequisite is satisfied; it is never parked as a human `BLOCKED`
-item.
+item. The recoverable signal must reach the source in a form it cannot mistake
+for a normal failure: the Dispatch adapter publishes a dedicated
+`waiting-external` task outcome and, for queue-backed follow-ups, a
+generation-fenced `WAITING_EXTERNAL` queue mark, so the prerequisite wait does
+not advance the issued generation or burn fix-attempt budget.
 
 Outcome comments carry the full declared evidence, question, or missing
 explanation after redaction. They are not shortened to the termination reason;

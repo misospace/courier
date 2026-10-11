@@ -201,8 +201,16 @@ on the run branch; the declaration never substitutes for that check (#169):
   **BlockedExternal**. The source item is kept active (`in-progress`) and
   reported with a recoverable lifecycle result, so the source can re-issue the
   work once the named prerequisite is satisfied; it is never parked as a human
-  block. A CI failure discovered after publication is not this outcome: it
-  follows the operator's verification and source failure policy.
+  block. The recoverable signal must reach the source in a way it cannot
+  mistake for a normal failure: publishing the lifecycle as a regular
+  `failed` report causes a queue-backed source to advance its generation and
+  burn fix-attempt budget on a prerequisite Courier cannot satisfy, ending
+  exactly in the human park this outcome is designed to avoid. The Dispatch
+  adapter therefore publishes a dedicated `waiting-external` task outcome
+  and, for queue-backed follow-ups, a generation-fenced `WAITING_EXTERNAL`
+  queue mark — both recoverable, neither a `BLOCKED` human park. A CI
+  failure discovered after publication is not this outcome: it follows the
+  operator's verification and source failure policy.
 
 Comments preserve the full declared evidence, question, or missing explanation
 after redaction; they are not shortened to the termination reason. Comment
@@ -1259,6 +1267,25 @@ one. That separate Dispatch change is tracked by misospace/dispatch#1045; an
 adapter fallback/dedup change is conditional on its wire contract, not a generic
 core retry or a metadata-hash substitute.
 
+#### Recoverable dependency blocks across the Dispatch boundary
+
+A `BlockedExternal` run must reach Dispatch as a recoverable dependency wait,
+not as a regular failure: `resolvePrFixFromAgentReport` treats `outcome:"failed"`
+as an attempt to be reissued, advancing the issued generation and incrementing
+`fixAttempts` until it eventually surfaces `status:"BLOCKED", lane:"NEEDS_HUMAN"`
+at the cap — exactly the human park the new phase is designed to avoid. The
+Dispatch adapter therefore publishes a dedicated `outcome:"waiting-external"`
+task report and, for queue-backed follow-ups, a generation-fenced
+`status:"WAITING_EXTERNAL"` queue mark. Dispatch is expected to treat both as
+no-ops for fix-attempt accounting: do not advance generation, do not increment
+`fixAttempts`, do not surface as a human block, and keep the item discoverable
+so a future discovery cycle can re-offer the same work once the prerequisite
+is satisfied. Until Dispatch learns both signals, Courier emits them
+forward-compatibly; a legacy Dispatch rejects the report, and the controller
+retries on the existing bounded backoff. The contract change is tracked
+alongside #267; the source-neutral `blocked-external` lifecycle result and
+`BlockedExternal` phase in the operator are unchanged.
+
 ## MCP surface
 
 The legacy coordinator pod currently receives forge access through MCP, alongside
@@ -1415,24 +1442,37 @@ named items remain unresolved and must not be described as production-ready:
 ## Decisions
 
 - **2026-10-11 — #267: settle fix-pr `no_change_needed` against the world; make
-  `blocked_external` a recoverable dependency block.** A fix-pr
-  `no_change_needed` declaration (executor exit 3) was mapped to `NeedsHuman`
-  only because Dispatch lacked an explicit already-addressed settlement, so
-  already-merged runs (miso-gallery #527, musebridge #81) reported the correct
-  outcome and still ended `NeedsHuman`. It is now routed to `Verifying`, which
-  settles it from the world: `Done` requires a merged/already-addressed pull
-  request, `AwaitingReview` requires stable green checks, a red check reaches
-  retryable `Failed`, and an unobservable pull request reaches `NeedsHuman`.
-  `blocked_external` (executor exit 2) is no longer a human block: it gains the
-  terminal recoverable phase `BlockedExternal` and the source lifecycle result
-  `blocked-external`, which the Dispatch adapter publishes as its existing
-  retryable failure report (never a `BLOCKED` human park), keeping the item
-  active so the source can re-issue it once the prerequisite is satisfied.
-  `needs_decision` still reaches `NeedsHuman`; provider/workload failures remain
-  `Failed`; exit codes and trusted handoff payloads are unchanged, so legacy
-  exits stay compatible. This supersedes the fix-pr `no_change_needed` and
-  `blocked_external` mappings recorded in the 2026-09-30 #169/#175 entry; the
-  rest of that contract stands. (#267)
+  `blocked_external` a recoverable dependency block across the source
+  boundary.** A fix-pr `no_change_needed` declaration (executor exit 3) was
+  mapped to `NeedsHuman` only because Dispatch lacked an explicit
+  already-addressed settlement, so already-merged runs (miso-gallery #527,
+  musebridge #81) reported the correct outcome and still ended `NeedsHuman`.
+  It is now routed to `Verifying`, which settles it from the world: `Done`
+  requires a merged/already-addressed pull request, `AwaitingReview` requires
+  stable green checks, a red check reaches retryable `Failed`, and an
+  unobservable pull request reaches `NeedsHuman`. `blocked_external`
+  (executor exit 2) is no longer a human block: it gains the terminal
+  recoverable phase `BlockedExternal` and the source lifecycle result
+  `blocked-external`. The PR #271 review caught that publishing that result
+  as the existing Dispatch `failed` task report would burn the issued
+  generation's fix-attempt budget on a prerequisite Courier cannot satisfy
+  and surface the item as a human `BLOCKED` at the cap — exactly the park
+  the new phase is meant to avoid. The Dispatch adapter now publishes a
+  dedicated `waiting-external` task outcome and, for queue-backed follow-ups,
+  a generation-fenced `WAITING_EXTERNAL` queue mark, so the recoverable
+  signal reaches Dispatch without touching failed-attempt accounting and the
+  item stays discoverable for re-offer once the prerequisite is satisfied.
+  The Dispatch-side acceptance of the new outcome and queue status is a
+  cross-repo contract change; until Dispatch learns both, the report and
+  mark are emitted (forward-compatible) but a legacy Dispatch will reject
+  them, and the controller retries on the existing bounded backoff. The
+  source-neutral `blocked-external` lifecycle result and the
+  `BlockedExternal` phase are unchanged from the PR #271 first landing.
+  `needs_decision` still reaches `NeedsHuman`; provider/workload failures
+  remain `Failed`; exit codes and trusted handoff payloads are unchanged, so
+  legacy exits stay compatible. This supersedes the fix-pr
+  `no_change_needed` and `blocked_external` mappings recorded in the
+  2026-09-30 #169/#175 entry; the rest of that contract stands. (#267)
 
 - **2026-10-10 — #259: intake accepts the sender's empty RunUID and stamps
   the live UID; the bearer itself is a credential; untrusted manifest
