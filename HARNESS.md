@@ -997,18 +997,23 @@ worktree; it is control metadata, not a repository file. The executor validates
 the declaration against the world before terminalizing: exit `0` (`changes`)
 reaches `Verifying` only when the coordinator validates integrated work locally,
 fixes failures, and commits are reachable from the run branch; exit `2`
-(`needs_decision` or `blocked_external`) reaches `NeedsHuman`; exit `3`
-(`no_change_needed`) reaches `AwaitingReview` with source `in-review` for
-resolve-issue runs and `NeedsHuman` for fix-pr runs; an externally observed
-failed check reaches `Failed` and follows the source's failure policy, while
-other nonzero exits also reach `Failed`. Session recovery for undeclared recoverable
-endings is shipped: with a captured session, dirty, off-branch, and no-work
-states resume under the #170 continuation budget and no-progress guard; without
-a captured session, those endings fail as incomplete. This does not change the
-declared-outcome exit mapping above. A `no_change_needed` result never resolves
-the source. For fix-pr, its blocked lifecycle report parks the PR-fix
-item as `BLOCKED`/needs-human; `BlockedReportParksPRFix` skips only the redundant
-queue-mark call and does not wake a reviewer or request another review.
+(`needs_decision`) reaches `NeedsHuman` and `blocked_external` reaches the
+terminal, recoverable `BlockedExternal` phase; exit `3` (`no_change_needed`)
+reaches `AwaitingReview` with source `in-review` for resolve-issue runs, and for
+fix-pr runs is settled against the world through `Verifying` (`Done` only on a
+merged/already-addressed pull request, `AwaitingReview` only on stable green
+checks, retryable `Failed` on a red check, `NeedsHuman` when unobservable); an
+externally observed failed check reaches `Failed` and follows the source's
+failure policy, while other nonzero exits also reach `Failed`. Session recovery
+for undeclared recoverable endings is shipped: with a captured session, dirty,
+off-branch, and no-work states resume under the #170 continuation budget and
+no-progress guard; without a captured session, those endings fail as
+incomplete. This does not change the declared-outcome exit mapping above. A
+`no_change_needed` result never resolves the source on the coordinator's word
+alone. A `blocked_external` result keeps the source item active (`in-progress`)
+and reports a recoverable lifecycle result, so the source can re-issue the work
+once the prerequisite is satisfied; it is never parked as a human `BLOCKED`
+item.
 
 Outcome comments carry the full declared evidence, question, or missing
 explanation after redaction. They are not shortened to the termination reason;

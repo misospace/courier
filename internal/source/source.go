@@ -82,6 +82,11 @@ const (
 	ResultReady Result = "ready"
 	// ResultBlocked marks work requiring human intervention.
 	ResultBlocked Result = "blocked"
+	// ResultBlockedExternal marks work blocked on an external prerequisite
+	// that Courier cannot satisfy itself. It is recoverable: unlike
+	// ResultBlocked it must not park the item for a human, so a source may
+	// re-issue the work once the prerequisite is satisfied.
+	ResultBlockedExternal Result = "blocked-external"
 	// ResultFailed marks work that failed execution. Sources own the policy for
 	// handling it; some may issue a fresh attempt while others only record it.
 	ResultFailed Result = "failed"

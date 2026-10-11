@@ -14,7 +14,7 @@ const (
 )
 
 // Phase is the lifecycle phase of a CoderRun.
-// +kubebuilder:validation:Enum=Pending;Claimed;Running;Verifying;AwaitingReview;NeedsHuman;Done;Failed
+// +kubebuilder:validation:Enum=Pending;Claimed;Running;Verifying;AwaitingReview;NeedsHuman;Done;Failed;BlockedExternal
 type Phase string
 
 const (
@@ -26,6 +26,12 @@ const (
 	PhaseNeedsHuman     Phase = "NeedsHuman"
 	PhaseDone           Phase = "Done"
 	PhaseFailed         Phase = "Failed"
+	// PhaseBlockedExternal is a terminal, recoverable external-dependency
+	// block: the run stopped on a prerequisite outside Courier, and the
+	// source may re-issue the work once that prerequisite is satisfied. It is
+	// deliberately distinct from NeedsHuman (a human decision) and Failed (a
+	// provider or workload failure).
+	PhaseBlockedExternal Phase = "BlockedExternal"
 )
 
 // CoderRunSpec is set once by a source adapter and is then immutable.

@@ -226,11 +226,16 @@ locally, fixes any failures, and committed work is verified on the run branch;
 the operator then polls the external PR and CI state. Stable green observations
 reach `AwaitingReview`; a failed check reaches `Failed` and is handled by the
 source's failure policy, while missing or draft PR state reaches `NeedsHuman`.
-Exit `2` (`needs_decision` or
-`blocked_external`) moves the run to `NeedsHuman`. Exit `3` (`no_change_needed`)
-moves a resolve-issue run to `AwaitingReview` with the source `in-review`, and a
-fix-pr run to `NeedsHuman`, never settling the source; its blocked lifecycle
-report parks the PR-fix item as `BLOCKED`/needs-human. The evidence, question,
+Exit `2` (`needs_decision`) moves the run to `NeedsHuman`, and
+`blocked_external` moves it to the terminal, recoverable `BlockedExternal`
+phase, keeping the source item active and reporting a recoverable result so the
+source can re-issue the work once the prerequisite is satisfied. Exit `3`
+(`no_change_needed`) moves a resolve-issue run to `AwaitingReview` with the
+source `in-review`, and settles a fix-pr run against the world through
+`Verifying` (`Done` only on a merged/already-addressed pull request,
+`AwaitingReview` only on stable green checks, retryable `Failed` on a red check,
+`NeedsHuman` when unobservable), never settling the source on the declaration
+alone. The evidence, question,
 or missing explanation is posted in full after redaction; only the separate
 termination reason is bounded and redacted. Comment posting is best-effort:
 failures are logged as `outcome.comment` and do not change the ending.

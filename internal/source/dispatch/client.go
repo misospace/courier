@@ -437,6 +437,12 @@ func (c *HTTPClient) Report(ctx context.Context, id string, lifecycle source.Lif
 			return reportErr
 		}
 		return errors.Join(reportErr, c.markPRFixBlocked(ctx, d, lifecycle.Error))
+	case source.ResultBlockedExternal:
+		// Recoverable dependency block: reuse Dispatch's failed report so
+		// its existing retry policy can re-issue eligible work once the
+		// prerequisite is satisfied. Never mark the PR-fix item BLOCKED for
+		// a human, which is what ResultBlocked does.
+		return c.reportTaskWithPR(ctx, d, "failed", lifecycle.Error, lifecycle.PR, lifecycle.IdempotencyKey, lifecycle.Telemetry, lifecycle.StartedAt)
 	case source.ResultFailed:
 		// Dispatch's failed report requeues eligible PR-fix work under its
 		// existing attempt cap. A separate BLOCKED mark can target a stale

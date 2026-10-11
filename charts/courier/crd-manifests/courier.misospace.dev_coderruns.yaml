@@ -346,6 +346,7 @@ spec:
                 - NeedsHuman
                 - Done
                 - Failed
+                - BlockedExternal
                 type: string
               pr:
                 description: PR is the pull request opened by this run (number or

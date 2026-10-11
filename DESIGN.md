@@ -183,20 +183,25 @@ on the run branch; the declaration never substitutes for that check (#169):
   commits reachable from the run branch → exit `0`, **Verifying**. Work committed
   only elsewhere is not run success.
 - **`no_change_needed`** — nothing to do, with evidence. The executor posts the
-  complete evidence as a redacted issue/PR comment, then exits `3`: a
+  complete evidence as a redacted issue/PR comment, then exits `3`. A
   resolve-issue run ends in **AwaitingReview** and moves the source to
-  `in-review` for a human to settle; a fix-pr run ends **NeedsHuman** and sends
-  a blocked lifecycle report. That report parks the PR-fix item as
-  `BLOCKED`/needs-human. Its `BlockedReportParksPRFix` flag suppresses only the
-  redundant follow-up queue mark; it does not wake a reviewer or request
-  another review. Neither mode resolves the source on the coordinator's word.
+  `in-review` for a human to settle. A fix-pr run is settled against the world
+  through **Verifying**: a merged/already-addressed pull request reaches
+  **Done**; an open pull request reaches **AwaitingReview** only after stable
+  green checks; a red check reaches retryable **Failed**; a pull request that
+  cannot be observed (no observer, or a missing or draft pull request) reaches
+  **NeedsHuman**. Neither mode resolves the source on the coordinator's word
+  alone.
 - **`needs_decision`** — a real decision the coordinator cannot make. The
   executor posts the complete question as a redacted issue/PR comment and exits
   `2` to **NeedsHuman** with a blocked source report.
 - **`blocked_external`** — an external prerequisite needed to perform the work
   is missing. The executor posts the complete `missing` explanation as a
-  redacted issue/PR comment and exits `2` to **NeedsHuman** with a blocked source
-  report. A CI failure discovered after publication is not this outcome: it
+  redacted issue/PR comment and exits `2` to the terminal, recoverable phase
+  **BlockedExternal**. The source item is kept active (`in-progress`) and
+  reported with a recoverable lifecycle result, so the source can re-issue the
+  work once the named prerequisite is satisfied; it is never parked as a human
+  block. A CI failure discovered after publication is not this outcome: it
   follows the operator's verification and source failure policy.
 
 Comments preserve the full declared evidence, question, or missing explanation
@@ -1110,9 +1115,10 @@ there is no delete verb because active runs reference lanes. (#73)
   **Verifying** only when the coordinator validates integrated work locally,
   fixes failures, and committed work is reachable from the run branch; work
   committed elsewhere is not success.
-  Exit `2` (`needs_decision` or `blocked_external`) reaches **NeedsHuman**;
-  exit `3` (`no_change_needed`)
-  reaches **AwaitingReview** for resolve-issue and **NeedsHuman** for fix-pr.
+  Exit `2` reaches **NeedsHuman** for a `needs_decision` declaration and the
+  recoverable **BlockedExternal** phase for a `blocked_external` declaration;
+  exit `3` (`no_change_needed`) reaches **AwaitingReview** for resolve-issue and
+  is settled against the world through **Verifying** for fix-pr.
   Other failure exits reach **Failed**. When no outcome is declared, recoverable
   endings — uncommitted changes, commits off the run branch, or no commit and no
   workspace changes — resume the same session with a short state message, up to
@@ -1407,6 +1413,26 @@ named items remain unresolved and must not be described as production-ready:
 - The exact vLLM gauge for backpressure on the target model server.
 
 ## Decisions
+
+- **2026-10-11 — #267: settle fix-pr `no_change_needed` against the world; make
+  `blocked_external` a recoverable dependency block.** A fix-pr
+  `no_change_needed` declaration (executor exit 3) was mapped to `NeedsHuman`
+  only because Dispatch lacked an explicit already-addressed settlement, so
+  already-merged runs (miso-gallery #527, musebridge #81) reported the correct
+  outcome and still ended `NeedsHuman`. It is now routed to `Verifying`, which
+  settles it from the world: `Done` requires a merged/already-addressed pull
+  request, `AwaitingReview` requires stable green checks, a red check reaches
+  retryable `Failed`, and an unobservable pull request reaches `NeedsHuman`.
+  `blocked_external` (executor exit 2) is no longer a human block: it gains the
+  terminal recoverable phase `BlockedExternal` and the source lifecycle result
+  `blocked-external`, which the Dispatch adapter publishes as its existing
+  retryable failure report (never a `BLOCKED` human park), keeping the item
+  active so the source can re-issue it once the prerequisite is satisfied.
+  `needs_decision` still reaches `NeedsHuman`; provider/workload failures remain
+  `Failed`; exit codes and trusted handoff payloads are unchanged, so legacy
+  exits stay compatible. This supersedes the fix-pr `no_change_needed` and
+  `blocked_external` mappings recorded in the 2026-09-30 #169/#175 entry; the
+  rest of that contract stands. (#267)
 
 - **2026-10-10 — #259: intake accepts the sender's empty RunUID and stamps
   the live UID; the bearer itself is a credential; untrusted manifest
