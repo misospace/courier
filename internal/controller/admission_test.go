@@ -258,21 +258,23 @@ type fakeStatusWriter struct {
 func (w fakeStatusWriter) PatchStatus(ctx context.Context, name types.NamespacedName, patch []byte) error {
 	var document struct {
 		Status struct {
-			Phase                  courierv1alpha1.Phase              `json:"phase,omitempty"`
-			Branch                 *string                            `json:"branch,omitempty"`
-			HeadRepo               *string                            `json:"headRepo,omitempty"`
-			HeadSHA                *string                            `json:"headSHA,omitempty"`
-			PR                     string                             `json:"pr,omitempty"`
-			AdmittedAt             *metav1.Time                       `json:"admittedAt,omitempty"`
-			StartedAt              *metav1.Time                       `json:"startedAt,omitempty"`
-			FinishedAt             *metav1.Time                       `json:"finishedAt,omitempty"`
-			WaitDuration           string                             `json:"waitDuration,omitempty"`
-			RunDuration            string                             `json:"runDuration,omitempty"`
-			CheckFingerprint       *string                            `json:"checkFingerprint,omitempty"`
-			FailedCheckFingerprint *string                            `json:"failedCheckFingerprint,omitempty"`
-			Restarts               *int                               `json:"restarts,omitempty"`
-			Conditions             []metav1.Condition                 `json:"conditions,omitempty"`
-			PublicationPolicy      *courierv1alpha1.PublicationPolicy `json:"publicationPolicy,omitempty"`
+			Phase                           courierv1alpha1.Phase              `json:"phase,omitempty"`
+			Branch                          *string                            `json:"branch,omitempty"`
+			HeadRepo                        *string                            `json:"headRepo,omitempty"`
+			HeadSHA                         *string                            `json:"headSHA,omitempty"`
+			PR                              string                             `json:"pr,omitempty"`
+			AdmittedAt                      *metav1.Time                       `json:"admittedAt,omitempty"`
+			StartedAt                       *metav1.Time                       `json:"startedAt,omitempty"`
+			FinishedAt                      *metav1.Time                       `json:"finishedAt,omitempty"`
+			WaitDuration                    string                             `json:"waitDuration,omitempty"`
+			RunDuration                     string                             `json:"runDuration,omitempty"`
+			CheckFingerprint                *string                            `json:"checkFingerprint,omitempty"`
+			FailedCheckFingerprint          *string                            `json:"failedCheckFingerprint,omitempty"`
+			LifecycleReportRetryToken       *string                            `json:"lifecycleReportRetryToken,omitempty"`
+			LifecycleReportActiveRetryToken *string                            `json:"lifecycleReportActiveRetryToken,omitempty"`
+			Restarts                        *int                               `json:"restarts,omitempty"`
+			Conditions                      []metav1.Condition                 `json:"conditions,omitempty"`
+			PublicationPolicy               *courierv1alpha1.PublicationPolicy `json:"publicationPolicy,omitempty"`
 		} `json:"status"`
 	}
 	if err := json.Unmarshal(patch, &document); err != nil {
@@ -317,6 +319,12 @@ func (w fakeStatusWriter) PatchStatus(ctx context.Context, name types.Namespaced
 	}
 	if document.Status.FailedCheckFingerprint != nil {
 		run.Status.FailedCheckFingerprint = *document.Status.FailedCheckFingerprint
+	}
+	if document.Status.LifecycleReportRetryToken != nil {
+		run.Status.LifecycleReportRetryToken = *document.Status.LifecycleReportRetryToken
+	}
+	if document.Status.LifecycleReportActiveRetryToken != nil {
+		run.Status.LifecycleReportActiveRetryToken = *document.Status.LifecycleReportActiveRetryToken
 	}
 	if document.Status.Restarts != nil {
 		run.Status.Restarts = *document.Status.Restarts

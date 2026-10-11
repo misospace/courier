@@ -343,10 +343,15 @@ spec:
               lastCommit:
                 description: LastCommit is the last commit pushed to the work branch.
                 type: string
+              lifecycleReportActiveRetryToken:
+                description: LifecycleReportActiveRetryToken persists an explicit
+                  retry token while its report is transiently retrying.
+                maxLength: 128
+                type: string
               lifecycleReportRetryToken:
                 description: LifecycleReportRetryToken records the last explicit retry
                   token handled for an unsupported lifecycle result; it is an opaque,
-                  non-secret value.
+                  non-secret value limited to 128 Unicode code points.
                 maxLength: 128
                 type: string
               phase:

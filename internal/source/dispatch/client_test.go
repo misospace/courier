@@ -714,8 +714,11 @@ func TestHTTPClientClassifiesOnlyInvalidOutcomeBadRequestAsUnsupported(t *testin
 		body        string
 		unsupported bool
 	}{
-		{name: "invalid outcome", statusCode: http.StatusBadRequest, body: `{"error":"Invalid outcome. Must be one of: pr_opened, failed"}`, unsupported: true},
+		{name: "invalid outcome", statusCode: http.StatusBadRequest, body: `{"error":"Invalid outcome. Must be one of: pr_opened, pr_updated, issue_updated, issue_closed, blocked, failed, no_changes_needed, already_addressed"}`, unsupported: true},
+		{name: "reordered valid outcomes", statusCode: http.StatusBadRequest, body: `{"error":"Invalid outcome. Must be one of: already_addressed, blocked, issue_closed, issue_updated, no_changes_needed, failed, pr_updated, pr_opened"}`, unsupported: true},
+		{name: "new allowlisted outcome", statusCode: http.StatusBadRequest, body: `{"error":"Invalid outcome. Must be one of: pr_opened, pr_updated, issue_updated, issue_closed, blocked, failed, no_changes_needed, already_addressed, queued"}`, unsupported: true},
 		{name: "other bad request", statusCode: http.StatusBadRequest, body: `{"error":"invalid task schema"}`},
+		{name: "malformed bad request", statusCode: http.StatusBadRequest, body: `{"error":`},
 		{name: "server error", statusCode: http.StatusInternalServerError, body: `{"error":"Invalid outcome. Must be one of: pr_opened"}`},
 	} {
 		t.Run(tt.name, func(t *testing.T) {

@@ -95,11 +95,12 @@ type OperatorPatch struct {
 	// WaitDuration is set once, when StartedAt is recorded.
 	WaitDuration string `json:"waitDuration,omitempty"`
 	// RunDuration is set once, when FinishedAt is recorded.
-	RunDuration               string  `json:"runDuration,omitempty"`
-	CheckFingerprint          *string `json:"checkFingerprint,omitempty"`
-	FailedCheckFingerprint    *string `json:"failedCheckFingerprint,omitempty"`
-	LifecycleReportRetryToken *string `json:"lifecycleReportRetryToken,omitempty"`
-	Restarts                  *int    `json:"restarts,omitempty"`
+	RunDuration                     string  `json:"runDuration,omitempty"`
+	CheckFingerprint                *string `json:"checkFingerprint,omitempty"`
+	FailedCheckFingerprint          *string `json:"failedCheckFingerprint,omitempty"`
+	LifecycleReportRetryToken       *string `json:"lifecycleReportRetryToken,omitempty"`
+	LifecycleReportActiveRetryToken *string `json:"lifecycleReportActiveRetryToken,omitempty"`
+	Restarts                        *int    `json:"restarts,omitempty"`
 	// PublicationPolicy is the operator-resolved immutable publication
 	// destination, persisted once at secure admission. The caller enforces
 	// set-once semantics: the operator only emits the field when the run's

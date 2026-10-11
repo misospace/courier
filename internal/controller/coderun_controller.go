@@ -8,6 +8,7 @@ import (
 	"reflect"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	corev1 "k8s.io/api/core/v1"
 	apimeta "k8s.io/apimachinery/pkg/api/meta"
@@ -42,6 +43,7 @@ const coordinatorContainerName = "coordinator"
 // report has been published; a False status means a later reconcile retries it.
 const (
 	lifecycleReportedCondition                              = "LifecycleReported"
+	lifecycleReportSupportedCondition                       = "LifecycleReportSupported"
 	lifecycleReportPendingReason                            = "Pending"
 	lifecycleReportPendingBlockedReportParksPRFixReason     = "PendingBlockedReportParksPRFix"
 	lifecycleReportPendingWithErrorReason                   = "PendingWithError"
@@ -214,8 +216,13 @@ func (r *CoderRunReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 	// the run already reached its phase and freed capacity.
 	if run.Status.Phase != "" && run.Status.Phase != courierv1alpha1.PhasePending {
 		if lifecycleReportPending(&run) {
-			if lifecycleReportUnsupported(&run) && !lifecycleReportRetryRequested(&run) {
-				return ctrl.Result{}, nil
+			if lifecycleReportUnsupported(&run) {
+				if lifecycleReportRetryTokenInvalid(&run) {
+					log.FromContext(ctx).Info("ignoring invalid lifecycle retry token; token must be non-empty and at most 128 Unicode code points")
+				}
+				if !lifecycleReportRetryRequested(&run) {
+					return ctrl.Result{}, nil
+				}
 			}
 			return r.retryTerminalLifecycle(ctx, &run)
 		}
@@ -840,27 +847,31 @@ func pendingLifecycleIntent(run *courierv1alpha1.CoderRun) terminalLifecycleInte
 // itself is never held by the report.
 func (r *CoderRunReconciler) publishTerminalLifecycle(ctx context.Context, run *courierv1alpha1.CoderRun, adapter source.Adapter, item source.WorkItem, phase courierv1alpha1.Phase, intent terminalLifecycleIntent) (ctrl.Result, error) {
 	err := r.publishSourceLifecycle(ctx, run, adapter, item, phase, intent)
-	retryToken := ""
-	if lifecycleReportRetryRequested(run) {
-		retryToken = strings.TrimSpace(run.Annotations[retryLifecycleReportAnnotation])
+	retryToken := run.Status.LifecycleReportActiveRetryToken
+	if retryToken == "" && lifecycleReportUnsupported(run) && lifecycleReportRetryRequested(run) {
+		retryToken = run.Annotations[retryLifecycleReportAnnotation]
 	}
 	switch {
 	case err == nil:
-		return ctrl.Result{}, r.markLifecycleReportOutcome(ctx, run, true, "Published", "", retryToken)
+		return ctrl.Result{}, r.markLifecycleReportOutcome(ctx, run, true, "Published", "", retryToken, "Accepted")
 	case errors.Is(err, source.ErrSuperseded):
 		log.FromContext(ctx).Info("dropping superseded source lifecycle report",
 			"run", run.Name, "phase", phase, "error", err.Error())
-		return ctrl.Result{}, r.markLifecycleReportOutcome(ctx, run, true, "Superseded", err.Error(), retryToken)
+		return ctrl.Result{}, r.markLifecycleReportOutcome(ctx, run, true, "Superseded", err.Error(), "", "Superseded")
 	case errors.Is(err, source.ErrUnsupportedOutcome):
 		log.FromContext(ctx).Info("source does not support terminal lifecycle outcome; awaiting explicit retry",
 			"run", run.Name, "phase", phase, "error", err.Error())
-		return ctrl.Result{}, r.markLifecycleReportOutcome(ctx, run, false, lifecycleReportUnsupportedOutcomeReason, intent.error, retryToken)
+		return ctrl.Result{}, r.markLifecycleReportOutcome(ctx, run, false, pendingLifecycleReason(intent), intent.error, retryToken, lifecycleReportUnsupportedOutcomeReason)
 	default:
 		log.FromContext(ctx).Info("terminal lifecycle report failed; will retry",
 			"run", run.Name, "phase", phase, "error", err.Error())
 		// Keep the explanation in the pending condition so a declared block's
 		// lifecycle report can be reproduced exactly on every retry.
-		return ctrl.Result{RequeueAfter: lifecycleReportRequeueDelay}, r.markLifecycleReportOutcome(ctx, run, false, pendingLifecycleReason(intent), intent.error, "")
+		retryToken := run.Status.LifecycleReportActiveRetryToken
+		if retryToken == "" && lifecycleReportUnsupported(run) && lifecycleReportRetryRequested(run) {
+			retryToken = run.Annotations[retryLifecycleReportAnnotation]
+		}
+		return ctrl.Result{RequeueAfter: lifecycleReportRequeueDelay}, r.markLifecycleReportOutcome(ctx, run, false, pendingLifecycleReason(intent), intent.error, retryToken, "Retryable")
 	}
 }
 
@@ -931,21 +942,47 @@ func (r *CoderRunReconciler) setLifecycleReport(run *courierv1alpha1.CoderRun, p
 // run's current phase has been published. Published means done or intentionally
 // dropped (superseded); False means a later reconcile must retry it.
 func (r *CoderRunReconciler) markLifecycleReported(ctx context.Context, run *courierv1alpha1.CoderRun, published bool, reason, message string) error {
-	return r.markLifecycleReportOutcome(ctx, run, published, reason, message, "")
+	return r.markLifecycleReportOutcome(ctx, run, published, reason, message, "", "")
 }
 
-func (r *CoderRunReconciler) markLifecycleReportOutcome(ctx context.Context, run *courierv1alpha1.CoderRun, published bool, reason, message, retryToken string) error {
+func (r *CoderRunReconciler) markLifecycleReportOutcome(ctx context.Context, run *courierv1alpha1.CoderRun, published bool, reason, message, retryToken, supportReason string) error {
 	before := run.DeepCopy()
-	r.setLifecycleReport(run, published, reason, message)
-	if retryToken != "" {
-		run.Status.LifecycleReportRetryToken = retryToken
+	if reason != lifecycleReportUnsupportedOutcomeReason {
+		r.setLifecycleReport(run, published, reason, message)
+	}
+	switch supportReason {
+	case lifecycleReportUnsupportedOutcomeReason:
+		r.setLifecycleReportCapability(run, metav1.ConditionFalse, lifecycleReportUnsupportedOutcomeReason, "source rejected this lifecycle outcome as unsupported")
+	case "Accepted":
+		r.setLifecycleReportCapability(run, metav1.ConditionTrue, "Accepted", "source accepted this lifecycle outcome")
+	case "Superseded":
+		r.setLifecycleReportCapability(run, metav1.ConditionUnknown, "Superseded", "source lifecycle report was superseded before acceptance could be determined")
+	case "Retryable":
+		r.setLifecycleReportCapability(run, metav1.ConditionUnknown, "Retryable", "source report failed transiently; automatic retry remains enabled")
+	}
+	if supportReason == "Retryable" {
+		if retryToken != "" {
+			run.Status.LifecycleReportActiveRetryToken = retryToken
+		}
+	} else {
+		if retryToken != "" {
+			run.Status.LifecycleReportRetryToken = retryToken
+		}
+		run.Status.LifecycleReportActiveRetryToken = ""
 	}
 	return r.patchStatus(ctx, before, run)
 }
 
+func (r *CoderRunReconciler) setLifecycleReportCapability(run *courierv1alpha1.CoderRun, statusValue metav1.ConditionStatus, reason, message string) {
+	apimeta.SetStatusCondition(&run.Status.Conditions, metav1.Condition{
+		Type: lifecycleReportSupportedCondition, Status: statusValue, Reason: reason, Message: message,
+		LastTransitionTime: metav1.NewTime(r.clock()),
+	})
+}
+
 // lifecycleReportPending reports a terminal run whose lifecycle report has not
-// yet been published. Unsupported reports remain pending but wait for an
-// explicit retry token; other pending reports retry on reconcile as before.
+// yet been published. Compatibility is tracked independently so this condition
+// retains the original report intent for retries.
 func lifecycleReportPending(run *courierv1alpha1.CoderRun) bool {
 	switch run.Status.Phase {
 	case courierv1alpha1.PhaseAwaitingReview, courierv1alpha1.PhaseHandedOff, courierv1alpha1.PhaseNeedsHuman, courierv1alpha1.PhaseFailed:
@@ -957,13 +994,22 @@ func lifecycleReportPending(run *courierv1alpha1.CoderRun) bool {
 }
 
 func lifecycleReportUnsupported(run *courierv1alpha1.CoderRun) bool {
-	cond := apimeta.FindStatusCondition(run.Status.Conditions, lifecycleReportedCondition)
+	cond := apimeta.FindStatusCondition(run.Status.Conditions, lifecycleReportSupportedCondition)
 	return cond != nil && cond.Status == metav1.ConditionFalse && cond.Reason == lifecycleReportUnsupportedOutcomeReason
 }
 
 func lifecycleReportRetryRequested(run *courierv1alpha1.CoderRun) bool {
-	token := strings.TrimSpace(run.Annotations[retryLifecycleReportAnnotation])
-	return len(token) > 0 && len(token) <= 128 && token != run.Status.LifecycleReportRetryToken
+	token, ok := run.Annotations[retryLifecycleReportAnnotation]
+	return ok && validLifecycleReportRetryToken(token) && token != run.Status.LifecycleReportRetryToken
+}
+
+func lifecycleReportRetryTokenInvalid(run *courierv1alpha1.CoderRun) bool {
+	token, ok := run.Annotations[retryLifecycleReportAnnotation]
+	return ok && !validLifecycleReportRetryToken(token)
+}
+
+func validLifecycleReportRetryToken(token string) bool {
+	return token != "" && utf8.ValidString(token) && utf8.RuneCountInString(token) <= 128
 }
 
 // reconcileEvidence owns the run's failure-evidence lifecycle at the terminal
@@ -1139,6 +1185,10 @@ func (r *CoderRunReconciler) patchStatus(ctx context.Context, before, after *cou
 	if before.Status.LifecycleReportRetryToken != after.Status.LifecycleReportRetryToken {
 		token := after.Status.LifecycleReportRetryToken
 		fields.LifecycleReportRetryToken = &token
+	}
+	if before.Status.LifecycleReportActiveRetryToken != after.Status.LifecycleReportActiveRetryToken {
+		token := after.Status.LifecycleReportActiveRetryToken
+		fields.LifecycleReportActiveRetryToken = &token
 	}
 	if before.Status.Restarts != after.Status.Restarts {
 		restarts := after.Status.Restarts

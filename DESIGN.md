@@ -1748,14 +1748,26 @@ was superseded.
   `State` transition and exactly one idempotent `handed-off` lifecycle report
   under `coderun/<namespace>/<name>/HandedOff` (with the run UID appended when
   set). Transient report failures retry with the same key. If the source
-  rejects the outcome as unsupported, Courier records `LifecycleReported=False`
-  with reason `UnsupportedOutcome` and preserves the pending intent without
-  retrying automatically. An operator can request a retry by setting the
-  `courier.misospace.dev/retry-lifecycle-report` annotation to a new opaque
-  token (up to 128 characters); the processed token is persisted in status, and
-  the same idempotency key is reused. Dispatch currently rejects `handed-off`
-  with HTTP 400; Courier identifies only its explicit invalid-outcome response
-  as unsupported, while unrelated client and server errors remain transient.
+  rejects the outcome as unsupported, Courier preserves the original
+  `LifecycleReported=False` intent and records the separate
+  `LifecycleReportSupported=False/UnsupportedOutcome` condition; no automatic
+  retry occurs until an operator sets a new token in the
+  `courier.misospace.dev/retry-lifecycle-report` annotation. Tokens are opaque,
+  non-empty, valid UTF-8, and limited to 128 Unicode code points; invalid values
+  are ignored and logged without logging their contents. A transient failure
+  during an explicit retry keeps retrying normally and does not consume its
+  token; the report-support condition becomes Unknown while transient, allowing
+  automatic retries to continue even if the annotation is later removed. The
+  token is recorded only on success or another unsupported response; an active
+  token identifies the in-flight explicit attempt and is not replaced if a newer
+  annotation arrives mid-retry. On success that report is published and no
+  duplicate is sent; if it remains unsupported, only its token is settled, so a
+  newer annotation remains eligible for the next reconcile. A superseded report
+  is marked Unknown for support, not accepted. The same idempotency key is reused.
+  Dispatch currently rejects `handed-off`
+  with HTTP 400; Courier recognizes only its documented `Invalid outcome. Must
+  be one of:` response as unsupported. Other 400s and 5xx errors remain
+  retryable; this conservative match may not classify future error formats.
   The report remains truthful and source-neutral; no source `State` transition
   is published. Fix-pr's immediate red path (`Failed` plus a
   retryable failed report) and the missing/draft-PR path (`NeedsHuman`) are
