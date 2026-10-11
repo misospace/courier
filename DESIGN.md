@@ -1209,7 +1209,9 @@ Pluggable adapters over a generic interface. An adapter both *creates* runs and
   `outcome="handed-off"`, the PR, and the verification error; it is neither
   `ready` nor a `BLOCKED` queue mark, because Dispatch discovers the failed
   checks through its own `POST /api/pr-followup/sync` and enqueues repair
-  independently.
+  independently. That acceptance is pending a companion change on
+  misospace/dispatch; until it lands Courier's `handed-off` report is rejected
+  (HTTP 400) and retried.
 - **github-label / gitlab / forgejo / tangled** — a labeled issue becomes a
   resolve-issue run; CHANGES_REQUESTED becomes a fix-pr run.
 - **cron** — scheduled work (the weekly audit, backlog grooming). This is what
@@ -1745,11 +1747,15 @@ was superseded.
   `State` transition and exactly one idempotent `handed-off` lifecycle report
   under `coderun/<namespace>/<name>/HandedOff` (with the run UID appended when
   set); a failed report is retried
-  on a later reconcile with the same key. Dispatch maps `handed-off` to a task
-  report and does not mark the PR-fix queue `BLOCKED`, because it discovers the
-  red checks through its own `pr-followup/sync`. Fix-pr's immediate red path
-  (`Failed` plus a retryable failed report) and the missing/draft-PR path
-  (`NeedsHuman`) are unchanged. (#246, #171)
+  on a later reconcile with the same key. Dispatch's acceptance of
+  `handed-off` — mapping it to a task report and not marking the PR-fix queue
+  `BLOCKED`, because it discovers the red checks through its own
+  `pr-followup/sync` — is the companion change's required behavior and is
+  still pending on misospace/dispatch; until it lands Courier's `handed-off`
+  lifecycle report is rejected (HTTP 400) and retried, and the link will be
+  added here when it lands. Fix-pr's immediate red path (`Failed` plus a
+  retryable failed report) and the missing/draft-PR path (`NeedsHuman`) are
+  unchanged. (#246, #171)
 - **2026-09-30 — #169/#175: declare outcomes outside the worktree; never settle
   from a declaration alone.** #169 replaced inference of coordinator intent from
   workspace state with explicit `changes`, `no_change_needed`, `needs_decision`,
