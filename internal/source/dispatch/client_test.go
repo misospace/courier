@@ -437,37 +437,54 @@ func TestHTTPClientReportMapsObservedPR(t *testing.T) {
 
 // TestHTTPClientReportBlockedExternalIsRetryableFailure pins issue #267: a
 // recoverable dependency block reuses Dispatch's retryable failure report and
-// must never issue the human BLOCKED queue mark.
+// must never issue the human BLOCKED queue mark. Both task types are covered:
+// a follow-up PR carries the queue mark path, an implement task does not.
 func TestHTTPClientReportBlockedExternalIsRetryableFailure(t *testing.T) {
-	var request map[string]any
-	var paths []string
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		paths = append(paths, r.URL.Path)
-		if r.URL.Path != "/prefix/api/agents/worker/tasks/report" {
-			t.Errorf("unexpected path %q", r.URL.Path)
-			w.WriteHeader(http.StatusBadRequest)
-			return
-		}
-		body, _ := io.ReadAll(r.Body)
-		if err := json.Unmarshal(body, &request); err != nil {
-			t.Fatal(err)
-		}
-		w.WriteHeader(http.StatusNoContent)
-	}))
-	defer server.Close()
-	client, err := NewClientWithLane(server.URL+"/prefix/", "worker", "normal", "secret-token", time.Second)
-	if err != nil {
-		t.Fatal(err)
+	tests := []struct {
+		name string
+		task Task
+	}{
+		{
+			name: "followup-pr",
+			task: Task{Type: "followup-pr", PullRequest: &PullRequest{Repo: "acme/widgets", Number: 42}, PRFixItem: &PRFixItem{ID: "item-1", Generation: 3}},
+		},
+		{
+			name: "implement",
+			task: Task{Type: "implement", Issue: &Issue{Repo: "acme/widgets", Number: 42}},
+		},
 	}
-	id := EncodeWorkID(Task{Type: "followup-pr", PullRequest: &PullRequest{Repo: "acme/widgets", Number: 42}, PRFixItem: &PRFixItem{ID: "item-1", Generation: 3}})
-	if err := client.Report(context.Background(), id, source.Lifecycle{State: source.StateInProgress, Result: source.ResultBlockedExternal, Error: "missing prerequisite: secrets/prod"}); err != nil {
-		t.Fatal(err)
-	}
-	if request["outcome"] != "failed" || request["error"] != "missing prerequisite: secrets/prod" {
-		t.Fatalf("request = %#v, want a retryable failed report with the missing reason", request)
-	}
-	if len(paths) != 1 || paths[0] != "/prefix/api/agents/worker/tasks/report" {
-		t.Fatalf("paths = %#v, want only the task report (no BLOCKED queue mark)", paths)
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var request map[string]any
+			var paths []string
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				paths = append(paths, r.URL.Path)
+				if r.URL.Path != "/prefix/api/agents/worker/tasks/report" {
+					t.Errorf("unexpected path %q", r.URL.Path)
+					w.WriteHeader(http.StatusBadRequest)
+					return
+				}
+				body, _ := io.ReadAll(r.Body)
+				if err := json.Unmarshal(body, &request); err != nil {
+					t.Fatal(err)
+				}
+				w.WriteHeader(http.StatusNoContent)
+			}))
+			defer server.Close()
+			client, err := NewClientWithLane(server.URL+"/prefix/", "worker", "normal", "secret-token", time.Second)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := client.Report(context.Background(), EncodeWorkID(tt.task), source.Lifecycle{State: source.StateInProgress, Result: source.ResultBlockedExternal, Error: "missing prerequisite: secrets/prod"}); err != nil {
+				t.Fatal(err)
+			}
+			if request["outcome"] != "failed" || request["error"] != "missing prerequisite: secrets/prod" {
+				t.Fatalf("request = %#v, want a retryable failed report with the missing reason", request)
+			}
+			if len(paths) != 1 || paths[0] != "/prefix/api/agents/worker/tasks/report" {
+				t.Fatalf("paths = %#v, want only the task report (no BLOCKED queue mark)", paths)
+			}
+		})
 	}
 }
 

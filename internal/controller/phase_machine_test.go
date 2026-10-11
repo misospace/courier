@@ -1225,47 +1225,60 @@ func TestExit3NoChangeNeededResolveIssueSettlesNothingDirectly(t *testing.T) {
 // request stays NeedsHuman.
 func TestExit3NoChangeNeededFixPRSettlesAgainstWorld(t *testing.T) {
 	tests := []struct {
-		name         string
-		observer     WorldObserver
-		wantPhase    courierv1alpha1.Phase
-		wantSource   source.State
-		wantResult   source.Result
-		wantReport   bool
-		wantResolved bool
+		name            string
+		observer        WorldObserver
+		wantPhase       courierv1alpha1.Phase
+		wantSource      source.State
+		wantResult      source.Result
+		wantReport      bool
+		wantResolved    bool
+		wantTransitions int
+		// wantBlockedParksPRFix is the lifecycle flag the source sees; a
+		// recoverable block must never set it (issue #267).
+		wantBlockedParksPRFix bool
 		// secondObserve runs one more reconcile when the world needs a second
 		// observation to settle (stable green).
 		secondObserve bool
 	}{
 		{
-			name:         "merged settles Done without a human",
-			observer:     fakeWorldObserver{observation: PRObservation{PR: "42", Merged: true}},
-			wantPhase:    courierv1alpha1.PhaseDone,
-			wantResolved: true,
+			name:            "merged settles Done without a human",
+			observer:        fakeWorldObserver{observation: PRObservation{PR: "42", Merged: true}},
+			wantPhase:       courierv1alpha1.PhaseDone,
+			wantResolved:    true,
+			wantTransitions: 0,
 		},
 		{
-			name:          "open green settles AwaitingReview",
-			observer:      fakeWorldObserver{observation: PRObservation{PR: "42", Head: "abc", Checks: []CheckObservation{{Name: "test", State: CheckStatePassed}}}},
-			wantPhase:     courierv1alpha1.PhaseAwaitingReview,
-			wantSource:    source.StateInReview,
-			wantReport:    true,
-			wantResult:    source.ResultReady,
-			secondObserve: true,
+			name:            "open green settles AwaitingReview",
+			observer:        fakeWorldObserver{observation: PRObservation{PR: "42", Head: "abc", Checks: []CheckObservation{{Name: "test", State: CheckStatePassed}}}},
+			wantPhase:       courierv1alpha1.PhaseAwaitingReview,
+			wantSource:      source.StateInReview,
+			wantReport:      true,
+			wantResult:      source.ResultReady,
+			wantTransitions: 1,
+			secondObserve:   true,
 		},
 		{
-			name:       "open red reaches retryable Failed",
-			observer:   fakeWorldObserver{observation: PRObservation{PR: "42", Head: "abc", Checks: []CheckObservation{{Name: "test", State: CheckStateFailed}}}},
-			wantPhase:  courierv1alpha1.PhaseFailed,
-			wantSource: source.StateInProgress,
-			wantReport: true,
-			wantResult: source.ResultFailed,
+			name:            "open red reaches retryable Failed",
+			observer:        fakeWorldObserver{observation: PRObservation{PR: "42", Head: "abc", Checks: []CheckObservation{{Name: "test", State: CheckStateFailed}}}},
+			wantPhase:       courierv1alpha1.PhaseFailed,
+			wantSource:      source.StateInProgress,
+			wantReport:      true,
+			wantResult:      source.ResultFailed,
+			wantTransitions: 1,
 		},
 		{
-			name:       "unobservable pull request stays NeedsHuman",
-			observer:   fakeWorldObserver{observation: PRObservation{}},
-			wantPhase:  courierv1alpha1.PhaseNeedsHuman,
-			wantSource: source.StateNeedsHuman,
-			wantReport: true,
-			wantResult: source.ResultBlocked,
+			// A pull request the operator cannot observe is a genuinely
+			// blocked diagnostic state, not a recoverable external block: the
+			// source is parked for a human (BlockedReportParksPRFix is false,
+			// so the PR-fix item is marked BLOCKED).
+			name:                  "unobservable pull request stays NeedsHuman",
+			observer:              fakeWorldObserver{observation: PRObservation{}},
+			wantPhase:             courierv1alpha1.PhaseNeedsHuman,
+			wantSource:            source.StateNeedsHuman,
+			wantReport:            true,
+			wantResult:            source.ResultBlocked,
+			wantTransitions:       1,
+			wantBlockedParksPRFix: false,
 		},
 	}
 	for _, tt := range tests {
@@ -1317,11 +1330,24 @@ func TestExit3NoChangeNeededFixPRSettlesAgainstWorld(t *testing.T) {
 			} else if len(item.resolved) != 0 {
 				t.Fatalf("resolved = %#v, want none: the source is not settled on the declaration alone", item.resolved)
 			}
+			// Done publishes no source transition; every other settled ending
+			// publishes exactly one.
+			if len(item.transitions) != tt.wantTransitions {
+				t.Fatalf("transitions = %#v, want %d", item.transitions, tt.wantTransitions)
+			}
 			if !tt.wantReport {
+				for _, report := range item.reports {
+					if report.Result != "" {
+						t.Fatalf("reports = %#v, want no outcome report", item.reports)
+					}
+				}
 				return
 			}
 			if len(item.reports) != 1 || item.reports[0].Result != tt.wantResult {
 				t.Fatalf("reports = %#v, want one with result %q", item.reports, tt.wantResult)
+			}
+			if item.reports[0].BlockedReportParksPRFix != tt.wantBlockedParksPRFix {
+				t.Fatalf("BlockedReportParksPRFix = %t, want %t", item.reports[0].BlockedReportParksPRFix, tt.wantBlockedParksPRFix)
 			}
 			if tt.wantSource != "" {
 				if len(item.transitions) != 1 || item.transitions[0] != tt.wantSource {
