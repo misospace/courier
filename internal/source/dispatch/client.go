@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"net/url"
 	"path"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -170,11 +171,70 @@ func newClient(baseURL, agentName, queueLane, token string, timeout time.Duratio
 }
 
 func (c *HTTPClient) Discover(ctx context.Context) ([]source.WorkItem, error) {
-	var task Task
-	path := "/api/agents/" + url.PathEscape(c.agentName) + "/next-task"
-	if err := c.do(ctx, http.MethodGet, path, nil, &task); err != nil {
+	return c.discover(ctx, nil)
+}
+
+func (c *HTTPClient) DiscoverExcluding(ctx context.Context, exclusions []source.WorkItem) ([]source.WorkItem, error) {
+	if len(exclusions) == 0 {
+		return c.Discover(ctx)
+	}
+	query := url.Values{"exclude_pr_fix_version": {"1"}}
+	seen := make(map[string]struct{})
+	for _, item := range exclusions {
+		d, err := decodeWorkID(item.ID)
+		if err != nil || d.Type != "followup-pr" || d.PRFixID == "" || d.Generation < 1 || d.Repo == "" {
+			continue
+		}
+		repo := strings.ToLower(d.Repo)
+		if !dispatchRepoPattern.MatchString(repo) || d.Number > maxSafeInteger || d.Generation > maxSafeInteger {
+			return nil, fmt.Errorf("dispatch client: invalid PR-fix exclusion descriptor")
+		}
+		value := fmt.Sprintf("%s#%d@%d", repo, d.Number, d.Generation)
+		if len(value) > 300 {
+			return nil, fmt.Errorf("dispatch client: PR-fix exclusion exceeds maximum 300 characters")
+		}
+		if _, exists := seen[value]; exists {
+			continue
+		}
+		seen[value] = struct{}{}
+		if len(seen) > 32 {
+			return nil, fmt.Errorf("dispatch client: PR-fix exclusions exceed maximum 32")
+		}
+		query.Add("exclude_pr_fix", value)
+	}
+	if len(seen) == 0 {
+		return c.Discover(ctx)
+	}
+	return c.discover(ctx, query)
+}
+
+const maxSafeInteger = 9007199254740991
+
+var dispatchRepoPattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9_.-]{0,99}/[A-Za-z0-9][A-Za-z0-9_.-]{0,99}$`)
+
+type nextTaskResponse struct {
+	Task
+	PRFixExclusions json.RawMessage `json:"prFixExclusions"`
+}
+
+func (c *HTTPClient) discover(ctx context.Context, query url.Values) ([]source.WorkItem, error) {
+	var response nextTaskResponse
+	endpoint := "/api/agents/" + url.PathEscape(c.agentName) + "/next-task"
+	if query != nil {
+		endpoint += "?" + query.Encode()
+	}
+	if err := c.do(ctx, http.MethodGet, endpoint, nil, &response); err != nil {
 		return nil, err
 	}
+	if query != nil && len(response.PRFixExclusions) > 0 {
+		var ack struct {
+			Version int `json:"version"`
+		}
+		if err := json.Unmarshal(response.PRFixExclusions, &ack); err != nil || ack.Version != 1 {
+			return nil, fmt.Errorf("dispatch client: unsupported PR-fix exclusions acknowledgment")
+		}
+	}
+	task := response.Task
 	if !task.ShouldRun || task.Type == "idle" {
 		return nil, nil
 	}

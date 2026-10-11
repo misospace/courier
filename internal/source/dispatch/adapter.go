@@ -88,6 +88,20 @@ func (a *Adapter) Discover(ctx context.Context) ([]source.WorkItem, error) {
 	return a.client.Discover(ctx)
 }
 
+// DiscoverExcluding uses the optional client capability, preserving compatibility
+// with clients that only implement the original discovery contract.
+func (a *Adapter) DiscoverExcluding(ctx context.Context, exclusions []source.WorkItem) ([]source.WorkItem, error) {
+	if err := a.validateClient(); err != nil {
+		return nil, err
+	}
+	if client, ok := a.client.(interface {
+		DiscoverExcluding(context.Context, []source.WorkItem) ([]source.WorkItem, error)
+	}); ok {
+		return client.DiscoverExcluding(ctx, exclusions)
+	}
+	return a.client.Discover(ctx)
+}
+
 // Claim atomically claims item in Dispatch.
 func (a *Adapter) Claim(ctx context.Context, item source.WorkItem) error {
 	if err := a.validate(item); err != nil {
