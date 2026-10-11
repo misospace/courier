@@ -72,6 +72,7 @@ func TestHTTPClientDiscoverExcludingEncodesCanonicalUniqueQueueKeys(t *testing.T
 	if err != nil {
 		t.Fatal(err)
 	}
+	client.WithPRFixExclusions(true)
 	id := EncodeWorkID(Task{Type: "followup-pr", PullRequest: &PullRequest{Repo: "Acme/Widgets", Number: 42}, PRFixItem: &PRFixItem{ID: "item", Generation: 3}})
 	if _, err := client.DiscoverExcluding(context.Background(), []source.WorkItem{{ID: id}, {ID: id}}); err != nil {
 		t.Fatal(err)
@@ -93,6 +94,7 @@ func TestHTTPClientDiscoverExcludingBoundsFilteredUniqueKeys(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	client.WithPRFixExclusions(true)
 	legacy := EncodeWorkID(Task{Type: "followup-pr", PullRequest: &PullRequest{Repo: "acme/widgets", Number: 7}})
 	if _, err := client.DiscoverExcluding(context.Background(), []source.WorkItem{{ID: legacy}}); err != nil {
 		t.Fatal(err)
@@ -106,11 +108,12 @@ func TestHTTPClientDiscoverExcludingBoundsFilteredUniqueKeys(t *testing.T) {
 	}
 }
 
-func TestHTTPClientDiscoverExcludingDoesNotRepollUnacknowledgedHandout(t *testing.T) {
-	gets := 0
+func TestHTTPClientDiscoverExcludingDefaultsToOrdinaryDiscover(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		gets++
-		_ = json.NewEncoder(w).Encode(Task{Type: "implement", ShouldRun: true, Issue: &Issue{Repo: "acme/widgets", Number: 5}})
+		if r.URL.Query().Has("exclude_pr_fix") || r.URL.Query().Has("exclude_pr_fix_version") {
+			t.Fatalf("default client sent exclusions: %s", r.URL.RawQuery)
+		}
+		_ = json.NewEncoder(w).Encode(Task{Type: "idle"})
 	}))
 	defer server.Close()
 	client, err := NewClientWithLane(server.URL, "worker", "cloud", "token", time.Second)
@@ -118,9 +121,62 @@ func TestHTTPClientDiscoverExcludingDoesNotRepollUnacknowledgedHandout(t *testin
 		t.Fatal(err)
 	}
 	id := EncodeWorkID(Task{Type: "followup-pr", PullRequest: &PullRequest{Repo: "acme/widgets", Number: 42}, PRFixItem: &PRFixItem{ID: "q", Generation: 1}})
-	items, err := client.DiscoverExcluding(context.Background(), []source.WorkItem{{ID: id}})
-	if err != nil || len(items) != 1 || gets != 1 {
-		t.Fatalf("items=%#v err=%v GETs=%d", items, err, gets)
+	if _, err := client.DiscoverExcluding(context.Background(), []source.WorkItem{{ID: id}}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestHTTPClientDiscoverExcludingOlderServerIgnoresParams(t *testing.T) {
+	for _, task := range []Task{
+		{Type: "implement", ShouldRun: true, Issue: &Issue{Repo: "acme/widgets", Number: 5}},
+		{Type: "idle"},
+	} {
+		t.Run(task.Type, func(t *testing.T) {
+			gets := 0
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				gets++
+				if !r.URL.Query().Has("exclude_pr_fix") {
+					t.Errorf("missing exclusion query")
+				}
+				_ = json.NewEncoder(w).Encode(task)
+			}))
+			defer server.Close()
+			client, err := NewClientWithLane(server.URL, "worker", "cloud", "token", time.Second)
+			if err != nil {
+				t.Fatal(err)
+			}
+			client.WithPRFixExclusions(true)
+			id := EncodeWorkID(Task{Type: "followup-pr", PullRequest: &PullRequest{Repo: "acme/widgets", Number: 42}, PRFixItem: &PRFixItem{ID: "q", Generation: 1}})
+			items, err := client.DiscoverExcluding(context.Background(), []source.WorkItem{{ID: id}})
+			if err == nil || items != nil || gets != 1 {
+				t.Fatalf("items=%#v err=%v GETs=%d", items, err, gets)
+			}
+		})
+	}
+}
+
+func TestHTTPClientDiscoverExcludingRejectsInvalidAcknowledgments(t *testing.T) {
+	for _, ack := range []string{`<missing>`, `null`, `{}`, `{"version":null}`, `{"version":"1"}`, `{"version":2}`} {
+		t.Run(ack, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				payload := `{"type":"idle","shouldRun":false}`
+				if ack != `<missing>` {
+					payload = `{"type":"idle","shouldRun":false,"prFixExclusions":` + ack + `}`
+				}
+				_, _ = io.WriteString(w, payload)
+			}))
+			defer server.Close()
+			client, err := NewClient(server.URL, "worker", "token", time.Second)
+			if err != nil {
+				t.Fatal(err)
+			}
+			client.WithPRFixExclusions(true)
+			id := EncodeWorkID(Task{Type: "followup-pr", PullRequest: &PullRequest{Repo: "acme/widgets", Number: 42}, PRFixItem: &PRFixItem{ID: "q", Generation: 1}})
+			items, err := client.DiscoverExcluding(context.Background(), []source.WorkItem{{ID: id}})
+			if err == nil || items != nil {
+				t.Fatalf("items=%#v err=%v", items, err)
+			}
+		})
 	}
 }
 
@@ -141,6 +197,7 @@ func TestHTTPClientDiscoverExcludingAllowsNewerGeneration(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	client.WithPRFixExclusions(true)
 	client.WithPullRequestStateChecker(PullRequestStateCheckerFunc(func(context.Context, string, int) (PullRequestState, error) {
 		return PullRequestState{State: "open"}, nil
 	}))

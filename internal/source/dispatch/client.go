@@ -113,12 +113,13 @@ func (e *APIError) Error() string {
 
 // HTTPClient implements the Dispatch HTTP API behind the source adapter.
 type HTTPClient struct {
-	baseURL        *url.URL
-	token          string
-	agentName      string
-	queueLane      string
-	httpClient     HTTPDoer
-	prStateChecker PullRequestStateChecker
+	baseURL                *url.URL
+	token                  string
+	agentName              string
+	queueLane              string
+	httpClient             HTTPDoer
+	prStateChecker         PullRequestStateChecker
+	prFixExclusionsEnabled bool
 }
 
 // NewClient creates a Dispatch HTTP client without a queue lane override.
@@ -134,6 +135,13 @@ func NewClientWithLane(baseURL, agentName, queueLane, token string, timeout time
 // WithPullRequestStateChecker configures stale follow-up detection.
 func (c *HTTPClient) WithPullRequestStateChecker(checker PullRequestStateChecker) *HTTPClient {
 	c.prStateChecker = checker
+	return c
+}
+
+// WithPRFixExclusions opts into Dispatch's acknowledged PR-fix exclusion contract.
+// Enable only after deployment has confirmed support for that contract.
+func (c *HTTPClient) WithPRFixExclusions(enabled bool) *HTTPClient {
+	c.prFixExclusionsEnabled = enabled
 	return c
 }
 
@@ -175,7 +183,7 @@ func (c *HTTPClient) Discover(ctx context.Context) ([]source.WorkItem, error) {
 }
 
 func (c *HTTPClient) DiscoverExcluding(ctx context.Context, exclusions []source.WorkItem) ([]source.WorkItem, error) {
-	if len(exclusions) == 0 {
+	if !c.prFixExclusionsEnabled || len(exclusions) == 0 {
 		return c.Discover(ctx)
 	}
 	query := url.Values{"exclude_pr_fix_version": {"1"}}
@@ -226,11 +234,14 @@ func (c *HTTPClient) discover(ctx context.Context, query url.Values) ([]source.W
 	if err := c.do(ctx, http.MethodGet, endpoint, nil, &response); err != nil {
 		return nil, err
 	}
-	if query != nil && len(response.PRFixExclusions) > 0 {
-		var ack struct {
-			Version int `json:"version"`
+	if query != nil {
+		var ack map[string]json.RawMessage
+		if len(response.PRFixExclusions) == 0 || json.Unmarshal(response.PRFixExclusions, &ack) != nil || ack == nil {
+			return nil, fmt.Errorf("dispatch client: missing or invalid PR-fix exclusions acknowledgment")
 		}
-		if err := json.Unmarshal(response.PRFixExclusions, &ack); err != nil || ack.Version != 1 {
+		version, ok := ack["version"]
+		var versionValue int
+		if !ok || json.Unmarshal(version, &versionValue) != nil || versionValue != 1 {
 			return nil, fmt.Errorf("dispatch client: unsupported PR-fix exclusions acknowledgment")
 		}
 	}

@@ -1215,13 +1215,13 @@ capacity lease, and checks only once per poll; stale reads or a source returning
 batch may still materialize work beyond available slots. It also cannot make
 Dispatch hide an already-discovered Pending head from a free sibling profile;
 that needs Dispatch-side queue exclusion. Where supported, discovery passes
-retained same-source work IDs as opaque exclusions; Dispatch queue-backed PR-
-fix exclusions match the PR and exact generation before selection, preventing a
-consumed retained head from hiding free sibling work. This is bounded to 32
-unique valid entries of 300 characters each. Older adapters retain their
-Discover behavior, and older Dispatch servers are queried only once; an
-unacknowledged handout is processed under Courier's ordinary dedupe semantics,
-not repolled. Exclusions are dedupe hints, not claims or ownership. While
+retained same-source work IDs as opaque exclusions when the Dispatch client is
+explicitly opted in; exclusion support defaults off and must be enabled only
+after deployment has confirmed the Dispatch contract. Enabled requests are
+bounded to 32 unique valid entries of 300 characters each, and every response
+must acknowledge `prFixExclusions.version: 1` before either a task or idle result
+is processed. Missing or malformed acknowledgements fail closed without retry or
+side effects. Exclusions are dedupe hints, not claims or ownership. While
 discovery is paused, Dispatch `next-task` and stale-item bookkeeping are
 deferred until a later poll.
 
@@ -1422,12 +1422,11 @@ named items remain unresolved and must not be described as production-ready:
   translates only valid queue-backed descriptors with positive generations into
   at most 32 unique repeated `exclude_pr_fix` values, canonicalizing
   repositories before wire encoding. The server applies them before next-task
-  side effects and matches exact generations; its versioned acknowledgment
-  establishes whether exclusions applied. Legacy linked-PR identities remain
-  deduped in Courier but are not assigned invented generations. Older adapters
-  preserve discovery, and an older server is never repolled to search past a
-  handout. Exclusions are dedupe hints, not claims or ownership. (#263;
-  Dispatch #1227)
+  side effects and matches exact generations; explicitly opted-in clients require
+  a version-1 acknowledgment before processing any response. Exclusions default
+  off until deployment support is confirmed. Legacy linked-PR identities remain
+  deduped in Courier but are not assigned invented generations. Exclusions are
+  dedupe hints, not claims or ownership. (#263; Dispatch #1227)
 
 - **2026-10-10 — #259: intake accepts the sender's empty RunUID and stamps
   the live UID; the bearer itself is a credential; untrusted manifest
