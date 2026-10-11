@@ -11,9 +11,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
-	"os/exec"
 	"path/filepath"
-	"strings"
 	"testing"
 	"time"
 
@@ -30,7 +28,7 @@ import (
 )
 
 // TestEvidenceEnvtestDirtyTerminalCapturesSecretAndCondition drives a run
-// through the real reconcile loop to a dirty terminal (Failed or NeedsHuman),
+// through the real reconcile loop to a dirty terminal (Failed),
 // POSTs a REAL bundle from the capture core over a real git worktree, and
 // asserts the evidence Secret and the EvidenceCaptured condition.
 func TestEvidenceEnvtestDirtyTerminalCapturesSecretAndCondition(t *testing.T) {
@@ -56,6 +54,9 @@ func TestEvidenceEnvtestDirtyTerminalCapturesSecretAndCondition(t *testing.T) {
 
 	// Cleanup: delete created resources.
 	t.Cleanup(func() {
+		// Delete coordinator pod.
+		coordinatorPod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: runName + "-coordinator", Namespace: namespace}}
+		_ = envtestClient.Delete(ctx, coordinatorPod)
 		// Delete evidence secrets by label.
 		var secrets corev1.SecretList
 		if err := envtestClient.List(ctx, &secrets, client.InNamespace(namespace), client.MatchingLabels{EvidenceLabelKey: evidenceLabelValue(runName)}); err == nil {
@@ -67,8 +68,8 @@ func TestEvidenceEnvtestDirtyTerminalCapturesSecretAndCondition(t *testing.T) {
 		_ = envtestClient.Delete(ctx, lane)
 	})
 
-	// Build the intake with the same PodConfig the 200-path unit tests use.
-	// The PodConfig needs GitCredentialSecret and GitTokenKey for the credential scanner.
+	// Build the intake with an empty PodConfig (no credential secret).
+	// Empty PodConfig = no credential set, nothing withheld by credentials in that test.
 	intake := &EvidenceIntake{
 		Client:    envtestClient,
 		APIReader: envtestClient,
@@ -136,27 +137,25 @@ func TestEvidenceEnvtestDirtyTerminalCapturesSecretAndCondition(t *testing.T) {
 	// Now the run is in Failed phase. Generate a REAL evidence bundle
 	// using evidence.Capture over a real git worktree with dirty+untracked files.
 	workdir := t.TempDir()
+	// Isolate git from the workstation config, mirroring evidence_intake_test.go.
+	home := t.TempDir()
+	t.Setenv("GIT_CONFIG_GLOBAL", filepath.Join(home, "gitconfig"))
+	t.Setenv("GIT_CONFIG_NOSYSTEM", "1")
+	t.Setenv("GIT_AUTHOR_NAME", "Courier Test")
+	t.Setenv("GIT_AUTHOR_EMAIL", "courier-test@example.invalid")
+	t.Setenv("GIT_COMMITTER_NAME", "Courier Test")
+	t.Setenv("GIT_COMMITTER_EMAIL", "courier-test@example.invalid")
+
 	// Initialize git repo.
-	if err := runGit(t, workdir, "init", "-q"); err != nil {
-		t.Fatalf("git init: %v", err)
-	}
-	if err := runGit(t, workdir, "config", "user.name", "Courier Test"); err != nil {
-		t.Fatalf("git config user.name: %v", err)
-	}
-	if err := runGit(t, workdir, "config", "user.email", "courier-test@example.invalid"); err != nil {
-		t.Fatalf("git config user.email: %v", err)
-	}
+	gitRoundTrip(t, workdir, "init", "-q")
+	// user.name/email are set via env vars; no git config needed.
 	// Base commit.
 	baseFile := filepath.Join(workdir, "base.txt")
 	if err := os.WriteFile(baseFile, []byte("base\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if err := runGit(t, workdir, "add", "--all"); err != nil {
-		t.Fatal(err)
-	}
-	if err := runGit(t, workdir, "commit", "-q", "-m", "base: initial"); err != nil {
-		t.Fatal(err)
-	}
+	gitRoundTrip(t, workdir, "add", "--all")
+	gitRoundTrip(t, workdir, "commit", "-q", "-m", "base: initial")
 
 	// Add dirty (modified) and untracked files.
 	dirtyFile := filepath.Join(workdir, "src/dirty.go")
@@ -241,9 +240,8 @@ func TestEvidenceEnvtestDirtyTerminalCapturesSecretAndCondition(t *testing.T) {
 		t.Fatalf("intake POST code = %d, want 200; body = %s", rec.Code, rec.Body.String())
 	}
 
-	// Reconcile again so the controller's reconcileEvidence sees the secret.
+	// Reconcile so the controller's reconcileEvidence sees the secret.
 	reconcile()
-	reconcile() // May need twice for condition to be set.
 
 	// Assert evidence Secret exists with correct name, labels, ownerRef, and data keys.
 	wantSecretName := evidenceSecretName(runName, nonce)
@@ -577,12 +575,12 @@ func TestEvidenceEnvtestWithheldEntryPersistsRestAndInvalidBundlesPersistNothing
 	// ---- (b) Invalid bundles test ----
 	// Each rejected POST must not leave an evidence Secret.
 
-	// (b.1) Oversize manifest part (over ManifestBudgetBytes).
+	// (b.1) Oversize manifest entry count (over MaxManifestEntries).
 	nonceB1 := make([]byte, executor.EvidenceNonceBytes)
 	if _, err := rand.Read(nonceB1); err != nil {
 		t.Fatalf("generate nonce: %v", err)
 	}
-	// Build a manifest with many entries to exceed ManifestBudgetBytes.
+	// Build a manifest with many entries to exceed MaxManifestEntries.
 	bigManifest := sampleIntakeManifest(run, "x")
 	bigManifest.Entries = make([]evidence.Entry, evidence.MaxManifestEntries+1)
 	for idx := range bigManifest.Entries {
@@ -596,7 +594,7 @@ func TestEvidenceEnvtestWithheldEntryPersistsRestAndInvalidBundlesPersistNothing
 	reqB1, _ := intakeRequest(t, testKey, run, bigManifest, map[string][]byte{}, nonceB1)
 	recB1 := doIntake(intake, reqB1)
 	if recB1.Code != http.StatusBadRequest {
-		t.Errorf("oversize manifest: code = %d, want 400; body = %s", recB1.Code, recB1.Body.String())
+		t.Errorf("oversize manifest entry count: code = %d, want 400; body = %s", recB1.Code, recB1.Body.String())
 	}
 	requireNoSecret(t, intake, runName, namespace, nonceB1)
 
@@ -626,47 +624,93 @@ func TestEvidenceEnvtestWithheldEntryPersistsRestAndInvalidBundlesPersistNothing
 	}
 	requireNoSecret(t, intake, runName, namespace, nonceB2)
 
-	// (b.3) Gzip bomb: a small gzip that decompresses to huge content.
-	// We construct a valid gzip stream that decompresses to exceed MaxTotalBytes.
-	nonceB3 := make([]byte, executor.EvidenceNonceBytes)
-	if _, err := rand.Read(nonceB3); err != nil {
+	// (b.3a) Entry-count cap: a tar with MaxContentEntries+1 small members.
+	// This trips the entry-count cap (evidence_intake.go:874), not the
+	// decompressed-total cap.
+	nonceB3a := make([]byte, executor.EvidenceNonceBytes)
+	if _, err := rand.Read(nonceB3a); err != nil {
 		t.Fatalf("generate nonce: %v", err)
 	}
-	mB3 := sampleIntakeManifest(run, "x")
-	var bufB3 bytes.Buffer
-	mwB3 := multipart.NewWriter(&bufB3)
-	mpB3, _ := mwB3.CreateFormFile("manifest", "manifest.json")
-	manifestBytesB3, _ := mB3.MarshalCanonical()
-	_, _ = mpB3.Write(manifestBytesB3)
-	apB3, _ := mwB3.CreateFormFile("archive", "bundle.tar.gz")
-	// Build a gzip bomb: a tar with one member whose header claims huge size
-	// but actual content is small (the intake reads with LimitReader so it
-	// will cap at MaxFileBytes+1, but the total content cap is enforced).
-	// Instead, we send a valid gzip that expands to many small members
-	// exceeding MaxContentEntries.
-	var gzipBomb bytes.Buffer
-	gz := gzip.NewWriter(&gzipBomb)
-	tw := tar.NewWriter(gz)
-	// Create MaxContentEntries + 1 members, each 1 byte.
+	mB3a := sampleIntakeManifest(run, "x")
+	var bufB3a bytes.Buffer
+	mwB3a := multipart.NewWriter(&bufB3a)
+	mpB3a, _ := mwB3a.CreateFormFile("manifest", "manifest.json")
+	manifestBytesB3a, _ := mB3a.MarshalCanonical()
+	_, _ = mpB3a.Write(manifestBytesB3a)
+	apB3a, _ := mwB3a.CreateFormFile("archive", "bundle.tar.gz")
+	var entryCountBomb bytes.Buffer
+	gz3a := gzip.NewWriter(&entryCountBomb)
+	tw3a := tar.NewWriter(gz3a)
 	for i := 0; i <= evidence.MaxContentEntries; i++ {
 		name := fmt.Sprintf("bomb/%04d.txt", i)
 		hdr := &tar.Header{Name: name, Mode: 0o644, Size: 1, Typeflag: tar.TypeReg, Format: tar.FormatPAX}
-		_ = tw.WriteHeader(hdr)
-		_, _ = tw.Write([]byte("x"))
+		_ = tw3a.WriteHeader(hdr)
+		_, _ = tw3a.Write([]byte("x"))
 	}
-	_ = tw.Close()
-	_ = gz.Close()
-	_, _ = apB3.Write(gzipBomb.Bytes())
-	_ = mwB3.Close()
-	tokenB3 := executor.EvidenceToken(testKey, namespace, runName, string(run.UID), nonceB3)
-	reqB3 := httptest.NewRequest(http.MethodPost, "/intake", &bufB3)
-	reqB3.Header.Set("Content-Type", mwB3.FormDataContentType())
-	reqB3.Header.Set("Authorization", "Bearer "+tokenB3)
-	recB3 := doIntake(intake, reqB3)
-	if recB3.Code != http.StatusBadRequest {
-		t.Errorf("gzip bomb: code = %d, want 400; body = %s", recB3.Code, recB3.Body.String())
+	_ = tw3a.Close()
+	_ = gz3a.Close()
+	_, _ = apB3a.Write(entryCountBomb.Bytes())
+	_ = mwB3a.Close()
+	tokenB3a := executor.EvidenceToken(testKey, namespace, runName, string(run.UID), nonceB3a)
+	reqB3a := httptest.NewRequest(http.MethodPost, "/intake", &bufB3a)
+	reqB3a.Header.Set("Content-Type", mwB3a.FormDataContentType())
+	reqB3a.Header.Set("Authorization", "Bearer "+tokenB3a)
+	recB3a := doIntake(intake, reqB3a)
+	if recB3a.Code != http.StatusBadRequest {
+		t.Errorf("entry-count cap: code = %d, want 400; body = %s", recB3a.Code, recB3a.Body.String())
 	}
-	requireNoSecret(t, intake, runName, namespace, nonceB3)
+	requireNoSecret(t, intake, runName, namespace, nonceB3a)
+
+	// (b.3b) Decompressed-total cap: N tar members each exactly MaxFileBytes
+	// so no single member trips the per-file cap, but their cumulative
+	// decompressed size exceeds MaxTotalBytes. Highly compressible (zeros)
+	// so compressed size stays under the part cap.
+	nonceB3b := make([]byte, executor.EvidenceNonceBytes)
+	if _, err := rand.Read(nonceB3b); err != nil {
+		t.Fatalf("generate nonce: %v", err)
+	}
+	// 9 members × 64 KiB = 576 KiB > 512 KiB (MaxTotalBytes); 9 < MaxContentEntries (256).
+	const bombMembers = 9
+	mB3b := sampleIntakeManifest(run, "x")
+	mB3b.Entries = make([]evidence.Entry, bombMembers)
+	for i := 0; i < bombMembers; i++ {
+		mB3b.Entries[i] = evidence.Entry{
+			Path:        fmt.Sprintf("bomb/zeros%02d.bin", i),
+			Class:       evidence.ClassUntracked,
+			Disposition: evidence.DispositionStored,
+			StoredPath:  fmt.Sprintf("bomb/zeros%02d.bin", i),
+			Bytes:       evidence.MaxFileBytes,
+		}
+	}
+	mB3b.Totals = evidence.Totals{Files: bombMembers, Stored: bombMembers, StoredBytes: int64(bombMembers) * evidence.MaxFileBytes}
+	var bufB3b bytes.Buffer
+	mwB3b := multipart.NewWriter(&bufB3b)
+	mpB3b, _ := mwB3b.CreateFormFile("manifest", "manifest.json")
+	manifestBytesB3b, _ := mB3b.MarshalCanonical()
+	_, _ = mpB3b.Write(manifestBytesB3b)
+	apB3b, _ := mwB3b.CreateFormFile("archive", "bundle.tar.gz")
+	var gzipBomb bytes.Buffer
+	gz3b := gzip.NewWriter(&gzipBomb)
+	tw3b := tar.NewWriter(gz3b)
+	for i := 0; i < bombMembers; i++ {
+		name := fmt.Sprintf("bomb/zeros%02d.bin", i)
+		hdr := &tar.Header{Name: name, Mode: 0o644, Size: evidence.MaxFileBytes, Typeflag: tar.TypeReg, Format: tar.FormatPAX}
+		_ = tw3b.WriteHeader(hdr)
+		_, _ = tw3b.Write(make([]byte, evidence.MaxFileBytes))
+	}
+	_ = tw3b.Close()
+	_ = gz3b.Close()
+	_, _ = apB3b.Write(gzipBomb.Bytes())
+	_ = mwB3b.Close()
+	tokenB3b := executor.EvidenceToken(testKey, namespace, runName, string(run.UID), nonceB3b)
+	reqB3b := httptest.NewRequest(http.MethodPost, "/intake", &bufB3b)
+	reqB3b.Header.Set("Content-Type", mwB3b.FormDataContentType())
+	reqB3b.Header.Set("Authorization", "Bearer "+tokenB3b)
+	recB3b := doIntake(intake, reqB3b)
+	if recB3b.Code != http.StatusBadRequest {
+		t.Errorf("decompressed-total cap (gzip bomb): code = %d, want 400; body = %s", recB3b.Code, recB3b.Body.String())
+	}
+	requireNoSecret(t, intake, runName, namespace, nonceB3b)
 
 	// (b.4) Tar-slip member name (parent directory segment).
 	nonceB4 := make([]byte, executor.EvidenceNonceBytes)
@@ -714,18 +758,6 @@ func TestEvidenceEnvtestWithheldEntryPersistsRestAndInvalidBundlesPersistNothing
 		}
 		t.Errorf("final evidence secrets = %v, want only %s", names, evidenceSecretName(runName, nonceA))
 	}
-}
-
-// runGit runs a git command in the given directory.
-func runGit(t *testing.T, dir string, args ...string) error {
-	t.Helper()
-	cmd := exec.CommandContext(context.Background(), "git", args...)
-	cmd.Dir = dir
-	out, err := cmd.CombinedOutput()
-	if err != nil {
-		return fmt.Errorf("git %s: %v: %s", strings.Join(args, " "), err, strings.TrimSpace(string(out)))
-	}
-	return nil
 }
 
 // TestEvidenceEnvtestGraceCapturePhaseAcceptance verifies the intake's phase
@@ -832,11 +864,11 @@ func TestEvidenceEnvtestGraceCapturePhaseAcceptance(t *testing.T) {
 }
 
 // TestEvidenceEnvtestOperatorDeletesAtLandedKeepsAtNeedsHuman verifies the
-// reconcile loop's evidence lifecycle: evidence is deleted when a run lands
-// (AwaitingReview/Done) and retained at NeedsHuman. It also checks that a run
-// in Verifying with pre-seeded evidence keeps it while Verifying, and still
-// keeps it after transitioning to NeedsHuman. The ownerRef contract is asserted
-// to confirm production GC cascade behavior.
+// reconcile loop's evidence lifecycle: evidence is kept at NeedsHuman, deleted
+// when a run lands at AwaitingReview, and deleted again at Done (idempotent).
+// It also checks that a run in Verifying with pre-seeded evidence keeps it
+// while Verifying, and still keeps it after transitioning to NeedsHuman.
+// The ownerRef contract is asserted to confirm production GC cascade behavior.
 func TestEvidenceEnvtestOperatorDeletesAtLandedKeepsAtNeedsHuman(t *testing.T) {
 	if envtestClient == nil {
 		t.Skip("KUBEBUILDER_ASSETS is not set")
@@ -844,7 +876,8 @@ func TestEvidenceEnvtestOperatorDeletesAtLandedKeepsAtNeedsHuman(t *testing.T) {
 	ctx := context.Background()
 
 	// Run A: NeedsHuman -> POST -> reconcile -> kept + condition.
-	// Then phase -> Done -> reconcile -> deleted (idempotent).
+	// Then phase -> AwaitingReview -> reconcile -> deleted.
+	// Then re-seed evidence -> phase -> Done -> reconcile -> deleted (idempotent).
 	runAName := "evidence-op-needshuman-to-done"
 	laneName := "evidence-op-lifecycle"
 	namespace := "default"
@@ -972,7 +1005,66 @@ func TestEvidenceEnvtestOperatorDeletesAtLandedKeepsAtNeedsHuman(t *testing.T) {
 		t.Errorf("run A owner ref flags: BlockOwnerDeletion=%v, Controller=%v, want true/false", or.BlockOwnerDeletion, or.Controller)
 	}
 
-	// Now move run A to Done via Status().Update and reconcile.
+	// ---- AwaitingReview delete branch ----
+	// Move run A to AwaitingReview via Status().Update and reconcile.
+	if err := envtestClient.Get(ctx, envtestKey(runAName), &updatedRunA); err != nil {
+		t.Fatal(err)
+	}
+	updatedRunA.Status.Phase = courierv1alpha1.PhaseAwaitingReview
+	if err := envtestClient.Status().Update(ctx, &updatedRunA); err != nil {
+		t.Fatal(err)
+	}
+	reconcile()
+
+	// Evidence should be deleted (label-list empty).
+	var secretsA corev1.SecretList
+	if err := envtestClient.List(ctx, &secretsA, client.InNamespace(namespace), client.MatchingLabels{EvidenceLabelKey: evidenceLabelValue(runAName)}); err != nil {
+		t.Fatal(err)
+	}
+	if len(secretsA.Items) != 0 {
+		t.Errorf("run A after AwaitingReview: found %d evidence secrets, want 0", len(secretsA.Items))
+	}
+
+	// Second reconcile is idempotent (no error, still empty).
+	reconcile()
+	if err := envtestClient.List(ctx, &secretsA, client.InNamespace(namespace), client.MatchingLabels{EvidenceLabelKey: evidenceLabelValue(runAName)}); err != nil {
+		t.Fatal(err)
+	}
+	if len(secretsA.Items) != 0 {
+		t.Errorf("run A after second reconcile (AwaitingReview): found %d evidence secrets, want 0", len(secretsA.Items))
+	}
+
+	// ---- Done delete branch (separate verification, reuse run A) ----
+	// Re-seed evidence: move back to NeedsHuman (admissible phase), POST a
+	// fresh accepted intake (new nonce), then pin to Done and reconcile ->
+	// deleted (idempotent).
+	if err := envtestClient.Get(ctx, envtestKey(runAName), &updatedRunA); err != nil {
+		t.Fatal(err)
+	}
+	updatedRunA.Status.Phase = courierv1alpha1.PhaseNeedsHuman
+	if err := envtestClient.Status().Update(ctx, &updatedRunA); err != nil {
+		t.Fatal(err)
+	}
+	reconcile()
+
+	nonceA2 := make([]byte, executor.EvidenceNonceBytes)
+	if _, err := rand.Read(nonceA2); err != nil {
+		t.Fatalf("generate nonceA2: %v", err)
+	}
+	m2 := sampleIntakeManifest(runA, "benign content re-seed")
+	reqA2, _ := intakeRequest(t, testKey, runA, m2, map[string][]byte{"src/a.go": []byte("benign content re-seed")}, nonceA2)
+	recA2 := doIntake(intake, reqA2)
+	if recA2.Code != http.StatusOK {
+		t.Fatalf("run A re-seed intake POST code = %d, want 200; body = %s", recA2.Code, recA2.Body.String())
+	}
+
+	// Verify the re-seeded secret exists.
+	secretA2 := getSecret(t, intake, evidenceSecretName(runAName, nonceA2))
+	if secretA2 == nil {
+		t.Fatal("run A re-seed secret not found")
+	}
+
+	// Move run A to Done via Status().Update and reconcile.
 	if err := envtestClient.Get(ctx, envtestKey(runAName), &updatedRunA); err != nil {
 		t.Fatal(err)
 	}
@@ -983,7 +1075,6 @@ func TestEvidenceEnvtestOperatorDeletesAtLandedKeepsAtNeedsHuman(t *testing.T) {
 	reconcile()
 
 	// Evidence should be deleted (label-list empty).
-	var secretsA corev1.SecretList
 	if err := envtestClient.List(ctx, &secretsA, client.InNamespace(namespace), client.MatchingLabels{EvidenceLabelKey: evidenceLabelValue(runAName)}); err != nil {
 		t.Fatal(err)
 	}
@@ -997,7 +1088,7 @@ func TestEvidenceEnvtestOperatorDeletesAtLandedKeepsAtNeedsHuman(t *testing.T) {
 		t.Fatal(err)
 	}
 	if len(secretsA.Items) != 0 {
-		t.Errorf("run A after second reconcile: found %d evidence secrets, want 0", len(secretsA.Items))
+		t.Errorf("run A after second reconcile (Done): found %d evidence secrets, want 0", len(secretsA.Items))
 	}
 
 	// Run B: Verifying with pre-seeded evidence -> reconcile (kept) ->
@@ -1047,7 +1138,7 @@ func TestEvidenceEnvtestOperatorDeletesAtLandedKeepsAtNeedsHuman(t *testing.T) {
 			}},
 		},
 		Data: map[string][]byte{
-			evidenceManifestKey: []byte(`{"schema_version":1,"run":{"name":"` + runBName + `","namespace":"` + namespace + `","runUID":"` + string(runB.UID) + `","podUID":"pod-1"},"workspace":{"baseRepo":"acme/widgets","headRepo":"acme/widgets","branch":"courier/x","startSHA":"00000000","headSHA":"11111111"},"captured_at":"2026-01-01T00:00:00Z","trigger":"terminal","entries":[],"totals":{"files":0,"stored":0,"stored_bytes":0}}`),
+			evidenceManifestKey: []byte(`{"schemaVersion":1,"run":{"name":"` + runBName + `","namespace":"` + namespace + `","runUID":"` + string(runB.UID) + `","podUID":"pod-1"},"workspace":{"baseRepo":"acme/widgets","headRepo":"acme/widgets","branch":"courier/x","startSHA":"00000000","headSHA":"11111111"},"capturedAt":"2026-01-01T00:00:00Z","trigger":"terminal","entries":[],"totals":{"files":0,"stored":0,"storedBytes":0}}`),
 			evidenceBundleKey:   []byte{},
 		},
 	}
@@ -1055,13 +1146,20 @@ func TestEvidenceEnvtestOperatorDeletesAtLandedKeepsAtNeedsHuman(t *testing.T) {
 		t.Fatalf("create pre-seeded secret for run B: %v", err)
 	}
 
-	// Build a reconciler for run B (no Launch needed; we only test evidence lifecycle).
+	// Build a reconciler for run B with a sequenceWorldObserver that returns
+	// a non-settling observation (pending check) so the run stays in Verifying
+	// for multiple reconciles.
 	reconcilerB := &CoderRunReconciler{
 		Client:       envtestClient,
 		APIReader:    envtestClient,
 		Sources:      NewSourceRegistry(map[string]source.Adapter{"manual": &admissionSource{}}),
 		StatusWriter: status.KubePatchWriter{Client: envtestClient},
 		Evidence:     intake,
+		Observer: &sequenceWorldObserver{observations: []PRObservation{
+			{PR: "42", Head: "sha-1", Checks: []CheckObservation{{Name: "check-a", State: CheckStatePending}}},
+			{PR: "42", Head: "sha-1", Checks: []CheckObservation{{Name: "check-a", State: CheckStatePending}}},
+			{PR: "42", Head: "sha-1", Checks: []CheckObservation{{Name: "check-a", State: CheckStatePending}}},
+		}},
 	}
 
 	reconcileB := func() {
@@ -1077,6 +1175,10 @@ func TestEvidenceEnvtestOperatorDeletesAtLandedKeepsAtNeedsHuman(t *testing.T) {
 	if err := envtestClient.Get(ctx, envtestKey(runBName), &runBUpdated); err != nil {
 		t.Fatal(err)
 	}
+	// Assert phase is still Verifying (observer returns pending checks).
+	if runBUpdated.Status.Phase != courierv1alpha1.PhaseVerifying {
+		t.Errorf("run B phase = %q, want Verifying (observer returns pending)", runBUpdated.Status.Phase)
+	}
 	condB := apimeta.FindStatusCondition(runBUpdated.Status.Conditions, EvidenceConditionType)
 	if condB != nil {
 		t.Errorf("run B (Verifying) condition = %+v, want none (reconcileEvidence is no-op in Verifying)", condB)
@@ -1085,6 +1187,19 @@ func TestEvidenceEnvtestOperatorDeletesAtLandedKeepsAtNeedsHuman(t *testing.T) {
 	secretCheck := &corev1.Secret{}
 	if err := envtestClient.Get(ctx, client.ObjectKey{Namespace: namespace, Name: secretB.Name}, secretCheck); err != nil {
 		t.Errorf("run B (Verifying) secret deleted: %v", err)
+	}
+
+	// Second reconcile while still Verifying (observer still returns pending).
+	reconcileB()
+	if err := envtestClient.Get(ctx, envtestKey(runBName), &runBUpdated); err != nil {
+		t.Fatal(err)
+	}
+	if runBUpdated.Status.Phase != courierv1alpha1.PhaseVerifying {
+		t.Errorf("run B phase = %q, want Verifying (observer returns pending)", runBUpdated.Status.Phase)
+	}
+	secretCheck2 := &corev1.Secret{}
+	if err := envtestClient.Get(ctx, client.ObjectKey{Namespace: namespace, Name: secretB.Name}, secretCheck2); err != nil {
+		t.Errorf("run B (Verifying) secret deleted on second reconcile: %v", err)
 	}
 
 	// Transition to NeedsHuman and reconcile again: evidence should still be kept, condition set.
@@ -1103,8 +1218,8 @@ func TestEvidenceEnvtestOperatorDeletesAtLandedKeepsAtNeedsHuman(t *testing.T) {
 	if condB2 == nil || condB2.Status != metav1.ConditionTrue || condB2.Reason != EvidenceReasonCaptured {
 		t.Errorf("run B (NeedsHuman) condition = %+v, want True/%s", condB2, EvidenceReasonCaptured)
 	}
-	secretCheck2 := &corev1.Secret{}
-	if err := envtestClient.Get(ctx, client.ObjectKey{Namespace: namespace, Name: secretB.Name}, secretCheck2); err != nil {
+	secretCheck3 := &corev1.Secret{}
+	if err := envtestClient.Get(ctx, client.ObjectKey{Namespace: namespace, Name: secretB.Name}, secretCheck3); err != nil {
 		t.Errorf("run B (NeedsHuman) secret deleted: %v", err)
 	}
 }
@@ -1266,6 +1381,7 @@ func TestEvidenceEnvtestStaleEvidenceFencing(t *testing.T) {
 			}
 			_ = envtestClient.Delete(ctx, &courierv1alpha1.CoderRun{ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: namespace}})
 		}
+		_ = envtestClient.Delete(ctx, lane)
 	})
 
 	// Mint a token for run X2, but POST a manifest locating run Y.
@@ -1297,6 +1413,4 @@ func TestEvidenceEnvtestStaleEvidenceFencing(t *testing.T) {
 	if len(secretsY.Items) != 0 {
 		t.Errorf("run Y label-list after cross-run replay: found %d secrets, want 0", len(secretsY.Items))
 	}
-
-	_ = envtestClient.Delete(ctx, lane)
 }
