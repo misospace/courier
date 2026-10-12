@@ -23,8 +23,11 @@ failure after the pod needed to diagnose them is gone.
 
 Classification uses the strongest available evidence: a concrete category the
 executor emitted in its handoff wins; otherwise Kubernetes/container failure
-evidence; otherwise a declared decision or external block; otherwise a non-zero
-exit with no valid handoff is `executor-crash`; otherwise `unknown`.
+evidence (a runtime-written kubelet `Terminated.Reason` or pod `Status.Reason`
+on the allowlist, a `PodFailed` with no recorded terminated state and no valid
+handoff, or a missing pod); otherwise a declared decision or external block;
+otherwise a non-zero exit with no valid handoff is `executor-crash`; otherwise
+`unknown`.
 
 ## Inspecting a run
 

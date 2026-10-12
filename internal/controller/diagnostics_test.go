@@ -690,3 +690,157 @@ func TestOverlongKubeletReasonIsBounded(t *testing.T) {
 		t.Errorf("phase = %q, want Failed; the overlong kubelet reason must not block terminalization", updated.Status.Phase)
 	}
 }
+
+// TestKubernetesFailureEvidenceAllowlists proves the classifier's
+// kubernetes-failure evidence is governed by the same allowlists the
+// reason builder applies: a pod marked with any allowlisted kubelet or pod
+// reason, with no valid executor handoff, is classified as
+// kubernetes-failure rather than falling through to executor-crash or
+// unknown. A non-allowlisted kubelet or pod reason, even with no valid
+// handoff, is not Kubernetes evidence (the allowlist is the single source
+// of truth for runtime-written values). A valid executor handoff
+// suppresses Kubernetes evidence even when the kubelet/pod reason is
+// allowlisted (the executor's stated outcome wins, per the documented
+// precedence). Closes the asymmetry called out in #275's review:
+// kubernetesFailureEvidence now consumes the full allowlist set rather
+// than the prior two-of-eight pod / two-of-seven container subset.
+func TestKubernetesFailureEvidenceAllowlists(t *testing.T) {
+	t.Run("allowlisted pod reasons are kubernetes evidence without a handoff", func(t *testing.T) {
+		for _, reason := range []string{
+			"Evicted", "NodeAffinity", "NodeLost", "Shutdown",
+			"Unschedulable", "UnexpectedAdmissionError", "Error", "ContainerStatusUnknown",
+		} {
+			pod := diagnosticPod()
+			pod.Status.Reason = reason
+			if got := kubernetesFailureEvidence(pod, false); !got {
+				t.Errorf("pod reason %q: kubernetesFailureEvidence = false, want true", reason)
+			}
+		}
+	})
+	t.Run("allowlisted kubelet reasons are kubernetes evidence without a handoff", func(t *testing.T) {
+		for _, reason := range []string{
+			"Completed", "Error", "OOMKilled", "ContainerStatusUnknown",
+			"Evicted", "DeadlineExceeded", "Preempt",
+		} {
+			pod := diagnosticPod()
+			pod.Status.ContainerStatuses[0].State.Terminated.Reason = reason
+			if got := kubernetesFailureEvidence(pod, false); !got {
+				t.Errorf("kubelet reason %q: kubernetesFailureEvidence = false, want true", reason)
+			}
+		}
+	})
+	t.Run("non-allowlisted pod reason is not kubernetes evidence", func(t *testing.T) {
+		pod := diagnosticPod()
+		pod.Status.Reason = "POD_STATUS_SENTINEL_DO_NOT_PERSIST"
+		// Clear the allowlisted kubelet reason so the test isolates the
+		// pod-reason branch.
+		pod.Status.ContainerStatuses[0].State.Terminated = nil
+		if got := kubernetesFailureEvidence(pod, false); got {
+			t.Errorf("non-allowlisted pod reason: kubernetesFailureEvidence = true, want false")
+		}
+	})
+	t.Run("non-allowlisted kubelet reason is not kubernetes evidence", func(t *testing.T) {
+		pod := diagnosticPod()
+		pod.Status.ContainerStatuses[0].State.Terminated.Reason = "kubelet says PRIVATE_PROMPT_SENTINEL_DO_NOT_PERSIST"
+		if got := kubernetesFailureEvidence(pod, false); got {
+			t.Errorf("non-allowlisted kubelet reason: kubernetesFailureEvidence = true, want false")
+		}
+	})
+	t.Run("valid handoff suppresses kubernetes evidence", func(t *testing.T) {
+		for _, reason := range []string{
+			"Evicted", "NodeLost", "Shutdown", "OOMKilled", "ContainerStatusUnknown",
+		} {
+			pod := diagnosticPod()
+			pod.Status.Reason = reason
+			pod.Status.ContainerStatuses[0].State.Terminated.Reason = reason
+			if got := kubernetesFailureEvidence(pod, true); got {
+				t.Errorf("reason %q with valid handoff: kubernetesFailureEvidence = true, want false", reason)
+			}
+		}
+	})
+	t.Run("nil pod is kubernetes evidence regardless of handoff", func(t *testing.T) {
+		if got := kubernetesFailureEvidence(nil, true); !got {
+			t.Errorf("nil pod with valid handoff: kubernetesFailureEvidence = false, want true")
+		}
+	})
+	t.Run("PodFailed with no terminated state and no handoff is kubernetes evidence", func(t *testing.T) {
+		pod := diagnosticPod()
+		pod.Status.Phase = corev1.PodFailed
+		pod.Status.ContainerStatuses[0].State.Terminated = nil
+		if got := kubernetesFailureEvidence(pod, false); !got {
+			t.Errorf("PodFailed + no terminated + no handoff: kubernetesFailureEvidence = false, want true")
+		}
+	})
+	t.Run("PodFailed with no terminated state and valid handoff is not kubernetes evidence", func(t *testing.T) {
+		pod := diagnosticPod()
+		pod.Status.Phase = corev1.PodFailed
+		pod.Status.ContainerStatuses[0].State.Terminated = nil
+		if got := kubernetesFailureEvidence(pod, true); got {
+			t.Errorf("PodFailed + no terminated + valid handoff: kubernetesFailureEvidence = true, want false")
+		}
+	})
+}
+
+// TestClassifyAllowsAllKubernetesFailureIndicators covers the
+// end-to-end classification for the previously-untested allowlisted
+// pod/container reasons, so the diagnostic settles as kubernetes-failure
+// for every value the operator's reason builder can also emit. The full
+// set must agree across the reason builder and the classifier: a value
+// the operator records on the durable status must be the same value the
+// diagnostic records as its category.
+func TestClassifyAllowsAllKubernetesFailureIndicators(t *testing.T) {
+	podCases := []string{
+		"Evicted", "NodeAffinity", "NodeLost", "Shutdown",
+		"Unschedulable", "UnexpectedAdmissionError", "Error", "ContainerStatusUnknown",
+	}
+	for _, podReason := range podCases {
+		t.Run("pod/"+podReason, func(t *testing.T) {
+			run := admissionRun("k8spod-"+podReason, "local", courierv1alpha1.PhaseRunning)
+			pod := coordinatorPod(run, 1)
+			pod.Status.Reason = podReason
+			kube := phaseClient(t, run, pod)
+			reconciler := diagnosticReconciler(kube, &admissionSource{})
+			if _, err := reconciler.Reconcile(context.Background(), admissionRequest(run.Name)); err != nil {
+				t.Fatalf("reconcile: %v", err)
+			}
+			var updated courierv1alpha1.CoderRun
+			if err := kube.Get(context.Background(), admissionKey(run.Name), &updated); err != nil {
+				t.Fatal(err)
+			}
+			diag := updated.Status.TerminalDiagnostic
+			if diag == nil || diag.Category != courierv1alpha1.TerminalDiagnosticCategoryKubernetesFailure {
+				t.Fatalf("pod reason %q: category = %#v, want kubernetes-failure", podReason, diag)
+			}
+			if !strings.Contains(diag.Reason, "pod: "+podReason) {
+				t.Errorf("pod reason %q: reason %q does not carry the pod contribution", podReason, diag.Reason)
+			}
+		})
+	}
+	kubeletCases := []string{
+		"Completed", "Error", "OOMKilled", "ContainerStatusUnknown",
+		"Evicted", "DeadlineExceeded", "Preempt",
+	}
+	for _, kubeletReason := range kubeletCases {
+		t.Run("kubelet/"+kubeletReason, func(t *testing.T) {
+			run := admissionRun("k8sc-"+kubeletReason, "local", courierv1alpha1.PhaseRunning)
+			pod := coordinatorPod(run, 1)
+			pod.Status.ContainerStatuses[0].State.Terminated.Reason = kubeletReason
+			kube := phaseClient(t, run, pod)
+			reconciler := diagnosticReconciler(kube, &admissionSource{})
+			if _, err := reconciler.Reconcile(context.Background(), admissionRequest(run.Name)); err != nil {
+				t.Fatalf("reconcile: %v", err)
+			}
+			var updated courierv1alpha1.CoderRun
+			if err := kube.Get(context.Background(), admissionKey(run.Name), &updated); err != nil {
+				t.Fatal(err)
+			}
+			diag := updated.Status.TerminalDiagnostic
+			if diag == nil || diag.Category != courierv1alpha1.TerminalDiagnosticCategoryKubernetesFailure {
+				t.Fatalf("kubelet reason %q: category = %#v, want kubernetes-failure", kubeletReason, diag)
+			}
+			if !strings.Contains(diag.Reason, "container: "+kubeletReason) {
+				t.Errorf("kubelet reason %q: reason %q does not carry the container contribution", kubeletReason, diag.Reason)
+			}
+		})
+	}
+}

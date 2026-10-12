@@ -897,9 +897,12 @@ evidence is a separate bundle pipeline and is not a substitute.
 The executor emits a machine-readable `category` in its `COURIER_TERMINATION`
 handoff; the operator classifies from the strongest available evidence and
 never invents a cause. A concrete executor category wins; otherwise
-Kubernetes/container failure evidence (OOMKill, eviction, a lost pod);
-otherwise a declared `needs_decision`/`blocked_external`; otherwise a non-zero
-exit with no valid handoff is `executor-crash`; otherwise `unknown`. Missing or
+Kubernetes/container failure evidence — a runtime-written kubelet
+`Terminated.Reason` or pod `Status.Reason` on the allowlist (the same
+allowlist the reason builder uses), a `PodFailed` with no recorded
+terminated state and no valid handoff, or a missing pod; otherwise a
+declared `needs_decision`/`blocked_external`; otherwise a non-zero exit
+with no valid handoff is `executor-crash`; otherwise `unknown`. Missing or
 ambiguous evidence is `unknown`. Categories: `executor-crash`,
 `model-transport-error`, `continuation-exhaustion`, `verifier-rejection`,
 `kubernetes-failure`, `needs-decision`, `blocked-external`, `unknown`.
@@ -1518,12 +1521,21 @@ named items remain unresolved and must not be described as production-ready:
   128-byte cap matching the CRD's `+kubebuilder:validation:MaxLength=128`,
   so an overlong kubelet value cannot cause the apiserver to reject the
   terminal status patch (which would block terminalization and source
-  reporting). User-facing explanations are posted on the source issue/PR by
-  the executor's terminal handler. Missing evidence is `unknown`; a missing
-  pod yields `kubernetes-failure` with no fabricated container details.
-  Revisited in #275 to make the reason safe by construction and to prove the
-  set-once gate holds across pod deletion and controller restart. (#272,
-  #275)
+  reporting). The classifier's kubernetes-failure evidence and the
+  reason builder's allowlist are the same set: a runtime-written
+  kubelet or pod reason on the allowlist, with no valid executor handoff,
+  is Kubernetes-level evidence; a `PodFailed` with no recorded
+  terminated state and no valid handoff; or a missing pod. User-facing
+  explanations are posted on the source issue/PR by the executor's
+  terminal handler. Missing evidence is `unknown`; a missing pod yields
+  `kubernetes-failure` with no fabricated container details. Revisited in
+  #275 to make the reason safe by construction, to prove the set-once
+  gate holds across pod deletion and controller restart, to make the
+  kubelet/pod reason allowlist real (drop, not persist, arbitrary
+  kubelet/apiserver text), to bound `container.terminationReason` to
+  the CRD's 128-byte cap, and to align the classifier's
+  kubernetes-failure evidence with the reason builder's allowlist.
+  (#272, #275)
 - **2026-10-11 — #263: exclude retained PR-fix generations before Dispatch selection.**
   The optional source-neutral discovery-with-exclusions capability passes
   retained WorkItems without decoding their opaque IDs in core. Dispatch
