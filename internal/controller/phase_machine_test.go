@@ -1888,7 +1888,7 @@ func TestExit3NoChangeNeededFixPRSettlesAgainstWorld(t *testing.T) {
 			wantPhase:       courierv1alpha1.PhaseAwaitingReview,
 			wantSource:      source.StateInReview,
 			wantReport:      true,
-			wantResult:      source.ResultReady,
+			wantResult:      source.ResultNoChange,
 			wantTransitions: 1,
 			secondObserve:   true,
 		},
@@ -2384,5 +2384,130 @@ func TestSupersededReportFreesLaneForNextRun(t *testing.T) {
 	}
 	if updatedNext.Status.Phase != courierv1alpha1.PhaseClaimed {
 		t.Fatalf("next phase = %q, want Claimed (a dropped report must not hold the lane)", updatedNext.Status.Phase)
+	}
+}
+
+// TestFixPRDeclaredNoChangeRecordedOnTerminatingExit records that a fix-pr
+// run whose coordinator terminates with the verified no_change_needed exit
+// (3) lands in Verifying with the declaration persisted, while a normal
+// success (0) reaches Verifying without it: exit 0 may have pushed a fix, so
+// it must not be mistaken for a no-change declaration.
+func TestFixPRDeclaredNoChangeRecordedOnTerminatingExit(t *testing.T) {
+	tests := []struct {
+		name string
+		exit int32
+		want bool
+	}{
+		{name: "declared no_change_needed records the declaration", exit: 3, want: true},
+		{name: "normal success does not record a declaration", exit: 0, want: false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			item := &admissionSource{}
+			run := admissionRun("run", "local", courierv1alpha1.PhaseRunning)
+			run.Spec.Mode = courierv1alpha1.ModeFixPR
+			client := phaseClient(t, run, coordinatorPod(run, tt.exit))
+			reconciler := &CoderRunReconciler{
+				Client:       client,
+				Sources:      NewSourceRegistry(map[string]source.Adapter{"test": item}),
+				StatusWriter: status.KubePatchWriter{Client: client},
+			}
+			if _, err := reconciler.Reconcile(context.Background(), admissionRequest("run")); err != nil {
+				t.Fatalf("Reconcile() error = %v", err)
+			}
+			var updated courierv1alpha1.CoderRun
+			if err := client.Get(context.Background(), admissionKey("run"), &updated); err != nil {
+				t.Fatalf("get run: %v", err)
+			}
+			if updated.Status.Phase != courierv1alpha1.PhaseVerifying {
+				t.Fatalf("phase = %q, want Verifying", updated.Status.Phase)
+			}
+			if updated.Status.DeclaredNoChange != tt.want {
+				t.Fatalf("DeclaredNoChange = %t, want %t", updated.Status.DeclaredNoChange, tt.want)
+			}
+		})
+	}
+}
+
+// TestFixPRDeclaredNoChangeTerminalizesNoChangeInReview covers issue #267: a
+// fix-pr run that recorded a verified no_change_needed declaration and settles
+// in AwaitingReview must report no-change to its source rather than ready,
+// because it pushed nothing; a "fix was pushed" report would charge the source
+// a fresh fix attempt.
+func TestFixPRDeclaredNoChangeTerminalizesNoChangeInReview(t *testing.T) {
+	item := &admissionSource{}
+	run := admissionRun("run", "local", courierv1alpha1.PhaseVerifying)
+	run.Spec.Mode = courierv1alpha1.ModeFixPR
+	run.Status.DeclaredNoChange = true
+	client := phaseClient(t, run)
+	reconciler := &CoderRunReconciler{
+		Client:       client,
+		Sources:      NewSourceRegistry(map[string]source.Adapter{"test": item}),
+		StatusWriter: status.KubePatchWriter{Client: client},
+		Observer:     fakeWorldObserver{observation: greenObservation("abc", "check-a")},
+	}
+	if _, err := reconciler.Reconcile(context.Background(), admissionRequest("run")); err != nil {
+		t.Fatalf("first Reconcile() error = %v", err)
+	}
+	if _, err := reconciler.Reconcile(context.Background(), admissionRequest("run")); err != nil {
+		t.Fatalf("second Reconcile() error = %v", err)
+	}
+	var updated courierv1alpha1.CoderRun
+	if err := client.Get(context.Background(), admissionKey("run"), &updated); err != nil {
+		t.Fatalf("get run: %v", err)
+	}
+	if updated.Status.Phase != courierv1alpha1.PhaseAwaitingReview {
+		t.Fatalf("phase = %q, want AwaitingReview", updated.Status.Phase)
+	}
+	if len(item.reports) != 1 {
+		t.Fatalf("reports = %#v, want exactly one", item.reports)
+	}
+	if item.reports[0].Result != source.ResultNoChange {
+		t.Fatalf("report result = %q, want no-change (the declared run pushed nothing)", item.reports[0].Result)
+	}
+	if item.reports[0].State != source.StateInReview {
+		t.Fatalf("report state = %q, want in-review", item.reports[0].State)
+	}
+	if item.reports[0].PR != "42" {
+		t.Fatalf("report PR = %q, want the carried PR 42", item.reports[0].PR)
+	}
+}
+
+// TestFixPRWithoutDeclarationStillReportsReadyInReview is the regression guard
+// for the no-change override: a fix-pr run that never recorded a
+// no_change_needed declaration may have pushed a fix, so it still reports
+// ready in review rather than no-change.
+func TestFixPRWithoutDeclarationStillReportsReadyInReview(t *testing.T) {
+	item := &admissionSource{}
+	run := admissionRun("run", "local", courierv1alpha1.PhaseVerifying)
+	run.Spec.Mode = courierv1alpha1.ModeFixPR
+	client := phaseClient(t, run)
+	reconciler := &CoderRunReconciler{
+		Client:       client,
+		Sources:      NewSourceRegistry(map[string]source.Adapter{"test": item}),
+		StatusWriter: status.KubePatchWriter{Client: client},
+		Observer:     fakeWorldObserver{observation: greenObservation("abc", "check-a")},
+	}
+	if _, err := reconciler.Reconcile(context.Background(), admissionRequest("run")); err != nil {
+		t.Fatalf("first Reconcile() error = %v", err)
+	}
+	if _, err := reconciler.Reconcile(context.Background(), admissionRequest("run")); err != nil {
+		t.Fatalf("second Reconcile() error = %v", err)
+	}
+	var updated courierv1alpha1.CoderRun
+	if err := client.Get(context.Background(), admissionKey("run"), &updated); err != nil {
+		t.Fatalf("get run: %v", err)
+	}
+	if updated.Status.Phase != courierv1alpha1.PhaseAwaitingReview {
+		t.Fatalf("phase = %q, want AwaitingReview", updated.Status.Phase)
+	}
+	if len(item.reports) != 1 {
+		t.Fatalf("reports = %#v, want exactly one", item.reports)
+	}
+	if item.reports[0].Result != source.ResultReady {
+		t.Fatalf("report result = %q, want ready (no declaration means a fix may have been pushed)", item.reports[0].Result)
+	}
+	if item.reports[0].State != source.StateInReview {
+		t.Fatalf("report state = %q, want in-review", item.reports[0].State)
 	}
 }

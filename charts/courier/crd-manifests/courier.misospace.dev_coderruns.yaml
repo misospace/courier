@@ -289,6 +289,13 @@ spec:
                 x-kubernetes-list-map-keys:
                 - type
                 x-kubernetes-list-type: map
+              declaredNoChange:
+                description: |-
+                  DeclaredNoChange records that the coordinator of this run exited with
+                  the verified no_change_needed declaration. Only a fix-pr run has it set:
+                  the run pushed nothing, so its terminal source report must state that no
+                  change was pushed rather than claim a fix was pushed.
+                type: boolean
               failedCheckFingerprint:
                 description: FailedCheckFingerprint is the compact identity (head
                   plus sorted check names) of the last fully-failed CI observation

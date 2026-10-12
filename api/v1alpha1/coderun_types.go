@@ -260,6 +260,13 @@ type CoderRunStatus struct {
 	// +optional
 	FailedCheckFingerprint string `json:"failedCheckFingerprint,omitempty"`
 
+	// DeclaredNoChange records that the coordinator of this run exited with
+	// the verified no_change_needed declaration. Only a fix-pr run has it set:
+	// the run pushed nothing, so its terminal source report must state that no
+	// change was pushed rather than claim a fix was pushed.
+	// +optional
+	DeclaredNoChange bool `json:"declaredNoChange,omitempty"`
+
 	// LifecycleReportRetryToken records the last explicit retry token handled for an unsupported lifecycle result; it is an opaque, non-secret value limited to 128 Unicode code points.
 	// +optional
 	// +kubebuilder:validation:MaxLength=128

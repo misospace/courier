@@ -45,6 +45,8 @@ var expectedTasksReportOutcomes = []tasksReportOutcome{
 	{result: source.ResultFailed, taskType: "followup-pr", wantOutcome: "failed"},
 	{result: source.ResultHandedOff, taskType: "implement", wantOutcome: "handed-off"},
 	{result: source.ResultHandedOff, taskType: "followup-pr", wantOutcome: "handed-off"},
+	{result: source.ResultNoChange, taskType: "implement", wantOutcome: "already_addressed"},
+	{result: source.ResultNoChange, taskType: "followup-pr", wantOutcome: "already_addressed"},
 }
 
 type tasksReportOutcome struct {
@@ -66,8 +68,8 @@ func TestDispatchTasksReportContractGuard(t *testing.T) {
 			var captured map[string]any
 			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				if r.URL.Path == "/api/pr-fix-queue/mark" {
-					if pair.result == source.ResultHandedOff {
-						t.Errorf("handed-off report unexpectedly settled PR-fix queue")
+					if pair.result == source.ResultHandedOff || pair.result == source.ResultNoChange {
+						t.Errorf("%s report unexpectedly settled PR-fix queue", pair.result)
 					}
 					w.WriteHeader(http.StatusNoContent)
 					return

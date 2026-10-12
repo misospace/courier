@@ -98,6 +98,7 @@ type OperatorPatch struct {
 	RunDuration                     string  `json:"runDuration,omitempty"`
 	CheckFingerprint                *string `json:"checkFingerprint,omitempty"`
 	FailedCheckFingerprint          *string `json:"failedCheckFingerprint,omitempty"`
+	DeclaredNoChange                *bool   `json:"declaredNoChange,omitempty"`
 	LifecycleReportRetryToken       *string `json:"lifecycleReportRetryToken,omitempty"`
 	LifecycleReportActiveRetryToken *string `json:"lifecycleReportActiveRetryToken,omitempty"`
 	Restarts                        *int    `json:"restarts,omitempty"`

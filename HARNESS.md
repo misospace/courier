@@ -1079,7 +1079,9 @@ terminal, recoverable `BlockedExternal` phase; exit `3` (`no_change_needed`)
 reaches `AwaitingReview` with source `in-review` for resolve-issue runs, and for
 fix-pr runs is settled against the world through `Verifying` (`Done` only on a
 merged/already-addressed pull request, `AwaitingReview` only on stable green
-checks, retryable `Failed` on a red check, `NeedsHuman` when unobservable); an
+checks, retryable `Failed` on a red check, `NeedsHuman` when unobservable), and
+such a run reports the neutral `no-change` lifecycle result at `AwaitingReview`
+instead of claiming a fix it never pushed; an
 externally observed failed check reaches `Failed` and follows the source's
 failure policy, while other nonzero exits also reach `Failed`. Session recovery
 for undeclared recoverable endings is shipped: with a captured session, dirty,

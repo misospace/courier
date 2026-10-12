@@ -610,6 +610,12 @@ func (r *CoderRunReconciler) observeRunning(ctx context.Context, run *courierv1a
 		phase := phaseForExit(run.Spec.Mode, exitCode, terminationOutcome)
 		if phase == courierv1alpha1.PhaseVerifying {
 			before := run.DeepCopy()
+			// Record a declared no_change_needed fix-pr run (exit 3) so its terminal
+			// report can say no change was pushed; exit 0 also lands here but may have
+			// pushed a fix, so only the declared exit sets the flag.
+			if run.Spec.Mode == courierv1alpha1.ModeFixPR && exitCode == exitDeclaredNoChange {
+				run.Status.DeclaredNoChange = true
+			}
 			run.Status.Phase = courierv1alpha1.PhaseVerifying
 			if terminationSummary != nil {
 				run.Status.Telemetry = terminationSummary
@@ -893,6 +899,13 @@ func (r *CoderRunReconciler) publishSourceLifecycle(ctx context.Context, run *co
 		startedAt = &t
 	}
 	lifecycle := lifecycleForPhase(phase, state, run.Status.PR, startedAt, intent)
+	// A declared no_change_needed fix-pr run pushed nothing, so its review report must
+	// say no change was pushed rather than claim a fix; a "fix was pushed" report would
+	// charge the source a fresh fix attempt.
+	if phase == courierv1alpha1.PhaseAwaitingReview && lifecycle.Result == source.ResultReady &&
+		run.Status.DeclaredNoChange && run.Spec.Mode == courierv1alpha1.ModeFixPR {
+		lifecycle.Result = source.ResultNoChange
+	}
 	lifecycle.IdempotencyKey = lifecycleIdempotencyKey(run, phase)
 	if run.Status.Telemetry != nil {
 		if raw, err := json.Marshal(run.Status.Telemetry); err == nil {
@@ -1194,6 +1207,10 @@ func (r *CoderRunReconciler) patchStatus(ctx context.Context, before, after *cou
 	if before.Status.FailedCheckFingerprint != after.Status.FailedCheckFingerprint {
 		fingerprint := after.Status.FailedCheckFingerprint
 		fields.FailedCheckFingerprint = &fingerprint
+	}
+	if before.Status.DeclaredNoChange != after.Status.DeclaredNoChange {
+		declaredNoChange := after.Status.DeclaredNoChange
+		fields.DeclaredNoChange = &declaredNoChange
 	}
 	if before.Status.LifecycleReportRetryToken != after.Status.LifecycleReportRetryToken {
 		token := after.Status.LifecycleReportRetryToken

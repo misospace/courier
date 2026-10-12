@@ -192,8 +192,10 @@ on the run branch; the declaration never substitutes for that check (#169):
   **Done**; an open pull request reaches **AwaitingReview** only after stable
   green checks; a red check reaches retryable **Failed**; a pull request that
   cannot be observed (no observer, or a missing or draft pull request) reaches
-  **NeedsHuman**. Neither mode resolves the source on the coordinator's word
-  alone.
+  **NeedsHuman**. A fix-pr settle that pushed nothing reports the neutral
+  `no-change` lifecycle result rather than `ready`: the run did not fix
+  anything, and a source that is told it did charges the work a fix attempt.
+  Neither mode resolves the source on the coordinator's word alone.
 - **`needs_decision`** — a real decision the coordinator cannot make. The
   executor posts the complete question as a redacted issue/PR comment and exits
   `2` to **NeedsHuman** with a blocked source report.
@@ -1191,7 +1193,14 @@ there is no delete verb because active runs reference lanes. (#73)
   marks **Done** and resolves the source; feedback/conflict → the source spawns a
   fresh `fix-pr` run without reusing the previous run. A `no_change_needed`
   resolve-issue run also waits here with its evidence posted for human review;
-  Courier does not resolve that source from the coordinator's declaration. The
+  Courier does not resolve that source from the coordinator's declaration. A
+  `no_change_needed` **fix-pr** run settles here against the world and publishes
+  the neutral `no-change` lifecycle result rather than `ready`: it pushed
+  nothing, and a source told a fix was pushed charges the work an attempt it did
+  not spend (Dispatch's head-moved guard refuses a `pr_updated`/`no_changes_needed`
+  settlement whose head did not move and requeues the item at a new generation
+  with `fixAttempts` incremented, so `already_addressed` — the one outcome that
+  settles without that guard — is what the adapter sends). The
   previous run remains auditable; its completion does not settle later feedback.
   **HandedOff** is the separate terminal phase for a published resolve-issue PR
   whose stable red checks the source will repair; it is not a success, so it is
@@ -1321,8 +1330,14 @@ task report and, for queue-backed follow-ups, a generation-fenced
 no-ops for fix-attempt accounting: do not advance generation, do not increment
 `fixAttempts`, do not surface as a human block, and keep the item discoverable
 so a future discovery cycle can re-offer the same work once the prerequisite
-is satisfied; source discovery's retained-generation exclusions omit
-BlockedExternal runs so the same work stays re-offerable. Until Dispatch
+is satisfied. Omitting a BlockedExternal run from the retained-generation
+exclusions is not sufficient on its own: CoderRun dedupe also keys on the work
+identity and the run name hashes that identity, so discovery treats a blocked
+run whose lifecycle report was published as superseded — when the source
+re-offers the identity, the blocked run is deleted and the fresh run takes its
+place in the same poll. A blocked run whose report is still pending keeps
+suppressing its identity, so a stuck report never becomes pod churn. Until
+Dispatch
 learns both signals, Courier emits them forward-compatibly; a legacy Dispatch
 rejects the report, and the controller holds it as a pending report on the
 unsupported-outcome path — automatic retries stop until an operator retry
@@ -1484,6 +1499,31 @@ named items remain unresolved and must not be described as production-ready:
 - The exact vLLM gauge for backpressure on the target model server.
 
 ## Decisions
+
+- **2026-10-12 — #267 review: a report must say what the run actually did, and a
+  blocked run must be able to wake.** Two blockers on the merged #267 behavior,
+  both verified against Dispatch `main`. (1) A `no_change_needed` fix-pr run
+  settled `AwaitingReview` and reported `ready` → Dispatch `outcome:"pr_updated"`.
+  Because the run pushed nothing, `markPrFixItem`'s head-moved guard refused the
+  `FIXED` mark and reset the queue row to `QUEUED` at a **new generation** with
+  `fixAttempts` incremented (`pr-fix-queue.ts:1766-1805`), so a run that changed
+  nothing burned an attempt and was falsely re-issued — the same charge the
+  `waiting-external` work removed. `no_changes_needed` does not help: it is
+  done-like and takes the same guard; only `already_addressed` sets
+  `alreadyAddressed` and settles without it (`pr-fix-queue.ts:2839`). The run now
+  records `status.declaredNoChange` when its exit is the verified
+  `no_change_needed` exit, and its `AwaitingReview` report publishes the new
+  source-neutral `no-change` result, which the Dispatch adapter maps to
+  `already_addressed` with no queue mark. Resolve-issue is unchanged. (2) Omitting
+  `BlockedExternal` runs from the discovery exclusions did not make the work
+  re-offerable: the same-source dedupe map and the identity-hashed run name still
+  suppressed it, so a blocked generation could never run again. Discovery now
+  supersedes a blocked run whose lifecycle report was published, deleting it and
+  creating the fresh run when the source re-offers that identity; a blocked run
+  whose report is still pending keeps suppressing, so a rejected report cannot
+  turn into relaunch churn. Both are truthful-report changes: the phase, the
+  executor exit codes, and the `waiting-external` contract from #267 are
+  unchanged. (#267)
 
 - **2026-10-11 — #267: settle fix-pr `no_change_needed` against the world; make
   `blocked_external` a recoverable dependency block across the source

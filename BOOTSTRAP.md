@@ -239,7 +239,9 @@ issued generation or burn fix-attempt budget. Exit `3`
 source `in-review`, and settles a fix-pr run against the world through
 `Verifying` (`Done` only on a merged/already-addressed pull request,
 `AwaitingReview` only on stable green checks, retryable `Failed` on a red check,
-`NeedsHuman` when unobservable), never settling the source on the declaration
+`NeedsHuman` when unobservable), and a fix-pr run that settles there reports the
+neutral `no-change` lifecycle result instead of claiming a fix it never pushed,
+never settling the source on the declaration
 alone. The evidence, question,
 or missing explanation is posted in full after redaction; only the separate
 termination reason is bounded and redacted. Comment posting is best-effort:
