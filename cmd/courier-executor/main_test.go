@@ -599,6 +599,9 @@ func TestRunDeclaredNeedsDecisionReachesNeedsHumanAndComments(t *testing.T) {
 	if !strings.Contains(output.String(), "coordinator needs a decision: Which payment provider should the run use?") {
 		t.Fatalf("needs-decision reason = %q", output.String())
 	}
+	if got := terminationLineJSON(t, output.String())["category"]; got != terminalCategoryNeedsDecision {
+		t.Fatalf("termination category = %v, want %q", got, terminalCategoryNeedsDecision)
+	}
 	mu.Lock()
 	defer mu.Unlock()
 	if len(comments) != 1 {
@@ -815,6 +818,9 @@ func TestRunDeclaredNoChangeNeededButCommittedBecomesFailed(t *testing.T) {
 	}
 	if !strings.Contains(output.String(), "opencode declared no change needed but the workspace has new commits or uncommitted changes") {
 		t.Fatalf("no-change-needed-committed reason = %q", output.String())
+	}
+	if got := terminationLineJSON(t, output.String())["category"]; got != terminalCategoryVerifierRejection {
+		t.Fatalf("termination category = %v, want %q", got, terminalCategoryVerifierRejection)
 	}
 }
 
@@ -1292,6 +1298,9 @@ func TestRunChildExitTwoBecomesFailed(t *testing.T) {
 	}
 	if !strings.Contains(output.String(), "opencode exited with status 2") {
 		t.Fatalf("child-exit-2 reason = %q", output.String())
+	}
+	if got := terminationLineJSON(t, output.String())["category"]; got != terminalCategoryModelTransportError {
+		t.Fatalf("termination category = %v, want %q", got, terminalCategoryModelTransportError)
 	}
 }
 
@@ -2255,6 +2264,9 @@ func TestRunConfigFailureKeepsRunScope(t *testing.T) {
 	exit := findEvent(t, parseEvents(t, &output), "run.exit")
 	if exit["run_id"] != "coderrun-it-7" || exit["status"] != "error" {
 		t.Fatalf("run.exit event lost run scope or status: run_id=%v status=%v", exit["run_id"], exit["status"])
+	}
+	if got := terminationLineJSON(t, output.String())["category"]; got != terminalCategoryExecutorCrash {
+		t.Fatalf("termination category = %v, want %q", got, terminalCategoryExecutorCrash)
 	}
 }
 

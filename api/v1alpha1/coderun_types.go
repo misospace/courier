@@ -125,6 +125,113 @@ type Heartbeat struct {
 	CoordinatorPodUID string `json:"coordinatorPodUID"`
 }
 
+// TerminalDiagnosticCategory is the stable classification of a terminal run's
+// cause, derived only from evidence the operator observed. Unknown is used
+// whenever evidence is missing or ambiguous; a cause is never invented.
+// +kubebuilder:validation:Enum=executor-crash;model-transport-error;continuation-exhaustion;verifier-rejection;kubernetes-failure;needs-decision;blocked-external;unknown
+type TerminalDiagnosticCategory string
+
+const (
+	// TerminalDiagnosticCategoryExecutorCrash: the executor bootstrap or
+	// harness process failed before or around the model run.
+	TerminalDiagnosticCategoryExecutorCrash TerminalDiagnosticCategory = "executor-crash"
+	// TerminalDiagnosticCategoryModelTransportError: the model/agent child
+	// process exited non-zero.
+	TerminalDiagnosticCategoryModelTransportError TerminalDiagnosticCategory = "model-transport-error"
+	// TerminalDiagnosticCategoryContinuationExhaustion: the bounded
+	// continuation budget was exhausted or a no-progress loop was detected.
+	TerminalDiagnosticCategoryContinuationExhaustion TerminalDiagnosticCategory = "continuation-exhaustion"
+	// TerminalDiagnosticCategoryVerifierRejection: the verified world (git,
+	// the PR, or authoritative linkage) disagreed with the declared or
+	// expected outcome.
+	TerminalDiagnosticCategoryVerifierRejection TerminalDiagnosticCategory = "verifier-rejection"
+	// TerminalDiagnosticCategoryKubernetesFailure: a Kubernetes/container-level
+	// failure (eviction, failed scheduling, OOMKill, or a lost pod).
+	TerminalDiagnosticCategoryKubernetesFailure TerminalDiagnosticCategory = "kubernetes-failure"
+	// TerminalDiagnosticCategoryNeedsDecision: the coordinator declared it
+	// needed a human decision.
+	TerminalDiagnosticCategoryNeedsDecision TerminalDiagnosticCategory = "needs-decision"
+	// TerminalDiagnosticCategoryBlockedExternal: the coordinator declared it
+	// was blocked on an external prerequisite.
+	TerminalDiagnosticCategoryBlockedExternal TerminalDiagnosticCategory = "blocked-external"
+	// TerminalDiagnosticCategoryUnknown: the evidence was missing or
+	// ambiguous.
+	TerminalDiagnosticCategoryUnknown TerminalDiagnosticCategory = "unknown"
+)
+
+// TerminalDiagnostic is the durable, bounded, redacted record of how a run's
+// coordinator ended. The operator captures it before pod cleanup so the cause
+// survives pod deletion and controller restart. It is best-effort: absent when
+// no evidence was available, and never fabricated from a missing pod.
+type TerminalDiagnostic struct {
+	// Category is the stable cause classification.
+	Category TerminalDiagnosticCategory `json:"category"`
+	// ExitCode is the observed coordinator container exit code, when the
+	// container terminated and reported one.
+	// +optional
+	ExitCode *int32 `json:"exitCode,omitempty"`
+	// Reason is a short, redacted, length-bounded explanation.
+	// +optional
+	// +kubebuilder:validation:MaxLength=1024
+	Reason string `json:"reason,omitempty"`
+	// Outcome is the executor-declared outcome kind, when a valid declaration
+	// drove the ending (#169); empty when classified from the world alone.
+	// +optional
+	// +kubebuilder:validation:MaxLength=64
+	Outcome string `json:"outcome,omitempty"`
+	// Container preserves the coordinator container identity and termination
+	// metadata for kubectl-describe-equivalent inspection after the pod is
+	// deleted. It is absent when no pod evidence was available.
+	// +optional
+	Container *TerminalContainerDiagnostic `json:"container,omitempty"`
+	// ObservedAt is when the operator captured this diagnostic.
+	// +optional
+	ObservedAt *metav1.Time `json:"observedAt,omitempty"`
+}
+
+// TerminalContainerDiagnostic is the bounded pod/container identity retained
+// for diagnostics after the pod is gone. No credential, token, prompt, or
+// unbounded provider text is ever recorded here.
+type TerminalContainerDiagnostic struct {
+	// PodName is the coordinator pod name at capture.
+	// +optional
+	// +kubebuilder:validation:MaxLength=253
+	PodName string `json:"podName,omitempty"`
+	// PodUID fences the retained identity to one pod incarnation.
+	// +optional
+	// +kubebuilder:validation:MaxLength=128
+	PodUID string `json:"podUID,omitempty"`
+	// Namespace is the pod namespace at capture.
+	// +optional
+	// +kubebuilder:validation:MaxLength=253
+	Namespace string `json:"namespace,omitempty"`
+	// ContainerName is the coordinator container name.
+	// +optional
+	// +kubebuilder:validation:MaxLength=253
+	ContainerName string `json:"containerName,omitempty"`
+	// ContainerID is the runtime container id (for example
+	// "containerd://...").
+	// +optional
+	// +kubebuilder:validation:MaxLength=256
+	ContainerID string `json:"containerID,omitempty"`
+	// Image is the coordinator container image.
+	// +optional
+	// +kubebuilder:validation:MaxLength=1024
+	Image string `json:"image,omitempty"`
+	// NodeName is the node the coordinator pod ran on.
+	// +optional
+	// +kubebuilder:validation:MaxLength=253
+	NodeName string `json:"nodeName,omitempty"`
+	// RestartCount is the container's restart count at capture.
+	// +optional
+	RestartCount int32 `json:"restartCount,omitempty"`
+	// TerminationReason is the container's Terminated.Reason (for example
+	// OOMKilled, Error, or Completed), when the runtime reported one.
+	// +optional
+	// +kubebuilder:validation:MaxLength=128
+	TerminationReason string `json:"terminationReason,omitempty"`
+}
+
 // ActiveOperation is one concurrently dispatched tool/subagent operation in
 // the run's active-operation set. It is dispatch evidence for liveness
 // suppression — not liveness itself, not a checkpoint — and only a heartbeat
@@ -310,6 +417,13 @@ type CoderRunStatus struct {
 	// runs that ended before the event stream could be tallied.
 	// +optional
 	Telemetry *RunTelemetry `json:"telemetry,omitempty"`
+
+	// TerminalDiagnostic is the durable, bounded, redacted record of how the
+	// run's coordinator ended, captured by the operator before pod cleanup so
+	// the cause survives pod deletion and controller restart. Best-effort:
+	// absent when no evidence was available, never fabricated.
+	// +optional
+	TerminalDiagnostic *TerminalDiagnostic `json:"terminalDiagnostic,omitempty"`
 
 	// Conditions is the standard condition set.
 	// +optional

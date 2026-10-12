@@ -533,6 +533,98 @@ spec:
                   toolCalls:
                     type: integer
                 type: object
+              terminalDiagnostic:
+                description: |-
+                  TerminalDiagnostic is the durable, bounded, redacted record of how the
+                  run's coordinator ended, captured by the operator before pod cleanup so
+                  the cause survives pod deletion and controller restart. Best-effort:
+                  absent when no evidence was available, never fabricated.
+                properties:
+                  category:
+                    description: Category is the stable cause classification.
+                    enum:
+                    - executor-crash
+                    - model-transport-error
+                    - continuation-exhaustion
+                    - verifier-rejection
+                    - kubernetes-failure
+                    - needs-decision
+                    - blocked-external
+                    - unknown
+                    type: string
+                  container:
+                    description: |-
+                      Container preserves the coordinator container identity and termination
+                      metadata for kubectl-describe-equivalent inspection after the pod is
+                      deleted. It is absent when no pod evidence was available.
+                    properties:
+                      containerID:
+                        description: |-
+                          ContainerID is the runtime container id (for example
+                          "containerd://...").
+                        maxLength: 256
+                        type: string
+                      containerName:
+                        description: ContainerName is the coordinator container name.
+                        maxLength: 253
+                        type: string
+                      image:
+                        description: Image is the coordinator container image.
+                        maxLength: 1024
+                        type: string
+                      namespace:
+                        description: Namespace is the pod namespace at capture.
+                        maxLength: 253
+                        type: string
+                      nodeName:
+                        description: NodeName is the node the coordinator pod ran
+                          on.
+                        maxLength: 253
+                        type: string
+                      podName:
+                        description: PodName is the coordinator pod name at capture.
+                        maxLength: 253
+                        type: string
+                      podUID:
+                        description: PodUID fences the retained identity to one pod
+                          incarnation.
+                        maxLength: 128
+                        type: string
+                      restartCount:
+                        description: RestartCount is the container's restart count
+                          at capture.
+                        format: int32
+                        type: integer
+                      terminationReason:
+                        description: |-
+                          TerminationReason is the container's Terminated.Reason (for example
+                          OOMKilled, Error, or Completed), when the runtime reported one.
+                        maxLength: 128
+                        type: string
+                    type: object
+                  exitCode:
+                    description: |-
+                      ExitCode is the observed coordinator container exit code, when the
+                      container terminated and reported one.
+                    format: int32
+                    type: integer
+                  observedAt:
+                    description: ObservedAt is when the operator captured this diagnostic.
+                    format: date-time
+                    type: string
+                  outcome:
+                    description: |-
+                      Outcome is the executor-declared outcome kind, when a valid declaration
+                      drove the ending (#169); empty when classified from the world alone.
+                    maxLength: 64
+                    type: string
+                  reason:
+                    description: Reason is a short, redacted, length-bounded explanation.
+                    maxLength: 1024
+                    type: string
+                required:
+                - category
+                type: object
               waitDuration:
                 description: |-
                   WaitDuration is the human-readable time between creation and StartedAt,

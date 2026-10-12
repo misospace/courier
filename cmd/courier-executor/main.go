@@ -115,6 +115,9 @@ type termination struct {
 	// declaration drove the ending (#169); empty when classified from the
 	// world alone.
 	Outcome string `json:"outcome,omitempty"`
+	// Category is the stable, machine-readable cause classification (#272),
+	// matching the TerminalDiagnosticCategory values the operator persists.
+	Category string `json:"category,omitempty"`
 	// Summary is the compact per-run telemetry tallied from the OpenCode event
 	// stream (#172). Omitted when the run recorded no activity.
 	Summary *courierv1alpha1.RunTelemetry `json:"summary,omitempty"`
@@ -333,6 +336,7 @@ func (r reporter) terminate(result termination) {
 		"exit_code": result.ExitCode,
 		"phase":     result.Phase,
 		"reason":    result.Reason,
+		"category":  result.Category,
 	})
 }
 
@@ -897,7 +901,7 @@ func run(ctx context.Context, stdout, stderr io.Writer) int {
 		// Configuration failed before identity could be validated; fall back
 		// to the raw environment so the exit event still carries run scope.
 		report.cfg = envIdentity()
-		report.terminate(termination{Phase: "Failed", Result: "failure", ExitCode: 1, Reason: err.Error()})
+		report.terminate(termination{Phase: "Failed", Result: "failure", ExitCode: 1, Reason: err.Error(), Category: terminalCategoryExecutorCrash})
 		return 1
 	}
 
@@ -910,7 +914,7 @@ func run(ctx context.Context, stdout, stderr io.Writer) int {
 
 	askpassPath, err := os.Executable()
 	if err != nil {
-		report.terminate(termination{Phase: "Failed", Result: "failure", ExitCode: 1, Reason: "resolve executable: " + err.Error()})
+		report.terminate(termination{Phase: "Failed", Result: "failure", ExitCode: 1, Reason: "resolve executable: " + err.Error(), Category: terminalCategoryExecutorCrash})
 		return 1
 	}
 	restoreIdentity := installGitIdentity()
@@ -918,7 +922,7 @@ func run(ctx context.Context, stdout, stderr io.Writer) int {
 	restoreEnv := installAskpass(askpassPath)
 	defer restoreEnv()
 	if err := git.TrustDirectory(ctx, cfg.Directory); err != nil {
-		report.terminate(termination{Phase: "Failed", Result: "failure", ExitCode: 1, Reason: "trust workspace: " + err.Error()})
+		report.terminate(termination{Phase: "Failed", Result: "failure", ExitCode: 1, Reason: "trust workspace: " + err.Error(), Category: terminalCategoryExecutorCrash})
 		return 1
 	}
 
@@ -938,12 +942,12 @@ func run(ctx context.Context, stdout, stderr io.Writer) int {
 		Branch:        cfg.Branch,
 	})
 	if err != nil {
-		report.terminate(termination{Phase: "Failed", Result: "failure", ExitCode: 1, Reason: err.Error()})
+		report.terminate(termination{Phase: "Failed", Result: "failure", ExitCode: 1, Reason: err.Error(), Category: terminalCategoryExecutorCrash})
 		return 1
 	}
 	startCommit, err := workspace.Head(ctx)
 	if err != nil {
-		report.terminate(termination{Phase: "Failed", Result: "failure", ExitCode: 1, Reason: "record workspace start: " + err.Error()})
+		report.terminate(termination{Phase: "Failed", Result: "failure", ExitCode: 1, Reason: "record workspace start: " + err.Error(), Category: terminalCategoryExecutorCrash})
 		return 1
 	}
 
@@ -1056,7 +1060,7 @@ func run(ctx context.Context, stdout, stderr io.Writer) int {
 			// Raw child exit 2 is not a declaration; only the verified outcome
 			// handoff may request NeedsHuman.
 			if code == exitNeedsHuman {
-				report.terminateCaptured(ctx, workspace, startCommit, failed(fmt.Sprintf("opencode exited with status %d", code)))
+				report.terminateCaptured(ctx, workspace, startCommit, failedWith(fmt.Sprintf("opencode exited with status %d", code), terminalCategoryModelTransportError))
 				return exitFailed
 			}
 			if tap.sessionID != "" && ctx.Err() == nil && continuations < cfg.MaxContinuations {
@@ -1077,7 +1081,7 @@ func run(ctx context.Context, stdout, stderr io.Writer) int {
 				case <-ctx.Done():
 				}
 				if ctx.Err() != nil {
-					report.terminateCaptured(ctx, workspace, startCommit, failed(fmt.Sprintf("opencode exited with status %d and the context was canceled", code)))
+					report.terminateCaptured(ctx, workspace, startCommit, failedWith(fmt.Sprintf("opencode exited with status %d and the context was canceled", code), terminalCategoryModelTransportError))
 					return exitFailed
 				}
 				stateMessage = fmt.Sprintf("Your previous turn ended unexpectedly (opencode exited with status %d). Continue working toward the goal.", code)
@@ -1087,13 +1091,13 @@ func run(ctx context.Context, stdout, stderr io.Writer) int {
 			if continuations > 0 {
 				reason += fmt.Sprintf(" after %d continuations", continuations)
 			}
-			report.terminateCaptured(ctx, workspace, startCommit, failed(reason))
+			report.terminateCaptured(ctx, workspace, startCommit, failedWith(reason, terminalCategoryModelTransportError))
 			return exitFailed
 		}
 
 		if workspace.Conflict != nil {
 			if reason := unresolvedBaseSync(ctx, workspace); reason != "" {
-				report.terminateCaptured(ctx, workspace, startCommit, termination{Phase: "NeedsHuman", Result: "needs-human", ExitCode: exitNeedsHuman, Reason: reason})
+				report.terminateCaptured(ctx, workspace, startCommit, termination{Phase: "NeedsHuman", Result: "needs-human", ExitCode: exitNeedsHuman, Reason: reason, Category: terminalCategoryUnknown})
 				return exitNeedsHuman
 			}
 		}
@@ -1139,7 +1143,7 @@ func run(ctx context.Context, stdout, stderr io.Writer) int {
 					continue
 				}
 				if verdict.FailReason != "" {
-					report.terminateCaptured(ctx, workspace, startCommit, termination{Phase: "NeedsHuman", Result: "needs-human", ExitCode: exitNeedsHuman, Reason: verdict.FailReason, Outcome: result.Outcome})
+					report.terminateCaptured(ctx, workspace, startCommit, termination{Phase: "NeedsHuman", Result: "needs-human", ExitCode: exitNeedsHuman, Reason: verdict.FailReason, Outcome: result.Outcome, Category: terminalCategoryVerifierRejection})
 					return exitNeedsHuman
 				}
 			}
@@ -1189,7 +1193,7 @@ func run(ctx context.Context, stdout, stderr io.Writer) int {
 					continue
 				}
 				if verdict.FailReason != "" {
-					report.terminateCaptured(ctx, workspace, startCommit, termination{Phase: "NeedsHuman", Result: "needs-human", ExitCode: exitNeedsHuman, Reason: verdict.FailReason})
+					report.terminateCaptured(ctx, workspace, startCommit, termination{Phase: "NeedsHuman", Result: "needs-human", ExitCode: exitNeedsHuman, Reason: verdict.FailReason, Category: terminalCategoryVerifierRejection})
 					return exitNeedsHuman
 				}
 				report.terminateCaptured(ctx, workspace, startCommit, termination{Phase: "Verifying", Result: "success", ExitCode: exitSuccess, Reason: "opencode completed with committed work"})
@@ -1244,12 +1248,12 @@ func run(ctx context.Context, stdout, stderr io.Writer) int {
 		}
 		if !worldReadFailed && prevFingerprint != "" && fingerprint == prevFingerprint {
 			history = append(history, summary)
-			report.terminateCaptured(ctx, workspace, startCommit, termination{Phase: "NeedsHuman", Result: "needs-human", ExitCode: exitNeedsHuman, Reason: "looping: " + summarizeHistory(history)})
+			report.terminateCaptured(ctx, workspace, startCommit, termination{Phase: "NeedsHuman", Result: "needs-human", ExitCode: exitNeedsHuman, Reason: "looping: " + summarizeHistory(history), Category: terminalCategoryContinuationExhaustion})
 			return exitNeedsHuman
 		}
 		if continuations >= cfg.MaxContinuations {
 			history = append(history, summary)
-			report.terminateCaptured(ctx, workspace, startCommit, termination{Phase: "NeedsHuman", Result: "needs-human", ExitCode: exitNeedsHuman, Reason: fmt.Sprintf("looping after %d continuations: %s", continuations, summarizeHistory(history))})
+			report.terminateCaptured(ctx, workspace, startCommit, termination{Phase: "NeedsHuman", Result: "needs-human", ExitCode: exitNeedsHuman, Reason: fmt.Sprintf("looping after %d continuations: %s", continuations, summarizeHistory(history)), Category: terminalCategoryContinuationExhaustion})
 			return exitNeedsHuman
 		}
 		continuations++
@@ -1271,6 +1275,16 @@ func run(ctx context.Context, stdout, stderr io.Writer) int {
 	}
 
 }
+
+const (
+	terminalCategoryExecutorCrash          = "executor-crash"
+	terminalCategoryModelTransportError    = "model-transport-error"
+	terminalCategoryContinuationExhaustion = "continuation-exhaustion"
+	terminalCategoryVerifierRejection      = "verifier-rejection"
+	terminalCategoryUnknown                = "unknown"
+	terminalCategoryNeedsDecision          = "needs-decision"
+	terminalCategoryBlockedExternal        = "blocked-external"
+)
 
 // The outcome kinds the coordinator may declare (#169).
 const (
@@ -1343,7 +1357,11 @@ func truncateTerminationReason(reason string) string {
 
 // failed builds a Failed termination with the standard failure exit code.
 func failed(reason string) termination {
-	return termination{Phase: "Failed", Result: "failure", ExitCode: exitFailed, Reason: reason}
+	return failedWith(reason, terminalCategoryExecutorCrash)
+}
+
+func failedWith(reason, category string) termination {
+	return termination{Phase: "Failed", Result: "failure", ExitCode: exitFailed, Reason: reason, Category: category}
 }
 
 // classify decides the run's terminal outcome from the coordinator's
@@ -1354,7 +1372,7 @@ func (r reporter) classify(ctx context.Context, workspace *git.Workspace, branch
 	if declErr != nil {
 		// An invalid declaration is a failed run, never a human-attention
 		// signal: the world does not say the coordinator asked for a decision.
-		return failed("opencode wrote an invalid outcome declaration: " + declErr.Error())
+		return failedWith("opencode wrote an invalid outcome declaration: "+declErr.Error(), terminalCategoryUnknown)
 	}
 	if declared {
 		return r.classifyDeclared(ctx, workspace, branch, startCommit, workState, decl)
@@ -1377,9 +1395,9 @@ func (r reporter) classifyDeclared(ctx context.Context, workspace *git.Workspace
 		r.emitOutcomeDeclared(outcomeChanges)
 		switch workState {
 		case git.WorkStateDirty:
-			return failed("opencode declared changes but left uncommitted workspace changes")
+			return failedWith("opencode declared changes but left uncommitted workspace changes", terminalCategoryVerifierRejection)
 		case git.WorkStateNone:
-			return failed("opencode declared changes but produced no commit")
+			return failedWith("opencode declared changes but produced no commit", terminalCategoryVerifierRejection)
 		default:
 			// The run branch's own ref, not where HEAD points, is the world:
 			// committed work counts only when reachable from the run branch. A
@@ -1387,7 +1405,7 @@ func (r reporter) classifyDeclared(ctx context.Context, workspace *git.Workspace
 			// falls through to the success path.
 			ahead, branchErr := workspace.CommitsOnBranchSince(ctx, branch, startCommit)
 			if branchErr == nil && ahead == 0 {
-				return failed(r.offBranchReason(ctx, workspace, branch) + "; the run branch has no new commits")
+				return failedWith(r.offBranchReason(ctx, workspace, branch)+"; the run branch has no new commits", terminalCategoryVerifierRejection)
 			}
 			return termination{Phase: "Verifying", Result: "success", ExitCode: exitSuccess, Reason: "opencode completed with committed work", Outcome: outcomeChanges}
 		}
@@ -1397,18 +1415,18 @@ func (r reporter) classifyDeclared(ctx context.Context, workspace *git.Workspace
 			r.postOutcomeComment(ctx, "**Courier: already addressed** (run "+r.cfg.RunID+")\n\n"+decl.Evidence)
 			return termination{Phase: "NoChangeNeeded", Result: "success", ExitCode: exitNoChangeNeeded, Reason: "opencode declared no change needed: " + decl.Evidence, Outcome: outcomeNoChangeNeeded}
 		}
-		return failed("opencode declared no change needed but the workspace has new commits or uncommitted changes")
+		return failedWith("opencode declared no change needed but the workspace has new commits or uncommitted changes", terminalCategoryVerifierRejection)
 	case outcomeNeedsDecision:
 		r.emitOutcomeDeclared(outcomeNeedsDecision)
 		r.postOutcomeComment(ctx, "**Courier needs a decision** (run "+r.cfg.RunID+")\n\n"+decl.Question)
-		return termination{Phase: "NeedsHuman", Result: "needs-human", ExitCode: exitNeedsHuman, Reason: "coordinator needs a decision: " + decl.Question, Outcome: outcomeNeedsDecision}
+		return termination{Phase: "NeedsHuman", Result: "needs-human", ExitCode: exitNeedsHuman, Reason: "coordinator needs a decision: " + decl.Question, Outcome: outcomeNeedsDecision, Category: terminalCategoryNeedsDecision}
 	case outcomeBlockedExternal:
 		r.emitOutcomeDeclared(outcomeBlockedExternal)
 		r.postOutcomeComment(ctx, "**Courier is blocked on an external prerequisite** (run "+r.cfg.RunID+")\n\n"+decl.Missing)
-		return termination{Phase: "NeedsHuman", Result: "needs-human", ExitCode: exitNeedsHuman, Reason: "coordinator is blocked on an external prerequisite: " + decl.Missing, Outcome: outcomeBlockedExternal}
+		return termination{Phase: "NeedsHuman", Result: "needs-human", ExitCode: exitNeedsHuman, Reason: "coordinator is blocked on an external prerequisite: " + decl.Missing, Outcome: outcomeBlockedExternal, Category: terminalCategoryBlockedExternal}
 	}
 	// Unreachable: readOutcome rejects any unknown outcome kind above.
-	return failed("opencode wrote an invalid outcome declaration: unknown outcome")
+	return failedWith("opencode wrote an invalid outcome declaration: unknown outcome", terminalCategoryUnknown)
 }
 
 // classifyUndeclared resolves a run the coordinator ended without a valid
@@ -1418,11 +1436,11 @@ func (r reporter) classifyDeclared(ctx context.Context, workspace *git.Workspace
 func (r reporter) classifyUndeclared(ctx context.Context, workspace *git.Workspace, branch, startCommit string, workState git.WorkState, caps []executor.MCPCapability) termination {
 	switch workState {
 	case git.WorkStateDirty:
-		return failed("opencode exited successfully without declaring an outcome and left uncommitted workspace changes")
+		return failedWith("opencode exited successfully without declaring an outcome and left uncommitted workspace changes", terminalCategoryUnknown)
 	case git.WorkStateCommitted:
 		ahead, branchErr := workspace.CommitsOnBranchSince(ctx, branch, startCommit)
 		if branchErr == nil && ahead == 0 {
-			return failed(r.offBranchReason(ctx, workspace, branch) + "; no outcome was declared")
+			return failedWith(r.offBranchReason(ctx, workspace, branch)+"; no outcome was declared", terminalCategoryVerifierRejection)
 		}
 		// The world shows verified work on the run branch; that ending stands
 		// on its own, declaration or not.
@@ -1432,7 +1450,7 @@ func (r reporter) classifyUndeclared(ctx context.Context, workspace *git.Workspa
 		if names := unavailableCapabilities(caps); len(names) > 0 {
 			reason += "; configured capability unavailable: " + strings.Join(names, ", ")
 		}
-		return failed(reason)
+		return failedWith(reason, terminalCategoryUnknown)
 	}
 }
 
@@ -1602,7 +1620,7 @@ func (r reporter) guardAdoption(ctx context.Context) (int, bool) {
 	}
 	exists, err := git.RemoteBranchExists(ctx, r.cfg.RemoteURL, r.cfg.Branch)
 	if err != nil {
-		r.terminate(termination{Phase: "Failed", Result: "failure", ExitCode: 1, Reason: err.Error()})
+		r.terminate(termination{Phase: "Failed", Result: "failure", ExitCode: 1, Reason: err.Error(), Category: terminalCategoryExecutorCrash})
 		return 1, true
 	}
 	if !exists {
@@ -1610,17 +1628,17 @@ func (r reporter) guardAdoption(ctx context.Context) (int, bool) {
 	}
 	owner, name, ok := splitOwnerRepo(r.cfg.Repo)
 	if !ok {
-		r.terminate(termination{Phase: "Failed", Result: "failure", ExitCode: 1, Reason: "resolve branch already exists on the remote and COURIER_REPO does not name an owner/repo; refusing adoption"})
+		r.terminate(termination{Phase: "Failed", Result: "failure", ExitCode: 1, Reason: "resolve branch already exists on the remote and COURIER_REPO does not name an owner/repo; refusing adoption", Category: terminalCategoryExecutorCrash})
 		return 1, true
 	}
 	client, err := github.NewClient(r.cfg.GitHubAPIBase, r.cfg.GitHubToken)
 	if err != nil {
-		r.terminate(termination{Phase: "Failed", Result: "failure", ExitCode: 1, Reason: err.Error()})
+		r.terminate(termination{Phase: "Failed", Result: "failure", ExitCode: 1, Reason: err.Error(), Category: terminalCategoryExecutorCrash})
 		return 1, true
 	}
 	pulls, err := client.PullRequestsForHead(ctx, owner, name, owner, r.cfg.Branch)
 	if err != nil {
-		r.terminate(termination{Phase: "Failed", Result: "failure", ExitCode: 1, Reason: err.Error()})
+		r.terminate(termination{Phase: "Failed", Result: "failure", ExitCode: 1, Reason: err.Error(), Category: terminalCategoryExecutorCrash})
 		return 1, true
 	}
 	for _, pull := range pulls {
@@ -1630,7 +1648,7 @@ func (r reporter) guardAdoption(ctx context.Context) (int, bool) {
 		}
 	}
 	for _, pull := range pulls {
-		r.terminate(termination{Phase: "NeedsHuman", Result: "needs-human", ExitCode: exitNeedsHuman, Reason: fmt.Sprintf("resolve branch already has PR #%d (%s); refusing adoption", pull.Number, pull.State)})
+		r.terminate(termination{Phase: "NeedsHuman", Result: "needs-human", ExitCode: exitNeedsHuman, Reason: fmt.Sprintf("resolve branch already has PR #%d (%s); refusing adoption", pull.Number, pull.State), Category: terminalCategoryUnknown})
 		return exitNeedsHuman, true
 	}
 	return 0, false
@@ -1648,11 +1666,11 @@ func (r reporter) guardFixPRHead(ctx context.Context) int {
 	}
 	exists, err := git.RemoteBranchExists(ctx, r.cfg.RemoteURL, r.cfg.Branch)
 	if err != nil {
-		r.terminate(termination{Phase: "Failed", Result: "failure", ExitCode: 1, Reason: err.Error()})
+		r.terminate(termination{Phase: "Failed", Result: "failure", ExitCode: 1, Reason: err.Error(), Category: terminalCategoryExecutorCrash})
 		return 1
 	}
 	if !exists {
-		r.terminate(termination{Phase: "NeedsHuman", Result: "needs-human", ExitCode: exitNeedsHuman, Reason: fmt.Sprintf("PR head branch %s was not found on the fork head repo %s; refusing to fall back to a same-named base branch", r.cfg.Branch, r.cfg.HeadRepo)})
+		r.terminate(termination{Phase: "NeedsHuman", Result: "needs-human", ExitCode: exitNeedsHuman, Reason: fmt.Sprintf("PR head branch %s was not found on the fork head repo %s; refusing to fall back to a same-named base branch", r.cfg.Branch, r.cfg.HeadRepo), Category: terminalCategoryUnknown})
 		return exitNeedsHuman
 	}
 	return 0
