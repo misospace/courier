@@ -73,6 +73,7 @@ func main() {
 	var context7MCPURL string
 	var metricsMCPURL string
 	var dispatchEnabled bool
+	var dispatchPRFixExclusions bool
 	var dispatchBaseURL string
 	var dispatchAgentName string
 	var dispatchQueueLane string
@@ -125,6 +126,7 @@ func main() {
 	flag.StringVar(&modelGatewayCIDR, "model-gateway-cidr", "", "Secure mode: CIDR of the model gateway for control egress policy; empty means no gateway egress slot.")
 	flag.IntVar(&modelGatewayPort, "model-gateway-port", 0, "Secure mode: model gateway port for control egress policy.")
 	flag.BoolVar(&dispatchEnabled, "dispatch-enabled", false, "Enable Dispatch source discovery.")
+	flag.BoolVar(&dispatchPRFixExclusions, "dispatch-pr-fix-exclusions", false, "Enable Dispatch PR-fix exclusion acknowledgements.")
 	flag.StringVar(&dispatchBaseURL, "dispatch-base-url", "", "Dispatch base URL.")
 	flag.StringVar(&dispatchAgentName, "dispatch-agent-name", "", "Dispatch agent name.")
 	flag.StringVar(&dispatchQueueLane, "dispatch-queue-lane", "", "Dispatch queue lane sent to next-task.")
@@ -302,6 +304,9 @@ func main() {
 			os.Exit(1)
 		}
 		legacyClient.WithPullRequestStateChecker(checker)
+		if dispatchPRFixExclusions {
+			legacyClient.WithPRFixExclusions(true)
+		}
 		sources.Register("dispatch", dispatch.New(legacyClient))
 		for _, binding := range bindings {
 			bindingClient, err := dispatch.NewClientWithLane(dispatchBaseURL, binding.agentName, binding.queueLane, token, dispatchHTTPTimeout)
@@ -310,6 +315,9 @@ func main() {
 				os.Exit(1)
 			}
 			bindingClient.WithPullRequestStateChecker(checker)
+			if dispatchPRFixExclusions {
+				bindingClient.WithPRFixExclusions(true)
+			}
 			adapter := dispatch.New(bindingClient)
 			if binding.sourceAgent != "" {
 				sources.Register("dispatch:"+binding.sourceAgent, adapter)
