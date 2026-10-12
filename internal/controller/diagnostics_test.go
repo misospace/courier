@@ -75,16 +75,19 @@ func TestBoundedDiagnosticReason(t *testing.T) {
 func TestBuildTerminalDiagnostic(t *testing.T) {
 	exit := int32(1)
 	now := time.Date(2026, 10, 12, 1, 2, 3, 0, time.FixedZone("offset", 3600))
-	missing := buildTerminalDiagnostic(now, &exit, "failure", "", "", true, nil)
+	missing := buildTerminalDiagnostic(now, &exit, "", "", "", true, nil)
 	if missing.Container != nil || missing.ExitCode != &exit && (missing.ExitCode == nil || *missing.ExitCode != exit) {
 		t.Fatalf("missing-pod diagnostic = %#v", missing)
 	}
 	if !missing.ObservedAt.Time.Equal(now.UTC()) {
 		t.Fatalf("ObservedAt = %v, want %v", missing.ObservedAt, now.UTC())
 	}
+	if missing.Reason != categoryDiagnosticReason(courierv1alpha1.TerminalDiagnosticCategoryKubernetesFailure) {
+		t.Fatalf("missing-pod reason = %q, want the operator category label", missing.Reason)
+	}
 	pod := diagnosticPod()
 	pod.Status.ContainerStatuses[0].State.Terminated.Reason = "OOMKilled"
-	got := buildTerminalDiagnostic(now, &exit, "oom", "", "", kubernetesFailureEvidence(pod, false), pod)
+	got := buildTerminalDiagnostic(now, &exit, "", "", "", kubernetesFailureEvidence(pod, false), pod)
 	if got.Category != courierv1alpha1.TerminalDiagnosticCategoryKubernetesFailure {
 		t.Fatalf("OOM category = %q", got.Category)
 	}
@@ -93,6 +96,9 @@ func TestBuildTerminalDiagnostic(t *testing.T) {
 	}
 	if got.ExitCode == nil || *got.ExitCode != exit {
 		t.Fatalf("exit code = %v, want %d", got.ExitCode, exit)
+	}
+	if !strings.Contains(got.Reason, kubeletContainerReason(pod)) {
+		t.Fatalf("OOM reason = %q, want it to include the kubelet reason %q", got.Reason, kubeletContainerReason(pod))
 	}
 }
 
@@ -232,8 +238,11 @@ func TestRelaunchCeilingPersistsWedgedDiagnostic(t *testing.T) {
 	if err := kube.Get(context.Background(), admissionKey(run.Name), &updated); err != nil {
 		t.Fatal(err)
 	}
-	if updated.Status.Phase != courierv1alpha1.PhaseNeedsHuman || updated.Status.TerminalDiagnostic == nil || updated.Status.TerminalDiagnostic.Category != courierv1alpha1.TerminalDiagnosticCategoryUnknown || updated.Status.TerminalDiagnostic.Reason != wedgedReapDiagnosticReason {
+	if updated.Status.Phase != courierv1alpha1.PhaseNeedsHuman || updated.Status.TerminalDiagnostic == nil || updated.Status.TerminalDiagnostic.Category != courierv1alpha1.TerminalDiagnosticCategoryUnknown {
 		t.Fatalf("wedged diagnostic = %#v phase=%q", updated.Status.TerminalDiagnostic, updated.Status.Phase)
+	}
+	if !strings.Contains(updated.Status.TerminalDiagnostic.Reason, wedgedReapDiagnosticReason) {
+		t.Fatalf("wedged reason = %q, want it to carry the wedge override %q", updated.Status.TerminalDiagnostic.Reason, wedgedReapDiagnosticReason)
 	}
 }
 
@@ -262,6 +271,238 @@ func TestDiagnosticCaptureFailureDoesNotTerminalize(t *testing.T) {
 	}
 	if updated.Status.Phase == courierv1alpha1.PhaseFailed || updated.Status.TerminalDiagnostic != nil {
 		t.Fatalf("run changed despite status write failure: %#v", updated.Status)
+	}
+}
+
+// TestDiagnosticReasonExcludesExecutorFreeformText proves the diagnostic's
+// reason is operator-derived: the executor's freeform termination text
+// (which can carry a model's needs-decision question, blocked-external
+// missing description, verifier fail-reason, or arbitrary Go error
+// strings) does not land on the durable status. AC1/AC3/AC6 of #272.
+func TestDiagnosticReasonExcludesExecutorFreeformText(t *testing.T) {
+	cases := []struct {
+		name          string
+		exitCode      int32
+		phase         string
+		result        string
+		outcome       string
+		category      string
+		reason        string
+		termReason    string
+		handoff       bool
+		wantCat       courierv1alpha1.TerminalDiagnosticCategory
+		denyTokens    []string
+		denySentinels []string
+	}{
+		{
+			name:          "needs-decision question",
+			exitCode:      2,
+			phase:         "NeedsHuman",
+			result:        "needs-human",
+			outcome:       "needs_decision",
+			category:      "needs-decision",
+			reason:        "coordinator needs a decision: PRIVATE_PROMPT_SENTINEL_DO_NOT_PERSIST",
+			handoff:       true,
+			wantCat:       courierv1alpha1.TerminalDiagnosticCategoryNeedsDecision,
+			denySentinels: []string{"PRIVATE_PROMPT_SENTINEL_DO_NOT_PERSIST"},
+		},
+		{
+			name:          "blocked-external missing",
+			exitCode:      2,
+			phase:         "NeedsHuman",
+			result:        "needs-human",
+			outcome:       "blocked_external",
+			category:      "blocked-external",
+			reason:        "coordinator is blocked on an external prerequisite: ANOTHER_PROMPT_SENTINEL",
+			handoff:       true,
+			wantCat:       courierv1alpha1.TerminalDiagnosticCategoryBlockedExternal,
+			denySentinels: []string{"ANOTHER_PROMPT_SENTINEL"},
+		},
+		{
+			name:          "verifier fail-reason",
+			exitCode:      1,
+			phase:         "Failed",
+			result:        "failure",
+			category:      "verifier-rejection",
+			reason:        "opencode declared changes but the run branch has no new commits; PR_BODY_SENTINEL_VALUE",
+			handoff:       true,
+			wantCat:       courierv1alpha1.TerminalDiagnosticCategoryVerifierRejection,
+			denySentinels: []string{"PR_BODY_SENTINEL_VALUE"},
+		},
+		{
+			name:       "arbitrary unregistered token",
+			exitCode:   1,
+			phase:      "Failed",
+			result:     "failure",
+			category:   "executor-crash",
+			reason:     "trust workspace: AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+			handoff:    true,
+			wantCat:    courierv1alpha1.TerminalDiagnosticCategoryExecutorCrash,
+			denyTokens: []string{"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"},
+		},
+	}
+	for _, tt := range cases {
+		t.Run(tt.name, func(t *testing.T) {
+			run := admissionRun("deny-"+strings.ReplaceAll(tt.name, " ", ""), "local", courierv1alpha1.PhaseRunning)
+			pod := coordinatorPod(run, tt.exitCode)
+			pod.Status.ContainerStatuses[0].State.Terminated.Reason = tt.termReason
+			if tt.handoff {
+				payload, err := json.Marshal(terminationMessage{Phase: tt.phase, Result: tt.result, ExitCode: tt.exitCode, Outcome: tt.outcome, Reason: tt.reason, Category: tt.category})
+				if err != nil {
+					t.Fatal(err)
+				}
+				pod.Status.ContainerStatuses[0].State.Terminated.Message = handoffPrefix + string(payload)
+			}
+			kube := phaseClient(t, run, pod)
+			reconciler := diagnosticReconciler(kube, &admissionSource{})
+			if _, err := reconciler.Reconcile(context.Background(), admissionRequest(run.Name)); err != nil {
+				t.Fatalf("reconcile: %v", err)
+			}
+			var updated courierv1alpha1.CoderRun
+			if err := kube.Get(context.Background(), admissionKey(run.Name), &updated); err != nil {
+				t.Fatal(err)
+			}
+			diag := updated.Status.TerminalDiagnostic
+			if diag == nil {
+				t.Fatal("diagnostic was not persisted")
+			}
+			if diag.Category != tt.wantCat {
+				t.Errorf("category = %q, want %q", diag.Category, tt.wantCat)
+			}
+			for _, sentinel := range tt.denySentinels {
+				if strings.Contains(diag.Reason, sentinel) {
+					t.Errorf("reason retained executor freeform text %q: %q", sentinel, diag.Reason)
+				}
+			}
+			for _, token := range tt.denyTokens {
+				if strings.Contains(diag.Reason, token) {
+					t.Errorf("reason retained literal %q: %q", token, diag.Reason)
+				}
+			}
+		})
+	}
+}
+
+// TestDiagnosticSurvivesPodDeletionAndReconcilerRestart proves the durable
+// diagnostic set during a terminal transition persists across pod deletion
+// and a fresh controller-runtime reconciler (simulated controller restart).
+// The set-once gate must hold: a later reconcile on a run whose diagnostic
+// was already persisted in a prior incarnation leaves every field of the
+// diagnostic unchanged. AC1/AC4/AC6 of #272.
+func TestDiagnosticSurvivesPodDeletionAndReconcilerRestart(t *testing.T) {
+	run := admissionRun("survive-run", "local", courierv1alpha1.PhaseRunning)
+	const executorReason = "PR_BODY_SENTINEL_LIFECYCLE_VALUE"
+	pod := coordinatorPodWithOutcome(run, 1, "", executorReason)
+	payload, err := json.Marshal(terminationMessage{Phase: "Failed", Result: "failure", ExitCode: 1, Reason: executorReason, Category: "verifier-rejection"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	pod.Status.ContainerStatuses[0].State.Terminated.Message = handoffPrefix + string(payload)
+	pod.Status.ContainerStatuses[0].State.Terminated.Reason = "Error"
+	pod.Status.ContainerStatuses[0].ContainerID = "containerd://survive"
+	pod.Status.ContainerStatuses[0].Image = "courier:test"
+	pod.Status.ContainerStatuses[0].RestartCount = 4
+	kube := phaseClient(t, run, pod)
+	firstReconciler := diagnosticReconciler(kube, &admissionSource{})
+	if _, err := firstReconciler.Reconcile(context.Background(), admissionRequest(run.Name)); err != nil {
+		t.Fatalf("first reconcile: %v", err)
+	}
+	var afterFirst courierv1alpha1.CoderRun
+	if err := kube.Get(context.Background(), admissionKey(run.Name), &afterFirst); err != nil {
+		t.Fatal(err)
+	}
+	captured := afterFirst.Status.TerminalDiagnostic
+	if captured == nil {
+		t.Fatal("first reconcile did not capture diagnostic")
+	}
+	if captured.Container == nil || captured.Container.PodName != pod.Name || captured.Container.ContainerID != "containerd://survive" || captured.Container.RestartCount != 4 {
+		t.Fatalf("container identity = %#v", captured.Container)
+	}
+	if captured.Category != courierv1alpha1.TerminalDiagnosticCategoryVerifierRejection {
+		t.Fatalf("category = %q, want verifier-rejection", captured.Category)
+	}
+
+	// Simulate pod cleanup: the coordinator pod is gone before the next
+	// reconcile, the same shape as kubelet-initiated GC. A second
+	// reconciler instance is built to model controller restart.
+	if err := kube.Delete(context.Background(), pod); err != nil {
+		t.Fatalf("delete pod: %v", err)
+	}
+	freshReconciler := diagnosticReconciler(kube, &admissionSource{})
+	if _, err := freshReconciler.Reconcile(context.Background(), admissionRequest(run.Name)); err != nil {
+		t.Fatalf("second reconcile: %v", err)
+	}
+	var afterRestart courierv1alpha1.CoderRun
+	if err := kube.Get(context.Background(), admissionKey(run.Name), &afterRestart); err != nil {
+		t.Fatal(err)
+	}
+	survived := afterRestart.Status.TerminalDiagnostic
+	if survived == nil {
+		t.Fatal("diagnostic lost after pod deletion and reconciler restart")
+	}
+	if survived.Category != captured.Category {
+		t.Errorf("category changed: %q -> %q", captured.Category, survived.Category)
+	}
+	if captured.ExitCode == nil || survived.ExitCode == nil || *survived.ExitCode != *captured.ExitCode {
+		t.Errorf("exit code changed: %v -> %v", captured.ExitCode, survived.ExitCode)
+	}
+	if survived.Container == nil || survived.Container.ContainerID != captured.Container.ContainerID || survived.Container.PodName != captured.Container.PodName || survived.Container.Image != captured.Container.Image || survived.Container.RestartCount != captured.Container.RestartCount || survived.Container.PodUID != captured.Container.PodUID {
+		t.Errorf("container identity changed: %#v -> %#v", captured.Container, survived.Container)
+	}
+	if captured.ObservedAt == nil || survived.ObservedAt == nil || !survived.ObservedAt.Time.Equal(captured.ObservedAt.Time) {
+		t.Errorf("observedAt changed: %v -> %v", captured.ObservedAt, survived.ObservedAt)
+	}
+	if !strings.Contains(survived.Reason, kubeletContainerReason(pod)) {
+		t.Errorf("reason dropped kubelet reason: %q", survived.Reason)
+	}
+	if strings.Contains(survived.Reason, executorReason) {
+		t.Errorf("reason retained executor freeform text %q: %q", executorReason, survived.Reason)
+	}
+}
+
+// TestPodDeletedBeforeCaptureSurvivesRestart proves the durable diagnostic
+// capture path that the disappearance backstop and the relaunch-ceiling
+// path share: a coordinator pod that vanishes before any reconcile can
+// capture a diagnostic still produces a kubernetes-failure diagnostic with
+// no fabricated container, and the diagnostic survives a fresh reconciler.
+// AC1/AC4/AC6 of #272.
+func TestPodDeletedBeforeCaptureSurvivesRestart(t *testing.T) {
+	run := admissionRun("predelete", "local", courierv1alpha1.PhaseRunning)
+	run.Status.Restarts = defaultMaxRestarts
+	kube := phaseClient(t, run)
+	first := diagnosticReconciler(kube, &admissionSource{})
+	if _, err := first.observeMissingCoordinator(context.Background(), run); err != nil {
+		t.Fatalf("observe missing: %v", err)
+	}
+	var afterFirst courierv1alpha1.CoderRun
+	if err := kube.Get(context.Background(), admissionKey(run.Name), &afterFirst); err != nil {
+		t.Fatal(err)
+	}
+	captured := afterFirst.Status.TerminalDiagnostic
+	if captured == nil || captured.Category != courierv1alpha1.TerminalDiagnosticCategoryKubernetesFailure || captured.Container != nil {
+		t.Fatalf("missing-pod capture = %#v", captured)
+	}
+
+	fresh := diagnosticReconciler(kube, &admissionSource{})
+	if _, err := fresh.Reconcile(context.Background(), admissionRequest(run.Name)); err != nil {
+		t.Fatalf("second reconcile: %v", err)
+	}
+	var afterRestart courierv1alpha1.CoderRun
+	if err := kube.Get(context.Background(), admissionKey(run.Name), &afterRestart); err != nil {
+		t.Fatal(err)
+	}
+	survived := afterRestart.Status.TerminalDiagnostic
+	if survived == nil {
+		t.Fatal("diagnostic lost after restart")
+	}
+	if survived.Category != captured.Category {
+		t.Errorf("category changed: %q -> %q", captured.Category, survived.Category)
+	}
+	if survived.Container != nil {
+		t.Errorf("container block fabricated from missing pod: %#v", survived.Container)
+	}
+	if !strings.Contains(survived.Reason, podLostReason) {
+		t.Errorf("reason = %q, want it to carry the pod-loss override %q", survived.Reason, podLostReason)
 	}
 }
 

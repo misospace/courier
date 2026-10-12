@@ -629,12 +629,16 @@ func (r *CoderRunReconciler) observeRunning(ctx context.Context, run *courierv1a
 		}
 		// A diagnostic explains a non-success ending. Successful handoffs
 		// (Verifying, AwaitingReview) carry no failure cause, so they get none.
+		// The diagnostic's reason is operator-derived (category + kubelet
+		// state); the executor's freeform termination text is intentionally
+		// not an input, so a model-controlled needs-decision question or
+		// verifier fail-reason cannot land on the durable status.
 		if phase == courierv1alpha1.PhaseFailed || phase == courierv1alpha1.PhaseNeedsHuman {
 			exit := exitCode
 			handoffCategory := coordinatorHandoffCategory(pod)
 			handoffValid := coordinatorHandoffValid(pod)
 			k8sFailure := kubernetesFailureEvidence(pod, handoffValid)
-			intent.diagnostic = buildTerminalDiagnostic(r.clock(), &exit, terminationReason, terminationOutcome, handoffCategory, k8sFailure, pod)
+			intent.diagnostic = buildTerminalDiagnostic(r.clock(), &exit, "", terminationOutcome, handoffCategory, k8sFailure, pod)
 		}
 		return r.transitionTerminal(ctx, run, phase, "", intent, terminationSummary)
 	}

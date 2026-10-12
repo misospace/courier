@@ -905,17 +905,27 @@ ambiguous evidence is `unknown`. Categories: `executor-crash`,
 `kubernetes-failure`, `needs-decision`, `blocked-external`, `unknown`.
 
 The diagnostic carries the observed exit code, the executor-declared outcome
-kind when any, a short redacted reason (re-bounded to 1024 bytes and re-redacted
-through the defensive credential table; no token, credential, raw prompt, or
-unbounded provider text is stored), and the coordinator container's identity
-and termination metadata (`podName`, `podUID`, `containerID`, `image`,
-`nodeName`, `restartCount`, `terminationReason`) for kubectl-describe-equivalent
-inspection after the pod is gone. Capture is best-effort and set-once: the
-terminal transition captures when the pod is present; the pod-loss/restart
-ceiling captures `kubernetes-failure` with no fabricated container details when
-it is not. A later reconcile never clears an already-captured diagnostic, and
-capture never changes a phase, exit, retry, or source report. Operator
-workflow is in [docs/terminal-diagnostics.md](./docs/terminal-diagnostics.md).
+kind when any, an **operator-derived** short reason (a category label, the
+kubelet's allowlisted `Terminated.Reason` and pod `Status.Reason`, and a
+fixed override for the wedge-reap and pod-loss ceiling paths — never the
+executor model text), and the coordinator container's identity and
+termination metadata (`podName`, `podUID`, `containerID`, `image`,
+`nodeName`, `restartCount`, `terminationReason`) for
+kubectl-describe-equivalent inspection after the pod is gone. The reason is
+re-bounded to 1024 bytes and re-redacted through the defensive credential
+table as a defense-in-depth pass on the operator-derived string, but the
+executor model text never reaches the field by construction: a model's
+`needs-decision` question, a `blocked-external` missing description, a
+verifier fail-reason, or a bootstrap error string cannot land on the
+durable status, because no path from the executor's `termination.Reason`
+to the diagnostic's reason exists. User-facing explanations live on the
+source issue/PR comment posted by the executor's terminal handler.
+Capture is best-effort and set-once: the terminal transition captures when
+the pod is present; the pod-loss/restart ceiling captures
+`kubernetes-failure` with no fabricated container details when it is not. A
+later reconcile never clears an already-captured diagnostic, and capture
+never changes a phase, exit, retry, or source report. Operator workflow is
+in [docs/terminal-diagnostics.md](./docs/terminal-diagnostics.md).
 
 ### Toolchain reference for bootstrap lanes (#153)
 
@@ -1487,11 +1497,21 @@ named items remain unresolved and must not be described as production-ready:
   verifier rejection, or Kubernetes/container failure. The executor emits a
   machine-readable category in its handoff; the operator classifies from the
   strongest evidence and never invents a cause (`unknown` otherwise), persists
-  `status.terminalDiagnostic` (bounded, redacted reason plus retained
-  pod/container identity for describe-equivalent inspection), and never lets a
-  capture alter the phase, retry, or source report. Missing evidence is
-  `unknown`; a missing pod yields `kubernetes-failure` with no fabricated
-  container details. (#272)
+  `status.terminalDiagnostic` (an operator-derived category-labelled reason
+  plus retained pod/container identity for describe-equivalent inspection),
+  and never lets a capture alter the phase, retry, or source report. The
+  diagnostic's reason is operator-derived by construction: a category label,
+  the kubelet's allowlisted `Terminated.Reason` and pod `Status.Reason`, and a
+  fixed operator override for the wedge-reap and pod-loss ceiling paths. The
+  executor's freeform text (`needs-decision` questions, `blocked-external`
+  missing descriptions, verifier fail-reasons, bootstrap error strings) is
+  never an input, so no model-controlled text can land on the durable
+  status. User-facing explanations are posted on the source issue/PR by the
+  executor's terminal handler. Missing evidence is `unknown`; a missing pod
+  yields `kubernetes-failure` with no fabricated container details.
+  Revisited in #275 to make the reason safe by construction and to prove the
+  set-once gate holds across pod deletion and controller restart. (#272,
+  #275)
 - **2026-10-11 — #263: exclude retained PR-fix generations before Dispatch selection.**
   The optional source-neutral discovery-with-exclusions capability passes
   retained WorkItems without decoding their opaque IDs in core. Dispatch

@@ -78,11 +78,86 @@ func boundedDiagnosticOutcome(outcome string) string {
 	return string(runes)
 }
 
-func buildTerminalDiagnostic(now time.Time, exitCode *int32, reason, outcome, handoffCategory string, kubernetesFailure bool, pod *corev1.Pod) *courierv1alpha1.TerminalDiagnostic {
+// categoryDiagnosticReason returns a short, allowlisted, operator-generated
+// explanation for a category. The string is the operator's own label, not
+// any text the executor produced: the coordinator's needs-decision
+// question and blocked-external missing description, the verifier's
+// fail-reason, error text from the executor bootstrap, and any other
+// executor-produced freeform text are deliberately not used here. The
+// category is the only durable handle on the meaning of an ending; the
+// human-facing explanation lives on the source issue/PR comment posted
+// by the executor's terminal handler.
+func categoryDiagnosticReason(category courierv1alpha1.TerminalDiagnosticCategory) string {
+	switch category {
+	case courierv1alpha1.TerminalDiagnosticCategoryNeedsDecision:
+		return "coordinator declared it needed a decision"
+	case courierv1alpha1.TerminalDiagnosticCategoryBlockedExternal:
+		return "coordinator declared it was blocked on an external prerequisite"
+	case courierv1alpha1.TerminalDiagnosticCategoryVerifierRejection:
+		return "coordinator exit was rejected by the verified world"
+	case courierv1alpha1.TerminalDiagnosticCategoryModelTransportError:
+		return "coordinator model transport exited with a non-zero status"
+	case courierv1alpha1.TerminalDiagnosticCategoryContinuationExhaustion:
+		return "coordinator exhausted its continuation budget"
+	case courierv1alpha1.TerminalDiagnosticCategoryKubernetesFailure:
+		return "coordinator pod failed at the Kubernetes or container layer"
+	case courierv1alpha1.TerminalDiagnosticCategoryExecutorCrash:
+		return "coordinator exited without a valid handoff"
+	case courierv1alpha1.TerminalDiagnosticCategoryUnknown:
+		return "coordinator ended with no captured cause"
+	}
+	return ""
+}
+
+// kubeletContainerReason returns the coordinator container's kubelet
+// Terminated.Reason, or "" when the container is not recorded as
+// terminated. The value is one of a small allowlisted set the runtime
+// itself writes (for example OOMKilled, Error, Completed,
+// ContainerStatusUnknown) and is bounded by Kubernetes to 128 bytes;
+// it is safe to fold into the operator-derived diagnostic reason.
+func kubeletContainerReason(pod *corev1.Pod) string {
+	if pod == nil {
+		return ""
+	}
+	for i := range pod.Status.ContainerStatuses {
+		status := &pod.Status.ContainerStatuses[i]
+		if status.Name != coordinatorContainerName || status.State.Terminated == nil {
+			continue
+		}
+		return strings.TrimSpace(status.State.Terminated.Reason)
+	}
+	return ""
+}
+
+// operatorDiagnosticReason builds the reason persisted on a diagnostic
+// entirely from operator-derived data: the category label, the kubelet's
+// allowlisted container and pod state reasons, and a small set of
+// operator-controlled override strings (wedge reap, pod loss). The
+// executor's freeform termination text is never an input. The result is
+// passed through boundedDiagnosticReason for the length cap and a
+// defensive pattern-redaction pass.
+func operatorDiagnosticReason(category courierv1alpha1.TerminalDiagnosticCategory, override string, pod *corev1.Pod) string {
+	parts := []string{categoryDiagnosticReason(category)}
+	if reason := kubeletContainerReason(pod); reason != "" {
+		parts = append(parts, "container: "+reason)
+	}
+	if pod != nil {
+		if reason := strings.TrimSpace(pod.Status.Reason); reason != "" {
+			parts = append(parts, "pod: "+reason)
+		}
+	}
+	if override != "" {
+		parts = append(parts, override)
+	}
+	return strings.Join(parts, "; ")
+}
+
+func buildTerminalDiagnostic(now time.Time, exitCode *int32, reasonOverride, outcome, handoffCategory string, kubernetesFailure bool, pod *corev1.Pod) *courierv1alpha1.TerminalDiagnostic {
+	category := classifyTerminalDiagnostic(handoffCategory, exitCode, outcome, kubernetesFailure)
 	diagnostic := &courierv1alpha1.TerminalDiagnostic{
-		Category:   classifyTerminalDiagnostic(handoffCategory, exitCode, outcome, kubernetesFailure),
+		Category:   category,
 		ExitCode:   exitCode,
-		Reason:     boundedDiagnosticReason(reason),
+		Reason:     boundedDiagnosticReason(operatorDiagnosticReason(category, reasonOverride, pod)),
 		Outcome:    boundedDiagnosticOutcome(outcome),
 		ObservedAt: &metav1.Time{Time: now.UTC()},
 	}

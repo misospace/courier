@@ -63,7 +63,19 @@ already gone at capture; no container details are fabricated.
 
 ## Bounds and redaction
 
-The reason is length-bounded (1024 bytes) and redacted: tokens, credentials,
-raw prompts, and unbounded provider responses are never stored. Capture is
-best-effort, so an absent diagnostic is not proof of success, and `unknown`
-means the evidence was missing or ambiguous.
+The reason is **operator-derived**: a short, allowlisted category label,
+optionally followed by the kubelet's allowlisted `Terminated.Reason` and the
+pod's `Status.Reason`, and (for the operator's own wedge-reap and pod-loss
+ceiling paths) a fixed operator-controlled override. The executor's freeform
+text — `needs-decision` questions, `blocked-external` missing descriptions,
+verifier fail-reasons, bootstrap error strings — is never an input to the
+diagnostic's reason. The user-facing explanation lives on the source issue
+or pull request, where the executor's terminal handler posts it through the
+registered-secret redactor.
+
+The reason is length-bounded to 1024 bytes and run through a defensive
+pattern-redaction pass on whatever operator-derived text it does carry
+(so a kubelet state reason that happens to look like a credential is
+still replaced). Capture is best-effort, so an absent diagnostic is not
+proof of success, and `unknown` means the evidence was missing or
+ambiguous.
