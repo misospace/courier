@@ -3,7 +3,6 @@ package dispatch
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -18,10 +17,9 @@ import (
 
 // dispatchAcceptedOutcomes mirrors the allowlist declared in
 // src/app/api/agents/[agentName]/tasks/report/route.ts of
-// misospace/dispatch (currently `VALID_OUTCOMES`). Outcomes outside this
-// set are modeled as Dispatch's explicit invalid-outcome HTTP 400 below,
-// proving Courier classifies the real backend rejection as unsupported.
-// Update this fixture in lockstep with any change to the upstream allowlist.
+// misospace/dispatch (currently `VALID_OUTCOMES`); `handed-off` was added
+// upstream by misospace/dispatch#1226. Update this fixture in lockstep with
+// any change to the upstream allowlist.
 var dispatchAcceptedOutcomes = map[string]struct{}{
 	"pr_opened":         {},
 	"pr_updated":        {},
@@ -31,17 +29,7 @@ var dispatchAcceptedOutcomes = map[string]struct{}{
 	"failed":            {},
 	"no_changes_needed": {},
 	"already_addressed": {},
-}
-
-// dispatchContractGaps enumerates outcomes the courier adapter emits
-// today that Dispatch does not yet accept. Each entry records the exact
-// old-backend gap; it is not evidence that Dispatch accepts the outcome.
-// The fixture server below returns the actual unsupported-outcome response
-// shape so the adapter behavior remains covered without claiming backend support.
-var dispatchContractGaps = map[string]string{
-	// #246: the current Dispatch VALID_OUTCOMES fixture lacks this value;
-	// runtime support remains a separate source-backend capability.
-	"handed-off": "the current Dispatch report contract rejects this result; Courier records it as unsupported and keeps the pending report retryable by explicit operator token (#246).",
+	"handed-off":        {},
 }
 
 // expectedTasksReportOutcomes enumerates the (Result, taskType) pairs
@@ -66,23 +54,11 @@ type tasksReportOutcome struct {
 }
 
 // TestDispatchTasksReportContractGuard asserts every courier-emitted
-// outcome is either explicitly accepted by Dispatch (see
-// dispatchAcceptedOutcomes) or explicitly listed as a known contract
-// gap with a referenced fix (see dispatchContractGaps). Adding a new
-// outcome to client.go without updating the fixture fails this test.
-// Removing an accepted outcome from the upstream allowlist also fails
-// it, as long as courier still emits the now-rejected value.
+// outcome is accepted by the current Dispatch fixture. Adding a new outcome
+// to client.go or removing one upstream fails this end-to-end contract test.
 func TestDispatchTasksReportContractGuard(t *testing.T) {
-	for gap := range dispatchContractGaps {
-		if _, ok := dispatchAcceptedOutcomes[gap]; ok {
-			t.Errorf("dispatchContractGaps entry %q duplicates dispatchAcceptedOutcomes — move it across instead", gap)
-		}
-	}
-
 	accepted := sortedOutcomeKeys(dispatchAcceptedOutcomes)
-	gaps := sortedGapKeys(dispatchContractGaps)
 	t.Logf("dispatch accepted outcomes (mirror of VALID_OUTCOMES): %s", strings.Join(accepted, ", "))
-	t.Logf("dispatch contract gaps (awaiting dispatch-side change): %s", strings.Join(gaps, ", "))
 
 	for _, pair := range expectedTasksReportOutcomes {
 		pair := pair
@@ -90,17 +66,14 @@ func TestDispatchTasksReportContractGuard(t *testing.T) {
 			var captured map[string]any
 			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				if r.URL.Path == "/api/pr-fix-queue/mark" {
+					if pair.result == source.ResultHandedOff {
+						t.Errorf("handed-off report unexpectedly settled PR-fix queue")
+					}
 					w.WriteHeader(http.StatusNoContent)
 					return
 				}
 				body, _ := io.ReadAll(r.Body)
 				_ = json.Unmarshal(body, &captured)
-				outcome, _ := captured["outcome"].(string)
-				if _, ok := dispatchContractGaps[outcome]; ok {
-					w.WriteHeader(http.StatusBadRequest)
-					_, _ = w.Write([]byte(`{"error":"Invalid outcome. Must be one of: pr_opened, pr_updated, issue_updated, issue_closed, blocked, failed, no_changes_needed, already_addressed"}`))
-					return
-				}
 				w.WriteHeader(http.StatusNoContent)
 			}))
 			defer server.Close()
@@ -119,22 +92,12 @@ func TestDispatchTasksReportContractGuard(t *testing.T) {
 			if outcome != pair.wantOutcome {
 				t.Fatalf("captured outcome = %q, want %q", outcome, pair.wantOutcome)
 			}
-			if _, unsupported := dispatchContractGaps[outcome]; unsupported {
-				if !errors.Is(err, source.ErrUnsupportedOutcome) {
-					t.Fatalf("Report() error = %v, want source.ErrUnsupportedOutcome from Dispatch's invalid-outcome 400", err)
-				}
-				return
-			}
 			if err != nil {
 				t.Fatalf("Report() error = %v", err)
 			}
-			if _, ok := dispatchAcceptedOutcomes[outcome]; ok {
-				return
+			if _, ok := dispatchAcceptedOutcomes[outcome]; !ok {
+				t.Fatalf("emitted outcome %q is not accepted by Dispatch; update the fixture", outcome)
 			}
-			if why, gap := dispatchContractGaps[outcome]; gap {
-				t.Skipf("cross-repo contract gap acknowledged: outcome %q is not in Dispatch's allowlist — %s", outcome, why)
-			}
-			t.Fatalf("emitted outcome %q is neither accepted (dispatchAcceptedOutcomes) nor tracked (dispatchContractGaps); update the fixture or close the gap", outcome)
 		})
 	}
 }
@@ -180,9 +143,8 @@ func TestDispatchTasksReportContractRejectsUnknownOutcomes(t *testing.T) {
 }
 
 // TestDispatchAcceptedOutcomesMatchDispatchFixture asserts the
-// allowlist fixture stays in lockstep with the documented
-// mirror-comment. A developer who drops a literal (or adds one by
-// accident from a pending dispatch change) trips this test.
+// allowlist fixture stays in lockstep with Dispatch's VALID_OUTCOMES
+// mirror. A developer who drops or accidentally adds a literal trips this test.
 func TestDispatchAcceptedOutcomesMatchDispatchFixture(t *testing.T) {
 	want := map[string]struct{}{
 		"pr_opened":         {},
@@ -193,6 +155,7 @@ func TestDispatchAcceptedOutcomesMatchDispatchFixture(t *testing.T) {
 		"failed":            {},
 		"no_changes_needed": {},
 		"already_addressed": {},
+		"handed-off":        {},
 	}
 	if len(want) != len(dispatchAcceptedOutcomes) {
 		t.Fatalf("dispatchAcceptedOutcomes size = %d, want %d — update the comment and this set together", len(dispatchAcceptedOutcomes), len(want))

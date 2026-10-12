@@ -1209,9 +1209,10 @@ Pluggable adapters over a generic interface. An adapter both *creates* runs and
   `outcome="handed-off"`, the PR, and the verification error; it is neither
   `ready` nor a `BLOCKED` queue mark, because Dispatch discovers the failed
   checks through its own `POST /api/pr-followup/sync` and enqueues repair
-  independently. That acceptance is pending a companion change on
-  misospace/dispatch; until it lands Courier's `handed-off` report is rejected
-  (HTTP 400) and retried.
+  independently. Dispatch accepts this neutral outcome since
+  misospace/dispatch#1226; its task report does not settle the PR-fix queue.
+  Courier still recognizes unsupported-outcome HTTP 400 responses from older
+  or incompatible Dispatch servers and waits for explicit operator retry.
 - **github-label / gitlab / forgejo / tangled** — a labeled issue becomes a
   resolve-issue run; CHANGES_REQUESTED becomes a fix-pr run.
 - **cron** — scheduled work (the weekly audit, backlog grooming). This is what
@@ -1726,7 +1727,7 @@ was superseded.
   issue. Sources apply their own failure policy. Dispatch's failed report performs the retry/cap
   decision for queue-backed PR-fix work, so Courier must not send a second
   `BLOCKED` mark for the same now-advanced generation.
-- **2026-10-11 — #246: unsupported lifecycle reports stop retrying until explicit request.** Dispatch's current outcome allowlist rejects `handed-off`, and automatic retries at the normal lifecycle interval cannot make that source contract change. Courier now preserves the truthful pending lifecycle condition, stops retrying only this typed unsupported case, and allows an operator to request another attempt with a new bounded annotation token. Transient source errors still retry as before.
+- **2026-10-11 — #246: unsupported lifecycle reports stop retrying until explicit request.** At implementation time Dispatch's outcome allowlist did not include `handed-off`; after misospace/dispatch#1226 merged, current Dispatch accepts this neutral result without PR-fix queue settlement. Courier still handles explicit unsupported-outcome responses from older or incompatible servers: it preserves truthful pending lifecycle intent, stops retrying only that typed case, and allows an operator to request another attempt with a new bounded annotation token. Transient source errors still retry as before.
 - **2026-10-09 — #246: a resolve-issue run hands off a published PR with stable
   red checks.** Supersedes the resolve-issue half of the 2026-10-06 decision
   above: a resolve-issue run sat in `Verifying` indefinitely on red CI, waiting
@@ -1764,10 +1765,11 @@ was superseded.
   duplicate is sent; if it remains unsupported, only its token is settled, so a
   newer annotation remains eligible for the next reconcile. A superseded report
   is marked Unknown for support, not accepted. The same idempotency key is reused.
-  Dispatch currently rejects `handed-off`
-  with HTTP 400; Courier recognizes only its documented `Invalid outcome. Must
-  be one of:` response as unsupported. Other 400s and 5xx errors remain
-  retryable; this conservative match may not classify future error formats.
+  Dispatch accepts `handed-off` as a neutral task-report outcome since
+  misospace/dispatch#1226; its handler records the handoff without settling the
+  PR-fix queue. Courier retains the documented invalid-outcome 400 classifier
+  for older or incompatible Dispatch servers; unrelated 400s and 5xx errors
+  remain retryable. The classifier may not recognize future error formats.
   The report remains truthful and source-neutral; no source `State` transition
   is published. Fix-pr's immediate red path (`Failed` plus a
   retryable failed report) and the missing/draft-PR path (`NeedsHuman`) are
