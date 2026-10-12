@@ -67,6 +67,24 @@ func isAllowlistedPodReason(reason string) bool {
 	return ok
 }
 
+func isInfraContainerReason(reason string) bool {
+	switch reason {
+	case "OOMKilled", "ContainerStatusUnknown", "Evicted", "DeadlineExceeded", "Preempt":
+		return true
+	default:
+		return false
+	}
+}
+
+func isInfraPodReason(reason string) bool {
+	switch reason {
+	case "Evicted", "NodeAffinity", "NodeLost", "Unschedulable", "UnexpectedAdmissionError", "ContainerStatusUnknown":
+		return true
+	default:
+		return false
+	}
+}
+
 // boundedContainerTerminationReason returns an allowlisted kubelet
 // `Terminated.Reason` value, hard-capped at terminalContainerReasonBytes so the
 // persisted `Container.TerminationReason` cannot exceed the CRD's
@@ -272,25 +290,17 @@ func coordinatorContainerDiagnostic(pod *corev1.Pod) *courierv1alpha1.TerminalCo
 	return diagnostic
 }
 
-// kubernetesFailureEvidence reports whether the operator has evidence the
-// pod's failure is at the Kubernetes or container layer rather than in the
-// executor. A runtime-written state reason on the allowlist (kubelet
-// `Terminated.Reason` or pod `Status.Reason`) is Kubernetes-level evidence
-// when no valid executor handoff contradicts it: the same allowlist the
-// reason builder applies governs the classifier, so the operator's durable
-// reason and the diagnostic's category stay in lockstep. A pod that failed
-// without ever recording a terminated container state, and has no valid
-// handoff, is indistinguishable from a Kubernetes-level loss: the kubelet
-// never reported a coordinator exit, so no model outcome can be inferred.
+// kubernetesFailureEvidence reports causal Kubernetes/container failures,
+// independently of the broader allowlist used only to safely display reasons.
 func kubernetesFailureEvidence(pod *corev1.Pod, handoffValid bool) bool {
 	if pod == nil {
 		return true
 	}
 	if !handoffValid {
-		if kubeletContainerReason(pod) != "" {
+		if isInfraContainerReason(kubeletContainerReason(pod)) {
 			return true
 		}
-		if isAllowlistedPodReason(strings.TrimSpace(pod.Status.Reason)) {
+		if isInfraPodReason(strings.TrimSpace(pod.Status.Reason)) {
 			return true
 		}
 	}

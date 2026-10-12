@@ -22,12 +22,14 @@ failure after the pod needed to diagnose them is gone.
 | `unknown` | Evidence was missing or ambiguous. The operator never invents a cause. |
 
 Classification uses the strongest available evidence: a concrete category the
-executor emitted in its handoff wins; otherwise Kubernetes/container failure
-evidence (a runtime-written kubelet `Terminated.Reason` or pod `Status.Reason`
-on the allowlist, a `PodFailed` with no recorded terminated state and no valid
-handoff, or a missing pod); otherwise a declared decision or external block;
-otherwise a non-zero exit with no valid handoff is `executor-crash`; otherwise
-`unknown`.
+executor emitted in its handoff wins; otherwise causal Kubernetes/container
+failure evidence (`OOMKilled`, `ContainerStatusUnknown`, authoritative eviction,
+scheduling, or node-loss reasons; a `PodFailed` with no recorded terminated
+state and no valid handoff; or a missing pod); otherwise a declared decision
+or external block; otherwise a non-zero exit with no valid handoff is
+`executor-crash`; otherwise `unknown`. `Error`, `Completed`, and `Shutdown` remain safe to display but do
+not by themselves establish an infrastructure cause. The exact causal subsets
+are maintained separately from the broader display allowlists in the operator.
 
 ## Inspecting a run
 

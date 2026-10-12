@@ -897,12 +897,15 @@ evidence is a separate bundle pipeline and is not a substitute.
 The executor emits a machine-readable `category` in its `COURIER_TERMINATION`
 handoff; the operator classifies from the strongest available evidence and
 never invents a cause. A concrete executor category wins; otherwise
-Kubernetes/container failure evidence — a runtime-written kubelet
-`Terminated.Reason` or pod `Status.Reason` on the allowlist (the same
-allowlist the reason builder uses), a `PodFailed` with no recorded
-terminated state and no valid handoff, or a missing pod; otherwise a
-declared `needs_decision`/`blocked_external`; otherwise a non-zero exit
-with no valid handoff is `executor-crash`; otherwise `unknown`. Missing or
+causal Kubernetes/container failure evidence (`OOMKilled`,
+`ContainerStatusUnknown`, authoritative eviction, scheduling, or node-loss
+reasons; a `PodFailed` with no recorded terminated state and no valid handoff;
+or a missing pod); otherwise a declared `needs_decision`/`blocked_external`;
+otherwise a non-zero exit with no valid handoff is `executor-crash`; otherwise
+`unknown`. Display allowlists for kubelet/pod reasons are broader than this
+evidence predicate: `Error` and `Completed` are safe to retain for inspection,
+but do not alone establish infrastructure failure; pod reason `Shutdown` is
+display-only as well. Missing or
 ambiguous evidence is `unknown`. Categories: `executor-crash`,
 `model-transport-error`, `continuation-exhaustion`, `verifier-rejection`,
 `kubernetes-failure`, `needs-decision`, `blocked-external`, `unknown`.
