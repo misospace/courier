@@ -215,6 +215,162 @@ func TestRunnerExclusionOmitsBlockedExternalRuns(t *testing.T) {
 	}
 }
 
+// A blocked run whose terminal lifecycle report was published offers its work
+// identity again: if the source re-offers it, discovery supersedes the old run
+// and creates a fresh one in the same poll.
+func TestRunnerSupersedesPublishedBlockedExternalRun(t *testing.T) {
+	lane := testLane()
+	lane.Spec.Concurrency = 2
+	blocked := &courierv1alpha1.CoderRun{
+		ObjectMeta: metav1.ObjectMeta{Name: runName("dispatch", "opaque/generation-7"), Namespace: "courier"},
+		Spec:       courierv1alpha1.CoderRunSpec{Source: "dispatch", WorkItemID: "opaque/generation-7", Mode: courierv1alpha1.ModeFixPR, Repo: "acme/widgets", Ref: 42, Lane: "local"},
+		Status: courierv1alpha1.CoderRunStatus{
+			Phase: courierv1alpha1.PhaseBlockedExternal,
+			Conditions: []metav1.Condition{{
+				Type:               lifecycleReportedCondition,
+				Status:             metav1.ConditionTrue,
+				Reason:             "Published",
+				LastTransitionTime: metav1.Now(),
+			}},
+		},
+	}
+	adapter := &testAdapter{items: []WorkItem{{ID: "opaque/generation-7", Mode: "fix-pr", Repo: "acme/widgets", Ref: 42}}}
+	kubeClient := newTestClient(t, lane, blocked)
+	runner := NewRunner(kubeClient, adapter, RunnerConfig{Source: "dispatch", LaneProfile: "local", Namespace: "courier"})
+	if err := runner.Poll(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	var runs courierv1alpha1.CoderRunList
+	if err := kubeClient.List(context.Background(), &runs, client.InNamespace("courier")); err != nil {
+		t.Fatal(err)
+	}
+	if len(runs.Items) != 1 {
+		t.Fatalf("runs = %#v, want the blocked run superseded by exactly one fresh run", runs.Items)
+	}
+	if runs.Items[0].Name != runName("dispatch", "opaque/generation-7") {
+		t.Fatalf("fresh run name = %q, want the canonical name", runs.Items[0].Name)
+	}
+	if runs.Items[0].Status.Phase != "" {
+		t.Fatalf("fresh run phase = %q, want an empty phase", runs.Items[0].Status.Phase)
+	}
+	if runs.Items[0].Spec.WorkItemID != "opaque/generation-7" {
+		t.Fatalf("fresh run workItemID = %q, want opaque/generation-7", runs.Items[0].Spec.WorkItemID)
+	}
+}
+
+// A blocked run whose lifecycle report is still pending keeps suppressing its
+// identity, even when the source re-offers it.
+func TestRunnerKeepsPendingBlockedExternalRunSuppressed(t *testing.T) {
+	lane := testLane()
+	lane.Spec.Concurrency = 2
+	blocked := &courierv1alpha1.CoderRun{
+		ObjectMeta: metav1.ObjectMeta{Name: runName("dispatch", "opaque/generation-7"), Namespace: "courier"},
+		Spec:       courierv1alpha1.CoderRunSpec{Source: "dispatch", WorkItemID: "opaque/generation-7", Mode: courierv1alpha1.ModeFixPR, Repo: "acme/widgets", Ref: 42, Lane: "local"},
+		Status: courierv1alpha1.CoderRunStatus{
+			Phase: courierv1alpha1.PhaseBlockedExternal,
+			Conditions: []metav1.Condition{{
+				Type:               lifecycleReportedCondition,
+				Status:             metav1.ConditionFalse,
+				Reason:             "Pending",
+				LastTransitionTime: metav1.Now(),
+			}},
+		},
+	}
+	adapter := &testAdapter{items: []WorkItem{{ID: "opaque/generation-7", Mode: "fix-pr", Repo: "acme/widgets", Ref: 42}}}
+	kubeClient := newTestClient(t, lane, blocked)
+	runner := NewRunner(kubeClient, adapter, RunnerConfig{Source: "dispatch", LaneProfile: "local", Namespace: "courier"})
+	if err := runner.Poll(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	var runs courierv1alpha1.CoderRunList
+	if err := kubeClient.List(context.Background(), &runs, client.InNamespace("courier")); err != nil {
+		t.Fatal(err)
+	}
+	if len(runs.Items) != 1 {
+		t.Fatalf("runs = %#v, want the pending blocked run kept (no delete, no create)", runs.Items)
+	}
+	if runs.Items[0].Status.Phase != courierv1alpha1.PhaseBlockedExternal {
+		t.Fatalf("run phase = %q, want the original blocked run untouched", runs.Items[0].Status.Phase)
+	}
+}
+
+// A published blocked run that the source does not re-offer is left in place.
+func TestRunnerLeavesUnofferedPublishedBlockedExternalRun(t *testing.T) {
+	lane := testLane()
+	lane.Spec.Concurrency = 2
+	blocked := &courierv1alpha1.CoderRun{
+		ObjectMeta: metav1.ObjectMeta{Name: runName("dispatch", "opaque/generation-7"), Namespace: "courier"},
+		Spec:       courierv1alpha1.CoderRunSpec{Source: "dispatch", WorkItemID: "opaque/generation-7", Mode: courierv1alpha1.ModeFixPR, Repo: "acme/widgets", Ref: 42, Lane: "local"},
+		Status: courierv1alpha1.CoderRunStatus{
+			Phase: courierv1alpha1.PhaseBlockedExternal,
+			Conditions: []metav1.Condition{{
+				Type:               lifecycleReportedCondition,
+				Status:             metav1.ConditionTrue,
+				Reason:             "Published",
+				LastTransitionTime: metav1.Now(),
+			}},
+		},
+	}
+	adapter := &testAdapter{items: []WorkItem{{ID: "opaque/generation-8", Mode: "fix-pr", Repo: "acme/widgets", Ref: 42}}}
+	kubeClient := newTestClient(t, lane, blocked)
+	runner := NewRunner(kubeClient, adapter, RunnerConfig{Source: "dispatch", LaneProfile: "local", Namespace: "courier"})
+	if err := runner.Poll(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	var runs courierv1alpha1.CoderRunList
+	if err := kubeClient.List(context.Background(), &runs, client.InNamespace("courier")); err != nil {
+		t.Fatal(err)
+	}
+	if len(runs.Items) != 2 {
+		t.Fatalf("runs = %#v, want the published blocked run plus one run for the new identity", runs.Items)
+	}
+	kept := false
+	for _, run := range runs.Items {
+		if run.Spec.WorkItemID == "opaque/generation-7" && run.Status.Phase == courierv1alpha1.PhaseBlockedExternal {
+			kept = true
+		}
+	}
+	if !kept {
+		t.Fatal("published blocked run was deleted although the source did not offer it")
+	}
+}
+
+// Supersede is limited to blocked runs: a published run in a retained phase
+// (the #263 duty) still suppresses its identity and is never deleted.
+func TestRunnerKeepsPublishedAwaitingReviewRunSuppressed(t *testing.T) {
+	lane := testLane()
+	lane.Spec.Concurrency = 2
+	retained := &courierv1alpha1.CoderRun{
+		ObjectMeta: metav1.ObjectMeta{Name: runName("dispatch", "opaque/generation-7"), Namespace: "courier"},
+		Spec:       courierv1alpha1.CoderRunSpec{Source: "dispatch", WorkItemID: "opaque/generation-7", Mode: courierv1alpha1.ModeFixPR, Repo: "acme/widgets", Ref: 42, Lane: "local"},
+		Status: courierv1alpha1.CoderRunStatus{
+			Phase: courierv1alpha1.PhaseAwaitingReview,
+			Conditions: []metav1.Condition{{
+				Type:               lifecycleReportedCondition,
+				Status:             metav1.ConditionTrue,
+				Reason:             "Published",
+				LastTransitionTime: metav1.Now(),
+			}},
+		},
+	}
+	adapter := &testAdapter{items: []WorkItem{{ID: "opaque/generation-7", Mode: "fix-pr", Repo: "acme/widgets", Ref: 42}}}
+	kubeClient := newTestClient(t, lane, retained)
+	runner := NewRunner(kubeClient, adapter, RunnerConfig{Source: "dispatch", LaneProfile: "local", Namespace: "courier"})
+	if err := runner.Poll(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	var runs courierv1alpha1.CoderRunList
+	if err := kubeClient.List(context.Background(), &runs, client.InNamespace("courier")); err != nil {
+		t.Fatal(err)
+	}
+	if len(runs.Items) != 1 {
+		t.Fatalf("runs = %#v, want the published awaiting-review run kept, not superseded", runs.Items)
+	}
+	if runs.Items[0].Status.Phase != courierv1alpha1.PhaseAwaitingReview {
+		t.Fatalf("run phase = %q, want the original awaiting-review run", runs.Items[0].Status.Phase)
+	}
+}
+
 func TestRunnerSkipsDiscoveryWhenPendingRunReservesLaneCapacity(t *testing.T) {
 	item := WorkItem{ID: "queue-item/generation-2", Mode: "fix-pr", Repo: "acme/widgets", Ref: 43}
 	localLane := testLane()

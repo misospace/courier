@@ -12,6 +12,7 @@ import (
 
 	courierv1alpha1 "github.com/misospace/courier/api/v1alpha1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	apimeta "k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
@@ -27,6 +28,10 @@ var (
 )
 
 const defaultPollInterval = 30 * time.Second
+
+// lifecycleReportedCondition mirrors the condition type the controller writes
+// on a run's status to track its terminal lifecycle report (internal/controller).
+const lifecycleReportedCondition = "LifecycleReported"
 
 // RunnerConfig controls one source discovery loop. LaneProfile, when set, is
 // the Courier LaneProfile assigned to every discovered item.
@@ -194,12 +199,25 @@ func (r *Runner) Poll(ctx context.Context) error {
 
 	existing := make(map[string]struct{}, len(runs.Items))
 	legacyIdentities := make(map[string]struct{})
+	// superseded holds same-source blocked runs whose lifecycle report is
+	// published: they suppress nothing, and if the source re-offers one,
+	// discovery supersedes the old run instead of rematerializing forever.
+	superseded := make(map[string]*courierv1alpha1.CoderRun)
 	for i := range runs.Items {
 		run := &runs.Items[i]
 		if strings.TrimSpace(run.Spec.WorkItemID) == "" {
 			continue
 		}
 		identity := r.identity(run.Spec.WorkItemID)
+		if run.Status.Phase == courierv1alpha1.PhaseBlockedExternal && lifecycleReportPublished(run) {
+			// A published blocked run offers its identity again, so it counts
+			// in neither dedupe map; a blocked run with a pending report keeps
+			// suppressing until the report lands.
+			if run.Spec.Source == r.Config.Source {
+				superseded[workKey(run.Spec.Source, identity)] = run
+			}
+			continue
+		}
 		if run.Spec.Source == r.Config.Source {
 			existing[workKey(run.Spec.Source, identity)] = struct{}{}
 		}
@@ -230,6 +248,16 @@ func (r *Runner) Poll(ctx context.Context) error {
 			continue
 		}
 		seen[key] = struct{}{}
+
+		if blocked, ok := superseded[key]; ok {
+			// The source re-offered a blocked run whose lifecycle report was
+			// published: supersede it, creating the fresh run below. Owned
+			// pods are garbage collected with the run.
+			if err := client.IgnoreNotFound(r.Delete(ctx, blocked)); err != nil {
+				return fmt.Errorf("delete superseded CoderRun %s: %w", blocked.Name, err)
+			}
+			log.FromContext(ctx).Info("superseding blocked CoderRun", "coderRun", blocked.Name, "workItemID", item.ID)
+		}
 
 		spec := item.Spec(r.Config.Source)
 		if strings.TrimSpace(r.Config.LaneProfile) != "" {
@@ -288,6 +316,14 @@ func (r *Runner) identity(workItemID string) string {
 		}
 	}
 	return workItemID
+}
+
+// lifecycleReportPublished reports whether the run's terminal lifecycle report
+// has been published: the LifecycleReported condition exists with a True
+// status. Both the Published and Superseded reasons count.
+func lifecycleReportPublished(run *courierv1alpha1.CoderRun) bool {
+	cond := apimeta.FindStatusCondition(run.Status.Conditions, lifecycleReportedCondition)
+	return cond != nil && cond.Status == metav1.ConditionTrue
 }
 
 // laneCapacityReservations conservatively counts empty-phase and Pending runs as
