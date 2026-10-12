@@ -138,7 +138,32 @@ func (r *Runner) Poll(ctx context.Context) error {
 		r.laneAtCapacity = false
 	}
 
-	items, err := r.Adapter.Discover(ctx)
+	exclusions := make([]WorkItem, 0, len(runs.Items))
+	for i := range runs.Items {
+		run := &runs.Items[i]
+		if strings.TrimSpace(run.Spec.WorkItemID) == "" {
+			continue
+		}
+		retainedSource := run.Spec.Source == r.Config.Source
+		if r.Config.Source == "dispatch" {
+			retainedSource = retainedSource || run.Spec.Source == "dispatch" || strings.HasPrefix(run.Spec.Source, "dispatch:")
+		}
+		if retainedSource {
+			exclusions = append(exclusions, WorkItem{
+				ID:   run.Spec.WorkItemID,
+				Mode: string(run.Spec.Mode),
+				Repo: run.Spec.Repo,
+				Ref:  run.Spec.Ref,
+			})
+		}
+	}
+	var items []WorkItem
+	var err error
+	if excluder, ok := r.Adapter.(DiscoveryExcluder); ok {
+		items, err = excluder.DiscoverExcluding(ctx, exclusions)
+	} else {
+		items, err = r.Adapter.Discover(ctx)
+	}
 	if err != nil {
 		return err
 	}

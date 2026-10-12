@@ -1214,8 +1214,16 @@ execution capacity. The gate uses one pre-discovery list snapshot, not an atomic
 capacity lease, and checks only once per poll; stale reads or a source returning a
 batch may still materialize work beyond available slots. It also cannot make
 Dispatch hide an already-discovered Pending head from a free sibling profile;
-that needs Dispatch-side queue exclusion. While discovery is paused, Dispatch
-`next-task` and stale-item bookkeeping are deferred until a later poll.
+that needs Dispatch-side queue exclusion. Where supported, discovery passes
+retained same-source work IDs as opaque exclusions when the Dispatch client is
+explicitly opted in; exclusion support defaults off and must be enabled only
+after deployment has confirmed the Dispatch contract. Enabled requests are
+bounded to 32 unique valid entries of 300 characters each, and every response
+must acknowledge `prFixExclusions.version: 1` before either a task or idle result
+is processed. Missing or malformed acknowledgements fail closed without retry or
+side effects. Exclusions are dedupe hints, not claims or ownership. While
+discovery is paused, Dispatch `next-task` and stale-item bookkeeping are
+deferred until a later poll.
 
 ### Dispatch follow-up attempts (#98)
 
@@ -1408,6 +1416,17 @@ named items remain unresolved and must not be described as production-ready:
 
 ## Decisions
 
+- **2026-10-11 — #263: exclude retained PR-fix generations before Dispatch selection.**
+  The optional source-neutral discovery-with-exclusions capability passes
+  retained WorkItems without decoding their opaque IDs in core. Dispatch
+  translates only valid queue-backed descriptors with positive generations into
+  at most 32 unique repeated `exclude_pr_fix` values, canonicalizing
+  repositories before wire encoding. The server applies them before next-task
+  side effects and matches exact generations; explicitly opted-in clients require
+  a version-1 acknowledgment before processing any response. Exclusions default
+  off until deployment support is confirmed. Legacy linked-PR identities remain
+  deduped in Courier but are not assigned invented generations. Exclusions are
+  dedupe hints, not claims or ownership. (#263; Dispatch #1227)
 - **2026-10-10 — #248: authoritative source-issue linkage is enforced in
   both publication paths against one shared behavioral truth table.**
   Resolved-issue PR bodies must carry a supported closing-keyword

@@ -125,6 +125,12 @@ type WorkIdentifier interface {
 	WorkIdentity(workItemID string) string
 }
 
+// DiscoveryExcluder optionally discovers work while excluding retained items.
+// Exclusions remain opaque to the source-neutral runner.
+type DiscoveryExcluder interface {
+	DiscoverExcluding(context.Context, []WorkItem) ([]WorkItem, error)
+}
+
 // PreLauncher optionally revalidates claimed work immediately before launch.
 // ErrStaleWork means the claim was released because the work no longer needs a
 // coordinator; other errors leave the run retryable.
