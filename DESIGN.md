@@ -1182,10 +1182,10 @@ there is no delete verb because active runs reference lanes. (#73)
   **HandedOff** is the separate terminal phase for a published resolve-issue PR
   whose stable red checks the source will repair; it is not a success, so it is
   not reaped like **Done** and does not publish `in-review`.
-- **Reap:** Done runs are deleted (checkpoint dies with the CR). NeedsHuman and
-  HandedOff runs are kept for inspection and deleted on request. Zero standing
-  footprint between runs — a strict improvement over Foreman's ownerRef-less
-  audit ConfigMaps, which require an external sweeper.
+- **Reap:** Done runs are deleted after their window; NeedsHuman and Failed runs
+  are reaped after the seven-day default window and never while a lifecycle report
+  is pending. HandedOff is still kept (not reaped) and deleted on request; see
+  [Terminal retention and closed-unmerged PRs](#terminal-retention-and-closed-unmerged-prs-251).
 
 **Terminalization writes the run's own phase before it reports to the source.**
 A rejected or failed source report never holds a run in `Running`: the phase is
@@ -1196,6 +1196,24 @@ this attempt was superseded by a newer generation of the same work, so the repor
 is dropped rather than retried (the newer generation belongs to another run) and
 the run still terminalizes; a transient report failure leaves the run in its
 terminal phase with the report retried on a later reconcile. (#178)
+
+## Terminal retention and closed-unmerged PRs (#251)
+
+**The leak:** `reapDone` (`internal/controller/reap.go`) deletes only resolved `Done` runs after a default five minutes. `AwaitingReview`, `HandedOff`, `NeedsHuman`, and `Failed` are never reaped: `Reconcile` (`internal/controller/coderun_controller.go`) revisits a terminal phase only to retry a pending lifecycle report and otherwise returns without a timer, and the controller never re-observes a PR after a run settles `AwaitingReview`. The #179 dogfood deployment left 26 `AwaitingReview`, 6 `NeedsHuman`, 1 `Failed`, and 17 retained coordinator pods. `source.Runner.Poll` (`internal/source/runner.go`) lists every CoderRun on every poll to build its dedupe set, so the list grows without bound.
+
+**Retention clock:** Retention is a bounded inspection window keyed to a durable terminal marker. `FinishedAt` is written once by `transitionTerminal` for every terminal phase and never moved, so it is the retention clock for `NeedsHuman` and `Failed` — never `CreationTimestamp`, which can predate the terminal state by far longer than the window. `Done` keeps its existing separate `courier.misospace.dev/done-at` annotation (`doneAtAnnotation`) because a `Done` transition can occur long after `FinishedAt`. A missing or malformed marker starts a fresh window and never deletes on the same pass; a future-dated marker (clock skew) is capped at the window and never deletes early — the same fail-safe rules `reapDone` already applies. `AwaitingReview` is deliberately outside this window: it is a success ending awaiting a human merge, not a terminal failure, so it is kept until the world moves it — #250 resolves a merge to `Done`, and this design resolves a closed-unmerged PR to `NeedsHuman`; only then does a retention window start. A PR that stays open keeps its run, which is the run's live-work record and the human gate.
+
+**Defaults and deployment knob:** `Done` stays five minutes. `Failed` and `NeedsHuman` default to 168 hours (seven days). Expose three manager flags and a chart `retention:` block (`done`, `failed`, `needsHuman`) rendered into `controllers.main.containers.main.args` like the existing `evidence:` block. `DoneRetention` already exists on `CoderRunReconciler`; add `FailedRetention` and `NeedsHumanRetention` fields with zero-falls-back-to-default semantics matching `doneRetention()`.
+
+**Closed-unmerged PRs:** A run terminalizes as `NeedsHuman` with a precise reason; no new CRD phase. Today a `Verifying` run whose PR is closed without merge observes an empty `PRObservation` and transitions to `NeedsHuman` (#146); the gap is a PR closed after the run already settled `AwaitingReview`, which is never observed. The slow, bounded world observation added for #250 (merged -> `Done`) classifies the run's exact recorded PR identity as: merged -> `Done` (existing resolve + reap); open -> stay `AwaitingReview`; closed without merge -> `NeedsHuman` with a new `PullRequestClosedUnmerged` condition (`Status=True`, reason `ClosedUnmerged`) whose message carries the recorded PR identity, under the existing needs-human source policy (a `blocked` lifecycle report; the source parks the item and owns retry/escalation); absent, ambiguous, or a transient forge error -> no transition, stay `AwaitingReview`, and retry the observation later. A missing or unreadable PR is never treated as closed. No new CRD phase: `Done` would falsely attest shipped work, and a bespoke `Closed` phase is unnecessary because an existing non-successful phase already covers it. Implementation hook: the GitHub observer (`internal/github/observer.go`) currently collapses closed and never-opened into "no open PR" (`PRObservation{}`), so it must expose an explicit closed-unmerged signal on `PRObservation` for the controller to distinguish them.
+
+**Deletion gates:** A terminal run is deleted only when all hold: (a) phase is `Done` (existing path) or `Failed`/`NeedsHuman` past its window; (b) `lifecycleReportPending(run)` is false — a report-pending CoderRun is the only durable retry intent and is never reaped; a published or superseded report satisfies this, and a superseded report means a newer generation owns the item; (c) the source report reached settlement: for `NeedsHuman` and non-CI `Failed` that is a `blocked` transition, which parks the source item so `source.Runner.Poll` will not re-offer it; for `Done`, `Resolve` (source `done`) precedes the clock; (d) owned resources: evidence Secrets and coordinator pods are owner-referenced to the run and are garbage-collected with it, so the retention window is also the evidence inspection window. Operators who need longer raise the TTL before it expires or retrieve evidence out-of-band (label `courier.misospace.dev/evidence=<run>`). No separate evidence clock or sweeper is added; this aligns #198/#200/#202 without duplicating them.
+
+**No accidental resubmission:** The runner dedupes only against currently-existing CoderRuns. Reaping a `Failed`/`NeedsHuman` run whose source report is published is safe because the source, not the CoderRun, is the dedupe authority: the blocked report parks the item. If a source later re-offers the same identity (for example a human unblocks it), that is a new, intended dispatch that materializes a fresh CoderRun, not a duplicate of the reaped attempt. Deleting before the report is published is forbidden by gate (b). No automatic retry loop is added to fix retention; retry and escalation stay source-owned.
+
+**Covered cases:** controller restart (the clock is durable on the run, so a new process recomputes the remaining window); absent PR (no transition, no clock start); transient source/forge failure (no transition, no early reap); stale generation (a superseded report counts as published and the newer run dedupes the identity); re-discovery (after a reaped run, a source that still offers an already-blocked/resolved item does not recreate it).
+
+**Decomposition:** Two implementation children are settled here: (a) bounded retention for `Failed`/`NeedsHuman` (generalize the reaper, `FinishedAt` clock, flags, chart values); (b) closed-unmerged terminalization (observer closed-unmerged signal plus the `AwaitingReview` observation branch). Both build on #250's observation loop. The implementation must also retire the stale "terminal runs are never reaped" comments and assertions in `internal/controller/coderun_controller.go`, `internal/controller/secure_launcher.go`, and `internal/controller/reap.go` (and their tests), scoping them to `AwaitingReview` and `HandedOff`, and correct the `FinishedAt` doc comment in `api/v1alpha1/coderun_types.go` to include `HandedOff`. `HandedOff` retention and an independent evidence TTL are explicitly out of scope.
 
 ## Sources
 
@@ -1449,6 +1467,7 @@ named items remain unresolved and must not be described as production-ready:
 
 ## Decisions
 
+- **2026-10-12 — #251: terminal retention is a bounded inspection window keyed to `FinishedAt`; closed-unmerged PRs terminalize as `NeedsHuman` with a precise reason, not a new CRD phase.** Deletion requires a non-pending source report, so reaping never drops the only durable retry intent. The #250 observation loop handles the recorded PR identity: merged resolves to `Done`, closed-unmerged becomes `NeedsHuman`, and absent or ambiguous observations do not transition. This bounds retained runs without conflating closure with successful delivery and leaves retries and escalation source-owned. (#251, #179, #146, #250)
 - **2026-10-11 — #263: exclude retained PR-fix generations before Dispatch selection.**
   The optional source-neutral discovery-with-exclusions capability passes
   retained WorkItems without decoding their opaque IDs in core. Dispatch
