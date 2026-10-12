@@ -1,5 +1,26 @@
 # Changelog
 
+## [0.1.8](https://github.com/misospace/courier/compare/v0.1.7...v0.1.8) (2026-10-12)
+
+
+### Features
+
+* **controller:** retain terminal runtime diagnostics after pod cleanup ([#272](https://github.com/misospace/courier/issues/272)) ([#275](https://github.com/misospace/courier/issues/275)) ([59f9d42](https://github.com/misospace/courier/commit/59f9d4227023616e26d3746c9ebc043c5e0d43d4))
+* **executor:** capture failure evidence at gated moments ([#257](https://github.com/misospace/courier/issues/257)) ([2e379ae](https://github.com/misospace/courier/commit/2e379ae7aa2cbb95eb0c50241271870427fa7326)), closes [#198](https://github.com/misospace/courier/issues/198)
+* **helm:** update chart common (5.2.1 → 5.3.0) ([#266](https://github.com/misospace/courier/issues/266)) ([1c6a83c](https://github.com/misospace/courier/commit/1c6a83c31cc9a4a8cf8e6cd43c20439c8b7c3ba2))
+* **operator:** evidence intake listener, run-owned persistence, and RBAC ([#259](https://github.com/misospace/courier/issues/259)) ([7a16947](https://github.com/misospace/courier/commit/7a169477521bc293b739406e9ba4a2e0a3622867))
+
+
+### Bug Fixes
+
+* **ci:** include harness validation in images gate ([#214](https://github.com/misospace/courier/issues/214)) ([#279](https://github.com/misospace/courier/issues/279)) ([6662ec8](https://github.com/misospace/courier/commit/6662ec8c74ed284bab2db2097553e55432d8665a))
+* **controller:** hand off red resolve-issue PR checks ([#246](https://github.com/misospace/courier/issues/246)) ([#258](https://github.com/misospace/courier/issues/258)) ([737e8ca](https://github.com/misospace/courier/commit/737e8ca9fd7f1d608f236f308b1ef88e592e5287))
+* **controller:** stop misclassifying terminal outcomes ([#267](https://github.com/misospace/courier/issues/267)) ([#271](https://github.com/misospace/courier/issues/271)) ([a3254aa](https://github.com/misospace/courier/commit/a3254aa58f5aa0ecb54a8b8a62516c260464ecbf))
+* **deps:** update module github.com/prometheus/common (v0.72.0 → v0.72.1) ([#268](https://github.com/misospace/courier/issues/268)) ([6db4cd8](https://github.com/misospace/courier/commit/6db4cd8247da240530fc5d52f1fbf3712202e8f6))
+* **dispatch:** skip consumed PR-fix generations during discovery ([#273](https://github.com/misospace/courier/issues/273)) ([dee8755](https://github.com/misospace/courier/commit/dee8755c146ea7580e430af542bdea68a24ce9a5))
+* **operator:** fence worker and broker on control-pod loss detection ([#265](https://github.com/misospace/courier/issues/265)) ([ba7d0c6](https://github.com/misospace/courier/commit/ba7d0c62d861299891562283fda675dbb6ece685))
+* **pr-authoring:** require authoritative source-issue linkage before handoff ([#262](https://github.com/misospace/courier/issues/262)) ([f1b263f](https://github.com/misospace/courier/commit/f1b263f498133e36886044dd66ede71061d3eb23))
+
 ## [0.1.7](https://github.com/misospace/courier/compare/v0.1.6...v0.1.7) (2026-10-10)
 
 
