@@ -1571,6 +1571,33 @@ named items remain unresolved and must not be described as production-ready:
 
 ## Decisions
 
+- **2026-10-12 — #249: one executor-neutral acceptance-criterion evidence
+  contract is enforced in both publication paths against a revision-pinned
+  trusted snapshot of the source issue.** Admission reads the source issue
+  through a trusted forge read (today nothing trusted reads it — the model
+  does, through forge tools) and pins its acceptance criteria: ordinal IDs,
+  per-criterion digests, and a set digest over identity plus ordered
+  criteria, so no model input can add, delete, or rewrite the contract. A
+  resolve-issue PR body carries one machine-readable evidence block — one
+  row per pinned criterion, status from a closed vocabulary
+  (`implementation-evidence`, `regression-check`, `manual-verification`,
+  `not-implemented`, `unknown`) — and the validator enforces pin
+  integrity, exact ID coverage, per-status reference shape
+  (regression-check must cite a file path or check URL), and coverage
+  honesty: `full` is derived — every pinned criterion regression-checked
+  with a citable location — and the claim must match. The contract
+  explicitly does **not** claim that a cited test semantically enforces
+  its criterion; that audit stays with the reviewer. Unverified criteria
+  remain visible legal records that forfeit the full-verification claim;
+  missing or malformed evidence is repairable under the same #170 budget
+  as #248's linkage and otherwise terminates `NeedsHuman` as an explicit
+  incomplete handoff. Both paths consume the same pure functions in
+  `internal/broker/criteria.go`; the truth table in
+  `internal/broker/criteria_test.go` pins the miso-gallery#502/#505
+  dogfood failure. Implementation is three bounded tickets (#280
+  admission pinning, #281 native boundary, #282 legacy boundary); no new
+  service, no schema migration beyond the additive policy pin, no LLM
+  proof system. (#249, #204, #248)
 - **2026-10-12 — #251: terminal retention is a bounded inspection window keyed to per-phase annotations (`courier.misospace.dev/needs-human-at`, `courier.misospace.dev/failed-at`), not `FinishedAt`; closed-unmerged PRs terminalize as `NeedsHuman` with a precise reason, not a new CRD phase.** `FinishedAt` records execution end and stays immutable on later transitions, so a months-late `AwaitingReview → NeedsHuman` close-unmerged starts a fresh window at the close-unmerged transition rather than inheriting a zero-length residue. Deletion requires a **positive, settled** `LifecycleReported` condition (`Status=True` and a permitted reason); missing/`Unknown`/`False` conditions do not satisfy the gate, so a legacy or partially-upgraded terminal run with no published/superseded report proof is never reaped. The #250 observation loop handles the recorded PR identity: merged resolves to `Done`, closed-unmerged becomes `NeedsHuman`, and absent or ambiguous observations do not transition. This bounds retained runs without conflating closure with successful delivery and leaves retries and escalation source-owned. (#251, #179, #146, #250, #276, #277)
 - **2026-10-12 — #267 review: a report must say what the run actually did, and a
   blocked run must be able to wake.** Two blockers on the merged #267 behavior,

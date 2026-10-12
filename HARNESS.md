@@ -475,6 +475,158 @@ paths share acceptance, not implementation.
   repair-message tests assert the same vocabulary, so a
   regression in the validator fails both paths simultaneously.
 
+### Acceptance-criterion evidence contract (#249)
+
+Linkage (#248) guarantees the PR *names* the trusted source issue; it says
+nothing about whether the PR's completion claim answers the issue's
+acceptance criteria. The dogfood failure that split this contract off #204 —
+misospace/miso-gallery#502/#505 — omitted the built-container endpoint
+criterion from the PR body while presenting a Dockerfile-shape check as if
+it demonstrated the full requirement, and declared a manually-inspected
+`.dockerignore` invariant as a maintained one while noting no test enforced
+it. One executor-neutral criterion-evidence contract closes that class in
+both active paths, with the same shape as linkage: a pure validator in
+`internal/broker/criteria.go`, two consumption boundaries, one shared truth
+table in `internal/broker/criteria_test.go`.
+
+**Identification and revision pinning.** Today nothing trusted ever reads
+the source issue body — the model reads it through forge tools, which is
+exactly why the completion claim cannot be checked against it. Admission
+therefore reads the issue through the registered provider's typed read (a
+new trusted operator-side capability; the dispatch task and the immutable
+`CoderRun` spec already pin which issue, never the model) and runs
+`ExtractCriteria`, a pure, deterministic parser: criteria are the top-level
+bullet items of the issue's single `Acceptance` section (`## Acceptance`,
+`**Acceptance:**`, or `Acceptance:`; task-list checkboxes accepted), ending
+at the next heading-like line. Each criterion gets an ordinal ID (`AC-1`,
+`AC-2`, …) and a sha256 digest of its normalized text; the set digest
+covers the trusted issue identity plus every criterion digest in order.
+No recognizable section, or a section with no bullets, pins an **empty
+set** — a legitimate pin: the evidence block is then not required and
+linkage remains the only PR-body contract. More than one Acceptance
+section, more than 32 criteria, or a criterion over 512 bytes fails
+extraction fail-closed at admission (`NeedsHuman` naming why): an
+unpinnable contract must not become an unchecked one, and an over-bound
+set is never silently truncated. The pinned set is **revision-pinned by
+content**: an edit to the issue after admission does not add, remove, or
+rewrite this run's criteria — a human changing requirements re-queues the
+work through admission; the model never supplies criteria at any point.
+
+**Carriage to the boundary.** Native: the pinned set joins the immutable
+run publication policy (`Status.PublicationPolicy`), resolved at admission
+and verified by the broker binding like every other policy field. Legacy:
+the operator projects the identical set into the executor pod as trusted
+environment (`COURIER_CRITERIA`, bounded JSON: issue identity, criteria
+with IDs/texts/digests, set digest) beside `COURIER_REPO`/`COURIER_REF`.
+Legacy pod visibility is fine — the set is public issue text; the contract
+is that the *validator's* comparison target is operator-authored, and the
+model cannot change it.
+
+**Data shape.** The PR body carries one machine-readable block — the only
+machine-read coverage surface; prose outside it is not a coverage claim:
+
+```
+courier-criteria:v1 source=<owner/name>#<n> set=sha256:<64hex> coverage=<full|partial>
+
+- AC-<n> sha256:<64hex>: <status> - <reference>
+```
+
+The header names the trusted source identity and the pinned set digest;
+each row names the criterion's pinned digest, one status from a closed
+vocabulary — `implementation-evidence`, `regression-check`,
+`manual-verification`, `not-implemented`, `unknown` — and a bounded
+(≤400-byte) reference. `regression-check` and `implementation-evidence`
+must cite at least one file path or check URL; `manual-verification` and
+`not-implemented` must carry a non-empty note; `unknown` may be bare. A
+criterion's status says what *kind* of evidence exists, never that the
+evidence is semantically sufficient.
+
+**What the validator mechanically proves — and what it does not.**
+`ValidateCriterionEvidence(prBody, set)` enforces: exactly one block; the
+header's source and set digest equal the trusted pin (no model-authored
+criteria revision); every pinned criterion ID appears exactly once (no
+missing, added, duplicated, or unknown IDs); per-row digest agreement with
+the pin; the per-status reference shapes; and coverage honesty — `full` is
+*derived* (every pinned criterion present exactly once and recorded
+`regression-check` with a citable location) and the header's claim must
+match the derivation. That last rule is the mechanically caught form of
+"assert a weaker check as if it demonstrated the full requirement", and the
+reference shape rule is the mechanically caught form of "no test
+represented as regression-enforced". The validator **does not and must not
+claim** that a cited test actually fails when its criterion regresses:
+presence of a reference is traceability, not semantic proof. Whether
+`test_dockerfile_packages_assets` really detects an omitted COPY line is
+established by mutation evidence in the target repository and audited by
+the reviewer, who reads each criterion's citations next to the linked
+issue. Boundary implementations may additionally verify that cited *paths*
+exist in the proposed head (the legacy executor holds the run branch
+locally; the native engine may read the tree at the proposed OID) —
+existence is referential integrity, still not semantics. No component of
+this contract runs tests, interprets reference text, or grows an LLM proof
+system.
+
+**Unknown and unverified criteria.** A criterion recorded `unknown`,
+`not-implemented`, or `manual-verification` is a **legal, visible record**,
+not a repair trigger: forcing the model to keep working would constrain
+behavior the harness cannot judge. What it forfeits is the claim — derived
+coverage is `partial`, the run's outcome comment and telemetry carry the
+per-status counts and coverage, and the PR never presents itself as fully
+verified. Merge stays a human gate.
+
+**Missing or malformed evidence is repairable, then terminal.** A missing
+block, a missing criterion ID, a stale digest, an invented ID, a bad
+status shape, or a coverage lie is a *repairable* handoff defect: the
+native engine refuses the `CreatePullRequest` (or body update) with the
+structured `*CriteriaError` before any forge write; the legacy path asks
+the captured OpenCode session to repair the body under the **same** #170
+continuation budget as linkage — one combined repair instruction naming
+every violation (both contracts' failures, the trusted identity, the
+pinned criteria verbatim, the exact grammar, the PR number, the remaining
+budget), so one continuation can fix both. When the budget is exhausted,
+no session was captured, or the run is shutting down, the legacy path
+terminates `NeedsHuman` with reason `incomplete handoff: criterion
+evidence …` (category `verifier-rejection`), preserving the declared
+outcome tag exactly as the linkage plan does. A forge read failure during
+the legacy check is fail-closed exactly as #248's is. A run that never
+opened a PR passes vacuously — PR absence is the operator's world-check
+concern. An empty pinned set also passes vacuously.
+
+**Retry and idempotency.** Validation is pure over `(body, pinned set)`:
+native rejections happen before any write, so a corrected body is a fresh
+call with nothing to undo, and the existing duplicate-PR guard still
+precedes creation; legacy repairs go through the captured session (the
+executor never edits the PR itself), and each continuation re-reads the
+live PR body — the world wins over any cached read. A repair that changes
+nothing hits the existing no-progress fingerprint guard and terminates
+`NeedsHuman (looping)`. Repeated validation of the same body is a no-op.
+
+**Reviewer consumption.** The block renders as a plain list on the PR:
+each pinned criterion's status and citations sit next to the closing
+reference, so a reviewer audits per-criterion sufficiency — the judgment
+the validator explicitly does not make — in one place, and the coverage
+header is the one-glance completeness signal. The worker holds no
+authority to rewrite issue requirements: it cannot add criteria (unknown
+IDs refused), delete them (missing IDs refused), restate them (digests
+pinned), or upgrade its own claim past the derived coverage.
+
+**Shared truth table.** `internal/broker/criteria_test.go` pins the real
+dogfood material — the live miso-gallery#502 issue body and reconstructed
+stages of #505 — plus the mechanical rule table: the deficient handoff
+(no block), the partial block omitting the built-image endpoint criterion
+while claiming full, the overstated block adding a `.dockerignore`
+criterion as regression-enforced with no citable automation, the honest
+full record, and the honest partial record with manual verification.
+Revision-pin mutations (edit/reorder/add/delete change the set digest) and
+extraction grammar and bounds are covered there too. Both paths consume
+the same pure functions; divergent acceptance rules between the paths
+would be a correctness regression.
+
+The wiring is deliberately not in this design change: the admission
+snapshot (trusted issue read + pin, #280), native enforcement at
+`PolicyEngine.CreatePullRequest` (#281), and legacy enforcement at the
+handoff (#282) are each one bounded implementation issue. Until they land,
+the contract exists as the tested pure seam both paths will call.
+
 ### Git policy and publication (#118)
 
 The operator owns one immutable, run-UID-bound publication policy. It resolves
@@ -1105,6 +1257,15 @@ that separate reason is bounded and redacted before publication. Comment posting
 is best-effort: failures are logged as `outcome.comment` and do not change the
 run ending.
 
+The criterion-evidence contract (#249, §4) adds one classification: a
+Verifying handoff whose criterion evidence is missing or malformed beyond
+its continuation budget terminates `NeedsHuman` with an explicit
+`incomplete handoff` reason (`verifier-rejection` category) — the run does
+not hand off as complete. A handoff whose criteria are recorded but
+unverified (`manual-verification`, `not-implemented`, `unknown`) is **not**
+a failure: it proceeds with derived coverage `partial` surfaced in the
+outcome comment and telemetry, and never claims fully verified completion.
+
 The native harness adds an explicit result contract on top of the exit code:
 a structured terminal result (outcome + reason) written by trusted control
 before process exit. The operator classifies from that trusted evidence plus
@@ -1131,6 +1292,14 @@ is.
   referenced by any broker registration or secure run, because one legacy run
   otherwise defeats the isolation every secure run sharing that credential
   claims.
+- **Legacy compatibility of the PR-body contracts:** while OpenCode remains
+  the live runtime, the legacy executor enforces the same source-issue
+  linkage (#248) and criterion-evidence (#249) contracts as the native
+  broker, against the operator-projected trusted identity and pinned
+  criterion set, with one shared #170 continuation budget for repairs.
+  Native-only enforcement would leave today's running system exposed; the
+  legacy wiring is temporary and is removed with the executor, while the
+  pure validators and truth tables are shared forever.
 - **Phase 1:** establish the broker and typed policy APIs, but do not claim the
   existing OpenCode shim is secure merely by routing calls through a broker. It
   still cannot safely run model-controlled tools in the trusted harness pod or
@@ -1285,6 +1454,24 @@ and the acceptance tests below are satisfied.
 - **Failure semantics:** workload failure and infrastructure failure are
   distinguishable from trusted evidence; the operator's exit-code mapping
   follows DESIGN.md's exit contract.
+- **Criterion-evidence contract (§4, #249):** the shared truth table in
+  `internal/broker/criteria_test.go` pins the dogfood material — the live
+  miso-gallery#502 issue body pins exactly AC-1..AC-3 (its Evidence
+  section's bullets are not criteria); the deficient #505 handoff (no
+  block) fails with the missing-block sentinel naming the trusted issue
+  and set digest; the partial block omitting the built-image endpoint
+  criterion fails naming AC-2 and its `coverage=full` claim; the
+  overstated block adding a `.dockerignore` criterion recorded
+  regression-enforced without a citable location fails on the unknown ID,
+  the status shape, and the coverage lie together; the honest full record
+  passes; the honest partial record (manual verification) passes with
+  derived `partial`. Revision-pin mutations (edit/reorder/add/delete
+  criterion text) change the set digest and reject a stale block. These
+  fixtures prove the validator's decision table — pin integrity, exact
+  coverage, status/reference shape, coverage honesty — and deliberately
+  prove nothing about whether a cited test semantically enforces its
+  criterion: that audit belongs to the reviewer and, where demonstrated,
+  to mutation evidence in the target repository.
 
 ## 11. Open blockers
 
@@ -1326,6 +1513,15 @@ and the acceptance tests below are satisfied.
    deployment/control-plane configuration, not a `LaneProfile` field.
 6. Prove any OpenCode adapter's isolation and status guarantees before routing
    runs through it as secure; otherwise it remains legacy insecure mode.
+7. Settled in §4 (#249): the acceptance-criterion evidence contract —
+   trusted admission snapshot of the source issue, revision-pinned criterion
+   set, evidence-block grammar and closed status vocabulary, mechanical
+   completeness rules with their explicit non-claims (no semantic proof from
+   cited tests), and the shared native/legacy enforcement shape with one
+   bounded repair budget. Implementation is three bounded tickets — #280
+   (admission pinning), #281 (native boundary), #282 (legacy boundary) —
+   and until they land the contract exists as the tested pure seam in
+   `internal/broker/criteria.go` that both paths will call.
 
 ## 12. Threat model and issue gates
 
