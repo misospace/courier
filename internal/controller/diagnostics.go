@@ -15,6 +15,74 @@ import (
 const terminalDiagnosticReasonBytes = 1024
 const terminalDiagnosticReasonSuffix = "... [truncated]"
 const wedgedReapDiagnosticReason = "coordinator was reaped as wedged after no successful activity"
+const terminalContainerReasonBytes = 128
+
+// allowlistedContainerReasons is the small, closed set of kubelet
+// `ContainerStateTerminated.Reason` values that may enter the diagnostic.
+// The runtime writes these; arbitrary CRD or message content does not, so a
+// non-pattern-matching value carried in the kubelet's Terminated.Reason never
+// reaches the diagnostic. Standard values from the Kubernetes source
+// (k8s.io/kubernetes/pkg/kubelet/container/helpers.go and
+// k8s.io/api/core/v1/types.go); kubelets may write "Error" or
+// "ContainerStatusUnknown" when state cannot be determined.
+var allowlistedContainerReasons = map[string]struct{}{
+	"Completed":              {},
+	"Error":                  {},
+	"OOMKilled":              {},
+	"ContainerStatusUnknown": {},
+	"Evicted":                {},
+	"DeadlineExceeded":       {},
+	"Preempt":                {},
+}
+
+// allowlistedPodReasons is the small, closed set of `Pod.Status.Reason` values
+// that may enter the diagnostic. The runtime writes these values during
+// eviction, scheduling failure, node loss, or graceful shutdown. Other
+// reasons — including arbitrary freeform text a CRD or status writer might
+// include — never reach the diagnostic.
+var allowlistedPodReasons = map[string]struct{}{
+	"Evicted":                 {},
+	"NodeAffinity":            {},
+	"NodeLost":                {},
+	"Shutdown":                {},
+	"Unschedulable":           {},
+	"UnexpectedAdmissionError": {},
+	"Error":                   {},
+	"ContainerStatusUnknown":  {},
+}
+
+func isAllowlistedContainerReason(reason string) bool {
+	if reason == "" {
+		return false
+	}
+	_, ok := allowlistedContainerReasons[reason]
+	return ok
+}
+
+func isAllowlistedPodReason(reason string) bool {
+	if reason == "" {
+		return false
+	}
+	_, ok := allowlistedPodReasons[reason]
+	return ok
+}
+
+// boundedContainerTerminationReason returns an allowlisted kubelet
+// `Terminated.Reason` value, hard-capped at terminalContainerReasonBytes so the
+// persisted `Container.TerminationReason` cannot exceed the CRD's
+// `+kubebuilder:validation:MaxLength=128` and cause the API server to reject
+// the entire status patch (which would block terminalization and source
+// reporting). Values outside the allowlist are dropped.
+func boundedContainerTerminationReason(reason string) string {
+	reason = strings.TrimSpace(reason)
+	if !isAllowlistedContainerReason(reason) {
+		return ""
+	}
+	if len(reason) > terminalContainerReasonBytes {
+		return reason[:terminalContainerReasonBytes]
+	}
+	return reason
+}
 
 var terminalDiagnosticRedactor = courierlog.NewRedactor()
 
@@ -110,11 +178,11 @@ func categoryDiagnosticReason(category courierv1alpha1.TerminalDiagnosticCategor
 }
 
 // kubeletContainerReason returns the coordinator container's kubelet
-// Terminated.Reason, or "" when the container is not recorded as
-// terminated. The value is one of a small allowlisted set the runtime
-// itself writes (for example OOMKilled, Error, Completed,
-// ContainerStatusUnknown) and is bounded by Kubernetes to 128 bytes;
-// it is safe to fold into the operator-derived diagnostic reason.
+// `Terminated.Reason` when it is on the allowlist of runtime-written
+// values (for example `OOMKilled`, `Error`, `Completed`,
+// `ContainerStatusUnknown`); otherwise it returns `""`. The allowlist
+// ensures arbitrary or non-pattern-matching kubelet text cannot land on
+// the operator-derived diagnostic reason.
 func kubeletContainerReason(pod *corev1.Pod) string {
 	if pod == nil {
 		return ""
@@ -124,7 +192,11 @@ func kubeletContainerReason(pod *corev1.Pod) string {
 		if status.Name != coordinatorContainerName || status.State.Terminated == nil {
 			continue
 		}
-		return strings.TrimSpace(status.State.Terminated.Reason)
+		reason := strings.TrimSpace(status.State.Terminated.Reason)
+		if !isAllowlistedContainerReason(reason) {
+			return ""
+		}
+		return reason
 	}
 	return ""
 }
@@ -133,16 +205,18 @@ func kubeletContainerReason(pod *corev1.Pod) string {
 // entirely from operator-derived data: the category label, the kubelet's
 // allowlisted container and pod state reasons, and a small set of
 // operator-controlled override strings (wedge reap, pod loss). The
-// executor's freeform termination text is never an input. The result is
-// passed through boundedDiagnosticReason for the length cap and a
-// defensive pattern-redaction pass.
+// executor's freeform termination text is never an input, and the
+// Kubernetes-derived text is also constrained to the allowlist of values
+// the runtime itself writes (arbitrary kubelet or apiserver text is
+// dropped). The result is passed through boundedDiagnosticReason for the
+// length cap and a defensive pattern-redaction pass.
 func operatorDiagnosticReason(category courierv1alpha1.TerminalDiagnosticCategory, override string, pod *corev1.Pod) string {
 	parts := []string{categoryDiagnosticReason(category)}
 	if reason := kubeletContainerReason(pod); reason != "" {
 		parts = append(parts, "container: "+reason)
 	}
 	if pod != nil {
-		if reason := strings.TrimSpace(pod.Status.Reason); reason != "" {
+		if reason := strings.TrimSpace(pod.Status.Reason); isAllowlistedPodReason(reason) {
 			parts = append(parts, "pod: "+reason)
 		}
 	}
@@ -186,7 +260,12 @@ func coordinatorContainerDiagnostic(pod *corev1.Pod) *courierv1alpha1.TerminalCo
 		diagnostic.Image = status.Image
 		diagnostic.RestartCount = status.RestartCount
 		if status.State.Terminated != nil {
-			diagnostic.TerminationReason = status.State.Terminated.Reason
+			// Apply the same allowlist + 128-byte bound that the CRD
+			// promises: arbitrary or overlong kubelet text cannot persist on
+			// the durable status, and an overlong value cannot cause the
+			// API server to reject the terminal patch (which would block
+			// terminalization and source reporting).
+			diagnostic.TerminationReason = boundedContainerTerminationReason(status.State.Terminated.Reason)
 		}
 		break
 	}

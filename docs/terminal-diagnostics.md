@@ -73,9 +73,25 @@ diagnostic's reason. The user-facing explanation lives on the source issue
 or pull request, where the executor's terminal handler posts it through the
 registered-secret redactor.
 
+The kubelet-derived and pod-derived text is constrained to a small allowlist
+of values the runtime itself writes (`Completed`, `Error`, `OOMKilled`,
+`ContainerStatusUnknown`, `Evicted`, `DeadlineExceeded`, `Preempt` for the
+container; `Evicted`, `NodeAffinity`, `NodeLost`, `Shutdown`,
+`Unschedulable`, `UnexpectedAdmissionError`, `Error`,
+`ContainerStatusUnknown` for the pod). Any other value is dropped before it
+reaches the operator-derived reason, so a non-pattern-matching secret in the
+kubelet's `Terminated.Reason` or the pod's `Status.Reason` cannot land on
+the durable status.
+
 The reason is length-bounded to 1024 bytes and run through a defensive
 pattern-redaction pass on whatever operator-derived text it does carry
 (so a kubelet state reason that happens to look like a credential is
 still replaced). Capture is best-effort, so an absent diagnostic is not
 proof of success, and `unknown` means the evidence was missing or
 ambiguous.
+
+`container.terminationReason` applies the same allowlist, plus a hard
+128-byte cap that mirrors the CRD's `+kubebuilder:validation:MaxLength=128`
+in code. This prevents an overlong kubelet value from causing the API
+server to reject the terminal status patch (which would block
+terminalization and source reporting).

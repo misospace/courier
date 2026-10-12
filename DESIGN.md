@@ -908,13 +908,18 @@ The diagnostic carries the observed exit code, the executor-declared outcome
 kind when any, an **operator-derived** short reason (a category label, the
 kubelet's allowlisted `Terminated.Reason` and pod `Status.Reason`, and a
 fixed override for the wedge-reap and pod-loss ceiling paths — never the
-executor model text), and the coordinator container's identity and
-termination metadata (`podName`, `podUID`, `containerID`, `image`,
-`nodeName`, `restartCount`, `terminationReason`) for
-kubectl-describe-equivalent inspection after the pod is gone. The reason is
-re-bounded to 1024 bytes and re-redacted through the defensive credential
-table as a defense-in-depth pass on the operator-derived string, but the
-executor model text never reaches the field by construction: a model's
+executor model text, and the kubelet/apiserver text is constrained to a
+small allowlist of values the runtime itself writes), and the coordinator
+container's identity and termination metadata (`podName`, `podUID`,
+`containerID`, `image`, `nodeName`, `restartCount`, `terminationReason`)
+for kubectl-describe-equivalent inspection after the pod is gone. The
+reason is re-bounded to 1024 bytes and re-redacted through the defensive
+credential table as a defense-in-depth pass on the operator-derived string,
+and the `container.terminationReason` field is hard-capped at 128 bytes
+(the CRD's `+kubebuilder:validation:MaxLength=128`) with the same
+allowlist, so an overlong kubelet value cannot cause the API server to
+reject the terminal status patch and block terminalization. The executor
+model text never reaches the field by construction: a model's
 `needs-decision` question, a `blocked-external` missing description, a
 verifier fail-reason, or a bootstrap error string cannot land on the
 durable status, because no path from the executor's `termination.Reason`
@@ -1503,12 +1508,19 @@ named items remain unresolved and must not be described as production-ready:
   diagnostic's reason is operator-derived by construction: a category label,
   the kubelet's allowlisted `Terminated.Reason` and pod `Status.Reason`, and a
   fixed operator override for the wedge-reap and pod-loss ceiling paths. The
+  kubelet and apiserver text is also constrained to a small allowlist of
+  values the runtime itself writes, so a non-pattern-matching secret carried
+  in `Terminated.Reason` or `Status.Reason` cannot reach the diagnostic. The
   executor's freeform text (`needs-decision` questions, `blocked-external`
   missing descriptions, verifier fail-reasons, bootstrap error strings) is
   never an input, so no model-controlled text can land on the durable
-  status. User-facing explanations are posted on the source issue/PR by the
-  executor's terminal handler. Missing evidence is `unknown`; a missing pod
-  yields `kubernetes-failure` with no fabricated container details.
+  status. `container.terminationReason` applies the same allowlist and a
+  128-byte cap matching the CRD's `+kubebuilder:validation:MaxLength=128`,
+  so an overlong kubelet value cannot cause the apiserver to reject the
+  terminal status patch (which would block terminalization and source
+  reporting). User-facing explanations are posted on the source issue/PR by
+  the executor's terminal handler. Missing evidence is `unknown`; a missing
+  pod yields `kubernetes-failure` with no fabricated container details.
   Revisited in #275 to make the reason safe by construction and to prove the
   set-once gate holds across pod deletion and controller restart. (#272,
   #275)

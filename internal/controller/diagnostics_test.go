@@ -516,3 +516,177 @@ func diagnosticPod() *corev1.Pod {
 		}},
 	}
 }
+
+// TestBoundedContainerTerminationReason proves the CRD's
+// `+kubebuilder:validation:MaxLength=128` is enforced in code, not just
+// at the API server: arbitrary text the kubelet might write is dropped
+// (the allowlist is exact-match, not prefix), the allowlisted value
+// passes through unchanged, and an overlong non-allowlisted value is
+// dropped (not persisted) so the terminalization status patch cannot be
+// rejected by the apiserver for being too long.
+func TestBoundedContainerTerminationReason(t *testing.T) {
+	if got := boundedContainerTerminationReason(""); got != "" {
+		t.Errorf("empty reason = %q, want empty", got)
+	}
+	if got := boundedContainerTerminationReason(strings.Repeat("x", terminalContainerReasonBytes)); got != "" {
+		t.Errorf("non-allowlisted overlong reason = %q, want empty (allowlist exact-match, not prefix)", got)
+	}
+	if got := boundedContainerTerminationReason(strings.Repeat("x", terminalContainerReasonBytes+1)); got != "" {
+		t.Errorf("non-allowlisted overlong reason = %q, want empty (allowlist exact-match, not prefix)", got)
+	}
+	if got := boundedContainerTerminationReason("  OOMKilled  "); got != "OOMKilled" {
+		t.Errorf("trim+allow reason = %q, want OOMKilled", got)
+	}
+	if got := boundedContainerTerminationReason("OOMKilled-with-suffix"); got != "" {
+		t.Errorf("allowlist is exact-match: %q, want empty", got)
+	}
+	if got := boundedContainerTerminationReason("PRIVATE_PROMPT_SENTINEL_DO_NOT_PERSIST"); got != "" {
+		t.Errorf("non-allowlisted reason = %q, want empty", got)
+	}
+}
+
+// TestOperatorDiagnosticReasonAllowlistsKubernetesReasons proves the
+// allowlist is real (not just claimed): arbitrary kubelet
+// `Terminated.Reason` and arbitrary `pod.Status.Reason` values are
+// dropped from the operator-derived reason, while the small set of
+// runtime-written values is retained. The executor's freeform text and
+// arbitrary CRD-side state can never reach the durable status.
+func TestOperatorDiagnosticReasonAllowlistsKubernetesReasons(t *testing.T) {
+	const kubeletSentinel = "PRIVATE_PROMPT_SENTINEL_DO_NOT_PERSIST"
+	const podSentinel = "POD_STATUS_SENTINEL_DO_NOT_PERSIST"
+
+	t.Run("non-allowlisted kubelet reason is dropped", func(t *testing.T) {
+		pod := diagnosticPod()
+		pod.Status.ContainerStatuses[0].State.Terminated.Reason = kubeletSentinel
+		got := operatorDiagnosticReason(courierv1alpha1.TerminalDiagnosticCategoryKubernetesFailure, "", pod)
+		if strings.Contains(got, kubeletSentinel) {
+			t.Errorf("reason retained kubelet sentinel %q: %q", kubeletSentinel, got)
+		}
+		if strings.Contains(got, "container:") {
+			t.Errorf("reason carried a non-allowlisted container contribution: %q", got)
+		}
+	})
+
+	t.Run("non-allowlisted pod reason is dropped", func(t *testing.T) {
+		pod := diagnosticPod()
+		pod.Status.Reason = podSentinel
+		got := operatorDiagnosticReason(courierv1alpha1.TerminalDiagnosticCategoryKubernetesFailure, "", pod)
+		if strings.Contains(got, podSentinel) {
+			t.Errorf("reason retained pod status sentinel %q: %q", podSentinel, got)
+		}
+		if strings.Contains(got, "pod:") {
+			t.Errorf("reason carried a non-allowlisted pod contribution: %q", got)
+		}
+	})
+
+	t.Run("allowlisted kubelet and pod reasons are retained", func(t *testing.T) {
+		pod := diagnosticPod()
+		pod.Status.ContainerStatuses[0].State.Terminated.Reason = "OOMKilled"
+		pod.Status.Reason = "Evicted"
+		got := operatorDiagnosticReason(courierv1alpha1.TerminalDiagnosticCategoryKubernetesFailure, "", pod)
+		if !strings.Contains(got, "container: OOMKilled") {
+			t.Errorf("reason = %q, want it to carry container: OOMKilled", got)
+		}
+		if !strings.Contains(got, "pod: Evicted") {
+			t.Errorf("reason = %q, want it to carry pod: Evicted", got)
+		}
+	})
+
+	t.Run("override is still honored on non-allowlisted pod reason", func(t *testing.T) {
+		pod := diagnosticPod()
+		pod.Status.Reason = podSentinel
+		got := operatorDiagnosticReason(courierv1alpha1.TerminalDiagnosticCategoryKubernetesFailure, podLostReason, pod)
+		if !strings.Contains(got, podLostReason) {
+			t.Errorf("reason = %q, want it to carry the operator override %q", got, podLostReason)
+		}
+		if strings.Contains(got, podSentinel) {
+			t.Errorf("reason = %q, want it to drop the non-allowlisted pod reason", got)
+		}
+	})
+}
+
+// TestContainerTerminationReasonExcludesArbitraryKubeletText proves
+// `status.terminalDiagnostic.container.terminationReason` is constrained
+// to the kubelet's allowlisted values: a non-pattern-matching secret
+// carried in the kubelet's `Terminated.Reason` does not land on the
+// durable status.
+func TestContainerTerminationReasonExcludesArbitraryKubeletText(t *testing.T) {
+	cases := []struct {
+		name   string
+		reason string
+		want   string
+	}{
+		{"allowlisted OOMKilled", "OOMKilled", "OOMKilled"},
+		{"allowlisted Error", "Error", "Error"},
+		{"allowlisted Completed", "Completed", "Completed"},
+		{"allowlisted ContainerStatusUnknown", "ContainerStatusUnknown", "ContainerStatusUnknown"},
+		{"empty stays empty", "", ""},
+		{"arbitrary secret is dropped", "PRIVATE_PROMPT_SENTINEL_DO_NOT_PERSIST", ""},
+		{"URL with embedded secret is dropped", "https://user:secret-password@host/path", ""},
+		{"token-shaped is dropped", "ghp_abcdefghijklmnopqrstuvwxyz0123456789", ""},
+		{"kubelet error message is dropped", "container exited with code 1 due to: PRIVATE_PROMPT_SENTINEL", ""},
+		{"whitespace around allowlisted is trimmed", "  OOMKilled  ", "OOMKilled"},
+	}
+	for _, tt := range cases {
+		t.Run(tt.name, func(t *testing.T) {
+			pod := diagnosticPod()
+			pod.Status.ContainerStatuses[0].State.Terminated.Reason = tt.reason
+			got := coordinatorContainerDiagnostic(pod)
+			if got == nil {
+				t.Fatal("container diagnostic is nil")
+			}
+			if got.TerminationReason != tt.want {
+				t.Errorf("TerminationReason = %q, want %q", got.TerminationReason, tt.want)
+			}
+		})
+	}
+}
+
+// TestOverlongKubeletReasonIsBounded proves
+// `status.terminalDiagnostic.container.terminationReason` cannot exceed
+// the CRD's MaxLength=128 and the terminalization status patch is not
+// rejected by the apiserver when the kubelet writes an overlong
+// `Terminated.Reason`: a non-allowlisted overlong value is dropped, the
+// diagnostic still settles, the run reaches its terminal phase, and the
+// operator-derived reason never carries the overlong text or the
+// executor's freeform text.
+func TestOverlongKubeletReasonIsBounded(t *testing.T) {
+	const kubeletSentinel = "PRIVATE_PROMPT_SENTINEL_DO_NOT_PERSIST"
+	overlong := strings.Repeat("x", 200)
+	run := admissionRun("overlong-run", "local", courierv1alpha1.PhaseRunning)
+	pod := coordinatorPod(run, 1)
+	pod.Status.ContainerStatuses[0].State.Terminated.Reason = overlong
+	payload, err := json.Marshal(terminationMessage{Phase: "Failed", Result: "failure", ExitCode: 1, Reason: kubeletSentinel, Category: "executor-crash"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	pod.Status.ContainerStatuses[0].State.Terminated.Message = handoffPrefix + string(payload)
+	kube := phaseClient(t, run, pod)
+	reconciler := diagnosticReconciler(kube, &admissionSource{})
+	if _, err := reconciler.Reconcile(context.Background(), admissionRequest(run.Name)); err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+	var updated courierv1alpha1.CoderRun
+	if err := kube.Get(context.Background(), admissionKey(run.Name), &updated); err != nil {
+		t.Fatal(err)
+	}
+	diag := updated.Status.TerminalDiagnostic
+	if diag == nil {
+		t.Fatal("diagnostic was not persisted")
+	}
+	if diag.Container == nil {
+		t.Fatal("container diagnostic was not persisted")
+	}
+	if len(diag.Container.TerminationReason) > terminalContainerReasonBytes {
+		t.Errorf("Container.TerminationReason len=%d, want <=%d", len(diag.Container.TerminationReason), terminalContainerReasonBytes)
+	}
+	if strings.Contains(diag.Reason, overlong) {
+		t.Errorf("reason retained overlong kubelet text (len=%d): %q", len(overlong), diag.Reason)
+	}
+	if strings.Contains(diag.Reason, kubeletSentinel) {
+		t.Errorf("reason retained executor freeform text %q: %q", kubeletSentinel, diag.Reason)
+	}
+	if updated.Status.Phase != courierv1alpha1.PhaseFailed {
+		t.Errorf("phase = %q, want Failed; the overlong kubelet reason must not block terminalization", updated.Status.Phase)
+	}
+}
