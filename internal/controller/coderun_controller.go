@@ -42,7 +42,7 @@ const coordinatorContainerName = "coordinator"
 // lifecycleReportedCondition tracks whether a terminal run's source lifecycle
 // report has been published; a False status means a later reconcile retries it.
 const (
-	lifecycleReportedCondition                              = "LifecycleReported"
+	lifecycleReportedCondition                              = courierv1alpha1.ConditionLifecycleReported
 	lifecycleReportSupportedCondition                       = "LifecycleReportSupported"
 	lifecycleReportPendingReason                            = "Pending"
 	lifecycleReportPendingBlockedReportParksPRFixReason     = "PendingBlockedReportParksPRFix"

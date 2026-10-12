@@ -13,6 +13,11 @@ const (
 	ModeFixPR Mode = "fix-pr"
 )
 
+// ConditionLifecycleReported is the status condition type the operator writes
+// on a CoderRun to record the outcome of its terminal lifecycle report. It is
+// read back wherever another component must know whether the report landed.
+const ConditionLifecycleReported = "LifecycleReported"
+
 // Phase is the lifecycle phase of a CoderRun.
 // +kubebuilder:validation:Enum=Pending;Claimed;Running;Verifying;AwaitingReview;HandedOff;NeedsHuman;Done;Failed;BlockedExternal
 type Phase string

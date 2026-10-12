@@ -1197,10 +1197,12 @@ there is no delete verb because active runs reference lanes. (#73)
   `no_change_needed` **fix-pr** run settles here against the world and publishes
   the neutral `no-change` lifecycle result rather than `ready`: it pushed
   nothing, and a source told a fix was pushed charges the work an attempt it did
-  not spend (Dispatch's head-moved guard refuses a `pr_updated`/`no_changes_needed`
-  settlement whose head did not move and requeues the item at a new generation
-  with `fixAttempts` incremented, so `already_addressed` — the one outcome that
-  settles without that guard — is what the adapter sends). The
+  not spend. Dispatch's head-moved guard refuses a
+  `pr_updated`/`no_changes_needed` settlement whose head did not move and requeues
+  the item at a new generation with `fixAttempts` incremented
+  (`dispatch@60c8213 src/lib/pr-fix-queue.ts:1766-1805`), so `already_addressed` —
+  the one outcome that settles without that guard
+  (`dispatch@60c8213 src/lib/pr-fix-queue.ts:2839`) — is what the adapter sends). The
   previous run remains auditable; its completion does not settle later feedback.
   **HandedOff** is the separate terminal phase for a published resolve-issue PR
   whose stable red checks the source will repair; it is not a success, so it is
@@ -1338,7 +1340,7 @@ re-offers the identity, the blocked run is deleted and the fresh run takes its
 place in the same poll. A blocked run whose report is still pending keeps
 suppressing its identity, so a stuck report never becomes pod churn. Until
 Dispatch
-learns both signals, Courier emits them forward-compatibly; a legacy Dispatch
+learns these signals, Courier emits them forward-compatibly; a legacy Dispatch
 rejects the report, and the controller holds it as a pending report on the
 unsupported-outcome path — automatic retries stop until an operator retry
 annotation re-publishes it once Dispatch accepts the signal. The contract
@@ -1504,13 +1506,14 @@ named items remain unresolved and must not be described as production-ready:
   blocked run must be able to wake.** Two blockers on the merged #267 behavior,
   both verified against Dispatch `main`. (1) A `no_change_needed` fix-pr run
   settled `AwaitingReview` and reported `ready` → Dispatch `outcome:"pr_updated"`.
-  Because the run pushed nothing, `markPrFixItem`'s head-moved guard refused the
+Because the run pushed nothing, `markPrFixItem`'s head-moved guard refused the
   `FIXED` mark and reset the queue row to `QUEUED` at a **new generation** with
-  `fixAttempts` incremented (`pr-fix-queue.ts:1766-1805`), so a run that changed
-  nothing burned an attempt and was falsely re-issued — the same charge the
-  `waiting-external` work removed. `no_changes_needed` does not help: it is
+  `fixAttempts` incremented
+  (`dispatch@60c8213 src/lib/pr-fix-queue.ts:1766-1805`), so a run that changed
+  nothing burned an attempt and was falsely re-issued. `no_changes_needed` does not help: it is
   done-like and takes the same guard; only `already_addressed` sets
-  `alreadyAddressed` and settles without it (`pr-fix-queue.ts:2839`). The run now
+  `alreadyAddressed` and settles without it
+  (`dispatch@60c8213 src/lib/pr-fix-queue.ts:2839`). The run now
   records `status.declaredNoChange` when its exit is the verified
   `no_change_needed` exit, and its `AwaitingReview` report publishes the new
   source-neutral `no-change` result, which the Dispatch adapter maps to
