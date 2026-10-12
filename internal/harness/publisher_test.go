@@ -271,6 +271,7 @@ func newBrokerFixtureWithWorkRef(t *testing.T, existingWorkRef bool) *brokerFixt
 		WorkRepo: "org/repo", WorkRef: observer.workRef,
 		WorkInitiallyAbsent: !existingWorkRef,
 		WorkAnchorOID:       workAnchor,
+		SourceIssue:         broker.SourceIssue{Owner: "org", Name: "repo", Number: 1},
 	}
 	gitStore, err := couriergit.NewBroker(ctx, t.TempDir())
 	if err != nil {

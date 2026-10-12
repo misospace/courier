@@ -137,3 +137,46 @@ func TestPolicyFromRunRequiresConsistentResolveInitialTip(t *testing.T) {
 		t.Fatal("expected initially absent work ref with a tip to be rejected")
 	}
 }
+
+// TestPolicyFromRunPopulatesSourceIssueFromSpec proves the broker binding
+// resolves the trusted source-issue identity from the immutable spec. The
+// identity feeds the broker's authoritative-linkage check (#248) and is the
+// only authority a PR body's closing reference may match. A fix-pr run
+// leaves the field zero because the existing PR's identity is already
+// pinned through PRNumber and HeadAnchorOID.
+func TestPolicyFromRunPopulatesSourceIssueFromSpec(t *testing.T) {
+	run := bindingRun(v1alpha1.ModeResolveIssue)
+	got, err := PolicyFromRun(run, "providers/github", "org/repo")
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := SourceIssue{Owner: "org", Name: "repo", Number: 12}
+	if got.SourceIssue != want {
+		t.Fatalf("SourceIssue = %+v, want %+v", got.SourceIssue, want)
+	}
+
+	// A fix-pr run must not set the SourceIssue; the broker's
+	// CreatePullRequest path is closed to fix-pr, and the
+	// existing PR's identity is pinned through PRNumber.
+	run = bindingRun(v1alpha1.ModeFixPR)
+	got, err = PolicyFromRun(run, "providers/github", "org/repo")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !got.SourceIssue.IsZero() {
+		t.Fatalf("fix-pr SourceIssue = %+v, want zero", got.SourceIssue)
+	}
+}
+
+// TestPolicyFromRunRejectsBaseRepoWithoutOwnerSlash proves the broker
+// binding refuses to derive a source-issue identity from a base
+// repository that is not an "owner/name" form. The identity is the
+// only authority a PR body may match, so a malformed value must
+// fail closed at admission.
+func TestPolicyFromRunRejectsBaseRepoWithoutOwnerSlash(t *testing.T) {
+	run := bindingRun(v1alpha1.ModeResolveIssue)
+	run.Status.PublicationPolicy.BaseRepo = "no-slash"
+	if _, err := PolicyFromRun(run, "providers/github", "no-slash"); err == nil {
+		t.Fatal("expected non-owner/name base repository to be rejected")
+	}
+}

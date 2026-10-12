@@ -26,6 +26,7 @@ func TestCapabilitiesEndpoint(t *testing.T) {
 		RunUID: "run-uid", Mode: ModeResolveIssue, Provider: "test",
 		BaseRepo: "org/repo", BaseRef: "main", BaseOID: strings.Repeat("a", 40),
 		WorkRepo: "org/repo", WorkRef: "courier/org/repo/issue-1", WorkInitiallyAbsent: true,
+		SourceIssue: SourceIssue{Owner: "org", Name: "repo", Number: 1},
 	}, importTestObserver{}, serverPusher{})
 	if err != nil {
 		t.Fatal(err)

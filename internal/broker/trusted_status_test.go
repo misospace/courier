@@ -102,7 +102,7 @@ func TestTrustedStatusRejectsCrossRunAndStalePod(t *testing.T) {
 func trustedPublicServer(t *testing.T) *Server {
 	t.Helper()
 	cert, key := testTLSFiles(t)
-	engine, err := NewPolicyEngine(Policy{RunUID: "run-uid", Mode: ModeResolveIssue, Provider: "test", BaseRepo: "org/repo", BaseRef: "main", BaseOID: "base", WorkRepo: "org/repo", WorkRef: "courier/org/repo/issue-1", WorkInitiallyAbsent: true}, serverObserver{}, serverPusher{})
+	engine, err := NewPolicyEngine(Policy{RunUID: "run-uid", Mode: ModeResolveIssue, Provider: "test", BaseRepo: "org/repo", BaseRef: "main", BaseOID: "base", WorkRepo: "org/repo", WorkRef: "courier/org/repo/issue-1", WorkInitiallyAbsent: true, SourceIssue: SourceIssue{Owner: "org", Name: "repo", Number: 1}}, serverObserver{}, serverPusher{})
 	if err != nil {
 		t.Fatal(err)
 	}
