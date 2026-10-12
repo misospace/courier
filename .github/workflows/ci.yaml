@@ -357,7 +357,7 @@ jobs:
 
   images:
     runs-on: ubuntu-latest
-    needs: [images-classify, image-manager, image-coordinator, image-coordinator-go]
+    needs: [images-classify, image-manager, image-coordinator, image-coordinator-go, image-harness]
     if: ${{ !cancelled() }}
     steps:
       - uses: actions/checkout@v7.0.1
@@ -369,7 +369,8 @@ jobs:
             '${{ needs.images-classify.outputs.images_required }}' \
             '${{ needs.image-manager.result }}' \
             '${{ needs.image-coordinator.result }}' \
-            '${{ needs.image-coordinator-go.result }}'
+            '${{ needs.image-coordinator-go.result }}' \
+            '${{ needs.image-harness.result }}'
 
   vulnerability:
     runs-on: ubuntu-latest

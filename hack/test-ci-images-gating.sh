@@ -157,34 +157,78 @@ else
   report FAIL "classifier GITHUB_OUTPUT append" "rc=$gh_rc out=[$gh_out_content]"
 fi
 
-check_aggregator "docs-only, all skipped" 0 success false skipped skipped skipped
-check_aggregator "required, all succeeded" 0 success true success success success
-check_aggregator "classify failed, required" 1 failure true skipped skipped skipped
-check_aggregator "classify failed, not required" 1 failure false skipped skipped skipped
-check_aggregator "coordinator failed" 1 success true success failure success
-check_aggregator "coordinator-go skipped" 1 success true success success skipped
-check_aggregator "manager ran, skip expected" 1 success false skipped success skipped
-check_aggregator "jobs ran, skip expected" 1 success false success success success
-check_aggregator "not required, job neutral" 1 success false neutral skipped skipped
-check_aggregator "not required, job cancelled" 1 success false skipped cancelled skipped
-check_aggregator "empty images_required" 1 success "" skipped skipped skipped
-check_aggregator "unknown images_required value" 1 success TRUE skipped skipped skipped
-check_aggregator "nonsense images_required value" 1 success yes skipped skipped skipped
-check_aggregator "classify cancelled" 1 cancelled true skipped skipped skipped
-check_aggregator "classify skipped" 1 skipped false skipped skipped skipped
-check_aggregator "required, job neutral" 1 success true success neutral success
+check_aggregator "docs-only, all skipped" 0 success false skipped skipped skipped skipped
+check_aggregator "required, all succeeded" 0 success true success success success success
+check_aggregator "classify failed, required" 1 failure true skipped skipped skipped skipped
+check_aggregator "classify failed, not required" 1 failure false skipped skipped skipped skipped
+check_aggregator "coordinator failed" 1 success true success failure success success
+check_aggregator "coordinator-go skipped" 1 success true success success skipped success
+check_aggregator "manager ran, skip expected" 1 success false skipped success skipped skipped
+check_aggregator "jobs ran, skip expected" 1 success false success success success skipped
+check_aggregator "not required, job neutral" 1 success false neutral skipped skipped skipped
+check_aggregator "not required, job cancelled" 1 success false skipped cancelled skipped skipped
+check_aggregator "empty images_required" 1 success "" skipped skipped skipped skipped
+check_aggregator "unknown images_required value" 1 success TRUE skipped skipped skipped skipped
+check_aggregator "nonsense images_required value" 1 success yes skipped skipped skipped skipped
+check_aggregator "classify cancelled" 1 cancelled true skipped skipped skipped skipped
+check_aggregator "classify skipped" 1 skipped false skipped skipped skipped skipped
+check_aggregator "required, job neutral" 1 success true success neutral success success
+
+for result in failure skipped cancelled neutral unknown ""; do
+  check_aggregator "required, harness [$result]" 1 success true success success success "$result"
+done
+for result in success failure cancelled neutral unknown ""; do
+  check_aggregator "docs-only, harness [$result]" 1 success false skipped skipped skipped "$result"
+done
+
+workflow="${1:-$script_dir/../.github/workflows/ci.yaml}"
+harness_job="$work/harness-job.yaml"
+awk '/^  image-harness:$/ {inside=1; next} inside && /^  [^[:space:]].*:/ {exit} inside {print}' "$workflow" > "$harness_job"
+if grep -Fqx '    needs: images-classify' "$harness_job" &&
+  grep -Fqx "    if: needs.images-classify.outputs.images_required == 'true'" "$harness_job"; then
+  report PASS "workflow: harness uses the image classification gate"
+else
+  report FAIL "workflow: harness uses the image classification gate"
+fi
+images_job="$work/images-job.yaml"
+awk '/^  images:$/ {inside=1; next} inside && /^  [^[:space:]].*:/ {exit} inside {print}' "$workflow" > "$images_job"
+if grep -Fqx '    needs: [images-classify, image-manager, image-coordinator, image-coordinator-go, image-harness]' "$images_job"; then
+  report PASS "workflow: images waits for all image jobs"
+else
+  report FAIL "workflow: images waits for all image jobs"
+fi
+if grep -Fqx '    if: ${{ !cancelled() }}' "$images_job"; then
+  report PASS "workflow: aggregate retains cancellation semantics"
+else
+  report FAIL "workflow: aggregate retains cancellation semantics"
+fi
+awk '/^          bash hack\/ci-images-aggregate.sh/ {inside=1} inside && /^[[:space:]]*$/ {exit} inside {print}' "$images_job" > "$work/actual-command"
+cat > "$work/expected-command" <<'EOF'
+          bash hack/ci-images-aggregate.sh \
+            '${{ needs.images-classify.result }}' \
+            '${{ needs.images-classify.outputs.images_required }}' \
+            '${{ needs.image-manager.result }}' \
+            '${{ needs.image-coordinator.result }}' \
+            '${{ needs.image-coordinator-go.result }}' \
+            '${{ needs.image-harness.result }}'
+EOF
+if diff -u "$work/expected-command" "$work/actual-command"; then
+  report PASS "workflow: aggregate receives all results in argument order"
+else
+  report FAIL "workflow: aggregate receives all results in argument order"
+fi
 
 agg_rc=0
-bash "$aggregator" success true success success >/dev/null 2>&1 || agg_rc=$?
-if [ "$agg_rc" -ne 0 ]; then
+bash "$aggregator" success true success success success >/dev/null 2>&1 || agg_rc=$?
+if [ "$agg_rc" -eq 2 ]; then
   report PASS "aggregator: wrong arg count"
 else
   report FAIL "aggregator: wrong arg count" "rc=$agg_rc"
 fi
 
 agg_rc=0
-bash "$aggregator" success true success success success success >/dev/null 2>&1 || agg_rc=$?
-if [ "$agg_rc" -ne 0 ]; then
+bash "$aggregator" success true success success success success success >/dev/null 2>&1 || agg_rc=$?
+if [ "$agg_rc" -eq 2 ]; then
   report PASS "aggregator: too many args"
 else
   report FAIL "aggregator: too many args" "rc=$agg_rc"
