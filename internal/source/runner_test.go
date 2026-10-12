@@ -52,6 +52,47 @@ func TestRunnerPollMaterializesAndDeduplicatesByOpaqueID(t *testing.T) {
 	}
 }
 
+func TestRunnerDiscoveryExclusionsAreOpaqueAndSourceScoped(t *testing.T) {
+	lane := testLane()
+	lane.Spec.Concurrency = 2
+	retained := &courierv1alpha1.CoderRun{
+		ObjectMeta: metav1.ObjectMeta{Name: "retained", Namespace: "courier"},
+		Spec:       courierv1alpha1.CoderRunSpec{Source: "dispatch:local", WorkItemID: "opaque/generation-7", Mode: courierv1alpha1.ModeFixPR, Repo: "acme/widgets", Ref: 42, Lane: "local"},
+		Status:     courierv1alpha1.CoderRunStatus{Phase: courierv1alpha1.PhaseDone},
+	}
+	unrelated := &courierv1alpha1.CoderRun{
+		ObjectMeta: metav1.ObjectMeta{Name: "unrelated", Namespace: "courier"},
+		Spec:       courierv1alpha1.CoderRunSpec{Source: "other", WorkItemID: "do-not-exclude", Mode: courierv1alpha1.ModeResolveIssue, Repo: "acme/other", Ref: 9, Lane: "local"},
+		Status:     courierv1alpha1.CoderRunStatus{Phase: courierv1alpha1.PhaseDone},
+	}
+	adapter := &excludingTestAdapter{testAdapter: testAdapter{items: []WorkItem{{ID: "opaque/generation-8", Mode: "fix-pr", Repo: "acme/widgets", Ref: 42}}}}
+	runner := NewRunner(newTestClient(t, lane, retained, unrelated), adapter, RunnerConfig{Source: "dispatch", LaneProfile: "local", Namespace: "courier"})
+	if err := runner.Poll(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if adapter.discoverCalls != 0 || adapter.excludingCalls != 1 {
+		t.Fatalf("Discover/DiscoverExcluding calls = %d/%d, want 0/1", adapter.discoverCalls, adapter.excludingCalls)
+	}
+	if len(adapter.exclusions) != 1 {
+		t.Fatalf("exclusions = %#v, want only the retained dispatch run", adapter.exclusions)
+	}
+	want := (WorkItem{ID: "opaque/generation-7", Mode: "fix-pr", Repo: "acme/widgets", Ref: 42})
+	if adapter.exclusions[0] != want {
+		t.Fatalf("exclusion = %#v, want %#v", adapter.exclusions[0], want)
+	}
+	var runs courierv1alpha1.CoderRunList
+	if err := runner.List(context.Background(), &runs, client.InNamespace("courier")); err != nil {
+		t.Fatal(err)
+	}
+	foundNewer := false
+	for _, run := range runs.Items {
+		foundNewer = foundNewer || run.Spec.WorkItemID == "opaque/generation-8"
+	}
+	if !foundNewer {
+		t.Fatal("newer generation was not eligible for materialization")
+	}
+}
+
 func TestRunnerSkipsDiscoveryWhenLaneCapacityIsFull(t *testing.T) {
 	item := WorkItem{ID: "queue-item/generation-1", Mode: "fix-pr", Repo: "acme/widgets", Ref: 42}
 	localLane := testLane()
@@ -91,6 +132,40 @@ func TestRunnerSkipsDiscoveryWhenLaneCapacityIsFull(t *testing.T) {
 	for _, run := range runs.Items {
 		if run.Spec.WorkItemID == item.ID && (run.Spec.Lane != "minimax" || run.Spec.SourceAgent != "courier-cloud") {
 			t.Fatalf("new run binding = lane %q, agent %q; want minimax/courier-cloud", run.Spec.Lane, run.Spec.SourceAgent)
+		}
+	}
+}
+
+func TestRunnerExcludesPendingHeadSoFreeCloudBindingGetsNextItem(t *testing.T) {
+	localLane := testLane()
+	localLane.Spec.Concurrency = 1
+	cloudLane := testLane()
+	cloudLane.Name = "cloud"
+	cloudLane.Spec.Concurrency = 1
+	pending := &courierv1alpha1.CoderRun{
+		ObjectMeta: metav1.ObjectMeta{Name: "pending-a", Namespace: "courier"},
+		Spec:       courierv1alpha1.CoderRunSpec{Source: "dispatch", WorkItemID: "queue-a", Lane: "local"},
+		Status:     courierv1alpha1.CoderRunStatus{Phase: courierv1alpha1.PhasePending},
+	}
+	adapter := &excludingTestAdapter{testAdapter: testAdapter{items: []WorkItem{{ID: "queue-b", Mode: "fix-pr", Repo: "acme/widgets", Ref: 43}}}}
+	kubeClient := newTestClient(t, localLane, cloudLane, pending)
+	runner := NewRunner(kubeClient, adapter, RunnerConfig{Source: "dispatch", LaneProfile: "cloud", Namespace: "courier"})
+	if err := runner.Poll(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if adapter.discoverCalls != 0 || adapter.excludingCalls != 1 || len(adapter.exclusions) != 1 || adapter.exclusions[0].ID != "queue-a" {
+		t.Fatalf("discovery/exclusions = %d/%d/%#v", adapter.discoverCalls, adapter.excludingCalls, adapter.exclusions)
+	}
+	var runs courierv1alpha1.CoderRunList
+	if err := kubeClient.List(context.Background(), &runs, client.InNamespace("courier")); err != nil {
+		t.Fatal(err)
+	}
+	if len(runs.Items) != 2 {
+		t.Fatalf("runs = %d, want pending A and new B", len(runs.Items))
+	}
+	for _, run := range runs.Items {
+		if run.Spec.WorkItemID == "queue-a" && run.Spec.Lane != "local" {
+			t.Fatalf("pending A changed: %#v", run.Spec)
 		}
 	}
 }
@@ -809,6 +884,18 @@ func TestRunnerValidation(t *testing.T) {
 	if err := NewRunner(kubeClient, &testAdapter{}, RunnerConfig{Source: "test", Namespace: "courier"}).Poll(context.Background()); err == nil {
 		t.Fatal("missing LaneProfile was accepted")
 	}
+}
+
+type excludingTestAdapter struct {
+	testAdapter
+	excludingCalls int
+	exclusions     []WorkItem
+}
+
+func (a *excludingTestAdapter) DiscoverExcluding(_ context.Context, exclusions []WorkItem) ([]WorkItem, error) {
+	a.excludingCalls++
+	a.exclusions = append([]WorkItem(nil), exclusions...)
+	return a.items, a.err
 }
 
 type testAdapter struct {

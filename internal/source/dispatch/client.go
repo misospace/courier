@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"net/url"
 	"path"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -112,12 +113,13 @@ func (e *APIError) Error() string {
 
 // HTTPClient implements the Dispatch HTTP API behind the source adapter.
 type HTTPClient struct {
-	baseURL        *url.URL
-	token          string
-	agentName      string
-	queueLane      string
-	httpClient     HTTPDoer
-	prStateChecker PullRequestStateChecker
+	baseURL                *url.URL
+	token                  string
+	agentName              string
+	queueLane              string
+	httpClient             HTTPDoer
+	prStateChecker         PullRequestStateChecker
+	prFixExclusionsEnabled bool
 }
 
 // NewClient creates a Dispatch HTTP client without a queue lane override.
@@ -133,6 +135,13 @@ func NewClientWithLane(baseURL, agentName, queueLane, token string, timeout time
 // WithPullRequestStateChecker configures stale follow-up detection.
 func (c *HTTPClient) WithPullRequestStateChecker(checker PullRequestStateChecker) *HTTPClient {
 	c.prStateChecker = checker
+	return c
+}
+
+// WithPRFixExclusions opts into Dispatch's acknowledged PR-fix exclusion contract.
+// Enable only after deployment has confirmed support for that contract.
+func (c *HTTPClient) WithPRFixExclusions(enabled bool) *HTTPClient {
+	c.prFixExclusionsEnabled = enabled
 	return c
 }
 
@@ -170,11 +179,73 @@ func newClient(baseURL, agentName, queueLane, token string, timeout time.Duratio
 }
 
 func (c *HTTPClient) Discover(ctx context.Context) ([]source.WorkItem, error) {
-	var task Task
-	path := "/api/agents/" + url.PathEscape(c.agentName) + "/next-task"
-	if err := c.do(ctx, http.MethodGet, path, nil, &task); err != nil {
+	return c.discover(ctx, nil)
+}
+
+func (c *HTTPClient) DiscoverExcluding(ctx context.Context, exclusions []source.WorkItem) ([]source.WorkItem, error) {
+	if !c.prFixExclusionsEnabled || len(exclusions) == 0 {
+		return c.Discover(ctx)
+	}
+	query := url.Values{"exclude_pr_fix_version": {"1"}}
+	seen := make(map[string]struct{})
+	for _, item := range exclusions {
+		d, err := decodeWorkID(item.ID)
+		if err != nil || d.Type != "followup-pr" || d.PRFixID == "" || d.Generation < 1 || d.Repo == "" {
+			continue
+		}
+		repo := strings.ToLower(d.Repo)
+		if !dispatchRepoPattern.MatchString(repo) || d.Number > maxSafeInteger || d.Generation > maxSafeInteger {
+			return nil, fmt.Errorf("dispatch client: invalid PR-fix exclusion descriptor")
+		}
+		value := fmt.Sprintf("%s#%d@%d", repo, d.Number, d.Generation)
+		if len(value) > 300 {
+			return nil, fmt.Errorf("dispatch client: PR-fix exclusion exceeds maximum 300 characters")
+		}
+		if _, exists := seen[value]; exists {
+			continue
+		}
+		seen[value] = struct{}{}
+		if len(seen) > 32 {
+			return nil, fmt.Errorf("dispatch client: PR-fix exclusions exceed maximum 32")
+		}
+		query.Add("exclude_pr_fix", value)
+	}
+	if len(seen) == 0 {
+		return c.Discover(ctx)
+	}
+	return c.discover(ctx, query)
+}
+
+const maxSafeInteger = 9007199254740991
+
+var dispatchRepoPattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9_.-]{0,99}/[A-Za-z0-9][A-Za-z0-9_.-]{0,99}$`)
+
+type nextTaskResponse struct {
+	Task
+	PRFixExclusions json.RawMessage `json:"prFixExclusions"`
+}
+
+func (c *HTTPClient) discover(ctx context.Context, query url.Values) ([]source.WorkItem, error) {
+	var response nextTaskResponse
+	endpoint := "/api/agents/" + url.PathEscape(c.agentName) + "/next-task"
+	if query != nil {
+		endpoint += "?" + query.Encode()
+	}
+	if err := c.do(ctx, http.MethodGet, endpoint, nil, &response); err != nil {
 		return nil, err
 	}
+	if query != nil {
+		var ack map[string]json.RawMessage
+		if len(response.PRFixExclusions) == 0 || json.Unmarshal(response.PRFixExclusions, &ack) != nil || ack == nil {
+			return nil, fmt.Errorf("dispatch client: missing or invalid PR-fix exclusions acknowledgment")
+		}
+		version, ok := ack["version"]
+		var versionValue int
+		if !ok || json.Unmarshal(version, &versionValue) != nil || versionValue != 1 {
+			return nil, fmt.Errorf("dispatch client: unsupported PR-fix exclusions acknowledgment")
+		}
+	}
+	task := response.Task
 	if !task.ShouldRun || task.Type == "idle" {
 		return nil, nil
 	}
