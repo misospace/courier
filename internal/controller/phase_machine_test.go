@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"reflect"
+	"strings"
 	"testing"
 
 	corev1 "k8s.io/api/core/v1"
@@ -32,6 +33,7 @@ type admissionSource struct {
 	preLaunches   []string
 	transitionErr error
 	reportErr     error
+	reportErrors  []error
 }
 
 type fakeWorldObserver struct {
@@ -64,6 +66,11 @@ func (s *admissionSource) Transition(_ context.Context, _ source.WorkItem, state
 func (s *admissionSource) Report(_ context.Context, _ source.WorkItem, lifecycle source.Lifecycle) error {
 	s.reports = append(s.reports, lifecycle)
 	s.events = append(s.events, "report:"+string(lifecycle.Result))
+	if len(s.reportErrors) > 0 {
+		err := s.reportErrors[0]
+		s.reportErrors = s.reportErrors[1:]
+		return err
+	}
 	return s.reportErr
 }
 func (s *admissionSource) PreLaunch(_ context.Context, item source.WorkItem) error {
@@ -1017,6 +1024,276 @@ func TestResolveIssueRedCIObserverReachesReviewAfterRepair(t *testing.T) {
 	}
 }
 
+func TestResolveIssueStableRedChecksHandOff(t *testing.T) {
+	item := &admissionSource{}
+	run := admissionRun("run", "local", courierv1alpha1.PhaseVerifying)
+	run.Spec.Mode = courierv1alpha1.ModeResolveIssue
+	run.Spec.Source = "manual"
+	run.Status.Branch = "courier/acme/widgets/issue-1"
+	run.Status.HeadRepo = "acme/widgets"
+	run.Status.HeadSHA = "head-abc"
+	client := phaseClient(t, run)
+	reconciler := &CoderRunReconciler{
+		Client:       client,
+		Sources:      NewSourceRegistry(map[string]source.Adapter{"manual": item}),
+		StatusWriter: fakeStatusWriter{client: client},
+		Observer: &sequenceWorldObserver{observations: []PRObservation{
+			redObservation("sha-red", "test"),
+			redObservation("sha-red", "test"),
+		}},
+	}
+	if _, err := reconciler.Reconcile(context.Background(), admissionRequest("run")); err != nil {
+		t.Fatalf("first Reconcile() error = %v", err)
+	}
+	var verifying courierv1alpha1.CoderRun
+	if err := client.Get(context.Background(), admissionKey("run"), &verifying); err != nil {
+		t.Fatalf("get run: %v", err)
+	}
+	if verifying.Status.Phase != courierv1alpha1.PhaseVerifying {
+		t.Fatalf("phase after first red observation = %q, want Verifying", verifying.Status.Phase)
+	}
+	if verifying.Status.FailedCheckFingerprint == "" {
+		t.Fatal("failedCheckFingerprint after first red observation = empty, want the recorded red set")
+	}
+	if len(item.reports) != 0 || len(item.transitions) != 0 {
+		t.Fatalf("first red observation settled early: reports=%#v transitions=%#v", item.reports, item.transitions)
+	}
+	if _, err := reconciler.Reconcile(context.Background(), admissionRequest("run")); err != nil {
+		t.Fatalf("second Reconcile() error = %v", err)
+	}
+	var settled courierv1alpha1.CoderRun
+	if err := client.Get(context.Background(), admissionKey("run"), &settled); err != nil {
+		t.Fatalf("get run: %v", err)
+	}
+	if settled.Status.Phase != courierv1alpha1.PhaseHandedOff {
+		t.Fatalf("phase after stable red observation = %q, want HandedOff", settled.Status.Phase)
+	}
+	if settled.Status.PR != "42" {
+		t.Fatalf("PR after handoff = %q, want 42 preserved", settled.Status.PR)
+	}
+	if settled.Status.HeadRepo != "acme/widgets" || settled.Status.HeadSHA != "head-abc" {
+		t.Fatalf("head identity after handoff = repo %q sha %q, want preserved", settled.Status.HeadRepo, settled.Status.HeadSHA)
+	}
+	if len(item.transitions) != 0 {
+		t.Fatalf("transitions = %#v, want none: a handoff publishes no source state", item.transitions)
+	}
+	if len(item.reports) != 1 || item.reports[0].Result != source.ResultHandedOff || item.reports[0].PR != "42" || item.reports[0].Error != externalVerificationFailureReason {
+		t.Fatalf("reports = %#v, want one handed-off report for PR 42", item.reports)
+	}
+}
+
+func TestResolveIssuePendingRedDoesNotSettle(t *testing.T) {
+	item := &admissionSource{}
+	run := admissionRun("run", "local", courierv1alpha1.PhaseVerifying)
+	run.Spec.Mode = courierv1alpha1.ModeResolveIssue
+	run.Spec.Source = "manual"
+	run.Status.Branch = "courier/acme/widgets/issue-1"
+	// Pre-seed a prior red candidate: the mixed observation must clear it
+	// rather than let it pair with a later fully-failed set.
+	run.Status.FailedCheckFingerprint = checkSetFingerprint(redObservation("sha-red", "test"))
+	client := phaseClient(t, run)
+	mixed := PRObservation{PR: "42", Head: "sha-red", Checks: []CheckObservation{
+		{Name: "test", State: CheckStateFailed},
+		{Name: "lint", State: CheckStatePending},
+	}}
+	reconciler := &CoderRunReconciler{
+		Client:       client,
+		Sources:      NewSourceRegistry(map[string]source.Adapter{"manual": item}),
+		StatusWriter: fakeStatusWriter{client: client},
+		Observer: &sequenceWorldObserver{observations: []PRObservation{
+			mixed,
+			mixed,
+			redObservation("sha-red", "test", "lint"),
+			redObservation("sha-red", "test", "lint"),
+		}},
+	}
+	for i, want := range []courierv1alpha1.Phase{
+		courierv1alpha1.PhaseVerifying,
+		courierv1alpha1.PhaseVerifying,
+		courierv1alpha1.PhaseVerifying,
+		courierv1alpha1.PhaseHandedOff,
+	} {
+		if _, err := reconciler.Reconcile(context.Background(), admissionRequest("run")); err != nil {
+			t.Fatalf("Reconcile() %d error = %v", i+1, err)
+		}
+		var updated courierv1alpha1.CoderRun
+		if err := client.Get(context.Background(), admissionKey("run"), &updated); err != nil {
+			t.Fatalf("get run: %v", err)
+		}
+		if updated.Status.Phase != want {
+			t.Fatalf("phase after observation %d = %q, want %q", i+1, updated.Status.Phase, want)
+		}
+		if i < 2 && updated.Status.FailedCheckFingerprint != "" {
+			t.Fatalf("failedCheckFingerprint after pending+red observation = %q, want cleared", updated.Status.FailedCheckFingerprint)
+		}
+	}
+	if len(item.transitions) != 0 {
+		t.Fatalf("transitions = %#v, want none: a pending observation never transitions", item.transitions)
+	}
+	if len(item.reports) != 1 || item.reports[0].Result != source.ResultHandedOff {
+		t.Fatalf("reports = %#v, want exactly one handed-off report", item.reports)
+	}
+}
+
+func TestResolveIssueRedThenGreenBeforeSettlement(t *testing.T) {
+	item := &admissionSource{}
+	run := admissionRun("run", "local", courierv1alpha1.PhaseVerifying)
+	run.Spec.Mode = courierv1alpha1.ModeResolveIssue
+	run.Spec.Source = "manual"
+	run.Status.Branch = "courier/acme/widgets/issue-1"
+	client := phaseClient(t, run)
+	reconciler := &CoderRunReconciler{
+		Client:       client,
+		Sources:      NewSourceRegistry(map[string]source.Adapter{"manual": item}),
+		StatusWriter: fakeStatusWriter{client: client},
+		Observer: &sequenceWorldObserver{observations: []PRObservation{
+			redObservation("sha-red", "test"),
+			greenObservation("sha-green", "test"),
+			greenObservation("sha-green", "test"),
+		}},
+	}
+	for i, want := range []courierv1alpha1.Phase{
+		courierv1alpha1.PhaseVerifying,
+		courierv1alpha1.PhaseVerifying,
+		courierv1alpha1.PhaseAwaitingReview,
+	} {
+		if _, err := reconciler.Reconcile(context.Background(), admissionRequest("run")); err != nil {
+			t.Fatalf("Reconcile() %d error = %v", i+1, err)
+		}
+		var updated courierv1alpha1.CoderRun
+		if err := client.Get(context.Background(), admissionKey("run"), &updated); err != nil {
+			t.Fatalf("get run: %v", err)
+		}
+		if updated.Status.Phase != want {
+			t.Fatalf("phase after observation %d = %q, want %q", i+1, updated.Status.Phase, want)
+		}
+	}
+	if len(item.transitions) != 1 || item.transitions[0] != source.StateInReview {
+		t.Fatalf("transitions = %#v, want exactly one in-review", item.transitions)
+	}
+	if len(item.reports) != 1 || item.reports[0].Result != source.ResultReady {
+		t.Fatalf("reports = %#v, want exactly one ready report", item.reports)
+	}
+}
+
+func TestHandoffReportRetryReusesIdempotencyKey(t *testing.T) {
+	item := &admissionSource{reportErr: errors.New("report unavailable")}
+	run := admissionRun("run", "local", courierv1alpha1.PhaseVerifying)
+	run.Spec.Mode = courierv1alpha1.ModeResolveIssue
+	run.Spec.Source = "manual"
+	run.Status.Branch = "courier/acme/widgets/issue-1"
+	observation := redObservation("sha-red", "test")
+	run.Status.FailedCheckFingerprint = checkSetFingerprint(observation)
+	client := phaseClient(t, run)
+	reconciler := &CoderRunReconciler{
+		Client:       client,
+		Sources:      NewSourceRegistry(map[string]source.Adapter{"manual": item}),
+		StatusWriter: fakeStatusWriter{client: client},
+		Observer:     fakeWorldObserver{observation: observation},
+	}
+	if _, err := reconciler.Reconcile(context.Background(), admissionRequest("run")); err != nil {
+		t.Fatalf("first Reconcile() error = %v, want nil (a failed report must not block terminalization)", err)
+	}
+	if len(item.reports) != 1 {
+		t.Fatalf("reports = %#v, want one before the retry", item.reports)
+	}
+	var handedOff courierv1alpha1.CoderRun
+	if err := client.Get(context.Background(), admissionKey("run"), &handedOff); err != nil {
+		t.Fatalf("get run: %v", err)
+	}
+	if handedOff.Status.Phase != courierv1alpha1.PhaseHandedOff {
+		t.Fatalf("phase = %q, want HandedOff", handedOff.Status.Phase)
+	}
+	item.reportErr = nil
+	if _, err := reconciler.Reconcile(context.Background(), admissionRequest("run")); err != nil {
+		t.Fatalf("second Reconcile() error = %v", err)
+	}
+	if len(item.reports) != 2 {
+		t.Fatalf("reports = %#v, want one per attempt", item.reports)
+	}
+	want := lifecycleIdempotencyKey(run, courierv1alpha1.PhaseHandedOff)
+	if item.reports[0].IdempotencyKey != want {
+		t.Fatalf("first report key = %q, want %q", item.reports[0].IdempotencyKey, want)
+	}
+	if item.reports[1].IdempotencyKey != item.reports[0].IdempotencyKey {
+		t.Fatalf("retry report key = %q, want %q", item.reports[1].IdempotencyKey, item.reports[0].IdempotencyKey)
+	}
+	if _, err := reconciler.Reconcile(context.Background(), admissionRequest("run")); err != nil {
+		t.Fatalf("third Reconcile() error = %v", err)
+	}
+	if len(item.reports) != 2 {
+		t.Fatalf("reports after publish = %#v, want no additional report", item.reports)
+	}
+	if len(item.resolved) != 0 {
+		t.Fatalf("resolved IDs = %#v, want none: a handoff never resolves the source", item.resolved)
+	}
+}
+
+func TestResolveIssueLostObserverDoesNotHandOff(t *testing.T) {
+	item := &admissionSource{}
+	run := admissionRun("run", "local", courierv1alpha1.PhaseVerifying)
+	run.Spec.Mode = courierv1alpha1.ModeResolveIssue
+	run.Spec.Source = "manual"
+	run.Status.Branch = "courier/acme/widgets/issue-1"
+	client := phaseClient(t, run)
+	reconciler := &CoderRunReconciler{
+		Client:       client,
+		Sources:      NewSourceRegistry(map[string]source.Adapter{"manual": item}),
+		StatusWriter: fakeStatusWriter{client: client},
+		Observer:     nil,
+	}
+	if _, err := reconciler.Reconcile(context.Background(), admissionRequest("run")); err != nil {
+		t.Fatalf("Reconcile() error = %v", err)
+	}
+	var updated courierv1alpha1.CoderRun
+	if err := client.Get(context.Background(), admissionKey("run"), &updated); err != nil {
+		t.Fatalf("get run: %v", err)
+	}
+	if updated.Status.Phase != courierv1alpha1.PhaseNeedsHuman {
+		t.Fatalf("phase = %q, want NeedsHuman without an observer", updated.Status.Phase)
+	}
+	for _, report := range item.reports {
+		if report.Result == source.ResultHandedOff {
+			t.Fatalf("reports = %#v, want no handoff without an observer", item.reports)
+		}
+	}
+}
+
+func TestResolveIssueHandoffIsSourceAgnostic(t *testing.T) {
+	item := &admissionSource{}
+	run := admissionRun("run", "local", courierv1alpha1.PhaseVerifying)
+	run.Spec.Mode = courierv1alpha1.ModeResolveIssue
+	run.Spec.Source = "custom"
+	run.Status.Branch = "courier/acme/widgets/issue-1"
+	client := phaseClient(t, run)
+	reconciler := &CoderRunReconciler{
+		Client:       client,
+		Sources:      NewSourceRegistry(map[string]source.Adapter{"custom": item}),
+		StatusWriter: fakeStatusWriter{client: client},
+		Observer: &sequenceWorldObserver{observations: []PRObservation{
+			redObservation("sha-red", "test"),
+			redObservation("sha-red", "test"),
+		}},
+	}
+	for i := 0; i < 2; i++ {
+		if _, err := reconciler.Reconcile(context.Background(), admissionRequest("run")); err != nil {
+			t.Fatalf("Reconcile() %d error = %v", i+1, err)
+		}
+	}
+	want := source.Lifecycle{
+		Result:         source.ResultHandedOff,
+		PR:             "42",
+		Error:          externalVerificationFailureReason,
+		IdempotencyKey: lifecycleIdempotencyKey(run, courierv1alpha1.PhaseHandedOff),
+	}
+	if len(item.reports) != 1 || !reflect.DeepEqual(item.reports[0], want) {
+		t.Fatalf("reports = %#v, want exactly one source-agnostic handoff %#v", item.reports, want)
+	}
+	if len(item.transitions) != 0 {
+		t.Fatalf("transitions = %#v, want none: the handoff carries no source state", item.transitions)
+	}
+}
+
 func TestCheckSetFingerprintRepresentsIdentity(t *testing.T) {
 	passed := func(name string) CheckObservation { return CheckObservation{Name: name, State: CheckStatePassed} }
 	pending := func(name string) CheckObservation { return CheckObservation{Name: name, State: CheckStatePending} }
@@ -1050,13 +1327,23 @@ func greenObservation(head string, names ...string) PRObservation {
 	return observation
 }
 
+// redObservation builds an all-red observation over the named checks.
+func redObservation(head string, names ...string) PRObservation {
+	observation := PRObservation{PR: "42", Head: head}
+	for _, name := range names {
+		observation.Checks = append(observation.Checks, CheckObservation{Name: name, State: CheckStateFailed})
+	}
+	return observation
+}
+
 func TestTerminalLifecycleReportsToSource(t *testing.T) {
 	tests := []struct {
-		name        string
-		mode        courierv1alpha1.Mode
-		observation PRObservation
-		wantPhase   courierv1alpha1.Phase
-		wantReport  source.Lifecycle
+		name             string
+		mode             courierv1alpha1.Mode
+		observation      PRObservation
+		wantPhase        courierv1alpha1.Phase
+		wantReport       source.Lifecycle
+		wantNoTransition bool
 	}{
 		{
 			name:        "awaiting review",
@@ -1072,9 +1359,12 @@ func TestTerminalLifecycleReportsToSource(t *testing.T) {
 			wantReport:  source.Lifecycle{State: source.StateInProgress, Result: source.ResultFailed, PR: "42", Error: externalVerificationFailureReason, IdempotencyKey: "coderun/default/run/Failed"},
 		},
 		{
-			name:        "failed resolve-issue checks stay nonterminal",
-			mode:        courierv1alpha1.ModeResolveIssue,
-			observation: PRObservation{PR: "42", Checks: []CheckObservation{{State: CheckStateFailed}}},
+			name:             "failed resolve-issue checks hand off",
+			mode:             courierv1alpha1.ModeResolveIssue,
+			observation:      redObservation("sha-red", "test", "lint"),
+			wantPhase:        courierv1alpha1.PhaseHandedOff,
+			wantReport:       source.Lifecycle{Result: source.ResultHandedOff, PR: "42", Error: externalVerificationFailureReason, IdempotencyKey: "coderun/default/run/HandedOff"},
+			wantNoTransition: true,
 		},
 	}
 	for _, tt := range tests {
@@ -1113,15 +1403,360 @@ func TestTerminalLifecycleReportsToSource(t *testing.T) {
 			if updated.Status.Phase != tt.wantPhase || updated.Status.PR != "42" {
 				t.Fatalf("status = phase %q PR %q, want %q 42", updated.Status.Phase, updated.Status.PR, tt.wantPhase)
 			}
+			if tt.wantNoTransition && len(item.transitions) != 0 {
+				t.Fatalf("transitions = %#v, want none: a handoff publishes no source state", item.transitions)
+			}
 		})
 	}
 }
 
-// TestTerminalLifecycleReportRetryReusesIdempotencyKey checks the retry-safe
-// ordering: the terminal phase is written before the lifecycle report, so a
-// failed report leaves the run in its terminal phase and the next reconcile
-// re-reports the same lifecycle carrying the same idempotency key for the
-// source to deduplicate.
+func TestUnsupportedLifecycleReportWaitsForExplicitTokenAndRetriesPendingIntent(t *testing.T) {
+	item := &admissionSource{reportErr: fmt.Errorf("%w: handed-off", source.ErrUnsupportedOutcome)}
+	run := admissionRun("run", "local", courierv1alpha1.PhaseHandedOff)
+	run.Spec.Source = "test"
+	run.Spec.WorkItemID = "opaque-work-item"
+	run.Status.PR = "42"
+	run.Status.Conditions = []metav1.Condition{{
+		Type: lifecycleReportedCondition, Status: metav1.ConditionFalse,
+		Reason:             lifecycleReportPendingExternalVerificationFailureReason,
+		Message:            externalVerificationFailureReason,
+		LastTransitionTime: metav1.Now(),
+	}}
+	client := phaseClient(t, run)
+	reconciler := &CoderRunReconciler{
+		Client: client, Sources: NewSourceRegistry(map[string]source.Adapter{"test": item}),
+		StatusWriter: status.KubePatchWriter{Client: client},
+	}
+
+	for i := 0; i < 2; i++ {
+		result, err := reconciler.Reconcile(context.Background(), admissionRequest("run"))
+		if err != nil || result.Requeue || result.RequeueAfter != 0 {
+			t.Fatalf("unsupported reconcile %d = (%#v, %v), want no error or retry", i, result, err)
+		}
+	}
+	if len(item.reports) != 1 || item.reports[0].Result != source.ResultHandedOff || item.reports[0].Error != externalVerificationFailureReason {
+		t.Fatalf("reports = %#v, want one truthful pending handoff report", item.reports)
+	}
+	var pending courierv1alpha1.CoderRun
+	if err := client.Get(context.Background(), admissionKey("run"), &pending); err != nil {
+		t.Fatal(err)
+	}
+	cond := apimeta.FindStatusCondition(pending.Status.Conditions, lifecycleReportedCondition)
+	capability := apimeta.FindStatusCondition(pending.Status.Conditions, lifecycleReportSupportedCondition)
+	if pending.Status.Phase != courierv1alpha1.PhaseHandedOff || cond == nil || cond.Status != metav1.ConditionFalse || cond.Reason != lifecycleReportPendingExternalVerificationFailureReason || cond.Message != externalVerificationFailureReason || capability == nil || capability.Status != metav1.ConditionFalse || capability.Reason != lifecycleReportUnsupportedOutcomeReason {
+		t.Fatalf("pending state = phase %q lifecycle %#v capability %#v, want preserved intent and unsupported capability", pending.Status.Phase, cond, capability)
+	}
+
+	if len(item.transitions) != 0 {
+		t.Fatalf("transitions = %#v, want none for source-neutral handoff", item.transitions)
+	}
+
+	// An explicit retry is consumed even if the backend still rejects it;
+	// it does not create a new automatic retry loop.
+	pending.Annotations = map[string]string{retryLifecycleReportAnnotation: "operator-retry-1"}
+	if err := client.Update(context.Background(), &pending); err != nil {
+		t.Fatal(err)
+	}
+	restarted := &CoderRunReconciler{
+		Client: client, Sources: NewSourceRegistry(map[string]source.Adapter{"test": item}),
+		StatusWriter: status.KubePatchWriter{Client: client},
+	}
+	if result, err := restarted.Reconcile(context.Background(), admissionRequest("run")); err != nil || result.Requeue || result.RequeueAfter != 0 {
+		t.Fatalf("unsupported explicit retry = (%#v, %v), want no automatic retry", result, err)
+	}
+	if len(item.reports) != 2 {
+		t.Fatalf("reports = %d, want one explicit retry", len(item.reports))
+	}
+	var unsupported courierv1alpha1.CoderRun
+	if err := client.Get(context.Background(), admissionKey("run"), &unsupported); err != nil {
+		t.Fatal(err)
+	}
+	if unsupported.Status.LifecycleReportRetryToken != "operator-retry-1" {
+		t.Fatalf("processed token = %q, want operator-retry-1", unsupported.Status.LifecycleReportRetryToken)
+	}
+	if _, err := restarted.Reconcile(context.Background(), admissionRequest("run")); err != nil || len(item.reports) != 2 {
+		t.Fatalf("reconcile with consumed token = error %v reports %d, want no duplicate", err, len(item.reports))
+	}
+	if got := pendingLifecycleIntent(&unsupported); got.ciFailure != true || got.error != externalVerificationFailureReason {
+		t.Fatalf("restart intent = %#v, want CI failure and original report text", got)
+	}
+
+	// A second token can retry after the source gains support.
+	unsupported.Annotations[retryLifecycleReportAnnotation] = "operator-retry-2"
+	if err := client.Update(context.Background(), &unsupported); err != nil {
+		t.Fatal(err)
+	}
+	item.reportErr = nil
+	if result, err := restarted.Reconcile(context.Background(), admissionRequest("run")); err != nil || result.Requeue || result.RequeueAfter != 0 {
+		t.Fatalf("accepted retry = (%#v, %v), want published without retry", result, err)
+	}
+	if len(item.reports) != 3 || item.reports[2].Result != source.ResultHandedOff || item.reports[2].PR != "42" || item.reports[2].Error != externalVerificationFailureReason || item.reports[2].IdempotencyKey != item.reports[0].IdempotencyKey {
+		t.Fatalf("retry reports = %#v, want same pending lifecycle and idempotency key", item.reports)
+	}
+	var published courierv1alpha1.CoderRun
+	if err := client.Get(context.Background(), admissionKey("run"), &published); err != nil {
+		t.Fatal(err)
+	}
+	cond = apimeta.FindStatusCondition(published.Status.Conditions, lifecycleReportedCondition)
+	capability = apimeta.FindStatusCondition(published.Status.Conditions, lifecycleReportSupportedCondition)
+	if published.Status.Phase != courierv1alpha1.PhaseHandedOff || published.Status.LifecycleReportRetryToken != "operator-retry-2" || cond == nil || cond.Status != metav1.ConditionTrue || cond.Reason != "Published" || capability == nil || capability.Status != metav1.ConditionTrue {
+		t.Fatalf("published state = phase %q token %q lifecycle %#v capability %#v", published.Status.Phase, published.Status.LifecycleReportRetryToken, cond, capability)
+	}
+	if _, err := restarted.Reconcile(context.Background(), admissionRequest("run")); err != nil || len(item.reports) != 3 {
+		t.Fatalf("reconcile after publish = error %v reports %d, want no duplicate", err, len(item.reports))
+	}
+}
+
+func TestUnsupportedRetryPreservesLifecycleIntent(t *testing.T) {
+	for _, tt := range []struct {
+		name         string
+		phase        courierv1alpha1.Phase
+		mode         courierv1alpha1.Mode
+		reason       string
+		message      string
+		wantState    source.State
+		wantResult   source.Result
+		wantError    string
+		wantSkipMark bool
+	}{
+		{
+			name: "fix-pr CI failure", phase: courierv1alpha1.PhaseFailed, mode: courierv1alpha1.ModeFixPR,
+			reason: lifecycleReportPendingExternalVerificationFailureReason, message: externalVerificationFailureReason,
+			wantState: source.StateInProgress, wantResult: source.ResultFailed, wantError: externalVerificationFailureReason,
+		},
+		{
+			name: "needs-human skip queue mark", phase: courierv1alpha1.PhaseNeedsHuman, mode: courierv1alpha1.ModeFixPR,
+			reason: lifecycleReportPendingBlockedReportParksPRFixReason, message: "coordinator failed",
+			wantState: source.StateNeedsHuman, wantResult: source.ResultBlocked, wantError: "coordinator failed", wantSkipMark: true,
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			item := &admissionSource{reportErr: fmt.Errorf("%w: unsupported", source.ErrUnsupportedOutcome)}
+			run := admissionRun("run", "local", tt.phase)
+			run.Spec.Mode, run.Spec.Source, run.Spec.WorkItemID = tt.mode, "test", "opaque-work-item"
+			run.Status.Conditions = []metav1.Condition{{
+				Type: lifecycleReportedCondition, Status: metav1.ConditionFalse,
+				Reason: tt.reason, Message: tt.message, LastTransitionTime: metav1.Now(),
+			}, {
+				Type: lifecycleReportSupportedCondition, Status: metav1.ConditionFalse,
+				Reason: lifecycleReportUnsupportedOutcomeReason, Message: "unsupported", LastTransitionTime: metav1.Now(),
+			}}
+			run.Annotations = map[string]string{retryLifecycleReportAnnotation: "retry-1"}
+			client := phaseClient(t, run)
+			reconciler := &CoderRunReconciler{
+				Client: client, Sources: NewSourceRegistry(map[string]source.Adapter{"test": item}),
+				StatusWriter: status.KubePatchWriter{Client: client},
+			}
+			if _, err := reconciler.Reconcile(context.Background(), admissionRequest("run")); err != nil {
+				t.Fatalf("retry Reconcile() error = %v", err)
+			}
+			if len(item.transitions) != 1 || item.transitions[0] != tt.wantState {
+				t.Fatalf("transitions = %#v, want [%s]", item.transitions, tt.wantState)
+			}
+			if len(item.reports) != 1 || item.reports[0].Result != tt.wantResult || item.reports[0].Error != tt.wantError || item.reports[0].BlockedReportParksPRFix != tt.wantSkipMark {
+				t.Fatalf("reports = %#v, want result %s, error %q, skip mark %t", item.reports, tt.wantResult, tt.wantError, tt.wantSkipMark)
+			}
+			var updated courierv1alpha1.CoderRun
+			if err := client.Get(context.Background(), admissionKey("run"), &updated); err != nil {
+				t.Fatal(err)
+			}
+			cond := apimeta.FindStatusCondition(updated.Status.Conditions, lifecycleReportedCondition)
+			if cond == nil || cond.Reason != tt.reason || cond.Message != tt.message {
+				t.Fatalf("LifecycleReported = %#v, want original durable intent", cond)
+			}
+			if updated.Status.LifecycleReportRetryToken != "retry-1" {
+				t.Fatalf("processed retry token = %q, want retry-1", updated.Status.LifecycleReportRetryToken)
+			}
+			if _, err := reconciler.Reconcile(context.Background(), admissionRequest("run")); err != nil || len(item.reports) != 1 {
+				t.Fatalf("reconcile with consumed retry token = %v reports %d, want no duplicate", err, len(item.reports))
+			}
+		})
+	}
+}
+
+func TestUnsupportedRetryTransientSequenceRetainsTokenAndIntent(t *testing.T) {
+	item := &admissionSource{reportErrors: []error{
+		errors.New("502 upstream unavailable"),
+		fmt.Errorf("%w: unsupported", source.ErrUnsupportedOutcome),
+	}}
+	run := admissionRun("run", "local", courierv1alpha1.PhaseFailed)
+	run.Spec.Mode, run.Spec.Source, run.Spec.WorkItemID = courierv1alpha1.ModeFixPR, "test", "opaque-work-item"
+	run.Status.Conditions = []metav1.Condition{{
+		Type: lifecycleReportedCondition, Status: metav1.ConditionFalse,
+		Reason:  lifecycleReportPendingExternalVerificationFailureReason,
+		Message: externalVerificationFailureReason, LastTransitionTime: metav1.Now(),
+	}, {
+		Type: lifecycleReportSupportedCondition, Status: metav1.ConditionFalse,
+		Reason: lifecycleReportUnsupportedOutcomeReason, LastTransitionTime: metav1.Now(),
+	}}
+	run.Status.LifecycleReportRetryToken = "prior-token"
+	run.Annotations = map[string]string{retryLifecycleReportAnnotation: "retry-1"}
+	client := phaseClient(t, run)
+	reconciler := &CoderRunReconciler{
+		Client: client, Sources: NewSourceRegistry(map[string]source.Adapter{"test": item}),
+		StatusWriter: status.KubePatchWriter{Client: client},
+	}
+	for i := 0; i < 3; i++ {
+		result, err := reconciler.Reconcile(context.Background(), admissionRequest("run"))
+		if err != nil {
+			t.Fatalf("reconcile %d error = %v", i, err)
+		}
+		if i == 0 && result.RequeueAfter <= 0 {
+			t.Fatalf("transient retry result = %#v, want bounded automatic retry", result)
+		}
+		if i == 1 && (result.Requeue || result.RequeueAfter != 0) {
+			t.Fatalf("unsupported retry result = %#v, want no automatic retry", result)
+		}
+		if i == 0 {
+			var retry courierv1alpha1.CoderRun
+			if err := client.Get(context.Background(), admissionKey("run"), &retry); err != nil {
+				t.Fatal(err)
+			}
+			if retry.Status.LifecycleReportRetryToken != "prior-token" || retry.Status.LifecycleReportActiveRetryToken != "retry-1" {
+				t.Fatalf("transient attempt tokens = consumed %q active %q, want prior-token retained and retry-1 pending", retry.Status.LifecycleReportRetryToken, retry.Status.LifecycleReportActiveRetryToken)
+			}
+			delete(retry.Annotations, retryLifecycleReportAnnotation)
+			if err := client.Update(context.Background(), &retry); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	var updated courierv1alpha1.CoderRun
+	if err := client.Get(context.Background(), admissionKey("run"), &updated); err != nil {
+		t.Fatal(err)
+	}
+	cond := apimeta.FindStatusCondition(updated.Status.Conditions, lifecycleReportedCondition)
+	capability := apimeta.FindStatusCondition(updated.Status.Conditions, lifecycleReportSupportedCondition)
+	if updated.Status.LifecycleReportRetryToken != "retry-1" || updated.Status.LifecycleReportActiveRetryToken != "" || cond == nil || cond.Reason != lifecycleReportPendingExternalVerificationFailureReason || cond.Message != externalVerificationFailureReason || capability == nil || capability.Status != metav1.ConditionFalse {
+		t.Fatalf("state = token %q active token %q lifecycle %#v capability %#v; want consumed token, original intent, and stopped unsupported state", updated.Status.LifecycleReportRetryToken, updated.Status.LifecycleReportActiveRetryToken, cond, capability)
+	}
+	if len(item.reports) != 2 || len(item.transitions) != 2 || item.transitions[1] != source.StateInProgress || item.reports[1].Result != source.ResultFailed {
+		t.Fatalf("reports %#v transitions %#v; want three attempts preserving CI failure", item.reports, item.transitions)
+	}
+	if _, err := reconciler.Reconcile(context.Background(), admissionRequest("run")); err != nil || len(item.reports) != 2 {
+		t.Fatalf("post-unsupported reconcile error %v reports %d; want stopped", err, len(item.reports))
+	}
+}
+
+func TestUnsupportedRetryTransientThenSuccessConsumesToken(t *testing.T) {
+	item := &admissionSource{reportErr: errors.New("502 upstream unavailable")}
+	run := admissionRun("run", "local", courierv1alpha1.PhaseFailed)
+	run.Spec.Mode, run.Spec.Source, run.Spec.WorkItemID = courierv1alpha1.ModeFixPR, "test", "opaque-work-item"
+	run.Status.Conditions = []metav1.Condition{{
+		Type: lifecycleReportedCondition, Status: metav1.ConditionFalse,
+		Reason:  lifecycleReportPendingExternalVerificationFailureReason,
+		Message: externalVerificationFailureReason, LastTransitionTime: metav1.Now(),
+	}, {
+		Type: lifecycleReportSupportedCondition, Status: metav1.ConditionFalse,
+		Reason: lifecycleReportUnsupportedOutcomeReason, LastTransitionTime: metav1.Now(),
+	}}
+	run.Annotations = map[string]string{retryLifecycleReportAnnotation: "retry-1"}
+	client := phaseClient(t, run)
+	reconciler := &CoderRunReconciler{
+		Client: client, Sources: NewSourceRegistry(map[string]source.Adapter{"test": item}),
+		StatusWriter: status.KubePatchWriter{Client: client},
+	}
+	result, err := reconciler.Reconcile(context.Background(), admissionRequest("run"))
+	if err != nil || result.RequeueAfter <= 0 {
+		t.Fatalf("transient explicit retry = (%#v, %v), want ordinary bounded retry", result, err)
+	}
+	var pending courierv1alpha1.CoderRun
+	if err := client.Get(context.Background(), admissionKey("run"), &pending); err != nil {
+		t.Fatal(err)
+	}
+	cond := apimeta.FindStatusCondition(pending.Status.Conditions, lifecycleReportedCondition)
+	if pending.Status.LifecycleReportRetryToken != "" || pending.Status.LifecycleReportActiveRetryToken != "retry-1" || cond == nil || cond.Reason != lifecycleReportPendingExternalVerificationFailureReason || cond.Message != externalVerificationFailureReason {
+		t.Fatalf("transient state tokens consumed %q active %q condition %#v; want pending attempt token and original intent", pending.Status.LifecycleReportRetryToken, pending.Status.LifecycleReportActiveRetryToken, cond)
+	}
+	pending.Annotations[retryLifecycleReportAnnotation] = "retry-2"
+	if err := client.Update(context.Background(), &pending); err != nil {
+		t.Fatal(err)
+	}
+	item.reportErr = nil
+	result, err = reconciler.Reconcile(context.Background(), admissionRequest("run"))
+	if err != nil || result.Requeue || result.RequeueAfter != 0 {
+		t.Fatalf("successful retry = (%#v, %v), want published", result, err)
+	}
+	var published courierv1alpha1.CoderRun
+	if err := client.Get(context.Background(), admissionKey("run"), &published); err != nil {
+		t.Fatal(err)
+	}
+	cond = apimeta.FindStatusCondition(published.Status.Conditions, lifecycleReportedCondition)
+	if published.Status.LifecycleReportRetryToken != "retry-1" || published.Status.LifecycleReportActiveRetryToken != "" || cond == nil || cond.Status != metav1.ConditionTrue || cond.Reason != "Published" || len(item.reports) != 2 || item.reports[1].Result != source.ResultFailed {
+		t.Fatalf("published state token %q condition %#v reports %#v; want settled in-flight token and original failed result", published.Status.LifecycleReportRetryToken, cond, item.reports)
+	}
+	if _, err := reconciler.Reconcile(context.Background(), admissionRequest("run")); err != nil || len(item.reports) != 2 {
+		t.Fatalf("reconcile after publication = %v reports %d, want no duplicate report", err, len(item.reports))
+	}
+}
+
+func TestUnsupportedRetryTransientThenUnsupportedKeepsNewerAnnotationEligible(t *testing.T) {
+	item := &admissionSource{reportErr: errors.New("502 upstream unavailable")}
+	run := admissionRun("run", "local", courierv1alpha1.PhaseFailed)
+	run.Spec.Mode, run.Spec.Source, run.Spec.WorkItemID = courierv1alpha1.ModeFixPR, "test", "opaque-work-item"
+	run.Status.Conditions = []metav1.Condition{{
+		Type: lifecycleReportedCondition, Status: metav1.ConditionFalse,
+		Reason:  lifecycleReportPendingExternalVerificationFailureReason,
+		Message: externalVerificationFailureReason, LastTransitionTime: metav1.Now(),
+	}, {
+		Type: lifecycleReportSupportedCondition, Status: metav1.ConditionFalse,
+		Reason: lifecycleReportUnsupportedOutcomeReason, LastTransitionTime: metav1.Now(),
+	}}
+	run.Annotations = map[string]string{retryLifecycleReportAnnotation: "retry-1"}
+	client := phaseClient(t, run)
+	reconciler := &CoderRunReconciler{
+		Client: client, Sources: NewSourceRegistry(map[string]source.Adapter{"test": item}),
+		StatusWriter: status.KubePatchWriter{Client: client},
+	}
+	if result, err := reconciler.Reconcile(context.Background(), admissionRequest("run")); err != nil || result.RequeueAfter <= 0 {
+		t.Fatalf("transient retry = (%#v, %v), want bounded retry", result, err)
+	}
+	var pending courierv1alpha1.CoderRun
+	if err := client.Get(context.Background(), admissionKey("run"), &pending); err != nil {
+		t.Fatal(err)
+	}
+	pending.Annotations[retryLifecycleReportAnnotation] = "retry-2"
+	if err := client.Update(context.Background(), &pending); err != nil {
+		t.Fatal(err)
+	}
+	item.reportErr = fmt.Errorf("%w: still unsupported", source.ErrUnsupportedOutcome)
+	if result, err := reconciler.Reconcile(context.Background(), admissionRequest("run")); err != nil || result.Requeue || result.RequeueAfter != 0 {
+		t.Fatalf("unsupported in-flight retry = (%#v, %v), want settled without automatic retry", result, err)
+	}
+	var settled courierv1alpha1.CoderRun
+	if err := client.Get(context.Background(), admissionKey("run"), &settled); err != nil {
+		t.Fatal(err)
+	}
+	if settled.Status.LifecycleReportRetryToken != "retry-1" || settled.Status.LifecycleReportActiveRetryToken != "" {
+		t.Fatalf("settled tokens consumed %q active %q; want only retry-1 settled", settled.Status.LifecycleReportRetryToken, settled.Status.LifecycleReportActiveRetryToken)
+	}
+	item.reportErr = nil
+	if _, err := reconciler.Reconcile(context.Background(), admissionRequest("run")); err != nil {
+		t.Fatalf("reconcile newer token: %v", err)
+	}
+	if len(item.reports) != 3 {
+		t.Fatalf("reports = %d, want second explicit retry after initial transient and unsupported attempts", len(item.reports))
+	}
+	if _, err := reconciler.Reconcile(context.Background(), admissionRequest("run")); err != nil || len(item.reports) != 3 {
+		t.Fatalf("reconcile after newer token published = %v reports %d, want no duplicate", err, len(item.reports))
+	}
+}
+
+func TestLifecycleRetryTokenUsesUnicodeCodePointBound(t *testing.T) {
+	if !validLifecycleReportRetryToken(strings.Repeat("é", 128)) {
+		t.Fatal("128 Unicode code points should be accepted")
+	}
+	if validLifecycleReportRetryToken(strings.Repeat("é", 129)) {
+		t.Fatal("129 Unicode code points should be rejected")
+	}
+	if validLifecycleReportRetryToken("") || validLifecycleReportRetryToken(string([]byte{0xff})) {
+		t.Fatal("empty and invalid UTF-8 tokens should be rejected")
+	}
+	if validLifecycleReportRetryToken(strings.Repeat("a", 129)) {
+		t.Fatal("129 ASCII code points should be rejected")
+	}
+}
+
 func TestTerminalLifecycleReportRetryReusesIdempotencyKey(t *testing.T) {
 	item := &admissionSource{reportErr: errors.New("report unavailable")}
 	run := admissionRun("run", "local", courierv1alpha1.PhaseVerifying)
@@ -1373,6 +2008,10 @@ func TestTransitionSupersededReportCompletesTerminalAndDrops(t *testing.T) {
 	}
 	if cond.Status != metav1.ConditionTrue || cond.Reason != "Superseded" {
 		t.Fatalf("LifecycleReported = %s %q, want True Superseded", cond.Status, cond.Reason)
+	}
+	capability := apimeta.FindStatusCondition(updated.Status.Conditions, lifecycleReportSupportedCondition)
+	if capability == nil || capability.Status != metav1.ConditionUnknown || capability.Reason != "Superseded" {
+		t.Fatalf("LifecycleReportSupported = %#v, want Unknown Superseded", capability)
 	}
 }
 

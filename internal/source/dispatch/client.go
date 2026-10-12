@@ -439,7 +439,22 @@ func (c *HTTPClient) reportTaskWithPR(ctx context.Context, d workDescriptor, out
 	if len(telemetry) > 0 {
 		body["telemetry"] = telemetry
 	}
-	return c.do(ctx, http.MethodPost, "/api/agents/"+url.PathEscape(c.agentName)+"/tasks/report", body, nil)
+	err := c.do(ctx, http.MethodPost, "/api/agents/"+url.PathEscape(c.agentName)+"/tasks/report", body, nil)
+	var apiErr *APIError
+	if errors.As(err, &apiErr) && apiErr.StatusCode == http.StatusBadRequest && isInvalidOutcomeResponse(apiErr.Message) {
+		return fmt.Errorf("%w: %w", source.ErrUnsupportedOutcome, apiErr)
+	}
+	return err
+}
+
+func isInvalidOutcomeResponse(message string) bool {
+	var response struct {
+		Error string `json:"error"`
+	}
+	if err := json.Unmarshal([]byte(message), &response); err != nil {
+		return false
+	}
+	return strings.HasPrefix(strings.TrimSpace(response.Error), "Invalid outcome. Must be one of:")
 }
 
 func parsePullRequest(value string) (int, string) {
@@ -513,6 +528,11 @@ func (c *HTTPClient) Report(ctx context.Context, id string, lifecycle source.Lif
 		// existing attempt cap. A separate BLOCKED mark can target a stale
 		// generation after the report advances the queue item.
 		return c.reportTaskWithPR(ctx, d, "failed", lifecycle.Error, lifecycle.PR, lifecycle.IdempotencyKey, lifecycle.Telemetry, lifecycle.StartedAt)
+	case source.ResultHandedOff:
+		// This is truthful, non-parking evidence; Dispatch discovers red checks
+		// through its own PR-followup sync. It must not be Ready (green) or
+		// BLOCKED (which parks the issue).
+		return c.reportTaskWithPR(ctx, d, "handed-off", lifecycle.Error, lifecycle.PR, lifecycle.IdempotencyKey, lifecycle.Telemetry, lifecycle.StartedAt)
 	default:
 		return nil
 	}

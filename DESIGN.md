@@ -168,9 +168,11 @@ A coordinator run ends after one of:
   source report.
 
 External verification can later reach a separate outcome: stable green advances
-**Verifying** to **AwaitingReview**; a red check ends the run as **Failed** and
-emits a failed lifecycle result. The source decides how to handle that failure;
-queue-backed PR-fix work follows its existing retry policy.
+**Verifying** to **AwaitingReview**; a red check on a fix-pr run ends it as
+**Failed** and emits a failed lifecycle result, while a resolve-issue run whose
+published PR has stable, confirmed red checks reaches **HandedOff** and hands
+the PR to the source's independent repair mechanism. The source decides how to
+handle the failure; queue-backed PR-fix work follows its existing retry policy.
 
 The coordinator declares its ending in the executor-provided outcome file,
 whose exact path is in the goal. The executor validates the declaration against
@@ -1029,7 +1031,7 @@ spec:                       # set once by the source adapter, then immutable
   debug: false                     # per-run: bumps pod log level, nothing else
   # no attempts field — by design
 status:
-  phase: Pending | Claimed | Running | Verifying | AwaitingReview | NeedsHuman | Done | Failed
+  phase: Pending | Claimed | Running | Verifying | AwaitingReview | HandedOff | NeedsHuman | Done | Failed
   branch: <derived resolve branch or adopted PR head>
   headRepo: <PR head repo; spec.repo for a same-repo PR, the fork's owner/name for a fork PR>
   headSHA: <head commit SHA>
@@ -1132,34 +1134,58 @@ there is no delete verb because active runs reference lanes. (#73)
   the external PR and CI world indefinitely, with a reconciliation cadence and
   no deadline. Observer errors remain Verifying and requeue. A missing observer
   or missing/draft PR reaches **NeedsHuman**. A failed check on a fix-pr run
-  reaches **Failed** so its source can apply its retry policy. Resolve-issue
-  runs remain **Verifying** on red checks so the original issue can still reach
-  review after a follow-up repairs the PR. Queue-backed PR-fix sources issue
-  another attempt under their existing cap. A PR with no checks or pending
-  checks remains **Verifying**; the PR is persisted. Green is declared
-  only from **two consecutive all-green observations of the same check set**:
-  every all-green observation records a compact fingerprint of the check
-  identities (head commit plus sorted check names) on the run status, and an
-  observation may transition to **AwaitingReview** only when it matches the
-  previous all-green observation's fingerprint. Any pending or empty
-  observation clears that recorded candidate — checks that have not registered
-  yet can still appear at any later poll, so a pending observation can never
-  pre-settle an identity — and a changed set (a new check, a new push) resets
-  it the same way. A partial snapshot cannot pass. The source becomes
-  `in-review` with the transition. Verifying does not consume LaneProfile
-  execution capacity; the source remains `in-progress` while polling, publishes
-  `in-review` after stable green observations. Fix-pr attempts receive `failed`
-  if checks turn red; initial issue observers remain active without lane capacity.
+  reaches **Failed** so its source can apply its retry policy. A resolve-issue
+  run whose published PR has stable, confirmed red checks reaches **HandedOff**
+  rather than sitting in **Verifying** forever: the PR was published but
+  external verification did not pass, so the source's independent PR-repair
+  mechanism takes over using the carried PR identity. Queue-backed PR-fix
+  sources issue another attempt under their existing cap. A PR with no checks or
+  pending checks remains **Verifying**; the PR is persisted.
+
+  Green is declared only from **two consecutive all-green observations of the
+  same check set**: every all-green observation records a compact fingerprint of
+  the check identities (head commit plus sorted check names) on
+  `status.checkFingerprint`, and an observation may transition to
+  **AwaitingReview** only when it matches the previous all-green observation's
+  fingerprint. Any pending or empty observation clears that recorded candidate —
+  checks that have not registered yet can still appear at any later poll, so a
+  pending observation can never pre-settle an identity — and a changed set (a
+  new check, a new push) resets it the same way. A partial snapshot cannot pass.
+  The source becomes `in-review` with the transition.
+
+  Red settles symmetrically. A fully-failed observation records the compact
+  identity of the check set on `status.failedCheckFingerprint` — the same head
+  plus sorted check names, independent of check state — and a **second
+  consecutive fully-failed observation with the same fingerprint** moves a
+  resolve-issue run to **HandedOff**. A pending or empty observation clears both
+  candidates; a changed check set resets the red candidate; an all-green
+  observation clears the red candidate and starts or continues the
+  two-consecutive-green settle. A red check combined with any pending check is
+  not fully-failed and does not settle. On settle the run preserves `status.pr`
+  and the head/check identity and publishes **no source `State` transition** —
+  neither `in-review` nor `needs-human` — and exactly one lifecycle report:
+  `handed-off`, carrying the observed PR and the reason `external verification
+  failed`, under the run's stable `coderun/<namespace>/<name>/HandedOff`
+  idempotency key, with the run UID appended when set. A failed report leaves the
+  run **HandedOff** and is retried on
+  a later reconcile with the same key. Verifying does not consume LaneProfile
+  execution capacity; the source remains `in-progress` while polling and
+  publishes `in-review` after stable green observations. Fix-pr attempts receive
+  `failed` if checks turn red; a resolve-issue run hands off to **HandedOff**
+  instead.
 - **AwaitingReview** is terminal for this run. For a PR, human merges → operator
   marks **Done** and resolves the source; feedback/conflict → the source spawns a
   fresh `fix-pr` run without reusing the previous run. A `no_change_needed`
   resolve-issue run also waits here with its evidence posted for human review;
   Courier does not resolve that source from the coordinator's declaration. The
   previous run remains auditable; its completion does not settle later feedback.
-- **Reap:** Done runs are deleted (checkpoint dies with the CR). NeedsHuman runs
-  are kept for inspection and deleted on request. Zero standing footprint between
-  runs — a strict improvement over Foreman's ownerRef-less audit ConfigMaps,
-  which require an external sweeper.
+  **HandedOff** is the separate terminal phase for a published resolve-issue PR
+  whose stable red checks the source will repair; it is not a success, so it is
+  not reaped like **Done** and does not publish `in-review`.
+- **Reap:** Done runs are deleted (checkpoint dies with the CR). NeedsHuman and
+  HandedOff runs are kept for inspection and deleted on request. Zero standing
+  footprint between runs — a strict improvement over Foreman's ownerRef-less
+  audit ConfigMaps, which require an external sweeper.
 
 **Terminalization writes the run's own phase before it reports to the source.**
 A rejected or failed source report never holds a run in `Running`: the phase is
@@ -1179,7 +1205,14 @@ Pluggable adapters over a generic interface. An adapter both *creates* runs and
 - **dispatch** (first-party, native — no bridge). The operator *is* the dispatch
   client: claim, in-progress, in-review, needs-human, and watching the pr-fix
   queue to materialize `fix-pr` runs. This replaces the foreman-dispatch-bridge
-  entirely.
+  entirely. A resolve-issue `handed-off` report sends a task report with
+  `outcome="handed-off"`, the PR, and the verification error; it is neither
+  `ready` nor a `BLOCKED` queue mark, because Dispatch discovers the failed
+  checks through its own `POST /api/pr-followup/sync` and enqueues repair
+  independently. Dispatch accepts this neutral outcome since
+  misospace/dispatch#1226; its task report does not settle the PR-fix queue.
+  Courier still recognizes unsupported-outcome HTTP 400 responses from older
+  or incompatible Dispatch servers and waits for explicit operator retry.
 - **github-label / gitlab / forgejo / tangled** — a labeled issue becomes a
   resolve-issue run; CHANGES_REQUESTED becomes a fix-pr run.
 - **cron** — scheduled work (the weekly audit, backlog grooming). This is what
@@ -1714,6 +1747,53 @@ was superseded.
   issue. Sources apply their own failure policy. Dispatch's failed report performs the retry/cap
   decision for queue-backed PR-fix work, so Courier must not send a second
   `BLOCKED` mark for the same now-advanced generation.
+- **2026-10-11 — #246: unsupported lifecycle reports stop retrying until explicit request.** At implementation time Dispatch's outcome allowlist did not include `handed-off`; after misospace/dispatch#1226 merged, current Dispatch accepts this neutral result without PR-fix queue settlement. Courier still handles explicit unsupported-outcome responses from older or incompatible servers: it preserves truthful pending lifecycle intent, stops retrying only that typed case, and allows an operator to request another attempt with a new bounded annotation token. Transient source errors still retry as before.
+- **2026-10-09 — #246: a resolve-issue run hands off a published PR with stable
+  red checks.** Supersedes the resolve-issue half of the 2026-10-06 decision
+  above: a resolve-issue run sat in `Verifying` indefinitely on red CI, waiting
+  for a later repair to advance the original issue. That tied the run's
+  lifetime to an unrelated repair and left a red PR with no source-side signal.
+  Reusing `ResultReady` was rejected: it would falsely attest green to the
+  source. A plain `Failed` was rejected: it parks the underlying issue as
+  `BLOCKED` even though the PR is published and the source's own repair path
+  should own it. The new source-neutral `ResultHandedOff` ("handed-off") says
+  exactly that: published but not verified, so the source neither treats it as
+  ready nor parks it, and its independent PR-repair mechanism takes over using
+  the carried PR identity. A fully-failed observation records a compact red
+  fingerprint (head plus sorted check names) on
+  `status.failedCheckFingerprint`, symmetric to the all-green
+  `status.checkFingerprint`; a second consecutive fully-failed observation with
+  the same fingerprint settles a resolve-issue run to the new terminal
+  `HandedOff` phase, which consumes no lane capacity, is not reaped like `Done`,
+  and is not a success like `AwaitingReview`. On settle it publishes no source
+  `State` transition and exactly one idempotent `handed-off` lifecycle report
+  under `coderun/<namespace>/<name>/HandedOff` (with the run UID appended when
+  set). Transient report failures retry with the same key. If the source
+  rejects the outcome as unsupported, Courier preserves the original
+  `LifecycleReported=False` intent and records the separate
+  `LifecycleReportSupported=False/UnsupportedOutcome` condition; no automatic
+  retry occurs until an operator sets a new token in the
+  `courier.misospace.dev/retry-lifecycle-report` annotation. Tokens are opaque,
+  non-empty, valid UTF-8, and limited to 128 Unicode code points; invalid values
+  are ignored and logged without logging their contents. A transient failure
+  during an explicit retry keeps retrying normally and does not consume its
+  token; the report-support condition becomes Unknown while transient, allowing
+  automatic retries to continue even if the annotation is later removed. The
+  token is recorded only on success or another unsupported response; an active
+  token identifies the in-flight explicit attempt and is not replaced if a newer
+  annotation arrives mid-retry. On success that report is published and no
+  duplicate is sent; if it remains unsupported, only its token is settled, so a
+  newer annotation remains eligible for the next reconcile. A superseded report
+  is marked Unknown for support, not accepted. The same idempotency key is reused.
+  Dispatch accepts `handed-off` as a neutral task-report outcome since
+  misospace/dispatch#1226; its handler records the handoff without settling the
+  PR-fix queue. Courier retains the documented invalid-outcome 400 classifier
+  for older or incompatible Dispatch servers; unrelated 400s and 5xx errors
+  remain retryable. The classifier may not recognize future error formats.
+  The report remains truthful and source-neutral; no source `State` transition
+  is published. Fix-pr's immediate red path (`Failed` plus a
+  retryable failed report) and the missing/draft-PR path (`NeedsHuman`) are
+  unchanged. (#246, #171)
 - **2026-09-30 — #169/#175: declare outcomes outside the worktree; never settle
   from a declaration alone.** #169 replaced inference of coordinator intent from
   workspace state with explicit `changes`, `no_change_needed`, `needs_decision`,
