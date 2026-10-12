@@ -97,11 +97,10 @@ const (
 	ResultFailed Result = "failed"
 	// ResultHandedOff means the PR was published but external verification did not pass; the source must not treat it as ready or blocked, and its independent PR-repair mechanism takes over using the carried PR identity.
 	ResultHandedOff Result = "handed-off"
-	// ResultNoChange means a fix-pr run verified the pull request was already
-	// addressed: the coordinator declared no_change_needed and the world
-	// confirmed stable green checks. The source treats this as a neutral
-	// outcome that settles the work without burning a fix attempt and without
-	// parking it for a human.
+	// ResultNoChange is retained for enum compatibility, not settlement
+	// authority. A no-change assertion and green CI cannot prove queued review
+	// feedback was addressed. Dispatch rejects this result without wire effects;
+	// the controller uses ResultBlockedExternal for unverified open PRs.
 	ResultNoChange Result = "no-change"
 )
 

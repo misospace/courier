@@ -237,12 +237,13 @@ task outcome and, for queue-backed follow-ups, a generation-fenced
 issued generation or burn fix-attempt budget. Exit `3`
 (`no_change_needed`) moves a resolve-issue run to `AwaitingReview` with the
 source `in-review`, and settles a fix-pr run against the world through
-`Verifying` (`Done` only on a merged/already-addressed pull request,
-`AwaitingReview` only on stable green checks, retryable `Failed` on a red check,
-`NeedsHuman` when unobservable), and a fix-pr run that settles there reports the
-neutral `no-change` lifecycle result instead of claiming a fix it never pushed,
-never settling the source on the declaration
-alone. The evidence, question,
+`Verifying`: a verified merge reaches `Done`, an open green no-change PR
+waits recoverably in `BlockedExternal`, red CI reaches retryable `Failed`, and
+an unobservable PR reaches `NeedsHuman`. Green CI cannot certify queued review
+feedback was addressed, so open no-change attempts report `waiting-external`
+rather than authorizing `already_addressed` or claiming a push. Recovery requires
+a fresh source attempt identity; prior runs and evidence remain retained.
+The evidence, question,
 or missing explanation is posted in full after redaction; only the separate
 termination reason is bounded and redacted. Comment posting is best-effort:
 failures are logged as `outcome.comment` and do not change the ending.

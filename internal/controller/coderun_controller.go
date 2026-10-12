@@ -747,6 +747,15 @@ func (r *CoderRunReconciler) observeVerifying(ctx context.Context, run *courierv
 		return ctrl.Result{}, err
 	}
 	if settled {
+		// Green CI does not prove queued review feedback was addressed. A
+		// no-change attempt on an open PR waits for authoritative resolution
+		// instead of claiming a push or authorizing already-addressed settlement.
+		if run.Status.DeclaredNoChange && run.Spec.Mode == courierv1alpha1.ModeFixPR {
+			return r.transitionTerminal(ctx, run, courierv1alpha1.PhaseBlockedExternal, pr, terminalLifecycleIntent{
+				error:      "no changes pushed; queued feedback resolution is not verified",
+				diagnostic: buildTerminalDiagnostic(r.clock(), nil, "", "", "", false, nil),
+			}, nil)
+		}
 		return r.transitionTerminal(ctx, run, courierv1alpha1.PhaseAwaitingReview, pr, terminalLifecycleIntent{}, nil)
 	}
 	return ctrl.Result{RequeueAfter: observationRequeueDelay}, nil
@@ -902,6 +911,10 @@ func (r *CoderRunReconciler) publishTerminalLifecycle(ctx context.Context, run *
 
 func (r *CoderRunReconciler) publishSourceLifecycle(ctx context.Context, run *courierv1alpha1.CoderRun, adapter source.Adapter, item source.WorkItem, phase courierv1alpha1.Phase, intent terminalLifecycleIntent) error {
 	state := stateForTerminalPhase(phase, run.Spec.Mode, intent)
+	legacyNoChange := phase == courierv1alpha1.PhaseAwaitingReview && run.Status.DeclaredNoChange && run.Spec.Mode == courierv1alpha1.ModeFixPR
+	if legacyNoChange {
+		state = source.StateInProgress
+	}
 	if state != "" {
 		if err := adapter.Transition(ctx, item, state); err != nil {
 			return err
@@ -916,12 +929,11 @@ func (r *CoderRunReconciler) publishSourceLifecycle(ctx context.Context, run *co
 		startedAt = &t
 	}
 	lifecycle := lifecycleForPhase(phase, state, run.Status.PR, startedAt, intent)
-	// A declared no_change_needed fix-pr run pushed nothing, so its review report must
-	// say no change was pushed rather than claim a fix; a "fix was pushed" report would
-	// charge the source a fresh fix attempt.
-	if phase == courierv1alpha1.PhaseAwaitingReview && lifecycle.Result == source.ResultReady &&
-		run.Status.DeclaredNoChange && run.Spec.Mode == courierv1alpha1.ModeFixPR {
-		lifecycle.Result = source.ResultNoChange
+	// Fail closed for retained AwaitingReview runs written before the
+	// no-change verification gate: replay must not certify unresolved feedback.
+	if legacyNoChange {
+		lifecycle.Result = source.ResultBlockedExternal
+		lifecycle.Error = "no changes pushed; queued feedback resolution is not verified"
 	}
 	lifecycle.IdempotencyKey = lifecycleIdempotencyKey(run, phase)
 	if run.Status.Telemetry != nil {

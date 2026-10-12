@@ -1077,12 +1077,13 @@ fixes failures, and commits are reachable from the run branch; exit `2`
 (`needs_decision`) reaches `NeedsHuman` and `blocked_external` reaches the
 terminal, recoverable `BlockedExternal` phase; exit `3` (`no_change_needed`)
 reaches `AwaitingReview` with source `in-review` for resolve-issue runs, and for
-fix-pr runs is settled against the world through `Verifying` (`Done` only on a
-merged/already-addressed pull request, `AwaitingReview` only on stable green
-checks, retryable `Failed` on a red check, `NeedsHuman` when unobservable), and
-such a run reports the neutral `no-change` lifecycle result at `AwaitingReview`
-instead of claiming a fix it never pushed; an
-externally observed failed check reaches `Failed` and follows the source's
+fix-pr runs are settled through `Verifying`: a verified merge reaches `Done`, an open green no-change PR
+waits recoverably in `BlockedExternal`, red CI reaches retryable `Failed`, and
+an unobservable PR reaches `NeedsHuman`. Green CI cannot certify queued review
+feedback was addressed, so open no-change attempts report `waiting-external`
+rather than authorizing `already_addressed` or claiming a push. Recovery requires
+a fresh source attempt identity; prior runs and evidence remain retained.
+An externally observed failed check reaches `Failed` and follows the source's
 failure policy, while other nonzero exits also reach `Failed`. Session recovery
 for undeclared recoverable endings is shipped: with a captured session, dirty,
 off-branch, and no-work states resume under the #170 continuation budget and

@@ -1883,12 +1883,12 @@ func TestExit3NoChangeNeededFixPRSettlesAgainstWorld(t *testing.T) {
 			wantTransitions: 0,
 		},
 		{
-			name:            "open green settles AwaitingReview",
+			name:            "open green cannot verify queued feedback",
 			observer:        fakeWorldObserver{observation: PRObservation{PR: "42", Head: "abc", Checks: []CheckObservation{{Name: "test", State: CheckStatePassed}}}},
-			wantPhase:       courierv1alpha1.PhaseAwaitingReview,
-			wantSource:      source.StateInReview,
+			wantPhase:       courierv1alpha1.PhaseBlockedExternal,
+			wantSource:      source.StateInProgress,
 			wantReport:      true,
-			wantResult:      source.ResultNoChange,
+			wantResult:      source.ResultBlockedExternal,
 			wantTransitions: 1,
 			secondObserve:   true,
 		},
@@ -2430,10 +2430,8 @@ func TestFixPRDeclaredNoChangeRecordedOnTerminatingExit(t *testing.T) {
 }
 
 // TestFixPRDeclaredNoChangeTerminalizesNoChangeInReview covers issue #267: a
-// fix-pr run that recorded a verified no_change_needed declaration and settles
-// in AwaitingReview must report no-change to its source rather than ready,
-// because it pushed nothing; a "fix was pushed" report would charge the source
-// a fresh fix attempt.
+// Green CI alone cannot verify queued feedback resolution. A no-change
+// attempt stays recoverable without authorizing FIXED or claiming a push.
 func TestFixPRDeclaredNoChangeTerminalizesNoChangeInReview(t *testing.T) {
 	item := &admissionSource{}
 	run := admissionRun("run", "local", courierv1alpha1.PhaseVerifying)
@@ -2456,17 +2454,17 @@ func TestFixPRDeclaredNoChangeTerminalizesNoChangeInReview(t *testing.T) {
 	if err := client.Get(context.Background(), admissionKey("run"), &updated); err != nil {
 		t.Fatalf("get run: %v", err)
 	}
-	if updated.Status.Phase != courierv1alpha1.PhaseAwaitingReview {
-		t.Fatalf("phase = %q, want AwaitingReview", updated.Status.Phase)
+	if updated.Status.Phase != courierv1alpha1.PhaseBlockedExternal {
+		t.Fatalf("phase = %q, want BlockedExternal", updated.Status.Phase)
 	}
 	if len(item.reports) != 1 {
 		t.Fatalf("reports = %#v, want exactly one", item.reports)
 	}
-	if item.reports[0].Result != source.ResultNoChange {
-		t.Fatalf("report result = %q, want no-change (the declared run pushed nothing)", item.reports[0].Result)
+	if item.reports[0].Result != source.ResultBlockedExternal {
+		t.Fatalf("report result = %q, want blocked-external (feedback resolution is unverified)", item.reports[0].Result)
 	}
-	if item.reports[0].State != source.StateInReview {
-		t.Fatalf("report state = %q, want in-review", item.reports[0].State)
+	if item.reports[0].State != source.StateInProgress {
+		t.Fatalf("report state = %q, want in-progress", item.reports[0].State)
 	}
 	if item.reports[0].PR != "42" {
 		t.Fatalf("report PR = %q, want the carried PR 42", item.reports[0].PR)
@@ -2509,5 +2507,47 @@ func TestFixPRWithoutDeclarationStillReportsReadyInReview(t *testing.T) {
 	}
 	if item.reports[0].State != source.StateInReview {
 		t.Fatalf("report state = %q, want in-review", item.reports[0].State)
+	}
+}
+
+// Migration replay cannot certify feedback resolution from an old phase.
+func TestRetainedAwaitingReviewNoChangeReportFailsClosed(t *testing.T) {
+	item := &admissionSource{}
+	run := admissionRun("run", "local", courierv1alpha1.PhaseAwaitingReview)
+	run.Spec.Mode = courierv1alpha1.ModeFixPR
+	run.Status.DeclaredNoChange = true
+	run.Status.PR = "42"
+	run.Status.Conditions = []metav1.Condition{{Type: lifecycleReportedCondition, Status: metav1.ConditionFalse, Reason: lifecycleReportPendingReason, LastTransitionTime: metav1.Now()}}
+	client := phaseClient(t, run)
+	reconciler := &CoderRunReconciler{
+		Client:       client,
+		Sources:      NewSourceRegistry(map[string]source.Adapter{"test": item}),
+		StatusWriter: status.KubePatchWriter{Client: client},
+		Observer:     fakeWorldObserver{observation: greenObservation("abc", "check-a")},
+	}
+	if _, err := reconciler.Reconcile(context.Background(), admissionRequest("run")); err != nil {
+		t.Fatalf("first Reconcile() error = %v", err)
+	}
+	if _, err := reconciler.Reconcile(context.Background(), admissionRequest("run")); err != nil {
+		t.Fatalf("second Reconcile() error = %v", err)
+	}
+	var updated courierv1alpha1.CoderRun
+	if err := client.Get(context.Background(), admissionKey("run"), &updated); err != nil {
+		t.Fatalf("get run: %v", err)
+	}
+	if updated.Status.Phase != courierv1alpha1.PhaseAwaitingReview {
+		t.Fatalf("phase = %q, want BlockedExternal", updated.Status.Phase)
+	}
+	if len(item.reports) != 1 {
+		t.Fatalf("reports = %#v, want exactly one", item.reports)
+	}
+	if item.reports[0].Result != source.ResultBlockedExternal {
+		t.Fatalf("report result = %q, want blocked-external (feedback resolution is unverified)", item.reports[0].Result)
+	}
+	if item.reports[0].State != source.StateInProgress {
+		t.Fatalf("report state = %q, want in-progress", item.reports[0].State)
+	}
+	if item.reports[0].PR != "42" {
+		t.Fatalf("report PR = %q, want the carried PR 42", item.reports[0].PR)
 	}
 }

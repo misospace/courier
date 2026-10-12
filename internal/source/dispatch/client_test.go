@@ -738,13 +738,8 @@ func TestHTTPClientReportWaitingExternalNoBlockedMark(t *testing.T) {
 	}
 }
 
-// TestHTTPClientReportNoChangeSettlesWithoutAnAttempt guards the #267 review
-// finding for the other non-decision outcome: a fix-pr run that declared
-// no_change_needed pushed nothing, so its report must be already_addressed —
-// the one Dispatch outcome that settles a PR-fix item FIXED while bypassing the
-// head-moved guard. A pr_updated (or no_changes_needed) report on an unmoved
-// head is refused and requeued at a new generation with fixAttempts incremented,
-// and no queue mark may accompany it.
+// A bare no-change assertion cannot authorize already-addressed settlement.
+
 func TestHTTPClientReportNoChangeSettlesWithoutAnAttempt(t *testing.T) {
 	var reports []map[string]any
 	var paths []string
@@ -766,22 +761,11 @@ func TestHTTPClientReportNoChangeSettlesWithoutAnAttempt(t *testing.T) {
 		t.Fatal(err)
 	}
 	id := EncodeWorkID(Task{Type: "followup-pr", PullRequest: &PullRequest{Repo: "acme/widgets", Number: 42}, PRFixItem: &PRFixItem{ID: "item-1", Generation: 5}})
-	if err := client.Report(context.Background(), id, source.Lifecycle{State: source.StateInReview, Result: source.ResultNoChange, PR: "https://github.com/acme/widgets/pull/77"}); err != nil {
-		t.Fatal(err)
+	if err := client.Report(context.Background(), id, source.Lifecycle{State: source.StateInReview, Result: source.ResultNoChange, PR: "https://github.com/acme/widgets/pull/77"}); !errors.Is(err, source.ErrUnsupportedOutcome) {
+		t.Fatalf("Report error = %v, want unsupported outcome", err)
 	}
-	if len(reports) != 1 {
-		t.Fatalf("reports = %#v, want exactly one task report", reports)
-	}
-	if reports[0]["outcome"] != "already_addressed" {
-		t.Fatalf("report outcome = %v, want already_addressed so an unmoved head is not refused and requeued", reports[0]["outcome"])
-	}
-	for _, path := range paths {
-		if path == "/api/pr-fix-queue/mark" {
-			t.Fatalf("unexpected queue mark %#v: the report settles the item, a mark would re-fence the generation", paths)
-		}
-	}
-	if len(paths) != 1 {
-		t.Fatalf("paths = %#v, want only the task report", paths)
+	if len(paths) != 0 || len(reports) != 0 {
+		t.Fatalf("unverified no-change had wire effects: %v %v", paths, reports)
 	}
 }
 

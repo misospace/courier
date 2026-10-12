@@ -577,14 +577,9 @@ func (c *HTTPClient) Report(ctx context.Context, id string, lifecycle source.Lif
 		// BLOCKED (which parks the issue).
 		return c.reportTaskWithPR(ctx, d, "handed-off", lifecycle.Error, lifecycle.PR, lifecycle.IdempotencyKey, lifecycle.Telemetry, lifecycle.StartedAt)
 	case source.ResultNoChange:
-		// A fix-pr run that declared no_change_needed pushed nothing, so it must
-		// not claim a fix. `already_addressed` is the one accepted outcome that
-		// settles a PR-fix item FIXED while bypassing Dispatch's head-moved guard
-		// (src/lib/pr-fix-queue.ts: a plain FIXED whose head did not move is
-		// refused and the row is requeued at a new generation with fixAttempts
-		// incremented); `no_changes_needed` is done-like and takes that same
-		// guard. No queue mark: the settlement is the report.
-		return c.reportTaskWithPR(ctx, d, "already_addressed", lifecycle.Error, lifecycle.PR, lifecycle.IdempotencyKey, lifecycle.Telemetry, lifecycle.StartedAt)
+		// Retain enum compatibility, but a bare no-change assertion carries
+		// no source-verified feedback evidence and cannot authorize FIXED.
+		return source.ErrUnsupportedOutcome
 	default:
 		return nil
 	}
