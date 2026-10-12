@@ -57,6 +57,7 @@ type terminalLifecycleIntent struct {
 	skipPRFixQueueMark bool
 	ciFailure          bool
 	error              string
+	diagnostic         *courierv1alpha1.TerminalDiagnostic
 }
 
 // CoderRunReconciler reconciles a CoderRun object.
@@ -626,6 +627,15 @@ func (r *CoderRunReconciler) observeRunning(ctx context.Context, run *courierv1a
 		if exitCode == 2 && phase == courierv1alpha1.PhaseNeedsHuman && terminationOutcome == "blocked_external" {
 			intent.error = terminationReason
 		}
+		// A diagnostic explains a non-success ending. Successful handoffs
+		// (Verifying, AwaitingReview) carry no failure cause, so they get none.
+		if phase == courierv1alpha1.PhaseFailed || phase == courierv1alpha1.PhaseNeedsHuman {
+			exit := exitCode
+			handoffCategory := coordinatorHandoffCategory(pod)
+			handoffValid := coordinatorHandoffValid(pod)
+			k8sFailure := kubernetesFailureEvidence(pod, handoffValid)
+			intent.diagnostic = buildTerminalDiagnostic(r.clock(), &exit, terminationReason, terminationOutcome, handoffCategory, k8sFailure, pod)
+		}
 		return r.transitionTerminal(ctx, run, phase, "", intent, terminationSummary)
 	}
 	result, handled, err := r.checkLiveness(ctx, run, pods.Items)
@@ -783,6 +793,9 @@ func (r *CoderRunReconciler) transitionTerminal(ctx context.Context, run *courie
 				run.Status.RunDuration = durationString(run.Status.FinishedAt.Time.Sub(run.Status.StartedAt.Time))
 			}
 		}
+		if intent.diagnostic != nil && run.Status.TerminalDiagnostic == nil {
+			run.Status.TerminalDiagnostic = intent.diagnostic
+		}
 		// Persist report intent with the phase so retries can reproduce the same
 		// lifecycle without extending the CRD status schema.
 		r.setLifecycleReport(run, false, pendingLifecycleReason(intent), intent.error)
@@ -790,7 +803,7 @@ func (r *CoderRunReconciler) transitionTerminal(ctx context.Context, run *courie
 	// Write the terminal phase first so the run stops holding lane capacity
 	// regardless of whether the source lifecycle report below succeeds. The
 	// run's own terminalization must never depend on the source.
-	if run.Status.Phase != before.Status.Phase || run.Status.PR != before.Status.PR || !reflect.DeepEqual(run.Status.Telemetry, before.Status.Telemetry) {
+	if run.Status.Phase != before.Status.Phase || run.Status.PR != before.Status.PR || !reflect.DeepEqual(run.Status.Telemetry, before.Status.Telemetry) || !reflect.DeepEqual(run.Status.TerminalDiagnostic, before.Status.TerminalDiagnostic) {
 		if err := r.patchStatus(ctx, before, run); err != nil {
 			return ctrl.Result{}, err
 		}
@@ -1201,6 +1214,9 @@ func (r *CoderRunReconciler) patchStatus(ctx context.Context, before, after *cou
 	if before.Status.PublicationPolicy == nil && after.Status.PublicationPolicy != nil {
 		fields.PublicationPolicy = after.Status.PublicationPolicy
 	}
+	if before.Status.TerminalDiagnostic == nil && after.Status.TerminalDiagnostic != nil {
+		fields.TerminalDiagnostic = after.Status.TerminalDiagnostic
+	}
 	if !reflect.DeepEqual(before.Status.Conditions, after.Status.Conditions) {
 		fields.Conditions = after.Status.Conditions
 	}
@@ -1297,6 +1313,7 @@ type terminationMessage struct {
 	ExitCode int32                         `json:"exit_code"`
 	Reason   string                        `json:"reason"`
 	Outcome  string                        `json:"outcome"`
+	Category string                        `json:"category,omitempty"`
 	Summary  *courierv1alpha1.RunTelemetry `json:"summary"`
 }
 
@@ -1341,7 +1358,45 @@ func durationString(d time.Duration) string {
 	return d.Round(time.Second).String()
 }
 
+const handoffPrefix = "COURIER_TERMINATION "
+
+func parseCoordinatorTermination(pod *corev1.Pod) (terminationMessage, bool) {
+	if pod == nil {
+		return terminationMessage{}, false
+	}
+	for _, status := range pod.Status.ContainerStatuses {
+		if status.Name != coordinatorContainerName || status.State.Terminated == nil {
+			continue
+		}
+		terminated := status.State.Terminated
+		var message terminationMessage
+		rawMessage := strings.TrimSpace(terminated.Message)
+		payload, ok := strings.CutPrefix(rawMessage, handoffPrefix)
+		if !ok || json.Unmarshal([]byte(payload), &message) != nil || message.ExitCode != terminated.ExitCode || !validTerminationPhaseResult(terminated.ExitCode, message.Phase, message.Result) {
+			return terminationMessage{}, false
+		}
+		return message, true
+	}
+	return terminationMessage{}, false
+}
+
+func coordinatorHandoffCategory(pod *corev1.Pod) string {
+	message, valid := parseCoordinatorTermination(pod)
+	if !valid {
+		return ""
+	}
+	return strings.TrimSpace(message.Category)
+}
+
+func coordinatorHandoffValid(pod *corev1.Pod) bool {
+	_, valid := parseCoordinatorTermination(pod)
+	return valid
+}
+
 func coordinatorTermination(pod *corev1.Pod) (int32, string, string, *courierv1alpha1.RunTelemetry, bool) {
+	if pod == nil {
+		return 0, "", "", nil, false
+	}
 	for _, status := range pod.Status.ContainerStatuses {
 		if status.Name != coordinatorContainerName || status.State.Terminated == nil {
 			continue
@@ -1349,10 +1404,7 @@ func coordinatorTermination(pod *corev1.Pod) (int32, string, string, *courierv1a
 		terminated := status.State.Terminated
 		code, reason, outcome := terminated.ExitCode, "", ""
 		var summary *courierv1alpha1.RunTelemetry
-		var message terminationMessage
-		rawMessage := strings.TrimSpace(terminated.Message)
-		const handoffPrefix = "COURIER_TERMINATION "
-		if payload, ok := strings.CutPrefix(rawMessage, handoffPrefix); ok && json.Unmarshal([]byte(payload), &message) == nil && message.ExitCode == code && validTerminationPhaseResult(code, message.Phase, message.Result) {
+		if message, valid := parseCoordinatorTermination(pod); valid {
 			reason, outcome = strings.TrimSpace(message.Reason), strings.TrimSpace(message.Outcome)
 			summary = message.Summary
 		}
@@ -1363,6 +1415,10 @@ func coordinatorTermination(pod *corev1.Pod) (int32, string, string, *courierv1a
 
 // exitDeclaredNoChange is the executor's verified no_change_needed exit.
 const exitDeclaredNoChange = 3
+
+// exitNeedsHuman is the executor's NeedsHuman exit: a declared decision or
+// external block, or a guard refusal.
+const exitNeedsHuman = 2
 
 // phaseForExit maps the executor's exit code to the run's next phase. A
 // no-change declaration is reviewable in resolve-issue mode; fix-pr remains

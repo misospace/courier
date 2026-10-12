@@ -111,6 +111,10 @@ type OperatorPatch struct {
 	// the coordinator's termination handoff (#172). Pointer so it is emitted
 	// only when set and cleared only by an explicit write.
 	Telemetry *courierv1alpha1.RunTelemetry `json:"telemetry,omitempty"`
+	// TerminalDiagnostic is the operator-owned durable terminal runtime
+	// diagnostic (#272). It is set once at terminalization and never cleared.
+	// +optional
+	TerminalDiagnostic *courierv1alpha1.TerminalDiagnostic `json:"terminalDiagnostic,omitempty"`
 	// Conditions is the operator-owned condition set. The operator is the only
 	// writer of a CoderRun's conditions, so a merge patch carrying them replaces
 	// the array wholesale; a second writer must extend this field rather than

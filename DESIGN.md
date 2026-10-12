@@ -885,6 +885,38 @@ oversized/binary/untracked → capture core, executor triggers; abrupt pod loss 
 executor triggers, envtest; duplicate capture → executor triggers;
 cleanup/expiry → intake, envtest; retrieval/application → runbook, envtest.
 
+### Terminal runtime diagnostics (#272)
+
+A terminal phase and exit code alone cannot distinguish an executor crash, a
+model transport error, continuation exhaustion, a verifier rejection, or a
+Kubernetes/container failure. The operator therefore captures a bounded,
+redacted `status.terminalDiagnostic` on the run **before pod cleanup**, so the
+cause survives pod deletion and controller restart; #198/#200 dirty-worktree
+evidence is a separate bundle pipeline and is not a substitute.
+
+The executor emits a machine-readable `category` in its `COURIER_TERMINATION`
+handoff; the operator classifies from the strongest available evidence and
+never invents a cause. A concrete executor category wins; otherwise
+Kubernetes/container failure evidence (OOMKill, eviction, a lost pod);
+otherwise a declared `needs_decision`/`blocked_external`; otherwise a non-zero
+exit with no valid handoff is `executor-crash`; otherwise `unknown`. Missing or
+ambiguous evidence is `unknown`. Categories: `executor-crash`,
+`model-transport-error`, `continuation-exhaustion`, `verifier-rejection`,
+`kubernetes-failure`, `needs-decision`, `blocked-external`, `unknown`.
+
+The diagnostic carries the observed exit code, the executor-declared outcome
+kind when any, a short redacted reason (re-bounded to 1024 bytes and re-redacted
+through the defensive credential table; no token, credential, raw prompt, or
+unbounded provider text is stored), and the coordinator container's identity
+and termination metadata (`podName`, `podUID`, `containerID`, `image`,
+`nodeName`, `restartCount`, `terminationReason`) for kubectl-describe-equivalent
+inspection after the pod is gone. Capture is best-effort and set-once: the
+terminal transition captures when the pod is present; the pod-loss/restart
+ceiling captures `kubernetes-failure` with no fabricated container details when
+it is not. A later reconcile never clears an already-captured diagnostic, and
+capture never changes a phase, exit, retry, or source report. Operator
+workflow is in [docs/terminal-diagnostics.md](./docs/terminal-diagnostics.md).
+
 ### Toolchain reference for bootstrap lanes (#153)
 
 Repository toolchains (Go today) keep their module and build caches on
@@ -1449,6 +1481,17 @@ named items remain unresolved and must not be described as production-ready:
 
 ## Decisions
 
+- **2026-10-12 — #272: durable terminal runtime diagnostics are captured before
+  pod cleanup, set-once and best-effort.** A terminal phase/exit alone cannot
+  distinguish executor crash, model transport error, continuation exhaustion,
+  verifier rejection, or Kubernetes/container failure. The executor emits a
+  machine-readable category in its handoff; the operator classifies from the
+  strongest evidence and never invents a cause (`unknown` otherwise), persists
+  `status.terminalDiagnostic` (bounded, redacted reason plus retained
+  pod/container identity for describe-equivalent inspection), and never lets a
+  capture alter the phase, retry, or source report. Missing evidence is
+  `unknown`; a missing pod yields `kubernetes-failure` with no fabricated
+  container details. (#272)
 - **2026-10-11 — #263: exclude retained PR-fix generations before Dispatch selection.**
   The optional source-neutral discovery-with-exclusions capability passes
   retained WorkItems without decoding their opaque IDs in core. Dispatch
