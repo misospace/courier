@@ -178,7 +178,7 @@ func (r *CoderRunReconciler) checkLiveness(ctx context.Context, run *courierv1al
 			// absence, so the hand-off carries the pod-loss cause a human
 			// needs, exactly as the disappearance backstop would.
 			if atCeiling {
-				result, err := r.relaunchAfterInfraLoss(ctx, run, podLostReason, podLostEventReason)
+				result, err := r.relaunchAfterInfraLoss(ctx, run, podLostReason, podLostEventReason, buildTerminalDiagnostic(r.clock(), nil, podLostReason, "", "", true, cached))
 				return result, true, err
 			}
 			return ctrl.Result{RequeueAfter: observationRequeueDelay}, true, nil
@@ -319,7 +319,7 @@ func (r *CoderRunReconciler) checkLiveness(ctx context.Context, run *courierv1al
 	// against the API server, so a reaped wedge keeps the generic message in
 	// both the event stream and the ceiling hand-off; a deferred charge
 	// arrives with the backstop's pod-loss cause.
-	result, err := r.relaunchAfterInfraLoss(ctx, run, "", "")
+	result, err := r.relaunchAfterInfraLoss(ctx, run, "", "", buildTerminalDiagnostic(r.clock(), nil, wedgedReapDiagnosticReason, "", "", false, coordinatorPodOf(livePods, run)))
 	return result, true, err
 }
 
@@ -529,7 +529,11 @@ func (r *CoderRunReconciler) observeMissingCoordinator(ctx context.Context, run 
 			return ctrl.Result{}, err
 		}
 	}
-	return r.relaunchAfterInfraLoss(ctx, run, podLostReason, podLostEventReason)
+	var deadPodPtr *corev1.Pod
+	if len(dead) > 0 {
+		deadPodPtr = &dead[0]
+	}
+	return r.relaunchAfterInfraLoss(ctx, run, podLostReason, podLostEventReason, buildTerminalDiagnostic(r.clock(), nil, podLostReason, "", "", true, deadPodPtr))
 }
 
 // relaunchAfterInfraLoss returns a run to Claimed so the next reconcile
@@ -543,13 +547,14 @@ func (r *CoderRunReconciler) observeMissingCoordinator(ctx context.Context, run 
 // the accumulation. A deferred wedge charge arrives through the
 // disappearance backstop and carries its pod-loss reason; only a wedge
 // charged in place keeps the generic event.
-func (r *CoderRunReconciler) relaunchAfterInfraLoss(ctx context.Context, run *courierv1alpha1.CoderRun, reason, eventReason string) (ctrl.Result, error) {
+func (r *CoderRunReconciler) relaunchAfterInfraLoss(ctx context.Context, run *courierv1alpha1.CoderRun, reason, eventReason string, diagnostic *courierv1alpha1.TerminalDiagnostic) (ctrl.Result, error) {
 	if run.Status.Restarts >= r.maxRestarts() {
 		// The ceiling is reached: hand the run to a human instead of
 		// relaunching it again. The counter is already at the ceiling, so
 		// it is left untouched.
 		return r.transitionTerminal(ctx, run, courierv1alpha1.PhaseNeedsHuman, "", terminalLifecycleIntent{
-			error: reason,
+			error:      reason,
+			diagnostic: diagnostic,
 		}, nil)
 	}
 	before := run.DeepCopy()

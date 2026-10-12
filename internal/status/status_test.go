@@ -389,6 +389,28 @@ type fakeClock struct {
 
 func (c *fakeClock) Now() time.Time { return c.now }
 
+func TestOperatorWriterCarriesTerminalDiagnostic(t *testing.T) {
+	patcher := &fakePatcher{}
+	writer := NewOperatorWriter(patcher)
+	diagnostic := &courierv1alpha1.TerminalDiagnostic{Category: courierv1alpha1.TerminalDiagnosticCategoryExecutorCrash}
+	if err := writer.Patch(context.Background(), types.NamespacedName{Namespace: "ns", Name: "run"}, OperatorPatch{TerminalDiagnostic: diagnostic}); err != nil {
+		t.Fatal(err)
+	}
+	var document struct {
+		Status map[string]json.RawMessage `json:"status"`
+	}
+	if err := json.Unmarshal(patcher.patches[0].patch, &document); err != nil {
+		t.Fatal(err)
+	}
+	var got courierv1alpha1.TerminalDiagnostic
+	if err := json.Unmarshal(document.Status["terminalDiagnostic"], &got); err != nil {
+		t.Fatal(err)
+	}
+	if got.Category != diagnostic.Category {
+		t.Fatalf("terminalDiagnostic category = %q, want %q", got.Category, diagnostic.Category)
+	}
+}
+
 func TestOperatorWriterCarriesPublicationPolicy(t *testing.T) {
 	patcher := &fakePatcher{}
 	writer := NewOperatorWriter(patcher)

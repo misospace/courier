@@ -885,6 +885,59 @@ oversized/binary/untracked → capture core, executor triggers; abrupt pod loss 
 executor triggers, envtest; duplicate capture → executor triggers;
 cleanup/expiry → intake, envtest; retrieval/application → runbook, envtest.
 
+### Terminal runtime diagnostics (#272)
+
+A terminal phase and exit code alone cannot distinguish an executor crash, a
+model transport error, continuation exhaustion, a verifier rejection, or a
+Kubernetes/container failure. The operator therefore captures a bounded,
+redacted `status.terminalDiagnostic` on the run **before pod cleanup**, so the
+cause survives pod deletion and controller restart; #198/#200 dirty-worktree
+evidence is a separate bundle pipeline and is not a substitute.
+
+The executor emits a machine-readable `category` in its `COURIER_TERMINATION`
+handoff; the operator classifies from the strongest available evidence and
+never invents a cause. A concrete executor category wins; otherwise
+causal Kubernetes/container failure evidence (`OOMKilled`,
+`ContainerStatusUnknown`, authoritative eviction, scheduling, or node-loss
+reasons; a `PodFailed` with no recorded terminated state and no valid handoff;
+or a missing pod); otherwise a declared `needs_decision`/`blocked_external`;
+otherwise a non-zero exit with no valid handoff is `executor-crash`; otherwise
+`unknown`. Display allowlists for kubelet/pod reasons are broader than this
+evidence predicate: `Error` and `Completed` are safe to retain for inspection,
+but do not alone establish infrastructure failure; pod reason `Shutdown` is
+display-only as well. Missing or
+ambiguous evidence is `unknown`. Categories: `executor-crash`,
+`model-transport-error`, `continuation-exhaustion`, `verifier-rejection`,
+`kubernetes-failure`, `needs-decision`, `blocked-external`, `unknown`.
+
+The diagnostic carries the observed exit code, the executor-declared outcome
+kind when any, an **operator-derived** short reason (a category label, the
+kubelet's allowlisted `Terminated.Reason` and pod `Status.Reason`, and a
+fixed override for the wedge-reap and pod-loss ceiling paths — never the
+executor model text, and the kubelet/apiserver text is constrained to a
+small allowlist of values the runtime itself writes), and the coordinator
+container's identity and termination metadata (`podName`, `podUID`,
+`containerID`, `image`, `nodeName`, `restartCount`, `terminationReason`)
+for kubectl-describe-equivalent inspection after the pod is gone. The
+reason is re-bounded to 1024 bytes and re-redacted through the defensive
+credential table as a defense-in-depth pass on the operator-derived string,
+and the `container.terminationReason` field is hard-capped at 128 bytes
+(the CRD's `+kubebuilder:validation:MaxLength=128`) with the same
+allowlist, so an overlong kubelet value cannot cause the API server to
+reject the terminal status patch and block terminalization. The executor
+model text never reaches the field by construction: a model's
+`needs-decision` question, a `blocked-external` missing description, a
+verifier fail-reason, or a bootstrap error string cannot land on the
+durable status, because no path from the executor's `termination.Reason`
+to the diagnostic's reason exists. User-facing explanations live on the
+source issue/PR comment posted by the executor's terminal handler.
+Capture is best-effort and set-once: the terminal transition captures when
+the pod is present; the pod-loss/restart ceiling captures
+`kubernetes-failure` with no fabricated container details when it is not. A
+later reconcile never clears an already-captured diagnostic, and capture
+never changes a phase, exit, retry, or source report. Operator workflow is
+in [docs/terminal-diagnostics.md](./docs/terminal-diagnostics.md).
+
 ### Toolchain reference for bootstrap lanes (#153)
 
 Repository toolchains (Go today) keep their module and build caches on
@@ -1469,6 +1522,43 @@ named items remain unresolved and must not be described as production-ready:
 ## Decisions
 
 - **2026-10-12 — #251: terminal retention is a bounded inspection window keyed to per-phase annotations (`courier.misospace.dev/needs-human-at`, `courier.misospace.dev/failed-at`), not `FinishedAt`; closed-unmerged PRs terminalize as `NeedsHuman` with a precise reason, not a new CRD phase.** `FinishedAt` records execution end and stays immutable on later transitions, so a months-late `AwaitingReview → NeedsHuman` close-unmerged starts a fresh window at the close-unmerged transition rather than inheriting a zero-length residue. Deletion requires a **positive, settled** `LifecycleReported` condition (`Status=True` and a permitted reason); missing/`Unknown`/`False` conditions do not satisfy the gate, so a legacy or partially-upgraded terminal run with no published/superseded report proof is never reaped. The #250 observation loop handles the recorded PR identity: merged resolves to `Done`, closed-unmerged becomes `NeedsHuman`, and absent or ambiguous observations do not transition. This bounds retained runs without conflating closure with successful delivery and leaves retries and escalation source-owned. (#251, #179, #146, #250, #276, #277)
+- **2026-10-12 — #272: durable terminal runtime diagnostics are captured before
+  pod cleanup, set-once and best-effort.** A terminal phase/exit alone cannot
+  distinguish executor crash, model transport error, continuation exhaustion,
+  verifier rejection, or Kubernetes/container failure. The executor emits a
+  machine-readable category in its handoff; the operator classifies from the
+  strongest evidence and never invents a cause (`unknown` otherwise), persists
+  `status.terminalDiagnostic` (an operator-derived category-labelled reason
+  plus retained pod/container identity for describe-equivalent inspection),
+  and never lets a capture alter the phase, retry, or source report. The
+  diagnostic's reason is operator-derived by construction: a category label,
+  the kubelet's allowlisted `Terminated.Reason` and pod `Status.Reason`, and a
+  fixed operator override for the wedge-reap and pod-loss ceiling paths. The
+  kubelet and apiserver text is also constrained to a small allowlist of
+  values the runtime itself writes, so a non-pattern-matching secret carried
+  in `Terminated.Reason` or `Status.Reason` cannot reach the diagnostic. The
+  executor's freeform text (`needs-decision` questions, `blocked-external`
+  missing descriptions, verifier fail-reasons, bootstrap error strings) is
+  never an input, so no model-controlled text can land on the durable
+  status. `container.terminationReason` applies the same allowlist and a
+  128-byte cap matching the CRD's `+kubebuilder:validation:MaxLength=128`,
+  so an overlong kubelet value cannot cause the apiserver to reject the
+  terminal status patch (which would block terminalization and source
+  reporting). The classifier's kubernetes-failure evidence and the
+  reason builder's allowlist are the same set: a runtime-written
+  kubelet or pod reason on the allowlist, with no valid executor handoff,
+  is Kubernetes-level evidence; a `PodFailed` with no recorded
+  terminated state and no valid handoff; or a missing pod. User-facing
+  explanations are posted on the source issue/PR by the executor's
+  terminal handler. Missing evidence is `unknown`; a missing pod yields
+  `kubernetes-failure` with no fabricated container details. Revisited in
+  #275 to make the reason safe by construction, to prove the set-once
+  gate holds across pod deletion and controller restart, to make the
+  kubelet/pod reason allowlist real (drop, not persist, arbitrary
+  kubelet/apiserver text), to bound `container.terminationReason` to
+  the CRD's 128-byte cap, and to align the classifier's
+  kubernetes-failure evidence with the reason builder's allowlist.
+  (#272, #275)
 - **2026-10-11 — #263: exclude retained PR-fix generations before Dispatch selection.**
   The optional source-neutral discovery-with-exclusions capability passes
   retained WorkItems without decoding their opaque IDs in core. Dispatch
