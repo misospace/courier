@@ -22,7 +22,8 @@ func (raceSnapshotter) Snapshot(context.Context, SnapshotRequest) ([]byte, error
 func TestSnapshotRaceExhaustionPreservesRetryableSentinel(t *testing.T) {
 	policy := Policy{RunUID: "run-uid", Mode: ModeResolveIssue, Provider: "test",
 		BaseRepo: "org/repo", BaseRef: "main", BaseOID: strings.Repeat("a", 40),
-		WorkRepo: "org/repo", WorkRef: "courier/org/repo/issue-7", WorkInitiallyAbsent: true}
+		WorkRepo: "org/repo", WorkRef: "courier/org/repo/issue-7", WorkInitiallyAbsent: true,
+		SourceIssue: SourceIssue{Owner: "org", Name: "repo", Number: 7}}
 	observer := importTestObserver{}
 	pusher := serverPusher{}
 	engine, err := NewPolicyEngineWithSnapshotter(policy, observer, pusher, raceSnapshotter{})
@@ -40,7 +41,8 @@ func TestServerSnapshotRaceReturns503(t *testing.T) {
 	cert, key := testTLSFiles(t)
 	engine, err := NewPolicyEngine(Policy{RunUID: "run-uid", Mode: ModeResolveIssue, Provider: "test",
 		BaseRepo: "org/repo", BaseRef: "main", BaseOID: strings.Repeat("a", 40),
-		WorkRepo: "org/repo", WorkRef: "courier/org/repo/issue-7", WorkInitiallyAbsent: true},
+		WorkRepo: "org/repo", WorkRef: "courier/org/repo/issue-7", WorkInitiallyAbsent: true,
+		SourceIssue: SourceIssue{Owner: "org", Name: "repo", Number: 7}},
 		importTestObserver{}, serverPusher{})
 	if err != nil {
 		t.Fatal(err)

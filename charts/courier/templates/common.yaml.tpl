@@ -124,6 +124,7 @@
 {{- fail "dispatch.enabled requires dispatch.lanes or both dispatch.queueLane and dispatch.laneProfile" }}
 {{- end }}
 {{- if not $hasDispatchEnabled }}{{- $args = append $args "--dispatch-enabled=true" }}{{- end }}
+{{- if $dispatch.prFixExclusions }}{{- $args = append $args "--dispatch-pr-fix-exclusions=true" }}{{- end }}
 {{- if not $hasDispatchBaseURL }}{{- $args = append $args (printf "--dispatch-base-url=%s" $dispatch.baseURL) }}{{- end }}
 {{- if not $hasDispatchAgentName }}{{- $args = append $args (printf "--dispatch-agent-name=%s" $dispatch.agentName) }}{{- end }}
 {{- if $lanes }}

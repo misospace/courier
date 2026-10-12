@@ -193,6 +193,10 @@ func newIntegrationFixture(t *testing.T, mode Mode) *integrationFixture {
 	policy := Policy{RunUID: "run-uid", Mode: mode, Provider: "test", BaseRepo: baseRepo.Canonical, BaseRef: "main", BaseOID: baseOID, WorkRepo: workCanonical, WorkRef: workRef}
 	if mode == ModeResolveIssue {
 		policy.WorkInitiallyAbsent = true
+		// The trusted source identity for the resolve-issue integration
+		// tests is the base repository plus a stable issue number
+		// that every PR body must reference for linkage to pass.
+		policy.SourceIssue = SourceIssue{Owner: "acme", Name: "project", Number: 122}
 	} else {
 		policy.PRNumber, policy.HeadAnchorOID, policy.WorkAnchorOID = 7, anchor, anchor
 		provider.prs = []forge.PullRequest{{Number: 7, Repo: baseRepo.Canonical, BaseRepo: baseRepo.Canonical, BaseRef: "main", BaseSHA: baseOID, HeadRepo: workRepo.Canonical, HeadRef: workRef, HeadSHA: anchor, State: "open", Title: "before", Body: "old"}}
@@ -234,7 +238,7 @@ func TestBrokerIntegrationResolvePublishAndCreatePR(t *testing.T) {
 	if result.OID != f.proposed {
 		t.Fatalf("published OID = %s", result.OID)
 	}
-	pr, err := f.engine.CreatePullRequest(ctx, f.proposed, "issue 122", "completed", false)
+	pr, err := f.engine.CreatePullRequest(ctx, f.proposed, "issue 122", "Closes acme/project#122.", false)
 	if err != nil {
 		t.Fatalf("CreatePullRequest: %v", err)
 	}
@@ -332,7 +336,7 @@ func TestBrokerIntegrationDeniesConcurrentDuplicatePR(t *testing.T) {
 		t.Fatal(err)
 	}
 	f.provider.racePR = true
-	if _, err := f.engine.CreatePullRequest(context.Background(), f.proposed, "title", "body", false); err == nil {
+	if _, err := f.engine.CreatePullRequest(context.Background(), f.proposed, "title", "Closes acme/project#122.", false); err == nil {
 		t.Fatal("concurrent duplicate PR accepted")
 	}
 }

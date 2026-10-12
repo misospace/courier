@@ -21,6 +21,7 @@ func TestChartRendersDispatchConfiguration(t *testing.T) {
 
 	enabled := runHelm(t, chartDir, "template", "courier", ".",
 		"--set", "dispatch.enabled=true",
+		"--set", "dispatch.prFixExclusions=true",
 		"--set", "dispatch.baseURL=https://dispatch.example.test/custom-api",
 		"--set", "dispatch.agentName=example-agent",
 		"--set", "dispatch.queueLane=queue-x",
@@ -32,6 +33,7 @@ func TestChartRendersDispatchConfiguration(t *testing.T) {
 	)
 	for _, want := range []string{
 		"--dispatch-enabled=true",
+		"--dispatch-pr-fix-exclusions=true",
 		"--dispatch-base-url=https://dispatch.example.test/custom-api",
 		"--dispatch-agent-name=example-agent",
 		"--dispatch-queue-lane=queue-x",
@@ -45,6 +47,18 @@ func TestChartRendersDispatchConfiguration(t *testing.T) {
 		}
 	}
 
+	defaultExcluded := runHelm(t, chartDir, "template", "courier", ".",
+		"--set", "dispatch.enabled=true",
+		"--set", "dispatch.baseURL=https://dispatch.example.test",
+		"--set", "dispatch.agentName=example-agent",
+		"--set", "dispatch.queueLane=queue-x",
+		"--set", "dispatch.laneProfile=lane-y",
+		"--set", "dispatch.tokenSecret.name=dispatch-token-secret",
+	)
+	if strings.Contains(defaultExcluded, "--dispatch-pr-fix-exclusions") {
+		t.Fatal("Dispatch-enabled chart output unexpectedly contains PR-fix exclusion flag")
+	}
+
 	disabled := runHelm(t, chartDir, "template", "courier", ".", "--set", "dispatch.enabled=false")
 	for _, unwanted := range []string{
 		"--dispatch-enabled",
@@ -54,6 +68,7 @@ func TestChartRendersDispatchConfiguration(t *testing.T) {
 		"--dispatch-lane",
 		"--dispatch-poll-interval",
 		"--dispatch-http-timeout",
+		"--dispatch-pr-fix-exclusions",
 		"DISPATCH_AGENT_TOKEN",
 	} {
 		if strings.Contains(disabled, unwanted) {

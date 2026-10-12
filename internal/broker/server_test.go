@@ -89,7 +89,7 @@ func (a *testAuthenticator) Authenticate(_ context.Context, token string) (Ident
 func serverForTest(t *testing.T) (*Server, *testAuthenticator) {
 	t.Helper()
 	cert, key := testTLSFiles(t)
-	engine, err := NewPolicyEngine(Policy{RunUID: "run-uid", Mode: ModeResolveIssue, Provider: "test", BaseRepo: "org/repo", BaseRef: "main", BaseOID: strings.Repeat("a", 40), WorkRepo: "org/repo", WorkRef: "courier/org/repo/issue-1", WorkInitiallyAbsent: true}, importTestObserver{}, serverPusher{})
+	engine, err := NewPolicyEngine(Policy{RunUID: "run-uid", Mode: ModeResolveIssue, Provider: "test", BaseRepo: "org/repo", BaseRef: "main", BaseOID: strings.Repeat("a", 40), WorkRepo: "org/repo", WorkRef: "courier/org/repo/issue-1", WorkInitiallyAbsent: true, SourceIssue: SourceIssue{Owner: "org", Name: "repo", Number: 1}}, importTestObserver{}, serverPusher{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -196,7 +196,7 @@ func TestServerRejectsInvalidBundleRequests(t *testing.T) {
 
 func TestServerServesSeedSnapshot(t *testing.T) {
 	cert, key := testTLSFiles(t)
-	engine, err := NewPolicyEngine(Policy{RunUID: "run-uid", Mode: ModeResolveIssue, Provider: "test", BaseRepo: "org/repo", BaseRef: "main", BaseOID: strings.Repeat("a", 40), WorkRepo: "org/repo", WorkRef: "courier/org/repo/issue-1", WorkInitiallyAbsent: true}, importTestObserver{}, serverPusher{})
+	engine, err := NewPolicyEngine(Policy{RunUID: "run-uid", Mode: ModeResolveIssue, Provider: "test", BaseRepo: "org/repo", BaseRef: "main", BaseOID: strings.Repeat("a", 40), WorkRepo: "org/repo", WorkRef: "courier/org/repo/issue-1", WorkInitiallyAbsent: true, SourceIssue: SourceIssue{Owner: "org", Name: "repo", Number: 1}}, importTestObserver{}, serverPusher{})
 	if err != nil {
 		t.Fatal(err)
 	}

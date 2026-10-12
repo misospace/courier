@@ -48,6 +48,170 @@ func TestHTTPClientDiscoverMapsTasksAndQueueLane(t *testing.T) {
 	}
 }
 
+func TestHTTPClientDiscoverExcludingEncodesCanonicalUniqueQueueKeys(t *testing.T) {
+	var gets int
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gets++
+		if r.URL.Path != "/prefix/api/agents/worker/next-task" || r.URL.Query().Get("lane") != "cloud" || !reflect.DeepEqual(r.URL.Query()["exclude_pr_fix_version"], []string{"1"}) {
+			t.Fatalf("request = %s?%s", r.URL.Path, r.URL.RawQuery)
+		}
+		if r.Header.Get("Authorization") != "Bearer token" {
+			t.Fatalf("Authorization = %q", r.Header.Get("Authorization"))
+		}
+		values := r.URL.Query()["exclude_pr_fix"]
+		if !reflect.DeepEqual(values, []string{"acme/widgets#42@3"}) {
+			t.Fatalf("exclude_pr_fix = %#v", values)
+		}
+		if r.URL.Query().Has("exclude_pr_fix_ack") {
+			t.Fatal("unexpected query key")
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{"type": "idle", "shouldRun": false, "prFixExclusions": map[string]any{"version": 1, "skipped": []any{}}})
+	}))
+	defer server.Close()
+	client, err := NewClientWithLane(server.URL+"/prefix/", "worker", "cloud", "token", time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	client.WithPRFixExclusions(true)
+	id := EncodeWorkID(Task{Type: "followup-pr", PullRequest: &PullRequest{Repo: "Acme/Widgets", Number: 42}, PRFixItem: &PRFixItem{ID: "item", Generation: 3}})
+	if _, err := client.DiscoverExcluding(context.Background(), []source.WorkItem{{ID: id}, {ID: id}}); err != nil {
+		t.Fatal(err)
+	}
+	if gets != 1 {
+		t.Fatalf("GET count = %d, want 1", gets)
+	}
+}
+
+func TestHTTPClientDiscoverExcludingBoundsFilteredUniqueKeys(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Query().Get("lane") != "cloud" || r.URL.Query().Has("exclude_pr_fix_version") {
+			t.Fatalf("unexpected query %s", r.URL.RawQuery)
+		}
+		_ = json.NewEncoder(w).Encode(Task{Type: "idle"})
+	}))
+	defer server.Close()
+	client, err := NewClientWithLane(server.URL, "worker", "cloud", "token", time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	client.WithPRFixExclusions(true)
+	legacy := EncodeWorkID(Task{Type: "followup-pr", PullRequest: &PullRequest{Repo: "acme/widgets", Number: 7}})
+	if _, err := client.DiscoverExcluding(context.Background(), []source.WorkItem{{ID: legacy}}); err != nil {
+		t.Fatal(err)
+	}
+	items := make([]source.WorkItem, 33)
+	for i := range items {
+		items[i].ID = EncodeWorkID(Task{Type: "followup-pr", PullRequest: &PullRequest{Repo: "acme/widgets", Number: i + 1}, PRFixItem: &PRFixItem{ID: "q", Generation: 1}})
+	}
+	if _, err := client.DiscoverExcluding(context.Background(), items); err == nil {
+		t.Fatal("33 filtered unique entries accepted")
+	}
+}
+
+func TestHTTPClientDiscoverExcludingDefaultsToOrdinaryDiscover(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Query().Has("exclude_pr_fix") || r.URL.Query().Has("exclude_pr_fix_version") {
+			t.Fatalf("default client sent exclusions: %s", r.URL.RawQuery)
+		}
+		_ = json.NewEncoder(w).Encode(Task{Type: "idle"})
+	}))
+	defer server.Close()
+	client, err := NewClientWithLane(server.URL, "worker", "cloud", "token", time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	id := EncodeWorkID(Task{Type: "followup-pr", PullRequest: &PullRequest{Repo: "acme/widgets", Number: 42}, PRFixItem: &PRFixItem{ID: "q", Generation: 1}})
+	if _, err := client.DiscoverExcluding(context.Background(), []source.WorkItem{{ID: id}}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestHTTPClientDiscoverExcludingOlderServerIgnoresParams(t *testing.T) {
+	for _, task := range []Task{
+		{Type: "implement", ShouldRun: true, Issue: &Issue{Repo: "acme/widgets", Number: 5}},
+		{Type: "idle"},
+	} {
+		t.Run(task.Type, func(t *testing.T) {
+			gets := 0
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				gets++
+				if !r.URL.Query().Has("exclude_pr_fix") {
+					t.Errorf("missing exclusion query")
+				}
+				_ = json.NewEncoder(w).Encode(task)
+			}))
+			defer server.Close()
+			client, err := NewClientWithLane(server.URL, "worker", "cloud", "token", time.Second)
+			if err != nil {
+				t.Fatal(err)
+			}
+			client.WithPRFixExclusions(true)
+			id := EncodeWorkID(Task{Type: "followup-pr", PullRequest: &PullRequest{Repo: "acme/widgets", Number: 42}, PRFixItem: &PRFixItem{ID: "q", Generation: 1}})
+			items, err := client.DiscoverExcluding(context.Background(), []source.WorkItem{{ID: id}})
+			if err == nil || items != nil || gets != 1 {
+				t.Fatalf("items=%#v err=%v GETs=%d", items, err, gets)
+			}
+		})
+	}
+}
+
+func TestHTTPClientDiscoverExcludingRejectsInvalidAcknowledgments(t *testing.T) {
+	for _, ack := range []string{`<missing>`, `null`, `{}`, `{"version":null}`, `{"version":"1"}`, `{"version":2}`} {
+		t.Run(ack, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				payload := `{"type":"idle","shouldRun":false}`
+				if ack != `<missing>` {
+					payload = `{"type":"idle","shouldRun":false,"prFixExclusions":` + ack + `}`
+				}
+				_, _ = io.WriteString(w, payload)
+			}))
+			defer server.Close()
+			client, err := NewClient(server.URL, "worker", "token", time.Second)
+			if err != nil {
+				t.Fatal(err)
+			}
+			client.WithPRFixExclusions(true)
+			id := EncodeWorkID(Task{Type: "followup-pr", PullRequest: &PullRequest{Repo: "acme/widgets", Number: 42}, PRFixItem: &PRFixItem{ID: "q", Generation: 1}})
+			items, err := client.DiscoverExcluding(context.Background(), []source.WorkItem{{ID: id}})
+			if err == nil || items != nil {
+				t.Fatalf("items=%#v err=%v", items, err)
+			}
+		})
+	}
+}
+
+func TestHTTPClientDiscoverExcludingAllowsNewerGeneration(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !reflect.DeepEqual(r.URL.Query()["exclude_pr_fix"], []string{"acme/widgets#42@3"}) {
+			t.Errorf("unexpected exclusions: %s", r.URL.RawQuery)
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"type": "followup-pr", "shouldRun": true,
+			"pullRequest":     PullRequest{Repo: "acme/widgets", Number: 42},
+			"prFixItem":       PRFixItem{ID: "item", Generation: 4},
+			"prFixExclusions": map[string]any{"version": 1},
+		})
+	}))
+	defer server.Close()
+	client, err := NewClient(server.URL, "worker", "token", time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	client.WithPRFixExclusions(true)
+	client.WithPullRequestStateChecker(PullRequestStateCheckerFunc(func(context.Context, string, int) (PullRequestState, error) {
+		return PullRequestState{State: "open"}, nil
+	}))
+	oldID := EncodeWorkID(Task{Type: "followup-pr", PullRequest: &PullRequest{Repo: "acme/widgets", Number: 42}, PRFixItem: &PRFixItem{ID: "item", Generation: 3}})
+	items, err := client.DiscoverExcluding(context.Background(), []source.WorkItem{{ID: oldID}})
+	if err != nil || len(items) != 1 {
+		t.Fatalf("items=%#v err=%v", items, err)
+	}
+	descriptor, err := decodeWorkID(items[0].ID)
+	if err != nil || descriptor.Generation != 4 || WorkIdentity(items[0].ID) == WorkIdentity(oldID) {
+		t.Fatalf("new generation lost: descriptor=%#v err=%v", descriptor, err)
+	}
+}
+
 func TestHTTPClientDiscoverMapsFollowupPR(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		_ = json.NewEncoder(w).Encode(Task{
@@ -843,6 +1007,114 @@ func TestHTTPClientReportMapsBlockedAndFailed(t *testing.T) {
 	}
 	if len(requests) != 3 || requests[0]["taskType"] != "followup-pr" || requests[0]["outcome"] != "blocked" || requests[0]["error"] != "blocked" || requests[1]["status"] != "BLOCKED" || requests[1]["repo"] != "acme/widgets" || requests[1]["pr"] != float64(77) || requests[2]["taskType"] != "implement" || requests[2]["outcome"] != "failed" || requests[2]["error"] != "failed" || requests[2]["issueNumber"] != float64(42) || requests[2]["pullRequestNumber"] != nil || requests[2]["prFixItem"] != nil {
 		t.Fatalf("requests = %#v, want blocked report + queue mark, then an issue-work failed report without a queue mark", requests)
+	}
+}
+
+func TestHTTPClientClassifiesOnlyInvalidOutcomeBadRequestAsUnsupported(t *testing.T) {
+	for _, tt := range []struct {
+		name        string
+		statusCode  int
+		body        string
+		unsupported bool
+	}{
+		{name: "invalid outcome", statusCode: http.StatusBadRequest, body: `{"error":"Invalid outcome. Must be one of: pr_opened, pr_updated, issue_updated, issue_closed, blocked, failed, no_changes_needed, already_addressed"}`, unsupported: true},
+		{name: "reordered valid outcomes", statusCode: http.StatusBadRequest, body: `{"error":"Invalid outcome. Must be one of: already_addressed, blocked, issue_closed, issue_updated, no_changes_needed, failed, pr_updated, pr_opened"}`, unsupported: true},
+		{name: "new allowlisted outcome", statusCode: http.StatusBadRequest, body: `{"error":"Invalid outcome. Must be one of: pr_opened, pr_updated, issue_updated, issue_closed, blocked, failed, no_changes_needed, already_addressed, queued"}`, unsupported: true},
+		{name: "other bad request", statusCode: http.StatusBadRequest, body: `{"error":"invalid task schema"}`},
+		{name: "malformed bad request", statusCode: http.StatusBadRequest, body: `{"error":`},
+		{name: "server error", statusCode: http.StatusInternalServerError, body: `{"error":"Invalid outcome. Must be one of: pr_opened"}`},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				w.WriteHeader(tt.statusCode)
+				_, _ = w.Write([]byte(tt.body))
+			}))
+			defer server.Close()
+			client, err := NewClient(server.URL, "worker", "secret-token", time.Second)
+			if err != nil {
+				t.Fatal(err)
+			}
+			id := EncodeWorkID(Task{Type: "implement", Issue: &Issue{ID: "issue-1", Repo: "acme/widgets", Number: 42}})
+			err = client.Report(context.Background(), id, source.Lifecycle{Result: source.ResultHandedOff, PR: "42"})
+			if got := errors.Is(err, source.ErrUnsupportedOutcome); got != tt.unsupported {
+				t.Fatalf("errors.Is(ErrUnsupportedOutcome) = %t, error %v; want %t", got, err, tt.unsupported)
+			}
+			if err == nil {
+				t.Fatal("Report() error = nil, want API error")
+			}
+		})
+	}
+}
+
+func TestHTTPClientReportHandedOffDoesNotParkPRFix(t *testing.T) {
+	var reports []map[string]any
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/api/pr-fix-queue/mark" {
+			t.Fatalf("handed-off report made a queue request: %s", r.URL.Path)
+		}
+		if r.Method != http.MethodPost || r.URL.Path != "/api/agents/worker/tasks/report" {
+			t.Fatalf("request = %s %s, want POST /api/agents/worker/tasks/report", r.Method, r.URL.Path)
+		}
+		body, _ := io.ReadAll(r.Body)
+		var request map[string]any
+		if err := json.Unmarshal(body, &request); err != nil {
+			t.Fatal(err)
+		}
+		reports = append(reports, request)
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer server.Close()
+	client, err := NewClientWithLane(server.URL, "worker", "normal", "secret-token", time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	id := EncodeWorkID(Task{Type: "followup-pr", PullRequest: &PullRequest{Repo: "acme/widgets", Number: 77}, PRFixItem: &PRFixItem{ID: "queue-item", Generation: 1}})
+	if err := client.Report(context.Background(), id, source.Lifecycle{Result: source.ResultHandedOff, PR: "88", Error: "external verification failed"}); err != nil {
+		t.Fatal(err)
+	}
+	if len(reports) != 1 {
+		t.Fatalf("reports = %#v, want exactly one handed-off task report", reports)
+	}
+	if reports[0]["outcome"] != "handed-off" || reports[0]["error"] != "external verification failed" || reports[0]["pullRequestNumber"] != float64(88) {
+		t.Fatalf("report = %#v, want handed-off outcome, error, and echoed PR 88", reports[0])
+	}
+}
+
+func TestHTTPClientReportHandedOffImplementDoesNotParkPRFix(t *testing.T) {
+	var reports []map[string]any
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/api/pr-fix-queue/mark" {
+			t.Fatalf("handed-off implement report made a queue request: %s", r.URL.Path)
+		}
+		if r.Method != http.MethodPost || r.URL.Path != "/api/agents/worker/tasks/report" {
+			t.Fatalf("request = %s %s, want POST /api/agents/worker/tasks/report", r.Method, r.URL.Path)
+		}
+		body, _ := io.ReadAll(r.Body)
+		var request map[string]any
+		if err := json.Unmarshal(body, &request); err != nil {
+			t.Fatal(err)
+		}
+		reports = append(reports, request)
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer server.Close()
+	client, err := NewClientWithLane(server.URL, "worker", "normal", "secret-token", time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	id := EncodeWorkID(Task{Type: "implement", Issue: &Issue{ID: "issue-1", Repo: "acme/widgets", Number: 42}})
+	if err := client.Report(context.Background(), id, source.Lifecycle{Result: source.ResultHandedOff, PR: "77", Error: "external verification failed"}); err != nil {
+		t.Fatal(err)
+	}
+	if len(reports) != 1 {
+		t.Fatalf("reports = %#v, want exactly one handed-off task report", reports)
+	}
+	report := reports[0]
+	if report["taskType"] != "implement" || report["outcome"] != "handed-off" || report["issueNumber"] != float64(42) || report["pullRequestNumber"] != float64(77) || report["error"] != "external verification failed" {
+		t.Fatalf("report = %#v, want an implement handed-off report for issue 42 PR 77", report)
+	}
+	if _, ok := report["prFixItem"]; ok {
+		t.Fatalf("implement handed-off report included prFixItem: %#v", report)
 	}
 }
 

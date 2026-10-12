@@ -18,6 +18,11 @@ var ErrStaleWork = errors.New("source: work item is stale")
 // dropped rather than retried: the newer generation belongs to another run.
 var ErrSuperseded = errors.New("source: work item superseded")
 
+// ErrUnsupportedOutcome means the source does not accept a lifecycle result.
+// The report intent stays pending, but automatic retries stop until an
+// operator supplies a new explicit retry token on the CoderRun.
+var ErrUnsupportedOutcome = errors.New("source: unsupported lifecycle outcome")
+
 // WorkItem identifies work in a source. ID is intentionally opaque: sources
 // are free to choose their identifier format, and the core must not know about
 // a source's queue or API types.
@@ -90,6 +95,8 @@ const (
 	// ResultFailed marks work that failed execution. Sources own the policy for
 	// handling it; some may issue a fresh attempt while others only record it.
 	ResultFailed Result = "failed"
+	// ResultHandedOff means the PR was published but external verification did not pass; the source must not treat it as ready or blocked, and its independent PR-repair mechanism takes over using the carried PR identity.
+	ResultHandedOff Result = "handed-off"
 )
 
 // Lifecycle contains source-neutral metadata for an optional lifecycle report.
@@ -128,6 +135,12 @@ type Reporter interface {
 // runner dedupes on this identity when an adapter provides one.
 type WorkIdentifier interface {
 	WorkIdentity(workItemID string) string
+}
+
+// DiscoveryExcluder optionally discovers work while excluding retained items.
+// Exclusions remain opaque to the source-neutral runner.
+type DiscoveryExcluder interface {
+	DiscoverExcluding(context.Context, []WorkItem) ([]WorkItem, error)
 }
 
 // PreLauncher optionally revalidates claimed work immediately before launch.
