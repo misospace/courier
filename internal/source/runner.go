@@ -144,6 +144,10 @@ func (r *Runner) Poll(ctx context.Context) error {
 		if strings.TrimSpace(run.Spec.WorkItemID) == "" {
 			continue
 		}
+		// A BlockedExternal run is recoverable: its generation stays re-offerable, so it adds no exclusion.
+		if run.Status.Phase == courierv1alpha1.PhaseBlockedExternal {
+			continue
+		}
 		retainedSource := run.Spec.Source == r.Config.Source
 		if r.Config.Source == "dispatch" {
 			retainedSource = retainedSource || run.Spec.Source == "dispatch" || strings.HasPrefix(run.Spec.Source, "dispatch:")

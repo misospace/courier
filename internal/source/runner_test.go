@@ -170,6 +170,51 @@ func TestRunnerExcludesPendingHeadSoFreeCloudBindingGetsNextItem(t *testing.T) {
 	}
 }
 
+func TestRunnerExclusionOmitsBlockedExternalRuns(t *testing.T) {
+	phases := []courierv1alpha1.Phase{
+		"",
+		courierv1alpha1.PhasePending,
+		courierv1alpha1.PhaseClaimed,
+		courierv1alpha1.PhaseRunning,
+		courierv1alpha1.PhaseVerifying,
+		courierv1alpha1.PhaseAwaitingReview,
+		courierv1alpha1.PhaseHandedOff,
+		courierv1alpha1.PhaseNeedsHuman,
+		courierv1alpha1.PhaseDone,
+		courierv1alpha1.PhaseFailed,
+		courierv1alpha1.PhaseBlockedExternal,
+	}
+	for _, phase := range phases {
+		t.Run(string(phase), func(t *testing.T) {
+			lane := testLane()
+			lane.Spec.Concurrency = 2
+			run := &courierv1alpha1.CoderRun{
+				ObjectMeta: metav1.ObjectMeta{Name: "retained", Namespace: "courier"},
+				Spec:       courierv1alpha1.CoderRunSpec{Source: "dispatch", WorkItemID: "opaque/generation-7", Mode: courierv1alpha1.ModeFixPR, Repo: "acme/widgets", Ref: 42, Lane: "local"},
+				Status:     courierv1alpha1.CoderRunStatus{Phase: phase},
+			}
+			adapter := &excludingTestAdapter{testAdapter: testAdapter{items: []WorkItem{{ID: "opaque/generation-8", Mode: "fix-pr", Repo: "acme/widgets", Ref: 42}}}}
+			runner := NewRunner(newTestClient(t, lane, run), adapter, RunnerConfig{Source: "dispatch", LaneProfile: "local", Namespace: "courier"})
+			if err := runner.Poll(context.Background()); err != nil {
+				t.Fatal(err)
+			}
+			if adapter.excludingCalls != 1 {
+				t.Fatalf("DiscoverExcluding calls = %d, want 1", adapter.excludingCalls)
+			}
+			if phase == courierv1alpha1.PhaseBlockedExternal {
+				if len(adapter.exclusions) != 0 {
+					t.Fatalf("exclusions = %#v, want none for BlockedExternal", adapter.exclusions)
+				}
+				return
+			}
+			want := (WorkItem{ID: "opaque/generation-7", Mode: "fix-pr", Repo: "acme/widgets", Ref: 42})
+			if len(adapter.exclusions) != 1 || adapter.exclusions[0] != want {
+				t.Fatalf("exclusions = %#v, want the retained %s run", adapter.exclusions, phase)
+			}
+		})
+	}
+}
+
 func TestRunnerSkipsDiscoveryWhenPendingRunReservesLaneCapacity(t *testing.T) {
 	item := WorkItem{ID: "queue-item/generation-2", Mode: "fix-pr", Repo: "acme/widgets", Ref: 43}
 	localLane := testLane()

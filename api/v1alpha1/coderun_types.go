@@ -225,7 +225,8 @@ type CoderRunStatus struct {
 	StartedAt *metav1.Time `json:"startedAt,omitempty"`
 
 	// FinishedAt is when the run's execution ended (the transition to a
-	// terminal phase: AwaitingReview, NeedsHuman, Done, or Failed). It is set
+	// terminal phase: AwaitingReview, HandedOff, NeedsHuman, Done, Failed, or
+	// BlockedExternal). It is set
 	// exactly once and never overwritten; a later transition (e.g.
 	// AwaitingReview -> Done) does not move it.
 	// +optional

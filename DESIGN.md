@@ -1044,7 +1044,7 @@ spec:                       # set once by the source adapter, then immutable
   debug: false                     # per-run: bumps pod log level, nothing else
   # no attempts field — by design
 status:
-  phase: Pending | Claimed | Running | Verifying | AwaitingReview | HandedOff | NeedsHuman | Done | Failed
+  phase: Pending | Claimed | Running | Verifying | AwaitingReview | HandedOff | NeedsHuman | Done | Failed | BlockedExternal
   branch: <derived resolve branch or adopted PR head>
   headRepo: <PR head repo; spec.repo for a same-repo PR, the fork's owner/name for a fork PR>
   headSHA: <head commit SHA>
@@ -1321,10 +1321,13 @@ task report and, for queue-backed follow-ups, a generation-fenced
 no-ops for fix-attempt accounting: do not advance generation, do not increment
 `fixAttempts`, do not surface as a human block, and keep the item discoverable
 so a future discovery cycle can re-offer the same work once the prerequisite
-is satisfied. Until Dispatch learns both signals, Courier emits them
-forward-compatibly; a legacy Dispatch rejects the report, and the controller
-retries on the existing bounded backoff. The contract change is tracked
-alongside #267; the source-neutral `blocked-external` lifecycle result and
+is satisfied; source discovery's retained-generation exclusions omit
+BlockedExternal runs so the same work stays re-offerable. Until Dispatch
+learns both signals, Courier emits them forward-compatibly; a legacy Dispatch
+rejects the report, and the controller holds it as a pending report on the
+unsupported-outcome path — automatic retries stop until an operator retry
+annotation re-publishes it once Dispatch accepts the signal. The contract
+change is tracked alongside #267; the source-neutral `blocked-external` lifecycle result and
 `BlockedExternal` phase in the operator are unchanged.
 
 ## MCP surface
@@ -1506,9 +1509,12 @@ named items remain unresolved and must not be described as production-ready:
   The Dispatch-side acceptance of the new outcome and queue status is a
   cross-repo contract change; until Dispatch learns both, the report and
   mark are emitted (forward-compatible) but a legacy Dispatch will reject
-  them, and the controller retries on the existing bounded backoff. The
-  source-neutral `blocked-external` lifecycle result and the
-  `BlockedExternal` phase are unchanged from the PR #271 first landing.
+  them, and the controller holds the report on the unsupported-outcome path
+  until an operator retry annotation re-publishes it. Source discovery's
+  retained-generation exclusions omit BlockedExternal runs so the blocked
+  generation stays re-offerable. The source-neutral `blocked-external`
+  lifecycle result and the `BlockedExternal` phase are unchanged from the
+  PR #271 first landing.
   `needs_decision` still reaches `NeedsHuman`; provider/workload failures
   remain `Failed`; exit codes and trusted handoff payloads are unchanged, so
   legacy exits stay compatible. This supersedes the fix-pr
