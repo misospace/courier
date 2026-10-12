@@ -67,7 +67,7 @@ func TestDispatchTasksReportContractGuard(t *testing.T) {
 			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				if r.URL.Path == "/api/pr-fix-queue/mark" {
 					if pair.result == source.ResultHandedOff {
-						t.Errorf("handed-off report unexpectedly settled PR-fix queue")
+						t.Errorf("%s report unexpectedly settled PR-fix queue", pair.result)
 					}
 					w.WriteHeader(http.StatusNoContent)
 					return
@@ -139,6 +139,90 @@ func TestDispatchTasksReportContractRejectsUnknownOutcomes(t *testing.T) {
 	followupID := EncodeWorkID(Task{Type: "followup-pr", PullRequest: &PullRequest{Repo: "acme/widgets", Number: 77}, PRFixItem: &PRFixItem{ID: "queue-item", Generation: 1}})
 	if err := client.Report(context.Background(), followupID, source.Lifecycle{Result: source.ResultReady, PR: "1"}); err != nil {
 		t.Fatalf("Report(pr_updated via followup-pr) error = %v; want nil", err)
+	}
+}
+
+// TestDispatchTasksReportBlockedExternalPendingUpstream pins the cross-repo
+// gap for source.ResultBlockedExternal. The adapter emits a dedicated
+// "waiting-external" task-report outcome for both task types, and — only for
+// queue-backed follow-ups — a generation-fenced WAITING_EXTERNAL queue mark;
+// but Dispatch has not landed acceptance for "waiting-external" yet, so it is
+// deliberately absent from dispatchAcceptedOutcomes and from
+// expectedTasksReportOutcomes (adding the pair there would fail the guard
+// test above).
+//
+// misospace/dispatch#1231 tracks Dispatch landing that acceptance. When it
+// lands, add "waiting-external" to dispatchAcceptedOutcomes and the
+// (ResultBlockedExternal, implement / followup-pr) pairs to
+// expectedTasksReportOutcomes in the same change; this test then flips to
+// asserting acceptance and the guard test regains full coverage.
+func TestDispatchTasksReportBlockedExternalPendingUpstream(t *testing.T) {
+	const wantOutcome = "waiting-external"
+
+	type expectation struct {
+		taskType       string
+		wantMark       bool
+		wantMarkStatus string
+	}
+	for _, want := range []expectation{
+		{taskType: "implement"},
+		{taskType: "followup-pr", wantMark: true, wantMarkStatus: "WAITING_EXTERNAL"},
+	} {
+		want := want
+		t.Run(want.taskType, func(t *testing.T) {
+			var reportBody map[string]any
+			var markBody map[string]any
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.URL.Path == "/api/pr-fix-queue/mark" {
+					_ = json.NewDecoder(r.Body).Decode(&markBody)
+					w.WriteHeader(http.StatusNoContent)
+					return
+				}
+				_ = json.NewDecoder(r.Body).Decode(&reportBody)
+				w.WriteHeader(http.StatusNoContent)
+			}))
+			defer server.Close()
+
+			id := encodeWorkIDForTaskType(t, want.taskType)
+			client, err := NewClientWithLane(server.URL, "worker", "normal", "secret-token", time.Second)
+			if err != nil {
+				t.Fatal(err)
+			}
+			err = client.Report(context.Background(), id, source.Lifecycle{
+				Result: source.ResultBlockedExternal,
+				PR:     "1",
+				Error:  "waiting on an external prerequisite",
+			})
+			if err != nil {
+				t.Fatalf("Report() error = %v", err)
+			}
+
+			if got, _ := reportBody["taskType"].(string); got != want.taskType {
+				t.Fatalf("captured taskType = %q, want %q", got, want.taskType)
+			}
+			if got, _ := reportBody["outcome"].(string); got != wantOutcome {
+				t.Fatalf("captured outcome = %q, want %q", got, wantOutcome)
+			}
+			if want.wantMark {
+				if markBody == nil {
+					t.Fatalf("expected a PR-fix queue mark, got none")
+				}
+				if got, _ := markBody["status"].(string); got != want.wantMarkStatus {
+					t.Fatalf("queue mark status = %q, want %q", got, want.wantMarkStatus)
+				}
+			} else if markBody != nil {
+				t.Fatalf("unexpected PR-fix queue mark for %s", want.taskType)
+			}
+		})
+	}
+
+	// The gap, pinned: the adapter emits "waiting-external" but Dispatch has
+	// not landed acceptance for it yet (misospace/dispatch#1231), so it must
+	// stay out of dispatchAcceptedOutcomes until that lands. If it appears
+	// here, dispatch#1231 has landed — add the blocked-external pairs to
+	// expectedTasksReportOutcomes and the accepted fixture in the same change.
+	if _, ok := dispatchAcceptedOutcomes[wantOutcome]; ok {
+		t.Fatalf(`"waiting-external" is now in dispatchAcceptedOutcomes; misospace/dispatch#1231 has landed — add the (ResultBlockedExternal, implement / followup-pr) pairs to expectedTasksReportOutcomes and update the accepted fixture in the same change`)
 	}
 }
 

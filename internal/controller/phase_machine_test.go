@@ -444,13 +444,12 @@ func TestRunningPodExitMapsPhaseAndSourceState(t *testing.T) {
 		{name: "needs-human", exitCode: 2, wantPhase: courierv1alpha1.PhaseNeedsHuman, wantSource: source.StateNeedsHuman, wantReport: true, wantResult: source.ResultBlocked},
 		// no_change_needed (issue #169) never settles the source directly: a
 		// resolve-issue run lands in AwaitingReview for a human to review the
-		// posted evidence; a fix-pr run lands in NeedsHuman until Dispatch
-		// accepts an explicit already-addressed settlement
-		// (misospace/dispatch#1121).
+		// posted evidence; a fix-pr run is settled against the world through
+		// Verifying (issue #267).
 		{name: "no-change-needed resolve-issue", mode: courierv1alpha1.ModeResolveIssue, exitCode: 3, wantPhase: courierv1alpha1.PhaseAwaitingReview, wantSource: source.StateInReview, wantReport: true},
-		// The blocked task report parks the item; skip only the redundant
-		// follow-up PR-fix queue mark.
-		{name: "no-change-needed fix-pr", mode: courierv1alpha1.ModeFixPR, exitCode: 3, wantPhase: courierv1alpha1.PhaseNeedsHuman, wantSource: source.StateNeedsHuman, wantReport: true, wantResult: source.ResultBlocked, wantBlockedReportParksPRFix: true},
+		// A fix-pr no_change_needed declaration is settled against the world
+		// by Verifying, not mapped straight to NeedsHuman (issue #267).
+		{name: "no-change-needed fix-pr", mode: courierv1alpha1.ModeFixPR, exitCode: 3, wantPhase: courierv1alpha1.PhaseVerifying},
 		{name: "failure", exitCode: 17, wantPhase: courierv1alpha1.PhaseFailed, wantSource: source.StateNeedsHuman, wantReport: true, wantResult: source.ResultBlocked},
 	}
 	for _, tt := range tests {
@@ -1815,49 +1814,137 @@ func TestDoneRunResolvesSourceWorkItem(t *testing.T) {
 	}
 }
 
-// TestExit3NoChangeNeededSettlesNothingDirectly checks the no_change_needed
-// path (issue #169) behind the human review gate: a coordinator that exits 3
-// never settles the source directly. A resolve-issue run ends AwaitingReview
-// with the source transitioned to in-review; a fix-pr run ends NeedsHuman
-// with a blocked lifecycle report. Neither resolves the work item, not even
-// on a follow-up reconcile.
-func TestExit3NoChangeNeededSettlesNothingDirectly(t *testing.T) {
+// TestExit3NoChangeNeededResolveIssueSettlesNothingDirectly checks the
+// resolve-issue no_change_needed path (issue #169) behind the human review
+// gate: a coordinator that exits 3 never settles the source directly. The run
+// ends AwaitingReview with the source transitioned to in-review, and neither
+// the first reconcile nor a follow-up resolves the work item.
+func TestExit3NoChangeNeededResolveIssueSettlesNothingDirectly(t *testing.T) {
+	item := &admissionSource{}
+	run := admissionRun("run", "local", courierv1alpha1.PhaseRunning)
+	run.Spec.Mode = courierv1alpha1.ModeResolveIssue
+	client := phaseClient(t, run, coordinatorPod(run, 3))
+	reconciler := &CoderRunReconciler{
+		Client:       client,
+		Sources:      NewSourceRegistry(map[string]source.Adapter{"test": item}),
+		StatusWriter: fakeStatusWriter{client: client},
+	}
+	if _, err := reconciler.Reconcile(context.Background(), admissionRequest("run")); err != nil {
+		t.Fatalf("Reconcile() error = %v", err)
+	}
+	var updated courierv1alpha1.CoderRun
+	if err := client.Get(context.Background(), admissionKey("run"), &updated); err != nil {
+		t.Fatalf("get run: %v", err)
+	}
+	if updated.Status.Phase != courierv1alpha1.PhaseAwaitingReview {
+		t.Fatalf("phase = %q, want AwaitingReview", updated.Status.Phase)
+	}
+	if len(item.transitions) != 1 || item.transitions[0] != source.StateInReview {
+		t.Fatalf("source transitions = %#v, want in-review", item.transitions)
+	}
+	// The terminal phase is stable: a follow-up reconcile must not settle the
+	// source.
+	if _, err := reconciler.Reconcile(context.Background(), admissionRequest("run")); err != nil {
+		t.Fatalf("second Reconcile() error = %v", err)
+	}
+	if len(item.resolved) != 0 {
+		t.Fatalf("resolved IDs = %#v, want none: no_change_needed never resolves the source directly", item.resolved)
+	}
+}
+
+// TestExit3NoChangeNeededFixPRSettlesAgainstWorld covers issue #267: a fix-pr
+// no_change_needed run (executor exit 3) is routed to Verifying and settled
+// from the world instead of being mapped straight to NeedsHuman. Only a merged
+// pull request reaches Done; an open pull request reaches AwaitingReview only
+// on stable green checks and retryable Failed on red; an unobservable pull
+// request stays NeedsHuman.
+func TestExit3NoChangeNeededFixPRSettlesAgainstWorld(t *testing.T) {
 	tests := []struct {
-		name                        string
-		mode                        courierv1alpha1.Mode
-		wantPhase                   courierv1alpha1.Phase
-		wantSource                  source.State
-		wantResult                  source.Result
-		wantBlockedReportParksPRFix bool
+		name            string
+		observer        WorldObserver
+		wantPhase       courierv1alpha1.Phase
+		wantSource      source.State
+		wantResult      source.Result
+		wantReport      bool
+		wantResolved    bool
+		wantTransitions int
+		// wantBlockedParksPRFix is the lifecycle flag the source sees; a
+		// recoverable block must never set it (issue #267).
+		wantBlockedParksPRFix bool
+		// secondObserve runs one more reconcile when the world needs a second
+		// observation to settle (stable green).
+		secondObserve bool
 	}{
 		{
-			name:       "resolve-issue awaits human review",
-			mode:       courierv1alpha1.ModeResolveIssue,
-			wantPhase:  courierv1alpha1.PhaseAwaitingReview,
-			wantSource: source.StateInReview,
+			name:            "merged settles Done without a human",
+			observer:        fakeWorldObserver{observation: PRObservation{PR: "42", Merged: true}},
+			wantPhase:       courierv1alpha1.PhaseDone,
+			wantResolved:    true,
+			wantTransitions: 0,
 		},
 		{
-			name:                        "fix-pr needs human",
-			mode:                        courierv1alpha1.ModeFixPR,
-			wantPhase:                   courierv1alpha1.PhaseNeedsHuman,
-			wantSource:                  source.StateNeedsHuman,
-			wantResult:                  source.ResultBlocked,
-			wantBlockedReportParksPRFix: true,
+			name:            "open green cannot verify queued feedback",
+			observer:        fakeWorldObserver{observation: PRObservation{PR: "42", Head: "abc", Checks: []CheckObservation{{Name: "test", State: CheckStatePassed}}}},
+			wantPhase:       courierv1alpha1.PhaseBlockedExternal,
+			wantSource:      source.StateInProgress,
+			wantReport:      true,
+			wantResult:      source.ResultBlockedExternal,
+			wantTransitions: 1,
+			secondObserve:   true,
+		},
+		{
+			name:            "open red reaches retryable Failed",
+			observer:        fakeWorldObserver{observation: PRObservation{PR: "42", Head: "abc", Checks: []CheckObservation{{Name: "test", State: CheckStateFailed}}}},
+			wantPhase:       courierv1alpha1.PhaseFailed,
+			wantSource:      source.StateInProgress,
+			wantReport:      true,
+			wantResult:      source.ResultFailed,
+			wantTransitions: 1,
+		},
+		{
+			// A pull request the operator cannot observe is a genuinely
+			// blocked diagnostic state, not a recoverable external block: the
+			// source is parked for a human (BlockedReportParksPRFix is false,
+			// so the PR-fix item is marked BLOCKED).
+			name:                  "unobservable pull request stays NeedsHuman",
+			observer:              fakeWorldObserver{observation: PRObservation{}},
+			wantPhase:             courierv1alpha1.PhaseNeedsHuman,
+			wantSource:            source.StateNeedsHuman,
+			wantReport:            true,
+			wantResult:            source.ResultBlocked,
+			wantTransitions:       1,
+			wantBlockedParksPRFix: false,
 		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			item := &admissionSource{}
 			run := admissionRun("run", "local", courierv1alpha1.PhaseRunning)
-			run.Spec.Mode = tt.mode
+			run.Spec.Mode = courierv1alpha1.ModeFixPR
 			client := phaseClient(t, run, coordinatorPod(run, 3))
 			reconciler := &CoderRunReconciler{
 				Client:       client,
 				Sources:      NewSourceRegistry(map[string]source.Adapter{"test": item}),
 				StatusWriter: fakeStatusWriter{client: client},
+				Observer:     tt.observer,
 			}
 			if _, err := reconciler.Reconcile(context.Background(), admissionRequest("run")); err != nil {
-				t.Fatalf("Reconcile() error = %v", err)
+				t.Fatalf("first Reconcile() error = %v", err)
+			}
+			var afterFirst courierv1alpha1.CoderRun
+			if err := client.Get(context.Background(), admissionKey("run"), &afterFirst); err != nil {
+				t.Fatalf("get run after first reconcile: %v", err)
+			}
+			if afterFirst.Status.Phase != courierv1alpha1.PhaseVerifying {
+				t.Fatalf("phase after exit 3 = %q, want Verifying (settle against the world)", afterFirst.Status.Phase)
+			}
+			if _, err := reconciler.Reconcile(context.Background(), admissionRequest("run")); err != nil {
+				t.Fatalf("second Reconcile() error = %v", err)
+			}
+			if tt.secondObserve {
+				if _, err := reconciler.Reconcile(context.Background(), admissionRequest("run")); err != nil {
+					t.Fatalf("third Reconcile() error = %v", err)
+				}
 			}
 			var updated courierv1alpha1.CoderRun
 			if err := client.Get(context.Background(), admissionKey("run"), &updated); err != nil {
@@ -1866,26 +1953,118 @@ func TestExit3NoChangeNeededSettlesNothingDirectly(t *testing.T) {
 			if updated.Status.Phase != tt.wantPhase {
 				t.Fatalf("phase = %q, want %q", updated.Status.Phase, tt.wantPhase)
 			}
-			if len(item.transitions) != 1 || item.transitions[0] != tt.wantSource {
-				t.Fatalf("source transitions = %#v, want %#v", item.transitions, []source.State{tt.wantSource})
+			if tt.wantResolved {
+				// Done resolves the source on the reconcile after the phase
+				// transition.
+				if _, err := reconciler.Reconcile(context.Background(), admissionRequest("run")); err != nil {
+					t.Fatalf("resolve reconcile error = %v", err)
+				}
+				if len(item.resolved) != 1 || item.resolved[0] != "run" {
+					t.Fatalf("resolved = %#v, want the merged fix-pr run resolved", item.resolved)
+				}
+			} else if len(item.resolved) != 0 {
+				t.Fatalf("resolved = %#v, want none: the source is not settled on the declaration alone", item.resolved)
 			}
-			if len(item.reports) != 1 || item.reports[0].Result != tt.wantResult || item.reports[0].BlockedReportParksPRFix != tt.wantBlockedReportParksPRFix {
-				t.Fatalf("lifecycle reports = %#v, want one with result %q and blocked-report parking %t", item.reports, tt.wantResult, tt.wantBlockedReportParksPRFix)
+			// Done publishes no source transition; every other settled ending
+			// publishes exactly one.
+			if len(item.transitions) != tt.wantTransitions {
+				t.Fatalf("transitions = %#v, want %d", item.transitions, tt.wantTransitions)
 			}
-			// The terminal phase is stable: a follow-up reconcile must not
-			// settle the source.
-			if _, err := reconciler.Reconcile(context.Background(), admissionRequest("run")); err != nil {
-				t.Fatalf("second Reconcile() error = %v", err)
+			if !tt.wantReport {
+				for _, report := range item.reports {
+					if report.Result != "" {
+						t.Fatalf("reports = %#v, want no outcome report", item.reports)
+					}
+				}
+				return
 			}
-			if len(item.resolved) != 0 {
-				t.Fatalf("resolved IDs = %#v, want none: no_change_needed never resolves the source", item.resolved)
+			if len(item.reports) != 1 || item.reports[0].Result != tt.wantResult {
+				t.Fatalf("reports = %#v, want one with result %q", item.reports, tt.wantResult)
 			}
-			var settled courierv1alpha1.CoderRun
-			if err := client.Get(context.Background(), admissionKey("run"), &settled); err != nil {
-				t.Fatalf("get run: %v", err)
+			if item.reports[0].BlockedReportParksPRFix != tt.wantBlockedParksPRFix {
+				t.Fatalf("BlockedReportParksPRFix = %t, want %t", item.reports[0].BlockedReportParksPRFix, tt.wantBlockedParksPRFix)
 			}
-			if settled.Status.Phase != tt.wantPhase {
-				t.Fatalf("phase after follow-up = %q, want %q", settled.Status.Phase, tt.wantPhase)
+			if tt.wantSource != "" {
+				if len(item.transitions) != 1 || item.transitions[0] != tt.wantSource {
+					t.Fatalf("transitions = %#v, want %#v", item.transitions, []source.State{tt.wantSource})
+				}
+			}
+		})
+	}
+}
+
+// TestBlockedExternalIsRecoverableDependencyBlock covers issue #267: an
+// external-prerequisite declaration (executor exit 2, outcome blocked_external)
+// becomes the recoverable BlockedExternal phase, keeps the source item active,
+// and reports a recoverable result rather than parking it for a human.
+func TestBlockedExternalIsRecoverableDependencyBlock(t *testing.T) {
+	item := &admissionSource{}
+	run := admissionRun("run", "local", courierv1alpha1.PhaseRunning)
+	pod := coordinatorPodWithOutcome(run, 2, "blocked_external", "missing prerequisite: secrets/prod")
+	client := phaseClient(t, run, pod)
+	reconciler := &CoderRunReconciler{
+		Client:       client,
+		Sources:      NewSourceRegistry(map[string]source.Adapter{"test": item}),
+		StatusWriter: fakeStatusWriter{client: client},
+	}
+	if _, err := reconciler.Reconcile(context.Background(), admissionRequest("run")); err != nil {
+		t.Fatalf("Reconcile() error = %v", err)
+	}
+	var updated courierv1alpha1.CoderRun
+	if err := client.Get(context.Background(), admissionKey("run"), &updated); err != nil {
+		t.Fatalf("get run: %v", err)
+	}
+	if updated.Status.Phase != courierv1alpha1.PhaseBlockedExternal {
+		t.Fatalf("phase = %q, want BlockedExternal", updated.Status.Phase)
+	}
+	if len(item.transitions) != 1 || item.transitions[0] != source.StateInProgress {
+		t.Fatalf("transitions = %#v, want in-progress (recoverable, not parked)", item.transitions)
+	}
+	if len(item.reports) != 1 || item.reports[0].Result != source.ResultBlockedExternal || item.reports[0].State != source.StateInProgress {
+		t.Fatalf("reports = %#v, want one recoverable blocked-external report", item.reports)
+	}
+	if item.reports[0].Error != "missing prerequisite: secrets/prod" {
+		t.Fatalf("report error = %q, want the bounded missing explanation", item.reports[0].Error)
+	}
+	if item.reports[0].BlockedReportParksPRFix {
+		t.Fatalf("reports = %#v, want no PR-fix park: the block is recoverable", item.reports)
+	}
+	// The phase is terminal, so it no longer consumes lane capacity and a
+	// follow-up reconcile does not re-publish the lifecycle.
+	if phaseConsumesCapacity(updated.Status.Phase) {
+		t.Fatalf("phase %q must not consume lane capacity", updated.Status.Phase)
+	}
+	if _, err := reconciler.Reconcile(context.Background(), admissionRequest("run")); err != nil {
+		t.Fatalf("second Reconcile() error = %v", err)
+	}
+	if len(item.reports) != 1 {
+		t.Fatalf("reports = %#v, want the terminal phase to be stable", item.reports)
+	}
+}
+
+// TestPhaseForExitClassification pins the exit/outcome classification contract,
+// including legacy exits with no trusted handoff outcome (issue #267).
+func TestPhaseForExitClassification(t *testing.T) {
+	tests := []struct {
+		name     string
+		mode     courierv1alpha1.Mode
+		exitCode int32
+		outcome  string
+		want     courierv1alpha1.Phase
+	}{
+		{name: "changes verifies", mode: courierv1alpha1.ModeResolveIssue, exitCode: 0, want: courierv1alpha1.PhaseVerifying},
+		{name: "needs_decision is human", mode: courierv1alpha1.ModeResolveIssue, exitCode: 2, outcome: "needs_decision", want: courierv1alpha1.PhaseNeedsHuman},
+		{name: "legacy exit 2 with no outcome is human", mode: courierv1alpha1.ModeResolveIssue, exitCode: 2, want: courierv1alpha1.PhaseNeedsHuman},
+		{name: "blocked_external is a recoverable block", mode: courierv1alpha1.ModeFixPR, exitCode: 2, outcome: "blocked_external", want: courierv1alpha1.PhaseBlockedExternal},
+		{name: "no_change_needed resolve-issue awaits review", mode: courierv1alpha1.ModeResolveIssue, exitCode: 3, want: courierv1alpha1.PhaseAwaitingReview},
+		{name: "legacy exit 3 fix-pr verifies", mode: courierv1alpha1.ModeFixPR, exitCode: 3, want: courierv1alpha1.PhaseVerifying},
+		{name: "provider failure stays failed", mode: courierv1alpha1.ModeFixPR, exitCode: 1, want: courierv1alpha1.PhaseFailed},
+		{name: "untrusted blocked_external on a failure exit stays failed", mode: courierv1alpha1.ModeFixPR, exitCode: 1, outcome: "blocked_external", want: courierv1alpha1.PhaseFailed},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := phaseForExit(tt.mode, tt.exitCode, tt.outcome); got != tt.want {
+				t.Fatalf("phaseForExit(%q, %d, %q) = %q, want %q", tt.mode, tt.exitCode, tt.outcome, got, tt.want)
 			}
 		})
 	}
@@ -2037,15 +2216,15 @@ func TestTransientReportKeepsRunTerminalAndRetriesSeparately(t *testing.T) {
 	if err := client.Get(context.Background(), admissionKey("run"), &updated); err != nil {
 		t.Fatalf("get run: %v", err)
 	}
-	if updated.Status.Phase != courierv1alpha1.PhaseNeedsHuman {
-		t.Fatalf("phase = %q, want NeedsHuman (terminal immediately)", updated.Status.Phase)
+	if updated.Status.Phase != courierv1alpha1.PhaseBlockedExternal {
+		t.Fatalf("phase = %q, want BlockedExternal (terminal immediately, recoverable)", updated.Status.Phase)
 	}
 	cond := apimeta.FindStatusCondition(updated.Status.Conditions, lifecycleReportedCondition)
 	if cond == nil || cond.Status != metav1.ConditionFalse || cond.Reason != lifecycleReportPendingWithErrorReason || cond.Message != "missing prerequisite: secrets/prod" {
 		t.Fatalf("LifecycleReported = %#v, want pending external prerequisite reason", cond)
 	}
-	if len(item.reports) != 1 || item.reports[0].Result != source.ResultBlocked || item.reports[0].Error != "missing prerequisite: secrets/prod" {
-		t.Fatalf("reports = %#v, want blocked report with external prerequisite reason", item.reports)
+	if len(item.reports) != 1 || item.reports[0].Result != source.ResultBlockedExternal || item.reports[0].Error != "missing prerequisite: secrets/prod" {
+		t.Fatalf("reports = %#v, want recoverable blocked-external report with the missing reason", item.reports)
 	}
 	// The source recovers: a later reconcile retries only the report.
 	item.reportErr = nil
@@ -2059,8 +2238,8 @@ func TestTransientReportKeepsRunTerminalAndRetriesSeparately(t *testing.T) {
 	if len(item.reports) != 2 {
 		t.Fatalf("reports = %#v, want the retry to add a second report", item.reports)
 	}
-	if item.reports[1].Result != source.ResultBlocked || item.reports[1].Error != "missing prerequisite: secrets/prod" {
-		t.Fatalf("retry report = %#v, want blocked external prerequisite reason", item.reports[1])
+	if item.reports[1].Result != source.ResultBlockedExternal || item.reports[1].Error != "missing prerequisite: secrets/prod" {
+		t.Fatalf("retry report = %#v, want recoverable blocked external prerequisite reason", item.reports[1])
 	}
 	if err := client.Get(context.Background(), admissionKey("run"), &updated); err != nil {
 		t.Fatalf("get run: %v", err)
@@ -2113,41 +2292,6 @@ func TestFixPRCIFailureReportRetryPreservesQueueSettlementIntent(t *testing.T) {
 	}
 	if len(item.reports) != 2 || item.reports[1].Result != source.ResultFailed || item.reports[1].Error != externalVerificationFailureReason {
 		t.Fatalf("retry reports = %#v, want preserved external-verification failure", item.reports)
-	}
-}
-
-func TestExit3FixPRReportRetryPreservesSkipQueueMark(t *testing.T) {
-	item := &admissionSource{reportErr: errors.New("dispatch unavailable")}
-	run := admissionRun("run", "local", courierv1alpha1.PhaseRunning)
-	run.Spec.Mode = courierv1alpha1.ModeFixPR
-	run.Spec.Source = "test"
-	run.Spec.WorkItemID = "opaque-work-item"
-	client := phaseClient(t, run, coordinatorPod(run, 3))
-	reconciler := &CoderRunReconciler{
-		Client:       client,
-		Sources:      NewSourceRegistry(map[string]source.Adapter{"test": item}),
-		StatusWriter: status.KubePatchWriter{Client: client},
-	}
-	if _, err := reconciler.Reconcile(context.Background(), admissionRequest("run")); err != nil {
-		t.Fatalf("first Reconcile() error = %v", err)
-	}
-	if len(item.reports) != 1 || !item.reports[0].BlockedReportParksPRFix {
-		t.Fatalf("first reports = %#v, want BlockedReportParksPRFix", item.reports)
-	}
-	var pending courierv1alpha1.CoderRun
-	if err := client.Get(context.Background(), admissionKey("run"), &pending); err != nil {
-		t.Fatalf("get pending run: %v", err)
-	}
-	cond := apimeta.FindStatusCondition(pending.Status.Conditions, lifecycleReportedCondition)
-	if cond == nil || cond.Reason != lifecycleReportPendingBlockedReportParksPRFixReason {
-		t.Fatalf("LifecycleReported = %#v, want durable skip-queue-mark intent", cond)
-	}
-	item.reportErr = nil
-	if _, err := reconciler.Reconcile(context.Background(), admissionRequest("run")); err != nil {
-		t.Fatalf("retry Reconcile() error = %v", err)
-	}
-	if len(item.reports) != 2 || !item.reports[1].BlockedReportParksPRFix {
-		t.Fatalf("reports after retry = %#v, want BlockedReportParksPRFix on both reports", item.reports)
 	}
 }
 
@@ -2240,5 +2384,170 @@ func TestSupersededReportFreesLaneForNextRun(t *testing.T) {
 	}
 	if updatedNext.Status.Phase != courierv1alpha1.PhaseClaimed {
 		t.Fatalf("next phase = %q, want Claimed (a dropped report must not hold the lane)", updatedNext.Status.Phase)
+	}
+}
+
+// TestFixPRDeclaredNoChangeRecordedOnTerminatingExit records that a fix-pr
+// run whose coordinator terminates with the verified no_change_needed exit
+// (3) lands in Verifying with the declaration persisted, while a normal
+// success (0) reaches Verifying without it: exit 0 may have pushed a fix, so
+// it must not be mistaken for a no-change declaration.
+func TestFixPRDeclaredNoChangeRecordedOnTerminatingExit(t *testing.T) {
+	tests := []struct {
+		name string
+		exit int32
+		want bool
+	}{
+		{name: "declared no_change_needed records the declaration", exit: 3, want: true},
+		{name: "normal success does not record a declaration", exit: 0, want: false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			item := &admissionSource{}
+			run := admissionRun("run", "local", courierv1alpha1.PhaseRunning)
+			run.Spec.Mode = courierv1alpha1.ModeFixPR
+			client := phaseClient(t, run, coordinatorPod(run, tt.exit))
+			reconciler := &CoderRunReconciler{
+				Client:       client,
+				Sources:      NewSourceRegistry(map[string]source.Adapter{"test": item}),
+				StatusWriter: status.KubePatchWriter{Client: client},
+			}
+			if _, err := reconciler.Reconcile(context.Background(), admissionRequest("run")); err != nil {
+				t.Fatalf("Reconcile() error = %v", err)
+			}
+			var updated courierv1alpha1.CoderRun
+			if err := client.Get(context.Background(), admissionKey("run"), &updated); err != nil {
+				t.Fatalf("get run: %v", err)
+			}
+			if updated.Status.Phase != courierv1alpha1.PhaseVerifying {
+				t.Fatalf("phase = %q, want Verifying", updated.Status.Phase)
+			}
+			if updated.Status.DeclaredNoChange != tt.want {
+				t.Fatalf("DeclaredNoChange = %t, want %t", updated.Status.DeclaredNoChange, tt.want)
+			}
+		})
+	}
+}
+
+// TestFixPRDeclaredNoChangeTerminalizesNoChangeInReview covers issue #267: a
+// Green CI alone cannot verify queued feedback resolution. A no-change
+// attempt stays recoverable without authorizing FIXED or claiming a push.
+func TestFixPRDeclaredNoChangeTerminalizesNoChangeInReview(t *testing.T) {
+	item := &admissionSource{}
+	run := admissionRun("run", "local", courierv1alpha1.PhaseVerifying)
+	run.Spec.Mode = courierv1alpha1.ModeFixPR
+	run.Status.DeclaredNoChange = true
+	client := phaseClient(t, run)
+	reconciler := &CoderRunReconciler{
+		Client:       client,
+		Sources:      NewSourceRegistry(map[string]source.Adapter{"test": item}),
+		StatusWriter: status.KubePatchWriter{Client: client},
+		Observer:     fakeWorldObserver{observation: greenObservation("abc", "check-a")},
+	}
+	if _, err := reconciler.Reconcile(context.Background(), admissionRequest("run")); err != nil {
+		t.Fatalf("first Reconcile() error = %v", err)
+	}
+	if _, err := reconciler.Reconcile(context.Background(), admissionRequest("run")); err != nil {
+		t.Fatalf("second Reconcile() error = %v", err)
+	}
+	var updated courierv1alpha1.CoderRun
+	if err := client.Get(context.Background(), admissionKey("run"), &updated); err != nil {
+		t.Fatalf("get run: %v", err)
+	}
+	if updated.Status.Phase != courierv1alpha1.PhaseBlockedExternal {
+		t.Fatalf("phase = %q, want BlockedExternal", updated.Status.Phase)
+	}
+	if len(item.reports) != 1 {
+		t.Fatalf("reports = %#v, want exactly one", item.reports)
+	}
+	if item.reports[0].Result != source.ResultBlockedExternal {
+		t.Fatalf("report result = %q, want blocked-external (feedback resolution is unverified)", item.reports[0].Result)
+	}
+	if item.reports[0].State != source.StateInProgress {
+		t.Fatalf("report state = %q, want in-progress", item.reports[0].State)
+	}
+	if item.reports[0].PR != "42" {
+		t.Fatalf("report PR = %q, want the carried PR 42", item.reports[0].PR)
+	}
+}
+
+// TestFixPRWithoutDeclarationStillReportsReadyInReview is the regression guard
+// for the no-change override: a fix-pr run that never recorded a
+// no_change_needed declaration may have pushed a fix, so it still reports
+// ready in review rather than no-change.
+func TestFixPRWithoutDeclarationStillReportsReadyInReview(t *testing.T) {
+	item := &admissionSource{}
+	run := admissionRun("run", "local", courierv1alpha1.PhaseVerifying)
+	run.Spec.Mode = courierv1alpha1.ModeFixPR
+	client := phaseClient(t, run)
+	reconciler := &CoderRunReconciler{
+		Client:       client,
+		Sources:      NewSourceRegistry(map[string]source.Adapter{"test": item}),
+		StatusWriter: status.KubePatchWriter{Client: client},
+		Observer:     fakeWorldObserver{observation: greenObservation("abc", "check-a")},
+	}
+	if _, err := reconciler.Reconcile(context.Background(), admissionRequest("run")); err != nil {
+		t.Fatalf("first Reconcile() error = %v", err)
+	}
+	if _, err := reconciler.Reconcile(context.Background(), admissionRequest("run")); err != nil {
+		t.Fatalf("second Reconcile() error = %v", err)
+	}
+	var updated courierv1alpha1.CoderRun
+	if err := client.Get(context.Background(), admissionKey("run"), &updated); err != nil {
+		t.Fatalf("get run: %v", err)
+	}
+	if updated.Status.Phase != courierv1alpha1.PhaseAwaitingReview {
+		t.Fatalf("phase = %q, want AwaitingReview", updated.Status.Phase)
+	}
+	if len(item.reports) != 1 {
+		t.Fatalf("reports = %#v, want exactly one", item.reports)
+	}
+	if item.reports[0].Result != source.ResultReady {
+		t.Fatalf("report result = %q, want ready (no declaration means a fix may have been pushed)", item.reports[0].Result)
+	}
+	if item.reports[0].State != source.StateInReview {
+		t.Fatalf("report state = %q, want in-review", item.reports[0].State)
+	}
+}
+
+// Migration replay cannot certify feedback resolution from an old phase.
+func TestRetainedAwaitingReviewNoChangeReportFailsClosed(t *testing.T) {
+	item := &admissionSource{}
+	run := admissionRun("run", "local", courierv1alpha1.PhaseAwaitingReview)
+	run.Spec.Mode = courierv1alpha1.ModeFixPR
+	run.Status.DeclaredNoChange = true
+	run.Status.PR = "42"
+	run.Status.Conditions = []metav1.Condition{{Type: lifecycleReportedCondition, Status: metav1.ConditionFalse, Reason: lifecycleReportPendingReason, LastTransitionTime: metav1.Now()}}
+	client := phaseClient(t, run)
+	reconciler := &CoderRunReconciler{
+		Client:       client,
+		Sources:      NewSourceRegistry(map[string]source.Adapter{"test": item}),
+		StatusWriter: status.KubePatchWriter{Client: client},
+		Observer:     fakeWorldObserver{observation: greenObservation("abc", "check-a")},
+	}
+	if _, err := reconciler.Reconcile(context.Background(), admissionRequest("run")); err != nil {
+		t.Fatalf("first Reconcile() error = %v", err)
+	}
+	if _, err := reconciler.Reconcile(context.Background(), admissionRequest("run")); err != nil {
+		t.Fatalf("second Reconcile() error = %v", err)
+	}
+	var updated courierv1alpha1.CoderRun
+	if err := client.Get(context.Background(), admissionKey("run"), &updated); err != nil {
+		t.Fatalf("get run: %v", err)
+	}
+	if updated.Status.Phase != courierv1alpha1.PhaseAwaitingReview {
+		t.Fatalf("phase = %q, want BlockedExternal", updated.Status.Phase)
+	}
+	if len(item.reports) != 1 {
+		t.Fatalf("reports = %#v, want exactly one", item.reports)
+	}
+	if item.reports[0].Result != source.ResultBlockedExternal {
+		t.Fatalf("report result = %q, want blocked-external (feedback resolution is unverified)", item.reports[0].Result)
+	}
+	if item.reports[0].State != source.StateInProgress {
+		t.Fatalf("report state = %q, want in-progress", item.reports[0].State)
+	}
+	if item.reports[0].PR != "42" {
+		t.Fatalf("report PR = %q, want the carried PR 42", item.reports[0].PR)
 	}
 }

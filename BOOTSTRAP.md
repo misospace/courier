@@ -226,11 +226,24 @@ locally, fixes any failures, and committed work is verified on the run branch;
 the operator then polls the external PR and CI state. Stable green observations
 reach `AwaitingReview`; a failed check reaches `Failed` and is handled by the
 source's failure policy, while missing or draft PR state reaches `NeedsHuman`.
-Exit `2` (`needs_decision` or
-`blocked_external`) moves the run to `NeedsHuman`. Exit `3` (`no_change_needed`)
-moves a resolve-issue run to `AwaitingReview` with the source `in-review`, and a
-fix-pr run to `NeedsHuman`, never settling the source; its blocked lifecycle
-report parks the PR-fix item as `BLOCKED`/needs-human. The evidence, question,
+Exit `2` (`needs_decision`) moves the run to `NeedsHuman`, and
+`blocked_external` moves it to the terminal, recoverable `BlockedExternal`
+phase, keeping the source item active and reporting a recoverable result so the
+source can re-issue the work once the prerequisite is satisfied. The
+recoverable signal must reach the source in a form it cannot mistake for a
+normal failure: the Dispatch adapter publishes a dedicated `waiting-external`
+task outcome and, for queue-backed follow-ups, a generation-fenced
+`WAITING_EXTERNAL` queue mark, so the prerequisite wait does not advance the
+issued generation or burn fix-attempt budget. Exit `3`
+(`no_change_needed`) moves a resolve-issue run to `AwaitingReview` with the
+source `in-review`, and settles a fix-pr run against the world through
+`Verifying`: a verified merge reaches `Done`, an open green no-change PR
+waits recoverably in `BlockedExternal`, red CI reaches retryable `Failed`, and
+an unobservable PR reaches `NeedsHuman`. Green CI cannot certify queued review
+feedback was addressed, so open no-change attempts report `waiting-external`
+rather than authorizing `already_addressed` or claiming a push. Recovery requires
+a fresh source attempt identity; prior runs and evidence remain retained.
+The evidence, question,
 or missing explanation is posted in full after redaction; only the separate
 termination reason is bounded and redacted. Comment posting is best-effort:
 failures are logged as `outcome.comment` and do not change the ending.

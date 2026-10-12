@@ -144,6 +144,12 @@ func (r *Runner) Poll(ctx context.Context) error {
 		if strings.TrimSpace(run.Spec.WorkItemID) == "" {
 			continue
 		}
+		// Dependency recovery requires a fresh source attempt identity. Do not
+		// exclude blocked work from discovery, which must see reactivation, but
+		// retain same-identity dedupe below to preserve history and prevent churn.
+		if run.Status.Phase == courierv1alpha1.PhaseBlockedExternal {
+			continue
+		}
 		retainedSource := run.Spec.Source == r.Config.Source
 		if r.Config.Source == "dispatch" {
 			retainedSource = retainedSource || run.Spec.Source == "dispatch" || strings.HasPrefix(run.Spec.Source, "dispatch:")
@@ -196,12 +202,13 @@ func (r *Runner) Poll(ctx context.Context) error {
 			continue
 		}
 		identity := r.identity(run.Spec.WorkItemID)
+		legacyBinding := run.Spec.Source == "dispatch" || strings.HasPrefix(run.Spec.Source, "dispatch:")
 		if run.Spec.Source == r.Config.Source {
 			existing[workKey(run.Spec.Source, identity)] = struct{}{}
 		}
 		// Previous Dispatch bindings encoded queue lanes in Source. Keep those
 		// retained runs from being rematerialized during the identity rollout.
-		if run.Spec.Source == "dispatch" || strings.HasPrefix(run.Spec.Source, "dispatch:") {
+		if legacyBinding {
 			legacyIdentities[identity] = struct{}{}
 		}
 	}

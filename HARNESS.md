@@ -1074,18 +1074,30 @@ worktree; it is control metadata, not a repository file. The executor validates
 the declaration against the world before terminalizing: exit `0` (`changes`)
 reaches `Verifying` only when the coordinator validates integrated work locally,
 fixes failures, and commits are reachable from the run branch; exit `2`
-(`needs_decision` or `blocked_external`) reaches `NeedsHuman`; exit `3`
-(`no_change_needed`) reaches `AwaitingReview` with source `in-review` for
-resolve-issue runs and `NeedsHuman` for fix-pr runs; an externally observed
-failed check reaches `Failed` and follows the source's failure policy, while
-other nonzero exits also reach `Failed`. Session recovery for undeclared recoverable
-endings is shipped: with a captured session, dirty, off-branch, and no-work
-states resume under the #170 continuation budget and no-progress guard; without
-a captured session, those endings fail as incomplete. This does not change the
-declared-outcome exit mapping above. A `no_change_needed` result never resolves
-the source. For fix-pr, its blocked lifecycle report parks the PR-fix
-item as `BLOCKED`/needs-human; `BlockedReportParksPRFix` skips only the redundant
-queue-mark call and does not wake a reviewer or request another review.
+(`needs_decision`) reaches `NeedsHuman` and `blocked_external` reaches the
+terminal, recoverable `BlockedExternal` phase; exit `3` (`no_change_needed`)
+reaches `AwaitingReview` with source `in-review` for resolve-issue runs, and for
+fix-pr runs are settled through `Verifying`: a verified merge reaches `Done`, an open green no-change PR
+waits recoverably in `BlockedExternal`, red CI reaches retryable `Failed`, and
+an unobservable PR reaches `NeedsHuman`. Green CI cannot certify queued review
+feedback was addressed, so open no-change attempts report `waiting-external`
+rather than authorizing `already_addressed` or claiming a push. Recovery requires
+a fresh source attempt identity; prior runs and evidence remain retained.
+An externally observed failed check reaches `Failed` and follows the source's
+failure policy, while other nonzero exits also reach `Failed`. Session recovery
+for undeclared recoverable endings is shipped: with a captured session, dirty,
+off-branch, and no-work states resume under the #170 continuation budget and
+no-progress guard; without a captured session, those endings fail as
+incomplete. This does not change the declared-outcome exit mapping above. A
+`no_change_needed` result never resolves the source on the coordinator's word
+alone. A `blocked_external` result keeps the source item active (`in-progress`)
+and reports a recoverable lifecycle result, so the source can re-issue the work
+once the prerequisite is satisfied; it is never parked as a human `BLOCKED`
+item. The recoverable signal must reach the source in a form it cannot mistake
+for a normal failure: the Dispatch adapter publishes a dedicated
+`waiting-external` task outcome and, for queue-backed follow-ups, a
+generation-fenced `WAITING_EXTERNAL` queue mark, so the prerequisite wait does
+not advance the issued generation or burn fix-attempt budget.
 
 Outcome comments carry the full declared evidence, question, or missing
 explanation after redaction. They are not shortened to the termination reason;
