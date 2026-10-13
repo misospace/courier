@@ -9,6 +9,8 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 
 	courierv1alpha1 "github.com/misospace/courier/api/v1alpha1"
 	"github.com/misospace/courier/internal/forge"
@@ -340,6 +342,133 @@ func TestAwaitingReviewPendingReportRetriesBeforeMergeObservation(t *testing.T) 
 	}
 	if stored.Status.Phase != courierv1alpha1.PhaseDone {
 		t.Fatalf("phase = %q, want Done after the report settled and the merge was confirmed", stored.Status.Phase)
+	}
+}
+
+func TestAwaitingReviewUnsupportedReportStaysUnobserved(t *testing.T) {
+	// The run never proved its in-review lifecycle to the source, so the
+	// Done resolve must not jump the queue: observation waits for the
+	// operator-gated report retry, even though the PR has merged.
+	item := &admissionSource{}
+	reader := &fakePullRequestReader{pull: mergedPR()}
+	run := reviewRun("unsupported")
+	run.Status.Conditions = []metav1.Condition{
+		{Type: lifecycleReportedCondition, Status: metav1.ConditionFalse, Reason: lifecycleReportPendingReason, LastTransitionTime: metav1.NewTime(reapClock)},
+		{Type: lifecycleReportSupportedCondition, Status: metav1.ConditionFalse, Reason: lifecycleReportUnsupportedOutcomeReason, LastTransitionTime: metav1.NewTime(reapClock)},
+	}
+	c := phaseClient(t, run)
+	reconciler := reapReconciler(c, item, reapClock)
+	reconciler.PullRequests = reader
+
+	result, err := reconciler.Reconcile(context.Background(), admissionRequest("unsupported"))
+	if err != nil {
+		t.Fatalf("Reconcile() error = %v", err)
+	}
+	if reader.calls != 0 {
+		t.Fatalf("pull-request reads = %d, want none while the report waits for an explicit retry", reader.calls)
+	}
+	if result.RequeueAfter != 0 {
+		t.Fatalf("RequeueAfter = %v, want no timer; unsupported reports retry only on request", result.RequeueAfter)
+	}
+	var stored courierv1alpha1.CoderRun
+	if err := c.Get(context.Background(), admissionKey("unsupported"), &stored); err != nil {
+		t.Fatalf("get run: %v", err)
+	}
+	if stored.Status.Phase != courierv1alpha1.PhaseAwaitingReview {
+		t.Fatalf("phase = %q, want AwaitingReview", stored.Status.Phase)
+	}
+	if len(item.resolved) != 0 {
+		t.Fatalf("resolved IDs = %#v, want none before the source accepted the in-review lifecycle", item.resolved)
+	}
+}
+
+func TestAwaitingReviewMergedPRMatchesAcrossRepositoryNameCasing(t *testing.T) {
+	// GitHub answers canonical casing while the source supplied the run's
+	// spec repository string; a casing drift must not stall a real merge.
+	item := &admissionSource{}
+	reader := &fakePullRequestReader{pull: observedPR(func(pull forge.PullRequest) forge.PullRequest {
+		pull.State = "closed"
+		pull.Merged = true
+		pull.Repo = "Acme/Widgets"
+		pull.BaseRepo = "Acme/Widgets"
+		pull.HeadRepo = "Acme/Widgets"
+		return pull
+	})}
+	c := phaseClient(t, reviewRun("casing"))
+	reconciler := reapReconciler(c, item, reapClock)
+	reconciler.PullRequests = reader
+
+	if _, err := reconciler.Reconcile(context.Background(), admissionRequest("casing")); err != nil {
+		t.Fatalf("Reconcile() error = %v", err)
+	}
+	var stored courierv1alpha1.CoderRun
+	if err := c.Get(context.Background(), admissionKey("casing"), &stored); err != nil {
+		t.Fatalf("get run: %v", err)
+	}
+	if stored.Status.Phase != courierv1alpha1.PhaseDone {
+		t.Fatalf("phase = %q, want Done; repository casing must not break the exact-identity match", stored.Status.Phase)
+	}
+}
+
+func TestDoneReconcileReResolvesOnlyUntilMarkerPersists(t *testing.T) {
+	// Crash window: the source resolved but the done-at marker never
+	// persisted. The next reconcile resolves again — safe because the source
+	// resolve is idempotent — and once the marker is durable no further
+	// resolve happens.
+	item := &admissionSource{}
+	reader := &fakePullRequestReader{pull: mergedPR()}
+	base := phaseClient(t, reviewRun("crash"))
+	withWatch, ok := base.(client.WithWatch)
+	if !ok {
+		t.Fatal("fake client does not implement client.WithWatch")
+	}
+	patchFailures := 1
+	failing := interceptor.NewClient(withWatch, interceptor.Funcs{
+		Patch: func(ctx context.Context, c client.WithWatch, obj client.Object, patch client.Patch, opts ...client.PatchOption) error {
+			if patchFailures > 0 {
+				patchFailures--
+				return errors.New("marker patch lost")
+			}
+			return c.Patch(ctx, obj, patch, opts...)
+		},
+	})
+
+	first := reapReconciler(failing, item, reapClock)
+	first.PullRequests = reader
+	if _, err := first.Reconcile(context.Background(), admissionRequest("crash")); err != nil {
+		t.Fatalf("Done Reconcile() error = %v", err)
+	}
+	second := reapReconciler(failing, item, reapClock.Add(time.Minute))
+	if _, err := second.Reconcile(context.Background(), admissionRequest("crash")); err == nil {
+		t.Fatal("Reconcile() error = nil, want the lost marker patch to surface")
+	}
+	if len(item.resolved) != 1 {
+		t.Fatalf("resolved IDs = %#v, want one resolve before the marker persisted", item.resolved)
+	}
+	var stored courierv1alpha1.CoderRun
+	if err := base.Get(context.Background(), admissionKey("crash"), &stored); err != nil {
+		t.Fatalf("get run: %v", err)
+	}
+	if _, ok := stored.Annotations[doneAtAnnotation]; ok {
+		t.Fatal("done-at marker persisted although its patch failed")
+	}
+
+	third := reapReconciler(failing, item, reapClock.Add(2*time.Minute))
+	result, err := third.Reconcile(context.Background(), admissionRequest("crash"))
+	if err != nil {
+		t.Fatalf("retry Reconcile() error = %v", err)
+	}
+	if result.RequeueAfter != 10*time.Minute {
+		t.Fatalf("RequeueAfter = %v, want the retention window after the retried resolve", result.RequeueAfter)
+	}
+	if len(item.resolved) != 2 {
+		t.Fatalf("resolved IDs = %#v, want the restart window to resolve exactly once more", item.resolved)
+	}
+	if _, err := third.Reconcile(context.Background(), admissionRequest("crash")); err != nil {
+		t.Fatalf("settled Reconcile() error = %v", err)
+	}
+	if len(item.resolved) != 2 {
+		t.Fatalf("resolved IDs = %#v, want the durable marker to stop re-resolving", item.resolved)
 	}
 }
 

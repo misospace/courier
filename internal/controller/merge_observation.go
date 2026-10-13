@@ -61,6 +61,14 @@ func (r *CoderRunReconciler) observeMergedReviewPR(ctx context.Context, run *cou
 		return ctrl.Result{RequeueAfter: mergeObservationRequeueDelay}, nil
 	}
 	if !exactPullRequestMerged(run, number, pull) {
+		if pull.Merged {
+			// A merged PR that is not this run's exact recorded identity is
+			// an anomaly worth one durable line: it means the recorded head
+			// drifted, and the run will wait for a merge of its own.
+			log.FromContext(ctx).Info("recorded pull request is merged but no longer matches the run's head identity; leaving the run in awaiting-review",
+				"repo", run.Spec.Repo, "pr", run.Status.PR, "recordedHeadRepo", run.Status.HeadRepo, "recordedBranch", run.Status.Branch,
+				"observedHeadRepo", pull.HeadRepo, "observedBranch", pull.HeadRef)
+		}
 		return ctrl.Result{RequeueAfter: mergeObservationRequeueDelay}, nil
 	}
 	log.FromContext(ctx).Info("recorded pull request merged; resolving run",
@@ -74,10 +82,13 @@ func (r *CoderRunReconciler) observeMergedReviewPR(ctx context.Context, run *cou
 // status.headRepo means a same-repository head, the same convention the
 // observer uses for runs persisted before head identity was recorded. A
 // changed head identity means the read pull request is not the one this run
-// produced, so a merge on it is never this run's completion. Head SHA is
-// deliberately not part of the identity: a pushed commit repairs review
-// feedback and still ships this run's work, and a resolve-issue head is
-// recorded without a SHA.
+// produced, so a merge on it is never this run's completion. Repository
+// names compare case-insensitively: GitHub repository names cannot collide
+// across case, and the recorded spec repository comes from the source while
+// the forge answers the canonical casing, so a casing drift must not stall
+// a real merge forever. Head SHA is deliberately not part of the identity: a
+// pushed commit repairs review feedback and still ships this run's work, and
+// a resolve-issue head is recorded without a SHA.
 func exactPullRequestMerged(run *courierv1alpha1.CoderRun, number int, pull forge.PullRequest) bool {
 	if !pull.Merged || pull.Number != number {
 		return false
@@ -86,5 +97,7 @@ func exactPullRequestMerged(run *courierv1alpha1.CoderRun, number int, pull forg
 	if headRepo == "" {
 		headRepo = run.Spec.Repo
 	}
-	return pull.BaseRepo == run.Spec.Repo && pull.HeadRepo == headRepo && pull.HeadRef == run.Status.Branch
+	return strings.EqualFold(pull.BaseRepo, run.Spec.Repo) &&
+		strings.EqualFold(pull.HeadRepo, headRepo) &&
+		pull.HeadRef == run.Status.Branch
 }

@@ -2520,6 +2520,11 @@ was superseded.
   source is the dedupe authority (Dispatch excludes `done` issues from
   `next-task`, verified against `src/lib/agent-queue.ts`). Terminal-run metrics
   are recorded on the run's **first** terminal transition only, so a late
-  `Done` does not count the run twice. Closed-unmerged terminalization and the
+  `Done` does not count the run twice. Repository identity compares
+  case-insensitively (GitHub names cannot collide across case), and a merged
+  PR that no longer matches the recorded head logs its mismatch instead of
+  failing silently. Runs already settled at upgrade are observed on their next
+  wake (watch event or informer resync), then on the same slow cadence.
+  Closed-unmerged terminalization and the
   `Failed`/`NeedsHuman` retention window stay with #251's children.
   (#250, #179, #251)
