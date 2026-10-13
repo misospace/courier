@@ -27,15 +27,29 @@ var (
 	// empty UID mints a token the intake can never verify from its live read
 	// of the run.
 	ErrEvidenceRunUIDRequired = errors.New("coordinator launcher: evidence tokens require the run UID")
-	// ErrProvisioningInFlight is returned when Launch's create collided with
-	// a pod carrying a DeletionTimestamp: the slot is held by a pod being
-	// torn down, not a live coordinator, so the reconciler must not record
-	// Running. The reconciler treats this as "stay Claimed, requeue", the
-	// same shape as the secure topology's in-flight signal; the pod delete
+	// ErrProvisioningInFlight is returned when Launch could not establish a
+	// live, run-owned coordinator pod at the slot name. Three shapes fit
+	// here, and each one means "stay Claimed, do not record Running":
+	//
+	//   - The create collided with a pod that is being torn down
+	//     (DeletionTimestamp != nil). The slot is held by a pod whose
+	//     disappearance is in flight.
+	//   - The follow-up read of the existing pod failed (NotFound, a
+	//     transient API error, or a Forbidden). The slot's live state
+	//     could not be verified; recording Running would re-introduce the
+	//     false-running transition #217 exists to prevent.
+	//   - The follow-up read returned a pod that is not owned by this run
+	//     (no Courier OwnerReference, no LabelRun). A pod sitting at the
+	//     deterministic name but unrelated to this run must not be
+	//     silently adopted as "idempotently live."
+	//
+	// The reconciler treats this as "stay Claimed, requeue", the same
+	// shape as the secure topology's in-flight signal; the pod's delete
 	// event normally wakes the next reconcile, with a bounded requeue as
-	// the backstop. A live existing pod still resolves to a successful,
-	// idempotent Launch.
-	ErrProvisioningInFlight = errors.New("coordinator launcher: provisioning in flight; existing pod is terminating")
+	// the backstop. Only a follow-up read that returns a verified live,
+	// run-owned pod resolves the collision to a successful, idempotent
+	// Launch.
+	ErrProvisioningInFlight = errors.New("coordinator launcher: provisioning in flight; slot could not be verified as a live run-owned pod")
 )
 
 // CoordinatorLauncher creates the ephemeral coordinator Pod for an admitted
@@ -118,17 +132,41 @@ func (l *CoordinatorLauncher) Launch(ctx context.Context, run *courierv1alpha1.C
 	if !apierrors.IsAlreadyExists(err) {
 		return err
 	}
-	// The create collided with an existing pod. A live one means Launch was
-	// already idempotent at the resource boundary, so nothing more to do;
-	// the reconciler's resumeClaimed path will see the live pod and finish
-	// the admission without a second charge. A terminating one means the
-	// slot is being torn down and writing Running over it would (a) bind
-	// the run to a dying coordinator that the next reconcile could
-	// terminalize as Failed, and (b) charge a second infrastructure loss
-	// if the pod disappears before the wedge path observes it. Surface the
-	// collision so the reconciler can stay Claimed and wait for the delete.
+	// The create collided with an existing pod. Three shapes are possible
+	// and each one must surface as "stay Claimed, do not record Running":
+	//
+	//   - The follow-up Get fails (NotFound, transient, Forbidden). The
+	//     slot's live state is unverified; treating that as success would
+	//     re-introduce the false-running transition #217 exists to
+	//     prevent, because the reconciler would then write Running over a
+	//     slot we have no proof is occupied by a live coordinator.
+	//   - The existing pod carries DeletionTimestamp: the slot is being
+	//     torn down and the next reconcile could terminalize a freshly
+	//     relaunched run as Failed off the dying pod's own termination,
+	//     or charge a second infrastructure loss if the pod vanishes
+	//     before the wedge path observes it.
+	//   - The existing pod does not belong to this run (no Courier
+	//     OwnerReference and no LabelRun). The deterministic slot name
+	//     can collide with stale or unrelated state; silently adopting
+	//     such a pod as "idempotently live" would bind the run to an
+	//     arbitrary coordinator.
+	//
+	// A live, run-owned existing pod is the only case that resolves the
+	// collision to a successful, no-second-charge Launch: the resource
+	// boundary was already idempotent and resumeClaimed will finish the
+	// admission in its next pass.
 	var existing corev1.Pod
-	if getErr := l.Client.Get(ctx, client.ObjectKey{Namespace: pod.Namespace, Name: pod.Name}, &existing); getErr == nil && existing.DeletionTimestamp != nil {
+	getErr := l.Client.Get(ctx, client.ObjectKey{Namespace: pod.Namespace, Name: pod.Name}, &existing)
+	switch {
+	case getErr != nil:
+		// Could not verify the slot's live state (NotFound is the
+		// common race: the pod was deleted between the Create and the
+		// follow-up Get; transient API errors fall here too). Stay
+		// Claimed and let the bounded requeue / pod watch resolve it.
+		return ErrProvisioningInFlight
+	case existing.DeletionTimestamp != nil:
+		return ErrProvisioningInFlight
+	case !podBelongsToRun(&existing, run):
 		return ErrProvisioningInFlight
 	}
 	return nil

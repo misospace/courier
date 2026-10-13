@@ -11,9 +11,11 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 
 	courierv1alpha1 "github.com/misospace/courier/api/v1alpha1"
 	"github.com/misospace/courier/internal/executor"
@@ -435,10 +437,163 @@ func TestCoordinatorLauncherAcceptsExistingPodWhenLive(t *testing.T) {
 		ObjectMeta: metav1.ObjectMeta{Name: "local", Namespace: "default"},
 		Spec:       courierv1alpha1.LaneProfileSpec{Roles: map[string]string{"coordinator": "test-model"}},
 	}
-	// A live existing pod (no DeletionTimestamp) — the resource boundary
-	// was already idempotent, the relaunch is genuinely complete, and the
-	// reconciler should be free to record Running on the next pass without
-	// a second charge.
+	// A live existing pod (no DeletionTimestamp) that this run actually
+	// owns — a previous Launch left it at the slot name. The resource
+	// boundary is already idempotent, the relaunch is genuinely complete,
+	// and the reconciler is free to record Running on the next pass
+	// without a second charge. Ownership is verified by OwnerReference
+	// (and LabelRun as the legacy fallback), so a foreign pod at the
+	// same name is not silently adopted.
+	controller := true
+	existing := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "run-1-coordinator",
+			Namespace: "default",
+			Labels: map[string]string{
+				executor.LabelRun: run.Name,
+			},
+			OwnerReferences: []metav1.OwnerReference{{
+				APIVersion: courierv1alpha1.GroupVersion.String(),
+				Kind:       "CoderRun",
+				Name:       run.Name,
+				UID:        run.UID,
+				Controller: &controller,
+			}},
+		},
+	}
+	fakeClient := fake.NewClientBuilder().
+		WithScheme(launcherScheme(t)).
+		WithStatusSubresource(&courierv1alpha1.CoderRun{}).
+		WithRuntimeObjects(run, lane, existing).
+		Build()
+	launcher := &CoordinatorLauncher{
+		Client: fakeClient,
+		Pod:    executor.PodConfig{Image: "example/opencode:test"},
+	}
+
+	if err := launcher.Launch(context.Background(), run); err != nil {
+		t.Fatalf("Launch() error = %v, want nil; a colliding live, run-owned pod keeps the existing idempotency", err)
+	}
+	var runOut courierv1alpha1.CoderRun
+	if err := fakeClient.Get(context.Background(), client.ObjectKey{Namespace: "default", Name: "run-1"}, &runOut); err != nil {
+		t.Fatalf("get run: %v", err)
+	}
+	if runOut.Status.Phase != courierv1alpha1.PhaseClaimed {
+		t.Fatalf("run phase = %q, want unchanged Claimed; phase transitions belong to the reconciler", runOut.Status.Phase)
+	}
+}
+
+// TestCoordinatorLauncherReportsProvisioningInFlightWhenExistingPodVanishesBetweenCreateAndGet
+// pins the create-then-read race #217's review flagged: a colliding pod
+// is deleted between the Create that returned AlreadyExists and the
+// follow-up Get that returns NotFound. Treating that as success would
+// write Running over a slot with no live coordinator.
+func TestCoordinatorLauncherReportsProvisioningInFlightWhenExistingPodVanishesBetweenCreateAndGet(t *testing.T) {
+	run := &courierv1alpha1.CoderRun{
+		ObjectMeta: metav1.ObjectMeta{Name: "run-1", Namespace: "default", UID: types.UID("run-uid")},
+		Spec: courierv1alpha1.CoderRunSpec{
+			Mode: courierv1alpha1.ModeResolveIssue,
+			Repo: "acme/widgets",
+			Ref:  1,
+			Lane: "local",
+		},
+		Status: courierv1alpha1.CoderRunStatus{Phase: courierv1alpha1.PhaseClaimed},
+	}
+	lane := &courierv1alpha1.LaneProfile{
+		ObjectMeta: metav1.ObjectMeta{Name: "local", Namespace: "default"},
+		Spec:       courierv1alpha1.LaneProfileSpec{Roles: map[string]string{"coordinator": "test-model"}},
+	}
+	fakeClient := fake.NewClientBuilder().
+		WithScheme(launcherScheme(t)).
+		WithStatusSubresource(&courierv1alpha1.CoderRun{}).
+		WithInterceptorFuncs(interceptor.Funcs{
+			// Create returns AlreadyExists as if a previous create of the
+			// same name had landed, but the follow-up Get sees nothing.
+			Create: func(ctx context.Context, c client.WithWatch, obj client.Object, opts ...client.CreateOption) error {
+				return apierrors.NewAlreadyExists(schema.GroupResource{Group: "", Resource: "pods"}, obj.GetName())
+			},
+		}).
+		WithRuntimeObjects(run, lane).
+		Build()
+	launcher := &CoordinatorLauncher{
+		Client: fakeClient,
+		Pod:    executor.PodConfig{Image: "example/opencode:test"},
+	}
+
+	err := launcher.Launch(context.Background(), run)
+	if !errors.Is(err, ErrProvisioningInFlight) {
+		t.Fatalf("Launch() error = %v, want ErrProvisioningInFlight; a slot whose pod vanished between create and read is not verifiably live", err)
+	}
+}
+
+// TestCoordinatorLauncherReportsProvisioningInFlightWhenExistingPodReadErrors
+// covers the second half of #217's review: the follow-up Get returns a
+// transient API error (anything other than success) rather than a real
+// pod. Treating that as success would similarly write Running over a
+// slot we have no proof is occupied by a live coordinator.
+func TestCoordinatorLauncherReportsProvisioningInFlightWhenExistingPodReadErrors(t *testing.T) {
+	run := &courierv1alpha1.CoderRun{
+		ObjectMeta: metav1.ObjectMeta{Name: "run-1", Namespace: "default", UID: types.UID("run-uid")},
+		Spec: courierv1alpha1.CoderRunSpec{
+			Mode: courierv1alpha1.ModeResolveIssue,
+			Repo: "acme/widgets",
+			Ref:  1,
+			Lane: "local",
+		},
+		Status: courierv1alpha1.CoderRunStatus{Phase: courierv1alpha1.PhaseClaimed},
+	}
+	lane := &courierv1alpha1.LaneProfile{
+		ObjectMeta: metav1.ObjectMeta{Name: "local", Namespace: "default"},
+		Spec:       courierv1alpha1.LaneProfileSpec{Roles: map[string]string{"coordinator": "test-model"}},
+	}
+	transient := errors.New("API server timeout: connection reset")
+	fakeClient := fake.NewClientBuilder().
+		WithScheme(launcherScheme(t)).
+		WithStatusSubresource(&courierv1alpha1.CoderRun{}).
+		WithInterceptorFuncs(interceptor.Funcs{
+			Create: func(ctx context.Context, c client.WithWatch, obj client.Object, opts ...client.CreateOption) error {
+				return apierrors.NewAlreadyExists(schema.GroupResource{Group: "", Resource: "pods"}, obj.GetName())
+			},
+			Get: func(ctx context.Context, c client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+				return transient
+			},
+		}).
+		WithRuntimeObjects(run, lane).
+		Build()
+	launcher := &CoordinatorLauncher{
+		Client: fakeClient,
+		Pod:    executor.PodConfig{Image: "example/opencode:test"},
+	}
+
+	err := launcher.Launch(context.Background(), run)
+	if !errors.Is(err, ErrProvisioningInFlight) {
+		t.Fatalf("Launch() error = %v, want ErrProvisioningInFlight; a slot whose read returned a transient error is not verifiably live", err)
+	}
+}
+
+// TestCoordinatorLauncherReportsProvisioningInFlightWhenExistingPodIsForeign
+// pins the ownership-check half of #217's review: a live pod sits at the
+// deterministic slot name but is not owned by this run. Silently adopting
+// it as "idempotently live" would bind the run to an arbitrary
+// coordinator, so the launcher surfaces the collision instead.
+func TestCoordinatorLauncherReportsProvisioningInFlightWhenExistingPodIsForeign(t *testing.T) {
+	run := &courierv1alpha1.CoderRun{
+		ObjectMeta: metav1.ObjectMeta{Name: "run-1", Namespace: "default", UID: types.UID("run-uid")},
+		Spec: courierv1alpha1.CoderRunSpec{
+			Mode: courierv1alpha1.ModeResolveIssue,
+			Repo: "acme/widgets",
+			Ref:  1,
+			Lane: "local",
+		},
+		Status: courierv1alpha1.CoderRunStatus{Phase: courierv1alpha1.PhaseClaimed},
+	}
+	lane := &courierv1alpha1.LaneProfile{
+		ObjectMeta: metav1.ObjectMeta{Name: "local", Namespace: "default"},
+		Spec:       courierv1alpha1.LaneProfileSpec{Roles: map[string]string{"coordinator": "test-model"}},
+	}
+	// Live, no DeletionTimestamp, neither OwnerReference nor LabelRun
+	// tying it to this run — a stale or unrelated pod sitting at the
+	// deterministic slot name.
 	existing := &corev1.Pod{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      "run-1-coordinator",
@@ -455,14 +610,8 @@ func TestCoordinatorLauncherAcceptsExistingPodWhenLive(t *testing.T) {
 		Pod:    executor.PodConfig{Image: "example/opencode:test"},
 	}
 
-	if err := launcher.Launch(context.Background(), run); err != nil {
-		t.Fatalf("Launch() error = %v, want nil; a colliding live pod keeps the existing idempotency", err)
-	}
-	var runOut courierv1alpha1.CoderRun
-	if err := fakeClient.Get(context.Background(), client.ObjectKey{Namespace: "default", Name: "run-1"}, &runOut); err != nil {
-		t.Fatalf("get run: %v", err)
-	}
-	if runOut.Status.Phase != courierv1alpha1.PhaseClaimed {
-		t.Fatalf("run phase = %q, want unchanged Claimed; phase transitions belong to the reconciler", runOut.Status.Phase)
+	err := launcher.Launch(context.Background(), run)
+	if !errors.Is(err, ErrProvisioningInFlight) {
+		t.Fatalf("Launch() error = %v, want ErrProvisioningInFlight; an unrelated pod at the slot name must not be silently adopted", err)
 	}
 }
