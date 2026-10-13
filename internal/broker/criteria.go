@@ -51,11 +51,12 @@ const (
 // Criterion is one acceptance criterion pinned from the trusted source-issue
 // snapshot at admission. ID is the ordinal assigned at extraction ("AC-1",
 // "AC-2", …, in document order); Digest covers the normalized criterion
-// text so a row authored against edited criterion text is rejected.
+// text so a row authored against edited criterion text is rejected. The JSON
+// tags define the COURIER_CRITERIA envelope projected to the legacy executor.
 type Criterion struct {
-	ID     string
-	Text   string
-	Digest string
+	ID     string `json:"id"`
+	Text   string `json:"text"`
+	Digest string `json:"digest"`
 }
 
 // CriterionSet is the revision-pinned contract carried from admission to the
@@ -63,9 +64,9 @@ type Criterion struct {
 // identity plus every criterion digest in order, so adding, deleting,
 // reordering, or editing any criterion changes it.
 type CriterionSet struct {
-	Issue    SourceIssue
-	Criteria []Criterion
-	Digest   string
+	Issue    SourceIssue `json:"issue"`
+	Criteria []Criterion `json:"criteria"`
+	Digest   string      `json:"digest"`
 }
 
 // IsEmpty reports whether no criteria were pinned. An issue without a
@@ -281,7 +282,12 @@ func ExtractCriteria(issueBody string, issue SourceIssue) (CriterionSet, error) 
 		}
 	}
 	if len(raw) == 0 {
-		return CriterionSet{Issue: issue}, nil
+		// An empty set is a legitimate pin, so it carries its digest too:
+		// the identity-only digest distinguishes a pinned empty set from an
+		// unset one at the persistence and projection boundaries.
+		empty := CriterionSet{Issue: issue}
+		empty.Digest = empty.digest()
+		return empty, nil
 	}
 	if len(raw) > MaxCriteria {
 		return CriterionSet{}, fmt.Errorf("criteria extraction: issue carries %d acceptance criteria; the bound is %d and an over-bound set is never truncated", len(raw), MaxCriteria)
