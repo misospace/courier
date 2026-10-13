@@ -38,6 +38,15 @@ type Policy struct {
 	// runs leave it zero because the existing PR's identity is
 	// already pinned through PRNumber and HeadAnchorOID.
 	SourceIssue SourceIssue
+	// Criteria is the acceptance-criterion set pinned at admission
+	// (#249/#280), reconstructed from the persisted publication policy and
+	// verified by digest at binding. A zero CriterionSet means no set was
+	// pinned (fix-pr runs, policies admitted before the criterion
+	// contract); an empty pinned set is carried as a set with no criteria
+	// and a digest. Carriage is the identification boundary's whole job:
+	// enforcing the set at a publication boundary is #281 (native) and
+	// #282 (legacy handoff).
+	Criteria CriterionSet
 }
 
 // RepositoryState is a complete live observation. Unknown protection or write

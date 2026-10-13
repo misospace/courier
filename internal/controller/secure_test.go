@@ -3,6 +3,8 @@ package controller
 import (
 	"context"
 	"errors"
+	"fmt"
+	"os"
 	"strings"
 	"testing"
 	"time"
@@ -23,6 +25,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 
 	courier "github.com/misospace/courier/api/v1alpha1"
+	"github.com/misospace/courier/internal/broker"
 	"github.com/misospace/courier/internal/forge"
 	"github.com/misospace/courier/internal/source"
 	"github.com/misospace/courier/internal/status"
@@ -33,10 +36,12 @@ const secureTestNamespace = "courier-runs"
 
 // fakeAdmissionForge implements the admission provider facets in memory.
 type fakeAdmissionForge struct {
-	repos   map[string]forge.Repository
-	refs    map[string]forge.RefState
-	prs     []forge.PullRequest
-	readErr error
+	repos        map[string]forge.Repository
+	refs         map[string]forge.RefState
+	prs          []forge.PullRequest
+	issues       map[string]forge.WorkItem
+	readErr      error
+	issueReadErr error
 }
 
 func (f *fakeAdmissionForge) ResolveRepository(_ context.Context, name string) (forge.Repository, error) {
@@ -65,8 +70,15 @@ func (f *fakeAdmissionForge) CanWriteRepository(context.Context, forge.Repositor
 	return true, nil
 }
 
-func (f *fakeAdmissionForge) ReadWorkItem(context.Context, forge.WorkItemRef) (forge.WorkItem, error) {
-	return forge.WorkItem{}, forge.ErrUnsupported
+func (f *fakeAdmissionForge) ReadWorkItem(_ context.Context, ref forge.WorkItemRef) (forge.WorkItem, error) {
+	if f.issueReadErr != nil {
+		return forge.WorkItem{}, f.issueReadErr
+	}
+	item, ok := f.issues[ref.Repo+"#"+ref.ID]
+	if !ok {
+		return forge.WorkItem{}, errors.New("work item not found")
+	}
+	return item, nil
 }
 
 func (f *fakeAdmissionForge) Config() forge.ProviderConfig {
@@ -161,6 +173,9 @@ func secureForge() *fakeAdmissionForge {
 		refs: map[string]forge.RefState{
 			"Acme/Widgets:main":                         {Ref: "main", OID: "baseoid", Exists: true},
 			"Acme/Widgets:courier/Acme/Widgets/issue-7": {Ref: "courier/Acme/Widgets/issue-7", Exists: false},
+		},
+		issues: map[string]forge.WorkItem{
+			"Acme/Widgets#7": {ID: "7", Repo: "Acme/Widgets", Title: "Add the widget", Body: "## Problem\nThe widget is missing.", State: "open"},
 		},
 	}
 }
@@ -265,6 +280,14 @@ func TestResolveAdmissionResolveIssue(t *testing.T) {
 	if policy.ProviderEndpoint != "https://api.github.com/" || policy.CredentialRefDigest == "" {
 		t.Fatalf("provider binding fields = %q %q", policy.ProviderEndpoint, policy.CredentialRefDigest)
 	}
+	// The trusted source-issue read pins the identity and an explicit empty
+	// set: this issue body carries no Acceptance section.
+	if policy.SourceIssue == nil || policy.SourceIssue.Owner != "Acme" || policy.SourceIssue.Name != "Widgets" || policy.SourceIssue.Number != 7 {
+		t.Fatalf("source issue pin = %+v, want Acme/Widgets#7", policy.SourceIssue)
+	}
+	if len(policy.AcceptanceCriteria) != 0 || policy.AcceptanceCriteriaDigest == "" {
+		t.Fatalf("criteria pin = %+v digest %q, want an explicit empty set with a digest", policy.AcceptanceCriteria, policy.AcceptanceCriteriaDigest)
+	}
 }
 
 func TestResolveAdmissionFixPR(t *testing.T) {
@@ -297,6 +320,204 @@ func TestResolveAdmissionFixPR(t *testing.T) {
 	}
 	if policy.WorkInitiallyAbsent {
 		t.Fatal("a fix-pr head always exists")
+	}
+	if policy.SourceIssue != nil || len(policy.AcceptanceCriteria) > 0 || policy.AcceptanceCriteriaDigest != "" {
+		t.Fatalf("a fix-pr run pins nothing: %+v", policy)
+	}
+}
+
+// criteriaForge serves a resolve-issue run against the miso-gallery#502
+// fixture body so admission tests pin the real dogfood material (#280).
+func criteriaForge(t *testing.T, body string) *fakeAdmissionForge {
+	t.Helper()
+	repo := forge.Repository{ID: "repo-1", Canonical: "misospace/miso-gallery", DefaultRef: "main"}
+	return &fakeAdmissionForge{
+		repos: map[string]forge.Repository{"misospace/miso-gallery": repo},
+		refs: map[string]forge.RefState{
+			"misospace/miso-gallery:main":                                     {Ref: "main", OID: "baseoid", Exists: true},
+			"misospace/miso-gallery:courier/misospace/miso-gallery/issue-502": {Ref: "courier/misospace/miso-gallery/issue-502", Exists: false},
+		},
+		issues: map[string]forge.WorkItem{
+			"misospace/miso-gallery#502": {ID: "502", Repo: "misospace/miso-gallery", Title: "Package the tracked assets directory", Body: body, State: "open"},
+		},
+	}
+}
+
+func criteriaRun() *courier.CoderRun {
+	run := secureRun("criteria")
+	run.Spec.Repo = "misospace/miso-gallery"
+	run.Spec.Ref = 502
+	return run
+}
+
+func criteriaControl(t *testing.T, forge *fakeAdmissionForge) *SecureControl {
+	t.Helper()
+	control, _ := secureControl(t)
+	control.Config.Providers = fakeProviderFactory(forge)
+	return control
+}
+
+// Admission pins the live miso-gallery#502 issue body exactly: the three
+// Acceptance bullets become AC-1..AC-3 with digests the shared pure
+// extraction re-derives, and re-running admission on the same issue revision
+// yields the same set digest (restart idempotency).
+func TestResolveAdmissionPinsCriteria(t *testing.T) {
+	body, err := os.ReadFile("../../internal/broker/testdata/miso-gallery-502-issue.md")
+	if err != nil {
+		t.Fatalf("read 502 fixture: %v", err)
+	}
+	control := criteriaControl(t, criteriaForge(t, string(body)))
+	run := criteriaRun()
+
+	_, policy, err := control.ResolveAdmission(context.Background(), run)
+	if err != nil {
+		t.Fatalf("ResolveAdmission: %v", err)
+	}
+	if policy.SourceIssue == nil || policy.SourceIssue.Owner != "misospace" || policy.SourceIssue.Name != "miso-gallery" || policy.SourceIssue.Number != 502 {
+		t.Fatalf("source issue pin = %+v, want misospace/miso-gallery#502", policy.SourceIssue)
+	}
+	expected, err := broker.ExtractCriteria(string(body), broker.SourceIssue{Owner: "misospace", Name: "miso-gallery", Number: 502})
+	if err != nil {
+		t.Fatalf("re-derive expected set: %v", err)
+	}
+	if policy.AcceptanceCriteriaDigest != expected.Digest {
+		t.Fatalf("set digest = %q, want the pure extraction's %q", policy.AcceptanceCriteriaDigest, expected.Digest)
+	}
+	if len(policy.AcceptanceCriteria) != len(expected.Criteria) {
+		t.Fatalf("pinned %d criteria, want %d", len(policy.AcceptanceCriteria), len(expected.Criteria))
+	}
+	for i, criterion := range policy.AcceptanceCriteria {
+		want := expected.Criteria[i]
+		if criterion.ID != want.ID || criterion.Text != want.Text || criterion.Digest != want.Digest {
+			t.Fatalf("criterion %d = %+v, want %+v", i, criterion, want)
+		}
+	}
+	if len(policy.AcceptanceCriteria) != 3 || policy.AcceptanceCriteria[0].ID != "AC-1" || policy.AcceptanceCriteria[2].ID != "AC-3" {
+		t.Fatalf("502 must pin AC-1..AC-3, got %+v", policy.AcceptanceCriteria)
+	}
+
+	// The same issue revision admitted again pins the identical digest.
+	_, again, err := control.ResolveAdmission(context.Background(), criteriaRun())
+	if err != nil {
+		t.Fatalf("re-admission: %v", err)
+	}
+	if again.AcceptanceCriteriaDigest != policy.AcceptanceCriteriaDigest {
+		t.Fatalf("re-admission digest = %q, want the stable %q", again.AcceptanceCriteriaDigest, policy.AcceptanceCriteriaDigest)
+	}
+}
+
+// An issue whose body carries no Acceptance section (or a bullet-less one)
+// pins an explicit empty set — a legitimate pin, not a failure.
+func TestResolveAdmissionPinsEmptyCriteriaSet(t *testing.T) {
+	tests := map[string]string{
+		"no acceptance section": "## Problem\nSomething is broken.\n\n## Evidence\n- observed locally\n",
+		"bullet-less section":   "## Acceptance\nProse only, no bullets to pin.\n",
+		"empty body":            "",
+	}
+	for name, body := range tests {
+		t.Run(name, func(t *testing.T) {
+			control := criteriaControl(t, criteriaForge(t, body))
+			_, policy, err := control.ResolveAdmission(context.Background(), criteriaRun())
+			if err != nil {
+				t.Fatalf("ResolveAdmission: %v", err)
+			}
+			if policy.SourceIssue == nil {
+				t.Fatal("the source-issue identity is pinned even for an empty set")
+			}
+			if len(policy.AcceptanceCriteria) != 0 || policy.AcceptanceCriteriaDigest == "" {
+				t.Fatalf("criteria = %+v digest %q, want an empty set with a digest", policy.AcceptanceCriteria, policy.AcceptanceCriteriaDigest)
+			}
+		})
+	}
+}
+
+// Ambiguous or over-bound bodies fail closed at admission: an unpinnable
+// contract must not become an unchecked one, and an over-bound set is never
+// truncated.
+func TestResolveAdmissionCriteriaFailClosed(t *testing.T) {
+	tooMany := &strings.Builder{}
+	tooMany.WriteString("## Acceptance\n")
+	for i := 0; i < broker.MaxCriteria+1; i++ {
+		fmt.Fprintf(tooMany, "- criterion %d\n", i+1)
+	}
+	overLong := "## Acceptance\n- " + strings.Repeat("x", broker.MaxCriterionTextBytes+1) + "\n"
+
+	tests := map[string]struct {
+		body   string
+		reason string
+	}{
+		"ambiguous sections": {
+			body:   "## Acceptance\n- one\n\n## Notes\n\n## Acceptance\n- two\n",
+			reason: "CriteriaUnpinnable",
+		},
+		"over-bound set": {
+			body:   tooMany.String(),
+			reason: "CriteriaUnpinnable",
+		},
+		"over-long criterion": {
+			body:   overLong,
+			reason: "CriteriaUnpinnable",
+		},
+	}
+	for name, test := range tests {
+		t.Run(name, func(t *testing.T) {
+			control := criteriaControl(t, criteriaForge(t, test.body))
+			_, _, err := control.ResolveAdmission(context.Background(), criteriaRun())
+			var permanent *SecureNeedsHumanError
+			if !errors.As(err, &permanent) || permanent.Reason != test.reason {
+				t.Fatalf("error = %v, want NeedsHuman %s", err, test.reason)
+			}
+			if !strings.Contains(permanent.Detail, "criteria extraction") {
+				t.Fatalf("NeedsHuman detail must name why: %q", permanent.Detail)
+			}
+		})
+	}
+
+	t.Run("issue read failure is transient", func(t *testing.T) {
+		provider := criteriaForge(t, "## Acceptance\n- one\n")
+		provider.issueReadErr = errors.New("transport hiccup")
+		control := criteriaControl(t, provider)
+		_, _, err := control.ResolveAdmission(context.Background(), criteriaRun())
+		if err == nil {
+			t.Fatal("a failed trusted read must fail admission")
+		}
+		var permanent *SecureNeedsHumanError
+		if errors.As(err, &permanent) {
+			t.Fatalf("transport failure must be transient, got NeedsHuman: %v", err)
+		}
+	})
+
+	t.Run("unsupported issue read is a capability failure", func(t *testing.T) {
+		provider := criteriaForge(t, "## Acceptance\n- one\n")
+		provider.issueReadErr = forge.ErrUnsupported
+		control := criteriaControl(t, provider)
+		_, _, err := control.ResolveAdmission(context.Background(), criteriaRun())
+		var permanent *SecureNeedsHumanError
+		if !errors.As(err, &permanent) || permanent.Reason != "ProviderCapability" {
+			t.Fatalf("error = %v, want NeedsHuman ProviderCapability", err)
+		}
+	})
+
+	// The response's identity is checked against the request before
+	// anything is pinned: a provider returning another issue's number, a
+	// number-less answer, or a different repository must never stand in for
+	// the trusted source issue.
+	identityMismatch := map[string]forge.WorkItem{
+		"wrong issue number": {ID: "13", Repo: "misospace/miso-gallery", Body: "## Acceptance\n- someone else's criterion\n"},
+		"number-less answer": {ID: "", Repo: "misospace/miso-gallery", Body: "## Acceptance\n- someone else's criterion\n"},
+		"wrong repository":   {ID: "502", Repo: "other/repo", Body: "## Acceptance\n- someone else's criterion\n"},
+	}
+	for name, item := range identityMismatch {
+		t.Run(name, func(t *testing.T) {
+			provider := criteriaForge(t, "## Acceptance\n- one\n")
+			provider.issues["misospace/miso-gallery#502"] = item
+			control := criteriaControl(t, provider)
+			_, _, err := control.ResolveAdmission(context.Background(), criteriaRun())
+			var permanent *SecureNeedsHumanError
+			if !errors.As(err, &permanent) || permanent.Reason != "ProviderRead" {
+				t.Fatalf("error = %v, want NeedsHuman ProviderRead", err)
+			}
+		})
 	}
 }
 
@@ -1403,5 +1624,425 @@ func TestObserveTopologyTerminatedControlWithVanishedWorkerIsNilSafe(t *testing.
 	var updated corev1.Pod
 	if err := c.Get(context.Background(), client.ObjectKeyFromObject(brokerPod), &updated); err == nil && updated.DeletionTimestamp == nil {
 		t.Fatal("broker pod survived with no deletion in flight; the terminated control must fence it")
+	}
+}
+
+// wedgedControlPod is a secure round's control pod past the liveness window
+// with no fresh heartbeat: a silent wedge, not a termination — the container
+// is still Running, so the exit-code mapping and ObserveTopology leave the
+// decision to liveness.
+func wedgedControlPod(run *courier.CoderRun, now time.Time) *corev1.Pod {
+	pod := healthyPod(run.Name, topology.ComponentCoordinator)
+	pod.Spec.Containers[0].Name = topology.ControlContainerName
+	pod.CreationTimestamp = metav1.NewTime(now.Add(-2 * time.Hour))
+	pod.Status.ContainerStatuses = []corev1.ContainerStatus{{
+		Name: topology.ControlContainerName,
+		State: corev1.ContainerState{Running: &corev1.ContainerStateRunning{
+			StartedAt: metav1.NewTime(now.Add(-2 * time.Hour)),
+		}},
+	}}
+	return pod
+}
+
+func secureLivenessReconciler(c client.Client, control *SecureControl, now time.Time) *CoderRunReconciler {
+	return &CoderRunReconciler{
+		Client:         c,
+		APIReader:      c,
+		Sources:        NewSourceRegistry(map[string]source.Adapter{"manual": &admissionSource{}}),
+		StatusWriter:   fakeStatusWriter{client: c},
+		Secure:         control,
+		LivenessWindow: 5 * time.Minute,
+		MaxRestarts:    3,
+		Now:            func() time.Time { return now },
+	}
+}
+
+// TestWedgeOfSecureRunReapsOnlyCoordinatorAndFencesRound pins #222: a
+// stale-heartbeat wedge of a secure run charges exactly one crashloop credit,
+// the wedge reap set is the coordinator pod, and the surviving round is torn
+// down by SecureControl's fence — Service before broker pod (HARNESS.md §3) —
+// on the same reconcile, exactly as the disappearance backstop does (#215).
+func TestWedgeOfSecureRunReapsOnlyCoordinatorAndFencesRound(t *testing.T) {
+	control, c := secureControl(t)
+	run := secureRun("wedge-secure")
+	run.Status.Phase = courier.PhaseRunning
+	controlPod := wedgedControlPod(run, livenessClock)
+	run.Status.Heartbeat = &courier.Heartbeat{
+		At:                metav1.NewTime(livenessClock.Add(-10 * time.Minute)),
+		Kind:              "stream",
+		CoordinatorPodUID: string(controlPod.UID),
+	}
+	if err := c.Create(context.Background(), run); err != nil {
+		t.Fatal(err)
+	}
+	workerPod := healthyPod(run.Name, topology.ComponentWorker)
+	brokerPod := healthyPod(run.Name, topology.ComponentBroker)
+	for _, pod := range []*corev1.Pod{controlPod, workerPod, brokerPod} {
+		if err := c.Create(context.Background(), pod); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := c.Create(context.Background(), topology.BrokerService(run)); err != nil {
+		t.Fatal(err)
+	}
+
+	reconciler := secureLivenessReconciler(c, control, livenessClock)
+	result, err := reconciler.Reconcile(context.Background(), ctrl.Request{NamespacedName: client.ObjectKeyFromObject(run)})
+	if err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	if !result.Requeue {
+		t.Fatalf("Requeue = false, want true; a wedged control must relaunch the round")
+	}
+	var updated courier.CoderRun
+	if err := c.Get(context.Background(), client.ObjectKeyFromObject(run), &updated); err != nil {
+		t.Fatal(err)
+	}
+	if updated.Status.Phase != courier.PhaseClaimed {
+		t.Fatalf("phase = %q, want Claimed", updated.Status.Phase)
+	}
+	if updated.Status.Restarts != 1 {
+		t.Fatalf("restarts = %d, want exactly 1; one coordinator wedge is one credit", updated.Status.Restarts)
+	}
+	var got corev1.Pod
+	if err := c.Get(context.Background(), types.NamespacedName{Namespace: run.Namespace, Name: topology.ControlPodName(run.Name)}, &got); !apierrors.IsNotFound(err) {
+		t.Fatalf("control pod must be reaped, got %v", err)
+	}
+	if err := c.Get(context.Background(), types.NamespacedName{Namespace: run.Namespace, Name: topology.WorkerPodName(run.Name)}, &got); !apierrors.IsNotFound(err) {
+		t.Fatalf("worker must be fenced by SecureControl on the wedge reconcile, got %v", err)
+	}
+	var service corev1.Service
+	if err := c.Get(context.Background(), types.NamespacedName{Namespace: run.Namespace, Name: topology.BrokerServiceName(run.Name)}, &service); !apierrors.IsNotFound(err) {
+		t.Fatalf("broker ingress must be disabled with the wedge, got %v", err)
+	}
+	if err := c.Get(context.Background(), types.NamespacedName{Namespace: run.Namespace, Name: topology.BrokerPodName(run.Name)}, &got); !apierrors.IsNotFound(err) {
+		t.Fatalf("broker pod must be fenced with the wedge, got %v", err)
+	}
+}
+
+// TestWedgeOfSecureRunAtCeilingFencesThenNeedsHuman pins the at-ceiling arm:
+// the wedge hand-off terminalizes in the detection reconcile, so the fence
+// must run there — a terminal run is never relaunched and would otherwise
+// leave the untrusted executor and the credentialed broker alive past the
+// human decision.
+func TestWedgeOfSecureRunAtCeilingFencesThenNeedsHuman(t *testing.T) {
+	control, c := secureControl(t)
+	run := secureRun("wedge-secure-ceiling")
+	run.Status.Phase = courier.PhaseRunning
+	run.Status.Restarts = 3
+	controlPod := wedgedControlPod(run, livenessClock)
+	run.Status.Heartbeat = &courier.Heartbeat{
+		At:                metav1.NewTime(livenessClock.Add(-10 * time.Minute)),
+		Kind:              "stream",
+		CoordinatorPodUID: string(controlPod.UID),
+	}
+	if err := c.Create(context.Background(), run); err != nil {
+		t.Fatal(err)
+	}
+	workerPod := healthyPod(run.Name, topology.ComponentWorker)
+	brokerPod := healthyPod(run.Name, topology.ComponentBroker)
+	for _, pod := range []*corev1.Pod{controlPod, workerPod, brokerPod} {
+		if err := c.Create(context.Background(), pod); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := c.Create(context.Background(), topology.BrokerService(run)); err != nil {
+		t.Fatal(err)
+	}
+
+	reconciler := secureLivenessReconciler(c, control, livenessClock)
+	result, err := reconciler.Reconcile(context.Background(), ctrl.Request{NamespacedName: client.ObjectKeyFromObject(run)})
+	if err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	if result.Requeue || result.RequeueAfter != 0 {
+		t.Fatalf("result = %#v, want no requeue; the ceiling hand-off terminalizes in this reconcile", result)
+	}
+	var updated courier.CoderRun
+	if err := c.Get(context.Background(), client.ObjectKeyFromObject(run), &updated); err != nil {
+		t.Fatal(err)
+	}
+	if updated.Status.Phase != courier.PhaseNeedsHuman {
+		t.Fatalf("phase = %q, want NeedsHuman from the ceiling", updated.Status.Phase)
+	}
+	if updated.Status.Restarts != 3 {
+		t.Fatalf("restarts = %d, want 3 (ceiling is preserved, not incremented)", updated.Status.Restarts)
+	}
+	var got corev1.Pod
+	if err := c.Get(context.Background(), types.NamespacedName{Namespace: run.Namespace, Name: topology.WorkerPodName(run.Name)}, &got); !apierrors.IsNotFound(err) {
+		t.Fatalf("worker must be fenced on the ceiling reconcile, got %v", err)
+	}
+	var service corev1.Service
+	if err := c.Get(context.Background(), types.NamespacedName{Namespace: run.Namespace, Name: topology.BrokerServiceName(run.Name)}, &service); !apierrors.IsNotFound(err) {
+		t.Fatalf("broker ingress must be disabled on the ceiling reconcile, got %v", err)
+	}
+	if err := c.Get(context.Background(), types.NamespacedName{Namespace: run.Namespace, Name: topology.BrokerPodName(run.Name)}, &got); !apierrors.IsNotFound(err) {
+		t.Fatalf("broker pod must be fenced on the ceiling reconcile, got %v", err)
+	}
+}
+
+// readerWithoutControlPod answers pod lists from the wrapped client with the
+// run's control pod removed, standing in for the informer cache disagreeing
+// with the API server: the cache still shows a live control the API server
+// does not have.
+type readerWithoutControlPod struct {
+	client.Client
+	controlName string
+}
+
+func (w readerWithoutControlPod) List(ctx context.Context, list client.ObjectList, opts ...client.ListOption) error {
+	if err := w.Client.List(ctx, list, opts...); err != nil {
+		return err
+	}
+	if pods, ok := list.(*corev1.PodList); ok {
+		kept := make([]corev1.Pod, 0, len(pods.Items))
+		for _, pod := range pods.Items {
+			if pod.Name != w.controlName {
+				kept = append(kept, pod)
+			}
+		}
+		pods.Items = kept
+	}
+	return nil
+}
+
+// TestWedgeViewDisagreementAtCeilingFencesThenNeedsHuman pins the fence on
+// the cached-view-disagrees hand-off: the live read shows no control pod
+// while the cache still shows a live one, and the ceiling hand-off
+// terminalizes the run in this reconcile, so the surviving round must be
+// fenced here — a terminal run is never torn down again.
+func TestWedgeViewDisagreementAtCeilingFencesThenNeedsHuman(t *testing.T) {
+	control, c := secureControl(t)
+	run := secureRun("wedge-disagree")
+	run.Status.Phase = courier.PhaseRunning
+	run.Status.Restarts = 3
+	controlPod := wedgedControlPod(run, livenessClock)
+	run.Status.Heartbeat = &courier.Heartbeat{
+		At:                metav1.NewTime(livenessClock.Add(-10 * time.Minute)),
+		Kind:              "stream",
+		CoordinatorPodUID: string(controlPod.UID),
+	}
+	if err := c.Create(context.Background(), run); err != nil {
+		t.Fatal(err)
+	}
+	workerPod := healthyPod(run.Name, topology.ComponentWorker)
+	brokerPod := healthyPod(run.Name, topology.ComponentBroker)
+	for _, pod := range []*corev1.Pod{controlPod, workerPod, brokerPod} {
+		if err := c.Create(context.Background(), pod); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := c.Create(context.Background(), topology.BrokerService(run)); err != nil {
+		t.Fatal(err)
+	}
+
+	reconciler := secureLivenessReconciler(c, control, livenessClock)
+	reconciler.APIReader = readerWithoutControlPod{Client: c, controlName: topology.ControlPodName(run.Name)}
+	if _, err := reconciler.Reconcile(context.Background(), ctrl.Request{NamespacedName: client.ObjectKeyFromObject(run)}); err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	var updated courier.CoderRun
+	if err := c.Get(context.Background(), client.ObjectKeyFromObject(run), &updated); err != nil {
+		t.Fatal(err)
+	}
+	if updated.Status.Phase != courier.PhaseNeedsHuman {
+		t.Fatalf("phase = %q, want NeedsHuman from the ceiling hand-off", updated.Status.Phase)
+	}
+	var got corev1.Pod
+	if err := c.Get(context.Background(), types.NamespacedName{Namespace: run.Namespace, Name: topology.WorkerPodName(run.Name)}, &got); !apierrors.IsNotFound(err) {
+		t.Fatalf("worker must be fenced on the disagrees hand-off reconcile, got %v", err)
+	}
+	if err := c.Get(context.Background(), types.NamespacedName{Namespace: run.Namespace, Name: topology.BrokerPodName(run.Name)}, &got); !apierrors.IsNotFound(err) {
+		t.Fatalf("broker pod must be fenced on the disagrees hand-off reconcile, got %v", err)
+	}
+	var service corev1.Service
+	if err := c.Get(context.Background(), types.NamespacedName{Namespace: run.Namespace, Name: topology.BrokerServiceName(run.Name)}, &service); !apierrors.IsNotFound(err) {
+		t.Fatalf("broker ingress must be disabled on the disagrees hand-off reconcile, got %v", err)
+	}
+}
+
+// TestWedgeAtCeilingPreservesUnrecoverableControlAndFencesRound pins the
+// #106 evidence rule inside the secure topology: an evicted control object
+// at the ceiling is the NeedsHuman hand-off's only record of the cause and
+// survives, while the surviving round is still fenced — terminal worker or
+// broker objects are never coordinator evidence, and a terminal run must
+// not leave them standing.
+func TestWedgeAtCeilingPreservesUnrecoverableControlAndFencesRound(t *testing.T) {
+	control, c := secureControl(t)
+	run := secureRun("wedge-secure-preserved")
+	run.Status.Phase = courier.PhaseRunning
+	run.Status.Restarts = 3
+	controlPod := healthyPod(run.Name, topology.ComponentCoordinator)
+	controlPod.Spec.Containers[0].Name = topology.ControlContainerName
+	controlPod.CreationTimestamp = metav1.NewTime(livenessClock.Add(-2 * time.Hour))
+	controlPod.Status = corev1.PodStatus{
+		Phase:   corev1.PodFailed,
+		Reason:  "Evicted",
+		Message: "The node was low on resource: ephemeral-storage.",
+	}
+	run.Status.Heartbeat = &courier.Heartbeat{
+		At:                metav1.NewTime(livenessClock.Add(-10 * time.Minute)),
+		Kind:              "stream",
+		CoordinatorPodUID: string(controlPod.UID),
+	}
+	if err := c.Create(context.Background(), run); err != nil {
+		t.Fatal(err)
+	}
+	workerPod := healthyPod(run.Name, topology.ComponentWorker)
+	brokerPod := healthyPod(run.Name, topology.ComponentBroker)
+	for _, pod := range []*corev1.Pod{controlPod, workerPod, brokerPod} {
+		if err := c.Create(context.Background(), pod); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := c.Create(context.Background(), topology.BrokerService(run)); err != nil {
+		t.Fatal(err)
+	}
+
+	reconciler := secureLivenessReconciler(c, control, livenessClock)
+	if _, err := reconciler.Reconcile(context.Background(), ctrl.Request{NamespacedName: client.ObjectKeyFromObject(run)}); err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	var updated courier.CoderRun
+	if err := c.Get(context.Background(), client.ObjectKeyFromObject(run), &updated); err != nil {
+		t.Fatal(err)
+	}
+	if updated.Status.Phase != courier.PhaseNeedsHuman {
+		t.Fatalf("phase = %q, want NeedsHuman from the ceiling", updated.Status.Phase)
+	}
+	var got corev1.Pod
+	if err := c.Get(context.Background(), types.NamespacedName{Namespace: run.Namespace, Name: topology.ControlPodName(run.Name)}, &got); err != nil {
+		t.Fatalf("the unrecoverable control object must survive as the hand-off's evidence: %v", err)
+	}
+	if err := c.Get(context.Background(), types.NamespacedName{Namespace: run.Namespace, Name: topology.WorkerPodName(run.Name)}, &got); !apierrors.IsNotFound(err) {
+		t.Fatalf("worker must be fenced even when the control is preserved, got %v", err)
+	}
+	var service corev1.Service
+	if err := c.Get(context.Background(), types.NamespacedName{Namespace: run.Namespace, Name: topology.BrokerServiceName(run.Name)}, &service); !apierrors.IsNotFound(err) {
+		t.Fatalf("broker ingress must be disabled even when the control is preserved, got %v", err)
+	}
+	if err := c.Get(context.Background(), types.NamespacedName{Namespace: run.Namespace, Name: topology.BrokerPodName(run.Name)}, &got); !apierrors.IsNotFound(err) {
+		t.Fatalf("broker pod must be fenced even when the control is preserved, got %v", err)
+	}
+}
+
+// TestWedgeOfSecureRunAtConfiguredCeilingFencesThenNeedsHuman pins the
+// configured-ceiling path (#216): with `MaxRestarts` set below the package
+// default, the wedge detection reconcile terminalizes a run at the configured
+// counter — not the default — and the secure round is fenced on that
+// detection reconcile. A wedge at `Restarts == configured` must hand off
+// to a human; a wedge below the configured counter would relaunch.
+func TestWedgeOfSecureRunAtConfiguredCeilingFencesThenNeedsHuman(t *testing.T) {
+	control, c := secureControl(t)
+	run := secureRun("wedge-secure-configured-ceiling")
+	run.Status.Phase = courier.PhaseRunning
+	const configuredCeiling = 2
+	run.Status.Restarts = configuredCeiling
+	controlPod := wedgedControlPod(run, livenessClock)
+	run.Status.Heartbeat = &courier.Heartbeat{
+		At:                metav1.NewTime(livenessClock.Add(-10 * time.Minute)),
+		Kind:              "stream",
+		CoordinatorPodUID: string(controlPod.UID),
+	}
+	if err := c.Create(context.Background(), run); err != nil {
+		t.Fatal(err)
+	}
+	workerPod := healthyPod(run.Name, topology.ComponentWorker)
+	brokerPod := healthyPod(run.Name, topology.ComponentBroker)
+	for _, pod := range []*corev1.Pod{controlPod, workerPod, brokerPod} {
+		if err := c.Create(context.Background(), pod); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := c.Create(context.Background(), topology.BrokerService(run)); err != nil {
+		t.Fatal(err)
+	}
+
+	reconciler := secureLivenessReconciler(c, control, livenessClock)
+	reconciler.MaxRestarts = configuredCeiling
+	result, err := reconciler.Reconcile(context.Background(), ctrl.Request{NamespacedName: client.ObjectKeyFromObject(run)})
+	if err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	if result.Requeue || result.RequeueAfter != 0 {
+		t.Fatalf("result = %#v, want no requeue; the configured-ceiling hand-off terminalizes in this reconcile", result)
+	}
+	var updated courier.CoderRun
+	if err := c.Get(context.Background(), client.ObjectKeyFromObject(run), &updated); err != nil {
+		t.Fatal(err)
+	}
+	if updated.Status.Phase != courier.PhaseNeedsHuman {
+		t.Fatalf("phase = %q, want NeedsHuman from the configured ceiling (%d), not the package default", updated.Status.Phase, configuredCeiling)
+	}
+	if updated.Status.Restarts != configuredCeiling {
+		t.Fatalf("restarts = %d, want %d (configured ceiling is preserved, not incremented)", updated.Status.Restarts, configuredCeiling)
+	}
+	var got corev1.Pod
+	if err := c.Get(context.Background(), types.NamespacedName{Namespace: run.Namespace, Name: topology.WorkerPodName(run.Name)}, &got); !apierrors.IsNotFound(err) {
+		t.Fatalf("worker must be fenced on the configured-ceiling reconcile, got %v", err)
+	}
+	var service corev1.Service
+	if err := c.Get(context.Background(), types.NamespacedName{Namespace: run.Namespace, Name: topology.BrokerServiceName(run.Name)}, &service); !apierrors.IsNotFound(err) {
+		t.Fatalf("broker ingress must be disabled on the configured-ceiling reconcile, got %v", err)
+	}
+	if err := c.Get(context.Background(), types.NamespacedName{Namespace: run.Namespace, Name: topology.BrokerPodName(run.Name)}, &got); !apierrors.IsNotFound(err) {
+		t.Fatalf("broker pod must be fenced on the configured-ceiling reconcile, got %v", err)
+	}
+}
+
+// TestWedgeDeferredChargeDoesNotFenceYet pins the sequencing the deferred
+// charge depends on: when the coordinator delete is still re-confirming
+// (the object survives the live read), the detection reconcile takes no
+// charge and leaves the round standing — the disappearance backstop, which
+// fences when it takes the deferred charge, owns that teardown.
+func TestWedgeDeferredChargeDoesNotFenceYet(t *testing.T) {
+	control, c := secureControl(t)
+	run := secureRun("wedge-deferred")
+	run.Status.Phase = courier.PhaseRunning
+	controlPod := wedgedControlPod(run, livenessClock)
+	// A finalizer is what keeps the deleted object present for the live
+	// re-confirmation; the fake client refuses a DeletionTimestamp without one.
+	controlPod.Finalizers = []string{"courier.misospace.dev/test"}
+	run.Status.Heartbeat = &courier.Heartbeat{
+		At:                metav1.NewTime(livenessClock.Add(-10 * time.Minute)),
+		Kind:              "stream",
+		CoordinatorPodUID: string(controlPod.UID),
+	}
+	if err := c.Create(context.Background(), run); err != nil {
+		t.Fatal(err)
+	}
+	workerPod := healthyPod(run.Name, topology.ComponentWorker)
+	brokerPod := healthyPod(run.Name, topology.ComponentBroker)
+	for _, pod := range []*corev1.Pod{controlPod, workerPod, brokerPod} {
+		if err := c.Create(context.Background(), pod); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := c.Create(context.Background(), topology.BrokerService(run)); err != nil {
+		t.Fatal(err)
+	}
+
+	reconciler := secureLivenessReconciler(c, control, livenessClock)
+	result, err := reconciler.Reconcile(context.Background(), ctrl.Request{NamespacedName: client.ObjectKeyFromObject(run)})
+	if err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	if result.RequeueAfter != observationRequeueDelay {
+		t.Fatalf("RequeueAfter = %v, want %v; a delete still re-confirming defers", result.RequeueAfter, observationRequeueDelay)
+	}
+	var updated courier.CoderRun
+	if err := c.Get(context.Background(), client.ObjectKeyFromObject(run), &updated); err != nil {
+		t.Fatal(err)
+	}
+	if updated.Status.Restarts != 0 || updated.Status.Phase != courier.PhaseRunning {
+		t.Fatalf("state = phase %q restarts %d, want Running/0 while the charge is deferred", updated.Status.Phase, updated.Status.Restarts)
+	}
+	var got corev1.Pod
+	if err := c.Get(context.Background(), types.NamespacedName{Namespace: run.Namespace, Name: topology.WorkerPodName(run.Name)}, &got); err != nil {
+		t.Fatalf("worker must still stand while the charge defers to the backstop: %v", err)
+	}
+	var service corev1.Service
+	if err := c.Get(context.Background(), types.NamespacedName{Namespace: run.Namespace, Name: topology.BrokerServiceName(run.Name)}, &service); err != nil {
+		t.Fatalf("broker ingress must still stand while the charge defers to the backstop: %v", err)
 	}
 }

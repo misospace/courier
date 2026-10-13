@@ -20,6 +20,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
 	courierv1alpha1 "github.com/misospace/courier/api/v1alpha1"
+	"github.com/misospace/courier/internal/broker"
 	"github.com/misospace/courier/internal/executor"
 	courierlog "github.com/misospace/courier/internal/log"
 	"github.com/misospace/courier/internal/source"
@@ -448,6 +449,12 @@ func (r *CoderRunReconciler) resolvePersistSecurePolicy(ctx context.Context, run
 		if err != nil || registration.Name != policy.ProviderConfigRef || registration.Endpoint != policy.ProviderEndpoint || registration.Projection().Digest != policy.CredentialRefDigest {
 			return secureNeedsHuman("PolicyConflict",
 				"the provider registry no longer matches this run's persisted policy")
+		}
+		// A pinned criterion set is re-verified like every other policy
+		// field: a digest that no longer covers the pinned criteria is a
+		// fail-closed corruption signal, not an input to launch-loop on.
+		if _, _, err := broker.CriterionSetFromPolicy(policy); err != nil {
+			return secureNeedsHuman("PolicyCorrupt", "%v", err)
 		}
 		return nil
 	}

@@ -377,6 +377,17 @@ to die.
    the API server and charges it with its pod-loss cause. At the ceiling
    there is no charge to defer: the wedge preserves the inert unrecoverable
    object exactly like the backstop and terminalizes in the same reconcile.
+   The wedge path's pod set — reap and startup grace — is the run's
+   **coordinator** pod, identified by the coordinator container, never
+   every pod bearing the run's label: a secure round's worker and broker
+   are torn down by `SecureControl`'s fence, not reaped here. The wedge
+   detection reconcile fences the surviving round exactly as the
+   disappearance backstop does — below the ceiling before returning to
+   `Claimed`, at the ceiling before the `NeedsHuman` hand-off, because a
+   terminal run is never relaunched and a fence deferred past the
+   detection reconcile would never run (#215). One wedge therefore charges
+   one crashloop credit and tears the round down in one place: the wedge
+   reaps the coordinator, `SecureControl` fences the rest. (#222)
 - The crashloop counter bounds a **consecutive** streak of wedges, not a lifetime
   total: a run that demonstrates liveness — a fresh heartbeat within the window
   while a recoverable coordinator is observable — resets the streak to zero, so
@@ -388,7 +399,10 @@ to die.
 - A just-relaunched pod gets a **startup grace** so it is not re-reaped on the
   previous incarnation's stale heartbeat before it can send its first one: a pod
   created within the window (or whose coordinator started within it) is never
-  reaped. Freshness is judged only on observable pod/run state — the operator
+  reaped — judged on the run's **coordinator** pod only, since a freshly
+  provisioned worker or broker of a secure round says nothing about the
+  coordinator's wedge (#222). Freshness is judged only on observable pod/run
+  state — the operator
   never writes the harness-owned heartbeat. A pod already terminating is neither
   reapable nor counted, and the wedge-path charge re-confirms every delete
   against the API server, so a delete racing a reconcile cannot double-count a
@@ -1599,6 +1613,33 @@ named items remain unresolved and must not be described as production-ready:
 
 ## Decisions
 
+- **2026-10-13 — #280: the acceptance-criterion set is pinned at admission
+  by a trusted forge read and carried, never re-derived.** The identification
+  boundary of #249: secure admission reads the source issue through the
+  selected provider's typed work-item read (`github.Client.GetIssue` behind
+  `forge.Provider.ReadWorkItem` — an existing capability in the closed
+  vocabulary, read-only) on the operator's read identity, runs the pure
+  `ExtractCriteria`, and persists the set beside a `sourceIssue` identity
+  pin in `Status.PublicationPolicy` (`acceptanceCriteria` +
+  `acceptanceCriteriaDigest`, additive; CRDs/deepcopy regenerated). An empty
+  set is pinned with its identity-only digest — the smallest contract change
+  to #249's pure seam, needed so a pinned-empty contract stays
+  distinguishable from an unpinned policy; ambiguity, over-bound sets, and
+  over-long criteria terminalize `NeedsHuman` naming why and are never
+  truncated. The broker binding reconstructs and digest-verifies the pin
+  (fix-pr pins, tampered pins,
+  and orphaned pin fields — any partial tuple — fail closed; only the fully
+  absent tuple is the legal pre-contract state, no migration). The trusted
+  read's response identity is verified against the request — the returned
+  issue number and repository must match the canonical pin — so a
+  misrouted provider answer can never pin another issue's criteria. The identical set is projected to the executor
+  contract as trusted env `COURIER_CRITERIA` (broker criterion-set JSON)
+  from the persisted policy by the legacy launcher and the secure control
+  invocation — the executor package stays free of any broker import because
+  broker's test graph imports the harness; the envelope is injected at the
+  launcher seam like evidence tokens are. Boundary enforcement stays with
+  #281 (native create refusal) and #282 (legacy handoff repair). (#280,
+  #249, #204)
 - **2026-10-13 — #210: `COURIER_TERMINATION` line budgeting lives in one place; both
   producers (`courier-executor`, `courier-control`) call it.** The native
   control handoff built its reason from capability detail strings with no
@@ -2563,6 +2604,25 @@ was superseded.
   Closed-unmerged terminalization and the
   `Failed`/`NeedsHuman` retention window stay with #251's children.
   (#250, #179, #251)
+- **2026-10-13 — #222: the wedge path reaps the coordinator, `SecureControl`
+  fences the round.** `checkLiveness`'s wedge path selected its reap set (and
+  its startup-grace set) by run ownership alone, while the coordinator
+  identity everywhere else — `coordinatorPodOf`, `observeMissingCoordinator`,
+  #106's ceiling evidence-preservation skip — is the coordinator *container*.
+  A secure-topology run that reached the wedge path therefore had its worker
+  and broker reaped by the legacy loop as well: teardown the secure topology
+  owns, with the broker's ingress `Service` left behind (an un-fenced broker
+  keeps the run's copied credentials and its Service keeps routing), and the
+  wedge's teardown was decided in two places at once. The wedge path now
+  scopes both loops to pods carrying the coordinator container, and fences
+  the surviving round through `SecureControl.Fence` on the wedge's detection
+  reconcile — below the ceiling before returning to `Claimed`, at the ceiling
+  (including the cached-view-disagrees hand-off) before the `NeedsHuman`
+  hand-off terminalizes — exactly the pattern #215 established for
+  confirmed control loss, because a terminal run is never relaunched and a
+  fence deferred past the detection reconcile never runs. Legacy single-pod
+  behavior is unchanged: the lone pod carries the coordinator container, so
+  the scoped sets match the old ones. (#222)
 
 - **2026-10-12 — #286: exclusion overflow degrades by truncation, not failure.**
   Retained dispatch CoderRuns with `followup-pr` work-item IDs grew past
