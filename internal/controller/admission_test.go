@@ -393,6 +393,7 @@ func TestReconcileStaysClaimedWhenCoordinatorSlotIsTerminating(t *testing.T) {
 	// CoordinatorLauncher.Launch must report the collision as
 	// ErrProvisioningInFlight, the reconciler must stay Claimed with a
 	// bounded requeue, and capacity must not be released back to Pending.
+	controller := true
 	now := metav1.Now()
 	existing := &corev1.Pod{
 		ObjectMeta: metav1.ObjectMeta{
@@ -400,6 +401,13 @@ func TestReconcileStaysClaimedWhenCoordinatorSlotIsTerminating(t *testing.T) {
 			Namespace:         admissionNamespace,
 			DeletionTimestamp: &now,
 			Finalizers:        []string{"keep.test/deletion"},
+			Labels:            map[string]string{executor.LabelRun: "next"},
+			OwnerReferences: []metav1.OwnerReference{{
+				APIVersion: courierv1alpha1.GroupVersion.String(),
+				Kind:       "CoderRun",
+				Name:       "next",
+				Controller: &controller,
+			}},
 		},
 	}
 	client := launcherClientForAdmission(t,
@@ -447,6 +455,7 @@ func TestResumeClaimedStaysClaimedWhenCoordinatorSlotIsTerminating(t *testing.T)
 	// the fix, the next reconcile would either terminalize the run as
 	// Failed off the dying pod's own termination, or charge a second
 	// infrastructure loss if the pod vanished first.
+	controller := true
 	now := metav1.Now()
 	existing := &corev1.Pod{
 		ObjectMeta: metav1.ObjectMeta{
@@ -454,6 +463,13 @@ func TestResumeClaimedStaysClaimedWhenCoordinatorSlotIsTerminating(t *testing.T)
 			Namespace:         admissionNamespace,
 			DeletionTimestamp: &now,
 			Finalizers:        []string{"keep.test/deletion"},
+			Labels:            map[string]string{executor.LabelRun: "next"},
+			OwnerReferences: []metav1.OwnerReference{{
+				APIVersion: courierv1alpha1.GroupVersion.String(),
+				Kind:       "CoderRun",
+				Name:       "next",
+				Controller: &controller,
+			}},
 		},
 	}
 	client := launcherClientForAdmission(t,

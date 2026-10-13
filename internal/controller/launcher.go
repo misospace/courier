@@ -46,9 +46,11 @@ var (
 	// The reconciler treats this as "stay Claimed, requeue", the same
 	// shape as the secure topology's in-flight signal; the pod's delete
 	// event normally wakes the next reconcile, with a bounded requeue as
-	// the backstop. Only a follow-up read that returns a verified live,
-	// run-owned pod resolves the collision to a successful, idempotent
-	// Launch.
+	// the backstop. Only a follow-up read that returns a run-owned pod
+	// not being torn down resolves the collision to a successful,
+	// idempotent Launch; a completed-but-not-yet-deleted owned pod also
+	// resolves it, and the observation path terminalizes it with a single
+	// charge as before.
 	ErrProvisioningInFlight = errors.New("coordinator launcher: provisioning in flight; slot could not be verified as a live run-owned pod")
 )
 
@@ -151,10 +153,10 @@ func (l *CoordinatorLauncher) Launch(ctx context.Context, run *courierv1alpha1.C
 	//     such a pod as "idempotently live" would bind the run to an
 	//     arbitrary coordinator.
 	//
-	// A live, run-owned existing pod is the only case that resolves the
-	// collision to a successful, no-second-charge Launch: the resource
-	// boundary was already idempotent and resumeClaimed will finish the
-	// admission in its next pass.
+	// A run-owned existing pod not being torn down is the only case that
+	// resolves the collision to a successful, no-second-charge Launch: the
+	// resource boundary was already idempotent and resumeClaimed will
+	// finish the admission in its next pass.
 	var existing corev1.Pod
 	getErr := l.Client.Get(ctx, client.ObjectKey{Namespace: pod.Namespace, Name: pod.Name}, &existing)
 	switch {

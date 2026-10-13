@@ -397,6 +397,9 @@ func TestCoordinatorLauncherReportsProvisioningInFlightWhenExistingPodIsTerminat
 	// must not record Running. The launcher surfaces this collision as
 	// ErrProvisioningInFlight so the reconciler can stay Claimed and
 	// requeue, instead of treating AlreadyExists as a successful Launch.
+	// The pod is run-owned so the DeletionTimestamp branch — not the
+	// ownership check — is what rejects the collision.
+	controller := true
 	now := metav1.Now()
 	existing := &corev1.Pod{
 		ObjectMeta: metav1.ObjectMeta{
@@ -404,6 +407,16 @@ func TestCoordinatorLauncherReportsProvisioningInFlightWhenExistingPodIsTerminat
 			Namespace:         "default",
 			DeletionTimestamp: &now,
 			Finalizers:        []string{"keep.test/deletion"},
+			Labels: map[string]string{
+				executor.LabelRun: run.Name,
+			},
+			OwnerReferences: []metav1.OwnerReference{{
+				APIVersion: courierv1alpha1.GroupVersion.String(),
+				Kind:       "CoderRun",
+				Name:       run.Name,
+				UID:        run.UID,
+				Controller: &controller,
+			}},
 		},
 	}
 	fakeClient := fake.NewClientBuilder().
