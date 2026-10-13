@@ -561,13 +561,18 @@ func (r *CoderRunReconciler) relaunchAfterInfraLoss(ctx context.Context, run *co
 	if run.Status.Restarts >= r.maxRestarts() {
 		// The ceiling is reached: hand the run to a human instead of
 		// relaunching it again. The counter is already at the ceiling, so
-		// it is left untouched.
+		// it is left untouched. The terminal transition disarms the control
+		// request itself.
 		return r.transitionTerminal(ctx, run, courierv1alpha1.PhaseNeedsHuman, "", terminalLifecycleIntent{
 			error:      reason,
 			diagnostic: diagnostic,
 		}, nil)
 	}
 	before := run.DeepCopy()
+	// A soft-stop addressed to the torn-down incarnation is void; disarm it
+	// (observing an unacknowledged request) after the diff base so the
+	// relaunch patch persists the disarm alongside the restart charge (#238).
+	softStopBeforeRelaunch(run, r.clock())
 	run.Status.Restarts++
 	run.Status.Phase = courierv1alpha1.PhaseClaimed
 	if err := r.patchStatus(ctx, before, run); err != nil {
