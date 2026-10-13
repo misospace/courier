@@ -305,14 +305,56 @@ func TestProviderProtectionEstablishesUnprotectedOnlyFromBothAPIs(t *testing.T) 
 func TestProviderUnsupportedOperations(t *testing.T) {
 	p := NewProvider(forge.ProviderConfig{Name: "gh"}, nil)
 	ctx := context.Background()
-	if _, err := p.ReadWorkItem(ctx, forge.WorkItemRef{Repo: "acme/demo", ID: "1"}); !errors.Is(err, forge.ErrUnsupported) {
-		t.Fatalf("ReadWorkItem() error = %v, want ErrUnsupported", err)
-	}
 	if _, err := p.ListReviews(ctx, forge.PullRequestRef{Repo: "acme/demo", Number: 7}); !errors.Is(err, forge.ErrUnsupported) {
 		t.Fatalf("ListReviews() error = %v, want ErrUnsupported", err)
 	}
 	if _, err := p.ListComments(ctx, forge.PullRequestRef{Repo: "acme/demo", Number: 7}); !errors.Is(err, forge.ErrUnsupported) {
 		t.Fatalf("ListComments() error = %v, want ErrUnsupported", err)
+	}
+}
+
+// ReadWorkItem is the typed trusted issue read admission pins criteria from
+// (#280): the reference ID is the decimal issue number, the response is the
+// issue's title/body/state, and a pull-request response is refused rather
+// than laundered into an issue.
+func TestProviderReadWorkItem(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/repos/acme/demo/issues/502":
+			_, _ = io.WriteString(w, `{"number":502,"title":"Package the assets","body":"## Acceptance\n- built image contains the PNGs","state":"open","html_url":"https://github.com/acme/demo/issues/502"}`)
+		case "/repos/acme/demo/issues/9":
+			_, _ = io.WriteString(w, `{"number":9,"title":"a pull request in disguise","pull_request":{"url":"https://api.github.com/repos/acme/demo/pulls/9"}}`)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	client, err := NewClient(server.URL, "token")
+	if err != nil {
+		t.Fatal(err)
+	}
+	p := NewProvider(forge.ProviderConfig{Name: "gh", Endpoint: server.URL, CredentialRef: "secret/gh"}, client)
+	ctx := context.Background()
+
+	if !p.Capabilities().Has(forge.CapabilityReadWorkItem) {
+		t.Fatal("provider must register the read-work-item capability it now covers")
+	}
+	item, err := p.ReadWorkItem(ctx, forge.WorkItemRef{Repo: "acme/demo", ID: "502"})
+	if err != nil {
+		t.Fatalf("ReadWorkItem() error = %v", err)
+	}
+	if item.ID != "502" || item.Repo != "acme/demo" || item.Title != "Package the assets" ||
+		item.Body != "## Acceptance\n- built image contains the PNGs" || item.State != "open" ||
+		item.URL != "https://github.com/acme/demo/issues/502" {
+		t.Fatalf("ReadWorkItem() = %#v, want the full issue snapshot", item)
+	}
+	if _, err := p.ReadWorkItem(ctx, forge.WorkItemRef{Repo: "acme/demo", ID: "9"}); err == nil {
+		t.Fatal("a pull-request response must not be returned as a work item")
+	}
+	if _, err := p.ReadWorkItem(ctx, forge.WorkItemRef{Repo: "acme/demo", ID: "not-a-number"}); err == nil {
+		t.Fatal("a non-numeric work item ID must be rejected")
 	}
 }
 func TestProviderListsPullRequestsByFullHeadAcrossPages(t *testing.T) {

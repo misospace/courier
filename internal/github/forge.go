@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/http"
 	"strconv"
+	"strings"
 
 	"github.com/misospace/courier/internal/forge"
 )
@@ -62,6 +63,7 @@ func NewProvider(cfg forge.ProviderConfig, client *Client) *Provider {
 		cfg:    cfg,
 		client: client,
 		caps: forge.NewCapabilities(
+			forge.CapabilityReadWorkItem,
 			forge.CapabilityReadPullRequest,
 			forge.CapabilityReadChecks,
 			forge.CapabilityCreatePullRequest,
@@ -159,9 +161,34 @@ func (p *Provider) CanWriteRepository(ctx context.Context, repository forge.Repo
 	return got.Permissions.Push, nil
 }
 
-// ReadWorkItem is not covered by this client.
+// ReadWorkItem reads one issue by number. The reference ID is the issue
+// number as a decimal string — the identity admission already pins in the
+// immutable spec. The issues API also serves pull requests; a pull-request
+// response is refused rather than laundered into an issue read.
 func (p *Provider) ReadWorkItem(ctx context.Context, ref forge.WorkItemRef) (forge.WorkItem, error) {
-	return forge.WorkItem{}, forge.ErrUnsupported
+	owner, repo, err := splitRepository(ref.Repo)
+	if err != nil {
+		return forge.WorkItem{}, err
+	}
+	number, err := strconv.Atoi(strings.TrimSpace(ref.ID))
+	if err != nil || number < 1 {
+		return forge.WorkItem{}, fmt.Errorf("GitHub work item ID must be a positive issue number, got %q", ref.ID)
+	}
+	issue, err := p.client.GetIssue(ctx, owner, repo, number)
+	if err != nil {
+		return forge.WorkItem{}, boundaryError(err)
+	}
+	if issue.PullRequest != nil {
+		return forge.WorkItem{}, fmt.Errorf("GitHub work item %d is a pull request, not an issue", number)
+	}
+	return forge.WorkItem{
+		ID:    strconv.Itoa(issue.Number),
+		Repo:  ref.Repo,
+		Title: issue.Title,
+		Body:  issue.Body,
+		State: issue.State,
+		URL:   issue.HTMLURL,
+	}, nil
 }
 
 // ReadPullRequest reads the current pull request from GitHub.

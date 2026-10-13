@@ -102,6 +102,24 @@ func PolicyFromRun(run *v1alpha1.CoderRun, providerConfigRef, canonicalSpecRepo 
 			return Policy{}, fmt.Errorf("broker binding: persisted base repository %q is not an owner/name", persisted.BaseRepo)
 		}
 		policy.SourceIssue = SourceIssue{Owner: owner, Name: name, Number: run.Spec.Ref}
+		// A persisted source-issue pin is cross-checked against the
+		// spec-derived identity: the pin describes the same issue the
+		// run's immutable spec names, or the policy is corrupt.
+		if persisted.SourceIssue != nil {
+			if persisted.SourceIssue.Owner != owner || persisted.SourceIssue.Name != name || persisted.SourceIssue.Number != run.Spec.Ref {
+				return Policy{}, errors.New("broker binding: persisted source-issue identity does not match the spec-derived identity")
+			}
+		}
+		set, pinned, err := CriterionSetFromPolicy(persisted)
+		if err != nil {
+			return Policy{}, err
+		}
+		if !pinned && persisted.SourceIssue != nil {
+			return Policy{}, errors.New("broker binding: source-issue identity pinned without a criterion set")
+		}
+		if pinned {
+			policy.Criteria = set
+		}
 	case ModeFixPR:
 		if persisted.PRNumber != run.Spec.Ref || persisted.HeadAnchorOID == "" {
 			return Policy{}, errors.New("broker binding: fix-pr policy does not match the requested PR and head anchor")
@@ -109,10 +127,62 @@ func PolicyFromRun(run *v1alpha1.CoderRun, providerConfigRef, canonicalSpecRepo 
 		if persisted.WorkInitiallyAbsent || persisted.WorkOID == "" || persisted.WorkOID != persisted.HeadAnchorOID {
 			return Policy{}, errors.New("broker binding: fix-pr work tip must equal the full PR head anchor")
 		}
+		// A fix-pr run pins nothing: its contract is the existing PR, and a
+		// policy that carries resolve-issue criterion pins is corrupt.
+		if persisted.SourceIssue != nil || len(persisted.AcceptanceCriteria) > 0 || persisted.AcceptanceCriteriaDigest != "" {
+			return Policy{}, errors.New("broker binding: fix-pr policy carries resolve-issue criterion pins")
+		}
 	}
 
 	if err := validatePolicy(policy); err != nil {
 		return Policy{}, fmt.Errorf("broker binding: %w", err)
 	}
 	return policy, nil
+}
+
+// CriterionSetFromPolicy reconstructs the pinned acceptance-criterion set
+// from a persisted publication policy. pinned is false when no set was
+// pinned — fix-pr runs and policies admitted before the criterion contract
+// (#280) — which is a legal state, not an error. A pinned set is verified
+// like every other policy field: each criterion's digest is recomputed from
+// its persisted text, IDs must remain the extraction ordinals, and the set
+// digest is recomputed over the trusted issue identity plus every criterion
+// digest in order. A tampered or corrupted pin fails closed instead of
+// becoming the target a publication boundary validates against.
+func CriterionSetFromPolicy(persisted *v1alpha1.PublicationPolicy) (set CriterionSet, pinned bool, err error) {
+	if persisted == nil || persisted.AcceptanceCriteriaDigest == "" {
+		return CriterionSet{}, false, nil
+	}
+	if persisted.SourceIssue == nil {
+		return CriterionSet{}, false, errors.New("broker binding: pinned criterion set carries no source-issue identity")
+	}
+	if len(persisted.AcceptanceCriteria) > MaxCriteria {
+		return CriterionSet{}, false, fmt.Errorf("broker binding: pinned criterion set carries %d criteria; the bound is %d", len(persisted.AcceptanceCriteria), MaxCriteria)
+	}
+	set = CriterionSet{
+		Issue: SourceIssue{
+			Owner:  persisted.SourceIssue.Owner,
+			Name:   persisted.SourceIssue.Name,
+			Number: persisted.SourceIssue.Number,
+		},
+		Criteria: make([]Criterion, 0, len(persisted.AcceptanceCriteria)),
+	}
+	for i, criterion := range persisted.AcceptanceCriteria {
+		if criterion.ID != fmt.Sprintf("AC-%d", i+1) {
+			return CriterionSet{}, false, fmt.Errorf("broker binding: pinned criterion %d carries ID %q; extraction ordinals are immutable", i+1, criterion.ID)
+		}
+		if len(criterion.Text) > MaxCriterionTextBytes {
+			return CriterionSet{}, false, fmt.Errorf("broker binding: pinned criterion %s exceeds the %d-byte text bound", criterion.ID, MaxCriterionTextBytes)
+		}
+		if digestString(criterion.Text) != criterion.Digest {
+			return CriterionSet{}, false, fmt.Errorf("broker binding: pinned criterion %s text does not match its digest", criterion.ID)
+		}
+		set.Criteria = append(set.Criteria, Criterion{ID: criterion.ID, Text: criterion.Text, Digest: criterion.Digest})
+	}
+	computed := set.digest()
+	if computed != persisted.AcceptanceCriteriaDigest {
+		return CriterionSet{}, false, errors.New("broker binding: pinned criterion set digest does not cover the pinned criteria")
+	}
+	set.Digest = computed
+	return set, true, nil
 }

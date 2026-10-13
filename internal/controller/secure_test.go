@@ -3,6 +3,8 @@ package controller
 import (
 	"context"
 	"errors"
+	"fmt"
+	"os"
 	"strings"
 	"testing"
 	"time"
@@ -23,6 +25,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 
 	courier "github.com/misospace/courier/api/v1alpha1"
+	"github.com/misospace/courier/internal/broker"
 	"github.com/misospace/courier/internal/forge"
 	"github.com/misospace/courier/internal/source"
 	"github.com/misospace/courier/internal/status"
@@ -33,10 +36,12 @@ const secureTestNamespace = "courier-runs"
 
 // fakeAdmissionForge implements the admission provider facets in memory.
 type fakeAdmissionForge struct {
-	repos   map[string]forge.Repository
-	refs    map[string]forge.RefState
-	prs     []forge.PullRequest
-	readErr error
+	repos        map[string]forge.Repository
+	refs         map[string]forge.RefState
+	prs          []forge.PullRequest
+	issues       map[string]forge.WorkItem
+	readErr      error
+	issueReadErr error
 }
 
 func (f *fakeAdmissionForge) ResolveRepository(_ context.Context, name string) (forge.Repository, error) {
@@ -65,8 +70,15 @@ func (f *fakeAdmissionForge) CanWriteRepository(context.Context, forge.Repositor
 	return true, nil
 }
 
-func (f *fakeAdmissionForge) ReadWorkItem(context.Context, forge.WorkItemRef) (forge.WorkItem, error) {
-	return forge.WorkItem{}, forge.ErrUnsupported
+func (f *fakeAdmissionForge) ReadWorkItem(_ context.Context, ref forge.WorkItemRef) (forge.WorkItem, error) {
+	if f.issueReadErr != nil {
+		return forge.WorkItem{}, f.issueReadErr
+	}
+	item, ok := f.issues[ref.Repo+"#"+ref.ID]
+	if !ok {
+		return forge.WorkItem{}, errors.New("work item not found")
+	}
+	return item, nil
 }
 
 func (f *fakeAdmissionForge) Config() forge.ProviderConfig {
@@ -161,6 +173,9 @@ func secureForge() *fakeAdmissionForge {
 		refs: map[string]forge.RefState{
 			"Acme/Widgets:main":                         {Ref: "main", OID: "baseoid", Exists: true},
 			"Acme/Widgets:courier/Acme/Widgets/issue-7": {Ref: "courier/Acme/Widgets/issue-7", Exists: false},
+		},
+		issues: map[string]forge.WorkItem{
+			"Acme/Widgets#7": {ID: "7", Repo: "Acme/Widgets", Title: "Add the widget", Body: "## Problem\nThe widget is missing.", State: "open"},
 		},
 	}
 }
@@ -265,6 +280,14 @@ func TestResolveAdmissionResolveIssue(t *testing.T) {
 	if policy.ProviderEndpoint != "https://api.github.com/" || policy.CredentialRefDigest == "" {
 		t.Fatalf("provider binding fields = %q %q", policy.ProviderEndpoint, policy.CredentialRefDigest)
 	}
+	// The trusted source-issue read pins the identity and an explicit empty
+	// set: this issue body carries no Acceptance section.
+	if policy.SourceIssue == nil || policy.SourceIssue.Owner != "Acme" || policy.SourceIssue.Name != "Widgets" || policy.SourceIssue.Number != 7 {
+		t.Fatalf("source issue pin = %+v, want Acme/Widgets#7", policy.SourceIssue)
+	}
+	if len(policy.AcceptanceCriteria) != 0 || policy.AcceptanceCriteriaDigest == "" {
+		t.Fatalf("criteria pin = %+v digest %q, want an explicit empty set with a digest", policy.AcceptanceCriteria, policy.AcceptanceCriteriaDigest)
+	}
 }
 
 func TestResolveAdmissionFixPR(t *testing.T) {
@@ -298,6 +321,182 @@ func TestResolveAdmissionFixPR(t *testing.T) {
 	if policy.WorkInitiallyAbsent {
 		t.Fatal("a fix-pr head always exists")
 	}
+	if policy.SourceIssue != nil || len(policy.AcceptanceCriteria) > 0 || policy.AcceptanceCriteriaDigest != "" {
+		t.Fatalf("a fix-pr run pins nothing: %+v", policy)
+	}
+}
+
+// criteriaForge serves a resolve-issue run against the miso-gallery#502
+// fixture body so admission tests pin the real dogfood material (#280).
+func criteriaForge(t *testing.T, body string) *fakeAdmissionForge {
+	t.Helper()
+	repo := forge.Repository{ID: "repo-1", Canonical: "misospace/miso-gallery", DefaultRef: "main"}
+	return &fakeAdmissionForge{
+		repos: map[string]forge.Repository{"misospace/miso-gallery": repo},
+		refs: map[string]forge.RefState{
+			"misospace/miso-gallery:main":                                     {Ref: "main", OID: "baseoid", Exists: true},
+			"misospace/miso-gallery:courier/misospace/miso-gallery/issue-502": {Ref: "courier/misospace/miso-gallery/issue-502", Exists: false},
+		},
+		issues: map[string]forge.WorkItem{
+			"misospace/miso-gallery#502": {ID: "502", Repo: "misospace/miso-gallery", Title: "Package the tracked assets directory", Body: body, State: "open"},
+		},
+	}
+}
+
+func criteriaRun() *courier.CoderRun {
+	run := secureRun("criteria")
+	run.Spec.Repo = "misospace/miso-gallery"
+	run.Spec.Ref = 502
+	return run
+}
+
+func criteriaControl(t *testing.T, forge *fakeAdmissionForge) *SecureControl {
+	t.Helper()
+	control, _ := secureControl(t)
+	control.Config.Providers = fakeProviderFactory(forge)
+	return control
+}
+
+// Admission pins the live miso-gallery#502 issue body exactly: the three
+// Acceptance bullets become AC-1..AC-3 with digests the shared pure
+// extraction re-derives, and re-running admission on the same issue revision
+// yields the same set digest (restart idempotency).
+func TestResolveAdmissionPinsCriteria(t *testing.T) {
+	body, err := os.ReadFile("../../internal/broker/testdata/miso-gallery-502-issue.md")
+	if err != nil {
+		t.Fatalf("read 502 fixture: %v", err)
+	}
+	control := criteriaControl(t, criteriaForge(t, string(body)))
+	run := criteriaRun()
+
+	_, policy, err := control.ResolveAdmission(context.Background(), run)
+	if err != nil {
+		t.Fatalf("ResolveAdmission: %v", err)
+	}
+	if policy.SourceIssue == nil || policy.SourceIssue.Owner != "misospace" || policy.SourceIssue.Name != "miso-gallery" || policy.SourceIssue.Number != 502 {
+		t.Fatalf("source issue pin = %+v, want misospace/miso-gallery#502", policy.SourceIssue)
+	}
+	expected, err := broker.ExtractCriteria(string(body), broker.SourceIssue{Owner: "misospace", Name: "miso-gallery", Number: 502})
+	if err != nil {
+		t.Fatalf("re-derive expected set: %v", err)
+	}
+	if policy.AcceptanceCriteriaDigest != expected.Digest {
+		t.Fatalf("set digest = %q, want the pure extraction's %q", policy.AcceptanceCriteriaDigest, expected.Digest)
+	}
+	if len(policy.AcceptanceCriteria) != len(expected.Criteria) {
+		t.Fatalf("pinned %d criteria, want %d", len(policy.AcceptanceCriteria), len(expected.Criteria))
+	}
+	for i, criterion := range policy.AcceptanceCriteria {
+		want := expected.Criteria[i]
+		if criterion.ID != want.ID || criterion.Text != want.Text || criterion.Digest != want.Digest {
+			t.Fatalf("criterion %d = %+v, want %+v", i, criterion, want)
+		}
+	}
+	if len(policy.AcceptanceCriteria) != 3 || policy.AcceptanceCriteria[0].ID != "AC-1" || policy.AcceptanceCriteria[2].ID != "AC-3" {
+		t.Fatalf("502 must pin AC-1..AC-3, got %+v", policy.AcceptanceCriteria)
+	}
+
+	// The same issue revision admitted again pins the identical digest.
+	_, again, err := control.ResolveAdmission(context.Background(), criteriaRun())
+	if err != nil {
+		t.Fatalf("re-admission: %v", err)
+	}
+	if again.AcceptanceCriteriaDigest != policy.AcceptanceCriteriaDigest {
+		t.Fatalf("re-admission digest = %q, want the stable %q", again.AcceptanceCriteriaDigest, policy.AcceptanceCriteriaDigest)
+	}
+}
+
+// An issue whose body carries no Acceptance section (or a bullet-less one)
+// pins an explicit empty set — a legitimate pin, not a failure.
+func TestResolveAdmissionPinsEmptyCriteriaSet(t *testing.T) {
+	tests := map[string]string{
+		"no acceptance section": "## Problem\nSomething is broken.\n\n## Evidence\n- observed locally\n",
+		"bullet-less section":   "## Acceptance\nProse only, no bullets to pin.\n",
+		"empty body":            "",
+	}
+	for name, body := range tests {
+		t.Run(name, func(t *testing.T) {
+			control := criteriaControl(t, criteriaForge(t, body))
+			_, policy, err := control.ResolveAdmission(context.Background(), criteriaRun())
+			if err != nil {
+				t.Fatalf("ResolveAdmission: %v", err)
+			}
+			if policy.SourceIssue == nil {
+				t.Fatal("the source-issue identity is pinned even for an empty set")
+			}
+			if len(policy.AcceptanceCriteria) != 0 || policy.AcceptanceCriteriaDigest == "" {
+				t.Fatalf("criteria = %+v digest %q, want an empty set with a digest", policy.AcceptanceCriteria, policy.AcceptanceCriteriaDigest)
+			}
+		})
+	}
+}
+
+// Ambiguous or over-bound bodies fail closed at admission: an unpinnable
+// contract must not become an unchecked one, and an over-bound set is never
+// truncated.
+func TestResolveAdmissionCriteriaFailClosed(t *testing.T) {
+	tooMany := &strings.Builder{}
+	tooMany.WriteString("## Acceptance\n")
+	for i := 0; i < broker.MaxCriteria+1; i++ {
+		fmt.Fprintf(tooMany, "- criterion %d\n", i+1)
+	}
+	overLong := "## Acceptance\n- " + strings.Repeat("x", broker.MaxCriterionTextBytes+1) + "\n"
+
+	tests := map[string]struct {
+		body   string
+		reason string
+	}{
+		"ambiguous sections": {
+			body:   "## Acceptance\n- one\n\n## Notes\n\n## Acceptance\n- two\n",
+			reason: "CriteriaUnpinnable",
+		},
+		"over-bound set": {
+			body:   tooMany.String(),
+			reason: "CriteriaUnpinnable",
+		},
+		"over-long criterion": {
+			body:   overLong,
+			reason: "CriteriaUnpinnable",
+		},
+	}
+	for name, test := range tests {
+		t.Run(name, func(t *testing.T) {
+			control := criteriaControl(t, criteriaForge(t, test.body))
+			_, _, err := control.ResolveAdmission(context.Background(), criteriaRun())
+			var permanent *SecureNeedsHumanError
+			if !errors.As(err, &permanent) || permanent.Reason != test.reason {
+				t.Fatalf("error = %v, want NeedsHuman %s", err, test.reason)
+			}
+			if !strings.Contains(permanent.Detail, "criteria extraction") {
+				t.Fatalf("NeedsHuman detail must name why: %q", permanent.Detail)
+			}
+		})
+	}
+
+	t.Run("issue read failure is transient", func(t *testing.T) {
+		provider := criteriaForge(t, "## Acceptance\n- one\n")
+		provider.issueReadErr = errors.New("transport hiccup")
+		control := criteriaControl(t, provider)
+		_, _, err := control.ResolveAdmission(context.Background(), criteriaRun())
+		if err == nil {
+			t.Fatal("a failed trusted read must fail admission")
+		}
+		var permanent *SecureNeedsHumanError
+		if errors.As(err, &permanent) {
+			t.Fatalf("transport failure must be transient, got NeedsHuman: %v", err)
+		}
+	})
+
+	t.Run("unsupported issue read is a capability failure", func(t *testing.T) {
+		provider := criteriaForge(t, "## Acceptance\n- one\n")
+		provider.issueReadErr = forge.ErrUnsupported
+		control := criteriaControl(t, provider)
+		_, _, err := control.ResolveAdmission(context.Background(), criteriaRun())
+		var permanent *SecureNeedsHumanError
+		if !errors.As(err, &permanent) || permanent.Reason != "ProviderCapability" {
+			t.Fatalf("error = %v, want NeedsHuman ProviderCapability", err)
+		}
+	})
 }
 
 func TestResolveAdmissionFailsClosed(t *testing.T) {

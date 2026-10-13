@@ -319,7 +319,9 @@ type Provider interface {
 	// each is currently available.
 	Capabilities() Capabilities
 
-	// ReadWorkItem reads a work item (issue/ticket) by reference.
+	// ReadWorkItem reads a work item (issue/ticket) by reference. For forges
+	// with numeric issue identities the reference ID is the decimal issue
+	// number — the same identity a CoderRun pins in its immutable spec.
 	ReadWorkItem(context.Context, WorkItemRef) (WorkItem, error)
 	// ReadPullRequest reads a pull/merge request by reference.
 	ReadPullRequest(context.Context, PullRequestRef) (PullRequest, error)
