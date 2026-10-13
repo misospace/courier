@@ -59,6 +59,35 @@ func gaugeValue(t *testing.T, m *dto.Metric, name string) float64 {
 	return m.GetGauge().GetValue()
 }
 
+// gaugeValueIfPresent reports the named gauge's value for the given labels and
+// whether the series exists at all, for assertions that a series may be
+// legitimately absent (a phase with nothing retained).
+func gaugeValueIfPresent(t *testing.T, reg *prometheus.Registry, name string, labels map[string]string) (float64, bool) {
+	t.Helper()
+	families, err := reg.Gather()
+	if err != nil {
+		t.Fatalf("gather: %v", err)
+	}
+	for _, f := range families {
+		if f.GetName() != name {
+			continue
+		}
+		for _, m := range f.GetMetric() {
+			match := true
+			for _, lp := range m.GetLabel() {
+				if labels[lp.GetName()] != lp.GetValue() {
+					match = false
+					break
+				}
+			}
+			if match && m.GetGauge() != nil {
+				return m.GetGauge().GetValue(), true
+			}
+		}
+	}
+	return 0, false
+}
+
 func histogramSample(t *testing.T, reg *prometheus.Registry, name string, labels map[string]string) (uint64, float64) {
 	t.Helper()
 	m := gatherMetric(t, reg, name, labels)
@@ -246,8 +275,8 @@ func TestMetricLabelsExcludeIdentity(t *testing.T) {
 	} {
 		assertGatheredLabelSet(t, registry, name, "lane", "mode", "phase")
 	}
-	recorder.ObserveReap(courierv1alpha1.PhaseFailed)
-	assertGatheredLabelSet(t, registry, "courier_coderuns_reaped_total", "phase")
+	recorder.ObserveReapRequest(courierv1alpha1.PhaseFailed)
+	assertGatheredLabelSet(t, registry, "courier_coderuns_reap_requests_total", "phase")
 
 	// A drained lane must still appear on both lane gauges, reporting 0.
 	doneRun := admissionRun("run2", "local", courierv1alpha1.PhaseDone)
@@ -401,10 +430,10 @@ func TestTerminalStatusPatchFailureRecordsNoMetrics(t *testing.T) {
 	}
 }
 
-// TestReapObservesReapCounter checks the deletion half of the retention
-// observability: a reaped run increments the phase-labelled counter exactly
-// once, even though the object is gone.
-func TestReapObservesReapCounter(t *testing.T) {
+// TestReapObservesReapRequestCounter checks the deletion half of the retention
+// observability: an accepted delete request increments the phase-labelled
+// counter exactly once, even though the object is gone.
+func TestReapObservesReapRequestCounter(t *testing.T) {
 	run := withReapMarker(
 		terminalReapRun("failed", courierv1alpha1.PhaseFailed, timestampClock.Add(-11*time.Minute)),
 		failedAtAnnotation, timestampClock.Add(-11*time.Minute))
@@ -419,9 +448,9 @@ func TestReapObservesReapCounter(t *testing.T) {
 	if _, err := r.Reconcile(context.Background(), admissionRequest("failed")); err != nil {
 		t.Fatalf("reconcile: %v", err)
 	}
-	m := gatherMetric(t, registry, "courier_coderuns_reaped_total", map[string]string{"phase": "Failed"})
+	m := gatherMetric(t, registry, "courier_coderuns_reap_requests_total", map[string]string{"phase": "Failed"})
 	if m.GetCounter() == nil || m.GetCounter().GetValue() != 1 {
-		t.Fatalf("courier_coderuns_reaped_total = %v, want 1", m.GetCounter())
+		t.Fatalf("courier_coderuns_reap_requests_total = %v, want 1", m.GetCounter())
 	}
 }
 

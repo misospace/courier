@@ -79,10 +79,10 @@ var (
 // default bound to the controller-runtime metrics registry is used when a
 // reconciler has no explicit recorder (see CoderRunReconciler.metrics).
 type RunRecorder struct {
-	RunDuration *prometheus.HistogramVec
-	QueueWait   *prometheus.HistogramVec
-	Total       *prometheus.CounterVec
-	Reaped      *prometheus.CounterVec
+	RunDuration  *prometheus.HistogramVec
+	QueueWait    *prometheus.HistogramVec
+	Total        *prometheus.CounterVec
+	ReapRequests *prometheus.CounterVec
 }
 
 func NewRunRecorder(reg prometheus.Registerer) *RunRecorder {
@@ -101,12 +101,12 @@ func NewRunRecorder(reg prometheus.Registerer) *RunRecorder {
 			Name: "courier_coderuns_total",
 			Help: "Total CoderRuns that reached a terminal phase, by lane, mode, and terminal phase.",
 		}, terminalMetricLabels),
-		Reaped: prometheus.NewCounterVec(prometheus.CounterOpts{
-			Name: "courier_coderuns_reaped_total",
-			Help: "Total terminal CoderRuns deleted by the retention reaper, by terminal phase.",
+		ReapRequests: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "courier_coderuns_reap_requests_total",
+			Help: "Terminal CoderRun deletions requested by the retention reaper, by terminal phase. The API server accepts a request even while a finalizer still holds the object; courier_coderuns_oldest_terminal_age_seconds shows what is actually retained.",
 		}, reapMetricLabels),
 	}
-	reg.MustRegister(rec.RunDuration, rec.QueueWait, rec.Total, rec.Reaped)
+	reg.MustRegister(rec.RunDuration, rec.QueueWait, rec.Total, rec.ReapRequests)
 	return rec
 }
 
@@ -151,14 +151,19 @@ func (r *RunRecorder) ObserveTerminal(run *courierv1alpha1.CoderRun) {
 	}
 }
 
-// ObserveReap records a terminal CoderRun deleted by the retention reaper. It
-// counts every deletion, keyed only by the run's terminal phase, so a reaped
-// run leaves one bounded, aggregatable trace even after its object is gone.
-func (r *RunRecorder) ObserveReap(phase courierv1alpha1.Phase) {
-	if r == nil || r.Reaped == nil {
+// ObserveReapRequest records an accepted deletion request for a terminal
+// CoderRun. It is deliberately a request counter, not a "gone" counter: the
+// Kubernetes API server accepts a delete on a secure run while the topology
+// finalizer still holds the object, so the object may outlive the counter.
+// Completed cleanup is observable instead through the scrape-time
+// courier_coderuns_oldest_terminal_age_seconds gauge, which reads live state.
+// Requests are counted once per delete attempt and keyed only by the run's
+// terminal phase, so a reaped run leaves one bounded, aggregatable trace.
+func (r *RunRecorder) ObserveReapRequest(phase courierv1alpha1.Phase) {
+	if r == nil || r.ReapRequests == nil {
 		return
 	}
-	r.Reaped.With(prometheus.Labels{"phase": string(phase)}).Inc()
+	r.ReapRequests.With(prometheus.Labels{"phase": string(phase)}).Inc()
 }
 
 // nonNegativeSeconds clamps a duration to zero for the negative case, which
@@ -248,10 +253,13 @@ func (c *LaneCollector) Collect(ch chan<- prometheus.Metric) {
 
 // TerminalAgeCollector reports the age of the oldest retained terminal
 // CoderRun per phase, read from the live cluster at scrape time. It is the
-// observability half of the retention reaper (#287): the reaped counter shows
-// deletions, and this gauge shows whether anything is aging past its window —
-// a stuck lifecycle report or an audit-floor hold. A failed List increments the
-// scrape-errors counter instead of silently dropping the scrape.
+// observability half of the retention reaper (#287): the reap-request counter
+// shows deletions the API server accepted, and this gauge shows what is
+// actually retained — an object a finalizer still holds stays on it, so a
+// request that never completed cleanup is visible. It also shows whether
+// anything is aging past its window — a stuck lifecycle report or an
+// audit-floor hold. A failed List increments the scrape-errors counter instead
+// of silently dropping the scrape.
 type TerminalAgeCollector struct {
 	client       client.Client
 	now          func() time.Time
