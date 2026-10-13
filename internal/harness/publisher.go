@@ -101,6 +101,20 @@ func (e *PublicationEngine) PrepareSnapshot(ctx context.Context) (Snapshot, erro
 	return e.tree.Render(ctx)
 }
 
+// WorkRefBeyondAnchor reports the broker's live observation of the pinned
+// work ref: whether it exists and holds a tip beyond the admission anchor.
+// It is the soft-stop finish's world input (#238) — a tip at the anchor (or
+// an absent ref) is ordinary pre-existing state, never this run's work.
+func (e *PublicationEngine) WorkRefBeyondAnchor(ctx context.Context) (bool, error) {
+	snap, err := retried(ctx, func(ctx context.Context) (BrokerSnapshot, error) {
+		return e.broker.Snapshot(ctx)
+	})
+	if err != nil {
+		return false, e.classify(err, "the work-ref observation")
+	}
+	return snap.WorkRefExists && !snap.AtAnchor, nil
+}
+
 // Integrate implements the Publisher seam.
 func (e *PublicationEngine) Integrate(ctx context.Context, req IntegrationRequest) (Integration, error) {
 	return e.tree.Integrate(ctx, req)
