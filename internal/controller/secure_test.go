@@ -622,6 +622,81 @@ func TestObserveTopologyFencesBrokenWorker(t *testing.T) {
 	}
 }
 
+// brokenWorkerSecureRound stands up a Running secure round whose worker has
+// definitively failed — the fixture a broken-topology relaunch is charged
+// from — and returns it with its control and client before any observation.
+func brokenWorkerSecureRound(t *testing.T, name string, restarts int) (*SecureControl, client.Client, *courier.CoderRun) {
+	t.Helper()
+	control, c := secureControl(t)
+	run := secureRun(name)
+	run.Status.Phase = courier.PhaseRunning
+	run.Status.Restarts = restarts
+	if err := c.Create(context.Background(), run); err != nil {
+		t.Fatal(err)
+	}
+	controlPod := healthyPod(run.Name, topology.ComponentCoordinator)
+	workerPod := healthyPod(run.Name, topology.ComponentWorker)
+	brokerPod := healthyPod(run.Name, topology.ComponentBroker)
+	for _, pod := range []*corev1.Pod{controlPod, workerPod, brokerPod} {
+		if err := c.Create(context.Background(), pod); err != nil {
+			t.Fatal(err)
+		}
+	}
+	workerPod.Status.Phase = corev1.PodFailed
+	if err := c.Status().Update(context.Background(), workerPod); err != nil {
+		t.Fatal(err)
+	}
+	return control, c, run
+}
+
+// TestObserveTopologyBrokenWorkerCeilingIsConfigured pins #216: the secure
+// broken-topology relaunch bounds against the configured ceiling, not the
+// package default. A configured ceiling of 1 terminalizes a repeatedly
+// broken topology the package default would still relaunch; with no
+// configured ceiling the same round relaunches, so the terminalization can
+// only come from the configured value.
+func TestObserveTopologyBrokenWorkerCeilingIsConfigured(t *testing.T) {
+	t.Run("ConfiguredCeilingTerminalizesBelowPackageDefault", func(t *testing.T) {
+		control, c, run := brokenWorkerSecureRound(t, "ceiling-configured", 1)
+		control.MaxRestarts = 1 // below defaultMaxRestarts, at the run's counter.
+		// The ceiling hand-off terminalizes through the patcher, which needs
+		// the source registry the plain secure helper does not wire.
+		control.Patcher = &CoderRunReconciler{
+			Client:       c,
+			Sources:      NewSourceRegistry(map[string]source.Adapter{"manual": &admissionSource{}}),
+			StatusWriter: fakeStatusWriter{client: c},
+		}
+		_, handled, err := control.ObserveTopology(context.Background(), run, listRunPods(t, c, run))
+		if err != nil || !handled {
+			t.Fatalf("handled=%v err=%v", handled, err)
+		}
+		var updated courier.CoderRun
+		if err := c.Get(context.Background(), client.ObjectKeyFromObject(run), &updated); err != nil {
+			t.Fatal(err)
+		}
+		if updated.Status.Phase != courier.PhaseNeedsHuman {
+			t.Fatalf("phase = %q, want NeedsHuman from the configured ceiling; the package default must not bound this path", updated.Status.Phase)
+		}
+		if updated.Status.Restarts != 1 {
+			t.Fatalf("restarts = %d, want 1 (ceiling is preserved, not incremented)", updated.Status.Restarts)
+		}
+	})
+	t.Run("PackageDefaultRelaunchesAboveConfiguredCounter", func(t *testing.T) {
+		control, c, run := brokenWorkerSecureRound(t, "ceiling-default", 1)
+		_, handled, err := control.ObserveTopology(context.Background(), run, listRunPods(t, c, run))
+		if err != nil || !handled {
+			t.Fatalf("handled=%v err=%v", handled, err)
+		}
+		var updated courier.CoderRun
+		if err := c.Get(context.Background(), client.ObjectKeyFromObject(run), &updated); err != nil {
+			t.Fatal(err)
+		}
+		if updated.Status.Phase != courier.PhaseClaimed || updated.Status.Restarts != 2 {
+			t.Fatalf("relaunch state = phase %q restarts %d, want Claimed with the counter incremented under the package default", updated.Status.Phase, updated.Status.Restarts)
+		}
+	})
+}
+
 func TestObserveTopologyFencesWorkerOnControlTermination(t *testing.T) {
 	control, c := secureControl(t)
 	run := secureRun("term")
@@ -1328,5 +1403,425 @@ func TestObserveTopologyTerminatedControlWithVanishedWorkerIsNilSafe(t *testing.
 	var updated corev1.Pod
 	if err := c.Get(context.Background(), client.ObjectKeyFromObject(brokerPod), &updated); err == nil && updated.DeletionTimestamp == nil {
 		t.Fatal("broker pod survived with no deletion in flight; the terminated control must fence it")
+	}
+}
+
+// wedgedControlPod is a secure round's control pod past the liveness window
+// with no fresh heartbeat: a silent wedge, not a termination — the container
+// is still Running, so the exit-code mapping and ObserveTopology leave the
+// decision to liveness.
+func wedgedControlPod(run *courier.CoderRun, now time.Time) *corev1.Pod {
+	pod := healthyPod(run.Name, topology.ComponentCoordinator)
+	pod.Spec.Containers[0].Name = topology.ControlContainerName
+	pod.CreationTimestamp = metav1.NewTime(now.Add(-2 * time.Hour))
+	pod.Status.ContainerStatuses = []corev1.ContainerStatus{{
+		Name: topology.ControlContainerName,
+		State: corev1.ContainerState{Running: &corev1.ContainerStateRunning{
+			StartedAt: metav1.NewTime(now.Add(-2 * time.Hour)),
+		}},
+	}}
+	return pod
+}
+
+func secureLivenessReconciler(c client.Client, control *SecureControl, now time.Time) *CoderRunReconciler {
+	return &CoderRunReconciler{
+		Client:         c,
+		APIReader:      c,
+		Sources:        NewSourceRegistry(map[string]source.Adapter{"manual": &admissionSource{}}),
+		StatusWriter:   fakeStatusWriter{client: c},
+		Secure:         control,
+		LivenessWindow: 5 * time.Minute,
+		MaxRestarts:    3,
+		Now:            func() time.Time { return now },
+	}
+}
+
+// TestWedgeOfSecureRunReapsOnlyCoordinatorAndFencesRound pins #222: a
+// stale-heartbeat wedge of a secure run charges exactly one crashloop credit,
+// the wedge reap set is the coordinator pod, and the surviving round is torn
+// down by SecureControl's fence — Service before broker pod (HARNESS.md §3) —
+// on the same reconcile, exactly as the disappearance backstop does (#215).
+func TestWedgeOfSecureRunReapsOnlyCoordinatorAndFencesRound(t *testing.T) {
+	control, c := secureControl(t)
+	run := secureRun("wedge-secure")
+	run.Status.Phase = courier.PhaseRunning
+	controlPod := wedgedControlPod(run, livenessClock)
+	run.Status.Heartbeat = &courier.Heartbeat{
+		At:                metav1.NewTime(livenessClock.Add(-10 * time.Minute)),
+		Kind:              "stream",
+		CoordinatorPodUID: string(controlPod.UID),
+	}
+	if err := c.Create(context.Background(), run); err != nil {
+		t.Fatal(err)
+	}
+	workerPod := healthyPod(run.Name, topology.ComponentWorker)
+	brokerPod := healthyPod(run.Name, topology.ComponentBroker)
+	for _, pod := range []*corev1.Pod{controlPod, workerPod, brokerPod} {
+		if err := c.Create(context.Background(), pod); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := c.Create(context.Background(), topology.BrokerService(run)); err != nil {
+		t.Fatal(err)
+	}
+
+	reconciler := secureLivenessReconciler(c, control, livenessClock)
+	result, err := reconciler.Reconcile(context.Background(), ctrl.Request{NamespacedName: client.ObjectKeyFromObject(run)})
+	if err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	if !result.Requeue {
+		t.Fatalf("Requeue = false, want true; a wedged control must relaunch the round")
+	}
+	var updated courier.CoderRun
+	if err := c.Get(context.Background(), client.ObjectKeyFromObject(run), &updated); err != nil {
+		t.Fatal(err)
+	}
+	if updated.Status.Phase != courier.PhaseClaimed {
+		t.Fatalf("phase = %q, want Claimed", updated.Status.Phase)
+	}
+	if updated.Status.Restarts != 1 {
+		t.Fatalf("restarts = %d, want exactly 1; one coordinator wedge is one credit", updated.Status.Restarts)
+	}
+	var got corev1.Pod
+	if err := c.Get(context.Background(), types.NamespacedName{Namespace: run.Namespace, Name: topology.ControlPodName(run.Name)}, &got); !apierrors.IsNotFound(err) {
+		t.Fatalf("control pod must be reaped, got %v", err)
+	}
+	if err := c.Get(context.Background(), types.NamespacedName{Namespace: run.Namespace, Name: topology.WorkerPodName(run.Name)}, &got); !apierrors.IsNotFound(err) {
+		t.Fatalf("worker must be fenced by SecureControl on the wedge reconcile, got %v", err)
+	}
+	var service corev1.Service
+	if err := c.Get(context.Background(), types.NamespacedName{Namespace: run.Namespace, Name: topology.BrokerServiceName(run.Name)}, &service); !apierrors.IsNotFound(err) {
+		t.Fatalf("broker ingress must be disabled with the wedge, got %v", err)
+	}
+	if err := c.Get(context.Background(), types.NamespacedName{Namespace: run.Namespace, Name: topology.BrokerPodName(run.Name)}, &got); !apierrors.IsNotFound(err) {
+		t.Fatalf("broker pod must be fenced with the wedge, got %v", err)
+	}
+}
+
+// TestWedgeOfSecureRunAtCeilingFencesThenNeedsHuman pins the at-ceiling arm:
+// the wedge hand-off terminalizes in the detection reconcile, so the fence
+// must run there — a terminal run is never relaunched and would otherwise
+// leave the untrusted executor and the credentialed broker alive past the
+// human decision.
+func TestWedgeOfSecureRunAtCeilingFencesThenNeedsHuman(t *testing.T) {
+	control, c := secureControl(t)
+	run := secureRun("wedge-secure-ceiling")
+	run.Status.Phase = courier.PhaseRunning
+	run.Status.Restarts = 3
+	controlPod := wedgedControlPod(run, livenessClock)
+	run.Status.Heartbeat = &courier.Heartbeat{
+		At:                metav1.NewTime(livenessClock.Add(-10 * time.Minute)),
+		Kind:              "stream",
+		CoordinatorPodUID: string(controlPod.UID),
+	}
+	if err := c.Create(context.Background(), run); err != nil {
+		t.Fatal(err)
+	}
+	workerPod := healthyPod(run.Name, topology.ComponentWorker)
+	brokerPod := healthyPod(run.Name, topology.ComponentBroker)
+	for _, pod := range []*corev1.Pod{controlPod, workerPod, brokerPod} {
+		if err := c.Create(context.Background(), pod); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := c.Create(context.Background(), topology.BrokerService(run)); err != nil {
+		t.Fatal(err)
+	}
+
+	reconciler := secureLivenessReconciler(c, control, livenessClock)
+	result, err := reconciler.Reconcile(context.Background(), ctrl.Request{NamespacedName: client.ObjectKeyFromObject(run)})
+	if err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	if result.Requeue || result.RequeueAfter != 0 {
+		t.Fatalf("result = %#v, want no requeue; the ceiling hand-off terminalizes in this reconcile", result)
+	}
+	var updated courier.CoderRun
+	if err := c.Get(context.Background(), client.ObjectKeyFromObject(run), &updated); err != nil {
+		t.Fatal(err)
+	}
+	if updated.Status.Phase != courier.PhaseNeedsHuman {
+		t.Fatalf("phase = %q, want NeedsHuman from the ceiling", updated.Status.Phase)
+	}
+	if updated.Status.Restarts != 3 {
+		t.Fatalf("restarts = %d, want 3 (ceiling is preserved, not incremented)", updated.Status.Restarts)
+	}
+	var got corev1.Pod
+	if err := c.Get(context.Background(), types.NamespacedName{Namespace: run.Namespace, Name: topology.WorkerPodName(run.Name)}, &got); !apierrors.IsNotFound(err) {
+		t.Fatalf("worker must be fenced on the ceiling reconcile, got %v", err)
+	}
+	var service corev1.Service
+	if err := c.Get(context.Background(), types.NamespacedName{Namespace: run.Namespace, Name: topology.BrokerServiceName(run.Name)}, &service); !apierrors.IsNotFound(err) {
+		t.Fatalf("broker ingress must be disabled on the ceiling reconcile, got %v", err)
+	}
+	if err := c.Get(context.Background(), types.NamespacedName{Namespace: run.Namespace, Name: topology.BrokerPodName(run.Name)}, &got); !apierrors.IsNotFound(err) {
+		t.Fatalf("broker pod must be fenced on the ceiling reconcile, got %v", err)
+	}
+}
+
+// readerWithoutControlPod answers pod lists from the wrapped client with the
+// run's control pod removed, standing in for the informer cache disagreeing
+// with the API server: the cache still shows a live control the API server
+// does not have.
+type readerWithoutControlPod struct {
+	client.Client
+	controlName string
+}
+
+func (w readerWithoutControlPod) List(ctx context.Context, list client.ObjectList, opts ...client.ListOption) error {
+	if err := w.Client.List(ctx, list, opts...); err != nil {
+		return err
+	}
+	if pods, ok := list.(*corev1.PodList); ok {
+		kept := make([]corev1.Pod, 0, len(pods.Items))
+		for _, pod := range pods.Items {
+			if pod.Name != w.controlName {
+				kept = append(kept, pod)
+			}
+		}
+		pods.Items = kept
+	}
+	return nil
+}
+
+// TestWedgeViewDisagreementAtCeilingFencesThenNeedsHuman pins the fence on
+// the cached-view-disagrees hand-off: the live read shows no control pod
+// while the cache still shows a live one, and the ceiling hand-off
+// terminalizes the run in this reconcile, so the surviving round must be
+// fenced here — a terminal run is never torn down again.
+func TestWedgeViewDisagreementAtCeilingFencesThenNeedsHuman(t *testing.T) {
+	control, c := secureControl(t)
+	run := secureRun("wedge-disagree")
+	run.Status.Phase = courier.PhaseRunning
+	run.Status.Restarts = 3
+	controlPod := wedgedControlPod(run, livenessClock)
+	run.Status.Heartbeat = &courier.Heartbeat{
+		At:                metav1.NewTime(livenessClock.Add(-10 * time.Minute)),
+		Kind:              "stream",
+		CoordinatorPodUID: string(controlPod.UID),
+	}
+	if err := c.Create(context.Background(), run); err != nil {
+		t.Fatal(err)
+	}
+	workerPod := healthyPod(run.Name, topology.ComponentWorker)
+	brokerPod := healthyPod(run.Name, topology.ComponentBroker)
+	for _, pod := range []*corev1.Pod{controlPod, workerPod, brokerPod} {
+		if err := c.Create(context.Background(), pod); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := c.Create(context.Background(), topology.BrokerService(run)); err != nil {
+		t.Fatal(err)
+	}
+
+	reconciler := secureLivenessReconciler(c, control, livenessClock)
+	reconciler.APIReader = readerWithoutControlPod{Client: c, controlName: topology.ControlPodName(run.Name)}
+	if _, err := reconciler.Reconcile(context.Background(), ctrl.Request{NamespacedName: client.ObjectKeyFromObject(run)}); err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	var updated courier.CoderRun
+	if err := c.Get(context.Background(), client.ObjectKeyFromObject(run), &updated); err != nil {
+		t.Fatal(err)
+	}
+	if updated.Status.Phase != courier.PhaseNeedsHuman {
+		t.Fatalf("phase = %q, want NeedsHuman from the ceiling hand-off", updated.Status.Phase)
+	}
+	var got corev1.Pod
+	if err := c.Get(context.Background(), types.NamespacedName{Namespace: run.Namespace, Name: topology.WorkerPodName(run.Name)}, &got); !apierrors.IsNotFound(err) {
+		t.Fatalf("worker must be fenced on the disagrees hand-off reconcile, got %v", err)
+	}
+	if err := c.Get(context.Background(), types.NamespacedName{Namespace: run.Namespace, Name: topology.BrokerPodName(run.Name)}, &got); !apierrors.IsNotFound(err) {
+		t.Fatalf("broker pod must be fenced on the disagrees hand-off reconcile, got %v", err)
+	}
+	var service corev1.Service
+	if err := c.Get(context.Background(), types.NamespacedName{Namespace: run.Namespace, Name: topology.BrokerServiceName(run.Name)}, &service); !apierrors.IsNotFound(err) {
+		t.Fatalf("broker ingress must be disabled on the disagrees hand-off reconcile, got %v", err)
+	}
+}
+
+// TestWedgeAtCeilingPreservesUnrecoverableControlAndFencesRound pins the
+// #106 evidence rule inside the secure topology: an evicted control object
+// at the ceiling is the NeedsHuman hand-off's only record of the cause and
+// survives, while the surviving round is still fenced — terminal worker or
+// broker objects are never coordinator evidence, and a terminal run must
+// not leave them standing.
+func TestWedgeAtCeilingPreservesUnrecoverableControlAndFencesRound(t *testing.T) {
+	control, c := secureControl(t)
+	run := secureRun("wedge-secure-preserved")
+	run.Status.Phase = courier.PhaseRunning
+	run.Status.Restarts = 3
+	controlPod := healthyPod(run.Name, topology.ComponentCoordinator)
+	controlPod.Spec.Containers[0].Name = topology.ControlContainerName
+	controlPod.CreationTimestamp = metav1.NewTime(livenessClock.Add(-2 * time.Hour))
+	controlPod.Status = corev1.PodStatus{
+		Phase:   corev1.PodFailed,
+		Reason:  "Evicted",
+		Message: "The node was low on resource: ephemeral-storage.",
+	}
+	run.Status.Heartbeat = &courier.Heartbeat{
+		At:                metav1.NewTime(livenessClock.Add(-10 * time.Minute)),
+		Kind:              "stream",
+		CoordinatorPodUID: string(controlPod.UID),
+	}
+	if err := c.Create(context.Background(), run); err != nil {
+		t.Fatal(err)
+	}
+	workerPod := healthyPod(run.Name, topology.ComponentWorker)
+	brokerPod := healthyPod(run.Name, topology.ComponentBroker)
+	for _, pod := range []*corev1.Pod{controlPod, workerPod, brokerPod} {
+		if err := c.Create(context.Background(), pod); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := c.Create(context.Background(), topology.BrokerService(run)); err != nil {
+		t.Fatal(err)
+	}
+
+	reconciler := secureLivenessReconciler(c, control, livenessClock)
+	if _, err := reconciler.Reconcile(context.Background(), ctrl.Request{NamespacedName: client.ObjectKeyFromObject(run)}); err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	var updated courier.CoderRun
+	if err := c.Get(context.Background(), client.ObjectKeyFromObject(run), &updated); err != nil {
+		t.Fatal(err)
+	}
+	if updated.Status.Phase != courier.PhaseNeedsHuman {
+		t.Fatalf("phase = %q, want NeedsHuman from the ceiling", updated.Status.Phase)
+	}
+	var got corev1.Pod
+	if err := c.Get(context.Background(), types.NamespacedName{Namespace: run.Namespace, Name: topology.ControlPodName(run.Name)}, &got); err != nil {
+		t.Fatalf("the unrecoverable control object must survive as the hand-off's evidence: %v", err)
+	}
+	if err := c.Get(context.Background(), types.NamespacedName{Namespace: run.Namespace, Name: topology.WorkerPodName(run.Name)}, &got); !apierrors.IsNotFound(err) {
+		t.Fatalf("worker must be fenced even when the control is preserved, got %v", err)
+	}
+	var service corev1.Service
+	if err := c.Get(context.Background(), types.NamespacedName{Namespace: run.Namespace, Name: topology.BrokerServiceName(run.Name)}, &service); !apierrors.IsNotFound(err) {
+		t.Fatalf("broker ingress must be disabled even when the control is preserved, got %v", err)
+	}
+	if err := c.Get(context.Background(), types.NamespacedName{Namespace: run.Namespace, Name: topology.BrokerPodName(run.Name)}, &got); !apierrors.IsNotFound(err) {
+		t.Fatalf("broker pod must be fenced even when the control is preserved, got %v", err)
+	}
+}
+
+// TestWedgeOfSecureRunAtConfiguredCeilingFencesThenNeedsHuman pins the
+// configured-ceiling path (#216): with `MaxRestarts` set below the package
+// default, the wedge detection reconcile terminalizes a run at the configured
+// counter — not the default — and the secure round is fenced on that
+// detection reconcile. A wedge at `Restarts == configured` must hand off
+// to a human; a wedge below the configured counter would relaunch.
+func TestWedgeOfSecureRunAtConfiguredCeilingFencesThenNeedsHuman(t *testing.T) {
+	control, c := secureControl(t)
+	run := secureRun("wedge-secure-configured-ceiling")
+	run.Status.Phase = courier.PhaseRunning
+	const configuredCeiling = 2
+	run.Status.Restarts = configuredCeiling
+	controlPod := wedgedControlPod(run, livenessClock)
+	run.Status.Heartbeat = &courier.Heartbeat{
+		At:                metav1.NewTime(livenessClock.Add(-10 * time.Minute)),
+		Kind:              "stream",
+		CoordinatorPodUID: string(controlPod.UID),
+	}
+	if err := c.Create(context.Background(), run); err != nil {
+		t.Fatal(err)
+	}
+	workerPod := healthyPod(run.Name, topology.ComponentWorker)
+	brokerPod := healthyPod(run.Name, topology.ComponentBroker)
+	for _, pod := range []*corev1.Pod{controlPod, workerPod, brokerPod} {
+		if err := c.Create(context.Background(), pod); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := c.Create(context.Background(), topology.BrokerService(run)); err != nil {
+		t.Fatal(err)
+	}
+
+	reconciler := secureLivenessReconciler(c, control, livenessClock)
+	reconciler.MaxRestarts = configuredCeiling
+	result, err := reconciler.Reconcile(context.Background(), ctrl.Request{NamespacedName: client.ObjectKeyFromObject(run)})
+	if err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	if result.Requeue || result.RequeueAfter != 0 {
+		t.Fatalf("result = %#v, want no requeue; the configured-ceiling hand-off terminalizes in this reconcile", result)
+	}
+	var updated courier.CoderRun
+	if err := c.Get(context.Background(), client.ObjectKeyFromObject(run), &updated); err != nil {
+		t.Fatal(err)
+	}
+	if updated.Status.Phase != courier.PhaseNeedsHuman {
+		t.Fatalf("phase = %q, want NeedsHuman from the configured ceiling (%d), not the package default", updated.Status.Phase, configuredCeiling)
+	}
+	if updated.Status.Restarts != configuredCeiling {
+		t.Fatalf("restarts = %d, want %d (configured ceiling is preserved, not incremented)", updated.Status.Restarts, configuredCeiling)
+	}
+	var got corev1.Pod
+	if err := c.Get(context.Background(), types.NamespacedName{Namespace: run.Namespace, Name: topology.WorkerPodName(run.Name)}, &got); !apierrors.IsNotFound(err) {
+		t.Fatalf("worker must be fenced on the configured-ceiling reconcile, got %v", err)
+	}
+	var service corev1.Service
+	if err := c.Get(context.Background(), types.NamespacedName{Namespace: run.Namespace, Name: topology.BrokerServiceName(run.Name)}, &service); !apierrors.IsNotFound(err) {
+		t.Fatalf("broker ingress must be disabled on the configured-ceiling reconcile, got %v", err)
+	}
+	if err := c.Get(context.Background(), types.NamespacedName{Namespace: run.Namespace, Name: topology.BrokerPodName(run.Name)}, &got); !apierrors.IsNotFound(err) {
+		t.Fatalf("broker pod must be fenced on the configured-ceiling reconcile, got %v", err)
+	}
+}
+
+// TestWedgeDeferredChargeDoesNotFenceYet pins the sequencing the deferred
+// charge depends on: when the coordinator delete is still re-confirming
+// (the object survives the live read), the detection reconcile takes no
+// charge and leaves the round standing — the disappearance backstop, which
+// fences when it takes the deferred charge, owns that teardown.
+func TestWedgeDeferredChargeDoesNotFenceYet(t *testing.T) {
+	control, c := secureControl(t)
+	run := secureRun("wedge-deferred")
+	run.Status.Phase = courier.PhaseRunning
+	controlPod := wedgedControlPod(run, livenessClock)
+	// A finalizer is what keeps the deleted object present for the live
+	// re-confirmation; the fake client refuses a DeletionTimestamp without one.
+	controlPod.Finalizers = []string{"courier.misospace.dev/test"}
+	run.Status.Heartbeat = &courier.Heartbeat{
+		At:                metav1.NewTime(livenessClock.Add(-10 * time.Minute)),
+		Kind:              "stream",
+		CoordinatorPodUID: string(controlPod.UID),
+	}
+	if err := c.Create(context.Background(), run); err != nil {
+		t.Fatal(err)
+	}
+	workerPod := healthyPod(run.Name, topology.ComponentWorker)
+	brokerPod := healthyPod(run.Name, topology.ComponentBroker)
+	for _, pod := range []*corev1.Pod{controlPod, workerPod, brokerPod} {
+		if err := c.Create(context.Background(), pod); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := c.Create(context.Background(), topology.BrokerService(run)); err != nil {
+		t.Fatal(err)
+	}
+
+	reconciler := secureLivenessReconciler(c, control, livenessClock)
+	result, err := reconciler.Reconcile(context.Background(), ctrl.Request{NamespacedName: client.ObjectKeyFromObject(run)})
+	if err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	if result.RequeueAfter != observationRequeueDelay {
+		t.Fatalf("RequeueAfter = %v, want %v; a delete still re-confirming defers", result.RequeueAfter, observationRequeueDelay)
+	}
+	var updated courier.CoderRun
+	if err := c.Get(context.Background(), client.ObjectKeyFromObject(run), &updated); err != nil {
+		t.Fatal(err)
+	}
+	if updated.Status.Restarts != 0 || updated.Status.Phase != courier.PhaseRunning {
+		t.Fatalf("state = phase %q restarts %d, want Running/0 while the charge is deferred", updated.Status.Phase, updated.Status.Restarts)
+	}
+	var got corev1.Pod
+	if err := c.Get(context.Background(), types.NamespacedName{Namespace: run.Namespace, Name: topology.WorkerPodName(run.Name)}, &got); err != nil {
+		t.Fatalf("worker must still stand while the charge defers to the backstop: %v", err)
+	}
+	var service corev1.Service
+	if err := c.Get(context.Background(), types.NamespacedName{Namespace: run.Namespace, Name: topology.BrokerServiceName(run.Name)}, &service); err != nil {
+		t.Fatalf("broker ingress must still stand while the charge defers to the backstop: %v", err)
 	}
 }
