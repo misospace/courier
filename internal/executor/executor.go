@@ -283,11 +283,125 @@ func RunContextEnvironment(inv Invocation) []EnvVar {
 // operator-authored and the model cannot change it.
 const criteriaEnvName = "COURIER_CRITERIA"
 
+// Default git identity names used when a deployment configures none. A fresh
+// clone has no git identity, so the coordinator environment must always carry
+// one; the default stays explicit and backward compatible (#317).
+const (
+	DefaultGitAuthorName  = "Courier"
+	DefaultGitAuthorEmail = "courier@localhost"
+)
+
+// The git identity environment contract. One set of names is shared by the
+// operator's pod rendering and the standalone executor's fallback so the two
+// producers cannot drift (#317).
+const (
+	EnvGitAuthorName     = "GIT_AUTHOR_NAME"
+	EnvGitAuthorEmail    = "GIT_AUTHOR_EMAIL"
+	EnvGitCommitterName  = "GIT_COMMITTER_NAME"
+	EnvGitCommitterEmail = "GIT_COMMITTER_EMAIL"
+)
+
+// GitIdentity is the deployment-configured git author and committer identity
+// rendered into operator-created coordinator pods (#317). Authentication
+// identity and commit authorship are separate concerns: nothing here is
+// derived from a token or names a particular forge account. Empty fields
+// resolve to the explicit default identity.
+type GitIdentity struct {
+	AuthorName     string
+	AuthorEmail    string
+	CommitterName  string
+	CommitterEmail string
+}
+
+// DefaultGitIdentity returns the identity used when a deployment configures
+// none. The standalone executor installs the same values as its fallback so
+// the two producers cannot drift.
+func DefaultGitIdentity() GitIdentity {
+	return GitIdentity{
+		AuthorName:     DefaultGitAuthorName,
+		AuthorEmail:    DefaultGitAuthorEmail,
+		CommitterName:  DefaultGitAuthorName,
+		CommitterEmail: DefaultGitAuthorEmail,
+	}
+}
+
+// Resolved trims each field and replaces unset fields with the default
+// identity, so an empty or whitespace-only configuration becomes the explicit
+// default rather than an empty environment value.
+func (g GitIdentity) Resolved() GitIdentity {
+	resolved := DefaultGitIdentity()
+	if value := strings.TrimSpace(g.AuthorName); value != "" {
+		resolved.AuthorName = value
+	}
+	if value := strings.TrimSpace(g.AuthorEmail); value != "" {
+		resolved.AuthorEmail = value
+	}
+	if value := strings.TrimSpace(g.CommitterName); value != "" {
+		resolved.CommitterName = value
+	}
+	if value := strings.TrimSpace(g.CommitterEmail); value != "" {
+		resolved.CommitterEmail = value
+	}
+	return resolved
+}
+
+// Environment returns the four git identity variables for the resolved
+// identity. The coordinator commits completed work in the cloned repository,
+// so the environment always carries a stable non-secret identity without
+// requiring mutable image configuration.
+func (g GitIdentity) Environment() []EnvVar {
+	resolved := g.Resolved()
+	return []EnvVar{
+		{Name: EnvGitAuthorName, Value: resolved.AuthorName},
+		{Name: EnvGitAuthorEmail, Value: resolved.AuthorEmail},
+		{Name: EnvGitCommitterName, Value: resolved.CommitterName},
+		{Name: EnvGitCommitterEmail, Value: resolved.CommitterEmail},
+	}
+}
+
+// Validate rejects configured (non-empty after trimming) identity values that
+// cannot safely travel in a container environment or a git commit object: any
+// ASCII control character or angle bracket in any field (git's ident format
+// is `name <email>`, so `<`/`>` fail at commit time, and fail-fast is the
+// point), and an email without "@" or with embedded whitespace. Empty fields
+// are not an error; they resolve to the default identity.
+func (g GitIdentity) Validate() error {
+	fields := []struct {
+		name  string
+		value string
+		email bool
+	}{
+		{name: "git author name", value: strings.TrimSpace(g.AuthorName)},
+		{name: "git author email", value: strings.TrimSpace(g.AuthorEmail), email: true},
+		{name: "git committer name", value: strings.TrimSpace(g.CommitterName)},
+		{name: "git committer email", value: strings.TrimSpace(g.CommitterEmail), email: true},
+	}
+	for _, field := range fields {
+		if field.value == "" {
+			continue
+		}
+		for _, r := range field.value {
+			if r < 0x20 || r == 0x7f || r == '<' || r == '>' {
+				return fmt.Errorf("executor: %s must not contain control characters or angle brackets", field.name)
+			}
+		}
+		if field.email {
+			if !strings.Contains(field.value, "@") {
+				return fmt.Errorf("executor: %s must contain an @: %q", field.name, field.value)
+			}
+			if strings.ContainsAny(field.value, " \t") {
+				return fmt.Errorf("executor: %s must not contain whitespace: %q", field.name, field.value)
+			}
+		}
+	}
+	return nil
+}
+
 // Environment returns the run context a coordinator container receives. The
 // values are kept in environment variables rather than shell-expanded command
 // strings so repository names, framing, and goals cannot become shell syntax.
 func Environment(inv Invocation, executorName string) []EnvVar {
-	return EnvironmentWithConfig(inv, executorName, "", "", "", "", "", "", "", "", "")
+	return EnvironmentWithConfig(inv, executorName, "", "", "", "", "", "", "", "", "", GitIdentity{})
 }
 
 // EnvironmentWithConfig extends the run context with the deployment-specific
@@ -297,8 +411,10 @@ func Environment(inv Invocation, executorName string) []EnvVar {
 // repository that owns the base branch, so a fork workspace can sync against
 // upstream while pushing to the fork. evidenceURL and evidenceNonce are set
 // only when failure-evidence capture is enabled, and each empty argument
-// omits its own environment name.
-func EnvironmentWithConfig(inv Invocation, executorName, remoteURL, baseRemoteURL, baseBranch, opencodeBinary, opencodeFormat, terminationFile, opencodeAgent, evidenceURL, evidenceNonce string) []EnvVar {
+// omits its own environment name. identity is the deployment-configured git
+// author/committer identity; empty fields resolve to the explicit default
+// (#317).
+func EnvironmentWithConfig(inv Invocation, executorName, remoteURL, baseRemoteURL, baseBranch, opencodeBinary, opencodeFormat, terminationFile, opencodeAgent, evidenceURL, evidenceNonce string, identity GitIdentity) []EnvVar {
 	values := []EnvVar{{Name: "COURIER_EXECUTOR", Value: executorName}}
 	values = append(values, RunContextEnvironment(inv)...)
 	values = append(values,
@@ -309,14 +425,8 @@ func EnvironmentWithConfig(inv Invocation, executorName, remoteURL, baseRemoteUR
 		EnvVar{Name: "COURIER_OPENCODE_FORMAT", Value: opencodeFormat},
 		EnvVar{Name: "COURIER_OPENCODE_AGENT", Value: opencodeAgent},
 		EnvVar{Name: "COURIER_TERMINATION_FILE", Value: terminationFile},
-		// The coordinator commits completed work in the cloned repository. A
-		// fresh clone has no git identity, so provide a stable non-secret
-		// identity without requiring mutable image configuration.
-		EnvVar{Name: "GIT_AUTHOR_NAME", Value: "Courier"},
-		EnvVar{Name: "GIT_AUTHOR_EMAIL", Value: "courier@localhost"},
-		EnvVar{Name: "GIT_COMMITTER_NAME", Value: "Courier"},
-		EnvVar{Name: "GIT_COMMITTER_EMAIL", Value: "courier@localhost"},
 	)
+	values = append(values, identity.Environment()...)
 	if strings.TrimSpace(evidenceURL) != "" {
 		values = append(values, EnvVar{Name: EnvEvidenceURL, Value: evidenceURL})
 	}

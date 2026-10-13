@@ -1644,6 +1644,33 @@ named items remain unresolved and must not be described as production-ready:
 
 ## Decisions
 
+- **2026-10-13 — #317: git commit identity is deployment configuration,
+  never a hard-coded value or a token-derived one.** Operator-managed
+  executor pods injected `Courier <courier@localhost>` explicitly, and the
+  explicit container environment beat the envFrom executor Secret, so no
+  deployment could associate its commits with a forge account (PR #301's
+  commits resolved to a null author and committer on GitHub). Four operator
+  flags — `--git-author-name`, `--git-author-email`, `--git-committer-name`,
+  `--git-committer-email` — flow through `executor.PodConfig.Git`
+  (`GitIdentity`) into the four `GIT_*` variables of every generated
+  coordinator pod. Empty or whitespace-only fields resolve to the same
+  explicit default `Courier <courier@localhost>`, so default behavior is
+  backward compatible; configured values are validated fail-closed at startup
+  and at pod generation (no ASCII control characters or angle brackets; a
+  non-empty email must contain `@` and carry no whitespace). Precedence: operator flags are
+  explicit container env and therefore win over same-named keys of
+  `--executor-environment-secret` (Kubernetes env-over-envFrom), while the
+  standalone executor keeps the opposite order — a non-empty `GIT_*` in its
+  environment (shell export or Secret) is preserved and only unset or blank
+  names receive the fallback, and the fallback reads the executor package's
+  default constants so the two producers cannot drift. Authorship stays a
+  separate concern from forge authentication: nothing derives identity from
+  a token and no account is hard-coded upstream; GitHub links a commit to an
+  account only through an account-associated email, and attribution is
+  separate from commit signing. Secure mode's integration identity in
+  `internal/git` is control's own plumbing identity and is unchanged by this
+  decision. (#317)
+
 - **2026-10-13 — #280: the acceptance-criterion set is pinned at admission
   by a trusted forge read and carried, never re-derived.** The identification
   boundary of #249: secure admission reads the source issue through the
