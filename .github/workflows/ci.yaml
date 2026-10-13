@@ -30,6 +30,13 @@ jobs:
             echo "generated code is stale; run 'make manifests generate' and commit"; \
             exit 1; }
 
+      - name: Verify go.sum is tidy
+        run: |
+          go mod tidy -diff
+          git diff --exit-code go.mod go.sum || { \
+            echo "go.mod or go.sum is not what 'go mod tidy' would produce; run 'go mod tidy' and commit"; \
+            exit 1; }
+
       - name: Check formatting
         run: |
           unformatted="$(gofmt -l .)"
