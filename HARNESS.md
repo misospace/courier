@@ -498,7 +498,10 @@ new trusted operator-side capability; the dispatch task and the immutable
 `ExtractCriteria`, a pure, deterministic parser: criteria are the top-level
 bullet items of the issue's single `Acceptance` section (`## Acceptance`,
 `**Acceptance:**`, or `Acceptance:`; task-list checkboxes accepted), ending
-at the next heading-like line. Each criterion gets an ordinal ID (`AC-1`,
+at the next heading-like line — an ATX heading, a bold label, or a bare
+`Label:` line standing alone; prose with content after a colon is not a
+heading, so unindented prose inside the section neither ends it nor
+truncates the criteria. Each criterion gets an ordinal ID (`AC-1`,
 `AC-2`, …) and a sha256 digest of its normalized text; the set digest
 covers the trusted issue identity plus every criterion digest in order.
 No recognizable section, or a section with no bullets, pins an **empty
@@ -549,7 +552,10 @@ missing, added, duplicated, or unknown IDs); per-row digest agreement with
 the pin; the per-status reference shapes; and coverage honesty — `full` is
 *derived* (every pinned criterion present exactly once and recorded
 `regression-check` with a citable location) and the header's claim must
-match the derivation. That last rule is the mechanically caught form of
+match the derivation. Inside a block's contiguous row list, a line shaped
+like an AC row that does not parse is an explicit malformed-row rejection,
+never silent prose that ends the block — a trailing invented or malformed
+row must not fail open. That last rule is the mechanically caught form of
 "assert a weaker check as if it demonstrated the full requirement", and the
 reference shape rule is the mechanically caught form of "no test
 represented as regression-enforced". The validator **does not and must not

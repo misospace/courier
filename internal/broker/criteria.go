@@ -421,7 +421,11 @@ func parseEvidenceBlock(body string) (*CriteriaReport, error) {
 		}
 		// Rows follow the header: consecutive "- AC-n" lines, blank
 		// lines allowed between them; any other non-blank line ends the
-		// block.
+		// block. A line shaped like an AC row that does not parse — an
+		// unknown status token, a malformed digest, a stray duplicate —
+		// is an explicit malformed-row rejection, never a silent block
+		// terminator: otherwise a trailing invented or malformed row
+		// after otherwise-valid rows would fail open as prose.
 		for _, next := range lines[i+1:] {
 			next = strings.TrimRight(next, " \t")
 			if strings.TrimSpace(next) == "" {
@@ -429,6 +433,9 @@ func parseEvidenceBlock(body string) (*CriteriaReport, error) {
 			}
 			rm := criteriaRowPattern.FindStringSubmatch(next)
 			if rm == nil {
+				if strings.HasPrefix(strings.TrimSpace(next), "- AC-") {
+					return nil, fmt.Errorf("publication denied: criterion-evidence block contains a malformed row: %s", truncateForRowEcho(next))
+				}
 				break
 			}
 			if len(report.Records) >= MaxBlockRows {
@@ -522,17 +529,26 @@ func describeCriteriaFailure(e *CriteriaError) string {
 // --- extraction helpers ---
 
 // isHeadingLine reports whether a trimmed line is heading-like: an ATX
-// heading or a bold label line ("**Acceptance:**", "**Problem:**"). Bold
+// heading, a bold label line ("**Acceptance:**", "**Problem:**"), or a bare
+// label line ("Acceptance:", "Notes:") standing alone — the label word(s)
+// plus an optional trailing colon and nothing after it. Bold and bare
 // labels end a section so a later section's bullets are never swallowed as
-// criteria.
+// criteria. A line with content after the colon ("Note: see the build
+// docs") is prose, never a heading, so unindented prose inside the
+// acceptance section neither ends it nor truncates the criteria.
 func isHeadingLine(trimmed string) bool {
 	if strings.HasPrefix(trimmed, "#") {
 		return true
 	}
-	return boldLabelPattern.MatchString(trimmed)
+	return boldLabelPattern.MatchString(trimmed) || bareLabelPattern.MatchString(trimmed)
 }
 
-var boldLabelPattern = regexp.MustCompile(`^\*\*[^*]+\*\*:?$`)
+var (
+	boldLabelPattern = regexp.MustCompile(`^\*\*[^*]+\*\*:?$`)
+	// A bare label requires the trailing colon so ordinary short prose
+	// ("continued line") is never mistaken for a heading.
+	bareLabelPattern = regexp.MustCompile(`^[A-Za-z][A-Za-z0-9 _/&-]{0,31}:$`)
+)
 
 // isAcceptanceHeading reports whether a heading-like line names the
 // acceptance section, after stripping ATX markers, bold wrappers, and an
@@ -562,6 +578,17 @@ func stripBulletMarker(trimmed string) string {
 
 func stripCheckboxMarker(text string) string {
 	return strings.TrimSpace(checkboxPattern.ReplaceAllString(text, ""))
+}
+
+// normalizeCriterionText canonicalizes a criterion's text for digesting:
+// truncateForRowEcho bounds the malformed-row echo in rejection reasons so
+// an oversized hostile row cannot inflate diagnostics.
+func truncateForRowEcho(line string) string {
+	const echoBound = 120
+	if len(line) <= echoBound {
+		return line
+	}
+	return line[:echoBound] + "…"
 }
 
 // normalizeCriterionText canonicalizes a criterion's text for digesting:

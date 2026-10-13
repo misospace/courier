@@ -225,6 +225,46 @@ func TestValidateCriterionEvidenceHonestHandoffFull(t *testing.T) {
 	}
 }
 
+// TestHonestHandoffPlusTrailingMalformedRowFails is the exact-head
+// regression for the fail-open trailing-row defect (review finding on
+// #283): appending a row-shaped line that does not parse to the
+// otherwise-valid honest-full body must be rejected. Before the fix, the
+// row ended the block as prose and the body validated, silently dropping
+// the invented criterion and the duplicate from coverage enforcement.
+func TestHonestHandoffPlusTrailingMalformedRowFails(t *testing.T) {
+	set := pinMisoGallerySet(t)
+	honest := loadFixture(t, "miso-gallery-505-pr-honest.md")
+	cases := []struct {
+		name string
+		line string
+	}{
+		{
+			name: "invented AC-4 with an unknown status token",
+			line: "- AC-4 sha256:" + strings.Repeat("0", 64) + ": definitely-done - tests/foo.py",
+		},
+		{
+			name: "malformed duplicate AC-3",
+			line: "- AC-3 " + set.Criteria[2].Digest + ": verified-by-vibes - tests/foo.py",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if _, err := ValidateCriterionEvidence(honest+"\n"+tc.line+"\n", set); err == nil {
+				t.Fatalf("honest-full body with appended %q validated; want malformed-row rejection", tc.line)
+			} else if !strings.Contains(err.Error(), "malformed row") {
+				t.Fatalf("want malformed-row rejection, got: %v", err)
+			}
+		})
+	}
+	// A well-formed appended duplicate still fails through the duplicate
+	// rule rather than the malformed-row rule.
+	duplicate := "\n" + "- AC-3 " + set.Criteria[2].Digest + ": regression-check - tests/x.py\n"
+	_, err := ValidateCriterionEvidence(honest+duplicate, set)
+	if err == nil || !strings.Contains(err.Error(), "duplicate rows for AC-3") {
+		t.Fatalf("well-formed appended duplicate should fail as duplicate, got: %v", err)
+	}
+}
+
 // TestValidateCriterionEvidenceHonestHandoffPartial accepts the honest
 // partial record: AC-2 is verified by hand and recorded manual-verification
 // with coverage=partial. Unverified criteria stay visible; the run simply
@@ -292,6 +332,32 @@ func TestExtractCriteriaGrammar(t *testing.T) {
 			name: "crlf bodies extract identically",
 			body: "**Acceptance:**\r\n- One.\r\n- Two.\r\n",
 			want: []string{"One.", "Two."},
+		},
+		{
+			// The documented bare-label form: a plain "Acceptance:" line
+			// opens the section. Before bare labels were recognized, such
+			// an issue pinned a silent empty set and the whole evidence
+			// contract was vacuously satisfied (review finding on #283).
+			name: "bare acceptance label recognized",
+			body: "Intro prose.\n\nAcceptance:\n- First criterion.\n- Second criterion.\n",
+			want: []string{"First criterion.", "Second criterion."},
+		},
+		{
+			// A bare label standing alone ends the section exactly as a
+			// bold label does, so a later section's bullets are never
+			// swallowed as criteria.
+			name: "bare notes and evidence labels end the section",
+			body: "Acceptance:\n- Criterion one.\n\nNotes:\n- Not a criterion.\n\nEvidence:\n- Also not a criterion.\n",
+			want: []string{"Criterion one."},
+		},
+		{
+			// Prose with content after the colon is not a bare label: it
+			// neither opens nor ends a section, so criteria before and
+			// after it stay pinned — the fix must not trade the silent
+			// bypass for silent under-collection.
+			name: "colon prose inside the section is not a heading",
+			body: "Acceptance:\n- Criterion one.\nNote: also handle the edge case.\n- Criterion two.\n",
+			want: []string{"Criterion one.", "Criterion two."},
 		},
 	}
 	for _, tc := range cases {
@@ -450,7 +516,27 @@ func TestValidateCriterionEvidenceTruthTable(t *testing.T) {
 		{
 			name:    "unknown status token refused as a row",
 			body:    baseBlock(CoverageFull, "- AC-1 "+set.Criteria[0].Digest+": definitely-done - tests/x.py", ac2+": regression-check - tests/x.py", ac3+": regression-check - tests/x.py"),
-			wantErr: "criterion evidence missing for AC-1",
+			wantErr: "malformed row",
+		},
+		{
+			// A trailing row-shaped line after otherwise-valid rows used to
+			// end the block as prose and fail open: an invented AC-4 with
+			// an unknown status token validated a coverage=full block
+			// (review finding on PR #283).
+			name:    "trailing malformed row after valid rows refused",
+			body:    baseBlock(CoverageFull, row("AC-1", set.Criteria[0].Digest, StatusRegressionCheck, "tests/x.py"), row("AC-2", set.Criteria[1].Digest, StatusRegressionCheck, "tests/x.py"), row("AC-3", set.Criteria[2].Digest, StatusRegressionCheck, "tests/x.py")) + "\n- AC-4 sha256:" + strings.Repeat("0", 64) + ": definitely-done - tests/foo.py",
+			wantErr: "malformed row",
+		},
+		{
+			name:    "trailing row-shaped garbage refused",
+			body:    baseBlock(CoverageFull, row("AC-1", set.Criteria[0].Digest, StatusRegressionCheck, "tests/x.py"), row("AC-2", set.Criteria[1].Digest, StatusRegressionCheck, "tests/x.py"), row("AC-3", set.Criteria[2].Digest, StatusRegressionCheck, "tests/x.py")) + "\n- AC-",
+			wantErr: "malformed row",
+		},
+		{
+			// Ordinary prose after the block stays allowed; only row-shaped
+			// lines inside the contiguous row list are rejections.
+			name: "prose after the block still ends it silently",
+			body: baseBlock(CoverageFull, row("AC-1", set.Criteria[0].Digest, StatusRegressionCheck, "tests/x.py"), row("AC-2", set.Criteria[1].Digest, StatusRegressionCheck, "tests/x.py"), row("AC-3", set.Criteria[2].Digest, StatusRegressionCheck, "tests/x.py")) + "\n\nThe `.dockerignore` invariant is discussed above.",
 		},
 	}
 	for _, tc := range cases {
