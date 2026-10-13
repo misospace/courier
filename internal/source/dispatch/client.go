@@ -17,10 +17,16 @@ import (
 	"time"
 
 	"github.com/misospace/courier/internal/source"
+	"sigs.k8s.io/controller-runtime/pkg/log"
 )
 
 const (
 	defaultTimeout = 30 * time.Second
+
+	// maxPRFixExclusions is the Dispatch server contract ceiling on
+	// exclude_pr_fix entries per request; requests beyond it are rejected
+	// server-side, so the client truncates instead.
+	maxPRFixExclusions = 32
 
 	// outcomeWaitingExternal is the Dispatch task-report outcome Courier
 	// sends for a recoverable dependency block (source.ResultBlockedExternal).
@@ -192,12 +198,20 @@ func (c *HTTPClient) Discover(ctx context.Context) ([]source.WorkItem, error) {
 	return c.discover(ctx, nil)
 }
 
+// DiscoverExcluding discovers work while asking Dispatch to skip the excluded
+// PR-fix attempts. Exclusions arrive most-relevant-first from the runner; when
+// more unique valid entries qualify than the server contract allows, the most
+// relevant head is kept and the tail is dropped with a warning — an overflow
+// must degrade discovery, not starve it (#286). Dropped entries may be
+// re-offered; the runner's same-identity dedupe absorbs the repeat without a
+// duplicate run.
 func (c *HTTPClient) DiscoverExcluding(ctx context.Context, exclusions []source.WorkItem) ([]source.WorkItem, error) {
 	if !c.prFixExclusionsEnabled || len(exclusions) == 0 {
 		return c.Discover(ctx)
 	}
 	query := url.Values{"exclude_pr_fix_version": {"1"}}
 	seen := make(map[string]struct{})
+	values := make([]string, 0, min(len(exclusions), maxPRFixExclusions))
 	for _, item := range exclusions {
 		d, err := decodeWorkID(item.ID)
 		if err != nil || d.Type != "followup-pr" || d.PRFixID == "" || d.Generation < 1 || d.Repo == "" {
@@ -215,12 +229,17 @@ func (c *HTTPClient) DiscoverExcluding(ctx context.Context, exclusions []source.
 			continue
 		}
 		seen[value] = struct{}{}
-		if len(seen) > 32 {
-			return nil, fmt.Errorf("dispatch client: PR-fix exclusions exceed maximum 32")
+		if len(seen) <= maxPRFixExclusions {
+			values = append(values, value)
 		}
+	}
+	if dropped := len(seen) - maxPRFixExclusions; dropped > 0 {
+		log.FromContext(ctx).Info("dispatch client: PR-fix exclusions exceed contract maximum, keeping the most relevant", "agent", c.agentName, "kept", maxPRFixExclusions, "dropped", dropped)
+	}
+	for _, value := range values {
 		query.Add("exclude_pr_fix", value)
 	}
-	if len(seen) == 0 {
+	if len(values) == 0 {
 		return c.Discover(ctx)
 	}
 	return c.discover(ctx, query)
@@ -423,13 +442,13 @@ func (c *HTTPClient) markPRFixStale(ctx context.Context, pullRequest *PullReques
 	if state.Merged {
 		note = "upstream pull request is merged"
 	}
-	return c.do(ctx, http.MethodPost, "/api/pr-fix-queue/mark", map[string]any{
+	return asSuperseded(c.do(ctx, http.MethodPost, "/api/pr-fix-queue/mark", map[string]any{
 		"repo":       pullRequest.Repo,
 		"pr":         pullRequest.Number,
 		"status":     "STALE",
 		"note":       note,
 		"generation": generation,
-	}, nil)
+	}, nil))
 }
 
 func (c *HTTPClient) reportTaskWithPR(ctx context.Context, d workDescriptor, outcome, failure, observedPR, idempotencyKey string, telemetry json.RawMessage, startedAt *time.Time) error {
