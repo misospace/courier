@@ -1571,6 +1571,35 @@ named items remain unresolved and must not be described as production-ready:
 
 ## Decisions
 
+- **2026-10-13 — #243: the harness owns a per-role context budget and compacts
+  before the ceiling at a step boundary; the effective limit is the minimum of
+  the declared budget and the gateway-verified model input capability, never an
+  implicit default.** Today the native harness declares no budget and the
+  OpenCode executor's auto-compaction fires reactively at its own threshold, so
+  a worker can ride its prompt past the bound model alias's input limit and
+  LiteLLM diverts the oversize request to a fallback alias before compaction
+  lands — capacity management by accident. The settled policy: (a) an optional
+  `LaneProfileSpec.context` per-role budget (`compactAtPercent` default 75,
+  `outputReservation`, and per-role `maxInputTokens`/overrides), absent meaning
+  the harness owns no budget and the executor default stands; (b) effective
+  limit `= min(declared, gateway-verified)`, where a verified read is `healthy`,
+  a declared-only ceiling is `configured` (never healthy), and neither is an
+  explicit failure — no implicit context-window fallback is treated as
+  successful capacity management; (c) a pre-ceiling step-boundary trigger at
+  `floor(effective × compactAtPercent / 100)` or when the next turn plus the
+  output reservation would cross the effective limit, with the post-condition
+  `prompt + reservation ≤ effective` and fail-closed behavior when it cannot
+  hold or when a digest reclaims no tokens (`After < Before`); (d) digest-not-prune compaction that never drops the pinned brief,
+  settled `Decision`s, `OwnedFiles`, or the most recent turn, with the §7
+  checkpoint ladder as the durable record, and a `session.compacted` run event
+  carrying before/after/reclaimed token counts. The pure resolution, trigger,
+  and preservation policy and its truth table land in
+  `internal/harness/budget.go` / `internal/harness/budget_test.go`. The
+  per-brief spawn budget stays out of scope, and the OpenCode default is
+  unchanged — a legacy mitigation is a separate bounded ticket. Implementation
+  is three bounded children (#295 schema + bootstrap mirror, #296 gateway probe
+  + effective-limit resolution, #297 step-boundary enforcement + telemetry).
+  (#243)
 - **2026-10-12 — #249: one executor-neutral acceptance-criterion evidence
   contract is enforced in both publication paths against a revision-pinned
   trusted snapshot of the source issue.** Admission reads the source issue

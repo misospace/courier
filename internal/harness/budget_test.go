@@ -1,0 +1,313 @@
+package harness
+
+import (
+	"errors"
+	"strings"
+	"testing"
+
+	"github.com/misospace/courier/internal/log"
+)
+
+// The shared behavioral truth table for the context-budget and step-boundary
+// compaction policy (#243). It is the source of truth for the four settled
+// choices: per-role budget resolution, effective limit = min(declared,
+// gateway-verified), the pre-ceiling step-boundary trigger with output
+// reservation, and digest selection that preserves settled state. The CRD
+// field, the gateway probe, the session loop, and the session.compacted
+// emitter are bounded implementation children (#295, #296, #297); this table
+// proves the pure policy they will call, and deliberately proves nothing about
+// their wiring.
+
+func TestResolveContextBudgetTruthTable(t *testing.T) {
+	tests := []struct {
+		name      string
+		in        ContextBudgetInput
+		wantState string
+		wantLimit int
+		wantPoint int
+		wantErr   error
+	}{
+		{
+			name:      "declared and verified take the lower gateway limit",
+			in:        ContextBudgetInput{Role: "coder", DeclaredMaxInputTokens: 100000, ProbedMaxInputTokens: 80000, CompactAtPercent: 75},
+			wantState: StateHealthy, wantLimit: 80000, wantPoint: 60000,
+		},
+		{
+			name:      "declared ceiling lowers a higher gateway limit",
+			in:        ContextBudgetInput{Role: "coder", DeclaredMaxInputTokens: 60000, ProbedMaxInputTokens: 80000, CompactAtPercent: 75},
+			wantState: StateHealthy, wantLimit: 60000, wantPoint: 45000,
+		},
+		{
+			name:      "verified only uses the gateway limit and default fraction",
+			in:        ContextBudgetInput{Role: "reviewer", ProbedMaxInputTokens: 128000},
+			wantState: StateHealthy, wantLimit: 128000, wantPoint: 96000,
+		},
+		{
+			name:      "declared only is configured, never healthy",
+			in:        ContextBudgetInput{Role: "coordinator", DeclaredMaxInputTokens: 100000},
+			wantState: StateConfigured, wantLimit: 100000, wantPoint: 75000,
+		},
+		{
+			name:    "neither declared nor verified fails closed",
+			in:      ContextBudgetInput{Role: "coder"},
+			wantErr: ErrNoContextCapacity,
+		},
+		{
+			name:      "explicit compact fraction",
+			in:        ContextBudgetInput{Role: "coder", DeclaredMaxInputTokens: 1000, CompactAtPercent: 90},
+			wantState: StateConfigured, wantLimit: 1000, wantPoint: 900,
+		},
+		{
+			name:      "reservation below the fraction does not move the point",
+			in:        ContextBudgetInput{Role: "coder", DeclaredMaxInputTokens: 1000, CompactAtPercent: 75, OutputReservation: 100},
+			wantState: StateConfigured, wantLimit: 1000, wantPoint: 750,
+		},
+		{
+			name:      "minimum compact fraction",
+			in:        ContextBudgetInput{Role: "coder", DeclaredMaxInputTokens: 1000, CompactAtPercent: 1},
+			wantState: StateConfigured, wantLimit: 1000, wantPoint: 10,
+		},
+		{
+			name:      "maximum compact fraction",
+			in:        ContextBudgetInput{Role: "coder", DeclaredMaxInputTokens: 1000, CompactAtPercent: 99},
+			wantState: StateConfigured, wantLimit: 1000, wantPoint: 990,
+		},
+		{
+			name:      "declared equal to verified stays healthy at the shared limit",
+			in:        ContextBudgetInput{Role: "coder", DeclaredMaxInputTokens: 80000, ProbedMaxInputTokens: 80000, CompactAtPercent: 75},
+			wantState: StateHealthy, wantLimit: 80000, wantPoint: 60000,
+		},
+		{
+			name:    "compact fraction at the ceiling is rejected",
+			in:      ContextBudgetInput{Role: "coder", DeclaredMaxInputTokens: 1000, CompactAtPercent: 100},
+			wantErr: errors.New("compactAtPercent"),
+		},
+		{
+			name:    "negative verified limit is rejected",
+			in:      ContextBudgetInput{Role: "coder", ProbedMaxInputTokens: -1},
+			wantErr: errors.New("negative token limit"),
+		},
+		{
+			name:    "reservation at the limit leaves no input room",
+			in:      ContextBudgetInput{Role: "coder", DeclaredMaxInputTokens: 1000, CompactAtPercent: 75, OutputReservation: 1000},
+			wantErr: ErrContextReservation,
+		},
+		{
+			name:    "negative declared limit is rejected",
+			in:      ContextBudgetInput{Role: "coder", DeclaredMaxInputTokens: -1, ProbedMaxInputTokens: 1000},
+			wantErr: errors.New("negative token limit"),
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := ResolveContextBudget(tt.in)
+			if tt.wantErr != nil {
+				if err == nil {
+					t.Fatalf("expected error matching %v, got nil (%+v)", tt.wantErr, got)
+				}
+				if !errors.Is(err, tt.wantErr) && !strings.Contains(err.Error(), tt.wantErr.Error()) {
+					t.Fatalf("error %v does not match %v", err, tt.wantErr)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if got.State != tt.wantState || got.EffectiveLimit != tt.wantLimit || got.CompactPoint != tt.wantPoint {
+				t.Fatalf("resolved %+v, want state=%s limit=%d point=%d", got, tt.wantState, tt.wantLimit, tt.wantPoint)
+			}
+			if got.OutputReservation != tt.in.OutputReservation {
+				t.Fatalf("reservation = %d, want %d", got.OutputReservation, tt.in.OutputReservation)
+			}
+		})
+	}
+}
+
+func TestContextBudgetShouldCompactTruthTable(t *testing.T) {
+	resolved := func(t *testing.T, in ContextBudgetInput) ContextBudget {
+		t.Helper()
+		budget, err := ResolveContextBudget(in)
+		if err != nil {
+			t.Fatalf("resolve: %v", err)
+		}
+		return budget
+	}
+	fraction := resolved(t, ContextBudgetInput{Role: "coder", DeclaredMaxInputTokens: 1000, CompactAtPercent: 75, OutputReservation: 100})
+	reservation := resolved(t, ContextBudgetInput{Role: "coder", DeclaredMaxInputTokens: 1000, CompactAtPercent: 99, OutputReservation: 200})
+
+	tests := []struct {
+		name   string
+		budget ContextBudget
+		tokens int
+		want   bool
+	}{
+		{name: "no budget never triggers", budget: ContextBudget{}, tokens: 1000000, want: false},
+		{name: "below the fraction", budget: fraction, tokens: 749, want: false},
+		{name: "at the fraction", budget: fraction, tokens: 750, want: true},
+		{name: "above the fraction", budget: fraction, tokens: 900, want: true},
+		{name: "below the fraction and the reservation fits", budget: reservation, tokens: 700, want: false},
+		{name: "below the fraction but the reservation would cross the ceiling", budget: reservation, tokens: 850, want: true},
+		{name: "reservation exactly at the ceiling does not trigger", budget: reservation, tokens: 800, want: false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := tt.budget.ShouldCompact(tt.tokens); got != tt.want {
+				t.Fatalf("ShouldCompact(%d) with %+v = %v, want %v", tt.tokens, tt.budget, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestPlanCompactionTruthTable(t *testing.T) {
+	budget := func(t *testing.T, declared, percent, reservation int) ContextBudget {
+		t.Helper()
+		b, err := ResolveContextBudget(ContextBudgetInput{Role: "coder", DeclaredMaxInputTokens: declared, CompactAtPercent: percent, OutputReservation: reservation})
+		if err != nil {
+			t.Fatalf("resolve: %v", err)
+		}
+		return b
+	}
+
+	tests := []struct {
+		name          string
+		in            CompactionInput
+		wantCompacted bool
+		wantDigested  []int
+		wantRetained  []int
+		wantAfter     int
+		wantReclaimed int
+		wantErr       error
+	}{
+		{
+			name: "within budget is unchanged",
+			in: CompactionInput{
+				MessageTokens: []int{100, 100}, Protected: []bool{true, false}, DigestTokens: 10,
+				Budget: budget(t, 1000, 75, 100),
+			},
+			wantCompacted: false, wantRetained: []int{0}, wantAfter: 200,
+		},
+		{
+			name: "at the fraction digests the oldest non-protected turn until it fits",
+			in: CompactionInput{
+				MessageTokens: []int{500, 300, 200}, DigestTokens: 50,
+				Budget: budget(t, 1000, 75, 100),
+			},
+			wantCompacted: true, wantDigested: []int{0}, wantAfter: 550, wantReclaimed: 500,
+		},
+		{
+			name: "protected turns are never digested",
+			in: CompactionInput{
+				MessageTokens: []int{600, 100, 300}, Protected: []bool{true, false, false}, DigestTokens: 50,
+				Budget: budget(t, 1000, 75, 100),
+			},
+			wantCompacted: true, wantDigested: []int{1, 2}, wantRetained: []int{0}, wantAfter: 650, wantReclaimed: 400,
+		},
+		{
+			name: "protected state that cannot fit fails closed",
+			in: CompactionInput{
+				MessageTokens: []int{900, 50}, Protected: []bool{true, false}, DigestTokens: 50,
+				Budget: budget(t, 1000, 75, 100),
+			},
+			wantErr: ErrCompactionCannotFit,
+		},
+		{
+			name: "an all-protected transcript that cannot fit fails closed",
+			in: CompactionInput{
+				MessageTokens: []int{500, 500}, Protected: []bool{true, true}, DigestTokens: 10,
+				Budget: budget(t, 1000, 75, 100),
+			},
+			wantErr: ErrCompactionCannotFit,
+		},
+		{
+			name: "a digest costlier than what it reclaims fails closed",
+			in: CompactionInput{
+				MessageTokens: []int{10, 10}, DigestTokens: 100,
+				Budget: budget(t, 20, 75, 0),
+			},
+			wantErr: ErrCompactionCannotFit,
+		},
+		{
+			name: "a digest that reclaims nothing fails closed",
+			in: CompactionInput{
+				MessageTokens: []int{80}, DigestTokens: 80,
+				Budget: budget(t, 100, 75, 0),
+			},
+			wantErr: ErrCompactionCannotFit,
+		},
+		{
+			name: "an empty transcript is unchanged",
+			in: CompactionInput{
+				Budget: budget(t, 100, 75, 0),
+			},
+			wantCompacted: false, wantAfter: 0,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := PlanCompaction(tt.in)
+			if tt.wantErr != nil {
+				if !errors.Is(err, tt.wantErr) {
+					t.Fatalf("error = %v, want %v", err, tt.wantErr)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if got.Compacted != tt.wantCompacted {
+				t.Fatalf("Compacted = %v, want %v (%+v)", got.Compacted, tt.wantCompacted, got)
+			}
+			if !equalInts(got.Digested, tt.wantDigested) {
+				t.Fatalf("Digested = %v, want %v", got.Digested, tt.wantDigested)
+			}
+			if !equalInts(got.Retained, tt.wantRetained) {
+				t.Fatalf("Retained = %v, want %v", got.Retained, tt.wantRetained)
+			}
+			if got.After != tt.wantAfter {
+				t.Fatalf("After = %d, want %d", got.After, tt.wantAfter)
+			}
+			if got.Reclaimed != tt.wantReclaimed {
+				t.Fatalf("Reclaimed = %d, want %d", got.Reclaimed, tt.wantReclaimed)
+			}
+			if got.Compacted && !tt.in.Budget.FitsAfterCompaction(got.After) {
+				t.Fatalf("post-condition violated: After %d + reservation %d > effective %d", got.After, tt.in.Budget.OutputReservation, tt.in.Budget.EffectiveLimit)
+			}
+			for _, index := range got.Digested {
+				if protectedAt(tt.in.Protected, index) {
+					t.Fatalf("digested protected message index %d", index)
+				}
+			}
+		})
+	}
+}
+
+func TestFitsAfterCompactionBoundary(t *testing.T) {
+	budget, err := ResolveContextBudget(ContextBudgetInput{Role: "coder", DeclaredMaxInputTokens: 1000, CompactAtPercent: 75, OutputReservation: 200})
+	if err != nil {
+		t.Fatalf("resolve: %v", err)
+	}
+	if !budget.FitsAfterCompaction(800) {
+		t.Fatalf("800 + 200 should fit 1000")
+	}
+	if budget.FitsAfterCompaction(801) {
+		t.Fatalf("801 + 200 must not fit 1000")
+	}
+}
+
+func TestSessionCompactedEventVocabulary(t *testing.T) {
+	if log.EventSessionCompacted != "session.compacted" {
+		t.Fatalf("log event = %q", log.EventSessionCompacted)
+	}
+}
+
+func equalInts(a, b []int) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
