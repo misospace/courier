@@ -549,14 +549,15 @@ open:
 
 - Discovery attempt/success/failure signal names and units — settled by #290
   (`courier_source_discovery_attempts_total`, `..._successes_total`,
-  `..._failures_total`, with `..._skipped_total` and `..._paused_total` for
-  pre-call skips).
+  `..._failures_total`, with `..._paused_total` counting polls skipped before
+  the source was called, not as attempts).
 - The source-level state model separating idle from degraded — settled by #290
   (`disabled`/`starting`/`ok`/`degraded`/`unavailable`/`unknown`, with pausing
   orthogonal).
 - Connector capability negotiation and how dashboards discover optional
   capabilities — settled by #291 (negotiation states plus a
-  `courier_connector_capability_info` discovery procedure).
+  `courier_connector_capability_info` discovery procedure; how that catalogue is
+  emitted is still open below).
 - Reservation staleness as a first-class condition — settled by #290 as a
   condition backed by a reservation-age signal.
 - Per-phase timing and token metrics with bounded dimensions — settled by #290
@@ -569,6 +570,8 @@ Still open on the siblings' own unknown lists, and consumed as such:
   no-progress (#290).
 - Whether per-phase duration and token counters ship in a first cut or after
   the discovery/lane layer (#290).
+- Whether the connector capability catalogue is a scrape-time gauge, a startup
+  event, or both (#291).
 
 ## 8. Units, aggregation, and reset semantics
 
