@@ -1583,6 +1583,20 @@ named items remain unresolved and must not be described as production-ready:
 
 ## Decisions
 
+- **2026-10-13 — #210: `COURIER_TERMINATION` line budgeting lives in one place; both
+  producers (`courier-executor`, `courier-control`) call it.** The native
+  control handoff built its reason from capability detail strings with no
+  byte bound, so an escape-heavy reason (every `<`, `>`, `&` becomes a
+  six-byte `\uXXXX`) could push the marshaled line past Kubernetes' 4 KiB
+  pod termination-message budget and lose the entire trusted handoff —
+  the same failure mode #188 fixed for the executor. Both producers now
+  call `internal/executor.FitTerminationLine` and `MarshalTerminationLine`
+  for marshaling and the line fit; the wire prefix, the budget, and the
+  truncation marker are constants in one place, so the two producers
+  cannot drift. The executor keeps its summary-shrink loop (which is
+  specific to the OpenCode telemetry path) and delegates the reason-shrink
+  step to the shared helper; the control uses the shared helper
+  end-to-end. (#210, #188)
 - **2026-10-12 — #249: one executor-neutral acceptance-criterion evidence
   contract is enforced in both publication paths against a revision-pinned
   trusted snapshot of the source issue.** Admission reads the source issue
