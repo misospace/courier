@@ -1954,3 +1954,70 @@ func TestCacheDisagreementAtCeilingHandsOffWithPodLossCause(t *testing.T) {
 		t.Fatalf("reported error = %q, want the pod-loss cause; the live read confirmed the coordinator object is gone", src.reports[0].Error)
 	}
 }
+
+// runShellPod is a run-owned pod without the coordinator container — the
+// shape a secure round's worker or broker has. The wedge reap set is the
+// coordinator, so this pod must survive a coordinator wedge.
+func runShellPod(run *courierv1alpha1.CoderRun, name string) *corev1.Pod {
+	controller := true
+	return &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:              name,
+			Namespace:         run.Namespace,
+			UID:               types.UID(name),
+			CreationTimestamp: metav1.NewTime(livenessClock.Add(-2 * time.Hour)),
+			Labels:            map[string]string{executorRunLabel: run.Name},
+			OwnerReferences: []metav1.OwnerReference{{
+				APIVersion: courierv1alpha1.GroupVersion.String(),
+				Kind:       "CoderRun",
+				Name:       run.Name,
+				UID:        run.UID,
+				Controller: &controller,
+			}},
+		},
+		Spec: corev1.PodSpec{Containers: []corev1.Container{{Name: "worker", Image: "example/test"}}},
+		Status: corev1.PodStatus{
+			Phase: corev1.PodRunning,
+			ContainerStatuses: []corev1.ContainerStatus{{
+				Name:  "worker",
+				State: corev1.ContainerState{Running: &corev1.ContainerStateRunning{StartedAt: metav1.NewTime(livenessClock.Add(-2 * time.Hour))}},
+			}},
+		},
+	}
+}
+
+func TestWedgeReapLeavesNonCoordinatorRunPod(t *testing.T) {
+	src := &admissionSource{}
+	run := admissionRun("run", "local", courierv1alpha1.PhaseRunning)
+	withHeartbeat(run, livenessClock.Add(-10*time.Minute))
+	coordinator := runningCoordinatorPod(run)
+	coordinator.CreationTimestamp = metav1.NewTime(livenessClock.Add(-2 * time.Hour))
+	coordinator.Status.ContainerStatuses[0].State = corev1.ContainerState{
+		Waiting: &corev1.ContainerStateWaiting{Reason: "CrashLoopBackOff"},
+	}
+	shell := runShellPod(run, "run-worker")
+	c := phaseClient(t, run, coordinator, shell)
+	reconciler := livenessReconciler(c, src, livenessClock)
+
+	result, err := reconciler.Reconcile(context.Background(), admissionRequest("run"))
+	if err != nil {
+		t.Fatalf("Reconcile() error = %v", err)
+	}
+	if !result.Requeue {
+		t.Fatalf("Requeue = false, want true; a wedged coordinator must still relaunch")
+	}
+	var got corev1.Pod
+	if err := c.Get(context.Background(), types.NamespacedName{Name: "run-coordinator", Namespace: "default"}, &got); !apierrors.IsNotFound(err) {
+		t.Fatalf("get coordinator: %v, want NotFound after reap", err)
+	}
+	if err := c.Get(context.Background(), types.NamespacedName{Name: "run-worker", Namespace: "default"}, &got); err != nil {
+		t.Fatalf("get non-coordinator run pod: %v; the wedge reap set is the coordinator, not every run pod (#222)", err)
+	}
+	var updated courierv1alpha1.CoderRun
+	if err := c.Get(context.Background(), admissionKey("run"), &updated); err != nil {
+		t.Fatalf("get run: %v", err)
+	}
+	if updated.Status.Restarts != 1 {
+		t.Fatalf("restarts = %d, want exactly 1 for a single coordinator wedge", updated.Status.Restarts)
+	}
+}
