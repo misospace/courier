@@ -762,8 +762,9 @@ manifest, and rejects a non-empty sender UID that does not match the
 live run as a forged identity. The
 phase gate is
 an allowlist over **non-resolved versus resolved**: the intake accepts
-`Pending`, `Claimed`, `Running`, `Failed`, and `NeedsHuman`, and rejects
-`Verifying`, `AwaitingReview`, and `Done`. The admitted set is broad because
+`Pending`, `Claimed`, `Running`, `Failed`, `NeedsHuman`, and
+`BlockedExternal`, and rejects `Verifying`, `AwaitingReview`, and `Done`. The
+admitted set is broad because
 the operator moves runs around a dying pod: an ordinary liveness reap deletes
 the pod and writes `Claimed` in the same reconcile (and a failed relaunch can
 reach `Pending`) while the previous pod's SIGTERM grace capture is still in
@@ -812,12 +813,16 @@ in that window has its evidence already cleaned, and the re-read refuses
 to write a Secret for a phase the operator has world-proven as resolved.
 Access control is namespace RBAC: the operator gains
 `create/get/list/patch/delete` on `secrets` through a namespaced
-Role/RoleBinding rendered by the chart — deliberately not the generated
-operator ClusterRole, whose ClusterRoleBinding would widen the grant
-cluster-wide (`list` is required by the
-condition derivation and the AwaitingReview/Done cleanup; both use uncached
-API-reader lists) — see
-Security and boundaries. Encryption at rest is the deployment's cluster
+Role/RoleBinding rendered by the chart — deliberately not added to the
+generated operator ClusterRole, whose ClusterRoleBinding would widen the
+evidence verbs cluster-wide and attach them to installs that keep evidence
+disabled. The residual: the generated ClusterRole already
+carries `create/delete/get/list` on `secrets` cluster-wide for the secure-mode
+launcher, so against a shipped install the namespaced evidence grant's marginal
+verb is `patch`, which the intake uses to supersede a slot it already wrote
+(`list` is required by the condition derivation and the AwaitingReview/Done
+cleanup; both use uncached API-reader lists) — see Security and boundaries.
+Encryption at rest is the deployment's cluster
 configuration; Courier recommends enabling it. Status carries one condition,
 `EvidenceCaptured`, derived by the reconcile loop from the world through an
 **uncached** list (terminal runs rarely reconcile again, so a cached informer
@@ -1357,10 +1362,22 @@ that needs Dispatch-side queue exclusion. Where supported, discovery passes
 retained same-source work IDs as opaque exclusions when the Dispatch client is
 explicitly opted in; exclusion support defaults off and must be enabled only
 after deployment has confirmed the Dispatch contract. Enabled requests are
-bounded to 32 unique valid entries of 300 characters each, and every response
-must acknowledge `prFixExclusions.version: 1` before either a task or idle result
-is processed. Missing or malformed acknowledgements fail closed without retry or
-side effects. Exclusions are dedupe hints, not claims or ownership. While
+bounded to 32 unique valid entries of 300 characters each. The runner orders
+exclusions most-relevant-first — pre-terminal runs before terminal retained
+runs (whose attempts are usually settled; ranking is a truncation heuristic,
+not settlement authority, and a terminal run with a still-pending report ranks
+with the retained group), newest first within each group — so when more entries
+qualify than the cap allows, the client keeps the most relevant head and drops
+the tail with a warning instead of failing closed (#286); an exclusion overflow
+must degrade discovery, not starve it. Progress after truncation is a
+two-sided contract: Dispatch's per-agent, per-generation handout ledger scans
+past candidates the agent was already handed, and Courier's same-identity
+dedupe absorbs any re-offered truncated-out generation without materializing a
+duplicate run. Every response must acknowledge `prFixExclusions.version: 1`
+before either a task or idle result is processed. Missing or malformed
+acknowledgements fail
+closed without retry or side effects. Exclusions are dedupe hints, not claims
+or ownership. While
 discovery is paused, Dispatch `next-task` and stale-item bookkeeping are
 deferred until a later poll.
 
@@ -1504,15 +1521,19 @@ only informs.
   write-only evidence intake listener (in-cluster, token-gated, no read path)
   and holds namespaced Secret CRUD to persist evidence bundles. The evidence
   verbs are provisioned as a namespaced Role/RoleBinding in the chart,
-  deliberately never inside the generated operator ClusterRole, whose
-  ClusterRoleBinding would widen them cluster-wide. The authority expansion is
-  real but bounded: the chart's namespaced `credential-reader` Role already
-  grants the operator's service account `get` on every Secret in the namespace
-  (no `resourceNames`), so the evidence grant's marginal authority is `list`
-  and the mutating `create/patch/delete`. Deployments that cannot accept
-  Secret mutation should not enable evidence capture, and
-  reject-preservation remains the named fallback in the #115
-  design. Evidence content itself is model-authored untrusted data stored
+  deliberately never added to the generated operator ClusterRole, whose
+  ClusterRoleBinding would widen them cluster-wide and attach them to installs
+  that keep evidence disabled. The authority expansion is real but bounded.
+  The whole residual: the generated
+  ClusterRole already grants `create/delete/get/list` on `secrets` cluster-wide
+  for the secure-mode launcher, and the chart's namespaced `credential-reader`
+  Role grants the operator's service account `get` on every Secret in the run
+  namespace (no `resourceNames`), so the evidence Role's marginal verb against a
+   shipped install is `patch` — the intake's supersede path. Evidence capture
+   therefore adds one verb and no new read, create, or delete surface to an
+   operator that already mutates Secrets, alongside the intake listener and the
+   run-owned Secret shape, and reject-preservation remains the named fallback in
+   the #115 design. Evidence content itself is model-authored untrusted data stored
   inert in run-owned Secrets: never executed, never consumed by tooling,
   applied only by reviewed human action.
 - Dispatch is an adapter; the product boundary (dispatch is not Courier, Courier
@@ -1585,6 +1606,20 @@ named items remain unresolved and must not be described as production-ready:
 
 ## Decisions
 
+- **2026-10-13 — #210: `COURIER_TERMINATION` line budgeting lives in one place; both
+  producers (`courier-executor`, `courier-control`) call it.** The native
+  control handoff built its reason from capability detail strings with no
+  byte bound, so an escape-heavy reason (every `<`, `>`, `&` becomes a
+  six-byte `\uXXXX`) could push the marshaled line past Kubernetes' 4 KiB
+  pod termination-message budget and lose the entire trusted handoff —
+  the same failure mode #188 fixed for the executor. Both producers now
+  call `internal/executor.FitTerminationLine` and `MarshalTerminationLine`
+  for marshaling and the line fit; the wire prefix, the budget, and the
+  truncation marker are constants in one place, so the two producers
+  cannot drift. The executor keeps its summary-shrink loop (which is
+  specific to the OpenCode telemetry path) and delegates the reason-shrink
+  step to the shared helper; the control uses the shared helper
+  end-to-end. (#210, #188)
 - **2026-10-12 — #249: one executor-neutral acceptance-criterion evidence
   contract is enforced in both publication paths against a revision-pinned
   trusted snapshot of the source issue.** Admission reads the source issue
@@ -2531,3 +2566,19 @@ was superseded.
   fence deferred past the detection reconcile never runs. Legacy single-pod
   behavior is unchanged: the lone pod carries the coordinator container, so
   the scoped sets match the old ones. (#222)
+
+- **2026-10-12 — #286: exclusion overflow degrades by truncation, not failure.**
+  Retained dispatch CoderRuns with `followup-pr` work-item IDs grew past
+  Dispatch's 32-entry PR-fix exclusion cap, and the client's fail-closed
+  overflow error turned every 30s discovery cycle into an error, starving all
+  lanes because most retained runs were terminal zombies the Dispatch queue
+  had already settled. The cap is a Dispatch server contract and stays.
+  Courier's runner now orders exclusions most-relevant-first — pre-terminal
+  runs before terminal retained runs, newest first within each group; ranking
+  is a truncation heuristic, not settlement authority — and the Dispatch
+  client keeps the first 32 unique valid entries, dropping the tail with a
+  warning. Progress after truncation is two-sided: Dispatch's per-agent,
+  per-generation handout ledger scans past already-handed candidates, and
+  Courier's same-identity dedupe absorbs any re-offered truncated-out
+  generation without materializing a duplicate run. Malformed
+  descriptors still fail closed. (#286)

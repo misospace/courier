@@ -3,6 +3,7 @@ package source
 import (
 	"context"
 	"errors"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -90,6 +91,42 @@ func TestRunnerDiscoveryExclusionsAreOpaqueAndSourceScoped(t *testing.T) {
 	}
 	if !foundNewer {
 		t.Fatal("newer generation was not eligible for materialization")
+	}
+}
+
+func TestRunnerOrdersDiscoveryExclusionsMostRelevantFirst(t *testing.T) {
+	lane := testLane()
+	lane.Spec.Concurrency = 8
+	now := time.Now()
+	run := func(name, id string, phase courierv1alpha1.Phase, age time.Duration) *courierv1alpha1.CoderRun {
+		return &courierv1alpha1.CoderRun{
+			ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: "courier", CreationTimestamp: metav1.NewTime(now.Add(-age))},
+			Spec:       courierv1alpha1.CoderRunSpec{Source: "dispatch", WorkItemID: id, Mode: courierv1alpha1.ModeFixPR, Repo: "acme/widgets", Ref: 42, Lane: "local"},
+			Status:     courierv1alpha1.CoderRunStatus{Phase: phase},
+		}
+	}
+	// Unsettled runs sort ahead of terminal ones regardless of age; within a
+	// group, newest first. Names deliberately do not sort in the wanted order,
+	// so equal timestamps cannot pass by accident.
+	runs := []*courierv1alpha1.CoderRun{
+		run("z-done", "done-old", courierv1alpha1.PhaseDone, 5*time.Hour),
+		run("a-running", "running-old", courierv1alpha1.PhaseRunning, 3*time.Hour),
+		run("y-review", "review-new", courierv1alpha1.PhaseAwaitingReview, 30*time.Minute),
+		run("b-verifying", "verifying-mid", courierv1alpha1.PhaseVerifying, 2*time.Hour),
+		run("x-pending", "pending-new", courierv1alpha1.PhasePending, 1*time.Hour),
+	}
+	adapter := &excludingTestAdapter{}
+	runner := NewRunner(newTestClient(t, lane, runs[0], runs[1], runs[2], runs[3], runs[4]), adapter, RunnerConfig{Source: "dispatch", LaneProfile: "local", Namespace: "courier"})
+	if err := runner.Poll(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"pending-new", "verifying-mid", "running-old", "review-new", "done-old"}
+	got := make([]string, 0, len(adapter.exclusions))
+	for _, exclusion := range adapter.exclusions {
+		got = append(got, exclusion.ID)
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("exclusion order = %v, want %v", got, want)
 	}
 }
 

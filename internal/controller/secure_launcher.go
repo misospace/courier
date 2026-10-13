@@ -405,7 +405,7 @@ func (s *SecureControl) fenceAndRelaunch(ctx context.Context, run *courier.Coder
 	if err := s.Fence(ctx, run); err != nil {
 		return ctrl.Result{}, true, err
 	}
-	if run.Status.Restarts >= defaultMaxRestarts {
+	if run.Status.Restarts >= crashloopCeiling(s.MaxRestarts) {
 		result, err := s.transitionNeedsHuman(ctx, run, "secure topology failed repeatedly and reached the crashloop ceiling")
 		return result, true, err
 	}

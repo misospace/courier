@@ -35,6 +35,21 @@ executor contract and a manual first-run example. Contributor conventions are
 in [AGENTS.md](./AGENTS.md). Security issues should be reported privately; see
 [SECURITY.md](./SECURITY.md).
 
+## Prerequisites
+
+Building and testing this repository from source requires **git >= 2.41**
+(CI runs git 2.43+). Worker-artifact validation unpacks delivered bundles with
+`git bundle unbundle` into a quarantined object directory
+(`GIT_OBJECT_DIRECTORY`, see `internal/git/bundle.go`); on git <= 2.40 that
+command resolves the surrounding repository's local refs (including
+`refs/courier/*`) against the quarantine store and dies with
+`fatal: bad object <ref>` even for a fully self-contained bundle, which
+`internal/harness` surfaces as `bundle is malformed or not self-contained`.
+Upstream made bundle verification a connectivity check in git 2.41. On
+Debian 12 / Ubuntu 22.04-era git (2.39) several `internal/harness` tests
+(for example `TestPublicationChainEndToEnd`) fail from this version gap alone;
+upgrade git before treating those failures as real.
+
 ## Install
 
 Published releases use the OCI chart `oci://ghcr.io/misospace/charts/courier`.
