@@ -22,6 +22,7 @@ import (
 	"path/filepath"
 	"syscall"
 	"time"
+	"unicode/utf8"
 
 	"github.com/misospace/courier/internal/executor"
 	"github.com/misospace/courier/internal/harness"
@@ -55,11 +56,21 @@ const (
 // diagnostics, never full model output.
 const maxTerminationReasonBytes = 1200
 
+// terminationTruncationSuffix marks a reason cut to the byte bound. boundReason
+// reserves room for it so the result stays within maxTerminationReasonBytes.
+const terminationTruncationSuffix = "…[truncated]"
+
+// boundReason bounds the reason to maxTerminationReasonBytes, splitting only
+// on a rune boundary so the trusted reason remains valid UTF-8.
 func boundReason(reason string) string {
 	if len(reason) <= maxTerminationReasonBytes {
 		return reason
 	}
-	return reason[:maxTerminationReasonBytes] + "…[truncated]"
+	limit := maxTerminationReasonBytes - len(terminationTruncationSuffix)
+	for limit > 0 && !utf8.ValidString(reason[:limit]) {
+		limit--
+	}
+	return reason[:limit] + terminationTruncationSuffix
 }
 
 func main() {
@@ -130,14 +141,14 @@ func runArgs(args []string) error {
 		if err == nil {
 			break
 		}
-		var gateErr *harness.GateError
-		if !errors.As(err, &gateErr) || !gateErr.AllRetryable() || attempt >= probeRetryRounds {
-			return declareNeedsHuman(gateErr.Error(), caps)
+		reason, retryable := classifyGateFailure(err)
+		if !retryable || attempt >= probeRetryRounds {
+			return declareNeedsHuman(reason, caps)
 		}
-		fmt.Printf("transient capability failure, re-probing: %s\n", gateErr)
+		fmt.Printf("transient capability failure, re-probing: %s\n", reason)
 		select {
 		case <-ctx.Done():
-			return declareNeedsHuman(gateErr.Error(), caps)
+			return declareNeedsHuman(reason, caps)
 		case <-time.After(probeRetryDelay):
 		}
 	}
@@ -185,6 +196,19 @@ func runArgs(args []string) error {
 	}
 	result := coordinator.Run(ctx, invocation)
 	return declare(result)
+}
+
+// classifyGateFailure decides, for a harness.Gate failure, the reason the
+// probe loop declares when it stops and whether a re-probe round may run.
+// harness.Gate returns a *GateError today, but a non-GateError must still
+// fail closed: it declares with the gate-failure error itself, so a change
+// to that contract cannot nil-deref the declare path.
+func classifyGateFailure(err error) (reason string, retryable bool) {
+	var gateErr *harness.GateError
+	if !errors.As(err, &gateErr) {
+		return fmt.Sprintf("capability gate failed: %v", err), false
+	}
+	return gateErr.Error(), gateErr.AllRetryable()
 }
 
 // declare maps the harness result onto the operator's exit contract:

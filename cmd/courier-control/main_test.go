@@ -8,6 +8,7 @@ import (
 	"strings"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"github.com/misospace/courier/internal/executor"
 	"github.com/misospace/courier/internal/harness"
@@ -69,8 +70,63 @@ func TestBoundReason(t *testing.T) {
 	}
 	long := strings.Repeat("x", maxTerminationReasonBytes+100)
 	got := boundReason(long)
-	if len(got) > maxTerminationReasonBytes+20 || !strings.HasSuffix(got, "[truncated]") {
+	if len(got) > maxTerminationReasonBytes || !strings.HasSuffix(got, "[truncated]") {
 		t.Fatalf("boundReason did not bound the reason: %d bytes", len(got))
+	}
+}
+
+// The truncation boundary must not split a multi-byte rune: the trusted
+// termination reason stays valid UTF-8 within the byte bound.
+func TestBoundReasonSplitsOnRuneBoundary(t *testing.T) {
+	long := strings.Repeat("a", maxTerminationReasonBytes-len(terminationTruncationSuffix)-1) +
+		"é" + strings.Repeat("b", 20)
+	got := boundReason(long)
+	if len(got) > maxTerminationReasonBytes {
+		t.Fatalf("truncated reason is %d bytes, want <= %d", len(got), maxTerminationReasonBytes)
+	}
+	if !utf8.ValidString(got) {
+		t.Fatalf("truncated reason is not valid UTF-8: %q", got)
+	}
+	if !strings.HasSuffix(got, "[truncated]") {
+		t.Fatalf("truncated reason lost its suffix: %q", got)
+	}
+}
+
+// A gate failure that is not a *GateError must not panic the probe loop and
+// must still fail closed: no re-probe rounds, declare NeedsHuman.
+func TestClassifyGateFailureNonGateErrorFailsClosed(t *testing.T) {
+	reason, retryable := classifyGateFailure(errors.New("gate exploded"))
+	if retryable {
+		t.Fatal("a non-GateError gate failure must not be retryable")
+	}
+	if reason == "" || !strings.Contains(reason, "gate exploded") {
+		t.Fatalf("reason = %q, want a safe reason naming the failure", reason)
+	}
+}
+
+func TestClassifyGateFailureGateError(t *testing.T) {
+	transient := &harness.GateError{Failed: []harness.Capability{
+		{Name: "broker", State: harness.StateUnavailable, Detail: "is unreachable", Required: true, Retryable: true},
+	}}
+	reason, retryable := classifyGateFailure(transient)
+	if !retryable {
+		t.Fatal("an all-transient GateError must stay retryable")
+	}
+	if !strings.Contains(reason, "broker") {
+		t.Fatalf("reason = %q, want the capability table", reason)
+	}
+
+	permanent := &harness.GateError{Failed: []harness.Capability{
+		{Name: "broker", State: harness.StateUnavailable, Detail: "is unreachable", Required: true, Retryable: true},
+		{Name: "forge-operations", State: harness.StateUnavailable, Detail: "operation missing", Required: true},
+	}}
+	if _, retryable := classifyGateFailure(permanent); retryable {
+		t.Fatal("a GateError with a permanent failure must not be retryable")
+	}
+
+	wrapped := fmt.Errorf("gate: %w", transient)
+	if _, retryable := classifyGateFailure(wrapped); !retryable {
+		t.Fatal("a wrapped GateError must still be classified as retryable")
 	}
 }
 
