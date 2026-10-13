@@ -51,8 +51,18 @@ func (r *CoderRunReconciler) livenessWindow() time.Duration {
 // run relaunches and the counter increments. Zero falls back to the package
 // default.
 func (r *CoderRunReconciler) maxRestarts() int {
-	if r.MaxRestarts > 0 {
-		return r.MaxRestarts
+	return crashloopCeiling(r.MaxRestarts)
+}
+
+// crashloopCeiling resolves a configured crashloop threshold against the
+// package default. Every relaunch path — the reconciler's wedge and pod-loss
+// paths and the secure topology's broken-topology relaunch — bounds through
+// here so one configured value, chosen once where the operator wires the
+// binaries, is the single ceiling; the secure path is bounded identically
+// even though it lives outside the reconciler (#216).
+func crashloopCeiling(configured int) int {
+	if configured > 0 {
+		return configured
 	}
 	return defaultMaxRestarts
 }

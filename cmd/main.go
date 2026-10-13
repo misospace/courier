@@ -374,6 +374,7 @@ func main() {
 		}
 		secure.Client = mgr.GetClient()
 		secure.Patcher = reconciler
+		secure.MaxRestarts = reconciler.MaxRestarts
 		reconciler.Secure = secure
 	}
 	if err := reconciler.SetupWithManager(mgr); err != nil {

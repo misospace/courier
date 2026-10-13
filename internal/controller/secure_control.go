@@ -108,6 +108,11 @@ type SecureControl struct {
 	// Patcher is the reconciler that owns CoderRun status writes; the secure
 	// path terminalizes through it so all status flows through one writer.
 	Patcher statusPatcher
+	// MaxRestarts is the crashloop ceiling for the secure topology's
+	// broken-topology relaunch, wired from the reconciler where Secure is
+	// assembled so it shares one configured ceiling with the wedge and
+	// pod-loss paths (#216). Zero falls back to the package default.
+	MaxRestarts int
 }
 
 func (s *SecureControl) now() time.Time {

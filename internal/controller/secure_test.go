@@ -622,6 +622,81 @@ func TestObserveTopologyFencesBrokenWorker(t *testing.T) {
 	}
 }
 
+// brokenWorkerSecureRound stands up a Running secure round whose worker has
+// definitively failed — the fixture a broken-topology relaunch is charged
+// from — and returns it with its control and client before any observation.
+func brokenWorkerSecureRound(t *testing.T, name string, restarts int) (*SecureControl, client.Client, *courier.CoderRun) {
+	t.Helper()
+	control, c := secureControl(t)
+	run := secureRun(name)
+	run.Status.Phase = courier.PhaseRunning
+	run.Status.Restarts = restarts
+	if err := c.Create(context.Background(), run); err != nil {
+		t.Fatal(err)
+	}
+	controlPod := healthyPod(run.Name, topology.ComponentCoordinator)
+	workerPod := healthyPod(run.Name, topology.ComponentWorker)
+	brokerPod := healthyPod(run.Name, topology.ComponentBroker)
+	for _, pod := range []*corev1.Pod{controlPod, workerPod, brokerPod} {
+		if err := c.Create(context.Background(), pod); err != nil {
+			t.Fatal(err)
+		}
+	}
+	workerPod.Status.Phase = corev1.PodFailed
+	if err := c.Status().Update(context.Background(), workerPod); err != nil {
+		t.Fatal(err)
+	}
+	return control, c, run
+}
+
+// TestObserveTopologyBrokenWorkerCeilingIsConfigured pins #216: the secure
+// broken-topology relaunch bounds against the configured ceiling, not the
+// package default. A configured ceiling of 1 terminalizes a repeatedly
+// broken topology the package default would still relaunch; with no
+// configured ceiling the same round relaunches, so the terminalization can
+// only come from the configured value.
+func TestObserveTopologyBrokenWorkerCeilingIsConfigured(t *testing.T) {
+	t.Run("ConfiguredCeilingTerminalizesBelowPackageDefault", func(t *testing.T) {
+		control, c, run := brokenWorkerSecureRound(t, "ceiling-configured", 1)
+		control.MaxRestarts = 1 // below defaultMaxRestarts, at the run's counter.
+		// The ceiling hand-off terminalizes through the patcher, which needs
+		// the source registry the plain secure helper does not wire.
+		control.Patcher = &CoderRunReconciler{
+			Client:       c,
+			Sources:      NewSourceRegistry(map[string]source.Adapter{"manual": &admissionSource{}}),
+			StatusWriter: fakeStatusWriter{client: c},
+		}
+		_, handled, err := control.ObserveTopology(context.Background(), run, listRunPods(t, c, run))
+		if err != nil || !handled {
+			t.Fatalf("handled=%v err=%v", handled, err)
+		}
+		var updated courier.CoderRun
+		if err := c.Get(context.Background(), client.ObjectKeyFromObject(run), &updated); err != nil {
+			t.Fatal(err)
+		}
+		if updated.Status.Phase != courier.PhaseNeedsHuman {
+			t.Fatalf("phase = %q, want NeedsHuman from the configured ceiling; the package default must not bound this path", updated.Status.Phase)
+		}
+		if updated.Status.Restarts != 1 {
+			t.Fatalf("restarts = %d, want 1 (ceiling is preserved, not incremented)", updated.Status.Restarts)
+		}
+	})
+	t.Run("PackageDefaultRelaunchesAboveConfiguredCounter", func(t *testing.T) {
+		control, c, run := brokenWorkerSecureRound(t, "ceiling-default", 1)
+		_, handled, err := control.ObserveTopology(context.Background(), run, listRunPods(t, c, run))
+		if err != nil || !handled {
+			t.Fatalf("handled=%v err=%v", handled, err)
+		}
+		var updated courier.CoderRun
+		if err := c.Get(context.Background(), client.ObjectKeyFromObject(run), &updated); err != nil {
+			t.Fatal(err)
+		}
+		if updated.Status.Phase != courier.PhaseClaimed || updated.Status.Restarts != 2 {
+			t.Fatalf("relaunch state = phase %q restarts %d, want Claimed with the counter incremented under the package default", updated.Status.Phase, updated.Status.Restarts)
+		}
+	})
+}
+
 func TestObserveTopologyFencesWorkerOnControlTermination(t *testing.T) {
 	control, c := secureControl(t)
 	run := secureRun("term")
