@@ -206,7 +206,9 @@ Capacity saturation is a **supply** condition, not a failure: a lane pinned at
 its concurrency limit with a healthy source is doing its job. It becomes
 interesting only in combination with rising queue wait or with a source that is
 *also* failing. The dashboard must not paint saturation as an incident by
-itself.
+itself. The reservation-pressure panel pairs with A3 (stuck reservation) once
+the age signal is exposed; until then it is informational only, distinct from
+A2 (which covers healthy saturation with rising queue wait).
 
 ### 3.3 Run execution and outcomes
 
@@ -301,16 +303,16 @@ Common rules that apply to every alert:
 
 | Field | Value |
 | --- | --- |
-| Condition | A source's discovery error ratio exceeds the threshold while the lane is enabled, the binding is not paused (neither `lane-suspended` nor `lane-at-capacity`), and it has free capacity |
-| Evidence | discovery attempt/failure counters per source (gap); `source discovery failed` log lines |
+| Condition | the source is enabled, the binding is **not paused** (every `courier_source_discovery_paused{reason}` is zero — neither `lane-suspended` nor `lane-at-capacity` and not otherwise paused), the lane has free capacity (`courier_lane_reservations < courier_lane_concurrency` for the lane), **and** within the window the failure counter is strictly rising (covers at least one additional `courier_source_discovery_failures_total` increment) **with no success** in the same evaluation window (no new `courier_source_discovery_successes_total` and `courier_source_last_success_timestamp_seconds` older than the window) |
+| Evidence | `courier_source_discovery_attempts_total`, `courier_source_discovery_successes_total`, `courier_source_discovery_failures_total`, `courier_source_last_success_timestamp_seconds` (gap), `courier_source_discovery_paused{reason}` (gap), `courier_lane_concurrency` (gap; not exported today — `LaneProfile.Spec.Concurrency`), `courier_lane_reservations`, `courier_lane_suspended`, `source discovery failed` log lines |
 | Window | 3× the configured poll interval (default 90s at the 30s poll) |
-| Threshold rationale | One failed poll can be a transient API blip; three consecutive windows with capacity available indicates a persistent supply failure |
-| Recovery | a successful discovery in the same window clears it |
+| Threshold rationale | One failed poll can be a transient API blip; three consecutive windows with capacity available **and** no successful discovery indicates a persistent supply failure (a success anywhere in the window resets the predicate so an isolated blip does not latch) |
+| Recovery | the predicate clears when **any** of: a successful discovery is observed in the evaluation window (`courier_source_last_success_timestamp_seconds` refreshes), the binding becomes paused (a non-zero `reason` appears in `courier_source_discovery_paused`), or the lane loses free capacity (`courier_lane_reservations >= courier_lane_concurrency`) |
 | Severity | warning |
 | Expected action | inspect the connector/provider, credentials, and rate limits; check whether the lane is intentionally suspended. If this is the only configured source, treat it as page-worthy (paging policy, not severity) |
-| Missing telemetry | without discovery counters, fall back to log-based detection; if logs are not collected, this alert is **unavailable** (not silently green) |
-| Startup | suppressed for the first N windows after controller start to avoid a cold-start false positive |
-| Disabled source | does not fire (source disabled); a paused binding (`lane-suspended` / `lane-at-capacity`) likewise does not fire — pausing is orthogonal to source health |
+| Missing telemetry | without discovery counters, fall back to log-based detection; if the paused/reservations/concurrency signals are also missing, the gate cannot be evaluated and this alert is **unavailable** (not silently green) |
+| Startup | suppressed for the first N windows after controller start, and until at least one success is recorded, to avoid a cold-start false positive |
+| Disabled source | does not fire (source disabled); a paused binding (`lane-suspended` / `lane-at-capacity` / any other `reason`) likewise does not fire — pausing is orthogonal to source health |
 | Empty queue | this alert fires precisely because discovery *failed*, independent of whether work was returned |
 | Low traffic | unaffected; it measures failure, not volume |
 
@@ -331,7 +333,24 @@ Common rules that apply to every alert:
 | Empty queue | does not fire (no in-flight runs) |
 | Low traffic | does not fire |
 
-### A3. Elevated run failure rate
+### A3. Stuck reservation (age-based, distinct from saturation)
+
+| Field | Value |
+| --- | --- |
+| Condition | the lane is `open` (not suspended, `courier_lane_reservations < courier_lane_concurrency`), there is at least one reservation (`courier_lane_reservations > 0` or `courier_coderuns_pending > 0`), and the oldest reservation has not advanced for the freshness window (`courier_lane_oldest_reservation_age_seconds` ≥ window **and** no new terminal or phase transition for any reservation in that window) |
+| Evidence | `courier_lane_reservations`, `courier_lane_concurrency` (gap), `courier_lane_oldest_reservation_age_seconds` (gap), `courier_coderuns_pending` (gap), `courier_lane_suspended`, `phase.transition` log lines for the affected `run_id`s |
+| Window | 15m (operator-tuned; the reservation-freshness window is independent of the 30s poll interval because the failure mode is admission, not discovery) |
+| Threshold rationale | `courier_coderuns_in_flight` excludes `Pending` and the queue-wait histogram only advances on terminalization, so a healthy lane that has materialised work but cannot start any run looks *idle* on the existing panels. Age on the oldest reservation is the only signal that distinguishes this from normal healthy saturation (covered by A2); a sustained age without progress indicates admission is wedged rather than merely busy |
+| Recovery | the oldest reservation is admitted (the age resets), the lane becomes suspended or saturated (the predicate no longer holds), or the reservation is reaped as failed (no longer counts) |
+| Severity | warning |
+| Expected action | inspect lane capacity, the controlling `LaneProfile`, and the affected `run_id`s; check for an admission-side wedge (controller stalled reconcile, broker handoff blocked, webhook not reachable) before treating it as a sizing problem |
+| Missing telemetry | if `courier_lane_oldest_reservation_age_seconds` (or its constituents) is absent, the alert is **unavailable** (not silently green); the queue-wait histogram alone cannot detect this condition |
+| Startup | suppressed until at least one reservation has existed for the full window |
+| Disabled/suspended source | does not fire (lane suspended ⇒ condition is not `open`; saturated lanes are A2, not this) |
+| Empty queue | does not fire (no reservations ⇒ no oldest age) |
+| Low traffic | unaffected; age alone is the signal, not volume |
+
+### A4. Elevated run failure rate
 
 | Field | Value |
 | --- | --- |
@@ -341,14 +360,14 @@ Common rules that apply to every alert:
 | Threshold rationale | a small absolute failure count can be normal; a sustained ratio above the operator's baseline is actionable |
 | Recovery | failure ratio returns below threshold for one full window |
 | Severity | warning |
-| Expected action | inspect terminal diagnostic mix (A5) and recent `run.exit` events to find the common cause |
+| Expected action | inspect terminal diagnostic mix (A6) and recent `run.exit` events to find the common cause |
 | Missing telemetry | if no terminal runs occurred, no ratio exists ⇒ no fire (low traffic is not failure) |
 | Startup | suppressed until enough terminal runs exist to form a ratio |
 | Disabled source | does not fire |
 | Empty queue | does not fire |
 | Low traffic | use an absolute-count floor alongside the ratio so one failure in one run does not page |
 
-### A4. Lifecycle reports not settling
+### A5. Lifecycle reports not settling
 
 | Field | Value |
 | --- | --- |
@@ -365,7 +384,7 @@ Common rules that apply to every alert:
 | Empty queue | does not fire |
 | Low traffic | an absolute floor prevents a single slow report from paging |
 
-### A5. Terminal diagnostic concentration
+### A6. Terminal diagnostic concentration
 
 | Field | Value |
 | --- | --- |
@@ -382,7 +401,7 @@ Common rules that apply to every alert:
 | Empty queue | does not fire |
 | Low traffic | absolute floor applies |
 
-### A6. Metrics scrape failing
+### A7. Metrics scrape failing
 
 | Field | Value |
 | --- | --- |
@@ -397,7 +416,7 @@ Common rules that apply to every alert:
 | Startup | counter is monotonic; rate() naturally ignores the initial zero |
 | Disabled/empty/low traffic | unaffected; this is a collection-health signal |
 
-### A7. Controller target down
+### A8. Controller target down
 
 | Field | Value |
 | --- | --- |
@@ -412,7 +431,7 @@ Common rules that apply to every alert:
 | Startup | a target that has never been up is a deployment problem, not a false positive |
 | Disabled/empty/low traffic | unaffected |
 
-### A8. Connector capability absent or protocol errors (optional)
+### A9. Connector capability absent or protocol errors (optional)
 
 | Field | Value |
 | --- | --- |
@@ -471,7 +490,7 @@ of a mapping, not deployable configuration.
 PromQL-compatible renderings of representative panels:
 
 ```promql
-# Run failure ratio (A3)
+# Run failure ratio (A4)
 sum(rate(courier_coderuns_total{phase="Failed"}[1h]))
   / sum(rate(courier_coderuns_total[1h]))
 
@@ -480,7 +499,7 @@ courier_coderuns_in_flight
   / on(lane) group_left()
 max by (lane) (courier_lane_concurrency)   # concurrency exposure is a gap
 
-# Scrape errors (A6)
+# Scrape errors (A7)
 increase(courier_metrics_scrape_errors_total[10m]) > 0
 
 # Median run duration by lane (3.3)
