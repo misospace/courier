@@ -29,9 +29,9 @@ const (
 // Retention defaults. Done runs are a short inspection window because their
 // source work already resolved; Failed and NeedsHuman runs hold genuine
 // outcomes, so they are kept for a week by default before the reaper deletes
-// them. The audit floor keeps the N most recent terminal runs per repository
-// even after their window expires, so a burst of work never erases the recent
-// audit trail.
+// them. The audit floor keeps the N most recent reaped outcome runs per
+// repository even after their window expires, so a burst of work never erases
+// the recent audit trail.
 const (
 	defaultDoneRetention       = 5 * time.Minute
 	defaultFailedRetention     = 168 * time.Hour
@@ -53,11 +53,11 @@ func (r *CoderRunReconciler) reapDone(ctx context.Context, run *courierv1alpha1.
 // per-phase marker, then deletes it once the audit floor no longer covers it.
 // A missing or malformed marker starts a fresh window and never deletes on the
 // same pass; a future-dated marker (clock skew) is capped at the window and
-// never deletes early. When applyAuditFloor is set, the most recent terminal
-// runs per repository are retained past their window. The caller must have
-// already established the run's lifecycle report reached a positive, settled
-// state — reapTerminal refuses to delete a run whose only durable retry intent
-// is still pending.
+// never deletes early. When applyAuditFloor is set, the most recent runs in the
+// floor-governed phases are retained per repository even after their window
+// expires. The caller must have already established the run's lifecycle report
+// reached a positive, settled state — reapTerminal refuses to delete a run whose
+// only durable retry intent is still pending.
 func (r *CoderRunReconciler) reapTerminal(ctx context.Context, run *courierv1alpha1.CoderRun, marker string, retention time.Duration, applyAuditFloor bool) (ctrl.Result, error) {
 	now := r.clock()
 	at, ok := reapMarker(run, marker)
@@ -86,7 +86,7 @@ func (r *CoderRunReconciler) reapTerminal(ctx context.Context, run *courierv1alp
 		}
 		return ctrl.Result{RequeueAfter: remaining}, nil
 	}
-	// Past the window. The audit floor keeps the most recent terminal runs per
+	// Past the window. The audit floor keeps the most recent runs per
 	// repository even after their window expires, so a burst of work never
 	// erases the recent audit trail.
 	if applyAuditFloor {
@@ -96,28 +96,32 @@ func (r *CoderRunReconciler) reapTerminal(ctx context.Context, run *courierv1alp
 		}
 		if keep {
 			// Re-evaluate at the retention cadence: a later, more recent
-			// terminal run may push this one out of the audit floor.
+			// floor-governed run may push this one out of the audit floor.
 			return ctrl.Result{RequeueAfter: retention}, nil
 		}
 	}
 	// NotFound after an attempted delete is success; a transient failure
 	// returns and retries. Owned coordinator pods and evidence Secrets are
-	// garbage-collected through their owner references.
+	// garbage-collected through their owner references. The counter records the
+	// accepted delete request, not a confirmed removal: a finalizer (the secure
+	// topology's) can hold the object after the API server accepts the delete,
+	// and courier_coderuns_oldest_terminal_age_seconds is what shows such a run
+	// is still retained.
 	if err := r.Delete(ctx, run); err != nil {
 		if apierrors.IsNotFound(err) {
 			return ctrl.Result{}, nil
 		}
 		return ctrl.Result{}, err
 	}
-	r.metrics().ObserveReap(run.Status.Phase)
+	r.metrics().ObserveReapRequest(run.Status.Phase)
 	return ctrl.Result{}, nil
 }
 
 // withinAuditFloor reports whether run is still covered by the per-repository
-// audit floor: the most recent terminalAuditKeep terminal runs are retained
-// regardless of age. The candidate is covered while fewer than the floor's
-// count of same-repository terminal runs are newer than it. A non-positive
-// floor disables the guard.
+// audit floor: the most recent floor-governed runs are retained regardless of
+// age. The candidate is covered while fewer than the floor's count of
+// same-repository floor-governed runs are newer than it. A non-positive floor
+// disables the guard.
 func (r *CoderRunReconciler) withinAuditFloor(ctx context.Context, run *courierv1alpha1.CoderRun) (bool, error) {
 	keep := r.terminalAuditKeep()
 	if keep <= 0 {
@@ -133,7 +137,7 @@ func (r *CoderRunReconciler) withinAuditFloor(ctx context.Context, run *courierv
 		if other.Name == run.Name || other.Spec.Repo != run.Spec.Repo {
 			continue
 		}
-		if !terminalPhase(other.Status.Phase) {
+		if !auditFloorPhase(other.Status.Phase) {
 			continue
 		}
 		if terminalNewer(other, run) {
@@ -141,6 +145,24 @@ func (r *CoderRunReconciler) withinAuditFloor(ctx context.Context, run *courierv
 		}
 	}
 	return newer < keep, nil
+}
+
+// auditFloorPhase reports whether a run in phase is governed by — and so
+// consumes a slot of — the per-repository audit floor. The floor exists to keep
+// the recent outcome trail of runs the reaper would otherwise delete, so
+// exactly the reaped long-term outcomes participate: Failed and NeedsHuman.
+// Done runs are exempt from the floor (their source work is already resolved)
+// and AwaitingReview, HandedOff, and BlockedExternal are never reaped at all.
+// Counting an exempt or unreaped run as a newer entry would let a burst of
+// short-lived Done runs, or one permanently held AwaitingReview run, drain the
+// protected quota and permanently delete the runs the floor promises to keep.
+func auditFloorPhase(phase courierv1alpha1.Phase) bool {
+	switch phase {
+	case courierv1alpha1.PhaseFailed, courierv1alpha1.PhaseNeedsHuman:
+		return true
+	default:
+		return false
+	}
 }
 
 // terminalNewer orders two terminal runs for the audit floor: by terminal time,
@@ -165,7 +187,10 @@ func terminalTime(run *courierv1alpha1.CoderRun) time.Time {
 	return run.CreationTimestamp.Time
 }
 
-// terminalPhase reports whether phase is a terminal lifecycle phase.
+// terminalPhase reports whether phase is a terminal lifecycle phase. The
+// oldest-terminal-age gauge reports every terminal phase, including the ones
+// the reaper never deletes, so an operator sees a held AwaitingReview run aging
+// too; the audit floor narrows to auditFloorPhase instead.
 func terminalPhase(phase courierv1alpha1.Phase) bool {
 	switch phase {
 	case courierv1alpha1.PhaseAwaitingReview, courierv1alpha1.PhaseHandedOff,

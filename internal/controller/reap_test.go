@@ -3,11 +3,14 @@ package controller
 import (
 	"context"
 	"errors"
+	"fmt"
 	"testing"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	courierv1alpha1 "github.com/misospace/courier/api/v1alpha1"
@@ -647,5 +650,155 @@ func TestReapFailedRetentionSurvivesRestart(t *testing.T) {
 	}
 	if err := c.Get(context.Background(), admissionKey("restart"), &courierv1alpha1.CoderRun{}); !apierrors.IsNotFound(err) {
 		t.Fatalf("get restart run = %v, want NotFound; retention must outlive the process", err)
+	}
+}
+
+// doneRun returns a Done run whose terminal time and retention marker sit at
+// the given offsets, so a test can place a Done run anywhere on the audit
+// floor's timeline.
+func doneRun(name string, finishedAt, doneAt time.Time) *courierv1alpha1.CoderRun {
+	run := admissionRun(name, "local", courierv1alpha1.PhaseDone)
+	run.CreationTimestamp = metav1.NewTime(finishedAt)
+	run.Status.FinishedAt = &metav1.Time{Time: finishedAt}
+	return withReapMarker(run, doneAtAnnotation, doneAt)
+}
+
+// TestReapAuditFloorSurvivesDoneBurstAndCleanup is the temporal regression for
+// the audit floor's candidate set: five transient Done runs (exempt from the
+// floor) and three never-reaped runs must not count as newer floor entries and
+// drain the protected quota of the two settled outcomes the floor promises to
+// keep. The Done runs are reaped afterwards, and the protected trail must
+// survive that cleanup.
+func TestReapAuditFloorSurvivesDoneBurstAndCleanup(t *testing.T) {
+	protected := map[string]*courierv1alpha1.CoderRun{
+		"protected-failed": withReapMarker(
+			terminalReapRun("protected-failed", courierv1alpha1.PhaseFailed, reapClock.Add(-30*time.Hour)),
+			failedAtAnnotation, reapClock.Add(-30*time.Hour)),
+		"protected-needs": withReapMarker(
+			terminalReapRun("protected-needs", courierv1alpha1.PhaseNeedsHuman, reapClock.Add(-29*time.Hour)),
+			needsHumanAtAnnotation, reapClock.Add(-29*time.Hour)),
+	}
+	done := make([]*courierv1alpha1.CoderRun, 0, 5)
+	objects := make([]runtime.Object, 0, len(protected)+5+3)
+	for _, run := range protected {
+		objects = append(objects, run)
+	}
+	for i := range 5 {
+		// Five newer, already-spent Done runs: newer than every protected run,
+		// past their own window, and not yet reconciled.
+		run := doneRun(fmt.Sprintf("done-%d", i), reapClock.Add(-time.Minute), reapClock.Add(-11*time.Minute))
+		done = append(done, run)
+		objects = append(objects, run)
+	}
+	// Never-reaped runs are newer still, and must not consume the quota either.
+	for _, phase := range []courierv1alpha1.Phase{
+		courierv1alpha1.PhaseAwaitingReview,
+		courierv1alpha1.PhaseHandedOff,
+		courierv1alpha1.PhaseBlockedExternal,
+	} {
+		objects = append(objects, terminalReapRun("held-"+string(phase), phase, reapClock.Add(-30*time.Second)))
+	}
+
+	c := phaseClient(t, objects...)
+	reconciler := terminalReapReconciler(c, &admissionSource{}, reapClock, 2)
+
+	// The whole floor is occupied by the two protected outcomes, so neither may
+	// be reaped while eight newer runs of other phases exist.
+	for name := range protected {
+		result, err := reconciler.Reconcile(context.Background(), admissionRequest(name))
+		if err != nil {
+			t.Fatalf("reconcile %s: %v", name, err)
+		}
+		if result.RequeueAfter <= 0 {
+			t.Fatalf("%s RequeueAfter = %v, want a bounded recheck inside the audit floor", name, result.RequeueAfter)
+		}
+		if err := c.Get(context.Background(), admissionKey(name), &courierv1alpha1.CoderRun{}); err != nil {
+			t.Fatalf("get %s: %v; a Done burst must not drain the audit floor", name, err)
+		}
+	}
+
+	// The Done runs are reaped on their own window; the protected trail must be
+	// intact afterwards, not left drained by the burst that preceded it.
+	for _, run := range done {
+		if _, err := reconciler.Reconcile(context.Background(), admissionRequest(run.Name)); err != nil {
+			t.Fatalf("reconcile %s: %v", run.Name, err)
+		}
+		if err := c.Get(context.Background(), admissionKey(run.Name), &courierv1alpha1.CoderRun{}); !apierrors.IsNotFound(err) {
+			t.Fatalf("get %s = %v, want NotFound; Done keeps its own short window", run.Name, err)
+		}
+	}
+	for name := range protected {
+		if _, err := reconciler.Reconcile(context.Background(), admissionRequest(name)); err != nil {
+			t.Fatalf("re-reconcile %s: %v", name, err)
+		}
+		if err := c.Get(context.Background(), admissionKey(name), &courierv1alpha1.CoderRun{}); err != nil {
+			t.Fatalf("get %s: %v; the protected audit trail must survive the Done cleanup", name, err)
+		}
+	}
+}
+
+// TestReapRequestCountsAcceptedDeleteWhileFinalizerHolds pins the reap
+// counter's contract: the API server accepts the delete even while the secure
+// topology finalizer still holds the object, so the counter records a request
+// and the run stays visible on the oldest-terminal-age gauge until revocation
+// completes. A second wake on the held object must not count it again.
+func TestReapRequestCountsAcceptedDeleteWhileFinalizerHolds(t *testing.T) {
+	run := withReapMarker(
+		terminalReapRun("held", courierv1alpha1.PhaseFailed, reapClock.Add(-11*time.Minute)),
+		failedAtAnnotation, reapClock.Add(-11*time.Minute))
+	run.Finalizers = []string{secureTopologyFinalizer}
+
+	registry := prometheus.NewRegistry()
+	recorder := NewRunRecorder(registry)
+	ageRegistry := prometheus.NewRegistry()
+	collector := NewTerminalAgeCollector(nil)
+	collector.now = func() time.Time { return reapClock }
+
+	c := phaseClient(t, run)
+	reconciler := terminalReapReconciler(c, &admissionSource{}, reapClock, -1)
+	reconciler.Metrics = recorder
+	collector.client = c
+	ageRegistry.MustRegister(collector)
+
+	labels := map[string]string{"phase": "Failed"}
+	if _, err := reconciler.Reconcile(context.Background(), admissionRequest("held")); err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+	m := gatherMetric(t, registry, "courier_coderuns_reap_requests_total", labels)
+	if m.GetCounter() == nil || m.GetCounter().GetValue() != 1 {
+		t.Fatalf("reap requests = %v, want 1 for an accepted delete", m.GetCounter())
+	}
+	var held courierv1alpha1.CoderRun
+	if err := c.Get(context.Background(), admissionKey("held"), &held); err != nil {
+		t.Fatalf("get held run: %v; the finalizer must hold the object after the accepted delete", err)
+	}
+	if held.DeletionTimestamp.IsZero() {
+		t.Fatal("held run has no DeletionTimestamp; the delete request never landed")
+	}
+	age, ok := gaugeValueIfPresent(t, ageRegistry, "courier_coderuns_oldest_terminal_age_seconds", labels)
+	if !ok || age != (11*time.Minute).Seconds() {
+		t.Fatalf("oldest terminal age = (%v, %v), want (%v, true); a held run is still retained", age, ok, (11 * time.Minute).Seconds())
+	}
+
+	// A duplicate wake on the held object counts nothing more.
+	if _, err := reconciler.Reconcile(context.Background(), admissionRequest("held")); err != nil {
+		t.Fatalf("second reconcile: %v", err)
+	}
+	m = gatherMetric(t, registry, "courier_coderuns_reap_requests_total", labels)
+	if m.GetCounter().GetValue() != 1 {
+		t.Fatalf("reap requests = %v after a duplicate wake, want 1", m.GetCounter().GetValue())
+	}
+
+	// Revocation completes: the finalizer is released and the object goes away,
+	// which is when the age gauge drops the phase.
+	held.Finalizers = nil
+	if err := c.Update(context.Background(), &held); err != nil {
+		t.Fatalf("release finalizer: %v", err)
+	}
+	if err := c.Get(context.Background(), admissionKey("held"), &courierv1alpha1.CoderRun{}); !apierrors.IsNotFound(err) {
+		t.Fatalf("get held run = %v, want NotFound once the finalizer is released", err)
+	}
+	if _, ok := gaugeValueIfPresent(t, ageRegistry, "courier_coderuns_oldest_terminal_age_seconds", labels); ok {
+		t.Fatal("oldest terminal age still reports Failed after the object was removed")
 	}
 }
