@@ -207,8 +207,10 @@ its concurrency limit with a healthy source is doing its job. It becomes
 interesting only in combination with rising queue wait or with a source that is
 *also* failing. The dashboard must not paint saturation as an incident by
 itself. The reservation-pressure panel pairs with A3 (stuck reservation) once
-the age signal is exposed; until then it is informational only, distinct from
-A2 (which covers healthy saturation with rising queue wait).
+the reservation-age and admission-progress signals are exposed; A3 covers work
+that is materialised but wedged unadmitted — at or below lane capacity — while
+A2 covers healthy saturation with rising queue wait. Until those signals exist
+the panel is informational only.
 
 ### 3.3 Run execution and outcomes
 
@@ -303,7 +305,7 @@ Common rules that apply to every alert:
 
 | Field | Value |
 | --- | --- |
-| Condition | the source is enabled, the binding is **not paused** (every `courier_source_discovery_paused{reason}` is zero — neither `lane-suspended` nor `lane-at-capacity` and not otherwise paused), the lane has free capacity (`courier_lane_reservations < courier_lane_concurrency` for the lane), **and** within the window the failure counter is strictly rising (covers at least one additional `courier_source_discovery_failures_total` increment) **with no success** in the same evaluation window (no new `courier_source_discovery_successes_total` and `courier_source_last_success_timestamp_seconds` older than the window) |
+| Condition | the source is enabled, the binding is **not paused** (every `courier_source_discovery_paused{reason}` is zero — neither `lane-suspended` nor `lane-at-capacity` and not otherwise paused), the lane has free capacity (`courier_lane_reservations < courier_lane_concurrency` for the lane), **and** within the window the failure counter is strictly rising (covers at least one additional `courier_source_discovery_failures_total` increment) **with no success** in the same evaluation window (no new `courier_source_discovery_successes_total` and `courier_source_last_success_timestamp_seconds` older than the window, or absent — a binding that has never succeeded satisfies the no-success gate, subject to the startup grace below) |
 | Evidence | `courier_source_discovery_attempts_total`, `courier_source_discovery_successes_total`, `courier_source_discovery_failures_total`, `courier_source_last_success_timestamp_seconds` (gap), `courier_source_discovery_paused{reason}` (gap), `courier_lane_concurrency` (gap; not exported today — `LaneProfile.Spec.Concurrency`), `courier_lane_reservations`, `courier_lane_suspended`, `source discovery failed` log lines |
 | Window | 3× the configured poll interval (default 90s at the 30s poll) |
 | Threshold rationale | One failed poll can be a transient API blip; three consecutive windows with capacity available **and** no successful discovery indicates a persistent supply failure (a success anywhere in the window resets the predicate so an isolated blip does not latch) |
@@ -311,7 +313,7 @@ Common rules that apply to every alert:
 | Severity | warning |
 | Expected action | inspect the connector/provider, credentials, and rate limits; check whether the lane is intentionally suspended. If this is the only configured source, treat it as page-worthy (paging policy, not severity) |
 | Missing telemetry | without discovery counters, fall back to log-based detection; if the paused/reservations/concurrency signals are also missing, the gate cannot be evaluated and this alert is **unavailable** (not silently green) |
-| Startup | suppressed for the first N windows after controller start, and until at least one success is recorded, to avoid a cold-start false positive |
+| Startup | suppressed only for a **finite** startup grace while `courier_source_last_success_timestamp_seconds` is absent — candidate 10× the poll interval, matching #290's `SourceNeverSucceeded` grace; A1 covers that condition rather than waiting for a first success that may never come. All-failed startup: once the grace elapses with the first poll ever attempted (or attempted and failing), the no-success gate plus rising failures fires — an all-failing source alerts instead of staying silent forever. Empty-but-successful discovery: the first zero-item success establishes `last_success` and normal A1 semantics immediately; zero items is healthy and never fires. Ordinary initial grace: no fire. If the first poll has not yet been attempted when the grace elapses, this is `SourceDiscoveryStalled`-territory, not A1 — the alert stays suppressed until at least one attempt is recorded |
 | Disabled source | does not fire (source disabled); a paused binding (`lane-suspended` / `lane-at-capacity` / any other `reason`) likewise does not fire — pausing is orthogonal to source health |
 | Empty queue | this alert fires precisely because discovery *failed*, independent of whether work was returned |
 | Low traffic | unaffected; it measures failure, not volume |
@@ -333,22 +335,23 @@ Common rules that apply to every alert:
 | Empty queue | does not fire (no in-flight runs) |
 | Low traffic | does not fire |
 
-### A3. Stuck reservation (age-based, distinct from saturation)
+### A3. Stuck reservation (unadmitted work wedged, distinct from saturation)
 
 | Field | Value |
 | --- | --- |
-| Condition | the lane is `open` (not suspended, `courier_lane_reservations < courier_lane_concurrency`), there is at least one reservation (`courier_lane_reservations > 0` or `courier_coderuns_pending > 0`), and the oldest reservation has not advanced for the freshness window (`courier_lane_oldest_reservation_age_seconds` ≥ window **and** no new terminal or phase transition for any reservation in that window) |
-| Evidence | `courier_lane_reservations`, `courier_lane_concurrency` (gap), `courier_lane_oldest_reservation_age_seconds` (gap), `courier_coderuns_pending` (gap), `courier_lane_suspended`, `phase.transition` log lines for the affected `run_id`s |
+| Condition | the lane is not suspended (`courier_lane_suspended == 0`), **at least one reservation is unadmitted** (`courier_lane_reservations > courier_coderuns_in_flight`: reservations span empty-phase + `Pending` + `Claimed` + `Running` while in-flight counts only `Claimed` + `Running`, so the difference is exactly the materialised-but-unadmitted work), **admission has not progressed** in the window (no `Claimed` transition for the lane: `increase(courier_coderun_phase_transitions_total{to="Claimed"}[window]) == 0`), **and** the oldest reservation is older than the freshness window (`courier_lane_oldest_reservation_age_seconds` ≥ window). Deliberately *not* gated on the lane being `open` (`courier_lane_reservations < courier_lane_concurrency`): the fully reserved wedge — concurrency 1, one `Pending` reservation, in-flight 0 — must fire here, and an open-lane gate would reject it (`1 < 1` false) while A2 sees no in-flight run and A1 is paused for capacity |
+| Evidence | `courier_lane_reservations`, `courier_coderuns_in_flight`, `courier_coderun_phase_transitions_total{to="Claimed"}` (admission-progress gate), `courier_lane_oldest_reservation_age_seconds` (gap), `courier_coderuns_pending` (gap; narrows the unadmitted set to `Pending` for display), `courier_lane_concurrency` (gap), `courier_lane_suspended`, `phase.transition` log lines for the affected `run_id`s |
 | Window | 15m (operator-tuned; the reservation-freshness window is independent of the 30s poll interval because the failure mode is admission, not discovery) |
-| Threshold rationale | `courier_coderuns_in_flight` excludes `Pending` and the queue-wait histogram only advances on terminalization, so a healthy lane that has materialised work but cannot start any run looks *idle* on the existing panels. Age on the oldest reservation is the only signal that distinguishes this from normal healthy saturation (covered by A2); a sustained age without progress indicates admission is wedged rather than merely busy |
-| Recovery | the oldest reservation is admitted (the age resets), the lane becomes suspended or saturated (the predicate no longer holds), or the reservation is reaped as failed (no longer counts) |
+| Threshold rationale | `courier_coderuns_in_flight` excludes `Pending` and the queue-wait histogram only advances on terminalization, so a lane that has materialised work but cannot start any run — at *or below* capacity — looks *idle* on the existing panels. The unadmitted gate (`reservations > in_flight`) is what distinguishes this failure from both normal healthy saturation and a healthy long run: a saturated lane whose reservations are all `Claimed`/`Running` and progressing, and a 2-slot lane with one 20-minute `Running` task, both have no unadmitted work and never fire. The age gate carries the duration; the stalled-admission gate carries "no progress" |
+| Caveats | `courier_lane_oldest_reservation_age_seconds` is creation-time age of the oldest reservation across **all** reservation phases: it does **not** reset on admission or any phase transition, and it does not isolate the unadmitted subset. The alert therefore uses it as a duration floor and relies on the unadmitted + stalled-admission gates for precision; a per-phase reservation age is a candidate refinement (#290 leaves age-alone vs age-plus-no-progress open). A freshly materialised item is normally admitted within one reconcile, so the just-arrived sliver is self-limiting: the first `Claimed` transition clears the predicate |
+| Recovery | the unadmitted backlog drains — `courier_lane_reservations` falls back to `courier_coderuns_in_flight` as `Pending`/empty-phase work is claimed, or a `Claimed` transition is observed again in the window (**not** an age reset: the age gauge measures `metadata.creationTimestamp` and admission does not clear it); or the lane becomes suspended; or the reservation terminates (failed/reaped), shrinking `courier_lane_reservations` |
 | Severity | warning |
 | Expected action | inspect lane capacity, the controlling `LaneProfile`, and the affected `run_id`s; check for an admission-side wedge (controller stalled reconcile, broker handoff blocked, webhook not reachable) before treating it as a sizing problem |
 | Missing telemetry | if `courier_lane_oldest_reservation_age_seconds` (or its constituents) is absent, the alert is **unavailable** (not silently green); the queue-wait histogram alone cannot detect this condition |
-| Startup | suppressed until at least one reservation has existed for the full window |
-| Disabled/suspended source | does not fire (lane suspended ⇒ condition is not `open`; saturated lanes are A2, not this) |
-| Empty queue | does not fire (no reservations ⇒ no oldest age) |
-| Low traffic | unaffected; age alone is the signal, not volume |
+| Startup | self-suppressing: the age gate cannot hold until some reservation is older than the freshness window; the transition counter resets on controller restart, so the admission-progress gate re-arms from the restart |
+| Disabled/suspended source | does not fire (lane suspended). A lane full of admitted, progressing reservations is healthy saturation (A2); a lane full of reservations that stay *unadmitted* fires here — the wedge A2 cannot see |
+| Empty queue | does not fire (no reservations ⇒ no oldest age and no unadmitted work) |
+| Low traffic | unaffected; age and admission progress are the signals, not volume |
 
 ### A4. Elevated run failure rate
 
