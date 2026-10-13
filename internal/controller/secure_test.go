@@ -1705,6 +1705,70 @@ func TestWedgeAtCeilingPreservesUnrecoverableControlAndFencesRound(t *testing.T)
 	}
 }
 
+// TestWedgeOfSecureRunAtConfiguredCeilingFencesThenNeedsHuman pins the
+// configured-ceiling path (#216): with `MaxRestarts` set below the package
+// default, the wedge detection reconcile terminalizes a run at the configured
+// counter — not the default — and the secure round is fenced on that
+// detection reconcile. A wedge at `Restarts == configured` must hand off
+// to a human; a wedge below the configured counter would relaunch.
+func TestWedgeOfSecureRunAtConfiguredCeilingFencesThenNeedsHuman(t *testing.T) {
+	control, c := secureControl(t)
+	run := secureRun("wedge-secure-configured-ceiling")
+	run.Status.Phase = courier.PhaseRunning
+	const configuredCeiling = 2
+	run.Status.Restarts = configuredCeiling
+	controlPod := wedgedControlPod(run, livenessClock)
+	run.Status.Heartbeat = &courier.Heartbeat{
+		At:                metav1.NewTime(livenessClock.Add(-10 * time.Minute)),
+		Kind:              "stream",
+		CoordinatorPodUID: string(controlPod.UID),
+	}
+	if err := c.Create(context.Background(), run); err != nil {
+		t.Fatal(err)
+	}
+	workerPod := healthyPod(run.Name, topology.ComponentWorker)
+	brokerPod := healthyPod(run.Name, topology.ComponentBroker)
+	for _, pod := range []*corev1.Pod{controlPod, workerPod, brokerPod} {
+		if err := c.Create(context.Background(), pod); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := c.Create(context.Background(), topology.BrokerService(run)); err != nil {
+		t.Fatal(err)
+	}
+
+	reconciler := secureLivenessReconciler(c, control, livenessClock)
+	reconciler.MaxRestarts = configuredCeiling
+	result, err := reconciler.Reconcile(context.Background(), ctrl.Request{NamespacedName: client.ObjectKeyFromObject(run)})
+	if err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	if result.Requeue || result.RequeueAfter != 0 {
+		t.Fatalf("result = %#v, want no requeue; the configured-ceiling hand-off terminalizes in this reconcile", result)
+	}
+	var updated courier.CoderRun
+	if err := c.Get(context.Background(), client.ObjectKeyFromObject(run), &updated); err != nil {
+		t.Fatal(err)
+	}
+	if updated.Status.Phase != courier.PhaseNeedsHuman {
+		t.Fatalf("phase = %q, want NeedsHuman from the configured ceiling (%d), not the package default", updated.Status.Phase, configuredCeiling)
+	}
+	if updated.Status.Restarts != configuredCeiling {
+		t.Fatalf("restarts = %d, want %d (configured ceiling is preserved, not incremented)", updated.Status.Restarts, configuredCeiling)
+	}
+	var got corev1.Pod
+	if err := c.Get(context.Background(), types.NamespacedName{Namespace: run.Namespace, Name: topology.WorkerPodName(run.Name)}, &got); !apierrors.IsNotFound(err) {
+		t.Fatalf("worker must be fenced on the configured-ceiling reconcile, got %v", err)
+	}
+	var service corev1.Service
+	if err := c.Get(context.Background(), types.NamespacedName{Namespace: run.Namespace, Name: topology.BrokerServiceName(run.Name)}, &service); !apierrors.IsNotFound(err) {
+		t.Fatalf("broker ingress must be disabled on the configured-ceiling reconcile, got %v", err)
+	}
+	if err := c.Get(context.Background(), types.NamespacedName{Namespace: run.Namespace, Name: topology.BrokerPodName(run.Name)}, &got); !apierrors.IsNotFound(err) {
+		t.Fatalf("broker pod must be fenced on the configured-ceiling reconcile, got %v", err)
+	}
+}
+
 // TestWedgeDeferredChargeDoesNotFenceYet pins the sequencing the deferred
 // charge depends on: when the coordinator delete is still re-confirming
 // (the object survives the live read), the detection reconcile takes no
