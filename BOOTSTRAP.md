@@ -75,11 +75,11 @@ selected with `--executor-environment-secret`.
 Coordinator pods commit work in a fresh clone, so they always receive a git
 author and committer identity. Four operator flags configure it:
 `--git-author-name`, `--git-author-email`, `--git-committer-name`, and
-`--git-committer-email`. An unset or empty flag falls back to the explicit
-default `Courier <courier@localhost>`, keeping default behavior backward
-compatible. Configured values are validated at operator startup and again at
-pod generation: no control characters, and a non-empty email must contain `@`
-with no whitespace.
+`--git-committer-email`. An unset, empty, or whitespace-only flag falls back
+to the explicit default `Courier <courier@localhost>`, keeping default
+behavior backward compatible. Configured values are validated at operator
+startup and again at pod generation: no control characters or angle brackets,
+and a non-empty email must contain `@` with no whitespace.
 
 Precedence differs by path, deliberately. On the operator path the rendered
 values are explicit container environment variables, so they win over

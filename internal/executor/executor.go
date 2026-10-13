@@ -291,6 +291,16 @@ const (
 	DefaultGitAuthorEmail = "courier@localhost"
 )
 
+// The git identity environment contract. One set of names is shared by the
+// operator's pod rendering and the standalone executor's fallback so the two
+// producers cannot drift (#317).
+const (
+	EnvGitAuthorName     = "GIT_AUTHOR_NAME"
+	EnvGitAuthorEmail    = "GIT_AUTHOR_EMAIL"
+	EnvGitCommitterName  = "GIT_COMMITTER_NAME"
+	EnvGitCommitterEmail = "GIT_COMMITTER_EMAIL"
+)
+
 // GitIdentity is the deployment-configured git author and committer identity
 // rendered into operator-created coordinator pods (#317). Authentication
 // identity and commit authorship are separate concerns: nothing here is
@@ -342,18 +352,19 @@ func (g GitIdentity) Resolved() GitIdentity {
 func (g GitIdentity) Environment() []EnvVar {
 	resolved := g.Resolved()
 	return []EnvVar{
-		{Name: "GIT_AUTHOR_NAME", Value: resolved.AuthorName},
-		{Name: "GIT_AUTHOR_EMAIL", Value: resolved.AuthorEmail},
-		{Name: "GIT_COMMITTER_NAME", Value: resolved.CommitterName},
-		{Name: "GIT_COMMITTER_EMAIL", Value: resolved.CommitterEmail},
+		{Name: EnvGitAuthorName, Value: resolved.AuthorName},
+		{Name: EnvGitAuthorEmail, Value: resolved.AuthorEmail},
+		{Name: EnvGitCommitterName, Value: resolved.CommitterName},
+		{Name: EnvGitCommitterEmail, Value: resolved.CommitterEmail},
 	}
 }
 
 // Validate rejects configured (non-empty after trimming) identity values that
-// cannot safely travel in a container environment or a git commit object:
-// any ASCII control character in any field, and an email without "@" or with
-// embedded whitespace. Empty fields are not an error; they resolve to the
-// default identity.
+// cannot safely travel in a container environment or a git commit object: any
+// ASCII control character or angle bracket in any field (git's ident format
+// is `name <email>`, so `<`/`>` fail at commit time, and fail-fast is the
+// point), and an email without "@" or with embedded whitespace. Empty fields
+// are not an error; they resolve to the default identity.
 func (g GitIdentity) Validate() error {
 	fields := []struct {
 		name  string
@@ -370,8 +381,8 @@ func (g GitIdentity) Validate() error {
 			continue
 		}
 		for _, r := range field.value {
-			if r < 0x20 || r == 0x7f {
-				return fmt.Errorf("executor: %s must not contain control characters", field.name)
+			if r < 0x20 || r == 0x7f || r == '<' || r == '>' {
+				return fmt.Errorf("executor: %s must not contain control characters or angle brackets", field.name)
 			}
 		}
 		if field.email {

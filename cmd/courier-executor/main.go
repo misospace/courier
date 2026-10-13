@@ -1951,10 +1951,10 @@ func (r reporter) applyLinkagePlan(ctx context.Context, continuations int, maxCo
 // operator (or upstream) hard-coding a particular account (#317).
 func installGitIdentity() func() {
 	defaults := map[string]string{
-		"GIT_AUTHOR_NAME":     executor.DefaultGitAuthorName,
-		"GIT_AUTHOR_EMAIL":    executor.DefaultGitAuthorEmail,
-		"GIT_COMMITTER_NAME":  executor.DefaultGitAuthorName,
-		"GIT_COMMITTER_EMAIL": executor.DefaultGitAuthorEmail,
+		executor.EnvGitAuthorName:     executor.DefaultGitAuthorName,
+		executor.EnvGitAuthorEmail:    executor.DefaultGitAuthorEmail,
+		executor.EnvGitCommitterName:  executor.DefaultGitAuthorName,
+		executor.EnvGitCommitterEmail: executor.DefaultGitAuthorEmail,
 	}
 	type previousValue struct {
 		value string

@@ -1639,8 +1639,8 @@ named items remain unresolved and must not be described as production-ready:
   coordinator pod. Empty or whitespace-only fields resolve to the same
   explicit default `Courier <courier@localhost>`, so default behavior is
   backward compatible; configured values are validated fail-closed at startup
-  and at pod generation (no ASCII control characters; a non-empty email must
-  contain `@` and carry no whitespace). Precedence: operator flags are
+  and at pod generation (no ASCII control characters or angle brackets; a
+  non-empty email must contain `@` and carry no whitespace). Precedence: operator flags are
   explicit container env and therefore win over same-named keys of
   `--executor-environment-secret` (Kubernetes env-over-envFrom), while the
   standalone executor keeps the opposite order — a non-empty `GIT_*` in its

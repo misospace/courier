@@ -213,9 +213,9 @@ func main() {
 		CommitterEmail: gitCommitterEmail,
 	}
 	// Fail fast on a malformed deployment identity at startup rather than at
-	// the first launch; the same check runs again inside every Build.
-	if err := podConfig.Validate(); err != nil {
-		setupLog.Error(err, "unable to configure executor pods")
+	// the first launch; Build validates the identity again on every pod.
+	if err := podConfig.Git.Validate(); err != nil {
+		setupLog.Error(err, "unable to configure executor git identity")
 		os.Exit(1)
 	}
 	podConfig.OpenCode.Agent = opencodeAgent

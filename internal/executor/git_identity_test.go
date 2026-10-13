@@ -66,6 +66,8 @@ func TestGitIdentityValidate(t *testing.T) {
 		}},
 		{name: "newline in name", identity: GitIdentity{AuthorName: "Courier\nEvil"}, wantErr: "control characters"},
 		{name: "nul in email", identity: GitIdentity{CommitterEmail: "bot\x00@example.invalid"}, wantErr: "control characters"},
+		{name: "angle bracket in name", identity: GitIdentity{AuthorName: "Courier <Evil>"}, wantErr: "angle brackets"},
+		{name: "angle bracket in email", identity: GitIdentity{AuthorEmail: "bot>@example.invalid"}, wantErr: "angle brackets"},
 		{name: "email without at sign", identity: GitIdentity{AuthorEmail: "bot.example.invalid"}, wantErr: "must contain an @"},
 		{name: "email with space", identity: GitIdentity{CommitterEmail: "bot @example.invalid"}, wantErr: "whitespace"},
 	} {
@@ -149,13 +151,34 @@ func TestBuildCoordinatorPodRendersConfiguredGitIdentity(t *testing.T) {
 		defaultEnv[value.Name] = value.Value
 	}
 	for name, want := range map[string]string{
-		"GIT_AUTHOR_NAME":     DefaultGitAuthorName,
-		"GIT_AUTHOR_EMAIL":    DefaultGitAuthorEmail,
-		"GIT_COMMITTER_NAME":  DefaultGitAuthorName,
-		"GIT_COMMITTER_EMAIL": DefaultGitAuthorEmail,
+		EnvGitAuthorName:     DefaultGitAuthorName,
+		EnvGitAuthorEmail:    DefaultGitAuthorEmail,
+		EnvGitCommitterName:  DefaultGitAuthorName,
+		EnvGitCommitterEmail: DefaultGitAuthorEmail,
 	} {
 		if defaultEnv[name] != want {
 			t.Fatalf("default env %s = %q, want %q", name, defaultEnv[name], want)
+		}
+	}
+	// A whitespace-only configured field resolves end to end through pod
+	// generation to the explicit default, matching the standalone fallback.
+	blankPod, err := BuildCoordinatorPod(run, lane, PodConfig{
+		Image: "registry.example/courier-opencode:test",
+		Git:   GitIdentity{AuthorName: "   ", CommitterEmail: " \t"},
+	})
+	if err != nil {
+		t.Fatalf("BuildCoordinatorPod() blank error = %v", err)
+	}
+	blankEnv := map[string]string{}
+	for _, value := range blankPod.Spec.Containers[0].Env {
+		blankEnv[value.Name] = value.Value
+	}
+	for name, want := range map[string]string{
+		EnvGitAuthorName:     DefaultGitAuthorName,
+		EnvGitCommitterEmail: DefaultGitAuthorEmail,
+	} {
+		if blankEnv[name] != want {
+			t.Fatalf("blank env %s = %q, want %q", name, blankEnv[name], want)
 		}
 	}
 }
