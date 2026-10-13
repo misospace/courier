@@ -153,15 +153,32 @@ Phases are the existing enum (`api/v1alpha1/coderun_types.go:26-41`): `Pending`,
 | --- | --- | --- | --- | --- |
 | `courier_coderun_phase_transitions_total` | counter | transitions | `lane`, `mode`, `from`, `to` | One per observed phase change. `from`/`to` are the bounded phase enum. |
 | `courier_coderun_phase_duration_seconds` | histogram | seconds | `lane`, `mode`, `phase` | Time spent in a phase, observed once on leaving it. Buckets are a candidate; the existing run/queue buckets are a starting shape (`internal/controller/metrics.go:19-28`). |
-| `courier_coderuns_total` | counter | runs | `lane`, `mode`, `phase` | Existing: terminal runs by final phase. |
+| `courier_coderuns_total` | counter | runs | `lane`, `mode`, `phase` | Existing: terminal runs by **first** terminal phase. The label is set once — `transitionTerminal` records the metric exactly once on the run's first terminal transition (`firstTerminal := FinishedAt == nil`, `internal/controller/coderun_controller.go:835-885`), and a later transition that corrects the ending (for example `AwaitingReview → Done`, #250) does not increment the new phase. The label preserved is the phase at the first terminal transition, not the run's final disposition. |
 | `courier_coderun_run_duration_seconds` | histogram | seconds | `lane`, `mode`, `phase` | Existing: `StartedAt`→`FinishedAt`. |
 | `courier_coderun_queue_wait_seconds` | histogram | seconds | `lane`, `mode`, `phase` | Existing: creation→`AdmittedAt`. |
 
 Phase **age** (how long a run has been in its current phase) is not a metric
-dimension: a per-run label would be unbounded. Age is derived at view time from
-the status timestamps (`AdmittedAt`, `StartedAt`, `FinishedAt`, and condition
-`lastTransitionTime`) against the cluster clock. The histogram above captures the
-aggregate distribution without a per-run label.
+dimension: a per-run label would be unbounded. The status timestamps cover a
+subset of phases only; what is recoverable from `Status` today is:
+
+| Phase | Recoverable from `Status` today | What is missing |
+| --- | --- | --- |
+| `Pending` | yes — `now − metadata.creationTimestamp` | — |
+| `Claimed` | partial — `now − AdmittedAt` overstates `Claimed` age once the run advances to `Running` | a `Claimed`-entry timestamp |
+| `Running` | yes — `now − StartedAt` | — |
+| `Verifying` | **no** — `StartedAt` is the `Running` start, not the `Verifying` start; `FinishedAt` is nil; no condition `lastTransitionTime` is stamped for `Verifying` (`coderun_controller.go:649-666`). A view that derives `Verifying` age from `Status` overstates it by the entire `Running` duration | the `Verifying`-entry timestamp |
+| `AwaitingReview` / `HandedOff` / `Failed` / `NeedsHuman` / `BlockedExternal` | partial — `FinishedAt` is the run's first terminal transition (set-once, `coderun_controller.go:838-848`); a later `AwaitingReview → Done` does **not** move `FinishedAt` and never records a `Done`-entry timestamp, so `now − FinishedAt` overstates a `Done` run's age by the gap from `AwaitingReview` to merge | a per-phase entry timestamp |
+| `Done` | **no** — never an entry timestamp; the terminal histogram captures aggregate distribution, not per-run age | the `Done`-entry timestamp |
+
+The recoverable cells are the only safe derivations; the **unknown** cells
+are exactly the cases the rule in §4.3 demands: uncertainty is a state, not
+a measured zero (a view that shows `now − StartedAt` as `Verifying` age is
+silently wrong, not just imprecise). The histogram in this section captures
+aggregate distribution without a per-run label; per-run accurate phase age
+requires either the `phase.transition` log event
+(`internal/log/events.go:67-68`), joined on `run_id`, or a proposed
+durable `Status.PhaseEnteredAt` per phase, neither of which is authorized
+here.
 
 ### 3.5 Execution outcomes (core)
 
@@ -260,6 +277,25 @@ collapse into one "done".
   `courier_coderun_phase_transitions_total` /
   `courier_coderun_phase_duration_seconds` — the `Running` phase's duration is
   observed on leaving it — not a reinterpretation of the terminal duration.
+
+  The **`phase` label** of `courier_coderuns_total` is the phase at the
+  first terminal transition, **not** the run's final disposition. A run
+  that reaches `Verifying`, is observed green, advances to `AwaitingReview`,
+  and later resolves to `Done` (#250) records exactly one
+  `{phase="AwaitingReview"}` increment and never a `{phase="Done"}`:
+  `transitionTerminal`'s `firstTerminal := FinishedAt == nil`
+  (`internal/controller/coderun_controller.go:835-885`) gates the
+  `ObserveTerminal` call, and `ObserveTerminal`'s own comment
+  (`internal/controller/metrics.go:114-136`) is explicit that a later
+  `AwaitingReview → Done` must not count again. The terminal histogram
+  keeps the first terminal-phase label as well. Treating the metric as
+  "runs by final phase" would invite a dashboard to read `{phase="Done"}`
+  as merge throughput — a count the metric never emits. Run-level
+  current state per phase is a separate future measurement: a
+  current-state per-phase gauge derived from the cluster
+  (e.g. `courier_coderuns_by_phase`), or a `courier_coderuns_disposition_total`
+  event counter for merge/handoff transitions, neither of which is
+  authorized here.
 - **External disposition** is what happens after Courier stopped working: CI
   advancing to green, a red check, a human review, a merge, or the source's own
   handling. `Verifying` is a *live* state — Courier owns observation but has no

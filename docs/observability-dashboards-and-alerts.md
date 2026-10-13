@@ -84,7 +84,7 @@ controller-runtime on the `--metrics-bind-address` endpoint (default `:8080`,
 | --- | --- | --- | --- |
 | `courier_coderun_run_duration_seconds` | histogram | `lane`, `mode`, `phase` | `StartedAt`→`FinishedAt`, observed once on terminal transition |
 | `courier_coderun_queue_wait_seconds` | histogram | `lane`, `mode`, `phase` | creation→`AdmittedAt`, observed once on terminal transition |
-| `courier_coderuns_total` | counter | `lane`, `mode`, `phase` | runs reaching a terminal phase |
+| `courier_coderuns_total` | counter | `lane`, `mode`, `phase` | runs reaching a terminal phase — label is the **first** terminal phase (one increment per run; a later `AwaitingReview → Done` does not increment `{phase="Done"}`, per #290 §3.4/§4.1) |
 | `courier_coderuns_in_flight` | gauge | `lane` | live cluster read at scrape; counts `Claimed`+`Running` |
 | `courier_lane_suspended` | gauge | `lane` | 1 suspended, 0 active; live read at scrape |
 | `courier_metrics_scrape_errors_total` | counter | — | failed `List` calls during lane collection |
@@ -218,7 +218,7 @@ Run execution answers: *what happened to the runs, and why?*
 
 | Panel | Intent | Backing signals | Portable semantics | Empty / unknown | Status |
 | --- | --- | --- | --- | --- | --- |
-| Terminal outcomes | Outcome mix over time | `courier_coderuns_total` | rate of terminal runs by `lane`,`mode`,`phase` | no runs ⇒ zero | today |
+| Terminal outcomes | Outcome mix over time | `courier_coderuns_total` | rate of terminal runs by `lane`,`mode`,`phase` (label = first terminal phase; a later `AwaitingReview → Done` does not increment `{phase="Done"}` — render merge throughput separately, see §3.4) | no runs ⇒ zero | today |
 | Run duration | How long runs take | `courier_coderun_run_duration_seconds` | histogram quantiles, seconds, by lane/mode/phase | no samples ⇒ "no completed runs" | today |
 | Queue wait | Admission delay | `courier_coderun_queue_wait_seconds` | histogram quantiles, seconds | no samples ⇒ "no recent admissions" | today |
 | Terminal diagnostic mix | Why runs ended badly | `TerminalDiagnostic` category (status), `run.exit` log | counts by category | absent diagnostic ⇒ "unknown", never "success" | log/status |
@@ -227,9 +227,15 @@ Run execution answers: *what happened to the runs, and why?*
 | Token/model usage | Cost and model behaviour | `status.telemetry`, `run.summary` log (gap: not exported) | tokens by type, per lane/mode where exported | absent telemetry ⇒ "not reported" | log/status |
 
 Outcomes are split deliberately: **executor completion** (the run reached a
-terminal phase) is not the same as **external disposition** (CI, review, merge).
-The dashboard shows terminal-phase mix as executor completion; external
-disposition appears in section 3.4.
+terminal phase — the run's first terminal phase, per #290 §3.4/§4.1, which
+is the label on `courier_coderuns_total` and the entry the
+`courier_coderun_run_duration_seconds` histogram observes) is not the same
+as **external disposition** (CI, review, merge). The dashboard shows
+first-terminal-phase mix as executor completion; external disposition
+appears in section 3.4, and a current-state per-phase gauge or a
+disposition event counter is a separate future measurement, not a
+reinterpretation of `courier_coderuns_total{phase="Done"}` (the metric
+never increments `Done` for a run that terminalized at `AwaitingReview`).
 
 ### 3.4 Lifecycle reporting
 
