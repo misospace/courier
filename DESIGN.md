@@ -1241,9 +1241,16 @@ there is no delete verb because active runs reference lanes. (#73)
   publishes `in-review` after stable green observations. Fix-pr attempts receive
   `failed` if checks turn red; a resolve-issue run hands off to **HandedOff**
   instead.
-- **AwaitingReview** is terminal for this run. For a PR, human merges → operator
-  marks **Done** and resolves the source; feedback/conflict → the source spawns a
-  fresh `fix-pr` run without reusing the previous run. A `no_change_needed`
+- **AwaitingReview** is terminal for this run. For a PR, human merges → a slow,
+  bounded world observation (#250) reads the run's **exact recorded PR identity**
+  — base repository plus `status.pr` number through the forge read-pull-request
+  capability, head repository and ref from `status` — and only a merge the forge
+  confirms on that identity moves the run to **Done** and resolves the source;
+  an open PR, a PR closed without merge, a forge error, a missing PR, or a PR
+  whose head identity no longer matches keeps the run in **AwaitingReview** and
+  retries at the slow cadence (closed-unmerged terminalization is #251).
+  feedback/conflict → the source spawns a fresh `fix-pr` run without reusing the
+  previous run. A `no_change_needed`
   resolve-issue run also waits here with its evidence posted for human review;
   Courier does not resolve that source from the coordinator's declaration. A
   `no_change_needed` **fix-pr** run instead waits in **BlockedExternal** on an
@@ -1273,7 +1280,7 @@ terminal phase with the report retried on a later reconcile. (#178)
 
 ## Terminal retention and closed-unmerged PRs (#251)
 
-**The leak:** `reapDone` (`internal/controller/reap.go`) deletes only resolved `Done` runs after a default five minutes. `AwaitingReview`, `HandedOff`, `NeedsHuman`, and `Failed` are never reaped: `Reconcile` (`internal/controller/coderun_controller.go`) revisits a terminal phase only to retry a pending lifecycle report and otherwise returns without a timer, and the controller never re-observes a PR after a run settles `AwaitingReview`. The #179 dogfood deployment left 26 `AwaitingReview`, 6 `NeedsHuman`, 1 `Failed`, and 17 retained coordinator pods. `source.Runner.Poll` (`internal/source/runner.go`) lists every CoderRun on every poll to build its dedupe set, so the list grows without bound.
+**The leak:** `reapDone` (`internal/controller/reap.go`) deletes only resolved `Done` runs after a default five minutes. `HandedOff`, `NeedsHuman`, and `Failed` are never reaped: `Reconcile` (`internal/controller/coderun_controller.go`) revisits a terminal phase only to retry a pending lifecycle report and otherwise returns without a timer. `AwaitingReview` was part of the same gap — the controller never re-observed a PR after a run settled — until #250 added the slow, bounded read of the recorded pull request that turns a confirmed merge into `Done`; a PR closed without merge still keeps its run indefinitely, which this design fixes below. The #179 dogfood deployment left 26 `AwaitingReview`, 6 `NeedsHuman`, 1 `Failed`, and 17 retained coordinator pods. `source.Runner.Poll` (`internal/source/runner.go`) lists every CoderRun on every poll to build its dedupe set, so the list grows without bound.
 
 **Retention clock:** Retention is a bounded inspection window keyed to a durable, **per-phase "reap-eligible" annotation** — not `FinishedAt`, not `CreationTimestamp`, and not the source report condition alone. `FinishedAt` records the run's execution end and is set-once on the first terminal transition (`AwaitingReview`, `HandedOff`, `NeedsHuman`, or `Failed`); it must remain immutable so a later transition (notably the months-late `AwaitingReview → NeedsHuman` from a closed-unmerged PR) does not distort `RunDuration` or the merge-to-`Done` semantics, and so `Done`'s `RunDuration` is always the work's wall-clock cost rather than the reaper's view of it. Therefore `FinishedAt` is **not** the retention clock for `NeedsHuman`/`Failed`. The controller instead writes a new set-once annotation when the run becomes reap-eligible for that phase: `courier.misospace.dev/needs-human-at` on entry to `NeedsHuman` and `courier.misospace.dev/failed-at` on entry to `Failed`, each an RFC3339 timestamp stamped once after the lifecycle report reaches a settled state (see Deletion gates). For a direct `Running`/`Verifying → NeedsHuman`/`Failed`, the annotation is written at the same moment `FinishedAt` is set, so the window starts at the actual end of execution; for a late `AwaitingReview → NeedsHuman` (the closed-unmerged case), the annotation is written at the close-unmerged transition, **not** the original `FinishedAt`, so the seven-day window is the operator's inspection window for the new outcome, not a zero-length residue of months-old execution time. `Done` keeps its existing separate `courier.misospace.dev/done-at` annotation (`doneAtAnnotation`) because a `Done` transition can occur long after `FinishedAt` (and the source `Resolve` precedes the marker, not the phase change). A missing or malformed marker starts a fresh window and never deletes on the same pass; a future-dated marker (clock skew) is capped at the window and never deletes early — the same fail-safe rules `reapDone` already applies. `AwaitingReview` is deliberately outside this window: it is a success ending awaiting a human merge, not a terminal failure, so it is kept until the world moves it — #250 resolves a merge to `Done`, and this design resolves a closed-unmerged PR to `NeedsHuman`; only then does a retention window start. A PR that stays open keeps its run, which is the run's live-work record and the human gate. The annotations live on the object, so controller restart re-derives the remaining window from the durable marker without re-stamping, re-arming, or distorting `FinishedAt`.
 
@@ -2497,3 +2504,22 @@ was superseded.
   This reverses the delete-before-recreate and open-green already-addressed
   policies recorded in the earlier #267 follow-up. Source-owned generation and
   cooldown fence recovery instead of a Courier poll-driven retry loop. (#267)
+
+- **2026-10-13 — #250: a settled `AwaitingReview` run observes its exact
+  recorded PR identity at a slow cadence; a forge-confirmed merge on that
+  identity finishes it `Done`.** `Reconcile` now revisits a settled
+  `AwaitingReview` run (after any pending lifecycle report has retried — the
+  source sees `in-review` before the `Done` resolve) with one slow, bounded
+  read through the forge `read-pull-request` capability: base repository plus
+  the `status.pr` number, verified against the recorded head repository and
+  ref, never inferred from a branch name. Only `merged` on that exact identity
+  transitions; open, closed-unmerged, absent, ambiguous, head-changed, or an
+  error never does, and `FinishedAt` is preserved. `Done` reuses the existing
+  lifecycle — source `Resolve` precedes the `done-at` marker, so a run whose
+  source could not be resolved is still never reaped, and after the reap the
+  source is the dedupe authority (Dispatch excludes `done` issues from
+  `next-task`, verified against `src/lib/agent-queue.ts`). Terminal-run metrics
+  are recorded on the run's **first** terminal transition only, so a late
+  `Done` does not count the run twice. Closed-unmerged terminalization and the
+  `Failed`/`NeedsHuman` retention window stay with #251's children.
+  (#250, #179, #251)

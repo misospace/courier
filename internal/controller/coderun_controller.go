@@ -96,6 +96,14 @@ type CoderRunReconciler struct {
 	// Observer reads the external pull request and CI state after a successful run.
 	Observer WorldObserver
 
+	// PullRequests, when set, gives a settled AwaitingReview run its slow,
+	// bounded world observation: an exact read of the recorded pull request
+	// through the configured forge capability. A confirmed merge resolves
+	// the run to Done and enters the existing resolve-then-reap lifecycle.
+	// Nil means post-review merges are never observed, so the run keeps the
+	// watch-only behavior of a deployment without a forge read path.
+	PullRequests PullRequestReader
+
 	// Evidence reconciles the run's failure-evidence Secrets at the terminal
 	// boundary the operator can prove: a world-verified success (AwaitingReview,
 	// Done) has its evidence deleted, and a dirty terminal (Failed, NeedsHuman)
@@ -214,7 +222,9 @@ func (r *CoderRunReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 	// value as Pending so a source does not need a second status write before
 	// admission can begin. A terminal run normally does nothing, except when its
 	// lifecycle report is still pending: then the report alone is retried, since
-	// the run already reached its phase and freed capacity.
+	// the run already reached its phase and freed capacity. A settled
+	// AwaitingReview run additionally takes one slow, bounded read of its
+	// recorded pull request, so a human merge can finish and reap it.
 	if run.Status.Phase != "" && run.Status.Phase != courierv1alpha1.PhasePending {
 		if lifecycleReportPending(&run) {
 			if lifecycleReportUnsupported(&run) {
@@ -226,6 +236,12 @@ func (r *CoderRunReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 				}
 			}
 			return r.retryTerminalLifecycle(ctx, &run)
+		}
+		// The pending report above owns the reconcile first: the source must
+		// see the in-review lifecycle before the Done resolve, so a merged PR
+		// is observed only once the run's own report has settled.
+		if run.Status.Phase == courierv1alpha1.PhaseAwaitingReview {
+			return r.observeMergedReviewPR(ctx, &run)
 		}
 		l.V(1).Info("reconcile", "phase", run.Status.Phase)
 		return ctrl.Result{}, nil
@@ -795,6 +811,9 @@ func (r *CoderRunReconciler) transitionTerminal(ctx context.Context, run *courie
 		return ctrl.Result{}, err
 	}
 	phaseChanged := run.Status.Phase != phase
+	// FinishedAt is set once, on the run's first terminal transition, so its
+	// absence marks this reconcile as the one that records the run's metrics.
+	firstTerminal := run.Status.FinishedAt == nil
 	before := run.DeepCopy()
 	run.Status.Phase = phase
 	if pr != "" {
@@ -806,8 +825,7 @@ func (r *CoderRunReconciler) transitionTerminal(ctx context.Context, run *courie
 	if phaseChanged {
 		// finishedAt marks when the run's own execution ended: it is
 		// recorded on every terminal transition, set-once, so a later
-		// operator-marked Done (post-merge, currently unimplemented) never
-		// moves it.
+		// merge-confirmed Done (#250) never moves it.
 		if run.Status.FinishedAt == nil {
 			run.Status.FinishedAt = &metav1.Time{Time: r.clock().UTC()}
 			if run.Status.StartedAt != nil && run.Status.RunDuration == "" {
@@ -837,9 +855,13 @@ func (r *CoderRunReconciler) transitionTerminal(ctx context.Context, run *courie
 		// dropped) on the reconcile that entered it.
 		return ctrl.Result{}, nil
 	}
-	// The terminal phase is final, so only the reconcile that changes into it
-	// records the run's metrics; re-reconciles return above.
-	r.metrics().ObserveTerminal(run)
+	// The run's metrics are recorded once, on its first terminal transition.
+	// A later transition that corrects the ending — a confirmed merge
+	// settling AwaitingReview as Done (#250) — must not count the same run
+	// twice.
+	if firstTerminal {
+		r.metrics().ObserveTerminal(run)
+	}
 	return r.publishTerminalLifecycle(ctx, run, adapter, item, phase, intent)
 }
 

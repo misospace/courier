@@ -12,6 +12,8 @@ import (
 
 	courierv1alpha1 "github.com/misospace/courier/api/v1alpha1"
 	"github.com/misospace/courier/internal/controller"
+	"github.com/misospace/courier/internal/forge"
+	couriergithub "github.com/misospace/courier/internal/github"
 	"github.com/misospace/courier/internal/source/dispatch"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -42,6 +44,26 @@ func TestExistingPRHeadResolver(t *testing.T) {
 	}
 	if got := existingPRHeadResolver(nil); got != nil {
 		t.Fatal("existingPRHeadResolver(nil) returned a resolver")
+	}
+}
+
+func TestPullRequestReaderWiresForgeCapability(t *testing.T) {
+	if got := pullRequestReader(nil); got != nil {
+		t.Fatal("pullRequestReader(nil) returned a reader")
+	}
+	if got := pullRequestReader(observerWithHeadResolver{}); got != nil {
+		t.Fatal("pullRequestReader() returned a reader for a non-GitHub observer")
+	}
+	client, err := couriergithub.New("test-token")
+	if err != nil {
+		t.Fatalf("build GitHub client: %v", err)
+	}
+	reader := pullRequestReader(couriergithub.Observer{Client: client})
+	if reader == nil {
+		t.Fatal("pullRequestReader() returned nil for the GitHub observer")
+	}
+	if availability := reader.Capabilities().Available(forge.CapabilityReadPullRequest); !availability.Available {
+		t.Fatalf("read-pull-request capability = %#v, want available for the wired reader", availability)
 	}
 }
 

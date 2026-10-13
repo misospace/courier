@@ -345,6 +345,7 @@ func main() {
 		Sources:        sources,
 		StatusWriter:   status.KubePatchWriter{Client: mgr.GetClient()},
 		Observer:       githubObserver,
+		PullRequests:   pullRequestReader(githubObserver),
 		Events:         runEvents,
 		Evidence:       evidenceIntake,
 		PRHeadResolver: existingPRHeadResolver(githubObserver),
@@ -404,6 +405,19 @@ func existingPRHeadResolver(observer controller.WorldObserver) controller.Existi
 	}
 	resolver, _ := observer.(controller.ExistingPRHeadResolver)
 	return resolver
+}
+
+// pullRequestReader gives the reconciler's slow post-review observation the
+// forge capability it reads through: the exact pull-request read of the
+// configured provider, built on the operator's own read credential. The core
+// never receives a forge-specific client or CLI — only the forge.Provider
+// seam and its capability diagnostics.
+func pullRequestReader(observer controller.WorldObserver) controller.PullRequestReader {
+	githubObserver, ok := observer.(couriergithub.Observer)
+	if !ok || githubObserver.Client == nil {
+		return nil
+	}
+	return couriergithub.NewProvider(forge.ProviderConfig{Name: "github"}, githubObserver.Client)
 }
 
 // validateEvidenceFlags reports a clear error when the evidence intake flags
