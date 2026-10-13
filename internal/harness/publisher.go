@@ -76,29 +76,40 @@ func NewPublicationEngine(broker *BrokerClient, tree *Integrator) (*PublicationE
 // PrepareSnapshot implements the SnapshotProvider seam.
 func (e *PublicationEngine) PrepareSnapshot(ctx context.Context) (Snapshot, error) {
 	if !e.seeded {
-		snap, err := retried(ctx, func(ctx context.Context) (BrokerSnapshot, error) {
-			return e.broker.Snapshot(ctx)
-		})
-		if err != nil {
-			return Snapshot{}, e.classify(err, "the seed snapshot read")
-		}
-		tip, err := e.tree.Seed(ctx, snap.Data)
-		if err != nil {
-			return Snapshot{}, err
-		}
-		if tip != snap.Tip {
-			return Snapshot{}, errors.New("harness: seeded tree does not match the observed snapshot tip")
-		}
-		e.seeded = true
-		e.seedTip = tip
-		e.seedWorkRefExist = snap.WorkRefExists
-		e.seedAtAnchor = snap.AtAnchor
-		// The seed is the world at incarnation start: nothing this
-		// incarnation published is confirmed yet.
-		e.lastConfirmed = ""
-		return Snapshot{Data: snap.Data, Tip: tip, BaseTip: e.tree.BaseTip()}, nil
+		return e.seed(ctx)
 	}
 	return e.tree.Render(ctx)
+}
+
+// seed absorbs the live world into this incarnation's integration tree and
+// records it as the seed publication evidence: the world at incarnation
+// start, before anything this incarnation did. It is the engine's own
+// recovery when a publication is attempted before any snapshot, brief, or
+// shell has prepared one — a recovered incarnation whose run is soft-stopped
+// at its first step boundary still publishes from the world's evidence, not
+// from a refused unseeded publish.
+func (e *PublicationEngine) seed(ctx context.Context) (Snapshot, error) {
+	snap, err := retried(ctx, func(ctx context.Context) (BrokerSnapshot, error) {
+		return e.broker.Snapshot(ctx)
+	})
+	if err != nil {
+		return Snapshot{}, e.classify(err, "the seed snapshot read")
+	}
+	tip, err := e.tree.Seed(ctx, snap.Data)
+	if err != nil {
+		return Snapshot{}, err
+	}
+	if tip != snap.Tip {
+		return Snapshot{}, errors.New("harness: seeded tree does not match the observed snapshot tip")
+	}
+	e.seeded = true
+	e.seedTip = tip
+	e.seedWorkRefExist = snap.WorkRefExists
+	e.seedAtAnchor = snap.AtAnchor
+	// The seed is the world at incarnation start: nothing this
+	// incarnation published is confirmed yet.
+	e.lastConfirmed = ""
+	return Snapshot{Data: snap.Data, Tip: tip, BaseTip: e.tree.BaseTip()}, nil
 }
 
 // WorkRefBeyondAnchor reports the broker's live observation of the pinned
@@ -126,10 +137,16 @@ func (e *PublicationEngine) Integrate(ctx context.Context, req IntegrationReques
 // observation. When the world has moved, the engine re-observes and
 // classifies once per round: its own previously published state is
 // fast-forwarded, a base advance is re-synced with a merge, and a foreign
-// tip is never rebased onto or adopted.
+// tip is never rebased onto or adopted. An engine that was never prepared
+// seeds from the live world first, so a publication reached before any
+// snapshot, brief, or shell — a soft stop acknowledged at a recovered
+// incarnation's first step boundary — confirms the world's own evidence
+// idempotently instead of refusing to publish.
 func (e *PublicationEngine) Publish(ctx context.Context) (Publication, error) {
 	if !e.seeded {
-		return Publication{}, ErrNothingToPublish
+		if _, err := e.seed(ctx); err != nil {
+			return Publication{}, err
+		}
 	}
 	expected := e.expectedTip()
 	for round := 0; round <= worldReconcileRounds; round++ {

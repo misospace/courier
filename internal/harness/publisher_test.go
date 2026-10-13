@@ -755,8 +755,9 @@ func TestPublicationNothingToPublishWithoutWork(t *testing.T) {
 	if _, err := engine.Publish(context.Background()); !errors.Is(err, ErrNothingToPublish) {
 		t.Fatalf("publish without work = %v, want ErrNothingToPublish", err)
 	}
-	// An engine that never seeded has the same verdict, deterministically
-	// rather than as an infrastructure failure.
+	// An engine that never seeded reaches the same verdict: it seeds from
+	// the live world first, and a world with no work beyond the anchor has
+	// nothing to publish either.
 	if _, err := f.engineFor().Publish(context.Background()); !errors.Is(err, ErrNothingToPublish) {
 		t.Fatalf("unseeded publish = %v, want ErrNothingToPublish", err)
 	}

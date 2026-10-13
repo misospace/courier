@@ -361,6 +361,63 @@ func TestSoftStopFinishDerivesOutcomeFromWorld(t *testing.T) {
 	})
 }
 
+// A soft stop acknowledged at a recovered incarnation's first step boundary
+// arrives before any snapshot, brief, or shell has prepared the publication
+// engine. The finish must still confirm the world's own already-published
+// work and end as changes — never refuse the publish and relaunch. This runs
+// the real engine against the real broker: a stub publisher cannot see the
+// state dependency.
+func TestSoftStopEarlyFinishConfirmsRecoveredWork(t *testing.T) {
+	ctx := context.Background()
+	f := newBrokerFixture(t)
+	engine := f.engineFor()
+	tip := f.prepare(t, engine)
+	bundle := f.workerBundle(tip, "b1", "c.txt", "work\n", engine)
+	integration, err := engine.Integrate(ctx, f.request("b1", tip, bundle))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := engine.Publish(ctx); err != nil {
+		t.Fatal(err)
+	}
+	published := integration.Commit
+
+	// The recovered incarnation: control-side state is gone, the world is
+	// not, and nothing has prepared the engine yet.
+	recovered := f.engineFor()
+	beyond, err := recovered.WorkRefBeyondAnchor(ctx)
+	if err != nil || !beyond {
+		t.Fatalf("work ref beyond anchor = %v (err %v), want the recovered publication", beyond, err)
+	}
+	gateway, _, cleanup := gatewayFor(
+		gatewayResponse{body: sse(contentChunk(`{"outcome":"changes"}`), finishChunk("stop"))},
+	)
+	defer cleanup()
+	watcher := NewControlWatcher(&stubControlSource{requests: []*courierv1alpha1.ControlRequest{controlRequest("req-1")}}, &stubAckWriter{})
+	watcher.Poll(ctx) // acknowledged before the first turn, engine unprepared
+	coordinator, err := NewCoordinator(CoordinatorConfig{
+		Gateway: gateway, Bindings: testBindings(),
+		Control: watcher, Publisher: recovered,
+		WorkRefBeyondAnchor: recovered.WorkRefBeyondAnchor,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	result := coordinator.Run(ctx, testInvocation())
+	if result.Err != nil || result.Outcome != "changes" {
+		t.Fatalf("result = %+v, want changes from the world's confirmed work", result)
+	}
+	// The confirmation is idempotent: the remote holds exactly the one
+	// publication, with no duplicate push and no relaunch.
+	remote, _, err := f.remoteWorkTip()
+	if err != nil || remote != published {
+		t.Fatalf("remote tip = %s (err %v), want exactly %s", remote, err, published)
+	}
+	if commits := gitRev(t, f.workPath, "rev-list", "--count", f.baseOID+".."+remote); commits != "1" {
+		t.Fatalf("remote commits beyond base = %s, want exactly 1 (no duplicates)", commits)
+	}
+}
+
 // --- broker client read route ---------------------------------------------------
 
 func TestBrokerClientControlRequest(t *testing.T) {
