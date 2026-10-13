@@ -21,6 +21,16 @@ import (
 
 const (
 	defaultTimeout = 30 * time.Second
+
+	// outcomeWaitingExternal is the Dispatch task-report outcome Courier
+	// sends for a recoverable dependency block (source.ResultBlockedExternal).
+	// Dispatch is expected to treat it as a no-op for fix-attempt accounting:
+	// do not advance generation, do not increment fixAttempts, do not park
+	// the item for a human, and keep it discoverable so the source can
+	// re-issue the work once the prerequisite is satisfied. A legacy
+	// Dispatch that does not yet recognise this outcome will reject the
+	// report; that is a known cross-repo gap tracked alongside #267.
+	outcomeWaitingExternal = "waiting-external"
 )
 
 var (
@@ -382,6 +392,29 @@ func (c *HTTPClient) markPRFixBlocked(ctx context.Context, d workDescriptor, not
 	}, nil))
 }
 
+// markPRFixWaitingExternal records a Courier-classified dependency wait on
+// the issued PR-fix generation. Unlike a BLOCKED mark it must not surface to
+// a human; unlike a STALE mark it must not retire the work. Dispatch treats
+// it as a recoverable, generation-fenced wait: the attempt is not reissued,
+// fixAttempts is not advanced, and the item is left discoverable for the
+// next cycle once the prerequisite is satisfied. See DESIGN.md §267 for the
+// cross-repo contract this depends on.
+func (c *HTTPClient) markPRFixWaitingExternal(ctx context.Context, d workDescriptor, note string) error {
+	if d.Type != "followup-pr" || d.PRFixID == "" {
+		return nil
+	}
+	if strings.TrimSpace(note) == "" {
+		note = "Courier run is waiting on an external prerequisite"
+	}
+	return asSuperseded(c.do(ctx, http.MethodPost, "/api/pr-fix-queue/mark", map[string]any{
+		"repo":       d.Repo,
+		"pr":         d.Number,
+		"status":     "WAITING_EXTERNAL",
+		"note":       note,
+		"generation": d.Generation,
+	}, nil))
+}
+
 func (c *HTTPClient) markPRFixStale(ctx context.Context, pullRequest *PullRequest, state PullRequestState, generation int) error {
 	if pullRequest == nil {
 		return errors.New("dispatch client: cannot mark missing pull request stale")
@@ -523,6 +556,16 @@ func (c *HTTPClient) Report(ctx context.Context, id string, lifecycle source.Lif
 			return reportErr
 		}
 		return errors.Join(reportErr, c.markPRFixBlocked(ctx, d, lifecycle.Error))
+	case source.ResultBlockedExternal:
+		// Recoverable dependency block. The task report uses a dedicated
+		// outcome so Dispatch's existing failed-attempt accounting does not
+		// fire; for a queue-backed follow-up the queue mark keeps the issued
+		// generation current with a distinct recoverable status (no
+		// advancement, no human park). See DESIGN.md §267 for the cross-repo
+		// contract this depends on and the failure modes each signal rules
+		// out.
+		reportErr := c.reportTaskWithPR(ctx, d, outcomeWaitingExternal, lifecycle.Error, lifecycle.PR, lifecycle.IdempotencyKey, lifecycle.Telemetry, lifecycle.StartedAt)
+		return errors.Join(reportErr, c.markPRFixWaitingExternal(ctx, d, lifecycle.Error))
 	case source.ResultFailed:
 		// Dispatch's failed report requeues eligible PR-fix work under its
 		// existing attempt cap. A separate BLOCKED mark can target a stale
@@ -533,6 +576,10 @@ func (c *HTTPClient) Report(ctx context.Context, id string, lifecycle source.Lif
 		// through its own PR-followup sync. It must not be Ready (green) or
 		// BLOCKED (which parks the issue).
 		return c.reportTaskWithPR(ctx, d, "handed-off", lifecycle.Error, lifecycle.PR, lifecycle.IdempotencyKey, lifecycle.Telemetry, lifecycle.StartedAt)
+	case source.ResultNoChange:
+		// Retain enum compatibility, but a bare no-change assertion carries
+		// no source-verified feedback evidence and cannot authorize FIXED.
+		return source.ErrUnsupportedOutcome
 	default:
 		return nil
 	}

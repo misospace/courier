@@ -240,7 +240,7 @@ func TestEnvtestNoChangeNeededResolveIssueEndsInReview(t *testing.T) {
 	}
 }
 
-func TestEnvtestNoChangeNeededFixPREndsNeedsHuman(t *testing.T) {
+func TestEnvtestNoChangeNeededFixPRMergedSettlesDone(t *testing.T) {
 	if envtestClient == nil {
 		t.Skip("KUBEBUILDER_ASSETS is not set")
 	}
@@ -263,6 +263,9 @@ func TestEnvtestNoChangeNeededFixPREndsNeedsHuman(t *testing.T) {
 			"manual": item,
 		}),
 		StatusWriter: status.KubePatchWriter{Client: envtestClient},
+		// The world proves the fix-pr's pull request is already merged, so a
+		// no_change_needed declaration settles successfully as Done (#267).
+		Observer: fakeWorldObserver{observation: PRObservation{PR: "42", Merged: true}},
 		PRHeadResolver: ExistingPRHeadResolverFunc(func(_ context.Context, run *courierv1alpha1.CoderRun) (HeadRef, error) {
 			return HeadRef{Repo: run.Spec.Repo, Branch: "feature/existing-pr-head", SHA: "abc123"}, nil
 		}),
@@ -317,14 +320,92 @@ func TestEnvtestNoChangeNeededFixPREndsNeedsHuman(t *testing.T) {
 		t.Fatalf("admitted head = branch %q repo %q sha %q, want existing PR head", admitted.Status.Branch, admitted.Status.HeadRepo, admitted.Status.HeadSHA)
 	}
 	reconcile()
-	assertEnvtestPhase(t, name, courierv1alpha1.PhaseNeedsHuman)
-	// Exactly one needs-human transition: the launch's in-progress plus the
-	// no_change_needed ending. The source must never be resolved.
-	if len(item.transitions) != 2 || item.transitions[0] != source.StateInProgress || item.transitions[1] != source.StateNeedsHuman {
-		t.Fatalf("source transitions = %#v, want in-progress then needs-human", item.transitions)
+	assertEnvtestPhase(t, name, courierv1alpha1.PhaseVerifying)
+	reconcile()
+	assertEnvtestPhase(t, name, courierv1alpha1.PhaseDone)
+	// The launch's in-progress is the only source transition: a fix-pr
+	// no_change_needed declaration is settled by the world (merged), not
+	// parked as a human block.
+	if len(item.transitions) != 1 || item.transitions[0] != source.StateInProgress {
+		t.Fatalf("source transitions = %#v, want only the launch in-progress", item.transitions)
 	}
-	if len(item.resolved) != 0 {
-		t.Fatalf("source resolves = %#v, want none", item.resolved)
+	// Done resolves the source on the next reconcile.
+	reconcile()
+	if len(item.resolved) != 1 || item.resolved[0] != name {
+		t.Fatalf("source resolves = %#v, want the merged fix-pr resolved", item.resolved)
+	}
+}
+
+func TestEnvtestBlockedExternalIsRecoverablePhase(t *testing.T) {
+	if envtestClient == nil {
+		t.Skip("KUBEBUILDER_ASSETS is not set")
+	}
+	ctx := context.Background()
+	name := "blocked-external"
+	item := &admissionSource{}
+	run := envtestRun(name, "envtest-blocked-external")
+	lane := envtestLane("envtest-blocked-external")
+	if err := envtestClient.Create(ctx, lane); err != nil {
+		t.Fatal(err)
+	}
+	if err := envtestClient.Create(ctx, run); err != nil {
+		t.Fatal(err)
+	}
+
+	reconciler := &CoderRunReconciler{
+		Client: envtestClient,
+		Sources: NewSourceRegistry(map[string]source.Adapter{
+			"manual": item,
+		}),
+		StatusWriter: status.KubePatchWriter{Client: envtestClient},
+		Launch: func(ctx context.Context, run *courierv1alpha1.CoderRun) error {
+			controller := true
+			pod := &corev1.Pod{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      run.Name + "-coordinator",
+					Namespace: run.Namespace,
+					Labels:    map[string]string{executor.LabelRun: run.Name},
+					OwnerReferences: []metav1.OwnerReference{{
+						APIVersion: courierv1alpha1.GroupVersion.String(),
+						Kind:       "CoderRun",
+						Name:       run.Name,
+						UID:        run.UID,
+						Controller: &controller,
+					}},
+				},
+				Spec: corev1.PodSpec{Containers: []corev1.Container{{Name: "coordinator", Image: "example/test"}}},
+			}
+			if err := envtestClient.Create(ctx, pod); err != nil {
+				return err
+			}
+			pod.Status.ContainerStatuses = []corev1.ContainerStatus{{
+				Name: "coordinator",
+				State: corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{
+					ExitCode: 2,
+					Message:  `COURIER_TERMINATION {"phase":"NeedsHuman","result":"needs-human","exit_code":2,"reason":"missing prerequisite: secrets/prod","outcome":"blocked_external"}`,
+				}},
+			}}
+			return envtestClient.Status().Update(ctx, pod)
+		},
+	}
+
+	reconcile := func() {
+		t.Helper()
+		if _, err := reconciler.Reconcile(ctx, envtestRequest(name)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	reconcile()
+	assertEnvtestPhase(t, name, courierv1alpha1.PhaseRunning)
+	reconcile()
+	// The CRD enum must accept the new phase, and the source must see a
+	// recoverable in-progress transition plus a blocked-external report.
+	assertEnvtestPhase(t, name, courierv1alpha1.PhaseBlockedExternal)
+	if len(item.transitions) == 0 || item.transitions[len(item.transitions)-1] != source.StateInProgress {
+		t.Fatalf("transitions = %#v, want a final in-progress (recoverable, not parked)", item.transitions)
+	}
+	if len(item.reports) != 1 || item.reports[0].Result != source.ResultBlockedExternal {
+		t.Fatalf("reports = %#v, want a recoverable blocked-external report", item.reports)
 	}
 }
 

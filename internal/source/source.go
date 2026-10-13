@@ -87,11 +87,21 @@ const (
 	ResultReady Result = "ready"
 	// ResultBlocked marks work requiring human intervention.
 	ResultBlocked Result = "blocked"
+	// ResultBlockedExternal marks work blocked on an external prerequisite
+	// that Courier cannot satisfy itself. It is recoverable: unlike
+	// ResultBlocked it must not park the item for a human, so a source may
+	// re-issue the work once the prerequisite is satisfied.
+	ResultBlockedExternal Result = "blocked-external"
 	// ResultFailed marks work that failed execution. Sources own the policy for
 	// handling it; some may issue a fresh attempt while others only record it.
 	ResultFailed Result = "failed"
 	// ResultHandedOff means the PR was published but external verification did not pass; the source must not treat it as ready or blocked, and its independent PR-repair mechanism takes over using the carried PR identity.
 	ResultHandedOff Result = "handed-off"
+	// ResultNoChange is retained for enum compatibility, not settlement
+	// authority. A no-change assertion and green CI cannot prove queued review
+	// feedback was addressed. Dispatch rejects this result without wire effects;
+	// the controller uses ResultBlockedExternal for unverified open PRs.
+	ResultNoChange Result = "no-change"
 )
 
 // Lifecycle contains source-neutral metadata for an optional lifecycle report.

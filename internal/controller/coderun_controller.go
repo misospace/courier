@@ -42,7 +42,7 @@ const coordinatorContainerName = "coordinator"
 // lifecycleReportedCondition tracks whether a terminal run's source lifecycle
 // report has been published; a False status means a later reconcile retries it.
 const (
-	lifecycleReportedCondition                              = "LifecycleReported"
+	lifecycleReportedCondition                              = courierv1alpha1.ConditionLifecycleReported
 	lifecycleReportSupportedCondition                       = "LifecycleReportSupported"
 	lifecycleReportPendingReason                            = "Pending"
 	lifecycleReportPendingBlockedReportParksPRFixReason     = "PendingBlockedReportParksPRFix"
@@ -608,9 +608,15 @@ func (r *CoderRunReconciler) observeRunning(ctx context.Context, run *courierv1a
 		if !terminated {
 			continue
 		}
-		phase := phaseForExit(run.Spec.Mode, exitCode)
+		phase := phaseForExit(run.Spec.Mode, exitCode, terminationOutcome)
 		if phase == courierv1alpha1.PhaseVerifying {
 			before := run.DeepCopy()
+			// Record a declared no_change_needed fix-pr run (exit 3) so its terminal
+			// report can say no change was pushed; exit 0 also lands here but may have
+			// pushed a fix, so only the declared exit sets the flag.
+			if run.Spec.Mode == courierv1alpha1.ModeFixPR && exitCode == exitDeclaredNoChange {
+				run.Status.DeclaredNoChange = true
+			}
 			run.Status.Phase = courierv1alpha1.PhaseVerifying
 			if terminationSummary != nil {
 				run.Status.Telemetry = terminationSummary
@@ -621,10 +627,12 @@ func (r *CoderRunReconciler) observeRunning(ctx context.Context, run *courierv1a
 			r.emitPhaseTransition(run, courierv1alpha1.PhaseVerifying, map[string]any{"exit_code": exitCode})
 			return ctrl.Result{Requeue: true}, nil
 		}
-		intent := terminalLifecycleIntent{
-			skipPRFixQueueMark: exitCode == exitDeclaredNoChange && run.Spec.Mode == courierv1alpha1.ModeFixPR,
-		}
-		if exitCode == 2 && phase == courierv1alpha1.PhaseNeedsHuman && terminationOutcome == "blocked_external" {
+		// An external-dependency block carries the coordinator's bounded
+		// reason into the source report, exactly like a declared question.
+		// A no_change_needed fix-pr run no longer terminalizes directly: it
+		// is routed to Verifying, which settles it against the world.
+		intent := terminalLifecycleIntent{}
+		if phase == courierv1alpha1.PhaseBlockedExternal {
 			intent.error = terminationReason
 		}
 		// A diagnostic explains a non-success ending. Successful handoffs
@@ -633,7 +641,7 @@ func (r *CoderRunReconciler) observeRunning(ctx context.Context, run *courierv1a
 		// state); the executor's freeform termination text is intentionally
 		// not an input, so a model-controlled needs-decision question or
 		// verifier fail-reason cannot land on the durable status.
-		if phase == courierv1alpha1.PhaseFailed || phase == courierv1alpha1.PhaseNeedsHuman {
+		if phase == courierv1alpha1.PhaseFailed || phase == courierv1alpha1.PhaseNeedsHuman || phase == courierv1alpha1.PhaseBlockedExternal {
 			exit := exitCode
 			handoffCategory := coordinatorHandoffCategory(pod)
 			handoffValid := coordinatorHandoffValid(pod)
@@ -739,6 +747,15 @@ func (r *CoderRunReconciler) observeVerifying(ctx context.Context, run *courierv
 		return ctrl.Result{}, err
 	}
 	if settled {
+		// Green CI does not prove queued review feedback was addressed. A
+		// no-change attempt on an open PR waits for authoritative resolution
+		// instead of claiming a push or authorizing already-addressed settlement.
+		if run.Status.DeclaredNoChange && run.Spec.Mode == courierv1alpha1.ModeFixPR {
+			return r.transitionTerminal(ctx, run, courierv1alpha1.PhaseBlockedExternal, pr, terminalLifecycleIntent{
+				error:      "no changes pushed; queued feedback resolution is not verified",
+				diagnostic: buildTerminalDiagnostic(r.clock(), nil, "", "", "", false, nil),
+			}, nil)
+		}
 		return r.transitionTerminal(ctx, run, courierv1alpha1.PhaseAwaitingReview, pr, terminalLifecycleIntent{}, nil)
 	}
 	return ctrl.Result{RequeueAfter: observationRequeueDelay}, nil
@@ -768,7 +785,7 @@ func (r *CoderRunReconciler) enrichTerminalPR(ctx context.Context, run *courierv
 }
 
 func (r *CoderRunReconciler) transitionTerminal(ctx context.Context, run *courierv1alpha1.CoderRun, phase courierv1alpha1.Phase, pr string, intent terminalLifecycleIntent, telemetry *courierv1alpha1.RunTelemetry) (ctrl.Result, error) {
-	if phase == courierv1alpha1.PhaseNeedsHuman || phase == courierv1alpha1.PhaseFailed {
+	if phase == courierv1alpha1.PhaseNeedsHuman || phase == courierv1alpha1.PhaseFailed || phase == courierv1alpha1.PhaseBlockedExternal {
 		if pr == "" {
 			pr = r.enrichTerminalPR(ctx, run)
 		}
@@ -894,6 +911,10 @@ func (r *CoderRunReconciler) publishTerminalLifecycle(ctx context.Context, run *
 
 func (r *CoderRunReconciler) publishSourceLifecycle(ctx context.Context, run *courierv1alpha1.CoderRun, adapter source.Adapter, item source.WorkItem, phase courierv1alpha1.Phase, intent terminalLifecycleIntent) error {
 	state := stateForTerminalPhase(phase, run.Spec.Mode, intent)
+	legacyNoChange := phase == courierv1alpha1.PhaseAwaitingReview && run.Status.DeclaredNoChange && run.Spec.Mode == courierv1alpha1.ModeFixPR
+	if legacyNoChange {
+		state = source.StateInProgress
+	}
 	if state != "" {
 		if err := adapter.Transition(ctx, item, state); err != nil {
 			return err
@@ -908,6 +929,12 @@ func (r *CoderRunReconciler) publishSourceLifecycle(ctx context.Context, run *co
 		startedAt = &t
 	}
 	lifecycle := lifecycleForPhase(phase, state, run.Status.PR, startedAt, intent)
+	// Fail closed for retained AwaitingReview runs written before the
+	// no-change verification gate: replay must not certify unresolved feedback.
+	if legacyNoChange {
+		lifecycle.Result = source.ResultBlockedExternal
+		lifecycle.Error = "no changes pushed; queued feedback resolution is not verified"
+	}
 	lifecycle.IdempotencyKey = lifecycleIdempotencyKey(run, phase)
 	if run.Status.Telemetry != nil {
 		if raw, err := json.Marshal(run.Status.Telemetry); err == nil {
@@ -926,6 +953,11 @@ func stateForTerminalPhase(phase courierv1alpha1.Phase, runMode courierv1alpha1.
 	switch phase {
 	case courierv1alpha1.PhaseAwaitingReview:
 		return source.StateInReview
+	case courierv1alpha1.PhaseBlockedExternal:
+		// A recoverable block keeps the source item active so it can be
+		// re-issued when the prerequisite is satisfied; it is not parked
+		// for a human.
+		return source.StateInProgress
 	case courierv1alpha1.PhaseNeedsHuman:
 		return source.StateNeedsHuman
 	case courierv1alpha1.PhaseFailed:
@@ -1002,7 +1034,7 @@ func (r *CoderRunReconciler) setLifecycleReportCapability(run *courierv1alpha1.C
 // retains the original report intent for retries.
 func lifecycleReportPending(run *courierv1alpha1.CoderRun) bool {
 	switch run.Status.Phase {
-	case courierv1alpha1.PhaseAwaitingReview, courierv1alpha1.PhaseHandedOff, courierv1alpha1.PhaseNeedsHuman, courierv1alpha1.PhaseFailed:
+	case courierv1alpha1.PhaseAwaitingReview, courierv1alpha1.PhaseHandedOff, courierv1alpha1.PhaseNeedsHuman, courierv1alpha1.PhaseFailed, courierv1alpha1.PhaseBlockedExternal:
 	default:
 		return false
 	}
@@ -1047,7 +1079,7 @@ func (r *CoderRunReconciler) reconcileEvidence(ctx context.Context, run *courier
 		// evidence it captured is no longer needed. The delete is idempotent: a
 		// run with no Secret simply lists nothing and leaves nothing to delete.
 		return r.Evidence.DeleteEvidenceForRun(ctx, run)
-	case courierv1alpha1.PhaseFailed, courierv1alpha1.PhaseNeedsHuman:
+	case courierv1alpha1.PhaseFailed, courierv1alpha1.PhaseNeedsHuman, courierv1alpha1.PhaseBlockedExternal:
 		secrets, err := r.Evidence.ListEvidenceForRun(ctx, run)
 		if err != nil {
 			return err
@@ -1144,6 +1176,12 @@ func lifecycleForPhase(phase courierv1alpha1.Phase, state source.State, pr strin
 			lifecycle.Error = "run requires human intervention"
 		}
 		lifecycle.BlockedReportParksPRFix = intent.skipPRFixQueueMark
+	case courierv1alpha1.PhaseBlockedExternal:
+		lifecycle.Result = source.ResultBlockedExternal
+		lifecycle.Error = intent.error
+		if lifecycle.Error == "" {
+			lifecycle.Error = "run is blocked on an external prerequisite"
+		}
 	}
 	return lifecycle
 }
@@ -1198,6 +1236,10 @@ func (r *CoderRunReconciler) patchStatus(ctx context.Context, before, after *cou
 	if before.Status.FailedCheckFingerprint != after.Status.FailedCheckFingerprint {
 		fingerprint := after.Status.FailedCheckFingerprint
 		fields.FailedCheckFingerprint = &fingerprint
+	}
+	if before.Status.DeclaredNoChange != after.Status.DeclaredNoChange {
+		declaredNoChange := after.Status.DeclaredNoChange
+		fields.DeclaredNoChange = &declaredNoChange
 	}
 	if before.Status.LifecycleReportRetryToken != after.Status.LifecycleReportRetryToken {
 		token := after.Status.LifecycleReportRetryToken
@@ -1420,22 +1462,34 @@ func coordinatorTermination(pod *corev1.Pod) (int32, string, string, *courierv1a
 // exitDeclaredNoChange is the executor's verified no_change_needed exit.
 const exitDeclaredNoChange = 3
 
+// outcomeBlockedExternal is the executor's declared external-prerequisite
+// outcome, carried in the trusted termination handoff on exit 2.
+const outcomeBlockedExternal = "blocked_external"
+
 // exitNeedsHuman is the executor's NeedsHuman exit: a declared decision or
 // external block, or a guard refusal.
 const exitNeedsHuman = 2
 
-// phaseForExit maps the executor's exit code to the run's next phase. A
-// no-change declaration is reviewable in resolve-issue mode; fix-pr remains
-// NeedsHuman until Dispatch supports an explicit already-addressed settlement.
-func phaseForExit(mode courierv1alpha1.Mode, exitCode int32) courierv1alpha1.Phase {
+// phaseForExit maps the executor's exit code and declared outcome to the run's
+// next phase. A fix-pr no_change_needed declaration is settled against the
+// world, not the coordinator's word: it is routed to Verifying, which reaches
+// Done only when the PR is already merged and AwaitingReview only after stable
+// green checks. A blocked_external declaration becomes a recoverable
+// dependency block; a needs_decision declaration (or any exit 2 without a
+// recognized external-block outcome) remains NeedsHuman. Other failure exits
+// remain Failed.
+func phaseForExit(mode courierv1alpha1.Mode, exitCode int32, outcome string) courierv1alpha1.Phase {
 	switch exitCode {
 	case 0:
 		return courierv1alpha1.PhaseVerifying
 	case 2:
+		if outcome == outcomeBlockedExternal {
+			return courierv1alpha1.PhaseBlockedExternal
+		}
 		return courierv1alpha1.PhaseNeedsHuman
 	case exitDeclaredNoChange:
 		if mode == courierv1alpha1.ModeFixPR {
-			return courierv1alpha1.PhaseNeedsHuman
+			return courierv1alpha1.PhaseVerifying
 		}
 		return courierv1alpha1.PhaseAwaitingReview
 	default:

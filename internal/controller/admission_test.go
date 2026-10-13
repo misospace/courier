@@ -270,6 +270,7 @@ func (w fakeStatusWriter) PatchStatus(ctx context.Context, name types.Namespaced
 			RunDuration                     string                             `json:"runDuration,omitempty"`
 			CheckFingerprint                *string                            `json:"checkFingerprint,omitempty"`
 			FailedCheckFingerprint          *string                            `json:"failedCheckFingerprint,omitempty"`
+			DeclaredNoChange                *bool                              `json:"declaredNoChange,omitempty"`
 			LifecycleReportRetryToken       *string                            `json:"lifecycleReportRetryToken,omitempty"`
 			LifecycleReportActiveRetryToken *string                            `json:"lifecycleReportActiveRetryToken,omitempty"`
 			Restarts                        *int                               `json:"restarts,omitempty"`
@@ -319,6 +320,9 @@ func (w fakeStatusWriter) PatchStatus(ctx context.Context, name types.Namespaced
 	}
 	if document.Status.FailedCheckFingerprint != nil {
 		run.Status.FailedCheckFingerprint = *document.Status.FailedCheckFingerprint
+	}
+	if document.Status.DeclaredNoChange != nil {
+		run.Status.DeclaredNoChange = *document.Status.DeclaredNoChange
 	}
 	if document.Status.LifecycleReportRetryToken != nil {
 		run.Status.LifecycleReportRetryToken = *document.Status.LifecycleReportRetryToken

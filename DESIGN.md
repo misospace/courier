@@ -185,21 +185,35 @@ on the run branch; the declaration never substitutes for that check (#169):
   commits reachable from the run branch → exit `0`, **Verifying**. Work committed
   only elsewhere is not run success.
 - **`no_change_needed`** — nothing to do, with evidence. The executor posts the
-  complete evidence as a redacted issue/PR comment, then exits `3`: a
+  complete evidence as a redacted issue/PR comment, then exits `3`. A
   resolve-issue run ends in **AwaitingReview** and moves the source to
-  `in-review` for a human to settle; a fix-pr run ends **NeedsHuman** and sends
-  a blocked lifecycle report. That report parks the PR-fix item as
-  `BLOCKED`/needs-human. Its `BlockedReportParksPRFix` flag suppresses only the
-  redundant follow-up queue mark; it does not wake a reviewer or request
-  another review. Neither mode resolves the source on the coordinator's word.
+  `in-review` for a human to settle. A fix-pr run is settled against the world
+  through **Verifying**: a merged/already-addressed pull request reaches
+  **Done**; an open pull request with stable green checks reaches recoverable
+  **BlockedExternal** because CI cannot verify queued feedback resolution.
+  A red check reaches retryable **Failed**; an unobservable pull request reaches
+  **NeedsHuman**. The open no-change attempt reports `waiting-external`, never
+  `pr_updated` or `already_addressed`; its declaration is not settlement authority.
+  Neither mode resolves the source on the coordinator's word alone.
 - **`needs_decision`** — a real decision the coordinator cannot make. The
   executor posts the complete question as a redacted issue/PR comment and exits
   `2` to **NeedsHuman** with a blocked source report.
 - **`blocked_external`** — an external prerequisite needed to perform the work
   is missing. The executor posts the complete `missing` explanation as a
-  redacted issue/PR comment and exits `2` to **NeedsHuman** with a blocked source
-  report. A CI failure discovered after publication is not this outcome: it
-  follows the operator's verification and source failure policy.
+  redacted issue/PR comment and exits `2` to the terminal, recoverable phase
+  **BlockedExternal**. The source item is kept active (`in-progress`) and
+  reported with a recoverable lifecycle result, so the source can re-issue the
+  work once the named prerequisite is satisfied; it is never parked as a human
+  block. The recoverable signal must reach the source in a way it cannot
+  mistake for a normal failure: publishing the lifecycle as a regular
+  `failed` report causes a queue-backed source to advance its generation and
+  burn fix-attempt budget on a prerequisite Courier cannot satisfy, ending
+  exactly in the human park this outcome is designed to avoid. The Dispatch
+  adapter therefore publishes a dedicated `waiting-external` task outcome
+  and, for queue-backed follow-ups, a generation-fenced `WAITING_EXTERNAL`
+  queue mark — both recoverable, neither a `BLOCKED` human park. A CI
+  failure discovered after publication is not this outcome: it follows the
+  operator's verification and source failure policy.
 
 Comments preserve the full declared evidence, question, or missing explanation
 after redaction; they are not shortened to the termination reason. Comment
@@ -1084,7 +1098,7 @@ spec:                       # set once by the source adapter, then immutable
   debug: false                     # per-run: bumps pod log level, nothing else
   # no attempts field — by design
 status:
-  phase: Pending | Claimed | Running | Verifying | AwaitingReview | HandedOff | NeedsHuman | Done | Failed
+  phase: Pending | Claimed | Running | Verifying | AwaitingReview | HandedOff | NeedsHuman | Done | Failed | BlockedExternal
   branch: <derived resolve branch or adopted PR head>
   headRepo: <PR head repo; spec.repo for a same-repo PR, the fork's owner/name for a fork PR>
   headSHA: <head commit SHA>
@@ -1165,9 +1179,10 @@ there is no delete verb because active runs reference lanes. (#73)
   **Verifying** only when the coordinator validates integrated work locally,
   fixes failures, and committed work is reachable from the run branch; work
   committed elsewhere is not success.
-  Exit `2` (`needs_decision` or `blocked_external`) reaches **NeedsHuman**;
-  exit `3` (`no_change_needed`)
-  reaches **AwaitingReview** for resolve-issue and **NeedsHuman** for fix-pr.
+  Exit `2` reaches **NeedsHuman** for a `needs_decision` declaration and the
+  recoverable **BlockedExternal** phase for a `blocked_external` declaration;
+  exit `3` (`no_change_needed`) reaches **AwaitingReview** for resolve-issue and
+  is settled against the world through **Verifying** for fix-pr.
   Other failure exits reach **Failed**. When no outcome is declared, recoverable
   endings — uncommitted changes, commits off the run branch, or no commit and no
   workspace changes — resume the same session with a short state message, up to
@@ -1230,8 +1245,13 @@ there is no delete verb because active runs reference lanes. (#73)
   marks **Done** and resolves the source; feedback/conflict → the source spawns a
   fresh `fix-pr` run without reusing the previous run. A `no_change_needed`
   resolve-issue run also waits here with its evidence posted for human review;
-  Courier does not resolve that source from the coordinator's declaration. The
-  previous run remains auditable; its completion does not settle later feedback.
+  Courier does not resolve that source from the coordinator's declaration. A
+  `no_change_needed` **fix-pr** run instead waits in **BlockedExternal** on an
+  open green PR: neither CI nor a clean workspace proves review feedback was
+  addressed. Only a verified merge can settle that attempt successfully. A
+  retained pre-migration AwaitingReview no-change report also fails closed to
+  `waiting-external`, without claiming a push or bypassing the head guard.
+  The previous run remains auditable; its completion does not settle later feedback.
   **HandedOff** is the separate terminal phase for a published resolve-issue PR
   whose stable red checks the source will repair; it is not a success, so it is
   not reaped like **Done** and does not publish `in-review`.
@@ -1365,6 +1385,36 @@ persistent attempt identity and settlement semantics, Courier must not fabricate
 one. That separate Dispatch change is tracked by misospace/dispatch#1045; an
 adapter fallback/dedup change is conditional on its wire contract, not a generic
 core retry or a metadata-hash substitute.
+
+#### Recoverable dependency blocks across the Dispatch boundary
+
+A `BlockedExternal` run must reach Dispatch as a recoverable dependency wait,
+not as a regular failure: `resolvePrFixFromAgentReport` treats `outcome:"failed"`
+as an attempt to be reissued, advancing the issued generation and incrementing
+`fixAttempts` until it eventually surfaces `status:"BLOCKED", lane:"NEEDS_HUMAN"`
+at the cap — exactly the human park the new phase is designed to avoid. The
+Dispatch adapter therefore publishes a dedicated `outcome:"waiting-external"`
+task report and, for queue-backed follow-ups, a generation-fenced
+`status:"WAITING_EXTERNAL"` queue mark. Dispatch is expected to treat both as
+no-ops for fix-attempt accounting: do not advance generation, do not increment
+`fixAttempts`, do not surface as a human block, and keep the item discoverable
+so a future discovery cycle can reactivate the work. Recovery requires a fresh
+source-owned durable attempt identity. Dispatch's waiting queue reactivation
+issues a new generation after its cooldown; Courier materializes a distinct
+CoderRun and retains the previous run, diagnostic, report/retry intent, and
+owner-referenced evidence. Same-identity reoffers remain suppressed, including
+legacy Dispatch bindings, regardless of lifecycle report publication. Courier
+never deletes history to escape dedupe and never invents a generation or retry
+policy for adapters lacking durable attempt identities. Omitting blocked work
+from discovery exclusions allows the source to reactivate it, not permission
+to rerun the retained attempt every poll. Until
+Dispatch
+learns these signals, Courier emits them forward-compatibly; a legacy Dispatch
+rejects the report, and the controller holds it as a pending report on the
+unsupported-outcome path — automatic retries stop until an operator retry
+annotation re-publishes it once Dispatch accepts the signal. The contract
+change is tracked alongside #267; the source-neutral `blocked-external` lifecycle result and
+`BlockedExternal` phase in the operator are unchanged.
 
 ## MCP surface
 
@@ -1522,6 +1572,68 @@ named items remain unresolved and must not be described as production-ready:
 ## Decisions
 
 - **2026-10-12 — #251: terminal retention is a bounded inspection window keyed to per-phase annotations (`courier.misospace.dev/needs-human-at`, `courier.misospace.dev/failed-at`), not `FinishedAt`; closed-unmerged PRs terminalize as `NeedsHuman` with a precise reason, not a new CRD phase.** `FinishedAt` records execution end and stays immutable on later transitions, so a months-late `AwaitingReview → NeedsHuman` close-unmerged starts a fresh window at the close-unmerged transition rather than inheriting a zero-length residue. Deletion requires a **positive, settled** `LifecycleReported` condition (`Status=True` and a permitted reason); missing/`Unknown`/`False` conditions do not satisfy the gate, so a legacy or partially-upgraded terminal run with no published/superseded report proof is never reaped. The #250 observation loop handles the recorded PR identity: merged resolves to `Done`, closed-unmerged becomes `NeedsHuman`, and absent or ambiguous observations do not transition. This bounds retained runs without conflating closure with successful delivery and leaves retries and escalation source-owned. (#251, #179, #146, #250, #276, #277)
+- **2026-10-12 — #267 review: a report must say what the run actually did, and a
+  blocked run must be able to wake.** Two blockers on the merged #267 behavior,
+  both verified against Dispatch `main`. (1) A `no_change_needed` fix-pr run
+  settled `AwaitingReview` and reported `ready` → Dispatch `outcome:"pr_updated"`.
+Because the run pushed nothing, `markPrFixItem`'s head-moved guard refused the
+  `FIXED` mark and reset the queue row to `QUEUED` at a **new generation** with
+  `fixAttempts` incremented
+  (`dispatch@60c8213 src/lib/pr-fix-queue.ts:1766-1805`), so a run that changed
+  nothing burned an attempt and was falsely re-issued. `no_changes_needed` does not help: it is
+  done-like and takes the same guard; only `already_addressed` sets
+  `alreadyAddressed` and settles without it
+  (`dispatch@60c8213 src/lib/pr-fix-queue.ts:2839`). The run now
+  records `status.declaredNoChange` when its exit is the verified
+  `no_change_needed` exit, and its `AwaitingReview` report publishes the new
+  source-neutral `no-change` result, which the Dispatch adapter maps to
+  `already_addressed` with no queue mark. Resolve-issue is unchanged. (2) Omitting
+  `BlockedExternal` runs from the discovery exclusions did not make the work
+  re-offerable: the same-source dedupe map and the identity-hashed run name still
+  suppressed it, so a blocked generation could never run again. Discovery now
+  supersedes a blocked run whose lifecycle report was published, deleting it and
+  creating the fresh run when the source re-offers that identity; a blocked run
+  whose report is still pending keeps suppressing, so a rejected report cannot
+  turn into relaunch churn. Both are truthful-report changes: the phase, the
+  executor exit codes, and the `waiting-external` contract from #267 are
+  unchanged. (#267)
+
+- **2026-10-11 — #267: settle fix-pr `no_change_needed` against the world; make
+  `blocked_external` a recoverable dependency block across the source
+  boundary.** A fix-pr `no_change_needed` declaration (executor exit 3) was
+  mapped to `NeedsHuman` only because Dispatch lacked an explicit
+  already-addressed settlement, so already-merged runs (miso-gallery #527,
+  musebridge #81) reported the correct outcome and still ended `NeedsHuman`.
+  It is now routed to `Verifying`, which settles it from the world: `Done`
+  requires a merged/already-addressed pull request, `AwaitingReview` requires
+  stable green checks, a red check reaches retryable `Failed`, and an
+  unobservable pull request reaches `NeedsHuman`. `blocked_external`
+  (executor exit 2) is no longer a human block: it gains the terminal
+  recoverable phase `BlockedExternal` and the source lifecycle result
+  `blocked-external`. The PR #271 review caught that publishing that result
+  as the existing Dispatch `failed` task report would burn the issued
+  generation's fix-attempt budget on a prerequisite Courier cannot satisfy
+  and surface the item as a human `BLOCKED` at the cap — exactly the park
+  the new phase is meant to avoid. The Dispatch adapter now publishes a
+  dedicated `waiting-external` task outcome and, for queue-backed follow-ups,
+  a generation-fenced `WAITING_EXTERNAL` queue mark, so the recoverable
+  signal reaches Dispatch without touching failed-attempt accounting and the
+  item stays discoverable for re-offer once the prerequisite is satisfied.
+  The Dispatch-side acceptance of the new outcome and queue status is a
+  cross-repo contract change; until Dispatch learns both, the report and
+  mark are emitted (forward-compatible) but a legacy Dispatch will reject
+  them, and the controller holds the report on the unsupported-outcome path
+  until an operator retry annotation re-publishes it. Source discovery's
+  retained-generation exclusions omit BlockedExternal runs so the blocked
+  generation stays re-offerable. The source-neutral `blocked-external`
+  lifecycle result and the `BlockedExternal` phase are unchanged from the
+  PR #271 first landing.
+  `needs_decision` still reaches `NeedsHuman`; provider/workload failures
+  remain `Failed`; exit codes and trusted handoff payloads are unchanged, so
+  legacy exits stay compatible. This supersedes the fix-pr
+  `no_change_needed` and `blocked_external` mappings recorded in the
+  2026-09-30 #169/#175 entry; the rest of that contract stands. (#267)
+
 - **2026-10-12 — #272: durable terminal runtime diagnostics are captured before
   pod cleanup, set-once and best-effort.** A terminal phase/exit alone cannot
   distinguish executor crash, model transport error, continuation exhaustion,
@@ -2349,3 +2461,12 @@ was superseded.
   pod, and deletes the broker pod, matching the `Revoke` ordering and
   the terminated-control branch of `ObserveTopology`. Legacy
   (non-secure) relaunch behavior is unchanged. (#215)
+
+- **2026-10-12 — #267 review follow-up: settlement authority and recovery history.**
+  Green CI cannot certify queued review feedback was addressed. Open fix-pr
+  no-change attempts now wait recoverably, including migration report replay;
+  verified merges still settle Done. Blocked recovery requires a fresh source
+  attempt identity and retains all previous CoderRuns and owned evidence.
+  This reverses the delete-before-recreate and open-green already-addressed
+  policies recorded in the earlier #267 follow-up. Source-owned generation and
+  cooldown fence recovery instead of a Courier poll-driven retry loop. (#267)

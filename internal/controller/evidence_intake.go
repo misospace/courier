@@ -519,7 +519,8 @@ func evidencePhaseAdmitted(phase courierv1alpha1.Phase) bool {
 		courierv1alpha1.PhaseClaimed,
 		courierv1alpha1.PhaseRunning,
 		courierv1alpha1.PhaseFailed,
-		courierv1alpha1.PhaseNeedsHuman:
+		courierv1alpha1.PhaseNeedsHuman,
+		courierv1alpha1.PhaseBlockedExternal:
 		return true
 	default:
 		return false

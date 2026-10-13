@@ -13,8 +13,13 @@ const (
 	ModeFixPR Mode = "fix-pr"
 )
 
+// ConditionLifecycleReported is the status condition type the operator writes
+// on a CoderRun to record the outcome of its terminal lifecycle report. It is
+// read back wherever another component must know whether the report landed.
+const ConditionLifecycleReported = "LifecycleReported"
+
 // Phase is the lifecycle phase of a CoderRun.
-// +kubebuilder:validation:Enum=Pending;Claimed;Running;Verifying;AwaitingReview;HandedOff;NeedsHuman;Done;Failed
+// +kubebuilder:validation:Enum=Pending;Claimed;Running;Verifying;AwaitingReview;HandedOff;NeedsHuman;Done;Failed;BlockedExternal
 type Phase string
 
 const (
@@ -28,6 +33,12 @@ const (
 	PhaseNeedsHuman Phase = "NeedsHuman"
 	PhaseDone       Phase = "Done"
 	PhaseFailed     Phase = "Failed"
+	// PhaseBlockedExternal is a terminal, recoverable external-dependency
+	// block: the run stopped on a prerequisite outside Courier, and the
+	// source may re-issue the work once that prerequisite is satisfied. It is
+	// deliberately distinct from NeedsHuman (a human decision) and Failed (a
+	// provider or workload failure).
+	PhaseBlockedExternal Phase = "BlockedExternal"
 )
 
 // CoderRunSpec is set once by a source adapter and is then immutable.
@@ -326,7 +337,8 @@ type CoderRunStatus struct {
 	StartedAt *metav1.Time `json:"startedAt,omitempty"`
 
 	// FinishedAt is when the run's execution ended (the transition to a
-	// terminal phase: AwaitingReview, NeedsHuman, Done, or Failed). It is set
+	// terminal phase: AwaitingReview, HandedOff, NeedsHuman, Done, Failed, or
+	// BlockedExternal). It is set
 	// exactly once and never overwritten; a later transition (e.g.
 	// AwaitingReview -> Done) does not move it.
 	// +optional
@@ -359,6 +371,13 @@ type CoderRunStatus struct {
 	// FailedCheckFingerprint is the compact identity (head plus sorted check names) of the last fully-failed CI observation while Verifying. A resolve-issue run hands off only when two consecutive fully-failed observations carry the same fingerprint; a pending or empty observation clears it, a changed set resets it, and fix-pr does not use it.
 	// +optional
 	FailedCheckFingerprint string `json:"failedCheckFingerprint,omitempty"`
+
+	// DeclaredNoChange records that the coordinator of this run exited with
+	// the verified no_change_needed declaration. Only a fix-pr run has it set:
+	// the run pushed nothing, so its terminal source report must state that no
+	// change was pushed rather than claim a fix was pushed.
+	// +optional
+	DeclaredNoChange bool `json:"declaredNoChange,omitempty"`
 
 	// LifecycleReportRetryToken records the last explicit retry token handled for an unsupported lifecycle result; it is an opaque, non-secret value limited to 128 Unicode code points.
 	// +optional
