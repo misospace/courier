@@ -971,6 +971,76 @@ later reconcile never clears an already-captured diagnostic, and capture
 never changes a phase, exit, retry, or source report. Operator workflow is
 in [docs/terminal-diagnostics.md](./docs/terminal-diagnostics.md).
 
+### Model-provider availability and allowance exhaustion (#320)
+
+Provider allowance exhaustion (for example an HTTP 429 carrying a verified
+plan-limit code) is a **recoverable resource-availability condition**, not a
+code failure, a human decision, or a claim of no progress. The native harness
+classifies it at its only structured model boundary — the LiteLLM-compatible
+gateway — and routes it to a `blocked_external` ending so the work waits for
+capacity and the source re-offers it, rather than burning retries, failing the
+attempt, or parking it for a human. This section settles the behavior; the
+first implementation covers the native gateway path, and the remaining scope
+is named at the end.
+
+**Classification.** `ClassifyProviderError` reads at most a bounded prefix of a
+provider error body and the standard `Retry-After` header and returns a fixed
+`ProviderAvailability`: `allowance-exhausted`, `transient-rate-limit`,
+`authentication-failed`, `request-rejected`, `context-exhausted`,
+`provider-unavailable`, or `unknown`. A 429 alone is **not** exhaustion: only a
+structured signal (a provider error `code`/`type` on the configured allowlist,
+or HTTP 402) confirms it. Unrecognized failures stay `unknown` and are never
+folded into a known class. The classifier retains only the fixed class and, at
+most, a short allowlisted code; the provider body, message, and any credential
+it might quote are never retained or surfaced.
+
+**Retry policy.** Transport failures, 5xx, request timeouts, and a plain 429
+remain retryable in-process (bounded by the existing stream-retry budget). A
+confirmed exhaustion, an auth rejection, a context-limit rejection, and a
+request rejection are not retried in-process. A retryable failure whose
+authoritative `Retry-After` exceeds the in-process bound (5s) is likewise not
+spun on: the run ends recoverable and the source re-offers it. The harness
+never invents a reset time; an absent or unparseable hint is reported as
+unknown, not guessed.
+
+**Recovery ending.** A **deferred** failure — a confirmed exhaustion, or a
+transient failure with a reset hint longer than the in-process bound — ends the
+run as `blocked_external`. The operator already maps exit 2 plus the
+`blocked_external` outcome to `PhaseBlockedExternal`, which reports the
+source-neutral `blocked-external` lifecycle result (Dispatch `waiting-external`
+plus the generation-fenced `WAITING_EXTERNAL` mark); that path is recoverable,
+does not park the item for a human, does not erase failed attempts, and keeps
+the item re-offerable. A provider outage (5xx) that exhausts its in-process
+retries stays an infrastructure failure for the operator's relaunch path, and a
+genuine task blocker is unchanged.
+
+**Scoping and fallback.** Classification is per role-bound model binding: an
+exhausted coordinator binding fails the gate for that run without disabling
+unrelated lanes, profiles, or bindings. At startup the capability probe carries
+the classification, and a required model-binding gate failure that is a
+confirmed exhaustion declares `blocked_external` instead of `NeedsHuman`.
+Courier adds no automatic fallback, no silent model switch, and no paid
+capacity: a compatible fallback is a future, explicitly configured behavior.
+
+**Configuration and diagnostics.** The default exhaustion signals are
+provider-neutral, OpenAI-compatible tokens. A deployment extends them (never
+replaces them) with `COURIER_MODEL_EXHAUSTION_CODES` and
+`COURIER_MODEL_EXHAUSTION_TYPES` (comma-separated); Courier core hard-codes no
+provider policy. Diagnostics expose the fixed class and the allowlisted code
+only — never the response body, credentials, or an unbounded string as a label.
+
+**Unknowns and remaining scope.** The legacy OpenCode executor delegates model
+calls to an external binary and has no structured provider signal, so it is not
+yet classified here; until it is, its exhaustion still consumes continuations
+and can end `NeedsHuman`/`failed`. In-run long cooldown (waiting out a reset
+inside one incarnation) and honoring a source-side cooldown are not
+implemented: recovery today is source re-offer after the blocked-external
+ending. Gateway retries that happen below Courier (LiteLLM/SDK) are outside its
+observation and are not counted. The control process reads the
+`COURIER_MODEL_EXHAUSTION_CODES`/`_TYPES` extension signals when the deployment
+projects them; wiring the operator-rendered control pod to a deployment
+setting is follow-up, so today the provider-neutral defaults apply. (#320)
+
 ### Toolchain reference for bootstrap lanes (#153)
 
 Repository toolchains (Go today) keep their module and build caches on
@@ -2702,3 +2772,24 @@ was superseded.
   Courier's same-identity dedupe absorbs any re-offered truncated-out
   generation without materializing a duplicate run. Malformed
   descriptors still fail closed. (#286)
+
+- **2026-10-13 — #320: model-provider allowance exhaustion is a recoverable
+  availability condition, classified at the gateway and routed to a
+  blocked-external ending.** A 429 is not by itself exhaustion: the native
+  harness's gateway classifies each failed model call from structured provider
+  signals (`code`/`type`, HTTP 402) plus the standard `Retry-After` header into
+  a fixed, backend-neutral `ProviderAvailability`, retaining only the class and
+  a short allowlisted code — never the response body or credentials. Confirmed
+  exhaustion and other permanent classes are not retried in-process, and a
+  retryable failure whose reset hint exceeds the 5s in-process bound is not
+  spun on either; such a **deferred** failure ends the run `blocked_external`,
+  which the operator already maps to `PhaseBlockedExternal` and the
+  source-neutral `blocked-external`/`waiting-external` report — recoverable,
+  not parked for a human, and not a claim of no progress. A startup model-
+  binding probe that confirms exhaustion declares `blocked_external` instead of
+  `NeedsHuman`. Exhaustion signals default to provider-neutral tokens and a
+  deployment extends them with `COURIER_MODEL_EXHAUSTION_CODES` /
+  `COURIER_MODEL_EXHAUSTION_TYPES`; Courier core hard-codes no provider policy
+  and adds no silent fallback. The legacy OpenCode executor has no structured
+  provider signal and is not yet classified; in-run long cooldown and
+  source-side cooldown honoring are not implemented. (#320)

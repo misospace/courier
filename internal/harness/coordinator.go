@@ -133,6 +133,9 @@ func (c *Coordinator) Run(ctx context.Context, inv executor.Invocation) executor
 	for {
 		turn := c.pump(ctx, session, "", c.coordinatorTools())
 		if turn.streamErr != nil {
+			if result, ok := availabilityEnding(turn.streamErr); ok {
+				return result
+			}
 			return executor.HarnessResult{Err: fmt.Errorf("harness: model stream failed: %w", turn.streamErr)}
 		}
 		if !turn.final {
@@ -151,6 +154,34 @@ func (c *Coordinator) Run(ctx context.Context, inv executor.Invocation) executor
 			Reason: fmt.Sprintf("undeclared ending: the coordinator's final message was not a valid outcome declaration: %v", parseErr),
 		}
 	}
+}
+
+// availabilityEnding maps a deferred model-provider availability failure — a
+// confirmed allowance exhaustion, or a transient failure whose authoritative
+// reset hint is longer than this incarnation should spin on — to a recoverable
+// blocked-external ending. It is not a human decision, a code failure, or a
+// claim of no progress: the source re-offers the work when capacity returns
+// (#320).
+func availabilityEnding(err error) (executor.HarnessResult, bool) {
+	classification, ok := providerClassificationOf(err)
+	if !ok || !classification.Deferred() {
+		return executor.HarnessResult{}, false
+	}
+	return executor.HarnessResult{
+		Outcome: executor.OutcomeBlockedExternal,
+		Reason:  providerAvailabilityReason(classification),
+	}, true
+}
+
+// providerAvailabilityReason renders a bounded, redacted explanation of a
+// deferred provider-availability failure. It names only the fixed class and,
+// when recognized, the short allowlisted provider code.
+func providerAvailabilityReason(classification ProviderClassification) string {
+	reason := "model provider capacity is temporarily unavailable (" + string(classification.Availability) + ")"
+	if classification.Code != "" {
+		reason += ", provider code " + classification.Code
+	}
+	return reason + "; the run is recoverable and will resume when capacity returns"
 }
 
 // turnResult is one processed model turn.
