@@ -452,3 +452,114 @@ authorized by this document:
   even against a source that invents new reasons.
 - How #290's source-health states and #291's connector states compose in the
   #292 views without double-counting (see §6.2).
+
+## 11. Verification contract for §6
+
+§6 fixes rules that are easy to violate by accident: a label key slips in,
+a connector sums its diagnostic onto the core failure counter, a free-form
+string becomes a label value, or a `run_id` turns into a high-cardinality
+metric label. This section is the **contract a later instrumentation ticket
+must satisfy before it can close**. None of the assertions below runs in this
+PR — this PR is documentation only — but every checklist item names the test
+or scrape-time invariant that will trip CI when the rule is broken.
+
+A future instrumentation PR (the one that actually emits
+`courier_connector_*` and `connector.diagnostic`) lands only when each rule
+in §6 has a passing assertion of the form listed below. New connectors that
+declare new capabilities inherit the same assertions. The list is the
+requirement-trace target the design itself closes against.
+
+### 11.1 Bounded labels (§6.1)
+
+- **Allowlist assertion.** A unit test enumerates every `courier_connector_*`
+  metric family and every `courier_source_*` metric family emitted by the
+  controller, runner, and connector adapters, and fails the build if any
+  family exposes a label key outside the closed set
+  `{connector, mode, lane, phase, signal, reason, state, capability}`
+  (plus, for core signals, the existing closed enums already enumerated
+  elsewhere in this document). The set itself is defined in code by a
+  single source-of-truth slice used by the test and by the helper that
+  validates a family's labels at registration time.
+- **Closed-reason assertion.** A table-driven test asserts that, for every
+  `(connector, capability, signal)` tuple registered, the connector
+  declares a closed `reason` vocabulary of small bounded size, and that the
+  emitter maps any unrecognised reason to a single `other` value before
+  the event crosses the metric/log boundary. The test fails if a connector
+  ships a `reason` label whose value is not in its declared vocabulary or
+  `other`.
+- **Numeric-as-value assertion.** A static check (CI unit test) parses every
+  registered metric family and fails the build if any label has a `float64`
+  or `int64` value at runtime — i.e., asserts that numeric observations
+  (`requested`, `limit`, `accepted`, `pressure`, latency) live as metric
+  **values**, never as label values.
+
+### 11.2 Duplicate-counting (§6.2)
+
+- **No-double-count fixture.** An envtest fixture runs a synthetic
+  discovery poll that both fails the core `Discover`/`DiscoverExcluding`
+  call *and* emits a connector `protocol-error` diagnostic for the same
+  cycle, then asserts: `courier_source_discovery_failures_total` increments
+  by exactly one, `courier_connector_diagnostics_total{...,reason=...}`
+  increments by exactly one, and a helper that joins the two on
+  `(connector, cycle_id)` returns 1, not 2. The fixture's pre-baked
+  expected series is checked with `testutil.CollectAndCompare`.
+- **One overflow per cycle.** A separate fixture forces
+  `requested > limit` and asserts that
+  `courier_connector_diagnostics_total{...,reason="overflow"}` increments
+  by exactly one for the cycle, regardless of how many descriptors were
+  dropped — the drop count lives in the `overflow` value (or its
+  equivalents), not in additional events. The fixture also asserts that
+  `accepted < requested ⇒ overflow >= 1`, so a partial exclusion set can
+  never be reported as full coverage.
+- **Bounded-retry assertion.** A test fixture with a bounded retry policy
+  asserts that each attempt increments the connector diagnostic once per
+  attempt, distinguished by `signal`/`reason` where the design calls for
+  it, and that the total equals the number of attempts the fixture
+  recorded (no coalescing, no fan-out).
+
+### 11.3 Privacy (§6.3)
+
+- **Redaction guard.** A unit test feeds canonical forbidden strings
+  (tokens from the existing fixture corpus, repo names, PR numbers, head
+  SHAs, model names, free-form narrative over the configured length cap)
+  through the structured-log redactor at `internal/log/redact.go` and
+  asserts each is replaced/redacted before any line reaches a logger
+  wired to metric output. The same corpus is run against the metric
+  emitter with a mock registry; the collector's label-set dump must
+  contain none of the forbidden substrings.
+- **No-free-form-label assertion.** A static check (Go AST walk over the
+  connectors and a CI grep over the metric registration helpers) fails
+  the build if any label value is built from `fmt.Sprintf` over a string
+  that is not in the connector's declared closed vocabulary or one of the
+  bounded enums.
+- **Detail-channel assertion.** A unit test asserts that the only field
+  on the `connector.diagnostic` event that carries a free-form string is
+  the debug `detail`, that `detail` is debug-gated (never emitted at the
+  default log level), and that the existing redactor still passes
+  before write.
+
+### 11.4 Optional trace correlation (§6.4)
+
+- **No-correlation-label invariant.** A scrape-time test in envtest
+  exports the full metric set with a `run_id` populated on every
+  connector diagnostic log line and asserts that no `courier_connector_*`
+  metric family has a `run_id`, `trace_id`, `span_id`, or any other
+  correlation identifier as a label. The collector's label dump is the
+  evidence.
+- **Log-only assertion.** A unit test asserts that the only code path
+  that writes a correlation identifier is the logging half of the
+  envelope; the metric half's emitter helper rejects any event whose
+  payload contains a correlation key, with a clear error in unit tests
+  (it is unreachable in production).
+- **Untraced-deployment compatibility.** An end-to-end test runs the
+  executor with no tracing backend configured and asserts that
+  `courier_connector_capability_info`, `courier_connector_*` counters
+  and gauges, and the bounded `connector.diagnostic` log stream still
+  emit normally. Absence of a tracing pipeline must not silence any
+  bounded signal.
+
+The instrumentation PR is not complete until every assertion above is
+checked into the test tree and passing in `go test` (and, for the
+scrape-time checks, in the `images` job that already runs the live
+manager). Until then, every signal in §3 is a paper contract; the §11
+checklist is the only thing that turns it into enforced behavior.

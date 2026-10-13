@@ -1075,10 +1075,13 @@ as a core constant or label. A dashboard enumerates connectors from
 capabilities, so a non-Dispatch connector needs no Dispatch panel and Courier
 works with an alternate source. Absent and unsupported diagnostics are distinct
 from success, core and connector counters are joined rather than summed, labels
-stay bounded, and trace correlation is optional and never a metric label. The
-design records the #286 exclusion-overflow outage as the motivating case while
-leaving the overflow *strategy* to #286 and retention to #287; #290 owns the
-source-health semantics and #292 the views this layer feeds.
+stay bounded, and trace correlation is optional and never a metric label. §11
+of that document names the bounded-label, duplicate-counting, privacy, and
+correlation assertions the future instrumentation PR must satisfy — the
+requirement-trace target for #291 lives in the doc, not in code that does not
+yet exist. The design records the #286 exclusion-overflow outage as the
+motivating case while leaving the overflow *strategy* to #286 and retention to
+#287; #290 owns the source-health semantics and #292 the views this layer feeds.
 
 ### Per-run telemetry (#172)
 
@@ -1610,12 +1613,16 @@ named items remain unresolved and must not be described as production-ready:
   diagnostics are distinct states from success; a connector diagnostic that
   explains a core signal is joined by `connector` and time, never summed; and
   optional `run_id`/trace correlation rides logs only, never metric labels, and
-  is not a prerequisite for either app. The `PR-fix exclusions exceed maximum
-  32` stall (#286) is the motivating case, but this document only makes the
-  pressure observable: it does not choose an overflow strategy (#286) or touch
-  retention (#287). Design only — no protocol change, implementation, shared
-  cross-app schema, mandatory identifier, deployment, or dashboard. (#291,
-  #289, #290, #292, #286, #287)
+  is not a prerequisite for either app. §11 of the spec lists the
+  bounded-label, duplicate-counting, privacy, and correlation assertions the
+  future instrumentation PR must satisfy; that checklist is the
+  requirement-trace target for this design — until those tests land, the
+  envelope is paper, not enforced behavior. The `PR-fix exclusions exceed
+  maximum 32` stall (#286) is the motivating case, but this document only makes
+  the pressure observable: it does not choose an overflow strategy (#286) or
+  touch retention (#287). Design only — no protocol change, implementation,
+  shared cross-app schema, mandatory identifier, deployment, or dashboard.
+  (#291, #289, #290, #292, #286, #287)
 
 - **2026-10-12 — #249: one executor-neutral acceptance-criterion evidence
   contract is enforced in both publication paths against a revision-pinned
