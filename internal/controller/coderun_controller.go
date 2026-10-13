@@ -222,9 +222,11 @@ func (r *CoderRunReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 	// value as Pending so a source does not need a second status write before
 	// admission can begin. A terminal run normally does nothing, except when its
 	// lifecycle report is still pending: then the report alone is retried, since
-	// the run already reached its phase and freed capacity. A settled
-	// AwaitingReview run additionally takes one slow, bounded read of its
-	// recorded pull request, so a human merge can finish and reap it.
+	// the run already reached its phase and freed capacity. An AwaitingReview
+	// run whose LifecycleReported condition has reached a positive, settled
+	// state (Status=True with reason Published or Superseded) additionally takes
+	// one slow, bounded read of its recorded pull request, so a human merge can
+	// finish and reap it.
 	if run.Status.Phase != "" && run.Status.Phase != courierv1alpha1.PhasePending {
 		if lifecycleReportPending(&run) {
 			if lifecycleReportUnsupported(&run) {
@@ -237,10 +239,23 @@ func (r *CoderRunReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 			}
 			return r.retryTerminalLifecycle(ctx, &run)
 		}
-		// The pending report above owns the reconcile first: the source must
-		// see the in-review lifecycle before the Done resolve, so a merged PR
-		// is observed only once the run's own report has settled.
 		if run.Status.Phase == courierv1alpha1.PhaseAwaitingReview {
+			// The pending-report retry above handles a False LifecycleReported.
+			// A missing, Unknown, or True-with-another-reason condition does not
+			// prove the source saw the in-review lifecycle either, so the
+			// post-review merge observation must wait too: a legacy or partially
+			// upgraded AwaitingReview run without a positively settled
+			// LifecycleReported (Published or Superseded) cannot transition to
+			// Done without first proving its in-review lifecycle. The run stays
+			// parked without a timer; the report-retry path above re-arms any
+			// pending report, and a run whose condition is missing/Unknown/other
+			// remains unobserved until the source publishes the report or an
+			// operator intervenes.
+			if !lifecycleReportSettled(&run) {
+				log.FromContext(ctx).V(1).Info("awaiting-review run observed without a positively settled LifecycleReported; leaving in awaiting-review",
+					"lifecycleReported", lifecycleReportConditionState(&run))
+				return ctrl.Result{}, nil
+			}
 			return r.observeMergedReviewPR(ctx, &run)
 		}
 		l.V(1).Info("reconcile", "phase", run.Status.Phase)
@@ -1062,6 +1077,35 @@ func lifecycleReportPending(run *courierv1alpha1.CoderRun) bool {
 	}
 	cond := apimeta.FindStatusCondition(run.Status.Conditions, lifecycleReportedCondition)
 	return cond != nil && cond.Status == metav1.ConditionFalse
+}
+
+// lifecycleReportSettled reports whether the run's source lifecycle report has
+// reached the positive, settled state DESIGN.md §1291 demands before world
+// observation can close the loop: the LifecycleReported condition carries
+// Status=True with reason Published or Superseded. A missing, Unknown, or False
+// condition does not satisfy the gate, and Status=True with any other reason is
+// treated as not yet settled too — only Published/Superseded are the reasons
+// the condition's Status=True carries in practice, but the helper defends the
+// invariant by name. The gate keeps a legacy, partially upgraded, or corrupted
+// terminal CoderRun from being finished by world observation before the source
+// has proof of the in-review lifecycle.
+func lifecycleReportSettled(run *courierv1alpha1.CoderRun) bool {
+	cond := apimeta.FindStatusCondition(run.Status.Conditions, lifecycleReportedCondition)
+	if cond == nil || cond.Status != metav1.ConditionTrue {
+		return false
+	}
+	return cond.Reason == "Published" || cond.Reason == "Superseded"
+}
+
+// lifecycleReportConditionState renders the LifecycleReported condition as a
+// short, log-friendly string: "<missing>" when absent, otherwise
+// "<status>/<reason>". Used only for diagnostic logging.
+func lifecycleReportConditionState(run *courierv1alpha1.CoderRun) string {
+	cond := apimeta.FindStatusCondition(run.Status.Conditions, lifecycleReportedCondition)
+	if cond == nil {
+		return "<missing>"
+	}
+	return string(cond.Status) + "/" + cond.Reason
 }
 
 func lifecycleReportUnsupported(run *courierv1alpha1.CoderRun) bool {

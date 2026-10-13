@@ -382,6 +382,88 @@ func TestAwaitingReviewUnsupportedReportStaysUnobserved(t *testing.T) {
 	}
 }
 
+func TestAwaitingReviewUnsettledLifecycleReportLeavesRunUnobserved(t *testing.T) {
+	// A legacy, partially upgraded, or corrupted AwaitingReview run whose
+	// LifecycleReported condition has not reached the positive, settled
+	// state (LifecycleReported=True with reason Published or Superseded)
+	// must not transition to Done via a forge read: the source has no proof
+	// the in-review lifecycle was published, and the post-review merge
+	// observation must wait. The merge below is therefore inert — no forge
+	// read, no source Resolve, no Done. Each sub-test keeps the run in
+	// AwaitingReview without a timer so the operator (or a future report
+	// retry) can drive settlement.
+	tests := []struct {
+		name   string
+		mutate func(run *courierv1alpha1.CoderRun)
+	}{
+		{
+			"missing-condition",
+			func(run *courierv1alpha1.CoderRun) { run.Status.Conditions = nil },
+		},
+		{
+			"unknown-status",
+			func(run *courierv1alpha1.CoderRun) {
+				run.Status.Conditions = []metav1.Condition{{
+					Type:               lifecycleReportedCondition,
+					Status:             metav1.ConditionUnknown,
+					Reason:             "Pending",
+					LastTransitionTime: metav1.NewTime(reapClock),
+				}}
+			},
+		},
+		{
+			"true-with-non-settled-reason",
+			func(run *courierv1alpha1.CoderRun) {
+				run.Status.Conditions = []metav1.Condition{{
+					Type:               lifecycleReportedCondition,
+					Status:             metav1.ConditionTrue,
+					Reason:             "Accepted",
+					LastTransitionTime: metav1.NewTime(reapClock),
+				}}
+			},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			item := &admissionSource{}
+			reader := &fakePullRequestReader{pull: mergedPR()}
+			run := reviewRun("unsettled-" + test.name)
+			finishedBefore := run.Status.FinishedAt.Time
+			test.mutate(run)
+			c := phaseClient(t, run)
+			reconciler := reapReconciler(c, item, reapClock)
+			reconciler.PullRequests = reader
+
+			result, err := reconciler.Reconcile(context.Background(), admissionRequest(run.Name))
+			if err != nil {
+				t.Fatalf("Reconcile() error = %v, want the observation never to fail the run", err)
+			}
+			if reader.calls != 0 {
+				t.Fatalf("pull-request reads = %d, want none until the LifecycleReported condition is positively settled", reader.calls)
+			}
+			if result.RequeueAfter != 0 {
+				t.Fatalf("RequeueAfter = %v, want no timer; an unsettled LifecycleReported has no settled retry cadence of its own", result.RequeueAfter)
+			}
+			var stored courierv1alpha1.CoderRun
+			if err := c.Get(context.Background(), admissionKey(run.Name), &stored); err != nil {
+				t.Fatalf("get run: %v", err)
+			}
+			if stored.Status.Phase != courierv1alpha1.PhaseAwaitingReview {
+				t.Fatalf("phase = %q, want AwaitingReview; an unsettled LifecycleReported cannot reach Done", stored.Status.Phase)
+			}
+			if stored.Status.FinishedAt == nil || !stored.Status.FinishedAt.Time.Equal(finishedBefore) {
+				t.Fatal("finishedAt changed without a terminal transition")
+			}
+			if len(item.resolved) != 0 {
+				t.Fatalf("resolved IDs = %#v, want none before the source accepted the in-review lifecycle", item.resolved)
+			}
+			if _, ok := stored.Annotations[doneAtAnnotation]; ok {
+				t.Fatal("done-at marker written without a Done phase; the retention clock must not start")
+			}
+		})
+	}
+}
+
 func TestAwaitingReviewMergedPRMatchesAcrossRepositoryNameCasing(t *testing.T) {
 	// GitHub answers canonical casing while the source supplied the run's
 	// spec repository string; a casing drift must not stall a real merge.
