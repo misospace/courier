@@ -10,12 +10,14 @@ signal, it names the signal a later, separately-scoped instrumentation decision
 would emit; it does not add one.
 
 The motivating incident is the `PR-fix exclusions exceed maximum 32` discovery
-stall described in #289 and #286. This document exists so an operator can *see*
-that pressure without Courier core learning Dispatch's name or its cap. It does
-**not** settle the truncation/overflow behavior — #286 owns the strategy and
-#287 owns retention — and it must not be read as choosing a behavioral
-workaround. Observability reports pressure; it never silently decides how much
-work to drop.
+stall described in #289 and #286 — since resolved by truncating to the cap
+(#293), which is why the stall no longer appears in logs. The pressure that
+caused it does not go away with it, so this document exists so an operator can
+*see* that pressure without Courier core learning Dispatch's name or its cap. It
+does **not** settle the truncation/overflow behavior — #286 owns the strategy
+and #287 owns retention — and it must not be read as choosing a behavioral
+workaround or as describing the connector's current overflow path. Observability
+reports pressure; it never silently decides how much work to drop.
 
 ## 1. Purpose, scope, and boundaries
 
@@ -128,11 +130,11 @@ cannot advertise a capability Courier has no seam for.
 Courier's Dispatch adapter already bounds an acknowledged exclusion request:
 `exclude_pr_fix_version=1`, one `exclude_pr_fix=<repo>#<number>@<generation>`
 value per retained PR-fix generation, each value at most 300 characters, and at
-most 32 unique values per request (`internal/source/dispatch/client.go:195-227,
-247-256`; the cap is mirrored in DESIGN.md's Sources section). The cap is a
-**contract maximum**; the design treats it as connector-declared data rather
-than a core constant, even though in today's adapter it is a hardcoded value
-rather than a configurable one.
+most 32 unique values per request (`internal/source/dispatch/client.go:208-246`;
+the cap is mirrored in DESIGN.md's Sources section). The cap is a **contract
+maximum**; the design treats it as connector-declared data rather than a core
+constant, even though in today's adapter it is a hardcoded value rather than a
+configurable one.
 
 The connector emits, per discovery cycle in which exclusions were attempted:
 
@@ -149,19 +151,44 @@ health rule compares them to the connector's declared limit. **No core rule, and
 no alert, hardcodes 32.** A connector with a different limit — or no exclusion
 capability at all — needs no rule change.
 
-`overflow` is the observable that lets an operator see the #286 failure mode.
-Whether overflow is handled by refusing the request (today's fail-closed path),
-truncating to the limit (#286's proposal), or another strategy is a **behavior
-decision this document does not make**. In every case the pressure is visible,
-and a partial exclusion set must not be reported as full coverage: `accepted <
-requested` is always accompanied by an `overflow` observation.
+`overflow` is the observable that lets an operator see exclusion pressure under
+whichever strategy a connector takes. Which strategy that is stays a **behavior
+decision this document does not make** — but the current state of the code is
+stated here so the design does not describe a path that no longer ships.
+
+**Shipped today: truncation.** The Dispatch adapter keeps the first
+`maxPRFixExclusions` unique valid descriptors and drops the tail with a log line
+naming what was kept and dropped, instead of failing the request closed
+(`internal/source/dispatch/client.go:232-238`; the behavior decision is #286's,
+shipped by #293). Truncation is one connector's answer; a connector that refuses
+the request, or truncates under a different rule, reports the same three values.
+
+**Fail-closed, and a different thing entirely.** Two paths still fail the whole
+request closed, and neither one is overflow handling:
+
+- **Invalid exclusion descriptors.** A descriptor whose repo does not match the
+  contract's repo pattern, whose number or generation falls outside the safe
+  range, or whose value exceeds the 300-character maximum, fails discovery
+  rather than being dropped (`internal/source/dispatch/client.go:221-227`). A
+  work ID that does not decode to a PR-fix generation at all is skipped, not
+  fatal (`internal/source/dispatch/client.go:216-219`).
+- **Acknowledgement gate.** A response carrying no `prFixExclusions` object, or
+  one naming a version other than 1, fails closed before any task or idle result
+  is processed (`internal/source/dispatch/client.go:266-276`; §3.2). That is a
+  `missing`/`invalid`/`version-unsupported` acknowledgement, never an `overflow`.
+
+Because the two are distinct, an operator reading `overflow = 0` alongside a
+`missing` acknowledgement sees a failed contract, not a connector that found
+nothing to exclude. In every strategy the pressure stays visible, and a partial
+exclusion set must not be reported as full coverage: `accepted < requested` is
+always accompanied by an `overflow` observation.
 
 ### 3.2 Acknowledgement support and mismatch
 
 The exclusion contract requires the source to acknowledge
 `prFixExclusions.version: 1` before a task or idle result is processed
-(`internal/source/dispatch/client.go:246-256`). Acknowledgement is distinct from
-success and has its own reasons:
+(`internal/source/dispatch/client.go:266-276`). Acknowledgement is distinct
+from success and has its own reasons:
 
 | Reason | State | Meaning |
 | --- | --- | --- |
@@ -388,8 +415,9 @@ descriptor set exceeds its configured limit.
    `discovery-exclusions` capability, plots `requested/limit`, and alerts when
    `requested >= limit`. The rule contains no `dispatch` string and no `32`.
 6. The behavior taken at overflow — refuse, truncate, or something else — is
-   #286's decision and is visible in the `accepted` value. The observability
-   layer reports it; it does not choose it.
+   #286's decision (the current adapter truncates and logs the drop, §3.1) and is
+   visible in the `accepted` value. The observability layer reports it; it does
+   not choose it.
 
 **What is unknown when Dispatch telemetry is absent.** Courier can only report
 what it sent and what Dispatch acknowledged. It cannot observe Dispatch's
@@ -426,9 +454,12 @@ degrades to fewer panels rather than to a broken dashboard.
 ## 9. Relationship to the behavior fixes
 
 - **#286** (observed overflow) owns whether and how an over-limit exclusion set
-  is truncated. This document makes the pressure and the `accepted`/`requested`
-  gap observable; it deliberately does not prescribe a truncation algorithm,
-  because excluding only a subset can reintroduce hand-out starvation.
+  is truncated; #293 shipped truncation with a warning (§3.1). This document
+  makes the pressure and the `accepted`/`requested` gap observable, so the
+  chosen strategy is visible to an operator; it does not prescribe a truncation
+  algorithm. A partial exclusion set is safe to send because the exclusion
+  request is a dedupe hint, not a claim — but only the `accepted < requested`
+  gap proves that happened, which is why the gap is a first-class observation.
 - **#287** (retention) owns how many retained generations exist to be excluded
   in the first place. Retention and observability must agree on counts: the
   exclusion set is a set of decoded/deduplicated PR-fix generation descriptors,
