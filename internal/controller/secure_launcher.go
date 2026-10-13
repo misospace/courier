@@ -221,13 +221,24 @@ func (s *SecureControl) LaunchSecure(ctx context.Context, run *courier.CoderRun)
 
 // controlInvocation assembles the run context the control pod carries: the
 // same executor.Invocation a process executor would receive, built from the
-// immutable spec, the current status, and the lane's roles and framing.
+// immutable spec, the current status, and the lane's roles and framing. The
+// trusted criterion envelope (#280) travels with it exactly as the legacy
+// executor receives it: the identical pinned set, operator-authored.
 func (s *SecureControl) controlInvocation(ctx context.Context, run *courier.CoderRun) (executor.Invocation, error) {
 	lane := &courier.LaneProfile{}
 	if err := s.Client.Get(ctx, types.NamespacedName{Namespace: run.Namespace, Name: run.Spec.Lane}, lane); err != nil {
 		return executor.Invocation{}, fmt.Errorf("secure topology: read lane profile %q: %w", run.Spec.Lane, err)
 	}
-	return executor.NewInvocation(run, lane, topology.ControlWorkspacePath)
+	invocation, err := executor.NewInvocation(run, lane, topology.ControlWorkspacePath)
+	if err != nil {
+		return executor.Invocation{}, err
+	}
+	criteria, err := criteriaEnvelope(run)
+	if err != nil {
+		return executor.Invocation{}, err
+	}
+	invocation.Criteria = criteria
+	return invocation, nil
 }
 
 type gatewayConfig struct {

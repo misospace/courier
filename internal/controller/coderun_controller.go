@@ -20,6 +20,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
 	courierv1alpha1 "github.com/misospace/courier/api/v1alpha1"
+	"github.com/misospace/courier/internal/broker"
 	"github.com/misospace/courier/internal/executor"
 	courierlog "github.com/misospace/courier/internal/log"
 	"github.com/misospace/courier/internal/source"
@@ -95,6 +96,14 @@ type CoderRunReconciler struct {
 
 	// Observer reads the external pull request and CI state after a successful run.
 	Observer WorldObserver
+
+	// PullRequests, when set, gives a settled AwaitingReview run its slow,
+	// bounded world observation: an exact read of the recorded pull request
+	// through the configured forge capability. A confirmed merge resolves
+	// the run to Done and enters the existing resolve-then-reap lifecycle.
+	// Nil means post-review merges are never observed, so the run keeps the
+	// watch-only behavior of a deployment without a forge read path.
+	PullRequests PullRequestReader
 
 	// Evidence reconciles the run's failure-evidence Secrets at the terminal
 	// boundary the operator can prove: a world-verified success (AwaitingReview,
@@ -214,7 +223,11 @@ func (r *CoderRunReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 	// value as Pending so a source does not need a second status write before
 	// admission can begin. A terminal run normally does nothing, except when its
 	// lifecycle report is still pending: then the report alone is retried, since
-	// the run already reached its phase and freed capacity.
+	// the run already reached its phase and freed capacity. An AwaitingReview
+	// run whose LifecycleReported condition has reached a positive, settled
+	// state (Status=True with reason Published or Superseded) additionally takes
+	// one slow, bounded read of its recorded pull request, so a human merge can
+	// finish and reap it.
 	if run.Status.Phase != "" && run.Status.Phase != courierv1alpha1.PhasePending {
 		if lifecycleReportPending(&run) {
 			if lifecycleReportUnsupported(&run) {
@@ -226,6 +239,25 @@ func (r *CoderRunReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 				}
 			}
 			return r.retryTerminalLifecycle(ctx, &run)
+		}
+		if run.Status.Phase == courierv1alpha1.PhaseAwaitingReview {
+			// The pending-report retry above handles a False LifecycleReported.
+			// A missing, Unknown, or True-with-another-reason condition does not
+			// prove the source saw the in-review lifecycle either, so the
+			// post-review merge observation must wait too: a legacy or partially
+			// upgraded AwaitingReview run without a positively settled
+			// LifecycleReported (Published or Superseded) cannot transition to
+			// Done without first proving its in-review lifecycle. The run stays
+			// parked without a timer; the report-retry path above re-arms any
+			// pending report, and a run whose condition is missing/Unknown/other
+			// remains unobserved until the source publishes the report or an
+			// operator intervenes.
+			if !lifecycleReportSettled(&run) {
+				log.FromContext(ctx).V(1).Info("awaiting-review run observed without a positively settled LifecycleReported; leaving in awaiting-review",
+					"lifecycleReported", lifecycleReportConditionState(&run))
+				return ctrl.Result{}, nil
+			}
+			return r.observeMergedReviewPR(ctx, &run)
 		}
 		l.V(1).Info("reconcile", "phase", run.Status.Phase)
 		return ctrl.Result{}, nil
@@ -417,6 +449,12 @@ func (r *CoderRunReconciler) resolvePersistSecurePolicy(ctx context.Context, run
 		if err != nil || registration.Name != policy.ProviderConfigRef || registration.Endpoint != policy.ProviderEndpoint || registration.Projection().Digest != policy.CredentialRefDigest {
 			return secureNeedsHuman("PolicyConflict",
 				"the provider registry no longer matches this run's persisted policy")
+		}
+		// A pinned criterion set is re-verified like every other policy
+		// field: a digest that no longer covers the pinned criteria is a
+		// fail-closed corruption signal, not an input to launch-loop on.
+		if _, _, err := broker.CriterionSetFromPolicy(policy); err != nil {
+			return secureNeedsHuman("PolicyCorrupt", "%v", err)
 		}
 		return nil
 	}
@@ -925,6 +963,9 @@ func (r *CoderRunReconciler) transitionTerminal(ctx context.Context, run *courie
 		return ctrl.Result{}, err
 	}
 	phaseChanged := run.Status.Phase != phase
+	// FinishedAt is set once, on the run's first terminal transition, so its
+	// absence marks this reconcile as the one that records the run's metrics.
+	firstTerminal := run.Status.FinishedAt == nil
 	before := run.DeepCopy()
 	// The run's control request is void once it is torn down: clear it and its
 	// acknowledgement so the terminal state carries no live request (#238).
@@ -940,8 +981,7 @@ func (r *CoderRunReconciler) transitionTerminal(ctx context.Context, run *courie
 	if phaseChanged {
 		// finishedAt marks when the run's own execution ended: it is
 		// recorded on every terminal transition, set-once, so a later
-		// operator-marked Done (post-merge, currently unimplemented) never
-		// moves it.
+		// merge-confirmed Done (#250) never moves it.
 		if run.Status.FinishedAt == nil {
 			run.Status.FinishedAt = &metav1.Time{Time: r.clock().UTC()}
 			if run.Status.StartedAt != nil && run.Status.RunDuration == "" {
@@ -971,9 +1011,13 @@ func (r *CoderRunReconciler) transitionTerminal(ctx context.Context, run *courie
 		// dropped) on the reconcile that entered it.
 		return ctrl.Result{}, nil
 	}
-	// The terminal phase is final, so only the reconcile that changes into it
-	// records the run's metrics; re-reconciles return above.
-	r.metrics().ObserveTerminal(run)
+	// The run's metrics are recorded once, on its first terminal transition.
+	// A later transition that corrects the ending — a confirmed merge
+	// settling AwaitingReview as Done (#250) — must not count the same run
+	// twice.
+	if firstTerminal {
+		r.metrics().ObserveTerminal(run)
+	}
 	return r.publishTerminalLifecycle(ctx, run, adapter, item, phase, intent)
 }
 
@@ -1174,6 +1218,35 @@ func lifecycleReportPending(run *courierv1alpha1.CoderRun) bool {
 	}
 	cond := apimeta.FindStatusCondition(run.Status.Conditions, lifecycleReportedCondition)
 	return cond != nil && cond.Status == metav1.ConditionFalse
+}
+
+// lifecycleReportSettled reports whether the run's source lifecycle report has
+// reached the positive, settled state DESIGN.md §1291 demands before world
+// observation can close the loop: the LifecycleReported condition carries
+// Status=True with reason Published or Superseded. A missing, Unknown, or False
+// condition does not satisfy the gate, and Status=True with any other reason is
+// treated as not yet settled too — only Published/Superseded are the reasons
+// the condition's Status=True carries in practice, but the helper defends the
+// invariant by name. The gate keeps a legacy, partially upgraded, or corrupted
+// terminal CoderRun from being finished by world observation before the source
+// has proof of the in-review lifecycle.
+func lifecycleReportSettled(run *courierv1alpha1.CoderRun) bool {
+	cond := apimeta.FindStatusCondition(run.Status.Conditions, lifecycleReportedCondition)
+	if cond == nil || cond.Status != metav1.ConditionTrue {
+		return false
+	}
+	return cond.Reason == "Published" || cond.Reason == "Superseded"
+}
+
+// lifecycleReportConditionState renders the LifecycleReported condition as a
+// short, log-friendly string: "<missing>" when absent, otherwise
+// "<status>/<reason>". Used only for diagnostic logging.
+func lifecycleReportConditionState(run *courierv1alpha1.CoderRun) string {
+	cond := apimeta.FindStatusCondition(run.Status.Conditions, lifecycleReportedCondition)
+	if cond == nil {
+		return "<missing>"
+	}
+	return string(cond.Status) + "/" + cond.Reason
 }
 
 func lifecycleReportUnsupported(run *courierv1alpha1.CoderRun) bool {

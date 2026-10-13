@@ -515,14 +515,24 @@ content**: an edit to the issue after admission does not add, remove, or
 rewrite this run's criteria — a human changing requirements re-queues the
 work through admission; the model never supplies criteria at any point.
 
-**Carriage to the boundary.** Native: the pinned set joins the immutable
-run publication policy (`Status.PublicationPolicy`), resolved at admission
-and verified by the broker binding like every other policy field. Legacy:
-the operator projects the identical set into the executor pod as trusted
-environment (`COURIER_CRITERIA`, bounded JSON: issue identity, criteria
-with IDs/texts/digests, set digest) beside `COURIER_REPO`/`COURIER_REF`.
-Legacy pod visibility is fine — the set is public issue text; the contract
-is that the *validator's* comparison target is operator-authored, and the
+**Carriage to the boundary (#280, shipped).** Native: the pinned set joins
+the immutable run publication policy (`Status.PublicationPolicy`:
+`sourceIssue`, `acceptanceCriteria`, `acceptanceCriteriaDigest`), resolved
+at admission through the provider's typed work-item read (`ReadWorkItem`,
+the operator's read identity, read-only) and re-verified by the broker
+binding like every other policy field — per-criterion digests, extraction
+ordinals, and the set digest are recomputed, so a tampered pin fails the
+binding. An empty pinned set carries its identity-only digest, which is
+what distinguishes a pinned-empty contract from an unpinned policy
+(pre-#280 runs bind with no pin — backward compatible). Legacy: the
+operator projects the identical set into the executor pod as trusted
+environment (`COURIER_CRITERIA`, bounded JSON in the broker criterion-set
+shape: issue identity, criteria with IDs/texts/digests, set digest) beside
+`COURIER_REPO`/`COURIER_REF`, rendered from the persisted policy by the
+legacy launcher and the secure control invocation alike; a fix-pr run and
+a run without a pin receive no envelope, so absence is meaningful. Legacy
+pod visibility is fine — the set is public issue text; the contract is
+that the *validator's* comparison target is operator-authored, and the
 model cannot change it.
 
 **Data shape.** The PR body carries one machine-readable block — the only

@@ -59,6 +59,11 @@ const (
 // still cut by the shared line fit (#210).
 const maxTerminationReasonBytes = 1200
 
+// boundReason bounds the reason to maxTerminationReasonBytes, splitting only
+// on a rune boundary so the trusted reason remains valid UTF-8. It reuses the
+// shared executor.TerminationTruncationSuffix marker so every COURIER_TERMINATION
+// producer (this path, the legacy courier-executor, the operator's
+// boundedDiagnosticReason) ends the truncated reason on the same bytes.
 func boundReason(reason string) string {
 	if len(reason) <= maxTerminationReasonBytes {
 		return reason
@@ -140,14 +145,14 @@ func runArgs(args []string) error {
 		if err == nil {
 			break
 		}
-		var gateErr *harness.GateError
-		if !errors.As(err, &gateErr) || !gateErr.AllRetryable() || attempt >= probeRetryRounds {
-			return declareNeedsHuman(gateErr.Error(), caps)
+		reason, retryable := classifyGateFailure(err)
+		if !retryable || attempt >= probeRetryRounds {
+			return declareNeedsHuman(reason, caps)
 		}
-		fmt.Printf("transient capability failure, re-probing: %s\n", gateErr)
+		fmt.Printf("transient capability failure, re-probing: %s\n", reason)
 		select {
 		case <-ctx.Done():
-			return declareNeedsHuman(gateErr.Error(), caps)
+			return declareNeedsHuman(reason, caps)
 		case <-time.After(probeRetryDelay):
 		}
 	}
@@ -201,6 +206,19 @@ func runArgs(args []string) error {
 	}
 	result := coordinator.Run(ctx, invocation)
 	return declare(result)
+}
+
+// classifyGateFailure decides, for a harness.Gate failure, the reason the
+// probe loop declares when it stops and whether a re-probe round may run.
+// harness.Gate returns a *GateError today, but a non-GateError must still
+// fail closed: it declares with the gate-failure error itself, so a change
+// to that contract cannot nil-deref the declare path.
+func classifyGateFailure(err error) (reason string, retryable bool) {
+	var gateErr *harness.GateError
+	if !errors.As(err, &gateErr) {
+		return fmt.Sprintf("capability gate failed: %v", err), false
+	}
+	return gateErr.Error(), gateErr.AllRetryable()
 }
 
 // declare maps the harness result onto the operator's exit contract:

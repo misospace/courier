@@ -441,6 +441,49 @@ spec:
                   PublicationPolicy is the immutable destination resolved by the operator
                   before launch. Its RunUID must match this object's current UID.
                 properties:
+                  acceptanceCriteria:
+                    description: |-
+                      AcceptanceCriteria is the revision-pinned acceptance-criterion set
+                      extracted from the trusted source-issue body at admission. An empty
+                      list is a legitimate pin — the issue carries no recognizable
+                      Acceptance section — and is distinct from nil, which means no set was
+                      pinned (fix-pr runs, policies admitted before #280). Later issue
+                      edits never mutate a live run's pin.
+                    items:
+                      description: |-
+                        Criterion is one acceptance criterion pinned from the trusted source-issue
+                        snapshot at admission (#249/#280). ID is the ordinal assigned at extraction
+                        ("AC-1", "AC-2", …, in document order); Digest covers the normalized
+                        criterion text so an evidence row authored against edited text is refused.
+                      properties:
+                        digest:
+                          description: Digest is the sha256 of the normalized text.
+                          pattern: ^sha256:[0-9a-f]{64}$
+                          type: string
+                        id:
+                          description: ID is the extraction ordinal ("AC-1", "AC-2",
+                            …).
+                          pattern: ^AC-[1-9][0-9]*$
+                          type: string
+                        text:
+                          description: Text is the normalized criterion text (whitespace-collapsed).
+                          maxLength: 512
+                          type: string
+                      required:
+                      - digest
+                      - id
+                      - text
+                      type: object
+                    maxItems: 32
+                    type: array
+                    x-kubernetes-list-type: atomic
+                  acceptanceCriteriaDigest:
+                    description: |-
+                      AcceptanceCriteriaDigest covers the trusted issue identity plus every
+                      criterion digest in order. It is non-empty exactly when a set is
+                      pinned; the broker binding recomputes it and refuses a mismatched pin.
+                    pattern: ^sha256:[0-9a-f]{64}$
+                    type: string
                   baseOID:
                     description: BaseOID is the base ref tip observed at admission.
                     type: string
@@ -480,6 +523,31 @@ spec:
                   runUID:
                     description: RunUID binds this policy to one CoderRun incarnation.
                     type: string
+                  sourceIssue:
+                    description: |-
+                      SourceIssue pins the trusted source-issue identity for resolve-issue
+                      runs, recorded beside the criterion pin so the policy is
+                      self-describing. It is cross-checked by the broker binding against
+                      the identity derived from the immutable spec. Nil for fix-pr runs and
+                      for policies admitted before the criterion contract (#280).
+                    properties:
+                      name:
+                        description: Name is the provider-canonical repository name.
+                        minLength: 1
+                        type: string
+                      number:
+                        description: Number is the trusted source issue number.
+                        minimum: 1
+                        type: integer
+                      owner:
+                        description: Owner is the provider-canonical repository owner.
+                        minLength: 1
+                        type: string
+                    required:
+                    - name
+                    - number
+                    - owner
+                    type: object
                   workInitiallyAbsent:
                     description: WorkInitiallyAbsent distinguishes an absent ref from
                       one with a tip at admission.
