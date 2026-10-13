@@ -638,7 +638,7 @@ func (r *CoderRunReconciler) observeRunning(ctx context.Context, run *courierv1a
 	// coordinator-termination handler below: a terminated control pod must
 	// fence its worker and take the broker down in the same reconcile that
 	// terminalizes the run. A terminal run is never relaunched, and an
-	// AwaitingReview or HandedOff run is never reaped, so fencing left to a
+	// AwaitingReview, HandedOff, or BlockedExternal run is never reaped, so fencing left to a
 	// later reconcile could never run at all — the untrusted executor and the
 	// credentialed broker would outlive their supervisor indefinitely.
 	if r.Secure != nil {

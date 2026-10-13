@@ -1281,7 +1281,7 @@ func TestRevokeDeletesBrokerServiceWhenBrokerPodIsGone(t *testing.T) {
 // regression for fence placement: the legacy coordinator-termination handler
 // must not bypass the secure topology's teardown, or the untrusted worker and
 // the credentialed broker outlive their supervisor — a terminal run is never
-// relaunched (and an AwaitingReview or HandedOff run is never reaped), so a
+// relaunched (and an AwaitingReview, HandedOff, or BlockedExternal run is never reaped), so a
 // later-reconcile fence would never run at all.
 func TestReconcileFencesWorkerWhenControlTerminates(t *testing.T) {
 	control, c := secureControl(t)
@@ -1495,7 +1495,7 @@ func TestReconcileControlLossWithoutStatusReturnsToClaimed(t *testing.T) {
 // arm of #215: when the control loss lands on a run whose restart counter
 // has already reached the ceiling, the detection reconcile still fences the
 // surviving round before terminalizing to NeedsHuman. A terminal run is
-// never relaunched (and an AwaitingReview or HandedOff run is never reaped),
+// never relaunched (and an AwaitingReview, HandedOff, or BlockedExternal run is never reaped),
 // so a fence deferred past the detection reconcile would never run, and the
 // run's hand-off must keep the only intact objects of the round safe from the
 // missing supervisor.
