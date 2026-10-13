@@ -39,9 +39,9 @@ views. Where this document answers a question #292 recorded as open, it says so.
 Courier's current observability is run-centric. `courier_coderuns_total`,
 `courier_coderun_run_duration_seconds`, and `courier_coderun_queue_wait_seconds`
 are observed only when a run reaches a terminal phase
-(`internal/controller/metrics.go:119-138`); `courier_coderuns_in_flight` and
+(`internal/controller/metrics.go:121-140`); `courier_coderuns_in_flight` and
 `courier_lane_suspended` are read live from the cluster
-(`internal/controller/metrics.go:180-223`). **None of these can distinguish an
+(`internal/controller/metrics.go:182-225`). **None of these can distinguish an
 idle, healthy, empty queue from a broken discovery loop**, because discovery
 failures are logged and then discarded
 (`internal/source/runner.go:67-69,78-80`) and never reach a counter, condition,
@@ -99,8 +99,8 @@ source runner is not configured emits nothing.
 | `courier_source_discovery_successes_total` | counter | polls | `source`, `lane` | Source calls that returned without error, **including zero items**. This is what makes an idle queue observable as healthy. |
 | `courier_source_discovery_failures_total` | counter | polls | `source`, `lane` | Source calls that returned an error. The authoritative discovery-failure rate (#291 §6.2). |
 | `courier_source_items_offered_total` | counter | items | `source`, `lane` | Items returned by discovery before core validation and dedupe. |
-| `courier_source_discovery_skipped_total` | counter | items | `source`, `lane`, `reason` | Items dropped by runner validation; `reason` ∈ `missing-id`, `unsupported-mode`, `invalid-ref` (`internal/source/runner.go:179-195`). |
-| `courier_source_items_materialized_total` | counter | runs | `source`, `lane` | Items that became `CoderRun`s. Dedupe and exclusions may make this smaller than `items_offered_total` (`internal/source/runner.go:216-262`). |
+| `courier_source_discovery_skipped_total` | counter | items | `source`, `lane`, `reason` | Items dropped by runner validation; `reason` ∈ `missing-id`, `unsupported-mode`, `invalid-ref` (`internal/source/runner.go:210-220`). |
+| `courier_source_items_materialized_total` | counter | runs | `source`, `lane` | Items that became `CoderRun`s. Dedupe and exclusions may make this smaller than `items_offered_total` (`internal/source/runner.go:221-262`). |
 | `courier_source_last_attempt_timestamp_seconds` | gauge | unix seconds | `source`, `lane` | When the source was last called. |
 | `courier_source_last_success_timestamp_seconds` | gauge | unix seconds | `source`, `lane` | When discovery last succeeded. **Absent until the first success** — absence is `starting`/`unknown`, never `idle`. |
 | `courier_source_discovery_paused_total` | counter | polls | `source`, `lane`, `reason` | Polls skipped before the source was called; `reason` ∈ `lane-waiting`, `lane-suspended`, `lane-at-capacity` (`internal/source/runner.go:92-139`). |
@@ -117,14 +117,14 @@ shared adapter name.
 The `reason` tokens in this catalogue are a **structured metric vocabulary**
 owned by the emitter. They are deliberately kebab-case and distinct from the
 free-form log prose the runner prints today (for example the runner logs
-`"waiting for LaneProfile"` at `internal/source/runner.go:96`, which the metric
+`"waiting for LaneProfile"` at `internal/source/runner.go:97`, which the metric
 emits as `reason="lane-waiting"`); the log message is not a label.
 
 ### 3.3 Lane capacity and reservations (core)
 
 Reservations already exist as an internal predicate
-(`laneCapacityReservations`, `internal/source/runner.go:299-311`) and are only
-visible through one log line (`internal/source/runner.go:129-138`). They are
+(`laneCapacityReservations`, `internal/source/runner.go:343-355`) and are only
+visible through one log line (`internal/source/runner.go:125-138`). They are
 promoted to a signal so the lane's queue is observable.
 
 | Signal | Kind | Unit | Labels | Semantics |
@@ -132,7 +132,7 @@ promoted to a signal so the lane's queue is observable.
 | `courier_lane_concurrency` | gauge | slots | `lane` | Configured `LaneProfile.Spec.Concurrency` (default 1). Closes the gap #292 recorded for the saturation alert. |
 | `courier_lane_suspended` | gauge | 0/1 | `lane` | Existing: `LaneProfile.Suspended()` (`api/v1alpha1/laneprofile_types.go:13,71`). |
 | `courier_coderuns_in_flight` | gauge | runs | `lane` | Existing: runs admitted by the operator, i.e. `Claimed` + `Running` (`internal/controller/admission.go:21-23`). |
-| `courier_lane_reservations` | gauge | runs | `lane` | Discovery reservations: empty-phase + `Pending` + `Claimed` + `Running` (`internal/source/runner.go:299-311`). Deliberately broader than `in_flight`. |
+| `courier_lane_reservations` | gauge | runs | `lane` | Discovery reservations: empty-phase + `Pending` + `Claimed` + `Running` (`internal/source/runner.go:343-355`). Deliberately broader than `in_flight`. |
 | `courier_coderuns_pending` | gauge | runs | `lane` | Runs in `PhasePending` (a precise subset of reservations, for the queue display). |
 | `courier_lane_oldest_reservation_age_seconds` | gauge | seconds | `lane` | Age of the oldest reservation by `metadata.creationTimestamp`; absent when there are none. The evidence for the stale-reservation condition (§5). |
 
@@ -144,10 +144,10 @@ both visible rather than collapsing them.
 
 ### 3.4 Run phases, transitions, and age (core)
 
-Phases are the existing enum (`api/v1alpha1/coderun_types.go:22-41`): `Pending`,
+Phases are the existing enum (`api/v1alpha1/coderun_types.go:26-41`): `Pending`,
 `Claimed`, `Running`, `Verifying`, `AwaitingReview`, `HandedOff`, `NeedsHuman`,
 `Done`, `Failed`, `BlockedExternal`. Terminal phases carry `FinishedAt`
-(`internal/controller/coderun_controller.go:787-844`).
+(`internal/controller/coderun_controller.go:825-854`).
 
 | Signal | Kind | Unit | Labels | Semantics |
 | --- | --- | --- | --- | --- |
@@ -171,8 +171,8 @@ kept separate from external disposition (§4.1).
 | Signal | Kind | Unit | Labels | Semantics |
 | --- | --- | --- | --- | --- |
 | `courier_coderun_terminal_diagnostics_total` | counter | runs | `lane`, `mode`, `category` | One per terminal run, by `TerminalDiagnostic.Category`; `category` is the closed enum in `api/v1alpha1/coderun_types.go:135-159`. |
-| `courier_coderun_infra_restarts_total` | counter | restarts | `lane`, `mode` | Coordinator infra relaunches (`Status.Restarts`, `internal/controller/liveness.go:550-572`). |
-| `courier_coderun_verification_outcomes_total` | counter | runs | `lane`, `mode`, `result` | External verification disposition observed by the operator: `result` ∈ `green` (stable green → `AwaitingReview`), `red` (confirmed red → `HandedOff`/`Failed`), `unobservable` (draft/no-PR/unreadable → `NeedsHuman`) (`internal/controller/coderun_controller.go:684-762`). |
+| `courier_coderun_infra_restarts_total` | counter | restarts | `lane`, `mode` | Coordinator infra relaunches (`Status.Restarts`, `internal/controller/liveness.go:593-615`). |
+| `courier_coderun_verification_outcomes_total` | counter | runs | `lane`, `mode`, `result` | External verification disposition observed by the operator: `result` ∈ `green` (stable green → `AwaitingReview`), `red` (confirmed red → `HandedOff`/`Failed`), `unobservable` (draft/no-PR/unreadable → `NeedsHuman`) (`internal/controller/coderun_controller.go:722-800`). |
 | `courier_coderun_tokens_total` | counter | tokens | `lane`, `mode`, `kind` | Aggregate token totals from `RunTelemetry`; `kind` ∈ `input`, `output`, `reasoning`, `cache-read`, `cache-write`. `total` is the sum of these parts and is derived, not a separate series. Per-run and per-session detail stays in `status.telemetry` and the `run.summary` log; only the bounded aggregate is a metric. |
 
 ### 3.6 Lifecycle reporting (core)
@@ -180,8 +180,8 @@ kept separate from external disposition (§4.1).
 Reporting state already exists as two conditions —
 `LifecycleReported` (`api/v1alpha1/coderun_types.go:19`) and the support
 condition `LifecycleReportSupported`
-(`internal/controller/coderun_controller.go:45-46`) — and a bounded retry cadence
-(`lifecycleReportRequeueDelay = 30s`, `internal/controller/coderun_controller.go:35`).
+(`internal/controller/coderun_controller.go:47`) — and a bounded retry cadence
+(`lifecycleReportRequeueDelay = 30s`, `internal/controller/coderun_controller.go:36`).
 
 | Signal | Kind | Unit | Labels | Semantics |
 | --- | --- | --- | --- | --- |
@@ -191,7 +191,7 @@ condition `LifecycleReportSupported`
 
 The metric `result` vocabulary is a bounded projection of the two existing
 conditions, not a new source of truth. It maps to the code's reasons
-(`internal/controller/coderun_controller.go:882-910,997-1021`):
+(`internal/controller/coderun_controller.go:892-903,1041-1067`):
 `published` ← `LifecycleReported=True` reason `Published`; `superseded` ←
 `LifecycleReported=True` reason `Superseded`; `unsupported` ←
 `LifecycleReportSupported=False` reason `UnsupportedOutcome`; `retryable` ←
@@ -201,7 +201,7 @@ conditions, not a new source of truth. It maps to the code's reasons
 `courier_coderuns_lifecycle_pending`, not a `result`.
 
 The retry tokens (`LifecycleReportRetryToken`,
-`LifecycleReportActiveRetryToken`, `api/v1alpha1/coderun_types.go:385,390`) stay
+`LifecycleReportActiveRetryToken`, `api/v1alpha1/coderun_types.go:440,445`) stay
 per-run status and are **not** labels; only their aggregate count is observed.
 
 ### 3.7 Retention and reaping (core)
@@ -238,9 +238,25 @@ collapse into one "done".
 
 - **Executor completion** is the run leaving `Running`: it entered `Verifying`
   (executor exited `0` and published), or it reached a declared terminal phase
-  (`needs-human`, `blocked-external`, declared no-change). This is bounded by
-  `FinishedAt` and is what `courier_coderuns_total` and the duration histograms
-  measure.
+  (`needs-human`, `blocked-external`, declared no-change). Current evidence does
+  **not** measure executor completion directly. `FinishedAt` is set on the run's
+  first *terminal* transition (`transitionTerminal`,
+  `internal/controller/coderun_controller.go:825-854`) and
+  `courier_coderuns_total` plus the run-duration histogram are recorded at the
+  same point (`ObserveTerminal`, `internal/controller/metrics.go:121-140`); the
+  `Running → Verifying` transition (`internal/controller/coderun_controller.go:650-667`)
+  records neither. So a run parked in `Verifying` is not yet counted, and its
+  eventual `StartedAt → FinishedAt` duration includes the `Verifying`
+  observation wait: the terminal histogram measures execution *plus*
+  disposition, not executor time alone. For runs that terminalize directly
+  from `Running` without a `Verifying` stop, the first terminal transition *is*
+  the end of execution and `FinishedAt` equals executor completion there.
+  Executor completion as such is evidenced today only by the `phase.transition`
+  log event entering `Verifying` (§3.8). If it must be separately visible as a
+  signal, the evidence is §3.4's proposed
+  `courier_coderun_phase_transitions_total` /
+  `courier_coderun_phase_duration_seconds` — the `Running` phase's duration is
+  observed on leaving it — not a reinterpretation of the terminal duration.
 - **External disposition** is what happens after Courier stopped working: CI
   advancing to green, a red check, a human review, a merge, or the source's own
   handling. `Verifying` is a *live* state — Courier owns observation but has no
@@ -322,15 +338,20 @@ simply not rendered, never shown as idle.
 | `open` | not suspended and reservations below concurrency. |
 | `saturated` | reservations meet or exceed concurrency. Normal, informational. |
 | `suspended` | `courier_lane_suspended == 1`. |
-| `stalled` | `open` but the oldest reservation is older than the reservation-freshness window (§5). |
+| `stalled` | not suspended, capacity free but unused (`in_flight < concurrency`), at least one reservation unadmitted (`reservations > in_flight`), no `Claimed` transition for the lane in the window, and the oldest reservation older than the reservation-freshness window (§5). The discriminator is `in_flight` vs `concurrency`, not `reservations` vs `concurrency`, so the fully-reserved unadmitted wedge — which the capacity test classifies `saturated` — is still diagnosable. |
 | `unknown` | lane signals absent. |
+
+Saturation alone never makes a lane `stalled`: a busy lane's reservations age
+naturally and work waiting while every slot is genuinely held is an
+availability fact, not a failure (§4.2). Only *free* capacity paired with an
+unadmitted reservation that makes no admission progress is the wedge (§5).
 
 ## 5. Health conditions and evidence
 
 Each condition is a derived predicate over §3, not a raw signal. Thresholds and
 evaluation windows below are **design candidates**, not production defaults;
 `T_poll` is the discovery poll interval (`defaultPollInterval = 30s`,
-`internal/source/runner.go:29`). Every condition has an explicit behaviour when
+`internal/source/runner.go:30`). Every condition has an explicit behaviour when
 its evidence is missing — a condition with no evidence is `unknown`, never
 satisfied.
 
@@ -340,7 +361,7 @@ satisfied.
 | **SourceDiscoveryStalled** | enabled, not paused, attempts stopped (no attempt in window) | `last_attempt`, and the `discovery_paused` gauge reading 0 for every `reason` | 3·`T_poll` | `unknown` |
 | **SourceNeverSucceeded** | enabled, `starting` persists past grace | `last_success` absent, process uptime | 10·`T_poll` | `unknown` |
 | **LaneSaturated** | reservations ≥ concurrency, sustained | `lane_reservations`, `lane_concurrency` | 5 min | `unknown` if `lane_concurrency` absent |
-| **StaleReservation** | lane open, oldest reservation older than window, no progress | `lane_oldest_reservation_age_seconds`, `coderuns_pending`, `lane_suspended` | 15 min | `unknown` |
+| **StaleReservation** | not suspended; capacity free but unused (`in_flight < concurrency`); at least one reservation unadmitted (`reservations > in_flight`); no `Claimed` transition for the lane in the window; oldest reservation older than window | `lane_reservations`, `coderuns_in_flight`, `lane_concurrency`, `coderun_phase_transitions_total{to="Claimed"}`, `lane_oldest_reservation_age_seconds`, `coderuns_pending`, `lane_suspended` | 15 min | `unknown` if the reservation or progress evidence is absent |
 | **LifecycleReportFailing** | terminal runs with `LifecycleReported=False` older than cadence + headroom | `coderuns_lifecycle_pending`, `..._oldest_age_seconds` | retry cadence (30 s) + 5 min headroom | `unknown` |
 | **RunFailureRateHigh** | terminal failure ratio over window above threshold with an absolute floor | `coderuns_total{phase}` | 1 h, floor of ≥ 5 failures | no ratio ⇒ no fire |
 | **MetricsScrapeFailing** | `metrics_scrape_errors_total` increasing | `metrics_scrape_errors_total` | 10 min | `unknown` if absent |
@@ -354,11 +375,30 @@ Two conditions deserve emphasis because the issue names them:
   `lane-at-capacity`). If the binding is paused for capacity, the same failure
   counters are visible but the condition does not fire: the operator is
   deliberately not calling the source.
-- **Stale reservations.** A reservation is *stale* when the lane is open and the
-  oldest reservation has not advanced for the freshness window. Age is the
-  primary measure; "no progress" (no phase transition, no heartbeat) is a
-  candidate refinement recorded in §11. A stale reservation is a lane condition,
-  not a run failure: the run may be perfectly healthy but unable to start.
+- **Stale reservations.** `StaleReservation` is the admission wedge, not the
+  age of a busy lane. It requires all of: the lane is not suspended; capacity
+  is *free but unused* (`in_flight < concurrency`); at least one reservation is
+  unadmitted (`reservations > in_flight` — reservations span empty-phase +
+  `Pending` + `Claimed` + `Running` while in-flight counts only
+  `Claimed`+`Running` (§3.3), so the difference is exactly the
+  materialized-but-unadmitted work); admission is not progressing (no
+  `Claimed` transition for the lane in the window); and the oldest reservation
+  exceeds the freshness window. The discriminator is `in_flight` vs
+  `concurrency`, **not** `open` (`reservations < concurrency`): the runner
+  pauses discovery at `reserved >= capacity`
+  (`internal/source/runner.go:125-138`), so the fully-reserved unadmitted
+  wedge — say concurrency 1, one `Pending` reservation, nothing in flight —
+  reads `saturated` on the capacity test and an open-lane gate would never
+  fire on it. Work waiting while every slot is genuinely held
+  (`in_flight == concurrency`) stays an availability fact (§4.2), not this
+  condition. The `age` gauge measures `metadata.creationTimestamp` and does
+  not reset on admission, so recovery runs through the gates (the backlog
+  drains, a `Claimed` transition is seen, or the lane suspends), never through
+  an age reset. This predicate matches the A3 alert condition #292 settled in
+  [docs/observability-dashboards-and-alerts.md](./observability-dashboards-and-alerts.md);
+  the two documents must not diverge on it. A stale reservation is a lane
+  condition, not a run failure: the run may be perfectly healthy but unable to
+  start.
 - **Reporting failures.** `LifecycleReportFailing` fires when the unsettled
   backlog exists and its oldest member exceeds the report retry cadence plus
   headroom; a single slow report must not fire it (absolute floor).
@@ -370,7 +410,7 @@ document supplies the conditions and the evidence they require.
 
 ## 6. Example traces
 
-All three traces use one binding: source `github-label`, lane `cloud`,
+All traces use one binding: source `github-label`, lane `cloud`,
 concurrency 2, poll interval 30 s. Values are illustrative.
 
 ### 6.1 Healthy
@@ -427,19 +467,33 @@ not calling the source. If instead attempts stopped while paused was 0, that is
 `SourceDiscoveryStalled` (a wedged runner), a different condition with a
 different remedy.
 
-### 6.4 Stale reservation (lane open, run cannot start)
+### 6.4 Stale reservation (admission wedge, distinct from saturation)
 
-Reservations sit at concurrency for 20 minutes with no phase change and the lane
-is not suspended.
+Concurrency is 2. The first rows are a **busy, healthy** lane whose
+reservations are all admitted; the last row is the wedge. Saturation alone is
+identical in kind — the discriminator is unadmitted work paired with free
+capacity and stalled admission.
 
-| Time | reservations | in_flight | pending | oldest_reservation_age | lane state |
-| --- | --- | --- | --- | --- | --- |
-| 13:00:00 | 2 | 1 | 1 | 40 s | `open` |
-| 13:20:00 | 2 | 1 | 1 | 1240 s | `stalled` |
+| Time | reservations | in_flight | pending | oldest_reservation_age | `Claimed` transitions (15 min) | capacity test | lane state |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| 13:00:00 | 2 | 2 | 0 | 300 s | yes | `saturated` | `saturated` |
+| 13:10:00 | 2 | 2 | 0 | 900 s | yes | `saturated` | `saturated` |
+| 13:20:00 | 2 | 1 | 1 | 1240 s | none | `saturated` | `stalled` |
 
-`StaleReservation` fires at the candidate 15 min window. The source is `ok`; the
-run is not `Failed`; the lane simply cannot admit. The remedy is capacity or
-scheduling, not source repair.
+Age alone would have fired at 13:10 against a lane whose every reservation is
+a progressing `Claimed`/`Running` run — nothing is unadmitted, so the
+condition stays false however old those reservations get. At 13:20 a slot is
+free (`in_flight 1 < concurrency 2`) yet the `Pending` reservation behind it
+(`reservations 2 > in_flight 1`) has not advanced to `Claimed` in the window,
+and the oldest reservation exceeds it: `StaleReservation` fires even though
+the capacity test still reads `saturated`. What the lane cannot explain as
+sizing is the wedge itself — wedged admission, an unschedulable launch, a
+reservation parked in the empty phase — and the condition reports the
+observable fact, leaving the mechanism to diagnosis. The source is `ok` (its
+discovery is paused `lane-at-capacity`, not failing); the run is not `Failed`;
+the remedy is capacity or scheduling, not source repair. Recovery clears
+through the gates — the backlog drains as the reservation is claimed and the
+`Claimed` transition resumes — never through an age reset.
 
 ## 7. Privacy and cardinality budget
 
@@ -491,17 +545,17 @@ free-form text becomes a metric label or a structured field.
 ### 8.1 Clocks and timestamps
 
 - Authoritative timestamps are the cluster's: `metadata.creationTimestamp`,
-  `AdmittedAt`, `StartedAt`, `FinishedAt` (`api/v1alpha1/coderun_types.go:332-356`),
+  `AdmittedAt`, `StartedAt`, `FinishedAt` (`api/v1alpha1/coderun_types.go:383-400`),
   condition `lastTransitionTime`, and `Heartbeat.At`. Age and duration windows
   are computed from these against the API server's clock as observed by the
   operator, using the injectable `CoderRunReconciler.Now`
-  (`internal/controller/coderun_controller.go:124-126`) and `reap.clock()`
+  (`internal/controller/coderun_controller.go:133-135`) and `reap.clock()`
   (`internal/controller/reap.go:78-83`).
 - `*_timestamp_seconds` gauges are emitted from the operator clock and are used
   for **freshness only**, never for authoritative durations.
 - Negative durations from clock skew clamp to zero, matching existing helpers
-  (`nonNegativeSeconds`, `internal/controller/metrics.go:143-148`;
-  `durationString`, `internal/controller/coderun_controller.go:1400-1405`).
+  (`nonNegativeSeconds`, `internal/controller/metrics.go:145-150`;
+  `durationString`, `internal/controller/coderun_controller.go:1473-1478`).
 
 ### 8.2 Units
 
@@ -588,8 +642,6 @@ authorized here:
   cardinality.
 - Whether `courier_coderun_phase_duration_seconds` and the token counters ship
   in the first cut or after the discovery/lane layer.
-- Whether reservation staleness is defined by age alone or refined by
-  no-progress (no phase transition, no heartbeat).
 - Whether external verification disposition is a counter (as designed here) or
   derived from phase plus logs.
 - How "enabled/disabled" is declared to a view: a configuration source, or a
