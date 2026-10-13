@@ -377,6 +377,17 @@ to die.
    the API server and charges it with its pod-loss cause. At the ceiling
    there is no charge to defer: the wedge preserves the inert unrecoverable
    object exactly like the backstop and terminalizes in the same reconcile.
+   The wedge path's pod set — reap and startup grace — is the run's
+   **coordinator** pod, identified by the coordinator container, never
+   every pod bearing the run's label: a secure round's worker and broker
+   are torn down by `SecureControl`'s fence, not reaped here. The wedge
+   detection reconcile fences the surviving round exactly as the
+   disappearance backstop does — below the ceiling before returning to
+   `Claimed`, at the ceiling before the `NeedsHuman` hand-off, because a
+   terminal run is never relaunched and a fence deferred past the
+   detection reconcile would never run (#215). One wedge therefore charges
+   one crashloop credit and tears the round down in one place: the wedge
+   reaps the coordinator, `SecureControl` fences the rest. (#222)
 - The crashloop counter bounds a **consecutive** streak of wedges, not a lifetime
   total: a run that demonstrates liveness — a fresh heartbeat within the window
   while a recoverable coordinator is observable — resets the streak to zero, so
@@ -388,7 +399,10 @@ to die.
 - A just-relaunched pod gets a **startup grace** so it is not re-reaped on the
   previous incarnation's stale heartbeat before it can send its first one: a pod
   created within the window (or whose coordinator started within it) is never
-  reaped. Freshness is judged only on observable pod/run state — the operator
+  reaped — judged on the run's **coordinator** pod only, since a freshly
+  provisioned worker or broker of a secure round says nothing about the
+  coordinator's wedge (#222). Freshness is judged only on observable pod/run
+  state — the operator
   never writes the harness-owned heartbeat. A pod already terminating is neither
   reapable nor counted, and the wedge-path charge re-confirms every delete
   against the API server, so a delete racing a reconcile cannot double-count a
@@ -2497,3 +2511,23 @@ was superseded.
   This reverses the delete-before-recreate and open-green already-addressed
   policies recorded in the earlier #267 follow-up. Source-owned generation and
   cooldown fence recovery instead of a Courier poll-driven retry loop. (#267)
+
+- **2026-10-13 — #222: the wedge path reaps the coordinator, `SecureControl`
+  fences the round.** `checkLiveness`'s wedge path selected its reap set (and
+  its startup-grace set) by run ownership alone, while the coordinator
+  identity everywhere else — `coordinatorPodOf`, `observeMissingCoordinator`,
+  #106's ceiling evidence-preservation skip — is the coordinator *container*.
+  A secure-topology run that reached the wedge path therefore had its worker
+  and broker reaped by the legacy loop as well: teardown the secure topology
+  owns, with the broker's ingress `Service` left behind (an un-fenced broker
+  keeps the run's copied credentials and its Service keeps routing), and the
+  wedge's teardown was decided in two places at once. The wedge path now
+  scopes both loops to pods carrying the coordinator container, and fences
+  the surviving round through `SecureControl.Fence` on the wedge's detection
+  reconcile — below the ceiling before returning to `Claimed`, at the ceiling
+  (including the cached-view-disagrees hand-off) before the `NeedsHuman`
+  hand-off terminalizes — exactly the pattern #215 established for
+  confirmed control loss, because a terminal run is never relaunched and a
+  fence deferred past the detection reconcile never runs. Legacy single-pod
+  behavior is unchanged: the lone pod carries the coordinator container, so
+  the scoped sets match the old ones. (#222)

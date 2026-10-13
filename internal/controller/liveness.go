@@ -118,7 +118,10 @@ func (r *CoderRunReconciler) maxRestarts() int {
 // exactly as the disappearance backstop. Below the ceiling the run returns
 // to Claimed so the next reconcile relaunches and resumes it. The second
 // return value reports whether liveness took action, so the caller can stop
-// further pod observation.
+// further pod observation. The wedge path's pod set — reap and startup
+// grace — is the run's coordinator pod only: a secure round's worker and
+// broker are torn down by SecureControl's fence on the detection reconcile,
+// not reaped here (#222, following #215).
 func (r *CoderRunReconciler) checkLiveness(ctx context.Context, run *courierv1alpha1.CoderRun, cachedPods []corev1.Pod) (ctrl.Result, bool, error) {
 	l := log.FromContext(ctx)
 	var fresh courierv1alpha1.CoderRun
@@ -178,6 +181,15 @@ func (r *CoderRunReconciler) checkLiveness(ctx context.Context, run *courierv1al
 			// absence, so the hand-off carries the pod-loss cause a human
 			// needs, exactly as the disappearance backstop would.
 			if atCeiling {
+				// The hand-off terminalizes the run: a fence deferred past
+				// this reconcile would never run, so the secure round is
+				// fenced here exactly as the disappearance backstop does
+				// (#215).
+				if r.Secure != nil {
+					if err := r.Secure.Fence(ctx, run); err != nil {
+						return ctrl.Result{}, true, err
+					}
+				}
 				result, err := r.relaunchAfterInfraLoss(ctx, run, podLostReason, podLostEventReason, buildTerminalDiagnostic(r.clock(), nil, podLostReason, "", "", true, cached))
 				return result, true, err
 			}
@@ -216,10 +228,12 @@ func (r *CoderRunReconciler) checkLiveness(ctx context.Context, run *courierv1al
 	// coordinator may not be running at all, and may not even be in the
 	// informer cache, so freshness is judged on observable pod state, not on
 	// the container's running state alone. A pod already terminating is
-	// never fresh.
+	// never fresh. Only the run's coordinator grants the grace: a freshly
+	// created worker or broker of a secure round says nothing about the
+	// coordinator's wedge (#222).
 	for i := range livePods {
 		pod := &livePods[i]
-		if !podBelongsToRun(pod, run) || pod.DeletionTimestamp != nil {
+		if !podBelongsToRun(pod, run) || !hasCoordinatorContainer(pod) || pod.DeletionTimestamp != nil {
 			continue
 		}
 		if r.clock().Sub(pod.CreationTimestamp.Time) <= r.livenessWindow() {
@@ -237,12 +251,17 @@ func (r *CoderRunReconciler) checkLiveness(ctx context.Context, run *courierv1al
 	// The ceiling is judged once, before the loop: a pod skipped at the
 	// ceiling is preserved as evidence, not deleted, so the run must still
 	// terminalize in this reconcile.
+	// The reap set is the run's coordinator pod, never the whole run: a
+	// secure round's worker and broker are torn down by SecureControl's
+	// fence, not by this loop, so a coordinator wedge cannot reach past its
+	// supervisor and delete pods whose teardown the secure topology owns
+	// (#222, matching #215's fence-on-loss rule).
 	missing := true
 	deleted := false
 	preserved := false
 	for i := range livePods {
 		pod := &livePods[i]
-		if !podBelongsToRun(pod, run) {
+		if !podBelongsToRun(pod, run) || !hasCoordinatorContainer(pod) {
 			continue
 		}
 		missing = false
@@ -259,7 +278,7 @@ func (r *CoderRunReconciler) checkLiveness(ctx context.Context, run *courierv1al
 		// coordinator object counts: a worker or broker pod in a terminal
 		// phase records no coordinator termination, and the preserved
 		// evidence is the run's coordinator.
-		if atCeiling && hasCoordinatorContainer(pod) && coordinatorPodUnrecoverable(pod) {
+		if atCeiling && coordinatorPodUnrecoverable(pod) {
 			preserved = true
 			continue
 		}
@@ -312,13 +331,27 @@ func (r *CoderRunReconciler) checkLiveness(ctx context.Context, run *courierv1al
 		return ctrl.Result{RequeueAfter: observationRequeueDelay}, false, nil
 	}
 
-	// A confirmed wedge is the same infrastructure loss as a vanished pod,
-	// so it takes the shared relaunch path and its restart ceiling. A reaped
-	// wedge charged in place carries no reason: the pod-loss cause is
+	// A confirmed wedge is the same infrastructure loss as a vanished pod:
+	// the reap set is the run's coordinator pod only — the secure round's
+	// worker and broker are torn down by SecureControl's fence on the same
+	// reconcile, not reaped here — and it takes the shared relaunch path
+	// and its restart ceiling. A reaped wedge charged in place carries no
+	// reason: the pod-loss cause is
 	// published only by the disappearance backstop, which confirms the loss
 	// against the API server, so a reaped wedge keeps the generic message in
 	// both the event stream and the ceiling hand-off; a deferred charge
 	// arrives with the backstop's pod-loss cause.
+	//
+	// The wedge reap left the secure round's worker and broker standing: a
+	// relaunch's LaunchSecure would fence them, but the ceiling hand-off is
+	// terminal and never relaunches, so a fence deferred past this
+	// reconcile would never run. Fence on the detection reconcile exactly as
+	// the disappearance backstop does (#215).
+	if r.Secure != nil {
+		if err := r.Secure.Fence(ctx, run); err != nil {
+			return ctrl.Result{}, true, err
+		}
+	}
 	result, err := r.relaunchAfterInfraLoss(ctx, run, "", "", buildTerminalDiagnostic(r.clock(), nil, wedgedReapDiagnosticReason, "", "", false, coordinatorPodOf(livePods, run)))
 	return result, true, err
 }
