@@ -417,10 +417,15 @@ func (s *SecureControl) fenceAndRelaunch(ctx context.Context, run *courier.Coder
 		return ctrl.Result{}, true, err
 	}
 	if run.Status.Restarts >= crashloopCeiling(s.MaxRestarts) {
+		// The terminal hand-off disarms the control request itself.
 		result, err := s.transitionNeedsHuman(ctx, run, "secure topology failed repeatedly and reached the crashloop ceiling")
 		return result, true, err
 	}
 	before := run.DeepCopy()
+	// A soft-stop addressed to the torn-down incarnation is void; disarm it
+	// (observing an unacknowledged request) after the diff base so the
+	// relaunch patch persists the disarm alongside the restart charge (#238).
+	softStopBeforeRelaunch(run, s.now())
 	run.Status.Restarts++
 	run.Status.Phase = courier.PhaseClaimed
 	if err := s.Patcher.patchStatus(ctx, before, run); err != nil {

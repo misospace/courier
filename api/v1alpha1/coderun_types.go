@@ -13,10 +13,72 @@ const (
 	ModeFixPR Mode = "fix-pr"
 )
 
+// SoftStopAnnotation is the human ingress for an operator soft-stop of a
+// Running run (#238). Its non-empty, bounded value is an opaque request ID;
+// the controller alone translates it into the operator-owned
+// CoderRun.status.controlRequest record. Clearing or changing the annotation
+// clears or replaces the record.
+const SoftStopAnnotation = "courier.misospace.dev/soft-stop"
+
+// ControlRequestKind is the action one control request names. v1 closes the
+// CRD enum to soft-stop: the only settled action is a cooperative stop.
+// +kubebuilder:validation:Enum=soft-stop
+type ControlRequestKind string
+
+const (
+	// ControlRequestSoftStop asks the named control incarnation to stop
+	// dispatching new briefs, let in-flight work finish and integrate, and
+	// exit cooperatively with a normal outcome.
+	ControlRequestSoftStop ControlRequestKind = "soft-stop"
+)
+
+// ControlRequest is the operator-owned fenced control request stamped by the
+// controller from the soft-stop annotation (#238). It is addressed to one
+// control incarnation: targetPodUID is the live coordinator pod UID at stamp
+// time, and a request whose incarnation is gone is void, never re-targeted.
+type ControlRequest struct {
+	// ID is the opaque request ID: the annotation value, verbatim.
+	// +kubebuilder:validation:MinLength=1
+	// +kubebuilder:validation:MaxLength=128
+	ID string `json:"id"`
+	// Kind is the requested action.
+	Kind ControlRequestKind `json:"kind"`
+	// TargetPodUID fences the request to one control incarnation.
+	// +kubebuilder:validation:MinLength=1
+	// +kubebuilder:validation:MaxLength=128
+	TargetPodUID string `json:"targetPodUID"`
+	// RequestedAt is when the controller stamped this record.
+	RequestedAt metav1.Time `json:"requestedAt"`
+}
+
+// ControlRequestAck is the harness-owned durable acknowledgement written
+// through the broker's trusted status path after a matching control request
+// was served and before the stop latch was set (#238). A request is never
+// consumed without this record.
+type ControlRequestAck struct {
+	// ID is the acknowledged request ID: the serving record's ID, verbatim.
+	// +kubebuilder:validation:MinLength=1
+	// +kubebuilder:validation:MaxLength=128
+	ID string `json:"id"`
+	// At is when the harness wrote this acknowledgement.
+	At metav1.Time `json:"at"`
+}
+
 // ConditionLifecycleReported is the status condition type the operator writes
 // on a CoderRun to record the outcome of its terminal lifecycle report. It is
 // read back wherever another component must know whether the report landed.
 const ConditionLifecycleReported = "LifecycleReported"
+
+// ConditionSoftStopObserved is the status condition type the operator writes
+// on a CoderRun to surface a soft-stop control request the incarnation it
+// named never acknowledged (#238). It is set with reason Unacknowledged on
+// relaunch and clears on a fresh annotation or an acknowledgement.
+const ConditionSoftStopObserved = "SoftStopObserved"
+
+// ConditionReasonUnacknowledged is the reason carried by a
+// ConditionSoftStopObserved condition for a request the named incarnation
+// never acknowledged.
+const ConditionReasonUnacknowledged = "Unacknowledged"
 
 // Phase is the lifecycle phase of a CoderRun.
 // +kubebuilder:validation:Enum=Pending;Claimed;Running;Verifying;AwaitingReview;HandedOff;NeedsHuman;Done;Failed;BlockedExternal
@@ -461,6 +523,22 @@ type CoderRunStatus struct {
 	// +optional
 	// +kubebuilder:validation:MaxProperties=64
 	ActiveOperations map[string]ActiveOperation `json:"activeOperations,omitempty"`
+
+	// ControlRequest is the operator-owned fenced control request (#238).
+	// The controller translates the soft-stop annotation into this record
+	// and alone writes it; the broker's trusted status listener accepts only
+	// the harness-owned schema, so no other writer can forge a request. It
+	// is replaceable, not set-once: a changed annotation replaces the record
+	// and a cleared annotation clears it.
+	// +optional
+	ControlRequest *ControlRequest `json:"controlRequest,omitempty"`
+
+	// ControlRequestAck is the harness-owned durable acknowledgement of the
+	// control request the live incarnation served (#238). The harness writes
+	// it through the broker's trusted status path, which fences it to a
+	// matching live request.
+	// +optional
+	ControlRequestAck *ControlRequestAck `json:"controlRequestAck,omitempty"`
 
 	// Restarts counts infra relaunches (the crashloop backstop), not work
 	// retries.

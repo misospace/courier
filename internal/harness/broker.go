@@ -11,6 +11,7 @@ import (
 	"strings"
 	"time"
 
+	courier "github.com/misospace/courier/api/v1alpha1"
 	couriergit "github.com/misospace/courier/internal/git"
 )
 
@@ -19,10 +20,11 @@ import (
 // the persisted policy, and control supplies OIDs it derived itself. The
 // status path is served by the broker's separate trusted listener.
 const (
-	brokerPathSnapshot = "/v1/git/snapshot"
-	brokerPathImport   = "/v1/bundles/import"
-	brokerPathPublish  = "/v1/publication"
-	brokerPathStatus   = "/trusted/v1/status"
+	brokerPathSnapshot       = "/v1/git/snapshot"
+	brokerPathImport         = "/v1/bundles/import"
+	brokerPathPublish        = "/v1/publication"
+	brokerPathStatus         = "/trusted/v1/status"
+	brokerPathControlRequest = "/trusted/v1/control-request"
 )
 
 // Broker API header names.
@@ -197,6 +199,30 @@ func (b *BrokerClient) PostStatus(ctx context.Context, patch StatusPatch) error 
 	}
 	resp.Body.Close()
 	return nil
+}
+
+// ControlRequest reads the operator's control request as the broker serves
+// it to this exact control incarnation. A missing record for this incarnation
+// — including one addressed to a dead incarnation (broker 404) — is an
+// ordinary absence, not a failure.
+func (b *BrokerClient) ControlRequest(ctx context.Context) (*courier.ControlRequest, error) {
+	resp, err := b.do(ctx, http.MethodGet, brokerPathControlRequest, nil, nil)
+	if err != nil {
+		var callErr *BrokerCallError
+		if errors.As(err, &callErr) && callErr.StatusCode == http.StatusNotFound {
+			return nil, nil
+		}
+		return nil, err
+	}
+	defer resp.Body.Close()
+	var request courier.ControlRequest
+	if err := json.NewDecoder(io.LimitReader(resp.Body, 1<<16)).Decode(&request); err != nil {
+		return nil, &BrokerCallError{Category: "control request response is malformed", Retryable: true}
+	}
+	if request.ID == "" {
+		return nil, &BrokerCallError{Category: "control request response is malformed"}
+	}
+	return &request, nil
 }
 
 // Publication is the broker's confirmed publication result.

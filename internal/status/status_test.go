@@ -46,15 +46,18 @@ func TestStatusWritersOwnDisjointFields(t *testing.T) {
 	fingerprint := "observed-check-set"
 	failedFingerprint := "observed-red-check-set"
 	restarts := 2
-	if err := operator.Patch(context.Background(), name, OperatorPatch{
+	operatorFields := OperatorPatch{
 		Phase:                  phase,
 		Branch:                 &branch,
 		PR:                     "#42",
 		CheckFingerprint:       &fingerprint,
 		FailedCheckFingerprint: &failedFingerprint,
 		Restarts:               &restarts,
-		Conditions:             []metav1.Condition{{Type: "Ready", Status: metav1.ConditionTrue}},
-	}); err != nil {
+	}
+	if err := operatorFields.SetConditions([]metav1.Condition{{Type: "Ready", Status: metav1.ConditionTrue}}); err != nil {
+		t.Fatalf("encode conditions: %v", err)
+	}
+	if err := operator.Patch(context.Background(), name, operatorFields); err != nil {
 		t.Fatalf("operator patch: %v", err)
 	}
 	checkpoint := &courierv1alpha1.Checkpoint{Plan: "finish the work"}
