@@ -449,3 +449,27 @@ func TestTerminalAgeCollectorReportsOldestPerPhase(t *testing.T) {
 		t.Fatalf("oldest NeedsHuman age = %v, want %v", got, (2 * time.Hour).Seconds())
 	}
 }
+
+// TestTerminalAgeCollectorListFailure checks the scrape-error path: a failed
+// List must increment the dedicated counter instead of silently dropping the
+// scrape or panicking.
+func TestTerminalAgeCollectorListFailure(t *testing.T) {
+	base := phaseClient(t)
+	withWatch, ok := base.(client.WithWatch)
+	if !ok {
+		t.Fatal("fake client does not implement client.WithWatch")
+	}
+	failing := interceptor.NewClient(withWatch, interceptor.Funcs{
+		List: func(context.Context, client.WithWatch, client.ObjectList, ...client.ListOption) error {
+			return errors.New("list failed")
+		},
+	})
+
+	registry := prometheus.NewRegistry()
+	registry.MustRegister(NewTerminalAgeCollector(failing))
+
+	m := gatherMetric(t, registry, "courier_terminal_age_scrape_errors_total", map[string]string{})
+	if m.GetCounter() == nil || m.GetCounter().GetValue() != 1 {
+		t.Fatalf("courier_terminal_age_scrape_errors_total = %v, want 1", m.GetCounter())
+	}
+}

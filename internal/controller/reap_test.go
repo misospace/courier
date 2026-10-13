@@ -43,10 +43,14 @@ func withReapMarker(run *courierv1alpha1.CoderRun, marker string, at time.Time) 
 // positively settled (Published), the gate the Failed/NeedsHuman reaper
 // requires before it will delete.
 func withLifecycleSettled(run *courierv1alpha1.CoderRun) *courierv1alpha1.CoderRun {
+	return withLifecycleReported(run, metav1.ConditionTrue, "Published")
+}
+
+func withLifecycleReported(run *courierv1alpha1.CoderRun, status metav1.ConditionStatus, reason string) *courierv1alpha1.CoderRun {
 	run.Status.Conditions = append(run.Status.Conditions, metav1.Condition{
 		Type:               lifecycleReportedCondition,
-		Status:             metav1.ConditionTrue,
-		Reason:             "Published",
+		Status:             status,
+		Reason:             reason,
 		LastTransitionTime: metav1.NewTime(reapClock),
 	})
 	return run
@@ -526,5 +530,122 @@ func TestReapFutureMarkerWaitsBoundedWindow(t *testing.T) {
 	}
 	if err := c.Get(context.Background(), admissionKey("skewed"), &courierv1alpha1.CoderRun{}); err != nil {
 		t.Fatalf("get run: %v; a future marker must never delete early", err)
+	}
+}
+
+func TestReapFailedSupersededReportReaps(t *testing.T) {
+	src := &admissionSource{}
+	run := admissionRun("superseded", "local", courierv1alpha1.PhaseFailed)
+	run.CreationTimestamp = metav1.NewTime(reapClock.Add(-72 * time.Hour))
+	run.Status.FinishedAt = &metav1.Time{Time: reapClock.Add(-11 * time.Minute)}
+	withLifecycleReported(run, metav1.ConditionTrue, "Superseded")
+	withReapMarker(run, failedAtAnnotation, reapClock.Add(-11*time.Minute))
+	c := phaseClient(t, run)
+	reconciler := terminalReapReconciler(c, src, reapClock, -1)
+
+	if _, err := reconciler.Reconcile(context.Background(), admissionRequest("superseded")); err != nil {
+		t.Fatalf("Reconcile() error = %v", err)
+	}
+	if err := c.Get(context.Background(), admissionKey("superseded"), &courierv1alpha1.CoderRun{}); !apierrors.IsNotFound(err) {
+		t.Fatalf("get run = %v, want NotFound; a superseded report satisfies the settled gate", err)
+	}
+}
+
+func TestReapFailedUnknownReportParks(t *testing.T) {
+	src := &admissionSource{}
+	run := admissionRun("unknown", "local", courierv1alpha1.PhaseFailed)
+	run.CreationTimestamp = metav1.NewTime(reapClock.Add(-72 * time.Hour))
+	run.Status.FinishedAt = &metav1.Time{Time: reapClock.Add(-48 * time.Hour)}
+	withLifecycleReported(run, metav1.ConditionUnknown, "Retryable")
+	c := phaseClient(t, run)
+	reconciler := terminalReapReconciler(c, src, reapClock, -1)
+
+	result, err := reconciler.Reconcile(context.Background(), admissionRequest("unknown"))
+	if err != nil {
+		t.Fatalf("Reconcile() error = %v", err)
+	}
+	if result.RequeueAfter != 0 {
+		t.Fatalf("RequeueAfter = %v, want 0; an Unknown report proves nothing and parks", result.RequeueAfter)
+	}
+	var stored courierv1alpha1.CoderRun
+	if err := c.Get(context.Background(), admissionKey("unknown"), &stored); err != nil {
+		t.Fatalf("get run: %v; an Unknown report must not be reaped", err)
+	}
+	if _, ok := stored.Annotations[failedAtAnnotation]; ok {
+		t.Fatal("failed-at marker written despite an Unknown report")
+	}
+}
+
+func TestReapAuditFloorIsPerRepo(t *testing.T) {
+	src := &admissionSource{}
+	candidate := withReapMarker(
+		terminalReapRun("candidate", courierv1alpha1.PhaseFailed, reapClock.Add(-30*time.Hour)),
+		failedAtAnnotation, reapClock.Add(-30*time.Hour))
+	candidate.Spec.Repo = "acme/alpha"
+	// A newer terminal run in another repository must not cover this run.
+	other := withReapMarker(
+		terminalReapRun("other", courierv1alpha1.PhaseFailed, reapClock.Add(-10*time.Hour)),
+		failedAtAnnotation, reapClock.Add(-10*time.Hour))
+	other.Spec.Repo = "acme/beta"
+
+	c := phaseClient(t, candidate, other)
+	reconciler := terminalReapReconciler(c, src, reapClock, 1)
+
+	result, err := reconciler.Reconcile(context.Background(), admissionRequest("candidate"))
+	if err != nil {
+		t.Fatalf("Reconcile() error = %v", err)
+	}
+	if result.RequeueAfter <= 0 {
+		t.Fatalf("RequeueAfter = %v, want a bounded recheck; the floor is per repository", result.RequeueAfter)
+	}
+	if err := c.Get(context.Background(), admissionKey("candidate"), &courierv1alpha1.CoderRun{}); err != nil {
+		t.Fatalf("get candidate: %v; another repo's newer run must not push it out of the floor", err)
+	}
+}
+
+func TestReapAuditFloorTieBreaksDeterministically(t *testing.T) {
+	src := &admissionSource{}
+	mk := func(name string) *courierv1alpha1.CoderRun {
+		run := terminalReapRun(name, courierv1alpha1.PhaseFailed, reapClock.Add(-30*time.Hour))
+		return withReapMarker(run, failedAtAnnotation, reapClock.Add(-30*time.Hour))
+	}
+	c := phaseClient(t, mk("aaa"), mk("bbb"), mk("ccc"))
+	reconciler := terminalReapReconciler(c, src, reapClock, 1)
+
+	// Same terminal second for all three; the deterministic tiebreak keeps the
+	// single greatest name and reaps the rest.
+	for _, name := range []string{"aaa", "bbb"} {
+		if _, err := reconciler.Reconcile(context.Background(), admissionRequest(name)); err != nil {
+			t.Fatalf("reconcile %s: %v", name, err)
+		}
+		if err := c.Get(context.Background(), admissionKey(name), &courierv1alpha1.CoderRun{}); !apierrors.IsNotFound(err) {
+			t.Fatalf("get %s = %v, want NotFound; a tied run outside the floor must be reaped", name, err)
+		}
+	}
+	if _, err := reconciler.Reconcile(context.Background(), admissionRequest("ccc")); err != nil {
+		t.Fatalf("reconcile ccc: %v", err)
+	}
+	if err := c.Get(context.Background(), admissionKey("ccc"), &courierv1alpha1.CoderRun{}); err != nil {
+		t.Fatalf("get ccc: %v; the tiebreak winner must be retained", err)
+	}
+}
+
+func TestReapFailedRetentionSurvivesRestart(t *testing.T) {
+	src := &admissionSource{}
+	c := phaseClient(t, terminalReapRun("restart", courierv1alpha1.PhaseFailed, reapClock.Add(-time.Minute)))
+
+	first := terminalReapReconciler(c, src, reapClock, -1)
+	if _, err := first.Reconcile(context.Background(), admissionRequest("restart")); err != nil {
+		t.Fatalf("first Reconcile() error = %v", err)
+	}
+
+	// A brand-new reconciler instance shares nothing with the first except the
+	// API server: the persisted marker alone must carry the retention state.
+	second := terminalReapReconciler(c, src, reapClock.Add(11*time.Minute), -1)
+	if _, err := second.Reconcile(context.Background(), admissionRequest("restart")); err != nil {
+		t.Fatalf("second Reconcile() error = %v", err)
+	}
+	if err := c.Get(context.Background(), admissionKey("restart"), &courierv1alpha1.CoderRun{}); !apierrors.IsNotFound(err) {
+		t.Fatalf("get restart run = %v, want NotFound; retention must outlive the process", err)
 	}
 }

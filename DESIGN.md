@@ -1285,10 +1285,13 @@ there is no delete verb because active runs reference lanes. (#73)
   are reaped after their (seven-day default) window and only once the lifecycle
   report has reached a positive, settled state (never on a missing, `Unknown`, or
   still-`False` report). The reaper always retains the most recent terminal runs
-  per repository (default five) and emits `courier_coderuns_reaped_total` and
-  `courier_coderuns_oldest_terminal_age_seconds`. AwaitingReview is kept until
-  the world moves it; HandedOff is still kept (not reaped) and deleted on
-  request; see [Terminal retention and closed-unmerged PRs](#terminal-retention-and-closed-unmerged-prs-251).
+  per repository (default five), except Done runs, whose source work is already
+  resolved so the five-minute window is the whole retention. It emits
+  `courier_coderuns_reaped_total` and `courier_coderuns_oldest_terminal_age_seconds`.
+  AwaitingReview is kept until the world moves it; HandedOff and BlockedExternal
+  are still kept (not reaped) — HandedOff is deleted on request, and
+  BlockedExternal stays recoverable so its source can re-issue it; see
+  [Terminal retention and closed-unmerged PRs](#terminal-retention-and-closed-unmerged-prs-251).
 
 **Terminalization writes the run's own phase before it reports to the source.**
 A rejected or failed source report never holds a run in `Running`: the phase is
@@ -2661,8 +2664,11 @@ was superseded.
   and a scrape-time `TerminalAgeCollector` exposes
   `courier_coderuns_oldest_terminal_age_seconds{phase}`, so an aging run past
   its window is visible without listing objects. The four windows/floor are
-  wired as manager flags and a chart `retention:` block. `AwaitingReview` and
-  `HandedOff` stay unreaped (a later merge moves the former to `Done`); the
-  stale "terminal runs are never reaped" comments were retired, scoped to those
-  two phases. Closed-unmerged terminalization remains #277. This absorbs the
-  #276 brief; retry and escalation stay source-owned. (#287, #251, #276, #250)
+  wired as manager flags and a chart `retention:` block; the floor is scoped to
+  the run namespace and repository and orders runs by terminal time with a name
+  tiebreak, so exactly the floor's count is retained. `AwaitingReview`,
+  `HandedOff`, and `BlockedExternal` stay unreaped (a later merge moves the
+  former to `Done`); the stale "terminal runs are never reaped" comments were
+  retired, scoped to `AwaitingReview`/`HandedOff`. Closed-unmerged
+  terminalization remains #277. This absorbs the #276 brief; retry and
+  escalation stay source-owned. (#287, #251, #276, #250)

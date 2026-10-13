@@ -127,7 +127,6 @@ func (r *CoderRunReconciler) withinAuditFloor(ctx context.Context, run *courierv
 	if err := r.List(ctx, &runs, client.InNamespace(run.Namespace)); err != nil {
 		return false, err
 	}
-	candidate := terminalTime(run)
 	newer := 0
 	for i := range runs.Items {
 		other := &runs.Items[i]
@@ -137,11 +136,23 @@ func (r *CoderRunReconciler) withinAuditFloor(ctx context.Context, run *courierv
 		if !terminalPhase(other.Status.Phase) {
 			continue
 		}
-		if terminalTime(other).After(candidate) {
+		if terminalNewer(other, run) {
 			newer++
 		}
 	}
 	return newer < keep, nil
+}
+
+// terminalNewer orders two terminal runs for the audit floor: by terminal time,
+// and — because timestamps serialize at second precision and batch-created runs
+// can tie — by name as a deterministic tiebreak. The total order means exactly
+// the floor's count of runs is retained, never an ambiguous tie group.
+func terminalNewer(a, b *courierv1alpha1.CoderRun) bool {
+	at, bt := terminalTime(a), terminalTime(b)
+	if !at.Equal(bt) {
+		return at.After(bt)
+	}
+	return a.Name > b.Name
 }
 
 // terminalTime is the instant a terminal run became terminal for audit-floor
