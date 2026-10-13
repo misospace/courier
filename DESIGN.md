@@ -1361,6 +1361,54 @@ terminal phase with the report retried on a later reconcile. (#178)
 
 **Implementation:** Bounded retention for `Failed`/`NeedsHuman` is implemented (#287, absorbing the #276 brief). `reapTerminal` (`internal/controller/reap.go`) generalizes the reaper with the per-phase `courier.misospace.dev/needs-human-at` and `courier.misospace.dev/failed-at` annotations (set-once on the first reconcile after the lifecycle report settles, never derived from `FinishedAt`), the four flags/chart values above, and the positive `LifecycleReported` settled-state gate (legacy missing/`False`/`Unknown` runs stay unreaped). It adds a per-repository audit floor — the most recent `terminalAuditKeep` `Failed`/`NeedsHuman` runs are retained past their window, and the floor counts only those phases — and the retention metrics (`courier_coderuns_reap_requests_total` for accepted deletes, `courier_coderuns_oldest_terminal_age_seconds` for what is still retained). The stale "terminal runs are never reaped" comments and assertions were retired, scoped to `AwaitingReview` and `HandedOff`. Closed-unmerged terminalization remains child #277: the observer must expose an explicit closed-unmerged signal on `PRObservation` (it currently collapses closed and never-opened into "no open PR") and the `AwaitingReview` observation branch must stamp the `needs-human-at` annotation at the close-unmerged transition; until then a closed-unmerged PR keeps its run, exactly as before. The #277 done-condition that still binds: a late `AwaitingReview` age (days/weeks/months) must never cause an immediate reap of a closed-unmerged run, and the per-phase annotation must survive controller restarts without re-stamping (already true for the direct path). `HandedOff` retention and an independent evidence TTL remain out of scope.
 
+## Cross-worker capacity recovery (#327)
+
+Confirmed execution-resource exhaustion is distinct from a task blocker and an
+unknown failure. The source-neutral core may expose an optional recovery
+capability, but it must not infer exhaustion from HTTP status alone, release
+ownership through ordinary `Release`, or clear a human hold. Source adapters
+own fenced settlement tokens and report unsupported capability explicitly.
+
+A safe handoff requires durable source fencing, not simply lease expiry: the
+old attempt must be unable to settle after a replacement claim, while the new
+attempt reuses the existing branch/PR and preserves pushed partial work. Dirty
+unpushed work must be durably handed off or retained by the old owner; absent
+that mechanism, recovery fails closed and does not release ownership. Cooldown
+belongs to the exhausted capacity profile, so unrelated profiles remain
+eligible. The recovery contract requires terminal history to remain diagnostic
+without suppressing a fresh eligible attempt; today's same-identity terminal
+run deduplication still applies until #327 is implemented.
+
+The current Dispatch contract does not satisfy these requirements: issue
+unclaim is not bound to a claim generation/token, and PR-fix lacks a capacity
+handoff mark. Courier does not simulate fencing with the existing lifecycle
+or release calls. [Dispatch dependency #1256](https://github.com/misospace/dispatch/issues/1256)
+tracks the required API and tests; until it lands, automatic cross-worker
+release is unsupported for Dispatch. Its existing generation-fenced
+`WAITING_EXTERNAL` mark preserves task-repair budget, but a queue-wide timed
+retry is not a capacity-scoped cross-worker handoff. The proposed optional
+recovery capability, capacity cooldown, and runtime unsupported-capability
+reporting are not implemented by this design change. Other source adapters
+continue their existing behavior.
+
+Operator recovery remains manual and item-specific:
+
+- Inspect live source ownership, the run and its pods, the remote branch/PR,
+  and the exhaustion evidence. Unknown failures and explicit human holds do
+  not authorize release; quota reset alone does not authorize requeue.
+- Stop and confirm termination of every old writer before changing ownership.
+  Preserve dirty/unpushed work using the existing evidence retrieval procedure
+  before removing its workspace; evidence capture is bounded and best-effort,
+  not an automatic transfer or proof that every edit survived.
+- Use the source's explicit operator recovery procedure only after confirming
+  ownership again. Current Dispatch issue unclaim is not attempt-fenced, so
+  even repeated reads are not a substitute for atomic fencing. Do not automate
+  release/reclaim races or bulk requeues with that endpoint.
+- Confirm the replacement uses the existing branch/PR and fresh source attempt
+  identity. Retain the old run and diagnostics; do not delete history to bypass
+  rediscovery. Automatic discovery/admission and retained-history changes remain
+  implementation work under #327 after the source contract is available.
+
 ## Sources
 
 Pluggable adapters over a generic interface. An adapter both *creates* runs and
@@ -2820,6 +2868,17 @@ was superseded.
   retired, scoped to `AwaitingReview`/`HandedOff`. Closed-unmerged
   terminalization remains #277. This absorbs the #276 brief; retry and
   escalation stay source-owned. (#287, #251, #276, #250)
+
+- **2026-10-13 — #327: cross-worker capacity recovery requires fenced source
+  settlement; ordinary release is unsafe.** A generic core signal may identify
+  confirmed capacity exhaustion, but adapters must settle the exact owner and
+  attempt generation before another worker can write. Dispatch's existing
+  issue unclaim and PR-fix marks do not provide the necessary shared fenced
+  capacity handoff, so Courier fails closed rather than claiming this guarantee
+  or treating lease expiry as label cleanup. Dispatch dependency #1256 records
+  the API contract. Preserve pushed branch/PR work and human holds; unpushed
+  work needs durable transfer before ownership changes. Cooldown is capacity-
+  scoped, while terminal history remains diagnostic rather than a dedupe lock.
 
 - **2026-10-13 — #287 review: the audit floor counts only the phases it
   governs, and the reap counter counts accepted deletes rather than removals.**
