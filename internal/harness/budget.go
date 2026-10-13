@@ -184,13 +184,32 @@ type CompactionInput struct {
 // protected indexes that survive verbatim. After includes the digest cost, so
 // whenever Compacted is true, After < Before (the digest must reclaim tokens)
 // and After + budget.OutputReservation <= EffectiveLimit.
+//
+// DigestedTokens is the gross sum of message tokens replaced by the digest
+// (Before - After + DigestTokens). NetSaved is the prompt tokens actually
+// freed by the compaction (Before - After = DigestedTokens - DigestTokens).
+// Operators read NetSaved from `session.compacted`; DigestedTokens is the
+// secondary counter that exposes the gross work the digest replaced so
+// before/after/net agree and the gross size of the digests stays auditable.
+//
+// BudgetAfter is the budget calibrated for the post-compaction state. Its
+// CompactPoint is raised above the post-compaction After so the next step
+// boundary's ShouldCompact does not re-trigger immediately on a transcript
+// that already satisfies the post-condition; the executor (or any caller of
+// repeated compactions) must use this budget, not the original, for the next
+// decision. Without this hysteresis, a worker that compacts at the compact
+// point can land just above it and trip ShouldCompact again, where
+// re-digesting the digest fails to reclaim and surfaces ErrCompactionCannotFit
+// even though the post-condition held.
 type CompactionPlan struct {
-	Compacted bool
-	Digested  []int
-	Retained  []int
-	Before    int
-	After     int
-	Reclaimed int
+	Compacted      bool
+	Digested       []int
+	Retained       []int
+	Before         int
+	After          int
+	DigestedTokens int
+	NetSaved       int
+	BudgetAfter    ContextBudget
 }
 
 // PlanCompaction selects the oldest non-protected turns to replace with one
@@ -201,6 +220,11 @@ type CompactionPlan struct {
 // non-protected turn cannot fit or reclaim, it fails closed with
 // ErrCompactionCannotFit. A transcript already within budget is returned
 // unchanged (Compacted false).
+//
+// On success the returned BudgetAfter raises CompactPoint to at least
+// plan.After+1, so the next step boundary's ShouldCompact does not re-fire on
+// the just-compacted state; the caller must use BudgetAfter for any
+// subsequent compaction decision in the same session.
 func PlanCompaction(in CompactionInput) (CompactionPlan, error) {
 	before := 0
 	for _, tokens := range in.MessageTokens {
@@ -212,42 +236,53 @@ func PlanCompaction(in CompactionInput) (CompactionPlan, error) {
 	if in.DigestTokens < 0 {
 		return CompactionPlan{}, errors.New("harness: compaction input has a negative digest token count")
 	}
-	plan := CompactionPlan{Before: before, After: before, Retained: protectedIndexes(in.Protected)}
+	plan := CompactionPlan{Before: before, After: before, Retained: protectedIndexes(in.Protected), BudgetAfter: in.Budget}
 	if !in.Budget.ShouldCompact(before) {
 		return plan, nil
 	}
-	reclaimed := 0
+	digestedTokens := 0
 	digested := make([]int, 0, len(in.MessageTokens))
 	for i, tokens := range in.MessageTokens {
 		if protectedAt(in.Protected, i) {
 			continue
 		}
 		digested = append(digested, i)
-		reclaimed += tokens
-		after := before - reclaimed + in.DigestTokens
+		digestedTokens += tokens
+		after := before - digestedTokens + in.DigestTokens
 		if after < before && in.Budget.FitsAfterCompaction(after) {
 			plan.Compacted = true
 			plan.Digested = digested
 			plan.After = after
-			plan.Reclaimed = reclaimed
+			plan.DigestedTokens = digestedTokens
+			plan.NetSaved = before - after
+			plan.BudgetAfter = in.Budget
+			plan.BudgetAfter.CompactPoint = in.Budget.CompactPoint
+			if plan.After+1 > plan.BudgetAfter.CompactPoint {
+				plan.BudgetAfter.CompactPoint = plan.After + 1
+			}
 			return plan, nil
 		}
 	}
 	return CompactionPlan{}, fmt.Errorf("%w: before %d, digest %d, protected %d, effective %d, reservation %d",
-		ErrCompactionCannotFit, before, in.DigestTokens, before-reclaimed, in.Budget.EffectiveLimit, in.Budget.OutputReservation)
+		ErrCompactionCannotFit, before, in.DigestTokens, before-digestedTokens, in.Budget.EffectiveLimit, in.Budget.OutputReservation)
 }
 
 // CompactEvent is the payload of the session.compacted run event (#243),
 // whose canonical name is log.EventSessionCompacted. It reports token counts
-// only: before and after the compaction and the reclaimed total, plus the role
-// and its bound model. It is observability, never status, and never lets a
-// model assert liveness or completion.
+// only: before and after the compaction, the net tokens saved
+// (Before - After = DigestedTokens - DigestTokens), and the gross count of
+// tokens the digest replaced, plus the role and its bound model. The net
+// count is the user-facing "reclaimed" (what the compaction actually freed);
+// DigestedTokens is exposed so the gross digest size stays auditable. It is
+// observability, never status, and never lets a model assert liveness or
+// completion.
 type CompactEvent struct {
-	Role      string
-	Model     string
-	Before    int
-	After     int
-	Reclaimed int
+	Role           string
+	Model          string
+	Before         int
+	After          int
+	NetSaved       int
+	DigestedTokens int
 }
 
 func protectedAt(protected []bool, i int) bool {

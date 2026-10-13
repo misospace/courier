@@ -169,14 +169,15 @@ func TestPlanCompactionTruthTable(t *testing.T) {
 	}
 
 	tests := []struct {
-		name          string
-		in            CompactionInput
-		wantCompacted bool
-		wantDigested  []int
-		wantRetained  []int
-		wantAfter     int
-		wantReclaimed int
-		wantErr       error
+		name             string
+		in               CompactionInput
+		wantCompacted    bool
+		wantDigested     []int
+		wantRetained     []int
+		wantAfter        int
+		wantDigestedToks int
+		wantNetSaved     int
+		wantErr          error
 	}{
 		{
 			name: "within budget is unchanged",
@@ -192,7 +193,7 @@ func TestPlanCompactionTruthTable(t *testing.T) {
 				MessageTokens: []int{500, 300, 200}, DigestTokens: 50,
 				Budget: budget(t, 1000, 75, 100),
 			},
-			wantCompacted: true, wantDigested: []int{0}, wantAfter: 550, wantReclaimed: 500,
+			wantCompacted: true, wantDigested: []int{0}, wantAfter: 550, wantDigestedToks: 500, wantNetSaved: 450,
 		},
 		{
 			name: "protected turns are never digested",
@@ -200,7 +201,7 @@ func TestPlanCompactionTruthTable(t *testing.T) {
 				MessageTokens: []int{600, 100, 300}, Protected: []bool{true, false, false}, DigestTokens: 50,
 				Budget: budget(t, 1000, 75, 100),
 			},
-			wantCompacted: true, wantDigested: []int{1, 2}, wantRetained: []int{0}, wantAfter: 650, wantReclaimed: 400,
+			wantCompacted: true, wantDigested: []int{1, 2}, wantRetained: []int{0}, wantAfter: 650, wantDigestedToks: 400, wantNetSaved: 350,
 		},
 		{
 			name: "protected state that cannot fit fails closed",
@@ -266,11 +267,28 @@ func TestPlanCompactionTruthTable(t *testing.T) {
 			if got.After != tt.wantAfter {
 				t.Fatalf("After = %d, want %d", got.After, tt.wantAfter)
 			}
-			if got.Reclaimed != tt.wantReclaimed {
-				t.Fatalf("Reclaimed = %d, want %d", got.Reclaimed, tt.wantReclaimed)
+			if got.DigestedTokens != tt.wantDigestedToks {
+				t.Fatalf("DigestedTokens = %d, want %d", got.DigestedTokens, tt.wantDigestedToks)
 			}
-			if got.Compacted && !tt.in.Budget.FitsAfterCompaction(got.After) {
-				t.Fatalf("post-condition violated: After %d + reservation %d > effective %d", got.After, tt.in.Budget.OutputReservation, tt.in.Budget.EffectiveLimit)
+			if got.NetSaved != tt.wantNetSaved {
+				t.Fatalf("NetSaved = %d, want %d", got.NetSaved, tt.wantNetSaved)
+			}
+			if got.Compacted {
+				if got.DigestedTokens-got.NetSaved != tt.in.DigestTokens {
+					t.Fatalf("DigestedTokens(%d) - NetSaved(%d) = %d, want digest cost %d", got.DigestedTokens, got.NetSaved, got.DigestedTokens-got.NetSaved, tt.in.DigestTokens)
+				}
+				if got.NetSaved <= 0 {
+					t.Fatalf("NetSaved = %d, want > 0 when Compacted", got.NetSaved)
+				}
+				if !tt.in.Budget.FitsAfterCompaction(got.After) {
+					t.Fatalf("post-condition violated: After %d + reservation %d > effective %d", got.After, tt.in.Budget.OutputReservation, tt.in.Budget.EffectiveLimit)
+				}
+				if got.BudgetAfter.CompactPoint <= got.After {
+					t.Fatalf("hysteresis violated: post-compaction compact point %d does not exceed After %d", got.BudgetAfter.CompactPoint, got.After)
+				}
+				if got.BudgetAfter.ShouldCompact(got.After) {
+					t.Fatalf("post-compaction ShouldCompact(After=%d) is true with compact point %d", got.After, got.BudgetAfter.CompactPoint)
+				}
 			}
 			for _, index := range got.Digested {
 				if protectedAt(tt.in.Protected, index) {
@@ -291,6 +309,76 @@ func TestFitsAfterCompactionBoundary(t *testing.T) {
 	}
 	if budget.FitsAfterCompaction(801) {
 		t.Fatalf("801 + 200 must not fit 1000")
+	}
+}
+
+// TestPlanCompactionTwoBoundaryHysteresis pins the post-compaction
+// hysteresis: a successful compaction must return a BudgetAfter whose
+// compact point sits above the post-compaction After, so the next step
+// boundary's ShouldCompact does not re-fire on the just-compacted state.
+// The reviewer's example (effective 1000, point 750, reserve 100, transcript
+// [100,750] with [false,true] protected, digest 90) used to accept 840
+// while leaving ShouldCompact(840) true on the same budget, which then
+// re-triggered into ErrCompactionCannotFit on the very next boundary. The
+// second compact call must therefore run against BudgetAfter, not the
+// original budget.
+func TestPlanCompactionTwoBoundaryHysteresis(t *testing.T) {
+	budget, err := ResolveContextBudget(ContextBudgetInput{
+		Role: "coder", DeclaredMaxInputTokens: 1000, CompactAtPercent: 75, OutputReservation: 100,
+	})
+	if err != nil {
+		t.Fatalf("resolve: %v", err)
+	}
+
+	first, err := PlanCompaction(CompactionInput{
+		MessageTokens: []int{100, 750},
+		Protected:     []bool{false, true},
+		DigestTokens:  90,
+		Budget:        budget,
+	})
+	if err != nil {
+		t.Fatalf("first boundary: %v", err)
+	}
+	if !first.Compacted {
+		t.Fatalf("first boundary did not compact")
+	}
+	if first.After != 840 {
+		t.Fatalf("first boundary After = %d, want 840", first.After)
+	}
+	if first.DigestedTokens != 100 || first.NetSaved != 10 {
+		t.Fatalf("first boundary tokens: DigestedTokens=%d NetSaved=%d, want 100/10", first.DigestedTokens, first.NetSaved)
+	}
+	if first.BudgetAfter.CompactPoint <= first.After {
+		t.Fatalf("first boundary did not raise compact point: %d <= %d", first.BudgetAfter.CompactPoint, first.After)
+	}
+
+	second, err := PlanCompaction(CompactionInput{
+		MessageTokens: []int{90, 750},
+		Protected:     []bool{false, true},
+		DigestTokens:  90,
+		Budget:        first.BudgetAfter,
+	})
+	if err != nil {
+		t.Fatalf("second boundary: %v", err)
+	}
+	if second.Compacted {
+		t.Fatalf("second boundary should not re-fire on the post-compaction state (got Compacted=%+v)", second)
+	}
+	if second.BudgetAfter.CompactPoint != first.BudgetAfter.CompactPoint {
+		t.Fatalf("second boundary raised compact point: was %d, now %d", first.BudgetAfter.CompactPoint, second.BudgetAfter.CompactPoint)
+	}
+
+	withoutHysteresis, err := PlanCompaction(CompactionInput{
+		MessageTokens: []int{90, 750},
+		Protected:     []bool{false, true},
+		DigestTokens:  90,
+		Budget:        budget,
+	})
+	if err == nil {
+		t.Fatalf("original budget should have failed closed: got %+v", withoutHysteresis)
+	}
+	if !errors.Is(err, ErrCompactionCannotFit) {
+		t.Fatalf("original budget error = %v, want ErrCompactionCannotFit", err)
 	}
 }
 

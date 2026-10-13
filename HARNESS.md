@@ -1088,6 +1088,15 @@ reservation would exceed the effective limit. After compaction the invariant
 harness fails closed and surfaces the condition rather than truncating
 mid-task.
 
+A successful compaction also returns a calibrated `BudgetAfter` whose compact
+point is raised to at least `After+1` so the next step boundary does not
+re-fire on the just-compacted state. The compact point alone is not a
+sufficient exit condition for a session loop: a transcript that compacts at
+the point can still land above it, and re-digesting the digest would reclaim
+zero tokens and surface `ErrCompactionCannotFit` even though the
+post-condition held. The executor (and any caller of repeated compactions)
+must use `BudgetAfter`, not the original budget, for the next decision.
+
 **Digest, not prune; preserve settled state.** Compaction replaces the oldest
 non-protected turns with a single model-produced digest. It never discards the
 brief's pinned objective, the settled `Decision`s, the `OwnedFiles`, or the
@@ -1102,7 +1111,9 @@ Prune-only compaction is rejected because it silently drops task state.
 
 **Telemetry.** Every compaction emits the run event `session.compacted`
 (`log.EventSessionCompacted`) carrying the role, the bound model, and
-before/after/reclaimed token counts, so operators observe the behavior in run
+before/after token counts plus both the net savings (the user-facing
+"reclaimed" — `Before - After`) and the gross digest size (the sum of message
+tokens the digest replaced), so operators observe the behavior in run
 telemetry instead of inferring it from gateway failover alerts. It is a log
 event, never status, and never lets a model assert liveness or completion.
 
@@ -1571,9 +1582,18 @@ and the acceptance tests below are satisfied.
   brief/objective, settled `Decision`s, `OwnedFiles`, the most recent turn),
   the post-condition `After + outputReservation ≤ effective` holds whenever it
   compacts and the digest actually reclaims (`After < Before`), and it fails
-  closed (`ErrCompactionCannotFit`) rather than truncating protected state. Telemetry: the canonical `session.compacted`
-  event name lives in `internal/log/events.go` (`log.EventSessionCompacted`)
-  and the harness payload is `CompactEvent`. The table proves the pure policy
+  closed (`ErrCompactionCannotFit`) rather than truncating protected state.
+  Hysteresis: a successful compaction returns a calibrated `BudgetAfter` whose
+  compact point is raised above the post-compaction `After`, so the next step
+  boundary's `ShouldCompact` does not re-fire on the just-compacted state —
+  the post-condition alone is not a sufficient exit condition because
+  re-digesting the digest itself would reclaim zero tokens. Telemetry: the
+  canonical `session.compacted` event name lives in `internal/log/events.go`
+  (`log.EventSessionCompacted`), the harness payload is `CompactEvent`
+  carrying before/after/`NetSaved`/`DigestedTokens` counts (the net is the
+  user-facing "reclaimed"; the gross is the size of the span the digest
+  replaced), and the truth table proves both the digest accounting and the
+  two-boundary hysteresis. The table proves the pure policy
   and deliberately proves nothing about the executor wiring, which
   #295/#296/#297 own.
 
