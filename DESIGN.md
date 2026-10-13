@@ -377,6 +377,17 @@ to die.
    the API server and charges it with its pod-loss cause. At the ceiling
    there is no charge to defer: the wedge preserves the inert unrecoverable
    object exactly like the backstop and terminalizes in the same reconcile.
+   The wedge path's pod set — reap and startup grace — is the run's
+   **coordinator** pod, identified by the coordinator container, never
+   every pod bearing the run's label: a secure round's worker and broker
+   are torn down by `SecureControl`'s fence, not reaped here. The wedge
+   detection reconcile fences the surviving round exactly as the
+   disappearance backstop does — below the ceiling before returning to
+   `Claimed`, at the ceiling before the `NeedsHuman` hand-off, because a
+   terminal run is never relaunched and a fence deferred past the
+   detection reconcile would never run (#215). One wedge therefore charges
+   one crashloop credit and tears the round down in one place: the wedge
+   reaps the coordinator, `SecureControl` fences the rest. (#222)
 - The crashloop counter bounds a **consecutive** streak of wedges, not a lifetime
   total: a run that demonstrates liveness — a fresh heartbeat within the window
   while a recoverable coordinator is observable — resets the streak to zero, so
@@ -388,7 +399,10 @@ to die.
 - A just-relaunched pod gets a **startup grace** so it is not re-reaped on the
   previous incarnation's stale heartbeat before it can send its first one: a pod
   created within the window (or whose coordinator started within it) is never
-  reaped. Freshness is judged only on observable pod/run state — the operator
+  reaped — judged on the run's **coordinator** pod only, since a freshly
+  provisioned worker or broker of a secure round says nothing about the
+  coordinator's wedge (#222). Freshness is judged only on observable pod/run
+  state — the operator
   never writes the harness-owned heartbeat. A pod already terminating is neither
   reapable nor counted, and the wedge-path charge re-confirms every delete
   against the API server, so a delete racing a reconcile cannot double-count a
@@ -748,8 +762,9 @@ manifest, and rejects a non-empty sender UID that does not match the
 live run as a forged identity. The
 phase gate is
 an allowlist over **non-resolved versus resolved**: the intake accepts
-`Pending`, `Claimed`, `Running`, `Failed`, and `NeedsHuman`, and rejects
-`Verifying`, `AwaitingReview`, and `Done`. The admitted set is broad because
+`Pending`, `Claimed`, `Running`, `Failed`, `NeedsHuman`, and
+`BlockedExternal`, and rejects `Verifying`, `AwaitingReview`, and `Done`. The
+admitted set is broad because
 the operator moves runs around a dying pod: an ordinary liveness reap deletes
 the pod and writes `Claimed` in the same reconcile (and a failed relaunch can
 reach `Pending`) while the previous pod's SIGTERM grace capture is still in
@@ -798,12 +813,16 @@ in that window has its evidence already cleaned, and the re-read refuses
 to write a Secret for a phase the operator has world-proven as resolved.
 Access control is namespace RBAC: the operator gains
 `create/get/list/patch/delete` on `secrets` through a namespaced
-Role/RoleBinding rendered by the chart — deliberately not the generated
-operator ClusterRole, whose ClusterRoleBinding would widen the grant
-cluster-wide (`list` is required by the
-condition derivation and the AwaitingReview/Done cleanup; both use uncached
-API-reader lists) — see
-Security and boundaries. Encryption at rest is the deployment's cluster
+Role/RoleBinding rendered by the chart — deliberately not added to the
+generated operator ClusterRole, whose ClusterRoleBinding would widen the
+evidence verbs cluster-wide and attach them to installs that keep evidence
+disabled. The residual: the generated ClusterRole already
+carries `create/delete/get/list` on `secrets` cluster-wide for the secure-mode
+launcher, so against a shipped install the namespaced evidence grant's marginal
+verb is `patch`, which the intake uses to supersede a slot it already wrote
+(`list` is required by the condition derivation and the AwaitingReview/Done
+cleanup; both use uncached API-reader lists) — see Security and boundaries.
+Encryption at rest is the deployment's cluster
 configuration; Courier recommends enabling it. Status carries one condition,
 `EvidenceCaptured`, derived by the reconcile loop from the world through an
 **uncached** list (terminal runs rarely reconcile again, so a cached informer
@@ -1083,6 +1102,20 @@ yet exist. The design records the #286 exclusion-overflow outage as the
 motivating case while leaving the overflow *strategy* to #286 and retention to
 #287; #290 owns the source-health semantics and #292 the views this layer feeds.
 
+**Portable views and alerts (#292).**
+[docs/observability-dashboards-and-alerts.md](./docs/observability-dashboards-and-alerts.md)
+specifies the backend-neutral dashboard information architecture and alert
+catalogue that render the signals above: source health, lane capacity, run
+execution and outcomes, lifecycle reporting, retention, and optional connector
+panels. It separates the portable specification from optional executable
+dashboard/rule assets, names the evaluator an OTel-based integration must
+supply (OTLP is transport, not an alert engine), and records the
+instrumentation gaps — no discovery, reservation, lifecycle-report, or
+retention metrics — that a later instrumentation decision must close before
+those views exist. #290 owns the signal/health semantics and #291 the connector
+diagnostics this layer consumes; neither is required for a Courier dashboard to
+be useful standalone.
+
 ### Per-run telemetry (#172)
 
 The executor already relays the coordinator's stdout through a pass-through tap,
@@ -1264,9 +1297,16 @@ there is no delete verb because active runs reference lanes. (#73)
   publishes `in-review` after stable green observations. Fix-pr attempts receive
   `failed` if checks turn red; a resolve-issue run hands off to **HandedOff**
   instead.
-- **AwaitingReview** is terminal for this run. For a PR, human merges → operator
-  marks **Done** and resolves the source; feedback/conflict → the source spawns a
-  fresh `fix-pr` run without reusing the previous run. A `no_change_needed`
+- **AwaitingReview** is terminal for this run. For a PR, human merges → a slow,
+  bounded world observation (#250) reads the run's **exact recorded PR identity**
+  — base repository plus `status.pr` number through the forge read-pull-request
+  capability, head repository and ref from `status` — and only a merge the forge
+  confirms on that identity moves the run to **Done** and resolves the source;
+  an open PR, a PR closed without merge, a forge error, a missing PR, or a PR
+  whose head identity no longer matches keeps the run in **AwaitingReview** and
+  retries at the slow cadence (closed-unmerged terminalization is #251).
+  feedback/conflict → the source spawns a fresh `fix-pr` run without reusing the
+  previous run. A `no_change_needed`
   resolve-issue run also waits here with its evidence posted for human review;
   Courier does not resolve that source from the coordinator's declaration. A
   `no_change_needed` **fix-pr** run instead waits in **BlockedExternal** on an
@@ -1296,7 +1336,7 @@ terminal phase with the report retried on a later reconcile. (#178)
 
 ## Terminal retention and closed-unmerged PRs (#251)
 
-**The leak:** `reapDone` (`internal/controller/reap.go`) deletes only resolved `Done` runs after a default five minutes. `AwaitingReview`, `HandedOff`, `NeedsHuman`, and `Failed` are never reaped: `Reconcile` (`internal/controller/coderun_controller.go`) revisits a terminal phase only to retry a pending lifecycle report and otherwise returns without a timer, and the controller never re-observes a PR after a run settles `AwaitingReview`. The #179 dogfood deployment left 26 `AwaitingReview`, 6 `NeedsHuman`, 1 `Failed`, and 17 retained coordinator pods. `source.Runner.Poll` (`internal/source/runner.go`) lists every CoderRun on every poll to build its dedupe set, so the list grows without bound.
+**The leak:** `reapDone` (`internal/controller/reap.go`) deletes only resolved `Done` runs after a default five minutes. `HandedOff`, `NeedsHuman`, and `Failed` are never reaped: `Reconcile` (`internal/controller/coderun_controller.go`) revisits a terminal phase only to retry a pending lifecycle report and otherwise returns without a timer. `AwaitingReview` was part of the same gap — the controller never re-observed a PR after a run settled — until #250 added the slow, bounded read of the recorded pull request that turns a confirmed merge into `Done`; a PR closed without merge still keeps its run indefinitely, which this design fixes below. The #179 dogfood deployment left 26 `AwaitingReview`, 6 `NeedsHuman`, 1 `Failed`, and 17 retained coordinator pods. `source.Runner.Poll` (`internal/source/runner.go`) lists every CoderRun on every poll to build its dedupe set, so the list grows without bound.
 
 **Retention clock:** Retention is a bounded inspection window keyed to a durable, **per-phase "reap-eligible" annotation** — not `FinishedAt`, not `CreationTimestamp`, and not the source report condition alone. `FinishedAt` records the run's execution end and is set-once on the first terminal transition (`AwaitingReview`, `HandedOff`, `NeedsHuman`, or `Failed`); it must remain immutable so a later transition (notably the months-late `AwaitingReview → NeedsHuman` from a closed-unmerged PR) does not distort `RunDuration` or the merge-to-`Done` semantics, and so `Done`'s `RunDuration` is always the work's wall-clock cost rather than the reaper's view of it. Therefore `FinishedAt` is **not** the retention clock for `NeedsHuman`/`Failed`. The controller instead writes a new set-once annotation when the run becomes reap-eligible for that phase: `courier.misospace.dev/needs-human-at` on entry to `NeedsHuman` and `courier.misospace.dev/failed-at` on entry to `Failed`, each an RFC3339 timestamp stamped once after the lifecycle report reaches a settled state (see Deletion gates). For a direct `Running`/`Verifying → NeedsHuman`/`Failed`, the annotation is written at the same moment `FinishedAt` is set, so the window starts at the actual end of execution; for a late `AwaitingReview → NeedsHuman` (the closed-unmerged case), the annotation is written at the close-unmerged transition, **not** the original `FinishedAt`, so the seven-day window is the operator's inspection window for the new outcome, not a zero-length residue of months-old execution time. `Done` keeps its existing separate `courier.misospace.dev/done-at` annotation (`doneAtAnnotation`) because a `Done` transition can occur long after `FinishedAt` (and the source `Resolve` precedes the marker, not the phase change). A missing or malformed marker starts a fresh window and never deletes on the same pass; a future-dated marker (clock skew) is capped at the window and never deletes early — the same fail-safe rules `reapDone` already applies. `AwaitingReview` is deliberately outside this window: it is a success ending awaiting a human merge, not a terminal failure, so it is kept until the world moves it — #250 resolves a merge to `Done`, and this design resolves a closed-unmerged PR to `NeedsHuman`; only then does a retention window start. A PR that stays open keeps its run, which is the run's live-work record and the human gate. The annotations live on the object, so controller restart re-derives the remaining window from the durable marker without re-stamping, re-arming, or distorting `FinishedAt`.
 
@@ -1366,10 +1406,22 @@ that needs Dispatch-side queue exclusion. Where supported, discovery passes
 retained same-source work IDs as opaque exclusions when the Dispatch client is
 explicitly opted in; exclusion support defaults off and must be enabled only
 after deployment has confirmed the Dispatch contract. Enabled requests are
-bounded to 32 unique valid entries of 300 characters each, and every response
-must acknowledge `prFixExclusions.version: 1` before either a task or idle result
-is processed. Missing or malformed acknowledgements fail closed without retry or
-side effects. Exclusions are dedupe hints, not claims or ownership. While
+bounded to 32 unique valid entries of 300 characters each. The runner orders
+exclusions most-relevant-first — pre-terminal runs before terminal retained
+runs (whose attempts are usually settled; ranking is a truncation heuristic,
+not settlement authority, and a terminal run with a still-pending report ranks
+with the retained group), newest first within each group — so when more entries
+qualify than the cap allows, the client keeps the most relevant head and drops
+the tail with a warning instead of failing closed (#286); an exclusion overflow
+must degrade discovery, not starve it. Progress after truncation is a
+two-sided contract: Dispatch's per-agent, per-generation handout ledger scans
+past candidates the agent was already handed, and Courier's same-identity
+dedupe absorbs any re-offered truncated-out generation without materializing a
+duplicate run. Every response must acknowledge `prFixExclusions.version: 1`
+before either a task or idle result is processed. Missing or malformed
+acknowledgements fail
+closed without retry or side effects. Exclusions are dedupe hints, not claims
+or ownership. While
 discovery is paused, Dispatch `next-task` and stale-item bookkeeping are
 deferred until a later poll.
 
@@ -1513,15 +1565,19 @@ only informs.
   write-only evidence intake listener (in-cluster, token-gated, no read path)
   and holds namespaced Secret CRUD to persist evidence bundles. The evidence
   verbs are provisioned as a namespaced Role/RoleBinding in the chart,
-  deliberately never inside the generated operator ClusterRole, whose
-  ClusterRoleBinding would widen them cluster-wide. The authority expansion is
-  real but bounded: the chart's namespaced `credential-reader` Role already
-  grants the operator's service account `get` on every Secret in the namespace
-  (no `resourceNames`), so the evidence grant's marginal authority is `list`
-  and the mutating `create/patch/delete`. Deployments that cannot accept
-  Secret mutation should not enable evidence capture, and
-  reject-preservation remains the named fallback in the #115
-  design. Evidence content itself is model-authored untrusted data stored
+  deliberately never added to the generated operator ClusterRole, whose
+  ClusterRoleBinding would widen them cluster-wide and attach them to installs
+  that keep evidence disabled. The authority expansion is real but bounded.
+  The whole residual: the generated
+  ClusterRole already grants `create/delete/get/list` on `secrets` cluster-wide
+  for the secure-mode launcher, and the chart's namespaced `credential-reader`
+  Role grants the operator's service account `get` on every Secret in the run
+  namespace (no `resourceNames`), so the evidence Role's marginal verb against a
+   shipped install is `patch` — the intake's supersede path. Evidence capture
+   therefore adds one verb and no new read, create, or delete surface to an
+   operator that already mutates Secrets, alongside the intake listener and the
+   run-owned Secret shape, and reject-preservation remains the named fallback in
+   the #115 design. Evidence content itself is model-authored untrusted data stored
   inert in run-owned Secrets: never executed, never consumed by tooling,
   applied only by reviewed human action.
 - Dispatch is an adapter; the product boundary (dispatch is not Courier, Courier
@@ -1594,6 +1650,96 @@ named items remain unresolved and must not be described as production-ready:
 
 ## Decisions
 
+- **2026-10-13 — #317: git commit identity is deployment configuration,
+  never a hard-coded value or a token-derived one.** Operator-managed
+  executor pods injected `Courier <courier@localhost>` explicitly, and the
+  explicit container environment beat the envFrom executor Secret, so no
+  deployment could associate its commits with a forge account (PR #301's
+  commits resolved to a null author and committer on GitHub). Four operator
+  flags — `--git-author-name`, `--git-author-email`, `--git-committer-name`,
+  `--git-committer-email` — flow through `executor.PodConfig.Git`
+  (`GitIdentity`) into the four `GIT_*` variables of every generated
+  coordinator pod. Empty or whitespace-only fields resolve to the same
+  explicit default `Courier <courier@localhost>`, so default behavior is
+  backward compatible; configured values are validated fail-closed at startup
+  and at pod generation (no ASCII control characters or angle brackets; a
+  non-empty email must contain `@` and carry no whitespace). Precedence: operator flags are
+  explicit container env and therefore win over same-named keys of
+  `--executor-environment-secret` (Kubernetes env-over-envFrom), while the
+  standalone executor keeps the opposite order — a non-empty `GIT_*` in its
+  environment (shell export or Secret) is preserved and only unset or blank
+  names receive the fallback, and the fallback reads the executor package's
+  default constants so the two producers cannot drift. Authorship stays a
+  separate concern from forge authentication: nothing derives identity from
+  a token and no account is hard-coded upstream; GitHub links a commit to an
+  account only through an account-associated email, and attribution is
+  separate from commit signing. Secure mode's integration identity in
+  `internal/git` is control's own plumbing identity and is unchanged by this
+  decision. (#317)
+
+- **2026-10-13 — #280: the acceptance-criterion set is pinned at admission
+  by a trusted forge read and carried, never re-derived.** The identification
+  boundary of #249: secure admission reads the source issue through the
+  selected provider's typed work-item read (`github.Client.GetIssue` behind
+  `forge.Provider.ReadWorkItem` — an existing capability in the closed
+  vocabulary, read-only) on the operator's read identity, runs the pure
+  `ExtractCriteria`, and persists the set beside a `sourceIssue` identity
+  pin in `Status.PublicationPolicy` (`acceptanceCriteria` +
+  `acceptanceCriteriaDigest`, additive; CRDs/deepcopy regenerated). An empty
+  set is pinned with its identity-only digest — the smallest contract change
+  to #249's pure seam, needed so a pinned-empty contract stays
+  distinguishable from an unpinned policy; ambiguity, over-bound sets, and
+  over-long criteria terminalize `NeedsHuman` naming why and are never
+  truncated. The broker binding reconstructs and digest-verifies the pin
+  (fix-pr pins, tampered pins,
+  and orphaned pin fields — any partial tuple — fail closed; only the fully
+  absent tuple is the legal pre-contract state, no migration). The trusted
+  read's response identity is verified against the request — the returned
+  issue number and repository must match the canonical pin — so a
+  misrouted provider answer can never pin another issue's criteria. The identical set is projected to the executor
+  contract as trusted env `COURIER_CRITERIA` (broker criterion-set JSON)
+  from the persisted policy by the legacy launcher and the secure control
+  invocation — the executor package stays free of any broker import because
+  broker's test graph imports the harness; the envelope is injected at the
+  launcher seam like evidence tokens are. Boundary enforcement stays with
+  #281 (native create refusal) and #282 (legacy handoff repair). (#280,
+  #249, #204)
+- **2026-10-13 — #210: `COURIER_TERMINATION` line budgeting lives in one place; both
+  producers (`courier-executor`, `courier-control`) call it.** The native
+  control handoff built its reason from capability detail strings with no
+  byte bound, so an escape-heavy reason (every `<`, `>`, `&` becomes a
+  six-byte `\uXXXX`) could push the marshaled line past Kubernetes' 4 KiB
+  pod termination-message budget and lose the entire trusted handoff —
+  the same failure mode #188 fixed for the executor. Both producers now
+  call `internal/executor.FitTerminationLine` and `MarshalTerminationLine`
+  for marshaling and the line fit; the wire prefix, the budget, and the
+  truncation marker are constants in one place, so the two producers
+  cannot drift. The executor keeps its summary-shrink loop (which is
+  specific to the OpenCode telemetry path) and delegates the reason-shrink
+  step to the shared helper; the control uses the shared helper
+  end-to-end. (#210, #188)
+- **2026-10-13 — #292: Courier's dashboard views and alert conditions are
+  specified backend-neutrally, and assets are optional renderings.** The
+  portable specification is
+  [docs/observability-dashboards-and-alerts.md](./docs/observability-dashboards-and-alerts.md):
+  a six-section dashboard information architecture (source health, lane
+  capacity, run execution/outcomes, lifecycle reporting, retention, optional
+  connector panels) and an alert catalogue that states each condition's
+  evidence, window, threshold rationale, recovery, severity, expected action,
+  and behaviour under missing telemetry, startup, disabled sources, empty
+  queues, and low traffic. Prometheus and VictoriaMetrics share one
+  PromQL-compatible mapping; OTel is transport and must name an evaluator
+  (a rules engine — the Collector alone is not an alert evaluator); any other
+  backend may implement the same views and conditions, with no promise of
+  identical assets or feature parity. Idle is not failure, discovery failure
+  is distinguishable from an empty queue, and no Courier health condition
+  requires Dispatch telemetry. The design records the existing instrumentation
+  (`internal/controller/metrics.go`, `internal/log/events.go`, `CoderRun`
+  status) and the gaps — discovery, reservation, lifecycle-report, and
+  retention signals are absent — so no exporter or dependency is chosen before
+  those gaps are settled. This is design only: no code, dashboard JSON,
+  executable rules, exporter dependencies, or deployment manifests, and no
+  instrumentation work is authorized. (#292, #289, #290, #291)
 - **2026-10-13 — #291: connector diagnostics are adapter-owned and carried in a
   generic envelope; core stays source-agnostic and configured limits are data.**
   The design is
@@ -1623,7 +1769,6 @@ named items remain unresolved and must not be described as production-ready:
   touch retention (#287). Design only — no protocol change, implementation,
   shared cross-app schema, mandatory identifier, deployment, or dashboard.
   (#291, #289, #290, #292, #286, #287)
-
 - **2026-10-12 — #249: one executor-neutral acceptance-criterion evidence
   contract is enforced in both publication paths against a revision-pinned
   trusted snapshot of the source issue.** Admission reads the source issue
@@ -2550,3 +2695,62 @@ was superseded.
   This reverses the delete-before-recreate and open-green already-addressed
   policies recorded in the earlier #267 follow-up. Source-owned generation and
   cooldown fence recovery instead of a Courier poll-driven retry loop. (#267)
+
+- **2026-10-13 — #250: a settled `AwaitingReview` run observes its exact
+  recorded PR identity at a slow cadence; a forge-confirmed merge on that
+  identity finishes it `Done`.** `Reconcile` now revisits a settled
+  `AwaitingReview` run (after any pending lifecycle report has retried — the
+  source sees `in-review` before the `Done` resolve) with one slow, bounded
+  read through the forge `read-pull-request` capability: base repository plus
+  the `status.pr` number, verified against the recorded head repository and
+  ref, never inferred from a branch name. Only `merged` on that exact identity
+  transitions; open, closed-unmerged, absent, ambiguous, head-changed, or an
+  error never does, and `FinishedAt` is preserved. `Done` reuses the existing
+  lifecycle — source `Resolve` precedes the `done-at` marker, so a run whose
+  source could not be resolved is still never reaped, and after the reap the
+  source is the dedupe authority (Dispatch excludes `done` issues from
+  `next-task`, verified against `src/lib/agent-queue.ts`). Terminal-run metrics
+  are recorded on the run's **first** terminal transition only, so a late
+  `Done` does not count the run twice. Repository identity compares
+  case-insensitively (GitHub names cannot collide across case), and a merged
+  PR that no longer matches the recorded head logs its mismatch instead of
+  failing silently. Runs already settled at upgrade are observed on their next
+  wake (watch event or informer resync), then on the same slow cadence.
+  Closed-unmerged terminalization and the
+  `Failed`/`NeedsHuman` retention window stay with #251's children.
+  (#250, #179, #251)
+- **2026-10-13 — #222: the wedge path reaps the coordinator, `SecureControl`
+  fences the round.** `checkLiveness`'s wedge path selected its reap set (and
+  its startup-grace set) by run ownership alone, while the coordinator
+  identity everywhere else — `coordinatorPodOf`, `observeMissingCoordinator`,
+  #106's ceiling evidence-preservation skip — is the coordinator *container*.
+  A secure-topology run that reached the wedge path therefore had its worker
+  and broker reaped by the legacy loop as well: teardown the secure topology
+  owns, with the broker's ingress `Service` left behind (an un-fenced broker
+  keeps the run's copied credentials and its Service keeps routing), and the
+  wedge's teardown was decided in two places at once. The wedge path now
+  scopes both loops to pods carrying the coordinator container, and fences
+  the surviving round through `SecureControl.Fence` on the wedge's detection
+  reconcile — below the ceiling before returning to `Claimed`, at the ceiling
+  (including the cached-view-disagrees hand-off) before the `NeedsHuman`
+  hand-off terminalizes — exactly the pattern #215 established for
+  confirmed control loss, because a terminal run is never relaunched and a
+  fence deferred past the detection reconcile never runs. Legacy single-pod
+  behavior is unchanged: the lone pod carries the coordinator container, so
+  the scoped sets match the old ones. (#222)
+
+- **2026-10-12 — #286: exclusion overflow degrades by truncation, not failure.**
+  Retained dispatch CoderRuns with `followup-pr` work-item IDs grew past
+  Dispatch's 32-entry PR-fix exclusion cap, and the client's fail-closed
+  overflow error turned every 30s discovery cycle into an error, starving all
+  lanes because most retained runs were terminal zombies the Dispatch queue
+  had already settled. The cap is a Dispatch server contract and stays.
+  Courier's runner now orders exclusions most-relevant-first — pre-terminal
+  runs before terminal retained runs, newest first within each group; ranking
+  is a truncation heuristic, not settlement authority — and the Dispatch
+  client keeps the first 32 unique valid entries, dropping the tail with a
+  warning. Progress after truncation is two-sided: Dispatch's per-agent,
+  per-generation handout ledger scans past already-handed candidates, and
+  Courier's same-identity dedupe absorbs any re-offered truncated-out
+  generation without materializing a duplicate run. Malformed
+  descriptors still fail closed. (#286)

@@ -412,6 +412,11 @@ func policyMatches(resolved broker.Policy, persisted *courier.PublicationPolicy)
 		resolved.HeadAnchorOID != persisted.HeadAnchorOID {
 		return errors.New("courier-broker: live policy binding differs from the persisted policy")
 	}
+	// The pinned criterion set is part of the policy the binding verified by
+	// digest; the document copy must carry the same pin.
+	if resolved.Criteria.Digest != persisted.AcceptanceCriteriaDigest {
+		return errors.New("courier-broker: live policy binding differs from the persisted criterion pin")
+	}
 	return nil
 }
 

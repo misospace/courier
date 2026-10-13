@@ -1,13 +1,16 @@
 package main
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http/httptest"
 	"strings"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"github.com/misospace/courier/internal/executor"
 	"github.com/misospace/courier/internal/harness"
@@ -69,8 +72,229 @@ func TestBoundReason(t *testing.T) {
 	}
 	long := strings.Repeat("x", maxTerminationReasonBytes+100)
 	got := boundReason(long)
-	if len(got) > maxTerminationReasonBytes+20 || !strings.HasSuffix(got, "[truncated]") {
+	if len(got) > maxTerminationReasonBytes {
 		t.Fatalf("boundReason did not bound the reason: %d bytes", len(got))
+	}
+	if !utf8.ValidString(got) {
+		t.Fatalf("boundReason produced invalid UTF-8: %q", got)
+	}
+	if !strings.HasSuffix(got, executor.TerminationTruncationSuffix) {
+		t.Fatalf("boundReason = %q, want the shared truncation suffix", got)
+	}
+}
+
+// TestHandoffStaysWithinTerminationBudget pins #210's done-condition:
+// an 8 KiB escape-heavy reason (the worst case the capability-table
+// detail strings can produce) must yield an emitted handoff line at or
+// under the 4 KiB Kubernetes pod termination-message budget, and the
+// surviving line must parse back as JSON with phase / result / exit_code
+// intact and a non-empty reason. Without the line fit the same payload
+// marshals to well past 4 KiB and the controller's parseCoordinatorTermination
+// rejects the entire handoff.
+func TestHandoffStaysWithinTerminationBudget(t *testing.T) {
+	// Eight-byte unit covering all six escaping characters: the two
+	// quotes, two backslashes and newline double in length, while <, >
+	// and & expand to six-byte \uXXXX escapes. 1024 units make exactly
+	// 8192 raw bytes (8 KiB); the marshaled payload overshoots the 4
+	// KiB budget by far, so the line fit has to fire.
+	unit := `"` + `"` + `\` + `\` + "\n" + "<>&"
+	if len(unit) != 8 {
+		t.Fatalf("test unit is %d bytes, want 8", len(unit))
+	}
+	reason := strings.Repeat(unit, executor.MaxTerminationLineBytes/len(unit))
+	if len(reason) != executor.MaxTerminationLineBytes {
+		t.Fatalf("reason is %d bytes, want %d", len(reason), executor.MaxTerminationLineBytes)
+	}
+
+	payload := termination{
+		Phase:    "NeedsHuman",
+		Result:   "needs-human",
+		ExitCode: 2,
+		Outcome:  "needs_decision",
+		Reason:   reason,
+	}
+	line := executor.FitTerminationLine(&payload)
+	if len(line) > executor.MaxTerminationLineBytes {
+		t.Fatalf("termination line is %d bytes, want <= %d", len(line), executor.MaxTerminationLineBytes)
+	}
+	if !bytes.HasPrefix([]byte(line), []byte(executor.TerminationLinePrefix)) {
+		t.Fatalf("termination line is missing the wire prefix %q: %q", executor.TerminationLinePrefix, line)
+	}
+	body := strings.TrimSuffix(strings.TrimPrefix(line, executor.TerminationLinePrefix), "\n")
+	var parsed struct {
+		Phase    string `json:"phase"`
+		Result   string `json:"result"`
+		ExitCode int32  `json:"exit_code"`
+		Reason   string `json:"reason"`
+		Outcome  string `json:"outcome,omitempty"`
+	}
+	if err := json.Unmarshal([]byte(body), &parsed); err != nil {
+		t.Fatalf("termination line is not valid JSON: %v: %q", err, body)
+	}
+	if parsed.Phase != "NeedsHuman" {
+		t.Fatalf("phase = %q, want %q", parsed.Phase, "NeedsHuman")
+	}
+	if parsed.Result != "needs-human" {
+		t.Fatalf("result = %q, want %q", parsed.Result, "needs-human")
+	}
+	if parsed.ExitCode != 2 {
+		t.Fatalf("exit_code = %d, want 2", parsed.ExitCode)
+	}
+	if parsed.Outcome != "needs_decision" {
+		t.Fatalf("outcome = %q, want %q", parsed.Outcome, "needs_decision")
+	}
+	if parsed.Reason == "" {
+		t.Fatal("reason was emptied by the line fit")
+	}
+	if !utf8.ValidString(parsed.Reason) {
+		t.Fatalf("trimmed reason is not valid UTF-8: %q", parsed.Reason)
+	}
+	if !strings.HasSuffix(parsed.Reason, executor.TerminationTruncationSuffix) {
+		t.Fatalf("trimmed reason %q does not end with the shared truncation suffix", parsed.Reason)
+	}
+}
+
+// TestHandoffFitsEscapeHeavyBareReason covers the case where
+// declareNeedsHuman hands boundReason a raw reason that survives the
+// raw-byte cap but still escapes past 4 KiB — the exact failure mode
+// filed as #210. boundReason alone caps raw bytes; the line fit the
+// handoff applies afterwards must close the gap that escape inflation
+// opens.
+func TestHandoffFitsEscapeHeavyBareReason(t *testing.T) {
+	// 4096 raw bytes of `&` expand to 24,576 escaped bytes — well past
+	// 4 KiB even after boundReason's 1200-byte cap. The line fit has
+	// to cut the reason regardless.
+	reason := strings.Repeat("&", 4096)
+	if len(reason) != 4096 {
+		t.Fatalf("reason is %d bytes, want 4096", len(reason))
+	}
+
+	payload := termination{
+		Phase:    "Failed",
+		Result:   "failure",
+		ExitCode: 1,
+		Reason:   reason,
+	}
+	line := executor.FitTerminationLine(&payload)
+	if len(line) > executor.MaxTerminationLineBytes {
+		t.Fatalf("termination line is %d bytes, want <= %d", len(line), executor.MaxTerminationLineBytes)
+	}
+	body := strings.TrimSuffix(strings.TrimPrefix(line, executor.TerminationLinePrefix), "\n")
+	var parsed struct {
+		Phase    string `json:"phase"`
+		Result   string `json:"result"`
+		ExitCode int32  `json:"exit_code"`
+		Reason   string `json:"reason"`
+	}
+	if err := json.Unmarshal([]byte(body), &parsed); err != nil {
+		t.Fatalf("termination line is not valid JSON: %v: %q", err, body)
+	}
+	if parsed.Phase != "Failed" {
+		t.Fatalf("phase = %q, want %q", parsed.Phase, "Failed")
+	}
+	if parsed.Result != "failure" {
+		t.Fatalf("result = %q, want %q", parsed.Result, "failure")
+	}
+	if parsed.ExitCode != 1 {
+		t.Fatalf("exit_code = %d, want 1", parsed.ExitCode)
+	}
+	if parsed.Reason == "" {
+		t.Fatal("reason was emptied by the line fit")
+	}
+}
+
+// TestHandoffKeepsUTF8ReasonOnShrink pins the rune-boundary guarantee
+// when the line fit cuts a multi-byte reason. A long CJK reason (no
+// JSON escaping, so the marshaler leaves the bytes alone) overruns the
+// 4 KiB budget in raw form; the cut must land on a rune boundary,
+// leaving a valid-UTF-8, non-empty reason ending with the shared
+// truncation marker.
+func TestHandoffKeepsUTF8ReasonOnShrink(t *testing.T) {
+	reason := strings.Repeat("你", 1500)
+	if len(reason) != 4500 {
+		t.Fatalf("reason is %d bytes, want 4500", len(reason))
+	}
+
+	payload := termination{
+		Phase:    "NeedsHuman",
+		Result:   "needs-human",
+		ExitCode: 2,
+		Reason:   reason,
+	}
+	line := executor.FitTerminationLine(&payload)
+	if len(line) > executor.MaxTerminationLineBytes {
+		t.Fatalf("termination line is %d bytes, want <= %d", len(line), executor.MaxTerminationLineBytes)
+	}
+	body := strings.TrimSuffix(strings.TrimPrefix(line, executor.TerminationLinePrefix), "\n")
+	var parsed struct {
+		Reason string `json:"reason"`
+	}
+	if err := json.Unmarshal([]byte(body), &parsed); err != nil {
+		t.Fatalf("termination line is not valid JSON: %v: %q", err, body)
+	}
+	if parsed.Reason == "" {
+		t.Fatal("reason was emptied by the line fit")
+	}
+	if !utf8.ValidString(parsed.Reason) {
+		t.Fatalf("trimmed reason is not valid UTF-8: %q", parsed.Reason)
+	}
+	if !strings.HasSuffix(parsed.Reason, executor.TerminationTruncationSuffix) {
+		t.Fatalf("trimmed reason %q does not end with the shared truncation suffix", parsed.Reason)
+	}
+}
+
+// The truncation boundary must not split a multi-byte rune: the trusted
+// termination reason stays valid UTF-8 within the byte bound.
+func TestBoundReasonSplitsOnRuneBoundary(t *testing.T) {
+	long := strings.Repeat("a", maxTerminationReasonBytes-len(executor.TerminationTruncationSuffix)-1) +
+		"é" + strings.Repeat("b", 20)
+	got := boundReason(long)
+	if len(got) > maxTerminationReasonBytes {
+		t.Fatalf("truncated reason is %d bytes, want <= %d", len(got), maxTerminationReasonBytes)
+	}
+	if !utf8.ValidString(got) {
+		t.Fatalf("truncated reason is not valid UTF-8: %q", got)
+	}
+	if !strings.HasSuffix(got, executor.TerminationTruncationSuffix) {
+		t.Fatalf("truncated reason lost its suffix: %q", got)
+	}
+}
+
+// A gate failure that is not a *GateError must not panic the probe loop and
+// must still fail closed: no re-probe rounds, declare NeedsHuman.
+func TestClassifyGateFailureNonGateErrorFailsClosed(t *testing.T) {
+	reason, retryable := classifyGateFailure(errors.New("gate exploded"))
+	if retryable {
+		t.Fatal("a non-GateError gate failure must not be retryable")
+	}
+	if reason == "" || !strings.Contains(reason, "gate exploded") {
+		t.Fatalf("reason = %q, want a safe reason naming the failure", reason)
+	}
+}
+
+func TestClassifyGateFailureGateError(t *testing.T) {
+	transient := &harness.GateError{Failed: []harness.Capability{
+		{Name: "broker", State: harness.StateUnavailable, Detail: "is unreachable", Required: true, Retryable: true},
+	}}
+	reason, retryable := classifyGateFailure(transient)
+	if !retryable {
+		t.Fatal("an all-transient GateError must stay retryable")
+	}
+	if !strings.Contains(reason, "broker") {
+		t.Fatalf("reason = %q, want the capability table", reason)
+	}
+
+	permanent := &harness.GateError{Failed: []harness.Capability{
+		{Name: "broker", State: harness.StateUnavailable, Detail: "is unreachable", Required: true, Retryable: true},
+		{Name: "forge-operations", State: harness.StateUnavailable, Detail: "operation missing", Required: true},
+	}}
+	if _, retryable := classifyGateFailure(permanent); retryable {
+		t.Fatal("a GateError with a permanent failure must not be retryable")
+	}
+
+	wrapped := fmt.Errorf("gate: %w", transient)
+	if _, retryable := classifyGateFailure(wrapped); !retryable {
+		t.Fatal("a wrapped GateError must still be classified as retryable")
 	}
 }
 

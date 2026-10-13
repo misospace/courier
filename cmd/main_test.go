@@ -9,13 +9,17 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+	"time"
 
 	courierv1alpha1 "github.com/misospace/courier/api/v1alpha1"
 	"github.com/misospace/courier/internal/controller"
+	"github.com/misospace/courier/internal/forge"
+	couriergithub "github.com/misospace/courier/internal/github"
 	"github.com/misospace/courier/internal/source/dispatch"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 )
 
@@ -42,6 +46,26 @@ func TestExistingPRHeadResolver(t *testing.T) {
 	}
 	if got := existingPRHeadResolver(nil); got != nil {
 		t.Fatal("existingPRHeadResolver(nil) returned a resolver")
+	}
+}
+
+func TestPullRequestReaderWiresForgeCapability(t *testing.T) {
+	if got := pullRequestReader(nil); got != nil {
+		t.Fatal("pullRequestReader(nil) returned a reader")
+	}
+	if got := pullRequestReader(observerWithHeadResolver{}); got != nil {
+		t.Fatal("pullRequestReader() returned a reader for a non-GitHub observer")
+	}
+	client, err := couriergithub.New("test-token")
+	if err != nil {
+		t.Fatalf("build GitHub client: %v", err)
+	}
+	reader := pullRequestReader(couriergithub.Observer{Client: client})
+	if reader == nil {
+		t.Fatal("pullRequestReader() returned nil for the GitHub observer")
+	}
+	if availability := reader.Capabilities().Available(forge.CapabilityReadPullRequest); !availability.Available {
+		t.Fatalf("read-pull-request capability = %#v, want available for the wired reader", availability)
 	}
 }
 
@@ -282,6 +306,43 @@ func TestValidateEvidenceFlags(t *testing.T) {
 			}
 		})
 	}
+}
+
+// stalledReader mimics an API server that accepts the connection but never
+// answers: every Get blocks until the caller's context ends.
+type stalledReader struct{ client.Reader }
+
+func (stalledReader) Get(ctx context.Context, _ client.ObjectKey, _ client.Object, _ ...client.GetOption) error {
+	<-ctx.Done()
+	return ctx.Err()
+}
+
+func TestStartupReadsSurfaceDeadlineErrors(t *testing.T) {
+	reader := stalledReader{}
+
+	t.Run("evidence intake key read", func(t *testing.T) {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Millisecond)
+		defer cancel()
+		_, err := loadEvidenceKey(ctx, reader, "courier-system", "courier-evidence-key")
+		if !errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("loadEvidenceKey() error = %v, want a deadline-exceeded error", err)
+		}
+		if !strings.Contains(err.Error(), "read evidence intake key Secret courier-system/courier-evidence-key") {
+			t.Fatalf("loadEvidenceKey() error = %q, want it to name the failing read", err)
+		}
+	})
+
+	t.Run("GitHub observer read", func(t *testing.T) {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Millisecond)
+		defer cancel()
+		_, err := githubObserver(ctx, reader, "courier-system", "courier-github", "", "", "")
+		if !errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("githubObserver() error = %v, want a deadline-exceeded error", err)
+		}
+		if !strings.Contains(err.Error(), "read GitHub credential Secret courier-system/courier-github") {
+			t.Fatalf("githubObserver() error = %q, want it to name the failing read", err)
+		}
+	})
 }
 
 func TestLoadEvidenceKey(t *testing.T) {

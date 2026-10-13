@@ -114,8 +114,10 @@ func processRunRecorder() *RunRecorder {
 }
 
 // ObserveTerminal records a CoderRun that has just entered its terminal
-// phase. It is called exactly once per run: the terminal phase is final, so
-// re-reconciles of an already-terminal run are no-ops here.
+// phase. It is called exactly once per run: the reconciler records metrics on
+// the run's first terminal transition, so a later transition that corrects
+// the ending — a confirmed merge settling AwaitingReview as Done (#250) —
+// does not count the run twice.
 func (r *RunRecorder) ObserveTerminal(run *courierv1alpha1.CoderRun) {
 	if run == nil {
 		return

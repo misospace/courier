@@ -68,6 +68,10 @@ func main() {
 	var githubCredentialSecret string
 	var githubTokenKey string
 	var executorEnvironmentSecret string
+	var gitAuthorName string
+	var gitAuthorEmail string
+	var gitCommitterName string
+	var gitCommitterEmail string
 	var opencodeAgent string
 	var githubMCPURL string
 	var context7MCPURL string
@@ -108,6 +112,10 @@ func main() {
 	flag.StringVar(&githubCredentialSecret, "github-credential-secret", "", "Optional Secret containing the GitHub API token; empty falls back to --git-credential-secret.")
 	flag.StringVar(&githubTokenKey, "github-token-key", "", "Optional key in the GitHub API credential Secret; empty falls back to --git-token-key or token.")
 	flag.StringVar(&executorEnvironmentSecret, "executor-environment-secret", "", "Optional Secret exposed as coordinator environment variables for model/provider configuration.")
+	flag.StringVar(&gitAuthorName, "git-author-name", defaults.Git.AuthorName, "Git author name rendered into operator-created coordinator pods; empty falls back to the explicit default. Separate from any forge authentication identity (#317).")
+	flag.StringVar(&gitAuthorEmail, "git-author-email", defaults.Git.AuthorEmail, "Git author email rendered into operator-created coordinator pods; empty falls back to the explicit default. Forge attribution requires an account-associated email (#317).")
+	flag.StringVar(&gitCommitterName, "git-committer-name", defaults.Git.CommitterName, "Git committer name rendered into operator-created coordinator pods; empty falls back to the explicit default (#317).")
+	flag.StringVar(&gitCommitterEmail, "git-committer-email", defaults.Git.CommitterEmail, "Git committer email rendered into operator-created coordinator pods; empty falls back to the explicit default (#317).")
 	flag.StringVar(&opencodeAgent, "opencode-agent", "", "Optional OpenCode agent name used for coordinator runs.")
 	flag.StringVar(&githubMCPURL, "github-mcp-url", "", "Optional remote MCP endpoint for GitHub.")
 	flag.StringVar(&context7MCPURL, "context7-mcp-url", "", "Optional remote MCP endpoint for Context7.")
@@ -142,6 +150,14 @@ func main() {
 	flag.Parse()
 
 	ctrl.SetLogger(zap.New(zap.UseFlagOptions(&opts)))
+
+	// The pre-start credential Secret reads below use the manager's API
+	// reader. An API server that accepts the connection but never answers
+	// would otherwise wedge startup forever with no log line, so both reads
+	// share one deadline (in the same spirit as --dispatch-http-timeout).
+	// A timeout fails closed like every other setup path; it adds no retry.
+	startupCtx, cancelStartup := context.WithTimeout(context.Background(), startupReadTimeout)
+	defer cancelStartup()
 
 	mgr, err := ctrl.NewManager(ctrl.GetConfigOrDie(), ctrl.Options{
 		Scheme:                 scheme,
@@ -190,6 +206,18 @@ func main() {
 	podConfig.GitHubCredentialSecret = githubCredentialSecret
 	podConfig.GitHubTokenKey = githubTokenKey
 	podConfig.EnvironmentSecret = executorEnvironmentSecret
+	podConfig.Git = executor.GitIdentity{
+		AuthorName:     gitAuthorName,
+		AuthorEmail:    gitAuthorEmail,
+		CommitterName:  gitCommitterName,
+		CommitterEmail: gitCommitterEmail,
+	}
+	// Fail fast on a malformed deployment identity at startup rather than at
+	// the first launch; Build validates the identity again on every pod.
+	if err := podConfig.Git.Validate(); err != nil {
+		setupLog.Error(err, "unable to configure executor git identity")
+		os.Exit(1)
+	}
 	podConfig.OpenCode.Agent = opencodeAgent
 	podConfig.GitHubMCPURL = githubMCPURL
 	podConfig.Context7MCPURL = context7MCPURL
@@ -213,7 +241,7 @@ func main() {
 			os.Exit(1)
 		}
 		podNamespace := strings.TrimSpace(os.Getenv("POD_NAMESPACE"))
-		key, err := loadEvidenceKey(context.Background(), mgr.GetAPIReader(), podNamespace, evidenceIntakeKeySecret)
+		key, err := loadEvidenceKey(startupCtx, mgr.GetAPIReader(), podNamespace, evidenceIntakeKeySecret)
 		if err != nil {
 			setupLog.Error(err, "unable to configure evidence capture")
 			os.Exit(1)
@@ -248,7 +276,7 @@ func main() {
 		os.Exit(1)
 	}
 
-	githubObserver, err := githubObserver(context.Background(), mgr.GetAPIReader(), os.Getenv("POD_NAMESPACE"), githubCredentialSecret, githubTokenKey, gitCredentialSecret, gitTokenKey)
+	githubObserver, err := githubObserver(startupCtx, mgr.GetAPIReader(), os.Getenv("POD_NAMESPACE"), githubCredentialSecret, githubTokenKey, gitCredentialSecret, gitTokenKey)
 	if err != nil {
 		setupLog.Error(err, "unable to configure GitHub observer")
 		os.Exit(1)
@@ -345,6 +373,7 @@ func main() {
 		Sources:        sources,
 		StatusWriter:   status.KubePatchWriter{Client: mgr.GetClient()},
 		Observer:       githubObserver,
+		PullRequests:   pullRequestReader(githubObserver),
 		Events:         runEvents,
 		Evidence:       evidenceIntake,
 		PRHeadResolver: existingPRHeadResolver(githubObserver),
@@ -374,6 +403,7 @@ func main() {
 		}
 		secure.Client = mgr.GetClient()
 		secure.Patcher = reconciler
+		secure.MaxRestarts = reconciler.MaxRestarts
 		reconciler.Secure = secure
 	}
 	if err := reconciler.SetupWithManager(mgr); err != nil {
@@ -404,6 +434,19 @@ func existingPRHeadResolver(observer controller.WorldObserver) controller.Existi
 	}
 	resolver, _ := observer.(controller.ExistingPRHeadResolver)
 	return resolver
+}
+
+// pullRequestReader gives the reconciler's slow post-review observation the
+// forge capability it reads through: the exact pull-request read of the
+// configured provider, built on the operator's own read credential. The core
+// never receives a forge-specific client or CLI — only the forge.Provider
+// seam and its capability diagnostics.
+func pullRequestReader(observer controller.WorldObserver) controller.PullRequestReader {
+	githubObserver, ok := observer.(couriergithub.Observer)
+	if !ok || githubObserver.Client == nil {
+		return nil
+	}
+	return couriergithub.NewProvider(forge.ProviderConfig{Name: "github"}, githubObserver.Client)
 }
 
 // validateEvidenceFlags reports a clear error when the evidence intake flags
@@ -605,6 +648,9 @@ type secureConfig struct {
 const (
 	defaultsHarnessImage = "ghcr.io/misospace/courier-harness:latest"
 	defaultsProbeImage   = "busybox:1.36"
+	// startupReadTimeout bounds the pre-start credential Secret reads so a
+	// stalled API server surfaces as a setup error instead of a silent hang.
+	startupReadTimeout = 30 * time.Second
 )
 
 // buildSecureControl loads and validates the provider registry, rejects

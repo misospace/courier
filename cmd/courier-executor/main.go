@@ -48,19 +48,16 @@ const (
 	exitNeedsHuman = 2
 	// The operator decodes this exit in phaseForExit (internal/controller);
 	// DESIGN.md's exit contract is the authority.
-	exitNoChangeNeeded          = 3
-	defaultBase                 = "main"
-	defaultWork                 = "/workspace"
-	defaultScratchDirectory     = "/var/tmp/courier-scratch"
-	defaultOutcomeFilename      = "outcome.json"
-	maxTerminationReasonBytes   = 1024
-	terminationTruncationSuffix = "... [truncated]"
-	// terminationLinePrefix is the fixed prefix of the legacy handoff line.
-	terminationLinePrefix = "COURIER_TERMINATION "
-	// maxTerminationLineBytes is the Kubernetes pod termination-message budget.
-	// The whole handoff line must stay at or under it, or the controller loses
-	// the entire handoff to truncation.
-	maxTerminationLineBytes = 4096
+	exitNoChangeNeeded        = 3
+	defaultBase               = "main"
+	defaultWork               = "/workspace"
+	defaultScratchDirectory   = "/var/tmp/courier-scratch"
+	defaultOutcomeFilename    = "outcome.json"
+	maxTerminationReasonBytes = 1024
+	// terminationTruncationSuffix / terminationLinePrefix /
+	// maxTerminationLineBytes live in internal/executor so the two
+	// COURIER_TERMINATION producers (here and courier-control) cannot
+	// drift on the wire prefix or the kubelet budget (#210).
 	defaultFormat           = "json"
 	defaultMaxContinuations = 3
 	defaultResumeBackoff    = 5 * time.Second
@@ -1344,15 +1341,18 @@ func readOutcome(path string) (outcomeDeclaration, bool, error) {
 
 // truncateTerminationReason applies the Kubernetes handoff bound after
 // redaction, preserving UTF-8 and reserving room for the truncation marker.
+// The marker itself is the shared termination suffix from internal/executor
+// so the executor and the native control producer cannot drift on the
+// truncation marker either (#210).
 func truncateTerminationReason(reason string) string {
 	if len(reason) <= maxTerminationReasonBytes {
 		return reason
 	}
-	limit := maxTerminationReasonBytes - len(terminationTruncationSuffix)
+	limit := maxTerminationReasonBytes - len(executor.TerminationTruncationSuffix)
 	for limit > 0 && !utf8.ValidString(reason[:limit]) {
 		limit--
 	}
-	return reason[:limit] + terminationTruncationSuffix
+	return reason[:limit] + executor.TerminationTruncationSuffix
 }
 
 // failed builds a Failed termination with the standard failure exit code.
@@ -1944,12 +1944,17 @@ func (r reporter) applyLinkagePlan(ctx context.Context, continuations int, maxCo
 	return linkageVerdict{ContinueMsg: linkageRepairMessage(r.sourceIssue(), linkOutcome, next), PRNumber: linkOutcome.pr.Number}
 }
 
+// installGitIdentity supplies the default git identity for any GIT_* variable
+// the process does not already carry. A deployment-provided value — a shell
+// export or a key of the executor environment Secret — always wins; only
+// unset or blank names fall back, so the standalone path overrides without an
+// operator (or upstream) hard-coding a particular account (#317).
 func installGitIdentity() func() {
 	defaults := map[string]string{
-		"GIT_AUTHOR_NAME":     "Courier",
-		"GIT_AUTHOR_EMAIL":    "courier@localhost",
-		"GIT_COMMITTER_NAME":  "Courier",
-		"GIT_COMMITTER_EMAIL": "courier@localhost",
+		executor.EnvGitAuthorName:     executor.DefaultGitAuthorName,
+		executor.EnvGitAuthorEmail:    executor.DefaultGitAuthorEmail,
+		executor.EnvGitCommitterName:  executor.DefaultGitAuthorName,
+		executor.EnvGitCommitterEmail: executor.DefaultGitAuthorEmail,
 	}
 	type previousValue struct {
 		value string
@@ -2019,9 +2024,9 @@ func askpass(args []string, username, token string, stdout io.Writer) int {
 // emitTermination writes the legacy COURIER_TERMINATION line to stdout (and to
 // cfg.TerminationFile when set). The whole line is bounded by the Kubernetes
 // pod termination-message budget: when the marshalled payload would push the
-// line past maxTerminationLineBytes, the compact telemetry summary is shrunk
-// — subagent entries dropped lowest-runtime first, then the summary key
-// itself — so phase, result, exit_code, outcome and reason always survive.
+// line past executor.MaxTerminationLineBytes, the compact telemetry summary
+// is shrunk — subagent entries dropped lowest-runtime first, then the summary
+// key itself — so phase, result, exit_code, outcome and reason always survive.
 func emitTermination(stdout io.Writer, cfg config, result termination) {
 	line := fitTerminationLine(result)
 	if line == "" {
@@ -2041,15 +2046,17 @@ func emitTermination(stdout io.Writer, cfg config, result termination) {
 
 // fitTerminationLine renders the handoff line, shrinking the telemetry summary
 // until the line fits the termination-message budget, and — only once the
-// summary is fully gone — shrinking the reason as a last resort. The summary
-// always gives ground first; the reason is cut last and only as much as
-// needed to fit, and it is kept non-empty. phase/result/exit_code/outcome are
-// never touched. It may shrink result.Summary and result.Reason in place: a
-// caller must not reuse the passed Summary pointer expecting the untouched
-// payload.
+// summary is fully gone — delegating the reason-shrink step to the shared
+// executor.FitTerminationLine so the two COURIER_TERMINATION producers
+// (here and courier-control) cannot drift on the wire prefix, the budget,
+// or the truncation marker (#210). The summary always gives ground first;
+// the reason is cut last and only as much as needed to fit, and it is kept
+// non-empty. phase/result/exit_code/outcome are never touched. It may shrink
+// result.Summary in place: a caller must not reuse the passed Summary
+// pointer expecting the untouched payload.
 func fitTerminationLine(result termination) string {
 	line := marshalTerminationLine(result)
-	for len(line) > maxTerminationLineBytes && result.Summary != nil {
+	for len(line) > executor.MaxTerminationLineBytes && result.Summary != nil {
 		if len(result.Summary.Subagents) > 0 {
 			// Subagents are ordered highest-runtime first, so the final entry
 			// is the lowest-runtime; drop it and re-measure.
@@ -2061,62 +2068,19 @@ func fitTerminationLine(result termination) string {
 		}
 		line = marshalTerminationLine(result)
 	}
-	// Last resort: the summary is gone yet the line still overruns the budget.
-	// An escape-heavy reason marshals to far more bytes than its raw length
-	// (each <, > or & becomes a six-byte \uXXXX escape), so the raw-byte
-	// truncation in terminate cannot see the overrun. Cut the reason until the
-	// line fits; it is the only field left allowed to give ground and it always
-	// stays non-empty.
-	for len(line) > maxTerminationLineBytes {
-		shrunk := shrinkTerminationReason(result.Reason, len(line)-maxTerminationLineBytes)
-		if shrunk == result.Reason {
-			// The reason is at its floor and cannot give more ground. The
-			// remaining overrun (if any) belongs to the fixed fields, which we
-			// never touch; stop rather than spin.
-			break
-		}
-		result.Reason = shrunk
-		line = marshalTerminationLine(result)
-	}
-	return line
-}
-
-// shrinkTerminationReason cuts raw reason bytes so the re-marshaled handoff
-// line drops back within the termination-message budget. overflow is how many
-// bytes the current line exceeds maxTerminationLineBytes by. Each removed raw
-// byte shrinks the escaped form by at least one byte, so removing overflow
-// bytes (plus the truncation marker) closes the gap; a UTF-8-safe cut and the
-// marker keep the reason non-empty and the cut visible. It returns the reason
-// unchanged when it is already at the marker floor, so the caller can stop.
-func shrinkTerminationReason(reason string, overflow int) string {
-	const floor = len(terminationTruncationSuffix)
-	if len(reason) <= floor {
-		return reason
-	}
-	// Drop a marker a previous cut left at the tail so it is not counted as
-	// content; it is re-appended below, so the length never inflates.
-	base := reason
-	if strings.HasSuffix(base, terminationTruncationSuffix) {
-		base = base[:len(base)-floor]
-	}
-	cut := overflow + floor
-	limit := len(base) - cut
-	if limit < 0 {
-		limit = 0
-	}
-	// Never split a multi-byte rune: back off only over the UTF-8
-	// continuation bytes at the cut point.
-	for limit > 0 && base[limit]&0xC0 == 0x80 {
-		limit--
-	}
-	return base[:limit] + terminationTruncationSuffix
+	// Last resort: the summary is gone yet the line still overruns the
+	// budget. An escape-heavy reason marshals to far more bytes than its raw
+	// length (each <, > or & becomes a six-byte \uXXXX escape), so the
+	// raw-byte truncation in terminate cannot see the overrun. The shared
+	// FitTerminationLine cuts the reason until the line fits; it is the only
+	// field left allowed to give ground and it always stays non-empty.
+	return executor.FitTerminationLine(&result)
 }
 
 // marshalTerminationLine renders the handoff line for a fixed termination.
+// It is a thin alias for the shared executor.MarshalTerminationLine, kept
+// so the executor's own summary-shrink loop and any future local helper
+// stay self-explanatory.
 func marshalTerminationLine(result termination) string {
-	payload, err := json.Marshal(result)
-	if err != nil {
-		return ""
-	}
-	return terminationLinePrefix + string(payload) + "\n"
+	return executor.MarshalTerminationLine(result)
 }

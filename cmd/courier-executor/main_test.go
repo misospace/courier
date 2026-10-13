@@ -63,6 +63,16 @@ func TestMain(m *testing.M) {
 	os.Exit(code)
 }
 
+// The shared termination-line constants live in internal/executor so the
+// executor and the native control producer cannot drift (#210). The
+// local aliases here keep the existing test bodies readable without
+// re-declaring the values.
+const (
+	terminationTruncationSuffix = executor.TerminationTruncationSuffix
+	terminationLinePrefix       = executor.TerminationLinePrefix
+	maxTerminationLineBytes     = executor.MaxTerminationLineBytes
+)
+
 func TestRunPreparesOrphanBranchAndInvokesOpenCodeWithExactContext(t *testing.T) {
 	root := t.TempDir()
 	remote := filepath.Join(root, "remote.git")
@@ -1246,11 +1256,13 @@ func TestEmitTerminationKeepsUTF8ReasonOnLastResortShrink(t *testing.T) {
 // TestShrinkTerminationReason pins the last-resort reason cut: it removes
 // exactly the overflow (plus the marker) bytes, leaves a reason at the marker
 // floor unchanged, and does not double-count a marker the content already ends
-// with.
+// with. The cut itself is the shared executor.ShrinkTerminationReason helper
+// that every COURIER_TERMINATION producer uses for the reason fit, so this
+// test pins the shared behavior, not a private copy (#210).
 func TestShrinkTerminationReason(t *testing.T) {
 	t.Run("closes a one-byte overflow", func(t *testing.T) {
 		reason := strings.Repeat("a", 100)
-		got := shrinkTerminationReason(reason, 1)
+		got := executor.ShrinkTerminationReason(reason, 1)
 		want := strings.Repeat("a", 84) + terminationTruncationSuffix
 		if got != want {
 			t.Fatalf("shrinkTerminationReason() = %q (%d bytes), want %q (%d bytes)", got, len(got), want, len(want))
@@ -1259,7 +1271,7 @@ func TestShrinkTerminationReason(t *testing.T) {
 
 	t.Run("reason at the marker floor is unchanged", func(t *testing.T) {
 		reason := strings.Repeat("a", len(terminationTruncationSuffix))
-		got := shrinkTerminationReason(reason, 1)
+		got := executor.ShrinkTerminationReason(reason, 1)
 		if got != reason {
 			t.Fatalf("shrinkTerminationReason() = %q, want unchanged %q", got, reason)
 		}
@@ -1267,7 +1279,7 @@ func TestShrinkTerminationReason(t *testing.T) {
 
 	t.Run("content ending in the marker is not double-counted", func(t *testing.T) {
 		reason := strings.Repeat("a", 50) + terminationTruncationSuffix
-		got := shrinkTerminationReason(reason, 1)
+		got := executor.ShrinkTerminationReason(reason, 1)
 		// The trailing marker is stripped before measuring, so the cut applies
 		// to the 50-byte content and the marker is appended exactly once.
 		want := strings.Repeat("a", 34) + terminationTruncationSuffix
@@ -5257,5 +5269,59 @@ func TestLinkageForgeFailureReason(t *testing.T) {
 		forgeErr.Error() + "; the run needs a human"
 	if got := report.linkageForgeFailureReason(forgeErr); got != want {
 		t.Fatalf("linkageForgeFailureReason = %q, want %q", got, want)
+	}
+}
+
+// TestInstallGitIdentityPrecedence pins the standalone executor's identity
+// contract (#317): a configured or exported nonempty GIT_* value always wins,
+// unset or blank names receive the shared default, and restore returns the
+// environment to exactly its prior state.
+func TestInstallGitIdentityPrecedence(t *testing.T) {
+	names := []string{"GIT_AUTHOR_NAME", "GIT_AUTHOR_EMAIL", "GIT_COMMITTER_NAME", "GIT_COMMITTER_EMAIL"}
+	for _, name := range names {
+		value, set := os.LookupEnv(name)
+		if set {
+			t.Cleanup(func() { _ = os.Setenv(name, value) })
+		} else {
+			t.Cleanup(func() { _ = os.Unsetenv(name) })
+		}
+	}
+	if err := os.Setenv("GIT_AUTHOR_NAME", "Deploy Bot"); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Unsetenv("GIT_AUTHOR_EMAIL"); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Setenv("GIT_COMMITTER_NAME", "   "); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Unsetenv("GIT_COMMITTER_EMAIL"); err != nil {
+		t.Fatal(err)
+	}
+	restore := installGitIdentity()
+	if got := os.Getenv("GIT_AUTHOR_NAME"); got != "Deploy Bot" {
+		t.Fatalf("GIT_AUTHOR_NAME = %q, want the configured value to be preserved", got)
+	}
+	if got := os.Getenv("GIT_AUTHOR_EMAIL"); got != executor.DefaultGitAuthorEmail {
+		t.Fatalf("GIT_AUTHOR_EMAIL = %q, want the shared default", got)
+	}
+	if got := os.Getenv("GIT_COMMITTER_NAME"); got != executor.DefaultGitAuthorName {
+		t.Fatalf("GIT_COMMITTER_NAME = %q, want the shared default for a blank value", got)
+	}
+	if got := os.Getenv("GIT_COMMITTER_EMAIL"); got != executor.DefaultGitAuthorEmail {
+		t.Fatalf("GIT_COMMITTER_EMAIL = %q, want the shared default", got)
+	}
+	restore()
+	if got := os.Getenv("GIT_AUTHOR_NAME"); got != "Deploy Bot" {
+		t.Fatalf("after restore GIT_AUTHOR_NAME = %q, want the prior value back", got)
+	}
+	if _, set := os.LookupEnv("GIT_AUTHOR_EMAIL"); set {
+		t.Fatal("after restore GIT_AUTHOR_EMAIL is set, want it returned to unset")
+	}
+	if got := os.Getenv("GIT_COMMITTER_NAME"); got != "   " {
+		t.Fatalf("after restore GIT_COMMITTER_NAME = %q, want the prior blank value back", got)
+	}
+	if _, set := os.LookupEnv("GIT_COMMITTER_EMAIL"); set {
+		t.Fatal("after restore GIT_COMMITTER_EMAIL is set, want it returned to unset")
 	}
 }
