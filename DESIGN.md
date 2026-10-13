@@ -1350,10 +1350,22 @@ that needs Dispatch-side queue exclusion. Where supported, discovery passes
 retained same-source work IDs as opaque exclusions when the Dispatch client is
 explicitly opted in; exclusion support defaults off and must be enabled only
 after deployment has confirmed the Dispatch contract. Enabled requests are
-bounded to 32 unique valid entries of 300 characters each, and every response
-must acknowledge `prFixExclusions.version: 1` before either a task or idle result
-is processed. Missing or malformed acknowledgements fail closed without retry or
-side effects. Exclusions are dedupe hints, not claims or ownership. While
+bounded to 32 unique valid entries of 300 characters each. The runner orders
+exclusions most-relevant-first — pre-terminal runs before terminal retained
+runs (whose attempts are usually settled; ranking is a truncation heuristic,
+not settlement authority, and a terminal run with a still-pending report ranks
+with the retained group), newest first within each group — so when more entries
+qualify than the cap allows, the client keeps the most relevant head and drops
+the tail with a warning instead of failing closed (#286); an exclusion overflow
+must degrade discovery, not starve it. Progress after truncation is a
+two-sided contract: Dispatch's per-agent, per-generation handout ledger scans
+past candidates the agent was already handed, and Courier's same-identity
+dedupe absorbs any re-offered truncated-out generation without materializing a
+duplicate run. Every response must acknowledge `prFixExclusions.version: 1`
+before either a task or idle result is processed. Missing or malformed
+acknowledgements fail
+closed without retry or side effects. Exclusions are dedupe hints, not claims
+or ownership. While
 discovery is paused, Dispatch `next-task` and stale-item bookkeeping are
 deferred until a later poll.
 
@@ -2528,3 +2540,19 @@ was superseded.
   Closed-unmerged terminalization and the
   `Failed`/`NeedsHuman` retention window stay with #251's children.
   (#250, #179, #251)
+
+- **2026-10-12 — #286: exclusion overflow degrades by truncation, not failure.**
+  Retained dispatch CoderRuns with `followup-pr` work-item IDs grew past
+  Dispatch's 32-entry PR-fix exclusion cap, and the client's fail-closed
+  overflow error turned every 30s discovery cycle into an error, starving all
+  lanes because most retained runs were terminal zombies the Dispatch queue
+  had already settled. The cap is a Dispatch server contract and stays.
+  Courier's runner now orders exclusions most-relevant-first — pre-terminal
+  runs before terminal retained runs, newest first within each group; ranking
+  is a truncation heuristic, not settlement authority — and the Dispatch
+  client keeps the first 32 unique valid entries, dropping the tail with a
+  warning. Progress after truncation is two-sided: Dispatch's per-agent,
+  per-generation handout ledger scans past already-handed candidates, and
+  Courier's same-identity dedupe absorbs any re-offered truncated-out
+  generation without materializing a duplicate run. Malformed
+  descriptors still fail closed. (#286)

@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -99,12 +100,60 @@ func TestHTTPClientDiscoverExcludingBoundsFilteredUniqueKeys(t *testing.T) {
 	if _, err := client.DiscoverExcluding(context.Background(), []source.WorkItem{{ID: legacy}}); err != nil {
 		t.Fatal(err)
 	}
-	items := make([]source.WorkItem, 33)
-	for i := range items {
-		items[i].ID = EncodeWorkID(Task{Type: "followup-pr", PullRequest: &PullRequest{Repo: "acme/widgets", Number: i + 1}, PRFixItem: &PRFixItem{ID: "q", Generation: 1}})
+}
+
+func TestHTTPClientDiscoverExcludingTruncatesToContractMaximum(t *testing.T) {
+	const total = 40
+	want := make([]string, 0, maxPRFixExclusions)
+	items := make([]source.WorkItem, 0, total)
+	for i := 1; i <= total; i++ {
+		value := fmt.Sprintf("acme/widgets#%d@1", i)
+		if len(want) < maxPRFixExclusions {
+			want = append(want, value)
+		}
+		items = append(items, source.WorkItem{ID: EncodeWorkID(Task{Type: "followup-pr", PullRequest: &PullRequest{Repo: "acme/widgets", Number: i}, PRFixItem: &PRFixItem{ID: "q", Generation: 1}})})
 	}
-	if _, err := client.DiscoverExcluding(context.Background(), items); err == nil {
-		t.Fatal("33 filtered unique entries accepted")
+	var gets int
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gets++
+		if !reflect.DeepEqual(r.URL.Query()["exclude_pr_fix"], want) {
+			t.Fatalf("exclude_pr_fix = %#v, want the first %d entries in order", r.URL.Query()["exclude_pr_fix"], maxPRFixExclusions)
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{"type": "idle", "shouldRun": false, "prFixExclusions": map[string]any{"version": 1, "skipped": []any{}}})
+	}))
+	defer server.Close()
+	client, err := NewClientWithLane(server.URL, "worker", "cloud", "token", time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	client.WithPRFixExclusions(true)
+	if _, err := client.DiscoverExcluding(context.Background(), items); err != nil {
+		t.Fatal(err)
+	}
+	if gets != 1 {
+		t.Fatalf("GET count = %d, want 1", gets)
+	}
+}
+
+func TestHTTPClientDiscoverExcludingKeepsExactContractMaximum(t *testing.T) {
+	items := make([]source.WorkItem, 0, maxPRFixExclusions)
+	for i := 1; i <= maxPRFixExclusions; i++ {
+		items = append(items, source.WorkItem{ID: EncodeWorkID(Task{Type: "followup-pr", PullRequest: &PullRequest{Repo: "acme/widgets", Number: i}, PRFixItem: &PRFixItem{ID: "q", Generation: 1}})})
+	}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if got := len(r.URL.Query()["exclude_pr_fix"]); got != maxPRFixExclusions {
+			t.Fatalf("exclude_pr_fix count = %d, want %d", got, maxPRFixExclusions)
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{"type": "idle", "shouldRun": false, "prFixExclusions": map[string]any{"version": 1, "skipped": []any{}}})
+	}))
+	defer server.Close()
+	client, err := NewClientWithLane(server.URL, "worker", "cloud", "token", time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	client.WithPRFixExclusions(true)
+	if _, err := client.DiscoverExcluding(context.Background(), items); err != nil {
+		t.Fatal(err)
 	}
 }
 

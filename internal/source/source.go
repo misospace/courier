@@ -143,7 +143,10 @@ type WorkIdentifier interface {
 }
 
 // DiscoveryExcluder optionally discovers work while excluding retained items.
-// Exclusions remain opaque to the source-neutral runner.
+// Exclusions remain opaque to the source-neutral runner; they are ordered
+// most-relevant-first — runs that have not settled with their source before
+// terminal retained runs, newest first within each group — so an adapter with
+// a bounded exclusion window can drop from the tail (#286).
 type DiscoveryExcluder interface {
 	DiscoverExcluding(context.Context, []WorkItem) ([]WorkItem, error)
 }
