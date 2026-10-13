@@ -281,13 +281,14 @@ capacity. `Pending` becomes actionable only when it is compared against
 capacity:
 
 - `Pending` with reservations below concurrency and a healthy source → normal
-  transient queuing.
+  transient queuing; the same holds at or above concurrency while the lane
+  shows a `Claimed` transition in the window — busy, still transient.
 - `Pending` while `courier_coderuns_in_flight == courier_lane_concurrency` →
   every slot is genuinely held; blocked on capacity (an availability fact, not
   a failure).
-- `Pending` while a slot is free (`courier_coderuns_in_flight <
-  courier_lane_concurrency`) yet it is not admitted and admission shows no
-  progress → the wedge of §5, not capacity.
+- `Pending` while the lane is not suspended, a slot is free
+  (`courier_coderuns_in_flight < courier_lane_concurrency`) yet it is not
+  admitted and admission shows no progress → the wedge of §5, not capacity.
 - `Pending` while `courier_lane_suspended == 1` → blocked on a suspended lane.
 
 The view must render `Pending` with its age and the lane state that explains it;
