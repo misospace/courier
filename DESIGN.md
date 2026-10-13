@@ -1079,6 +1079,20 @@ the world. `courier_metrics_scrape_errors_total` counts scrape failures. Scrapin
 is opt-in: the chart's `serviceMonitor.enabled` renders a metrics `Service` and a
 Prometheus Operator `ServiceMonitor`, off by default.
 
+**Portable views and alerts (#292).**
+[docs/observability-dashboards-and-alerts.md](./docs/observability-dashboards-and-alerts.md)
+specifies the backend-neutral dashboard information architecture and alert
+catalogue that render the signals above: source health, lane capacity, run
+execution and outcomes, lifecycle reporting, retention, and optional connector
+panels. It separates the portable specification from optional executable
+dashboard/rule assets, names the evaluator an OTel-based integration must
+supply (OTLP is transport, not an alert engine), and records the
+instrumentation gaps — no discovery, reservation, lifecycle-report, or
+retention metrics — that a later instrumentation decision must close before
+those views exist. #290 owns the signal/health semantics and #291 the connector
+diagnostics this layer consumes; neither is required for a Courier dashboard to
+be useful standalone.
+
 ### Per-run telemetry (#172)
 
 The executor already relays the coordinator's stdout through a pass-through tap,
@@ -1660,6 +1674,28 @@ named items remain unresolved and must not be described as production-ready:
   specific to the OpenCode telemetry path) and delegates the reason-shrink
   step to the shared helper; the control uses the shared helper
   end-to-end. (#210, #188)
+- **2026-10-13 — #292: Courier's dashboard views and alert conditions are
+  specified backend-neutrally, and assets are optional renderings.** The
+  portable specification is
+  [docs/observability-dashboards-and-alerts.md](./docs/observability-dashboards-and-alerts.md):
+  a six-section dashboard information architecture (source health, lane
+  capacity, run execution/outcomes, lifecycle reporting, retention, optional
+  connector panels) and an alert catalogue that states each condition's
+  evidence, window, threshold rationale, recovery, severity, expected action,
+  and behaviour under missing telemetry, startup, disabled sources, empty
+  queues, and low traffic. Prometheus and VictoriaMetrics share one
+  PromQL-compatible mapping; OTel is transport and must name an evaluator
+  (a rules engine — the Collector alone is not an alert evaluator); any other
+  backend may implement the same views and conditions, with no promise of
+  identical assets or feature parity. Idle is not failure, discovery failure
+  is distinguishable from an empty queue, and no Courier health condition
+  requires Dispatch telemetry. The design records the existing instrumentation
+  (`internal/controller/metrics.go`, `internal/log/events.go`, `CoderRun`
+  status) and the gaps — discovery, reservation, lifecycle-report, and
+  retention signals are absent — so no exporter or dependency is chosen before
+  those gaps are settled. This is design only: no code, dashboard JSON,
+  executable rules, exporter dependencies, or deployment manifests, and no
+  instrumentation work is authorized. (#292, #289, #290, #291)
 - **2026-10-12 — #249: one executor-neutral acceptance-criterion evidence
   contract is enforced in both publication paths against a revision-pinned
   trusted snapshot of the source issue.** Admission reads the source issue
