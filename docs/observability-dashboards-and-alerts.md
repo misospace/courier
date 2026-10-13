@@ -16,8 +16,8 @@ stack. It has three child designs, each owning a distinct layer:
 
 - **#290 — source-agnostic telemetry and health semantics.** Owns the signal
   catalogue and the state/health model: what is measured, in what units, with
-  which counter/gauge/reset semantics, and what "healthy", "idle", "degraded",
-  and "unknown" mean. Courier core is source-agnostic, so #290 defines a
+  which counter/gauge/reset semantics, and what `ok`, `idle`, `degraded`,
+  `unavailable`, and `unknown` mean. Courier core is source-agnostic, so #290 defines a
   source-level health view that exists even when discovery produces no
   `CoderRun`.
 - **#291 — connector diagnostics without core coupling.** Owns adapter-owned
@@ -28,8 +28,9 @@ stack. It has three child designs, each owning a distinct layer:
 - **#292 — this document.** Owns the **dashboard information architecture** and
   the **alert catalogue**: the views an operator should see, the health
   conditions worth alerting on, and how any backend renders them. It consumes
-  #290's semantics and #291's connector signals; where those are not yet
-  settled, this document states the dependency rather than inventing a signal.
+  #290's semantics and #291's connector signals; where a sibling has settled a
+  dependency, this document consumes it, and where one leaves an explicit
+  unknown, this document states the dependency rather than inventing a signal.
 
 **In scope.** A backend-neutral view catalogue (source health, lane capacity,
 run execution and outcomes, lifecycle reporting, retention, optional connector
@@ -119,7 +120,7 @@ check fingerprints; and publication state (`Branch`, `HeadRepo`, `HeadSHA`,
 `WorkIdentifier`, `DiscoveryExcluder`, and `PreLauncher` interfaces. The
 discovery runner (`internal/source/runner.go`) polls every 30s and pauses when
 the lane is missing, suspended, or at capacity, logging those transitions. It
-logs a discovery error at `internal/source/runner.go:68,79`.
+logs a discovery error at `internal/source/runner.go:69,80`.
 
 **Retention** (`internal/controller/reap.go`): resolved `Done` runs are deleted
 after five minutes via the `courier.misospace.dev/done-at` annotation.
@@ -184,8 +185,10 @@ no runs.
 
 **Idle vs failure.** A source that is enabled, has capacity, and repeatedly
 discovers nothing is **idle**, not failing. A source whose discovery call errors
-is **degraded**. These must render differently: idle is a normal steady state
-(no alert), degraded is actionable (alert, section 4). The distinction is lost
+is **degraded**, becoming **unavailable** once no success falls within the
+window (#290's source-state model). These must render differently: idle is a
+normal steady state (no alert), degraded and unavailable are actionable (alert,
+section 4). The distinction is lost
 today because both produce zero runs and only the error path logs.
 
 ### 3.2 Lane capacity
@@ -268,7 +271,7 @@ absence must not affect any panel above.
 
 | Panel | Intent | Backing signals | Portable semantics | Empty / unknown | Status |
 | --- | --- | --- | --- | --- | --- |
-| Connector availability | Is the connector reachable? | connector diagnostics (#291) | up/down/latency | not configured ⇒ panel hidden | #291 |
+| Connector availability | Is the connector reachable? | connector diagnostics (#291) | availability state (`available`/`degraded`/`unreachable`, per #291) and latency | not configured ⇒ panel hidden | #291 |
 | Exclusion pressure | Is discovery excluding work? | connector diagnostics (#291) | exclusion count vs configured limit (limit as data, not a baked constant) | unsupported ⇒ "unsupported", not "ok" | #291 |
 | Capability negotiation | Does the connector support a feature? | `capability.status` log, connector diagnostics (#291) | supported/unsupported/unknown per capability | absent ⇒ "unknown" | #291 |
 | Protocol errors | Connector-specific failures | connector diagnostics (#291) | counts by error class | unsupported ⇒ "unsupported" | #291 |
@@ -298,7 +301,7 @@ Common rules that apply to every alert:
 
 | Field | Value |
 | --- | --- |
-| Condition | A source's discovery error ratio exceeds the threshold while the lane is enabled and has free capacity |
+| Condition | A source's discovery error ratio exceeds the threshold while the lane is enabled, the binding is not paused (neither `lane-suspended` nor `lane-at-capacity`), and it has free capacity |
 | Evidence | discovery attempt/failure counters per source (gap); `source discovery failed` log lines |
 | Window | 3× the configured poll interval (default 90s at the 30s poll) |
 | Threshold rationale | One failed poll can be a transient API blip; three consecutive windows with capacity available indicates a persistent supply failure |
@@ -307,7 +310,7 @@ Common rules that apply to every alert:
 | Expected action | inspect the connector/provider, credentials, and rate limits; check whether the lane is intentionally suspended. If this is the only configured source, treat it as page-worthy (paging policy, not severity) |
 | Missing telemetry | without discovery counters, fall back to log-based detection; if logs are not collected, this alert is **unavailable** (not silently green) |
 | Startup | suppressed for the first N windows after controller start to avoid a cold-start false positive |
-| Disabled source | does not fire (source disabled) |
+| Disabled source | does not fire (source disabled); a paused binding (`lane-suspended` / `lane-at-capacity`) likewise does not fire — pausing is orthogonal to source health |
 | Empty queue | this alert fires precisely because discovery *failed*, independent of whether work was returned |
 | Low traffic | unaffected; it measures failure, not volume |
 
@@ -541,13 +544,31 @@ implicitly OK:
 **Open questions** (owned by sibling designs; this document consumes the
 answers):
 
-- The exact discovery attempt/success/failure signal names and units (#290).
-- The state model that separates idle from degraded at the source level (#290).
-- Connector capability-negotiation representation and how dashboards discover
-  optional capabilities (#291).
-- Whether reservation staleness is a first-class signal or derived (#290).
-- Whether per-phase timing and token metrics are exported, and with which
-  bounded dimensions (#290).
+Settled by the siblings on their current heads and consumed here, no longer
+open:
+
+- Discovery attempt/success/failure signal names and units — settled by #290
+  (`courier_source_discovery_attempts_total`, `..._successes_total`,
+  `..._failures_total`, with `..._skipped_total` and `..._paused_total` for
+  pre-call skips).
+- The source-level state model separating idle from degraded — settled by #290
+  (`disabled`/`starting`/`ok`/`degraded`/`unavailable`/`unknown`, with pausing
+  orthogonal).
+- Connector capability negotiation and how dashboards discover optional
+  capabilities — settled by #291 (negotiation states plus a
+  `courier_connector_capability_info` discovery procedure).
+- Reservation staleness as a first-class condition — settled by #290 as a
+  condition backed by a reservation-age signal.
+- Per-phase timing and token metrics with bounded dimensions — settled by #290
+  (`courier_coderun_phase_duration_seconds` by `lane`/`mode`/`phase`;
+  `courier_coderun_tokens_total` by `lane`/`mode`/`kind`).
+
+Still open on the siblings' own unknown lists, and consumed as such:
+
+- Whether reservation staleness is defined by age alone or refined by
+  no-progress (#290).
+- Whether per-phase duration and token counters ship in a first cut or after
+  the discovery/lane layer (#290).
 
 ## 8. Units, aggregation, and reset semantics
 
