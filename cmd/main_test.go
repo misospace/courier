@@ -9,6 +9,7 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+	"time"
 
 	courierv1alpha1 "github.com/misospace/courier/api/v1alpha1"
 	"github.com/misospace/courier/internal/controller"
@@ -16,6 +17,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 )
 
@@ -282,6 +284,43 @@ func TestValidateEvidenceFlags(t *testing.T) {
 			}
 		})
 	}
+}
+
+// stalledReader mimics an API server that accepts the connection but never
+// answers: every Get blocks until the caller's context ends.
+type stalledReader struct{ client.Reader }
+
+func (stalledReader) Get(ctx context.Context, _ client.ObjectKey, _ client.Object, _ ...client.GetOption) error {
+	<-ctx.Done()
+	return ctx.Err()
+}
+
+func TestStartupReadsSurfaceDeadlineErrors(t *testing.T) {
+	reader := stalledReader{}
+
+	t.Run("evidence intake key read", func(t *testing.T) {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Millisecond)
+		defer cancel()
+		_, err := loadEvidenceKey(ctx, reader, "courier-system", "courier-evidence-key")
+		if !errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("loadEvidenceKey() error = %v, want a deadline-exceeded error", err)
+		}
+		if !strings.Contains(err.Error(), "read evidence intake key Secret courier-system/courier-evidence-key") {
+			t.Fatalf("loadEvidenceKey() error = %q, want it to name the failing read", err)
+		}
+	})
+
+	t.Run("GitHub observer read", func(t *testing.T) {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Millisecond)
+		defer cancel()
+		_, err := githubObserver(ctx, reader, "courier-system", "courier-github", "", "", "")
+		if !errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("githubObserver() error = %v, want a deadline-exceeded error", err)
+		}
+		if !strings.Contains(err.Error(), "read GitHub credential Secret courier-system/courier-github") {
+			t.Fatalf("githubObserver() error = %q, want it to name the failing read", err)
+		}
+	})
 }
 
 func TestLoadEvidenceKey(t *testing.T) {

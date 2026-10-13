@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -99,12 +100,60 @@ func TestHTTPClientDiscoverExcludingBoundsFilteredUniqueKeys(t *testing.T) {
 	if _, err := client.DiscoverExcluding(context.Background(), []source.WorkItem{{ID: legacy}}); err != nil {
 		t.Fatal(err)
 	}
-	items := make([]source.WorkItem, 33)
-	for i := range items {
-		items[i].ID = EncodeWorkID(Task{Type: "followup-pr", PullRequest: &PullRequest{Repo: "acme/widgets", Number: i + 1}, PRFixItem: &PRFixItem{ID: "q", Generation: 1}})
+}
+
+func TestHTTPClientDiscoverExcludingTruncatesToContractMaximum(t *testing.T) {
+	const total = 40
+	want := make([]string, 0, maxPRFixExclusions)
+	items := make([]source.WorkItem, 0, total)
+	for i := 1; i <= total; i++ {
+		value := fmt.Sprintf("acme/widgets#%d@1", i)
+		if len(want) < maxPRFixExclusions {
+			want = append(want, value)
+		}
+		items = append(items, source.WorkItem{ID: EncodeWorkID(Task{Type: "followup-pr", PullRequest: &PullRequest{Repo: "acme/widgets", Number: i}, PRFixItem: &PRFixItem{ID: "q", Generation: 1}})})
 	}
-	if _, err := client.DiscoverExcluding(context.Background(), items); err == nil {
-		t.Fatal("33 filtered unique entries accepted")
+	var gets int
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gets++
+		if !reflect.DeepEqual(r.URL.Query()["exclude_pr_fix"], want) {
+			t.Fatalf("exclude_pr_fix = %#v, want the first %d entries in order", r.URL.Query()["exclude_pr_fix"], maxPRFixExclusions)
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{"type": "idle", "shouldRun": false, "prFixExclusions": map[string]any{"version": 1, "skipped": []any{}}})
+	}))
+	defer server.Close()
+	client, err := NewClientWithLane(server.URL, "worker", "cloud", "token", time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	client.WithPRFixExclusions(true)
+	if _, err := client.DiscoverExcluding(context.Background(), items); err != nil {
+		t.Fatal(err)
+	}
+	if gets != 1 {
+		t.Fatalf("GET count = %d, want 1", gets)
+	}
+}
+
+func TestHTTPClientDiscoverExcludingKeepsExactContractMaximum(t *testing.T) {
+	items := make([]source.WorkItem, 0, maxPRFixExclusions)
+	for i := 1; i <= maxPRFixExclusions; i++ {
+		items = append(items, source.WorkItem{ID: EncodeWorkID(Task{Type: "followup-pr", PullRequest: &PullRequest{Repo: "acme/widgets", Number: i}, PRFixItem: &PRFixItem{ID: "q", Generation: 1}})})
+	}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if got := len(r.URL.Query()["exclude_pr_fix"]); got != maxPRFixExclusions {
+			t.Fatalf("exclude_pr_fix count = %d, want %d", got, maxPRFixExclusions)
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{"type": "idle", "shouldRun": false, "prFixExclusions": map[string]any{"version": 1, "skipped": []any{}}})
+	}))
+	defer server.Close()
+	client, err := NewClientWithLane(server.URL, "worker", "cloud", "token", time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	client.WithPRFixExclusions(true)
+	if _, err := client.DiscoverExcluding(context.Background(), items); err != nil {
+		t.Fatal(err)
 	}
 }
 
@@ -433,6 +482,59 @@ func TestHTTPClientDiscoverMarksMergedFollowupStale(t *testing.T) {
 	}
 	if request["repo"] != "acme/widgets" || request["pr"] != float64(42) || request["status"] != "STALE" || request["generation"] != float64(1) {
 		t.Fatalf("stale request = %#v", request)
+	}
+}
+
+func TestHTTPClientPreLaunchStaleGenerationMismatchMapsToSuperseded(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/pr-fix-queue/mark" {
+			t.Fatalf("unexpected path %q", r.URL.Path)
+		}
+		w.WriteHeader(http.StatusConflict)
+		_, _ = w.Write([]byte(`{"error":"PR fix queue item generation mismatch: expected generation 1 did not match the item's current generation"}`))
+	}))
+	defer server.Close()
+
+	client, err := NewClientWithLane(server.URL, "worker", "normal", "secret-token", time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	client.WithPullRequestStateChecker(PullRequestStateCheckerFunc(func(context.Context, string, int) (PullRequestState, error) {
+		return PullRequestState{State: "closed"}, nil
+	}))
+	id := EncodeWorkID(Task{Type: "followup-pr", PullRequest: &PullRequest{Repo: "acme/widgets", Number: 42}, PRFixItem: &PRFixItem{ID: "queue-item", Generation: 1}})
+	if err := client.PreLaunch(context.Background(), id); !errors.Is(err, source.ErrSuperseded) {
+		t.Fatalf("PreLaunch() error = %v, want ErrSuperseded", err)
+	}
+}
+
+func TestHTTPClientDiscoverStaleGenerationMismatchMapsToSuperseded(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/agents/worker/next-task":
+			_ = json.NewEncoder(w).Encode(Task{Type: "followup-pr", ShouldRun: true, PullRequest: &PullRequest{Repo: "acme/widgets", Number: 42}, PRFixItem: &PRFixItem{ID: "queue-item", Generation: 1}})
+		case "/api/pr-fix-queue/mark":
+			w.WriteHeader(http.StatusConflict)
+			_, _ = w.Write([]byte(`{"error":"PR fix queue item generation mismatch: expected generation 1 did not match the item's current generation"}`))
+		default:
+			t.Fatalf("unexpected path %q", r.URL.Path)
+		}
+	}))
+	defer server.Close()
+
+	client, err := NewClientWithLane(server.URL, "worker", "normal", "secret-token", time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	client.WithPullRequestStateChecker(PullRequestStateCheckerFunc(func(context.Context, string, int) (PullRequestState, error) {
+		return PullRequestState{State: "closed", Merged: true}, nil
+	}))
+	items, err := client.Discover(context.Background())
+	if !errors.Is(err, source.ErrSuperseded) {
+		t.Fatalf("Discover() error = %v, want ErrSuperseded", err)
+	}
+	if len(items) != 0 {
+		t.Fatalf("items = %#v, want no work", items)
 	}
 }
 
