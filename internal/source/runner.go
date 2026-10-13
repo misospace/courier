@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -138,7 +139,13 @@ func (r *Runner) Poll(ctx context.Context) error {
 		r.laneAtCapacity = false
 	}
 
-	exclusions := make([]WorkItem, 0, len(runs.Items))
+	type rankedExclusion struct {
+		item      WorkItem
+		unsettled bool
+		created   metav1.Time
+		name      string
+	}
+	ranked := make([]rankedExclusion, 0, len(runs.Items))
 	for i := range runs.Items {
 		run := &runs.Items[i]
 		if strings.TrimSpace(run.Spec.WorkItemID) == "" {
@@ -155,13 +162,35 @@ func (r *Runner) Poll(ctx context.Context) error {
 			retainedSource = retainedSource || run.Spec.Source == "dispatch" || strings.HasPrefix(run.Spec.Source, "dispatch:")
 		}
 		if retainedSource {
-			exclusions = append(exclusions, WorkItem{
-				ID:   run.Spec.WorkItemID,
-				Mode: string(run.Spec.Mode),
-				Repo: run.Spec.Repo,
-				Ref:  run.Spec.Ref,
+			ranked = append(ranked, rankedExclusion{
+				item: WorkItem{
+					ID:   run.Spec.WorkItemID,
+					Mode: string(run.Spec.Mode),
+					Repo: run.Spec.Repo,
+					Ref:  run.Spec.Ref,
+				},
+				unsettled: phaseUnsettled(run.Status.Phase),
+				created:   run.CreationTimestamp,
+				name:      run.Name,
 			})
 		}
+	}
+	// Most-relevant-first: a bounded exclusion window drops the tail, so
+	// pre-terminal runs (which have not yet published the report that usually
+	// settles their source attempt) outrank terminal retained runs, and newer
+	// work outranks older work within each group.
+	sort.Slice(ranked, func(i, j int) bool {
+		if ranked[i].unsettled != ranked[j].unsettled {
+			return ranked[i].unsettled
+		}
+		if !ranked[i].created.Time.Equal(ranked[j].created.Time) {
+			return ranked[i].created.Time.After(ranked[j].created.Time)
+		}
+		return ranked[i].name < ranked[j].name
+	})
+	exclusions := make([]WorkItem, 0, len(ranked))
+	for i := range ranked {
+		exclusions = append(exclusions, ranked[i].item)
 	}
 	var items []WorkItem
 	var err error
@@ -291,6 +320,21 @@ func (r *Runner) identity(workItemID string) string {
 		}
 	}
 	return workItemID
+}
+
+// phaseUnsettled reports whether a retained run has not yet reached a terminal
+// phase. It is a ranking heuristic for discovery-exclusion order, not
+// settlement authority: terminal runs have usually published the lifecycle
+// report that settles their source attempt, but a terminal run can still owe a
+// pending report, and ranking cannot change what settles. Verifying is
+// included, unlike capacity reservation, because exclusion relevance tracks
+// settlement, not execution slots.
+func phaseUnsettled(phase courierv1alpha1.Phase) bool {
+	switch phase {
+	case "", courierv1alpha1.PhasePending, courierv1alpha1.PhaseClaimed, courierv1alpha1.PhaseRunning, courierv1alpha1.PhaseVerifying:
+		return true
+	}
+	return false
 }
 
 // laneCapacityReservations conservatively counts empty-phase and Pending runs as

@@ -143,6 +143,14 @@ func main() {
 
 	ctrl.SetLogger(zap.New(zap.UseFlagOptions(&opts)))
 
+	// The pre-start credential Secret reads below use the manager's API
+	// reader. An API server that accepts the connection but never answers
+	// would otherwise wedge startup forever with no log line, so both reads
+	// share one deadline (in the same spirit as --dispatch-http-timeout).
+	// A timeout fails closed like every other setup path; it adds no retry.
+	startupCtx, cancelStartup := context.WithTimeout(context.Background(), startupReadTimeout)
+	defer cancelStartup()
+
 	mgr, err := ctrl.NewManager(ctrl.GetConfigOrDie(), ctrl.Options{
 		Scheme:                 scheme,
 		Metrics:                metricsserver.Options{BindAddress: metricsAddr},
@@ -213,7 +221,7 @@ func main() {
 			os.Exit(1)
 		}
 		podNamespace := strings.TrimSpace(os.Getenv("POD_NAMESPACE"))
-		key, err := loadEvidenceKey(context.Background(), mgr.GetAPIReader(), podNamespace, evidenceIntakeKeySecret)
+		key, err := loadEvidenceKey(startupCtx, mgr.GetAPIReader(), podNamespace, evidenceIntakeKeySecret)
 		if err != nil {
 			setupLog.Error(err, "unable to configure evidence capture")
 			os.Exit(1)
@@ -248,7 +256,7 @@ func main() {
 		os.Exit(1)
 	}
 
-	githubObserver, err := githubObserver(context.Background(), mgr.GetAPIReader(), os.Getenv("POD_NAMESPACE"), githubCredentialSecret, githubTokenKey, gitCredentialSecret, gitTokenKey)
+	githubObserver, err := githubObserver(startupCtx, mgr.GetAPIReader(), os.Getenv("POD_NAMESPACE"), githubCredentialSecret, githubTokenKey, gitCredentialSecret, gitTokenKey)
 	if err != nil {
 		setupLog.Error(err, "unable to configure GitHub observer")
 		os.Exit(1)
@@ -374,6 +382,7 @@ func main() {
 		}
 		secure.Client = mgr.GetClient()
 		secure.Patcher = reconciler
+		secure.MaxRestarts = reconciler.MaxRestarts
 		reconciler.Secure = secure
 	}
 	if err := reconciler.SetupWithManager(mgr); err != nil {
@@ -605,6 +614,9 @@ type secureConfig struct {
 const (
 	defaultsHarnessImage = "ghcr.io/misospace/courier-harness:latest"
 	defaultsProbeImage   = "busybox:1.36"
+	// startupReadTimeout bounds the pre-start credential Secret reads so a
+	// stalled API server surfaces as a setup error instead of a silent hang.
+	startupReadTimeout = 30 * time.Second
 )
 
 // buildSecureControl loads and validates the provider registry, rejects

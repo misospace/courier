@@ -53,24 +53,28 @@ const (
 // maxTerminationReasonBytes bounds the termination reason. The kubelet caps
 // termination message files, and an oversized payload would truncate the
 // structured result; the reason carries names, categories, and short
-// diagnostics, never full model output.
+// diagnostics, never full model output. The marshaled line is then
+// budgeted against executor.MaxTerminationLineBytes by handoff, so a
+// reason that survives boundReason but inflates under JSON escaping is
+// still cut by the shared line fit (#210).
 const maxTerminationReasonBytes = 1200
 
-// terminationTruncationSuffix marks a reason cut to the byte bound. boundReason
-// reserves room for it so the result stays within maxTerminationReasonBytes.
-const terminationTruncationSuffix = "…[truncated]"
-
 // boundReason bounds the reason to maxTerminationReasonBytes, splitting only
-// on a rune boundary so the trusted reason remains valid UTF-8.
+// on a rune boundary so the trusted reason remains valid UTF-8. It reuses the
+// shared executor.TerminationTruncationSuffix marker so every COURIER_TERMINATION
+// producer (this path, the legacy courier-executor, the operator's
+// boundedDiagnosticReason) ends the truncated reason on the same bytes.
 func boundReason(reason string) string {
 	if len(reason) <= maxTerminationReasonBytes {
 		return reason
 	}
-	limit := maxTerminationReasonBytes - len(terminationTruncationSuffix)
+	limit := maxTerminationReasonBytes - len(executor.TerminationTruncationSuffix)
+	// Never split a multi-byte rune: back off only over the UTF-8
+	// continuation bytes at the cut point.
 	for limit > 0 && !utf8.ValidString(reason[:limit]) {
 		limit--
 	}
-	return reason[:limit] + terminationTruncationSuffix
+	return reason[:limit] + executor.TerminationTruncationSuffix
 }
 
 func main() {
@@ -257,16 +261,25 @@ func terminationFor(result executor.HarnessResult) termination {
 }
 
 // handoff writes the structured termination payload to stdout and the
-// termination file, then exits with the payload's exit code.
+// termination file, then exits with the payload's exit code. The whole
+// line is bounded by the Kubernetes pod termination-message budget
+// (4 KiB): a reason built from capability detail strings can inflate
+// under JSON escaping, and a truncated line loses the entire handoff —
+// the same risk the legacy executor's fit path defends against (#188).
+// The shared executor.MarshalTerminationLine / FitTerminationLine are the
+// single marshaling and line-fit path every COURIER_TERMINATION producer
+// uses so the wire prefix, the budget, and the truncation marker cannot
+// drift between them (#210).
 func handoff(payload termination) error {
-	data, err := json.Marshal(payload)
-	if err != nil {
-		return err
+	line := executor.FitTerminationLine(&payload)
+	if line == "" {
+		// A marshal failure leaves no handoff line; write nothing rather
+		// than an empty line that would truncate the termination file.
+		return nil
 	}
-	fmt.Printf("COURIER_TERMINATION %s\n", data)
+	fmt.Print(line)
 	if path := os.Getenv("COURIER_TERMINATION_FILE"); path != "" {
-		prefixed := append([]byte("COURIER_TERMINATION "), data...)
-		if err := os.WriteFile(path, prefixed, 0o600); err != nil {
+		if err := os.WriteFile(path, []byte(line), 0o600); err != nil {
 			return fmt.Errorf("courier-control: write termination file: %w", err)
 		}
 	}
