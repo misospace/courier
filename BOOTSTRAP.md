@@ -70,6 +70,33 @@ remain with a human maintainer.
 Provider or gateway environment variables can be placed in another Secret and
 selected with `--executor-environment-secret`.
 
+## Commit identity (#317)
+
+Coordinator pods commit work in a fresh clone, so they always receive a git
+author and committer identity. Four operator flags configure it:
+`--git-author-name`, `--git-author-email`, `--git-committer-name`, and
+`--git-committer-email`. An unset, empty, or whitespace-only flag falls back
+to the explicit default `Courier <courier@localhost>`, keeping default
+behavior backward compatible. Configured values are validated at operator
+startup and again at pod generation: no control characters or angle brackets,
+and a non-empty email must contain `@` with no whitespace.
+
+Precedence differs by path, deliberately. On the operator path the rendered
+values are explicit container environment variables, so they win over
+same-named keys in `--executor-environment-secret` (Kubernetes gives explicit
+env precedence over `envFrom`). The standalone executor keeps the opposite
+order: a non-empty `GIT_*` value already in its environment — a shell export
+or a Secret key — is preserved, and only unset or blank names receive the
+default.
+
+Commit authorship is separate from forge authentication and from commit
+signing: nothing derives identity from a token, and Courier hard-codes no
+particular account upstream. GitHub links a commit to an account only when
+the email is associated with that account — a verified account email or the
+exact `<id>+<login>@users.noreply.github.com` address — so a deployment that
+wants its commits attributed to its bot sets the flags to that verified
+address, not to a guessed one.
+
 ## Failure evidence (#115)
 
 When evidence capture is enabled, the operator persists a bounded snapshot of a
