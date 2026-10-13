@@ -222,15 +222,30 @@ func (s *SecureControl) ResolveAdmission(ctx context.Context, run *courier.Coder
 		// body is read through the provider's typed work-item read on the
 		// operator's read identity — never through model input — and the
 		// acceptance-criterion set extracted from it is frozen into the
-		// policy beside the source-issue identity. An issue without a
-		// recognizable Acceptance section pins an empty set (linkage remains
-		// the only PR-body contract); an ambiguous or over-bound body fails
-		// closed here so an unpinnable contract never becomes an unchecked
-		// one. The pin is revision-pinned by content: later issue edits do
-		// not mutate a live run's policy.
-		workItem, err := admission.Provider.ReadWorkItem(ctx, forge.WorkItemRef{Repo: canonical.Canonical, ID: strconv.Itoa(run.Spec.Ref)})
+		// policy beside the source-issue identity. The response's own
+		// identity is verified against the request first: a misrouted or
+		// inconsistent provider answer must never pin issue B's criteria as
+		// issue A's contract. An issue without a recognizable Acceptance
+		// section pins an empty set (linkage remains the only PR-body
+		// contract); an ambiguous or over-bound body fails closed here so
+		// an unpinnable contract never becomes an unchecked one. The pin is
+		// revision-pinned by content: later issue edits do not mutate a
+		// live run's policy.
+		source := forge.WorkItemRef{Repo: canonical.Canonical, ID: strconv.Itoa(run.Spec.Ref)}
+		workItem, err := admission.Provider.ReadWorkItem(ctx, source)
 		if err != nil {
 			return nil, nil, transientOrNeedsHuman(err, "ProviderRead", "source issue %d read for %q failed: %v", run.Spec.Ref, canonical.Canonical, err)
+		}
+		returnedNumber, err := strconv.Atoi(strings.TrimSpace(workItem.ID))
+		if err != nil || returnedNumber != run.Spec.Ref {
+			return nil, nil, secureNeedsHuman("ProviderRead",
+				"source issue read for %q returned work item %q; the trusted issue number is %d",
+				canonical.Canonical, workItem.ID, run.Spec.Ref)
+		}
+		if !strings.EqualFold(workItem.Repo, canonical.Canonical) {
+			return nil, nil, secureNeedsHuman("ProviderRead",
+				"source issue read for %q returned a work item for %q; repository identity mismatch",
+				canonical.Canonical, workItem.Repo)
 		}
 		owner, name, ok := splitOwnerName(canonical.Canonical)
 		if !ok {

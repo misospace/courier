@@ -163,8 +163,11 @@ func (p *Provider) CanWriteRepository(ctx context.Context, repository forge.Repo
 
 // ReadWorkItem reads one issue by number. The reference ID is the issue
 // number as a decimal string — the identity admission already pins in the
-// immutable spec. The issues API also serves pull requests; a pull-request
-// response is refused rather than laundered into an issue read.
+// immutable spec. The response's own identity is verified against the
+// request: a response naming a different or missing number is refused, so a
+// misrouted or inconsistent answer can never stand in for the requested
+// issue. The issues API also serves pull requests; a pull-request response
+// is refused rather than laundered into an issue read.
 func (p *Provider) ReadWorkItem(ctx context.Context, ref forge.WorkItemRef) (forge.WorkItem, error) {
 	owner, repo, err := splitRepository(ref.Repo)
 	if err != nil {
@@ -177,6 +180,9 @@ func (p *Provider) ReadWorkItem(ctx context.Context, ref forge.WorkItemRef) (for
 	issue, err := p.client.GetIssue(ctx, owner, repo, number)
 	if err != nil {
 		return forge.WorkItem{}, boundaryError(err)
+	}
+	if issue.Number != number {
+		return forge.WorkItem{}, fmt.Errorf("GitHub issue read for %d returned number %d; the response does not name the requested issue", number, issue.Number)
 	}
 	if issue.PullRequest != nil {
 		return forge.WorkItem{}, fmt.Errorf("GitHub work item %d is a pull request, not an issue", number)

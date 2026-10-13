@@ -481,4 +481,14 @@ func TestCoordinatorLauncherProjectsCriteriaEnvelope(t *testing.T) {
 	if err := launcher.Launch(context.Background(), corrupt); err == nil {
 		t.Fatal("a corrupt criterion pin must fail the launch")
 	}
+
+	// Orphaned pin fields are corruption, not a silent downgrade to the
+	// pre-contract state: criteria left without an issue identity or set
+	// digest must fail the launch instead of quietly omitting the envelope.
+	orphaned := run.DeepCopy()
+	orphaned.Status.PublicationPolicy.SourceIssue = nil
+	orphaned.Status.PublicationPolicy.AcceptanceCriteriaDigest = ""
+	if err := launcher.Launch(context.Background(), orphaned); err == nil {
+		t.Fatal("orphaned criterion pin fields must fail the launch")
+	}
 }

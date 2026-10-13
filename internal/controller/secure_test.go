@@ -497,6 +497,28 @@ func TestResolveAdmissionCriteriaFailClosed(t *testing.T) {
 			t.Fatalf("error = %v, want NeedsHuman ProviderCapability", err)
 		}
 	})
+
+	// The response's identity is checked against the request before
+	// anything is pinned: a provider returning another issue's number, a
+	// number-less answer, or a different repository must never stand in for
+	// the trusted source issue.
+	identityMismatch := map[string]forge.WorkItem{
+		"wrong issue number": {ID: "13", Repo: "misospace/miso-gallery", Body: "## Acceptance\n- someone else's criterion\n"},
+		"number-less answer": {ID: "", Repo: "misospace/miso-gallery", Body: "## Acceptance\n- someone else's criterion\n"},
+		"wrong repository":   {ID: "502", Repo: "other/repo", Body: "## Acceptance\n- someone else's criterion\n"},
+	}
+	for name, item := range identityMismatch {
+		t.Run(name, func(t *testing.T) {
+			provider := criteriaForge(t, "## Acceptance\n- one\n")
+			provider.issues["misospace/miso-gallery#502"] = item
+			control := criteriaControl(t, provider)
+			_, _, err := control.ResolveAdmission(context.Background(), criteriaRun())
+			var permanent *SecureNeedsHumanError
+			if !errors.As(err, &permanent) || permanent.Reason != "ProviderRead" {
+				t.Fatalf("error = %v, want NeedsHuman ProviderRead", err)
+			}
+		})
+	}
 }
 
 func TestResolveAdmissionFailsClosed(t *testing.T) {

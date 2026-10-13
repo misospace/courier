@@ -314,9 +314,10 @@ func TestProviderUnsupportedOperations(t *testing.T) {
 }
 
 // ReadWorkItem is the typed trusted issue read admission pins criteria from
-// (#280): the reference ID is the decimal issue number, the response is the
-// issue's title/body/state, and a pull-request response is refused rather
-// than laundered into an issue.
+// (#280): the reference ID is the decimal issue number, the response's own
+// number must equal the requested one (a misrouted or number-less response
+// is refused), the payload is the issue's title/body/state, and a
+// pull-request response is refused rather than laundered into an issue.
 func TestProviderReadWorkItem(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
@@ -325,6 +326,12 @@ func TestProviderReadWorkItem(t *testing.T) {
 			_, _ = io.WriteString(w, `{"number":502,"title":"Package the assets","body":"## Acceptance\n- built image contains the PNGs","state":"open","html_url":"https://github.com/acme/demo/issues/502"}`)
 		case "/repos/acme/demo/issues/9":
 			_, _ = io.WriteString(w, `{"number":9,"title":"a pull request in disguise","pull_request":{"url":"https://api.github.com/repos/acme/demo/pulls/9"}}`)
+		case "/repos/acme/demo/issues/10":
+			// A response naming a different number than the one requested.
+			_, _ = io.WriteString(w, `{"number":11,"title":"wrong issue","body":"- unrelated"}`)
+		case "/repos/acme/demo/issues/11":
+			// A number-less response decodes to zero.
+			_, _ = io.WriteString(w, `{"title":"no number","body":"- unrelated"}`)
 		default:
 			http.NotFound(w, r)
 		}
@@ -352,6 +359,12 @@ func TestProviderReadWorkItem(t *testing.T) {
 	}
 	if _, err := p.ReadWorkItem(ctx, forge.WorkItemRef{Repo: "acme/demo", ID: "9"}); err == nil {
 		t.Fatal("a pull-request response must not be returned as a work item")
+	}
+	if _, err := p.ReadWorkItem(ctx, forge.WorkItemRef{Repo: "acme/demo", ID: "10"}); err == nil {
+		t.Fatal("a response naming a different number than requested must be refused")
+	}
+	if _, err := p.ReadWorkItem(ctx, forge.WorkItemRef{Repo: "acme/demo", ID: "11"}); err == nil {
+		t.Fatal("a number-less response must be refused")
 	}
 	if _, err := p.ReadWorkItem(ctx, forge.WorkItemRef{Repo: "acme/demo", ID: "not-a-number"}); err == nil {
 		t.Fatal("a non-numeric work item ID must be rejected")

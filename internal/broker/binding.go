@@ -110,12 +110,12 @@ func PolicyFromRun(run *v1alpha1.CoderRun, providerConfigRef, canonicalSpecRepo 
 				return Policy{}, errors.New("broker binding: persisted source-issue identity does not match the spec-derived identity")
 			}
 		}
+		// CriterionSetFromPolicy owns the pin-tuple integrity: only the
+		// fully absent tuple is a pre-contract policy; anything partial or
+		// tampered fails the binding here.
 		set, pinned, err := CriterionSetFromPolicy(persisted)
 		if err != nil {
 			return Policy{}, err
-		}
-		if !pinned && persisted.SourceIssue != nil {
-			return Policy{}, errors.New("broker binding: source-issue identity pinned without a criterion set")
 		}
 		if pinned {
 			policy.Criteria = set
@@ -141,16 +141,26 @@ func PolicyFromRun(run *v1alpha1.CoderRun, providerConfigRef, canonicalSpecRepo 
 }
 
 // CriterionSetFromPolicy reconstructs the pinned acceptance-criterion set
-// from a persisted publication policy. pinned is false when no set was
-// pinned — fix-pr runs and policies admitted before the criterion contract
-// (#280) — which is a legal state, not an error. A pinned set is verified
-// like every other policy field: each criterion's digest is recomputed from
-// its persisted text, IDs must remain the extraction ordinals, and the set
-// digest is recomputed over the trusted issue identity plus every criterion
-// digest in order. A tampered or corrupted pin fails closed instead of
-// becoming the target a publication boundary validates against.
+// from a persisted publication policy. pinned is false only when the pin
+// tuple is fully absent — no source identity, no criteria, no set digest —
+// which is the legal pre-contract state for fix-pr runs and policies
+// admitted before #280. Any orphaned combination (criteria or identity
+// without a digest, digest without an identity) is corruption and fails
+// closed rather than silently downgrading to an unpinned policy. A pinned
+// set is verified like every other policy field: each criterion's digest is
+// recomputed from its persisted text, IDs must remain the extraction
+// ordinals, and the set digest is recomputed over the trusted issue
+// identity plus every criterion digest in order. A tampered or corrupted
+// pin fails closed instead of becoming the target a publication boundary
+// validates against.
 func CriterionSetFromPolicy(persisted *v1alpha1.PublicationPolicy) (set CriterionSet, pinned bool, err error) {
-	if persisted == nil || persisted.AcceptanceCriteriaDigest == "" {
+	if persisted == nil {
+		return CriterionSet{}, false, nil
+	}
+	if persisted.AcceptanceCriteriaDigest == "" {
+		if persisted.SourceIssue != nil || len(persisted.AcceptanceCriteria) > 0 {
+			return CriterionSet{}, false, errors.New("broker binding: orphaned criterion pin fields: a pre-contract policy must carry no source identity, no criteria, and no set digest")
+		}
 		return CriterionSet{}, false, nil
 	}
 	if persisted.SourceIssue == nil {

@@ -277,6 +277,13 @@ func TestPolicyFromRunRejectsCorruptCriterionPins(t *testing.T) {
 			p.AcceptanceCriteria = nil
 			p.AcceptanceCriteriaDigest = ""
 		},
+		"criteria without issue or set digest": func(p *v1alpha1.PublicationPolicy) {
+			p.SourceIssue = nil
+			p.AcceptanceCriteriaDigest = ""
+		},
+		"criteria without digest but with identity": func(p *v1alpha1.PublicationPolicy) {
+			p.AcceptanceCriteriaDigest = ""
+		},
 	}
 	for name, corrupt := range tamper {
 		t.Run(name, func(t *testing.T) {
