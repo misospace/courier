@@ -122,6 +122,21 @@ type CoderRunReconciler struct {
 	// Zero uses the package default.
 	DoneRetention time.Duration
 
+	// FailedRetention is how long a Failed run is kept before deletion, once
+	// its lifecycle report has reached a positive, settled state. Zero uses the
+	// package default.
+	FailedRetention time.Duration
+
+	// NeedsHumanRetention is how long a NeedsHuman run is kept before deletion,
+	// once its lifecycle report has reached a positive, settled state. Zero
+	// uses the package default.
+	NeedsHumanRetention time.Duration
+
+	// TerminalAuditKeep is the number of most recent terminal runs per
+	// repository the reaper always retains, even past their retention window.
+	// Zero uses the package default; a negative value disables the floor.
+	TerminalAuditKeep int
+
 	// LivenessWindow is how long a Running run may go without a heartbeat before
 	// it is considered wedged and reaped. Zero uses the package default.
 	LivenessWindow time.Duration
@@ -258,6 +273,23 @@ func (r *CoderRunReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 				return ctrl.Result{}, nil
 			}
 			return r.observeMergedReviewPR(ctx, &run)
+		}
+		if run.Status.Phase == courierv1alpha1.PhaseFailed || run.Status.Phase == courierv1alpha1.PhaseNeedsHuman {
+			// A Failed or NeedsHuman run is reaped only once its source
+			// lifecycle report reached a positive, settled state: while the
+			// report is pending the run is the only durable retry intent, and a
+			// missing, Unknown, or False condition proves nothing. Such a run
+			// is parked without a timer; the report-retry path above re-arms a
+			// pending report, and an operator settles a missing condition.
+			if !lifecycleReportSettled(&run) {
+				l.V(1).Info("terminal run observed without a positively settled LifecycleReported; leaving for retention",
+					"phase", run.Status.Phase, "lifecycleReported", lifecycleReportConditionState(&run))
+				return ctrl.Result{}, nil
+			}
+			if run.Status.Phase == courierv1alpha1.PhaseFailed {
+				return r.reapTerminal(ctx, &run, failedAtAnnotation, r.failedRetention(), true)
+			}
+			return r.reapTerminal(ctx, &run, needsHumanAtAnnotation, r.needsHumanRetention(), true)
 		}
 		l.V(1).Info("reconcile", "phase", run.Status.Phase)
 		return ctrl.Result{}, nil
@@ -613,9 +645,10 @@ func (r *CoderRunReconciler) observeRunning(ctx context.Context, run *courierv1a
 	// The secure topology's operator-owned observation runs before the
 	// coordinator-termination handler below: a terminated control pod must
 	// fence its worker and take the broker down in the same reconcile that
-	// terminalizes the run. Terminal runs are never reaped, so fencing left
-	// to a later reconcile would never run at all — the untrusted executor
-	// and the credentialed broker would outlive their supervisor.
+	// terminalizes the run. A terminal run is never relaunched, and an
+	// AwaitingReview, HandedOff, or BlockedExternal run is never reaped, so fencing left to a
+	// later reconcile could never run at all — the untrusted executor and the
+	// credentialed broker would outlive their supervisor indefinitely.
 	if r.Secure != nil {
 		securePods := make([]corev1.Pod, 0, len(pods.Items))
 		for i := range pods.Items {

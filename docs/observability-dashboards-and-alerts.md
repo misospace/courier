@@ -124,9 +124,13 @@ logs a discovery error at `internal/source/runner.go:69,80`.
 
 **Retention** (`internal/controller/reap.go`): resolved `Done` runs are deleted
 after five minutes via the `courier.misospace.dev/done-at` annotation.
-`Failed`/`NeedsHuman` retention (seven days, per-phase annotations) is designed
-in DESIGN.md ("Terminal retention and closed-unmerged PRs") but not yet wired
-into the reaper; `HandedOff` is not reaped.
+`Failed`/`NeedsHuman` runs are reaped after their seven-day default, measured
+from the `courier.misospace.dev/failed-at` and
+`courier.misospace.dev/needs-human-at` annotations, only once the lifecycle
+report reached a positive settled state, and never out of the per-repository
+audit floor; the reaper emits `courier_coderuns_reap_requests_total` (accepted
+delete requests) and `courier_coderuns_oldest_terminal_age_seconds` (age of the
+oldest retained terminal run per phase). `HandedOff` is not reaped.
 
 ### Instrumentation gaps
 
@@ -143,8 +147,9 @@ decision needs, and the reason several views below are marked "gap".
 - **Lifecycle reporting:** no counter of report outcomes (published,
   superseded, unsupported, retryable) or report failures, and no report
   latency histogram.
-- **Retention:** no metric of reaped runs by retention class, and no gauge of
-  retained-run backlog.
+- **Retention:** `courier_coderuns_reap_requests_total` and
+  `courier_coderuns_oldest_terminal_age_seconds` exist, but there is no gauge of
+  retained-run backlog (a count of terminal runs by phase).
 - **Per-phase timing:** run duration is only observed at the terminal
   transition; there is no histogram of time spent in each non-terminal phase.
 - **Liveness:** `Restarts` is in status but not exported; no restart-cause
@@ -257,15 +262,18 @@ stuck?*
 | Panel | Intent | Backing signals | Portable semantics | Empty / unknown | Status |
 | --- | --- | --- | --- | --- | --- |
 | Retained-run backlog | How many terminal runs persist | `CoderRun` list / count gauge (gap) | runs by terminal phase | none ⇒ zero | **gap** |
-| Reap rate | Runs reclaimed over time | reaped counters (gap) | rate by retention class | — | **gap** |
-| Oldest retained run | Is retention progressing? | per-phase annotations (gap for export) | age of oldest retained terminal run | none ⇒ "none retained" | **gap** |
+| Reap rate | Runs reclaimed over time | `courier_coderuns_reap_requests_total` | rate of accepted delete requests by retention class | — | status |
+| Oldest retained run | Is retention progressing? | `courier_coderuns_oldest_terminal_age_seconds` | age of oldest retained terminal run per phase | none ⇒ "none retained" | status |
 | Stuck retention | Runs past window but not reaped | annotations + `LifecycleReported` (gap) | count past window with unsettled report | — | **gap** |
 
-The retention design bounds `Done` (five minutes) and, once wired,
+The retention design bounds `Done` (five minutes) and
 `Failed`/`NeedsHuman` (seven days); `HandedOff` is explicitly out of scope
-there. A growing retained backlog is the observable symptom of the class of
-failure that motivated the umbrella design (#289), so it belongs on the
-dashboard even though it is currently uninstrumented.
+there. The reap counter counts delete requests the API server accepted, so a
+secure run held by its topology finalizer is still counted there; the age gauge
+is what shows such a run is still retained. A growing retained backlog is the
+observable symptom of the class of failure that motivated the umbrella design
+(#289), so it belongs on the dashboard even though its count is currently
+uninstrumented.
 
 ### 3.6 Optional connector panels
 
