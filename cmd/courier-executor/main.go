@@ -1944,12 +1944,17 @@ func (r reporter) applyLinkagePlan(ctx context.Context, continuations int, maxCo
 	return linkageVerdict{ContinueMsg: linkageRepairMessage(r.sourceIssue(), linkOutcome, next), PRNumber: linkOutcome.pr.Number}
 }
 
+// installGitIdentity supplies the default git identity for any GIT_* variable
+// the process does not already carry. A deployment-provided value — a shell
+// export or a key of the executor environment Secret — always wins; only
+// unset or blank names fall back, so the standalone path overrides without an
+// operator (or upstream) hard-coding a particular account (#317).
 func installGitIdentity() func() {
 	defaults := map[string]string{
-		"GIT_AUTHOR_NAME":     "Courier",
-		"GIT_AUTHOR_EMAIL":    "courier@localhost",
-		"GIT_COMMITTER_NAME":  "Courier",
-		"GIT_COMMITTER_EMAIL": "courier@localhost",
+		"GIT_AUTHOR_NAME":     executor.DefaultGitAuthorName,
+		"GIT_AUTHOR_EMAIL":    executor.DefaultGitAuthorEmail,
+		"GIT_COMMITTER_NAME":  executor.DefaultGitAuthorName,
+		"GIT_COMMITTER_EMAIL": executor.DefaultGitAuthorEmail,
 	}
 	type previousValue struct {
 		value string

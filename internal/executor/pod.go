@@ -52,12 +52,19 @@ type PodConfig struct {
 	GitHubCredentialSecret string
 	GitHubTokenKey         string
 	EnvironmentSecret      string
-	GitHubMCPURL           string
-	Context7MCPURL         string
-	MetricsMCPURL          string
-	BootstrapBinary        string
-	OpenCode               OpenCode
-	Resources              corev1.ResourceRequirements
+	// Git is the author/committer identity rendered into the generated
+	// pod's explicit container environment (#317). Empty fields resolve
+	// to the explicit default identity. Because explicit container env
+	// beats the envFrom EnvironmentSecret, a configured identity always
+	// wins over same-named keys in that Secret; the standalone executor
+	// keeps the opposite order (its environment wins, then the default).
+	Git             GitIdentity
+	GitHubMCPURL    string
+	Context7MCPURL  string
+	MetricsMCPURL   string
+	BootstrapBinary string
+	OpenCode        OpenCode
+	Resources       corev1.ResourceRequirements
 	// EvidenceURL, EvidenceToken, and EvidenceNonce enable bounded
 	// failure-evidence capture. Capture is all-or-nothing: all three must
 	// be set together, and leaving them empty keeps the pod on the kubelet's
@@ -82,6 +89,7 @@ func DefaultPodConfig() PodConfig {
 		WorkspacePath:   "/workspace",
 		GitRemoteURL:    "https://github.com/%s.git",
 		BaseBranch:      "main",
+		Git:             DefaultGitIdentity(),
 		BootstrapBinary: "/usr/local/bin/courier-executor",
 		OpenCode:        DefaultOpenCode(),
 	}
@@ -354,7 +362,7 @@ func podEnvironment(invocation Invocation, executorName string, config PodConfig
 	// Validate and the launcher both check the trimmed URL, so the pod env
 	// must carry the trimmed value too: a caller that bypasses the launcher
 	// must not be able to pad the intake URL with whitespace.
-	values := toKubernetesEnv(EnvironmentWithConfig(invocation, executorName, remoteURL, baseRemoteURL, config.BaseBranch, config.OpenCode.Binary, config.OpenCode.Format, terminationFile, config.OpenCode.Agent, strings.TrimSpace(config.EvidenceURL), config.EvidenceNonce))
+	values := toKubernetesEnv(EnvironmentWithConfig(invocation, executorName, remoteURL, baseRemoteURL, config.BaseBranch, config.OpenCode.Binary, config.OpenCode.Format, terminationFile, config.OpenCode.Agent, strings.TrimSpace(config.EvidenceURL), config.EvidenceNonce, config.Git))
 	values = append(values,
 		corev1.EnvVar{
 			Name:  "OPENCODE_CONFIG",
@@ -487,6 +495,9 @@ func (c PodConfig) Validate() error {
 	}
 	if pathsOverlap(c.WorkspacePath, toolchainReferencePath) {
 		return errors.New("executor: workspace path must not overlap the toolchain reference path")
+	}
+	if err := c.Git.Validate(); err != nil {
+		return err
 	}
 	// Capture is all-or-nothing. A half-configured evidence setup (for example
 	// a nonce without the URL and token) would hand the intake a token it
