@@ -74,28 +74,36 @@ selected with `--executor-environment-secret`.
 
 When evidence capture is enabled, the operator persists a bounded snapshot of a
 failed run's unrecoverable workspace state — uncommitted edits, local commits
-not on the run branch — as Kubernetes Secrets owned by the `CoderRun`. The
-mechanism is invisible when disabled.
+not on the run branch — as Kubernetes Secrets owned by the `CoderRun`.
+
+The mechanism is off by default and invisible when off. With no
+`--evidence-intake-*` flags, and with the chart's default
+`evidence.enabled: false`, the operator binds no intake listener, coordinator
+pods receive no evidence environment and keep the kubelet's default
+termination grace, the operator writes and deletes no evidence Secrets, and
+run behavior is otherwise unchanged.
 
 The design contract is in DESIGN.md § "Failure evidence for dirty runs
 (#115)". The coordinator-pod wiring (#199) is implemented: with the intake
-key and service configured, coordinator pods receive the evidence URL, a
-per-incarnation token and nonce, their pod UID, and a 45-second termination
-grace. The executor capture (#197 capture core, #198 executor triggers) is
-implemented: armed runs capture and POST gated failure evidence. The
-operator's intake listener (#200) is implemented: with the bind configured,
-the operator runs its own in-process listener that re-verifies a POSTed
-bundle and persists it as a Secret. The settings gate the mechanism together:
-with the bind empty nothing is persisted, and with the key or service empty
-runs are never armed.
+key and service configured, an armed coordinator pod receives
+`COURIER_EVIDENCE_URL`, `COURIER_EVIDENCE_TOKEN`, `COURIER_EVIDENCE_NONCE`,
+and `COURIER_POD_UID`, and is given a 45-second termination grace so a SIGTERM
+capture can finish before the kubelet force-kills it. The executor capture
+(#197 capture core, #198 executor triggers) is implemented: armed runs capture
+and POST gated failure evidence. The operator's intake listener (#200) is
+implemented: with the bind configured, the operator runs its own in-process
+listener that re-verifies a POSTed bundle and persists it as a Secret. The
+settings gate the mechanism together: with the bind empty nothing is
+persisted, and with the key or service empty runs are never armed.
 
 Enable it with three settings on the operator:
 
 - `--evidence-intake-bind` (for example `:8082`): binds the operator's own
   write-only intake listener in-process. Empty leaves the listener off, so
-  nothing is captured. The chart renders the `courier-evidence` ClusterIP
-  Service that coordinator pods reach it on; optionally restrict its ingress to
-  coordinator pods with a NetworkPolicy.
+  nothing is captured. The chart renders the `<release>-evidence` ClusterIP
+  Service (named after the Helm release, so `courier-evidence` for a release
+  named `courier`) that routes port 80 to the listener port; optionally
+  restrict its ingress to coordinator pods with a NetworkPolicy.
 - `--evidence-intake-key-secret`: name of a Secret in the operator namespace
   whose `key` entry holds a random HMAC key (for example
   `openssl rand -hex 32`). The operator derives each run's evidence token
@@ -107,30 +115,65 @@ Enable it with three settings on the operator:
   the Secret or its `key` entry is missing.
 - `--evidence-intake-service`: the URL coordinators are told to POST to.
   Wiring coordinator pods requires it together with
-  `--evidence-intake-key-secret`; the chart derives a default from the
-  `courier-evidence` Service when it is not set.
+  `--evidence-intake-key-secret`; when it is not set the chart derives
+  `http://<release>-evidence.<release-namespace>.svc`.
 
-The operator's Role grants `create`, `get`, `list`, `patch`, and `delete` on
-`secrets`, scoped to the operator's own namespaces (a namespaced grant, not a
-cluster-wide one) to persist bundles and derive the `EvidenceCaptured` condition
-(see DESIGN.md, Security and boundaries, for what that grant means). The chart
-renders that Role only when `evidence.enabled` is true, so passing
-`--evidence-intake-*` args by hand with `evidence.enabled=false` starts the
-intake without the RBAC it needs. Evidence Secrets carry the label
-`courier.misospace.dev/evidence: <run>`, one per coordinator pod incarnation,
-and are garbage-collected with the run; the operator also deletes them when a
-run reaches `AwaitingReview` or `Done` — the states where its own world
-observation has proven the work landed — while a `Verifying` run that falls to
-`NeedsHuman` keeps its evidence. A
-terminal run with any evidence Secret shows the `EvidenceCaptured` condition;
-the condition is informational — retrieve by label, never by condition.
+The chart renders a namespaced `evidence` Role and RoleBinding (named
+`<release>-evidence`) that grant the operator `create`, `get`, `list`, `patch`,
+and `delete` on `secrets` in the namespace they render in — the operator's own
+namespace, which is where bootstrap runs and their evidence Secrets live. That
+grant is what persists bundles and derives the `EvidenceCaptured` condition.
+It is deliberately a namespaced Role rather than part of the generated operator
+ClusterRole, whose ClusterRoleBinding would widen the evidence verbs
+cluster-wide and tie them to an install that has evidence disabled. The
+residual is that the generated ClusterRole already grants `create`, `delete`,
+`get`, and `list` on `secrets` cluster-wide for the secure-mode launcher, so
+against a shipped install the evidence Role's marginal verb is `patch`, which
+the intake needs to supersede a slot it already wrote. See DESIGN.md
+§ Security and boundaries for the same boundary and its residual. The chart
+renders the Role and binding only when `evidence.enabled` is true. Passing
+`--evidence-intake-*` args by hand with `evidence.enabled=false` leaves the
+intake without the evidence Role: the launcher's ClusterRole grant still covers
+the first persist, the listing, and the cleanup, so what breaks is the intake's
+supersede of a slot it already wrote. Evidence Secrets carry the label
+`courier.misospace.dev/evidence: <run>` — the value is the run name sanitized
+to a DNS label, hash-suffixed when the name is too long to fit one — one per
+coordinator pod incarnation, and are garbage-collected with the run; the
+operator also deletes them when a run reaches `AwaitingReview` or `Done` — the
+states where its own world observation has proven the work landed — while a
+`Verifying` run that falls to `NeedsHuman` keeps its evidence. A run in
+`Failed`, `NeedsHuman`, or `BlockedExternal` with at least one evidence Secret
+shows the `EvidenceCaptured` condition (`True`, reason `Captured`); the
+condition is informational — retrieve by label, never by condition.
+
+Evidence Secrets are ordinary Secrets: readable by anything in the namespace
+that holds the run, and stored however the cluster stores them. Courier does
+not encrypt them itself — encryption at rest is the deployment's etcd
+configuration, and enabling it is recommended. Access control is the
+deployment's namespace RBAC: keep `get` on Secrets where runs live limited to
+the subjects that need it, and account for the operator's own reach over them —
+the secure-launcher ClusterRole grant above plus the chart's namespaced
+`credential-reader` Role, which already gives it `get` on every Secret in that
+namespace. The intake listener is write-only: it has no read path, and a capture
+token authenticates only its own incarnation's slot, so a compromised
+coordinator can write that slot and nothing else.
 
 Retrieval and application are manual, and the content is model-authored
-untrusted data — treat it like a patch from an untrusted contributor:
+untrusted data — review it before applying anything, never execute it, and
+never let a tool or retry apply it unattended. Treat it like a patch from an
+untrusted contributor. What the bundle can hold is bounded: content matching a
+registered credential is withheld, and binary and over-limit content is never
+stored at all — the manifest names it as present-but-not-preserved, and once
+the pod is gone it is unrecoverable. A manifest alone is never a recoverable
+patch.
 
 ```sh
-# one Secret per pod incarnation; the manifest names what was captured and
-# what was withheld (secrets, binary, over-limit content is never stored)
+# one Secret per pod incarnation, named courier-evidence-<run>-<inc> where
+# <inc> is the first 8 hex characters of that incarnation's nonce (a long run
+# name is truncated and hash-suffixed in both the Secret name and the label
+# value, so list by label rather than guess a name);
+# the manifest names what was captured and what was withheld (credentials,
+# binary, and over-limit content are never stored)
 kubectl -n courier-system get secrets -l courier.misospace.dev/evidence=<run>
 kubectl -n courier-system get secret courier-evidence-<run>-<inc> \
   -o jsonpath='{.data.manifest\.json}' | base64 -d
@@ -140,9 +183,11 @@ kubectl -n courier-system get secret courier-evidence-<run>-<inc> \
 kubectl -n courier-system get secret courier-evidence-<run>-<inc> \
   -o jsonpath='{.data.bundle\.tar\.gz}' | base64 -d | tar -tzf -
 
-# extract OUTSIDE any checkout, never as root. This command is safe only
-# because the intake already rejected absolute and `..` entry paths and
-# symlink members — never generalize it to arbitrary untrusted tars
+# extract OUTSIDE any checkout, never as root, into a directory you create
+# first. This command is safe only because the intake already rejected absolute
+# and `..` entry paths and symlink members — never generalize it to arbitrary
+# untrusted tars
+mkdir -p /tmp/evidence-<run>
 kubectl -n courier-system get secret courier-evidence-<run>-<inc> \
   -o jsonpath='{.data.bundle\.tar\.gz}' | base64 -d | tar -xzf - -C /tmp/evidence-<run>
 ```
@@ -150,8 +195,8 @@ kubectl -n courier-system get secret courier-evidence-<run>-<inc> \
 Review the extracted files, apply the chosen ones to a fresh checkout with
 `git apply`, and publish through normal human review. Evidence is never
 adopted automatically: a #97 retry is a fresh attempt, never a restoration of
-the old checkout, and deleting a `NeedsHuman` run deletes its evidence —
-retrieve before deleting.
+the old checkout, and deleting a `NeedsHuman` run deletes its evidence with it
+— retrieve before deleting.
 
 To enable native Dispatch discovery, configure the chart's `dispatch` values and
 create the referenced Secret with the `DISPATCH_AGENT_TOKEN` value under the
