@@ -442,13 +442,13 @@ func (c *HTTPClient) markPRFixStale(ctx context.Context, pullRequest *PullReques
 	if state.Merged {
 		note = "upstream pull request is merged"
 	}
-	return c.do(ctx, http.MethodPost, "/api/pr-fix-queue/mark", map[string]any{
+	return asSuperseded(c.do(ctx, http.MethodPost, "/api/pr-fix-queue/mark", map[string]any{
 		"repo":       pullRequest.Repo,
 		"pr":         pullRequest.Number,
 		"status":     "STALE",
 		"note":       note,
 		"generation": generation,
-	}, nil)
+	}, nil))
 }
 
 func (c *HTTPClient) reportTaskWithPR(ctx context.Context, d workDescriptor, outcome, failure, observedPR, idempotencyKey string, telemetry json.RawMessage, startedAt *time.Time) error {

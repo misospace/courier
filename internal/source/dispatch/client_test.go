@@ -485,6 +485,59 @@ func TestHTTPClientDiscoverMarksMergedFollowupStale(t *testing.T) {
 	}
 }
 
+func TestHTTPClientPreLaunchStaleGenerationMismatchMapsToSuperseded(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/pr-fix-queue/mark" {
+			t.Fatalf("unexpected path %q", r.URL.Path)
+		}
+		w.WriteHeader(http.StatusConflict)
+		_, _ = w.Write([]byte(`{"error":"PR fix queue item generation mismatch: expected generation 1 did not match the item's current generation"}`))
+	}))
+	defer server.Close()
+
+	client, err := NewClientWithLane(server.URL, "worker", "normal", "secret-token", time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	client.WithPullRequestStateChecker(PullRequestStateCheckerFunc(func(context.Context, string, int) (PullRequestState, error) {
+		return PullRequestState{State: "closed"}, nil
+	}))
+	id := EncodeWorkID(Task{Type: "followup-pr", PullRequest: &PullRequest{Repo: "acme/widgets", Number: 42}, PRFixItem: &PRFixItem{ID: "queue-item", Generation: 1}})
+	if err := client.PreLaunch(context.Background(), id); !errors.Is(err, source.ErrSuperseded) {
+		t.Fatalf("PreLaunch() error = %v, want ErrSuperseded", err)
+	}
+}
+
+func TestHTTPClientDiscoverStaleGenerationMismatchMapsToSuperseded(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/agents/worker/next-task":
+			_ = json.NewEncoder(w).Encode(Task{Type: "followup-pr", ShouldRun: true, PullRequest: &PullRequest{Repo: "acme/widgets", Number: 42}, PRFixItem: &PRFixItem{ID: "queue-item", Generation: 1}})
+		case "/api/pr-fix-queue/mark":
+			w.WriteHeader(http.StatusConflict)
+			_, _ = w.Write([]byte(`{"error":"PR fix queue item generation mismatch: expected generation 1 did not match the item's current generation"}`))
+		default:
+			t.Fatalf("unexpected path %q", r.URL.Path)
+		}
+	}))
+	defer server.Close()
+
+	client, err := NewClientWithLane(server.URL, "worker", "normal", "secret-token", time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	client.WithPullRequestStateChecker(PullRequestStateCheckerFunc(func(context.Context, string, int) (PullRequestState, error) {
+		return PullRequestState{State: "closed", Merged: true}, nil
+	}))
+	items, err := client.Discover(context.Background())
+	if !errors.Is(err, source.ErrSuperseded) {
+		t.Fatalf("Discover() error = %v, want ErrSuperseded", err)
+	}
+	if len(items) != 0 {
+		t.Fatalf("items = %#v, want no work", items)
+	}
+}
+
 func TestHTTPClientDiscoverRejectsFollowupWithoutStateChecker(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		_ = json.NewEncoder(w).Encode(Task{Type: "followup-pr", ShouldRun: true, PullRequest: &PullRequest{Repo: "acme/widgets", Number: 42}, PRFixItem: &PRFixItem{ID: "queue-item", Generation: 1}})
