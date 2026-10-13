@@ -555,7 +555,14 @@ func TestCoordinatorLauncherReportsProvisioningInFlightWhenExistingPodReadErrors
 				return apierrors.NewAlreadyExists(schema.GroupResource{Group: "", Resource: "pods"}, obj.GetName())
 			},
 			Get: func(ctx context.Context, c client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
-				return transient
+				// Fail only the pod re-read that verifies the collision;
+				// the earlier LaneProfile Get must still succeed or Launch
+				// returns the transient error before reaching the collision
+				// branch.
+				if _, ok := obj.(*corev1.Pod); ok {
+					return transient
+				}
+				return c.Get(ctx, key, obj, opts...)
 			},
 		}).
 		WithRuntimeObjects(run, lane).
