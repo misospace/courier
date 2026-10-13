@@ -94,10 +94,12 @@ func (w *StatusWriter) Write(ctx context.Context, identity StatusIdentity, patch
 		patch.AddOperation == nil && patch.ClearOperation == "" && !patch.ReconcileOperations && patch.ControlRequestAck == nil {
 		return fmt.Errorf("empty harness status patch")
 	}
-	// An acknowledgement names the request it acknowledges; an empty ID is a
-	// malformed request, refused before any live read.
-	if patch.ControlRequestAck != nil && patch.ControlRequestAck.ID == "" {
-		return fmt.Errorf("control request acknowledgement carries no request ID")
+	// An acknowledgement names the request it acknowledges and carries its
+	// timestamp; either missing is a malformed request, refused before any
+	// live read so a definite denial never reaches the CAS path and is
+	// miscategorized as transient availability.
+	if patch.ControlRequestAck != nil && (patch.ControlRequestAck.ID == "" || patch.ControlRequestAck.At.IsZero()) {
+		return fmt.Errorf("control request acknowledgement is malformed")
 	}
 	if patch.LastCommit != nil && validate == nil {
 		return fmt.Errorf("lastCommit requires live-world validation")

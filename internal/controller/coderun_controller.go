@@ -681,6 +681,11 @@ func (r *CoderRunReconciler) observeRunning(ctx context.Context, run *courierv1a
 	return ctrl.Result{}, nil
 }
 
+// maxSoftStopRequestIDLength mirrors the CRD's controlRequest.id maxLength:
+// an annotation value beyond it can never be stamped, so ingress skips it
+// instead of failing the reconcile.
+const maxSoftStopRequestIDLength = 128
+
 // softStopDisarmMessage is the fixed operator message a SoftStopObserved
 // condition carries for a request its named incarnation never acknowledged
 // (#238), and the record of which annotation value that disarmed request
@@ -721,6 +726,13 @@ func softStopDisarmed(run *courierv1alpha1.CoderRun, id string) bool {
 // status.controlRequest and never charges or relaunches the run.
 func (r *CoderRunReconciler) syncSoftStop(ctx context.Context, run *courierv1alpha1.CoderRun, pods []corev1.Pod) error {
 	id := run.Annotations[courierv1alpha1.SoftStopAnnotation]
+	if len(id) > maxSoftStopRequestIDLength {
+		// The request ID is CRD-bounded; a longer annotation cannot become a
+		// record. Skip the stamp rather than failing the reconcile: an
+		// invalid human value must not wedge observation or liveness for the
+		// run. Correcting the annotation re-arms ingress.
+		return nil
+	}
 	if id == "" {
 		if run.Status.ControlRequest == nil && run.Status.ControlRequestAck == nil &&
 			apimeta.FindStatusCondition(run.Status.Conditions, courierv1alpha1.ConditionSoftStopObserved) == nil {
@@ -946,7 +958,7 @@ func (r *CoderRunReconciler) transitionTerminal(ctx context.Context, run *courie
 	// Write the terminal phase first so the run stops holding lane capacity
 	// regardless of whether the source lifecycle report below succeeds. The
 	// run's own terminalization must never depend on the source.
-	if run.Status.Phase != before.Status.Phase || run.Status.PR != before.Status.PR || !reflect.DeepEqual(run.Status.Telemetry, before.Status.Telemetry) || !reflect.DeepEqual(run.Status.TerminalDiagnostic, before.Status.TerminalDiagnostic) || !reflect.DeepEqual(run.Status.ControlRequest, before.Status.ControlRequest) {
+	if run.Status.Phase != before.Status.Phase || run.Status.PR != before.Status.PR || !reflect.DeepEqual(run.Status.Telemetry, before.Status.Telemetry) || !reflect.DeepEqual(run.Status.TerminalDiagnostic, before.Status.TerminalDiagnostic) || !reflect.DeepEqual(run.Status.ControlRequest, before.Status.ControlRequest) || !reflect.DeepEqual(run.Status.ControlRequestAck, before.Status.ControlRequestAck) || !reflect.DeepEqual(run.Status.Conditions, before.Status.Conditions) {
 		if err := r.patchStatus(ctx, before, run); err != nil {
 			return ctrl.Result{}, err
 		}

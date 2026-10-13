@@ -2,6 +2,7 @@ package controller
 
 import (
 	"context"
+	"strings"
 	"testing"
 	"time"
 
@@ -347,5 +348,21 @@ func TestSoftStopTerminalClearsRequestAndAck(t *testing.T) {
 	got := getRun(t, c, "run")
 	if got.Status.ControlRequest != nil || got.Status.ControlRequestAck != nil {
 		t.Fatalf("persisted control pair = %+v / %+v, want both cleared on terminalization", got.Status.ControlRequest, got.Status.ControlRequestAck)
+	}
+}
+
+func TestSoftStopOversizedAnnotationSkipsStampWithoutFailing(t *testing.T) {
+	now := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	run := admissionRun("run", "local", courierv1alpha1.PhaseRunning)
+	run.Annotations = map[string]string{courierv1alpha1.SoftStopAnnotation: strings.Repeat("x", maxSoftStopRequestIDLength+1)}
+	pod := liveCoordinator(run, "11111111-2222-3333-4444-555555555555")
+	c := phaseClient(t, run, pod)
+	r := softStopReconciler(t, c, now)
+
+	if err := r.syncSoftStop(context.Background(), run, []corev1.Pod{*pod}); err != nil {
+		t.Fatalf("syncSoftStop must not fail the reconcile for an over-bounds value: %v", err)
+	}
+	if got := getRun(t, c, "run"); got.Status.ControlRequest != nil {
+		t.Fatalf("controlRequest = %+v, want no stamp for a value over the CRD bound", got.Status.ControlRequest)
 	}
 }

@@ -147,6 +147,24 @@ func TestTrustedControlRequestAckRefused(t *testing.T) {
 			t.Fatalf("empty-id ack persisted: %#v", run.Status.ControlRequestAck)
 		}
 	})
+	t.Run("missing-at", func(t *testing.T) {
+		handler, _, c, identity := trustedHandlerFixture(t, validate)
+		setLiveControlRequest(t, c, &courier.ControlRequest{
+			ID: "softstop-1", Kind: courier.ControlRequestSoftStop,
+			TargetPodUID: string(identity.ControlPodUID), RequestedAt: metav1.NewTime(testNow),
+		})
+		rec := postControlRequestAck(t, handler, `{"controlRequestAck":{"id":"softstop-1"}}`)
+		if rec.Code != http.StatusUnprocessableEntity {
+			t.Fatalf("status = %d, body = %q; want a definite 422, never a retryable category", rec.Code, rec.Body.String())
+		}
+		run := &courier.CoderRun{}
+		if err := c.Get(context.Background(), client.ObjectKey{Namespace: testNamespace, Name: testRunName}, run); err != nil {
+			t.Fatal(err)
+		}
+		if run.Status.ControlRequestAck != nil {
+			t.Fatalf("missing-at ack persisted: %#v", run.Status.ControlRequestAck)
+		}
+	})
 }
 
 // TestTrustedControlRequestRead pins the authenticated read of the operator's
