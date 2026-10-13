@@ -748,8 +748,9 @@ manifest, and rejects a non-empty sender UID that does not match the
 live run as a forged identity. The
 phase gate is
 an allowlist over **non-resolved versus resolved**: the intake accepts
-`Pending`, `Claimed`, `Running`, `Failed`, and `NeedsHuman`, and rejects
-`Verifying`, `AwaitingReview`, and `Done`. The admitted set is broad because
+`Pending`, `Claimed`, `Running`, `Failed`, `NeedsHuman`, and
+`BlockedExternal`, and rejects `Verifying`, `AwaitingReview`, and `Done`. The
+admitted set is broad because
 the operator moves runs around a dying pod: an ordinary liveness reap deletes
 the pod and writes `Claimed` in the same reconcile (and a failed relaunch can
 reach `Pending`) while the previous pod's SIGTERM grace capture is still in
@@ -798,12 +799,16 @@ in that window has its evidence already cleaned, and the re-read refuses
 to write a Secret for a phase the operator has world-proven as resolved.
 Access control is namespace RBAC: the operator gains
 `create/get/list/patch/delete` on `secrets` through a namespaced
-Role/RoleBinding rendered by the chart — deliberately not the generated
-operator ClusterRole, whose ClusterRoleBinding would widen the grant
-cluster-wide (`list` is required by the
-condition derivation and the AwaitingReview/Done cleanup; both use uncached
-API-reader lists) — see
-Security and boundaries. Encryption at rest is the deployment's cluster
+Role/RoleBinding rendered by the chart — deliberately not added to the
+generated operator ClusterRole, whose ClusterRoleBinding would widen the
+evidence verbs cluster-wide and attach them to installs that keep evidence
+disabled. The residual: the generated ClusterRole already
+carries `create/delete/get/list` on `secrets` cluster-wide for the secure-mode
+launcher, so against a shipped install the namespaced evidence grant's marginal
+verb is `patch`, which the intake uses to supersede a slot it already wrote
+(`list` is required by the condition derivation and the AwaitingReview/Done
+cleanup; both use uncached API-reader lists) — see Security and boundaries.
+Encryption at rest is the deployment's cluster
 configuration; Courier recommends enabling it. Status carries one condition,
 `EvidenceCaptured`, derived by the reconcile loop from the world through an
 **uncached** list (terminal runs rarely reconcile again, so a cached informer
@@ -1490,15 +1495,19 @@ only informs.
   write-only evidence intake listener (in-cluster, token-gated, no read path)
   and holds namespaced Secret CRUD to persist evidence bundles. The evidence
   verbs are provisioned as a namespaced Role/RoleBinding in the chart,
-  deliberately never inside the generated operator ClusterRole, whose
-  ClusterRoleBinding would widen them cluster-wide. The authority expansion is
-  real but bounded: the chart's namespaced `credential-reader` Role already
-  grants the operator's service account `get` on every Secret in the namespace
-  (no `resourceNames`), so the evidence grant's marginal authority is `list`
-  and the mutating `create/patch/delete`. Deployments that cannot accept
-  Secret mutation should not enable evidence capture, and
-  reject-preservation remains the named fallback in the #115
-  design. Evidence content itself is model-authored untrusted data stored
+  deliberately never added to the generated operator ClusterRole, whose
+  ClusterRoleBinding would widen them cluster-wide and attach them to installs
+  that keep evidence disabled. The authority expansion is real but bounded.
+  The whole residual: the generated
+  ClusterRole already grants `create/delete/get/list` on `secrets` cluster-wide
+  for the secure-mode launcher, and the chart's namespaced `credential-reader`
+  Role grants the operator's service account `get` on every Secret in the run
+  namespace (no `resourceNames`), so the evidence Role's marginal verb against a
+   shipped install is `patch` — the intake's supersede path. Evidence capture
+   therefore adds one verb and no new read, create, or delete surface to an
+   operator that already mutates Secrets, alongside the intake listener and the
+   run-owned Secret shape, and reject-preservation remains the named fallback in
+   the #115 design. Evidence content itself is model-authored untrusted data stored
   inert in run-owned Secrets: never executed, never consumed by tooling,
   applied only by reviewed human action.
 - Dispatch is an adapter; the product boundary (dispatch is not Courier, Courier
