@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"strconv"
 	"strings"
 	"time"
 
@@ -19,6 +20,7 @@ import (
 
 	courier "github.com/misospace/courier/api/v1alpha1"
 	"github.com/misospace/courier/internal/branch"
+	"github.com/misospace/courier/internal/broker"
 	"github.com/misospace/courier/internal/forge"
 	"github.com/misospace/courier/internal/protocol"
 	"github.com/misospace/courier/internal/topology"
@@ -216,6 +218,52 @@ func (s *SecureControl) ResolveAdmission(ctx context.Context, run *courier.Coder
 		if work.Exists {
 			policy.WorkOID = work.OID
 		}
+		// Trusted source-issue read and criterion pinning (#280): the issue
+		// body is read through the provider's typed work-item read on the
+		// operator's read identity — never through model input — and the
+		// acceptance-criterion set extracted from it is frozen into the
+		// policy beside the source-issue identity. The response's own
+		// identity is verified against the request first: a misrouted or
+		// inconsistent provider answer must never pin issue B's criteria as
+		// issue A's contract. An issue without a recognizable Acceptance
+		// section pins an empty set (linkage remains the only PR-body
+		// contract); an ambiguous or over-bound body fails closed here so
+		// an unpinnable contract never becomes an unchecked one. The pin is
+		// revision-pinned by content: later issue edits do not mutate a
+		// live run's policy.
+		source := forge.WorkItemRef{Repo: canonical.Canonical, ID: strconv.Itoa(run.Spec.Ref)}
+		workItem, err := admission.Provider.ReadWorkItem(ctx, source)
+		if err != nil {
+			return nil, nil, transientOrNeedsHuman(err, "ProviderRead", "source issue %d read for %q failed: %v", run.Spec.Ref, canonical.Canonical, err)
+		}
+		returnedNumber, err := strconv.Atoi(strings.TrimSpace(workItem.ID))
+		if err != nil || returnedNumber != run.Spec.Ref {
+			return nil, nil, secureNeedsHuman("ProviderRead",
+				"source issue read for %q returned work item %q; the trusted issue number is %d",
+				canonical.Canonical, workItem.ID, run.Spec.Ref)
+		}
+		if !strings.EqualFold(workItem.Repo, canonical.Canonical) {
+			return nil, nil, secureNeedsHuman("ProviderRead",
+				"source issue read for %q returned a work item for %q; repository identity mismatch",
+				canonical.Canonical, workItem.Repo)
+		}
+		owner, name, ok := splitOwnerName(canonical.Canonical)
+		if !ok {
+			return nil, nil, secureNeedsHuman("ProviderRead", "canonical repository %q is not an owner/name", canonical.Canonical)
+		}
+		set, err := broker.ExtractCriteria(workItem.Body, broker.SourceIssue{Owner: owner, Name: name, Number: run.Spec.Ref})
+		if err != nil {
+			return nil, nil, secureNeedsHuman("CriteriaUnpinnable", "%v", err)
+		}
+		policy.SourceIssue = &courier.SourceIssueRef{Owner: owner, Name: name, Number: run.Spec.Ref}
+		for _, criterion := range set.Criteria {
+			policy.AcceptanceCriteria = append(policy.AcceptanceCriteria, courier.Criterion{
+				ID:     criterion.ID,
+				Text:   criterion.Text,
+				Digest: criterion.Digest,
+			})
+		}
+		policy.AcceptanceCriteriaDigest = set.Digest
 	case courier.ModeFixPR:
 		pr, err := admission.Provider.ReadPullRequest(ctx, forge.PullRequestRef{Repo: canonical.Canonical, Number: run.Spec.Ref})
 		if err != nil {
@@ -265,6 +313,16 @@ func transientOrNeedsHuman(err error, reason, format string, args ...any) error 
 		return err
 	}
 	return fmt.Errorf("%s: %w", reason, fmt.Errorf(format, args...))
+}
+
+// splitOwnerName splits a canonical "owner/name" repository on the final
+// separator. It mirrors the broker's split without importing provider code.
+func splitOwnerName(canonical string) (string, string, bool) {
+	idx := strings.LastIndex(canonical, "/")
+	if idx <= 0 || idx == len(canonical)-1 {
+		return "", "", false
+	}
+	return canonical[:idx], canonical[idx+1:], true
 }
 
 // VerifyPersistedPolicy returns the run's persisted publication policy after

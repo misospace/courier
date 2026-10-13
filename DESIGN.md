@@ -1606,6 +1606,33 @@ named items remain unresolved and must not be described as production-ready:
 
 ## Decisions
 
+- **2026-10-13 — #280: the acceptance-criterion set is pinned at admission
+  by a trusted forge read and carried, never re-derived.** The identification
+  boundary of #249: secure admission reads the source issue through the
+  selected provider's typed work-item read (`github.Client.GetIssue` behind
+  `forge.Provider.ReadWorkItem` — an existing capability in the closed
+  vocabulary, read-only) on the operator's read identity, runs the pure
+  `ExtractCriteria`, and persists the set beside a `sourceIssue` identity
+  pin in `Status.PublicationPolicy` (`acceptanceCriteria` +
+  `acceptanceCriteriaDigest`, additive; CRDs/deepcopy regenerated). An empty
+  set is pinned with its identity-only digest — the smallest contract change
+  to #249's pure seam, needed so a pinned-empty contract stays
+  distinguishable from an unpinned policy; ambiguity, over-bound sets, and
+  over-long criteria terminalize `NeedsHuman` naming why and are never
+  truncated. The broker binding reconstructs and digest-verifies the pin
+  (fix-pr pins, tampered pins,
+  and orphaned pin fields — any partial tuple — fail closed; only the fully
+  absent tuple is the legal pre-contract state, no migration). The trusted
+  read's response identity is verified against the request — the returned
+  issue number and repository must match the canonical pin — so a
+  misrouted provider answer can never pin another issue's criteria. The identical set is projected to the executor
+  contract as trusted env `COURIER_CRITERIA` (broker criterion-set JSON)
+  from the persisted policy by the legacy launcher and the secure control
+  invocation — the executor package stays free of any broker import because
+  broker's test graph imports the harness; the envelope is injected at the
+  launcher seam like evidence tokens are. Boundary enforcement stays with
+  #281 (native create refusal) and #282 (legacy handoff repair). (#280,
+  #249, #204)
 - **2026-10-13 — #210: `COURIER_TERMINATION` line budgeting lives in one place; both
   producers (`courier-executor`, `courier-control`) call it.** The native
   control handoff built its reason from capability detail strings with no

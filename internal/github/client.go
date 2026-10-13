@@ -130,6 +130,26 @@ type GitRef struct {
 	} `json:"object"`
 }
 
+// Issue is the subset of a GitHub issue that Courier needs. The issues API
+// also serves pull requests; PullRequest is non-nil exactly then, so callers
+// can refuse to treat a pull request as a work item.
+type Issue struct {
+	Number      int       `json:"number"`
+	Title       string    `json:"title"`
+	Body        string    `json:"body"`
+	State       string    `json:"state"`
+	HTMLURL     string    `json:"html_url"`
+	PullRequest *struct{} `json:"pull_request,omitempty"`
+}
+
+// GetIssue reads one issue from GitHub. It is a read-only typed issue read:
+// no write capability is added here.
+func (c *Client) GetIssue(ctx context.Context, owner, repo string, number int) (Issue, error) {
+	var out Issue
+	err := c.doJSON(ctx, http.MethodGet, repoEndpoint(owner, repo, "issues", strconv.Itoa(number)), nil, &out)
+	return out, err
+}
+
 // CreatePullRequestRequest is the payload for creating a pull request.
 type CreatePullRequestRequest struct {
 	Title string `json:"title"`
