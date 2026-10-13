@@ -1086,7 +1086,10 @@ the compact point **or** when the next turn's prompt plus the output
 reservation would exceed the effective limit. After compaction the invariant
 `promptTokens + outputReservation ≤ effective` must hold; if it cannot, the
 harness fails closed and surfaces the condition rather than truncating
-mid-task.
+mid-task. The two acceptance conditions fail independently: a digest can
+reclaim tokens and still leave the protected tail too large to fit, in which
+case every digestible turn has already been spent and there is no progress left
+to make.
 
 A successful compaction also returns a calibrated `BudgetAfter` whose compact
 point is raised to at least `After+1` so the next step boundary does not

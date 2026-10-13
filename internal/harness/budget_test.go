@@ -220,6 +220,14 @@ func TestPlanCompactionTruthTable(t *testing.T) {
 			wantErr: ErrCompactionCannotFit,
 		},
 		{
+			name: "digesting every non-protected turn still cannot fit fails closed",
+			in: CompactionInput{
+				MessageTokens: []int{900, 200}, Protected: []bool{true, false}, DigestTokens: 10,
+				Budget: budget(t, 1000, 75, 100),
+			},
+			wantErr: ErrCompactionCannotFit,
+		},
+		{
 			name: "a digest costlier than what it reclaims fails closed",
 			in: CompactionInput{
 				MessageTokens: []int{10, 10}, DigestTokens: 100,
@@ -379,6 +387,43 @@ func TestPlanCompactionTwoBoundaryHysteresis(t *testing.T) {
 	}
 	if !errors.Is(err, ErrCompactionCannotFit) {
 		t.Fatalf("original budget error = %v, want ErrCompactionCannotFit", err)
+	}
+}
+
+// TestPlanCompactionFailsClosedAfterDigestingEveryTurn pins the fail-closed
+// branch the truth table row of the same name exercises: every non-protected
+// turn is digested, the digest does reclaim tokens, and the post-condition is
+// still violated because protected state alone outweighs the room left under
+// the effective limit. Without this, a transcript can neither progress nor
+// reclaim further, and failing closed is the only outcome that keeps protected
+// state intact.
+func TestPlanCompactionFailsClosedAfterDigestingEveryTurn(t *testing.T) {
+	budget, err := ResolveContextBudget(ContextBudgetInput{
+		Role: "coder", DeclaredMaxInputTokens: 1000, CompactAtPercent: 75, OutputReservation: 100,
+	})
+	if err != nil {
+		t.Fatalf("resolve: %v", err)
+	}
+	in := CompactionInput{
+		MessageTokens: []int{900, 200},
+		Protected:     []bool{true, false},
+		DigestTokens:  10,
+		Budget:        budget,
+	}
+	if _, err := PlanCompaction(in); !errors.Is(err, ErrCompactionCannotFit) {
+		t.Fatalf("error = %v, want ErrCompactionCannotFit", err)
+	}
+
+	var before int
+	for _, tokens := range in.MessageTokens {
+		before += tokens
+	}
+	after := before - in.MessageTokens[1] + in.DigestTokens
+	if after >= before {
+		t.Fatalf("fixture no longer reclaims: after %d >= before %d, so this row would exercise the zero-reclaim branch", after, before)
+	}
+	if budget.FitsAfterCompaction(after) {
+		t.Fatalf("fixture now fits: after %d + reservation %d <= effective %d, so this row would compact", after, budget.OutputReservation, budget.EffectiveLimit)
 	}
 }
 
