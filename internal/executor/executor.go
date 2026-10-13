@@ -55,6 +55,14 @@ type Invocation struct {
 	Session   string
 	Workspace string
 	Debug     bool
+	// Criteria is the bounded JSON envelope of the acceptance-criterion set
+	// pinned at admission (#280), in the broker criterion-set shape: the
+	// trusted issue identity, criteria with IDs/texts/digests, and the set
+	// digest. It is empty when no set is pinned — fix-pr runs, policies
+	// admitted before the criterion contract, and runs without a persisted
+	// publication policy. The value is operator-authored from the persisted
+	// policy; a coordinator may read it but can never author it.
+	Criteria string
 }
 
 // Command is a process command with no shell interpolation.
@@ -241,7 +249,7 @@ func RunContextEnvironment(inv Invocation) []EnvVar {
 	if err != nil {
 		rolesJSON = []byte("{}")
 	}
-	return []EnvVar{
+	values := []EnvVar{
 		{Name: "COURIER_RUN_NAME", Value: inv.RunName},
 		{Name: "COURIER_RUN_NAMESPACE", Value: inv.Namespace},
 		{Name: "COURIER_MODE", Value: string(inv.Mode)},
@@ -257,7 +265,23 @@ func RunContextEnvironment(inv Invocation) []EnvVar {
 		{Name: "COURIER_WORKSPACE", Value: inv.Workspace},
 		{Name: "COURIER_LOG_LEVEL", Value: level},
 	}
+	// The pinned criterion envelope travels beside the run context it
+	// belongs to, but only when a set is pinned: fix-pr runs and
+	// pre-contract policies carry no envelope, so its absence is meaningful
+	// to the legacy boundary rather than an empty stand-in.
+	if strings.TrimSpace(inv.Criteria) != "" {
+		values = append(values, EnvVar{Name: criteriaEnvName, Value: inv.Criteria})
+	}
+	return values
 }
+
+// criteriaEnvName is the trusted envelope carrying the pinned
+// acceptance-criterion set to a coordinator (#280): the broker criterion-set
+// JSON (issue identity, criteria with IDs/texts/digests, set digest),
+// operator-authored from the persisted publication policy. The set is public
+// issue text; the contract is that the validator's comparison target is
+// operator-authored and the model cannot change it.
+const criteriaEnvName = "COURIER_CRITERIA"
 
 // Environment returns the run context a coordinator container receives. The
 // values are kept in environment variables rather than shell-expanded command
@@ -328,6 +352,7 @@ func InvocationFromEnv(get func(string) string) (Invocation, error) {
 		Framing:   get("COURIER_FRAMING"),
 		Workspace: get("COURIER_WORKSPACE"),
 		Debug:     get("COURIER_LOG_LEVEL") == "debug",
+		Criteria:  get(criteriaEnvName),
 	}
 	inv.Mode = courierv1alpha1.Mode(get("COURIER_MODE"))
 	switch inv.Mode {
