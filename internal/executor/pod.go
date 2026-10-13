@@ -59,12 +59,18 @@ type PodConfig struct {
 	OpenCode               OpenCode
 	Resources              corev1.ResourceRequirements
 	// EvidenceURL, EvidenceToken, and EvidenceNonce enable bounded
-	// failure-evidence capture. Capture is all-or-nothing: all three must be
-	// set together, and leaving them empty keeps the pod on the kubelet's
+	// failure-evidence capture. Capture is all-or-nothing: all three must
+	// be set together, and leaving them empty keeps the pod on the kubelet's
 	// default termination grace period.
 	EvidenceURL   string
 	EvidenceToken string
 	EvidenceNonce string
+	// Criteria is the per-run trusted COURIER_CRITERIA envelope: the
+	// operator-authored JSON of the acceptance-criterion set pinned at
+	// admission (#280), rendered from the persisted publication policy.
+	// Empty means no set is pinned (fix-pr runs, pre-contract policies) and
+	// emits no environment variable.
+	Criteria string
 }
 
 // DefaultPodConfig is suitable for the temporary OpenCode shim image. The
@@ -148,6 +154,9 @@ func (b *PodBuilder) Build(run *courierv1alpha1.CoderRun, lane *courierv1alpha1.
 	if err != nil {
 		return nil, err
 	}
+	// The trusted criterion envelope is operator-authored per run; the
+	// executor contract only carries it, never derives it.
+	invocation.Criteria = config.Criteria
 	command := executorImpl.Command(invocation)
 	if bootstrapper, ok := executorImpl.(Bootstrapper); ok {
 		command = bootstrapper.BootstrapCommand(invocation, config.BootstrapBinary)

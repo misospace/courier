@@ -1,6 +1,7 @@
 package broker
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/misospace/courier/api/v1alpha1"
@@ -179,4 +180,126 @@ func TestPolicyFromRunRejectsBaseRepoWithoutOwnerSlash(t *testing.T) {
 	if _, err := PolicyFromRun(run, "providers/github", "no-slash"); err == nil {
 		t.Fatal("expected non-owner/name base repository to be rejected")
 	}
+}
+
+// pinCriteriaOn mirrors admission's mapping of an extracted set onto the
+// persisted policy fields (#280), so binding tests exercise the same shape
+// the operator writes.
+func pinCriteriaOn(t *testing.T, policy *v1alpha1.PublicationPolicy, body string) {
+	t.Helper()
+	set, err := ExtractCriteria(body, SourceIssue{Owner: "org", Name: "repo", Number: 12})
+	if err != nil {
+		t.Fatalf("extract criteria: %v", err)
+	}
+	policy.SourceIssue = &v1alpha1.SourceIssueRef{Owner: "org", Name: "repo", Number: 12}
+	for _, criterion := range set.Criteria {
+		policy.AcceptanceCriteria = append(policy.AcceptanceCriteria, v1alpha1.Criterion{
+			ID: criterion.ID, Text: criterion.Text, Digest: criterion.Digest,
+		})
+	}
+	policy.AcceptanceCriteriaDigest = set.Digest
+}
+
+// The binding reconstructs a pinned criterion set and re-verifies it by
+// digest; a policy admitted before the criterion contract (no pin at all)
+// still binds — the backward-compatibility requirement.
+func TestPolicyFromRunCarriesPinnedCriteria(t *testing.T) {
+	run := bindingRun(v1alpha1.ModeResolveIssue)
+	pinCriteriaOn(t, run.Status.PublicationPolicy, "## Acceptance\n- first criterion\n- second criterion\n")
+	got, err := PolicyFromRun(run, "providers/github", "org/repo")
+	if err != nil {
+		t.Fatal(err)
+	}
+	set := got.Criteria
+	if set.Issue != (SourceIssue{Owner: "org", Name: "repo", Number: 12}) {
+		t.Fatalf("pinned issue = %+v", set.Issue)
+	}
+	if len(set.Criteria) != 2 || set.Criteria[0].ID != "AC-1" || set.Criteria[1].ID != "AC-2" {
+		t.Fatalf("pinned criteria = %+v", set.Criteria)
+	}
+	if set.Digest == "" || set.Digest != run.Status.PublicationPolicy.AcceptanceCriteriaDigest {
+		t.Fatalf("pinned digest = %q", set.Digest)
+	}
+
+	// A pre-contract policy carries no pin and still binds.
+	legacy := bindingRun(v1alpha1.ModeResolveIssue)
+	got, err = PolicyFromRun(legacy, "providers/github", "org/repo")
+	if err != nil {
+		t.Fatalf("legacy policy binding: %v", err)
+	}
+	if got.Criteria.Digest != "" || got.Criteria.Issue != (SourceIssue{}) {
+		t.Fatalf("legacy policy must carry no criteria pin: %+v", got.Criteria)
+	}
+
+	// An explicitly empty pin is carried as a pinned empty set.
+	empty := bindingRun(v1alpha1.ModeResolveIssue)
+	pinCriteriaOn(t, empty.Status.PublicationPolicy, "No acceptance section here.\n")
+	got, err = PolicyFromRun(empty, "providers/github", "org/repo")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !got.Criteria.IsEmpty() || got.Criteria.Digest == "" {
+		t.Fatalf("empty pin = %+v, want an empty set with a digest", got.Criteria)
+	}
+}
+
+// Every corruption of the pin fails closed at the binding: tampered text,
+// a stale set digest, a rewritten ordinal, a cross-issue identity, a pin
+// without an identity, an identity without a pin, and fix-pr pins.
+func TestPolicyFromRunRejectsCorruptCriterionPins(t *testing.T) {
+	pinned := func(t *testing.T) *v1alpha1.CoderRun {
+		t.Helper()
+		run := bindingRun(v1alpha1.ModeResolveIssue)
+		pinCriteriaOn(t, run.Status.PublicationPolicy, "## Acceptance\n- first criterion\n- second criterion\n")
+		return run
+	}
+
+	tamper := map[string]func(*v1alpha1.PublicationPolicy){
+		"tampered criterion text": func(p *v1alpha1.PublicationPolicy) {
+			p.AcceptanceCriteria[0].Text = "rewritten by someone else"
+		},
+		"stale set digest": func(p *v1alpha1.PublicationPolicy) {
+			p.AcceptanceCriteriaDigest = "sha256:" + strings.Repeat("a", 64)
+		},
+		"rewritten ordinal": func(p *v1alpha1.PublicationPolicy) {
+			p.AcceptanceCriteria[0].ID = "AC-2"
+		},
+		"dropped criterion": func(p *v1alpha1.PublicationPolicy) {
+			p.AcceptanceCriteria = p.AcceptanceCriteria[1:]
+		},
+		"cross-issue identity": func(p *v1alpha1.PublicationPolicy) {
+			p.SourceIssue.Number = 13
+		},
+		"pin without identity": func(p *v1alpha1.PublicationPolicy) {
+			p.SourceIssue = nil
+		},
+		"identity without pin": func(p *v1alpha1.PublicationPolicy) {
+			p.AcceptanceCriteria = nil
+			p.AcceptanceCriteriaDigest = ""
+		},
+		"criteria without issue or set digest": func(p *v1alpha1.PublicationPolicy) {
+			p.SourceIssue = nil
+			p.AcceptanceCriteriaDigest = ""
+		},
+		"criteria without digest but with identity": func(p *v1alpha1.PublicationPolicy) {
+			p.AcceptanceCriteriaDigest = ""
+		},
+	}
+	for name, corrupt := range tamper {
+		t.Run(name, func(t *testing.T) {
+			run := pinned(t)
+			corrupt(run.Status.PublicationPolicy)
+			if _, err := PolicyFromRun(run, "providers/github", "org/repo"); err == nil {
+				t.Fatal("a corrupt criterion pin must fail the binding")
+			}
+		})
+	}
+
+	t.Run("fix-pr pins", func(t *testing.T) {
+		run := bindingRun(v1alpha1.ModeFixPR)
+		pinCriteriaOn(t, run.Status.PublicationPolicy, "## Acceptance\n- stray pin\n")
+		if _, err := PolicyFromRun(run, "providers/github", "org/repo"); err == nil {
+			t.Fatal("a fix-pr policy must not carry resolve-issue criterion pins")
+		}
+	})
 }
