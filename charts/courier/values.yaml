@@ -156,12 +156,25 @@ controllers:
         #   --executor-environment-secret
         #                               Secret exposed to coordinator pods for
         #                               model/provider environment
+        #   --git-author-name / --git-author-email /
+        #   --git-committer-name / --git-committer-email
+        #                               git identity rendered into coordinator
+        #                               pods; empty falls back to the explicit
+        #                               default Courier <courier@localhost>.
+        #                               These explicit pod env values win over
+        #                               same-named keys of
+        #                               --executor-environment-secret. GitHub
+        #                               attribution needs an account-associated
+        #                               email; authorship is separate from
+        #                               authentication and commit signing.
         args:
           - --leader-elect
           - --git-remote-template=https://github.com/%s.git
           - --git-credential-secret=courier-github
           # - --github-credential-secret=courier-github-api
           # - --github-token-key=token
+          # - --git-author-name=bot
+          # - --git-author-email=123456+bot@users.noreply.github.com
         probes:
           liveness:
             enabled: true
