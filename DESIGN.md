@@ -1060,6 +1060,26 @@ the world. `courier_metrics_scrape_errors_total` counts scrape failures. Scrapin
 is opt-in: the chart's `serviceMonitor.enabled` renders a metrics `Service` and a
 Prometheus Operator `ServiceMonitor`, off by default.
 
+**Connector diagnostics without core coupling (#291).**
+[docs/connector-diagnostics.md](./docs/connector-diagnostics.md) specifies
+adapter-owned diagnostics for optional source connectors so an operator can see
+protocol pressure — exclusion overflow, acknowledgement support/mismatch,
+protocol errors, superseded identities, provider availability — **without**
+Courier core learning a connector's name or its limits. Core keeps a
+source-neutral signal layer (`courier_source_*`); each connector declares a
+bounded capability set (mirroring the optional `internal/source` interfaces) and
+reports values inside one generic `connector.diagnostic` envelope, with the
+configured cap carried as **data** (`courier_connector_exclusion_limit`), never
+as a core constant or label. A dashboard enumerates connectors from
+`courier_connector_capability_info` and renders a panel only for declared
+capabilities, so a non-Dispatch connector needs no Dispatch panel and Courier
+works with an alternate source. Absent and unsupported diagnostics are distinct
+from success, core and connector counters are joined rather than summed, labels
+stay bounded, and trace correlation is optional and never a metric label. The
+design records the #286 exclusion-overflow outage as the motivating case while
+leaving the overflow *strategy* to #286 and retention to #287; #290 owns the
+source-health semantics and #292 the views this layer feeds.
+
 ### Per-run telemetry (#172)
 
 The executor already relays the coordinator's stdout through a pass-through tap,
@@ -1570,6 +1590,32 @@ named items remain unresolved and must not be described as production-ready:
 - The exact vLLM gauge for backpressure on the target model server.
 
 ## Decisions
+
+- **2026-10-13 — #291: connector diagnostics are adapter-owned and carried in a
+  generic envelope; core stays source-agnostic and configured limits are data.**
+  The design is
+  [docs/connector-diagnostics.md](./docs/connector-diagnostics.md), a child of
+  the portable-observability umbrella (#289). Courier core owns only a
+  source-neutral signal layer (`courier_source_*`) and a closed capability
+  vocabulary that mirrors the optional `internal/source` seams
+  (`DiscoveryExcluder`, `Reporter`, `PreLauncher`, `WorkIdentifier`); each
+  connector declares a per-capability state (`supported`/`unsupported`/
+  `unknown`) and reports values in one generic `connector.diagnostic` envelope
+  whose label set is bounded (`connector`, `signal`, `reason`, `state`) and
+  whose numeric observations — including an exclusion cap such as Dispatch's 32
+  — travel as **values**, never as labels or core constants. A dashboard
+  discovers optional capabilities from `courier_connector_capability_info`, so a
+  non-Dispatch connector renders without any Dispatch-specific core logic and
+  Courier remains usable with an alternate source. Absent and unsupported
+  diagnostics are distinct states from success; a connector diagnostic that
+  explains a core signal is joined by `connector` and time, never summed; and
+  optional `run_id`/trace correlation rides logs only, never metric labels, and
+  is not a prerequisite for either app. The `PR-fix exclusions exceed maximum
+  32` stall (#286) is the motivating case, but this document only makes the
+  pressure observable: it does not choose an overflow strategy (#286) or touch
+  retention (#287). Design only — no protocol change, implementation, shared
+  cross-app schema, mandatory identifier, deployment, or dashboard. (#291,
+  #289, #290, #292, #286, #287)
 
 - **2026-10-12 — #249: one executor-neutral acceptance-criterion evidence
   contract is enforced in both publication paths against a revision-pinned
