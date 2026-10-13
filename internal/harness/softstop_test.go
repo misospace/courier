@@ -277,6 +277,40 @@ func TestSoftStopLatchBlocksNewBriefsOnly(t *testing.T) {
 	}
 }
 
+// A Coordinator built without a Control watcher has no soft-stop path, and
+// the step boundary must read that absence as "nothing to serve" rather than
+// dereferencing it. Every ControlWatcher method guards its own receiver, so a
+// nil watcher is a no-op watcher — pinned here so a dropped guard fails here
+// instead of panicking a run that never asked for a soft stop.
+func TestCoordinatorWithoutControlHasNoSoftStopPath(t *testing.T) {
+	ctx := context.Background()
+	var absent *ControlWatcher
+	absent.Poll(ctx)
+	absent.PollThrottled(ctx)
+	if absent.Stopped() {
+		t.Fatal("an absent watcher is never latched")
+	}
+	if _, injected := absent.TakeControlTurn(); injected {
+		t.Fatal("an absent watcher never injects a control turn")
+	}
+
+	gateway, _, cleanup := gatewayFor(
+		gatewayResponse{body: sse(contentChunk(`{"outcome":"no_change_needed","evidence":"nothing to change"}`), finishChunk("stop"))},
+	)
+	defer cleanup()
+	coordinator, err := NewCoordinator(CoordinatorConfig{Gateway: gateway, Bindings: testBindings()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if coordinator.control != nil {
+		t.Fatal("this harness must exercise the no-soft-stop build")
+	}
+	result := coordinator.Run(ctx, testInvocation())
+	if result.Err != nil || result.Outcome != "no_change_needed" {
+		t.Fatalf("result = %+v, want the declared outcome, not a soft-stop ending", result)
+	}
+}
+
 func TestSoftStopFinishDerivesOutcomeFromWorld(t *testing.T) {
 	t.Run("beyond-anchor-publishes-changes", func(t *testing.T) {
 		publisher := &stubPublisher{result: Publication{OID: "abc123"}}
