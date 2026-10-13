@@ -1343,10 +1343,18 @@ that needs Dispatch-side queue exclusion. Where supported, discovery passes
 retained same-source work IDs as opaque exclusions when the Dispatch client is
 explicitly opted in; exclusion support defaults off and must be enabled only
 after deployment has confirmed the Dispatch contract. Enabled requests are
-bounded to 32 unique valid entries of 300 characters each, and every response
-must acknowledge `prFixExclusions.version: 1` before either a task or idle result
-is processed. Missing or malformed acknowledgements fail closed without retry or
-side effects. Exclusions are dedupe hints, not claims or ownership. While
+bounded to 32 unique valid entries of 300 characters each. The runner orders
+exclusions most-relevant-first — runs that have not yet reached a terminal
+phase (their source attempt is still open) before terminal retained runs,
+newest first within each group — so when more entries qualify than the cap
+allows, the client keeps the most relevant head and drops the tail with a
+warning instead of failing closed (#286); an exclusion overflow must degrade
+discovery, not starve it. Dropped entries may be re-offered by the source;
+same-identity dedupe absorbs the repeat without materializing a duplicate run.
+Every response must acknowledge `prFixExclusions.version: 1` before either a
+task or idle result is processed. Missing or malformed acknowledgements fail
+closed without retry or side effects. Exclusions are dedupe hints, not claims
+or ownership. While
 discovery is paused, Dispatch `next-task` and stale-item bookkeeping are
 deferred until a later poll.
 
@@ -2497,3 +2505,17 @@ was superseded.
   This reverses the delete-before-recreate and open-green already-addressed
   policies recorded in the earlier #267 follow-up. Source-owned generation and
   cooldown fence recovery instead of a Courier poll-driven retry loop. (#267)
+
+- **2026-10-12 — #286: exclusion overflow degrades by truncation, not failure.**
+  Retained dispatch CoderRuns with `followup-pr` work-item IDs grew past
+  Dispatch's 32-entry PR-fix exclusion cap, and the client's fail-closed
+  overflow error turned every 30s discovery cycle into an error, starving all
+  lanes because most retained runs were terminal zombies the Dispatch queue
+  had already settled. The cap is a Dispatch server contract and stays.
+  Courier's runner now orders exclusions most-relevant-first — runs whose
+  source attempt is still open (pre-terminal, report unpublished) before
+  terminal retained runs, newest first within each group — and the Dispatch
+  client keeps the first 32 unique valid entries, dropping the tail with a
+  warning. Dropped entries may be re-offered by the source; same-identity
+  dedupe absorbs the repeat without materializing a duplicate run. Malformed
+  descriptors still fail closed. (#286)
