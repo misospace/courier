@@ -44,7 +44,7 @@ are observed only when a run reaches a terminal phase
 (`internal/controller/metrics.go:182-225`). **None of these can distinguish an
 idle, healthy, empty queue from a broken discovery loop**, because discovery
 failures are logged and then discarded
-(`internal/source/runner.go:67-69,78-80`) and never reach a counter, condition,
+(`internal/source/runner.go:68-70,79-81`) and never reach a counter, condition,
 or status.
 
 The design therefore introduces a **source-level** layer, `courier_source_*`,
@@ -238,7 +238,10 @@ collapse into one "done".
 
 - **Executor completion** is the run leaving `Running`: it entered `Verifying`
   (executor exited `0` and published), or it reached a declared terminal phase
-  (`needs-human`, `blocked-external`, declared no-change). Current evidence does
+  (`needs-human`, `blocked-external`, and a declared no-change outside fix-pr
+  mode — a fix-pr declared no-change goes through `Verifying` like a normal
+  exit, `phaseForExit`, `internal/controller/coderun_controller.go:1555-1571`).
+  Current evidence does
   **not** measure executor completion directly. `FinishedAt` is set on the run's
   first *terminal* transition (`transitionTerminal`,
   `internal/controller/coderun_controller.go:825-854`) and
@@ -279,8 +282,12 @@ capacity:
 
 - `Pending` with reservations below concurrency and a healthy source → normal
   transient queuing.
-- `Pending` while `courier_lane_reservations >= courier_lane_concurrency` →
-  blocked on capacity (an availability fact, not a failure).
+- `Pending` while `courier_coderuns_in_flight == courier_lane_concurrency` →
+  every slot is genuinely held; blocked on capacity (an availability fact, not
+  a failure).
+- `Pending` while a slot is free (`courier_coderuns_in_flight <
+  courier_lane_concurrency`) yet it is not admitted and admission shows no
+  progress → the wedge of §5, not capacity.
 - `Pending` while `courier_lane_suspended == 1` → blocked on a suspended lane.
 
 The view must render `Pending` with its age and the lane state that explains it;
@@ -336,7 +343,7 @@ simply not rendered, never shown as idle.
 | State | Derivation |
 | --- | --- |
 | `open` | not suspended and reservations below concurrency. |
-| `saturated` | reservations meet or exceed concurrency. Normal, informational. |
+| `saturated` | reservations meet or exceed concurrency. Normal, informational; `stalled` outranks it when that row's gates hold. |
 | `suspended` | `courier_lane_suspended == 1`. |
 | `stalled` | not suspended, capacity free but unused (`in_flight < concurrency`), at least one reservation unadmitted (`reservations > in_flight`), no `Claimed` transition for the lane in the window, and the oldest reservation older than the reservation-freshness window (§5). The discriminator is `in_flight` vs `concurrency`, not `reservations` vs `concurrency`, so the fully-reserved unadmitted wedge — which the capacity test classifies `saturated` — is still diagnosable. |
 | `unknown` | lane signals absent. |
@@ -477,7 +484,7 @@ capacity and stalled admission.
 | Time | reservations | in_flight | pending | oldest_reservation_age | `Claimed` transitions (15 min) | capacity test | lane state |
 | --- | --- | --- | --- | --- | --- | --- | --- |
 | 13:00:00 | 2 | 2 | 0 | 300 s | yes | `saturated` | `saturated` |
-| 13:10:00 | 2 | 2 | 0 | 900 s | yes | `saturated` | `saturated` |
+| 13:10:00 | 2 | 2 | 0 | 940 s | yes | `saturated` | `saturated` |
 | 13:20:00 | 2 | 1 | 1 | 1240 s | none | `saturated` | `stalled` |
 
 Age alone would have fired at 13:10 against a lane whose every reservation is
@@ -485,7 +492,9 @@ a progressing `Claimed`/`Running` run — nothing is unadmitted, so the
 condition stays false however old those reservations get. At 13:20 a slot is
 free (`in_flight 1 < concurrency 2`) yet the `Pending` reservation behind it
 (`reservations 2 > in_flight 1`) has not advanced to `Claimed` in the window,
-and the oldest reservation exceeds it: `StaleReservation` fires even though
+and the oldest reservation exceeds it — the age gate is a lane-level floor
+that does not isolate the unadmitted subset (§3.3); the free-capacity and
+unadmitted gates carry the precision. `StaleReservation` fires even though
 the capacity test still reads `saturated`. What the lane cannot explain as
 sizing is the wedge itself — wedged admission, an unschedulable launch, a
 reservation parked in the empty phase — and the condition reports the

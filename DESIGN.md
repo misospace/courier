@@ -1698,7 +1698,9 @@ named items remain unresolved and must not be described as production-ready:
   capacity, reservations, and reservation age; bounded run phase, execution,
   lifecycle-report, and retention signals; and terminal-diagnostic/token
   aggregates extend the existing run metrics. The state model keeps executor
-  completion (`Verifying`, `FinishedAt`) separate from external disposition
+  completion (entry to `Verifying`, or direct terminalization; `FinishedAt` is
+  recorded at first terminalization and its duration includes any `Verifying`
+  observation wait) separate from external disposition
   (CI/review/merge, source settlement) and renders unknown/stale/absent as states
   distinct from idle or healthy, so uncertain evidence never reads as healthy.
   Labels stay bounded (`source`, `lane`, `mode`, `phase`, `category`, `result`,
