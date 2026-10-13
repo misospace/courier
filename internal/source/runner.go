@@ -175,9 +175,10 @@ func (r *Runner) Poll(ctx context.Context) error {
 			})
 		}
 	}
-	// Most-relevant-first: a bounded exclusion window drops the tail, so work
-	// whose source generation is still open outranks terminal retained runs,
-	// and newer work outranks older work within each group.
+	// Most-relevant-first: a bounded exclusion window drops the tail, so
+	// pre-terminal runs (which have not yet published the report that usually
+	// settles their source attempt) outrank terminal retained runs, and newer
+	// work outranks older work within each group.
 	sort.Slice(ranked, func(i, j int) bool {
 		if ranked[i].unsettled != ranked[j].unsettled {
 			return ranked[i].unsettled
@@ -322,10 +323,12 @@ func (r *Runner) identity(workItemID string) string {
 }
 
 // phaseUnsettled reports whether a retained run has not yet reached a terminal
-// phase, so its source attempt is still open: the terminal lifecycle report
-// that settles it has not been published. Unsettled runs sort first among
-// discovery exclusions. Verifying is included, unlike capacity reservation,
-// because exclusion relevance tracks settlement, not execution slots.
+// phase. It is a ranking heuristic for discovery-exclusion order, not
+// settlement authority: terminal runs have usually published the lifecycle
+// report that settles their source attempt, but a terminal run can still owe a
+// pending report, and ranking cannot change what settles. Verifying is
+// included, unlike capacity reservation, because exclusion relevance tracks
+// settlement, not execution slots.
 func phaseUnsettled(phase courierv1alpha1.Phase) bool {
 	switch phase {
 	case "", courierv1alpha1.PhasePending, courierv1alpha1.PhaseClaimed, courierv1alpha1.PhaseRunning, courierv1alpha1.PhaseVerifying:

@@ -1344,15 +1344,19 @@ retained same-source work IDs as opaque exclusions when the Dispatch client is
 explicitly opted in; exclusion support defaults off and must be enabled only
 after deployment has confirmed the Dispatch contract. Enabled requests are
 bounded to 32 unique valid entries of 300 characters each. The runner orders
-exclusions most-relevant-first — runs that have not yet reached a terminal
-phase (their source attempt is still open) before terminal retained runs,
-newest first within each group — so when more entries qualify than the cap
-allows, the client keeps the most relevant head and drops the tail with a
-warning instead of failing closed (#286); an exclusion overflow must degrade
-discovery, not starve it. Dropped entries may be re-offered by the source;
-same-identity dedupe absorbs the repeat without materializing a duplicate run.
-Every response must acknowledge `prFixExclusions.version: 1` before either a
-task or idle result is processed. Missing or malformed acknowledgements fail
+exclusions most-relevant-first — pre-terminal runs before terminal retained
+runs (whose attempts are usually settled; ranking is a truncation heuristic,
+not settlement authority, and a terminal run with a still-pending report ranks
+with the retained group), newest first within each group — so when more entries
+qualify than the cap allows, the client keeps the most relevant head and drops
+the tail with a warning instead of failing closed (#286); an exclusion overflow
+must degrade discovery, not starve it. Progress after truncation is a
+two-sided contract: Dispatch's per-agent, per-generation handout ledger scans
+past candidates the agent was already handed, and Courier's same-identity
+dedupe absorbs any re-offered truncated-out generation without materializing a
+duplicate run. Every response must acknowledge `prFixExclusions.version: 1`
+before either a task or idle result is processed. Missing or malformed
+acknowledgements fail
 closed without retry or side effects. Exclusions are dedupe hints, not claims
 or ownership. While
 discovery is paused, Dispatch `next-task` and stale-item bookkeeping are
@@ -2512,10 +2516,12 @@ was superseded.
   overflow error turned every 30s discovery cycle into an error, starving all
   lanes because most retained runs were terminal zombies the Dispatch queue
   had already settled. The cap is a Dispatch server contract and stays.
-  Courier's runner now orders exclusions most-relevant-first — runs whose
-  source attempt is still open (pre-terminal, report unpublished) before
-  terminal retained runs, newest first within each group — and the Dispatch
+  Courier's runner now orders exclusions most-relevant-first — pre-terminal
+  runs before terminal retained runs, newest first within each group; ranking
+  is a truncation heuristic, not settlement authority — and the Dispatch
   client keeps the first 32 unique valid entries, dropping the tail with a
-  warning. Dropped entries may be re-offered by the source; same-identity
-  dedupe absorbs the repeat without materializing a duplicate run. Malformed
+  warning. Progress after truncation is two-sided: Dispatch's per-agent,
+  per-generation handout ledger scans past already-handed candidates, and
+  Courier's same-identity dedupe absorbs any re-offered truncated-out
+  generation without materializing a duplicate run. Malformed
   descriptors still fail closed. (#286)
