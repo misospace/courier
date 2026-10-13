@@ -84,6 +84,10 @@ func main() {
 	var evidenceIntakeKeySecret string
 	var evidenceIntakeService string
 	var evidenceIntakeBind string
+	var doneRetention time.Duration
+	var failedRetention time.Duration
+	var needsHumanRetention time.Duration
+	var terminalAuditKeep int
 	var secureMode bool
 	var forgeProvidersFile string
 	var runNamespace string
@@ -137,6 +141,10 @@ func main() {
 	flag.StringVar(&evidenceIntakeKeySecret, "evidence-intake-key-secret", "", "Name of the Secret in the operator namespace holding the evidence intake HMAC key under the \"key\" entry; empty with no --evidence-intake-service disables evidence wiring.")
 	flag.StringVar(&evidenceIntakeService, "evidence-intake-service", "", "URL coordinator pods POST failure evidence to; required with --evidence-intake-key-secret.")
 	flag.StringVar(&evidenceIntakeBind, "evidence-intake-bind", "", "Address the operator's own evidence-intake server binds to in-process (for example :8082); the chart derives the matching --evidence-intake-service URL. Empty leaves the operator-side intake off, and a non-empty value requires --evidence-intake-key-secret.")
+	flag.DurationVar(&doneRetention, "done-retention", 5*time.Minute, "How long a resolved Done CoderRun is kept before the retention reaper deletes it.")
+	flag.DurationVar(&failedRetention, "failed-retention", 168*time.Hour, "How long a Failed CoderRun is kept, once its lifecycle report has settled, before the retention reaper deletes it.")
+	flag.DurationVar(&needsHumanRetention, "needs-human-retention", 168*time.Hour, "How long a NeedsHuman CoderRun is kept, once its lifecycle report has settled, before the retention reaper deletes it.")
+	flag.IntVar(&terminalAuditKeep, "terminal-audit-keep", 5, "Number of most recent terminal CoderRuns per repository the retention reaper always retains, even past their retention window.")
 	opts := zap.Options{Development: true}
 	opts.BindFlags(flag.CommandLine)
 	flag.Parse()
@@ -166,6 +174,10 @@ func main() {
 	// Per-lane capacity and suspension gauges are read from the live cluster
 	// at scrape time, so they need only the manager's client.
 	crmetrics.Registry.MustRegister(controller.NewLaneCollector(mgr.GetClient()))
+	// The oldest retained terminal-run age is likewise read from the live
+	// cluster at scrape time, so the retention reaper's observability half
+	// needs only the manager's client.
+	crmetrics.Registry.MustRegister(controller.NewTerminalAgeCollector(mgr.GetClient()))
 
 	bootstrapProfilesFile := strings.TrimSpace(bootstrapLaneProfilesFile)
 	if bootstrapProfilesFile != "" {
@@ -346,17 +358,21 @@ func main() {
 	}
 
 	reconciler := &controller.CoderRunReconciler{
-		Client:         mgr.GetClient(),
-		Scheme:         mgr.GetScheme(),
-		APIReader:      mgr.GetAPIReader(),
-		Launch:         launcher.Launch,
-		Sources:        sources,
-		StatusWriter:   status.KubePatchWriter{Client: mgr.GetClient()},
-		Observer:       githubObserver,
-		PullRequests:   pullRequestReader(githubObserver),
-		Events:         runEvents,
-		Evidence:       evidenceIntake,
-		PRHeadResolver: existingPRHeadResolver(githubObserver),
+		Client:              mgr.GetClient(),
+		Scheme:              mgr.GetScheme(),
+		APIReader:           mgr.GetAPIReader(),
+		Launch:              launcher.Launch,
+		Sources:             sources,
+		StatusWriter:        status.KubePatchWriter{Client: mgr.GetClient()},
+		Observer:            githubObserver,
+		PullRequests:        pullRequestReader(githubObserver),
+		Events:              runEvents,
+		Evidence:            evidenceIntake,
+		PRHeadResolver:      existingPRHeadResolver(githubObserver),
+		DoneRetention:       doneRetention,
+		FailedRetention:     failedRetention,
+		NeedsHumanRetention: needsHumanRetention,
+		TerminalAuditKeep:   terminalAuditKeep,
 	}
 	if secureMode {
 		secure, err := buildSecureControl(secureConfig{

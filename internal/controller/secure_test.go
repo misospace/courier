@@ -1280,8 +1280,9 @@ func TestRevokeDeletesBrokerServiceWhenBrokerPodIsGone(t *testing.T) {
 // TestReconcileFencesWorkerWhenControlTerminates is the reconcile-level
 // regression for fence placement: the legacy coordinator-termination handler
 // must not bypass the secure topology's teardown, or the untrusted worker and
-// the credentialed broker outlive their supervisor — terminal runs are never
-// reaped, so a later-reconcile fence would never run at all.
+// the credentialed broker outlive their supervisor — a terminal run is never
+// relaunched (and an AwaitingReview or HandedOff run is never reaped), so a
+// later-reconcile fence would never run at all.
 func TestReconcileFencesWorkerWhenControlTerminates(t *testing.T) {
 	control, c := secureControl(t)
 	run := secureRun("fence-reconcile")
@@ -1493,10 +1494,11 @@ func TestReconcileControlLossWithoutStatusReturnsToClaimed(t *testing.T) {
 // TestReconcileControlLossAtCeilingFencesThenNeedsHuman pins the at-ceiling
 // arm of #215: when the control loss lands on a run whose restart counter
 // has already reached the ceiling, the detection reconcile still fences the
-// surviving round before terminalizing to NeedsHuman. Terminal runs are
-// never reaped, so a fence deferred past the detection reconcile would
-// never run, and the run's hand-off must keep the only intact objects of
-// the round safe from the missing supervisor.
+// surviving round before terminalizing to NeedsHuman. A terminal run is
+// never relaunched (and an AwaitingReview or HandedOff run is never reaped),
+// so a fence deferred past the detection reconcile would never run, and the
+// run's hand-off must keep the only intact objects of the round safe from the
+// missing supervisor.
 func TestReconcileControlLossAtCeilingFencesThenNeedsHuman(t *testing.T) {
 	control, c := secureControl(t)
 	run := secureRun("control-loss-ceiling")

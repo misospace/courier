@@ -242,6 +242,23 @@
 {{- if not $hasEvidenceBind }}{{- $args = append $args (printf "--evidence-intake-bind=:%d" (int $evidence.port)) }}{{- end }}
 {{- if not $hasEvidenceService }}{{- $args = append $args (printf "--evidence-intake-service=http://%s-evidence.%s.svc" .Release.Name .Release.Namespace) }}{{- end }}
 {{- end }}
+{{- $retention := .Values.retention }}
+{{- if $retention }}
+{{- $hasDoneRetention := false }}
+{{- $hasFailedRetention := false }}
+{{- $hasNeedsHumanRetention := false }}
+{{- $hasAuditKeep := false }}
+{{- range $arg := $args }}
+{{- if hasPrefix "--done-retention=" $arg }}{{- $hasDoneRetention = true }}{{- end }}
+{{- if hasPrefix "--failed-retention=" $arg }}{{- $hasFailedRetention = true }}{{- end }}
+{{- if hasPrefix "--needs-human-retention=" $arg }}{{- $hasNeedsHumanRetention = true }}{{- end }}
+{{- if hasPrefix "--terminal-audit-keep=" $arg }}{{- $hasAuditKeep = true }}{{- end }}
+{{- end }}
+{{- if and $retention.done (not $hasDoneRetention) }}{{- $args = append $args (printf "--done-retention=%s" $retention.done) }}{{- end }}
+{{- if and $retention.failed (not $hasFailedRetention) }}{{- $args = append $args (printf "--failed-retention=%s" $retention.failed) }}{{- end }}
+{{- if and $retention.needsHuman (not $hasNeedsHumanRetention) }}{{- $args = append $args (printf "--needs-human-retention=%s" $retention.needsHuman) }}{{- end }}
+{{- if and $retention.auditKeep (not $hasAuditKeep) }}{{- $args = append $args (printf "--terminal-audit-keep=%d" (int $retention.auditKeep)) }}{{- end }}
+{{- end }}
 {{- $_ := set $container "args" $args }}
 
 {{- /* The namespaced evidence Secret authority renders only when the intake is enabled. */}}

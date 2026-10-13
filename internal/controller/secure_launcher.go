@@ -336,7 +336,8 @@ func (s *SecureControl) ObserveTopology(ctx context.Context, run *courier.CoderR
 		// The control incarnation is over: fence its worker so no untrusted
 		// executor outlives its supervisor, and take the broker's ingress and
 		// pod down with it — the broker holds the run's copied credentials and
-		// terminal runs are never reaped. Run-only material is removed by the
+		// a terminal run is never relaunched; an AwaitingReview or HandedOff
+		// run is never reaped either. Run-only material is removed by the
 		// ordered finalizer when the CoderRun is deleted. The caller proceeds
 		// to the exit-code mapping, which decides the run's phase. The worker
 		// or broker may already be gone in the same observation (the guard
@@ -446,8 +447,9 @@ func (s *SecureControl) fenceAndRelaunch(ctx context.Context, run *courier.Coder
 // supervisor is gone or terminal — including the control-loss backstop
 // (#215), where the detection reconcile must not leave the untrusted
 // executor and the credentialed broker alive just because a later relaunch
-// reconcile may never run. Terminal runs are never reaped, so a fence
-// deferred past the detection reconcile never runs at all.
+// reconcile may never run. A terminal run is never relaunched, and an
+// AwaitingReview or HandedOff run is never reaped, so a fence deferred past
+// the detection reconcile never runs at all.
 func (s *SecureControl) Fence(ctx context.Context, run *courier.CoderRun) error {
 	workerPod, err := s.pod(ctx, run, topology.ComponentWorker)
 	if err != nil {

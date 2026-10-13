@@ -32,6 +32,7 @@ var queueWaitBuckets = []float64{
 var (
 	terminalMetricLabels = []string{"lane", "mode", "phase"}
 	laneMetricLabels     = []string{"lane"}
+	reapMetricLabels     = []string{"phase"}
 )
 
 var (
@@ -65,6 +66,12 @@ var (
 		laneMetricLabels,
 		nil,
 	)
+	oldestTerminalAgeDesc = prometheus.NewDesc(
+		"courier_coderuns_oldest_terminal_age_seconds",
+		"Age of the oldest retained terminal CoderRun, by terminal phase.",
+		reapMetricLabels,
+		nil,
+	)
 )
 
 // RunRecorder observes CoderRuns as they reach their terminal phase. The
@@ -75,6 +82,7 @@ type RunRecorder struct {
 	RunDuration *prometheus.HistogramVec
 	QueueWait   *prometheus.HistogramVec
 	Total       *prometheus.CounterVec
+	Reaped      *prometheus.CounterVec
 }
 
 func NewRunRecorder(reg prometheus.Registerer) *RunRecorder {
@@ -93,8 +101,12 @@ func NewRunRecorder(reg prometheus.Registerer) *RunRecorder {
 			Name: "courier_coderuns_total",
 			Help: "Total CoderRuns that reached a terminal phase, by lane, mode, and terminal phase.",
 		}, terminalMetricLabels),
+		Reaped: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "courier_coderuns_reaped_total",
+			Help: "Total terminal CoderRuns deleted by the retention reaper, by terminal phase.",
+		}, reapMetricLabels),
 	}
-	reg.MustRegister(rec.RunDuration, rec.QueueWait, rec.Total)
+	reg.MustRegister(rec.RunDuration, rec.QueueWait, rec.Total, rec.Reaped)
 	return rec
 }
 
@@ -137,6 +149,16 @@ func (r *RunRecorder) ObserveTerminal(run *courierv1alpha1.CoderRun) {
 		r.QueueWait.With(labels).Observe(nonNegativeSeconds(
 			run.Status.AdmittedAt.Time.Sub(run.CreationTimestamp.Time)))
 	}
+}
+
+// ObserveReap records a terminal CoderRun deleted by the retention reaper. It
+// counts every deletion, keyed only by the run's terminal phase, so a reaped
+// run leaves one bounded, aggregatable trace even after its object is gone.
+func (r *RunRecorder) ObserveReap(phase courierv1alpha1.Phase) {
+	if r == nil || r.Reaped == nil {
+		return
+	}
+	r.Reaped.With(prometheus.Labels{"phase": string(phase)}).Inc()
 }
 
 // nonNegativeSeconds clamps a duration to zero for the negative case, which
@@ -221,5 +243,67 @@ func (c *LaneCollector) Collect(ch chan<- prometheus.Metric) {
 		}
 		ch <- prometheus.MustNewConstMetric(
 			laneSuspendedDesc, prometheus.GaugeValue, suspended, lanes.Items[i].Name)
+	}
+}
+
+// TerminalAgeCollector reports the age of the oldest retained terminal
+// CoderRun per phase, read from the live cluster at scrape time. It is the
+// observability half of the retention reaper (#287): the reaped counter shows
+// deletions, and this gauge shows whether anything is aging past its window —
+// a stuck lifecycle report or an audit-floor hold. A failed List increments the
+// scrape-errors counter instead of silently dropping the scrape.
+type TerminalAgeCollector struct {
+	client       client.Client
+	now          func() time.Time
+	scrapeErrors prometheus.Counter
+}
+
+func NewTerminalAgeCollector(c client.Client) *TerminalAgeCollector {
+	return &TerminalAgeCollector{
+		client: c,
+		now:    time.Now,
+		scrapeErrors: prometheus.NewCounter(prometheus.CounterOpts{
+			Name: "courier_terminal_age_scrape_errors_total",
+			Help: "List calls that failed while the TerminalAgeCollector collected terminal-age metrics.",
+		}),
+	}
+}
+
+// Describe implements prometheus.Collector.
+func (c *TerminalAgeCollector) Describe(ch chan<- *prometheus.Desc) {
+	ch <- oldestTerminalAgeDesc
+	ch <- c.scrapeErrors.Desc()
+}
+
+// Collect implements prometheus.Collector.
+func (c *TerminalAgeCollector) Collect(ch chan<- prometheus.Metric) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	defer func() { ch <- c.scrapeErrors }()
+
+	var runs courierv1alpha1.CoderRunList
+	if err := c.client.List(ctx, &runs); err != nil {
+		c.scrapeErrors.Inc()
+		crlog.Log.Error(err, "metrics scrape: listing CoderRuns failed")
+		return
+	}
+	oldest := make(map[courierv1alpha1.Phase]time.Time, 6)
+	for i := range runs.Items {
+		run := &runs.Items[i]
+		if !terminalPhase(run.Status.Phase) {
+			continue
+		}
+		at := terminalTime(run)
+		if at.IsZero() {
+			continue
+		}
+		if current, ok := oldest[run.Status.Phase]; !ok || at.Before(current) {
+			oldest[run.Status.Phase] = at
+		}
+	}
+	now := c.now()
+	for phase, at := range oldest {
+		ch <- prometheus.MustNewConstMetric(
+			oldestTerminalAgeDesc, prometheus.GaugeValue, nonNegativeSeconds(now.Sub(at)), string(phase))
 	}
 }
