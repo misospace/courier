@@ -6,6 +6,7 @@ import (
 	"errors"
 	"testing"
 
+	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
@@ -14,6 +15,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
 	courierv1alpha1 "github.com/misospace/courier/api/v1alpha1"
+	"github.com/misospace/courier/internal/executor"
 	"github.com/misospace/courier/internal/source"
 )
 
@@ -357,6 +359,19 @@ func admissionLane(name string, concurrency int) *courierv1alpha1.LaneProfile {
 	}
 }
 
+// admissionLaneWithCoordinator mirrors admissionLane but names a coordinator
+// role, so a test that drives the real CoordinatorLauncher (which builds the
+// pod from the lane) does not fail on the missing-model validation.
+func admissionLaneWithCoordinator(name string, concurrency int) *courierv1alpha1.LaneProfile {
+	return &courierv1alpha1.LaneProfile{
+		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: admissionNamespace},
+		Spec: courierv1alpha1.LaneProfileSpec{
+			Concurrency: concurrency,
+			Roles:       map[string]string{"coordinator": "test-model"},
+		},
+	}
+}
+
 func admissionRun(name, lane string, phase courierv1alpha1.Phase) *courierv1alpha1.CoderRun {
 	return &courierv1alpha1.CoderRun{
 		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: admissionNamespace},
@@ -371,4 +386,168 @@ func admissionKey(name string) types.NamespacedName {
 
 func admissionRequest(name string) ctrl.Request {
 	return ctrl.Request{NamespacedName: admissionKey(name)}
+}
+
+func TestReconcileStaysClaimedWhenCoordinatorSlotIsTerminating(t *testing.T) {
+	// The deterministic pod name is held by a pod that is being torn down.
+	// CoordinatorLauncher.Launch must report the collision as
+	// ErrProvisioningInFlight, the reconciler must stay Claimed with a
+	// bounded requeue, and capacity must not be released back to Pending.
+	now := metav1.Now()
+	existing := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:              "next-coordinator",
+			Namespace:         admissionNamespace,
+			DeletionTimestamp: &now,
+			Finalizers:        []string{"keep.test/deletion"},
+		},
+	}
+	client := launcherClientForAdmission(t,
+		admissionLaneWithCoordinator("local", 1),
+		admissionRun("next", "local", courierv1alpha1.PhasePending),
+		existing,
+	)
+	reconciler := &CoderRunReconciler{
+		Client:       client,
+		Sources:      NewSourceRegistry(map[string]source.Adapter{"test": &admissionSource{}}),
+		StatusWriter: fakeStatusWriter{client: client},
+		Launch:       launchFuncForAdmission(client, "example/opencode:test"),
+	}
+
+	result, err := reconciler.Reconcile(context.Background(), admissionRequest("next"))
+	if err != nil {
+		t.Fatalf("Reconcile() error = %v, want nil; a provisioning-in-flight slot must not surface as a launch failure", err)
+	}
+	if result.RequeueAfter != provisioningInFlightRequeueDelay {
+		t.Fatalf("RequeueAfter = %v, want %v; the wait rides the pod delete event with a bounded requeue as the backstop",
+			result.RequeueAfter, provisioningInFlightRequeueDelay)
+	}
+
+	var next courierv1alpha1.CoderRun
+	if err := client.Get(context.Background(), admissionKey("next"), &next); err != nil {
+		t.Fatalf("get next run: %v", err)
+	}
+	if next.Status.Phase != courierv1alpha1.PhaseClaimed {
+		t.Fatalf("next phase = %q, want Claimed; the run must not record Running while the slot is being torn down", next.Status.Phase)
+	}
+
+	var runs courierv1alpha1.CoderRunList
+	if err := client.List(context.Background(), &runs); err != nil {
+		t.Fatalf("list runs: %v", err)
+	}
+	if got := admittedCount(runs.Items, "local"); got != 1 {
+		t.Fatalf("admittedCount(local) after a provisioning-in-flight wait = %d, want 1; the Claimed slot is still reserved", got)
+	}
+}
+
+func TestResumeClaimedStaysClaimedWhenCoordinatorSlotIsTerminating(t *testing.T) {
+	// resumeClaimed is the relaunch path: the run was already Claimed, the
+	// launcher's create collided with a terminating pod, and the run must
+	// not advance to Running until a live pod occupies the name. Without
+	// the fix, the next reconcile would either terminalize the run as
+	// Failed off the dying pod's own termination, or charge a second
+	// infrastructure loss if the pod vanished first.
+	now := metav1.Now()
+	existing := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:              "next-coordinator",
+			Namespace:         admissionNamespace,
+			DeletionTimestamp: &now,
+			Finalizers:        []string{"keep.test/deletion"},
+		},
+	}
+	client := launcherClientForAdmission(t,
+		admissionLaneWithCoordinator("local", 1),
+		admissionRun("next", "local", courierv1alpha1.PhaseClaimed),
+		existing,
+	)
+	reconciler := &CoderRunReconciler{
+		Client:       client,
+		Sources:      NewSourceRegistry(map[string]source.Adapter{"test": &admissionSource{}}),
+		StatusWriter: fakeStatusWriter{client: client},
+		Launch:       launchFuncForAdmission(client, "example/opencode:test"),
+	}
+
+	result, err := reconciler.Reconcile(context.Background(), admissionRequest("next"))
+	if err != nil {
+		t.Fatalf("Reconcile() error = %v, want nil; a provisioning-in-flight slot must not surface as a launch failure", err)
+	}
+	if result.RequeueAfter != provisioningInFlightRequeueDelay {
+		t.Fatalf("RequeueAfter = %v, want %v; the wait rides the pod delete event with a bounded requeue as the backstop",
+			result.RequeueAfter, provisioningInFlightRequeueDelay)
+	}
+
+	var next courierv1alpha1.CoderRun
+	if err := client.Get(context.Background(), admissionKey("next"), &next); err != nil {
+		t.Fatalf("get next run: %v", err)
+	}
+	if next.Status.Phase != courierv1alpha1.PhaseClaimed {
+		t.Fatalf("next phase = %q, want Claimed; the run must not record Running while the slot is being torn down", next.Status.Phase)
+	}
+}
+
+func TestResumeClaimedReachesRunningWhenLaunchSucceeds(t *testing.T) {
+	// Once the slot is free — no terminating pod, the create succeeds — the
+	// resumeClaimed path finishes the admission and the run records
+	// Running, the existing idempotency the issue requires us to preserve.
+	client := launcherClientForAdmission(t,
+		admissionLaneWithCoordinator("local", 1),
+		admissionRun("next", "local", courierv1alpha1.PhaseClaimed),
+	)
+	reconciler := &CoderRunReconciler{
+		Client:       client,
+		Sources:      NewSourceRegistry(map[string]source.Adapter{"test": &admissionSource{}}),
+		StatusWriter: fakeStatusWriter{client: client},
+		Launch:       launchFuncForAdmission(client, "example/opencode:test"),
+	}
+
+	if _, err := reconciler.Reconcile(context.Background(), admissionRequest("next")); err != nil {
+		t.Fatalf("Reconcile() error = %v", err)
+	}
+
+	var next courierv1alpha1.CoderRun
+	if err := client.Get(context.Background(), admissionKey("next"), &next); err != nil {
+		t.Fatalf("get next run: %v", err)
+	}
+	if next.Status.Phase != courierv1alpha1.PhaseRunning {
+		t.Fatalf("next phase = %q, want Running; a free slot advances the resumed admission", next.Status.Phase)
+	}
+	var pod corev1.Pod
+	if err := client.Get(context.Background(), types.NamespacedName{Namespace: admissionNamespace, Name: "next-coordinator"}, &pod); err != nil {
+		t.Fatalf("get coordinator pod: %v", err)
+	}
+	if pod.DeletionTimestamp != nil {
+		t.Fatalf("coordinator pod has DeletionTimestamp set; a fresh Launch must not produce a terminating pod")
+	}
+}
+
+// launcherClientForAdmission is the admission_test mirror of launcherScheme's
+// fake client: it registers corev1 alongside the Courier types so a test that
+// exercises the live launcher can seed a terminating pod alongside the run.
+func launcherClientForAdmission(t *testing.T, objects ...runtime.Object) client.Client {
+	t.Helper()
+	scheme := runtime.NewScheme()
+	if err := courierv1alpha1.AddToScheme(scheme); err != nil {
+		t.Fatalf("add Courier scheme: %v", err)
+	}
+	if err := corev1.AddToScheme(scheme); err != nil {
+		t.Fatalf("add core scheme: %v", err)
+	}
+	return fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithStatusSubresource(&courierv1alpha1.CoderRun{}).
+		WithRuntimeObjects(objects...).
+		Build()
+}
+
+// launchFuncForAdmission adapts the production CoordinatorLauncher to a
+// LaunchFunc so a controller test can drive the real launch path through
+// the reconciler. The fake client carries the run, lane, and any seed
+// pod (live or terminating) the test wants to exercise.
+func launchFuncForAdmission(c client.Client, image string) LaunchFunc {
+	launcher := &CoordinatorLauncher{
+		Client: c,
+		Pod:    executor.PodConfig{Image: image},
+	}
+	return launcher.Launch
 }

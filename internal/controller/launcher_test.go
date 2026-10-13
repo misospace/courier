@@ -374,3 +374,95 @@ func TestCoordinatorLauncherRejectsMalformedEvidenceURL(t *testing.T) {
 		t.Fatalf("coordinator pod present after a malformed intake URL: %v", err)
 	}
 }
+
+func TestCoordinatorLauncherReportsProvisioningInFlightWhenExistingPodIsTerminating(t *testing.T) {
+	run := &courierv1alpha1.CoderRun{
+		ObjectMeta: metav1.ObjectMeta{Name: "run-1", Namespace: "default", UID: types.UID("run-uid")},
+		Spec: courierv1alpha1.CoderRunSpec{
+			Mode: courierv1alpha1.ModeResolveIssue,
+			Repo: "acme/widgets",
+			Ref:  1,
+			Lane: "local",
+		},
+		Status: courierv1alpha1.CoderRunStatus{Phase: courierv1alpha1.PhaseClaimed},
+	}
+	lane := &courierv1alpha1.LaneProfile{
+		ObjectMeta: metav1.ObjectMeta{Name: "local", Namespace: "default"},
+		Spec:       courierv1alpha1.LaneProfileSpec{Roles: map[string]string{"coordinator": "test-model"}},
+	}
+	// A pod that already exists in the API with DeletionTimestamp set:
+	// the slot is held by a pod that is being torn down, so the relaunch
+	// must not record Running. The launcher surfaces this collision as
+	// ErrProvisioningInFlight so the reconciler can stay Claimed and
+	// requeue, instead of treating AlreadyExists as a successful Launch.
+	now := metav1.Now()
+	existing := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:              "run-1-coordinator",
+			Namespace:         "default",
+			DeletionTimestamp: &now,
+			Finalizers:        []string{"keep.test/deletion"},
+		},
+	}
+	fakeClient := fake.NewClientBuilder().
+		WithScheme(launcherScheme(t)).
+		WithStatusSubresource(&courierv1alpha1.CoderRun{}).
+		WithRuntimeObjects(run, lane, existing).
+		Build()
+	launcher := &CoordinatorLauncher{
+		Client: fakeClient,
+		Pod:    executor.PodConfig{Image: "example/opencode:test"},
+	}
+
+	err := launcher.Launch(context.Background(), run)
+	if !errors.Is(err, ErrProvisioningInFlight) {
+		t.Fatalf("Launch() error = %v, want ErrProvisioningInFlight; a colliding terminating pod must not be treated as a successful launch", err)
+	}
+}
+
+func TestCoordinatorLauncherAcceptsExistingPodWhenLive(t *testing.T) {
+	run := &courierv1alpha1.CoderRun{
+		ObjectMeta: metav1.ObjectMeta{Name: "run-1", Namespace: "default", UID: types.UID("run-uid")},
+		Spec: courierv1alpha1.CoderRunSpec{
+			Mode: courierv1alpha1.ModeResolveIssue,
+			Repo: "acme/widgets",
+			Ref:  1,
+			Lane: "local",
+		},
+		Status: courierv1alpha1.CoderRunStatus{Phase: courierv1alpha1.PhaseClaimed},
+	}
+	lane := &courierv1alpha1.LaneProfile{
+		ObjectMeta: metav1.ObjectMeta{Name: "local", Namespace: "default"},
+		Spec:       courierv1alpha1.LaneProfileSpec{Roles: map[string]string{"coordinator": "test-model"}},
+	}
+	// A live existing pod (no DeletionTimestamp) — the resource boundary
+	// was already idempotent, the relaunch is genuinely complete, and the
+	// reconciler should be free to record Running on the next pass without
+	// a second charge.
+	existing := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "run-1-coordinator",
+			Namespace: "default",
+		},
+	}
+	fakeClient := fake.NewClientBuilder().
+		WithScheme(launcherScheme(t)).
+		WithStatusSubresource(&courierv1alpha1.CoderRun{}).
+		WithRuntimeObjects(run, lane, existing).
+		Build()
+	launcher := &CoordinatorLauncher{
+		Client: fakeClient,
+		Pod:    executor.PodConfig{Image: "example/opencode:test"},
+	}
+
+	if err := launcher.Launch(context.Background(), run); err != nil {
+		t.Fatalf("Launch() error = %v, want nil; a colliding live pod keeps the existing idempotency", err)
+	}
+	var runOut courierv1alpha1.CoderRun
+	if err := fakeClient.Get(context.Background(), client.ObjectKey{Namespace: "default", Name: "run-1"}, &runOut); err != nil {
+		t.Fatalf("get run: %v", err)
+	}
+	if runOut.Status.Phase != courierv1alpha1.PhaseClaimed {
+		t.Fatalf("run phase = %q, want unchanged Claimed; phase transitions belong to the reconciler", runOut.Status.Phase)
+	}
+}

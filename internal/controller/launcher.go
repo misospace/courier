@@ -6,6 +6,7 @@ import (
 	"errors"
 	"strings"
 
+	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -26,6 +27,15 @@ var (
 	// empty UID mints a token the intake can never verify from its live read
 	// of the run.
 	ErrEvidenceRunUIDRequired = errors.New("coordinator launcher: evidence tokens require the run UID")
+	// ErrProvisioningInFlight is returned when Launch's create collided with
+	// a pod carrying a DeletionTimestamp: the slot is held by a pod being
+	// torn down, not a live coordinator, so the reconciler must not record
+	// Running. The reconciler treats this as "stay Claimed, requeue", the
+	// same shape as the secure topology's in-flight signal; the pod delete
+	// event normally wakes the next reconcile, with a bounded requeue as
+	// the backstop. A live existing pod still resolves to a successful,
+	// idempotent Launch.
+	ErrProvisioningInFlight = errors.New("coordinator launcher: provisioning in flight; existing pod is terminating")
 )
 
 // CoordinatorLauncher creates the ephemeral coordinator Pod for an admitted
@@ -101,8 +111,25 @@ func (l *CoordinatorLauncher) Launch(ctx context.Context, run *courierv1alpha1.C
 	if err != nil {
 		return err
 	}
-	if err := l.Client.Create(ctx, pod); err != nil && !apierrors.IsAlreadyExists(err) {
+	err = l.Client.Create(ctx, pod)
+	if err == nil {
+		return nil
+	}
+	if !apierrors.IsAlreadyExists(err) {
 		return err
+	}
+	// The create collided with an existing pod. A live one means Launch was
+	// already idempotent at the resource boundary, so nothing more to do;
+	// the reconciler's resumeClaimed path will see the live pod and finish
+	// the admission without a second charge. A terminating one means the
+	// slot is being torn down and writing Running over it would (a) bind
+	// the run to a dying coordinator that the next reconcile could
+	// terminalize as Failed, and (b) charge a second infrastructure loss
+	// if the pod disappears before the wedge path observes it. Surface the
+	// collision so the reconciler can stay Claimed and wait for the delete.
+	var existing corev1.Pod
+	if getErr := l.Client.Get(ctx, client.ObjectKey{Namespace: pod.Namespace, Name: pod.Name}, &existing); getErr == nil && existing.DeletionTimestamp != nil {
+		return ErrProvisioningInFlight
 	}
 	return nil
 }
