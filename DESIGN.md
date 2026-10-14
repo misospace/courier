@@ -2927,7 +2927,15 @@ was superseded.
   source-neutral `blocked-external`/`waiting-external` report — recoverable,
   not parked for a human, and not a claim of no progress. A startup model-
   binding probe that confirms exhaustion declares `blocked_external` instead of
-  `NeedsHuman`. Exhaustion signals default to provider-neutral tokens and a
+  `NeedsHuman`. A delegated sub-agent's **deferred** failure crosses the
+  delegation boundary as the structured classification rather than flattening
+  into tool-visible prose: the coordinator loop ends the run blocked-external
+  before its own (possibly healthy) binding takes another turn, so a
+  role-bound outage cannot invite fresh re-delegations onto the exhausted
+  binding or a false no-progress/human ending; the brief keeps its spent ID,
+  its partial work is never integrated or published, and only fixed redacted
+  text reaches the transcript. Ordinary sub-agent failures stay ordinary tool
+  failures. Exhaustion signals default to provider-neutral tokens and a
   deployment extends them with `COURIER_MODEL_EXHAUSTION_CODES` /
   `COURIER_MODEL_EXHAUSTION_TYPES`; Courier core hard-codes no provider policy
   and adds no silent fallback. The legacy OpenCode executor has no structured

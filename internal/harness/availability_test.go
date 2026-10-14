@@ -384,3 +384,143 @@ func TestExhaustedModelBindingGateIsRecoverable(t *testing.T) {
 		t.Fatalf("gate error = %v, want a recoverable exhausted gate", err)
 	}
 }
+
+func TestClassifyStreamSignalPreservesUnknown(t *testing.T) {
+	tests := []struct {
+		name    string
+		code    string
+		errType string
+	}{
+		{name: "empty signal", code: "", errType: ""},
+		{name: "unrelated type", code: "", errType: "server_overloaded"},
+		{name: "unrelated code", code: "9999", errType: "provider_error"},
+	}
+	for _, test := range tests {
+		got := classifyStreamSignal(test.code, test.errType, ExhaustionSignals{})
+		if got.Availability != ProviderUnknown {
+			t.Fatalf("%s: availability = %q, want unknown", test.name, got.Availability)
+		}
+		if got.Code != "" {
+			t.Fatalf("%s: retained code = %q, want none", test.name, got.Code)
+		}
+		if got.Deferred() {
+			t.Fatalf("%s: unknown stream signal must not be deferred", test.name)
+		}
+	}
+	if got := classifyStreamSignal("", "insufficient_quota", ExhaustionSignals{}); got.Availability != ProviderAllowanceExhausted {
+		t.Fatalf("known stream signal = %+v, want allowance-exhausted", got)
+	}
+}
+
+func TestCoordinatorEndsBlockedExternalOnDelegatedExhaustion(t *testing.T) {
+	worker, delegator, cleanupWorker := testWorkerAndDelegator(t)
+	defer cleanupWorker()
+	worker.completeAll = true
+	worker.snapshotTip = "snap-tip"
+
+	gateway, mocker, cleanup := gatewayFor(
+		// Coordinator (healthy binding): delegate one brief to the coder.
+		gatewayResponse{body: sse(
+			toolCallChunk(0, "call-1", toolDelegate, `{"id":"b1","role":"coder","objective":"Do the work","successCheck":"tests pass"}`),
+			finishChunk("tool_calls"),
+		)},
+		// Coder binding: confirmed allowance exhaustion.
+		gatewayResponse{status: http.StatusTooManyRequests, errBody: `{"error":{"type":"insufficient_quota"}}`},
+	)
+	defer cleanup()
+
+	publisher := &mockPublisher{}
+	coordinator, err := NewCoordinator(CoordinatorConfig{
+		Gateway:   gateway,
+		Bindings:  testBindings(),
+		Worker:    delegator,
+		Snapshot:  snapshotProvider("snap-tip"),
+		Publisher: publisher,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	result := coordinator.Run(context.Background(), testInvocation())
+	if result.Err != nil {
+		t.Fatalf("delegated exhaustion must not be an infrastructure error: %v", result.Err)
+	}
+	if result.Outcome != executor.OutcomeBlockedExternal {
+		t.Fatalf("outcome = %q, want blocked_external", result.Outcome)
+	}
+	if !strings.Contains(result.Reason, "allowance-exhausted") {
+		t.Fatalf("reason = %q, want the availability class", result.Reason)
+	}
+	// Exactly one request reaches the exhausted coder binding: a healthy
+	// coordinator must not re-delegate or burn the binding further.
+	coderRequests := 0
+	for _, call := range mocker.calls {
+		if call.model == "test/coder" {
+			coderRequests++
+		}
+	}
+	if coderRequests != 1 {
+		t.Fatalf("coder requests = %d, want exactly 1", coderRequests)
+	}
+	// The incomplete brief is not integrated and nothing is published; its
+	// partial worker commits never reach the artifact chain, and the brief
+	// unit is terminal so the run state stays consistent for the source.
+	if len(publisher.integrated) != 0 || publisher.count() != 0 {
+		t.Fatalf("integrations = %+v, publisher calls = %d, want none", publisher.integrated, publisher.count())
+	}
+	if coordinator.briefs.HasInFlight() {
+		t.Fatal("the failed brief must be terminal, not in flight")
+	}
+}
+
+func TestDelegatedOrdinaryStreamFailureStaysToolFailure(t *testing.T) {
+	worker, delegator, cleanupWorker := testWorkerAndDelegator(t)
+	defer cleanupWorker()
+	worker.completeAll = true
+	worker.snapshotTip = "snap-tip"
+
+	script := []gatewayResponse{
+		// Coordinator: delegate one brief to the coder.
+		{body: sse(
+			toolCallChunk(0, "call-1", toolDelegate, `{"id":"b1","role":"coder","objective":"Do the work","successCheck":"tests pass"}`),
+			finishChunk("tool_calls"),
+		)},
+	}
+	// Coder binding: a plain provider outage — retried in-process and then
+	// an ordinary, non-deferred brief failure, not a run-level block.
+	for i := 0; i <= maxStreamRetries; i++ {
+		script = append(script, gatewayResponse{status: http.StatusServiceUnavailable})
+	}
+	// Coordinator keeps control after the tool failure and declares.
+	script = append(script, gatewayResponse{body: sse(
+		contentChunk(`{"outcome":"no_change_needed","evidence":"the brief failed with no work integrated"}`),
+		finishChunk("stop"),
+	)})
+
+	gateway, mocker, cleanup := gatewayFor(script...)
+	defer cleanup()
+
+	publisher := &mockPublisher{}
+	coordinator, err := NewCoordinator(CoordinatorConfig{
+		Gateway:   gateway,
+		Bindings:  testBindings(),
+		Worker:    delegator,
+		Snapshot:  snapshotProvider("snap-tip"),
+		Publisher: publisher,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	result := coordinator.Run(context.Background(), testInvocation())
+	if result.Err != nil {
+		t.Fatalf("an ordinary sub-agent failure must not fail the run: %v", result.Err)
+	}
+	if result.Outcome != executor.OutcomeNoChangeNeeded {
+		t.Fatalf("outcome = %q, want the coordinator's declared ending, not a provider block", result.Outcome)
+	}
+	if got := mocker.requestCount(); got != maxStreamRetries+3 {
+		t.Fatalf("gateway requests = %d, want coordinator + retried coder + coordinator", got)
+	}
+	if len(publisher.integrated) != 0 || publisher.count() != 0 {
+		t.Fatalf("integrations = %+v, publisher calls = %d, want none", publisher.integrated, publisher.count())
+	}
+}
