@@ -572,9 +572,9 @@ func TestCoordinatorLauncherAcceptsExistingPodWhenLive(t *testing.T) {
 	// owns — a previous Launch left it at the slot name. The resource
 	// boundary is already idempotent, the relaunch is genuinely complete,
 	// and the reconciler is free to record Running on the next pass
-	// without a second charge. Ownership is verified by OwnerReference
-	// (and LabelRun as the legacy fallback), so a foreign pod at the
-	// same name is not silently adopted.
+	// without a second charge. Ownership is bound to the run's UID via
+	// the controller OwnerReference, so neither a foreign pod nor a pod
+	// left by a dead incarnation of the same name is adopted.
 	controller := true
 	existing := &corev1.Pod{
 		ObjectMeta: metav1.ObjectMeta{
