@@ -134,10 +134,25 @@ func (e *PublicationEngine) CapacityWorkspaceSafety(ctx context.Context) (execut
 	if state == couriergit.WorkStateDirty {
 		return executor.WorkspaceSafetyEvidence{State: "dirty", Branch: branch, Head: head}, nil
 	}
-	if state == couriergit.WorkStateNone {
-		return executor.WorkspaceSafetyEvidence{State: "empty", Branch: branch, Head: head}, nil
+	if state != couriergit.WorkStateCommitted && state != couriergit.WorkStateNone {
+		return executor.WorkspaceSafetyEvidence{State: "unknown", Branch: branch, Head: head}, nil
 	}
-	return executor.WorkspaceSafetyEvidence{State: "unknown", Branch: branch, Head: head}, nil
+	if branch != "integration" {
+		return executor.WorkspaceSafetyEvidence{State: "unknown", Branch: branch, Head: head}, nil
+	}
+	snap, err := retried(ctx, func(ctx context.Context) (BrokerSnapshot, error) {
+		return e.broker.Snapshot(ctx)
+	})
+	if err != nil {
+		return executor.WorkspaceSafetyEvidence{}, e.classify(err, "the capacity workspace proof")
+	}
+	if state == couriergit.WorkStateNone {
+		return executor.WorkspaceSafetyEvidence{State: "empty", Branch: branch, Head: head, RemoteHead: snap.Tip}, nil
+	}
+	if !snap.WorkRefExists || snap.Tip != head {
+		return executor.WorkspaceSafetyEvidence{State: "unknown", Branch: branch, Head: head}, nil
+	}
+	return executor.WorkspaceSafetyEvidence{State: "pushed", Branch: branch, Head: head, RemoteHead: snap.Tip}, nil
 }
 
 func (e *PublicationEngine) WorkRefBeyondAnchor(ctx context.Context) (bool, error) {

@@ -3,6 +3,7 @@ package dispatch
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
@@ -393,7 +394,29 @@ func (c *HTTPClient) SettleCapacityExhaustion(ctx context.Context, id, opaqueCon
 		if d.IssueRepo == "" || d.IssueNumber <= 0 || d.IssueID == "" {
 			return source.ErrUnsupportedCapacityRecovery
 		}
-		return classifyCapacityHandoff(c.do(ctx, http.MethodPost, "/api/issues/capacity-handoff", map[string]any{"issueId": d.IssueID, "repoFullName": d.IssueRepo, "issueNumber": d.IssueNumber, "agentName": c.agentName, "claimToken": handoff.FenceToken, "capacity": handoff.CapacityIdentity}, nil))
+		marker := capacityReceiptMarker(handoff.FenceToken, handoff.IdempotencyKey, handoff.WorkIdentity)
+		if c.issueCapacityHandoffAudited(ctx, d, marker) {
+			return nil
+		}
+		body := map[string]any{"issueId": d.IssueID, "repoFullName": d.IssueRepo, "issueNumber": d.IssueNumber, "agentName": c.agentName, "claimToken": handoff.FenceToken, "capacity": handoff.CapacityIdentity, "note": marker}
+		var response struct {
+			Success bool `json:"success"`
+		}
+		err := c.do(ctx, http.MethodPost, "/api/issues/capacity-handoff", body, &response)
+		if err == nil && response.Success {
+			return nil
+		}
+		if err != nil {
+			if c.issueCapacityHandoffAudited(ctx, d, marker) {
+				return nil
+			}
+			return classifyCapacityHandoff(err)
+		}
+		malformedErr := errors.New("dispatch client: capacity handoff response did not confirm success")
+		if c.issueCapacityHandoffAudited(ctx, d, marker) {
+			return nil
+		}
+		return malformedErr
 	}
 	if d.Type == "followup-pr" && receipt.HandoutToken == handoff.FenceToken && receipt.PRFixID == d.PRFixID && receipt.Generation == d.Generation && d.PRFixID != "" && d.Generation > 0 {
 		body := map[string]any{"taskType": d.Type, "outcome": "capacity-exhausted", "repoFullName": d.Repo, "pullRequestNumber": d.Number, "capacity": handoff.CapacityIdentity, "idempotencyKey": handoff.IdempotencyKey, "prFixItem": map[string]any{"id": d.PRFixID, "generation": d.Generation, "handoutToken": handoff.FenceToken}}
@@ -413,6 +436,34 @@ func (c *HTTPClient) SettleCapacityExhaustion(ctx context.Context, id, opaqueCon
 		return nil
 	}
 	return source.ErrUnsupportedCapacityRecovery
+}
+
+func capacityReceiptMarker(claimToken, idempotencyKey, workIdentity string) string {
+	sum := sha256.Sum256([]byte(claimToken + "\x00" + idempotencyKey + "\x00" + workIdentity))
+	return fmt.Sprintf("capacity-receipt:%x", sum[:])
+}
+
+type capacityAuditEntry struct {
+	Action      string `json:"action"`
+	Success     bool   `json:"success"`
+	Repo        string `json:"repoFullName"`
+	IssueNumber int    `json:"issueNumber"`
+	IssueID     string `json:"issueId"`
+	Notes       string `json:"notes"`
+}
+
+func (c *HTTPClient) issueCapacityHandoffAudited(ctx context.Context, d workDescriptor, marker string) bool {
+	endpoint := "/api/audit?repo=" + url.QueryEscape(d.IssueRepo) + "&limit=100"
+	var entries []capacityAuditEntry
+	if err := c.do(ctx, http.MethodGet, endpoint, nil, &entries); err != nil {
+		return false
+	}
+	for _, entry := range entries {
+		if entry.Action == "issue_capacity_handoff" && entry.Success && entry.Repo == d.IssueRepo && entry.IssueNumber == d.IssueNumber && entry.IssueID == d.IssueID && (entry.Notes == marker || strings.HasSuffix(entry.Notes, "; "+marker)) {
+			return true
+		}
+	}
+	return false
 }
 
 func (c *HTTPClient) Claim(ctx context.Context, id string) error {

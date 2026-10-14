@@ -273,12 +273,12 @@ func (r *Runner) Poll(ctx context.Context) error {
 		if run.Spec.Source == r.Config.Source {
 			if !settledCapacityExhaustion(run) {
 				existing[workKey(run.Spec.Source, identity)] = struct{}{}
+				existing[workKey(run.Spec.Source, run.Spec.WorkItemID)] = struct{}{}
 			}
-			existing[workKey(run.Spec.Source, run.Spec.WorkItemID)] = struct{}{}
 		}
 		// Previous Dispatch bindings encoded queue lanes in Source. Keep those
 		// retained runs from being rematerialized during the identity rollout.
-		if legacyBinding {
+		if legacyBinding && !settledCapacityExhaustion(run) {
 			legacyIdentities[identity] = struct{}{}
 		}
 	}
@@ -325,7 +325,11 @@ func (r *Runner) Poll(ctx context.Context) error {
 				Debug:         spec.Debug,
 			},
 		}
-		run.Name = runName(r.Config.Source, itemIdentity)
+		name := runName(r.Config.Source, itemIdentity)
+		if predecessor := settledPredecessor(runs.Items, r.Config.Source, itemIdentity, r); predecessor != nil {
+			name = successorRunName(r.Config.Source, itemIdentity, predecessor.UID)
+		}
+		run.Name = name
 		if err := r.Create(ctx, run); err != nil && !apierrors.IsAlreadyExists(err) {
 			return fmt.Errorf("create CoderRun for %q: %w", item.ID, err)
 		}
@@ -418,4 +422,24 @@ func workKey(sourceName, workItemID string) string {
 func runName(sourceName, workItemID string) string {
 	digest := sha256.Sum256([]byte(workKey(sourceName, workItemID)))
 	return "courier-" + hex.EncodeToString(digest[:])[:32]
+}
+
+func successorRunName(sourceName, workItemID string, predecessorUID types.UID) string {
+	digest := sha256.Sum256([]byte(workKey(sourceName, workItemID) + "\x00" + string(predecessorUID)))
+	return "courier-" + hex.EncodeToString(digest[:])[:32]
+}
+
+func settledPredecessor(runs []courierv1alpha1.CoderRun, sourceName, identity string, runner *Runner) *courierv1alpha1.CoderRun {
+	var predecessor *courierv1alpha1.CoderRun
+	for i := range runs {
+		run := &runs[i]
+		if run.Spec.Source != sourceName || !settledCapacityExhaustion(run) || run.UID == "" || runner.identity(run.Spec.WorkItemID) != identity {
+			continue
+		}
+		if predecessor == nil || run.CreationTimestamp.Time.After(predecessor.CreationTimestamp.Time) ||
+			(run.CreationTimestamp.Equal(&predecessor.CreationTimestamp) && run.Name > predecessor.Name) {
+			predecessor = run
+		}
+	}
+	return predecessor
 }

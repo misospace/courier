@@ -220,9 +220,15 @@ func runArgs(args []string) error {
 		// through the broker's trusted listener, fenced to this exact
 		// incarnation, and is acknowledged durably through the same
 		// trusted status path before the stop latch flips.
-		Control:                 harness.NewControlWatcher(identity.brokerStatusClient(), reporter),
-		WorkRefBeyondAnchor:     engine.WorkRefBeyondAnchor,
-		CapacityWorkspaceSafety: engine.CapacityWorkspaceSafety,
+		Control:             harness.NewControlWatcher(identity.brokerStatusClient(), reporter),
+		WorkRefBeyondAnchor: engine.WorkRefBeyondAnchor,
+		CapacityWorkspaceSafety: func(ctx context.Context) (executor.WorkspaceSafetyEvidence, error) {
+			evidence, err := engine.CapacityWorkspaceSafety(ctx)
+			// The integration checkout uses a private branch; the broker's pinned
+			// publication destination is the run branch from trusted invocation.
+			evidence.Branch = invocation.Branch
+			return evidence, err
+		},
 	})
 	if err != nil {
 		return fmt.Errorf("courier-control: %w", err)

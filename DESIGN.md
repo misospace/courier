@@ -271,10 +271,10 @@ affirmative trusted safety proof; settle atomically applies it. Incomplete proof
 unsupported capability, or stale fencing retains ownership. Transient settlement
 errors are retried with the same run-scoped idempotency key after controller
 reconstruction. The fake contract exercises both resolve-issue and fix-PR paths,
-including preserved branch/PR metadata; Dispatch implements the interfaces via the merged #1259 receipt-fenced endpoints. Issue settlement is fenced by the issued claim token, but the merged capacity-handoff endpoint does not accept a settlement idempotency key or durably replay success after release: a lost success response can therefore leave Courier holding ownership despite the source having released it. PR-fix capacity settlement uses the issued per-handout receipt. Lifecycle task reports separately support payload-bound replay when given a stable idempotency key. Discovery and dedupe bypass history only for a
+including preserved branch/PR metadata; Dispatch implements the interfaces via the merged #1259 receipt-fenced endpoints. Issue settlement is fenced by the issued claim token. If its POST response is lost or cannot be confirmed, the adapter makes one bounded best-effort lookup in the latest 100 audit rows, matching an exact SHA-256 capacity receipt marker and issue identity; a positive match replays success without another POST. This is not durable server-side idempotency: audit pagination/retention, malformed responses, or lookup failures leave the outcome unknown and ownership held for retry. PR-fix capacity settlement uses the issued per-handout receipt. Lifecycle task reports separately support payload-bound replay when given a stable idempotency key. Discovery and dedupe bypass history only for a
 `BlockedExternal` capacity-exhaustion run with `CapacityRecovery=True/Settled`
-and `LifecycleReported=True`; the exact consumed `WorkItemID` remains
-suppressed, requiring a fresh opaque attempt ID. Other, incomplete, and human
+and `LifecycleReported=True`; a deterministic predecessor-UID successor name permits stable source IDs while
+retaining diagnostic history and active-run deduplication. Other, incomplete, and human
 histories remain barriers. Retained terminal history is never deleted.
 
 ## Contention and concurrency
@@ -1518,7 +1518,8 @@ eligible. Namespace-wide discovery and admission consult all profiles sharing
 15 minutes, a retry-control window rather than a claimed provider reset time.
 Retries of the same exhaustion do not extend its deadline. Successfully settled
 exhaustion history permits rediscovery with a fresh opaque source attempt ID;
-the consumed ID remains excluded, and the old run is retained for diagnostics.
+the successor name incorporates the settled predecessor UID, and the old run
+is retained for diagnostics. Source-issued ownership is reacquired before launch.
 
 Dispatch and Courier are independent systems connected by an adapter, not hard
 dependencies. Dispatch #1259 supplies dedicated fenced capacity handoff APIs;
@@ -1533,7 +1534,8 @@ The core requires trusted secure-executor workspace evidence before invoking
 `CapacityRecoveryPreparer` and `CapacityRecovery`. Legacy or missing evidence,
 dirty work, and unknown remote state hold ownership. The current native evidence
 producer proves only a clean, unchanged integration workspace safe; committed
-work remains unknown until authoritative remote confirmation is implemented.
+work is safe only when a fresh trusted broker snapshot confirms the existing
+work ref at exactly the integration HEAD; local-only commits remain held.
 Evidence absence and a run UID are not proof. No automatic dirty-work transfer
 is claimed. Source-specific receipts are sensitive opaque metadata, never model
 inputs or capacity identities.
@@ -1861,6 +1863,15 @@ named items remain unresolved and must not be described as production-ready:
 - The exact vLLM gauge for backpressure on the target model server.
 
 ## Decisions
+
+- **2026-10-16 — #327: materialize recovery attempts without deleting history.**
+  Successor names incorporate the settled predecessor UID so stable issue IDs
+  and preserved PR-fix generations do not collide with retained runs. Active
+  attempts remain barriers; source claims and handout receipts remain fenced.
+  Published-work evidence comes from a fresh broker remote snapshot, not a
+  cached publication or local ref. Dispatch issue replay accepts only positive
+  matching successful audit evidence bound to the original token and settlement
+  key; absent best-effort audit evidence remains an explicit conservative hold.
 
 - **2026-10-14 — #217: a coordinator slot collision resolves to a successful
   launch only against a pod verified live and owned by the run's UID; every

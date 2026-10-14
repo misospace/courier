@@ -255,7 +255,38 @@ func TestRunnerExclusionOmitsOnlySettledCapacityRuns(t *testing.T) {
 	}
 }
 
-func TestRunnerSettledCapacityExhaustionRequiresFreshOpaqueID(t *testing.T) {
+func TestRunnerSettledCapacityExhaustionAllowsSameOfferWithSuccessorUIDName(t *testing.T) {
+	lane := testLane()
+	lane.Spec.Concurrency = 3
+	old := &courierv1alpha1.CoderRun{
+		ObjectMeta: metav1.ObjectMeta{Name: "old-attempt", Namespace: "courier", UID: "prior-uid"},
+		Spec:       courierv1alpha1.CoderRunSpec{Source: "source", WorkItemID: "settled-token", Mode: courierv1alpha1.ModeFixPR, Repo: "acme/widgets", Ref: 42, Lane: "local"},
+		Status:     courierv1alpha1.CoderRunStatus{Phase: courierv1alpha1.PhaseBlockedExternal, TerminalDiagnostic: &courierv1alpha1.TerminalDiagnostic{Category: courierv1alpha1.TerminalDiagnosticCategoryCapacityExhaustion}, Conditions: []metav1.Condition{{Type: courierv1alpha1.ConditionCapacityRecovery, Status: metav1.ConditionTrue, Reason: "Settled"}, {Type: courierv1alpha1.ConditionLifecycleReported, Status: metav1.ConditionTrue, Reason: "Published"}}},
+	}
+	item := WorkItem{ID: old.Spec.WorkItemID, Mode: "fix-pr", Repo: "acme/widgets", Ref: 42}
+	c := newTestClient(t, lane, old)
+	runner := NewRunner(c, &testAdapter{items: []WorkItem{item}}, RunnerConfig{Source: "source", LaneProfile: "local", Namespace: "courier"})
+	if err := runner.Poll(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	var runs courierv1alpha1.CoderRunList
+	if err := c.List(context.Background(), &runs, client.InNamespace("courier")); err != nil {
+		t.Fatal(err)
+	}
+	if len(runs.Items) != 2 {
+		t.Fatalf("runs=%d, want retained predecessor and successor", len(runs.Items))
+	}
+	wantName := successorRunName("source", item.ID, old.UID)
+	found := false
+	for _, run := range runs.Items {
+		found = found || run.Name == wantName
+	}
+	if !found {
+		t.Fatalf("successor %q not materialized; runs=%#v", wantName, runs.Items)
+	}
+}
+
+func TestRunnerSettledCapacityExhaustionMaterializesSuccessor(t *testing.T) {
 	lane := testLane()
 	lane.Spec.Concurrency = 3
 	old := &courierv1alpha1.CoderRun{
@@ -271,7 +302,7 @@ func TestRunnerSettledCapacityExhaustionRequiresFreshOpaqueID(t *testing.T) {
 	for _, tc := range []struct {
 		name, id string
 		wantRuns int
-	}{{"same consumed token", "consumed-token", 1}, {"fresh token", "new-opaque-token", 2}} {
+	}{{"same consumed token", "consumed-token", 2}, {"fresh token", "new-opaque-token", 2}} {
 		t.Run(tc.name, func(t *testing.T) {
 			adapter := &testAdapter{items: []WorkItem{{ID: tc.id, Mode: "fix-pr", Repo: "acme/widgets", Ref: 42}}}
 			c := newTestClient(t, lane, old.DeepCopy())
