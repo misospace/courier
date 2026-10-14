@@ -47,6 +47,10 @@ var (
 	//     run incarnation — or to no run at all — must not be silently
 	//     adopted as "idempotently live."
 	//
+	// The follow-up read goes through the uncached API reader, not the
+	// informer cache: a cached pod predating a deletion timestamp the API
+	// server already carries must not resolve the collision to success.
+	//
 	// The reconciler treats this as "stay Claimed, requeue", the same
 	// shape as the secure topology's in-flight signal; the pod's delete
 	// event normally wakes the next reconcile, with a bounded requeue as
@@ -62,8 +66,17 @@ var (
 // run. The runtime configuration is deployment-specific; the default is the
 // temporary headless OpenCode shim.
 type CoordinatorLauncher struct {
-	Client   client.Client
-	Scheme   *runtime.Scheme
+	Client client.Client
+	// APIReader reads the API server directly, bypassing the informer
+	// cache. The AlreadyExists collision verification is a liveness check
+	// that gates PhaseRunning, so it must see the API server's current
+	// state: a cached pod predating a deletion timestamp would resolve a
+	// terminating slot to a successful launch, the exact false-running
+	// transition #217 exists to prevent. The manager wiring injects it;
+	// when nil the collision read falls back to the cached client, which
+	// serves only direct-construction tests.
+	APIReader client.Reader
+	Scheme    *runtime.Scheme
 	Pod      executor.PodConfig
 	Executor executor.Executor
 	// EvidenceURL is the intake endpoint handed to coordinator pods for
@@ -169,7 +182,7 @@ func (l *CoordinatorLauncher) Launch(ctx context.Context, run *courierv1alpha1.C
 	// resource boundary was already idempotent and resumeClaimed will
 	// finish the admission in its next pass.
 	var existing corev1.Pod
-	getErr := l.Client.Get(ctx, client.ObjectKey{Namespace: pod.Namespace, Name: pod.Name}, &existing)
+	getErr := l.collisionReader().Get(ctx, client.ObjectKey{Namespace: pod.Namespace, Name: pod.Name}, &existing)
 	switch {
 	case getErr != nil:
 		// Could not verify the slot's live state (NotFound is the
@@ -183,6 +196,18 @@ func (l *CoordinatorLauncher) Launch(ctx context.Context, run *courierv1alpha1.C
 		return ErrProvisioningInFlight
 	}
 	return nil
+}
+
+// collisionReader returns the reader the AlreadyExists collision
+// verification goes through, preferring the injected uncached API reader and
+// falling back to the cached client. Production wiring always injects the
+// API reader, so the fallback serves only direct-construction tests; the
+// liveness decision that gates PhaseRunning never runs against cached state.
+func (l *CoordinatorLauncher) collisionReader() client.Reader {
+	if l.APIReader != nil {
+		return l.APIReader
+	}
+	return l.Client
 }
 
 // criteriaEnvelope renders the trusted COURIER_CRITERIA envelope for one run

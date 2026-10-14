@@ -811,3 +811,70 @@ func TestCoordinatorLauncherReportsProvisioningInFlightWhenExistingPodIsStaleInc
 		t.Fatalf("Launch() error = %v, want ErrProvisioningInFlight; a pod owned by a dead run incarnation must not be adopted", err)
 	}
 }
+
+// TestCoordinatorLauncherCollisionReadBypassesCachedClient pins the review
+// finding that the collision verification must not run against the informer
+// cache: the cached client still serves the pre-deletion view of the slot
+// pod (live, run-owned), while the direct API reader shows the current
+// state (terminating). A cached read would resolve the collision to a
+// successful Launch and let the reconciler record Running over a pod being
+// torn down, so the verification must go through the API reader.
+func TestCoordinatorLauncherCollisionReadBypassesCachedClient(t *testing.T) {
+	run := &courierv1alpha1.CoderRun{
+		ObjectMeta: metav1.ObjectMeta{Name: "run-1", Namespace: "default", UID: types.UID("run-uid")},
+		Spec: courierv1alpha1.CoderRunSpec{
+			Mode: courierv1alpha1.ModeResolveIssue,
+			Repo: "acme/widgets",
+			Ref:  1,
+			Lane: "local",
+		},
+		Status: courierv1alpha1.CoderRunStatus{Phase: courierv1alpha1.PhaseClaimed},
+	}
+	lane := &courierv1alpha1.LaneProfile{
+		ObjectMeta: metav1.ObjectMeta{Name: "local", Namespace: "default"},
+		Spec:       courierv1alpha1.LaneProfileSpec{Roles: map[string]string{"coordinator": "test-model"}},
+	}
+	controller := true
+	ownerRef := metav1.OwnerReference{
+		APIVersion: courierv1alpha1.GroupVersion.String(),
+		Kind:       "CoderRun",
+		Name:       run.Name,
+		UID:        run.UID,
+		Controller: &controller,
+	}
+	// The stale cached view: the pod as it looked before the API server
+	// stamped the deletion timestamp — live and run-owned.
+	stale := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:            "run-1-coordinator",
+			Namespace:       "default",
+			Labels:          map[string]string{executor.LabelRun: run.Name},
+			OwnerReferences: []metav1.OwnerReference{ownerRef},
+		},
+	}
+	// The current API-server view: the same pod carries DeletionTimestamp.
+	now := metav1.Now()
+	current := stale.DeepCopy()
+	current.Finalizers = []string{"keep.test/deletion"}
+	current.DeletionTimestamp = &now
+
+	cached := fake.NewClientBuilder().
+		WithScheme(launcherScheme(t)).
+		WithStatusSubresource(&courierv1alpha1.CoderRun{}).
+		WithRuntimeObjects(run, lane, stale).
+		Build()
+	apiReader := fake.NewClientBuilder().
+		WithScheme(launcherScheme(t)).
+		WithRuntimeObjects(current).
+		Build()
+	launcher := &CoordinatorLauncher{
+		Client:    cached,
+		APIReader: apiReader,
+		Pod:       executor.PodConfig{Image: "example/opencode:test"},
+	}
+
+	err := launcher.Launch(context.Background(), run)
+	if !errors.Is(err, ErrProvisioningInFlight) {
+		t.Fatalf("Launch() error = %v, want ErrProvisioningInFlight; the collision verification must read the API server's current state, not a cached pre-deletion view", err)
+	}
+}
