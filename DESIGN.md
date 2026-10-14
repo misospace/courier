@@ -1079,6 +1079,43 @@ the world. `courier_metrics_scrape_errors_total` counts scrape failures. Scrapin
 is opt-in: the chart's `serviceMonitor.enabled` renders a metrics `Service` and a
 Prometheus Operator `ServiceMonitor`, off by default.
 
+**Connector diagnostics without core coupling (#291).**
+[docs/connector-diagnostics.md](./docs/connector-diagnostics.md) specifies
+adapter-owned diagnostics for optional source connectors so an operator can see
+protocol pressure — exclusion overflow, acknowledgement support/mismatch,
+protocol errors, superseded identities, provider availability — **without**
+Courier core learning a connector's name or its limits. Core keeps a
+source-neutral signal layer (`courier_source_*`); each connector declares a
+bounded capability set (mirroring the optional `internal/source` interfaces) and
+reports values inside one generic `connector.diagnostic` envelope, with the
+configured cap carried as **data** (`courier_connector_exclusion_limit`), never
+as a core constant or label. A dashboard enumerates connectors from
+`courier_connector_capability_info` and renders a panel only for declared
+capabilities, so a non-Dispatch connector needs no Dispatch panel and Courier
+works with an alternate source. Absent and unsupported diagnostics are distinct
+from success, core and connector counters are joined rather than summed, labels
+stay bounded, and trace correlation is optional and never a metric label. §11
+of that document names the bounded-label, duplicate-counting, privacy, and
+correlation assertions the future instrumentation PR must satisfy — the
+requirement-trace target for #291 lives in the doc, not in code that does not
+yet exist. The design records the #286 exclusion-overflow outage as the
+motivating case while leaving the overflow *strategy* to #286 and retention to
+#287; #290 owns the source-health semantics and #292 the views this layer feeds.
+
+**Portable views and alerts (#292).**
+[docs/observability-dashboards-and-alerts.md](./docs/observability-dashboards-and-alerts.md)
+specifies the backend-neutral dashboard information architecture and alert
+catalogue that render the signals above: source health, lane capacity, run
+execution and outcomes, lifecycle reporting, retention, and optional connector
+panels. It separates the portable specification from optional executable
+dashboard/rule assets, names the evaluator an OTel-based integration must
+supply (OTLP is transport, not an alert engine), and records the
+instrumentation gaps — no discovery, reservation, lifecycle-report, or
+retention metrics — that a later instrumentation decision must close before
+those views exist. #290 owns the signal/health semantics and #291 the connector
+diagnostics this layer consumes; neither is required for a Courier dashboard to
+be useful standalone.
+
 ### Per-run telemetry (#172)
 
 The executor already relays the coordinator's stdout through a pass-through tap,
@@ -1260,9 +1297,16 @@ there is no delete verb because active runs reference lanes. (#73)
   publishes `in-review` after stable green observations. Fix-pr attempts receive
   `failed` if checks turn red; a resolve-issue run hands off to **HandedOff**
   instead.
-- **AwaitingReview** is terminal for this run. For a PR, human merges → operator
-  marks **Done** and resolves the source; feedback/conflict → the source spawns a
-  fresh `fix-pr` run without reusing the previous run. A `no_change_needed`
+- **AwaitingReview** is terminal for this run. For a PR, human merges → a slow,
+  bounded world observation (#250) reads the run's **exact recorded PR identity**
+  — base repository plus `status.pr` number through the forge read-pull-request
+  capability, head repository and ref from `status` — and only a merge the forge
+  confirms on that identity moves the run to **Done** and resolves the source;
+  an open PR, a PR closed without merge, a forge error, a missing PR, or a PR
+  whose head identity no longer matches keeps the run in **AwaitingReview** and
+  retries at the slow cadence (closed-unmerged terminalization is #251).
+  feedback/conflict → the source spawns a fresh `fix-pr` run without reusing the
+  previous run. A `no_change_needed`
   resolve-issue run also waits here with its evidence posted for human review;
   Courier does not resolve that source from the coordinator's declaration. A
   `no_change_needed` **fix-pr** run instead waits in **BlockedExternal** on an
@@ -1274,11 +1318,20 @@ there is no delete verb because active runs reference lanes. (#73)
   **HandedOff** is the separate terminal phase for a published resolve-issue PR
   whose stable red checks the source will repair; it is not a success, so it is
   not reaped like **Done** and does not publish `in-review`.
-- **Reap:** Done runs are deleted after their window; NeedsHuman and Failed runs
-  are reaped after the seven-day default window and only once the lifecycle
+- **Reap:** Done runs are deleted after their window; Failed and NeedsHuman runs
+  are reaped after their (seven-day default) window and only once the lifecycle
   report has reached a positive, settled state (never on a missing, `Unknown`, or
-  still-`False` report). HandedOff is still kept (not reaped) and deleted on
-  request; see [Terminal retention and closed-unmerged PRs](#terminal-retention-and-closed-unmerged-prs-251).
+  still-`False` report). The reaper always retains the most recent
+  `Failed`/`NeedsHuman` runs per repository (default five), counting only the
+  phases the floor governs: Done runs are exempt because their source work is
+  already resolved so the five-minute window is the whole retention, and the
+  never-reaped phases cannot drain the quota. It emits
+  `courier_coderuns_reap_requests_total` (accepted delete requests) and
+  `courier_coderuns_oldest_terminal_age_seconds` (what is still retained).
+  AwaitingReview is kept until the world moves it; HandedOff and BlockedExternal
+  are still kept (not reaped) — HandedOff is deleted on request, and
+  BlockedExternal stays recoverable so its source can re-issue it; see
+  [Terminal retention and closed-unmerged PRs](#terminal-retention-and-closed-unmerged-prs-251).
 
 **Terminalization writes the run's own phase before it reports to the source.**
 A rejected or failed source report never holds a run in `Running`: the phase is
@@ -1292,11 +1345,11 @@ terminal phase with the report retried on a later reconcile. (#178)
 
 ## Terminal retention and closed-unmerged PRs (#251)
 
-**The leak:** `reapDone` (`internal/controller/reap.go`) deletes only resolved `Done` runs after a default five minutes. `AwaitingReview`, `HandedOff`, `NeedsHuman`, and `Failed` are never reaped: `Reconcile` (`internal/controller/coderun_controller.go`) revisits a terminal phase only to retry a pending lifecycle report and otherwise returns without a timer, and the controller never re-observes a PR after a run settles `AwaitingReview`. The #179 dogfood deployment left 26 `AwaitingReview`, 6 `NeedsHuman`, 1 `Failed`, and 17 retained coordinator pods. `source.Runner.Poll` (`internal/source/runner.go`) lists every CoderRun on every poll to build its dedupe set, so the list grows without bound.
+**The leak:** `reapDone` (`internal/controller/reap.go`) deletes only resolved `Done` runs after a default five minutes. `HandedOff`, `NeedsHuman`, and `Failed` are never reaped: `Reconcile` (`internal/controller/coderun_controller.go`) revisits a terminal phase only to retry a pending lifecycle report and otherwise returns without a timer. `AwaitingReview` was part of the same gap — the controller never re-observed a PR after a run settled — until #250 added the slow, bounded read of the recorded pull request that turns a confirmed merge into `Done`; a PR closed without merge still keeps its run indefinitely, which this design fixes below. The #179 dogfood deployment left 26 `AwaitingReview`, 6 `NeedsHuman`, 1 `Failed`, and 17 retained coordinator pods. `source.Runner.Poll` (`internal/source/runner.go`) lists every CoderRun on every poll to build its dedupe set, so the list grows without bound.
 
-**Retention clock:** Retention is a bounded inspection window keyed to a durable, **per-phase "reap-eligible" annotation** — not `FinishedAt`, not `CreationTimestamp`, and not the source report condition alone. `FinishedAt` records the run's execution end and is set-once on the first terminal transition (`AwaitingReview`, `HandedOff`, `NeedsHuman`, or `Failed`); it must remain immutable so a later transition (notably the months-late `AwaitingReview → NeedsHuman` from a closed-unmerged PR) does not distort `RunDuration` or the merge-to-`Done` semantics, and so `Done`'s `RunDuration` is always the work's wall-clock cost rather than the reaper's view of it. Therefore `FinishedAt` is **not** the retention clock for `NeedsHuman`/`Failed`. The controller instead writes a new set-once annotation when the run becomes reap-eligible for that phase: `courier.misospace.dev/needs-human-at` on entry to `NeedsHuman` and `courier.misospace.dev/failed-at` on entry to `Failed`, each an RFC3339 timestamp stamped once after the lifecycle report reaches a settled state (see Deletion gates). For a direct `Running`/`Verifying → NeedsHuman`/`Failed`, the annotation is written at the same moment `FinishedAt` is set, so the window starts at the actual end of execution; for a late `AwaitingReview → NeedsHuman` (the closed-unmerged case), the annotation is written at the close-unmerged transition, **not** the original `FinishedAt`, so the seven-day window is the operator's inspection window for the new outcome, not a zero-length residue of months-old execution time. `Done` keeps its existing separate `courier.misospace.dev/done-at` annotation (`doneAtAnnotation`) because a `Done` transition can occur long after `FinishedAt` (and the source `Resolve` precedes the marker, not the phase change). A missing or malformed marker starts a fresh window and never deletes on the same pass; a future-dated marker (clock skew) is capped at the window and never deletes early — the same fail-safe rules `reapDone` already applies. `AwaitingReview` is deliberately outside this window: it is a success ending awaiting a human merge, not a terminal failure, so it is kept until the world moves it — #250 resolves a merge to `Done`, and this design resolves a closed-unmerged PR to `NeedsHuman`; only then does a retention window start. A PR that stays open keeps its run, which is the run's live-work record and the human gate. The annotations live on the object, so controller restart re-derives the remaining window from the durable marker without re-stamping, re-arming, or distorting `FinishedAt`.
+**Retention clock:** Retention is a bounded inspection window keyed to a durable, **per-phase "reap-eligible" annotation** — not `FinishedAt`, not `CreationTimestamp`, and not the source report condition alone. `FinishedAt` records the run's execution end and is set-once on the first terminal transition (`AwaitingReview`, `HandedOff`, `NeedsHuman`, or `Failed`); it must remain immutable so a later transition (notably the months-late `AwaitingReview → NeedsHuman` from a closed-unmerged PR) does not distort `RunDuration` or the merge-to-`Done` semantics, and so `Done`'s `RunDuration` is always the work's wall-clock cost rather than the reaper's view of it. Therefore `FinishedAt` is **not** the retention clock for `NeedsHuman`/`Failed`. The controller instead writes a new set-once annotation when the run becomes reap-eligible for that phase: `courier.misospace.dev/needs-human-at` on entry to `NeedsHuman` and `courier.misospace.dev/failed-at` on entry to `Failed`, each an RFC3339 timestamp stamped once after the lifecycle report reaches a settled state (see Deletion gates). For a direct `Running`/`Verifying → NeedsHuman`/`Failed`, the annotation is written on the first reconcile after the lifecycle report settles — the reconcile immediately after `FinishedAt` is set — so the window starts at the actual end of execution; for a late `AwaitingReview → NeedsHuman` (the closed-unmerged case), the annotation is written at the close-unmerged transition, **not** the original `FinishedAt`, so the seven-day window is the operator's inspection window for the new outcome, not a zero-length residue of months-old execution time. `Done` keeps its existing separate `courier.misospace.dev/done-at` annotation (`doneAtAnnotation`) because a `Done` transition can occur long after `FinishedAt` (and the source `Resolve` precedes the marker, not the phase change). A missing or malformed marker starts a fresh window and never deletes on the same pass; a future-dated marker (clock skew) is capped at the window and never deletes early — the same fail-safe rules `reapDone` already applies. `AwaitingReview` is deliberately outside this window: it is a success ending awaiting a human merge, not a terminal failure, so it is kept until the world moves it — #250 resolves a merge to `Done`, and this design resolves a closed-unmerged PR to `NeedsHuman`; only then does a retention window start. A PR that stays open keeps its run, which is the run's live-work record and the human gate. The annotations live on the object, so controller restart re-derives the remaining window from the durable marker without re-stamping, re-arming, or distorting `FinishedAt`.
 
-**Defaults and deployment knob:** `Done` stays five minutes. `Failed` and `NeedsHuman` default to 168 hours (seven days), measured from each run's per-phase annotation (`courier.misospace.dev/failed-at` and `courier.misospace.dev/needs-human-at`) rather than from `FinishedAt`, so a late `AwaitingReview → NeedsHuman` transition starts a fresh window. Expose three manager flags and a chart `retention:` block (`done`, `failed`, `needsHuman`) rendered into `controllers.main.containers.main.args` like the existing `evidence:` block. `DoneRetention` already exists on `CoderRunReconciler`; add `FailedRetention` and `NeedsHumanRetention` fields with zero-falls-back-to-default semantics matching `doneRetention()`.
+**Defaults and deployment knob:** `Done` stays five minutes. `Failed` and `NeedsHuman` default to 168 hours (seven days), measured from each run's per-phase annotation (`courier.misospace.dev/failed-at` and `courier.misospace.dev/needs-human-at`) rather than from `FinishedAt`, so a late `AwaitingReview → NeedsHuman` transition starts a fresh window. Expose four manager flags (`--done-retention`, `--failed-retention`, `--needs-human-retention`, `--terminal-audit-keep`) and a chart `retention:` block (`done`, `failed`, `needsHuman`, `auditKeep`) rendered into `controllers.main.containers.main.args` like the existing `evidence:` block. `CoderRunReconciler` carries `DoneRetention`, `FailedRetention`, `NeedsHumanRetention`, and `TerminalAuditKeep` fields with zero-falls-back-to-default semantics; a negative `TerminalAuditKeep` disables the audit floor. **The audit floor's candidate set is exactly the phases it governs:** a run counts toward — and is protected by — the floor only in `Failed` or `NeedsHuman`. `Done` runs are exempt from the floor (their source work is already resolved) and `AwaitingReview`, `HandedOff`, and `BlockedExternal` are never reaped at all, so counting either as a newer entry would let a burst of short-lived Done runs, or one permanently held run, drain the protected quota and permanently delete the runs the floor promises to keep. **The metric contract is a request, not a removal:** the reaper increments `courier_coderuns_reap_requests_total{phase}` on every accepted delete request — the API server accepts the delete on a secure run while the topology finalizer still holds the object — and the scrape-time `TerminalAgeCollector` reports `courier_coderuns_oldest_terminal_age_seconds{phase}` so an operator can see what is actually retained (a finalizer-held object stays on the gauge) and whether anything is aging past its window (a stuck report or an audit-floor hold).
 
 **Closed-unmerged PRs:** A run terminalizes as `NeedsHuman` with a precise reason; no new CRD phase. Today a `Verifying` run whose PR is closed without merge observes an empty `PRObservation` and transitions to `NeedsHuman` (#146); the gap is a PR closed after the run already settled `AwaitingReview`, which is never observed. The slow, bounded world observation added for #250 (merged -> `Done`) classifies the run's exact recorded PR identity as: merged -> `Done` (existing resolve + reap); open -> stay `AwaitingReview`; closed without merge -> `NeedsHuman` with a new `PullRequestClosedUnmerged` condition (`Status=True`, reason `ClosedUnmerged`) whose message carries the recorded PR identity, under the existing needs-human source policy (a `blocked` lifecycle report; the source parks the item and owns retry/escalation); absent, ambiguous, or a transient forge error -> no transition, stay `AwaitingReview`, and retry the observation later. A missing or unreadable PR is never treated as closed. The transition stamps the per-phase `courier.misospace.dev/needs-human-at` annotation at the close-unmerged moment (not the original `FinishedAt`), so the seven-day inspection window starts at the operator-visible close event. No new CRD phase: `Done` would falsely attest shipped work, and a bespoke `Closed` phase is unnecessary because an existing non-successful phase already covers it. Implementation hook: the GitHub observer (`internal/github/observer.go`) currently collapses closed and never-opened into "no open PR" (`PRObservation{}`), so it must expose an explicit closed-unmerged signal on `PRObservation` for the controller to distinguish them.
 
@@ -1306,7 +1359,7 @@ terminal phase with the report retried on a later reconcile. (#178)
 
 **Covered cases:** controller restart (the per-phase annotation and the `LifecycleReported` condition are durable on the run, so a new process recomputes the remaining window from the object without re-stamping, re-arming, or distorting `FinishedAt`); absent PR (no transition, no annotation, no clock start); transient source/forge failure (no transition, no early reap); stale generation (a superseded report satisfies the settled-state gate and the newer run dedupes the identity); re-discovery (after a reaped run, a source that still offers an already-blocked/resolved item does not recreate it); late `AwaitingReview → NeedsHuman` from a closed-unmerged PR (the seven-day window starts at the close-unmerged transition's `courier.misospace.dev/needs-human-at` annotation, not at the original `FinishedAt`); a missing or `Unknown`/`False` `LifecycleReported` condition (the run stays unreaped until the report reaches a positive settled state or an operator intervenes — there is no fail-open delete path).
 
-**Decomposition:** Two implementation children are settled here: (a) bounded retention for `Failed`/`NeedsHuman` — generalize the reaper with the per-phase `courier.misospace.dev/needs-human-at` and `courier.misospace.dev/failed-at` annotations (set-once after the lifecycle report settles, never derived from `FinishedAt`), the new flags/chart values, and the positive `LifecycleReported` settled-state gate (legacy missing/`False`/`Unknown` runs stay unreaped); (b) closed-unmerged terminalization (observer closed-unmerged signal plus the `AwaitingReview` observation branch, stamping the new annotation at the close-unmerged transition rather than re-using the original `FinishedAt`). Both build on #250's observation loop. The implementation must also retire the stale "terminal runs are never reaped" comments and assertions at `internal/controller/coderun_controller.go:548`, `internal/controller/coderun_controller.go:570`, `internal/controller/reap.go:27`, `internal/controller/secure_launcher.go:328`, `internal/controller/secure_launcher.go:438`, and the matching assertion in `internal/controller/secure_test.go:1201`, scoping their replacements to `AwaitingReview` and `HandedOff`; retire the "there is deliberately no deployment knob for it" comment at `internal/controller/reap.go:86`, which the new `done` flag makes false; and correct the `FinishedAt` doc comment at `api/v1alpha1/coderun_types.go:328–331` to include `HandedOff` in the listed terminal phases. `HandedOff` retention and an independent evidence TTL are explicitly out of scope. The two children's done-conditions must explicitly require: a late `AwaitingReview` age (days/weeks/months) must never cause an immediate reap of a closed-unmerged run, the per-phase annotation must survive controller restarts without re-stamping, and a legacy/missing/`False`/`Unknown` `LifecycleReported` condition must never satisfy the settled-state gate.
+**Implementation:** Bounded retention for `Failed`/`NeedsHuman` is implemented (#287, absorbing the #276 brief). `reapTerminal` (`internal/controller/reap.go`) generalizes the reaper with the per-phase `courier.misospace.dev/needs-human-at` and `courier.misospace.dev/failed-at` annotations (set-once on the first reconcile after the lifecycle report settles, never derived from `FinishedAt`), the four flags/chart values above, and the positive `LifecycleReported` settled-state gate (legacy missing/`False`/`Unknown` runs stay unreaped). It adds a per-repository audit floor — the most recent `terminalAuditKeep` `Failed`/`NeedsHuman` runs are retained past their window, and the floor counts only those phases — and the retention metrics (`courier_coderuns_reap_requests_total` for accepted deletes, `courier_coderuns_oldest_terminal_age_seconds` for what is still retained). The stale "terminal runs are never reaped" comments and assertions were retired, scoped to `AwaitingReview` and `HandedOff`. Closed-unmerged terminalization remains child #277: the observer must expose an explicit closed-unmerged signal on `PRObservation` (it currently collapses closed and never-opened into "no open PR") and the `AwaitingReview` observation branch must stamp the `needs-human-at` annotation at the close-unmerged transition; until then a closed-unmerged PR keeps its run, exactly as before. The #277 done-condition that still binds: a late `AwaitingReview` age (days/weeks/months) must never cause an immediate reap of a closed-unmerged run, and the per-phase annotation must survive controller restarts without re-stamping (already true for the direct path). `HandedOff` retention and an independent evidence TTL remain out of scope.
 
 ## Sources
 
@@ -1606,6 +1659,90 @@ named items remain unresolved and must not be described as production-ready:
 
 ## Decisions
 
+- **2026-10-13 — #317: git commit identity is deployment configuration,
+  never a hard-coded value or a token-derived one.** Operator-managed
+  executor pods injected `Courier <courier@localhost>` explicitly, and the
+  explicit container environment beat the envFrom executor Secret, so no
+  deployment could associate its commits with a forge account (PR #301's
+  commits resolved to a null author and committer on GitHub). Four operator
+  flags — `--git-author-name`, `--git-author-email`, `--git-committer-name`,
+  `--git-committer-email` — flow through `executor.PodConfig.Git`
+  (`GitIdentity`) into the four `GIT_*` variables of every generated
+  coordinator pod. Empty or whitespace-only fields resolve to the same
+  explicit default `Courier <courier@localhost>`, so default behavior is
+  backward compatible; configured values are validated fail-closed at startup
+  and at pod generation (no ASCII control characters or angle brackets; a
+  non-empty email must contain `@` and carry no whitespace). Precedence: operator flags are
+  explicit container env and therefore win over same-named keys of
+  `--executor-environment-secret` (Kubernetes env-over-envFrom), while the
+  standalone executor keeps the opposite order — a non-empty `GIT_*` in its
+  environment (shell export or Secret) is preserved and only unset or blank
+  names receive the fallback, and the fallback reads the executor package's
+  default constants so the two producers cannot drift. Authorship stays a
+  separate concern from forge authentication: nothing derives identity from
+  a token and no account is hard-coded upstream; GitHub links a commit to an
+  account only through an account-associated email, and attribution is
+  separate from commit signing. Secure mode's integration identity in
+  `internal/git` is control's own plumbing identity and is unchanged by this
+  decision. (#317)
+
+- **2026-10-13 — #280: the acceptance-criterion set is pinned at admission
+  by a trusted forge read and carried, never re-derived.** The identification
+  boundary of #249: secure admission reads the source issue through the
+  selected provider's typed work-item read (`github.Client.GetIssue` behind
+  `forge.Provider.ReadWorkItem` — an existing capability in the closed
+  vocabulary, read-only) on the operator's read identity, runs the pure
+  `ExtractCriteria`, and persists the set beside a `sourceIssue` identity
+  pin in `Status.PublicationPolicy` (`acceptanceCriteria` +
+  `acceptanceCriteriaDigest`, additive; CRDs/deepcopy regenerated). An empty
+  set is pinned with its identity-only digest — the smallest contract change
+  to #249's pure seam, needed so a pinned-empty contract stays
+  distinguishable from an unpinned policy; ambiguity, over-bound sets, and
+  over-long criteria terminalize `NeedsHuman` naming why and are never
+  truncated. The broker binding reconstructs and digest-verifies the pin
+  (fix-pr pins, tampered pins,
+  and orphaned pin fields — any partial tuple — fail closed; only the fully
+  absent tuple is the legal pre-contract state, no migration). The trusted
+  read's response identity is verified against the request — the returned
+  issue number and repository must match the canonical pin — so a
+  misrouted provider answer can never pin another issue's criteria. The identical set is projected to the executor
+  contract as trusted env `COURIER_CRITERIA` (broker criterion-set JSON)
+  from the persisted policy by the legacy launcher and the secure control
+  invocation — the executor package stays free of any broker import because
+  broker's test graph imports the harness; the envelope is injected at the
+  launcher seam like evidence tokens are. Boundary enforcement stays with
+  #281 (native create refusal) and #282 (legacy handoff repair). (#280,
+  #249, #204)
+
+- **2026-10-13 — #243: the harness owns a per-role context budget and compacts
+  before the ceiling at a step boundary; the effective limit is the minimum of
+  the declared budget and the gateway-verified model input capability, never an
+  implicit default.** Today the native harness declares no budget and the
+  OpenCode executor's auto-compaction fires reactively at its own threshold, so
+  a worker can ride its prompt past the bound model alias's input limit and
+  LiteLLM diverts the oversize request to a fallback alias before compaction
+  lands — capacity management by accident. The settled policy: (a) an optional
+  `LaneProfileSpec.context` per-role budget (`compactAtPercent` default 75,
+  `outputReservation`, and per-role `maxInputTokens`/overrides), absent meaning
+  the harness owns no budget and the executor default stands; (b) effective
+  limit `= min(declared, gateway-verified)`, where a verified read is `healthy`,
+  a declared-only ceiling is `configured` (never healthy), and neither is an
+  explicit failure — no implicit context-window fallback is treated as
+  successful capacity management; (c) a pre-ceiling step-boundary trigger at
+  `floor(effective × compactAtPercent / 100)` or when the next turn plus the
+  output reservation would cross the effective limit, with the post-condition
+  `prompt + reservation ≤ effective` and fail-closed behavior when it cannot
+  hold or when a digest reclaims no tokens (`After < Before`); (d) digest-not-prune compaction that never drops the pinned brief,
+  settled `Decision`s, `OwnedFiles`, or the most recent turn, with the §7
+  checkpoint ladder as the durable record, and a `session.compacted` run event
+  carrying before/after/reclaimed token counts. The pure resolution, trigger,
+  and preservation policy and its truth table land in
+  `internal/harness/budget.go` / `internal/harness/budget_test.go`. The
+  per-brief spawn budget stays out of scope, and the OpenCode default is
+  unchanged — a legacy mitigation is a separate bounded ticket. Implementation
+  is three bounded children (#295 schema + bootstrap mirror, #296 gateway probe
+  + effective-limit resolution, #297 step-boundary enforcement + telemetry).
+  (#243)
 - **2026-10-13 — #210: `COURIER_TERMINATION` line budgeting lives in one place; both
   producers (`courier-executor`, `courier-control`) call it.** The native
   control handoff built its reason from capability detail strings with no
@@ -1620,6 +1757,57 @@ named items remain unresolved and must not be described as production-ready:
   specific to the OpenCode telemetry path) and delegates the reason-shrink
   step to the shared helper; the control uses the shared helper
   end-to-end. (#210, #188)
+- **2026-10-13 — #292: Courier's dashboard views and alert conditions are
+  specified backend-neutrally, and assets are optional renderings.** The
+  portable specification is
+  [docs/observability-dashboards-and-alerts.md](./docs/observability-dashboards-and-alerts.md):
+  a six-section dashboard information architecture (source health, lane
+  capacity, run execution/outcomes, lifecycle reporting, retention, optional
+  connector panels) and an alert catalogue that states each condition's
+  evidence, window, threshold rationale, recovery, severity, expected action,
+  and behaviour under missing telemetry, startup, disabled sources, empty
+  queues, and low traffic. Prometheus and VictoriaMetrics share one
+  PromQL-compatible mapping; OTel is transport and must name an evaluator
+  (a rules engine — the Collector alone is not an alert evaluator); any other
+  backend may implement the same views and conditions, with no promise of
+  identical assets or feature parity. Idle is not failure, discovery failure
+  is distinguishable from an empty queue, and no Courier health condition
+  requires Dispatch telemetry. The design records the existing instrumentation
+  (`internal/controller/metrics.go`, `internal/log/events.go`, `CoderRun`
+  status) and the gaps — discovery, reservation, lifecycle-report, and
+  retention signals are absent — so no exporter or dependency is chosen before
+  those gaps are settled. This is design only: no code, dashboard JSON,
+  executable rules, exporter dependencies, or deployment manifests, and no
+  instrumentation work is authorized. (#292, #289, #290, #291)
+- **2026-10-13 — #291: connector diagnostics are adapter-owned and carried in a
+  generic envelope; core stays source-agnostic and configured limits are data.**
+  The design is
+  [docs/connector-diagnostics.md](./docs/connector-diagnostics.md), a child of
+  the portable-observability umbrella (#289). Courier core owns only a
+  source-neutral signal layer (`courier_source_*`) and a closed capability
+  vocabulary that mirrors the optional `internal/source` seams
+  (`DiscoveryExcluder`, `Reporter`, `PreLauncher`, `WorkIdentifier`); each
+  connector declares a per-capability state (`supported`/`unsupported`/
+  `unknown`) and reports values in one generic `connector.diagnostic` envelope
+  whose label set is bounded (`connector`, `signal`, `reason`, `state`) and
+  whose numeric observations — including an exclusion cap such as Dispatch's 32
+  — travel as **values**, never as labels or core constants. A dashboard
+  discovers optional capabilities from `courier_connector_capability_info`, so a
+  non-Dispatch connector renders without any Dispatch-specific core logic and
+  Courier remains usable with an alternate source. Absent and unsupported
+  diagnostics are distinct states from success; a connector diagnostic that
+  explains a core signal is joined by `connector` and time, never summed; and
+  optional `run_id`/trace correlation rides logs only, never metric labels, and
+  is not a prerequisite for either app. §11 of the spec lists the
+  bounded-label, duplicate-counting, privacy, and correlation assertions the
+  future instrumentation PR must satisfy; that checklist is the
+  requirement-trace target for this design — until those tests land, the
+  envelope is paper, not enforced behavior. The `PR-fix exclusions exceed
+  maximum 32` stall (#286) is the motivating case, but this document only makes
+  the pressure observable: it does not choose an overflow strategy (#286) or
+  touch retention (#287). Design only — no protocol change, implementation,
+  shared cross-app schema, mandatory identifier, deployment, or dashboard.
+  (#291, #289, #290, #292, #286, #287)
 - **2026-10-12 — #249: one executor-neutral acceptance-criterion evidence
   contract is enforced in both publication paths against a revision-pinned
   trusted snapshot of the source issue.** Admission reads the source issue
@@ -2547,6 +2735,29 @@ was superseded.
   policies recorded in the earlier #267 follow-up. Source-owned generation and
   cooldown fence recovery instead of a Courier poll-driven retry loop. (#267)
 
+- **2026-10-13 — #250: a settled `AwaitingReview` run observes its exact
+  recorded PR identity at a slow cadence; a forge-confirmed merge on that
+  identity finishes it `Done`.** `Reconcile` now revisits a settled
+  `AwaitingReview` run (after any pending lifecycle report has retried — the
+  source sees `in-review` before the `Done` resolve) with one slow, bounded
+  read through the forge `read-pull-request` capability: base repository plus
+  the `status.pr` number, verified against the recorded head repository and
+  ref, never inferred from a branch name. Only `merged` on that exact identity
+  transitions; open, closed-unmerged, absent, ambiguous, head-changed, or an
+  error never does, and `FinishedAt` is preserved. `Done` reuses the existing
+  lifecycle — source `Resolve` precedes the `done-at` marker, so a run whose
+  source could not be resolved is still never reaped, and after the reap the
+  source is the dedupe authority (Dispatch excludes `done` issues from
+  `next-task`, verified against `src/lib/agent-queue.ts`). Terminal-run metrics
+  are recorded on the run's **first** terminal transition only, so a late
+  `Done` does not count the run twice. Repository identity compares
+  case-insensitively (GitHub names cannot collide across case), and a merged
+  PR that no longer matches the recorded head logs its mismatch instead of
+  failing silently. Runs already settled at upgrade are observed on their next
+  wake (watch event or informer resync), then on the same slow cadence.
+  Closed-unmerged terminalization and the
+  `Failed`/`NeedsHuman` retention window stay with #251's children.
+  (#250, #179, #251)
 - **2026-10-13 — #222: the wedge path reaps the coordinator, `SecureControl`
   fences the round.** `checkLiveness`'s wedge path selected its reap set (and
   its startup-grace set) by run ownership alone, while the coordinator
@@ -2582,3 +2793,52 @@ was superseded.
   Courier's same-identity dedupe absorbs any re-offered truncated-out
   generation without materializing a duplicate run. Malformed
   descriptors still fail closed. (#286)
+
+- **2026-10-13 — #287: the terminal reaper covers `Failed` and `NeedsHuman`
+  with a per-repository audit floor and retention metrics.** `reapDone` was
+  generalized into `reapTerminal`: `Failed` and `NeedsHuman` runs are deleted
+  after their (168h default) window, measured from a set-once per-phase
+  annotation (`courier.misospace.dev/failed-at`,
+  `courier.misospace.dev/needs-human-at`) stamped on the first reconcile after
+  the `LifecycleReported` condition reaches a positive, settled state. The
+  reaper never deletes a run whose report is pending, missing, `Unknown`, or
+  `False` — that run is the only durable retry intent — and it never deletes on
+  the pass that stamps a missing or malformed marker, nor early on a
+  future-dated (skewed) one. A per-repository audit floor keeps the most recent
+  `--terminal-audit-keep` (default 5) terminal runs even past their window, so a
+  burst of work never erases the recent audit trail; `Done` keeps its separate
+  five-minute window and is not subject to the floor because its source work is
+  already resolved. Deletions increment `courier_coderuns_reaped_total{phase}`
+  and a scrape-time `TerminalAgeCollector` exposes
+  `courier_coderuns_oldest_terminal_age_seconds{phase}`, so an aging run past
+  its window is visible without listing objects. The four windows/floor are
+  wired as manager flags and a chart `retention:` block; the floor is scoped to
+  the run namespace and repository and orders runs by terminal time with a name
+  tiebreak, so exactly the floor's count is retained. `AwaitingReview`,
+  `HandedOff`, and `BlockedExternal` stay unreaped (a later merge moves the
+  former to `Done`); the stale "terminal runs are never reaped" comments were
+  retired, scoped to `AwaitingReview`/`HandedOff`. Closed-unmerged
+  terminalization remains #277. This absorbs the #276 brief; retry and
+  escalation stay source-owned. (#287, #251, #276, #250)
+
+- **2026-10-13 — #287 review: the audit floor counts only the phases it
+  governs, and the reap counter counts accepted deletes rather than removals.**
+  The floor originally counted every terminal phase as a newer entry, which let
+  a burst of exempt `Done` runs — or a single never-reaped `AwaitingReview` run —
+  push the settled `Failed`/`NeedsHuman` runs it was meant to protect out of the
+  floor and delete them permanently, leaving no audit trail at all. The floor's
+  candidate set is now `auditFloorPhase` (`Failed`/`NeedsHuman`) in both roles:
+  an exempt or unreaped run neither consumes a protected slot nor needs one, and
+  the floor stays bounded because every run that counts toward it is reaped.
+  Separately, `courier_coderuns_reaped_total` was incremented on an accepted
+  Kubernetes DELETE, but a secure run's topology finalizer keeps the object
+  after that request, so the counter claimed a removal that had not happened; it
+  is now `courier_coderuns_reap_requests_total{phase}` and says so in its help
+  text, and the scrape-time `courier_coderuns_oldest_terminal_age_seconds{phase}`
+  gauge is the evidence of completed cleanup because it reads live state — a
+  held object stays on it. Confirming removal inside the reconciler would need
+  new watch machinery for no operator gain, so the honest split (requests
+  counted, retention shown) was chosen instead. A regression test walks the
+  temporal case — five newer Done runs plus three unreaped runs against a
+  floor of two, then the Done cleanup — and a finalizer-held test pins the
+  request semantics, including no double count on a duplicate wake. (#287, #251)

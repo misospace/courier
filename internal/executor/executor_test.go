@@ -1368,14 +1368,14 @@ func TestBuildCoordinatorPodOmitsEvidenceWhenNotConfigured(t *testing.T) {
 func TestEnvironmentWithConfigOmitsEvidenceWhenNotSet(t *testing.T) {
 	inv := Invocation{RunName: "r", Namespace: "n", Ref: 1, Goal: "g", Model: "m", Workspace: "/w", Mode: courierv1alpha1.ModeResolveIssue}
 	names := map[string]bool{}
-	for _, env := range EnvironmentWithConfig(inv, "opencode", "url", "base", "main", "bin", "json", "term", "agent", "", "") {
+	for _, env := range EnvironmentWithConfig(inv, "opencode", "url", "base", "main", "bin", "json", "term", "agent", "", "", GitIdentity{}) {
 		names[env.Name] = true
 	}
 	if names[EnvEvidenceURL] || names[EnvEvidenceNonce] {
 		t.Fatalf("evidence env names are present when the evidence args are empty")
 	}
 	values := map[string]string{}
-	for _, env := range EnvironmentWithConfig(inv, "opencode", "url", "base", "main", "bin", "json", "term", "agent", "http://intake", "deadbeef") {
+	for _, env := range EnvironmentWithConfig(inv, "opencode", "url", "base", "main", "bin", "json", "term", "agent", "http://intake", "deadbeef", GitIdentity{}) {
 		values[env.Name] = env.Value
 	}
 	if values[EnvEvidenceURL] != "http://intake" {

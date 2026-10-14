@@ -20,6 +20,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
 	courierv1alpha1 "github.com/misospace/courier/api/v1alpha1"
+	"github.com/misospace/courier/internal/broker"
 	"github.com/misospace/courier/internal/executor"
 	courierlog "github.com/misospace/courier/internal/log"
 	"github.com/misospace/courier/internal/source"
@@ -97,6 +98,14 @@ type CoderRunReconciler struct {
 	// Observer reads the external pull request and CI state after a successful run.
 	Observer WorldObserver
 
+	// PullRequests, when set, gives a settled AwaitingReview run its slow,
+	// bounded world observation: an exact read of the recorded pull request
+	// through the configured forge capability. A confirmed merge resolves
+	// the run to Done and enters the existing resolve-then-reap lifecycle.
+	// Nil means post-review merges are never observed, so the run keeps the
+	// watch-only behavior of a deployment without a forge read path.
+	PullRequests PullRequestReader
+
 	// Evidence reconciles the run's failure-evidence Secrets at the terminal
 	// boundary the operator can prove: a world-verified success (AwaitingReview,
 	// Done) has its evidence deleted, and a dirty terminal (Failed, NeedsHuman)
@@ -113,6 +122,21 @@ type CoderRunReconciler struct {
 	// DoneRetention is how long a resolved Done run is kept before deletion.
 	// Zero uses the package default.
 	DoneRetention time.Duration
+
+	// FailedRetention is how long a Failed run is kept before deletion, once
+	// its lifecycle report has reached a positive, settled state. Zero uses the
+	// package default.
+	FailedRetention time.Duration
+
+	// NeedsHumanRetention is how long a NeedsHuman run is kept before deletion,
+	// once its lifecycle report has reached a positive, settled state. Zero
+	// uses the package default.
+	NeedsHumanRetention time.Duration
+
+	// TerminalAuditKeep is the number of most recent terminal runs per
+	// repository the reaper always retains, even past their retention window.
+	// Zero uses the package default; a negative value disables the floor.
+	TerminalAuditKeep int
 
 	// LivenessWindow is how long a Running run may go without a heartbeat before
 	// it is considered wedged and reaped. Zero uses the package default.
@@ -215,7 +239,11 @@ func (r *CoderRunReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 	// value as Pending so a source does not need a second status write before
 	// admission can begin. A terminal run normally does nothing, except when its
 	// lifecycle report is still pending: then the report alone is retried, since
-	// the run already reached its phase and freed capacity.
+	// the run already reached its phase and freed capacity. An AwaitingReview
+	// run whose LifecycleReported condition has reached a positive, settled
+	// state (Status=True with reason Published or Superseded) additionally takes
+	// one slow, bounded read of its recorded pull request, so a human merge can
+	// finish and reap it.
 	if run.Status.Phase != "" && run.Status.Phase != courierv1alpha1.PhasePending {
 		if lifecycleReportPending(&run) {
 			if lifecycleReportUnsupported(&run) {
@@ -227,6 +255,42 @@ func (r *CoderRunReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 				}
 			}
 			return r.retryTerminalLifecycle(ctx, &run)
+		}
+		if run.Status.Phase == courierv1alpha1.PhaseAwaitingReview {
+			// The pending-report retry above handles a False LifecycleReported.
+			// A missing, Unknown, or True-with-another-reason condition does not
+			// prove the source saw the in-review lifecycle either, so the
+			// post-review merge observation must wait too: a legacy or partially
+			// upgraded AwaitingReview run without a positively settled
+			// LifecycleReported (Published or Superseded) cannot transition to
+			// Done without first proving its in-review lifecycle. The run stays
+			// parked without a timer; the report-retry path above re-arms any
+			// pending report, and a run whose condition is missing/Unknown/other
+			// remains unobserved until the source publishes the report or an
+			// operator intervenes.
+			if !lifecycleReportSettled(&run) {
+				log.FromContext(ctx).V(1).Info("awaiting-review run observed without a positively settled LifecycleReported; leaving in awaiting-review",
+					"lifecycleReported", lifecycleReportConditionState(&run))
+				return ctrl.Result{}, nil
+			}
+			return r.observeMergedReviewPR(ctx, &run)
+		}
+		if run.Status.Phase == courierv1alpha1.PhaseFailed || run.Status.Phase == courierv1alpha1.PhaseNeedsHuman {
+			// A Failed or NeedsHuman run is reaped only once its source
+			// lifecycle report reached a positive, settled state: while the
+			// report is pending the run is the only durable retry intent, and a
+			// missing, Unknown, or False condition proves nothing. Such a run
+			// is parked without a timer; the report-retry path above re-arms a
+			// pending report, and an operator settles a missing condition.
+			if !lifecycleReportSettled(&run) {
+				l.V(1).Info("terminal run observed without a positively settled LifecycleReported; leaving for retention",
+					"phase", run.Status.Phase, "lifecycleReported", lifecycleReportConditionState(&run))
+				return ctrl.Result{}, nil
+			}
+			if run.Status.Phase == courierv1alpha1.PhaseFailed {
+				return r.reapTerminal(ctx, &run, failedAtAnnotation, r.failedRetention(), true)
+			}
+			return r.reapTerminal(ctx, &run, needsHumanAtAnnotation, r.needsHumanRetention(), true)
 		}
 		l.V(1).Info("reconcile", "phase", run.Status.Phase)
 		return ctrl.Result{}, nil
@@ -451,6 +515,12 @@ func (r *CoderRunReconciler) resolvePersistSecurePolicy(ctx context.Context, run
 			return secureNeedsHuman("PolicyConflict",
 				"the provider registry no longer matches this run's persisted policy")
 		}
+		// A pinned criterion set is re-verified like every other policy
+		// field: a digest that no longer covers the pinned criteria is a
+		// fail-closed corruption signal, not an input to launch-loop on.
+		if _, _, err := broker.CriterionSetFromPolicy(policy); err != nil {
+			return secureNeedsHuman("PolicyCorrupt", "%v", err)
+		}
 		return nil
 	}
 	_, policy, err := r.Secure.ResolveAdmission(ctx, run)
@@ -597,12 +667,21 @@ func (r *CoderRunReconciler) observeRunning(ctx context.Context, run *courierv1a
 	if err := r.List(ctx, &pods, client.InNamespace(run.Namespace)); err != nil {
 		return ctrl.Result{}, err
 	}
+	// Soft-stop ingress (#238): before any secure observation, translate the
+	// human's annotation into the operator-owned control request. The request
+	// is fenced to the live coordinator pod, so a secure control and a legacy
+	// coordinator are stamped by the same rule; a cleared or changed value is
+	// persisted here, before the reconcile continues.
+	if err := r.syncSoftStop(ctx, run, pods.Items); err != nil {
+		return ctrl.Result{}, err
+	}
 	// The secure topology's operator-owned observation runs before the
 	// coordinator-termination handler below: a terminated control pod must
 	// fence its worker and take the broker down in the same reconcile that
-	// terminalizes the run. Terminal runs are never reaped, so fencing left
-	// to a later reconcile would never run at all — the untrusted executor
-	// and the credentialed broker would outlive their supervisor.
+	// terminalizes the run. A terminal run is never relaunched, and an
+	// AwaitingReview, HandedOff, or BlockedExternal run is never reaped, so fencing left to a
+	// later reconcile could never run at all — the untrusted executor and the
+	// credentialed broker would outlive their supervisor indefinitely.
 	if r.Secure != nil {
 		securePods := make([]corev1.Pod, 0, len(pods.Items))
 		for i := range pods.Items {
@@ -704,6 +783,128 @@ func (r *CoderRunReconciler) observeRunning(ctx context.Context, run *courierv1a
 		return r.observeMissingCoordinator(ctx, run)
 	}
 	return ctrl.Result{}, nil
+}
+
+// maxSoftStopRequestIDLength mirrors the CRD's controlRequest.id maxLength:
+// an annotation value beyond it can never be stamped, so ingress skips it
+// instead of failing the reconcile.
+const maxSoftStopRequestIDLength = 128
+
+// softStopDisarmMessage is the fixed operator message a SoftStopObserved
+// condition carries for a request its named incarnation never acknowledged
+// (#238), and the record of which annotation value that disarmed request
+// carried. A torn-down incarnation's request is void and is never handed to
+// its replacement: re-targeting requires a new annotation value, so the same
+// value must not stamp again while the observation stands. The message is a
+// fixed operator string built only from the opaque request ID, so a
+// soft-stop observation can never carry executor or harness text.
+func softStopDisarmMessage(id string) string {
+	return fmt.Sprintf("soft-stop request %q was never acknowledged by the coordinator before it was torn down; re-targeting requires a new annotation value", id)
+}
+
+// softStopDisarmed reports whether the annotation value id has already been
+// served or disarmed and must not stamp again: it is the live record, it was
+// acknowledged, or it was disarmed unacknowledged by a torn-down
+// incarnation. Re-annotating with a fresh value — or withdrawing the
+// annotation and re-adding it — is what re-arms a request.
+func softStopDisarmed(run *courierv1alpha1.CoderRun, id string) bool {
+	if current := run.Status.ControlRequest; current != nil && current.ID == id {
+		return true
+	}
+	if ack := run.Status.ControlRequestAck; ack != nil && ack.ID == id {
+		return true
+	}
+	if cond := apimeta.FindStatusCondition(run.Status.Conditions, courierv1alpha1.ConditionSoftStopObserved); cond != nil && cond.Message == softStopDisarmMessage(id) {
+		return true
+	}
+	return false
+}
+
+// syncSoftStop translates the human's soft-stop annotation on a Running run
+// into the operator-owned control request and persists the change. A value
+// never served or disarmed stamps a fresh request fenced to the live
+// coordinator pod and clears any unacknowledged-observation; a cleared
+// annotation clears the record, its acknowledgement, and its observation;
+// a value already served, acknowledged, or disarmed — or a vanished
+// coordinator — leaves the record untouched. It is the sole writer of
+// status.controlRequest and never charges or relaunches the run.
+func (r *CoderRunReconciler) syncSoftStop(ctx context.Context, run *courierv1alpha1.CoderRun, pods []corev1.Pod) error {
+	id := run.Annotations[courierv1alpha1.SoftStopAnnotation]
+	if len(id) > maxSoftStopRequestIDLength {
+		// The request ID is CRD-bounded; a longer annotation cannot become a
+		// record. Skip the stamp rather than failing the reconcile: an
+		// invalid human value must not wedge observation or liveness for the
+		// run. Correcting the annotation re-arms ingress.
+		return nil
+	}
+	if id == "" {
+		if run.Status.ControlRequest == nil && run.Status.ControlRequestAck == nil &&
+			apimeta.FindStatusCondition(run.Status.Conditions, courierv1alpha1.ConditionSoftStopObserved) == nil {
+			return nil
+		}
+		before := run.DeepCopy()
+		// The human withdrew the soft-stop: clear the record, its
+		// acknowledgement, and its unacknowledged-observation, so a later
+		// value — even a repeat of an old one — is a fresh request.
+		run.Status.ControlRequest = nil
+		run.Status.ControlRequestAck = nil
+		clearSoftStopCondition(run)
+		return r.patchStatus(ctx, before, run)
+	}
+	if softStopDisarmed(run, id) {
+		return nil
+	}
+	pod := coordinatorPodOf(pods, run)
+	if pod == nil {
+		// A request is fenced to one control incarnation; with no live
+		// coordinator there is nothing to address it to, so it is not
+		// stamped.
+		return nil
+	}
+	before := run.DeepCopy()
+	// A new value stamps a fresh request and clears any prior
+	// unacknowledged-observation.
+	run.Status.ControlRequest = &courierv1alpha1.ControlRequest{
+		ID:           id,
+		Kind:         courierv1alpha1.ControlRequestSoftStop,
+		TargetPodUID: string(pod.UID),
+		RequestedAt:  metav1.NewTime(r.clock()),
+	}
+	clearSoftStopCondition(run)
+	return r.patchStatus(ctx, before, run)
+}
+
+// clearSoftStopCondition removes the SoftStopObserved condition from a run.
+func clearSoftStopCondition(run *courierv1alpha1.CoderRun) {
+	apimeta.RemoveStatusCondition(&run.Status.Conditions, courierv1alpha1.ConditionSoftStopObserved)
+}
+
+// softStopBeforeRelaunch disarms a run's control request before its control
+// incarnation is torn down by a relaunch. A request addressed to the dying
+// incarnation is void: the record is cleared so a fresh incarnation starts
+// from a clean control state, and the value that was disarmed is remembered
+// so the replacement is never handed its predecessor's request. If the named
+// incarnation never acknowledged the request, the run records that as a
+// SoftStopObserved observation; an acknowledged request is cleared silently,
+// its acknowledgement retained as the record of the settled value.
+func softStopBeforeRelaunch(run *courierv1alpha1.CoderRun, now time.Time) {
+	record := run.Status.ControlRequest
+	if record == nil {
+		return
+	}
+	if ack := run.Status.ControlRequestAck; ack == nil || ack.ID != record.ID {
+		apimeta.SetStatusCondition(&run.Status.Conditions, metav1.Condition{
+			Type:               courierv1alpha1.ConditionSoftStopObserved,
+			Status:             metav1.ConditionTrue,
+			Reason:             courierv1alpha1.ConditionReasonUnacknowledged,
+			Message:            softStopDisarmMessage(record.ID),
+			LastTransitionTime: metav1.NewTime(now),
+		})
+	}
+	// Only the request is disarmed: an acknowledgement (matching or older)
+	// stays as the settled-value memory that keeps a repeated annotation
+	// from re-targeting the replacement.
+	run.Status.ControlRequest = nil
 }
 
 // controllerHeadRef reconstructs the run's resolved head identity from its
@@ -828,7 +1029,14 @@ func (r *CoderRunReconciler) transitionTerminal(ctx context.Context, run *courie
 		return ctrl.Result{}, err
 	}
 	phaseChanged := run.Status.Phase != phase
+	// FinishedAt is set once, on the run's first terminal transition, so its
+	// absence marks this reconcile as the one that records the run's metrics.
+	firstTerminal := run.Status.FinishedAt == nil
 	before := run.DeepCopy()
+	// The run's control request is void once it is torn down: clear it and its
+	// acknowledgement so the terminal state carries no live request (#238).
+	run.Status.ControlRequest = nil
+	run.Status.ControlRequestAck = nil
 	run.Status.Phase = phase
 	if pr != "" {
 		run.Status.PR = pr
@@ -839,8 +1047,7 @@ func (r *CoderRunReconciler) transitionTerminal(ctx context.Context, run *courie
 	if phaseChanged {
 		// finishedAt marks when the run's own execution ended: it is
 		// recorded on every terminal transition, set-once, so a later
-		// operator-marked Done (post-merge, currently unimplemented) never
-		// moves it.
+		// merge-confirmed Done (#250) never moves it.
 		if run.Status.FinishedAt == nil {
 			run.Status.FinishedAt = &metav1.Time{Time: r.clock().UTC()}
 			if run.Status.StartedAt != nil && run.Status.RunDuration == "" {
@@ -857,7 +1064,7 @@ func (r *CoderRunReconciler) transitionTerminal(ctx context.Context, run *courie
 	// Write the terminal phase first so the run stops holding lane capacity
 	// regardless of whether the source lifecycle report below succeeds. The
 	// run's own terminalization must never depend on the source.
-	if run.Status.Phase != before.Status.Phase || run.Status.PR != before.Status.PR || !reflect.DeepEqual(run.Status.Telemetry, before.Status.Telemetry) || !reflect.DeepEqual(run.Status.TerminalDiagnostic, before.Status.TerminalDiagnostic) {
+	if run.Status.Phase != before.Status.Phase || run.Status.PR != before.Status.PR || !reflect.DeepEqual(run.Status.Telemetry, before.Status.Telemetry) || !reflect.DeepEqual(run.Status.TerminalDiagnostic, before.Status.TerminalDiagnostic) || !reflect.DeepEqual(run.Status.ControlRequest, before.Status.ControlRequest) || !reflect.DeepEqual(run.Status.ControlRequestAck, before.Status.ControlRequestAck) || !reflect.DeepEqual(run.Status.Conditions, before.Status.Conditions) {
 		if err := r.patchStatus(ctx, before, run); err != nil {
 			return ctrl.Result{}, err
 		}
@@ -870,9 +1077,13 @@ func (r *CoderRunReconciler) transitionTerminal(ctx context.Context, run *courie
 		// dropped) on the reconcile that entered it.
 		return ctrl.Result{}, nil
 	}
-	// The terminal phase is final, so only the reconcile that changes into it
-	// records the run's metrics; re-reconciles return above.
-	r.metrics().ObserveTerminal(run)
+	// The run's metrics are recorded once, on its first terminal transition.
+	// A later transition that corrects the ending — a confirmed merge
+	// settling AwaitingReview as Done (#250) — must not count the same run
+	// twice.
+	if firstTerminal {
+		r.metrics().ObserveTerminal(run)
+	}
 	return r.publishTerminalLifecycle(ctx, run, adapter, item, phase, intent)
 }
 
@@ -1073,6 +1284,35 @@ func lifecycleReportPending(run *courierv1alpha1.CoderRun) bool {
 	}
 	cond := apimeta.FindStatusCondition(run.Status.Conditions, lifecycleReportedCondition)
 	return cond != nil && cond.Status == metav1.ConditionFalse
+}
+
+// lifecycleReportSettled reports whether the run's source lifecycle report has
+// reached the positive, settled state DESIGN.md §1291 demands before world
+// observation can close the loop: the LifecycleReported condition carries
+// Status=True with reason Published or Superseded. A missing, Unknown, or False
+// condition does not satisfy the gate, and Status=True with any other reason is
+// treated as not yet settled too — only Published/Superseded are the reasons
+// the condition's Status=True carries in practice, but the helper defends the
+// invariant by name. The gate keeps a legacy, partially upgraded, or corrupted
+// terminal CoderRun from being finished by world observation before the source
+// has proof of the in-review lifecycle.
+func lifecycleReportSettled(run *courierv1alpha1.CoderRun) bool {
+	cond := apimeta.FindStatusCondition(run.Status.Conditions, lifecycleReportedCondition)
+	if cond == nil || cond.Status != metav1.ConditionTrue {
+		return false
+	}
+	return cond.Reason == "Published" || cond.Reason == "Superseded"
+}
+
+// lifecycleReportConditionState renders the LifecycleReported condition as a
+// short, log-friendly string: "<missing>" when absent, otherwise
+// "<status>/<reason>". Used only for diagnostic logging.
+func lifecycleReportConditionState(run *courierv1alpha1.CoderRun) string {
+	cond := apimeta.FindStatusCondition(run.Status.Conditions, lifecycleReportedCondition)
+	if cond == nil {
+		return "<missing>"
+	}
+	return string(cond.Status) + "/" + cond.Reason
 }
 
 func lifecycleReportUnsupported(run *courierv1alpha1.CoderRun) bool {
@@ -1296,8 +1536,34 @@ func (r *CoderRunReconciler) patchStatus(ctx context.Context, before, after *cou
 	if before.Status.TerminalDiagnostic == nil && after.Status.TerminalDiagnostic != nil {
 		fields.TerminalDiagnostic = after.Status.TerminalDiagnostic
 	}
+	// ControlRequest is replaceable, not set-once: a changed value replaces
+	// the record and a cleared record emits an explicit null, because a merge
+	// patch leaves an omitted nested object untouched.
+	if !reflect.DeepEqual(before.Status.ControlRequest, after.Status.ControlRequest) {
+		if after.Status.ControlRequest == nil {
+			fields.ClearControlRequest()
+		} else {
+			if err := fields.SetControlRequest(*after.Status.ControlRequest); err != nil {
+				return err
+			}
+		}
+	}
+	// ControlRequestAck is operator-cleared only (relaunch and
+	// terminalization disarm the control pair); the harness writes records
+	// through the broker's trusted status path.
+	if !reflect.DeepEqual(before.Status.ControlRequestAck, after.Status.ControlRequestAck) {
+		if after.Status.ControlRequestAck == nil {
+			fields.ClearControlRequestAck()
+		} else {
+			if err := fields.SetControlRequestAck(*after.Status.ControlRequestAck); err != nil {
+				return err
+			}
+		}
+	}
 	if !reflect.DeepEqual(before.Status.Conditions, after.Status.Conditions) {
-		fields.Conditions = after.Status.Conditions
+		if err := fields.SetConditions(after.Status.Conditions); err != nil {
+			return err
+		}
 	}
 	if !reflect.DeepEqual(before.Status.Telemetry, after.Status.Telemetry) {
 		fields.Telemetry = after.Status.Telemetry

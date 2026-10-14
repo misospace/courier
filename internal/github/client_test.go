@@ -789,3 +789,53 @@ func TestAPIErrorAndAuthentication(t *testing.T) {
 		t.Fatalf("error = %v (%T)", err, err)
 	}
 }
+
+func TestGetIssue(t *testing.T) {
+	t.Parallel()
+	var methods []string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		methods = append(methods, r.Method)
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/repos/acme/demo/issues/502":
+			_, _ = io.WriteString(w, `{"number":502,"title":"Package the assets","body":"## Acceptance\n- one\n- two","state":"open","html_url":"https://github.com/acme/demo/issues/502"}`)
+		case "/repos/acme/demo/issues/503":
+			// GitHub returns null for an absent issue body.
+			_, _ = io.WriteString(w, `{"number":503,"title":"Empty body","body":null,"state":"open"}`)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+	client, err := NewClient(server.URL, "token")
+	if err != nil {
+		t.Fatal(err)
+	}
+	issue, err := client.GetIssue(context.Background(), "acme", "demo", 502)
+	if err != nil {
+		t.Fatalf("GetIssue() error = %v", err)
+	}
+	if issue.Number != 502 || issue.Title != "Package the assets" || issue.Body != "## Acceptance\n- one\n- two" || issue.State != "open" {
+		t.Fatalf("GetIssue() = %#v, want the full issue snapshot", issue)
+	}
+	if issue.PullRequest != nil {
+		t.Fatalf("GetIssue() = %#v, want no pull-request marker on an issue", issue)
+	}
+	empty, err := client.GetIssue(context.Background(), "acme", "demo", 503)
+	if err != nil {
+		t.Fatalf("GetIssue() with null body error = %v", err)
+	}
+	if empty.Body != "" {
+		t.Fatalf("null body must decode to the empty string, got %q", empty.Body)
+	}
+	for _, method := range methods {
+		if method != http.MethodGet {
+			t.Fatalf("issue read must be GET-only, saw %s", method)
+		}
+	}
+	_, err = client.GetIssue(context.Background(), "acme", "demo", 404)
+	var apiErr *APIError
+	if !errors.As(err, &apiErr) || apiErr.StatusCode != http.StatusNotFound {
+		t.Fatalf("missing issue error = %v (%T), want a 404 APIError", err, err)
+	}
+}

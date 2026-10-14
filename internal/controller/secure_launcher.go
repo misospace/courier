@@ -221,13 +221,24 @@ func (s *SecureControl) LaunchSecure(ctx context.Context, run *courier.CoderRun)
 
 // controlInvocation assembles the run context the control pod carries: the
 // same executor.Invocation a process executor would receive, built from the
-// immutable spec, the current status, and the lane's roles and framing.
+// immutable spec, the current status, and the lane's roles and framing. The
+// trusted criterion envelope (#280) travels with it exactly as the legacy
+// executor receives it: the identical pinned set, operator-authored.
 func (s *SecureControl) controlInvocation(ctx context.Context, run *courier.CoderRun) (executor.Invocation, error) {
 	lane := &courier.LaneProfile{}
 	if err := s.Client.Get(ctx, types.NamespacedName{Namespace: run.Namespace, Name: run.Spec.Lane}, lane); err != nil {
 		return executor.Invocation{}, fmt.Errorf("secure topology: read lane profile %q: %w", run.Spec.Lane, err)
 	}
-	return executor.NewInvocation(run, lane, topology.ControlWorkspacePath)
+	invocation, err := executor.NewInvocation(run, lane, topology.ControlWorkspacePath)
+	if err != nil {
+		return executor.Invocation{}, err
+	}
+	criteria, err := criteriaEnvelope(run)
+	if err != nil {
+		return executor.Invocation{}, err
+	}
+	invocation.Criteria = criteria
+	return invocation, nil
 }
 
 type gatewayConfig struct {
@@ -325,9 +336,11 @@ func (s *SecureControl) ObserveTopology(ctx context.Context, run *courier.CoderR
 		// The control incarnation is over: fence its worker so no untrusted
 		// executor outlives its supervisor, and take the broker's ingress and
 		// pod down with it — the broker holds the run's copied credentials and
-		// terminal runs are never reaped. Run-only material is removed by the
-		// ordered finalizer when the CoderRun is deleted. The caller proceeds
-		// to the exit-code mapping, which decides the run's phase. The worker
+		// a terminal run is never relaunched; an AwaitingReview, HandedOff, or
+		// BlockedExternal run is never reaped either. Run-only material is
+		// removed by the ordered finalizer when the CoderRun is deleted. The
+		// caller proceeds to the exit-code mapping, which decides the run's
+		// phase. The worker
 		// or broker may already be gone in the same observation (the guard
 		// above requires only the control pod) — an absent pod needs no
 		// fencing, which keeps this branch nil-safe.
@@ -406,10 +419,15 @@ func (s *SecureControl) fenceAndRelaunch(ctx context.Context, run *courier.Coder
 		return ctrl.Result{}, true, err
 	}
 	if run.Status.Restarts >= crashloopCeiling(s.MaxRestarts) {
+		// The terminal hand-off disarms the control request itself.
 		result, err := s.transitionNeedsHuman(ctx, run, "secure topology failed repeatedly and reached the crashloop ceiling")
 		return result, true, err
 	}
 	before := run.DeepCopy()
+	// A soft-stop addressed to the torn-down incarnation is void; disarm it
+	// (observing an unacknowledged request) after the diff base so the
+	// relaunch patch persists the disarm alongside the restart charge (#238).
+	softStopBeforeRelaunch(run, s.now())
 	run.Status.Restarts++
 	run.Status.Phase = courier.PhaseClaimed
 	if err := s.Patcher.patchStatus(ctx, before, run); err != nil {
@@ -435,8 +453,9 @@ func (s *SecureControl) fenceAndRelaunch(ctx context.Context, run *courier.Coder
 // supervisor is gone or terminal — including the control-loss backstop
 // (#215), where the detection reconcile must not leave the untrusted
 // executor and the credentialed broker alive just because a later relaunch
-// reconcile may never run. Terminal runs are never reaped, so a fence
-// deferred past the detection reconcile never runs at all.
+// reconcile may never run. A terminal run is never relaunched, and an
+// AwaitingReview, HandedOff, or BlockedExternal run is never reaped, so a fence deferred past
+// the detection reconcile never runs at all.
 func (s *SecureControl) Fence(ctx context.Context, run *courier.CoderRun) error {
 	workerPod, err := s.pod(ctx, run, topology.ComponentWorker)
 	if err != nil {

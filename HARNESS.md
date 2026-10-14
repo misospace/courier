@@ -515,14 +515,24 @@ content**: an edit to the issue after admission does not add, remove, or
 rewrite this run's criteria — a human changing requirements re-queues the
 work through admission; the model never supplies criteria at any point.
 
-**Carriage to the boundary.** Native: the pinned set joins the immutable
-run publication policy (`Status.PublicationPolicy`), resolved at admission
-and verified by the broker binding like every other policy field. Legacy:
-the operator projects the identical set into the executor pod as trusted
-environment (`COURIER_CRITERIA`, bounded JSON: issue identity, criteria
-with IDs/texts/digests, set digest) beside `COURIER_REPO`/`COURIER_REF`.
-Legacy pod visibility is fine — the set is public issue text; the contract
-is that the *validator's* comparison target is operator-authored, and the
+**Carriage to the boundary (#280, shipped).** Native: the pinned set joins
+the immutable run publication policy (`Status.PublicationPolicy`:
+`sourceIssue`, `acceptanceCriteria`, `acceptanceCriteriaDigest`), resolved
+at admission through the provider's typed work-item read (`ReadWorkItem`,
+the operator's read identity, read-only) and re-verified by the broker
+binding like every other policy field — per-criterion digests, extraction
+ordinals, and the set digest are recomputed, so a tampered pin fails the
+binding. An empty pinned set carries its identity-only digest, which is
+what distinguishes a pinned-empty contract from an unpinned policy
+(pre-#280 runs bind with no pin — backward compatible). Legacy: the
+operator projects the identical set into the executor pod as trusted
+environment (`COURIER_CRITERIA`, bounded JSON in the broker criterion-set
+shape: issue identity, criteria with IDs/texts/digests, set digest) beside
+`COURIER_REPO`/`COURIER_REF`, rendered from the persisted policy by the
+legacy launcher and the secure control invocation alike; a fix-pr run and
+a run without a pin receive no envelope, so absence is meaningful. Legacy
+pod visibility is fine — the set is public issue text; the contract is
+that the *validator's* comparison target is operator-authored, and the
 model cannot change it.
 
 **Data shape.** The PR body carries one machine-readable block — the only
@@ -1030,6 +1040,92 @@ The trusted integration tree and coordinator implementation must not be
 shell-accessible. A worker may receive another sanitized snapshot for a later
 task; it never receives the control pod's writable tree or credentials.
 
+### Context budgets and compaction (#243)
+
+The harness owns the context policy; the executor implements it. Today the
+native harness declares no budget and the OpenCode executor's auto-compaction
+fires reactively at its own default threshold, so a worker can ride its prompt
+past the bound model alias's input limit, LiteLLM diverts the oversize request
+to a fallback alias, and only then does compaction land. That is capacity
+management by accident. The policy below makes the limit a declared,
+profile-owned value and the compaction trigger a mechanical, pre-ceiling,
+step-boundary decision. It does not change the OpenCode default: an immediate
+legacy mitigation, if warranted, is a separate bounded executor/config ticket,
+and no implicit context-window fallback is ever treated as successful capacity
+management. The pure resolution, trigger, and preservation rules live in
+`internal/harness/budget.go` with the shared truth table in
+`internal/harness/budget_test.go`.
+
+**Per-role budget schema.** A lane may declare an optional `spec.context`
+policy on `LaneProfileSpec`, beside the existing per-role `roles` map:
+
+- `context.compactAtPercent` (default 75, range 1–99) is the fraction of the
+  effective input limit at which a step-boundary compaction fires.
+- `context.outputReservation` reserves tokens for the next turn's maximum
+  output.
+- `context.roles.<role>.maxInputTokens` declares a ceiling for the role's
+  bound model; `context.roles.<role>` may override `compactAtPercent` and
+  `outputReservation`. An absent `context` leaves the harness owning no budget
+  and the executor default standing — explicitly not capacity management.
+
+**Effective limit = min(declared, verified).** At session start the harness
+reads the bound model's advertised input limit from the gateway's model-info
+endpoint and takes the **minimum** of that verified capability and the lane's
+declared ceiling: a profile can only lower the effective limit, never raise it
+past what the gateway verifies. Resolution reuses the §5 capability
+vocabulary: a verified read is `healthy`; a declared ceiling used because the
+gateway could not verify is `configured` — in use, never treated as healthy;
+neither declared nor verified is `unavailable`, and the harness refuses to
+substitute an implicit default. The gateway read is redacted like every other
+stream/status path: a fixed category, never a provider body or key material.
+
+**Compact before the ceiling, at a step boundary.** The compact point is
+`floor(effective × compactAtPercent / 100)`. At a step boundary — between
+turns, never mid-turn — the harness compacts when the transcript has reached
+the compact point **or** when the next turn's prompt plus the output
+reservation would exceed the effective limit. After compaction the invariant
+`promptTokens + outputReservation ≤ effective` must hold; if it cannot, the
+harness fails closed and surfaces the condition rather than truncating
+mid-task. The two acceptance conditions fail independently: a digest can
+reclaim tokens and still leave the protected tail too large to fit, in which
+case every digestible turn has already been spent and there is no progress left
+to make.
+
+A successful compaction also returns a calibrated `BudgetAfter` whose compact
+point is raised to at least `After+1` so the next step boundary does not
+re-fire on the just-compacted state. The compact point alone is not a
+sufficient exit condition for a session loop: a transcript that compacts at
+the point can still land above it, and re-digesting the digest would reclaim
+zero tokens and surface `ErrCompactionCannotFit` even though the
+post-condition held. The executor (and any caller of repeated compactions)
+must use `BudgetAfter`, not the original budget, for the next decision.
+
+**Digest, not prune; preserve settled state.** Compaction replaces the oldest
+non-protected turns with a single model-produced digest. It never discards the
+brief's pinned objective, the settled `Decision`s, the `OwnedFiles`, or the
+most recent turn: those are protected, re-injected verbatim into the digest.
+The durable record remains the §7 checkpoint ladder — `plan` plus ordered
+`completedBriefs` — so a resumed session reconstructs settled state from the
+world and the checkpoint, never from a lossy transcript. A digest is accepted
+only when it both fits the post-condition and actually reclaims tokens
+(`After < Before`): a digest that costs as much as it replaces would re-trigger
+on the next boundary forever, so that degenerate case fails closed too.
+Prune-only compaction is rejected because it silently drops task state.
+
+**Telemetry.** Every compaction emits the run event `session.compacted`
+(`log.EventSessionCompacted`) carrying the role, the bound model, and
+before/after token counts plus both the net savings (the user-facing
+"reclaimed" — `Before - After`) and the gross digest size (the sum of message
+tokens the digest replaced), so operators observe the behavior in run
+telemetry instead of inferring it from gateway failover alerts. It is a log
+event, never status, and never lets a model assert liveness or completion.
+
+Implementation is three bounded, file-scoped tickets — #295 (CRD per-role
+budget schema + bootstrap mirror), #296 (gateway model-capability probe +
+effective-limit resolution + capability gate), #297 (step-boundary compaction
+enforcement + `session.compacted` emitter) — and until they land the policy
+exists as the tested pure seam in `internal/harness/budget.go`.
+
 ## 6. Long-tool liveness contract (#119)
 
 **Limit of observation.** A legitimate silent build and an indefinitely wedged
@@ -1478,6 +1574,31 @@ and the acceptance tests below are satisfied.
   prove nothing about whether a cited test semantically enforces its
   criterion: that audit belongs to the reviewer and, where demonstrated,
   to mutation evidence in the target repository.
+- **Context budget and compaction (§5, #243):** the shared truth table in
+  `internal/harness/budget_test.go` pins the four settled choices. Resolution:
+  `effective = min(declared, gateway-verified)`; a verified read is `healthy`,
+  a declared-only ceiling is `configured`, and neither is
+  `ErrNoContextCapacity` — no implicit default. Trigger: a step boundary
+  compacts at `floor(effective × compactAtPercent)` or when the next turn plus
+  the output reservation would cross the effective limit, and never mid-turn.
+  Preservation: digest selection never includes a protected turn (pinned
+  brief/objective, settled `Decision`s, `OwnedFiles`, the most recent turn),
+  the post-condition `After + outputReservation ≤ effective` holds whenever it
+  compacts and the digest actually reclaims (`After < Before`), and it fails
+  closed (`ErrCompactionCannotFit`) rather than truncating protected state.
+  Hysteresis: a successful compaction returns a calibrated `BudgetAfter` whose
+  compact point is raised above the post-compaction `After`, so the next step
+  boundary's `ShouldCompact` does not re-fire on the just-compacted state —
+  the post-condition alone is not a sufficient exit condition because
+  re-digesting the digest itself would reclaim zero tokens. Telemetry: the
+  canonical `session.compacted` event name lives in `internal/log/events.go`
+  (`log.EventSessionCompacted`), the harness payload is `CompactEvent`
+  carrying before/after/`NetSaved`/`DigestedTokens` counts (the net is the
+  user-facing "reclaimed"; the gross is the size of the span the digest
+  replaced), and the truth table proves both the digest accounting and the
+  two-boundary hysteresis. The table proves the pure policy
+  and deliberately proves nothing about the executor wiring, which
+  #295/#296/#297 own.
 
 ## 11. Open blockers
 
@@ -1528,6 +1649,15 @@ and the acceptance tests below are satisfied.
    (admission pinning), #281 (native boundary), #282 (legacy boundary) —
    and until they land the contract exists as the tested pure seam in
    `internal/broker/criteria.go` that both paths will call.
+8. Settled in §5 (#243): the harness-owned per-role context budget and
+   pre-ceiling, step-boundary compaction policy. Implementation is three
+   bounded tickets — #295 (CRD per-role budget schema + bootstrap mirror),
+   #296 (gateway model-capability probe + effective-limit resolution +
+   capability gate), #297 (step-boundary compaction enforcement +
+   `session.compacted` telemetry) — and until they land the policy exists as
+   the tested pure seam in `internal/harness/budget.go`. The OpenCode default
+   threshold is unchanged by this design; any legacy mitigation is a separate
+   bounded ticket.
 
 ## 12. Threat model and issue gates
 

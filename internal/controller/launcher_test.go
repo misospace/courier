@@ -3,6 +3,7 @@ package controller
 import (
 	"context"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"strings"
 	"testing"
@@ -18,6 +19,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 
 	courierv1alpha1 "github.com/misospace/courier/api/v1alpha1"
+	"github.com/misospace/courier/internal/broker"
 	"github.com/misospace/courier/internal/executor"
 )
 
@@ -432,6 +434,122 @@ func TestCoordinatorLauncherReportsProvisioningInFlightWhenExistingPodIsTerminat
 	err := launcher.Launch(context.Background(), run)
 	if !errors.Is(err, ErrProvisioningInFlight) {
 		t.Fatalf("Launch() error = %v, want ErrProvisioningInFlight; a colliding terminating pod must not be treated as a successful launch", err)
+	}
+}
+
+// pinnedCriteriaPolicy builds a persisted policy whose criterion pin mirrors
+// admission's mapping of an extracted set, so launcher tests exercise the
+// same shape the operator writes (#280).
+func pinnedCriteriaPolicy(t *testing.T, body string) *courierv1alpha1.PublicationPolicy {
+	t.Helper()
+	set, err := broker.ExtractCriteria(body, broker.SourceIssue{Owner: "acme", Name: "widgets", Number: 1})
+	if err != nil {
+		t.Fatalf("extract criteria: %v", err)
+	}
+	policy := &courierv1alpha1.PublicationPolicy{
+		SourceIssue: &courierv1alpha1.SourceIssueRef{Owner: "acme", Name: "widgets", Number: 1},
+	}
+	for _, criterion := range set.Criteria {
+		policy.AcceptanceCriteria = append(policy.AcceptanceCriteria, courierv1alpha1.Criterion{
+			ID: criterion.ID, Text: criterion.Text, Digest: criterion.Digest,
+		})
+	}
+	policy.AcceptanceCriteriaDigest = set.Digest
+	return policy
+}
+
+// The legacy coordinator pod receives the trusted COURIER_CRITERIA envelope
+// projected from the persisted policy — the identical pinned set the broker
+// binding re-verifies — while a run without a pin receives no envelope, and
+// a corrupt pin fails the launch closed.
+func TestCoordinatorLauncherProjectsCriteriaEnvelope(t *testing.T) {
+	run := &courierv1alpha1.CoderRun{
+		ObjectMeta: metav1.ObjectMeta{Name: "run-1", Namespace: "default", UID: types.UID("run-uid")},
+		Spec: courierv1alpha1.CoderRunSpec{
+			Mode: courierv1alpha1.ModeResolveIssue,
+			Repo: "acme/widgets",
+			Ref:  1,
+			Lane: "local",
+		},
+		Status: courierv1alpha1.CoderRunStatus{Phase: courierv1alpha1.PhaseClaimed},
+	}
+	run.Status.PublicationPolicy = pinnedCriteriaPolicy(t, "## Acceptance\n- one\n- two\n")
+	lane := &courierv1alpha1.LaneProfile{
+		ObjectMeta: metav1.ObjectMeta{Name: "local", Namespace: "default"},
+		Spec:       courierv1alpha1.LaneProfileSpec{Roles: map[string]string{"coordinator": "test-model"}},
+	}
+	fakeClient := fake.NewClientBuilder().
+		WithScheme(launcherScheme(t)).
+		WithStatusSubresource(&courierv1alpha1.CoderRun{}).
+		WithRuntimeObjects(run, lane).
+		Build()
+	launcher := &CoordinatorLauncher{Client: fakeClient, Pod: executor.PodConfig{Image: "example/opencode:test"}}
+
+	if err := launcher.Launch(context.Background(), run); err != nil {
+		t.Fatalf("Launch() error = %v", err)
+	}
+	var pod corev1.Pod
+	if err := fakeClient.Get(context.Background(), client.ObjectKey{Namespace: "default", Name: "run-1-coordinator"}, &pod); err != nil {
+		t.Fatalf("get coordinator pod: %v", err)
+	}
+	env := podEnvironmentByName(t, &pod)
+	criteria, ok := env["COURIER_CRITERIA"]
+	if !ok || strings.TrimSpace(criteria.Value) == "" {
+		t.Fatalf("COURIER_CRITERIA missing or empty in pod env: %+v", criteria)
+	}
+	var projected broker.CriterionSet
+	if err := json.Unmarshal([]byte(criteria.Value), &projected); err != nil {
+		t.Fatalf("COURIER_CRITERIA is not the broker criterion-set shape: %v", err)
+	}
+	if projected.Digest != run.Status.PublicationPolicy.AcceptanceCriteriaDigest ||
+		projected.Issue != (broker.SourceIssue{Owner: "acme", Name: "widgets", Number: 1}) ||
+		len(projected.Criteria) != 2 {
+		t.Fatalf("projected envelope = %+v, want the persisted pin", projected)
+	}
+	// The envelope must survive a decode→validate round trip: it is the
+	// exact comparison target the legacy boundary validates against.
+	if _, err := broker.ValidateCriterionEvidence("", projected); err == nil {
+		t.Fatal("an empty body against a non-empty pin must not validate")
+	}
+
+	// A run without a persisted pin launches without the envelope: its
+	// absence is meaningful to the legacy boundary.
+	unpinned := run.DeepCopy()
+	unpinned.Status.PublicationPolicy = nil
+	var existing corev1.Pod
+	if err := fakeClient.Get(context.Background(), client.ObjectKey{Namespace: "default", Name: "run-1-coordinator"}, &existing); err != nil {
+		t.Fatal(err)
+	}
+	if err := fakeClient.Delete(context.Background(), &existing); err != nil {
+		t.Fatal(err)
+	}
+	if err := launcher.Launch(context.Background(), unpinned); err != nil {
+		t.Fatalf("Launch() unpinned error = %v", err)
+	}
+	var bare corev1.Pod
+	if err := fakeClient.Get(context.Background(), client.ObjectKey{Namespace: "default", Name: "run-1-coordinator"}, &bare); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := podEnvironmentByName(t, &bare)["COURIER_CRITERIA"]; ok {
+		t.Fatal("a run without a pinned set must not receive COURIER_CRITERIA")
+	}
+
+	// A corrupt pin fails the launch closed rather than projecting an
+	// envelope that cannot be trusted.
+	corrupt := run.DeepCopy()
+	corrupt.Status.PublicationPolicy.AcceptanceCriteria[0].Text = "tampered"
+	if err := launcher.Launch(context.Background(), corrupt); err == nil {
+		t.Fatal("a corrupt criterion pin must fail the launch")
+	}
+
+	// Orphaned pin fields are corruption, not a silent downgrade to the
+	// pre-contract state: criteria left without an issue identity or set
+	// digest must fail the launch instead of quietly omitting the envelope.
+	orphaned := run.DeepCopy()
+	orphaned.Status.PublicationPolicy.SourceIssue = nil
+	orphaned.Status.PublicationPolicy.AcceptanceCriteriaDigest = ""
+	if err := launcher.Launch(context.Background(), orphaned); err == nil {
+		t.Fatal("orphaned criterion pin fields must fail the launch")
 	}
 }
 

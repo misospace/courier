@@ -16,11 +16,11 @@ import (
 // cross-repo closing reference may name.
 type SourceIssue struct {
 	// Owner is the trusted source repository owner.
-	Owner string
+	Owner string `json:"owner"`
 	// Name is the trusted source repository name.
-	Name string
+	Name string `json:"name"`
 	// Number is the trusted source issue number.
-	Number int
+	Number int `json:"number"`
 }
 
 // IsZero reports whether the source issue is unset. A zero value is

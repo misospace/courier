@@ -1115,6 +1115,33 @@ func (a *testAdapter) Release(context.Context, WorkItem) error           { retur
 func (a *testAdapter) Transition(context.Context, WorkItem, State) error { return nil }
 func (a *testAdapter) Resolve(context.Context, WorkItem) error           { return nil }
 
+// resolvingDispatchAdapter mirrors Dispatch's terminal path: a resolved item
+// is permanently excluded from later discovery, because done issues are not
+// re-offered in the next-task queue.
+type resolvingDispatchAdapter struct {
+	testAdapter
+	resolutions map[string]int
+}
+
+func (a *resolvingDispatchAdapter) Discover(context.Context) ([]WorkItem, error) {
+	a.discoverCalls++
+	items := make([]WorkItem, 0, len(a.items))
+	for _, item := range a.items {
+		if a.resolutions[item.ID] == 0 {
+			items = append(items, item)
+		}
+	}
+	return items, a.err
+}
+
+func (a *resolvingDispatchAdapter) Resolve(_ context.Context, item WorkItem) error {
+	if a.resolutions == nil {
+		a.resolutions = make(map[string]int)
+	}
+	a.resolutions[item.ID]++
+	return nil
+}
+
 func newTestClient(t *testing.T, objs ...client.Object) client.Client {
 	t.Helper()
 	return fake.NewClientBuilder().WithScheme(testScheme()).WithObjects(objs...).Build()
@@ -1306,5 +1333,84 @@ func TestRunnerBindingsSuspendIndependently(t *testing.T) {
 	}
 	if len(runs.Items) != 2 {
 		t.Fatalf("created %d runs after resume, want 2", len(runs.Items))
+	}
+}
+
+// The runner dedupes only against existing runs, so a reaped run must not be
+// re-created once the source has resolved the work behind it.
+func TestRunnerDoesNotRecreateResolvedWorkAfterReap(t *testing.T) {
+	item := WorkItem{ID: "issue-101", Mode: "resolve-issue", Repo: "acme/widgets", Ref: 1}
+	adapter := &resolvingDispatchAdapter{testAdapter: testAdapter{items: []WorkItem{item}}}
+	kubeClient := newTestClient(t, testLane())
+	runner := NewRunner(kubeClient, adapter, RunnerConfig{Source: "dispatch", LaneProfile: "local", Namespace: "courier"})
+
+	if err := runner.Poll(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	var runs courierv1alpha1.CoderRunList
+	if err := kubeClient.List(context.Background(), &runs, client.InNamespace("courier")); err != nil {
+		t.Fatal(err)
+	}
+	if len(runs.Items) != 1 {
+		t.Fatalf("created %d runs, want 1", len(runs.Items))
+	}
+
+	// The controller's terminal path resolves the source work, then reaps the run.
+	if err := adapter.Resolve(context.Background(), item); err != nil {
+		t.Fatal(err)
+	}
+	if err := kubeClient.Delete(context.Background(), &runs.Items[0]); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := runner.Poll(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if err := kubeClient.List(context.Background(), &runs, client.InNamespace("courier")); err != nil {
+		t.Fatal(err)
+	}
+	if len(runs.Items) != 0 {
+		t.Fatalf("reaped resolved work re-created %d runs, want 0", len(runs.Items))
+	}
+	if adapter.resolutions[item.ID] != 1 {
+		t.Fatalf("Resolve calls for %q = %d, want exactly 1", item.ID, adapter.resolutions[item.ID])
+	}
+}
+
+// A source that still offers the identity after the run is reaped means a
+// fresh intended dispatch, so the run is re-created.
+func TestRunnerRecreatesStillOfferedWorkAfterReap(t *testing.T) {
+	item := WorkItem{ID: "issue-102", Mode: "resolve-issue", Repo: "acme/widgets", Ref: 1}
+	adapter := &testAdapter{items: []WorkItem{item}}
+	kubeClient := newTestClient(t, testLane())
+	runner := NewRunner(kubeClient, adapter, RunnerConfig{Source: "dispatch", LaneProfile: "local", Namespace: "courier"})
+
+	if err := runner.Poll(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	var runs courierv1alpha1.CoderRunList
+	if err := kubeClient.List(context.Background(), &runs, client.InNamespace("courier")); err != nil {
+		t.Fatal(err)
+	}
+	if len(runs.Items) != 1 {
+		t.Fatalf("created %d runs, want 1", len(runs.Items))
+	}
+
+	// The run is reaped but the source never resolves the item, so it stays offered.
+	if err := kubeClient.Delete(context.Background(), &runs.Items[0]); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := runner.Poll(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if err := kubeClient.List(context.Background(), &runs, client.InNamespace("courier")); err != nil {
+		t.Fatal(err)
+	}
+	if len(runs.Items) != 1 {
+		t.Fatalf("found %d runs, want 1 re-created", len(runs.Items))
+	}
+	if runs.Items[0].Spec.WorkItemID != item.ID {
+		t.Fatalf("re-created run workItemID = %q, want %q", runs.Items[0].Spec.WorkItemID, item.ID)
 	}
 }

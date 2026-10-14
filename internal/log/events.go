@@ -93,6 +93,12 @@ const (
 	// taken at a gated moment (#198). It carries trigger, totals, and outcome
 	// only — never paths or content (#198).
 	EventEvidenceCapture = "evidence.capture"
+	// EventSessionCompacted reports one step-boundary compaction of a
+	// role-bound model session (#243), carrying before/after token counts and
+	// both the net savings and the gross digest size in the detail. It is
+	// observability, never status, and lets operators see compaction in run
+	// telemetry instead of inferring it from gateway failover.
+	EventSessionCompacted = "session.compacted"
 )
 
 // Status values for the status field.

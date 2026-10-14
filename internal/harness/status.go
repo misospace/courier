@@ -36,6 +36,13 @@ type StatusPatch struct {
 	AddOperation        *OperationAddition `json:"addOperation,omitempty"`
 	ClearOperation      string             `json:"clearOperation,omitempty"`
 	ReconcileOperations bool               `json:"reconcileOperations,omitempty"`
+
+	// ControlRequestAck acknowledges the control request this incarnation
+	// served. The broker fences it to the live request the ack names, so it
+	// can never acknowledge a request that was not served to this
+	// incarnation.
+	// +optional
+	ControlRequestAck *courierv1alpha1.ControlRequestAck `json:"controlRequestAck,omitempty"`
 }
 
 // OperationAddition carries the operation ID (the set's key) and its entry.
@@ -240,6 +247,21 @@ func (r *StatusReporter) CheckpointPublished(ctx context.Context, checkpoint *co
 	r.statusDebt = nil
 	r.mu.Unlock()
 	return nil
+}
+
+// ControlRequestAck durably acknowledges the control request this
+// incarnation served, through the broker's trusted status path. The broker
+// fences the acknowledgement to the live request it names, and the caller
+// consumes the request only after this write returns success (§6's
+// persist-before-consume, same shape as persist-before-dispatch).
+func (r *StatusReporter) ControlRequestAck(ctx context.Context, id string) error {
+	if r == nil || r.transport == nil {
+		return errors.New("harness: control acknowledgement has no trusted status path")
+	}
+	return r.retried(ctx, StatusPatch{ControlRequestAck: &courierv1alpha1.ControlRequestAck{
+		ID: id,
+		At: metav1.NewTime(r.now()),
+	}})
 }
 
 // ReconcileDebt retries a retained checkpoint write. The broker's

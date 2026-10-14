@@ -68,6 +68,10 @@ func main() {
 	var githubCredentialSecret string
 	var githubTokenKey string
 	var executorEnvironmentSecret string
+	var gitAuthorName string
+	var gitAuthorEmail string
+	var gitCommitterName string
+	var gitCommitterEmail string
 	var opencodeAgent string
 	var githubMCPURL string
 	var context7MCPURL string
@@ -84,6 +88,10 @@ func main() {
 	var evidenceIntakeKeySecret string
 	var evidenceIntakeService string
 	var evidenceIntakeBind string
+	var doneRetention time.Duration
+	var failedRetention time.Duration
+	var needsHumanRetention time.Duration
+	var terminalAuditKeep int
 	var secureMode bool
 	var forgeProvidersFile string
 	var runNamespace string
@@ -108,6 +116,10 @@ func main() {
 	flag.StringVar(&githubCredentialSecret, "github-credential-secret", "", "Optional Secret containing the GitHub API token; empty falls back to --git-credential-secret.")
 	flag.StringVar(&githubTokenKey, "github-token-key", "", "Optional key in the GitHub API credential Secret; empty falls back to --git-token-key or token.")
 	flag.StringVar(&executorEnvironmentSecret, "executor-environment-secret", "", "Optional Secret exposed as coordinator environment variables for model/provider configuration.")
+	flag.StringVar(&gitAuthorName, "git-author-name", defaults.Git.AuthorName, "Git author name rendered into operator-created coordinator pods; empty falls back to the explicit default. Separate from any forge authentication identity (#317).")
+	flag.StringVar(&gitAuthorEmail, "git-author-email", defaults.Git.AuthorEmail, "Git author email rendered into operator-created coordinator pods; empty falls back to the explicit default. Forge attribution requires an account-associated email (#317).")
+	flag.StringVar(&gitCommitterName, "git-committer-name", defaults.Git.CommitterName, "Git committer name rendered into operator-created coordinator pods; empty falls back to the explicit default (#317).")
+	flag.StringVar(&gitCommitterEmail, "git-committer-email", defaults.Git.CommitterEmail, "Git committer email rendered into operator-created coordinator pods; empty falls back to the explicit default (#317).")
 	flag.StringVar(&opencodeAgent, "opencode-agent", "", "Optional OpenCode agent name used for coordinator runs.")
 	flag.StringVar(&githubMCPURL, "github-mcp-url", "", "Optional remote MCP endpoint for GitHub.")
 	flag.StringVar(&context7MCPURL, "context7-mcp-url", "", "Optional remote MCP endpoint for Context7.")
@@ -137,6 +149,10 @@ func main() {
 	flag.StringVar(&evidenceIntakeKeySecret, "evidence-intake-key-secret", "", "Name of the Secret in the operator namespace holding the evidence intake HMAC key under the \"key\" entry; empty with no --evidence-intake-service disables evidence wiring.")
 	flag.StringVar(&evidenceIntakeService, "evidence-intake-service", "", "URL coordinator pods POST failure evidence to; required with --evidence-intake-key-secret.")
 	flag.StringVar(&evidenceIntakeBind, "evidence-intake-bind", "", "Address the operator's own evidence-intake server binds to in-process (for example :8082); the chart derives the matching --evidence-intake-service URL. Empty leaves the operator-side intake off, and a non-empty value requires --evidence-intake-key-secret.")
+	flag.DurationVar(&doneRetention, "done-retention", 5*time.Minute, "How long a resolved Done CoderRun is kept before the retention reaper deletes it.")
+	flag.DurationVar(&failedRetention, "failed-retention", 168*time.Hour, "How long a Failed CoderRun is kept, once its lifecycle report has settled, before the retention reaper deletes it.")
+	flag.DurationVar(&needsHumanRetention, "needs-human-retention", 168*time.Hour, "How long a NeedsHuman CoderRun is kept, once its lifecycle report has settled, before the retention reaper deletes it.")
+	flag.IntVar(&terminalAuditKeep, "terminal-audit-keep", 5, "Number of most recent terminal CoderRuns per repository the retention reaper always retains, even past their retention window.")
 	opts := zap.Options{Development: true}
 	opts.BindFlags(flag.CommandLine)
 	flag.Parse()
@@ -166,6 +182,10 @@ func main() {
 	// Per-lane capacity and suspension gauges are read from the live cluster
 	// at scrape time, so they need only the manager's client.
 	crmetrics.Registry.MustRegister(controller.NewLaneCollector(mgr.GetClient()))
+	// The oldest retained terminal-run age is likewise read from the live
+	// cluster at scrape time, so the retention reaper's observability half
+	// needs only the manager's client.
+	crmetrics.Registry.MustRegister(controller.NewTerminalAgeCollector(mgr.GetClient()))
 
 	bootstrapProfilesFile := strings.TrimSpace(bootstrapLaneProfilesFile)
 	if bootstrapProfilesFile != "" {
@@ -198,6 +218,18 @@ func main() {
 	podConfig.GitHubCredentialSecret = githubCredentialSecret
 	podConfig.GitHubTokenKey = githubTokenKey
 	podConfig.EnvironmentSecret = executorEnvironmentSecret
+	podConfig.Git = executor.GitIdentity{
+		AuthorName:     gitAuthorName,
+		AuthorEmail:    gitAuthorEmail,
+		CommitterName:  gitCommitterName,
+		CommitterEmail: gitCommitterEmail,
+	}
+	// Fail fast on a malformed deployment identity at startup rather than at
+	// the first launch; Build validates the identity again on every pod.
+	if err := podConfig.Git.Validate(); err != nil {
+		setupLog.Error(err, "unable to configure executor git identity")
+		os.Exit(1)
+	}
 	podConfig.OpenCode.Agent = opencodeAgent
 	podConfig.GitHubMCPURL = githubMCPURL
 	podConfig.Context7MCPURL = context7MCPURL
@@ -346,16 +378,21 @@ func main() {
 	}
 
 	reconciler := &controller.CoderRunReconciler{
-		Client:         mgr.GetClient(),
-		Scheme:         mgr.GetScheme(),
-		APIReader:      mgr.GetAPIReader(),
-		Launch:         launcher.Launch,
-		Sources:        sources,
-		StatusWriter:   status.KubePatchWriter{Client: mgr.GetClient()},
-		Observer:       githubObserver,
-		Events:         runEvents,
-		Evidence:       evidenceIntake,
-		PRHeadResolver: existingPRHeadResolver(githubObserver),
+		Client:              mgr.GetClient(),
+		Scheme:              mgr.GetScheme(),
+		APIReader:           mgr.GetAPIReader(),
+		Launch:              launcher.Launch,
+		Sources:             sources,
+		StatusWriter:        status.KubePatchWriter{Client: mgr.GetClient()},
+		Observer:            githubObserver,
+		PullRequests:        pullRequestReader(githubObserver),
+		Events:              runEvents,
+		Evidence:            evidenceIntake,
+		PRHeadResolver:      existingPRHeadResolver(githubObserver),
+		DoneRetention:       doneRetention,
+		FailedRetention:     failedRetention,
+		NeedsHumanRetention: needsHumanRetention,
+		TerminalAuditKeep:   terminalAuditKeep,
 	}
 	if secureMode {
 		secure, err := buildSecureControl(secureConfig{
@@ -413,6 +450,19 @@ func existingPRHeadResolver(observer controller.WorldObserver) controller.Existi
 	}
 	resolver, _ := observer.(controller.ExistingPRHeadResolver)
 	return resolver
+}
+
+// pullRequestReader gives the reconciler's slow post-review observation the
+// forge capability it reads through: the exact pull-request read of the
+// configured provider, built on the operator's own read credential. The core
+// never receives a forge-specific client or CLI — only the forge.Provider
+// seam and its capability diagnostics.
+func pullRequestReader(observer controller.WorldObserver) controller.PullRequestReader {
+	githubObserver, ok := observer.(couriergithub.Observer)
+	if !ok || githubObserver.Client == nil {
+		return nil
+	}
+	return couriergithub.NewProvider(forge.ProviderConfig{Name: "github"}, githubObserver.Client)
 }
 
 // validateEvidenceFlags reports a clear error when the evidence intake flags

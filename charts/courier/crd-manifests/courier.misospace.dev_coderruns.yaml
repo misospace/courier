@@ -289,6 +289,62 @@ spec:
                 x-kubernetes-list-map-keys:
                 - type
                 x-kubernetes-list-type: map
+              controlRequest:
+                description: |-
+                  ControlRequest is the operator-owned fenced control request (#238).
+                  The controller translates the soft-stop annotation into this record
+                  and alone writes it; the broker's trusted status listener accepts only
+                  the harness-owned schema, so no other writer can forge a request. It
+                  is replaceable, not set-once: a changed annotation replaces the record
+                  and a cleared annotation clears it.
+                properties:
+                  id:
+                    description: 'ID is the opaque request ID: the annotation value,
+                      verbatim.'
+                    maxLength: 128
+                    minLength: 1
+                    type: string
+                  kind:
+                    description: Kind is the requested action.
+                    enum:
+                    - soft-stop
+                    type: string
+                  requestedAt:
+                    description: RequestedAt is when the controller stamped this record.
+                    format: date-time
+                    type: string
+                  targetPodUID:
+                    description: TargetPodUID fences the request to one control incarnation.
+                    maxLength: 128
+                    minLength: 1
+                    type: string
+                required:
+                - id
+                - kind
+                - requestedAt
+                - targetPodUID
+                type: object
+              controlRequestAck:
+                description: |-
+                  ControlRequestAck is the harness-owned durable acknowledgement of the
+                  control request the live incarnation served (#238). The harness writes
+                  it through the broker's trusted status path, which fences it to a
+                  matching live request.
+                properties:
+                  at:
+                    description: At is when the harness wrote this acknowledgement.
+                    format: date-time
+                    type: string
+                  id:
+                    description: 'ID is the acknowledged request ID: the serving record''s
+                      ID, verbatim.'
+                    maxLength: 128
+                    minLength: 1
+                    type: string
+                required:
+                - at
+                - id
+                type: object
               declaredNoChange:
                 description: |-
                   DeclaredNoChange records that the coordinator of this run exited with
@@ -385,6 +441,49 @@ spec:
                   PublicationPolicy is the immutable destination resolved by the operator
                   before launch. Its RunUID must match this object's current UID.
                 properties:
+                  acceptanceCriteria:
+                    description: |-
+                      AcceptanceCriteria is the revision-pinned acceptance-criterion set
+                      extracted from the trusted source-issue body at admission. An empty
+                      list is a legitimate pin — the issue carries no recognizable
+                      Acceptance section — and is distinct from nil, which means no set was
+                      pinned (fix-pr runs, policies admitted before #280). Later issue
+                      edits never mutate a live run's pin.
+                    items:
+                      description: |-
+                        Criterion is one acceptance criterion pinned from the trusted source-issue
+                        snapshot at admission (#249/#280). ID is the ordinal assigned at extraction
+                        ("AC-1", "AC-2", …, in document order); Digest covers the normalized
+                        criterion text so an evidence row authored against edited text is refused.
+                      properties:
+                        digest:
+                          description: Digest is the sha256 of the normalized text.
+                          pattern: ^sha256:[0-9a-f]{64}$
+                          type: string
+                        id:
+                          description: ID is the extraction ordinal ("AC-1", "AC-2",
+                            …).
+                          pattern: ^AC-[1-9][0-9]*$
+                          type: string
+                        text:
+                          description: Text is the normalized criterion text (whitespace-collapsed).
+                          maxLength: 512
+                          type: string
+                      required:
+                      - digest
+                      - id
+                      - text
+                      type: object
+                    maxItems: 32
+                    type: array
+                    x-kubernetes-list-type: atomic
+                  acceptanceCriteriaDigest:
+                    description: |-
+                      AcceptanceCriteriaDigest covers the trusted issue identity plus every
+                      criterion digest in order. It is non-empty exactly when a set is
+                      pinned; the broker binding recomputes it and refuses a mismatched pin.
+                    pattern: ^sha256:[0-9a-f]{64}$
+                    type: string
                   baseOID:
                     description: BaseOID is the base ref tip observed at admission.
                     type: string
@@ -424,6 +523,31 @@ spec:
                   runUID:
                     description: RunUID binds this policy to one CoderRun incarnation.
                     type: string
+                  sourceIssue:
+                    description: |-
+                      SourceIssue pins the trusted source-issue identity for resolve-issue
+                      runs, recorded beside the criterion pin so the policy is
+                      self-describing. It is cross-checked by the broker binding against
+                      the identity derived from the immutable spec. Nil for fix-pr runs and
+                      for policies admitted before the criterion contract (#280).
+                    properties:
+                      name:
+                        description: Name is the provider-canonical repository name.
+                        minLength: 1
+                        type: string
+                      number:
+                        description: Number is the trusted source issue number.
+                        minimum: 1
+                        type: integer
+                      owner:
+                        description: Owner is the provider-canonical repository owner.
+                        minLength: 1
+                        type: string
+                    required:
+                    - name
+                    - number
+                    - owner
+                    type: object
                   workInitiallyAbsent:
                     description: WorkInitiallyAbsent distinguishes an absent ref from
                       one with a tip at admission.

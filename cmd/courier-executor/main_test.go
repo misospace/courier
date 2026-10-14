@@ -5271,3 +5271,57 @@ func TestLinkageForgeFailureReason(t *testing.T) {
 		t.Fatalf("linkageForgeFailureReason = %q, want %q", got, want)
 	}
 }
+
+// TestInstallGitIdentityPrecedence pins the standalone executor's identity
+// contract (#317): a configured or exported nonempty GIT_* value always wins,
+// unset or blank names receive the shared default, and restore returns the
+// environment to exactly its prior state.
+func TestInstallGitIdentityPrecedence(t *testing.T) {
+	names := []string{"GIT_AUTHOR_NAME", "GIT_AUTHOR_EMAIL", "GIT_COMMITTER_NAME", "GIT_COMMITTER_EMAIL"}
+	for _, name := range names {
+		value, set := os.LookupEnv(name)
+		if set {
+			t.Cleanup(func() { _ = os.Setenv(name, value) })
+		} else {
+			t.Cleanup(func() { _ = os.Unsetenv(name) })
+		}
+	}
+	if err := os.Setenv("GIT_AUTHOR_NAME", "Deploy Bot"); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Unsetenv("GIT_AUTHOR_EMAIL"); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Setenv("GIT_COMMITTER_NAME", "   "); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Unsetenv("GIT_COMMITTER_EMAIL"); err != nil {
+		t.Fatal(err)
+	}
+	restore := installGitIdentity()
+	if got := os.Getenv("GIT_AUTHOR_NAME"); got != "Deploy Bot" {
+		t.Fatalf("GIT_AUTHOR_NAME = %q, want the configured value to be preserved", got)
+	}
+	if got := os.Getenv("GIT_AUTHOR_EMAIL"); got != executor.DefaultGitAuthorEmail {
+		t.Fatalf("GIT_AUTHOR_EMAIL = %q, want the shared default", got)
+	}
+	if got := os.Getenv("GIT_COMMITTER_NAME"); got != executor.DefaultGitAuthorName {
+		t.Fatalf("GIT_COMMITTER_NAME = %q, want the shared default for a blank value", got)
+	}
+	if got := os.Getenv("GIT_COMMITTER_EMAIL"); got != executor.DefaultGitAuthorEmail {
+		t.Fatalf("GIT_COMMITTER_EMAIL = %q, want the shared default", got)
+	}
+	restore()
+	if got := os.Getenv("GIT_AUTHOR_NAME"); got != "Deploy Bot" {
+		t.Fatalf("after restore GIT_AUTHOR_NAME = %q, want the prior value back", got)
+	}
+	if _, set := os.LookupEnv("GIT_AUTHOR_EMAIL"); set {
+		t.Fatal("after restore GIT_AUTHOR_EMAIL is set, want it returned to unset")
+	}
+	if got := os.Getenv("GIT_COMMITTER_NAME"); got != "   " {
+		t.Fatalf("after restore GIT_COMMITTER_NAME = %q, want the prior blank value back", got)
+	}
+	if _, set := os.LookupEnv("GIT_COMMITTER_EMAIL"); set {
+		t.Fatal("after restore GIT_COMMITTER_EMAIL is set, want it returned to unset")
+	}
+}

@@ -3,7 +3,9 @@ package controller
 import (
 	"context"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
+	"fmt"
 	"strings"
 
 	corev1 "k8s.io/api/core/v1"
@@ -12,6 +14,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	courierv1alpha1 "github.com/misospace/courier/api/v1alpha1"
+	"github.com/misospace/courier/internal/broker"
 	"github.com/misospace/courier/internal/executor"
 )
 
@@ -121,6 +124,11 @@ func (l *CoordinatorLauncher) Launch(ctx context.Context, run *courierv1alpha1.C
 		podConfig.EvidenceToken = executor.EvidenceToken(l.EvidenceKey, run.Namespace, run.Name, string(run.UID), nonce)
 		podConfig.EvidenceNonce = hex.EncodeToString(nonce)
 	}
+	criteria, err := criteriaEnvelope(run)
+	if err != nil {
+		return err
+	}
+	podConfig.Criteria = criteria
 	builder := executor.NewPodBuilder(podConfig)
 	builder.Executor = l.Executor
 	pod, err := builder.Build(run, &lane)
@@ -172,4 +180,30 @@ func (l *CoordinatorLauncher) Launch(ctx context.Context, run *courierv1alpha1.C
 		return ErrProvisioningInFlight
 	}
 	return nil
+}
+
+// criteriaEnvelope renders the trusted COURIER_CRITERIA envelope for one run
+// from its persisted publication policy (#280): the pinned criterion set —
+// re-verified by digest like every other policy field — serialized in the
+// broker criterion-set shape. Empty means no set was pinned (fix-pr runs,
+// policies admitted before the criterion contract, runs without a persisted
+// policy). A corrupt pin fails closed: a run whose envelope cannot be
+// trusted never launches with one.
+func criteriaEnvelope(run *courierv1alpha1.CoderRun) (string, error) {
+	policy := run.Status.PublicationPolicy
+	if policy == nil {
+		return "", nil
+	}
+	set, pinned, err := broker.CriterionSetFromPolicy(policy)
+	if err != nil {
+		return "", fmt.Errorf("launcher: pinned acceptance criteria are corrupt: %w", err)
+	}
+	if !pinned {
+		return "", nil
+	}
+	encoded, err := json.Marshal(set)
+	if err != nil {
+		return "", fmt.Errorf("launcher: encode pinned acceptance criteria: %w", err)
+	}
+	return string(encoded), nil
 }

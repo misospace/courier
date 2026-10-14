@@ -18,12 +18,13 @@ import (
 )
 
 const (
-	PathPublish       = "/v1/publication"
-	PathImportBundle  = "/v1/bundles/import"
-	PathSnapshot      = "/v1/git/snapshot"
-	PathCreatePR      = "/v1/pull-requests"
-	PathUpdatePR      = "/v1/pull-requests/update"
-	PathTrustedStatus = "/trusted/v1/status"
+	PathPublish        = "/v1/publication"
+	PathImportBundle   = "/v1/bundles/import"
+	PathSnapshot       = "/v1/git/snapshot"
+	PathCreatePR       = "/v1/pull-requests"
+	PathUpdatePR       = "/v1/pull-requests/update"
+	PathTrustedStatus  = "/trusted/v1/status"
+	PathControlRequest = "/trusted/v1/control-request"
 )
 
 // RequestAuthenticator verifies a bearer token for each request. Implementations

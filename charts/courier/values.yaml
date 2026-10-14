@@ -100,6 +100,20 @@ evidence:
   #    rendered Service routes port 80 to it.
   port: 8082
 
+retention:
+  # -- Terminal CoderRun retention (#287). The controller deletes terminal runs
+  #    after these windows and always keeps the most recent `auditKeep` terminal
+  #    runs per repository for audit. `done` applies to resolved Done runs;
+  #    `failed` and `needsHuman` apply once a run's lifecycle report has
+  #    settled. Rendered as the matching `--*-retention` manager flags; an
+  #    empty value leaves the manager default.
+  done: 5m
+  failed: 168h
+  needsHuman: 168h
+  # -- Number of most recent terminal runs per repository always retained,
+  #    even past their retention window. Negative disables the floor.
+  auditKeep: 5
+
 controllers:
   main:
     replicas: 1
@@ -142,12 +156,25 @@ controllers:
         #   --executor-environment-secret
         #                               Secret exposed to coordinator pods for
         #                               model/provider environment
+        #   --git-author-name / --git-author-email /
+        #   --git-committer-name / --git-committer-email
+        #                               git identity rendered into coordinator
+        #                               pods; empty falls back to the explicit
+        #                               default Courier <courier@localhost>.
+        #                               These explicit pod env values win over
+        #                               same-named keys of
+        #                               --executor-environment-secret. GitHub
+        #                               attribution needs an account-associated
+        #                               email; authorship is separate from
+        #                               authentication and commit signing.
         args:
           - --leader-elect
           - --git-remote-template=https://github.com/%s.git
           - --git-credential-secret=courier-github
           # - --github-credential-secret=courier-github-api
           # - --github-token-key=token
+          # - --git-author-name=bot
+          # - --git-author-email=123456+bot@users.noreply.github.com
         probes:
           liveness:
             enabled: true
