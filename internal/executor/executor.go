@@ -116,17 +116,17 @@ const (
 // infrastructure failure (pod, gateway, status path) that the operator
 // relaunches under the crashloop backstop — it is never a verdict on the work.
 type HarnessResult struct {
-	Outcome DeclaredOutcome
-	Reason  string
-	Err     error
+	Outcome         DeclaredOutcome
+	Reason          string
+	Err             error
 	WorkspaceSafety *WorkspaceSafetyEvidence
 }
 
 // WorkspaceSafetyEvidence is trusted executor evidence, never a model claim.
 type WorkspaceSafetyEvidence struct {
-	State string `json:"state"`
-	Branch string `json:"branch"`
-	Head string `json:"head"`
+	State      string `json:"state"`
+	Branch     string `json:"branch"`
+	Head       string `json:"head"`
 	RemoteHead string `json:"remote_head"`
 }
 

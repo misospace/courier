@@ -1544,10 +1544,14 @@ PR-fix reports carry the stable settlement idempotency key and must return a
 matching deferred resolution. Dispatch issue handoff currently lacks a durable
 same-key success replay surface: after source release succeeds but the run status
 write is lost, a stale-token response remains a conservative hold rather than
-manufactured success. Full cross-worker issue rediscovery and committed-partial-
-work recovery remain incomplete; this is not the full #327 acceptance guarantee.
+manufactured success. Normal issue and PR-fix handoffs materialize successors
+while retaining predecessor history, and fresh remote proof permits takeover of
+pushed work on the existing branch/PR. An issue release with both its response
+and matching audit evidence lost is not automatically recoverable: diagnostics
+and history remain held, and retrying the consumed receipt cannot release a
+replacement claim. Dirty/unpushed work likewise requires manual preservation.
 
-Operator recovery remains manual and item-specific:
+Manual recovery for ambiguous or unsupported handoffs is item-specific:
 
 - Inspect live source ownership, the run and its pods, the remote branch/PR,
   and the exhaustion evidence. Unknown failures and explicit human holds do
@@ -1556,6 +1560,11 @@ Operator recovery remains manual and item-specific:
   Preserve dirty/unpushed work using the existing evidence retrieval procedure
   before removing its workspace; evidence capture is bounded and best-effort,
   not an automatic transfer or proof that every edit survived.
+- If release is ambiguous, compare live source ownership and the retained
+  attempt receipt with source audit/history. Do not mark the old attempt settled
+  without positive evidence, or clear a replacement owner's claim to force a
+  retry. If evidence is unavailable, leave the diagnostic hold and use the
+  source's explicit item-specific operator recovery procedure.
 - Use the source's explicit operator recovery procedure only after confirming
   ownership again. Current Dispatch issue unclaim is not attempt-fenced, so
   even repeated reads are not a substitute for atomic fencing. Do not automate

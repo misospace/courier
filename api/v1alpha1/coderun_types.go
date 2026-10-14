@@ -243,9 +243,9 @@ const (
 
 // WorkspaceSafetyEvidence is the executor's trusted workspace snapshot.
 type WorkspaceSafetyEvidence struct {
-	State string `json:"state,omitempty"`
-	Branch string `json:"branch,omitempty"`
-	Head string `json:"head,omitempty"`
+	State      string `json:"state,omitempty"`
+	Branch     string `json:"branch,omitempty"`
+	Head       string `json:"head,omitempty"`
 	RemoteHead string `json:"remoteHead,omitempty"`
 }
 

@@ -41,14 +41,11 @@ func TestDispatchCapacityRecoveryCreatesOnlyFreshSuccessors(t *testing.T) {
 		mode                     courierv1alpha1.Mode
 		ref                      int
 	}{
-		{"issue", issueID, dispatch.EncodeWorkID(dispatch.Task{Type: "implement", Issue: &dispatch.Issue{ID: "issue-17", Repo: "acme/widgets", Number: 17}, PullRequest: &dispatch.PullRequest{Repo: "acme/widgets", Number: 17, URL: "https://github.com/acme/widgets/pull/17"}}), courierv1alpha1.ModeResolveIssue, 17},
+		{"issue", issueID, issueID, courierv1alpha1.ModeResolveIssue, 17},
 		{"prfix-handout-token", prID("old-token"), prID("new-handout-token"), courierv1alpha1.ModeFixPR, 42},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			old := settledDispatchRun(tc.initial, tc.name+"-old", tc.mode, tc.ref)
-			if tc.name == "prfix-handout-token" {
-				old.Spec.WorkItemID = dispatch.EncodeWorkID(dispatch.Task{Type: "followup-pr", PullRequest: &dispatch.PullRequest{Repo: "acme/widgets", Number: 42}, PRFixItem: &dispatch.PRFixItem{ID: "fix-42", Generation: 2, HandoutToken: "old-token"}})
-			}
 			kube := recoveryTestClient(t, old)
 			adapter := &dispatchRecoveryAdapter{items: []source.WorkItem{{ID: tc.initial, Mode: string(tc.mode), Repo: "acme/widgets", Ref: tc.ref}}}
 			runner := source.NewRunner(kube, adapter, source.RunnerConfig{Source: "dispatch", LaneProfile: "local", Namespace: "courier"})
@@ -69,7 +66,7 @@ func TestDispatchCapacityRecoveryCreatesOnlyFreshSuccessors(t *testing.T) {
 			}
 			var successor *courierv1alpha1.CoderRun
 			for i := range runs.Items {
-				if runs.Items[i].Spec.WorkItemID == tc.successor {
+				if runs.Items[i].Spec.WorkItemID == tc.successor && runs.Items[i].Name != old.Name {
 					successor = &runs.Items[i]
 				}
 			}
@@ -92,7 +89,6 @@ func TestDispatchCapacityRecoveryConcurrentRunnersCreateOneSuccessor(t *testing.
 	oldID := dispatch.EncodeWorkID(dispatch.Task{Type: "implement", Issue: &dispatch.Issue{ID: "issue-17", Repo: "acme/widgets", Number: 17}})
 	newID := oldID
 	old := settledDispatchRun(oldID, "predecessor", courierv1alpha1.ModeResolveIssue, 17)
-	old.Spec.WorkItemID = dispatch.EncodeWorkID(dispatch.Task{Type: "implement", Issue: &dispatch.Issue{ID: "issue-17", Repo: "acme/widgets", Number: 17}, PullRequest: &dispatch.PullRequest{Repo: "acme/widgets", Number: 17, URL: "https://github.com/acme/widgets/pull/17"}})
 	kube := recoveryTestClient(t, old)
 	adapter := &dispatchRecoveryAdapter{items: []source.WorkItem{{ID: newID, Mode: "resolve-issue", Repo: "acme/widgets", Ref: 17}}}
 	config := source.RunnerConfig{Source: "dispatch", LaneProfile: "local", Namespace: "courier"}
