@@ -12,6 +12,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
 	"unicode/utf8"
 
@@ -561,6 +562,101 @@ func TestCaptureAcceptance(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestReadCappedNoFollow pins the issue #237 primitive: a path that is a
+// symlink when opened — as after a regular-file-to-symlink swap in the
+// window between Lstat classification and the read — fails with ELOOP and
+// yields no content; a plain regular file still reads through the cap.
+func TestReadCappedNoFollow(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+
+	regular := filepath.Join(dir, "regular.txt")
+	writeFile(t, regular, "regular content\n")
+	data, err := readCapped(regular, MaxFileBytes+1)
+	if err != nil {
+		t.Fatalf("readCapped regular file: %v", err)
+	}
+	if string(data) != "regular content\n" {
+		t.Errorf("readCapped regular file = %q, want %q", data, "regular content\n")
+	}
+
+	secret := filepath.Join(dir, "secret.txt")
+	writeFile(t, secret, "SECRET-TARGET-CONTENT\n")
+	victim := filepath.Join(dir, "victim.txt")
+	writeFile(t, victim, "original bytes\n")
+	// Simulate the swap that raced in after classification: the path the
+	// read now opens is a symlink the classification pass never saw.
+	if err := os.Remove(victim); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(secret, victim); err != nil {
+		t.Fatal(err)
+	}
+	data, err = readCapped(victim, MaxFileBytes+1)
+	if !errors.Is(err, syscall.ELOOP) {
+		t.Fatalf("readCapped swapped symlink err = %v, want ELOOP", err)
+	}
+	if data != nil {
+		t.Errorf("readCapped returned %q for a swapped symlink, want nil", data)
+	}
+}
+
+// TestCaptureSymlinkSwapRace is the issue #237 regression: a hostile worktree
+// swaps a classified-regular file for an escaping symlink in the window
+// between the Lstat classification and the read. The capture must store
+// symlink metadata only, never the target's bytes.
+func TestCaptureSymlinkSwapRace(t *testing.T) {
+	// Not parallel: the test replaces a package-level seam that parallel
+	// captures share.
+	dir := newRepo(t)
+	writeFile(t, filepath.Join(dir, "swap.txt"), "SWAP-RACE-ORIGINAL\n")
+
+	original := readFileForCapture
+	t.Cleanup(func() { readFileForCapture = original })
+	readFileForCapture = func(path string, limit int) ([]byte, error) {
+		// The swap lands after Lstat classified the path as regular and
+		// before the O_NOFOLLOW open.
+		if err := os.Remove(path); err != nil {
+			t.Errorf("swap remove: %v", err)
+		}
+		if err := os.Symlink("../../../../etc/shadow", path); err != nil {
+			t.Errorf("swap symlink: %v", err)
+		}
+		return original(path, limit)
+	}
+
+	bundle, err := Capture(context.Background(), captureOptions(dir, nil))
+	if err != nil {
+		t.Fatalf("capture: %v", err)
+	}
+	entry := findEntry(t, bundle, "swap.txt")
+	if entry.Class != ClassUntracked {
+		t.Errorf("class = %q, want %q", entry.Class, ClassUntracked)
+	}
+	if entry.Disposition != DispositionSymlink {
+		t.Errorf("disposition = %q, want %q", entry.Disposition, DispositionSymlink)
+	}
+	if entry.LinkTarget != "../../../../etc/shadow" {
+		t.Errorf("linkTarget = %q, want %q", entry.LinkTarget, "../../../../etc/shadow")
+	}
+	if !entry.Escaping {
+		t.Errorf("escaping = false, want true for a target outside the repository root")
+	}
+	if entry.StoredPath != "" {
+		t.Errorf("symlink entry carries StoredPath %q", entry.StoredPath)
+	}
+	if entry.Bytes != 0 {
+		t.Errorf("symlink entry carries Bytes %d, want 0", entry.Bytes)
+	}
+	if members := untar(t, bundle.Archive); len(members) != 0 {
+		t.Errorf("archive carries %d members for a swapped symlink: %v", len(members), members)
+	}
+	if got := bundle.Manifest.Totals; got.Files != 1 || got.Symlinks != 1 || got.Stored != 0 {
+		t.Errorf("totals = %+v, want Files 1, Symlinks 1, Stored 0", got)
+	}
+	assertAbsent(t, bundle, []string{"SWAP-RACE-ORIGINAL"})
 }
 
 // TestRunGitCapped drives the bounded pipe reader directly: a

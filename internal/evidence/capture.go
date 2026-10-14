@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"compress/gzip"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -12,6 +13,7 @@ import (
 	"path"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"time"
 	"unicode/utf8"
 
@@ -101,14 +103,7 @@ func Capture(ctx context.Context, opts Options) (*Bundle, error) {
 				totals.OmittedBinary++
 			}
 		case info.Mode()&os.ModeSymlink != 0:
-			entry.Disposition = DispositionSymlink
-			totals.Symlinks++
-			if target, rerr := os.Readlink(full); rerr == nil {
-				entry.LinkTarget = target
-				entry.Escaping = symlinkEscapes(dir, full, target)
-			} else {
-				entry.Escaping = true
-			}
+			applySymlinkMetadata(&entry, &totals, dir, full)
 		case !info.Mode().IsRegular():
 			// Non-regular files (fifo, socket, device) are unscannable.
 			entry.Disposition = DispositionOmittedBinary
@@ -122,8 +117,16 @@ func Capture(ctx context.Context, opts Options) (*Bundle, error) {
 			// omitted-over-limit WITHOUT a content scan, so an oversized
 			// file is never read into memory whole; both omitted-binary
 			// and omitted-over-limit store nothing.
-			data, rerr := readCapped(full, MaxFileBytes+1)
+			data, rerr := readFileForCapture(full, MaxFileBytes+1)
 			if rerr != nil {
+				if errors.Is(rerr, syscall.ELOOP) {
+					// The path was swapped for a symlink between the Lstat
+					// classification and this O_NOFOLLOW open: re-classify as
+					// symlink metadata and store nothing, so a target the
+					// classification pass never saw is never stored.
+					applySymlinkMetadata(&entry, &totals, dir, full)
+					break
+				}
 				entry.Disposition = DispositionOmittedBinary
 				entry.Bytes = info.Size()
 				totals.OmittedBinary++
@@ -363,6 +366,23 @@ func isBinary(data []byte) bool {
 	return bytes.IndexByte(window, 0) != -1 || !utf8.Valid(data)
 }
 
+// applySymlinkMetadata classifies an entry as metadata-only symlink and
+// records the target and whether it escapes the repository root. It is used
+// both for paths Lstat saw as symlinks and for paths swapped into symlinks
+// before the O_NOFOLLOW read (ELOOP); the target is read at classification
+// time, so a later swap to a different target is a metadata artifact, never
+// stored content.
+func applySymlinkMetadata(entry *Entry, totals *Totals, dir, full string) {
+	entry.Disposition = DispositionSymlink
+	totals.Symlinks++
+	if target, rerr := os.Readlink(full); rerr == nil {
+		entry.LinkTarget = target
+		entry.Escaping = symlinkEscapes(dir, full, target)
+	} else {
+		entry.Escaping = true
+	}
+}
+
 // symlinkEscapes reports whether a symlink target resolves outside the
 // repository root, without ever following the link. Resolution is lexical
 // (no EvalSymlinks; intermediate symlinks in the target path are not
@@ -414,10 +434,17 @@ func truncateDisplay(s string) string {
 	return s[:cut] + "…"
 }
 
-// readCapped opens path and reads at most limit bytes, stopping there even if
-// the file on disk is larger.
+// readFileForCapture reads the content of a file classified as regular.
+// Tests swap it to simulate a hostile worktree mutating a path between the
+// Lstat classification and the read.
+var readFileForCapture = readCapped
+
+// readCapped opens path without following a trailing symlink (O_NOFOLLOW)
+// and reads at most limit bytes, stopping there even if the file on disk is
+// larger. A path swapped for a symlink after classification fails with
+// ELOOP instead of following the new target.
 func readCapped(path string, limit int) ([]byte, error) {
-	f, err := os.Open(path)
+	f, err := os.OpenFile(path, os.O_RDONLY|syscall.O_NOFOLLOW, 0)
 	if err != nil {
 		return nil, err
 	}
