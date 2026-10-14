@@ -116,17 +116,15 @@ spec:
                     type: string
                   exhaustionCount:
                     description: |-
-                      ExhaustionCount is how many distinct runs' confirmed exhaustion
-                      endings this cooldown window has absorbed. Each refreshed exhaustion
-                      extends the window, so an operator can see a capacity that keeps
-                      failing without reading run history.
+                      ExhaustionCount is the number of distinct confirmed exhaustion events
+                      whose per-run markers fall in the active cooldown window. The count is
+                      recomputed from retained CoderRuns, avoiding an unbounded lane history.
                     minimum: 1
                     type: integer
                   lastExhaustedRun:
                     description: |-
-                      LastExhaustedRun is the most recent run folded into this window; it
-                      makes the count idempotent per run, so a retried recovery never
-                      double-counts its own attempt.
+                      LastExhaustedRun is the most recent run observed while folding the
+                      active window. Per-run CoderRun status markers provide deduplication.
                     maxLength: 253
                     type: string
                   nextEligibleAt:

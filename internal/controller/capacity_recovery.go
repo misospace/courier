@@ -6,10 +6,13 @@ import (
 	"fmt"
 	"time"
 
+	"k8s.io/apimachinery/pkg/api/equality"
+
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	apimeta "k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/client-go/util/retry"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/log"
@@ -40,6 +43,13 @@ const (
 	capacityRecoveryPendingWriters = "PendingWriters"
 	capacityRecoveryRetryable      = "Retryable"
 )
+
+const conditionCapacityCooldownRecorded = "CapacityCooldownRecorded"
+
+func capacityCooldownRecorded(run *courierv1alpha1.CoderRun) bool {
+	condition := apimeta.FindStatusCondition(run.Status.Conditions, conditionCapacityCooldownRecorded)
+	return condition != nil && condition.Status == metav1.ConditionTrue
+}
 
 func (r *CoderRunReconciler) capacityCooldownWindow() time.Duration {
 	if r.CapacityCooldownWindow > 0 {
@@ -91,8 +101,12 @@ func capacityRecoveryPending(run *courierv1alpha1.CoderRun) bool {
 // decision from the cluster. An adapter without the capability is recorded
 // Unsupported — the core never simulates fencing with ordinary Release.
 func (r *CoderRunReconciler) recoverCapacityExhaustion(ctx context.Context, run *courierv1alpha1.CoderRun, adapter source.Adapter, item source.WorkItem) (ctrl.Result, error) {
-	// The source must have seen the recoverable lifecycle report before any
-	// ownership handoff; until then the report retry path owns the timer.
+	// Cooldown registration depends only on the trusted persisted diagnostic,
+	// never on source report availability.
+	if err := r.recordCapacityCooldown(ctx, run); err != nil {
+		return ctrl.Result{}, err
+	}
+	// Ownership handoff remains gated on the positively accepted report.
 	report := apimeta.FindStatusCondition(run.Status.Conditions, lifecycleReportedCondition)
 	if report == nil || report.Status != metav1.ConditionTrue {
 		return ctrl.Result{}, nil
@@ -102,14 +116,6 @@ func (r *CoderRunReconciler) recoverCapacityExhaustion(ctx context.Context, run 
 		// settle or release anything, fenced or not.
 		return ctrl.Result{}, r.setCapacityRecovery(ctx, run, metav1.ConditionFalse, capacityRecoveryStale,
 			"the lifecycle report was superseded; a newer source attempt owns the work")
-	}
-
-	// Cooldown first, and source-neutral: even an adapter that cannot settle
-	// stops its capacity from immediately re-claiming. Idempotent per run.
-	if err := r.recordCapacityCooldown(ctx, run); err != nil {
-		// No condition is written, so the next reconcile re-drives the whole
-		// recovery — the cooldown write must not be silently lost.
-		return ctrl.Result{}, err
 	}
 
 	// Never allow overlapping writers: settlement waits until every pod of
@@ -175,8 +181,28 @@ func (r *CoderRunReconciler) recoverCapacityExhaustion(ctx context.Context, run 
 // exhaustion from a different run extends the window so repeatedly failing
 // capacity keeps pausing. Unrelated capacity identities are untouched.
 func (r *CoderRunReconciler) recordCapacityCooldown(ctx context.Context, run *courierv1alpha1.CoderRun) error {
+	// Persist an attempt-owned event marker before changing shared lane state.
+	// This makes retries and A/B/A interleavings idempotent without a growing
+	// history list on the LaneProfile.
+	if !capacityCooldownRecorded(run) {
+		before := run.DeepCopy()
+		apimeta.SetStatusCondition(&run.Status.Conditions, metav1.Condition{
+			Type: conditionCapacityCooldownRecorded, Status: metav1.ConditionTrue,
+			Reason: "Recorded", Message: "confirmed capacity exhaustion registered",
+			LastTransitionTime: metav1.NewTime(r.clock()),
+		})
+		if err := r.patchStatus(ctx, before, run); err != nil {
+			return err
+		}
+	}
+	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		return r.recordCapacityCooldownLane(ctx, run)
+	})
+}
+
+func (r *CoderRunReconciler) recordCapacityCooldownLane(ctx context.Context, run *courierv1alpha1.CoderRun) error {
 	lane := &courierv1alpha1.LaneProfile{}
-	if err := r.Get(ctx, client.ObjectKey{Namespace: run.Namespace, Name: run.Spec.Lane}, lane); err != nil {
+	if err := r.reader().Get(ctx, client.ObjectKey{Namespace: run.Namespace, Name: run.Spec.Lane}, lane); err != nil {
 		if apierrors.IsNotFound(err) {
 			// The lane object is gone; there is no capacity identity left to
 			// cool down. Settlement proceeds — the source side is still the
@@ -188,27 +214,80 @@ func (r *CoderRunReconciler) recordCapacityCooldown(ctx context.Context, run *co
 		return fmt.Errorf("get LaneProfile %s/%s: %w", run.Namespace, run.Spec.Lane, err)
 	}
 	identity := lane.CapacityIdentity()
-	reason := fmt.Sprintf("run %s reported confirmed execution-capacity exhaustion", run.Name)
+	// Recompute the active window from durable per-run first-event timestamps.
+	// This makes cross-object patch gaps harmless and bounds the evidence by
+	// the cooldown window rather than accumulating a lane-owned history list.
+	var runs courierv1alpha1.CoderRunList
+	if err := r.reader().List(ctx, &runs, client.InNamespace(run.Namespace)); err != nil {
+		return fmt.Errorf("list capacity exhaustion evidence: %w", err)
+	}
+	var lanes courierv1alpha1.LaneProfileList
+	if err := r.reader().List(ctx, &lanes, client.InNamespace(run.Namespace)); err != nil {
+		return fmt.Errorf("list capacity evidence lanes: %w", err)
+	}
+	laneByName := make(map[string]*courierv1alpha1.LaneProfile, len(lanes.Items))
+	for i := range lanes.Items {
+		laneByName[lanes.Items[i].Name] = &lanes.Items[i]
+	}
+	// The run may have been patched through the direct client while this list
+	// came from a lagging cache. Overlay it so its event is never undercounted.
+	foundCurrent := false
+	for i := range runs.Items {
+		if runs.Items[i].UID == run.UID && runs.Items[i].Name == run.Name {
+			runs.Items[i] = *run.DeepCopy()
+			foundCurrent = true
+			break
+		}
+	}
+	if !foundCurrent {
+		runs.Items = append(runs.Items, *run.DeepCopy())
+	}
+	windowStart := r.clock().UTC().Add(-r.capacityCooldownWindow())
+	count := 0
+	var latest time.Time
+	latestRun := ""
+	for i := range runs.Items {
+		event := &runs.Items[i]
+		if !isCapacityExhaustionRun(event) || event.Spec.Lane == "" {
+			continue
+		}
+		eventLane := laneByName[event.Spec.Lane]
+		if eventLane == nil || eventLane.CapacityIdentity() != identity {
+			continue
+		}
+		marker := apimeta.FindStatusCondition(event.Status.Conditions, conditionCapacityCooldownRecorded)
+		if marker == nil || marker.Status != metav1.ConditionTrue || marker.LastTransitionTime.Time.Before(windowStart) {
+			continue
+		}
+		count++
+		if marker.LastTransitionTime.Time.After(latest) || (marker.LastTransitionTime.Time.Equal(latest) && event.Name > latestRun) {
+			latest = marker.LastTransitionTime.Time
+			latestRun = event.Name
+		}
+	}
 	before := lane.DeepCopy()
-	cooldown := lane.Status.CapacityCooldown
-	if cooldown == nil || cooldown.CapacityID != identity {
+	if count == 0 {
+		if lane.Status.CapacityCooldown != nil && lane.Status.CapacityCooldown.CapacityID == identity {
+			lane.Status.CapacityCooldown = nil
+		}
+	} else {
 		lane.Status.CapacityCooldown = &courierv1alpha1.CapacityCooldown{
 			CapacityID:       identity,
-			Reason:           reason,
-			LastExhaustedRun: run.Name,
-			ExhaustionCount:  1,
-			NextEligibleAt:   metav1.NewTime(r.clock().UTC().Add(r.capacityCooldownWindow())),
+			Reason:           fmt.Sprintf("run %s reported confirmed execution-capacity exhaustion", latestRun),
+			LastExhaustedRun: latestRun,
+			ExhaustionCount:  count,
+			NextEligibleAt:   metav1.NewTime(latest.Add(r.capacityCooldownWindow())),
 		}
-	} else if cooldown.LastExhaustedRun != run.Name {
-		// A retry of this run must not slide the deadline. A distinct
-		// exhaustion event starts a fresh window.
-		cooldown.ExhaustionCount++
-		cooldown.LastExhaustedRun = run.Name
-		cooldown.Reason = reason
-		cooldown.NextEligibleAt = metav1.NewTime(r.clock().UTC().Add(r.capacityCooldownWindow()))
+	}
+	if equality.Semantic.DeepEqual(before.Status.CapacityCooldown, lane.Status.CapacityCooldown) {
+		return nil
 	}
 	if err := r.Status().Patch(ctx, lane, client.MergeFromWithOptions(before, client.MergeFromWithOptimisticLock{})); err != nil {
 		return fmt.Errorf("record capacity cooldown on lane %s: %w", lane.Name, err)
+	}
+	if lane.Status.CapacityCooldown == nil {
+		log.FromContext(ctx).Info("capacity cooldown cleared: no live exhaustion markers", "lane", lane.Name, "capacityID", identity)
+		return nil
 	}
 	log.FromContext(ctx).Info("capacity cooldown recorded",
 		"lane", lane.Name, "capacityID", identity,

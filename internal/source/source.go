@@ -164,6 +164,8 @@ type CapacityRecoveryProof struct {
 // CapacityRecoveryPreparer is an explicit optional capability. Preparation
 // must check source claim generation and trusted workspace/remote safety; it
 // must not infer safety from missing evidence or untrusted model declarations.
+// A key already committed by settlement MUST replay its original proof after
+// ownership moves; settlement replay must never mutate a newer owner.
 type CapacityRecoveryPreparer interface {
 	PrepareCapacityRecovery(context.Context, WorkItem, CapacityRecoveryAttempt) (CapacityRecoveryProof, error)
 }
@@ -175,7 +177,8 @@ type CapacityRecoveryPreparer interface {
 // opaque to the core, which derives it from the immutable run incarnation and
 // never from model, worker, or lane names. IdempotencyKey lets the source
 // collapse retries of the same settlement into one transition; it is stable
-// across reconciles and operator retries of the same attempt.
+// across reconciles and operator retries of the same attempt. A committed key
+// MUST return its original result without mutating a newer owner.
 type CapacityHandoff struct {
 	// FenceToken identifies the exact claimed attempt. It is never valid for
 	// a replacement attempt to present another attempt's token, and a source

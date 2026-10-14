@@ -67,15 +67,13 @@ type CapacityCooldown struct {
 	// It never carries executor freeform text.
 	// +kubebuilder:validation:MaxLength=256
 	Reason string `json:"reason"`
-	// ExhaustionCount is how many distinct runs' confirmed exhaustion
-	// endings this cooldown window has absorbed. Each refreshed exhaustion
-	// extends the window, so an operator can see a capacity that keeps
-	// failing without reading run history.
+	// ExhaustionCount is the number of distinct confirmed exhaustion events
+	// whose per-run markers fall in the active cooldown window. The count is
+	// recomputed from retained CoderRuns, avoiding an unbounded lane history.
 	// +kubebuilder:validation:Minimum=1
 	ExhaustionCount int `json:"exhaustionCount"`
-	// LastExhaustedRun is the most recent run folded into this window; it
-	// makes the count idempotent per run, so a retried recovery never
-	// double-counts its own attempt.
+	// LastExhaustedRun is the most recent run observed while folding the
+	// active window. Per-run CoderRun status markers provide deduplication.
 	// +optional
 	// +kubebuilder:validation:MaxLength=253
 	LastExhaustedRun string `json:"lastExhaustedRun,omitempty"`

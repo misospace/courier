@@ -252,6 +252,13 @@ func (r *CoderRunReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 	// one slow, bounded read of its recorded pull request, so a human merge can
 	// finish and reap it.
 	if run.Status.Phase != "" && run.Status.Phase != courierv1alpha1.PhasePending {
+		// Capacity availability is independent of source reporting. Persist it
+		// before a pending or unsupported lifecycle report can return early.
+		if isCapacityExhaustionRun(&run) {
+			if err := r.recordCapacityCooldown(ctx, &run); err != nil {
+				return ctrl.Result{}, err
+			}
+		}
 		if lifecycleReportPending(&run) {
 			if lifecycleReportUnsupported(&run) {
 				if lifecycleReportRetryTokenInvalid(&run) {

@@ -2928,7 +2928,16 @@ was superseded.
   unsupported or stale settlement without changing ownership. The current
   Dispatch adapter lacks that contract, so the cross-worker guarantee is not
   yet available for Dispatch; connector issue #1256 tracks the missing API.
-  Prior branch/PR identity and terminal history remain untouched. (#327)
+  Prior branch/PR identity and terminal history remain untouched. Cooldown
+  registration is independent of lifecycle-report success and is driven by the
+  persisted trusted diagnostic; ownership release remains report/proof gated.
+  Each run persists one cooldown-event timestamp before lane mutation, and the
+  active count/deadline are recomputed from retained run markers in the shared
+  capacity identity, so interleaved retries do not double-count and the lane
+  does not accumulate an unbounded event list. Settlement preparation and
+  commit share a source idempotency key: after commit, both operations must
+  replay the original proof/result even after ownership moves, without changing
+  a newer owner, allowing Courier to recover from a lost status write. (#327)
 
 - **2026-10-13 — #287 review: the audit floor counts only the phases it
   governs, and the reap counter counts accepted deletes rather than removals.**
