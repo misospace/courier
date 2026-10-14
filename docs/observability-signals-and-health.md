@@ -235,12 +235,16 @@ floor that keeps the most recent floor-governed runs past their window. Each
 window runs from its own durable marker (`courier.misospace.dev/done-at`,
 `failed-at`, `needs-human-at`, `internal/controller/reap.go:24-26`) rather than
 `creationTimestamp`, because a run can exist far longer than its window before it
-terminalizes. `reapTerminal` additionally refuses to delete a run whose lifecycle
-report has not reached a positive settled state
-(`internal/controller/reap.go:61`), and `AwaitingReview`, `HandedOff`, and
-`BlockedExternal` are never reaped
-(`internal/controller/reap.go:150-159,193-200`). Nothing here changes that
-policy.
+terminalizes. Deletion additionally waits on the source lifecycle report: the
+reconciler holds a terminal run in place while `lifecycleReportSettled` is false
+(`internal/controller/coderun_controller.go:270,284-287`; predicate at
+`internal/controller/coderun_controller.go:1266`), and `reapTerminal` records
+that as the caller's precondition rather than checking it itself
+(`internal/controller/reap.go:58-61`). Only `Failed` and `NeedsHuman` reach
+`reapTerminal`: `AwaitingReview` goes to `observeMergedReviewPR` instead, and
+`HandedOff` and `BlockedExternal` fall through to a log line, so those phases
+are never reaped (`internal/controller/coderun_controller.go:258-295`). Nothing
+here changes that policy.
 
 | Signal | Kind | Unit | Labels | Semantics |
 | --- | --- | --- | --- | --- |
