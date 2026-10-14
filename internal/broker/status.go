@@ -39,6 +39,10 @@ type HarnessPatch struct {
 	// no longer exists. The broker refuses writes from any but the current
 	// control incarnation, so this cannot drop a concurrent writer's state.
 	ReconcileOperations bool `json:"reconcileOperations,omitempty"`
+	// ControlRequestAck persists the harness's durable acknowledgement of the
+	// control request the live incarnation served. The writer fences it to a
+	// matching live request on every CAS attempt.
+	ControlRequestAck *courier.ControlRequestAck `json:"controlRequestAck,omitempty"`
 }
 
 // OperationAddition carries the operation ID (the map key) and the entry.
@@ -87,8 +91,15 @@ func (w *StatusWriter) Write(ctx context.Context, identity StatusIdentity, patch
 		return fmt.Errorf("authenticated status identity is incomplete")
 	}
 	if patch.Checkpoint == nil && patch.Heartbeat == nil && patch.LastCommit == nil &&
-		patch.AddOperation == nil && patch.ClearOperation == "" && !patch.ReconcileOperations {
+		patch.AddOperation == nil && patch.ClearOperation == "" && !patch.ReconcileOperations && patch.ControlRequestAck == nil {
 		return fmt.Errorf("empty harness status patch")
+	}
+	// An acknowledgement names the request it acknowledges and carries its
+	// timestamp; either missing is a malformed request, refused before any
+	// live read so a definite denial never reaches the CAS path and is
+	// miscategorized as transient availability.
+	if patch.ControlRequestAck != nil && (patch.ControlRequestAck.ID == "" || patch.ControlRequestAck.At.IsZero()) {
+		return fmt.Errorf("control request acknowledgement is malformed")
 	}
 	if patch.LastCommit != nil && validate == nil {
 		return fmt.Errorf("lastCommit requires live-world validation")
@@ -147,6 +158,16 @@ func (w *StatusWriter) Write(ctx context.Context, identity StatusIdentity, patch
 		if current != 1 {
 			return fmt.Errorf("expected exactly one live control pod for CoderRun, found %d", current)
 		}
+		// Fenced against the fresh run on every CAS attempt: an
+		// acknowledgement is served only when it names the live request that
+		// fences to this exact authenticated incarnation. A mismatch is a
+		// definite denial, never transient availability.
+		if patch.ControlRequestAck != nil {
+			request := run.Status.ControlRequest
+			if request == nil || request.ID != patch.ControlRequestAck.ID || request.TargetPodUID != string(identity.ControlPodUID) {
+				return fmt.Errorf("control request acknowledgement does not fence to the live request")
+			}
+		}
 		if validate != nil {
 			if err := validate(ctx, run, pod, patch); err != nil {
 				// A validator that reports its own backend failure (e.g. a
@@ -170,6 +191,9 @@ func (w *StatusWriter) Write(ctx context.Context, identity StatusIdentity, patch
 		}
 		if patch.LastCommit != nil {
 			run.Status.LastCommit = *patch.LastCommit
+		}
+		if patch.ControlRequestAck != nil {
+			run.Status.ControlRequestAck = patch.ControlRequestAck.DeepCopy()
 		}
 		if patch.ReconcileOperations {
 			run.Status.ActiveOperations = nil

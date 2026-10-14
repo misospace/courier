@@ -53,6 +53,12 @@ type Coordinator struct {
 	activity  ActivitySink
 	briefs    *BriefRegistry
 	status    *StatusReporter
+	control   *ControlWatcher
+	// workRefBeyondAnchor is the soft-stop world probe: the broker's live
+	// observation of whether the pinned work ref holds a tip beyond the
+	// admission anchor. The soft-stop finish derives the outcome from that
+	// observation, never from a model declaration.
+	workRefBeyondAnchor func(context.Context) (bool, error)
 }
 
 // CoordinatorConfig assembles the harness. Worker, snapshot, forge, and
@@ -68,6 +74,15 @@ type CoordinatorConfig struct {
 	Publisher Publisher
 	Activity  ActivitySink
 	Status    *StatusReporter
+	// Control optionally serves the operator soft-stop path (#238): the
+	// broker-sourced control request, its durable acknowledgement through
+	// the status reporter, the stop latch, and the injected control turn.
+	// Absent, the run has no soft-stop path.
+	Control *ControlWatcher
+	// WorkRefBeyondAnchor optionally reports the broker's live observation
+	// of whether the pinned work ref holds a tip beyond the admission
+	// anchor. The soft-stop finish derives the run's outcome from it.
+	WorkRefBeyondAnchor func(context.Context) (bool, error)
 }
 
 // NewCoordinator fails closed on an unusable model configuration: without a
@@ -80,15 +95,17 @@ func NewCoordinator(config CoordinatorConfig) (*Coordinator, error) {
 		return nil, errors.New("harness: no model is bound to the coordinator role")
 	}
 	return &Coordinator{
-		gateway:   config.Gateway,
-		bindings:  config.Bindings,
-		worker:    config.Worker,
-		forge:     config.Forge,
-		snapshot:  config.Snapshot,
-		publisher: config.Publisher,
-		activity:  config.Activity,
-		briefs:    NewBriefRegistry(),
-		status:    config.Status,
+		gateway:             config.Gateway,
+		bindings:            config.Bindings,
+		worker:              config.Worker,
+		forge:               config.Forge,
+		snapshot:            config.Snapshot,
+		publisher:           config.Publisher,
+		activity:            config.Activity,
+		briefs:              NewBriefRegistry(),
+		status:              config.Status,
+		control:             config.Control,
+		workRefBeyondAnchor: config.WorkRefBeyondAnchor,
 	}, nil
 }
 
@@ -131,6 +148,13 @@ func (c *Coordinator) Run(ctx context.Context, inv executor.Invocation) executor
 
 	clarifications := 0
 	for {
+		// Step boundary (#238): read the broker-served control request and
+		// inject its control turn once. The latch, not the model, decides
+		// how a stopped run ends.
+		c.control.Poll(ctx)
+		if note, ok := c.control.TakeControlTurn(); ok {
+			session.Append(note)
+		}
 		turn := c.pump(ctx, session, "", c.coordinatorTools())
 		if turn.streamErr != nil {
 			if result, ok := availabilityEnding(turn.streamErr); ok {
@@ -138,20 +162,28 @@ func (c *Coordinator) Run(ctx context.Context, inv executor.Invocation) executor
 			}
 			return executor.HarnessResult{Err: fmt.Errorf("harness: model stream failed: %w", turn.streamErr)}
 		}
-		if !turn.final {
-			continue
-		}
-		outcome, parseErr := parseOutcome(turn.text)
-		if parseErr == nil {
-			return c.finish(ctx, inv, outcome, turn.text)
-		}
-		if clarifications < maxOutcomeClarifications {
-			clarifications++
-			session.Append(Message{Role: "user", Content: "Your final message was not a valid outcome declaration. Reply with exactly one JSON object: {\"outcome\":\"changes\"}, {\"outcome\":\"no_change_needed\",\"evidence\":\"...\"}, {\"outcome\":\"needs_decision\",\"question\":\"...\"}, or {\"outcome\":\"blocked_external\",\"missing\":\"...\"}."})
-			continue
-		}
-		return executor.HarnessResult{
-			Reason: fmt.Sprintf("undeclared ending: the coordinator's final message was not a valid outcome declaration: %v", parseErr),
+		if turn.final {
+			if c.control.Stopped() {
+				// The run loop exits only with the latch set and every
+				// brief terminal: in-flight work always reaches its
+				// integration before the soft-stop finish runs.
+				if c.briefs.HasInFlight() {
+					continue
+				}
+				return c.finishSoftStop(ctx)
+			}
+			outcome, parseErr := parseOutcome(turn.text)
+			if parseErr == nil {
+				return c.finish(ctx, inv, outcome, turn.text)
+			}
+			if clarifications < maxOutcomeClarifications {
+				clarifications++
+				session.Append(Message{Role: "user", Content: "Your final message was not a valid outcome declaration. Reply with exactly one JSON object: {\"outcome\":\"changes\"}, {\"outcome\":\"no_change_needed\",\"evidence\":\"...\"}, {\"outcome\":\"needs_decision\",\"question\":\"...\"}, or {\"outcome\":\"blocked_external\",\"missing\":\"...\"}."})
+				continue
+			}
+			return executor.HarnessResult{
+				Reason: fmt.Sprintf("undeclared ending: the coordinator's final message was not a valid outcome declaration: %v", parseErr),
+			}
 		}
 	}
 }
@@ -296,6 +328,60 @@ func (c *Coordinator) finish(ctx context.Context, inv executor.Invocation, outco
 	default:
 		return executor.HarnessResult{Reason: fmt.Sprintf("undeclared outcome %q", outcome)}
 	}
+}
+
+// finishSoftStop closes a soft-stopped run (#238). The latch, not the model,
+// owns this ending: it reconciles status debt and flushes active operations
+// like finish, then derives the outcome from the world — changes iff the
+// broker's live observation shows the work ref holding a tip beyond the
+// admission anchor, confirmed through the publisher (whose re-confirm is
+// idempotent); otherwise no_change_needed. A broker publication block
+// promotes the outcome to blocked_external. A SIGTERM that cancelled the
+// context takes precedence and is the caller's stream-failure path, never a
+// soft-stop outcome.
+func (c *Coordinator) finishSoftStop(ctx context.Context) executor.HarnessResult {
+	if err := ctx.Err(); err != nil {
+		return executor.HarnessResult{Err: fmt.Errorf("harness: model stream failed: %w", err)}
+	}
+	_ = c.status.Flush(ctx)
+	if err := c.status.ReconcileDebt(ctx); err != nil {
+		return executor.HarnessResult{Err: fmt.Errorf("harness: a completed brief lacks a durable status record: %w", err)}
+	}
+	if c.workRefBeyondAnchor == nil {
+		return executor.HarnessResult{Err: errors.New("harness: soft stop has no work-ref observation configured")}
+	}
+	beyond, err := c.workRefBeyondAnchor(ctx)
+	if err != nil {
+		return executor.HarnessResult{Err: fmt.Errorf("harness: soft stop could not observe the work ref: %w", err)}
+	}
+	if !beyond {
+		return executor.HarnessResult{
+			Outcome: executor.OutcomeNoChangeNeeded,
+			Reason:  "soft stop: the work ref holds no tip beyond the admission anchor",
+		}
+	}
+	if c.publisher == nil {
+		return executor.HarnessResult{
+			Reason: "soft stop found work beyond the admission anchor but this build has no publication path",
+			Err:    errors.New("harness: publication is not configured"),
+		}
+	}
+	publication, err := c.publisher.Publish(ctx)
+	if err != nil {
+		var blocked *PublicationBlockedError
+		if errors.As(err, &blocked) {
+			return executor.HarnessResult{
+				Outcome: executor.OutcomeBlockedExternal,
+				Reason:  blocked.Error(),
+			}
+		}
+		return executor.HarnessResult{Err: fmt.Errorf("harness: soft stop publication failed: %w", err)}
+	}
+	reason := "soft stop: published through the broker"
+	if publication.AlreadyPublished {
+		reason = "soft stop: publication already confirmed at " + publication.OID
+	}
+	return executor.HarnessResult{Outcome: executor.OutcomeChanges, Reason: reason}
 }
 
 // parseOutcome parses the model's final message as the outcome declaration.
@@ -514,6 +600,14 @@ func (c *Coordinator) runShell(ctx context.Context, call ToolCall, briefID strin
 // untrusted and publication stays unreachable from it — integration and
 // publication happen here, in trusted control.
 func (c *Coordinator) runDelegate(ctx context.Context, call ToolCall, result ToolResult) ToolResult {
+	// Soft-stop latch (#238): no new briefs once the operator has stopped
+	// this incarnation. Shell, cancellation, and forge stay available so
+	// the model can validate, commit, and publish what it has.
+	if c.control.Stopped() {
+		result.IsError = true
+		result.Content = "a soft stop is in effect: this incarnation dispatches no new briefs; let in-flight work stand, run final validation, and declare your outcome"
+		return result
+	}
 	var args struct {
 		ID           string     `json:"id"`
 		Role         string     `json:"role"`
@@ -558,6 +652,10 @@ func (c *Coordinator) runDelegate(ctx context.Context, call ToolCall, result Too
 		result.Content = safeToolError(err)
 		return result
 	}
+	// Whatever this brief's fate — result, failed session, failed
+	// integration, or failed durable write — its work unit ends terminal
+	// when this call returns, so a soft-stop exit never waits on it again.
+	defer c.briefs.MarkTerminal(registered.ID)
 	// The brief's own fresh snapshot: it must carry every integrated but
 	// possibly unpublished brief, so delegates never reuse a stale
 	// workspace. A transient failure here fails the brief; the model
@@ -808,7 +906,9 @@ func (c *Coordinator) dispatchAndAwait(ctx context.Context, opID, briefID string
 			return protocol.Result{}, fmt.Errorf("operation %s is unknown to the worker", opID)
 		}
 		// Still running: keep polling. Polling is observation, not a
-		// heartbeat and not a duration limit.
+		// heartbeat and not a duration limit. The throttled control read
+		// (#238) lets a soft-stop latch land while an operation waits, so
+		// in-flight briefs finish and integrate before the stop boundary.
 		select {
 		case <-ctx.Done():
 			// The context is gone but the operation may still be executing:
@@ -817,6 +917,7 @@ func (c *Coordinator) dispatchAndAwait(ctx context.Context, opID, briefID string
 			return protocol.Result{}, ctx.Err()
 		case <-time.After(200 * time.Millisecond):
 		}
+		c.control.PollThrottled(ctx)
 	}
 }
 

@@ -117,14 +117,19 @@ type BriefRegistry struct {
 	order   []string
 	tombs   map[string]struct{}
 	results map[string]BriefResult
+	// terminal holds briefs whose work unit ended without a recorded result
+	// (a failed session or integration). A terminal brief is spent, not
+	// in flight; it never becomes a checkpoint entry.
+	terminal map[string]struct{}
 }
 
 // NewBriefRegistry returns an empty ledger.
 func NewBriefRegistry() *BriefRegistry {
 	return &BriefRegistry{
-		briefs:  make(map[string]Brief),
-		tombs:   make(map[string]struct{}),
-		results: make(map[string]BriefResult),
+		briefs:   make(map[string]Brief),
+		tombs:    make(map[string]struct{}),
+		results:  make(map[string]BriefResult),
+		terminal: make(map[string]struct{}),
 	}
 }
 
@@ -139,6 +144,40 @@ func (r *BriefRegistry) RecordResult(briefID string, result BriefResult) {
 	}
 	result.BriefID = briefID
 	r.results[briefID] = result
+	r.terminal[briefID] = struct{}{}
+}
+
+// MarkTerminal records that a registered brief's work unit ended without a
+// recorded result — a failed session, integration, or durable write. The
+// brief is spent (its ID is never reusable) and no longer in flight: a
+// soft-stop exit waits on work that may still land, not on briefs that
+// already ended in failure.
+func (r *BriefRegistry) MarkTerminal(briefID string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if _, ok := r.briefs[briefID]; !ok {
+		return
+	}
+	r.terminal[briefID] = struct{}{}
+}
+
+// HasInFlight reports whether any registered brief has reached no terminal
+// state — neither a recorded result nor an end in failure. It includes a
+// brief still inside packAndIntegrate: the soft-stop run loop exits only
+// after the last in-flight brief resolves.
+func (r *BriefRegistry) HasInFlight() bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	for _, id := range r.order {
+		if _, ok := r.results[id]; ok {
+			continue
+		}
+		if _, ok := r.terminal[id]; ok {
+			continue
+		}
+		return true
+	}
+	return false
 }
 
 // Result returns the recorded result for a brief, if any.

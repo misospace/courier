@@ -209,6 +209,12 @@ func runArgs(args []string) error {
 		Publisher: engine,
 		Activity:  reporter,
 		Status:    reporter,
+		// Operator soft-stop (#238): the control request arrives only
+		// through the broker's trusted listener, fenced to this exact
+		// incarnation, and is acknowledged durably through the same
+		// trusted status path before the stop latch flips.
+		Control:             harness.NewControlWatcher(identity.brokerStatusClient(), reporter),
+		WorkRefBeyondAnchor: engine.WorkRefBeyondAnchor,
 	})
 	if err != nil {
 		return fmt.Errorf("courier-control: %w", err)
