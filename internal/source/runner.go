@@ -13,6 +13,7 @@ import (
 
 	courierv1alpha1 "github.com/misospace/courier/api/v1alpha1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	apimeta "k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
@@ -49,6 +50,17 @@ type Runner struct {
 	laneWaiting    bool
 	laneSuspended  bool
 	laneAtCapacity bool
+	laneCooling    bool
+	// Now is the runner's time source, injectable so tests never sleep.
+	// Nil falls back to time.Now.
+	Now func() time.Time
+}
+
+func (r *Runner) clock() time.Time {
+	if r.Now != nil {
+		return r.Now()
+	}
+	return time.Now()
 }
 
 func NewRunner(c client.Client, adapter Adapter, config RunnerConfig) *Runner {
@@ -117,6 +129,30 @@ func (r *Runner) Poll(ctx context.Context) error {
 		log.FromContext(ctx).Info("lane resumed, resuming source discovery", "laneProfile", r.Config.LaneProfile)
 		r.laneSuspended = false
 	}
+	// A confirmed capacity-exhaustion cooldown pauses discovery for this
+	// lane's capacity identity only (#327): the exhausted capacity stops
+	// immediately re-claiming work, while every other identity — including
+	// other profiles drawing on a different pool — keeps discovering. The
+	// cooldown lives on the LaneProfile status, so an operator restart
+	// re-derives the remaining window from the cluster, not process memory.
+	var lanes courierv1alpha1.LaneProfileList
+	if err := r.List(ctx, &lanes, client.InNamespace(r.Config.Namespace)); err != nil {
+		return fmt.Errorf("list LaneProfiles: %w", err)
+	}
+	if cooldown, active := courierv1alpha1.CapacityCooldownActive(lane, lanes.Items, r.clock()); active {
+		if !r.laneCooling {
+			log.FromContext(ctx).Info("capacity cooldown active, pausing source discovery",
+				"laneProfile", r.Config.LaneProfile,
+				"capacityID", lane.CapacityIdentity(),
+				"nextEligibleAt", cooldown.NextEligibleAt.Time)
+			r.laneCooling = true
+		}
+		return nil
+	}
+	if r.laneCooling {
+		log.FromContext(ctx).Info("capacity cooldown expired, resuming source discovery", "laneProfile", r.Config.LaneProfile)
+		r.laneCooling = false
+	}
 
 	var runs courierv1alpha1.CoderRunList
 	if err := r.List(ctx, &runs, client.InNamespace(r.Config.Namespace)); err != nil {
@@ -151,10 +187,10 @@ func (r *Runner) Poll(ctx context.Context) error {
 		if strings.TrimSpace(run.Spec.WorkItemID) == "" {
 			continue
 		}
-		// Dependency recovery requires a fresh source attempt identity. Do not
-		// exclude blocked work from discovery, which must see reactivation, but
-		// retain same-identity dedupe below to preserve history and prevent churn.
-		if run.Status.Phase == courierv1alpha1.PhaseBlockedExternal {
+		// Only an explicitly settled capacity exhaustion releases the
+		// identity-level discovery barrier. The exact consumed source token
+		// remains in the dedupe map below, so reactivation requires a fresh ID.
+		if settledCapacityExhaustion(run) {
 			continue
 		}
 		retainedSource := run.Spec.Source == r.Config.Source
@@ -194,7 +230,9 @@ func (r *Runner) Poll(ctx context.Context) error {
 	}
 	var items []WorkItem
 	var err error
-	if excluder, ok := r.Adapter.(DiscoveryExcluder); ok {
+	if discoverer, ok := r.Adapter.(CapacityAwareDiscoverer); ok {
+		items, err = discoverer.DiscoverForCapacity(ctx, lane.CapacityIdentity(), exclusions)
+	} else if excluder, ok := r.Adapter.(DiscoveryExcluder); ok {
 		items, err = excluder.DiscoverExcluding(ctx, exclusions)
 	} else {
 		items, err = r.Adapter.Discover(ctx)
@@ -233,11 +271,14 @@ func (r *Runner) Poll(ctx context.Context) error {
 		identity := r.identity(run.Spec.WorkItemID)
 		legacyBinding := run.Spec.Source == "dispatch" || strings.HasPrefix(run.Spec.Source, "dispatch:")
 		if run.Spec.Source == r.Config.Source {
-			existing[workKey(run.Spec.Source, identity)] = struct{}{}
+			if !settledCapacityExhaustion(run) {
+				existing[workKey(run.Spec.Source, identity)] = struct{}{}
+				existing[workKey(run.Spec.Source, run.Spec.WorkItemID)] = struct{}{}
+			}
 		}
 		// Previous Dispatch bindings encoded queue lanes in Source. Keep those
 		// retained runs from being rematerialized during the identity rollout.
-		if legacyBinding {
+		if legacyBinding && !settledCapacityExhaustion(run) {
 			legacyIdentities[identity] = struct{}{}
 		}
 	}
@@ -273,17 +314,22 @@ func (r *Runner) Poll(ctx context.Context) error {
 		run := &courierv1alpha1.CoderRun{
 			ObjectMeta: metav1.ObjectMeta{Namespace: r.Config.Namespace},
 			Spec: courierv1alpha1.CoderRunSpec{
-				Mode:        courierv1alpha1.Mode(spec.Mode),
-				Source:      spec.Source,
-				SourceAgent: r.Config.SourceAgent,
-				WorkItemID:  spec.WorkItemID,
-				Repo:        spec.Repo,
-				Ref:         spec.Ref,
-				Lane:        spec.Lane,
-				Debug:       spec.Debug,
+				Mode:          courierv1alpha1.Mode(spec.Mode),
+				Source:        spec.Source,
+				SourceAgent:   r.Config.SourceAgent,
+				WorkItemID:    spec.WorkItemID,
+				SourceContext: spec.Context,
+				Repo:          spec.Repo,
+				Ref:           spec.Ref,
+				Lane:          spec.Lane,
+				Debug:         spec.Debug,
 			},
 		}
-		run.Name = runName(r.Config.Source, itemIdentity)
+		name := runName(r.Config.Source, itemIdentity)
+		if predecessor := settledPredecessor(runs.Items, r.Config.Source, itemIdentity, r); predecessor != nil {
+			name = successorRunName(r.Config.Source, itemIdentity, predecessor.UID)
+		}
+		run.Name = name
 		if err := r.Create(ctx, run); err != nil && !apierrors.IsAlreadyExists(err) {
 			return fmt.Errorf("create CoderRun for %q: %w", item.ID, err)
 		}
@@ -320,6 +366,21 @@ func (r *Runner) identity(workItemID string) string {
 		}
 	}
 	return workItemID
+}
+
+// settledCapacityExhaustion is the sole history state that permits discovery
+// past the semantic identity barrier. Incomplete, negative, or human-marked
+// settlement records remain barriers.
+func settledCapacityExhaustion(run *courierv1alpha1.CoderRun) bool {
+	if run.Status.Phase != courierv1alpha1.PhaseBlockedExternal ||
+		run.Status.TerminalDiagnostic == nil ||
+		run.Status.TerminalDiagnostic.Category != courierv1alpha1.TerminalDiagnosticCategoryCapacityExhaustion {
+		return false
+	}
+	recovery := apimeta.FindStatusCondition(run.Status.Conditions, courierv1alpha1.ConditionCapacityRecovery)
+	reported := apimeta.FindStatusCondition(run.Status.Conditions, courierv1alpha1.ConditionLifecycleReported)
+	return recovery != nil && recovery.Status == metav1.ConditionTrue && recovery.Reason == "Settled" &&
+		reported != nil && reported.Status == metav1.ConditionTrue
 }
 
 // phaseUnsettled reports whether a retained run has not yet reached a terminal
@@ -361,4 +422,24 @@ func workKey(sourceName, workItemID string) string {
 func runName(sourceName, workItemID string) string {
 	digest := sha256.Sum256([]byte(workKey(sourceName, workItemID)))
 	return "courier-" + hex.EncodeToString(digest[:])[:32]
+}
+
+func successorRunName(sourceName, workItemID string, predecessorUID types.UID) string {
+	digest := sha256.Sum256([]byte(workKey(sourceName, workItemID) + "\x00" + string(predecessorUID)))
+	return "courier-" + hex.EncodeToString(digest[:])[:32]
+}
+
+func settledPredecessor(runs []courierv1alpha1.CoderRun, sourceName, identity string, runner *Runner) *courierv1alpha1.CoderRun {
+	var predecessor *courierv1alpha1.CoderRun
+	for i := range runs {
+		run := &runs[i]
+		if run.Spec.Source != sourceName || !settledCapacityExhaustion(run) || run.UID == "" || runner.identity(run.Spec.WorkItemID) != identity {
+			continue
+		}
+		if predecessor == nil || run.CreationTimestamp.Time.After(predecessor.CreationTimestamp.Time) ||
+			(run.CreationTimestamp.Equal(&predecessor.CreationTimestamp) && run.Name > predecessor.Name) {
+			predecessor = run
+		}
+	}
+	return predecessor
 }

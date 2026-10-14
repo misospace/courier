@@ -72,6 +72,37 @@ func TestReconcileLeavesNPlusOnePending(t *testing.T) {
 	}
 }
 
+type receiptAdmissionSource struct{ admissionSource }
+
+func (*receiptAdmissionSource) ClaimWithReceipt(_ context.Context, item source.WorkItem) (source.WorkItem, error) {
+	item.Context = "issued-a"
+	return item, nil
+}
+
+func TestAdmissionPersistsAndReconstructsSourceReceipt(t *testing.T) {
+	client := admissionClient(t, admissionLane("local", 1), admissionRun("receipt", "local", courierv1alpha1.PhasePending))
+	src := &receiptAdmissionSource{}
+	reconciler := admissionReconciler(client)
+	reconciler.Sources = NewSourceRegistry(map[string]source.Adapter{"test": src})
+	if _, err := reconciler.Reconcile(context.Background(), admissionRequest("receipt")); err != nil {
+		t.Fatalf("Reconcile() error = %v", err)
+	}
+	var run courierv1alpha1.CoderRun
+	if err := client.Get(context.Background(), admissionKey("receipt"), &run); err != nil {
+		t.Fatal(err)
+	}
+	if run.Status.SourceReceipt != "issued-a" {
+		t.Fatalf("SourceReceipt = %q, want issued-a", run.Status.SourceReceipt)
+	}
+	item, err := sourceWorkItem(&run)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if item.Context != "issued-a" {
+		t.Fatalf("reconstructed Context = %q, want issued-a", item.Context)
+	}
+}
+
 func TestReconcileAdmitsPendingRunWhenFirstRunVerifies(t *testing.T) {
 	client := admissionClient(t,
 		admissionLane("local", 1),
@@ -265,6 +296,7 @@ func (w fakeStatusWriter) PatchStatus(ctx context.Context, name types.Namespaced
 			HeadRepo                        *string                            `json:"headRepo,omitempty"`
 			HeadSHA                         *string                            `json:"headSHA,omitempty"`
 			PR                              string                             `json:"pr,omitempty"`
+			SourceReceipt                   *string                            `json:"sourceReceipt,omitempty"`
 			AdmittedAt                      *metav1.Time                       `json:"admittedAt,omitempty"`
 			StartedAt                       *metav1.Time                       `json:"startedAt,omitempty"`
 			FinishedAt                      *metav1.Time                       `json:"finishedAt,omitempty"`
@@ -290,6 +322,9 @@ func (w fakeStatusWriter) PatchStatus(ctx context.Context, name types.Namespaced
 	if document.Status.Phase != "" {
 		run.Status.Phase = document.Status.Phase
 	}
+	if document.Status.SourceReceipt != nil {
+		run.Status.SourceReceipt = *document.Status.SourceReceipt
+	}
 	if document.Status.Branch != nil {
 		run.Status.Branch = *document.Status.Branch
 	}
@@ -301,6 +336,9 @@ func (w fakeStatusWriter) PatchStatus(ctx context.Context, name types.Namespaced
 	}
 	if document.Status.PR != "" {
 		run.Status.PR = document.Status.PR
+	}
+	if document.Status.SourceReceipt != nil {
+		run.Status.SourceReceipt = *document.Status.SourceReceipt
 	}
 	if document.Status.AdmittedAt != nil {
 		run.Status.AdmittedAt = document.Status.AdmittedAt

@@ -24,6 +24,9 @@ type Profile struct {
 	Concurrency  int               `json:"concurrency,omitempty"`
 	Roles        map[string]string `json:"roles"`
 	Framing      string            `json:"framing,omitempty"`
+	// CapacityGroup names the shared execution-capacity pool this lane
+	// draws from (#327); empty means the lane is its own capacity identity.
+	CapacityGroup string `json:"capacityGroup,omitempty"`
 }
 
 // Parse reads a bootstrap config document: a top-level profiles list of
@@ -59,6 +62,10 @@ func Parse(data []byte) ([]Profile, error) {
 			return nil, fmt.Errorf("bootstrap profile %q: concurrency must be at least 1, got %d", name, profile.Concurrency)
 		}
 		profile.RuntimeImage = strings.TrimSpace(profile.RuntimeImage)
+		profile.CapacityGroup = strings.TrimSpace(profile.CapacityGroup)
+		if len(profile.CapacityGroup) > 253 {
+			return nil, fmt.Errorf("bootstrap profile %q: capacityGroup must be at most 253 characters", name)
+		}
 		if len(profile.Roles) == 0 {
 			return nil, fmt.Errorf("bootstrap profile %q: roles must contain at least one entry", name)
 		}

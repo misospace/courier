@@ -112,6 +112,11 @@ spec:
                   Empty preserves the source's legacy, unqualified identity.
                 pattern: ^[A-Za-z0-9._-]*$
                 type: string
+              sourceContext:
+                description: SourceContext is bounded opaque source-owned JSON, never
+                  interpreted by core.
+                maxLength: 16384
+                type: string
               workItemID:
                 description: |-
                   WorkItemID is the opaque identifier assigned by the source adapter. It
@@ -583,6 +588,11 @@ spec:
                   RunDuration is the human-readable time between StartedAt and FinishedAt,
                   in Go duration format. Written once when FinishedAt is recorded.
                 type: string
+              sourceReceipt:
+                description: SourceReceipt is sensitive source-issued claim fencing
+                  data.
+                maxLength: 16384
+                type: string
               startedAt:
                 description: |-
                   StartedAt is when the coordinator container first reached Running.
@@ -674,6 +684,7 @@ spec:
                     - kubernetes-failure
                     - needs-decision
                     - blocked-external
+                    - capacity-exhaustion
                     - unknown
                     type: string
                   container:
@@ -755,6 +766,20 @@ spec:
                   in Go duration format (e.g. "3m5s"). Written once when StartedAt is
                   recorded.
                 type: string
+              workspaceSafety:
+                description: |-
+                  WorkspaceSafety is the bounded trusted snapshot reported by the executor
+                  at terminal handoff. It is informational unless independently verified.
+                properties:
+                  branch:
+                    type: string
+                  head:
+                    type: string
+                  remoteHead:
+                    type: string
+                  state:
+                    type: string
+                type: object
             type: object
         type: object
     served: true

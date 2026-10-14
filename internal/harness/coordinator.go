@@ -58,7 +58,8 @@ type Coordinator struct {
 	// observation of whether the pinned work ref holds a tip beyond the
 	// admission anchor. The soft-stop finish derives the outcome from that
 	// observation, never from a model declaration.
-	workRefBeyondAnchor func(context.Context) (bool, error)
+	workRefBeyondAnchor     func(context.Context) (bool, error)
+	capacityWorkspaceSafety func(context.Context) (executor.WorkspaceSafetyEvidence, error)
 
 	// deferredAvailability carries a sub-agent stream failure classified as
 	// deferred model-provider availability (#320) from the delegation
@@ -111,7 +112,8 @@ type CoordinatorConfig struct {
 	// WorkRefBeyondAnchor optionally reports the broker's live observation
 	// of whether the pinned work ref holds a tip beyond the admission
 	// anchor. The soft-stop finish derives the run's outcome from it.
-	WorkRefBeyondAnchor func(context.Context) (bool, error)
+	WorkRefBeyondAnchor     func(context.Context) (bool, error)
+	CapacityWorkspaceSafety func(context.Context) (executor.WorkspaceSafetyEvidence, error)
 }
 
 // NewCoordinator fails closed on an unusable model configuration: without a
@@ -124,17 +126,18 @@ func NewCoordinator(config CoordinatorConfig) (*Coordinator, error) {
 		return nil, errors.New("harness: no model is bound to the coordinator role")
 	}
 	return &Coordinator{
-		gateway:             config.Gateway,
-		bindings:            config.Bindings,
-		worker:              config.Worker,
-		forge:               config.Forge,
-		snapshot:            config.Snapshot,
-		publisher:           config.Publisher,
-		activity:            config.Activity,
-		briefs:              NewBriefRegistry(),
-		status:              config.Status,
-		control:             config.Control,
-		workRefBeyondAnchor: config.WorkRefBeyondAnchor,
+		gateway:                 config.Gateway,
+		bindings:                config.Bindings,
+		worker:                  config.Worker,
+		forge:                   config.Forge,
+		snapshot:                config.Snapshot,
+		publisher:               config.Publisher,
+		activity:                config.Activity,
+		briefs:                  NewBriefRegistry(),
+		status:                  config.Status,
+		control:                 config.Control,
+		workRefBeyondAnchor:     config.WorkRefBeyondAnchor,
+		capacityWorkspaceSafety: config.CapacityWorkspaceSafety,
 	}, nil
 }
 
@@ -187,6 +190,15 @@ func (c *Coordinator) Run(ctx context.Context, inv executor.Invocation) executor
 		turn := c.pump(ctx, session, "", c.coordinatorTools())
 		if turn.streamErr != nil {
 			if result, ok := availabilityEnding(turn.streamErr); ok {
+				if result.Outcome == executor.OutcomeCapacityExhausted {
+					evidence := executor.WorkspaceSafetyEvidence{State: "unknown"}
+					if c.capacityWorkspaceSafety != nil {
+						if observed, observeErr := c.capacityWorkspaceSafety(ctx); observeErr == nil {
+							evidence = observed
+						}
+					}
+					result.WorkspaceSafety = &evidence
+				}
 				return result
 			}
 			return executor.HarnessResult{Err: fmt.Errorf("harness: model stream failed: %w", turn.streamErr)}
@@ -228,10 +240,12 @@ func availabilityEnding(err error) (executor.HarnessResult, bool) {
 	if !ok || !classification.Deferred() {
 		return executor.HarnessResult{}, false
 	}
-	return executor.HarnessResult{
-		Outcome: executor.OutcomeBlockedExternal,
-		Reason:  providerAvailabilityReason(classification),
-	}, true
+	outcome := executor.OutcomeBlockedExternal
+	if classification.Availability == ProviderAllowanceExhausted {
+		outcome = executor.OutcomeCapacityExhausted
+	}
+	result := executor.HarnessResult{Outcome: outcome, Reason: providerAvailabilityReason(classification)}
+	return result, true
 }
 
 // providerAvailabilityReason renders a bounded, redacted explanation of a

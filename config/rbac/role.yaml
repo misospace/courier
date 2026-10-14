@@ -67,6 +67,7 @@ rules:
   - courier.misospace.dev
   resources:
   - coderruns/status
+  - laneprofiles/status
   verbs:
   - get
   - patch
@@ -79,6 +80,7 @@ rules:
   - create
   - get
   - list
+  - patch
   - update
   - watch
 - apiGroups:

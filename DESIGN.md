@@ -167,6 +167,8 @@ A coordinator run ends after one of:
   Coordinator-declared blocks include a redacted issue/PR comment and a blocked
   source report.
 
+Capacity-exhaustion recovery is an authoritative source boundary: after uncached topology observation and cooldown, an adapter must explicitly prepare a source-owned receipt proving the current claim/generation and that trusted workspace/remote state holds every partial write. The operator then submits that receipt to an atomic, idempotent source settlement. Missing capability or incomplete proof keeps ownership held; run identity, evidence absence, and model declarations are not proof. No production adapter currently implements this verifier, so production recovery remains safely unsupported.
+
 External verification can later reach a separate outcome: stable green advances
 **Verifying** to **AwaitingReview**; a red check on a fix-pr run ends it as
 **Failed** and emits a failed lifecycle result, while a resolve-issue run whose
@@ -244,6 +246,36 @@ harness with trusted control, a credential-holding policy-enforcing broker, and
 an untrusted isolated worker. Its contract and outstanding blockers are detailed
 in [HARNESS.md](./HARNESS.md); describing that target does not imply that its
 executor or worker isolation is implemented or production-ready.
+
+## Capacity exhaustion and cross-worker recovery (#327)
+
+A structured `capacity_exhausted` outcome is distinct from task failure, an
+external task prerequisite, and a human decision. It is accepted only when the
+executor/runtime positively classifies capacity exhaustion; Courier does not
+infer it from HTTP 429 or provider text. The operator records a recoverable
+`BlockedExternal` terminal diagnostic and starts a durable, idempotent handoff.
+
+`LaneProfile.spec.capacityGroup` optionally names lanes sharing an execution
+capacity identity; otherwise the lane name is the identity. Confirmed
+exhaustion persists a default 15-minute cooldown on LaneProfile status. Source
+discovery and admission pause only for that identity; already-running work and
+unrelated pools continue. The interval is an anti-hammering window, not a
+provider reset estimate. Operators may inspect the `CapacityRecovery`
+condition and LaneProfile `capacityCooldown` status.
+
+Before settlement, the controller reads run pods through the uncached API
+reader and fails closed if any topology writer is running, pending, unknown, or
+terminating. A source may implement optional `CapacityRecoveryPreparer` and
+`CapacityRecovery` interfaces: prepare supplies opaque source fencing and an
+affirmative trusted safety proof; settle atomically applies it. Incomplete proof,
+unsupported capability, or stale fencing retains ownership. Transient settlement
+errors are retried with the same run-scoped idempotency key after controller
+reconstruction. The fake contract exercises both resolve-issue and fix-PR paths,
+including preserved branch/PR metadata; Dispatch implements the interfaces via the merged #1259 receipt-fenced endpoints. Issue settlement is fenced by the issued claim token. If its POST response is lost or cannot be confirmed, the adapter makes one bounded best-effort lookup in the latest 100 audit rows, matching an exact SHA-256 capacity receipt marker and issue identity; a positive match replays success without another POST. This is not durable server-side idempotency: audit pagination/retention, malformed responses, or lookup failures leave the outcome unknown and ownership held for retry. PR-fix capacity settlement uses the issued per-handout receipt. Lifecycle task reports separately support payload-bound replay when given a stable idempotency key. Discovery and dedupe bypass history only for a
+`BlockedExternal` capacity-exhaustion run with `CapacityRecovery=True/Settled`
+and `LifecycleReported=True`; a deterministic predecessor-UID successor name permits stable source IDs while
+retaining diagnostic history and active-run deduplication. Other, incomplete, and human
+histories remain barriers. Retained terminal history is never deleted.
 
 ## Contention and concurrency
 
@@ -1461,6 +1493,88 @@ terminal phase with the report retried on a later reconcile. (#178)
 
 **Implementation:** Bounded retention for `Failed`/`NeedsHuman` is implemented (#287, absorbing the #276 brief). `reapTerminal` (`internal/controller/reap.go`) generalizes the reaper with the per-phase `courier.misospace.dev/needs-human-at` and `courier.misospace.dev/failed-at` annotations (set-once on the first reconcile after the lifecycle report settles, never derived from `FinishedAt`), the four flags/chart values above, and the positive `LifecycleReported` settled-state gate (legacy missing/`False`/`Unknown` runs stay unreaped). It adds a per-repository audit floor — the most recent `terminalAuditKeep` `Failed`/`NeedsHuman` runs are retained past their window, and the floor counts only those phases — and the retention metrics (`courier_coderuns_reap_requests_total` for accepted deletes, `courier_coderuns_oldest_terminal_age_seconds` for what is still retained). The stale "terminal runs are never reaped" comments and assertions were retired, scoped to `AwaitingReview` and `HandedOff`. Closed-unmerged terminalization remains child #277: the observer must expose an explicit closed-unmerged signal on `PRObservation` (it currently collapses closed and never-opened into "no open PR") and the `AwaitingReview` observation branch must stamp the `needs-human-at` annotation at the close-unmerged transition; until then a closed-unmerged PR keeps its run, exactly as before. The #277 done-condition that still binds: a late `AwaitingReview` age (days/weeks/months) must never cause an immediate reap of a closed-unmerged run, and the per-phase annotation must survive controller restarts without re-stamping (already true for the direct path). `HandedOff` retention and an independent evidence TTL remain out of scope.
 
+## Cross-worker capacity recovery (#327)
+
+Confirmed execution-resource exhaustion is distinct from a task blocker and an
+unknown failure. `TerminalDiagnosticCategoryCapacityExhaustion` is the durable
+structured signal vocabulary, and `source.CapacityRecovery` is the optional
+adapter boundary for fenced settlement. Neither is inferred from HTTP status
+alone, and neither permits ordinary `Release` or clearing a human hold. The
+executor recognizes the structured `capacity_exhausted` outcome, maps it to
+`BlockedExternal`, and retains the capacity diagnostic. Provider-specific
+classification remains separate (#320); unknown failures and plain HTTP 429
+responses do not authorize recovery. The operator invokes optional adapter
+preparation and settlement only after an uncached read confirms all run pods
+are inert. Adapters without those capabilities fail closed with diagnostics.
+
+A safe handoff requires durable source fencing, not simply lease expiry: the
+old attempt must be unable to settle after a replacement claim, while the new
+attempt reuses the existing branch/PR and preserves pushed partial work. Dirty
+unpushed work must be durably handed off or retained by the old owner; absent
+that mechanism, recovery fails closed and does not release ownership. Cooldown
+belongs to the exhausted capacity profile, so unrelated profiles remain
+eligible. Namespace-wide discovery and admission consult all profiles sharing
+`capacityGroup`; unrelated capacity remains eligible. The default cooldown is
+15 minutes, a retry-control window rather than a claimed provider reset time.
+Retries of the same exhaustion do not extend its deadline. Successfully settled
+exhaustion history permits rediscovery with a fresh opaque source attempt ID;
+the successor name incorporates the settled predecessor UID, and the old run
+is retained for diagnostics. Source-issued ownership is reacquired before launch.
+
+Dispatch and Courier are independent systems connected by an adapter, not hard
+dependencies. Dispatch #1259 supplies dedicated fenced capacity handoff APIs;
+only the Dispatch adapter knows their HTTP routes, issued claim/handout receipts,
+and generation semantics. Discovery declares the configured opaque capacity,
+claims preserve source receipts in bounded opaque run metadata, and PR-fix
+settlement validates the returned resolution rather than treating HTTP 200 as
+proof of release. Ordinary external waits and task failures keep their existing
+semantics; capacity exhaustion does not first park the queue as an external wait.
+
+The core requires trusted secure-executor workspace evidence before invoking
+`CapacityRecoveryPreparer` and `CapacityRecovery`. Legacy or missing evidence,
+dirty work, and unknown remote state hold ownership. The current native evidence
+producer proves only a clean, unchanged integration workspace safe; committed
+work is safe only when a fresh trusted broker snapshot confirms the existing
+work ref at exactly the integration HEAD; local-only commits remain held.
+Evidence absence and a run UID are not proof. No automatic dirty-work transfer
+is claimed. Source-specific receipts are sensitive opaque metadata, never model
+inputs or capacity identities.
+
+PR-fix reports carry the stable settlement idempotency key and must return a
+matching deferred resolution. Dispatch issue handoff currently lacks a durable
+same-key success replay surface: after source release succeeds but the run status
+write is lost, a stale-token response remains a conservative hold rather than
+manufactured success. Normal issue and PR-fix handoffs materialize successors
+while retaining predecessor history, and fresh remote proof permits takeover of
+pushed work on the existing branch/PR. An issue release with both its response
+and matching audit evidence lost is not automatically recoverable: diagnostics
+and history remain held, and retrying the consumed receipt cannot release a
+replacement claim. Dirty/unpushed work likewise requires manual preservation.
+
+Manual recovery for ambiguous or unsupported handoffs is item-specific:
+
+- Inspect live source ownership, the run and its pods, the remote branch/PR,
+  and the exhaustion evidence. Unknown failures and explicit human holds do
+  not authorize release; quota reset alone does not authorize requeue.
+- Stop and confirm termination of every old writer before changing ownership.
+  Preserve dirty/unpushed work using the existing evidence retrieval procedure
+  before removing its workspace; evidence capture is bounded and best-effort,
+  not an automatic transfer or proof that every edit survived.
+- If release is ambiguous, compare live source ownership and the retained
+  attempt receipt with source audit/history. Do not mark the old attempt settled
+  without positive evidence, or clear a replacement owner's claim to force a
+  retry. If evidence is unavailable, leave the diagnostic hold and use the
+  source's explicit item-specific operator recovery procedure.
+- Use the source's explicit operator recovery procedure only after confirming
+  ownership again. Current Dispatch issue unclaim is not attempt-fenced, so
+  even repeated reads are not a substitute for atomic fencing. Do not automate
+  release/reclaim races or bulk requeues with that endpoint.
+- Confirm the replacement uses the existing branch/PR and fresh source attempt
+  identity. Retain the old run and diagnostics; do not delete history to bypass
+  rediscovery. Capable connectors can use the implemented core settlement and
+  fresh-attempt discovery path; unsupported connectors still require manual
+  recovery and must not emulate atomic fencing with ordinary release calls.
+
 ## Sources
 
 Pluggable adapters over a generic interface. An adapter both *creates* runs and
@@ -1758,6 +1872,15 @@ named items remain unresolved and must not be described as production-ready:
 - The exact vLLM gauge for backpressure on the target model server.
 
 ## Decisions
+
+- **2026-10-16 — #327: materialize recovery attempts without deleting history.**
+  Successor names incorporate the settled predecessor UID so stable issue IDs
+  and preserved PR-fix generations do not collide with retained runs. Active
+  attempts remain barriers; source claims and handout receipts remain fenced.
+  Published-work evidence comes from a fresh broker remote snapshot, not a
+  cached publication or local ref. Dispatch issue replay accepts only positive
+  matching successful audit evidence bound to the original token and settlement
+  key; absent best-effort audit evidence remains an explicit conservative hold.
 
 - **2026-10-14 — #217: a coordinator slot collision resolves to a successful
   launch only against a pod verified live and owned by the run's UID; every
@@ -3003,6 +3126,29 @@ was superseded.
   retired, scoped to `AwaitingReview`/`HandedOff`. Closed-unmerged
   terminalization remains #277. This absorbs the #276 brief; retry and
   escalation stay source-owned. (#287, #251, #276, #250)
+
+- **2026-10-13 — #327: capacity recovery is source-neutral in core and fenced
+  at the adapter boundary.** The operator accepts only a structured positive
+  capacity-exhaustion classification, records a durable recoverable diagnostic,
+  pauses discovery/admission for the lane's capacity identity (default 15
+  minutes), waits for writers to stop, and refuses handoff when failure evidence
+  leaves unpushed work unresolved. A source must atomically fence the exact
+  owner/generation and make work eligible without consuming task-repair budget
+  or overriding a human hold; ordinary Release is never a substitute. The
+  optional capability has durable retry/status semantics and the core reports
+  unsupported or stale settlement without changing ownership. The current
+  Dispatch adapter lacks that contract, so the cross-worker guarantee is not
+  yet available for Dispatch; connector issue #1256 tracks the missing API.
+  Prior branch/PR identity and terminal history remain untouched. Cooldown
+  registration is independent of lifecycle-report success and is driven by the
+  persisted trusted diagnostic; ownership release remains report/proof gated.
+  Each run persists one cooldown-event timestamp before lane mutation, and the
+  active count/deadline are recomputed from retained run markers in the shared
+  capacity identity, so interleaved retries do not double-count and the lane
+  does not accumulate an unbounded event list. Settlement preparation and
+  commit share a source idempotency key: after commit, both operations must
+  replay the original proof/result even after ownership moves, without changing
+  a newer owner, allowing Courier to recover from a lost status write. (#327)
 
 - **2026-10-13 — #287 review: the audit floor counts only the phases it
   governs, and the reap counter counts accepted deletes rather than removals.**

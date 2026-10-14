@@ -101,6 +101,14 @@ const (
 	OutcomeNeedsDecision DeclaredOutcome = "needs_decision"
 	// OutcomeBlockedExternal: something outside the run is missing.
 	OutcomeBlockedExternal DeclaredOutcome = "blocked_external"
+	// OutcomeCapacityExhausted: the execution capacity itself (a provider
+	// allowance, credential pool, or local hardware pool) is confirmed
+	// exhausted (#320/#327). This is an affirmative structured declaration
+	// from a runtime that verified exhaustion — never inferred from an HTTP
+	// status like 429, and never a verdict on the work itself. The operator
+	// routes it to the recoverable capacity-recovery path, not to a failure
+	// or a human park.
+	OutcomeCapacityExhausted DeclaredOutcome = "capacity_exhausted"
 )
 
 // HarnessResult is what a native harness reports when its execution ends.
@@ -108,9 +116,18 @@ const (
 // infrastructure failure (pod, gateway, status path) that the operator
 // relaunches under the crashloop backstop — it is never a verdict on the work.
 type HarnessResult struct {
-	Outcome DeclaredOutcome
-	Reason  string
-	Err     error
+	Outcome         DeclaredOutcome
+	Reason          string
+	Err             error
+	WorkspaceSafety *WorkspaceSafetyEvidence
+}
+
+// WorkspaceSafetyEvidence is trusted executor evidence, never a model claim.
+type WorkspaceSafetyEvidence struct {
+	State      string `json:"state"`
+	Branch     string `json:"branch"`
+	Head       string `json:"head"`
+	RemoteHead string `json:"remote_head"`
 }
 
 // Harness is the native secure-mode runtime seam (#124): the trusted control

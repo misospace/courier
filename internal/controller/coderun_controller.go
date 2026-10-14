@@ -146,6 +146,13 @@ type CoderRunReconciler struct {
 	// run transitions to NeedsHuman. Zero uses the package default.
 	MaxRestarts int
 
+	// CapacityCooldownWindow is how long a capacity identity stays paused for
+	// new work after a confirmed execution-capacity exhaustion (#327). It is
+	// the operator's bounded re-claim control — never a provider-observed
+	// reset time, which Courier does not invent — and it never bounds a run
+	// already executing. Zero uses the package default.
+	CapacityCooldownWindow time.Duration
+
 	// Now is the reconciler's time source, injectable so tests never sleep.
 	// Nil falls back to time.Now.
 	Now func() time.Time
@@ -175,7 +182,8 @@ func (r *CoderRunReconciler) metrics() *RunRecorder {
 // +kubebuilder:rbac:groups=courier.misospace.dev,resources=coderruns,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=courier.misospace.dev,resources=coderruns/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups=courier.misospace.dev,resources=coderruns/finalizers,verbs=update
-// +kubebuilder:rbac:groups=courier.misospace.dev,resources=laneprofiles,verbs=get;list;watch
+// +kubebuilder:rbac:groups=courier.misospace.dev,resources=laneprofiles,verbs=get;list;watch;patch
+// +kubebuilder:rbac:groups=courier.misospace.dev,resources=laneprofiles/status,verbs=get;patch;update
 // +kubebuilder:rbac:groups="",resources=pods,verbs=get;list;watch;create;delete
 
 // Reconcile is the CoderRun control loop.
@@ -245,6 +253,13 @@ func (r *CoderRunReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 	// one slow, bounded read of its recorded pull request, so a human merge can
 	// finish and reap it.
 	if run.Status.Phase != "" && run.Status.Phase != courierv1alpha1.PhasePending {
+		// Capacity availability is independent of source reporting. Persist it
+		// before a pending or unsupported lifecycle report can return early.
+		if isCapacityExhaustionRun(&run) {
+			if err := r.recordCapacityCooldown(ctx, &run); err != nil {
+				return ctrl.Result{}, err
+			}
+		}
 		if lifecycleReportPending(&run) {
 			if lifecycleReportUnsupported(&run) {
 				if lifecycleReportRetryTokenInvalid(&run) {
@@ -275,7 +290,7 @@ func (r *CoderRunReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 			}
 			return r.observeMergedReviewPR(ctx, &run)
 		}
-		if run.Status.Phase == courierv1alpha1.PhaseFailed || run.Status.Phase == courierv1alpha1.PhaseNeedsHuman {
+		if (run.Status.Phase == courierv1alpha1.PhaseFailed || run.Status.Phase == courierv1alpha1.PhaseNeedsHuman) && !isCapacityExhaustionRun(&run) {
 			// A Failed or NeedsHuman run is reaped only once its source
 			// lifecycle report reached a positive, settled state: while the
 			// report is pending the run is the only durable retry intent, and a
@@ -291,6 +306,17 @@ func (r *CoderRunReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 				return r.reapTerminal(ctx, &run, failedAtAnnotation, r.failedRetention(), true)
 			}
 			return r.reapTerminal(ctx, &run, needsHumanAtAnnotation, r.needsHumanRetention(), true)
+		}
+		if isCapacityExhaustionRun(&run) && capacityRecoveryPending(&run) {
+			// A capacity settlement left retryable (transient source error or
+			// writers still draining) is durable intent on the run: an
+			// operator restart re-derives it from the condition and retries
+			// here, after the lifecycle report itself has settled.
+			adapter, item, err := r.adapterAndWorkItem(&run)
+			if err != nil {
+				return ctrl.Result{}, err
+			}
+			return r.recoverCapacityExhaustion(ctx, &run, adapter, item)
 		}
 		l.V(1).Info("reconcile", "phase", run.Status.Phase)
 		return ctrl.Result{}, nil
@@ -312,6 +338,22 @@ func (r *CoderRunReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 		l.V(1).Info("lane suspended, run waits", "lane", run.Spec.Lane)
 		return ctrl.Result{RequeueAfter: capacityRequeueDelay}, nil
 	}
+	// An active capacity cooldown on this lane's capacity identity withholds
+	// admission too (#327): discovery is paused on the runner, but runs the
+	// runner materialized before the exhaustion must not be launched straight
+	// back into exhausted capacity. Runs already admitted (Claimed, Running)
+	// are never touched — the cooldown bounds re-claim, not execution.
+	var lanes courierv1alpha1.LaneProfileList
+	if err := r.List(ctx, &lanes, client.InNamespace(run.Namespace)); err != nil {
+		return ctrl.Result{}, err
+	}
+	if cooldown, active := courierv1alpha1.CapacityCooldownActive(&lane, lanes.Items, r.clock()); active {
+		l.V(1).Info("capacity cooldown active, run waits",
+			"lane", run.Spec.Lane,
+			"capacityID", lane.CapacityIdentity(),
+			"nextEligibleAt", cooldown.NextEligibleAt.Time)
+		return ctrl.Result{RequeueAfter: capacityRequeueDelay}, nil
+	}
 
 	var runs courierv1alpha1.CoderRunList
 	if err := r.List(ctx, &runs, client.InNamespace(run.Namespace)); err != nil {
@@ -330,13 +372,25 @@ func (r *CoderRunReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 		return ctrl.Result{RequeueAfter: capacityRequeueDelay}, nil
 	}
 
-	if err := adapter.Claim(ctx, item); err != nil {
+	if claimer, ok := adapter.(source.ClaimerWithReceipt); ok {
+		claimed, err := claimer.ClaimWithReceipt(ctx, item)
+		if err != nil {
+			return ctrl.Result{}, err
+		}
+		if claimed.Context != "" && len(claimed.Context) > source.MaxSourceContextBytes {
+			return ctrl.Result{}, fmt.Errorf("source claim returned oversized receipt")
+		}
+		item.Context = claimed.Context
+	} else if err := adapter.Claim(ctx, item); err != nil {
 		return ctrl.Result{}, err
 	}
 	// Claimed is the admission reservation. Persist it before launching so a
 	// concurrent reconciliation cannot observe an unaccounted-for launch.
 	before := run.DeepCopy()
 	run.Status.Phase = courierv1alpha1.PhaseClaimed
+	if _, ok := adapter.(source.ClaimerWithReceipt); ok {
+		run.Status.SourceReceipt = item.Context
+	}
 	if run.Status.AdmittedAt == nil {
 		run.Status.AdmittedAt = &metav1.Time{Time: r.clock().UTC()}
 	}
@@ -749,6 +803,10 @@ func (r *CoderRunReconciler) observeRunning(ctx context.Context, run *courierv1a
 		// A no_change_needed fix-pr run no longer terminalizes directly: it
 		// is routed to Verifying, which settles it against the world.
 		intent := terminalLifecycleIntent{}
+		if message, valid := parseCoordinatorTermination(pod); valid &&
+			terminationOutcome == string(executor.OutcomeCapacityExhausted) && r.Secure != nil {
+			run.Status.WorkspaceSafety = boundedWorkspaceSafety(message.WorkspaceSafety)
+		}
 		if phase == courierv1alpha1.PhaseBlockedExternal {
 			intent.error = terminationReason
 		}
@@ -1069,7 +1127,7 @@ func (r *CoderRunReconciler) transitionTerminal(ctx context.Context, run *courie
 	// Write the terminal phase first so the run stops holding lane capacity
 	// regardless of whether the source lifecycle report below succeeds. The
 	// run's own terminalization must never depend on the source.
-	if run.Status.Phase != before.Status.Phase || run.Status.PR != before.Status.PR || !reflect.DeepEqual(run.Status.Telemetry, before.Status.Telemetry) || !reflect.DeepEqual(run.Status.TerminalDiagnostic, before.Status.TerminalDiagnostic) || !reflect.DeepEqual(run.Status.ControlRequest, before.Status.ControlRequest) || !reflect.DeepEqual(run.Status.ControlRequestAck, before.Status.ControlRequestAck) || !reflect.DeepEqual(run.Status.Conditions, before.Status.Conditions) {
+	if run.Status.Phase != before.Status.Phase || run.Status.PR != before.Status.PR || !reflect.DeepEqual(run.Status.Telemetry, before.Status.Telemetry) || !reflect.DeepEqual(run.Status.TerminalDiagnostic, before.Status.TerminalDiagnostic) || !reflect.DeepEqual(run.Status.ControlRequest, before.Status.ControlRequest) || !reflect.DeepEqual(run.Status.ControlRequestAck, before.Status.ControlRequestAck) || !reflect.DeepEqual(run.Status.WorkspaceSafety, before.Status.WorkspaceSafety) || !reflect.DeepEqual(run.Status.Conditions, before.Status.Conditions) {
 		if err := r.patchStatus(ctx, before, run); err != nil {
 			return ctrl.Result{}, err
 		}
@@ -1136,7 +1194,17 @@ func (r *CoderRunReconciler) publishTerminalLifecycle(ctx context.Context, run *
 	}
 	switch {
 	case err == nil:
-		return ctrl.Result{}, r.markLifecycleReportOutcome(ctx, run, true, "Published", "", retryToken, "Accepted")
+		if markErr := r.markLifecycleReportOutcome(ctx, run, true, "Published", "", retryToken, "Accepted"); markErr != nil {
+			return ctrl.Result{}, markErr
+		}
+		// A capacity-exhaustion ending is not finished with the source until
+		// the attempt is settled with fencing: the published report makes the
+		// work recoverable, and the fenced settlement releases this attempt's
+		// ownership so a compatible worker can take it (#327).
+		if isCapacityExhaustionRun(run) {
+			return r.recoverCapacityExhaustion(ctx, run, adapter, item)
+		}
+		return ctrl.Result{}, nil
 	case errors.Is(err, source.ErrSuperseded):
 		log.FromContext(ctx).Info("dropping superseded source lifecycle report",
 			"run", run.Name, "phase", phase, "error", err.Error())
@@ -1163,6 +1231,12 @@ func (r *CoderRunReconciler) publishSourceLifecycle(ctx context.Context, run *co
 	legacyNoChange := phase == courierv1alpha1.PhaseAwaitingReview && run.Status.DeclaredNoChange && run.Spec.Mode == courierv1alpha1.ModeFixPR
 	if legacyNoChange {
 		state = source.StateInProgress
+	}
+	if isCapacityExhaustionRun(run) {
+		lifecycle := lifecycleForPhase(phase, state, run.Status.PR, startedAtForRun(run), intent)
+		lifecycle.Result = source.ResultCapacityExhausted
+		lifecycle.IdempotencyKey = lifecycleIdempotencyKey(run, phase)
+		return reportLifecycle(ctx, adapter, item, lifecycle)
 	}
 	if state != "" {
 		if err := adapter.Transition(ctx, item, state); err != nil {
@@ -1427,6 +1501,14 @@ func reportLifecycle(ctx context.Context, adapter source.Adapter, item source.Wo
 // lifecycleForPhase maps a terminal phase to its source lifecycle report.
 // startedAt is the recorded coordinator start, so sources can report real run
 // durations; nil when the run never reached a recorded start.
+func startedAtForRun(run *courierv1alpha1.CoderRun) *time.Time {
+	if run.Status.StartedAt == nil {
+		return nil
+	}
+	t := run.Status.StartedAt.Time
+	return &t
+}
+
 func lifecycleForPhase(phase courierv1alpha1.Phase, state source.State, pr string, startedAt *time.Time, intent terminalLifecycleIntent) source.Lifecycle {
 	lifecycle := source.Lifecycle{State: state, PR: pr, StartedAt: startedAt}
 	switch phase {
@@ -1489,6 +1571,13 @@ func (r *CoderRunReconciler) patchStatus(ctx context.Context, before, after *cou
 	}
 	if before.Status.PR != after.Status.PR {
 		fields.PR = after.Status.PR
+	}
+	if !reflect.DeepEqual(before.Status.WorkspaceSafety, after.Status.WorkspaceSafety) {
+		fields.WorkspaceSafety = after.Status.WorkspaceSafety
+	}
+	if before.Status.SourceReceipt == "" && after.Status.SourceReceipt != "" {
+		receipt := after.Status.SourceReceipt
+		fields.SourceReceipt = &receipt
 	}
 	// Set-once fields: emitted only on the empty-to-set transition, so a
 	// patch can never clear a recorded timestamp.
@@ -1658,13 +1747,27 @@ func podBelongsToRun(pod *corev1.Pod, run *courierv1alpha1.CoderRun) bool {
 }
 
 type terminationMessage struct {
-	Phase    string                        `json:"phase"`
-	Result   string                        `json:"result"`
-	ExitCode int32                         `json:"exit_code"`
-	Reason   string                        `json:"reason"`
-	Outcome  string                        `json:"outcome"`
-	Category string                        `json:"category,omitempty"`
-	Summary  *courierv1alpha1.RunTelemetry `json:"summary"`
+	Phase           string                                   `json:"phase"`
+	Result          string                                   `json:"result"`
+	ExitCode        int32                                    `json:"exit_code"`
+	Reason          string                                   `json:"reason"`
+	Outcome         string                                   `json:"outcome"`
+	Category        string                                   `json:"category,omitempty"`
+	Summary         *courierv1alpha1.RunTelemetry            `json:"summary"`
+	WorkspaceSafety *courierv1alpha1.WorkspaceSafetyEvidence `json:"workspace_safety,omitempty"`
+}
+
+func boundedWorkspaceSafety(in *courierv1alpha1.WorkspaceSafetyEvidence) *courierv1alpha1.WorkspaceSafetyEvidence {
+	if in == nil || (in.State != "clean" && in.State != "dirty" && in.State != "empty" && in.State != "unknown" && in.State != "pushed") {
+		return nil
+	}
+	bound := func(value string, max int) string {
+		if len(value) > max {
+			return ""
+		}
+		return value
+	}
+	return &courierv1alpha1.WorkspaceSafetyEvidence{State: in.State, Branch: bound(in.Branch, 256), Head: bound(in.Head, 128), RemoteHead: bound(in.RemoteHead, 128)}
 }
 
 func validTerminationPhaseResult(exitCode int32, phase, result string) bool {
@@ -1774,6 +1877,13 @@ const outcomeBlockedExternal = "blocked_external"
 // external block, or a guard refusal.
 const exitNeedsHuman = 2
 
+// outcomeCapacityExhausted is the executor's affirmative structured
+// declaration that execution capacity was confirmed exhausted (#320/#327).
+// It arrives only through the trusted termination handoff — never inferred
+// from transport status — and routes the run to the recoverable
+// BlockedExternal capacity path instead of a failure or a human park.
+const outcomeCapacityExhausted = "capacity_exhausted"
+
 // phaseForExit maps the executor's exit code and declared outcome to the run's
 // next phase. A fix-pr no_change_needed declaration is settled against the
 // world, not the coordinator's word: it is routed to Verifying, which reaches
@@ -1787,7 +1897,11 @@ func phaseForExit(mode courierv1alpha1.Mode, exitCode int32, outcome string) cou
 	case 0:
 		return courierv1alpha1.PhaseVerifying
 	case 2:
-		if outcome == outcomeBlockedExternal {
+		if outcome == outcomeBlockedExternal || outcome == outcomeCapacityExhausted {
+			// A confirmed capacity exhaustion is a recoverable wait on an
+			// external resource, not a verdict on the work and not a human
+			// park; the diagnostic category keeps it distinguishable from a
+			// task-shaped external block (#327).
 			return courierv1alpha1.PhaseBlockedExternal
 		}
 		return courierv1alpha1.PhaseNeedsHuman

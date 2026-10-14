@@ -204,10 +204,11 @@ func (r *Reconciler) ensure(ctx context.Context, profile *Profile) error {
 // desiredSpec maps a bootstrap Profile onto a LaneProfileSpec.
 func desiredSpec(profile *Profile) courierv1alpha1.LaneProfileSpec {
 	return courierv1alpha1.LaneProfileSpec{
-		RuntimeImage: profile.RuntimeImage,
-		Concurrency:  profile.Concurrency,
-		Roles:        profile.Roles,
-		Framing:      profile.Framing,
+		RuntimeImage:  profile.RuntimeImage,
+		Concurrency:   profile.Concurrency,
+		Roles:         profile.Roles,
+		Framing:       profile.Framing,
+		CapacityGroup: profile.CapacityGroup,
 	}
 }
 

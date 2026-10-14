@@ -3,6 +3,7 @@ package dispatch
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
@@ -63,8 +64,9 @@ type Task struct {
 
 // PRFixItem identifies one generation of a queued PR followup.
 type PRFixItem struct {
-	ID         string `json:"id"`
-	Generation int    `json:"generation"`
+	ID           string `json:"id"`
+	Generation   int    `json:"generation"`
+	HandoutToken string `json:"handoutToken,omitempty"`
 }
 
 // Issue identifies the issue associated with a Dispatch task.
@@ -103,15 +105,16 @@ func (f PullRequestStateCheckerFunc) CheckPullRequestState(ctx context.Context, 
 }
 
 type workDescriptor struct {
-	Type        string `json:"type"`
-	IssueID     string `json:"issueId,omitempty"`
-	IssueRepo   string `json:"issueRepo,omitempty"`
-	IssueNumber int    `json:"issueNumber,omitempty"`
-	Repo        string `json:"repo,omitempty"`
-	Number      int    `json:"number,omitempty"`
-	PRURL       string `json:"prURL,omitempty"`
-	PRFixID     string `json:"prFixId,omitempty"`
-	Generation  int    `json:"generation,omitempty"`
+	Type         string `json:"type"`
+	IssueID      string `json:"issueId,omitempty"`
+	IssueRepo    string `json:"issueRepo,omitempty"`
+	IssueNumber  int    `json:"issueNumber,omitempty"`
+	Repo         string `json:"repo,omitempty"`
+	Number       int    `json:"number,omitempty"`
+	PRURL        string `json:"prURL,omitempty"`
+	PRFixID      string `json:"prFixId,omitempty"`
+	Generation   int    `json:"generation,omitempty"`
+	HandoutToken string `json:"handoutToken,omitempty"`
 }
 
 // APIError reports a non-2xx Dispatch response.
@@ -129,13 +132,14 @@ func (e *APIError) Error() string {
 
 // HTTPClient implements the Dispatch HTTP API behind the source adapter.
 type HTTPClient struct {
-	baseURL                *url.URL
-	token                  string
-	agentName              string
-	queueLane              string
-	httpClient             HTTPDoer
-	prStateChecker         PullRequestStateChecker
-	prFixExclusionsEnabled bool
+	baseURL                  *url.URL
+	token                    string
+	agentName                string
+	queueLane                string
+	httpClient               HTTPDoer
+	prStateChecker           PullRequestStateChecker
+	prFixExclusionsEnabled   bool
+	reportIdempotencyEnabled bool
 }
 
 // NewClient creates a Dispatch HTTP client without a queue lane override.
@@ -151,6 +155,12 @@ func NewClientWithLane(baseURL, agentName, queueLane, token string, timeout time
 // WithPullRequestStateChecker configures stale follow-up detection.
 func (c *HTTPClient) WithPullRequestStateChecker(checker PullRequestStateChecker) *HTTPClient {
 	c.prStateChecker = checker
+	return c
+}
+
+// WithReportIdempotency configures whether the Dispatch report handler accepts idempotencyKey.
+func (c *HTTPClient) WithReportIdempotency(enabled bool) *HTTPClient {
+	c.reportIdempotencyEnabled = enabled
 	return c
 }
 
@@ -186,16 +196,25 @@ func newClient(baseURL, agentName, queueLane, token string, timeout time.Duratio
 		httpClient = clients[0]
 	}
 	return &HTTPClient{
-		baseURL:    u,
-		token:      strings.TrimSpace(token),
-		agentName:  strings.TrimSpace(agentName),
-		queueLane:  strings.TrimSpace(queueLane),
-		httpClient: httpClient,
+		reportIdempotencyEnabled: true,
+		baseURL:                  u,
+		token:                    strings.TrimSpace(token),
+		agentName:                strings.TrimSpace(agentName),
+		queueLane:                strings.TrimSpace(queueLane),
+		httpClient:               httpClient,
 	}, nil
 }
 
 func (c *HTTPClient) Discover(ctx context.Context) ([]source.WorkItem, error) {
 	return c.discover(ctx, nil)
+}
+
+func (c *HTTPClient) DiscoverForCapacity(ctx context.Context, capacityID string, exclusions []source.WorkItem) ([]source.WorkItem, error) {
+	query := url.Values{"capacity": {capacityID}}
+	if len(exclusions) > 0 && c.prFixExclusionsEnabled {
+		return c.discoverWithExclusions(ctx, query, exclusions)
+	}
+	return c.discover(ctx, query)
 }
 
 // DiscoverExcluding discovers work while asking Dispatch to skip the excluded
@@ -209,7 +228,14 @@ func (c *HTTPClient) DiscoverExcluding(ctx context.Context, exclusions []source.
 	if !c.prFixExclusionsEnabled || len(exclusions) == 0 {
 		return c.Discover(ctx)
 	}
-	query := url.Values{"exclude_pr_fix_version": {"1"}}
+	return c.discoverWithExclusions(ctx, nil, exclusions)
+}
+
+func (c *HTTPClient) discoverWithExclusions(ctx context.Context, query url.Values, exclusions []source.WorkItem) ([]source.WorkItem, error) {
+	if query == nil {
+		query = url.Values{}
+	}
+	query.Set("exclude_pr_fix_version", "1")
 	seen := make(map[string]struct{})
 	values := make([]string, 0, min(len(exclusions), maxPRFixExclusions))
 	for _, item := range exclusions {
@@ -240,7 +266,8 @@ func (c *HTTPClient) DiscoverExcluding(ctx context.Context, exclusions []source.
 		query.Add("exclude_pr_fix", value)
 	}
 	if len(values) == 0 {
-		return c.Discover(ctx)
+		query.Del("exclude_pr_fix_version")
+		return c.discover(ctx, query)
 	}
 	return c.discover(ctx, query)
 }
@@ -263,7 +290,7 @@ func (c *HTTPClient) discover(ctx context.Context, query url.Values) ([]source.W
 	if err := c.do(ctx, http.MethodGet, endpoint, nil, &response); err != nil {
 		return nil, err
 	}
-	if query != nil {
+	if query != nil && query.Has("exclude_pr_fix_version") {
 		var ack map[string]json.RawMessage
 		if len(response.PRFixExclusions) == 0 || json.Unmarshal(response.PRFixExclusions, &ack) != nil || ack == nil {
 			return nil, fmt.Errorf("dispatch client: missing or invalid PR-fix exclusions acknowledgment")
@@ -305,24 +332,168 @@ func (c *HTTPClient) discover(ctx context.Context, query url.Values) ([]source.W
 		}
 		mode = "fix-pr"
 	}
-	return []source.WorkItem{{ID: itemID, Mode: mode, Repo: repo, Ref: ref}}, nil
+	context := ""
+	if task.PRFixItem != nil {
+		var receipt dispatchContext
+		receipt.PRFixID, receipt.Generation = task.PRFixItem.ID, task.PRFixItem.Generation
+		receipt.HandoutToken = task.PRFixItem.HandoutToken
+		encoded, _ := json.Marshal(receipt)
+		context = string(encoded)
+	}
+	return []source.WorkItem{{ID: itemID, Context: context, Mode: mode, Repo: repo, Ref: ref}}, nil
 }
 
-func (c *HTTPClient) Claim(ctx context.Context, id string) error {
-	d, err := c.resolveIssue(ctx, id)
+type dispatchContext struct {
+	ClaimToken   string `json:"claimToken,omitempty"`
+	PRFixID      string `json:"prFixId,omitempty"`
+	Generation   int    `json:"generation,omitempty"`
+	HandoutToken string `json:"handoutToken,omitempty"`
+}
+
+func encodeDispatchContext(existing, token, fixID string, generation int) string {
+	var value dispatchContext
+	_ = json.Unmarshal([]byte(existing), &value)
+	if token != "" {
+		value.ClaimToken = token
+	}
+	if fixID != "" {
+		value.PRFixID, value.Generation = fixID, generation
+	}
+	encoded, _ := json.Marshal(value)
+	return string(encoded)
+}
+
+func (c *HTTPClient) PrepareCapacityRecovery(ctx context.Context, id, opaqueContext string) (source.CapacityRecoveryProof, error) {
+	d, err := decodeWorkID(id)
+	if err != nil {
+		return source.CapacityRecoveryProof{}, err
+	}
+	var receipt dispatchContext
+	if json.Unmarshal([]byte(opaqueContext), &receipt) != nil {
+		return source.CapacityRecoveryProof{}, source.ErrUnsupportedCapacityRecovery
+	}
+	if d.Type == "implement" && d.IssueID != "" && receipt.ClaimToken != "" {
+		return source.CapacityRecoveryProof{FenceToken: receipt.ClaimToken, WorkIdentity: WorkIdentity(id), SafetyProof: "trusted workspace safety established by core"}, nil
+	}
+	if d.Type == "followup-pr" && d.PRFixID != "" && d.Generation > 0 && receipt.PRFixID == d.PRFixID && receipt.Generation == d.Generation && receipt.HandoutToken != "" {
+		return source.CapacityRecoveryProof{FenceToken: receipt.HandoutToken, WorkIdentity: WorkIdentity(id), SafetyProof: "trusted workspace safety established by core"}, nil
+	}
+	return source.CapacityRecoveryProof{}, source.ErrUnsupportedCapacityRecovery
+}
+
+func (c *HTTPClient) SettleCapacityExhaustion(ctx context.Context, id, opaqueContext string, handoff source.CapacityHandoff) error {
+	d, err := decodeWorkID(id)
 	if err != nil {
 		return err
 	}
-	if d.Type == "followup-pr" || d.IssueID == "" {
+	var receipt dispatchContext
+	if json.Unmarshal([]byte(opaqueContext), &receipt) != nil || handoff.FenceToken == "" || handoff.WorkIdentity != WorkIdentity(id) {
+		return source.ErrUnsupportedCapacityRecovery
+	}
+	if d.Type == "implement" && d.IssueID != "" && receipt.ClaimToken == handoff.FenceToken {
+		if d.IssueRepo == "" || d.IssueNumber <= 0 || d.IssueID == "" {
+			return source.ErrUnsupportedCapacityRecovery
+		}
+		marker := capacityReceiptMarker(handoff.FenceToken, handoff.IdempotencyKey, handoff.WorkIdentity)
+		if c.issueCapacityHandoffAudited(ctx, d, marker) {
+			return nil
+		}
+		body := map[string]any{"issueId": d.IssueID, "repoFullName": d.IssueRepo, "issueNumber": d.IssueNumber, "agentName": c.agentName, "claimToken": handoff.FenceToken, "capacity": handoff.CapacityIdentity, "note": marker}
+		var response struct {
+			Success bool `json:"success"`
+		}
+		err := c.do(ctx, http.MethodPost, "/api/issues/capacity-handoff", body, &response)
+		if err == nil && response.Success {
+			return nil
+		}
+		if err != nil {
+			if c.issueCapacityHandoffAudited(ctx, d, marker) {
+				return nil
+			}
+			return classifyCapacityHandoff(err)
+		}
+		malformedErr := errors.New("dispatch client: capacity handoff response did not confirm success")
+		if c.issueCapacityHandoffAudited(ctx, d, marker) {
+			return nil
+		}
+		return malformedErr
+	}
+	if d.Type == "followup-pr" && receipt.HandoutToken == handoff.FenceToken && receipt.PRFixID == d.PRFixID && receipt.Generation == d.Generation && d.PRFixID != "" && d.Generation > 0 {
+		body := map[string]any{"taskType": d.Type, "outcome": "capacity-exhausted", "repoFullName": d.Repo, "pullRequestNumber": d.Number, "capacity": handoff.CapacityIdentity, "idempotencyKey": handoff.IdempotencyKey, "prFixItem": map[string]any{"id": d.PRFixID, "generation": d.Generation, "handoutToken": handoff.FenceToken}}
+		var response struct {
+			Resolution struct {
+				Matched bool   `json:"matched"`
+				Action  string `json:"action"`
+				ItemID  string `json:"itemId"`
+			} `json:"prFixResolution"`
+		}
+		if err := c.do(ctx, http.MethodPost, "/api/agents/"+url.PathEscape(c.agentName)+"/tasks/report", body, &response); err != nil {
+			return classifyCapacityHandoff(err)
+		}
+		if !response.Resolution.Matched || response.Resolution.ItemID != d.PRFixID || response.Resolution.Action != "deferred" {
+			return source.ErrStaleCapacitySettlement
+		}
 		return nil
 	}
-	body := map[string]any{
-		"issueId":      d.IssueID,
-		"repoFullName": d.IssueRepo,
-		"issueNumber":  d.IssueNumber,
-		"agentName":    c.agentName,
+	return source.ErrUnsupportedCapacityRecovery
+}
+
+func capacityReceiptMarker(claimToken, idempotencyKey, workIdentity string) string {
+	sum := sha256.Sum256([]byte(claimToken + "\x00" + idempotencyKey + "\x00" + workIdentity))
+	return fmt.Sprintf("capacity-receipt:%x", sum[:])
+}
+
+type capacityAuditEntry struct {
+	Action      string `json:"action"`
+	Success     bool   `json:"success"`
+	Repo        string `json:"repoFullName"`
+	IssueNumber int    `json:"issueNumber"`
+	IssueID     string `json:"issueId"`
+	Notes       string `json:"notes"`
+}
+
+func (c *HTTPClient) issueCapacityHandoffAudited(ctx context.Context, d workDescriptor, marker string) bool {
+	endpoint := "/api/audit?repo=" + url.QueryEscape(d.IssueRepo) + "&limit=100"
+	var entries []capacityAuditEntry
+	if err := c.do(ctx, http.MethodGet, endpoint, nil, &entries); err != nil {
+		return false
 	}
-	return c.do(ctx, http.MethodPost, "/api/issues/claim", body, nil)
+	for _, entry := range entries {
+		if entry.Action == "issue_capacity_handoff" && entry.Success && entry.Repo == d.IssueRepo && entry.IssueNumber == d.IssueNumber && entry.IssueID == d.IssueID && (entry.Notes == marker || strings.HasSuffix(entry.Notes, "; "+marker)) {
+			return true
+		}
+	}
+	return false
+}
+
+func (c *HTTPClient) Claim(ctx context.Context, id string) error {
+	_, err := c.ClaimWithReceipt(ctx, id, "")
+	return err
+}
+
+func (c *HTTPClient) ClaimWithReceipt(ctx context.Context, id, existingContext string) (string, error) {
+	d, err := c.resolveIssue(ctx, id)
+	if err != nil {
+		return "", err
+	}
+	if d.Type == "followup-pr" {
+		return encodeDispatchContext(existingContext, "", d.PRFixID, d.Generation), nil
+	}
+	if d.IssueID == "" {
+		return existingContext, nil
+	}
+	body := map[string]any{"issueId": d.IssueID, "repoFullName": d.IssueRepo, "issueNumber": d.IssueNumber, "agentName": c.agentName}
+	var response struct {
+		ClaimToken string `json:"claimToken"`
+	}
+	if err := c.do(ctx, http.MethodPost, "/api/issues/claim", body, &response); err != nil {
+		return "", err
+	}
+	if strings.TrimSpace(response.ClaimToken) == "" {
+		// Older servers can execute ordinary work but cannot fence recovery.
+		return existingContext, nil
+	}
+	return encodeDispatchContext(existingContext, response.ClaimToken, "", 0), nil
 }
 
 func (c *HTTPClient) Release(ctx context.Context, id string) error {
@@ -379,20 +550,37 @@ func (c *HTTPClient) checkPullRequestState(ctx context.Context, pullRequest *Pul
 	return c.prStateChecker.CheckPullRequestState(ctx, pullRequest.Repo, pullRequest.Number)
 }
 
-// asSuperseded reports a Dispatch generation-mismatch conflict as a
-// source.ErrSuperseded. Dispatch answers a stale settle to
-// /api/pr-fix-queue/mark with HTTP 409 and a "generation mismatch" body when a
-// newer attempt took the item between this run's read and write. That is a
-// permanent outcome the controller must not retry, so it is mapped to the
-// source-agnostic superseded signal while preserving the underlying error.
+// asSuperseded maps only an explicitly stale generation to a terminal source result.
 func asSuperseded(err error) error {
 	var apiErr *APIError
-	if errors.As(err, &apiErr) &&
-		apiErr.StatusCode == http.StatusConflict &&
-		strings.Contains(strings.ToLower(apiErr.Message), "generation mismatch") {
+	if errors.As(err, &apiErr) && apiErr.StatusCode == http.StatusConflict &&
+		(strings.Contains(strings.ToLower(apiErr.Message), "generation mismatch") || strings.Contains(strings.ToLower(apiErr.Message), "expected generation")) {
 		return fmt.Errorf("%w: %w", source.ErrSuperseded, err)
 	}
 	return err
+}
+
+// classifyCapacityHandoff maps explicit ownership/human conflicts to stale work;
+// contention and infrastructure failures remain retryable, unknown codes unchanged.
+func classifyCapacityHandoff(err error) error {
+	var apiErr *APIError
+	if !errors.As(err, &apiErr) || apiErr.StatusCode != http.StatusConflict {
+		return err
+	}
+	var response struct {
+		Code string `json:"code"`
+	}
+	if json.Unmarshal([]byte(apiErr.Message), &response) != nil {
+		return err
+	}
+	switch response.Code {
+	case "stale_claim_token", "claim_expired", "ownership_changed", "human_hold", "no_active_claim", "issue_done", "issue_closed":
+		return fmt.Errorf("%w: %w", source.ErrStaleCapacitySettlement, err)
+	case "handoff_race_lost":
+		return err
+	default:
+		return err
+	}
 }
 
 func (c *HTTPClient) markPRFixBlocked(ctx context.Context, d workDescriptor, note string) error {
@@ -403,10 +591,7 @@ func (c *HTTPClient) markPRFixBlocked(ctx context.Context, d workDescriptor, not
 		note = "Courier run requires human intervention"
 	}
 	return asSuperseded(c.do(ctx, http.MethodPost, "/api/pr-fix-queue/mark", map[string]any{
-		"repo":       d.Repo,
-		"pr":         d.Number,
-		"status":     "BLOCKED",
-		"note":       note,
+		"repo": d.Repo, "pr": d.Number, "status": "BLOCKED", "note": note,
 		"generation": d.Generation,
 	}, nil))
 }
@@ -426,10 +611,7 @@ func (c *HTTPClient) markPRFixWaitingExternal(ctx context.Context, d workDescrip
 		note = "Courier run is waiting on an external prerequisite"
 	}
 	return asSuperseded(c.do(ctx, http.MethodPost, "/api/pr-fix-queue/mark", map[string]any{
-		"repo":       d.Repo,
-		"pr":         d.Number,
-		"status":     "WAITING_EXTERNAL",
-		"note":       note,
+		"repo": d.Repo, "pr": d.Number, "status": "WAITING_EXTERNAL", "note": note,
 		"generation": d.Generation,
 	}, nil))
 }
@@ -443,10 +625,7 @@ func (c *HTTPClient) markPRFixStale(ctx context.Context, pullRequest *PullReques
 		note = "upstream pull request is merged"
 	}
 	return asSuperseded(c.do(ctx, http.MethodPost, "/api/pr-fix-queue/mark", map[string]any{
-		"repo":       pullRequest.Repo,
-		"pr":         pullRequest.Number,
-		"status":     "STALE",
-		"note":       note,
+		"repo": pullRequest.Repo, "pr": pullRequest.Number, "status": "STALE", "note": note,
 		"generation": generation,
 	}, nil))
 }
@@ -457,7 +636,9 @@ func (c *HTTPClient) reportTaskWithPR(ctx context.Context, d workDescriptor, out
 		"outcome":      outcome,
 		"repoFullName": d.Repo,
 	}
-	if idempotencyKey != "" {
+	// The merged Dispatch tasks/report route does not consume idempotencyKey;
+	// only send it when an explicitly configured deployment supports it.
+	if idempotencyKey != "" && c.reportIdempotencyEnabled {
 		body["idempotencyKey"] = idempotencyKey
 	}
 	if startedAt != nil {
@@ -478,6 +659,9 @@ func (c *HTTPClient) reportTaskWithPR(ctx context.Context, d workDescriptor, out
 	// issued, so echo that token back; linked-PR follow-ups have none.
 	if d.Type == "followup-pr" && d.PRFixID != "" {
 		body["prFixItem"] = map[string]any{"id": d.PRFixID, "generation": d.Generation}
+		if outcome == "capacity-exhausted" && d.HandoutToken != "" {
+			body["prFixItem"].(map[string]any)["handoutToken"] = d.HandoutToken
+		}
 	}
 	if number, rawURL := parsePullRequest(observedPR); number > 0 {
 		body["pullRequestNumber"] = number
@@ -575,6 +759,10 @@ func (c *HTTPClient) Report(ctx context.Context, id string, lifecycle source.Lif
 			return reportErr
 		}
 		return errors.Join(reportErr, c.markPRFixBlocked(ctx, d, lifecycle.Error))
+	case source.ResultCapacityExhausted:
+		// Do not publish a waiting-external report: settlement is exclusively
+		// performed by the fenced CapacityRecovery capability.
+		return nil
 	case source.ResultBlockedExternal:
 		// Recoverable dependency block. The task report uses a dedicated
 		// outcome so Dispatch's existing failed-attempt accounting does not
@@ -621,6 +809,7 @@ func EncodeWorkID(task Task) string {
 	if task.Type == "followup-pr" && task.PRFixItem != nil {
 		d.PRFixID = strings.TrimSpace(task.PRFixItem.ID)
 		d.Generation = task.PRFixItem.Generation
+		d.HandoutToken = task.PRFixItem.HandoutToken
 	}
 	if task.Issue != nil {
 		if task.Type == "implement" {

@@ -301,8 +301,8 @@ func TestCoordinatorEndsBlockedExternalOnAllowanceExhaustion(t *testing.T) {
 	if result.Err != nil {
 		t.Fatalf("exhaustion must not be an infrastructure error: %v", result.Err)
 	}
-	if result.Outcome != executor.OutcomeBlockedExternal {
-		t.Fatalf("outcome = %q, want blocked_external", result.Outcome)
+	if result.Outcome != executor.OutcomeCapacityExhausted {
+		t.Fatalf("outcome = %q, want capacity_exhausted", result.Outcome)
 	}
 	if !strings.Contains(result.Reason, "allowance-exhausted") {
 		t.Fatalf("reason = %q, want the availability class", result.Reason)
@@ -445,8 +445,8 @@ func TestCoordinatorEndsBlockedExternalOnDelegatedExhaustion(t *testing.T) {
 	if result.Err != nil {
 		t.Fatalf("delegated exhaustion must not be an infrastructure error: %v", result.Err)
 	}
-	if result.Outcome != executor.OutcomeBlockedExternal {
-		t.Fatalf("outcome = %q, want blocked_external", result.Outcome)
+	if result.Outcome != executor.OutcomeCapacityExhausted {
+		t.Fatalf("outcome = %q, want capacity_exhausted", result.Outcome)
 	}
 	if !strings.Contains(result.Reason, "allowance-exhausted") {
 		t.Fatalf("reason = %q, want the availability class", result.Reason)

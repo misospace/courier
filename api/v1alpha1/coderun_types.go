@@ -1,6 +1,8 @@
 package v1alpha1
 
-import metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+import (
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+)
 
 // Mode is the kind of work a CoderRun performs.
 // +kubebuilder:validation:Enum=resolve-issue;fix-pr
@@ -80,6 +82,16 @@ const ConditionSoftStopObserved = "SoftStopObserved"
 // never acknowledged.
 const ConditionReasonUnacknowledged = "Unacknowledged"
 
+// ConditionCapacityRecovery is the status condition type the operator writes
+// on a capacity-exhaustion run to record the outcome of its fenced recovery
+// settlement with the source (#327). Status True with reason Settled means
+// the exhausted attempt was released with source-enforced fencing; False
+// with reason Unsupported, Stale, UnsafeWork, PendingWriters, or Retryable
+// records why it has not been (or will not be, without an operator). It is
+// written only for runs whose terminal diagnostic category is
+// capacity-exhaustion.
+const ConditionCapacityRecovery = "CapacityRecovery"
+
 // Phase is the lifecycle phase of a CoderRun.
 // +kubebuilder:validation:Enum=Pending;Claimed;Running;Verifying;AwaitingReview;HandedOff;NeedsHuman;Done;Failed;BlockedExternal
 type Phase string
@@ -122,6 +134,11 @@ type CoderRunSpec struct {
 	// +optional
 	// +kubebuilder:validation:Pattern=`^[A-Za-z0-9._-]*$`
 	SourceAgent string `json:"sourceAgent,omitempty"`
+
+	// SourceContext is bounded opaque source-owned JSON, never interpreted by core.
+	// +optional
+	// +kubebuilder:validation:MaxLength=16384
+	SourceContext string `json:"sourceContext,omitempty"`
 
 	// WorkItemID is the opaque identifier assigned by the source adapter. It
 	// is persisted so lifecycle calls never need to infer source identity from
@@ -190,7 +207,7 @@ type Heartbeat struct {
 // TerminalDiagnosticCategory is the stable classification of a terminal run's
 // cause, derived only from evidence the operator observed. Unknown is used
 // whenever evidence is missing or ambiguous; a cause is never invented.
-// +kubebuilder:validation:Enum=executor-crash;model-transport-error;continuation-exhaustion;verifier-rejection;kubernetes-failure;needs-decision;blocked-external;unknown
+// +kubebuilder:validation:Enum=executor-crash;model-transport-error;continuation-exhaustion;verifier-rejection;kubernetes-failure;needs-decision;blocked-external;capacity-exhaustion;unknown
 type TerminalDiagnosticCategory string
 
 const (
@@ -216,10 +233,21 @@ const (
 	// TerminalDiagnosticCategoryBlockedExternal: the coordinator declared it
 	// was blocked on an external prerequisite.
 	TerminalDiagnosticCategoryBlockedExternal TerminalDiagnosticCategory = "blocked-external"
+	// TerminalDiagnosticCategoryCapacityExhaustion is a structured, affirmative
+	// signal that execution capacity (not task correctness) was exhausted.
+	TerminalDiagnosticCategoryCapacityExhaustion TerminalDiagnosticCategory = "capacity-exhaustion"
 	// TerminalDiagnosticCategoryUnknown: the evidence was missing or
 	// ambiguous.
 	TerminalDiagnosticCategoryUnknown TerminalDiagnosticCategory = "unknown"
 )
+
+// WorkspaceSafetyEvidence is the executor's trusted workspace snapshot.
+type WorkspaceSafetyEvidence struct {
+	State      string `json:"state,omitempty"`
+	Branch     string `json:"branch,omitempty"`
+	Head       string `json:"head,omitempty"`
+	RemoteHead string `json:"remoteHead,omitempty"`
+}
 
 // TerminalDiagnostic is the durable, bounded, redacted record of how a run's
 // coordinator ended. The operator captures it before pod cleanup so the cause
@@ -413,6 +441,11 @@ type PublicationPolicy struct {
 
 // CoderRunStatus is the observed state of a CoderRun.
 type CoderRunStatus struct {
+	// SourceReceipt is sensitive source-issued claim fencing data.
+	// +optional
+	// +kubebuilder:validation:MaxLength=16384
+	SourceReceipt string `json:"sourceReceipt,omitempty"`
+
 	// Phase is the current lifecycle phase.
 	// +optional
 	Phase Phase `json:"phase,omitempty"`
@@ -550,6 +583,11 @@ type CoderRunStatus struct {
 	// runs that ended before the event stream could be tallied.
 	// +optional
 	Telemetry *RunTelemetry `json:"telemetry,omitempty"`
+
+	// WorkspaceSafety is the bounded trusted snapshot reported by the executor
+	// at terminal handoff. It is informational unless independently verified.
+	// +optional
+	WorkspaceSafety *WorkspaceSafetyEvidence `json:"workspaceSafety,omitempty"`
 
 	// TerminalDiagnostic is the durable, bounded, redacted record of how the
 	// run's coordinator ended, captured by the operator before pod cleanup so

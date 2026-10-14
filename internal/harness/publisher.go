@@ -8,6 +8,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/misospace/courier/internal/executor"
 	couriergit "github.com/misospace/courier/internal/git"
 )
 
@@ -116,6 +117,44 @@ func (e *PublicationEngine) seed(ctx context.Context) (Snapshot, error) {
 // work ref: whether it exists and holds a tip beyond the admission anchor.
 // It is the soft-stop finish's world input (#238) — a tip at the anchor (or
 // an absent ref) is ordinary pre-existing state, never this run's work.
+func (e *PublicationEngine) CapacityWorkspaceSafety(ctx context.Context) (executor.WorkspaceSafetyEvidence, error) {
+	workspace := &couriergit.Workspace{Directory: e.tree.Dir}
+	state, err := workspace.WorkState(ctx, e.tree.BaseTip())
+	if err != nil {
+		return executor.WorkspaceSafetyEvidence{}, err
+	}
+	head, err := e.tree.Head(ctx)
+	if err != nil {
+		return executor.WorkspaceSafetyEvidence{}, err
+	}
+	branch, err := workspace.CurrentBranch(ctx)
+	if err != nil {
+		return executor.WorkspaceSafetyEvidence{}, err
+	}
+	if state == couriergit.WorkStateDirty {
+		return executor.WorkspaceSafetyEvidence{State: "dirty", Branch: branch, Head: head}, nil
+	}
+	if state != couriergit.WorkStateCommitted && state != couriergit.WorkStateNone {
+		return executor.WorkspaceSafetyEvidence{State: "unknown", Branch: branch, Head: head}, nil
+	}
+	if branch != "integration" {
+		return executor.WorkspaceSafetyEvidence{State: "unknown", Branch: branch, Head: head}, nil
+	}
+	snap, err := retried(ctx, func(ctx context.Context) (BrokerSnapshot, error) {
+		return e.broker.Snapshot(ctx)
+	})
+	if err != nil {
+		return executor.WorkspaceSafetyEvidence{}, e.classify(err, "the capacity workspace proof")
+	}
+	if state == couriergit.WorkStateNone {
+		return executor.WorkspaceSafetyEvidence{State: "empty", Branch: branch, Head: head, RemoteHead: snap.Tip}, nil
+	}
+	if !snap.WorkRefExists || snap.Tip != head {
+		return executor.WorkspaceSafetyEvidence{State: "unknown", Branch: branch, Head: head}, nil
+	}
+	return executor.WorkspaceSafetyEvidence{State: "pushed", Branch: branch, Head: head, RemoteHead: snap.Tip}, nil
+}
+
 func (e *PublicationEngine) WorkRefBeyondAnchor(ctx context.Context) (bool, error) {
 	snap, err := retried(ctx, func(ctx context.Context) (BrokerSnapshot, error) {
 		return e.broker.Snapshot(ctx)

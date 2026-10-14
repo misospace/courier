@@ -22,6 +22,7 @@ import (
 	"time"
 
 	"github.com/misospace/courier/internal/broker"
+	"github.com/misospace/courier/internal/executor"
 	couriergit "github.com/misospace/courier/internal/git"
 )
 
@@ -393,6 +394,44 @@ func briefBundleFromSnapshot(t *testing.T, snapshot []byte, briefID, file, conte
 		t.Fatal(err)
 	}
 	return data
+}
+
+func TestCapacityWorkspaceSafetyRequiresBrokerProof(t *testing.T) {
+	f := newBrokerFixture(t)
+	engine := f.engineFor()
+	if _, err := engine.PrepareSnapshot(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	check := func(want string) executor.WorkspaceSafetyEvidence {
+		t.Helper()
+		evidence, err := engine.CapacityWorkspaceSafety(context.Background())
+		if err != nil {
+			t.Fatalf("capacity proof: %v", err)
+		}
+		if evidence.State != want {
+			t.Fatalf("capacity state = %q, want %q (evidence %+v)", evidence.State, want, evidence)
+		}
+		return evidence
+	}
+	check("empty") // absent remote ref and clean anchor is safe only as no work
+	bundle := f.workerBundle(f.baseOID, "proof", "proof.txt", "held\n", engine)
+	integration, err := engine.Integrate(context.Background(), f.request("proof", f.baseOID, bundle))
+	if err != nil {
+		t.Fatal(err)
+	}
+	check("unknown") // local-only commit is not remote proof
+	if _, err := engine.Publish(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	pushed := check("pushed")
+	if pushed.RemoteHead != integration.Commit || pushed.Head != integration.Commit {
+		t.Fatalf("pushed proof = %+v, want matching commit", pushed)
+	}
+	writeFile(t, filepath.Join(engine.tree.Dir, "a.txt"), "dirty\n")
+	dirty := check("dirty")
+	if dirty.RemoteHead != "" {
+		t.Fatalf("dirty workspace incorrectly claimed remote proof: %+v", dirty)
+	}
 }
 
 // The full control→broker→remote chain: seed, integrate, publish,

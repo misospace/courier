@@ -99,13 +99,20 @@ func sourceWorkItem(run *courierv1alpha1.CoderRun) (source.WorkItem, error) {
 	if run == nil || strings.TrimSpace(run.Spec.WorkItemID) == "" {
 		return source.WorkItem{}, ErrMissingWorkItemID
 	}
+	context := run.Spec.SourceContext
+	// Receipts are persisted after claim; prefer them when rebuilding a work item
+	// so retries and settlement retain the source-issued fencing token.
+	if run.Status.SourceReceipt != "" {
+		context = run.Status.SourceReceipt
+	}
 	return source.WorkItem{
-		ID:    run.Spec.WorkItemID,
-		Mode:  string(run.Spec.Mode),
-		Repo:  run.Spec.Repo,
-		Ref:   run.Spec.Ref,
-		Lane:  run.Spec.Lane,
-		Debug: run.Spec.Debug,
+		ID:      run.Spec.WorkItemID,
+		Context: context,
+		Mode:    string(run.Spec.Mode),
+		Repo:    run.Spec.Repo,
+		Ref:     run.Spec.Ref,
+		Lane:    run.Spec.Lane,
+		Debug:   run.Spec.Debug,
 	}, nil
 }
 

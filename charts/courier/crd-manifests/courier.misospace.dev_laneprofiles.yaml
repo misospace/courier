@@ -56,6 +56,16 @@ spec:
               (internal/bootstrap/config.go), which carries the portable spec for
               manager-bootstrapped profiles.
             properties:
+              capacityGroup:
+                description: |-
+                  CapacityGroup names the opaque execution-capacity pool this lane draws
+                  from — a shared provider deployment, credential pool, or piece of local
+                  hardware. It is intentionally a bare name: Courier core never learns
+                  what the pool is. Lanes that share a group share its capacity cooldown;
+                  a lane with no group is its own capacity identity. Empty uses the lane
+                  name.
+                maxLength: 253
+                type: string
               concurrency:
                 default: 1
                 description: |-
@@ -85,7 +95,60 @@ spec:
             - concurrency
             - roles
             type: object
+          status:
+            description: |-
+              Status is operator-written lane state (capacity cooldown). It lives on
+              the status subresource so spec writers (Helm, bootstrap) never clobber
+              it.
+            properties:
+              capacityCooldown:
+                description: |-
+                  CapacityCooldown, when set, pauses new work for its capacity identity
+                  until NextEligibleAt (#327). Cooldowns for other capacity identities
+                  never gate this lane.
+                properties:
+                  capacityID:
+                    description: |-
+                      CapacityID is the capacity identity this cooldown belongs to: the
+                      lane's CapacityGroup, or the lane name when the group is empty.
+                    maxLength: 253
+                    minLength: 1
+                    type: string
+                  exhaustionCount:
+                    description: |-
+                      ExhaustionCount is the number of distinct confirmed exhaustion events
+                      whose per-run markers fall in the active cooldown window. The count is
+                      recomputed from retained CoderRuns, avoiding an unbounded lane history.
+                    minimum: 1
+                    type: integer
+                  lastExhaustedRun:
+                    description: |-
+                      LastExhaustedRun is the most recent run observed while folding the
+                      active window. Per-run CoderRun status markers provide deduplication.
+                    maxLength: 253
+                    type: string
+                  nextEligibleAt:
+                    description: |-
+                      NextEligibleAt is when discovery and admission for this capacity
+                      identity may resume. It is the operator's bounded retry window, not a
+                      provider-observed reset time (Courier never invents one).
+                    format: date-time
+                    type: string
+                  reason:
+                    description: |-
+                      Reason is the operator-written explanation of why the cooldown exists.
+                      It never carries executor freeform text.
+                    maxLength: 256
+                    type: string
+                required:
+                - capacityID
+                - exhaustionCount
+                - nextEligibleAt
+                - reason
+                type: object
+            type: object
         type: object
     served: true
     storage: true
-    subresources: {}
+    subresources:
+      status: {}
