@@ -31,9 +31,10 @@ import (
 // capacityRequeueDelay bounds how long a Pending run can wait behind a full
 // lane before checking again.
 const (
-	capacityRequeueDelay        = 15 * time.Second
-	observationRequeueDelay     = 5 * time.Second
-	lifecycleReportRequeueDelay = 30 * time.Second
+	capacityRequeueDelay             = 15 * time.Second
+	observationRequeueDelay          = 5 * time.Second
+	lifecycleReportRequeueDelay      = 30 * time.Second
+	provisioningInFlightRequeueDelay = 5 * time.Second
 )
 
 // coordinatorContainerName is the coordinator's container name, shared by the
@@ -393,6 +394,23 @@ func (r *CoderRunReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 				return result, nil
 			}
 		} else if err := r.Launch(ctx, &run); err != nil {
+			if errors.Is(err, ErrProvisioningInFlight) {
+				// The deterministic pod name could not be verified as a
+				// live coordinator pod owned by this run: it is being
+				// torn down, unreadable, or owned by something else
+				// (including a dead incarnation of the same name).
+				// Writing Running over that slot would bind the run to a
+				// dying or foreign coordinator — the next reconcile
+				// could terminalize it as Failed off the pod's own
+				// termination, and the disappearance path would charge a
+				// second infrastructure loss if the pod vanishes before
+				// the wedge path observes it. Stay Claimed and let the
+				// pod delete event wake the next reconcile; the bounded
+				// requeue is the backstop.
+				l.V(1).Info("coordinator slot not verifiably a live run-owned pod; staying Claimed",
+					"run", run.Name, "pod", run.Name)
+				return ctrl.Result{RequeueAfter: provisioningInFlightRequeueDelay}, nil
+			}
 			return ctrl.Result{}, r.releaseClaim(ctx, &run, adapter, item, err)
 		}
 		run.Status.Phase = courierv1alpha1.PhaseRunning
@@ -414,8 +432,14 @@ func (r *CoderRunReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 // resumeClaimed closes the small crash/conflict window between reserving a run
 // and recording that its pod is Running. Launch is idempotent at the Kubernetes
 // resource boundary (AlreadyExists is accepted by CoordinatorLauncher), so a
-// retry can safely finish a partially-completed admission.
+// retry can safely finish a partially-completed admission. The
+// ErrProvisioningInFlight sentinel that Launch may return when the slot
+// cannot be verified as a live pod owned by this run's UID is the carve-out:
+// the resource boundary is no longer authoritative, the slot is being torn
+// down or holds a foreign pod, and writing Running over it would bind the
+// run to a dying or foreign coordinator (#217).
 func (r *CoderRunReconciler) resumeClaimed(ctx context.Context, run *courierv1alpha1.CoderRun) (ctrl.Result, error) {
+	l := log.FromContext(ctx)
 	adapter, item, err := r.adapterAndWorkItem(run)
 	if err != nil {
 		return ctrl.Result{}, err
@@ -455,6 +479,20 @@ func (r *CoderRunReconciler) resumeClaimed(ctx context.Context, run *courierv1al
 			return result, nil
 		}
 	} else if err := r.Launch(ctx, run); err != nil {
+		if errors.Is(err, ErrProvisioningInFlight) {
+			// A relaunch's create collided with a slot that could not be
+			// verified as a live pod owned by this run's UID: torn down,
+			// unreadable, or foreign. The next reconcile either rides the
+			// pod's delete event (the pod owns the watch) or the bounded
+			// requeue. Recording Running would bind the run to a dying or
+			// foreign coordinator — the wedge path could terminalize the
+			// run as Failed off the pod's own termination, and a
+			// vanishing pod would charge a second infrastructure loss
+			// (#217).
+			l.V(1).Info("coordinator slot not verifiably a live run-owned pod; staying Claimed",
+				"run", run.Name)
+			return ctrl.Result{RequeueAfter: provisioningInFlightRequeueDelay}, nil
+		}
 		return ctrl.Result{}, r.releaseClaim(ctx, run, adapter, item, err)
 	}
 	run.Status.Phase = courierv1alpha1.PhaseRunning

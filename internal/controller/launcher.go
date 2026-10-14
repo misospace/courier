@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"strings"
 
+	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -29,16 +30,55 @@ var (
 	// empty UID mints a token the intake can never verify from its live read
 	// of the run.
 	ErrEvidenceRunUIDRequired = errors.New("coordinator launcher: evidence tokens require the run UID")
+	// ErrProvisioningInFlight is returned when Launch could not establish a
+	// live, run-owned coordinator pod at the slot name. Three shapes fit
+	// here, and each one means "stay Claimed, do not record Running":
+	//
+	//   - The create collided with a pod that is being torn down
+	//     (DeletionTimestamp != nil). The slot is held by a pod whose
+	//     disappearance is in flight.
+	//   - The follow-up read of the existing pod failed (NotFound, a
+	//     transient API error, or a Forbidden). The slot's live state
+	//     could not be verified; recording Running would re-introduce the
+	//     false-running transition #217 exists to prevent.
+	//   - The follow-up read returned a pod not owned by this run's UID
+	//     (no controller Courier OwnerReference bound to the run's UID).
+	//     A pod sitting at the deterministic name but tied to another
+	//     run incarnation — or to no run at all — must not be silently
+	//     adopted as "idempotently live."
+	//
+	// The follow-up read goes through the uncached API reader, not the
+	// informer cache: a cached pod predating a deletion timestamp the API
+	// server already carries must not resolve the collision to success.
+	//
+	// The reconciler treats this as "stay Claimed, requeue", the same
+	// shape as the secure topology's in-flight signal; the pod's delete
+	// event normally wakes the next reconcile, with a bounded requeue as
+	// the backstop. Only a follow-up read that returns a run-owned pod
+	// not being torn down resolves the collision to a successful,
+	// idempotent Launch; a completed-but-not-yet-deleted owned pod also
+	// resolves it, and the observation path terminalizes it with a single
+	// charge as before.
+	ErrProvisioningInFlight = errors.New("coordinator launcher: provisioning in flight; slot could not be verified as a live run-owned pod")
 )
 
 // CoordinatorLauncher creates the ephemeral coordinator Pod for an admitted
 // run. The runtime configuration is deployment-specific; the default is the
 // temporary headless OpenCode shim.
 type CoordinatorLauncher struct {
-	Client   client.Client
-	Scheme   *runtime.Scheme
-	Pod      executor.PodConfig
-	Executor executor.Executor
+	Client client.Client
+	// APIReader reads the API server directly, bypassing the informer
+	// cache. The AlreadyExists collision verification is a liveness check
+	// that gates PhaseRunning, so it must see the API server's current
+	// state: a cached pod predating a deletion timestamp would resolve a
+	// terminating slot to a successful launch, the exact false-running
+	// transition #217 exists to prevent. The manager wiring injects it;
+	// when nil the collision read falls back to the cached client, which
+	// serves only direct-construction tests.
+	APIReader client.Reader
+	Scheme    *runtime.Scheme
+	Pod       executor.PodConfig
+	Executor  executor.Executor
 	// EvidenceURL is the intake endpoint handed to coordinator pods for
 	// failure-evidence capture. Empty leaves capture disabled.
 	EvidenceURL string
@@ -109,10 +149,65 @@ func (l *CoordinatorLauncher) Launch(ctx context.Context, run *courierv1alpha1.C
 	if err != nil {
 		return err
 	}
-	if err := l.Client.Create(ctx, pod); err != nil && !apierrors.IsAlreadyExists(err) {
+	err = l.Client.Create(ctx, pod)
+	if err == nil {
+		return nil
+	}
+	if !apierrors.IsAlreadyExists(err) {
 		return err
 	}
+	// The create collided with an existing pod. Three shapes are possible
+	// and each one must surface as "stay Claimed, do not record Running":
+	//
+	//   - The follow-up Get fails (NotFound, transient, Forbidden). The
+	//     slot's live state is unverified; treating that as success would
+	//     re-introduce the false-running transition #217 exists to
+	//     prevent, because the reconciler would then write Running over a
+	//     slot we have no proof is occupied by a live coordinator.
+	//   - The existing pod carries DeletionTimestamp: the slot is being
+	//     torn down and the next reconcile could terminalize a freshly
+	//     relaunched run as Failed off the dying pod's own termination,
+	//     or charge a second infrastructure loss if the pod vanishes
+	//     before the wedge path observes it.
+	//   - The existing pod is not owned by this run's UID (no controller
+	//     OwnerReference whose UID is the run's). The deterministic slot
+	//     name can collide with stale or unrelated state — including a
+	//     live coordinator left by a deleted-and-recreated CoderRun of
+	//     the same name — and silently adopting such a pod as
+	//     "idempotently live" would bind the run to an arbitrary
+	//     coordinator.
+	//
+	// A run-owned existing pod not being torn down is the only case that
+	// resolves the collision to a successful, no-second-charge Launch: the
+	// resource boundary was already idempotent and resumeClaimed will
+	// finish the admission in its next pass.
+	var existing corev1.Pod
+	getErr := l.collisionReader().Get(ctx, client.ObjectKey{Namespace: pod.Namespace, Name: pod.Name}, &existing)
+	switch {
+	case getErr != nil:
+		// Could not verify the slot's live state (NotFound is the
+		// common race: the pod was deleted between the Create and the
+		// follow-up Get; transient API errors fall here too). Stay
+		// Claimed and let the bounded requeue / pod watch resolve it.
+		return ErrProvisioningInFlight
+	case existing.DeletionTimestamp != nil:
+		return ErrProvisioningInFlight
+	case !podOwnedByRunUID(&existing, run.UID):
+		return ErrProvisioningInFlight
+	}
 	return nil
+}
+
+// collisionReader returns the reader the AlreadyExists collision
+// verification goes through, preferring the injected uncached API reader and
+// falling back to the cached client. Production wiring always injects the
+// API reader, so the fallback serves only direct-construction tests; the
+// liveness decision that gates PhaseRunning never runs against cached state.
+func (l *CoordinatorLauncher) collisionReader() client.Reader {
+	if l.APIReader != nil {
+		return l.APIReader
+	}
+	return l.Client
 }
 
 // criteriaEnvelope renders the trusted COURIER_CRITERIA envelope for one run

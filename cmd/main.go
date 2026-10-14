@@ -235,9 +235,10 @@ func main() {
 	podConfig.Context7MCPURL = context7MCPURL
 	podConfig.MetricsMCPURL = metricsMCPURL
 	launcher := &controller.CoordinatorLauncher{
-		Client: mgr.GetClient(),
-		Scheme: mgr.GetScheme(),
-		Pod:    podConfig,
+		Client:    mgr.GetClient(),
+		APIReader: mgr.GetAPIReader(),
+		Scheme:    mgr.GetScheme(),
+		Pod:       podConfig,
 	}
 
 	evidenceSecretSet := strings.TrimSpace(evidenceIntakeKeySecret) != ""
