@@ -1149,6 +1149,23 @@ the world. `courier_metrics_scrape_errors_total` counts scrape failures. Scrapin
 is opt-in: the chart's `serviceMonitor.enabled` renders a metrics `Service` and a
 Prometheus Operator `ServiceMonitor`, off by default.
 
+**Source-agnostic telemetry and health semantics (#290).**
+[docs/observability-signals-and-health.md](./docs/observability-signals-and-health.md)
+specifies Courier's own signal catalogue and health model: a source-neutral
+`courier_source_*` discovery layer that exists even when no `CoderRun` is
+created, so an idle empty queue, a failed discovery loop, and unavailable lane
+capacity are distinguishable; lane capacity and reservation signals (including
+the reservation age that makes staleness observable); bounded run phase,
+execution-outcome, lifecycle-report, and retention/reaping signals; and a state
+model that separates executor completion from external disposition and renders
+unknown/stale/absent as states distinct from idle or healthy. It defines units,
+clocks, counter/gauge reset behaviour, and a bounded-label privacy budget that
+keeps run ids, issue/PR numbers, repo names, arbitrary error strings, and secrets
+out of labels, with per-run correlation left to the structured log. #291 owns
+the connector diagnostics and #292 the views and alerts that consume these
+signals; the thresholds and windows are design candidates, not defaults, and no
+implementation, exporter, dashboard, or alert rule is authorized here.
+
 **Connector diagnostics without core coupling (#291).**
 [docs/connector-diagnostics.md](./docs/connector-diagnostics.md) specifies
 adapter-owned diagnostics for optional source connectors so an operator can see
@@ -1827,6 +1844,32 @@ named items remain unresolved and must not be described as production-ready:
   specific to the OpenCode telemetry path) and delegates the reason-shrink
   step to the shared helper; the control uses the shared helper
   end-to-end. (#210, #188)
+- **2026-10-13 — #290: Courier's telemetry is source-agnostic and its health
+  model separates idle, degraded, and capacity-unavailable states.** The design
+  is
+  [docs/observability-signals-and-health.md](./docs/observability-signals-and-health.md),
+  a child of the portable-observability umbrella (#289). A source-neutral
+  `courier_source_*` discovery layer is emitted by the runner independent of
+  whether any `CoderRun` is created, so an idle empty queue (`ok`, zero items),
+  a failing discovery loop (`degraded`/`unavailable`, failures rising while
+  enabled with capacity), and unavailable capacity (`lane-suspended`/
+  `lane-at-capacity`, paused before the source is called) are distinct. Lane
+  capacity, reservations, and reservation age; bounded run phase, execution,
+  lifecycle-report, and retention signals; and terminal-diagnostic/token
+  aggregates extend the existing run metrics. The state model keeps executor
+  completion (entry to `Verifying`, or direct terminalization; `FinishedAt` is
+  recorded at first terminalization and its duration includes any `Verifying`
+  observation wait) separate from external disposition
+  (CI/review/merge, source settlement) and renders unknown/stale/absent as states
+  distinct from idle or healthy, so uncertain evidence never reads as healthy.
+  Labels stay bounded (`source`, `lane`, `mode`, `phase`, `category`, `result`,
+  closed `reason` enums); run ids, issue/PR numbers, repos, branches, error
+  strings, and secrets never become labels, and per-run correlation rides the
+  structured log. Counters reset on restart, cluster gauges are read live, and
+  timestamps/units are settled. Thresholds and windows are design candidates, not
+  defaults. Design only: no code, exporter, dashboard, alert rule, deployment,
+  or lifecycle/retention change, and #286/#287/#288 remain separate. (#290,
+  #289, #291, #292, #286, #287, #288)
 - **2026-10-13 — #292: Courier's dashboard views and alert conditions are
   specified backend-neutrally, and assets are optional renderings.** The
   portable specification is
