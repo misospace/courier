@@ -7,6 +7,7 @@ import (
 	"crypto/rand"
 	"crypto/x509"
 	"crypto/x509/pkix"
+	"encoding/json"
 	"encoding/pem"
 	"math/big"
 	"net/http"
@@ -301,4 +302,87 @@ func testTLSFiles(t *testing.T) (string, string) {
 		t.Fatal(err)
 	}
 	return certPath, keyPath
+}
+
+// TestServerCreatePRRefusalCarriesStructuredViolations: a criterion-evidence
+// refusal must reach the caller as the precise, machine-readable violation
+// set, not the bare denial every other rejection receives, and a body that
+// failed linkage still gets the bare denial (only the criteria contract is
+// model-repairable at this boundary).
+func TestServerCreatePRRefusalCarriesStructuredViolations(t *testing.T) {
+	set := pinMisoGallerySet(t)
+	p := galleryResolvePolicy(set)
+	p.RunUID = "run-uid"
+	observer := galleryResolveObserver()
+	engine, err := NewPolicyEngine(p, observer, serverPusher{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	cert, key := testTLSFiles(t)
+	s, err := NewServer(ServerConfig{Policy: engine, Authenticator: &testAuthenticator{}, TLSCertFile: cert, TLSKeyFile: key})
+	if err != nil {
+		t.Fatal(err)
+	}
+	post := func(body string) *httptest.ResponseRecorder {
+		req := httptest.NewRequest("POST", PathCreatePR, strings.NewReader(`{"oid":"old","title":"t","body":`+mustJSON(t, body)+`,"draft":false}`))
+		req.Header.Set("Authorization", "Bearer valid-token")
+		w := httptest.NewRecorder()
+		s.Handler().ServeHTTP(w, req)
+		return w
+	}
+	w := post("Closes #502.\n\nShips the assets with no criterion-evidence block.")
+	if w.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("status = %d body %s", w.Code, w.Body.String())
+	}
+	var violation criteriaViolation
+	if err := json.Unmarshal(w.Body.Bytes(), &violation); err != nil {
+		t.Fatalf("refusal body is not the structured violation: %v: %s", err, w.Body.String())
+	}
+	if !violation.BlockMissing || violation.Reason == "" {
+		t.Fatalf("violation = %+v, want the missing-block refusal with its reason", violation)
+	}
+	if observer.created.Body != "" {
+		t.Fatal("forge write reached despite criteria refusal")
+	}
+	// The bare denial remains the shape for every non-criteria rejection.
+	if w := post("no closing reference at all"); w.Code != http.StatusUnprocessableEntity || strings.TrimSpace(w.Body.String()) != "operation denied" {
+		t.Fatalf("non-criteria denial = %d %q, want the bare 422", w.Code, w.Body.String())
+	}
+}
+
+// TestServerCreatePRSucceedsSurfacesCoverage: a validated honest partial
+// create answers normally and carries the derived coverage on the response.
+func TestServerCreatePRSucceedsSurfacesCoverage(t *testing.T) {
+	set := pinMisoGallerySet(t)
+	p := galleryResolvePolicy(set)
+	p.RunUID = "run-uid"
+	engine, err := NewPolicyEngine(p, galleryResolveObserver(), serverPusher{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	cert, key := testTLSFiles(t)
+	s, err := NewServer(ServerConfig{Policy: engine, Authenticator: &testAuthenticator{}, TLSCertFile: cert, TLSKeyFile: key})
+	if err != nil {
+		t.Fatal(err)
+	}
+	body := loadFixture(t, "miso-gallery-505-pr-honest-partial.md")
+	req := httptest.NewRequest("POST", PathCreatePR, strings.NewReader(`{"oid":"old","title":"t","body":`+mustJSON(t, body)+`,"draft":false}`))
+	req.Header.Set("Authorization", "Bearer valid-token")
+	w := httptest.NewRecorder()
+	s.Handler().ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("honest partial create denied: %d %s", w.Code, w.Body.String())
+	}
+	if got := w.Header().Get("X-Courier-Criteria-Coverage"); got != CoveragePartial {
+		t.Fatalf("coverage header = %q, want partial", got)
+	}
+}
+
+func mustJSON(t *testing.T, value string) string {
+	t.Helper()
+	b, err := json.Marshal(value)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return string(b)
 }

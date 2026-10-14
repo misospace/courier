@@ -146,6 +146,14 @@ type integrationFixture struct {
 
 func newIntegrationFixture(t *testing.T, mode Mode) *integrationFixture {
 	t.Helper()
+	return newIntegrationFixtureWithCriteria(t, mode, CriterionSet{})
+}
+
+// newIntegrationFixtureWithCriteria binds the resolve-issue fixture policy
+// to a pinned criterion set; the zero set models the legal pre-contract
+// policy (linkage-only body contract).
+func newIntegrationFixtureWithCriteria(t *testing.T, mode Mode, criteria CriterionSet) *integrationFixture {
+	t.Helper()
 	ctx := context.Background()
 	root := t.TempDir()
 	basePath, workPath, source := filepath.Join(root, "base.git"), filepath.Join(root, "fork.git"), filepath.Join(root, "source")
@@ -197,6 +205,7 @@ func newIntegrationFixture(t *testing.T, mode Mode) *integrationFixture {
 		// tests is the base repository plus a stable issue number
 		// that every PR body must reference for linkage to pass.
 		policy.SourceIssue = SourceIssue{Owner: "acme", Name: "project", Number: 122}
+		policy.Criteria = criteria
 	} else {
 		policy.PRNumber, policy.HeadAnchorOID, policy.WorkAnchorOID = 7, anchor, anchor
 		provider.prs = []forge.PullRequest{{Number: 7, Repo: baseRepo.Canonical, BaseRepo: baseRepo.Canonical, BaseRef: "main", BaseSHA: baseOID, HeadRepo: workRepo.Canonical, HeadRef: workRef, HeadSHA: anchor, State: "open", Title: "before", Body: "old"}}
@@ -238,7 +247,7 @@ func TestBrokerIntegrationResolvePublishAndCreatePR(t *testing.T) {
 	if result.OID != f.proposed {
 		t.Fatalf("published OID = %s", result.OID)
 	}
-	pr, err := f.engine.CreatePullRequest(ctx, f.proposed, "issue 122", "Closes acme/project#122.", false)
+	pr, _, err := f.engine.CreatePullRequest(ctx, f.proposed, "issue 122", "Closes acme/project#122.", false)
 	if err != nil {
 		t.Fatalf("CreatePullRequest: %v", err)
 	}
@@ -336,7 +345,7 @@ func TestBrokerIntegrationDeniesConcurrentDuplicatePR(t *testing.T) {
 		t.Fatal(err)
 	}
 	f.provider.racePR = true
-	if _, err := f.engine.CreatePullRequest(context.Background(), f.proposed, "title", "Closes acme/project#122.", false); err == nil {
+	if _, _, err := f.engine.CreatePullRequest(context.Background(), f.proposed, "title", "Closes acme/project#122.", false); err == nil {
 		t.Fatal("concurrent duplicate PR accepted")
 	}
 }
@@ -361,4 +370,52 @@ func igWrite(t *testing.T, path, value string) {
 func igOID(t *testing.T, dir, rev string) string {
 	t.Helper()
 	return strings.TrimSpace(string(igGit(t, dir, "rev-parse", rev)))
+}
+
+// TestBrokerIntegrationCriterionEvidenceBoundary runs the native
+// criterion-evidence boundary (#281) through the real git broker, pinned
+// transport, forge adapter, and policy engine: linkage-valid bodies that
+// omit the evidence block or overstate coverage are refused with the
+// structured violation before any forge write, and the honest record
+// creates exactly one pull request whose report carries derived coverage.
+func TestBrokerIntegrationCriterionEvidenceBoundary(t *testing.T) {
+	issueBody := "## Acceptance\n\n- The built image serves /favicon.ico with image content.\n- A regression check covers the packaging of tracked assets.\n"
+	set, err := ExtractCriteria(issueBody, SourceIssue{Owner: "acme", Name: "project", Number: 122})
+	if err != nil || len(set.Criteria) != 2 {
+		t.Fatalf("pin fixture criteria: %+v err %v", set, err)
+	}
+	f := newIntegrationFixtureWithCriteria(t, ModeResolveIssue, set)
+	ctx := context.Background()
+	if _, err := f.engine.Publish(ctx, PublicationRequest{RunUID: "run-uid", ProposedOID: f.proposed}); err != nil {
+		t.Fatalf("Publish: %v", err)
+	}
+	prsBefore := len(f.provider.prs)
+	_, _, err = f.engine.CreatePullRequest(ctx, f.proposed, "title", "Closes acme/project#122. Ships the packaging fix.", false)
+	var cerr *CriteriaError
+	if !errors.As(err, &cerr) || !errors.Is(err, ErrCriteriaBlockMissing) {
+		t.Fatalf("missing-block body: want the missing-block refusal, got %v", err)
+	}
+	if len(f.provider.prs) != prsBefore {
+		t.Fatal("the forge recorded a pull request despite the criterion-evidence refusal")
+	}
+	body := "Closes acme/project#122. Ships the packaging fix.\n\n" + honestBlockFor(set)
+	pr, report, err := f.engine.CreatePullRequest(ctx, f.proposed, "issue 122", body, false)
+	if err != nil {
+		t.Fatalf("honest block refused: %v", err)
+	}
+	if pr.Number != 11 || report == nil || report.DerivedCoverage(set) != CoverageFull {
+		t.Fatalf("created = %+v report = %+v, want one PR and a full report", pr, report)
+	}
+	// An overstated record — one criterion downgraded to manual
+	// verification under an unchanged full claim — is refused naming the
+	// coverage lie, again without touching the forge.
+	overstated := strings.Replace(body,
+		"- "+set.Criteria[0].ID+" "+set.Criteria[0].Digest+": regression-check - internal/broker/criteria.go covers "+set.Criteria[0].ID,
+		"- "+set.Criteria[0].ID+" "+set.Criteria[0].Digest+": manual-verification - curled the endpoint by hand", 1)
+	if _, _, err = f.engine.CreatePullRequest(ctx, f.proposed, "issue 122", overstated, false); !errors.As(err, &cerr) || cerr.CoverageClaim != CoverageFull || cerr.CoverageDerived != CoveragePartial {
+		t.Fatalf("overstated body: want the coverage-lie refusal, got %v", err)
+	}
+	if len(f.provider.prs) != prsBefore+1 {
+		t.Fatalf("the overstated body changed forge state: %d pull requests", len(f.provider.prs))
+	}
 }

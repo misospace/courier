@@ -637,11 +637,13 @@ extraction grammar and bounds are covered there too. Both paths consume
 the same pure functions; divergent acceptance rules between the paths
 would be a correctness regression.
 
-The wiring is deliberately not in this design change: the admission
-snapshot (trusted issue read + pin, #280), native enforcement at
-`PolicyEngine.CreatePullRequest` (#281), and legacy enforcement at the
-handoff (#282) are each one bounded implementation issue. Until they land,
-the contract exists as the tested pure seam both paths will call.
+The boundary wiring is landed issue by issue, not in the design change
+itself: the admission snapshot (trusted issue read + pin, #280) and native
+enforcement at `PolicyEngine.CreatePullRequest` (#281 — refusal before any
+forge write, the structured `*CriteriaError` surfaced through the broker API,
+and derived coverage on the create response) are merged; legacy enforcement
+at the handoff (#282) remains one bounded implementation issue. The contract
+is the tested pure seam both paths call.
 
 ### Git policy and publication (#118)
 
