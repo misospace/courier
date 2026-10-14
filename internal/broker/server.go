@@ -315,7 +315,13 @@ func (s *Server) createPR(w http.ResponseWriter, r *http.Request) {
 	if !decodeJSON(w, r, &req) {
 		return
 	}
-	result, err := s.policy.CreatePullRequest(r.Context(), req.OID, req.Title, req.Body, req.Draft)
+	result, report, err := s.policy.CreatePullRequest(r.Context(), req.OID, req.Title, req.Body, req.Draft)
+	if err == nil && report != nil {
+		// A validated evidence block surfaces its coverage (claim and
+		// derivation agree by construction) so the caller can record the
+		// honest partial state without re-parsing its own body.
+		w.Header().Set("X-Courier-Criteria-Coverage", report.Coverage)
+	}
 	respond(w, result, err)
 }
 
@@ -354,6 +360,11 @@ func decodeJSON(w http.ResponseWriter, r *http.Request, target any) bool {
 
 func respond(w http.ResponseWriter, value any, err error) {
 	if err != nil {
+		var cerr *CriteriaError
+		if errors.As(err, &cerr) {
+			respondCriteriaViolation(w, cerr)
+			return
+		}
 		http.Error(w, "operation denied", http.StatusUnprocessableEntity)
 		return
 	}
@@ -361,6 +372,44 @@ func respond(w http.ResponseWriter, value any, err error) {
 	if err := json.NewEncoder(w).Encode(value); err != nil {
 		return
 	}
+}
+
+// criteriaViolation is the machine-readable refusal shape for the
+// criterion-evidence contract (#249/#281): every violation class travels
+// named — missing IDs, unknown IDs, duplicates, per-row digest mismatches,
+// bad status shapes, and the coverage claim beside its derivation — so a
+// corrected body is a fresh call fixing the exact defect instead of a
+// guess against a bare denial. Everything in it is derived from the
+// caller's own proposed body and the admission-pinned set the operator
+// projected; no provider response or credential data is echoed.
+type criteriaViolation struct {
+	Error           string   `json:"error"`
+	Reason          string   `json:"reason"`
+	BlockMissing    bool     `json:"blockMissing"`
+	Missing         []string `json:"missing,omitempty"`
+	Unknown         []string `json:"unknown,omitempty"`
+	Duplicate       []string `json:"duplicate,omitempty"`
+	BadDigest       []string `json:"badDigest,omitempty"`
+	BadStatus       []string `json:"badStatus,omitempty"`
+	CoverageClaim   string   `json:"coverageClaim,omitempty"`
+	CoverageDerived string   `json:"coverageDerived,omitempty"`
+}
+
+func respondCriteriaViolation(w http.ResponseWriter, cerr *CriteriaError) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusUnprocessableEntity)
+	_ = json.NewEncoder(w).Encode(criteriaViolation{
+		Error:           "criterion-evidence violation",
+		Reason:          cerr.Reason,
+		BlockMissing:    errors.Is(cerr, ErrCriteriaBlockMissing),
+		Missing:         cerr.Missing,
+		Unknown:         cerr.Unknown,
+		Duplicate:       cerr.Duplicate,
+		BadDigest:       cerr.BadDigest,
+		BadStatus:       cerr.BadStatus,
+		CoverageClaim:   cerr.CoverageClaim,
+		CoverageDerived: cerr.CoverageDerived,
+	})
 }
 
 // LoadTLSIdentity is available to callers that need to validate cert material before serving.

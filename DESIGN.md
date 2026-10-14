@@ -1340,7 +1340,20 @@ there is no delete verb because active runs reference lanes. (#73)
 - **Claimed** — the source adapter claims the work (dispatch: claim +
   status=in-progress; label/cron/cli: no-op or equivalent). Branch name derived.
   If the pod then fails to launch, **release the claim** — never strand work as
-  in-progress.
+  in-progress. A launch whose create collides with an already-occupied
+  coordinator pod name (`AlreadyExists`) is verified before it may count as
+  success, against the API server's current state rather than the informer
+  cache: the collision resolves to an idempotent, no-second-charge launch
+  **only** when the existing pod carries a controller `OwnerReference` whose
+  UID is the run's and is not being torn down. Every other shape — a failed
+  verification read (NotFound, transient, Forbidden), a terminating pod, or a
+  pod not bound to this run's UID (foreign, or a live coordinator left by a
+  deleted-and-recreated same-name run) — surfaces as **provisioning in
+  flight**: the run stays **Claimed** and requeues, and `Running` is never
+  written over a slot not verified as a live, run-owned pod. The wait rides
+  the pod's delete event with a bounded requeue as the backstop; no wall-clock
+  bound is introduced. This mirrors the secure topology's in-flight signal for
+  a terminating control pod rather than inventing a second shape (#217).
 - **Running** — pod launches: ephemeral workspace, clone, **adopt the branch if it
   exists and base-sync first**, inject LaneProfile framing + roles, wire the MCP
   tools, set log level from `debug`. For a fork PR the workspace's `origin` is
@@ -1848,6 +1861,63 @@ named items remain unresolved and must not be described as production-ready:
 - The exact vLLM gauge for backpressure on the target model server.
 
 ## Decisions
+
+- **2026-10-14 — #217: a coordinator slot collision resolves to a successful
+  launch only against a pod verified live and owned by the run's UID; every
+  other shape keeps the run Claimed.** The legacy launcher treated
+  `AlreadyExists` on pod creation as an idempotent success, so a relaunch
+  colliding with a pod being torn down recorded `Running` over the dying pod —
+  the next reconcile could terminalize the freshly relaunched run as `Failed`
+  by reading that pod's own termination, and a pod that vanished before the
+  wedge path observed it would charge a second infrastructure loss against the
+  ceiling #106 shares with pod loss. The settled contract: the collision is a
+  liveness check, and a liveness check reads the world, not a cache — the
+  verification `Get` goes through the manager's uncached API reader (the same
+  reader the pod-loss confirmation and evidence intake already use), because a
+  cached pod predating a deletion timestamp the API server already carries must
+  not resolve a terminating slot to success. Identity is bound to the run's
+  UID with the pre-existing `podOwnedByRunUID`: neither name matching nor the
+  `LabelRun` fallback adopts at this site, so a live coordinator left by a
+  deleted-and-recreated same-name CoderRun is not silently adopted (owner GC
+  reaps its pod). Only a verification read returning a run-owned pod not being
+  torn down resolves the collision to a no-second-charge launch; a read error
+  (NotFound, transient, Forbidden), a terminating pod, or an unowned/foreign
+  pod returns an in-flight sentinel that the reconciler treats as *stay
+  Claimed, requeue* — the same shape as the secure topology's
+  terminating-control-pod requeue, bounded by a backstop requeue that is not a
+  deadline (liveness is bounded, duration never is). The launcher still never
+  writes run status: the sentinel returns to the reconciler, which owns phase
+  transitions, and it returns before any status write or claim release so no
+  claim is stranded. (#217, #106)
+
+- **2026-10-14 — #281: the criterion-evidence contract is enforced at native
+  PR creation before any forge write, and the refusal travels to the caller
+  as structured violations.** The native boundary of #249/#280:
+  `PolicyEngine.CreatePullRequest` runs `ValidateCriterionEvidence` against
+  the policy-carried pinned set immediately after linkage and before any
+  forge observation or write, so a deficient body is a repairable rejection
+  with nothing to undo — a corrected body is a fresh call, exactly like a
+  linkage refusal, and the duplicate-PR guard still precedes creation. An
+  unpinned pre-contract policy and a pinned empty set are vacuous passes
+  (linkage remains their only body contract), distinguished by the set's
+  digest (`IsPinned`). The engine returns the structured `*CriteriaError`
+  unflattened, and the broker HTTP layer answers it with a 422 JSON body
+  naming every violation class — block-missing flag, missing/unknown/
+  duplicate IDs, per-row digest mismatch, bad status shape, and the coverage
+  claim beside its derivation — where every other rejection keeps the bare
+  denial: the criteria contract is the one defect class the model can
+  mechanically repair, so it gets the precise repair instruction, and the
+  echo carries only caller-authored body structure and admission-pinned
+  digests, never provider or credential data. A validated create answers
+  with the derived coverage (full/partial) in the
+  `X-Courier-Criteria-Coverage` response header so an honest partial record
+  stays visible without re-parsing the body; carrying that result into
+  outcome comments and telemetry is #282's executor-side job. There is no
+  resolve-issue body-update surface — `UpdateFixPR` is fix-pr-only and
+  fix-pr policies carry no criterion contract — so the boundary has no
+  update path to guard and a compliant create cannot be followed by an edit
+  that drops the block; settled against the current code, not assumed.
+  (#281, #249, #280, #204)
 
 - **2026-10-13 — #317: git commit identity is deployment configuration,
   never a hard-coded value or a token-derived one.** Operator-managed

@@ -97,7 +97,7 @@ func TestForgeAdapterResolveCreateAndVerifyPullRequest(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	created, err := engine.CreatePullRequest(ctx, "work-oid", "title", "Closes org/repo#1", false)
+	created, _, err := engine.CreatePullRequest(ctx, "work-oid", "title", "Closes org/repo#1", false)
 	if err != nil {
 		t.Fatalf("CreatePullRequest: %v", err)
 	}
