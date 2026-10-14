@@ -351,6 +351,50 @@ func TestChartRendersEvidenceIntake(t *testing.T) {
 	}
 }
 
+// TestChartRendersRetentionConfiguration checks the #287 retention block is
+// rendered as the matching manager flags, and that an explicit args override
+// wins over the value.
+func TestChartRendersRetentionConfiguration(t *testing.T) {
+	if _, err := exec.LookPath("helm"); err != nil {
+		t.Skip("helm is not installed")
+	}
+
+	chartDir := copyChart(t)
+	if err := exec.Command("helm", "repo", "add", "bjw-s-labs", "https://bjw-s-labs.github.io/helm-charts").Run(); err != nil {
+		t.Fatalf("configure chart repository: %v", err)
+	}
+	runHelm(t, chartDir, "dependency", "build")
+
+	out := runHelm(t, chartDir, "template", "courier", ".",
+		"--set", "retention.done=15m",
+		"--set", "retention.failed=72h",
+		"--set", "retention.needsHuman=240h",
+		"--set", "retention.auditKeep=9",
+	)
+	for _, want := range []string{
+		"--done-retention=15m",
+		"--failed-retention=72h",
+		"--needs-human-retention=240h",
+		"--terminal-audit-keep=9",
+	} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("retention chart output is missing %q", want)
+		}
+	}
+
+	// An explicit manager arg wins over the value, mirroring the evidence block.
+	overridden := runHelm(t, chartDir, "template", "courier", ".",
+		"--set", "controllers.main.containers.main.args={--leader-elect,--done-retention=1m}",
+		"--set", "retention.done=15m",
+	)
+	if strings.Contains(overridden, "--done-retention=15m") {
+		t.Fatal("explicit --done-retention arg did not win over the retention.done value")
+	}
+	if !strings.Contains(overridden, "--done-retention=1m") {
+		t.Fatalf("explicit --done-retention arg missing from output")
+	}
+}
+
 // findDocument returns the YAML document (a block of the multi-doc helm
 // output separated by ---) that contains a line equal to kindLine and a
 // line equal to nameLine.

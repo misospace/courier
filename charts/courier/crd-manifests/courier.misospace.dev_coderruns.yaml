@@ -289,6 +289,62 @@ spec:
                 x-kubernetes-list-map-keys:
                 - type
                 x-kubernetes-list-type: map
+              controlRequest:
+                description: |-
+                  ControlRequest is the operator-owned fenced control request (#238).
+                  The controller translates the soft-stop annotation into this record
+                  and alone writes it; the broker's trusted status listener accepts only
+                  the harness-owned schema, so no other writer can forge a request. It
+                  is replaceable, not set-once: a changed annotation replaces the record
+                  and a cleared annotation clears it.
+                properties:
+                  id:
+                    description: 'ID is the opaque request ID: the annotation value,
+                      verbatim.'
+                    maxLength: 128
+                    minLength: 1
+                    type: string
+                  kind:
+                    description: Kind is the requested action.
+                    enum:
+                    - soft-stop
+                    type: string
+                  requestedAt:
+                    description: RequestedAt is when the controller stamped this record.
+                    format: date-time
+                    type: string
+                  targetPodUID:
+                    description: TargetPodUID fences the request to one control incarnation.
+                    maxLength: 128
+                    minLength: 1
+                    type: string
+                required:
+                - id
+                - kind
+                - requestedAt
+                - targetPodUID
+                type: object
+              controlRequestAck:
+                description: |-
+                  ControlRequestAck is the harness-owned durable acknowledgement of the
+                  control request the live incarnation served (#238). The harness writes
+                  it through the broker's trusted status path, which fences it to a
+                  matching live request.
+                properties:
+                  at:
+                    description: At is when the harness wrote this acknowledgement.
+                    format: date-time
+                    type: string
+                  id:
+                    description: 'ID is the acknowledged request ID: the serving record''s
+                      ID, verbatim.'
+                    maxLength: 128
+                    minLength: 1
+                    type: string
+                required:
+                - at
+                - id
+                type: object
               declaredNoChange:
                 description: |-
                   DeclaredNoChange records that the coordinator of this run exited with

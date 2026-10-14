@@ -59,6 +59,35 @@ func gaugeValue(t *testing.T, m *dto.Metric, name string) float64 {
 	return m.GetGauge().GetValue()
 }
 
+// gaugeValueIfPresent reports the named gauge's value for the given labels and
+// whether the series exists at all, for assertions that a series may be
+// legitimately absent (a phase with nothing retained).
+func gaugeValueIfPresent(t *testing.T, reg *prometheus.Registry, name string, labels map[string]string) (float64, bool) {
+	t.Helper()
+	families, err := reg.Gather()
+	if err != nil {
+		t.Fatalf("gather: %v", err)
+	}
+	for _, f := range families {
+		if f.GetName() != name {
+			continue
+		}
+		for _, m := range f.GetMetric() {
+			match := true
+			for _, lp := range m.GetLabel() {
+				if labels[lp.GetName()] != lp.GetValue() {
+					match = false
+					break
+				}
+			}
+			if match && m.GetGauge() != nil {
+				return m.GetGauge().GetValue(), true
+			}
+		}
+	}
+	return 0, false
+}
+
 func histogramSample(t *testing.T, reg *prometheus.Registry, name string, labels map[string]string) (uint64, float64) {
 	t.Helper()
 	m := gatherMetric(t, reg, name, labels)
@@ -246,11 +275,15 @@ func TestMetricLabelsExcludeIdentity(t *testing.T) {
 	} {
 		assertGatheredLabelSet(t, registry, name, "lane", "mode", "phase")
 	}
+	recorder.ObserveReapRequest(courierv1alpha1.PhaseFailed)
+	assertGatheredLabelSet(t, registry, "courier_coderuns_reap_requests_total", "phase")
 
 	// A drained lane must still appear on both lane gauges, reporting 0.
+	doneRun := admissionRun("run2", "local", courierv1alpha1.PhaseDone)
+	doneRun.Status.FinishedAt = &metav1.Time{Time: timestampClock.Add(-time.Hour)}
 	runsClient := phaseClient(t,
 		admissionLane("local", 2),
-		admissionRun("run2", "local", courierv1alpha1.PhaseDone),
+		doneRun,
 	)
 	laneRegistry := prometheus.NewRegistry()
 	laneRegistry.MustRegister(NewLaneCollector(runsClient))
@@ -261,6 +294,11 @@ func TestMetricLabelsExcludeIdentity(t *testing.T) {
 		t.Fatalf("in-flight for a drained lane = %v, want 0", got)
 	}
 
+	// The oldest-terminal-age gauge carries only the bounded terminal phase.
+	ageRegistry := prometheus.NewRegistry()
+	ageRegistry.MustRegister(NewTerminalAgeCollector(runsClient))
+	assertGatheredLabelSet(t, ageRegistry, "courier_coderuns_oldest_terminal_age_seconds", "phase")
+
 	// No label value may carry work-item identity.
 	identity := map[string]bool{
 		run.Spec.Repo:       true,
@@ -268,7 +306,7 @@ func TestMetricLabelsExcludeIdentity(t *testing.T) {
 		run.Name:            true,
 		"1":                 true,
 	}
-	for _, g := range []prometheus.Gatherer{registry, laneRegistry} {
+	for _, g := range []prometheus.Gatherer{registry, laneRegistry, ageRegistry} {
 		families, err := g.Gather()
 		if err != nil {
 			t.Fatalf("gather: %v", err)
@@ -389,5 +427,78 @@ func TestTerminalStatusPatchFailureRecordsNoMetrics(t *testing.T) {
 		if f.GetName() == "courier_coderuns_total" {
 			t.Fatalf("courier_coderuns_total observed after a failed terminal status patch: %#v", f)
 		}
+	}
+}
+
+// TestReapObservesReapRequestCounter checks the deletion half of the retention
+// observability: an accepted delete request increments the phase-labelled
+// counter exactly once, even though the object is gone.
+func TestReapObservesReapRequestCounter(t *testing.T) {
+	run := withReapMarker(
+		terminalReapRun("failed", courierv1alpha1.PhaseFailed, timestampClock.Add(-11*time.Minute)),
+		failedAtAnnotation, timestampClock.Add(-11*time.Minute))
+
+	registry := prometheus.NewRegistry()
+	recorder := NewRunRecorder(registry)
+
+	c := phaseClient(t, run)
+	r := terminalReapReconciler(c, &admissionSource{}, timestampClock, -1)
+	r.Metrics = recorder
+
+	if _, err := r.Reconcile(context.Background(), admissionRequest("failed")); err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+	m := gatherMetric(t, registry, "courier_coderuns_reap_requests_total", map[string]string{"phase": "Failed"})
+	if m.GetCounter() == nil || m.GetCounter().GetValue() != 1 {
+		t.Fatalf("courier_coderuns_reap_requests_total = %v, want 1", m.GetCounter())
+	}
+}
+
+// TestTerminalAgeCollectorReportsOldestPerPhase checks the age half of the
+// retention observability: the gauge reports the age of the oldest retained
+// run per terminal phase, ignoring non-terminal runs.
+func TestTerminalAgeCollectorReportsOldestPerPhase(t *testing.T) {
+	now := timestampClock
+	failedOld := terminalReapRun("failed-old", courierv1alpha1.PhaseFailed, now.Add(-3*time.Hour))
+	failedNew := terminalReapRun("failed-new", courierv1alpha1.PhaseFailed, now.Add(-1*time.Hour))
+	needs := terminalReapRun("needs", courierv1alpha1.PhaseNeedsHuman, now.Add(-2*time.Hour))
+	pending := admissionRun("pending", "local", courierv1alpha1.PhasePending)
+
+	c := phaseClient(t, failedOld, failedNew, needs, pending)
+	collector := NewTerminalAgeCollector(c)
+	collector.now = func() time.Time { return now }
+
+	registry := prometheus.NewRegistry()
+	registry.MustRegister(collector)
+
+	if got := gaugeValue(t, gatherMetric(t, registry, "courier_coderuns_oldest_terminal_age_seconds", map[string]string{"phase": "Failed"}), "courier_coderuns_oldest_terminal_age_seconds"); got != (3 * time.Hour).Seconds() {
+		t.Fatalf("oldest Failed age = %v, want %v", got, (3 * time.Hour).Seconds())
+	}
+	if got := gaugeValue(t, gatherMetric(t, registry, "courier_coderuns_oldest_terminal_age_seconds", map[string]string{"phase": "NeedsHuman"}), "courier_coderuns_oldest_terminal_age_seconds"); got != (2 * time.Hour).Seconds() {
+		t.Fatalf("oldest NeedsHuman age = %v, want %v", got, (2 * time.Hour).Seconds())
+	}
+}
+
+// TestTerminalAgeCollectorListFailure checks the scrape-error path: a failed
+// List must increment the dedicated counter instead of silently dropping the
+// scrape or panicking.
+func TestTerminalAgeCollectorListFailure(t *testing.T) {
+	base := phaseClient(t)
+	withWatch, ok := base.(client.WithWatch)
+	if !ok {
+		t.Fatal("fake client does not implement client.WithWatch")
+	}
+	failing := interceptor.NewClient(withWatch, interceptor.Funcs{
+		List: func(context.Context, client.WithWatch, client.ObjectList, ...client.ListOption) error {
+			return errors.New("list failed")
+		},
+	})
+
+	registry := prometheus.NewRegistry()
+	registry.MustRegister(NewTerminalAgeCollector(failing))
+
+	m := gatherMetric(t, registry, "courier_terminal_age_scrape_errors_total", map[string]string{})
+	if m.GetCounter() == nil || m.GetCounter().GetValue() != 1 {
+		t.Fatalf("courier_terminal_age_scrape_errors_total = %v, want 1", m.GetCounter())
 	}
 }

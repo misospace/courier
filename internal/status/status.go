@@ -116,11 +116,78 @@ type OperatorPatch struct {
 	// diagnostic (#272). It is set once at terminalization and never cleared.
 	// +optional
 	TerminalDiagnostic *courierv1alpha1.TerminalDiagnostic `json:"terminalDiagnostic,omitempty"`
-	// Conditions is the operator-owned condition set. The operator is the only
-	// writer of a CoderRun's conditions, so a merge patch carrying them replaces
-	// the array wholesale; a second writer must extend this field rather than
-	// patch a disjoint list.
-	Conditions []metav1.Condition `json:"conditions,omitempty"`
+	// ControlRequest is the operator-owned fenced control request (#238).
+	// It is raw JSON rather than a typed pointer because the field is
+	// replaceable, not set-once: a changed value replaces the record and an
+	// explicit JSON null clears it — an omitted field alone cannot clear a
+	// nested object under merge-patch semantics. Set it with
+	// SetControlRequest or ClearControlRequest rather than by hand.
+	// +optional
+	ControlRequest json.RawMessage `json:"controlRequest,omitempty"`
+	// ControlRequestAck is the operator-side view of the harness-owned
+	// acknowledgement (#238). Raw for the same reason as ControlRequest: the
+	// operator may only clear it (relaunch and terminalization disarm the
+	// control pair), never write a record.
+	// +optional
+	ControlRequestAck json.RawMessage `json:"controlRequestAck,omitempty"`
+	// Conditions is the operator-owned condition set, raw for the same
+	// merge-patch reason: removing the last condition requires an explicit
+	// null, which an omitted empty slice cannot express. Set it with
+	// SetConditions rather than by hand.
+	// +optional
+	Conditions json.RawMessage `json:"conditions,omitempty"`
+}
+
+// SetControlRequest encodes one operator control request into the patch,
+// replacing any previously recorded record when the patch is applied.
+func (p *OperatorPatch) SetControlRequest(record courierv1alpha1.ControlRequest) error {
+	data, err := json.Marshal(record)
+	if err != nil {
+		return fmt.Errorf("status: encode control request: %w", err)
+	}
+	p.ControlRequest = data
+	return nil
+}
+
+// ClearControlRequest emits an explicit JSON null for the control request,
+// clearing the record: a merge patch leaves omitted fields untouched, so only
+// null removes a nested object.
+func (p *OperatorPatch) ClearControlRequest() {
+	p.ControlRequest = json.RawMessage("null")
+}
+
+// SetControlRequestAck encodes an acknowledgement into the patch. The
+// operator clears acknowledgements only (the harness writes them through the
+// broker); the patch path exists so a disarm can clear a stale record.
+func (p *OperatorPatch) SetControlRequestAck(ack courierv1alpha1.ControlRequestAck) error {
+	data, err := json.Marshal(ack)
+	if err != nil {
+		return fmt.Errorf("status: encode control request acknowledgement: %w", err)
+	}
+	p.ControlRequestAck = data
+	return nil
+}
+
+// ClearControlRequestAck emits an explicit JSON null for the acknowledgement.
+func (p *OperatorPatch) ClearControlRequestAck() {
+	p.ControlRequestAck = json.RawMessage("null")
+}
+
+// SetConditions encodes the operator-owned condition set. An empty set emits
+// an explicit null: the conditions array is replaced wholesale by a merge
+// patch, and removing the last condition requires more than an omitted
+// (empty and therefore dropped) slice.
+func (p *OperatorPatch) SetConditions(conditions []metav1.Condition) error {
+	if len(conditions) == 0 {
+		p.Conditions = json.RawMessage("null")
+		return nil
+	}
+	data, err := json.Marshal(conditions)
+	if err != nil {
+		return fmt.Errorf("status: encode conditions: %w", err)
+	}
+	p.Conditions = data
+	return nil
 }
 
 // HarnessPatch contains only fields owned by the coordinator harness: its
@@ -129,6 +196,11 @@ type HarnessPatch struct {
 	Checkpoint *courierv1alpha1.Checkpoint `json:"checkpoint,omitempty"`
 	Heartbeat  *courierv1alpha1.Heartbeat  `json:"heartbeat,omitempty"`
 	LastCommit string                      `json:"lastCommit,omitempty"`
+	// ControlRequestAck is the harness-owned acknowledgement of the control
+	// request this incarnation served (#238). The broker's trusted status
+	// listener fences it to a matching live operator request.
+	// +optional
+	ControlRequestAck *courierv1alpha1.ControlRequestAck `json:"controlRequestAck,omitempty"`
 }
 
 // OperatorWriter writes only operator-owned status fields.
