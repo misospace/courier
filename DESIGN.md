@@ -2935,7 +2935,10 @@ was superseded.
   binding or a false no-progress/human ending; the brief keeps its spent ID,
   its partial work is never integrated or published, and only fixed redacted
   text reaches the transcript. Ordinary sub-agent failures stay ordinary tool
-  failures. Exhaustion signals default to provider-neutral tokens and a
+  failures. Like the coordinator's own stream-failure ending, this ending
+  returns directly: a set soft-stop latch does not redirect it to the
+  world-derived finish, and any outstanding status debt is reconciled by the
+  resume path. Exhaustion signals default to provider-neutral tokens and a
   deployment extends them with `COURIER_MODEL_EXHAUSTION_CODES` /
   `COURIER_MODEL_EXHAUSTION_TYPES`; Courier core hard-codes no provider policy
   and adds no silent fallback. The legacy OpenCode executor has no structured

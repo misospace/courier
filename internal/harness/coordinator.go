@@ -303,8 +303,16 @@ func (c *Coordinator) pump(ctx context.Context, session *Session, briefID string
 		// another turn would let it re-delegate onto the exhausted binding
 		// or declare a false ending. The run ends through the same
 		// availability ending as the coordinator's own stream failure.
-		if deferred := c.takeDeferredAvailability(); deferred != nil {
-			return turnResult{streamErr: deferred}
+		// The hand-off is scoped to the coordinator's own loop: a
+		// sub-agent pump never consumes it, so a recorded failure can
+		// only abort the session that owns the run. The transcript may
+		// hold fewer tool results than the assistant message requested,
+		// which is safe because the ending discards the session; the
+		// earned events are still returned, not dropped.
+		if briefID == "" {
+			if deferred := c.takeDeferredAvailability(); deferred != nil {
+				return turnResult{streamErr: deferred, toolResults: toolResults}
+			}
 		}
 	}
 	return turnResult{toolResults: toolResults}

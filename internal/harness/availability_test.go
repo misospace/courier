@@ -424,8 +424,9 @@ func TestCoordinatorEndsBlockedExternalOnDelegatedExhaustion(t *testing.T) {
 			toolCallChunk(0, "call-1", toolDelegate, `{"id":"b1","role":"coder","objective":"Do the work","successCheck":"tests pass"}`),
 			finishChunk("tool_calls"),
 		)},
-		// Coder binding: confirmed allowance exhaustion.
-		gatewayResponse{status: http.StatusTooManyRequests, errBody: `{"error":{"type":"insufficient_quota"}}`},
+		// Coder binding: confirmed allowance exhaustion. The message is
+		// provider detail that must never reach the ending.
+		gatewayResponse{status: http.StatusTooManyRequests, errBody: `{"error":{"message":"quota-secret-detail","type":"insufficient_quota"}}`},
 	)
 	defer cleanup()
 
@@ -449,6 +450,14 @@ func TestCoordinatorEndsBlockedExternalOnDelegatedExhaustion(t *testing.T) {
 	}
 	if !strings.Contains(result.Reason, "allowance-exhausted") {
 		t.Fatalf("reason = %q, want the availability class", result.Reason)
+	}
+	if strings.Contains(result.Reason, "quota-secret-detail") {
+		t.Fatalf("ending leaked the provider body: %q", result.Reason)
+	}
+	// The healthy coordinator takes no further turn: exactly one request
+	// each reaches the coordinator and the exhausted coder binding.
+	if got := mocker.requestCount(); got != 2 {
+		t.Fatalf("gateway requests = %d, want 2 (no coordinator turn after the delegation)", got)
 	}
 	// Exactly one request reaches the exhausted coder binding: a healthy
 	// coordinator must not re-delegate or burn the binding further.
