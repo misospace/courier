@@ -207,7 +207,7 @@ func TestRunnerExcludesPendingHeadSoFreeCloudBindingGetsNextItem(t *testing.T) {
 	}
 }
 
-func TestRunnerExclusionOmitsBlockedExternalRuns(t *testing.T) {
+func TestRunnerExclusionOmitsOnlySettledCapacityRuns(t *testing.T) {
 	phases := []courierv1alpha1.Phase{
 		"",
 		courierv1alpha1.PhasePending,
@@ -239,14 +239,49 @@ func TestRunnerExclusionOmitsBlockedExternalRuns(t *testing.T) {
 				t.Fatalf("DiscoverExcluding calls = %d, want 1", adapter.excludingCalls)
 			}
 			if phase == courierv1alpha1.PhaseBlockedExternal {
-				if len(adapter.exclusions) != 0 {
-					t.Fatalf("exclusions = %#v, want none for BlockedExternal", adapter.exclusions)
+				if len(adapter.exclusions) != 1 {
+					t.Fatalf("exclusions = %#v, unsettled BlockedExternal must remain a barrier", adapter.exclusions)
 				}
 				return
 			}
 			want := (WorkItem{ID: "opaque/generation-7", Mode: "fix-pr", Repo: "acme/widgets", Ref: 42})
 			if len(adapter.exclusions) != 1 || adapter.exclusions[0] != want {
 				t.Fatalf("exclusions = %#v, want the retained %s run", adapter.exclusions, phase)
+			}
+		})
+	}
+}
+
+func TestRunnerSettledCapacityExhaustionRequiresFreshOpaqueID(t *testing.T) {
+	lane := testLane()
+	lane.Spec.Concurrency = 3
+	old := &courierv1alpha1.CoderRun{
+		ObjectMeta: metav1.ObjectMeta{Name: "old-attempt", Namespace: "courier"},
+		Spec:       courierv1alpha1.CoderRunSpec{Source: "dispatch", WorkItemID: "consumed-token", Mode: courierv1alpha1.ModeFixPR, Repo: "acme/widgets", Ref: 42, Lane: "local"},
+		Status: courierv1alpha1.CoderRunStatus{Phase: courierv1alpha1.PhaseBlockedExternal,
+			TerminalDiagnostic: &courierv1alpha1.TerminalDiagnostic{Category: courierv1alpha1.TerminalDiagnosticCategoryCapacityExhaustion},
+			Conditions: []metav1.Condition{
+				{Type: courierv1alpha1.ConditionCapacityRecovery, Status: metav1.ConditionTrue, Reason: "Settled"},
+				{Type: courierv1alpha1.ConditionLifecycleReported, Status: metav1.ConditionTrue, Reason: "Published"},
+			}},
+	}
+	for _, tc := range []struct {
+		name, id string
+		wantRuns int
+	}{{"same consumed token", "consumed-token", 1}, {"fresh token", "new-opaque-token", 2}} {
+		t.Run(tc.name, func(t *testing.T) {
+			adapter := &testAdapter{items: []WorkItem{{ID: tc.id, Mode: "fix-pr", Repo: "acme/widgets", Ref: 42}}}
+			c := newTestClient(t, lane, old.DeepCopy())
+			runner := NewRunner(c, adapter, RunnerConfig{Source: "dispatch", LaneProfile: "local", Namespace: "courier"})
+			if err := runner.Poll(context.Background()); err != nil {
+				t.Fatal(err)
+			}
+			var runs courierv1alpha1.CoderRunList
+			if err := c.List(context.Background(), &runs, client.InNamespace("courier")); err != nil {
+				t.Fatal(err)
+			}
+			if len(runs.Items) != tc.wantRuns {
+				t.Fatalf("runs=%d, want %d", len(runs.Items), tc.wantRuns)
 			}
 		})
 	}
@@ -902,6 +937,41 @@ func TestRunnerPollSkipsDiscoveryWhenLaneProfileMissing(t *testing.T) {
 	}
 	if len(runs.Items) != 0 {
 		t.Fatalf("created %d runs, want none", len(runs.Items))
+	}
+}
+
+func TestRunnerPollCooldownUsesSharedCapacityIdentity(t *testing.T) {
+	now := time.Date(2025, 1, 2, 3, 4, 5, 0, time.UTC)
+	exhausted := testLane()
+	exhausted.Name = "lane-a"
+	exhausted.Spec.CapacityGroup = "pool-a"
+	exhausted.Status.CapacityCooldown = &courierv1alpha1.CapacityCooldown{
+		CapacityID: "pool-a", NextEligibleAt: metav1.NewTime(now.Add(time.Hour)),
+	}
+	sameGroup := testLane()
+	sameGroup.Name = "lane-b"
+	sameGroup.Spec.CapacityGroup = "pool-a"
+	unrelated := testLane()
+	unrelated.Name = "lane-c"
+	unrelated.Spec.CapacityGroup = "pool-c"
+
+	for _, tc := range []struct {
+		name string
+		lane *courierv1alpha1.LaneProfile
+		want int
+	}{{"shared group is paused", sameGroup, 0}, {"unrelated group discovers", unrelated, 1}} {
+		t.Run(tc.name, func(t *testing.T) {
+			adapter := &testAdapter{items: []WorkItem{{ID: "opaque-a", Mode: "resolve-issue", Repo: "acme/widgets", Ref: 1}}}
+			kubeClient := newTestClient(t, exhausted, sameGroup, unrelated)
+			runner := NewRunner(kubeClient, adapter, RunnerConfig{Source: "dispatch", LaneProfile: tc.lane.Name, Namespace: "courier"})
+			runner.Now = func() time.Time { return now }
+			if err := runner.Poll(context.Background()); err != nil {
+				t.Fatal(err)
+			}
+			if adapter.discoverCalls != tc.want {
+				t.Fatalf("discovery ran %d times, want %d", adapter.discoverCalls, tc.want)
+			}
+		})
 	}
 }
 

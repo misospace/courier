@@ -80,6 +80,16 @@ const ConditionSoftStopObserved = "SoftStopObserved"
 // never acknowledged.
 const ConditionReasonUnacknowledged = "Unacknowledged"
 
+// ConditionCapacityRecovery is the status condition type the operator writes
+// on a capacity-exhaustion run to record the outcome of its fenced recovery
+// settlement with the source (#327). Status True with reason Settled means
+// the exhausted attempt was released with source-enforced fencing; False
+// with reason Unsupported, Stale, UnsafeWork, PendingWriters, or Retryable
+// records why it has not been (or will not be, without an operator). It is
+// written only for runs whose terminal diagnostic category is
+// capacity-exhaustion.
+const ConditionCapacityRecovery = "CapacityRecovery"
+
 // Phase is the lifecycle phase of a CoderRun.
 // +kubebuilder:validation:Enum=Pending;Claimed;Running;Verifying;AwaitingReview;HandedOff;NeedsHuman;Done;Failed;BlockedExternal
 type Phase string
@@ -190,7 +200,7 @@ type Heartbeat struct {
 // TerminalDiagnosticCategory is the stable classification of a terminal run's
 // cause, derived only from evidence the operator observed. Unknown is used
 // whenever evidence is missing or ambiguous; a cause is never invented.
-// +kubebuilder:validation:Enum=executor-crash;model-transport-error;continuation-exhaustion;verifier-rejection;kubernetes-failure;needs-decision;blocked-external;unknown
+// +kubebuilder:validation:Enum=executor-crash;model-transport-error;continuation-exhaustion;verifier-rejection;kubernetes-failure;needs-decision;blocked-external;capacity-exhaustion;unknown
 type TerminalDiagnosticCategory string
 
 const (
@@ -216,6 +226,9 @@ const (
 	// TerminalDiagnosticCategoryBlockedExternal: the coordinator declared it
 	// was blocked on an external prerequisite.
 	TerminalDiagnosticCategoryBlockedExternal TerminalDiagnosticCategory = "blocked-external"
+	// TerminalDiagnosticCategoryCapacityExhaustion is a structured, affirmative
+	// signal that execution capacity (not task correctness) was exhausted.
+	TerminalDiagnosticCategoryCapacityExhaustion TerminalDiagnosticCategory = "capacity-exhaustion"
 	// TerminalDiagnosticCategoryUnknown: the evidence was missing or
 	// ambiguous.
 	TerminalDiagnosticCategoryUnknown TerminalDiagnosticCategory = "unknown"

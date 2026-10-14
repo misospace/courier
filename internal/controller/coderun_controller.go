@@ -145,6 +145,13 @@ type CoderRunReconciler struct {
 	// run transitions to NeedsHuman. Zero uses the package default.
 	MaxRestarts int
 
+	// CapacityCooldownWindow is how long a capacity identity stays paused for
+	// new work after a confirmed execution-capacity exhaustion (#327). It is
+	// the operator's bounded re-claim control — never a provider-observed
+	// reset time, which Courier does not invent — and it never bounds a run
+	// already executing. Zero uses the package default.
+	CapacityCooldownWindow time.Duration
+
 	// Now is the reconciler's time source, injectable so tests never sleep.
 	// Nil falls back to time.Now.
 	Now func() time.Time
@@ -174,7 +181,8 @@ func (r *CoderRunReconciler) metrics() *RunRecorder {
 // +kubebuilder:rbac:groups=courier.misospace.dev,resources=coderruns,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=courier.misospace.dev,resources=coderruns/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups=courier.misospace.dev,resources=coderruns/finalizers,verbs=update
-// +kubebuilder:rbac:groups=courier.misospace.dev,resources=laneprofiles,verbs=get;list;watch
+// +kubebuilder:rbac:groups=courier.misospace.dev,resources=laneprofiles,verbs=get;list;watch;patch
+// +kubebuilder:rbac:groups=courier.misospace.dev,resources=laneprofiles/status,verbs=get;patch;update
 // +kubebuilder:rbac:groups="",resources=pods,verbs=get;list;watch;create;delete
 
 // Reconcile is the CoderRun control loop.
@@ -274,7 +282,7 @@ func (r *CoderRunReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 			}
 			return r.observeMergedReviewPR(ctx, &run)
 		}
-		if run.Status.Phase == courierv1alpha1.PhaseFailed || run.Status.Phase == courierv1alpha1.PhaseNeedsHuman {
+		if (run.Status.Phase == courierv1alpha1.PhaseFailed || run.Status.Phase == courierv1alpha1.PhaseNeedsHuman) && !isCapacityExhaustionRun(&run) {
 			// A Failed or NeedsHuman run is reaped only once its source
 			// lifecycle report reached a positive, settled state: while the
 			// report is pending the run is the only durable retry intent, and a
@@ -290,6 +298,17 @@ func (r *CoderRunReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 				return r.reapTerminal(ctx, &run, failedAtAnnotation, r.failedRetention(), true)
 			}
 			return r.reapTerminal(ctx, &run, needsHumanAtAnnotation, r.needsHumanRetention(), true)
+		}
+		if isCapacityExhaustionRun(&run) && capacityRecoveryPending(&run) {
+			// A capacity settlement left retryable (transient source error or
+			// writers still draining) is durable intent on the run: an
+			// operator restart re-derives it from the condition and retries
+			// here, after the lifecycle report itself has settled.
+			adapter, item, err := r.adapterAndWorkItem(&run)
+			if err != nil {
+				return ctrl.Result{}, err
+			}
+			return r.recoverCapacityExhaustion(ctx, &run, adapter, item)
 		}
 		l.V(1).Info("reconcile", "phase", run.Status.Phase)
 		return ctrl.Result{}, nil
@@ -309,6 +328,22 @@ func (r *CoderRunReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 	// lane, since lifting the annotation does not reconcile Pending runs.
 	if lane.Suspended() {
 		l.V(1).Info("lane suspended, run waits", "lane", run.Spec.Lane)
+		return ctrl.Result{RequeueAfter: capacityRequeueDelay}, nil
+	}
+	// An active capacity cooldown on this lane's capacity identity withholds
+	// admission too (#327): discovery is paused on the runner, but runs the
+	// runner materialized before the exhaustion must not be launched straight
+	// back into exhausted capacity. Runs already admitted (Claimed, Running)
+	// are never touched — the cooldown bounds re-claim, not execution.
+	var lanes courierv1alpha1.LaneProfileList
+	if err := r.List(ctx, &lanes, client.InNamespace(run.Namespace)); err != nil {
+		return ctrl.Result{}, err
+	}
+	if cooldown, active := courierv1alpha1.CapacityCooldownActive(&lane, lanes.Items, r.clock()); active {
+		l.V(1).Info("capacity cooldown active, run waits",
+			"lane", run.Spec.Lane,
+			"capacityID", lane.CapacityIdentity(),
+			"nextEligibleAt", cooldown.NextEligibleAt.Time)
 		return ctrl.Result{RequeueAfter: capacityRequeueDelay}, nil
 	}
 
@@ -1098,7 +1133,17 @@ func (r *CoderRunReconciler) publishTerminalLifecycle(ctx context.Context, run *
 	}
 	switch {
 	case err == nil:
-		return ctrl.Result{}, r.markLifecycleReportOutcome(ctx, run, true, "Published", "", retryToken, "Accepted")
+		if markErr := r.markLifecycleReportOutcome(ctx, run, true, "Published", "", retryToken, "Accepted"); markErr != nil {
+			return ctrl.Result{}, markErr
+		}
+		// A capacity-exhaustion ending is not finished with the source until
+		// the attempt is settled with fencing: the published report makes the
+		// work recoverable, and the fenced settlement releases this attempt's
+		// ownership so a compatible worker can take it (#327).
+		if isCapacityExhaustionRun(run) {
+			return r.recoverCapacityExhaustion(ctx, run, adapter, item)
+		}
+		return ctrl.Result{}, nil
 	case errors.Is(err, source.ErrSuperseded):
 		log.FromContext(ctx).Info("dropping superseded source lifecycle report",
 			"run", run.Name, "phase", phase, "error", err.Error())
@@ -1736,6 +1781,13 @@ const outcomeBlockedExternal = "blocked_external"
 // external block, or a guard refusal.
 const exitNeedsHuman = 2
 
+// outcomeCapacityExhausted is the executor's affirmative structured
+// declaration that execution capacity was confirmed exhausted (#320/#327).
+// It arrives only through the trusted termination handoff — never inferred
+// from transport status — and routes the run to the recoverable
+// BlockedExternal capacity path instead of a failure or a human park.
+const outcomeCapacityExhausted = "capacity_exhausted"
+
 // phaseForExit maps the executor's exit code and declared outcome to the run's
 // next phase. A fix-pr no_change_needed declaration is settled against the
 // world, not the coordinator's word: it is routed to Verifying, which reaches
@@ -1749,7 +1801,11 @@ func phaseForExit(mode courierv1alpha1.Mode, exitCode int32, outcome string) cou
 	case 0:
 		return courierv1alpha1.PhaseVerifying
 	case 2:
-		if outcome == outcomeBlockedExternal {
+		if outcome == outcomeBlockedExternal || outcome == outcomeCapacityExhausted {
+			// A confirmed capacity exhaustion is a recoverable wait on an
+			// external resource, not a verdict on the work and not a human
+			// park; the diagnostic category keeps it distinguishable from a
+			// task-shaped external block (#327).
 			return courierv1alpha1.PhaseBlockedExternal
 		}
 		return courierv1alpha1.PhaseNeedsHuman

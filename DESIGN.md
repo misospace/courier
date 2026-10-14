@@ -167,6 +167,8 @@ A coordinator run ends after one of:
   Coordinator-declared blocks include a redacted issue/PR comment and a blocked
   source report.
 
+Capacity-exhaustion recovery is an authoritative source boundary: after uncached topology observation and cooldown, an adapter must explicitly prepare a source-owned receipt proving the current claim/generation and that trusted workspace/remote state holds every partial write. The operator then submits that receipt to an atomic, idempotent source settlement. Missing capability or incomplete proof keeps ownership held; run identity, evidence absence, and model declarations are not proof. No production adapter currently implements this verifier, so production recovery remains safely unsupported.
+
 External verification can later reach a separate outcome: stable green advances
 **Verifying** to **AwaitingReview**; a red check on a fix-pr run ends it as
 **Failed** and emits a failed lifecycle result, while a resolve-issue run whose
@@ -244,6 +246,38 @@ harness with trusted control, a credential-holding policy-enforcing broker, and
 an untrusted isolated worker. Its contract and outstanding blockers are detailed
 in [HARNESS.md](./HARNESS.md); describing that target does not imply that its
 executor or worker isolation is implemented or production-ready.
+
+## Capacity exhaustion and cross-worker recovery (#327)
+
+A structured `capacity_exhausted` outcome is distinct from task failure, an
+external task prerequisite, and a human decision. It is accepted only when the
+executor/runtime positively classifies capacity exhaustion; Courier does not
+infer it from HTTP 429 or provider text. The operator records a recoverable
+`BlockedExternal` terminal diagnostic and starts a durable, idempotent handoff.
+
+`LaneProfile.spec.capacityGroup` optionally names lanes sharing an execution
+capacity identity; otherwise the lane name is the identity. Confirmed
+exhaustion persists a default 15-minute cooldown on LaneProfile status. Source
+discovery and admission pause only for that identity; already-running work and
+unrelated pools continue. The interval is an anti-hammering window, not a
+provider reset estimate. Operators may inspect the `CapacityRecovery`
+condition and LaneProfile `capacityCooldown` status.
+
+Before settlement, the controller reads run pods through the uncached API
+reader and fails closed if any topology writer is running, pending, unknown, or
+terminating. A source may implement optional `CapacityRecoveryPreparer` and
+`CapacityRecovery` interfaces: prepare supplies opaque source fencing and an
+affirmative trusted safety proof; settle atomically applies it. Incomplete proof,
+unsupported capability, or stale fencing retains ownership. Transient settlement
+errors are retried with the same run-scoped idempotency key after controller
+reconstruction. The fake contract exercises both resolve-issue and fix-PR paths,
+including preserved branch/PR metadata; it is not production evidence. The
+Dispatch adapter still lacks these interfaces (#1256), so production Dispatch
+recovery remains unsupported. Discovery and dedupe bypass history only for a
+`BlockedExternal` capacity-exhaustion run with `CapacityRecovery=True/Settled`
+and `LifecycleReported=True`; the exact consumed `WorkItemID` remains
+suppressed, requiring a fresh opaque attempt ID. Other, incomplete, and human
+histories remain barriers. Retained terminal history is never deleted.
 
 ## Contention and concurrency
 
@@ -1364,10 +1398,16 @@ terminal phase with the report retried on a later reconcile. (#178)
 ## Cross-worker capacity recovery (#327)
 
 Confirmed execution-resource exhaustion is distinct from a task blocker and an
-unknown failure. The source-neutral core may expose an optional recovery
-capability, but it must not infer exhaustion from HTTP status alone, release
-ownership through ordinary `Release`, or clear a human hold. Source adapters
-own fenced settlement tokens and report unsupported capability explicitly.
+unknown failure. `TerminalDiagnosticCategoryCapacityExhaustion` is the durable
+structured signal vocabulary, and `source.CapacityRecovery` is the optional
+adapter boundary for fenced settlement. Neither is inferred from HTTP status
+alone, and neither permits ordinary `Release` or clearing a human hold. The
+executor recognizes the structured `capacity_exhausted` outcome, maps it to
+`BlockedExternal`, and retains the capacity diagnostic. Provider-specific
+classification remains separate (#320); unknown failures and plain HTTP 429
+responses do not authorize recovery. The operator invokes optional adapter
+preparation and settlement only after an uncached read confirms all run pods
+are inert. Adapters without those capabilities fail closed with diagnostics.
 
 A safe handoff requires durable source fencing, not simply lease expiry: the
 old attempt must be unable to settle after a replacement claim, while the new
@@ -1375,21 +1415,27 @@ attempt reuses the existing branch/PR and preserves pushed partial work. Dirty
 unpushed work must be durably handed off or retained by the old owner; absent
 that mechanism, recovery fails closed and does not release ownership. Cooldown
 belongs to the exhausted capacity profile, so unrelated profiles remain
-eligible. The recovery contract requires terminal history to remain diagnostic
-without suppressing a fresh eligible attempt; today's same-identity terminal
-run deduplication still applies until #327 is implemented.
+eligible. Namespace-wide discovery and admission consult all profiles sharing
+`capacityGroup`; unrelated capacity remains eligible. The default cooldown is
+15 minutes, a retry-control window rather than a claimed provider reset time.
+Retries of the same exhaustion do not extend its deadline. Successfully settled
+exhaustion history permits rediscovery with a fresh opaque source attempt ID;
+the consumed ID remains excluded, and the old run is retained for diagnostics.
 
-The current Dispatch contract does not satisfy these requirements: issue
-unclaim is not bound to a claim generation/token, and PR-fix lacks a capacity
-handoff mark. Courier does not simulate fencing with the existing lifecycle
-or release calls. [Dispatch dependency #1256](https://github.com/misospace/dispatch/issues/1256)
-tracks the required API and tests; until it lands, automatic cross-worker
-release is unsupported for Dispatch. Its existing generation-fenced
-`WAITING_EXTERNAL` mark preserves task-repair budget, but a queue-wide timed
-retry is not a capacity-scoped cross-worker handoff. The proposed optional
-recovery capability, capacity cooldown, and runtime unsupported-capability
-reporting are not implemented by this design change. Other source adapters
-continue their existing behavior.
+Dispatch and Courier are independent systems connected by an adapter, not hard
+dependencies. The current Dispatch contract does not satisfy fenced capacity
+settlement: issue unclaim is not bound to claim generation/token, and PR-fix
+lacks a capacity handoff mark. Courier must not simulate fencing with ordinary
+lifecycle or release calls. [Dispatch #1256](https://github.com/misospace/dispatch/issues/1256)
+tracks that connector gap; it does not block source-neutral core work. The core
+requires `CapacityRecoveryPreparer` to return an authoritative source-owned
+claim receipt and affirmative workspace-safety proof, then invokes atomic
+`CapacityRecovery` settlement with a stable idempotency key. Missing or incomplete
+proof holds ownership; evidence absence and a run UID are not proof. The adapter
+must preserve existing branch/PR identity and safely account for unpushed work.
+No production connector currently implements this verification and settlement
+pair. Core regression coverage uses a capable fake source; this change does not
+claim automatic recovery through Dispatch or automatic dirty-work transfer.
 
 Operator recovery remains manual and item-specific:
 
@@ -1406,8 +1452,9 @@ Operator recovery remains manual and item-specific:
   release/reclaim races or bulk requeues with that endpoint.
 - Confirm the replacement uses the existing branch/PR and fresh source attempt
   identity. Retain the old run and diagnostics; do not delete history to bypass
-  rediscovery. Automatic discovery/admission and retained-history changes remain
-  implementation work under #327 after the source contract is available.
+  rediscovery. Capable connectors can use the implemented core settlement and
+  fresh-attempt discovery path; unsupported connectors still require manual
+  recovery and must not emulate atomic fencing with ordinary release calls.
 
 ## Sources
 
@@ -2869,16 +2916,19 @@ was superseded.
   terminalization remains #277. This absorbs the #276 brief; retry and
   escalation stay source-owned. (#287, #251, #276, #250)
 
-- **2026-10-13 — #327: cross-worker capacity recovery requires fenced source
-  settlement; ordinary release is unsafe.** A generic core signal may identify
-  confirmed capacity exhaustion, but adapters must settle the exact owner and
-  attempt generation before another worker can write. Dispatch's existing
-  issue unclaim and PR-fix marks do not provide the necessary shared fenced
-  capacity handoff, so Courier fails closed rather than claiming this guarantee
-  or treating lease expiry as label cleanup. Dispatch dependency #1256 records
-  the API contract. Preserve pushed branch/PR work and human holds; unpushed
-  work needs durable transfer before ownership changes. Cooldown is capacity-
-  scoped, while terminal history remains diagnostic rather than a dedupe lock.
+- **2026-10-13 — #327: capacity recovery is source-neutral in core and fenced
+  at the adapter boundary.** The operator accepts only a structured positive
+  capacity-exhaustion classification, records a durable recoverable diagnostic,
+  pauses discovery/admission for the lane's capacity identity (default 15
+  minutes), waits for writers to stop, and refuses handoff when failure evidence
+  leaves unpushed work unresolved. A source must atomically fence the exact
+  owner/generation and make work eligible without consuming task-repair budget
+  or overriding a human hold; ordinary Release is never a substitute. The
+  optional capability has durable retry/status semantics and the core reports
+  unsupported or stale settlement without changing ownership. The current
+  Dispatch adapter lacks that contract, so the cross-worker guarantee is not
+  yet available for Dispatch; connector issue #1256 tracks the missing API.
+  Prior branch/PR identity and terminal history remain untouched. (#327)
 
 - **2026-10-13 — #287 review: the audit floor counts only the phases it
   governs, and the reap counter counts accepted deletes rather than removals.**

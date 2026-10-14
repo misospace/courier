@@ -674,6 +674,7 @@ spec:
                     - kubernetes-failure
                     - needs-decision
                     - blocked-external
+                    - capacity-exhaustion
                     - unknown
                     type: string
                   container:

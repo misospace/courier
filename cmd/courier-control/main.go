@@ -24,6 +24,7 @@ import (
 	"time"
 	"unicode/utf8"
 
+	courierv1alpha1 "github.com/misospace/courier/api/v1alpha1"
 	"github.com/misospace/courier/internal/executor"
 	"github.com/misospace/courier/internal/harness"
 	"github.com/misospace/courier/internal/protocol"
@@ -39,6 +40,11 @@ type termination struct {
 	ExitCode int32  `json:"exit_code"`
 	Reason   string `json:"reason"`
 	Outcome  string `json:"outcome,omitempty"`
+	// Category is the structured diagnostic vocabulary the operator persists
+	// verbatim when it is one it knows (TerminalDiagnosticCategory). Only
+	// fixed, code-owned strings travel here — never provider response bodies
+	// or model text.
+	Category string `json:"category,omitempty"`
 }
 
 // Probe retry rounds and delay are bounded infrastructure retries covering a
@@ -242,6 +248,7 @@ func terminationFor(result executor.HarnessResult) termination {
 	phase := "Failed"
 	handoffResult := "failure"
 	outcome := ""
+	category := ""
 	switch {
 	case result.Err != nil && result.Outcome == executor.OutcomeChanges:
 		// Declared changes, publication failed: infrastructure failure that
@@ -256,6 +263,14 @@ func terminationFor(result executor.HarnessResult) termination {
 		exit, phase, handoffResult, outcome = 3, "NoChangeNeeded", "success", string(result.Outcome)
 	case result.Outcome == executor.OutcomeNeedsDecision, result.Outcome == executor.OutcomeBlockedExternal:
 		exit, phase, handoffResult, outcome = 2, "NeedsHuman", "needs-human", string(result.Outcome)
+	case result.Outcome == executor.OutcomeCapacityExhausted:
+		// Confirmed execution-capacity exhaustion travels as its own
+		// structured signal: exit 2 keeps the handoff vocabulary valid, the
+		// outcome routes the operator to the recoverable capacity path, and
+		// the category is the durable diagnostic (#320/#327). The operator
+		// never sees this as a failure exit or a human park.
+		exit, phase, handoffResult, outcome = 2, "NeedsHuman", "needs-human", string(result.Outcome)
+		category = string(courierv1alpha1.TerminalDiagnosticCategoryCapacityExhaustion)
 	}
 	return termination{
 		Phase:    phase,
@@ -263,6 +278,7 @@ func terminationFor(result executor.HarnessResult) termination {
 		ExitCode: exit,
 		Reason:   boundReason(reason),
 		Outcome:  outcome,
+		Category: category,
 	}
 }
 

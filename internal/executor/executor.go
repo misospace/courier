@@ -101,6 +101,14 @@ const (
 	OutcomeNeedsDecision DeclaredOutcome = "needs_decision"
 	// OutcomeBlockedExternal: something outside the run is missing.
 	OutcomeBlockedExternal DeclaredOutcome = "blocked_external"
+	// OutcomeCapacityExhausted: the execution capacity itself (a provider
+	// allowance, credential pool, or local hardware pool) is confirmed
+	// exhausted (#320/#327). This is an affirmative structured declaration
+	// from a runtime that verified exhaustion — never inferred from an HTTP
+	// status like 429, and never a verdict on the work itself. The operator
+	// routes it to the recoverable capacity-recovery path, not to a failure
+	// or a human park.
+	OutcomeCapacityExhausted DeclaredOutcome = "capacity_exhausted"
 )
 
 // HarnessResult is what a native harness reports when its execution ends.

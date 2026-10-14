@@ -113,6 +113,7 @@ func knownTerminalDiagnosticCategory(category courierv1alpha1.TerminalDiagnostic
 		courierv1alpha1.TerminalDiagnosticCategoryKubernetesFailure,
 		courierv1alpha1.TerminalDiagnosticCategoryNeedsDecision,
 		courierv1alpha1.TerminalDiagnosticCategoryBlockedExternal,
+		courierv1alpha1.TerminalDiagnosticCategoryCapacityExhaustion,
 		courierv1alpha1.TerminalDiagnosticCategoryUnknown:
 		return true
 	default:
@@ -133,6 +134,10 @@ func classifyTerminalDiagnostic(handoffCategory string, exitCode *int32, outcome
 		return courierv1alpha1.TerminalDiagnosticCategoryNeedsDecision
 	case "blocked_external":
 		return courierv1alpha1.TerminalDiagnosticCategoryBlockedExternal
+	case outcomeCapacityExhausted:
+		// The trusted outcome vocabulary alone establishes the category; no
+		// transport-status heuristic participates (#320/#327).
+		return courierv1alpha1.TerminalDiagnosticCategoryCapacityExhaustion
 	}
 	if exitCode != nil && *exitCode != 0 && *exitCode != exitDeclaredNoChange && *exitCode != exitNeedsHuman {
 		// A non-success exit that is neither a declared no-change nor a
@@ -187,6 +192,8 @@ func categoryDiagnosticReason(category courierv1alpha1.TerminalDiagnosticCategor
 		return "coordinator exhausted its continuation budget"
 	case courierv1alpha1.TerminalDiagnosticCategoryKubernetesFailure:
 		return "coordinator pod failed at the Kubernetes or container layer"
+	case courierv1alpha1.TerminalDiagnosticCategoryCapacityExhaustion:
+		return "execution capacity was confirmed exhausted"
 	case courierv1alpha1.TerminalDiagnosticCategoryExecutorCrash:
 		return "coordinator exited without a valid handoff"
 	case courierv1alpha1.TerminalDiagnosticCategoryUnknown:

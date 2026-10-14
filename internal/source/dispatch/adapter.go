@@ -51,6 +51,16 @@ type API = Client
 
 // Adapter translates Courier's generic source lifecycle into Dispatch API
 // calls.
+//
+// The adapter deliberately does NOT implement source.CapacityRecovery: the
+// current Dispatch contract cannot fence settlement — issue unclaim is not
+// bound to a claim generation/token, and the PR-fix queue has no capacity
+// handoff mark. Simulating fenced settlement with the existing Release or
+// lifecycle calls would let a stale attempt move a replacement's ownership,
+// so capacity-exhausted work on Dispatch keeps its BlockedExternal lifecycle
+// (a recoverable wait, no task-repair budget consumed) and its operator-side
+// recovery procedure until the connector gains real fencing.
+// Connector gap: misospace/dispatch#1256.
 type Adapter struct {
 	client Client
 }

@@ -2081,7 +2081,7 @@ func phaseClient(t *testing.T, objects ...runtime.Object) client.Client {
 	}
 	return fake.NewClientBuilder().
 		WithScheme(scheme).
-		WithStatusSubresource(&courierv1alpha1.CoderRun{}).
+		WithStatusSubresource(&courierv1alpha1.CoderRun{}, &courierv1alpha1.LaneProfile{}).
 		WithRuntimeObjects(objects...).
 		Build()
 }

@@ -18,6 +18,18 @@ var ErrStaleWork = errors.New("source: work item is stale")
 // dropped rather than retried: the newer generation belongs to another run.
 var ErrSuperseded = errors.New("source: work item superseded")
 
+// ErrStaleCapacitySettlement means a fenced capacity settlement named an
+// attempt that no longer owns the work: a replacement claimed it (or the
+// source advanced a generation), so the settlement is refused without touching
+// the current owner. The exhausted attempt records it and stops retrying.
+var ErrStaleCapacitySettlement = errors.New("source: capacity settlement is stale for the current owner")
+
+// ErrUnsupportedCapacityRecovery means the source cannot represent a fenced
+// capacity settlement at all. It is permanent for this adapter: the core
+// records it as a diagnostic and must never fall back to ordinary Release or
+// lifecycle transitions to imitate fencing.
+var ErrUnsupportedCapacityRecovery = errors.New("source: fenced capacity recovery is unsupported")
+
 // ErrUnsupportedOutcome means the source does not accept a lifecycle result.
 // The report intent stays pending, but automatic retries stop until an
 // operator supplies a new explicit retry token on the CoderRun.
@@ -126,6 +138,73 @@ type Lifecycle struct {
 	// StartedAt is the coordinator container start time, reported so sources
 	// can record real run durations; optional.
 	StartedAt *time.Time
+}
+
+// CapacityRecoveryAttempt is the immutable attempt identity supplied to a source
+// before it vouches that recovery is safe. It is correlation only, never a fence.
+type CapacityRecoveryAttempt struct {
+	RunUID         string
+	IdempotencyKey string
+}
+
+// CapacityRecoveryProof is an authoritative, source-owned receipt for one
+// safe handoff. FenceToken must be opaque and generated/validated by the source;
+// WorkIdentity and SafetyProof affirm the existing source work and that remote
+// state holds every partial write. Adapters must verify the current claim /
+// generation and trusted workspace/remote safety. Absence of evidence and a
+// fabricated run UID are never proof. Missing or incomplete proof fails closed.
+type CapacityRecoveryProof struct {
+	FenceToken   string
+	WorkIdentity string
+	SafetyProof  string
+	Branch       string
+	PR           string
+}
+
+// CapacityRecoveryPreparer is an explicit optional capability. Preparation
+// must check source claim generation and trusted workspace/remote safety; it
+// must not infer safety from missing evidence or untrusted model declarations.
+type CapacityRecoveryPreparer interface {
+	PrepareCapacityRecovery(context.Context, WorkItem, CapacityRecoveryAttempt) (CapacityRecoveryProof, error)
+}
+
+// CapacityHandoff is the fenced settlement identity of exactly one exhausted
+// attempt. FenceToken is presented by the attempt that holds the claim; the
+// source must compare it against its ownership record and refuse any token
+// that a replacement attempt or an older generation now invalidates. It is
+// opaque to the core, which derives it from the immutable run incarnation and
+// never from model, worker, or lane names. IdempotencyKey lets the source
+// collapse retries of the same settlement into one transition; it is stable
+// across reconciles and operator retries of the same attempt.
+type CapacityHandoff struct {
+	// FenceToken identifies the exact claimed attempt. It is never valid for
+	// a replacement attempt to present another attempt's token, and a source
+	// with real fencing rejects a token whose claim it no longer records.
+	FenceToken string
+	// IdempotencyKey identifies this settlement so a retried call cannot
+	// settle or release the same attempt twice.
+	IdempotencyKey string
+	// Existing work identity carried forward for a compatible new attempt.
+	WorkIdentity string
+	Branch       string
+	PR           string
+}
+
+// CapacityRecovery is the optional fenced settlement boundary for confirmed
+// execution-capacity exhaustion (#327). SettleCapacityExhaustion must, in one
+// atomic source-side transition, stop exactly the named attempt from owning
+// the work and make the work discoverable again for a compatible worker —
+// without consuming the genuine task-repair attempt budget, without touching
+// an explicit human hold, and without resolving anything. It returns
+// ErrStaleCapacitySettlement when the current ownership record no longer
+// matches the handoff's fence, and ErrUnsupportedCapacityRecovery when the
+// source cannot fence at all. Adapters whose source cannot provide atomic
+// fenced settlement must not implement this interface, and must never
+// emulate it with ordinary Claim/Release/Transition calls: the core treats a
+// missing implementation as unsupported, records that on the run, and leaves
+// ownership exactly as it was.
+type CapacityRecovery interface {
+	SettleCapacityExhaustion(context.Context, WorkItem, CapacityHandoff) error
 }
 
 // Reporter optionally publishes lifecycle results in addition to ordinary
