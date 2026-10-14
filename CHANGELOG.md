@@ -1,5 +1,51 @@
 # Changelog
 
+## [0.1.9](https://github.com/misospace/courier/compare/v0.1.8...v0.1.9) (2026-10-14)
+
+
+### Features
+
+* **admission:** pin the trusted acceptance-criterion set at run admission ([#316](https://github.com/misospace/courier/issues/316)) ([5aaaffa](https://github.com/misospace/courier/commit/5aaaffac7a8a19a9ba924fd9effb28a4bec78a85))
+* **broker:** enforce the criterion-evidence contract at native PR publication ([#333](https://github.com/misospace/courier/issues/333)) ([a7b5bab](https://github.com/misospace/courier/commit/a7b5babd79de0e5c82c4c7797a6782c325efe827))
+* **controller:** finish AwaitingReview runs when the linked PR merges ([#250](https://github.com/misospace/courier/issues/250)) ([#314](https://github.com/misospace/courier/issues/314)) ([5fd3a69](https://github.com/misospace/courier/commit/5fd3a69eae6ee793df4e991f9f95837e47325b77))
+* **controller:** reap terminal Failed and NeedsHuman CoderRuns ([#287](https://github.com/misospace/courier/issues/287)) ([#319](https://github.com/misospace/courier/issues/319)) ([2d42cc4](https://github.com/misospace/courier/commit/2d42cc49fa80f584dc1723c7f539246b44e61166))
+* operator soft-stop control request with a checkpoint-safe stop boundary ([#315](https://github.com/misospace/courier/issues/315)) ([0419240](https://github.com/misospace/courier/commit/04192406c8bb74601d6e725f3be9a7531ba23058))
+* **recovery:** add source-neutral capacity handoff and cooldown ([#327](https://github.com/misospace/courier/issues/327)) ([#328](https://github.com/misospace/courier/issues/328)) ([2b98272](https://github.com/misospace/courier/commit/2b98272ee5cf38f3fd8cfa413ae45d62c99d6756))
+
+
+### Bug Fixes
+
+* **control:** fit COURIER_TERMINATION line to the 4 KiB pod budget ([#210](https://github.com/misospace/courier/issues/210)) ([#298](https://github.com/misospace/courier/issues/298)) ([687750e](https://github.com/misospace/courier/commit/687750ec2e489a4ceb137a3f744e2f3fe0dafc44))
+* **controller:** bound secure relaunches by the configured ceiling ([#216](https://github.com/misospace/courier/issues/216)) ([#305](https://github.com/misospace/courier/issues/305)) ([1b0629e](https://github.com/misospace/courier/commit/1b0629ebea7ad0a27a91731e7210af6950c79180))
+* **controller:** scope the wedge reap to the coordinator, fence the secure round ([#309](https://github.com/misospace/courier/issues/309)) ([964d3e5](https://github.com/misospace/courier/commit/964d3e57463a926215d86ed807ac37dad42d0833))
+* **controller:** stay Claimed when a relaunch collides with a terminating pod ([#217](https://github.com/misospace/courier/issues/217)) ([#294](https://github.com/misospace/courier/issues/294)) ([cae30f4](https://github.com/misospace/courier/commit/cae30f40e330a0b43ac2ad471fcd1eae3450c787))
+* **discovery:** truncate PR-fix exclusions to contract max instead of failing closed ([#293](https://github.com/misospace/courier/issues/293)) ([48b0ef7](https://github.com/misospace/courier/commit/48b0ef7ebea141a47b001df47f52326fb4980cc6))
+* **dispatch:** map stale-mark generation mismatch to ErrSuperseded ([#304](https://github.com/misospace/courier/issues/304)) ([d6afbee](https://github.com/misospace/courier/commit/d6afbee3f27bd01d404797cb353ae4c0883a18b1))
+* **evidence:** close the Lstat→Open symlink-swap race with an O_NOFOLLOW read ([#338](https://github.com/misospace/courier/issues/338)) ([0be7d4f](https://github.com/misospace/courier/commit/0be7d4f259ce3eceec0010aabe19e090cf90c631)), closes [#237](https://github.com/misospace/courier/issues/237)
+* **executor:** make git commit identity configurable ([#321](https://github.com/misospace/courier/issues/321)) ([87e081f](https://github.com/misospace/courier/commit/87e081f2a26b50c2e4d69c0a079f95e5f3d94617))
+* **harness:** treat model-provider allowance exhaustion as recoverable ([#322](https://github.com/misospace/courier/issues/322)) ([948c629](https://github.com/misospace/courier/commit/948c629b20166e05b78bdffb5f253598ce67d328))
+* **operator:** bound startup credential Secret reads with a context deadline ([#311](https://github.com/misospace/courier/issues/311)) ([abb4c5c](https://github.com/misospace/courier/commit/abb4c5cbeb833fc6581dd5bbd3be88b94d0a9493)), closes [#229](https://github.com/misospace/courier/issues/229)
+
+
+### Chores
+
+* **container:** update image golang (007a316 → 8201530) ([#329](https://github.com/misospace/courier/issues/329)) ([c962f3c](https://github.com/misospace/courier/commit/c962f3cd7dd6b80aa567e5540a8cc8f34f049791))
+* **container:** update image golang (5bc7f57 → 007a316) ([#310](https://github.com/misospace/courier/issues/310)) ([c3a9bc9](https://github.com/misospace/courier/commit/c3a9bc977fa535348644bea7571db09ec49e4ace))
+* **control:** make gate failures nil-safe and reason truncation rune-safe ([#307](https://github.com/misospace/courier/issues/307)) ([7653499](https://github.com/misospace/courier/commit/7653499ec9fe50618485fd2f631706cd53cd6b13)), closes [#219](https://github.com/misospace/courier/issues/219)
+* **deps:** tidy go.sum and gate the static job on tidy drift ([#308](https://github.com/misospace/courier/issues/308)) ([a1d1e7c](https://github.com/misospace/courier/commit/a1d1e7cd82cf55f6d2f5dfb45d97de9ff9d6c18e))
+
+
+### Documentation
+
+* **harness:** settle context budgets and step-boundary compaction ([#243](https://github.com/misospace/courier/issues/243)) ([#299](https://github.com/misospace/courier/issues/299)) ([764205f](https://github.com/misospace/courier/commit/764205f8e189f3763c2a35413fbbe59aa055d81a))
+* **harness:** settle the acceptance-criterion evidence contract ([#249](https://github.com/misospace/courier/issues/249)) ([#283](https://github.com/misospace/courier/issues/283)) ([2d1ff01](https://github.com/misospace/courier/commit/2d1ff01642b532c2f96c07e1d9b5acb1ff501dc2))
+* match the failure-evidence runbook to shipped behavior ([#300](https://github.com/misospace/courier/issues/300)) ([bc81b02](https://github.com/misospace/courier/commit/bc81b027096d8f649af8911cbaf7fa8060d0030f))
+* settle terminal retention and closed-unmerged lifecycle design ([#251](https://github.com/misospace/courier/issues/251)) ([#278](https://github.com/misospace/courier/issues/278)) ([ab00098](https://github.com/misospace/courier/commit/ab000982692c7b6388733b456c1ed26bfc936bcd))
+* specify connector diagnostics without core coupling ([#291](https://github.com/misospace/courier/issues/291)) ([#302](https://github.com/misospace/courier/issues/302)) ([77faa33](https://github.com/misospace/courier/commit/77faa332f323fb57366d5cdac749524b4a15dd98))
+* specify portable dashboard and alert views ([#292](https://github.com/misospace/courier/issues/292)) ([#301](https://github.com/misospace/courier/issues/301)) ([d6ad3c8](https://github.com/misospace/courier/commit/d6ad3c8e94e13d5d3ae0941bddd233d5efdad4d8))
+* specify source-agnostic telemetry and health semantics ([#290](https://github.com/misospace/courier/issues/290)) ([#303](https://github.com/misospace/courier/issues/303)) ([3804878](https://github.com/misospace/courier/commit/38048782cd5d371588d942621ae00e33f8b09216))
+* state the git &gt;= 2.41 minimum required by harness artifact validation ([#235](https://github.com/misospace/courier/issues/235)) ([#313](https://github.com/misospace/courier/issues/313)) ([93bbf4b](https://github.com/misospace/courier/commit/93bbf4bb486bf4b1292d36c9c0175b9e9570e718))
+
 ## [0.1.8](https://github.com/misospace/courier/compare/v0.1.7...v0.1.8) (2026-10-12)
 
 
