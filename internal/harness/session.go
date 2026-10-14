@@ -75,6 +75,12 @@ const maxStreamRetries = 3
 // retryBackoff spaces out in-process infra retries.
 const retryBackoff = 250 * time.Millisecond
 
+// maxInProcessRetryAfter bounds how long a single incarnation honors an
+// authoritative Retry-After hint before handing the run back to the source.
+// A longer hint is a resource-availability condition, not something to spin
+// on in-process (#320).
+const maxInProcessRetryAfter = 5 * time.Second
+
 // Session is one role-bound model conversation. It owns the normalized
 // transcript and turns provider streams into events; every message it
 // accepts or produces is data.
@@ -119,27 +125,44 @@ func (s *Session) Turn(ctx context.Context, tools []ToolDef) []Event {
 			s.recordActivity(events)
 			return events
 		}
-		if !retryableTurnError(terminal.Err) || attempt >= maxStreamRetries {
-			return events
+		if delay, retry := turnRetryDelay(terminal.Err); retry && attempt < maxStreamRetries {
+			// Infra retry backoff: bounded, transport-class, not a model cap.
+			// The delay honors an authoritative Retry-After hint when it is
+			// short enough to wait out in-process.
+			select {
+			case <-ctx.Done():
+				return events
+			case <-time.After(delay):
+			}
+			continue
 		}
-		// Infra retry backoff: bounded, transport-class, not a model cap.
-		select {
-		case <-ctx.Done():
-			return events
-		case <-time.After(retryBackoff):
-		}
+		return events
 	}
 }
 
-// retryableTurnError reports whether a terminal stream error is transient:
-// transport-class failures and retryable gateway statuses.
-func retryableTurnError(err error) bool {
+// turnRetryDelay reports whether a terminal stream error is worth retrying
+// in-process and how long to wait first. Transport failures and retryable
+// gateway statuses (5xx, request timeout, a plain 429) retry; a confirmed
+// allowance exhaustion or other classified permanent failure does not. An
+// authoritative Retry-After hint longer than maxInProcessRetryAfter is not
+// waited on in-process — the run ends recoverable and the source re-offers.
+func turnRetryDelay(err error) (time.Duration, bool) {
 	var transportErr *GatewayTransportError
 	if errors.As(err, &transportErr) {
-		return true
+		return retryBackoff, true
 	}
 	var gatewayErr *GatewayError
-	return errors.As(err, &gatewayErr) && isTransientGatewayStatus(gatewayErr.Status)
+	if !errors.As(err, &gatewayErr) {
+		return 0, false
+	}
+	classification := gatewayErr.classification()
+	if !classification.Retryable || classification.RetryAfter > maxInProcessRetryAfter {
+		return 0, false
+	}
+	if classification.RetryAfter > 0 {
+		return classification.RetryAfter, true
+	}
+	return retryBackoff, true
 }
 
 // recordActivity marks earned stream activity once per successful turn that

@@ -104,7 +104,15 @@ func runArgs(args []string) error {
 	if err != nil {
 		return fmt.Errorf("courier-control: lane roles: %w", err)
 	}
-	gateway := &harness.Gateway{BaseURL: os.Getenv(topology.EnvGatewayURL)}
+	gateway := &harness.Gateway{
+		BaseURL: os.Getenv(topology.EnvGatewayURL),
+		// Provider-specific exhaustion codes are deployment configuration:
+		// the provider-neutral defaults are extended, never replaced (#320).
+		ExhaustionSignals: harness.ParseExhaustionSignals(
+			os.Getenv("COURIER_MODEL_EXHAUSTION_CODES"),
+			os.Getenv("COURIER_MODEL_EXHAUSTION_TYPES"),
+		),
+	}
 	if keyFile := os.Getenv(topology.EnvGatewayKeyFile); keyFile != "" {
 		key, err := os.ReadFile(keyFile)
 		if err != nil || len(key) == 0 {
@@ -147,6 +155,13 @@ func runArgs(args []string) error {
 		}
 		reason, retryable := classifyGateFailure(err)
 		if !retryable || attempt >= probeRetryRounds {
+			// A confirmed provider allowance exhaustion is a recoverable
+			// resource-availability condition, not a human decision: declare
+			// a blocked-external ending so the source re-offers the work once
+			// capacity returns (#320).
+			if exhaustedGate(err) {
+				return declareBlockedExternal(reason, caps)
+			}
 			return declareNeedsHuman(reason, caps)
 		}
 		fmt.Printf("transient capability failure, re-probing: %s\n", reason)
@@ -221,6 +236,14 @@ func classifyGateFailure(err error) (reason string, retryable bool) {
 	return gateErr.Error(), gateErr.AllRetryable()
 }
 
+// exhaustedGate reports whether a gate failure is a confirmed provider
+// allowance exhaustion. Such a failure is recoverable and must declare a
+// blocked-external ending rather than NeedsHuman (#320).
+func exhaustedGate(err error) bool {
+	var gateErr *harness.GateError
+	return errors.As(err, &gateErr) && gateErr.Exhausted()
+}
+
 // declare maps the harness result onto the operator's exit contract:
 // changes exits 0 (Verifying), no_change_needed exits 3 (AwaitingReview),
 // needs_decision and blocked_external exit 2 (NeedsHuman), and an
@@ -291,6 +314,20 @@ func handoff(payload termination) error {
 	}
 	os.Exit(int(payload.ExitCode))
 	return nil
+}
+
+// declareBlockedExternal writes a structured blocked-external handoff with the
+// capability table as the reason, then exits 2. The operator maps exit 2 plus
+// the blocked_external outcome to a recoverable external-dependency block, so
+// a confirmed provider allowance exhaustion waits for capacity instead of
+// parking the run for a human (#320).
+func declareBlockedExternal(reason string, caps []harness.Capability) error {
+	table, _ := json.Marshal(caps)
+	fmt.Printf("capability health: %s\n", table)
+	return handoff(terminationFor(executor.HarnessResult{
+		Outcome: executor.OutcomeBlockedExternal,
+		Reason:  reason,
+	}))
 }
 
 // declareNeedsHuman writes the structured NeedsHuman handoff with the

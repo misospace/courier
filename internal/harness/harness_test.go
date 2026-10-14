@@ -32,6 +32,10 @@ type chatRecord struct {
 type gatewayResponse struct {
 	status int // 0 means 200 with an SSE body
 	body   string
+	// errBody overrides the default provider error body on a non-2xx
+	// response; header adds response headers (for example Retry-After).
+	errBody string
+	header  http.Header
 }
 
 type mockGateway struct {
@@ -67,8 +71,17 @@ func (m *mockGateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if response.status != 0 {
 		// The body content is never echoed into harness errors; make it
 		// recognizable so redaction tests can assert it stays out.
+		for key, values := range response.header {
+			for _, value := range values {
+				w.Header().Add(key, value)
+			}
+		}
 		w.WriteHeader(response.status)
-		fmt.Fprint(w, `{"error":{"message":"super-secret-provider-detail","type":"provider_error"}}`)
+		body := response.errBody
+		if body == "" {
+			body = `{"error":{"message":"super-secret-provider-detail","type":"provider_error"}}`
+		}
+		fmt.Fprint(w, body)
 		return
 	}
 	w.Header().Set("Content-Type", "text/event-stream")
