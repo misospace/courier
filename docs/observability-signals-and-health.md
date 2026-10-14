@@ -236,15 +236,26 @@ window runs from its own durable marker (`courier.misospace.dev/done-at`,
 `failed-at`, `needs-human-at`, `internal/controller/reap.go:24-26`) rather than
 `creationTimestamp`, because a run can exist far longer than its window before it
 terminalizes. Deletion additionally waits on the source lifecycle report: the
-reconciler holds a terminal run in place while `lifecycleReportSettled` is false
-(`internal/controller/coderun_controller.go:270,284-287`; predicate at
-`internal/controller/coderun_controller.go:1266`), and `reapTerminal` records
+reconciler holds a run in place while `lifecycleReportSettled` is false — on the
+`AwaitingReview` path before it may become `Done`
+(`internal/controller/coderun_controller.go:270`) and on the
+`Failed`/`NeedsHuman` path before reaping
+(`internal/controller/coderun_controller.go:284-288`; predicate at
+`internal/controller/coderun_controller.go:1266`) — and `reapTerminal` records
 that as the caller's precondition rather than checking it itself
-(`internal/controller/reap.go:58-61`). Only `Failed` and `NeedsHuman` reach
-`reapTerminal`: `AwaitingReview` goes to `observeMergedReviewPR` instead, and
-`HandedOff` and `BlockedExternal` fall through to a log line, so those phases
-are never reaped (`internal/controller/coderun_controller.go:258-295`). Nothing
-here changes that policy.
+(`internal/controller/reap.go:58-61`). A run reaches `Done` by two routes and
+only one sits behind that gate: from `AwaitingReview`, so the run arrives with an
+already-settled report; and from `Verifying` on a merged-PR observation
+(`internal/controller/coderun_controller.go:895-899`), where the load-bearing
+gate is instead the source resolve succeeding (`resolveCompleted`,
+`internal/controller/coderun_controller.go:619-629`). Three phases reach
+`reapTerminal`: `Failed` and `NeedsHuman` directly
+(`internal/controller/coderun_controller.go:289-292`) and `Done` through `reapDone`
+once its source work has resolved (`internal/controller/reap.go:42-49`);
+`AwaitingReview` goes to `observeMergedReviewPR` instead, and `HandedOff` and
+`BlockedExternal` fall through to a log line, so those phases are never reaped
+(`internal/controller/coderun_controller.go:258-295`). Nothing here changes that
+policy.
 
 | Signal | Kind | Unit | Labels | Semantics |
 | --- | --- | --- | --- | --- |
@@ -279,7 +290,8 @@ Courier's own work and the world's judgement are different events and must not
 collapse into one "done".
 
 - **Executor completion** is the run leaving `Running`: it entered `Verifying`
-  (executor exited `0` and published), or it reached a declared terminal phase
+  (executor exit `0`, which `phaseForExit` routes there without checking
+  publication), or it reached a declared terminal phase
   (`needs-human`, `blocked-external`, and a declared no-change outside fix-pr
   mode — a fix-pr declared no-change goes through `Verifying` like a normal
   exit, `phaseForExit`, `internal/controller/coderun_controller.go:1747-1764`).
@@ -582,7 +594,7 @@ free-form error string, request/response body, or any secret. Correlation to a
 specific item is done in the **structured log** via `run_id`
 (`internal/log/events.go:143-175`) and joined at view time, never promoted to a
 metric dimension. This preserves the existing budget
-(`DESIGN.md:1051-1061`) and the redaction guarantee
+(`DESIGN.md:1070-1075`) and the redaction guarantee
 (`internal/log/redact.go`).
 
 ### 7.3 Budget
@@ -599,7 +611,8 @@ Series are bounded by configuration, not by traffic or history:
   recorded as an open question (§11).
 - lifecycle outcomes: `O(S · L · M · |result|)`; verification outcomes
   `O(L · M · |result|)`;
-- retention/reaping: `O(L · |terminal phase|)`.
+- retention/reaping: `O(|terminal phase|)` — the retention signals are
+  `phase`-only, never `lane` (§3.7).
 
 No series is created per run, per item, or per error string. A working ceiling
 of a few thousand active series per deployment is the design target; the exact

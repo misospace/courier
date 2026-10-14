@@ -223,7 +223,7 @@ Run execution answers: *what happened to the runs, and why?*
 
 | Panel | Intent | Backing signals | Portable semantics | Empty / unknown | Status |
 | --- | --- | --- | --- | --- | --- |
-| Terminal outcomes | Outcome mix over time | `courier_coderuns_total` | rate of terminal runs by `lane`,`mode`,`phase` (label = first terminal phase; a later `AwaitingReview → Done` does not increment `{phase="Done"}` — render merge throughput separately, see §3.4) | no runs ⇒ zero | today |
+| Terminal outcomes | Outcome mix over time | `courier_coderuns_total` | rate of terminal runs by `lane`,`mode`,`phase` (label = first terminal phase; a later `AwaitingReview → Done` does not increment `{phase="Done"}` — merge throughput has no panel here; see the disposition split below) | no runs ⇒ zero | today |
 | Run duration | How long runs take | `courier_coderun_run_duration_seconds` | histogram quantiles, seconds, by lane/mode/phase | no samples ⇒ "no completed runs" | today |
 | Queue wait | Admission delay | `courier_coderun_queue_wait_seconds` | histogram quantiles, seconds | no samples ⇒ "no recent admissions" | today |
 | Terminal diagnostic mix | Why runs ended badly | `TerminalDiagnostic` category (status), `run.exit` log | counts by category | absent diagnostic ⇒ "unknown", never "success" | log/status |
@@ -236,8 +236,8 @@ terminal phase — the run's first terminal phase, per #290 §3.4/§4.1, which
 is the label on `courier_coderuns_total` and the entry the
 `courier_coderun_run_duration_seconds` histogram observes) is not the same
 as **external disposition** (CI, review, merge). The dashboard shows
-first-terminal-phase mix as executor completion; external disposition
-appears in section 3.4, and a current-state per-phase gauge or a
+first-terminal-phase mix as executor completion; external disposition has no
+panel in this document today, and a current-state per-phase gauge or a
 disposition event counter is a separate future measurement, not a
 reinterpretation of `courier_coderuns_total{phase="Done"}` (the metric
 never increments `Done` for a run that terminalized at `AwaitingReview`).
