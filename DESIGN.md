@@ -1308,7 +1308,20 @@ there is no delete verb because active runs reference lanes. (#73)
 - **Claimed** — the source adapter claims the work (dispatch: claim +
   status=in-progress; label/cron/cli: no-op or equivalent). Branch name derived.
   If the pod then fails to launch, **release the claim** — never strand work as
-  in-progress.
+  in-progress. A launch whose create collides with an already-occupied
+  coordinator pod name (`AlreadyExists`) is verified before it may count as
+  success, against the API server's current state rather than the informer
+  cache: the collision resolves to an idempotent, no-second-charge launch
+  **only** when the existing pod carries a controller `OwnerReference` whose
+  UID is the run's and is not being torn down. Every other shape — a failed
+  verification read (NotFound, transient, Forbidden), a terminating pod, or a
+  pod not bound to this run's UID (foreign, or a live coordinator left by a
+  deleted-and-recreated same-name run) — surfaces as **provisioning in
+  flight**: the run stays **Claimed** and requeues, and `Running` is never
+  written over a slot not verified as a live, run-owned pod. The wait rides
+  the pod's delete event with a bounded requeue as the backstop; no wall-clock
+  bound is introduced. This mirrors the secure topology's in-flight signal for
+  a terminating control pod rather than inventing a second shape (#217).
 - **Running** — pod launches: ephemeral workspace, clone, **adopt the branch if it
   exists and base-sync first**, inject LaneProfile framing + roles, wire the MCP
   tools, set log level from `debug`. For a fork PR the workspace's `origin` is
@@ -1745,6 +1758,34 @@ named items remain unresolved and must not be described as production-ready:
 - The exact vLLM gauge for backpressure on the target model server.
 
 ## Decisions
+
+- **2026-10-14 — #217: a coordinator slot collision resolves to a successful
+  launch only against a pod verified live and owned by the run's UID; every
+  other shape keeps the run Claimed.** The legacy launcher treated
+  `AlreadyExists` on pod creation as an idempotent success, so a relaunch
+  colliding with a pod being torn down recorded `Running` over the dying pod —
+  the next reconcile could terminalize the freshly relaunched run as `Failed`
+  by reading that pod's own termination, and a pod that vanished before the
+  wedge path observed it would charge a second infrastructure loss against the
+  ceiling #106 shares with pod loss. The settled contract: the collision is a
+  liveness check, and a liveness check reads the world, not a cache — the
+  verification `Get` goes through the manager's uncached API reader (the same
+  reader the pod-loss confirmation and evidence intake already use), because a
+  cached pod predating a deletion timestamp the API server already carries must
+  not resolve a terminating slot to success. Identity is bound to the run's
+  UID with the pre-existing `podOwnedByRunUID`: neither name matching nor the
+  `LabelRun` fallback adopts at this site, so a live coordinator left by a
+  deleted-and-recreated same-name CoderRun is not silently adopted (owner GC
+  reaps its pod). Only a verification read returning a run-owned pod not being
+  torn down resolves the collision to a no-second-charge launch; a read error
+  (NotFound, transient, Forbidden), a terminating pod, or an unowned/foreign
+  pod returns an in-flight sentinel that the reconciler treats as *stay
+  Claimed, requeue* — the same shape as the secure topology's
+  terminating-control-pod requeue, bounded by a backstop requeue that is not a
+  deadline (liveness is bounded, duration never is). The launcher still never
+  writes run status: the sentinel returns to the reconciler, which owns phase
+  transitions, and it returns before any status write or claim release so no
+  claim is stranded. (#217, #106)
 
 - **2026-10-14 — #281: the criterion-evidence contract is enforced at native
   PR creation before any forge write, and the refusal travels to the caller
