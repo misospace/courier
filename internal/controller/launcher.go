@@ -41,10 +41,11 @@ var (
 	//     transient API error, or a Forbidden). The slot's live state
 	//     could not be verified; recording Running would re-introduce the
 	//     false-running transition #217 exists to prevent.
-	//   - The follow-up read returned a pod that is not owned by this run
-	//     (no Courier OwnerReference, no LabelRun). A pod sitting at the
-	//     deterministic name but unrelated to this run must not be
-	//     silently adopted as "idempotently live."
+	//   - The follow-up read returned a pod not owned by this run's UID
+	//     (no controller Courier OwnerReference bound to the run's UID).
+	//     A pod sitting at the deterministic name but tied to another
+	//     run incarnation — or to no run at all — must not be silently
+	//     adopted as "idempotently live."
 	//
 	// The reconciler treats this as "stay Claimed, requeue", the same
 	// shape as the secure topology's in-flight signal; the pod's delete
@@ -155,11 +156,13 @@ func (l *CoordinatorLauncher) Launch(ctx context.Context, run *courierv1alpha1.C
 	//     relaunched run as Failed off the dying pod's own termination,
 	//     or charge a second infrastructure loss if the pod vanishes
 	//     before the wedge path observes it.
-	//   - The existing pod does not belong to this run (no Courier
-	//     OwnerReference and no LabelRun). The deterministic slot name
-	//     can collide with stale or unrelated state; silently adopting
-	//     such a pod as "idempotently live" would bind the run to an
-	//     arbitrary coordinator.
+	//   - The existing pod is not owned by this run's UID (no controller
+	//     OwnerReference whose UID is the run's). The deterministic slot
+	//     name can collide with stale or unrelated state — including a
+	//     live coordinator left by a deleted-and-recreated CoderRun of
+	//     the same name — and silently adopting such a pod as
+	//     "idempotently live" would bind the run to an arbitrary
+	//     coordinator.
 	//
 	// A run-owned existing pod not being torn down is the only case that
 	// resolves the collision to a successful, no-second-charge Launch: the
@@ -176,7 +179,7 @@ func (l *CoordinatorLauncher) Launch(ctx context.Context, run *courierv1alpha1.C
 		return ErrProvisioningInFlight
 	case existing.DeletionTimestamp != nil:
 		return ErrProvisioningInFlight
-	case !podBelongsToRun(&existing, run):
+	case !podOwnedByRunUID(&existing, run.UID):
 		return ErrProvisioningInFlight
 	}
 	return nil

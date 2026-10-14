@@ -753,3 +753,61 @@ func TestCoordinatorLauncherReportsProvisioningInFlightWhenExistingPodIsForeign(
 		t.Fatalf("Launch() error = %v, want ErrProvisioningInFlight; an unrelated pod at the slot name must not be silently adopted", err)
 	}
 }
+
+// TestCoordinatorLauncherReportsProvisioningInFlightWhenExistingPodIsStaleIncarnation
+// pins the UID-binding half of #217's review: a live pod left at the slot
+// name by a previous CoderRun incarnation — same name, same LabelRun, and
+// a controller OwnerReference of Kind CoderRun with the same name but the
+// dead incarnation's UID. Ownership matching on name or label alone would
+// adopt it and record Running over a coordinator belonging to a run that
+// no longer exists, so ownership is bound to the run's UID.
+func TestCoordinatorLauncherReportsProvisioningInFlightWhenExistingPodIsStaleIncarnation(t *testing.T) {
+	run := &courierv1alpha1.CoderRun{
+		ObjectMeta: metav1.ObjectMeta{Name: "run-1", Namespace: "default", UID: types.UID("run-uid")},
+		Spec: courierv1alpha1.CoderRunSpec{
+			Mode: courierv1alpha1.ModeResolveIssue,
+			Repo: "acme/widgets",
+			Ref:  1,
+			Lane: "local",
+		},
+		Status: courierv1alpha1.CoderRunStatus{Phase: courierv1alpha1.PhaseClaimed},
+	}
+	lane := &courierv1alpha1.LaneProfile{
+		ObjectMeta: metav1.ObjectMeta{Name: "local", Namespace: "default"},
+		Spec:       courierv1alpha1.LaneProfileSpec{Roles: map[string]string{"coordinator": "test-model"}},
+	}
+	// Live, no DeletionTimestamp, and every name-level identity marker
+	// matching this run — only the owner UID differs (the previous
+	// incarnation of run-1).
+	controller := true
+	existing := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "run-1-coordinator",
+			Namespace: "default",
+			Labels: map[string]string{
+				executor.LabelRun: run.Name,
+			},
+			OwnerReferences: []metav1.OwnerReference{{
+				APIVersion: courierv1alpha1.GroupVersion.String(),
+				Kind:       "CoderRun",
+				Name:       run.Name,
+				UID:        types.UID("dead-incarnation-uid"),
+				Controller: &controller,
+			}},
+		},
+	}
+	fakeClient := fake.NewClientBuilder().
+		WithScheme(launcherScheme(t)).
+		WithStatusSubresource(&courierv1alpha1.CoderRun{}).
+		WithRuntimeObjects(run, lane, existing).
+		Build()
+	launcher := &CoordinatorLauncher{
+		Client: fakeClient,
+		Pod:    executor.PodConfig{Image: "example/opencode:test"},
+	}
+
+	err := launcher.Launch(context.Background(), run)
+	if !errors.Is(err, ErrProvisioningInFlight) {
+		t.Fatalf("Launch() error = %v, want ErrProvisioningInFlight; a pod owned by a dead run incarnation must not be adopted", err)
+	}
+}
