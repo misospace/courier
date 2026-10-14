@@ -6,8 +6,10 @@ and the conditions an operator can reason about. It is a **design-only** child o
 the portable-observability umbrella (#289). It defines no code, exporter,
 dashboard, alert rule, deployment, or environment-specific configuration, and it
 does not authorize any implementation. The behaviour issues it borders — #286
-(exclusion overflow), #287 (retention), #288 (`Pending` display) — remain
-separate work; nothing here changes lifecycle behaviour or retention policy.
+(exclusion overflow) and #288 (`Pending` display) — remain separate work; #287
+(per-phase retention) has since landed independently and is read here as
+existing behaviour (§3.7), not as something this document proposes. Nothing
+here changes lifecycle behaviour or retention policy.
 
 The grounding surfaces are the existing metrics
 (`internal/controller/metrics.go`), the source-neutral interfaces
@@ -39,9 +41,9 @@ views. Where this document answers a question #292 recorded as open, it says so.
 Courier's current observability is run-centric. `courier_coderuns_total`,
 `courier_coderun_run_duration_seconds`, and `courier_coderun_queue_wait_seconds`
 are observed only when a run reaches a terminal phase
-(`internal/controller/metrics.go:121-140`); `courier_coderuns_in_flight` and
+(`internal/controller/metrics.go:128-152`); `courier_coderuns_in_flight` and
 `courier_lane_suspended` are read live from the cluster
-(`internal/controller/metrics.go:182-225`). **None of these can distinguish an
+(`internal/controller/metrics.go:209-252`). **None of these can distinguish an
 idle, healthy, empty queue from a broken discovery loop**, because discovery
 failures are logged and then discarded
 (`internal/source/runner.go:68-70,79-81`) and never reach a counter, condition,
@@ -100,7 +102,7 @@ source runner is not configured emits nothing.
 | `courier_source_discovery_failures_total` | counter | polls | `source`, `lane` | Source calls that returned an error. The authoritative discovery-failure rate (#291 §6.2). |
 | `courier_source_items_offered_total` | counter | items | `source`, `lane` | Items returned by discovery before core validation and dedupe. |
 | `courier_source_discovery_skipped_total` | counter | items | `source`, `lane`, `reason` | Items dropped by runner validation; `reason` ∈ `missing-id`, `unsupported-mode`, `invalid-ref` (`internal/source/runner.go:210-220`). |
-| `courier_source_items_materialized_total` | counter | runs | `source`, `lane` | Items that became `CoderRun`s. Dedupe and exclusions may make this smaller than `items_offered_total` (`internal/source/runner.go:221-262`). |
+| `courier_source_items_materialized_total` | counter | runs | `source`, `lane` | Items that became `CoderRun`s. Dedupe and exclusions may make this smaller than `items_offered_total` (`internal/source/runner.go:226-291`). |
 | `courier_source_last_attempt_timestamp_seconds` | gauge | unix seconds | `source`, `lane` | When the source was last called. |
 | `courier_source_last_success_timestamp_seconds` | gauge | unix seconds | `source`, `lane` | When discovery last succeeded. **Absent until the first success** — absence is `starting`/`unknown`, never `idle`. |
 | `courier_source_discovery_paused_total` | counter | polls | `source`, `lane`, `reason` | Polls skipped before the source was called; `reason` ∈ `lane-waiting`, `lane-suspended`, `lane-at-capacity` (`internal/source/runner.go:92-139`). |
@@ -144,16 +146,16 @@ both visible rather than collapsing them.
 
 ### 3.4 Run phases, transitions, and age (core)
 
-Phases are the existing enum (`api/v1alpha1/coderun_types.go:26-41`): `Pending`,
+Phases are the existing enum (`api/v1alpha1/coderun_types.go:83-104`): `Pending`,
 `Claimed`, `Running`, `Verifying`, `AwaitingReview`, `HandedOff`, `NeedsHuman`,
 `Done`, `Failed`, `BlockedExternal`. Terminal phases carry `FinishedAt`
-(`internal/controller/coderun_controller.go:825-854`).
+(`internal/controller/coderun_controller.go:988-1055`).
 
 | Signal | Kind | Unit | Labels | Semantics |
 | --- | --- | --- | --- | --- |
 | `courier_coderun_phase_transitions_total` | counter | transitions | `lane`, `mode`, `from`, `to` | One per observed phase change. `from`/`to` are the bounded phase enum. |
 | `courier_coderun_phase_duration_seconds` | histogram | seconds | `lane`, `mode`, `phase` | Time spent in a phase, observed once on leaving it. Buckets are a candidate; the existing run/queue buckets are a starting shape (`internal/controller/metrics.go:19-28`). |
-| `courier_coderuns_total` | counter | runs | `lane`, `mode`, `phase` | Existing: terminal runs by **first** terminal phase. The label is set once — `transitionTerminal` records the metric exactly once on the run's first terminal transition (`firstTerminal := FinishedAt == nil`, `internal/controller/coderun_controller.go:835-885`), and a later transition that corrects the ending (for example `AwaitingReview → Done`, #250) does not increment the new phase. The label preserved is the phase at the first terminal transition, not the run's final disposition. |
+| `courier_coderuns_total` | counter | runs | `lane`, `mode`, `phase` | Existing: terminal runs by **first** terminal phase. The label is set once — `transitionTerminal` records the metric exactly once on the run's first terminal transition (`firstTerminal := FinishedAt == nil`, `internal/controller/coderun_controller.go:999-1053`), and a later transition that corrects the ending (for example `AwaitingReview → Done`, #250) does not increment the new phase. The label preserved is the phase at the first terminal transition, not the run's final disposition. |
 | `courier_coderun_run_duration_seconds` | histogram | seconds | `lane`, `mode`, `phase` | Existing: `StartedAt`→`FinishedAt`. |
 | `courier_coderun_queue_wait_seconds` | histogram | seconds | `lane`, `mode`, `phase` | Existing: creation→`AdmittedAt`. |
 
@@ -166,8 +168,8 @@ subset of phases only; what is recoverable from `Status` today is:
 | `Pending` | yes — `now − metadata.creationTimestamp` | — |
 | `Claimed` | partial — `now − AdmittedAt` overstates `Claimed` age once the run advances to `Running` | a `Claimed`-entry timestamp |
 | `Running` | yes — `now − StartedAt` | — |
-| `Verifying` | **no** — `StartedAt` is the `Running` start, not the `Verifying` start; `FinishedAt` is nil; no condition `lastTransitionTime` is stamped for `Verifying` (`coderun_controller.go:649-666`). A view that derives `Verifying` age from `Status` overstates it by the entire `Running` duration | the `Verifying`-entry timestamp |
-| `AwaitingReview` / `HandedOff` / `Failed` / `NeedsHuman` / `BlockedExternal` | partial — `FinishedAt` is the run's first terminal transition (set-once, `coderun_controller.go:838-848`); a later `AwaitingReview → Done` does **not** move `FinishedAt` and never records a `Done`-entry timestamp, so `now − FinishedAt` overstates a `Done` run's age by the gap from `AwaitingReview` to merge | a per-phase entry timestamp |
+| `Verifying` | **no** — `StartedAt` is the `Running` start, not the `Verifying` start; `FinishedAt` is nil; no condition `lastTransitionTime` is stamped for `Verifying` (`internal/controller/coderun_controller.go:691-708`). A view that derives `Verifying` age from `Status` overstates it by the entire `Running` duration | the `Verifying`-entry timestamp |
+| `AwaitingReview` / `HandedOff` / `Failed` / `NeedsHuman` / `BlockedExternal` | partial — `FinishedAt` is the run's first terminal transition (set-once, `internal/controller/coderun_controller.go:1014-1023`); a later `AwaitingReview → Done` does **not** move `FinishedAt` and never records a `Done`-entry timestamp, so `now − FinishedAt` overstates a `Done` run's age by the gap from `AwaitingReview` to merge | a per-phase entry timestamp |
 | `Done` | **no** — never an entry timestamp; the terminal histogram captures aggregate distribution, not per-run age | the `Done`-entry timestamp |
 
 The recoverable cells are the only safe derivations; the **unknown** cells
@@ -187,15 +189,15 @@ kept separate from external disposition (§4.1).
 
 | Signal | Kind | Unit | Labels | Semantics |
 | --- | --- | --- | --- | --- |
-| `courier_coderun_terminal_diagnostics_total` | counter | runs | `lane`, `mode`, `category` | One per terminal run, by `TerminalDiagnostic.Category`; `category` is the closed enum in `api/v1alpha1/coderun_types.go:135-159`. |
-| `courier_coderun_infra_restarts_total` | counter | restarts | `lane`, `mode` | Coordinator infra relaunches (`Status.Restarts`, `internal/controller/liveness.go:593-615`). |
-| `courier_coderun_verification_outcomes_total` | counter | runs | `lane`, `mode`, `result` | External verification disposition observed by the operator: `result` ∈ `green` (stable green → `AwaitingReview`), `red` (confirmed red → `HandedOff`/`Failed`), `unobservable` (draft/no-PR/unreadable → `NeedsHuman`) (`internal/controller/coderun_controller.go:722-800`). |
+| `courier_coderun_terminal_diagnostics_total` | counter | runs | `lane`, `mode`, `category` | One per terminal run, by `TerminalDiagnostic.Category`; `category` is the closed enum in `api/v1alpha1/coderun_types.go:194-222`. |
+| `courier_coderun_infra_restarts_total` | counter | restarts | `lane`, `mode` | Coordinator infra relaunches (`Status.Restarts`, `internal/controller/liveness.go:593-620`). |
+| `courier_coderun_verification_outcomes_total` | counter | runs | `lane`, `mode`, `result` | External verification disposition observed by the operator: `result` ∈ `green` (stable green → `AwaitingReview`), `red` (confirmed red → `HandedOff`/`Failed`), `unobservable` (draft/no-PR/unreadable → `NeedsHuman`) (`internal/controller/coderun_controller.go:885-963`). |
 | `courier_coderun_tokens_total` | counter | tokens | `lane`, `mode`, `kind` | Aggregate token totals from `RunTelemetry`; `kind` ∈ `input`, `output`, `reasoning`, `cache-read`, `cache-write`. `total` is the sum of these parts and is derived, not a separate series. Per-run and per-session detail stays in `status.telemetry` and the `run.summary` log; only the bounded aggregate is a metric. |
 
 ### 3.6 Lifecycle reporting (core)
 
 Reporting state already exists as two conditions —
-`LifecycleReported` (`api/v1alpha1/coderun_types.go:19`) and the support
+`LifecycleReported` (`api/v1alpha1/coderun_types.go:67-70)` and the support
 condition `LifecycleReportSupported`
 (`internal/controller/coderun_controller.go:47`) — and a bounded retry cadence
 (`lifecycleReportRequeueDelay = 30s`, `internal/controller/coderun_controller.go:36`).
@@ -208,7 +210,7 @@ condition `LifecycleReportSupported`
 
 The metric `result` vocabulary is a bounded projection of the two existing
 conditions, not a new source of truth. It maps to the code's reasons
-(`internal/controller/coderun_controller.go:892-903,1041-1067`):
+(`internal/controller/coderun_controller.go:1099-1121`):
 `published` ← `LifecycleReported=True` reason `Published`; `superseded` ←
 `LifecycleReported=True` reason `Superseded`; `unsupported` ←
 `LifecycleReportSupported=False` reason `UnsupportedOutcome`; `retryable` ←
@@ -218,21 +220,38 @@ conditions, not a new source of truth. It maps to the code's reasons
 `courier_coderuns_lifecycle_pending`, not a `result`.
 
 The retry tokens (`LifecycleReportRetryToken`,
-`LifecycleReportActiveRetryToken`, `api/v1alpha1/coderun_types.go:440,445`) stay
+`LifecycleReportActiveRetryToken`, `api/v1alpha1/coderun_types.go:499-507`) stay
 per-run status and are **not** labels; only their aggregate count is observed.
 
 ### 3.7 Retention and reaping (core)
 
-Retention today reaps only resolved `Done` runs after a fixed window
-(`defaultDoneRetention = 5m`, `internal/controller/reap.go:18-23,28-60`). This
-section makes reaping observable **without changing the retention policy**;
-per-phase retention remains #287's work.
+Retention is already per-phase and already partly observable, so this section
+records what exists and names the one remaining gap rather than proposing the
+whole layer. Each reaped phase's window is a constant in
+`internal/controller/reap.go:29-40`: `defaultDoneRetention = 5m` for `Done`,
+`defaultFailedRetention` and `defaultNeedsHumanRetention = 168h` for `Failed`
+and `NeedsHuman`, and `defaultTerminalAuditKeep = 5` — the per-repository audit
+floor that keeps the most recent floor-governed runs past their window. Each
+window runs from its own durable marker (`courier.misospace.dev/done-at`,
+`failed-at`, `needs-human-at`, `internal/controller/reap.go:24-26`) rather than
+`creationTimestamp`, because a run can exist far longer than its window before it
+terminalizes. `reapTerminal` additionally refuses to delete a run whose lifecycle
+report has not reached a positive settled state
+(`internal/controller/reap.go:61`), and `AwaitingReview`, `HandedOff`, and
+`BlockedExternal` are never reaped
+(`internal/controller/reap.go:150-159,193-200`). Nothing here changes that
+policy.
 
 | Signal | Kind | Unit | Labels | Semantics |
 | --- | --- | --- | --- | --- |
-| `courier_coderuns_reaped_total` | counter | runs | `lane`, `phase` | Runs deleted by retention, by the terminal phase they were reaped from (today only `Done`). |
-| `courier_coderuns_awaiting_reap` | gauge | runs | `lane`, `phase` | Terminal runs retained for inspection and not yet reaped. |
-| `courier_coderun_oldest_retained_age_seconds` | gauge | seconds | `lane` | Age of the oldest retained terminal run; evidence for a stalled reaper. |
+| `courier_coderuns_reap_requests_total` | counter | requests | `phase` | Existing: terminal-run deletions the reaper asked the API server to accept, by the terminal phase they were requested from. It counts **requests, not deletions** — the API server accepts a delete while a finalizer still holds the object, so a securely-topology-held run is counted here and not yet gone. |
+| `courier_coderuns_oldest_terminal_age_seconds` | gauge | seconds | `phase` | Existing: age of the oldest retained terminal run per phase, read live from the cluster at scrape time, so it survives an operator restart. Paired with the counter above it is what separates "the reaper is asking" from "the run is actually still there". |
+| `courier_coderuns_awaiting_reap` | gauge | runs | `phase` | Proposed: terminal runs retained for inspection and not yet reaped. The age gauge answers *how stale* the oldest retained run is; this answers *how many* runs are held, which is the retained-backlog view #292 needs. |
+
+Both shipped retention signals are labelled `phase` only, never `lane`
+(`reapMetricLabels`, `internal/controller/metrics.go:35`): retention is a
+per-terminal-phase property, and a `lane` label would multiply the series by
+lane for no diagnostic gain.
 
 ### 3.8 Crosswalk with existing signals
 
@@ -244,6 +263,8 @@ per-phase retention remains #287's work.
 | `courier_coderuns_in_flight` | retained (§3.3) |
 | `courier_lane_suspended` | retained (§3.3) |
 | `courier_metrics_scrape_errors_total` | retained; it is the collection-health signal for the whole catalogue |
+| `courier_coderuns_reap_requests_total` | retained (§3.7) |
+| `courier_coderuns_oldest_terminal_age_seconds` | retained (§3.7) |
 | `run.exit`, `phase.transition`, `run.summary`, `capability.status`, `evidence.capture`, `outcome.*` events | retained as the log half; `phase.transition` is the source for `courier_coderun_phase_transitions_total`, `run.exit` for the terminal diagnostic category |
 
 ## 4. State model
@@ -257,14 +278,14 @@ collapse into one "done".
   (executor exited `0` and published), or it reached a declared terminal phase
   (`needs-human`, `blocked-external`, and a declared no-change outside fix-pr
   mode — a fix-pr declared no-change goes through `Verifying` like a normal
-  exit, `phaseForExit`, `internal/controller/coderun_controller.go:1555-1571`).
+  exit, `phaseForExit`, `internal/controller/coderun_controller.go:1747-1764`).
   Current evidence does
   **not** measure executor completion directly. `FinishedAt` is set on the run's
   first *terminal* transition (`transitionTerminal`,
-  `internal/controller/coderun_controller.go:825-854`) and
+  `internal/controller/coderun_controller.go:988-1055`) and
   `courier_coderuns_total` plus the run-duration histogram are recorded at the
-  same point (`ObserveTerminal`, `internal/controller/metrics.go:121-140`); the
-  `Running → Verifying` transition (`internal/controller/coderun_controller.go:650-667`)
+  same point (`ObserveTerminal`, `internal/controller/metrics.go:128-152`); the
+  `Running → Verifying` transition (`internal/controller/coderun_controller.go:691-708`)
   records neither. So a run parked in `Verifying` is not yet counted, and its
   eventual `StartedAt → FinishedAt` duration includes the `Verifying`
   observation wait: the terminal histogram measures execution *plus*
@@ -284,9 +305,9 @@ collapse into one "done".
   and later resolves to `Done` (#250) records exactly one
   `{phase="AwaitingReview"}` increment and never a `{phase="Done"}`:
   `transitionTerminal`'s `firstTerminal := FinishedAt == nil`
-  (`internal/controller/coderun_controller.go:835-885`) gates the
+  (`internal/controller/coderun_controller.go:999-1053`) gates the
   `ObserveTerminal` call, and `ObserveTerminal`'s own comment
-  (`internal/controller/metrics.go:114-136`) is explicit that a later
+  (`internal/controller/metrics.go:128-132`) is explicit that a later
   `AwaitingReview → Done` must not count again. The terminal histogram
   keeps the first terminal-phase label as well. Treating the metric as
   "runs by final phase" would invite a dashboard to read `{phase="Done"}`
@@ -591,17 +612,17 @@ free-form text becomes a metric label or a structured field.
 ### 8.1 Clocks and timestamps
 
 - Authoritative timestamps are the cluster's: `metadata.creationTimestamp`,
-  `AdmittedAt`, `StartedAt`, `FinishedAt` (`api/v1alpha1/coderun_types.go:383-400`),
+  `AdmittedAt`, `StartedAt`, `FinishedAt` (`api/v1alpha1/coderun_types.go:445-471`),
   condition `lastTransitionTime`, and `Heartbeat.At`. Age and duration windows
   are computed from these against the API server's clock as observed by the
   operator, using the injectable `CoderRunReconciler.Now`
-  (`internal/controller/coderun_controller.go:133-135`) and `reap.clock()`
-  (`internal/controller/reap.go:78-83`).
+  (`internal/controller/coderun_controller.go:148-150`) and `(*CoderRunReconciler).clock()`
+  (`internal/controller/reap.go:227-232`).
 - `*_timestamp_seconds` gauges are emitted from the operator clock and are used
   for **freshness only**, never for authoritative durations.
 - Negative durations from clock skew clamp to zero, matching existing helpers
-  (`nonNegativeSeconds`, `internal/controller/metrics.go:145-150`;
-  `durationString`, `internal/controller/coderun_controller.go:1473-1478`).
+  (`nonNegativeSeconds`, `internal/controller/metrics.go:169-177`;
+  `durationString`, `internal/controller/coderun_controller.go:1664-1671`).
 
 ### 8.2 Units
 
@@ -708,6 +729,7 @@ authorized here:
 
 No code, exporter, dashboard, alert rule, deployment manifest, or
 environment-specific configuration. No change to lifecycle behaviour or
-retention policy. #286 (exclusion overflow), #287 (retention), and #288
-(`Pending` display) remain separate behaviour work and are not authorized by
-this document.
+retention policy. #286 (exclusion overflow) and #288 (`Pending` display)
+remain separate behaviour work and are not authorized by this document; #287
+(per-phase retention) has landed independently and is read here as existing
+behaviour, not authorized by this document.
