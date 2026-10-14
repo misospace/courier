@@ -177,9 +177,24 @@ func validatePolicy(p Policy) error {
 		if p.SourceIssue.Canonical() != p.BaseRepo {
 			return fmt.Errorf("publication policy: resolve-issue source-issue repository %q does not match base repository %q", p.SourceIssue.Canonical(), p.BaseRepo)
 		}
+		// Criterion pin integrity at the engine boundary, mirroring the
+		// binding: a carried set is either fully zero (unpinned, or
+		// admitted before the contract) or a digest-carrying pin naming
+		// exactly this policy's trusted source issue. A half-set must
+		// never reach a publication boundary.
+		if p.Criteria.IsPinned() {
+			if p.Criteria.Issue.IsZero() || p.Criteria.Issue != p.SourceIssue {
+				return errors.New("publication policy: pinned criterion set does not name the policy's trusted source issue")
+			}
+		} else if !p.Criteria.Issue.IsZero() || len(p.Criteria.Criteria) > 0 {
+			return errors.New("publication policy: criterion set carries an identity or rows without a set digest")
+		}
 	case ModeFixPR:
 		if p.PRNumber <= 0 || p.HeadAnchorOID == "" || p.WorkInitiallyAbsent || p.WorkAnchorOID != p.HeadAnchorOID {
 			return errors.New("publication policy: fix-pr requires an exact PR head anchor")
+		}
+		if p.Criteria.IsPinned() || !p.Criteria.Issue.IsZero() || len(p.Criteria.Criteria) > 0 {
+			return errors.New("publication policy: fix-pr policies carry no criterion contract")
 		}
 	default:
 		return fmt.Errorf("publication policy: unsupported mode %q", p.Mode)
@@ -399,66 +414,91 @@ func (e *PolicyEngine) checkPR(pr *PullRequestState, workOID, trustedTip string)
 // gets to create a PR. Both the cross-repo form ("Closes owner/repo#N") and
 // the bare form ("Closes #N") are accepted when the trusted source identity
 // matches.
-func (e *PolicyEngine) CreatePullRequest(ctx context.Context, oid, title, body string, draft bool) (PullRequestState, error) {
+//
+// When the policy carries a criterion set pinned at admission (#249/#281),
+// the body must additionally satisfy ValidateCriterionEvidence against that
+// exact pin. Both body contracts run before any forge read or write, so a
+// refusal has nothing to undo and a corrected body is a fresh call; the
+// duplicate-PR guard still precedes creation. A refusal returns the
+// structured *CriteriaError so the caller sees each violation (missing IDs,
+// unknown IDs, stale digests, bad status shape, coverage lie) rather than a
+// bare denial. An unpinned policy (pre-contract runs) and a pinned empty set
+// are vacuous passes: linkage is then the only body contract. On success the
+// parsed report is returned (nil when no block was required) so a partial
+// honest record surfaces its derived coverage to the caller; carriage of
+// that result into outcome comments and telemetry is the executor boundary's
+// job, not the engine's.
+func (e *PolicyEngine) CreatePullRequest(ctx context.Context, oid, title, body string, draft bool) (PullRequestState, *CriteriaReport, error) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	p := e.policy
 	if p.Mode != ModeResolveIssue {
-		return PullRequestState{}, errors.New("publication denied: fix-pr cannot create or retarget a pull request")
+		return PullRequestState{}, nil, errors.New("publication denied: fix-pr cannot create or retarget a pull request")
 	}
 	if err := ValidateLinkage(body, p.SourceIssue); err != nil {
-		return PullRequestState{}, fmt.Errorf("publication denied: %w", err)
+		return PullRequestState{}, nil, fmt.Errorf("publication denied: %w", err)
+	}
+	// The criterion-evidence boundary (#281) is checked beside linkage,
+	// before any forge observation, so a deficient body reaches no forge
+	// write and names every violation for the repair loop.
+	var report *CriteriaReport
+	if p.Criteria.IsPinned() {
+		var err error
+		report, err = ValidateCriterionEvidence(body, p.Criteria)
+		if err != nil {
+			return PullRequestState{}, nil, err
+		}
 	}
 	base, work, _, err := e.observe(ctx)
 	if err != nil {
-		return PullRequestState{}, err
+		return PullRequestState{}, nil, err
 	}
 	if err = e.checkBase(base); err != nil {
-		return PullRequestState{}, err
+		return PullRequestState{}, nil, err
 	}
 	if err = e.checkDestination(work); err != nil {
-		return PullRequestState{}, err
+		return PullRequestState{}, nil, err
 	}
 	if !work.Exists || oid == "" || work.OID != oid {
-		return PullRequestState{}, errors.New("publication denied: proposed OID is not the exact live head")
+		return PullRequestState{}, nil, errors.New("publication denied: proposed OID is not the exact live head")
 	}
 	if e.confirmed != oid && oid != p.WorkAnchorOID {
-		return PullRequestState{}, errors.New("publication denied: pull request head is not an admitted or previously confirmed run tip")
+		return PullRequestState{}, nil, errors.New("publication denied: pull request head is not an admitted or previously confirmed run tip")
 	}
 	pulls, err := e.observer.FindPullRequest(ctx, p.WorkRepo, p.WorkRef)
 	if err != nil {
-		return PullRequestState{}, errors.New("check existing pull request failed")
+		return PullRequestState{}, nil, errors.New("check existing pull request failed")
 	}
 	if len(pulls) != 0 {
-		return PullRequestState{}, errors.New("publication denied: a pull request already exists for the pinned head")
+		return PullRequestState{}, nil, errors.New("publication denied: a pull request already exists for the pinned head")
 	}
 	number, err := e.observer.CreatePullRequest(ctx, CreatePullRequest{BaseRepo: p.BaseRepo, BaseRef: p.BaseRef, HeadRepo: p.WorkRepo, HeadRef: p.WorkRef, Title: title, Body: body, Draft: draft})
 	if err != nil {
-		return PullRequestState{}, errors.New("create pull request failed")
+		return PullRequestState{}, nil, errors.New("create pull request failed")
 	}
 	if number <= 0 {
-		return PullRequestState{}, errors.New("publication denied: provider returned invalid pull request number")
+		return PullRequestState{}, nil, errors.New("publication denied: provider returned invalid pull request number")
 	}
 	created, err := e.observer.PullRequest(ctx, number)
 	if err != nil {
-		return PullRequestState{}, errors.New("verify created pull request failed")
+		return PullRequestState{}, nil, errors.New("verify created pull request failed")
 	}
 	liveBase, err := e.observer.Repository(ctx, p.BaseRepo, p.BaseRef)
 	if err != nil || e.checkBase(liveBase) != nil {
-		return PullRequestState{}, errors.New("publication denied: pinned base changed while creating pull request")
+		return PullRequestState{}, nil, errors.New("publication denied: pinned base changed while creating pull request")
 	}
 	liveWork, err := e.observer.Repository(ctx, p.WorkRepo, p.WorkRef)
 	if err != nil || e.checkDestination(liveWork) != nil || !liveWork.Exists || liveWork.OID != oid {
-		return PullRequestState{}, errors.New("publication denied: pinned work tip changed while creating pull request")
+		return PullRequestState{}, nil, errors.New("publication denied: pinned work tip changed while creating pull request")
 	}
 	if !matchesPR(p, created, oid) {
-		return PullRequestState{}, errors.New("publication denied: created pull request identity or head differs from pinned policy")
+		return PullRequestState{}, nil, errors.New("publication denied: created pull request identity or head differs from pinned policy")
 	}
 	// Close the create race: a provider may return one PR while another matching
 	// PR is created concurrently. Confirm the complete pinned head list again.
 	pulls, err = e.observer.FindPullRequest(ctx, p.WorkRepo, p.WorkRef)
 	if err != nil {
-		return PullRequestState{}, errors.New("recheck pull requests after create failed")
+		return PullRequestState{}, nil, errors.New("recheck pull requests after create failed")
 	}
 	found := false
 	for _, candidate := range pulls {
@@ -467,16 +507,23 @@ func (e *PolicyEngine) CreatePullRequest(ctx context.Context, oid, title, body s
 			continue
 		}
 		if candidate.HeadRepo == p.WorkRepo && candidate.HeadRef == p.WorkRef {
-			return PullRequestState{}, errors.New("publication denied: concurrent pull request exists for pinned head")
+			return PullRequestState{}, nil, errors.New("publication denied: concurrent pull request exists for pinned head")
 		}
 	}
 	if !found {
-		return PullRequestState{}, errors.New("publication denied: created pull request is absent from pinned head recheck")
+		return PullRequestState{}, nil, errors.New("publication denied: created pull request is absent from pinned head recheck")
 	}
-	return created, nil
+	return created, report, nil
 }
 
 // UpdateFixPR updates metadata only after confirming the pinned PR and exact live head.
+//
+// There is deliberately no resolve-issue body-update surface: a resolve-issue
+// run publishes its body only through CreatePullRequest, where both body
+// contracts are enforced, so the criterion-evidence boundary (#281) has no
+// update path to guard. fix-pr runs carry no criterion contract at all
+// (validatePolicy and the binding reject criterion pins on a fix-pr policy),
+// so body updates there remain governed by nothing but the pinned identity.
 func (e *PolicyEngine) UpdateFixPR(ctx context.Context, update UpdatePullRequest) error {
 	e.mu.Lock()
 	defer e.mu.Unlock()

@@ -3,6 +3,8 @@ package broker
 import (
 	"context"
 	"errors"
+	"strconv"
+	"strings"
 	"testing"
 )
 
@@ -432,16 +434,16 @@ func TestCreatePRGuardsPinnedHeadAndReturnedIdentity(t *testing.T) {
 	// the work ref; "body" by itself is rejected before the head
 	// guard runs, so the first error is the linkage rejection. Use
 	// a body with valid linkage to exercise the head guard.
-	if _, err := e.CreatePullRequest(context.Background(), "candidate", "title", "body", false); err == nil {
+	if _, _, err := e.CreatePullRequest(context.Background(), "candidate", "title", "body", false); err == nil {
 		t.Fatal("create accepted with missing linkage")
 	}
-	if _, err := e.CreatePullRequest(context.Background(), "candidate", "title", "Closes org/repo#502", false); err == nil {
+	if _, _, err := e.CreatePullRequest(context.Background(), "candidate", "title", "Closes org/repo#502", false); err == nil {
 		t.Fatal("create accepted without exact pinned work tip")
 	}
 	o.work.Exists = false
 	o.work.OID = ""
 	o.pulls = []PullRequestState{{Number: 9, HeadRepo: "fork/repo", HeadRef: "courier/work"}}
-	if _, err := e.CreatePullRequest(context.Background(), "candidate", "title", "Closes org/repo#502", false); err == nil {
+	if _, _, err := e.CreatePullRequest(context.Background(), "candidate", "title", "Closes org/repo#502", false); err == nil {
 		t.Fatal("ignored same-name fork PR")
 	}
 }
@@ -471,7 +473,7 @@ func TestCreatePREnforcesSourceIssueLinkageBeforeForgeWrite(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			if _, err := e.CreatePullRequest(context.Background(), "candidate", "title", tc.body, false); err == nil {
+			if _, _, err := e.CreatePullRequest(context.Background(), "candidate", "title", tc.body, false); err == nil {
 				t.Fatalf("create accepted body %q without valid linkage", tc.body)
 			}
 			if o.created.Body != "" {
@@ -501,7 +503,7 @@ func TestCreatePRAcceptsValidLinkage(t *testing.T) {
 		"This change ships the icon assets. Closes #502.\n",
 	} {
 		o.created = CreatePullRequest{}
-		_, err := e.CreatePullRequest(context.Background(), "old", "title", body, false)
+		_, _, err := e.CreatePullRequest(context.Background(), "old", "title", body, false)
 		if err != nil {
 			var le *LinkageError
 			if errors.As(err, &le) {
@@ -528,5 +530,201 @@ func TestValidatePolicyRejectsResolveIssueWithMismatchedSourceRepo(t *testing.T)
 	p.SourceIssue = SourceIssue{Owner: "other", Name: "repo", Number: 502}
 	if _, err := NewPolicyEngine(p, goodObserver(ModeResolveIssue), &fakePusher{}); err == nil {
 		t.Fatal("resolve-issue policy with mismatched source repository accepted")
+	}
+}
+
+// --- criterion-evidence boundary at CreatePullRequest (#281) ---
+
+// adoptObserver completes the create flow: its CreatePullRequest adopts the
+// created identity so the engine's full post-create verification (read-back,
+// head recheck) succeeds and a passing body can be asserted end to end.
+type adoptObserver struct{ *fakeObserver }
+
+func (a *adoptObserver) CreatePullRequest(ctx context.Context, in CreatePullRequest) (int, error) {
+	number, err := a.fakeObserver.CreatePullRequest(ctx, in)
+	if err != nil {
+		return number, err
+	}
+	a.pr = PullRequestState{Number: number, State: "open", BaseRepo: in.BaseRepo, BaseRef: in.BaseRef, HeadRepo: in.HeadRepo, HeadRef: in.HeadRef, HeadOID: a.work.OID, Title: in.Title, Body: in.Body, Draft: in.Draft}
+	a.pulls = []PullRequestState{a.pr}
+	return number, nil
+}
+
+func criteriaEngine(t *testing.T, p Policy, o *adoptObserver) *PolicyEngine {
+	t.Helper()
+	e, err := NewPolicyEngine(p, o, &fakePusher{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return e
+}
+
+func galleryResolvePolicy(set CriterionSet) Policy {
+	return Policy{RunUID: "uid-1", Mode: ModeResolveIssue, Provider: "gh", BaseRepo: "misospace/miso-gallery", BaseRef: "main", BaseOID: "base1", WorkRepo: "misospace/miso-gallery", WorkRef: "courier/work", WorkAnchorOID: "old", SourceIssue: misoGalleryIssue, Criteria: set}
+}
+
+func galleryResolveObserver() *adoptObserver {
+	return &adoptObserver{fakeObserver: &fakeObserver{
+		base: RepositoryState{Repo: "misospace/miso-gallery", Ref: "main", Exists: true, OID: "base2", Default: true, Protected: true},
+		work: RepositoryState{Repo: "misospace/miso-gallery", Ref: "courier/work", Exists: true, OID: "old", ProtectionKnown: true, Writable: true, WriteKnown: true},
+	}}
+}
+
+// TestCreatePREnforcesCriterionEvidenceBeforeForgeWrite is the native
+// boundary of #281: every violation class is refused with the structured
+// *CriteriaError naming the defect, and the observer's CreatePullRequest —
+// the only forge write on this path — is never reached.
+func TestCreatePREnforcesCriterionEvidenceBeforeForgeWrite(t *testing.T) {
+	set := pinMisoGallerySet(t)
+	honest := loadFixture(t, "miso-gallery-505-pr-honest.md")
+	cases := []struct {
+		name   string
+		body   string
+		assert func(*testing.T, *CriteriaError)
+	}{
+		{"block-missing", "Closes misospace/miso-gallery#502.\n\nShips the assets; the manifest is updated too.", func(t *testing.T, e *CriteriaError) {
+			if !errors.Is(e, ErrCriteriaBlockMissing) {
+				t.Errorf("want ErrCriteriaBlockMissing sentinel, reason %q", e.Reason)
+			}
+		}},
+		{"missing-criterion-and-coverage-lie", loadFixture(t, "miso-gallery-505-pr-partial.md"), func(t *testing.T, e *CriteriaError) {
+			if len(e.Missing) != 1 || e.Missing[0] != "AC-2" {
+				t.Errorf("missing = %v, want [AC-2]", e.Missing)
+			}
+			if e.CoverageClaim != CoverageFull || e.CoverageDerived != CoveragePartial {
+				t.Errorf("coverage claim %q derived %q: omitting AC-2 cannot claim full", e.CoverageClaim, e.CoverageDerived)
+			}
+		}},
+		{"unknown-criterion", honest + "\n- AC-4 " + digestString("invented") + ": unknown\n", func(t *testing.T, e *CriteriaError) {
+			if len(e.Unknown) != 1 || e.Unknown[0] != "AC-4" {
+				t.Errorf("unknown = %v, want [AC-4]; the model cannot add criteria", e.Unknown)
+			}
+		}},
+		{"malformed-trailing-row", honest + "\n- AC-\n", func(t *testing.T, e *CriteriaError) {
+			if !strings.Contains(e.Reason, "malformed row") {
+				t.Errorf("structural block defects must also travel as the structured type: %q", e.Reason)
+			}
+		}},
+		{"stale-set-digest", strings.Replace(honest, set.Digest, "sha256:"+strings.Repeat("a", 64), 1), func(t *testing.T, e *CriteriaError) {
+			if !strings.Contains(e.Reason, "the admitted criterion set is "+set.Digest) {
+				t.Errorf("reason must name the admitted set digest: %q", e.Reason)
+			}
+		}},
+		{"regression-check-without-location", strings.Replace(honest, "regression-check - `Dockerfile` `COPY assets/ assets/` ships the three PNGs; `tests/test_dockerfile_packaging.py::test_dockerfile_packages_assets` fails if that COPY line is removed", "regression-check - inspected by hand, no automation", 1), func(t *testing.T, e *CriteriaError) {
+			if len(e.BadStatus) != 1 || e.BadStatus[0] != "AC-1" {
+				t.Errorf("bad status = %v, want [AC-1] (automated claim with no citable location)", e.BadStatus)
+			}
+		}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			o := galleryResolveObserver()
+			e := criteriaEngine(t, galleryResolvePolicy(set), o)
+			_, report, err := e.CreatePullRequest(context.Background(), "old", "title", tc.body, false)
+			if err == nil {
+				t.Fatalf("create accepted a %s body", tc.name)
+			}
+			var cerr *CriteriaError
+			if !errors.As(err, &cerr) {
+				t.Fatalf("want *CriteriaError, got %T: %v", err, err)
+			}
+			if report != nil {
+				t.Error("a rejected body must not surface a report")
+			}
+			if o.created.Body != "" {
+				t.Fatalf("observer CreatePullRequest reached the forge despite %s rejection", tc.name)
+			}
+			tc.assert(t, cerr)
+		})
+	}
+}
+
+// TestCreatePRLinkagePrecedesCriterionEvidence pins the boundary order with
+// bodies that fail both contracts at once: whichever order enforcement
+// happened in, the answer must come from the linkage contract, never the
+// criteria contract.
+func TestCreatePRLinkagePrecedesCriterionEvidence(t *testing.T) {
+	set := pinMisoGallerySet(t)
+	o := galleryResolveObserver()
+	e := criteriaEngine(t, galleryResolvePolicy(set), o)
+	for name, body := range map[string]string{
+		"no-block":      "Addresses the icon assets.",
+		"perfect-block": "Addresses the icon assets.\n\n" + honestBlockFor(set),
+	} {
+		_, _, err := e.CreatePullRequest(context.Background(), "old", "title", body, false)
+		if err == nil {
+			t.Fatalf("%s: create accepted a body without a closing reference", name)
+		}
+		var le *LinkageError
+		if !errors.As(err, &le) {
+			t.Fatalf("%s: want linkage rejection, got %v", name, err)
+		}
+		var cerr *CriteriaError
+		if errors.As(err, &cerr) {
+			t.Fatalf("%s: criteria contract answered before linkage: %v", name, err)
+		}
+	}
+}
+
+func honestBlockFor(set CriterionSet) string {
+	var b strings.Builder
+	b.WriteString("courier-criteria:v1 source=" + strings.ToLower(set.Issue.Canonical()) + "#" + strconv.Itoa(set.Issue.Number) + " set=" + set.Digest + " coverage=full\n\n")
+	for _, c := range set.Criteria {
+		b.WriteString("- " + c.ID + " " + c.Digest + ": regression-check - internal/broker/criteria.go covers " + c.ID + "\n")
+	}
+	return b.String()
+}
+
+// TestCreatePRAcceptsHonestCriterionEvidence covers the two honest records
+// from the shared truth table: both pass the native boundary, reach the
+// forge write, and the parsed report surfaces its derived coverage to the
+// caller — partial stays visible as partial.
+func TestCreatePRAcceptsHonestCriterionEvidence(t *testing.T) {
+	set := pinMisoGallerySet(t)
+	for _, tc := range []struct{ fixture, want string }{
+		{"miso-gallery-505-pr-honest.md", CoverageFull},
+		{"miso-gallery-505-pr-honest-partial.md", CoveragePartial},
+	} {
+		t.Run(tc.want, func(t *testing.T) {
+			body := loadFixture(t, tc.fixture)
+			o := galleryResolveObserver()
+			e := criteriaEngine(t, galleryResolvePolicy(set), o)
+			pr, report, err := e.CreatePullRequest(context.Background(), "old", "title", body, false)
+			if err != nil {
+				t.Fatalf("honest %s record rejected: %v", tc.want, err)
+			}
+			if report == nil || report.Coverage != tc.want || report.DerivedCoverage(set) != tc.want {
+				t.Fatalf("report = %+v, want derived coverage %s surfaced to the caller", report, tc.want)
+			}
+			if o.created.Body != body || pr.Number != 42 {
+				t.Fatalf("forge write mismatch: created=%+v pr=%+v", o.created, pr)
+			}
+		})
+	}
+}
+
+// TestCreatePRCriterionEvidenceVacuousPaths: a pinned empty set and an
+// unpinned pre-contract policy are both vacuous passes — linkage remains
+// the only body contract, with no report and no refusal.
+func TestCreatePRCriterionEvidenceVacuousPaths(t *testing.T) {
+	empty, err := ExtractCriteria("No acceptance section here.\n\n- this is not an acceptance section", misoGalleryIssue)
+	if err != nil || !empty.IsEmpty() || !empty.IsPinned() {
+		t.Fatalf("want a pinned empty set, got %+v err %v", empty, err)
+	}
+	for name, set := range map[string]CriterionSet{"pinned-empty": empty, "unpinned": {}} {
+		t.Run(name, func(t *testing.T) {
+			o := galleryResolveObserver()
+			e := criteriaEngine(t, galleryResolvePolicy(set), o)
+			_, report, err := e.CreatePullRequest(context.Background(), "old", "title", "Closes #502. Ships the assets with no evidence block.", false)
+			if err != nil {
+				t.Fatalf("vacuous %s policy rejected: %v", name, err)
+			}
+			if report != nil {
+				t.Errorf("no block was required; report = %+v", report)
+			}
+			if o.created.Body == "" {
+				t.Fatal("observer was not reached")
+			}
+		})
 	}
 }

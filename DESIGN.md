@@ -1746,6 +1746,35 @@ named items remain unresolved and must not be described as production-ready:
 
 ## Decisions
 
+- **2026-10-14 — #281: the criterion-evidence contract is enforced at native
+  PR creation before any forge write, and the refusal travels to the caller
+  as structured violations.** The native boundary of #249/#280:
+  `PolicyEngine.CreatePullRequest` runs `ValidateCriterionEvidence` against
+  the policy-carried pinned set immediately after linkage and before any
+  forge observation or write, so a deficient body is a repairable rejection
+  with nothing to undo — a corrected body is a fresh call, exactly like a
+  linkage refusal, and the duplicate-PR guard still precedes creation. An
+  unpinned pre-contract policy and a pinned empty set are vacuous passes
+  (linkage remains their only body contract), distinguished by the set's
+  digest (`IsPinned`). The engine returns the structured `*CriteriaError`
+  unflattened, and the broker HTTP layer answers it with a 422 JSON body
+  naming every violation class — block-missing flag, missing/unknown/
+  duplicate IDs, per-row digest mismatch, bad status shape, and the coverage
+  claim beside its derivation — where every other rejection keeps the bare
+  denial: the criteria contract is the one defect class the model can
+  mechanically repair, so it gets the precise repair instruction, and the
+  echo carries only caller-authored body structure and admission-pinned
+  digests, never provider or credential data. A validated create answers
+  with the derived coverage (full/partial) in the
+  `X-Courier-Criteria-Coverage` response header so an honest partial record
+  stays visible without re-parsing the body; carrying that result into
+  outcome comments and telemetry is #282's executor-side job. There is no
+  resolve-issue body-update surface — `UpdateFixPR` is fix-pr-only and
+  fix-pr policies carry no criterion contract — so the boundary has no
+  update path to guard and a compliant create cannot be followed by an edit
+  that drops the block; settled against the current code, not assumed.
+  (#281, #249, #280, #204)
+
 - **2026-10-13 — #317: git commit identity is deployment configuration,
   never a hard-coded value or a token-derived one.** Operator-managed
   executor pods injected `Courier <courier@localhost>` explicitly, and the
