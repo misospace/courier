@@ -77,8 +77,8 @@ type CoordinatorLauncher struct {
 	// serves only direct-construction tests.
 	APIReader client.Reader
 	Scheme    *runtime.Scheme
-	Pod      executor.PodConfig
-	Executor executor.Executor
+	Pod       executor.PodConfig
+	Executor  executor.Executor
 	// EvidenceURL is the intake endpoint handed to coordinator pods for
 	// failure-evidence capture. Empty leaves capture disabled.
 	EvidenceURL string
