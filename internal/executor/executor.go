@@ -119,6 +119,15 @@ type HarnessResult struct {
 	Outcome DeclaredOutcome
 	Reason  string
 	Err     error
+	WorkspaceSafety *WorkspaceSafetyEvidence
+}
+
+// WorkspaceSafetyEvidence is trusted executor evidence, never a model claim.
+type WorkspaceSafetyEvidence struct {
+	State string `json:"state"`
+	Branch string `json:"branch"`
+	Head string `json:"head"`
+	RemoteHead string `json:"remote_head"`
 }
 
 // Harness is the native secure-mode runtime seam (#124): the trusted control

@@ -35,11 +35,12 @@ import (
 // phase/result pair must satisfy validTerminationPhaseResult for the exit
 // code, and the declared outcome travels in Outcome.
 type termination struct {
-	Phase    string `json:"phase"`
-	Result   string `json:"result"`
-	ExitCode int32  `json:"exit_code"`
-	Reason   string `json:"reason"`
-	Outcome  string `json:"outcome,omitempty"`
+	Phase           string                            `json:"phase"`
+	Result          string                            `json:"result"`
+	ExitCode        int32                             `json:"exit_code"`
+	Reason          string                            `json:"reason"`
+	Outcome         string                            `json:"outcome,omitempty"`
+	WorkspaceSafety *executor.WorkspaceSafetyEvidence `json:"workspace_safety,omitempty"`
 	// Category is the structured diagnostic vocabulary the operator persists
 	// verbatim when it is one it knows (TerminalDiagnosticCategory). Only
 	// fixed, code-owned strings travel here — never provider response bodies
@@ -219,8 +220,9 @@ func runArgs(args []string) error {
 		// through the broker's trusted listener, fenced to this exact
 		// incarnation, and is acknowledged durably through the same
 		// trusted status path before the stop latch flips.
-		Control:             harness.NewControlWatcher(identity.brokerStatusClient(), reporter),
-		WorkRefBeyondAnchor: engine.WorkRefBeyondAnchor,
+		Control:                 harness.NewControlWatcher(identity.brokerStatusClient(), reporter),
+		WorkRefBeyondAnchor:     engine.WorkRefBeyondAnchor,
+		CapacityWorkspaceSafety: engine.CapacityWorkspaceSafety,
 	})
 	if err != nil {
 		return fmt.Errorf("courier-control: %w", err)
@@ -296,12 +298,13 @@ func terminationFor(result executor.HarnessResult) termination {
 		category = string(courierv1alpha1.TerminalDiagnosticCategoryCapacityExhaustion)
 	}
 	return termination{
-		Phase:    phase,
-		Result:   handoffResult,
-		ExitCode: exit,
-		Reason:   boundReason(reason),
-		Outcome:  outcome,
-		Category: category,
+		Phase:           phase,
+		Result:          handoffResult,
+		ExitCode:        exit,
+		Reason:          boundReason(reason),
+		Outcome:         outcome,
+		Category:        category,
+		WorkspaceSafety: result.WorkspaceSafety,
 	}
 }
 

@@ -136,6 +136,11 @@ func (r *CoderRunReconciler) recoverCapacityExhaustion(ctx context.Context, run 
 		}
 	}
 
+	if !safeCapacityWorkspace(run.Status.WorkspaceSafety, run.Status.Branch, run.Status.HeadSHA) {
+		return ctrl.Result{}, r.setCapacityRecovery(ctx, run, metav1.ConditionFalse, capacityRecoveryUnsafeWork,
+			"trusted workspace evidence does not prove partial work is safely held remotely; ownership remains held")
+	}
+
 	preparer, ok := adapter.(source.CapacityRecoveryPreparer)
 	if !ok {
 		return ctrl.Result{}, r.setCapacityRecovery(ctx, run, metav1.ConditionFalse, capacityRecoveryUnsupported,
@@ -157,6 +162,12 @@ func (r *CoderRunReconciler) recoverCapacityExhaustion(ctx context.Context, run 
 			"source returned incomplete authoritative safety proof; ownership remains held")
 	}
 	handoff := source.CapacityHandoff{FenceToken: proof.FenceToken, IdempotencyKey: key, WorkIdentity: proof.WorkIdentity, Branch: proof.Branch, PR: proof.PR}
+	lane := &courierv1alpha1.LaneProfile{}
+	if err := r.reader().Get(ctx, client.ObjectKey{Namespace: run.Namespace, Name: run.Spec.Lane}, lane); err == nil {
+		handoff.CapacityIdentity = lane.CapacityIdentity()
+	} else {
+		return ctrl.Result{}, r.setCapacityRecovery(ctx, run, metav1.ConditionFalse, capacityRecoveryRetryable, "read capacity identity for source settlement: "+err.Error())
+	}
 	recovery, ok := adapter.(source.CapacityRecovery)
 	if !ok {
 		return ctrl.Result{}, r.setCapacityRecovery(ctx, run, metav1.ConditionFalse, capacityRecoveryUnsupported,
@@ -173,6 +184,21 @@ func (r *CoderRunReconciler) recoverCapacityExhaustion(ctx context.Context, run 
 	}
 	return ctrl.Result{}, r.setCapacityRecovery(ctx, run, metav1.ConditionTrue, capacityRecoverySettled,
 		"source accepted authoritative safe handoff and settled this attempt")
+}
+
+func safeCapacityWorkspace(evidence *courierv1alpha1.WorkspaceSafetyEvidence, branch, head string) bool {
+	if evidence == nil {
+		return false
+	}
+	switch evidence.State {
+	case "empty":
+		return true
+	case "pushed":
+		return evidence.RemoteHead != "" && evidence.Head != "" && evidence.RemoteHead == evidence.Head &&
+			evidence.Branch != "" && evidence.Branch == branch && branch != ""
+	default:
+		return false
+	}
 }
 
 // recordCapacityCooldown stamps (or monotonically extends) the capacity

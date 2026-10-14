@@ -82,6 +82,20 @@ func (s *admissionSource) Resolve(_ context.Context, item source.WorkItem) error
 	return nil
 }
 
+func TestSourceWorkItemPrefersPersistedReceipt(t *testing.T) {
+	run := admissionRun("run", "local", courierv1alpha1.PhaseClaimed)
+	run.Spec.WorkItemID = "dispatch-id"
+	run.Spec.SourceContext = `{"claimToken":"discovery"}`
+	run.Status.SourceReceipt = `{"claimToken":"issued"}`
+	item, err := sourceWorkItem(run)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if item.Context != run.Status.SourceReceipt {
+		t.Fatalf("Context = %q, want persisted receipt %q", item.Context, run.Status.SourceReceipt)
+	}
+}
+
 func TestSourceRegistryUsesSpecSourceAndDurableWorkItemID(t *testing.T) {
 	first := &admissionSource{}
 	second := &admissionSource{}

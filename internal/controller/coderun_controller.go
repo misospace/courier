@@ -371,13 +371,25 @@ func (r *CoderRunReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 		return ctrl.Result{RequeueAfter: capacityRequeueDelay}, nil
 	}
 
-	if err := adapter.Claim(ctx, item); err != nil {
+	if claimer, ok := adapter.(source.ClaimerWithReceipt); ok {
+		claimed, err := claimer.ClaimWithReceipt(ctx, item)
+		if err != nil {
+			return ctrl.Result{}, err
+		}
+		if claimed.Context != "" && len(claimed.Context) > source.MaxSourceContextBytes {
+			return ctrl.Result{}, fmt.Errorf("source claim returned oversized receipt")
+		}
+		item.Context = claimed.Context
+	} else if err := adapter.Claim(ctx, item); err != nil {
 		return ctrl.Result{}, err
 	}
 	// Claimed is the admission reservation. Persist it before launching so a
 	// concurrent reconciliation cannot observe an unaccounted-for launch.
 	before := run.DeepCopy()
 	run.Status.Phase = courierv1alpha1.PhaseClaimed
+	if _, ok := adapter.(source.ClaimerWithReceipt); ok {
+		run.Status.SourceReceipt = item.Context
+	}
 	if run.Status.AdmittedAt == nil {
 		run.Status.AdmittedAt = &metav1.Time{Time: r.clock().UTC()}
 	}
@@ -753,6 +765,10 @@ func (r *CoderRunReconciler) observeRunning(ctx context.Context, run *courierv1a
 		// A no_change_needed fix-pr run no longer terminalizes directly: it
 		// is routed to Verifying, which settles it against the world.
 		intent := terminalLifecycleIntent{}
+		if message, valid := parseCoordinatorTermination(pod); valid &&
+			terminationOutcome == string(executor.OutcomeCapacityExhausted) && r.Secure != nil {
+			run.Status.WorkspaceSafety = boundedWorkspaceSafety(message.WorkspaceSafety)
+		}
 		if phase == courierv1alpha1.PhaseBlockedExternal {
 			intent.error = terminationReason
 		}
@@ -1073,7 +1089,7 @@ func (r *CoderRunReconciler) transitionTerminal(ctx context.Context, run *courie
 	// Write the terminal phase first so the run stops holding lane capacity
 	// regardless of whether the source lifecycle report below succeeds. The
 	// run's own terminalization must never depend on the source.
-	if run.Status.Phase != before.Status.Phase || run.Status.PR != before.Status.PR || !reflect.DeepEqual(run.Status.Telemetry, before.Status.Telemetry) || !reflect.DeepEqual(run.Status.TerminalDiagnostic, before.Status.TerminalDiagnostic) || !reflect.DeepEqual(run.Status.ControlRequest, before.Status.ControlRequest) || !reflect.DeepEqual(run.Status.ControlRequestAck, before.Status.ControlRequestAck) || !reflect.DeepEqual(run.Status.Conditions, before.Status.Conditions) {
+	if run.Status.Phase != before.Status.Phase || run.Status.PR != before.Status.PR || !reflect.DeepEqual(run.Status.Telemetry, before.Status.Telemetry) || !reflect.DeepEqual(run.Status.TerminalDiagnostic, before.Status.TerminalDiagnostic) || !reflect.DeepEqual(run.Status.ControlRequest, before.Status.ControlRequest) || !reflect.DeepEqual(run.Status.ControlRequestAck, before.Status.ControlRequestAck) || !reflect.DeepEqual(run.Status.WorkspaceSafety, before.Status.WorkspaceSafety) || !reflect.DeepEqual(run.Status.Conditions, before.Status.Conditions) {
 		if err := r.patchStatus(ctx, before, run); err != nil {
 			return ctrl.Result{}, err
 		}
@@ -1177,6 +1193,12 @@ func (r *CoderRunReconciler) publishSourceLifecycle(ctx context.Context, run *co
 	legacyNoChange := phase == courierv1alpha1.PhaseAwaitingReview && run.Status.DeclaredNoChange && run.Spec.Mode == courierv1alpha1.ModeFixPR
 	if legacyNoChange {
 		state = source.StateInProgress
+	}
+	if isCapacityExhaustionRun(run) {
+		lifecycle := lifecycleForPhase(phase, state, run.Status.PR, startedAtForRun(run), intent)
+		lifecycle.Result = source.ResultCapacityExhausted
+		lifecycle.IdempotencyKey = lifecycleIdempotencyKey(run, phase)
+		return reportLifecycle(ctx, adapter, item, lifecycle)
 	}
 	if state != "" {
 		if err := adapter.Transition(ctx, item, state); err != nil {
@@ -1441,6 +1463,14 @@ func reportLifecycle(ctx context.Context, adapter source.Adapter, item source.Wo
 // lifecycleForPhase maps a terminal phase to its source lifecycle report.
 // startedAt is the recorded coordinator start, so sources can report real run
 // durations; nil when the run never reached a recorded start.
+func startedAtForRun(run *courierv1alpha1.CoderRun) *time.Time {
+	if run.Status.StartedAt == nil {
+		return nil
+	}
+	t := run.Status.StartedAt.Time
+	return &t
+}
+
 func lifecycleForPhase(phase courierv1alpha1.Phase, state source.State, pr string, startedAt *time.Time, intent terminalLifecycleIntent) source.Lifecycle {
 	lifecycle := source.Lifecycle{State: state, PR: pr, StartedAt: startedAt}
 	switch phase {
@@ -1503,6 +1533,13 @@ func (r *CoderRunReconciler) patchStatus(ctx context.Context, before, after *cou
 	}
 	if before.Status.PR != after.Status.PR {
 		fields.PR = after.Status.PR
+	}
+	if !reflect.DeepEqual(before.Status.WorkspaceSafety, after.Status.WorkspaceSafety) {
+		fields.WorkspaceSafety = after.Status.WorkspaceSafety
+	}
+	if before.Status.SourceReceipt == "" && after.Status.SourceReceipt != "" {
+		receipt := after.Status.SourceReceipt
+		fields.SourceReceipt = &receipt
 	}
 	// Set-once fields: emitted only on the empty-to-set transition, so a
 	// patch can never clear a recorded timestamp.
@@ -1672,13 +1709,27 @@ func podBelongsToRun(pod *corev1.Pod, run *courierv1alpha1.CoderRun) bool {
 }
 
 type terminationMessage struct {
-	Phase    string                        `json:"phase"`
-	Result   string                        `json:"result"`
-	ExitCode int32                         `json:"exit_code"`
-	Reason   string                        `json:"reason"`
-	Outcome  string                        `json:"outcome"`
-	Category string                        `json:"category,omitempty"`
-	Summary  *courierv1alpha1.RunTelemetry `json:"summary"`
+	Phase           string                                   `json:"phase"`
+	Result          string                                   `json:"result"`
+	ExitCode        int32                                    `json:"exit_code"`
+	Reason          string                                   `json:"reason"`
+	Outcome         string                                   `json:"outcome"`
+	Category        string                                   `json:"category,omitempty"`
+	Summary         *courierv1alpha1.RunTelemetry            `json:"summary"`
+	WorkspaceSafety *courierv1alpha1.WorkspaceSafetyEvidence `json:"workspace_safety,omitempty"`
+}
+
+func boundedWorkspaceSafety(in *courierv1alpha1.WorkspaceSafetyEvidence) *courierv1alpha1.WorkspaceSafetyEvidence {
+	if in == nil || (in.State != "clean" && in.State != "dirty" && in.State != "empty" && in.State != "unknown" && in.State != "pushed") {
+		return nil
+	}
+	bound := func(value string, max int) string {
+		if len(value) > max {
+			return ""
+		}
+		return value
+	}
+	return &courierv1alpha1.WorkspaceSafetyEvidence{State: in.State, Branch: bound(in.Branch, 256), Head: bound(in.Head, 128), RemoteHead: bound(in.RemoteHead, 128)}
 }
 
 func validTerminationPhaseResult(exitCode int32, phase, result string) bool {

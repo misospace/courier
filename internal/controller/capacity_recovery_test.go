@@ -69,6 +69,8 @@ func TestCapacityRecoverySettlesIssueAndExistingPRFixWithFence(t *testing.T) {
 			run := admissionRun("exhausted", "pool-a", courierv1alpha1.PhaseBlockedExternal)
 			run.UID = "run-uid"
 			run.Spec.Mode, run.Spec.Source, run.Spec.WorkItemID = mode, "fake", "existing-work"
+			run.Status.Branch = "branch"
+			run.Status.WorkspaceSafety = &courierv1alpha1.WorkspaceSafetyEvidence{State: "empty"}
 			run.Status.TerminalDiagnostic = &courierv1alpha1.TerminalDiagnostic{Category: courierv1alpha1.TerminalDiagnosticCategoryCapacityExhaustion}
 			run.Status.Conditions = append(run.Status.Conditions, metav1.Condition{Type: lifecycleReportedCondition, Status: metav1.ConditionTrue, Reason: "Published"})
 			lane := admissionLane("pool-a", 1)
@@ -105,6 +107,8 @@ func TestCapacityRecoverySettlesIssueAndExistingPRFixWithFence(t *testing.T) {
 func TestCapacityRecoveryRetriesWithSameKeyAfterReconcileReconstruction(t *testing.T) {
 	run := admissionRun("exhausted", "pool-a", courierv1alpha1.PhaseBlockedExternal)
 	run.UID, run.Spec.Source, run.Spec.WorkItemID = "run-uid", "fake", "work"
+	run.Status.Branch = "branch"
+	run.Status.WorkspaceSafety = &courierv1alpha1.WorkspaceSafetyEvidence{State: "empty"}
 	run.Status.TerminalDiagnostic = &courierv1alpha1.TerminalDiagnostic{Category: courierv1alpha1.TerminalDiagnosticCategoryCapacityExhaustion}
 	run.Status.Conditions = append(run.Status.Conditions, metav1.Condition{Type: lifecycleReportedCondition, Status: metav1.ConditionTrue, Reason: "Published"})
 	c := capacityTestClient(t, admissionLane("pool-a", 1), run)
@@ -127,6 +131,8 @@ func TestCapacityRecoveryRetriesWithSameKeyAfterReconcileReconstruction(t *testi
 func TestCapacityRecoveryReplaysCommittedSettlementAfterStatusPatchFailure(t *testing.T) {
 	run := admissionRun("exhausted", "pool-a", courierv1alpha1.PhaseBlockedExternal)
 	run.UID, run.Spec.Source, run.Spec.WorkItemID = "run-uid", "fake", "work"
+	run.Status.Branch = "branch"
+	run.Status.WorkspaceSafety = &courierv1alpha1.WorkspaceSafetyEvidence{State: "empty"}
 	run.Status.TerminalDiagnostic = &courierv1alpha1.TerminalDiagnostic{Category: courierv1alpha1.TerminalDiagnosticCategoryCapacityExhaustion}
 	run.Status.Conditions = append(run.Status.Conditions, metav1.Condition{Type: lifecycleReportedCondition, Status: metav1.ConditionTrue, Reason: "Published"})
 	c := capacityTestClient(t, admissionLane("pool-a", 1), run)
@@ -335,6 +341,7 @@ func TestCapacityRecoveryFailsClosedForUnsupportedAndLiveWriters(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			run := admissionRun("exhausted", "pool-a", courierv1alpha1.PhaseBlockedExternal)
 			run.UID, run.Spec.Source, run.Spec.WorkItemID = "run-uid", "fake", "work"
+			run.Status.WorkspaceSafety = &courierv1alpha1.WorkspaceSafetyEvidence{State: "empty"}
 			run.Status.TerminalDiagnostic = &courierv1alpha1.TerminalDiagnostic{Category: courierv1alpha1.TerminalDiagnosticCategoryCapacityExhaustion}
 			run.Status.Conditions = append(run.Status.Conditions, metav1.Condition{Type: lifecycleReportedCondition, Status: metav1.ConditionTrue, Reason: "Published"})
 			objects := []runtime.Object{admissionLane("pool-a", 1), run}

@@ -51,16 +51,6 @@ type API = Client
 
 // Adapter translates Courier's generic source lifecycle into Dispatch API
 // calls.
-//
-// The adapter deliberately does NOT implement source.CapacityRecovery: the
-// current Dispatch contract cannot fence settlement — issue unclaim is not
-// bound to a claim generation/token, and the PR-fix queue has no capacity
-// handoff mark. Simulating fenced settlement with the existing Release or
-// lifecycle calls would let a stale attempt move a replacement's ownership,
-// so capacity-exhausted work on Dispatch keeps its BlockedExternal lifecycle
-// (a recoverable wait, no task-repair budget consumed) and its operator-side
-// recovery procedure until the connector gains real fencing.
-// Connector gap: misospace/dispatch#1256.
 type Adapter struct {
 	client Client
 }
@@ -72,6 +62,8 @@ var _ source.Adapter = (*Adapter)(nil)
 var _ source.Reporter = (*Adapter)(nil)
 var _ source.PreLauncher = (*Adapter)(nil)
 var _ source.WorkIdentifier = (*Adapter)(nil)
+var _ source.CapacityRecoveryPreparer = (*Adapter)(nil)
+var _ source.CapacityRecovery = (*Adapter)(nil)
 
 // New creates a Dispatch adapter around an injected API client.
 func New(client Client) *Adapter {
@@ -98,6 +90,16 @@ func (a *Adapter) Discover(ctx context.Context) ([]source.WorkItem, error) {
 	return a.client.Discover(ctx)
 }
 
+func (a *Adapter) DiscoverForCapacity(ctx context.Context, capacityID string, exclusions []source.WorkItem) ([]source.WorkItem, error) {
+	if err := a.validateClient(); err != nil {
+		return nil, err
+	}
+	if client, ok := a.client.(source.CapacityAwareDiscoverer); ok {
+		return client.DiscoverForCapacity(ctx, capacityID, exclusions)
+	}
+	return a.DiscoverExcluding(ctx, exclusions)
+}
+
 // DiscoverExcluding uses the optional client capability, preserving compatibility
 // with clients that only implement the original discovery contract.
 func (a *Adapter) DiscoverExcluding(ctx context.Context, exclusions []source.WorkItem) ([]source.WorkItem, error) {
@@ -118,6 +120,25 @@ func (a *Adapter) Claim(ctx context.Context, item source.WorkItem) error {
 		return err
 	}
 	return a.client.Claim(ctx, item.ID)
+}
+
+// ClaimWithReceipt captures Dispatch's issued claim token as opaque durable context.
+func (a *Adapter) ClaimWithReceipt(ctx context.Context, item source.WorkItem) (source.WorkItem, error) {
+	if err := a.validate(item); err != nil {
+		return source.WorkItem{}, err
+	}
+	claimer, ok := a.client.(interface {
+		ClaimWithReceipt(context.Context, string, string) (string, error)
+	})
+	if !ok {
+		return source.WorkItem{}, fmt.Errorf("dispatch source: client does not support claim receipts")
+	}
+	receipt, err := claimer.ClaimWithReceipt(ctx, item.ID, item.Context)
+	if err != nil {
+		return source.WorkItem{}, err
+	}
+	item.Context = receipt
+	return item, nil
 }
 
 // Release returns a claimed item to Dispatch after coordinator launch fails.
@@ -166,6 +187,32 @@ func (a *Adapter) InReview(ctx context.Context, item source.WorkItem) error {
 // NeedsHuman marks item as requiring human intervention.
 func (a *Adapter) NeedsHuman(ctx context.Context, item source.WorkItem) error {
 	return a.Transition(ctx, item, source.StateNeedsHuman)
+}
+
+func (a *Adapter) PrepareCapacityRecovery(ctx context.Context, item source.WorkItem, _ source.CapacityRecoveryAttempt) (source.CapacityRecoveryProof, error) {
+	if err := a.validate(item); err != nil {
+		return source.CapacityRecoveryProof{}, err
+	}
+	preparer, ok := a.client.(interface {
+		PrepareCapacityRecovery(context.Context, string, string) (source.CapacityRecoveryProof, error)
+	})
+	if !ok {
+		return source.CapacityRecoveryProof{}, source.ErrUnsupportedCapacityRecovery
+	}
+	return preparer.PrepareCapacityRecovery(ctx, item.ID, item.Context)
+}
+
+func (a *Adapter) SettleCapacityExhaustion(ctx context.Context, item source.WorkItem, handoff source.CapacityHandoff) error {
+	if err := a.validate(item); err != nil {
+		return err
+	}
+	settler, ok := a.client.(interface {
+		SettleCapacityExhaustion(context.Context, string, string, source.CapacityHandoff) error
+	})
+	if !ok {
+		return source.ErrUnsupportedCapacityRecovery
+	}
+	return settler.SettleCapacityExhaustion(ctx, item.ID, item.Context, handoff)
 }
 
 // Report publishes lifecycle audit metadata to Dispatch.

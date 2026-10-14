@@ -16,6 +16,23 @@ import (
 	"github.com/misospace/courier/internal/source"
 )
 
+func TestHTTPClientDiscoverForCapacityUsesCapacityParameter(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Query().Get("capacity") != "pool-a" || r.URL.Query().Has("capacity_id") {
+			t.Fatalf("query = %s", r.URL.RawQuery)
+		}
+		_ = json.NewEncoder(w).Encode(Task{Type: "idle"})
+	}))
+	defer server.Close()
+	client, err := NewClientWithLane(server.URL, "worker", "normal", "token", time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := client.DiscoverForCapacity(context.Background(), "pool-a", nil); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestHTTPClientDiscoverMapsTasksAndQueueLane(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/prefix/api/agents/worker/next-task" || r.URL.Query().Get("lane") != "normal" {
@@ -589,7 +606,7 @@ func TestHTTPClientClaimResolvesImplementIssueIDFromState(t *testing.T) {
 		if err := json.Unmarshal(body, &request); err != nil {
 			t.Fatal(err)
 		}
-		w.WriteHeader(http.StatusNoContent)
+		_ = json.NewEncoder(w).Encode(map[string]string{"claimToken": "claim-receipt"})
 	}))
 	defer server.Close()
 
@@ -598,8 +615,12 @@ func TestHTTPClientClaimResolvesImplementIssueIDFromState(t *testing.T) {
 		t.Fatal(err)
 	}
 	id := EncodeWorkID(Task{Type: "implement", Issue: &Issue{ID: "stale-client-id", Repo: "acme/widgets", Number: 42}})
-	if err := client.Claim(context.Background(), id); err != nil {
+	receipt, err := client.ClaimWithReceipt(context.Background(), id, "")
+	if err != nil {
 		t.Fatal(err)
+	}
+	if !strings.Contains(receipt, "claim-receipt") {
+		t.Fatalf("receipt = %q, want claim token", receipt)
 	}
 	if request["issueId"] != "opaque-issue" || request["repoFullName"] != "acme/widgets" || request["issueNumber"] != float64(42) || request["agentName"] != "worker" {
 		t.Fatalf("request = %#v", request)
@@ -895,6 +916,27 @@ func TestHTTPClientReportCarriesIdempotencyKey(t *testing.T) {
 	}
 	if request["idempotencyKey"] != key {
 		t.Fatalf("request = %#v", request)
+	}
+}
+
+func TestHTTPClientReportOmitsIdempotencyKeyWhenUnsupported(t *testing.T) {
+	var request map[string]any
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewDecoder(r.Body).Decode(&request)
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer server.Close()
+	client, err := NewClientWithLane(server.URL, "worker", "normal", "secret-token", time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	client.WithReportIdempotency(false)
+	id := EncodeWorkID(Task{Type: "implement", Issue: &Issue{Repo: "acme/widgets", Number: 42}})
+	if err := client.Report(context.Background(), id, source.Lifecycle{Result: source.ResultReady, IdempotencyKey: "run/phase"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := request["idempotencyKey"]; ok {
+		t.Fatalf("unsupported handler received idempotencyKey: %#v", request)
 	}
 }
 

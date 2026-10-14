@@ -271,9 +271,7 @@ affirmative trusted safety proof; settle atomically applies it. Incomplete proof
 unsupported capability, or stale fencing retains ownership. Transient settlement
 errors are retried with the same run-scoped idempotency key after controller
 reconstruction. The fake contract exercises both resolve-issue and fix-PR paths,
-including preserved branch/PR metadata; it is not production evidence. The
-Dispatch adapter still lacks these interfaces (#1256), so production Dispatch
-recovery remains unsupported. Discovery and dedupe bypass history only for a
+including preserved branch/PR metadata; Dispatch implements the interfaces via the merged #1259 receipt-fenced endpoints. Issue settlement is fenced by the issued claim token, but the merged capacity-handoff endpoint does not accept a settlement idempotency key or durably replay success after release: a lost success response can therefore leave Courier holding ownership despite the source having released it. PR-fix capacity settlement uses the issued per-handout receipt. Lifecycle task reports separately support payload-bound replay when given a stable idempotency key. Discovery and dedupe bypass history only for a
 `BlockedExternal` capacity-exhaustion run with `CapacityRecovery=True/Settled`
 and `LifecycleReported=True`; the exact consumed `WorkItemID` remains
 suppressed, requiring a fresh opaque attempt ID. Other, incomplete, and human
@@ -1510,19 +1508,29 @@ exhaustion history permits rediscovery with a fresh opaque source attempt ID;
 the consumed ID remains excluded, and the old run is retained for diagnostics.
 
 Dispatch and Courier are independent systems connected by an adapter, not hard
-dependencies. The current Dispatch contract does not satisfy fenced capacity
-settlement: issue unclaim is not bound to claim generation/token, and PR-fix
-lacks a capacity handoff mark. Courier must not simulate fencing with ordinary
-lifecycle or release calls. [Dispatch #1256](https://github.com/misospace/dispatch/issues/1256)
-tracks that connector gap; it does not block source-neutral core work. The core
-requires `CapacityRecoveryPreparer` to return an authoritative source-owned
-claim receipt and affirmative workspace-safety proof, then invokes atomic
-`CapacityRecovery` settlement with a stable idempotency key. Missing or incomplete
-proof holds ownership; evidence absence and a run UID are not proof. The adapter
-must preserve existing branch/PR identity and safely account for unpushed work.
-No production connector currently implements this verification and settlement
-pair. Core regression coverage uses a capable fake source; this change does not
-claim automatic recovery through Dispatch or automatic dirty-work transfer.
+dependencies. Dispatch #1259 supplies dedicated fenced capacity handoff APIs;
+only the Dispatch adapter knows their HTTP routes, issued claim/handout receipts,
+and generation semantics. Discovery declares the configured opaque capacity,
+claims preserve source receipts in bounded opaque run metadata, and PR-fix
+settlement validates the returned resolution rather than treating HTTP 200 as
+proof of release. Ordinary external waits and task failures keep their existing
+semantics; capacity exhaustion does not first park the queue as an external wait.
+
+The core requires trusted secure-executor workspace evidence before invoking
+`CapacityRecoveryPreparer` and `CapacityRecovery`. Legacy or missing evidence,
+dirty work, and unknown remote state hold ownership. The current native evidence
+producer proves only a clean, unchanged integration workspace safe; committed
+work remains unknown until authoritative remote confirmation is implemented.
+Evidence absence and a run UID are not proof. No automatic dirty-work transfer
+is claimed. Source-specific receipts are sensitive opaque metadata, never model
+inputs or capacity identities.
+
+PR-fix reports carry the stable settlement idempotency key and must return a
+matching deferred resolution. Dispatch issue handoff currently lacks a durable
+same-key success replay surface: after source release succeeds but the run status
+write is lost, a stale-token response remains a conservative hold rather than
+manufactured success. Full cross-worker issue rediscovery and committed-partial-
+work recovery remain incomplete; this is not the full #327 acceptance guarantee.
 
 Operator recovery remains manual and item-specific:
 

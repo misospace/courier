@@ -38,7 +38,11 @@ var ErrUnsupportedOutcome = errors.New("source: unsupported lifecycle outcome")
 // WorkItem identifies work in a source. ID is intentionally opaque: sources
 // are free to choose their identifier format, and the core must not know about
 // a source's queue or API types.
+const MaxSourceContextBytes = 16 * 1024
+
+// WorkItem carries source-owned opaque context. Core code copies it without decoding.
 type WorkItem struct {
+	Context string
 	// ID is the source's opaque identifier used for claim and lifecycle calls.
 	ID string
 	// Mode, Repo, Ref, and Lane are the source-provided run identity.
@@ -55,8 +59,9 @@ type WorkItem struct {
 // CoderRun. A source adapter owns discovery; the operator owns the Kubernetes
 // object and sets Source to its adapter name.
 type RunSpec struct {
-	Mode   string
-	Source string
+	Context string
+	Mode    string
+	Source  string
 	// WorkItemID is copied from WorkItem.ID so it remains available for
 	// lifecycle calls after the source item has been materialized as a run.
 	WorkItemID string
@@ -69,6 +74,7 @@ type RunSpec struct {
 // Spec returns the immutable run data carried by a discovered work item.
 func (w WorkItem) Spec(sourceName string) RunSpec {
 	return RunSpec{
+		Context:    w.Context,
 		Mode:       w.Mode,
 		Source:     sourceName,
 		WorkItemID: w.ID,
@@ -99,6 +105,8 @@ const (
 	ResultReady Result = "ready"
 	// ResultBlocked marks work requiring human intervention.
 	ResultBlocked Result = "blocked"
+	// ResultCapacityExhausted explicitly returns an issued attempt due to exhausted execution capacity.
+	ResultCapacityExhausted Result = "capacity-exhausted"
 	// ResultBlockedExternal marks work blocked on an external prerequisite
 	// that Courier cannot satisfy itself. It is recoverable: unlike
 	// ResultBlocked it must not park the item for a human, so a source may
@@ -188,9 +196,10 @@ type CapacityHandoff struct {
 	// settle or release the same attempt twice.
 	IdempotencyKey string
 	// Existing work identity carried forward for a compatible new attempt.
-	WorkIdentity string
-	Branch       string
-	PR           string
+	WorkIdentity     string
+	Branch           string
+	PR               string
+	CapacityIdentity string
 }
 
 // CapacityRecovery is the optional fenced settlement boundary for confirmed
@@ -233,6 +242,12 @@ type DiscoveryExcluder interface {
 	DiscoverExcluding(context.Context, []WorkItem) ([]WorkItem, error)
 }
 
+// CapacityAwareDiscoverer optionally scopes discovery to the lane's current
+// capacity identity. The identity is passed per call to avoid shared adapter mutation.
+type CapacityAwareDiscoverer interface {
+	DiscoverForCapacity(context.Context, string, []WorkItem) ([]WorkItem, error)
+}
+
 // PreLauncher optionally revalidates claimed work immediately before launch.
 // ErrStaleWork means the claim was released because the work no longer needs a
 // coordinator; other errors leave the run retryable.
@@ -246,6 +261,11 @@ type PreLauncher interface {
 //
 // No source-specific request, response, or status type belongs here. An
 // adapter translates this contract to its own API.
+// ClaimerWithReceipt returns source-issued claim context required for durable fencing.
+type ClaimerWithReceipt interface {
+	ClaimWithReceipt(context.Context, WorkItem) (WorkItem, error)
+}
+
 type Adapter interface {
 	// Discover returns source work that should become CoderRuns. It must not
 	// claim items; claiming is a separate compare-and-set step.

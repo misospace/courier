@@ -1,6 +1,8 @@
 package v1alpha1
 
-import metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+import (
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+)
 
 // Mode is the kind of work a CoderRun performs.
 // +kubebuilder:validation:Enum=resolve-issue;fix-pr
@@ -133,6 +135,11 @@ type CoderRunSpec struct {
 	// +kubebuilder:validation:Pattern=`^[A-Za-z0-9._-]*$`
 	SourceAgent string `json:"sourceAgent,omitempty"`
 
+	// SourceContext is bounded opaque source-owned JSON, never interpreted by core.
+	// +optional
+	// +kubebuilder:validation:MaxLength=16384
+	SourceContext string `json:"sourceContext,omitempty"`
+
 	// WorkItemID is the opaque identifier assigned by the source adapter. It
 	// is persisted so lifecycle calls never need to infer source identity from
 	// the Kubernetes name or the numeric ref.
@@ -233,6 +240,14 @@ const (
 	// ambiguous.
 	TerminalDiagnosticCategoryUnknown TerminalDiagnosticCategory = "unknown"
 )
+
+// WorkspaceSafetyEvidence is the executor's trusted workspace snapshot.
+type WorkspaceSafetyEvidence struct {
+	State string `json:"state,omitempty"`
+	Branch string `json:"branch,omitempty"`
+	Head string `json:"head,omitempty"`
+	RemoteHead string `json:"remoteHead,omitempty"`
+}
 
 // TerminalDiagnostic is the durable, bounded, redacted record of how a run's
 // coordinator ended. The operator captures it before pod cleanup so the cause
@@ -426,6 +441,11 @@ type PublicationPolicy struct {
 
 // CoderRunStatus is the observed state of a CoderRun.
 type CoderRunStatus struct {
+	// SourceReceipt is sensitive source-issued claim fencing data.
+	// +optional
+	// +kubebuilder:validation:MaxLength=16384
+	SourceReceipt string `json:"sourceReceipt,omitempty"`
+
 	// Phase is the current lifecycle phase.
 	// +optional
 	Phase Phase `json:"phase,omitempty"`
@@ -563,6 +583,11 @@ type CoderRunStatus struct {
 	// runs that ended before the event stream could be tallied.
 	// +optional
 	Telemetry *RunTelemetry `json:"telemetry,omitempty"`
+
+	// WorkspaceSafety is the bounded trusted snapshot reported by the executor
+	// at terminal handoff. It is informational unless independently verified.
+	// +optional
+	WorkspaceSafety *WorkspaceSafetyEvidence `json:"workspaceSafety,omitempty"`
 
 	// TerminalDiagnostic is the durable, bounded, redacted record of how the
 	// run's coordinator ended, captured by the operator before pod cleanup so

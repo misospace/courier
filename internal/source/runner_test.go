@@ -17,7 +17,7 @@ import (
 
 func TestRunnerPollMaterializesAndDeduplicatesByOpaqueID(t *testing.T) {
 	adapter := &testAdapter{items: []WorkItem{
-		{ID: "opaque-a", Mode: "resolve-issue", Repo: "acme/widgets", Ref: 1, Lane: "source-lane"},
+		{ID: "opaque-a", Context: `{"opaque":"receipt"}`, Mode: "resolve-issue", Repo: "acme/widgets", Ref: 1, Lane: "source-lane"},
 		{ID: "opaque-a", Mode: "resolve-issue", Repo: "acme/other", Ref: 99, Lane: "source-lane"},
 		{ID: "opaque-b", Mode: "fix-pr", Repo: "acme/widgets", Ref: 2, Lane: "source-lane"},
 	}}
@@ -40,6 +40,9 @@ func TestRunnerPollMaterializesAndDeduplicatesByOpaqueID(t *testing.T) {
 		}
 		if run.Spec.Source != "dispatch" || run.Spec.WorkItemID == "" {
 			t.Fatalf("run identity = %#v", run.Spec)
+		}
+		if run.Spec.WorkItemID == "opaque-a" && run.Spec.SourceContext != `{"opaque":"receipt"}` {
+			t.Fatalf("source context = %q, want opaque context preserved", run.Spec.SourceContext)
 		}
 	}
 	if err := runner.Poll(context.Background()); err != nil {
@@ -78,7 +81,7 @@ func TestRunnerDiscoveryExclusionsAreOpaqueAndSourceScoped(t *testing.T) {
 		t.Fatalf("exclusions = %#v, want only the retained dispatch run", adapter.exclusions)
 	}
 	want := (WorkItem{ID: "opaque/generation-7", Mode: "fix-pr", Repo: "acme/widgets", Ref: 42})
-	if adapter.exclusions[0] != want {
+	if !reflect.DeepEqual(adapter.exclusions[0], want) {
 		t.Fatalf("exclusion = %#v, want %#v", adapter.exclusions[0], want)
 	}
 	var runs courierv1alpha1.CoderRunList
@@ -245,7 +248,7 @@ func TestRunnerExclusionOmitsOnlySettledCapacityRuns(t *testing.T) {
 				return
 			}
 			want := (WorkItem{ID: "opaque/generation-7", Mode: "fix-pr", Repo: "acme/widgets", Ref: 42})
-			if len(adapter.exclusions) != 1 || adapter.exclusions[0] != want {
+			if len(adapter.exclusions) != 1 || !reflect.DeepEqual(adapter.exclusions[0], want) {
 				t.Fatalf("exclusions = %#v, want the retained %s run", adapter.exclusions, phase)
 			}
 		})
