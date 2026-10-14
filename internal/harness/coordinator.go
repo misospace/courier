@@ -59,6 +59,35 @@ type Coordinator struct {
 	// admission anchor. The soft-stop finish derives the outcome from that
 	// observation, never from a model declaration.
 	workRefBeyondAnchor func(context.Context) (bool, error)
+
+	// deferredAvailability carries a sub-agent stream failure classified as
+	// deferred model-provider availability (#320) from the delegation
+	// boundary to the coordinator loop, which ends the run recoverably
+	// before any further request can burn the exhausted binding.
+	deferredAvailability   error
+	deferredAvailabilityMu sync.Mutex
+}
+
+// recordDeferredAvailability keeps the first deferred provider-availability
+// failure raised across a delegation boundary. Only the structured
+// classification travels; the raw provider error never reaches the
+// coordinator's transcript as tool data.
+func (c *Coordinator) recordDeferredAvailability(err error) {
+	c.deferredAvailabilityMu.Lock()
+	defer c.deferredAvailabilityMu.Unlock()
+	if c.deferredAvailability == nil {
+		c.deferredAvailability = err
+	}
+}
+
+// takeDeferredAvailability removes and returns a recorded deferred
+// provider-availability failure, if any.
+func (c *Coordinator) takeDeferredAvailability() error {
+	c.deferredAvailabilityMu.Lock()
+	defer c.deferredAvailabilityMu.Unlock()
+	err := c.deferredAvailability
+	c.deferredAvailability = nil
+	return err
 }
 
 // CoordinatorConfig assembles the harness. Worker, snapshot, forge, and
@@ -157,6 +186,9 @@ func (c *Coordinator) Run(ctx context.Context, inv executor.Invocation) executor
 		}
 		turn := c.pump(ctx, session, "", c.coordinatorTools())
 		if turn.streamErr != nil {
+			if result, ok := availabilityEnding(turn.streamErr); ok {
+				return result
+			}
 			return executor.HarnessResult{Err: fmt.Errorf("harness: model stream failed: %w", turn.streamErr)}
 		}
 		if turn.final {
@@ -183,6 +215,34 @@ func (c *Coordinator) Run(ctx context.Context, inv executor.Invocation) executor
 			}
 		}
 	}
+}
+
+// availabilityEnding maps a deferred model-provider availability failure — a
+// confirmed allowance exhaustion, or a transient failure whose authoritative
+// reset hint is longer than this incarnation should spin on — to a recoverable
+// blocked-external ending. It is not a human decision, a code failure, or a
+// claim of no progress: the source re-offers the work when capacity returns
+// (#320).
+func availabilityEnding(err error) (executor.HarnessResult, bool) {
+	classification, ok := providerClassificationOf(err)
+	if !ok || !classification.Deferred() {
+		return executor.HarnessResult{}, false
+	}
+	return executor.HarnessResult{
+		Outcome: executor.OutcomeBlockedExternal,
+		Reason:  providerAvailabilityReason(classification),
+	}, true
+}
+
+// providerAvailabilityReason renders a bounded, redacted explanation of a
+// deferred provider-availability failure. It names only the fixed class and,
+// when recognized, the short allowlisted provider code.
+func providerAvailabilityReason(classification ProviderClassification) string {
+	reason := "model provider capacity is temporarily unavailable (" + string(classification.Availability) + ")"
+	if classification.Code != "" {
+		reason += ", provider code " + classification.Code
+	}
+	return reason + "; the run is recoverable and will resume when capacity returns"
 }
 
 // turnResult is one processed model turn.
@@ -237,6 +297,23 @@ func (c *Coordinator) pump(ctx context.Context, session *Session, briefID string
 		event := Event{Kind: KindToolResult, Result: result}
 		session.Append(ToolResultMessage(event.Result))
 		toolResults = append(toolResults, event)
+		// A delegated session that died on deferred provider availability
+		// (#320) ends the run now, before this session's next request: the
+		// coordinator's own binding may be healthy, and letting it take
+		// another turn would let it re-delegate onto the exhausted binding
+		// or declare a false ending. The run ends through the same
+		// availability ending as the coordinator's own stream failure.
+		// The hand-off is scoped to the coordinator's own loop: a
+		// sub-agent pump never consumes it, so a recorded failure can
+		// only abort the session that owns the run. The transcript may
+		// hold fewer tool results than the assistant message requested,
+		// which is safe because the ending discards the session; the
+		// earned events are still returned, not dropped.
+		if briefID == "" {
+			if deferred := c.takeDeferredAvailability(); deferred != nil {
+				return turnResult{streamErr: deferred, toolResults: toolResults}
+			}
+		}
 	}
 	return turnResult{toolResults: toolResults}
 }
@@ -635,7 +712,20 @@ func (c *Coordinator) runDelegate(ctx context.Context, call ToolCall, result Too
 		result.Content = "workspace snapshot could not be prepared: " + safeToolError(err)
 		return result
 	}
-	summary, completed := c.runBrief(ctx, registered)
+	summary, completed, unavailable := c.runBrief(ctx, registered)
+	if unavailable != nil {
+		// Deferred provider availability on the role-bound binding (#320):
+		// the structured classification crosses the delegation boundary
+		// through the coordinator loop, which ends the run blocked-external
+		// before any further request. The brief keeps its spent ID and its
+		// partial commits stay untrusted worker data — nothing is packed,
+		// integrated, or published — and the tool-visible text is fixed and
+		// redacted, never the provider body.
+		c.recordDeferredAvailability(unavailable)
+		result.IsError = true
+		result.Content = "the delegated model binding is temporarily unavailable; the run ends recoverably and this brief's incomplete work is not integrated"
+		return result
+	}
 	if !completed {
 		// A brief that never reached its final result has no outcome to
 		// integrate: its partial commits stay untrusted worker data and
@@ -733,26 +823,36 @@ func (c *Coordinator) packAndIntegrate(ctx context.Context, brief Brief, dispatc
 // failure as data with completed=false — whatever the worker committed
 // before the failure is partial work that must never be packed,
 // integrated, or published (§7's cadence is per completed unit).
-func (c *Coordinator) runBrief(ctx context.Context, brief Brief) (summary string, completed bool) {
+//
+// A stream failure classified as deferred model-provider availability is
+// the exception (#320): it returns the typed error as unavailable instead
+// of flattening it to tool data, because the coordinator's own binding may
+// stay healthy while the role-bound binding is exhausted, and treating
+// that as ordinary brief failure invites further delegations onto the
+// exhausted binding.
+func (c *Coordinator) runBrief(ctx context.Context, brief Brief) (summary string, completed bool, unavailable error) {
 	session, err := NewSession(c.gateway, c.bindings, brief.Role, c.activity)
 	if err != nil {
-		return safeToolError(err), false
+		return safeToolError(err), false, nil
 	}
 	session.Append(Message{Role: "system", Content: briefText(brief) + "\n\n" + subagentFraming})
 	for {
 		turn := c.pump(ctx, session, brief.ID, c.subagentTools())
 		if turn.streamErr != nil {
-			// Deliberate: a subagent stream failure becomes tool-visible
-			// data for the coordinator, which owns the brief's fate; the
-			// coordinator's own next turn surfaces a gateway outage as
-			// the §8 infrastructure failure.
-			return "sub-agent stream failed: " + safeToolError(turn.streamErr), false
+			if classification, ok := providerClassificationOf(turn.streamErr); ok && classification.Deferred() {
+				return "", false, turn.streamErr
+			}
+			// Deliberate: an ordinary subagent stream failure becomes
+			// tool-visible data for the coordinator, which owns the
+			// brief's fate; the coordinator's own next turn surfaces a
+			// gateway outage as the §8 infrastructure failure.
+			return "sub-agent stream failed: " + safeToolError(turn.streamErr), false, nil
 		}
 		if turn.final {
-			return turn.text, true
+			return turn.text, true, nil
 		}
 		if turn.toolResults == nil {
-			return "sub-agent ended without a result", false
+			return "sub-agent ended without a result", false, nil
 		}
 	}
 }

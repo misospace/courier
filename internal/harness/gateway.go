@@ -5,12 +5,13 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"sort"
+	"strconv"
 	"strings"
+	"time"
 )
 
 // Gateway is the LiteLLM-compatible model gateway client: the harness's only
@@ -26,6 +27,11 @@ type Gateway struct {
 	// gateway accepts unauthenticated callers.
 	APIKey string
 	HTTP   *http.Client
+	// ExhaustionSignals names the structured provider signals that mean a
+	// model allowance is spent rather than a transient rate limit (#320). An
+	// empty value falls back to the provider-neutral defaults; deployments
+	// extend the defaults through configuration.
+	ExhaustionSignals ExhaustionSignals
 }
 
 func (g *Gateway) client() *http.Client {
@@ -33,6 +39,15 @@ func (g *Gateway) client() *http.Client {
 		return g.HTTP
 	}
 	return http.DefaultClient
+}
+
+// signals returns the configured exhaustion signals, falling back to the
+// provider-neutral defaults when the deployment configures none.
+func (g *Gateway) signals() ExhaustionSignals {
+	if g.ExhaustionSignals.Empty() {
+		return DefaultExhaustionSignals()
+	}
+	return g.ExhaustionSignals
 }
 
 // Message is one conversation message in the normalized transcript. Role is
@@ -144,17 +159,27 @@ func (g *Gateway) StreamChat(ctx context.Context, req ChatRequest) ([]Event, err
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return []Event{{Kind: KindError, Err: gatewayStatusError(resp.StatusCode)}}, nil
+		// Read only a bounded prefix of the error body to classify the
+		// failure. The body is never retained or echoed: a provider error
+		// may quote credentials, endpoints, or model-influenced text, and the
+		// capability contract requires a safe reason instead.
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, maxProviderErrorBody))
+		return []Event{{Kind: KindError, Err: gatewayStatusError(resp.StatusCode, resp.Header, body, g.signals())}}, nil
 	}
-	return normalizeStream(resp.Body)
+	return normalizeStream(resp.Body, g.signals())
 }
 
-// gatewayStatusError maps a gateway HTTP status to a redacted, actionable
-// error. Provider response bodies are never echoed: they may quote upstream
-// endpoints, key material, or model-influenced text, and the capability
-// contract requires a safe reason instead.
-func gatewayStatusError(status int) error {
-	return &GatewayError{Status: status}
+// gatewayStatusError maps a gateway HTTP status to a redacted, classified,
+// actionable error. Provider response bodies are never echoed.
+func gatewayStatusError(status int, header http.Header, body []byte, signals ExhaustionSignals) *GatewayError {
+	classification := ClassifyProviderError(status, header, body, signals)
+	return &GatewayError{
+		Status:       status,
+		Availability: classification.Availability,
+		ProviderCode: classification.Code,
+		RetryAfter:   classification.RetryAfter,
+		Retryable:    classification.Retryable,
+	}
 }
 
 // GatewayTransportError is a transport-class gateway failure: dial, reset,
@@ -168,14 +193,45 @@ func (e *GatewayTransportError) Error() string {
 
 func (e *GatewayTransportError) Unwrap() error { return e.Err }
 
-// GatewayError is a redacted gateway failure. It carries only the status and
-// a fixed category — never a provider response body.
+// GatewayError is a redacted, classified gateway failure. It carries the
+// status, a fixed availability class, and at most a short allowlisted provider
+// signal — never a provider response body.
 type GatewayError struct {
 	Status int
+	// Availability is the provider-availability class. Empty means the error
+	// was built without classification (a legacy literal); callers fall back
+	// to status-based retryability.
+	Availability ProviderAvailability
+	// ProviderCode is the bounded structured provider error code or type when
+	// recognized; empty otherwise.
+	ProviderCode string
+	// RetryAfter is the parsed authoritative reset/retry hint, zero when
+	// absent or unknown.
+	RetryAfter time.Duration
+	// Retryable reports whether an immediate in-process retry can succeed.
+	// Only meaningful when Availability is set.
+	Retryable bool
 }
 
 func (e *GatewayError) Error() string {
+	if e.Status == 0 && e.Availability != "" {
+		return fmt.Sprintf("harness: gateway reported a stream error (%s)", e.Availability)
+	}
 	return fmt.Sprintf("harness: gateway returned status %d (%s)", e.Status, httpStatusCategory(e.Status))
+}
+
+// classification returns the error's classification, defaulting to a
+// status-derived one for an error built without explicit classification.
+func (e *GatewayError) classification() ProviderClassification {
+	if e.Availability == "" {
+		return ClassifyProviderError(e.Status, nil, nil, DefaultExhaustionSignals())
+	}
+	return ProviderClassification{
+		Availability: e.Availability,
+		Code:         e.ProviderCode,
+		RetryAfter:   e.RetryAfter,
+		Retryable:    e.Retryable,
+	}
 }
 
 func httpStatusCategory(status int) string {
@@ -195,12 +251,33 @@ func httpStatusCategory(status int) string {
 	}
 }
 
-// isTransientGatewayStatus reports whether a gateway status is worth
-// retrying in-process: gateway-side failures (5xx) and the two explicitly
-// retryable client statuses (request timeout, rate limit). Every other 4xx
-// is a configuration or request-shape problem that retrying cannot fix.
-func isTransientGatewayStatus(status int) bool {
-	return status >= 500 || status == http.StatusRequestTimeout || status == http.StatusTooManyRequests
+// streamErrorClassification classifies a provider error object that arrived
+// inside a 200 stream. It carries no HTTP status, so only a recognized
+// structured signal is placed; everything else is unknown.
+func streamErrorClassification(wire *wireError, signals ExhaustionSignals) error {
+	classification := classifyStreamSignal(wireCodeString(wire.Code), wire.Type, signals)
+	return &GatewayError{
+		Status:       0,
+		Availability: classification.Availability,
+		ProviderCode: classification.Code,
+		RetryAfter:   classification.RetryAfter,
+		Retryable:    classification.Retryable,
+	}
+}
+
+// wireCodeString renders a decoded JSON error code (string or number) as a
+// string, or empty for any other shape.
+func wireCodeString(code any) string {
+	switch value := code.(type) {
+	case string:
+		return value
+	case float64:
+		return strconv.FormatFloat(value, 'f', -1, 64)
+	case json.Number:
+		return value.String()
+	default:
+		return ""
+	}
 }
 
 func toolsToWire(tools []ToolDef) []wireTool {
@@ -254,7 +331,7 @@ type wireError struct {
 // normalizeStream reads an SSE body and produces the normalized event
 // sequence. Tool-call fragments are assembled here — consumers never see a
 // partial tool request — and the terminal event closes the sequence.
-func normalizeStream(body io.Reader) ([]Event, error) {
+func normalizeStream(body io.Reader, signals ExhaustionSignals) ([]Event, error) {
 	scanner := bufio.NewScanner(body)
 	scanner.Buffer(make([]byte, 0, 64*1024), maxStreamLineBytes)
 
@@ -284,8 +361,9 @@ func normalizeStream(body io.Reader) ([]Event, error) {
 		if chunk.Error != nil {
 			// The error object is provider-controlled body data; its type and
 			// message never reach the trusted error string, which can flow
-			// into capability diagnostics and termination reasons.
-			return streamError(events, errors.New("harness: gateway reported a stream error"))
+			// into capability diagnostics and termination reasons. Only a
+			// recognized structured code/type is retained as a classification.
+			return streamError(events, streamErrorClassification(chunk.Error, signals))
 		}
 		for _, choice := range chunk.Choices {
 			if choice.Index != 0 {

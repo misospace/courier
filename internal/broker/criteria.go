@@ -76,6 +76,13 @@ type CriterionSet struct {
 // failure.
 func (s CriterionSet) IsEmpty() bool { return len(s.Criteria) == 0 }
 
+// IsPinned reports whether a criterion set was pinned at admission. Only
+// the zero set is unpinned: fix-pr runs and resolve-issue policies admitted
+// before the criterion contract. Every pinned set — including an empty one —
+// carries a digest, which is what distinguishes a vacuous contract from an
+// absent one at the publication boundary.
+func (s CriterionSet) IsPinned() bool { return s.Digest != "" }
+
 // Criterion returns the pinned criterion for an ID.
 func (s CriterionSet) Criterion(id string) (Criterion, bool) {
 	for _, c := range s.Criteria {
@@ -337,7 +344,11 @@ func ValidateCriterionEvidence(prBody string, set CriterionSet) (*CriteriaReport
 	}
 	report, err := parseEvidenceBlock(prBody)
 	if err != nil {
-		return nil, err
+		// A structurally impossible block is the same model-repairable
+		// defect class as the violation list below: it carries the
+		// structured type so every boundary can surface the named defect
+		// instead of a flattened denial.
+		return nil, &CriteriaError{Reason: err.Error()}
 	}
 	if report == nil {
 		return nil, &CriteriaError{

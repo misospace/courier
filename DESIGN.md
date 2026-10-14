@@ -971,6 +971,76 @@ later reconcile never clears an already-captured diagnostic, and capture
 never changes a phase, exit, retry, or source report. Operator workflow is
 in [docs/terminal-diagnostics.md](./docs/terminal-diagnostics.md).
 
+### Model-provider availability and allowance exhaustion (#320)
+
+Provider allowance exhaustion (for example an HTTP 429 carrying a verified
+plan-limit code) is a **recoverable resource-availability condition**, not a
+code failure, a human decision, or a claim of no progress. The native harness
+classifies it at its only structured model boundary — the LiteLLM-compatible
+gateway — and routes it to a `blocked_external` ending so the work waits for
+capacity and the source re-offers it, rather than burning retries, failing the
+attempt, or parking it for a human. This section settles the behavior; the
+first implementation covers the native gateway path, and the remaining scope
+is named at the end.
+
+**Classification.** `ClassifyProviderError` reads at most a bounded prefix of a
+provider error body and the standard `Retry-After` header and returns a fixed
+`ProviderAvailability`: `allowance-exhausted`, `transient-rate-limit`,
+`authentication-failed`, `request-rejected`, `context-exhausted`,
+`provider-unavailable`, or `unknown`. A 429 alone is **not** exhaustion: only a
+structured signal (a provider error `code`/`type` on the configured allowlist,
+or HTTP 402) confirms it. Unrecognized failures stay `unknown` and are never
+folded into a known class. The classifier retains only the fixed class and, at
+most, a short allowlisted code; the provider body, message, and any credential
+it might quote are never retained or surfaced.
+
+**Retry policy.** Transport failures, 5xx, request timeouts, and a plain 429
+remain retryable in-process (bounded by the existing stream-retry budget). A
+confirmed exhaustion, an auth rejection, a context-limit rejection, and a
+request rejection are not retried in-process. A retryable failure whose
+authoritative `Retry-After` exceeds the in-process bound (5s) is likewise not
+spun on: the run ends recoverable and the source re-offers it. The harness
+never invents a reset time; an absent or unparseable hint is reported as
+unknown, not guessed.
+
+**Recovery ending.** A **deferred** failure — a confirmed exhaustion, or a
+transient failure with a reset hint longer than the in-process bound — ends the
+run as `blocked_external`. The operator already maps exit 2 plus the
+`blocked_external` outcome to `PhaseBlockedExternal`, which reports the
+source-neutral `blocked-external` lifecycle result (Dispatch `waiting-external`
+plus the generation-fenced `WAITING_EXTERNAL` mark); that path is recoverable,
+does not park the item for a human, does not erase failed attempts, and keeps
+the item re-offerable. A provider outage (5xx) that exhausts its in-process
+retries stays an infrastructure failure for the operator's relaunch path, and a
+genuine task blocker is unchanged.
+
+**Scoping and fallback.** Classification is per role-bound model binding: an
+exhausted coordinator binding fails the gate for that run without disabling
+unrelated lanes, profiles, or bindings. At startup the capability probe carries
+the classification, and a required model-binding gate failure that is a
+confirmed exhaustion declares `blocked_external` instead of `NeedsHuman`.
+Courier adds no automatic fallback, no silent model switch, and no paid
+capacity: a compatible fallback is a future, explicitly configured behavior.
+
+**Configuration and diagnostics.** The default exhaustion signals are
+provider-neutral, OpenAI-compatible tokens. A deployment extends them (never
+replaces them) with `COURIER_MODEL_EXHAUSTION_CODES` and
+`COURIER_MODEL_EXHAUSTION_TYPES` (comma-separated); Courier core hard-codes no
+provider policy. Diagnostics expose the fixed class and the allowlisted code
+only — never the response body, credentials, or an unbounded string as a label.
+
+**Unknowns and remaining scope.** The legacy OpenCode executor delegates model
+calls to an external binary and has no structured provider signal, so it is not
+yet classified here; until it is, its exhaustion still consumes continuations
+and can end `NeedsHuman`/`failed`. In-run long cooldown (waiting out a reset
+inside one incarnation) and honoring a source-side cooldown are not
+implemented: recovery today is source re-offer after the blocked-external
+ending. Gateway retries that happen below Courier (LiteLLM/SDK) are outside its
+observation and are not counted. The control process reads the
+`COURIER_MODEL_EXHAUSTION_CODES`/`_TYPES` extension signals when the deployment
+projects them; wiring the operator-rendered control pod to a deployment
+setting is follow-up, so today the provider-neutral defaults apply. (#320)
+
 ### Toolchain reference for bootstrap lanes (#153)
 
 Repository toolchains (Go today) keep their module and build caches on
@@ -1078,6 +1148,23 @@ rather than pushed counters, so they survive an operator restart and always matc
 the world. `courier_metrics_scrape_errors_total` counts scrape failures. Scraping
 is opt-in: the chart's `serviceMonitor.enabled` renders a metrics `Service` and a
 Prometheus Operator `ServiceMonitor`, off by default.
+
+**Source-agnostic telemetry and health semantics (#290).**
+[docs/observability-signals-and-health.md](./docs/observability-signals-and-health.md)
+specifies Courier's own signal catalogue and health model: a source-neutral
+`courier_source_*` discovery layer that exists even when no `CoderRun` is
+created, so an idle empty queue, a failed discovery loop, and unavailable lane
+capacity are distinguishable; lane capacity and reservation signals (including
+the reservation age that makes staleness observable); bounded run phase,
+execution-outcome, lifecycle-report, and retention/reaping signals; and a state
+model that separates executor completion from external disposition and renders
+unknown/stale/absent as states distinct from idle or healthy. It defines units,
+clocks, counter/gauge reset behaviour, and a bounded-label privacy budget that
+keeps run ids, issue/PR numbers, repo names, arbitrary error strings, and secrets
+out of labels, with per-run correlation left to the structured log. #291 owns
+the connector diagnostics and #292 the views and alerts that consume these
+signals; the thresholds and windows are design candidates, not defaults, and no
+implementation, exporter, dashboard, or alert rule is authorized here.
 
 **Connector diagnostics without core coupling (#291).**
 [docs/connector-diagnostics.md](./docs/connector-diagnostics.md) specifies
@@ -1659,6 +1746,35 @@ named items remain unresolved and must not be described as production-ready:
 
 ## Decisions
 
+- **2026-10-14 — #281: the criterion-evidence contract is enforced at native
+  PR creation before any forge write, and the refusal travels to the caller
+  as structured violations.** The native boundary of #249/#280:
+  `PolicyEngine.CreatePullRequest` runs `ValidateCriterionEvidence` against
+  the policy-carried pinned set immediately after linkage and before any
+  forge observation or write, so a deficient body is a repairable rejection
+  with nothing to undo — a corrected body is a fresh call, exactly like a
+  linkage refusal, and the duplicate-PR guard still precedes creation. An
+  unpinned pre-contract policy and a pinned empty set are vacuous passes
+  (linkage remains their only body contract), distinguished by the set's
+  digest (`IsPinned`). The engine returns the structured `*CriteriaError`
+  unflattened, and the broker HTTP layer answers it with a 422 JSON body
+  naming every violation class — block-missing flag, missing/unknown/
+  duplicate IDs, per-row digest mismatch, bad status shape, and the coverage
+  claim beside its derivation — where every other rejection keeps the bare
+  denial: the criteria contract is the one defect class the model can
+  mechanically repair, so it gets the precise repair instruction, and the
+  echo carries only caller-authored body structure and admission-pinned
+  digests, never provider or credential data. A validated create answers
+  with the derived coverage (full/partial) in the
+  `X-Courier-Criteria-Coverage` response header so an honest partial record
+  stays visible without re-parsing the body; carrying that result into
+  outcome comments and telemetry is #282's executor-side job. There is no
+  resolve-issue body-update surface — `UpdateFixPR` is fix-pr-only and
+  fix-pr policies carry no criterion contract — so the boundary has no
+  update path to guard and a compliant create cannot be followed by an edit
+  that drops the block; settled against the current code, not assumed.
+  (#281, #249, #280, #204)
+
 - **2026-10-13 — #317: git commit identity is deployment configuration,
   never a hard-coded value or a token-derived one.** Operator-managed
   executor pods injected `Courier <courier@localhost>` explicitly, and the
@@ -1757,6 +1873,32 @@ named items remain unresolved and must not be described as production-ready:
   specific to the OpenCode telemetry path) and delegates the reason-shrink
   step to the shared helper; the control uses the shared helper
   end-to-end. (#210, #188)
+- **2026-10-13 — #290: Courier's telemetry is source-agnostic and its health
+  model separates idle, degraded, and capacity-unavailable states.** The design
+  is
+  [docs/observability-signals-and-health.md](./docs/observability-signals-and-health.md),
+  a child of the portable-observability umbrella (#289). A source-neutral
+  `courier_source_*` discovery layer is emitted by the runner independent of
+  whether any `CoderRun` is created, so an idle empty queue (`ok`, zero items),
+  a failing discovery loop (`degraded`/`unavailable`, failures rising while
+  enabled with capacity), and unavailable capacity (`lane-suspended`/
+  `lane-at-capacity`, paused before the source is called) are distinct. Lane
+  capacity, reservations, and reservation age; bounded run phase, execution,
+  lifecycle-report, and retention signals; and terminal-diagnostic/token
+  aggregates extend the existing run metrics. The state model keeps executor
+  completion (entry to `Verifying`, or direct terminalization; `FinishedAt` is
+  recorded at first terminalization and its duration includes any `Verifying`
+  observation wait) separate from external disposition
+  (CI/review/merge, source settlement) and renders unknown/stale/absent as states
+  distinct from idle or healthy, so uncertain evidence never reads as healthy.
+  Labels stay bounded (`source`, `lane`, `mode`, `phase`, `category`, `result`,
+  closed `reason` enums); run ids, issue/PR numbers, repos, branches, error
+  strings, and secrets never become labels, and per-run correlation rides the
+  structured log. Counters reset on restart, cluster gauges are read live, and
+  timestamps/units are settled. Thresholds and windows are design candidates, not
+  defaults. Design only: no code, exporter, dashboard, alert rule, deployment,
+  or lifecycle/retention change, and #286/#287/#288 remain separate. (#290,
+  #289, #291, #292, #286, #287, #288)
 - **2026-10-13 — #292: Courier's dashboard views and alert conditions are
   specified backend-neutrally, and assets are optional renderings.** The
   portable specification is
@@ -2839,6 +2981,38 @@ was superseded.
   held object stays on it. Confirming removal inside the reconciler would need
   new watch machinery for no operator gain, so the honest split (requests
   counted, retention shown) was chosen instead. A regression test walks the
-  temporal case — five newer Done runs plus three unreaped runs against a
-  floor of two, then the Done cleanup — and a finalizer-held test pins the
+  temporal case — five newer Done runs plus three unreaped runs against a floor
+  of two, then the Done cleanup — and a finalizer-held test pins the
   request semantics, including no double count on a duplicate wake. (#287, #251)
+
+- **2026-10-13 — #320: model-provider allowance exhaustion is a recoverable
+  availability condition, classified at the gateway and routed to a
+  blocked-external ending.** A 429 is not by itself exhaustion: the native
+  harness's gateway classifies each failed model call from structured provider
+  signals (`code`/`type`, HTTP 402) plus the standard `Retry-After` header into
+  a fixed, backend-neutral `ProviderAvailability`, retaining only the class and
+  a short allowlisted code — never the response body or credentials. Confirmed
+  exhaustion and other permanent classes are not retried in-process, and a
+  retryable failure whose reset hint exceeds the 5s in-process bound is not
+  spun on either; such a **deferred** failure ends the run `blocked_external`,
+  which the operator already maps to `PhaseBlockedExternal` and the
+  source-neutral `blocked-external`/`waiting-external` report — recoverable,
+  not parked for a human, and not a claim of no progress. A startup model-
+  binding probe that confirms exhaustion declares `blocked_external` instead of
+  `NeedsHuman`. A delegated sub-agent's **deferred** failure crosses the
+  delegation boundary as the structured classification rather than flattening
+  into tool-visible prose: the coordinator loop ends the run blocked-external
+  before its own (possibly healthy) binding takes another turn, so a
+  role-bound outage cannot invite fresh re-delegations onto the exhausted
+  binding or a false no-progress/human ending; the brief keeps its spent ID,
+  its partial work is never integrated or published, and only fixed redacted
+  text reaches the transcript. Ordinary sub-agent failures stay ordinary tool
+  failures. Like the coordinator's own stream-failure ending, this ending
+  returns directly: a set soft-stop latch does not redirect it to the
+  world-derived finish, and any outstanding status debt is reconciled by the
+  resume path. Exhaustion signals default to provider-neutral tokens and a
+  deployment extends them with `COURIER_MODEL_EXHAUSTION_CODES` /
+  `COURIER_MODEL_EXHAUSTION_TYPES`; Courier core hard-codes no provider policy
+  and adds no silent fallback. The legacy OpenCode executor has no structured
+  provider signal and is not yet classified; in-run long cooldown and
+  source-side cooldown honoring are not implemented. (#320)

@@ -40,6 +40,12 @@ type Capability struct {
 	// or availability failure (a broker still starting, one gateway hiccup):
 	// re-probing can fix it. Non-retryable unavailability is configuration.
 	Retryable bool `json:"retryable,omitempty"`
+	// Availability names a classified provider-availability failure when a
+	// model binding's unavailability is a provider condition (allowance
+	// exhaustion, auth rejection) rather than a configuration error. It is
+	// empty for non-model capabilities and for unclassified failures, and it
+	// never carries provider response text.
+	Availability ProviderAvailability `json:"availability,omitempty"`
 }
 
 // healthy/unavailable helpers keep state spellings in one place.
@@ -95,7 +101,7 @@ func isProbeRetryable(err error) bool {
 	}
 	var gatewayErr *GatewayError
 	if errors.As(err, &gatewayErr) {
-		return isTransientGatewayStatus(gatewayErr.Status)
+		return gatewayErr.classification().Retryable
 	}
 	var brokerErr *BrokerProbeError
 	if errors.As(err, &brokerErr) {
@@ -325,6 +331,9 @@ func probeModelBindings(ctx context.Context, deps ProbeDeps) []Capability {
 		if err := deps.ModelProbe(ctx, deps.Bindings.Model(role)); err != nil {
 			capability := unavailable("model-binding:"+role, role == RoleCoordinator, err.Error())
 			capability.Retryable = isProbeRetryable(err)
+			if classification, ok := providerClassificationOf(err); ok {
+				capability.Availability = classification.Availability
+			}
 			caps = append(caps, capability)
 			continue
 		}
@@ -373,6 +382,26 @@ func (e *GateError) AllRetryable() bool {
 		}
 	}
 	return true
+}
+
+// Exhausted reports whether a gate failure is a recoverable provider
+// allowance exhaustion: at least one required failure is exhaustion and every
+// other required failure is transient. A permanent, non-exhaustion failure
+// (an auth rejection, a missing capability) must not be masked by an
+// exhaustion alongside it — that gate is a configuration problem for a human,
+// and declaring it recoverable would re-offer work that can never succeed.
+func (e *GateError) Exhausted() bool {
+	exhausted := false
+	for _, capability := range e.Failed {
+		if capability.Availability == ProviderAllowanceExhausted {
+			exhausted = true
+			continue
+		}
+		if !capability.Retryable {
+			return false
+		}
+	}
+	return exhausted
 }
 
 // Gate fails closed when a required capability is unavailable and reports

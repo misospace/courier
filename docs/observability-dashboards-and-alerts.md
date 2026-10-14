@@ -84,7 +84,7 @@ controller-runtime on the `--metrics-bind-address` endpoint (default `:8080`,
 | --- | --- | --- | --- |
 | `courier_coderun_run_duration_seconds` | histogram | `lane`, `mode`, `phase` | `StartedAt`→`FinishedAt`, observed once on terminal transition |
 | `courier_coderun_queue_wait_seconds` | histogram | `lane`, `mode`, `phase` | creation→`AdmittedAt`, observed once on terminal transition |
-| `courier_coderuns_total` | counter | `lane`, `mode`, `phase` | runs reaching a terminal phase |
+| `courier_coderuns_total` | counter | `lane`, `mode`, `phase` | runs reaching a terminal phase — label is the **first** terminal phase (one increment per run; a later `AwaitingReview → Done` does not increment `{phase="Done"}`, per #290 §3.4/§4.1) |
 | `courier_coderuns_in_flight` | gauge | `lane` | live cluster read at scrape; counts `Claimed`+`Running` |
 | `courier_lane_suspended` | gauge | `lane` | 1 suspended, 0 active; live read at scrape |
 | `courier_metrics_scrape_errors_total` | counter | — | failed `List` calls during lane collection |
@@ -223,7 +223,7 @@ Run execution answers: *what happened to the runs, and why?*
 
 | Panel | Intent | Backing signals | Portable semantics | Empty / unknown | Status |
 | --- | --- | --- | --- | --- | --- |
-| Terminal outcomes | Outcome mix over time | `courier_coderuns_total` | rate of terminal runs by `lane`,`mode`,`phase` | no runs ⇒ zero | today |
+| Terminal outcomes | Outcome mix over time | `courier_coderuns_total` | rate of terminal runs by `lane`,`mode`,`phase` (label = first terminal phase; a later `AwaitingReview → Done` does not increment `{phase="Done"}` — merge throughput has no panel here; see the disposition split below) | no runs ⇒ zero | today |
 | Run duration | How long runs take | `courier_coderun_run_duration_seconds` | histogram quantiles, seconds, by lane/mode/phase | no samples ⇒ "no completed runs" | today |
 | Queue wait | Admission delay | `courier_coderun_queue_wait_seconds` | histogram quantiles, seconds | no samples ⇒ "no recent admissions" | today |
 | Terminal diagnostic mix | Why runs ended badly | `TerminalDiagnostic` category (status), `run.exit` log | counts by category | absent diagnostic ⇒ "unknown", never "success" | log/status |
@@ -232,9 +232,15 @@ Run execution answers: *what happened to the runs, and why?*
 | Token/model usage | Cost and model behaviour | `status.telemetry`, `run.summary` log (gap: not exported) | tokens by type, per lane/mode where exported | absent telemetry ⇒ "not reported" | log/status |
 
 Outcomes are split deliberately: **executor completion** (the run reached a
-terminal phase) is not the same as **external disposition** (CI, review, merge).
-The dashboard shows terminal-phase mix as executor completion; external
-disposition appears in section 3.4.
+terminal phase — the run's first terminal phase, per #290 §3.4/§4.1, which
+is the label on `courier_coderuns_total` and the entry the
+`courier_coderun_run_duration_seconds` histogram observes) is not the same
+as **external disposition** (CI, review, merge). The dashboard shows
+first-terminal-phase mix as executor completion; external disposition has no
+panel in this document today, and a current-state per-phase gauge or a
+disposition event counter is a separate future measurement, not a
+reinterpretation of `courier_coderuns_total{phase="Done"}` (the metric
+never increments `Done` for a run that terminalized at `AwaitingReview`).
 
 ### 3.4 Lifecycle reporting
 
@@ -351,7 +357,7 @@ Common rules that apply to every alert:
 | Evidence | `courier_lane_reservations`, `courier_coderuns_in_flight`, `courier_coderun_phase_transitions_total{to="Claimed"}` (admission-progress gate), `courier_lane_oldest_reservation_age_seconds` (gap), `courier_coderuns_pending` (gap; narrows the unadmitted set to `Pending` for display), `courier_lane_concurrency` (gap), `courier_lane_suspended`, `phase.transition` log lines for the affected `run_id`s |
 | Window | 15m (operator-tuned; the reservation-freshness window is independent of the 30s poll interval because the failure mode is admission, not discovery) |
 | Threshold rationale | `courier_coderuns_in_flight` excludes `Pending` and the queue-wait histogram only advances on terminalization, so a lane that has materialised work but cannot start any run — at *or below* capacity — looks *idle* on the existing panels. The free-capacity + unadmitted gates (`in_flight < concurrency` **and** `reservations > in_flight`) are what distinguish this failure from every healthy shape: a saturated lane whose reservations are all `Claimed`/`Running` and progressing (no unadmitted work), a 2-slot lane with one 20-minute `Running` task (no unadmitted work), and a genuinely busy lane with a legitimate `Pending` backlog (all slots held, `in_flight == concurrency` — #290 classes capacity-blocked `Pending` as an availability fact, surfaced by A2's rising queue wait, not a page). The age gate carries the duration; the stalled-admission gate carries "no progress" |
-| Caveats | `courier_lane_oldest_reservation_age_seconds` is creation-time age of the oldest reservation across **all** reservation phases: it does **not** reset on admission or any phase transition, and it does not isolate the unadmitted subset. The alert therefore uses it as a duration floor and relies on the free-capacity + unadmitted + stalled-admission gates for precision; a per-phase reservation age is a candidate refinement (#290 leaves age-alone vs age-plus-no-progress open). A freshly materialised item is normally admitted within one reconcile, so the just-arrived sliver is self-limiting: the first `Claimed` transition clears the predicate. This predicate also intentionally refines #290's `StaleReservation`, whose "lane open" clause classifies the fully reserved unadmitted wedge as `saturated` and would not fire on it; #290 is asked to adopt the same `in_flight` vs `concurrency` discriminator ([#318](https://github.com/misospace/courier/issues/318)) |
+| Caveats | `courier_lane_oldest_reservation_age_seconds` is creation-time age of the oldest reservation across **all** reservation phases: it does **not** reset on admission or any phase transition, and it does not isolate the unadmitted subset. The alert therefore uses it as a duration floor and relies on the free-capacity + unadmitted + stalled-admission gates for precision; a per-phase reservation age is a candidate refinement. A freshly materialised item is normally admitted within one reconcile, so the just-arrived sliver is self-limiting: the first `Claimed` transition clears the predicate. #290's `StaleReservation` now uses the same `in_flight` vs `concurrency` discriminator and the same stalled-admission gate (#290 §4.5/§5, [#318](https://github.com/misospace/courier/issues/318)); the two documents must not diverge on this predicate |
 | Recovery | the unadmitted backlog drains — `courier_lane_reservations` falls back to `courier_coderuns_in_flight` as `Pending`/empty-phase work is claimed, or a `Claimed` transition is observed again in the window (**not** an age reset: the age gauge measures `metadata.creationTimestamp` and admission does not clear it); or the lane becomes suspended; or the reservation terminates (failed/reaped), shrinking `courier_lane_reservations`; or a reconfiguration removes the free capacity (in-flight reaches the new concurrency) — the predicate clears through the gates, never through an age reset |
 | Severity | warning |
 | Expected action | inspect lane capacity, the controlling `LaneProfile`, and the affected `run_id`s; check for an admission-side wedge (controller stalled reconcile, broker handoff blocked, webhook not reachable) before treating it as a sizing problem |
@@ -588,16 +594,16 @@ open:
   capabilities — settled by #291 (negotiation states plus a
   `courier_connector_capability_info` discovery procedure; how that catalogue is
   emitted is still open below).
-- Reservation staleness as a first-class condition — settled by #290 as a
-  condition backed by a reservation-age signal.
+- Reservation staleness as a first-class condition — settled by #290 as the
+  admission-wedge condition (`in_flight < concurrency` free-but-unused with an
+  unadmitted reservation and no `Claimed` progress, backed by a reservation-age
+  signal), matching this document's A3 alert.
 - Per-phase timing and token metrics with bounded dimensions — settled by #290
   (`courier_coderun_phase_duration_seconds` by `lane`/`mode`/`phase`;
   `courier_coderun_tokens_total` by `lane`/`mode`/`kind`).
 
 Still open on the siblings' own unknown lists, and consumed as such:
 
-- Whether reservation staleness is defined by age alone or refined by
-  no-progress (#290).
 - Whether per-phase duration and token counters ship in a first cut or after
   the discovery/lane layer (#290).
 - Whether the connector capability catalogue is a scrape-time gauge, a startup
