@@ -298,6 +298,46 @@ func TestClassifyGateFailureGateError(t *testing.T) {
 	}
 }
 
+// A confirmed provider allowance exhaustion is a recoverable availability
+// condition: the gate must declare blocked-external, not NeedsHuman (#320).
+func TestExhaustedGateIsRecoverable(t *testing.T) {
+	exhausted := &harness.GateError{Failed: []harness.Capability{
+		{Name: "model-binding:coordinator", State: harness.StateUnavailable, Detail: "allowance", Required: true, Availability: harness.ProviderAllowanceExhausted},
+	}}
+	if !exhaustedGate(exhausted) {
+		t.Fatal("an exhausted model-binding gate must be recoverable")
+	}
+	if !exhaustedGate(fmt.Errorf("gate: %w", exhausted)) {
+		t.Fatal("a wrapped exhausted gate must be recoverable")
+	}
+	other := &harness.GateError{Failed: []harness.Capability{
+		{Name: "forge-operations", State: harness.StateUnavailable, Detail: "missing", Required: true},
+	}}
+	if exhaustedGate(other) {
+		t.Fatal("a non-exhausted gate must not be treated as recoverable exhaustion")
+	}
+	// An exhaustion must not mask a permanent non-exhaustion failure: that
+	// gate is a configuration problem for a human, not a recoverable wait.
+	mixed := &harness.GateError{Failed: []harness.Capability{
+		{Name: "model-binding:coordinator", State: harness.StateUnavailable, Detail: "allowance", Required: true, Availability: harness.ProviderAllowanceExhausted},
+		{Name: "model-binding:coder", State: harness.StateUnavailable, Detail: "auth rejected", Required: true, Availability: harness.ProviderAuthenticationFailed},
+	}}
+	if exhaustedGate(mixed) {
+		t.Fatal("an exhaustion alongside a permanent auth failure must not be recoverable")
+	}
+	// A transient failure alongside exhaustion stays recoverable.
+	transientMixed := &harness.GateError{Failed: []harness.Capability{
+		{Name: "model-binding:coordinator", State: harness.StateUnavailable, Detail: "allowance", Required: true, Availability: harness.ProviderAllowanceExhausted},
+		{Name: "git-remote", State: harness.StateUnavailable, Detail: "starting", Required: true, Retryable: true},
+	}}
+	if !exhaustedGate(transientMixed) {
+		t.Fatal("exhaustion with only transient co-failures must stay recoverable")
+	}
+	if exhaustedGate(errors.New("not a gate error")) {
+		t.Fatal("a non-GateError must not be treated as exhaustion")
+	}
+}
+
 // The probe must mint a fresh operation ID per attempt: the worker keeps
 // replay state in process memory, so a fixed probe opID would conflict (409)
 // on every re-probe round and transient recovery would be impossible.
