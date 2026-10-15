@@ -1873,6 +1873,15 @@ named items remain unresolved and must not be described as production-ready:
 
 ## Decisions
 
+- **2026-10-16 — #327: materialize recovery attempts without deleting history.**
+  Successor names incorporate the settled predecessor UID so stable issue IDs
+  and preserved PR-fix generations do not collide with retained runs. Active
+  attempts remain barriers; source claims and handout receipts remain fenced.
+  Published-work evidence comes from a fresh broker remote snapshot, not a
+  cached publication or local ref. Dispatch issue replay accepts only positive
+  matching successful audit evidence bound to the original token and settlement
+  key; absent best-effort audit evidence remains an explicit conservative hold.
+
 - **2026-10-15 — #312: the coordinator and toolchain images install git from
   Debian bookworm-backports, not the stock bookworm archive, and positively
   enforce the documented `>= 2.41` minimum.** Bookworm ships git 2.39; the
@@ -1890,15 +1899,6 @@ named items remain unresolved and must not be described as production-ready:
   change that lowers the bundled git fails the verifier instead of producing
   misleading internal/harness failures. A contributor host or a custom lane
   image must still verify its own git version. (#312)
-
-- **2026-10-16 — #327: materialize recovery attempts without deleting history.**
-  Successor names incorporate the settled predecessor UID so stable issue IDs
-  and preserved PR-fix generations do not collide with retained runs. Active
-  attempts remain barriers; source claims and handout receipts remain fenced.
-  Published-work evidence comes from a fresh broker remote snapshot, not a
-  cached publication or local ref. Dispatch issue replay accepts only positive
-  matching successful audit evidence bound to the original token and settlement
-  key; absent best-effort audit evidence remains an explicit conservative hold.
 
 - **2026-10-14 — #217: a coordinator slot collision resolves to a successful
   launch only against a pod verified live and owned by the run's UID; every
