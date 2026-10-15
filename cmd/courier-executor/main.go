@@ -36,6 +36,7 @@ import (
 	"github.com/misospace/courier/internal/broker"
 	"github.com/misospace/courier/internal/evidence"
 	"github.com/misospace/courier/internal/executor"
+	"github.com/misospace/courier/internal/forge"
 	"github.com/misospace/courier/internal/git"
 	"github.com/misospace/courier/internal/github"
 	courierlog "github.com/misospace/courier/internal/log"
@@ -1128,7 +1129,7 @@ func run(ctx context.Context, stdout, stderr io.Writer) int {
 					continuations++
 					stateMessage = verdict.ContinueMsg
 					detail := map[string]any{
-						"kind":         "linkage-repair",
+						"kind":         verdict.Kind,
 						"continuation": continuations,
 						"instruction":  stateMessage,
 					}
@@ -1136,7 +1137,7 @@ func run(ctx context.Context, stdout, stderr io.Writer) int {
 						detail["pr"] = verdict.PRNumber
 					}
 					report.eventVerbose(courierlog.EventExecutorContinuation, courierlog.StatusOK, detail)
-					history = append(history, stateSummary("linkage-repair", head, tap.lastText, nil))
+					history = append(history, stateSummary(verdict.Kind, head, tap.lastText, nil))
 					continue
 				}
 				if verdict.FailReason != "" {
@@ -1163,22 +1164,23 @@ func run(ctx context.Context, stdout, stderr io.Writer) int {
 			if branchReadErr != nil || ahead > 0 {
 				// Committed work on the run branch is a candidate for
 				// the Verifying handoff, but the legacy executor must
-				// still enforce authoritative source-issue linkage
-				// before claiming success (#248) when a published
-				// PR exists. The shared applyLinkagePlan helper is
-				// the single repair/budget mechanism for both
-				// declared and undeclared Verifying paths: a valid
-				// body passes, invalid or missing ones retry inside
-				// the captured session's bounded continuation
-				// budget, and an exhausted budget — or an
-				// unverifiable forge read — escalates to
-				// NeedsHuman.
+				// still observe the forge before claiming success: the
+				// shared applyLinkagePlan check (#248 linkage, #247
+				// presence/draft) is the single mechanism for both the
+				// declared and undeclared Verifying paths. A verified
+				// open, non-draft PR with a valid body passes; a
+				// missing PR, a draft PR, an invalid body, or an
+				// unverifiable forge read retries inside the captured
+				// session's bounded continuation budget; a confirmed
+				// ambiguous, closed-only, or unpublished head, an
+				// exhausted budget, or a session that cannot be
+				// resumed escalates to NeedsHuman.
 				verdict := report.applyLinkagePlan(ctx, continuations, cfg.MaxContinuations, tap.sessionID, ctx.Err())
 				if verdict.ContinueMsg != "" {
 					continuations++
 					stateMessage = verdict.ContinueMsg
 					detail := map[string]any{
-						"kind":         "linkage-repair",
+						"kind":         verdict.Kind,
 						"continuation": continuations,
 						"instruction":  stateMessage,
 					}
@@ -1186,7 +1188,7 @@ func run(ctx context.Context, stdout, stderr io.Writer) int {
 						detail["pr"] = verdict.PRNumber
 					}
 					report.eventVerbose(courierlog.EventExecutorContinuation, courierlog.StatusOK, detail)
-					history = append(history, stateSummary("linkage-repair", head, tap.lastText, nil))
+					history = append(history, stateSummary(verdict.Kind, head, tap.lastText, nil))
 					continue
 				}
 				if verdict.FailReason != "" {
@@ -1232,7 +1234,11 @@ func run(ctx context.Context, stdout, stderr io.Writer) int {
 
 		if tap.sessionID == "" {
 			// Without a captured session there is nothing to resume; apply the
-			// ordinary undeclared-outcome contract to the verified world state.
+			// ordinary undeclared-outcome contract to the verified world
+			// state. The committed-work Verifying ending was already settled
+			// above through the shared pre-handoff plan (#247, #248), which
+			// fails closed without a session, so classifyUndeclared here can
+			// only return non-Verifying endings.
 			result := report.classifyUndeclared(ctx, workspace, cfg.Branch, startCommit, workState, caps)
 			report.terminateCaptured(ctx, workspace, startCommit, result)
 			return result.ExitCode
@@ -1697,12 +1703,50 @@ type prLinkageObservation struct {
 	State string
 	// Body is the raw PR body, exactly as the forge returned it.
 	Body string
+	// Draft reports whether the forge marked the PR a draft.
+	Draft bool
+}
+
+// runBranchPRKind classifies the executor's identity-checked observation of
+// the pull requests whose head carries the run branch, taken while the
+// OpenCode session is still alive (#247).
+type runBranchPRKind int
+
+const (
+	// prStateOpen: exactly one open, non-draft PR carries the verified
+	// head; its body still faces the authoritative-linkage check (#248).
+	prStateOpen runBranchPRKind = iota
+	// prStateDraft: exactly one open PR carries the verified head and
+	// the forge marks it a draft; the run may not hand off until it is
+	// ready for review.
+	prStateDraft
+	// prStateMissing: no pull request of any state carries the verified
+	// head; the caller confirms remote publication before treating it
+	// as a confirmed missing PR (#247).
+	prStateMissing
+	// prStateAmbiguous: more than one open pull request claims the
+	// verified head; the executor refuses to adopt one (#247 fail-closed).
+	prStateAmbiguous
+	// prStateClosedOnly: the head's only pull requests are closed or
+	// merged; the executor refuses adoption, reopening, or a duplicate
+	// creation (#247 fail-closed, matching the adoption guard).
+	prStateClosedOnly
+)
+
+// runBranchPRObservation is the classified result of the executor's
+// identity-checked PR observation. open and draft carry the single PR in
+// that state; the fail-closed kinds carry only the kind.
+type runBranchPRObservation struct {
+	kind  runBranchPRKind
+	open  *prLinkageObservation
+	draft *prLinkageObservation
 }
 
 // linkageCheckOutcome is the result of the authoritative-linkage check
-// run against the live PR for the run branch. It is consumed by the
+// run against the live PRs for the run branch. It is consumed by the
 // legacy executor's run loop to decide between Verifying, a finite
-// continuation to repair the body, and NeedsHuman.
+// continuation to create or ready the PR or repair its body, and a
+// fail-closed NeedsHuman.
 type linkageCheckOutcome struct {
 	// pr records the live PR observed for the run branch. nil
 	// when no PR was found.
@@ -1710,10 +1754,23 @@ type linkageCheckOutcome struct {
 	// err is the structured rejection from the linkage validator,
 	// or nil when the body satisfies the contract.
 	err *broker.LinkageError
-	// missing reports whether the branch has no open PR at all.
-	// The run loop treats a missing PR the same way as a
-	// body-missing-linkage: a continuation to create one.
+	// missing reports that the confirmed-published branch has no pull
+	// request at all: a bounded continuation asks the session to open
+	// one (#247).
 	missing bool
+	// draft reports that the branch's only open PR is a draft: a
+	// bounded continuation asks the session to ready it (#247).
+	draft bool
+	// unpublished reports that the head ref is confirmed absent from
+	// the remote and no PR exists: fail-closed, never a create prompt
+	// (#247).
+	unpublished bool
+	// ambiguous reports more than one open PR on the verified head:
+	// fail-closed, never a silent adoption (#247).
+	ambiguous bool
+	// closedOnly reports a head whose only PRs are closed or merged:
+	// fail-closed, never a duplicate creation (#247).
+	closedOnly bool
 }
 
 // trustedSourceIssue derives the source-issue identity the run was
@@ -1732,53 +1789,80 @@ func trustedSourceIssue(cfg config) (broker.SourceIssue, bool) {
 	return broker.SourceIssue{Owner: owner, Name: name, Number: cfg.Ref}, true
 }
 
-// fetchRunBranchPR reads the open pull request whose head matches the
-// run's branch and base repository. The call uses the same GitHub
-// client the executor's existing PR-discovery code uses (the legacy
-// forge capability), not a forge-specific CLI. A non-open PR, a read
-// failure, or a branch with no PRs returns (nil, nil) — the caller
-// distinguishes "no PR" from "PR with bad linkage" by inspecting the
-// returned pointer.
-func (r reporter) fetchRunBranchPR(ctx context.Context) (*prLinkageObservation, error) {
-	if r.cfg.Ref <= 0 {
-		// fix-pr runs have a pinned PR; the legacy handoff uses
-		// the broker's existing path, not this read.
-		return nil, nil
-	}
-	owner, name, ok := splitOwnerRepo(r.cfg.Repo)
-	if !ok {
-		return nil, fmt.Errorf("COURIER_REPO does not name an owner/repo: %q", r.cfg.Repo)
-	}
+// observeRunBranchPullRequest reads every pull request whose head carries
+// the run's branch through the configured forge capability
+// (forge.PullRequestHeadLister, never a forge-specific CLI) and classifies
+// the set (#247). The provider compares the full base- and head-repository
+// and ref identities carried in the forge response and refuses a response
+// missing either identity, so a foreign or fork head can never be mistaken
+// for the run's own PR. A read failure is returned as an error: an
+// unverifiable observation is not a confirmed missing PR, and the caller
+// must fail closed or retry inside the bounded budget rather than claim
+// absence (#247).
+func (r reporter) observeRunBranchPullRequest(ctx context.Context) (runBranchPRObservation, error) {
 	client, err := github.NewClient(r.cfg.GitHubAPIBase, r.cfg.GitHubToken)
 	if err != nil {
-		return nil, err
+		return runBranchPRObservation{}, err
 	}
-	pulls, err := client.PullRequestsForHead(ctx, owner, name, owner, r.cfg.Branch)
+	provider := github.NewProvider(forge.ProviderConfig{Name: "github", Endpoint: r.cfg.GitHubAPIBase}, client)
+	pulls, err := provider.ListPullRequestsByHead(ctx, forge.PullRequestRef{Repo: r.cfg.Repo}, r.cfg.Repo, r.cfg.Branch)
 	if err != nil {
-		return nil, err
+		return runBranchPRObservation{}, err
 	}
+	var opens, drafts []*prLinkageObservation
+	closed := 0
 	for _, pull := range pulls {
-		if pull.Head.Ref == r.cfg.Branch && strings.EqualFold(pull.State, "open") {
-			return &prLinkageObservation{Number: pull.Number, State: strings.ToLower(pull.State), Body: pull.Body}, nil
+		observed := &prLinkageObservation{Number: pull.Number, State: strings.ToLower(pull.State), Body: pull.Body, Draft: pull.Draft}
+		switch {
+		case strings.EqualFold(pull.State, "open") && !pull.Draft:
+			opens = append(opens, observed)
+		case strings.EqualFold(pull.State, "open"):
+			drafts = append(drafts, observed)
+		default:
+			closed++
 		}
 	}
-	return nil, nil
+	switch {
+	case len(opens)+len(drafts) > 1:
+		return runBranchPRObservation{kind: prStateAmbiguous}, nil
+	case len(opens) == 1:
+		return runBranchPRObservation{kind: prStateOpen, open: opens[0]}, nil
+	case len(drafts) == 1:
+		return runBranchPRObservation{kind: prStateDraft, draft: drafts[0]}, nil
+	case closed > 0:
+		return runBranchPRObservation{kind: prStateClosedOnly}, nil
+	default:
+		return runBranchPRObservation{kind: prStateMissing}, nil
+	}
 }
 
-// checkPRLinkage is the legacy executor's authoritative-linkage check
-// (#248). It looks up the live PR for the run branch and validates
-// its body against the trusted source-issue identity. The check is
-// run through the same forge capability the executor uses for
-// adoption and outcome comments, never through a forge-specific CLI,
-// so the legacy path enforces the same contract as the native broker
-// and never relies on a model-supplied PR number.
+// confirmRemotePublication checks that the run branch is published on the
+// remote before the executor claims a confirmed missing PR (#247). Only a
+// published head can be missing a pull request; an unpublished head means
+// the work itself never landed, and a failed check is unverifiable, not
+// proof of absence.
+func (r reporter) confirmRemotePublication(ctx context.Context) (bool, error) {
+	return git.RemoteBranchExists(ctx, r.cfg.RemoteURL, r.cfg.Branch)
+}
+
+// checkPRLinkage is the legacy executor's pre-handoff forge observation:
+// it classifies the pull requests whose head carries the run branch and,
+// for the single open PR, validates its body against the trusted
+// source-issue identity (#248). The read goes through the configured forge
+// capability — an identity-checked head listing that compares full base and
+// head repository identity and includes every state — never through a
+// forge-specific CLI, so the legacy path enforces the same contract as the
+// native broker and never relies on a model-supplied PR number.
 //
-// The function returns (nil, nil) when the body satisfies linkage —
-// the run loop may proceed. A non-nil outcome carries either a
-// missing-PR flag (the model never opened one) or a structured
-// rejection that names the failure mode; the run loop converts a
-// missing PR or invalid body into a bounded continuation to repair
-// the body or open a new PR with correct linkage.
+// The function returns (nil, nil) when a single open, non-draft PR carries
+// the verified head and its body satisfies linkage — the run loop may
+// proceed. A non-nil outcome carries one of: a confirmed missing PR on a
+// confirmed-published head (a continuation to open one, #247), a draft PR
+// (a continuation to ready it, #247), or a fail-closed world the executor
+// must not paper over with a retry or a creation — an unpublished head, an
+// ambiguous set of open PRs, or only closed/merged PRs (#247). A failed
+// live observation is returned as an error, never as a confirmed missing
+// PR: an unreadable forge is not evidence of absence (#247).
 func (r reporter) checkPRLinkage(ctx context.Context) (*linkageCheckOutcome, error) {
 	source, ok := trustedSourceIssue(r.cfg)
 	if !ok {
@@ -1788,21 +1872,41 @@ func (r reporter) checkPRLinkage(ctx context.Context) (*linkageCheckOutcome, err
 		// repair.
 		return nil, nil
 	}
-	pr, err := r.fetchRunBranchPR(ctx)
+	observation, err := r.observeRunBranchPullRequest(ctx)
 	if err != nil {
 		return nil, err
 	}
-	if pr == nil {
+	switch observation.kind {
+	case prStateOpen:
+		if linkErr := broker.ValidateLinkage(observation.open.Body, source); linkErr != nil {
+			var le *broker.LinkageError
+			if errors.As(linkErr, &le) {
+				return &linkageCheckOutcome{pr: observation.open, err: le}, nil
+			}
+			return nil, linkErr
+		}
+		return nil, nil
+	case prStateDraft:
+		return &linkageCheckOutcome{draft: true, pr: observation.draft}, nil
+	case prStateAmbiguous:
+		return &linkageCheckOutcome{ambiguous: true}, nil
+	case prStateClosedOnly:
+		return &linkageCheckOutcome{closedOnly: true}, nil
+	case prStateMissing:
+		published, err := r.confirmRemotePublication(ctx)
+		if err != nil {
+			// The head's publication state is unverifiable: that is not
+			// proof either way, so it surfaces as a read failure the
+			// caller fails closed on, never as a confirmed missing PR.
+			return nil, fmt.Errorf("confirm remote publication of run branch %s: %w", r.cfg.Branch, err)
+		}
+		if !published {
+			return &linkageCheckOutcome{unpublished: true}, nil
+		}
 		return &linkageCheckOutcome{missing: true}, nil
 	}
-	if linkErr := broker.ValidateLinkage(pr.Body, source); linkErr != nil {
-		var le *broker.LinkageError
-		if errors.As(linkErr, &le) {
-			return &linkageCheckOutcome{pr: pr, err: le}, nil
-		}
-		return nil, linkErr
-	}
-	return nil, nil
+	// Unreachable: every observation kind is handled above.
+	return nil, fmt.Errorf("unclassified pull-request observation state for run branch %s", r.cfg.Branch)
 }
 
 // sourceIssue returns the trusted source-issue identity for the run, or
@@ -1814,34 +1918,86 @@ func (r reporter) sourceIssue() broker.SourceIssue {
 	return source
 }
 
+// sourceIssueTarget renders the trusted source-issue identity as the
+// canonical owner/name#N form the continuation messages name.
+func sourceIssueTarget(source broker.SourceIssue) string {
+	return fmt.Sprintf("%s#%d", source.Canonical(), source.Number)
+}
+
 // linkageRepairMessage composes the precise OpenCode continuation
-// message that asks the captured session to fix the PR body or open
-// the PR if none exists. The message names the exact trusted issue
-// and the supported closing keyword forms so the model can repair
-// the body deterministically rather than re-derive the requirement.
-// The text is bounded to a few hundred bytes so it stays under the
-// legacy executor's continuation message budget. The continuation
-// number is named so a model can see the remaining budget.
+// message that asks the captured session to fix a published PR's body.
+// The message names the exact trusted issue and the supported closing
+// keyword forms so the model can repair the body deterministically
+// rather than re-derive the requirement. The text is bounded to a few
+// hundred bytes so it stays under the legacy executor's continuation
+// message budget. The continuation number is named so a model can see
+// the remaining budget.
 func linkageRepairMessage(source broker.SourceIssue, outcome *linkageCheckOutcome, continuation int) string {
-	canonical := source.Canonical()
-	target := fmt.Sprintf("%s#%d", canonical, source.Number)
+	target := sourceIssueTarget(source)
 	bare := fmt.Sprintf("#%d", source.Number)
-	cross := fmt.Sprintf("%s#%d", canonical, source.Number)
-	if outcome.missing {
-		return fmt.Sprintf(
-			"Courier refused the handoff: no open pull request exists for the run branch yet, "+
-				"so the run cannot be handed off as Verifying. "+
-				"Open a pull request through the forge capability whose body carries an authoritative closing reference to %s. "+
-				"Use a supported closing keyword (Closes, Fixes, or Resolves) followed by %s, or the cross-repo form %s when the trusted source repository differs from the PR base. "+
-				"Then re-declare the same outcome. (continuation %d)",
-			target, bare, cross, continuation,
-		)
-	}
+	cross := target
 	return fmt.Sprintf(
 		"Courier refused the handoff: PR #%d's body does not carry an authoritative closing reference to %s. "+
 			"Update the PR body through the forge capability so it carries a supported closing keyword (Closes, Fixes, or Resolves) followed by %s, or the cross-repo form %s when the trusted source repository differs from the PR base. "+
 			"Then re-declare the same outcome. (continuation %d)",
 		outcome.pr.Number, target, bare, cross, continuation,
+	)
+}
+
+// prMissingMessage composes the #247 continuation message for a
+// confirmed-published run branch that carries no pull request. The
+// message is factual: it names the pinned repository, the run branch,
+// the base ref, and the trusted source issue, and it forbids adopting
+// another actor's PR or moving an existing PR's base/head. It leaves a
+// genuine external block reachable through a blocked_external
+// declaration rather than forcing a creation the model cannot make.
+func (r reporter) prMissingMessage(source broker.SourceIssue, continuation int) string {
+	target := sourceIssueTarget(source)
+	bare := fmt.Sprintf("#%d", source.Number)
+	return fmt.Sprintf(
+		"Courier refused the handoff: the run branch %q is published to %s, but the forge shows no pull request for that head, so the run cannot be handed off as Verifying. "+
+			"Open the pull request through the forge capability with head %s against base %s, and give its body an authoritative closing reference to %s: a supported closing keyword (Closes, Fixes, or Resolves) followed by %s, or the cross-repo form %s when the trusted source repository differs from the PR base. "+
+			"Do not adopt a pull request whose head belongs to another repository, and do not change an existing pull request's base or head. "+
+			"If a genuine external block prevents opening the pull request, declare blocked_external naming the block. "+
+			"Then re-declare the same outcome. (continuation %d)",
+		r.cfg.Branch, r.cfg.Repo, r.cfg.Repo+":"+r.cfg.Branch, r.cfg.Base, target, bare, target, continuation,
+	)
+}
+
+// prDraftMessage composes the #247 continuation message for a draft PR
+// on the run branch: it asks the captured session to mark that exact PR
+// ready for review — never to create a duplicate or move base/head —
+// and leaves a genuine external block reachable through a
+// blocked_external declaration.
+func (r reporter) prDraftMessage(source broker.SourceIssue, number, continuation int) string {
+	target := sourceIssueTarget(source)
+	bare := fmt.Sprintf("#%d", source.Number)
+	return fmt.Sprintf(
+		"Courier refused the handoff: pull request #%d for the run branch %q on %s is still a draft, so the run cannot be handed off as Verifying. "+
+			"Mark pull request #%d ready for review through the forge capability; do not create a duplicate pull request, and do not change its base or head. "+
+			"Confirm its body carries an authoritative closing reference to %s: a supported closing keyword (Closes, Fixes, or Resolves) followed by %s, or the cross-repo form %s when the trusted source repository differs from the PR base. "+
+			"If a genuine external block prevents readying it, declare blocked_external naming the block. "+
+			"Then re-declare the same outcome. (continuation %d)",
+		number, r.cfg.Branch, r.cfg.Repo, number, target, bare, target, continuation,
+	)
+}
+
+// prUnverifiedMessage composes the continuation message for a failed
+// live forge observation (#247). It is explicitly not a missing-PR
+// claim: the read failed, which proves nothing about the pull request's
+// state. The message asks the session to verify and repair through the
+// forge capability and keeps the honest endings — a forge that stays
+// unreachable — reachable through blocked_external.
+func (r reporter) prUnverifiedMessage(source broker.SourceIssue, observationErr error, continuation int) string {
+	target := sourceIssueTarget(source)
+	bare := fmt.Sprintf("#%d", source.Number)
+	return fmt.Sprintf(
+		"Courier could not verify the pull-request state for the run branch %q on %s (%s); this is not proof that the pull request is missing. "+
+			"Confirm through the forge capability that the run branch is published and carries exactly one open, non-draft pull request whose body carries an authoritative closing reference to %s: a supported closing keyword (Closes, Fixes, or Resolves) followed by %s, or the cross-repo form %s when the trusted source repository differs from the PR base. "+
+			"Ready, open, or repair it as the observation requires; do not adopt a pull request whose head belongs to another repository. "+
+			"If the forge stays unreachable, declare blocked_external naming the block. "+
+			"Then re-declare the same outcome. (continuation %d)",
+		r.cfg.Branch, r.cfg.Repo, observationErr.Error(), target, bare, target, continuation,
 	)
 }
 
@@ -1852,7 +2008,7 @@ func linkageRepairMessage(source broker.SourceIssue, outcome *linkageCheckOutcom
 // the run without re-reading the issue.
 func (r reporter) linkageExhaustedReason(outcome *linkageCheckOutcome) string {
 	source := r.sourceIssue()
-	target := source.Canonical() + "#" + strconv.Itoa(source.Number)
+	target := sourceIssueTarget(source)
 	if outcome.missing {
 		return fmt.Sprintf("the model never opened a pull request for the run branch, so the handoff was refused; the run needs a human to open one with the trusted source-issue linkage to %s", target)
 	}
@@ -1867,52 +2023,112 @@ func (r reporter) linkageExhaustedReason(outcome *linkageCheckOutcome) string {
 }
 
 // linkageForgeFailureReason composes the human-readable NeedsHuman reason
-// when the live PR body could not be read from the forge at all — the
-// verifier cannot prove linkage on an unverifiable world (#248), so the
-// run escalates to a human rather than being handed off as Verifying.
+// when the live PR state could not be verified at all — the forge read
+// or the remote-publication confirmation behind the observation failed,
+// so the verifier cannot prove linkage or PR presence on an unverifiable
+// world (#248, #247). The run escalates to a human rather than being
+// handed off as Verifying and rather than being told the PR is missing.
 func (r reporter) linkageForgeFailureReason(err error) string {
 	source := r.sourceIssue()
-	target := source.Canonical() + "#" + strconv.Itoa(source.Number)
-	return fmt.Sprintf("the live pull request body could not be read from the forge to verify authoritative source-issue linkage to %s: %s; the run needs a human", target, err.Error())
+	target := sourceIssueTarget(source)
+	return fmt.Sprintf("the live pull-request state could not be verified to confirm an open, non-draft pull request with authoritative source-issue linkage to %s: %s; the run needs a human", target, err.Error())
 }
 
-// linkageVerdict is the legacy executor's authoritative-linkage decision
-// for a Verifying candidate. Pass and FailReason are mutually exclusive
-// with ContinueMsg: the run loop interprets exactly one signal at a time.
-// Pass means the linkage check satisfied the contract (or found no PR
-// for the branch, which the operator's own world check covers) and the
-// run may hand off as Verifying. ContinueMsg names the bounded repair
-// instruction the next continuation should feed the captured session;
-// PRNumber names the PR observed during the check, for audit detail on
-// the continuation event. FailReason names the precise NeedsHuman reason
-// when the bounded budget is exhausted or there is no captured session
-// to resume (#248).
+// draftExhaustedReason composes the NeedsHuman reason for a run whose
+// continuation budget ran out while the run branch's pull request was
+// still a draft (#247).
+func (r reporter) draftExhaustedReason(number int) string {
+	source := r.sourceIssue()
+	target := sourceIssueTarget(source)
+	return fmt.Sprintf("pull request #%d for the run branch %q remained a draft after the bounded continuation budget, so the handoff was refused; the run needs a human to mark it ready for review (trusted source issue %s)", number, r.cfg.Branch, target)
+}
+
+// draftUnresolvedReason names why a draft pull request could not be
+// resumed to ready it, without claiming a cause the run did not hit:
+// a shutdown is not budget exhaustion, and a missing session is not a
+// spent budget (#247).
+func (r reporter) draftUnresolvedReason(number int, sessionID string, ctxErr error) string {
+	switch {
+	case ctxErr != nil:
+		source := r.sourceIssue()
+		return fmt.Sprintf("pull request #%d for the run branch %q is still a draft and the run is shutting down, so the handoff was refused; the run needs a human to mark it ready for review (trusted source issue %s)", number, r.cfg.Branch, sourceIssueTarget(source))
+	case sessionID == "":
+		source := r.sourceIssue()
+		return fmt.Sprintf("pull request #%d for the run branch %q is still a draft and no captured session exists to ready it, so the handoff was refused; the run needs a human to mark it ready for review (trusted source issue %s)", number, r.cfg.Branch, sourceIssueTarget(source))
+	default:
+		return r.draftExhaustedReason(number)
+	}
+}
+
+// unpublishedBranchReason composes the NeedsHuman reason for a run whose
+// commits were never published to the remote and whose branch carries no
+// pull request (#247). The executor neither hands off as Verifying nor
+// asks for a pull request over work that never landed.
+func (r reporter) unpublishedBranchReason() string {
+	return fmt.Sprintf("the run branch %q is not published on the remote and carries no pull request, so the handoff was refused; the executor will not ask for a pull request over unpublished work; the run needs a human", r.cfg.Branch)
+}
+
+// prAmbiguousReason composes the NeedsHuman reason for a run branch the
+// forge reports with more than one open pull request (#247). Choosing
+// one would be a silent adoption.
+func (r reporter) prAmbiguousReason() string {
+	return fmt.Sprintf("the forge reports more than one open pull request for the run branch %q on %s; the executor refuses to adopt one or create another; the run needs a human to settle which pull request belongs to this run", r.cfg.Branch, r.cfg.Repo)
+}
+
+// closedOnlyPRReason composes the NeedsHuman reason for a run branch
+// whose only pull requests are closed or merged (#247), mirroring the
+// adoption guard's refusal to reopen or duplicate a closed PR.
+func (r reporter) closedOnlyPRReason() string {
+	return fmt.Sprintf("the run branch %q on %s has only closed or merged pull requests and no open one; the executor refuses adoption, reopening, or duplicate creation; the run needs a human", r.cfg.Branch, r.cfg.Repo)
+}
+
+// linkageVerdict is the legacy executor's pre-handoff forge-observation
+// decision for a Verifying candidate. Pass and FailReason are mutually
+// exclusive with ContinueMsg: the run loop interprets exactly one signal
+// at a time. Pass means the observation verified an open, non-draft PR
+// on the confirmed head with a body that satisfies linkage, and the run
+// may hand off as Verifying. ContinueMsg names the bounded instruction
+// the next continuation should feed the captured session — open the
+// missing PR, ready the draft PR, repair a disagreeing body, or re-verify
+// after an unreadable forge read; Kind names that instruction for the
+// continuation event audit. PRNumber names the PR observed during the
+// check, when exactly one was observed. FailReason names the precise
+// NeedsHuman reason when the bounded budget is exhausted, there is no
+// captured session to resume, or the observation is fail-closed
+// (ambiguous, closed-only, or unpublished head) (#247, #248).
 type linkageVerdict struct {
 	Pass        bool
 	ContinueMsg string
+	Kind        string
 	PRNumber    int
 	FailReason  string
 }
 
-// applyLinkagePlan runs the authoritative-source-issue linkage check and
-// returns the verdict the run loop should follow. It is shared by the
-// declared (post-classify) and the undeclared-Verifying paths so both
-// routes share one bounded retry/budget mechanism (#248). The shared
-// mechanism treats a forge read error as a fail-closed problem on both
-// paths (a transient GitHub outage cannot quietly become a Verifying
-// success, and the existing PR observer does not perform the linkage
-// check), and treats a published PR body that disagrees with the
-// trusted source issue as a bounded repair opportunity on both paths
-// (the declared-changes path used to skip the repair budget, which
-// #248 does not allow). A run that never opened a PR for the branch
-// is not a linkage violation on either path — the operator's world
-// check observes the missing PR through its own read, and the legacy
-// executor hands off as Verifying once the rest of the world agrees
-// (this matches the pre-#248 contract the design preserves). The
-// call site signals the budget consumed so far through continuations
-// (so the helper consumes one slot when it asks for a continue);
-// ctxErr is the run context's current error (non-nil when the run is
-// shutting down) and sessionID gates the resume path.
+// applyLinkagePlan runs the identity-checked pre-handoff forge
+// observation and returns the verdict the run loop should follow. It is
+// shared by the declared (post-classify) and the undeclared-Verifying
+// paths so both routes share one bounded mechanism (#248, #247):
+//   - A single open, non-draft PR on the verified head passes when its
+//     body satisfies the trusted source-issue linkage (#248) and fails
+//     to a bounded body-repair continuation when it does not.
+//   - A confirmed missing PR on a confirmed-published head asks the
+//     captured session to open the intended PR (#247); a confirmed
+//     draft PR asks it to ready that exact PR (#247). Both consume the
+//     #170 continuation budget and terminate with a bounded reason on
+//     true exhaustion or when no session can be resumed.
+//   - An ambiguous set of open PRs, a head with only closed/merged
+//     PRs, and a head confirmed absent from the remote are fail-closed
+//     on sight: no retry and no creation over an unverifiable or
+//     foreign world (#247).
+//   - A failed live observation is never represented as a confirmed
+//     missing PR: it retries inside the bounded budget with a factual
+//     "could not verify" message, and fails closed to NeedsHuman when
+//     no retry is possible (#247, #248).
+//
+// The call site signals the budget consumed so far through continuations
+// (so the helper consumes one slot when it asks for a continue); ctxErr
+// is the run context's current error (non-nil when the run is shutting
+// down) and sessionID gates the resume path.
 func (r reporter) applyLinkagePlan(ctx context.Context, continuations int, maxContinuations int, sessionID string, ctxErr error) linkageVerdict {
 	linkOutcome, linkErr := r.checkPRLinkage(ctx)
 	if linkErr != nil {
@@ -1920,28 +2136,45 @@ func (r reporter) applyLinkagePlan(ctx context.Context, continuations int, maxCo
 		if continuations >= maxContinuations || sessionID == "" || ctxErr != nil {
 			return linkageVerdict{FailReason: r.linkageForgeFailureReason(linkErr)}
 		}
-		// The verifier could not reach GitHub at all. Fail closed
-		// (#248 follow-up): the next iteration retries the read once
-		// the captured session has had a chance to act on its own;
-		// using the same "open with authoritative closing reference"
-		// message keeps the model's contract crisp and the operator's
-		// audit simpler.
+		// The verifier could not read the forge state at all. That is
+		// not a confirmed missing PR (#247), so the retry message says
+		// what is known — the observation failed — rather than asserting
+		// absence; the captured session re-verifies and repairs inside
+		// the bounded budget.
 		next := continuations + 1
-		return linkageVerdict{ContinueMsg: linkageRepairMessage(r.sourceIssue(), &linkageCheckOutcome{missing: true}, next)}
+		return linkageVerdict{Kind: "pr-unverified", ContinueMsg: r.prUnverifiedMessage(r.sourceIssue(), linkErr, next)}
 	}
-	if linkOutcome == nil || linkOutcome.missing {
-		// A run that never opened a PR is the operator's concern, not
-		// a linkage violation: the operator's own world check observes
-		// the absence on its read. The legacy executor's only linkage
-		// contract is "if a PR is published, its body must authorize
-		// the trusted source" — matches the pre-#248 design.
+	if linkOutcome == nil {
 		return linkageVerdict{Pass: true}
 	}
-	if continuations >= maxContinuations || sessionID == "" || ctxErr != nil {
-		return linkageVerdict{PRNumber: linkOutcome.pr.Number, FailReason: r.linkageExhaustedReason(linkOutcome)}
+	// Fail-closed worlds first: none of these is a condition the model
+	// may resolve by retrying or creating (#247).
+	switch {
+	case linkOutcome.ambiguous:
+		return linkageVerdict{FailReason: r.prAmbiguousReason()}
+	case linkOutcome.closedOnly:
+		return linkageVerdict{FailReason: r.closedOnlyPRReason()}
+	case linkOutcome.unpublished:
+		return linkageVerdict{FailReason: r.unpublishedBranchReason()}
 	}
-	next := continuations + 1
-	return linkageVerdict{ContinueMsg: linkageRepairMessage(r.sourceIssue(), linkOutcome, next), PRNumber: linkOutcome.pr.Number}
+	resumable := sessionID != "" && ctxErr == nil && continuations < maxContinuations
+	switch {
+	case linkOutcome.draft:
+		if !resumable {
+			return linkageVerdict{PRNumber: linkOutcome.pr.Number, FailReason: r.draftUnresolvedReason(linkOutcome.pr.Number, sessionID, ctxErr)}
+		}
+		return linkageVerdict{Kind: "pr-draft", PRNumber: linkOutcome.pr.Number, ContinueMsg: r.prDraftMessage(r.sourceIssue(), linkOutcome.pr.Number, continuations+1)}
+	case linkOutcome.missing:
+		if !resumable {
+			return linkageVerdict{FailReason: r.linkageExhaustedReason(linkOutcome)}
+		}
+		return linkageVerdict{Kind: "pr-missing", ContinueMsg: r.prMissingMessage(r.sourceIssue(), continuations+1)}
+	default:
+		if !resumable {
+			return linkageVerdict{PRNumber: linkOutcome.pr.Number, FailReason: r.linkageExhaustedReason(linkOutcome)}
+		}
+		return linkageVerdict{Kind: "linkage-repair", ContinueMsg: linkageRepairMessage(r.sourceIssue(), linkOutcome, continuations+1), PRNumber: linkOutcome.pr.Number}
+	}
 }
 
 // installGitIdentity supplies the default git identity for any GIT_* variable

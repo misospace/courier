@@ -1368,6 +1368,7 @@ func TestRunUncommittedWorkResumesAndSucceeds(t *testing.T) {
 	root := t.TempDir()
 	remote := remoteWithExistingBranch(t, root)
 	fakeOpenCode := filepath.Join(root, "opencode")
+	prServer, prState := fakeForgePullRequestServer(t)
 	writeExecutable(t, fakeOpenCode, `#!/bin/sh
 case "$1" in mcp) exit 0;; esac
 printf '%s\n' "$(printf '%s' "$*" | tr '\n' ' ')" >> "$COURIER_FAKE_STATE/argv.log"
@@ -1378,13 +1379,12 @@ done
 if [ -n "$SESSION" ]; then
   git add --all -- .
   git commit -m 'test: committed the partial work' >/dev/null
-  exit 0
+`+writePullRequestScript(prState, pullRequestFixtureJSON(12, "open", false, "Closes #7. The resumed turn opened the pull request."))+`  exit 0
 fi
 printf '{"type":"text","sessionID":"ses_resume1","part":{"type":"text","text":"partial work"}}\n'
 printf 'partial\n' > partial.txt
 exit 0
 `)
-	prServer := fakeLinkedPRServer(t)
 	setContinuationEnv(t, root, remote, prServer.URL, fakeOpenCode)
 
 	var output bytes.Buffer
@@ -1427,6 +1427,7 @@ func TestRunNoWorkResumesAndSucceeds(t *testing.T) {
 	root := t.TempDir()
 	remote := remoteWithExistingBranch(t, root)
 	fakeOpenCode := filepath.Join(root, "opencode")
+	prServer, prState := fakeForgePullRequestServer(t)
 	writeExecutable(t, fakeOpenCode, `#!/bin/sh
 case "$1" in mcp) exit 0;; esac
 printf '%s\n' "$(printf '%s' "$*" | tr '\n' ' ')" >> "$COURIER_FAKE_STATE/argv.log"
@@ -1438,12 +1439,11 @@ if [ -n "$SESSION" ]; then
   printf 'done\n' > done.txt
   git add --all -- .
   git commit -m 'test: produced the work' >/dev/null
-  exit 0
+`+writePullRequestScript(prState, pullRequestFixtureJSON(12, "open", false, "Closes #7. The resumed turn opened the pull request."))+`  exit 0
 fi
 printf '{"type":"text","sessionID":"ses_nowork1","part":{"type":"text","text":"nothing yet"}}\n'
 exit 0
 `)
-	prServer := fakeLinkedPRServer(t)
 	setContinuationEnv(t, root, remote, prServer.URL, fakeOpenCode)
 
 	var output bytes.Buffer
@@ -1486,6 +1486,7 @@ func TestRunOffBranchResumesAndSucceeds(t *testing.T) {
 	root := t.TempDir()
 	remote := remoteWithExistingBranch(t, root)
 	fakeOpenCode := filepath.Join(root, "opencode")
+	prServer, prState := fakeForgePullRequestServer(t)
 	writeExecutable(t, fakeOpenCode, `#!/bin/sh
 case "$1" in mcp) exit 0;; esac
 printf '%s\n' "$(printf '%s' "$*" | tr '\n' ' ')" >> "$COURIER_FAKE_STATE/argv.log"
@@ -1495,7 +1496,7 @@ for a in "$@"; do
 done
 if [ -n "$SESSION" ]; then
   git branch -f "$COURIER_BRANCH" HEAD
-  exit 0
+`+writePullRequestScript(prState, pullRequestFixtureJSON(12, "open", false, "Closes #7. The resumed turn opened the pull request."))+`  exit 0
 fi
 git checkout -b side/branch
 printf 'side\n' > side.txt
@@ -1504,7 +1505,6 @@ git commit -m 'test: work on a side branch' >/dev/null
 printf '{"type":"text","sessionID":"ses_offbranch1","part":{"type":"text","text":"committed off branch"}}\n'
 exit 0
 `)
-	prServer := fakeLinkedPRServer(t)
 	setContinuationEnv(t, root, remote, prServer.URL, fakeOpenCode)
 
 	var output bytes.Buffer
@@ -1633,6 +1633,7 @@ func TestRunCrashResumesAndSucceeds(t *testing.T) {
 	root := t.TempDir()
 	remote := remoteWithExistingBranch(t, root)
 	fakeOpenCode := filepath.Join(root, "opencode")
+	prServer, prState := fakeForgePullRequestServer(t)
 	writeExecutable(t, fakeOpenCode, `#!/bin/sh
 case "$1" in mcp) exit 0;; esac
 printf '%s\n' "$(printf '%s' "$*" | tr '\n' ' ')" >> "$COURIER_FAKE_STATE/argv.log"
@@ -1644,12 +1645,11 @@ if [ -n "$SESSION" ]; then
   printf 'recovered\n' > recovered.txt
   git add --all -- .
   git commit -m 'test: recovered after crash' >/dev/null
-  exit 0
+`+writePullRequestScript(prState, pullRequestFixtureJSON(12, "open", false, "Closes #7. The resumed turn opened the pull request."))+`  exit 0
 fi
 printf '{"type":"text","sessionID":"ses_crash1","part":{"type":"text","text":"about to crash"}}\n'
 exit 1
 `)
-	prServer := fakeLinkedPRServer(t)
 	setContinuationEnv(t, root, remote, prServer.URL, fakeOpenCode)
 
 	var output bytes.Buffer
@@ -1735,6 +1735,7 @@ func TestRunNoWorkResumeCarriesCapabilitySuffix(t *testing.T) {
 	root := t.TempDir()
 	remote := remoteWithExistingBranch(t, root)
 	fakeOpenCode := filepath.Join(root, "opencode")
+	prServer, prState := fakeForgePullRequestServer(t)
 	writeExecutable(t, fakeOpenCode, `#!/bin/sh
 case "$1" in mcp) printf 'metrics failed\n    connection refused\n'; exit 0;; esac
 printf '%s\n' "$(printf '%s' "$*" | tr '\n' ' ')" >> "$COURIER_FAKE_STATE/argv.log"
@@ -1746,12 +1747,11 @@ if [ -n "$SESSION" ]; then
   printf 'done\n' > done.txt
   git add --all -- .
   git commit -m 'test: produced the work' >/dev/null
-  exit 0
+`+writePullRequestScript(prState, pullRequestFixtureJSON(12, "open", false, "Closes #7. The resumed turn opened the pull request."))+`  exit 0
 fi
 printf '{"type":"text","sessionID":"ses_cap1","part":{"type":"text","text":"nothing yet"}}\n'
 exit 0
 `)
-	prServer := fakeLinkedPRServer(t)
 	setContinuationEnv(t, root, remote, prServer.URL, fakeOpenCode)
 
 	var output bytes.Buffer
@@ -2163,12 +2163,14 @@ func TestRunEmitsRunScopedEventsWithoutDetail(t *testing.T) {
 	root := t.TempDir()
 	remote := remoteWithExistingBranch(t, root)
 
-	fakeOpenCode := filepath.Join(root, "opencode")
-	writeExecutable(t, fakeOpenCode, "#!/bin/sh\ncase \"$1\" in mcp) exit 0;; esac\nprintf 'opencode ran\\n'\nprintf 'completed\\n' > completed.txt\ngit add --all -- .\ngit commit -m 'test: completed work' >/dev/null\n")
+	// The branch exists on the remote and is orphaned until the model
+	// commits and opens the run-branch pull request (#247): the adoption
+	// guard must see no pull requests and let the run proceed, and the
+	// pre-handoff observation must see the opened PR.
+	prServer, prState := fakeForgePullRequestServer(t)
 
-	// The branch exists on the remote and is orphaned: the adoption guard
-	// must see no pull requests and let the run proceed.
-	prServer := fakeLinkedPRServer(t)
+	fakeOpenCode := filepath.Join(root, "opencode")
+	writeExecutable(t, fakeOpenCode, "#!/bin/sh\ncase \"$1\" in mcp) exit 0;; esac\nprintf 'opencode ran\\n'\nprintf 'completed\\n' > completed.txt\ngit add --all -- .\ngit commit -m 'test: completed work' >/dev/null\n"+writePullRequestScript(prState, pullRequestFixtureJSON(12, "open", false, "Closes #7. The completed turn opened the pull request.")))
 
 	setResolveIssueEnv(t, root, remote, prServer.URL, fakeOpenCode)
 	t.Setenv("COURIER_GIT_TOKEN", testGitToken)
@@ -2291,7 +2293,7 @@ func TestChildOutputIsRedactedBeforeStreams(t *testing.T) {
 	root := t.TempDir()
 	remote := remoteWithExistingBranch(t, root)
 
-	prServer := fakeLinkedPRServer(t)
+	prServer, prState := fakeForgePullRequestServer(t)
 
 	fragment1 := testGitToken[:9]
 	fragment2 := testGitToken[9:]
@@ -2307,7 +2309,7 @@ printf 'stderr partial without newline ' >&2
 printf 'completed\n' > completed.txt
 git add --all -- .
 git commit -m 'test: completed work' >/dev/null
-`, fragment1, fragment2, testGitHubTokn)
+`, fragment1, fragment2, testGitHubTokn) + writePullRequestScript(prState, pullRequestFixtureJSON(12, "open", false, "Closes #7. The completed turn opened the pull request."))
 	fakeOpenCode := filepath.Join(root, "opencode")
 	writeExecutable(t, fakeOpenCode, script)
 
@@ -2734,24 +2736,85 @@ func setContinuationEnv(t *testing.T, root, remote, githubBase, openCodeBinary s
 }
 
 // fakeLinkedPRServer stands up the minimal httptest fixture for resolve-issue
-// tests that do not themselves exercise the linkage check (#248) or the
-// adoption short-circuit. The endpoint answers the run-branch pull request
-// query with a single open PR whose head ref names a side branch and whose
-// body closes the trusted source issue. The side-branch head ref is what
-// `PullRequestsForHead` filters on, so neither guardAdoption nor
-// fetchRunBranchPR match it to the run branch: adoption therefore proceeds
-// to the model run, and the linkage check sees no PR for the run branch
-// (a permitted outcome that is the operator's own world check concern, not
-// a linkage violation). Tests that need missing or bad linkage on the run
-// branch set up their own server instead.
+// tests that never reach the Verifying handoff (loop-guard, crash, and
+// no-work endings) or that run without a trusted source identity, where the
+// pre-handoff forge observation is skipped. It answers every request with
+// no pull requests: adoption therefore proceeds, and a run that ends
+// Verifying would find a confirmed missing PR (#247) rather than a permitted
+// one. Tests that end Verifying script the run-branch pull request with
+// fakeForgePullRequestServer instead.
 func fakeLinkedPRServer(t *testing.T) *httptest.Server {
 	t.Helper()
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
+		if r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/comments") {
+			_, _ = io.Copy(io.Discard, r.Body)
+			_, _ = io.WriteString(w, `{"id":1}`)
+			return
+		}
 		_, _ = io.WriteString(w, `[]`)
 	}))
 	t.Cleanup(server.Close)
 	return server
+}
+
+// fakeForgePullRequestServer stands up the stateful GitHub pulls-list
+// fixture for the pre-handoff observation tests (#247, #248). Every
+// request re-reads the state file: while it is absent the run branch
+// carries no pull request; when it holds a JSON array the server answers
+// the head query with it; the literal "500" makes the forge read fail.
+// Tests script the world by writing the file before the run, and a fake
+// OpenCode script can "open", "ready", or break the pull request mid-run
+// by rewriting it, so the executor's live observations see a forge that
+// changes across continuations exactly as a real one would.
+func fakeForgePullRequestServer(t *testing.T) (*httptest.Server, string) {
+	t.Helper()
+	dir := t.TempDir()
+	statePath := filepath.Join(dir, "pulls.json")
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/comments") {
+			_, _ = io.Copy(io.Discard, r.Body)
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = io.WriteString(w, `{"id":1}`)
+			return
+		}
+		data, err := os.ReadFile(statePath)
+		w.Header().Set("Content-Type", "application/json")
+		if err != nil || len(bytes.TrimSpace(data)) == 0 {
+			_, _ = io.WriteString(w, `[]`)
+			return
+		}
+		if string(bytes.TrimSpace(data)) == "500" {
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		_, _ = w.Write(data)
+	}))
+	t.Cleanup(server.Close)
+	return server, statePath
+}
+
+// pullRequestFixtureObjectJSON renders one pull request on the run branch
+// in the shape the identity-checked forge read requires: full base- and
+// head-repository identity naming acme/widgets, matching the run's pinned
+// repository and branch. Bodies must avoid apostrophes so the fixture
+// survives single-quoted shell embedding in the fake OpenCode scripts.
+func pullRequestFixtureObjectJSON(number int, state string, draft bool, body string) string {
+	return fmt.Sprintf(`{"number":%d,"state":%q,"draft":%t,"title":"Work","base":{"ref":"main","repo":{"full_name":"acme/widgets"}},"head":{"ref":"courier/resolve-issue/acme-widgets/7","sha":"deadbeef","repo":{"full_name":"acme/widgets"}},"body":%q}`, number, state, draft, body)
+}
+
+// pullRequestFixtureJSON wraps a single fixture object in the array the
+// pulls-list endpoint returns.
+func pullRequestFixtureJSON(number int, state string, draft bool, body string) string {
+	return "[" + pullRequestFixtureObjectJSON(number, state, draft, body) + "]"
+}
+
+// writePullRequestScript is the shell line a fake OpenCode script uses to
+// stand in for the model opening or readying the run-branch pull request
+// through the forge capability: it writes the fixture JSON to the state
+// file the fake forge server answers from.
+func writePullRequestScript(statePath, fixture string) string {
+	return fmt.Sprintf("printf '%%s' '%s' > '%s'\n", fixture, statePath)
 }
 
 // readArgvLog returns the argv lines the fake script recorded, one per
@@ -3041,7 +3104,7 @@ func TestRunResolveIssuePublishedPRWithVagueBodyNeedsHuman(t *testing.T) {
 		// Match either the /pulls (head query) or /pulls/{n} (post-create read).
 		if strings.HasSuffix(r.URL.Path, "/pulls") && r.URL.RawQuery != "" {
 			w.Header().Set("Content-Type", "application/json")
-			_, _ = io.WriteString(w, `[{"number":12,"state":"open","head":{"ref":"courier/resolve-issue/acme-widgets/7","sha":"deadbeef"},"body":"Addresses #7. Just bundling changes."}]`)
+			_, _ = io.WriteString(w, pullRequestFixtureJSON(12, "open", false, "Addresses #7. Just bundling changes."))
 			return
 		}
 		w.WriteHeader(http.StatusNotFound)
@@ -3116,7 +3179,7 @@ func TestRunResolveIssuePublishedPRWithCorrectLinkageVerifying(t *testing.T) {
 	prServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if strings.HasSuffix(r.URL.Path, "/pulls") && r.URL.RawQuery != "" {
 			w.Header().Set("Content-Type", "application/json")
-			_, _ = io.WriteString(w, `[{"number":12,"state":"open","head":{"ref":"courier/resolve-issue/acme-widgets/7","sha":"deadbeef"},"body":"Closes #7. This PR resolves the icon assets gap."}]`)
+			_, _ = io.WriteString(w, pullRequestFixtureJSON(12, "open", false, "Closes #7. This PR resolves the icon assets gap."))
 			return
 		}
 		w.WriteHeader(http.StatusNotFound)
@@ -3203,7 +3266,7 @@ func TestRunResolveIssueUndeclaredVerifyingTriggersLinkageRepair(t *testing.T) {
 	prServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if strings.HasSuffix(r.URL.Path, "/pulls") && r.URL.RawQuery != "" {
 			w.Header().Set("Content-Type", "application/json")
-			_, _ = io.WriteString(w, `[{"number":12,"state":"open","head":{"ref":"courier/resolve-issue/acme-widgets/7","sha":"deadbeef"},"body":"Closes #999. Wrong issue number."}]`)
+			_, _ = io.WriteString(w, pullRequestFixtureJSON(12, "open", false, "Closes #999. Wrong issue number."))
 			return
 		}
 		w.WriteHeader(http.StatusNotFound)
@@ -3337,16 +3400,16 @@ func TestRunResolveIssueLinkageReadFailureFailsClosed(t *testing.T) {
 }
 
 // TestRunResolveIssueLinkageReadFailureRetriesInsideBudget exercises
-// the bounded retry/fail-closed mechanism (#248 follow-up) on the
+// the bounded retry/fail-closed mechanism (#248 follow-up, #247) on the
 // declared-changes path: a forge read failure that is recoverable
-// inside the captured session's continuation budget must route
-// through the linkage-repair continuation, exactly the way the
-// undeclared-Verifying path does. The body remains unread, so the
-// retry message preserves the missing-PR text the shared helper
-// composes. The fake's first turn declares changes; the second
-// turn never declares an outcome — so the run ends mid-budget
-// without exhausting it, after the linkage-repair continuation
-// fires at least once.
+// inside the captured session's continuation budget must route through a
+// re-verify continuation exactly the way the undeclared-Verifying path
+// does. #247 requires that a transient read failure is never dressed up
+// as a confirmed missing pull request: the continuation is a factual
+// pr-unverified turn that says the read failed, not a missing-PR create
+// prompt. The fake's first turn declares changes; the second turn never
+// declares an outcome, so the run ends after the read-failure retry fires
+// at least once and the budget is then exhausted.
 func TestRunResolveIssueLinkageReadFailureRetriesInsideBudget(t *testing.T) {
 	root := t.TempDir()
 	remote := filepath.Join(root, "remote.git")
@@ -3424,14 +3487,19 @@ func TestRunResolveIssueLinkageReadFailureRetriesInsideBudget(t *testing.T) {
 	if code != exitNeedsHuman {
 		t.Fatalf("run exit code = %d, want %d (fail-closed on forge read failure); stderr=%q stdout=%q", code, exitNeedsHuman, errorsOut.String(), output.String())
 	}
-	if !strings.Contains(output.String(), `"kind":"linkage-repair"`) {
-		t.Fatalf("expected the shared helper to fire a linkage-repair continuation: %q", output.String())
+	if !strings.Contains(output.String(), `"kind":"pr-unverified"`) {
+		t.Fatalf("expected the shared helper to fire a factual pr-unverified continuation: %q", output.String())
+	}
+	// #247: the read failure must not be represented as a confirmed
+	// missing pull request.
+	if strings.Contains(output.String(), "no pull request for that head") {
+		t.Fatalf("a failed read must not claim the pull request is missing: %q", output.String())
 	}
 	if !strings.Contains(output.String(), `"linkage.read.failed"`) {
 		t.Fatalf("expected the linkage read failure event: %q", output.String())
 	}
 	if !strings.Contains(output.String(), "acme/widgets#7") {
-		t.Fatalf("repair message should name the trusted source identity: %q", output.String())
+		t.Fatalf("re-verify message should name the trusted source identity: %q", output.String())
 	}
 }
 
@@ -3474,11 +3542,10 @@ func TestRunResolveIssueDeclaredChangesLinkageFailureUsesBoundedRepair(t *testin
 	// fire again, consume one continuation, and so on.
 	writeExecutable(t, fakeOpenCode, "#!/bin/sh\ncase \"$1\" in mcp) exit 0;; esac\necho \"$*\" >> \""+argvLog+"\"\necho '{\"sessionID\":\"ses_decl_repair\"}'\nmkdir -p \"$COURIER_SCRATCH_DIR\"\nprintf 'completed\\n' > completed.txt\ngit add --all -- .\ngit commit -m 'test: completed work' >/dev/null\nprintf '{\"outcome\":\"changes\"}' > \"$COURIER_SCRATCH_DIR/outcome.json\"\nexit 0\n")
 
-	// Match either the /pulls (head query) or /pulls/{n} (post-create read).
 	prServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if strings.HasSuffix(r.URL.Path, "/pulls") && r.URL.RawQuery != "" {
 			w.Header().Set("Content-Type", "application/json")
-			_, _ = io.WriteString(w, `[{"number":12,"state":"open","head":{"ref":"courier/resolve-issue/acme-widgets/7","sha":"deadbeef"},"body":"Addresses #7. Just bundling changes."}]`)
+			_, _ = io.WriteString(w, pullRequestFixtureJSON(12, "open", false, "Addresses #7. Just bundling changes."))
 			return
 		}
 		w.WriteHeader(http.StatusNotFound)
@@ -3612,8 +3679,8 @@ func TestRunResolveIssueUndeclaredLinkageReadFailureFailsClosed(t *testing.T) {
 	if strings.Contains(output.String(), `"phase":"Verifying"`) {
 		t.Fatalf("undeclared-Verifying must not be handed off as Verifying on a forge read error: %q", output.String())
 	}
-	if !strings.Contains(output.String(), `"kind":"linkage-repair"`) {
-		t.Fatalf("expected the undeclared path to fire a linkage-repair continuation before exhausting the budget: %q", output.String())
+	if !strings.Contains(output.String(), `"kind":"pr-unverified"`) {
+		t.Fatalf("expected the undeclared path to fire a factual pr-unverified continuation before exhausting the budget: %q", output.String())
 	}
 	if !strings.Contains(output.String(), `"linkage.read.failed"`) {
 		t.Fatalf("expected the linkage read failure event: %q", output.String())
@@ -3621,6 +3688,380 @@ func TestRunResolveIssueUndeclaredLinkageReadFailureFailsClosed(t *testing.T) {
 	if !strings.Contains(output.String(), "acme/widgets#7") {
 		t.Fatalf("NeedsHuman reason should name the trusted source identity: %q", output.String())
 	}
+}
+
+// The #247 tests below pin the post-turn, pre-handoff forge observation for
+// legacy resolve-issue runs: a confirmed missing or draft pull request
+// resumes the captured session with a factual state message inside #170's
+// shared budget, while an ambiguous, closed-only, or unpublished world and a
+// session that cannot be resumed fail closed. A transient forge read is
+// never dressed up as a confirmed missing pull request.
+
+// runResolveIssue247 runs a scripted resolve-issue scenario against the
+// stateful fake forge and a bare-base remote (the run branch is absent
+// from the remote at adoption time, so the adoption guard is skipped).
+// prePullRequests optionally seeds the pull-request state served before
+// the run starts. The returned values are the exit code, the run output,
+// and the fake-script argv log.
+func runResolveIssue247(t *testing.T, prePullRequests, script string) (int, string, []string) {
+	t.Helper()
+	root := t.TempDir()
+	remote := remoteWithBaseOnly(t, root)
+	prServer, prState := fakeForgePullRequestServer(t)
+	if prePullRequests != "" {
+		write(t, prState, prePullRequests)
+	}
+	fakeOpenCode := filepath.Join(root, "opencode")
+	writeExecutable(t, fakeOpenCode, script)
+	setContinuationEnv(t, root, remote, prServer.URL, fakeOpenCode)
+	var output bytes.Buffer
+	var errorsOut bytes.Buffer
+	code := run(context.Background(), &output, &errorsOut)
+	return code, output.String(), readArgvLog(t, filepath.Join(root, "fakestate"))
+}
+
+// script247 renders the shared fake OpenCode body for the #247 tests: log
+// argv, announce the session, commit per-turn work, push it when push is
+// set, run extraShell (which may reference $COURIER_FAKE_PR_STATE), then
+// declare changes. Every turn carries the same session id so a captured
+// session exists for resumes.
+func script247(session string, push bool, extraShell string) string {
+	pushLine := ""
+	if push {
+		pushLine = "git push origin \"$COURIER_BRANCH\" >/dev/null 2>&1 || true\n"
+	}
+	return `#!/bin/sh
+case "$1" in mcp) exit 0;; esac
+printf '%s\n' "$(printf '%s' "$*" | tr '\n' ' ')" >> "$COURIER_FAKE_STATE/argv.log"
+N=$(cat "$COURIER_FAKE_STATE/count" 2>/dev/null || echo 0)
+N=$((N+1))
+echo "$N" > "$COURIER_FAKE_STATE/count"
+printf '{"type":"text","sessionID":"` + session + `","part":{"type":"text","text":"turn %s of the work"}}\n' "$N"
+printf 'work\n' > "work-$N.txt"
+git add --all -- .
+git commit -m "test: work turn $N" >/dev/null 2>&1 || true
+` + pushLine + extraShell + `mkdir -p "$COURIER_SCRATCH_DIR"
+printf '{"outcome":"changes"}' > "$COURIER_SCRATCH_DIR/outcome.json"
+exit 0
+`
+}
+
+// script247OnSecondTurn runs turn 1's work, and on every later turn also
+// runs resumeShell — the seam that stands in for the model acting on a
+// pr-missing or pr-draft continuation through the forge capability.
+func script247OnSecondTurn(session, resumeShell string) string {
+	return script247(session, true, `if [ "$N" -ge 2 ]; then
+`+resumeShell+`fi
+`)
+}
+
+// TestRunResolveIssueMissingPullRequestResumesSessionToOpenIt proves the
+// core #247 ending: a resolve-issue run whose published branch carries no
+// pull request does not hand off as Verifying. It resumes the same
+// OpenCode session with a factual message naming the pinned repository,
+// branch, and trusted source issue; the resumed turn opens the intended
+// PR through the forge capability and re-declares, and the verified
+// open PR then yields the ordinary Verifying handoff.
+func TestRunResolveIssueMissingPullRequestResumesSessionToOpenIt(t *testing.T) {
+	root := t.TempDir()
+	remote := remoteWithBaseOnly(t, root)
+	prServer, prState := fakeForgePullRequestServer(t)
+	fakeOpenCode := filepath.Join(root, "opencode")
+	// The forge shows no pull request until the resumed turn "opens"
+	// one through it, standing in for the model acting on the
+	// pr-missing continuation.
+	writeExecutable(t, fakeOpenCode, script247OnSecondTurn("ses_missing1",
+		writePullRequestScript(prState, pullRequestFixtureJSON(12, "open", false, "Closes #7. The session opened the intended pull request."))))
+	setContinuationEnv(t, root, remote, prServer.URL, fakeOpenCode)
+	var output bytes.Buffer
+	var errorsOut bytes.Buffer
+	code := run(context.Background(), &output, &errorsOut)
+	out := output.String()
+	if code != exitSuccess {
+		t.Fatalf("run exit code = %d, want 0; stdout=%q state=%q", code, out, mustReadState(prState))
+	}
+	if !strings.Contains(out, `"phase":"Verifying"`) {
+		t.Fatalf("missing Verifying termination: %q", out)
+	}
+	if !strings.Contains(out, `"kind":"pr-missing"`) {
+		t.Fatalf("expected a pr-missing continuation: %q", out)
+	}
+	calls := readArgvLog(t, filepath.Join(root, "fakestate"))
+	if len(calls) != 2 {
+		t.Fatalf("fake script invoked %d times, want 2: %q", len(calls), calls)
+	}
+	if !strings.Contains(calls[1], "--session ses_missing1") {
+		t.Fatalf("resume did not carry the same session: %q", calls[1])
+	}
+	for _, want := range []string{
+		"Courier refused the handoff",
+		`is published to acme/widgets`,
+		`"courier/resolve-issue/acme-widgets/7"`,
+		"acme/widgets#7",
+		"declare blocked_external",
+	} {
+		if !strings.Contains(calls[1], want) {
+			t.Fatalf("missing-PR state message lost %q: %q", want, calls[1])
+		}
+	}
+}
+
+// TestRunResolveIssueMissingPullRequestWithoutSessionFailsClosed proves
+// #247's fail-closed rule for a missing same-session ID: with no captured
+// session to resume, a confirmed missing pull request never becomes a
+// Verifying handoff and never triggers a blind retry.
+func TestRunResolveIssueMissingPullRequestWithoutSessionFailsClosed(t *testing.T) {
+	sessionless := `#!/bin/sh
+case "$1" in mcp) exit 0;; esac
+printf '%s\n' "$*" >> "$COURIER_FAKE_STATE/argv.log"
+printf 'work\n' > work.txt
+git add --all -- .
+git commit -m 'test: committed work without a session' >/dev/null
+git push origin "$COURIER_BRANCH" >/dev/null 2>&1 || true
+mkdir -p "$COURIER_SCRATCH_DIR"
+printf '{"outcome":"changes"}' > "$COURIER_SCRATCH_DIR/outcome.json"
+exit 0
+`
+	code, out, _ := runResolveIssue247(t, "", sessionless)
+	if code != exitNeedsHuman {
+		t.Fatalf("run exit code = %d, want %d (fail-closed without a session); stdout=%q", code, exitNeedsHuman, out)
+	}
+	if !strings.Contains(out, "never opened a pull request") {
+		t.Fatalf("reason should name the missing pull request: %q", out)
+	}
+	if n := strings.Count(out, `"event":"executor.continuation"`); n != 0 {
+		t.Fatalf("executor.continuation count = %d, want 0 (nothing to resume)", n)
+	}
+}
+
+// TestRunResolveIssueMissingPullRequestBudgetExhaustsToNeedsHuman proves
+// the missing-PR continuation shares #170's max-attempt budget and
+// produces a bounded terminal reason on true exhaustion: two resumable
+// turns are offered, then the run escalates to NeedsHuman.
+func TestRunResolveIssueMissingPullRequestBudgetExhaustsToNeedsHuman(t *testing.T) {
+	root := t.TempDir()
+	remote := remoteWithBaseOnly(t, root)
+	prServer, _ := fakeForgePullRequestServer(t)
+	fakeOpenCode := filepath.Join(root, "opencode")
+	writeExecutable(t, fakeOpenCode, script247("ses_missing_budget", true, ""))
+	setContinuationEnv(t, root, remote, prServer.URL, fakeOpenCode)
+	t.Setenv("COURIER_MAX_CONTINUATIONS", "2")
+
+	var output bytes.Buffer
+	var errorsOut bytes.Buffer
+	code := run(context.Background(), &output, &errorsOut)
+	if code != exitNeedsHuman {
+		t.Fatalf("run exit code = %d, want %d; stdout=%q", code, exitNeedsHuman, output.String())
+	}
+	if !strings.Contains(output.String(), "never opened a pull request") {
+		t.Fatalf("terminal reason should name the missing pull request: %q", output.String())
+	}
+	events := parseEvents(t, &output)
+	if n := countEvents(t, events, "executor.continuation"); n != 2 {
+		t.Fatalf("executor.continuation count = %d, want 2 (shared bounded budget)", n)
+	}
+	for _, event := range events {
+		if event["event"] != "executor.continuation" {
+			continue
+		}
+		if kind := eventDetail(t, event)["kind"]; kind != "pr-missing" {
+			t.Fatalf("continuation kind = %v, want pr-missing", kind)
+		}
+	}
+}
+
+// TestRunResolveIssueDraftPullRequestResumesSessionToReadyIt proves the
+// draft ending of #247: a confirmed draft PR on the published head
+// resumes the same session with a message asking for that exact PR to be
+// marked ready — not for a duplicate — and the readied PR then yields the
+// ordinary Verifying handoff.
+func TestRunResolveIssueDraftPullRequestResumesSessionToReadyIt(t *testing.T) {
+	draft := pullRequestFixtureJSON(12, "open", true, "Closes #7. Work in progress.")
+	readied := pullRequestFixtureJSON(12, "open", false, "Closes #7. Work in progress.")
+	root := t.TempDir()
+	remote := remoteWithBaseOnly(t, root)
+	prServer, prState := fakeForgePullRequestServer(t)
+	write(t, prState, draft)
+	fakeOpenCode := filepath.Join(root, "opencode")
+	writeExecutable(t, fakeOpenCode, script247OnSecondTurn("ses_draft1",
+		writePullRequestScript(prState, readied)))
+	setContinuationEnv(t, root, remote, prServer.URL, fakeOpenCode)
+
+	var output bytes.Buffer
+	var errorsOut bytes.Buffer
+	code := run(context.Background(), &output, &errorsOut)
+	if code != exitSuccess {
+		t.Fatalf("run exit code = %d, want 0; stdout=%q", code, output.String())
+	}
+	if !strings.Contains(output.String(), `"phase":"Verifying"`) {
+		t.Fatalf("missing Verifying termination: %q", output.String())
+	}
+	if !strings.Contains(output.String(), `"kind":"pr-draft"`) {
+		t.Fatalf("expected a pr-draft continuation: %q", output.String())
+	}
+	if !strings.Contains(output.String(), `"pr":12`) {
+		t.Fatalf("pr-draft continuation should record the draft PR number: %q", output.String())
+	}
+	calls := readArgvLog(t, filepath.Join(root, "fakestate"))
+	if len(calls) != 2 {
+		t.Fatalf("fake script invoked %d times, want 2: %q", len(calls), calls)
+	}
+	if !strings.Contains(calls[1], "--session ses_draft1") {
+		t.Fatalf("resume did not carry the same session: %q", calls[1])
+	}
+	for _, want := range []string{
+		"pull request #12",
+		"ready for review",
+		"do not create a duplicate pull request",
+	} {
+		if !strings.Contains(calls[1], want) {
+			t.Fatalf("draft state message lost %q: %q", want, calls[1])
+		}
+	}
+}
+
+// TestRunResolveIssueDraftPullRequestBudgetExhaustsToNeedsHuman proves a
+// PR that stays draft past the shared budget terminates with the bounded
+// draft reason rather than a Verifying handoff.
+func TestRunResolveIssueDraftPullRequestBudgetExhaustsToNeedsHuman(t *testing.T) {
+	root := t.TempDir()
+	remote := remoteWithBaseOnly(t, root)
+	prServer, prState := fakeForgePullRequestServer(t)
+	write(t, prState, pullRequestFixtureJSON(12, "open", true, "Closes #7. Still a draft."))
+	fakeOpenCode := filepath.Join(root, "opencode")
+	writeExecutable(t, fakeOpenCode, script247("ses_draft_budget", true, ""))
+	setContinuationEnv(t, root, remote, prServer.URL, fakeOpenCode)
+	t.Setenv("COURIER_MAX_CONTINUATIONS", "1")
+
+	var output bytes.Buffer
+	var errorsOut bytes.Buffer
+	code := run(context.Background(), &output, &errorsOut)
+	if code != exitNeedsHuman {
+		t.Fatalf("run exit code = %d, want %d; stdout=%q", code, exitNeedsHuman, output.String())
+	}
+	if !strings.Contains(output.String(), "remained a draft") {
+		t.Fatalf("terminal reason should name the draft PR: %q", output.String())
+	}
+	if strings.Contains(output.String(), `"phase":"Verifying"`) {
+		t.Fatalf("a draft PR must not be handed off as Verifying: %q", output.String())
+	}
+}
+
+// TestRunResolveIssueUnpublishedHeadFailsClosedWithoutCreatePrompt proves
+// #247's remote-publication guard: a head confirmed absent from the
+// remote is an unpublished run, not a branch missing a pull request. The
+// run fails closed and is never asked to open a pull request over
+// unpublished work.
+func TestRunResolveIssueUnpublishedHeadFailsClosedWithoutCreatePrompt(t *testing.T) {
+	noPush := `#!/bin/sh
+case "$1" in mcp) exit 0;; esac
+printf '%s\n' "$*" >> "$COURIER_FAKE_STATE/argv.log"
+printf 'work\n' > work.txt
+git add --all -- .
+git commit -m 'test: committed but never pushed' >/dev/null
+mkdir -p "$COURIER_SCRATCH_DIR"
+printf '{"outcome":"changes"}' > "$COURIER_SCRATCH_DIR/outcome.json"
+exit 0
+`
+	code, out, _ := runResolveIssue247(t, "", noPush)
+	if code != exitNeedsHuman {
+		t.Fatalf("run exit code = %d, want %d (fail-closed on unpublished head); stdout=%q", code, exitNeedsHuman, out)
+	}
+	if !strings.Contains(out, "is not published on the remote") {
+		t.Fatalf("reason should name the unpublished head: %q", out)
+	}
+	if strings.Contains(out, "Open the pull request") {
+		t.Fatalf("an unpublished head must never be asked to open a pull request: %q", out)
+	}
+}
+
+// TestRunResolveIssueAmbiguousOpenPullRequestsFailClosed proves #247's
+// no-adoption rule: when the forge reports more than one open pull
+// request on the verified head, the executor refuses to pick one. The
+// run terminates immediately, without a retry continuation or a create
+// prompt.
+func TestRunResolveIssueAmbiguousOpenPullRequestsFailClosed(t *testing.T) {
+	ambiguous := "[" + pullRequestFixtureObjectJSON(12, "open", false, "Closes #7. First.") + "," + pullRequestFixtureObjectJSON(13, "open", false, "Closes #7. Second.") + "]"
+	code, out, _ := runResolveIssue247(t, ambiguous, script247("ses_ambiguous", true, ""))
+	if code != exitNeedsHuman {
+		t.Fatalf("run exit code = %d, want %d (fail-closed on ambiguity); stdout=%q", code, exitNeedsHuman, out)
+	}
+	if !strings.Contains(out, "more than one open pull request") {
+		t.Fatalf("reason should name the ambiguity: %q", out)
+	}
+	if n := strings.Count(out, `"event":"executor.continuation"`); n != 0 {
+		t.Fatalf("executor.continuation count = %d, want 0 (ambiguous world is fail-closed)", n)
+	}
+}
+
+// TestRunResolveIssueClosedOnlyPullRequestFailsClosed proves #247 keeps
+// the adoption guard's refusal mid-run: a head whose only pull requests
+// are closed or merged is never reopened, adopted, or duplicated by a
+// continuation.
+func TestRunResolveIssueClosedOnlyPullRequestFailsClosed(t *testing.T) {
+	closed := pullRequestFixtureJSON(11, "closed", false, "Closes #7. Abandoned.")
+	code, out, _ := runResolveIssue247(t, closed, script247("ses_closed", true, ""))
+	if code != exitNeedsHuman {
+		t.Fatalf("run exit code = %d, want %d (fail-closed on closed-only PRs); stdout=%q", code, exitNeedsHuman, out)
+	}
+	if !strings.Contains(out, "only closed or merged pull requests") {
+		t.Fatalf("reason should name the closed-only state: %q", out)
+	}
+	if strings.Contains(out, `"kind":"pr-missing"`) {
+		t.Fatalf("a closed PR must not be treated as a missing one: %q", out)
+	}
+}
+
+// TestRunResolveIssueTransientForgeReadRetriesFactuallyThenVerifies
+// proves the #247 transient rule: a failed live observation is never
+// represented as a confirmed missing pull request. The captured session
+// gets a factual re-verify turn, and when the next observation succeeds
+// the run completes its Verifying handoff.
+func TestRunResolveIssueTransientForgeReadRetriesFactuallyThenVerifies(t *testing.T) {
+	prJSON := pullRequestFixtureJSON(12, "open", false, "Closes #7. The PR was there all along.")
+	root := t.TempDir()
+	remote := remoteWithBaseOnly(t, root)
+	prServer, prState := fakeForgePullRequestServer(t)
+	fakeOpenCode := filepath.Join(root, "opencode")
+	// Turn 1: the forge read fails (the state file says 500). Turn 2:
+	// the state file holds the real PR the transient read missed.
+	write(t, prState, "500")
+	writeExecutable(t, fakeOpenCode, script247OnSecondTurn("ses_transient1",
+		writePullRequestScript(prState, prJSON)))
+	setContinuationEnv(t, root, remote, prServer.URL, fakeOpenCode)
+
+	var output bytes.Buffer
+	var errorsOut bytes.Buffer
+	code := run(context.Background(), &output, &errorsOut)
+	if code != exitSuccess {
+		t.Fatalf("run exit code = %d, want 0 (transient read retried, then verified); stdout=%q", code, output.String())
+	}
+	if !strings.Contains(output.String(), `"kind":"pr-unverified"`) {
+		t.Fatalf("expected a factual pr-unverified continuation: %q", output.String())
+	}
+	if strings.Contains(output.String(), "no pull request for that head") {
+		t.Fatalf("a transient read failure must not claim the pull request is missing: %q", output.String())
+	}
+	if !strings.Contains(output.String(), `"phase":"Verifying"`) {
+		t.Fatalf("missing Verifying termination after the retry: %q", output.String())
+	}
+	calls := readArgvLog(t, filepath.Join(root, "fakestate"))
+	if len(calls) != 2 {
+		t.Fatalf("fake script invoked %d times, want 2: %q", len(calls), calls)
+	}
+	if !strings.Contains(calls[1], "this is not proof that the pull request is missing") {
+		t.Fatalf("re-verify message should disclaim a missing-PR claim: %q", calls[1])
+	}
+}
+
+// mustReadState reads the fake forge state file for failure messages,
+// returning a marker when it never materialized.
+func mustReadState(path string) string {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return "<no state>"
+	}
+	return string(data)
 }
 
 // The failure-evidence tests below pin the gate's silence and capture
@@ -3795,15 +4236,16 @@ func TestEvidenceGateCleanRemoteConfirmed(t *testing.T) {
 	root := t.TempDir()
 	remote := remoteWithExistingBranch(t, root)
 	fakeOpenCode := filepath.Join(root, "opencode")
+	prServer, prState := fakeForgePullRequestServer(t)
 	writeExecutable(t, fakeOpenCode, `#!/bin/sh
 case "$1" in mcp) exit 0;; esac
 printf 'completed\n' > completed.txt
 git add --all -- . && git commit -m done && git push origin "$COURIER_BRANCH" >/dev/null 2>&1 || true
 mkdir -p "$COURIER_SCRATCH_DIR"
 printf '{"outcome":"changes"}' > "$COURIER_SCRATCH_DIR/outcome.json"
-`)
+`+writePullRequestScript(prState, pullRequestFixtureJSON(12, "open", false, "Closes #7. The pushed turn opened the pull request.")))
 	intake, snapshot := newEvidenceIntake(t)
-	setResolveIssueEnv(t, root, remote, fakeGitHubAPI(t).URL, fakeOpenCode)
+	setResolveIssueEnv(t, root, remote, prServer.URL, fakeOpenCode)
 	t.Setenv("COURIER_REF", "7")
 	t.Setenv("COURIER_RUN_NAME", "coderrun-it-7")
 	t.Setenv("GITHUB_TOKEN", "github-api-token")
@@ -4012,11 +4454,13 @@ func remoteWithBaseOnly(t *testing.T, root string) string {
 // TestEvidenceLocalCommitsNotOnRemoteCaptures proves a local commit the
 // remote run branch does not hold is preserved: the run commits work but does
 // not push, the remote has no run branch so the gate's bounded fetch fails,
-// and the run declares changes for a Verifying ending. The gate finds
-// unrecoverable state, captures the local commit, delivers one authenticated
-// bundle, and emits a single evidence.capture event. A second run of the same
-// scenario with capture unconfigured must produce the same Verifying handoff,
-// proving the capture never changes the run's ending.
+// and the run declares changes. The pre-handoff observation (#247) then
+// confirms the head was never published and fails the handoff closed to
+// NeedsHuman. The gate finds the same unrecoverable state, captures the
+// local commit, delivers one authenticated bundle, and emits a single
+// evidence.capture event. A second run of the same scenario with capture
+// unconfigured must produce the same handoff, proving the capture never
+// changes the run's ending.
 func TestEvidenceLocalCommitsNotOnRemoteCaptures(t *testing.T) {
 	runScenario := func(t *testing.T, armed bool) (int, string, func() []intakeRecord) {
 		t.Helper()
@@ -4053,11 +4497,14 @@ printf '{"outcome":"changes"}' > "$COURIER_SCRATCH_DIR/outcome.json"
 	}
 
 	code, armedOut, snapshot := runScenario(t, true)
-	if code != exitSuccess {
-		t.Fatalf("armed run exit code = %d, want %d (Verifying)", code, exitSuccess)
+	if code != exitNeedsHuman {
+		t.Fatalf("armed run exit code = %d, want %d (unpublished head fails closed, #247)", code, exitNeedsHuman)
 	}
-	if !strings.Contains(armedOut, `"phase":"Verifying"`) {
-		t.Fatalf("armed run should end verifying: %q", armedOut)
+	if !strings.Contains(armedOut, `"phase":"NeedsHuman"`) {
+		t.Fatalf("armed run should end needs-human: %q", armedOut)
+	}
+	if !strings.Contains(armedOut, "is not published on the remote") {
+		t.Fatalf("armed run should name the unpublished head: %q", armedOut)
 	}
 
 	t.Run("armed captures and delivers", func(t *testing.T) {
@@ -4097,8 +4544,8 @@ printf '{"outcome":"changes"}' > "$COURIER_SCRATCH_DIR/outcome.json"
 
 	t.Run("unconfigured leaves the ending unchanged", func(t *testing.T) {
 		disarmedCode, disarmedOut, _ := runScenario(t, false)
-		if disarmedCode != exitSuccess {
-			t.Fatalf("disarmed run exit code = %d, want %d (Verifying)", disarmedCode, exitSuccess)
+		if disarmedCode != exitNeedsHuman {
+			t.Fatalf("disarmed run exit code = %d, want %d (unpublished head fails closed, #247)", disarmedCode, exitNeedsHuman)
 		}
 		want := terminationLineJSON(t, armedOut)
 		got := terminationLineJSON(t, disarmedOut)
@@ -5165,35 +5612,137 @@ printf '{"outcome":"changes"}' > "$COURIER_SCRATCH_DIR/outcome.json"
 // instruction the legacy executor feeds to the captured session (#248):
 // the trusted source identity, the supported closing keywords, the
 // offending PR number when the check observed one, and the continuation
-// number.
+// number. The missing-PR instruction moved to prMissingMessage (#247),
+// which carries the published-branch facts, so this helper only repairs
+// a published PR body.
 func TestLinkageRepairMessage(t *testing.T) {
 	source := broker.SourceIssue{Owner: "misospace", Name: "miso-gallery", Number: 502}
 
-	cases := []struct {
-		name         string
-		outcome      *linkageCheckOutcome
-		continuation int
-		want         string
-	}{
-		{
-			name:         "missing PR asks for one to be opened",
-			outcome:      &linkageCheckOutcome{missing: true},
-			continuation: 1,
-			want:         "Courier refused the handoff: no open pull request exists for the run branch yet, so the run cannot be handed off as Verifying. Open a pull request through the forge capability whose body carries an authoritative closing reference to misospace/miso-gallery#502. Use a supported closing keyword (Closes, Fixes, or Resolves) followed by #502, or the cross-repo form misospace/miso-gallery#502 when the trusted source repository differs from the PR base. Then re-declare the same outcome. (continuation 1)",
-		},
-		{
-			name:         "published PR names the offending number",
-			outcome:      &linkageCheckOutcome{pr: &prLinkageObservation{Number: 12, State: "open", Body: "Addresses #502"}},
-			continuation: 2,
-			want:         "Courier refused the handoff: PR #12's body does not carry an authoritative closing reference to misospace/miso-gallery#502. Update the PR body through the forge capability so it carries a supported closing keyword (Closes, Fixes, or Resolves) followed by #502, or the cross-repo form misospace/miso-gallery#502 when the trusted source repository differs from the PR base. Then re-declare the same outcome. (continuation 2)",
-		},
+	outcome := &linkageCheckOutcome{pr: &prLinkageObservation{Number: 12, State: "open", Body: "Addresses #502"}}
+	want := "Courier refused the handoff: PR #12's body does not carry an authoritative closing reference to misospace/miso-gallery#502. Update the PR body through the forge capability so it carries a supported closing keyword (Closes, Fixes, or Resolves) followed by #502, or the cross-repo form misospace/miso-gallery#502 when the trusted source repository differs from the PR base. Then re-declare the same outcome. (continuation 2)"
+	if got := linkageRepairMessage(source, outcome, 2); got != want {
+		t.Fatalf("linkageRepairMessage = %q, want %q", got, want)
 	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			if got := linkageRepairMessage(source, tc.outcome, tc.continuation); got != tc.want {
-				t.Fatalf("linkageRepairMessage = %q, want %q", got, tc.want)
-			}
+}
+
+// TestPullRequestStateMessages pins the exact #247 continuation
+// instructions: the missing-PR message names the pinned repository, the
+// run branch, and the trusted source issue and forbids foreign adoption;
+// the draft message names the exact PR number and asks only for that PR
+// to be marked ready; the unverified message reports a failed read as a
+// failed read and never claims the pull request is missing.
+func TestPullRequestStateMessages(t *testing.T) {
+	var output, errorsOut bytes.Buffer
+	report := newReporter(&output, &errorsOut, config{
+		Mode:   "resolve-issue",
+		Repo:   "misospace/miso-gallery",
+		Branch: "courier/resolve-issue/miso-gallery/502",
+		Base:   "main",
+		Ref:    502,
+	})
+	source := report.sourceIssue()
+
+	missing := report.prMissingMessage(source, 1)
+	for _, want := range []string{
+		`the run branch "courier/resolve-issue/miso-gallery/502" is published to misospace/miso-gallery`,
+		"head misospace/miso-gallery:courier/resolve-issue/miso-gallery/502 against base main",
+		"authoritative closing reference to misospace/miso-gallery#502",
+		"Do not adopt a pull request whose head belongs to another repository",
+		"declare blocked_external naming the block",
+		"(continuation 1)",
+	} {
+		if !strings.Contains(missing, want) {
+			t.Fatalf("missing-PR message lost %q: %q", want, missing)
+		}
+	}
+
+	draft := report.prDraftMessage(source, 44, 2)
+	for _, want := range []string{
+		"pull request #44 for the run branch",
+		"Mark pull request #44 ready for review through the forge capability",
+		"do not create a duplicate pull request",
+		"do not change its base or head",
+		"(continuation 2)",
+	} {
+		if !strings.Contains(draft, want) {
+			t.Fatalf("draft message lost %q: %q", want, draft)
+		}
+	}
+
+	unverified := report.prUnverifiedMessage(source, errors.New("GitHub API returned HTTP 500"), 3)
+	for _, want := range []string{
+		"could not verify the pull-request state",
+		"GitHub API returned HTTP 500",
+		"this is not proof that the pull request is missing",
+		"open, non-draft pull request",
+		"(continuation 3)",
+	} {
+		if !strings.Contains(unverified, want) {
+			t.Fatalf("unverified message lost %q: %q", want, unverified)
+		}
+	}
+}
+
+// TestObserveRunBranchPullRequestIdentity pins the identity rules of the
+// executor's pre-handoff forge read (#247): only a pull request whose
+// full base- and head-repository identity matches the run's pinned
+// repository and branch counts as the run's own; a foreign head is never
+// adopted; a response missing either identity is a read failure, never a
+// classified world; and two open PRs on the verified head are ambiguous
+// rather than a silent pick.
+func TestObserveRunBranchPullRequestIdentity(t *testing.T) {
+	newObserved := func(body string) runBranchPRObservation {
+		t.Helper()
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = io.WriteString(w, body)
+		}))
+		t.Cleanup(server.Close)
+		var output, errorsOut bytes.Buffer
+		report := newReporter(&output, &errorsOut, config{
+			Mode:          "resolve-issue",
+			Repo:          "acme/widgets",
+			Branch:        "courier/resolve-issue/acme-widgets/7",
+			Ref:           7,
+			GitHubAPIBase: server.URL,
 		})
+		observation, err := report.observeRunBranchPullRequest(context.Background())
+		if err != nil {
+			t.Fatalf("observeRunBranchPullRequest() error = %v", err)
+		}
+		return observation
+	}
+
+	if got := newObserved(pullRequestFixtureJSON(12, "open", false, "Closes #7.")); got.kind != prStateOpen || got.open == nil || got.open.Number != 12 {
+		t.Fatalf("own-head open PR classified as %+v, want prStateOpen #12", got)
+	}
+	if got := newObserved(pullRequestFixtureJSON(12, "open", true, "Closes #7.")); got.kind != prStateDraft || got.draft == nil {
+		t.Fatalf("draft PR classified as %+v, want prStateDraft", got)
+	}
+	foreign := `[{"number":9,"state":"open","draft":false,"base":{"ref":"main","repo":{"full_name":"acme/widgets"}},"head":{"ref":"courier/resolve-issue/acme-widgets/7","repo":{"full_name":"mallory/widgets"}},"body":"Closes #7."}]`
+	if got := newObserved(foreign); got.kind != prStateMissing {
+		t.Fatalf("foreign-head PR classified as %+v, want prStateMissing (never adopted)", got)
+	}
+	missingIdentity := `[{"number":9,"state":"open","draft":false,"body":"Closes #7."}]`
+	foreignServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, missingIdentity)
+	}))
+	t.Cleanup(foreignServer.Close)
+	var output, errorsOut bytes.Buffer
+	report := newReporter(&output, &errorsOut, config{
+		Mode:          "resolve-issue",
+		Repo:          "acme/widgets",
+		Branch:        "courier/resolve-issue/acme-widgets/7",
+		Ref:           7,
+		GitHubAPIBase: foreignServer.URL,
+	})
+	if _, err := report.observeRunBranchPullRequest(context.Background()); err == nil {
+		t.Fatal("a response without repository identity must fail the read, not classify a world")
+	}
+	ambiguous := "[" + pullRequestFixtureObjectJSON(12, "open", false, "Closes #7.") + "," + pullRequestFixtureObjectJSON(13, "open", false, "Closes #7.") + "]"
+	if got := newObserved(ambiguous); got.kind != prStateAmbiguous {
+		t.Fatalf("two open PRs on the verified head classified as %+v, want prStateAmbiguous", got)
 	}
 }
 
@@ -5255,8 +5804,9 @@ func TestLinkageExhaustedReason(t *testing.T) {
 }
 
 // TestLinkageForgeFailureReason pins the exact NeedsHuman reason for a
-// forge read failure (#248): the trusted source identity, the forge's
-// error text verbatim, and the human handoff marker.
+// forge read failure (#248, #247): the trusted source identity, the
+// open non-draft contract the read could not confirm, the forge's error
+// text verbatim, and the human handoff marker.
 func TestLinkageForgeFailureReason(t *testing.T) {
 	var output, errorsOut bytes.Buffer
 	report := newReporter(&output, &errorsOut, config{
@@ -5265,10 +5815,57 @@ func TestLinkageForgeFailureReason(t *testing.T) {
 		Ref:  502,
 	})
 	forgeErr := errors.New("GitHub request: GET https://api.example.com/repos/misospace/miso-gallery/pulls?per_page=100: 500 Internal Server Error")
-	want := "the live pull request body could not be read from the forge to verify authoritative source-issue linkage to misospace/miso-gallery#502: " +
+	want := "the live pull-request state could not be verified to confirm an open, non-draft pull request with authoritative source-issue linkage to misospace/miso-gallery#502: " +
 		forgeErr.Error() + "; the run needs a human"
 	if got := report.linkageForgeFailureReason(forgeErr); got != want {
 		t.Fatalf("linkageForgeFailureReason = %q, want %q", got, want)
+	}
+}
+
+// TestPreHandoffFailClosedReasons pins the exact NeedsHuman reasons for
+// the worlds the #247 observation must not paper over with a retry or a
+// creation: an unpublished head, an ambiguous set of open pull requests,
+// and a head whose only pull requests are closed or merged.
+func TestPreHandoffFailClosedReasons(t *testing.T) {
+	var output, errorsOut bytes.Buffer
+	report := newReporter(&output, &errorsOut, config{
+		Mode:   "resolve-issue",
+		Repo:   "misospace/miso-gallery",
+		Branch: "courier/resolve-issue/miso-gallery/502",
+		Ref:    502,
+	})
+	cases := []struct {
+		name string
+		got  string
+		want string
+	}{
+		{
+			name: "unpublished head",
+			got:  report.unpublishedBranchReason(),
+			want: `the run branch "courier/resolve-issue/miso-gallery/502" is not published on the remote and carries no pull request, so the handoff was refused; the executor will not ask for a pull request over unpublished work; the run needs a human`,
+		},
+		{
+			name: "ambiguous open PRs",
+			got:  report.prAmbiguousReason(),
+			want: `the forge reports more than one open pull request for the run branch "courier/resolve-issue/miso-gallery/502" on misospace/miso-gallery; the executor refuses to adopt one or create another; the run needs a human to settle which pull request belongs to this run`,
+		},
+		{
+			name: "closed-only PRs",
+			got:  report.closedOnlyPRReason(),
+			want: `the run branch "courier/resolve-issue/miso-gallery/502" on misospace/miso-gallery has only closed or merged pull requests and no open one; the executor refuses adoption, reopening, or duplicate creation; the run needs a human`,
+		},
+		{
+			name: "draft never readied",
+			got:  report.draftExhaustedReason(44),
+			want: `pull request #44 for the run branch "courier/resolve-issue/miso-gallery/502" remained a draft after the bounded continuation budget, so the handoff was refused; the run needs a human to mark it ready for review (trusted source issue misospace/miso-gallery#502)`,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if tc.got != tc.want {
+				t.Fatalf("%s reason = %q, want %q", tc.name, tc.got, tc.want)
+			}
+		})
 	}
 }
 
