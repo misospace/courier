@@ -216,7 +216,7 @@ jobs:
         run: test "$(docker inspect --format '{{.Config.User}}' courier-coordinator:ci)" = "65532:65532"
 
       - name: Test coordinator scratch boundary (image)
-        run: COURIER_COORDINATOR_IMAGE=courier-coordinator:ci go test -run 'Scratch|Toolchain' ./internal/executor
+        run: COURIER_COORDINATOR_IMAGE=courier-coordinator:ci go test -run 'Scratch|Toolchain|ProcessTree' ./internal/executor
 
   image-harness:
     runs-on: ubuntu-latest
