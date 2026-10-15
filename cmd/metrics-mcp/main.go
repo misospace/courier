@@ -25,7 +25,19 @@ type options struct {
 	metricsURL    string
 	backend       string
 	scrapeTimeout time.Duration
+	// shutdownGrace bounds Shutdown before remaining connections are force-closed.
+	shutdownGrace time.Duration
 }
+
+// HTTP-server timeouts bound inbound reads: an incomplete header or body
+// cannot pin a connection, and idle keep-alives expire. Values follow the
+// project-wide pattern in cmd/courier-broker and internal/controller.
+const (
+	httpReadHeaderTimeout = 10 * time.Second
+	httpReadTimeout       = 60 * time.Second
+	httpWriteTimeout      = 30 * time.Second
+	httpIdleTimeout       = 120 * time.Second
+)
 
 func main() {
 	var opts options
@@ -34,6 +46,7 @@ func main() {
 	flag.StringVar(&opts.metricsURL, "metrics-url", "", "URL of the model server's Prometheus /metrics endpoint.")
 	flag.StringVar(&opts.backend, "backend", couriermetrics.BackendAuto, "Backend mapping for the metrics endpoint: auto, or vllm.")
 	flag.DurationVar(&opts.scrapeTimeout, "scrape-timeout", 5*time.Second, "Timeout for a single metrics scrape.")
+	flag.DurationVar(&opts.shutdownGrace, "shutdown-grace", 10*time.Second, "Grace period for in-flight requests on shutdown before remaining connections are force-closed.")
 	flag.Parse()
 
 	listener, err := net.Listen("tcp", addr)
@@ -65,7 +78,13 @@ func run(ctx context.Context, listener net.Listener, opts options, logw io.Write
 	logger := log.New(logw, "metrics-mcp ", log.LstdFlags|log.Lmsgprefix)
 	scraper := couriermetrics.NewScraper(&http.Client{Timeout: opts.scrapeTimeout}, mapping)
 	server := couriermetrics.NewServer(opts.metricsURL, scraper)
-	httpServer := &http.Server{Handler: couriermetrics.HTTPHandler(server)}
+	httpServer := &http.Server{
+		Handler:           couriermetrics.HTTPHandler(server),
+		ReadHeaderTimeout: httpReadHeaderTimeout,
+		ReadTimeout:       httpReadTimeout,
+		WriteTimeout:      httpWriteTimeout,
+		IdleTimeout:       httpIdleTimeout,
+	}
 
 	logger.Printf("listening on %s (backend %s, metrics endpoint %s)", listener.Addr(), mapping.Name(), couriermetrics.RedactedURL(opts.metricsURL))
 	serveErr := make(chan error, 1)
@@ -75,6 +94,13 @@ func run(ctx context.Context, listener net.Listener, opts options, logw io.Write
 		return err
 	case <-ctx.Done():
 		logger.Printf("shutting down")
-		return httpServer.Shutdown(context.Background())
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), opts.shutdownGrace)
+		defer cancel()
+		if err := httpServer.Shutdown(shutdownCtx); err != nil {
+			// Grace budget expired; force-close any remaining connections so
+			// a stuck read does not stall process termination.
+			return httpServer.Close()
+		}
+		return nil
 	}
 }
