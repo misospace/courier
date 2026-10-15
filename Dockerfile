@@ -57,19 +57,35 @@ RUN --mount=type=cache,target=/go/pkg/mod \
 FROM node:24-bookworm-slim@sha256:a5f4366e834695d5f363b920c104953a535d3a9864d1bdf74566a0ebe01daee5 AS coordinator
 ARG OPENCODE_VERSION=1.18.31
 
-# bookworm ships git 2.39, but the harness artifact validation (internal/harness)
-# documented in README Prerequisites requires git >= 2.41. Pull git from
-# bookworm-backports so the lane runtime passes the documented minimum; without
-# this, several internal/harness tests fail purely on the version gap. The
-# backports source is removed after install so the image does not advertise it
-# at runtime.
+# bookworm ships git 2.39; the harness artifact validation (internal/harness)
+# requires git >= 2.41 and bookworm-backports does not carry git. Build git
+# v2.47.3 from a pinned GitHub release tarball, verifying SHA-256, with
+# /usr/local as the install prefix so the new binary shadows the stock one.
 RUN set -eux; \
-	echo 'deb http://deb.debian.org/debian bookworm-backports main' > /etc/apt/sources.list.d/backports.list && \
 	apt-get update && \
 	apt-get install -y --no-install-recommends \
 		ca-certificates \
-		git/bookworm-backports && \
-	rm /etc/apt/sources.list.d/backports.list && \
+		wget \
+		build-essential \
+		libssl-dev \
+		libcurl4-openssl-dev \
+		zlib1g-dev \
+		libexpat1-dev && \
+	wget -qO /tmp/git.tar.gz https://github.com/git/git/archive/refs/tags/v2.47.3.tar.gz && \
+	echo 'f61ffa245b9a353a8d32b1c6c22d92ccf9a888419edb850260ceb4ce1b2b3cae  /tmp/git.tar.gz' | sha256sum -c - && \
+	mkdir -p /tmp/git-src && \
+	tar -xzf /tmp/git.tar.gz -C /tmp/git-src --strip-components=1 && \
+	rm /tmp/git.tar.gz && \
+	make -j"$(nproc)" -C /tmp/git-src prefix=/usr/local all && \
+	make -C /tmp/git-src prefix=/usr/local install && \
+	rm -rf /tmp/git-src && \
+	apt-get purge -y --auto-remove \
+		build-essential \
+		libssl-dev \
+		libcurl4-openssl-dev \
+		zlib1g-dev \
+		libexpat1-dev \
+		wget && \
 	apt-get clean && rm -rf /var/lib/apt/lists/* && \
 	git_version="$(git version | awk '{print $3}')" && \
 	if ! printf '%s\n%s\n' '2.41' "$git_version" | sort -V -C; then \
