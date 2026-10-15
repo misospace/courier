@@ -213,30 +213,55 @@ func (p *Provider) ReadPullRequest(ctx context.Context, ref forge.PullRequestRef
 // ListPullRequestsByHead returns all PRs queried by head owner and branch, then
 // filters exact repository and ref identities locally. GitHub's head filter is
 // only owner:branch, so repository identity must be checked in the response.
+// Records whose forge-carried identity does not match the requested head are
+// dropped here; callers that must distinguish "no pull request exists" from
+// "the only records claiming this head selector belong to another repository"
+// use ListPullRequestsWithForeign instead, because an empty filtered list must
+// never be read as confirmed absence on a world the listing did not settle.
 func (p *Provider) ListPullRequestsByHead(ctx context.Context, base forge.PullRequestRef, headRepo, headRef string) ([]forge.PullRequest, error) {
+	matches, _, err := p.listPullRequestsByHead(ctx, base, headRepo, headRef)
+	return matches, err
+}
+
+// ListPullRequestsWithForeign is the identity-checked head listing that keeps
+// foreign records visible: it returns the PRs whose full base- and head-
+// repository and ref identities match the request separately from the PRs
+// GitHub's owner:branch head selector surfaced whose identity differs from the
+// requested pair (a same-owner fork claiming the same branch, or a response
+// that does not carry the queried base repository). A foreign record can
+// neither be adopted as the run's pull request nor silently deleted toward a
+// "missing" claim, so callers that fail closed on a foreign head get them
+// separated rather than dropped. A record missing either repository identity
+// outright is a read failure, as in toForgePR.
+func (p *Provider) ListPullRequestsWithForeign(ctx context.Context, base forge.PullRequestRef, headRepo, headRef string) (matches, foreign []forge.PullRequest, err error) {
+	return p.listPullRequestsByHead(ctx, base, headRepo, headRef)
+}
+
+func (p *Provider) listPullRequestsByHead(ctx context.Context, base forge.PullRequestRef, headRepo, headRef string) (matches, foreign []forge.PullRequest, err error) {
 	baseOwner, baseName, err := splitRepository(base.Repo)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	headOwner, _, err := splitRepository(headRepo)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	pulls, err := p.client.PullRequestsForHeadAllPages(ctx, baseOwner, baseName, headOwner, headRef)
 	if err != nil {
-		return nil, boundaryError(err)
+		return nil, nil, boundaryError(err)
 	}
-	var matches []forge.PullRequest
 	for _, raw := range pulls {
 		pr, err := toForgePR(raw)
 		if err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 		if pr.BaseRepo == base.Repo && pr.HeadRepo == headRepo && pr.HeadRef == headRef {
 			matches = append(matches, pr)
+		} else {
+			foreign = append(foreign, pr)
 		}
 	}
-	return matches, nil
+	return matches, foreign, nil
 }
 
 // ListReviews is not covered by this client.

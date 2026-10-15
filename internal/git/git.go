@@ -334,22 +334,36 @@ func Clone(ctx context.Context, remoteURL, destination string) error {
 	return err
 }
 
-// RemoteBranchExists reports whether remoteURL advertises the branch, without
-// requiring a local clone. It is the forge-agnostic half of the "adopt only
-// when orphaned" guard: deciding what an existing remote branch means is the
-// caller's job.
-func RemoteBranchExists(ctx context.Context, remoteURL, branch string) (bool, error) {
+// RemoteBranchHead reports the commit remoteURL advertises for the branch,
+// without requiring a local clone. An absent branch returns an empty sha and
+// false; a failed read is an error, never a guess about what the remote holds.
+// Deciding what the advertised commit means for a run is the caller's job.
+func RemoteBranchHead(ctx context.Context, remoteURL, branch string) (string, bool, error) {
 	if strings.TrimSpace(remoteURL) == "" {
-		return false, errors.New("remote URL is required")
+		return "", false, errors.New("remote URL is required")
 	}
 	if err := validateRef(branch, "branch"); err != nil {
-		return false, err
+		return "", false, err
 	}
 	out, err := run(ctx, "", "ls-remote", "--heads", "--", remoteURL, "refs/heads/"+branch)
 	if err != nil {
-		return false, err
+		return "", false, err
 	}
-	return len(bytes.TrimSpace(out)) > 0, nil
+	trimmed := strings.TrimSpace(string(out))
+	if trimmed == "" {
+		return "", false, nil
+	}
+	return strings.Fields(trimmed)[0], true, nil
+}
+
+// RemoteBranchExists reports whether remoteURL advertises the branch, without
+// requiring a local clone. It is the forge-agnostic half of the "adopt only
+// when orphaned" guard: deciding what an existing remote branch means is the
+// caller's job. Callers that must prove particular commits are published need
+// RemoteBranchHead: a ref's mere existence does not say which commit it holds.
+func RemoteBranchExists(ctx context.Context, remoteURL, branch string) (bool, error) {
+	_, exists, err := RemoteBranchHead(ctx, remoteURL, branch)
+	return exists, err
 }
 
 // Prepare clones a repository and checks out its deterministic work branch.

@@ -3203,3 +3203,48 @@ was superseded.
   and adds no silent fallback. The legacy OpenCode executor has no structured
   provider signal and is not yet classified; in-run long cooldown and
   source-side cooldown honoring are not implemented. (#320)
+- **2026-10-14 — #247: the legacy executor performs a bounded, identity-checked
+  post-turn PR observation before any `Verifying` handoff; a confirmed missing
+  or draft pull request resumes the captured OpenCode session, and every
+  unresumable state fails closed.** This supersedes the pre-handoff rule from
+  the 2026-10-10 #248 follow-up that a run which never opened a PR for the
+  branch returned `Pass` and handed off as `Verifying`. The executor now
+  observes the whole head through the configured forge's
+  `PullRequestHeadLister` capability (all states, paginated) and adopts a
+  candidate only when the response carries authoritative `repo.full_name`
+  identity on both sides of the head/base pair — a response without it is a
+  read failure, never a pull request, so the executor cannot adopt a PR whose
+  owning repository it cannot verify. A record that claims the owner:branch
+  head selector from a different repository stays visible and fails the
+  observation closed rather than being filtered toward a "missing" claim that
+  would prompt a duplicate creation. Classification drives fixed consequences:
+  a **missing** PR on a head confirmed published to the remote resumes the
+  same captured session under the #170 budget with a factual message naming
+  the repository, branch, and trusted source issue; a **draft** resumes the
+  same session asking that exact PR to be marked ready, never a duplicate;
+  **ambiguous** (more than one open PR), **closed-or-merged-only**,
+  **foreign-head**, **wrong-base** (an open PR on the verified head targeting
+  a base other than the pinned one), and **unpublished head** are fail-closed
+  on sight with no continuation, because resuming would invite the model to
+  adopt, reopen, duplicate, re-target, or publish over a world the executor
+  cannot disambiguate. Publication is a sha proof applied to every resumable
+  and passing kind, not a ref-existence proof on the missing route alone: the
+  remote must advertise the run's current head commit, so a stale remote
+  branch — or an already-open PR behind unpushed commits — fails closed like
+  an absent one. A failed observation is
+  unverifiable, never reported as missing — the retry message says so
+  explicitly — and consumes the same bounded budget. With no captured
+  session, an exhausted budget, or shutdown, every resumable kind terminates
+  `NeedsHuman` with the precise state in the reason, and the reason names
+  the actual cause rather than claiming budget exhaustion that did not
+  happen. Both the declared and undeclared `Verifying` routes share the one
+  `applyLinkagePlan` helper, so no route can hand off unobserved. The
+  executor's terminating `Verifying` handoff is emitted only for a verified
+  open, non-draft PR on the pinned base with authoritative linkage and the
+  run's current commit advertised by the remote; the separate pre-dispatch
+  adoption guard, which reports a pre-existing open PR without a draft or
+  linkage check, stays as the 2026-10-10 entry describes and is settled by
+  the controller's `Verifying` observation.
+  Boundedness stays liveness-shaped: the budget is `MaxContinuations` (#170)
+  shared with linkage and criteria-evidence repair, with no new wall-clock
+  timeout. (#247, #248, #170)

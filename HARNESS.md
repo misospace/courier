@@ -437,32 +437,69 @@ paths share acceptance, not implementation.
   the structured `*LinkageError` so the caller (and the
   observability surface) can see the precise mismatch.
 - **Legacy path.** Before the `Verifying` handoff — declared or
-  undeclared — the executor reads the live PR for the run branch
-  through the GitHub `PullRequestsForHead` call (the same forge
-  capability every other legacy forge read uses; never a
-  forge-specific CLI). Both paths share one `applyLinkagePlan`
-  helper so the linkage check behaves identically regardless of
-  how the run reached `Verifying`:
+  undeclared — the executor performs a bounded, identity-checked
+  post-turn observation of the live pull request state for the run
+  branch through the configured forge capability
+  (`PullRequestHeadLister`, all states, paginated; never a
+  forge-specific CLI). A candidate is adopted only when the forge
+  response carries authoritative `repo.full_name` identity on both
+  sides of the head/base pair; a response without it is a read
+  failure, not a pull request. A record that claims the
+  owner:branch head selector from a *different* repository (a
+  same-owner fork, or a response that does not carry the queried
+  base) is kept visible and fails the observation closed — it is
+  neither adopted nor silently dropped toward a "missing" claim,
+  because the listing then settles nothing about the run's own
+  head. An open candidate is adopted only when its actual base
+  ref is the run's pinned base; a wrong-base open PR fails closed
+  rather than being adopted, re-targeted, or paralleled. Both
+  paths share one `applyLinkagePlan` helper so the check behaves
+  identically regardless of how the run reached `Verifying`:
   - On a published PR with a body that disagrees with the trusted
     identity, the run asks the captured OpenCode session to
-    repair the body or open the PR under the bounded
-    continuation budget (#170) and only escalates to
-    `NeedsHuman` when the budget is exhausted, or escalates
-    immediately when no captured session exists.
-  - On a forge read failure the check is fail-closed: a verbose
-    `linkage.read.failed` event is logged and the run either
-    retries the read inside the captured session's bounded
-    continuation budget (one retry with the same repair
-    instruction) or escalates to `NeedsHuman` with the precise
-    forge error as the reason. A transient outage cannot quietly
+    repair the body under the bounded continuation budget
+    (#170) and only escalates to `NeedsHuman` when the budget
+    is exhausted, or escalates immediately when no captured
+    session exists.
+  - On an observation read failure the check is fail-closed: a
+    verbose `linkage.read.failed` event is logged and the run
+    either retries inside the captured session's bounded
+    continuation budget with the factual `pr-unverified`
+    re-verification instruction (#247: the message disclaims
+    any missing-PR claim, because a failed read is not
+    evidence of absence) or escalates to `NeedsHuman` with the
+    precise error as the reason. A transient outage cannot quietly
     become a `Verifying` success; the existing PR observer does
-    not perform this linkage check, so the legacy executor owns
-    it.
-  - On a run that never opened a PR for the branch the check
-    returns `Pass`: the absence is the operator's world-check
-    concern, not a linkage violation, and the legacy executor
-    hands off as `Verifying` once the rest of the world agrees
-    (this preserves the pre-#248 contract).
+    not perform this check, so the legacy executor owns it.
+  - The observation classifies the whole head, not just one PR, and
+    each kind has a fixed consequence (#247). Publication is a sha
+    proof, not a ref-existence proof: the remote must advertise the
+    run's *current head commit*, and every resumable or passing
+    kind (open, draft, missing) requires it — a remote holding an
+    older commit means local work never pushed, on the missing
+    route exactly as behind an already-open PR. On that footing,
+    **Missing** (no pull request at all) on a head confirmed
+    *published* resumes the captured session with a factual message
+    naming the repository, branch, and trusted source issue, under
+    the same #170 budget. **Draft** resumes the same session asking
+    that exact PR be marked ready, never a duplicate. **Ambiguous**
+    (more than one open PR), **closed-or-merged only**,
+    **foreign-head** (a record claiming the head selector from
+    another repository), **wrong-base** (an open PR on the verified
+    head targeting a base other than the pinned one), and an
+    unpublished head (ref absent or stale relative to the run's
+    current commit) are fail-closed on sight: no continuation, no
+    adoption, no duplicate, and no create prompt over work the
+    remote does not carry. Where there is no captured session or
+    the budget is exhausted, every resumable kind fails closed to
+    `NeedsHuman` with the precise state in the reason; the
+    executor's terminating `Verifying` handoff is emitted only for
+    a verified open, non-draft PR on the pinned base with the
+    run's commit published to the remote. (The separate adoption
+    guard that reviews a pre-existing open PR before dispatch is
+    unchanged and does not itself check draft or linkage; the
+    controller's `Verifying` observation settles what that early
+    handoff leaves open.)
   The repair instruction names the trusted identity, the supported
   closing keywords, the bare and cross-repo forms, and the
   existing PR number so the model can fix the body
@@ -604,8 +641,10 @@ terminates `NeedsHuman` with reason `incomplete handoff: criterion
 evidence …` (category `verifier-rejection`), preserving the declared
 outcome tag exactly as the linkage plan does. A forge read failure during
 the legacy check is fail-closed exactly as #248's is. A run that never
-opened a PR passes vacuously — PR absence is the operator's world-check
-concern. An empty pinned set also passes vacuously.
+opened a PR passes the *evidence* check vacuously — PR absence is not
+an evidence violation; it is caught separately by the #247 pre-handoff
+observation, which refuses the handoff before evidence is ever
+consulted. An empty pinned set also passes vacuously.
 
 **Retry and idempotency.** Validation is pure over `(body, pinned set)`:
 native rejections happen before any write, so a corrected body is a fresh

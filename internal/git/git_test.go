@@ -345,6 +345,46 @@ func TestRemoteBranchExists(t *testing.T) {
 	}
 }
 
+func TestRemoteBranchHead(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	root := t.TempDir()
+	remote := filepath.Join(root, "remote.git")
+	source := filepath.Join(root, "source")
+	initBare(t, remote)
+	initRepo(t, source)
+	writeFile(t, filepath.Join(source, "README.md"), "base\n")
+	commit(t, source, "base: initial")
+	git(t, source, "branch", "-M", "main")
+	git(t, source, "remote", "add", "origin", remote)
+	git(t, source, "push", "-u", "origin", "main")
+	shaOutput, err := exec.Command("git", "-C", source, "rev-parse", "main").Output()
+	if err != nil {
+		t.Fatalf("read local main sha: %v", err)
+	}
+	want := strings.TrimSpace(string(shaOutput))
+
+	head, exists, err := RemoteBranchHead(ctx, remote, "main")
+	if err != nil {
+		t.Fatalf("RemoteBranchHead(main): %v", err)
+	}
+	if !exists || head != want {
+		t.Fatalf("RemoteBranchHead(main) = (%q, %v), want (%q, true)", head, exists, want)
+	}
+
+	head, exists, err = RemoteBranchHead(ctx, remote, "courier/resolve-issue/acme-widget/10")
+	if err != nil {
+		t.Fatalf("RemoteBranchHead(missing): %v", err)
+	}
+	if exists || head != "" {
+		t.Fatalf("RemoteBranchHead(missing) = (%q, %v), want empty and false", head, exists)
+	}
+
+	if _, _, err := RemoteBranchHead(ctx, remote, "-not-a-branch"); err == nil {
+		t.Fatal("RemoteBranchHead accepted an invalid ref")
+	}
+}
+
 func TestTrustDirectoryAddsOnlyConfiguredPath(t *testing.T) {
 	t.Setenv("GIT_CONFIG_GLOBAL", filepath.Join(t.TempDir(), "gitconfig"))
 	directory := filepath.Join(t.TempDir(), "workspace")
