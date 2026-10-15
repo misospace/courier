@@ -71,6 +71,16 @@ RUN set -eux; \
 		git/bookworm-backports && \
 	rm /etc/apt/sources.list.d/backports.list && \
 	apt-get clean && rm -rf /var/lib/apt/lists/* && \
+	# Selecting git/bookworm-backports does not itself enforce the documented
+	# >= 2.41 minimum, so encode it as a numeric gate. A future Debian change
+	# that drops or reverts the backports package, or installs an older git from
+	# the stock archive, fails the build instead of silently relaxing the
+	# documented contract.
+	git_version="$(git version | awk '{print $3}')" && \
+	if ! printf '%s\n%s\n' '2.41' "$git_version" | sort -V -C; then \
+		echo "git >= 2.41 required, got $git_version" >&2; \
+		exit 1; \
+	fi && \
 	npm install -g opencode-ai@${OPENCODE_VERSION} && \
 	groupadd --gid 65532 courier && \
 	useradd --create-home --uid 65532 --gid 65532 courier && \

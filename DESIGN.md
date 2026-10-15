@@ -1874,17 +1874,22 @@ named items remain unresolved and must not be described as production-ready:
 ## Decisions
 
 - **2026-10-15 — #312: the coordinator and toolchain images install git from
-  Debian bookworm-backports, not the stock bookworm archive.** Bookworm ships
-  git 2.39; the harness artifact validation documented in README Prerequisites
-  requires git >= 2.41 (upstream made bundle verification a connectivity check
-  in 2.41, so older git fails on `refs/courier/*` refs invisible in the
-  quarantine store). Without the bump, the published `coordinator-go` image
-  reproduces the same misleading `internal/harness` failures a Debian 12
-  contributor hits. The base image digest stays pinned at
-  `node:24-bookworm-slim`; the backports source is added only for the install
-  step and removed afterward so the runtime does not advertise it. A
-  contributor host or a custom lane image must still verify its own git
-  version. (#312)
+  Debian bookworm-backports, not the stock bookworm archive, and positively
+  enforce the documented `>= 2.41` minimum.** Bookworm ships git 2.39; the
+  harness artifact validation documented in README Prerequisites requires
+  git >= 2.41 (upstream made bundle verification a connectivity check in 2.41,
+  so older git fails on `refs/courier/*` refs invisible in the quarantine
+  store). Without the bump, the published `coordinator-go` image reproduces
+  the same misleading `internal/harness` failures a Debian 12 contributor
+  hits. The base image digest stays pinned at `node:24-bookworm-slim`; the
+  backports source is added only for the install step and removed afterward
+  so the runtime does not advertise it. Selecting `git/bookworm-backports`
+  does not itself enforce the minimum, so the build asserts the installed
+  git version with a numeric comparison, and `hack/verify-courier-go-runtime.sh`
+  repeats the same gate inside the `coordinator-go` image so a future image
+  change that lowers the bundled git fails the verifier instead of producing
+  misleading internal/harness failures. A contributor host or a custom lane
+  image must still verify its own git version. (#312)
 
 - **2026-10-16 — #327: materialize recovery attempts without deleting history.**
   Successor names incorporate the settled predecessor UID so stable issue IDs

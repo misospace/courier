@@ -58,8 +58,10 @@ artifact validation unbundles with `GIT_OBJECT_DIRECTORY` quarantining objects,
 and older git fails on `refs/courier/*` refs invisible in the quarantine store,
 reporting self-contained bundles as `bundle is malformed or not
 self-contained`. The published coordinator image installs git from
-bookworm-backports to satisfy the documented minimum; a contributor host or a
-non-default lane image must still verify the runtime git version directly.
+bookworm-backports and the build positively asserts the installed version
+satisfies the minimum; `hack/verify-courier-go-runtime.sh` repeats the same
+numeric gate inside the `coordinator-go` image. A contributor host or a
+non-default lane image must still verify its own runtime git version directly.
 
 Create `courier-github` in the operator namespace with `username` and `token`
 keys. The token needs branch push, pull-request read, Checks read, and commit-status
