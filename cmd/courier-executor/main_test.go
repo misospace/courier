@@ -1379,6 +1379,7 @@ done
 if [ -n "$SESSION" ]; then
   git add --all -- .
   git commit -m 'test: committed the partial work' >/dev/null
+  git push origin "$COURIER_BRANCH" >/dev/null 2>&1
 `+writePullRequestScript(prState, pullRequestFixtureJSON(12, "open", false, "Closes #7. The resumed turn opened the pull request."))+`  exit 0
 fi
 printf '{"type":"text","sessionID":"ses_resume1","part":{"type":"text","text":"partial work"}}\n'
@@ -1439,6 +1440,7 @@ if [ -n "$SESSION" ]; then
   printf 'done\n' > done.txt
   git add --all -- .
   git commit -m 'test: produced the work' >/dev/null
+  git push origin "$COURIER_BRANCH" >/dev/null 2>&1
 `+writePullRequestScript(prState, pullRequestFixtureJSON(12, "open", false, "Closes #7. The resumed turn opened the pull request."))+`  exit 0
 fi
 printf '{"type":"text","sessionID":"ses_nowork1","part":{"type":"text","text":"nothing yet"}}\n'
@@ -1496,6 +1498,7 @@ for a in "$@"; do
 done
 if [ -n "$SESSION" ]; then
   git branch -f "$COURIER_BRANCH" HEAD
+  git push origin "HEAD:refs/heads/$COURIER_BRANCH" >/dev/null 2>&1
 `+writePullRequestScript(prState, pullRequestFixtureJSON(12, "open", false, "Closes #7. The resumed turn opened the pull request."))+`  exit 0
 fi
 git checkout -b side/branch
@@ -1645,6 +1648,7 @@ if [ -n "$SESSION" ]; then
   printf 'recovered\n' > recovered.txt
   git add --all -- .
   git commit -m 'test: recovered after crash' >/dev/null
+  git push origin "$COURIER_BRANCH" >/dev/null 2>&1
 `+writePullRequestScript(prState, pullRequestFixtureJSON(12, "open", false, "Closes #7. The resumed turn opened the pull request."))+`  exit 0
 fi
 printf '{"type":"text","sessionID":"ses_crash1","part":{"type":"text","text":"about to crash"}}\n'
@@ -1747,6 +1751,7 @@ if [ -n "$SESSION" ]; then
   printf 'done\n' > done.txt
   git add --all -- .
   git commit -m 'test: produced the work' >/dev/null
+  git push origin "$COURIER_BRANCH" >/dev/null 2>&1
 `+writePullRequestScript(prState, pullRequestFixtureJSON(12, "open", false, "Closes #7. The resumed turn opened the pull request."))+`  exit 0
 fi
 printf '{"type":"text","sessionID":"ses_cap1","part":{"type":"text","text":"nothing yet"}}\n'
@@ -2170,7 +2175,7 @@ func TestRunEmitsRunScopedEventsWithoutDetail(t *testing.T) {
 	prServer, prState := fakeForgePullRequestServer(t)
 
 	fakeOpenCode := filepath.Join(root, "opencode")
-	writeExecutable(t, fakeOpenCode, "#!/bin/sh\ncase \"$1\" in mcp) exit 0;; esac\nprintf 'opencode ran\\n'\nprintf 'completed\\n' > completed.txt\ngit add --all -- .\ngit commit -m 'test: completed work' >/dev/null\n"+writePullRequestScript(prState, pullRequestFixtureJSON(12, "open", false, "Closes #7. The completed turn opened the pull request.")))
+	writeExecutable(t, fakeOpenCode, "#!/bin/sh\ncase \"$1\" in mcp) exit 0;; esac\nprintf 'opencode ran\\n'\nprintf 'completed\\n' > completed.txt\ngit add --all -- .\ngit commit -m 'test: completed work' >/dev/null\ngit push origin \"$COURIER_BRANCH\" >/dev/null 2>&1\n"+writePullRequestScript(prState, pullRequestFixtureJSON(12, "open", false, "Closes #7. The completed turn opened the pull request.")))
 
 	setResolveIssueEnv(t, root, remote, prServer.URL, fakeOpenCode)
 	t.Setenv("COURIER_GIT_TOKEN", testGitToken)
@@ -2309,6 +2314,7 @@ printf 'stderr partial without newline ' >&2
 printf 'completed\n' > completed.txt
 git add --all -- .
 git commit -m 'test: completed work' >/dev/null
+git push origin "$COURIER_BRANCH" >/dev/null 2>&1
 `, fragment1, fragment2, testGitHubTokn) + writePullRequestScript(prState, pullRequestFixtureJSON(12, "open", false, "Closes #7. The completed turn opened the pull request."))
 	fakeOpenCode := filepath.Join(root, "opencode")
 	writeExecutable(t, fakeOpenCode, script)
@@ -2809,6 +2815,21 @@ func pullRequestFixtureJSON(number int, state string, draft bool, body string) s
 	return "[" + pullRequestFixtureObjectJSON(number, state, draft, body) + "]"
 }
 
+// pullRequestFixtureObjectJSONWithBase renders one pull request whose head
+// identity matches the run but whose BASE ref differs from the pinned base,
+// the wrong-base world the executor must fail closed on (#247).
+func pullRequestFixtureObjectJSONWithBase(number int, state string, draft bool, baseRef, body string) string {
+	return fmt.Sprintf(`{"number":%d,"state":%q,"draft":%t,"title":"Work","base":{"ref":%q,"repo":{"full_name":"acme/widgets"}},"head":{"ref":"courier/resolve-issue/acme-widgets/7","sha":"deadbeef","repo":{"full_name":"acme/widgets"}},"body":%q}`, number, state, draft, baseRef, body)
+}
+
+// pullRequestFixtureObjectJSONWithHeadRepo renders one pull request whose
+// head REPOSITORY differs from the run's own — a same-owner fork claiming
+// the branch selector — the foreign world the executor must fail closed on
+// rather than adopt or delete toward a missing-PR claim (#247).
+func pullRequestFixtureObjectJSONWithHeadRepo(number int, state string, draft bool, headRepo, body string) string {
+	return fmt.Sprintf(`{"number":%d,"state":%q,"draft":%t,"title":"Work","base":{"ref":"main","repo":{"full_name":"acme/widgets"}},"head":{"ref":"courier/resolve-issue/acme-widgets/7","sha":"deadbeef","repo":{"full_name":%q}},"body":%q}`, number, state, draft, headRepo, body)
+}
+
 // writePullRequestScript is the shell line a fake OpenCode script uses to
 // stand in for the model opening or readying the run-branch pull request
 // through the forge capability: it writes the fixture JSON to the state
@@ -3098,7 +3119,7 @@ func TestRunResolveIssuePublishedPRWithVagueBodyNeedsHuman(t *testing.T) {
 
 	fakeOpenCode := filepath.Join(root, "opencode")
 	scratchDirectory := filepath.Join(root, "scratch")
-	writeExecutable(t, fakeOpenCode, "#!/bin/sh\ncase \"$1\" in mcp) exit 0;; esac\nprintf 'completed\\n' > completed.txt\ngit add --all -- .\ngit commit -m 'test: completed work' >/dev/null\nmkdir -p \"$COURIER_SCRATCH_DIR\"\nprintf '{\"outcome\":\"changes\"}' > \"$COURIER_SCRATCH_DIR/outcome.json\"\nexit 0\n")
+	writeExecutable(t, fakeOpenCode, "#!/bin/sh\ncase \"$1\" in mcp) exit 0;; esac\nprintf 'completed\\n' > completed.txt\ngit add --all -- .\ngit commit -m 'test: completed work' >/dev/null\ngit push origin \"$COURIER_BRANCH\" >/dev/null 2>&1\nmkdir -p \"$COURIER_SCRATCH_DIR\"\nprintf '{\"outcome\":\"changes\"}' > \"$COURIER_SCRATCH_DIR/outcome.json\"\nexit 0\n")
 
 	prServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		// Match either the /pulls (head query) or /pulls/{n} (post-create read).
@@ -3174,7 +3195,7 @@ func TestRunResolveIssuePublishedPRWithCorrectLinkageVerifying(t *testing.T) {
 
 	fakeOpenCode := filepath.Join(root, "opencode")
 	scratchDirectory := filepath.Join(root, "scratch")
-	writeExecutable(t, fakeOpenCode, "#!/bin/sh\ncase \"$1\" in mcp) exit 0;; esac\nprintf 'completed\\n' > completed.txt\ngit add --all -- .\ngit commit -m 'test: completed work' >/dev/null\nmkdir -p \"$COURIER_SCRATCH_DIR\"\nprintf '{\"outcome\":\"changes\"}' > \"$COURIER_SCRATCH_DIR/outcome.json\"\nexit 0\n")
+	writeExecutable(t, fakeOpenCode, "#!/bin/sh\ncase \"$1\" in mcp) exit 0;; esac\nprintf 'completed\\n' > completed.txt\ngit add --all -- .\ngit commit -m 'test: completed work' >/dev/null\ngit push origin \"$COURIER_BRANCH\" >/dev/null 2>&1\nmkdir -p \"$COURIER_SCRATCH_DIR\"\nprintf '{\"outcome\":\"changes\"}' > \"$COURIER_SCRATCH_DIR/outcome.json\"\nexit 0\n")
 
 	prServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if strings.HasSuffix(r.URL.Path, "/pulls") && r.URL.RawQuery != "" {
@@ -3261,7 +3282,7 @@ func TestRunResolveIssueUndeclaredVerifyingTriggersLinkageRepair(t *testing.T) {
 		t.Fatal(err)
 	}
 	argvLog := filepath.Join(stateDir, "argv.log")
-	writeExecutable(t, fakeOpenCode, "#!/bin/sh\ncase \"$1\" in mcp) exit 0;; esac\necho \"$*\" >> \""+argvLog+"\"\n# Reuse the resume session id so a captured session exists.\necho '{\"sessionID\":\"ses_linkage\"}'\nprintf 'not done yet\\n'\nprintf 'completed\\n' > completed.txt\ngit add --all -- .\ngit commit -m 'test: completed work' >/dev/null\n# Never declare an outcome; the legacy path must keep the run\n# on the undeclared-Verifying track and the linkage check must\n# keep firing.\nexit 0\n")
+	writeExecutable(t, fakeOpenCode, "#!/bin/sh\ncase \"$1\" in mcp) exit 0;; esac\necho \"$*\" >> \""+argvLog+"\"\n# Reuse the resume session id so a captured session exists.\necho '{\"sessionID\":\"ses_linkage\"}'\nprintf 'not done yet\\n'\nprintf 'completed\\n' > completed.txt\ngit add --all -- .\ngit commit -m 'test: completed work' >/dev/null\ngit push origin \"$COURIER_BRANCH\" >/dev/null 2>&1\n# Never declare an outcome; the legacy path must keep the run\n# on the undeclared-Verifying track and the linkage check must\n# keep firing.\nexit 0\n")
 
 	prServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if strings.HasSuffix(r.URL.Path, "/pulls") && r.URL.RawQuery != "" {
@@ -3540,7 +3561,7 @@ func TestRunResolveIssueDeclaredChangesLinkageFailureUsesBoundedRepair(t *testin
 	// success. The model never repairs the body because the fake
 	// only declares changes — the linkage check on each turn will
 	// fire again, consume one continuation, and so on.
-	writeExecutable(t, fakeOpenCode, "#!/bin/sh\ncase \"$1\" in mcp) exit 0;; esac\necho \"$*\" >> \""+argvLog+"\"\necho '{\"sessionID\":\"ses_decl_repair\"}'\nmkdir -p \"$COURIER_SCRATCH_DIR\"\nprintf 'completed\\n' > completed.txt\ngit add --all -- .\ngit commit -m 'test: completed work' >/dev/null\nprintf '{\"outcome\":\"changes\"}' > \"$COURIER_SCRATCH_DIR/outcome.json\"\nexit 0\n")
+	writeExecutable(t, fakeOpenCode, "#!/bin/sh\ncase \"$1\" in mcp) exit 0;; esac\necho \"$*\" >> \""+argvLog+"\"\necho '{\"sessionID\":\"ses_decl_repair\"}'\nmkdir -p \"$COURIER_SCRATCH_DIR\"\nprintf 'completed\\n' > completed.txt\ngit add --all -- .\ngit commit -m 'test: completed work' >/dev/null\ngit push origin \"$COURIER_BRANCH\" >/dev/null 2>&1\nprintf '{\"outcome\":\"changes\"}' > \"$COURIER_SCRATCH_DIR/outcome.json\"\nexit 0\n")
 
 	prServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if strings.HasSuffix(r.URL.Path, "/pulls") && r.URL.RawQuery != "" {
@@ -4051,6 +4072,113 @@ func TestRunResolveIssueTransientForgeReadRetriesFactuallyThenVerifies(t *testin
 	}
 	if !strings.Contains(calls[1], "this is not proof that the pull request is missing") {
 		t.Fatalf("re-verify message should disclaim a missing-PR claim: %q", calls[1])
+	}
+}
+
+// TestRunResolveIssueStaleRemoteBranchFailsClosedWithoutCreatePrompt proves
+// the #247 publication guard is a sha proof, not a ref-existence proof: the
+// branch ref exists on the remote but at an older commit, so the run's newest
+// commits never pushed. The run fails closed as an incomplete publication —
+// it is never asked to open a pull request over work that is not on the
+// remote, and the reason names both commits.
+func TestRunResolveIssueStaleRemoteBranchFailsClosedWithoutCreatePrompt(t *testing.T) {
+	stalePush := `#!/bin/sh
+case "$1" in mcp) exit 0;; esac
+printf '%s\n' "$*" >> "$COURIER_FAKE_STATE/argv.log"
+printf 'pushed work\n' > work-pushed.txt
+git add --all -- .
+git commit -m 'test: pushed commit' >/dev/null
+git push origin "$COURIER_BRANCH" >/dev/null 2>&1
+printf 'never pushed\n' > work-local.txt
+git add --all -- .
+git commit -m 'test: commit that never pushed' >/dev/null
+mkdir -p "$COURIER_SCRATCH_DIR"
+printf '{"outcome":"changes"}' > "$COURIER_SCRATCH_DIR/outcome.json"
+exit 0
+`
+	code, out, _ := runResolveIssue247(t, "", stalePush)
+	if code != exitNeedsHuman {
+		t.Fatalf("run exit code = %d, want %d (fail-closed on stale remote head); stdout=%q", code, exitNeedsHuman, out)
+	}
+	if !strings.Contains(out, "never pushed") {
+		t.Fatalf("reason should name the unpushed commits: %q", out)
+	}
+	if strings.Contains(out, `"phase":"Verifying"`) {
+		t.Fatalf("a stale remote head must not be handed off as Verifying: %q", out)
+	}
+	if strings.Contains(out, "Open the pull request") {
+		t.Fatalf("unpushed commits must never earn a create-PR prompt: %q", out)
+	}
+}
+
+// TestRunResolveIssueOpenPullRequestBehindUnpushedCommitsFailsClosed proves
+// the publication check covers the already-open route: an open, correctly
+// linked PR on a stale remote ref must not carry the Verifying handoff over
+// local commits that never pushed.
+func TestRunResolveIssueOpenPullRequestBehindUnpushedCommitsFailsClosed(t *testing.T) {
+	linked := pullRequestFixtureJSON(12, "open", false, "Closes #7. The PR exists but is behind.")
+	stalePush := `#!/bin/sh
+case "$1" in mcp) exit 0;; esac
+printf '%s\n' "$*" >> "$COURIER_FAKE_STATE/argv.log"
+printf 'pushed work\n' > work-pushed.txt
+git add --all -- .
+git commit -m 'test: pushed commit' >/dev/null
+git push origin "$COURIER_BRANCH" >/dev/null 2>&1
+printf 'never pushed\n' > work-local.txt
+git add --all -- .
+git commit -m 'test: commit that never pushed' >/dev/null
+mkdir -p "$COURIER_SCRATCH_DIR"
+printf '{"outcome":"changes"}' > "$COURIER_SCRATCH_DIR/outcome.json"
+exit 0
+`
+	code, out, _ := runResolveIssue247(t, linked, stalePush)
+	if code != exitNeedsHuman {
+		t.Fatalf("run exit code = %d, want %d (fail-closed on unpushed commits behind an open PR); stdout=%q", code, exitNeedsHuman, out)
+	}
+	if !strings.Contains(out, "never pushed") {
+		t.Fatalf("reason should name the unpushed commits: %q", out)
+	}
+	if strings.Contains(out, `"phase":"Verifying"`) {
+		t.Fatalf("an open PR on a stale ref must not justify Verifying: %q", out)
+	}
+}
+
+// TestRunResolveIssueWrongBasePullRequestFailsClosed proves #247's base
+// check: an open PR carries the verified head but targets a base other than
+// the pinned one. The executor neither adopts it, prompts to ready or repair
+// it, nor creates a parallel pull request; the run fails closed.
+func TestRunResolveIssueWrongBasePullRequestFailsClosed(t *testing.T) {
+	wrongBase := "[" + pullRequestFixtureObjectJSONWithBase(12, "open", false, "release-9", "Closes #7. Targeting the wrong base.") + "]"
+	code, out, _ := runResolveIssue247(t, wrongBase, script247("ses_wrongbase", true, ""))
+	if code != exitNeedsHuman {
+		t.Fatalf("run exit code = %d, want %d (fail-closed on wrong base); stdout=%q", code, exitNeedsHuman, out)
+	}
+	if !strings.Contains(out, "targets a base other than the pinned base") {
+		t.Fatalf("reason should name the base mismatch: %q", out)
+	}
+	if n := strings.Count(out, `"event":"executor.continuation"`); n != 0 {
+		t.Fatalf("executor.continuation count = %d, want 0 (wrong-base world is fail-closed)", n)
+	}
+}
+
+// TestRunResolveIssueForeignHeadPullRequestFailsClosed proves #247's foreign
+// rule end to end: a same-owner fork claiming the run branch's selector must
+// fail the observation closed, not be adopted and not be deleted toward a
+// "missing" claim that prompts a duplicate creation.
+func TestRunResolveIssueForeignHeadPullRequestFailsClosed(t *testing.T) {
+	foreign := "[" + pullRequestFixtureObjectJSONWithHeadRepo(44, "open", false, "acme/widgets-fork", "Closes #7. Not this run's head.") + "]"
+	code, out, _ := runResolveIssue247(t, foreign, script247("ses_foreign", true, ""))
+	if code != exitNeedsHuman {
+		t.Fatalf("run exit code = %d, want %d (fail-closed on foreign head); stdout=%q", code, exitNeedsHuman, out)
+	}
+	if !strings.Contains(out, "from a different repository") {
+		t.Fatalf("reason should name the foreign head: %q", out)
+	}
+	if strings.Contains(out, `"kind":"pr-missing"`) {
+		t.Fatalf("a foreign claim must not be turned into a missing-PR continuation: %q", out)
+	}
+	if n := strings.Count(out, `"event":"executor.continuation"`); n != 0 {
+		t.Fatalf("executor.continuation count = %d, want 0 (foreign world is fail-closed)", n)
 	}
 }
 
@@ -5704,6 +5832,7 @@ func TestObserveRunBranchPullRequestIdentity(t *testing.T) {
 			Repo:          "acme/widgets",
 			Branch:        "courier/resolve-issue/acme-widgets/7",
 			Ref:           7,
+			Base:          "main",
 			GitHubAPIBase: server.URL,
 		})
 		observation, err := report.observeRunBranchPullRequest(context.Background())
@@ -5720,8 +5849,12 @@ func TestObserveRunBranchPullRequestIdentity(t *testing.T) {
 		t.Fatalf("draft PR classified as %+v, want prStateDraft", got)
 	}
 	foreign := `[{"number":9,"state":"open","draft":false,"base":{"ref":"main","repo":{"full_name":"acme/widgets"}},"head":{"ref":"courier/resolve-issue/acme-widgets/7","repo":{"full_name":"mallory/widgets"}},"body":"Closes #7."}]`
-	if got := newObserved(foreign); got.kind != prStateMissing {
-		t.Fatalf("foreign-head PR classified as %+v, want prStateMissing (never adopted)", got)
+	if got := newObserved(foreign); got.kind != prStateForeignHead {
+		t.Fatalf("foreign-head PR classified as %+v, want prStateForeignHead (fail-closed, never adopted, never deleted toward a missing claim)", got)
+	}
+	wrongBase := `[{"number":10,"state":"open","draft":false,"base":{"ref":"release-9","repo":{"full_name":"acme/widgets"}},"head":{"ref":"courier/resolve-issue/acme-widgets/7","sha":"deadbeef","repo":{"full_name":"acme/widgets"}},"body":"Closes #7."}]`
+	if got := newObserved(wrongBase); got.kind != prStateWrongBase {
+		t.Fatalf("wrong-base PR classified as %+v, want prStateWrongBase (fail-closed, never adopted)", got)
 	}
 	missingIdentity := `[{"number":9,"state":"open","draft":false,"body":"Closes #7."}]`
 	foreignServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -5735,6 +5868,7 @@ func TestObserveRunBranchPullRequestIdentity(t *testing.T) {
 		Repo:          "acme/widgets",
 		Branch:        "courier/resolve-issue/acme-widgets/7",
 		Ref:           7,
+		Base:          "main",
 		GitHubAPIBase: foreignServer.URL,
 	})
 	if _, err := report.observeRunBranchPullRequest(context.Background()); err == nil {
@@ -5824,8 +5958,10 @@ func TestLinkageForgeFailureReason(t *testing.T) {
 
 // TestPreHandoffFailClosedReasons pins the exact NeedsHuman reasons for
 // the worlds the #247 observation must not paper over with a retry or a
-// creation: an unpublished head, an ambiguous set of open pull requests,
-// and a head whose only pull requests are closed or merged.
+// creation: an unpublished head (ref absent or stale), an ambiguous set of
+// open pull requests, a head whose only pull requests are closed or merged,
+// a foreign record claiming the head selector, and an open pull request on
+// a base other than the pinned one.
 func TestPreHandoffFailClosedReasons(t *testing.T) {
 	var output, errorsOut bytes.Buffer
 	report := newReporter(&output, &errorsOut, config{
@@ -5833,6 +5969,7 @@ func TestPreHandoffFailClosedReasons(t *testing.T) {
 		Repo:   "misospace/miso-gallery",
 		Branch: "courier/resolve-issue/miso-gallery/502",
 		Ref:    502,
+		Base:   "main",
 	})
 	cases := []struct {
 		name string
@@ -5841,8 +5978,23 @@ func TestPreHandoffFailClosedReasons(t *testing.T) {
 	}{
 		{
 			name: "unpublished head",
-			got:  report.unpublishedBranchReason(),
-			want: `the run branch "courier/resolve-issue/miso-gallery/502" is not published on the remote and carries no pull request, so the handoff was refused; the executor will not ask for a pull request over unpublished work; the run needs a human`,
+			got:  report.unpublishedBranchReason(remotePublicationState{localHead: "5566aabb"}),
+			want: `the run branch "courier/resolve-issue/miso-gallery/502" is not published on the remote, so the handoff was refused; the executor will not ask for a pull request over unpublished work; the run needs a human`,
+		},
+		{
+			name: "stale remote head",
+			got:  report.unpublishedBranchReason(remotePublicationState{localHead: "5566aabb", remoteHead: "1122ccdd"}),
+			want: `the run branch "courier/resolve-issue/miso-gallery/502" on the remote is at 1122ccdd while the run's current commit is 5566aabb, so the remote does not carry the run's pushed work; the executor will not hand off as Verifying or ask for a pull request over commits that never pushed; the run needs a human`,
+		},
+		{
+			name: "foreign head claim",
+			got:  report.foreignHeadPRReason(),
+			want: `the forge reported a pull request claiming the head selector misospace/miso-gallery:courier/resolve-issue/miso-gallery/502 from a different repository, so the observation cannot settle this run's own pull-request state; the executor refuses to adopt a foreign head or open another pull request; the run needs a human`,
+		},
+		{
+			name: "open PR on a wrong base",
+			got:  report.wrongBasePRReason(),
+			want: `an open pull request on the run branch "courier/resolve-issue/miso-gallery/502" of misospace/miso-gallery targets a base other than the pinned base "main"; the executor refuses to adopt it, re-target it, or create a parallel pull request; the run needs a human to settle the base`,
 		},
 		{
 			name: "ambiguous open PRs",

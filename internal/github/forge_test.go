@@ -410,3 +410,70 @@ func TestProviderListsPullRequestsByFullHeadAcrossPages(t *testing.T) {
 		t.Fatalf("pages = %v, want [1 2]", pages)
 	}
 }
+
+// TestListPullRequestsWithForeignSeparatesForeignHeadClaims proves the
+// foreign-aware listing: records whose identity matches the requested base and
+// head pair come back as matches, and records claiming the owner:branch head
+// selector from another repository (or another base) come back as foreign
+// instead of being silently dropped, so a caller can fail closed on a world
+// that only a foreign record claims.
+func TestListPullRequestsWithForeignSeparatesForeignHeadClaims(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`[` +
+			`{"number":1,"state":"open","head":{"ref":"work","sha":"foreign","repo":{"full_name":"octo/other"}},"base":{"ref":"main","repo":{"full_name":"acme/demo"}}},` +
+			`{"number":2,"state":"open","head":{"ref":"work","sha":"match","repo":{"full_name":"octo/widgets"}},"base":{"ref":"main","repo":{"full_name":"acme/demo"}}}` +
+			`]`))
+	}))
+	defer server.Close()
+	client, err := NewClient(server.URL, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	provider := NewProvider(forge.ProviderConfig{Name: "github"}, client)
+	matches, foreign, err := provider.ListPullRequestsWithForeign(context.Background(), forge.PullRequestRef{Repo: "acme/demo"}, "octo/widgets", "work")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(matches) != 1 || matches[0].Number != 2 || matches[0].HeadRepo != "octo/widgets" {
+		t.Fatalf("matches = %#v, want only PR 2", matches)
+	}
+	if len(foreign) != 1 || foreign[0].Number != 1 || foreign[0].HeadRepo != "octo/other" {
+		t.Fatalf("foreign = %#v, want only PR 1 from octo/other", foreign)
+	}
+}
+
+// TestListPullRequestsWithForeignAllForeignIsNotEmptyFailure proves that a
+// response carrying only foreign claims yields zero matches with the foreign
+// records still visible: the caller must see "the listing did not settle this
+// head" rather than a bare empty set that reads like confirmed absence.
+func TestListPullRequestsWithForeignAllForeignIsNotEmptyFailure(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`[{"number":7,"state":"open","head":{"ref":"work","sha":"foreign","repo":{"full_name":"octo/other"}},"base":{"ref":"main","repo":{"full_name":"acme/demo"}}}]`))
+	}))
+	defer server.Close()
+	client, err := NewClient(server.URL, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	provider := NewProvider(forge.ProviderConfig{Name: "github"}, client)
+	matches, foreign, err := provider.ListPullRequestsWithForeign(context.Background(), forge.PullRequestRef{Repo: "acme/demo"}, "octo/widgets", "work")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(matches) != 0 {
+		t.Fatalf("matches = %#v, want none", matches)
+	}
+	if len(foreign) != 1 || foreign[0].Number != 7 {
+		t.Fatalf("foreign = %#v, want PR 7 visible", foreign)
+	}
+	// The plain listing keeps its filtered contract for existing callers.
+	filtered, err := provider.ListPullRequestsByHead(context.Background(), forge.PullRequestRef{Repo: "acme/demo"}, "octo/widgets", "work")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(filtered) != 0 {
+		t.Fatalf("filtered = %#v, want none", filtered)
+	}
+}

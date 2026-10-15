@@ -1172,7 +1172,8 @@ func run(ctx context.Context, stdout, stderr io.Writer) int {
 				// missing PR, a draft PR, an invalid body, or an
 				// unverifiable forge read retries inside the captured
 				// session's bounded continuation budget; a confirmed
-				// ambiguous, closed-only, or unpublished head, an
+				// ambiguous, closed-only, foreign-head, wrong-base, or
+				// not-currently-published head, an
 				// exhausted budget, or a session that cannot be
 				// resumed escalates to NeedsHuman.
 				verdict := report.applyLinkagePlan(ctx, continuations, cfg.MaxContinuations, tap.sessionID, ctx.Err())
@@ -1731,6 +1732,18 @@ const (
 	// merged; the executor refuses adoption, reopening, or a duplicate
 	// creation (#247 fail-closed, matching the adoption guard).
 	prStateClosedOnly
+	// prStateForeignHead: the forge's owner:branch head selector surfaced
+	// a pull request whose repository identity is not the run's own head;
+	// the executor cannot reconcile that world, so it fails closed — no
+	// adoption, no creation prompt, and never a "missing" claim built by
+	// silently deleting the foreign record (#247 fail-closed).
+	prStateForeignHead
+	// prStateWrongBase: an open pull request carries the verified head
+	// but targets a base other than the run's pinned base; adopting it
+	// would hand off against the wrong contract, re-targeting it is
+	// forbidden, and creating another PR would paper over the world the
+	// forge reported (#247 fail-closed).
+	prStateWrongBase
 )
 
 // runBranchPRObservation is the classified result of the executor's
@@ -1761,16 +1774,39 @@ type linkageCheckOutcome struct {
 	// draft reports that the branch's only open PR is a draft: a
 	// bounded continuation asks the session to ready it (#247).
 	draft bool
-	// unpublished reports that the head ref is confirmed absent from
-	// the remote and no PR exists: fail-closed, never a create prompt
-	// (#247).
+	// unpublished reports that the remote does not carry the run's
+	// current commit — the ref is absent or holds a different commit —
+	// so the handoff is fail-closed and no create prompt or Verifying
+	// handoff may cover work that never landed (#247). publication
+	// carries the observed local/remote pair for the terminal reason.
 	unpublished bool
+	// publication is the git-side evidence behind unpublished.
+	publication remotePublicationState
 	// ambiguous reports more than one open PR on the verified head:
 	// fail-closed, never a silent adoption (#247).
 	ambiguous bool
 	// closedOnly reports a head whose only PRs are closed or merged:
 	// fail-closed, never a duplicate creation (#247).
 	closedOnly bool
+	// foreignHead reports a forge record that claims the head selector
+	// from another repository: fail-closed, never deleted toward a
+	// missing claim (#247).
+	foreignHead bool
+	// wrongBase reports an open PR on the verified head that targets a
+	// base other than the pinned base: fail-closed, never adopted or
+	// re-targeted (#247).
+	wrongBase bool
+}
+
+// remotePublicationState is the git-side proof that the run's current commit
+// is published to the remote branch (#247). A ref merely existing is not
+// publication: only the remote advertising the run's own head commit proves
+// the work landed, and a remote holding a different commit means local
+// commits never pushed.
+type remotePublicationState struct {
+	published  bool
+	localHead  string
+	remoteHead string // empty when the branch ref is absent entirely
 }
 
 // trustedSourceIssue derives the source-issue identity the run was
@@ -1795,25 +1831,36 @@ func trustedSourceIssue(cfg config) (broker.SourceIssue, bool) {
 // the set (#247). The provider compares the full base- and head-repository
 // and ref identities carried in the forge response and refuses a response
 // missing either identity, so a foreign or fork head can never be mistaken
-// for the run's own PR. A read failure is returned as an error: an
-// unverifiable observation is not a confirmed missing PR, and the caller
-// must fail closed or retry inside the bounded budget rather than claim
-// absence (#247).
+// for the run's own PR. A record that claims the owner:branch head selector
+// from a different repository is kept visible and fails the observation
+// closed: the executor may neither adopt it nor delete it toward a "missing"
+// claim, because the listing then settles nothing about the run's own head
+// (#247). An open candidate is adopted only when its actual base ref is the
+// run's pinned base; an open PR on the verified head that targets another
+// base fails closed rather than being adopted or duplicated (#247). A read
+// failure is returned as an error: an unverifiable observation is not a
+// confirmed missing PR, and the caller must fail closed or retry inside the
+// bounded budget rather than claim absence (#247).
 func (r reporter) observeRunBranchPullRequest(ctx context.Context) (runBranchPRObservation, error) {
 	client, err := github.NewClient(r.cfg.GitHubAPIBase, r.cfg.GitHubToken)
 	if err != nil {
 		return runBranchPRObservation{}, err
 	}
 	provider := github.NewProvider(forge.ProviderConfig{Name: "github", Endpoint: r.cfg.GitHubAPIBase}, client)
-	pulls, err := provider.ListPullRequestsByHead(ctx, forge.PullRequestRef{Repo: r.cfg.Repo}, r.cfg.Repo, r.cfg.Branch)
+	pulls, foreign, err := provider.ListPullRequestsWithForeign(ctx, forge.PullRequestRef{Repo: r.cfg.Repo}, r.cfg.Repo, r.cfg.Branch)
 	if err != nil {
 		return runBranchPRObservation{}, err
 	}
-	var opens, drafts []*prLinkageObservation
+	if len(foreign) > 0 {
+		return runBranchPRObservation{kind: prStateForeignHead}, nil
+	}
+	var opens, drafts, wrongBases []*prLinkageObservation
 	closed := 0
 	for _, pull := range pulls {
 		observed := &prLinkageObservation{Number: pull.Number, State: strings.ToLower(pull.State), Body: pull.Body, Draft: pull.Draft}
 		switch {
+		case strings.EqualFold(pull.State, "open") && pull.BaseRef != r.cfg.Base:
+			wrongBases = append(wrongBases, observed)
 		case strings.EqualFold(pull.State, "open") && !pull.Draft:
 			opens = append(opens, observed)
 		case strings.EqualFold(pull.State, "open"):
@@ -1823,6 +1870,8 @@ func (r reporter) observeRunBranchPullRequest(ctx context.Context) (runBranchPRO
 		}
 	}
 	switch {
+	case len(wrongBases) > 0:
+		return runBranchPRObservation{kind: prStateWrongBase}, nil
 	case len(opens)+len(drafts) > 1:
 		return runBranchPRObservation{kind: prStateAmbiguous}, nil
 	case len(opens) == 1:
@@ -1836,13 +1885,27 @@ func (r reporter) observeRunBranchPullRequest(ctx context.Context) (runBranchPRO
 	}
 }
 
-// confirmRemotePublication checks that the run branch is published on the
-// remote before the executor claims a confirmed missing PR (#247). Only a
-// published head can be missing a pull request; an unpublished head means
-// the work itself never landed, and a failed check is unverifiable, not
-// proof of absence.
-func (r reporter) confirmRemotePublication(ctx context.Context) (bool, error) {
-	return git.RemoteBranchExists(ctx, r.cfg.RemoteURL, r.cfg.Branch)
+// confirmRemotePublication proves the run's current commit is published on
+// the remote before the executor claims a confirmed missing PR or hands off
+// as Verifying (#247). A branch ref merely existing is not publication: the
+// remote must advertise the run's own head commit, so a stale remote branch
+// (local commits never pushed) fails the check exactly like an absent one.
+// Only a published head can be missing a pull request or carry publishable
+// review work, and a failed check is unverifiable, not proof either way.
+func (r reporter) confirmRemotePublication(ctx context.Context) (remotePublicationState, error) {
+	localHead, err := (&git.Workspace{Directory: r.cfg.Directory}).Head(ctx)
+	if err != nil {
+		return remotePublicationState{}, fmt.Errorf("read local head of run workspace: %w", err)
+	}
+	remoteHead, exists, err := git.RemoteBranchHead(ctx, r.cfg.RemoteURL, r.cfg.Branch)
+	if err != nil {
+		return remotePublicationState{}, fmt.Errorf("read remote head of run branch %s: %w", r.cfg.Branch, err)
+	}
+	return remotePublicationState{
+		published:  exists && remoteHead == localHead,
+		localHead:  localHead,
+		remoteHead: remoteHead,
+	}, nil
 }
 
 // checkPRLinkage is the legacy executor's pre-handoff forge observation:
@@ -1850,19 +1913,24 @@ func (r reporter) confirmRemotePublication(ctx context.Context) (bool, error) {
 // for the single open PR, validates its body against the trusted
 // source-issue identity (#248). The read goes through the configured forge
 // capability — an identity-checked head listing that compares full base and
-// head repository identity and includes every state — never through a
-// forge-specific CLI, so the legacy path enforces the same contract as the
-// native broker and never relies on a model-supplied PR number.
+// head repository identity, keeps foreign head claims visible, and includes
+// every state — never through a forge-specific CLI, so the legacy path
+// enforces the same contract as the native broker and never relies on a
+// model-supplied PR number.
 //
-// The function returns (nil, nil) when a single open, non-draft PR carries
-// the verified head and its body satisfies linkage — the run loop may
+// The function returns (nil, nil) when a single open, non-draft PR on the
+// pinned base carries the verified head, the remote advertises the run's
+// current commit, and the body satisfies linkage — the run loop may
 // proceed. A non-nil outcome carries one of: a confirmed missing PR on a
 // confirmed-published head (a continuation to open one, #247), a draft PR
 // (a continuation to ready it, #247), or a fail-closed world the executor
-// must not paper over with a retry or a creation — an unpublished head, an
-// ambiguous set of open PRs, or only closed/merged PRs (#247). A failed
-// live observation is returned as an error, never as a confirmed missing
-// PR: an unreadable forge is not evidence of absence (#247).
+// must not paper over with a retry or a creation — a head whose current
+// commits the remote does not advertise (absent or stale ref), an ambiguous
+// set of open PRs, only closed/merged PRs, a foreign record claiming the
+// head selector from another repository, or an open PR whose actual base
+// differs from the pinned base (#247). A failed live observation is
+// returned as an error, never as a confirmed missing PR: an unreadable
+// forge is not evidence of absence (#247).
 func (r reporter) checkPRLinkage(ctx context.Context) (*linkageCheckOutcome, error) {
 	source, ok := trustedSourceIssue(r.cfg)
 	if !ok {
@@ -1878,6 +1946,16 @@ func (r reporter) checkPRLinkage(ctx context.Context) (*linkageCheckOutcome, err
 	}
 	switch observation.kind {
 	case prStateOpen:
+		// The PR head's published state is part of the world being
+		// verified: an open PR on a stale remote ref must not carry a
+		// Verifying handoff over local commits that never pushed.
+		publication, err := r.confirmRemotePublication(ctx)
+		if err != nil {
+			return nil, err
+		}
+		if !publication.published {
+			return &linkageCheckOutcome{unpublished: true, publication: publication}, nil
+		}
 		if linkErr := broker.ValidateLinkage(observation.open.Body, source); linkErr != nil {
 			var le *broker.LinkageError
 			if errors.As(linkErr, &le) {
@@ -1887,21 +1965,32 @@ func (r reporter) checkPRLinkage(ctx context.Context) (*linkageCheckOutcome, err
 		}
 		return nil, nil
 	case prStateDraft:
+		publication, err := r.confirmRemotePublication(ctx)
+		if err != nil {
+			return nil, err
+		}
+		if !publication.published {
+			return &linkageCheckOutcome{unpublished: true, publication: publication}, nil
+		}
 		return &linkageCheckOutcome{draft: true, pr: observation.draft}, nil
 	case prStateAmbiguous:
 		return &linkageCheckOutcome{ambiguous: true}, nil
 	case prStateClosedOnly:
 		return &linkageCheckOutcome{closedOnly: true}, nil
+	case prStateForeignHead:
+		return &linkageCheckOutcome{foreignHead: true}, nil
+	case prStateWrongBase:
+		return &linkageCheckOutcome{wrongBase: true}, nil
 	case prStateMissing:
-		published, err := r.confirmRemotePublication(ctx)
+		publication, err := r.confirmRemotePublication(ctx)
 		if err != nil {
 			// The head's publication state is unverifiable: that is not
 			// proof either way, so it surfaces as a read failure the
 			// caller fails closed on, never as a confirmed missing PR.
 			return nil, fmt.Errorf("confirm remote publication of run branch %s: %w", r.cfg.Branch, err)
 		}
-		if !published {
-			return &linkageCheckOutcome{unpublished: true}, nil
+		if !publication.published {
+			return &linkageCheckOutcome{unpublished: true, publication: publication}, nil
 		}
 		return &linkageCheckOutcome{missing: true}, nil
 	}
@@ -2061,11 +2150,34 @@ func (r reporter) draftUnresolvedReason(number int, sessionID string, ctxErr err
 }
 
 // unpublishedBranchReason composes the NeedsHuman reason for a run whose
-// commits were never published to the remote and whose branch carries no
-// pull request (#247). The executor neither hands off as Verifying nor
-// asks for a pull request over work that never landed.
-func (r reporter) unpublishedBranchReason() string {
-	return fmt.Sprintf("the run branch %q is not published on the remote and carries no pull request, so the handoff was refused; the executor will not ask for a pull request over unpublished work; the run needs a human", r.cfg.Branch)
+// current commits the remote branch does not advertise (#247): the ref is
+// absent entirely, or it holds a different commit than the run's head, so
+// local commits never pushed. The executor neither hands off as Verifying
+// nor asks for a pull request over work that never landed, whatever the
+// forge otherwise reports for the branch.
+func (r reporter) unpublishedBranchReason(publication remotePublicationState) string {
+	if publication.remoteHead == "" {
+		return fmt.Sprintf("the run branch %q is not published on the remote, so the handoff was refused; the executor will not ask for a pull request over unpublished work; the run needs a human", r.cfg.Branch)
+	}
+	return fmt.Sprintf("the run branch %q on the remote is at %s while the run's current commit is %s, so the remote does not carry the run's pushed work; the executor will not hand off as Verifying or ask for a pull request over commits that never pushed; the run needs a human", r.cfg.Branch, publication.remoteHead, publication.localHead)
+}
+
+// foreignHeadPRReason composes the NeedsHuman reason for a forge record
+// that claims the run branch's owner:head selector from a different
+// repository (#247). The executor neither adopts such a pull request nor
+// deletes it toward a "missing" claim that would prompt a creation over a
+// world it cannot reconcile.
+func (r reporter) foreignHeadPRReason() string {
+	return fmt.Sprintf("the forge reported a pull request claiming the head selector %s:%s from a different repository, so the observation cannot settle this run's own pull-request state; the executor refuses to adopt a foreign head or open another pull request; the run needs a human", r.cfg.Repo, r.cfg.Branch)
+}
+
+// wrongBasePRReason composes the NeedsHuman reason for an open pull request
+// that carries the verified head but targets a base other than the run's
+// pinned base (#247). Adoption would hand off against the wrong contract,
+// re-targeting is forbidden, and creating a parallel PR would bury the
+// discrepancy a human must settle.
+func (r reporter) wrongBasePRReason() string {
+	return fmt.Sprintf("an open pull request on the run branch %q of %s targets a base other than the pinned base %q; the executor refuses to adopt it, re-target it, or create a parallel pull request; the run needs a human to settle the base", r.cfg.Branch, r.cfg.Repo, r.cfg.Base)
 }
 
 // prAmbiguousReason composes the NeedsHuman reason for a run branch the
@@ -2095,7 +2207,8 @@ func (r reporter) closedOnlyPRReason() string {
 // check, when exactly one was observed. FailReason names the precise
 // NeedsHuman reason when the bounded budget is exhausted, there is no
 // captured session to resume, or the observation is fail-closed
-// (ambiguous, closed-only, or unpublished head) (#247, #248).
+// (ambiguous, closed-only, foreign head, wrong base, or a head whose
+// current commits the remote does not advertise) (#247, #248).
 type linkageVerdict struct {
 	Pass        bool
 	ContinueMsg string
@@ -2117,9 +2230,11 @@ type linkageVerdict struct {
 //     #170 continuation budget and terminate with a bounded reason on
 //     true exhaustion or when no session can be resumed.
 //   - An ambiguous set of open PRs, a head with only closed/merged
-//     PRs, and a head confirmed absent from the remote are fail-closed
-//     on sight: no retry and no creation over an unverifiable or
-//     foreign world (#247).
+//     PRs, a head whose current commits the remote does not advertise
+//     (absent or stale ref), a forge record claiming the head selector
+//     from another repository, and an open PR that targets a base other
+//     than the pinned base are fail-closed on sight: no retry and no
+//     creation over an unverifiable or foreign world (#247).
 //   - A failed live observation is never represented as a confirmed
 //     missing PR: it retries inside the bounded budget with a factual
 //     "could not verify" message, and fails closed to NeedsHuman when
@@ -2154,8 +2269,12 @@ func (r reporter) applyLinkagePlan(ctx context.Context, continuations int, maxCo
 		return linkageVerdict{FailReason: r.prAmbiguousReason()}
 	case linkOutcome.closedOnly:
 		return linkageVerdict{FailReason: r.closedOnlyPRReason()}
+	case linkOutcome.foreignHead:
+		return linkageVerdict{FailReason: r.foreignHeadPRReason()}
+	case linkOutcome.wrongBase:
+		return linkageVerdict{FailReason: r.wrongBasePRReason()}
 	case linkOutcome.unpublished:
-		return linkageVerdict{FailReason: r.unpublishedBranchReason()}
+		return linkageVerdict{FailReason: r.unpublishedBranchReason(linkOutcome.publication)}
 	}
 	resumable := sessionID != "" && ctxErr == nil && continuations < maxContinuations
 	switch {

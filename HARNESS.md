@@ -444,9 +444,17 @@ paths share acceptance, not implementation.
   forge-specific CLI). A candidate is adopted only when the forge
   response carries authoritative `repo.full_name` identity on both
   sides of the head/base pair; a response without it is a read
-  failure, not a pull request. Both paths share one
-  `applyLinkagePlan` helper so the check behaves identically
-  regardless of how the run reached `Verifying`:
+  failure, not a pull request. A record that claims the
+  owner:branch head selector from a *different* repository (a
+  same-owner fork, or a response that does not carry the queried
+  base) is kept visible and fails the observation closed — it is
+  neither adopted nor silently dropped toward a "missing" claim,
+  because the listing then settles nothing about the run's own
+  head. An open candidate is adopted only when its actual base
+  ref is the run's pinned base; a wrong-base open PR fails closed
+  rather than being adopted, re-targeted, or paralleled. Both
+  paths share one `applyLinkagePlan` helper so the check behaves
+  identically regardless of how the run reached `Verifying`:
   - On a published PR with a body that disagrees with the trusted
     identity, the run asks the captured OpenCode session to
     repair the body under the bounded continuation budget
@@ -464,22 +472,30 @@ paths share acceptance, not implementation.
     become a `Verifying` success; the existing PR observer does
     not perform this check, so the legacy executor owns it.
   - The observation classifies the whole head, not just one PR, and
-    each kind has a fixed consequence (#247). **Missing** (no pull
-    request at all) is confirmed against the remote first: only a
-    head confirmed *published* is a missing-PR state, and then the
-    captured session is resumed with a factual message naming the
-    repository, branch, and trusted source issue, under the same
-    #170 budget. **Draft** resumes the same session asking that
-    exact PR be marked ready, never a duplicate. **Ambiguous**
-    (more than one open PR) and **closed-or-merged only** are
-    fail-closed on sight: no continuation, no adoption, no
-    duplicate. An unpublished head (commits not on the remote) is
-    fail-closed as an incomplete run and is never asked to open a
-    PR over unpublished work. Where there is no captured session
-    or the budget is exhausted, every resumable kind fails closed
-    to `NeedsHuman` with the precise state in the reason; the
-    executor's terminating `Verifying` handoff is emitted only
-    for a verified open, non-draft PR. (The separate adoption
+    each kind has a fixed consequence (#247). Publication is a sha
+    proof, not a ref-existence proof: the remote must advertise the
+    run's *current head commit*, and every resumable or passing
+    kind (open, draft, missing) requires it — a remote holding an
+    older commit means local work never pushed, on the missing
+    route exactly as behind an already-open PR. On that footing,
+    **Missing** (no pull request at all) on a head confirmed
+    *published* resumes the captured session with a factual message
+    naming the repository, branch, and trusted source issue, under
+    the same #170 budget. **Draft** resumes the same session asking
+    that exact PR be marked ready, never a duplicate. **Ambiguous**
+    (more than one open PR), **closed-or-merged only**,
+    **foreign-head** (a record claiming the head selector from
+    another repository), **wrong-base** (an open PR on the verified
+    head targeting a base other than the pinned one), and an
+    unpublished head (ref absent or stale relative to the run's
+    current commit) are fail-closed on sight: no continuation, no
+    adoption, no duplicate, and no create prompt over work the
+    remote does not carry. Where there is no captured session or
+    the budget is exhausted, every resumable kind fails closed to
+    `NeedsHuman` with the precise state in the reason; the
+    executor's terminating `Verifying` handoff is emitted only for
+    a verified open, non-draft PR on the pinned base with the
+    run's commit published to the remote. (The separate adoption
     guard that reviews a pre-existing open PR before dispatch is
     unchanged and does not itself check draft or linkage; the
     controller's `Verifying` observation settles what that early

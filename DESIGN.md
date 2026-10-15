@@ -3214,16 +3214,24 @@ was superseded.
   candidate only when the response carries authoritative `repo.full_name`
   identity on both sides of the head/base pair — a response without it is a
   read failure, never a pull request, so the executor cannot adopt a PR whose
-  owning repository it cannot verify (fork PRs are filtered, never adopted).
-  Classification drives fixed consequences: a **missing** PR on a head
-  confirmed published to the remote resumes the same captured session under
-  the #170 budget with a factual message naming the repository, branch, and
-  trusted source issue; a **draft** resumes the same session asking that
-  exact PR to be marked ready, never a duplicate; **ambiguous** (more than
-  one open PR), **closed-or-merged-only**, and **unpublished head** (commits
-  not on the remote) are fail-closed on sight with no continuation, because
-  resuming would invite the model to adopt, reopen, duplicate, or publish
-  over a world the executor cannot disambiguate. A failed observation is
+  owning repository it cannot verify. A record that claims the owner:branch
+  head selector from a different repository stays visible and fails the
+  observation closed rather than being filtered toward a "missing" claim that
+  would prompt a duplicate creation. Classification drives fixed consequences:
+  a **missing** PR on a head confirmed published to the remote resumes the
+  same captured session under the #170 budget with a factual message naming
+  the repository, branch, and trusted source issue; a **draft** resumes the
+  same session asking that exact PR to be marked ready, never a duplicate;
+  **ambiguous** (more than one open PR), **closed-or-merged-only**,
+  **foreign-head**, **wrong-base** (an open PR on the verified head targeting
+  a base other than the pinned one), and **unpublished head** are fail-closed
+  on sight with no continuation, because resuming would invite the model to
+  adopt, reopen, duplicate, re-target, or publish over a world the executor
+  cannot disambiguate. Publication is a sha proof applied to every resumable
+  and passing kind, not a ref-existence proof on the missing route alone: the
+  remote must advertise the run's current head commit, so a stale remote
+  branch — or an already-open PR behind unpushed commits — fails closed like
+  an absent one. A failed observation is
   unverifiable, never reported as missing — the retry message says so
   explicitly — and consumes the same bounded budget. With no captured
   session, an exhausted budget, or shutdown, every resumable kind terminates
@@ -3232,7 +3240,8 @@ was superseded.
   happen. Both the declared and undeclared `Verifying` routes share the one
   `applyLinkagePlan` helper, so no route can hand off unobserved. The
   executor's terminating `Verifying` handoff is emitted only for a verified
-  open, non-draft PR with authoritative linkage; the separate pre-dispatch
+  open, non-draft PR on the pinned base with authoritative linkage and the
+  run's current commit advertised by the remote; the separate pre-dispatch
   adoption guard, which reports a pre-existing open PR without a draft or
   linkage check, stays as the 2026-10-10 entry describes and is settled by
   the controller's `Verifying` observation.
