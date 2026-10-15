@@ -3776,6 +3776,27 @@ func script247OnSecondTurn(session, resumeShell string) string {
 `)
 }
 
+// stalePushScript renders the fake OpenCode body that leaves the run with a
+// published branch ref that does NOT carry its newest commit: it pushes one
+// commit and then commits again without pushing, the stale-remote world the
+// sha publication proof must fail closed on (#247).
+func stalePushScript() string {
+	return `#!/bin/sh
+case "$1" in mcp) exit 0;; esac
+printf '%s\n' "$*" >> "$COURIER_FAKE_STATE/argv.log"
+printf 'pushed work\n' > work-pushed.txt
+git add --all -- .
+git commit -m 'test: pushed commit' >/dev/null
+git push origin "$COURIER_BRANCH" >/dev/null 2>&1
+printf 'never pushed\n' > work-local.txt
+git add --all -- .
+git commit -m 'test: commit that never pushed' >/dev/null
+mkdir -p "$COURIER_SCRATCH_DIR"
+printf '{"outcome":"changes"}' > "$COURIER_SCRATCH_DIR/outcome.json"
+exit 0
+`
+}
+
 // TestRunResolveIssueMissingPullRequestResumesSessionToOpenIt proves the
 // core #247 ending: a resolve-issue run whose published branch carries no
 // pull request does not hand off as Verifying. It resumes the same
@@ -4082,21 +4103,7 @@ func TestRunResolveIssueTransientForgeReadRetriesFactuallyThenVerifies(t *testin
 // it is never asked to open a pull request over work that is not on the
 // remote, and the reason names both commits.
 func TestRunResolveIssueStaleRemoteBranchFailsClosedWithoutCreatePrompt(t *testing.T) {
-	stalePush := `#!/bin/sh
-case "$1" in mcp) exit 0;; esac
-printf '%s\n' "$*" >> "$COURIER_FAKE_STATE/argv.log"
-printf 'pushed work\n' > work-pushed.txt
-git add --all -- .
-git commit -m 'test: pushed commit' >/dev/null
-git push origin "$COURIER_BRANCH" >/dev/null 2>&1
-printf 'never pushed\n' > work-local.txt
-git add --all -- .
-git commit -m 'test: commit that never pushed' >/dev/null
-mkdir -p "$COURIER_SCRATCH_DIR"
-printf '{"outcome":"changes"}' > "$COURIER_SCRATCH_DIR/outcome.json"
-exit 0
-`
-	code, out, _ := runResolveIssue247(t, "", stalePush)
+	code, out, _ := runResolveIssue247(t, "", stalePushScript())
 	if code != exitNeedsHuman {
 		t.Fatalf("run exit code = %d, want %d (fail-closed on stale remote head); stdout=%q", code, exitNeedsHuman, out)
 	}
@@ -4117,21 +4124,7 @@ exit 0
 // local commits that never pushed.
 func TestRunResolveIssueOpenPullRequestBehindUnpushedCommitsFailsClosed(t *testing.T) {
 	linked := pullRequestFixtureJSON(12, "open", false, "Closes #7. The PR exists but is behind.")
-	stalePush := `#!/bin/sh
-case "$1" in mcp) exit 0;; esac
-printf '%s\n' "$*" >> "$COURIER_FAKE_STATE/argv.log"
-printf 'pushed work\n' > work-pushed.txt
-git add --all -- .
-git commit -m 'test: pushed commit' >/dev/null
-git push origin "$COURIER_BRANCH" >/dev/null 2>&1
-printf 'never pushed\n' > work-local.txt
-git add --all -- .
-git commit -m 'test: commit that never pushed' >/dev/null
-mkdir -p "$COURIER_SCRATCH_DIR"
-printf '{"outcome":"changes"}' > "$COURIER_SCRATCH_DIR/outcome.json"
-exit 0
-`
-	code, out, _ := runResolveIssue247(t, linked, stalePush)
+	code, out, _ := runResolveIssue247(t, linked, stalePushScript())
 	if code != exitNeedsHuman {
 		t.Fatalf("run exit code = %d, want %d (fail-closed on unpushed commits behind an open PR); stdout=%q", code, exitNeedsHuman, out)
 	}
@@ -4140,6 +4133,80 @@ exit 0
 	}
 	if strings.Contains(out, `"phase":"Verifying"`) {
 		t.Fatalf("an open PR on a stale ref must not justify Verifying: %q", out)
+	}
+}
+
+// TestRunResolveIssueDraftPullRequestBehindUnpushedCommitsFailsClosed proves
+// the publication proof covers the draft route too: a draft PR on a remote
+// ref that does not carry the run's current commit must not earn a
+// mark-it-ready continuation over work that never pushed; the run fails
+// closed on the stale ref instead.
+func TestRunResolveIssueDraftPullRequestBehindUnpushedCommitsFailsClosed(t *testing.T) {
+	draft := pullRequestFixtureJSON(12, "open", true, "Closes #7. Draft, but the ref is stale.")
+	code, out, _ := runResolveIssue247(t, draft, stalePushScript())
+	if code != exitNeedsHuman {
+		t.Fatalf("run exit code = %d, want %d (fail-closed on stale ref behind a draft); stdout=%q", code, exitNeedsHuman, out)
+	}
+	if !strings.Contains(out, "never pushed") {
+		t.Fatalf("reason should name the unpushed commits: %q", out)
+	}
+	if strings.Contains(out, `"kind":"pr-draft"`) {
+		t.Fatalf("a stale ref must not earn a ready-the-draft continuation: %q", out)
+	}
+}
+
+// TestRunResolveIssuePublicationReadFailureRetriesAsUnverified proves the
+// git half of the observation obeys #247's transient rule: a publication
+// read that cannot complete is unverifiable, never a confirmed missing PR.
+// The captured session gets the factual pr-unverified turn, and exhaustion
+// escalates with the could-not-verify reason.
+func TestRunResolveIssuePublicationReadFailureRetriesAsUnverified(t *testing.T) {
+	// The fake opens, readies, or breaks nothing here: after the first
+	// push the remote itself disappears (simulated by removing the bare
+	// repo), so the forge read succeeds with no PR while the remote-head
+	// read fails outright.
+	script := `#!/bin/sh
+case "$1" in mcp) exit 0;; esac
+printf '%s\n' "$(printf '%s' "$*" | tr '\n' ' ')" >> "$COURIER_FAKE_STATE/argv.log"
+N=$(cat "$COURIER_FAKE_STATE/count" 2>/dev/null || echo 0)
+N=$((N+1))
+echo "$N" > "$COURIER_FAKE_STATE/count"
+printf '{"type":"text","sessionID":"ses_pub_read","part":{"type":"text","text":"turn %s"}}\n' "$N"
+printf 'work\n' > "work-$N.txt"
+git add --all -- .
+git commit -m "test: work turn $N" >/dev/null 2>&1 || true
+git push origin "$COURIER_BRANCH" >/dev/null 2>&1 || true
+if [ "$N" -ge 1 ]; then rm -rf "$COURIER_REPO_URL"; fi
+mkdir -p "$COURIER_SCRATCH_DIR"
+printf '{"outcome":"changes"}' > "$COURIER_SCRATCH_DIR/outcome.json"
+exit 0
+`
+	root := t.TempDir()
+	remote := remoteWithBaseOnly(t, root)
+	prServer, _ := fakeForgePullRequestServer(t)
+	fakeOpenCode := filepath.Join(root, "opencode")
+	writeExecutable(t, fakeOpenCode, script)
+	setContinuationEnv(t, root, remote, prServer.URL, fakeOpenCode)
+	t.Setenv("COURIER_MAX_CONTINUATIONS", "1")
+
+	var output bytes.Buffer
+	var errorsOut bytes.Buffer
+	code := run(context.Background(), &output, &errorsOut)
+	out := output.String()
+	if code != exitNeedsHuman {
+		t.Fatalf("run exit code = %d, want %d (unverifiable publication read fails closed); stdout=%q", code, exitNeedsHuman, out)
+	}
+	if !strings.Contains(out, `"kind":"pr-unverified"`) {
+		t.Fatalf("expected the factual pr-unverified continuation on a failed publication read: %q", out)
+	}
+	if !strings.Contains(out, "could not be verified") {
+		t.Fatalf("terminal reason should name the unverifiable observation: %q", out)
+	}
+	if strings.Contains(out, "no pull request for that head") {
+		t.Fatalf("a failed publication read must never claim the pull request is missing: %q", out)
+	}
+	if strings.Contains(out, `"phase":"Verifying"`) {
+		t.Fatalf("an unverifiable publication read must not end Verifying: %q", out)
 	}
 }
 
