@@ -57,8 +57,19 @@ RUN --mount=type=cache,target=/go/pkg/mod \
 FROM node:24-bookworm-slim@sha256:a5f4366e834695d5f363b920c104953a535d3a9864d1bdf74566a0ebe01daee5 AS coordinator
 ARG OPENCODE_VERSION=1.18.31
 
-RUN apt-get update && \
-	apt-get install -y --no-install-recommends ca-certificates git && \
+# bookworm ships git 2.39, but the harness artifact validation (internal/harness)
+# documented in README Prerequisites requires git >= 2.41. Pull git from
+# bookworm-backports so the lane runtime passes the documented minimum; without
+# this, several internal/harness tests fail purely on the version gap. The
+# backports source is removed after install so the image does not advertise it
+# at runtime.
+RUN set -eux; \
+	echo 'deb http://deb.debian.org/debian bookworm-backports main' > /etc/apt/sources.list.d/backports.list && \
+	apt-get update && \
+	apt-get install -y --no-install-recommends \
+		ca-certificates \
+		git/bookworm-backports && \
+	rm /etc/apt/sources.list.d/backports.list && \
 	apt-get clean && rm -rf /var/lib/apt/lists/* && \
 	npm install -g opencode-ai@${OPENCODE_VERSION} && \
 	groupadd --gid 65532 courier && \
