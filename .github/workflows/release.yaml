@@ -157,7 +157,7 @@ jobs:
         run: >-
           docker run --rm --entrypoint sh
           ${{ env.COORDINATOR_IMAGE }}:${{ steps.version.outputs.version }}
-          -c 'test -x /usr/local/bin/courier-executor && opencode --help'
+          -c 'test -x /usr/local/bin/courier-executor && opencode --help && for t in ps pgrep pkill; do command -v "$t" >/dev/null; done'
       - name: Validate coordinator identity
         run: test "$(docker inspect --format '{{.Config.User}}' ${{ env.COORDINATOR_IMAGE }}:${{ steps.version.outputs.version }})" = "65532:65532"
       - name: Validate Go toolchain coordinator image
