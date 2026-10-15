@@ -298,6 +298,33 @@ vllm:num_requests_waiting 3.0
 	}
 }
 
+// A redirect chain can reflect the configured credential into its Location
+// under a different path and parameter name; when the chain exhausts Go's
+// redirect limit, the transport error must name the failure without echoing
+// any URL the endpoint chose.
+func TestScrapeRedactsRedirectReflectedCredentials(t *testing.T) {
+	const secret = "redirect-secret-8d41b"
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, "/new-path?session="+secret+"&test=1", http.StatusFound)
+	}))
+	defer srv.Close()
+
+	scraper := NewScraper(&http.Client{Timeout: 2 * time.Second}, mustMapping(t, BackendAuto))
+	load := scraper.Scrape(context.Background(), srv.URL+"/metrics?token="+secret)
+	if load.Available {
+		t.Fatalf("load = %+v, want unavailable", load)
+	}
+	if strings.Contains(load.Detail, secret) {
+		t.Fatalf("detail %q leaks the reflected credential", load.Detail)
+	}
+	if !strings.Contains(load.Detail, srv.URL+"/metrics") {
+		t.Fatalf("detail %q should keep the configured host and path for debugging", load.Detail)
+	}
+	if !strings.Contains(load.Detail, "redirect") {
+		t.Fatalf("detail %q should name the failure category", load.Detail)
+	}
+}
+
 // RedactedURL backs every diagnostic surface that prints the URL, including
 // the startup log.
 func TestRedactedURLStripsAllUserinfo(t *testing.T) {

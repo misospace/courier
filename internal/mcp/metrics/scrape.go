@@ -109,6 +109,18 @@ func redacted(parsed *url.URL) string {
 	return sanitized.String()
 }
 
+// urlFreeError strips *url.Error wrappers — which embed a URL — down to the
+// underlying cause. If the error is not a url.Error, it is returned as-is.
+func urlFreeError(err error) string {
+	for {
+		ue, ok := err.(*url.Error)
+		if !ok || ue.Err == nil {
+			return err.Error()
+		}
+		err = ue.Err
+	}
+}
+
 // queryFragmentRenderings lists every spelling of the URL's query and
 // fragment that can appear in an error message: the raw forms, the escaped
 // fragment renderings net/url actually emits, and the %q-escaped forms
@@ -135,14 +147,19 @@ func queryFragmentRenderings(parsed *url.URL) []string {
 }
 
 func redactError(parsed *url.URL, err error) string {
-	message := strings.ReplaceAll(err.Error(), parsed.String(), redacted(parsed))
-	// The URL can survive inside the error in other renderings: verbatim,
-	// with net/http's own password masking (user:***@), or as bare userinfo.
-	// Those replacements leave the rest of the URL intact, so the query and
-	// fragment are scrubbed separately. Each must match every spelling the
-	// message can carry: net/url stores Fragment decoded but renders it
+	// Start from the unwrapped cause: *url.Error embeds a request URL, and on
+	// a redirect chain that URL can be a redirect target the endpoint chose —
+	// one that may repeat a configured credential reflected into its
+	// Location. The underlying cause (dial failures, redirect-loop stops,
+	// context deadlines) names the operation and address but never a URL, so
+	// it is safe to surface.
+	message := urlFreeError(err)
+	// Defense in depth: an inner error can still echo the configured URL, so
+	// scrub every spelling of its credential-bearing parts from whatever
+	// text remains. net/url stores Fragment decoded but renders it
 	// %-escaped, and url.Error formats URLs through %q, which escapes quotes
-	// and backslashes. Credentials there must not leak through any rendering.
+	// and backslashes — match each spelling.
+	message = strings.ReplaceAll(message, parsed.String(), redacted(parsed))
 	for _, rendering := range queryFragmentRenderings(parsed) {
 		message = strings.ReplaceAll(message, rendering, "")
 	}
