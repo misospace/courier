@@ -180,6 +180,16 @@ const outcomeContract = "You own this run's completion end to end, and you exerc
 
 const outcomeFilename = "outcome.json"
 
+// publicationBlockGrammar names the criterion-evidence block grammar the
+// PR body must satisfy when an acceptance-criterion set is pinned at
+// admission (#249, #280, #282). It is a one-liner extension the goal
+// pastes into a resolve-issue prompt so the model knows the exact shape
+// the legacy and native broker will both refuse to verify against
+// instead of re-deriving it from a repair turn. The grammar is sourced
+// from the broker's evidence-block rules (#249) so the two producers
+// (legacy handoff and native broker) cannot drift.
+const publicationBlockGrammar = "If COURIER_CRITERIA is set, the PR body must carry a criterion-evidence block: a single header line 'courier-criteria:v1 source=<owner/name>#<n> set=sha256:<64hex> coverage=full|partial' followed by one row per pinned criterion, each shaped '- AC-<n> sha256:<64hex>: <status> - <reference>', with the per-criterion digests matching the pinned set; the per-status vocabulary is implementation-evidence, regression-check, manual-verification, not-implemented, unknown; regression-check and implementation-evidence must cite a file path or check URL, and manual-verification and not-implemented must carry a note."
+
 // Goal returns the concise coordinator goal for a run. Lane framing is passed
 // separately so it remains context rather than becoming a hard-coded prompt
 // scaffold. The outcome declaration path matches the per-run scratch mount.
@@ -198,7 +208,7 @@ func Goal(run *courierv1alpha1.CoderRun) (string, error) {
 	}
 	switch run.Spec.Mode {
 	case courierv1alpha1.ModeResolveIssue:
-		return fmt.Sprintf("Open a PR to address issue #%d. %s %s %s%s %s", run.Spec.Ref, forgeContract, completionContract, localValidationContract, publication, fmt.Sprintf(outcomeContract, outcomeFile)), nil
+		return fmt.Sprintf("Open a PR to address issue #%d. %s %s %s%s %s %s", run.Spec.Ref, forgeContract, completionContract, localValidationContract, publication, publicationBlockGrammar, fmt.Sprintf(outcomeContract, outcomeFile)), nil
 	case courierv1alpha1.ModeFixPR:
 		return fmt.Sprintf("Take over PR #%d. Inspect the current pull request state, CI/checks, and existing review feedback to determine what work is needed; address feedback already present without repeatedly searching for new reviews. %s %s %s%s %s", run.Spec.Ref, forgeContract, completionContract, localValidationContract, publication, fmt.Sprintf(outcomeContract, outcomeFile)), nil
 	default:

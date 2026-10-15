@@ -5820,6 +5820,112 @@ func TestLinkageRepairMessage(t *testing.T) {
 	}
 }
 
+// TestCombinedBodyRepairMessageNamesBothContracts pins the
+// combined-repair continuation shape (#282): a body that violates
+// both linkage (#248) and the criterion-evidence contract (#249)
+// earns a single bounded continuation that names both defects so one
+// turn can fix both, instead of two sequential repairs that would
+// burn the shared #170 budget in turn. The linkage defect is named
+// first because the closing reference is structurally prior — a body
+// without one does not address a specific issue for criteria to
+// evaluate — and the criterion-evidence defect is named second so a
+// single repair pass lands both contracts.
+func TestCombinedBodyRepairMessageNamesBothContracts(t *testing.T) {
+	source := broker.SourceIssue{Owner: "misospace", Name: "miso-gallery", Number: 502}
+	linkErr := &broker.LinkageError{Reason: "publication denied: pull request body names different source issue number admitted (expected misospace/miso-gallery#502, found Closes #999)"}
+	critErr := &broker.CriteriaError{Reason: "publication denied: criterion evidence missing for AC-2"}
+	pinned := &broker.CriterionSet{
+		Issue: source,
+		Criteria: []broker.Criterion{
+			{ID: "AC-1", Text: "first criterion", Digest: "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},
+			{ID: "AC-2", Text: "second criterion", Digest: "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"},
+		},
+		Digest: "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+	}
+	outcome := &handoffCheckOutcome{
+		pr:          &prLinkageObservation{Number: 12, State: "open"},
+		err:         linkErr,
+		criteria:    &broker.CriteriaReport{SetDigest: pinned.Digest},
+		criteriaErr: critErr,
+		pinnedSet:   pinned,
+	}
+	msg := combinedBodyRepairMessage(source, outcome, 2)
+	// Both defects must be present in one message.
+	if !strings.Contains(msg, "Closes, Fixes, or Resolves") {
+		t.Fatalf("combinedBodyRepairMessage must name the linkage contract: %q", msg)
+	}
+	if !strings.Contains(msg, "courier-criteria:v1") {
+		t.Fatalf("combinedBodyRepairMessage must name the criterion-evidence contract: %q", msg)
+	}
+	if !strings.Contains(msg, "criterion evidence missing for AC-2") {
+		t.Fatalf("combinedBodyRepairMessage must quote the criterion validator's reason: %q", msg)
+	}
+	if !strings.Contains(msg, pinned.Digest) {
+		t.Fatalf("combinedBodyRepairMessage must name the pinned set digest: %q", msg)
+	}
+	// The single bounded repair is one continuation slot, not two.
+	// The combined message concatenates the two repair parts and
+	// each part names the continuation number; both must agree.
+	if got := strings.Count(msg, "(continuation 2)"); got != 2 {
+		t.Fatalf("combinedBodyRepairMessage should name (continuation 2) twice (one from each part) since the shared budget consumes one slot; got %d in: %q", got, msg)
+	}
+	if strings.Contains(msg, "(continuation 3)") {
+		t.Fatalf("combinedBodyRepairMessage should not name a different continuation number: %q", msg)
+	}
+	// Linkage first, criteria second — structurally prior ordering.
+	linkIdx := strings.Index(msg, "Closes, Fixes, or Resolves")
+	critIdx := strings.Index(msg, "courier-criteria:v1")
+	if linkIdx == -1 || critIdx == -1 || linkIdx > critIdx {
+		t.Fatalf("combinedBodyRepairMessage should name linkage first, then criteria: linkIdx=%d critIdx=%d in: %q", linkIdx, critIdx, msg)
+	}
+}
+
+// TestCombinedBodyExhaustedReasonNamesBothContracts pins the
+// human-readable NeedsHuman reason for a run whose budget ran out
+// before the model repaired both body contracts (#282): the reason
+// names every defect the validator surfaced so the operator can
+// settle the run without re-reading the body, and the trusted source
+// identity once. The two halves are joined with " and " so the
+// operator reads the failure as a single combined defect.
+func TestCombinedBodyExhaustedReasonNamesBothContracts(t *testing.T) {
+	var output, errorsOut bytes.Buffer
+	report := newReporter(&output, &errorsOut, config{
+		Mode: "resolve-issue",
+		Repo: "misospace/miso-gallery",
+		Ref:  502,
+	})
+	linkErr := &broker.LinkageError{Reason: "publication denied: pull request body names different source issue number admitted (expected misospace/miso-gallery#502, found Closes #999)"}
+	critErr := &broker.CriteriaError{Reason: "publication denied: criterion evidence missing for AC-2"}
+	outcome := &handoffCheckOutcome{
+		pr:          &prLinkageObservation{Number: 12, State: "open"},
+		err:         linkErr,
+		criteriaErr: critErr,
+	}
+	got := report.combinedBodyExhaustedReason(outcome)
+	for _, want := range []string{
+		"incomplete handoff:",
+		"linkage:",
+		"criterion evidence",
+		" and ",
+		"misospace/miso-gallery#502",
+		"different source issue number",
+		"criterion evidence missing for AC-2",
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("combinedBodyExhaustedReason missing %q in: %q", want, got)
+		}
+	}
+	// The trusted source identity must appear at least once in a
+	// parenthetical trailing the reason so the operator reads a
+	// single combined defect with one anchoring source issue; the
+	// linkage validator's reason may also name it inline, so the
+	// minimum contract is "one occurrence" (the trailing form),
+	// not "exactly one" (the validator's own text could echo it).
+	if !strings.Contains(got, "(trusted source issue misospace/miso-gallery#502)") {
+		t.Fatalf("combinedBodyExhaustedReason must name the trusted source issue in a trailing parenthetical: %q", got)
+	}
+}
+
 // pinCriteriaEnvelopeForMisoGallery extracts the pinned criterion set the
 // controller admission stage would produce from the real miso-gallery
 // issue body, serializes it in the COURIER_CRITERIA envelope shape the
@@ -5852,11 +5958,13 @@ func pinCriteriaEnvelopeForMisoGallery(t *testing.T) string {
 // the criterion-repair continuation (#282, #249): the offending PR number,
 // the trusted source issue identity, the broker-defined rejection reason
 // (drawn verbatim from the validator so any change to the validator's
-// vocabulary surfaces in both paths), and the grammar the body must
-// satisfy — the "courier-criteria:v1" header, the "AC-n sha256:...
-// status - reference" row form, the closed status vocabulary, and the
-// per-status shape rules. The continuation number is named for the model
-// to see the remaining budget.
+// vocabulary surfaces in both paths), the pinned set digest and the
+// verbatim pinned criterion texts so the model can verify what it must
+// satisfy, and the grammar the body must satisfy — the
+// "courier-criteria:v1" header, the "AC-n sha256:... status - reference"
+// row form, the closed status vocabulary, and the per-status shape rules.
+// The continuation number is named for the model to see the remaining
+// budget.
 func TestCriteriaRepairMessagePinsValidatorVocabulary(t *testing.T) {
 	source := broker.SourceIssue{Owner: "misospace", Name: "miso-gallery", Number: 502}
 	ce := &broker.CriteriaError{
@@ -5869,9 +5977,20 @@ func TestCriteriaRepairMessagePinsValidatorVocabulary(t *testing.T) {
 	// describeCriteriaFailure ordering so the test pins the actual broker
 	// vocabulary, not a re-derivation.
 	ce.Reason = "publication denied: criterion evidence missing for AC-2; coverage claimed full but the records derive partial"
+	pinned := &broker.CriterionSet{
+		Issue: source,
+		Criteria: []broker.Criterion{
+			{ID: "AC-1", Text: "image ships three tracked PNGs", Digest: "sha256:1111111111111111111111111111111111111111111111111111111111111111"},
+			{ID: "AC-2", Text: "icon endpoints return 200", Digest: "sha256:2222222222222222222222222222222222222222222222222222222222222222"},
+			{ID: "AC-3", Text: "assets path is included in build", Digest: "sha256:3333333333333333333333333333333333333333333333333333333333333333"},
+		},
+		Digest: "sha256:4444444444444444444444444444444444444444444444444444444444444444",
+	}
 	outcome := &handoffCheckOutcome{
 		pr:          &prLinkageObservation{Number: 12, State: "open"},
+		criteria:    &broker.CriteriaReport{SetDigest: pinned.Digest},
 		criteriaErr: ce,
+		pinnedSet:   pinned,
 	}
 	msg := criteriaRepairMessage(source, outcome, 3)
 	for _, want := range []string{
@@ -5888,10 +6007,42 @@ func TestCriteriaRepairMessagePinsValidatorVocabulary(t *testing.T) {
 		"file path or check URL",
 		"Update the PR body through the forge capability",
 		"(continuation 3)",
+		pinned.Digest,
+		"AC-1 sha256:1111111111111111111111111111111111111111111111111111111111111111",
+		"AC-2 sha256:2222222222222222222222222222222222222222222222222222222222222222",
+		"AC-3 sha256:3333333333333333333333333333333333333333333333333333333333333333",
+		"image ships three tracked PNGs",
+		"icon endpoints return 200",
+		"assets path is included in build",
 	} {
 		if !strings.Contains(msg, want) {
 			t.Fatalf("criteriaRepairMessage missing %q in: %q", want, msg)
 		}
+	}
+}
+
+// TestCriteriaRepairMessageFallsBackToReportDigestOnUncarriedSet pins
+// the criterion-repair message's digest-source contract (#282): when
+// the outcome carries no pinned set (e.g. an older checkCriterionEvidence
+// path that produced a report but did not attach the set), the
+// repair path must still surface the validator-observed set digest
+// rather than falling back to the generic "the admitted set" string,
+// so an operator can read the contract the body failed against.
+func TestCriteriaRepairMessageFallsBackToReportDigestOnUncarriedSet(t *testing.T) {
+	source := broker.SourceIssue{Owner: "misospace", Name: "miso-gallery", Number: 502}
+	ce := &broker.CriteriaError{Reason: "publication denied: criterion-evidence block missing"}
+	reportDigest := "sha256:5555555555555555555555555555555555555555555555555555555555555555"
+	outcome := &handoffCheckOutcome{
+		pr:          &prLinkageObservation{Number: 12, State: "open"},
+		criteria:    &broker.CriteriaReport{SetDigest: reportDigest},
+		criteriaErr: ce,
+	}
+	msg := criteriaRepairMessage(source, outcome, 1)
+	if !strings.Contains(msg, reportDigest) {
+		t.Fatalf("criteriaRepairMessage should carry the report's set digest when no pinned set is attached: %q", msg)
+	}
+	if strings.Contains(msg, "the admitted set") {
+		t.Fatalf("criteriaRepairMessage should not fall back to generic phrase when the report carries a digest: %q", msg)
 	}
 }
 
@@ -6485,7 +6636,10 @@ func TestRunResolveIssueCriteriaPartialBodyTriggersRepair(t *testing.T) {
 // the trusted source issue and carries an honest partial evidence
 // block passes both the linkage and criterion checks on the first
 // turn; the run ends Verifying with the run.exit event detail carrying
-// "criteria.coverage":"partial" so an operator audits the honesty.
+// "criteria.coverage":"partial" and the per-status record counts so an
+// operator audits the run's honesty against the linked criteria
+// without the legacy handoff falsely claiming fully verified
+// completion outside the PR body.
 func TestRunResolveIssueCriteriaHonestPartialHandsOffVerifyingWithCoverage(t *testing.T) {
 	body := readBrokerFixture(t, "miso-gallery-505-pr-honest-partial.md")
 	envelope := pinCriteriaEnvelopeForMisoGallery(t)
@@ -6501,6 +6655,20 @@ func TestRunResolveIssueCriteriaHonestPartialHandsOffVerifyingWithCoverage(t *te
 	}
 	if !strings.Contains(out, `"criteria.coverage":"partial"`) {
 		t.Fatalf("run.exit event detail should carry the criteria.coverage=partial audit field: %q", out)
+	}
+	// Per-status record counts must ride the run.exit detail so
+	// the operator audits the run's honesty against the linked
+	// criteria (#249, #282). The honest-partial fixture carries a
+	// regression-check row, a manual-verification row, and another
+	// regression-check row, so both statuses surface in the
+	// emitted counts.
+	if !strings.Contains(out, `"criteria.status_counts"`) {
+		t.Fatalf("run.exit event detail should carry criteria.status_counts: %q", out)
+	}
+	for _, status := range []string{"regression-check", "manual-verification"} {
+		if !strings.Contains(out, status) {
+			t.Fatalf("criteria.status_counts should surface %q: %q", status, out)
+		}
 	}
 	// The criteria pass must not fire any continuation — the body
 	// satisfies both contracts on the first turn.
@@ -6559,5 +6727,76 @@ func TestRunResolveIssueUnpinnedRunSkipsCriteriaCheck(t *testing.T) {
 	}
 	if strings.Contains(out, `"criteria.coverage"`) {
 		t.Fatalf("absent COURIER_CRITERIA must not surface criteria.coverage on run.exit: %q", out)
+	}
+}
+
+// TestRunResolveIssueCombinedBodyFiresSingleBodyRepair pins the
+// combined-repair contract on the legacy pre-handoff plan (#282): a
+// body that fails BOTH linkage (#248) and the criterion-evidence
+// contract (#249) earns a single bounded continuation that names
+// both defects, not two sequential repairs. The fixture
+// (miso-gallery-505-pr-deficient.md) uses "Addresses #502" — a
+// non-closing reference, so the linkage validator rejects it — and
+// carries no criterion-evidence block, so the criterion validator
+// also rejects it. With MaxContinuations=1, the run ends NeedsHuman
+// after one combined body-repair continuation; the run.exit reason
+// names both halves of the failure, and the executor never fires
+// a separate "criteria-repair" or "linkage-repair" kind on the
+// shared budget.
+func TestRunResolveIssueCombinedBodyFiresSingleBodyRepair(t *testing.T) {
+	source := "misospace/miso-gallery#502"
+	// The deficient fixture has "Addresses #502" (not a closing
+	// keyword) and no criterion block, so it fails both contracts
+	// against the same live body the forge read returned.
+	body := readBrokerFixture(t, "miso-gallery-505-pr-deficient.md")
+	envelope := pinCriteriaEnvelopeForMisoGallery(t)
+	code, out, _ := runCriteriaEndToEnd(t, body, scriptCriteriaDeficientTurns("ses_combined_body"), envelope)
+	if code != exitNeedsHuman {
+		t.Fatalf("run exit code = %d, want %d (NeedsHuman after combined-repair budget exhausts); detail: %q", code, exitNeedsHuman, out)
+	}
+	if !strings.Contains(out, `"phase":"NeedsHuman"`) {
+		t.Fatalf("expected NeedsHuman phase: %q", out)
+	}
+	if !strings.Contains(out, `"category":"verifier-rejection"`) {
+		t.Fatalf("expected verifier-rejection category: %q", out)
+	}
+	if !strings.Contains(out, `"outcome":"changes"`) {
+		t.Fatalf("declared changes outcome tag should be preserved: %q", out)
+	}
+	// The combined repair is a single bounded continuation that
+	// names both defects: the body-repair kind for the shared
+	// budget slot, with linkage and criteria vocabulary both
+	// present in the same continuation message.
+	if n := strings.Count(out, `"kind":"body-repair"`); n != 1 {
+		t.Fatalf("expected exactly one body-repair continuation (combined); got %d in: %q", n, out)
+	}
+	// The combined repair must not split into separate
+	// single-contract continuations.
+	if strings.Contains(out, `"kind":"linkage-repair"`) {
+		t.Fatalf("combined body-repair must not split into a separate linkage-repair event: %q", out)
+	}
+	if strings.Contains(out, `"kind":"criteria-repair"`) {
+		t.Fatalf("combined body-repair must not split into a separate criteria-repair event: %q", out)
+	}
+	// The combined repair message quotes the linkage contract's
+	// closing-keyword vocabulary and the criterion contract's
+	// block header so one turn can fix both.
+	if !strings.Contains(out, "Closes, Fixes, or Resolves") {
+		t.Fatalf("combined repair must name the linkage contract: %q", out)
+	}
+	if !strings.Contains(out, "courier-criteria:v1") {
+		t.Fatalf("combined repair must name the criterion contract: %q", out)
+	}
+	// The exhausted reason names both halves: linkage plus
+	// criterion evidence, joined with " and ", and the trusted
+	// source identity anchors the trailing parenthetical.
+	if !strings.Contains(out, "incomplete handoff: linkage:") {
+		t.Fatalf("exhausted reason must name the linkage half: %q", out)
+	}
+	if !strings.Contains(out, "criterion evidence") {
+		t.Fatalf("exhausted reason must name the criterion half: %q", out)
+	}
+	if !strings.Contains(out, source) {
+		t.Fatalf("exhausted reason must name the trusted source identity: %q", out)
 	}
 }

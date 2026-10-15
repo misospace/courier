@@ -268,6 +268,17 @@ type reporter struct {
 	// criteria check did not run. It rides event detail only — never the
 	// Verifying Reason line, never the COURIER_TERMINATION payload.
 	handoffCoverage string
+	// handoffStatusCounts carries the per-status record counts of the
+	// criterion-evidence block from the pre-handoff plan to the
+	// run.exit event detail (#249, #282). Set by applyHandoffPlan
+	// when a Verifying pass carries a parseable criteria report;
+	// nil when no set was pinned or when the criteria check did not
+	// run. It rides event detail only — never the Verifying Reason
+	// line, never the COURIER_TERMINATION payload — alongside
+	// handoffCoverage so an operator audits the run's honesty
+	// without the legacy handoff falsely claiming fully verified
+	// completion outside the PR body.
+	handoffStatusCounts map[broker.CriterionStatus]int
 }
 
 // newReporter builds the run's reporter and registers every credential the
@@ -327,10 +338,11 @@ func (r reporter) event(eventType, status string, detail map[string]any) {
 
 // terminate publishes the terminal handoff: the legacy COURIER_TERMINATION
 // line with a redacted reason, plus the run.exit event. The run.exit detail
-// rides the criterion-evidence coverage claim ("full" or "partial") when the
-// pre-handoff check produced one (#249, #282): a partial record is the run
-// ending honestly, an operator can audit whether the run stayed consistent
-// with the linked criteria, and the Reason line is untouched.
+// rides the criterion-evidence coverage claim ("full" or "partial") and the
+// per-status record counts when the pre-handoff check produced them (#249,
+// #282): a partial record is the run ending honestly, an operator can audit
+// whether the run stayed consistent with the linked criteria, and the Reason
+// line is untouched.
 func (r reporter) terminate(result termination) {
 	if r.tel != nil {
 		if compact := r.tel.Compact(); compact != nil {
@@ -355,6 +367,13 @@ func (r reporter) terminate(result termination) {
 	}
 	if r.handoffCoverage != "" {
 		detail["criteria.coverage"] = r.handoffCoverage
+	}
+	if len(r.handoffStatusCounts) > 0 {
+		counts := make(map[string]int, len(r.handoffStatusCounts))
+		for statusName, count := range r.handoffStatusCounts {
+			counts[string(statusName)] = count
+		}
+		detail["criteria.status_counts"] = counts
 	}
 	r.event(courierlog.EventRunExit, status, detail)
 }
@@ -1165,8 +1184,13 @@ func run(ctx context.Context, stdout, stderr io.Writer) int {
 					report.terminateCaptured(ctx, workspace, startCommit, termination{Phase: "NeedsHuman", Result: "needs-human", ExitCode: exitNeedsHuman, Reason: verdict.FailReason, Outcome: result.Outcome, Category: terminalCategoryVerifierRejection})
 					return exitNeedsHuman
 				}
-				if verdict.Pass && verdict.Coverage != "" {
-					report.handoffCoverage = verdict.Coverage
+				if verdict.Pass {
+					if verdict.Coverage != "" {
+						report.handoffCoverage = verdict.Coverage
+					}
+					if len(verdict.StatusCounts) > 0 {
+						report.handoffStatusCounts = verdict.StatusCounts
+					}
 				}
 			}
 			report.terminateCaptured(ctx, workspace, startCommit, result)
@@ -1221,8 +1245,13 @@ func run(ctx context.Context, stdout, stderr io.Writer) int {
 					report.terminateCaptured(ctx, workspace, startCommit, termination{Phase: "NeedsHuman", Result: "needs-human", ExitCode: exitNeedsHuman, Reason: verdict.FailReason, Category: terminalCategoryVerifierRejection})
 					return exitNeedsHuman
 				}
-				if verdict.Pass && verdict.Coverage != "" {
-					report.handoffCoverage = verdict.Coverage
+				if verdict.Pass {
+					if verdict.Coverage != "" {
+						report.handoffCoverage = verdict.Coverage
+					}
+					if len(verdict.StatusCounts) > 0 {
+						report.handoffStatusCounts = verdict.StatusCounts
+					}
 				}
 				report.terminateCaptured(ctx, workspace, startCommit, termination{Phase: "Verifying", Result: "success", ExitCode: exitSuccess, Reason: "opencode completed with committed work"})
 				return exitSuccess
@@ -1833,15 +1862,25 @@ type handoffCheckOutcome struct {
 	// ran against the open PR's body and the pinned set was non-empty.
 	// nil when no set was pinned, when the set was empty (vacuous pass),
 	// or when the observation is anything other than prStateOpen — the
-	// body contract only applies where there is a body to check.
+	// body contract only applies where there is a body to check. When
+	// the body fails the contract, criteria still carries the parsed
+	// report (rows, derived coverage) so the repair path can quote the
+	// pinned digest and surface per-status counts to the operator
+	// audit.
 	criteria *broker.CriteriaReport
 	// criteriaErr is the structured rejection from the criterion validator
-	// when criteria is nil because the body failed the contract; nil
-	// otherwise.
+	// when the body failed the contract; nil otherwise.
 	criteriaErr *broker.CriteriaError
 	// coverage mirrors the criteria report's claim ("full" or "partial")
 	// when the check ran; empty when the check did not.
 	coverage string
+	// pinnedSet is the trusted criterion set the criteria check ran
+	// against. It is carried on the outcome (not just inside
+	// checkCriterionEvidence) so the repair path can quote its digest,
+	// IDs, and texts verbatim — the model cannot re-derive them and
+	// the operator can audit the contract that was pinned. nil when no
+	// set was pinned or when the set was empty (vacuous pass).
+	pinnedSet *broker.CriterionSet
 }
 
 // remotePublicationState is the git-side proof that the run's current commit
@@ -1959,29 +1998,30 @@ func (r reporter) confirmRemotePublication(ctx context.Context) (remotePublicati
 // (#247) and, for the single open PR, runs the body's two shared
 // contracts — authoritative source-issue linkage (#248) and, when an
 // acceptance-criterion set is pinned at admission (#280), the criterion-
-// evidence block contract (#249). Both checks go through the same body
-// the forge read; the criterion contract is gated on linkage already
-// passing because a head without an open PR cannot have its body
-// checked. The forge read goes through the configured forge capability
-// — an identity-checked head listing that compares full base and head
-// repository identity, keeps foreign head claims visible, and includes
-// every state — never through a forge-specific CLI, so the legacy path
-// enforces the same contract as the native broker and never relies on a
-// model-supplied PR number.
+// evidence block contract (#249). Both contracts are evaluated
+// independently against the same live body the forge read returned, so
+// a body that violates both earns one bounded continuation that names
+// both defects instead of two sequential ones that would burn the
+// shared #170 budget in turn. The forge read goes through the
+// configured forge capability — an identity-checked head listing that
+// compares full base and head repository identity, keeps foreign head
+// claims visible, and includes every state — never through a
+// forge-specific CLI, so the legacy path enforces the same contract as
+// the native broker and never relies on a model-supplied PR number.
 //
 // The function returns (nil, nil) when a single open, non-draft PR on the
 // pinned base carries the verified head, the remote advertises the run's
 // current commit, and the body satisfies every applicable contract —
 // the run loop may proceed. A non-nil outcome carries one of: a
 // confirmed missing PR on a confirmed-published head (a continuation to
-// open one, #247), a draft PR (a continuation to ready it, #247), a
-// linkage repair, a criterion-evidence repair when a set was pinned and
-// the body's evidence block disagrees with it, or a fail-closed world
-// the executor must not paper over with a retry or a creation — a head
-// whose current commits the remote does not advertise (absent or stale
-// ref), an ambiguous set of open PRs, only closed/merged PRs, a foreign
-// record claiming the head selector from another repository, or an open
-// PR whose actual base differs from the pinned base (#247). A failed
+// open one, #247), a draft PR (a continuation to ready it, #247), one
+// or both body-contract repairs (a single bounded continuation names
+// every applicable defect), or a fail-closed world the executor must
+// not paper over with a retry or a creation — a head whose current
+// commits the remote does not advertise (absent or stale ref), an
+// ambiguous set of open PRs, only closed/merged PRs, a foreign record
+// claiming the head selector from another repository, or an open PR
+// whose actual base differs from the pinned base (#247). A failed
 // live observation is returned as an error, never as a confirmed
 // missing PR: an unreadable forge is not evidence of absence (#247).
 func (r reporter) checkHandoff(ctx context.Context) (*handoffCheckOutcome, error) {
@@ -2009,21 +2049,41 @@ func (r reporter) checkHandoff(ctx context.Context) (*handoffCheckOutcome, error
 		if !publication.published {
 			return &handoffCheckOutcome{unpublished: true, publication: publication}, nil
 		}
+		// Evaluate both body contracts against the same live body so a
+		// single bounded continuation can name every defect the model
+		// must repair in one turn (#282, #249, #248). linkageErr and
+		// the criterion result aggregate on the same outcome: each
+		// is non-nil exactly when its contract fails, and a body
+		// that violates both earns a single combined-repair verdict
+		// rather than two sequential ones.
+		outcome := &handoffCheckOutcome{pr: observation.open}
 		if linkErr := broker.ValidateLinkage(observation.open.Body, source); linkErr != nil {
 			var le *broker.LinkageError
 			if errors.As(linkErr, &le) {
-				return &handoffCheckOutcome{pr: observation.open, err: le}, nil
+				outcome.err = le
+			} else {
+				return nil, linkErr
 			}
-			return nil, linkErr
 		}
 		criteriaOutcome, critErr := r.checkCriterionEvidence(ctx, observation.open)
 		if critErr != nil {
 			return nil, critErr
 		}
-		if criteriaOutcome == nil {
+		if criteriaOutcome != nil {
+			outcome.criteria = criteriaOutcome.criteria
+			outcome.criteriaErr = criteriaOutcome.criteriaErr
+			outcome.coverage = criteriaOutcome.coverage
+			outcome.pinnedSet = criteriaOutcome.pinnedSet
+		}
+		// A passing combined outcome — neither contract fired — means
+		// the body is acceptable and the run may hand off as Verifying.
+		// The nil-outcome signal the verdict path recognizes is "no
+		// defects", which only happens when both validators passed
+		// (or the criterion check was a vacuous pass with no defects).
+		if outcome.err == nil && outcome.criteriaErr == nil && outcome.criteria == nil && outcome.pinnedSet == nil {
 			return nil, nil
 		}
-		return criteriaOutcome, nil
+		return outcome, nil
 	case prStateDraft:
 		publication, err := r.confirmRemotePublication(ctx)
 		if err != nil {
@@ -2083,9 +2143,12 @@ func (r reporter) checkHandoff(ctx context.Context) (*handoffCheckOutcome, error
 //     kind:"criteria" so an operator can tell which pre-handoff read
 //     failed.
 //   - Body validation error: a *broker.CriteriaError is recorded on the
-//     outcome (criteriaErr) and a partial success still returns the
-//     outcome so the planner can repair; any non-CriteriaError is
-//     returned as a plain error.
+//     outcome (criteriaErr); a partial-success report is also kept on
+//     the outcome (criteria) so the repair path can quote the rows
+//     and per-status counts, and any non-CriteriaError is returned as
+//     a plain error. The pinned set is always attached (pinnedSet) so
+//     the repair path can name its digest and the verbatim criterion
+//     texts the model must satisfy (#282).
 //   - On success, populate outcome.criteria with the report and
 //     outcome.coverage with its claimed coverage.
 //
@@ -2114,6 +2177,11 @@ func (r reporter) checkCriterionEvidence(ctx context.Context, observation *prLin
 	if set.IsEmpty() {
 		return nil, nil
 	}
+	// Carry the pinned set on the outcome so the repair path can
+	// quote its digest, IDs, and texts verbatim. The set is
+	// operator-authored; passing it through the outcome is a
+	// reference hand-off, not a copy that the model could rewrite.
+	pinned := set
 	report, err := broker.ValidateCriterionEvidence(observation.Body, set)
 	if err != nil {
 		var ce *broker.CriteriaError
@@ -2122,7 +2190,13 @@ func (r reporter) checkCriterionEvidence(ctx context.Context, observation *prLin
 			if report != nil {
 				coverage = report.Coverage
 			}
-			return &handoffCheckOutcome{pr: observation, criteriaErr: ce, coverage: coverage}, nil
+			return &handoffCheckOutcome{
+				pr:          observation,
+				criteria:    report,
+				criteriaErr: ce,
+				coverage:    coverage,
+				pinnedSet:   &pinned,
+			}, nil
 		}
 		return nil, err
 	}
@@ -2130,7 +2204,7 @@ func (r reporter) checkCriterionEvidence(ctx context.Context, observation *prLin
 	if report != nil {
 		coverage = report.Coverage
 	}
-	return &handoffCheckOutcome{pr: observation, criteria: report, coverage: coverage}, nil
+	return &handoffCheckOutcome{pr: observation, criteria: report, coverage: coverage, pinnedSet: &pinned}, nil
 }
 
 // sourceIssue returns the trusted source-issue identity for the run, or
@@ -2171,22 +2245,20 @@ func linkageRepairMessage(source broker.SourceIssue, outcome *handoffCheckOutcom
 // criteriaRepairMessage composes the precise OpenCode continuation
 // message for a criterion-evidence violation (#282). It names the
 // offending PR number, the trusted source issue, the pinned set digest
-// so a model can verify what it must satisfy, and the continuation
-// budget. The vocabulary is composed verbatim from the broker error's
-// reason (which describeCriteriaFailure built) so any change to the
-// validator's vocabulary surfaces in both paths. The required shape
-// rules echo the documented header and per-status rules from criteria.go
-// so the model can repair the body without re-deriving the contract.
+// and the verbatim pinned criteria texts so a model can verify what
+// it must satisfy, and the continuation budget. The vocabulary is
+// composed verbatim from the broker error's reason (which
+// describeCriteriaFailure built) so any change to the validator's
+// vocabulary surfaces in both paths. The required shape rules echo
+// the documented header and per-status rules from criteria.go so the
+// model can repair the body without re-deriving the contract.
 func criteriaRepairMessage(source broker.SourceIssue, outcome *handoffCheckOutcome, continuation int) string {
 	target := sourceIssueTarget(source)
 	reason := describeCriteriaFailureForRepair(outcome.criteriaErr)
-	var setDigest string
-	if outcome.criteriaErr != nil && outcome.criteria != nil {
-		setDigest = outcome.criteria.SetDigest
-	}
+	setDigest, criteriaLines := pinnedSetRepairSnippet(outcome.pinnedSet, outcome.criteria)
 	return fmt.Sprintf(
 		"Courier refused the handoff: PR #%d's body does not satisfy the criterion-evidence contract pinned at admission for %s (pinned set %s): %s. "+
-			"Update the PR body through the forge capability so it carries the criterion-evidence block: a single line starting with %q followed by %q, then one %q row per pinned criterion, each carrying a closed status from the vocabulary implementation-evidence, regression-check, manual-verification, not-implemented, or unknown, with regression-check and implementation-evidence referencing a file path or check URL and manual-verification and not-implemented referencing a note. "+
+			"Update the PR body through the forge capability so it carries the criterion-evidence block: a single line starting with %q followed by %q, then one %q row per pinned criterion (each row's digest must match the pinned criterion digest below), each carrying a closed status from the vocabulary implementation-evidence, regression-check, manual-verification, not-implemented, or unknown, with regression-check and implementation-evidence referencing a file path or check URL and manual-verification and not-implemented referencing a note. Pinned criteria: %s. "+
 			"Then re-declare the same outcome. (continuation %d)",
 		outcome.pr.Number, target,
 		nonEmptyOr(setDigest, "the admitted set"),
@@ -2194,8 +2266,28 @@ func criteriaRepairMessage(source broker.SourceIssue, outcome *handoffCheckOutco
 		"courier-criteria:v1 source="+strings.ToLower(source.Canonical())+"#"+strconv.Itoa(source.Number),
 		"set=sha256:<64hex> coverage=full|partial",
 		"- AC-<n> sha256:<64hex>: <status> - <reference>",
+		nonEmptyOr(criteriaLines, "(no pinned criteria on this run)"),
 		continuation,
 	)
+}
+
+// combinedBodyRepairMessage composes one OpenCode continuation that
+// names every body-contract defect the legacy pre-handoff plan found on
+// a single live body read (#282). A body that violates both linkage
+// (#248) and the criterion-evidence contract (#249) earns a single
+// bounded repair that names both — the shared #170 budget covers them
+// together, and one turn can fix both — instead of two sequential
+// continuations that burn the budget in turn. The linkage defect is
+// named first because the closing reference is structurally prior: a
+// body without a closing reference does not address a specific issue
+// for criteria to evaluate, so the model needs to know the linkage
+// contract lands first. The criterion-evidence contract is named
+// second so a body that fixes both earns a single repair pass and
+// passes both validators on the next observation.
+func combinedBodyRepairMessage(source broker.SourceIssue, outcome *handoffCheckOutcome, continuation int) string {
+	linkPart := linkageRepairMessage(source, outcome, continuation)
+	critPart := criteriaRepairMessage(source, outcome, continuation)
+	return linkPart + " " + critPart
 }
 
 // describeCriteriaFailureForRepair returns the precise broker-defined
@@ -2216,6 +2308,51 @@ func nonEmptyOr(value, fallback string) string {
 		return fallback
 	}
 	return value
+}
+
+// pinnedSetRepairSnippet renders the pinned criterion set as a short,
+// model-quotable snippet the repair path pastes into the criteria
+// continuation message (#282). The digest is the trust anchor — the
+// model must satisfy the exact pinned set, not a re-derivation — and
+// the per-criterion IDs, digests, and texts are the contract a body
+// row references. Both are operator-authored, never model-controlled;
+// the snippet is bounded to keep the legacy continuation message
+// inside its byte budget. Returns (digest, snippet) — snippet is empty
+// when the outcome carries no pinned set so callers can fall back.
+func pinnedSetRepairSnippet(set *broker.CriterionSet, report *broker.CriteriaReport) (string, string) {
+	if set == nil {
+		// The validator may have produced a report even when no
+		// pinned set was carried on the outcome (e.g. older
+		// callers); the report's SetDigest is the only signal the
+		// repair path has. Surface it so the message does not
+		// fall back to "the admitted set" without the operator
+		// being able to tell what was admitted.
+		if report == nil {
+			return "", ""
+		}
+		return report.SetDigest, ""
+	}
+	digest := strings.TrimSpace(set.Digest)
+	if digest == "" && report != nil {
+		digest = strings.TrimSpace(report.SetDigest)
+	}
+	if len(set.Criteria) == 0 {
+		return digest, ""
+	}
+	parts := make([]string, 0, len(set.Criteria))
+	for _, c := range set.Criteria {
+		text := strings.TrimSpace(c.Text)
+		if text == "" {
+			text = "(criterion text not embedded in envelope)"
+		}
+		// The broker's Criterion.Digest already includes the
+		// "sha256:" prefix; render the bare hex so the snippet
+		// matches the row-shape a body must carry. Strip a
+		// leading scheme to be tolerant of future renames.
+		digestHex := strings.TrimPrefix(strings.TrimSpace(c.Digest), "sha256:")
+		parts = append(parts, fmt.Sprintf("%s sha256:%s — %s", c.ID, digestHex, text))
+	}
+	return digest, strings.Join(parts, "; ")
 }
 
 // prMissingMessage composes the #247 continuation message for a
@@ -2309,6 +2446,58 @@ func (r reporter) criteriaExhaustedReason(outcome *handoffCheckOutcome) string {
 		return "incomplete handoff: criterion evidence " + outcome.criteriaErr.Reason + " (trusted source issue " + target + ")"
 	}
 	return "incomplete handoff: criterion evidence block did not satisfy the pinned set (trusted source issue " + target + ")"
+}
+
+// combinedBodyExhaustedReason composes the human-readable NeedsHuman
+// reason for a run whose continuation budget ran out before the model
+// repaired both body contracts at once (#282). The reason names every
+// defect the validator surfaced so the operator can settle the run
+// without re-reading the body: the trusted source identity, the
+// linkage contract rejection, and the criterion-evidence contract
+// rejection. The two are joined with " and " so the operator reads
+// the failure as a single combined defect, not as two parallel
+// failures; the trusted source identity is named in a single trailing
+// parenthetical so it cannot disagree between the two halves.
+func (r reporter) combinedBodyExhaustedReason(outcome *handoffCheckOutcome) string {
+	target := sourceIssueTarget(r.sourceIssue())
+	linkPart := "linkage: " + describeLinkageFailureForReason(outcome.err)
+	critPart := "criterion evidence " + describeCriteriaFailureForRepair(outcome.criteriaErr)
+	return "incomplete handoff: " + linkPart + " and " + critPart + " (trusted source issue " + target + ")"
+}
+
+// describeLinkageFailureForReason returns the precise broker-defined
+// reason the linkage validator recorded on the outcome, or a stable
+// fallback when the error is nil so the operator can settle the run
+// without re-reading the body.
+func describeLinkageFailureForReason(lerr *broker.LinkageError) string {
+	if lerr == nil {
+		return "the published pull request body did not carry an authoritative closing reference"
+	}
+	if strings.TrimSpace(lerr.Error()) == "" {
+		return "the published pull request body did not carry an authoritative closing reference"
+	}
+	return strings.TrimPrefix(strings.TrimSpace(lerr.Error()), "publication denied: ")
+}
+
+// criteriaStatusCounts returns the per-status record counts the
+// run.exit event detail rides, or nil when the criteria check did
+// not run. The map is JSON-marshalled with status names as keys; an
+// empty map and a nil map both serialize, so the verdict never emits
+// a misleading "no records" map for runs where the criteria check did
+// not run. The status names mirror the broker vocabulary
+// (implementation-evidence, regression-check, manual-verification,
+// not-implemented, unknown) so the operator audit reads the same
+// vocabulary across the legacy handoff, the native broker, and the
+// PR body itself.
+func criteriaStatusCounts(report *broker.CriteriaReport) map[broker.CriterionStatus]int {
+	if report == nil {
+		return nil
+	}
+	counts := report.StatusCounts()
+	if len(counts) == 0 {
+		return nil
+	}
+	return counts
 }
 
 // linkageForgeFailureReason composes the human-readable NeedsHuman reason
@@ -2425,7 +2614,15 @@ type handoffVerdict struct {
 	// pinned, when the set was empty (vacuous pass), or when the
 	// observation was anything other than prStateOpen.
 	Coverage string
-	FailReason string
+	// StatusCounts is set when the criteria check produced a parseable
+	// evidence block; it is the per-status record count from the
+	// CriteriaReport (#249, #282). The run.exit event detail carries
+	// it alongside criteria.coverage so an operator audits the run's
+	// honesty without the legacy handoff falsely claiming fully
+	// verified completion outside the PR body. nil when the
+	// criteria check did not run.
+	StatusCounts map[broker.CriterionStatus]int
+	FailReason   string
 }
 
 // applyHandoffPlan runs the identity-checked pre-handoff forge
@@ -2523,20 +2720,33 @@ func (r reporter) applyHandoffPlan(ctx context.Context, continuations int, maxCo
 		return handoffVerdict{Kind: "pr-missing", ContinueMsg: r.prMissingMessage(r.sourceIssue(), continuations+1)}
 	}
 	// A prStateOpen outcome: the PR is open, the remote is published,
-	// and either linkage has a structured rejection (the body contract
-	// repair, #248) or the criterion-evidence contract does (#249,
-	// #282). The two repairs share the same bounded budget and the
-	// same "linkage structurally prior" rule — a body linkage failure
-	// already fails before criteria is even reached, because a body
-	// that does not link the PR to the trusted issue carries no
-	// contract for criteria to evaluate against.
-	if linkOutcome.err != nil {
+	// and zero, one, or both body contracts fired. The verdict path
+	// aggregates every applicable defect into one bounded
+	// continuation so a body that violates both contracts earns one
+	// repair turn (with linkage named first as the structurally prior
+	// contract) rather than two sequential repairs that would burn
+	// the shared #170 budget in turn (#282).
+	switch {
+	case linkOutcome.err != nil && linkOutcome.criteriaErr != nil:
+		if !resumable {
+			// Budget exhausted: name every defect so the operator
+			// can settle the run with a single read.
+			return handoffVerdict{
+				PRNumber:   linkOutcome.pr.Number,
+				FailReason: r.combinedBodyExhaustedReason(linkOutcome),
+			}
+		}
+		return handoffVerdict{
+			Kind:        "body-repair",
+			PRNumber:    linkOutcome.pr.Number,
+			ContinueMsg: combinedBodyRepairMessage(r.sourceIssue(), linkOutcome, continuations+1),
+		}
+	case linkOutcome.err != nil:
 		if !resumable {
 			return handoffVerdict{PRNumber: linkOutcome.pr.Number, FailReason: r.linkageExhaustedReason(linkOutcome)}
 		}
 		return handoffVerdict{Kind: "linkage-repair", ContinueMsg: linkageRepairMessage(r.sourceIssue(), linkOutcome, continuations+1), PRNumber: linkOutcome.pr.Number}
-	}
-	if linkOutcome.criteriaErr != nil {
+	case linkOutcome.criteriaErr != nil:
 		if !resumable {
 			return handoffVerdict{
 				PRNumber:   linkOutcome.pr.Number,
@@ -2549,15 +2759,18 @@ func (r reporter) applyHandoffPlan(ctx context.Context, continuations int, maxCo
 			ContinueMsg: criteriaRepairMessage(r.sourceIssue(), linkOutcome, continuations+1),
 		}
 	}
-	// Linkage passed; either the criteria check also passed (carrying
-	// the report and its coverage claim), or no criteria set was pinned
-	// and the body contract was vacuous. In either case the run may
-	// hand off as Verifying — the coverage claim rides the event detail
-	// for the operator audit but never the Reason line.
+	// Both contracts passed: either the criteria check ran and
+	// produced a report (so the verdict carries its coverage claim
+	// and per-status counts for the run.exit audit), or no criteria
+	// set was pinned and the body contract was vacuous. In either
+	// case the run may hand off as Verifying — the coverage claim
+	// rides the event detail for the operator audit but never the
+	// Reason line.
 	return handoffVerdict{
-		Pass:     true,
-		PRNumber: linkOutcome.pr.Number,
-		Coverage: linkOutcome.coverage,
+		Pass:         true,
+		PRNumber:     linkOutcome.pr.Number,
+		Coverage:     linkOutcome.coverage,
+		StatusCounts: criteriaStatusCounts(linkOutcome.criteria),
 	}
 }
 
