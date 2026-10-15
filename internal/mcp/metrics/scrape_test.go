@@ -170,6 +170,8 @@ process_cpu_seconds_total 4.2
 // Credentials embedded in the configured URL must never leak into tool
 // output: net/http echoes them in transport errors unless scrubbed, and the
 // whole userinfo component is secret — a username can be a bearer token.
+// Query parameters and fragments can carry credentials too (?token=…), so
+// every failure path is exercised with a secret in each position.
 func TestScrapeRedactsCredentialsInDiagnostics(t *testing.T) {
 	dead := httptest.NewServer(http.NotFoundHandler())
 	host := dead.URL
@@ -180,12 +182,44 @@ func TestScrapeRedactsCredentialsInDiagnostics(t *testing.T) {
 	}
 
 	tests := []struct {
-		name   string
-		raw    string
-		secret string
+		name    string
+		raw     string
+		secrets []string
 	}{
-		{name: "password userinfo", raw: "http://alice:hunter2@" + parsed.Host + "/metrics", secret: "hunter2"},
-		{name: "username is the token", raw: "http://super-secret-token@" + parsed.Host + "/metrics", secret: "super-secret-token"},
+		{name: "password userinfo", raw: "http://alice:hunter2@" + parsed.Host + "/metrics", secrets: []string{"hunter2"}},
+		{name: "username is the token", raw: "http://super-secret-token@" + parsed.Host + "/metrics", secrets: []string{"super-secret-token"}},
+		{name: "query token", raw: host + "/metrics?token=query-secret-tok3n&region=us", secrets: []string{"query-secret-tok3n"}},
+		{name: "fragment secret", raw: host + "/metrics#fragment-secret-secr3t", secrets: []string{"fragment-secret-secr3t"}},
+		{
+			// net/http rewrites u:pw@ to u:***@ before building url.Error, so
+			// the whole-URL replacement misses and only the query/fragment
+			// scrub can catch these.
+			name:    "password masks the query and fragment",
+			raw:     "http://alice:hunter2@" + parsed.Host + "/metrics?token=query-secret-tok3n&z=1#fragment-secret-secr3t",
+			secrets: []string{"hunter2", "query-secret-tok3n", "fragment-secret-secr3t"},
+		},
+		{
+			// Same masking plus a %-encoded fragment: net/url stores Fragment
+			// decoded but renders EscapedFragment, so only the escaped form
+			// appears in the message.
+			name:    "password masks an escaped fragment",
+			raw:     "http://alice:hunter2@" + parsed.Host + "/metrics#tok%3AenFRAG3",
+			secrets: []string{"hunter2", "tok%3AenFRAG3", "tok:enFRAG3"},
+		},
+		{
+			// url.URL.Fragment is stored decoded but rendered %-escaped; both
+			// spellings must disappear.
+			name:    "escaped fragment",
+			raw:     host + "/metrics#tok%3AenESC3",
+			secrets: []string{"tok%3AenESC3", "tok:enESC3"},
+		},
+		{
+			// url.Error formats the URL through %q, escaping quotes and
+			// backslashes; the escaped spelling must not survive either.
+			name:    "quote-escaping in the error rendering",
+			raw:     host + `/metrics?token=QUOTE"LEAK`,
+			secrets: []string{`QUOTE"LEAK`, `QUOTE\"LEAK`},
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -194,7 +228,7 @@ func TestScrapeRedactsCredentialsInDiagnostics(t *testing.T) {
 			if load.Available {
 				t.Fatalf("load = %+v, want unavailable", load)
 			}
-			for _, leaked := range []string{tt.secret, "alice", "@", "xxxxx"} {
+			for _, leaked := range append(tt.secrets, "alice", "@", "xxxxx") {
 				if strings.Contains(load.Detail, leaked) {
 					t.Fatalf("detail %q leaks %q", load.Detail, leaked)
 				}
@@ -206,6 +240,91 @@ func TestScrapeRedactsCredentialsInDiagnostics(t *testing.T) {
 	}
 }
 
+// A query-authenticated endpoint must lose its secret on every failure path
+// that names the URL — non-200 responses, malformed bodies, and transport
+// errors — while the scrape itself still receives the configured query.
+func TestScrapeRedactsQueryCredentialsOnFailurePaths(t *testing.T) {
+	const secret = "url-secret-c3eb91a1"
+
+	serve500 := serve(t, http.StatusInternalServerError, "boom")
+	defer serve500.Close()
+	malformed := serve(t, http.StatusOK, "this is {{{ not prometheus")
+	defer malformed.Close()
+	refused := httptest.NewServer(http.NotFoundHandler())
+	transportURL := refused.URL
+	refused.Close() // nothing listens there anymore
+
+	tests := []struct {
+		name string
+		raw  string
+	}{
+		{name: "non-200", raw: serve500.URL + "/metrics?token=" + secret + "&z=1#" + secret},
+		{name: "malformed response", raw: malformed.URL + "/metrics?token=" + secret + "&z=1#" + secret},
+		{name: "transport error", raw: transportURL + "/metrics?token=" + secret + "&z=1#" + secret},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			scraper := NewScraper(&http.Client{Timeout: 2 * time.Second}, mustMapping(t, BackendAuto))
+			load := scraper.Scrape(context.Background(), tt.raw)
+			if load.Available {
+				t.Fatalf("load = %+v, want unavailable", load)
+			}
+			if strings.Contains(load.Detail, secret) {
+				t.Fatalf("detail %q leaks the query secret", load.Detail)
+			}
+			if !strings.Contains(load.Detail, "/metrics") {
+				t.Fatalf("detail %q should keep the path for debugging", load.Detail)
+			}
+		})
+	}
+
+	// The configured query reaches the wire unredacted: a scraping handler
+	// must observe the token parameter.
+	var gotQuery url.Values
+	observed := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotQuery = r.URL.Query()
+		_, _ = w.Write([]byte(`# TYPE vllm:num_requests_waiting gauge
+vllm:num_requests_waiting 3.0
+`))
+	}))
+	defer observed.Close()
+	scraper := NewScraper(&http.Client{Timeout: 2 * time.Second}, mustMapping(t, BackendAuto))
+	load := scraper.Scrape(context.Background(), observed.URL+"/metrics?token="+secret)
+	if !load.Available {
+		t.Fatalf("load = %+v, want available", load)
+	}
+	if gotQuery.Get("token") != secret {
+		t.Fatalf("upstream saw token %q, want the configured secret", gotQuery.Get("token"))
+	}
+}
+
+// A redirect chain can reflect the configured credential into its Location
+// under a different path and parameter name; when the chain exhausts Go's
+// redirect limit, the transport error must name the failure without echoing
+// any URL the endpoint chose.
+func TestScrapeRedactsRedirectReflectedCredentials(t *testing.T) {
+	const secret = "redirect-secret-8d41b"
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, "/new-path?session="+secret+"&test=1", http.StatusFound)
+	}))
+	defer srv.Close()
+
+	scraper := NewScraper(&http.Client{Timeout: 2 * time.Second}, mustMapping(t, BackendAuto))
+	load := scraper.Scrape(context.Background(), srv.URL+"/metrics?token="+secret)
+	if load.Available {
+		t.Fatalf("load = %+v, want unavailable", load)
+	}
+	if strings.Contains(load.Detail, secret) {
+		t.Fatalf("detail %q leaks the reflected credential", load.Detail)
+	}
+	if !strings.Contains(load.Detail, srv.URL+"/metrics") {
+		t.Fatalf("detail %q should keep the configured host and path for debugging", load.Detail)
+	}
+	if !strings.Contains(load.Detail, "redirect") {
+		t.Fatalf("detail %q should name the failure category", load.Detail)
+	}
+}
+
 // RedactedURL backs every diagnostic surface that prints the URL, including
 // the startup log.
 func TestRedactedURLStripsAllUserinfo(t *testing.T) {
@@ -213,6 +332,9 @@ func TestRedactedURLStripsAllUserinfo(t *testing.T) {
 		{raw: "https://alice:hunter2@example/metrics", want: "https://example/metrics"},
 		{raw: "https://super-secret-token@example/metrics", want: "https://example/metrics"},
 		{raw: "http://vllm:8000/metrics", want: "http://vllm:8000/metrics"},
+		{raw: "https://example/metrics?token=secret-tok3n&x=1#frag-s3cret", want: "https://example/metrics"},
+		{raw: "https://alice:pw@example/metrics?token=secret-tok3n", want: "https://example/metrics"},
+		{raw: "https://example/metrics?", want: "https://example/metrics"},
 	}
 	for _, tt := range tests {
 		if got := RedactedURL(tt.raw); got != tt.want {
