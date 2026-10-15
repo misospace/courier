@@ -5813,10 +5813,129 @@ printf '{"outcome":"changes"}' > "$COURIER_SCRATCH_DIR/outcome.json"
 func TestLinkageRepairMessage(t *testing.T) {
 	source := broker.SourceIssue{Owner: "misospace", Name: "miso-gallery", Number: 502}
 
-	outcome := &linkageCheckOutcome{pr: &prLinkageObservation{Number: 12, State: "open", Body: "Addresses #502"}}
+	outcome := &handoffCheckOutcome{pr: &prLinkageObservation{Number: 12, State: "open", Body: "Addresses #502"}}
 	want := "Courier refused the handoff: PR #12's body does not carry an authoritative closing reference to misospace/miso-gallery#502. Update the PR body through the forge capability so it carries a supported closing keyword (Closes, Fixes, or Resolves) followed by #502, or the cross-repo form misospace/miso-gallery#502 when the trusted source repository differs from the PR base. Then re-declare the same outcome. (continuation 2)"
 	if got := linkageRepairMessage(source, outcome, 2); got != want {
 		t.Fatalf("linkageRepairMessage = %q, want %q", got, want)
+	}
+}
+
+// pinCriteriaEnvelopeForMisoGallery extracts the pinned criterion set the
+// controller admission stage would produce from the real miso-gallery
+// issue body, serializes it in the COURIER_CRITERIA envelope shape the
+// legacy executor consumes (#280), and returns the rendered JSON so a
+// run-level test can set it as the run's COURIER_CRITERIA value. The
+// envelope is rooted in the broker's internal package; this helper is the
+// test-local mirror so the executor's tests never depend on the
+// controller's projection logic.
+func pinCriteriaEnvelopeForMisoGallery(t *testing.T) string {
+	t.Helper()
+	body, err := os.ReadFile(filepath.Join("..", "..", "internal", "broker", "testdata", "miso-gallery-502-issue.md"))
+	if err != nil {
+		t.Fatalf("read broker testdata fixture: %v", err)
+	}
+	set, err := broker.ExtractCriteria(string(body), broker.SourceIssue{Owner: "misospace", Name: "miso-gallery", Number: 502})
+	if err != nil {
+		t.Fatalf("extract criteria from broker testdata fixture: %v", err)
+	}
+	if set.IsEmpty() {
+		t.Fatal("expected a non-empty pinned set for miso-gallery #502")
+	}
+	rendered, err := json.Marshal(set)
+	if err != nil {
+		t.Fatalf("marshal pinned criterion envelope: %v", err)
+	}
+	return string(rendered)
+}
+
+// TestCriteriaRepairMessagePinsValidatorVocabulary pins the exact shape of
+// the criterion-repair continuation (#282, #249): the offending PR number,
+// the trusted source issue identity, the broker-defined rejection reason
+// (drawn verbatim from the validator so any change to the validator's
+// vocabulary surfaces in both paths), and the grammar the body must
+// satisfy — the "courier-criteria:v1" header, the "AC-n sha256:...
+// status - reference" row form, the closed status vocabulary, and the
+// per-status shape rules. The continuation number is named for the model
+// to see the remaining budget.
+func TestCriteriaRepairMessagePinsValidatorVocabulary(t *testing.T) {
+	source := broker.SourceIssue{Owner: "misospace", Name: "miso-gallery", Number: 502}
+	ce := &broker.CriteriaError{
+		Missing:         []string{"AC-2"},
+		CoverageClaim:   broker.CoverageFull,
+		CoverageDerived: broker.CoveragePartial,
+	}
+	// Reflect the validator's describeCriteriaFailure composition: missing
+	// fields followed by the coverage lie. Mirror the validator's
+	// describeCriteriaFailure ordering so the test pins the actual broker
+	// vocabulary, not a re-derivation.
+	ce.Reason = "publication denied: criterion evidence missing for AC-2; coverage claimed full but the records derive partial"
+	outcome := &handoffCheckOutcome{
+		pr:          &prLinkageObservation{Number: 12, State: "open"},
+		criteriaErr: ce,
+	}
+	msg := criteriaRepairMessage(source, outcome, 3)
+	for _, want := range []string{
+		"PR #12",
+		"misospace/miso-gallery#502",
+		ce.Reason,
+		"courier-criteria:v1",
+		"- AC-<n> sha256:<64hex>: <status> - <reference>",
+		"implementation-evidence",
+		"regression-check",
+		"manual-verification",
+		"not-implemented",
+		"regression-check and implementation-evidence",
+		"file path or check URL",
+		"Update the PR body through the forge capability",
+		"(continuation 3)",
+	} {
+		if !strings.Contains(msg, want) {
+			t.Fatalf("criteriaRepairMessage missing %q in: %q", want, msg)
+		}
+	}
+}
+
+// TestCriteriaExhaustedReasonPinsIncompleteHandoffMarker pins the precise
+// NeedsHuman reason the legacy executor records when the criteria-repair
+// budget is exhausted (#282): the "incomplete handoff: criterion
+// evidence" prefix, the broker-defined violation reason (when the
+// validator saw something the broker test table covers), the trusted
+// source identity, and the stable fallback the helper returns when no
+// structured error is set.
+func TestCriteriaExhaustedReasonPinsIncompleteHandoffMarker(t *testing.T) {
+	var output, errorsOut bytes.Buffer
+	report := newReporter(&output, &errorsOut, config{
+		Mode: "resolve-issue",
+		Repo: "misospace/miso-gallery",
+		Ref:  502,
+	})
+
+	// Validator-seen path: the broker carries the violation reason
+	// verbatim so the operator can read what failed.
+	withReason := &handoffCheckOutcome{
+		pr:          &prLinkageObservation{Number: 12, State: "open"},
+		criteriaErr: &broker.CriteriaError{Reason: "publication denied: criterion evidence missing for AC-2"},
+	}
+	got := report.criteriaExhaustedReason(withReason)
+	if !strings.HasPrefix(got, "incomplete handoff: criterion evidence") {
+		t.Fatalf("criteriaExhaustedReason prefix = %q, want %q", got, "incomplete handoff: criterion evidence")
+	}
+	if !strings.Contains(got, "missing for AC-2") {
+		t.Fatalf("criteriaExhaustedReason should carry the broker reason: %q", got)
+	}
+	if !strings.Contains(got, "misospace/miso-gallery#502") {
+		t.Fatalf("criteriaExhaustedReason should name the trusted source identity: %q", got)
+	}
+
+	// Stable fallback path: nothing the validator saw, the helper
+	// returns the documented stable string while still naming the
+	// trusted source identity.
+	fallback := report.criteriaExhaustedReason(&handoffCheckOutcome{pr: &prLinkageObservation{Number: 12, State: "open"}})
+	if !strings.HasPrefix(fallback, "incomplete handoff: criterion evidence block did not satisfy the pinned set") {
+		t.Fatalf("fallback prefix = %q, want the stable string", fallback)
+	}
+	if !strings.Contains(fallback, "misospace/miso-gallery#502") {
+		t.Fatalf("fallback should name the trusted source identity: %q", fallback)
 	}
 }
 
@@ -5971,27 +6090,27 @@ func TestLinkageExhaustedReason(t *testing.T) {
 
 	cases := []struct {
 		name    string
-		outcome *linkageCheckOutcome
+		outcome *handoffCheckOutcome
 		want    string
 	}{
 		{
 			name:    "missing PR",
-			outcome: &linkageCheckOutcome{missing: true},
+			outcome: &handoffCheckOutcome{missing: true},
 			want:    "the model never opened a pull request for the run branch, so the handoff was refused; the run needs a human to open one with the trusted source-issue linkage to misospace/miso-gallery#502",
 		},
 		{
 			name:    "wrong issue number reports the model's attempted reference",
-			outcome: &linkageCheckOutcome{pr: &prLinkageObservation{Number: 12, State: "open"}, err: wrongNumber},
+			outcome: &handoffCheckOutcome{pr: &prLinkageObservation{Number: 12, State: "open"}, err: wrongNumber},
 			want:    "the published pull request body did not satisfy the trusted source-issue linkage to misospace/miso-gallery#502 after the bounded repair budget (model wrote: Closes #999): publication denied: pull request body names a different source issue number than admitted (expected misospace/miso-gallery#502, found Closes #999)",
 		},
 		{
 			name:    "no supported reference names the missing-reference rejection",
-			outcome: &linkageCheckOutcome{pr: &prLinkageObservation{Number: 12, State: "open"}, err: missingRef},
+			outcome: &handoffCheckOutcome{pr: &prLinkageObservation{Number: 12, State: "open"}, err: missingRef},
 			want:    "the published pull request body did not satisfy the trusted source-issue linkage to misospace/miso-gallery#502 after the bounded repair budget: " + broker.ErrLinkageMissing.Error(),
 		},
 		{
 			name:    "no structured error keeps the generic handoff marker",
-			outcome: &linkageCheckOutcome{pr: &prLinkageObservation{Number: 12, State: "open"}},
+			outcome: &handoffCheckOutcome{pr: &prLinkageObservation{Number: 12, State: "open"}},
 			want:    "the published pull request body did not satisfy the trusted source-issue linkage to misospace/miso-gallery#502; the run needs a human",
 		},
 	}
@@ -6139,5 +6258,306 @@ func TestInstallGitIdentityPrecedence(t *testing.T) {
 	}
 	if _, set := os.LookupEnv("GIT_COMMITTER_EMAIL"); set {
 		t.Fatal("after restore GIT_COMMITTER_EMAIL is set, want it returned to unset")
+	}
+}
+
+// The criterion-evidence contract tests below generalize the legacy
+// pre-handoff plan (#282, #249): both linkage and criteria share one
+// mechanism — the run loop calls applyHandoffPlan once per turn and
+// reacts to whichever body contract failed. The run behavior must agree
+// across both bodies: a vacuous pass for an empty/unpinned set, a
+// bounded "criteria-repair" continuation when a set was pinned and the
+// evidence block disagrees with it, an "incomplete handoff: criterion
+// evidence" NeedsHuman reason when the bounded budget is exhausted, and
+// a Verifying handoff with a criteria.coverage event-detail when the
+// body satisfies both contracts and a set was pinned.
+
+// withClosingReference prepends a supported closing-keyword reference
+// to a body so the linkage check passes before the criterion check
+// runs. The legacy executor enforces the body contracts in linkage-
+// first order — a head whose linkage has already failed cannot earn a
+// criteria-repair continuation — and the deficient/partial fixtures
+// intentionally omit the closing keyword. The honest-partial fixture
+// already carries it; the others need this shim.
+func withClosingReference(body, source string) string {
+	return "Closes " + source + "\n\n" + body
+}
+
+// readBrokerFixture reads one of the broker testdata markdown fixtures
+// the legacy executor's criterion-evidence contract consumes. It is the
+// test-local mirror of broker.loadFixture so the executor's tests do
+// not depend on the broker's internals.
+func readBrokerFixture(t *testing.T, name string) string {
+	t.Helper()
+	data, err := os.ReadFile(filepath.Join("..", "..", "internal", "broker", "testdata", name))
+	if err != nil {
+		t.Fatalf("read broker testdata fixture %s: %v", name, err)
+	}
+	return string(data)
+}
+
+// setMisoGalleryRepoConfig swaps the run's COURIER_REPO, COURIER_BRANCH,
+// and COURIER_REF onto the miso-gallery identity so the pinned-set
+// fixture (which names misospace/miso-gallery#502) is compared against
+// a body whose trusted source identity matches. setContinuationEnv sets
+// acme/widgets defaults, so this helper resets the run-level identity
+// for the criterion tests.
+func setMisoGalleryRepoConfig(t *testing.T) {
+	t.Helper()
+	t.Setenv("COURIER_REPO", "misospace/miso-gallery")
+	t.Setenv("COURIER_BRANCH", "courier/resolve-issue/miso-gallery/502")
+	t.Setenv("COURIER_REF", "502")
+}
+
+// misoGalleryPRFixtureJSON renders the run-branch pull request in the
+// identity-checked shape the executor's pre-handoff observation
+// requires (#247, #248): full base- and head-repository identity naming
+// misospace/miso-gallery (the trusted source identity the criterion set
+// is pinned against). The default pullRequestFixtureJSON names
+// acme/widgets and would mismatched as a foreign head, so the
+// criterion tests need the miso-gallery mirror.
+func misoGalleryPRFixtureJSON(number int, state string, draft bool, body string) string {
+	return fmt.Sprintf(`[{"number":%d,"state":%q,"draft":%t,"title":"Work","base":{"ref":"main","repo":{"full_name":"misospace/miso-gallery"}},"head":{"ref":"courier/resolve-issue/miso-gallery/502","sha":"deadbeef","repo":{"full_name":"misospace/miso-gallery"}},"body":%q}]`, number, state, draft, body)
+}
+
+// runCriteriaEndToEnd stands up the run scaffolding shared by the
+// criterion evidence end-to-end tests: an HTTP forge that scripts the
+// run-branch PR body via writePullRequestScript across turns, a fake
+// OpenCode script, and the resolved COURIER_CRITERIA envelope to the
+// miso-gallery pinned set. prBody is the initial PR body the forge
+// returns; script is the full fake OpenCode script that decides what
+// happens after the first turn (typically echoing the same deficient
+// body so the budget exhausts); criteriaEnvelope is the JSON for the
+// pinned criterion set (empty string for no-pinning tests). The
+// helpers set continuations=1, run name, debug log level, zero resume
+// backoff, and the fake state dir so the run loop can retarget the PR
+// body mid-run if a test chooses to.
+func runCriteriaEndToEnd(t *testing.T, prBody, script, criteriaEnvelope string) (int, string, []string) {
+	t.Helper()
+	root := t.TempDir()
+	remote := remoteWithBaseOnly(t, root)
+	prServer, prState := fakeForgePullRequestServer(t)
+	stateDir := filepath.Join(root, "fakestate")
+	if err := os.MkdirAll(stateDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	write(t, prState, misoGalleryPRFixtureJSON(12, "open", false, prBody))
+	fakeOpenCode := filepath.Join(root, "opencode")
+	writeExecutable(t, fakeOpenCode, script)
+	setContinuationEnv(t, root, remote, prServer.URL, fakeOpenCode)
+	setMisoGalleryRepoConfig(t)
+	if criteriaEnvelope != "" {
+		t.Setenv("COURIER_CRITERIA", criteriaEnvelope)
+	}
+	t.Setenv("COURIER_MAX_CONTINUATIONS", "1")
+	t.Setenv("COURIER_FAKE_STATE", stateDir)
+	t.Setenv("COURIER_LOG_LEVEL", "debug")
+	t.Setenv("COURIER_RUN_NAME", "coderrun-criteria-it-"+strings.ReplaceAll(t.Name(), "/", "-"))
+	var output bytes.Buffer
+	var errorsOut bytes.Buffer
+	code := run(context.Background(), &output, &errorsOut)
+	return code, output.String(), readArgvLog(t, stateDir)
+}
+
+// scriptCriteriaDeficientTurns is the fake OpenCode body for the
+// criteria-repair exhaustion tests: every turn commits and pushes
+// without repairing the body, so the bounded budget exhausts and the
+// run ends NeedsHuman. The first turn declares changes; later turns do
+// not, so the verifier-rejection verdict settles the run. Written as a
+// raw string with literal newlines so every shell command is exactly
+// what gets written — the inlined helper must avoid Go string-escape
+// confusion around the printf format strings.
+func scriptCriteriaDeficientTurns(sessionID string) string {
+	script := `#!/bin/sh
+case "$1" in mcp) exit 0;; esac
+printf '%s\n' "$(printf '%s' "$*" | tr '\n' ' ')" >> "$COURIER_FAKE_STATE/argv.log"
+N=$(cat "$COURIER_FAKE_STATE/count" 2>/dev/null || echo 0)
+N=$((N+1)); echo "$N" > "$COURIER_FAKE_STATE/count"
+printf '{"sessionID":"` + sessionID + `","part":{"type":"text","text":"turn %s"}}\n' "$N"
+printf 'work\n' > "work-$N.txt"
+git add --all -- .
+git commit -m "test: turn $N" >/dev/null 2>&1 || true
+git push origin "$COURIER_BRANCH" >/dev/null 2>&1 || true
+mkdir -p "$COURIER_SCRATCH_DIR"
+printf '{"outcome":"changes"}' > "$COURIER_SCRATCH_DIR/outcome.json"
+exit 0
+`
+	return script
+}
+
+// scriptCriteriaHonestPartialTurns is the fake OpenCode body for the
+// honest-partial positive path: a single turn opens a PR whose body
+// already carries the honest-partial evidence block, declares
+// changes, and exits 0; the criteria check then passes and the run
+// ends Verifying with the criteria.coverage=partial event detail. No
+// continuation is fired.
+func scriptCriteriaHonestPartialTurns(sessionID string) string {
+	script := `#!/bin/sh
+case "$1" in mcp) exit 0;; esac
+printf '%s\n' "$(printf '%s' "$*" | tr '\n' ' ')" >> "$COURIER_FAKE_STATE/argv.log"
+printf '{"sessionID":"` + sessionID + `","part":{"type":"text","text":"honest partial run"}}\n'
+printf 'work\n' > work.txt
+git add --all -- .
+git commit -m 'test: opened the PR with an honest partial evidence block' >/dev/null
+git push origin "$COURIER_BRANCH" >/dev/null 2>&1 || true
+mkdir -p "$COURIER_SCRATCH_DIR"
+printf '{"outcome":"changes"}' > "$COURIER_SCRATCH_DIR/outcome.json"
+exit 0
+`
+	return script
+}
+
+// TestRunResolveIssueCriteriaDeficientBodyTriggersRepair proves the
+// criterion-evidence contract enters the shared pre-handoff plan on
+// the same path as linkage (#282): a deficient PR body (the initial
+// miso-gallery#505 handoff with an authoritative closing reference
+// prepended so linkage passes the body through to the criterion check)
+// fires a criteria-repair continuation under the bounded budget; when
+// the model never repairs the body, the run ends NeedsHuman with the
+// "incomplete handoff: criterion evidence" reason and the declared
+// "changes" outcome tag preserved on the terminal handoff.
+func TestRunResolveIssueCriteriaDeficientBodyTriggersRepair(t *testing.T) {
+	source := "misospace/miso-gallery#502"
+	// deficient body + a Closes #502 prefix so linkage accepts the
+	// body before the criterion check sees a no-block body.
+	body := withClosingReference(readBrokerFixture(t, "miso-gallery-505-pr-deficient.md"), "#502")
+	envelope := pinCriteriaEnvelopeForMisoGallery(t)
+	code, out, _ := runCriteriaEndToEnd(t, body, scriptCriteriaDeficientTurns("ses_criteria_deficient"), envelope)
+	if code != exitNeedsHuman {
+		t.Fatalf("run exit code = %d, want %d (NeedsHuman after criteria-repair budget exhausts); stderr/criteria detail: %q", code, exitNeedsHuman, out)
+	}
+	if !strings.Contains(out, `"phase":"NeedsHuman"`) {
+		t.Fatalf("expected NeedsHuman phase: %q", out)
+	}
+	if !strings.Contains(out, `"category":"verifier-rejection"`) {
+		t.Fatalf("expected verifier-rejection category: %q", out)
+	}
+	if !strings.Contains(out, `"outcome":"changes"`) {
+		t.Fatalf("declared changes outcome tag should be preserved: %q", out)
+	}
+	if !strings.Contains(out, `"kind":"criteria-repair"`) {
+		t.Fatalf("expected a criteria-repair continuation in the event log: %q", out)
+	}
+	if !strings.Contains(out, "incomplete handoff: criterion evidence") {
+		t.Fatalf("exhausted-budget reason should mention incomplete criterion handoff: %q", out)
+	}
+	if !strings.Contains(out, source) {
+		t.Fatalf("exhausted-budget reason should name the trusted source identity: %q", out)
+	}
+}
+
+// TestRunResolveIssueCriteriaPartialBodyTriggersRepair is the partial
+// case of the criteria-repair continuation: an evidence block that
+// names AC-1 and AC-3 but omits AC-2 while claiming coverage=full
+// passes linkage (the body still says Closes #502.) and fails the
+// criterion check with a CriteriaError carrying Missing=[AC-2] and a
+// coverage claim/derivation disagreement. The bounded budget exhausts
+// with one criteria-repair continuation; the run ends NeedsHuman with
+// the declared outcome tag preserved and the "incomplete handoff"
+// reason carrying the broker-defined violation.
+func TestRunResolveIssueCriteriaPartialBodyTriggersRepair(t *testing.T) {
+	body := readBrokerFixture(t, "miso-gallery-505-pr-partial.md")
+	envelope := pinCriteriaEnvelopeForMisoGallery(t)
+	code, out, _ := runCriteriaEndToEnd(t, body, scriptCriteriaDeficientTurns("ses_criteria_partial"), envelope)
+	if code != exitNeedsHuman {
+		t.Fatalf("run exit code = %d, want %d (NeedsHuman after criteria-repair budget exhausts); detail: %q", code, exitNeedsHuman, out)
+	}
+	if !strings.Contains(out, `"kind":"criteria-repair"`) {
+		t.Fatalf("expected a criteria-repair continuation: %q", out)
+	}
+	if n := strings.Count(out, `"kind":"criteria-repair"`); n != 1 {
+		t.Fatalf("criteria-repair continuation count = %d, want 1 (single slot consumed before exhaustion): %q", n, out)
+	}
+	if !strings.Contains(out, "incomplete handoff: criterion evidence") {
+		t.Fatalf("NeedsHuman reason should mention incomplete criterion handoff: %q", out)
+	}
+	if !strings.Contains(out, "AC-2") {
+		t.Fatalf("broker-defined reason should name the missing criterion: %q", out)
+	}
+	if !strings.Contains(out, `"outcome":"changes"`) {
+		t.Fatalf("declared changes outcome tag should be preserved on criteria-exhausted NeedsHuman: %q", out)
+	}
+}
+
+// TestRunResolveIssueCriteriaHonestPartialHandsOffVerifyingWithCoverage
+// pins the positive path of the criterion-evidence contract at the
+// legacy executor's pre-handoff plan (#249, #282): a body that names
+// the trusted source issue and carries an honest partial evidence
+// block passes both the linkage and criterion checks on the first
+// turn; the run ends Verifying with the run.exit event detail carrying
+// "criteria.coverage":"partial" so an operator audits the honesty.
+func TestRunResolveIssueCriteriaHonestPartialHandsOffVerifyingWithCoverage(t *testing.T) {
+	body := readBrokerFixture(t, "miso-gallery-505-pr-honest-partial.md")
+	envelope := pinCriteriaEnvelopeForMisoGallery(t)
+	code, out, _ := runCriteriaEndToEnd(t, body, scriptCriteriaHonestPartialTurns("ses_criteria_honest_partial"), envelope)
+	if code != exitSuccess {
+		t.Fatalf("run exit code = %d, want 0 (Verifying after honest partial evidence); detail: %q", code, out)
+	}
+	if !strings.Contains(out, `"phase":"Verifying"`) {
+		t.Fatalf("missing Verifying termination: %q", out)
+	}
+	if !strings.Contains(out, `"outcome":"changes"`) {
+		t.Fatalf("Verifying termination should carry the declared changes outcome: %q", out)
+	}
+	if !strings.Contains(out, `"criteria.coverage":"partial"`) {
+		t.Fatalf("run.exit event detail should carry the criteria.coverage=partial audit field: %q", out)
+	}
+	// The criteria pass must not fire any continuation — the body
+	// satisfies both contracts on the first turn.
+	for _, kind := range []string{`"kind":"criteria-repair"`, `"kind":"linkage-repair"`, `"kind":"pr-missing"`, `"kind":"pr-draft"`, `"kind":"pr-unverified"`} {
+		if strings.Contains(out, kind) {
+			t.Fatalf("criteria pass must not fire continuation kind %s: %q", kind, out)
+		}
+	}
+}
+
+// TestRunResolveIssueEmptyPinnedSetSkipsCriteriaCheck pins the
+// vacuous-pass branch of the criterion-evidence contract (#249, #282):
+// when an issue has no acceptance section (or its admission produced
+// an empty pinned set), the criterion check is a vacuous pass and the
+// body faces only the linkage contract. A body that would otherwise
+// fail criteria — here the deficient fixture with a Closes #502 prefix
+// — still hands off Verifying because the criteria check is skipped
+// entirely. No "criteria-repair" event is emitted and no
+// "criteria.coverage" rides the run.exit event detail.
+func TestRunResolveIssueEmptyPinnedSetSkipsCriteriaCheck(t *testing.T) {
+	emptyEnvelope := `{"issue":{"owner":"misospace","name":"miso-gallery","number":502},"criteria":[],"digest":"sha256:empty-pin"}`
+	body := withClosingReference(readBrokerFixture(t, "miso-gallery-505-pr-deficient.md"), "#502")
+	code, out, _ := runCriteriaEndToEnd(t, body, scriptCriteriaHonestPartialTurns("ses_criteria_empty_set"), emptyEnvelope)
+	if code != exitSuccess {
+		t.Fatalf("run exit code = %d, want 0 (empty pinned set is vacuous; linkage holds); detail: %q", code, out)
+	}
+	if !strings.Contains(out, `"phase":"Verifying"`) {
+		t.Fatalf("missing Verifying termination: %q", out)
+	}
+	if strings.Contains(out, `"kind":"criteria-repair"`) {
+		t.Fatalf("empty pinned set must not fire criteria-repair continuation: %q", out)
+	}
+	if strings.Contains(out, `"criteria.coverage"`) {
+		t.Fatalf("empty pinned set must not surface criteria.coverage on run.exit: %q", out)
+	}
+}
+
+// TestRunResolveIssueUnpinnedRunSkipsCriteriaCheck pins the
+// absent-envelope branch of the criterion-evidence contract (#249,
+// #282): with no COURIER_CRITERIA env var, the criterion check is
+// skipped entirely and the body faces only the linkage contract.
+// The deficient body (with a Closes #502 prefix so linkage passes)
+// hands off Verifying with no criteria-repair event and no
+// criteria.coverage in the run.exit detail.
+func TestRunResolveIssueUnpinnedRunSkipsCriteriaCheck(t *testing.T) {
+	body := withClosingReference(readBrokerFixture(t, "miso-gallery-505-pr-deficient.md"), "#502")
+	code, out, _ := runCriteriaEndToEnd(t, body, scriptCriteriaHonestPartialTurns("ses_criteria_unpinned"), "")
+	if code != exitSuccess {
+		t.Fatalf("run exit code = %d, want 0 (no COURIER_CRITERIA at all; linkage holds); detail: %q", code, out)
+	}
+	if !strings.Contains(out, `"phase":"Verifying"`) {
+		t.Fatalf("missing Verifying termination: %q", out)
+	}
+	if strings.Contains(out, `"kind":"criteria-repair"`) {
+		t.Fatalf("absent COURIER_CRITERIA must not fire criteria-repair continuation: %q", out)
+	}
+	if strings.Contains(out, `"criteria.coverage"`) {
+		t.Fatalf("absent COURIER_CRITERIA must not surface criteria.coverage on run.exit: %q", out)
 	}
 }

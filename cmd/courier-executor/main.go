@@ -94,6 +94,11 @@ type config struct {
 	EvidenceURL      string
 	EvidenceToken    string
 	PodUID           string
+	// Criteria is the bounded JSON envelope of the acceptance-criterion set
+	// pinned at admission (#280). Empty means no set was pinned; presence
+	// (even of an empty set) is meaningful and turns the criterion check
+	// into a vacuous pass instead of a no-op (#249).
+	Criteria string
 }
 
 // evidenceEnabled reports whether failure-evidence capture is armed for this
@@ -179,6 +184,7 @@ func readConfig(getenv func(string) string) (config, error) {
 		EvidenceURL:      strings.TrimSpace(getenv(executor.EnvEvidenceURL)),
 		EvidenceToken:    strings.TrimSpace(getenv(executor.EnvEvidenceToken)),
 		PodUID:           strings.TrimSpace(getenv(executor.EnvPodUID)),
+		Criteria:         strings.TrimSpace(getenv("COURIER_CRITERIA")),
 	}
 	if strings.TrimSpace(cfg.GitHubToken) == "" {
 		cfg.GitHubToken = cfg.GitToken
@@ -255,6 +261,13 @@ type reporter struct {
 	red    *courierlog.Redactor
 	tel    *telemetry.Tracker
 	cfg    config
+	// handoffCoverage carries the criterion-evidence block's claimed
+	// coverage ("full" or "partial") from the pre-handoff plan to the
+	// run.exit event (#249, #282). Set by applyHandoffPlan when a Verifying
+	// pass carries criteria data; empty when no set was pinned or when the
+	// criteria check did not run. It rides event detail only — never the
+	// Verifying Reason line, never the COURIER_TERMINATION payload.
+	handoffCoverage string
 }
 
 // newReporter builds the run's reporter and registers every credential the
@@ -313,7 +326,11 @@ func (r reporter) event(eventType, status string, detail map[string]any) {
 }
 
 // terminate publishes the terminal handoff: the legacy COURIER_TERMINATION
-// line with a redacted reason, plus the run.exit event.
+// line with a redacted reason, plus the run.exit event. The run.exit detail
+// rides the criterion-evidence coverage claim ("full" or "partial") when the
+// pre-handoff check produced one (#249, #282): a partial record is the run
+// ending honestly, an operator can audit whether the run stayed consistent
+// with the linked criteria, and the Reason line is untouched.
 func (r reporter) terminate(result termination) {
 	if r.tel != nil {
 		if compact := r.tel.Compact(); compact != nil {
@@ -330,12 +347,16 @@ func (r reporter) terminate(result termination) {
 	case "NeedsHuman":
 		status = courierlog.StatusNeedsHuman
 	}
-	r.event(courierlog.EventRunExit, status, map[string]any{
+	detail := map[string]any{
 		"exit_code": result.ExitCode,
 		"phase":     result.Phase,
 		"reason":    result.Reason,
 		"category":  result.Category,
-	})
+	}
+	if r.handoffCoverage != "" {
+		detail["criteria.coverage"] = r.handoffCoverage
+	}
+	r.event(courierlog.EventRunExit, status, detail)
 }
 
 // Bounds for the failure-evidence capture family (#198). They are variables,
@@ -1117,14 +1138,14 @@ func run(ctx context.Context, stdout, stderr io.Writer) int {
 			// mechanism the undeclared-Verifying path uses. The declared
 			// path therefore participates in the same continuation/repair
 			// loop as the undeclared path — without losing the declared
-			// outcome tag, which applyLinkagePlan preserves on the
+			// outcome tag, which applyHandoffPlan preserves on the
 			// terminating terminal. This keeps the legacy executor from
 			// forcing NeedsHuman on a declared run whose captured
 			// session still has unused continuation budget.
 			if result.Phase == "Verifying" {
 				head, headErr := workspace.Head(ctx)
 				_ = headErr
-				verdict := report.applyLinkagePlan(ctx, continuations, cfg.MaxContinuations, tap.sessionID, ctx.Err())
+				verdict := report.applyHandoffPlan(ctx, continuations, cfg.MaxContinuations, tap.sessionID, ctx.Err())
 				if verdict.ContinueMsg != "" {
 					continuations++
 					stateMessage = verdict.ContinueMsg
@@ -1143,6 +1164,9 @@ func run(ctx context.Context, stdout, stderr io.Writer) int {
 				if verdict.FailReason != "" {
 					report.terminateCaptured(ctx, workspace, startCommit, termination{Phase: "NeedsHuman", Result: "needs-human", ExitCode: exitNeedsHuman, Reason: verdict.FailReason, Outcome: result.Outcome, Category: terminalCategoryVerifierRejection})
 					return exitNeedsHuman
+				}
+				if verdict.Pass && verdict.Coverage != "" {
+					report.handoffCoverage = verdict.Coverage
 				}
 			}
 			report.terminateCaptured(ctx, workspace, startCommit, result)
@@ -1165,18 +1189,19 @@ func run(ctx context.Context, stdout, stderr io.Writer) int {
 				// Committed work on the run branch is a candidate for
 				// the Verifying handoff, but the legacy executor must
 				// still observe the forge before claiming success: the
-				// shared applyLinkagePlan check (#248 linkage, #247
-				// presence/draft) is the single mechanism for both the
-				// declared and undeclared Verifying paths. A verified
-				// open, non-draft PR with a valid body passes; a
-				// missing PR, a draft PR, an invalid body, or an
-				// unverifiable forge read retries inside the captured
-				// session's bounded continuation budget; a confirmed
-				// ambiguous, closed-only, foreign-head, wrong-base, or
-				// not-currently-published head, an
-				// exhausted budget, or a session that cannot be
-				// resumed escalates to NeedsHuman.
-				verdict := report.applyLinkagePlan(ctx, continuations, cfg.MaxContinuations, tap.sessionID, ctx.Err())
+				// shared applyHandoffPlan check (#248 linkage, #247
+				// presence/draft, #249 criteria) is the single mechanism
+				// for both the declared and undeclared Verifying paths.
+				// A verified open, non-draft PR with a valid body
+				// passes; a missing PR, a draft PR, an invalid body, an
+				// invalid criterion-evidence block, or an unverifiable
+				// forge read retries inside the captured session's
+				// bounded continuation budget; a confirmed ambiguous,
+				// closed-only, foreign-head, wrong-base, or not-
+				// currently-published head, an exhausted budget, or a
+				// session that cannot be resumed escalates to
+				// NeedsHuman.
+				verdict := report.applyHandoffPlan(ctx, continuations, cfg.MaxContinuations, tap.sessionID, ctx.Err())
 				if verdict.ContinueMsg != "" {
 					continuations++
 					stateMessage = verdict.ContinueMsg
@@ -1195,6 +1220,9 @@ func run(ctx context.Context, stdout, stderr io.Writer) int {
 				if verdict.FailReason != "" {
 					report.terminateCaptured(ctx, workspace, startCommit, termination{Phase: "NeedsHuman", Result: "needs-human", ExitCode: exitNeedsHuman, Reason: verdict.FailReason, Category: terminalCategoryVerifierRejection})
 					return exitNeedsHuman
+				}
+				if verdict.Pass && verdict.Coverage != "" {
+					report.handoffCoverage = verdict.Coverage
 				}
 				report.terminateCaptured(ctx, workspace, startCommit, termination{Phase: "Verifying", Result: "success", ExitCode: exitSuccess, Reason: "opencode completed with committed work"})
 				return exitSuccess
@@ -1755,12 +1783,17 @@ type runBranchPRObservation struct {
 	draft *prLinkageObservation
 }
 
-// linkageCheckOutcome is the result of the authoritative-linkage check
-// run against the live PRs for the run branch. It is consumed by the
-// legacy executor's run loop to decide between Verifying, a finite
-// continuation to create or ready the PR or repair its body, and a
-// fail-closed NeedsHuman.
-type linkageCheckOutcome struct {
+// handoffCheckOutcome is the result of the shared pre-handoff check that
+// the legacy executor runs against the live PRs for the run branch. It
+// carries the identity-checked forge observation (the #247 fields) plus
+// the body-contract checks that share the plan — authoritative linkage
+// (#248) and, when a criterion set is pinned (#280), the criterion-
+// evidence contract (#249). It is consumed by the run loop to decide
+// between Verifying, a finite continuation to create or ready the PR or
+// repair its body, and a fail-closed NeedsHuman. Every field here is
+// fail-closed at the boundary: the model can neither skip the check nor
+// argue against its verdict.
+type handoffCheckOutcome struct {
 	// pr records the live PR observed for the run branch. nil
 	// when no PR was found.
 	pr *prLinkageObservation
@@ -1768,8 +1801,8 @@ type linkageCheckOutcome struct {
 	// or nil when the body satisfies the contract.
 	err *broker.LinkageError
 	// missing reports that the confirmed-published branch has no pull
-	// request at all: a bounded continuation asks the session to open
-	// one (#247).
+	// request at all: a bounded continuation asks the session to
+	// open one (#247).
 	missing bool
 	// draft reports that the branch's only open PR is a draft: a
 	// bounded continuation asks the session to ready it (#247).
@@ -1793,9 +1826,22 @@ type linkageCheckOutcome struct {
 	// missing claim (#247).
 	foreignHead bool
 	// wrongBase reports an open PR on the verified head that targets a
-	// base other than the pinned base: fail-closed, never adopted or
+	// base other than the run's pinned base: fail-closed, never adopted or
 	// re-targeted (#247).
 	wrongBase bool
+	// criteria is the criterion-evidence report when the criteria check
+	// ran against the open PR's body and the pinned set was non-empty.
+	// nil when no set was pinned, when the set was empty (vacuous pass),
+	// or when the observation is anything other than prStateOpen — the
+	// body contract only applies where there is a body to check.
+	criteria *broker.CriteriaReport
+	// criteriaErr is the structured rejection from the criterion validator
+	// when criteria is nil because the body failed the contract; nil
+	// otherwise.
+	criteriaErr *broker.CriteriaError
+	// coverage mirrors the criteria report's claim ("full" or "partial")
+	// when the check ran; empty when the check did not.
+	coverage string
 }
 
 // remotePublicationState is the git-side proof that the run's current commit
@@ -1908,30 +1954,37 @@ func (r reporter) confirmRemotePublication(ctx context.Context) (remotePublicati
 	}, nil
 }
 
-// checkPRLinkage is the legacy executor's pre-handoff forge observation:
-// it classifies the pull requests whose head carries the run branch and,
-// for the single open PR, validates its body against the trusted
-// source-issue identity (#248). The read goes through the configured forge
-// capability — an identity-checked head listing that compares full base and
-// head repository identity, keeps foreign head claims visible, and includes
+// checkHandoff is the legacy executor's pre-handoff forge observation:
+// it classifies the pull requests whose head carries the run branch
+// (#247) and, for the single open PR, runs the body's two shared
+// contracts — authoritative source-issue linkage (#248) and, when an
+// acceptance-criterion set is pinned at admission (#280), the criterion-
+// evidence block contract (#249). Both checks go through the same body
+// the forge read; the criterion contract is gated on linkage already
+// passing because a head without an open PR cannot have its body
+// checked. The forge read goes through the configured forge capability
+// — an identity-checked head listing that compares full base and head
+// repository identity, keeps foreign head claims visible, and includes
 // every state — never through a forge-specific CLI, so the legacy path
 // enforces the same contract as the native broker and never relies on a
 // model-supplied PR number.
 //
 // The function returns (nil, nil) when a single open, non-draft PR on the
 // pinned base carries the verified head, the remote advertises the run's
-// current commit, and the body satisfies linkage — the run loop may
-// proceed. A non-nil outcome carries one of: a confirmed missing PR on a
-// confirmed-published head (a continuation to open one, #247), a draft PR
-// (a continuation to ready it, #247), or a fail-closed world the executor
-// must not paper over with a retry or a creation — a head whose current
-// commits the remote does not advertise (absent or stale ref), an ambiguous
-// set of open PRs, only closed/merged PRs, a foreign record claiming the
-// head selector from another repository, or an open PR whose actual base
-// differs from the pinned base (#247). A failed live observation is
-// returned as an error, never as a confirmed missing PR: an unreadable
-// forge is not evidence of absence (#247).
-func (r reporter) checkPRLinkage(ctx context.Context) (*linkageCheckOutcome, error) {
+// current commit, and the body satisfies every applicable contract —
+// the run loop may proceed. A non-nil outcome carries one of: a
+// confirmed missing PR on a confirmed-published head (a continuation to
+// open one, #247), a draft PR (a continuation to ready it, #247), a
+// linkage repair, a criterion-evidence repair when a set was pinned and
+// the body's evidence block disagrees with it, or a fail-closed world
+// the executor must not paper over with a retry or a creation — a head
+// whose current commits the remote does not advertise (absent or stale
+// ref), an ambiguous set of open PRs, only closed/merged PRs, a foreign
+// record claiming the head selector from another repository, or an open
+// PR whose actual base differs from the pinned base (#247). A failed
+// live observation is returned as an error, never as a confirmed
+// missing PR: an unreadable forge is not evidence of absence (#247).
+func (r reporter) checkHandoff(ctx context.Context) (*handoffCheckOutcome, error) {
 	source, ok := trustedSourceIssue(r.cfg)
 	if !ok {
 		// fix-pr runs use the broker's existing identity check;
@@ -1954,33 +2007,40 @@ func (r reporter) checkPRLinkage(ctx context.Context) (*linkageCheckOutcome, err
 			return nil, err
 		}
 		if !publication.published {
-			return &linkageCheckOutcome{unpublished: true, publication: publication}, nil
+			return &handoffCheckOutcome{unpublished: true, publication: publication}, nil
 		}
 		if linkErr := broker.ValidateLinkage(observation.open.Body, source); linkErr != nil {
 			var le *broker.LinkageError
 			if errors.As(linkErr, &le) {
-				return &linkageCheckOutcome{pr: observation.open, err: le}, nil
+				return &handoffCheckOutcome{pr: observation.open, err: le}, nil
 			}
 			return nil, linkErr
 		}
-		return nil, nil
+		criteriaOutcome, critErr := r.checkCriterionEvidence(ctx, observation.open)
+		if critErr != nil {
+			return nil, critErr
+		}
+		if criteriaOutcome == nil {
+			return nil, nil
+		}
+		return criteriaOutcome, nil
 	case prStateDraft:
 		publication, err := r.confirmRemotePublication(ctx)
 		if err != nil {
 			return nil, err
 		}
 		if !publication.published {
-			return &linkageCheckOutcome{unpublished: true, publication: publication}, nil
+			return &handoffCheckOutcome{unpublished: true, publication: publication}, nil
 		}
-		return &linkageCheckOutcome{draft: true, pr: observation.draft}, nil
+		return &handoffCheckOutcome{draft: true, pr: observation.draft}, nil
 	case prStateAmbiguous:
-		return &linkageCheckOutcome{ambiguous: true}, nil
+		return &handoffCheckOutcome{ambiguous: true}, nil
 	case prStateClosedOnly:
-		return &linkageCheckOutcome{closedOnly: true}, nil
+		return &handoffCheckOutcome{closedOnly: true}, nil
 	case prStateForeignHead:
-		return &linkageCheckOutcome{foreignHead: true}, nil
+		return &handoffCheckOutcome{foreignHead: true}, nil
 	case prStateWrongBase:
-		return &linkageCheckOutcome{wrongBase: true}, nil
+		return &handoffCheckOutcome{wrongBase: true}, nil
 	case prStateMissing:
 		publication, err := r.confirmRemotePublication(ctx)
 		if err != nil {
@@ -1990,12 +2050,87 @@ func (r reporter) checkPRLinkage(ctx context.Context) (*linkageCheckOutcome, err
 			return nil, fmt.Errorf("confirm remote publication of run branch %s: %w", r.cfg.Branch, err)
 		}
 		if !publication.published {
-			return &linkageCheckOutcome{unpublished: true, publication: publication}, nil
+			return &handoffCheckOutcome{unpublished: true, publication: publication}, nil
 		}
-		return &linkageCheckOutcome{missing: true}, nil
+		return &handoffCheckOutcome{missing: true}, nil
 	}
 	// Unreachable: every observation kind is handled above.
 	return nil, fmt.Errorf("unclassified pull-request observation state for run branch %s", r.cfg.Branch)
+}
+
+// checkCriterionEvidence decodes the pinned criterion envelope from the
+// run's COURIER_CRITERIA environment and validates the live PR body's
+// evidence block against it (#249, #280). It is the second body contract
+// the legacy executor applies to the open PR's body after authoritative
+// linkage (#248): a head whose linkage already failed cannot pass a
+// body check, but a head whose linkage passed but whose evidence block
+// does not satisfy the pinned set still must be repaired before
+// handoff. The envelope is operator-authored from the persisted
+// publication policy at admission; the validator's comparison target is
+// never model-controlled.
+//
+// Behavior:
+//   - No envelope: vacuous pass; nothing to check, return nil.
+//   - Empty pinned set (an issue without an acceptance section, or a
+//     set with zero criteria): vacuous pass; linkage is the only PR-body
+//     contract for that run. Return nil so the planner carries forward
+//     as if no set were pinned.
+//   - Decode failure of the envelope into a broker.CriterionSet: an
+//     operator-side forge-read style failure. The same fail-closed
+//     ordering the linkage check uses applies: return as an error so the
+//     caller fails closed exactly like a linkage read failure; the
+//     applyHandoffPlan helper emits EventLinkageReadFailed with
+//     kind:"criteria" so an operator can tell which pre-handoff read
+//     failed.
+//   - Body validation error: a *broker.CriteriaError is recorded on the
+//     outcome (criteriaErr) and a partial success still returns the
+//     outcome so the planner can repair; any non-CriteriaError is
+//     returned as a plain error.
+//   - On success, populate outcome.criteria with the report and
+//     outcome.coverage with its claimed coverage.
+//
+// checkCriterionEvidence is only called inside the prStateOpen branch of
+// checkHandoff (#249): no PR — or a draft, ambiguous, closed-only,
+// foreign, wrong-base, or unpublished head — has a body that the
+// validator can compare against the pinned set.
+// criteriaEnvelopeDecodeErr is the typed sentinel the criterion-envelope
+// decoder returns when the operator-authored COURIER_CRITERIA envelope is
+// not a valid CriterionSet (#280, #282). The pre-handoff plan emits the
+// shared EventLinkageReadFailed event with kind:"criteria" for this
+// class, distinct from the linkage observation read failure, so an
+// operator can tell which pre-handoff read failed without parsing the
+// error text.
+var criteriaEnvelopeDecodeErr = errors.New("decode COURIER_CRITERIA envelope")
+
+func (r reporter) checkCriterionEvidence(ctx context.Context, observation *prLinkageObservation) (*handoffCheckOutcome, error) {
+	_ = ctx
+	if strings.TrimSpace(r.cfg.Criteria) == "" {
+		return nil, nil
+	}
+	var set broker.CriterionSet
+	if err := json.Unmarshal([]byte(r.cfg.Criteria), &set); err != nil {
+		return nil, fmt.Errorf("%w: %v", criteriaEnvelopeDecodeErr, err)
+	}
+	if set.IsEmpty() {
+		return nil, nil
+	}
+	report, err := broker.ValidateCriterionEvidence(observation.Body, set)
+	if err != nil {
+		var ce *broker.CriteriaError
+		if errors.As(err, &ce) {
+			coverage := ""
+			if report != nil {
+				coverage = report.Coverage
+			}
+			return &handoffCheckOutcome{pr: observation, criteriaErr: ce, coverage: coverage}, nil
+		}
+		return nil, err
+	}
+	coverage := ""
+	if report != nil {
+		coverage = report.Coverage
+	}
+	return &handoffCheckOutcome{pr: observation, criteria: report, coverage: coverage}, nil
 }
 
 // sourceIssue returns the trusted source-issue identity for the run, or
@@ -2021,7 +2156,7 @@ func sourceIssueTarget(source broker.SourceIssue) string {
 // hundred bytes so it stays under the legacy executor's continuation
 // message budget. The continuation number is named so a model can see
 // the remaining budget.
-func linkageRepairMessage(source broker.SourceIssue, outcome *linkageCheckOutcome, continuation int) string {
+func linkageRepairMessage(source broker.SourceIssue, outcome *handoffCheckOutcome, continuation int) string {
 	target := sourceIssueTarget(source)
 	bare := fmt.Sprintf("#%d", source.Number)
 	cross := target
@@ -2031,6 +2166,56 @@ func linkageRepairMessage(source broker.SourceIssue, outcome *linkageCheckOutcom
 			"Then re-declare the same outcome. (continuation %d)",
 		outcome.pr.Number, target, bare, cross, continuation,
 	)
+}
+
+// criteriaRepairMessage composes the precise OpenCode continuation
+// message for a criterion-evidence violation (#282). It names the
+// offending PR number, the trusted source issue, the pinned set digest
+// so a model can verify what it must satisfy, and the continuation
+// budget. The vocabulary is composed verbatim from the broker error's
+// reason (which describeCriteriaFailure built) so any change to the
+// validator's vocabulary surfaces in both paths. The required shape
+// rules echo the documented header and per-status rules from criteria.go
+// so the model can repair the body without re-deriving the contract.
+func criteriaRepairMessage(source broker.SourceIssue, outcome *handoffCheckOutcome, continuation int) string {
+	target := sourceIssueTarget(source)
+	reason := describeCriteriaFailureForRepair(outcome.criteriaErr)
+	var setDigest string
+	if outcome.criteriaErr != nil && outcome.criteria != nil {
+		setDigest = outcome.criteria.SetDigest
+	}
+	return fmt.Sprintf(
+		"Courier refused the handoff: PR #%d's body does not satisfy the criterion-evidence contract pinned at admission for %s (pinned set %s): %s. "+
+			"Update the PR body through the forge capability so it carries the criterion-evidence block: a single line starting with %q followed by %q, then one %q row per pinned criterion, each carrying a closed status from the vocabulary implementation-evidence, regression-check, manual-verification, not-implemented, or unknown, with regression-check and implementation-evidence referencing a file path or check URL and manual-verification and not-implemented referencing a note. "+
+			"Then re-declare the same outcome. (continuation %d)",
+		outcome.pr.Number, target,
+		nonEmptyOr(setDigest, "the admitted set"),
+		reason,
+		"courier-criteria:v1 source="+strings.ToLower(source.Canonical())+"#"+strconv.Itoa(source.Number),
+		"set=sha256:<64hex> coverage=full|partial",
+		"- AC-<n> sha256:<64hex>: <status> - <reference>",
+		continuation,
+	)
+}
+
+// describeCriteriaFailureForRepair returns the precise broker-defined
+// reason the validator recorded on the outcome, or a stable fallback
+// when the error is nil so the model can repair without re-deriving.
+func describeCriteriaFailureForRepair(cerr *broker.CriteriaError) string {
+	if cerr == nil {
+		return "criterion evidence block did not satisfy the pinned set"
+	}
+	if cerr.Reason == "" {
+		return "criterion evidence block did not satisfy the pinned set"
+	}
+	return cerr.Reason
+}
+
+func nonEmptyOr(value, fallback string) string {
+	if strings.TrimSpace(value) == "" {
+		return fallback
+	}
+	return value
 }
 
 // prMissingMessage composes the #247 continuation message for a
@@ -2095,7 +2280,7 @@ func (r reporter) prUnverifiedMessage(source broker.SourceIssue, observationErr 
 // repaired the PR body. The reason names the trusted source identity
 // and the model's attempted references so the operator can settle
 // the run without re-reading the issue.
-func (r reporter) linkageExhaustedReason(outcome *linkageCheckOutcome) string {
+func (r reporter) linkageExhaustedReason(outcome *handoffCheckOutcome) string {
 	source := r.sourceIssue()
 	target := sourceIssueTarget(source)
 	if outcome.missing {
@@ -2109,6 +2294,21 @@ func (r reporter) linkageExhaustedReason(outcome *linkageCheckOutcome) string {
 		return fmt.Sprintf("the published pull request body did not satisfy the trusted source-issue linkage to %s after the bounded repair budget (model wrote: %s): %s", target, observed, outcome.err.Error())
 	}
 	return fmt.Sprintf("the published pull request body did not satisfy the trusted source-issue linkage to %s; the run needs a human", target)
+}
+
+// criteriaExhaustedReason composes the human-readable NeedsHuman reason
+// for a run whose continuation budget ran out before the model repaired
+// the criterion-evidence block (#282). The reason names the trusted
+// source identity so the operator can settle the run without re-reading
+// the issue, and the broker-defined reason the validator produced — or a
+// stable fallback when the validator's structured error is missing.
+// Always surfaces the trusted source issue via sourceIssueTarget(r.sourceIssue()).
+func (r reporter) criteriaExhaustedReason(outcome *handoffCheckOutcome) string {
+	target := sourceIssueTarget(r.sourceIssue())
+	if outcome != nil && outcome.criteriaErr != nil && strings.TrimSpace(outcome.criteriaErr.Reason) != "" {
+		return "incomplete handoff: criterion evidence " + outcome.criteriaErr.Reason + " (trusted source issue " + target + ")"
+	}
+	return "incomplete handoff: criterion evidence block did not satisfy the pinned set (trusted source issue " + target + ")"
 }
 
 // linkageForgeFailureReason composes the human-readable NeedsHuman reason
@@ -2194,36 +2394,49 @@ func (r reporter) closedOnlyPRReason() string {
 	return fmt.Sprintf("the run branch %q on %s has only closed or merged pull requests and no open one; the executor refuses adoption, reopening, or duplicate creation; the run needs a human", r.cfg.Branch, r.cfg.Repo)
 }
 
-// linkageVerdict is the legacy executor's pre-handoff forge-observation
+// handoffVerdict is the legacy executor's pre-handoff forge-observation
 // decision for a Verifying candidate. Pass and FailReason are mutually
 // exclusive with ContinueMsg: the run loop interprets exactly one signal
 // at a time. Pass means the observation verified an open, non-draft PR
-// on the confirmed head with a body that satisfies linkage, and the run
-// may hand off as Verifying. ContinueMsg names the bounded instruction
-// the next continuation should feed the captured session — open the
-// missing PR, ready the draft PR, repair a disagreeing body, or re-verify
-// after an unreadable forge read; Kind names that instruction for the
-// continuation event audit. PRNumber names the PR observed during the
-// check, when exactly one was observed. FailReason names the precise
-// NeedsHuman reason when the bounded budget is exhausted, there is no
-// captured session to resume, or the observation is fail-closed
-// (ambiguous, closed-only, foreign head, wrong base, or a head whose
-// current commits the remote does not advertise) (#247, #248).
-type linkageVerdict struct {
+// on the confirmed head with a body that satisfies linkage (and the
+// criterion-evidence contract when a set is pinned), and the run may
+// hand off as Verifying. ContinueMsg names the bounded instruction the
+// next continuation should feed the captured session — open the missing
+// PR, ready the draft PR, repair a disagreeing body or criterion block,
+// or re-verify after an unreadable forge read; Kind names that
+// instruction for the continuation event audit. PRNumber names the PR
+// observed during the check, when exactly one was observed. Coverage
+// mirrors the criterion-evidence block's claimed coverage when the
+// criteria check ran (empty otherwise); it is event-detail only and
+// never flows into the Verifying Reason line. FailReason names the
+// precise NeedsHuman reason when the bounded budget is exhausted, there
+// is no captured session to resume, or the observation is fail-closed
+// (ambiguous, closed-only, foreign head, wrong base, a head whose
+// current commits the remote does not advertise, or a body whose
+// criterion-evidence block cannot be repaired) (#247, #248, #249).
+type handoffVerdict struct {
 	Pass        bool
 	ContinueMsg string
 	Kind        string
 	PRNumber    int
-	FailReason  string
+	// Coverage is set when the criteria check ran against the open PR's
+	// body and the pinned set was non-empty; it mirrors the validator's
+	// claimed coverage ("full" or "partial"). Empty when no set was
+	// pinned, when the set was empty (vacuous pass), or when the
+	// observation was anything other than prStateOpen.
+	Coverage string
+	FailReason string
 }
 
-// applyLinkagePlan runs the identity-checked pre-handoff forge
+// applyHandoffPlan runs the identity-checked pre-handoff forge
 // observation and returns the verdict the run loop should follow. It is
 // shared by the declared (post-classify) and the undeclared-Verifying
-// paths so both routes share one bounded mechanism (#248, #247):
+// paths so both routes share one bounded mechanism (#248, #247, #249):
 //   - A single open, non-draft PR on the verified head passes when its
-//     body satisfies the trusted source-issue linkage (#248) and fails
-//     to a bounded body-repair continuation when it does not.
+//     body satisfies the trusted source-issue linkage (#248) and, when
+//     a criterion set is pinned at admission, the criterion-evidence
+//     block contract (#249, #280). It fails to a bounded body-repair
+//     continuation when either body contract fails.
 //   - A confirmed missing PR on a confirmed-published head asks the
 //     captured session to open the intended PR (#247); a confirmed
 //     draft PR asks it to ready that exact PR (#247). Both consume the
@@ -2238,18 +2451,38 @@ type linkageVerdict struct {
 //   - A failed live observation is never represented as a confirmed
 //     missing PR: it retries inside the bounded budget with a factual
 //     "could not verify" message, and fails closed to NeedsHuman when
-//     no retry is possible (#247, #248).
+//     no retry is possible (#247, #248). A forged-side decode failure
+//     of COURIER_CRITERIA is the same fail-closed ordering: the
+//     linkage.read.failed event surfaces with kind:"criteria" so an
+//     operator can distinguish the two forge-read failures; the
+//     captured session retries inside the bounded budget and the run
+//     fails closed when no retry is possible.
 //
 // The call site signals the budget consumed so far through continuations
 // (so the helper consumes one slot when it asks for a continue); ctxErr
 // is the run context's current error (non-nil when the run is shutting
 // down) and sessionID gates the resume path.
-func (r reporter) applyLinkagePlan(ctx context.Context, continuations int, maxContinuations int, sessionID string, ctxErr error) linkageVerdict {
-	linkOutcome, linkErr := r.checkPRLinkage(ctx)
+func (r reporter) applyHandoffPlan(ctx context.Context, continuations int, maxContinuations int, sessionID string, ctxErr error) handoffVerdict {
+	linkOutcome, linkErr := r.checkHandoff(ctx)
 	if linkErr != nil {
-		r.eventVerbose(courierlog.EventLinkageReadFailed, courierlog.StatusError, map[string]any{"error": linkErr.Error()})
+		// One event, two origins: the EventLinkageReadFailed constant
+		// serves both the linkage forge-read failure (PR listing or
+		// remote publication confirmation) and the criterion envelope
+		// decode failure (#282). The "kind" detail field is the
+		// discriminator — "linkage" for the identity-checked PR
+		// observation and "criteria" for the COURIER_CRITERIA envelope
+		// decode — so an operator can tell which pre-handoff read
+		// failed without parsing the body.
+		kind := "linkage"
+		if errors.Is(linkErr, criteriaEnvelopeDecodeErr) {
+			kind = "criteria"
+		}
+		r.eventVerbose(courierlog.EventLinkageReadFailed, courierlog.StatusError, map[string]any{
+			"kind":  kind,
+			"error": linkErr.Error(),
+		})
 		if continuations >= maxContinuations || sessionID == "" || ctxErr != nil {
-			return linkageVerdict{FailReason: r.linkageForgeFailureReason(linkErr)}
+			return handoffVerdict{FailReason: r.linkageForgeFailureReason(linkErr)}
 		}
 		// The verifier could not read the forge state at all. That is
 		// not a confirmed missing PR (#247), so the retry message says
@@ -2257,42 +2490,74 @@ func (r reporter) applyLinkagePlan(ctx context.Context, continuations int, maxCo
 		// absence; the captured session re-verifies and repairs inside
 		// the bounded budget.
 		next := continuations + 1
-		return linkageVerdict{Kind: "pr-unverified", ContinueMsg: r.prUnverifiedMessage(r.sourceIssue(), linkErr, next)}
+		return handoffVerdict{Kind: "pr-unverified", ContinueMsg: r.prUnverifiedMessage(r.sourceIssue(), linkErr, next)}
 	}
 	if linkOutcome == nil {
-		return linkageVerdict{Pass: true}
+		return handoffVerdict{Pass: true}
 	}
 	// Fail-closed worlds first: none of these is a condition the model
 	// may resolve by retrying or creating (#247).
 	switch {
 	case linkOutcome.ambiguous:
-		return linkageVerdict{FailReason: r.prAmbiguousReason()}
+		return handoffVerdict{FailReason: r.prAmbiguousReason()}
 	case linkOutcome.closedOnly:
-		return linkageVerdict{FailReason: r.closedOnlyPRReason()}
+		return handoffVerdict{FailReason: r.closedOnlyPRReason()}
 	case linkOutcome.foreignHead:
-		return linkageVerdict{FailReason: r.foreignHeadPRReason()}
+		return handoffVerdict{FailReason: r.foreignHeadPRReason()}
 	case linkOutcome.wrongBase:
-		return linkageVerdict{FailReason: r.wrongBasePRReason()}
+		return handoffVerdict{FailReason: r.wrongBasePRReason()}
 	case linkOutcome.unpublished:
-		return linkageVerdict{FailReason: r.unpublishedBranchReason(linkOutcome.publication)}
+		return handoffVerdict{FailReason: r.unpublishedBranchReason(linkOutcome.publication)}
 	}
 	resumable := sessionID != "" && ctxErr == nil && continuations < maxContinuations
 	switch {
 	case linkOutcome.draft:
 		if !resumable {
-			return linkageVerdict{PRNumber: linkOutcome.pr.Number, FailReason: r.draftUnresolvedReason(linkOutcome.pr.Number, sessionID, ctxErr)}
+			return handoffVerdict{PRNumber: linkOutcome.pr.Number, FailReason: r.draftUnresolvedReason(linkOutcome.pr.Number, sessionID, ctxErr)}
 		}
-		return linkageVerdict{Kind: "pr-draft", PRNumber: linkOutcome.pr.Number, ContinueMsg: r.prDraftMessage(r.sourceIssue(), linkOutcome.pr.Number, continuations+1)}
+		return handoffVerdict{Kind: "pr-draft", PRNumber: linkOutcome.pr.Number, ContinueMsg: r.prDraftMessage(r.sourceIssue(), linkOutcome.pr.Number, continuations+1)}
 	case linkOutcome.missing:
 		if !resumable {
-			return linkageVerdict{FailReason: r.linkageExhaustedReason(linkOutcome)}
+			return handoffVerdict{FailReason: r.linkageExhaustedReason(linkOutcome)}
 		}
-		return linkageVerdict{Kind: "pr-missing", ContinueMsg: r.prMissingMessage(r.sourceIssue(), continuations+1)}
-	default:
+		return handoffVerdict{Kind: "pr-missing", ContinueMsg: r.prMissingMessage(r.sourceIssue(), continuations+1)}
+	}
+	// A prStateOpen outcome: the PR is open, the remote is published,
+	// and either linkage has a structured rejection (the body contract
+	// repair, #248) or the criterion-evidence contract does (#249,
+	// #282). The two repairs share the same bounded budget and the
+	// same "linkage structurally prior" rule — a body linkage failure
+	// already fails before criteria is even reached, because a body
+	// that does not link the PR to the trusted issue carries no
+	// contract for criteria to evaluate against.
+	if linkOutcome.err != nil {
 		if !resumable {
-			return linkageVerdict{PRNumber: linkOutcome.pr.Number, FailReason: r.linkageExhaustedReason(linkOutcome)}
+			return handoffVerdict{PRNumber: linkOutcome.pr.Number, FailReason: r.linkageExhaustedReason(linkOutcome)}
 		}
-		return linkageVerdict{Kind: "linkage-repair", ContinueMsg: linkageRepairMessage(r.sourceIssue(), linkOutcome, continuations+1), PRNumber: linkOutcome.pr.Number}
+		return handoffVerdict{Kind: "linkage-repair", ContinueMsg: linkageRepairMessage(r.sourceIssue(), linkOutcome, continuations+1), PRNumber: linkOutcome.pr.Number}
+	}
+	if linkOutcome.criteriaErr != nil {
+		if !resumable {
+			return handoffVerdict{
+				PRNumber:   linkOutcome.pr.Number,
+				FailReason: r.criteriaExhaustedReason(linkOutcome),
+			}
+		}
+		return handoffVerdict{
+			Kind:        "criteria-repair",
+			PRNumber:    linkOutcome.pr.Number,
+			ContinueMsg: criteriaRepairMessage(r.sourceIssue(), linkOutcome, continuations+1),
+		}
+	}
+	// Linkage passed; either the criteria check also passed (carrying
+	// the report and its coverage claim), or no criteria set was pinned
+	// and the body contract was vacuous. In either case the run may
+	// hand off as Verifying — the coverage claim rides the event detail
+	// for the operator audit but never the Reason line.
+	return handoffVerdict{
+		Pass:     true,
+		PRNumber: linkOutcome.pr.Number,
+		Coverage: linkOutcome.coverage,
 	}
 }
 
