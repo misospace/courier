@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 
 	dto "github.com/prometheus/client_model/go"
@@ -87,7 +88,10 @@ func ValidateMetricsURL(raw string) (*url.URL, error) {
 
 // RedactedURL renders raw safe for diagnostics: the entire userinfo
 // component is removed, not just the password — a username can itself be a
-// bearer token. Host and path are kept for debugging.
+// bearer token — and the query and fragment are dropped, since query- and
+// fragment-authenticated endpoints put credentials there (?token=…).
+// Scheme, host, and path are kept for debugging. The scrape itself still
+// receives the configured URL unredacted.
 func RedactedURL(raw string) string {
 	parsed, err := url.Parse(strings.TrimSpace(raw))
 	if err != nil {
@@ -99,13 +103,49 @@ func RedactedURL(raw string) string {
 func redacted(parsed *url.URL) string {
 	sanitized := *parsed
 	sanitized.User = nil
+	sanitized.RawQuery = ""
+	sanitized.ForceQuery = false
+	sanitized.Fragment = ""
 	return sanitized.String()
+}
+
+// queryFragmentRenderings lists every spelling of the URL's query and
+// fragment that can appear in an error message: the raw forms, the escaped
+// fragment renderings net/url actually emits, and the %q-escaped forms
+// url.Error produces. URLs with neither query nor fragment yield an empty
+// slice.
+func queryFragmentRenderings(parsed *url.URL) []string {
+	var forms []string
+	if parsed.RawQuery != "" {
+		forms = append(forms, "?"+parsed.RawQuery)
+	}
+	for _, fragment := range []string{parsed.EscapedFragment(), parsed.Fragment, parsed.RawFragment} {
+		if fragment != "" {
+			forms = append(forms, "#"+fragment)
+		}
+	}
+	var renderings []string
+	for _, form := range forms {
+		renderings = append(renderings, form)
+		if escaped := strconv.Quote(form); len(escaped) > 2 {
+			renderings = append(renderings, escaped[1:len(escaped)-1])
+		}
+	}
+	return renderings
 }
 
 func redactError(parsed *url.URL, err error) string {
 	message := strings.ReplaceAll(err.Error(), parsed.String(), redacted(parsed))
 	// The URL can survive inside the error in other renderings: verbatim,
 	// with net/http's own password masking (user:***@), or as bare userinfo.
+	// Those replacements leave the rest of the URL intact, so the query and
+	// fragment are scrubbed separately. Each must match every spelling the
+	// message can carry: net/url stores Fragment decoded but renders it
+	// %-escaped, and url.Error formats URLs through %q, which escapes quotes
+	// and backslashes. Credentials there must not leak through any rendering.
+	for _, rendering := range queryFragmentRenderings(parsed) {
+		message = strings.ReplaceAll(message, rendering, "")
+	}
 	if parsed.User != nil {
 		message = strings.ReplaceAll(message, parsed.User.String()+"@", "")
 		message = strings.ReplaceAll(message, parsed.User.Username()+":***@", "")
