@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"time"
@@ -38,7 +39,7 @@ func observerMode(ctx context.Context, seed bool) error {
 		defer cancel()
 		baseline, err := legacyobserver.Seed(operation, options.RemoteURL, options.BaseBranch, options.Branch, filepath.Join(private, "seed-repo"), options.Username, options.Token)
 		if err != nil {
-			return errors.New("observer: could not pin initial remote head")
+			return fmt.Errorf("observer: could not pin initial remote head: %w", err)
 		}
 		if err = os.WriteFile(baselineFile, []byte(baseline), 0600); err != nil {
 			return err
