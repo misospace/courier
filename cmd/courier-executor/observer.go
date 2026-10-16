@@ -21,10 +21,9 @@ import (
 func observerMode(ctx context.Context, seed bool) error {
 	private := filepath.Join(executor.ObserverStatePath, "private")
 	if seed {
+		// MkdirAll already applies 0700 to the new leaf; an explicit chmod
+		// hits EPERM on some volume layouts and adds nothing.
 		if err := os.MkdirAll(private, 0700); err != nil {
-			return err
-		}
-		if err := os.Chmod(private, 0700); err != nil {
 			return err
 		}
 	}
