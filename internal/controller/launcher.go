@@ -165,9 +165,14 @@ func (l *CoordinatorLauncher) Launch(ctx context.Context, run *courierv1alpha1.C
 	}
 	// The run-scoped identity must be on the pod before it is created;
 	// setting it afterwards would not persist, and the observer would run
-	// as the namespace default SA with no access to its own pod.
+	// as the namespace default SA with no access to its own pod. The API
+	// server resolves the SA at create time, so the SA itself must exist
+	// first; the Role/RoleBinding still wait for slot verification.
 	if pod.Annotations[executor.ObserverContractAnnotation] == executor.ObserverContractVersion {
 		pod.Spec.ServiceAccountName = legacyObserverResourceName(run.Name)
+		if err := l.ensureObserverServiceAccount(ctx, run); err != nil {
+			return err
+		}
 	}
 	err = l.Client.Create(ctx, pod)
 	if err == nil {
@@ -238,20 +243,20 @@ func (l *CoordinatorLauncher) ensureLegacyObserverResources(ctx context.Context,
 	owner := []metav1.OwnerReference{{APIVersion: courierv1alpha1.GroupVersion.String(), Kind: "CoderRun", Name: run.Name, UID: run.UID, Controller: boolPtr(true), BlockOwnerDeletion: boolPtr(true)}}
 	// The SA must exist before the pod does: the API server resolves the
 	// pod's service account at create time and rejects the pod otherwise.
-	if err := l.ensureObserverObject(ctx, run.UID, &corev1.ServiceAccount{ObjectMeta: metav1.ObjectMeta{Namespace: run.Namespace, Name: name, OwnerReferences: owner}, AutomountServiceAccountToken: boolPtr(false)}); err != nil {
+	if err := l.ensureObserverServiceAccount(ctx, run); err != nil {
 		return err
-	}
-	if pod.Spec.ServiceAccountName == name {
-		// The pod is not persisted yet (fresh launch); the Role and
-		// RoleBinding are provisioned only once the coordinator slot is
-		// verified live.
-		return nil
 	}
 	role := &rbacv1.Role{ObjectMeta: metav1.ObjectMeta{Namespace: run.Namespace, Name: name, OwnerReferences: owner}, Rules: []rbacv1.PolicyRule{{APIGroups: []string{""}, Resources: []string{"pods"}, ResourceNames: []string{pod.Name}, Verbs: []string{"get"}}}}
 	if err := l.ensureObserverObject(ctx, run.UID, role); err != nil {
 		return err
 	}
 	return l.ensureObserverObject(ctx, run.UID, &rbacv1.RoleBinding{ObjectMeta: metav1.ObjectMeta{Namespace: run.Namespace, Name: name, OwnerReferences: owner}, RoleRef: rbacv1.RoleRef{APIGroup: rbacv1.GroupName, Kind: "Role", Name: name}, Subjects: []rbacv1.Subject{{Kind: rbacv1.ServiceAccountKind, Name: name, Namespace: run.Namespace}}})
+}
+
+func (l *CoordinatorLauncher) ensureObserverServiceAccount(ctx context.Context, run *courierv1alpha1.CoderRun) error {
+	name := legacyObserverResourceName(run.Name)
+	owner := []metav1.OwnerReference{{APIVersion: courierv1alpha1.GroupVersion.String(), Kind: "CoderRun", Name: run.Name, UID: run.UID, Controller: boolPtr(true), BlockOwnerDeletion: boolPtr(true)}}
+	return l.ensureObserverObject(ctx, run.UID, &corev1.ServiceAccount{ObjectMeta: metav1.ObjectMeta{Namespace: run.Namespace, Name: name, OwnerReferences: owner}, AutomountServiceAccountToken: boolPtr(false)})
 }
 
 func (l *CoordinatorLauncher) ensureObserverObject(ctx context.Context, runUID types.UID, desired client.Object) error {
