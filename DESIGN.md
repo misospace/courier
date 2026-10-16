@@ -1950,6 +1950,31 @@ named items remain unresolved and must not be described as production-ready:
   matching successful audit evidence bound to the original token and settlement
   key; absent best-effort audit evidence remains an explicit conservative hold.
 
+- **2026-10-15 — #312: the coordinator and toolchain images build git from a
+  pinned GitHub release tarball, not the stock bookworm package, and positively
+  enforce the documented `>= 2.41` minimum.** Bookworm ships git 2.39; the
+  harness artifact validation documented in README Prerequisites requires
+  git >= 2.41 (upstream made bundle verification a connectivity check in 2.41,
+  so older git fails on `refs/courier/*` refs invisible in the quarantine
+  store). Without the bump, the published `coordinator-go` image reproduces
+  the same misleading `internal/harness` failures a Debian 12 contributor
+  hits. Debian `bookworm-backports` does not carry git (only `bookworm` and
+  `bookworm-security` ship git binaries for the bookworm suite, both at
+  2.39.5; verified via `dak ls` for `git` on amd64), so the lane builds git
+  v2.47.3 from a pinned GitHub release tarball, verifies the SHA-256, and
+  installs to `/usr/local` so `/usr/local/bin/git` shadows the stock
+  `/usr/bin/git` (PATH puts `/usr/local/bin` first). The base image
+  digest stays pinned at `node:24-bookworm-slim`; build dependencies
+  (`build-essential`, `libssl-dev`, `libcurl4-openssl-dev`, `zlib1g-dev`,
+  `libexpat1-dev`, `wget`) are installed only for the compile step and purged
+  afterward so they don't ship in the runtime image. The build asserts the
+  installed git version with a numeric comparison, and
+  `hack/verify-courier-go-runtime.sh` repeats the same gate inside the
+  `coordinator-go` image so a future image change that lowers the bundled
+  git fails the verifier instead of producing misleading internal/harness
+  failures. A contributor host or a custom lane image must still verify its
+  own git version. (#312)
+
 - **2026-10-14 — #217: a coordinator slot collision resolves to a successful
   launch only against a pod verified live and owned by the run's UID; every
   other shape keeps the run Claimed.** The legacy launcher treated
