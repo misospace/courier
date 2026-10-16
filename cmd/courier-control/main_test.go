@@ -12,8 +12,10 @@ import (
 	"time"
 	"unicode/utf8"
 
+	courierv1alpha1 "github.com/misospace/courier/api/v1alpha1"
 	"github.com/misospace/courier/internal/executor"
 	"github.com/misospace/courier/internal/harness"
+	courierlog "github.com/misospace/courier/internal/log"
 	"github.com/misospace/courier/internal/protocol"
 	"github.com/misospace/courier/internal/topology"
 )
@@ -370,6 +372,70 @@ func TestProbeWorkerSurvivesRepeatedProbes(t *testing.T) {
 		capability := identity.probeWorker(context.Background())
 		if capability.State != harness.StateHealthy {
 			t.Fatalf("probe attempt %d = %+v, want healthy (a fixed opID conflicts on the second probe)", attempt, capability)
+		}
+	}
+}
+
+// TestCompactionSinkEmitsSessionCompacted pins #297's telemetry contract: the
+// harness's applied-compaction event reaches the run's structured log as one
+// session.compacted line carrying the role, the bound model, and the
+// before/after/net/digested counts.
+//
+// It also pins two things the contract is specific about. The counts are
+// verbose-only in the emitter, so the event marks itself Verbose or they
+// never reach the store at info level. And the event sets no Status:
+// compaction is observability, and a line carrying a status would let it be
+// read as a liveness or completion claim about the run.
+func TestCompactionSinkEmitsSessionCompacted(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	sink := compactionSink{
+		emitter: courierlog.NewEmitter(&stdout, courierlog.LevelInfo),
+		stderr:  &stderr,
+		invocation: executor.Invocation{
+			RunName: "run-1",
+			Repo:    "owner/name",
+			Ref:     7,
+			Mode:    courierv1alpha1.ModeResolveIssue,
+		},
+	}
+	sink.SessionCompacted(harness.CompactEvent{
+		Role:           "coder",
+		Model:          "test/coder",
+		Before:         1200,
+		After:          480,
+		NetSaved:       720,
+		DigestedTokens: 900,
+	})
+	if stderr.Len() != 0 {
+		t.Fatalf("stderr = %q, want a clean emission", stderr.String())
+	}
+	lines := strings.Split(strings.TrimSpace(stdout.String()), "\n")
+	if len(lines) != 1 {
+		t.Fatalf("emitted %d lines, want exactly one: %q", len(lines), stdout.String())
+	}
+	var event map[string]any
+	if err := json.Unmarshal([]byte(lines[0]), &event); err != nil {
+		t.Fatalf("emitted line is not JSON: %v: %q", err, lines[0])
+	}
+	if event["event"] != courierlog.EventSessionCompacted {
+		t.Fatalf("event = %v, want %q", event["event"], courierlog.EventSessionCompacted)
+	}
+	if event["run_id"] != "run-1" || event["repo"] != "owner/name" {
+		t.Fatalf("run identity = %v/%v, want the invocation's", event["run_id"], event["repo"])
+	}
+	if event["role"] != "coder" || event["model"] != "test/coder" {
+		t.Fatalf("role/model = %v/%v, want coder/test-coder", event["role"], event["model"])
+	}
+	if _, ok := event["status"]; ok {
+		t.Fatalf("session.compacted carries status %v; compaction is observability, never status", event["status"])
+	}
+	detail, ok := event["detail"].(map[string]any)
+	if !ok {
+		t.Fatalf("detail = %v, want the verbose counts at info level", event["detail"])
+	}
+	for key, want := range map[string]float64{"before": 1200, "after": 480, "reclaimed": 720, "digested": 900} {
+		if detail[key] != want {
+			t.Fatalf("detail[%q] = %v, want %v", key, detail[key], want)
 		}
 	}
 }

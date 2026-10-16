@@ -54,6 +54,11 @@ type Coordinator struct {
 	briefs    *BriefRegistry
 	status    *StatusReporter
 	control   *ControlWatcher
+	// budgets is the context policy resolved per role at startup; a role
+	// with no entry has no policy and never compacts.
+	budgets map[string]ContextBudget
+	// compactions receives applied-compaction telemetry.
+	compactions CompactionSink
 	// workRefBeyondAnchor is the soft-stop world probe: the broker's live
 	// observation of whether the pinned work ref holds a tip beyond the
 	// admission anchor. The soft-stop finish derives the outcome from that
@@ -114,6 +119,19 @@ type CoordinatorConfig struct {
 	// anchor. The soft-stop finish derives the run's outcome from it.
 	WorkRefBeyondAnchor     func(context.Context) (bool, error)
 	CapacityWorkspaceSafety func(context.Context) (executor.WorkspaceSafetyEvidence, error)
+	// ContextBudgets is the per-role context policy input (#243), keyed by
+	// role. It is resolved once here — the session loop never derives a
+	// budget — and a role named with an input that does not resolve fails
+	// startup closed rather than running on an invented context window. A
+	// role absent from the map gets the zero budget: the harness owns no
+	// policy for it and never compacts it. #295/#296 populate this map from
+	// the lane profile and the gateway-verified model input limit; nothing
+	// does yet, so no production session carries a budget.
+	ContextBudgets map[string]ContextBudgetInput
+	// Compactions optionally receives one telemetry event per applied
+	// step-boundary compaction (#243). Emission is best-effort and
+	// observability only: it never changes a transcript or a run outcome.
+	Compactions CompactionSink
 }
 
 // NewCoordinator fails closed on an unusable model configuration: without a
@@ -125,6 +143,18 @@ func NewCoordinator(config CoordinatorConfig) (*Coordinator, error) {
 	if config.Bindings.Model(RoleCoordinator) == "" {
 		return nil, errors.New("harness: no model is bound to the coordinator role")
 	}
+	// The context policy is resolved here, once, at the only point that can
+	// still fail closed: a role the deployment declared a budget for and
+	// could not resolve is a configuration failure, not a session that
+	// compacts by accident or not at all.
+	budgets := make(map[string]ContextBudget, len(config.ContextBudgets))
+	for role, input := range config.ContextBudgets {
+		budget, err := ResolveContextBudget(input)
+		if err != nil {
+			return nil, fmt.Errorf("harness: context budget: %w", err)
+		}
+		budgets[role] = budget
+	}
 	return &Coordinator{
 		gateway:                 config.Gateway,
 		bindings:                config.Bindings,
@@ -133,6 +163,8 @@ func NewCoordinator(config CoordinatorConfig) (*Coordinator, error) {
 		snapshot:                config.Snapshot,
 		publisher:               config.Publisher,
 		activity:                config.Activity,
+		budgets:                 budgets,
+		compactions:             config.Compactions,
 		briefs:                  NewBriefRegistry(),
 		status:                  config.Status,
 		control:                 config.Control,
@@ -169,13 +201,13 @@ const subagentFraming = `You are a bounded delegate running inside Courier's con
 // as undeclared, or hits an infrastructure error. It implements the trusted
 // side of HARNESS.md §5: planning, delegation, and the terminal declaration.
 func (c *Coordinator) Run(ctx context.Context, inv executor.Invocation) executor.HarnessResult {
-	session, err := NewSession(c.gateway, c.bindings, RoleCoordinator, c.activity)
+	session, err := c.newSession(RoleCoordinator)
 	if err != nil {
 		return executor.HarnessResult{Err: err}
 	}
-	session.Append(Message{Role: "system", Content: strings.TrimSpace(inv.Goal) + "\n\n" + harnessFraming})
+	session.Pin(Message{Role: "system", Content: strings.TrimSpace(inv.Goal) + "\n\n" + harnessFraming})
 	if strings.TrimSpace(inv.Framing) != "" {
-		session.Append(Message{Role: "system", Content: inv.Framing})
+		session.Pin(Message{Role: "system", Content: inv.Framing})
 	}
 
 	clarifications := 0
@@ -188,6 +220,9 @@ func (c *Coordinator) Run(ctx context.Context, inv executor.Invocation) executor
 			session.Append(note)
 		}
 		turn := c.pump(ctx, session, "", c.coordinatorTools())
+		if turn.harnessErr != nil {
+			return executor.HarnessResult{Err: fmt.Errorf("harness: step-boundary compaction: %w", turn.harnessErr)}
+		}
 		if turn.streamErr != nil {
 			if result, ok := availabilityEnding(turn.streamErr); ok {
 				if result.Outcome == executor.OutcomeCapacityExhausted {
@@ -270,13 +305,35 @@ type turnResult struct {
 	toolResults []Event
 	// streamErr reports a failed model stream.
 	streamErr error
+	// harnessErr reports a trusted-control failure that is not the model's:
+	// today a step-boundary compaction whose protected state cannot fit
+	// (#243). The transcript is unchanged, so the run ends as an
+	// infrastructure failure rather than continuing on truncated state.
+	harnessErr error
+}
+
+// newSession opens one role-bound session carrying that role's resolved
+// context policy and the compaction telemetry sink. A role with no resolved
+// budget gets a session that owns no policy and never compacts.
+func (c *Coordinator) newSession(role string) (*Session, error) {
+	return NewSession(c.gateway, c.bindings, role, c.activity,
+		WithContextBudget(c.budgets[role]),
+		WithCompactionSink(c.compactions),
+	)
 }
 
 // pump drives one model turn through the normalized event contract: the
 // provider stream is consumed as events, requested tools execute through
 // their trusted implementations, and every verified tool completion is
 // emitted as a KindToolResult event into the transcript.
+//
+// The step-boundary compaction decision (#243) runs first, between turns and
+// never mid-turn: a compaction decided after a request is sent would be
+// reacting to a context the provider has already accepted.
 func (c *Coordinator) pump(ctx context.Context, session *Session, briefID string, tools []ToolDef) turnResult {
+	if _, _, err := session.Compact(); err != nil {
+		return turnResult{harnessErr: err}
+	}
 	events := session.Turn(ctx, tools)
 	var text strings.Builder
 	var calls []ToolCall
@@ -845,13 +902,23 @@ func (c *Coordinator) packAndIntegrate(ctx context.Context, brief Brief, dispatc
 // that as ordinary brief failure invites further delegations onto the
 // exhausted binding.
 func (c *Coordinator) runBrief(ctx context.Context, brief Brief) (summary string, completed bool, unavailable error) {
-	session, err := NewSession(c.gateway, c.bindings, brief.Role, c.activity)
+	session, err := c.newSession(brief.Role)
 	if err != nil {
 		return safeToolError(err), false, nil
 	}
-	session.Append(Message{Role: "system", Content: briefText(brief) + "\n\n" + subagentFraming})
+	session.Pin(Message{Role: "system", Content: briefText(brief) + "\n\n" + subagentFraming})
+	// The brief's settled state is re-injected verbatim into every digest:
+	// a delegate that loses its decisions mid-brief must not re-derive them.
+	session.Settle(settledStateBlock(brief))
 	for {
 		turn := c.pump(ctx, session, brief.ID, c.subagentTools())
+		if turn.harnessErr != nil {
+			// Compaction could not fit the protected tail (#243). The
+			// transcript is unchanged, so this is a brief failure like any
+			// other — tool-visible, bounded, never a silent truncation —
+			// and the coordinator re-delegates under a fresh brief ID.
+			return "sub-agent context could not be compacted: " + safeToolError(turn.harnessErr), false, nil
+		}
 		if turn.streamErr != nil {
 			if classification, ok := providerClassificationOf(turn.streamErr); ok && classification.Deferred() {
 				return "", false, turn.streamErr
@@ -874,14 +941,8 @@ func (c *Coordinator) runBrief(ctx context.Context, brief Brief) (summary string
 func briefText(brief Brief) string {
 	var b strings.Builder
 	fmt.Fprintf(&b, "Brief %s\nRole: %s\nObjective: %s\nSuccess check: %s", brief.ID, brief.Role, brief.Objective, brief.SuccessCheck)
-	if len(brief.Decisions) > 0 {
-		b.WriteString("\nSettled decisions (apply exactly, do not re-derive):")
-		for _, d := range brief.Decisions {
-			fmt.Fprintf(&b, "\n- %s: %s", d.Summary, d.Value)
-		}
-	}
-	if len(brief.OwnedFiles) > 0 {
-		b.WriteString("\nOwned files: " + strings.Join(brief.OwnedFiles, ", "))
+	if block := settledStateBlock(brief); block != "" {
+		b.WriteString(block)
 	}
 	if len(brief.NonGoals) > 0 {
 		b.WriteString("\nNon-goals: " + strings.Join(brief.NonGoals, "; "))

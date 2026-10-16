@@ -1168,7 +1168,12 @@ post-condition held. The executor (and any caller of repeated compactions)
 must use `BudgetAfter`, not the original budget, for the next decision.
 
 **Digest, not prune; preserve settled state.** Compaction replaces the oldest
-non-protected turns with a single model-produced digest. It never discards the
+non-protected turns with a single harness-composed digest — a bounded index of
+what was compacted plus the settled-state block, not a second model call: the
+digest's cost has to be known before it is sent, and an extra turn to produce
+it would itself be context the policy is trying to bound. The digest lands
+whole at the start of the span it replaces, never between an assistant's tool
+requests and the results answering them. It never discards the
 brief's pinned objective, the settled `Decision`s, the `OwnedFiles`, or the
 most recent turn: those are protected, re-injected verbatim into the digest.
 The durable record remains the §7 checkpoint ladder — `plan` plus ordered
@@ -1190,8 +1195,13 @@ event, never status, and never lets a model assert liveness or completion.
 Implementation is three bounded, file-scoped tickets — #295 (CRD per-role
 budget schema + bootstrap mirror), #296 (gateway model-capability probe +
 effective-limit resolution + capability gate), #297 (step-boundary compaction
-enforcement + `session.compacted` emitter) — and until they land the policy
-exists as the tested pure seam in `internal/harness/budget.go`.
+enforcement + `session.compacted` emitter). #297 has landed: the session loop
+calls the policy between turns and never mid-turn, per-role budgets are
+resolved once in `NewCoordinator` from an injected `ContextBudgets` map, a
+digest that cannot fit fails the run rather than truncating, and
+`courier-control` emits `session.compacted`. A role with no resolved budget
+still owns no policy and never compacts, so until #295 and #296 supply
+declared and verified limits no production session carries a budget.
 
 ## 6. Long-tool liveness contract (#119)
 
