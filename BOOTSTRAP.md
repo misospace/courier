@@ -18,9 +18,21 @@ The image selected with `--executor-image` must contain:
 
 - `/usr/local/bin/courier-executor` built from `./cmd/courier-executor`;
 - `git`;
-- the `opencode` binary; and
+- the `opencode` binary;
+- process-tree utilities `ps`, `pgrep`, and `pkill` (the OpenCode runtime's
+  subprocess preflight refuses tree-owning launches when they are missing,
+  so a runtime image without them fails launches outright); and
 - any OpenCode configuration needed to reach the models named by a
   `LaneProfile`.
+
+Tool availability is part of this contract; extra runtime privileges are
+not. The image runs unprivileged (uid/gid 65532) and the utilities must
+work without added capabilities or namespace grants. When required tooling
+is missing, the runtime preflight fails the launch promptly and explicitly
+rather than degrading silently. Availability and ordinary process-tree
+termination are verified against the built image by
+`TestCoordinatorImageProcessTreeTools` (`internal/executor`), which CI runs
+in the coordinator image job.
 
 The published bootstrap image is
 `ghcr.io/misospace/courier-opencode:0.1.0`; replace `0.1.0` with the Courier

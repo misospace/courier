@@ -65,6 +65,7 @@ RUN set -eux; \
 	apt-get update && \
 	apt-get install -y --no-install-recommends \
 		ca-certificates \
+		procps \
 		wget \
 		build-essential \
 		libssl-dev \
