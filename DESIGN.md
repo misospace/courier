@@ -1576,10 +1576,32 @@ held. Evidence absence and a run UID are not proof. No automatic dirty-work
 transfer is claimed. Source-specific receipts are sensitive opaque metadata,
 never model inputs or capacity identities.
 
-Issue #327's executor-side OpenCode detection is not yet sufficient to enable
-legacy automatic recovery: a trusted operator-observer seam for its workspace
-snapshot is unresolved. Keep the feature gated and #327 open until that seam is
-implemented and the documented deployment smoke succeeds.
+Legacy recovery uses a separate workspace-observer container and UID in the
+existing coordinator pod. A trusted init container pins the initial remote head
+before OpenCode starts. Only the observer mounts its private baseline, Kubernetes
+read token, and termination output; the writer mounts none of these. The observer
+uses a run-scoped service account with `get` permission for its own pod only. It
+waits for kubelet's coordinator-container `Terminated` state before reading the
+workspace read-only. Process-group cancellation is not itself release proof.
+
+The observer never runs Git in the writer's repository. It fetches the
+operator-pinned remote URL and exact branch into private storage, disregarding
+workspace Git configuration, hooks, index, replacement refs, and alternates. It
+compares every workspace file (including ignored/untracked files, excluding only
+the root `.git` directory) against the trusted remote tree, including modes and
+symlink targets. Unsupported/submodule trees, unreadable paths, local-only heads,
+and ambiguity fail closed. An absent work branch can be `empty` only when the
+workspace matches the independently pinned baseline; existing branches require
+an exact freshly fetched `pushed` head.
+
+The operator re-reads the pod uncached, verifies the run owner UID, pod UID,
+writer container ID, isolated observer specification, protected init baseline,
+and observer termination result before persisting safety evidence. Model-written
+executor termination text remains a claim only. The existing source recovery
+path still waits for the entire pod to terminate and applies its unchanged
+source fencing, capacity cooldown, retained-history, and successor rules. Native
+workspace observation remains unchanged. Keep #327 open until both legacy
+handoff paths and the isolated deployment smoke have recorded passing evidence.
 
 PR-fix reports carry the stable settlement idempotency key and must return a
 matching deferred resolution. Dispatch issue handoff currently lacks a durable

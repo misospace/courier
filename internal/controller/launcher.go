@@ -6,11 +6,15 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"reflect"
 	"strings"
 
 	corev1 "k8s.io/api/core/v1"
+	rbacv1 "k8s.io/api/rbac/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	courierv1alpha1 "github.com/misospace/courier/api/v1alpha1"
@@ -149,9 +153,19 @@ func (l *CoordinatorLauncher) Launch(ctx context.Context, run *courierv1alpha1.C
 	if err != nil {
 		return err
 	}
+	// The isolated legacy observer's run-scoped identity is provisioned only
+	// once the coordinator slot is verified live: a collision that must stay
+	// Claimed never creates side resources, and an adopted pod re-verifies
+	// its existing ones idempotently.
+	provisionObserver := func() error {
+		if pod.Annotations[executor.ObserverContractAnnotation] != executor.ObserverContractVersion {
+			return nil
+		}
+		return l.ensureLegacyObserverResources(ctx, run, pod)
+	}
 	err = l.Client.Create(ctx, pod)
 	if err == nil {
-		return nil
+		return provisionObserver()
 	}
 	if !apierrors.IsAlreadyExists(err) {
 		return err
@@ -195,6 +209,9 @@ func (l *CoordinatorLauncher) Launch(ctx context.Context, run *courierv1alpha1.C
 	case !podOwnedByRunUID(&existing, run.UID):
 		return ErrProvisioningInFlight
 	}
+	if err := provisionObserver(); err != nil {
+		return err
+	}
 	return nil
 }
 
@@ -208,6 +225,69 @@ func (l *CoordinatorLauncher) collisionReader() client.Reader {
 		return l.APIReader
 	}
 	return l.Client
+}
+
+func (l *CoordinatorLauncher) ensureLegacyObserverResources(ctx context.Context, run *courierv1alpha1.CoderRun, pod *corev1.Pod) error {
+	name := legacyObserverResourceName(run.Name)
+	owner := []metav1.OwnerReference{{APIVersion: courierv1alpha1.GroupVersion.String(), Kind: "CoderRun", Name: run.Name, UID: run.UID, Controller: boolPtr(true), BlockOwnerDeletion: boolPtr(true)}}
+	objects := []client.Object{
+		&corev1.ServiceAccount{ObjectMeta: metav1.ObjectMeta{Namespace: run.Namespace, Name: name, OwnerReferences: owner}, AutomountServiceAccountToken: boolPtr(false)},
+		&rbacv1.Role{ObjectMeta: metav1.ObjectMeta{Namespace: run.Namespace, Name: name, OwnerReferences: owner}, Rules: []rbacv1.PolicyRule{{APIGroups: []string{""}, Resources: []string{"pods"}, ResourceNames: []string{pod.Name}, Verbs: []string{"get"}}}},
+		&rbacv1.RoleBinding{ObjectMeta: metav1.ObjectMeta{Namespace: run.Namespace, Name: name, OwnerReferences: owner}, RoleRef: rbacv1.RoleRef{APIGroup: rbacv1.GroupName, Kind: "Role", Name: name}, Subjects: []rbacv1.Subject{{Kind: rbacv1.ServiceAccountKind, Name: name, Namespace: run.Namespace}}},
+	}
+	for _, desired := range objects {
+		if err := l.Client.Create(ctx, desired); err != nil {
+			if !apierrors.IsAlreadyExists(err) {
+				return err
+			}
+			if err := l.verifyObserverResource(ctx, desired, run.UID); err != nil {
+				return err
+			}
+		}
+	}
+	pod.Spec.ServiceAccountName = name
+	return nil
+}
+
+func (l *CoordinatorLauncher) verifyObserverResource(ctx context.Context, desired client.Object, runUID types.UID) error {
+	key := client.ObjectKeyFromObject(desired)
+	actual := desired.DeepCopyObject().(client.Object)
+	if err := l.Client.Get(ctx, key, actual); err != nil {
+		return err
+	}
+	if !resourceOwnedByUID(actual, runUID) {
+		return fmt.Errorf("legacy observer resource %s is not owned by run UID %q", key.Name, runUID)
+	}
+	switch want := desired.(type) {
+	case *corev1.ServiceAccount:
+		got := actual.(*corev1.ServiceAccount)
+		if !reflect.DeepEqual(want.AutomountServiceAccountToken, got.AutomountServiceAccountToken) {
+			return fmt.Errorf("legacy observer service account %s has unexpected spec", key.Name)
+		}
+	case *rbacv1.Role:
+		if !reflect.DeepEqual(want.Rules, actual.(*rbacv1.Role).Rules) {
+			return fmt.Errorf("legacy observer role %s has unexpected rules", key.Name)
+		}
+	case *rbacv1.RoleBinding:
+		got := actual.(*rbacv1.RoleBinding)
+		if !reflect.DeepEqual(want.RoleRef, got.RoleRef) || !reflect.DeepEqual(want.Subjects, got.Subjects) {
+			return fmt.Errorf("legacy observer role binding %s has unexpected spec", key.Name)
+		}
+	}
+	return nil
+}
+
+func resourceOwnedByUID(obj metav1.Object, uid types.UID) bool {
+	for _, ref := range obj.GetOwnerReferences() {
+		if ref.UID == uid && ref.Kind == "CoderRun" && ref.Controller != nil && *ref.Controller {
+			return true
+		}
+	}
+	return false
+}
+
+func legacyObserverResourceName(runName string) string {
+	return "courier-observer-" + executor.RunLabelValue(runName)
 }
 
 // criteriaEnvelope renders the trusted COURIER_CRITERIA envelope for one run

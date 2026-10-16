@@ -132,6 +132,15 @@ type termination struct {
 }
 
 func main() {
+	if len(os.Args) == 2 && (os.Args[1] == "observe-seed" || os.Args[1] == "observe-workspace") {
+		ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM)
+		defer stop()
+		if err := observerMode(ctx, os.Args[1] == "observe-seed"); err != nil {
+			fmt.Fprintln(os.Stderr, "courier: workspace observation failed")
+			os.Exit(1)
+		}
+		return
+	}
 	if os.Getenv("COURIER_ASKPASS") == "1" {
 		os.Exit(askpass(os.Args[1:], os.Getenv("COURIER_GIT_USERNAME"), os.Getenv("COURIER_GIT_TOKEN"), os.Stdout))
 	}

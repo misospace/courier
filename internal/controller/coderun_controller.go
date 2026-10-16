@@ -808,9 +808,30 @@ func (r *CoderRunReconciler) observeRunning(ctx context.Context, run *courierv1a
 		// A no_change_needed fix-pr run no longer terminalizes directly: it
 		// is routed to Verifying, which settles it against the world.
 		intent := terminalLifecycleIntent{}
-		if message, valid := parseCoordinatorTermination(pod); valid &&
-			terminationOutcome == string(executor.OutcomeCapacityExhausted) && r.Secure != nil {
-			run.Status.WorkspaceSafety = boundedWorkspaceSafety(message.WorkspaceSafety)
+		if terminationOutcome == string(executor.OutcomeCapacityExhausted) {
+			evidenceBefore := run.DeepCopy()
+			if r.Secure != nil {
+				if message, valid := parseCoordinatorTermination(pod); valid {
+					run.Status.WorkspaceSafety = boundedWorkspaceSafety(message.WorkspaceSafety)
+				}
+			} else {
+				safety, pending, err := r.legacyWorkspaceObservation(ctx, run, pod)
+				if err != nil {
+					return ctrl.Result{}, err
+				}
+				if pending {
+					return ctrl.Result{RequeueAfter: observationRequeueDelay}, nil
+				}
+				run.Status.WorkspaceSafety = safety
+				if safety != nil {
+					intent.conditions = append(intent.conditions, legacyObservationCondition(run, metav1.NewTime(r.clock())))
+				}
+			}
+			if !reflect.DeepEqual(evidenceBefore.Status.WorkspaceSafety, run.Status.WorkspaceSafety) {
+				if err := r.patchStatus(ctx, evidenceBefore, run); err != nil {
+					return ctrl.Result{}, err
+				}
+			}
 		}
 		if phase == courierv1alpha1.PhaseBlockedExternal {
 			intent.error = terminationReason
