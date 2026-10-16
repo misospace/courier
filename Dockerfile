@@ -70,15 +70,17 @@ RUN set -eux; \
 		build-essential \
 		libssl-dev \
 		libcurl4-openssl-dev \
-		zlib1g-dev \
-		libexpat1-dev && \
+		libcurl4 \
+		libexpat1-dev \
+		libexpat1 \
+		zlib1g-dev && \
 	wget -qO /tmp/git.tar.gz https://github.com/git/git/archive/refs/tags/v2.47.3.tar.gz && \
 	echo 'f61ffa245b9a353a8d32b1c6c22d92ccf9a888419edb850260ceb4ce1b2b3cae  /tmp/git.tar.gz' | sha256sum -c - && \
 	mkdir -p /tmp/git-src && \
 	tar -xzf /tmp/git.tar.gz -C /tmp/git-src --strip-components=1 && \
 	rm /tmp/git.tar.gz && \
-	make -j"$(nproc)" -C /tmp/git-src prefix=/usr/local NO_GETTEXT=YesPlease all && \
-	make -C /tmp/git-src prefix=/usr/local NO_GETTEXT=YesPlease install && \
+	make -j"$(nproc)" -C /tmp/git-src prefix=/usr/local NO_GETTEXT=YesPlease NO_TCLTK=YesPlease all && \
+	make -C /tmp/git-src prefix=/usr/local NO_GETTEXT=YesPlease NO_TCLTK=YesPlease install && \
 	rm -rf /tmp/git-src && \
 	apt-get purge -y --auto-remove \
 		build-essential \
