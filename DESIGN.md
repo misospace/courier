@@ -1521,6 +1521,33 @@ exhaustion history permits rediscovery with a fresh opaque source attempt ID;
 the successor name incorporates the settled predecessor UID, and the old run
 is retained for diagnostics. Source-issued ownership is reacquired before launch.
 
+The legacy OpenCode runtime is pinned in the image by `Dockerfile`'s
+`OPENCODE_VERSION` (currently 1.18.31). Its `run --format json` event stream
+is the only accepted exhaustion seam: `error.name=APIError` carries provider
+evidence in `error.data.statusCode` and `error.data.responseBody`. The response
+must confirm exhaustion using the shared classifier or carry a
+configured exhaustion code/type (with MiniMax code 2056 configured by that
+deployment); generic 429, ordinary process failures, assistant prose, and
+stderr do not prove exhaustion. On the recognized event the executor kills the OpenCode
+process group before observing git state and never resumes that turn. Git status
+includes tracked and untracked changes; an empty snapshot requires no commits
+since start and no local changes, while pushed work requires fetching the exact
+run branch and matching its remote tip to HEAD. Unverifiable state remains held.
+
+Before enabling this in a deployment, configure the verified provider token
+(for MiniMax 2056, `COURIER_MODEL_EXHAUSTION_CODES=2056`), build and publish
+the executor image with the pinned runtime, deploy to a non-production lane
+using the same `opencode`
+executor, and run both (1) an issue claim and (2) an existing PR-fix claim on
+the shared queue. Induce a confirmed MiniMax 2056 response while each run has
+an existing branch/PR; verify the exhaustion event is followed by process-group
+termination, `BlockedExternal` plus `CapacityRecovery=True/Settled`, no further
+model calls, retained predecessor history, and a fresh local-lane successor on
+the same issue branch or PR without a duplicate PR. Also verify generic 429,
+unknown provider errors, dirty unpushed work, and remote mismatch do not settle
+ownership. Capture run names, event excerpts, source state, and successor
+identity for both paths. Do not close #327 until this deployed smoke succeeds.
+
 Dispatch and Courier are independent systems connected by an adapter, not hard
 dependencies. Dispatch #1259 supplies dedicated fenced capacity handoff APIs;
 only the Dispatch adapter knows their HTTP routes, issued claim/handout receipts,
@@ -1530,15 +1557,22 @@ settlement validates the returned resolution rather than treating HTTP 200 as
 proof of release. Ordinary external waits and task failures keep their existing
 semantics; capacity exhaustion does not first park the queue as an external wait.
 
-The core requires trusted secure-executor workspace evidence before invoking
-`CapacityRecoveryPreparer` and `CapacityRecovery`. Legacy or missing evidence,
-dirty work, and unknown remote state hold ownership. The current native evidence
-producer proves only a clean, unchanged integration workspace safe; committed
-work is safe only when a fresh trusted broker snapshot confirms the existing
-work ref at exactly the integration HEAD; local-only commits remain held.
-Evidence absence and a run UID are not proof. No automatic dirty-work transfer
-is claimed. Source-specific receipts are sensitive opaque metadata, never model
-inputs or capacity identities.
+The core requires trusted, semantically validated workspace evidence before
+invoking `CapacityRecoveryPreparer` and `CapacityRecovery`. The native control
+runtime's workspace observer is the trusted producer; model-writable terminal
+text and legacy OpenCode termination labels are not trusted evidence. Missing
+evidence, dirty work, malformed claims, and unknown remote state hold ownership.
+The native producer proves only a clean, unchanged integration workspace safe;
+committed work is safe only when a fresh trusted broker snapshot confirms the
+existing work ref at exactly the integration HEAD; local-only commits remain
+held. Evidence absence and a run UID are not proof. No automatic dirty-work
+transfer is claimed. Source-specific receipts are sensitive opaque metadata,
+never model inputs or capacity identities.
+
+Issue #327's executor-side OpenCode detection is not yet sufficient to enable
+legacy automatic recovery: a trusted operator-observer seam for its workspace
+snapshot is unresolved. Keep the feature gated and #327 open until that seam is
+implemented and the documented deployment smoke succeeds.
 
 PR-fix reports carry the stable settlement idempotency key and must return a
 matching deferred resolution. Dispatch issue handoff currently lacks a durable

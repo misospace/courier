@@ -11,7 +11,7 @@ import (
 // partial line with no newline is captured only on Flush.
 func TestSessionTapCapturesSessionAcrossWritesAndFlush(t *testing.T) {
 	var out bytes.Buffer
-	tap := newSessionTap(&out)
+	tap := newSessionTap(&out, defaultExhaustionSignals())
 
 	first := `{"type":"text","sessionID":"ses_split1","part":{"type":"text","text":"hello"}}`
 	_, _ = tap.Write([]byte(first[:10]))
@@ -46,7 +46,7 @@ func TestSessionTapCapturesSessionAcrossWritesAndFlush(t *testing.T) {
 // parse.
 func TestSessionTapDropsOversizedUnterminatedLine(t *testing.T) {
 	var out bytes.Buffer
-	tap := newSessionTap(&out)
+	tap := newSessionTap(&out, defaultExhaustionSignals())
 
 	big := make([]byte, tapMaxLine+1)
 	for i := range big {
@@ -67,7 +67,7 @@ func TestSessionTapDropsOversizedUnterminatedLine(t *testing.T) {
 // and a JSON line does.
 func TestSessionTapIgnoresNonJSONLines(t *testing.T) {
 	var out bytes.Buffer
-	tap := newSessionTap(&out)
+	tap := newSessionTap(&out, defaultExhaustionSignals())
 	_, _ = tap.Write([]byte("plain text\n{broken json\n"))
 	if tap.sessionID != "" || tap.lastText != "" {
 		t.Fatalf("non-JSON lines captured state: sessionID=%q lastText=%q", tap.sessionID, tap.lastText)
@@ -82,7 +82,7 @@ func TestSessionTapIgnoresNonJSONLines(t *testing.T) {
 // kept, while lastText keeps updating.
 func TestSessionTapFirstSessionIDWins(t *testing.T) {
 	var out bytes.Buffer
-	tap := newSessionTap(&out)
+	tap := newSessionTap(&out, defaultExhaustionSignals())
 	_, _ = tap.Write(append([]byte(`{"type":"text","sessionID":"ses_first","part":{"type":"text","text":"one"}}`), '\n'))
 	_, _ = tap.Write(append([]byte(`{"type":"text","sessionID":"ses_second","part":{"type":"text","text":"two"}}`), '\n'))
 	if tap.sessionID != "ses_first" {
@@ -97,7 +97,7 @@ func TestSessionTapFirstSessionIDWins(t *testing.T) {
 // truncated at tapLastTextLimit runes, not bytes, for multibyte text.
 func TestSessionTapTruncatesMultibyteTextAtRuneLimit(t *testing.T) {
 	var out bytes.Buffer
-	tap := newSessionTap(&out)
+	tap := newSessionTap(&out, defaultExhaustionSignals())
 	text := strings.Repeat("é", tapLastTextLimit+50)
 	_, _ = tap.Write(append([]byte(`{"type":"text","sessionID":"ses_multibyte","part":{"type":"text","text":"`+text+`"}}`), '\n'))
 	if got := len([]rune(tap.lastText)); got != tapLastTextLimit {
@@ -112,7 +112,7 @@ func TestSessionTapTruncatesMultibyteTextAtRuneLimit(t *testing.T) {
 // update lastText.
 func TestSessionTapIgnoresNonTextParts(t *testing.T) {
 	var out bytes.Buffer
-	tap := newSessionTap(&out)
+	tap := newSessionTap(&out, defaultExhaustionSignals())
 	_, _ = tap.Write(append([]byte(`{"type":"step","sessionID":"ses_step1","part":{"type":"step","text":"not text"}}`), '\n'))
 	if tap.lastText != "" {
 		t.Fatalf("lastText = %q, want empty (non-text parts are ignored)", tap.lastText)

@@ -28,6 +28,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"syscall"
 	"time"
 	"unicode/utf8"
@@ -94,6 +95,11 @@ type config struct {
 	EvidenceURL      string
 	EvidenceToken    string
 	PodUID           string
+	// ExhaustionCodes/ExhaustionTypes are the deployment-extended provider
+	// exhaustion signals (#320 policy): structured tokens added to the
+	// provider-neutral defaults, never replacing them (#327).
+	ExhaustionCodes string
+	ExhaustionTypes string
 }
 
 // evidenceEnabled reports whether failure-evidence capture is armed for this
@@ -119,6 +125,10 @@ type termination struct {
 	// Summary is the compact per-run telemetry tallied from the OpenCode event
 	// stream (#172). Omitted when the run recorded no activity.
 	Summary *courierv1alpha1.RunTelemetry `json:"summary,omitempty"`
+	// WorkspaceSafety reports post-stop Git observations on capacity endings.
+	// Legacy observations are not authority: the controller keeps recovery held
+	// until an independent trusted observer can validate them.
+	WorkspaceSafety *courierv1alpha1.WorkspaceSafetyEvidence `json:"workspace_safety,omitempty"`
 }
 
 func main() {
@@ -179,6 +189,8 @@ func readConfig(getenv func(string) string) (config, error) {
 		EvidenceURL:      strings.TrimSpace(getenv(executor.EnvEvidenceURL)),
 		EvidenceToken:    strings.TrimSpace(getenv(executor.EnvEvidenceToken)),
 		PodUID:           strings.TrimSpace(getenv(executor.EnvPodUID)),
+		ExhaustionCodes:  getenv("COURIER_MODEL_EXHAUSTION_CODES"),
+		ExhaustionTypes:  getenv("COURIER_MODEL_EXHAUSTION_TYPES"),
 	}
 	if strings.TrimSpace(cfg.GitHubToken) == "" {
 		cfg.GitHubToken = cfg.GitToken
@@ -442,6 +454,21 @@ func revListCount(ctx context.Context, dir, span string) (int, error) {
 		return 0, err
 	}
 	return count, nil
+}
+
+// revParse resolves one rev to its full object name.
+func revParse(ctx context.Context, dir, rev string) (string, error) {
+	cmd := exec.CommandContext(ctx, "git", "-C", dir, "rev-parse", rev)
+	// Same WaitDelay bound as every spawned git call: a remote helper or
+	// askpass grandchild holding the pipe must not outlive the context.
+	cmd.WaitDelay = 2 * time.Second
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+	if err := cmd.Run(); err != nil {
+		return "", err
+	}
+	return strings.TrimSpace(stdout.String()), nil
 }
 
 // captureGate is the single place deciding whether a capture is warranted at
@@ -822,16 +849,36 @@ const tapLastTextLimit = 200
 // sessionID and the last assistant text part so a recoverable exit can
 // resume the same session; it never alters the bytes it forwards. lastText
 // intentionally persists across resumed turns when a new turn emits no text.
+// It also classifies structured provider-exhaustion evidence from OpenCode's
+// session error events (#327): only runtime-authored structured error
+// events can prove exhaustion, never model prose.
 type sessionTap struct {
 	w         io.Writer
 	pending   []byte
 	sessionID string
 	lastText  string
 	tel       *telemetry.Tracker
+	// seq counts every scanned line, so "the exhaustion error was the last
+	// thing the child emitted" is decidable at stop time.
+	seq int
+	// exhaustion holds the most recent error event that classified as
+	// confirmed provider exhaustion, with the sequence number it arrived
+	// at. A nil value means no event proved exhaustion.
+	exhaustion   *tapExhaustion
+	signals      exhaustionSignals
+	onExhaustion func()
 }
 
-func newSessionTap(w io.Writer) *sessionTap {
-	return &sessionTap{w: w}
+// tapExhaustion is one classified exhaustion event: the bounded class and
+// code tokens only — never provider response text.
+type tapExhaustion struct {
+	seq   int
+	class string
+	code  string
+}
+
+func newSessionTap(w io.Writer, signals exhaustionSignals) *sessionTap {
+	return &sessionTap{w: w, signals: signals}
 }
 
 func (t *sessionTap) Write(p []byte) (int, error) {
@@ -846,7 +893,12 @@ func (t *sessionTap) Write(p []byte) (int, error) {
 		t.pending = t.pending[idx+1:]
 	}
 	if len(t.pending) > tapMaxLine {
+		// The oversized unfinished line is dropped unseen, but it is still
+		// output the child produced after anything scanned before it: it
+		// must invalidate a prior exhaustion the same way a parsed line
+		// would (#327).
 		t.pending = nil
+		t.seq++
 	}
 	return n, err
 }
@@ -860,9 +912,12 @@ func (t *sessionTap) Flush() error {
 	return nil
 }
 
-// scan extracts the session id and assistant text from one JSON event line.
-// Lines that are not JSON events are ignored.
+// scan extracts the session id and assistant text from one JSON event line,
+// and classifies structured provider-exhaustion evidence from OpenCode's
+// session error events (#327). Lines that are not JSON events are ignored —
+// they still count as output, so they invalidate any earlier exhaustion.
 func (t *sessionTap) scan(line []byte) {
+	t.seq++
 	if t.tel != nil {
 		t.tel.Observe(line)
 	}
@@ -882,6 +937,29 @@ func (t *sessionTap) scan(line []byte) {
 	if event.Part != nil && event.Part.Type == "text" {
 		t.lastText = truncatedRunes(event.Part.Text, tapLastTextLimit)
 	}
+	if exhausted, class, code := classifyProviderExhaustion(line, t.signals); exhausted {
+		t.exhaustion = &tapExhaustion{seq: t.seq, class: class, code: code}
+		if t.onExhaustion != nil {
+			t.onExhaustion()
+		}
+	}
+}
+
+// confirmedExhaustion reports whether the classified event is the final line.
+// The stop path retains the first classification even when already-buffered
+// output drains after SIGKILL; those bytes cannot restart the stopped child.
+func (t *sessionTap) confirmedExhaustion() (class, code string, ok bool) {
+	if t.exhaustion == nil || t.exhaustion.seq != t.seq {
+		return "", "", false
+	}
+	return t.exhaustion.class, t.exhaustion.code, true
+}
+
+func (t *sessionTap) lastExhaustion() (class, code string, ok bool) {
+	if t.exhaustion == nil {
+		return "", "", false
+	}
+	return t.exhaustion.class, t.exhaustion.code, true
 }
 
 func truncatedRunes(value string, limit int) string {
@@ -985,8 +1063,16 @@ func run(ctx context.Context, stdout, stderr io.Writer) int {
 	// observes OpenCode's JSON events without changing their bytes.
 	stdoutRedacted := courierlog.NewRedactingWriter(stdout, report.red)
 	stderrTransport := courierlog.NewRedactingWriter(stderr, report.red)
-	tap := newSessionTap(stdoutRedacted)
+	tap := newSessionTap(stdoutRedacted, parseExhaustionSignals(cfg.ExhaustionCodes, cfg.ExhaustionTypes))
 	tap.tel = report.tel
+	var exhaustionSignal atomic.Bool
+	var cancelChild func()
+	tap.onExhaustion = func() {
+		exhaustionSignal.Store(true)
+		if cancelChild != nil {
+			cancelChild()
+		}
+	}
 
 	// Recoverable workspace endings and crashes share one continuation budget.
 	continuations, crashes := 0, 0
@@ -1037,8 +1123,13 @@ func run(ctx context.Context, stdout, stderr io.Writer) int {
 		// snapshots it (DESIGN.md, #115).
 		process.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 		process.Cancel = func() error {
+			if process.Process == nil {
+				return os.ErrProcessDone
+			}
 			return syscall.Kill(-process.Process.Pid, syscall.SIGKILL)
 		}
+		cancelChild = func() { _ = process.Cancel() }
+		defer func() { cancelChild = nil }()
 		// Bound the wait for the group after the context is done; the margin
 		// keeps the capture inside the 45-second termination grace.
 		process.WaitDelay = 10 * time.Second
@@ -1049,6 +1140,21 @@ func run(ctx context.Context, stdout, stderr io.Writer) int {
 		_ = tap.Flush()
 		_ = stdoutRedacted.Flush()
 		_ = stderrTransport.Flush()
+
+		if ctx.Err() == nil && exhaustionSignal.Load() {
+			// The callback fires on the structured error event itself, causing
+			// the command context to kill the whole process group. Ignore any
+			// later output from that killed turn; it cannot trigger a continuation.
+			class, code, exhausted := tap.confirmedExhaustion()
+			if !exhausted {
+				class, code, exhausted = tap.lastExhaustion()
+			}
+			if exhausted {
+				result := report.capacityExhaustedTermination(ctx, workspace, cfg, startCommit, class, code)
+				report.terminateCaptured(ctx, workspace, startCommit, result)
+				return exitNeedsHuman
+			}
+		}
 
 		if processErr != nil {
 			code := processExitCode(processErr)
@@ -1288,6 +1394,7 @@ const (
 	terminalCategoryUnknown                = "unknown"
 	terminalCategoryNeedsDecision          = "needs-decision"
 	terminalCategoryBlockedExternal        = "blocked-external"
+	terminalCategoryCapacityExhaustion     = "capacity-exhaustion"
 )
 
 // The outcome kinds the coordinator may declare (#169).
