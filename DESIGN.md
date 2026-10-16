@@ -1434,9 +1434,16 @@ there is no delete verb because active runs reference lanes. (#73)
   — base repository plus `status.pr` number through the forge read-pull-request
   capability, head repository and ref from `status` — and only a merge the forge
   confirms on that identity moves the run to **Done** and resolves the source;
-  an open PR, a PR closed without merge, a forge error, a missing PR, or a PR
-  whose head identity no longer matches keeps the run in **AwaitingReview** and
-  retries at the slow cadence (closed-unmerged terminalization is #251).
+  an open PR, a forge error, a missing PR, or a PR whose head identity no
+  longer matches keeps the run in **AwaitingReview** and retries at the slow
+  cadence. An exact PR closed without merge instead transitions the run to
+  **NeedsHuman** with a durable `PullRequestClosedUnmerged` condition (#277).
+  That read is bounded per request (per page for a paginated walk), not per
+  run: the GitHub adapter's default transport carries a finite 30-second request
+  bound covering the header wait and the response-body read, and an earlier
+  caller cancellation or deadline stays authoritative, so a stalled forge fails
+  the read instead of holding a reconcile — or an unrelated run — open until
+  process shutdown (#341).
   feedback/conflict → the source spawns a fresh `fix-pr` run without reusing the
   previous run. A `no_change_needed`
   resolve-issue run also waits here with its evidence posted for human review;
@@ -3279,3 +3286,17 @@ was superseded.
   a fresh seven-day inspection window rather than an immediate reap, and the
   marker survives controller restarts without re-stamping. (#277, #251, #250,
   #179, #146)
+- **2026-10-16 — Forge requests are bounded per request, never per run.** The
+  GitHub adapter defaulted to `http.DefaultClient` and passed the caller's
+  context straight through, so a forge that accepted a connection and then
+  stalled — before headers or mid-body — held the request until process
+  shutdown, and the reconciler runs these reads inline with no reconciliation
+  deadline, so one stalled call could stop progress for unrelated runs. The
+  default transport now carries a finite 30-second total request bound
+  (`defaultRequestTimeout`) that covers the header wait and the body read, and
+  every request context carries the same bound so an injected `HTTPDoer` is
+  bounded too. The bound is per request, not per operation: a paginated read
+  gets it per page, an earlier caller cancellation or deadline remains the
+  effective one, injected-`HTTPDoer` testing stays available, and no run, phase,
+  or reconciliation acquires a wall-clock deadline. This bounds *stuck*, in line
+  with the no-run-timeout principle; it does not bound duration. (#341)
