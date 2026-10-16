@@ -394,21 +394,26 @@ to die.
   is deleted so the run's deterministic pod name is free for the replacement —
   except at the restart ceiling, where it survives as the `NeedsHuman`
   hand-off's only record of the cause. Below the ceiling the charge is
-  deferred until a live read shows the deleted object gone on **both** delete
-  paths — the disappearance backstop and every delete of the wedge's reap —
-  so one physical loss is charged once and the replacement can
-   never attach to a dying object the launcher would tolerate. A
-   stale-heartbeat run whose cache already shows such a pod is reaped by the
-   wedge path first, and below the ceiling **every** wedge-path delete is
-   re-confirmed the same way (#105): a cached view can lag the API server's
-   deletion timestamp, and deleting an already-terminating object succeeds
-   without deleting anything, so a no-op delete must not charge a second
-   wedge for one physical loss. A reap whose live re-confirmation finds the
-   object gone charges in place with the generic message; a deferred charge
-   is left to the disappearance backstop, which confirms the loss against
-   the API server and charges it with its pod-loss cause. At the ceiling
-   there is no charge to defer: the wedge preserves the inert unrecoverable
-   object exactly like the backstop and terminalizes in the same reconcile.
+   deferred until a live read shows the deleted object gone on **every** delete
+   path that removes such a dead object — the disappearance backstop and the
+   secure topology's broken-topology relaunch, which deletes the same inert
+   control object for the same reason — so one physical loss is charged once
+   and the replacement can
+    never attach to a dying object the launcher would tolerate. A
+    stale-heartbeat run whose cache already shows such a pod is reaped by the
+    wedge path first, and below the ceiling **every** wedge-path delete is
+    re-confirmed the same way (#105): a cached view can lag the API server's
+    deletion timestamp, and deleting an already-terminating object succeeds
+    without deleting anything, so a no-op delete must not charge a second
+    wedge for one physical loss. A reap whose live re-confirmation finds the
+    object gone charges in place with the generic message; a deferred charge
+    is left to the disappearance backstop, which confirms the loss against
+    the API server and charges it with its pod-loss cause. At the ceiling
+    there is no charge to defer: the wedge preserves the inert unrecoverable
+    object exactly like the backstop and terminalizes in the same reconcile,
+    and `SecureControl`'s broken-topology relaunch preserves an unrecoverable
+    control object the same way, so the `NeedsHuman` hand-off keeps the only
+    record of the cause whichever path detected the loss (#106, #223).
    The wedge path's pod set — reap and startup grace — is the run's
    **coordinator** pod, identified by the coordinator container, never
    every pod bearing the run's label: a secure round's worker and broker
@@ -2996,7 +3001,49 @@ was superseded.
   the same reconcile. The counter stays bound to *observed* wedges; no timer
   and no duration bound was introduced. The window it does not close — a
   cached run status lagging a sibling's already-charged status patch — needs
-  charge-proof writes and stays with #126. (#105)
+   charge-proof writes and stays with #126. (#105)
+- **2026-10-16 — #223: the secure topology's broken-topology relaunch obeys
+  the same delete rule, and stops destroying the evidence at the ceiling.**
+  `SecureControl.fenceAndRelaunch` predated both rules #106 established for the
+  legacy delete paths: it deleted the stale control pod and charged the relaunch
+  with no post-delete live re-confirmation, so a finalizer-held control object
+  made `Delete` a no-op that was charged as a loss — and because the launch path
+  tolerates `AlreadyExists`, the replacement round could attach to the dying
+  object and charge the same physical loss a second time. It also deleted at the
+  restart ceiling, so the `NeedsHuman` hand-off lost the record of the cause the
+  legacy paths preserve. `fenceAndRelaunch` now judges the ceiling once and skips
+  the delete for an unrecoverable control object at the ceiling so the inert
+  record survives; a still-recoverable control object is deleted at the ceiling
+  as below it, because it records a live round rather than a cause. Below the
+  ceiling, the delete of an **inert** control object is re-confirmed with the
+  same uncached live read the legacy paths use — `coordinatorObjectPresentLive`,
+  now a package-level helper taking its `client.Reader` so one implementation is
+  shared by the reconciler and the secure path, backed by a new
+  `SecureControl.APIReader` wired from the manager — and a survivor defers the
+  charge *before* the fence, exactly as `checkLiveness` defers, so the round
+  stays standing and the disappearance backstop takes both the fence and the
+  single deferred charge once the name is provably free. Deferring before the
+  fence does leave the untrusted worker and the credentialed broker standing
+  while the supervisor object is terminating — a deliberate extension of #215's
+  fence-on-loss rule to this arm, on the same grounds `checkLiveness` and #222
+  give: the supervisor object still exists, so the round has not lost its
+  supervisor yet, and the backstop that takes the deferred charge fences in the
+  same reconcile. The re-confirmation
+  guards the inert object only, deliberately: that is the object the
+  disappearance backstop itself deletes and defers on. A *recoverable* control
+  object is charged in place, because a deferred charge leaves the run `Running`
+  while the pod is torn down, and the next reconcile's exit-code mapping reads
+  that teardown's exit code and terminalizes the run as `Failed` instead of
+  relaunching it — measured, not assumed. No duration bound and no timer was
+  added; the deferred requeue is the secure path's existing bounded observation
+  delay. Only the charge's state mutation is shared with
+  `relaunchAfterInfraLoss` (`chargeRelaunch`); the ceiling hand-offs stay
+  separate because the reconciler's carries a terminal diagnostic and a
+  phase-transition event while the secure path's records `SecurePreflightFailed`,
+  and neither surface is expressible as the other. The legacy wedge deferral
+  carries the exit-code hazard this arm avoids, and the secure path's cached
+  control-pod read and unconditioned delete, as #369 and #370. (#223)
+
 - **2026-10-10 — #248 follow-up: legacy linkage check is fail-closed on forge
   read errors, and the declared-changes path routes through the bounded
   repair budget.** The legacy executor's `checkPRLinkage` previously logged a
