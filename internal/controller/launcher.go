@@ -163,6 +163,12 @@ func (l *CoordinatorLauncher) Launch(ctx context.Context, run *courierv1alpha1.C
 		}
 		return l.ensureLegacyObserverResources(ctx, run, pod)
 	}
+	// The run-scoped identity must be on the pod before it is created;
+	// setting it afterwards would not persist, and the observer would run
+	// as the namespace default SA with no access to its own pod.
+	if pod.Annotations[executor.ObserverContractAnnotation] == executor.ObserverContractVersion {
+		pod.Spec.ServiceAccountName = legacyObserverResourceName(run.Name)
+	}
 	err = l.Client.Create(ctx, pod)
 	if err == nil {
 		return provisionObserver()
@@ -245,7 +251,6 @@ func (l *CoordinatorLauncher) ensureLegacyObserverResources(ctx context.Context,
 			}
 		}
 	}
-	pod.Spec.ServiceAccountName = name
 	return nil
 }
 
