@@ -92,6 +92,19 @@ const ConditionReasonUnacknowledged = "Unacknowledged"
 // capacity-exhaustion.
 const ConditionCapacityRecovery = "CapacityRecovery"
 
+// ConditionPullRequestClosedUnmerged is the status condition type the operator
+// writes on a settled AwaitingReview run whose exact recorded pull request was
+// observed closed without merge (#277). Status True with reason ClosedUnmerged
+// marks the run NeedsHuman so it is retained for a human instead of being held
+// in AwaitingReview forever. A missing or unreadable pull request is never
+// treated as closed.
+const ConditionPullRequestClosedUnmerged = "PullRequestClosedUnmerged"
+
+// ConditionReasonClosedUnmerged is the reason carried by a
+// ConditionPullRequestClosedUnmerged condition when the recorded pull request
+// was observed closed without merge (#277).
+const ConditionReasonClosedUnmerged = "ClosedUnmerged"
+
 // Phase is the lifecycle phase of a CoderRun.
 // +kubebuilder:validation:Enum=Pending;Claimed;Running;Verifying;AwaitingReview;HandedOff;NeedsHuman;Done;Failed;BlockedExternal
 type Phase string
