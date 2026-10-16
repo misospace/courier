@@ -55,9 +55,11 @@ func boundaryError(err error) error {
 
 // NewProvider builds a forge.Provider over a GitHub client. cfg carries the
 // endpoint, name, and a credential *reference* (never a resolved credential);
-// the caller is responsible for constructing client with a broker-resolved
-// token. NewProvider registers capabilities for the operations this client
-// covers and marks the rest as unavailable.
+// the caller is responsible for constructing client against cfg.Endpoint and
+// with a broker-resolved token, so every read and write goes to the
+// registered API host rather than the GitHub.com default. NewProvider
+// registers capabilities for the operations this client covers and marks the
+// rest as unavailable.
 func NewProvider(cfg forge.ProviderConfig, client *Client) *Provider {
 	return &Provider{
 		cfg:    cfg,

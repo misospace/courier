@@ -394,21 +394,26 @@ to die.
   is deleted so the run's deterministic pod name is free for the replacement —
   except at the restart ceiling, where it survives as the `NeedsHuman`
   hand-off's only record of the cause. Below the ceiling the charge is
-  deferred until a live read shows the deleted object gone on **both** delete
-  paths — the disappearance backstop and every delete of the wedge's reap —
-  so one physical loss is charged once and the replacement can
-   never attach to a dying object the launcher would tolerate. A
-   stale-heartbeat run whose cache already shows such a pod is reaped by the
-   wedge path first, and below the ceiling **every** wedge-path delete is
-   re-confirmed the same way (#105): a cached view can lag the API server's
-   deletion timestamp, and deleting an already-terminating object succeeds
-   without deleting anything, so a no-op delete must not charge a second
-   wedge for one physical loss. A reap whose live re-confirmation finds the
-   object gone charges in place with the generic message; a deferred charge
-   is left to the disappearance backstop, which confirms the loss against
-   the API server and charges it with its pod-loss cause. At the ceiling
-   there is no charge to defer: the wedge preserves the inert unrecoverable
-   object exactly like the backstop and terminalizes in the same reconcile.
+   deferred until a live read shows the deleted object gone on **every** delete
+   path that removes such a dead object — the disappearance backstop and the
+   secure topology's broken-topology relaunch, which deletes the same inert
+   control object for the same reason — so one physical loss is charged once
+   and the replacement can
+    never attach to a dying object the launcher would tolerate. A
+    stale-heartbeat run whose cache already shows such a pod is reaped by the
+    wedge path first, and below the ceiling **every** wedge-path delete is
+    re-confirmed the same way (#105): a cached view can lag the API server's
+    deletion timestamp, and deleting an already-terminating object succeeds
+    without deleting anything, so a no-op delete must not charge a second
+    wedge for one physical loss. A reap whose live re-confirmation finds the
+    object gone charges in place with the generic message; a deferred charge
+    is left to the disappearance backstop, which confirms the loss against
+    the API server and charges it with its pod-loss cause. At the ceiling
+    there is no charge to defer: the wedge preserves the inert unrecoverable
+    object exactly like the backstop and terminalizes in the same reconcile,
+    and `SecureControl`'s broken-topology relaunch preserves an unrecoverable
+    control object the same way, so the `NeedsHuman` hand-off keeps the only
+    record of the cause whichever path detected the loss (#106, #223).
    The wedge path's pod set — reap and startup grace — is the run's
    **coordinator** pod, identified by the coordinator container, never
    every pod bearing the run's label: a secure round's worker and broker
@@ -1880,6 +1885,62 @@ named items remain unresolved and must not be described as production-ready:
 
 ## Decisions
 
+- **2026-10-16 — #282: the legacy executor enforces the criterion-evidence
+  contract in one shared handoff plan, and the pinned envelope binds to the
+  trusted source identity.** `applyLinkagePlan` became `applyHandoffPlan`
+  (`checkPRLinkage` → `checkHandoff`): one identity-checked forge
+  observation per handoff now evaluates both PR-body contracts — the
+  authoritative source-issue linkage (#248) and, when `COURIER_CRITERIA`
+  pins a criterion set at admission (#280, #249), the criterion-evidence
+  block — against the same live body, so a body violating both earns a
+  single bounded `body-repair` continuation on the shared #170 budget
+  instead of two sequential repairs that burn it in turn. A decoded
+  envelope naming a source issue other than the run's trusted
+  `COURIER_REPO`/`COURIER_REF` identity — or one that cannot be bound
+  because the run carries no valid trusted identity — is a policy
+  mismatch between operator-side inputs, not a model-repairable body
+  defect: the run fails closed to `NeedsHuman` (`linkage.read.failed`
+  with kind `criteria-identity`) without consuming the budget, before the
+  forge is read and before the observation is classified — so no missing,
+  draft, or otherwise fail-closed forge world can spend a #170 slot on it
+  — and the binding is checked before the pinned-empty shortcut so a
+  foreign envelope cannot slip through as a vacuous pass — mirroring the
+  native engine's `Criteria.Issue == SourceIssue` binding in
+  `internal/broker/policy.go`. A run whose pinned envelope has no bindable
+  identity at all fails closed the same way, in the same pre-read
+  position, so a malformed `COURIER_REPO`/`COURIER_REF` can never hand off
+  `Verifying` with neither body contract enforced. An envelope that does
+  not decode is the same class of admission-time fault — read once from
+  the pod environment, unchangeable by any later observation — so it fails
+  closed in the same position (`linkage.read.failed` with kind
+  `criteria`), spending no #170 slot and never being presented to the model
+  as a repairable body defect. Both faults are settled by one
+  `pinnedCriterionSet` admission check that runs before the forge read;
+  classifying the observation first would let the decode fault hide behind
+  a missing or draft PR and burn the budget on the wrong contract.
+  A passing pinned handoff surfaces the derived coverage and per-status
+  counts both in the `run.exit` telemetry and as a best-effort outcome
+  comment on the run's source issue — a partial record is labelled
+  honestly partial, and the legacy handoff never claims fully verified
+  completion outside the PR body. No new budget, gate, or wall clock:
+  boundedness stays `MaxContinuations` (#170). (#282, #249, #280, #248)
+- **2026-10-16 — #282 follow-up: the pinned-envelope admission check runs
+  before the forge observation, not inside it.** The undecodable-envelope
+  fail-closed path was only reachable from the open-PR branch, so a missing,
+  draft, or closed-only forge world classified first and spent its own
+  bounded #247 continuation (`pr-missing` / `pr-draft`) on a projection
+  fault no turn can repair — the decode fault was visible exactly where a
+  slot was cheapest to waste. Decode and trust-binding now live in one
+  `pinnedCriterionSet` admission check that `checkHandoff` runs before
+  `observeRunBranchPullRequest`, so both envelope faults settle on sight
+  whatever the forge says; the genuine linkage read failure keeps its
+  retry-inside-budget path. One precedence change follows: when a run
+  carries both a broken envelope and an unreadable forge, the envelope
+  fault is now the reported one (`linkage.read.failed` kind `criteria` /
+  `criteria-identity`, zero budget) rather than a retryable `linkage` read
+  failure — the envelope is the input that cannot move under a retry.
+  No new budget, gate, or duration bound: this
+  reorders an existing fail-closed check, it does not add one. (#282)
 - **2026-10-16 — #327: materialize recovery attempts without deleting history.**
   Successor names incorporate the settled predecessor UID so stable issue IDs
   and preserved PR-fix generations do not collide with retained runs. Active
@@ -3021,14 +3082,58 @@ was superseded.
   the same reconcile. The counter stays bound to *observed* wedges; no timer
   and no duration bound was introduced. The window it does not close — a
   cached run status lagging a sibling's already-charged status patch — needs
-  charge-proof writes and stays with #126. (#105)
+   charge-proof writes and stays with #126. (#105)
+- **2026-10-16 — #223: the secure topology's broken-topology relaunch obeys
+  the same delete rule, and stops destroying the evidence at the ceiling.**
+  `SecureControl.fenceAndRelaunch` predated both rules #106 established for the
+  legacy delete paths: it deleted the stale control pod and charged the relaunch
+  with no post-delete live re-confirmation, so a finalizer-held control object
+  made `Delete` a no-op that was charged as a loss — and because the launch path
+  tolerates `AlreadyExists`, the replacement round could attach to the dying
+  object and charge the same physical loss a second time. It also deleted at the
+  restart ceiling, so the `NeedsHuman` hand-off lost the record of the cause the
+  legacy paths preserve. `fenceAndRelaunch` now judges the ceiling once and skips
+  the delete for an unrecoverable control object at the ceiling so the inert
+  record survives; a still-recoverable control object is deleted at the ceiling
+  as below it, because it records a live round rather than a cause. Below the
+  ceiling, the delete of an **inert** control object is re-confirmed with the
+  same uncached live read the legacy paths use — `coordinatorObjectPresentLive`,
+  now a package-level helper taking its `client.Reader` so one implementation is
+  shared by the reconciler and the secure path, backed by a new
+  `SecureControl.APIReader` wired from the manager — and a survivor defers the
+  charge *before* the fence, exactly as `checkLiveness` defers, so the round
+  stays standing and the disappearance backstop takes both the fence and the
+  single deferred charge once the name is provably free. Deferring before the
+  fence does leave the untrusted worker and the credentialed broker standing
+  while the supervisor object is terminating — a deliberate extension of #215's
+  fence-on-loss rule to this arm, on the same grounds `checkLiveness` and #222
+  give: the supervisor object still exists, so the round has not lost its
+  supervisor yet, and the backstop that takes the deferred charge fences in the
+  same reconcile. The re-confirmation
+  guards the inert object only, deliberately: that is the object the
+  disappearance backstop itself deletes and defers on. A *recoverable* control
+  object is charged in place, because a deferred charge leaves the run `Running`
+  while the pod is torn down, and the next reconcile's exit-code mapping reads
+  that teardown's exit code and terminalizes the run as `Failed` instead of
+  relaunching it — measured, not assumed. No duration bound and no timer was
+  added; the deferred requeue is the secure path's existing bounded observation
+  delay. Only the charge's state mutation is shared with
+  `relaunchAfterInfraLoss` (`chargeRelaunch`); the ceiling hand-offs stay
+  separate because the reconciler's carries a terminal diagnostic and a
+  phase-transition event while the secure path's records `SecurePreflightFailed`,
+  and neither surface is expressible as the other. The legacy wedge deferral
+  carries the exit-code hazard this arm avoids, and the secure path's cached
+  control-pod read and unconditioned delete, as #369 and #370. (#223)
+
 - **2026-10-10 — #248 follow-up: legacy linkage check is fail-closed on forge
   read errors, and the declared-changes path routes through the bounded
-  repair budget.** The legacy executor's `checkPRLinkage` previously logged a
+  repair budget.** The legacy executor's `checkPRLinkage` (since renamed
+  `checkHandoff`, #282) previously logged a
   `linkage.read.failed` event and handed off as `Verifying` on a forge read
   error, and `classifyDeclared` returned `NeedsHuman` immediately on a bad
   PR body without consulting the captured session's continuation budget.
-  Both paths now route through one shared `applyLinkagePlan` helper: a forge
+  Both paths now route through one shared `applyLinkagePlan` helper (renamed
+  `applyHandoffPlan` by #282): a forge
   read failure is consumed by the bounded continuation budget (one retry
   with `linkageRepairMessage`, then `NeedsHuman` with the precise forge
   error as the reason); a published PR whose body disagrees with the trusted
@@ -3270,13 +3375,14 @@ was superseded.
   `NeedsHuman` with the precise state in the reason, and the reason names
   the actual cause rather than claiming budget exhaustion that did not
   happen. Both the declared and undeclared `Verifying` routes share the one
-  `applyLinkagePlan` helper, so no route can hand off unobserved. The
+  `applyLinkagePlan` helper (renamed `applyHandoffPlan` by #282), so no route can hand off unobserved. The
   executor's terminating `Verifying` handoff is emitted only for a verified
   open, non-draft PR on the pinned base with authoritative linkage and the
   run's current commit advertised by the remote; the separate pre-dispatch
-  adoption guard, which reports a pre-existing open PR without a draft or
-  linkage check, stays as the 2026-10-10 entry describes and is settled by
-  the controller's `Verifying` observation.
+  adoption guard reads through the same identity-checked listing and reports
+  only a verified open, non-draft PR on the pinned base, but does not check
+  linkage; the controller's `Verifying` observation settles what that early
+  handoff leaves open.
   Boundedness stays liveness-shaped: the budget is `MaxContinuations` (#170)
   shared with linkage and criteria-evidence repair, with no new wall-clock
   timeout. (#247, #248, #170)
@@ -3325,3 +3431,16 @@ was superseded.
   effective one, injected-`HTTPDoer` testing stays available, and no run, phase,
   or reconciliation acquires a wall-clock deadline. This bounds *stuck*, in line
   with the no-run-timeout principle; it does not bound duration. (#341)
+- **2026-10-16 — #343: the adoption guard shares the identity-checked PR read.**
+  The pre-dispatch adoption guard still terminated on the raw GitHub
+  owner:branch head listing, so a same-owner fork claiming `owner:branch`, a
+  PR re-targeted to another base, or a draft was reported to the source as
+  reviewable before `Prepare`. The guard now consumes the same
+  identity-checked forge listing as the pre-handoff observation: only an
+  open, non-draft PR whose full base/head identity matches the run's
+  repository and branch and whose base ref is the pinned base exits
+  `Verifying`; foreign, wrong-base, draft, ambiguous, and closed-only worlds
+  exit `NeedsHuman` naming the actual state, and an unreadable listing fails
+  closed rather than adopting. Linkage stays the controller's
+  `Verifying` observation — the guard runs before a PR body contract exists
+  to check. (#343, superseding the guard carve-out in the #247 entry.)

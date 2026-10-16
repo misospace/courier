@@ -95,6 +95,21 @@ func New(token string, httpClient ...HTTPDoer) (*Client, error) {
 	return NewClient(defaultBaseURL, token, httpClient...)
 }
 
+// WithBaseURL returns a client for a different API base URL carrying this
+// client's credential, transport, and request bound. Secure-mode wiring uses
+// it to build one client per registered endpoint from a single read
+// identity: the registration decides the destination, and a credential is
+// only ever sent to the endpoint its identity is scoped to. An empty base
+// URL is refused rather than silently falling back to GitHub.com, so a
+// missing endpoint configuration cannot redirect a custom registration's
+// traffic (and credential) to the public API.
+func (c *Client) WithBaseURL(baseURL string) (*Client, error) {
+	if strings.TrimSpace(baseURL) == "" {
+		return nil, errors.New("GitHub base URL must not be empty")
+	}
+	return newClient(baseURL, c.token, c.requestTimeout, c.httpClient)
+}
+
 // PullRequest is the subset of a GitHub pull request that Courier needs.
 type PullRequest struct {
 	Number         int    `json:"number"`

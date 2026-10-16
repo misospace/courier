@@ -428,7 +428,11 @@ func newProvider(env *brokerEnv, document *topology.BrokerPolicyDocument) (inter
 	cfg := forge.ProviderConfig{Name: document.Provider.Name, Endpoint: env.providerEndpt}
 	switch env.providerType {
 	case "github":
-		client, err := couriergithub.New(env.forgeAPIToken)
+		// The verified projection's endpoint is the only forge destination:
+		// build the credential-bearing client against it so a GitHub
+		// Enterprise registration's traffic — and its resolved credential —
+		// never reach the public API.
+		client, err := couriergithub.NewClient(env.providerEndpt, env.forgeAPIToken)
 		if err != nil {
 			return nil, fmt.Errorf("courier-broker: forge client rejected its configuration: %w", err)
 		}
