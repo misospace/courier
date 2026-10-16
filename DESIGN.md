@@ -3354,9 +3354,10 @@ was superseded.
   executor's terminating `Verifying` handoff is emitted only for a verified
   open, non-draft PR on the pinned base with authoritative linkage and the
   run's current commit advertised by the remote; the separate pre-dispatch
-  adoption guard, which reports a pre-existing open PR without a draft or
-  linkage check, stays as the 2026-10-10 entry describes and is settled by
-  the controller's `Verifying` observation.
+  adoption guard reads through the same identity-checked listing and reports
+  only a verified open, non-draft PR on the pinned base, but does not check
+  linkage; the controller's `Verifying` observation settles what that early
+  handoff leaves open.
   Boundedness stays liveness-shaped: the budget is `MaxContinuations` (#170)
   shared with linkage and criteria-evidence repair, with no new wall-clock
   timeout. (#247, #248, #170)
@@ -3405,3 +3406,16 @@ was superseded.
   effective one, injected-`HTTPDoer` testing stays available, and no run, phase,
   or reconciliation acquires a wall-clock deadline. This bounds *stuck*, in line
   with the no-run-timeout principle; it does not bound duration. (#341)
+- **2026-10-16 — #343: the adoption guard shares the identity-checked PR read.**
+  The pre-dispatch adoption guard still terminated on the raw GitHub
+  owner:branch head listing, so a same-owner fork claiming `owner:branch`, a
+  PR re-targeted to another base, or a draft was reported to the source as
+  reviewable before `Prepare`. The guard now consumes the same
+  identity-checked forge listing as the pre-handoff observation: only an
+  open, non-draft PR whose full base/head identity matches the run's
+  repository and branch and whose base ref is the pinned base exits
+  `Verifying`; foreign, wrong-base, draft, ambiguous, and closed-only worlds
+  exit `NeedsHuman` naming the actual state, and an unreadable listing fails
+  closed rather than adopting. Linkage stays the controller's
+  `Verifying` observation — the guard runs before a PR body contract exists
+  to check. (#343, superseding the guard carve-out in the #247 entry.)

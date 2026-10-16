@@ -498,10 +498,14 @@ paths share acceptance, not implementation.
     executor's terminating `Verifying` handoff is emitted only for
     a verified open, non-draft PR on the pinned base with the
     run's commit published to the remote. (The separate adoption
-    guard that reviews a pre-existing open PR before dispatch is
-    unchanged and does not itself check draft or linkage; the
-    controller's `Verifying` observation settles what that early
-    handoff leaves open.)
+    guard that reviews a pre-existing pull request before dispatch
+    reads through the same identity-checked head listing (#343):
+    it reports only an open, non-draft PR whose full base and head
+    identity and base ref match the run, and sends a foreign,
+    wrong-base, draft, ambiguous, or closed-or-merged-only world
+    to `NeedsHuman` with the precise state, but it does not itself
+    check linkage; the controller's `Verifying` observation settles
+    what that early handoff leaves open.)
   The repair instruction names the trusted identity, the supported
   closing keywords, the bare and cross-repo forms, and the
   existing PR number so the model can fix the body

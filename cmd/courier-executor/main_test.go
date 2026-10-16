@@ -160,7 +160,7 @@ func TestRunResolveIssueWithExistingOpenPullRequestReportsForReview(t *testing.T
 
 	prServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		_, _ = io.WriteString(w, `[{"number":12,"state":"open","head":{"ref":"courier/resolve-issue/acme-widgets/7"}}]`)
+		_, _ = io.WriteString(w, pullRequestFixtureJSON(12, "open", false, "Closes #7."))
 	}))
 	defer prServer.Close()
 
@@ -199,7 +199,7 @@ func TestRunResolveIssueRefusesBranchWithClosedPullRequest(t *testing.T) {
 
 	prServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		_, _ = io.WriteString(w, `[{"number":12,"state":"closed","head":{"ref":"courier/resolve-issue/acme-widgets/7"}}]`)
+		_, _ = io.WriteString(w, pullRequestFixtureJSON(12, "closed", false, "Closes #7."))
 	}))
 	defer prServer.Close()
 
@@ -238,7 +238,7 @@ func TestRunResolveIssueWithMixedPullRequestsReportsOpenForReview(t *testing.T) 
 
 	prServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		_, _ = io.WriteString(w, `[{"number":11,"state":"closed","head":{"ref":"courier/resolve-issue/acme-widgets/7"}},{"number":12,"state":"open","head":{"ref":"courier/resolve-issue/acme-widgets/7"}}]`)
+		_, _ = io.WriteString(w, "["+pullRequestFixtureObjectJSON(11, "closed", false, "Closes #7.")+","+pullRequestFixtureObjectJSON(12, "open", false, "Closes #7.")+"]")
 	}))
 	defer prServer.Close()
 
@@ -259,6 +259,120 @@ func TestRunResolveIssueWithMixedPullRequestsReportsOpenForReview(t *testing.T) 
 	for _, event := range parseEvents(t, &output) {
 		if name, _ := event["event"].(string); name == "workspace.ready" || name == "executor.start" {
 			t.Fatalf("run reached %s despite an existing PR: %v", name, event)
+		}
+	}
+}
+
+// TestRunResolveIssueAdoptionGuardFailClosedWorlds pins the #343 rule at the
+// adoption guard: only an open, non-draft PR whose full identity and base ref
+// match the run may be reported for review. A draft, a PR re-targeted to
+// another base, a same-owner fork claiming the branch selector, and an
+// ambiguous set of open PRs all terminate NeedsHuman with the precise state
+// in the reason, before Prepare and before any executor turn.
+func TestRunResolveIssueAdoptionGuardFailClosedWorlds(t *testing.T) {
+	cases := []struct {
+		name         string
+		pullRequests string
+		wantReason   string
+	}{
+		{
+			name:         "draft PR is not reviewable",
+			pullRequests: pullRequestFixtureJSON(12, "open", true, "Closes #7."),
+			wantReason:   "resolve branch already has draft PR #12",
+		},
+		{
+			name:         "wrong-base PR settles nothing",
+			pullRequests: "[" + pullRequestFixtureObjectJSONWithBase(12, "open", false, "release-9", "Closes #7.") + "]",
+			wantReason:   "targets a base other than the pinned base",
+		},
+		{
+			name:         "foreign head is never adopted",
+			pullRequests: "[" + pullRequestFixtureObjectJSONWithHeadRepo(12, "open", false, "fork/widgets", "Closes #7.") + "]",
+			wantReason:   "from a different repository",
+		},
+		{
+			name:         "ambiguous open PRs settle nothing",
+			pullRequests: "[" + pullRequestFixtureObjectJSON(12, "open", false, "Closes #7.") + "," + pullRequestFixtureObjectJSON(13, "open", false, "Closes #7.") + "]",
+			wantReason:   "more than one open pull request",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			root := t.TempDir()
+			remote := remoteWithExistingBranch(t, root)
+
+			// A binary that fails loudly if it is ever executed: reaching it
+			// would mean the run adopted the branch despite the existing PR.
+			fakeOpenCode := filepath.Join(root, "opencode")
+			writeExecutable(t, fakeOpenCode, "#!/bin/sh\nexit 99\n")
+
+			prServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = io.WriteString(w, tc.pullRequests)
+			}))
+			defer prServer.Close()
+
+			setResolveIssueEnv(t, root, remote, prServer.URL, fakeOpenCode)
+
+			var output bytes.Buffer
+			var errorsOut bytes.Buffer
+			code := run(context.Background(), &output, &errorsOut)
+			if code != exitNeedsHuman {
+				t.Fatalf("run exit code = %d, want %d (NeedsHuman); stderr=%q stdout=%q", code, exitNeedsHuman, errorsOut.String(), output.String())
+			}
+			if !strings.Contains(output.String(), `"phase":"NeedsHuman"`) {
+				t.Fatalf("missing NeedsHuman termination: %q", output.String())
+			}
+			if !strings.Contains(output.String(), tc.wantReason) {
+				t.Fatalf("termination reason should name the actual state %q: %q", tc.wantReason, output.String())
+			}
+			if strings.Contains(output.String(), `"phase":"Verifying"`) {
+				t.Fatalf("fail-closed world must not be reported for review: %q", output.String())
+			}
+			for _, event := range parseEvents(t, &output) {
+				if name, _ := event["event"].(string); name == "workspace.ready" || name == "executor.start" {
+					t.Fatalf("run reached %s despite a fail-closed existing PR: %v", name, event)
+				}
+			}
+		})
+	}
+}
+
+// TestRunResolveIssueAdoptionGuardRejectsUnidentifiedPullRequest proves the
+// guard reads through the identity-checked forge capability rather than a
+// raw head listing: a record claiming the branch ref without base- or
+// head-repository identity can no longer be reported for review, and the
+// unreadable world fails closed instead of adopting.
+func TestRunResolveIssueAdoptionGuardRejectsUnidentifiedPullRequest(t *testing.T) {
+	root := t.TempDir()
+	remote := remoteWithExistingBranch(t, root)
+
+	fakeOpenCode := filepath.Join(root, "opencode")
+	writeExecutable(t, fakeOpenCode, "#!/bin/sh\nexit 99\n")
+
+	prServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `[{"number":12,"state":"open","head":{"ref":"courier/resolve-issue/acme-widgets/7"}}]`)
+	}))
+	defer prServer.Close()
+
+	setResolveIssueEnv(t, root, remote, prServer.URL, fakeOpenCode)
+
+	var output bytes.Buffer
+	var errorsOut bytes.Buffer
+	code := run(context.Background(), &output, &errorsOut)
+	if code != 1 {
+		t.Fatalf("run exit code = %d, want 1 (Failed); stderr=%q stdout=%q", code, errorsOut.String(), output.String())
+	}
+	if !strings.Contains(output.String(), `"phase":"Failed"`) {
+		t.Fatalf("missing Failed termination: %q", output.String())
+	}
+	if !strings.Contains(output.String(), "missing the base repository identity") {
+		t.Fatalf("termination should name the identity-check failure: %q", output.String())
+	}
+	for _, event := range parseEvents(t, &output) {
+		if name, _ := event["event"].(string); name == "workspace.ready" || name == "executor.start" {
+			t.Fatalf("run reached %s despite an unverifiable PR record: %v", name, event)
 		}
 	}
 }
