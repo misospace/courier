@@ -1880,6 +1880,30 @@ named items remain unresolved and must not be described as production-ready:
 
 ## Decisions
 
+- **2026-10-16 — #282: the legacy executor enforces the criterion-evidence
+  contract in one shared handoff plan, and the pinned envelope binds to the
+  trusted source identity.** `applyLinkagePlan` became `applyHandoffPlan`
+  (`checkPRLinkage` → `checkHandoff`): one identity-checked forge
+  observation per handoff now evaluates both PR-body contracts — the
+  authoritative source-issue linkage (#248) and, when `COURIER_CRITERIA`
+  pins a criterion set at admission (#280, #249), the criterion-evidence
+  block — against the same live body, so a body violating both earns a
+  single bounded `body-repair` continuation on the shared #170 budget
+  instead of two sequential repairs that burn it in turn. A decoded
+  envelope naming a source issue other than the run's trusted
+  `COURIER_REPO`/`COURIER_REF` identity is a policy mismatch between two
+  operator-side inputs, not a model-repairable body defect: the run fails
+  closed to `NeedsHuman` on sight (`linkage.read.failed` with kind
+  `criteria-identity`) without consuming the budget, and the binding is
+  checked before the pinned-empty shortcut so a foreign envelope cannot
+  slip through as a vacuous pass — mirroring the native engine's
+  `Criteria.Issue == SourceIssue` binding in `internal/broker/policy.go`.
+  A passing pinned handoff surfaces the derived coverage and per-status
+  counts both in the `run.exit` telemetry and as a best-effort outcome
+  comment on the run's source issue, labelled honestly `partial`; the
+  legacy handoff never claims fully verified completion outside the PR
+  body. No new budget, gate, or wall clock: boundedness stays
+  `MaxContinuations` (#170). (#282, #249, #280, #248)
 - **2026-10-16 — #327: materialize recovery attempts without deleting history.**
   Successor names incorporate the settled predecessor UID so stable issue IDs
   and preserved PR-fix generations do not collide with retained runs. Active
@@ -2999,11 +3023,13 @@ was superseded.
   charge-proof writes and stays with #126. (#105)
 - **2026-10-10 — #248 follow-up: legacy linkage check is fail-closed on forge
   read errors, and the declared-changes path routes through the bounded
-  repair budget.** The legacy executor's `checkPRLinkage` previously logged a
+  repair budget.** The legacy executor's `checkPRLinkage` (since renamed
+  `checkHandoff`, #282) previously logged a
   `linkage.read.failed` event and handed off as `Verifying` on a forge read
   error, and `classifyDeclared` returned `NeedsHuman` immediately on a bad
   PR body without consulting the captured session's continuation budget.
-  Both paths now route through one shared `applyLinkagePlan` helper: a forge
+  Both paths now route through one shared `applyLinkagePlan` helper (renamed
+  `applyHandoffPlan` by #282): a forge
   read failure is consumed by the bounded continuation budget (one retry
   with `linkageRepairMessage`, then `NeedsHuman` with the precise forge
   error as the reason); a published PR whose body disagrees with the trusted
@@ -3245,7 +3271,7 @@ was superseded.
   `NeedsHuman` with the precise state in the reason, and the reason names
   the actual cause rather than claiming budget exhaustion that did not
   happen. Both the declared and undeclared `Verifying` routes share the one
-  `applyLinkagePlan` helper, so no route can hand off unobserved. The
+  `applyLinkagePlan` helper (renamed `applyHandoffPlan` by #282), so no route can hand off unobserved. The
   executor's terminating `Verifying` handoff is emitted only for a verified
   open, non-draft PR on the pinned base with authoritative linkage and the
   run's current commit advertised by the remote; the separate pre-dispatch

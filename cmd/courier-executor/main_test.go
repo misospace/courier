@@ -2769,6 +2769,9 @@ func fakeLinkedPRServer(t *testing.T) *httptest.Server {
 // request re-reads the state file: while it is absent the run branch
 // carries no pull request; when it holds a JSON array the server answers
 // the head query with it; the literal "500" makes the forge read fail.
+// Posted issue comments are appended to comments.jsonl beside the state
+// file (see readForgeComments) and a comment-fail marker file beside it
+// makes every comment return HTTP 500 (#282).
 // Tests script the world by writing the file before the run, and a fake
 // OpenCode script can "open", "ready", or break the pull request mid-run
 // by rewriting it, so the executor's live observations see a forge that
@@ -2779,7 +2782,23 @@ func fakeForgePullRequestServer(t *testing.T) (*httptest.Server, string) {
 	statePath := filepath.Join(dir, "pulls.json")
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/comments") {
-			_, _ = io.Copy(io.Discard, r.Body)
+			body, _ := io.ReadAll(r.Body)
+			// The "comment-fail" marker file (written by a test before
+			// the run) makes every comment a forge failure, so a test
+			// can pin that a comment failure never changes the run's
+			// ending (#282). Otherwise the comment is appended to
+			// comments.jsonl for readForgeComments.
+			if _, err := os.Stat(filepath.Join(dir, "comment-fail")); err == nil {
+				w.WriteHeader(http.StatusInternalServerError)
+				return
+			}
+			f, err := os.OpenFile(filepath.Join(dir, "comments.jsonl"), os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
+			if err != nil {
+				w.WriteHeader(http.StatusInternalServerError)
+				return
+			}
+			_, _ = f.Write(append(body, '\n'))
+			_ = f.Close()
 			w.Header().Set("Content-Type", "application/json")
 			_, _ = io.WriteString(w, `{"id":1}`)
 			return
@@ -6485,9 +6504,23 @@ func misoGalleryPRFixtureJSON(number int, state string, draft bool, body string)
 // body mid-run if a test chooses to.
 func runCriteriaEndToEnd(t *testing.T, prBody, script, criteriaEnvelope string) (int, string, []string) {
 	t.Helper()
+	code, out, argv, _ := runCriteriaEndToEndTracked(t, prBody, script, criteriaEnvelope, false)
+	return code, out, argv
+}
+
+// runCriteriaEndToEndTracked is runCriteriaEndToEnd with the forge
+// comment traffic surfaced: it also returns the bodies of every issue
+// comment the run posted, and failComments makes the forge reject every
+// comment with HTTP 500 so a test can pin that a comment failure never
+// changes the run's ending (#282, step 4).
+func runCriteriaEndToEndTracked(t *testing.T, prBody, script, criteriaEnvelope string, failComments bool) (int, string, []string, []string) {
+	t.Helper()
 	root := t.TempDir()
 	remote := remoteWithBaseOnly(t, root)
 	prServer, prState := fakeForgePullRequestServer(t)
+	if failComments {
+		write(t, filepath.Join(filepath.Dir(prState), "comment-fail"), "")
+	}
 	stateDir := filepath.Join(root, "fakestate")
 	if err := os.MkdirAll(stateDir, 0o755); err != nil {
 		t.Fatal(err)
@@ -6507,7 +6540,37 @@ func runCriteriaEndToEnd(t *testing.T, prBody, script, criteriaEnvelope string) 
 	var output bytes.Buffer
 	var errorsOut bytes.Buffer
 	code := run(context.Background(), &output, &errorsOut)
-	return code, output.String(), readArgvLog(t, stateDir)
+	return code, output.String(), readArgvLog(t, stateDir), readForgeComments(t, prState)
+}
+
+// readForgeComments returns the bodies of the issue comments the run
+// posted to the fake forge (#282), decoded from the comments.jsonl file
+// the fakeForgePullRequestServer fixture appends to. A forge with no
+// posted comments yields nil.
+func readForgeComments(t *testing.T, statePath string) []string {
+	t.Helper()
+	path := filepath.Join(filepath.Dir(statePath), "comments.jsonl")
+	data, err := os.ReadFile(path)
+	if os.IsNotExist(err) {
+		return nil
+	}
+	if err != nil {
+		t.Fatalf("read forge comments: %v", err)
+	}
+	var bodies []string
+	for _, line := range strings.Split(strings.TrimSpace(string(data)), "\n") {
+		if strings.TrimSpace(line) == "" {
+			continue
+		}
+		var payload struct {
+			Body string `json:"body"`
+		}
+		if err := json.Unmarshal([]byte(line), &payload); err != nil {
+			t.Fatalf("decode forge comment %q: %v", line, err)
+		}
+		bodies = append(bodies, payload.Body)
+	}
+	return bodies
 }
 
 // scriptCriteriaDeficientTurns is the fake OpenCode body for the
@@ -6643,7 +6706,7 @@ func TestRunResolveIssueCriteriaPartialBodyTriggersRepair(t *testing.T) {
 func TestRunResolveIssueCriteriaHonestPartialHandsOffVerifyingWithCoverage(t *testing.T) {
 	body := readBrokerFixture(t, "miso-gallery-505-pr-honest-partial.md")
 	envelope := pinCriteriaEnvelopeForMisoGallery(t)
-	code, out, _ := runCriteriaEndToEnd(t, body, scriptCriteriaHonestPartialTurns("ses_criteria_honest_partial"), envelope)
+	code, out, _, comments := runCriteriaEndToEndTracked(t, body, scriptCriteriaHonestPartialTurns("ses_criteria_honest_partial"), envelope, false)
 	if code != exitSuccess {
 		t.Fatalf("run exit code = %d, want 0 (Verifying after honest partial evidence); detail: %q", code, out)
 	}
@@ -6677,6 +6740,21 @@ func TestRunResolveIssueCriteriaHonestPartialHandsOffVerifyingWithCoverage(t *te
 			t.Fatalf("criteria pass must not fire continuation kind %s: %q", kind, out)
 		}
 	}
+	// #282 step 4: the derived coverage and per-status counts reach the
+	// run's source issue as an outcome comment as well as the run.exit
+	// telemetry — the honest partial label must be visible outside the
+	// PR body, and it must agree with the event detail.
+	if len(comments) != 1 {
+		t.Fatalf("passing pinned handoff must post exactly one coverage comment, got %d: %q", len(comments), comments)
+	}
+	for _, want := range []string{"criterion-evidence", "`partial`", "regression-check: 2", "manual-verification: 1"} {
+		if !strings.Contains(comments[0], want) {
+			t.Fatalf("coverage comment missing %q: %q", want, comments[0])
+		}
+	}
+	if strings.Contains(comments[0], "`full`") {
+		t.Fatalf("honest partial comment must not claim full: %q", comments[0])
+	}
 }
 
 // TestRunResolveIssueEmptyPinnedSetSkipsCriteriaCheck pins the
@@ -6691,7 +6769,7 @@ func TestRunResolveIssueCriteriaHonestPartialHandsOffVerifyingWithCoverage(t *te
 func TestRunResolveIssueEmptyPinnedSetSkipsCriteriaCheck(t *testing.T) {
 	emptyEnvelope := `{"issue":{"owner":"misospace","name":"miso-gallery","number":502},"criteria":[],"digest":"sha256:empty-pin"}`
 	body := withClosingReference(readBrokerFixture(t, "miso-gallery-505-pr-deficient.md"), "#502")
-	code, out, _ := runCriteriaEndToEnd(t, body, scriptCriteriaHonestPartialTurns("ses_criteria_empty_set"), emptyEnvelope)
+	code, out, _, comments := runCriteriaEndToEndTracked(t, body, scriptCriteriaHonestPartialTurns("ses_criteria_empty_set"), emptyEnvelope, false)
 	if code != exitSuccess {
 		t.Fatalf("run exit code = %d, want 0 (empty pinned set is vacuous; linkage holds); detail: %q", code, out)
 	}
@@ -6704,6 +6782,11 @@ func TestRunResolveIssueEmptyPinnedSetSkipsCriteriaCheck(t *testing.T) {
 	if strings.Contains(out, `"criteria.coverage"`) {
 		t.Fatalf("empty pinned set must not surface criteria.coverage on run.exit: %q", out)
 	}
+	// The coverage comment is a pinned-handoff surface: an empty pinned
+	// set must post no outcome comment at all (#282).
+	if len(comments) != 0 {
+		t.Fatalf("empty pinned set must post no coverage comment, got %q", comments)
+	}
 }
 
 // TestRunResolveIssueUnpinnedRunSkipsCriteriaCheck pins the
@@ -6715,7 +6798,7 @@ func TestRunResolveIssueEmptyPinnedSetSkipsCriteriaCheck(t *testing.T) {
 // criteria.coverage in the run.exit detail.
 func TestRunResolveIssueUnpinnedRunSkipsCriteriaCheck(t *testing.T) {
 	body := withClosingReference(readBrokerFixture(t, "miso-gallery-505-pr-deficient.md"), "#502")
-	code, out, _ := runCriteriaEndToEnd(t, body, scriptCriteriaHonestPartialTurns("ses_criteria_unpinned"), "")
+	code, out, _, comments := runCriteriaEndToEndTracked(t, body, scriptCriteriaHonestPartialTurns("ses_criteria_unpinned"), "", false)
 	if code != exitSuccess {
 		t.Fatalf("run exit code = %d, want 0 (no COURIER_CRITERIA at all; linkage holds); detail: %q", code, out)
 	}
@@ -6727,6 +6810,11 @@ func TestRunResolveIssueUnpinnedRunSkipsCriteriaCheck(t *testing.T) {
 	}
 	if strings.Contains(out, `"criteria.coverage"`) {
 		t.Fatalf("absent COURIER_CRITERIA must not surface criteria.coverage on run.exit: %q", out)
+	}
+	// An unpinned run has no criterion contract to report: no coverage
+	// comment may reach the source issue (#282).
+	if len(comments) != 0 {
+		t.Fatalf("absent COURIER_CRITERIA must post no coverage comment, got %q", comments)
 	}
 }
 
@@ -6798,5 +6886,169 @@ func TestRunResolveIssueCombinedBodyFiresSingleBodyRepair(t *testing.T) {
 	}
 	if !strings.Contains(out, source) {
 		t.Fatalf("exhausted reason must name the trusted source identity: %q", out)
+	}
+}
+
+// TestCheckCriterionEvidenceBindsEnvelopeToTrustedSource pins the trust
+// binding of the pinned criterion envelope (#282): an operator-authored
+// COURIER_CRITERIA envelope that names a source issue other than the
+// run's trusted COURIER_REPO/COURIER_REF identity must fail closed with
+// criteriaEnvelopeIdentityErr — before the pinned-empty shortcut, so a
+// foreign envelope cannot slip through as a vacuous pass — and the
+// error must name both identities so the operator can tell which
+// admission input was wrong. The matching case still validates normally
+// (block missing on a matching non-empty set is a repairable
+// CriteriaError, not an identity failure), and the repository identity
+// is compared case-insensitively.
+func TestCheckCriterionEvidenceBindsEnvelopeToTrustedSource(t *testing.T) {
+	var output, errorsOut bytes.Buffer
+	obs := &prLinkageObservation{Number: 12, State: "open", Body: "Closes #502"}
+	needle := strings.Repeat("a", 64)
+	emptyDigest := strings.Repeat("b", 64)
+	cases := []struct{ name, envelope string }{
+		{"foreign repo", `{"issue":{"owner":"misospace","name":"other-repo","number":502},"criteria":[{"id":"AC-1","text":"x","digest":"sha256:` + needle + `"}],"digest":"sha256:` + emptyDigest + `"}`},
+		{"foreign number", `{"issue":{"owner":"misospace","name":"miso-gallery","number":503},"criteria":[{"id":"AC-1","text":"x","digest":"sha256:` + needle + `"}],"digest":"sha256:` + emptyDigest + `"}`},
+		{"zero issue with empty set", `{"issue":{},"criteria":[],"digest":"sha256:` + emptyDigest + `"}`},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			report := newReporter(&output, &errorsOut, config{
+				Mode:     "resolve-issue",
+				Repo:     "misospace/miso-gallery",
+				Ref:      502,
+				Criteria: tc.envelope,
+			})
+			outcome, err := report.checkCriterionEvidence(context.Background(), obs)
+			if !errors.Is(err, criteriaEnvelopeIdentityErr) {
+				t.Fatalf("checkCriterionEvidence err = %v, want criteriaEnvelopeIdentityErr", err)
+			}
+			if outcome != nil {
+				t.Fatalf("identity mismatch must not produce an outcome: %+v", outcome)
+			}
+			if !strings.Contains(err.Error(), "misospace/miso-gallery#502") {
+				t.Fatalf("error must name the trusted source identity: %q", err.Error())
+			}
+		})
+	}
+	// Case-insensitive repository identity with an empty criteria list:
+	// the identity binds, the set is empty, and the vacuous pass stands.
+	report := newReporter(&output, &errorsOut, config{
+		Mode:     "resolve-issue",
+		Repo:     "misospace/miso-gallery",
+		Ref:      502,
+		Criteria: `{"issue":{"owner":"MisoSpace","name":"MISO-GALLERY","number":502},"criteria":[],"digest":"sha256:` + emptyDigest + `"}`,
+	})
+	if outcome, err := report.checkCriterionEvidence(context.Background(), obs); err != nil || outcome != nil {
+		t.Fatalf("case-insensitive matching empty set must vacuous-pass, got outcome %+v err %v", outcome, err)
+	}
+	// Matching non-empty envelope against a body with no evidence block:
+	// the identity binds, the validator fires, and the failure is the
+	// repairable CriteriaError shape, not the identity sentinel.
+	report = newReporter(&output, &errorsOut, config{
+		Mode:     "resolve-issue",
+		Repo:     "misospace/miso-gallery",
+		Ref:      502,
+		Criteria: `{"issue":{"owner":"misospace","name":"miso-gallery","number":502},"criteria":[{"id":"AC-1","text":"x","digest":"sha256:` + needle + `"}],"digest":"sha256:` + emptyDigest + `"}`,
+	})
+	outcome, err := report.checkCriterionEvidence(context.Background(), obs)
+	if err != nil {
+		t.Fatalf("matching envelope must reach the validator, got err %v", err)
+	}
+	if outcome == nil || outcome.criteriaErr == nil {
+		t.Fatalf("matching envelope with block-less body must produce a criteriaErr outcome, got %+v", outcome)
+	}
+}
+
+// TestHandoffCoverageCommentRendersDerivedCoverage pins the outcome
+// comment body the executor posts on a passing pinned handoff (#282,
+// step 4): the derived coverage is named verbatim, per-status counts
+// render in the broker vocabulary order and omit absent statuses, and
+// the comment never claims fully verified completion.
+func TestHandoffCoverageCommentRendersDerivedCoverage(t *testing.T) {
+	got := handoffCoverageComment("run-9", broker.CoveragePartial, map[broker.CriterionStatus]int{
+		broker.StatusManualVerification: 1,
+		broker.StatusRegressionCheck:    2,
+		broker.StatusNotImplemented:     0,
+	})
+	for _, want := range []string{"run-9", "`partial`", "regression-check: 2", "manual-verification: 1"} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("coverage comment missing %q: %q", want, got)
+		}
+	}
+	if strings.Contains(got, "not-implemented") {
+		t.Fatalf("zero-count statuses must be omitted: %q", got)
+	}
+	if strings.Contains(got, "full") {
+		t.Fatalf("partial handoff comment must not claim full: %q", got)
+	}
+	if strings.Index(got, "regression-check") > strings.Index(got, "manual-verification") {
+		t.Fatalf("counts must render in the broker vocabulary order: %q", got)
+	}
+	plain := handoffCoverageComment("run-9", broker.CoverageFull, nil)
+	if !strings.Contains(plain, "`full`") || strings.Contains(plain, "Per-status") {
+		t.Fatalf("full handoff without counts: %q", plain)
+	}
+}
+
+// TestRunResolveIssueForeignCriterionEnvelopeFailsClosedWithoutRepair
+// pins the envelope identity binding end to end (#282): a syntactically
+// valid COURIER_CRITERIA envelope naming a different source issue than
+// the run's trusted COURIER_REPO/COURIER_REF must terminate the run
+// NeedsHuman (verifier-rejection) immediately — the linkage.read.failed
+// event surfaces with kind "criteria-identity", the reason names the
+// policy mismatch — and must never spend a bounded continuation, since
+// no PR-body edit can fix a wrong pinned envelope.
+func TestRunResolveIssueForeignCriterionEnvelopeFailsClosedWithoutRepair(t *testing.T) {
+	body := withClosingReference(readBrokerFixture(t, "miso-gallery-505-pr-deficient.md"), "#502")
+	foreign := `{"issue":{"owner":"misospace","name":"miso-gallery","number":503},"criteria":[{"id":"AC-1","text":"pinned for the wrong issue","digest":"sha256:` + strings.Repeat("a", 64) + `"}],"digest":"sha256:` + strings.Repeat("b", 64) + `"}`
+	code, out, _ := runCriteriaEndToEnd(t, body, scriptCriteriaHonestPartialTurns("ses_foreign_envelope"), foreign)
+	if code != exitNeedsHuman {
+		t.Fatalf("run exit code = %d, want %d (NeedsHuman on envelope identity mismatch); detail: %q", code, exitNeedsHuman, out)
+	}
+	if !strings.Contains(out, `"phase":"NeedsHuman"`) {
+		t.Fatalf("expected NeedsHuman phase: %q", out)
+	}
+	if !strings.Contains(out, `"category":"verifier-rejection"`) {
+		t.Fatalf("expected verifier-rejection category: %q", out)
+	}
+	if !strings.Contains(out, `"kind":"criteria-identity"`) {
+		t.Fatalf("linkage.read.failed event must carry kind criteria-identity: %q", out)
+	}
+	if !strings.Contains(out, "policy mismatch") {
+		t.Fatalf("reason must name the policy mismatch: %q", out)
+	}
+	// The identity mismatch is not model-repairable: no continuation of
+	// any body-repair kind may fire, and the run must not claim
+	// Verifying.
+	for _, kind := range []string{`"kind":"criteria-repair"`, `"kind":"body-repair"`, `"kind":"linkage-repair"`} {
+		if strings.Contains(out, kind) {
+			t.Fatalf("identity mismatch must not fire continuation kind %s: %q", kind, out)
+		}
+	}
+	if strings.Contains(out, `"phase":"Verifying"`) {
+		t.Fatalf("identity mismatch must not hand off Verifying: %q", out)
+	}
+}
+
+// TestRunResolveIssueCoverageCommentFailureDoesNotBlockHandoff pins the
+// best-effort semantics of the handoff coverage comment (#282, step 4):
+// when the forge rejects the comment, the run records the
+// outcome.comment error and still hands off Verifying with the same
+// telemetry.
+func TestRunResolveIssueCoverageCommentFailureDoesNotBlockHandoff(t *testing.T) {
+	body := readBrokerFixture(t, "miso-gallery-505-pr-honest-partial.md")
+	envelope := pinCriteriaEnvelopeForMisoGallery(t)
+	code, out, _, comments := runCriteriaEndToEndTracked(t, body, scriptCriteriaHonestPartialTurns("ses_coverage_comment_fail"), envelope, true)
+	if code != exitSuccess {
+		t.Fatalf("run exit code = %d, want 0 (comment failure must not block the handoff); detail: %q", code, out)
+	}
+	if len(comments) != 0 {
+		t.Fatalf("no comment may land when the forge rejects them: %q", comments)
+	}
+	if !strings.Contains(out, `"outcome.comment"`) {
+		t.Fatalf("failed comment must surface an outcome.comment event: %q", out)
+	}
+	if !strings.Contains(out, `"phase":"Verifying"`) || !strings.Contains(out, `"criteria.coverage":"partial"`) {
+		t.Fatalf("handoff and telemetry must stand despite the comment failure: %q", out)
 	}
 }
