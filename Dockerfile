@@ -77,8 +77,8 @@ RUN set -eux; \
 	mkdir -p /tmp/git-src && \
 	tar -xzf /tmp/git.tar.gz -C /tmp/git-src --strip-components=1 && \
 	rm /tmp/git.tar.gz && \
-	make -j"$(nproc)" -C /tmp/git-src prefix=/usr/local all && \
-	make -C /tmp/git-src prefix=/usr/local install && \
+	make -j"$(nproc)" -C /tmp/git-src prefix=/usr/local NO_GETTEXT=YesPlease all && \
+	make -C /tmp/git-src prefix=/usr/local NO_GETTEXT=YesPlease install && \
 	rm -rf /tmp/git-src && \
 	apt-get purge -y --auto-remove \
 		build-essential \
