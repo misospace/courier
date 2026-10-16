@@ -236,20 +236,33 @@ func (l *CoordinatorLauncher) collisionReader() client.Reader {
 func (l *CoordinatorLauncher) ensureLegacyObserverResources(ctx context.Context, run *courierv1alpha1.CoderRun, pod *corev1.Pod) error {
 	name := legacyObserverResourceName(run.Name)
 	owner := []metav1.OwnerReference{{APIVersion: courierv1alpha1.GroupVersion.String(), Kind: "CoderRun", Name: run.Name, UID: run.UID, Controller: boolPtr(true), BlockOwnerDeletion: boolPtr(true)}}
-	objects := []client.Object{
-		&corev1.ServiceAccount{ObjectMeta: metav1.ObjectMeta{Namespace: run.Namespace, Name: name, OwnerReferences: owner}, AutomountServiceAccountToken: boolPtr(false)},
-		&rbacv1.Role{ObjectMeta: metav1.ObjectMeta{Namespace: run.Namespace, Name: name, OwnerReferences: owner}, Rules: []rbacv1.PolicyRule{{APIGroups: []string{""}, Resources: []string{"pods"}, ResourceNames: []string{pod.Name}, Verbs: []string{"get"}}}},
-		&rbacv1.RoleBinding{ObjectMeta: metav1.ObjectMeta{Namespace: run.Namespace, Name: name, OwnerReferences: owner}, RoleRef: rbacv1.RoleRef{APIGroup: rbacv1.GroupName, Kind: "Role", Name: name}, Subjects: []rbacv1.Subject{{Kind: rbacv1.ServiceAccountKind, Name: name, Namespace: run.Namespace}}},
+	// The SA must exist before the pod does: the API server resolves the
+	// pod's service account at create time and rejects the pod otherwise.
+	if err := l.ensureObserverObject(ctx, run.UID, &corev1.ServiceAccount{ObjectMeta: metav1.ObjectMeta{Namespace: run.Namespace, Name: name, OwnerReferences: owner}, AutomountServiceAccountToken: boolPtr(false)}); err != nil {
+		return err
 	}
-	for _, desired := range objects {
-		if err := l.Client.Create(ctx, desired); err != nil {
-			if !apierrors.IsAlreadyExists(err) {
-				return err
-			}
-			if err := l.verifyObserverResource(ctx, desired, run.UID); err != nil {
-				return err
-			}
+	if pod.Spec.ServiceAccountName == name {
+		// The pod is not persisted yet (fresh launch); the Role and
+		// RoleBinding are provisioned only once the coordinator slot is
+		// verified live.
+		return nil
+	}
+	role := &rbacv1.Role{ObjectMeta: metav1.ObjectMeta{Namespace: run.Namespace, Name: name, OwnerReferences: owner}, Rules: []rbacv1.PolicyRule{{APIGroups: []string{""}, Resources: []string{"pods"}, ResourceNames: []string{pod.Name}, Verbs: []string{"get"}}}}
+	if err := l.ensureObserverObject(ctx, run.UID, role); err != nil {
+		return err
+	}
+	return l.ensureObserverObject(ctx, run.UID, &rbacv1.RoleBinding{ObjectMeta: metav1.ObjectMeta{Namespace: run.Namespace, Name: name, OwnerReferences: owner}, RoleRef: rbacv1.RoleRef{APIGroup: rbacv1.GroupName, Kind: "Role", Name: name}, Subjects: []rbacv1.Subject{{Kind: rbacv1.ServiceAccountKind, Name: name, Namespace: run.Namespace}}})
+}
+
+func (l *CoordinatorLauncher) ensureObserverObject(ctx context.Context, runUID types.UID, desired client.Object) error {
+	if err := l.Client.Create(ctx, desired); err != nil {
+		if !apierrors.IsAlreadyExists(err) {
+			return err
 		}
+		// A same-named leftover from a deleted run must never be adopted:
+		// garbage collection will remove it, and until then the launch
+		// stays unverified.
+		return l.verifyObserverResource(ctx, desired, runUID)
 	}
 	return nil
 }
