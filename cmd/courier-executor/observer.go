@@ -60,27 +60,35 @@ func observerMode(ctx context.Context, seed bool) error {
 	}
 	namespace, name, uid := os.Getenv("POD_NAMESPACE"), os.Getenv("POD_NAME"), os.Getenv("POD_UID")
 	var writerID string
-	for {
+	var getErr error
+	for attempt := 0; attempt < 5; attempt++ {
 		pod, err := kube.CoreV1().Pods(namespace).Get(ctx, name, metav1.GetOptions{})
-		if err != nil {
-			return errors.New("observer: pod observation failed")
-		}
-		if string(pod.UID) != uid || !pod.DeletionTimestamp.IsZero() || pod.Spec.RestartPolicy != corev1.RestartPolicyNever {
-			return errors.New("observer: pod identity changed")
-		}
-		for _, s := range pod.Status.ContainerStatuses {
-			if s.Name == "coordinator" && s.State.Terminated != nil {
-				writerID = s.ContainerID
+		if err == nil {
+			getErr = nil
+			if string(pod.UID) != uid || !pod.DeletionTimestamp.IsZero() || pod.Spec.RestartPolicy != corev1.RestartPolicyNever {
+				return errors.New("observer: pod identity changed")
 			}
-		}
-		if writerID != "" {
-			break
+			for _, s := range pod.Status.ContainerStatuses {
+				if s.Name == "coordinator" && s.State.Terminated != nil {
+					writerID = s.ContainerID
+				}
+			}
+			if writerID != "" {
+				break
+			}
+		} else {
+			// The observer starts alongside the writer; a brief API or
+			// network blip at pod start must not forfeit the evidence.
+			getErr = err
 		}
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
 		case <-time.After(time.Second):
 		}
+	}
+	if getErr != nil {
+		return fmt.Errorf("observer: pod observation failed: %w", getErr)
 	}
 	operation, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
