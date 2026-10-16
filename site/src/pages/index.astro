@@ -1,0 +1,65 @@
+---
+import Base from "../layouts/Base.astro";
+---
+<Base
+  title="Courier — autonomous coding coordinators for Kubernetes"
+  description="Courier runs a coordinator per task: plan, delegate to model sub-agents, validate locally, publish a change, hand control back for human review."
+  active="/courier"
+>
+  <section class="hero">
+    <span class="badge warn">bootstrap MVP</span>
+    <h1>Courier</h1>
+    <p class="sub">
+      A Kubernetes operator that runs autonomous coding <em>coordinators</em> in
+      pods. You feed it an issue or PR feedback; it plans, delegates to model
+      sub-agents, validates locally, publishes a change — and hands control
+      back to an operator and a human to merge or send back with feedback.
+    </p>
+    <div class="cta-row">
+      <a class="btn primary" href="https://github.com/misospace/courier">View on GitHub ↗</a>
+      <a class="btn" href="https://github.com/misospace/courier/blob/main/BOOTSTRAP.md">Bootstrap guide</a>
+    </div>
+  </section>
+
+  <section class="section">
+    <h2>Why a coordinator</h2>
+    <p class="lede">
+      A narrow one-shot executor gives the coder no feedback mid-run and treats
+      a reviewer NO-GO as a reason to kill the workload. But local models do
+      their best work in a loop. Courier replaces the one-shot with a
+      long-lived, resumable coordinator that can take feedback and iterate
+      locally — the loop that helps a model converge on a change ready for
+      human review.
+    </p>
+    <div class="terminal">
+      <div class="term-head"><span class="dotset"><i></i><i></i><i></i></span> the loop</div>
+      <pre><span class="c-dim"># issue in, published change out — bounded by stuck, not by duration</span>
+<span class="c-prompt">$</span> source claims work <span class="c-link">(dispatch · labels · cron · CLI · web)</span>
+<span class="c-prompt">$</span> courier reconciles <span class="c-hi">CoderRun</span>  <span class="c-dim">admit → claim → launch → resume → reap</span>
+<span class="c-prompt">$</span> coordinator runs   <span class="c-dim">OpenCode + model tools + credentials</span>
+<span class="c-prompt">$</span> validates locally, publishes, waits for the human verdict</pre>
+    </div>
+  </section>
+
+  <section class="section">
+    <h2>Principles</h2>
+    <div class="cards two">
+      <div class="card"><h3>A coordinator, not a one-shot</h3><p>Long-lived and resumable. It can take feedback and iterate locally, then hand published work to the operator for external verification.</p></div>
+      <div class="card"><h3>Bounded by stuck, not duration</h3><p>Consumer hardware is slow. An 18-hour run that is making progress is fine. Courier bounds <em>stuck</em>, not <em>duration</em>.</p></div>
+      <div class="card"><h3>Model-agnostic lanes</h3><p>A lane runs whatever its <code>LaneProfile</code> names — Anthropic, OpenAI, MiniMax, a local vLLM, or any mix of them.</p></div>
+      <div class="card"><h3>Local-capable, not local-constrained</h3><p>Built so consumer-hardware local models can iterate their way to a locally validated published PR — but equally happy driving cloud models.</p></div>
+      <div class="card"><h3>Source-agnostic</h3><p>Dispatch, GitHub labels, cron, CLI, and a web UI are adapters. Nothing in the core depends on any one of them, or on any one forge.</p></div>
+      <div class="card"><h3>General infrastructure</h3><p>Designed to be run by anyone, not scoped to one operator's problems. The GitHub + OpenCode path is a replaceable bootstrap, not a product boundary.</p></div>
+    </div>
+  </section>
+
+  <section class="section">
+    <h2>Status</h2>
+    <p class="lede">
+      Bootstrap MVP: Courier can admit a <code>CoderRun</code>, claim its source
+      work, derive or adopt a branch, launch the temporary OpenCode coordinator,
+      and map the completed pod back to review or needs-human state. The
+      resumable custom harness and liveness recovery are later work.
+    </p>
+  </section>
+</Base>
