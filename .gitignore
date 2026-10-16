@@ -17,3 +17,4 @@ vendor/
 charts/*/charts/
 charts/**/*.tgz
 dist/
+.astro/
