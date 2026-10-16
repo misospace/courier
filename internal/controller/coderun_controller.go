@@ -60,6 +60,11 @@ type terminalLifecycleIntent struct {
 	ciFailure          bool
 	error              string
 	diagnostic         *courierv1alpha1.TerminalDiagnostic
+	// conditions are extra status conditions applied in the same status patch
+	// as the phase change, so a caller can record the reason for a terminal
+	// transition atomically with it (for example a closed-unmerged pull
+	// request settling AwaitingReview as NeedsHuman, #277).
+	conditions []metav1.Condition
 }
 
 // CoderRunReconciler reconciles a CoderRun object.
@@ -1119,6 +1124,12 @@ func (r *CoderRunReconciler) transitionTerminal(ctx context.Context, run *courie
 		}
 		if intent.diagnostic != nil && run.Status.TerminalDiagnostic == nil {
 			run.Status.TerminalDiagnostic = intent.diagnostic
+		}
+		// Caller-supplied conditions land in the same status patch as the phase
+		// change, so the recorded reason for the transition is never split from
+		// it across a failed write.
+		for _, cond := range intent.conditions {
+			apimeta.SetStatusCondition(&run.Status.Conditions, cond)
 		}
 		// Persist report intent with the phase so retries can reproduce the same
 		// lifecycle without extending the CRD status schema.
