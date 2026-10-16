@@ -297,6 +297,11 @@ func (b *PodBuilder) Build(run *courierv1alpha1.CoderRun, lane *courierv1alpha1.
 		pod.Spec.Volumes = append(pod.Spec.Volumes, observerVolumes()...)
 		pod.Spec.InitContainers = append(pod.Spec.InitContainers, observerSeedContainer(config, invocation, pod.Name, string(run.UID)))
 		pod.Spec.Containers = append(pod.Spec.Containers, observerContainer(config, invocation, pod.Name, string(run.UID)))
+		// The pod-level fsGroup (65532) owns the shared emptyDir roots; the
+		// observer's distinct UID/GID (65533) needs that group as a
+		// supplement or it cannot create its private state directory. For
+		// the coordinator it is a no-op (it already runs 65532:65532).
+		pod.Spec.SecurityContext.SupplementalGroups = []int64{CoordinatorGID}
 	}
 	if config.EvidenceEnabled() {
 		pod.Spec.TerminationGracePeriodSeconds = int64Ptr(EvidenceTerminationGracePeriodSeconds)
