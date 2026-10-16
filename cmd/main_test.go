@@ -4,6 +4,9 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
+	"io"
+	"net/http"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -19,6 +22,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/client-go/rest"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 )
@@ -234,6 +238,112 @@ func TestBuildSecureControlRequiresObserverCredential(t *testing.T) {
 		runNamespace:  "runs",
 	}); err == nil || !strings.Contains(err.Error(), "observer") {
 		t.Fatalf("secure mode without an admission-read identity must fail startup, got %v", err)
+	}
+}
+
+// recordingForgeTransport records every request the GitHub client makes and
+// answers repository reads, so wiring tests can assert the destination host
+// and path without any network.
+type recordingForgeTransport struct {
+	requests []*http.Request
+}
+
+func (t *recordingForgeTransport) Do(req *http.Request) (*http.Response, error) {
+	t.requests = append(t.requests, req.Clone(context.Background()))
+	body := io.NopCloser(strings.NewReader(`{"id":7,"full_name":"acme/widgets","default_branch":"main"}`))
+	return &http.Response{
+		StatusCode: http.StatusOK,
+		Proto:      "HTTP/1.1",
+		ProtoMajor: 1,
+		ProtoMinor: 1,
+		Header:     http.Header{"Content-Type": []string{"application/json"}},
+		Body:       body,
+	}, nil
+}
+
+func TestSecureAdmissionProviderHonorsRegistrationEndpoint(t *testing.T) {
+	const operatorToken = "operator-read-token"
+	tests := []struct {
+		name     string
+		endpoint string
+		wantHost string
+		wantPath string
+	}{
+		{
+			name:     "enterprise registration keeps reads on its own host and API prefix",
+			endpoint: "https://ghes.example.test/api/v3",
+			wantHost: "ghes.example.test",
+			wantPath: "/api/v3/repos/acme/widgets",
+		},
+		{
+			name:     "enterprise API prefix keeps its path with a trailing slash",
+			endpoint: "https://ghes.example.test/api/v3/",
+			wantHost: "ghes.example.test",
+			wantPath: "/api/v3/repos/acme/widgets",
+		},
+		{
+			name:     "github.com registration keeps the default destination",
+			endpoint: "https://api.github.com/",
+			wantHost: "api.github.com",
+			wantPath: "/repos/acme/widgets",
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			registryFile := filepath.Join(t.TempDir(), "providers.json")
+			providers := fmt.Sprintf(`{"providers":[{"name":"primary","type":"github","endpoint":%q,"credentials":{"forge-api":{"secretName":"forge-creds","key":"token"}},"serves":["*"]}]}`, test.endpoint)
+			if err := os.WriteFile(registryFile, []byte(providers), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			transport := &recordingForgeTransport{}
+			observerClient, err := couriergithub.NewClient("https://unexpected.invalid/", operatorToken, transport)
+			if err != nil {
+				t.Fatal(err)
+			}
+			control, err := buildSecureControl(secureConfig{
+				providersFile: registryFile,
+				runNamespace:  "runs",
+				harnessImage:  "harness:test",
+				probeImage:    "busybox:test",
+				observer:      couriergithub.Observer{Client: observerClient},
+				operatorNS:    "courier-system",
+				restConfig:    &rest.Config{Host: "https://127.0.0.1:1"},
+			})
+			if err != nil {
+				t.Fatalf("buildSecureControl: %v", err)
+			}
+			registration, err := control.Config.Registry.Select("acme/widgets")
+			if err != nil {
+				t.Fatalf("select registration: %v", err)
+			}
+			admission, err := control.Config.Providers(context.Background(), registration)
+			if err != nil {
+				t.Fatalf("providers factory: %v", err)
+			}
+			if got := admission.Provider.Config().Endpoint; got != test.endpoint {
+				t.Fatalf("provider endpoint = %q, want %q", got, test.endpoint)
+			}
+			repo, err := admission.Policy.ResolveRepository(context.Background(), "acme/widgets")
+			if err != nil || repo.Canonical != "acme/widgets" {
+				t.Fatalf("resolve repository = %#v, %v", repo, err)
+			}
+			if len(transport.requests) != 1 {
+				t.Fatalf("recorded %d requests, want exactly one", len(transport.requests))
+			}
+			req := transport.requests[0]
+			if req.URL.Host == "api.github.com" && test.wantHost != "api.github.com" {
+				t.Fatalf("a custom registration must not reach the public API: host = %q", req.URL.Host)
+			}
+			if req.URL.Host != test.wantHost {
+				t.Fatalf("request host = %q, want %q", req.URL.Host, test.wantHost)
+			}
+			if req.URL.Path != test.wantPath {
+				t.Fatalf("request path = %q, want %q", req.URL.Path, test.wantPath)
+			}
+			if got := req.Header.Get("Authorization"); got != "Bearer "+operatorToken {
+				t.Fatalf("authorization = %q, want the operator read identity carried over", got)
+			}
+		})
 	}
 }
 

@@ -741,9 +741,18 @@ func buildSecureControl(config secureConfig) (*controller.SecureControl, error) 
 			Providers: func(ctx context.Context, registration *forge.Registration) (controller.AdmissionProvider, error) {
 				// Admission reads use the operator's own read identity. The
 				// registration's credential reference is never resolved here.
+				// Each registration's endpoint decides the destination: the
+				// client is rebuilt against it rather than reused from the
+				// observer's GitHub.com default, so a GitHub Enterprise
+				// registration's admission reads never leave for the public
+				// API.
+				client, err := observer.Client.WithBaseURL(registration.Endpoint)
+				if err != nil {
+					return controller.AdmissionProvider{}, fmt.Errorf("provider %q endpoint %q is not usable: %w", registration.Name, registration.Endpoint, err)
+				}
 				provider := couriergithub.NewProvider(
 					forge.ProviderConfig{Name: registration.Name, Endpoint: registration.Endpoint},
-					observer.Client)
+					client)
 				return controller.AdmissionProvider{Provider: provider, Policy: provider, HeadLister: provider}, nil
 			},
 		},

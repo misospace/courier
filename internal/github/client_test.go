@@ -171,6 +171,48 @@ func TestReadPullRequestAndChecks(t *testing.T) {
 	}
 }
 
+func TestWithBaseURLRetargetsCarryingCredential(t *testing.T) {
+	var enterpriseAuth string
+	enterprise := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/v3/repos/acme/demo" {
+			http.NotFound(w, r)
+			return
+		}
+		enterpriseAuth = r.Header.Get("Authorization")
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"id":3,"full_name":"acme/demo","default_branch":"main"}`)
+	}))
+	defer enterprise.Close()
+	original := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		t.Errorf("WithBaseURL must not leave requests going to the original base: %s", r.URL.Path)
+		w.WriteHeader(http.StatusBadGateway)
+	}))
+	defer original.Close()
+
+	client, err := NewClient(original.URL, "secret")
+	if err != nil {
+		t.Fatal(err)
+	}
+	rebased, err := client.WithBaseURL(enterprise.URL + "/api/v3")
+	if err != nil {
+		t.Fatal(err)
+	}
+	repo, err := rebased.GetRepository(context.Background(), "acme", "demo")
+	if err != nil || repo.FullName != "acme/demo" {
+		t.Fatalf("repository = %#v, %v", repo, err)
+	}
+	if enterpriseAuth != "Bearer secret" {
+		t.Fatalf("authorization = %q, want the client credential carried over", enterpriseAuth)
+	}
+
+	if _, err := client.WithBaseURL("   "); err == nil {
+		t.Fatal("an empty base URL must fail closed, not fall back to the GitHub.com default")
+	}
+	if _, err := client.WithBaseURL("ghes.example.test/api"); err == nil {
+		t.Fatal("a base URL without scheme and host must be refused")
+	}
+}
+
 func TestPullRequestsForHead(t *testing.T) {
 	t.Parallel()
 	var rawQuery string

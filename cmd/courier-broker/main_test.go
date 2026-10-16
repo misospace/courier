@@ -2,6 +2,9 @@ package main
 
 import (
 	"context"
+	"io"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
@@ -97,6 +100,70 @@ func TestPinnedResolverOnlyServesPolicyRepositories(t *testing.T) {
 	}
 	if _, err := resolver.Endpoint(context.Background(), "other/repo"); err == nil {
 		t.Fatal("a repository outside the policy must have no endpoint")
+	}
+}
+
+func TestNewProviderUsesRegisteredEndpoint(t *testing.T) {
+	var gotPath, gotHost, gotAuth string
+	var gotRequests int
+	fixture := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotRequests++
+		gotPath, gotHost, gotAuth = r.URL.Path, r.Host, r.Header.Get("Authorization")
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"id":7,"full_name":"acme/widgets","default_branch":"main"}`)
+	}))
+	defer fixture.Close()
+
+	tests := []struct {
+		name     string
+		endpoint string
+		wantPath string
+	}{
+		{name: "enterprise API base with path prefix", endpoint: fixture.URL + "/api/v3", wantPath: "/api/v3/repos/acme/widgets"},
+		{name: "host-only API base", endpoint: fixture.URL, wantPath: "/repos/acme/widgets"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			env := &brokerEnv{
+				providerName:  "primary",
+				providerType:  "github",
+				providerEndpt: test.endpoint,
+				forgeAPIToken: "broker-resolved-token",
+			}
+			document := &topology.BrokerPolicyDocument{
+				Provider: forge.Projection{Name: "primary", Type: "github", Endpoint: test.endpoint},
+			}
+			provider, err := newProvider(env, document)
+			if err != nil {
+				t.Fatalf("newProvider: %v", err)
+			}
+			if got := provider.Config().Endpoint; got != test.endpoint {
+				t.Fatalf("provider endpoint = %q, want %q", got, test.endpoint)
+			}
+			gotRequests = 0
+			repo, err := provider.ResolveRepository(context.Background(), "acme/widgets")
+			if err != nil || repo.Canonical != "acme/widgets" {
+				t.Fatalf("resolve repository = %#v, %v", repo, err)
+			}
+			if gotRequests != 1 {
+				t.Fatalf("fixture saw %d requests, want exactly one per read", gotRequests)
+			}
+			if gotHost != fixture.Listener.Addr().String() {
+				t.Fatalf("request host = %q, want the registered fixture host %q", gotHost, fixture.Listener.Addr().String())
+			}
+			if gotPath != test.wantPath {
+				t.Fatalf("request path = %q, want %q", gotPath, test.wantPath)
+			}
+			if gotAuth != "Bearer broker-resolved-token" {
+				t.Fatalf("authorization = %q, want the broker-resolved credential", gotAuth)
+			}
+		})
+	}
+
+	env := &brokerEnv{providerName: "primary", providerType: "github", providerEndpt: "not a url", forgeAPIToken: "tok"}
+	document := &topology.BrokerPolicyDocument{Provider: forge.Projection{Name: "primary", Endpoint: "not a url"}}
+	if _, err := newProvider(env, document); err == nil {
+		t.Fatal("a malformed registered endpoint must fail closed, not fall back to the public API")
 	}
 }
 
