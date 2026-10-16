@@ -2294,17 +2294,18 @@ func sourceIssueTarget(source broker.SourceIssue) string {
 // keyword forms so the model can repair the body deterministically
 // rather than re-derive the requirement. The text is bounded to a few
 // hundred bytes so it stays under the legacy executor's continuation
-// message budget. The continuation number is named so a model can see
-// the remaining budget.
-func linkageRepairMessage(source broker.SourceIssue, outcome *handoffCheckOutcome, continuation int) string {
+// message budget. The continuation number, the total budget, and the
+// slots left after this turn are named so a model can see the remaining
+// budget (#282).
+func linkageRepairMessage(source broker.SourceIssue, outcome *handoffCheckOutcome, continuation, maxContinuations int) string {
 	target := sourceIssueTarget(source)
 	bare := fmt.Sprintf("#%d", source.Number)
 	cross := target
 	return fmt.Sprintf(
 		"Courier refused the handoff: PR #%d's body does not carry an authoritative closing reference to %s. "+
 			"Update the PR body through the forge capability so it carries a supported closing keyword (Closes, Fixes, or Resolves) followed by %s, or the cross-repo form %s when the trusted source repository differs from the PR base. "+
-			"Then re-declare the same outcome. (continuation %d)",
-		outcome.pr.Number, target, bare, cross, continuation,
+			"Then re-declare the same outcome. (continuation %s)",
+		outcome.pr.Number, target, bare, cross, continuationBudget(continuation, maxContinuations),
 	)
 }
 
@@ -2318,14 +2319,14 @@ func linkageRepairMessage(source broker.SourceIssue, outcome *handoffCheckOutcom
 // vocabulary surfaces in both paths. The required shape rules echo
 // the documented header and per-status rules from criteria.go so the
 // model can repair the body without re-deriving the contract.
-func criteriaRepairMessage(source broker.SourceIssue, outcome *handoffCheckOutcome, continuation int) string {
+func criteriaRepairMessage(source broker.SourceIssue, outcome *handoffCheckOutcome, continuation, maxContinuations int) string {
 	target := sourceIssueTarget(source)
 	reason := describeCriteriaFailureForRepair(outcome.criteriaErr)
 	setDigest, criteriaLines := pinnedSetRepairSnippet(outcome.pinnedSet, outcome.criteria)
 	return fmt.Sprintf(
 		"Courier refused the handoff: PR #%d's body does not satisfy the criterion-evidence contract pinned at admission for %s (pinned set %s): %s. "+
 			"Update the PR body through the forge capability so it carries the criterion-evidence block: a single line starting with %q followed by %q, then one %q row per pinned criterion (each row's digest must match the pinned criterion digest below), each carrying a closed status from the vocabulary implementation-evidence, regression-check, manual-verification, not-implemented, or unknown, with regression-check and implementation-evidence referencing a file path or check URL and manual-verification and not-implemented referencing a note. Pinned criteria: %s. "+
-			"Then re-declare the same outcome. (continuation %d)",
+			"Then re-declare the same outcome. (continuation %s)",
 		outcome.pr.Number, target,
 		nonEmptyOr(setDigest, "the admitted set"),
 		reason,
@@ -2333,8 +2334,20 @@ func criteriaRepairMessage(source broker.SourceIssue, outcome *handoffCheckOutco
 		"set=sha256:<64hex> coverage=full|partial",
 		"- AC-<n> sha256:<64hex>: <status> - <reference>",
 		nonEmptyOr(criteriaLines, "(no pinned criteria on this run)"),
-		continuation,
+		continuationBudget(continuation, maxContinuations),
 	)
+}
+
+// continuationBudget renders the bounded-repair budget a repair
+// instruction must name (#282): the number of this continuation, the
+// shared #170 total, and the slots left after this turn, so a model can
+// see the remaining budget rather than only its ordinal.
+func continuationBudget(continuation, maxContinuations int) string {
+	remaining := maxContinuations - continuation
+	if remaining < 0 {
+		remaining = 0
+	}
+	return fmt.Sprintf("%d of %d; %d remaining", continuation, maxContinuations, remaining)
 }
 
 // combinedBodyRepairMessage composes one OpenCode continuation that
@@ -2350,9 +2363,9 @@ func criteriaRepairMessage(source broker.SourceIssue, outcome *handoffCheckOutco
 // contract lands first. The criterion-evidence contract is named
 // second so a body that fixes both earns a single repair pass and
 // passes both validators on the next observation.
-func combinedBodyRepairMessage(source broker.SourceIssue, outcome *handoffCheckOutcome, continuation int) string {
-	linkPart := linkageRepairMessage(source, outcome, continuation)
-	critPart := criteriaRepairMessage(source, outcome, continuation)
+func combinedBodyRepairMessage(source broker.SourceIssue, outcome *handoffCheckOutcome, continuation, maxContinuations int) string {
+	linkPart := linkageRepairMessage(source, outcome, continuation, maxContinuations)
+	critPart := criteriaRepairMessage(source, outcome, continuation, maxContinuations)
 	return linkPart + " " + critPart
 }
 
@@ -2867,13 +2880,13 @@ func (r reporter) applyHandoffPlan(ctx context.Context, continuations int, maxCo
 		return handoffVerdict{
 			Kind:        "body-repair",
 			PRNumber:    linkOutcome.pr.Number,
-			ContinueMsg: combinedBodyRepairMessage(r.sourceIssue(), linkOutcome, continuations+1),
+			ContinueMsg: combinedBodyRepairMessage(r.sourceIssue(), linkOutcome, continuations+1, maxContinuations),
 		}
 	case linkOutcome.err != nil:
 		if !resumable {
 			return handoffVerdict{PRNumber: linkOutcome.pr.Number, FailReason: r.linkageExhaustedReason(linkOutcome)}
 		}
-		return handoffVerdict{Kind: "linkage-repair", ContinueMsg: linkageRepairMessage(r.sourceIssue(), linkOutcome, continuations+1), PRNumber: linkOutcome.pr.Number}
+		return handoffVerdict{Kind: "linkage-repair", ContinueMsg: linkageRepairMessage(r.sourceIssue(), linkOutcome, continuations+1, maxContinuations), PRNumber: linkOutcome.pr.Number}
 	case linkOutcome.criteriaErr != nil:
 		if !resumable {
 			return handoffVerdict{
@@ -2884,7 +2897,7 @@ func (r reporter) applyHandoffPlan(ctx context.Context, continuations int, maxCo
 		return handoffVerdict{
 			Kind:        "criteria-repair",
 			PRNumber:    linkOutcome.pr.Number,
-			ContinueMsg: criteriaRepairMessage(r.sourceIssue(), linkOutcome, continuations+1),
+			ContinueMsg: criteriaRepairMessage(r.sourceIssue(), linkOutcome, continuations+1, maxContinuations),
 		}
 	}
 	// Both contracts passed: either the criteria check ran and

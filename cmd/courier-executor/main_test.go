@@ -5833,8 +5833,8 @@ func TestLinkageRepairMessage(t *testing.T) {
 	source := broker.SourceIssue{Owner: "misospace", Name: "miso-gallery", Number: 502}
 
 	outcome := &handoffCheckOutcome{pr: &prLinkageObservation{Number: 12, State: "open", Body: "Addresses #502"}}
-	want := "Courier refused the handoff: PR #12's body does not carry an authoritative closing reference to misospace/miso-gallery#502. Update the PR body through the forge capability so it carries a supported closing keyword (Closes, Fixes, or Resolves) followed by #502, or the cross-repo form misospace/miso-gallery#502 when the trusted source repository differs from the PR base. Then re-declare the same outcome. (continuation 2)"
-	if got := linkageRepairMessage(source, outcome, 2); got != want {
+	want := "Courier refused the handoff: PR #12's body does not carry an authoritative closing reference to misospace/miso-gallery#502. Update the PR body through the forge capability so it carries a supported closing keyword (Closes, Fixes, or Resolves) followed by #502, or the cross-repo form misospace/miso-gallery#502 when the trusted source repository differs from the PR base. Then re-declare the same outcome. (continuation 2 of 3; 1 remaining)"
+	if got := linkageRepairMessage(source, outcome, 2, 3); got != want {
 		t.Fatalf("linkageRepairMessage = %q, want %q", got, want)
 	}
 }
@@ -5868,7 +5868,7 @@ func TestCombinedBodyRepairMessageNamesBothContracts(t *testing.T) {
 		criteriaErr: critErr,
 		pinnedSet:   pinned,
 	}
-	msg := combinedBodyRepairMessage(source, outcome, 2)
+	msg := combinedBodyRepairMessage(source, outcome, 2, 3)
 	// Both defects must be present in one message.
 	if !strings.Contains(msg, "Closes, Fixes, or Resolves") {
 		t.Fatalf("combinedBodyRepairMessage must name the linkage contract: %q", msg)
@@ -5884,11 +5884,12 @@ func TestCombinedBodyRepairMessageNamesBothContracts(t *testing.T) {
 	}
 	// The single bounded repair is one continuation slot, not two.
 	// The combined message concatenates the two repair parts and
-	// each part names the continuation number; both must agree.
-	if got := strings.Count(msg, "(continuation 2)"); got != 2 {
-		t.Fatalf("combinedBodyRepairMessage should name (continuation 2) twice (one from each part) since the shared budget consumes one slot; got %d in: %q", got, msg)
+	// each part names the continuation number and the remaining
+	// budget; both must agree.
+	if got := strings.Count(msg, "(continuation 2 of 3; 1 remaining)"); got != 2 {
+		t.Fatalf("combinedBodyRepairMessage should name (continuation 2 of 3; 1 remaining) twice (one from each part) since the shared budget consumes one slot; got %d in: %q", got, msg)
 	}
-	if strings.Contains(msg, "(continuation 3)") {
+	if strings.Contains(msg, "(continuation 3 of 3") {
 		t.Fatalf("combinedBodyRepairMessage should not name a different continuation number: %q", msg)
 	}
 	// Linkage first, criteria second — structurally prior ordering.
@@ -5982,8 +5983,8 @@ func pinCriteriaEnvelopeForMisoGallery(t *testing.T) string {
 // satisfy, and the grammar the body must satisfy — the
 // "courier-criteria:v1" header, the "AC-n sha256:... status - reference"
 // row form, the closed status vocabulary, and the per-status shape rules.
-// The continuation number is named for the model to see the remaining
-// budget.
+// The continuation number, total, and remaining slots are named so the
+// model sees the remaining budget (#282).
 func TestCriteriaRepairMessagePinsValidatorVocabulary(t *testing.T) {
 	source := broker.SourceIssue{Owner: "misospace", Name: "miso-gallery", Number: 502}
 	ce := &broker.CriteriaError{
@@ -6011,7 +6012,7 @@ func TestCriteriaRepairMessagePinsValidatorVocabulary(t *testing.T) {
 		criteriaErr: ce,
 		pinnedSet:   pinned,
 	}
-	msg := criteriaRepairMessage(source, outcome, 3)
+	msg := criteriaRepairMessage(source, outcome, 3, 3)
 	for _, want := range []string{
 		"PR #12",
 		"misospace/miso-gallery#502",
@@ -6025,7 +6026,7 @@ func TestCriteriaRepairMessagePinsValidatorVocabulary(t *testing.T) {
 		"regression-check and implementation-evidence",
 		"file path or check URL",
 		"Update the PR body through the forge capability",
-		"(continuation 3)",
+		"(continuation 3 of 3; 0 remaining)",
 		pinned.Digest,
 		"AC-1 sha256:1111111111111111111111111111111111111111111111111111111111111111",
 		"AC-2 sha256:2222222222222222222222222222222222222222222222222222222222222222",
@@ -6056,7 +6057,7 @@ func TestCriteriaRepairMessageFallsBackToReportDigestOnUncarriedSet(t *testing.T
 		criteria:    &broker.CriteriaReport{SetDigest: reportDigest},
 		criteriaErr: ce,
 	}
-	msg := criteriaRepairMessage(source, outcome, 1)
+	msg := criteriaRepairMessage(source, outcome, 1, 3)
 	if !strings.Contains(msg, reportDigest) {
 		t.Fatalf("criteriaRepairMessage should carry the report's set digest when no pinned set is attached: %q", msg)
 	}
