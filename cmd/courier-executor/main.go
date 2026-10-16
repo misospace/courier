@@ -136,7 +136,7 @@ func main() {
 		ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM)
 		defer stop()
 		if err := observerMode(ctx, os.Args[1] == "observe-seed"); err != nil {
-			fmt.Fprintln(os.Stderr, "courier: workspace observation failed")
+			fmt.Fprintln(os.Stderr, "courier: workspace observation failed:", err)
 			os.Exit(1)
 		}
 		return
