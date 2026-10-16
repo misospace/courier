@@ -45,7 +45,7 @@ func observerMode(ctx context.Context, seed bool) error {
 			return err
 		}
 		// Kubelet carries the init container's independent baseline to the operator.
-		return os.WriteFile(filepath.Join(private, "seed-termination"), []byte(baseline), 0600)
+		return os.WriteFile(executor.ObserverStatePath+"/seed-termination", []byte(baseline), 0600)
 	}
 	baseline, err := os.ReadFile(baselineFile)
 	if err != nil {
@@ -96,5 +96,5 @@ func observerMode(ctx context.Context, seed bool) error {
 	if len(data) > executor.MaxTerminationLineBytes {
 		return errors.New("observer: evidence exceeds termination budget")
 	}
-	return os.WriteFile(filepath.Join(private, "termination"), data, 0600)
+	return os.WriteFile(os.Getenv("COURIER_TERMINATION_FILE"), data, 0600)
 }

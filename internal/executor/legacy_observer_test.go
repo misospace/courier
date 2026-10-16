@@ -67,10 +67,10 @@ func TestLegacyObserverPodIsolationContract(t *testing.T) {
 	if envSecretRef(observer.Env, "GITHUB_TOKEN", "git-auth", "token") {
 		t.Fatal("observer received GitHub API credentials")
 	}
-	if observer.TerminationMessagePath != ObserverStatePath+"/private/termination" || observer.TerminationMessagePolicy != corev1.TerminationMessageReadFile {
+	if observer.TerminationMessagePath != ObserverStatePath+"/termination" || observer.TerminationMessagePolicy != corev1.TerminationMessageReadFile {
 		t.Fatalf("termination path = %q", observer.TerminationMessagePath)
 	}
-	if seed.TerminationMessagePath != ObserverStatePath+"/private/seed-termination" || seed.TerminationMessagePolicy != corev1.TerminationMessageReadFile {
+	if seed.TerminationMessagePath != ObserverStatePath+"/seed-termination" || seed.TerminationMessagePolicy != corev1.TerminationMessageReadFile {
 		t.Fatalf("seed termination path = %q", seed.TerminationMessagePath)
 	}
 }

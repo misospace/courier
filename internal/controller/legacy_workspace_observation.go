@@ -110,7 +110,7 @@ func isolatedObserverSpec(pod *corev1.Pod) bool {
 			observer = c
 		}
 	}
-	if writer == nil || observer == nil || observer.TerminationMessagePath != executor.ObserverStatePath+"/private/termination" || observer.TerminationMessagePolicy != corev1.TerminationMessageReadFile || observer.Image != writer.Image || !reflect.DeepEqual(observer.Command, []string{"/usr/local/bin/courier-executor"}) || !reflect.DeepEqual(observer.Args, []string{"observe-workspace"}) {
+	if writer == nil || observer == nil || observer.TerminationMessagePath != executor.ObserverStatePath+"/termination" || observer.TerminationMessagePolicy != corev1.TerminationMessageReadFile || observer.Image != writer.Image || !reflect.DeepEqual(observer.Command, []string{"/usr/local/bin/courier-executor"}) || !reflect.DeepEqual(observer.Args, []string{"observe-workspace"}) {
 		return false
 	}
 	security := observer.SecurityContext
@@ -124,7 +124,7 @@ func isolatedObserverSpec(pod *corev1.Pod) bool {
 	// the only shared volume is the workspace, mounted read-only by the observer.
 	seedValid := false
 	for _, seed := range pod.Spec.InitContainers {
-		if seed.Name == "workspace-observer-seed" && seed.Image == observer.Image && reflect.DeepEqual(seed.Command, observer.Command) && reflect.DeepEqual(seed.Args, []string{"observe-seed"}) && seed.TerminationMessagePath == executor.ObserverStatePath+"/private/seed-termination" {
+		if seed.Name == "workspace-observer-seed" && seed.Image == observer.Image && reflect.DeepEqual(seed.Command, observer.Command) && reflect.DeepEqual(seed.Args, []string{"observe-seed"}) && seed.TerminationMessagePath == executor.ObserverStatePath+"/seed-termination" {
 			seedValid = true
 		}
 	}
