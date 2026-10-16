@@ -27,6 +27,91 @@ func TestCoordinatorDockerfileUsesNumericIdentity(t *testing.T) {
 	}
 }
 
+func TestCoordinatorDockerfileShipsProcessTreeTools(t *testing.T) {
+	data, err := os.ReadFile(filepath.Join("..", "..", "Dockerfile"))
+	if err != nil {
+		t.Fatalf("read Dockerfile: %v", err)
+	}
+	dockerfile := string(data)
+
+	// First "AS coordinator\n" is the bootstrap coordinator stage; the
+	// coordinator-go FROM line comes later and only prefixes it.
+	stageStart := strings.Index(dockerfile, "AS coordinator\n")
+	if stageStart < 0 {
+		t.Fatal("Dockerfile does not define coordinator stage")
+	}
+	stageEnd := strings.Index(dockerfile[stageStart:], "\nFROM ")
+	if stageEnd < 0 {
+		stageEnd = len(dockerfile) - stageStart
+	}
+	stage := dockerfile[stageStart : stageStart+stageEnd]
+
+	if !strings.Contains(stage, "procps") {
+		t.Fatal("coordinator Dockerfile does not install procps (ps, pgrep, pkill required by the runtime process-tree preflight)")
+	}
+}
+
+func TestCoordinatorImageProcessTreeTools(t *testing.T) {
+	image := os.Getenv("COURIER_COORDINATOR_IMAGE")
+	if image == "" {
+		t.Skip("set COURIER_COORDINATOR_IMAGE to run the coordinator process-tree image test")
+	}
+	dockerPath, err := exec.LookPath("docker")
+	if err != nil {
+		t.Skip("docker CLI not found on PATH; install Docker to run the coordinator process-tree image test")
+	}
+
+	run := func(args ...string) (string, string, error) {
+		cmd := exec.Command(dockerPath, args...)
+		var stdout, stderr bytes.Buffer
+		cmd.Stdout = &stdout
+		cmd.Stderr = &stderr
+		runErr := cmd.Run()
+		return stdout.String(), stderr.String(), runErr
+	}
+
+	// Smoke test runs inside the built runtime image, not against CI host
+	// utilities: the shipped image must carry the process-tree tools the
+	// OpenCode runtime preflight requires, and they must actually terminate
+	// a two-level tree. Availability is a toolchain contract; no extra
+	// runtime privileges are granted or implied.
+	probe := `set -eu
+for tool in ps pgrep pkill; do
+	command -v "$tool" >/dev/null || { echo "missing required tool: $tool" >&2; exit 1; }
+done
+sh -c 'sleep 30 & sleep 30; wait' &
+child=$!
+tries=0
+until [ -n "$(pgrep -P "$child" 2>/dev/null)" ] || [ "$tries" -ge 50 ]; do
+	sleep 0.1; tries=$((tries+1))
+done
+tree="$(pgrep -P "$child" 2>/dev/null || true)"
+test -n "$tree"
+ps -o pid= -p "$child" >/dev/null
+pkill -TERM -P "$child"
+tries=0
+until [ -z "$(pgrep -P "$child" 2>/dev/null)" ] || [ "$tries" -ge 50 ]; do
+	sleep 0.1; tries=$((tries+1))
+done
+left="$(pgrep -P "$child" 2>/dev/null || true)"
+test -z "$left"
+kill -TERM "$child" 2>/dev/null || true
+echo PROCTREE_OK`
+	stdout, stderr, err := run(
+		"run", "--rm",
+		"--user", "65532:65532",
+		"--entrypoint", "sh",
+		image,
+		"-c", probe,
+	)
+	if err != nil {
+		t.Fatalf("process-tree probe failed in image %s: %s", image, snippet(stderr))
+	}
+	if !strings.Contains(stdout, "PROCTREE_OK") {
+		t.Fatalf("process-tree probe in image %s did not confirm termination: %s", image, snippet(stderr))
+	}
+}
+
 func TestCoordinatorGoDockerfilePinsToolchainCachePath(t *testing.T) {
 	data, err := os.ReadFile(filepath.Join("..", "..", "Dockerfile"))
 	if err != nil {

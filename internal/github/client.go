@@ -16,6 +16,7 @@ import (
 	"path"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/misospace/courier/internal/forge"
 )
@@ -26,6 +27,16 @@ const (
 	maxPullRequestPages = 1000
 )
 
+// defaultRequestTimeout bounds one GitHub request end to end: the connection
+// and TLS handshake, redirects, the wait for response headers, and the
+// response-body read. The default transport carries it and every request context
+// carries it too, so a forge that accepts a connection and then stalls fails the
+// request instead of holding a reconcile, a broker policy read, or an executor
+// handoff check open until process shutdown. It bounds a single request, never a
+// run: a caller's earlier cancellation or deadline stays authoritative, and a
+// paginated read gets the bound per page rather than once for the whole walk.
+const defaultRequestTimeout = 30 * time.Second
+
 // HTTPDoer is the part of http.Client used by Client. Keeping it small makes
 // the GitHub adapter straightforward to test without a live repository.
 type HTTPDoer interface {
@@ -34,15 +45,21 @@ type HTTPDoer interface {
 
 // Client is a minimal GitHub REST API client for pull requests and CI checks.
 type Client struct {
-	baseURL    *url.URL
-	token      string
-	httpClient HTTPDoer
+	baseURL        *url.URL
+	token          string
+	httpClient     HTTPDoer
+	requestTimeout time.Duration
 }
 
 // NewClient creates a GitHub client. baseURL is normally left as
 // https://api.github.com/; a custom URL is useful for GitHub Enterprise and
-// tests. The optional HTTP client defaults to http.DefaultClient.
+// tests. The optional HTTP client replaces the default transport; either way
+// every request is bounded by defaultRequestTimeout.
 func NewClient(baseURL, token string, clients ...HTTPDoer) (*Client, error) {
+	return newClient(baseURL, token, defaultRequestTimeout, clients...)
+}
+
+func newClient(baseURL, token string, requestTimeout time.Duration, clients ...HTTPDoer) (*Client, error) {
 	if strings.TrimSpace(baseURL) == "" {
 		baseURL = defaultBaseURL
 	}
@@ -56,11 +73,14 @@ func NewClient(baseURL, token string, clients ...HTTPDoer) (*Client, error) {
 	if len(clients) > 1 {
 		return nil, errors.New("at most one HTTP client may be supplied")
 	}
-	httpClient := HTTPDoer(http.DefaultClient)
+	if requestTimeout <= 0 {
+		requestTimeout = defaultRequestTimeout
+	}
+	httpClient := HTTPDoer(&http.Client{Timeout: requestTimeout})
 	if len(clients) == 1 && clients[0] != nil {
 		httpClient = clients[0]
 	}
-	return &Client{baseURL: u, token: token, httpClient: httpClient}, nil
+	return &Client{baseURL: u, token: token, httpClient: httpClient, requestTimeout: requestTimeout}, nil
 }
 
 // NewGitHubClient is an explicit constructor alias for callers that prefer a
@@ -486,8 +506,16 @@ func (c *Client) doJSON(ctx context.Context, method, relative string, input, out
 }
 
 // doJSONQuery is doJSON with a raw query string, for list endpoints that
-// filter server-side.
+// filter server-side. The request context carries the client's bound so the
+// response-body read is covered even when a caller injects an HTTPDoer with no
+// timeout of its own; an earlier caller deadline remains the effective one.
 func (c *Client) doJSONQuery(ctx context.Context, method, relative, query string, input, output any) error {
+	bound := c.requestTimeout
+	if bound <= 0 {
+		bound = defaultRequestTimeout
+	}
+	ctx, cancel := context.WithTimeout(ctx, bound)
+	defer cancel()
 	var body io.Reader
 	if input != nil {
 		encoded, err := json.Marshal(input)

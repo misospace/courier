@@ -10,6 +10,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	courierv1alpha1 "github.com/misospace/courier/api/v1alpha1"
 	"github.com/misospace/courier/internal/controller"
@@ -837,5 +838,221 @@ func TestGetIssue(t *testing.T) {
 	var apiErr *APIError
 	if !errors.As(err, &apiErr) || apiErr.StatusCode != http.StatusNotFound {
 		t.Fatalf("missing issue error = %v (%T), want a 404 APIError", err, err)
+	}
+}
+
+// stalledHandler answers a request only after the client has given up, which is
+// how a forge that accepts a connection and then stops behaves: the client's
+// own bound, not the caller's context, is what ends the call.
+func stalledHandler(partialBody bool) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if partialBody {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusOK)
+			_, _ = io.WriteString(w, `{"number":7,`)
+			if flusher, ok := w.(http.Flusher); ok {
+				flusher.Flush()
+			}
+		}
+		<-r.Context().Done()
+	}
+}
+
+func TestDefaultRequestTimeoutIsFinite(t *testing.T) {
+	t.Parallel()
+	client, err := New("token")
+	if err != nil {
+		t.Fatal(err)
+	}
+	doer, ok := client.httpClient.(*http.Client)
+	if !ok {
+		t.Fatalf("default transport = %T, want *http.Client", client.httpClient)
+	}
+	if doer.Timeout != defaultRequestTimeout {
+		t.Fatalf("default transport timeout = %v, want %v", doer.Timeout, defaultRequestTimeout)
+	}
+	if defaultRequestTimeout <= 0 {
+		t.Fatalf("defaultRequestTimeout = %v, want a finite bound", defaultRequestTimeout)
+	}
+}
+
+func TestRequestBoundTerminatesStalledHeaders(t *testing.T) {
+	t.Parallel()
+	server := httptest.NewServer(stalledHandler(false))
+	defer server.Close()
+	client, err := newClient(server.URL, "token", 100*time.Millisecond)
+	if err != nil {
+		t.Fatal(err)
+	}
+	start := time.Now()
+	_, err = client.GetPullRequest(context.Background(), "acme", "demo", 7)
+	elapsed := time.Since(start)
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("stalled-header error = %v (%T), want a deadline error", err, err)
+	}
+	if !strings.Contains(err.Error(), "GitHub request:") {
+		t.Fatalf("stalled-header error = %v, want the header wait to be the phase that failed", err)
+	}
+	if elapsed > 5*time.Second {
+		t.Fatalf("stalled headers held the read for %v, want the request bound to end it", elapsed)
+	}
+}
+
+func TestRequestBoundTerminatesStalledBody(t *testing.T) {
+	t.Parallel()
+	server := httptest.NewServer(stalledHandler(true))
+	defer server.Close()
+	client, err := newClient(server.URL, "token", 100*time.Millisecond)
+	if err != nil {
+		t.Fatal(err)
+	}
+	start := time.Now()
+	_, err = client.GetPullRequest(context.Background(), "acme", "demo", 7)
+	elapsed := time.Since(start)
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("stalled-body error = %v (%T), want a deadline error", err, err)
+	}
+	if !strings.Contains(err.Error(), "read GitHub response:") {
+		t.Fatalf("stalled-body error = %v, want the body read to be the phase that failed", err)
+	}
+	if elapsed > 5*time.Second {
+		t.Fatalf("stalled body held the read for %v, want the request bound to end it", elapsed)
+	}
+}
+
+func TestInjectedHTTPDoerKeepsTheRequestBound(t *testing.T) {
+	t.Parallel()
+	blocking := &blockingHTTPDoer{}
+	client, err := newClient("https://api.github.invalid/", "token", 100*time.Millisecond, blocking)
+	if err != nil {
+		t.Fatal(err)
+	}
+	start := time.Now()
+	_, err = client.GetPullRequest(context.Background(), "acme", "demo", 7)
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("injected-doer error = %v (%T), want a deadline error", err, err)
+	}
+	if blocking.calls != 1 {
+		t.Fatalf("injected doer calls = %d, want 1", blocking.calls)
+	}
+	if elapsed := time.Since(start); elapsed > 5*time.Second {
+		t.Fatalf("injected doer held the read for %v, want the request bound to end it", elapsed)
+	}
+}
+
+// blockingHTTPDoer stands in for a test HTTPDoer that never answers. It blocks
+// on the request context rather than on a timer so the client's own bound is
+// the only thing that can release it.
+type blockingHTTPDoer struct {
+	calls int
+}
+
+func (d *blockingHTTPDoer) Do(req *http.Request) (*http.Response, error) {
+	d.calls++
+	<-req.Context().Done()
+	return nil, req.Context().Err()
+}
+
+// stallingBodyHTTPDoer answers with headers and a body that never finishes,
+// which only the request context can interrupt: an injected transport carries no
+// timeout of its own, so the client's per-request bound is the sole bound on the
+// body read.
+type stallingBodyHTTPDoer struct {
+	body *contextBody
+}
+
+func (d stallingBodyHTTPDoer) Do(req *http.Request) (*http.Response, error) {
+	d.body.ctx = req.Context()
+	return &http.Response{
+		StatusCode: http.StatusOK,
+		Header:     http.Header{"Content-Type": []string{"application/json"}},
+		Body:       d.body,
+	}, nil
+}
+
+type contextBody struct {
+	ctx context.Context
+}
+
+func (b *contextBody) Read([]byte) (int, error) {
+	<-b.ctx.Done()
+	return 0, b.ctx.Err()
+}
+
+func (b *contextBody) Close() error {
+	return nil
+}
+
+func TestInjectedHTTPDoerBoundsTheBodyRead(t *testing.T) {
+	t.Parallel()
+	doer := stallingBodyHTTPDoer{body: &contextBody{}}
+	client, err := newClient("https://api.github.invalid/", "token", 100*time.Millisecond, doer)
+	if err != nil {
+		t.Fatal(err)
+	}
+	start := time.Now()
+	_, err = client.GetPullRequest(context.Background(), "acme", "demo", 7)
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("injected-body error = %v (%T), want a deadline error", err, err)
+	}
+	if !strings.Contains(err.Error(), "read GitHub response:") {
+		t.Fatalf("injected-body error = %v, want the body read to be the phase that failed", err)
+	}
+	if elapsed := time.Since(start); elapsed > 5*time.Second {
+		t.Fatalf("injected body held the read for %v, want the request bound to end it", elapsed)
+	}
+}
+
+func TestEarlierCallerDeadlineStaysAuthoritative(t *testing.T) {
+	t.Parallel()
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		select {
+		case <-time.After(2 * time.Second):
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = io.WriteString(w, `{"number":7,"state":"open"}`)
+		case <-r.Context().Done():
+		}
+	}))
+	defer server.Close()
+	// The default 30-second bound is far longer than the response, so a read that
+	// returns on the caller's deadline proves that deadline stayed in force.
+	client, err := NewClient(server.URL, "token")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+	start := time.Now()
+	_, err = client.GetPullRequest(ctx, "acme", "demo", 7)
+	elapsed := time.Since(start)
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("caller-deadline error = %v (%T), want the caller's deadline to end the read", err, err)
+	}
+	if elapsed > 2*time.Second {
+		t.Fatalf("caller deadline was not authoritative: read returned after %v", elapsed)
+	}
+}
+
+func TestBoundedRequestStillCompletes(t *testing.T) {
+	t.Parallel()
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		select {
+		case <-time.After(50 * time.Millisecond):
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = io.WriteString(w, `{"number":7,"title":"Bound the read","state":"open"}`)
+		case <-r.Context().Done():
+		}
+	}))
+	defer server.Close()
+	client, err := NewClient(server.URL, "token")
+	if err != nil {
+		t.Fatal(err)
+	}
+	pull, err := client.GetPullRequest(context.Background(), "acme", "demo", 7)
+	if err != nil {
+		t.Fatalf("GetPullRequest() error = %v", err)
+	}
+	if pull.Number != 7 || pull.Title != "Bound the read" {
+		t.Fatalf("GetPullRequest() = %#v, want the slow response decoded", pull)
 	}
 }
