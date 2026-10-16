@@ -402,6 +402,9 @@ func topologyBroken(pod *corev1.Pod) bool {
 
 // fenceAndRelaunch deletes the run's topology pods and returns the run to
 // Claimed for relaunch, honoring the crashloop ceiling exactly like liveness.
+// The charge itself is the reconciler's chargeRelaunch; what stays this path's
+// own is the ceiling hand-off, which records SecurePreflightFailed rather than
+// the reconciler's terminal diagnostic (#223).
 func (s *SecureControl) fenceAndRelaunch(ctx context.Context, run *courier.CoderRun) (ctrl.Result, bool, error) {
 	// Fence leaves the control pod in place (see its doc); relaunch needs
 	// every component torn down so the next LaunchSecure pass produces a
@@ -410,26 +413,68 @@ func (s *SecureControl) fenceAndRelaunch(ctx context.Context, run *courier.Coder
 	if err != nil {
 		return ctrl.Result{}, true, err
 	}
-	if controlPod != nil {
+	atCeiling := run.Status.Restarts >= crashloopCeiling(s.MaxRestarts)
+	// A control object that reports no outcome — terminal phase, no recorded
+	// coordinator termination — is inert: it can never tell the reconciler
+	// what the run's model did, so the only thing left of it is the evidence.
+	// An unrecoverable control object at the ceiling is that evidence and is
+	// preserved, not deleted, exactly as the wedge path and the disappearance
+	// backstop do (#106). Below the ceiling it is deleted so the deterministic
+	// pod name is free for the replacement round.
+	//
+	// A still-recoverable control object is never preserved, at the ceiling or
+	// below: no replacement needs its name withheld, and it records a live
+	// round rather than a cause.
+	//
+	// The nil case is a live read that no longer shows the control pod — it
+	// vanished between ObserveTopology's observation and this re-read — so
+	// nothing is deleted and nothing is preserved. coordinatorPodUnrecoverable
+	// dereferences its argument, hence the guard here rather than at the call.
+	inert := controlPod != nil && coordinatorPodUnrecoverable(controlPod)
+	deleted := false
+	if controlPod != nil && !(atCeiling && inert) {
 		if err := s.Client.Delete(ctx, controlPod); client.IgnoreNotFound(err) != nil {
 			return ctrl.Result{}, true, err
+		}
+		deleted = true
+	}
+	// A delete is not a disappearance: below the ceiling the delete is
+	// re-confirmed against the API server before the relaunch is charged,
+	// so a finalizer-held control object defers the charge instead of
+	// charging a no-op delete for one physical loss. The deferral happens
+	// BEFORE the fence, exactly as checkLiveness defers before fencing: the
+	// round stays standing, and the disappearance backstop takes both the
+	// fence and the deferred charge once the name is provably free. A failed
+	// live read is not evidence the name is free and defers too. At the
+	// ceiling there is no charge to defer and the hand-off terminalizes in
+	// this reconcile.
+	//
+	// The re-confirmation guards the inert object only, which is exactly the
+	// object the disappearance backstop deletes and defers on: a finalizer can
+	// hold such an object indefinitely, and it carries no exit the reconciler
+	// could mistake for a run outcome. A recoverable control object is not
+	// deferred, because a deferred charge leaves the run Running while the
+	// pod is torn down — and the next reconcile's exit-code mapping would
+	// read the teardown's exit code and terminalize the run instead of
+	// relaunching it. That object is charged in place, the run leaves Running
+	// immediately, and the launch path re-observes the deterministic name
+	// until it is free. (#223)
+	if deleted && !atCeiling && inert {
+		present, err := coordinatorObjectPresentLive(ctx, s.reader(), run)
+		if err != nil || present {
+			return ctrl.Result{RequeueAfter: secureRequeueDelay}, true, nil
 		}
 	}
 	if err := s.Fence(ctx, run); err != nil {
 		return ctrl.Result{}, true, err
 	}
-	if run.Status.Restarts >= crashloopCeiling(s.MaxRestarts) {
+	if atCeiling {
 		// The terminal hand-off disarms the control request itself.
 		result, err := s.transitionNeedsHuman(ctx, run, "secure topology failed repeatedly and reached the crashloop ceiling")
 		return result, true, err
 	}
 	before := run.DeepCopy()
-	// A soft-stop addressed to the torn-down incarnation is void; disarm it
-	// (observing an unacknowledged request) after the diff base so the
-	// relaunch patch persists the disarm alongside the restart charge (#238).
-	softStopBeforeRelaunch(run, s.now())
-	run.Status.Restarts++
-	run.Status.Phase = courier.PhaseClaimed
+	chargeRelaunch(run, s.now())
 	if err := s.Patcher.patchStatus(ctx, before, run); err != nil {
 		return ctrl.Result{}, true, err
 	}
