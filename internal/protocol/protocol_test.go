@@ -142,7 +142,16 @@ func TestWorkerHappyPathDispatchAndResult(t *testing.T) {
 	env := dispatchEnvelope(worker.clock())
 	env.PayloadDigest = PayloadDigestOf(payload)
 	status, err := (&Client{BaseURL: server.URL}).Dispatch(ctx, priv, env, payload)
-	if err != nil || status != "running" {
+	// The dispatch response is written after the task goroutine starts, so a
+	// trivial task may already be terminal when the response is written; the
+	// eventual result is polled below either way, and the redelivery guard is
+	// asserted separately.
+	if err != nil {
+		t.Fatalf("Dispatch: %v", err)
+	}
+	switch status {
+	case "running", ResultCompleted, ResultCancelled, ResultFailed:
+	default:
 		t.Fatalf("Dispatch = %q, %v", status, err)
 	}
 
