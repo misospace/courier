@@ -61,7 +61,12 @@ func observerMode(ctx context.Context, seed bool) error {
 	namespace, name, uid := os.Getenv("POD_NAMESPACE"), os.Getenv("POD_NAME"), os.Getenv("POD_UID")
 	var writerID string
 	var getErr error
-	for attempt := 0; attempt < 5; attempt++ {
+	// The observer starts alongside the writer, before the operator has
+	// provisioned its run-scoped RBAC; API blips and authorization
+	// propagation at pod start must not forfeit the evidence, so startup
+	// failures retry for a bounded window before the observation gives up.
+	startupDeadline := time.Now().Add(90 * time.Second)
+	for {
 		pod, err := kube.CoreV1().Pods(namespace).Get(ctx, name, metav1.GetOptions{})
 		if err == nil {
 			getErr = nil
@@ -77,18 +82,16 @@ func observerMode(ctx context.Context, seed bool) error {
 				break
 			}
 		} else {
-			// The observer starts alongside the writer; a brief API or
-			// network blip at pod start must not forfeit the evidence.
 			getErr = err
+			if time.Now().After(startupDeadline) {
+				return fmt.Errorf("observer: pod observation failed: %w", getErr)
+			}
 		}
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
 		case <-time.After(time.Second):
 		}
-	}
-	if getErr != nil {
-		return fmt.Errorf("observer: pod observation failed: %w", getErr)
 	}
 	operation, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
