@@ -297,18 +297,20 @@ func RunContextEnvironment(inv Invocation) []EnvVar {
 	// pre-contract policies carry no envelope, so its absence is meaningful
 	// to the legacy boundary rather than an empty stand-in.
 	if strings.TrimSpace(inv.Criteria) != "" {
-		values = append(values, EnvVar{Name: criteriaEnvName, Value: inv.Criteria})
+		values = append(values, EnvVar{Name: EnvCriteria, Value: inv.Criteria})
 	}
 	return values
 }
 
-// criteriaEnvName is the trusted envelope carrying the pinned
+// EnvCriteria is the trusted envelope carrying the pinned
 // acceptance-criterion set to a coordinator (#280): the broker criterion-set
 // JSON (issue identity, criteria with IDs/texts/digests, set digest),
 // operator-authored from the persisted publication policy. The set is public
 // issue text; the contract is that the validator's comparison target is
-// operator-authored and the model cannot change it.
-const criteriaEnvName = "COURIER_CRITERIA"
+// operator-authored and the model cannot change it. Exported so the
+// operator's pod rendering (RunContextEnvironment) and the standalone
+// executor's config read name the same variable and cannot drift.
+const EnvCriteria = "COURIER_CRITERIA"
 
 // Default git identity names used when a deployment configures none. A fresh
 // clone has no git identity, so the coordinator environment must always carry
@@ -489,7 +491,7 @@ func InvocationFromEnv(get func(string) string) (Invocation, error) {
 		Framing:   get("COURIER_FRAMING"),
 		Workspace: get("COURIER_WORKSPACE"),
 		Debug:     get("COURIER_LOG_LEVEL") == "debug",
-		Criteria:  get(criteriaEnvName),
+		Criteria:  get(EnvCriteria),
 	}
 	inv.Mode = courierv1alpha1.Mode(get("COURIER_MODE"))
 	switch inv.Mode {

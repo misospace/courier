@@ -1900,7 +1900,15 @@ named items remain unresolved and must not be described as production-ready:
   run, and the binding is checked before the pinned-empty shortcut so a
   foreign envelope cannot slip through as a vacuous pass — mirroring the
   native engine's `Criteria.Issue == SourceIssue` binding in
-  `internal/broker/policy.go`.
+  `internal/broker/policy.go`. A run whose pinned envelope has no bindable
+  identity at all fails closed one step earlier, before the forge is read,
+  so a malformed `COURIER_REPO`/`COURIER_REF` can never hand off
+  `Verifying` with neither body contract enforced. An envelope that does
+  not decode is the same class of admission-time fault — read once from
+  the pod environment, unchangeable by any later observation — so it fails
+  closed too (`linkage.read.failed` with kind `criteria`), spending no
+  #170 slot and never being presented to the model as a repairable body
+  defect.
   A passing pinned handoff surfaces the derived coverage and per-status
   counts both in the `run.exit` telemetry and as a best-effort outcome
   comment on the run's source issue — a partial record is labelled

@@ -6513,8 +6513,23 @@ func runCriteriaEndToEnd(t *testing.T, prBody, script, criteriaEnvelope string) 
 // comment traffic surfaced: it also returns the bodies of every issue
 // comment the run posted, and failComments makes the forge reject every
 // comment with HTTP 500 so a test can pin that a comment failure never
-// changes the run's ending (#282, step 4).
+// changes the run's ending (#282, step 4). The run's trusted identity is
+// the miso-gallery one the pinned-set fixture is bound to; a test that
+// needs an identity trustedSourceIssue cannot bind uses
+// runCriteriaEndToEndTrackedAs.
 func runCriteriaEndToEndTracked(t *testing.T, prBody, script, criteriaEnvelope string, failComments bool) (int, string, []string, []string) {
+	t.Helper()
+	return runCriteriaEndToEndTrackedAs(t, prBody, script, criteriaEnvelope, failComments, "misospace/miso-gallery", "502")
+}
+
+// runCriteriaEndToEndTrackedAs is runCriteriaEndToEndTracked with the
+// run's COURIER_REPO/COURIER_REF identity supplied by the caller, applied
+// after the harness's own defaults so every other input — the run branch,
+// the fixture PR head, the pinned envelope — stays exactly what the shared
+// fixture describes. It exists so a test can pin the #282 case where the
+// identity the pinned envelope must bind to is itself malformed, without
+// standing up a second forge fixture.
+func runCriteriaEndToEndTrackedAs(t *testing.T, prBody, script, criteriaEnvelope string, failComments bool, repo, ref string) (int, string, []string, []string) {
 	t.Helper()
 	root := t.TempDir()
 	remote := remoteWithBaseOnly(t, root)
@@ -6531,6 +6546,8 @@ func runCriteriaEndToEndTracked(t *testing.T, prBody, script, criteriaEnvelope s
 	writeExecutable(t, fakeOpenCode, script)
 	setContinuationEnv(t, root, remote, prServer.URL, fakeOpenCode)
 	setMisoGalleryRepoConfig(t)
+	t.Setenv("COURIER_REPO", repo)
+	t.Setenv("COURIER_REF", ref)
 	if criteriaEnvelope != "" {
 		t.Setenv("COURIER_CRITERIA", criteriaEnvelope)
 	}
@@ -6670,9 +6687,24 @@ func TestRunResolveIssueCriteriaDeficientBodyTriggersRepair(t *testing.T) {
 // with one criteria-repair continuation; the run ends NeedsHuman with
 // the declared outcome tag preserved and the "incomplete handoff"
 // reason carrying the broker-defined violation.
+//
+// The continuation is asserted against the pinned contract it renders,
+// not just the validator's verdict: the instruction must carry the
+// operator-pinned set digest and every pinned criterion row — ID,
+// digest, and verbatim text — so a model can satisfy the exact pinned
+// set instead of re-deriving it (#282). Asserting only "AC-2" would pass
+// on the broker-defined reason alone, which never proves the pinned
+// criteria reached the message.
 func TestRunResolveIssueCriteriaPartialBodyTriggersRepair(t *testing.T) {
 	body := readBrokerFixture(t, "miso-gallery-505-pr-partial.md")
 	envelope := pinCriteriaEnvelopeForMisoGallery(t)
+	var pinned broker.CriterionSet
+	if err := json.Unmarshal([]byte(envelope), &pinned); err != nil {
+		t.Fatalf("decode pinned criterion envelope: %v", err)
+	}
+	if len(pinned.Criteria) < 2 {
+		t.Fatalf("pinned fixture set carries %d criteria, want the full miso-gallery #502 set", len(pinned.Criteria))
+	}
 	code, out, _ := runCriteriaEndToEnd(t, body, scriptCriteriaDeficientTurns("ses_criteria_partial"), envelope)
 	if code != exitNeedsHuman {
 		t.Fatalf("run exit code = %d, want %d (NeedsHuman after criteria-repair budget exhausts); detail: %q", code, exitNeedsHuman, out)
@@ -6688,6 +6720,20 @@ func TestRunResolveIssueCriteriaPartialBodyTriggersRepair(t *testing.T) {
 	}
 	if !strings.Contains(out, "AC-2") {
 		t.Fatalf("broker-defined reason should name the missing criterion: %q", out)
+	}
+	// The pinned set digest is the trust anchor the repair instruction
+	// quotes; it appears nowhere else in the run's telemetry, so its
+	// presence proves the envelope's contract reached the message.
+	if !strings.Contains(out, "pinned set "+pinned.Digest) {
+		t.Fatalf("repair instruction must name the operator-pinned set digest %s: %q", pinned.Digest, out)
+	}
+	// Every pinned criterion is reproduced verbatim, text included, in
+	// the row shape a body must carry (see pinnedSetRepairSnippet).
+	for _, c := range pinned.Criteria {
+		row := fmt.Sprintf("%s sha256:%s — %s", c.ID, strings.TrimPrefix(c.Digest, "sha256:"), strings.TrimSpace(c.Text))
+		if !strings.Contains(out, row) {
+			t.Fatalf("repair instruction must quote pinned criterion %q: %q", row, out)
+		}
 	}
 	if !strings.Contains(out, `"outcome":"changes"`) {
 		t.Fatalf("declared changes outcome tag should be preserved on criteria-exhausted NeedsHuman: %q", out)
@@ -7040,6 +7086,108 @@ func TestRunResolveIssueForeignCriterionEnvelopeFailsClosedWithoutRepair(t *test
 	}
 	if strings.Contains(out, `"phase":"Verifying"`) {
 		t.Fatalf("identity mismatch must not hand off Verifying: %q", out)
+	}
+}
+
+// TestRunResolveIssueUnbindableIdentityWithPinnedEnvelopeFailsClosed
+// pins the other half of the envelope trust binding (#282): a
+// resolve-issue run that carries a well-formed COURIER_CRITERIA envelope
+// but no trusted source identity to bind it to (COURIER_REPO naming no
+// owner/repo, so trustedSourceIssue is not ok) must not skip both body
+// contracts and hand off as Verifying. checkHandoff fails the run closed
+// on the same criteriaEnvelopeIdentityErr the bound check raises, so the
+// run terminates NeedsHuman (verifier-rejection) with the
+// linkage.read.failed event at kind "criteria-identity", spending no
+// continuation of any kind and posting no coverage comment.
+func TestRunResolveIssueUnbindableIdentityWithPinnedEnvelopeFailsClosed(t *testing.T) {
+	body := withClosingReference(readBrokerFixture(t, "miso-gallery-505-pr-deficient.md"), "#502")
+	envelope := pinCriteriaEnvelopeForMisoGallery(t)
+	// COURIER_REPO names no owner/repo pair: the run has no trusted source
+	// identity, so the pinned envelope cannot be bound to anything.
+	code, out, _, comments := runCriteriaEndToEndTrackedAs(t, body, scriptCriteriaHonestPartialTurns("ses_unbindable_identity"), envelope, false, "miso-gallery", "502")
+	if code != exitNeedsHuman {
+		t.Fatalf("run exit code = %d, want %d (NeedsHuman on an unbindable pinned envelope); detail: %q", code, exitNeedsHuman, out)
+	}
+	if !strings.Contains(out, `"phase":"NeedsHuman"`) {
+		t.Fatalf("expected NeedsHuman phase: %q", out)
+	}
+	if !strings.Contains(out, `"category":"verifier-rejection"`) {
+		t.Fatalf("expected verifier-rejection category: %q", out)
+	}
+	if !strings.Contains(out, `"kind":"criteria-identity"`) {
+		t.Fatalf("linkage.read.failed event must carry kind criteria-identity: %q", out)
+	}
+	if !strings.Contains(out, "policy mismatch") {
+		t.Fatalf("reason must name the policy mismatch: %q", out)
+	}
+	if !strings.Contains(out, "cannot be bound") {
+		t.Fatalf("reason must say the pinned envelope cannot be bound: %q", out)
+	}
+	// Zero continuations of any kind: the budget is untouched, and the
+	// run neither claims Verifying nor reports coverage it never earned.
+	if n := strings.Count(out, `"event":"executor.continuation"`); n != 0 {
+		t.Fatalf("continuation count = %d, want 0 (an unbound envelope fails closed on sight): %q", n, out)
+	}
+	if strings.Contains(out, `"phase":"Verifying"`) {
+		t.Fatalf("an unbindable pinned envelope must not hand off Verifying: %q", out)
+	}
+	if len(comments) != 0 {
+		t.Fatalf("a failed-closed handoff must post no coverage comment, got %q", comments)
+	}
+}
+
+// TestRunResolveIssueUndecodableCriterionEnvelopeFailsClosed pins the
+// decode-failure ordering of the pre-handoff plan (#282): the pinned
+// envelope is read once from the pod environment at process start, so a
+// COURIER_CRITERIA value that does not decode can never become valid on a
+// later observation. The run must therefore fail closed on sight — the
+// linkage.read.failed event still surfaces with kind "criteria", but the
+// run spends no continuation of the shared #170 budget and is never told
+// the PR body is unverified, because the cause is the admission-time
+// projection, not the body.
+func TestRunResolveIssueUndecodableCriterionEnvelopeFailsClosed(t *testing.T) {
+	body := withClosingReference(readBrokerFixture(t, "miso-gallery-505-pr-deficient.md"), "#502")
+	undecodable := `{"issue":{"owner":"misospace","name":"miso-gallery","number":502},"criteria":[{"id":"AC-1"`
+	code, out, _, comments := runCriteriaEndToEndTracked(t, body, scriptCriteriaHonestPartialTurns("ses_undecodable_envelope"), undecodable, false)
+	if code != exitNeedsHuman {
+		t.Fatalf("run exit code = %d, want %d (NeedsHuman on an undecodable pinned envelope); detail: %q", code, exitNeedsHuman, out)
+	}
+	if !strings.Contains(out, `"phase":"NeedsHuman"`) {
+		t.Fatalf("expected NeedsHuman phase: %q", out)
+	}
+	if !strings.Contains(out, `"category":"verifier-rejection"`) {
+		t.Fatalf("expected verifier-rejection category: %q", out)
+	}
+	if !strings.Contains(out, `"kind":"criteria"`) {
+		t.Fatalf("linkage.read.failed event must carry kind criteria: %q", out)
+	}
+	if strings.Contains(out, `"kind":"criteria-identity"`) {
+		t.Fatalf("a decode failure must not be reported as an identity mismatch: %q", out)
+	}
+	if strings.Contains(out, `"kind":"linkage"`) {
+		t.Fatalf("a decode failure must not be reported as a linkage read failure: %q", out)
+	}
+	// The reason names the decode fault, not a body defect, and the
+	// decode error itself rides along.
+	if !strings.Contains(out, "could not be decoded") {
+		t.Fatalf("reason must name the undecodable envelope: %q", out)
+	}
+	if !strings.Contains(out, "decode COURIER_CRITERIA envelope") {
+		t.Fatalf("reason must carry the decoder's own error: %q", out)
+	}
+	// The decode fault is not retryable: the captured session is never
+	// asked to repair a PR body that the envelope, not the body, broke.
+	if strings.Contains(out, "could not verify the pull-request state") {
+		t.Fatalf("an undecodable envelope must not hand the model the PR-unverified repair message: %q", out)
+	}
+	if n := strings.Count(out, `"event":"executor.continuation"`); n != 0 {
+		t.Fatalf("continuation count = %d, want 0 (an undecodable envelope spends no #170 slot): %q", n, out)
+	}
+	if strings.Contains(out, `"phase":"Verifying"`) {
+		t.Fatalf("an undecodable pinned envelope must not hand off Verifying: %q", out)
+	}
+	if len(comments) != 0 {
+		t.Fatalf("a failed-closed handoff must post no coverage comment, got %q", comments)
 	}
 }
 

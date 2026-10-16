@@ -184,7 +184,7 @@ func readConfig(getenv func(string) string) (config, error) {
 		EvidenceURL:      strings.TrimSpace(getenv(executor.EnvEvidenceURL)),
 		EvidenceToken:    strings.TrimSpace(getenv(executor.EnvEvidenceToken)),
 		PodUID:           strings.TrimSpace(getenv(executor.EnvPodUID)),
-		Criteria:         strings.TrimSpace(getenv("COURIER_CRITERIA")),
+		Criteria:         strings.TrimSpace(getenv(executor.EnvCriteria)),
 	}
 	if strings.TrimSpace(cfg.GitHubToken) == "" {
 		cfg.GitHubToken = cfg.GitToken
@@ -2036,13 +2036,30 @@ func (r reporter) confirmRemotePublication(ctx context.Context) (remotePublicati
 // whose actual base differs from the pinned base (#247). A failed
 // live observation is returned as an error, never as a confirmed
 // missing PR: an unreadable forge is not evidence of absence (#247).
+//
+// A run that carries an operator-pinned criterion envelope but no trusted
+// source identity to bind it to cannot enforce either body contract, and
+// is returned as an error (criteriaEnvelopeIdentityErr) rather than as a
+// silent pass: the pre-handoff plan fails closed to NeedsHuman on sight,
+// without spending the #170 continuation budget (#282).
 func (r reporter) checkHandoff(ctx context.Context) (*handoffCheckOutcome, error) {
 	source, ok := trustedSourceIssue(r.cfg)
 	if !ok {
-		// fix-pr runs use the broker's existing identity check;
-		// resolve-issue with malformed identity is a
-		// configuration error and not something the model can
-		// repair.
+		// fix-pr runs use the broker's existing identity check, and a
+		// resolve-issue run with malformed identity carries no linkage
+		// contract to enforce — but it may still carry a pinned
+		// criterion envelope, and an operator-admitted contract that
+		// cannot be bound to any trusted issue must not be skipped
+		// silently: the run would otherwise hand off as Verifying
+		// having enforced neither body contract. Fail closed on the
+		// same criteriaEnvelopeIdentityErr the bound check raises, so
+		// applyHandoffPlan settles it for a human without spending the
+		// #170 budget (#282). With no envelope pinned the pre-handoff
+		// plan is skipped exactly as before.
+		if strings.TrimSpace(r.cfg.Criteria) != "" {
+			return nil, fmt.Errorf("%w: the run carries no valid trusted source identity, so the pinned criterion envelope cannot be bound",
+				criteriaEnvelopeIdentityErr)
+		}
 		return nil, nil
 	}
 	observation, err := r.observeRunBranchPullRequest(ctx)
@@ -2147,13 +2164,14 @@ func (r reporter) checkHandoff(ctx context.Context) (*handoffCheckOutcome, error
 //     set with zero criteria): vacuous pass; linkage is the only PR-body
 //     contract for that run. Return nil so the planner carries forward
 //     as if no set were pinned.
-//   - Decode failure of the envelope into a broker.CriterionSet: an
-//     operator-side forge-read style failure. The same fail-closed
-//     ordering the linkage check uses applies: return as an error so the
-//     caller fails closed exactly like a linkage read failure; the
+//   - Decode failure of the envelope into a broker.CriterionSet: the
+//     envelope is read once from the pod environment at process start,
+//     so no live observation can change it and a retry inside the
+//     bounded budget cannot succeed. Returned as an error; the
 //     applyHandoffPlan helper emits EventLinkageReadFailed with
 //     kind:"criteria" so an operator can tell which pre-handoff read
-//     failed.
+//     failed, then fails closed to NeedsHuman without spending the
+//     #170 budget (#282).
 //   - Envelope naming a source issue other than the run's trusted
 //     COURIER_REPO/COURIER_REF identity: a policy mismatch between two
 //     operator-side inputs, returned as criteriaEnvelopeIdentityErr so
@@ -2161,7 +2179,9 @@ func (r reporter) checkHandoff(ctx context.Context) (*handoffCheckOutcome, error
 //     model cannot repair a wrong pinned envelope by editing the PR
 //     body, and no continuation is spent on it (#282). The binding is
 //     checked before the pinned-empty shortcut, so a foreign envelope
-//     cannot slip through as a vacuous pass.
+//     cannot slip through as a vacuous pass. A run whose pinned envelope
+//     has no bindable trusted identity at all fails closed the same way
+//     one step earlier, in checkHandoff, before the forge is read.
 //   - Body validation error: a *broker.CriteriaError is recorded on the
 //     outcome (criteriaErr); a partial-success report is also kept on
 //     the outcome (criteria) so the repair path can quote the rows
@@ -2182,7 +2202,10 @@ func (r reporter) checkHandoff(ctx context.Context) (*handoffCheckOutcome, error
 // shared EventLinkageReadFailed event with kind:"criteria" for this
 // class, distinct from the linkage observation read failure, so an
 // operator can tell which pre-handoff read failed without parsing the
-// error text.
+// error text. The envelope is read once from the pod environment at
+// process start, so no retry can change it: the plan fails closed to
+// NeedsHuman without spending the #170 continuation budget rather than
+// retrying inside it.
 var criteriaEnvelopeDecodeErr = errors.New("decode COURIER_CRITERIA envelope")
 
 // criteriaEnvelopeIdentityErr is the typed sentinel the criterion-envelope
@@ -2389,15 +2412,17 @@ func nonEmptyOr(value, fallback string) string {
 	return value
 }
 
-// pinnedSetRepairSnippet renders the pinned criterion set as a short,
+// pinnedSetRepairSnippet renders the pinned criterion set as a
 // model-quotable snippet the repair path pastes into the criteria
 // continuation message (#282). The digest is the trust anchor — the
 // model must satisfy the exact pinned set, not a re-derivation — and
 // the per-criterion IDs, digests, and texts are the contract a body
-// row references. Both are operator-authored, never model-controlled;
-// the snippet is bounded to keep the legacy continuation message
-// inside its byte budget. Returns (digest, snippet) — snippet is empty
-// when the outcome carries no pinned set so callers can fall back.
+// row references. Both are operator-authored, never model-controlled.
+// The set is reproduced verbatim, each criterion text included in full:
+// #282 requires the pinned criteria verbatim, so no truncation,
+// elision, or byte cap is applied. Returns (digest, snippet) — snippet
+// is empty when the outcome carries no pinned set so callers can
+// fall back.
 func pinnedSetRepairSnippet(set *broker.CriterionSet, report *broker.CriteriaReport) (string, string) {
 	if set == nil {
 		// The validator may have produced a report even when no
@@ -2520,6 +2545,20 @@ func (r reporter) linkageExhaustedReason(outcome *handoffCheckOutcome) string {
 // can fix a policy mismatch — the run never spends a continuation here.
 func (r reporter) criteriaIdentityMismatchReason(err error) string {
 	return fmt.Sprintf("the operator-pinned criterion envelope disagrees with the run's trusted source issue and the criterion-evidence contract cannot be enforced against the wrong pinned set; this is an admission-time policy mismatch no model can repair by editing the pull-request body; the run needs a human to settle which admission input was wrong: %s", err.Error())
+}
+
+// criteriaEnvelopeDecodeReason composes the NeedsHuman reason for a run
+// whose operator-pinned COURIER_CRITERIA envelope does not decode into a
+// criterion set, so the criterion-evidence contract has no
+// operator-authored target to enforce (#282). The envelope is read once
+// from the pod environment at process start: this is an admission-time
+// projection fault that no model can repair by editing the
+// pull-request body and no live observation can change, so the run fails
+// closed without consuming the #170 continuation budget rather than
+// retrying an input that cannot move. The reason carries the decoder's
+// own error so the operator can see what the envelope failed to parse.
+func (r reporter) criteriaEnvelopeDecodeReason(err error) string {
+	return fmt.Sprintf("the operator-pinned criterion envelope could not be decoded into a criterion set, so the criterion-evidence contract has no operator-authored target to enforce; this is an admission-time projection fault no model can repair by editing the pull-request body and no live observation can change; the run needs a human to settle the pinned envelope: %s", err.Error())
 }
 
 // criteriaExhaustedReason composes the human-readable NeedsHuman reason
@@ -2769,18 +2808,19 @@ type handoffVerdict struct {
 //   - A failed live observation is never represented as a confirmed
 //     missing PR: it retries inside the bounded budget with a factual
 //     "could not verify" message, and fails closed to NeedsHuman when
-//     no retry is possible (#247, #248). A forged-side decode failure
-//     of COURIER_CRITERIA is the same fail-closed ordering: the
-//     linkage.read.failed event surfaces with kind:"criteria" so an
-//     operator can distinguish the two forge-read failures; the
-//     captured session retries inside the bounded budget and the run
-//     fails closed when no retry is possible. An envelope that decodes
-//     but names a source issue other than the run's trusted identity is
-//     not a read failure and not a model-repairable defect: the event
-//     surfaces with kind:"criteria-identity" and the run fails closed to
-//     NeedsHuman without consuming the #170 budget, as soon as the
-//     observation reaches a state where the evidence contract would run
-//     (#282).
+//     no retry is possible (#247, #248).
+//   - Two operator-side envelope faults are not read failures and not
+//     model-repairable defects, so they fail closed to NeedsHuman on
+//     sight without consuming the #170 budget (#282). The
+//     linkage.read.failed event keeps its kind detail as the
+//     discriminator — "criteria-identity" for an envelope that cannot be
+//     bound to the run's trusted source identity (wrong issue named, or
+//     no valid trusted identity at all), "criteria" for an envelope that
+//     does not decode at all, "linkage" for the genuine forge-read
+//     failure that retries inside the budget. Both envelope faults are
+//     admission-time projections read once from the pod environment, so
+//     the model can neither repair them by editing the PR body nor outlast
+//     them with a retry.
 //
 // The call site signals the budget consumed so far through continuations
 // (so the helper consumes one slot when it asks for a continue); ctxErr
@@ -2801,22 +2841,29 @@ func (r reporter) applyHandoffPlan(ctx context.Context, continuations int, maxCo
 		})
 		return handoffVerdict{FailReason: r.criteriaIdentityMismatchReason(linkErr)}
 	}
-	if linkErr != nil {
-		// One event, two remaining origins: the EventLinkageReadFailed
-		// constant serves the linkage forge-read failure (PR listing or
-		// remote publication confirmation) and the criterion envelope
-		// decode failure (#282); the envelope identity mismatch was
-		// already handled fail-closed above. The "kind" detail field is
-		// the discriminator — "linkage" for the identity-checked PR
-		// observation and "criteria" for the COURIER_CRITERIA envelope
-		// decode — so an operator can tell which pre-handoff read
-		// failed without parsing the body.
-		kind := "linkage"
-		if errors.Is(linkErr, criteriaEnvelopeDecodeErr) {
-			kind = "criteria"
-		}
+	if errors.Is(linkErr, criteriaEnvelopeDecodeErr) {
+		// The pinned envelope did not decode. It was read once from the
+		// pod environment at process start, so no live observation can
+		// change it and no retry inside the #170 budget can succeed;
+		// spending a shared slot on it would also misattribute an
+		// admission-time projection fault to the pull-request body.
+		// Fail closed on sight like the identity mismatch above, keeping
+		// the same event and kind:"criteria" discriminator so an operator
+		// can still tell the envelope decode from the linkage read.
 		r.eventVerbose(courierlog.EventLinkageReadFailed, courierlog.StatusError, map[string]any{
-			"kind":  kind,
+			"kind":  "criteria",
+			"error": linkErr.Error(),
+		})
+		return handoffVerdict{FailReason: r.criteriaEnvelopeDecodeReason(linkErr)}
+	}
+	if linkErr != nil {
+		// The linkage forge read failed: the identity-checked PR listing
+		// or the remote-publication confirmation behind the observation.
+		// The envelope decode and identity-mismatch classes were already
+		// handled fail-closed above, so this path is the linkage
+		// observation alone and kind:"linkage" is the discriminator.
+		r.eventVerbose(courierlog.EventLinkageReadFailed, courierlog.StatusError, map[string]any{
+			"kind":  "linkage",
 			"error": linkErr.Error(),
 		})
 		if continuations >= maxContinuations || sessionID == "" || ctxErr != nil {
