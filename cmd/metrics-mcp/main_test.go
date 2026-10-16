@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net"
 	"net/http"
@@ -145,3 +146,85 @@ vllm:num_requests_waiting 3.0
 # TYPE vllm:gpu_cache_usage_perc gauge
 vllm:gpu_cache_usage_perc 0.72
 `
+
+// A query-authenticated metrics URL must not leak its secret into the
+// startup log or into the model-visible unavailable reason when the
+// endpoint fails. A closed server forces a transport error, which is the
+// failure path that renders the URL through redactError.
+func TestRunRedactsQueryCredentials(t *testing.T) {
+	const secret = "startup-log-secret-5f2c9"
+
+	dead := httptest.NewServer(http.NotFoundHandler())
+	transportURL := dead.URL
+	dead.Close() // nothing listens there anymore
+
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var logs strings.Builder
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() {
+		done <- run(ctx, listener, options{
+			metricsURL: "http://alice:hunter2@" + strings.TrimPrefix(transportURL, "http://") +
+				"/metrics?token=" + secret + "&z=1#" + secret,
+			backend:       couriermetrics.BackendAuto,
+			scrapeTimeout: 2 * time.Second,
+		}, &logs)
+	}()
+
+	var call struct {
+		IsError bool `json:"isError"`
+		Content []struct {
+			Text string `json:"text"`
+		} `json:"content"`
+		StructuredContent map[string]any `json:"structuredContent"`
+	}
+	if err := json.Unmarshal(rpcCall(t, "http://"+listener.Addr().String(), "tools/call",
+		`{"name":"`+couriermetrics.ToolName+`","arguments":{}}`), &call); err != nil {
+		t.Fatalf("decode tools/call: %v", err)
+	}
+	if call.IsError {
+		t.Fatalf("tools/call returned a tool error: %+v", call)
+	}
+	if call.StructuredContent["available"] != false {
+		t.Fatalf("structuredContent = %+v, want unavailable", call.StructuredContent)
+	}
+
+	cancel()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("run returned %v on shutdown", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("run did not shut down on context cancel")
+	}
+
+	detail := fmt.Sprint(call.StructuredContent["detail"])
+	if detail == "" && len(call.Content) > 0 {
+		t.Fatalf("no structured detail available; content = %+v", call.Content)
+	}
+	for _, surface := range append([]string{logs.String(), detail}, contentTexts(call.Content)...) {
+		for _, leaked := range []string{secret, "hunter2", "alice"} {
+			if strings.Contains(surface, leaked) {
+				t.Fatalf("diagnostic surface %q leaks %q", surface, leaked)
+			}
+		}
+	}
+	if !strings.Contains(logs.String(), transportURL+"/metrics") {
+		t.Fatalf("startup log %q should keep the host and path for debugging", logs.String())
+	}
+}
+
+func contentTexts(content []struct {
+	Text string `json:"text"`
+}) []string {
+	texts := make([]string, 0, len(content))
+	for _, part := range content {
+		texts = append(texts, part.Text)
+	}
+	return texts
+}
