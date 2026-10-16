@@ -1900,26 +1900,47 @@ named items remain unresolved and must not be described as production-ready:
   because the run carries no valid trusted identity — is a policy
   mismatch between operator-side inputs, not a model-repairable body
   defect: the run fails closed to `NeedsHuman` (`linkage.read.failed`
-  with kind `criteria-identity`) without consuming the budget, as soon
-  as the observation reaches a state where the evidence contract would
-  run, and the binding is checked before the pinned-empty shortcut so a
+  with kind `criteria-identity`) without consuming the budget, before the
+  forge is read and before the observation is classified — so no missing,
+  draft, or otherwise fail-closed forge world can spend a #170 slot on it
+  — and the binding is checked before the pinned-empty shortcut so a
   foreign envelope cannot slip through as a vacuous pass — mirroring the
   native engine's `Criteria.Issue == SourceIssue` binding in
   `internal/broker/policy.go`. A run whose pinned envelope has no bindable
-  identity at all fails closed one step earlier, before the forge is read,
-  so a malformed `COURIER_REPO`/`COURIER_REF` can never hand off
+  identity at all fails closed the same way, in the same pre-read
+  position, so a malformed `COURIER_REPO`/`COURIER_REF` can never hand off
   `Verifying` with neither body contract enforced. An envelope that does
   not decode is the same class of admission-time fault — read once from
   the pod environment, unchangeable by any later observation — so it fails
-  closed too (`linkage.read.failed` with kind `criteria`), spending no
-  #170 slot and never being presented to the model as a repairable body
-  defect.
+  closed in the same position (`linkage.read.failed` with kind
+  `criteria`), spending no #170 slot and never being presented to the model
+  as a repairable body defect. Both faults are settled by one
+  `pinnedCriterionSet` admission check that runs before the forge read;
+  classifying the observation first would let the decode fault hide behind
+  a missing or draft PR and burn the budget on the wrong contract.
   A passing pinned handoff surfaces the derived coverage and per-status
   counts both in the `run.exit` telemetry and as a best-effort outcome
   comment on the run's source issue — a partial record is labelled
   honestly partial, and the legacy handoff never claims fully verified
   completion outside the PR body. No new budget, gate, or wall clock:
   boundedness stays `MaxContinuations` (#170). (#282, #249, #280, #248)
+- **2026-10-16 — #282 follow-up: the pinned-envelope admission check runs
+  before the forge observation, not inside it.** The undecodable-envelope
+  fail-closed path was only reachable from the open-PR branch, so a missing,
+  draft, or closed-only forge world classified first and spent its own
+  bounded #247 continuation (`pr-missing` / `pr-draft`) on a projection
+  fault no turn can repair — the decode fault was visible exactly where a
+  slot was cheapest to waste. Decode and trust-binding now live in one
+  `pinnedCriterionSet` admission check that `checkHandoff` runs before
+  `observeRunBranchPullRequest`, so both envelope faults settle on sight
+  whatever the forge says; the genuine linkage read failure keeps its
+  retry-inside-budget path. One precedence change follows: when a run
+  carries both a broken envelope and an unreadable forge, the envelope
+  fault is now the reported one (`linkage.read.failed` kind `criteria` /
+  `criteria-identity`, zero budget) rather than a retryable `linkage` read
+  failure — the envelope is the input that cannot move under a retry.
+  No new budget, gate, or duration bound: this
+  reorders an existing fail-closed check, it does not add one. (#282)
 - **2026-10-16 — #327: materialize recovery attempts without deleting history.**
   Successor names incorporate the settled predecessor UID so stable issue IDs
   and preserved PR-fix generations do not collide with retained runs. Active

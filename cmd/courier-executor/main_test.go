@@ -6531,6 +6531,18 @@ func runCriteriaEndToEndTracked(t *testing.T, prBody, script, criteriaEnvelope s
 // standing up a second forge fixture.
 func runCriteriaEndToEndTrackedAs(t *testing.T, prBody, script, criteriaEnvelope string, failComments bool, repo, ref string) (int, string, []string, []string) {
 	t.Helper()
+	return runCriteriaEndToEndPullRequestRecord(t, misoGalleryPRFixtureJSON(12, "open", false, prBody), script, criteriaEnvelope, failComments, repo, ref)
+}
+
+// runCriteriaEndToEndPullRequestRecord is runCriteriaEndToEndTrackedAs with
+// the raw pull-request record the fake forge serves supplied by the caller,
+// so a test can stand up a world other than the default open non-draft PR —
+// in particular the missing-PR world (an empty record) whose own bounded
+// #247 continuation must not be spent on an operator-side envelope fault
+// (#282). Every other input stays exactly what the shared fixture
+// describes.
+func runCriteriaEndToEndPullRequestRecord(t *testing.T, pullsJSON, script, criteriaEnvelope string, failComments bool, repo, ref string) (int, string, []string, []string) {
+	t.Helper()
 	root := t.TempDir()
 	remote := remoteWithBaseOnly(t, root)
 	prServer, prState := fakeForgePullRequestServer(t)
@@ -6541,7 +6553,12 @@ func runCriteriaEndToEndTrackedAs(t *testing.T, prBody, script, criteriaEnvelope
 	if err := os.MkdirAll(stateDir, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	write(t, prState, misoGalleryPRFixtureJSON(12, "open", false, prBody))
+	// An empty record leaves the fake forge with no pull request at all:
+	// the handler answers the pulls list with [] and the run observes the
+	// missing-PR world (#247).
+	if pullsJSON != "" {
+		write(t, prState, pullsJSON)
+	}
 	fakeOpenCode := filepath.Join(root, "opencode")
 	writeExecutable(t, fakeOpenCode, script)
 	setContinuationEnv(t, root, remote, prServer.URL, fakeOpenCode)
@@ -6936,18 +6953,18 @@ func TestRunResolveIssueCombinedBodyFiresSingleBodyRepair(t *testing.T) {
 	}
 }
 
-// TestCheckCriterionEvidenceBindsEnvelopeToTrustedSource pins the trust
+// TestPinnedCriterionSetBindsEnvelopeToTrustedSource pins the trust
 // binding of the pinned criterion envelope (#282): an operator-authored
 // COURIER_CRITERIA envelope that names a source issue other than the
 // run's trusted COURIER_REPO/COURIER_REF identity must fail closed with
 // criteriaEnvelopeIdentityErr — before the pinned-empty shortcut, so a
 // foreign envelope cannot slip through as a vacuous pass — and the
 // error must name both identities so the operator can tell which
-// admission input was wrong. The matching case still validates normally
-// (block missing on a matching non-empty set is a repairable
-// CriteriaError, not an identity failure), and the repository identity
-// is compared case-insensitively.
-func TestCheckCriterionEvidenceBindsEnvelopeToTrustedSource(t *testing.T) {
+// admission input was wrong. The matching case still decodes and
+// validates normally (block missing on a matching non-empty set is a
+// repairable CriteriaError, not an identity failure), and the repository
+// identity is compared case-insensitively.
+func TestPinnedCriterionSetBindsEnvelopeToTrustedSource(t *testing.T) {
 	var output, errorsOut bytes.Buffer
 	obs := &prLinkageObservation{Number: 12, State: "open", Body: "Closes #502"}
 	needle := strings.Repeat("a", 64)
@@ -6965,12 +6982,12 @@ func TestCheckCriterionEvidenceBindsEnvelopeToTrustedSource(t *testing.T) {
 				Ref:      502,
 				Criteria: tc.envelope,
 			})
-			outcome, err := report.checkCriterionEvidence(context.Background(), obs)
+			set, err := report.pinnedCriterionSet()
 			if !errors.Is(err, criteriaEnvelopeIdentityErr) {
-				t.Fatalf("checkCriterionEvidence err = %v, want criteriaEnvelopeIdentityErr", err)
+				t.Fatalf("pinnedCriterionSet err = %v, want criteriaEnvelopeIdentityErr", err)
 			}
-			if outcome != nil {
-				t.Fatalf("identity mismatch must not produce an outcome: %+v", outcome)
+			if set != nil {
+				t.Fatalf("identity mismatch must not return a pinned set: %+v", set)
 			}
 			if !strings.Contains(err.Error(), "misospace/miso-gallery#502") {
 				t.Fatalf("error must name the trusted source identity: %q", err.Error())
@@ -6986,8 +7003,8 @@ func TestCheckCriterionEvidenceBindsEnvelopeToTrustedSource(t *testing.T) {
 		Ref:      502,
 		Criteria: `{"issue":{"owner":"misospace","name":"miso-gallery","number":502},"criteria":[{"id":"AC-1","text":"x","digest":"sha256:` + needle + `"}],"digest":"sha256:` + emptyDigest + `"}`,
 	})
-	if outcome, err := report.checkCriterionEvidence(context.Background(), obs); !errors.Is(err, criteriaEnvelopeIdentityErr) || outcome != nil {
-		t.Fatalf("pinned envelope without a trusted identity must fail closed, got outcome %+v err %v", outcome, err)
+	if set, err := report.pinnedCriterionSet(); !errors.Is(err, criteriaEnvelopeIdentityErr) || set != nil {
+		t.Fatalf("pinned envelope without a trusted identity must fail closed, got set %+v err %v", set, err)
 	}
 	// Case-insensitive repository identity with an empty criteria list:
 	// the identity binds, the set is empty, and the vacuous pass stands.
@@ -6997,7 +7014,11 @@ func TestCheckCriterionEvidenceBindsEnvelopeToTrustedSource(t *testing.T) {
 		Ref:      502,
 		Criteria: `{"issue":{"owner":"MisoSpace","name":"MISO-GALLERY","number":502},"criteria":[],"digest":"sha256:` + emptyDigest + `"}`,
 	})
-	if outcome, err := report.checkCriterionEvidence(context.Background(), obs); err != nil || outcome != nil {
+	set, err := report.pinnedCriterionSet()
+	if err != nil || set == nil || !set.IsEmpty() {
+		t.Fatalf("case-insensitive matching empty set must decode and bind, got set %+v err %v", set, err)
+	}
+	if outcome, err := report.checkCriterionEvidence(set, obs); err != nil || outcome != nil {
 		t.Fatalf("case-insensitive matching empty set must vacuous-pass, got outcome %+v err %v", outcome, err)
 	}
 	// Matching non-empty envelope against a body with no evidence block:
@@ -7009,7 +7030,11 @@ func TestCheckCriterionEvidenceBindsEnvelopeToTrustedSource(t *testing.T) {
 		Ref:      502,
 		Criteria: `{"issue":{"owner":"misospace","name":"miso-gallery","number":502},"criteria":[{"id":"AC-1","text":"x","digest":"sha256:` + needle + `"}],"digest":"sha256:` + emptyDigest + `"}`,
 	})
-	outcome, err := report.checkCriterionEvidence(context.Background(), obs)
+	set, err = report.pinnedCriterionSet()
+	if err != nil {
+		t.Fatalf("matching envelope must decode, got err %v", err)
+	}
+	outcome, err := report.checkCriterionEvidence(set, obs)
 	if err != nil {
 		t.Fatalf("matching envelope must reach the validator, got err %v", err)
 	}
@@ -7188,6 +7213,70 @@ func TestRunResolveIssueUndecodableCriterionEnvelopeFailsClosed(t *testing.T) {
 	}
 	if len(comments) != 0 {
 		t.Fatalf("a failed-closed handoff must post no coverage comment, got %q", comments)
+	}
+}
+
+// TestRunResolveIssueUndecodableCriterionEnvelopeSettlesBeforeObservation
+// pins the *ordering* of the admission-time envelope check (#282): a
+// COURIER_CRITERIA envelope that does not decode must fail closed on sight
+// whatever the forge world looks like, including the worlds whose own
+// bounded #247 outcome is a continuation. Classifying the observation
+// first let a missing or draft PR spend continuation 1 of kind pr-missing
+// / pr-draft on an admission-time fault no turn can repair, and only reach
+// the decoder when the world happened to carry an open PR — the decode
+// fault was invisible exactly where a slot could be wasted.
+func TestRunResolveIssueUndecodableCriterionEnvelopeSettlesBeforeObservation(t *testing.T) {
+	undecodable := `{"issue":{"owner":"misospace","name":"miso-gallery","number":502},"criteria":[{"id":"AC-1`
+	body := withClosingReference(readBrokerFixture(t, "miso-gallery-505-pr-deficient.md"), "#502")
+	worlds := []struct {
+		name     string
+		pulls    string
+		session  string
+		notFired string
+	}{
+		{"missing pull request", "", "ses_undecodable_missing_pr", `"kind":"pr-missing"`},
+		{"draft pull request", misoGalleryPRFixtureJSON(12, "open", true, body), "ses_undecodable_draft_pr", `"kind":"pr-draft"`},
+		{"closed pull request", misoGalleryPRFixtureJSON(12, "closed", false, body), "ses_undecodable_closed_pr", "only closed or merged"},
+		// The forge answers the pulls list with HTTP 500: the observation
+		// itself is unreadable. The envelope fault is settled first, so it
+		// is never reported as a retryable linkage read failure.
+		{"unreadable forge", "500", "ses_undecodable_forge_500", "could not verify the pull-request state"},
+	}
+	for _, world := range worlds {
+		t.Run(world.name, func(t *testing.T) {
+			code, out, _, comments := runCriteriaEndToEndPullRequestRecord(t, world.pulls,
+				scriptCriteriaHonestPartialTurns(world.session), undecodable, false, "misospace/miso-gallery", "502")
+			if code != exitNeedsHuman {
+				t.Fatalf("run exit code = %d, want %d (NeedsHuman on an undecodable pinned envelope); detail: %q", code, exitNeedsHuman, out)
+			}
+			if !strings.Contains(out, `"phase":"NeedsHuman"`) || !strings.Contains(out, `"category":"verifier-rejection"`) {
+				t.Fatalf("expected a fail-closed NeedsHuman verdict: %q", out)
+			}
+			// The envelope fault, not the observation, settles the run.
+			if !strings.Contains(out, `"kind":"criteria"`) {
+				t.Fatalf("linkage.read.failed event must carry kind criteria: %q", out)
+			}
+			if strings.Contains(out, `"kind":"criteria-identity"`) || strings.Contains(out, `"kind":"linkage"`) {
+				t.Fatalf("a decode failure must not be reported as another read class: %q", out)
+			}
+			if !strings.Contains(out, "could not be decoded") {
+				t.Fatalf("reason must name the undecodable envelope: %q", out)
+			}
+			// The observation's own bounded outcome never fires, so no
+			// #170 slot is spent on the admission-time fault.
+			if strings.Contains(out, world.notFired) {
+				t.Fatalf("the envelope fault must settle the run before %s: %q", world.notFired, out)
+			}
+			if n := strings.Count(out, `"event":"executor.continuation"`); n != 0 {
+				t.Fatalf("continuation count = %d, want 0 (an undecodable envelope spends no #170 slot): %q", n, out)
+			}
+			if strings.Contains(out, `"phase":"Verifying"`) {
+				t.Fatalf("an undecodable pinned envelope must not hand off Verifying: %q", out)
+			}
+			if len(comments) != 0 {
+				t.Fatalf("a failed-closed handoff must post no coverage comment, got %q", comments)
+			}
+		})
 	}
 }
 

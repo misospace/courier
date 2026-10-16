@@ -647,17 +647,22 @@ that decodes but names a source issue other than the run's trusted
 `COURIER_REPO`/`COURIER_REF` identity — or that cannot be bound because
 the run carries no valid trusted identity — is not a repairable defect:
 it is a policy mismatch between operator-side inputs, so the legacy check
-fails closed to `NeedsHuman` without consuming the budget, as soon as the
-observation reaches a state where the evidence contract would run (a
-missing or draft PR is still settled by its own #247 continuation first)
-(#282). The binding is checked before the pinned-empty shortcut, and it
-mirrors the native engine's `Criteria.Issue == SourceIssue` binding in
-`internal/broker/policy.go`. An unbindable envelope fails closed before the
-forge is read, so a malformed `COURIER_REPO`/`COURIER_REF` cannot hand off
+fails closed to `NeedsHuman` without consuming the budget, before the
+forge is read and before the observation is classified, so a missing or
+draft PR — whose own #247 continuation would otherwise fire — never
+spends a slot on an admission-time fault (#282). The binding is checked
+before the pinned-empty shortcut, and it mirrors the native engine's
+`Criteria.Issue == SourceIssue` binding in `internal/broker/policy.go`.
+An unbound envelope fails closed in the same
+position, so a malformed `COURIER_REPO`/`COURIER_REF` cannot hand off
 `Verifying` with neither contract enforced; an envelope that does not decode
 is the same admission-time fault (it is read once from the pod environment
 and no later observation can change it) and likewise fails closed on sight,
-with `linkage.read.failed` kind `criteria` and no #170 slot spent. A run that never
+with `linkage.read.failed` kind `criteria` and no #170 slot spent. Because
+the envelope check precedes the forge read, a run carrying a broken
+envelope is settled as an envelope fault even when the forge is itself
+unreadable — the admission-time fault is reported under its own `kind`
+rather than as a retryable `linkage` read failure. A run that never
 opened a PR passes the *evidence* check vacuously — PR absence is not
 an evidence violation; it is caught separately by the #247 pre-handoff
 observation, which refuses the handoff before evidence is ever
