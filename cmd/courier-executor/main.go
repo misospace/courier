@@ -1614,11 +1614,20 @@ func envIdentity() config {
 }
 
 // guardAdoption enforces the resolve-issue invariant that a deterministic
-// branch may be adopted only when it is orphaned. If the branch already exists
-// on the remote with an open pull request, the run refuses to adopt it but
-// reports that PR for review by exiting 0, so the operator's world-verification
-// publishes the existing pull request to the source as in-review. A branch
-// whose only pull requests are closed or merged is handed to a human. It
+// branch may be adopted only when it is orphaned. When the branch already
+// exists on the remote, the guard reads the run branch's pull requests
+// through the same identity-checked forge capability as the pre-handoff
+// observation (#343) — never through a forge-specific listing — so a
+// same-owner fork, a re-targeted base, or a draft cannot masquerade as a
+// reviewable PR. Only an open, non-draft PR whose full base- and head
+// identity matches the run's repository and branch and whose base ref is the
+// pinned base is reported for review by exiting 0, so the operator's
+// world-verification publishes the existing pull request to the source as
+// in-review. Foreign head claims, wrong-base PRs, drafts, ambiguous sets,
+// and heads whose only pull requests are closed or merged terminate
+// NeedsHuman with the precise state, mirroring the observation's fixed
+// consequences (#247). Body linkage is not checked here: the controller's
+// `Verifying` observation settles what this early handoff leaves open. It
 // returns (0, false) when the run may proceed to Prepare, or a terminal
 // (code, true) once it has emitted the run's handoff.
 func (r reporter) guardAdoption(ctx context.Context) (int, bool) {
@@ -1633,29 +1642,32 @@ func (r reporter) guardAdoption(ctx context.Context) (int, bool) {
 	if !exists {
 		return 0, false
 	}
-	owner, name, ok := splitOwnerRepo(r.cfg.Repo)
-	if !ok {
-		r.terminate(termination{Phase: "Failed", Result: "failure", ExitCode: 1, Reason: "resolve branch already exists on the remote and COURIER_REPO does not name an owner/repo; refusing adoption", Category: terminalCategoryExecutorCrash})
-		return 1, true
-	}
-	client, err := github.NewClient(r.cfg.GitHubAPIBase, r.cfg.GitHubToken)
+	observation, err := r.observeRunBranchPullRequest(ctx)
 	if err != nil {
 		r.terminate(termination{Phase: "Failed", Result: "failure", ExitCode: 1, Reason: err.Error(), Category: terminalCategoryExecutorCrash})
 		return 1, true
 	}
-	pulls, err := client.PullRequestsForHead(ctx, owner, name, owner, r.cfg.Branch)
-	if err != nil {
-		r.terminate(termination{Phase: "Failed", Result: "failure", ExitCode: 1, Reason: err.Error(), Category: terminalCategoryExecutorCrash})
-		return 1, true
-	}
-	for _, pull := range pulls {
-		if pull.Head.Ref == r.cfg.Branch && strings.EqualFold(pull.State, "open") {
-			r.terminate(termination{Phase: "Verifying", Result: "success", ExitCode: exitSuccess, Reason: fmt.Sprintf("resolve branch already has open PR #%d; reporting the existing pull request to the source without adopting", pull.Number)})
-			return exitSuccess, true
-		}
-	}
-	for _, pull := range pulls {
-		r.terminate(termination{Phase: "NeedsHuman", Result: "needs-human", ExitCode: exitNeedsHuman, Reason: fmt.Sprintf("resolve branch already has PR #%d (%s); refusing adoption", pull.Number, pull.State), Category: terminalCategoryUnknown})
+	switch observation.kind {
+	case prStateMissing:
+		return 0, false
+	case prStateOpen:
+		r.terminate(termination{Phase: "Verifying", Result: "success", ExitCode: exitSuccess, Reason: fmt.Sprintf("resolve branch already has open PR #%d on base %q; reporting the existing pull request to the source without adopting", observation.open.Number, r.cfg.Base)})
+		return exitSuccess, true
+	case prStateDraft:
+		r.terminate(termination{Phase: "NeedsHuman", Result: "needs-human", ExitCode: exitNeedsHuman, Reason: r.adoptionDraftPRReason(observation.draft.Number), Category: terminalCategoryUnknown})
+		return exitNeedsHuman, true
+	case prStateWrongBase:
+		r.terminate(termination{Phase: "NeedsHuman", Result: "needs-human", ExitCode: exitNeedsHuman, Reason: r.wrongBasePRReason(), Category: terminalCategoryUnknown})
+		return exitNeedsHuman, true
+	case prStateForeignHead:
+		r.terminate(termination{Phase: "NeedsHuman", Result: "needs-human", ExitCode: exitNeedsHuman, Reason: r.foreignHeadPRReason(), Category: terminalCategoryUnknown})
+		return exitNeedsHuman, true
+	case prStateAmbiguous:
+		r.terminate(termination{Phase: "NeedsHuman", Result: "needs-human", ExitCode: exitNeedsHuman, Reason: r.prAmbiguousReason(), Category: terminalCategoryUnknown})
+		return exitNeedsHuman, true
+	case prStateClosedOnly:
+		closed := observation.closed[0]
+		r.terminate(termination{Phase: "NeedsHuman", Result: "needs-human", ExitCode: exitNeedsHuman, Reason: fmt.Sprintf("resolve branch already has PR #%d (%s); refusing adoption", closed.Number, closed.State), Category: terminalCategoryUnknown})
 		return exitNeedsHuman, true
 	}
 	return 0, false
@@ -1748,11 +1760,14 @@ const (
 
 // runBranchPRObservation is the classified result of the executor's
 // identity-checked PR observation. open and draft carry the single PR in
-// that state; the fail-closed kinds carry only the kind.
+// that state; closed carries the closed or merged PRs when the kind is
+// prStateClosedOnly, so terminal reasons can name the actual PR; the other
+// fail-closed kinds carry only the kind.
 type runBranchPRObservation struct {
-	kind  runBranchPRKind
-	open  *prLinkageObservation
-	draft *prLinkageObservation
+	kind   runBranchPRKind
+	open   *prLinkageObservation
+	draft  *prLinkageObservation
+	closed []*prLinkageObservation
 }
 
 // linkageCheckOutcome is the result of the authoritative-linkage check
@@ -1854,8 +1869,7 @@ func (r reporter) observeRunBranchPullRequest(ctx context.Context) (runBranchPRO
 	if len(foreign) > 0 {
 		return runBranchPRObservation{kind: prStateForeignHead}, nil
 	}
-	var opens, drafts, wrongBases []*prLinkageObservation
-	closed := 0
+	var opens, drafts, wrongBases, closed []*prLinkageObservation
 	for _, pull := range pulls {
 		observed := &prLinkageObservation{Number: pull.Number, State: strings.ToLower(pull.State), Body: pull.Body, Draft: pull.Draft}
 		switch {
@@ -1866,7 +1880,7 @@ func (r reporter) observeRunBranchPullRequest(ctx context.Context) (runBranchPRO
 		case strings.EqualFold(pull.State, "open"):
 			drafts = append(drafts, observed)
 		default:
-			closed++
+			closed = append(closed, observed)
 		}
 	}
 	switch {
@@ -1878,8 +1892,8 @@ func (r reporter) observeRunBranchPullRequest(ctx context.Context) (runBranchPRO
 		return runBranchPRObservation{kind: prStateOpen, open: opens[0]}, nil
 	case len(drafts) == 1:
 		return runBranchPRObservation{kind: prStateDraft, draft: drafts[0]}, nil
-	case closed > 0:
-		return runBranchPRObservation{kind: prStateClosedOnly}, nil
+	case len(closed) > 0:
+		return runBranchPRObservation{kind: prStateClosedOnly, closed: closed}, nil
 	default:
 		return runBranchPRObservation{kind: prStateMissing}, nil
 	}
@@ -2147,6 +2161,15 @@ func (r reporter) draftUnresolvedReason(number int, sessionID string, ctxErr err
 	default:
 		return r.draftExhaustedReason(number)
 	}
+}
+
+// adoptionDraftPRReason composes the NeedsHuman reason for a pre-existing
+// draft pull request on the run branch at the adoption guard (#343): the
+// guard neither adopts a draft nor reports it as reviewable, and no captured
+// session exists yet to ready it, so the reason names the actual state and a
+// human settles readiness.
+func (r reporter) adoptionDraftPRReason(number int) string {
+	return fmt.Sprintf("resolve branch already has draft PR #%d; refusing adoption; the run needs a human to mark it ready for review before it can be reported", number)
 }
 
 // unpublishedBranchReason composes the NeedsHuman reason for a run whose
