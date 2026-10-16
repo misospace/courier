@@ -10,14 +10,16 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"sort"
 	"time"
 )
 
 // Capability states (HARNESS.md §5): healthy (probed and working) and
-// unavailable (probed and not usable) are what today's probes emit.
-// Configured (declared and in use but not probed) is the third state of the
-// settled vocabulary, reserved for a capability this build does not probe;
-// no probe emits it, and the gate never treats it as healthy.
+// unavailable (probed and not usable) are what the forge, model-binding, and
+// workspace probes emit. Configured (declared and in use but not verified) is
+// the third state of the settled vocabulary: a context budget the lane
+// declared that the gateway could not confirm is configured, never healthy,
+// and never a gate failure on its own.
 const (
 	StateConfigured  = "configured"
 	StateHealthy     = "healthy"
@@ -51,6 +53,12 @@ type Capability struct {
 // healthy/unavailable helpers keep state spellings in one place.
 func healthy(name string, required bool) Capability {
 	return Capability{Name: name, State: StateHealthy, Required: required}
+}
+
+// configured marks a declared capability in use but not verified, such as a
+// context budget whose ceiling the gateway could not confirm.
+func configured(name, detail string) Capability {
+	return Capability{Name: name, State: StateConfigured, Detail: detail}
 }
 
 func unavailable(name string, required bool, detail string) Capability {
@@ -218,6 +226,10 @@ type ProbeDeps struct {
 	ProbeWorker func(context.Context) Capability
 	// ModelProbe performs one cheap model call for a role binding.
 	ModelProbe func(context.Context, string) error
+	// Context is the context budget the lane declared per role. The zero
+	// value declares nothing, in which case the probe still reports the
+	// per-role budget capability but never requires it.
+	Context ContextPolicy
 }
 
 // requiredForgeOperations maps a run mode to the forge operations its
@@ -238,11 +250,15 @@ func requiredForgeOperations(mode string) []string {
 // and returns the health table. It never fails: an unusable probe is an
 // unavailable capability with a safe reason.
 func ProbeCapabilities(ctx context.Context, deps ProbeDeps) []Capability {
-	caps := make([]Capability, 0, 6)
+	caps := make([]Capability, 0, 8)
 	if deps.ProbeWorker != nil {
 		caps = append(caps, deps.ProbeWorker(ctx))
 	}
 	caps = append(caps, probeForge(ctx, deps)...)
+	// The metadata read is cheap and answerable without a model turn, so it
+	// goes ahead of the chat-completion binding probes rather than behind
+	// them.
+	caps = append(caps, probeContextBudgets(ctx, deps)...)
 	caps = append(caps, probeModelBindings(ctx, deps)...)
 	caps = append(caps, probeSnapshot(deps), probePublication(deps))
 	return caps
@@ -342,6 +358,149 @@ func probeModelBindings(ctx context.Context, deps ProbeDeps) []Capability {
 	return caps
 }
 
+// probeContextBudgets reports every bound role's context budget (#296). The
+// effective limit is min(declared, gateway-verified): a gateway-confirmed read
+// is healthy, a ceiling the gateway could not confirm is configured and never
+// healthy, and a role with neither is unavailable rather than quietly given an
+// implicit window. The capability is required only when the lane declared a
+// usable budget for that role, so a lane with no context policy proceeds
+// degraded instead of being gated by a policy it never opted into. A declared
+// role this run does not bind is named without gating: one LaneProfile serves
+// several lanes, so a role another lane binds is not this run's failure, but a
+// typo must not silently disable that role's capacity management either.
+func probeContextBudgets(ctx context.Context, deps ProbeDeps) []Capability {
+	roles := deps.Bindings.Roles()
+	bound := make(map[string]struct{}, len(roles))
+	for _, role := range roles {
+		bound[role] = struct{}{}
+	}
+	caps := make([]Capability, 0, len(roles))
+	// One read per model: two roles bound to one model must not issue two
+	// authenticated reads of the same gateway metadata.
+	probed := make(map[string]int, len(roles))
+	failed := make(map[string]error, len(roles))
+	for _, role := range roles {
+		name := "context-budget:" + role
+		required := deps.Context.declaresRole(role)
+		model := deps.Bindings.Model(role)
+		inputLimit, probeErr := 0, error(nil)
+		if deps.Gateway != nil {
+			inputLimit, probeErr = probed[model], failed[model]
+			if inputLimit == 0 && probeErr == nil {
+				inputLimit, probeErr = deps.Gateway.ModelInputLimit(ctx, model)
+				probed[model], failed[model] = inputLimit, probeErr
+			}
+		}
+		budget, err := deps.Context.RoleBudget(role, inputLimit)
+		// A role with no usable budget: either the resolution failed closed,
+		// or the lane owns no policy for it and the budget is the zero one. The
+		// probe reason still reaches the table when there is one — it is why no
+		// capacity was established — but a role the lane never declared for is
+		// never gated by it.
+		if err != nil || budget.EffectiveLimit <= 0 {
+			caps = append(caps, budgetUnavailable(name, required, err, probeErr, deps.Gateway == nil))
+			continue
+		}
+		if budget.State == StateConfigured {
+			capability := configured(name, budget.Detail)
+			if probeErr != nil {
+				// The declared ceiling is in use; the operator still needs to
+				// know the gateway could not confirm it.
+				capability.Detail += "; the gateway read failed: " + gatewayReadReason(probeErr)
+			}
+			capability.Required = required
+			caps = append(caps, capability)
+			continue
+		}
+		capability := healthy(name, required)
+		capability.Detail = budget.Detail
+		caps = append(caps, capability)
+	}
+	caps = append(caps, unboundDeclaredRoles(deps.Context, bound)...)
+	return caps
+}
+
+// budgetUnavailable builds the capability for a role with no usable budget. A
+// declaration error is primary: it is the operator's misconfiguration, it
+// never becomes retryable, and the read failure is appended as secondary so an
+// unrelated gateway outage cannot hide it or flip its diagnosis. Only a
+// resolution that failed for want of capacity is attributed to the read, and
+// then the read's classified reason and retryability carry it.
+func budgetUnavailable(name string, required bool, resolveErr, probeErr error, noGateway bool) Capability {
+	// Only a resolution that failed for want of capacity belongs to the
+	// gateway; every other resolution error is the declaration's own.
+	declarationErr := resolveErr != nil && !errors.Is(resolveErr, ErrNoContextCapacity)
+	var detail string
+	readPrimary := false
+	switch {
+	case declarationErr:
+		detail = resolveErr.Error()
+		if probeErr != nil {
+			detail += "; the gateway read failed: " + gatewayReadReason(probeErr)
+		}
+	case noGateway:
+		detail = "no model gateway is configured in this build"
+	case probeErr != nil:
+		detail = gatewayReadReason(probeErr)
+		readPrimary = true
+	case resolveErr != nil:
+		detail = resolveErr.Error()
+	default:
+		detail = "the lane declares no context budget for this role"
+	}
+	capability := unavailable(name, required, detail)
+	if readPrimary {
+		capability.Retryable = isProbeRetryable(probeErr)
+		if classification, ok := providerClassificationOf(probeErr); ok {
+			capability.Availability = classification.Availability
+		}
+	}
+	return capability
+}
+
+// gatewayReadReason renders why the model-info read failed for a capability
+// detail. A status failure keeps its redacted status-and-category form; a
+// transport failure embeds an endpoint and a dial error, so it is reduced to
+// its fixed class — capability details flow into the byte-bounded termination
+// reason. Every other probe failure is already a code-owned fixed message
+// naming the bound model, and is returned as is.
+func gatewayReadReason(err error) string {
+	var transportErr *GatewayTransportError
+	if errors.As(err, &transportErr) {
+		return "harness: gateway transport failed"
+	}
+	return err.Error()
+}
+
+// unboundDeclaredRoles names every role the lane declared a context budget for
+// that this run does not bind, sorted for a deterministic table. It answers
+// which *named* entries went unused — deliberately stricter than
+// ContextPolicy.declaresRole, which answers whether a role is covered by any
+// declaration: a global fraction covers every bound role but names no unbound
+// one. All-zero entries declare nothing and are skipped.
+func unboundDeclaredRoles(policy ContextPolicy, bound map[string]struct{}) []Capability {
+	var unbound []string
+	for role, declared := range policy.Roles {
+		if _, ok := bound[role]; ok {
+			continue
+		}
+		if declared.MaxInputTokens <= 0 && declared.CompactAtPercent <= 0 && declared.OutputReservation <= 0 {
+			continue
+		}
+		unbound = append(unbound, role)
+	}
+	if len(unbound) == 0 {
+		return nil
+	}
+	sort.Strings(unbound)
+	caps := make([]Capability, 0, len(unbound))
+	for _, role := range unbound {
+		caps = append(caps, unavailable("context-budget:"+role, false,
+			fmt.Sprintf("the lane declares a context budget for role %q, which this run does not bind", role)))
+	}
+	return caps
+}
+
 // probePublication reports the publication seam honestly. Publication is
 // required: the coordinator owns the terminal contract, and a build without
 // the publisher fails closed instead of burning model work it cannot land.
@@ -408,8 +567,8 @@ func (e *GateError) Exhausted() bool {
 // which optional capabilities the run will proceed without. A run proceeds
 // degraded whenever only optional capabilities are down (HARNESS.md §5:
 // "a run that can proceed does, degraded capabilities and all"). A required
-// capability that is merely configured — declared but never probed — never
-// exists: probes either mark required capabilities healthy or unavailable.
+// capability that is merely configured passes: declared-but-unverified is a
+// declared decision to proceed, so only unavailable gates.
 func Gate(caps []Capability) ([]Capability, error) {
 	var failed []Capability
 	for _, capability := range caps {

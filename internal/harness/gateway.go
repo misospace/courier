@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -167,6 +168,83 @@ func (g *Gateway) StreamChat(ctx context.Context, req ChatRequest) ([]Event, err
 		return []Event{{Kind: KindError, Err: gatewayStatusError(resp.StatusCode, resp.Header, body, g.signals())}}, nil
 	}
 	return normalizeStream(resp.Body, g.signals())
+}
+
+// wireModelInfo is the OpenAI/LiteLLM-compatible model-metadata envelope. An
+// entry advertises its input limit under model_info, with the entry-level field
+// as the fallback for a gateway that does not nest it.
+type wireModelInfo struct {
+	Data []wireModelEntry `json:"data"`
+}
+
+type wireModelEntry struct {
+	ModelName      string `json:"model_name"`
+	ID             string `json:"id"`
+	MaxInputTokens int    `json:"max_input_tokens"`
+	ModelInfo      struct {
+		MaxInputTokens int `json:"max_input_tokens"`
+	} `json:"model_info"`
+}
+
+func (e wireModelEntry) inputLimit() int {
+	if e.ModelInfo.MaxInputTokens > 0 {
+		return e.ModelInfo.MaxInputTokens
+	}
+	return e.MaxInputTokens
+}
+
+// maxModelInfoBody bounds the model-metadata read. It is a transport resource
+// bound, not a work limit: a gateway lists every model it serves, and a body
+// larger than this is broken or hostile.
+const maxModelInfoBody = 1 << 20
+
+// ModelInputLimit reads the input limit the gateway advertises for one bound
+// model. The read is what lets a lane's declared budget be verified rather
+// than merely declared (#243, #296): a ceiling the gateway could not confirm
+// stays `configured`, never healthy. Failures follow the same redaction
+// contract as every other gateway path — a bounded body prefix is read only to
+// classify the failure and is never retained or echoed — and an unknown model,
+// an unusable limit, or an unreadable envelope is an explicit error, never a
+// silent zero a caller could mistake for a small window. The success path
+// reads under maxModelInfoBody, so a hostile 200 cannot amplify memory at
+// startup.
+func (g *Gateway) ModelInputLimit(ctx context.Context, model string) (int, error) {
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodGet, strings.TrimSuffix(g.BaseURL, "/")+"/model/info", nil)
+	if err != nil {
+		return 0, fmt.Errorf("harness: build model info request: %w", err)
+	}
+	httpReq.Header.Set("Accept", "application/json")
+	if g.APIKey != "" {
+		httpReq.Header.Set("Authorization", "Bearer "+g.APIKey)
+	}
+	resp, err := g.client().Do(httpReq)
+	if err != nil {
+		return 0, &GatewayTransportError{Err: err}
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, maxProviderErrorBody))
+		return 0, gatewayStatusError(resp.StatusCode, resp.Header, body, g.signals())
+	}
+	var report wireModelInfo
+	if err := json.NewDecoder(io.LimitReader(resp.Body, maxModelInfoBody)).Decode(&report); err != nil {
+		return 0, errors.New("harness: gateway model info is undecodable")
+	}
+	limit, named := 0, false
+	for _, entry := range report.Data {
+		if entry.ModelName != model && entry.ID != model {
+			continue
+		}
+		limit, named = entry.inputLimit(), true
+		break
+	}
+	if !named {
+		return 0, fmt.Errorf("harness: gateway model info names no entry for model %q", model)
+	}
+	if limit <= 0 {
+		return 0, fmt.Errorf("harness: gateway advertises no input limit for model %q", model)
+	}
+	return limit, nil
 }
 
 // gatewayStatusError maps a gateway HTTP status to a redacted, classified,

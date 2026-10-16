@@ -3444,3 +3444,60 @@ was superseded.
   closed rather than adopting. Linkage stays the controller's
   `Verifying` observation — the guard runs before a PR body contract exists
   to check. (#343, superseding the guard carve-out in the #247 entry.)
+- **2026-10-16 — #296: the effective context limit is read and resolved,
+  never defaulted; `ContextPolicy.RoleBudget` is its one entry point.**
+  `Gateway.ModelInputLimit` performs one bounded authenticated read of the
+  gateway's OpenAI/LiteLLM-compatible model metadata (`GET /model/info`) for a
+  bound model and returns the advertised input limit
+  (`model_info.max_input_tokens`, falling back to the entry-level field; the
+  first matching `model_name`/`id` entry wins), cached per model so two roles
+  on one model issue one read. The read obeys the existing redaction contract:
+  the success body is cut at a fixed transport bound (an over-long envelope
+  fails as undecodable rather than spiking memory at startup), a non-2xx is
+  classified through the same bounded-prefix `ClassifyProviderError` path the
+  stream uses, a transport failure is a `GatewayTransportError`, and an unknown
+  model or an entry with no positive limit is an explicit error — never a
+  silent zero a caller could mistake for a small window, and never provider
+  body or key material in an error, a capability detail, or a termination
+  reason. Resolution lives in `ContextPolicy.RoleBudget(role, probed)` over the
+  pure `ResolveContextBudget` of #243, so there is exactly one effective limit
+  in the package: effective `= min(declared, verified)`, a gateway-verified read
+  is `healthy`, a declared ceiling the gateway could not confirm is
+  `configured` and never `healthy`, and a role with neither is `unavailable`
+  rather than given an implicit context window. `ProbeCapabilities` emits the
+  per-role `context-budget:<role>` capability from that resolver and probes it
+  ahead of the chat-completion binding probes so the cheap metadata read is
+  not starved inside the shared probe context; the session loop and its
+  consumption of `CoordinatorConfig.ContextBudgets` are #297's, already in
+  flight on its own branch, as is the step-boundary enforcement and the
+  `session.compacted` emitter. The capability is `Required` only on a positive
+  declaration — a global fraction or reservation or a positive per-role
+  ceiling — so a lane that declared nothing, including one whose config carries
+  an all-zero per-role entry, merely proceeds degraded, while a declared budget
+  whose capacity cannot be established fails the gate closed; a `configured`
+  budget never gates. A failed gateway read reaches the table as the
+  classified, redacted status reason with its retryability and availability
+  class, so a 404, a 401, and an unreachable gateway stay distinguishable and
+  courier-control's re-probe loop still sees an all-retryable gate. A role the
+  lane declared a budget for that this run does not bind is named without
+  gating — one LaneProfile serves several lanes — so a `codr` typo is visible
+  instead of silently disabling that role's capacity management. The predicate
+  that defines "declared" is settled here so no second rule can drift from it:
+  `ContextPolicy.declaresRole` holds a role declared only when the lane declares
+  a positive value for it — a per-role `maxInputTokens`, or a global
+  `compactAtPercent`/`outputReservation` — and an all-zero per-role entry
+  declares nothing. An undeclared role is `configured` or `unavailable` but
+  never `Required` and never gates; whoever populates
+  `CoordinatorConfig.ContextBudgets` once #295's schema lands must key that map
+  by declared roles only, so #297's fail-closed startup resolution cannot
+  contradict this probe and park a run whose lane never declared a budget. One
+  diagnosis per condition as well: a declaration error is primary in the
+  capability table — its detail leads, it is never retryable, and a failed
+  gateway read is appended after it as `; the gateway read failed: …` — so an
+  unrelated gateway outage cannot hide a permanent misconfiguration or make it
+  look transient to the re-probe loop; only a resolution that failed with
+  `ErrNoContextCapacity` is attributed to the read, which then carries the
+  classified reason, retryability, and availability class. A transport-class
+  read failure renders as its fixed class alone, since its endpoint and dial
+  error must not reach the byte-bounded termination reason. (#296, #243,
+  #297)
