@@ -166,13 +166,17 @@ func (l *CoordinatorLauncher) Launch(ctx context.Context, run *courierv1alpha1.C
 	// The run-scoped identity must be on the pod before it is created;
 	// setting it afterwards would not persist, and the observer would run
 	// as the namespace default SA with no access to its own pod. The API
-	// server resolves the SA at create time, so the SA itself must exist
-	// first; the Role/RoleBinding still wait for slot verification.
+	// server resolves the SA at create time, so the SA must exist first.
+	// This first attempt is best-effort: a collision or transient failure
+	// here must not mask the slot-verification contract, and the next
+	// reconcile retries the SA before the pod create can succeed. The
+	// verified provision below still hard-checks ownership.
 	if pod.Annotations[executor.ObserverContractAnnotation] == executor.ObserverContractVersion {
 		pod.Spec.ServiceAccountName = legacyObserverResourceName(run.Name)
-		if err := l.ensureObserverServiceAccount(ctx, run); err != nil {
-			return err
-		}
+		// Best-effort: a failure here must not mask slot verification; the
+		// pod create below surfaces a missing SA and the next reconcile
+		// retries the SA create first.
+		_ = l.Client.Create(ctx, l.observerServiceAccount(run))
 	}
 	err = l.Client.Create(ctx, pod)
 	if err == nil {
@@ -240,23 +244,22 @@ func (l *CoordinatorLauncher) collisionReader() client.Reader {
 
 func (l *CoordinatorLauncher) ensureLegacyObserverResources(ctx context.Context, run *courierv1alpha1.CoderRun, pod *corev1.Pod) error {
 	name := legacyObserverResourceName(run.Name)
-	owner := []metav1.OwnerReference{{APIVersion: courierv1alpha1.GroupVersion.String(), Kind: "CoderRun", Name: run.Name, UID: run.UID, Controller: boolPtr(true), BlockOwnerDeletion: boolPtr(true)}}
-	// The SA must exist before the pod does: the API server resolves the
-	// pod's service account at create time and rejects the pod otherwise.
-	if err := l.ensureObserverServiceAccount(ctx, run); err != nil {
+	if err := l.ensureObserverObject(ctx, run.UID, l.observerServiceAccount(run)); err != nil {
 		return err
 	}
-	role := &rbacv1.Role{ObjectMeta: metav1.ObjectMeta{Namespace: run.Namespace, Name: name, OwnerReferences: owner}, Rules: []rbacv1.PolicyRule{{APIGroups: []string{""}, Resources: []string{"pods"}, ResourceNames: []string{pod.Name}, Verbs: []string{"get"}}}}
+	role := &rbacv1.Role{ObjectMeta: metav1.ObjectMeta{Namespace: run.Namespace, Name: name, OwnerReferences: l.observerOwner(run)}, Rules: []rbacv1.PolicyRule{{APIGroups: []string{""}, Resources: []string{"pods"}, ResourceNames: []string{pod.Name}, Verbs: []string{"get"}}}}
 	if err := l.ensureObserverObject(ctx, run.UID, role); err != nil {
 		return err
 	}
-	return l.ensureObserverObject(ctx, run.UID, &rbacv1.RoleBinding{ObjectMeta: metav1.ObjectMeta{Namespace: run.Namespace, Name: name, OwnerReferences: owner}, RoleRef: rbacv1.RoleRef{APIGroup: rbacv1.GroupName, Kind: "Role", Name: name}, Subjects: []rbacv1.Subject{{Kind: rbacv1.ServiceAccountKind, Name: name, Namespace: run.Namespace}}})
+	return l.ensureObserverObject(ctx, run.UID, &rbacv1.RoleBinding{ObjectMeta: metav1.ObjectMeta{Namespace: run.Namespace, Name: name, OwnerReferences: l.observerOwner(run)}, RoleRef: rbacv1.RoleRef{APIGroup: rbacv1.GroupName, Kind: "Role", Name: name}, Subjects: []rbacv1.Subject{{Kind: rbacv1.ServiceAccountKind, Name: name, Namespace: run.Namespace}}})
 }
 
-func (l *CoordinatorLauncher) ensureObserverServiceAccount(ctx context.Context, run *courierv1alpha1.CoderRun) error {
-	name := legacyObserverResourceName(run.Name)
-	owner := []metav1.OwnerReference{{APIVersion: courierv1alpha1.GroupVersion.String(), Kind: "CoderRun", Name: run.Name, UID: run.UID, Controller: boolPtr(true), BlockOwnerDeletion: boolPtr(true)}}
-	return l.ensureObserverObject(ctx, run.UID, &corev1.ServiceAccount{ObjectMeta: metav1.ObjectMeta{Namespace: run.Namespace, Name: name, OwnerReferences: owner}, AutomountServiceAccountToken: boolPtr(false)})
+func (l *CoordinatorLauncher) observerOwner(run *courierv1alpha1.CoderRun) []metav1.OwnerReference {
+	return []metav1.OwnerReference{{APIVersion: courierv1alpha1.GroupVersion.String(), Kind: "CoderRun", Name: run.Name, UID: run.UID, Controller: boolPtr(true), BlockOwnerDeletion: boolPtr(true)}}
+}
+
+func (l *CoordinatorLauncher) observerServiceAccount(run *courierv1alpha1.CoderRun) *corev1.ServiceAccount {
+	return &corev1.ServiceAccount{ObjectMeta: metav1.ObjectMeta{Namespace: run.Namespace, Name: legacyObserverResourceName(run.Name), OwnerReferences: l.observerOwner(run)}, AutomountServiceAccountToken: boolPtr(false)}
 }
 
 func (l *CoordinatorLauncher) ensureObserverObject(ctx context.Context, runUID types.UID, desired client.Object) error {
