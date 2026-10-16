@@ -6930,9 +6930,21 @@ func TestCheckCriterionEvidenceBindsEnvelopeToTrustedSource(t *testing.T) {
 			}
 		})
 	}
+	// A pinned envelope with no verifiable trusted identity at all (here
+	// a fix-pr mode run) fails closed the same way: an unbound contract
+	// is not enforced silently (#282).
+	report := newReporter(&output, &errorsOut, config{
+		Mode:     "fix-pr",
+		Repo:     "misospace/miso-gallery",
+		Ref:      502,
+		Criteria: `{"issue":{"owner":"misospace","name":"miso-gallery","number":502},"criteria":[{"id":"AC-1","text":"x","digest":"sha256:` + needle + `"}],"digest":"sha256:` + emptyDigest + `"}`,
+	})
+	if outcome, err := report.checkCriterionEvidence(context.Background(), obs); !errors.Is(err, criteriaEnvelopeIdentityErr) || outcome != nil {
+		t.Fatalf("pinned envelope without a trusted identity must fail closed, got outcome %+v err %v", outcome, err)
+	}
 	// Case-insensitive repository identity with an empty criteria list:
 	// the identity binds, the set is empty, and the vacuous pass stands.
-	report := newReporter(&output, &errorsOut, config{
+	report = newReporter(&output, &errorsOut, config{
 		Mode:     "resolve-issue",
 		Repo:     "misospace/miso-gallery",
 		Ref:      502,

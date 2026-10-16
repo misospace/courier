@@ -2220,12 +2220,19 @@ func (r reporter) checkCriterionEvidence(ctx context.Context, observation *prLin
 	}
 	// Bind the envelope to the run's trusted source identity before the
 	// set is consulted at all — including the pinned-empty case, where a
-	// foreign envelope must not silently become this run's vacuous
-	// pass (#282). The envelope's issue identity is operator-authored;
-	// a disagreement with COURIER_REPO/COURIER_REF is a policy mismatch
-	// to settle by hand, not a body defect to repair.
+	// foreign envelope must not silently become this run's vacuous pass
+	// (#282). The envelope's issue identity is operator-authored; a
+	// disagreement with COURIER_REPO/COURIER_REF is a policy mismatch to
+	// settle by hand, not a body defect to repair. A pinned envelope
+	// with no verifiable trusted identity at all fails closed the same
+	// way: the contract cannot be bound, and an unbound contract is not
+	// enforced silently.
 	source, ok := trustedSourceIssue(r.cfg)
-	if ok && !criteriaSetMatchesSource(set, source) {
+	if !ok {
+		return nil, fmt.Errorf("%w: the run carries no valid trusted source identity, so the pinned criterion envelope cannot be bound",
+			criteriaEnvelopeIdentityErr)
+	}
+	if !criteriaSetMatchesSource(set, source) {
 		envelopeTarget := "(no source issue in envelope)"
 		if !set.Issue.IsZero() {
 			envelopeTarget = sourceIssueTarget(set.Issue)
@@ -2758,7 +2765,9 @@ type handoffVerdict struct {
 //     but names a source issue other than the run's trusted identity is
 //     not a read failure and not a model-repairable defect: the event
 //     surfaces with kind:"criteria-identity" and the run fails closed to
-//     NeedsHuman on sight, without consuming the #170 budget (#282).
+//     NeedsHuman without consuming the #170 budget, as soon as the
+//     observation reaches a state where the evidence contract would run
+//     (#282).
 //
 // The call site signals the budget consumed so far through continuations
 // (so the helper consumes one slot when it asks for a continue); ctxErr

@@ -1891,19 +1891,22 @@ named items remain unresolved and must not be described as production-ready:
   single bounded `body-repair` continuation on the shared #170 budget
   instead of two sequential repairs that burn it in turn. A decoded
   envelope naming a source issue other than the run's trusted
-  `COURIER_REPO`/`COURIER_REF` identity is a policy mismatch between two
-  operator-side inputs, not a model-repairable body defect: the run fails
-  closed to `NeedsHuman` on sight (`linkage.read.failed` with kind
-  `criteria-identity`) without consuming the budget, and the binding is
-  checked before the pinned-empty shortcut so a foreign envelope cannot
-  slip through as a vacuous pass — mirroring the native engine's
-  `Criteria.Issue == SourceIssue` binding in `internal/broker/policy.go`.
+  `COURIER_REPO`/`COURIER_REF` identity — or one that cannot be bound
+  because the run carries no valid trusted identity — is a policy
+  mismatch between operator-side inputs, not a model-repairable body
+  defect: the run fails closed to `NeedsHuman` (`linkage.read.failed`
+  with kind `criteria-identity`) without consuming the budget, as soon
+  as the observation reaches a state where the evidence contract would
+  run, and the binding is checked before the pinned-empty shortcut so a
+  foreign envelope cannot slip through as a vacuous pass — mirroring the
+  native engine's `Criteria.Issue == SourceIssue` binding in
+  `internal/broker/policy.go`.
   A passing pinned handoff surfaces the derived coverage and per-status
   counts both in the `run.exit` telemetry and as a best-effort outcome
-  comment on the run's source issue, labelled honestly `partial`; the
-  legacy handoff never claims fully verified completion outside the PR
-  body. No new budget, gate, or wall clock: boundedness stays
-  `MaxContinuations` (#170). (#282, #249, #280, #248)
+  comment on the run's source issue — a partial record is labelled
+  honestly partial, and the legacy handoff never claims fully verified
+  completion outside the PR body. No new budget, gate, or wall clock:
+  boundedness stays `MaxContinuations` (#170). (#282, #249, #280, #248)
 - **2026-10-16 — #327: materialize recovery attempts without deleting history.**
   Successor names incorporate the settled predecessor UID so stable issue IDs
   and preserved PR-fix generations do not collide with retained runs. Active
