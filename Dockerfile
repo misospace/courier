@@ -57,10 +57,6 @@ RUN --mount=type=cache,target=/go/pkg/mod \
 FROM node:24-bookworm-slim@sha256:a5f4366e834695d5f363b920c104953a535d3a9864d1bdf74566a0ebe01daee5 AS coordinator
 ARG OPENCODE_VERSION=1.18.31
 
-# bookworm ships git 2.39; the harness artifact validation (internal/harness)
-# requires git >= 2.41 and bookworm-backports does not carry git. Build git
-# v2.47.3 from a pinned GitHub release tarball, verifying SHA-256, with
-# /usr/local as the install prefix so the new binary shadows the stock one.
 RUN set -eux; \
 	apt-get update && \
 	apt-get install -y --no-install-recommends \
