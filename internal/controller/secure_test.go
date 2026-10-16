@@ -2048,3 +2048,376 @@ func TestWedgeDeferredChargeDoesNotFenceYet(t *testing.T) {
 		t.Fatalf("broker ingress must still stand while the charge defers to the backstop: %v", err)
 	}
 }
+
+// recordingReader is a client.Reader that reports whether it was consulted.
+// The repo's convention for live reads is a reader distinct from the cached
+// client (liveness_test.go's `api` readers); pointing APIReader at the very
+// same fake client as Client would make the uncached read indistinguishable
+// from the cached one, so a test using this wrapper pins which reader the
+// secure relaunch's re-confirmation actually goes through.
+type recordingReader struct {
+	client.Reader
+	consulted bool
+}
+
+func (r *recordingReader) List(ctx context.Context, list client.ObjectList, opts ...client.ListOption) error {
+	r.consulted = true
+	return r.Reader.List(ctx, list, opts...)
+}
+
+func (r *recordingReader) Get(ctx context.Context, key client.ObjectKey, object client.Object, opts ...client.GetOption) error {
+	r.consulted = true
+	return r.Reader.Get(ctx, key, object, opts...)
+}
+
+// inertControlPod turns a live secure control pod into the shape the secure
+// relaunch treats as evidence: a terminal object Kubernetes never recorded a
+// coordinator exit for (an eviction), so it can never report a run outcome.
+// healthyPod's fixture names its container "main"; the live re-confirmation
+// recognizes the coordinator object by its container name, so that is set here
+// too — the production coupling `topology.ControlPod` renders, pinned rather
+// than patched around.
+func inertControlPod(t *testing.T, c client.Client, run *courier.CoderRun) *corev1.Pod {
+	t.Helper()
+	var pod corev1.Pod
+	key := types.NamespacedName{Namespace: run.Namespace, Name: topology.ControlPodName(run.Name)}
+	if err := c.Get(context.Background(), key, &pod); err != nil {
+		t.Fatal(err)
+	}
+	pod.Spec.Containers[0].Name = topology.ControlContainerName
+	// The spec change goes through a full update and the status through the
+	// status subresource; the fake client will not carry a spec edit on a
+	// status write.
+	if err := c.Update(context.Background(), &pod); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.Get(context.Background(), key, &pod); err != nil {
+		t.Fatal(err)
+	}
+	pod.Status = corev1.PodStatus{
+		Phase:   corev1.PodFailed,
+		Reason:  "Evicted",
+		Message: "The node was low on resource: ephemeral-storage.",
+	}
+	if err := c.Status().Update(context.Background(), &pod); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.Get(context.Background(), key, &pod); err != nil {
+		t.Fatal(err)
+	}
+	if controlTerminated(&pod) {
+		t.Fatal("the inert control fixture must not read as a terminated coordinator, or ObserveTopology's control-terminated branch would intercept it")
+	}
+	if !hasCoordinatorContainer(&pod) {
+		t.Fatalf("the control fixture must declare the %q container, or the live re-confirmation cannot recognize it as a coordinator object", coordinatorContainerName)
+	}
+	if !coordinatorPodUnrecoverable(&pod) {
+		t.Fatalf("control phase %v with %d container statuses must read as unrecoverable", pod.Status.Phase, len(pod.Status.ContainerStatuses))
+	}
+	return &pod
+}
+
+// TestSecureBrokenTopologyDefersChargeUntilControlObjectIsGone pins #223's core
+// arm: the secure broken-topology relaunch obeys "a delete is not a
+// disappearance" for the control object that carries evidence. A delete the API
+// server has only marked terminating — held by a finalizer — is not a
+// disappearance, so the charge is deferred and the round is left standing; the
+// disappearance backstop takes both the fence and the single charge once the
+// object is provably gone, so one physical loss is charged once.
+func TestSecureBrokenTopologyDefersChargeUntilControlObjectIsGone(t *testing.T) {
+	ctx := context.Background()
+	control, c, run := brokenWorkerSecureRound(t, "secure-deferred-charge", 0)
+	// The live re-confirmation reads through the uncached API reader, as the
+	// manager wires it in production.
+	api := &recordingReader{Reader: c}
+	control.APIReader = api
+
+	controlKey := types.NamespacedName{Namespace: run.Namespace, Name: topology.ControlPodName(run.Name)}
+	controlPod := inertControlPod(t, c, run)
+	// A finalizer is what keeps the deleted object present for the live
+	// re-confirmation; the fake client refuses a DeletionTimestamp without one.
+	controlPod.Finalizers = []string{"courier.misospace.dev/test"}
+	if err := c.Update(ctx, controlPod); err != nil {
+		t.Fatal(err)
+	}
+
+	result, handled, err := control.ObserveTopology(ctx, run, listRunPods(t, c, run))
+	if err != nil || !handled {
+		t.Fatalf("handled=%v err=%v, want the broken topology handled", handled, err)
+	}
+	if !api.consulted {
+		t.Fatal("the re-confirmation must read through the uncached APIReader, not the cached Client")
+	}
+	if result.RequeueAfter != secureRequeueDelay {
+		t.Fatalf("RequeueAfter = %v, want %v; a delete still re-confirming defers", result.RequeueAfter, secureRequeueDelay)
+	}
+	if result.Requeue {
+		t.Fatal("Requeue = true, want false; a deferred charge must not relaunch")
+	}
+	var updated courier.CoderRun
+	if err := c.Get(ctx, client.ObjectKeyFromObject(run), &updated); err != nil {
+		t.Fatal(err)
+	}
+	if updated.Status.Phase != courier.PhaseRunning || updated.Status.Restarts != 0 {
+		t.Fatalf("state = phase %q restarts %d, want Running/0; a delete that only set a deletionTimestamp is not a loss to charge",
+			updated.Status.Phase, updated.Status.Restarts)
+	}
+	// The control object is still there, terminating: the delete was issued and
+	// is in flight, not confirmed.
+	var still corev1.Pod
+	if err := c.Get(ctx, controlKey, &still); err != nil {
+		t.Fatalf("the deleted control object must survive as terminating: %v", err)
+	}
+	if still.DeletionTimestamp == nil {
+		t.Fatal("deletionTimestamp = nil, want set; the delete must be in flight")
+	}
+	var got corev1.Pod
+	if err := c.Get(ctx, types.NamespacedName{Namespace: run.Namespace, Name: topology.WorkerPodName(run.Name)}, &got); err != nil {
+		t.Fatalf("worker must still stand while the charge defers: %v", err)
+	}
+	if err := c.Get(ctx, types.NamespacedName{Namespace: run.Namespace, Name: topology.BrokerPodName(run.Name)}, &got); err != nil {
+		t.Fatalf("broker pod must still stand while the charge defers: %v", err)
+	}
+
+	// Release the finalizer so the object is actually gone, then reconcile: the
+	// disappearance backstop now confirms the loss and takes the deferred charge,
+	// fencing the round on the same reconcile.
+	still.Finalizers = nil
+	if err := c.Update(ctx, &still); err != nil {
+		t.Fatal(err)
+	}
+	reconciler := secureLivenessReconciler(c, control, livenessClock)
+	result, err = reconciler.Reconcile(ctx, ctrl.Request{NamespacedName: client.ObjectKeyFromObject(run)})
+	if err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	if !result.Requeue {
+		t.Fatal("Requeue = false, want true; a confirmed-gone loss must relaunch")
+	}
+	if err := c.Get(ctx, client.ObjectKeyFromObject(run), &updated); err != nil {
+		t.Fatal(err)
+	}
+	if updated.Status.Phase != courier.PhaseClaimed {
+		t.Fatalf("phase = %q, want Claimed; the loss is charged once the control object is gone", updated.Status.Phase)
+	}
+	if updated.Status.Restarts != 1 {
+		// A second charge here is the double-charge this issue is about: the
+		// relaunch path tolerates AlreadyExists, so a replacement round could
+		// attach to the dying object and one physical loss be paid for twice.
+		t.Fatalf("restarts = %d, want 1; one physical loss is charged exactly once", updated.Status.Restarts)
+	}
+	if err := c.Get(ctx, types.NamespacedName{Namespace: run.Namespace, Name: topology.WorkerPodName(run.Name)}, &got); !apierrors.IsNotFound(err) {
+		t.Fatalf("the backstop must fence the worker when it takes the deferred charge, got %v", err)
+	}
+	if err := c.Get(ctx, types.NamespacedName{Namespace: run.Namespace, Name: topology.BrokerPodName(run.Name)}, &got); !apierrors.IsNotFound(err) {
+		t.Fatalf("the backstop must fence the broker pod when it takes the deferred charge, got %v", err)
+	}
+}
+
+// TestSecureBrokenTopologyChargesRecoverableControlInPlace pins the boundary of
+// the #223 deferral, and is the regression guard for it. Only the inert control
+// object — the one that can never report an outcome — may defer its charge. A
+// still-recoverable control object is charged in place: a deferred charge would
+// leave the run Running while the pod is torn down, and the next reconcile's
+// exit-code mapping would read that teardown's exit code and terminalize the
+// run (Failed) instead of relaunching it. A finalizer holding the recoverable
+// object therefore costs a bounded re-observation at the launch path, never a
+// lost charge and never a premature terminal transition.
+func TestSecureBrokenTopologyChargesRecoverableControlInPlace(t *testing.T) {
+	ctx := context.Background()
+	control, c, run := brokenWorkerSecureRound(t, "secure-recoverable-control", 0)
+	control.APIReader = c
+
+	controlKey := types.NamespacedName{Namespace: run.Namespace, Name: topology.ControlPodName(run.Name)}
+	var controlPod corev1.Pod
+	if err := c.Get(ctx, controlKey, &controlPod); err != nil {
+		t.Fatal(err)
+	}
+	controlPod.Spec.Containers[0].Name = topology.ControlContainerName
+	// The same finalizer-held delete as the inert case above.
+	controlPod.Finalizers = []string{"courier.misospace.dev/test"}
+	if err := c.Update(ctx, &controlPod); err != nil {
+		t.Fatal(err)
+	}
+	if coordinatorPodUnrecoverable(&controlPod) {
+		t.Fatal("a running control object is recoverable and must not take the inert path")
+	}
+
+	result, handled, err := control.ObserveTopology(ctx, run, listRunPods(t, c, run))
+	if err != nil || !handled {
+		t.Fatalf("handled=%v err=%v, want the broken topology handled", handled, err)
+	}
+	if result.RequeueAfter != 0 || !result.Requeue {
+		t.Fatalf("result = %+v, want Requeue with no requeue delay; a recoverable control object is charged in place, not deferred", result)
+	}
+	var updated courier.CoderRun
+	if err := c.Get(ctx, client.ObjectKeyFromObject(run), &updated); err != nil {
+		t.Fatal(err)
+	}
+	if updated.Status.Phase != courier.PhaseClaimed || updated.Status.Restarts != 1 {
+		t.Fatalf("state = phase %q restarts %d, want Claimed/1 charged in place", updated.Status.Phase, updated.Status.Restarts)
+	}
+	// The round is fenced and the object deleted even though the finalizer keeps
+	// the control pod alive: the run has left Running, so nothing can read the
+	// teardown's exit code as a run outcome.
+	var got corev1.Pod
+	if err := c.Get(ctx, types.NamespacedName{Namespace: run.Namespace, Name: topology.WorkerPodName(run.Name)}, &got); !apierrors.IsNotFound(err) {
+		t.Fatalf("worker must be fenced on the in-place charge, got %v", err)
+	}
+	if err := c.Get(ctx, controlKey, &got); err != nil {
+		t.Fatalf("the recoverable control object must still be deleted: %v", err)
+	}
+	// The finalizer keeps the object readable after the delete, so its mere
+	// presence proves nothing: the delete must have been issued. Without it the
+	// deterministic name stays occupied, and the launch path's AlreadyExists
+	// tolerance would let the replacement round attach to this stale object.
+	if got.DeletionTimestamp == nil {
+		t.Fatal("deletionTimestamp = nil, want set; the recoverable control object must be deleted below the ceiling, not preserved")
+	}
+}
+
+// TestSecureBrokenTopologyAtCeilingPreservesUnrecoverableControl pins #223's
+// other arm: at the crashloop ceiling an unrecoverable control object is the
+// NeedsHuman hand-off's only record of the cause and is preserved rather than
+// deleted, while the round is still fenced. A terminal run is never relaunched,
+// so deleting the evidence would destroy the only record a human gets (#106).
+func TestSecureBrokenTopologyAtCeilingPreservesUnrecoverableControl(t *testing.T) {
+	ctx := context.Background()
+	// The package default ceiling: the run's counter already sits on it.
+	control, c, run := brokenWorkerSecureRound(t, "secure-ceiling-preserved", defaultMaxRestarts)
+	// The ceiling hand-off terminalizes through the patcher, which needs the
+	// source registry the plain secure helper does not wire.
+	control.Patcher = &CoderRunReconciler{
+		Client:       c,
+		Sources:      NewSourceRegistry(map[string]source.Adapter{"manual": &admissionSource{}}),
+		StatusWriter: fakeStatusWriter{client: c},
+	}
+	if err := c.Create(ctx, topology.BrokerService(run)); err != nil {
+		t.Fatal(err)
+	}
+	controlKey := types.NamespacedName{Namespace: run.Namespace, Name: topology.ControlPodName(run.Name)}
+	inertControlPod(t, c, run)
+
+	_, handled, err := control.ObserveTopology(ctx, run, listRunPods(t, c, run))
+	if err != nil || !handled {
+		t.Fatalf("handled=%v err=%v, want the broken topology handled", handled, err)
+	}
+	var updated courier.CoderRun
+	if err := c.Get(ctx, client.ObjectKeyFromObject(run), &updated); err != nil {
+		t.Fatal(err)
+	}
+	if updated.Status.Phase != courier.PhaseNeedsHuman {
+		t.Fatalf("phase = %q, want NeedsHuman from the ceiling", updated.Status.Phase)
+	}
+	if updated.Status.Restarts != defaultMaxRestarts {
+		t.Fatalf("restarts = %d, want %d (the ceiling is preserved, not incremented)", updated.Status.Restarts, defaultMaxRestarts)
+	}
+	var got corev1.Pod
+	if err := c.Get(ctx, controlKey, &got); err != nil {
+		t.Fatalf("the unrecoverable control object must survive as the hand-off's evidence: %v", err)
+	}
+	if err := c.Get(ctx, types.NamespacedName{Namespace: run.Namespace, Name: topology.WorkerPodName(run.Name)}, &got); !apierrors.IsNotFound(err) {
+		t.Fatalf("worker must be fenced even when the control is preserved, got %v", err)
+	}
+	var service corev1.Service
+	if err := c.Get(ctx, types.NamespacedName{Namespace: run.Namespace, Name: topology.BrokerServiceName(run.Name)}, &service); !apierrors.IsNotFound(err) {
+		t.Fatalf("broker ingress must be disabled even when the control is preserved, got %v", err)
+	}
+	if err := c.Get(ctx, types.NamespacedName{Namespace: run.Namespace, Name: topology.BrokerPodName(run.Name)}, &got); !apierrors.IsNotFound(err) {
+		t.Fatalf("broker pod must be fenced even when the control is preserved, got %v", err)
+	}
+}
+
+// TestSecureBrokenTopologyAtCeilingStillDeletesRecoverableControl pins the
+// qualifier on the arm above: preservation at the ceiling is for the inert
+// evidence object only. A still-recoverable control object records a live round,
+// not a cause, so it is deleted at the ceiling exactly as below it — nothing is
+// withheld from a replacement that will never come, and a live object is not the
+// hand-off's record.
+func TestSecureBrokenTopologyAtCeilingStillDeletesRecoverableControl(t *testing.T) {
+	ctx := context.Background()
+	control, c, run := brokenWorkerSecureRound(t, "secure-ceiling-recoverable", defaultMaxRestarts)
+	control.Patcher = &CoderRunReconciler{
+		Client:       c,
+		Sources:      NewSourceRegistry(map[string]source.Adapter{"manual": &admissionSource{}}),
+		StatusWriter: fakeStatusWriter{client: c},
+	}
+	controlKey := types.NamespacedName{Namespace: run.Namespace, Name: topology.ControlPodName(run.Name)}
+	var controlPod corev1.Pod
+	if err := c.Get(ctx, controlKey, &controlPod); err != nil {
+		t.Fatal(err)
+	}
+	controlPod.Spec.Containers[0].Name = topology.ControlContainerName
+	if err := c.Update(ctx, &controlPod); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, handled, err := control.ObserveTopology(ctx, run, listRunPods(t, c, run)); err != nil || !handled {
+		t.Fatalf("handled=%v err=%v, want the broken topology handled", handled, err)
+	}
+	var updated courier.CoderRun
+	if err := c.Get(ctx, client.ObjectKeyFromObject(run), &updated); err != nil {
+		t.Fatal(err)
+	}
+	if updated.Status.Phase != courier.PhaseNeedsHuman {
+		t.Fatalf("phase = %q, want NeedsHuman from the ceiling", updated.Status.Phase)
+	}
+	var got corev1.Pod
+	if err := c.Get(ctx, controlKey, &got); !apierrors.IsNotFound(err) {
+		t.Fatalf("a recoverable control object must be deleted at the ceiling, got %v", err)
+	}
+	// Preservation is the qualifier, not the fence: the round is still torn down
+	// on the ceiling reconcile either way, because a terminal run is never
+	// relaunched and a fence deferred past this reconcile would never run.
+	if err := c.Get(ctx, types.NamespacedName{Namespace: run.Namespace, Name: topology.WorkerPodName(run.Name)}, &got); !apierrors.IsNotFound(err) {
+		t.Fatalf("worker must be fenced at the ceiling, got %v", err)
+	}
+	if err := c.Get(ctx, types.NamespacedName{Namespace: run.Namespace, Name: topology.BrokerPodName(run.Name)}, &got); !apierrors.IsNotFound(err) {
+		t.Fatalf("broker pod must be fenced at the ceiling, got %v", err)
+	}
+}
+
+// TestFenceAndRelaunchToleratesControlPodVanishingBeforeReread pins the
+// nil-safety of the relaunch's own control-pod re-read. ObserveTopology decides
+// from the pod list the reconcile collected; fenceAndRelaunch lists again, so a
+// control pod that vanishes in between — eviction, node drain, a human deleting
+// it — arrives as no control pod at all. That is a loss the disappearance
+// backstop owns, not a panic: the relaunch must delete nothing, preserve
+// nothing, and charge exactly as it would for any absent control pod.
+func TestFenceAndRelaunchToleratesControlPodVanishingBeforeReread(t *testing.T) {
+	ctx := context.Background()
+	control, c, run := brokenWorkerSecureRound(t, "secure-control-vanished", 0)
+	control.APIReader = c
+	controlKey := types.NamespacedName{Namespace: run.Namespace, Name: topology.ControlPodName(run.Name)}
+	// Gone by the time the relaunch re-reads it.
+	if err := c.Delete(ctx, &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Namespace: controlKey.Namespace, Name: controlKey.Name},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.Create(ctx, topology.BrokerService(run)); err != nil {
+		t.Fatal(err)
+	}
+
+	result, handled, err := control.fenceAndRelaunch(ctx, run)
+	if err != nil {
+		t.Fatalf("fenceAndRelaunch: %v", err)
+	}
+	if !handled || !result.Requeue {
+		t.Fatalf("handled=%v result=%+v, want the relaunch handled with a requeue", handled, result)
+	}
+	var updated courier.CoderRun
+	if err := c.Get(ctx, client.ObjectKeyFromObject(run), &updated); err != nil {
+		t.Fatal(err)
+	}
+	if updated.Status.Phase != courier.PhaseClaimed || updated.Status.Restarts != 1 {
+		t.Fatalf("state = phase %q restarts %d, want Claimed/1; an absent control pod is charged like any other", updated.Status.Phase, updated.Status.Restarts)
+	}
+	var got corev1.Pod
+	if err := c.Get(ctx, types.NamespacedName{Namespace: run.Namespace, Name: topology.WorkerPodName(run.Name)}, &got); !apierrors.IsNotFound(err) {
+		t.Fatalf("worker must be fenced, got %v", err)
+	}
+	if err := c.Get(ctx, types.NamespacedName{Namespace: run.Namespace, Name: topology.BrokerPodName(run.Name)}, &got); !apierrors.IsNotFound(err) {
+		t.Fatalf("broker pod must be fenced, got %v", err)
+	}
+}

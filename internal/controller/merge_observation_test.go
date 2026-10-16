@@ -3,11 +3,13 @@ package controller
 import (
 	"context"
 	"errors"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	apimeta "k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
@@ -165,10 +167,6 @@ func TestAwaitingReviewMergeObservationNeverFinishesWithoutConfirmedIdentity(t *
 		reader *fakePullRequestReader
 	}{
 		{"open pull request", &fakePullRequestReader{pull: observedPR(func(pull forge.PullRequest) forge.PullRequest { return pull })}},
-		{"closed without merge", &fakePullRequestReader{pull: observedPR(func(pull forge.PullRequest) forge.PullRequest {
-			pull.State = "closed"
-			return pull
-		})}},
 		{"forge read failure", &fakePullRequestReader{err: errors.New("github unavailable")}},
 		{"merged from a changed head repository", &fakePullRequestReader{pull: observedPR(func(pull forge.PullRequest) forge.PullRequest {
 			pull.State = "closed"
@@ -228,7 +226,134 @@ func TestAwaitingReviewMergeObservationNeverFinishesWithoutConfirmedIdentity(t *
 			if _, ok := stored.Annotations[doneAtAnnotation]; ok {
 				t.Fatal("done-at marker written without a Done phase; the retention clock must not start")
 			}
+			if _, ok := stored.Annotations[needsHumanAtAnnotation]; ok {
+				t.Fatal("needs-human-at marker written without a NeedsHuman phase; the retention clock must not start")
+			}
 		})
+	}
+}
+
+func TestAwaitingReviewClosedUnmergedTransitionsToNeedsHuman(t *testing.T) {
+	item := &admissionSource{}
+	reader := &fakePullRequestReader{pull: observedPR(func(pull forge.PullRequest) forge.PullRequest {
+		pull.State = "closed"
+		return pull
+	})}
+	run := reviewRun("closed")
+	finishedBefore := run.Status.FinishedAt.Time
+	c := phaseClient(t, run)
+
+	reconciler := reapReconciler(c, item, reapClock)
+	reconciler.PullRequests = reader
+	if _, err := reconciler.Reconcile(context.Background(), admissionRequest("closed")); err != nil {
+		t.Fatalf("Reconcile() error = %v", err)
+	}
+	if len(reader.requests) != 1 || reader.requests[0] != (forge.PullRequestRef{Repo: "acme/widgets", Number: 42}) {
+		t.Fatalf("reads = %#v, want one exact read of PR 42 in the run's base repository", reader.requests)
+	}
+	var stored courierv1alpha1.CoderRun
+	if err := c.Get(context.Background(), admissionKey("closed"), &stored); err != nil {
+		t.Fatalf("get run: %v", err)
+	}
+	if stored.Status.Phase != courierv1alpha1.PhaseNeedsHuman {
+		t.Fatalf("phase = %q, want NeedsHuman after the recorded PR was closed without merge", stored.Status.Phase)
+	}
+	cond := apimeta.FindStatusCondition(stored.Status.Conditions, courierv1alpha1.ConditionPullRequestClosedUnmerged)
+	if cond == nil || cond.Status != metav1.ConditionTrue || cond.Reason != courierv1alpha1.ConditionReasonClosedUnmerged {
+		t.Fatalf("closed-unmerged condition = %#v, want True/ClosedUnmerged", cond)
+	}
+	if !strings.Contains(cond.Message, "acme/widgets#42") {
+		t.Fatalf("condition message = %q, want the recorded PR identity", cond.Message)
+	}
+	if stored.Status.FinishedAt == nil || !stored.Status.FinishedAt.Time.Equal(finishedBefore) {
+		t.Fatalf("finishedAt = %v, want the originally recorded %v preserved", stored.Status.FinishedAt, finishedBefore)
+	}
+	if len(item.reports) != 1 {
+		t.Fatalf("reports = %#v, want exactly one NeedsHuman lifecycle report", item.reports)
+	}
+	if item.reports[0].Result != source.ResultBlocked {
+		t.Fatalf("report result = %q, want ResultBlocked for a parked run", item.reports[0].Result)
+	}
+	if len(item.transitions) != 1 || item.transitions[0] != source.StateNeedsHuman {
+		t.Fatalf("transitions = %#v, want exactly one StateNeedsHuman", item.transitions)
+	}
+	if len(item.resolved) != 0 {
+		t.Fatalf("resolved IDs = %#v, want none; a closed-unmerged run is parked, not resolved", item.resolved)
+	}
+	if _, ok := stored.Annotations[needsHumanAtAnnotation]; ok {
+		t.Fatal("needs-human-at marker written during the transition; retention starts on the first reap-eligible reconcile")
+	}
+	if _, ok := stored.Annotations[doneAtAnnotation]; ok {
+		t.Fatal("done-at marker must not be written for a NeedsHuman run")
+	}
+}
+
+func TestAwaitingReviewClosedUnmergedRestartDoesNotRereadAndRetainsFresh(t *testing.T) {
+	item := &admissionSource{}
+	reader := &fakePullRequestReader{pull: observedPR(func(pull forge.PullRequest) forge.PullRequest {
+		pull.State = "closed"
+		return pull
+	})}
+	run := reviewRun("closed-retain")
+	finishedBefore := run.Status.FinishedAt.Time
+	c := phaseClient(t, run)
+
+	first := reapReconciler(c, item, reapClock)
+	first.PullRequests = reader
+	if _, err := first.Reconcile(context.Background(), admissionRequest("closed-retain")); err != nil {
+		t.Fatalf("Reconcile() error = %v", err)
+	}
+	if reader.calls != 1 {
+		t.Fatalf("pull-request reads = %d, want one during the closed-unmerged transition", reader.calls)
+	}
+
+	// A brand-new reconciler (controller restart) must not read the PR again
+	// or re-transition: NeedsHuman is terminal and its source report settled.
+	restartClock := reapClock.Add(time.Minute)
+	restart := terminalReapReconciler(c, item, restartClock, -1)
+	restart.PullRequests = reader
+	result, err := restart.Reconcile(context.Background(), admissionRequest("closed-retain"))
+	if err != nil {
+		t.Fatalf("restart Reconcile() error = %v", err)
+	}
+	if reader.calls != 1 {
+		t.Fatalf("pull-request reads = %d, want the restart to skip the forge read once NeedsHuman", reader.calls)
+	}
+	if len(item.transitions) != 1 {
+		t.Fatalf("transitions = %#v, want the restart not to re-transition", item.transitions)
+	}
+	var stored courierv1alpha1.CoderRun
+	if err := c.Get(context.Background(), admissionKey("closed-retain"), &stored); err != nil {
+		t.Fatalf("get run: %v", err)
+	}
+	if stored.Status.Phase != courierv1alpha1.PhaseNeedsHuman {
+		t.Fatalf("phase = %q, want NeedsHuman", stored.Status.Phase)
+	}
+	if stored.Status.FinishedAt == nil || !stored.Status.FinishedAt.Time.Equal(finishedBefore) {
+		t.Fatalf("finishedAt = %v, want the original execution end %v preserved", stored.Status.FinishedAt, finishedBefore)
+	}
+	// The restart's first reap-eligible reconcile stamps a fresh window at its
+	// own clock, not the run's original execution end.
+	wantStamp := restartClock.UTC().Format(time.RFC3339)
+	if got := stored.Annotations[needsHumanAtAnnotation]; got != wantStamp {
+		t.Fatalf("needs-human-at = %q, want the fresh restart stamp %q", got, wantStamp)
+	}
+	if result.RequeueAfter != 10*time.Minute {
+		t.Fatalf("RequeueAfter = %v, want the full NeedsHuman retention window", result.RequeueAfter)
+	}
+
+	// Past the fresh window the run is deleted. The audit floor is disabled
+	// (keep=-1) so the deletion is deterministic.
+	past := terminalReapReconciler(c, item, restartClock.Add(11*time.Minute), -1)
+	past.PullRequests = reader
+	if _, err := past.Reconcile(context.Background(), admissionRequest("closed-retain")); err != nil {
+		t.Fatalf("retention Reconcile() error = %v", err)
+	}
+	if err := c.Get(context.Background(), admissionKey("closed-retain"), &courierv1alpha1.CoderRun{}); !apierrors.IsNotFound(err) {
+		t.Fatalf("get run = %v, want NotFound past the NeedsHuman retention window", err)
+	}
+	if len(item.resolved) != 0 {
+		t.Fatalf("resolved IDs = %#v, want a NeedsHuman run never resolved", item.resolved)
 	}
 }
 
@@ -267,6 +392,15 @@ func TestAwaitingReviewMergeObservationSkipsRunsWithoutExactIdentity(t *testing.
 			}
 			if stored.Status.Phase != courierv1alpha1.PhaseAwaitingReview {
 				t.Fatalf("phase = %q, want AwaitingReview", stored.Status.Phase)
+			}
+			if len(item.resolved) != 0 || len(item.reports) != 0 {
+				t.Fatalf("source calls = resolve %#v reports %#v, want none", item.resolved, item.reports)
+			}
+			if _, ok := stored.Annotations[doneAtAnnotation]; ok {
+				t.Fatal("done-at marker written without a Done phase")
+			}
+			if _, ok := stored.Annotations[needsHumanAtAnnotation]; ok {
+				t.Fatal("needs-human-at marker written without a NeedsHuman phase")
 			}
 		})
 	}
