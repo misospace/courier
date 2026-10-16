@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"strings"
 	"time"
 
@@ -113,6 +114,26 @@ func (r reporter) capacityExhaustedTermination(ctx context.Context, workspace *g
 		Reason:          capacityExhaustionReason(class, code),
 		Outcome:         string(executor.OutcomeCapacityExhausted),
 		Category:        terminalCategoryCapacityExhaustion,
+		WorkspaceSafety: capacityWorkspaceSafety(ctx, workspace, cfg.RemoteURL, cfg.Branch, startCommit),
+	}
+}
+
+// availabilityRecoveryTermination builds the recoverable availability-handoff
+// ending (#327 Scenario D): the provider repeatedly failed to serve this
+// attempt without ever producing a structured allowance-exhaustion signal, so
+// the run ends on the same fenced capacity-recovery channel — exit 2, the
+// capacity-handoff outcome — but with the honest provider-unavailable
+// category, never claiming a quota verdict the evidence does not support.
+func (r reporter) availabilityRecoveryTermination(ctx context.Context, workspace *git.Workspace, cfg config, startCommit string, exitStatus int) termination {
+	ctx, cancel := context.WithTimeout(ctx, 20*time.Second)
+	defer cancel()
+	return termination{
+		Phase:           "NeedsHuman",
+		Result:          "needs-human",
+		ExitCode:        exitNeedsHuman,
+		Reason:          fmt.Sprintf("model provider failed to serve %d consecutive attempts (last exit %d); releasing work for another capacity without a structured exhaustion signal", cfg.MaxAvailabilityRetries, exitStatus),
+		Outcome:         string(executor.OutcomeCapacityExhausted),
+		Category:        terminalCategoryProviderUnavailable,
 		WorkspaceSafety: capacityWorkspaceSafety(ctx, workspace, cfg.RemoteURL, cfg.Branch, startCommit),
 	}
 }

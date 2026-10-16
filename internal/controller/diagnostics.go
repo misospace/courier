@@ -114,6 +114,7 @@ func knownTerminalDiagnosticCategory(category courierv1alpha1.TerminalDiagnostic
 		courierv1alpha1.TerminalDiagnosticCategoryNeedsDecision,
 		courierv1alpha1.TerminalDiagnosticCategoryBlockedExternal,
 		courierv1alpha1.TerminalDiagnosticCategoryCapacityExhaustion,
+		courierv1alpha1.TerminalDiagnosticCategoryProviderUnavailable,
 		courierv1alpha1.TerminalDiagnosticCategoryUnknown:
 		return true
 	default:
@@ -194,6 +195,8 @@ func categoryDiagnosticReason(category courierv1alpha1.TerminalDiagnosticCategor
 		return "coordinator pod failed at the Kubernetes or container layer"
 	case courierv1alpha1.TerminalDiagnosticCategoryCapacityExhaustion:
 		return "execution capacity was confirmed exhausted"
+	case courierv1alpha1.TerminalDiagnosticCategoryProviderUnavailable:
+		return "model provider repeatedly failed to serve this attempt; work released for another capacity"
 	case courierv1alpha1.TerminalDiagnosticCategoryExecutorCrash:
 		return "coordinator exited without a valid handoff"
 	case courierv1alpha1.TerminalDiagnosticCategoryUnknown:

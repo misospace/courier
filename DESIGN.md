@@ -255,6 +255,17 @@ executor/runtime positively classifies capacity exhaustion; Courier does not
 infer it from HTTP 429 or provider text. The operator records a recoverable
 `BlockedExternal` terminal diagnostic and starts a durable, idempotent handoff.
 
+An outage without an authoritative exhaustion signal must strand nothing
+(#327). Attempts that end without the provider ever serving a session id
+crash into a dedicated availability budget, separate from the task-repair
+continuation budget and backed off exponentially (capped, never a tight loop).
+Exhausting it ends the run on the same recovery channel — the
+`capacity_exhausted` outcome with the honest `provider-unavailable` diagnostic
+category — never a quota verdict the evidence does not support, never
+`Failed`, never NeedsHuman-for-model-outage. Settlement, safety gating, and
+cooldown semantics are identical to confirmed exhaustion: an unverified or
+unsafe workspace still retains ownership.
+
 `LaneProfile.spec.capacityGroup` optionally names lanes sharing an execution
 capacity identity; otherwise the lane name is the identity. Confirmed
 exhaustion persists a default 15-minute cooldown on LaneProfile status. Source
@@ -1935,6 +1946,18 @@ named items remain unresolved and must not be described as production-ready:
 - The exact vLLM gauge for backpressure on the target model server.
 
 ## Decisions
+
+- **2026-10-16 — #327: availability handoff for outages without quota evidence.**
+  Repeated no-session crashes (provider outage, transport failure) previously
+  terminalized runs as Failed and stranded the work item, because the shared
+  continuation budget was designed for task repair. Added a separate bounded,
+  backed-off availability budget in the executor that ends the run via the
+  existing fenced capacity-recovery channel with a new `provider-unavailable`
+  diagnostic category. No second state machine; the category keeps the claim
+  honest — an outage is not a quota verdict — and settlement still fails closed
+  on unsafe or unverifiable workspace evidence. Chosen because keeping work
+  moving outweighs failing fast: an idle local capacity on a claimed item is
+  the failure mode this feature exists to end.
 
 - **2026-10-16 — #327: materialize recovery attempts without deleting history.**
   Successor names incorporate the settled predecessor UID so stable issue IDs

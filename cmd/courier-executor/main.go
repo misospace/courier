@@ -63,7 +63,15 @@ const (
 	defaultFormat           = "json"
 	defaultMaxContinuations = 3
 	defaultResumeBackoff    = 5 * time.Second
-	maxResumeBackoffSeconds = 3600
+	// defaultMaxAvailabilityRetries bounds consecutive no-progress provider
+	// failures before the run ends recoverably for another capacity (#327).
+	// With defaultResumeBackoff doubling up to maxAvailabilityBackoffCap the
+	// budget spans roughly fifteen minutes of an outage — long enough to ride
+	// out brief blips, short enough that a healthy sibling capacity is not
+	// starved of the work.
+	defaultMaxAvailabilityRetries = 10
+	maxAvailabilityBackoffCap     = 4
+	maxResumeBackoffSeconds       = 3600
 )
 
 type config struct {
@@ -88,13 +96,18 @@ type config struct {
 	OpenCodeAgent    string
 	MaxContinuations int
 	ResumeBackoff    time.Duration
-	TerminationFile  string
-	GitUsername      string
-	GitToken         string
-	GitHubToken      string
-	EvidenceURL      string
-	EvidenceToken    string
-	PodUID           string
+	// MaxAvailabilityRetries bounds consecutive no-progress provider
+	// failures (#327 Scenario D): an outage keeps the run recoverable on a
+	// separate, backed-off budget instead of consuming task-repair
+	// continuations or terminalizing as Failed.
+	MaxAvailabilityRetries int
+	TerminationFile        string
+	GitUsername            string
+	GitToken               string
+	GitHubToken            string
+	EvidenceURL            string
+	EvidenceToken          string
+	PodUID                 string
 	// ExhaustionCodes/ExhaustionTypes are the deployment-extended provider
 	// exhaustion signals (#320 policy): structured tokens added to the
 	// provider-neutral defaults, never replacing them (#327).
@@ -162,6 +175,10 @@ func readConfig(getenv func(string) string) (config, error) {
 	if maxContinuations < 1 {
 		maxContinuations = defaultMaxContinuations
 	}
+	availabilityRetries, _ := strconv.Atoi(strings.TrimSpace(getenv("COURIER_MAX_AVAILABILITY_RETRIES")))
+	if availabilityRetries < 1 {
+		availabilityRetries = defaultMaxAvailabilityRetries
+	}
 	resumeBackoff, err := strconv.ParseFloat(strings.TrimSpace(getenv("COURIER_RESUME_BACKOFF_SECONDS")), 64)
 	if err != nil || math.IsNaN(resumeBackoff) || math.IsInf(resumeBackoff, 0) || resumeBackoff < 0 {
 		resumeBackoff = defaultResumeBackoff.Seconds()
@@ -170,36 +187,37 @@ func readConfig(getenv func(string) string) (config, error) {
 		resumeBackoff = maxResumeBackoffSeconds
 	}
 	cfg := config{
-		RemoteURL:        remoteURL,
-		BaseRemoteURL:    strings.TrimSpace(getenv("COURIER_BASE_REPO_URL")),
-		Directory:        strings.TrimSpace(getenv("COURIER_WORKSPACE")),
-		ScratchDirectory: strings.TrimSpace(getenv("COURIER_SCRATCH_DIR")),
-		Base:             strings.TrimSpace(getenv("COURIER_BASE")),
-		Branch:           strings.TrimSpace(getenv("COURIER_BRANCH")),
-		Repo:             strings.TrimSpace(getenv("COURIER_REPO")),
-		HeadRepo:         strings.TrimSpace(getenv("COURIER_HEAD_REPO")),
-		HeadSHA:          strings.TrimSpace(getenv("COURIER_HEAD_SHA")),
-		Goal:             strings.TrimSpace(getenv("COURIER_GOAL")),
-		Model:            strings.TrimSpace(getenv("COURIER_MODEL")),
-		Framing:          getenv("COURIER_FRAMING"),
-		Mode:             strings.TrimSpace(getenv("COURIER_MODE")),
-		RunID:            strings.TrimSpace(getenv("COURIER_RUN_NAME")),
-		Ref:              ref,
-		OpenCodeBinary:   strings.TrimSpace(getenv("COURIER_OPENCODE_BINARY")),
-		OpenCodeFormat:   strings.TrimSpace(getenv("COURIER_OPENCODE_FORMAT")),
-		OpenCodeAgent:    strings.TrimSpace(getenv("COURIER_OPENCODE_AGENT")),
-		MaxContinuations: maxContinuations,
-		ResumeBackoff:    time.Duration(resumeBackoff * float64(time.Second)),
-		TerminationFile:  strings.TrimSpace(getenv("COURIER_TERMINATION_FILE")),
-		GitUsername:      getenv("COURIER_GIT_USERNAME"),
-		GitToken:         getenv("COURIER_GIT_TOKEN"),
-		GitHubToken:      getenv("GITHUB_TOKEN"),
-		GitHubAPIBase:    strings.TrimSpace(getenv("COURIER_GITHUB_API_BASE")),
-		EvidenceURL:      strings.TrimSpace(getenv(executor.EnvEvidenceURL)),
-		EvidenceToken:    strings.TrimSpace(getenv(executor.EnvEvidenceToken)),
-		PodUID:           strings.TrimSpace(getenv(executor.EnvPodUID)),
-		ExhaustionCodes:  getenv("COURIER_MODEL_EXHAUSTION_CODES"),
-		ExhaustionTypes:  getenv("COURIER_MODEL_EXHAUSTION_TYPES"),
+		RemoteURL:              remoteURL,
+		BaseRemoteURL:          strings.TrimSpace(getenv("COURIER_BASE_REPO_URL")),
+		Directory:              strings.TrimSpace(getenv("COURIER_WORKSPACE")),
+		ScratchDirectory:       strings.TrimSpace(getenv("COURIER_SCRATCH_DIR")),
+		Base:                   strings.TrimSpace(getenv("COURIER_BASE")),
+		Branch:                 strings.TrimSpace(getenv("COURIER_BRANCH")),
+		Repo:                   strings.TrimSpace(getenv("COURIER_REPO")),
+		HeadRepo:               strings.TrimSpace(getenv("COURIER_HEAD_REPO")),
+		HeadSHA:                strings.TrimSpace(getenv("COURIER_HEAD_SHA")),
+		Goal:                   strings.TrimSpace(getenv("COURIER_GOAL")),
+		Model:                  strings.TrimSpace(getenv("COURIER_MODEL")),
+		Framing:                getenv("COURIER_FRAMING"),
+		Mode:                   strings.TrimSpace(getenv("COURIER_MODE")),
+		RunID:                  strings.TrimSpace(getenv("COURIER_RUN_NAME")),
+		Ref:                    ref,
+		OpenCodeBinary:         strings.TrimSpace(getenv("COURIER_OPENCODE_BINARY")),
+		OpenCodeFormat:         strings.TrimSpace(getenv("COURIER_OPENCODE_FORMAT")),
+		OpenCodeAgent:          strings.TrimSpace(getenv("COURIER_OPENCODE_AGENT")),
+		MaxContinuations:       maxContinuations,
+		ResumeBackoff:          time.Duration(resumeBackoff * float64(time.Second)),
+		MaxAvailabilityRetries: availabilityRetries,
+		TerminationFile:        strings.TrimSpace(getenv("COURIER_TERMINATION_FILE")),
+		GitUsername:            getenv("COURIER_GIT_USERNAME"),
+		GitToken:               getenv("COURIER_GIT_TOKEN"),
+		GitHubToken:            getenv("GITHUB_TOKEN"),
+		GitHubAPIBase:          strings.TrimSpace(getenv("COURIER_GITHUB_API_BASE")),
+		EvidenceURL:            strings.TrimSpace(getenv(executor.EnvEvidenceURL)),
+		EvidenceToken:          strings.TrimSpace(getenv(executor.EnvEvidenceToken)),
+		PodUID:                 strings.TrimSpace(getenv(executor.EnvPodUID)),
+		ExhaustionCodes:        getenv("COURIER_MODEL_EXHAUSTION_CODES"),
+		ExhaustionTypes:        getenv("COURIER_MODEL_EXHAUSTION_TYPES"),
 	}
 	if strings.TrimSpace(cfg.GitHubToken) == "" {
 		cfg.GitHubToken = cfg.GitToken
@@ -865,8 +883,12 @@ type sessionTap struct {
 	w         io.Writer
 	pending   []byte
 	sessionID string
-	lastText  string
-	tel       *telemetry.Tracker
+	// sawSession reports whether the child served a session id during the
+	// current attempt. A crash before any session is an availability
+	// failure (#327 Scenario D), distinct from a crash mid-work.
+	sawSession bool
+	lastText   string
+	tel        *telemetry.Tracker
 	// seq counts every scanned line, so "the exhaustion error was the last
 	// thing the child emitted" is decidable at stop time.
 	seq int
@@ -940,8 +962,11 @@ func (t *sessionTap) scan(line []byte) {
 	if err := json.Unmarshal(line, &event); err != nil {
 		return
 	}
-	if event.SessionID != "" && t.sessionID == "" {
-		t.sessionID = event.SessionID
+	if event.SessionID != "" {
+		if t.sessionID == "" {
+			t.sessionID = event.SessionID
+		}
+		t.sawSession = true
 	}
 	if event.Part != nil && event.Part.Type == "text" {
 		t.lastText = truncatedRunes(event.Part.Text, tapLastTextLimit)
@@ -1084,7 +1109,7 @@ func run(ctx context.Context, stdout, stderr io.Writer) int {
 	}
 
 	// Recoverable workspace endings and crashes share one continuation budget.
-	continuations, crashes := 0, 0
+	continuations, crashes, availability := 0, 0, 0
 	var (
 		stateMessage    string
 		prevFingerprint string
@@ -1119,6 +1144,7 @@ func run(ctx context.Context, stdout, stderr io.Writer) int {
 			}
 		}
 		command := runtime.Command(invocation)
+		tap.sawSession = false
 		report.event(courierlog.EventExecutorStart, courierlog.StatusOK, map[string]any{
 			"executor": runtime.Name(),
 			"format":   cfg.OpenCodeFormat,
@@ -1175,6 +1201,41 @@ func run(ctx context.Context, stdout, stderr io.Writer) int {
 			if code == exitNeedsHuman {
 				report.terminateCaptured(ctx, workspace, startCommit, failedWith(fmt.Sprintf("opencode exited with status %d", code), terminalCategoryModelTransportError))
 				return exitFailed
+			}
+			// Availability failures (#327 Scenario D): a provider outage makes
+			// OpenCode exit without ever serving a session id for this
+			// attempt. Those failures get their own bounded, backed-off
+			// budget: they never consume the task-repair continuation budget,
+			// and exhausting them ends the run on the recoverable
+			// capacity-handoff channel — as an availability handoff, never
+			// pretending a structured quota signal fired — so another
+			// capacity can take the work instead of it stranding as Failed.
+			// Any attempt that got a session proves the provider served us
+			// and resets the budget.
+			if !tap.sawSession {
+				if ctx.Err() == nil && availability < cfg.MaxAvailabilityRetries {
+					availability++
+					report.event(courierlog.EventExecutorContinuation, courierlog.StatusOK, map[string]any{
+						"kind":    "availability-retry",
+						"code":    code,
+						"attempt": availability,
+					})
+					delay := cfg.ResumeBackoff * time.Duration(1<<min(availability-1, maxAvailabilityBackoffCap))
+					select {
+					case <-time.After(delay):
+					case <-ctx.Done():
+					}
+					if stateMessage == "" && tap.sessionID != "" {
+						stateMessage = fmt.Sprintf("Your previous turn ended unexpectedly (opencode exited with status %d). Continue working toward the goal.", code)
+					}
+					continue
+				}
+				if ctx.Err() == nil {
+					report.terminateCaptured(ctx, workspace, startCommit, report.availabilityRecoveryTermination(ctx, workspace, cfg, startCommit, code))
+					return exitNeedsHuman
+				}
+			} else {
+				availability = 0
 			}
 			if tap.sessionID != "" && ctx.Err() == nil && continuations < cfg.MaxContinuations {
 				continuations++
@@ -1404,6 +1465,7 @@ const (
 	terminalCategoryNeedsDecision          = "needs-decision"
 	terminalCategoryBlockedExternal        = "blocked-external"
 	terminalCategoryCapacityExhaustion     = "capacity-exhaustion"
+	terminalCategoryProviderUnavailable    = "provider-unavailable"
 )
 
 // The outcome kinds the coordinator may declare (#169).
