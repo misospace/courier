@@ -18,3 +18,8 @@ charts/*/charts/
 charts/**/*.tgz
 dist/
 .astro/
+
+# site build artifacts
+node_modules/
+dist/
+.astro/
