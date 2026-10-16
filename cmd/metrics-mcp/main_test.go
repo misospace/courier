@@ -3,11 +3,13 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"strings"
 	"testing"
 	"time"
@@ -147,6 +149,43 @@ vllm:num_requests_waiting 3.0
 vllm:gpu_cache_usage_perc 0.72
 `
 
+// TestNewHTTPServerBoundsWritesAroundScrape pins the review contract that the
+// write budget is derived from the scrape timeout: it must stay finite yet
+// outlive any valid -scrape-timeout so it cannot cut off a bounded tool call.
+func TestNewHTTPServerBoundsWritesAroundScrape(t *testing.T) {
+	for _, scrape := range []time.Duration{time.Second, 30 * time.Second, 45 * time.Second, 2 * time.Minute} {
+		srv := newHTTPServer(http.NotFoundHandler(), scrape)
+		if srv.WriteTimeout <= scrape {
+			t.Errorf("scrape %s: WriteTimeout %s does not outlive the scrape budget", scrape, srv.WriteTimeout)
+		}
+		if srv.ReadHeaderTimeout <= 0 || srv.ReadTimeout <= 0 || srv.IdleTimeout <= 0 {
+			t.Errorf("scrape %s: inbound budgets must all be finite: %+v", scrape, srv)
+		}
+	}
+}
+
+// awaitForceClosed blocks until the server closes conn, proven by EOF or a
+// connection error such as reset. The read deadline is a test guard, not
+// evidence of closure: hitting it fails the test, because it means the server
+// left the connection open past the deadline instead of force-closing it.
+func awaitForceClosed(t *testing.T, conn net.Conn, within time.Duration) {
+	t.Helper()
+	_ = conn.SetReadDeadline(time.Now().Add(within))
+	for {
+		_, err := conn.Read(make([]byte, 1))
+		if err == nil {
+			continue // drain any response bytes written before the close
+		}
+		if errors.Is(err, io.EOF) {
+			return
+		}
+		if errors.Is(err, os.ErrDeadlineExceeded) {
+			t.Fatalf("connection still open after %s; want server-initiated EOF or reset", within)
+		}
+		return // e.g. connection reset: the server closed the socket
+	}
+}
+
 // TestRunShutdownBoundsIncompleteRequest opens a real TCP connection, sends
 // only a partial HTTP request, cancels run, and asserts that run returns
 // within the configured shutdown grace and the connection is force-closed.
@@ -210,14 +249,9 @@ func TestRunShutdownBoundsIncompleteRequest(t *testing.T) {
 	}
 
 	// The connection must be force-closed once the grace budget expires:
-	// the read side eventually observes EOF or a connection-reset error.
-	_ = conn.SetReadDeadline(time.Now().Add(2 * time.Second))
-	for {
-		_, readErr := conn.Read(make([]byte, 1))
-		if readErr != nil {
-			break
-		}
-	}
+	// the read side must observe EOF or a connection reset; the local read
+	// deadline expiring first fails the test.
+	awaitForceClosed(t, conn, 2*time.Second)
 	conn.Close()
 }
 
@@ -282,16 +316,10 @@ func TestRunShutdownBoundedByIncompleteBody(t *testing.T) {
 		t.Fatal("run did not return within 5s of cancel")
 	}
 
-	// Drain whatever response the server may have started writing; the
-	// connection must then be closed, with no further reads returning data.
-	_ = conn.SetReadDeadline(time.Now().Add(2 * time.Second))
-	for {
-		buf := make([]byte, 4096)
-		_, readErr := conn.Read(buf)
-		if readErr != nil {
-			break
-		}
-	}
+	// The server may have started an error response before the force-close;
+	// after draining it the connection must show EOF or a reset, not merely
+	// a local deadline hit.
+	awaitForceClosed(t, conn, 2*time.Second)
 	conn.Close()
 }
 
