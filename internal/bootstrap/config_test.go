@@ -6,6 +6,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	corev1 "k8s.io/api/core/v1"
 )
 
 func TestParseValidDocument(t *testing.T) {
@@ -257,6 +259,51 @@ func TestParseStoresTrimmedRuntimeImage(t *testing.T) {
 	}
 	if profiles[0].RuntimeImage != "ghcr.io/misospace/coordinator:1.0.0" {
 		t.Fatalf("runtimeImage = %q, want it trimmed", profiles[0].RuntimeImage)
+	}
+}
+
+// TestParseStoresResources pins that quantities parse without bespoke code and
+// land on the profile verbatim, quantities included; an omitted key stays
+// empty and is resolved later by EffectiveResources.
+func TestParseStoresResources(t *testing.T) {
+	data := []byte(`profiles:
+  - name: local
+    roles:
+      coder: gpt-5
+    resources:
+      requests:
+        cpu: 250m
+        memory: 512Mi
+      limits:
+        cpu: "2"
+        memory: 4Gi
+  - name: cloud
+    roles:
+      coder: gpt-5
+`)
+	profiles, err := Parse(data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertResources(t, profiles[0].Resources, "250m", "512Mi", "2", "4Gi")
+	if len(profiles[1].Resources.Requests) != 0 || len(profiles[1].Resources.Limits) != 0 {
+		t.Fatalf("resources = %#v, want empty when the key is omitted", profiles[1].Resources)
+	}
+}
+
+func assertResources(t *testing.T, got corev1.ResourceRequirements, cpuReq, memReq, cpuLim, memLim string) {
+	t.Helper()
+	if got.Requests.Cpu().String() != cpuReq {
+		t.Fatalf("cpu request = %s, want %s", got.Requests.Cpu(), cpuReq)
+	}
+	if got.Requests.Memory().String() != memReq {
+		t.Fatalf("memory request = %s, want %s", got.Requests.Memory(), memReq)
+	}
+	if limit, ok := got.Limits[corev1.ResourceCPU]; !ok || limit.String() != cpuLim {
+		t.Fatalf("cpu limit = %v, want %s", limit, cpuLim)
+	}
+	if limit, ok := got.Limits[corev1.ResourceMemory]; !ok || limit.String() != memLim {
+		t.Fatalf("memory limit = %v, want %s", limit, memLim)
 	}
 }
 

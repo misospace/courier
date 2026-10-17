@@ -232,8 +232,14 @@ func (s *SecureControl) checkDryRuns(ctx context.Context, run *courier.CoderRun,
 	if err != nil {
 		return err
 	}
+	// The dry run proves admission for the specs the launcher will really
+	// create, so it renders the lane's sizing rather than an idealized one.
+	resources, err := s.laneResources(ctx, run)
+	if err != nil {
+		return err
+	}
 	pods := []*corev1.Pod{}
-	worker, err := topology.WorkerPod(run, s.Config.HarnessImage, "dry-run-incarnation", publicKey, cache)
+	worker, err := topology.WorkerPod(run, s.Config.HarnessImage, "dry-run-incarnation", publicKey, cache, resources)
 	if err != nil {
 		return fmt.Errorf("secure preflight: render worker: %w", err)
 	}
@@ -245,12 +251,13 @@ func (s *SecureControl) checkDryRuns(ctx context.Context, run *courier.CoderRun,
 		ControlIncarnationUID: "dry-run-incarnation",
 		WorkerURL:             "http://dry-run:8080",
 		BrokerURL:             "https://dry-run:8443",
+		Resources:             resources,
 	})
 	if err != nil {
 		return fmt.Errorf("secure preflight: render control: %w", err)
 	}
 	pods = append(pods, control)
-	broker, err := topology.BrokerPod(run, s.Config.HarnessImage, registration.Projection(), "dry-run-sa")
+	broker, err := topology.BrokerPod(run, s.Config.HarnessImage, registration.Projection(), "dry-run-sa", resources)
 	if err != nil {
 		return fmt.Errorf("secure preflight: render broker: %w", err)
 	}
@@ -261,6 +268,17 @@ func (s *SecureControl) checkDryRuns(ctx context.Context, run *courier.CoderRun,
 		dry.Name = dry.Name + "-dryrun"
 		dry.GenerateName = ""
 		if err := s.Client.Create(ctx, dry, ctrlclient.DryRunAll); err != nil {
+			if apierrors.IsInvalid(err) {
+				// The rendered spec itself is refused, and requeueing cannot
+				// change it: the lane configures something the API server
+				// rejects outright (resources.claims, which no renderer
+				// honours, is the concrete case). Surface it instead of
+				// spinning. A Forbidden or quota denial stays an ordinary
+				// error — a quota or an RBAC grant can be raised later, so a
+				// requeue is the right answer there.
+				return secureNeedsHuman("PodAdmission",
+					"the API server rejected the rendered topology pod %s: %v", pod.Name, err)
+			}
 			return fmt.Errorf("secure preflight: dry-run create of %s failed: %w", pod.Name, err)
 		}
 	}
@@ -374,6 +392,10 @@ func (s *SecureControl) runLiveProbes(ctx context.Context, run *courier.CoderRun
 	if err != nil {
 		return fmt.Errorf("secure preflight: locate the broker service: %w", err)
 	}
+	resources, err := s.laneResources(ctx, run)
+	if err != nil {
+		return err
+	}
 
 	checks := []probeCheck{
 		{Name: "api-server", IP: apiIP, Port: 443, Expect: "deny"},
@@ -394,7 +416,7 @@ func (s *SecureControl) runLiveProbes(ctx context.Context, run *courier.CoderRun
 	defer cancel()
 
 	for _, node := range eligible {
-		pod := topology.ProbePod(run, node, s.Config.ProbeImage, script)
+		pod := topology.ProbePod(run, node, s.Config.ProbeImage, script, resources)
 		if err := s.Client.Delete(ctx, pod); err == nil {
 			// A leftover probe from an earlier attempt: wait for its
 			// termination below instead of failing on a name conflict.
@@ -406,13 +428,13 @@ func (s *SecureControl) runLiveProbes(ctx context.Context, run *courier.CoderRun
 
 	deadline := time.Now().Add(timeout)
 	for {
-		outcomes, pending, err := s.collectProbeResults(ctx, run, eligible, len(checks))
+		outcomes, pending, err := s.collectProbeResults(ctx, run, eligible, len(checks), resources)
 		if err != nil {
 			return err
 		}
 		if !pending {
 			for _, node := range eligible {
-				pod := topology.ProbePod(run, node, s.Config.ProbeImage, "")
+				pod := topology.ProbePod(run, node, s.Config.ProbeImage, "", resources)
 				_ = ctrlclient.IgnoreNotFound(s.Client.Delete(ctx, pod))
 			}
 			for _, outcome := range outcomes {
@@ -455,13 +477,15 @@ func findCheck(checks []probeCheck, name string) *probeCheck {
 }
 
 // collectProbeResults reads every probe pod's termination message. It returns
-// the outcomes and whether any probe is still pending.
-func (s *SecureControl) collectProbeResults(ctx context.Context, run *courier.CoderRun, nodes []string, checkCount int) ([]probeOutcome, bool, error) {
+// the outcomes and whether any probe is still pending. resources are the
+// lane-configured sizing the probes were rendered with; only the deterministic
+// name is read here, but the rendered spec stays identical to the live one.
+func (s *SecureControl) collectProbeResults(ctx context.Context, run *courier.CoderRun, nodes []string, checkCount int, resources corev1.ResourceRequirements) ([]probeOutcome, bool, error) {
 	var outcomes []probeOutcome
 	pending := false
 	for _, node := range nodes {
 		pod := &corev1.Pod{}
-		name := topology.ProbePod(run, node, s.Config.ProbeImage, "").Name
+		name := topology.ProbePod(run, node, s.Config.ProbeImage, "", resources).Name
 		if err := s.Client.Get(ctx, types.NamespacedName{Namespace: run.Namespace, Name: name}, pod); err != nil {
 			if apierrors.IsNotFound(err) {
 				pending = true

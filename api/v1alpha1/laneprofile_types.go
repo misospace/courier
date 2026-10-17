@@ -4,6 +4,7 @@ import (
 	"strings"
 	"time"
 
+	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
@@ -50,6 +51,13 @@ type LaneProfileSpec struct {
 	// +optional
 	// +kubebuilder:validation:MaxLength=253
 	CapacityGroup string `json:"capacityGroup,omitempty"`
+
+	// Resources sizes the pods Courier creates for runs on this lane. Both
+	// requests and limits are supported; a lane that configures either half
+	// uses it exactly as written. A lane that omits this field gets the
+	// built-in default (see DefaultPodResources), so no lane is BestEffort.
+	// +optional
+	Resources corev1.ResourceRequirements `json:"resources,omitempty"`
 }
 
 // CapacityCooldown is a durable pause on new work for one execution-capacity

@@ -3,13 +3,16 @@ package topology
 import (
 	"crypto/x509"
 	"encoding/pem"
+	"reflect"
 	"testing"
 
+	"github.com/misospace/courier/internal/executor"
 	"github.com/misospace/courier/internal/forge"
 	"github.com/misospace/courier/internal/protocol"
 
 	corev1 "k8s.io/api/core/v1"
 	networkingv1 "k8s.io/api/networking/v1"
+	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 
@@ -65,7 +68,7 @@ func TestWorkerPodHasNoIdentityMaterial(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	pod, err := WorkerPod(run, "harness:test", "incarnation-1", pub, nil)
+	pod, err := WorkerPod(run, "harness:test", "incarnation-1", pub, nil, courier.DefaultPodResources())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -111,7 +114,7 @@ func TestWorkerPodHasNoIdentityMaterial(t *testing.T) {
 func TestWorkerPodCachePin(t *testing.T) {
 	run := testRun("worker-cache")
 	pub, _, _ := protocol.GenerateKey()
-	pod, err := WorkerPod(run, "harness:test", "incarnation-1", pub, &CachePin{IP: "10.0.0.42", Port: 5120})
+	pod, err := WorkerPod(run, "harness:test", "incarnation-1", pub, &CachePin{IP: "10.0.0.42", Port: 5120}, courier.DefaultPodResources())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -136,6 +139,7 @@ func TestControlPodIdentityContract(t *testing.T) {
 		ControlIncarnationUID: "incarnation-1",
 		WorkerURL:             "http://r-worker.ns.svc.cluster.local:8080",
 		BrokerURL:             "https://r-broker.ns.svc.cluster.local:8443",
+		Resources:             courier.DefaultPodResources(),
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -201,7 +205,7 @@ func TestControlPodIdentityContract(t *testing.T) {
 func TestBrokerPodProjectionContract(t *testing.T) {
 	run := testRun("broker-pod")
 	registration := registrationFixture()
-	pod, err := BrokerPod(run, "harness:test", registration.Projection(), "sa-uid")
+	pod, err := BrokerPod(run, "harness:test", registration.Projection(), "sa-uid", courier.DefaultPodResources())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -245,6 +249,153 @@ func registrationFixture() *forge.Registration {
 			forge.PurposeForgeAPI: {SecretName: "src", Key: "token"},
 		},
 		Serves: []string{"*"},
+	}
+}
+
+// configuredResources is a lane's explicit sizing: an operator decision the
+// renderers must use exactly as written.
+func configuredResources() corev1.ResourceRequirements {
+	return corev1.ResourceRequirements{
+		Requests: corev1.ResourceList{
+			corev1.ResourceCPU:    resource.MustParse("500m"),
+			corev1.ResourceMemory: resource.MustParse("1Gi"),
+		},
+		Limits: corev1.ResourceList{
+			corev1.ResourceCPU:    resource.MustParse("1500m"),
+			corev1.ResourceMemory: resource.MustParse("2Gi"),
+		},
+	}
+}
+
+// renderEveryPod builds all four rendered pods with one sizing value, keyed by
+// container name.
+func renderEveryPod(t *testing.T, run *courier.CoderRun, resources corev1.ResourceRequirements) map[string]*corev1.Pod {
+	t.Helper()
+	pub, _, err := protocol.GenerateKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	worker, err := WorkerPod(run, "harness:test", "incarnation-1", pub, nil, resources)
+	if err != nil {
+		t.Fatal(err)
+	}
+	control, err := ControlPod(run, ControlInputs{
+		Image:                 "harness:test",
+		ControlSAUID:          "sa-uid",
+		WorkerPodUID:          "worker-uid",
+		ControlIncarnationUID: "incarnation-1",
+		WorkerURL:             "http://r-worker.ns.svc.cluster.local:8080",
+		BrokerURL:             "https://r-broker.ns.svc.cluster.local:8443",
+		Resources:             resources,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	broker, err := BrokerPod(run, "harness:test", registrationFixture().Projection(), "sa-uid", resources)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return map[string]*corev1.Pod{
+		WorkerContainerName:  worker,
+		ControlContainerName: control,
+		BrokerContainerName:  broker,
+		"probe":              ProbePod(run, "node-a", "busybox:test", "true", resources),
+	}
+}
+
+// TestConfiguredLaneResourcesReachEveryPod pins that the lane's sizing is the
+// sizing of every pod, not just the coordinator's.
+func TestConfiguredLaneResourcesReachEveryPod(t *testing.T) {
+	run := testRun("resources-configured")
+	want := configuredResources()
+	for container, pod := range renderEveryPod(t, run, want) {
+		if got := pod.Spec.Containers[0].Resources; !reflect.DeepEqual(got, want) {
+			t.Fatalf("%s container resources = %+v, want %+v", container, got, want)
+		}
+	}
+}
+
+// TestNoRenderedPodIsBestEffort is the invariant of #356: a caller that
+// configures no sizing still gets finite cpu and memory requests and limits,
+// so no Courier-created pod lands in the BestEffort QoS class.
+func TestNoRenderedPodIsBestEffort(t *testing.T) {
+	run := testRun("resources-default")
+	for container, pod := range renderEveryPod(t, run, corev1.ResourceRequirements{}) {
+		resources := pod.Spec.Containers[0].Resources
+		for _, list := range []struct {
+			what string
+			in   corev1.ResourceList
+		}{{"requests", resources.Requests}, {"limits", resources.Limits}} {
+			for _, key := range []corev1.ResourceName{corev1.ResourceCPU, corev1.ResourceMemory} {
+				quantity, ok := list.in[key]
+				if !ok || quantity.IsZero() {
+					t.Fatalf("%s container %s carry no finite %s: %+v", container, list.what, key, resources)
+				}
+			}
+		}
+	}
+}
+
+// TestPartialLaneResourcesAreNotToppedUp pins that a lane's partial sizing is
+// used verbatim: a requests-only configuration leaves limits empty rather than
+// borrowing the default's.
+func TestPartialLaneResourcesAreNotToppedUp(t *testing.T) {
+	run := testRun("resources-partial")
+	partial := corev1.ResourceRequirements{
+		Requests: corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("1")},
+	}
+	for container, pod := range renderEveryPod(t, run, partial) {
+		resources := pod.Spec.Containers[0].Resources
+		if !reflect.DeepEqual(resources, partial) {
+			t.Fatalf("%s container resources = %+v, want %+v", container, resources, partial)
+		}
+	}
+}
+
+// TestRenderedPodsDoNotAliasLaneSizing pins that a rendered pod owns its sizing
+// maps. The caller renders from a LaneProfile that controller-runtime may hold
+// in its informer cache, so a pod spec that still referenced those maps could
+// have its sizing mutated out from under the lane.
+func TestRenderedPodsDoNotAliasLaneSizing(t *testing.T) {
+	run := testRun("resources-alias")
+	from := configuredResources()
+	for container, pod := range renderEveryPod(t, run, from) {
+		requests := pod.Spec.Containers[0].Resources.Requests
+		requests[corev1.ResourceCPU] = resource.MustParse("64")
+		if got := requests.Cpu().String(); got != "64" {
+			t.Fatalf("%s container requests not writable, test proves nothing: cpu = %s", container, got)
+		}
+	}
+	if got := from.Requests.Cpu().String(); got != "500m" {
+		t.Fatalf("rendering aliased the caller's requests: cpu = %s, want 500m", got)
+	}
+}
+
+// TestCoordinatorAndTopologyPodsAgreeOnTheDefault proves the two pod-rendering
+// paths size an unconfigured lane identically, so one run is never half
+// BestEffort.
+func TestCoordinatorAndTopologyPodsAgreeOnTheDefault(t *testing.T) {
+	run := testRun("resources-agree")
+	lane := &courier.LaneProfile{
+		ObjectMeta: metav1.ObjectMeta{Name: run.Spec.Lane, Namespace: run.Namespace},
+		Spec:       courier.LaneProfileSpec{Roles: map[string]string{"coordinator": "test/coordinator"}},
+	}
+	coordinator, err := executor.BuildCoordinatorPod(run, lane, executor.PodConfig{
+		Image:              "harness:test",
+		WorkspacePath:      "/workspace",
+		ServiceAccountName: "coordinator",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := courier.DefaultPodResources()
+	if got := coordinator.Spec.Containers[0].Resources; !reflect.DeepEqual(got, want) {
+		t.Fatalf("coordinator pod resources = %+v, want the built-in default %+v", got, want)
+	}
+	for container, pod := range renderEveryPod(t, run, lane.Spec.EffectiveResources()) {
+		if got := pod.Spec.Containers[0].Resources; !reflect.DeepEqual(got, want) {
+			t.Fatalf("%s container resources = %+v, want the coordinator's %+v", container, got, want)
+		}
 	}
 }
 

@@ -1314,12 +1314,28 @@ spec:
     single 3090, may queue behind a shared pool, keep parallelism modest,
     use the load tool before you fan out
   runtimeImage: <optional image>   # repository-specific coordinator/toolchain image
+  resources:                       # optional CPU/memory sizing for this lane's pods
+    requests: {cpu: 500m, memory: 1Gi}
+    limits: {cpu: "4", memory: 8Gi}
 ```
 
 `runtimeImage` is an optional execution-environment selector. It is an image
 capability seam, not a Go or Kubernetes requirement: a lane can select a
 repository-specific image containing whatever tools its workflow needs, while
 the deployment default remains the minimal bootstrap image.
+
+`resources` is the lane's pod sizing, and the only source of it. Both requests
+and limits are supported; a lane that configures either half is used exactly as
+written, and a lane that configures none gets Courier's built-in default
+(250m/512Mi requested, 2 CPU/4Gi limited) — so a lane that says nothing about
+sizing gets the coordinator pod and the secure topology's control, worker,
+broker, and probe pods all carrying CPU and memory requests and limits, which
+lets the scheduler bin-pack, keeps one runaway build from taking a node, and
+keeps these pods off the front of the eviction queue. Only a lane that
+configures neither half is guaranteed both: a requests-only lane is rendered
+with exactly what it wrote, so its pods really do run limit-less by its own
+choice. One lane-level value sizes every pod on the lane; per-role sizing is
+deliberately not modelled.
 
 Roles name whatever models the operator has configured — cloud (`anthropic/...`,
 `openai/...`, `litellm-anthropic/MiniMax-M3`), local (`litellm/qwen3.8-27b`), or
@@ -3560,3 +3576,30 @@ was superseded.
   client query had no remaining caller after this change and is gone, so one
   listing seam remains. (#365, closing the `Observer` carve-out left open by
   the #343 entry.)
+- **2026-10-17 — #356: pod sizing is a LaneProfile field, and no
+  Courier-created pod is BestEffort.** `PodConfig.Resources` existed and was
+  applied to the coordinator container, but no production path ever assigned it
+  and the secure control, worker, broker, and probe pods set no `Resources` at
+  all, so every pod Courier created was BestEffort: the scheduler could not
+  bin-pack, a runaway model-driven build could take a node, and these pods were
+  the first evicted under pressure. Sizing is now
+  `LaneProfileSpec.Resources` (an optional `corev1.ResourceRequirements`),
+  mirrored into `bootstrap.Profile` so a GitOps-supplied lane can size itself,
+  and applied to the coordinator pod in the pod builder and to all four secure
+  topology pods at the render layer. A lane that configures either half of
+  requests/limits is rendered exactly as written and a lane that configures
+  none gets the built-in default (250m/512Mi requested, 2 CPU/4Gi limited) —
+  the default is applied inside the render helpers, so the invariant cannot
+  depend on each call site remembering to resolve it, and a partial lane config
+  is never topped up, because a lane's sizing is an operator decision rather
+  than a hint. `PodConfig.Resources` is gone: the lane is the single source,
+  no manager flag ever set the field, and a second source would be two truths
+  about one pod. The render layer substitutes the default for an empty sizing
+  argument, so no call site can render a BestEffort pod, and a rendered spec the
+  API server permanently rejects (an operator setting `resources.claims`, which
+  the CRD exposes and no renderer honours) surfaces as `NeedsHuman` rather than a
+  requeue loop — a quota or RBAC denial stays an ordinary error, because those
+  can be raised later. One lane-level value sizes every pod on the lane; per-role
+  sizing is deliberately unmodelled, and nothing here bounds a run — it bounds
+  what one run can take from the node, which is where #274's unproven OOM
+  candidate had no answer. (#356)

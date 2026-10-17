@@ -63,6 +63,13 @@ func (s *SecureControl) LaunchSecure(ctx context.Context, run *courier.CoderRun)
 		return ctrl.Result{}, err
 	}
 
+	// The sizing is resolved once for the pods this pass renders; every pod
+	// the launcher creates below carries it.
+	resources, err := s.laneResources(ctx, run)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+
 	// Broker: ensure Service and pod. A failed broker is replaced in two
 	// passes — Service and pod removed first, both recreated only once the
 	// old pod is confirmed gone.
@@ -96,7 +103,7 @@ func (s *SecureControl) LaunchSecure(ctx context.Context, run *courier.CoderRun)
 		if err != nil {
 			return ctrl.Result{}, err
 		}
-		pod, err := topology.BrokerPod(run, s.Config.HarnessImage, registration.Projection(), string(controlSA.UID))
+		pod, err := topology.BrokerPod(run, s.Config.HarnessImage, registration.Projection(), string(controlSA.UID), resources)
 		if err != nil {
 			return ctrl.Result{}, err
 		}
@@ -149,7 +156,7 @@ func (s *SecureControl) LaunchSecure(ctx context.Context, run *courier.CoderRun)
 		if err != nil {
 			return ctrl.Result{}, err
 		}
-		workerPod, err = topology.WorkerPod(run, s.Config.HarnessImage, incarnation, publicKey, cache)
+		workerPod, err = topology.WorkerPod(run, s.Config.HarnessImage, incarnation, publicKey, cache, resources)
 		if err != nil {
 			return ctrl.Result{}, err
 		}
@@ -208,6 +215,7 @@ func (s *SecureControl) LaunchSecure(ctx context.Context, run *courier.CoderRun)
 			WorkerURL:             "http://" + topology.WorkerServiceDNS(run.Namespace, run.Name) + ":" + fmt.Sprint(topology.WorkerPort),
 			BrokerURL:             "https://" + topology.BrokerServiceDNS(run.Namespace, run.Name) + ":8443",
 			BrokerStatusURL:       "https://" + topology.BrokerServiceDNS(run.Namespace, run.Name) + ":8444",
+			Resources:             resources,
 		})
 		if err != nil {
 			return ctrl.Result{}, err
@@ -239,6 +247,18 @@ func (s *SecureControl) controlInvocation(ctx context.Context, run *courier.Code
 	}
 	invocation.Criteria = criteria
 	return invocation, nil
+}
+
+// laneResources reads the pod sizing the run's lane configures. Every pod of
+// the secure topology carries it, so a lane that configures nothing still
+// renders the built-in default rather than a BestEffort pod. Read once per
+// pass and reused across the round's renders.
+func (s *SecureControl) laneResources(ctx context.Context, run *courier.CoderRun) (corev1.ResourceRequirements, error) {
+	lane := &courier.LaneProfile{}
+	if err := s.Client.Get(ctx, types.NamespacedName{Namespace: run.Namespace, Name: run.Spec.Lane}, lane); err != nil {
+		return corev1.ResourceRequirements{}, fmt.Errorf("secure topology: read lane profile %q: %w", run.Spec.Lane, err)
+	}
+	return lane.Spec.EffectiveResources(), nil
 }
 
 type gatewayConfig struct {

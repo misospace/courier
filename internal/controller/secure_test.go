@@ -14,9 +14,12 @@ import (
 	networkingv1 "k8s.io/api/networking/v1"
 	rbacv1 "k8s.io/api/rbac/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/util/validation/field"
 	fakek8s "k8s.io/client-go/kubernetes/fake"
 	k8stesting "k8s.io/client-go/testing"
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -806,6 +809,168 @@ func TestLaunchSecureRendersModelGateway(t *testing.T) {
 	})
 }
 
+// A lane's configured sizing must reach the pods the secure topology really
+// creates. The render layer substitutes the default for an empty argument, so
+// asserting on the resolved value would pass even with laneResources deleted
+// or a broken call site; this asserts on the created worker, broker, and
+// control pod specs instead.
+func TestLaunchSecureAppliesLaneResources(t *testing.T) {
+	control, c := secureControl(t, &courier.LaneProfile{
+		ObjectMeta: metav1.ObjectMeta{Namespace: secureTestNamespace, Name: "sized"},
+		Spec: courier.LaneProfileSpec{
+			Roles: map[string]string{"coordinator": "test/coordinator", "coder": "test/coder"},
+			Resources: corev1.ResourceRequirements{
+				Requests: corev1.ResourceList{
+					corev1.ResourceCPU:    resource.MustParse("750m"),
+					corev1.ResourceMemory: resource.MustParse("1Gi"),
+				},
+				Limits: corev1.ResourceList{
+					corev1.ResourceCPU:    resource.MustParse("3"),
+					corev1.ResourceMemory: resource.MustParse("6Gi"),
+				},
+			},
+		},
+	})
+	run := launchedSecureRun(t, c, "sized", "sized")
+	if _, err := control.LaunchSecure(context.Background(), run); err != nil {
+		t.Fatalf("LaunchSecure: %v", err)
+	}
+	for component, name := range map[string]string{
+		topology.ComponentWorker:      topology.WorkerPodName(run.Name),
+		topology.ComponentBroker:      topology.BrokerPodName(run.Name),
+		topology.ComponentCoordinator: topology.ControlPodName(run.Name),
+	} {
+		pod := &corev1.Pod{}
+		if err := c.Get(context.Background(), client.ObjectKey{Namespace: secureTestNamespace, Name: name}, pod); err != nil {
+			t.Fatalf("read %s pod: %v", component, err)
+		}
+		if len(pod.Spec.Containers) == 0 {
+			t.Fatalf("%s pod carries no container", component)
+		}
+		for _, container := range pod.Spec.Containers {
+			assertSized(t, component+" container "+container.Name, container.Resources)
+		}
+	}
+}
+
+// A rendered spec the API server rejects as Invalid is permanent — the lane
+// configures sizing the cluster refuses outright — so it surfaces as
+// NeedsHuman instead of requeueing forever. A Forbidden or quota denial may be
+// transient and must stay an ordinary requeueable error.
+func TestLaunchSecureClassifiesPermanentPodRejection(t *testing.T) {
+	cases := []struct {
+		name       string
+		rejection  error
+		wantReason string
+	}{
+		{
+			name: "invalid spec is permanent",
+			rejection: apierrors.NewInvalid(schema.GroupKind{Kind: "Pod"}, "worker-dryrun", field.ErrorList{
+				field.Invalid(field.NewPath("spec"), "", "pod resource claims must reference an existing resource claim template"),
+			}),
+			wantReason: "PodAdmission",
+		},
+		{
+			name:       "forbidden may be transient",
+			rejection:  apierrors.NewForbidden(corev1.Resource("pods"), "worker-dryrun", errors.New("exceeded quota")),
+			wantReason: "",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			control, c := secureControl(t)
+			run := launchedSecureRun(t, c, "rejected", "local")
+			watcher, ok := c.(client.WithWatch)
+			if !ok {
+				t.Fatal("the fake client does not support watch")
+			}
+			control.Client = interceptor.NewClient(watcher, interceptor.Funcs{
+				Create: func(ctx context.Context, cw client.WithWatch, obj client.Object, opts ...client.CreateOption) error {
+					// Only the launcher-shaped dry-run creates, never the
+					// known-bad specs the admission proof relies on.
+					if strings.HasSuffix(obj.GetName(), "-dryrun") && !strings.Contains(obj.GetName(), "-bad-dryrun") {
+						return tc.rejection
+					}
+					return cw.Create(ctx, obj, opts...)
+				},
+			})
+			_, err := control.LaunchSecure(context.Background(), run)
+			var permanent *SecureNeedsHumanError
+			if tc.wantReason == "" {
+				if err == nil || errors.As(err, &permanent) {
+					t.Fatalf("error = %v, want an ordinary requeueable error", err)
+				}
+				if !strings.Contains(err.Error(), "dry-run create of") {
+					t.Fatalf("error = %v, want the unchanged dry-run create failure", err)
+				}
+				return
+			}
+			if !errors.As(err, &permanent) || permanent.Reason != tc.wantReason {
+				t.Fatalf("error = %v, want a *SecureNeedsHumanError with reason %q", err, tc.wantReason)
+			}
+		})
+	}
+}
+
+// launchedSecureRun provisions one run as far as LaunchSecure needs to render
+// the whole topology: the persisted policy, the restricted run namespace, and
+// the credential source the per-run Secret copy reads.
+func launchedSecureRun(t *testing.T, c client.Client, name, lane string) *courier.CoderRun {
+	t.Helper()
+	run := secureRun(name)
+	run.Spec.Lane = lane
+	run.Status.Phase = courier.PhaseClaimed
+	run.Status.PublicationPolicy = &courier.PublicationPolicy{
+		RunUID:              string(run.UID),
+		ProviderConfigRef:   "github",
+		ProviderEndpoint:    "https://api.github.com/",
+		CredentialRefDigest: secureRegistry().Registrations()[0].Projection().Digest,
+		BaseRepo:            "Acme/Widgets",
+		BaseRef:             "main",
+		BaseOID:             "baseoid",
+		WorkRepo:            "Acme/Widgets",
+		WorkRef:             "courier/Acme/Widgets/issue-7",
+		WorkInitiallyAbsent: true,
+	}
+	if err := c.Create(context.Background(), run); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.Create(context.Background(), &corev1.Namespace{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:   secureTestNamespace,
+			Labels: map[string]string{"pod-security.kubernetes.io/enforce": "restricted"},
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.Create(context.Background(), &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{Namespace: "courier-system", Name: "forge-creds"},
+		Data:       map[string][]byte{"token": []byte("tok-123")},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	return run
+}
+
+func assertSized(t *testing.T, what string, got corev1.ResourceRequirements) {
+	t.Helper()
+	for name, want := range map[string]struct {
+		list corev1.ResourceList
+		cpu  string
+		mem  string
+	}{
+		"requests": {got.Requests, "750m", "1Gi"},
+		"limits":   {got.Limits, "3", "6Gi"},
+	} {
+		if cpu := want.list.Cpu(); cpu == nil || cpu.String() != want.cpu {
+			t.Fatalf("%s %s cpu = %v, want the lane's %q", what, name, want.list.Cpu(), want.cpu)
+		}
+		if memory := want.list.Memory(); memory == nil || memory.String() != want.mem {
+			t.Fatalf("%s %s memory = %v, want the lane's %q", what, name, want.list.Memory(), want.mem)
+		}
+	}
+}
+
 func TestObserveTopologyFencesBrokenWorker(t *testing.T) {
 	control, c := secureControl(t)
 	run := secureRun("fence")
@@ -1093,7 +1258,7 @@ func TestProbePodsAreExcludedFromWorkloadLookups(t *testing.T) {
 	}
 	// A leftover probe pod from a crashed preflight pass: worker labels, but
 	// marked as a probe.
-	probe := topology.ProbePod(run, "node-a", "busybox:test", "true")
+	probe := topology.ProbePod(run, "node-a", "busybox:test", "true", courier.DefaultPodResources())
 	if probe.Labels[topology.LabelProbe] != "true" {
 		t.Fatal("probe pods must carry the probe label")
 	}
@@ -1125,11 +1290,11 @@ func TestProbeCoverageIsIncompleteWithoutEveryNode(t *testing.T) {
 	// Two eligible nodes; only node-a produced a complete result set (two
 	// checks), node-b's probe crashed without a readable result.
 	for _, node := range []string{"node-a", "node-b"} {
-		if err := c.Create(context.Background(), topology.ProbePod(run, node, "busybox:test", "true")); err != nil {
+		if err := c.Create(context.Background(), topology.ProbePod(run, node, "busybox:test", "true", courier.DefaultPodResources())); err != nil {
 			t.Fatal(err)
 		}
 	}
-	a := topology.ProbePod(run, "node-a", "busybox:test", "true")
+	a := topology.ProbePod(run, "node-a", "busybox:test", "true", courier.DefaultPodResources())
 	a.Status.Phase = corev1.PodSucceeded
 	a.Status.ContainerStatuses = []corev1.ContainerStatus{{
 		Name:  "probe",
@@ -1138,7 +1303,7 @@ func TestProbeCoverageIsIncompleteWithoutEveryNode(t *testing.T) {
 	if err := c.Status().Update(context.Background(), a); err != nil {
 		t.Fatal(err)
 	}
-	b := topology.ProbePod(run, "node-b", "busybox:test", "true")
+	b := topology.ProbePod(run, "node-b", "busybox:test", "true", courier.DefaultPodResources())
 	b.Status.Phase = corev1.PodFailed
 	b.Status.ContainerStatuses = []corev1.ContainerStatus{{
 		Name:  "probe",
@@ -1147,7 +1312,7 @@ func TestProbeCoverageIsIncompleteWithoutEveryNode(t *testing.T) {
 	if err := c.Status().Update(context.Background(), b); err != nil {
 		t.Fatal(err)
 	}
-	_, pending, err := control.collectProbeResults(context.Background(), run, []string{"node-a", "node-b"}, 2)
+	_, pending, err := control.collectProbeResults(context.Background(), run, []string{"node-a", "node-b"}, 2, courier.DefaultPodResources())
 	if err == nil {
 		t.Fatal("incomplete probe coverage must not be treated as evidence")
 	}

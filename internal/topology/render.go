@@ -104,6 +104,24 @@ func containerSecurityContext() *corev1.SecurityContext {
 	}
 }
 
+// podResources returns the container sizing a builder must render. A caller
+// that configures nothing still gets the built-in default: no
+// Courier-created pod may be BestEffort, and that invariant cannot depend on
+// every call site remembering to default. A configured value is used exactly
+// as written — a partial configuration is never topped up from the default,
+// because a lane's sizing is an operator decision, not a hint. The rendered
+// value is a deep copy: the argument's maps belong to the caller's LaneProfile
+// read, and a rendered pod must not alias them.
+func podResources(in corev1.ResourceRequirements) corev1.ResourceRequirements {
+	if len(in.Requests) == 0 && len(in.Limits) == 0 {
+		return courier.DefaultPodResources()
+	}
+	if copied := in.DeepCopy(); copied != nil {
+		return *copied
+	}
+	return courier.DefaultPodResources()
+}
+
 func boolPtr(value bool) *bool { return &value }
 
 func int64Ptr(v int64) *int64 { return &v }
@@ -359,7 +377,10 @@ func WorkerService(run *courier.CoderRun) *corev1.Service {
 // control incarnation. Signed envelopes must carry exactly this value; a
 // control or worker replacement always mints a new one, so stale envelopes
 // are rejected by construction.
-func WorkerPod(run *courier.CoderRun, image string, controlIncarnationUID string, publicKey ed25519.PublicKey, cache *CachePin) (*corev1.Pod, error) {
+//
+// resources is the lane-configured sizing; the zero value renders the
+// built-in default rather than a BestEffort pod.
+func WorkerPod(run *courier.CoderRun, image string, controlIncarnationUID string, publicKey ed25519.PublicKey, cache *CachePin, resources corev1.ResourceRequirements) (*corev1.Pod, error) {
 	if controlIncarnationUID == "" {
 		return nil, errors.New("topology: worker pod requires the control incarnation identifier")
 	}
@@ -405,6 +426,7 @@ func WorkerPod(run *courier.CoderRun, image string, controlIncarnationUID string
 					Name:      "workspace",
 					MountPath: workerWorkspacePath,
 				}},
+				Resources:       podResources(resources),
 				SecurityContext: containerSecurityContext(),
 			}},
 		},
@@ -414,7 +436,10 @@ func WorkerPod(run *courier.CoderRun, image string, controlIncarnationUID string
 // BrokerPod renders the trusted per-run broker pod: TLS identity, the frozen
 // one-registration projection, its own projected API token, and the resolved
 // credential references — nothing else.
-func BrokerPod(run *courier.CoderRun, image string, projection forge.Projection, controlSAUID string) (*corev1.Pod, error) {
+//
+// resources is the lane-configured sizing; the zero value renders the
+// built-in default rather than a BestEffort pod.
+func BrokerPod(run *courier.CoderRun, image string, projection forge.Projection, controlSAUID string, resources corev1.ResourceRequirements) (*corev1.Pod, error) {
 	if controlSAUID == "" {
 		return nil, errors.New("topology: broker pod requires the control service account UID")
 	}
@@ -505,6 +530,7 @@ func BrokerPod(run *courier.CoderRun, image string, projection forge.Projection,
 					{Name: "api-token", MountPath: "/var/run/secrets/tokens/api", ReadOnly: true},
 					{Name: "kube-root-ca", MountPath: "/var/run/secrets/kubernetes.io/serviceaccount", ReadOnly: true},
 				},
+				Resources:       podResources(resources),
 				SecurityContext: containerSecurityContext(),
 			}},
 		},
@@ -515,7 +541,9 @@ func BrokerPod(run *courier.CoderRun, image string, projection forge.Projection,
 // invocation the operator assembled for the run, the resolved identity and
 // addresses of this incarnation round, and the optional model-gateway
 // configuration. The gateway key arrives through the per-run gateway Secret;
-// GatewayKeyMounted reports whether that Secret was provisioned.
+// GatewayKeyMounted reports whether that Secret was provisioned. Resources is
+// the lane-configured sizing; the zero value renders the built-in default
+// rather than a BestEffort pod.
 type ControlInputs struct {
 	Image                 string
 	Run                   executor.Invocation
@@ -527,6 +555,7 @@ type ControlInputs struct {
 	WorkerURL             string
 	BrokerURL             string
 	BrokerStatusURL       string
+	Resources             corev1.ResourceRequirements
 }
 
 // ControlPod renders the trusted control pod. Its container is named
@@ -638,6 +667,7 @@ func ControlPod(run *courier.CoderRun, in ControlInputs) (*corev1.Pod, error) {
 				TerminationMessagePolicy: corev1.TerminationMessageReadFile,
 				Env:                      env,
 				VolumeMounts:             mounts,
+				Resources:                podResources(in.Resources),
 				SecurityContext:          containerSecurityContext(),
 			}},
 		},
@@ -653,7 +683,10 @@ const LabelProbe = "courier.misospace.dev/probe"
 // ProbePod renders one disposable identity-less network probe pod pinned to a
 // node. It carries the worker's labels so the worker's own NetworkPolicy —
 // not a special exception — is what the probe exercises.
-func ProbePod(run *courier.CoderRun, node, image, script string) *corev1.Pod {
+//
+// resources is the lane-configured sizing; the zero value renders the
+// built-in default rather than a BestEffort pod.
+func ProbePod(run *courier.CoderRun, node, image, script string, resources corev1.ResourceRequirements) *corev1.Pod {
 	suffix := "-probe-" + nodeNameTag(node)
 	pod := &corev1.Pod{
 		ObjectMeta: objectMeta(run, resourceName(run.Name, suffix), ComponentWorker),
@@ -669,6 +702,7 @@ func ProbePod(run *courier.CoderRun, node, image, script string) *corev1.Pod {
 				Command:                  []string{"/bin/sh", "-c", script},
 				TerminationMessagePath:   "/dev/termination-log",
 				TerminationMessagePolicy: corev1.TerminationMessageReadFile,
+				Resources:                podResources(resources),
 				SecurityContext:          containerSecurityContext(),
 			}},
 		},
