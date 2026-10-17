@@ -336,18 +336,25 @@ func TestNoRenderedPodIsBestEffort(t *testing.T) {
 	}
 }
 
-// TestPartialLaneResourcesAreNotToppedUp pins that a lane's partial sizing is
-// used verbatim: a requests-only configuration leaves limits empty rather than
-// borrowing the default's.
-func TestPartialLaneResourcesAreNotToppedUp(t *testing.T) {
+// TestPartialLaneResourcesAreFloored pins the #356 floor at the render layer:
+// a lane sizing only one of CPU/memory requests still renders pods with
+// finite CPU *and* memory requests, while its configured values survive and
+// limits it did not set stay absent.
+func TestPartialLaneResourcesAreFloored(t *testing.T) {
 	run := testRun("resources-partial")
 	partial := corev1.ResourceRequirements{
 		Requests: corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("1")},
 	}
 	for container, pod := range renderEveryPod(t, run, partial) {
 		resources := pod.Spec.Containers[0].Resources
-		if !reflect.DeepEqual(resources, partial) {
-			t.Fatalf("%s container resources = %+v, want %+v", container, resources, partial)
+		if cpu := resources.Requests.Cpu(); cpu == nil || cpu.String() != "1" {
+			t.Fatalf("%s container requests cpu = %v, want the configured 1 intact", container, resources.Requests.Cpu())
+		}
+		if mem := resources.Requests.Memory(); mem == nil || mem.String() != "512Mi" {
+			t.Fatalf("%s container requests memory = %v, want the floored 512Mi", container, resources.Requests.Memory())
+		}
+		if len(resources.Limits) != 0 {
+			t.Fatalf("%s container limits = %+v, want none: omitting limits is the lane's choice", container, resources.Limits)
 		}
 	}
 }

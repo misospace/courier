@@ -52,10 +52,11 @@ type LaneProfileSpec struct {
 	// +kubebuilder:validation:MaxLength=253
 	CapacityGroup string `json:"capacityGroup,omitempty"`
 
-	// Resources sizes the pods Courier creates for runs on this lane. Both
-	// requests and limits are supported; a lane that configures either half
-	// uses it exactly as written. A lane that omits this field gets the
-	// built-in default (see DefaultPodResources), so no lane is BestEffort.
+	// Resources sizes the pods Courier creates for runs on this lane. Limits
+	// are used exactly as written and may be omitted; requests keep what the
+	// lane sets, but CPU and memory requests are floored to the built-in
+	// default wherever they are absent, so no lane is BestEffort. A lane that
+	// configures nothing gets the default whole (see DefaultPodResources).
 	// +optional
 	Resources corev1.ResourceRequirements `json:"resources,omitempty"`
 }

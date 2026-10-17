@@ -104,22 +104,16 @@ func containerSecurityContext() *corev1.SecurityContext {
 	}
 }
 
-// podResources returns the container sizing a builder must render. A caller
-// that configures nothing still gets the built-in default: no
-// Courier-created pod may be BestEffort, and that invariant cannot depend on
-// every call site remembering to default. A configured value is used exactly
-// as written — a partial configuration is never topped up from the default,
-// because a lane's sizing is an operator decision, not a hint. The rendered
-// value is a deep copy: the argument's maps belong to the caller's LaneProfile
-// read, and a rendered pod must not alias them.
+// podResources returns the container sizing a builder must render, by
+// delegating to courier.EffectivePodResources so the sizing policy lives in
+// exactly one place: a caller that configures nothing gets the built-in
+// default, and a caller that configures either half gets it with finite CPU
+// and memory requests floored in, so no Courier-created pod is BestEffort
+// and that invariant cannot depend on any call site. The rendered value is a
+// deep copy: the argument's maps belong to the caller's LaneProfile read, and
+// a rendered pod must not alias them.
 func podResources(in corev1.ResourceRequirements) corev1.ResourceRequirements {
-	if len(in.Requests) == 0 && len(in.Limits) == 0 {
-		return courier.DefaultPodResources()
-	}
-	if copied := in.DeepCopy(); copied != nil {
-		return *copied
-	}
-	return courier.DefaultPodResources()
+	return courier.EffectivePodResources(in)
 }
 
 func boolPtr(value bool) *bool { return &value }

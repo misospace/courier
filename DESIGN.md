@@ -1324,18 +1324,19 @@ capability seam, not a Go or Kubernetes requirement: a lane can select a
 repository-specific image containing whatever tools its workflow needs, while
 the deployment default remains the minimal bootstrap image.
 
-`resources` is the lane's pod sizing, and the only source of it. Both requests
-and limits are supported; a lane that configures either half is used exactly as
-written, and a lane that configures none gets Courier's built-in default
-(250m/512Mi requested, 2 CPU/4Gi limited) — so a lane that says nothing about
-sizing gets the coordinator pod and the secure topology's control, worker,
-broker, and probe pods all carrying CPU and memory requests and limits, which
-lets the scheduler bin-pack, keeps one runaway build from taking a node, and
-keeps these pods off the front of the eviction queue. Only a lane that
-configures neither half is guaranteed both: a requests-only lane is rendered
-with exactly what it wrote, so its pods really do run limit-less by its own
-choice. One lane-level value sizes every pod on the lane; per-role sizing is
-deliberately not modelled.
+`resources` is the lane's pod sizing, and the only source of it. Limits are
+used exactly as written and may be omitted; requests keep whatever the lane
+configured, but CPU and memory requests are floored to Courier's built-in
+default (250m/512Mi requested, 2 CPU/4Gi limited) wherever they are absent or
+non-positive — so every Courier-created pod, the coordinator and the secure
+topology's control, worker, broker, and probe pods, carries finite CPU and
+memory requests whatever the lane says, which lets the scheduler bin-pack,
+keeps one runaway build from taking a node, and keeps these pods off the front
+of the eviction queue. A lane that configures neither half gets the default
+whole; a limits-only lane gets the default requests; a requests-only lane is
+rendered with exactly its own requests plus the floored halves, so its pods
+really do run limit-less by its own choice. One lane-level value sizes every
+pod on the lane; per-role sizing is deliberately not modelled.
 
 Roles name whatever models the operator has configured — cloud (`anthropic/...`,
 `openai/...`, `litellm-anthropic/MiniMax-M3`), local (`litellm/qwen3.8-27b`), or
@@ -3603,3 +3604,15 @@ was superseded.
   sizing is deliberately unmodelled, and nothing here bounds a run — it bounds
   what one run can take from the node, which is where #274's unproven OOM
   candidate had no answer. (#356)
+- **2026-10-17 — #356 amendment: lane sizing floors CPU/memory requests, superseding
+  "never topped up".** Review on #401 caught that the same-day decision above let a
+  lane configure a partial request map (cpu without memory, or limits only), so a
+  Courier pod could still lack a finite CPU or memory request — the exact condition
+  #356's acceptance criterion rules out. `EffectivePodResources` now floors absent or
+  non-positive CPU/memory *requests* to the built-in default wherever a lane omits or
+  zeroes them, while limits remain exactly as written and omitting limits stays a
+  documented operator choice. The floor lives in the one resolver both the coordinator
+  builder and the topology renderers delegate to, keeping the no-BestEffort invariant
+  single-sourced. A lane's sizing is still an operator decision; the floor only fills
+  what the operator left unsaid about the two resources Kubernetes schedules and evicts
+  on. (#356, PR #401 review)
