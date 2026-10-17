@@ -1324,7 +1324,8 @@ capability seam, not a Go or Kubernetes requirement: a lane can select a
 repository-specific image containing whatever tools its workflow needs, while
 the deployment default remains the minimal bootstrap image.
 
-`resources` is the lane's pod sizing, and the only source of it. Limits are
+`resources` is the lane's pod sizing, and the only source of the lane-sized
+pods' sizing. Limits are
 used exactly as written and may be omitted; requests keep whatever the lane
 configured, but CPU and memory requests are floored to Courier's built-in
 default (250m/512Mi requested, 2 CPU/4Gi limited) wherever they are absent or
@@ -1368,8 +1369,9 @@ the claim is released and the next pass retries it — and the legacy path needs
 fence at all, since the create that failed left no pod to tear down. The sizing is
 resolved once per launch pass, so the spec the dry run admits and the pods
 created afterwards are one artifact rather than two reads of a lane that may have
-moved. One lane-level value sizes every pod on the lane; per-role sizing is
-deliberately not modelled.
+moved. One lane-level value sizes every lane-sized pod on the lane; per-role sizing
+is deliberately not modelled, and the probe pods above are the one role-level
+exception.
 
 Roles name whatever models the operator has configured — cloud (`anthropic/...`,
 `openai/...`, `litellm-anthropic/MiniMax-M3`), local (`litellm/qwen3.8-27b`), or

@@ -250,10 +250,11 @@ func (s *SecureControl) controlInvocation(ctx context.Context, run *courier.Code
 	return invocation, nil
 }
 
-// laneResources reads the pod sizing the run's lane configures. Every pod of
-// the secure topology carries it, so a lane that configures nothing still
-// renders the built-in default rather than a BestEffort pod. Read once per
-// pass and reused across the round's renders.
+// laneResources reads the pod sizing the run's lane configures. Every
+// lane-sized pod of the secure topology carries it — control, worker, and
+// broker; probe pods deliberately carry their own fixed sizing instead — so a
+// lane that configures nothing still renders the built-in default rather than
+// a BestEffort pod. Read once per pass and reused across the round's renders.
 func (s *SecureControl) laneResources(ctx context.Context, run *courier.CoderRun) (corev1.ResourceRequirements, error) {
 	lane := &courier.LaneProfile{}
 	if err := s.Client.Get(ctx, types.NamespacedName{Namespace: run.Namespace, Name: run.Spec.Lane}, lane); err != nil {

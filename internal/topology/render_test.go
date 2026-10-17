@@ -304,7 +304,8 @@ func renderEveryPod(t *testing.T, run *courier.CoderRun, resources corev1.Resour
 }
 
 // TestConfiguredLaneResourcesReachEveryPod pins that the lane's sizing is the
-// sizing of every pod, not just the coordinator's.
+// sizing of every lane-sized pod — worker, control, and broker — not just the
+// coordinator's. Probe pods are the deliberate exception, tested separately.
 func TestConfiguredLaneResourcesReachEveryPod(t *testing.T) {
 	run := testRun("resources-configured")
 	want := configuredResources()
@@ -386,8 +387,10 @@ func TestProbePodSizingIsFixed(t *testing.T) {
 // sizing is never the lane's or the built-in default, because preflight
 // creates one probe per eligible node simultaneously and lane-scale
 // reservations there can leave probes Pending on a request-tight cluster.
-// Asserting the inequality is the point — this is the regression guard for
-// the probe re-inheriting lane sizing.
+// The bound assertions, not just the inequality checks, are the regression
+// guard: a probe regressing to the default *requests* with no limits would
+// dodge an exact-equality check while reintroducing exactly the per-node
+// reservation that wedged preflight.
 func TestProbePodSizingIgnoresTheLane(t *testing.T) {
 	run := testRun("resources-probe-lane")
 	pod := ProbePod(run, "node-a", "busybox:test", "true")
@@ -397,6 +400,13 @@ func TestProbePodSizingIgnoresTheLane(t *testing.T) {
 	}
 	if reflect.DeepEqual(got, courier.EffectivePodResources(configuredResources())) {
 		t.Fatal("probe container carries the lane's sizing; probes must not reserve lane-scale capacity")
+	}
+	floor := courier.DefaultPodResources().Requests
+	if got.Requests.Cpu().Cmp(*floor.Cpu()) >= 0 {
+		t.Fatalf("probe requests cpu = %v, want strictly below the default floor %v", got.Requests.Cpu(), floor.Cpu())
+	}
+	if got.Requests.Memory().Cmp(*floor.Memory()) >= 0 {
+		t.Fatalf("probe requests memory = %v, want strictly below the default floor %v", got.Requests.Memory(), floor.Memory())
 	}
 }
 

@@ -169,6 +169,35 @@ func TestEffectiveResourcesDoesNotAliasLaneConfig(t *testing.T) {
 	}
 }
 
+// TestProbePodResourcesIsFixed pins the concrete #402 decision at the API
+// layer, where the literals live: a probe pod requests 10m CPU / 32Mi memory
+// and no limits. The values must stay far below the built-in default request
+// (250m/512Mi): preflight creates one probe per eligible node simultaneously,
+// and lane-scale reservations there can leave probes Pending on a
+// request-tight cluster and wedge preflight.
+func TestProbePodResourcesIsFixed(t *testing.T) {
+	got := ProbePodResources()
+	assertRequests(t, got.Requests, "10m", "32Mi")
+	if len(got.Limits) != 0 {
+		t.Fatalf("limits = %#v, want none: a probe has no runaway build to bound", got.Limits)
+	}
+}
+
+// TestProbePodResourcesIsIndependentPerCall pins that the maps are allocated
+// per call: ProbePod assigns the result straight into a pod spec, so a caller
+// mutating one probe's sizing must not corrupt the next one's.
+func TestProbePodResourcesIsIndependentPerCall(t *testing.T) {
+	first := ProbePodResources()
+	first.Requests[corev1.ResourceCPU] = resource.MustParse("64")
+	first.Requests[corev1.ResourceEphemeralStorage] = resource.MustParse("1Gi")
+
+	second := ProbePodResources()
+	assertRequests(t, second.Requests, "10m", "32Mi")
+	if _, ok := second.Requests[corev1.ResourceEphemeralStorage]; ok {
+		t.Fatalf("requests = %#v, want no leakage from a mutated earlier result", second.Requests)
+	}
+}
+
 func assertRequestsAndLimits(t *testing.T, got corev1.ResourceRequirements, cpuReq, memReq, cpuLim, memLim string) {
 	t.Helper()
 	assertRequests(t, got.Requests, cpuReq, memReq)
