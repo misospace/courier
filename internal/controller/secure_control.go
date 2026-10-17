@@ -27,11 +27,12 @@ import (
 )
 
 // SecureNeedsHumanError marks a permanent, actionable deployment failure: a
-// configuration or admission problem that requeueing cannot fix. The
-// reconciler records it as a SecurePreflightFailed condition and terminates
-// the run NeedsHuman, from the secure launch path or the legacy launcher
-// alike. Any other error from these paths is treated as transient and follows
-// the normal claim/release/retry cycle.
+// configuration or admission problem that requeueing cannot fix. A run
+// terminalizes NeedsHuman from the launch paths on the pod-admission class
+// alone — podAdmissionRejection narrows it to the case the rendered spec's
+// author must fix. Every other error from those paths is transient and follows
+// the normal claim/release/retry cycle, even when it is itself one of these: a
+// signal that clears on a later pass would strand the run if terminalized.
 type SecureNeedsHumanError struct {
 	Reason string
 	Detail string
@@ -41,6 +42,20 @@ func (e *SecureNeedsHumanError) Error() string { return e.Detail }
 
 func secureNeedsHuman(reason, format string, args ...any) *SecureNeedsHumanError {
 	return &SecureNeedsHumanError{Reason: reason, Detail: fmt.Sprintf(format, args...)}
+}
+
+// podAdmissionRejection returns the permanent pod-admission rejection a
+// rendered spec's author must fix — the class this sizing work made
+// reachable — and nil for every other preflight failure. Only this class
+// terminalizes from the launch paths: a live probe that outran a
+// just-written NetworkPolicy or a stale RBAC informer cache clears on a
+// later pass, and terminalizing those would strand a recoverable run.
+func podAdmissionRejection(err error) *SecureNeedsHumanError {
+	var permanent *SecureNeedsHumanError
+	if !errors.As(err, &permanent) || permanent.Reason != "PodAdmission" {
+		return nil
+	}
+	return permanent
 }
 
 // ProviderFactory constructs the forge provider facets for one selected

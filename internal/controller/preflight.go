@@ -49,7 +49,10 @@ type probeOutcome struct {
 // the static guarantees but do not repeat the multi-node live probes, which
 // ran before the first workload exposure. resources are the lane-configured
 // sizing the caller already resolved for this launch pass, so the dry-run
-// proof and the pods created afterwards are the same artifact.
+// proof and the pods created afterwards are the same artifact. The proof
+// carries the probe pod only on a pass that will create probes live, so a
+// deployment with no probe image never proves — and is never failed by — a
+// spec it will not create.
 //
 // Permanent deployment misconfiguration returns a *SecureNeedsHumanError;
 // transient API or probe failures return an ordinary error so the run requeues
@@ -68,7 +71,7 @@ func (s *SecureControl) Preflight(ctx context.Context, run *courier.CoderRun, po
 	if err != nil {
 		return err
 	}
-	if err := s.checkDryRuns(ctx, run, cache, resources); err != nil {
+	if err := s.checkDryRuns(ctx, run, cache, resources, !relaunch && s.Config.LiveProbes); err != nil {
 		return err
 	}
 	if relaunch || !s.Config.LiveProbes {
@@ -225,10 +228,11 @@ func (s *SecureControl) subjectAccessReviewAs(ctx context.Context, serviceAccoun
 // pod specs create under dry-run, and known-bad specs (host path, privileged,
 // host networking) are rejected. A bad spec that the API admits is permanent
 // evidence that the configured admission cannot hold the boundary. Every pod
-// the launcher creates is in the proof, probe pods included, so no create path
-// is left unproven. resources are the lane sizing the caller resolved once for
+// the launcher creates is in the proof; proveProbes adds the probe pod, which
+// is created live rather than through this loop, and only on a pass that will
+// create probes. resources are the lane sizing the caller resolved once for
 // this pass.
-func (s *SecureControl) checkDryRuns(ctx context.Context, run *courier.CoderRun, cache *topology.CachePin, resources corev1.ResourceRequirements) error {
+func (s *SecureControl) checkDryRuns(ctx context.Context, run *courier.CoderRun, cache *topology.CachePin, resources corev1.ResourceRequirements, proveProbes bool) error {
 	registration, err := s.Config.Registry.Select(run.Spec.Repo)
 	if err != nil {
 		return secureNeedsHuman("ProviderSelection", "provider selection failed: %v", err)
@@ -261,11 +265,17 @@ func (s *SecureControl) checkDryRuns(ctx context.Context, run *courier.CoderRun,
 		return fmt.Errorf("secure preflight: render broker: %w", err)
 	}
 	pods = append(pods, broker)
-	// The probe pod joins the proof because it is created live below, not
-	// through this loop. A placeholder node name is deliberate: admission
-	// does not validate spec.nodeName, and the live probe renders the same
-	// spec modulo node and script.
-	pods = append(pods, topology.ProbePod(run, "dry-run-node", s.Config.ProbeImage, "true", resources))
+	if proveProbes {
+		// The probe pod joins the proof because this pass creates it live
+		// below, not through this loop; a pass that creates no probes proves
+		// no probe spec. The placeholder node name is arbitrary as far as
+		// admission is concerned — the API server does not validate
+		// spec.nodeName at all, neither as a DNS subdomain nor as a node
+		// that must exist — but it has to stay DNS-subdomain-shaped anyway,
+		// because the live probe's deterministic name derives from the
+		// node's.
+		pods = append(pods, topology.ProbePod(run, "dry-run-node", s.Config.ProbeImage, "true", resources))
+	}
 
 	for _, pod := range pods {
 		dry := pod.DeepCopy()

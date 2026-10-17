@@ -91,7 +91,8 @@ type CoordinatorLauncher struct {
 // is called, so a transient failed create is returned to the reconciler, which
 // releases the claim back to Pending. A permanent, actionable deployment
 // failure — a rendered pod spec the API server rejects outright — returns a
-// *SecureNeedsHumanError instead, which the reconciler terminalizes.
+// *SecureNeedsHumanError instead, and the reconciler terminalizes the run from
+// that class on this path.
 // Phase transitions are the reconciler's to write through the status contract;
 // the launcher only creates the pod.
 func (l *CoordinatorLauncher) Launch(ctx context.Context, run *courierv1alpha1.CoderRun) error {

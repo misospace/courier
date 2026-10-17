@@ -557,8 +557,7 @@ func TestCoordinatorLauncherProjectsCriteriaEnvelope(t *testing.T) {
 // half of the permanent-rejection invariant: a coordinator pod spec the API
 // server refuses outright is a permanent, terminalizable failure, because
 // requeueing cannot change it. A Forbidden or quota denial stays an ordinary
-// error — a grant or a quota can still be raised — and the AlreadyExists
-// adoption path below the create is untouched.
+// error — a grant or a quota can still be raised.
 func TestCoordinatorLauncherClassifiesPermanentPodRejection(t *testing.T) {
 	cases := map[string]struct {
 		rejection     error

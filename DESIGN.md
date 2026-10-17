@@ -1337,17 +1337,33 @@ whole; a limits-only lane gets the default requests; a requests-only lane is
 rendered with exactly its own requests plus the floored halves, so its pods
 really do run limit-less by its own choice. One consequence: a limit below the
 floored default request (say `limits.cpu: 100m` on a lane that sets no
-requests) renders requests above limits, which the API server rejects; every
-create path classifies that as `NeedsHuman` (`PodAdmission`) rather than
-requeueing, since a requeue cannot change a permanently invalid spec. The
-preflight dry-run proof carries the probe pod alongside the control, worker, and
-broker, the live probe create and the legacy coordinator's own create classify
-an `Invalid` themselves, and either classification terminalizes the run
-`NeedsHuman` recording `SecurePreflightFailed` rather than cycling
-claim, preflight, and release on every reconcile. The sizing is resolved once per
-launch pass, so the spec the dry run admits and the pods created afterwards are
-one artifact rather than two reads of a lane that may have moved. One lane-level
-value sizes every pod on the lane; per-role sizing is
+requests) renders requests above limits, which the API server rejects. Requeueing
+cannot change a permanently invalid spec, so the rejection is caught where it
+happens and the run stops rather than cycling claim, preflight, and release on
+every reconcile. The secure path's dry-run proof is the primary catch: it admits
+the control, worker, and broker pods, and the probe pod too on the passes that
+create probes live, so no pass creates a spec it has not proved. The secure
+workload creates behind that proof return ordinary errors and rely on it; the two
+creates a dry run cannot stand in for — the live probe create and the legacy
+coordinator's own create — classify an `Invalid` where it happens. That class
+alone, `PodAdmission`, terminalizes: the reconciler ends the run `NeedsHuman`
+from both `LaunchSecure` call sites, recording `SecurePreflightFailed`, and from
+the legacy launcher, which carries the cause in the run's terminal diagnostic
+instead. Every other preflight verdict keeps the claim/release requeue, because
+each of them clears on a later pass — a live probe can outrun the dataplane
+programming of the NetworkPolicy the same reconcile just wrote, and an access
+review can read an informer cache that has not yet caught up with a Role created
+moments ago — so terminalizing them would strand a run that was always going to
+succeed. The secure round is fenced before it terminalizes: a resumed launch
+reaches the launcher with a live worker and a credentialed broker, and a
+`NeedsHuman` run is no longer observed, so a fence deferred past that reconcile
+would leave the untrusted executor running and the broker holding credentials
+until the run's retention window ends. A fence that fails does not terminalize —
+the claim is released and the next pass retries it — and the legacy path needs no
+fence at all, since the create that failed left no pod to tear down. The sizing is
+resolved once per launch pass, so the spec the dry run admits and the pods
+created afterwards are one artifact rather than two reads of a lane that may have
+moved. One lane-level value sizes every pod on the lane; per-role sizing is
 deliberately not modelled.
 
 Roles name whatever models the operator has configured — cloud (`anthropic/...`,
@@ -3612,13 +3628,17 @@ was superseded.
   API server permanently rejects (an operator setting `resources.claims`, which
   the CRD exposes and no renderer honours) surfaces as `NeedsHuman` rather than a
   requeue loop — a quota or RBAC denial stays an ordinary error, because those
-  can be raised later. The classification sits on every create path, not only the
-  three workload pods' dry runs: the probe pod joins the dry-run proof (under a
-  placeholder node name, since admission does not validate `spec.nodeName`), the
-  live probe create and the legacy coordinator's own create classify an `Invalid`
-  where they happen, and the reconciler terminalizes the run `NeedsHuman` from both
-  `LaunchSecure` call sites and from the legacy launcher instead of releasing the
-  claim back to Pending and spinning. The sizing is resolved once per launch pass
+  can be raised later. The rejection is caught where it happens and the run stops
+  rather than re-queueing: the secure path's dry-run proof admits the control,
+  worker, and broker pods and, on the passes that create probes live, the probe
+  pod too, while the two creates a dry run cannot stand in for — the live probe
+  create and the legacy coordinator's own create — classify an `Invalid`
+  themselves; the secure workload creates behind the proof rely on it rather than
+  classifying again. Only that pod-admission class terminalizes, from both
+  `LaunchSecure` call sites (which record `SecurePreflightFailed`) and from the
+  legacy launcher (which carries the cause in the run's terminal diagnostic); the
+  other permanent preflight verdicts keep the claim/release requeue because each
+  of them clears on a later pass. The sizing is resolved once per launch pass
   and handed down through preflight, so the spec the dry run admits and the spec
   actually created are the same artifact. One lane-level value sizes every pod on
   the lane; per-role sizing is deliberately unmodelled, and nothing here bounds a
@@ -3636,7 +3656,30 @@ was superseded.
   single-sourced. A lane's sizing is still an operator decision; the floor only fills
   what the operator left unsaid about the two resources Kubernetes schedules and evicts
   on. The same review closed the proof/create gap this sizing rode in on: a permanent
-  pod rejection is now classified on every create path and terminalizes the run rather
+  pod rejection is now classified where the create happens and terminalizes the run rather
   than re-queueing it, and the sizing is resolved once per launch pass so the dry-run
   proof and the created pod are the same artifact rather than two reads of a lane that
   may have moved between them. (#356, PR #401 review)
+- **2026-10-17 — #356 amendment: only the pod-admission class terminalizes a run, and
+  the secure round is fenced before it does.** A later adversarial round on the same PR
+  held the sizing work and rejected the breadth of the amendment above on two counts.
+  The classification was not really on every create path: the secure workload creates
+  return ordinary errors and rely on the dry-run proof, and only the live probe create
+  and the legacy coordinator's own create classify an `Invalid` where they happen. And
+  terminalizing every permanent preflight verdict from the launch paths stranded runs on
+  signals that clear — `IsolationBroken` can fire because a live probe outran the
+  dataplane programming of the NetworkPolicy the same reconcile just wrote,
+  `OperatorRBAC`/`BrokerRBAC` can read an informer cache lagging a Role created moments
+  ago, and both are gone on the next pass. Terminalization is therefore narrowed to the
+  pod-admission class, the one this sizing made newly reachable, and every other class
+  keeps the claim/release requeue. The secure terminalization also now fences first: a
+  resumed launch reaches the launcher with a live worker and a credentialed broker, and
+  a `NeedsHuman` run is no longer observed, so a fence deferred past that reconcile would
+  leave the untrusted executor running and the broker holding credentials until the
+  retention window ended — a requeue loop traded for an unattended topology. A fence that
+  fails releases the claim and retries rather than terminalizing; the legacy path needs
+  no fence, its failed create having left no pod behind. The probe pod joined the dry-run
+  proof only on passes that create probes, so a deployment with no probe image can no
+  longer fail a run whose probes are disabled, and the placeholder node name stays
+  DNS-subdomain-shaped only because the real probe's name derives from the node — the API
+  server does not validate `spec.nodeName` at all. (#356, PR #401 review)

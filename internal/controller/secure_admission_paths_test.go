@@ -59,44 +59,65 @@ func launcherDryRun(name string) error {
 	return nil
 }
 
-// TestPreflightDryRunProofCoversEveryCreatedPod pins the invariant that a
-// rendered pod spec the API server refuses surfaces as NeedsHuman
-// (PodAdmission) on every create path, not just the three workload pods. The
-// probe-only case rejects a name nothing but the probe's dry-run carries, so
-// dropping the probe from the proof fails here.
+// TestPreflightDryRunProofCoversEveryCreatedPod pins which pod specs the
+// dry-run proof must admit before the launcher creates anything: the three
+// launcher pods always, and the probe pod on exactly the passes that create
+// probes live. A launcher pod left out of the proof would be created unproven;
+// a probe pod proven on a pass that creates no probe would let a deployment's
+// probe configuration — a probe image this pass never needs — reject a run
+// that never asks for one.
 func TestPreflightDryRunProofCoversEveryCreatedPod(t *testing.T) {
 	cases := map[string]struct {
-		reject func(control *SecureControl, run *courier.CoderRun) func(string) error
-		wantIn string
+		reject        func(control *SecureControl, run *courier.CoderRun) func(string) error
+		wantIn        string
+		liveProbes    bool
+		relaunch      bool
+		wantPermanent bool
 	}{
-		"any launcher dry-run pod": {
+		"a launcher dry-run pod is proven on every pass": {
 			reject: func(*SecureControl, *courier.CoderRun) func(string) error {
 				return launcherDryRun
 			},
-			wantIn: "worker",
+			wantIn:        "worker",
+			wantPermanent: true,
 		},
-		"only the probe dry-run pod": {
-			reject: func(control *SecureControl, run *courier.CoderRun) func(string) error {
-				probe := topology.ProbePod(run, "dry-run-node", control.Config.ProbeImage, "true", courier.DefaultPodResources())
-				dryRun := probe.Name + "-dryrun"
-				return func(name string) error {
-					if name == dryRun {
-						return invalidPodRejection(name)
-					}
-					return nil
-				}
-			},
-			wantIn: "probe",
+		"the probe dry-run pod is proven on a pass that creates probes": {
+			reject:        rejectProbeDryRun,
+			wantIn:        "probe",
+			liveProbes:    true,
+			wantPermanent: true,
+		},
+		"the probe is unproven when the deployment disables probes": {
+			reject: rejectProbeDryRun,
+		},
+		"the probe is unproven on a relaunch, which creates no probes": {
+			reject:     rejectProbeDryRun,
+			liveProbes: true,
+			relaunch:   true,
 		},
 	}
 	for name, test := range cases {
 		t.Run(name, func(t *testing.T) {
 			control, c := secureControl(t)
+			control.Config.LiveProbes = test.liveProbes
 			run := launchedSecureRun(t, c, "admission-proof", "local")
+			if test.relaunch {
+				// Any surviving topology pod makes this a relaunch, which
+				// re-verifies the static guarantees but runs no live probes.
+				if err := c.Create(context.Background(), healthyPod(run.Name, topology.ComponentBroker)); err != nil {
+					t.Fatal(err)
+				}
+			}
 			rejectPodCreates(t, control, test.reject(control, run))
 
 			_, err := control.LaunchSecure(context.Background(), run)
 			var permanent *SecureNeedsHumanError
+			if !test.wantPermanent {
+				if errors.As(err, &permanent) {
+					t.Fatalf("error = %v (%s), want no terminalizable permanent rejection on a pass that creates no probe", err, permanent.Reason)
+				}
+				return
+			}
 			if !errors.As(err, &permanent) {
 				t.Fatalf("error = %v, want a *SecureNeedsHumanError the reconciler can terminalize", err)
 			}
@@ -107,6 +128,20 @@ func TestPreflightDryRunProofCoversEveryCreatedPod(t *testing.T) {
 				t.Fatalf("detail = %q, want it to name the rejected %q pod", permanent.Detail, test.wantIn)
 			}
 		})
+	}
+}
+
+// rejectProbeDryRun rejects only the probe pod's dry-run proof — the spec the
+// live probe phase creates outside the proof loop. Only the probe's
+// deterministic name is read here, so the sizing it renders with is arbitrary.
+func rejectProbeDryRun(control *SecureControl, run *courier.CoderRun) func(string) error {
+	probe := topology.ProbePod(run, "dry-run-node", control.Config.ProbeImage, "true", courier.DefaultPodResources())
+	dryRun := probe.Name + "-dryrun"
+	return func(name string) error {
+		if name == dryRun {
+			return invalidPodRejection(name)
+		}
+		return nil
 	}
 }
 
@@ -134,9 +169,11 @@ func probeClusterFixture(t *testing.T, c client.Client, run *courier.CoderRun) {
 	}
 }
 
-// TestLiveProbeCreateClassifiesOnlyPermanentRejection is the backstop under
-// the dry-run proof: the live probe create is the one create path the proof
-// cannot make, so it classifies an Invalid itself. A Forbidden or quota denial
+// TestLiveProbeCreateClassifiesOnlyPermanentRejection pins the live probe
+// create's own classification: the dry-run proof admits the probe spec on the
+// passes that create probes, but a dry run is not a create, so the live create
+// is the last point where the API can refuse that spec — and it classifies an
+// Invalid itself rather than requeueing forever. A Forbidden or quota denial
 // stays an ordinary error, because a grant or a quota can still be raised.
 func TestLiveProbeCreateClassifiesOnlyPermanentRejection(t *testing.T) {
 	cases := map[string]struct {
@@ -217,6 +254,7 @@ func TestLaunchSecureResolvesLaneResourcesOncePerPass(t *testing.T) {
 	run := launchedSecureRun(t, c, "one-pass", "sized")
 
 	reads := 0
+	proven := []*corev1.Pod{}
 	watcher, ok := control.Client.(client.WithWatch)
 	if !ok {
 		t.Fatal("the fake client does not support watch")
@@ -237,6 +275,12 @@ func TestLaunchSecureResolvesLaneResourcesOncePerPass(t *testing.T) {
 			}
 			return nil
 		},
+		Create: func(ctx context.Context, c client.WithWatch, obj client.Object, opts ...client.CreateOption) error {
+			if pod, isPod := obj.(*corev1.Pod); isPod && strings.HasSuffix(pod.Name, "-dryrun") {
+				proven = append(proven, pod.DeepCopy())
+			}
+			return c.Create(ctx, obj, opts...)
+		},
 	})
 
 	if _, err := control.LaunchSecure(context.Background(), run); err != nil {
@@ -246,6 +290,12 @@ func TestLaunchSecureResolvesLaneResourcesOncePerPass(t *testing.T) {
 	// means the lane is resolved again mid-pass.
 	if reads != 2 {
 		t.Fatalf("LaneProfile reads = %d, want 2: one sizing resolution plus the control pod's run-context read", reads)
+	}
+	if len(proven) == 0 {
+		t.Fatal("no dry-run pod was created, so the proof proved nothing")
+	}
+	for _, pod := range proven {
+		assertSized(t, "dry-run proof of "+pod.Name, pod.Spec.Containers[0].Resources)
 	}
 	for component, podName := range map[string]string{
 		topology.ComponentWorker:      topology.WorkerPodName(run.Name),
@@ -261,7 +311,7 @@ func TestLaunchSecureResolvesLaneResourcesOncePerPass(t *testing.T) {
 }
 
 // TestLaunchSecurePermanentRejectionTerminalizesRun is the reconciler half of
-// the invariant: a permanent rejection from either LaunchSecure call site
+// the invariant: a pod-admission rejection from either LaunchSecure call site
 // terminalizes the run NeedsHuman with the SecurePreflightFailed condition
 // instead of returning it to Pending and cycling claim and release. It drives
 // both entry phases — admission of a Pending run and resume of a Claimed one —
@@ -356,44 +406,272 @@ func restrictNamespaceAndCredentials(t *testing.T, c client.Client, run *courier
 // the legacy path: with no SecureControl wired, a permanent launcher failure
 // terminalizes the run NeedsHuman rather than releasing the claim back to
 // Pending forever. The claim is released once, the cause reaches the source's
-// terminal report, and a later reconcile neither re-claims nor re-releases.
+// terminal report, and a later reconcile neither re-claims nor re-releases. It
+// drives both entry phases — admission of a Pending run and resume of a Claimed
+// one — because the two call sites classify separately.
 func TestLegacyLaunchPermanentRejectionTerminalizesRun(t *testing.T) {
+	cases := map[string]courier.Phase{
+		"admission": courier.PhasePending,
+		"resume":    courier.PhaseClaimed,
+	}
+	for name, phase := range cases {
+		t.Run(name, func(t *testing.T) {
+			ctx := context.Background()
+			item := &admissionSource{}
+			runName := "legacy-terminal-" + name
+			run := admissionRun(runName, "local", phase)
+			c := phaseClient(t, admissionLane("local", 1), run)
+			reconciler := &CoderRunReconciler{
+				Client: c,
+				Launch: func(context.Context, *courier.CoderRun) error {
+					return secureNeedsHuman("PodAdmission",
+						"the API server rejected the coordinator pod %s: refused by admission", runName+"-coordinator")
+				},
+				Sources:      NewSourceRegistry(map[string]source.Adapter{"test": item}),
+				StatusWriter: fakeStatusWriter{client: c},
+			}
+			if _, err := reconciler.Reconcile(ctx, admissionRequest(runName)); err != nil {
+				t.Fatalf("Reconcile: %v", err)
+			}
+			var updated courier.CoderRun
+			if err := c.Get(ctx, admissionKey(runName), &updated); err != nil {
+				t.Fatal(err)
+			}
+			if updated.Status.Phase != courier.PhaseNeedsHuman {
+				t.Fatalf("phase = %q, want NeedsHuman", updated.Status.Phase)
+			}
+			if len(item.released) != 1 {
+				t.Fatalf("released = %#v, want exactly one release of the source claim", item.released)
+			}
+			if len(item.reports) != 1 || !strings.Contains(item.reports[0].Error, "rejected the coordinator pod") {
+				t.Fatalf("reports = %#v, want the terminal report to name the pod admission rejection", item.reports)
+			}
+
+			// The run is parked, not re-admitted: a later reconcile claims
+			// nothing and releases nothing further.
+			claims, releases := len(item.claimed), len(item.released)
+			if _, err := reconciler.Reconcile(ctx, admissionRequest(runName)); err != nil {
+				t.Fatalf("second Reconcile: %v", err)
+			}
+			if len(item.claimed) != claims || len(item.released) != releases {
+				t.Fatalf("claimed = %#v released = %#v, want the parked run to cycle neither", item.claimed, item.released)
+			}
+		})
+	}
+}
+
+// TestLegacyPodAdmissionTerminalizationKeepsPullRequestLink pins that the
+// shared terminalization leaves the run's branch identity alone. A fix-pr run
+// that a pod-admission rejection takes down still has a head to observe, and
+// the terminal PR enrichment reads Status.Branch to find it: clearing the
+// branch here — as the missing-head path does, for good reason, because its head
+// is genuinely gone — would silently drop the run's pull request link while the
+// secure path's identical outcome keeps it.
+func TestLegacyPodAdmissionTerminalizationKeepsPullRequestLink(t *testing.T) {
 	ctx := context.Background()
 	item := &admissionSource{}
-	run := admissionRun("legacy-terminal", "local", courier.PhasePending)
+	runName := "legacy-fix-pr"
+	run := admissionRun(runName, "local", courier.PhaseClaimed)
+	run.Spec.Mode = courier.ModeFixPR
+	run.Spec.Ref = 42
+	run.Status.Branch = "courier/Acme/Widgets/issue-42"
+	run.Status.HeadRepo = "Acme/Widgets"
+	run.Status.HeadSHA = "headsha"
 	c := phaseClient(t, admissionLane("local", 1), run)
+	calls := 0
+	observer := &fakeWorldObserver{observation: PRObservation{PR: "https://forge/acme/widgets/pull/42"}, calls: &calls}
 	reconciler := &CoderRunReconciler{
 		Client: c,
 		Launch: func(context.Context, *courier.CoderRun) error {
 			return secureNeedsHuman("PodAdmission",
-				"the API server rejected the coordinator pod %s: refused by admission", run.Name+"-coordinator")
+				"the API server rejected the coordinator pod %s: refused by admission", runName+"-coordinator")
 		},
 		Sources:      NewSourceRegistry(map[string]source.Adapter{"test": item}),
 		StatusWriter: fakeStatusWriter{client: c},
+		Observer:     observer,
 	}
-	if _, err := reconciler.Reconcile(ctx, admissionRequest("legacy-terminal")); err != nil {
+	if _, err := reconciler.Reconcile(ctx, admissionRequest(runName)); err != nil {
 		t.Fatalf("Reconcile: %v", err)
 	}
 	var updated courier.CoderRun
-	if err := c.Get(ctx, admissionKey("legacy-terminal"), &updated); err != nil {
+	if err := c.Get(ctx, admissionKey(runName), &updated); err != nil {
 		t.Fatal(err)
 	}
 	if updated.Status.Phase != courier.PhaseNeedsHuman {
 		t.Fatalf("phase = %q, want NeedsHuman", updated.Status.Phase)
 	}
-	if len(item.released) != 1 {
-		t.Fatalf("released = %#v, want exactly one release of the source claim", item.released)
+	if updated.Status.Branch != run.Status.Branch || updated.Status.HeadRepo != run.Status.HeadRepo {
+		t.Fatalf("head identity = %q@%q, want the run's own branch kept", updated.Status.HeadRepo, updated.Status.Branch)
 	}
-	if len(item.reports) != 1 || !strings.Contains(item.reports[0].Error, "rejected the coordinator pod") {
-		t.Fatalf("reports = %#v, want the terminal report to name the pod admission rejection", item.reports)
+	if observer.calls == nil || *observer.calls == 0 {
+		t.Fatal("the terminal PR enrichment never observed the run's head")
+	}
+	if updated.Status.PR != "https://forge/acme/widgets/pull/42" {
+		t.Fatalf("PR = %q, want the observed pull request recorded on the terminal run", updated.Status.PR)
+	}
+}
+
+// TestPodSecurityRejectionStaysRequeueable pins the narrowing of the launch
+// path's permanent classification to the pod-admission class. It drives the
+// PodSecurity class end to end — the run namespace missing the restricted
+// enforce label — because that verdict, like a live probe that outran the
+// just-written NetworkPolicy or an RBAC read off a stale informer cache, is one
+// an operator fixes on the live world and a later pass then admits. Terminalizing
+// it would strand the run over a label, so the reconciler keeps its requeue
+// behaviour: the claim is released back to Pending and the error is returned.
+func TestPodSecurityRejectionStaysRequeueable(t *testing.T) {
+	ctx := context.Background()
+	control, c := secureControl(t)
+	run := secureRun("pod-security-requeue")
+	run.Status.Phase = courier.PhasePending
+	if err := c.Create(ctx, run); err != nil {
+		t.Fatal(err)
+	}
+	// The restricted namespace, then the label this class trips over removed.
+	restrictNamespaceAndCredentials(t, c, run)
+	var namespace corev1.Namespace
+	if err := c.Get(ctx, client.ObjectKey{Name: secureTestNamespace}, &namespace); err != nil {
+		t.Fatal(err)
+	}
+	namespace.Labels = map[string]string{"pod-security.kubernetes.io/audit": "restricted"}
+	if err := c.Update(ctx, &namespace); err != nil {
+		t.Fatal(err)
 	}
 
-	// The run is parked, not re-admitted: a later reconcile claims nothing and
-	// releases nothing further.
-	if _, err := reconciler.Reconcile(ctx, admissionRequest("legacy-terminal")); err != nil {
-		t.Fatalf("second Reconcile: %v", err)
+	item := &admissionSource{}
+	reconciler := &CoderRunReconciler{
+		Client: c,
+		Launch: func(context.Context, *courier.CoderRun) error { return nil },
+		Sources: NewSourceRegistry(map[string]source.Adapter{
+			"manual": item,
+		}),
+		StatusWriter: fakeStatusWriter{client: c},
+		Secure:       control,
 	}
-	if len(item.claimed) != 1 || len(item.released) != 1 {
-		t.Fatalf("claimed = %#v released = %#v, want the parked run to cycle neither", item.claimed, item.released)
+	control.Patcher = reconciler
+
+	_, err := reconciler.Reconcile(ctx, ctrl.Request{NamespacedName: client.ObjectKeyFromObject(run)})
+	if err == nil {
+		t.Fatal("Reconcile returned nil, want the pod-security verdict requeued")
+	}
+	var permanent *SecureNeedsHumanError
+	if !errors.As(err, &permanent) || permanent.Reason != "PodSecurity" {
+		t.Fatalf("error = %v, want the unchanged pod-security failure to be requeued", err)
+	}
+	var updated courier.CoderRun
+	if err := c.Get(ctx, client.ObjectKeyFromObject(run), &updated); err != nil {
+		t.Fatal(err)
+	}
+	if updated.Status.Phase != courier.PhasePending {
+		t.Fatalf("phase = %q, want Pending: only the pod-admission class terminalizes", updated.Status.Phase)
+	}
+	if len(item.released) != 1 {
+		t.Fatalf("released = %#v, want the claim released back to Pending", item.released)
+	}
+	if condition := apimeta.FindStatusCondition(updated.Status.Conditions, "SecurePreflightFailed"); condition != nil {
+		t.Fatalf("condition = %#v, want no terminalizing condition on a requeueable failure", condition)
+	}
+}
+
+// TestPodAdmissionRejectionFencesRoundBeforeTerminalizing proves the secure
+// terminalization is fenced: a resumed launch reaches the launcher with a live
+// worker and a credentialed broker already provisioned, and a NeedsHuman run is
+// no longer observed, so a fence deferred past that reconcile would leave the
+// untrusted executor running and the broker holding credentials until the
+// retention window elapses. A fence that fails does not terminalize — the next
+// pass retries it.
+func TestPodAdmissionRejectionFencesRoundBeforeTerminalizing(t *testing.T) {
+	cases := map[string]struct {
+		fenceErr  error
+		wantPhase courier.Phase
+	}{
+		"fence-succeeds": {wantPhase: courier.PhaseNeedsHuman},
+		"fence-fails":    {fenceErr: errors.New("worker pod delete forbidden"), wantPhase: courier.PhasePending},
+	}
+	for name, test := range cases {
+		t.Run(name, func(t *testing.T) {
+			ctx := context.Background()
+			control, c := secureControl(t)
+			run := launchedSecureRun(t, c, "fenced-"+name, "local")
+			run.Status.Phase = courier.PhaseClaimed
+			if err := c.Status().Update(ctx, run); err != nil {
+				t.Fatal(err)
+			}
+			// A round already up: the resumed launch fails its dry-run
+			// proof with the worker and the credentialed broker live.
+			for _, pod := range []*corev1.Pod{
+				healthyPod(run.Name, topology.ComponentWorker),
+				healthyPod(run.Name, topology.ComponentBroker),
+			} {
+				if err := c.Create(ctx, pod); err != nil {
+					t.Fatal(err)
+				}
+			}
+			workerName := topology.WorkerPodName(run.Name)
+			watcher, ok := control.Client.(client.WithWatch)
+			if !ok {
+				t.Fatal("the fake client does not support watch")
+			}
+			control.Client = interceptor.NewClient(watcher, interceptor.Funcs{
+				Create: func(ctx context.Context, c client.WithWatch, obj client.Object, opts ...client.CreateOption) error {
+					if err := launcherDryRun(obj.GetName()); err != nil {
+						return err
+					}
+					return c.Create(ctx, obj, opts...)
+				},
+				Delete: func(ctx context.Context, c client.WithWatch, obj client.Object, opts ...client.DeleteOption) error {
+					if test.fenceErr != nil && obj.GetName() == workerName {
+						return test.fenceErr
+					}
+					return c.Delete(ctx, obj, opts...)
+				},
+			})
+
+			item := &admissionSource{}
+			reconciler := &CoderRunReconciler{
+				Client:       c,
+				Launch:       func(context.Context, *courier.CoderRun) error { return nil },
+				Sources:      NewSourceRegistry(map[string]source.Adapter{"manual": item}),
+				StatusWriter: fakeStatusWriter{client: c},
+				Secure:       control,
+			}
+			control.Patcher = reconciler
+
+			_, err := reconciler.Reconcile(ctx, ctrl.Request{NamespacedName: client.ObjectKeyFromObject(run)})
+			if test.fenceErr != nil {
+				if err == nil || !strings.Contains(err.Error(), test.fenceErr.Error()) {
+					t.Fatalf("Reconcile error = %v, want the fence failure surfaced for a retry", err)
+				}
+			} else if err != nil {
+				t.Fatalf("Reconcile: %v", err)
+			}
+			var updated courier.CoderRun
+			if err := c.Get(ctx, client.ObjectKeyFromObject(run), &updated); err != nil {
+				t.Fatal(err)
+			}
+			if updated.Status.Phase != test.wantPhase {
+				t.Fatalf("phase = %q, want %q", updated.Status.Phase, test.wantPhase)
+			}
+			for _, fenced := range []struct {
+				what   string
+				name   string
+				object client.Object
+			}{
+				{"worker pod", workerName, &corev1.Pod{}},
+				{"broker pod", topology.BrokerPodName(run.Name), &corev1.Pod{}},
+				{"broker Service", topology.BrokerServiceName(run.Name), &corev1.Service{}},
+			} {
+				err := c.Get(ctx, client.ObjectKey{Namespace: run.Namespace, Name: fenced.name}, fenced.object)
+				if test.fenceErr != nil {
+					if err != nil {
+						t.Fatalf("read %s after the failed fence: %v", fenced.what, err)
+					}
+					continue
+				}
+				if !apierrors.IsNotFound(err) {
+					t.Fatalf("read %s = %v, want NotFound: the round must be fenced before the run terminalizes", fenced.what, err)
+				}
+			}
+		})
 	}
 }
