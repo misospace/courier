@@ -56,6 +56,85 @@ func (b Bindings) Roles() []string {
 	return out
 }
 
+// ContextPolicy is the context budget a lane declared for its roles (#243).
+// Declared values only: the compact fraction and output reservation apply to
+// every role unless a per-role entry overrides them, and MaxInputTokens is the
+// per-role ceiling the gateway read is measured against. The zero value
+// declares nothing.
+type ContextPolicy struct {
+	CompactAtPercent  int
+	OutputReservation int
+	Roles             map[string]RoleContextPolicy
+}
+
+// RoleContextPolicy is one role's declared ceiling and overrides.
+type RoleContextPolicy struct {
+	MaxInputTokens    int
+	CompactAtPercent  int
+	OutputReservation int
+}
+
+// forRole builds one role's resolution input: the per-role ceiling with the
+// global fraction and reservation as the base. ProbedMaxInputTokens stays
+// zero — the verified limit comes from the gateway, never from the
+// declaration.
+func (p ContextPolicy) forRole(role string) ContextBudgetInput {
+	declared := p.Roles[role]
+	percent := p.CompactAtPercent
+	if declared.CompactAtPercent != 0 {
+		percent = declared.CompactAtPercent
+	}
+	reservation := p.OutputReservation
+	if declared.OutputReservation != 0 {
+		reservation = declared.OutputReservation
+	}
+	return ContextBudgetInput{
+		Role:                   role,
+		DeclaredMaxInputTokens: declared.MaxInputTokens,
+		CompactAtPercent:       percent,
+		OutputReservation:      reservation,
+	}
+}
+
+// declaresRole answers whether the lane declared a usable context policy for
+// this role — the predicate that makes a role required at the capability gate:
+// a global fraction or reservation, a positive per-role ceiling, or a nonzero
+// per-role override of either. It is deliberately broader than "the lane named
+// this role": a global fraction covers every bound role without naming it, and
+// an override is a declaration because forRole honors it. An all-zero
+// per-role entry declares nothing — a config-shaped `roles: {coder: {}}` must
+// not read as a declared budget — so an undeclared lane is merely degraded and
+// never gated by a policy it never opted into.
+func (p ContextPolicy) declaresRole(role string) bool {
+	declared := p.Roles[role]
+	return p.CompactAtPercent != 0 || p.OutputReservation != 0 ||
+		declared.MaxInputTokens > 0 || declared.CompactAtPercent != 0 || declared.OutputReservation != 0
+}
+
+// RoleBudget resolves one role's context budget from the lane's declaration
+// plus the input limit the gateway verified for its bound model, so the
+// capability probe and any other consumer cannot disagree on the effective
+// limit.
+//
+// A role the lane declared nothing for and whose limit could not be verified
+// resolves to a zero budget and no error — the same "the harness owns no
+// policy for this role" convention the session loop reads, and never an
+// implicit context window. Every other failure, including a declared ceiling
+// the run cannot establish and an invalid declaration, is returned fail
+// closed.
+func (p ContextPolicy) RoleBudget(role string, probedMaxInputTokens int) (ContextBudget, error) {
+	input := p.forRole(role)
+	input.ProbedMaxInputTokens = probedMaxInputTokens
+	budget, err := ResolveContextBudget(input)
+	if err != nil {
+		if errors.Is(err, ErrNoContextCapacity) && !p.declaresRole(role) {
+			return ContextBudget{}, nil
+		}
+		return ContextBudget{}, err
+	}
+	return budget, nil
+}
+
 // ActivitySink receives earned-activity signals (HARNESS.md §6). A stream
 // chunk from a role-bound model session is an earned stream heartbeat; a
 // verified tool boundary is an earned tool heartbeat. Failed streams,
