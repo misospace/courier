@@ -66,7 +66,11 @@ setup-envtest $se_pin"
 		log "repo-local tools do not match the Makefile pins; reinstalling"
 		rm -f bin/controller-gen bin/setup-envtest
 	fi
-	make controller-gen setup-envtest
+	# Pass the pins explicitly: the Makefile assignments use ?=, so an
+	# environment-provided override would otherwise install a binary other
+	# than the one stamped below and reported as ready.
+	make controller-gen setup-envtest \
+		CONTROLLER_TOOLS_VERSION="$cg_pin" ENVTEST_VERSION="$se_pin"
 	printf '%s\n' "$pins" > bin/.tool-pins
 
 	# envtest assets only — the suite itself stays behind an explicit task.
@@ -91,10 +95,21 @@ if [ "${1:-}" = "tools" ]; then
 	exit 0
 fi
 
-if command -v mise >/dev/null 2>&1; then
-	BOOTSTRAP_MISE=$(command -v mise)
-	export BOOTSTRAP_MISE
-	exec mise run bootstrap
+# A mise already on PATH is used only when it matches the pinned launcher
+# version; otherwise the pinned launcher below is installed and used instead,
+# so a stale or arbitrary installation cannot become the bootstrap
+# implementation or break the one-command setup.
+mise_pin=${MISE_VERSION#v}
+path_mise=$(command -v mise || true)
+if [ -n "$path_mise" ]; then
+	path_mise_version=$("$path_mise" --version 2>/dev/null | awk 'NR==1{print $1}')
+	path_mise_version=${path_mise_version#v}
+	if [ "$path_mise_version" = "$mise_pin" ]; then
+		BOOTSTRAP_MISE=$path_mise
+		export BOOTSTRAP_MISE
+		exec "$path_mise" run bootstrap
+	fi
+	log "mise on PATH reports '${path_mise_version:-unknown}', not the pinned ${mise_pin}; installing the pinned launcher instead"
 fi
 
 if [ -z "${MISE_INSTALL_DIR:-}" ] && [ -z "${HOME:-}" ]; then
