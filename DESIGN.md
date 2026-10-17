@@ -1393,7 +1393,13 @@ there is no delete verb because active runs reference lanes. (#73)
   stall relaunches/resumes it; a crashloop reaches NeedsHuman.
 - **Verifying** — no coordinator pod or liveness meaning. The operator polls
   the external PR and CI world indefinitely, with a reconciliation cadence and
-  no deadline. Observer errors remain Verifying and requeue. A missing observer
+  no deadline. Observer errors remain Verifying and requeue. The poll reads the
+  run head's pull requests through the identity-checked forge listing, so a
+  record whose base or head repository identity differs from the run's — a
+  same-owner fork claiming `owner:branch` — and a response carrying no
+  repository identity at all both fail the poll closed: they are the same
+  unverifiable world as a read error, never a "no pull request" claim
+  published as this run's state (#365). A missing observer
   or missing/draft PR reaches **NeedsHuman**. A failed check on a fix-pr run
   reaches **Failed** so its source can apply its retry policy. A resolve-issue
   run whose published PR has stable, confirmed red checks reaches **HandedOff**
@@ -3503,3 +3509,25 @@ was superseded.
   read failure renders as its fixed class alone, since its endpoint and dial
   error must not reach the byte-bounded termination reason. (#296, #243,
   #297)
+- **2026-10-17 — #365: the controller's `Verifying` observation reads its head
+  listing through the identity-checked capability.**
+  `internal/github.Observer.Observe` was the last reader of the raw
+  `head=owner:branch` listing. GitHub's selector carries no repository
+  identity, so a same-owner fork whose branch matched the run branch's name had
+  its number, draft flag, head SHA, checks, and statuses published as this
+  run's state. It now calls `Provider.ListPullRequestsWithForeign` — the same
+  capability the executor's pre-handoff observation and the adoption guard read
+  through — so the full base and head repository identity carried in the
+  response decides the match, a response missing either identity is a read
+  failure, every page of the listing is read, and any record claiming the
+  selector from another repository fails the poll closed instead of being
+  dropped toward a "no pull request" claim: an unverifiable world is never
+  published as `pr_opened`. Draft handling, check and status collection, and
+  the observation contract are unchanged. One consequence is deliberate and
+  stricter than before: a record the selector surfaced that does not carry the
+  run's own head identity — a same-repository record for another head ref — is
+  a foreign claim under this listing, not a row that is skipped, matching how
+  the executor's observation already treats it. The identity-blind one-page
+  client query had no remaining caller after this change and is gone, so one
+  listing seam remains. (#365, closing the `Observer` carve-out left open by
+  the #343 entry.)

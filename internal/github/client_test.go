@@ -213,7 +213,7 @@ func TestWithBaseURLRetargetsCarryingCredential(t *testing.T) {
 	}
 }
 
-func TestPullRequestsForHead(t *testing.T) {
+func TestPullRequestsForHeadAllPagesQueriesHeadAndAllStates(t *testing.T) {
 	t.Parallel()
 	var rawQuery string
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -230,9 +230,9 @@ func TestPullRequestsForHead(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	pulls, err := client.PullRequestsForHead(context.Background(), "acme", "demo", "octocat", "work")
+	pulls, err := client.PullRequestsForHeadAllPages(context.Background(), "acme", "demo", "octocat", "work")
 	if err != nil {
-		t.Fatalf("PullRequestsForHead: %v", err)
+		t.Fatalf("PullRequestsForHeadAllPages: %v", err)
 	}
 	if len(pulls) != 2 || pulls[0].Number != 12 || pulls[0].State != "open" || pulls[1].State != "merged" {
 		t.Fatalf("pulls = %#v, want an open and a merged PR", pulls)
@@ -509,7 +509,7 @@ func TestObserverReportsDraftPullRequest(t *testing.T) {
 		w.Header().Set("Content-Type", "application/json")
 		switch r.URL.Path {
 		case "/repos/acme/demo/pulls":
-			_, _ = io.WriteString(w, `[{"number":12,"state":"open","draft":true,"head":{"ref":"work","sha":"abc"}}]`)
+			_, _ = io.WriteString(w, `[{"number":12,"state":"open","draft":true,"head":{"ref":"work","sha":"abc","repo":{"full_name":"acme/demo"}},"base":{"ref":"main","repo":{"full_name":"acme/demo"}}}]`)
 		case "/repos/acme/demo/commits/abc/check-runs":
 			_, _ = io.WriteString(w, `{"total_count":1,"check_runs":[{"conclusion":"success"}]}`)
 		case "/repos/acme/demo/commits/abc/status":
@@ -541,7 +541,7 @@ func TestObserverCombinesChecksAndStatuses(t *testing.T) {
 		w.Header().Set("Content-Type", "application/json")
 		switch r.URL.Path {
 		case "/repos/acme/demo/pulls":
-			_, _ = io.WriteString(w, `[{"number":12,"state":"open","head":{"ref":"work","sha":"abc"}}]`)
+			_, _ = io.WriteString(w, `[{"number":12,"state":"open","head":{"ref":"work","sha":"abc","repo":{"full_name":"acme/demo"}},"base":{"ref":"main","repo":{"full_name":"acme/demo"}}}]`)
 		case "/repos/acme/demo/commits/abc/check-runs":
 			_, _ = io.WriteString(w, `{"total_count":1,"check_runs":[{"name":"build","status":"completed","conclusion":"success"}]}`)
 		case "/repos/acme/demo/commits/abc/status":
@@ -575,7 +575,7 @@ func TestObserverLaterPageFailureDoesNotPass(t *testing.T) {
 		w.Header().Set("Content-Type", "application/json")
 		switch r.URL.Path {
 		case "/repos/acme/demo/pulls":
-			_, _ = io.WriteString(w, `[{"number":12,"state":"open","head":{"ref":"work","sha":"abc"}}]`)
+			_, _ = io.WriteString(w, `[{"number":12,"state":"open","head":{"ref":"work","sha":"abc","repo":{"full_name":"acme/demo"}},"base":{"ref":"main","repo":{"full_name":"acme/demo"}}}]`)
 		case "/repos/acme/demo/commits/abc/check-runs":
 			switch r.URL.Query().Get("page") {
 			case "1":
@@ -608,7 +608,7 @@ func TestObserverLaterPagePendingDoesNotPass(t *testing.T) {
 		w.Header().Set("Content-Type", "application/json")
 		switch r.URL.Path {
 		case "/repos/acme/demo/pulls":
-			_, _ = io.WriteString(w, `[{"number":12,"state":"open","head":{"ref":"work","sha":"abc"}}]`)
+			_, _ = io.WriteString(w, `[{"number":12,"state":"open","head":{"ref":"work","sha":"abc","repo":{"full_name":"acme/demo"}},"base":{"ref":"main","repo":{"full_name":"acme/demo"}}}]`)
 		case "/repos/acme/demo/commits/abc/check-runs":
 			switch r.URL.Query().Get("page") {
 			case "1":
@@ -641,7 +641,7 @@ func TestObserverPendingStatusDoesNotPass(t *testing.T) {
 		w.Header().Set("Content-Type", "application/json")
 		switch r.URL.Path {
 		case "/repos/acme/demo/pulls":
-			_, _ = io.WriteString(w, `[{"number":12,"state":"open","head":{"ref":"work","sha":"abc"}}]`)
+			_, _ = io.WriteString(w, `[{"number":12,"state":"open","head":{"ref":"work","sha":"abc","repo":{"full_name":"acme/demo"}},"base":{"ref":"main","repo":{"full_name":"acme/demo"}}}]`)
 		case "/repos/acme/demo/commits/abc/check-runs":
 			_, _ = io.WriteString(w, `{"total_count":0,"check_runs":[]}`)
 		case "/repos/acme/demo/commits/abc/status":
@@ -669,7 +669,7 @@ func TestObserverStatusOnlySuccessIsPassed(t *testing.T) {
 		w.Header().Set("Content-Type", "application/json")
 		switch r.URL.Path {
 		case "/repos/acme/demo/pulls":
-			_, _ = io.WriteString(w, `[{"number":12,"state":"open","head":{"ref":"work","sha":"abc"}}]`)
+			_, _ = io.WriteString(w, `[{"number":12,"state":"open","head":{"ref":"work","sha":"abc","repo":{"full_name":"acme/demo"}},"base":{"ref":"main","repo":{"full_name":"acme/demo"}}}]`)
 		case "/repos/acme/demo/commits/abc/check-runs":
 			_, _ = io.WriteString(w, `{"total_count":0,"check_runs":[]}`)
 		case "/repos/acme/demo/commits/abc/status":
@@ -703,7 +703,7 @@ func TestObserverForkHeadQueriesBaseRepoWithForkOwner(t *testing.T) {
 		requests[r.URL.Path+"?"+r.URL.RawQuery]++
 		switch {
 		case r.URL.Path == "/repos/acme/demo/pulls" && r.URL.Query().Get("head") == "octocat:work":
-			_, _ = io.WriteString(w, `[{"number":12,"state":"open","head":{"ref":"work","repo":{"full_name":"octocat/widgets"},"sha":"abc123"}}]`)
+			_, _ = io.WriteString(w, `[{"number":12,"state":"open","head":{"ref":"work","repo":{"full_name":"octocat/widgets"},"sha":"abc123"},"base":{"ref":"main","repo":{"full_name":"acme/demo"}}}]`)
 		case r.URL.Path == "/repos/acme/demo/commits/abc123/check-runs":
 			_, _ = io.WriteString(w, `{"total_count":1,"check_runs":[{"name":"build","status":"completed","conclusion":"success"}]}`)
 		case r.URL.Path == "/repos/acme/demo/commits/abc123/status":
@@ -724,8 +724,14 @@ func TestObserverForkHeadQueriesBaseRepoWithForkOwner(t *testing.T) {
 	if observation.PR != "12" {
 		t.Fatalf("observation = %#v, want fork PR 12", observation)
 	}
-	if _, ok := requests["/repos/acme/demo/pulls?head=octocat:work&state=all"]; !ok {
-		t.Fatalf("pulls requests = %#v, want a base-repo query filtered to the fork head owner", requests)
+	queriedForkHead := false
+	for path := range requests {
+		if strings.HasPrefix(path, "/repos/acme/demo/pulls?") && strings.Contains(path, "head=octocat:work") && strings.Contains(path, "state=all") {
+			queriedForkHead = true
+		}
+	}
+	if !queriedForkHead {
+		t.Fatalf("pulls requests = %#v, want a paginated base-repo query filtered to the fork head owner", requests)
 	}
 	if _, ok := requests["/repos/acme/demo/commits/abc123/check-runs?page=1&per_page=100"]; !ok {
 		t.Fatalf("check-run requests = %#v, want check runs read from the base repo for the head SHA", requests)
@@ -793,7 +799,7 @@ func TestObserverResolveHeadRejectsEmptyHeadRef(t *testing.T) {
 	}
 }
 
-func TestPullRequestsForHeadAPIError(t *testing.T) {
+func TestPullRequestsForHeadAllPagesAPIError(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusInternalServerError)
 		_, _ = io.WriteString(w, `{"message":"internal error"}`)
@@ -803,7 +809,7 @@ func TestPullRequestsForHeadAPIError(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	_, err = client.PullRequestsForHead(context.Background(), "acme", "demo", "acme", "work")
+	_, err = client.PullRequestsForHeadAllPages(context.Background(), "acme", "demo", "acme", "work")
 	var apiErr *APIError
 	if !errors.As(err, &apiErr) || apiErr.StatusCode != http.StatusInternalServerError {
 		t.Fatalf("error = %v (%T), want a 500 APIError", err, err)
