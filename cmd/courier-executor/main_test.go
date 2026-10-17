@@ -1695,10 +1695,11 @@ exit 1
 	}
 }
 
-// TestRunCrashFailsAfterBudget proves a run that keeps crashing exhausts the
-// continuation budget and then fails with the child's exit code, reporting the
-// number of continuations.
-func TestRunCrashFailsAfterBudget(t *testing.T) {
+// TestRunCrashHandsOffRecoverablyAfterBudget proves a run that keeps
+// crashing consumes the continuation budget and then ends on the recoverable
+// availability handoff — reporting the number of continuations — instead of
+// terminalizing as Failed and stranding the claim (#327).
+func TestRunCrashHandsOffRecoverablyAfterBudget(t *testing.T) {
 	root := t.TempDir()
 	remote := remoteWithExistingBranch(t, root)
 	fakeOpenCode := filepath.Join(root, "opencode")
@@ -1714,14 +1715,18 @@ exit 1
 
 	var output bytes.Buffer
 	var errorsOut bytes.Buffer
-	if code := run(context.Background(), &output, &errorsOut); code != 1 {
-		t.Fatalf("run exit code = %d, want the child's code 1; stderr=%q stdout=%q", code, errorsOut.String(), output.String())
+	if code := run(context.Background(), &output, &errorsOut); code != exitNeedsHuman {
+		t.Fatalf("run exit code = %d, want %d (recoverable handoff); stderr=%q stdout=%q", code, exitNeedsHuman, errorsOut.String(), output.String())
 	}
-	if !strings.Contains(output.String(), `"phase":"Failed"`) {
-		t.Fatalf("missing Failed termination: %q", output.String())
+	out := output.String()
+	if !strings.Contains(out, `"outcome":"capacity_exhausted"`) || !strings.Contains(out, `"category":"provider-unavailable"`) {
+		t.Fatalf("missing recoverable availability handoff: %q", out)
 	}
-	if !strings.Contains(output.String(), "opencode exited with status 1 after 2 continuations") {
-		t.Fatalf("failure reason = %q, want the budget-exhausted reason", output.String())
+	if strings.Contains(out, `"phase":"Failed"`) {
+		t.Fatalf("a crashed child must not strand the work as Failed: %q", out)
+	}
+	if !strings.Contains(out, "opencode exited with status 1 after 2 continuations") {
+		t.Fatalf("handoff reason = %q, want the budget-exhausted detail", out)
 	}
 
 	events := parseEvents(t, &output)
@@ -1846,12 +1851,30 @@ exit 1
 
 	var output bytes.Buffer
 	var errorsOut bytes.Buffer
-	if code := run(context.Background(), &output, &errorsOut); code != exitFailed {
-		t.Fatalf("run exit code = %d, want %d (crash continuation exhausted after recovery); stderr=%q stdout=%q", code, exitFailed, errorsOut.String(), output.String())
+	if code := run(context.Background(), &output, &errorsOut); code != exitNeedsHuman {
+		t.Fatalf("run exit code = %d, want %d (recoverable handoff after the task budget); stderr=%q stdout=%q", code, exitNeedsHuman, errorsOut.String(), output.String())
 	}
 	out := output.String()
-	if !strings.Contains(out, "after 1 continuations") || strings.Contains(out, `"category":"provider-unavailable"`) {
-		t.Fatalf("availability retries leaked into the task budget: %q", out)
+	if !strings.Contains(out, "after 1 continuations") || !strings.Contains(out, `"category":"provider-unavailable"`) {
+		t.Fatalf("terminal handoff missing the task-budget detail: %q", out)
+	}
+	// Budget separation: the two no-session crashes rode the availability
+	// budget; only the post-recovery crash consumed a task continuation.
+	events := parseEvents(t, &output)
+	var crash, avail int
+	for _, event := range events {
+		if event["event"] != "executor.continuation" {
+			continue
+		}
+		switch kind := eventDetail(t, event)["kind"]; kind {
+		case "crash":
+			crash++
+		case "availability-retry":
+			avail++
+		}
+	}
+	if crash != 1 || avail != 2 {
+		t.Fatalf("crash continuations = %d (want 1), availability retries = %d (want 2)", crash, avail)
 	}
 }
 

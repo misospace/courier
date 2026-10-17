@@ -1231,7 +1231,7 @@ func run(ctx context.Context, stdout, stderr io.Writer) int {
 					continue
 				}
 				if ctx.Err() == nil {
-					report.terminateCaptured(ctx, workspace, startCommit, report.availabilityRecoveryTermination(ctx, workspace, cfg, startCommit, code))
+					report.terminateCaptured(ctx, workspace, startCommit, report.availabilityRecoveryTermination(ctx, workspace, cfg, startCommit, code, fmt.Sprintf("model provider failed to serve %d consecutive attempts without a session", cfg.MaxAvailabilityRetries)))
 					return exitNeedsHuman
 				}
 			} else {
@@ -1261,12 +1261,25 @@ func run(ctx context.Context, stdout, stderr io.Writer) int {
 				stateMessage = fmt.Sprintf("Your previous turn ended unexpectedly (opencode exited with status %d). Continue working toward the goal.", code)
 				continue
 			}
+			// The task-repair budget is spent. Repeated crashes with no
+			// provable task defect must not become a permanent Failed: a
+			// Failed run holds its claim and strands the work (#327). End
+			// on the recoverable availability-handoff channel — the same
+			// honest provider-unavailable verdict, never a quota claim —
+			// so fenced recovery can move the work to a healthy capacity.
+			// A canceled context is not provider trouble: it stays a plain
+			// Failed, since the operator chose to stop this run.
 			reason := fmt.Sprintf("opencode exited with status %d", code)
 			if continuations > 0 {
 				reason += fmt.Sprintf(" after %d continuations", continuations)
 			}
-			report.terminateCaptured(ctx, workspace, startCommit, failedWith(reason, terminalCategoryModelTransportError))
-			return exitFailed
+			if ctx.Err() != nil {
+				reason += " and the context was canceled"
+				report.terminateCaptured(ctx, workspace, startCommit, failedWith(reason, terminalCategoryModelTransportError))
+				return exitFailed
+			}
+			report.terminateCaptured(ctx, workspace, startCommit, report.availabilityRecoveryTermination(ctx, workspace, cfg, startCommit, code, reason))
+			return exitNeedsHuman
 		}
 
 		if workspace.Conflict != nil {
