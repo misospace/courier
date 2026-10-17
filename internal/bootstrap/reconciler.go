@@ -209,6 +209,7 @@ func desiredSpec(profile *Profile) courierv1alpha1.LaneProfileSpec {
 		Roles:         profile.Roles,
 		Framing:       profile.Framing,
 		CapacityGroup: profile.CapacityGroup,
+		Context:       profile.Context,
 		Resources:     profile.Resources,
 	}
 }

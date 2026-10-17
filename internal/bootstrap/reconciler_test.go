@@ -451,6 +451,43 @@ func TestReconcileAllCarriesResourcesOntoSpec(t *testing.T) {
 	assertResources(t, got.Spec.Resources, "750m", "2Gi", "4", "8Gi")
 }
 
+// TestReconcileAllCarriesContextOntoSpec pins the mirror direction for the
+// declared context budget (#295): what a profile configures is what the
+// managed LaneProfile carries, with nothing resolved on the way through.
+func TestReconcileAllCarriesContextOntoSpec(t *testing.T) {
+	kubeClient := newBootstrapClient(t)
+	provider := &staticProvider{profiles: []Profile{{
+		Name:  "local",
+		Roles: map[string]string{"coordinator": "claude-sonnet-4-5"},
+		Context: &courierv1alpha1.ContextPolicy{
+			CompactAtPercent:  60,
+			OutputReservation: 8192,
+			Roles: map[string]courierv1alpha1.ContextBudget{
+				"coder": {MaxInputTokens: 200000, OutputReservation: 24576},
+			},
+		},
+	}}}
+	r := &Reconciler{Client: kubeClient, Namespace: "courier", Provider: provider}
+	if err := r.ReconcileAll(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	var got courierv1alpha1.LaneProfile
+	if err := kubeClient.Get(context.Background(), client.ObjectKey{Namespace: "courier", Name: "local"}, &got); err != nil {
+		t.Fatal(err)
+	}
+	ctx := got.Spec.Context
+	if ctx == nil {
+		t.Fatal("spec.context is nil, want the declared policy")
+	}
+	if ctx.CompactAtPercent != 60 || ctx.OutputReservation != 8192 {
+		t.Fatalf("policy = %#v, want the declared fraction and reservation", ctx)
+	}
+	coder := ctx.Roles["coder"]
+	if coder.MaxInputTokens != 200000 || coder.OutputReservation != 24576 || coder.CompactAtPercent != 0 {
+		t.Fatalf("coder budget = %#v, want the declared ceiling and override with the fraction left inherited", coder)
+	}
+}
+
 type staticProvider struct {
 	profiles []Profile
 	err      error

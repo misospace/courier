@@ -4060,3 +4060,25 @@ was superseded.
   (#216) are unchanged; provisioning and the fence's own reads still use the
   cached client, because only the relaunch's delete and ceiling judgement are
   destructive decisions. (#370, #105, #223)
+- **2026-10-17 — #295: the per-role context budget is a declared CRD field;
+  the API carries declarations and resolves nothing.** `LaneProfileSpec`
+  gains an optional `context` policy — `compactAtPercent` (default 75, range
+  1–99), `outputReservation` (≥ 0), and `roles.<role>` entries declaring
+  `maxInputTokens` (≥ 1) with per-role overrides of the fraction and the
+  reservation — and `bootstrap.Profile` mirrors it with strict parsing and
+  the same bounds, so the harness policy finally has a declaration source.
+  One choice the parent left open is settled here: the per-role
+  `compactAtPercent` deliberately carries **no** CRD default while the
+  lane-wide one defaults to 75. A defaulted per-role percent would make
+  `compactAtPercent: 0` mean "75" instead of "inherit the lane policy", so a
+  role named under `roles` could no longer inherit a lane fraction other
+  than 75, and the all-zero entry that `ContextPolicy.declaresRole` (#296)
+  treats as declaring nothing could not exist through the API. The bootstrap
+  parser mirrors only the lane-level default, keeping the desired spec equal
+  to the server-defaulted spec so the reconciler never rewrites an unchanged
+  LaneProfile each pass. Resolution stays exactly where #243 put it:
+  `internal/harness` resolves declared values against gateway-verified
+  limits; no resolution, trigger, or preservation logic moved into the API.
+  Nothing yet populates `CoordinatorConfig.ContextBudgets` from the lane —
+  that population remains follow-up wiring and must key the map by declared
+  roles only, per #296's gate predicate. (#295, #243, #296)
