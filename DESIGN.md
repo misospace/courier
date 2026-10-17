@@ -3906,11 +3906,25 @@ was superseded.
   leave the untrusted executor running and the broker holding credentials until the
   retention window ended — a requeue loop traded for an unattended topology. A fence that
   fails releases the claim and retries rather than terminalizing; the legacy path needs
-  no fence, its failed create having left no pod behind. The probe pod joined the dry-run
+  no fence, because it terminalizes only once the coordinator slot is proven empty.
+  The probe pod joined the dry-run
   proof only on passes that create probes, so a deployment with no probe image can no
   longer fail a run whose probes are disabled, and the placeholder node name stays
   DNS-subdomain-shaped only because the real probe's name derives from the node — the API
   server does not validate `spec.nodeName` at all. (#356, PR #401 review)
+- **2026-10-17 — #356 amendment: the pod-admission class requires a proven-empty
+  coordinator slot.** The entry above claimed the legacy path needs no fence because a
+  failed create left no pod behind, which is true of that create and not of the slot. The
+  API server validates an object before its existence check, so a coordinator create on a
+  slot an earlier attempt of the same still-Claimed run already filled answers `Invalid`,
+  not `AlreadyExists`, and a live writer may be running there — the case the ambiguity check
+  on that path exists for. Terminalizing such a run as `NeedsHuman` takes it out from under
+  its own coordinator, which a `NeedsHuman` run never observes again and only the retention
+  window reaps, so the permanent class is now conditional on a proven-empty slot: the
+  launcher reads the slot uncached, and a pod sitting there (or an absence the read cannot
+  establish) returns the same stay-Claimed ambiguity result every other uncertain create
+  does, leaving the run to adopt its own live pod once the lane is fixed. One rule now
+  decides the slot for both outcomes. (#356, PR #401 review)
 - **2026-10-17 — #383: a pod-bound credential is read per request, never
   frozen.** Secure control read its projected broker-audience token once in
   `loadIdentity` and handed the byte slice to the capability, publication and
