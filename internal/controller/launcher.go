@@ -24,6 +24,11 @@ import (
 
 var (
 	ErrLauncherClientRequired = errors.New("coordinator launcher: client is required")
+	// ErrLauncherAPIReaderRequired is returned by Validate when the uncached
+	// API reader is unwired: the collision verification is a liveness check
+	// that gates PhaseRunning, so production use must fail fast at startup
+	// rather than silently falling back to cached state.
+	ErrLauncherAPIReaderRequired = errors.New("coordinator launcher: APIReader is required so the collision verification reads the API server directly and never falls back to cached state")
 	// ErrEvidenceConfiguration is returned when evidence intake is
 	// half-configured: the URL and the HMAC key must be set together, so a
 	// partial setup fails closed instead of minting tokens the intake cannot
@@ -76,9 +81,9 @@ type CoordinatorLauncher struct {
 	// that gates PhaseRunning, so it must see the API server's current
 	// state: a cached pod predating a deletion timestamp would resolve a
 	// terminating slot to a successful launch, the exact false-running
-	// transition #217 exists to prevent. The manager wiring injects it;
-	// when nil the collision read falls back to the cached client, which
-	// serves only direct-construction tests.
+	// transition #217 exists to prevent. Validate rejects a nil reader at
+	// production startup; when nil the collision read falls back to the
+	// cached client, which serves only direct-construction tests.
 	APIReader client.Reader
 	Scheme    *runtime.Scheme
 	Pod       executor.PodConfig
@@ -89,6 +94,20 @@ type CoordinatorLauncher struct {
 	// EvidenceKey is the HMAC key that signs the per-incarnation token
 	// minted in Launch.
 	EvidenceKey []byte
+}
+
+// Validate fails fast when the launcher is wired for production without an
+// uncached API reader, mirroring the reconciler's SetupWithManager guard:
+// a future wiring path that forgets the injection must not quietly
+// re-introduce the cached-view false-running risk #217 removed.
+// Direct-construction tests that omit the reader keep working through
+// Launch's runtime fallback; production wiring calls this at startup
+// instead.
+func (l *CoordinatorLauncher) Validate() error {
+	if l == nil || l.APIReader == nil {
+		return ErrLauncherAPIReaderRequired
+	}
+	return nil
 }
 
 // Launch implements LaunchFunc. The run is already Claimed when this method
@@ -246,9 +265,10 @@ func (l *CoordinatorLauncher) provisioningFailure(ctx context.Context, pod *core
 
 // collisionReader returns the reader the AlreadyExists collision
 // verification goes through, preferring the injected uncached API reader and
-// falling back to the cached client. Production wiring always injects the
-// API reader, so the fallback serves only direct-construction tests; the
-// liveness decision that gates PhaseRunning never runs against cached state.
+// falling back to the cached client. Validate rejects a nil API reader at
+// production startup, so the fallback serves only direct-construction tests;
+// the liveness decision that gates PhaseRunning never runs against cached
+// state in production.
 func (l *CoordinatorLauncher) collisionReader() client.Reader {
 	if l.APIReader != nil {
 		return l.APIReader
