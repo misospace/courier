@@ -111,9 +111,13 @@ func (l *CoordinatorLauncher) Validate() error {
 }
 
 // Launch implements LaunchFunc. The run is already Claimed when this method
-// is called, so a failed create is returned to the reconciler, which releases
-// the claim back to Pending. Phase transitions are the reconciler's to write
-// through the status contract; the launcher only creates the pod.
+// is called, so a transient failed create is returned to the reconciler, which
+// releases the claim back to Pending. A permanent, actionable deployment
+// failure — a rendered pod spec the API server rejects outright, with the
+// coordinator slot proven empty — returns a *SecureNeedsHumanError instead,
+// and the reconciler terminalizes the run from that class on this path.
+// Phase transitions are the reconciler's to write through the status contract;
+// the launcher only creates the pod.
 func (l *CoordinatorLauncher) Launch(ctx context.Context, run *courierv1alpha1.CoderRun) error {
 	if l == nil || l.Client == nil {
 		return ErrLauncherClientRequired
@@ -195,6 +199,25 @@ func (l *CoordinatorLauncher) Launch(ctx context.Context, run *courierv1alpha1.C
 		return nil
 	}
 	if !apierrors.IsAlreadyExists(err) {
+		if apierrors.IsInvalid(err) {
+			// The rendered spec itself is refused, and requeueing cannot
+			// change it: the lane configures something the API server
+			// rejects outright. The class is conditional on the slot, because
+			// validation runs before the API server's existence check: a slot
+			// an earlier attempt of this still-Claimed run already filled
+			// answers Invalid rather than AlreadyExists, and a live writer
+			// may occupy it. Terminalizing there would take the run out from
+			// under that writer — a NeedsHuman run is no longer observed —
+			// so the permanent class applies only to a slot proven empty.
+			// A Forbidden or quota denial stays an ordinary error — a quota
+			// or an RBAC grant can be raised later, so a requeue is the right
+			// answer there.
+			if !l.slotEmpty(ctx, pod) {
+				return ErrProvisioningInFlight
+			}
+			return secureNeedsHuman("PodAdmission",
+				"the API server rejected the coordinator pod %s: %v", pod.Name, err)
+		}
 		// A failed create is normally claim-safe, but an ambiguous failure
 		// (a timeout after the API server persisted the pod, or a pod left
 		// at the deterministic name by an earlier attempt of this still-
@@ -255,12 +278,20 @@ func (l *CoordinatorLauncher) Launch(ctx context.Context, run *courierv1alpha1.C
 // may be live, so the failure surfaces as ErrProvisioningInFlight and the
 // run stays Claimed instead of racing a live coordinator for ownership.
 func (l *CoordinatorLauncher) provisioningFailure(ctx context.Context, pod *corev1.Pod, cause error) error {
-	var existing corev1.Pod
-	err := l.collisionReader().Get(ctx, client.ObjectKey{Namespace: pod.Namespace, Name: pod.Name}, &existing)
-	if apierrors.IsNotFound(err) {
+	if l.slotEmpty(ctx, pod) {
 		return cause
 	}
 	return ErrProvisioningInFlight
+}
+
+// slotEmpty reports whether the coordinator slot is proven empty through the
+// uncached reader. A pod sitting at the name, and an absence the read cannot
+// establish at all, both count as occupied: a writer may be live, so the
+// caller must not release the claim or terminalize the run.
+func (l *CoordinatorLauncher) slotEmpty(ctx context.Context, pod *corev1.Pod) bool {
+	var existing corev1.Pod
+	err := l.collisionReader().Get(ctx, client.ObjectKey{Namespace: pod.Namespace, Name: pod.Name}, &existing)
+	return apierrors.IsNotFound(err)
 }
 
 // collisionReader returns the reader the AlreadyExists collision
