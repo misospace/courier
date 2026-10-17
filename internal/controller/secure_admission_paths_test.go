@@ -133,9 +133,10 @@ func TestPreflightDryRunProofCoversEveryCreatedPod(t *testing.T) {
 
 // rejectProbeDryRun rejects only the probe pod's dry-run proof — the spec the
 // live probe phase creates outside the proof loop. Only the probe's
-// deterministic name is read here, so the sizing it renders with is arbitrary.
+// deterministic name is read here, so the render must produce the same name the
+// proof created.
 func rejectProbeDryRun(control *SecureControl, run *courier.CoderRun) func(string) error {
-	probe := topology.ProbePod(run, "dry-run-node", control.Config.ProbeImage, "true", courier.DefaultPodResources())
+	probe := topology.ProbePod(run, "dry-run-node", control.Config.ProbeImage, "true")
 	dryRun := probe.Name + "-dryrun"
 	return func(name string) error {
 		if name == dryRun {

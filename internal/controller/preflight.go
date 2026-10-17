@@ -274,7 +274,7 @@ func (s *SecureControl) checkDryRuns(ctx context.Context, run *courier.CoderRun,
 		// that must exist — but it has to stay DNS-subdomain-shaped anyway,
 		// because the live probe's deterministic name derives from the
 		// node's.
-		pods = append(pods, topology.ProbePod(run, "dry-run-node", s.Config.ProbeImage, "true", resources))
+		pods = append(pods, topology.ProbePod(run, "dry-run-node", s.Config.ProbeImage, "true"))
 	}
 
 	for _, pod := range pods {
