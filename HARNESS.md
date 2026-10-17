@@ -505,7 +505,13 @@ paths share acceptance, not implementation.
     wrong-base, draft, ambiguous, or closed-or-merged-only world
     to `NeedsHuman` with the precise state, but it does not itself
     check linkage; the controller's `Verifying` observation settles
-    what that early handoff leaves open.)
+    what that early handoff leaves open.) That controller observation
+    reads its own head listing through the same identity-checked
+    capability (#365): a record whose base or head repository identity
+    differs from the run's — a same-owner fork claiming `owner:branch`
+    — or one carrying no repository identity at all fails the poll
+    closed and requeues, so another repository's pull request is never
+    published as this run's state.
   The repair instruction names the trusted identity, the supported
   closing keywords, the bare and cross-repo forms, and the
   existing PR number so the model can fix the body
