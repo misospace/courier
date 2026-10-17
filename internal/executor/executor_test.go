@@ -16,6 +16,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	courierv1alpha1 "github.com/misospace/courier/api/v1alpha1"
+	"github.com/misospace/courier/internal/broker/grammar"
 	courierlog "github.com/misospace/courier/internal/log"
 )
 
@@ -701,8 +702,10 @@ func TestGoalNamesRunBranchAsOnlyPublicationTarget(t *testing.T) {
 // reference and then has to learn the block shape from a repair turn
 // burns one of the bounded #170 continuations on format drift, so the
 // goal names the header, the row shape, the per-status vocabulary, and
-// the per-status reference rule. The fix-pr goal is unchanged — the
-// body contract is the model's responsibility to repair from the
+// the per-status reference rule. Those fragments are asserted against the
+// grammar leaf's own exports, so this test cannot pass on a stale copy of
+// the grammar the goal happens to embed (#375). The fix-pr goal is unchanged —
+// the body contract is the model's responsibility to repair from the
 // existing PR feedback, not a fresh authoring step.
 func TestGoalCarriesPublicationBlockGrammar(t *testing.T) {
 	resolve := &courierv1alpha1.CoderRun{
@@ -717,19 +720,18 @@ func TestGoalCarriesPublicationBlockGrammar(t *testing.T) {
 	}
 	for _, fragment := range []string{
 		"COURIER_CRITERIA",
-		"courier-criteria:v1 source=",
-		"set=sha256:",
-		"coverage=full|partial",
-		"- AC-<n> sha256:<64hex>: <status> - <reference>",
-		"implementation-evidence",
-		"regression-check",
-		"manual-verification",
-		"not-implemented",
-		"regression-check and implementation-evidence must cite a file path or check URL",
-		"manual-verification and not-implemented must carry a note",
+		grammar.CriteriaHeaderGrammar(),
+		grammar.CriteriaRowGrammar(),
+		grammar.StatusVocabularySentence(),
+		grammar.StatusReferenceRuleSentence(),
 	} {
 		if !strings.Contains(goal, fragment) {
 			t.Fatalf("resolve-issue goal missing publication-block grammar fragment %q in: %q", fragment, goal)
+		}
+	}
+	for _, status := range grammar.StatusVocabulary() {
+		if !strings.Contains(goal, string(status)) {
+			t.Fatalf("resolve-issue goal missing status %q in: %q", status, goal)
 		}
 	}
 
@@ -743,7 +745,7 @@ func TestGoalCarriesPublicationBlockGrammar(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Goal(fix-pr) error = %v", err)
 	}
-	if strings.Contains(fixGoal, "courier-criteria:v1 source=") {
+	if strings.Contains(fixGoal, grammar.CriteriaHeaderGrammar()) || strings.Contains(fixGoal, "COURIER_CRITERIA") {
 		t.Fatalf("fix-pr goal should not carry publication-block grammar; the body contract is read from the existing PR: %q", fixGoal)
 	}
 }

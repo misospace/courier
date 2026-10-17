@@ -34,6 +34,7 @@ import (
 
 	courierv1alpha1 "github.com/misospace/courier/api/v1alpha1"
 	"github.com/misospace/courier/internal/broker"
+	"github.com/misospace/courier/internal/broker/grammar"
 	"github.com/misospace/courier/internal/evidence"
 	"github.com/misospace/courier/internal/executor"
 	"github.com/misospace/courier/internal/forge"
@@ -2362,23 +2363,25 @@ func linkageRepairMessage(source broker.SourceIssue, outcome *handoffCheckOutcom
 // it must satisfy, and the continuation budget. The vocabulary is
 // composed verbatim from the broker error's reason (which
 // describeCriteriaFailure built) so any change to the validator's
-// vocabulary surfaces in both paths. The required shape rules echo
-// the documented header and per-status rules from criteria.go so the
-// model can repair the body without re-deriving the contract.
+// vocabulary surfaces in both paths. The header shape, row shape,
+// status vocabulary, and per-status rules are rendered from the broker's
+// validator (criteria.go) rather than restated, so the model can repair
+// the body without re-deriving the contract.
 func criteriaRepairMessage(source broker.SourceIssue, outcome *handoffCheckOutcome, continuation, maxContinuations int) string {
 	target := sourceIssueTarget(source)
 	reason := describeCriteriaFailureForRepair(outcome.criteriaErr)
 	setDigest, criteriaLines := pinnedSetRepairSnippet(outcome.pinnedSet, outcome.criteria)
 	return fmt.Sprintf(
 		"Courier refused the handoff: PR #%d's body does not satisfy the criterion-evidence contract pinned at admission for %s (pinned set %s): %s. "+
-			"Update the PR body through the forge capability so it carries the criterion-evidence block: a single line starting with %q followed by %q, then one %q row per pinned criterion (each row's digest must match the pinned criterion digest below), each carrying a closed status from the vocabulary implementation-evidence, regression-check, manual-verification, not-implemented, or unknown, with regression-check and implementation-evidence referencing a file path or check URL and manual-verification and not-implemented referencing a note. Pinned criteria: %s. "+
+			"Update the PR body through the forge capability so it carries the criterion-evidence block: a single line starting with %q followed by one %q row per pinned criterion (each row's digest must match the pinned criterion digest below), each carrying a closed status from the vocabulary %s; %s. Pinned criteria: %s. "+
 			"Then re-declare the same outcome. (continuation %s)",
 		outcome.pr.Number, target,
 		nonEmptyOr(setDigest, "the admitted set"),
 		reason,
-		"courier-criteria:v1 source="+strings.ToLower(source.Canonical())+"#"+strconv.Itoa(source.Number),
-		"set=sha256:<64hex> coverage=full|partial",
-		"- AC-<n> sha256:<64hex>: <status> - <reference>",
+		grammar.CriteriaHeaderShape(strings.ToLower(source.Canonical())+"#"+strconv.Itoa(source.Number)),
+		grammar.CriteriaRowGrammar(),
+		grammar.StatusVocabularySentence(),
+		grammar.StatusReferenceRuleSentence(),
 		nonEmptyOr(criteriaLines, "(no pinned criteria on this run)"),
 		continuationBudget(continuation, maxContinuations),
 	)
