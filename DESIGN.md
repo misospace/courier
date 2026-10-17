@@ -3603,3 +3603,26 @@ was superseded.
   is tracked separately; this is the worker half of the process-group
   cancellation the executor already performs (#115), for a different caller.
   (#372)
+- **2026-10-17 — #370: the secure broken-topology relaunch decides from the
+  live world, and deletes the control pod it observed.**
+  #223 gave `SecureControl.fenceAndRelaunch` the legacy paths' post-delete live
+  re-confirmation but left the two decisions in front of it reading the cached
+  manager client: the control pod came from an informer list and the delete
+  carried no precondition, so a control pod replaced between that cached read
+  and the delete was deleted by name; and the crashloop ceiling was judged from
+  the reconcile's possibly stale `run.Status.Restarts` in the same function that
+  takes a live read for the other judgement, so a stale-low counter let one
+  relaunch through past the configured ceiling and a stale-high one handed a
+  recoverable run to a human. The path now reads the run through the uncached
+  reader and acts on that object — a failed read, a changed run incarnation, a
+  live phase this path no longer owns, and a deleting run all re-observe
+  rather than charge, and the charge therefore lands on the world's counter
+  plus one — and reads the control pod through the same reader
+  (`SecureControl.podLive`, over the unchanged component filter) before
+  deleting it with the observed UID as a precondition, so a conflict is a
+  bounded re-observation and never a name delete or a charge. The post-delete
+  re-confirmation, the ceiling hand-off's preservation of inert evidence, the
+  in-place charge for a recoverable object, and the shared configured ceiling
+  (#216) are unchanged; provisioning and the fence's own reads still use the
+  cached client, because only the relaunch's delete and ceiling judgement are
+  destructive decisions. (#370, #105, #223)
