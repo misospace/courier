@@ -3470,9 +3470,9 @@ was superseded.
   not starved inside the shared probe context; the session loop and its
   consumption of `CoordinatorConfig.ContextBudgets` are #297's, already in
   flight on its own branch, as is the step-boundary enforcement and the
-  `session.compacted` emitter. The capability is `Required` only on a positive
-  declaration — a global fraction or reservation or a positive per-role
-  ceiling — so a lane that declared nothing, including one whose config carries
+  `session.compacted` emitter.   The capability is `Required` only on a positive
+  declaration — a global fraction or reservation, a positive per-role
+  ceiling, or a nonzero per-role override of either — so a lane that declared nothing, including one whose config carries
   an all-zero per-role entry, merely proceeds degraded, while a declared budget
   whose capacity cannot be established fails the gate closed; a `configured`
   budget never gates. A failed gateway read reaches the table as the
@@ -3484,7 +3484,9 @@ was superseded.
   instead of silently disabling that role's capacity management. The predicate
   that defines "declared" is settled here so no second rule can drift from it:
   `ContextPolicy.declaresRole` holds a role declared only when the lane declares
-  a positive value for it — a per-role `maxInputTokens`, or a global
+  a usable value for it — a per-role `maxInputTokens`, a nonzero per-role
+  `compactAtPercent`/`outputReservation` override (both are honored by
+  resolution, so both declare), or a global
   `compactAtPercent`/`outputReservation` — and an all-zero per-role entry
   declares nothing. An undeclared role is `configured` or `unavailable` but
   never `Required` and never gates; whoever populates

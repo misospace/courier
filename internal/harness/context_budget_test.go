@@ -531,6 +531,30 @@ func TestContextPolicyRoleBudgetTruthTable(t *testing.T) {
 			wantErr: ErrNoContextCapacity,
 		},
 		{
+			name: "a per-role compact override alone is declared and fails closed without a limit",
+			policy: ContextPolicy{Roles: map[string]RoleContextPolicy{
+				"coordinator": {CompactAtPercent: 80},
+			}},
+			probed:  0,
+			wantErr: ErrNoContextCapacity,
+		},
+		{
+			name: "a per-role reservation override alone is declared and fails closed without a limit",
+			policy: ContextPolicy{Roles: map[string]RoleContextPolicy{
+				"coordinator": {OutputReservation: 512},
+			}},
+			probed:  0,
+			wantErr: ErrNoContextCapacity,
+		},
+		{
+			name: "per-role overrides with a verified limit resolve at that limit",
+			policy: ContextPolicy{Roles: map[string]RoleContextPolicy{
+				"coordinator": {CompactAtPercent: 80, OutputReservation: 512},
+			}},
+			probed:    128000,
+			wantState: StateHealthy, wantLimit: 128000,
+		},
+		{
 			name:      "an undeclared lane has no budget and no error",
 			policy:    ContextPolicy{},
 			probed:    0,
@@ -740,6 +764,63 @@ func TestContextBudgetProbeFailureClassification(t *testing.T) {
 		}
 		if !failed.AllRetryable() {
 			t.Fatalf("gate failure = %v, want every failure retryable", gateErr)
+		}
+		assertShortBudgetDetails(t, caps)
+	})
+}
+
+// TestContextBudgetPerRoleOverrideIsDeclared pins that a per-role
+// compactAtPercent/outputReservation override is a declaration on its own:
+// forRole honors it, so declaresRole must too, or an explicitly configured
+// role is silently treated as undeclared and never gets compaction.
+func TestContextBudgetPerRoleOverrideIsDeclared(t *testing.T) {
+	t.Run("each override alone with a failed read is required and fails the gate", func(t *testing.T) {
+		gateway, _, cleanup := modelInfoGateway(t, func(w http.ResponseWriter, _ *http.Request) {
+			w.WriteHeader(http.StatusServiceUnavailable)
+		})
+		defer cleanup()
+		for _, policy := range []ContextPolicy{
+			{Roles: map[string]RoleContextPolicy{"coordinator": {CompactAtPercent: 80}}},
+			{Roles: map[string]RoleContextPolicy{"coordinator": {OutputReservation: 512}}},
+		} {
+			deps := budgetProbeDeps(gateway)
+			deps.Context = policy
+			caps := ProbeCapabilities(context.Background(), deps)
+			capability, ok := findCapability(caps, "context-budget:coordinator")
+			if !ok {
+				t.Fatalf("capability table = %+v", caps)
+			}
+			if capability.State != StateUnavailable || !capability.Required || !capability.Retryable {
+				t.Fatalf("override with a 503 read = %+v, want a required retryable unavailability", capability)
+			}
+			_, gateErr := Gate(caps)
+			var failed *GateError
+			if !errors.As(gateErr, &failed) {
+				t.Fatalf("gate error = %v, want *GateError", gateErr)
+			}
+			if !failed.AllRetryable() {
+				t.Fatalf("gate failure = %v, want every failure retryable", gateErr)
+			}
+			assertShortBudgetDetails(t, caps)
+		}
+	})
+
+	t.Run("overrides with a verified limit are healthy and required", func(t *testing.T) {
+		gateway, _, cleanup := modelInfoGateway(t, servingModelInfo(
+			`{"data":[{"model_name":"test/coordinator","model_info":{"max_input_tokens":128000}}]}`))
+		defer cleanup()
+		deps := budgetProbeDeps(gateway)
+		deps.Context = ContextPolicy{Roles: map[string]RoleContextPolicy{
+			"coordinator": {CompactAtPercent: 80, OutputReservation: 512},
+		}}
+
+		caps := ProbeCapabilities(context.Background(), deps)
+		capability, ok := findCapability(caps, "context-budget:coordinator")
+		if !ok || capability.State != StateHealthy || !capability.Required {
+			t.Fatalf("overrides with a verified limit = %+v, want healthy and required", capability)
+		}
+		if _, err := Gate(caps); err != nil {
+			t.Fatalf("gate = %v, want the declared override to pass", err)
 		}
 		assertShortBudgetDetails(t, caps)
 	})

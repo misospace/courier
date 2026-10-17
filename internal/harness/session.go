@@ -98,14 +98,17 @@ func (p ContextPolicy) forRole(role string) ContextBudgetInput {
 
 // declaresRole answers whether the lane declared a usable context policy for
 // this role — the predicate that makes a role required at the capability gate:
-// a global fraction or reservation, or a positive per-role ceiling. It is
-// deliberately broader than "the lane named this role": a global fraction
-// covers every bound role without naming it. An all-zero per-role entry
-// declares nothing — a config-shaped `roles: {coder: {}}` must not read as a
-// declared budget — so an undeclared lane is merely degraded and never gated
-// by a policy it never opted into.
+// a global fraction or reservation, a positive per-role ceiling, or a nonzero
+// per-role override of either. It is deliberately broader than "the lane named
+// this role": a global fraction covers every bound role without naming it, and
+// an override is a declaration because forRole honors it. An all-zero
+// per-role entry declares nothing — a config-shaped `roles: {coder: {}}` must
+// not read as a declared budget — so an undeclared lane is merely degraded and
+// never gated by a policy it never opted into.
 func (p ContextPolicy) declaresRole(role string) bool {
-	return p.CompactAtPercent != 0 || p.OutputReservation != 0 || p.Roles[role].MaxInputTokens > 0
+	declared := p.Roles[role]
+	return p.CompactAtPercent != 0 || p.OutputReservation != 0 ||
+		declared.MaxInputTokens > 0 || declared.CompactAtPercent != 0 || declared.OutputReservation != 0
 }
 
 // RoleBudget resolves one role's context budget from the lane's declaration
