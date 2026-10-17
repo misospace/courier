@@ -54,7 +54,7 @@ govulncheck: ## Run the Go vulnerability scanner.
 	govulncheck ./...
 
 .PHONY: ci-gating-test
-ci-gating-test: ## Run the image-gating classifier/aggregator truth table.
+ci-gating-test: ## Run the image-gating truth table and the Docker build-context guard.
 	bash hack/test-ci-images-gating.sh
 
 ##@ Build

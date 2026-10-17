@@ -33,6 +33,14 @@ func hardenedEnv() []string {
 // repository, bundle, or transport content, and callers classify failures
 // with fixed categories. Arguments must be assembled entirely from trusted
 // values; no request text or model-controlled string may reach this boundary.
+//
+// This package does not sanitize. A caller holding text that originated
+// outside the trust boundary — the courier-executor probing whether a path
+// a pull-request body cited exists at the published head (#367), which
+// extracts a restricted charset from the body and roots it against the
+// commit's top-level entries before building the argv here — owns that
+// sanitization, and this comment records that the exception is the
+// caller's to justify, not a license to pass arbitrary text.
 func Hardened(ctx context.Context, directory string, args ...string) ([]byte, error) {
 	stdout, _, err := hardened(ctx, directory, nil, args)
 	return stdout, err

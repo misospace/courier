@@ -10,6 +10,7 @@ import (
 	"io"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 
 	courier "github.com/misospace/courier/api/v1alpha1"
@@ -102,20 +103,58 @@ type BrokerClient struct {
 	TokenSource BrokerTokenSource
 	CA          []byte
 	HTTP        *http.Client
+
+	// mu guards owned, the client built once and shared by every request
+	// this BrokerClient makes for itself, so repeated calls reuse one idle
+	// connection pool.
+	mu    sync.Mutex
+	owned *http.Client
 }
+
+// Idle bounds on the transport a broker client builds for itself. The pool
+// lives as long as the client; the bounds keep idle sockets and their
+// read-loop goroutines from accumulating between requests.
+const (
+	brokerMaxIdleConns        = 4
+	brokerMaxIdleConnsPerHost = 4
+	brokerIdleConnTimeout     = 90 * time.Second
+)
 
 func (b *BrokerClient) transport() (*http.Client, error) {
 	if b.HTTP != nil {
 		return b.HTTP, nil
 	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.owned != nil {
+		return b.owned, nil
+	}
 	pool := x509.NewCertPool()
 	if !pool.AppendCertsFromPEM(b.CA) {
 		return nil, &BrokerCallError{Category: "CA is unreadable"}
 	}
-	return &http.Client{
-		Timeout:   5 * time.Minute,
-		Transport: &http.Transport{TLSClientConfig: &tls.Config{RootCAs: pool, ServerName: hostOnly(b.BaseURL), MinVersion: tls.VersionTLS13}},
-	}, nil
+	b.owned = &http.Client{
+		Timeout: 5 * time.Minute,
+		Transport: &http.Transport{
+			TLSClientConfig:     &tls.Config{RootCAs: pool, ServerName: hostOnly(b.BaseURL), MinVersion: tls.VersionTLS13},
+			MaxIdleConns:        brokerMaxIdleConns,
+			MaxIdleConnsPerHost: brokerMaxIdleConnsPerHost,
+			IdleConnTimeout:     brokerIdleConnTimeout,
+		},
+	}
+	return b.owned, nil
+}
+
+// CloseIdleConnections releases the idle pool of the transport this client
+// built for itself. A supplied HTTP client belongs to whoever supplied it:
+// this never touches it.
+func (b *BrokerClient) CloseIdleConnections() {
+	b.mu.Lock()
+	owned := b.owned
+	b.mu.Unlock()
+	if owned != nil {
+		owned.CloseIdleConnections()
+	}
 }
 
 func (b *BrokerClient) do(ctx context.Context, method, path string, headers map[string]string, body []byte) (*http.Response, error) {

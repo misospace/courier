@@ -116,9 +116,12 @@ type SecureControl struct {
 	// pod-loss paths (#216). Zero falls back to the package default.
 	MaxRestarts int
 	// APIReader reads the API server directly, bypassing the informer
-	// cache, so the broken-topology relaunch's post-delete
-	// re-confirmation never trusts a lagging cache (§6). Nil falls back
-	// to Client, which serves only direct-construction tests.
+	// cache, so every destructive decision on the broken-topology relaunch
+	// path is made against the world rather than a lagging cache (§6): the
+	// post-delete re-confirmation, the run read the crashloop ceiling is
+	// judged from, and the control-pod read whose delete carries the
+	// observed UID as a precondition. Nil falls back to Client, which serves
+	// only direct-construction tests.
 	APIReader client.Reader
 }
 
@@ -129,11 +132,12 @@ func (s *SecureControl) now() time.Time {
 	return time.Now()
 }
 
-// reader returns the reader the secure path's live re-confirmations go
-// through, preferring the injected API reader and falling back to the cached
-// client. Wired from the manager in production, so the fallback serves only
-// direct-construction tests and the post-delete confirmation never runs
-// against cached state.
+// reader returns the reader the secure path's live reads go through — the
+// post-delete re-confirmation and the run and control-pod reads behind the
+// broken-topology relaunch's destructive decisions — preferring the injected
+// API reader and falling back to the cached client. Wired from the manager in
+// production, so the fallback serves only direct-construction tests and no
+// destructive decision is made against cached state.
 func (s *SecureControl) reader() client.Reader {
 	if s.APIReader != nil {
 		return s.APIReader

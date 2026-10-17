@@ -7,7 +7,7 @@ import Base from "../layouts/Base.astro";
   active="/courier"
 >
   <section class="hero">
-    <span class="badge warn">bootstrap MVP</span>
+    <span class="badge warn">functional end to end</span>
     <h1>Courier</h1>
     <p class="sub">
       A Kubernetes operator that runs autonomous coding <em>coordinators</em> in
@@ -56,10 +56,15 @@ import Base from "../layouts/Base.astro";
   <section class="section">
     <h2>Status</h2>
     <p class="lede">
-      Bootstrap MVP: Courier can admit a <code>CoderRun</code>, claim its source
-      work, derive or adopt a branch, launch the temporary OpenCode coordinator,
-      and map the completed pod back to review or needs-human state. The
-      resumable custom harness and liveness recovery are later work.
+      Courier is functional end to end: it can admit a <code>CoderRun</code>,
+      claim its source work, derive or adopt a branch, launch a coordinator,
+      and map the completed pod back to review or needs-human state. The legacy
+      single-pod OpenCode coordinator remains the default and is explicitly
+      insecure; the resumable native harness has landed as an opt-in
+      deployment-level secure mode (<code>--secure-mode</code>), with the native
+      path's forge reads and PR creation still open (#127). Liveness recovery —
+      heartbeat liveness window, crashloop ceiling, and terminal reaping — is
+      implemented.
     </p>
   </section>
 </Base>

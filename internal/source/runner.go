@@ -370,11 +370,15 @@ func (r *Runner) identity(workItemID string) string {
 
 // settledCapacityExhaustion is the sole history state that permits discovery
 // past the semantic identity barrier. Incomplete, negative, or human-marked
-// settlement records remain barriers.
+// settlement records remain barriers. Both recoverable categories count —
+// a confirmed quota exhaustion and an availability handoff
+// (provider-unavailable, #327) settle through the same fenced channel, and a
+// settled outage run must not strand the work item forever.
 func settledCapacityExhaustion(run *courierv1alpha1.CoderRun) bool {
 	if run.Status.Phase != courierv1alpha1.PhaseBlockedExternal ||
 		run.Status.TerminalDiagnostic == nil ||
-		run.Status.TerminalDiagnostic.Category != courierv1alpha1.TerminalDiagnosticCategoryCapacityExhaustion {
+		(run.Status.TerminalDiagnostic.Category != courierv1alpha1.TerminalDiagnosticCategoryCapacityExhaustion &&
+			run.Status.TerminalDiagnostic.Category != courierv1alpha1.TerminalDiagnosticCategoryProviderUnavailable) {
 		return false
 	}
 	recovery := apimeta.FindStatusCondition(run.Status.Conditions, courierv1alpha1.ConditionCapacityRecovery)
