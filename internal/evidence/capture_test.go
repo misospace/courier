@@ -749,7 +749,10 @@ func TestReadCappedAbandonedOnCancel(t *testing.T) {
 // TestCaptureReadPhaseBoundedByDeadline is the issue #390 regression: a read
 // phase that stalls past the operation deadline must fail the capture with the
 // context's error and no bundle, so the executor's manifest-only degradation
-// is reachable instead of the capture running on to SIGKILL.
+// is reachable instead of the capture running on to SIGKILL. It pins the
+// Capture-side half, where the swapped seam stands in for the stalled read;
+// readCapped's own bounding of that read is covered by
+// TestReadCappedAbandonedOnCancel.
 func TestCaptureReadPhaseBoundedByDeadline(t *testing.T) {
 	// Not parallel: the test replaces a package-level seam that parallel
 	// captures share.
@@ -758,9 +761,9 @@ func TestCaptureReadPhaseBoundedByDeadline(t *testing.T) {
 
 	original := readFileForCapture
 	t.Cleanup(func() { readFileForCapture = original })
-	// reading proves the capture reached the read phase rather than losing the
-	// deadline earlier, in git status, where a kill would not wrap
-	// DeadlineExceeded and this test would fail for the wrong reason.
+	// reading proves the capture reached the read phase, so the deadline this
+	// test observes belongs to the read phase rather than having been lost
+	// earlier, in git status, before the bound was ever exercised.
 	reading := make(chan struct{})
 	var entered sync.Once
 	readFileForCapture = func(ctx context.Context, path string, limit int) ([]byte, error) {
@@ -775,9 +778,12 @@ func TestCaptureReadPhaseBoundedByDeadline(t *testing.T) {
 		bundle *Bundle
 		err    error
 	}
-	// Wide enough that the enumerated git status comfortably fits before the
-	// deadline, so the deadline the test observes is the read phase's.
-	ctx, cancel := context.WithTimeout(context.Background(), 250*time.Millisecond)
+	// The budget is capture-wide, so it must also cover the pre-read git status
+	// fork/exec, the one part of the phase this test does not control; losing it
+	// there would fail the test on a stall it never intended to measure. Widened
+	// from 250ms to leave generous headroom on a -race CI runner, while the guard
+	// below still fails fast if the bound is lost.
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	result := make(chan captureResult, 1)
 	go func() {
@@ -787,19 +793,19 @@ func TestCaptureReadPhaseBoundedByDeadline(t *testing.T) {
 
 	select {
 	case got := <-result:
+		select {
+		case <-reading:
+		default:
+			t.Fatal("capture never entered the read phase, so it did not exercise the bound")
+		}
 		if !errors.Is(got.err, context.DeadlineExceeded) {
 			t.Fatalf("capture err = %v, want context.DeadlineExceeded", got.err)
 		}
 		if got.bundle != nil {
 			t.Errorf("capture returned a bundle alongside a deadline abort, want nil so the caller degrades to manifest-only")
 		}
-		select {
-		case <-reading:
-		default:
-			t.Fatal("capture never entered the read phase, so it did not exercise the bound")
-		}
 	case <-time.After(10 * time.Second):
-		t.Fatal("capture did not return within 10s of the read phase stalling")
+		t.Fatal("capture did not return within 10s")
 	}
 }
 
