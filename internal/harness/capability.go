@@ -181,9 +181,16 @@ func (b *BrokerProbeClient) Capabilities(ctx context.Context) (*BrokerCapabiliti
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
+		// A 401 follows the same per-request rule as the work-path clients:
+		// refused bytes the projection has since replaced are the kubelet
+		// swap window, retryable; unchanged bytes, or a projection the
+		// re-read cannot read, are a credential the broker's verdict on
+		// stands, which must stay loud at the launch gate.
+		retryable := resp.StatusCode >= 500 ||
+			(resp.StatusCode == http.StatusUnauthorized && rotatedUnder(b.TokenSource, token))
 		return nil, &BrokerProbeError{
 			Msg:       fmt.Sprintf("broker rejected the authenticated capabilities read with status %d", resp.StatusCode),
-			Retryable: resp.StatusCode >= 500,
+			Retryable: retryable,
 		}
 	}
 	body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
