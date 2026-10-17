@@ -977,8 +977,14 @@ the original operation. A cancellation tombstone is
 accepted even if it arrives before dispatch. If cancel precedes dispatch, the worker tombstones the ID and must never run
 that dispatch. A tombstone is final for its `opID`: any later dispatch or
 retry with that ID is rejected, regardless of arrival order; new work gets a
-fresh `opID` after termination is confirmed. The worker acknowledges cancellation
-only after verified process termination (or confirmation it never started); only then may trusted control clear
+fresh `opID` after termination is confirmed. Each task leads its own process
+group, so cancellation terminates the task's whole tree — the tasks that reach
+the worker are `sh -c ...`, whose real work runs in descendants — and the
+worker acknowledges cancellation only after it has proven that no live process
+remains in that group (or confirmation it never started). Work that leaves the
+group cannot be proven gone, so it is reported as unverified rather than
+acknowledged, and trusted control keeps the operation's active status until
+termination is verified. Only then may trusted control clear
 active-operation status. A replacement worker (new pod UID) that never saw
 that `opID` treats a late cancel as unknown data and runs nothing; the
 authoritative termination of a fenced stale worker is the operator's pod kill,
