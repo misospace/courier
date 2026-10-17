@@ -218,7 +218,7 @@ func (f *brokerFixture) rebuiltBroker() *BrokerClient {
 	}
 	httpServer := httptest.NewServer(server.Handler())
 	f.t.Cleanup(httpServer.Close)
-	return &BrokerClient{BaseURL: httpServer.URL, Token: []byte("valid-token"), HTTP: httpServer.Client()}
+	return &BrokerClient{BaseURL: httpServer.URL, TokenSource: NewStaticBrokerTokenSource([]byte("valid-token")), HTTP: httpServer.Client()}
 }
 
 func newBrokerFixture(t *testing.T) *brokerFixture {
@@ -313,7 +313,7 @@ func newBrokerFixtureWithWorkRef(t *testing.T, existingWorkRef bool) *brokerFixt
 }
 
 func (f *brokerFixture) client() *BrokerClient {
-	return &BrokerClient{BaseURL: f.server.URL, Token: []byte("valid-token"), HTTP: f.server.Client()}
+	return &BrokerClient{BaseURL: f.server.URL, TokenSource: NewStaticBrokerTokenSource([]byte("valid-token")), HTTP: f.server.Client()}
 }
 
 // remoteWorkTip reads the live work ref tip from the bare remote.
@@ -736,7 +736,7 @@ func seedTipEngine(t *testing.T, client *BrokerClient) *PublicationEngine {
 // Publish proposes something beyond the tip.
 func denialEngine(t *testing.T, server *httptest.Server) *PublicationEngine {
 	t.Helper()
-	engine := seedTipEngine(t, &BrokerClient{BaseURL: server.URL, Token: []byte("x"), HTTP: server.Client()})
+	engine := seedTipEngine(t, &BrokerClient{BaseURL: server.URL, TokenSource: NewStaticBrokerTokenSource([]byte("x")), HTTP: server.Client()})
 	writeFile(t, filepath.Join(engine.tree.Dir, "z.txt"), "z\n")
 	gitCmd(t, engine.tree.Dir, "add", "z.txt")
 	gitCommit(t, engine.tree.Dir, "work")
@@ -754,7 +754,7 @@ func TestPublicationSeedTipConfirmClassification(t *testing.T) {
 			http.Error(w, "operation denied", http.StatusUnprocessableEntity)
 		}))
 		defer server.Close()
-		engine := seedTipEngine(t, &BrokerClient{BaseURL: server.URL, Token: []byte("x"), HTTP: server.Client()})
+		engine := seedTipEngine(t, &BrokerClient{BaseURL: server.URL, TokenSource: NewStaticBrokerTokenSource([]byte("x")), HTTP: server.Client()})
 		_, err := engine.Publish(context.Background())
 		var blocked *PublicationBlockedError
 		if !errors.As(err, &blocked) {
@@ -766,7 +766,7 @@ func TestPublicationSeedTipConfirmClassification(t *testing.T) {
 			http.Error(w, "unavailable", http.StatusServiceUnavailable)
 		}))
 		defer server.Close()
-		engine := seedTipEngine(t, &BrokerClient{BaseURL: server.URL, Token: []byte("x"), HTTP: server.Client()})
+		engine := seedTipEngine(t, &BrokerClient{BaseURL: server.URL, TokenSource: NewStaticBrokerTokenSource([]byte("x")), HTTP: server.Client()})
 		_, err := engine.Publish(context.Background())
 		var transient *TransientPublicationError
 		if !errors.As(err, &transient) {

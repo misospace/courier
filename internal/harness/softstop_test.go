@@ -473,7 +473,7 @@ func TestBrokerClientControlRequest(t *testing.T) {
 		fmt.Fprint(w, string(body))
 	}))
 	defer server.Close()
-	client := &BrokerClient{BaseURL: server.URL, Token: []byte("tok"), HTTP: server.Client()}
+	client := &BrokerClient{BaseURL: server.URL, TokenSource: NewStaticBrokerTokenSource([]byte("tok")), HTTP: server.Client()}
 	got, err := client.ControlRequest(context.Background())
 	if err != nil || got == nil || got.ID != "req-9" || got.TargetPodUID != "pod-uid-live" {
 		t.Fatalf("read = %+v, err = %v, want the record", got, err)
@@ -485,7 +485,7 @@ func TestBrokerClientControlRequestAbsentIsNotError(t *testing.T) {
 		w.WriteHeader(http.StatusNotFound)
 	}))
 	defer server.Close()
-	client := &BrokerClient{BaseURL: server.URL, Token: []byte("tok"), HTTP: server.Client()}
+	client := &BrokerClient{BaseURL: server.URL, TokenSource: NewStaticBrokerTokenSource([]byte("tok")), HTTP: server.Client()}
 	got, err := client.ControlRequest(context.Background())
 	if err != nil || got != nil {
 		t.Fatalf("read = %+v, err = %v, want (nil, nil): a request addressed elsewhere is an ordinary absence", got, err)

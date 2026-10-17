@@ -11,6 +11,8 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -804,7 +806,7 @@ func capabilityBroker(report map[string]any, status int) *BrokerProbeClient {
 			panic(err)
 		}
 	}))
-	return &BrokerProbeClient{BaseURL: server.URL, Token: []byte("tok"), HTTP: server.Client()}
+	return &BrokerProbeClient{BaseURL: server.URL, TokenSource: NewStaticBrokerTokenSource([]byte("tok")), HTTP: server.Client()}
 }
 
 func TestCapabilityHealthNamesUnavailableProvider(t *testing.T) {
@@ -1726,6 +1728,187 @@ func TestUnboundRoleDoesNotBurnBriefID(t *testing.T) {
 	}
 }
 
+// --- acceptance: projected broker token rotates -----------------------------
+
+// authRecorder is a broker stand-in that records the Authorization header of
+// every request it serves, so a test can prove which token bytes reached the
+// wire rather than which bytes a client happens to hold.
+type authRecorder struct {
+	mu     sync.Mutex
+	auths  []string
+	server *httptest.Server
+}
+
+func newAuthRecorder(t *testing.T) *authRecorder {
+	t.Helper()
+	rec := &authRecorder{}
+	rec.server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		rec.mu.Lock()
+		rec.auths = append(rec.auths, r.Header.Get("Authorization"))
+		rec.mu.Unlock()
+		w.Header().Set("Content-Type", "application/json")
+		if r.URL.Path == "/v1/capabilities" {
+			fmt.Fprint(w, `{"provider":{"name":"acme-forge","type":"github"},"operations":[],"git":{"endpoint":"https://git.acme.example/x.git","ready":true}}`)
+			return
+		}
+		fmt.Fprint(w, `{"id":"req-1"}`)
+	}))
+	t.Cleanup(rec.server.Close)
+	return rec
+}
+
+func (r *authRecorder) seen() []string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return append([]string(nil), r.auths...)
+}
+
+// projectToken lays out a projected volume the way kubelet does: a
+// timestamped payload directory, a `..data` symlink pointing at the current
+// payload, and a stable `token` symlink through `..data`. It returns the token
+// path — the path control reads on every request.
+func projectToken(t *testing.T, root, payload, token string) string {
+	t.Helper()
+	dir := filepath.Join(root, payload)
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	writeFile(t, filepath.Join(dir, "token"), token)
+	swapProjectedData(t, root, payload)
+	path := filepath.Join(root, "token")
+	if err := os.Symlink(filepath.Join("..data", "token"), path); err != nil {
+		t.Fatal(err)
+	}
+	return path
+}
+
+// rotateProjectedToken performs kubelet's rotation: a new payload directory
+// and an atomic `..data` symlink swap over the old one. The stable `token`
+// path keeps its name and identity, so a per-request read resolves the new
+// bytes with no cache to invalidate.
+func rotateProjectedToken(t *testing.T, root, payload, token string) {
+	t.Helper()
+	dir := filepath.Join(root, payload)
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	writeFile(t, filepath.Join(dir, "token"), token)
+	swapProjectedData(t, root, payload)
+}
+
+func swapProjectedData(t *testing.T, root, payload string) {
+	t.Helper()
+	next := filepath.Join(root, "..data_tmp")
+	if err := os.Symlink(payload, next); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(next, filepath.Join(root, "..data")); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// TestBrokerTokenSourcePicksUpRotation is the #383 regression: control reads
+// the projected broker token once at startup today, so kubelet's rotation
+// replaces the mounted file while every broker client keeps authenticating
+// with the bytes that have already expired. The same client and the same token
+// source must present the replacement token on the very next request, with no
+// identity rebuild and no run restart.
+func TestBrokerTokenSourcePicksUpRotation(t *testing.T) {
+	rec := newAuthRecorder(t)
+	root := t.TempDir()
+	// The projection writes the token verbatim; the presented bearer value
+	// must still be trimmed, because the broker rejects one that is not.
+	path := projectToken(t, root, "..2026_10_17_00_00_00", "token-one\n")
+	source := NewFileBrokerTokenSource(path)
+	client := &BrokerClient{BaseURL: rec.server.URL, TokenSource: source, HTTP: rec.server.Client()}
+	probe := &BrokerProbeClient{BaseURL: rec.server.URL, TokenSource: source, HTTP: rec.server.Client()}
+
+	if _, err := client.ControlRequest(context.Background()); err != nil {
+		t.Fatalf("pre-rotation control read = %v, want the recorded request", err)
+	}
+	if _, err := probe.Capabilities(context.Background()); err != nil {
+		t.Fatalf("pre-rotation capability read = %v, want the recorded request", err)
+	}
+
+	rotateProjectedToken(t, root, "..2026_10_17_00_10_00", "token-two\n")
+
+	if _, err := client.ControlRequest(context.Background()); err != nil {
+		t.Fatalf("post-rotation control read = %v, want the recorded request", err)
+	}
+	if _, err := probe.Capabilities(context.Background()); err != nil {
+		t.Fatalf("post-rotation capability read = %v, want the recorded request", err)
+	}
+
+	want := []string{"Bearer token-one", "Bearer token-one", "Bearer token-two", "Bearer token-two"}
+	got := rec.seen()
+	if len(got) != len(want) {
+		t.Fatalf("recorded authorizations = %q, want %q", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("recorded authorizations = %q, want %q", got, want)
+		}
+	}
+}
+
+// TestBrokerTokenSourceFailsClosed pins the other half of #383: a projection
+// control cannot read must produce a retryable local failure with a fixed
+// diagnostic, no request on the wire, and no token bytes anywhere in the
+// error. A run mid-rotation must wait for the new file, never send an
+// unauthenticated or stale-authenticated request.
+func TestBrokerTokenSourceFailsClosed(t *testing.T) {
+	const secret = "sk-super-secret-token-one"
+	rec := newAuthRecorder(t)
+	root := t.TempDir()
+	// Every case starts from a projection that has just served one
+	// authenticated read, so the failure path runs on a client whose token
+	// was demonstrably live a moment ago — a mid-rotation projection, not a
+	// misconfigured test.
+	healthy := filepath.Join(root, "healthy")
+	writeFile(t, healthy, secret+"\n")
+	empty := filepath.Join(root, "empty")
+	writeFile(t, empty, "")
+	blank := filepath.Join(root, "blank")
+	writeFile(t, blank, "  \n\t ")
+	cases := []struct {
+		name   string
+		source BrokerTokenSource
+	}{
+		{name: "missing file", source: NewFileBrokerTokenSource(filepath.Join(root, "absent"))},
+		{name: "empty file", source: NewFileBrokerTokenSource(empty)},
+		{name: "whitespace only", source: NewFileBrokerTokenSource(blank)},
+		{name: "no source wired", source: nil},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			warm := &BrokerClient{BaseURL: rec.server.URL, TokenSource: NewFileBrokerTokenSource(healthy), HTTP: rec.server.Client()}
+			if _, err := warm.ControlRequest(context.Background()); err != nil {
+				t.Fatalf("warm-up read = %v, want the recorded request", err)
+			}
+			before := len(rec.seen())
+			client := &BrokerClient{BaseURL: rec.server.URL, TokenSource: tc.source, HTTP: rec.server.Client()}
+			_, err := client.ControlRequest(context.Background())
+			if err == nil {
+				t.Fatalf("control read with %s = nil, want a fail-closed error", tc.name)
+			}
+			var callErr *BrokerCallError
+			if !errors.As(err, &callErr) || callErr.Category != "token is unavailable" || !callErr.Retryable {
+				t.Fatalf("control read error = %v, want a retryable token-unavailable BrokerCallError", err)
+			}
+			if strings.Contains(err.Error(), secret) || strings.Contains(err.Error(), root) {
+				t.Fatalf("error text carries credential or path detail: %v", err)
+			}
+			probe := &BrokerProbeClient{BaseURL: rec.server.URL, TokenSource: tc.source, HTTP: rec.server.Client()}
+			if _, err := probe.Capabilities(context.Background()); err == nil || err.Error() != "broker token is unavailable" {
+				t.Fatalf("capability read error = %v, want the fixed probe diagnostic", err)
+			}
+			if after := len(rec.seen()); after != before {
+				t.Fatalf("requests reaching the broker = %d, want %d: no request may be issued without a fresh token", after, before)
+			}
+		})
+	}
+}
+
 // --- broker transport reuse (#384) -----------------------------------------
 
 // countingTLSServer is an httptest TLS server that counts the connections it
@@ -1768,7 +1951,7 @@ func TestBrokerClientReusesOneTransportAcrossRequests(t *testing.T) {
 		}
 		w.WriteHeader(http.StatusNoContent)
 	})
-	client := &BrokerClient{BaseURL: server.URL, Token: []byte("tok"), CA: caPEM}
+	client := &BrokerClient{BaseURL: server.URL, TokenSource: NewStaticBrokerTokenSource([]byte("tok")), CA: caPEM}
 	for i := 1; i <= 5; i++ {
 		if err := client.PostStatus(context.Background(), StatusPatch{}); err != nil {
 			t.Fatalf("status post %d: %v", i, err)
@@ -1797,7 +1980,7 @@ func TestBrokerClientConcurrentRequestsShareOneTransport(t *testing.T) {
 	server, opened, _, caPEM := countingTLSServer(t, func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusNoContent)
 	})
-	client := &BrokerClient{BaseURL: server.URL, Token: []byte("tok"), CA: caPEM}
+	client := &BrokerClient{BaseURL: server.URL, TokenSource: NewStaticBrokerTokenSource([]byte("tok")), CA: caPEM}
 	var group sync.WaitGroup
 	for i := 0; i < 8; i++ {
 		group.Add(1)
@@ -1834,7 +2017,7 @@ func TestBrokerProbeClientReusesOneTransportAcrossProbes(t *testing.T) {
 		w.Header().Set("Content-Type", "application/json")
 		fmt.Fprint(w, `{"provider":{"name":"acme-forge","type":"github"},"git":{"endpoint":"https://git.acme.example/acme.git","ready":true}}`)
 	})
-	client := &BrokerProbeClient{BaseURL: server.URL, Token: []byte("tok"), CA: caPEM}
+	client := &BrokerProbeClient{BaseURL: server.URL, TokenSource: NewStaticBrokerTokenSource([]byte("tok")), CA: caPEM}
 	for i := 1; i <= 3; i++ {
 		report, err := client.Capabilities(context.Background())
 		if err != nil || report.Provider.Name != "acme-forge" {
@@ -1853,7 +2036,7 @@ func TestSuppliedHTTPClientKeepsOwnership(t *testing.T) {
 		w.WriteHeader(http.StatusNoContent)
 	})
 	supplied := server.Client()
-	client := &BrokerClient{BaseURL: server.URL, Token: []byte("tok"), HTTP: supplied}
+	client := &BrokerClient{BaseURL: server.URL, TokenSource: NewStaticBrokerTokenSource([]byte("tok")), HTTP: supplied}
 	if got, err := client.transport(); err != nil || got != supplied {
 		t.Fatalf("transport() = %v, %v, want the supplied client itself", got, err)
 	}
