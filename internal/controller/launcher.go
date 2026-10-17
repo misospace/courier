@@ -292,7 +292,11 @@ func (l *CoordinatorLauncher) ensureObserverObject(ctx context.Context, runUID t
 func (l *CoordinatorLauncher) verifyObserverResource(ctx context.Context, desired client.Object, runUID types.UID) error {
 	key := client.ObjectKeyFromObject(desired)
 	actual := desired.DeepCopyObject().(client.Object)
-	if err := l.Client.Get(ctx, key, actual); err != nil {
+	// Ownership is judged through the uncached reader, like the pod-slot
+	// gate: Create already hit the API server, so a cached Get could verify
+	// a deleted-and-replaced same-named resource against a stale owned view
+	// and admit the pod under a live foreign identity.
+	if err := l.collisionReader().Get(ctx, key, actual); err != nil {
 		return err
 	}
 	if !resourceOwnedByUID(actual, runUID) {
