@@ -28,6 +28,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"syscall"
 	"time"
@@ -920,24 +921,34 @@ const tapLastTextLimit = 200
 // session error events (#327): only runtime-authored structured error
 // events can prove exhaustion, never model prose.
 type sessionTap struct {
+	// mu guards every mutable field below: after WaitDelay fires, os/exec
+	// returns from Run while the previous attempt's stdout copy goroutine
+	// can still be mid-Write, so scan must never race the next attempt's
+	// reset, kill wiring, or the terminal classification reads.
+	mu        sync.Mutex
 	w         io.Writer
 	pending   []byte
 	sessionID string
+	lastText  string
+	tel       *telemetry.Tracker
+	signals   exhaustionSignals
+	// kill stops the currently running attempt's process group; only bytes
+	// from that same generation may invoke it.
+	kill func()
+	// gen counts attempts. attemptWriter carries the generation of the pipe
+	// it drains; bytes from an abandoned grandchild's pipe after its
+	// attempt ended are forwarded unseen and cannot alter state, splice
+	// framing, or stop the next child.
+	gen int
 	// sawSession reports whether the child served a session id during the
 	// current attempt. A crash before any session is an availability
 	// failure (#327 Scenario D), distinct from a crash mid-work.
 	sawSession bool
-	lastText   string
-	tel        *telemetry.Tracker
-	// seq counts every scanned line, so "the exhaustion error was the last
-	// thing the child emitted" is decidable at stop time.
-	seq int
-	// exhaustion holds the most recent error event that classified as
-	// confirmed provider exhaustion, with the sequence number it arrived
-	// at. A nil value means no event proved exhaustion.
-	exhaustion   *tapExhaustion
-	signals      exhaustionSignals
-	onExhaustion func()
+	// seq counts every scanned line of the current scan stream, so "the
+	// exhaustion error was the last thing the child emitted" is decidable
+	// at stop time.
+	seq        int
+	exhaustion *tapExhaustion
 }
 
 // tapExhaustion is one classified exhaustion event: the bounded class and
@@ -952,8 +963,47 @@ func newSessionTap(w io.Writer, signals exhaustionSignals) *sessionTap {
 	return &sessionTap{w: w, signals: signals}
 }
 
-func (t *sessionTap) Write(p []byte) (int, error) {
-	n, err := t.w.Write(p)
+// attemptWriter drains one attempt's stdout pipe. Bytes whose generation no
+// longer matches the tap (an abandoned grandchild still writing after its
+// attempt was killed) are forwarded to the output stream but never scanned:
+// they cannot set state, splice line framing, or invoke the kill callback.
+type attemptWriter struct {
+	tap *sessionTap
+	gen int
+}
+
+func (a *attemptWriter) Write(p []byte) (int, error) {
+	a.tap.mu.Lock()
+	defer a.tap.mu.Unlock()
+	n, err := a.tap.w.Write(p)
+	if a.gen != a.tap.gen {
+		return n, err
+	}
+	a.tap.consume(p)
+	return n, err
+}
+
+// beginAttempt starts a new generation: per-attempt scan state resets and
+// any partial line left in the buffer belongs to a dead attempt.
+func (t *sessionTap) beginAttempt() *attemptWriter {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.gen++
+	t.pending = nil
+	t.sawSession = false
+	return &attemptWriter{tap: t, gen: t.gen}
+}
+
+// setKill wires (or clears, with nil) the current attempt's stop function
+// under the tap lock, so the exhaustion callback can never observe a
+// half-assigned closure or kill a process group from a stale attempt.
+func (t *sessionTap) setKill(kill func()) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.kill = kill
+}
+
+func (t *sessionTap) consume(p []byte) {
 	t.pending = append(t.pending, p...)
 	for {
 		idx := bytes.IndexByte(t.pending, '\n')
@@ -971,15 +1021,19 @@ func (t *sessionTap) Write(p []byte) (int, error) {
 		t.pending = nil
 		t.seq++
 	}
-	return n, err
 }
 
-// Flush scans a trailing partial line after the child exits.
+// Flush scans a trailing partial line after the child exits and then ends
+// the generation: a copy goroutine abandoned by WaitDelay may still deliver
+// bytes afterwards, and those must no longer reach scan.
 func (t *sessionTap) Flush() error {
+	t.mu.Lock()
+	defer t.mu.Unlock()
 	if len(t.pending) > 0 {
 		t.scan(t.pending)
 		t.pending = nil
 	}
+	t.gen++
 	return nil
 }
 
@@ -1013,8 +1067,8 @@ func (t *sessionTap) scan(line []byte) {
 	}
 	if exhausted, class, code := classifyProviderExhaustion(line, t.signals); exhausted {
 		t.exhaustion = &tapExhaustion{seq: t.seq, class: class, code: code}
-		if t.onExhaustion != nil {
-			t.onExhaustion()
+		if t.kill != nil {
+			t.kill()
 		}
 	}
 }
@@ -1023,6 +1077,8 @@ func (t *sessionTap) scan(line []byte) {
 // The stop path retains the first classification even when already-buffered
 // output drains after SIGKILL; those bytes cannot restart the stopped child.
 func (t *sessionTap) confirmedExhaustion() (class, code string, ok bool) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
 	if t.exhaustion == nil || t.exhaustion.seq != t.seq {
 		return "", "", false
 	}
@@ -1030,10 +1086,37 @@ func (t *sessionTap) confirmedExhaustion() (class, code string, ok bool) {
 }
 
 func (t *sessionTap) lastExhaustion() (class, code string, ok bool) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
 	if t.exhaustion == nil {
 		return "", "", false
 	}
 	return t.exhaustion.class, t.exhaustion.code, true
+}
+
+// session returns the first session id served by any attempt, used to resume
+// the same conversation after a crash or continuation.
+func (t *sessionTap) session() string {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.sessionID
+}
+
+// sawSessionThisAttempt reports whether the current attempt ever served a
+// session id: no session at all means the provider never answered this turn,
+// which routes to the availability budget (#327 Scenario D).
+func (t *sessionTap) sawSessionThisAttempt() bool {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.sawSession
+}
+
+// text returns the last assistant text part observed, used for continuation
+// fingerprints and run summaries.
+func (t *sessionTap) text() string {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.lastText
 }
 
 func truncatedRunes(value string, limit int) string {
@@ -1140,13 +1223,6 @@ func run(ctx context.Context, stdout, stderr io.Writer) int {
 	tap := newSessionTap(stdoutRedacted, parseExhaustionSignals(cfg.ExhaustionCodes, cfg.ExhaustionTypes))
 	tap.tel = report.tel
 	var exhaustionSignal atomic.Bool
-	var cancelChild func()
-	tap.onExhaustion = func() {
-		exhaustionSignal.Store(true)
-		if cancelChild != nil {
-			cancelChild()
-		}
-	}
 
 	// Recoverable workspace endings and crashes share one continuation budget.
 	continuations, crashes, availability := 0, 0, 0
@@ -1180,11 +1256,11 @@ func run(ctx context.Context, stdout, stderr io.Writer) int {
 				Goal:      stateMessage,
 				Model:     cfg.Model,
 				Workspace: workspace.Directory,
-				Session:   tap.sessionID,
+				Session:   tap.session(),
 			}
 		}
 		command := runtime.Command(invocation)
-		tap.sawSession = false
+		modelStdout := tap.beginAttempt()
 		report.event(courierlog.EventExecutorStart, courierlog.StatusOK, map[string]any{
 			"executor": runtime.Name(),
 			"format":   cfg.OpenCodeFormat,
@@ -1203,16 +1279,16 @@ func run(ctx context.Context, stdout, stderr io.Writer) int {
 			}
 			return syscall.Kill(-process.Process.Pid, syscall.SIGKILL)
 		}
-		cancelChild = func() { _ = process.Cancel() }
-		defer func() { cancelChild = nil }()
+		tap.setKill(func() { exhaustionSignal.Store(true); _ = process.Cancel() })
 		// Bound the wait for the group after the context is done; the margin
 		// keeps the capture inside the 45-second termination grace.
 		process.WaitDelay = 10 * time.Second
 		process.Dir = workspace.Directory
-		process.Stdout = tap
+		process.Stdout = modelStdout
 		process.Stderr = stderrTransport
 		processErr := process.Run()
 		_ = tap.Flush()
+		tap.setKill(nil)
 		_ = stdoutRedacted.Flush()
 		_ = stderrTransport.Flush()
 
@@ -1252,7 +1328,7 @@ func run(ctx context.Context, stdout, stderr io.Writer) int {
 			// capacity can take the work instead of it stranding as Failed.
 			// Any attempt that got a session proves the provider served us
 			// and resets the budget.
-			if !tap.sawSession {
+			if !tap.sawSessionThisAttempt() {
 				if ctx.Err() == nil && availability < cfg.MaxAvailabilityRetries {
 					availability++
 					report.event(courierlog.EventExecutorContinuation, courierlog.StatusOK, map[string]any{
@@ -1265,7 +1341,7 @@ func run(ctx context.Context, stdout, stderr io.Writer) int {
 					case <-time.After(delay):
 					case <-ctx.Done():
 					}
-					if stateMessage == "" && tap.sessionID != "" {
+					if stateMessage == "" && tap.session() != "" {
 						stateMessage = fmt.Sprintf("Your previous turn ended unexpectedly (opencode exited with status %d). Continue working toward the goal.", code)
 					}
 					continue
@@ -1277,7 +1353,7 @@ func run(ctx context.Context, stdout, stderr io.Writer) int {
 			} else {
 				availability = 0
 			}
-			if tap.sessionID != "" && ctx.Err() == nil && continuations < cfg.MaxContinuations {
+			if tap.session() != "" && ctx.Err() == nil && continuations < cfg.MaxContinuations {
 				continuations++
 				crashes++
 				report.event(courierlog.EventExecutorContinuation, courierlog.StatusOK, map[string]any{
@@ -1353,7 +1429,7 @@ func run(ctx context.Context, stdout, stderr io.Writer) int {
 			if result.Phase == "Verifying" {
 				head, headErr := workspace.Head(ctx)
 				_ = headErr
-				verdict := report.applyHandoffPlan(ctx, continuations, cfg.MaxContinuations, tap.sessionID, ctx.Err())
+				verdict := report.applyHandoffPlan(ctx, continuations, cfg.MaxContinuations, tap.session(), ctx.Err())
 				if verdict.ContinueMsg != "" {
 					continuations++
 					stateMessage = verdict.ContinueMsg
@@ -1366,7 +1442,7 @@ func run(ctx context.Context, stdout, stderr io.Writer) int {
 						detail["pr"] = verdict.PRNumber
 					}
 					report.eventVerbose(courierlog.EventExecutorContinuation, courierlog.StatusOK, detail)
-					history = append(history, stateSummary(verdict.Kind, head, tap.lastText, nil))
+					history = append(history, stateSummary(verdict.Kind, head, tap.text(), nil))
 					continue
 				}
 				if verdict.FailReason != "" {
@@ -1421,7 +1497,7 @@ func run(ctx context.Context, stdout, stderr io.Writer) int {
 				// currently-published head, an exhausted budget, or a
 				// session that cannot be resumed escalates to
 				// NeedsHuman.
-				verdict := report.applyHandoffPlan(ctx, continuations, cfg.MaxContinuations, tap.sessionID, ctx.Err())
+				verdict := report.applyHandoffPlan(ctx, continuations, cfg.MaxContinuations, tap.session(), ctx.Err())
 				if verdict.ContinueMsg != "" {
 					continuations++
 					stateMessage = verdict.ContinueMsg
@@ -1434,7 +1510,7 @@ func run(ctx context.Context, stdout, stderr io.Writer) int {
 						detail["pr"] = verdict.PRNumber
 					}
 					report.eventVerbose(courierlog.EventExecutorContinuation, courierlog.StatusOK, detail)
-					history = append(history, stateSummary(verdict.Kind, head, tap.lastText, nil))
+					history = append(history, stateSummary(verdict.Kind, head, tap.text(), nil))
 					continue
 				}
 				if verdict.FailReason != "" {
@@ -1465,7 +1541,7 @@ func run(ctx context.Context, stdout, stderr io.Writer) int {
 			}
 			kind = "off-branch"
 			message = fmt.Sprintf("You committed work that is not on the run branch %q (HEAD is on %s). Move your commits onto %q and push, or declare needs_decision or blocked_external if a human is needed.", cfg.Branch, whereClause, cfg.Branch)
-			summary = stateSummary(kind, head, tap.lastText, nil)
+			summary = stateSummary(kind, head, tap.text(), nil)
 		case git.WorkStateDirty:
 			listed := dirty
 			more := ""
@@ -1479,11 +1555,11 @@ func run(ctx context.Context, stdout, stderr io.Writer) int {
 			} else {
 				message = fmt.Sprintf("You ended with uncommitted changes in %s%s; commit and push them to %q, or discard them and declare needs_decision or blocked_external if a human is needed.", strings.Join(listed, ", "), more, cfg.Branch)
 			}
-			summary = stateSummary(kind, head, tap.lastText, listed)
+			summary = stateSummary(kind, head, tap.text(), listed)
 		default:
 			kind = "no-work"
 			message = fmt.Sprintf("You ended without producing a commit or workspace changes and did not declare an outcome. Continue the work and push it to %q, or declare needs_decision or blocked_external if a human is needed.", cfg.Branch)
-			summary = stateSummary(kind, head, tap.lastText, nil)
+			summary = stateSummary(kind, head, tap.text(), nil)
 			if names := unavailableCapabilities(caps); len(names) > 0 {
 				suffix := "; configured capability unavailable: " + strings.Join(names, ", ")
 				message += suffix
@@ -1491,7 +1567,7 @@ func run(ctx context.Context, stdout, stderr io.Writer) int {
 			}
 		}
 
-		if tap.sessionID == "" {
+		if tap.session() == "" {
 			// Without a captured session there is nothing to resume; apply the
 			// ordinary undeclared-outcome contract to the verified world
 			// state. The committed-work Verifying ending was already settled
@@ -1503,7 +1579,7 @@ func run(ctx context.Context, stdout, stderr io.Writer) int {
 			return result.ExitCode
 		}
 
-		fingerprint, err := continuationFingerprint(workState, branch, head, dirty, tap.lastText)
+		fingerprint, err := continuationFingerprint(workState, branch, head, dirty, tap.text())
 		if err != nil {
 			report.terminateCaptured(ctx, workspace, startCommit, failed("fingerprint workspace state: "+err.Error()))
 			return exitFailed

@@ -45,18 +45,28 @@ func TestSessionTapStopsOnStructuredExhaustionEvent(t *testing.T) {
 	var output strings.Builder
 	stopped := false
 	tap := newSessionTap(&output, parseExhaustionSignals("2056", ""))
-	tap.onExhaustion = func() { stopped = true }
+	tap.setKill(func() { stopped = true })
+	model := tap.beginAttempt()
 	line := `{"type":"error","sessionID":"ses_fixture","error":{"name":"APIError","data":{"statusCode":429,"responseBody":"{\"error\":{\"code\":\"insufficient_quota\"}}"}}}`
-	_, _ = tap.Write([]byte(line + "\n"))
+	_, _ = model.Write([]byte(line + "\n"))
 	if !stopped {
 		t.Fatal("structured exhaustion did not trigger immediate stop callback")
 	}
 	if _, _, ok := tap.lastExhaustion(); !ok {
 		t.Fatal("structured exhaustion was not retained for terminal report")
 	}
-	_, _ = tap.Write([]byte(`{"type":"error","error":{"type":"provider.rate-limit","message":"network retry failed"}}` + "\n"))
+	_, _ = model.Write([]byte(`{"type":"error","error":{"type":"provider.rate-limit","message":"network retry failed"}}` + "\n"))
 	if _, _, ok := tap.confirmedExhaustion(); ok {
 		t.Fatal("later transport output incorrectly retained terminal proof")
+	}
+	// A pipe abandoned by a killed attempt (old generation, after the run
+	// loop flushed and moved on) forwards bytes but can neither re-arm the
+	// kill callback nor alter classification.
+	stopped = false
+	_ = tap.Flush()
+	_, _ = model.Write([]byte(line + "\n"))
+	if stopped {
+		t.Fatal("bytes from a closed generation stopped the next attempt")
 	}
 }
 
