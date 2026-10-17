@@ -29,6 +29,8 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 	"unicode/utf8"
@@ -63,7 +65,15 @@ const (
 	defaultFormat           = "json"
 	defaultMaxContinuations = 3
 	defaultResumeBackoff    = 5 * time.Second
-	maxResumeBackoffSeconds = 3600
+	// defaultMaxAvailabilityRetries bounds consecutive no-progress provider
+	// failures before the run ends recoverably for another capacity (#327).
+	// With defaultResumeBackoff doubling up to maxAvailabilityBackoffCap the
+	// budget spans roughly fifteen minutes of an outage — long enough to ride
+	// out brief blips, short enough that a healthy sibling capacity is not
+	// starved of the work.
+	defaultMaxAvailabilityRetries = 10
+	maxAvailabilityBackoffCap     = 4
+	maxResumeBackoffSeconds       = 3600
 )
 
 type config struct {
@@ -88,13 +98,23 @@ type config struct {
 	OpenCodeAgent    string
 	MaxContinuations int
 	ResumeBackoff    time.Duration
-	TerminationFile  string
-	GitUsername      string
-	GitToken         string
-	GitHubToken      string
-	EvidenceURL      string
-	EvidenceToken    string
-	PodUID           string
+	// MaxAvailabilityRetries bounds consecutive no-progress provider
+	// failures (#327 Scenario D): an outage keeps the run recoverable on a
+	// separate, backed-off budget instead of consuming task-repair
+	// continuations or terminalizing as Failed.
+	MaxAvailabilityRetries int
+	TerminationFile        string
+	GitUsername            string
+	GitToken               string
+	GitHubToken            string
+	EvidenceURL            string
+	EvidenceToken          string
+	PodUID                 string
+	// ExhaustionCodes/ExhaustionTypes are the deployment-extended provider
+	// exhaustion signals (#320 policy): structured tokens added to the
+	// provider-neutral defaults, never replacing them (#327).
+	ExhaustionCodes string
+	ExhaustionTypes string
 	// Criteria is the bounded JSON envelope of the acceptance-criterion set
 	// pinned at admission (#280). Empty means no set was pinned; presence
 	// (even of an empty set) is meaningful and turns the criterion check
@@ -125,9 +145,22 @@ type termination struct {
 	// Summary is the compact per-run telemetry tallied from the OpenCode event
 	// stream (#172). Omitted when the run recorded no activity.
 	Summary *courierv1alpha1.RunTelemetry `json:"summary,omitempty"`
+	// WorkspaceSafety reports post-stop Git observations on capacity endings.
+	// Legacy observations are not authority: the controller keeps recovery held
+	// until an independent trusted observer can validate them.
+	WorkspaceSafety *courierv1alpha1.WorkspaceSafetyEvidence `json:"workspace_safety,omitempty"`
 }
 
 func main() {
+	if len(os.Args) == 2 && (os.Args[1] == "observe-seed" || os.Args[1] == "observe-workspace") {
+		ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM)
+		defer stop()
+		if err := observerMode(ctx, os.Args[1] == "observe-seed"); err != nil {
+			fmt.Fprintln(os.Stderr, "courier: workspace observation failed:", err)
+			os.Exit(1)
+		}
+		return
+	}
 	if os.Getenv("COURIER_ASKPASS") == "1" {
 		os.Exit(askpass(os.Args[1:], os.Getenv("COURIER_GIT_USERNAME"), os.Getenv("COURIER_GIT_TOKEN"), os.Stdout))
 	}
@@ -149,6 +182,10 @@ func readConfig(getenv func(string) string) (config, error) {
 	if maxContinuations < 1 {
 		maxContinuations = defaultMaxContinuations
 	}
+	availabilityRetries, _ := strconv.Atoi(strings.TrimSpace(getenv("COURIER_MAX_AVAILABILITY_RETRIES")))
+	if availabilityRetries < 1 {
+		availabilityRetries = defaultMaxAvailabilityRetries
+	}
 	resumeBackoff, err := strconv.ParseFloat(strings.TrimSpace(getenv("COURIER_RESUME_BACKOFF_SECONDS")), 64)
 	if err != nil || math.IsNaN(resumeBackoff) || math.IsInf(resumeBackoff, 0) || resumeBackoff < 0 {
 		resumeBackoff = defaultResumeBackoff.Seconds()
@@ -157,35 +194,38 @@ func readConfig(getenv func(string) string) (config, error) {
 		resumeBackoff = maxResumeBackoffSeconds
 	}
 	cfg := config{
-		RemoteURL:        remoteURL,
-		BaseRemoteURL:    strings.TrimSpace(getenv("COURIER_BASE_REPO_URL")),
-		Directory:        strings.TrimSpace(getenv("COURIER_WORKSPACE")),
-		ScratchDirectory: strings.TrimSpace(getenv("COURIER_SCRATCH_DIR")),
-		Base:             strings.TrimSpace(getenv("COURIER_BASE")),
-		Branch:           strings.TrimSpace(getenv("COURIER_BRANCH")),
-		Repo:             strings.TrimSpace(getenv("COURIER_REPO")),
-		HeadRepo:         strings.TrimSpace(getenv("COURIER_HEAD_REPO")),
-		HeadSHA:          strings.TrimSpace(getenv("COURIER_HEAD_SHA")),
-		Goal:             strings.TrimSpace(getenv("COURIER_GOAL")),
-		Model:            strings.TrimSpace(getenv("COURIER_MODEL")),
-		Framing:          getenv("COURIER_FRAMING"),
-		Mode:             strings.TrimSpace(getenv("COURIER_MODE")),
-		RunID:            strings.TrimSpace(getenv("COURIER_RUN_NAME")),
-		Ref:              ref,
-		OpenCodeBinary:   strings.TrimSpace(getenv("COURIER_OPENCODE_BINARY")),
-		OpenCodeFormat:   strings.TrimSpace(getenv("COURIER_OPENCODE_FORMAT")),
-		OpenCodeAgent:    strings.TrimSpace(getenv("COURIER_OPENCODE_AGENT")),
-		MaxContinuations: maxContinuations,
-		ResumeBackoff:    time.Duration(resumeBackoff * float64(time.Second)),
-		TerminationFile:  strings.TrimSpace(getenv("COURIER_TERMINATION_FILE")),
-		GitUsername:      getenv("COURIER_GIT_USERNAME"),
-		GitToken:         getenv("COURIER_GIT_TOKEN"),
-		GitHubToken:      getenv("GITHUB_TOKEN"),
-		GitHubAPIBase:    strings.TrimSpace(getenv("COURIER_GITHUB_API_BASE")),
-		EvidenceURL:      strings.TrimSpace(getenv(executor.EnvEvidenceURL)),
-		EvidenceToken:    strings.TrimSpace(getenv(executor.EnvEvidenceToken)),
-		PodUID:           strings.TrimSpace(getenv(executor.EnvPodUID)),
-		Criteria:         strings.TrimSpace(getenv(executor.EnvCriteria)),
+		RemoteURL:              remoteURL,
+		BaseRemoteURL:          strings.TrimSpace(getenv("COURIER_BASE_REPO_URL")),
+		Directory:              strings.TrimSpace(getenv("COURIER_WORKSPACE")),
+		ScratchDirectory:       strings.TrimSpace(getenv("COURIER_SCRATCH_DIR")),
+		Base:                   strings.TrimSpace(getenv("COURIER_BASE")),
+		Branch:                 strings.TrimSpace(getenv("COURIER_BRANCH")),
+		Repo:                   strings.TrimSpace(getenv("COURIER_REPO")),
+		HeadRepo:               strings.TrimSpace(getenv("COURIER_HEAD_REPO")),
+		HeadSHA:                strings.TrimSpace(getenv("COURIER_HEAD_SHA")),
+		Goal:                   strings.TrimSpace(getenv("COURIER_GOAL")),
+		Model:                  strings.TrimSpace(getenv("COURIER_MODEL")),
+		Framing:                getenv("COURIER_FRAMING"),
+		Mode:                   strings.TrimSpace(getenv("COURIER_MODE")),
+		RunID:                  strings.TrimSpace(getenv("COURIER_RUN_NAME")),
+		Ref:                    ref,
+		OpenCodeBinary:         strings.TrimSpace(getenv("COURIER_OPENCODE_BINARY")),
+		OpenCodeFormat:         strings.TrimSpace(getenv("COURIER_OPENCODE_FORMAT")),
+		OpenCodeAgent:          strings.TrimSpace(getenv("COURIER_OPENCODE_AGENT")),
+		MaxContinuations:       maxContinuations,
+		ResumeBackoff:          time.Duration(resumeBackoff * float64(time.Second)),
+		MaxAvailabilityRetries: availabilityRetries,
+		TerminationFile:        strings.TrimSpace(getenv("COURIER_TERMINATION_FILE")),
+		GitUsername:            getenv("COURIER_GIT_USERNAME"),
+		GitToken:               getenv("COURIER_GIT_TOKEN"),
+		GitHubToken:            getenv("GITHUB_TOKEN"),
+		GitHubAPIBase:          strings.TrimSpace(getenv("COURIER_GITHUB_API_BASE")),
+		EvidenceURL:            strings.TrimSpace(getenv(executor.EnvEvidenceURL)),
+		EvidenceToken:          strings.TrimSpace(getenv(executor.EnvEvidenceToken)),
+		PodUID:                 strings.TrimSpace(getenv(executor.EnvPodUID)),
+		ExhaustionCodes:        getenv("COURIER_MODEL_EXHAUSTION_CODES"),
+		ExhaustionTypes:        getenv("COURIER_MODEL_EXHAUSTION_TYPES"),
+		Criteria:               strings.TrimSpace(getenv(executor.EnvCriteria)),
 	}
 	if strings.TrimSpace(cfg.GitHubToken) == "" {
 		cfg.GitHubToken = cfg.GitToken
@@ -483,6 +523,21 @@ func revListCount(ctx context.Context, dir, span string) (int, error) {
 		return 0, err
 	}
 	return count, nil
+}
+
+// revParse resolves one rev to its full object name.
+func revParse(ctx context.Context, dir, rev string) (string, error) {
+	cmd := exec.CommandContext(ctx, "git", "-C", dir, "rev-parse", rev)
+	// Same WaitDelay bound as every spawned git call: a remote helper or
+	// askpass grandchild holding the pipe must not outlive the context.
+	cmd.WaitDelay = 2 * time.Second
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+	if err := cmd.Run(); err != nil {
+		return "", err
+	}
+	return strings.TrimSpace(stdout.String()), nil
 }
 
 // captureGate is the single place deciding whether a capture is warranted at
@@ -863,20 +918,93 @@ const tapLastTextLimit = 200
 // sessionID and the last assistant text part so a recoverable exit can
 // resume the same session; it never alters the bytes it forwards. lastText
 // intentionally persists across resumed turns when a new turn emits no text.
+// It also classifies structured provider-exhaustion evidence from OpenCode's
+// session error events (#327): only runtime-authored structured error
+// events can prove exhaustion, never model prose.
 type sessionTap struct {
+	// mu guards every mutable field below: after WaitDelay fires, os/exec
+	// returns from Run while the previous attempt's stdout copy goroutine
+	// can still be mid-Write, so scan must never race the next attempt's
+	// reset, kill wiring, or the terminal classification reads.
+	mu        sync.Mutex
 	w         io.Writer
 	pending   []byte
 	sessionID string
 	lastText  string
 	tel       *telemetry.Tracker
+	signals   exhaustionSignals
+	// kill stops the currently running attempt's process group; only bytes
+	// from that same generation may invoke it.
+	kill func()
+	// gen counts attempts. attemptWriter carries the generation of the pipe
+	// it drains; bytes from an abandoned grandchild's pipe after its
+	// attempt ended are forwarded unseen and cannot alter state, splice
+	// framing, or stop the next child.
+	gen int
+	// sawSession reports whether the child served a session id during the
+	// current attempt. A crash before any session is an availability
+	// failure (#327 Scenario D), distinct from a crash mid-work.
+	sawSession bool
+	// seq counts every scanned line of the current scan stream, so "the
+	// exhaustion error was the last thing the child emitted" is decidable
+	// at stop time.
+	seq        int
+	exhaustion *tapExhaustion
 }
 
-func newSessionTap(w io.Writer) *sessionTap {
-	return &sessionTap{w: w}
+// tapExhaustion is one classified exhaustion event: the bounded class and
+// code tokens only — never provider response text.
+type tapExhaustion struct {
+	seq   int
+	class string
+	code  string
 }
 
-func (t *sessionTap) Write(p []byte) (int, error) {
-	n, err := t.w.Write(p)
+func newSessionTap(w io.Writer, signals exhaustionSignals) *sessionTap {
+	return &sessionTap{w: w, signals: signals}
+}
+
+// attemptWriter drains one attempt's stdout pipe. Bytes whose generation no
+// longer matches the tap (an abandoned grandchild still writing after its
+// attempt was killed) are forwarded to the output stream but never scanned:
+// they cannot set state, splice line framing, or invoke the kill callback.
+type attemptWriter struct {
+	tap *sessionTap
+	gen int
+}
+
+func (a *attemptWriter) Write(p []byte) (int, error) {
+	a.tap.mu.Lock()
+	defer a.tap.mu.Unlock()
+	n, err := a.tap.w.Write(p)
+	if a.gen != a.tap.gen {
+		return n, err
+	}
+	a.tap.consume(p)
+	return n, err
+}
+
+// beginAttempt starts a new generation: per-attempt scan state resets and
+// any partial line left in the buffer belongs to a dead attempt.
+func (t *sessionTap) beginAttempt() *attemptWriter {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.gen++
+	t.pending = nil
+	t.sawSession = false
+	return &attemptWriter{tap: t, gen: t.gen}
+}
+
+// setKill wires (or clears, with nil) the current attempt's stop function
+// under the tap lock, so the exhaustion callback can never observe a
+// half-assigned closure or kill a process group from a stale attempt.
+func (t *sessionTap) setKill(kill func()) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.kill = kill
+}
+
+func (t *sessionTap) consume(p []byte) {
 	t.pending = append(t.pending, p...)
 	for {
 		idx := bytes.IndexByte(t.pending, '\n')
@@ -887,23 +1015,35 @@ func (t *sessionTap) Write(p []byte) (int, error) {
 		t.pending = t.pending[idx+1:]
 	}
 	if len(t.pending) > tapMaxLine {
+		// The oversized unfinished line is dropped unseen, but it is still
+		// output the child produced after anything scanned before it: it
+		// must invalidate a prior exhaustion the same way a parsed line
+		// would (#327).
 		t.pending = nil
+		t.seq++
 	}
-	return n, err
 }
 
-// Flush scans a trailing partial line after the child exits.
+// Flush scans a trailing partial line after the child exits and then ends
+// the generation: a copy goroutine abandoned by WaitDelay may still deliver
+// bytes afterwards, and those must no longer reach scan.
 func (t *sessionTap) Flush() error {
+	t.mu.Lock()
+	defer t.mu.Unlock()
 	if len(t.pending) > 0 {
 		t.scan(t.pending)
 		t.pending = nil
 	}
+	t.gen++
 	return nil
 }
 
-// scan extracts the session id and assistant text from one JSON event line.
-// Lines that are not JSON events are ignored.
+// scan extracts the session id and assistant text from one JSON event line,
+// and classifies structured provider-exhaustion evidence from OpenCode's
+// session error events (#327). Lines that are not JSON events are ignored —
+// they still count as output, so they invalidate any earlier exhaustion.
 func (t *sessionTap) scan(line []byte) {
+	t.seq++
 	if t.tel != nil {
 		t.tel.Observe(line)
 	}
@@ -917,12 +1057,67 @@ func (t *sessionTap) scan(line []byte) {
 	if err := json.Unmarshal(line, &event); err != nil {
 		return
 	}
-	if event.SessionID != "" && t.sessionID == "" {
-		t.sessionID = event.SessionID
+	if event.SessionID != "" {
+		if t.sessionID == "" {
+			t.sessionID = event.SessionID
+		}
+		t.sawSession = true
 	}
 	if event.Part != nil && event.Part.Type == "text" {
 		t.lastText = truncatedRunes(event.Part.Text, tapLastTextLimit)
 	}
+	if exhausted, class, code := classifyProviderExhaustion(line, t.signals); exhausted {
+		t.exhaustion = &tapExhaustion{seq: t.seq, class: class, code: code}
+		if t.kill != nil {
+			t.kill()
+		}
+	}
+}
+
+// confirmedExhaustion reports whether the classified event is the final line.
+// The stop path retains the first classification even when already-buffered
+// output drains after SIGKILL; those bytes cannot restart the stopped child.
+func (t *sessionTap) confirmedExhaustion() (class, code string, ok bool) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.exhaustion == nil || t.exhaustion.seq != t.seq {
+		return "", "", false
+	}
+	return t.exhaustion.class, t.exhaustion.code, true
+}
+
+func (t *sessionTap) lastExhaustion() (class, code string, ok bool) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.exhaustion == nil {
+		return "", "", false
+	}
+	return t.exhaustion.class, t.exhaustion.code, true
+}
+
+// session returns the first session id served by any attempt, used to resume
+// the same conversation after a crash or continuation.
+func (t *sessionTap) session() string {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.sessionID
+}
+
+// sawSessionThisAttempt reports whether the current attempt ever served a
+// session id: no session at all means the provider never answered this turn,
+// which routes to the availability budget (#327 Scenario D).
+func (t *sessionTap) sawSessionThisAttempt() bool {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.sawSession
+}
+
+// text returns the last assistant text part observed, used for continuation
+// fingerprints and run summaries.
+func (t *sessionTap) text() string {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.lastText
 }
 
 func truncatedRunes(value string, limit int) string {
@@ -1026,11 +1221,12 @@ func run(ctx context.Context, stdout, stderr io.Writer) int {
 	// observes OpenCode's JSON events without changing their bytes.
 	stdoutRedacted := courierlog.NewRedactingWriter(stdout, report.red)
 	stderrTransport := courierlog.NewRedactingWriter(stderr, report.red)
-	tap := newSessionTap(stdoutRedacted)
+	tap := newSessionTap(stdoutRedacted, parseExhaustionSignals(cfg.ExhaustionCodes, cfg.ExhaustionTypes))
 	tap.tel = report.tel
+	var exhaustionSignal atomic.Bool
 
 	// Recoverable workspace endings and crashes share one continuation budget.
-	continuations, crashes := 0, 0
+	continuations, crashes, availability := 0, 0, 0
 	var (
 		stateMessage    string
 		prevFingerprint string
@@ -1061,10 +1257,11 @@ func run(ctx context.Context, stdout, stderr io.Writer) int {
 				Goal:      stateMessage,
 				Model:     cfg.Model,
 				Workspace: workspace.Directory,
-				Session:   tap.sessionID,
+				Session:   tap.session(),
 			}
 		}
 		command := runtime.Command(invocation)
+		modelStdout := tap.beginAttempt()
 		report.event(courierlog.EventExecutorStart, courierlog.StatusOK, map[string]any{
 			"executor": runtime.Name(),
 			"format":   cfg.OpenCodeFormat,
@@ -1078,31 +1275,91 @@ func run(ctx context.Context, stdout, stderr io.Writer) int {
 		// snapshots it (DESIGN.md, #115).
 		process.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 		process.Cancel = func() error {
+			if process.Process == nil {
+				return os.ErrProcessDone
+			}
 			return syscall.Kill(-process.Process.Pid, syscall.SIGKILL)
 		}
+		tap.setKill(func() { exhaustionSignal.Store(true); _ = process.Cancel() })
 		// Bound the wait for the group after the context is done; the margin
 		// keeps the capture inside the 45-second termination grace.
 		process.WaitDelay = 10 * time.Second
 		process.Dir = workspace.Directory
-		process.Stdout = tap
+		process.Stdout = modelStdout
 		process.Stderr = stderrTransport
 		processErr := process.Run()
 		_ = tap.Flush()
+		tap.setKill(nil)
 		_ = stdoutRedacted.Flush()
 		_ = stderrTransport.Flush()
+
+		if ctx.Err() == nil && exhaustionSignal.Load() {
+			// The callback fires on the structured error event itself, causing
+			// the command context to kill the whole process group. Ignore any
+			// later output from that killed turn; it cannot trigger a continuation.
+			class, code, exhausted := tap.confirmedExhaustion()
+			if !exhausted {
+				class, code, exhausted = tap.lastExhaustion()
+			}
+			if exhausted {
+				result := report.capacityExhaustedTermination(ctx, workspace, cfg, startCommit, class, code)
+				report.terminateCaptured(ctx, workspace, startCommit, result)
+				return exitNeedsHuman
+			}
+		}
 
 		if processErr != nil {
 			code := processExitCode(processErr)
 			if code < 0 {
 				code = exitFailed
 			}
-			// Raw child exit 2 is not a declaration; only the verified outcome
-			// handoff may request NeedsHuman.
-			if code == exitNeedsHuman {
-				report.terminateCaptured(ctx, workspace, startCommit, failedWith(fmt.Sprintf("opencode exited with status %d", code), terminalCategoryModelTransportError))
-				return exitFailed
+			// Every raw nonzero child status — including 2, which is only
+			// Courier's own exit constant and never a declaration by the
+			// child — takes the shared recovery path below. NeedsHuman is
+			// reserved for verified outcome handoffs; a provider outage or
+			// crash gets its bounded budget and, when spent, the recoverable
+			// availability handoff instead of a stranding Failed.
+			// Availability failures (#327 Scenario D): a provider outage makes
+			// OpenCode exit without ever serving a session id for this
+			// attempt. Those failures get their own bounded, backed-off
+			// budget: they never consume the task-repair continuation budget,
+			// and exhausting them ends the run on the recoverable
+			// capacity-handoff channel — as an availability handoff, never
+			// pretending a structured quota signal fired — so another
+			// capacity can take the work instead of it stranding as Failed.
+			// Any attempt that got a session proves the provider served us
+			// and resets the budget.
+			if !tap.sawSessionThisAttempt() {
+				if ctx.Err() == nil && availability < cfg.MaxAvailabilityRetries {
+					availability++
+					report.event(courierlog.EventExecutorContinuation, courierlog.StatusOK, map[string]any{
+						"kind":    "availability-retry",
+						"code":    code,
+						"attempt": availability,
+					})
+					// Same gate as the crash continuation: a dying tool may
+					// have left uncommitted work from an earlier session-
+					// serving attempt; a retry is exactly the moment the
+					// next turn could clobber it.
+					report.maybeCaptureEvidence(ctx, workspace, startCommit, evidence.TriggerCrash)
+					delay := cfg.ResumeBackoff * time.Duration(1<<min(availability-1, maxAvailabilityBackoffCap))
+					select {
+					case <-time.After(delay):
+					case <-ctx.Done():
+					}
+					if stateMessage == "" && tap.session() != "" {
+						stateMessage = fmt.Sprintf("Your previous turn ended unexpectedly (opencode exited with status %d). Continue working toward the goal.", code)
+					}
+					continue
+				}
+				if ctx.Err() == nil {
+					report.terminateCaptured(ctx, workspace, startCommit, report.availabilityRecoveryTermination(ctx, workspace, cfg, startCommit, fmt.Sprintf("model provider failed to serve %d consecutive attempts without a session (last exit %d)", cfg.MaxAvailabilityRetries, code)))
+					return exitNeedsHuman
+				}
+			} else {
+				availability = 0
 			}
-			if tap.sessionID != "" && ctx.Err() == nil && continuations < cfg.MaxContinuations {
+			if tap.session() != "" && ctx.Err() == nil && continuations < cfg.MaxContinuations {
 				continuations++
 				crashes++
 				report.event(courierlog.EventExecutorContinuation, courierlog.StatusOK, map[string]any{
@@ -1126,12 +1383,25 @@ func run(ctx context.Context, stdout, stderr io.Writer) int {
 				stateMessage = fmt.Sprintf("Your previous turn ended unexpectedly (opencode exited with status %d). Continue working toward the goal.", code)
 				continue
 			}
+			// The task-repair budget is spent. Repeated crashes with no
+			// provable task defect must not become a permanent Failed: a
+			// Failed run holds its claim and strands the work (#327). End
+			// on the recoverable availability-handoff channel — the same
+			// honest provider-unavailable verdict, never a quota claim —
+			// so fenced recovery can move the work to a healthy capacity.
+			// A canceled context is not provider trouble: it stays a plain
+			// Failed, since the operator chose to stop this run.
 			reason := fmt.Sprintf("opencode exited with status %d", code)
 			if continuations > 0 {
 				reason += fmt.Sprintf(" after %d continuations", continuations)
 			}
-			report.terminateCaptured(ctx, workspace, startCommit, failedWith(reason, terminalCategoryModelTransportError))
-			return exitFailed
+			if ctx.Err() != nil {
+				reason += " and the context was canceled"
+				report.terminateCaptured(ctx, workspace, startCommit, failedWith(reason, terminalCategoryModelTransportError))
+				return exitFailed
+			}
+			report.terminateCaptured(ctx, workspace, startCommit, report.availabilityRecoveryTermination(ctx, workspace, cfg, startCommit, reason))
+			return exitNeedsHuman
 		}
 
 		if workspace.Conflict != nil {
@@ -1165,7 +1435,7 @@ func run(ctx context.Context, stdout, stderr io.Writer) int {
 			if result.Phase == "Verifying" {
 				head, headErr := workspace.Head(ctx)
 				_ = headErr
-				verdict := report.applyHandoffPlan(ctx, continuations, cfg.MaxContinuations, tap.sessionID, ctx.Err())
+				verdict := report.applyHandoffPlan(ctx, continuations, cfg.MaxContinuations, tap.session(), ctx.Err())
 				if verdict.ContinueMsg != "" {
 					continuations++
 					stateMessage = verdict.ContinueMsg
@@ -1178,7 +1448,7 @@ func run(ctx context.Context, stdout, stderr io.Writer) int {
 						detail["pr"] = verdict.PRNumber
 					}
 					report.eventVerbose(courierlog.EventExecutorContinuation, courierlog.StatusOK, detail)
-					history = append(history, stateSummary(verdict.Kind, head, tap.lastText, nil))
+					history = append(history, stateSummary(verdict.Kind, head, tap.text(), nil))
 					continue
 				}
 				if verdict.FailReason != "" {
@@ -1233,7 +1503,7 @@ func run(ctx context.Context, stdout, stderr io.Writer) int {
 				// currently-published head, an exhausted budget, or a
 				// session that cannot be resumed escalates to
 				// NeedsHuman.
-				verdict := report.applyHandoffPlan(ctx, continuations, cfg.MaxContinuations, tap.sessionID, ctx.Err())
+				verdict := report.applyHandoffPlan(ctx, continuations, cfg.MaxContinuations, tap.session(), ctx.Err())
 				if verdict.ContinueMsg != "" {
 					continuations++
 					stateMessage = verdict.ContinueMsg
@@ -1246,7 +1516,7 @@ func run(ctx context.Context, stdout, stderr io.Writer) int {
 						detail["pr"] = verdict.PRNumber
 					}
 					report.eventVerbose(courierlog.EventExecutorContinuation, courierlog.StatusOK, detail)
-					history = append(history, stateSummary(verdict.Kind, head, tap.lastText, nil))
+					history = append(history, stateSummary(verdict.Kind, head, tap.text(), nil))
 					continue
 				}
 				if verdict.FailReason != "" {
@@ -1277,7 +1547,7 @@ func run(ctx context.Context, stdout, stderr io.Writer) int {
 			}
 			kind = "off-branch"
 			message = fmt.Sprintf("You committed work that is not on the run branch %q (HEAD is on %s). Move your commits onto %q and push, or declare needs_decision or blocked_external if a human is needed.", cfg.Branch, whereClause, cfg.Branch)
-			summary = stateSummary(kind, head, tap.lastText, nil)
+			summary = stateSummary(kind, head, tap.text(), nil)
 		case git.WorkStateDirty:
 			listed := dirty
 			more := ""
@@ -1291,11 +1561,11 @@ func run(ctx context.Context, stdout, stderr io.Writer) int {
 			} else {
 				message = fmt.Sprintf("You ended with uncommitted changes in %s%s; commit and push them to %q, or discard them and declare needs_decision or blocked_external if a human is needed.", strings.Join(listed, ", "), more, cfg.Branch)
 			}
-			summary = stateSummary(kind, head, tap.lastText, listed)
+			summary = stateSummary(kind, head, tap.text(), listed)
 		default:
 			kind = "no-work"
 			message = fmt.Sprintf("You ended without producing a commit or workspace changes and did not declare an outcome. Continue the work and push it to %q, or declare needs_decision or blocked_external if a human is needed.", cfg.Branch)
-			summary = stateSummary(kind, head, tap.lastText, nil)
+			summary = stateSummary(kind, head, tap.text(), nil)
 			if names := unavailableCapabilities(caps); len(names) > 0 {
 				suffix := "; configured capability unavailable: " + strings.Join(names, ", ")
 				message += suffix
@@ -1303,7 +1573,7 @@ func run(ctx context.Context, stdout, stderr io.Writer) int {
 			}
 		}
 
-		if tap.sessionID == "" {
+		if tap.session() == "" {
 			// Without a captured session there is nothing to resume; apply the
 			// ordinary undeclared-outcome contract to the verified world
 			// state. The committed-work Verifying ending was already settled
@@ -1315,7 +1585,7 @@ func run(ctx context.Context, stdout, stderr io.Writer) int {
 			return result.ExitCode
 		}
 
-		fingerprint, err := continuationFingerprint(workState, branch, head, dirty, tap.lastText)
+		fingerprint, err := continuationFingerprint(workState, branch, head, dirty, tap.text())
 		if err != nil {
 			report.terminateCaptured(ctx, workspace, startCommit, failed("fingerprint workspace state: "+err.Error()))
 			return exitFailed
@@ -1358,6 +1628,8 @@ const (
 	terminalCategoryUnknown                = "unknown"
 	terminalCategoryNeedsDecision          = "needs-decision"
 	terminalCategoryBlockedExternal        = "blocked-external"
+	terminalCategoryCapacityExhaustion     = "capacity-exhaustion"
+	terminalCategoryProviderUnavailable    = "provider-unavailable"
 )
 
 // The outcome kinds the coordinator may declare (#169).

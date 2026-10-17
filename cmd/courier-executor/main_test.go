@@ -1407,55 +1407,163 @@ func TestShrinkTerminationReason(t *testing.T) {
 	})
 }
 
-func TestRunChildExitTwoBecomesFailed(t *testing.T) {
+// TestRunChildExitTwoConsumesAvailabilityBudget replaces the old
+// TestRunChildExitTwoBecomesFailed, which encoded the now-invalid contract
+// that the child's raw exit 2 — numerically Courier's own NeedsHuman exit
+// constant — terminalized as Failed. A raw process status is never a
+// declaration: exit 2 with no session rides the bounded availability budget
+// (zero task continuations consumed) and ends on the recoverable
+// provider-unavailable handoff, so the claim moves instead of stranding.
+func TestRunChildExitTwoConsumesAvailabilityBudget(t *testing.T) {
 	root := t.TempDir()
 	remote := remoteWithExistingBranch(t, root)
 	fakeOpenCode := filepath.Join(root, "opencode")
 	writeExecutable(t, fakeOpenCode, "#!/bin/sh\ncase \"$1\" in mcp) exit 0;; esac\nexit 2\n")
 	prServer := fakeLinkedPRServer(t)
-	setResolveIssueEnv(t, root, remote, prServer.URL, fakeOpenCode)
+	setContinuationEnv(t, root, remote, prServer.URL, fakeOpenCode)
+	t.Setenv("COURIER_MAX_AVAILABILITY_RETRIES", "2")
 
 	var output bytes.Buffer
 	var errorsOut bytes.Buffer
-	if code := run(context.Background(), &output, &errorsOut); code != exitFailed {
-		t.Fatalf("run exit code = %d, want %d (the child's code must not pass through); stderr=%q stdout=%q", code, exitFailed, errorsOut.String(), output.String())
+	if code := run(context.Background(), &output, &errorsOut); code != exitNeedsHuman {
+		t.Fatalf("run exit code = %d, want %d (recoverable handoff); stderr=%q stdout=%q", code, exitNeedsHuman, errorsOut.String(), output.String())
 	}
-	if !strings.Contains(output.String(), `"phase":"Failed"`) {
-		t.Fatalf("child-exit-2 phase = %q", output.String())
+	out := output.String()
+	if !strings.Contains(out, `"outcome":"capacity_exhausted"`) || !strings.Contains(out, `"category":"provider-unavailable"`) {
+		t.Fatalf("child-exit-2 handoff missing the recoverable verdict: %q", out)
 	}
-	if !strings.Contains(output.String(), "opencode exited with status 2") {
-		t.Fatalf("child-exit-2 reason = %q", output.String())
+	if strings.Contains(out, `"phase":"Failed"`) {
+		t.Fatalf("raw exit 2 must not terminalize as Failed: %q", out)
 	}
-	if got := terminationLineJSON(t, output.String())["category"]; got != terminalCategoryModelTransportError {
-		t.Fatalf("termination category = %v, want %q", got, terminalCategoryModelTransportError)
+	if !strings.Contains(out, "last exit 2") {
+		t.Fatalf("handoff reason should keep the child's exit code: %q", out)
+	}
+	// The budget it burned was the availability budget, not task repair:
+	// two availability retries, zero crash continuations.
+	events := parseEvents(t, &output)
+	var crash, avail int
+	for _, event := range events {
+		if event["event"] != "executor.continuation" {
+			continue
+		}
+		switch kind := eventDetail(t, event)["kind"]; kind {
+		case "crash":
+			crash++
+		case "availability-retry":
+			avail++
+		}
+	}
+	if crash != 0 || avail != 2 {
+		t.Fatalf("crash continuations = %d (want 0), availability retries = %d (want 2)", crash, avail)
 	}
 }
 
-// TestRunChildExitThreeBecomesFailed is the symmetric guard for the
-// no_change_needed exit: a child that exits 3 without a declaration must fail
-// the run with the standard failure code, never end it with the no-change-
-// needed termination.
-func TestRunChildExitThreeBecomesFailed(t *testing.T) {
+// TestRunChildExitTwoWithSessionUsesTaskBudgetThenHandsOff proves exit 2 is
+// an ordinary unclassified crash once a session exists: it consumes the
+// task-repair continuation budget, and a spent budget recovers through the
+// fenced availability handoff rather than a permanent Failed.
+func TestRunChildExitTwoWithSessionUsesTaskBudgetThenHandsOff(t *testing.T) {
+	root := t.TempDir()
+	remote := remoteWithExistingBranch(t, root)
+	fakeOpenCode := filepath.Join(root, "opencode")
+	writeExecutable(t, fakeOpenCode, "#!/bin/sh\ncase \"$1\" in mcp) exit 0;; esac\nprintf '{\"type\":\"text\",\"sessionID\":\"ses_exit_two\",\"part\":{\"type\":\"text\",\"text\":\"crashing\"}}\\n'\nexit 2\n")
+	prServer := fakeLinkedPRServer(t)
+	setContinuationEnv(t, root, remote, prServer.URL, fakeOpenCode)
+	t.Setenv("COURIER_MAX_CONTINUATIONS", "1")
+	t.Setenv("COURIER_RESUME_BACKOFF_SECONDS", "0")
+
+	var output bytes.Buffer
+	var errorsOut bytes.Buffer
+	if code := run(context.Background(), &output, &errorsOut); code != exitNeedsHuman {
+		t.Fatalf("run exit code = %d, want %d (recoverable handoff after the task budget); stderr=%q stdout=%q", code, exitNeedsHuman, errorsOut.String(), output.String())
+	}
+	out := output.String()
+	if !strings.Contains(out, "after 1 continuations") || !strings.Contains(out, `"category":"provider-unavailable"`) {
+		t.Fatalf("session-crash handoff missing the task-budget detail: %q", out)
+	}
+	if strings.Contains(out, `"phase":"Failed"`) {
+		t.Fatalf("a spent crash budget on exit 2 must not end as Failed: %q", out)
+	}
+	events := parseEvents(t, &output)
+	var crash, avail int
+	for _, event := range events {
+		if event["event"] != "executor.continuation" {
+			continue
+		}
+		switch kind := eventDetail(t, event)["kind"]; kind {
+		case "crash":
+			crash++
+		case "availability-retry":
+			avail++
+		}
+	}
+	if crash != 1 || avail != 0 {
+		t.Fatalf("crash continuations = %d (want 1), availability retries = %d (want 0: every attempt served a session)", crash, avail)
+	}
+}
+
+// TestRunCanceledContextStaysFailedOnExitTwo pins the operator-cancellation
+// contract: a canceled context is the operator choosing to stop the run, not
+// a provider outage, so it stays a plain Failed and never enters the
+// recoverable capacity-handoff channel regardless of where the deadline
+// lands. The child sleeps past the deadline, so cancellation necessarily
+// interrupts the attempt stream.
+func TestRunCanceledContextStaysFailedOnExitTwo(t *testing.T) {
+	root := t.TempDir()
+	remote := remoteWithExistingBranch(t, root)
+	fakeOpenCode := filepath.Join(root, "opencode")
+	writeExecutable(t, fakeOpenCode, "#!/bin/sh\ncase \"$1\" in mcp) exit 0;; esac\nsleep 3\nexit 2\n")
+	prServer := fakeLinkedPRServer(t)
+	setResolveIssueEnv(t, root, remote, prServer.URL, fakeOpenCode)
+	t.Setenv("COURIER_RESUME_BACKOFF_SECONDS", "0")
+
+	ctx, cancel := context.WithTimeout(context.Background(), 1500*time.Millisecond)
+	defer cancel()
+	var output bytes.Buffer
+	var errorsOut bytes.Buffer
+	if code := run(ctx, &output, &errorsOut); code != exitFailed {
+		t.Fatalf("run exit code = %d, want %d (cancellation is not recoverable handoff); stdout=%q", code, exitFailed, output.String())
+	}
+	out := output.String()
+	if strings.Contains(out, `"outcome":"capacity_exhausted"`) || strings.Contains(out, `"category":"provider-unavailable"`) {
+		t.Fatalf("a canceled run must never enter the capacity-handoff channel: %q", out)
+	}
+	if !strings.Contains(out, `"phase":"Failed"`) {
+		t.Fatalf("canceled run phase = %q, want Failed", out)
+	}
+}
+
+// TestRunChildExitThreeHandsOffRecoverably is the symmetric guard for the
+// no_change_needed exit under the availability policy (#327 Scenario D): a
+// child that exits 3 without a declaration or a session burns its availability
+// budget and ends on the recoverable handoff, never with the no-change-needed
+// termination and never as a permanent Failed.
+func TestRunChildExitThreeHandsOffRecoverably(t *testing.T) {
 	root := t.TempDir()
 	remote := remoteWithExistingBranch(t, root)
 	fakeOpenCode := filepath.Join(root, "opencode")
 	writeExecutable(t, fakeOpenCode, "#!/bin/sh\ncase \"$1\" in mcp) exit 0;; esac\nexit 3\n")
 	prServer := fakeLinkedPRServer(t)
 	setResolveIssueEnv(t, root, remote, prServer.URL, fakeOpenCode)
+	t.Setenv("COURIER_MAX_AVAILABILITY_RETRIES", "1")
+	t.Setenv("COURIER_RESUME_BACKOFF_SECONDS", "0")
 
 	var output bytes.Buffer
 	var errorsOut bytes.Buffer
-	if code := run(context.Background(), &output, &errorsOut); code != exitFailed {
-		t.Fatalf("run exit code = %d, want %d; stderr=%q stdout=%q", code, exitFailed, errorsOut.String(), output.String())
+	if code := run(context.Background(), &output, &errorsOut); code != exitNeedsHuman {
+		t.Fatalf("run exit code = %d, want %d (recoverable handoff); stderr=%q stdout=%q", code, exitNeedsHuman, errorsOut.String(), output.String())
 	}
-	if !strings.Contains(output.String(), `"phase":"Failed"`) {
-		t.Fatalf("child-exit-3 phase = %q", output.String())
+	if !strings.Contains(output.String(), `"outcome":"capacity_exhausted"`) || !strings.Contains(output.String(), `"category":"provider-unavailable"`) {
+		t.Fatalf("child-exit-3 handoff = %q", output.String())
 	}
-	if !strings.Contains(output.String(), "opencode exited with status 3") {
-		t.Fatalf("child-exit-3 reason = %q", output.String())
+	if !strings.Contains(output.String(), "last exit 3") {
+		t.Fatalf("child-exit-3 reason should keep the child's exit code: %q", output.String())
 	}
 	if strings.Contains(output.String(), `"phase":"NoChangeNeeded"`) {
 		t.Fatalf("child exit 3 must never end the run with the no_change_needed exit: %q", output.String())
+	}
+	if strings.Contains(output.String(), `"phase":"Failed"`) {
+		t.Fatalf("an unavailable provider must not permanently fail the work: %q", output.String())
 	}
 }
 
@@ -1804,10 +1912,11 @@ exit 1
 	}
 }
 
-// TestRunCrashFailsAfterBudget proves a run that keeps crashing exhausts the
-// continuation budget and then fails with the child's exit code, reporting the
-// number of continuations.
-func TestRunCrashFailsAfterBudget(t *testing.T) {
+// TestRunCrashHandsOffRecoverablyAfterBudget proves a run that keeps
+// crashing consumes the continuation budget and then ends on the recoverable
+// availability handoff — reporting the number of continuations — instead of
+// terminalizing as Failed and stranding the claim (#327).
+func TestRunCrashHandsOffRecoverablyAfterBudget(t *testing.T) {
 	root := t.TempDir()
 	remote := remoteWithExistingBranch(t, root)
 	fakeOpenCode := filepath.Join(root, "opencode")
@@ -1823,14 +1932,18 @@ exit 1
 
 	var output bytes.Buffer
 	var errorsOut bytes.Buffer
-	if code := run(context.Background(), &output, &errorsOut); code != 1 {
-		t.Fatalf("run exit code = %d, want the child's code 1; stderr=%q stdout=%q", code, errorsOut.String(), output.String())
+	if code := run(context.Background(), &output, &errorsOut); code != exitNeedsHuman {
+		t.Fatalf("run exit code = %d, want %d (recoverable handoff); stderr=%q stdout=%q", code, exitNeedsHuman, errorsOut.String(), output.String())
 	}
-	if !strings.Contains(output.String(), `"phase":"Failed"`) {
-		t.Fatalf("missing Failed termination: %q", output.String())
+	out := output.String()
+	if !strings.Contains(out, `"outcome":"capacity_exhausted"`) || !strings.Contains(out, `"category":"provider-unavailable"`) {
+		t.Fatalf("missing recoverable availability handoff: %q", out)
 	}
-	if !strings.Contains(output.String(), "opencode exited with status 1 after 2 continuations") {
-		t.Fatalf("failure reason = %q, want the budget-exhausted reason", output.String())
+	if strings.Contains(out, `"phase":"Failed"`) {
+		t.Fatalf("a crashed child must not strand the work as Failed: %q", out)
+	}
+	if !strings.Contains(out, "opencode exited with status 1 after 2 continuations") {
+		t.Fatalf("handoff reason = %q, want the budget-exhausted detail", out)
 	}
 
 	events := parseEvents(t, &output)
@@ -1890,28 +2003,95 @@ exit 0
 	}
 }
 
-// TestRunCrashWithoutSessionFailsImmediately proves a child that exits with a
-// crash code before printing any sessionID fails with the standard failure
-// code and emits no continuation event: there is no session to resume.
-func TestRunCrashWithoutSessionFailsImmediately(t *testing.T) {
+// TestRunCrashWithoutSessionRetriesThenHandsOffRecoverably proves a provider
+// outage (#327 Scenario D): a child that exits with a crash code before any
+// sessionID burns the dedicated availability budget with backoff events, then
+// ends on the recoverable capacity-handoff channel — exit 2 with the
+// capacity_exhausted outcome and the honest provider-unavailable category —
+// instead of terminalizing as Failed. Work released this way is claimable by
+// another capacity; it is never a task verdict, and the task-repair
+// continuation budget is untouched.
+func TestRunCrashWithoutSessionRetriesThenHandsOffRecoverably(t *testing.T) {
 	root := t.TempDir()
 	remote := remoteWithExistingBranch(t, root)
 	fakeOpenCode := filepath.Join(root, "opencode")
 	writeExecutable(t, fakeOpenCode, "#!/bin/sh\ncase \"$1\" in mcp) exit 0;; esac\nexit 3\n")
 	prServer := fakeLinkedPRServer(t)
 	setContinuationEnv(t, root, remote, prServer.URL, fakeOpenCode)
+	t.Setenv("COURIER_MAX_AVAILABILITY_RETRIES", "2")
 
 	var output bytes.Buffer
 	var errorsOut bytes.Buffer
-	if code := run(context.Background(), &output, &errorsOut); code != exitFailed {
-		t.Fatalf("run exit code = %d, want %d; stderr=%q stdout=%q", code, exitFailed, errorsOut.String(), output.String())
+	if code := run(context.Background(), &output, &errorsOut); code != exitNeedsHuman {
+		t.Fatalf("run exit code = %d, want %d (recoverable handoff); stderr=%q stdout=%q", code, exitNeedsHuman, errorsOut.String(), output.String())
 	}
-	if !strings.Contains(output.String(), `"phase":"Failed"`) {
-		t.Fatalf("missing Failed termination: %q", output.String())
+	out := output.String()
+	if !strings.Contains(out, `"outcome":"capacity_exhausted"`) || !strings.Contains(out, `"category":"provider-unavailable"`) {
+		t.Fatalf("missing recoverable availability handoff: %q", out)
+	}
+	if strings.Contains(out, `"phase":"Failed"`) {
+		t.Fatalf("outage must not terminalize as Failed: %q", out)
 	}
 	events := parseEvents(t, &output)
-	if n := countEvents(t, events, "executor.continuation"); n != 0 {
-		t.Fatalf("executor.continuation count = %d, want 0 (no session to resume)", n)
+	if n := countEvents(t, events, "executor.continuation"); n != 2 {
+		t.Fatalf("executor.continuation count = %d, want 2 availability retries", n)
+	}
+	for _, event := range events {
+		if event["event"] != "executor.continuation" {
+			continue
+		}
+		if d := eventDetail(t, event); d["kind"] != "availability-retry" {
+			t.Fatalf("continuation kind = %v, want availability-retry", d["kind"])
+		}
+	}
+}
+
+// TestRunAvailabilityBudgetDoesNotConsumeTaskContinuations proves the two
+// budgets are separate: repeated no-session crashes (an outage) must not
+// drain the task-repair continuation budget, so a provider that recovers
+// mid-run still gets its full repair allowance for real work states.
+func TestRunAvailabilityBudgetDoesNotConsumeTaskContinuations(t *testing.T) {
+	root := t.TempDir()
+	remote := remoteWithExistingBranch(t, root)
+	fakeOpenCode := filepath.Join(root, "opencode")
+	writeExecutable(t, fakeOpenCode, `#!/bin/sh
+case "$1" in mcp) exit 0;; esac
+printf '%s\n' "$(printf '%s' "$*" | tr '\n' ' ')" >> "$COURIER_FAKE_STATE/argv.log"
+if [ "$(wc -l < "$COURIER_FAKE_STATE/argv.log" | tr -d ' ')" -le 2 ]; then exit 3; fi
+printf '{"type":"text","sessionID":"ses_attempt_%s","part":{"type":"text","text":"back"}}\n' "$(wc -l < "$COURIER_FAKE_STATE/argv.log" | tr -d ' ')"
+exit 1
+`)
+	prServer := fakeLinkedPRServer(t)
+	setContinuationEnv(t, root, remote, prServer.URL, fakeOpenCode)
+	t.Setenv("COURIER_MAX_AVAILABILITY_RETRIES", "5")
+	t.Setenv("COURIER_MAX_CONTINUATIONS", "1")
+
+	var output bytes.Buffer
+	var errorsOut bytes.Buffer
+	if code := run(context.Background(), &output, &errorsOut); code != exitNeedsHuman {
+		t.Fatalf("run exit code = %d, want %d (recoverable handoff after the task budget); stderr=%q stdout=%q", code, exitNeedsHuman, errorsOut.String(), output.String())
+	}
+	out := output.String()
+	if !strings.Contains(out, "after 1 continuations") || !strings.Contains(out, `"category":"provider-unavailable"`) {
+		t.Fatalf("terminal handoff missing the task-budget detail: %q", out)
+	}
+	// Budget separation: the two no-session crashes rode the availability
+	// budget; only the post-recovery crash consumed a task continuation.
+	events := parseEvents(t, &output)
+	var crash, avail int
+	for _, event := range events {
+		if event["event"] != "executor.continuation" {
+			continue
+		}
+		switch kind := eventDetail(t, event)["kind"]; kind {
+		case "crash":
+			crash++
+		case "availability-retry":
+			avail++
+		}
+	}
+	if crash != 1 || avail != 2 {
+		t.Fatalf("crash continuations = %d (want 1), availability retries = %d (want 2)", crash, avail)
 	}
 }
 
@@ -2471,9 +2651,10 @@ git push origin "$COURIER_BRANCH" >/dev/null 2>&1
 }
 
 // TestChildOutputRedactedOnFailureExit keeps failure-exit semantics and
-// redaction on a failing child: the run exits with the standard failure code
-// (the child's code rides in the termination reason) and the child's final
-// output is flushed through the redactor before the termination handoff.
+// redaction on an abnormally ending child under the availability policy: the
+// run ends on the recoverable handoff (the child's code rides in the handoff
+// reason) and the child's final output is flushed through the redactor before
+// the termination handoff.
 func TestChildOutputRedactedOnFailureExit(t *testing.T) {
 	root := t.TempDir()
 	remote := remoteWithExistingBranch(t, root)
@@ -2491,14 +2672,16 @@ exit 3
 	t.Setenv("COURIER_GIT_TOKEN", testGitToken)
 	t.Setenv("COURIER_RUN_NAME", "coderrun-it-7")
 	t.Setenv("COURIER_REF", "7")
+	t.Setenv("COURIER_MAX_AVAILABILITY_RETRIES", "1")
+	t.Setenv("COURIER_RESUME_BACKOFF_SECONDS", "0")
 
 	var output bytes.Buffer
 	var errorsOut bytes.Buffer
-	if code := run(context.Background(), &output, &errorsOut); code != exitFailed {
-		t.Fatalf("run exit code = %d, want %d (the child's code must not pass through)", code, exitFailed)
+	if code := run(context.Background(), &output, &errorsOut); code != exitNeedsHuman {
+		t.Fatalf("run exit code = %d, want %d (recoverable availability handoff); stderr=%q", code, exitNeedsHuman, errorsOut.String())
 	}
-	if !strings.Contains(output.String(), "opencode exited with status 3") {
-		t.Fatalf("failure reason should keep the child's exit code: %q", output.String())
+	if !strings.Contains(output.String(), "last exit 3") {
+		t.Fatalf("handoff reason should keep the child's exit code: %q", output.String())
 	}
 	if strings.Contains(output.String(), testGitToken) {
 		t.Fatal("stdout contains a fake credential on the failure path (constant: testGitToken)")
@@ -2506,7 +2689,7 @@ exit 3
 	if !strings.Contains(output.String(), "failing run token") || !strings.Contains(output.String(), courierlog.RedactedPlaceholder) {
 		t.Fatal("failure-path stdout lost ordinary output or the redaction placeholder")
 	}
-	if !strings.Contains(output.String(), `"phase":"Failed"`) {
+	if !strings.Contains(output.String(), `"category":"provider-unavailable"`) {
 		t.Fatal("failure path lost the termination handoff")
 	}
 }

@@ -364,7 +364,10 @@ func encodeDispatchContext(existing, token, fixID string, generation int) string
 }
 
 func (c *HTTPClient) PrepareCapacityRecovery(ctx context.Context, id, opaqueContext string) (source.CapacityRecoveryProof, error) {
-	d, err := decodeWorkID(id)
+	// Resolve the issue ID the same way Claim does: Dispatch's task offer may
+	// carry only repo+number, and the fence still rides the claim receipt, so
+	// the state lookup adds no trust the claim did not already establish.
+	d, err := c.resolveIssue(ctx, id)
 	if err != nil {
 		return source.CapacityRecoveryProof{}, err
 	}
@@ -382,7 +385,9 @@ func (c *HTTPClient) PrepareCapacityRecovery(ctx context.Context, id, opaqueCont
 }
 
 func (c *HTTPClient) SettleCapacityExhaustion(ctx context.Context, id, opaqueContext string, handoff source.CapacityHandoff) error {
-	d, err := decodeWorkID(id)
+	// Same resolution as PrepareCapacityRecovery: the server-side lease check
+	// on claimToken remains the authority for both paths.
+	d, err := c.resolveIssue(ctx, id)
 	if err != nil {
 		return err
 	}
