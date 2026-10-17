@@ -127,6 +127,19 @@ func Capture(ctx context.Context, opts Options) (*Bundle, error) {
 					applySymlinkMetadata(&entry, &totals, dir, full)
 					break
 				}
+				if errors.Is(rerr, errNotRegular) {
+					// The path was swapped for a fifo, directory, or device
+					// between the Lstat classification and this open:
+					// re-classify exactly as a path classified non-regular
+					// outright — omitted-binary, storing nothing — so a peer
+					// the classification pass never saw is never waited on and
+					// never blocks the capture. A socket swap needs no branch
+					// of its own: its read-only open fails outright and falls
+					// to the generic failed-read case, which stores nothing.
+					entry.Disposition = DispositionOmittedBinary
+					totals.OmittedBinary++
+					break
+				}
 				entry.Disposition = DispositionOmittedBinary
 				entry.Bytes = info.Size()
 				totals.OmittedBinary++
@@ -434,6 +447,10 @@ func truncateDisplay(s string) string {
 	return s[:cut] + "…"
 }
 
+// errNotRegular reports that the descriptor readCapped opened is not a
+// regular file, so nothing was read and nothing can be stored.
+var errNotRegular = errors.New("evidence: opened file is not regular")
+
 // readFileForCapture reads the content of a file classified as regular.
 // Tests swap it to simulate a hostile worktree mutating a path between the
 // Lstat classification and the read.
@@ -443,12 +460,28 @@ var readFileForCapture = readCapped
 // and reads at most limit bytes, stopping there even if the file on disk is
 // larger. A path swapped for a symlink after classification fails with
 // ELOOP instead of following the new target.
+//
+// A path swapped for a non-regular file — fifo, directory, device — is
+// opened O_NONBLOCK so the open cannot wait for a peer that may never come,
+// then checked with fstat on the descriptor: a non-regular result fails with
+// errNotRegular. fstat describes the object actually opened rather than the
+// path, so the check cannot be swapped out from under it the way a second
+// Lstat could. O_NONBLOCK is a no-op for the regular files this is reached
+// for. A swap to a socket never reaches this check: a read-only open of a
+// socket fails with ENXIO before any blocking is possible.
 func readCapped(path string, limit int) ([]byte, error) {
-	f, err := os.OpenFile(path, os.O_RDONLY|syscall.O_NOFOLLOW, 0)
+	f, err := os.OpenFile(path, os.O_RDONLY|syscall.O_NOFOLLOW|syscall.O_NONBLOCK, 0)
 	if err != nil {
 		return nil, err
 	}
 	defer f.Close()
+	info, err := f.Stat()
+	if err != nil {
+		return nil, err
+	}
+	if !info.Mode().IsRegular() {
+		return nil, errNotRegular
+	}
 	return io.ReadAll(io.LimitReader(f, int64(limit)))
 }
 

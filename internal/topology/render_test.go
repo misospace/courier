@@ -4,6 +4,7 @@ import (
 	"crypto/x509"
 	"encoding/pem"
 	"reflect"
+	"strings"
 	"testing"
 
 	"github.com/misospace/courier/internal/executor"
@@ -15,6 +16,7 @@ import (
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/util/validation"
 
 	courier "github.com/misospace/courier/api/v1alpha1"
 )
@@ -548,5 +550,77 @@ func TestResourceNamesStayUniqueAndStable(t *testing.T) {
 	}
 	if ControlPodName("short") != "short-control" {
 		t.Fatalf("short name = %q", ControlPodName("short"))
+	}
+}
+
+func TestServiceNamesAreValidDNSLabels(t *testing.T) {
+	names := []string{
+		"short",
+		"run.test",
+		"9lives",
+		"12345",
+		"9.lives.and.bones",
+		strings.Repeat("a", 60),
+		strings.Repeat("a", 59) + "x",
+		strings.Repeat("a", 59) + "y",
+		strings.Repeat("z", 253),
+		strings.Repeat("a.b", 84) + "c",
+	}
+	for _, name := range names {
+		if errs := validation.IsDNS1123Subdomain(name); len(errs) > 0 {
+			t.Fatalf("test input %q is not a supported CoderRun name: %v", name, errs)
+		}
+		for _, got := range []struct {
+			kind string
+			fn   func(string) string
+		}{{"broker", BrokerServiceName}, {"worker", WorkerServiceName}} {
+			svc := got.fn(name)
+			if errs := validation.IsDNS1035Label(svc); len(errs) > 0 {
+				t.Errorf("%s Service name for run %q = %q: %v", got.kind, name, svc, errs)
+			}
+			if again := got.fn(name); again != svc {
+				t.Errorf("%s Service name for run %q is not stable: %q then %q", got.kind, name, svc, again)
+			}
+		}
+	}
+	if BrokerServiceName("short") != "short-broker" || WorkerServiceName("short") != "short-worker" {
+		t.Fatalf("valid short names must pass through unchanged: %q %q",
+			BrokerServiceName("short"), WorkerServiceName("short"))
+	}
+	if BrokerServiceName("run.test") == BrokerServiceName("run-test") {
+		t.Fatal("dotted run name must not collide with its hyphenated form")
+	}
+	if BrokerServiceName("9lives") == WorkerServiceName("lives9") {
+		t.Fatal("distinct run names must not collide")
+	}
+	sharedPrefixA := BrokerServiceName(strings.Repeat("a", 59) + "x")
+	sharedPrefixB := BrokerServiceName(strings.Repeat("a", 59) + "y")
+	if sharedPrefixA == sharedPrefixB {
+		t.Fatalf("run names differing past the truncation point collide: %q", sharedPrefixA)
+	}
+	for _, name := range []string{"short", "run.test", "12345", strings.Repeat("a", 60)} {
+		if BrokerServiceName(name) == WorkerServiceName(name) {
+			t.Fatalf("run %q broker and worker Services collide: %q", name, BrokerServiceName(name))
+		}
+	}
+	if BrokerServiceDNS("ns", "run.test") != BrokerServiceName("run.test")+".ns.svc.cluster.local" {
+		t.Fatal("broker DNS must derive from the canonical Service name")
+	}
+	if WorkerServiceDNS("ns", "9lives") != WorkerServiceName("9lives")+".ns.svc.cluster.local" {
+		t.Fatal("worker DNS must derive from the canonical Service name")
+	}
+}
+
+func TestRenderedServicesCarryValidNames(t *testing.T) {
+	for _, name := range []string{"short", "run.test", "9lives", strings.Repeat("a", 60), strings.Repeat("z", 253)} {
+		run := testRun(name)
+		broker := BrokerService(run)
+		worker := WorkerService(run)
+		if errs := validation.IsDNS1035Label(broker.Name); len(errs) > 0 {
+			t.Errorf("rendered broker Service for run %q has invalid name %q: %v", name, broker.Name, errs)
+		}
+		if errs := validation.IsDNS1035Label(worker.Name); len(errs) > 0 {
+			t.Errorf("rendered worker Service for run %q has invalid name %q: %v", name, worker.Name, errs)
+		}
 	}
 }

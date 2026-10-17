@@ -233,7 +233,135 @@ if [ "$agg_rc" -eq 2 ]; then
 else
   report FAIL "aggregator: too many args" "rc=$agg_rc"
 fi
+# Every image job builds with `context: .`, so .dockerignore decides what the
+# builder sees. The invariant worth enforcing is that no path the Dockerfile
+# reads out of the context may be excluded, because that breaks every image
+# build. `.git` is asserted excluded as well, since shipping repo history to the
+# builder is the cost this file exists to avoid, and an all-empty ignore file
+# would otherwise satisfy every other case below.
+#
+# This deliberately does NOT pin the full rule list. The set of non-build paths
+# is repo layout, it changes as the tree changes, and ci-change-classifier.sh
+# already forces the real image builds to run on any .dockerignore change -- so
+# the expensive non-inputs are covered by those builds, not by asserting here
+# that a particular directory name is still present.
+dockerignore="$script_dir/../.dockerignore"
+dockerfile="$script_dir/../Dockerfile"
 
+# Paths every COPY/ADD reads from the build context, one per line, sorted and
+# deduplicated. Line continuations are joined first (an unwrapped COPY loses
+# sources silently), --flags are dropped rather than mistaken for sources, and
+# the trailing destination is discarded. Sources are normalised to paths with no
+# trailing slash so a directory source compares equal to what the ignore rules
+# match against.
+context_sources() {
+  awk '
+    {
+      line = $0
+      while (line ~ /\\[[:space:]]*$/) {
+        sub(/\\[[:space:]]*$/, "", line)
+        if ((getline nxt) <= 0) break
+        line = line " " nxt
+      }
+      sub(/^[[:space:]]+/, "", line)
+      if (line !~ /^(COPY|ADD|copy|add)[[:space:]]/) next
+      # --from= reads another stage, so it contributes no context source.
+      if (line ~ /--from=/) next
+      sub(/^(COPY|ADD|copy|add)[[:space:]]+/, "", line)
+      n = split(line, field, /[[:space:]]+/)
+      m = 0
+      for (i = 1; i <= n; i++) {
+        if (field[i] == "" || field[i] ~ /^--/) continue
+        gsub(/^["\047]|["\047]$/, "", field[i])
+        src[++m] = field[i]
+      }
+      for (i = 1; i < m; i++) {
+        s = src[i]
+        sub(/\/+$/, "", s)
+        print s
+      }
+    }
+  ' "$1" | sort -u
+}
+
+# True when .dockerignore would exclude the given context path, modelling
+# Docker's rules: * and ? stop at "/", a pattern matches at any depth, and
+# matching a directory excludes everything beneath it. Kept deliberately
+# minimal -- it understands no `**`, matching Docker closely enough for the
+# single-star patterns this repository uses and failing closed below if a COPY
+# source appears that it cannot reason about.
+dockerignore_drops() {
+  awk -v df="$dockerignore" -v target="$1" '
+    function to_ere(p,   out, i, c) {
+      out = ""
+      for (i = 1; i <= length(p); i++) {
+        c = substr(p, i, 1)
+        if (c == "*") out = out "[^/]*"
+        else if (c == "?") out = out "[^/]"
+        else if (index("\\^$.[]|()", c) > 0) out = out "\\" c
+        else out = out c
+      }
+      return out
+    }
+    FILENAME == df {
+      if ($0 ~ /^[[:space:]]*(#|$)/) next
+      if ($0 ~ /^[[:space:]]*!/) next
+      p = $0
+      sub(/^[[:space:]]+/, "", p)
+      sub(/^\/+/, "", p)
+      sub(/\/+$/, "", p)
+      if (p == "") next
+      ere[++np] = "^" to_ere(p) "$"
+      next
+    }
+    END {
+      if (target == "" || target == ".") { print "unanalysable"; exit }
+      for (i = 1; i <= np; i++) {
+        probe = target
+        while (1) {
+          if (probe ~ ere[i]) { print "drops"; exit }
+          if (probe !~ /\//) break
+          sub(/\/[^/]*$/, "", probe)
+        }
+      }
+      print "keeps"
+    }
+  ' "$dockerignore"
+}
+
+if [ ! -r "$dockerignore" ]; then
+  report FAIL "dockerignore: present" "missing $(basename "$dockerignore")"
+elif [ ! -r "$dockerfile" ]; then
+  report FAIL "dockerignore: reads Dockerfile" "missing $(basename "$dockerfile")"
+else
+  report PASS "dockerignore: present"
+  case_n=$((case_n + 1))
+  if [ "$(dockerignore_drops .git)" = "drops" ]; then
+    report PASS "dockerignore: excludes .git"
+  else
+    report FAIL "dockerignore: excludes .git" "repo history would reach the builder"
+  fi
+  sources_file="$work/context-sources.txt"
+  context_sources "$dockerfile" > "$sources_file"
+  if [ ! -s "$sources_file" ]; then
+    report FAIL "dockerignore: reads Dockerfile context sources" "parsed none"
+  else
+    while IFS= read -r source; do
+      case_n=$((case_n + 1))
+      case "$(dockerignore_drops "$source")" in
+        drops)
+          report FAIL "dockerignore: keeps Dockerfile input $source" "excluded by .dockerignore"
+          ;;
+        unanalysable)
+          report FAIL "dockerignore: keeps Dockerfile input $source" "cannot analyse this source"
+          ;;
+        *)
+          report PASS "dockerignore: keeps Dockerfile input $source"
+          ;;
+      esac
+    done < "$sources_file"
+  fi
+fi
 echo
 echo "total: $((pass + fail)) passed: $pass failed: $fail"
 if [ "$fail" -gt 0 ]; then
