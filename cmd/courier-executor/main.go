@@ -1336,6 +1336,11 @@ func run(ctx context.Context, stdout, stderr io.Writer) int {
 						"code":    code,
 						"attempt": availability,
 					})
+					// Same gate as the crash continuation: a dying tool may
+					// have left uncommitted work from an earlier session-
+					// serving attempt; a retry is exactly the moment the
+					// next turn could clobber it.
+					report.maybeCaptureEvidence(ctx, workspace, startCommit, evidence.TriggerCrash)
 					delay := cfg.ResumeBackoff * time.Duration(1<<min(availability-1, maxAvailabilityBackoffCap))
 					select {
 					case <-time.After(delay):
@@ -1347,7 +1352,7 @@ func run(ctx context.Context, stdout, stderr io.Writer) int {
 					continue
 				}
 				if ctx.Err() == nil {
-					report.terminateCaptured(ctx, workspace, startCommit, report.availabilityRecoveryTermination(ctx, workspace, cfg, startCommit, code, fmt.Sprintf("model provider failed to serve %d consecutive attempts without a session", cfg.MaxAvailabilityRetries)))
+					report.terminateCaptured(ctx, workspace, startCommit, report.availabilityRecoveryTermination(ctx, workspace, cfg, startCommit, fmt.Sprintf("model provider failed to serve %d consecutive attempts without a session (last exit %d)", cfg.MaxAvailabilityRetries, code)))
 					return exitNeedsHuman
 				}
 			} else {
@@ -1394,7 +1399,7 @@ func run(ctx context.Context, stdout, stderr io.Writer) int {
 				report.terminateCaptured(ctx, workspace, startCommit, failedWith(reason, terminalCategoryModelTransportError))
 				return exitFailed
 			}
-			report.terminateCaptured(ctx, workspace, startCommit, report.availabilityRecoveryTermination(ctx, workspace, cfg, startCommit, code, reason))
+			report.terminateCaptured(ctx, workspace, startCommit, report.availabilityRecoveryTermination(ctx, workspace, cfg, startCommit, reason))
 			return exitNeedsHuman
 		}
 

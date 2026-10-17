@@ -45,7 +45,11 @@ func classifyProviderExhaustion(line []byte, signals exhaustionSignals) (bool, s
 		return false, "", ""
 	}
 	classified := harness.ClassifyProviderError(data.StatusCode, nil, []byte(data.ResponseBody), signals)
-	if classified.Availability == harness.ProviderAllowanceExhausted {
+	// A quota verdict must be carried by the body's structured signal, never
+	// by status code alone: the harness treats bare 402 as allowance-shaped,
+	// but the stop path kills a working child and ends the run as exhausted,
+	// which #327 reserves for authoritative evidence.
+	if classified.Availability == harness.ProviderAllowanceExhausted && classified.Code != "" {
 		return true, string(classified.Availability), classified.Code
 	}
 	// Some Anthropic-compatible responses expose their numeric plan code only as
@@ -125,14 +129,14 @@ func (r reporter) capacityExhaustedTermination(ctx context.Context, workspace *g
 // outcome — but with the honest provider-unavailable category, never claiming
 // a quota verdict the evidence does not support. `detail` carries why this
 // attempt stream ended (outage retries or a spent crash budget).
-func (r reporter) availabilityRecoveryTermination(ctx context.Context, workspace *git.Workspace, cfg config, startCommit string, exitStatus int, detail string) termination {
+func (r reporter) availabilityRecoveryTermination(ctx context.Context, workspace *git.Workspace, cfg config, startCommit string, detail string) termination {
 	ctx, cancel := context.WithTimeout(ctx, 20*time.Second)
 	defer cancel()
 	return termination{
 		Phase:           "NeedsHuman",
 		Result:          "needs-human",
 		ExitCode:        exitNeedsHuman,
-		Reason:          fmt.Sprintf("%s (last exit %d); releasing work for another capacity without a structured exhaustion signal", detail, exitStatus),
+		Reason:          fmt.Sprintf("%s; releasing work for another capacity without a structured exhaustion signal", detail),
 		Outcome:         string(executor.OutcomeCapacityExhausted),
 		Category:        terminalCategoryProviderUnavailable,
 		WorkspaceSafety: capacityWorkspaceSafety(ctx, workspace, cfg.RemoteURL, cfg.Branch, startCommit),

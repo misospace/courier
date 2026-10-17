@@ -29,6 +29,8 @@ func TestClassifyProviderExhaustionOpenCodeEvents(t *testing.T) {
 		{name: "generic 429", line: strings.Replace(body("2056"), "2056", "429", 1)},
 		{name: "unknown provider code", line: body("987654")},
 		{name: "assistant prose", line: `{"type":"text","sessionID":"ses_fixture","part":{"type":"text","text":"provider quota exceeded (2056)"}}`},
+		{name: "bare 402 without a body signal", line: `{"type":"error","sessionID":"ses_fixture","error":{"name":"APIError","data":{"statusCode":402,"responseBody":"{\"error\":{\"message\":\"upgrade your plan\"}}"}}}`},
+		{name: "402 with a structured quota code", line: `{"type":"error","sessionID":"ses_fixture","error":{"name":"APIError","data":{"statusCode":402,"responseBody":"{\"error\":{\"code\":\"insufficient_quota\",\"message\":\"credits depleted\"}}"}}}`, want: true, wantCode: "insufficient_quota"},
 		{name: "non event JSON", line: `{"error":{"type":"provider.rate-limit","status":429}}`},
 		{name: "malformed event", line: `{"type":"error","error":`},
 	} {
