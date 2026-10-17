@@ -3577,3 +3577,29 @@ was superseded.
   client query had no remaining caller after this change and is gone, so one
   listing seam remains. (#365, closing the `Observer` carve-out left open by
   the #343 entry.)
+- **2026-10-17 — #372: native worker cancellation proves the task tree
+  is gone, and never claims otherwise.**
+  `internal/protocol` ran each task through `exec.CommandContext`, which kills
+  only the direct child, while production tasks are `sh -c ...`: a cancelled
+  shell left its own commands mutating the shared workspace after the worker
+  acknowledged verified termination, and a descendant that inherited the task's
+  output descriptors could hold the wait open so cancellation was never
+  acknowledged at all. Each task now leads its own process group
+  (`SysProcAttr.Setpgid`, verified after start — a task that did not get one
+  fails instead of reporting a termination nobody can prove), cancellation
+  signals the whole group, and the wait carries a bound so an inherited
+  descriptor cannot wedge cleanup. Nothing is acknowledged as stopped until the
+  worker proves the group holds no live process — zombies excluded, because an
+  exited process nobody has reaped yet holds no descriptors and writes nothing.
+  Work that leaves the group (`setsid`) escapes the signal, so a wait that
+  outlasts the grace is itself the evidence that a writer outside the group
+  survived: the count is reported nonzero and the cancellation is refused
+  (non-2xx) instead of acknowledged. The same count on the coordinator side
+  keeps `verifiedResult` from clearing an operation whose terminal state the
+  worker called unproven, so an unverified tree stays suppressed rather than
+  claimed gone. Cancellation tombstones and no-redelivery are unchanged, and the
+  bounds are cleanup bounds, never a run wall-clock. Containment stronger than a
+  process group (a per-task PID namespace or cgroup) is the remaining limit and
+  is tracked separately; this is the worker half of the process-group
+  cancellation the executor already performs (#115), for a different caller.
+  (#372)
