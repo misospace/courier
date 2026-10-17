@@ -2017,6 +2017,26 @@ named items remain unresolved and must not be described as production-ready:
   wiring) the observer keeps its GitHub.com client unchanged. Rejected: a
   second deployment flag for an Enterprise-first API base — it would fork the
   source of truth and still misroute mixed-host registries.
+
+- **2026-10-17 — #408: the capture's uncapped git read is bounded by the
+  operation deadline too, and a successful child whose pipes outlive it keeps
+  the bytes rather than the failure.** `runGit` handed `os/exec` stdout and
+  stderr buffers, so `Wait` consulted the context for the process but then
+  blocked on the copy goroutines until EOF — and a grandchild outliving git
+  (`git-remote-*`, askpass) holds a write end open forever, making the stall
+  that motivated #392 for `runGitCapped` reachable one function up, in the
+  same commit-scan loop. `runGit` now sets the same 2-second `WaitDelay`,
+  keeps the output of a child that exited successfully before its pipe was
+  held (`ErrWaitDelay` gated on `ProcessState` success), surfaces a canceled
+  context's own error, and caps the stderr it keeps with the shared
+  `stderrLimit`. Applying that cap exposed a short write in
+  `cappedBuffer.Write`: on a chunk straddling the limit it reported the
+  truncated count, which stops `io.Copy` and closes the child's pipe, so a
+  verbose-stderr git died of SIGPIPE instead of having its excess discarded;
+  the writer now consumes every chunk whole. No new bound is claimed — the
+  grace period already budgets a 2-second child-kill wait; this puts
+  `runGit`'s reads inside it.
+
 - **2026-10-16 — #282: the legacy executor enforces the criterion-evidence
   contract in one shared handoff plan, and the pinned envelope binds to the
   trusted source identity.** `applyLinkagePlan` became `applyHandoffPlan`
