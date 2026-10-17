@@ -614,11 +614,13 @@ func runGitCapped(ctx context.Context, dir string, limit int, args ...string) (o
 		if ctx.Err() != nil {
 			return nil, false, ctx.Err()
 		}
-		// WaitDelay expiring means the child itself succeeded but a surviving
-		// grandchild still held one of its pipes; a genuine git failure surfaces
-		// as its own exit status instead. stdout reached EOF, so what was read
-		// is complete and the timeout is ours, not git's: keep the bytes.
-		if errors.Is(err, exec.ErrWaitDelay) {
+		// ErrWaitDelay arrives only for a process that exited successfully with
+		// its pipes still open — a surviving grandchild — and ProcessState
+		// confirms that here rather than leaning on that precedence. stdout
+		// reached EOF, so the bytes are the complete result and the timeout is
+		// ours, not git's: keep them. A child that exited non-zero keeps its
+		// exit status in the wrapped error below.
+		if errors.Is(err, exec.ErrWaitDelay) && cmd.ProcessState != nil && cmd.ProcessState.Success() {
 			return out, false, nil
 		}
 		return nil, false, fmt.Errorf("git %s: %w: %s", strings.Join(args, " "), err, strings.TrimSpace(string(stderr.data)))

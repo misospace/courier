@@ -798,6 +798,54 @@ func TestRunGitCappedSurvivingPipeOnSuccess(t *testing.T) {
 	}
 }
 
+// TestRunGitCappedFailureWithHeldPipe is the failure side of that sibling
+// case: a git command that exits non-zero while a surviving grandchild still
+// holds a pipe must still fail the capture, with its exit status and stderr.
+// os/exec gives the process error precedence over a WaitDelay overrun, so a
+// failed child never reports ErrWaitDelay and the branch that keeps the bytes
+// stays reachable only for a child that succeeded. Nothing can fail the
+// ProcessState guard alone — that precedence rules it out — so this pins the
+// precedence itself; reverting capture.go past #392 fails it, parked on the
+// held stderr pipe until the guard trips.
+func TestRunGitCappedFailureWithHeldPipe(t *testing.T) {
+	t.Parallel()
+
+	dir := newRepo(t)
+	// The alias fails on stderr and exits 3 while sleep keeps only the stderr
+	// write end open, so WaitDelay elapses with a real git failure behind it.
+	git(t, dir, "config", "alias.holdfail", "!sh -c 'echo git-failed >&2; sleep 30 >&2 & exit 3'")
+
+	type held struct {
+		out  []byte
+		over bool
+		err  error
+	}
+	done := make(chan held, 1)
+	go func() {
+		out, over, err := runGitCapped(context.Background(), dir, MaxFileBytes, "holdfail")
+		done <- held{out, over, err}
+	}()
+
+	var got held
+	select {
+	case got = <-done:
+	case <-time.After(20 * time.Second):
+		t.Fatal("runGitCapped did not return within 20s while a grandchild held the stderr pipe")
+	}
+	if got.err == nil {
+		t.Fatalf("err = nil, want an error: a command that exited 3 is a git failure even with a grandchild holding a pipe (out = %q)", got.out)
+	}
+	if !strings.Contains(got.err.Error(), "exit status 3") {
+		t.Errorf("err = %v, want the command's exit status", got.err)
+	}
+	if !strings.Contains(got.err.Error(), "git-failed") {
+		t.Errorf("err = %v, want the command's stderr", got.err)
+	}
+	if got.over {
+		t.Error("over = true, want false")
+	}
+}
+
 // TestTruncateDisplay covers the manifest display cap directly: ASCII and
 // multibyte truncation land on rune boundaries with an ellipsis, short values
 // and the redaction placeholder pass through untouched.

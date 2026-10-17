@@ -678,12 +678,15 @@ Capture runs under a 20-second bounded operation deadline (an operation bound,
 not a run wall-clock — the same kind of bound as the 30s MCP preflight); over
 deadline the bundle degrades to the manifest alone. The pod sets
 `terminationGracePeriodSeconds: 45` when capture is enabled, sized to fit the
-deadline plus the child-kill wait plus exit margin. Delivery allows at most two
-attempts inside the deadline, then stops — no cross-reconcile retry, no
-requeue; loss is recorded in a redacted `evidence.capture` event. A capture the
-deadline itself aborts earns one fresh five-second manifest-only delivery
-window inside the grace (2026-10-09 decision); a stalled intake does not.
-Capture never changes a phase, exit code, or lifecycle report.
+deadline plus the child-kill wait plus exit margin. The reads that back the
+bundle are bounded by that same deadline, not by how long a git child keeps
+its pipes: a grandchild outliving git (`git-remote-*`, askpass) adds at most
+the capped read's 2-second child-kill wait inside the grace. Delivery allows
+at most two attempts inside the deadline, then stops — no cross-reconcile
+retry, no requeue; loss is recorded in a redacted `evidence.capture` event. A
+capture the deadline itself aborts earns one fresh five-second manifest-only
+delivery window inside the grace (2026-10-09 decision); a stalled intake does
+not. Capture never changes a phase, exit code, or lifecycle report.
 
 **Bundle, bounds, manifest.** One gzip'd tar plus a JSON manifest; the manifest
 is always present, content is best-effort within constants (these bound storage
@@ -1890,6 +1893,23 @@ named items remain unresolved and must not be described as production-ready:
 - The exact vLLM gauge for backpressure on the target model server.
 
 ## Decisions
+- **2026-10-17 — #392: the capture's capped git read is bounded by the
+  operation deadline, and a pipe outliving its child keeps the bytes
+  rather than the failure.** `runGitCapped` read the child's stdout
+  before reaping it, and the byte cap bounded volume, not blocking: a
+  grandchild outliving git (`git-remote-*`, askpass) parked the read
+  past the 20-second deadline, through the 45-second grace, to SIGKILL
+  — losing the manifest the degradation promise keeps. The read now
+  runs off-thread against the context, `WaitDelay` bounds the reap, and
+  a grandchild that outlives its git costs at most that 2-second
+  child-kill wait, inside the grace already sized for one. `ErrWaitDelay`
+  arrives only for a process that exited successfully with its pipes
+  still open — `os/exec` adopts the copy-goroutine error only when the
+  process error is nil — so the branch that keeps the bytes is gated on
+  the reaped child having succeeded, and a child that exited non-zero
+  keeps its exit status and stderr. Rejected: bounding the read by a
+  duration rather than the deadline (constrains duration, not stuck),
+  and reaping without a delay (reproduces the stall inside `Wait`).
 
 - **2026-10-16 — #282: the legacy executor enforces the criterion-evidence
   contract in one shared handoff plan, and the pinned envelope binds to the
