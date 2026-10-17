@@ -1393,7 +1393,13 @@ there is no delete verb because active runs reference lanes. (#73)
   stall relaunches/resumes it; a crashloop reaches NeedsHuman.
 - **Verifying** — no coordinator pod or liveness meaning. The operator polls
   the external PR and CI world indefinitely, with a reconciliation cadence and
-  no deadline. Observer errors remain Verifying and requeue. A missing observer
+  no deadline. Observer errors remain Verifying and requeue. The poll reads the
+  run head's pull requests through the identity-checked forge listing, so a
+  record whose base or head repository identity differs from the run's — a
+  same-owner fork claiming `owner:branch` — and a response carrying no
+  repository identity at all both fail the poll closed: they are the same
+  unverifiable world as a read error, never a "no pull request" claim
+  published as this run's state (#365). A missing observer
   or missing/draft PR reaches **NeedsHuman**. A failed check on a fix-pr run
   reaches **Failed** so its source can apply its retry policy. A resolve-issue
   run whose published PR has stable, confirmed red checks reaches **HandedOff**
@@ -3461,6 +3467,35 @@ was superseded.
   closed rather than adopting. Linkage stays the controller's
   `Verifying` observation — the guard runs before a PR body contract exists
   to check. (#343, superseding the guard carve-out in the #247 entry.)
+- **2026-10-16 — #297: compaction is enforced at the step boundary by the
+  harness, and the digest is composed, not model-produced.**
+  #243 landed the pure policy; nothing consumed it, so a session still rode
+  its transcript past the bound model alias's input limit and the compaction
+  the policy describes existed only as a tested seam. The session loop now
+  applies it between turns and never mid-turn, per-role budgets are resolved
+  once in `NewCoordinator` from an injected map, and each applied compaction
+  emits `session.compacted`. Two choices the parent ticket left open are
+  settled here. **The digest is composed by the harness**, as a bounded index
+  of the compacted span plus the settled-state block verbatim: `PlanCompaction`
+  needs the digest's cost before the digest exists, and a model call to produce
+  one would spend the context the policy is bounding (and could itself fail,
+  turning compaction into a new failure mode). Protected state is the pinned
+  objective or brief and the most recent turn; the brief's settled `Decision`s
+  and `OwnedFiles` are re-injected verbatim by re-rendering the exact bytes
+  `briefText` uses. A transcript that cannot fit fails closed — the run ends
+  as an infrastructure failure with the transcript unchanged — because
+  dropping protected state to fit is a silent truncation of the task. The
+  boundary is measured over the full next request — transcript plus the
+  serialized tool declarations the gateway sends with every turn, carried as
+  `CompactionInput.FixedTokens` — because a fit claimed over messages alone
+  can describe a request the effective limit cannot hold. A role
+  with no resolved budget owns no policy and never compacts: #296 supplies
+  the verified limit, but nothing populates `CoordinatorConfig.ContextBudgets`
+  until #295's declared schema lands, so no production session carries a
+  budget yet, and an implicit context window is never substituted. (§7's
+  checkpoint ladder is untouched: compaction neither advances nor replaces
+  it, so resume still reconstructs settled state from the world and the
+  checkpoint.) (#297)
 - **2026-10-16 — #296: the effective context limit is read and resolved,
   never defaulted; `ContextPolicy.RoleBudget` is its one entry point.**
   `Gateway.ModelInputLimit` performs one bounded authenticated read of the
@@ -3520,3 +3555,25 @@ was superseded.
   read failure renders as its fixed class alone, since its endpoint and dial
   error must not reach the byte-bounded termination reason. (#296, #243,
   #297)
+- **2026-10-17 — #365: the controller's `Verifying` observation reads its head
+  listing through the identity-checked capability.**
+  `internal/github.Observer.Observe` was the last reader of the raw
+  `head=owner:branch` listing. GitHub's selector carries no repository
+  identity, so a same-owner fork whose branch matched the run branch's name had
+  its number, draft flag, head SHA, checks, and statuses published as this
+  run's state. It now calls `Provider.ListPullRequestsWithForeign` — the same
+  capability the executor's pre-handoff observation and the adoption guard read
+  through — so the full base and head repository identity carried in the
+  response decides the match, a response missing either identity is a read
+  failure, every page of the listing is read, and any record claiming the
+  selector from another repository fails the poll closed instead of being
+  dropped toward a "no pull request" claim: an unverifiable world is never
+  published as `pr_opened`. Draft handling, check and status collection, and
+  the observation contract are unchanged. One consequence is deliberate and
+  stricter than before: a record the selector surfaced that does not carry the
+  run's own head identity — a same-repository record for another head ref — is
+  a foreign claim under this listing, not a row that is skipped, matching how
+  the executor's observation already treats it. The identity-blind one-page
+  client query had no remaining caller after this change and is gone, so one
+  listing seam remains. (#365, closing the `Observer` carve-out left open by
+  the #343 entry.)

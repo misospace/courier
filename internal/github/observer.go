@@ -84,6 +84,18 @@ func (o Observer) ClientForRepository(repository string) (*Client, error) {
 // the base repository. The pull request lives on, and its checks are reported
 // by, the base repository; the head owner comes from the resolved head
 // identity, because a fork pull request's head lives on the fork.
+//
+// The head listing goes through the identity-checked forge capability, never a
+// forge-specific query. GitHub's head selector carries no repository identity,
+// so a same-owner fork whose branch matches the run's would otherwise be
+// published as this run's pull request, number, draft flag, head SHA, checks,
+// and statuses included. The listing compares the full base- and
+// head-repository identity from the response, refuses a response missing
+// either identity, and paginates every page, so a record beyond the first page
+// is observed too. A record claiming the head selector from another repository
+// is kept visible and fails the observation closed: the run's own pull request
+// is then unverified, which is not the same claim as "no pull request", and an
+// unverifiable world is never published (#365).
 func (o Observer) Observe(ctx context.Context, base string, head controller.HeadRef) (controller.PRObservation, error) {
 	if o.Client == nil {
 		return controller.PRObservation{}, fmt.Errorf("GitHub observer: nil client")
@@ -103,28 +115,33 @@ func (o Observer) Observe(ctx context.Context, base string, head controller.Head
 		return controller.PRObservation{}, err
 	}
 	// A fork pull request is listed on the base repository but its head
-	// qualifier names the fork's owner. An empty head repository means a
-	// same-repository head, so the base owner is the head owner.
-	headOwner := baseOwner
-	if headRepo := strings.TrimSpace(head.Repo); headRepo != "" {
-		forkOwner, _, forkErr := splitRepository(headRepo)
-		if forkErr != nil {
-			return controller.PRObservation{}, fmt.Errorf("GitHub observer: invalid head repository %q: %w", headRepo, forkErr)
+	// repository is the fork. An empty head repository means a same-repository
+	// head, so the base repository is also the head repository.
+	headRepo := base
+	if resolved := strings.TrimSpace(head.Repo); resolved != "" {
+		if _, _, err := splitRepository(resolved); err != nil {
+			return controller.PRObservation{}, fmt.Errorf("GitHub observer: invalid head repository %q: %w", resolved, err)
 		}
-		headOwner = forkOwner
+		headRepo = resolved
 	}
-	pulls, err := client.PullRequestsForHead(ctx, baseOwner, baseRepo, headOwner, head.Branch)
+	provider := NewProvider(forge.ProviderConfig{Name: "github"}, client)
+	pulls, foreign, err := provider.ListPullRequestsWithForeign(ctx, forge.PullRequestRef{Repo: base}, headRepo, head.Branch)
 	if err != nil {
 		return controller.PRObservation{}, err
 	}
+	if len(foreign) > 0 {
+		return controller.PRObservation{}, fmt.Errorf(
+			"GitHub observer: %d pull request(s) claim head %s from a repository other than %s; the run's own pull request is unverified",
+			len(foreign), head.Branch, headRepo)
+	}
 	for _, pull := range pulls {
-		if !strings.EqualFold(pull.State, "open") || pull.Head.Ref != head.Branch {
+		if !strings.EqualFold(pull.State, "open") {
 			continue
 		}
 		// Check runs and commit statuses attach to the head commit on the
 		// base repository. The branch name is only a fallback for heads
 		// resolved without a SHA, which are always same-repository heads.
-		ref := pull.Head.SHA
+		ref := pull.HeadSHA
 		if ref == "" {
 			ref = head.SHA
 		}
@@ -139,7 +156,7 @@ func (o Observer) Observe(ctx context.Context, base string, head controller.Head
 		if err != nil {
 			return controller.PRObservation{}, err
 		}
-		observed := controller.PRObservation{PR: strconv.Itoa(pull.Number), Draft: pull.Draft, Head: pull.Head.SHA}
+		observed := controller.PRObservation{PR: strconv.Itoa(pull.Number), Draft: pull.Draft, Head: pull.HeadSHA}
 		for _, check := range checks.CheckRuns {
 			observed.Checks = append(observed.Checks, controller.CheckObservation{Name: check.Name, State: checkState(check.Status, check.Conclusion)})
 		}
@@ -151,7 +168,7 @@ func (o Observer) Observe(ctx context.Context, base string, head controller.Head
 	// No open PR. A merged one means the work already shipped, which is
 	// different from a branch that never had a PR.
 	for _, pull := range pulls {
-		if pull.Head.Ref == head.Branch && strings.TrimSpace(pull.MergedAt) != "" {
+		if pull.Merged {
 			return controller.PRObservation{PR: strconv.Itoa(pull.Number), Merged: true}, nil
 		}
 	}
