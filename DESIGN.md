@@ -3444,6 +3444,35 @@ was superseded.
   closed rather than adopting. Linkage stays the controller's
   `Verifying` observation — the guard runs before a PR body contract exists
   to check. (#343, superseding the guard carve-out in the #247 entry.)
+- **2026-10-16 — #297: compaction is enforced at the step boundary by the
+  harness, and the digest is composed, not model-produced.**
+  #243 landed the pure policy; nothing consumed it, so a session still rode
+  its transcript past the bound model alias's input limit and the compaction
+  the policy describes existed only as a tested seam. The session loop now
+  applies it between turns and never mid-turn, per-role budgets are resolved
+  once in `NewCoordinator` from an injected map, and each applied compaction
+  emits `session.compacted`. Two choices the parent ticket left open are
+  settled here. **The digest is composed by the harness**, as a bounded index
+  of the compacted span plus the settled-state block verbatim: `PlanCompaction`
+  needs the digest's cost before the digest exists, and a model call to produce
+  one would spend the context the policy is bounding (and could itself fail,
+  turning compaction into a new failure mode). Protected state is the pinned
+  objective or brief and the most recent turn; the brief's settled `Decision`s
+  and `OwnedFiles` are re-injected verbatim by re-rendering the exact bytes
+  `briefText` uses. A transcript that cannot fit fails closed — the run ends
+  as an infrastructure failure with the transcript unchanged — because
+  dropping protected state to fit is a silent truncation of the task. The
+  boundary is measured over the full next request — transcript plus the
+  serialized tool declarations the gateway sends with every turn, carried as
+  `CompactionInput.FixedTokens` — because a fit claimed over messages alone
+  can describe a request the effective limit cannot hold. A role
+  with no resolved budget owns no policy and never compacts: #296 supplies
+  the verified limit, but nothing populates `CoordinatorConfig.ContextBudgets`
+  until #295's declared schema lands, so no production session carries a
+  budget yet, and an implicit context window is never substituted. (§7's
+  checkpoint ladder is untouched: compaction neither advances nor replaces
+  it, so resume still reconstructs settled state from the world and the
+  checkpoint.) (#297)
 - **2026-10-16 — #296: the effective context limit is read and resolved,
   never defaulted; `ContextPolicy.RoleBudget` is its one entry point.**
   `Gateway.ModelInputLimit` performs one bounded authenticated read of the

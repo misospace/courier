@@ -17,6 +17,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -27,6 +28,7 @@ import (
 	courierv1alpha1 "github.com/misospace/courier/api/v1alpha1"
 	"github.com/misospace/courier/internal/executor"
 	"github.com/misospace/courier/internal/harness"
+	courierlog "github.com/misospace/courier/internal/log"
 	"github.com/misospace/courier/internal/protocol"
 	"github.com/misospace/courier/internal/topology"
 )
@@ -229,6 +231,11 @@ func runArgs(args []string) error {
 			evidence.Branch = invocation.Branch
 			return evidence, err
 		},
+		Compactions: compactionSink{
+			emitter:    courierlog.NewEmitter(os.Stdout, courierlog.ParseLevel(os.Getenv("COURIER_LOG_LEVEL"))),
+			stderr:     os.Stderr,
+			invocation: invocation,
+		},
 	})
 	if err != nil {
 		return fmt.Errorf("courier-control: %w", err)
@@ -267,6 +274,42 @@ func exhaustedGate(err error) bool {
 // never the classification.
 func declare(result executor.HarnessResult) error {
 	return handoff(terminationFor(result))
+}
+
+// compactionSink adapts the harness's applied-compaction telemetry onto the
+// run's structured event log (#243): one session.compacted line carrying
+// the role, its bound model, and the before/after/net/digested token counts.
+//
+// It sets no Status. Compaction is observability — an operator watching
+// session.compacted lines understands a run's context behavior from run
+// telemetry instead of inferring it from gateway failover — and a
+// compaction is never a liveness or completion claim, so it must never
+// touch the status vocabulary. Detail is Verbose so the counts reach the log
+// store at info level, matching run.summary. Emission is best-effort: a
+// dropped event is noted on stderr and the run continues, because losing an
+// observability line must never change what the harness does next.
+type compactionSink struct {
+	emitter    *courierlog.Emitter
+	stderr     io.Writer
+	invocation executor.Invocation
+}
+
+// SessionCompacted implements harness.CompactionSink.
+func (s compactionSink) SessionCompacted(event harness.CompactEvent) {
+	err := s.emitter.Emit(courierlog.Event{
+		Type:    courierlog.EventSessionCompacted,
+		RunID:   s.invocation.RunName,
+		Repo:    s.invocation.Repo,
+		Ref:     s.invocation.Ref,
+		Mode:    string(s.invocation.Mode),
+		Role:    event.Role,
+		Model:   event.Model,
+		Detail:  map[string]any{"before": event.Before, "after": event.After, "reclaimed": event.NetSaved, "digested": event.DigestedTokens},
+		Verbose: true,
+	})
+	if err != nil {
+		fmt.Fprintf(s.stderr, "courier-control: dropped %s event: %v\n", courierlog.EventSessionCompacted, err)
+	}
 }
 
 // terminationFor renders the operator handoff payload. Its phase/result pair
