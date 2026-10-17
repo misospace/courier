@@ -30,7 +30,9 @@ const (
 
 // Resource names are derived from the run name with a fixed suffix. Long run
 // names are truncated with a digest so every derived name stays a valid
-// DNS-1123 subdomain and remains unique and stable per run.
+// DNS-1123 subdomain and remains unique and stable per run. Objects with a
+// stricter naming rule (the Services, which must be RFC-1035 DNS labels)
+// derive their names through serviceResourceName instead.
 func resourceName(runName, suffix string) string {
 	base := strings.Trim(strings.ToLower(runName), "-")
 	maxBase := 253 - len(suffix) - 9
@@ -40,6 +42,57 @@ func resourceName(runName, suffix string) string {
 		base = strings.TrimRight(base[:maxBase-len(hash)-1], "-") + "-" + hash
 	}
 	return base + suffix
+}
+
+// serviceResourceName derives a Service object name. Kubernetes validates
+// Service names as RFC-1035 DNS labels: at most 63 characters, a lowercase
+// letter first, only lowercase alphanumerics and hyphens, and an alphanumeric
+// last. Run names are DNS subdomains, so they may contain dots or outgrow the
+// label limit once the suffix is appended. A run name that is not already a
+// valid label base within the limit maps deterministically to a normalized
+// prefix plus an 8-hex digest of the full run name, so distinct run names
+// stay distinct through normalization and truncation. Names that already fit
+// pass through unchanged.
+func serviceResourceName(runName, suffix string) string {
+	const maxLabelLen = 63
+	if isDNSLabelBase(runName) && len(runName)+len(suffix) <= maxLabelLen {
+		return runName + suffix
+	}
+	digest := sha256.Sum256([]byte(runName))
+	hash := hex.EncodeToString(digest[:])[:8]
+	maxBase := maxLabelLen - len(suffix) - len(hash) - 1
+	base := strings.ReplaceAll(strings.ToLower(runName), ".", "-")
+	if base == "" || base[0] < 'a' || base[0] > 'z' {
+		// Reserve one character for the letter prefix that anchors the label.
+		maxBase--
+	}
+	if len(base) > maxBase {
+		base = base[:maxBase]
+	}
+	base = strings.Trim(base, "-")
+	if base == "" {
+		base = "run"
+	} else if base[0] < 'a' || base[0] > 'z' {
+		base = "r" + base
+	}
+	return base + "-" + hash + suffix
+}
+
+// isDNSLabelBase reports whether s is a usable body of a DNS-1035 label:
+// non-empty, lowercase alphanumeric and hyphen characters only, a lowercase
+// letter first, and an alphanumeric last.
+func isDNSLabelBase(s string) bool {
+	if s == "" || s[0] < 'a' || s[0] > 'z' {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		switch c := s[i]; {
+		case c >= 'a' && c <= 'z', c >= '0' && c <= '9', c == '-':
+		default:
+			return false
+		}
+	}
+	return s[len(s)-1] != '-'
 }
 
 // ControlPodName, BrokerPodName, WorkerPodName and the rest name every
@@ -56,9 +109,9 @@ func BrokerSAName(runName string) string { return resourceName(runName, "-broker
 
 func WorkerSAName(runName string) string { return resourceName(runName, "-worker") }
 
-func BrokerServiceName(runName string) string { return resourceName(runName, "-broker") }
+func BrokerServiceName(runName string) string { return serviceResourceName(runName, "-broker") }
 
-func WorkerServiceName(runName string) string { return resourceName(runName, "-worker") }
+func WorkerServiceName(runName string) string { return serviceResourceName(runName, "-worker") }
 
 func BrokerTLSSecretName(runName string) string { return resourceName(runName, "-broker-tls") }
 

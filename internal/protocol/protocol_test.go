@@ -5,10 +5,16 @@ import (
 	"context"
 	"crypto/ed25519"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"runtime"
+	"strconv"
+	"strings"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -313,6 +319,263 @@ func TestWorkerCancelAcknowledgesOnlyAfterTermination(t *testing.T) {
 		t.Fatalf("result status = %q", state.Result.Status)
 	}
 	_ = worker
+}
+
+// TestWorkerCancelTerminatesTaskDescendants covers the cancellation contract
+// for tasks whose real work runs in descendants: production dispatches are
+// `sh -c ...`, so a cancelled shell must not leave its children behind (#372).
+func TestWorkerCancelTerminatesTaskDescendants(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("task-tree assertions read process groups and /proc")
+	}
+	cases := map[string]struct {
+		script     string
+		writesLate bool
+	}{
+		// The descendant inherits the task's output descriptors: the wait it
+		// holds open, and the workspace it writes, must both end at
+		// cancellation.
+		"descendant inherits stdout and stderr": {
+			script:     `(sleep 2; echo late > late.txt) & echo $! > pid.txt; wait`,
+			writesLate: true,
+		},
+		// The descendant redirects them away, so only the group kill can stop
+		// it.
+		"descendant redirects stdout and stderr": {
+			script:     `(sleep 2; echo late > late.txt) >/dev/null 2>&1 & echo $! > pid.txt; wait`,
+			writesLate: true,
+		},
+		// A descendant with no workspace effect of its own must still be gone.
+		"long-lived descendant": {script: `sleep 300 & echo $! > pid.txt; wait`},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			worker, priv, server := newTestWorker(t)
+			client := &Client{BaseURL: server.URL}
+			ctx := context.Background()
+
+			task, _ := json.Marshal(Task{Command: []string{"sh", "-c", tc.script}})
+			env := dispatchEnvelope(worker.clock())
+			env.PayloadDigest = PayloadDigestOf(task)
+			if _, err := client.Dispatch(ctx, priv, env, task); err != nil {
+				t.Fatalf("Dispatch: %v", err)
+			}
+			descendant := waitForDescendantPID(t, filepath.Join(worker.config.WorkspaceDir, "pid.txt"))
+			if !descendantLive(descendant) {
+				t.Fatalf("descendant %d never started", descendant)
+			}
+
+			cancelEnv := env
+			cancelEnv.Kind = KindCancel
+			cancelEnv.Sequence = 1
+			cancelEnv.PayloadDigest = CancelPayloadDigest
+			cancelEnv.Nonce = "cancel-nonce-value-0001"
+			started := time.Now()
+			status, err := client.Cancel(ctx, priv, cancelEnv)
+			if err != nil || status != ResultCancelled {
+				t.Fatalf("Cancel = %q, %v", status, err)
+			}
+			if elapsed := time.Since(started); elapsed > 20*time.Second {
+				t.Fatalf("cancellation was not bounded: %s", elapsed)
+			}
+
+			state, err := client.Result(ctx, "op-1")
+			if err != nil || state.Result == nil || state.Result.Status != ResultCancelled {
+				t.Fatalf("cancelled result = %+v, %v", state, err)
+			}
+			if state.Result.LiveDescendants != 0 {
+				t.Fatalf("cancellation acknowledged while %d descendants were live", state.Result.LiveDescendants)
+			}
+			if descendantLive(descendant) {
+				t.Fatalf("descendant %d outlived acknowledged cancellation", descendant)
+			}
+			if tc.writesLate {
+				// The descendant would have written into the shared workspace
+				// had cancellation left it running.
+				time.Sleep(4 * time.Second)
+				if _, err := os.Stat(filepath.Join(worker.config.WorkspaceDir, "late.txt")); !os.IsNotExist(err) {
+					t.Fatalf("descendant wrote into the workspace after cancellation: %v", err)
+				}
+			}
+		})
+	}
+}
+
+// TestWorkerCancelRefusesUnprovenTermination pins the other half of the
+// contract: work that escaped the task's process group cannot be proven gone,
+// so the worker must report the cancellation as unverified instead of
+// acknowledging it (#372).
+func TestWorkerCancelRefusesUnprovenTermination(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("task-tree assertions read process groups and /proc")
+	}
+	if _, err := exec.LookPath("setsid"); err != nil {
+		t.Skip("setsid is required to leave the task's process group")
+	}
+	worker, priv, server := newTestWorker(t)
+	client := &Client{BaseURL: server.URL}
+	ctx := context.Background()
+
+	// The escapee starts its own session, so the group signal never reaches
+	// it — but it inherits the task's output descriptors, which is what
+	// proves it is still there. It reports its own pid from inside that
+	// session, so the cancellation can never race the moment setsid moves
+	// it out of the task's group: a pid read from the background job would
+	// still be in the group, and the group signal would legitimately kill
+	// it before the test ever asked the worker to refuse anything.
+	task, _ := json.Marshal(Task{Command: []string{"sh", "-c", `setsid sh -c 'echo $$ > escaped.txt; exec sleep 300' & wait`}})
+	env := dispatchEnvelope(worker.clock())
+	env.PayloadDigest = PayloadDigestOf(task)
+	if _, err := client.Dispatch(ctx, priv, env, task); err != nil {
+		t.Fatalf("Dispatch: %v", err)
+	}
+	escapee := waitForDescendantPID(t, filepath.Join(worker.config.WorkspaceDir, "escaped.txt"))
+	if !descendantLive(escapee) {
+		t.Fatalf("escapee %d was gone before cancellation", escapee)
+	}
+	// Read the escapee's own session from the kernel: a process still in the
+	// task's session was never out of reach of the group signal, so a
+	// cancellation below would legitimately kill it and the refusal under
+	// test would be measuring nothing. The task inherits this process's
+	// session because the worker gives it a process group, not a session.
+	workerSession, ok := processSession(os.Getpid())
+	if !ok {
+		t.Fatal("could not read this test's own session")
+	}
+	escapeeSession, ok := processSession(escapee)
+	if !ok {
+		t.Fatalf("escapee %d left no readable session", escapee)
+	}
+	if escapeeSession == workerSession {
+		t.Fatalf("escapee %d never left the task's session (%d)", escapee, escapeeSession)
+	}
+
+	cancelEnv := env
+	cancelEnv.Kind = KindCancel
+	cancelEnv.Sequence = 1
+	cancelEnv.PayloadDigest = CancelPayloadDigest
+	cancelEnv.Nonce = "cancel-nonce-value-0001"
+	status, err := client.Cancel(ctx, priv, cancelEnv)
+	if err == nil {
+		t.Fatalf("cancellation was acknowledged with status %q while a task process outlived it", status)
+	}
+	var transportErr *TransportError
+	if !errors.As(err, &transportErr) || transportErr.StatusCode != http.StatusInternalServerError {
+		t.Fatalf("Cancel error = %v, want an unverified-termination rejection", err)
+	}
+	state, err := client.Result(ctx, "op-1")
+	if err != nil || state.Result == nil || state.Result.LiveDescendants == 0 {
+		t.Fatalf("unverified cancellation must still report the live tree: %+v, %v", state, err)
+	}
+	if !descendantLive(escapee) {
+		t.Fatalf("escapee %d is gone, so the refusal was not about surviving work", escapee)
+	}
+}
+
+// TestWorkerShutdownTerminatesTaskDescendants pins the same guarantee for pod
+// termination: Shutdown must return only once the task's tree is gone, and
+// must stay bounded while it proves it (#372).
+func TestWorkerShutdownTerminatesTaskDescendants(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("task-tree assertions read process groups and /proc")
+	}
+	worker, priv, server := newTestWorker(t)
+	client := &Client{BaseURL: server.URL}
+	ctx := context.Background()
+
+	task, _ := json.Marshal(Task{Command: []string{"sh", "-c", `sleep 300 & echo $! > pid.txt; wait`}})
+	env := dispatchEnvelope(worker.clock())
+	env.PayloadDigest = PayloadDigestOf(task)
+	if _, err := client.Dispatch(ctx, priv, env, task); err != nil {
+		t.Fatalf("Dispatch: %v", err)
+	}
+	descendant := waitForDescendantPID(t, filepath.Join(worker.config.WorkspaceDir, "pid.txt"))
+
+	shutdownCtx, cancel := context.WithTimeout(ctx, 20*time.Second)
+	defer cancel()
+	worker.Shutdown(shutdownCtx)
+	if shutdownCtx.Err() != nil {
+		t.Fatal("shutdown exceeded its bound while a descendant was live")
+	}
+	worker.mu.Lock()
+	op := worker.ops["op-1"]
+	var result *Result
+	if op != nil {
+		result = op.result
+	}
+	worker.mu.Unlock()
+	if op == nil {
+		t.Fatal("shutdown left no operation to account for")
+	}
+	if result == nil || result.LiveDescendants != 0 {
+		t.Fatalf("shutdown result = %+v", result)
+	}
+	if descendantLive(descendant) {
+		t.Fatalf("descendant %d outlived shutdown", descendant)
+	}
+}
+
+// waitForDescendantPID reads the pid a task reported for its background
+// descendant, and guarantees it is cleaned up even if the assertions below
+// fail — a leaked test descendant outlives the test binary.
+func waitForDescendantPID(t *testing.T, path string) int {
+	t.Helper()
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		data, err := os.ReadFile(path)
+		if err == nil {
+			if pid, convErr := strconv.Atoi(strings.TrimSpace(string(data))); convErr == nil {
+				t.Cleanup(func() { _ = syscall.Kill(pid, syscall.SIGKILL) })
+				return pid
+			}
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("task never reported a descendant pid: %v", err)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+// descendantLive reports whether a pid is still running, read straight from
+// the kernel rather than through the worker's own proof. A killed process
+// that nobody has reaped yet is a zombie: it is stopped, holds nothing, and
+// writes nothing, so it is not a surviving descendant.
+func descendantLive(pid int) bool {
+	data, err := os.ReadFile("/proc/" + strconv.Itoa(pid) + "/stat")
+	if err != nil {
+		return false
+	}
+	stat := string(data)
+	end := strings.LastIndex(stat, ")")
+	if end < 0 {
+		return false
+	}
+	fields := strings.Fields(stat[end+1:])
+	return len(fields) >= 3 && fields[0] != "Z" && fields[0] != "X"
+}
+
+// processSession reports the session a pid leads. A process in a session of
+// its own is unreachable by a signal aimed at the task's process group.
+func processSession(pid int) (int, bool) {
+	data, err := os.ReadFile("/proc/" + strconv.Itoa(pid) + "/stat")
+	if err != nil {
+		return 0, false
+	}
+	stat := string(data)
+	end := strings.LastIndex(stat, ")")
+	if end < 0 {
+		return 0, false
+	}
+	// After the parenthesized comm: state, parent, process group, session.
+	fields := strings.Fields(stat[end+1:])
+	if len(fields) < 4 {
+		return 0, false
+	}
+	session, err := strconv.Atoi(fields[3])
+	if err != nil {
+		return 0, false
+	}
+	return session, true
 }
 
 func TestWorkerLateCancelOnReplacementWorkerIsInert(t *testing.T) {
