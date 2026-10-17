@@ -49,8 +49,9 @@ change in the chart's values.
 
 - `hack/bootstrap.sh` — idempotent one-shot dev setup after a fresh checkout
   (#416): pinned mise/Go/Helm, controller-gen, setup-envtest, and envtest
-  assets. Tool versions live in `.mise/config.toml` + `.mise/mise.lock`; do
-  not restate them elsewhere.
+  assets. Go and Helm versions live in `.mise/config.toml` + `.mise/mise.lock`
+  and controller-gen/setup-envtest versions in the `Makefile`; do not restate
+  them elsewhere.
 - `mise run check` — CI-equivalent verification (generated-code diff,
 gofmt, vet, build, image-gating scripts). `mise run test` —
 authoritative suite (`make test` with envtest assets). Reuse bootstrap

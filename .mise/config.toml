@@ -11,7 +11,7 @@ run = "hack/bootstrap.sh tools"
 [tasks.check]
 description = "CI-equivalent checks mirroring the CI static job: generated-code drift, tidy diff, gofmt, vet, build, image-gating scripts"
 run = [
-  "make manifests generate",
+  """cg=$(sed -n 's/^CONTROLLER_TOOLS_VERSION ?= //p' Makefile) && se=$(sed -n 's/^ENVTEST_VERSION ?= //p' Makefile) && make manifests generate CONTROLLER_TOOLS_VERSION="$cg" ENVTEST_VERSION="$se\"""",
   """git diff --exit-code || { echo "generated code is stale; run 'make manifests generate' and commit" >&2; exit 1; }""",
   "go mod tidy -diff",
   """unformatted=$(gofmt -l .); if [ -n "$unformatted" ]; then printf '%s\\n' "$unformatted" >&2; exit 1; fi""",
@@ -23,9 +23,11 @@ run = [
 [tasks.test]
 description = "Authoritative suite: make test (manifests, generate, fmt, vet, go test -race) with envtest assets — a superset of the CI test job"
 run = '''
+cg=$(sed -n 's/^CONTROLLER_TOOLS_VERSION ?= //p' Makefile)
+se=$(sed -n 's/^ENVTEST_VERSION ?= //p' Makefile)
 k8s=$(sed -n 's/^ENVTEST_K8S_VERSION ?= //p' Makefile)
-if [ -z "$k8s" ]; then echo "could not read ENVTEST_K8S_VERSION from Makefile" >&2; exit 1; fi
-make setup-envtest
+if [ -z "$cg" ] || [ -z "$se" ] || [ -z "$k8s" ]; then echo "could not read tool pins from Makefile" >&2; exit 1; fi
+make setup-envtest ENVTEST_VERSION="$se"
 export KUBEBUILDER_ASSETS="$(bin/setup-envtest use -p path "$k8s")"
-make test
+make test CONTROLLER_TOOLS_VERSION="$cg" ENVTEST_VERSION="$se"
 '''
