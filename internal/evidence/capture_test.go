@@ -14,6 +14,7 @@ import (
 	"strings"
 	"syscall"
 	"testing"
+	"time"
 	"unicode/utf8"
 
 	"github.com/misospace/courier/internal/log"
@@ -708,6 +709,92 @@ func TestRunGitCapped(t *testing.T) {
 		if over {
 			t.Errorf("failing command reported over-limit, want false")
 		}
+	}
+}
+
+// TestRunGitCappedCanceledWithHeldPipe covers the stall where a grandchild
+// outlives git holding the stdout pipe open with no output: the cap bounds
+// bytes, not blocking, so the read must end with the context instead of parking
+// the capture forever. Returning is the contract, and both halves of the fix
+// carry it: the read/select ends the read at the context, and WaitDelay keeps
+// the cancel path's reap off the same held pipe.
+func TestRunGitCappedCanceledWithHeldPipe(t *testing.T) {
+	t.Parallel()
+
+	dir := newRepo(t)
+	// The alias leaves sleep holding git's stdout and stderr write ends, the same
+	// shape as a git-remote-* helper that outlives its parent.
+	git(t, dir, "config", "alias.holdpipe", "!sh -c 'sleep 30 &'")
+
+	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer cancel()
+
+	type capped struct {
+		out  []byte
+		over bool
+		err  error
+	}
+	done := make(chan capped, 1)
+	go func() {
+		out, over, err := runGitCapped(ctx, dir, MaxFileBytes, "holdpipe")
+		done <- capped{out: out, over: over, err: err}
+	}()
+
+	var got capped
+	select {
+	case got = <-done:
+	case <-time.After(20 * time.Second):
+		t.Fatal("runGitCapped did not return within 20s of its context deadline: the bounded read is parked on the pipe the surviving grandchild still holds")
+	}
+	if !errors.Is(got.err, context.DeadlineExceeded) {
+		t.Errorf("err = %v, want context.DeadlineExceeded", got.err)
+	}
+	if got.over {
+		t.Error("over = true, want false for a canceled context")
+	}
+	if len(got.out) != 0 {
+		t.Errorf("out = %q, want no output", got.out)
+	}
+}
+
+// TestRunGitCappedSurvivingPipeOnSuccess covers the sibling case where the
+// child itself succeeds but a surviving grandchild still holds a pipe. WaitDelay
+// then expires with no git failure to report, and stdout has already reached
+// EOF, so the bytes read are the complete result: the call must return them
+// instead of failing the capture over an expired timer.
+func TestRunGitCappedSurvivingPipeOnSuccess(t *testing.T) {
+	t.Parallel()
+
+	dir := newRepo(t)
+	// The alias exits 0 while sleep keeps only the stderr write end open, which
+	// is what lets Wait outlast its own child without any git failure behind it.
+	git(t, dir, "config", "alias.holderr", "!sh -c 'sleep 30 >&2 &'")
+
+	type held struct {
+		out  []byte
+		over bool
+		err  error
+	}
+	done := make(chan held, 1)
+	go func() {
+		out, over, err := runGitCapped(context.Background(), dir, MaxFileBytes, "holderr")
+		done <- held{out, over, err}
+	}()
+
+	var got held
+	select {
+	case got = <-done:
+	case <-time.After(20 * time.Second):
+		t.Fatal("runGitCapped did not return within 20s while a grandchild held the stderr pipe")
+	}
+	if got.err != nil {
+		t.Fatalf("err = %v, want nil: a command that succeeded before the pipe was held is not a git failure", got.err)
+	}
+	if got.over {
+		t.Error("over = true, want false")
+	}
+	if len(got.out) != 0 {
+		t.Errorf("out = %q, want no output", got.out)
 	}
 }
 

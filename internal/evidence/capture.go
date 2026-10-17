@@ -561,11 +561,17 @@ func runGit(ctx context.Context, dir string, args ...string) ([]byte, error) {
 // child is killed and overLimit is set with the bounded prefix returned, so a
 // run that would otherwise buffer an unbounded result stops at the cap.
 // A failing command returns a wrapped error (with the command's trimmed
-// stderr). A canceled context returns its own error and never overLimit, even
-// when the output had already exceeded the limit before the cancellation.
+// stderr). A canceled context that reached the command returns its own error
+// and never overLimit, even when the output had already exceeded the limit
+// before the cancellation or a surviving grandchild left the stdout pipe open.
 func runGitCapped(ctx context.Context, dir string, limit int, args ...string) (out []byte, overLimit bool, err error) {
 	cmd := exec.CommandContext(ctx, "git", args...)
 	cmd.Dir = dir
+	// cmd.Stderr is an io.Writer, so os/exec copies the child's stderr through a
+	// goroutine that Wait blocks on: a surviving grandchild holding the stderr
+	// write end would stall Wait itself, past the context. The delay bounds that
+	// child-kill wait.
+	cmd.WaitDelay = 2 * time.Second
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
 		return nil, false, fmt.Errorf("git %s: %w", strings.Join(args, " "), err)
@@ -576,7 +582,26 @@ func runGitCapped(ctx context.Context, dir string, limit int, args ...string) (o
 	if err := cmd.Start(); err != nil {
 		return nil, false, fmt.Errorf("git %s: %w: %s", strings.Join(args, " "), err, strings.TrimSpace(string(stderr.data)))
 	}
-	out, _ = io.ReadAll(io.LimitReader(stdout, int64(limit)+1))
+	// io.LimitReader bounds bytes, not blocking, so the read runs off-thread: a
+	// grandchild that outlives git holds the pipe write end open with no output
+	// and would park the reader forever, past the context. On cancellation the
+	// read end is closed to unblock the goroutine, its result drained so it
+	// cannot leak, and the child reaped before returning; that order is
+	// load-bearing, because Wait closes the same descriptor and a close on an
+	// already-closed one no longer evicts the parked reader.
+	read := make(chan []byte, 1)
+	go func() {
+		data, _ := io.ReadAll(io.LimitReader(stdout, int64(limit)+1))
+		read <- data
+	}()
+	select {
+	case out = <-read:
+	case <-ctx.Done():
+		_ = stdout.Close()
+		<-read
+		_ = cmd.Wait()
+		return nil, false, ctx.Err()
+	}
 	if len(out) > limit {
 		_ = cmd.Process.Kill()
 		_ = cmd.Wait()
@@ -586,6 +611,16 @@ func runGitCapped(ctx context.Context, dir string, limit int, args ...string) (o
 		return out, true, nil
 	}
 	if err := cmd.Wait(); err != nil {
+		if ctx.Err() != nil {
+			return nil, false, ctx.Err()
+		}
+		// WaitDelay expiring means the child itself succeeded but a surviving
+		// grandchild still held one of its pipes; a genuine git failure surfaces
+		// as its own exit status instead. stdout reached EOF, so what was read
+		// is complete and the timeout is ours, not git's: keep the bytes.
+		if errors.Is(err, exec.ErrWaitDelay) {
+			return out, false, nil
+		}
 		return nil, false, fmt.Errorf("git %s: %w: %s", strings.Join(args, " "), err, strings.TrimSpace(string(stderr.data)))
 	}
 	return out, false, nil
