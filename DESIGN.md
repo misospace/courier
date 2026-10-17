@@ -375,8 +375,19 @@ to die.
 - A pod's **disappearance** — no coordinator pod **object** at all — is
   infrastructure loss on its own terms, detected without any heartbeat,
   because there is no pod left to heartbeat from. A pod whose coordinator exit
-  state is observable is not pod loss: the recorded exit goes through the
-  exit-code mapping like any other termination. The cache is not trusted for
+  state is observable **and whose deletion is not in flight** is not pod loss:
+  the recorded exit goes through the exit-code mapping like any other
+  termination. A **terminating** coordinator's recorded exit is never mapped
+  to a run outcome — the deletion may itself have produced that exit (a
+  wedge-reaped coordinator carries a cancelled-stream failure exit, or even
+  exits 0 inside the shutdown window), so it is re-observed like any
+  in-flight deletion, and once the object is provably gone the disappearance
+  backstop takes the deferred charge as pod loss. The mirror case is decided
+  with it: a coordinator that exited with a meaningful code and was deleted
+  **afterwards** (node drain, manual delete) takes the same relaunch, because
+  a timestamp ordering test cannot distinguish the two exits, so a deleted
+  coordinator is untrusted and the resumed run re-reads the world. (#369)
+  The cache is not trusted for
   the loss judgement, so the absence of a coordinator is confirmed **against
   the API server** with a live read and no recorded state — one confirmation
   rule for the disappearance signal: a coordinator pod found live means the
@@ -3358,6 +3369,43 @@ was superseded.
   and neither surface is expressible as the other. The legacy wedge deferral
   carries the exit-code hazard this arm avoids, and the secure path's cached
   control-pod read and unconditioned delete, as #369 and #370. (#223)
+
+- **2026-10-17 — #369: a terminating coordinator's recorded exit is never
+  mapped, so the deferred wedge charge survives the coordinator's own
+  teardown.** #223 closed the deferred-charge hole on the secure path by
+  restricting the deferral to the inert control object, the one that can
+  never report an outcome; the wedge path deletes a *recoverable*
+  coordinator, so it needed its own repair. `checkLiveness` reaps a live
+  wedged coordinator and defers the charge when the object survives the
+  live re-confirmation, leaving the run `Running` while the pod is torn
+  down, and the Running-phase exit-code loop in `observeRunning` had no
+  `DeletionTimestamp` guard: once the kubelet finished the shutdown, the
+  loop read the teardown's exit and terminalized the run — `Failed` for a
+  cancelled model stream, `Verifying`/`Done` had the coordinator exited 0
+  in the window — instead of letting the disappearance backstop take the
+  deferred relaunch. The loop now skips a pod whose deletion is in flight,
+  the same terminating rule `topologyBroken`, `coordinatorPodOf` and
+  `activeOperationValid` already apply, and the deferred charge lands on
+  the backstop with its pod-loss cause: one credit, relaunch. The
+  mirror case was decided with it: a coordinator that exited with a
+  meaningful code and was deleted *afterwards* (node drain, manual delete)
+  no longer terminalizes through the exit mapping; it converges to the same
+  pod-loss relaunch. A timestamp ordering test cannot separate the cases —
+  graceful deletion stamps `deletionTimestamp` with a value of the request
+  plus the grace period, while the kubelet may end the SIGTERM'd container
+  at any point after the request, so a teardown exit can read as finished
+  before the stamp's value — and the exit of a deleted coordinator is
+  therefore untrusted by construction: the resumed run re-reads git, the
+  PR, and CI and lets the world win. The cost of a misordered success is
+  one crashloop credit against the shared ceiling. The guard sits in the
+  shared loop, so a terminating secure control pod's exit is likewise never
+  mapped — `ObserveTopology`'s existing control-termination branch still
+  fences the round while the object is terminating, and the same backstop
+  charges the loss with its fence; what #223 established is untouched — the
+  secure deferral still guards only the inert control object, so the secure
+  path still never leaves a `Running` run standing over a deferred
+  teardown of a recoverable control object. No timer and no duration bound
+  was added.
 
 - **2026-10-10 — #248 follow-up: legacy linkage check is fail-closed on forge
   read errors, and the declared-changes path routes through the bounded
