@@ -6,6 +6,8 @@ import (
 	"crypto/ed25519"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -688,6 +690,215 @@ func TestWorkerArtifactGuards(t *testing.T) {
 			t.Fatal("missing artifact must fail the operation")
 		}
 		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+// TestWorkerArtifactConfinement pins the readArtifact confinement against
+// paths the lexical check alone cannot see: symlinked parents, non-regular
+// substitutions, and growth past the bound after validation (#411).
+func TestWorkerArtifactConfinement(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("confinement relies on Linux openat O_NOFOLLOW semantics")
+	}
+	worker, priv, server := newTestWorker(t)
+	client := &Client{BaseURL: server.URL}
+	ctx := context.Background()
+
+	outside := filepath.Join(t.TempDir(), "outside")
+	if err := os.MkdirAll(outside, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(outside, "sentinel.txt"), []byte("outside-secret"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(outside, filepath.Join(worker.config.WorkspaceDir, "link")); err != nil {
+		t.Fatal(err)
+	}
+	if err := syscall.Mkfifo(filepath.Join(worker.config.WorkspaceDir, "fifo"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	oversized := filepath.Join(worker.config.WorkspaceDir, "oversized.bin")
+	if err := os.WriteFile(oversized, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Truncate(oversized, maxArtifactBytes+1); err != nil {
+		t.Fatal(err)
+	}
+
+	cases := []struct {
+		artifactPath string
+	}{
+		{artifactPath: "link/sentinel.txt"},
+		{artifactPath: "link"},
+		{artifactPath: "fifo"},
+		{artifactPath: "oversized.bin"},
+		{artifactPath: "."},
+	}
+	for i, tc := range cases {
+		name := tc.artifactPath
+		t.Run(name, func(t *testing.T) {
+			task, _ := json.Marshal(Task{Command: []string{"true"}, ArtifactPath: tc.artifactPath})
+			env := dispatchEnvelope(worker.clock())
+			env.OpID = fmt.Sprintf("op-confinement-%d", i)
+			env.Nonce = fmt.Sprintf("confinement-nonce-%08d", i)
+			env.PayloadDigest = PayloadDigestOf(task)
+			if _, err := client.Dispatch(ctx, priv, env, task); err != nil {
+				t.Fatalf("Dispatch: %v", err)
+			}
+			deadline := time.Now().Add(5 * time.Second)
+			for {
+				state, err := client.Result(ctx, env.OpID)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if state.Status == ResultFailed {
+					result := state.Result
+					if result == nil || result.Artifact != nil {
+						t.Fatalf("rejected artifact must return no bytes: %+v", result)
+					}
+					if strings.Contains(result.StdoutTail, "outside-secret") || strings.Contains(result.StderrTail, "outside-secret") {
+						t.Fatal("outside bytes leaked into the result")
+					}
+					return
+				}
+				if state.Status == ResultCompleted {
+					t.Fatalf("artifact %q must fail the operation: %+v", tc.artifactPath, state.Result)
+				}
+				if time.Now().After(deadline) {
+					t.Fatalf("operation with artifact %q never finished", tc.artifactPath)
+				}
+				time.Sleep(10 * time.Millisecond)
+			}
+		})
+	}
+
+	t.Run("valid artifact inside the workspace still reads", func(t *testing.T) {
+		if err := os.WriteFile(filepath.Join(worker.config.WorkspaceDir, "kept.txt"), []byte("kept"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		task, _ := json.Marshal(Task{Command: []string{"true"}, ArtifactPath: "kept.txt"})
+		env := dispatchEnvelope(worker.clock())
+		env.OpID = "op-confinement-valid"
+		env.Nonce = "confinement-nonce-valid"
+		env.PayloadDigest = PayloadDigestOf(task)
+		if _, err := client.Dispatch(ctx, priv, env, task); err != nil {
+			t.Fatalf("Dispatch: %v", err)
+		}
+		deadline := time.Now().Add(5 * time.Second)
+		for {
+			state, err := client.Result(ctx, env.OpID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if state.Status == ResultCompleted {
+				if string(state.Result.Artifact) != "kept" {
+					t.Fatalf("artifact = %q", state.Result.Artifact)
+				}
+				return
+			}
+			if state.Status == ResultFailed || time.Now().After(deadline) {
+				t.Fatalf("valid artifact must read: %+v", state.Result)
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+	})
+
+	// A FIFO swapped over the artifact path after the descriptor is opened
+	// and validated cannot affect the read: the descriptor still refers to
+	// the opened regular file, so the operation must complete with the
+	// original confined bytes and never block. A regression to a path-based
+	// read after validation would instead open the FIFO and stall to the
+	// deadline.
+	t.Run("a FIFO swapped in after validation cannot redirect the read", func(t *testing.T) {
+		staged := filepath.Join(worker.config.WorkspaceDir, "staged.fifo")
+		if err := syscall.Mkfifo(staged, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(worker.config.WorkspaceDir, "swapped.txt"), []byte("genuine"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		swapped := false
+		previous := artifactReadHook
+		artifactReadHook = func() {
+			if err := os.Rename(staged, filepath.Join(worker.config.WorkspaceDir, "swapped.txt")); err != nil {
+				t.Error(err)
+				return
+			}
+			swapped = true
+		}
+		t.Cleanup(func() { artifactReadHook = previous })
+		task, _ := json.Marshal(Task{Command: []string{"true"}, ArtifactPath: "swapped.txt"})
+		env := dispatchEnvelope(worker.clock())
+		env.OpID = "op-confinement-swap"
+		env.Nonce = "confinement-nonce-swap000"
+		env.PayloadDigest = PayloadDigestOf(task)
+		if _, err := client.Dispatch(ctx, priv, env, task); err != nil {
+			t.Fatalf("Dispatch: %v", err)
+		}
+		deadline := time.Now().Add(5 * time.Second)
+		for {
+			state, err := client.Result(ctx, env.OpID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if state.Status == ResultCompleted {
+				if string(state.Result.Artifact) != "genuine" {
+					t.Fatalf("substitution must not redirect the read: artifact = %q", state.Result.Artifact)
+				}
+				if !swapped {
+					t.Fatal("the swap hook never ran, so the post-validation window was not exercised")
+				}
+				return
+			}
+			if state.Status == ResultFailed || time.Now().After(deadline) {
+				t.Fatalf("a post-validation swap must not block or redirect the read: %+v", state.Result)
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+	})
+}
+
+// growingReader delivers maxArtifactBytes+1 bytes across reads whose sizes
+// grow, so the bound must be enforced on bytes actually read rather than on
+// any pre-read claim about the total.
+type growingReader struct {
+	delivered int
+}
+
+func (g *growingReader) Read(p []byte) (int, error) {
+	if g.delivered >= maxArtifactBytes+1 {
+		return 0, io.EOF
+	}
+	n := len(p)
+	if n > 4096 {
+		n = 4096
+	}
+	if g.delivered+n > maxArtifactBytes+1 {
+		n = maxArtifactBytes + 1 - g.delivered
+	}
+	for i := 0; i < n; i++ {
+		p[i] = 'x'
+	}
+	g.delivered += n
+	return n, nil
+}
+
+func TestReadArtifactBoundedAppliesToBytesRead(t *testing.T) {
+	data, err := readArtifactBounded(bytes.NewReader([]byte("artifact-bytes")))
+	if err != nil || string(data) != "artifact-bytes" {
+		t.Fatalf("readArtifactBounded = %q, %v", data, err)
+	}
+	data, err = readArtifactBounded(bytes.NewReader(make([]byte, maxArtifactBytes)))
+	if err != nil || len(data) != maxArtifactBytes {
+		t.Fatalf("an artifact of exactly the bound must read whole: %d bytes, %v", len(data), err)
+	}
+	data, err = readArtifactBounded(bytes.NewReader(make([]byte, maxArtifactBytes+1)))
+	if err == nil || len(data) != 0 {
+		t.Fatalf("a file truncated past the bound must be rejected whole: %d bytes, %v", len(data), err)
+	}
+	data, err = readArtifactBounded(&growingReader{})
+	if err == nil || len(data) != 0 {
+		t.Fatalf("a reader that grows past the bound must be rejected whole: %d bytes, %v", len(data), err)
 	}
 }
 
