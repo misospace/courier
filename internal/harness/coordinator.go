@@ -329,9 +329,11 @@ func (c *Coordinator) newSession(role string) (*Session, error) {
 //
 // The step-boundary compaction decision (#243) runs first, between turns and
 // never mid-turn: a compaction decided after a request is sent would be
-// reacting to a context the provider has already accepted.
+// reacting to a context the provider has already accepted. It receives the
+// same tool declarations as the turn it guards, because they ride every
+// request and consume the input limit the boundary is enforcing.
 func (c *Coordinator) pump(ctx context.Context, session *Session, briefID string, tools []ToolDef) turnResult {
-	if _, _, err := session.Compact(); err != nil {
+	if _, _, err := session.Compact(tools); err != nil {
 		return turnResult{harnessErr: err}
 	}
 	events := session.Turn(ctx, tools)

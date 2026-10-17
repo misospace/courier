@@ -1150,10 +1150,13 @@ stream/status path: a fixed category, never a provider body or key material.
 `floor(effective × compactAtPercent / 100)`. At a step boundary — between
 turns, never mid-turn — the harness compacts when the transcript has reached
 the compact point **or** when the next turn's prompt plus the output
-reservation would exceed the effective limit. After compaction the invariant
-`promptTokens + outputReservation ≤ effective` must hold; if it cannot, the
-harness fails closed and surfaces the condition rather than truncating
-mid-task. The two acceptance conditions fail independently: a digest can
+reservation would exceed the effective limit. The boundary is measured over
+the full next request: the transcript **and** the serialized tool
+declarations the gateway sends with every turn, since they consume input
+capacity each turn even though no compaction digests them. After compaction
+the invariant `promptTokens + outputReservation ≤ effective` must hold, on
+that same full-request account; if it cannot, the harness fails closed and
+surfaces the condition rather than truncating mid-task. The two acceptance conditions fail independently: a digest can
 reclaim tokens and still leave the protected tail too large to fit, in which
 case every digestible turn has already been spent and there is no progress left
 to make.
@@ -1200,8 +1203,9 @@ calls the policy between turns and never mid-turn, per-role budgets are
 resolved once in `NewCoordinator` from an injected `ContextBudgets` map, a
 digest that cannot fit fails the run rather than truncating, and
 `courier-control` emits `session.compacted`. A role with no resolved budget
-still owns no policy and never compacts, so until #295 and #296 supply
-declared and verified limits no production session carries a budget.
+still owns no policy and never compacts: #296 supplies the verified side, but
+nothing populates `ContextBudgets` until #295's declared schema lands, so no
+production session carries a budget yet.
 
 ## 6. Long-tool liveness contract (#119)
 

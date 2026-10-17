@@ -146,7 +146,7 @@ func TestCompactIsANoOpBelowTheCompactPoint(t *testing.T) {
 	sink := &recordingSink{}
 	session.compactions = sink
 
-	event, compacted, err := session.Compact()
+	event, compacted, err := session.Compact(nil)
 	if err != nil {
 		t.Fatalf("Compact() error = %v, want no error below the compact point", err)
 	}
@@ -178,7 +178,7 @@ func TestCompactAtCompactPointPreservesOrderAndEmits(t *testing.T) {
 	}
 	lastTurn := original[len(original)-2:]
 
-	event, compacted, err := session.Compact()
+	event, compacted, err := session.Compact(nil)
 	if err != nil {
 		t.Fatalf("Compact() error = %v", err)
 	}
@@ -260,7 +260,7 @@ func TestCompactPreservesSettledStateVerbatim(t *testing.T) {
 	appendTurns(session, 15)
 	pinned := session.Messages[:1]
 
-	_, compacted, err := session.Compact()
+	_, compacted, err := session.Compact(nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -303,7 +303,7 @@ func TestCompactFailsClosedWhenProtectedStateCannotFit(t *testing.T) {
 	session := transcriptWithTurns(t, budget, 6)
 	before := append([]Message(nil), session.Messages...)
 
-	_, compacted, err := session.Compact()
+	_, compacted, err := session.Compact(nil)
 	if err == nil {
 		t.Fatalf("Compact() compacted = %v, want an error when protected state cannot fit", compacted)
 	}
@@ -326,7 +326,7 @@ func TestCompactHysteresisDoesNotRefire(t *testing.T) {
 	session.compactions = sink
 	original := session.budget
 
-	_, compacted, err := session.Compact()
+	_, compacted, err := session.Compact(nil)
 	if err != nil || !compacted {
 		t.Fatalf("first Compact() = %v, %v; want a compaction", compacted, err)
 	}
@@ -353,7 +353,7 @@ func TestCompactHysteresisDoesNotRefire(t *testing.T) {
 	}
 
 	// The next boundary, on the just-compacted transcript, is a no-op.
-	_, compacted, err = session.Compact()
+	_, compacted, err = session.Compact(nil)
 	if err != nil {
 		t.Fatalf("second Compact() error = %v", err)
 	}
@@ -366,7 +366,7 @@ func TestCompactHysteresisDoesNotRefire(t *testing.T) {
 
 	// Growth past the calibrated compact point compacts again.
 	appendTurns(session, 15)
-	_, compacted, err = session.Compact()
+	_, compacted, err = session.Compact(nil)
 	if err != nil {
 		t.Fatalf("third Compact() error = %v", err)
 	}
@@ -387,7 +387,7 @@ func TestCompactDoesNotDigestTheRecentTurn(t *testing.T) {
 	lastAssistant := session.Messages[len(session.Messages)-2:]
 	lastTool := session.Messages[len(session.Messages)-1:]
 
-	_, compacted, err := session.Compact()
+	_, compacted, err := session.Compact(nil)
 	if err != nil || !compacted {
 		t.Fatalf("Compact() = %v, %v; want a compaction", compacted, err)
 	}
@@ -408,7 +408,7 @@ func TestZeroBudgetNeverCompacts(t *testing.T) {
 	session.Pin(Message{Role: "system", Content: "goal"})
 	appendTurns(session, 40)
 	before := append([]Message(nil), session.Messages...)
-	if _, compacted, err := session.Compact(); err != nil || compacted {
+	if _, compacted, err := session.Compact(nil); err != nil || compacted {
 		t.Fatalf("Compact() = %v, %v; want a no-op under a zero budget", compacted, err)
 	}
 	if len(session.Messages) != len(before) {
@@ -792,7 +792,7 @@ func TestCompactFailsRatherThanDigestTheRecentTurn(t *testing.T) {
 	session.Append(Message{Role: "assistant", Content: strings.Repeat("a", 1000*tokensPerChar), ToolCalls: []ToolCall{{ID: "c2", Name: toolShell, Arguments: `{"command":"ls"}`}}})
 	before := append([]Message(nil), session.Messages...)
 
-	_, compacted, err := session.Compact()
+	_, compacted, err := session.Compact(nil)
 	if err == nil {
 		t.Fatalf("Compact() compacted = %v, want a failure rather than digesting the most recent turn", compacted)
 	}
@@ -801,5 +801,119 @@ func TestCompactFailsRatherThanDigestTheRecentTurn(t *testing.T) {
 	}
 	if !sameMessages(session.Messages, before) {
 		t.Fatalf("the transcript changed after a compaction that could only succeed by digesting the most recent turn: %d messages, want %d", len(session.Messages), len(before))
+	}
+}
+
+// --- tool-declaration accounting in the boundary estimate -------------------
+//
+// Gateway.StreamChat serializes ChatRequest.Tools into every provider
+// request, so the declarations consume input capacity each turn even though
+// they are not transcript. A boundary that estimated only messages could
+// report a fitting post-condition for a request the effective limit cannot
+// hold. These tests pin that Compact accounts for the declarations of the
+// turn it guards.
+
+// TestCompactCountsToolDeclarationsTowardTheCompactPoint is the false-pass
+// counterexample: the same transcript is a no-op with no declarations and a
+// compaction with a schema large enough to cross the compact point. Omitting
+// the declarations from the account reports "no compaction needed" for a
+// request that has already reached it.
+func TestCompactCountsToolDeclarationsTowardTheCompactPoint(t *testing.T) {
+	budget := compactBudget(t, 4000) // compact point 3000, no reservation
+	tools := []ToolDef{{Name: "edit", Description: strings.Repeat("d", 1200)}}
+
+	session := transcriptWithTurns(t, budget, 14)
+	transcriptTokens := 0
+	for _, message := range session.Messages {
+		transcriptTokens += estimateMessageTokens(message)
+	}
+	toolTokens := estimateToolTokens(tools)
+	if transcriptTokens >= budget.CompactPoint {
+		t.Fatalf("test shape invalid: transcript alone (%d) already reaches the compact point %d", transcriptTokens, budget.CompactPoint)
+	}
+	if transcriptTokens+toolTokens < budget.CompactPoint {
+		t.Fatalf("test shape invalid: transcript plus declarations (%d) does not reach the compact point %d", transcriptTokens+toolTokens, budget.CompactPoint)
+	}
+
+	sink := &recordingSink{}
+	session.compactions = sink
+	event, compacted, err := session.Compact(tools)
+	if err != nil {
+		t.Fatalf("Compact(tools) error = %v, want a compaction the transcript alone would not trigger", err)
+	}
+	if !compacted {
+		t.Fatal("Compact(tools) was a no-op; the tool declarations were left out of the boundary account")
+	}
+	if event.Before != transcriptTokens+toolTokens {
+		t.Fatalf("event.Before = %d, want transcript %d + declarations %d", event.Before, transcriptTokens, toolTokens)
+	}
+	if event.Before-event.After != event.NetSaved {
+		t.Fatalf("event counts disagree: Before %d - After %d != NetSaved %d", event.Before, event.After, event.NetSaved)
+	}
+	if !budget.FitsAfterCompaction(event.After) {
+		t.Fatalf("post-condition violated: After %d exceeds effective limit %d", event.After, budget.EffectiveLimit)
+	}
+
+	// The identical transcript with no declarations is the negative control:
+	// the compaction fired because of the schema, not the messages.
+	control := transcriptWithTurns(t, budget, 14)
+	if _, compacted, err := control.Compact(nil); err != nil || compacted {
+		t.Fatalf("Compact(nil) = %v, %v; want a no-op below the compact point", compacted, err)
+	}
+}
+
+// TestCompactFailsClosedWhenDeclarationsCannotFit is the fail-closed half:
+// declarations so large that the protected state can never fit alongside
+// them end the run with the transcript unchanged, rather than reporting a fit
+// over messages alone. The same state without the declarations compacts
+// normally, so the failure is attributable to the schema and not the turn.
+func TestCompactFailsClosedWhenDeclarationsCannotFit(t *testing.T) {
+	budget := compactBudget(t, 4000)
+	tools := []ToolDef{{Name: "huge", Description: strings.Repeat("d", 16000)}}
+	if estimateToolTokens(tools) <= budget.EffectiveLimit {
+		t.Fatalf("test shape invalid: declarations (%d) must alone exceed the effective limit %d", estimateToolTokens(tools), budget.EffectiveLimit)
+	}
+
+	session := transcriptWithTurns(t, budget, 15)
+	before := append([]Message(nil), session.Messages...)
+	sink := &recordingSink{}
+	session.compactions = sink
+
+	_, compacted, err := session.Compact(tools)
+	if !errors.Is(err, ErrCompactionCannotFit) {
+		t.Fatalf("Compact(tools) error = %v, want ErrCompactionCannotFit", err)
+	}
+	if compacted {
+		t.Fatal("Compact(tools) compacted = true for a request that cannot fit with its declarations counted")
+	}
+	if !sameMessages(session.Messages, before) {
+		t.Fatal("the transcript changed after a compaction that must fail closed")
+	}
+	if len(sink.events) != 0 {
+		t.Fatalf("a failed compaction emitted %d telemetry events, want none", len(sink.events))
+	}
+
+	// The identical transcript without declarations compacts: the failure
+	// belongs to the request shape, not to the turns.
+	control := transcriptWithTurns(t, budget, 15)
+	if _, compacted, err := control.Compact(nil); err != nil || !compacted {
+		t.Fatalf("Compact(nil) = %v, %v; want the same shape to compact without declarations", compacted, err)
+	}
+}
+
+// TestEstimateToolTokensMatchesTheWireShape pins the estimator's floor and
+// that it costs the JSON encoding of the parameter schema, the bytes the
+// request actually carries.
+func TestEstimateToolTokensMatchesTheWireShape(t *testing.T) {
+	if got := estimateToolTokens(nil); got != 0 {
+		t.Fatalf("estimateToolTokens(nil) = %d, want 0", got)
+	}
+	if got := estimateToolTokens([]ToolDef{{}}); got != 1 {
+		t.Fatalf("estimateToolTokens(empty tool) = %d, want the one-token floor", got)
+	}
+	bare := estimateToolTokens([]ToolDef{{Name: "t", Description: "d"}})
+	withSchema := estimateToolTokens([]ToolDef{{Name: "t", Description: "d", Parameters: map[string]any{"type": "object", "properties": map[string]any{"path": map[string]any{"type": "string"}}}}})
+	if withSchema <= bare {
+		t.Fatalf("parameter schema cost nothing: with %d, bare %d", withSchema, bare)
 	}
 }

@@ -3461,10 +3461,15 @@ was superseded.
   and `OwnedFiles` are re-injected verbatim by re-rendering the exact bytes
   `briefText` uses. A transcript that cannot fit fails closed — the run ends
   as an infrastructure failure with the transcript unchanged — because
-  dropping protected state to fit is a silent truncation of the task. A role
-  with no resolved budget owns no policy and never compacts: until #295 and
-  #296 supply declared and verified limits, no production session carries a
-  budget, and an implicit context window is never substituted. (§7's
+  dropping protected state to fit is a silent truncation of the task. The
+  boundary is measured over the full next request — transcript plus the
+  serialized tool declarations the gateway sends with every turn, carried as
+  `CompactionInput.FixedTokens` — because a fit claimed over messages alone
+  can describe a request the effective limit cannot hold. A role
+  with no resolved budget owns no policy and never compacts: #296 supplies
+  the verified limit, but nothing populates `CoordinatorConfig.ContextBudgets`
+  until #295's declared schema lands, so no production session carries a
+  budget yet, and an implicit context window is never substituted. (§7's
   checkpoint ladder is untouched: compaction neither advances nor replaces
   it, so resume still reconstructs settled state from the world and the
   checkpoint.) (#297)

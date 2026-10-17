@@ -171,11 +171,16 @@ func (b ContextBudget) FitsAfterCompaction(promptTokens int) bool {
 // messages that must never be digested (the pinned brief/objective, settled
 // Decisions, OwnedFiles, and the most recent turn); DigestTokens is the
 // estimated cost of the single digest message that replaces the selected
-// span.
+// span. FixedTokens is the cost of the request that accompanies every turn
+// but is never part of the transcript and never digestible — the serialized
+// tool declarations the gateway sends with each request — so Before, After,
+// and both acceptance conditions are measured against the full prompt the
+// provider will actually receive.
 type CompactionInput struct {
 	MessageTokens []int
 	Protected     []bool
 	DigestTokens  int
+	FixedTokens   int
 	Budget        ContextBudget
 }
 
@@ -218,15 +223,21 @@ type CompactionPlan struct {
 // tokens (After < Before): a digest that costs as much as it replaces would
 // re-trigger on the next boundary forever. When even digesting every
 // non-protected turn cannot fit or reclaim, it fails closed with
-// ErrCompactionCannotFit. A transcript already within budget is returned
-// unchanged (Compacted false).
+// ErrCompactionCannotFit. The boundary is measured over the full next
+// request — FixedTokens plus the transcript — so a request that would fit
+// only because its tool declarations were left out of the account does not
+// pass. A request already within budget is returned unchanged (Compacted
+// false).
 //
 // On success the returned BudgetAfter raises CompactPoint to at least
 // plan.After+1, so the next step boundary's ShouldCompact does not re-fire on
 // the just-compacted state; the caller must use BudgetAfter for any
 // subsequent compaction decision in the same session.
 func PlanCompaction(in CompactionInput) (CompactionPlan, error) {
-	before := 0
+	if in.FixedTokens < 0 {
+		return CompactionPlan{}, errors.New("harness: compaction input has a negative fixed token count")
+	}
+	before := in.FixedTokens
 	for _, tokens := range in.MessageTokens {
 		if tokens < 0 {
 			return CompactionPlan{}, errors.New("harness: compaction input has a negative message token count")
@@ -269,7 +280,9 @@ func PlanCompaction(in CompactionInput) (CompactionPlan, error) {
 
 // CompactEvent is the payload of the session.compacted run event (#243),
 // whose canonical name is log.EventSessionCompacted. It reports token counts
-// only: before and after the compaction, the net tokens saved
+// only: before and after the compaction — the estimated full request prompt,
+// transcript plus the request-fixed cost such as the tool declarations the
+// gateway sends with every turn — the net tokens saved
 // (Before - After = DigestedTokens - DigestTokens), and the gross count of
 // tokens the digest replaced, plus the role and its bound model. The net
 // count is the user-facing "reclaimed" (what the compaction actually freed);

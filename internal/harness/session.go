@@ -2,6 +2,7 @@ package harness
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"sort"
@@ -319,6 +320,31 @@ func estimateMessageTokens(message Message) int {
 	return tokens
 }
 
+// estimateToolTokens is the deterministic prompt cost of the tool
+// declarations sent with a turn request. Gateway.StreamChat serializes the
+// declarations into the same provider request as the transcript, so a
+// boundary that accounted only for messages could report a fitting
+// post-condition for a request the model's input limit cannot hold. Every
+// declaration costs at least one token, and parameters are estimated over
+// their JSON encoding, the bytes the wire actually carries.
+func estimateToolTokens(tools []ToolDef) int {
+	total := 0
+	for _, tool := range tools {
+		chars := len(tool.Name) + len(tool.Description)
+		if len(tool.Parameters) > 0 {
+			if encoded, err := json.Marshal(tool.Parameters); err == nil {
+				chars += len(encoded)
+			}
+		}
+		tokens := chars / tokensPerChar
+		if tokens < 1 {
+			tokens = 1
+		}
+		total += tokens
+	}
+	return total
+}
+
 // messageTokens estimates each transcript message's prompt cost, oldest
 // first — the shape PlanCompaction consumes.
 func messageTokens(messages []Message) []int {
@@ -345,12 +371,18 @@ func messageTokens(messages []Message) []int {
 // settled-state block verbatim, so a compacted delegate still reads the
 // decisions it was told to apply exactly.
 //
+// The tools argument must be the declarations the next Turn will send: the
+// boundary accounts for the full request the provider will receive —
+// transcript plus serialized tool declarations — so a fit claimed over
+// messages alone is never reported for a request the input limit cannot
+// hold.
+//
 // On success the session adopts the plan's calibrated budget, so the next
 // boundary does not re-fire on the state this compaction just produced. On
 // ErrCompactionCannotFit the transcript is returned byte-for-byte unchanged
 // and the caller fails the run: dropping protected state to fit would be a
 // silent truncation of the task.
-func (s *Session) Compact() (CompactEvent, bool, error) {
+func (s *Session) Compact(tools []ToolDef) (CompactEvent, bool, error) {
 	if s.budget.EffectiveLimit <= 0 {
 		return CompactEvent{}, false, nil
 	}
@@ -368,6 +400,7 @@ func (s *Session) Compact() (CompactEvent, bool, error) {
 		MessageTokens: tokens,
 		Protected:     protected,
 		DigestTokens:  digestTokens,
+		FixedTokens:   estimateToolTokens(tools),
 		Budget:        s.budget,
 	})
 	if err != nil {
