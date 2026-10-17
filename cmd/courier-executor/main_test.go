@@ -16,6 +16,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"reflect"
+	"regexp"
 	"runtime"
 	"strings"
 	"sync"
@@ -6730,6 +6731,11 @@ func readForgeComments(t *testing.T, statePath string) []string {
 // raw string with literal newlines so every shell command is exactly
 // what gets written — the inlined helper must avoid Go string-escape
 // confusion around the printf format strings.
+//
+// It also creates the tests/ package without the packaging test, which is
+// the world the combined #367 case needs: a real top-level directory so
+// the body's citation is checkable, and an absent file inside it so the
+// citation is a finding.
 func scriptCriteriaDeficientTurns(sessionID string) string {
 	script := `#!/bin/sh
 case "$1" in mcp) exit 0;; esac
@@ -6738,6 +6744,8 @@ N=$(cat "$COURIER_FAKE_STATE/count" 2>/dev/null || echo 0)
 N=$((N+1)); echo "$N" > "$COURIER_FAKE_STATE/count"
 printf '{"sessionID":"` + sessionID + `","part":{"type":"text","text":"turn %s"}}\n' "$N"
 printf 'work\n' > "work-$N.txt"
+mkdir -p tests
+printf '# shared fixtures\n' > tests/conftest.py
 git add --all -- .
 git commit -m "test: turn $N" >/dev/null 2>&1 || true
 git push origin "$COURIER_BRANCH" >/dev/null 2>&1 || true
@@ -6754,12 +6762,23 @@ exit 0
 // changes, and exits 0; the criteria check then passes and the run
 // ends Verifying with the criteria.coverage=partial event detail. No
 // continuation is fired.
+//
+// The turn also writes the packaging test the honest-partial body
+// cites: since #367 the legacy plan checks that the paths a
+// regression-check row cites exist in the published head, so a model
+// claiming a regression check must ship the file that check lives in.
+// The fixture's bare `Dockerfile` citation is deliberately not written
+// here — a top-level name carries no slash and is therefore not one of
+// the citable locations the validator accepts, so it is never probed
+// (see TestCriterionEvidenceReferentialCheckAgainstPublishedHead).
 func scriptCriteriaHonestPartialTurns(sessionID string) string {
 	script := `#!/bin/sh
 case "$1" in mcp) exit 0;; esac
 printf '%s\n' "$(printf '%s' "$*" | tr '\n' ' ')" >> "$COURIER_FAKE_STATE/argv.log"
 printf '{"sessionID":"` + sessionID + `","part":{"type":"text","text":"honest partial run"}}\n'
 printf 'work\n' > work.txt
+mkdir -p tests
+printf 'def test_dockerfile_packages_assets():\n    pass\n' > tests/test_dockerfile_packaging.py
 git add --all -- .
 git commit -m 'test: opened the PR with an honest partial evidence block' >/dev/null
 git push origin "$COURIER_BRANCH" >/dev/null 2>&1 || true
@@ -6768,6 +6787,44 @@ printf '{"outcome":"changes"}' > "$COURIER_SCRATCH_DIR/outcome.json"
 exit 0
 `
 	return script
+}
+
+// scriptCriteriaCitedPathTurns is the fake OpenCode body for the #367
+// referential check end to end. addCitedPathFrom names the first turn
+// that writes the packaging test the honest-partial body cites: 1 means
+// the citation is truthful from the first observation and the handoff
+// passes clean, 2 means it is absent on the first observation and added
+// on the repair turn, which is how a run actually resolves a finding, and
+// any value past the last reachable turn leaves the finding standing for
+// the exhausted-budget ending. Every turn commits and pushes, so the
+// head the probe reads is the run's own current, published commit.
+//
+// Every turn creates the tests/ package with a sibling file: #367 roots
+// a candidate against the published tree's top-level entries, so the
+// honest-partial body's citation of tests/test_dockerfile_packaging.py is
+// only checkable when the tests/ directory itself is real in that tree.
+// A citation under a directory the head does not have is left alone
+// rather than guessed at.
+func scriptCriteriaCitedPathTurns(sessionID string, addCitedPathFrom int) string {
+	return `#!/bin/sh
+case "$1" in mcp) exit 0;; esac
+printf '%s\n' "$(printf '%s' "$*" | tr '\n' ' ')" >> "$COURIER_FAKE_STATE/argv.log"
+N=$(cat "$COURIER_FAKE_STATE/count" 2>/dev/null || echo 0)
+N=$((N+1)); echo "$N" > "$COURIER_FAKE_STATE/count"
+printf '{"sessionID":"` + sessionID + `","part":{"type":"text","text":"turn %s"}}\n' "$N"
+printf 'work\n' > "work-$N.txt"
+mkdir -p tests
+printf '# shared fixtures\n' > tests/conftest.py
+if [ "$N" -ge ` + fmt.Sprint(addCitedPathFrom) + ` ]; then
+  printf 'def test_dockerfile_packages_assets():\n    pass\n' > tests/test_dockerfile_packaging.py
+fi
+git add --all -- .
+git commit -m "test: turn $N" >/dev/null 2>&1 || true
+git push origin "$COURIER_BRANCH" >/dev/null 2>&1 || true
+mkdir -p "$COURIER_SCRATCH_DIR"
+printf '{"outcome":"changes"}' > "$COURIER_SCRATCH_DIR/outcome.json"
+exit 0
+`
 }
 
 // TestRunResolveIssueCriteriaDeficientBodyTriggersRepair proves the
@@ -7132,7 +7189,10 @@ func TestPinnedCriterionSetBindsEnvelopeToTrustedSource(t *testing.T) {
 	if err != nil || set == nil || !set.IsEmpty() {
 		t.Fatalf("case-insensitive matching empty set must decode and bind, got set %+v err %v", set, err)
 	}
-	if outcome, err := report.checkCriterionEvidence(set, obs); err != nil || outcome != nil {
+	// An empty pinned set is the vacuous case #367 must leave untouched, so
+	// the probe is handed no head to read: the check short-circuits before
+	// any git runs and the outcome stays nil.
+	if outcome, err := report.checkCriterionEvidence(context.Background(), "", set, obs); err != nil || outcome != nil {
 		t.Fatalf("case-insensitive matching empty set must vacuous-pass, got outcome %+v err %v", outcome, err)
 	}
 	// Matching non-empty envelope against a body with no evidence block:
@@ -7148,7 +7208,9 @@ func TestPinnedCriterionSetBindsEnvelopeToTrustedSource(t *testing.T) {
 	if err != nil {
 		t.Fatalf("matching envelope must decode, got err %v", err)
 	}
-	outcome, err := report.checkCriterionEvidence(set, obs)
+	// The block-less body fails the validator before any citation is probed
+	// (#367), so this case needs no head either.
+	outcome, err := report.checkCriterionEvidence(context.Background(), "", set, obs)
 	if err != nil {
 		t.Fatalf("matching envelope must reach the validator, got err %v", err)
 	}
@@ -7414,5 +7476,417 @@ func TestRunResolveIssueCoverageCommentFailureDoesNotBlockHandoff(t *testing.T) 
 	}
 	if !strings.Contains(out, `"phase":"Verifying"`) || !strings.Contains(out, `"criteria.coverage":"partial"`) {
 		t.Fatalf("handoff and telemetry must stand despite the comment failure: %q", out)
+	}
+}
+
+// evidenceProbeRepo builds the throwaway repository the #367 referential
+// check reads: a run workspace with a committed tree the check can probe
+// at an exact head. It reuses this file's git helpers (runGit,
+// configureGit, write, commit) instead of a second harness, and returns
+// the workspace directory and the head commit to probe.
+func evidenceProbeRepo(t *testing.T) (string, string) {
+	t.Helper()
+	root := t.TempDir()
+	repo := filepath.Join(root, "workspace")
+	runGit(t, root, "init", repo)
+	configureGit(t, repo)
+	runGit(t, repo, "branch", "-M", "main")
+	if err := os.MkdirAll(filepath.Join(repo, "tests"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(repo, ".github", "workflows"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	write(t, filepath.Join(repo, "tests", "test_packaging.py"), "def test_packaging():\n    pass\n")
+	write(t, filepath.Join(repo, ".github", "workflows", "ci.yaml"), "on: push\n")
+	write(t, filepath.Join(repo, "Dockerfile"), "FROM scratch\n")
+	commit(t, repo, "test: workspace with citable files")
+	head, err := exec.Command("git", "-C", repo, "rev-parse", "HEAD").Output()
+	if err != nil {
+		t.Fatalf("read workspace head: %v", err)
+	}
+	return repo, strings.TrimSpace(string(head))
+}
+
+// newEvidenceProbeReporter builds a reporter whose run workspace is the
+// throwaway repository, so the probe reads a real tree through the real
+// hardened-git boundary instead of a stub.
+func newEvidenceProbeReporter(t *testing.T, directory string) reporter {
+	t.Helper()
+	var output, errorsOut bytes.Buffer
+	return newReporter(&output, &errorsOut, config{
+		Mode:      "resolve-issue",
+		Repo:      "misospace/miso-gallery",
+		Ref:       502,
+		Directory: directory,
+	})
+}
+
+// oneRowReport wraps one evidence row in the parsed report the check
+// reads, so each table case below is exactly one citation claim.
+func oneRowReport(status broker.CriterionStatus, reference string) *broker.CriteriaReport {
+	return &broker.CriteriaReport{Records: []broker.CriterionRecord{
+		{ID: "AC-1", Status: status, Reference: reference},
+	}}
+}
+
+// TestCriterionEvidenceReferentialCheckAgainstPublishedHead pins the
+// #367 referential check against a real repository: a file path cited by
+// an implementation-evidence or regression-check row must exist in the
+// tree at the published head, and every other shape of reference is left
+// alone. The check is deliberately non-semantic — it asks whether a
+// cited file is there, never whether the cited check enforces its
+// criterion, because that audit stays the reviewer's (#249) — and it
+// fails open, so a probe it cannot complete must never become a defect
+// the model is asked to repair.
+//
+// Pinned, one case per row: a present path (with and without line and
+// test-symbol suffixes) is not a finding; an absent path, the same path
+// with a line suffix, and the same path with a leading ./ are findings
+// each naming the normalized path the probe asked git about; the same
+// path cited three ways yields exactly one candidate, so a body cannot
+// multiply probes by repeating itself; a URL is never probed, including
+// one whose host and path are path-shaped; prose with no location, a
+// bare top-level file name (not a citable location — the validator's own
+// rule), and manual-verification, not-implemented and unknown rows are
+// never probed even when their text is path-shaped, because those
+// references are notes rather than citations.
+func TestCriterionEvidenceReferentialCheckAgainstPublishedHead(t *testing.T) {
+	directory, head := evidenceProbeRepo(t)
+	reporter := newEvidenceProbeReporter(t, directory)
+	const (
+		present = "tests/test_packaging.py"
+		absent  = "tests/absent.py"
+	)
+	cases := []struct {
+		name       string
+		status     broker.CriterionStatus
+		reference  string
+		candidates int
+		rooted     int
+		missing    []string
+	}{
+		{"present path is not a finding", broker.StatusRegressionCheck, "`" + present + "` guards the COPY line", 1, 1, nil},
+		{"line suffix normalizes to the file", broker.StatusRegressionCheck, "`" + present + ":42-80` is the guard", 1, 1, nil},
+		{"test-symbol suffix normalizes to the file", broker.StatusRegressionCheck, "`" + present + "::test_packaging` is the guard", 1, 1, nil},
+		{"leading dot slash on a present file is not a finding", broker.StatusRegressionCheck, "./" + present + " is the guard", 1, 1, nil},
+		{"absent path is a finding", broker.StatusRegressionCheck, "`" + absent + "` guards the COPY line", 1, 1, []string{absent}},
+		{"implementation-evidence row is probed too", broker.StatusImplementationEvidence, "implemented in `" + absent + "`", 1, 1, []string{absent}},
+		{"line suffix on an absent file normalizes to the file", broker.StatusRegressionCheck, "`" + present + ":42` and `" + absent + ":12` are the guards", 2, 2, []string{absent}},
+		{"test-symbol suffix on an absent file normalizes to the file", broker.StatusRegressionCheck, "`" + absent + "::test_packaging` is the guard", 1, 1, []string{absent}},
+		{"leading dot slash on an absent file normalizes", broker.StatusRegressionCheck, "./" + absent + " is the guard", 1, 1, []string{absent}},
+		{"repeats probe once", broker.StatusRegressionCheck, "`" + absent + "`, ./" + absent + ":12 and `" + absent + "` again", 1, 1, []string{absent}},
+		{"URL is never probed", broker.StatusRegressionCheck, "the packaging job at https://ci.example.com/builds/12345", 0, 0, nil},
+		{"path-shaped URL is never probed or fetched", broker.StatusRegressionCheck, "see https://git.example.com/misospace/miso-gallery/blob/main/tests/test_packaging.py", 0, 0, nil},
+		{"URL beside a path probes only the path", broker.StatusRegressionCheck, "`" + absent + "` and https://ci.example.com/a/b/c", 1, 1, []string{absent}},
+		{"prose without a location yields nothing", broker.StatusRegressionCheck, "verified by hand in the built image", 0, 0, nil},
+		{"bare top-level name is not a location", broker.StatusRegressionCheck, "`Dockerfile` carries the COPY line", 0, 0, nil},
+		{"manual-verification prose is not a citation", broker.StatusManualVerification, "read `" + absent + "` and curled the endpoint by hand", 0, 0, nil},
+		{"not-implemented prose is not a citation", broker.StatusNotImplemented, "deliberately left out of `" + absent + "` for now", 0, 0, nil},
+		{"unknown status carries no citation", broker.StatusUnknown, "", 0, 0, nil},
+		// Rootedness against the published tree, not extraction, is what
+		// separates a repository path from a token that merely has a
+		// slash in it. Each of these is shaped like a path and is dropped
+		// at the probe, because no repository path can be rooted at a
+		// first segment the published tree does not carry — reporting one
+		// would burn the shared repair budget on a truthful body.
+		{"prose fraction beside a real path probes only the path", broker.StatusRegressionCheck, "matrix covers 3/4 endpoints; added `" + absent + "`", 2, 1, []string{absent}},
+		{"date-shaped token beside a real workflow path", broker.StatusRegressionCheck, "green in CI on 2026/10/17, see `.github/workflows/ci.yaml`", 2, 1, nil},
+		{"date-shaped token alone yields nothing", broker.StatusRegressionCheck, "green in CI on 2026/10/17", 1, 0, nil},
+		{"another repository's path yields nothing", broker.StatusRegressionCheck, "same approach as misospace/courier `internal/hardened.go`", 2, 0, nil},
+		{"module path yields nothing", broker.StatusImplementationEvidence, "implemented in `internal/x.go` using golang.org/x/net/html", 2, 0, nil},
+		{"port-shaped token yields nothing", broker.StatusRegressionCheck, "curl localhost:8080/health and `internal/x.go`", 2, 0, nil},
+		{"job name beside a real workflow path probes only the workflow", broker.StatusRegressionCheck, "nightly/contract job in `.github/workflows/ci.yaml`", 2, 1, nil},
+		{"top-level file name counts as a root", broker.StatusRegressionCheck, "`Dockerfile/nothing.py`", 1, 1, []string{"Dockerfile/nothing.py"}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			parsed := oneRowReport(tc.status, tc.reference)
+			candidates := citedEvidencePaths(parsed)
+			if len(candidates) != tc.candidates {
+				t.Fatalf("citedEvidencePaths(%q) = %q, want %d candidate(s)", tc.reference, candidates, tc.candidates)
+			}
+			rooted, ok := reporter.rootedAtPublishedTree(context.Background(), head, candidates)
+			if !ok {
+				t.Fatalf("the published tree at %s must be readable in this fixture", head)
+			}
+			if len(rooted) != tc.rooted {
+				t.Fatalf("rootedAtPublishedTree(%q) = %q, want %d rooted candidate(s)", tc.reference, rooted, tc.rooted)
+			}
+			missing, probed := reporter.missingEvidencePaths(context.Background(), parsed, head)
+			if !reflect.DeepEqual(missing, tc.missing) {
+				t.Fatalf("missingEvidencePaths(%q) = %q, want %q", tc.reference, missing, tc.missing)
+			}
+			// The head travels with the finding and only with it: a
+			// probe that found nothing reports no head, so the field
+			// cannot describe a head nobody needs named.
+			wantProbed := ""
+			if len(tc.missing) > 0 {
+				wantProbed = head
+			}
+			if probed != wantProbed {
+				t.Fatalf("probed head = %q, want %q", probed, wantProbed)
+			}
+		})
+	}
+}
+
+// TestCriterionEvidenceReferentialCheckFailsOpen pins the boundary cases
+// the shape table cannot reach: a head the probe cannot resolve, a caller
+// with no published head at all, a report with no rows, a top-level entry
+// the probe cannot descend into, and the normalization that keeps a path
+// git could refuse from ever reaching the hardened-git boundary. Every one
+// of them must yield no finding — the check is the one fail-open verdict
+// in a plan that is otherwise fail-closed, because a defect the model
+// cannot repair by editing the body may never be handed to it as one.
+func TestCriterionEvidenceReferentialCheckFailsOpen(t *testing.T) {
+	directory, head := evidenceProbeRepo(t)
+	reporter := newEvidenceProbeReporter(t, directory)
+	parsed := oneRowReport(broker.StatusRegressionCheck, "`tests/absent.py` guards the COPY line")
+
+	if missing, probed := reporter.missingEvidencePaths(context.Background(), parsed, strings.Repeat("0", 40)); missing != nil || probed != "" {
+		t.Fatalf("an unresolvable head must find nothing and name no head, got %q / %q", missing, probed)
+	}
+	if _, ok := reporter.rootedAtPublishedTree(context.Background(), strings.Repeat("0", 40), citedEvidencePaths(parsed)); ok {
+		t.Fatal("an unresolvable head must not be readable, or rooting would decide on an unread tree")
+	}
+	if missing, probed := reporter.missingEvidencePaths(context.Background(), parsed, ""); missing != nil || probed != "" {
+		t.Fatalf("no published head must skip the check entirely, got %q / %q", missing, probed)
+	}
+	if missing, probed := reporter.missingEvidencePaths(context.Background(), nil, head); missing != nil || probed != "" {
+		t.Fatalf("no parsed report must skip the check entirely, got %q / %q", missing, probed)
+	}
+	if missing, _ := reporter.missingEvidencePaths(context.Background(), &broker.CriteriaReport{}, head); missing != nil {
+		t.Fatalf("a report with no rows must skip the check entirely, got %q", missing)
+	}
+	// The single git probe the check performs directly: present at the
+	// head, absent at it, and fail-open on a head it cannot resolve.
+	if reporter.evidencePathAbsentAtHead(context.Background(), head, "tests/test_packaging.py") {
+		t.Fatal("a file the head carries must not read as absent")
+	}
+	if !reporter.evidencePathAbsentAtHead(context.Background(), head, "tests/absent.py") {
+		t.Fatal("a file the head does not carry must read as absent")
+	}
+	if reporter.evidencePathAbsentAtHead(context.Background(), strings.Repeat("0", 40), "tests/absent.py") {
+		t.Fatal("a probe that could not run must fail open, not read as absence")
+	}
+	// Normalization keeps git-hostile paths away from the boundary:
+	// ".." and "." segments are rejected by git, and a leading dash is
+	// what a pathspec-shaped string would use to become an option.
+	for match, want := range map[string]string{
+		"tests/../tests/test_packaging.py": "",
+		"tests/./test_packaging.py":        "",
+		"-tests/test_packaging.py":         "",
+		"tests//test_packaging.py":         "",
+		"./tests/test_packaging.py:9":      "tests/test_packaging.py",
+		"tests/test_packaging.py::test_x":  "tests/test_packaging.py",
+		"./tests/test_packaging.py":        "tests/test_packaging.py",
+	} {
+		if got := normalizeEvidencePathCandidate(match); got != want {
+			t.Fatalf("normalizeEvidencePathCandidate(%q) = %q, want %q", match, got, want)
+		}
+	}
+}
+
+// TestRunResolveIssueMissingCitedEvidencePathTriggersCriteriaRepair proves
+// the #367 finding end to end through the legacy pre-handoff plan. The
+// PR body is the honest-partial fixture — it passes the validator — but
+// the run's workspace never writes the packaging test its
+// regression-check rows cite, so the published head does not carry
+// `tests/test_dockerfile_packaging.py`. Exactly one bounded
+// criteria-repair continuation must name the missing path, and the
+// model's real repair — adding and pushing the cited file — must hand
+// the run off clean on the next observation: one repair turn, no new
+// budget.
+//
+// The mirror case pins the other half: with the cited file in the
+// workspace from the first turn, the same body hands off Verifying with
+// no continuation at all, so the check can never fail a truthful
+// citation.
+func TestRunResolveIssueMissingCitedEvidencePathTriggersCriteriaRepair(t *testing.T) {
+	body := readBrokerFixture(t, "miso-gallery-505-pr-honest-partial.md")
+	envelope := pinCriteriaEnvelopeForMisoGallery(t)
+	const cited = "tests/test_dockerfile_packaging.py"
+
+	t.Run("absent citation is repaired, then the run hands off clean", func(t *testing.T) {
+		code, out, _ := runCriteriaEndToEnd(t, body, scriptCriteriaCitedPathTurns("ses_cited_absent", 2), envelope)
+		if n := strings.Count(out, `"kind":"criteria-repair"`); n != 1 {
+			t.Fatalf("criteria-repair continuation count = %d, want 1: %q", n, out)
+		}
+		// The instruction names the path it probed, says plainly that the
+		// check was existence-only and fetched nothing, and leaves the two
+		// honest responses open instead of inventing a rule.
+		for _, want := range []string{cited, "Observed at published head ", "existence only", "no URL was fetched", "manual-verification"} {
+			if !strings.Contains(out, want) {
+				t.Fatalf("criteria-repair instruction must carry %q: %q", want, out)
+			}
+		}
+		// A block the validator passed must not be described with the
+		// vague pinned-set reason — that would send the model hunting
+		// through a contract it already satisfied.
+		if strings.Contains(out, "did not satisfy the pinned set") {
+			t.Fatalf("a validated block must not fall back to the vague reason: %q", out)
+		}
+		// The repair turn's observation is clean: the run ends Verifying
+		// with the derived coverage still reported.
+		if code != exitSuccess {
+			t.Fatalf("run exit code = %d, want 0 (repair hands off Verifying); detail: %q", code, out)
+		}
+		if !strings.Contains(out, `"phase":"Verifying"`) {
+			t.Fatalf("missing Verifying termination after the repair: %q", out)
+		}
+		if !strings.Contains(out, `"criteria.coverage":"partial"`) {
+			t.Fatalf("a passing handoff must still report derived coverage: %q", out)
+		}
+	})
+
+	t.Run("present citation hands off with no repair", func(t *testing.T) {
+		code, out, _ := runCriteriaEndToEnd(t, body, scriptCriteriaCitedPathTurns("ses_cited_present", 1), envelope)
+		if code != exitSuccess {
+			t.Fatalf("run exit code = %d, want 0 (a truthful citation is not a defect); detail: %q", code, out)
+		}
+		if strings.Contains(out, `"kind":"criteria-repair"`) {
+			t.Fatalf("a citation of a file the published head carries must not fire a repair: %q", out)
+		}
+		if !strings.Contains(out, `"phase":"Verifying"`) {
+			t.Fatalf("missing Verifying termination: %q", out)
+		}
+	})
+}
+
+// TestRunResolveIssueMissingCitedEvidencePathExhaustsBudgetToNamedReason
+// pins the criteria-only terminal ending of #367: linkage passes, the
+// validator passes, the cited file is still absent on the second
+// observation, and the single bounded repair turn is spent — so the run
+// must end NeedsHuman with the criterion-evidence terminal reason
+// (category verifier-rejection) naming the absent paths *and* the short
+// sha of the head the probe read, so an operator can settle the run from
+// the reason alone instead of re-deriving the observation. The combined
+// half of the same ending is pinned by
+// TestRunResolveIssueCombinedBodyWithMissingCitedPathFiresOneRepair.
+//
+// addCitedPathFrom 9 is beyond any turn the run can reach, so the fake
+// session never repairs: the finding survives to the terminal state.
+func TestRunResolveIssueMissingCitedEvidencePathExhaustsBudgetToNamedReason(t *testing.T) {
+	body := readBrokerFixture(t, "miso-gallery-505-pr-honest-partial.md")
+	envelope := pinCriteriaEnvelopeForMisoGallery(t)
+	code, out, _ := runCriteriaEndToEnd(t, body, scriptCriteriaCitedPathTurns("ses_cited_exhausted", 9), envelope)
+	if n := strings.Count(out, `"kind":"criteria-repair"`); n != 1 {
+		t.Fatalf("criteria-repair continuation count = %d, want 1 (the single slot is spent before exhaustion): %q", n, out)
+	}
+	if code != exitNeedsHuman {
+		t.Fatalf("run exit code = %d, want %d (NeedsHuman once the repair budget is spent); detail: %q", code, exitNeedsHuman, out)
+	}
+	if !strings.Contains(out, `"phase":"NeedsHuman"`) || !strings.Contains(out, `"category":"verifier-rejection"`) {
+		t.Fatalf("expected a fail-closed NeedsHuman verdict: %q", out)
+	}
+	// The terminal reason is the criterion-evidence one (not the linkage
+	// one, and not the combined one) and it names the absent path with
+	// the short sha of the head that was probed.
+	reason := terminalHandoffReason(t, out)
+	for _, want := range []string{
+		"incomplete handoff: criterion evidence",
+		"tests/test_dockerfile_packaging.py",
+		"absent from the published head ",
+		"misospace/miso-gallery#502",
+	} {
+		if !strings.Contains(reason, want) {
+			t.Fatalf("terminal reason must carry %q: %q", want, reason)
+		}
+	}
+	if strings.Contains(reason, "incomplete handoff: linkage:") {
+		t.Fatalf("linkage passed, so the combined reason must not be used: %q", reason)
+	}
+	// The named head must be a real short sha. Each observation probes the
+	// head it verified, so the head in the first repair instruction and the
+	// head in the terminal reason are different commits here (the fake
+	// session committed again between them); both must be named, and
+	// neither is fabricated.
+	if !regexp.MustCompile(`absent from the published head [0-9a-f]{7}\b`).MatchString(reason) {
+		t.Fatalf("terminal reason must name the probed head as a short sha: %q", reason)
+	}
+	_ = observedProbedHead(t, out)
+	if strings.Contains(out, `"phase":"Verifying"`) {
+		t.Fatalf("a run that exhausted its budget must not hand off Verifying: %q", out)
+	}
+}
+
+// observedProbedHead extracts the short head sha the #367 repair
+// instruction reported, asserting the instruction named one.
+func observedProbedHead(t *testing.T, out string) string {
+	t.Helper()
+	match := regexp.MustCompile(`Observed at published head ([0-9a-f]{7}):`).FindStringSubmatch(out)
+	if match == nil {
+		t.Fatalf("no probed head named in the repair instruction: %q", out)
+	}
+	return match[1]
+}
+
+// terminalHandoffReason returns the reason the run's terminating handoff
+// recorded, so a test asserts on the operator-facing sentence itself
+// rather than on any substring of the whole event log.
+func terminalHandoffReason(t *testing.T, out string) string {
+	t.Helper()
+	const prefix = "COURIER_TERMINATION "
+	for _, line := range strings.Split(out, "\n") {
+		line = strings.TrimSpace(line)
+		if !strings.HasPrefix(line, prefix) {
+			continue
+		}
+		var term struct {
+			Phase  string `json:"phase"`
+			Reason string `json:"reason"`
+		}
+		if err := json.Unmarshal([]byte(strings.TrimPrefix(line, prefix)), &term); err != nil {
+			t.Fatalf("decode termination line %q: %v", line, err)
+		}
+		return term.Reason
+	}
+	t.Fatalf("no %s line in output: %q", prefix, out)
+	return ""
+}
+
+// TestRunResolveIssueCombinedBodyWithMissingCitedPathFiresOneRepair pins
+// the combined verdict where the criterion half is a referential finding
+// rather than a validator error (#367): a body that fails linkage (the
+// honest-partial fixture with its closing keyword replaced by the vague
+// "Addresses") and cites a file the published head does not carry must
+// still earn exactly one bounded repair. The body-repair kind names both
+// halves on one turn, the missing path is quoted in that single
+// instruction, and neither linkage-repair nor criteria-repair fires
+// separately — the shared #170 budget is spent once, and the exhausted
+// reason names the absent paths so a terminal NeedsHuman explains itself.
+func TestRunResolveIssueCombinedBodyWithMissingCitedPathFiresOneRepair(t *testing.T) {
+	fixture := readBrokerFixture(t, "miso-gallery-505-pr-honest-partial.md")
+	body := strings.Replace(fixture, "Closes #502.", "Addresses #502.", 1)
+	if !strings.Contains(body, "Addresses #502.") {
+		t.Fatalf("fixture no longer carries the vague reference this test needs: %q", body)
+	}
+	envelope := pinCriteriaEnvelopeForMisoGallery(t)
+	// scriptCriteriaDeficientTurns never writes the cited file, so the
+	// referential finding survives the repair turn and the single
+	// continuation exhausts the budget.
+	code, out, _ := runCriteriaEndToEnd(t, body, scriptCriteriaDeficientTurns("ses_combined_cited"), envelope)
+	if n := strings.Count(out, `"kind":"body-repair"`); n != 1 {
+		t.Fatalf("expected exactly one combined body-repair continuation; got %d in: %q", n, out)
+	}
+	if strings.Contains(out, `"kind":"linkage-repair"`) || strings.Contains(out, `"kind":"criteria-repair"`) {
+		t.Fatalf("the combined repair must not split into single-contract repairs: %q", out)
+	}
+	if !strings.Contains(out, "Closes, Fixes, or Resolves") {
+		t.Fatalf("combined repair must name the linkage half: %q", out)
+	}
+	for _, want := range []string{
+		"tests/test_dockerfile_packaging.py",
+		"Observed at published head ",
+		"incomplete handoff: linkage:",
+		"absent from the published head",
+	} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("combined verdict must carry %q: %q", want, out)
+		}
+	}
+	if code != exitNeedsHuman {
+		t.Fatalf("run exit code = %d, want %d (NeedsHuman once the single repair turn is spent); detail: %q", code, exitNeedsHuman, out)
 	}
 }

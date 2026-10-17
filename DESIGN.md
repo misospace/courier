@@ -1891,6 +1891,73 @@ named items remain unresolved and must not be described as production-ready:
 
 ## Decisions
 
+- **2026-10-17 — #367: the legacy pre-handoff plan adds a bounded,
+  explicitly non-semantic referential check on cited evidence paths, and
+  fails open.** `checkCriterionEvidence` now takes the run's context and
+  the exact pushed head `confirmRemotePublication` just verified, and on
+  the success path probes the file paths the body's
+  `implementation-evidence` and `regression-check` rows cite against that
+  commit's tree in the run's own workspace (`git ls-tree <head> --
+  <path>`, hardened environment, stderr dropped). `ls-tree` rather than
+  the `cat-file -e` the issue first suggested: git exits 128 for an
+  absent path *and* for a head it cannot resolve, so exit status cannot
+  separate "the model cited a file that is not there" from "the probe
+  itself failed", and reading absence from a failed probe would fabricate
+  defects whenever git was unavailable — `ls-tree` exits 0 with empty
+  output for absence at a readable head and non-zero for an unreadable
+  one, so absence is a positive observation. Only the two statuses the
+  validator already requires to cite a location are probed:
+  `manual-verification` and `not-implemented` carry a note and `unknown`
+  carries none, and probing prose non-semantically would manufacture
+  defects the model can only silence by mislabelling the criterion.
+  Extraction mirrors the validator's own path alternative — whitespace
+  tokens, any token containing `://` dropped whole (URLs are never
+  fetched and a URL's host+path would otherwise read as a path), then
+  maximal matches of the slash-bearing charset, normalized (leading
+  `./` dropped, `:12`/`:12-40`/`::TestName` cut, `..`/`.`/empty segments
+  and a leading `-` rejected) and deduplicated in first-appearance order
+  — that charset admits no whitespace, `:`, or quote, no glob or
+  pathspec-magic character, and never begins with `-`, so a candidate can
+  neither split the argv it travels in nor be read as an option or a
+  pathspec expression (`(` and `)` can survive and are inert, because the
+  hardened boundary builds an argv directly and no shell sees the value);
+  the candidate is passed as the pathspec after `--`, never as part of a
+  `rev:path` argument, and that restriction is the caller's to justify —
+  `internal/git` does not sanitize. Extraction is deliberately
+  over-matching: it judges shape, not meaning, so every candidate is
+  rooted against the published tree before it is probed — the commit's
+  top-level entry names are read once (`ls-tree -z --full-name <head>`,
+  no pathspec, no recursion, bounded by the number of top-level entries;
+  blob and tree names both count) and only candidates whose first segment
+  is one of them survive. A slash-bearing token rooted nowhere is a ratio
+  ("3/4"), a date ("2026/10/17"), a port ("8080/health"), another
+  repository's path, a module path, or a job name — nothing this check can
+  speak about, and reporting one would burn the shared budget on a
+  truthful body and press the model to downgrade an honest criterion. The
+  trade-off is stated rather than hidden: an absent path under a real
+  top-level entry is still found and still named, while a citation the
+  extractor cannot resolve to a path-shaped candidate, or whose top-level
+  entry the head does not carry, is left alone rather than guessed at. The
+  candidate count is bounded by the operator-pinned set (`MaxCriteria`
+  rows, `MaxReferenceBytes` per reference) and no cap of the executor's
+  own is added. Findings ride `handoffCheckOutcome.missingEvidencePaths`
+  (with the probed head, so instruction and terminal reason can name the
+  revision): `applyHandoffPlan` folds them into one `criteriaDefect`
+  predicate, so a body that both fails linkage and cites a missing file
+  still earns a single `body-repair` on the shared #170 slot, and
+  `criteriaRepairMessage`, `criteriaExhaustedReason`, and
+  `combinedBodyExhaustedReason` name the paths — a validated block never
+  falls back to the vague "did not satisfy the pinned set" reason. This
+  is the one fail-open verdict in a plan that is otherwise fail-closed:
+  any probe it cannot complete yields no finding and no error, because a
+  defect the model cannot repair by editing the body must never be handed
+  to it as one, and the repair instruction is phrased as what was
+  observed plus the two honest responses (cite a path that exists in the
+  published head, or record the criterion honestly) rather than as a new
+  rule over the pinned contract. Empty and unpinned sets remain a
+  vacuous pass with no probe at all. No new cap, budget, timer, gate, or
+  network call. (#367, following #282 step 3 which marked the check
+  optional, #249, #248, #170)
 - **2026-10-17 — #377: the operator's own observation reads resolve their
   destination through the selected registration, the same routing admission
   was given in #340/#378.** Post-review PR observation, existing-PR head
@@ -1945,8 +2012,23 @@ named items remain unresolved and must not be described as production-ready:
   counts both in the `run.exit` telemetry and as a best-effort outcome
   comment on the run's source issue — a partial record is labelled
   honestly partial, and the legacy handoff never claims fully verified
-  completion outside the PR body. No new budget, gate, or wall clock:
-  boundedness stays `MaxContinuations` (#170). (#282, #249, #280, #248)
+  completion outside the PR body. The criterion half additionally
+  enforces referential integrity against the world (#367): a file path
+  cited by an `implementation-evidence` or `regression-check` row must
+  exist in the tree at the exact pushed head the observation just
+  verified, probed in the run's own workspace through hardened git, with
+  URLs never fetched and every probe that cannot complete failing open.
+  Only paths the published tree can confirm are probed: a candidate is
+  first rooted at a real top-level entry of that commit, so prose with a
+  slash in it — a ratio, a date, a port, another repository's path, a
+  module path — is left alone rather than reported.
+  It is existence, never semantics — whether a cited check enforces its
+  criterion stays the reviewer's audit — and it is a criterion defect for
+  every downstream purpose: the same single bounded repair, the same
+  shared #170 slot, the same terminal reasons. No new budget, gate, or
+  wall clock anywhere in the plan:
+  boundedness stays `MaxContinuations` (#170). (#282, #249, #280, #248,
+  #367)
 - **2026-10-16 — #282 follow-up: the pinned-envelope admission check runs
   before the forge observation, not inside it.** The undecodable-envelope
   fail-closed path was only reachable from the open-PR branch, so a missing,
