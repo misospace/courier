@@ -1909,6 +1909,288 @@ func TestBrokerTokenSourceFailsClosed(t *testing.T) {
 	}
 }
 
+// --- acceptance: a broker 401 during the kubelet token-swap window ----------
+
+// funcTokenSource is a scripted BrokerTokenSource: every read consults f, so
+// a test decides exactly which bytes each request — and each 401 re-read —
+// sees.
+type funcTokenSource func() ([]byte, error)
+
+func (f funcTokenSource) BrokerToken() ([]byte, error) { return f() }
+
+// swapBrokerStatus serves a broker stand-in that answers any route, records
+// every Authorization header, and answers refusedStatus to every bearer except
+// accepted — the apiserver's answer to a token it no longer honors (401) or
+// a credential it will not authorize (403).
+func swapBrokerStatus(t *testing.T, accepted string, refusedStatus int) *authRecorder {
+	t.Helper()
+	rec := &authRecorder{}
+	rec.server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		rec.mu.Lock()
+		rec.auths = append(rec.auths, r.Header.Get("Authorization"))
+		rec.mu.Unlock()
+		if r.Header.Get("Authorization") != "Bearer "+accepted {
+			w.WriteHeader(refusedStatus)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprint(w, `{"id":"req-1"}`)
+	}))
+	t.Cleanup(rec.server.Close)
+	return rec
+}
+
+func swapBroker(t *testing.T, accepted string) *authRecorder {
+	t.Helper()
+	return swapBrokerStatus(t, accepted, http.StatusUnauthorized)
+}
+
+// noLeakedCredential fails the test when any text in the error chain carries
+// a token byte string or one of the forbidden values: a rotation diagnostic
+// describes the window, never the bytes or the paths behind them.
+func noLeakedCredential(t *testing.T, err error, forbidden ...string) {
+	t.Helper()
+	if err == nil {
+		return
+	}
+	if text := err.Error(); strings.Contains(text, "token-") {
+		t.Fatalf("error text carries credential bytes: %v", err)
+	}
+	for _, secret := range forbidden {
+		if strings.Contains(err.Error(), secret) {
+			t.Fatalf("error text carries forbidden detail: %v", err)
+		}
+	}
+}
+
+// TestBroker401DuringTokenSwapRetriesWithFreshToken is the #406 regression:
+// a broker call landing between the apiserver refusing the on-disk token and
+// kubelet swapping the projection earned a 401 that classified as a definite
+// denial, blocking a healthy run behind a human. When the refused request's
+// own credential has already been replaced on disk, the refusal is the swap
+// window: retryable, and the next attempt carries the fresh bytes.
+func TestBroker401DuringTokenSwapRetriesWithFreshToken(t *testing.T) {
+	rec := swapBroker(t, "token-two")
+	reads := 0
+	source := funcTokenSource(func() ([]byte, error) {
+		reads++
+		if reads == 1 {
+			return []byte("token-one"), nil
+		}
+		return []byte("token-two"), nil
+	})
+	client := &BrokerClient{BaseURL: rec.server.URL, TokenSource: source, HTTP: rec.server.Client()}
+	ctx := context.Background()
+	request, err := retried(ctx, func(ctx context.Context) (*courier.ControlRequest, error) {
+		return client.ControlRequest(ctx)
+	})
+	noLeakedCredential(t, err)
+	if err != nil || request == nil {
+		t.Fatalf("control read across the swap window = (%v, %v), want success once the fresh token is mounted", request, err)
+	}
+	want := []string{"Bearer token-one", "Bearer token-two"}
+	if got := rec.seen(); len(got) != len(want) || got[0] != want[0] || got[1] != want[1] {
+		t.Fatalf("recorded authorizations = %q, want %q", got, want)
+	}
+}
+
+// TestBroker401WithoutRotationStaysADenial pins the other half of #406: the
+// same 401 is what a misconfigured or cross-run caller earns, so it must stay
+// a definite denial — a blocked publication, never an infrastructure blip —
+// whenever the projected credential is unchanged since the refused request
+// read it.
+func TestBroker401WithoutRotationStaysADenial(t *testing.T) {
+	rec := swapBroker(t, "never-accepted")
+	root := t.TempDir()
+	client := &BrokerClient{BaseURL: rec.server.URL, TokenSource: NewStaticBrokerTokenSource([]byte("token-one")), HTTP: rec.server.Client()}
+	_, err := client.ControlRequest(context.Background())
+	var callErr *BrokerCallError
+	if !errors.As(err, &callErr) || callErr.StatusCode != http.StatusUnauthorized || callErr.Retryable {
+		t.Fatalf("control read error = %v, want a non-retryable 401 BrokerCallError", err)
+	}
+	engine, buildErr := NewPublicationEngine(client, NewIntegrator(filepath.Join(root, "integration"), nil))
+	if buildErr != nil {
+		t.Fatal(buildErr)
+	}
+	classified := engine.classify(err, "the publication")
+	noLeakedCredential(t, classified, root, "token-one")
+	var blocked *PublicationBlockedError
+	var transient *TransientPublicationError
+	if !errors.As(classified, &blocked) || errors.As(classified, &transient) {
+		t.Fatalf("classified = %v, want a blocked publication", classified)
+	}
+}
+
+// TestBroker401SpinAcrossRoundsStaysTransient pins the bounded-spin property:
+// a credential the broker refuses while the projection keeps producing new
+// bytes exhausts the bounded retry rounds and surfaces as an infrastructure
+// failure that relaunching reconciles — never a blocked publication, and
+// never an unbounded loop.
+func TestBroker401SpinAcrossRoundsStaysTransient(t *testing.T) {
+	rec := swapBroker(t, "never-accepted")
+	reads := 0
+	source := funcTokenSource(func() ([]byte, error) {
+		reads++
+		return []byte(fmt.Sprintf("token-%d", reads)), nil
+	})
+	client := &BrokerClient{BaseURL: rec.server.URL, TokenSource: source, HTTP: rec.server.Client()}
+	err := retriedCall(context.Background(), func(ctx context.Context) error {
+		return client.PostStatus(ctx, StatusPatch{})
+	})
+	noLeakedCredential(t, err)
+	if !isBrokerRetryable(err) {
+		t.Fatalf("post-swap-window error = %v, want a retryable classification", err)
+	}
+	// One send and one 401 re-read per attempt, bounded by the retry rounds.
+	if reads != 2*(publishRetryRounds+1) {
+		t.Fatalf("token reads = %d, want %d: the window must retry bounded, not spin", reads, 2*(publishRetryRounds+1))
+	}
+	engine, buildErr := NewPublicationEngine(client, NewIntegrator(filepath.Join(t.TempDir(), "integration"), nil))
+	if buildErr != nil {
+		t.Fatal(buildErr)
+	}
+	classified := engine.classify(err, "the publication")
+	noLeakedCredential(t, classified)
+	var transient *TransientPublicationError
+	var blocked *PublicationBlockedError
+	if !errors.As(classified, &transient) || errors.As(classified, &blocked) {
+		t.Fatalf("classified = %v, want a transient publication failure", classified)
+	}
+}
+
+// TestTrustedStatusSurvivesTokenSwapWindow proves the trusted-status path
+// inherits the per-request distinction: a status write landing in the swap
+// window retries with the fresh bytes instead of persisting a failure that
+// only a human could clear.
+func TestTrustedStatusSurvivesTokenSwapWindow(t *testing.T) {
+	rec := swapBroker(t, "token-two")
+	reads := 0
+	source := funcTokenSource(func() ([]byte, error) {
+		reads++
+		if reads == 1 {
+			return []byte("token-one"), nil
+		}
+		return []byte("token-two"), nil
+	})
+	reporter := NewStatusReporter(&BrokerClient{BaseURL: rec.server.URL, TokenSource: source, HTTP: rec.server.Client()}, "control-uid", "worker-uid", 0)
+	if err := reporter.BeginOperation(context.Background(), "op-1", "brief-1"); err != nil {
+		noLeakedCredential(t, err)
+		t.Fatalf("status write across the swap window = %v, want success once the fresh token is mounted", err)
+	}
+	want := []string{"Bearer token-one", "Bearer token-two"}
+	if got := rec.seen(); len(got) != len(want) || got[0] != want[0] || got[1] != want[1] {
+		t.Fatalf("recorded authorizations = %q, want %q", got, want)
+	}
+}
+
+// TestBroker401WithFailingRereadStaysADenial pins the loudness guard: when
+// the re-read that would prove rotation fails — the projection is unreadable
+// exactly when its bytes are being questioned — there is no evidence the
+// request was rotated under, and the 401 stays a definite denial.
+func TestBroker401WithFailingRereadStaysADenial(t *testing.T) {
+	rec := swapBroker(t, "never-accepted")
+	root := t.TempDir()
+	reads := 0
+	source := funcTokenSource(func() ([]byte, error) {
+		reads++
+		if reads == 1 {
+			return []byte("token-one"), nil
+		}
+		return nil, errors.New("harness: broker token file is unreadable")
+	})
+	client := &BrokerClient{BaseURL: rec.server.URL, TokenSource: source, HTTP: rec.server.Client()}
+	_, err := client.ControlRequest(context.Background())
+	noLeakedCredential(t, err)
+	var callErr *BrokerCallError
+	if !errors.As(err, &callErr) || callErr.StatusCode != http.StatusUnauthorized || callErr.Retryable {
+		t.Fatalf("control read error = %v, want a non-retryable 401 BrokerCallError", err)
+	}
+	if reads != 2 {
+		t.Fatalf("token reads = %d, want 2 (the request and its one re-read)", reads)
+	}
+	engine, buildErr := NewPublicationEngine(client, NewIntegrator(filepath.Join(root, "integration"), nil))
+	if buildErr != nil {
+		t.Fatal(buildErr)
+	}
+	classified := engine.classify(err, "the publication")
+	noLeakedCredential(t, classified, root)
+	var blocked *PublicationBlockedError
+	var transient *TransientPublicationError
+	if !errors.As(classified, &blocked) || errors.As(classified, &transient) {
+		t.Fatalf("classified = %v, want a blocked publication", classified)
+	}
+}
+
+// TestBroker403IsADenialEvenWithFreshBytes pins the 401-only guard: the
+// rotation-window reclassification is scoped to the status a rotated-out
+// credential earns. A 403 is an authorization refusal of whatever bytes the
+// request carried, so it is never retried — and the projection is not even
+// re-read, because its answer could not change the verdict.
+func TestBroker403IsADenialEvenWithFreshBytes(t *testing.T) {
+	rec := swapBrokerStatus(t, "never-accepted", http.StatusForbidden)
+	reads := 0
+	source := funcTokenSource(func() ([]byte, error) {
+		reads++
+		return []byte(fmt.Sprintf("token-%d", reads)), nil
+	})
+	client := &BrokerClient{BaseURL: rec.server.URL, TokenSource: source, HTTP: rec.server.Client()}
+	_, err := client.ControlRequest(context.Background())
+	noLeakedCredential(t, err)
+	var callErr *BrokerCallError
+	if !errors.As(err, &callErr) || callErr.StatusCode != http.StatusForbidden || callErr.Retryable {
+		t.Fatalf("control read error = %v, want a non-retryable 403 BrokerCallError", err)
+	}
+	if reads != 1 {
+		t.Fatalf("token reads = %d, want 1: a 403 must not consult the projection", reads)
+	}
+}
+
+// TestProbe401DuringTokenSwapIsRetryable proves the launch gate follows the
+// same per-request rule: a capabilities read refused with 401 retries when
+// the projection has already replaced the refused bytes, so a swap window at
+// launch reports unavailable capabilities rather than NeedsHuman — while a
+// same-bytes 401 stays non-retryable and fails the gate loudly.
+func TestProbe401DuringTokenSwapIsRetryable(t *testing.T) {
+	cases := []struct {
+		name      string
+		accepted  string
+		refused   int
+		rotate    bool
+		reads     int
+		retryable bool
+	}{
+		{name: "rotation window", accepted: "token-two", refused: http.StatusUnauthorized, rotate: true, reads: 2, retryable: true},
+		{name: "unchanged credential", accepted: "never-accepted", refused: http.StatusUnauthorized, rotate: false, reads: 2, retryable: false},
+		{name: "authorization refusal", accepted: "never-accepted", refused: http.StatusForbidden, rotate: true, reads: 1, retryable: false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			rec := swapBrokerStatus(t, tc.accepted, tc.refused)
+			reads := 0
+			source := funcTokenSource(func() ([]byte, error) {
+				reads++
+				if tc.rotate && reads > 1 {
+					return []byte("token-two"), nil
+				}
+				return []byte("token-one"), nil
+			})
+			probe := &BrokerProbeClient{BaseURL: rec.server.URL, TokenSource: source, HTTP: rec.server.Client()}
+			_, err := probe.Capabilities(context.Background())
+			noLeakedCredential(t, err)
+			var probeErr *BrokerProbeError
+			if !errors.As(err, &probeErr) || probeErr.Msg == "" {
+				t.Fatalf("capability read error = %v, want a fixed probe diagnostic", err)
+			}
+			if probeErr.Retryable != tc.retryable {
+				t.Fatalf("capability read retryable = %v, want %v", probeErr.Retryable, tc.retryable)
+			}
+			if reads != tc.reads {
+				t.Fatalf("token reads = %d, want %d", reads, tc.reads)
+			}
+		})
+	}
+}
+
 // --- broker transport reuse (#384) -----------------------------------------
 
 // countingTLSServer is an httptest TLS server that counts the connections it

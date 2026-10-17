@@ -4008,9 +4008,32 @@ was superseded.
   projection that cannot be read fails the request closed with a fixed,
   retryable category rather than falling back to the last good bytes: during a
   swap the honest answer is that the credential is unknown, and a stale token
-  earns a 401 that is classified as a definite denial. Startup still validates
+earns a 401 that is classified as a definite denial (superseded by #406: a
+  stale token's 401 is now classified by the request's own freshness, above).
+  Startup still validates
   the projection once, so a control pod that can never authenticate never
   launches. (#383)
+- **2026-10-17 — #406: a broker 401 is a denial unless the projected credential
+  has already been replaced.** With #383's per-request token read, the one
+  remaining 401 a healthy run can earn is the kubelet swap window: the request
+  read the projection before kubelet swapped it, so it carried bytes the
+  apiserver was already refusing, and classifying every 401 as a definite
+  denial converted that window into `PublicationBlockedError` and a human even
+  though a fresh token was on disk by the time the refusal came back. Making
+  401 retryable outright was rejected: the same status is what a misconfigured
+  or cross-run caller earns, and a blanket retry turns a loud block into a
+  silent spin. The distinction therefore comes from the request's own
+  freshness: when a work-path or capabilities read is refused with 401, control
+  re-reads the projected token, and only bytes that differ from the ones the
+  refused request carried mark the rotation window — that refusal is
+  retryable, and the next attempt carries the fresh bytes. Same bytes, or a
+  re-read that fails, keep the denial loud. A misconfigured caller is loud on
+  the first attempt whenever the projection is stable, and in any case
+  converges inside the same bounded retry rounds, so nothing spins silently.
+  The residual ordering — kubelet lagging so far past a token's expiry that
+  the projection still holds the refused bytes at the re-read — also stays
+  loud: no positive freshness evidence exists for it, and the run blocks for a
+  human rather than guessing on a clock the process cannot observe. (#406)
 - **2026-10-17 — #372: native worker cancellation proves the task tree
   is gone, and never claims otherwise.**
   `internal/protocol` ran each task through `exec.CommandContext`, which kills
