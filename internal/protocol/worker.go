@@ -166,6 +166,7 @@ func (w *Worker) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /v1/tasks", w.handleDispatch)
 	mux.HandleFunc("POST /v1/tasks/cancel", w.handleCancel)
+	mux.HandleFunc("POST /v1/tasks/{opID}/release", w.handleRelease)
 	mux.HandleFunc("GET /v1/tasks/{opID}/result", w.handleResult)
 	mux.HandleFunc("POST /v1/snapshot", w.handleSnapshot)
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) {
@@ -545,6 +546,58 @@ func (w *Worker) readArtifact(declared string) ([]byte, error) {
 		return nil, errors.New("artifact read failed")
 	}
 	return data, nil
+}
+
+// handleRelease consumes one terminal result's payload on control's
+// instruction. The operation entry is never removed: the compact stub keeps
+// redelivery of the opID rejected by handleDispatch and keeps handleCancel
+// working, so replay protection outlives the payload it protects. Release is
+// idempotent — a repeat release rewrites the same stub.
+func (w *Worker) handleRelease(wr http.ResponseWriter, r *http.Request) {
+	opID := r.PathValue("opID")
+	if opID == "" || len(opID) > 128 || strings.ContainsAny(opID, "/\\") {
+		http.Error(wr, "invalid request", http.StatusBadRequest)
+		return
+	}
+	envelope, _, ok := w.verifySigned(wr, r, KindRelease, 0)
+	if !ok {
+		return
+	}
+	accepted, exhausted := w.consumeNonce(envelope)
+	if exhausted {
+		http.Error(wr, "replay state exhausted; worker must be replaced", http.StatusServiceUnavailable)
+		return
+	}
+	if !accepted {
+		http.Error(wr, "nonce replay rejected", http.StatusUnauthorized)
+		return
+	}
+
+	w.mu.Lock()
+	op, known := w.ops[opID]
+	_, tombstoned := w.tombstones[opID]
+	var terminal *Result
+	if known && op != nil && op.result != nil && op.result.LiveDescendants == 0 {
+		terminal = op.result
+		op.result = &Result{Status: op.result.Status}
+	}
+	unverified := known && op != nil && op.result != nil && terminal == nil
+	w.mu.Unlock()
+
+	switch {
+	case known && op != nil && terminal == nil && !unverified:
+		http.Error(wr, "operation has not terminated; nothing to release", http.StatusConflict)
+	case unverified:
+		// An unproven termination is never released: its LiveDescendants
+		// report is the only record that the task tree may still be live
+		// (#372), and dropping it would let a later cancellation read a
+		// verified stop that never happened.
+		http.Error(wr, "termination is unverified; result is retained", http.StatusConflict)
+	case known || tombstoned:
+		w.respondStatus(wr, opID, http.StatusOK)
+	default:
+		http.Error(wr, "unknown operation", http.StatusNotFound)
+	}
 }
 
 func (w *Worker) handleCancel(wr http.ResponseWriter, r *http.Request) {

@@ -966,7 +966,7 @@ typed brief carrying a stable `briefID` (unique within the run), objective,
 settled decisions with exact values, owned files, non-goals, and an observable
 success check. Each dispatch or cancellation is a signed canonical envelope
 containing the `CoderRun` UID, control-pod UID, worker-pod UID, `briefID`,
-`opID`, kind (`dispatch` or `cancel`), payload digest, sequence, nonce, and
+`opID`, kind (`dispatch`, `cancel`, or `release`), payload digest, sequence, nonce, and
 admission expiration. Expiration limits admission/replay only; it is not an
 operation-duration limit. The worker verifies the Ed25519 signature using the public key provisioned
 by the operator, checks the payload digest and exact run,
@@ -992,7 +992,10 @@ that `opID` treats a late cancel as unknown data and runs nothing; the
 authoritative termination of a fenced stale worker is the operator's pod kill,
 and op cleanup follows observed pod termination, not a worker acknowledgement.
 A worker result is keyed by `briefID` and contains a
-summary and artifact bundle, all treated as untrusted.
+summary and artifact bundle, all treated as untrusted. Control releases a
+consumed result payload with a signed release envelope bound to the same
+`opID`; the worker retains only the compact terminal status and continues to
+reject redelivery of that `opID`.
 
 If dispatch transport fails ambiguously, control does not automatically
 redeliver: it cancels and reconciles until process termination is proven. If

@@ -111,6 +111,7 @@ func TestEnvelopeValidation(t *testing.T) {
 	cases := map[string]func(*Envelope){
 		"dispatch sequence nonzero": func(e *Envelope) { e.Sequence = 1 },
 		"cancel sequence zero":      func(e *Envelope) { e.Kind = KindCancel; e.BriefID = ""; e.Sequence = 0 },
+		"release sequence zero":     func(e *Envelope) { e.Kind = KindRelease; e.Sequence = 0 },
 		"missing run uid":           func(e *Envelope) { e.RunUID = "" },
 		"missing control uid":       func(e *Envelope) { e.ControlPodUID = "" },
 		"missing worker uid":        func(e *Envelope) { e.WorkerPodUID = "" },
@@ -731,5 +732,271 @@ func TestWorkerShutdownTerminatesRunningTasks(t *testing.T) {
 	case <-op.wait:
 	default:
 		t.Fatal("shutdown returned before verified process termination")
+	}
+}
+
+// retainedArtifactBytes sums the artifact bytes the worker still retains
+// across every operation it knows.
+func retainedArtifactBytes(w *Worker) int {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	total := 0
+	for _, op := range w.ops {
+		if op != nil && op.result != nil {
+			total += len(op.result.Artifact)
+		}
+	}
+	return total
+}
+
+func releaseEnvelope(base Envelope, nonce string) Envelope {
+	env := base
+	env.Kind = KindRelease
+	env.Sequence = 1
+	env.PayloadDigest = CancelPayloadDigest
+	env.Nonce = nonce
+	return env
+}
+
+func TestWorkerReleaseConsumesResultPayload(t *testing.T) {
+	worker, priv, server := newTestWorker(t)
+	client := &Client{BaseURL: server.URL}
+	ctx := context.Background()
+
+	payload, _ := json.Marshal(Task{
+		Command:      []string{"sh", "-c", "head -c 1048576 /dev/zero > artifact.bin"},
+		ArtifactPath: "artifact.bin",
+	})
+	env := dispatchEnvelope(worker.clock())
+	env.PayloadDigest = PayloadDigestOf(payload)
+	if _, err := client.Dispatch(ctx, priv, env, payload); err != nil {
+		t.Fatalf("Dispatch: %v", err)
+	}
+	deadline := time.Now().Add(10 * time.Second)
+	var first ResultState
+	for {
+		state, err := client.Result(ctx, "op-1")
+		if err != nil {
+			t.Fatalf("Result: %v", err)
+		}
+		if state.Status == ResultCompleted {
+			first = state
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("task never completed")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if len(first.Result.Artifact) != 1<<20 {
+		t.Fatalf("first read artifact = %d bytes", len(first.Result.Artifact))
+	}
+	// Repeated reads before acknowledgement are reliable: the payload is
+	// only consumed by release, never by reading.
+	second, err := client.Result(ctx, "op-1")
+	if err != nil || len(second.Result.Artifact) != 1<<20 {
+		t.Fatalf("second read = %+v, %v", second.Result, err)
+	}
+	if retained := retainedArtifactBytes(worker); retained != 1<<20 {
+		t.Fatalf("retained artifact bytes = %d, want %d", retained, 1<<20)
+	}
+
+	status, err := client.Release(ctx, priv, releaseEnvelope(env, "release-nonce-value-01"))
+	if err != nil || status != ResultCompleted {
+		t.Fatalf("Release = %q, %v", status, err)
+	}
+	state, err := client.Result(ctx, "op-1")
+	if err != nil || state.Status != ResultCompleted {
+		t.Fatalf("released result poll = %+v, %v", state, err)
+	}
+	if state.Result == nil || state.Result.Artifact != nil ||
+		state.Result.StdoutTail != "" || state.Result.StderrTail != "" ||
+		state.Result.Status != ResultCompleted {
+		t.Fatalf("released result must be a compact stub: %+v", state.Result)
+	}
+	if retained := retainedArtifactBytes(worker); retained != 0 {
+		t.Fatalf("retained artifact bytes after release = %d", retained)
+	}
+
+	env2 := env
+	env2.Nonce = "redelivery-nonce-value-1"
+	if _, err := client.Dispatch(ctx, priv, env2, payload); err == nil {
+		t.Fatal("redelivery of a released opID must still be rejected")
+	}
+
+	if _, err := client.Release(ctx, priv, releaseEnvelope(env, "release-nonce-value-02")); err != nil {
+		t.Fatalf("repeat release must be idempotent: %v", err)
+	}
+	cancelEnv := env
+	cancelEnv.Kind = KindCancel
+	cancelEnv.Sequence = 1
+	cancelEnv.PayloadDigest = CancelPayloadDigest
+	cancelEnv.Nonce = "cancel-nonce-value-0001"
+	if _, err := client.Cancel(ctx, priv, cancelEnv); err != nil {
+		t.Fatalf("cancel of a released op must still be acknowledged: %v", err)
+	}
+
+	unknownEnv := releaseEnvelope(env, "release-nonce-value-03")
+	unknownEnv.OpID = "never-dispatched-op"
+	if _, err := client.Release(ctx, priv, unknownEnv); err == nil {
+		t.Fatal("release of an unknown opID must be rejected")
+	} else {
+		var transportErr *TransportError
+		if !errors.As(err, &transportErr) || transportErr.StatusCode != http.StatusNotFound {
+			t.Fatalf("release of an unknown opID = %v, want 404", err)
+		}
+	}
+
+	t.Run("release while running conflicts", func(t *testing.T) {
+		runningPayload, _ := json.Marshal(Task{Command: []string{"sh", "-c", "sleep 30"}})
+		runningEnv := dispatchEnvelope(worker.clock())
+		runningEnv.OpID = "op-running"
+		runningEnv.PayloadDigest = PayloadDigestOf(runningPayload)
+		runningEnv.Nonce = "running-dispatch-nonce-1"
+		if _, err := client.Dispatch(ctx, priv, runningEnv, runningPayload); err != nil {
+			t.Fatalf("Dispatch: %v", err)
+		}
+		_, err := client.Release(ctx, priv, releaseEnvelope(runningEnv, "running-release-nonce-1"))
+		var transportErr *TransportError
+		if !errors.As(err, &transportErr) || transportErr.StatusCode != http.StatusConflict {
+			t.Fatalf("release while running = %v, want 409", err)
+		}
+		cancelEnv := runningEnv
+		cancelEnv.Kind = KindCancel
+		cancelEnv.Sequence = 1
+		cancelEnv.PayloadDigest = CancelPayloadDigest
+		cancelEnv.Nonce = "running-cancel-nonce-1"
+		if status, err := client.Cancel(ctx, priv, cancelEnv); err != nil || status != ResultCancelled {
+			t.Fatalf("Cancel after refused release = %q, %v", status, err)
+		}
+	})
+
+	t.Run("release of a cancelled result", func(t *testing.T) {
+		cancelledPayload, _ := json.Marshal(Task{Command: []string{"sh", "-c", "sleep 30"}})
+		cancelledEnv := dispatchEnvelope(worker.clock())
+		cancelledEnv.OpID = "op-cancelled"
+		cancelledEnv.PayloadDigest = PayloadDigestOf(cancelledPayload)
+		cancelledEnv.Nonce = "cancelled-dispatch-nonce-1"
+		if _, err := client.Dispatch(ctx, priv, cancelledEnv, cancelledPayload); err != nil {
+			t.Fatalf("Dispatch: %v", err)
+		}
+		cancelEnv := cancelledEnv
+		cancelEnv.Kind = KindCancel
+		cancelEnv.Sequence = 1
+		cancelEnv.PayloadDigest = CancelPayloadDigest
+		cancelEnv.Nonce = "cancelled-cancel-nonce-1"
+		if _, err := client.Cancel(ctx, priv, cancelEnv); err != nil {
+			t.Fatalf("Cancel: %v", err)
+		}
+		state, err := client.Result(ctx, "op-cancelled")
+		if err != nil || state.Status != ResultCancelled || state.Result == nil {
+			t.Fatalf("cancelled result poll = %+v, %v", state, err)
+		}
+		if _, err := client.Release(ctx, priv, releaseEnvelope(cancelledEnv, "cancelled-release-nonce-1")); err != nil {
+			t.Fatalf("Release of a cancelled result: %v", err)
+		}
+		state, err = client.Result(ctx, "op-cancelled")
+		if err != nil || state.Status != ResultCancelled || state.Result == nil ||
+			state.Result.Artifact != nil || state.Result.ExitCode != 0 {
+			t.Fatalf("released cancelled result must be a compact stub: %+v, %v", state.Result, err)
+		}
+	})
+
+	t.Run("release refuses an unverified termination", func(t *testing.T) {
+		if runtime.GOOS != "linux" {
+			t.Skip("unverified-termination assertions read process groups and /proc")
+		}
+		if _, err := exec.LookPath("setsid"); err != nil {
+			t.Skip("setsid is required to leave the task's process group")
+		}
+		unverifiedPayload, _ := json.Marshal(Task{Command: []string{"sh", "-c", `setsid sh -c 'echo $$ > released-escaped.txt; exec sleep 300' & wait`}})
+		unverifiedEnv := dispatchEnvelope(worker.clock())
+		unverifiedEnv.OpID = "op-unverified"
+		unverifiedEnv.PayloadDigest = PayloadDigestOf(unverifiedPayload)
+		unverifiedEnv.Nonce = "unverified-dispatch-nonce-1"
+		if _, err := client.Dispatch(ctx, priv, unverifiedEnv, unverifiedPayload); err != nil {
+			t.Fatalf("Dispatch: %v", err)
+		}
+		waitForDescendantPID(t, filepath.Join(worker.config.WorkspaceDir, "released-escaped.txt"))
+		cancelEnv := unverifiedEnv
+		cancelEnv.Kind = KindCancel
+		cancelEnv.Sequence = 1
+		cancelEnv.PayloadDigest = CancelPayloadDigest
+		cancelEnv.Nonce = "unverified-cancel-nonce-1"
+		if _, err := client.Cancel(ctx, priv, cancelEnv); err == nil {
+			t.Fatal("cancellation with a live escapee must be refused")
+		}
+		state, err := client.Result(ctx, "op-unverified")
+		if err != nil || state.Result == nil || state.Result.LiveDescendants == 0 {
+			t.Fatalf("unverified result must report the live tree: %+v, %v", state.Result, err)
+		}
+		_, err = client.Release(ctx, priv, releaseEnvelope(unverifiedEnv, "unverified-release-nonce-1"))
+		var transportErr *TransportError
+		if !errors.As(err, &transportErr) || transportErr.StatusCode != http.StatusConflict {
+			t.Fatalf("release of an unverified termination = %v, want 409", err)
+		}
+		state, err = client.Result(ctx, "op-unverified")
+		if err != nil || state.Result == nil || state.Result.LiveDescendants == 0 {
+			t.Fatalf("release must retain the live-tree report: %+v, %v", state.Result, err)
+		}
+	})
+}
+
+func TestWorkerReleasedStorageStaysBoundedAcrossTasks(t *testing.T) {
+	worker, priv, server := newTestWorker(t)
+	client := &Client{BaseURL: server.URL}
+	ctx := context.Background()
+
+	opIDs := make([]string, 0, 6)
+	for i := 0; i < 6; i++ {
+		name := "artifact-" + strconv.Itoa(i) + ".bin"
+		payload, _ := json.Marshal(Task{
+			Command:      []string{"sh", "-c", "head -c 1048576 /dev/zero > " + name},
+			ArtifactPath: name,
+		})
+		env := dispatchEnvelope(worker.clock())
+		env.OpID = "op-round-" + strconv.Itoa(i)
+		env.PayloadDigest = PayloadDigestOf(payload)
+		env.Nonce = "round-dispatch-nonce-" + strconv.Itoa(i)
+		opIDs = append(opIDs, env.OpID)
+		if _, err := client.Dispatch(ctx, priv, env, payload); err != nil {
+			t.Fatalf("Dispatch round %d: %v", i, err)
+		}
+		deadline := time.Now().Add(10 * time.Second)
+		for {
+			state, err := client.Result(ctx, env.OpID)
+			if err != nil {
+				t.Fatalf("Result round %d: %v", i, err)
+			}
+			if state.Status == ResultCompleted {
+				if len(state.Result.Artifact) != 1<<20 {
+					t.Fatalf("round %d artifact = %d bytes", i, len(state.Result.Artifact))
+				}
+				break
+			}
+			if time.Now().After(deadline) {
+				t.Fatalf("round %d task never completed", i)
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+		if retained := retainedArtifactBytes(worker); retained != 1<<20 {
+			t.Fatalf("round %d retained artifact bytes = %d, want %d", i, retained, 1<<20)
+		}
+		if _, err := client.Release(ctx, priv, releaseEnvelope(env, "round-release-nonce-"+strconv.Itoa(i))); err != nil {
+			t.Fatalf("Release round %d: %v", i, err)
+		}
+		if retained := retainedArtifactBytes(worker); retained != 0 {
+			t.Fatalf("round %d left %d cumulative retained artifact bytes; retention must stay bounded", i, retained)
+		}
+	}
+
+	for _, opID := range opIDs {
+		env := dispatchEnvelope(worker.clock())
+		env.OpID = opID
+		env.Nonce = "post-release-nonce-" + opID
+		env.PayloadDigest = PayloadDigestOf([]byte(`{"command":["true"]}`))
+		if _, err := client.Dispatch(ctx, priv, env, []byte(`{"command":["true"]}`)); err == nil {
+			t.Fatalf("redispatch of released %s must be rejected", opID)
+		}
 	}
 }

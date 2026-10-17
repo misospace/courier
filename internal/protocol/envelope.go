@@ -1,8 +1,8 @@
 // Package protocol implements the signed control-to-worker task protocol
-// (HARNESS.md §5): typed dispatch and cancellation envelopes signed by the
-// trusted control pod's per-incarnation Ed25519 key, verified by an honest
-// worker listener that keeps in-memory replay state and cancellation
-// tombstones.
+// (HARNESS.md §5): typed dispatch, cancellation, and release envelopes
+// signed by the trusted control pod's per-incarnation Ed25519 key, verified
+// by an honest worker listener that keeps in-memory replay state and
+// cancellation tombstones.
 //
 // The worker listener is not a security boundary — a compromised worker may
 // bypass its own verifier and fabricate results — but it protects the honest
@@ -26,9 +26,11 @@ import (
 const (
 	KindDispatch = "dispatch"
 	KindCancel   = "cancel"
+	KindRelease  = "release"
 )
 
-// Envelope is the signed, canonical dispatch or cancellation record. Every
+// Envelope is the signed, canonical dispatch, cancellation, or release
+// record. Every
 // field is bound to the signature; a worker verifies the exact run,
 // control-pod, and worker-pod incarnation, the payload digest, the replay
 // state, and the admission expiration. The expiration bounds admission and
@@ -82,8 +84,9 @@ func (e Envelope) Verify(key ed25519.PublicKey, signature []byte) error {
 }
 
 // Validate checks the envelope's structural invariants before any signature
-// work: kind, sequence rules (dispatch is sequence 0, cancellation strictly
-// greater), identity binding, digest shape, and required identifiers.
+// work: kind, sequence rules (dispatch is sequence 0, cancellation and
+// release strictly greater), identity binding, digest shape, and required
+// identifiers.
 func (e Envelope) Validate(now time.Time) error {
 	switch e.Kind {
 	case KindDispatch:
@@ -96,6 +99,10 @@ func (e Envelope) Validate(now time.Time) error {
 	case KindCancel:
 		if e.Sequence == 0 {
 			return errors.New("protocol: cancellation sequence must be strictly greater than zero")
+		}
+	case KindRelease:
+		if e.Sequence == 0 {
+			return errors.New("protocol: release sequence must be strictly greater than zero")
 		}
 	default:
 		return fmt.Errorf("protocol: unknown envelope kind %q", e.Kind)
