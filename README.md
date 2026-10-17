@@ -79,7 +79,7 @@ together).
 After setup, verification is explicit:
 
 ```sh
-mise run check   # non-mutating: tidy diff, gofmt, vet, build, image-gating scripts
+mise run check # CI static job: generated-code diff, tidy diff, gofmt, vet, build, image-gating scripts
 mise run test    # authoritative: make test (codegen, fmt, vet, go test -race) with envtest assets
 ```
 

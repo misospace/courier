@@ -2058,8 +2058,13 @@ named items remain unresolved and must not be described as production-ready:
   operator-approved checkouts, and any change to this config is reviewed as
   executable install code in its PR. Bootstrap
   mutates no global config, installs no git hooks, generates no code, and
-  runs no tests — `check` (non-mutating CI equivalents) and `test` (the
-  authoritative `make test` with envtest assets) are explicit. The mise
+  runs no tests — `check` (the CI static-job equivalents — it regenerates
+  code first, exactly like CI, so generated-code drift fails a diff check
+  instead of passing — plus tidy diff, gofmt, vet, build, and image-gating)
+  and `test` (the authoritative `make test` with envtest assets) are
+  explicit, and repo-local tools are stamped against the Makefile pins at
+  install time so a stale `bin/` binary is reinstalled rather than
+  silently kept. The mise
   dependency itself is pinned and reviewed in `hack/bootstrap.sh` (version,
   per-platform SHA-256) plus `min_version`, per #414's vetting requirement.
   `make` stays a host prerequisite that bootstrap fails on clearly rather

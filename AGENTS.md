@@ -51,10 +51,10 @@ change in the chart's values.
   (#416): pinned mise/Go/Helm, controller-gen, setup-envtest, and envtest
   assets. Tool versions live in `.mise/config.toml` + `.mise/mise.lock`; do
   not restate them elsewhere.
-- `mise run check` — non-mutating CI-equivalent verification (tidy diff,
-  gofmt, vet, build, image-gating scripts). `mise run test` — the
-  authoritative suite (`make test` with envtest assets). Reuse the bootstrap
-  environment in later commands with `mise exec -- <command>`.
+- `mise run check` — CI-equivalent verification (generated-code diff,
+gofmt, vet, build, image-gating scripts). `mise run test` —
+authoritative suite (`make test` with envtest assets). Reuse bootstrap
+environment in later commands with `mise exec -- <command>`.
 - `make build` — generate + fmt + vet + build the manager.
 - `make test` — generate + fmt + vet + `go test ./...`.
 - `make manifests generate` — regenerate CRDs, RBAC, and deepcopy after any

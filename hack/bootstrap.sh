@@ -46,9 +46,24 @@ run_tools_steps() {
 	"${BOOTSTRAP_MISE:-mise}" install --locked ||
 		fail "mise install --locked failed; after changing tool versions run 'mise lock' and commit .mise/mise.lock"
 
-	# Repo-local build dependencies (idempotent: the Makefile targets skip
-	# existing binaries).
+	# Repo-local build dependencies. The Makefile targets skip any existing
+	# executable, so a stale binary would silently outlive a pin bump:
+	# stamp the pins at install time and drop binaries that no longer
+	# match before installing (idempotent; setup-envtest cannot report its
+	# own version, so the stamp is the only reliable check for either tool).
+	cg_pin=$(sed -n 's/^CONTROLLER_TOOLS_VERSION ?= //p' Makefile)
+	se_pin=$(sed -n 's/^ENVTEST_VERSION ?= //p' Makefile)
+	[ -n "$cg_pin" ] && [ -n "$se_pin" ] ||
+		fail "could not read CONTROLLER_TOOLS_VERSION or ENVTEST_VERSION from Makefile"
+	pins="controller-gen $cg_pin
+setup-envtest $se_pin"
+	if { [ -x bin/controller-gen ] || [ -x bin/setup-envtest ]; } &&
+		{ [ ! -f bin/.tool-pins ] || [ "$(cat bin/.tool-pins)" != "$pins" ]; }; then
+		log "repo-local tools do not match the Makefile pins; reinstalling"
+		rm -f bin/controller-gen bin/setup-envtest
+	fi
 	make controller-gen setup-envtest
+	printf '%s\n' "$pins" > bin/.tool-pins
 
 	# envtest assets only — the suite itself stays behind an explicit task.
 	k8s=$(sed -n 's/^ENVTEST_K8S_VERSION ?= //p' Makefile)

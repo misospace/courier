@@ -7,7 +7,7 @@
 #
 # Entry points:
 #   hack/bootstrap.sh   idempotent setup (also `mise run bootstrap`)
-#   mise run check      non-mutating CI-equivalent checks
+#   mise run check      CI-equivalent checks (generated-code drift included)
 #   mise run test       authoritative suite with envtest assets
 
 min_version = "2026.10.13"
@@ -21,8 +21,13 @@ description = "Install the pinned toolchain, controller-gen, setup-envtest, and 
 run = "hack/bootstrap.sh tools"
 
 [tasks.check]
-description = "Non-mutating CI-equivalent checks: tidy diff, gofmt, vet, build, image-gating scripts"
+description = "CI-equivalent checks mirroring the CI static job: generated-code drift, tidy diff, gofmt, vet, build, image-gating scripts"
 run = [
+  # Regenerates first, like CI's static job, so a stale tree fails the
+  # diff check instead of passing with outdated artifacts. Mutates the
+  # working tree only when generated code is actually stale.
+  "make manifests generate",
+  """git diff --exit-code || { echo "generated code is stale; run 'make manifests generate' and commit" >&2; exit 1; }""",
   "go mod tidy -diff",
   """unformatted=$(gofmt -l .); if [ -n "$unformatted" ]; then printf '%s\\n' "$unformatted" >&2; exit 1; fi""",
   "go vet ./...",
