@@ -418,14 +418,37 @@ func TestWorkerCancelRefusesUnprovenTermination(t *testing.T) {
 
 	// The escapee starts its own session, so the group signal never reaches
 	// it — but it inherits the task's output descriptors, which is what
-	// proves it is still there.
-	task, _ := json.Marshal(Task{Command: []string{"sh", "-c", "setsid sleep 300 & echo $! > pid.txt; wait"}})
+	// proves it is still there. It reports its own pid from inside that
+	// session, so the cancellation can never race the moment setsid moves
+	// it out of the task's group: a pid read from the background job would
+	// still be in the group, and the group signal would legitimately kill
+	// it before the test ever asked the worker to refuse anything.
+	task, _ := json.Marshal(Task{Command: []string{"sh", "-c", `setsid sh -c 'echo $$ > escaped.txt; exec sleep 300' & wait`}})
 	env := dispatchEnvelope(worker.clock())
 	env.PayloadDigest = PayloadDigestOf(task)
 	if _, err := client.Dispatch(ctx, priv, env, task); err != nil {
 		t.Fatalf("Dispatch: %v", err)
 	}
-	escapee := waitForDescendantPID(t, filepath.Join(worker.config.WorkspaceDir, "pid.txt"))
+	escapee := waitForDescendantPID(t, filepath.Join(worker.config.WorkspaceDir, "escaped.txt"))
+	if !descendantLive(escapee) {
+		t.Fatalf("escapee %d was gone before cancellation", escapee)
+	}
+	// Read the escapee's own session from the kernel: a process still in the
+	// task's session was never out of reach of the group signal, so a
+	// cancellation below would legitimately kill it and the refusal under
+	// test would be measuring nothing. The task inherits this process's
+	// session because the worker gives it a process group, not a session.
+	workerSession, ok := processSession(os.Getpid())
+	if !ok {
+		t.Fatal("could not read this test's own session")
+	}
+	escapeeSession, ok := processSession(escapee)
+	if !ok {
+		t.Fatalf("escapee %d left no readable session", escapee)
+	}
+	if escapeeSession == workerSession {
+		t.Fatalf("escapee %d never left the task's session (%d)", escapee, escapeeSession)
+	}
 
 	cancelEnv := env
 	cancelEnv.Kind = KindCancel
@@ -529,6 +552,30 @@ func descendantLive(pid int) bool {
 	}
 	fields := strings.Fields(stat[end+1:])
 	return len(fields) >= 3 && fields[0] != "Z" && fields[0] != "X"
+}
+
+// processSession reports the session a pid leads. A process in a session of
+// its own is unreachable by a signal aimed at the task's process group.
+func processSession(pid int) (int, bool) {
+	data, err := os.ReadFile("/proc/" + strconv.Itoa(pid) + "/stat")
+	if err != nil {
+		return 0, false
+	}
+	stat := string(data)
+	end := strings.LastIndex(stat, ")")
+	if end < 0 {
+		return 0, false
+	}
+	// After the parenthesized comm: state, parent, process group, session.
+	fields := strings.Fields(stat[end+1:])
+	if len(fields) < 4 {
+		return 0, false
+	}
+	session, err := strconv.Atoi(fields[3])
+	if err != nil {
+		return 0, false
+	}
+	return session, true
 }
 
 func TestWorkerLateCancelOnReplacementWorkerIsInert(t *testing.T) {
