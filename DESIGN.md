@@ -2043,6 +2043,30 @@ named items remain unresolved and must not be described as production-ready:
   duration rather than the deadline (constrains duration, not stuck),
   and reaping without a delay (reproduces the stall inside `Wait`).
 
+- **2026-10-17 — #416: repository-owned development bootstrap uses the mise
+  convention (#414) instead of ad-hoc tool discovery.** A fresh checkout
+  prepares itself with `hack/bootstrap.sh`, which ensures a pinned,
+  checksum-verified mise and then runs the `bootstrap` task:
+  `.mise/config.toml` pins only runtime tools (Go, Helm) with
+  `.mise/mise.lock` as committed per-platform URL + SHA-256 lock data, so
+  every mise download is pinned and locked; controller-gen, setup-envtest,
+  and envtest assets stay pinned by the existing Makefile targets, which the
+  task wraps instead of duplicating. Deliberate boundaries: the config
+  carries no `[settings]` and no hooks, so it requests no settings authority
+  and installs no hook state (#414: never auto-trust arbitrary fork
+  configuration); the gate is operational — bootstrap runs only against
+  operator-approved checkouts, and any change to this config is reviewed as
+  executable install code in its PR. Bootstrap
+  mutates no global config, installs no git hooks, generates no code, and
+  runs no tests — `check` (non-mutating CI equivalents) and `test` (the
+  authoritative `make test` with envtest assets) are explicit. The mise
+  dependency itself is pinned and reviewed in `hack/bootstrap.sh` (version,
+  per-platform SHA-256) plus `min_version`, per #414's vetting requirement.
+  `make` stays a host prerequisite that bootstrap fails on clearly rather
+  than manage. This is per-repo ergonomics coordinated with runtime-image
+  provisioning (#415); contributor docs no longer restate tool versions —
+  that config and lock are the source of truth.
+
 - **2026-10-17 — #367: the legacy pre-handoff plan adds a bounded,
   explicitly non-semantic referential check on cited evidence paths, and
   fails open.** `checkCriterionEvidence` now takes the run's context and
