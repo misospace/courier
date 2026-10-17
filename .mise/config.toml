@@ -11,7 +11,7 @@ run = "hack/bootstrap.sh tools"
 [tasks.check]
 description = "CI-equivalent checks mirroring the CI static job: generated-code drift, tidy diff, gofmt, vet, build, image-gating scripts"
 run = [
-  """cg=$(sed -n 's/^CONTROLLER_TOOLS_VERSION ?= //p' Makefile) && se=$(sed -n 's/^ENVTEST_VERSION ?= //p' Makefile) && make manifests generate CONTROLLER_TOOLS_VERSION="$cg" ENVTEST_VERSION="$se\"""",
+  """cg=$(sed -n 's/^CONTROLLER_TOOLS_VERSION ?= //p' Makefile) && se=$(sed -n 's/^ENVTEST_VERSION ?= //p' Makefile) && { [ -n "$cg" ] && [ -n "$se" ]; } || { echo "could not read tool pins from Makefile" >&2; exit 1; }; make manifests generate CONTROLLER_TOOLS_VERSION="$cg" ENVTEST_VERSION="$se\"""",
   """git diff --exit-code || { echo "generated code is stale; run 'make manifests generate' and commit" >&2; exit 1; }""",
   "go mod tidy -diff",
   """unformatted=$(gofmt -l .); if [ -n "$unformatted" ]; then printf '%s\\n' "$unformatted" >&2; exit 1; fi""",

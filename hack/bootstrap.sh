@@ -26,13 +26,17 @@ MISE_VERSION=v2026.10.13
 log() { printf 'bootstrap: %s\n' "$*"; }
 fail() { printf 'bootstrap: %s\n' "$*" >&2; exit 1; }
 
+# Failing inside a command substitution would only exit the subshell, so the
+# checksum-tool requirement is guarded up front, before any verification or
+# destructive cleanup runs.
+command -v sha256sum >/dev/null 2>&1 || command -v shasum >/dev/null 2>&1 ||
+	fail "verifying mise requires sha256sum or shasum"
+
 sha256_of() {
 	if command -v sha256sum >/dev/null 2>&1; then
 		sha256sum "$1" | awk '{print $1}'
-	elif command -v shasum >/dev/null 2>&1; then
-		shasum -a 256 "$1" | awk '{print $1}'
 	else
-		fail "verifying mise requires sha256sum or shasum"
+		shasum -a 256 "$1" | awk '{print $1}'
 	fi
 }
 
@@ -61,7 +65,7 @@ resolve_mise_digest() {
 			mise_sha256=4e4a996f4747eb59d55497fdd4b0d60d3add9a06c0dc5d65a70402015ee445d0
 			;;
 		*)
-			fail "unsupported platform $(uname -s)/$(uname -m); install mise ${MISE_VERSION} yourself and re-run"
+			fail "unsupported platform $(uname -s)/$(uname -m): no pinned digest to verify mise against; install mise ${MISE_VERSION} yourself and run 'mise run bootstrap' directly"
 			;;
 	esac
 }
@@ -143,25 +147,18 @@ if [ "${1:-}" = "tools" ]; then
 	exit 0
 fi
 
-# A mise already on PATH is used only when it matches the pinned launcher
-# version and digest; otherwise the pinned launcher below is installed and
-# used instead, so a stale, spoofed, or arbitrary installation cannot become
-# the bootstrap implementation or break the one-command setup.
-mise_pin=${MISE_VERSION#v}
+# A mise already on PATH is used only when its digest matches the pinned
+# launcher; the binary is not executed at all before that check, so a stale,
+# spoofed, or arbitrary installation can neither run the bootstrap steps nor
+# break the one-command setup.
 path_mise=$(command -v mise || true)
 if [ -n "$path_mise" ]; then
-	path_mise_version=$("$path_mise" --version 2>/dev/null | awk 'NR==1{print $1}')
-	path_mise_version=${path_mise_version#v}
-	if [ "$path_mise_version" = "$mise_pin" ]; then
-		if mise_is_pinned "$path_mise"; then
-			BOOTSTRAP_MISE=$path_mise
-			export BOOTSTRAP_MISE
-			exec "$path_mise" run bootstrap
-		fi
-		log "mise on PATH reports version ${mise_pin} but its digest does not match the pinned launcher; installing the pinned launcher instead"
-	else
-		log "mise on PATH reports '${path_mise_version:-unknown}', not the pinned ${mise_pin}; installing the pinned launcher instead"
+	if mise_is_pinned "$path_mise"; then
+		BOOTSTRAP_MISE=$path_mise
+		export BOOTSTRAP_MISE
+		exec "$path_mise" run bootstrap
 	fi
+	log "mise on PATH at ${path_mise} does not match the pinned launcher; installing the pinned launcher instead"
 fi
 
 if [ -z "${MISE_INSTALL_DIR:-}" ] && [ -z "${HOME:-}" ]; then
