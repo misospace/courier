@@ -678,9 +678,11 @@ const LabelProbe = "courier.misospace.dev/probe"
 // node. It carries the worker's labels so the worker's own NetworkPolicy —
 // not a special exception — is what the probe exercises.
 //
-// resources is the lane-configured sizing; the zero value renders the
-// built-in default rather than a BestEffort pod.
-func ProbePod(run *courier.CoderRun, node, image, script string, resources corev1.ResourceRequirements) *corev1.Pod {
+// Its sizing is the fixed probe value, not the lane's: preflight creates one
+// probe per eligible node simultaneously, and a seconds-lived network check
+// reserving lane-scale capacity can stay Pending on a request-tight cluster
+// and wedge preflight (#402).
+func ProbePod(run *courier.CoderRun, node, image, script string) *corev1.Pod {
 	suffix := "-probe-" + nodeNameTag(node)
 	pod := &corev1.Pod{
 		ObjectMeta: objectMeta(run, resourceName(run.Name, suffix), ComponentWorker),
@@ -696,7 +698,7 @@ func ProbePod(run *courier.CoderRun, node, image, script string, resources corev
 				Command:                  []string{"/bin/sh", "-c", script},
 				TerminationMessagePath:   "/dev/termination-log",
 				TerminationMessagePolicy: corev1.TerminationMessageReadFile,
-				Resources:                podResources(resources),
+				Resources:                courier.ProbePodResources(),
 				SecurityContext:          containerSecurityContext(),
 			}},
 		},

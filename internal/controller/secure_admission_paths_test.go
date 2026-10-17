@@ -133,15 +133,65 @@ func TestPreflightDryRunProofCoversEveryCreatedPod(t *testing.T) {
 
 // rejectProbeDryRun rejects only the probe pod's dry-run proof — the spec the
 // live probe phase creates outside the proof loop. Only the probe's
-// deterministic name is read here, so the sizing it renders with is arbitrary.
+// deterministic name is read here, so the render must produce the same name the
+// proof created.
 func rejectProbeDryRun(control *SecureControl, run *courier.CoderRun) func(string) error {
-	probe := topology.ProbePod(run, "dry-run-node", control.Config.ProbeImage, "true", courier.DefaultPodResources())
+	probe := topology.ProbePod(run, "dry-run-node", control.Config.ProbeImage, "true")
 	dryRun := probe.Name + "-dryrun"
 	return func(name string) error {
 		if name == dryRun {
 			return invalidPodRejection(name)
 		}
 		return nil
+	}
+}
+
+// TestDryRunProofAdmitsTheLiveProbeSpec pins the artifact claim at the probe
+// boundary, where the lane-sizing guarantee does not reach: the spec the proof
+// admits is the spec the live phase creates, and it is sized as a probe rather
+// than as the lane. The proof pod's node is a placeholder, so only the sizing —
+// the part this branch decided — can be compared.
+func TestDryRunProofAdmitsTheLiveProbeSpec(t *testing.T) {
+	control, c := secureControl(t)
+	run := secureRun("proof-probe")
+	if err := c.Create(context.Background(), run); err != nil {
+		t.Fatal(err)
+	}
+	var proof *corev1.Pod
+	watcher, ok := control.Client.(client.WithWatch)
+	if !ok {
+		t.Fatal("the fake client does not support watch")
+	}
+	control.Client = interceptor.NewClient(watcher, interceptor.Funcs{
+		Create: func(ctx context.Context, c client.WithWatch, obj client.Object, opts ...client.CreateOption) error {
+			if pod, isPod := obj.(*corev1.Pod); isPod && strings.HasSuffix(pod.Name, "-dryrun") &&
+				pod.Spec.Containers[0].Name == "probe" {
+				proof = pod.DeepCopy()
+			}
+			return c.Create(ctx, obj, opts...)
+		},
+	})
+	lane := courier.DefaultPodResources()
+	if err := control.checkDryRuns(context.Background(), run, nil, lane, true); err != nil {
+		t.Fatalf("checkDryRuns: %v", err)
+	}
+	if proof == nil {
+		t.Fatal("no probe pod was proved, so the live create admitted nothing")
+	}
+	got := proof.Spec.Containers[0].Resources
+	want := courier.ProbePodResources()
+	for _, name := range []corev1.ResourceName{corev1.ResourceCPU, corev1.ResourceMemory} {
+		wantQuantity := want.Requests[name]
+		gotQuantity := got.Requests[name]
+		if gotQuantity.Cmp(wantQuantity) != 0 {
+			t.Fatalf("probe proof %s request = %v, want the fixed probe sizing %v", name, gotQuantity, wantQuantity)
+		}
+	}
+	if len(got.Limits) != 0 {
+		t.Fatalf("probe proof limits = %v, want none: a limit under the probe image's usage would OOM-kill it", got.Limits)
+	}
+	if got.Requests.Cpu().Cmp(*lane.Requests.Cpu()) == 0 || got.Requests.Memory().Cmp(*lane.Requests.Memory()) == 0 {
+		t.Fatalf("probe proof sizing = %v, want it independent of the lane's %v", got.Requests, lane.Requests)
 	}
 }
 
@@ -201,7 +251,7 @@ func TestLiveProbeCreateClassifiesOnlyPermanentRejection(t *testing.T) {
 				return nil
 			})
 
-			err := control.runLiveProbes(context.Background(), run, nil, courier.DefaultPodResources())
+			err := control.runLiveProbes(context.Background(), run, nil)
 			if err == nil {
 				t.Fatal("runLiveProbes returned nil, want the create failure")
 			}
@@ -295,6 +345,11 @@ func TestLaunchSecureResolvesLaneResourcesOncePerPass(t *testing.T) {
 		t.Fatal("no dry-run pod was created, so the proof proved nothing")
 	}
 	for _, pod := range proven {
+		if pod.Spec.Containers[0].Name == "probe" {
+			// A probe pod is proven with the fixed probe sizing, not the
+			// lane's, so the lane-sizing claim covers the other three.
+			continue
+		}
 		assertSized(t, "dry-run proof of "+pod.Name, pod.Spec.Containers[0].Resources)
 	}
 	for component, podName := range map[string]string{

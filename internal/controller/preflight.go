@@ -77,7 +77,7 @@ func (s *SecureControl) Preflight(ctx context.Context, run *courier.CoderRun, po
 	if relaunch || !s.Config.LiveProbes {
 		return nil
 	}
-	return s.runLiveProbes(ctx, run, cache, resources)
+	return s.runLiveProbes(ctx, run, cache)
 }
 
 // checkNamespaceBoundary verifies the dedicated run namespace exists and
@@ -274,7 +274,7 @@ func (s *SecureControl) checkDryRuns(ctx context.Context, run *courier.CoderRun,
 		// that must exist — but it has to stay DNS-subdomain-shaped anyway,
 		// because the live probe's deterministic name derives from the
 		// node's.
-		pods = append(pods, topology.ProbePod(run, "dry-run-node", s.Config.ProbeImage, "true", resources))
+		pods = append(pods, topology.ProbePod(run, "dry-run-node", s.Config.ProbeImage, "true"))
 	}
 
 	for _, pod := range pods {
@@ -383,10 +383,9 @@ func (s *SecureControl) renderedWorkerPublicKey(ctx context.Context, run *courie
 
 // runLiveProbes executes the multi-node live deny/allow probe phase. Probe
 // pods carry the worker's labels, so the worker's own NetworkPolicy — not an
-// exception — is what the probes exercise. resources are the lane sizing the
-// caller resolved once for this pass, the same sizing the dry-run proof
-// admitted.
-func (s *SecureControl) runLiveProbes(ctx context.Context, run *courier.CoderRun, cache *topology.CachePin, resources corev1.ResourceRequirements) error {
+// exception — is what the probes exercise. A probe's sizing is fixed rather than
+// lane-following, so no lane sizing is resolved or passed in here.
+func (s *SecureControl) runLiveProbes(ctx context.Context, run *courier.CoderRun, cache *topology.CachePin) error {
 	nodes := &corev1.NodeList{}
 	if err := s.Client.List(ctx, nodes); err != nil {
 		return fmt.Errorf("secure preflight: list nodes: %w", err)
@@ -428,7 +427,7 @@ func (s *SecureControl) runLiveProbes(ctx context.Context, run *courier.CoderRun
 	defer cancel()
 
 	for _, node := range eligible {
-		pod := topology.ProbePod(run, node, s.Config.ProbeImage, script, resources)
+		pod := topology.ProbePod(run, node, s.Config.ProbeImage, script)
 		if err := s.Client.Delete(ctx, pod); err == nil {
 			// A leftover probe from an earlier attempt: wait for its
 			// termination below instead of failing on a name conflict.
@@ -450,13 +449,13 @@ func (s *SecureControl) runLiveProbes(ctx context.Context, run *courier.CoderRun
 
 	deadline := time.Now().Add(timeout)
 	for {
-		outcomes, pending, err := s.collectProbeResults(ctx, run, eligible, len(checks), resources)
+		outcomes, pending, err := s.collectProbeResults(ctx, run, eligible, len(checks))
 		if err != nil {
 			return err
 		}
 		if !pending {
 			for _, node := range eligible {
-				pod := topology.ProbePod(run, node, s.Config.ProbeImage, "", resources)
+				pod := topology.ProbePod(run, node, s.Config.ProbeImage, "")
 				_ = ctrlclient.IgnoreNotFound(s.Client.Delete(ctx, pod))
 			}
 			for _, outcome := range outcomes {
@@ -499,16 +498,15 @@ func findCheck(checks []probeCheck, name string) *probeCheck {
 }
 
 // collectProbeResults reads every probe pod's termination message. It returns
-// the outcomes and whether any probe is still pending. resources are the
-// lane-configured sizing the caller resolved for this pass and the probes were
-// rendered with; only the deterministic name is read here, so the lane is not
-// resolved again and the rendered spec stays identical to the live one.
-func (s *SecureControl) collectProbeResults(ctx context.Context, run *courier.CoderRun, nodes []string, checkCount int, resources corev1.ResourceRequirements) ([]probeOutcome, bool, error) {
+// the outcomes and whether any probe is still pending. The probe pod name is
+// deterministic and independent of sizing, so the lookup renders nothing but
+// the name.
+func (s *SecureControl) collectProbeResults(ctx context.Context, run *courier.CoderRun, nodes []string, checkCount int) ([]probeOutcome, bool, error) {
 	var outcomes []probeOutcome
 	pending := false
 	for _, node := range nodes {
 		pod := &corev1.Pod{}
-		name := topology.ProbePod(run, node, s.Config.ProbeImage, "", resources).Name
+		name := topology.ProbePod(run, node, s.Config.ProbeImage, "").Name
 		if err := s.Client.Get(ctx, types.NamespacedName{Namespace: run.Namespace, Name: name}, pod); err != nil {
 			if apierrors.IsNotFound(err) {
 				pending = true
