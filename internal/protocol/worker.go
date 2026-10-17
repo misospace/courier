@@ -563,6 +563,14 @@ func (w *Worker) handleRelease(wr http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
+	// The URL is not signed; the envelope is. A release addressed to one
+	// operation must not be able to erase another operation's result, so a
+	// path/envelope mismatch is refused before the nonce is consumed or any
+	// operation is touched.
+	if envelope.OpID != opID {
+		http.Error(wr, "release envelope does not address this operation", http.StatusBadRequest)
+		return
+	}
 	accepted, exhausted := w.consumeNonce(envelope)
 	if exhausted {
 		http.Error(wr, "replay state exhausted; worker must be replaced", http.StatusServiceUnavailable)

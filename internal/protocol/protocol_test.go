@@ -902,6 +902,94 @@ func TestWorkerReleaseConsumesResultPayload(t *testing.T) {
 		}
 	})
 
+	t.Run("mismatched path and envelope are refused", func(t *testing.T) {
+		for _, opID := range []string{"op-rel-a", "op-rel-b"} {
+			payload, _ := json.Marshal(Task{
+				Command:      []string{"sh", "-c", "head -c 1048576 /dev/zero > " + opID + ".bin"},
+				ArtifactPath: opID + ".bin",
+			})
+			env := dispatchEnvelope(worker.clock())
+			env.OpID = opID
+			env.PayloadDigest = PayloadDigestOf(payload)
+			env.Nonce = "mismatch-dispatch-" + opID
+			if _, err := client.Dispatch(ctx, priv, env, payload); err != nil {
+				t.Fatalf("Dispatch %s: %v", opID, err)
+			}
+		}
+		waitForCompleted := func(opID string) {
+			t.Helper()
+			deadline := time.Now().Add(10 * time.Second)
+			for {
+				state, err := client.Result(ctx, opID)
+				if err != nil {
+					t.Fatalf("Result %s: %v", opID, err)
+				}
+				if state.Status == ResultCompleted {
+					return
+				}
+				if time.Now().After(deadline) {
+					t.Fatalf("%s never completed", opID)
+				}
+				time.Sleep(10 * time.Millisecond)
+			}
+		}
+		waitForCompleted("op-rel-a")
+		waitForCompleted("op-rel-b")
+
+		// A validly signed release for op-rel-a, posted to op-rel-b's release
+		// URL, must be refused: the signature authorizes one operation, not
+		// whichever operation the URL names.
+		envA := dispatchEnvelope(worker.clock())
+		envA.OpID = "op-rel-a"
+		envA.PayloadDigest = CancelPayloadDigest
+		signature, err := releaseEnvelope(envA, "mismatch-release-a-1").Sign(priv)
+		if err != nil {
+			t.Fatal(err)
+		}
+		body, err := json.Marshal(signedRequest{
+			Envelope:  releaseEnvelope(envA, "mismatch-release-a-1"),
+			Signature: signature,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := client.post(ctx, "/v1/tasks/op-rel-b/release", body, "op-rel-b"); err == nil {
+			t.Fatal("a release for op-rel-a posted to op-rel-b must be refused")
+		} else {
+			var transportErr *TransportError
+			if !errors.As(err, &transportErr) || transportErr.StatusCode != http.StatusBadRequest {
+				t.Fatalf("mismatched release = %v, want 400", err)
+			}
+		}
+		// The refused request must not have consumed its nonce or touched
+		// either operation: both results keep their full payloads.
+		state, err := client.Result(ctx, "op-rel-b")
+		if err != nil || state.Result == nil || len(state.Result.Artifact) != 1<<20 {
+			t.Fatalf("op-rel-b must keep its full payload: %+v, %v", state.Result, err)
+		}
+		if retained := retainedArtifactBytes(worker); retained != 2<<20 {
+			t.Fatalf("retained artifact bytes after refused release = %d, want %d", retained, 2<<20)
+		}
+		// Re-posting the exact same signed envelope, now properly addressed
+		// to op-rel-a, must succeed: a burned nonce would surface as a 401
+		// replay rejection here, proving the refused attempt consumed
+		// nothing. The release compacts only op-rel-a.
+		if _, err := client.post(ctx, "/v1/tasks/op-rel-a/release", body, "op-rel-a"); err != nil {
+			t.Fatalf("properly addressed re-release must succeed: %v", err)
+		}
+		state, err = client.Result(ctx, "op-rel-a")
+		if err != nil || state.Result == nil || state.Result.Artifact != nil {
+			t.Fatalf("released op-rel-a must be a compact stub: %+v, %v", state.Result, err)
+		}
+		state, err = client.Result(ctx, "op-rel-b")
+		if err != nil || state.Result == nil || len(state.Result.Artifact) != 1<<20 {
+			t.Fatalf("op-rel-b must still keep its full payload: %+v, %v", state.Result, err)
+		}
+		if retained := retainedArtifactBytes(worker); retained != 1<<20 {
+			t.Fatalf("retained artifact bytes after addressed release = %d, want %d", retained, 1<<20)
+		}
+	})
+
 	t.Run("release refuses an unverified termination", func(t *testing.T) {
 		if runtime.GOOS != "linux" {
 			t.Skip("unverified-termination assertions read process groups and /proc")
