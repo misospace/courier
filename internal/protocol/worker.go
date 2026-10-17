@@ -521,6 +521,11 @@ func processStat(pid int) (state string, pgid int, ok bool) {
 	return fields[0], group, true
 }
 
+// artifactReadHook, when non-nil, runs between artifact validation and the
+// bounded read; tests install it to land a concurrent swap in exactly that
+// window. It is nil in production.
+var artifactReadHook func()
+
 // readArtifact reads the declared artifact, refusing anything outside the
 // workspace and over the transport bound. The lexical gate is only a first
 // filter; the authoritative confinement check walks the cleaned path from the
@@ -579,6 +584,9 @@ func (w *Worker) readArtifact(declared string) ([]byte, error) {
 	}
 	if info.Size() > maxArtifactBytes {
 		return nil, errors.New("artifact exceeds the bound and is rejected whole")
+	}
+	if artifactReadHook != nil {
+		artifactReadHook()
 	}
 	return readArtifactBounded(f)
 }

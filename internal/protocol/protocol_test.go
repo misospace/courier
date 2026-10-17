@@ -802,6 +802,60 @@ func TestWorkerArtifactConfinement(t *testing.T) {
 			time.Sleep(10 * time.Millisecond)
 		}
 	})
+
+	// A FIFO swapped over the artifact path after the descriptor is opened
+	// and validated cannot affect the read: the descriptor still refers to
+	// the opened regular file, so the operation must complete with the
+	// original confined bytes and never block. A regression to a path-based
+	// read after validation would instead open the FIFO and stall to the
+	// deadline.
+	t.Run("a FIFO swapped in after validation cannot redirect the read", func(t *testing.T) {
+		staged := filepath.Join(worker.config.WorkspaceDir, "staged.fifo")
+		if err := syscall.Mkfifo(staged, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(worker.config.WorkspaceDir, "swapped.txt"), []byte("genuine"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		swapped := false
+		previous := artifactReadHook
+		artifactReadHook = func() {
+			if err := os.Rename(staged, filepath.Join(worker.config.WorkspaceDir, "swapped.txt")); err != nil {
+				t.Error(err)
+				return
+			}
+			swapped = true
+		}
+		t.Cleanup(func() { artifactReadHook = previous })
+		task, _ := json.Marshal(Task{Command: []string{"true"}, ArtifactPath: "swapped.txt"})
+		env := dispatchEnvelope(worker.clock())
+		env.OpID = "op-confinement-swap"
+		env.Nonce = "confinement-nonce-swap000"
+		env.PayloadDigest = PayloadDigestOf(task)
+		if _, err := client.Dispatch(ctx, priv, env, task); err != nil {
+			t.Fatalf("Dispatch: %v", err)
+		}
+		deadline := time.Now().Add(5 * time.Second)
+		for {
+			state, err := client.Result(ctx, env.OpID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if state.Status == ResultCompleted {
+				if string(state.Result.Artifact) != "genuine" {
+					t.Fatalf("substitution must not redirect the read: artifact = %q", state.Result.Artifact)
+				}
+				if !swapped {
+					t.Fatal("the swap hook never ran, so the post-validation window was not exercised")
+				}
+				return
+			}
+			if state.Status == ResultFailed || time.Now().After(deadline) {
+				t.Fatalf("a post-validation swap must not block or redirect the read: %+v", state.Result)
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+	})
 }
 
 // growingReader delivers maxArtifactBytes+1 bytes across reads whose sizes
