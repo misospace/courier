@@ -61,6 +61,23 @@ func (c *Client) Cancel(ctx context.Context, key ed25519.PrivateKey, envelope En
 	return c.post(ctx, "/v1/tasks/cancel", body, envelope.OpID)
 }
 
+// Release delivers one signed release for a terminal operation, asking the
+// worker to drop the consumed result payload. The worker keeps only the
+// compact terminal status and continues to reject redelivery of the opID. A
+// failure is reported to the caller, which treats release as best-effort
+// retention cleanup and never as an outcome question.
+func (c *Client) Release(ctx context.Context, key ed25519.PrivateKey, envelope Envelope) (string, error) {
+	signature, err := envelope.Sign(key)
+	if err != nil {
+		return "", err
+	}
+	body, err := json.Marshal(signedRequest{Envelope: envelope, Signature: signature})
+	if err != nil {
+		return "", fmt.Errorf("protocol: encode release: %w", err)
+	}
+	return c.post(ctx, "/v1/tasks/"+envelope.OpID+"/release", body, envelope.OpID)
+}
+
 func (c *Client) post(ctx context.Context, path string, body []byte, opID string) (string, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.BaseURL+path, bytes.NewReader(body))
 	if err != nil {
