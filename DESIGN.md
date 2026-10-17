@@ -1891,6 +1891,44 @@ named items remain unresolved and must not be described as production-ready:
 
 ## Decisions
 
+- **2026-10-17 — #375: the criterion-evidence grammar a run is taught is
+  derived from the patterns the broker validates, so a validator edit can no
+  longer leave a prompt teaching a shape the validator refuses.** The grammar
+  was spelled three times — twice as prose baked into the legacy repair
+  continuation and the resolve-issue goal, once as the authoritative regexes
+  in the broker's criterion-evidence contract — and the copies had already
+  diverged from each other and from the broker's own rejection text: the repair
+  continuation taught the per-status rule as "referencing a file path or check
+  URL" where the validator says "must cite", and the goal's status vocabulary
+  dropped the conjunction the repair continuation carried. Constants behind a
+  cross-check test would have left the same failure open; the grammar is now
+  derived. `internal/broker` exports `CriteriaHeaderGrammar`,
+  `CriteriaHeaderShape`, `CriteriaRowGrammar`, `StatusVocabulary`,
+  `StatusVocabularySentence`, and `StatusReferenceRuleSentence`; the header and
+  row templates are rendered from the validator regexes by stripping the
+  anchors and substituting each capture group with the placeholder naming it.
+  Those substitutions are explicit, not automatic: each capture group's regex
+  source is hand-written as a substitution key, so the derivation is a
+  mechanical step over a table a human maintains. Drift between the taught
+  template and the validator is therefore caught rather than structurally
+  impossible — by equality against the pinned `derivedHeaderTemplate` and
+  `derivedRowTemplate`, by the alternation test that reads the row pattern's
+  own vocabulary in both directions, and by the substitution-key test that
+  fails a key occurring twice or a key that is a substring of another. The
+  patterns, the vocabulary, and the rule table live in the leaf package
+  `internal/broker/grammar`, so a prompt surface can render the grammar
+  without importing the broker — whose own in-package tests import the
+  harness — and `internal/broker` re-exports them under its existing names.
+  The per-status reference rule moves the same way: one table maps each
+  status to its requirement, consumed by both `validRecordShape` and the
+  rendered sentence, so the validator's parenthetical and the prose it teaches
+  are one string. Validation outcomes are unchanged — the derivation
+  re-spells how the grammar is taught, not what it accepts — and
+  `internal/broker/criteria_test.go` pins the derivation itself: every
+  instance rendered from a template must satisfy the pattern it claims to
+  describe, and the closed vocabulary must equal the row pattern's
+  alternation in both directions. (#375, #249, #282)
+
 - **2026-10-17 — #377: the operator's own observation reads resolve their
   destination through the selected registration, the same routing admission
   was given in #340/#378.** Post-review PR observation, existing-PR head

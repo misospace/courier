@@ -25,6 +25,7 @@ import (
 
 	courierv1alpha1 "github.com/misospace/courier/api/v1alpha1"
 	"github.com/misospace/courier/internal/broker"
+	"github.com/misospace/courier/internal/broker/grammar"
 	"github.com/misospace/courier/internal/evidence"
 	"github.com/misospace/courier/internal/executor"
 	"github.com/misospace/courier/internal/git"
@@ -6096,7 +6097,10 @@ func pinCriteriaEnvelopeForMisoGallery(t *testing.T) string {
 // verbatim pinned criterion texts so the model can verify what it must
 // satisfy, and the grammar the body must satisfy — the
 // "courier-criteria:v1" header, the "AC-n sha256:... status - reference"
-// row form, the closed status vocabulary, and the per-status shape rules.
+// row form, the closed status vocabulary, and the per-status shape rules —
+// each asserted against the grammar leaf's derived exports rather than a copy
+// re-embedded here, so this test fails if the repair message drifts away
+// from the validator it teaches (#375).
 // The continuation number, total, and remaining slots are named so the
 // model sees the remaining budget (#282).
 func TestCriteriaRepairMessagePinsValidatorVocabulary(t *testing.T) {
@@ -6132,11 +6136,10 @@ func TestCriteriaRepairMessagePinsValidatorVocabulary(t *testing.T) {
 		"misospace/miso-gallery#502",
 		ce.Reason,
 		"courier-criteria:v1",
-		"- AC-<n> sha256:<64hex>: <status> - <reference>",
-		"implementation-evidence",
-		"regression-check",
-		"manual-verification",
-		"not-implemented",
+		grammar.CriteriaHeaderShape("misospace/miso-gallery#502"),
+		grammar.CriteriaRowGrammar(),
+		grammar.StatusVocabularySentence(),
+		grammar.StatusReferenceRuleSentence(),
 		"regression-check and implementation-evidence",
 		"file path or check URL",
 		"Update the PR body through the forge capability",
@@ -6152,6 +6155,24 @@ func TestCriteriaRepairMessagePinsValidatorVocabulary(t *testing.T) {
 		if !strings.Contains(msg, want) {
 			t.Fatalf("criteriaRepairMessage missing %q in: %q", want, msg)
 		}
+	}
+	// The closed vocabulary is the validator's, so the repair names every
+	// status and nothing else.
+	for _, status := range grammar.StatusVocabulary() {
+		if !strings.Contains(msg, string(status)) {
+			t.Fatalf("criteriaRepairMessage missing status %q in: %q", status, msg)
+		}
+	}
+	// A rendered repair must not teach a doubled conjunction or a doubled
+	// rule while splicing the derived fragments into the sentence.
+	if strings.Contains(msg, "or or") {
+		t.Fatalf("criteriaRepairMessage renders a doubled conjunction in: %q", msg)
+	}
+	// The count is 1 only because the fixture sets no BadStatus and spells
+	// ce.Reason as a literal: a reason produced by the broker's
+	// describeCriteriaFailure would embed the same sentence.
+	if got := strings.Count(msg, grammar.StatusReferenceRuleSentence()); got != 1 {
+		t.Fatalf("criteriaRepairMessage should carry the per-status reference rule exactly once; got %d in: %q", got, msg)
 	}
 }
 
