@@ -320,6 +320,12 @@ func estimateMessageTokens(message Message) int {
 	return tokens
 }
 
+// toolWireEnvelopeChars approximates the JSON framing the gateway wraps
+// around each declaration — the type/function envelope and the field names
+// and separators — so the fixed component is not estimated systematically
+// lower than the transcript is.
+const toolWireEnvelopeChars = 48
+
 // estimateToolTokens is the deterministic prompt cost of the tool
 // declarations sent with a turn request. Gateway.StreamChat serializes the
 // declarations into the same provider request as the transcript, so a
@@ -330,7 +336,7 @@ func estimateMessageTokens(message Message) int {
 func estimateToolTokens(tools []ToolDef) int {
 	total := 0
 	for _, tool := range tools {
-		chars := len(tool.Name) + len(tool.Description)
+		chars := toolWireEnvelopeChars + len(tool.Name) + len(tool.Description)
 		if len(tool.Parameters) > 0 {
 			if encoded, err := json.Marshal(tool.Parameters); err == nil {
 				chars += len(encoded)

@@ -908,8 +908,8 @@ func TestEstimateToolTokensMatchesTheWireShape(t *testing.T) {
 	if got := estimateToolTokens(nil); got != 0 {
 		t.Fatalf("estimateToolTokens(nil) = %d, want 0", got)
 	}
-	if got := estimateToolTokens([]ToolDef{{}}); got != 1 {
-		t.Fatalf("estimateToolTokens(empty tool) = %d, want the one-token floor", got)
+	if got, want := estimateToolTokens([]ToolDef{{}}), toolWireEnvelopeChars/tokensPerChar; got != want {
+		t.Fatalf("estimateToolTokens(empty tool) = %d, want the %d-token wire envelope", got, want)
 	}
 	bare := estimateToolTokens([]ToolDef{{Name: "t", Description: "d"}})
 	withSchema := estimateToolTokens([]ToolDef{{Name: "t", Description: "d", Parameters: map[string]any{"type": "object", "properties": map[string]any{"path": map[string]any{"type": "string"}}}}})
