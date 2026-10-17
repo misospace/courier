@@ -205,7 +205,8 @@ const maxModelInfoBody = 1 << 20
 // contract as every other gateway path — a bounded body prefix is read only to
 // classify the failure and is never retained or echoed — and an unknown model,
 // an unusable limit, or an unreadable envelope is an explicit error, never a
-// silent zero a caller could mistake for a small window. The success path
+// silent zero a caller could mistake for a small window — trailing data after
+// the envelope included. The success path
 // reads under maxModelInfoBody, so a hostile 200 cannot amplify memory at
 // startup.
 func (g *Gateway) ModelInputLimit(ctx context.Context, model string) (int, error) {
@@ -227,7 +228,14 @@ func (g *Gateway) ModelInputLimit(ctx context.Context, model string) (int, error
 		return 0, gatewayStatusError(resp.StatusCode, resp.Header, body, g.signals())
 	}
 	var report wireModelInfo
-	if err := json.NewDecoder(io.LimitReader(resp.Body, maxModelInfoBody)).Decode(&report); err != nil {
+	decoder := json.NewDecoder(io.LimitReader(resp.Body, maxModelInfoBody))
+	if err := decoder.Decode(&report); err != nil {
+		return 0, errors.New("harness: gateway model info is undecodable")
+	}
+	// Trailing bytes — a second JSON value or any non-whitespace garbage —
+	// make the envelope unusable, not merely larger: a decoder that silently
+	// accepted them would treat a malformed or hostile body as a trusted one.
+	if decoder.More() {
 		return 0, errors.New("harness: gateway model info is undecodable")
 	}
 	limit, named := 0, false

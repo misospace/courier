@@ -104,6 +104,12 @@ func TestModelInputLimitReadsAdvertisedLimit(t *testing.T) {
 			model: "test/coordinator",
 			want:  96000,
 		},
+		{
+			name:  "trailing whitespace after the envelope is accepted",
+			body:  `{"data":[{"model_name":"test/coordinator","max_input_tokens":96000}]}` + "\n\n",
+			model: "test/coordinator",
+			want:  96000,
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -207,6 +213,18 @@ func TestModelInputLimitFailureMessages(t *testing.T) {
 		{
 			name:  "an undecodable envelope fails closed",
 			body:  `{"data": [`,
+			model: "test/coordinator",
+			want:  "harness: gateway model info is undecodable",
+		},
+		{
+			name:  "a second JSON value after the envelope fails closed",
+			body:  `{"data":[{"model_name":"test/coordinator","max_input_tokens":96000}]}{"data":[]}`,
+			model: "test/coordinator",
+			want:  "harness: gateway model info is undecodable",
+		},
+		{
+			name:  "trailing garbage after the envelope fails closed",
+			body:  `{"data":[{"model_name":"test/coordinator","max_input_tokens":96000}]} trailing`,
 			model: "test/coordinator",
 			want:  "harness: gateway model info is undecodable",
 		},
