@@ -202,7 +202,7 @@ func TestLiveProbeCreateClassifiesOnlyPermanentRejection(t *testing.T) {
 				return nil
 			})
 
-			err := control.runLiveProbes(context.Background(), run, nil, courier.DefaultPodResources())
+			err := control.runLiveProbes(context.Background(), run, nil)
 			if err == nil {
 				t.Fatal("runLiveProbes returned nil, want the create failure")
 			}
@@ -296,6 +296,11 @@ func TestLaunchSecureResolvesLaneResourcesOncePerPass(t *testing.T) {
 		t.Fatal("no dry-run pod was created, so the proof proved nothing")
 	}
 	for _, pod := range proven {
+		if strings.Contains(pod.Name, "-probe-") {
+			// A probe pod is proven with the fixed probe sizing, not the
+			// lane's, so the lane-sizing claim covers the other three.
+			continue
+		}
 		assertSized(t, "dry-run proof of "+pod.Name, pod.Spec.Containers[0].Resources)
 	}
 	for component, podName := range map[string]string{

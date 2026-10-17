@@ -46,10 +46,13 @@ func secureNeedsHuman(reason, format string, args ...any) *SecureNeedsHumanError
 
 // podAdmissionRejection returns the permanent pod-admission rejection a
 // rendered spec's author must fix — the class this sizing work made
-// reachable — and nil for every other preflight failure. Only this class
-// terminalizes from the launch paths: a live probe that outran a
-// just-written NetworkPolicy or a stale RBAC informer cache clears on a
-// later pass, and terminalizing those would strand a recoverable run.
+// reachable — and nil for every other preflight failure. A probe pod is in the
+// class although no lane configures it: its spec is an implementation constant,
+// so a rejection there implicates the probe image or the cluster, and neither
+// clears on a later pass. Only this class terminalizes from the launch paths: a
+// live probe that outran a just-written NetworkPolicy or a stale RBAC informer
+// cache clears on a later pass, and terminalizing those would strand a
+// recoverable run.
 func podAdmissionRejection(err error) *SecureNeedsHumanError {
 	var permanent *SecureNeedsHumanError
 	if !errors.As(err, &permanent) || permanent.Reason != "PodAdmission" {

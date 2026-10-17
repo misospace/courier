@@ -77,7 +77,7 @@ func (s *SecureControl) Preflight(ctx context.Context, run *courier.CoderRun, po
 	if relaunch || !s.Config.LiveProbes {
 		return nil
 	}
-	return s.runLiveProbes(ctx, run, cache, resources)
+	return s.runLiveProbes(ctx, run, cache)
 }
 
 // checkNamespaceBoundary verifies the dedicated run namespace exists and
@@ -383,10 +383,9 @@ func (s *SecureControl) renderedWorkerPublicKey(ctx context.Context, run *courie
 
 // runLiveProbes executes the multi-node live deny/allow probe phase. Probe
 // pods carry the worker's labels, so the worker's own NetworkPolicy — not an
-// exception — is what the probes exercise. resources are the lane sizing the
-// caller resolved once for this pass, the same sizing the dry-run proof
-// admitted.
-func (s *SecureControl) runLiveProbes(ctx context.Context, run *courier.CoderRun, cache *topology.CachePin, resources corev1.ResourceRequirements) error {
+// exception — is what the probes exercise. A probe's sizing is fixed rather than
+// lane-following, so no lane sizing is resolved or passed in here.
+func (s *SecureControl) runLiveProbes(ctx context.Context, run *courier.CoderRun, cache *topology.CachePin) error {
 	nodes := &corev1.NodeList{}
 	if err := s.Client.List(ctx, nodes); err != nil {
 		return fmt.Errorf("secure preflight: list nodes: %w", err)
