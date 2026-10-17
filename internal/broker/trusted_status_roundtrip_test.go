@@ -25,7 +25,7 @@ func TestTrustedStatusEndToEndRoundTrip(t *testing.T) {
 	})
 	server := httptest.NewServer(handler)
 	defer server.Close()
-	control := &harness.BrokerClient{BaseURL: server.URL, Token: []byte("trusted-token"), HTTP: server.Client()}
+	control := &harness.BrokerClient{BaseURL: server.URL, TokenSource: harness.NewStaticBrokerTokenSource([]byte("trusted-token")), HTTP: server.Client()}
 
 	// A UID-fenced heartbeat and an operation addition, exactly as the
 	// control process sends them.
