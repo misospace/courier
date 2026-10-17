@@ -6,6 +6,7 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"sync"
 	"testing"
 	"time"
 
@@ -70,32 +71,42 @@ func TestCapacityPreparationRejectsMismatchedGeneration(t *testing.T) {
 
 func TestIssueCapacityHandoffLostResponseReplaysFromAudit(t *testing.T) {
 	id := EncodeWorkID(Task{Type: "implement", Issue: &Issue{ID: "issue-a", Repo: "acme/widgets", Number: 42}})
+	// The post handler and the audit handler run on separate server goroutines,
+	// and the lost-response replay overlaps them, so the shared counters and the
+	// recorded marker are guarded by a mutex.
+	var mu sync.Mutex
 	var posts, audits int
 	marker := ""
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
 		case "/api/issues/capacity-handoff":
-			posts++
 			var body struct {
 				Note string `json:"note"`
 			}
 			_ = json.NewDecoder(r.Body).Decode(&body)
+			mu.Lock()
+			posts++
+			first := posts == 1
 			marker = body.Note
-			if posts == 1 {
-				_ = json.NewEncoder(w).Encode(map[string]any{"success": true})
+			mu.Unlock()
+			_ = json.NewEncoder(w).Encode(map[string]any{"success": true})
+			if first {
 				panic(http.ErrAbortHandler)
 			}
-			_ = json.NewEncoder(w).Encode(map[string]any{"success": true})
 		case "/api/audit":
+			mu.Lock()
 			audits++
+			first := audits == 1
+			notes := marker
+			mu.Unlock()
 			if r.URL.Query().Get("repo") != "acme/widgets" || r.URL.Query().Get("limit") != "100" {
 				t.Errorf("query = %v", r.URL)
 			}
-			if audits == 1 {
+			if first {
 				_ = json.NewEncoder(w).Encode([]map[string]any{})
 				return
 			}
-			_ = json.NewEncoder(w).Encode([]map[string]any{{"action": "issue_capacity_handoff", "success": true, "repoFullName": "acme/widgets", "issueNumber": 42, "issueId": "issue-a", "notes": "capacity=capacity-a; cooldownUntil=none; lease lease-a released by claim-token fence; " + marker}})
+			_ = json.NewEncoder(w).Encode([]map[string]any{{"action": "issue_capacity_handoff", "success": true, "repoFullName": "acme/widgets", "issueNumber": 42, "issueId": "issue-a", "notes": "capacity=capacity-a; cooldownUntil=none; lease lease-a released by claim-token fence; " + notes}})
 		default:
 			if r.URL.Path == "/api/issues/state" {
 				_ = json.NewEncoder(w).Encode(map[string]any{"issueId": "issue-a"})
@@ -117,8 +128,11 @@ func TestIssueCapacityHandoffLostResponseReplaysFromAudit(t *testing.T) {
 	if err := c.SettleCapacityExhaustion(context.Background(), id, receipt, handoff); err != nil {
 		t.Fatal(err)
 	}
-	if posts != 1 || audits != 3 || marker != capacityReceiptMarker("issued-a", "stable-key", WorkIdentity(id)) {
-		t.Fatalf("posts=%d audits=%d marker=%q", posts, audits, marker)
+	mu.Lock()
+	gotPosts, gotAudits, gotMarker := posts, audits, marker
+	mu.Unlock()
+	if gotPosts != 1 || gotAudits != 3 || gotMarker != capacityReceiptMarker("issued-a", "stable-key", WorkIdentity(id)) {
+		t.Fatalf("posts=%d audits=%d marker=%q", gotPosts, gotAudits, gotMarker)
 	}
 }
 
