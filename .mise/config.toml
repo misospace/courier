@@ -1,0 +1,41 @@
+# Repository development environment contract (#416).
+#
+# Local development tool versions live in this file and .mise/mise.lock; CI
+# and the images pin independently, so bump them together. Runtime tools
+# only — optional contributor conveniences do not belong here because they
+# would land in every automated worker.
+#
+# Entry points:
+#   hack/bootstrap.sh   idempotent setup (also `mise run bootstrap`)
+#   mise run check      non-mutating CI-equivalent checks
+#   mise run test       authoritative suite with envtest assets
+
+min_version = "2026.10.13"
+
+[tools]
+go = "1.27.2"
+helm = "3.18.6"
+
+[tasks.bootstrap]
+description = "Install the pinned toolchain, controller-gen, setup-envtest, and envtest assets (idempotent; no codegen, no tests, no formatting)"
+run = "hack/bootstrap.sh tools"
+
+[tasks.check]
+description = "Non-mutating CI-equivalent checks: tidy diff, gofmt, vet, build, image-gating scripts"
+run = [
+  "go mod tidy -diff",
+  """unformatted=$(gofmt -l .); if [ -n "$unformatted" ]; then printf '%s\\n' "$unformatted" >&2; exit 1; fi""",
+  "go vet ./...",
+  "go build ./...",
+  "bash hack/test-ci-images-gating.sh",
+]
+
+[tasks.test]
+description = "Authoritative suite: make test (manifests, generate, fmt, vet, go test -race) with envtest assets — a superset of the CI test job"
+run = '''
+k8s=$(sed -n 's/^ENVTEST_K8S_VERSION ?= //p' Makefile)
+if [ -z "$k8s" ]; then echo "could not read ENVTEST_K8S_VERSION from Makefile" >&2; exit 1; fi
+make setup-envtest
+export KUBEBUILDER_ASSETS="$(bin/setup-envtest use -p path "$k8s")"
+make test
+'''

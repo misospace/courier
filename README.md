@@ -59,6 +59,34 @@ Debian 12 / Ubuntu 22.04-era git (2.39) several `internal/harness` tests
 (for example `TestPublicationChainEndToEnd`) fail from this version gap alone;
 upgrade git before treating those failures as real.
 
+## Development setup
+
+One documented, non-interactive command prepares a clean checkout — no sudo,
+no global config mutation, no git-hook installation:
+
+```sh
+hack/bootstrap.sh
+```
+
+It ensures a pinned, checksum-verified [mise](https://mise.jdx.dev) (user-scoped,
+only when absent), then installs the pinned toolchain declared in
+`.mise/config.toml` with `.mise/mise.lock` as committed lock data, plus
+`controller-gen`, `setup-envtest`, and envtest assets through the existing
+Makefile targets. Re-running it is a no-op. Local dev tool versions live in
+that config and lock (CI and the images pin independently; bump them
+together).
+
+After setup, verification is explicit:
+
+```sh
+mise run check   # non-mutating: tidy diff, gofmt, vet, build, image-gating scripts
+mise run test    # authoritative: make test (codegen, fmt, vet, go test -race) with envtest assets
+```
+
+Later shell commands reuse the same environment with `mise exec -- <command>`;
+`mise run <task>` works without any shell activation. `make` and `git` are host
+prerequisites that bootstrap reports clearly when missing or too old.
+
 ## Install
 
 Published releases use the OCI chart `oci://ghcr.io/misospace/charts/courier`.
