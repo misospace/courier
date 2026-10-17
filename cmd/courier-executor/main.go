@@ -2378,7 +2378,7 @@ func criteriaRepairMessage(source broker.SourceIssue, outcome *handoffCheckOutco
 		outcome.pr.Number, target,
 		nonEmptyOr(setDigest, "the admitted set"),
 		reason,
-		grammar.CriteriaHeaderShape(strings.ToLower(source.Canonical()) + "#" + strconv.Itoa(source.Number)),
+		grammar.CriteriaHeaderShape(strings.ToLower(source.Canonical())+"#"+strconv.Itoa(source.Number)),
 		grammar.CriteriaRowGrammar(),
 		grammar.StatusVocabularySentence(),
 		grammar.StatusReferenceRuleSentence(),

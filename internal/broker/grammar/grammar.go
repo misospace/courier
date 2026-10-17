@@ -126,7 +126,7 @@ var (
 		`(\d+)`, CriterionPlaceholder,
 		`([0-9a-f]{64})`, DigestPlaceholder,
 		`(implementation-evidence|regression-check|manual-verification|not-implemented|unknown)`, StatusPlaceholder,
-		`(?:\s[-—]\s?(.*))?`, " - "+ReferencePlaceholder,
+		`(?:\s[-—]\s?(.*))?`, " - " + ReferencePlaceholder,
 	}
 )
 
