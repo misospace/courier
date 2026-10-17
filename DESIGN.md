@@ -262,7 +262,11 @@ continuation budget and backed off exponentially (capped, never a tight loop).
 Exhausting it ends the run on the same recovery channel — the
 `capacity_exhausted` outcome with the honest `provider-unavailable` diagnostic
 category — never a quota verdict the evidence does not support, never
-`Failed`, never NeedsHuman-for-model-outage. Settlement, safety gating, and
+`Failed`, never NeedsHuman-for-model-outage. A raw child process status is
+never an outcome declaration: exit `2`, which merely matches Courier's own
+NeedsHuman exit constant, takes this same shared recovery path like any other
+unclassified nonzero exit; only a verified outcome declaration may request a
+human. Settlement, safety gating, and
 cooldown semantics are identical to confirmed exhaustion: an unverified or
 unsafe workspace still retains ownership.
 
@@ -1602,7 +1606,12 @@ Legacy recovery uses a separate workspace-observer container and UID in the
 existing coordinator pod. A trusted init container pins the initial remote head
 before OpenCode starts. Only the observer mounts its private baseline, Kubernetes
 read token, and termination output; the writer mounts none of these. The observer
-uses a run-scoped service account with `get` permission for its own pod only. It
+uses a run-scoped service account with `get` permission for its own pod only.
+The complete run-scoped identity — ServiceAccount, Role, RoleBinding — is
+provisioned and ownership-verified before the coordinator pod is created, so a
+foreign same-named resource is never admitted under or silently adopted; a
+provisioning failure releases the claim only when the slot is proven empty,
+otherwise it stays Claimed as provisioning-in-flight. It
 waits for kubelet's coordinator-container `Terminated` state before reading the
 workspace read-only. Process-group cancellation is not itself release proof.
 
@@ -1958,6 +1967,28 @@ named items remain unresolved and must not be described as production-ready:
 
 ## Decisions
 
+- **2026-10-17 — #327 review: raw child exit 2 is an ordinary crash, never a
+  declaration.** The executor special-cased the child's raw exit status 2 —
+  numerically Courier's own NeedsHuman constant — into a permanent
+  `Failed(model-transport-error)` before the availability budget, stranding
+  exactly the outage this PR recovers from. Removed the special case: every
+  raw nonzero child status takes the shared recovery path (availability budget
+  without a session, task continuations with one, recoverable
+  `provider-unavailable` handoff when either is spent). NeedsHuman stays
+  reserved for verified outcome declarations; operator cancellation stays a
+  plain Failed. Supersedes the 2026-09-29 note that "a raw child exit 2
+  remains a failure". (#368)
+- **2026-10-17 — #327 review: verify the observer identity before the pod can
+  run.** Launch previously assigned the run-scoped ServiceAccount, created it
+  best-effort with the error ignored, and verified SA/Role/RoleBinding
+  ownership only after the coordinator pod create — so a foreign same-named
+  identity could admit the writer, and a post-create provisioning failure
+  released the Dispatch claim while that writer kept working, violating the
+  single-writer guarantee. Provisioning now fully precedes the create and
+  never adopts unowned resources; a pre-creation failure surfaces as a plain
+  error only when the slot is proven empty through the uncached reader,
+  otherwise as `ErrProvisioningInFlight` so the run stays Claimed. The #217
+  collision contract is unchanged. (#368)
 - **2026-10-16 — #327: availability handoff for outages without quota evidence.**
   Repeated no-session crashes (provider outage, transport failure) previously
   terminalized runs as Failed and stranded the work item, because the shared
