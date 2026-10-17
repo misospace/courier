@@ -8073,3 +8073,41 @@ func TestRunResolveIssueCombinedBodyWithMissingCitedPathFiresOneRepair(t *testin
 		t.Fatalf("run exit code = %d, want %d (NeedsHuman once the single repair turn is spent); detail: %q", code, exitNeedsHuman, out)
 	}
 }
+
+// TestClassifyUndeclaredCommittedBranchReadBias pins the committed-work
+// branch read in classifyUndeclared (#344): only a read that positively
+// shows work ahead of the start commit may carry the run to Verifying;
+// an unreadable branch fails closed instead of claiming committed work.
+func TestClassifyUndeclaredCommittedBranchReadBias(t *testing.T) {
+	root := t.TempDir()
+	runGit(t, root, "init")
+	configureGit(t, root)
+	runGit(t, root, "branch", "-M", "main")
+	write(t, filepath.Join(root, "one.txt"), "one\n")
+	commit(t, root, "base: one")
+	revOutput, err := exec.Command("git", "-C", root, "rev-parse", "HEAD").Output()
+	if err != nil {
+		t.Fatalf("rev-parse HEAD: %v", err)
+	}
+	startCommit := strings.TrimSpace(string(revOutput))
+	write(t, filepath.Join(root, "two.txt"), "two\n")
+	commit(t, root, "work: two")
+	workspace := &git.Workspace{Directory: root}
+
+	verifying := (reporter{}).classifyUndeclared(context.Background(), workspace, "main", startCommit, git.WorkStateCommitted, nil)
+	if verifying.Phase != "Verifying" || verifying.ExitCode != exitSuccess {
+		t.Fatalf("work ahead of the start commit must verify: %+v", verifying)
+	}
+
+	offBranch := (reporter{}).classifyUndeclared(context.Background(), workspace, "main", "HEAD", git.WorkStateCommitted, nil)
+	if offBranch.Phase != "Failed" || offBranch.Category != terminalCategoryVerifierRejection {
+		t.Fatalf("a read showing no work ahead must fail as off-branch: %+v", offBranch)
+	}
+
+	// An empty start commit makes CommitsOnBranchSince error; the run must
+	// fail closed rather than fall through to Verifying.
+	errored := (reporter{}).classifyUndeclared(context.Background(), workspace, "main", "", git.WorkStateCommitted, nil)
+	if errored.Phase != "Failed" || errored.ExitCode != exitFailed || errored.Category != terminalCategoryVerifierRejection {
+		t.Fatalf("a failed branch re-read must fail closed, not verify: %+v", errored)
+	}
+}
