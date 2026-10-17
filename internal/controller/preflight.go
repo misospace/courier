@@ -47,12 +47,17 @@ type probeOutcome struct {
 // topology objects (SAs, RBAC, secrets, services, policies) are already
 // provisioned. relaunch abbreviates the check: replacement launches re-verify
 // the static guarantees but do not repeat the multi-node live probes, which
-// ran before the first workload exposure.
+// ran before the first workload exposure. resources are the lane-configured
+// sizing the caller already resolved for this launch pass, so the dry-run
+// proof and the pods created afterwards are the same artifact. The proof
+// carries the probe pod only on a pass that will create probes live, so a
+// deployment with no probe image never proves — and is never failed by — a
+// spec it will not create.
 //
 // Permanent deployment misconfiguration returns a *SecureNeedsHumanError;
 // transient API or probe failures return an ordinary error so the run requeues
 // without launching.
-func (s *SecureControl) Preflight(ctx context.Context, run *courier.CoderRun, policy *courier.PublicationPolicy, relaunch bool) error {
+func (s *SecureControl) Preflight(ctx context.Context, run *courier.CoderRun, policy *courier.PublicationPolicy, relaunch bool, resources corev1.ResourceRequirements) error {
 	if err := s.checkNamespaceBoundary(ctx); err != nil {
 		return err
 	}
@@ -66,13 +71,13 @@ func (s *SecureControl) Preflight(ctx context.Context, run *courier.CoderRun, po
 	if err != nil {
 		return err
 	}
-	if err := s.checkDryRuns(ctx, run, cache); err != nil {
+	if err := s.checkDryRuns(ctx, run, cache, resources, !relaunch && s.Config.LiveProbes); err != nil {
 		return err
 	}
 	if relaunch || !s.Config.LiveProbes {
 		return nil
 	}
-	return s.runLiveProbes(ctx, run, cache)
+	return s.runLiveProbes(ctx, run, cache, resources)
 }
 
 // checkNamespaceBoundary verifies the dedicated run namespace exists and
@@ -222,8 +227,12 @@ func (s *SecureControl) subjectAccessReviewAs(ctx context.Context, serviceAccoun
 // checkDryRuns proves what the cluster's API admits: the operator's rendered
 // pod specs create under dry-run, and known-bad specs (host path, privileged,
 // host networking) are rejected. A bad spec that the API admits is permanent
-// evidence that the configured admission cannot hold the boundary.
-func (s *SecureControl) checkDryRuns(ctx context.Context, run *courier.CoderRun, cache *topology.CachePin) error {
+// evidence that the configured admission cannot hold the boundary. Every pod
+// the launcher creates is in the proof; proveProbes adds the probe pod, which
+// is created live rather than through this loop, and only on a pass that will
+// create probes. resources are the lane sizing the caller resolved once for
+// this pass.
+func (s *SecureControl) checkDryRuns(ctx context.Context, run *courier.CoderRun, cache *topology.CachePin, resources corev1.ResourceRequirements, proveProbes bool) error {
 	registration, err := s.Config.Registry.Select(run.Spec.Repo)
 	if err != nil {
 		return secureNeedsHuman("ProviderSelection", "provider selection failed: %v", err)
@@ -233,7 +242,7 @@ func (s *SecureControl) checkDryRuns(ctx context.Context, run *courier.CoderRun,
 		return err
 	}
 	pods := []*corev1.Pod{}
-	worker, err := topology.WorkerPod(run, s.Config.HarnessImage, "dry-run-incarnation", publicKey, cache)
+	worker, err := topology.WorkerPod(run, s.Config.HarnessImage, "dry-run-incarnation", publicKey, cache, resources)
 	if err != nil {
 		return fmt.Errorf("secure preflight: render worker: %w", err)
 	}
@@ -245,22 +254,45 @@ func (s *SecureControl) checkDryRuns(ctx context.Context, run *courier.CoderRun,
 		ControlIncarnationUID: "dry-run-incarnation",
 		WorkerURL:             "http://dry-run:8080",
 		BrokerURL:             "https://dry-run:8443",
+		Resources:             resources,
 	})
 	if err != nil {
 		return fmt.Errorf("secure preflight: render control: %w", err)
 	}
 	pods = append(pods, control)
-	broker, err := topology.BrokerPod(run, s.Config.HarnessImage, registration.Projection(), "dry-run-sa")
+	broker, err := topology.BrokerPod(run, s.Config.HarnessImage, registration.Projection(), "dry-run-sa", resources)
 	if err != nil {
 		return fmt.Errorf("secure preflight: render broker: %w", err)
 	}
 	pods = append(pods, broker)
+	if proveProbes {
+		// The probe pod joins the proof because this pass creates it live
+		// below, not through this loop; a pass that creates no probes proves
+		// no probe spec. The placeholder node name is arbitrary as far as
+		// admission is concerned — the API server does not validate
+		// spec.nodeName at all, neither as a DNS subdomain nor as a node
+		// that must exist — but it has to stay DNS-subdomain-shaped anyway,
+		// because the live probe's deterministic name derives from the
+		// node's.
+		pods = append(pods, topology.ProbePod(run, "dry-run-node", s.Config.ProbeImage, "true", resources))
+	}
 
 	for _, pod := range pods {
 		dry := pod.DeepCopy()
 		dry.Name = dry.Name + "-dryrun"
 		dry.GenerateName = ""
 		if err := s.Client.Create(ctx, dry, ctrlclient.DryRunAll); err != nil {
+			if apierrors.IsInvalid(err) {
+				// The rendered spec itself is refused, and requeueing cannot
+				// change it: the lane configures something the API server
+				// rejects outright (resources.claims, which no renderer
+				// honours, is the concrete case). Surface it instead of
+				// spinning. A Forbidden or quota denial stays an ordinary
+				// error — a quota or an RBAC grant can be raised later, so a
+				// requeue is the right answer there.
+				return secureNeedsHuman("PodAdmission",
+					"the API server rejected the rendered topology pod %s: %v", pod.Name, err)
+			}
 			return fmt.Errorf("secure preflight: dry-run create of %s failed: %w", pod.Name, err)
 		}
 	}
@@ -351,8 +383,10 @@ func (s *SecureControl) renderedWorkerPublicKey(ctx context.Context, run *courie
 
 // runLiveProbes executes the multi-node live deny/allow probe phase. Probe
 // pods carry the worker's labels, so the worker's own NetworkPolicy — not an
-// exception — is what the probes exercise.
-func (s *SecureControl) runLiveProbes(ctx context.Context, run *courier.CoderRun, cache *topology.CachePin) error {
+// exception — is what the probes exercise. resources are the lane sizing the
+// caller resolved once for this pass, the same sizing the dry-run proof
+// admitted.
+func (s *SecureControl) runLiveProbes(ctx context.Context, run *courier.CoderRun, cache *topology.CachePin, resources corev1.ResourceRequirements) error {
 	nodes := &corev1.NodeList{}
 	if err := s.Client.List(ctx, nodes); err != nil {
 		return fmt.Errorf("secure preflight: list nodes: %w", err)
@@ -394,25 +428,35 @@ func (s *SecureControl) runLiveProbes(ctx context.Context, run *courier.CoderRun
 	defer cancel()
 
 	for _, node := range eligible {
-		pod := topology.ProbePod(run, node, s.Config.ProbeImage, script)
+		pod := topology.ProbePod(run, node, s.Config.ProbeImage, script, resources)
 		if err := s.Client.Delete(ctx, pod); err == nil {
 			// A leftover probe from an earlier attempt: wait for its
 			// termination below instead of failing on a name conflict.
 		}
 		if err := s.Client.Create(ctx, pod); err != nil && !apierrors.IsAlreadyExists(err) {
+			if apierrors.IsInvalid(err) {
+				// The dry-run proof already covers this spec, so an
+				// Invalid here means the live create hit something the
+				// dry run could not: permanent, and requeueing cannot
+				// change it. A Forbidden or quota denial stays an
+				// ordinary error — a quota or an RBAC grant can be
+				// raised later, so a requeue is the right answer there.
+				return secureNeedsHuman("PodAdmission",
+					"the API server rejected the live probe pod on node %s: %v", node, err)
+			}
 			return fmt.Errorf("secure preflight: create probe pod on %s: %w", node, err)
 		}
 	}
 
 	deadline := time.Now().Add(timeout)
 	for {
-		outcomes, pending, err := s.collectProbeResults(ctx, run, eligible, len(checks))
+		outcomes, pending, err := s.collectProbeResults(ctx, run, eligible, len(checks), resources)
 		if err != nil {
 			return err
 		}
 		if !pending {
 			for _, node := range eligible {
-				pod := topology.ProbePod(run, node, s.Config.ProbeImage, "")
+				pod := topology.ProbePod(run, node, s.Config.ProbeImage, "", resources)
 				_ = ctrlclient.IgnoreNotFound(s.Client.Delete(ctx, pod))
 			}
 			for _, outcome := range outcomes {
@@ -455,13 +499,16 @@ func findCheck(checks []probeCheck, name string) *probeCheck {
 }
 
 // collectProbeResults reads every probe pod's termination message. It returns
-// the outcomes and whether any probe is still pending.
-func (s *SecureControl) collectProbeResults(ctx context.Context, run *courier.CoderRun, nodes []string, checkCount int) ([]probeOutcome, bool, error) {
+// the outcomes and whether any probe is still pending. resources are the
+// lane-configured sizing the caller resolved for this pass and the probes were
+// rendered with; only the deterministic name is read here, so the lane is not
+// resolved again and the rendered spec stays identical to the live one.
+func (s *SecureControl) collectProbeResults(ctx context.Context, run *courier.CoderRun, nodes []string, checkCount int, resources corev1.ResourceRequirements) ([]probeOutcome, bool, error) {
 	var outcomes []probeOutcome
 	pending := false
 	for _, node := range nodes {
 		pod := &corev1.Pod{}
-		name := topology.ProbePod(run, node, s.Config.ProbeImage, "").Name
+		name := topology.ProbePod(run, node, s.Config.ProbeImage, "", resources).Name
 		if err := s.Client.Get(ctx, types.NamespacedName{Namespace: run.Namespace, Name: name}, pod); err != nil {
 			if apierrors.IsNotFound(err) {
 				pending = true

@@ -59,7 +59,15 @@ func (s *SecureControl) LaunchSecure(ctx context.Context, run *courier.CoderRun)
 	if err := s.ensureFinalizer(ctx, run); err != nil {
 		return ctrl.Result{}, err
 	}
-	if err := s.Preflight(ctx, run, policy, relaunch); err != nil {
+	// The sizing is resolved once for the pods this pass renders: the
+	// preflight proof and every pod created below carry the same value, so a
+	// concurrent lane update cannot make the admitted spec differ from the
+	// created one.
+	resources, err := s.laneResources(ctx, run)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+	if err := s.Preflight(ctx, run, policy, relaunch, resources); err != nil {
 		return ctrl.Result{}, err
 	}
 
@@ -96,7 +104,7 @@ func (s *SecureControl) LaunchSecure(ctx context.Context, run *courier.CoderRun)
 		if err != nil {
 			return ctrl.Result{}, err
 		}
-		pod, err := topology.BrokerPod(run, s.Config.HarnessImage, registration.Projection(), string(controlSA.UID))
+		pod, err := topology.BrokerPod(run, s.Config.HarnessImage, registration.Projection(), string(controlSA.UID), resources)
 		if err != nil {
 			return ctrl.Result{}, err
 		}
@@ -149,7 +157,7 @@ func (s *SecureControl) LaunchSecure(ctx context.Context, run *courier.CoderRun)
 		if err != nil {
 			return ctrl.Result{}, err
 		}
-		workerPod, err = topology.WorkerPod(run, s.Config.HarnessImage, incarnation, publicKey, cache)
+		workerPod, err = topology.WorkerPod(run, s.Config.HarnessImage, incarnation, publicKey, cache, resources)
 		if err != nil {
 			return ctrl.Result{}, err
 		}
@@ -208,6 +216,7 @@ func (s *SecureControl) LaunchSecure(ctx context.Context, run *courier.CoderRun)
 			WorkerURL:             "http://" + topology.WorkerServiceDNS(run.Namespace, run.Name) + ":" + fmt.Sprint(topology.WorkerPort),
 			BrokerURL:             "https://" + topology.BrokerServiceDNS(run.Namespace, run.Name) + ":8443",
 			BrokerStatusURL:       "https://" + topology.BrokerServiceDNS(run.Namespace, run.Name) + ":8444",
+			Resources:             resources,
 		})
 		if err != nil {
 			return ctrl.Result{}, err
@@ -239,6 +248,18 @@ func (s *SecureControl) controlInvocation(ctx context.Context, run *courier.Code
 	}
 	invocation.Criteria = criteria
 	return invocation, nil
+}
+
+// laneResources reads the pod sizing the run's lane configures. Every pod of
+// the secure topology carries it, so a lane that configures nothing still
+// renders the built-in default rather than a BestEffort pod. Read once per
+// pass and reused across the round's renders.
+func (s *SecureControl) laneResources(ctx context.Context, run *courier.CoderRun) (corev1.ResourceRequirements, error) {
+	lane := &courier.LaneProfile{}
+	if err := s.Client.Get(ctx, types.NamespacedName{Namespace: run.Namespace, Name: run.Spec.Lane}, lane); err != nil {
+		return corev1.ResourceRequirements{}, fmt.Errorf("secure topology: read lane profile %q: %w", run.Spec.Lane, err)
+	}
+	return lane.Spec.EffectiveResources(), nil
 }
 
 type gatewayConfig struct {
@@ -950,7 +971,7 @@ func podOfComponent(ctx context.Context, reader client.Reader, run *courier.Code
 		if pod.Labels[topology.LabelProbe] == "true" {
 			continue
 		}
-		if pod.Labels[topology.LabelRun] == run.Name && pod.Labels["courier.misospace.dev/component"] == component {
+		if pod.Labels[topology.LabelRun] == topology.RunLabelValue(run.Name) && pod.Labels["courier.misospace.dev/component"] == component {
 			return pod, nil
 		}
 	}

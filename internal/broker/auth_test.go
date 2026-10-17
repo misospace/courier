@@ -2,6 +2,7 @@ package broker
 
 import (
 	"context"
+	"strings"
 	"testing"
 
 	authenticationv1 "k8s.io/api/authentication/v1"
@@ -15,6 +16,7 @@ import (
 	fakeclient "sigs.k8s.io/controller-runtime/pkg/client/fake"
 
 	courier "github.com/misospace/courier/api/v1alpha1"
+	"github.com/misospace/courier/internal/topology"
 )
 
 const (
@@ -201,6 +203,44 @@ func TestAuthenticateRejectsReviewFailureAndMissingToken(t *testing.T) {
 	tokens.PrependReactor("create", "tokenreviews", func(ktesting.Action) (bool, runtime.Object, error) { return true, nil, context.DeadlineExceeded })
 	if _, err := auth.Authenticate(context.Background(), "token"); err == nil {
 		t.Fatal("TokenReview error accepted")
+	}
+}
+
+func TestAuthenticateBindsSanitizedRunLabel(t *testing.T) {
+	long := strings.Repeat("a", 63) + "-overflow"
+	if topology.RunLabelValue(long) == long {
+		t.Fatalf("test precondition: %q must overflow the label cap", long)
+	}
+	scheme := runtime.NewScheme()
+	_ = corev1.AddToScheme(scheme)
+	_ = courier.AddToScheme(scheme)
+	uid := types.UID("run-uid-long")
+	owner := metav1.OwnerReference{APIVersion: courier.GroupVersion.String(), Kind: "CoderRun", Name: long, UID: uid, Controller: boolPtr(true)}
+	run := &courier.CoderRun{ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: long, UID: uid}}
+	brokerPod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: brokerName, UID: brokerUID, OwnerReferences: []metav1.OwnerReference{owner}}}
+	control := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: controlPod, UID: controlPodUID, Labels: map[string]string{topology.LabelRun: topology.RunLabelValue(long), "courier.misospace.dev/component": "coordinator"}, OwnerReferences: []metav1.OwnerReference{owner}}, Spec: corev1.PodSpec{ServiceAccountName: controlName}}
+	client := fakeclient.NewClientBuilder().WithScheme(scheme).WithObjects(run, brokerPod, control).Build()
+	tokens := fake.NewSimpleClientset()
+	tokens.PrependReactor("create", "tokenreviews", func(ktesting.Action) (bool, runtime.Object, error) { return true, validReview(), nil })
+
+	auth, err := NewAuthenticator(context.Background(), client, tokens, ns, brokerName, controlName, controlUID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := auth.Authenticate(context.Background(), "token"); err != nil {
+		t.Fatalf("Authenticate rejected a control pod labeled with the sanitized run label: %v", err)
+	}
+
+	stale := &corev1.Pod{}
+	if err := client.Get(context.Background(), ctrlclient.ObjectKey{Namespace: ns, Name: controlPod}, stale); err != nil {
+		t.Fatal(err)
+	}
+	stale.Labels[topology.LabelRun] = long
+	if err := client.Update(context.Background(), stale); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := auth.Authenticate(context.Background(), "token"); err == nil {
+		t.Fatal("Authenticate accepted a control pod labeled with the raw run name")
 	}
 }
 

@@ -445,7 +445,7 @@ func (r *CoderRunReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 		if r.Secure != nil {
 			result, err := r.Secure.LaunchSecure(ctx, &run)
 			if err != nil {
-				return ctrl.Result{}, r.releaseClaim(ctx, &run, adapter, item, err)
+				return r.secureLaunchFailure(ctx, &run, adapter, item, err)
 			}
 			if result.Requeue || result.RequeueAfter > 0 {
 				// Provisioning is in flight; the run stays Claimed and the
@@ -453,6 +453,9 @@ func (r *CoderRunReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 				return result, nil
 			}
 		} else if err := r.Launch(ctx, &run); err != nil {
+			if permanent := podAdmissionRejection(err); permanent != nil {
+				return r.terminateNeedsHuman(ctx, &run, adapter, item, permanent)
+			}
 			if errors.Is(err, ErrProvisioningInFlight) {
 				// The deterministic pod name could not be verified as a
 				// live coordinator pod owned by this run: it is being
@@ -532,12 +535,15 @@ func (r *CoderRunReconciler) resumeClaimed(ctx context.Context, run *courierv1al
 	if r.Secure != nil {
 		result, err := r.Secure.LaunchSecure(ctx, run)
 		if err != nil {
-			return ctrl.Result{}, r.releaseClaim(ctx, run, adapter, item, err)
+			return r.secureLaunchFailure(ctx, run, adapter, item, err)
 		}
 		if result.Requeue || result.RequeueAfter > 0 {
 			return result, nil
 		}
 	} else if err := r.Launch(ctx, run); err != nil {
+		if permanent := podAdmissionRejection(err); permanent != nil {
+			return r.terminateNeedsHuman(ctx, run, adapter, item, permanent)
+		}
 		if errors.Is(err, ErrProvisioningInFlight) {
 			// A relaunch's create collided with a slot that could not be
 			// verified as a live pod owned by this run's UID: torn down,
@@ -689,8 +695,11 @@ func (r *CoderRunReconciler) releaseClaim(ctx context.Context, run *courierv1alp
 // gone (a deleted fork). Unlike a transient resolution failure, the condition
 // cannot recover by re-claiming, so the claim is released and the run
 // terminalizes NeedsHuman rather than cycling claim and release on every
-// reconcile. The cause is handled here, so it is logged and not returned as a
-// reconcile error.
+// reconcile. This is the one path where the branch identity is cleared too:
+// the head it names no longer exists, and the terminal PR enrichment reads a
+// branch to observe, so leaving it set would send a fresh observation at a ref
+// that cannot resolve. The cause is handled here, so it is logged and not
+// returned as a reconcile error.
 func (r *CoderRunReconciler) terminateMissingHead(ctx context.Context, run *courierv1alpha1.CoderRun, cause error) (ctrl.Result, error) {
 	log.FromContext(ctx).Info("terminating fix-pr run: pull request head repository is missing",
 		"run", run.Name, "branch", run.Status.Branch, "cause", cause.Error())
@@ -698,11 +707,49 @@ func (r *CoderRunReconciler) terminateMissingHead(ctx context.Context, run *cour
 	if err != nil {
 		return ctrl.Result{}, err
 	}
-	releaseErr := adapter.Release(ctx, item)
 	run.Status.Branch = ""
 	run.Status.HeadRepo = ""
 	run.Status.HeadSHA = ""
-	terminalResult, terminalErr := r.transitionTerminal(ctx, run, courierv1alpha1.PhaseNeedsHuman, "", terminalLifecycleIntent{}, nil)
+	return r.terminateNeedsHuman(ctx, run, adapter, item, &SecureNeedsHumanError{Reason: "HeadRepositoryGone", Detail: cause.Error()})
+}
+
+// secureLaunchFailure handles an error from LaunchSecure. The pod-admission
+// class — a rendered pod spec the API server refuses outright — terminalizes
+// the run, and fences the round first: a resumed launch reaches the launcher
+// with a live worker and a credentialed broker already provisioned, and a
+// NeedsHuman run is no longer observed and is reaped only after its retention
+// window, so a fence deferred past this reconcile would leave the untrusted
+// executor running and the broker holding credentials for all of it. A fence
+// that fails does not terminalize: the claim is released and the next pass
+// retries the fence. Every other error keeps the launch path's transient
+// behaviour — the claim is released back to Pending — because a signal that
+// clears on a later pass must not strand the run (podAdmissionRejection).
+func (r *CoderRunReconciler) secureLaunchFailure(ctx context.Context, run *courierv1alpha1.CoderRun, adapter source.Adapter, item source.WorkItem, err error) (ctrl.Result, error) {
+	if permanent := podAdmissionRejection(err); permanent != nil {
+		if fenceErr := r.Secure.Fence(ctx, run); fenceErr != nil {
+			return ctrl.Result{}, r.releaseClaim(ctx, run, adapter, item, fenceErr)
+		}
+		return r.Secure.transitionNeedsHuman(ctx, run, permanent.Detail)
+	}
+	return ctrl.Result{}, r.releaseClaim(ctx, run, adapter, item, err)
+}
+
+// terminateNeedsHuman ends a run whose permanent, actionable deployment
+// failure requeueing cannot fix — a missing pull request head, a rendered pod
+// spec the API server rejects outright. This is the legacy launcher's ending:
+// the claim is released and the run terminalizes NeedsHuman naming the cause,
+// rather than cycling claim and release on every reconcile. The secure launch
+// path terminalizes the same way through transitionNeedsHuman, which records
+// its own SecurePreflightFailed condition and settles the claim through the
+// terminal lifecycle report; this path carries the cause in the run's terminal
+// diagnostic instead. It leaves the run's branch identity untouched, so a
+// fix-pr run keeps the head its terminal PR enrichment observes. The cause is
+// handled here, so it is logged and not returned as a reconcile error.
+func (r *CoderRunReconciler) terminateNeedsHuman(ctx context.Context, run *courierv1alpha1.CoderRun, adapter source.Adapter, item source.WorkItem, cause *SecureNeedsHumanError) (ctrl.Result, error) {
+	log.FromContext(ctx).Info("terminating run: permanent deployment failure a human must fix",
+		"run", run.Name, "reason", cause.Reason, "cause", cause.Detail)
+	releaseErr := adapter.Release(ctx, item)
+	terminalResult, terminalErr := r.transitionTerminal(ctx, run, courierv1alpha1.PhaseNeedsHuman, "", terminalLifecycleIntent{error: cause.Detail}, nil)
 	return terminalResult, errors.Join(releaseErr, terminalErr)
 }
 
@@ -782,6 +829,27 @@ func (r *CoderRunReconciler) observeRunning(ctx context.Context, run *courierv1a
 		}
 		exitCode, terminationReason, terminationOutcome, terminationSummary, terminated := coordinatorTermination(pod)
 		if !terminated {
+			continue
+		}
+		// A coordinator whose deletion is in flight is being deliberately
+		// torn down: its recorded exit belongs to that teardown, not to the
+		// model's work, and the two are indistinguishable — a wedge-reaped
+		// coordinator can carry a cancelled-stream failure exit or even exit
+		// 0 inside the shutdown window. Never map it, exactly as
+		// topologyBroken, coordinatorPodOf and activeOperationValid treat a
+		// terminating pod: checkLiveness re-observes the transition, and the
+		// disappearance backstop takes the deferred relaunch charge once the
+		// object is provably gone. The mirror case — a meaningful exit
+		// followed by deletion of the object (node drain, manual delete) —
+		// takes the same pod-loss relaunch by decision: a timestamp ordering
+		// test cannot separate the cases, because graceful deletion stamps
+		// deletionTimestamp with a value of the request plus the grace
+		// period, while the kubelet may end the SIGTERM'd container at any
+		// point after the request — a teardown exit can therefore read as
+		// finished before the stamp's value. A deleted coordinator is
+		// untrusted by construction, and the resumed run re-reads the
+		// world. (#369)
+		if pod.DeletionTimestamp != nil {
 			continue
 		}
 		phase := phaseForExit(run.Spec.Mode, exitCode, terminationOutcome)
@@ -1775,7 +1843,8 @@ func podBelongsToRun(pod *corev1.Pod, run *courierv1alpha1.CoderRun) bool {
 			return true
 		}
 	}
-	return pod.Labels[executor.LabelRun] == run.Name
+	label := pod.Labels[executor.LabelRun]
+	return label == executor.RunLabelValue(run.Name) || label == topology.RunLabelValue(run.Name)
 }
 
 type terminationMessage struct {

@@ -98,6 +98,24 @@ func (d *Delegator) Cancel(ctx context.Context, opID, briefID string) error {
 	return err
 }
 
+// Release tells the worker to drop one consumed result's payload after
+// control has taken ownership of the terminal result. The envelope carries
+// the same opID as its dispatch with a strictly greater sequence; the worker
+// retains only the compact terminal status and keeps rejecting redelivery of
+// the opID.
+func (d *Delegator) Release(ctx context.Context, opID, briefID string) error {
+	envelope := protocol.NewEnvelope(d.now(), d.admission, nil)
+	envelope.Kind = protocol.KindRelease
+	envelope.Sequence = 1
+	envelope.RunUID = d.identity.RunUID
+	envelope.ControlPodUID = d.identity.ControlPodUID
+	envelope.WorkerPodUID = d.identity.WorkerPodUID
+	envelope.BriefID = briefID
+	envelope.OpID = opID
+	_, err := d.client.Release(ctx, d.identity.Key, envelope)
+	return err
+}
+
 // Result polls one operation's state. A missing operation is reported with
 // Status "" — a replacement worker never saw the opID — which is observed
 // worker absence, not completion.
