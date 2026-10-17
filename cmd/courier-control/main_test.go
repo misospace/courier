@@ -359,14 +359,14 @@ func TestProbeWorkerSurvivesRepeatedProbes(t *testing.T) {
 	server := httptest.NewServer(realWorker.Handler())
 	defer server.Close()
 	identity := &controlIdentity{
-		runUID:      "run",
-		controlUID:  "control",
-		workerUID:   uid,
-		workerURL:   server.URL,
-		brokerURL:   "https://broker:8443",
-		signingKey:  priv,
-		brokerToken: []byte("token"),
-		brokerCA:    []byte("ca"),
+		runUID:            "run",
+		controlUID:        "control",
+		workerUID:         uid,
+		workerURL:         server.URL,
+		brokerURL:         "https://broker:8443",
+		signingKey:        priv,
+		brokerTokenSource: harness.NewStaticBrokerTokenSource([]byte("token")),
+		brokerCA:          []byte("ca"),
 	}
 	for attempt := 0; attempt < 3; attempt++ {
 		capability := identity.probeWorker(context.Background())

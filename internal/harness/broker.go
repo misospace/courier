@@ -9,6 +9,7 @@ import (
 	"io"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 
 	courier "github.com/misospace/courier/api/v1alpha1"
@@ -39,8 +40,11 @@ const (
 
 // BrokerCallError classifies one broker call failure. Transport-class and
 // 5xx/429/408 failures are retryable; other 4xx responses are definite
-// denials. Response bodies are never echoed: only a fixed category and the
-// status code travel.
+// denials. A local credential-read failure is retryable too — the projected
+// token file comes back when kubelet finishes rotating it, and the run never
+// needs rebuilding to pick the new bytes up. Response bodies are never
+// echoed, and neither is a credential read failure: only a fixed category and
+// the status code travel.
 type BrokerCallError struct {
 	StatusCode int
 	Category   string
@@ -87,29 +91,75 @@ type BrokerSnapshot struct {
 }
 
 // BrokerClient reaches the run's broker's typed publication API over TLS
-// with the control pod's projected broker-audience token.
+// with the control pod's projected broker-audience token. The token is read
+// per request from TokenSource: kubelet rotates the projected file, and a
+// client holding the bytes it read at startup would go stale mid-run.
 type BrokerClient struct {
-	BaseURL string
-	Token   []byte
-	CA      []byte
-	HTTP    *http.Client
+	BaseURL     string
+	TokenSource BrokerTokenSource
+	CA          []byte
+	HTTP        *http.Client
+
+	// mu guards owned, the client built once and shared by every request
+	// this BrokerClient makes for itself, so repeated calls reuse one idle
+	// connection pool.
+	mu    sync.Mutex
+	owned *http.Client
 }
+
+// Idle bounds on the transport a broker client builds for itself. The pool
+// lives as long as the client; the bounds keep idle sockets and their
+// read-loop goroutines from accumulating between requests.
+const (
+	brokerMaxIdleConns        = 4
+	brokerMaxIdleConnsPerHost = 4
+	brokerIdleConnTimeout     = 90 * time.Second
+)
 
 func (b *BrokerClient) transport() (*http.Client, error) {
 	if b.HTTP != nil {
 		return b.HTTP, nil
 	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.owned != nil {
+		return b.owned, nil
+	}
 	pool := x509.NewCertPool()
 	if !pool.AppendCertsFromPEM(b.CA) {
 		return nil, &BrokerCallError{Category: "CA is unreadable"}
 	}
-	return &http.Client{
-		Timeout:   5 * time.Minute,
-		Transport: &http.Transport{TLSClientConfig: &tls.Config{RootCAs: pool, ServerName: hostOnly(b.BaseURL), MinVersion: tls.VersionTLS13}},
-	}, nil
+	b.owned = &http.Client{
+		Timeout: 5 * time.Minute,
+		Transport: &http.Transport{
+			TLSClientConfig:     &tls.Config{RootCAs: pool, ServerName: hostOnly(b.BaseURL), MinVersion: tls.VersionTLS13},
+			MaxIdleConns:        brokerMaxIdleConns,
+			MaxIdleConnsPerHost: brokerMaxIdleConnsPerHost,
+			IdleConnTimeout:     brokerIdleConnTimeout,
+		},
+	}
+	return b.owned, nil
+}
+
+// CloseIdleConnections releases the idle pool of the transport this client
+// built for itself. A supplied HTTP client belongs to whoever supplied it:
+// this never touches it.
+func (b *BrokerClient) CloseIdleConnections() {
+	b.mu.Lock()
+	owned := b.owned
+	b.mu.Unlock()
+	if owned != nil {
+		owned.CloseIdleConnections()
+	}
 }
 
 func (b *BrokerClient) do(ctx context.Context, method, path string, headers map[string]string, body []byte) (*http.Response, error) {
+	token, err := resolveBrokerToken(b.TokenSource)
+	if err != nil {
+		// No request is issued without a fresh token: the projected file may
+		// be mid-rotation, and rotation is a retryable local condition.
+		return nil, &BrokerCallError{Category: "token is unavailable", Retryable: true}
+	}
 	transport, err := b.transport()
 	if err != nil {
 		return nil, err
@@ -118,7 +168,7 @@ func (b *BrokerClient) do(ctx context.Context, method, path string, headers map[
 	if err != nil {
 		return nil, &BrokerCallError{Category: "request is malformed"}
 	}
-	req.Header.Set("Authorization", "Bearer "+string(b.Token))
+	req.Header.Set("Authorization", "Bearer "+string(token))
 	for name, value := range headers {
 		req.Header.Set(name, value)
 	}
