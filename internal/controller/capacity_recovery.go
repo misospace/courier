@@ -58,17 +58,24 @@ func (r *CoderRunReconciler) capacityCooldownWindow() time.Duration {
 	return defaultCapacityCooldownWindow
 }
 
-// isCapacityExhaustionRun reports a run that ended on the structured
-// capacity-exhaustion signal: the recoverable BlockedExternal phase carrying
-// a confirmed capacity-exhaustion terminal diagnostic. Neither half is
-// sufficient — a plain external block is not a capacity event, and a
-// capacity-exhaustion category on any other phase proves nothing this path
+// isCapacityExhaustionRun reports a run that ended on a recoverable capacity
+// handoff: the BlockedExternal phase carrying either the confirmed
+// capacity-exhaustion diagnostic or the availability handoff
+// (provider-unavailable). Both mean "this capacity could not complete the
+// attempt for availability reasons"; neither is a task-correctness verdict.
+// Neither half is sufficient — a plain external block is not a capacity
+// event, and a capacity category on any other phase proves nothing this path
 // may act on.
 func isCapacityExhaustionRun(run *courierv1alpha1.CoderRun) bool {
-	return run != nil &&
-		run.Status.Phase == courierv1alpha1.PhaseBlockedExternal &&
-		run.Status.TerminalDiagnostic != nil &&
-		run.Status.TerminalDiagnostic.Category == courierv1alpha1.TerminalDiagnosticCategoryCapacityExhaustion
+	if run == nil || run.Status.Phase != courierv1alpha1.PhaseBlockedExternal || run.Status.TerminalDiagnostic == nil {
+		return false
+	}
+	switch run.Status.TerminalDiagnostic.Category {
+	case courierv1alpha1.TerminalDiagnosticCategoryCapacityExhaustion,
+		courierv1alpha1.TerminalDiagnosticCategoryProviderUnavailable:
+		return true
+	}
+	return false
 }
 
 // capacityRecoveryPending reports an exhaustion run whose fenced settlement

@@ -255,6 +255,21 @@ executor/runtime positively classifies capacity exhaustion; Courier does not
 infer it from HTTP 429 or provider text. The operator records a recoverable
 `BlockedExternal` terminal diagnostic and starts a durable, idempotent handoff.
 
+An outage without an authoritative exhaustion signal must strand nothing
+(#327). Attempts that end without the provider ever serving a session id
+crash into a dedicated availability budget, separate from the task-repair
+continuation budget and backed off exponentially (capped, never a tight loop).
+Exhausting it ends the run on the same recovery channel — the
+`capacity_exhausted` outcome with the honest `provider-unavailable` diagnostic
+category — never a quota verdict the evidence does not support, never
+`Failed`, never NeedsHuman-for-model-outage. A raw child process status is
+never an outcome declaration: exit `2`, which merely matches Courier's own
+NeedsHuman exit constant, takes this same shared recovery path like any other
+unclassified nonzero exit; only a verified outcome declaration may request a
+human. Settlement, safety gating, and
+cooldown semantics are identical to confirmed exhaustion: an unverified or
+unsafe workspace still retains ownership.
+
 `LaneProfile.spec.capacityGroup` optionally names lanes sharing an execution
 capacity identity; otherwise the lane name is the identity. Confirmed
 exhaustion persists a default 15-minute cooldown on LaneProfile status. Source
@@ -1539,6 +1554,33 @@ exhaustion history permits rediscovery with a fresh opaque source attempt ID;
 the successor name incorporates the settled predecessor UID, and the old run
 is retained for diagnostics. Source-issued ownership is reacquired before launch.
 
+The legacy OpenCode runtime is pinned in the image by `Dockerfile`'s
+`OPENCODE_VERSION` (currently 1.18.31). Its `run --format json` event stream
+is the only accepted exhaustion seam: `error.name=APIError` carries provider
+evidence in `error.data.statusCode` and `error.data.responseBody`. The response
+must confirm exhaustion using the shared classifier or carry a
+configured exhaustion code/type (with MiniMax code 2056 configured by that
+deployment); generic 429, ordinary process failures, assistant prose, and
+stderr do not prove exhaustion. On the recognized event the executor kills the OpenCode
+process group before observing git state and never resumes that turn. Git status
+includes tracked and untracked changes; an empty snapshot requires no commits
+since start and no local changes, while pushed work requires fetching the exact
+run branch and matching its remote tip to HEAD. Unverifiable state remains held.
+
+Before enabling this in a deployment, configure the verified provider token
+(for MiniMax 2056, `COURIER_MODEL_EXHAUSTION_CODES=2056`), build and publish
+the executor image with the pinned runtime, deploy to a non-production lane
+using the same `opencode`
+executor, and run both (1) an issue claim and (2) an existing PR-fix claim on
+the shared queue. Induce a confirmed MiniMax 2056 response while each run has
+an existing branch/PR; verify the exhaustion event is followed by process-group
+termination, `BlockedExternal` plus `CapacityRecovery=True/Settled`, no further
+model calls, retained predecessor history, and a fresh local-lane successor on
+the same issue branch or PR without a duplicate PR. Also verify generic 429,
+unknown provider errors, dirty unpushed work, and remote mismatch do not settle
+ownership. Capture run names, event excerpts, source state, and successor
+identity for both paths. Do not close #327 until this deployed smoke succeeds.
+
 Dispatch and Courier are independent systems connected by an adapter, not hard
 dependencies. Dispatch #1259 supplies dedicated fenced capacity handoff APIs;
 only the Dispatch adapter knows their HTTP routes, issued claim/handout receipts,
@@ -1548,15 +1590,49 @@ settlement validates the returned resolution rather than treating HTTP 200 as
 proof of release. Ordinary external waits and task failures keep their existing
 semantics; capacity exhaustion does not first park the queue as an external wait.
 
-The core requires trusted secure-executor workspace evidence before invoking
-`CapacityRecoveryPreparer` and `CapacityRecovery`. Legacy or missing evidence,
-dirty work, and unknown remote state hold ownership. The current native evidence
-producer proves only a clean, unchanged integration workspace safe; committed
-work is safe only when a fresh trusted broker snapshot confirms the existing
-work ref at exactly the integration HEAD; local-only commits remain held.
-Evidence absence and a run UID are not proof. No automatic dirty-work transfer
-is claimed. Source-specific receipts are sensitive opaque metadata, never model
-inputs or capacity identities.
+The core requires trusted, semantically validated workspace evidence before
+invoking `CapacityRecoveryPreparer` and `CapacityRecovery`. The native control
+runtime's workspace observer is the trusted producer; model-writable terminal
+text and legacy OpenCode termination labels are not trusted evidence. Missing
+evidence, dirty work, malformed claims, and unknown remote state hold ownership.
+The native producer proves only a clean, unchanged integration workspace safe;
+committed work is safe only when a fresh trusted broker snapshot confirms the
+existing work ref at exactly the integration HEAD; local-only commits remain
+held. Evidence absence and a run UID are not proof. No automatic dirty-work
+transfer is claimed. Source-specific receipts are sensitive opaque metadata,
+never model inputs or capacity identities.
+
+Legacy recovery uses a separate workspace-observer container and UID in the
+existing coordinator pod. A trusted init container pins the initial remote head
+before OpenCode starts. Only the observer mounts its private baseline, Kubernetes
+read token, and termination output; the writer mounts none of these. The observer
+uses a run-scoped service account with `get` permission for its own pod only.
+The complete run-scoped identity — ServiceAccount, Role, RoleBinding — is
+provisioned and ownership-verified before the coordinator pod is created, so a
+foreign same-named resource is never admitted under or silently adopted; a
+provisioning failure releases the claim only when the slot is proven empty,
+otherwise it stays Claimed as provisioning-in-flight. It
+waits for kubelet's coordinator-container `Terminated` state before reading the
+workspace read-only. Process-group cancellation is not itself release proof.
+
+The observer never runs Git in the writer's repository. It fetches the
+operator-pinned remote URL and exact branch into private storage, disregarding
+workspace Git configuration, hooks, index, replacement refs, and alternates. It
+compares every workspace file (including ignored/untracked files, excluding only
+the root `.git` directory) against the trusted remote tree, including modes and
+symlink targets. Unsupported/submodule trees, unreadable paths, local-only heads,
+and ambiguity fail closed. An absent work branch can be `empty` only when the
+workspace matches the independently pinned baseline; existing branches require
+an exact freshly fetched `pushed` head.
+
+The operator re-reads the pod uncached, verifies the run owner UID, pod UID,
+writer container ID, isolated observer specification, protected init baseline,
+and observer termination result before persisting safety evidence. Model-written
+executor termination text remains a claim only. The existing source recovery
+path still waits for the entire pod to terminate and applies its unchanged
+source fencing, capacity cooldown, retained-history, and successor rules. Native
+workspace observation remains unchanged. Keep #327 open until both legacy
+handoff paths and the isolated deployment smoke have recorded passing evidence.
 
 PR-fix reports carry the stable settlement idempotency key and must return a
 matching deferred resolution. Dispatch issue handoff currently lacks a durable
@@ -1891,6 +1967,39 @@ named items remain unresolved and must not be described as production-ready:
 
 ## Decisions
 
+- **2026-10-17 — #327 review: raw child exit 2 is an ordinary crash, never a
+  declaration.** The executor special-cased the child's raw exit status 2 —
+  numerically Courier's own NeedsHuman constant — into a permanent
+  `Failed(model-transport-error)` before the availability budget, stranding
+  exactly the outage this PR recovers from. Removed the special case: every
+  raw nonzero child status takes the shared recovery path (availability budget
+  without a session, task continuations with one, recoverable
+  `provider-unavailable` handoff when either is spent). NeedsHuman stays
+  reserved for verified outcome declarations; operator cancellation stays a
+  plain Failed. Supersedes the 2026-09-29 note that "a raw child exit 2
+  remains a failure". (#368)
+- **2026-10-17 — #327 review: verify the observer identity before the pod can
+  run.** Launch previously assigned the run-scoped ServiceAccount, created it
+  best-effort with the error ignored, and verified SA/Role/RoleBinding
+  ownership only after the coordinator pod create — so a foreign same-named
+  identity could admit the writer, and a post-create provisioning failure
+  released the Dispatch claim while that writer kept working, violating the
+  single-writer guarantee. Provisioning now fully precedes the create and
+  never adopts unowned resources; a pre-creation failure surfaces as a plain
+  error only when the slot is proven empty through the uncached reader,
+  otherwise as `ErrProvisioningInFlight` so the run stays Claimed. The #217
+  collision contract is unchanged. (#368)
+- **2026-10-16 — #327: availability handoff for outages without quota evidence.**
+  Repeated no-session crashes (provider outage, transport failure) previously
+  terminalized runs as Failed and stranded the work item, because the shared
+  continuation budget was designed for task repair. Added a separate bounded,
+  backed-off availability budget in the executor that ends the run via the
+  existing fenced capacity-recovery channel with a new `provider-unavailable`
+  diagnostic category. No second state machine; the category keeps the claim
+  honest — an outage is not a quota verdict — and settlement still fails closed
+  on unsafe or unverifiable workspace evidence. Chosen because keeping work
+  moving outweighs failing fast: an idle local capacity on a claimed item is
+  the failure mode this feature exists to end.
 - **2026-10-17 — #377: the operator's own observation reads resolve their
   destination through the selected registration, the same routing admission
   was given in #340/#378.** Post-review PR observation, existing-PR head
