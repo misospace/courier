@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"net/url"
 	"sort"
+	"sync"
 	"time"
 )
 
@@ -119,12 +120,57 @@ func isProbeRetryable(err error) bool {
 }
 
 // BrokerProbeClient reaches the run's broker's typed API over TLS with the
-// control pod's projected broker-audience token.
+// control pod's projected broker-audience token. The token is read per
+// request from TokenSource: kubelet rotates the projected file, and a probe
+// client holding the bytes it read at startup would report a stale identity.
 type BrokerProbeClient struct {
-	BaseURL string
-	Token   []byte
-	CA      []byte
-	HTTP    *http.Client
+	BaseURL     string
+	TokenSource BrokerTokenSource
+	CA          []byte
+	HTTP        *http.Client
+
+	// mu guards owned, the client built once and shared by every probe this
+	// BrokerProbeClient makes for itself, so repeated probes reuse one idle
+	// connection pool instead of accumulating abandoned ones.
+	mu    sync.Mutex
+	owned *http.Client
+}
+
+func (b *BrokerProbeClient) transport() (*http.Client, error) {
+	if b.HTTP != nil {
+		return b.HTTP, nil
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.owned != nil {
+		return b.owned, nil
+	}
+	pool := x509.NewCertPool()
+	if !pool.AppendCertsFromPEM(b.CA) {
+		return nil, &BrokerProbeError{Msg: "broker CA is unreadable"}
+	}
+	b.owned = &http.Client{
+		Timeout: 30 * time.Second,
+		Transport: &http.Transport{
+			TLSClientConfig:     &tls.Config{RootCAs: pool, ServerName: hostOnly(b.BaseURL), MinVersion: tls.VersionTLS13},
+			MaxIdleConns:        brokerMaxIdleConns,
+			MaxIdleConnsPerHost: brokerMaxIdleConnsPerHost,
+			IdleConnTimeout:     brokerIdleConnTimeout,
+		},
+	}
+	return b.owned, nil
+}
+
+// CloseIdleConnections releases the idle pool of the transport this client
+// built for itself. A supplied HTTP client belongs to whoever supplied it:
+// this never touches it.
+func (b *BrokerProbeClient) CloseIdleConnections() {
+	b.mu.Lock()
+	owned := b.owned
+	b.mu.Unlock()
+	if owned != nil {
+		owned.CloseIdleConnections()
+	}
 }
 
 // BrokerCapabilities is the redacted capability report served by the
@@ -149,23 +195,22 @@ type BrokerCapabilities struct {
 // maps to a fixed, safe diagnostic; transport-class failures are marked
 // retryable.
 func (b *BrokerProbeClient) Capabilities(ctx context.Context) (*BrokerCapabilities, error) {
-	transport := b.HTTP
-	if transport == nil {
-		pool := x509.NewCertPool()
-		if !pool.AppendCertsFromPEM(b.CA) {
-			return nil, &BrokerProbeError{Msg: "broker CA is unreadable"}
-		}
-		serverName := hostOnly(b.BaseURL)
-		transport = &http.Client{
-			Timeout:   30 * time.Second,
-			Transport: &http.Transport{TLSClientConfig: &tls.Config{RootCAs: pool, ServerName: serverName, MinVersion: tls.VersionTLS13}},
-		}
+	token, err := resolveBrokerToken(b.TokenSource)
+	if err != nil {
+		// A probe never fails the run: an unreadable projection reports
+		// unavailable capabilities, retryably, and the underlying read error
+		// text is dropped rather than surfaced.
+		return nil, &BrokerProbeError{Msg: "broker token is unavailable", Retryable: true}
+	}
+	transport, err := b.transport()
+	if err != nil {
+		return nil, err
 	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, trimSuffix(b.BaseURL, "/")+"/v1/capabilities", nil)
 	if err != nil {
 		return nil, &BrokerProbeError{Msg: "broker capabilities request is malformed"}
 	}
-	req.Header.Set("Authorization", "Bearer "+string(b.Token))
+	req.Header.Set("Authorization", "Bearer "+string(token))
 	resp, err := transport.Do(req)
 	if err != nil {
 		return nil, &BrokerProbeError{Msg: "broker is unreachable", Retryable: true}

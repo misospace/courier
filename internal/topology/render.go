@@ -54,10 +54,13 @@ const (
 	CredKeyGitToken      = "git-token"
 )
 
-// Labels returns the standard label set for one component of one run.
+// Labels returns the standard label set for one component of one run. The
+// run label value is bounded and sanitized (RunLabelValue) so every rendered
+// object passes Kubernetes label validation for every supported CoderRun
+// name.
 func Labels(runName, component string) map[string]string {
 	return map[string]string{
-		LabelRun:                          runName,
+		LabelRun:                          RunLabelValue(runName),
 		"courier.misospace.dev/component": component,
 		labelAppComponent:                 component,
 		labelAppManagedBy:                 "courier",
@@ -320,7 +323,7 @@ func BrokerService(run *courier.CoderRun) *corev1.Service {
 		Spec: corev1.ServiceSpec{
 			Type: corev1.ServiceTypeClusterIP,
 			Selector: map[string]string{
-				LabelRun:                          run.Name,
+				LabelRun:                          RunLabelValue(run.Name),
 				"courier.misospace.dev/component": ComponentBroker,
 			},
 			Ports: []corev1.ServicePort{
@@ -341,7 +344,7 @@ func WorkerService(run *courier.CoderRun) *corev1.Service {
 			Type:      corev1.ServiceTypeClusterIP,
 			ClusterIP: "None",
 			Selector: map[string]string{
-				LabelRun:                          run.Name,
+				LabelRun:                          RunLabelValue(run.Name),
 				"courier.misospace.dev/component": ComponentWorker,
 			},
 			Ports: []corev1.ServicePort{

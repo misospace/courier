@@ -2070,6 +2070,26 @@ func (r *recordingReader) Get(ctx context.Context, key client.ObjectKey, object 
 	return r.Reader.Get(ctx, key, object, opts...)
 }
 
+// runRecordingReader records the CoderRun reads that reach it. recordingReader
+// alone cannot say which read a path made uncached — any Get or List satisfies
+// it, and the relaunch reads both the run and the pod — so this pins the
+// counter read the crashloop ceiling is judged from.
+type runRecordingReader struct {
+	client.Reader
+	runReads int
+}
+
+func (r *runRecordingReader) List(ctx context.Context, list client.ObjectList, opts ...client.ListOption) error {
+	return r.Reader.List(ctx, list, opts...)
+}
+
+func (r *runRecordingReader) Get(ctx context.Context, key client.ObjectKey, object client.Object, opts ...client.GetOption) error {
+	if _, ok := object.(*courier.CoderRun); ok {
+		r.runReads++
+	}
+	return r.Reader.Get(ctx, key, object, opts...)
+}
+
 // inertControlPod turns a live secure control pod into the shape the secure
 // relaunch treats as evidence: a terminal object Kubernetes never recorded a
 // coordinator exit for (an eviction), so it can never report a run outcome.
@@ -2420,4 +2440,178 @@ func TestFenceAndRelaunchToleratesControlPodVanishingBeforeReread(t *testing.T) 
 	if err := c.Get(ctx, types.NamespacedName{Namespace: run.Namespace, Name: topology.BrokerPodName(run.Name)}, &got); !apierrors.IsNotFound(err) {
 		t.Fatalf("broker pod must be fenced, got %v", err)
 	}
+}
+
+// TestSecureBrokenTopologyReobservesWhenControlPodWasReplaced pins #370's UID
+// arm inside the secure topology: the control object the broken-topology
+// relaunch tears down is the one it observed, never the name it holds. A control
+// pod replaced between the live read and the delete conflicts instead of being
+// deleted by name, and the conflict is a re-observation — no fence, no charge —
+// the same discipline checkLiveness applies before it reaps a replaced
+// coordinator (#105; the liveness precedent is
+// TestReapDeleteConflictsWhenPodWasReplaced).
+func TestSecureBrokenTopologyReobservesWhenControlPodWasReplaced(t *testing.T) {
+	ctx := context.Background()
+	const (
+		replacementControlUID = types.UID("replacement-control-uid")
+		observedControlUID    = types.UID("observed-control-uid")
+	)
+	control, store, run := brokenWorkerSecureRound(t, "secure-replaced-control", 0)
+	controlKey := types.NamespacedName{Namespace: run.Namespace, Name: topology.ControlPodName(run.Name)}
+	// The store already holds the replacement control pod — the delete/recreate
+	// happened before this reconcile — while the live read it makes still
+	// observes the previous incarnation's UID.
+	var replacement corev1.Pod
+	if err := store.Get(ctx, controlKey, &replacement); err != nil {
+		t.Fatal(err)
+	}
+	replacement.UID = replacementControlUID
+	// Naming the coordinator container is what makes the live reader's UID
+	// rewrite apply, standing in for a server whose coordinator object still
+	// carries the UID this reconcile observed.
+	replacement.Spec.Containers[0].Name = topology.ControlContainerName
+	if err := store.Update(ctx, &replacement); err != nil {
+		t.Fatal(err)
+	}
+	enforcing := &uidEnforcingClient{Client: store}
+	control.Client = enforcing
+	control.APIReader = uidRewriteReader{Client: store, visibleUID: observedControlUID}
+
+	result, handled, err := control.ObserveTopology(ctx, run, listRunPods(t, store, run))
+	if err != nil || !handled {
+		t.Fatalf("handled=%v err=%v, want the broken topology handled", handled, err)
+	}
+	if result.RequeueAfter != secureRequeueDelay || result.Requeue {
+		t.Fatalf("result = %+v, want a bounded re-observation after the conflict; a conflicted delete must not act", result)
+	}
+	if len(enforcing.preconditions) == 0 {
+		t.Fatal("the relaunch delete carried no UID precondition; a pod must never be deleted by name alone")
+	}
+	// The precondition must be the UID this reconcile observed, not merely some
+	// precondition: a delete that named the live object's UID would delete the
+	// replacement this arm is about.
+	if got := enforcing.preconditions[0]; got != observedControlUID {
+		t.Fatalf("delete precondition UID = %q, want the observed control pod's UID %q", got, observedControlUID)
+	}
+	var updated courier.CoderRun
+	if err := store.Get(ctx, client.ObjectKeyFromObject(run), &updated); err != nil {
+		t.Fatal(err)
+	}
+	if updated.Status.Phase != courier.PhaseRunning || updated.Status.Restarts != 0 {
+		t.Fatalf("state = phase %q restarts %d, want no charge; the decision was made on a world that no longer exists",
+			updated.Status.Phase, updated.Status.Restarts)
+	}
+	var survived corev1.Pod
+	if err := store.Get(ctx, controlKey, &survived); err != nil {
+		t.Fatalf("the replacement control pod must survive the stale decision: %v", err)
+	}
+	if survived.UID != replacementControlUID {
+		t.Fatalf("control pod UID = %q, want the store's own object %q untouched by the stale decision", survived.UID, replacementControlUID)
+	}
+	if survived.DeletionTimestamp != nil {
+		t.Fatal("the replacement control pod carries a deletion; a conflicting delete must tear nothing down")
+	}
+	var got corev1.Pod
+	if err := store.Get(ctx, types.NamespacedName{Namespace: run.Namespace, Name: topology.WorkerPodName(run.Name)}, &got); err != nil {
+		t.Fatalf("worker must still stand; a conflicted delete does not fence the round: %v", err)
+	}
+	if err := store.Get(ctx, types.NamespacedName{Namespace: run.Namespace, Name: topology.BrokerPodName(run.Name)}, &got); err != nil {
+		t.Fatalf("broker pod must still stand; a conflicted delete does not fence the round: %v", err)
+	}
+}
+
+// TestSecureBrokenTopologyJudgesCeilingFromLiveRun pins #370's counter arm: the
+// crashloop ceiling the secure relaunch consults is the API server's own counter
+// on the live run, never the cached status the reconcile happens to carry. The
+// cached run's counter can read low (a run that already sits on the ceiling
+// would relaunch one more round past it) or high (a run the world has reset
+// would hand off to a human over a counter nobody holds). Both directions are
+// bounded by the world counter shared with the other relaunch paths (#216), and
+// the read itself goes through the uncached reader (§6).
+func TestSecureBrokenTopologyJudgesCeilingFromLiveRun(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("StaleLowCachedCounterTerminalizesAtWorldCeiling", func(t *testing.T) {
+		control, c, run := brokenWorkerSecureRound(t, "secure-live-ceiling", 0)
+		control.MaxRestarts = 1
+		// The ceiling hand-off terminalizes through the patcher, which needs the
+		// source registry the plain secure helper does not wire.
+		control.Patcher = &CoderRunReconciler{
+			Client:       c,
+			Sources:      NewSourceRegistry(map[string]source.Adapter{"manual": &admissionSource{}}),
+			StatusWriter: fakeStatusWriter{client: c},
+		}
+		// The world's counter already sits on the configured ceiling; the run this
+		// reconcile carries is stale and reads 0.
+		var stored courier.CoderRun
+		if err := c.Get(ctx, client.ObjectKeyFromObject(run), &stored); err != nil {
+			t.Fatal(err)
+		}
+		stored.Status.Restarts = 1
+		if err := c.Status().Update(ctx, &stored); err != nil {
+			t.Fatal(err)
+		}
+		api := &runRecordingReader{Reader: c}
+		control.APIReader = api
+		if err := c.Create(ctx, topology.BrokerService(run)); err != nil {
+			t.Fatal(err)
+		}
+		controlKey := types.NamespacedName{Namespace: run.Namespace, Name: topology.ControlPodName(run.Name)}
+
+		_, handled, err := control.ObserveTopology(ctx, run, listRunPods(t, c, run))
+		if err != nil || !handled {
+			t.Fatalf("handled=%v err=%v, want the broken topology handled", handled, err)
+		}
+		if api.runReads == 0 {
+			t.Fatal("the ceiling judgement must read the run through the uncached APIReader, not the cached Client")
+		}
+		var updated courier.CoderRun
+		if err := c.Get(ctx, client.ObjectKeyFromObject(run), &updated); err != nil {
+			t.Fatal(err)
+		}
+		if updated.Status.Phase != courier.PhaseNeedsHuman {
+			t.Fatalf("phase = %q, want NeedsHuman: the world's counter sits on the configured ceiling (%d) whatever the cached run carries",
+				updated.Status.Phase, control.MaxRestarts)
+		}
+		if updated.Status.Restarts != 1 {
+			t.Fatalf("restarts = %d, want 1 (the world's ceiling is preserved, not incremented)", updated.Status.Restarts)
+		}
+		// The control object is still recoverable, so it is deleted at the ceiling:
+		// nothing withholds its deterministic name from a replacement that will
+		// never come.
+		var got corev1.Pod
+		if err := c.Get(ctx, controlKey, &got); !apierrors.IsNotFound(err) {
+			t.Fatalf("a recoverable control object must be deleted at the ceiling, got %v", err)
+		}
+	})
+
+	t.Run("StaleHighCachedCounterRelaunchesAgainstWorldCounter", func(t *testing.T) {
+		control, c, run := brokenWorkerSecureRound(t, "secure-live-counter", 0)
+		// The cached run's counter sits on the package default ceiling while the
+		// world's counter is 0: the world wins, so the round relaunches instead of
+		// handing off over a counter nobody holds.
+		cached := run.DeepCopy()
+		cached.Status.Restarts = defaultMaxRestarts
+		api := &runRecordingReader{Reader: c}
+		control.APIReader = api
+
+		result, handled, err := control.ObserveTopology(ctx, cached, listRunPods(t, c, cached))
+		if err != nil || !handled {
+			t.Fatalf("handled=%v err=%v, want the broken topology handled", handled, err)
+		}
+		if api.runReads == 0 {
+			t.Fatal("the ceiling judgement must read the run through the uncached APIReader, not the cached Client")
+		}
+		if !result.Requeue || result.RequeueAfter != 0 {
+			t.Fatalf("result = %+v, want an immediate relaunch below the world's ceiling", result)
+		}
+		var updated courier.CoderRun
+		if err := c.Get(ctx, client.ObjectKeyFromObject(run), &updated); err != nil {
+			t.Fatal(err)
+		}
+		if updated.Status.Phase != courier.PhaseClaimed || updated.Status.Restarts != 1 {
+			t.Fatalf("state = phase %q restarts %d, want Claimed/1 charged as the world's counter plus one; a stale high counter must not hand off",
+				updated.Status.Phase, updated.Status.Restarts)
+		}
+	})
 }

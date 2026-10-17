@@ -784,6 +784,27 @@ func (r *CoderRunReconciler) observeRunning(ctx context.Context, run *courierv1a
 		if !terminated {
 			continue
 		}
+		// A coordinator whose deletion is in flight is being deliberately
+		// torn down: its recorded exit belongs to that teardown, not to the
+		// model's work, and the two are indistinguishable — a wedge-reaped
+		// coordinator can carry a cancelled-stream failure exit or even exit
+		// 0 inside the shutdown window. Never map it, exactly as
+		// topologyBroken, coordinatorPodOf and activeOperationValid treat a
+		// terminating pod: checkLiveness re-observes the transition, and the
+		// disappearance backstop takes the deferred relaunch charge once the
+		// object is provably gone. The mirror case — a meaningful exit
+		// followed by deletion of the object (node drain, manual delete) —
+		// takes the same pod-loss relaunch by decision: a timestamp ordering
+		// test cannot separate the cases, because graceful deletion stamps
+		// deletionTimestamp with a value of the request plus the grace
+		// period, while the kubelet may end the SIGTERM'd container at any
+		// point after the request — a teardown exit can therefore read as
+		// finished before the stamp's value. A deleted coordinator is
+		// untrusted by construction, and the resumed run re-reads the
+		// world. (#369)
+		if pod.DeletionTimestamp != nil {
+			continue
+		}
 		phase := phaseForExit(run.Spec.Mode, exitCode, terminationOutcome)
 		if phase == courierv1alpha1.PhaseVerifying {
 			before := run.DeepCopy()
@@ -808,9 +829,30 @@ func (r *CoderRunReconciler) observeRunning(ctx context.Context, run *courierv1a
 		// A no_change_needed fix-pr run no longer terminalizes directly: it
 		// is routed to Verifying, which settles it against the world.
 		intent := terminalLifecycleIntent{}
-		if message, valid := parseCoordinatorTermination(pod); valid &&
-			terminationOutcome == string(executor.OutcomeCapacityExhausted) && r.Secure != nil {
-			run.Status.WorkspaceSafety = boundedWorkspaceSafety(message.WorkspaceSafety)
+		if terminationOutcome == string(executor.OutcomeCapacityExhausted) {
+			evidenceBefore := run.DeepCopy()
+			if r.Secure != nil {
+				if message, valid := parseCoordinatorTermination(pod); valid {
+					run.Status.WorkspaceSafety = boundedWorkspaceSafety(message.WorkspaceSafety)
+				}
+			} else {
+				safety, pending, err := r.legacyWorkspaceObservation(ctx, run, pod)
+				if err != nil {
+					return ctrl.Result{}, err
+				}
+				if pending {
+					return ctrl.Result{RequeueAfter: observationRequeueDelay}, nil
+				}
+				run.Status.WorkspaceSafety = safety
+				if safety != nil {
+					intent.conditions = append(intent.conditions, legacyObservationCondition(run, metav1.NewTime(r.clock())))
+				}
+			}
+			if !reflect.DeepEqual(evidenceBefore.Status.WorkspaceSafety, run.Status.WorkspaceSafety) {
+				if err := r.patchStatus(ctx, evidenceBefore, run); err != nil {
+					return ctrl.Result{}, err
+				}
+			}
 		}
 		if phase == courierv1alpha1.PhaseBlockedExternal {
 			intent.error = terminationReason
@@ -1758,7 +1800,8 @@ func podBelongsToRun(pod *corev1.Pod, run *courierv1alpha1.CoderRun) bool {
 			return true
 		}
 	}
-	return pod.Labels[executor.LabelRun] == run.Name
+	label := pod.Labels[executor.LabelRun]
+	return label == executor.RunLabelValue(run.Name) || label == topology.RunLabelValue(run.Name)
 }
 
 type terminationMessage struct {

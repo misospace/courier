@@ -1,10 +1,12 @@
 # HARNESS.md — Durable Coordinator Harness
 
-Design pass for the resumable coordinator harness (#8), consuming the forge
-capability boundary (#80) and credential/process isolation problem (#104). It
-settles the trust and execution contract; it does not implement it. The current
-OpenCode bootstrap remains an explicitly insecure legacy mode until a safe
-replacement is proven.
+The trust and execution contract for the resumable coordinator harness (#8),
+consuming the forge capability boundary (#80) and credential/process isolation
+problem (#104). The topology it settles has landed and is available as the
+opt-in deployment-level secure mode (`--secure-mode`); §11 records what is
+still unwired, chiefly the native path's forge reads and PR creation (#127) and
+the Go dependency cache (#136). The OpenCode bootstrap remains the default,
+explicitly insecure legacy mode until a safe replacement is proven.
 
 DESIGN.md remains authoritative. In particular: inform, don't constrain model
 behavior; git, the PR, and CI are source of truth; no wall-clock run deadlines;
@@ -455,7 +457,9 @@ paths share acceptance, not implementation.
   rather than being adopted, re-targeted, or paralleled. Both
   paths share one `applyHandoffPlan` helper (formerly
   `applyLinkagePlan`, #282), which applies the criterion-evidence
-  contract (§4) to the same live body alongside linkage, so the check
+  contract (§4) to the same live body alongside linkage — including its
+  legacy-only referential check that cited file paths exist in the head
+  the observation just verified (#367) — so the check
   behaves identically regardless of how the run reached `Verifying`:
   - On a published PR with a body that disagrees with the trusted
     identity, the run asks the captured OpenCode session to
@@ -626,7 +630,88 @@ the reviewer, who reads each criterion's citations next to the linked
 issue. Boundary implementations may additionally verify that cited *paths*
 exist in the proposed head (the legacy executor holds the run branch
 locally; the native engine may read the tree at the proposed OID) —
-existence is referential integrity, still not semantics. No component of
+existence is referential integrity, still not semantics. The legacy
+pre-handoff plan does exactly that, and only that (#367): a body the
+validator *passed* has the file paths cited by its
+`implementation-evidence` and `regression-check` rows probed against the
+exact pushed head `confirmRemotePublication` just verified, in the run's
+own workspace, through the hardened-git environment (`ls-tree <head> --
+<path>`; stderr dropped, no config trust). Properties of the check, each
+deliberate:
+
+- **Non-semantic.** It asks whether the cited file is in that tree. It
+  never reads, fetches, or interprets a citation, and whether the cited
+  check enforces its criterion stays the reviewer's audit.
+- **Citations only.** Only `implementation-evidence` and
+  `regression-check` rows are probed — the two statuses whose reference
+  the contract requires to be a file path or a check URL, so their
+  reference is a claim about a citable artifact. `manual-verification`
+  and `not-implemented` carry a free-text note and `unknown` carries
+  none; probing prose would manufacture defects the model could only
+  "fix" by mislabelling the criterion.
+- **URLs are never fetched.** A reference containing `://` is dropped
+  whole before extraction, so a URL's host and path can never read as a
+  path. No network call happens here at all beyond git plumbing against
+  the local repository.
+- **Paths are extracted by the validator's own grammar.** Whitespace
+  tokens, `://` dropped, then the validator's path alternative
+  (`[A-Za-z0-9_.-]+(/[A-Za-z0-9_.()-]+)+`) — so a bare top-level name is
+  not a citable location and is never probed. Candidates are normalized
+  (leading `./` dropped, `:12`, `:12-40` and `::TestName` suffixes cut,
+  `..`/`.`/empty segments and a leading `-` rejected) and deduplicated.
+  What survives that charset admits no whitespace, `:` or quote, no glob
+  or pathspec-magic character, and never begins with `-`, so a candidate
+  can neither split the argv it travels in nor be read as an option or a
+  pathspec expression; `(` and `)` *can* survive and are inert, because
+  the hardened boundary builds an argv directly and no shell ever sees
+  the value. That restriction is what permits sanitized text from a
+  model-authored body to reach `git` at all, and the caller owns it —
+  `internal/git` does not sanitize. The candidate is passed as the
+  pathspec after `--`, never as part of a `rev:path` argument. The
+  candidate count is bounded by the operator-pinned set (`MaxCriteria`
+  rows, `MaxReferenceBytes` per reference); the executor adds no cap of
+  its own.
+- **Candidates are rooted at the published tree before they are
+  probed.** A repository path starts at a real top-level entry of the
+  commit, so the check reads that commit's top-level entry names once
+  (`ls-tree -z --full-name <head>`, no pathspec, no recursion — bounded
+  by the number of top-level entries, not by the tree's size; blob and
+  tree names both count) and keeps only the candidates whose first
+  segment is one of them. Everything else is prose this check cannot
+  speak about: a ratio ("3/4"), a date ("2026/10/17"), a port
+  ("8080/health"), another repository's path, a module path, a job name.
+  Extraction is deliberately over-matching — it judges shape, not
+  meaning — so rooting is what separates a path from a token that merely
+  contains a slash, and the trade-off is stated: an absent path under a
+  real top-level entry is still found and still named, while a citation
+  the extractor cannot resolve to a path-shaped candidate, or whose
+  top-level entry the published head does not carry, is left alone
+  rather than guessed at.
+- **Fails open.** A candidate is named only on the positive observation
+  that reports its absence: exit success with empty output. Any probe
+  that cannot be completed — unresolvable head, unreadable top-level
+  listing, git unavailable, cancelled context — yields no finding and no
+  error, as does a citation that survived extraction but rooted nowhere.
+  (`ls-tree` rather than `cat-file -e` for exactly this reason: git
+  exits 128 for both an absent path and an unreadable head, so exit
+  status cannot separate absence from probe failure.) The one
+  fail-open verdict in a plan that is otherwise fail-closed, because a
+  defect the model cannot repair by editing the body must never be handed
+  to it as one. No new cap, budget, timer, or gate.
+- **Rides the existing repair.** A named missing path is a criterion
+  defect: it earns the same bounded `criteria-repair` continuation as a
+  validator error, the same combined `body-repair` when linkage also
+  failed, and both `NeedsHuman` reasons name the paths and the probed
+  head's short sha. One shared #170 slot, no second budget, and the
+  repair instruction states the observation plus the two honest options
+  — cite a path that exists in the published head, or record the
+  criterion honestly (e.g. a `manual-verification` row with a note) —
+  rather than adding a rule the pinned set does not carry.
+- **Unchanged without a pin.** No envelope pinned, or an empty pinned
+  set, remains a vacuous pass with no probe and no finding, exactly as
+  before (#249).
+
+No component of
 this contract runs tests, interprets reference text, or grows an LLM proof
 system.
 
@@ -645,9 +730,14 @@ native engine refuses the `CreatePullRequest` (or body update) with the
 structured `*CriteriaError` before any forge write; the legacy path asks
 the captured OpenCode session to repair the body under the **same** #170
 continuation budget as linkage — one combined repair instruction naming
-every violation (both contracts' failures, the trusted identity, the
+every violation (both contracts' failures, the trusted identity,
 pinned criteria verbatim, the exact grammar, the PR number, the remaining
-budget), so one continuation can fix both. When the budget is exhausted,
+budget), so one continuation can fix both. A citation of a file the
+published head does not carry joins that class on the legacy path only
+(#367, described above): it rides the identical bounded repair — one
+`criteria-repair`, or one combined `body-repair` when linkage also failed,
+one #170 slot — and the instruction names the paths and the probed head
+instead of adding a rule. When the budget is exhausted,
 no session was captured, or the run is shutting down, the legacy path
 terminates `NeedsHuman` with reason `incomplete handoff: criterion
 evidence …` (category `verifier-rejection`), preserving the declared
@@ -964,7 +1054,7 @@ typed brief carrying a stable `briefID` (unique within the run), objective,
 settled decisions with exact values, owned files, non-goals, and an observable
 success check. Each dispatch or cancellation is a signed canonical envelope
 containing the `CoderRun` UID, control-pod UID, worker-pod UID, `briefID`,
-`opID`, kind (`dispatch` or `cancel`), payload digest, sequence, nonce, and
+`opID`, kind (`dispatch`, `cancel`, or `release`), payload digest, sequence, nonce, and
 admission expiration. Expiration limits admission/replay only; it is not an
 operation-duration limit. The worker verifies the Ed25519 signature using the public key provisioned
 by the operator, checks the payload digest and exact run,
@@ -977,14 +1067,23 @@ the original operation. A cancellation tombstone is
 accepted even if it arrives before dispatch. If cancel precedes dispatch, the worker tombstones the ID and must never run
 that dispatch. A tombstone is final for its `opID`: any later dispatch or
 retry with that ID is rejected, regardless of arrival order; new work gets a
-fresh `opID` after termination is confirmed. The worker acknowledges cancellation
-only after verified process termination (or confirmation it never started); only then may trusted control clear
+fresh `opID` after termination is confirmed. Each task leads its own process
+group, so cancellation terminates the task's whole tree — the tasks that reach
+the worker are `sh -c ...`, whose real work runs in descendants — and the
+worker acknowledges cancellation only after it has proven that no live process
+remains in that group (or confirmation it never started). Work that leaves the
+group cannot be proven gone, so it is reported as unverified rather than
+acknowledged, and trusted control keeps the operation's active status until
+termination is verified. Only then may trusted control clear
 active-operation status. A replacement worker (new pod UID) that never saw
 that `opID` treats a late cancel as unknown data and runs nothing; the
 authoritative termination of a fenced stale worker is the operator's pod kill,
 and op cleanup follows observed pod termination, not a worker acknowledgement.
 A worker result is keyed by `briefID` and contains a
-summary and artifact bundle, all treated as untrusted.
+summary and artifact bundle, all treated as untrusted. Control releases a
+consumed result payload with a signed release envelope bound to the same
+`opID`; the worker retains only the compact terminal status and continues to
+reject redelivery of that `opID`.
 
 If dispatch transport fails ambiguously, control does not automatically
 redeliver: it cancels and reconciles until process termination is proven. If

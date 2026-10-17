@@ -3,6 +3,7 @@ package topology
 import (
 	"crypto/x509"
 	"encoding/pem"
+	"strings"
 	"testing"
 
 	"github.com/misospace/courier/internal/forge"
@@ -12,6 +13,7 @@ import (
 	networkingv1 "k8s.io/api/networking/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/util/validation"
 
 	courier "github.com/misospace/courier/api/v1alpha1"
 )
@@ -390,5 +392,149 @@ func TestResourceNamesStayUniqueAndStable(t *testing.T) {
 	}
 	if ControlPodName("short") != "short-control" {
 		t.Fatalf("short name = %q", ControlPodName("short"))
+	}
+}
+
+func TestServiceNamesAreValidDNSLabels(t *testing.T) {
+	names := []string{
+		"short",
+		"run.test",
+		"9lives",
+		"12345",
+		"9.lives.and.bones",
+		strings.Repeat("a", 60),
+		strings.Repeat("a", 59) + "x",
+		strings.Repeat("a", 59) + "y",
+		strings.Repeat("z", 253),
+		strings.Repeat("a.b", 84) + "c",
+	}
+	for _, name := range names {
+		if errs := validation.IsDNS1123Subdomain(name); len(errs) > 0 {
+			t.Fatalf("test input %q is not a supported CoderRun name: %v", name, errs)
+		}
+		for _, got := range []struct {
+			kind string
+			fn   func(string) string
+		}{{"broker", BrokerServiceName}, {"worker", WorkerServiceName}} {
+			svc := got.fn(name)
+			if errs := validation.IsDNS1035Label(svc); len(errs) > 0 {
+				t.Errorf("%s Service name for run %q = %q: %v", got.kind, name, svc, errs)
+			}
+			if again := got.fn(name); again != svc {
+				t.Errorf("%s Service name for run %q is not stable: %q then %q", got.kind, name, svc, again)
+			}
+		}
+	}
+	if BrokerServiceName("short") != "short-broker" || WorkerServiceName("short") != "short-worker" {
+		t.Fatalf("valid short names must pass through unchanged: %q %q",
+			BrokerServiceName("short"), WorkerServiceName("short"))
+	}
+	if BrokerServiceName("run.test") == BrokerServiceName("run-test") {
+		t.Fatal("dotted run name must not collide with its hyphenated form")
+	}
+	if BrokerServiceName("9lives") == WorkerServiceName("lives9") {
+		t.Fatal("distinct run names must not collide")
+	}
+	sharedPrefixA := BrokerServiceName(strings.Repeat("a", 59) + "x")
+	sharedPrefixB := BrokerServiceName(strings.Repeat("a", 59) + "y")
+	if sharedPrefixA == sharedPrefixB {
+		t.Fatalf("run names differing past the truncation point collide: %q", sharedPrefixA)
+	}
+	for _, name := range []string{"short", "run.test", "12345", strings.Repeat("a", 60)} {
+		if BrokerServiceName(name) == WorkerServiceName(name) {
+			t.Fatalf("run %q broker and worker Services collide: %q", name, BrokerServiceName(name))
+		}
+	}
+	if BrokerServiceDNS("ns", "run.test") != BrokerServiceName("run.test")+".ns.svc.cluster.local" {
+		t.Fatal("broker DNS must derive from the canonical Service name")
+	}
+	if WorkerServiceDNS("ns", "9lives") != WorkerServiceName("9lives")+".ns.svc.cluster.local" {
+		t.Fatal("worker DNS must derive from the canonical Service name")
+	}
+}
+
+func TestRenderedServicesCarryValidNames(t *testing.T) {
+	for _, name := range []string{"short", "run.test", "9lives", strings.Repeat("a", 60), strings.Repeat("z", 253)} {
+		run := testRun(name)
+		broker := BrokerService(run)
+		worker := WorkerService(run)
+		if errs := validation.IsDNS1035Label(broker.Name); len(errs) > 0 {
+			t.Errorf("rendered broker Service for run %q has invalid name %q: %v", name, broker.Name, errs)
+		}
+		if errs := validation.IsDNS1035Label(worker.Name); len(errs) > 0 {
+			t.Errorf("rendered worker Service for run %q has invalid name %q: %v", name, worker.Name, errs)
+		}
+	}
+}
+
+func TestRunLabelValueStaysValidBoundedAndDistinct(t *testing.T) {
+	names := []string{
+		"short",
+		"run.test",
+		strings.Repeat("a", 60),
+		// 64+ characters: valid as a DNS subdomain but over the 63-character
+		// label-value cap.
+		strings.Repeat("a", 63) + "x",
+		strings.Repeat("a", 63) + "y",
+		strings.Repeat("z", 253),
+	}
+	seen := map[string]string{}
+	for _, name := range names {
+		value := RunLabelValue(name)
+		if errs := validation.IsValidLabelValue(value); len(errs) > 0 {
+			t.Errorf("run label value for run %q = %q: %v", name, value, errs)
+		}
+		if again := RunLabelValue(name); again != value {
+			t.Errorf("run label value for run %q is not stable: %q then %q", name, value, again)
+		}
+		if other, clash := seen[value]; clash {
+			t.Errorf("run label value %q collides between runs %q and %q", value, other, name)
+		}
+		seen[value] = name
+	}
+	if RunLabelValue("short") != "short" {
+		t.Fatalf("valid short names must pass through unchanged: %q", RunLabelValue("short"))
+	}
+}
+
+func TestRenderedSelectorsAgreeWithLabels(t *testing.T) {
+	components := map[string]bool{ComponentCoordinator: true, ComponentBroker: true, ComponentWorker: true}
+	for _, name := range []string{"short", "run.test", strings.Repeat("a", 63) + "x", strings.Repeat("z", 253)} {
+		run := testRun(name)
+		runLabel := Labels(run.Name, "")[LabelRun]
+		if len(runLabel) > 63 {
+			t.Fatalf("run %q renders a %d-character label value", name, len(runLabel))
+		}
+		check := func(kind string, got map[string]string) {
+			t.Helper()
+			if got["k8s-app"] == "kube-dns" {
+				return // the DNS egress rule deliberately matches no run pod
+			}
+			if got[LabelRun] != runLabel {
+				t.Errorf("run %q: %s selects run label %q; Labels writes %q", name, kind, got[LabelRun], runLabel)
+			}
+			if !components[got["courier.misospace.dev/component"]] {
+				t.Errorf("run %q: %s selects unknown component %q", name, kind, got["courier.misospace.dev/component"])
+			}
+		}
+		check("broker service selector", BrokerService(run).Spec.Selector)
+		check("worker service selector", WorkerService(run).Spec.Selector)
+		for _, policy := range NetworkPolicies(run, nil, nil) {
+			check(policy.Name+" pod selector", policy.Spec.PodSelector.MatchLabels)
+			for _, ingress := range policy.Spec.Ingress {
+				for _, from := range ingress.From {
+					if from.PodSelector != nil {
+						check(policy.Name+" ingress selector", from.PodSelector.MatchLabels)
+					}
+				}
+			}
+			for _, egress := range policy.Spec.Egress {
+				for _, to := range egress.To {
+					if to.PodSelector != nil {
+						check(policy.Name+" egress selector", to.PodSelector.MatchLabels)
+					}
+				}
+			}
+		}
 	}
 }

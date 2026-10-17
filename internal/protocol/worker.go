@@ -12,8 +12,11 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
+	"syscall"
 	"time"
 )
 
@@ -38,6 +41,15 @@ const (
 	// dispatchAdmissionWindow bounds how long a signed envelope may be
 	// admitted after signing. It is not an operation-duration limit.
 	defaultAdmissionWindow = 10 * time.Minute
+	// taskTerminationGrace bounds the wait after a task's own process is
+	// gone — cancelled or exited — while a descendant still holds the task's
+	// output descriptors. It bounds cleanup, never a run's duration.
+	taskTerminationGrace = 5 * time.Second
+	// taskTreeVerifyBound bounds the proof, after a task's wait ended, that
+	// no live process is left in the task's process group (#372). Together
+	// with the grace it keeps shutdown inside the pod's termination budget.
+	taskTreeVerifyBound = 5 * time.Second
+	taskTreeVerifyPoll  = 50 * time.Millisecond
 )
 
 // Task is the dispatch payload. The brief semantics (objective, owned files,
@@ -65,6 +77,13 @@ type Result struct {
 	// Artifact carries the untrusted artifact bytes, base64-encoded, when the
 	// task declared an artifact path and the file exists within the bound.
 	Artifact []byte `json:"artifact,omitempty"`
+	// LiveDescendants reports work that outlived the task it belonged to:
+	// processes still alive in the task's process group, or a holder of the
+	// task's output descriptors that survived the group entirely. Zero is a
+	// verified stop — nothing of the task was left running before anything
+	// was acknowledged. A nonzero value means termination could not be
+	// proven, so control must treat the operation as unverified (#372).
+	LiveDescendants int `json:"liveDescendants,omitempty"`
 }
 
 // Result statuses.
@@ -147,6 +166,7 @@ func (w *Worker) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /v1/tasks", w.handleDispatch)
 	mux.HandleFunc("POST /v1/tasks/cancel", w.handleCancel)
+	mux.HandleFunc("POST /v1/tasks/{opID}/release", w.handleRelease)
 	mux.HandleFunc("GET /v1/tasks/{opID}/result", w.handleResult)
 	mux.HandleFunc("POST /v1/snapshot", w.handleSnapshot)
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) {
@@ -269,13 +289,22 @@ func (w *Worker) handleDispatch(wr http.ResponseWriter, r *http.Request) {
 	// in the map, so a cancellation racing this dispatch can never observe a
 	// nil cancel function.
 	ctx, cancel := context.WithCancel(context.WithoutCancel(r.Context()))
-	op := &operation{envelope: envelope, cancel: cancel, wait: make(chan struct{})}
+	// The cancellation time bounds the wait that follows it: the task's own
+	// process group dies from the cancellation signal, so a wait that outlasts
+	// the grace means something outside that group still held the task's
+	// output (#372).
+	var cancelledAt atomic.Int64
+	op := &operation{envelope: envelope, wait: make(chan struct{})}
+	op.cancel = func() {
+		cancelledAt.CompareAndSwap(0, time.Now().UnixNano())
+		cancel()
+	}
 	w.ops[envelope.OpID] = op
 	w.mu.Unlock()
 
 	go func() {
 		defer close(op.wait)
-		result := w.runTask(ctx, task)
+		result := w.runTask(ctx, task, &cancelledAt)
 		w.mu.Lock()
 		op.result = result
 		w.mu.Unlock()
@@ -283,26 +312,65 @@ func (w *Worker) handleDispatch(wr http.ResponseWriter, r *http.Request) {
 	w.respondStatus(wr, envelope.OpID, http.StatusAccepted)
 }
 
-func (w *Worker) runTask(ctx context.Context, task Task) *Result {
+func (w *Worker) runTask(ctx context.Context, task Task, cancelledAt *atomic.Int64) *Result {
 	stdout := newTailBuffer(maxResultStreamBytes, resultTailBytes)
 	stderr := newTailBuffer(maxResultStreamBytes, resultTailBytes)
 	cmd := exec.CommandContext(ctx, task.Command[0], task.Command[1:]...)
 	cmd.Dir = w.config.WorkspaceDir
 	cmd.Stdout = stdout
 	cmd.Stderr = stderr
+	// Production tasks are `sh -c ...`, so the task's real work runs in
+	// descendants. exec.CommandContext kills only the direct child, which
+	// would leave those descendants mutating the workspace after
+	// cancellation claimed to be verified: the task gets its own process
+	// group and cancellation kills the whole group (#372).
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	cmd.Cancel = func() error { return signalProcessGroup(cmd.Process.Pid, syscall.SIGKILL) }
+	// A descendant that inherited the task's output descriptors keeps the
+	// wait open after the task itself is gone, so cleanup is bounded rather
+	// than left to hang on an inherited pipe.
+	cmd.WaitDelay = taskTerminationGrace
 	// The worker container carries no secrets; the child inherits the pod's
 	// environment. Git hardening belongs to trusted integration, not to the
 	// untrusted sandbox.
 	startErr := cmd.Start()
+	// A task that does not lead its own process group cannot have its
+	// descendants terminated at all, so a worker that reported such a task
+	// as stopped would be claiming a termination it never proved.
+	grouped := startErr == nil && leadsOwnProcessGroup(cmd.Process.Pid)
+	if startErr == nil && !grouped {
+		_ = cmd.Process.Kill()
+		_ = cmd.Wait()
+		startErr = errNoProcessGroup
+	}
 	exitCode := -1
-	if startErr == nil {
+	unaccountedWriter := false
+	if grouped {
 		waitErr := cmd.Wait()
+		// A wait that ended on the grace bound rather than on task exit
+		// means a descendant still holds the task's output descriptors: work
+		// outlived the task even when the task itself succeeded.
+		unaccountedWriter = errors.Is(waitErr, exec.ErrWaitDelay)
+		if !unaccountedWriter && ctx.Err() != nil {
+			// Wait only ever outlasts the grace because something outside
+			// the task's group held its output open — the group signal
+			// cannot be waiting on anything. A wait that returned sooner is
+			// proof that every writer closed.
+			if stamp := cancelledAt.Load(); stamp > 0 && !time.Now().Before(time.Unix(0, stamp).Add(taskTerminationGrace)) {
+				unaccountedWriter = true
+			}
+		}
 		if ctx.Err() == nil {
 			var exitErr *exec.ExitError
-			if errors.As(waitErr, &exitErr) {
+			switch {
+			case errors.As(waitErr, &exitErr):
 				exitCode = exitErr.ExitCode()
-			} else if waitErr == nil {
+			case waitErr == nil:
 				exitCode = 0
+			case cmd.ProcessState != nil:
+				// The task exited and only its output was still draining, so
+				// the exit code it produced still decides the result.
+				exitCode = cmd.ProcessState.ExitCode()
 			}
 		}
 	}
@@ -318,6 +386,20 @@ func (w *Worker) runTask(ctx context.Context, task Task) *Result {
 		StdoutTail: stdout.tail(),
 		StderrTail: stderr.tail(),
 	}
+	if errors.Is(startErr, errNoProcessGroup) {
+		result.StderrTail = strings.TrimSpace(result.StderrTail + "\n" + errNoProcessGroup.Error())
+	}
+	if grouped && (status == ResultCancelled || unaccountedWriter) {
+		// Nothing of the task is acknowledged as stopped until its process
+		// group is empty; anything left behind is reported rather than
+		// counted as verified termination.
+		result.LiveDescendants = awaitProcessGroupEmpty(cmd.Process.Pid)
+		if unaccountedWriter && result.LiveDescendants == 0 {
+			// The group is empty, yet a writer kept the task's descriptors
+			// past the grace: an unaccounted holder is not a proven stop.
+			result.LiveDescendants = 1
+		}
+	}
 	if task.ArtifactPath != "" && status == ResultCompleted {
 		artifact, artifactErr := w.readArtifact(task.ArtifactPath)
 		if artifactErr != nil {
@@ -330,30 +412,258 @@ func (w *Worker) runTask(ctx context.Context, task Task) *Result {
 	return result
 }
 
+// errNoProcessGroup reports a task that started without leading its own
+// process group. It is the worker's own fixed diagnostic, never task output.
+var errNoProcessGroup = errors.New("task process group was not established")
+
+// leadsOwnProcessGroup reports whether pid leads its own process group, which
+// is what makes a group signal reach the task's descendants.
+func leadsOwnProcessGroup(pid int) bool {
+	_, group, ok := processStat(pid)
+	return ok && group == pid
+}
+
+// signalProcessGroup delivers sig to the whole process group led by pid. A
+// group that is already gone counts as success: there is nothing left to
+// terminate, and reporting it as a failure would mask a completed cleanup.
+func signalProcessGroup(pid int, sig syscall.Signal) error {
+	if pid <= 0 {
+		return nil
+	}
+	err := syscall.Kill(-pid, sig)
+	if errors.Is(err, syscall.ESRCH) {
+		return nil
+	}
+	return err
+}
+
+// awaitProcessGroupEmpty proves that no live process remains in the process
+// group led by pgid and returns how many were still live when the bound
+// expired. The group is re-signalled while it waits, so a descendant that
+// raced the cancellation signal cannot outlive the acknowledgement (#372).
+func awaitProcessGroupEmpty(pgid int) int {
+	deadline := time.Now().Add(taskTreeVerifyBound)
+	for {
+		// A recycled pid answers for whatever now owns it: if the old group
+		// leader's entry reports a different group, nothing of the task's
+		// tree can be left in this one.
+		if _, group, ok := processStat(pgid); ok && group != pgid {
+			return 0
+		}
+		_ = signalProcessGroup(pgid, syscall.SIGKILL)
+		live, err := liveGroupMembers(pgid)
+		if err != nil {
+			// Without a process listing the only answer available is the
+			// kernel's, and a group signal that finds no member proves the
+			// group empty. Anything short of that proof stays unverified.
+			if errors.Is(syscall.Kill(-pgid, syscall.Signal(0)), syscall.ESRCH) {
+				return 0
+			}
+			return 1
+		}
+		if len(live) == 0 {
+			return 0
+		}
+		if !time.Now().Before(deadline) {
+			return len(live)
+		}
+		time.Sleep(taskTreeVerifyPoll)
+	}
+}
+
+// liveGroupMembers lists the processes still in the process group led by
+// pgid, excluding zombies: a zombie has already exited and holds no
+// descriptors, so it mutates nothing even before its new parent reaps it.
+// Failing to read the listing is an error rather than a silent empty group —
+// unproven termination must never read as verified termination.
+func liveGroupMembers(pgid int) ([]int, error) {
+	entries, err := os.ReadDir("/proc")
+	if err != nil {
+		return nil, err
+	}
+	live := make([]int, 0, 4)
+	for _, entry := range entries {
+		pid, convErr := strconv.Atoi(entry.Name())
+		if convErr != nil {
+			continue
+		}
+		state, group, ok := processStat(pid)
+		if !ok || group != pgid {
+			continue
+		}
+		if state != "Z" && state != "X" {
+			live = append(live, pid)
+		}
+	}
+	return live, nil
+}
+
+// processStat reads one process's run state and process group. The comm field
+// is parenthesized and may contain spaces, so parsing starts after its closing
+// parenthesis: what follows is state, parent, then process group.
+func processStat(pid int) (state string, pgid int, ok bool) {
+	data, err := os.ReadFile("/proc/" + strconv.Itoa(pid) + "/stat")
+	if err != nil {
+		return "", 0, false
+	}
+	stat := string(data)
+	end := strings.LastIndex(stat, ")")
+	if end < 0 {
+		return "", 0, false
+	}
+	fields := strings.Fields(stat[end+1:])
+	if len(fields) < 3 {
+		return "", 0, false
+	}
+	group, err := strconv.Atoi(fields[2])
+	if err != nil {
+		return "", 0, false
+	}
+	return fields[0], group, true
+}
+
+// artifactReadHook, when non-nil, runs between artifact validation and the
+// bounded read; tests install it to land a concurrent swap in exactly that
+// window. It is nil in production.
+var artifactReadHook func()
+
 // readArtifact reads the declared artifact, refusing anything outside the
-// workspace and over the transport bound.
+// workspace and over the transport bound. The lexical gate is only a first
+// filter; the authoritative confinement check walks the cleaned path from the
+// workspace's own directory descriptor with O_NOFOLLOW, so no component —
+// parent or final — can be a symlink at open time, and validation happens on
+// the opened descriptor rather than on a path a concurrent task could swap.
 func (w *Worker) readArtifact(declared string) ([]byte, error) {
 	clean := filepath.Clean("/" + declared)
+	if clean == "/" {
+		return nil, errors.New("declared artifact is unavailable")
+	}
 	abs := filepath.Join(w.config.WorkspaceDir, clean)
 	rel, err := filepath.Rel(w.config.WorkspaceDir, abs)
 	if err != nil || rel == ".." || strings.HasPrefix(rel, "../") {
 		return nil, errors.New("artifact path escapes the workspace")
 	}
-	info, err := os.Lstat(abs)
+	dir, err := os.Open(w.config.WorkspaceDir)
 	if err != nil {
 		return nil, errors.New("declared artifact is unavailable")
 	}
-	if !info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 {
+	defer dir.Close()
+	dirfd := int(dir.Fd())
+	components := strings.Split(strings.TrimPrefix(clean, "/"), "/")
+	for i, name := range components {
+		flags := syscall.O_NOFOLLOW | syscall.O_CLOEXEC | syscall.O_RDONLY
+		if i < len(components)-1 {
+			flags |= syscall.O_DIRECTORY
+		} else {
+			// O_NONBLOCK keeps a swapped-in FIFO from blocking the open; the
+			// regular-file check on the descriptor rejects it right after.
+			flags |= syscall.O_NONBLOCK
+		}
+		next, openErr := syscall.Openat(dirfd, name, flags, 0)
+		if i > 0 {
+			syscall.Close(dirfd)
+		}
+		if openErr != nil {
+			if errors.Is(openErr, syscall.ELOOP) {
+				if i < len(components)-1 {
+					return nil, errors.New("artifact path escapes the workspace")
+				}
+				return nil, errors.New("artifact must be a regular file")
+			}
+			return nil, errors.New("declared artifact is unavailable")
+		}
+		dirfd = next
+	}
+	f := os.NewFile(uintptr(dirfd), filepath.Join(w.config.WorkspaceDir, clean))
+	defer f.Close()
+	info, err := f.Stat()
+	if err != nil {
+		return nil, errors.New("artifact read failed")
+	}
+	if !info.Mode().IsRegular() {
 		return nil, errors.New("artifact must be a regular file")
 	}
 	if info.Size() > maxArtifactBytes {
 		return nil, errors.New("artifact exceeds the bound and is rejected whole")
 	}
-	data, err := os.ReadFile(abs)
+	if artifactReadHook != nil {
+		artifactReadHook()
+	}
+	return readArtifactBounded(f)
+}
+
+// readArtifactBounded enforces the artifact bound on bytes actually read, not
+// on pre-read metadata: a file that grows past the bound while being read is
+// rejected whole rather than truncated.
+func readArtifactBounded(r io.Reader) ([]byte, error) {
+	data, err := io.ReadAll(io.LimitReader(r, maxArtifactBytes+1))
 	if err != nil {
 		return nil, errors.New("artifact read failed")
 	}
+	if len(data) > maxArtifactBytes {
+		return nil, errors.New("artifact exceeds the bound and is rejected whole")
+	}
 	return data, nil
+}
+
+// handleRelease consumes one terminal result's payload on control's
+// instruction. The operation entry is never removed: the compact stub keeps
+// redelivery of the opID rejected by handleDispatch and keeps handleCancel
+// working, so replay protection outlives the payload it protects. Release is
+// idempotent — a repeat release rewrites the same stub.
+func (w *Worker) handleRelease(wr http.ResponseWriter, r *http.Request) {
+	opID := r.PathValue("opID")
+	if opID == "" || len(opID) > 128 || strings.ContainsAny(opID, "/\\") {
+		http.Error(wr, "invalid request", http.StatusBadRequest)
+		return
+	}
+	envelope, _, ok := w.verifySigned(wr, r, KindRelease, 0)
+	if !ok {
+		return
+	}
+	// The URL is not signed; the envelope is. A release addressed to one
+	// operation must not be able to erase another operation's result, so a
+	// path/envelope mismatch is refused before the nonce is consumed or any
+	// operation is touched.
+	if envelope.OpID != opID {
+		http.Error(wr, "release envelope does not address this operation", http.StatusBadRequest)
+		return
+	}
+	accepted, exhausted := w.consumeNonce(envelope)
+	if exhausted {
+		http.Error(wr, "replay state exhausted; worker must be replaced", http.StatusServiceUnavailable)
+		return
+	}
+	if !accepted {
+		http.Error(wr, "nonce replay rejected", http.StatusUnauthorized)
+		return
+	}
+
+	w.mu.Lock()
+	op, known := w.ops[opID]
+	_, tombstoned := w.tombstones[opID]
+	var terminal *Result
+	if known && op != nil && op.result != nil && op.result.LiveDescendants == 0 {
+		terminal = op.result
+		op.result = &Result{Status: op.result.Status}
+	}
+	unverified := known && op != nil && op.result != nil && terminal == nil
+	w.mu.Unlock()
+
+	switch {
+	case known && op != nil && terminal == nil && !unverified:
+		http.Error(wr, "operation has not terminated; nothing to release", http.StatusConflict)
+	case unverified:
+		// An unproven termination is never released: its LiveDescendants
+		// report is the only record that the task tree may still be live
+		// (#372), and dropping it would let a later cancellation read a
+		// verified stop that never happened.
+		http.Error(wr, "termination is unverified; result is retained", http.StatusConflict)
+	case known || tombstoned:
+		w.respondStatus(wr, opID, http.StatusOK)
+	default:
+		http.Error(wr, "unknown operation", http.StatusNotFound)
+	}
 }
 
 func (w *Worker) handleCancel(wr http.ResponseWriter, r *http.Request) {
@@ -383,12 +693,22 @@ func (w *Worker) handleCancel(wr http.ResponseWriter, r *http.Request) {
 	w.mu.Unlock()
 
 	if active && op != nil {
-		// Verified termination: acknowledge only after the process is gone.
+		// Verified termination: acknowledge only after the task's process
+		// group is empty. A cancellation that cannot prove that is reported
+		// as unverified instead of acknowledged, so control keeps treating
+		// the operation as possibly live (#372).
 		op.cancel()
 		select {
 		case <-op.wait:
 		case <-r.Context().Done():
 			http.Error(wr, "cancellation interrupted", http.StatusRequestTimeout)
+			return
+		}
+		w.mu.Lock()
+		result := op.result
+		w.mu.Unlock()
+		if result != nil && result.LiveDescendants > 0 {
+			http.Error(wr, "task tree outlived cancellation; termination is unverified", http.StatusInternalServerError)
 			return
 		}
 	}

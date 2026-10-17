@@ -255,6 +255,21 @@ executor/runtime positively classifies capacity exhaustion; Courier does not
 infer it from HTTP 429 or provider text. The operator records a recoverable
 `BlockedExternal` terminal diagnostic and starts a durable, idempotent handoff.
 
+An outage without an authoritative exhaustion signal must strand nothing
+(#327). Attempts that end without the provider ever serving a session id
+crash into a dedicated availability budget, separate from the task-repair
+continuation budget and backed off exponentially (capped, never a tight loop).
+Exhausting it ends the run on the same recovery channel — the
+`capacity_exhausted` outcome with the honest `provider-unavailable` diagnostic
+category — never a quota verdict the evidence does not support, never
+`Failed`, never NeedsHuman-for-model-outage. A raw child process status is
+never an outcome declaration: exit `2`, which merely matches Courier's own
+NeedsHuman exit constant, takes this same shared recovery path like any other
+unclassified nonzero exit; only a verified outcome declaration may request a
+human. Settlement, safety gating, and
+cooldown semantics are identical to confirmed exhaustion: an unverified or
+unsafe workspace still retains ownership.
+
 `LaneProfile.spec.capacityGroup` optionally names lanes sharing an execution
 capacity identity; otherwise the lane name is the identity. Confirmed
 exhaustion persists a default 15-minute cooldown on LaneProfile status. Source
@@ -360,8 +375,19 @@ to die.
 - A pod's **disappearance** — no coordinator pod **object** at all — is
   infrastructure loss on its own terms, detected without any heartbeat,
   because there is no pod left to heartbeat from. A pod whose coordinator exit
-  state is observable is not pod loss: the recorded exit goes through the
-  exit-code mapping like any other termination. The cache is not trusted for
+  state is observable **and whose deletion is not in flight** is not pod loss:
+  the recorded exit goes through the exit-code mapping like any other
+  termination. A **terminating** coordinator's recorded exit is never mapped
+  to a run outcome — the deletion may itself have produced that exit (a
+  wedge-reaped coordinator carries a cancelled-stream failure exit, or even
+  exits 0 inside the shutdown window), so it is re-observed like any
+  in-flight deletion, and once the object is provably gone the disappearance
+  backstop takes the deferred charge as pod loss. The mirror case is decided
+  with it: a coordinator that exited with a meaningful code and was deleted
+  **afterwards** (node drain, manual delete) takes the same relaunch, because
+  a timestamp ordering test cannot distinguish the two exits, so a deleted
+  coordinator is untrusted and the resumed run re-reads the world. (#369)
+  The cache is not trusted for
   the loss judgement, so the absence of a coordinator is confirmed **against
   the API server** with a live read and no recorded state — one confirmation
   rule for the disappearance signal: a coordinator pod found live means the
@@ -1539,6 +1565,33 @@ exhaustion history permits rediscovery with a fresh opaque source attempt ID;
 the successor name incorporates the settled predecessor UID, and the old run
 is retained for diagnostics. Source-issued ownership is reacquired before launch.
 
+The legacy OpenCode runtime is pinned in the image by `Dockerfile`'s
+`OPENCODE_VERSION` (currently 1.18.31). Its `run --format json` event stream
+is the only accepted exhaustion seam: `error.name=APIError` carries provider
+evidence in `error.data.statusCode` and `error.data.responseBody`. The response
+must confirm exhaustion using the shared classifier or carry a
+configured exhaustion code/type (with MiniMax code 2056 configured by that
+deployment); generic 429, ordinary process failures, assistant prose, and
+stderr do not prove exhaustion. On the recognized event the executor kills the OpenCode
+process group before observing git state and never resumes that turn. Git status
+includes tracked and untracked changes; an empty snapshot requires no commits
+since start and no local changes, while pushed work requires fetching the exact
+run branch and matching its remote tip to HEAD. Unverifiable state remains held.
+
+Before enabling this in a deployment, configure the verified provider token
+(for MiniMax 2056, `COURIER_MODEL_EXHAUSTION_CODES=2056`), build and publish
+the executor image with the pinned runtime, deploy to a non-production lane
+using the same `opencode`
+executor, and run both (1) an issue claim and (2) an existing PR-fix claim on
+the shared queue. Induce a confirmed MiniMax 2056 response while each run has
+an existing branch/PR; verify the exhaustion event is followed by process-group
+termination, `BlockedExternal` plus `CapacityRecovery=True/Settled`, no further
+model calls, retained predecessor history, and a fresh local-lane successor on
+the same issue branch or PR without a duplicate PR. Also verify generic 429,
+unknown provider errors, dirty unpushed work, and remote mismatch do not settle
+ownership. Capture run names, event excerpts, source state, and successor
+identity for both paths. Do not close #327 until this deployed smoke succeeds.
+
 Dispatch and Courier are independent systems connected by an adapter, not hard
 dependencies. Dispatch #1259 supplies dedicated fenced capacity handoff APIs;
 only the Dispatch adapter knows their HTTP routes, issued claim/handout receipts,
@@ -1548,15 +1601,49 @@ settlement validates the returned resolution rather than treating HTTP 200 as
 proof of release. Ordinary external waits and task failures keep their existing
 semantics; capacity exhaustion does not first park the queue as an external wait.
 
-The core requires trusted secure-executor workspace evidence before invoking
-`CapacityRecoveryPreparer` and `CapacityRecovery`. Legacy or missing evidence,
-dirty work, and unknown remote state hold ownership. The current native evidence
-producer proves only a clean, unchanged integration workspace safe; committed
-work is safe only when a fresh trusted broker snapshot confirms the existing
-work ref at exactly the integration HEAD; local-only commits remain held.
-Evidence absence and a run UID are not proof. No automatic dirty-work transfer
-is claimed. Source-specific receipts are sensitive opaque metadata, never model
-inputs or capacity identities.
+The core requires trusted, semantically validated workspace evidence before
+invoking `CapacityRecoveryPreparer` and `CapacityRecovery`. The native control
+runtime's workspace observer is the trusted producer; model-writable terminal
+text and legacy OpenCode termination labels are not trusted evidence. Missing
+evidence, dirty work, malformed claims, and unknown remote state hold ownership.
+The native producer proves only a clean, unchanged integration workspace safe;
+committed work is safe only when a fresh trusted broker snapshot confirms the
+existing work ref at exactly the integration HEAD; local-only commits remain
+held. Evidence absence and a run UID are not proof. No automatic dirty-work
+transfer is claimed. Source-specific receipts are sensitive opaque metadata,
+never model inputs or capacity identities.
+
+Legacy recovery uses a separate workspace-observer container and UID in the
+existing coordinator pod. A trusted init container pins the initial remote head
+before OpenCode starts. Only the observer mounts its private baseline, Kubernetes
+read token, and termination output; the writer mounts none of these. The observer
+uses a run-scoped service account with `get` permission for its own pod only.
+The complete run-scoped identity — ServiceAccount, Role, RoleBinding — is
+provisioned and ownership-verified before the coordinator pod is created, so a
+foreign same-named resource is never admitted under or silently adopted; a
+provisioning failure releases the claim only when the slot is proven empty,
+otherwise it stays Claimed as provisioning-in-flight. It
+waits for kubelet's coordinator-container `Terminated` state before reading the
+workspace read-only. Process-group cancellation is not itself release proof.
+
+The observer never runs Git in the writer's repository. It fetches the
+operator-pinned remote URL and exact branch into private storage, disregarding
+workspace Git configuration, hooks, index, replacement refs, and alternates. It
+compares every workspace file (including ignored/untracked files, excluding only
+the root `.git` directory) against the trusted remote tree, including modes and
+symlink targets. Unsupported/submodule trees, unreadable paths, local-only heads,
+and ambiguity fail closed. An absent work branch can be `empty` only when the
+workspace matches the independently pinned baseline; existing branches require
+an exact freshly fetched `pushed` head.
+
+The operator re-reads the pod uncached, verifies the run owner UID, pod UID,
+writer container ID, isolated observer specification, protected init baseline,
+and observer termination result before persisting safety evidence. Model-written
+executor termination text remains a claim only. The existing source recovery
+path still waits for the entire pod to terminate and applies its unchanged
+source fencing, capacity cooldown, retained-history, and successor rules. Native
+workspace observation remains unchanged. Keep #327 open until both legacy
+handoff paths and the isolated deployment smoke have recorded passing evidence.
 
 PR-fix reports carry the stable settlement idempotency key and must return a
 matching deferred resolution. Dispatch issue handoff currently lacks a durable
@@ -1891,6 +1978,143 @@ named items remain unresolved and must not be described as production-ready:
 
 ## Decisions
 
+- **2026-10-17 — #367: the legacy pre-handoff plan adds a bounded,
+  explicitly non-semantic referential check on cited evidence paths, and
+  fails open.** `checkCriterionEvidence` now takes the run's context and
+  the exact pushed head `confirmRemotePublication` just verified, and on
+  the success path probes the file paths the body's
+  `implementation-evidence` and `regression-check` rows cite against that
+  commit's tree in the run's own workspace (`git ls-tree <head> --
+  <path>`, hardened environment, stderr dropped). `ls-tree` rather than
+  the `cat-file -e` the issue first suggested: git exits 128 for an
+  absent path *and* for a head it cannot resolve, so exit status cannot
+  separate "the model cited a file that is not there" from "the probe
+  itself failed", and reading absence from a failed probe would fabricate
+  defects whenever git was unavailable — `ls-tree` exits 0 with empty
+  output for absence at a readable head and non-zero for an unreadable
+  one, so absence is a positive observation. Only the two statuses the
+  validator already requires to cite a location are probed:
+  `manual-verification` and `not-implemented` carry a note and `unknown`
+  carries none, and probing prose non-semantically would manufacture
+  defects the model can only silence by mislabelling the criterion.
+  Extraction mirrors the validator's own path alternative — whitespace
+  tokens, any token containing `://` dropped whole (URLs are never
+  fetched and a URL's host+path would otherwise read as a path), then
+  maximal matches of the slash-bearing charset, normalized (leading
+  `./` dropped, `:12`/`:12-40`/`::TestName` cut, `..`/`.`/empty segments
+  and a leading `-` rejected) and deduplicated in first-appearance order
+  — that charset admits no whitespace, `:`, or quote, no glob or
+  pathspec-magic character, and never begins with `-`, so a candidate can
+  neither split the argv it travels in nor be read as an option or a
+  pathspec expression (`(` and `)` can survive and are inert, because the
+  hardened boundary builds an argv directly and no shell sees the value);
+  the candidate is passed as the pathspec after `--`, never as part of a
+  `rev:path` argument, and that restriction is the caller's to justify —
+  `internal/git` does not sanitize. Extraction is deliberately
+  over-matching: it judges shape, not meaning, so every candidate is
+  rooted against the published tree before it is probed — the commit's
+  top-level entry names are read once (`ls-tree -z --full-name <head>`,
+  no pathspec, no recursion, bounded by the number of top-level entries;
+  blob and tree names both count) and only candidates whose first segment
+  is one of them survive. A slash-bearing token rooted nowhere is a ratio
+  ("3/4"), a date ("2026/10/17"), a port ("8080/health"), another
+  repository's path, a module path, or a job name — nothing this check can
+  speak about, and reporting one would burn the shared budget on a
+  truthful body and press the model to downgrade an honest criterion. The
+  trade-off is stated rather than hidden: an absent path under a real
+  top-level entry is still found and still named, while a citation the
+  extractor cannot resolve to a path-shaped candidate, or whose top-level
+  entry the head does not carry, is left alone rather than guessed at. The
+  candidate count is bounded by the operator-pinned set (`MaxCriteria`
+  rows, `MaxReferenceBytes` per reference) and no cap of the executor's
+  own is added. Findings ride `handoffCheckOutcome.missingEvidencePaths`
+  (with the probed head, so instruction and terminal reason can name the
+  revision): `applyHandoffPlan` folds them into one `criteriaDefect`
+  predicate, so a body that both fails linkage and cites a missing file
+  still earns a single `body-repair` on the shared #170 slot, and
+  `criteriaRepairMessage`, `criteriaExhaustedReason`, and
+  `combinedBodyExhaustedReason` name the paths — a validated block never
+  falls back to the vague "did not satisfy the pinned set" reason. This
+  is the one fail-open verdict in a plan that is otherwise fail-closed:
+  any probe it cannot complete yields no finding and no error, because a
+  defect the model cannot repair by editing the body must never be handed
+  to it as one, and the repair instruction is phrased as what was
+  observed plus the two honest responses (cite a path that exists in the
+  published head, or record the criterion honestly) rather than as a new
+  rule over the pinned contract. Empty and unpinned sets remain a
+  vacuous pass with no probe at all. No new cap, budget, timer, gate, or
+  network call. (#367, following #282 step 3 which marked the check
+  optional, #249, #248, #170)
+- **2026-10-17 — #327 review: raw child exit 2 is an ordinary crash, never a
+  declaration.** The executor special-cased the child's raw exit status 2 —
+  numerically Courier's own NeedsHuman constant — into a permanent
+  `Failed(model-transport-error)` before the availability budget, stranding
+  exactly the outage this PR recovers from. Removed the special case: every
+  raw nonzero child status takes the shared recovery path (availability budget
+  without a session, task continuations with one, recoverable
+  `provider-unavailable` handoff when either is spent). NeedsHuman stays
+  reserved for verified outcome declarations; operator cancellation stays a
+  plain Failed. Supersedes the 2026-09-29 note that "a raw child exit 2
+  remains a failure". (#368)
+- **2026-10-17 — #327 review: verify the observer identity before the pod can
+  run.** Launch previously assigned the run-scoped ServiceAccount, created it
+  best-effort with the error ignored, and verified SA/Role/RoleBinding
+  ownership only after the coordinator pod create — so a foreign same-named
+  identity could admit the writer, and a post-create provisioning failure
+  released the Dispatch claim while that writer kept working, violating the
+  single-writer guarantee. Provisioning now fully precedes the create and
+  never adopts unowned resources; a pre-creation failure surfaces as a plain
+  error only when the slot is proven empty through the uncached reader,
+  otherwise as `ErrProvisioningInFlight` so the run stays Claimed. The #217
+  collision contract is unchanged. (#368)
+- **2026-10-16 — #327: availability handoff for outages without quota evidence.**
+  Repeated no-session crashes (provider outage, transport failure) previously
+  terminalized runs as Failed and stranded the work item, because the shared
+  continuation budget was designed for task repair. Added a separate bounded,
+  backed-off availability budget in the executor that ends the run via the
+  existing fenced capacity-recovery channel with a new `provider-unavailable`
+  diagnostic category. No second state machine; the category keeps the claim
+  honest — an outage is not a quota verdict — and settlement still fails closed
+  on unsafe or unverifiable workspace evidence. Chosen because keeping work
+  moving outweighs failing fast: an idle local capacity on a claimed item is
+  the failure mode this feature exists to end.
+- **2026-10-17 — #377: the operator's own observation reads resolve their
+  destination through the selected registration, the same routing admission
+  was given in #340/#378.** Post-review PR observation, existing-PR head
+  resolution, post-review merge observation, and the Dispatch PR-state check
+  were built once on the observer's GitHub.com client, so in a secure
+  deployment whose registry serves a GitHub Enterprise host those reads still
+  left for `api.github.com`. The chosen fix is per-read resolution rather than
+  a deployment-wide API-base flag: the loaded registry — already the sole
+  source of truth for where forge traffic goes — is carried onto the GitHub
+  observer (`--forge-providers-file`, loaded once in `cmd/main.go`), and each
+  read selects the registration serving the repository under observation and
+  re-points the client at that registration's endpoint with the operator's own
+  read credential. A loaded registry that cannot settle a repository is a read
+  error, never a silent fallback to the public API; with no registry (legacy
+  wiring) the observer keeps its GitHub.com client unchanged. Rejected: a
+  second deployment flag for an Enterprise-first API base — it would fork the
+  source of truth and still misroute mixed-host registries.
+
+- **2026-10-17 — #408: the capture's uncapped git read is bounded by the
+  operation deadline too, and a successful child whose pipes outlive it keeps
+  the bytes rather than the failure.** `runGit` handed `os/exec` stdout and
+  stderr buffers, so `Wait` consulted the context for the process but then
+  blocked on the copy goroutines until EOF — and a grandchild outliving git
+  (`git-remote-*`, askpass) holds a write end open forever, making the stall
+  that motivated #392 for `runGitCapped` reachable one function up, in the
+  same commit-scan loop. `runGit` now sets the same 2-second `WaitDelay`,
+  keeps the output of a child that exited successfully before its pipe was
+  held (`ErrWaitDelay` gated on `ProcessState` success), surfaces a canceled
+  context's own error, and caps the stderr it keeps with the shared
+  `stderrLimit`. Applying that cap exposed a short write in
+  `cappedBuffer.Write`: on a chunk straddling the limit it reported the
+  truncated count, which stops `io.Copy` and closes the child's pipe, so a
+  verbose-stderr git died of SIGPIPE instead of having its excess discarded;
+  the writer now consumes every chunk whole. No new bound is claimed — the
+  grace period already budgets a 2-second child-kill wait; this puts
+  `runGit`'s reads inside it.
+
 - **2026-10-16 — #388: claim-token rotation around admission is adopted, not wedged.**
   A deployed smoke stranded a `BlockedExternal` capacity run permanently: discovery/
   admission claim churn rotated the Dispatch lease token, while the run's
@@ -1951,8 +2175,23 @@ named items remain unresolved and must not be described as production-ready:
   counts both in the `run.exit` telemetry and as a best-effort outcome
   comment on the run's source issue — a partial record is labelled
   honestly partial, and the legacy handoff never claims fully verified
-  completion outside the PR body. No new budget, gate, or wall clock:
-  boundedness stays `MaxContinuations` (#170). (#282, #249, #280, #248)
+  completion outside the PR body. The criterion half additionally
+  enforces referential integrity against the world (#367): a file path
+  cited by an `implementation-evidence` or `regression-check` row must
+  exist in the tree at the exact pushed head the observation just
+  verified, probed in the run's own workspace through hardened git, with
+  URLs never fetched and every probe that cannot complete failing open.
+  Only paths the published tree can confirm are probed: a candidate is
+  first rooted at a real top-level entry of that commit, so prose with a
+  slash in it — a ratio, a date, a port, another repository's path, a
+  module path — is left alone rather than reported.
+  It is existence, never semantics — whether a cited check enforces its
+  criterion stays the reviewer's audit — and it is a criterion defect for
+  every downstream purpose: the same single bounded repair, the same
+  shared #170 slot, the same terminal reasons. No new budget, gate, or
+  wall clock anywhere in the plan:
+  boundedness stays `MaxContinuations` (#170). (#282, #249, #280, #248,
+  #367)
 - **2026-10-16 — #282 follow-up: the pinned-envelope admission check runs
   before the forge observation, not inside it.** The undecodable-envelope
   fail-closed path was only reachable from the open-PR branch, so a missing,
@@ -3154,6 +3393,43 @@ was superseded.
   carries the exit-code hazard this arm avoids, and the secure path's cached
   control-pod read and unconditioned delete, as #369 and #370. (#223)
 
+- **2026-10-17 — #369: a terminating coordinator's recorded exit is never
+  mapped, so the deferred wedge charge survives the coordinator's own
+  teardown.** #223 closed the deferred-charge hole on the secure path by
+  restricting the deferral to the inert control object, the one that can
+  never report an outcome; the wedge path deletes a *recoverable*
+  coordinator, so it needed its own repair. `checkLiveness` reaps a live
+  wedged coordinator and defers the charge when the object survives the
+  live re-confirmation, leaving the run `Running` while the pod is torn
+  down, and the Running-phase exit-code loop in `observeRunning` had no
+  `DeletionTimestamp` guard: once the kubelet finished the shutdown, the
+  loop read the teardown's exit and terminalized the run — `Failed` for a
+  cancelled model stream, `Verifying`/`Done` had the coordinator exited 0
+  in the window — instead of letting the disappearance backstop take the
+  deferred relaunch. The loop now skips a pod whose deletion is in flight,
+  the same terminating rule `topologyBroken`, `coordinatorPodOf` and
+  `activeOperationValid` already apply, and the deferred charge lands on
+  the backstop with its pod-loss cause: one credit, relaunch. The
+  mirror case was decided with it: a coordinator that exited with a
+  meaningful code and was deleted *afterwards* (node drain, manual delete)
+  no longer terminalizes through the exit mapping; it converges to the same
+  pod-loss relaunch. A timestamp ordering test cannot separate the cases —
+  graceful deletion stamps `deletionTimestamp` with a value of the request
+  plus the grace period, while the kubelet may end the SIGTERM'd container
+  at any point after the request, so a teardown exit can read as finished
+  before the stamp's value — and the exit of a deleted coordinator is
+  therefore untrusted by construction: the resumed run re-reads git, the
+  PR, and CI and lets the world win. The cost of a misordered success is
+  one crashloop credit against the shared ceiling. The guard sits in the
+  shared loop, so a terminating secure control pod's exit is likewise never
+  mapped — `ObserveTopology`'s existing control-termination branch still
+  fences the round while the object is terminating, and the same backstop
+  charges the loss with its fence; what #223 established is untouched — the
+  secure deferral still guards only the inert control object, so the secure
+  path still never leaves a `Running` run standing over a deferred
+  teardown of a recoverable control object. No timer and no duration bound
+  was added.
+
 - **2026-10-10 — #248 follow-up: legacy linkage check is fail-closed on forge
   read errors, and the declared-changes path routes through the bounded
   repair budget.** The legacy executor's `checkPRLinkage` (since renamed
@@ -3583,3 +3859,70 @@ was superseded.
   client query had no remaining caller after this change and is gone, so one
   listing seam remains. (#365, closing the `Observer` carve-out left open by
   the #343 entry.)
+- **2026-10-17 — #383: a pod-bound credential is read per request, never
+  frozen.** Secure control read its projected broker-audience token once in
+  `loadIdentity` and handed the byte slice to the capability, publication and
+  trusted-status clients. Kubelet rotates the mounted file, not those slices,
+  so a run outlasting the first token lost every authenticated broker read
+  while a valid token sat on disk. The clients now hold a
+  `harness.BrokerTokenSource` and consult it per request: production wires the
+  file source, so rotation is picked up with no identity rebuild and no run
+  restart. Two choices are deliberate. There is no cache and no expiry
+  bookkeeping — a cached copy is the frozen-credential bug itself, and a
+  projected-volume read is a cheap local open, while cached-until-expiry adds a
+  second expiry clock that can only disagree with the kubelet's. And a
+  projection that cannot be read fails the request closed with a fixed,
+  retryable category rather than falling back to the last good bytes: during a
+  swap the honest answer is that the credential is unknown, and a stale token
+  earns a 401 that is classified as a definite denial. Startup still validates
+  the projection once, so a control pod that can never authenticate never
+  launches. (#383)
+- **2026-10-17 — #372: native worker cancellation proves the task tree
+  is gone, and never claims otherwise.**
+  `internal/protocol` ran each task through `exec.CommandContext`, which kills
+  only the direct child, while production tasks are `sh -c ...`: a cancelled
+  shell left its own commands mutating the shared workspace after the worker
+  acknowledged verified termination, and a descendant that inherited the task's
+  output descriptors could hold the wait open so cancellation was never
+  acknowledged at all. Each task now leads its own process group
+  (`SysProcAttr.Setpgid`, verified after start — a task that did not get one
+  fails instead of reporting a termination nobody can prove), cancellation
+  signals the whole group, and the wait carries a bound so an inherited
+  descriptor cannot wedge cleanup. Nothing is acknowledged as stopped until the
+  worker proves the group holds no live process — zombies excluded, because an
+  exited process nobody has reaped yet holds no descriptors and writes nothing.
+  Work that leaves the group (`setsid`) escapes the signal, so a wait that
+  outlasts the grace is itself the evidence that a writer outside the group
+  survived: the count is reported nonzero and the cancellation is refused
+  (non-2xx) instead of acknowledged. The same count on the coordinator side
+  keeps `verifiedResult` from clearing an operation whose terminal state the
+  worker called unproven, so an unverified tree stays suppressed rather than
+  claimed gone. Cancellation tombstones and no-redelivery are unchanged, and the
+  bounds are cleanup bounds, never a run wall-clock. Containment stronger than a
+  process group (a per-task PID namespace or cgroup) is the remaining limit and
+  is tracked separately; this is the worker half of the process-group
+  cancellation the executor already performs (#115), for a different caller.
+  (#372)
+- **2026-10-17 — #370: the secure broken-topology relaunch decides from the
+  live world, and deletes the control pod it observed.**
+  #223 gave `SecureControl.fenceAndRelaunch` the legacy paths' post-delete live
+  re-confirmation but left the two decisions in front of it reading the cached
+  manager client: the control pod came from an informer list and the delete
+  carried no precondition, so a control pod replaced between that cached read
+  and the delete was deleted by name; and the crashloop ceiling was judged from
+  the reconcile's possibly stale `run.Status.Restarts` in the same function that
+  takes a live read for the other judgement, so a stale-low counter let one
+  relaunch through past the configured ceiling and a stale-high one handed a
+  recoverable run to a human. The path now reads the run through the uncached
+  reader and acts on that object — a failed read, a changed run incarnation, a
+  live phase this path no longer owns, and a deleting run all re-observe
+  rather than charge, and the charge therefore lands on the world's counter
+  plus one — and reads the control pod through the same reader
+  (`SecureControl.podLive`, over the unchanged component filter) before
+  deleting it with the observed UID as a precondition, so a conflict is a
+  bounded re-observation and never a name delete or a charge. The post-delete
+  re-confirmation, the ceiling hand-off's preservation of inert evidence, the
+  in-place charge for a recoverable object, and the shared configured ceiling
+  (#216) are unchanged; provisioning and the fence's own reads still use the
+  cached client, because only the relaunch's delete and ceiling judgement are
+  destructive decisions. (#370, #105, #223)

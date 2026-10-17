@@ -28,6 +28,10 @@ func TestIssueCapacityHandoffLostResponseWithoutAuditPreservesReplacement(t *tes
 			claimAttempts++
 			w.WriteHeader(http.StatusConflict)
 			_ = json.NewEncoder(w).Encode(map[string]string{"error": "Issue is actively leased by worker-b. Use force=true override."})
+		case "/api/issues/state":
+			// Settle resolves the internal issue ID through the same read-only
+			// lookup Claim uses; the claim-token fence below stays the authority.
+			_ = json.NewEncoder(w).Encode(map[string]any{"issueId": "issue-a", "repoFullName": "acme/widgets", "number": 42})
 		case "/api/issues/capacity-handoff":
 			posts++
 			var body struct {

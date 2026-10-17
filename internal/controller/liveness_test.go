@@ -2021,3 +2021,251 @@ func TestWedgeReapLeavesNonCoordinatorRunPod(t *testing.T) {
 		t.Fatalf("restarts = %d, want exactly 1 for a single coordinator wedge", updated.Status.Restarts)
 	}
 }
+
+// TestDeferredWedgeChargeSurvivesCoordinatorTeardownExit pins the #369 guard on
+// the wedge path. A stale heartbeat wedges the run and the operator deletes the
+// coordinator; a finalizer keeps the delete in flight as a terminating object.
+// The SIGTERMed process then exits 1 inside the shutdown window — a teardown
+// exit, indistinguishable from a cancelled-stream failure or even exit 0. The
+// guard must refuse to map that exit to a terminal phase: the charge stays
+// deferred until the dead object is provably gone, and the disappearance
+// backstop takes it with the pod-loss cause exactly once.
+func TestDeferredWedgeChargeSurvivesCoordinatorTeardownExit(t *testing.T) {
+	src := &admissionSource{}
+	run := admissionRun("run", "local", courierv1alpha1.PhaseRunning)
+	withHeartbeat(run, livenessClock.Add(-10*time.Minute))
+	pod := runningCoordinatorPod(run)
+	// A finalizer keeps the wedge's delete in flight as a terminating object,
+	// and old timestamps past the liveness window so no freshness grace applies.
+	pod.Finalizers = []string{"courier.misospace.dev/test"}
+	pod.CreationTimestamp = metav1.NewTime(livenessClock.Add(-2 * time.Hour))
+	pod.Status.ContainerStatuses[0].State.Running.StartedAt = metav1.NewTime(livenessClock.Add(-10 * time.Minute))
+	c := phaseClient(t, run, pod)
+	reconciler := livenessReconciler(c, src, livenessClock)
+	reconciler.APIReader = c
+	var eventsOut bytes.Buffer
+	reconciler.Events = courierlog.NewEmitter(&eventsOut, courierlog.LevelDebug)
+	podKey := types.NamespacedName{Name: "run-coordinator", Namespace: "default"}
+
+	// Pass 1: the stale heartbeat wedges; the delete is in flight behind the
+	// finalizer, so the charge is deferred, not taken.
+	result, err := reconciler.Reconcile(context.Background(), admissionRequest("run"))
+	if err != nil {
+		t.Fatalf("Reconcile() wedge pass error = %v", err)
+	}
+	if result.Requeue || result.RequeueAfter != observationRequeueDelay {
+		t.Fatalf("result = %#v, want the deferred re-observation; a still-terminating object defers the charge", result)
+	}
+	var got corev1.Pod
+	if err := c.Get(context.Background(), podKey, &got); err != nil {
+		t.Fatalf("get pod: %v, want the deleted object to survive as terminating", err)
+	}
+	if got.DeletionTimestamp == nil {
+		t.Fatal("deletionTimestamp = nil, want set; the finalizer must keep the deleted object terminating")
+	}
+
+	// The torn-down process exits 1 inside the shutdown window: the same object,
+	// still terminating, now records a failed exit.
+	got.Status.ContainerStatuses[0].State = corev1.ContainerState{
+		Terminated: &corev1.ContainerStateTerminated{ExitCode: 1, Reason: "Error"},
+	}
+	if err := c.Status().Update(context.Background(), &got); err != nil {
+		t.Fatalf("record teardown exit: %v", err)
+	}
+
+	// Pass 2: a teardown exit on a terminating pod must not terminalize the run
+	// or publish a source lifecycle; it is re-observed.
+	result, err = reconciler.Reconcile(context.Background(), admissionRequest("run"))
+	if err != nil {
+		t.Fatalf("Reconcile() teardown pass error = %v", err)
+	}
+	if result.Requeue || result.RequeueAfter != observationRequeueDelay {
+		t.Fatalf("result = %#v, want the deferred re-observation; a terminating coordinator's teardown exit is never mapped", result)
+	}
+	var mid courierv1alpha1.CoderRun
+	if err := c.Get(context.Background(), admissionKey("run"), &mid); err != nil {
+		t.Fatalf("get run: %v", err)
+	}
+	if mid.Status.Phase != courierv1alpha1.PhaseRunning {
+		t.Fatalf("phase = %q, want Running; a teardown exit on a terminating pod must not terminalize the run", mid.Status.Phase)
+	}
+	if mid.Status.Restarts != 0 {
+		t.Fatalf("restarts = %d, want 0; a terminating coordinator's teardown exit is not charged yet", mid.Status.Restarts)
+	}
+	if len(src.transitions) != 0 || len(src.reports) != 0 {
+		t.Fatalf("transitions = %#v, reports = %#v, want none; a deferred charge is not a terminal publish", src.transitions, src.reports)
+	}
+
+	// Release the finalizer so the object is provably gone, then reconcile: the
+	// disappearance backstop takes the deferred charge with the pod-loss cause.
+	got.Finalizers = nil
+	if err := c.Update(context.Background(), &got); err != nil {
+		t.Fatalf("release finalizer: %v", err)
+	}
+	if err := c.Get(context.Background(), podKey, &got); !apierrors.IsNotFound(err) {
+		t.Fatalf("get pod after finalizer release: %v, want NotFound; the object must be gone", err)
+	}
+
+	result, err = reconciler.Reconcile(context.Background(), admissionRequest("run"))
+	if err != nil {
+		t.Fatalf("Reconcile() final pass error = %v", err)
+	}
+	if !result.Requeue {
+		t.Fatalf("Requeue = false, want true; a confirmed-gone loss must relaunch from its checkpoint")
+	}
+	var after courierv1alpha1.CoderRun
+	if err := c.Get(context.Background(), admissionKey("run"), &after); err != nil {
+		t.Fatalf("get run final pass: %v", err)
+	}
+	if after.Status.Phase != courierv1alpha1.PhaseClaimed {
+		t.Fatalf("phase = %q, want Claimed; the loss is charged once the dead object is gone", after.Status.Phase)
+	}
+	if after.Status.Restarts != 1 {
+		t.Fatalf("restarts = %d, want 1; one physical loss is charged exactly once", after.Status.Restarts)
+	}
+	if reason := eventReason(t, &eventsOut, string(courierv1alpha1.PhaseClaimed)); reason != podLostEventReason {
+		t.Fatalf("relaunch event reason = %q, want %q; the backstop charges the deferred loss with the pod-loss cause", reason, podLostEventReason)
+	}
+}
+
+// TestTerminatedCoordinatorNotDeletedStillMapsExitCode is the mirror of the
+// #369 guard. A coordinator that exits 1 with no deletion in flight and no
+// finalizer is not torn down: its exit is the model's own verdict and is mapped
+// to its terminal phase exactly as the exit-code table says, publishing the
+// source lifecycle. The restart counter is untouched, because a coordinator
+// failure is a terminal phase, not an infrastructure loss.
+func TestTerminatedCoordinatorNotDeletedStillMapsExitCode(t *testing.T) {
+	src := &admissionSource{}
+	run := admissionRun("run", "local", courierv1alpha1.PhaseRunning)
+	// A fresh heartbeat keeps liveness out of the picture: the exit is mapped in
+	// the pod loop before liveness is even consulted, and must not be reaped.
+	withHeartbeat(run, livenessClock)
+	pod := runningCoordinatorPod(run)
+	// No finalizer and no deletion timestamp: a plain dead coordinator that the
+	// kubelet reported as failed with a non-success exit.
+	pod.Status.Phase = corev1.PodFailed
+	pod.Status.ContainerStatuses[0].State = corev1.ContainerState{
+		Terminated: &corev1.ContainerStateTerminated{ExitCode: 1, Reason: "Error"},
+	}
+	c := phaseClient(t, run, pod)
+	reconciler := livenessReconciler(c, src, livenessClock)
+
+	result, err := reconciler.Reconcile(context.Background(), admissionRequest("run"))
+	if err != nil {
+		t.Fatalf("Reconcile() error = %v", err)
+	}
+	if result.Requeue || result.RequeueAfter != 0 {
+		t.Fatalf("result = %#v, want no requeue; a terminalized run settles in place", result)
+	}
+	var updated courierv1alpha1.CoderRun
+	if err := c.Get(context.Background(), admissionKey("run"), &updated); err != nil {
+		t.Fatalf("get run: %v", err)
+	}
+	if updated.Status.Phase != courierv1alpha1.PhaseFailed {
+		t.Fatalf("phase = %q, want Failed; an exit that is not torn down is mapped to its terminal phase", updated.Status.Phase)
+	}
+	if updated.Status.Restarts != 0 {
+		t.Fatalf("restarts = %d, want 0; a coordinator failure is a terminal phase, not an infrastructure loss", updated.Status.Restarts)
+	}
+	if len(src.transitions) != 1 || src.transitions[0] != source.StateNeedsHuman {
+		t.Fatalf("transitions = %#v, want [needs-human]; a coordinator failure parks the source for a human", src.transitions)
+	}
+	if len(src.reports) != 1 || src.reports[0].Result != source.ResultBlocked {
+		t.Fatalf("reports = %#v, want one blocked report", src.reports)
+	}
+	if !strings.Contains(src.reports[0].Error, "coordinator failed") {
+		t.Fatalf("reported error = %q, want the coordinator-failure cause", src.reports[0].Error)
+	}
+}
+
+// TestTerminatingCoordinatorMeaningfulExitTakesPodLossRelaunch pins the #369
+// guard on the success path with a live run. The coordinator's deletion is
+// already in flight (a finalizer holds the terminating object) and it records a
+// successful exit 0. With a fresh heartbeat the run is live, so no wedge reap is
+// even attempted; the deferral comes from the disappearance backstop's
+// terminating branch. The meaningful exit must not map to Verifying, and once
+// the finalizer is released and the object is provably gone, the backstop
+// charges the pod-loss relaunch.
+func TestTerminatingCoordinatorMeaningfulExitTakesPodLossRelaunch(t *testing.T) {
+	src := &admissionSource{}
+	run := admissionRun("run", "local", courierv1alpha1.PhaseRunning)
+	// A fresh heartbeat: the run is live, so the wedge's stale-heartbeat reap is
+	// not triggered; the deferral must come from the terminating branch instead.
+	withHeartbeat(run, livenessClock)
+	pod := runningCoordinatorPod(run)
+	// The coordinator exited 0 (a meaningful success) but its deletion is in
+	// flight: a finalizer holds the terminating object.
+	pod.Status.Phase = corev1.PodSucceeded
+	pod.Status.ContainerStatuses[0].State = corev1.ContainerState{
+		Terminated: &corev1.ContainerStateTerminated{ExitCode: 0, Reason: "Completed"},
+	}
+	pod.Finalizers = []string{"courier.misospace.dev/test"}
+	pod.DeletionTimestamp = &metav1.Time{Time: livenessClock}
+	c := phaseClient(t, run, pod)
+	reconciler := livenessReconciler(c, src, livenessClock)
+	reconciler.APIReader = c
+	var eventsOut bytes.Buffer
+	reconciler.Events = courierlog.NewEmitter(&eventsOut, courierlog.LevelDebug)
+	podKey := types.NamespacedName{Name: "run-coordinator", Namespace: "default"}
+
+	// Pass 1: the object is terminating. Its exit 0 must not map to Verifying;
+	// the backstop defers until the object is gone.
+	result, err := reconciler.Reconcile(context.Background(), admissionRequest("run"))
+	if err != nil {
+		t.Fatalf("Reconcile() error = %v", err)
+	}
+	if result.Requeue {
+		t.Fatalf("Requeue = true, want false; a terminating coordinator is re-observed, not relaunched")
+	}
+	if result.RequeueAfter != observationRequeueDelay {
+		t.Fatalf("RequeueAfter = %v, want %v; a terminating coordinator's meaningful exit is deferred, not mapped", result.RequeueAfter, observationRequeueDelay)
+	}
+	var mid courierv1alpha1.CoderRun
+	if err := c.Get(context.Background(), admissionKey("run"), &mid); err != nil {
+		t.Fatalf("get run: %v", err)
+	}
+	if mid.Status.Phase != courierv1alpha1.PhaseRunning {
+		t.Fatalf("phase = %q, want Running; a terminating coordinator's exit 0 must not map to Verifying", mid.Status.Phase)
+	}
+	if mid.Status.Restarts != 0 {
+		t.Fatalf("restarts = %d, want 0; a still-terminating coordinator is not a confirmed loss", mid.Status.Restarts)
+	}
+	if len(src.transitions) != 0 || len(src.reports) != 0 {
+		t.Fatalf("transitions = %#v, reports = %#v, want none; a deferred charge is not a terminal publish", src.transitions, src.reports)
+	}
+
+	// Release the finalizer so the object is provably gone, then reconcile: the
+	// disappearance backstop takes the pod-loss relaunch.
+	var gone corev1.Pod
+	if err := c.Get(context.Background(), podKey, &gone); err != nil {
+		t.Fatalf("get pod: %v, want the terminating object before release", err)
+	}
+	gone.Finalizers = nil
+	if err := c.Update(context.Background(), &gone); err != nil {
+		t.Fatalf("release finalizer: %v", err)
+	}
+	if err := c.Get(context.Background(), podKey, &gone); !apierrors.IsNotFound(err) {
+		t.Fatalf("get pod after finalizer release: %v, want NotFound; the object must be gone", err)
+	}
+
+	result, err = reconciler.Reconcile(context.Background(), admissionRequest("run"))
+	if err != nil {
+		t.Fatalf("Reconcile() final pass error = %v", err)
+	}
+	if !result.Requeue {
+		t.Fatalf("Requeue = false, want true; a confirmed-gone loss must relaunch from its checkpoint")
+	}
+	var after courierv1alpha1.CoderRun
+	if err := c.Get(context.Background(), admissionKey("run"), &after); err != nil {
+		t.Fatalf("get run final pass: %v", err)
+	}
+	if after.Status.Phase != courierv1alpha1.PhaseClaimed {
+		t.Fatalf("phase = %q, want Claimed; the loss is charged once the dead object is gone", after.Status.Phase)
+	}
+	if after.Status.Restarts != 1 {
+		t.Fatalf("restarts = %d, want 1; one physical loss is charged exactly once", after.Status.Restarts)
+	}
+	if reason := eventReason(t, &eventsOut, string(courierv1alpha1.PhaseClaimed)); reason != podLostEventReason {
+		t.Fatalf("relaunch event reason = %q, want %q; the backstop charges the pod loss with the pod-loss cause", reason, podLostEventReason)
+	}
+}

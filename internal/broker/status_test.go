@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"testing"
 
 	corev1 "k8s.io/api/core/v1"
@@ -16,6 +17,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
 	courier "github.com/misospace/courier/api/v1alpha1"
+	"github.com/misospace/courier/internal/topology"
 )
 
 const (
@@ -43,6 +45,43 @@ func statusFixture(t *testing.T) (*StatusWriter, client.Client, StatusIdentity) 
 		t.Fatal(err)
 	}
 	return w, c, StatusIdentity{RunUID: uid, ControlPod: pod.Name, ControlPodUID: podUID, ControlServiceAccount: "control-sa"}
+}
+
+func TestStatusWriterBindsSanitizedRunLabel(t *testing.T) {
+	long := strings.Repeat("a", 63) + "-overflow"
+	if topology.RunLabelValue(long) == long {
+		t.Fatalf("test precondition: %q must overflow the label cap", long)
+	}
+	scheme := runtime.NewScheme()
+	if err := courier.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	if err := corev1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	uid := types.UID("run-uid-long")
+	podUID := types.UID("pod-uid-long")
+	controller := true
+	run := &courier.CoderRun{ObjectMeta: metav1.ObjectMeta{Namespace: testNamespace, Name: long, UID: uid}}
+	pod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Namespace: testNamespace, Name: "control-long", UID: podUID, Labels: map[string]string{topology.LabelRun: topology.RunLabelValue(long), "courier.misospace.dev/component": "coordinator"}, OwnerReferences: []metav1.OwnerReference{{APIVersion: courier.GroupVersion.String(), Kind: "CoderRun", Name: long, UID: uid, Controller: &controller}}}, Spec: corev1.PodSpec{ServiceAccountName: "control-sa"}}
+	c := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(&courier.CoderRun{}).WithObjects(run, pod).Build()
+	w, err := NewStatusWriter(c, c, testNamespace, long)
+	if err != nil {
+		t.Fatal(err)
+	}
+	identity := StatusIdentity{RunUID: uid, ControlPod: pod.Name, ControlPodUID: podUID, ControlServiceAccount: "control-sa"}
+	checkpoint := &courier.Checkpoint{Plan: "long-run"}
+	if err := w.Write(context.Background(), identity, HarnessPatch{Checkpoint: checkpoint}, nil); err != nil {
+		t.Fatalf("Write rejected a control pod labeled with the sanitized run label: %v", err)
+	}
+
+	pod.Labels[topology.LabelRun] = long
+	if err := c.Update(context.Background(), pod); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.Write(context.Background(), identity, HarnessPatch{Checkpoint: &courier.Checkpoint{Plan: "raw"}}, nil); err == nil {
+		t.Fatal("Write accepted a control pod labeled with the raw run name")
+	}
 }
 
 func TestStatusWriterRejectsCrossRunIdentity(t *testing.T) {

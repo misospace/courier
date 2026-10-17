@@ -1022,7 +1022,11 @@ func (c *Coordinator) dispatchAndAwait(ctx context.Context, opID, briefID string
 		if reconcileErr != nil {
 			return protocol.Result{}, fmt.Errorf("dispatch of %s failed and reconciliation failed: dispatch: %v; reconcile: %w", opID, err, reconcileErr)
 		}
-		return c.verifiedResult(ctx, opID, state)
+		result, resultErr := c.verifiedResult(ctx, opID, state)
+		if resultErr == nil {
+			c.releaseConsumed(ctx, opID, briefID)
+		}
+		return result, resultErr
 	}
 	for {
 		state, err := c.worker.Result(ctx, opID)
@@ -1035,7 +1039,11 @@ func (c *Coordinator) dispatchAndAwait(ctx context.Context, opID, briefID string
 			if reconcileErr != nil {
 				return protocol.Result{}, fmt.Errorf("result poll for %s failed and reconciliation failed: poll: %v; reconcile: %w", opID, err, reconcileErr)
 			}
-			return c.verifiedResult(ctx, opID, reconciled)
+			result, resultErr := c.verifiedResult(ctx, opID, reconciled)
+			if resultErr == nil {
+				c.releaseConsumed(ctx, opID, briefID)
+			}
+			return result, resultErr
 		}
 		switch state.Status {
 		case protocol.ResultCompleted, protocol.ResultFailed, protocol.ResultCancelled:
@@ -1043,7 +1051,11 @@ func (c *Coordinator) dispatchAndAwait(ctx context.Context, opID, briefID string
 				c.closeOperation(ctx, opID, false)
 				return protocol.Result{}, fmt.Errorf("operation %s ended as %s without a result", opID, state.Status)
 			}
-			return c.verifiedResult(ctx, opID, state)
+			result, resultErr := c.verifiedResult(ctx, opID, state)
+			if resultErr == nil {
+				c.releaseConsumed(ctx, opID, briefID)
+			}
+			return result, resultErr
 		case "":
 			// The worker definitively does not know the operation: it is not
 			// running, and the entry says otherwise only because the worker
@@ -1081,8 +1093,22 @@ func (c *Coordinator) verifiedResult(ctx context.Context, opID string, state pro
 		c.closeOperation(ctx, opID, false)
 		return protocol.Result{}, fmt.Errorf("reconciliation of %s observed status %q without a result", opID, state.Status)
 	}
+	if state.Result.LiveDescendants > 0 {
+		// The worker reported work that outlived the task, so its terminal
+		// observation is not a verified termination: the entry is retained
+		// and the result is returned as an error, never as a cleared,
+		// suppressible operation (#372).
+		return *state.Result, fmt.Errorf("operation %s ended as %s with %d processes still live in its task tree", opID, state.Status, state.Result.LiveDescendants)
+	}
 	c.closeOperation(ctx, opID, state.Status == protocol.ResultCompleted)
 	return *state.Result, nil
+}
+
+// releaseConsumed is best-effort after a verified result is held in control
+// memory: a failed release leaves the worker's retained payload in place
+// until worker replacement and never fails a verified outcome.
+func (c *Coordinator) releaseConsumed(ctx context.Context, opID, briefID string) {
+	_ = c.worker.Release(ctx, opID, briefID)
 }
 
 // closeOperation clears one operation entry after verified termination and

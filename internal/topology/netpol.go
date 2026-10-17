@@ -170,15 +170,15 @@ func dnsEgressRule(protocolTCP, protocolUDP corev1.Protocol, dnsPort intstr.IntO
 }
 
 func workerSelector(runName string) map[string]string {
-	return map[string]string{LabelRun: runName, "courier.misospace.dev/component": ComponentWorker}
+	return map[string]string{LabelRun: RunLabelValue(runName), "courier.misospace.dev/component": ComponentWorker}
 }
 
 func coordinatorSelector(runName string) map[string]string {
-	return map[string]string{LabelRun: runName, "courier.misospace.dev/component": ComponentCoordinator}
+	return map[string]string{LabelRun: RunLabelValue(runName), "courier.misospace.dev/component": ComponentCoordinator}
 }
 
 func brokerSelector(runName string) map[string]string {
-	return map[string]string{LabelRun: runName, "courier.misospace.dev/component": ComponentBroker}
+	return map[string]string{LabelRun: RunLabelValue(runName), "courier.misospace.dev/component": ComponentBroker}
 }
 
 func isIPv6(ip string) bool {
