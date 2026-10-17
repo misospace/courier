@@ -1775,7 +1775,8 @@ func podBelongsToRun(pod *corev1.Pod, run *courierv1alpha1.CoderRun) bool {
 			return true
 		}
 	}
-	return pod.Labels[executor.LabelRun] == run.Name
+	label := pod.Labels[executor.LabelRun]
+	return label == executor.RunLabelValue(run.Name) || label == topology.RunLabelValue(run.Name)
 }
 
 type terminationMessage struct {
