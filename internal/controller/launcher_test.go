@@ -9,6 +9,7 @@ import (
 	"testing"
 
 	corev1 "k8s.io/api/core/v1"
+	rbacv1 "k8s.io/api/rbac/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -75,6 +76,9 @@ func launcherScheme(t *testing.T) *runtime.Scheme {
 	}
 	if err := corev1.AddToScheme(scheme); err != nil {
 		t.Fatalf("add core scheme: %v", err)
+	}
+	if err := rbacv1.AddToScheme(scheme); err != nil {
+		t.Fatalf("add rbac scheme: %v", err)
 	}
 	return scheme
 }
@@ -638,10 +642,16 @@ func TestCoordinatorLauncherReportsProvisioningInFlightWhenExistingPodVanishesBe
 		WithScheme(launcherScheme(t)).
 		WithStatusSubresource(&courierv1alpha1.CoderRun{}).
 		WithInterceptorFuncs(interceptor.Funcs{
-			// Create returns AlreadyExists as if a previous create of the
-			// same name had landed, but the follow-up Get sees nothing.
+			// The pod create collides as if a previous create of the same
+			// name had landed, but the follow-up Get sees nothing.
+			// Scoped to pods: observer identity provisioning now precedes
+			// the pod create, and provisioning its own resources is not
+			// the race under test.
 			Create: func(ctx context.Context, c client.WithWatch, obj client.Object, opts ...client.CreateOption) error {
-				return apierrors.NewAlreadyExists(schema.GroupResource{Group: "", Resource: "pods"}, obj.GetName())
+				if _, ok := obj.(*corev1.Pod); ok {
+					return apierrors.NewAlreadyExists(schema.GroupResource{Group: "", Resource: "pods"}, obj.GetName())
+				}
+				return c.Create(ctx, obj, opts...)
 			},
 		}).
 		WithRuntimeObjects(run, lane).

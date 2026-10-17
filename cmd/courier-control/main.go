@@ -433,8 +433,11 @@ type controlIdentity struct {
 	brokerURL      string
 	statusURL      string
 	signingKey     []byte
-	brokerToken    []byte
-	brokerCA       []byte
+	// brokerTokenSource reads the projected broker-audience token per
+	// request: kubelet rotates the mounted file, so the bytes are never
+	// frozen into control identity.
+	brokerTokenSource harness.BrokerTokenSource
+	brokerCA          []byte
 }
 
 func loadIdentity() (*controlIdentity, error) {
@@ -455,8 +458,8 @@ func loadIdentity() (*controlIdentity, error) {
 		return nil, errors.New("courier-control: signing key is missing or unusable")
 	}
 	out.signingKey = key
-	out.brokerToken, err = os.ReadFile(os.Getenv(topology.EnvBrokerTokenFile))
-	if err != nil || len(out.brokerToken) == 0 {
+	out.brokerTokenSource = harness.NewFileBrokerTokenSource(os.Getenv(topology.EnvBrokerTokenFile))
+	if token, tokenErr := out.brokerTokenSource.BrokerToken(); tokenErr != nil || len(token) == 0 {
 		return nil, errors.New("courier-control: projected broker token is missing")
 	}
 	out.brokerCA, err = os.ReadFile(os.Getenv(topology.EnvBrokerCAFile))
@@ -486,12 +489,12 @@ func (i *controlIdentity) delegator() *harness.Delegator {
 
 // brokerProber reaches the broker's typed capability report over TLS.
 func (i *controlIdentity) brokerProber() *harness.BrokerProbeClient {
-	return &harness.BrokerProbeClient{BaseURL: i.brokerURL, Token: i.brokerToken, CA: i.brokerCA}
+	return &harness.BrokerProbeClient{BaseURL: i.brokerURL, TokenSource: i.brokerTokenSource, CA: i.brokerCA}
 }
 
 // brokerClient reaches the broker's typed publication API over TLS.
 func (i *controlIdentity) brokerClient() *harness.BrokerClient {
-	return &harness.BrokerClient{BaseURL: i.brokerURL, Token: i.brokerToken, CA: i.brokerCA}
+	return &harness.BrokerClient{BaseURL: i.brokerURL, TokenSource: i.brokerTokenSource, CA: i.brokerCA}
 }
 
 // brokerStatusClient reaches the broker's separate trusted status listener
@@ -499,7 +502,7 @@ func (i *controlIdentity) brokerClient() *harness.BrokerClient {
 // neither earn heartbeats nor persist dispatch evidence, so a missing URL
 // fails the launch.
 func (i *controlIdentity) brokerStatusClient() *harness.BrokerClient {
-	return &harness.BrokerClient{BaseURL: i.statusURL, Token: i.brokerToken, CA: i.brokerCA}
+	return &harness.BrokerClient{BaseURL: i.statusURL, TokenSource: i.brokerTokenSource, CA: i.brokerCA}
 }
 
 // probeWorker exercises the signed worker protocol end to end: snapshot

@@ -20,6 +20,10 @@ func TestIssueCapacityHandoffLostResponseWithoutAuditPreservesReplacement(t *tes
 		switch r.URL.Path {
 		case "/api/audit":
 			_ = json.NewEncoder(w).Encode([]any{})
+		case "/api/issues/state":
+			// Settle resolves the internal issue ID through the same read-only
+			// lookup Claim uses; the claim-token fence below stays the authority.
+			_ = json.NewEncoder(w).Encode(map[string]any{"issueId": "issue-a", "repoFullName": "acme/widgets", "number": 42})
 		case "/api/issues/capacity-handoff":
 			posts++
 			var body struct {

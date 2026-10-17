@@ -685,6 +685,7 @@ spec:
                     - needs-decision
                     - blocked-external
                     - capacity-exhaustion
+                    - provider-unavailable
                     - unknown
                     type: string
                   container:

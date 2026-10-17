@@ -624,15 +624,40 @@ func manifestFits(manifest *Manifest, entries []Entry, omittedByBudget int) (boo
 }
 
 // runGit executes a git command in dir and returns stdout, wrapping failures
-// with the command's stderr.
+// with the command's trimmed, capped stderr. A canceled context returns its
+// own error even while a surviving grandchild holds a pipe open, and a command
+// that exited successfully before its pipe was held returns its output rather
+// than an exec.ErrWaitDelay error.
 func runGit(ctx context.Context, dir string, args ...string) ([]byte, error) {
 	cmd := exec.CommandContext(ctx, "git", args...)
 	cmd.Dir = dir
-	var stdout, stderr bytes.Buffer
+	// Stdout and Stderr are io.Writers, so os/exec copies the child's output
+	// through goroutines that Wait blocks on: a surviving grandchild holding a
+	// pipe write end never sends EOF and would stall Wait itself, past the
+	// context. The delay bounds that wait, as the executor's git calls already
+	// do (cmd/courier-executor/main.go).
+	cmd.WaitDelay = 2 * time.Second
+	var stdout bytes.Buffer
+	var stderr cappedBuffer
+	stderr.limit = stderrLimit
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
 	if err := cmd.Run(); err != nil {
-		return nil, fmt.Errorf("git %s: %w: %s", strings.Join(args, " "), err, strings.TrimSpace(stderr.String()))
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
+		// ErrWaitDelay arrives only for a process that exited successfully with
+		// its pipes still open — a surviving grandchild — and ProcessState
+		// confirms that here rather than leaning on os/exec's precedence. git
+		// wrote its full output before exiting and the copy goroutine drained
+		// the pipe before parking on the held write end, so the buffered bytes
+		// are the complete result and the timeout is ours, not git's: keep
+		// them. A child that exited non-zero keeps its exit status in the
+		// wrapped error below.
+		if errors.Is(err, exec.ErrWaitDelay) && cmd.ProcessState != nil && cmd.ProcessState.Success() {
+			return stdout.Bytes(), nil
+		}
+		return nil, fmt.Errorf("git %s: %w: %s", strings.Join(args, " "), err, strings.TrimSpace(string(stderr.data)))
 	}
 	return stdout.Bytes(), nil
 }
@@ -672,8 +697,8 @@ func runGitCapped(ctx context.Context, dir string, limit int, args ...string) (o
 	return out, false, nil
 }
 
-// stderrLimit bounds the child stderr captured by runGitCapped so a verbose
-// or failing git cannot allocate unbounded memory there either.
+// stderrLimit bounds the child stderr captured by runGit and runGitCapped so
+// a verbose or failing git cannot allocate unbounded memory there either.
 const stderrLimit = 4 * 1024
 
 // cappedBuffer is an io.Writer that keeps at most its limit bytes, silently
@@ -684,14 +709,19 @@ type cappedBuffer struct {
 }
 
 func (b *cappedBuffer) Write(p []byte) (int, error) {
+	// The full length is always reported as consumed: returning the truncated
+	// count once the limit is reached mid-chunk would be a short write, which
+	// stops io.Copy — and the exec copy goroutine closes the pipe when its
+	// copy stops, SIGPIPE-killing a child whose verbose stderr straddled the
+	// cap instead of merely discarding the excess.
 	room := b.limit - len(b.data)
-	if room <= 0 {
-		return len(p), nil
+	if room > 0 {
+		if room < len(p) {
+			b.data = append(b.data, p[:room]...)
+		} else {
+			b.data = append(b.data, p...)
+		}
 	}
-	if room < len(p) {
-		p = p[:room]
-	}
-	b.data = append(b.data, p...)
 	return len(p), nil
 }
 

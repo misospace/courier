@@ -177,3 +177,51 @@ func TestIssueCapacityHandoffUsesClaimReceipt(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+// TestIssueCapacityRecoveryResolvesMissingIssueID is the deployed-smoke
+// regression (#327): Dispatch's task offer may encode the work ID with only
+// repo+number. Recovery must resolve the internal issue ID through the same
+// state lookup Claim uses — the claim receipt remains the fence — instead of
+// holding the work as unsupported.
+func TestIssueCapacityRecoveryResolvesMissingIssueID(t *testing.T) {
+	id := EncodeWorkID(Task{Type: "implement", Issue: &Issue{Repo: "acme/widgets", Number: 42}})
+	var handedOff map[string]any
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/issues/state":
+			if r.URL.Query().Get("repo") != "acme/widgets" || r.URL.Query().Get("number") != "42" {
+				t.Errorf("state query = %v", r.URL.RawQuery)
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{"issueId": "issue-a", "repoFullName": "acme/widgets", "number": 42})
+		case "/api/audit":
+			_ = json.NewEncoder(w).Encode([]map[string]any{})
+		case "/api/issues/capacity-handoff":
+			if err := json.NewDecoder(r.Body).Decode(&handedOff); err != nil {
+				t.Error(err)
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{"success": true})
+		default:
+			t.Errorf("unexpected path %s", r.URL.Path)
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+	c, err := NewClient(server.URL, "worker-a", "auth", time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	receipt := `{"claimToken":"issued-a"}`
+	proof, err := c.PrepareCapacityRecovery(context.Background(), id, receipt)
+	if err != nil {
+		t.Fatalf("missing encoded issue ID must not strand recovery: %v", err)
+	}
+	if proof.FenceToken != "issued-a" || proof.WorkIdentity != WorkIdentity(id) {
+		t.Fatalf("proof = %#v", proof)
+	}
+	if err := c.SettleCapacityExhaustion(context.Background(), id, receipt, source.CapacityHandoff{FenceToken: "issued-a", WorkIdentity: proof.WorkIdentity, CapacityIdentity: "capacity-a"}); err != nil {
+		t.Fatal(err)
+	}
+	if handedOff["issueId"] != "issue-a" || handedOff["claimToken"] != "issued-a" {
+		t.Fatalf("handoff body = %#v", handedOff)
+	}
+}
