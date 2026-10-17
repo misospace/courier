@@ -3788,6 +3788,49 @@ was superseded.
   client query had no remaining caller after this change and is gone, so one
   listing seam remains. (#365, closing the `Observer` carve-out left open by
   the #343 entry.)
+- **2026-10-17 — #390: the read phase observes the operation deadline the git
+  calls already observed.**
+  `Capture` bounded its git calls by the 20-second operation deadline
+  (`exec.CommandContext`) but its per-file reads took no context at all, so one
+  stalling read — a regular file on a hung filesystem — carried the capture
+  past that deadline, through the pod's 45-second grace, to SIGKILL, and the
+  manifest went with it: "over deadline the
+  bundle degrades to the manifest alone" was unreachable for the one phase git
+  did not bound. The read is now bounded by the same context. The mechanism is
+  deliberately weak: a pre-check fails fast when the deadline is already gone
+  (no goroutine at all), and otherwise the open and the capped read run in a
+  goroutine whose result is received unless the context is done first.
+  Cancellation abandons that goroutine rather than interrupting it — closing a
+  descriptor from another goroutine is not a reliable way to unblock a read
+  already blocked in the kernel — and the abandoned read's bytes are discarded
+  and never stored, so bounding the wait costs no content risk. A canceled read
+  returns the context's error rather than a read failure to be classified, which
+  is what makes the executor's existing manifest-only degradation reachable
+  here: the same `Capture` error the executor already handles, with the same
+  fresh five-second window the 2026-10-09 decision grants a capture the
+  deadline itself aborted. The `O_NONBLOCK` open plus non-regular descriptor
+  guard that closes the fifo-swap hole (#336, merged as #389) was deliberately
+  kept out of #390's own change rather than folded into it: it is a different
+  problem — refusing to open a non-regular file at all, rather than bounding
+  the read that follows. The two landed independently and this merge composes
+  them in one function: `O_NONBLOCK` keeps a non-regular
+  swap from stalling the open, and the context bounds what survives that check,
+  which is a read of a regular file the kernel has already accepted. As #389
+  predicted, its guard took this regression's fixture with it: a fifo is
+  refused with `errNotRegular` before any read begins, so the abandoned-read
+  primitive is now reachable only by a hung filesystem serving a regular file,
+  which a unit test cannot construct without a privileged mount. The primitive
+  test therefore pins what is still observable — a context that is already
+  done is answered from the context, not with the path's own `errNotRegular`,
+  which is the ordering the taxonomy depends on — and the bound's observable
+  consequence is pinned end to end through the `readFileForCapture` seam. The
+  fast-path pre-check is not pinned by it, and the reason is measured rather
+  than argued: because #389 answers a fifo in two syscalls, without the
+  pre-check the goroutine's `errNotRegular` and the already-done context are
+  sometimes both ready at the select, which breaks that tie at random — about
+  1 run in 25,000 (20 of 500k), far below what a test can detect. The pre-check
+  is kept for the fast path it buys (no goroutine, no syscalls), not because a
+  test fails without it. (#390)
 - **2026-10-17 — #383: a pod-bound credential is read per request, never
   frozen.** Secure control read its projected broker-audience token once in
   `loadIdentity` and handed the byte slice to the capability, publication and

@@ -65,9 +65,9 @@ type change struct {
 
 // Capture snapshots the worktree and local commits into a manifest plus a tar
 // of admitted content. It is read-only on the repository (status, rev-list,
-// format-patch, and file reads) and honours ctx cancellation on git calls.
-// The order of operations is normative: enumerate, classify, scan, then build
-// the tar and the budget-bounded manifest.
+// format-patch, and file reads) and honours ctx cancellation on git calls and
+// on the per-file reads. The order of operations is normative: enumerate,
+// classify, scan, then build the tar and the budget-bounded manifest.
 func Capture(ctx context.Context, opts Options) (*Bundle, error) {
 	scanner := opts.Scanner
 	if scanner == nil {
@@ -117,8 +117,17 @@ func Capture(ctx context.Context, opts Options) (*Bundle, error) {
 			// omitted-over-limit WITHOUT a content scan, so an oversized
 			// file is never read into memory whole; both omitted-binary
 			// and omitted-over-limit store nothing.
-			data, rerr := readFileForCapture(full, MaxFileBytes+1)
+			data, rerr := readFileForCapture(ctx, full, MaxFileBytes+1)
 			if rerr != nil {
+				// Cancellation is settled before the read-error taxonomy: a
+				// read abandoned at the operation deadline carries a context
+				// error, and recording that as an omitted binary would both
+				// mask a stale content classification and keep the capture
+				// going instead of handing the caller the error its
+				// manifest-only degradation already handles.
+				if ctx.Err() != nil {
+					return nil, ctx.Err()
+				}
 				if errors.Is(rerr, syscall.ELOOP) {
 					// The path was swapped for a symlink between the Lstat
 					// classification and this O_NOFOLLOW open: re-classify as
@@ -451,9 +460,9 @@ func truncateDisplay(s string) string {
 // regular file, so nothing was read and nothing can be stored.
 var errNotRegular = errors.New("evidence: opened file is not regular")
 
-// readFileForCapture reads the content of a file classified as regular.
-// Tests swap it to simulate a hostile worktree mutating a path between the
-// Lstat classification and the read.
+// readFileForCapture reads, under the capture's own context, the content of a
+// file classified as regular. Tests swap it to simulate a hostile worktree
+// mutating a path between the Lstat classification and the read.
 var readFileForCapture = readCapped
 
 // readCapped opens path without following a trailing symlink (O_NOFOLLOW)
@@ -469,20 +478,59 @@ var readFileForCapture = readCapped
 // Lstat could. O_NONBLOCK is a no-op for the regular files this is reached
 // for. A swap to a socket never reaches this check: a read-only open of a
 // socket fails with ENXIO before any blocking is possible.
-func readCapped(path string, limit int) ([]byte, error) {
-	f, err := os.OpenFile(path, os.O_RDONLY|syscall.O_NOFOLLOW|syscall.O_NONBLOCK, 0)
-	if err != nil {
+//
+// The read is bounded by ctx and not by the file: one stalling read — a
+// regular file on a hung filesystem — must not carry the capture past its
+// operation deadline to the pod's SIGKILL, which would lose the manifest too.
+// The two bounds are independent and compose: O_NONBLOCK keeps a non-regular
+// swap from stalling the open, and the context bounds what survives that
+// check, which is a read of a regular file the kernel has already accepted.
+// Cancellation is checked before any filesystem work, so an already-expired
+// context starts no goroutine at all. Otherwise the open and the capped read
+// run in a goroutine whose result is received unless ctx is done first; on
+// cancellation the abandoned goroutine and its descriptor are left to finish
+// on their own, since closing a descriptor from another goroutine is not a
+// reliable way to interrupt a read already blocked in the kernel. Its bytes
+// are discarded and never stored. The pile-up question has a structural
+// answer rather than a bounded one: reads are sequential and Capture returns
+// at the first canceled read, so a capture abandons at most one goroutine and
+// holds at most its capped prefix.
+func readCapped(ctx context.Context, path string, limit int) ([]byte, error) {
+	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	defer f.Close()
-	info, err := f.Stat()
-	if err != nil {
-		return nil, err
+	type readResult struct {
+		data []byte
+		err  error
 	}
-	if !info.Mode().IsRegular() {
-		return nil, errNotRegular
+	// Buffered so the abandoned goroutine's send never blocks on a receiver
+	// that is already gone.
+	done := make(chan readResult, 1)
+	go func() {
+		f, err := os.OpenFile(path, os.O_RDONLY|syscall.O_NOFOLLOW|syscall.O_NONBLOCK, 0)
+		if err != nil {
+			done <- readResult{err: err}
+			return
+		}
+		defer f.Close()
+		info, err := f.Stat()
+		if err != nil {
+			done <- readResult{err: err}
+			return
+		}
+		if !info.Mode().IsRegular() {
+			done <- readResult{err: errNotRegular}
+			return
+		}
+		data, err := io.ReadAll(io.LimitReader(f, int64(limit)))
+		done <- readResult{data: data, err: err}
+	}()
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	case res := <-done:
+		return res.data, res.err
 	}
-	return io.ReadAll(io.LimitReader(f, int64(limit)))
 }
 
 // buildTar gzips a tar archive of the admitted entries only. An empty set
