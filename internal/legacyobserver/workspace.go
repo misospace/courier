@@ -27,14 +27,22 @@ type Options struct {
 	RemoteURL  string
 	Branch     string
 	BaseBranch string
-	Baseline   string
-	Username   string
-	Token      string
+	// BaseRemoteURL is the authoritative upstream for the base branch when
+	// it differs from RemoteURL — a fork PR-fix run publishes its head on
+	// the fork remote, which need not carry the base branch at all. Empty
+	// means the base lives on RemoteURL, as in a same-repository run.
+	BaseRemoteURL string
+	Baseline      string
+	Username      string
+	Token         string
 }
 
 // Seed fetches trusted refs into a fresh bare repository and returns the work
-// branch tip, or the base tip when no work branch exists yet.
-func Seed(ctx context.Context, remoteURL, baseBranch, workBranch, scratch, username, token string) (string, error) {
+// branch tip, or the base tip when no work branch exists yet. The work branch
+// resolves against RemoteURL; the base-branch fallback resolves against
+// baseRemoteURL (falling back to remoteURL when unset), so a fork holding a
+// valid PR head without the upstream base branch still seeds (#368 review).
+func Seed(ctx context.Context, remoteURL, baseRemoteURL, baseBranch, workBranch, scratch, username, token string) (string, error) {
 	if !validBranch(baseBranch) || !validBranch(workBranch) || baseBranch == workBranch {
 		return "", errors.New("invalid observer branch")
 	}
@@ -52,13 +60,11 @@ func Seed(ctx context.Context, remoteURL, baseBranch, workBranch, scratch, usern
 		return "", err
 	}
 	defer cleanup()
-	if err := fetch(ctx, scratch, remoteURL, "refs/heads/"+baseBranch, "refs/observer/base", auth); err != nil {
-		return "", errors.New("observer base fetch failed")
-	}
-	base, err := refOID(ctx, scratch, "refs/observer/base")
-	if err != nil {
-		return "", errors.New("observer base ref unavailable")
-	}
+	// Resolve the work branch first. On a fork PR-fix run the head remote may
+	// legitimately lack the base branch, and an unavailable base there must
+	// not forfeit a seed whose baseline is the existing head; the base is
+	// consulted only when the fallback is genuinely needed, and then only
+	// from its authoritative upstream remote.
 	remoteWork, err := remoteBranchExists(ctx, scratch, remoteURL, workBranch, auth)
 	if err != nil {
 		return "", errors.New("observer work branch lookup failed")
@@ -71,6 +77,17 @@ func Seed(ctx context.Context, remoteURL, baseBranch, workBranch, scratch, usern
 			return tip, nil
 		}
 		return "", errors.New("observer work ref unavailable")
+	}
+	baseSource := strings.TrimSpace(baseRemoteURL)
+	if baseSource == "" {
+		baseSource = remoteURL
+	}
+	if err := fetch(ctx, scratch, baseSource, "refs/heads/"+baseBranch, "refs/observer/base", auth); err != nil {
+		return "", errors.New("observer base fetch failed")
+	}
+	base, err := refOID(ctx, scratch, "refs/observer/base")
+	if err != nil {
+		return "", errors.New("observer base ref unavailable")
 	}
 	return base, nil
 }
@@ -113,7 +130,13 @@ func Observe(ctx context.Context, o Options) (executor.WorkspaceSafetyEvidence, 
 			ev.State = "dirty"
 			return ev, nil
 		}
-		if err := fetch(ctx, o.Scratch, o.RemoteURL, "refs/heads/"+o.BaseBranch, "refs/observer/base", auth); err != nil {
+		// Same rule as Seed: the base tip belongs to its authoritative
+		// upstream, which the head remote may not carry on a fork run.
+		baseSource := strings.TrimSpace(o.BaseRemoteURL)
+		if baseSource == "" {
+			baseSource = o.RemoteURL
+		}
+		if err := fetch(ctx, o.Scratch, baseSource, "refs/heads/"+o.BaseBranch, "refs/observer/base", auth); err != nil {
 			return ev, nil
 		}
 		base, err := refOID(ctx, o.Scratch, "refs/observer/base")

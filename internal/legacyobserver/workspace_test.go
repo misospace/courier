@@ -142,7 +142,7 @@ func gitTest(t *testing.T, dir string, args ...string) {
 	t.Helper()
 	cmd := exec.Command("git", args...)
 	cmd.Dir = dir
-	cmd.Env = append(os.Environ(), "GIT_TERMINAL_PROMPT=0")
+	cmd.Env = isolatedGitEnv()
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		t.Fatalf("git %s: %v: %s", strings.Join(args, " "), err, out)
@@ -152,9 +152,23 @@ func gitText(t *testing.T, dir string, args ...string) string {
 	t.Helper()
 	cmd := exec.Command("git", args...)
 	cmd.Dir = dir
+	cmd.Env = isolatedGitEnv()
 	out, err := cmd.Output()
 	if err != nil {
 		t.Fatal(err)
 	}
 	return strings.TrimSpace(string(out))
+}
+
+// isolatedGitEnv mirrors production runGit: no host config, no hooks, no
+// prompts. A developer machine's credential helper or hooksPath (e.g.
+// 1Password) must not participate in observer verification or its tests.
+func isolatedGitEnv() []string {
+	return []string{
+		"PATH=" + os.Getenv("PATH"), "HOME=" + os.DevNull,
+		"GIT_CONFIG_NOSYSTEM=1", "GIT_CONFIG_GLOBAL=" + os.DevNull,
+		"GIT_TERMINAL_PROMPT=0", "GIT_OPTIONAL_LOCKS=0", "GIT_CONFIG_COUNT=2",
+		"GIT_CONFIG_KEY_0=core.hooksPath", "GIT_CONFIG_VALUE_0=/dev/null",
+		"GIT_CONFIG_KEY_1=protocol.file.allow", "GIT_CONFIG_VALUE_1=always",
+	}
 }

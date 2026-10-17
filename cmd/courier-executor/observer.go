@@ -31,13 +31,14 @@ func observerMode(ctx context.Context, seed bool) error {
 	options := legacyobserver.Options{
 		Workspace: os.Getenv("COURIER_WORKSPACE"), Scratch: private,
 		RemoteURL: os.Getenv("COURIER_REPO_URL"), Branch: os.Getenv("COURIER_BRANCH"),
-		BaseBranch: os.Getenv("COURIER_BASE"), Username: os.Getenv("COURIER_GIT_USERNAME"), Token: os.Getenv("COURIER_GIT_TOKEN"),
+		BaseBranch: os.Getenv("COURIER_BASE"), BaseRemoteURL: os.Getenv("COURIER_BASE_REPO_URL"),
+		Username: os.Getenv("COURIER_GIT_USERNAME"), Token: os.Getenv("COURIER_GIT_TOKEN"),
 	}
 	baselineFile := filepath.Join(private, "baseline")
 	if seed {
 		operation, cancel := context.WithTimeout(ctx, 30*time.Second)
 		defer cancel()
-		baseline, err := legacyobserver.Seed(operation, options.RemoteURL, options.BaseBranch, options.Branch, filepath.Join(private, "seed-repo"), options.Username, options.Token)
+		baseline, err := legacyobserver.Seed(operation, options.RemoteURL, options.BaseRemoteURL, options.BaseBranch, options.Branch, filepath.Join(private, "seed-repo"), options.Username, options.Token)
 		if err != nil {
 			return fmt.Errorf("observer: could not pin initial remote head: %w", err)
 		}

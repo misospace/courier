@@ -67,15 +67,21 @@ func observerContainer(config PodConfig, invocation Invocation, podName, runUID 
 }
 
 func observerEnvironment(config PodConfig, invocation Invocation, podName, runUID string, observer bool) []corev1.EnvVar {
-	var remote string
+	var remote, baseRemote string
 	for _, env := range podEnvironment(invocation, "opencode", config) {
 		if env.Name == "COURIER_REPO_URL" {
 			remote = env.Value
+		}
+		if env.Name == "COURIER_BASE_REPO_URL" {
+			baseRemote = env.Value
+		}
+		if remote != "" && baseRemote != "" {
 			break
 		}
 	}
 	envs := []corev1.EnvVar{
 		{Name: "COURIER_REPO_URL", Value: remote},
+		{Name: "COURIER_BASE_REPO_URL", Value: baseRemote},
 		{Name: "COURIER_BRANCH", Value: invocation.Branch},
 		{Name: "COURIER_BASE", Value: config.BaseBranch},
 		{Name: "COURIER_RUN_UID", Value: runUID},
