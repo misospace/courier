@@ -405,21 +405,26 @@ to die.
   is deleted so the run's deterministic pod name is free for the replacement —
   except at the restart ceiling, where it survives as the `NeedsHuman`
   hand-off's only record of the cause. Below the ceiling the charge is
-  deferred until a live read shows the deleted object gone on **both** delete
-  paths — the disappearance backstop and every delete of the wedge's reap —
-  so one physical loss is charged once and the replacement can
-   never attach to a dying object the launcher would tolerate. A
-   stale-heartbeat run whose cache already shows such a pod is reaped by the
-   wedge path first, and below the ceiling **every** wedge-path delete is
-   re-confirmed the same way (#105): a cached view can lag the API server's
-   deletion timestamp, and deleting an already-terminating object succeeds
-   without deleting anything, so a no-op delete must not charge a second
-   wedge for one physical loss. A reap whose live re-confirmation finds the
-   object gone charges in place with the generic message; a deferred charge
-   is left to the disappearance backstop, which confirms the loss against
-   the API server and charges it with its pod-loss cause. At the ceiling
-   there is no charge to defer: the wedge preserves the inert unrecoverable
-   object exactly like the backstop and terminalizes in the same reconcile.
+   deferred until a live read shows the deleted object gone on **every** delete
+   path that removes such a dead object — the disappearance backstop and the
+   secure topology's broken-topology relaunch, which deletes the same inert
+   control object for the same reason — so one physical loss is charged once
+   and the replacement can
+    never attach to a dying object the launcher would tolerate. A
+    stale-heartbeat run whose cache already shows such a pod is reaped by the
+    wedge path first, and below the ceiling **every** wedge-path delete is
+    re-confirmed the same way (#105): a cached view can lag the API server's
+    deletion timestamp, and deleting an already-terminating object succeeds
+    without deleting anything, so a no-op delete must not charge a second
+    wedge for one physical loss. A reap whose live re-confirmation finds the
+    object gone charges in place with the generic message; a deferred charge
+    is left to the disappearance backstop, which confirms the loss against
+    the API server and charges it with its pod-loss cause. At the ceiling
+    there is no charge to defer: the wedge preserves the inert unrecoverable
+    object exactly like the backstop and terminalizes in the same reconcile,
+    and `SecureControl`'s broken-topology relaunch preserves an unrecoverable
+    control object the same way, so the `NeedsHuman` hand-off keeps the only
+    record of the cause whichever path detected the loss (#106, #223).
    The wedge path's pod set — reap and startup grace — is the run's
    **coordinator** pod, identified by the coordinator container, never
    every pod bearing the run's label: a secure round's worker and broker
@@ -1399,7 +1404,13 @@ there is no delete verb because active runs reference lanes. (#73)
   stall relaunches/resumes it; a crashloop reaches NeedsHuman.
 - **Verifying** — no coordinator pod or liveness meaning. The operator polls
   the external PR and CI world indefinitely, with a reconciliation cadence and
-  no deadline. Observer errors remain Verifying and requeue. A missing observer
+  no deadline. Observer errors remain Verifying and requeue. The poll reads the
+  run head's pull requests through the identity-checked forge listing, so a
+  record whose base or head repository identity differs from the run's — a
+  same-owner fork claiming `owner:branch` — and a response carrying no
+  repository identity at all both fail the poll closed: they are the same
+  unverifiable world as a read error, never a "no pull request" claim
+  published as this run's state (#365). A missing observer
   or missing/draft PR reaches **NeedsHuman**. A failed check on a fix-pr run
   reaches **Failed** so its source can apply its retry policy. A resolve-issue
   run whose published PR has stable, confirmed red checks reaches **HandedOff**
@@ -1959,6 +1970,62 @@ named items remain unresolved and must not be described as production-ready:
   moving outweighs failing fast: an idle local capacity on a claimed item is
   the failure mode this feature exists to end.
 
+- **2026-10-16 — #282: the legacy executor enforces the criterion-evidence
+  contract in one shared handoff plan, and the pinned envelope binds to the
+  trusted source identity.** `applyLinkagePlan` became `applyHandoffPlan`
+  (`checkPRLinkage` → `checkHandoff`): one identity-checked forge
+  observation per handoff now evaluates both PR-body contracts — the
+  authoritative source-issue linkage (#248) and, when `COURIER_CRITERIA`
+  pins a criterion set at admission (#280, #249), the criterion-evidence
+  block — against the same live body, so a body violating both earns a
+  single bounded `body-repair` continuation on the shared #170 budget
+  instead of two sequential repairs that burn it in turn. A decoded
+  envelope naming a source issue other than the run's trusted
+  `COURIER_REPO`/`COURIER_REF` identity — or one that cannot be bound
+  because the run carries no valid trusted identity — is a policy
+  mismatch between operator-side inputs, not a model-repairable body
+  defect: the run fails closed to `NeedsHuman` (`linkage.read.failed`
+  with kind `criteria-identity`) without consuming the budget, before the
+  forge is read and before the observation is classified — so no missing,
+  draft, or otherwise fail-closed forge world can spend a #170 slot on it
+  — and the binding is checked before the pinned-empty shortcut so a
+  foreign envelope cannot slip through as a vacuous pass — mirroring the
+  native engine's `Criteria.Issue == SourceIssue` binding in
+  `internal/broker/policy.go`. A run whose pinned envelope has no bindable
+  identity at all fails closed the same way, in the same pre-read
+  position, so a malformed `COURIER_REPO`/`COURIER_REF` can never hand off
+  `Verifying` with neither body contract enforced. An envelope that does
+  not decode is the same class of admission-time fault — read once from
+  the pod environment, unchangeable by any later observation — so it fails
+  closed in the same position (`linkage.read.failed` with kind
+  `criteria`), spending no #170 slot and never being presented to the model
+  as a repairable body defect. Both faults are settled by one
+  `pinnedCriterionSet` admission check that runs before the forge read;
+  classifying the observation first would let the decode fault hide behind
+  a missing or draft PR and burn the budget on the wrong contract.
+  A passing pinned handoff surfaces the derived coverage and per-status
+  counts both in the `run.exit` telemetry and as a best-effort outcome
+  comment on the run's source issue — a partial record is labelled
+  honestly partial, and the legacy handoff never claims fully verified
+  completion outside the PR body. No new budget, gate, or wall clock:
+  boundedness stays `MaxContinuations` (#170). (#282, #249, #280, #248)
+- **2026-10-16 — #282 follow-up: the pinned-envelope admission check runs
+  before the forge observation, not inside it.** The undecodable-envelope
+  fail-closed path was only reachable from the open-PR branch, so a missing,
+  draft, or closed-only forge world classified first and spent its own
+  bounded #247 continuation (`pr-missing` / `pr-draft`) on a projection
+  fault no turn can repair — the decode fault was visible exactly where a
+  slot was cheapest to waste. Decode and trust-binding now live in one
+  `pinnedCriterionSet` admission check that `checkHandoff` runs before
+  `observeRunBranchPullRequest`, so both envelope faults settle on sight
+  whatever the forge says; the genuine linkage read failure keeps its
+  retry-inside-budget path. One precedence change follows: when a run
+  carries both a broken envelope and an unreadable forge, the envelope
+  fault is now the reported one (`linkage.read.failed` kind `criteria` /
+  `criteria-identity`, zero budget) rather than a retryable `linkage` read
+  failure — the envelope is the input that cannot move under a retry.
+  No new budget, gate, or duration bound: this
+  reorders an existing fail-closed check, it does not add one. (#282)
 - **2026-10-16 — #327: materialize recovery attempts without deleting history.**
   Successor names incorporate the settled predecessor UID so stable issue IDs
   and preserved PR-fix generations do not collide with retained runs. Active
@@ -1967,6 +2034,31 @@ named items remain unresolved and must not be described as production-ready:
   cached publication or local ref. Dispatch issue replay accepts only positive
   matching successful audit evidence bound to the original token and settlement
   key; absent best-effort audit evidence remains an explicit conservative hold.
+
+- **2026-10-15 — #312: the coordinator and toolchain images build git from a
+  pinned GitHub release tarball, not the stock bookworm package, and positively
+  enforce the documented `>= 2.41` minimum.** Bookworm ships git 2.39; the
+  harness artifact validation documented in README Prerequisites requires
+  git >= 2.41 (upstream made bundle verification a connectivity check in 2.41,
+  so older git fails on `refs/courier/*` refs invisible in the quarantine
+  store). Without the bump, the published `coordinator-go` image reproduces
+  the same misleading `internal/harness` failures a Debian 12 contributor
+  hits. Debian `bookworm-backports` does not carry git (only `bookworm` and
+  `bookworm-security` ship git binaries for the bookworm suite, both at
+  2.39.5; verified via `dak ls` for `git` on amd64), so the lane builds git
+  v2.47.3 from a pinned GitHub release tarball, verifies the SHA-256, and
+  installs to `/usr/local` so `/usr/local/bin/git` shadows the stock
+  `/usr/bin/git` (PATH puts `/usr/local/bin` first). The base image
+  digest stays pinned at `node:24-bookworm-slim`; build dependencies
+  (`build-essential`, `libssl-dev`, `libcurl4-openssl-dev`, `zlib1g-dev`,
+  `libexpat1-dev`, `wget`) are installed only for the compile step and purged
+  afterward so they don't ship in the runtime image. The build asserts the
+  installed git version with a numeric comparison, and
+  `hack/verify-courier-go-runtime.sh` repeats the same gate inside the
+  `coordinator-go` image so a future image change that lowers the bundled
+  git fails the verifier instead of producing misleading internal/harness
+  failures. A contributor host or a custom lane image must still verify its
+  own git version. (#312)
 
 - **2026-10-14 — #217: a coordinator slot collision resolves to a successful
   launch only against a pod verified live and owned by the run's UID; every
@@ -3075,14 +3167,58 @@ was superseded.
   the same reconcile. The counter stays bound to *observed* wedges; no timer
   and no duration bound was introduced. The window it does not close — a
   cached run status lagging a sibling's already-charged status patch — needs
-  charge-proof writes and stays with #126. (#105)
+   charge-proof writes and stays with #126. (#105)
+- **2026-10-16 — #223: the secure topology's broken-topology relaunch obeys
+  the same delete rule, and stops destroying the evidence at the ceiling.**
+  `SecureControl.fenceAndRelaunch` predated both rules #106 established for the
+  legacy delete paths: it deleted the stale control pod and charged the relaunch
+  with no post-delete live re-confirmation, so a finalizer-held control object
+  made `Delete` a no-op that was charged as a loss — and because the launch path
+  tolerates `AlreadyExists`, the replacement round could attach to the dying
+  object and charge the same physical loss a second time. It also deleted at the
+  restart ceiling, so the `NeedsHuman` hand-off lost the record of the cause the
+  legacy paths preserve. `fenceAndRelaunch` now judges the ceiling once and skips
+  the delete for an unrecoverable control object at the ceiling so the inert
+  record survives; a still-recoverable control object is deleted at the ceiling
+  as below it, because it records a live round rather than a cause. Below the
+  ceiling, the delete of an **inert** control object is re-confirmed with the
+  same uncached live read the legacy paths use — `coordinatorObjectPresentLive`,
+  now a package-level helper taking its `client.Reader` so one implementation is
+  shared by the reconciler and the secure path, backed by a new
+  `SecureControl.APIReader` wired from the manager — and a survivor defers the
+  charge *before* the fence, exactly as `checkLiveness` defers, so the round
+  stays standing and the disappearance backstop takes both the fence and the
+  single deferred charge once the name is provably free. Deferring before the
+  fence does leave the untrusted worker and the credentialed broker standing
+  while the supervisor object is terminating — a deliberate extension of #215's
+  fence-on-loss rule to this arm, on the same grounds `checkLiveness` and #222
+  give: the supervisor object still exists, so the round has not lost its
+  supervisor yet, and the backstop that takes the deferred charge fences in the
+  same reconcile. The re-confirmation
+  guards the inert object only, deliberately: that is the object the
+  disappearance backstop itself deletes and defers on. A *recoverable* control
+  object is charged in place, because a deferred charge leaves the run `Running`
+  while the pod is torn down, and the next reconcile's exit-code mapping reads
+  that teardown's exit code and terminalizes the run as `Failed` instead of
+  relaunching it — measured, not assumed. No duration bound and no timer was
+  added; the deferred requeue is the secure path's existing bounded observation
+  delay. Only the charge's state mutation is shared with
+  `relaunchAfterInfraLoss` (`chargeRelaunch`); the ceiling hand-offs stay
+  separate because the reconciler's carries a terminal diagnostic and a
+  phase-transition event while the secure path's records `SecurePreflightFailed`,
+  and neither surface is expressible as the other. The legacy wedge deferral
+  carries the exit-code hazard this arm avoids, and the secure path's cached
+  control-pod read and unconditioned delete, as #369 and #370. (#223)
+
 - **2026-10-10 — #248 follow-up: legacy linkage check is fail-closed on forge
   read errors, and the declared-changes path routes through the bounded
-  repair budget.** The legacy executor's `checkPRLinkage` previously logged a
+  repair budget.** The legacy executor's `checkPRLinkage` (since renamed
+  `checkHandoff`, #282) previously logged a
   `linkage.read.failed` event and handed off as `Verifying` on a forge read
   error, and `classifyDeclared` returned `NeedsHuman` immediately on a bad
   PR body without consulting the captured session's continuation budget.
-  Both paths now route through one shared `applyLinkagePlan` helper: a forge
+  Both paths now route through one shared `applyLinkagePlan` helper (renamed
+  `applyHandoffPlan` by #282): a forge
   read failure is consumed by the bounded continuation budget (one retry
   with `linkageRepairMessage`, then `NeedsHuman` with the precise forge
   error as the reason); a published PR whose body disagrees with the trusted
@@ -3324,13 +3460,14 @@ was superseded.
   `NeedsHuman` with the precise state in the reason, and the reason names
   the actual cause rather than claiming budget exhaustion that did not
   happen. Both the declared and undeclared `Verifying` routes share the one
-  `applyLinkagePlan` helper, so no route can hand off unobserved. The
+  `applyLinkagePlan` helper (renamed `applyHandoffPlan` by #282), so no route can hand off unobserved. The
   executor's terminating `Verifying` handoff is emitted only for a verified
   open, non-draft PR on the pinned base with authoritative linkage and the
   run's current commit advertised by the remote; the separate pre-dispatch
-  adoption guard, which reports a pre-existing open PR without a draft or
-  linkage check, stays as the 2026-10-10 entry describes and is settled by
-  the controller's `Verifying` observation.
+  adoption guard reads through the same identity-checked listing and reports
+  only a verified open, non-draft PR on the pinned base, but does not check
+  linkage; the controller's `Verifying` observation settles what that early
+  handoff leaves open.
   Boundedness stays liveness-shaped: the budget is `MaxContinuations` (#170)
   shared with linkage and criteria-evidence repair, with no new wall-clock
   timeout. (#247, #248, #170)
@@ -3379,3 +3516,126 @@ was superseded.
   effective one, injected-`HTTPDoer` testing stays available, and no run, phase,
   or reconciliation acquires a wall-clock deadline. This bounds *stuck*, in line
   with the no-run-timeout principle; it does not bound duration. (#341)
+- **2026-10-16 — #343: the adoption guard shares the identity-checked PR read.**
+  The pre-dispatch adoption guard still terminated on the raw GitHub
+  owner:branch head listing, so a same-owner fork claiming `owner:branch`, a
+  PR re-targeted to another base, or a draft was reported to the source as
+  reviewable before `Prepare`. The guard now consumes the same
+  identity-checked forge listing as the pre-handoff observation: only an
+  open, non-draft PR whose full base/head identity matches the run's
+  repository and branch and whose base ref is the pinned base exits
+  `Verifying`; foreign, wrong-base, draft, ambiguous, and closed-only worlds
+  exit `NeedsHuman` naming the actual state, and an unreadable listing fails
+  closed rather than adopting. Linkage stays the controller's
+  `Verifying` observation — the guard runs before a PR body contract exists
+  to check. (#343, superseding the guard carve-out in the #247 entry.)
+- **2026-10-16 — #297: compaction is enforced at the step boundary by the
+  harness, and the digest is composed, not model-produced.**
+  #243 landed the pure policy; nothing consumed it, so a session still rode
+  its transcript past the bound model alias's input limit and the compaction
+  the policy describes existed only as a tested seam. The session loop now
+  applies it between turns and never mid-turn, per-role budgets are resolved
+  once in `NewCoordinator` from an injected map, and each applied compaction
+  emits `session.compacted`. Two choices the parent ticket left open are
+  settled here. **The digest is composed by the harness**, as a bounded index
+  of the compacted span plus the settled-state block verbatim: `PlanCompaction`
+  needs the digest's cost before the digest exists, and a model call to produce
+  one would spend the context the policy is bounding (and could itself fail,
+  turning compaction into a new failure mode). Protected state is the pinned
+  objective or brief and the most recent turn; the brief's settled `Decision`s
+  and `OwnedFiles` are re-injected verbatim by re-rendering the exact bytes
+  `briefText` uses. A transcript that cannot fit fails closed — the run ends
+  as an infrastructure failure with the transcript unchanged — because
+  dropping protected state to fit is a silent truncation of the task. The
+  boundary is measured over the full next request — transcript plus the
+  serialized tool declarations the gateway sends with every turn, carried as
+  `CompactionInput.FixedTokens` — because a fit claimed over messages alone
+  can describe a request the effective limit cannot hold. A role
+  with no resolved budget owns no policy and never compacts: #296 supplies
+  the verified limit, but nothing populates `CoordinatorConfig.ContextBudgets`
+  until #295's declared schema lands, so no production session carries a
+  budget yet, and an implicit context window is never substituted. (§7's
+  checkpoint ladder is untouched: compaction neither advances nor replaces
+  it, so resume still reconstructs settled state from the world and the
+  checkpoint.) (#297)
+- **2026-10-16 — #296: the effective context limit is read and resolved,
+  never defaulted; `ContextPolicy.RoleBudget` is its one entry point.**
+  `Gateway.ModelInputLimit` performs one bounded authenticated read of the
+  gateway's OpenAI/LiteLLM-compatible model metadata (`GET /model/info`) for a
+  bound model and returns the advertised input limit
+  (`model_info.max_input_tokens`, falling back to the entry-level field; the
+  first matching `model_name`/`id` entry wins), cached per model so two roles
+  on one model issue one read. The read obeys the existing redaction contract:
+  the success body is cut at a fixed transport bound (an over-long envelope
+  fails as undecodable rather than spiking memory at startup), a non-2xx is
+  classified through the same bounded-prefix `ClassifyProviderError` path the
+  stream uses, a transport failure is a `GatewayTransportError`, and an unknown
+  model or an entry with no positive limit is an explicit error — never a
+  silent zero a caller could mistake for a small window, and never provider
+  body or key material in an error, a capability detail, or a termination
+  reason. Resolution lives in `ContextPolicy.RoleBudget(role, probed)` over the
+  pure `ResolveContextBudget` of #243, so there is exactly one effective limit
+  in the package: effective `= min(declared, verified)`, a gateway-verified read
+  is `healthy`, a declared ceiling the gateway could not confirm is
+  `configured` and never `healthy`, and a role with neither is `unavailable`
+  rather than given an implicit context window. `ProbeCapabilities` emits the
+  per-role `context-budget:<role>` capability from that resolver and probes it
+  ahead of the chat-completion binding probes so the cheap metadata read is
+  not starved inside the shared probe context; the session loop and its
+  consumption of `CoordinatorConfig.ContextBudgets` are #297's, already in
+  flight on its own branch, as is the step-boundary enforcement and the
+  `session.compacted` emitter.   The capability is `Required` only on a positive
+  declaration — a global fraction or reservation, a positive per-role
+  ceiling, or a nonzero per-role override of either — so a lane that declared nothing, including one whose config carries
+  an all-zero per-role entry, merely proceeds degraded, while a declared budget
+  whose capacity cannot be established fails the gate closed; a `configured`
+  budget never gates. A failed gateway read reaches the table as the
+  classified, redacted status reason with its retryability and availability
+  class, so a 404, a 401, and an unreachable gateway stay distinguishable and
+  courier-control's re-probe loop still sees an all-retryable gate. A role the
+  lane declared a budget for that this run does not bind is named without
+  gating — one LaneProfile serves several lanes — so a `codr` typo is visible
+  instead of silently disabling that role's capacity management. The predicate
+  that defines "declared" is settled here so no second rule can drift from it:
+  `ContextPolicy.declaresRole` holds a role declared only when the lane declares
+  a usable value for it — a per-role `maxInputTokens`, a nonzero per-role
+  `compactAtPercent`/`outputReservation` override (both are honored by
+  resolution, so both declare), or a global
+  `compactAtPercent`/`outputReservation` — and an all-zero per-role entry
+  declares nothing. An undeclared role is `configured` or `unavailable` but
+  never `Required` and never gates; whoever populates
+  `CoordinatorConfig.ContextBudgets` once #295's schema lands must key that map
+  by declared roles only, so #297's fail-closed startup resolution cannot
+  contradict this probe and park a run whose lane never declared a budget. One
+  diagnosis per condition as well: a declaration error is primary in the
+  capability table — its detail leads, it is never retryable, and a failed
+  gateway read is appended after it as `; the gateway read failed: …` — so an
+  unrelated gateway outage cannot hide a permanent misconfiguration or make it
+  look transient to the re-probe loop; only a resolution that failed with
+  `ErrNoContextCapacity` is attributed to the read, which then carries the
+  classified reason, retryability, and availability class. A transport-class
+  read failure renders as its fixed class alone, since its endpoint and dial
+  error must not reach the byte-bounded termination reason. (#296, #243,
+  #297)
+- **2026-10-17 — #365: the controller's `Verifying` observation reads its head
+  listing through the identity-checked capability.**
+  `internal/github.Observer.Observe` was the last reader of the raw
+  `head=owner:branch` listing. GitHub's selector carries no repository
+  identity, so a same-owner fork whose branch matched the run branch's name had
+  its number, draft flag, head SHA, checks, and statuses published as this
+  run's state. It now calls `Provider.ListPullRequestsWithForeign` — the same
+  capability the executor's pre-handoff observation and the adoption guard read
+  through — so the full base and head repository identity carried in the
+  response decides the match, a response missing either identity is a read
+  failure, every page of the listing is read, and any record claiming the
+  selector from another repository fails the poll closed instead of being
+  dropped toward a "no pull request" claim: an unverifiable world is never
+  published as `pr_opened`. Draft handling, check and status collection, and
+  the observation contract are unchanged. One consequence is deliberate and
+  stricter than before: a record the selector surfaced that does not carry the
+  run's own head identity — a same-repository record for another head ref — is
+  a foreign claim under this listing, not a row that is skipped, matching how
+  the executor's observation already treats it. The identity-blind one-page
+  client query had no remaining caller after this change and is gone, so one
+  listing seam remains. (#365, closing the `Observer` carve-out left open by
+  the #343 entry.)

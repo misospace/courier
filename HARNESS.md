@@ -453,8 +453,10 @@ paths share acceptance, not implementation.
   head. An open candidate is adopted only when its actual base
   ref is the run's pinned base; a wrong-base open PR fails closed
   rather than being adopted, re-targeted, or paralleled. Both
-  paths share one `applyLinkagePlan` helper so the check behaves
-  identically regardless of how the run reached `Verifying`:
+  paths share one `applyHandoffPlan` helper (formerly
+  `applyLinkagePlan`, #282), which applies the criterion-evidence
+  contract (§4) to the same live body alongside linkage, so the check
+  behaves identically regardless of how the run reached `Verifying`:
   - On a published PR with a body that disagrees with the trusted
     identity, the run asks the captured OpenCode session to
     repair the body under the bounded continuation budget
@@ -496,10 +498,20 @@ paths share acceptance, not implementation.
     executor's terminating `Verifying` handoff is emitted only for
     a verified open, non-draft PR on the pinned base with the
     run's commit published to the remote. (The separate adoption
-    guard that reviews a pre-existing open PR before dispatch is
-    unchanged and does not itself check draft or linkage; the
-    controller's `Verifying` observation settles what that early
-    handoff leaves open.)
+    guard that reviews a pre-existing pull request before dispatch
+    reads through the same identity-checked head listing (#343):
+    it reports only an open, non-draft PR whose full base and head
+    identity and base ref match the run, and sends a foreign,
+    wrong-base, draft, ambiguous, or closed-or-merged-only world
+    to `NeedsHuman` with the precise state, but it does not itself
+    check linkage; the controller's `Verifying` observation settles
+    what that early handoff leaves open.) That controller observation
+    reads its own head listing through the same identity-checked
+    capability (#365): a record whose base or head repository identity
+    differs from the run's — a same-owner fork claiming `owner:branch`
+    — or one carrying no repository identity at all fails the poll
+    closed and requeues, so another repository's pull request is never
+    published as this run's state.
   The repair instruction names the trusted identity, the supported
   closing keywords, the bare and cross-repo forms, and the
   existing PR number so the model can fix the body
@@ -640,7 +652,27 @@ no session was captured, or the run is shutting down, the legacy path
 terminates `NeedsHuman` with reason `incomplete handoff: criterion
 evidence …` (category `verifier-rejection`), preserving the declared
 outcome tag exactly as the linkage plan does. A forge read failure during
-the legacy check is fail-closed exactly as #248's is. A run that never
+the legacy check is fail-closed exactly as #248's is. A pinned envelope
+that decodes but names a source issue other than the run's trusted
+`COURIER_REPO`/`COURIER_REF` identity — or that cannot be bound because
+the run carries no valid trusted identity — is not a repairable defect:
+it is a policy mismatch between operator-side inputs, so the legacy check
+fails closed to `NeedsHuman` without consuming the budget, before the
+forge is read and before the observation is classified, so a missing or
+draft PR — whose own #247 continuation would otherwise fire — never
+spends a slot on an admission-time fault (#282). The binding is checked
+before the pinned-empty shortcut, and it mirrors the native engine's
+`Criteria.Issue == SourceIssue` binding in `internal/broker/policy.go`.
+An unbound envelope fails closed in the same
+position, so a malformed `COURIER_REPO`/`COURIER_REF` cannot hand off
+`Verifying` with neither contract enforced; an envelope that does not decode
+is the same admission-time fault (it is read once from the pod environment
+and no later observation can change it) and likewise fails closed on sight,
+with `linkage.read.failed` kind `criteria` and no #170 slot spent. Because
+the envelope check precedes the forge read, a run carrying a broken
+envelope is settled as an envelope fault even when the forge is itself
+unreadable — the admission-time fault is reported under its own `kind`
+rather than as a retryable `linkage` read failure. A run that never
 opened a PR passes the *evidence* check vacuously — PR absence is not
 an evidence violation; it is caught separately by the #247 pre-handoff
 observation, which refuses the handoff before evidence is ever
@@ -1124,10 +1156,13 @@ stream/status path: a fixed category, never a provider body or key material.
 `floor(effective × compactAtPercent / 100)`. At a step boundary — between
 turns, never mid-turn — the harness compacts when the transcript has reached
 the compact point **or** when the next turn's prompt plus the output
-reservation would exceed the effective limit. After compaction the invariant
-`promptTokens + outputReservation ≤ effective` must hold; if it cannot, the
-harness fails closed and surfaces the condition rather than truncating
-mid-task. The two acceptance conditions fail independently: a digest can
+reservation would exceed the effective limit. The boundary is measured over
+the full next request: the transcript **and** the serialized tool
+declarations the gateway sends with every turn, since they consume input
+capacity each turn even though no compaction digests them. After compaction
+the invariant `promptTokens + outputReservation ≤ effective` must hold, on
+that same full-request account; if it cannot, the harness fails closed and
+surfaces the condition rather than truncating mid-task. The two acceptance conditions fail independently: a digest can
 reclaim tokens and still leave the protected tail too large to fit, in which
 case every digestible turn has already been spent and there is no progress left
 to make.
@@ -1142,7 +1177,12 @@ post-condition held. The executor (and any caller of repeated compactions)
 must use `BudgetAfter`, not the original budget, for the next decision.
 
 **Digest, not prune; preserve settled state.** Compaction replaces the oldest
-non-protected turns with a single model-produced digest. It never discards the
+non-protected turns with a single harness-composed digest — a bounded index of
+what was compacted plus the settled-state block, not a second model call: the
+digest's cost has to be known before it is sent, and an extra turn to produce
+it would itself be context the policy is trying to bound. The digest lands
+whole at the start of the span it replaces, never between an assistant's tool
+requests and the results answering them. It never discards the
 brief's pinned objective, the settled `Decision`s, the `OwnedFiles`, or the
 most recent turn: those are protected, re-injected verbatim into the digest.
 The durable record remains the §7 checkpoint ladder — `plan` plus ordered
@@ -1164,8 +1204,14 @@ event, never status, and never lets a model assert liveness or completion.
 Implementation is three bounded, file-scoped tickets — #295 (CRD per-role
 budget schema + bootstrap mirror), #296 (gateway model-capability probe +
 effective-limit resolution + capability gate), #297 (step-boundary compaction
-enforcement + `session.compacted` emitter) — and until they land the policy
-exists as the tested pure seam in `internal/harness/budget.go`.
+enforcement + `session.compacted` emitter). #297 has landed: the session loop
+calls the policy between turns and never mid-turn, per-role budgets are
+resolved once in `NewCoordinator` from an injected `ContextBudgets` map, a
+digest that cannot fit fails the run rather than truncating, and
+`courier-control` emits `session.compacted`. A role with no resolved budget
+still owns no policy and never compacts: #296 supplies the verified side, but
+nothing populates `ContextBudgets` until #295's declared schema lands, so no
+production session carries a budget yet.
 
 ## 6. Long-tool liveness contract (#119)
 

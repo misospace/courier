@@ -95,6 +95,21 @@ func New(token string, httpClient ...HTTPDoer) (*Client, error) {
 	return NewClient(defaultBaseURL, token, httpClient...)
 }
 
+// WithBaseURL returns a client for a different API base URL carrying this
+// client's credential, transport, and request bound. Secure-mode wiring uses
+// it to build one client per registered endpoint from a single read
+// identity: the registration decides the destination, and a credential is
+// only ever sent to the endpoint its identity is scoped to. An empty base
+// URL is refused rather than silently falling back to GitHub.com, so a
+// missing endpoint configuration cannot redirect a custom registration's
+// traffic (and credential) to the public API.
+func (c *Client) WithBaseURL(baseURL string) (*Client, error) {
+	if strings.TrimSpace(baseURL) == "" {
+		return nil, errors.New("GitHub base URL must not be empty")
+	}
+	return newClient(baseURL, c.token, c.requestTimeout, c.httpClient)
+}
+
 // PullRequest is the subset of a GitHub pull request that Courier needs.
 type PullRequest struct {
 	Number         int    `json:"number"`
@@ -353,19 +368,11 @@ func (c *Client) ReadPR(ctx context.Context, owner, repo string, number int) (Pu
 	return c.GetPullRequest(ctx, owner, repo, number)
 }
 
-// PullRequestsForHead lists every pull request in owner/repo whose head is
-// headOwner:branch, including merged and closed ones. state=all is deliberate:
-// an adoption guard must see pull requests in any state, not only open ones.
-// owner and headOwner differ for a fork pull request: the pull request lives
-// on the base repository while its head lives on the fork.
-func (c *Client) PullRequestsForHead(ctx context.Context, owner, repo, headOwner, branch string) ([]PullRequest, error) {
-	var out []PullRequest
-	err := c.doJSONQuery(ctx, http.MethodGet, repoEndpoint(owner, repo, "pulls"), headFilterQuery(headOwner, branch), nil, &out)
-	return out, err
-}
-
-// PullRequestsForHeadAllPages paginates the all-state GitHub head query. The
-// legacy PullRequestsForHead remains a one-page operation for existing callers.
+// PullRequestsForHeadAllPages paginates the all-state GitHub head query, whose
+// owner:branch selector carries no repository identity, so a caller that reads
+// through it must compare the base and head repository identity from each
+// response. Reading a head listing for a run's own pull request goes through
+// Provider.ListPullRequestsWithForeign, which does that comparison.
 func (c *Client) PullRequestsForHeadAllPages(ctx context.Context, owner, repo, headOwner, branch string) ([]PullRequest, error) {
 	endpoint := repoEndpoint(owner, repo, "pulls")
 	var out []PullRequest

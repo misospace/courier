@@ -250,6 +250,22 @@ func TestPlanCompactionTruthTable(t *testing.T) {
 			},
 			wantCompacted: false, wantAfter: 0,
 		},
+		{
+			name: "fixed request cost reaches the compact point the transcript alone misses",
+			in: CompactionInput{
+				MessageTokens: []int{400, 200}, Protected: []bool{true, false}, DigestTokens: 50, FixedTokens: 200,
+				Budget: budget(t, 1000, 75, 0),
+			},
+			wantCompacted: true, wantDigested: []int{1}, wantRetained: []int{0}, wantAfter: 650, wantDigestedToks: 200, wantNetSaved: 150,
+		},
+		{
+			name: "fixed cost that alone exceeds the limit fails closed over protected state",
+			in: CompactionInput{
+				MessageTokens: []int{900}, Protected: []bool{true}, DigestTokens: 10, FixedTokens: 200,
+				Budget: budget(t, 1000, 75, 0),
+			},
+			wantErr: ErrCompactionCannotFit,
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

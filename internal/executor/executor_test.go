@@ -695,6 +695,59 @@ func TestGoalNamesRunBranchAsOnlyPublicationTarget(t *testing.T) {
 	}
 }
 
+// TestGoalCarriesPublicationBlockGrammar pins the resolve-issue goal
+// extension that pastes the criterion-evidence block grammar into the
+// coordinator prompt (#282, #249, #280): a body that lands the closing
+// reference and then has to learn the block shape from a repair turn
+// burns one of the bounded #170 continuations on format drift, so the
+// goal names the header, the row shape, the per-status vocabulary, and
+// the per-status reference rule. The fix-pr goal is unchanged — the
+// body contract is the model's responsibility to repair from the
+// existing PR feedback, not a fresh authoring step.
+func TestGoalCarriesPublicationBlockGrammar(t *testing.T) {
+	resolve := &courierv1alpha1.CoderRun{
+		Spec: courierv1alpha1.CoderRunSpec{
+			Mode: courierv1alpha1.ModeResolveIssue,
+			Ref:  502,
+		},
+	}
+	goal, err := Goal(resolve)
+	if err != nil {
+		t.Fatalf("Goal() error = %v", err)
+	}
+	for _, fragment := range []string{
+		"COURIER_CRITERIA",
+		"courier-criteria:v1 source=",
+		"set=sha256:",
+		"coverage=full|partial",
+		"- AC-<n> sha256:<64hex>: <status> - <reference>",
+		"implementation-evidence",
+		"regression-check",
+		"manual-verification",
+		"not-implemented",
+		"regression-check and implementation-evidence must cite a file path or check URL",
+		"manual-verification and not-implemented must carry a note",
+	} {
+		if !strings.Contains(goal, fragment) {
+			t.Fatalf("resolve-issue goal missing publication-block grammar fragment %q in: %q", fragment, goal)
+		}
+	}
+
+	fixPR := &courierv1alpha1.CoderRun{
+		Spec: courierv1alpha1.CoderRunSpec{
+			Mode: courierv1alpha1.ModeFixPR,
+			Ref:  348,
+		},
+	}
+	fixGoal, err := Goal(fixPR)
+	if err != nil {
+		t.Fatalf("Goal(fix-pr) error = %v", err)
+	}
+	if strings.Contains(fixGoal, "courier-criteria:v1 source=") {
+		t.Fatalf("fix-pr goal should not carry publication-block grammar; the body contract is read from the existing PR: %q", fixGoal)
+	}
+}
+
 func TestBuildCoordinatorPodWiresRolesAndMCPConfig(t *testing.T) {
 	run := &courierv1alpha1.CoderRun{
 		ObjectMeta: metav1.ObjectMeta{Name: "run-mcp", Namespace: "courier-system"},

@@ -137,7 +137,8 @@ func TestCapacityRecoveryAcceptsAvailabilityHandoff(t *testing.T) {
 	}
 }
 
-func TestCapacityRecoveryRetriesWithSameKeyAfterReconcileReconstruction(t *testing.T) {	run := admissionRun("exhausted", "pool-a", courierv1alpha1.PhaseBlockedExternal)
+func TestCapacityRecoveryRetriesWithSameKeyAfterReconcileReconstruction(t *testing.T) {
+	run := admissionRun("exhausted", "pool-a", courierv1alpha1.PhaseBlockedExternal)
 	run.UID, run.Spec.Source, run.Spec.WorkItemID = "run-uid", "fake", "work"
 	run.Status.Branch = "branch"
 	run.Status.WorkspaceSafety = &courierv1alpha1.WorkspaceSafetyEvidence{State: "empty"}

@@ -325,7 +325,7 @@ func (r *CoderRunReconciler) checkLiveness(ctx context.Context, run *courierv1al
 	// defers the same way. At the ceiling there is no charge to defer: the
 	// hand-off terminalizes in this reconcile.
 	if deleted && !atCeiling {
-		present, err := r.coordinatorObjectPresentLive(ctx, run)
+		present, err := coordinatorObjectPresentLive(ctx, r.reader(), run)
 		if err != nil || present {
 			return ctrl.Result{RequeueAfter: observationRequeueDelay}, true, nil
 		}
@@ -459,10 +459,15 @@ func heartbeatAt(heartbeat *courierv1alpha1.Heartbeat) time.Time {
 // coordinatorObjectPresentLive reports whether any coordinator object for the
 // run still exists on the API server — a survivor means the deterministic pod
 // name is not free; a failed read is not evidence the name is free (callers
-// treat err as defer).
-func (r *CoderRunReconciler) coordinatorObjectPresentLive(ctx context.Context, run *courierv1alpha1.CoderRun) (bool, error) {
+// treat err as defer). The reader must be the uncached API reader, never a
+// lagging informer cache (§6): the whole judgement is that the object is gone
+// from the server, so a cache that has not caught up must never be the witness.
+// Taking the reader explicitly keeps one re-confirmation shared by the
+// reconciler's wedge and disappearance paths and SecureControl's
+// broken-topology relaunch, which is not the reconciler.
+func coordinatorObjectPresentLive(ctx context.Context, reader client.Reader, run *courierv1alpha1.CoderRun) (bool, error) {
 	var pods corev1.PodList
-	if err := r.reader().List(ctx, &pods,
+	if err := reader.List(ctx, &pods,
 		client.InNamespace(run.Namespace),
 		client.MatchingLabels{executor.LabelRun: executor.RunLabelValue(run.Name)},
 	); err != nil {
@@ -552,7 +557,7 @@ func (r *CoderRunReconciler) observeMissingCoordinator(ctx context.Context, run 
 			// charged: a survivor — terminating or not — defers the charge so
 			// the deterministic name is provably free first. A failed read is
 			// not evidence the name is free either.
-			present, err := r.coordinatorObjectPresentLive(ctx, run)
+			present, err := coordinatorObjectPresentLive(ctx, r.reader(), run)
 			if err != nil || present {
 				return ctrl.Result{RequeueAfter: observationRequeueDelay}, nil
 			}
@@ -602,12 +607,7 @@ func (r *CoderRunReconciler) relaunchAfterInfraLoss(ctx context.Context, run *co
 		}, nil)
 	}
 	before := run.DeepCopy()
-	// A soft-stop addressed to the torn-down incarnation is void; disarm it
-	// (observing an unacknowledged request) after the diff base so the
-	// relaunch patch persists the disarm alongside the restart charge (#238).
-	softStopBeforeRelaunch(run, r.clock())
-	run.Status.Restarts++
-	run.Status.Phase = courierv1alpha1.PhaseClaimed
+	chargeRelaunch(run, r.clock())
 	if err := r.patchStatus(ctx, before, run); err != nil {
 		return ctrl.Result{}, err
 	}
@@ -617,4 +617,23 @@ func (r *CoderRunReconciler) relaunchAfterInfraLoss(ctx context.Context, run *co
 	}
 	r.emitPhaseTransition(run, courierv1alpha1.PhaseClaimed, detail)
 	return ctrl.Result{Requeue: true}, nil
+}
+
+// chargeRelaunch applies the state mutation every relaunch path shares: it
+// disarms the soft-stop request addressed to the torn-down incarnation,
+// charges one crashloop credit, and returns the run to Claimed so the next
+// reconcile relaunches and resumes it. The caller captures its patch base
+// before calling, so the soft-stop disarm lands in the same patch as the
+// restart charge (#238), and keeps its own writer and post-patch behavior.
+//
+// Only the mutation is shared. The hand-offs above it are deliberately not: the
+// reconciler's carries a terminalLifecycleIntent with the caller's diagnostic
+// and reason and emits a phase-transition event, while SecureControl's
+// broken-topology relaunch records the SecurePreflightFailed condition through
+// transitionNeedsHuman and carries its own fixed cause — one hand-off surface
+// each, neither expressible as the other (#223).
+func chargeRelaunch(run *courierv1alpha1.CoderRun, now time.Time) {
+	softStopBeforeRelaunch(run, now)
+	run.Status.Restarts++
+	run.Status.Phase = courierv1alpha1.PhaseClaimed
 }

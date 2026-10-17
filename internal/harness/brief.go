@@ -232,6 +232,27 @@ func (r *BriefRegistry) Lookup(briefID string) (Brief, bool) {
 	return brief, ok
 }
 
+// settledStateBlock renders the brief's settled state — the decisions the
+// delegate applies exactly and the files it owns — in the exact text
+// briefText renders them, so a compaction digest can re-inject those bytes
+// verbatim. It is the one part of a brief that survives summarization:
+// re-deriving a settled decision is how a delegate produces work that
+// contradicts the plan the coordinator already made. Only a brief has
+// settled state; the coordinator session carries none.
+func settledStateBlock(brief Brief) string {
+	var b strings.Builder
+	if len(brief.Decisions) > 0 {
+		b.WriteString("\nSettled decisions (apply exactly, do not re-derive):")
+		for _, d := range brief.Decisions {
+			fmt.Fprintf(&b, "\n- %s: %s", d.Summary, d.Value)
+		}
+	}
+	if len(brief.OwnedFiles) > 0 {
+		b.WriteString("\nOwned files: " + strings.Join(brief.OwnedFiles, ", "))
+	}
+	return b.String()
+}
+
 // BriefIDs returns every registered brief ID in registration order.
 func (r *BriefRegistry) BriefIDs() []string {
 	r.mu.Lock()

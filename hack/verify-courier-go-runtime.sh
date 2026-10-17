@@ -10,6 +10,18 @@ helm version --short >/dev/null
 controller-gen --version >/dev/null
 test ! -x "$(command -v gh 2>/dev/null || true)"
 
+# internal/harness artifact validation runs `git bundle unbundle` against a
+# GIT_OBJECT_DIRECTORY quarantine and requires git >= 2.41; older git reports
+# self-contained bundles as `bundle is malformed or not self-contained`. The
+# installed binary is the contract surface: encode it as a numeric gate so a
+# future image change that lowers the bundled git fails this verifier instead
+# of producing misleading internal/harness failures.
+git_version="$(git version | awk '{print $3}')"
+if ! printf '%s\n%s\n' '2.41' "$git_version" | sort -V -C; then
+	echo "git >= 2.41 required, got $git_version" >&2
+	exit 1
+fi
+
 # The runtime image pins GOCACHE and GOMODCACHE onto the writable toolchain
 # cache; the fallbacks cover a bare `docker run` without pod volumes.
 export GOCACHE=${GOCACHE:-/courier-toolchain-cache/go-build}
