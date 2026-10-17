@@ -15,11 +15,19 @@ import (
 func TestIssueCapacityHandoffLostResponseWithoutAuditPreservesReplacement(t *testing.T) {
 	id := EncodeWorkID(Task{Type: "implement", Issue: &Issue{ID: "issue-a", Repo: "acme/widgets", Number: 42}})
 	owner, token := "worker-a", "issued-a"
-	posts := 0
+	posts, claimAttempts := 0, 0
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
 		case "/api/audit":
 			_ = json.NewEncoder(w).Encode([]any{})
+		case "/api/issues/claim":
+			// #388 settlement adoption re-presents the claim on a rotated-fence
+			// refusal. Real Dispatch fences this here: worker-a may not claim
+			// over worker-b's active lease, so adoption fails and settlement
+			// falls back to the original stale refusal.
+			claimAttempts++
+			w.WriteHeader(http.StatusConflict)
+			_ = json.NewEncoder(w).Encode(map[string]string{"error": "Issue is actively leased by worker-b. Use force=true override."})
 		case "/api/issues/capacity-handoff":
 			posts++
 			var body struct {

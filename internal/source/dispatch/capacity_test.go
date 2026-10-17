@@ -163,3 +163,95 @@ func TestIssueCapacityHandoffUsesClaimReceipt(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+// TestIssueCapacityHandoffAdoptsRotatedClaimToken is the #388 regression: when
+// claim churn around admission rotates the dispatch lease, the settlement
+// refused with stale_claim_token re-presents the claim, adopts the live lease
+// token, and succeeds — it must not wedge retrying an inert fence.
+func TestIssueCapacityHandoffAdoptsRotatedClaimToken(t *testing.T) {
+	id := EncodeWorkID(Task{Type: "implement", Issue: &Issue{ID: "issue-a", Repo: "acme/widgets", Number: 42}})
+	var posts, claimPosts int
+	var notes []string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/issues/capacity-handoff":
+			posts++
+			var body struct {
+				ClaimToken string `json:"claimToken"`
+				Note       string `json:"note"`
+			}
+			_ = json.NewDecoder(r.Body).Decode(&body)
+			notes = append(notes, body.ClaimToken+"|"+body.Note)
+			if posts == 1 {
+				w.WriteHeader(http.StatusConflict)
+				_ = json.NewEncoder(w).Encode(map[string]any{"error": "claimToken does not match current claim; re-issued claim invalidates prior tokens"})
+				return
+			}
+			if body.ClaimToken != "live-b" {
+				t.Errorf("retry claimToken = %q, want live-b", body.ClaimToken)
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{"success": true})
+		case "/api/issues/claim":
+			claimPosts++
+			_ = json.NewEncoder(w).Encode(map[string]any{"claimToken": "live-b"})
+		case "/api/audit":
+			_ = json.NewEncoder(w).Encode([]map[string]any{})
+		default:
+			t.Errorf("unexpected path %s", r.URL.Path)
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+	c, err := NewClient(server.URL, "worker-a", "auth", time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	receipt := `{"claimToken":"issued-a"}`
+	handoff := source.CapacityHandoff{FenceToken: "issued-a", WorkIdentity: WorkIdentity(id), CapacityIdentity: "capacity-a", IdempotencyKey: "stable-key"}
+	if err := c.SettleCapacityExhaustion(context.Background(), id, receipt, handoff); err != nil {
+		t.Fatalf("settlement against a rotated lease must adopt the live token, got %v", err)
+	}
+	if posts != 2 || claimPosts != 1 {
+		t.Fatalf("posts=%d claimPosts=%d, want 2 and 1", posts, claimPosts)
+	}
+	if want := "live-b|" + capacityReceiptMarker("live-b", "stable-key", WorkIdentity(id)); len(notes) != 2 || notes[1] != want {
+		t.Fatalf("retry token/marker = %q, want %q", notes, want)
+	}
+}
+
+// TestIssueCapacityHandoffNeverReclaimsNonRotationRefusal keeps the fence
+// honest: an ownership-changed 409 is not a rotated lease, and re-claiming
+// through it would overwrite a new owner, so settlement surfaces the refusal
+// without touching the claim endpoint.
+func TestIssueCapacityHandoffNeverReclaimsNonRotationRefusal(t *testing.T) {
+	id := EncodeWorkID(Task{Type: "implement", Issue: &Issue{ID: "issue-a", Repo: "acme/widgets", Number: 42}})
+	var claimPosts int
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/issues/capacity-handoff":
+			w.WriteHeader(http.StatusConflict)
+			_ = json.NewEncoder(w).Encode(map[string]any{"error": "Issue claim on GitHub belongs to agent/other; refusing to release another owner's claim"})
+		case "/api/issues/claim":
+			claimPosts++
+			_ = json.NewEncoder(w).Encode(map[string]any{"claimToken": "stolen"})
+		case "/api/audit":
+			_ = json.NewEncoder(w).Encode([]map[string]any{})
+		default:
+			t.Errorf("unexpected path %s", r.URL.Path)
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+	c, err := NewClient(server.URL, "worker-a", "auth", time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	receipt := `{"claimToken":"issued-a"}`
+	handoff := source.CapacityHandoff{FenceToken: "issued-a", WorkIdentity: WorkIdentity(id), CapacityIdentity: "capacity-a", IdempotencyKey: "stable-key"}
+	if err := c.SettleCapacityExhaustion(context.Background(), id, receipt, handoff); err == nil {
+		t.Fatal("ownership-changed refusal must still fail settlement")
+	}
+	if claimPosts != 0 {
+		t.Fatalf("claimPosts = %d, want 0; settlement may never re-claim over another owner", claimPosts)
+	}
+}
