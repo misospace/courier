@@ -153,37 +153,35 @@ func (l *CoordinatorLauncher) Launch(ctx context.Context, run *courierv1alpha1.C
 	if err != nil {
 		return err
 	}
-	// The isolated legacy observer's run-scoped identity is provisioned only
-	// once the coordinator slot is verified live: a collision that must stay
-	// Claimed never creates side resources, and an adopted pod re-verifies
-	// its existing ones idempotently.
-	provisionObserver := func() error {
-		if pod.Annotations[executor.ObserverContractAnnotation] != executor.ObserverContractVersion {
-			return nil
-		}
-		return l.ensureLegacyObserverResources(ctx, run, pod)
-	}
-	// The run-scoped identity must be on the pod before it is created;
-	// setting it afterwards would not persist, and the observer would run
-	// as the namespace default SA with no access to its own pod. The API
-	// server resolves the SA at create time, so the SA must exist first.
-	// This first attempt is best-effort: a collision or transient failure
-	// here must not mask the slot-verification contract, and the next
-	// reconcile retries the SA before the pod create can succeed. The
-	// verified provision below still hard-checks ownership.
+	// The isolated legacy observer's run-scoped identity — ServiceAccount,
+	// Role, RoleBinding — is provisioned and ownership-verified BEFORE the
+	// coordinator pod can begin execution (#327 single-writer guarantee).
+	// The API server resolves the ServiceAccount at create time, so a
+	// foreign same-named identity must never be admitted under, and Role or
+	// RoleBinding provisioning must never fail only after a live writer
+	// already exists. The same ensure is idempotent: retries and collision
+	// adoption re-verify existing run-owned resources instead of adopting
+	// anything unowned.
 	if pod.Annotations[executor.ObserverContractAnnotation] == executor.ObserverContractVersion {
+		// The run-scoped identity must be on the pod before it is created;
+		// setting it afterwards would not persist, and the observer would
+		// run as the namespace default SA with no access to its own pod.
 		pod.Spec.ServiceAccountName = legacyObserverResourceName(run.Name)
-		// Best-effort: a failure here must not mask slot verification; the
-		// pod create below surfaces a missing SA and the next reconcile
-		// retries the SA create first.
-		_ = l.Client.Create(ctx, l.observerServiceAccount(run))
+		if err := l.ensureLegacyObserverResources(ctx, run, pod); err != nil {
+			return l.provisioningFailure(ctx, pod, err)
+		}
 	}
 	err = l.Client.Create(ctx, pod)
 	if err == nil {
-		return provisionObserver()
+		return nil
 	}
 	if !apierrors.IsAlreadyExists(err) {
-		return err
+		// A failed create is normally claim-safe, but an ambiguous failure
+		// (a timeout after the API server persisted the pod, or a pod left
+		// at the deterministic name by an earlier attempt of this still-
+		// Claimed run) must not release the source claim while a writer may
+		// occupy the slot.
+		return l.provisioningFailure(ctx, pod, err)
 	}
 	// The create collided with an existing pod. Three shapes are possible
 	// and each one must surface as "stay Claimed, do not record Running":
@@ -224,10 +222,26 @@ func (l *CoordinatorLauncher) Launch(ctx context.Context, run *courierv1alpha1.C
 	case !podOwnedByRunUID(&existing, run.UID):
 		return ErrProvisioningInFlight
 	}
-	if err := provisionObserver(); err != nil {
-		return err
-	}
+	// The observer resources were ensured and verified above, before the
+	// create that produced this collision; the adopted run-owned slot is
+	// fully provisioned.
 	return nil
+}
+
+// provisioningFailure classifies a launch failure that happened while the
+// coordinator slot's state is in question. Releasing the source claim
+// resets the run to Pending and lets another capacity be handed the work —
+// safe only while the slot is proven empty. If a pod exists at the slot
+// (or its absence cannot be proven through the uncached reader), a writer
+// may be live, so the failure surfaces as ErrProvisioningInFlight and the
+// run stays Claimed instead of racing a live coordinator for ownership.
+func (l *CoordinatorLauncher) provisioningFailure(ctx context.Context, pod *corev1.Pod, cause error) error {
+	var existing corev1.Pod
+	err := l.collisionReader().Get(ctx, client.ObjectKey{Namespace: pod.Namespace, Name: pod.Name}, &existing)
+	if apierrors.IsNotFound(err) {
+		return cause
+	}
+	return ErrProvisioningInFlight
 }
 
 // collisionReader returns the reader the AlreadyExists collision
