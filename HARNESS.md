@@ -1,10 +1,12 @@
 # HARNESS.md — Durable Coordinator Harness
 
-Design pass for the resumable coordinator harness (#8), consuming the forge
-capability boundary (#80) and credential/process isolation problem (#104). It
-settles the trust and execution contract; it does not implement it. The current
-OpenCode bootstrap remains an explicitly insecure legacy mode until a safe
-replacement is proven.
+The trust and execution contract for the resumable coordinator harness (#8),
+consuming the forge capability boundary (#80) and credential/process isolation
+problem (#104). The topology it settles has landed and is available as the
+opt-in deployment-level secure mode (`--secure-mode`); §11 records what is
+still unwired, chiefly the native path's forge reads and PR creation (#127) and
+the Go dependency cache (#136). The OpenCode bootstrap remains the default,
+explicitly insecure legacy mode until a safe replacement is proven.
 
 DESIGN.md remains authoritative. In particular: inform, don't constrain model
 behavior; git, the PR, and CI are source of truth; no wall-clock run deadlines;
@@ -977,8 +979,14 @@ the original operation. A cancellation tombstone is
 accepted even if it arrives before dispatch. If cancel precedes dispatch, the worker tombstones the ID and must never run
 that dispatch. A tombstone is final for its `opID`: any later dispatch or
 retry with that ID is rejected, regardless of arrival order; new work gets a
-fresh `opID` after termination is confirmed. The worker acknowledges cancellation
-only after verified process termination (or confirmation it never started); only then may trusted control clear
+fresh `opID` after termination is confirmed. Each task leads its own process
+group, so cancellation terminates the task's whole tree — the tasks that reach
+the worker are `sh -c ...`, whose real work runs in descendants — and the
+worker acknowledges cancellation only after it has proven that no live process
+remains in that group (or confirmation it never started). Work that leaves the
+group cannot be proven gone, so it is reported as unverified rather than
+acknowledged, and trusted control keeps the operation's active status until
+termination is verified. Only then may trusted control clear
 active-operation status. A replacement worker (new pod UID) that never saw
 that `opID` treats a late cancel as unknown data and runs nothing; the
 authoritative termination of a fenced stale worker is the operator's pod kill,

@@ -46,7 +46,9 @@ func (c *Client) Dispatch(ctx context.Context, key ed25519.PrivateKey, envelope 
 
 // Cancel delivers one signed cancellation for the same opID as its dispatch.
 // It returns once the worker has verified process termination (or confirmed
-// the operation never started).
+// the operation never started). A non-2xx reply reports that the worker could
+// not prove termination; control reconciles that state rather than retrying
+// the cancellation.
 func (c *Client) Cancel(ctx context.Context, key ed25519.PrivateKey, envelope Envelope) (string, error) {
 	signature, err := envelope.Sign(key)
 	if err != nil {

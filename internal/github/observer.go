@@ -14,10 +14,71 @@ import (
 // Observer reads pull requests and their CI state from GitHub.
 type Observer struct {
 	Client *Client
+	// Registrations optionally carries the deployment's forge registry. When
+	// set, every observation read resolves the registration serving the
+	// repository under observation and goes to that registration's endpoint,
+	// the same routing secure-mode admission applies (#340/#378): a GitHub
+	// Enterprise registration's reads never leave for the public API. A
+	// registry that cannot settle a repository — no or ambiguous match — is a
+	// read error, never a silent fallback to the client's own destination.
+	// When nil (legacy wiring), reads use the client's base URL unchanged, so
+	// default GitHub.com deployments stay behaviorally unchanged.
+	Registrations *forge.Registry
 }
 
 var _ controller.WorldObserver = Observer{}
 var _ controller.ExistingPRHeadResolver = Observer{}
+var _ controller.PullRequestReader = Observer{}
+
+// registrationFor returns the registration selected for a repository, or nil
+// when no registry is loaded and the observer's own destination is authoritative.
+// Selection failures (invalid or unmatched, ambiguous) propagate: a loaded
+// registry is the source of truth for destination, so an unsettled repository
+// must not quietly inherit the GitHub.com default.
+func (o Observer) registrationFor(repository string) (*forge.Registration, error) {
+	if o.Client == nil {
+		return nil, fmt.Errorf("GitHub observer: nil client")
+	}
+	if o.Registrations == nil {
+		return nil, nil
+	}
+	registration, err := o.Registrations.Select(repository)
+	if err != nil {
+		return nil, fmt.Errorf("GitHub observer: %w", err)
+	}
+	return registration, nil
+}
+
+// ProviderForRepository builds a forge provider for one repository's reads:
+// against the selected registration's endpoint and identity when a registry is
+// loaded, otherwise against the observer's own client. Rebuilt per read on
+// purpose — routing is decided by the repository, not by which client happened
+// to be wired first.
+func (o Observer) ProviderForRepository(repository string) (*Provider, error) {
+	registration, err := o.registrationFor(repository)
+	if err != nil {
+		return nil, err
+	}
+	if registration == nil {
+		return NewProvider(forge.ProviderConfig{Name: "github"}, o.Client), nil
+	}
+	client, err := o.Client.WithBaseURL(registration.Endpoint)
+	if err != nil {
+		return nil, fmt.Errorf("GitHub observer: provider %q endpoint %q is not usable: %w", registration.Name, registration.Endpoint, err)
+	}
+	return NewProvider(forge.ProviderConfig{Name: registration.Name, Endpoint: registration.Endpoint}, client), nil
+}
+
+// ClientForRepository returns the client whose destination serves one
+// repository, carrying the observer's read credential to that registration's
+// endpoint. This is the routing seam for client-level observation reads.
+func (o Observer) ClientForRepository(repository string) (*Client, error) {
+	provider, err := o.ProviderForRepository(repository)
+	if err != nil {
+		return nil, err
+	}
+	return provider.client, nil
+}
 
 // Observe reads the open pull request for a run's head and its CI state from
 // the base repository. The pull request lives on, and its checks are reported
@@ -46,6 +107,13 @@ func (o Observer) Observe(ctx context.Context, base string, head controller.Head
 	if err != nil {
 		return controller.PRObservation{}, err
 	}
+	// The pull request lives on the base repository, so the registration
+	// serving the base repository decides the destination for every read here,
+	// including the head-repository listing and the base-repository checks.
+	client, err := o.ClientForRepository(base)
+	if err != nil {
+		return controller.PRObservation{}, err
+	}
 	// A fork pull request is listed on the base repository but its head
 	// repository is the fork. An empty head repository means a same-repository
 	// head, so the base repository is also the head repository.
@@ -56,7 +124,7 @@ func (o Observer) Observe(ctx context.Context, base string, head controller.Head
 		}
 		headRepo = resolved
 	}
-	provider := NewProvider(forge.ProviderConfig{Name: "github"}, o.Client)
+	provider := NewProvider(forge.ProviderConfig{Name: "github"}, client)
 	pulls, foreign, err := provider.ListPullRequestsWithForeign(ctx, forge.PullRequestRef{Repo: base}, headRepo, head.Branch)
 	if err != nil {
 		return controller.PRObservation{}, err
@@ -80,11 +148,11 @@ func (o Observer) Observe(ctx context.Context, base string, head controller.Head
 		if ref == "" {
 			ref = head.Branch
 		}
-		checks, err := o.Client.GetCheckRuns(ctx, baseOwner, baseRepo, ref)
+		checks, err := client.GetCheckRuns(ctx, baseOwner, baseRepo, ref)
 		if err != nil {
 			return controller.PRObservation{}, err
 		}
-		statuses, err := o.Client.GetCommitStatuses(ctx, baseOwner, baseRepo, ref)
+		statuses, err := client.GetCommitStatuses(ctx, baseOwner, baseRepo, ref)
 		if err != nil {
 			return controller.PRObservation{}, err
 		}
@@ -118,7 +186,11 @@ func (o Observer) ResolveHead(ctx context.Context, run *courierv1alpha1.CoderRun
 	if err != nil {
 		return controller.HeadRef{}, err
 	}
-	pull, err := o.Client.GetPullRequest(ctx, owner, repo, run.Spec.Ref)
+	client, err := o.ClientForRepository(run.Spec.Repo)
+	if err != nil {
+		return controller.HeadRef{}, err
+	}
+	pull, err := client.GetPullRequest(ctx, owner, repo, run.Spec.Ref)
 	if err != nil {
 		return controller.HeadRef{}, err
 	}
@@ -126,6 +198,24 @@ func (o Observer) ResolveHead(ctx context.Context, run *courierv1alpha1.CoderRun
 		return controller.HeadRef{}, fmt.Errorf("GitHub observer: pull request %d has no head ref", run.Spec.Ref)
 	}
 	return controller.HeadRef{Repo: pull.Head.Repo.FullName, Branch: pull.Head.Ref, SHA: pull.Head.SHA}, nil
+}
+
+// Capabilities reports the forge capabilities of the observer's provider. The
+// capability set belongs to the GitHub adapter, not to one endpoint, so the
+// observer's own client answers for every registration it can route to.
+func (o Observer) Capabilities() forge.Capabilities {
+	return NewProvider(forge.ProviderConfig{Name: "github"}, o.Client).Capabilities()
+}
+
+// ReadPullRequest reads the exact pull request through a provider built on the
+// endpoint of the registration serving the pull request's base repository, so
+// post-review merge observation follows the same host routing as admission.
+func (o Observer) ReadPullRequest(ctx context.Context, ref forge.PullRequestRef) (forge.PullRequest, error) {
+	provider, err := o.ProviderForRepository(ref.Repo)
+	if err != nil {
+		return forge.PullRequest{}, err
+	}
+	return provider.ReadPullRequest(ctx, ref)
 }
 
 func splitRepository(repository string) (string, string, error) {

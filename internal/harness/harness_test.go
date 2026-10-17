@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/ed25519"
 	"encoding/json"
+	"encoding/pem"
 	"errors"
 	"fmt"
 	"io"
@@ -1905,5 +1906,146 @@ func TestBrokerTokenSourceFailsClosed(t *testing.T) {
 				t.Fatalf("requests reaching the broker = %d, want %d: no request may be issued without a fresh token", after, before)
 			}
 		})
+	}
+}
+
+// --- broker transport reuse (#384) -----------------------------------------
+
+// countingTLSServer is an httptest TLS server that counts the connections it
+// opens and closes, and hands back its certificate as a CA PEM so a default
+// broker client can trust it.
+func countingTLSServer(t *testing.T, handler http.HandlerFunc) (*httptest.Server, *atomic.Int64, *atomic.Int64, []byte) {
+	t.Helper()
+	server := httptest.NewUnstartedServer(handler)
+	var opened, closed atomic.Int64
+	server.Config.ConnState = func(_ net.Conn, state http.ConnState) {
+		switch state {
+		case http.StateNew:
+			opened.Add(1)
+		case http.StateClosed:
+			closed.Add(1)
+		}
+	}
+	server.StartTLS()
+	t.Cleanup(server.Close)
+	caPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: server.Certificate().Raw})
+	return server, &opened, &closed, caPEM
+}
+
+// waitForClosed polls until the server has observed want connection closes.
+func waitForClosed(t *testing.T, closed *atomic.Int64, want int64) {
+	t.Helper()
+	for deadline := time.Now().Add(5 * time.Second); time.Now().Before(deadline); time.Sleep(10 * time.Millisecond) {
+		if closed.Load() >= want {
+			return
+		}
+	}
+	t.Fatalf("server closed %d connections, want %d", closed.Load(), want)
+}
+
+func TestBrokerClientReusesOneTransportAcrossRequests(t *testing.T) {
+	server, opened, closed, caPEM := countingTLSServer(t, func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/trusted/v1/status" || r.Method != http.MethodPost {
+			http.NotFound(w, r)
+			return
+		}
+		w.WriteHeader(http.StatusNoContent)
+	})
+	client := &BrokerClient{BaseURL: server.URL, TokenSource: NewStaticBrokerTokenSource([]byte("tok")), CA: caPEM}
+	for i := 1; i <= 5; i++ {
+		if err := client.PostStatus(context.Background(), StatusPatch{}); err != nil {
+			t.Fatalf("status post %d: %v", i, err)
+		}
+	}
+	if got := opened.Load(); got != 1 {
+		t.Fatalf("five sequential status posts opened %d TLS connections, want 1", got)
+	}
+	built, err := client.transport()
+	if err != nil {
+		t.Fatal(err)
+	}
+	transport, ok := built.Transport.(*http.Transport)
+	if !ok {
+		t.Fatalf("client built transport of type %T, want *http.Transport", built.Transport)
+	}
+	if transport.IdleConnTimeout <= 0 || transport.MaxIdleConns <= 0 || transport.MaxIdleConnsPerHost <= 0 {
+		t.Fatalf("idle bounds = timeout %d, max %d, max-per-host %d, want all finite",
+			transport.IdleConnTimeout, transport.MaxIdleConns, transport.MaxIdleConnsPerHost)
+	}
+	client.CloseIdleConnections()
+	waitForClosed(t, closed, 1)
+}
+
+func TestBrokerClientConcurrentRequestsShareOneTransport(t *testing.T) {
+	server, opened, _, caPEM := countingTLSServer(t, func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusNoContent)
+	})
+	client := &BrokerClient{BaseURL: server.URL, TokenSource: NewStaticBrokerTokenSource([]byte("tok")), CA: caPEM}
+	var group sync.WaitGroup
+	for i := 0; i < 8; i++ {
+		group.Add(1)
+		go func() {
+			defer group.Done()
+			if err := client.PostStatus(context.Background(), StatusPatch{}); err != nil {
+				t.Errorf("concurrent status post: %v", err)
+			}
+		}()
+	}
+	group.Wait()
+	if got := opened.Load(); got == 0 || got > 8 {
+		t.Fatalf("eight concurrent status posts opened %d TLS connections, want between 1 and 8", got)
+	}
+	first, err := client.transport()
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := client.transport()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first != second {
+		t.Fatal("the client must retain one built transport, not build a new one per request")
+	}
+}
+
+func TestBrokerProbeClientReusesOneTransportAcrossProbes(t *testing.T) {
+	server, opened, closed, caPEM := countingTLSServer(t, func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1/capabilities" {
+			http.NotFound(w, r)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprint(w, `{"provider":{"name":"acme-forge","type":"github"},"git":{"endpoint":"https://git.acme.example/acme.git","ready":true}}`)
+	})
+	client := &BrokerProbeClient{BaseURL: server.URL, TokenSource: NewStaticBrokerTokenSource([]byte("tok")), CA: caPEM}
+	for i := 1; i <= 3; i++ {
+		report, err := client.Capabilities(context.Background())
+		if err != nil || report.Provider.Name != "acme-forge" {
+			t.Fatalf("probe %d = %+v, err %v", i, report, err)
+		}
+	}
+	if got := opened.Load(); got != 1 {
+		t.Fatalf("three sequential capability probes opened %d TLS connections, want 1", got)
+	}
+	client.CloseIdleConnections()
+	waitForClosed(t, closed, 1)
+}
+
+func TestSuppliedHTTPClientKeepsOwnership(t *testing.T) {
+	server, _, closed, _ := countingTLSServer(t, func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusNoContent)
+	})
+	supplied := server.Client()
+	client := &BrokerClient{BaseURL: server.URL, TokenSource: NewStaticBrokerTokenSource([]byte("tok")), HTTP: supplied}
+	if got, err := client.transport(); err != nil || got != supplied {
+		t.Fatalf("transport() = %v, %v, want the supplied client itself", got, err)
+	}
+	if err := client.PostStatus(context.Background(), StatusPatch{}); err != nil {
+		t.Fatal(err)
+	}
+	client.CloseIdleConnections()
+	time.Sleep(200 * time.Millisecond)
+	if got := closed.Load(); got != 0 {
+		t.Fatalf("CloseIdleConnections closed %d connections on a supplied client, want 0: the supplier owns the pool", got)
 	}
 }
