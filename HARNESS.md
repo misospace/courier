@@ -1,10 +1,12 @@
 # HARNESS.md — Durable Coordinator Harness
 
-Design pass for the resumable coordinator harness (#8), consuming the forge
-capability boundary (#80) and credential/process isolation problem (#104). It
-settles the trust and execution contract; it does not implement it. The current
-OpenCode bootstrap remains an explicitly insecure legacy mode until a safe
-replacement is proven.
+The trust and execution contract for the resumable coordinator harness (#8),
+consuming the forge capability boundary (#80) and credential/process isolation
+problem (#104). The topology it settles has landed and is available as the
+opt-in deployment-level secure mode (`--secure-mode`); §11 records what is
+still unwired, chiefly the native path's forge reads and PR creation (#127) and
+the Go dependency cache (#136). The OpenCode bootstrap remains the default,
+explicitly insecure legacy mode until a safe replacement is proven.
 
 DESIGN.md remains authoritative. In particular: inform, don't constrain model
 behavior; git, the PR, and CI are source of truth; no wall-clock run deadlines;
