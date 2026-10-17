@@ -488,6 +488,58 @@ func TestReconcileAllCarriesContextOntoSpec(t *testing.T) {
 	}
 }
 
+// TestReconcileAllDoesNotChurnDefaultedContext closes the meet between the
+// parser's mirrored CRD default and the API server's default: a config that
+// omits the policy-level compactAtPercent, evaluated against a managed
+// LaneProfile already carrying the server-defaulted 75, must not update the
+// object. Without the mirror, every 60s pass would rewrite an unchanged lane.
+func TestReconcileAllDoesNotChurnDefaultedContext(t *testing.T) {
+	profiles, err := Parse([]byte(`profiles:
+  - name: local
+    roles:
+      coder: gpt-5
+    context:
+      outputReservation: 8192
+`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defaulted := &courierv1alpha1.LaneProfile{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: "courier",
+			Name:      "local",
+			Labels:    map[string]string{OwnerLabelKey: OwnerLabelValue},
+		},
+		Spec: courierv1alpha1.LaneProfileSpec{
+			Concurrency: 1,
+			Roles:       map[string]string{"coder": "gpt-5"},
+			Context: &courierv1alpha1.ContextPolicy{
+				CompactAtPercent:  75,
+				OutputReservation: 8192,
+			},
+		},
+	}
+	updates := 0
+	kubeClient := fake.NewClientBuilder().
+		WithScheme(bootstrapScheme()).
+		WithObjects(defaulted).
+		WithInterceptorFuncs(interceptor.Funcs{
+			Update: func(ctx context.Context, c client.WithWatch, obj client.Object, opts ...client.UpdateOption) error {
+				if _, ok := obj.(*courierv1alpha1.LaneProfile); ok {
+					updates++
+				}
+				return c.Update(ctx, obj, opts...)
+			},
+		}).Build()
+	r := &Reconciler{Client: kubeClient, Namespace: "courier", Provider: &staticProvider{profiles: profiles}}
+	if err := r.ReconcileAll(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if updates != 0 {
+		t.Fatalf("updates = %d, want 0: the parser's mirrored default must equal the server-defaulted spec", updates)
+	}
+}
+
 type staticProvider struct {
 	profiles []Profile
 	err      error
