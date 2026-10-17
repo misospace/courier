@@ -347,6 +347,213 @@ func TestSecureAdmissionProviderHonorsRegistrationEndpoint(t *testing.T) {
 	}
 }
 
+// observationRecordingTransport answers the operator's observation reads
+// (head listings, exact pull-request reads, check runs, commit statuses) and
+// records every request destination, so wiring tests can assert which host
+// each read reached without any network.
+type observationRecordingTransport struct {
+	requests []*http.Request
+}
+
+func (t *observationRecordingTransport) Do(req *http.Request) (*http.Response, error) {
+	t.requests = append(t.requests, req.Clone(context.Background()))
+	var body string
+	switch path := req.URL.Path; {
+	case strings.HasSuffix(path, "/pulls"):
+		body = `[{"number":7,"state":"open","head":{"ref":"agent/work","sha":"headsha","repo":{"full_name":"acme/widgets"}},"base":{"ref":"main","repo":{"full_name":"acme/widgets"}}}]`
+	case strings.HasSuffix(path, "/pulls/7"):
+		body = `{"number":7,"state":"open","head":{"ref":"agent/work","sha":"headsha","repo":{"full_name":"acme/widgets"}},"base":{"ref":"main","repo":{"full_name":"acme/widgets"}}}`
+	case strings.HasSuffix(path, "/check-runs"):
+		body = `{"total_count":1,"check_runs":[{"name":"unit","status":"completed","conclusion":"success"}]}`
+	case strings.HasSuffix(path, "/status"):
+		body = `{"total_count":0,"statuses":[]}`
+	default:
+		body = `{}`
+	}
+	return &http.Response{
+		StatusCode: http.StatusOK,
+		Proto:      "HTTP/1.1",
+		ProtoMajor: 1,
+		ProtoMinor: 1,
+		Header:     http.Header{"Content-Type": []string{"application/json"}},
+		Body:       io.NopCloser(strings.NewReader(body)),
+	}, nil
+}
+
+// TestObserverReadsRouteThroughRegistrationEndpoint is the #377 wiring test:
+// every operator-side forge read — post-review CI observation, existing-PR
+// head resolution, post-review merge observation, and the Dispatch PR-state
+// check — must go to the host of the registration serving the repository, and
+// a deployment with no registry must stay on the GitHub.com default.
+func TestObserverReadsRouteThroughRegistrationEndpoint(t *testing.T) {
+	const operatorToken = "operator-read-token"
+	tests := []struct {
+		name        string
+		useRegistry bool
+		wantHost    string
+		wantPrefix  string
+	}{
+		{
+			name:        "enterprise registration keeps observation reads on its own host",
+			useRegistry: true,
+			wantHost:    "ghes.example.test",
+			wantPrefix:  "/api/v3/repos/acme/widgets",
+		},
+		{
+			name:        "no registry keeps the GitHub.com default destination",
+			useRegistry: false,
+			wantHost:    "api.github.com",
+			wantPrefix:  "/repos/acme/widgets",
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			var registry *forge.Registry
+			if test.useRegistry {
+				registryFile := filepath.Join(t.TempDir(), "providers.json")
+				providers := `{"providers":[{"name":"ghe","type":"github","endpoint":"https://ghes.example.test/api/v3","credentials":{"forge-api":{"secretName":"forge-creds","key":"token"}},"serves":["acme/*"]}]}`
+				if err := os.WriteFile(registryFile, []byte(providers), 0o600); err != nil {
+					t.Fatal(err)
+				}
+				loaded, err := loadForgeRegistry(registryFile)
+				if err != nil {
+					t.Fatalf("loadForgeRegistry: %v", err)
+				}
+				registry = loaded
+			}
+			transport := &observationRecordingTransport{}
+			client, err := couriergithub.New(operatorToken, transport)
+			if err != nil {
+				t.Fatal(err)
+			}
+			observer := couriergithub.Observer{Client: client, Registrations: registry}
+			ctx := context.Background()
+
+			observation, err := observer.Observe(ctx, "acme/widgets", controller.HeadRef{Branch: "agent/work"})
+			if err != nil || observation.PR != "7" || len(observation.Checks) != 1 {
+				t.Fatalf("Observe() = %#v, %v", observation, err)
+			}
+			resolver := existingPRHeadResolver(observer)
+			if resolver == nil {
+				t.Fatal("existingPRHeadResolver() returned nil for the GitHub observer")
+			}
+			head, err := resolver.ResolveHead(ctx, &courierv1alpha1.CoderRun{Spec: courierv1alpha1.CoderRunSpec{Repo: "acme/widgets", Ref: 7}})
+			if err != nil || head.Branch != "agent/work" {
+				t.Fatalf("ResolveHead() = %#v, %v", head, err)
+			}
+			reader := pullRequestReader(observer)
+			if reader == nil {
+				t.Fatal("pullRequestReader() returned nil for the GitHub observer")
+			}
+			pull, err := reader.ReadPullRequest(ctx, forge.PullRequestRef{Repo: "acme/widgets", Number: 7})
+			if err != nil || pull.Number != 7 {
+				t.Fatalf("ReadPullRequest() = %#v, %v", pull, err)
+			}
+			checker, err := dispatchPRStateChecker(observer)
+			if err != nil {
+				t.Fatalf("dispatchPRStateChecker: %v", err)
+			}
+			state, err := checker.CheckPullRequestState(ctx, "acme/widgets", 7)
+			if err != nil || state.State != "open" {
+				t.Fatalf("Dispatch PR-state check = %#v, %v", state, err)
+			}
+
+			if len(transport.requests) == 0 {
+				t.Fatal("no observation requests recorded")
+			}
+			for _, req := range transport.requests {
+				if req.URL.Host != test.wantHost {
+					t.Fatalf("observation read for %s went to %q, want %q", req.URL.Path, req.URL.Host, test.wantHost)
+				}
+				if !strings.HasPrefix(req.URL.Path, test.wantPrefix) {
+					t.Fatalf("observation read path = %q, want prefix %q", req.URL.Path, test.wantPrefix)
+				}
+				if got := req.Header.Get("Authorization"); got != "Bearer "+operatorToken {
+					t.Fatalf("authorization = %q, want the operator read identity carried over", got)
+				}
+			}
+		})
+	}
+}
+
+// TestGithubObserverCarriesRegistry pins the production constructor handoff:
+// the loaded registry rides onto the observer that every observation read
+// routes through, so wiring the registry is not merely a parameter that the
+// adapters happen to bypass.
+func TestGithubObserverCarriesRegistry(t *testing.T) {
+	registryFile := filepath.Join(t.TempDir(), "providers.json")
+	providers := `{"providers":[{"name":"ghe","type":"github","endpoint":"https://ghes.example.test/api/v3","credentials":{"forge-api":{"secretName":"forge-creds","key":"token"}},"serves":["acme/*"]}]}`
+	if err := os.WriteFile(registryFile, []byte(providers), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	registry, err := loadForgeRegistry(registryFile)
+	if err != nil {
+		t.Fatalf("loadForgeRegistry: %v", err)
+	}
+	scheme := runtime.NewScheme()
+	if err := corev1.AddToScheme(scheme); err != nil {
+		t.Fatalf("add core scheme: %v", err)
+	}
+	reader := fake.NewClientBuilder().WithScheme(scheme).WithRuntimeObjects(&corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{Name: "courier-github", Namespace: "courier-system"},
+		Data:       map[string][]byte{"token": []byte("operator-read-token")},
+	}).Build()
+
+	observer, err := githubObserver(context.Background(), reader, "courier-system", "courier-github", "", "", "", registry)
+	if err != nil {
+		t.Fatalf("githubObserver() error = %v", err)
+	}
+	got, ok := observer.(couriergithub.Observer)
+	if !ok {
+		t.Fatalf("githubObserver() returned %T, want couriergithub.Observer", observer)
+	}
+	if got.Registrations != registry {
+		t.Fatal("githubObserver() did not carry the loaded registry onto the observer")
+	}
+	if _, err := got.ClientForRepository("acme/widgets"); err != nil {
+		t.Fatalf("ClientForRepository() error = %v, want the observer to route through the registry", err)
+	}
+}
+
+// TestObserverRegistryWithoutMatchFailsClosed pins that a loaded registry which
+// cannot settle a repository is a read error and never a silent send to the
+// observer client's default destination.
+func TestObserverRegistryWithoutMatchFailsClosed(t *testing.T) {
+	registryFile := filepath.Join(t.TempDir(), "providers.json")
+	providers := `{"providers":[{"name":"ghe","type":"github","endpoint":"https://ghes.example.test/api/v3","credentials":{"forge-api":{"secretName":"forge-creds","key":"token"}},"serves":["acme/*"]}]}`
+	if err := os.WriteFile(registryFile, []byte(providers), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	registry, err := loadForgeRegistry(registryFile)
+	if err != nil {
+		t.Fatalf("loadForgeRegistry: %v", err)
+	}
+	transport := &observationRecordingTransport{}
+	client, err := couriergithub.New("operator-read-token", transport)
+	if err != nil {
+		t.Fatal(err)
+	}
+	observer := couriergithub.Observer{Client: client, Registrations: registry}
+	ctx := context.Background()
+
+	if _, err := observer.Observe(ctx, "other/widgets", controller.HeadRef{Branch: "agent/work"}); err == nil || !strings.Contains(err.Error(), "no provider registration serves") {
+		t.Fatalf("Observe() error = %v, want the fail-closed selection error", err)
+	}
+	if _, err := pullRequestReader(observer).ReadPullRequest(ctx, forge.PullRequestRef{Repo: "other/widgets", Number: 7}); err == nil || !strings.Contains(err.Error(), "no provider registration serves") {
+		t.Fatalf("ReadPullRequest() error = %v, want the fail-closed selection error", err)
+	}
+	checker, err := dispatchPRStateChecker(observer)
+	if err != nil {
+		t.Fatalf("dispatchPRStateChecker: %v", err)
+	}
+	if _, err := checker.CheckPullRequestState(ctx, "other/widgets", 7); err == nil || !strings.Contains(err.Error(), "no provider registration serves") {
+		t.Fatalf("Dispatch PR-state check error = %v, want the fail-closed selection error", err)
+	}
+	if len(transport.requests) != 0 {
+		t.Fatalf("an unsettled repository made %d requests; it must make none, not fall back to the default host", len(transport.requests))
+	}
+}
+
 func TestValidateEvidenceFlags(t *testing.T) {
 	tests := []struct {
 		name      string
@@ -445,7 +652,7 @@ func TestStartupReadsSurfaceDeadlineErrors(t *testing.T) {
 	t.Run("GitHub observer read", func(t *testing.T) {
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Millisecond)
 		defer cancel()
-		_, err := githubObserver(ctx, reader, "courier-system", "courier-github", "", "", "")
+		_, err := githubObserver(ctx, reader, "courier-system", "courier-github", "", "", "", nil)
 		if !errors.Is(err, context.DeadlineExceeded) {
 			t.Fatalf("githubObserver() error = %v, want a deadline-exceeded error", err)
 		}

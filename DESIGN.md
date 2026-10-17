@@ -1891,6 +1891,23 @@ named items remain unresolved and must not be described as production-ready:
 
 ## Decisions
 
+- **2026-10-17 — #377: the operator's own observation reads resolve their
+  destination through the selected registration, the same routing admission
+  was given in #340/#378.** Post-review PR observation, existing-PR head
+  resolution, post-review merge observation, and the Dispatch PR-state check
+  were built once on the observer's GitHub.com client, so in a secure
+  deployment whose registry serves a GitHub Enterprise host those reads still
+  left for `api.github.com`. The chosen fix is per-read resolution rather than
+  a deployment-wide API-base flag: the loaded registry — already the sole
+  source of truth for where forge traffic goes — is carried onto the GitHub
+  observer (`--forge-providers-file`, loaded once in `cmd/main.go`), and each
+  read selects the registration serving the repository under observation and
+  re-points the client at that registration's endpoint with the operator's own
+  read credential. A loaded registry that cannot settle a repository is a read
+  error, never a silent fallback to the public API; with no registry (legacy
+  wiring) the observer keeps its GitHub.com client unchanged. Rejected: a
+  second deployment flag for an Enterprise-first API base — it would fork the
+  source of truth and still misroute mixed-host registries.
 - **2026-10-16 — #282: the legacy executor enforces the criterion-evidence
   contract in one shared handoff plan, and the pinned envelope binds to the
   trusted source identity.** `applyLinkagePlan` became `applyHandoffPlan`
@@ -3564,26 +3581,68 @@ was superseded.
   calls already observed.**
   `Capture` bounded its git calls by the 20-second operation deadline
   (`exec.CommandContext`) but its per-file reads took no context at all, so one
-  stalling read — a hostile worktree, a hung filesystem — carried the capture
+  stalling read — a regular file on a hung filesystem — carried the capture
   past that deadline, through the pod's 45-second grace, to SIGKILL, and the
-  manifest went with it: "over deadline the bundle degrades to the manifest
-  alone" was unreachable for the one phase git did not bound. The read is now
-  bounded by the same context. The mechanism is deliberately weak: a pre-check
-  fails fast when the deadline is already gone (no goroutine at all), and
-  otherwise the `O_NOFOLLOW` open and the capped read run in a goroutine whose
-  result is received unless the context is done first. Cancellation abandons
-  that goroutine rather than interrupting it — closing a descriptor from
-  another goroutine is not a reliable way to unblock a read already blocked in
-  the kernel — and the abandoned read's bytes are discarded and never stored,
-  so bounding the wait costs no content risk. A canceled read returns the
-  context's error rather than a read failure to be classified, which is what
-  makes the executor's existing manifest-only degradation reachable here: the
-  same `Capture` error the executor already handles, with the same fresh
-  five-second window the 2026-10-09 decision grants a capture the deadline
-  itself aborted.   Not folded in: the `O_NONBLOCK` open plus non-regular
-  descriptor guard that closes the fifo-swap hole outright. It is a different
+  manifest went with it: "over deadline the
+  bundle degrades to the manifest alone" was unreachable for the one phase git
+  did not bound. The read is now bounded by the same context. The mechanism is
+  deliberately weak: a pre-check fails fast when the deadline is already gone
+  (no goroutine at all), and otherwise the open and the capped read run in a
+  goroutine whose result is received unless the context is done first.
+  Cancellation abandons that goroutine rather than interrupting it — closing a
+  descriptor from another goroutine is not a reliable way to unblock a read
+  already blocked in the kernel — and the abandoned read's bytes are discarded
+  and never stored, so bounding the wait costs no content risk. A canceled read
+  returns the context's error rather than a read failure to be classified, which
+  is what makes the executor's existing manifest-only degradation reachable
+  here: the same `Capture` error the executor already handles, with the same
+  fresh five-second window the 2026-10-09 decision grants a capture the
+  deadline itself aborted. The `O_NONBLOCK` open plus non-regular descriptor
+  guard that closes the fifo-swap hole (#336, merged as #389) was deliberately
+  kept out of #390's own change rather than folded into it: it is a different
   problem — refusing to open a non-regular file at all, rather than bounding
-  the read that follows — and it stays with #336 (open as #389) rather than
-  widening this change's surface. The two compose, and #389 is the one that
-  changes the other's fixture: its regression stalls a read on a fifo, which an
-  `O_NONBLOCK` open refuses to begin, so that test is #389's to rework. (#390)
+  the read that follows. The two landed independently and this merge composes
+  them in one function: `O_NONBLOCK` keeps a non-regular
+  swap from stalling the open, and the context bounds what survives that check,
+  which is a read of a regular file the kernel has already accepted. As #389
+  predicted, its guard took this regression's fixture with it: a fifo is
+  refused with `errNotRegular` before any read begins, so the abandoned-read
+  primitive is now reachable only by a hung filesystem serving a regular file,
+  which a unit test cannot construct without a privileged mount. The primitive
+  test therefore pins what is still observable — a context that is already
+  done is answered from the context, not with the path's own `errNotRegular`,
+  which is the ordering the taxonomy depends on — and the bound's observable
+  consequence is pinned end to end through the `readFileForCapture` seam. The
+  fast-path pre-check is not pinned by it, and the reason is measured rather
+  than argued: because #389 answers a fifo in two syscalls, without the
+  pre-check the goroutine's `errNotRegular` and the already-done context are
+  sometimes both ready at the select, which breaks that tie at random — about
+  1 run in 25,000 (20 of 500k), far below what a test can detect. The pre-check
+  is kept for the fast path it buys (no goroutine, no syscalls), not because a
+  test fails without it. (#390)
+- **2026-10-17 — #372: native worker cancellation proves the task tree
+  is gone, and never claims otherwise.**
+  `internal/protocol` ran each task through `exec.CommandContext`, which kills
+  only the direct child, while production tasks are `sh -c ...`: a cancelled
+  shell left its own commands mutating the shared workspace after the worker
+  acknowledged verified termination, and a descendant that inherited the task's
+  output descriptors could hold the wait open so cancellation was never
+  acknowledged at all. Each task now leads its own process group
+  (`SysProcAttr.Setpgid`, verified after start — a task that did not get one
+  fails instead of reporting a termination nobody can prove), cancellation
+  signals the whole group, and the wait carries a bound so an inherited
+  descriptor cannot wedge cleanup. Nothing is acknowledged as stopped until the
+  worker proves the group holds no live process — zombies excluded, because an
+  exited process nobody has reaped yet holds no descriptors and writes nothing.
+  Work that leaves the group (`setsid`) escapes the signal, so a wait that
+  outlasts the grace is itself the evidence that a writer outside the group
+  survived: the count is reported nonzero and the cancellation is refused
+  (non-2xx) instead of acknowledged. The same count on the coordinator side
+  keeps `verifiedResult` from clearing an operation whose terminal state the
+  worker called unproven, so an unverified tree stays suppressed rather than
+  claimed gone. Cancellation tombstones and no-redelivery are unchanged, and the
+  bounds are cleanup bounds, never a run wall-clock. Containment stronger than a
+  process group (a per-task PID namespace or cgroup) is the remaining limit and
+  is tracked separately; this is the worker half of the process-group
+  cancellation the executor already performs (#115), for a different caller.
+  (#372)

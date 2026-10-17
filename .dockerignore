@@ -1,0 +1,37 @@
+# Build context for every image build: both workflows use `context: .`, so this
+# file is the only place non-build inputs can be trimmed before the checkout is
+# uploaded to the builder and captured in the type=gha build cache.
+#
+# The Dockerfile reads exactly six context paths: go.mod, go.sum, cmd/, api/,
+# and internal/ in the builder stage, and dist/ in the binaries-prebuilt stage.
+# Everything below is excluded because no stage reads it.
+#
+# dist/ is deliberately absent: `BINARIES=prebuilt` copies it, so CI builds
+# depend on it reaching the builder. hack/ is excluded for the same reason it is
+# never copied -- the coordinator-go runtime check bind-mounts the workspace and
+# runs hack/ from there, it is not baked into the image.
+
+# Version control and CI definitions.
+.git
+.gitignore
+.github
+
+# Local build and test output.
+bin/
+cover.out
+
+# Prose, the docs site, and the Helm chart.
+*.md
+docs/
+site/
+charts/
+
+# Developer-only sources and kubebuilder scaffolding.
+hack/
+config/
+
+# Release packaging output and dependency-automation metadata.
+.release/
+.release-please-manifest.json
+release-please-config.json
+renovate.json

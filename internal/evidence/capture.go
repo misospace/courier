@@ -136,6 +136,19 @@ func Capture(ctx context.Context, opts Options) (*Bundle, error) {
 					applySymlinkMetadata(&entry, &totals, dir, full)
 					break
 				}
+				if errors.Is(rerr, errNotRegular) {
+					// The path was swapped for a fifo, directory, or device
+					// between the Lstat classification and this open:
+					// re-classify exactly as a path classified non-regular
+					// outright — omitted-binary, storing nothing — so a peer
+					// the classification pass never saw is never waited on and
+					// never blocks the capture. A socket swap needs no branch
+					// of its own: its read-only open fails outright and falls
+					// to the generic failed-read case, which stores nothing.
+					entry.Disposition = DispositionOmittedBinary
+					totals.OmittedBinary++
+					break
+				}
 				entry.Disposition = DispositionOmittedBinary
 				entry.Bytes = info.Size()
 				totals.OmittedBinary++
@@ -443,6 +456,10 @@ func truncateDisplay(s string) string {
 	return s[:cut] + "…"
 }
 
+// errNotRegular reports that the descriptor readCapped opened is not a
+// regular file, so nothing was read and nothing can be stored.
+var errNotRegular = errors.New("evidence: opened file is not regular")
+
 // readFileForCapture reads, under the capture's own context, the content of a
 // file classified as regular. Tests swap it to simulate a hostile worktree
 // mutating a path between the Lstat classification and the read.
@@ -453,9 +470,21 @@ var readFileForCapture = readCapped
 // larger. A path swapped for a symlink after classification fails with
 // ELOOP instead of following the new target.
 //
+// A path swapped for a non-regular file — fifo, directory, device — is
+// opened O_NONBLOCK so the open cannot wait for a peer that may never come,
+// then checked with fstat on the descriptor: a non-regular result fails with
+// errNotRegular. fstat describes the object actually opened rather than the
+// path, so the check cannot be swapped out from under it the way a second
+// Lstat could. O_NONBLOCK is a no-op for the regular files this is reached
+// for. A swap to a socket never reaches this check: a read-only open of a
+// socket fails with ENXIO before any blocking is possible.
+//
 // The read is bounded by ctx and not by the file: one stalling read — a
-// hostile worktree, a hung filesystem — must not carry the capture past its
+// regular file on a hung filesystem — must not carry the capture past its
 // operation deadline to the pod's SIGKILL, which would lose the manifest too.
+// The two bounds are independent and compose: O_NONBLOCK keeps a non-regular
+// swap from stalling the open, and the context bounds what survives that
+// check, which is a read of a regular file the kernel has already accepted.
 // Cancellation is checked before any filesystem work, so an already-expired
 // context starts no goroutine at all. Otherwise the open and the capped read
 // run in a goroutine whose result is received unless ctx is done first; on
@@ -478,12 +507,21 @@ func readCapped(ctx context.Context, path string, limit int) ([]byte, error) {
 	// that is already gone.
 	done := make(chan readResult, 1)
 	go func() {
-		f, err := os.OpenFile(path, os.O_RDONLY|syscall.O_NOFOLLOW, 0)
+		f, err := os.OpenFile(path, os.O_RDONLY|syscall.O_NOFOLLOW|syscall.O_NONBLOCK, 0)
 		if err != nil {
 			done <- readResult{err: err}
 			return
 		}
 		defer f.Close()
+		info, err := f.Stat()
+		if err != nil {
+			done <- readResult{err: err}
+			return
+		}
+		if !info.Mode().IsRegular() {
+			done <- readResult{err: errNotRegular}
+			return
+		}
 		data, err := io.ReadAll(io.LimitReader(f, int64(limit)))
 		done <- readResult{data: data, err: err}
 	}()

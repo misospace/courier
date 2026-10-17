@@ -1081,6 +1081,13 @@ func (c *Coordinator) verifiedResult(ctx context.Context, opID string, state pro
 		c.closeOperation(ctx, opID, false)
 		return protocol.Result{}, fmt.Errorf("reconciliation of %s observed status %q without a result", opID, state.Status)
 	}
+	if state.Result.LiveDescendants > 0 {
+		// The worker reported work that outlived the task, so its terminal
+		// observation is not a verified termination: the entry is retained
+		// and the result is returned as an error, never as a cleared,
+		// suppressible operation (#372).
+		return *state.Result, fmt.Errorf("operation %s ended as %s with %d processes still live in its task tree", opID, state.Status, state.Result.LiveDescendants)
+	}
 	c.closeOperation(ctx, opID, state.Status == protocol.ResultCompleted)
 	return *state.Result, nil
 }

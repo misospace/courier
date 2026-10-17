@@ -289,7 +289,21 @@ func main() {
 		os.Exit(1)
 	}
 
-	githubObserver, err := githubObserver(startupCtx, mgr.GetAPIReader(), os.Getenv("POD_NAMESPACE"), githubCredentialSecret, githubTokenKey, gitCredentialSecret, gitTokenKey)
+	// The provider registry is the source of truth for where forge reads go.
+	// Load it once before the observer so the operator's own observation reads
+	// route through the same settled registrations as secure admission (#377);
+	// a malformed registry fails startup, not a run. Outside secure mode there
+	// is no registry and the observer keeps its GitHub.com default client.
+	var forgeRegistry *forge.Registry
+	if secureMode && strings.TrimSpace(forgeProvidersFile) != "" {
+		forgeRegistry, err = loadForgeRegistry(forgeProvidersFile)
+		if err != nil {
+			setupLog.Error(err, "unable to load forge provider registry")
+			os.Exit(1)
+		}
+	}
+
+	githubObserver, err := githubObserver(startupCtx, mgr.GetAPIReader(), os.Getenv("POD_NAMESPACE"), githubCredentialSecret, githubTokenKey, gitCredentialSecret, gitTokenKey, forgeRegistry)
 	if err != nil {
 		setupLog.Error(err, "unable to configure GitHub observer")
 		os.Exit(1)
@@ -398,6 +412,7 @@ func main() {
 	if secureMode {
 		secure, err := buildSecureControl(secureConfig{
 			providersFile:    forgeProvidersFile,
+			registry:         forgeRegistry,
 			runNamespace:     runNamespace,
 			harnessImage:     harnessImage,
 			probeImage:       probeImage,
@@ -458,13 +473,15 @@ func existingPRHeadResolver(observer controller.WorldObserver) controller.Existi
 // forge capability it reads through: the exact pull-request read of the
 // configured provider, built on the operator's own read credential. The core
 // never receives a forge-specific client or CLI — only the forge.Provider
-// seam and its capability diagnostics.
+// seam and its capability diagnostics. The GitHub observer routes each read
+// through the endpoint of the registration serving the pull request's
+// repository (#377), so the reader is the observer itself.
 func pullRequestReader(observer controller.WorldObserver) controller.PullRequestReader {
 	githubObserver, ok := observer.(couriergithub.Observer)
 	if !ok || githubObserver.Client == nil {
 		return nil
 	}
-	return couriergithub.NewProvider(forge.ProviderConfig{Name: "github"}, githubObserver.Client)
+	return githubObserver
 }
 
 // validateEvidenceFlags reports a clear error when the evidence intake flags
@@ -570,7 +587,14 @@ func dispatchPRStateChecker(observer controller.WorldObserver) (dispatch.PullReq
 		if len(parts) != 2 || parts[0] == "" || parts[1] == "" {
 			return dispatch.PullRequestState{}, fmt.Errorf("invalid repository %q", repo)
 		}
-		pull, err := githubObserver.Client.GetPullRequest(ctx, parts[0], parts[1], number)
+		// Resolve the destination per repository through the loaded registry,
+		// so a Dispatch-tracked pull request on an Enterprise registration is
+		// read from that registration's host, never the GitHub.com default (#377).
+		client, err := githubObserver.ClientForRepository(repo)
+		if err != nil {
+			return dispatch.PullRequestState{}, err
+		}
+		pull, err := client.GetPullRequest(ctx, parts[0], parts[1], number)
 		if err != nil {
 			return dispatch.PullRequestState{}, err
 		}
@@ -578,7 +602,12 @@ func dispatchPRStateChecker(observer controller.WorldObserver) (dispatch.PullReq
 	}), nil
 }
 
-func githubObserver(ctx context.Context, reader client.Reader, namespace, configuredSecret, configuredKey, gitSecret, gitKey string) (controller.WorldObserver, error) {
+// githubObserver builds the operator's own forge read identity. The registry
+// (nil outside secure mode) is carried onto the observer so every observation
+// read — post-review PR state, existing-PR head resolution, Dispatch PR state,
+// and merge observation — resolves its destination through the registration
+// serving the repository rather than the GitHub.com default (#377).
+func githubObserver(ctx context.Context, reader client.Reader, namespace, configuredSecret, configuredKey, gitSecret, gitKey string, registry *forge.Registry) (controller.WorldObserver, error) {
 	secretName := strings.TrimSpace(configuredSecret)
 	if secretName == "" {
 		secretName = strings.TrimSpace(gitSecret)
@@ -612,7 +641,7 @@ func githubObserver(ctx context.Context, reader client.Reader, namespace, config
 	if err != nil {
 		return nil, err
 	}
-	return couriergithub.Observer{Client: githubClient}, nil
+	return couriergithub.Observer{Client: githubClient, Registrations: registry}, nil
 }
 
 // loadEvidenceKey reads the evidence intake HMAC key from the named Secret in
@@ -646,6 +675,7 @@ func loadEvidenceKey(ctx context.Context, reader client.Reader, namespace, name 
 // secureConfig carries the parsed secure-mode flags into buildSecureControl.
 type secureConfig struct {
 	providersFile    string
+	registry         *forge.Registry
 	runNamespace     string
 	harnessImage     string
 	probeImage       string
@@ -671,24 +701,36 @@ const (
 	startupReadTimeout = 30 * time.Second
 )
 
-// buildSecureControl loads and validates the provider registry, rejects
+// loadForgeRegistry reads and validates the deployment's provider registry
+// file. The registry is loaded once in main so the same settled configuration
+// routes both secure admission and the operator's own observation reads (#377).
+func loadForgeRegistry(path string) (*forge.Registry, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, fmt.Errorf("read forge providers file: %w", err)
+	}
+	return forge.Load(data, "github")
+}
+
+// buildSecureControl validates the provider registry (preloaded by main, or
+// loaded from the providers file for callers that wire it directly), rejects
 // registrations that reference a credential exposed to legacy pods (the §9
 // taint rule, enforced where the deployment configuration is knowable), and
 // assembles the secure control.
 func buildSecureControl(config secureConfig) (*controller.SecureControl, error) {
-	if strings.TrimSpace(config.providersFile) == "" {
+	if config.registry == nil && strings.TrimSpace(config.providersFile) == "" {
 		return nil, fmt.Errorf("secure mode requires --forge-providers-file")
 	}
 	if strings.TrimSpace(config.runNamespace) == "" {
 		return nil, fmt.Errorf("secure mode requires --run-namespace")
 	}
-	data, err := os.ReadFile(config.providersFile)
-	if err != nil {
-		return nil, fmt.Errorf("read forge providers file: %w", err)
-	}
-	registry, err := forge.Load(data, "github")
-	if err != nil {
-		return nil, err
+	registry := config.registry
+	if registry == nil {
+		var err error
+		registry, err = loadForgeRegistry(config.providersFile)
+		if err != nil {
+			return nil, err
+		}
 	}
 	tainted := map[string]bool{
 		strings.TrimSpace(config.legacyGitSecret): true,
