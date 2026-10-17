@@ -3560,3 +3560,21 @@ was superseded.
   client query had no remaining caller after this change and is gone, so one
   listing seam remains. (#365, closing the `Observer` carve-out left open by
   the #343 entry.)
+- **2026-10-17 — #383: a pod-bound credential is read per request, never
+  frozen.** Secure control read its projected broker-audience token once in
+  `loadIdentity` and handed the byte slice to the capability, publication and
+  trusted-status clients. Kubelet rotates the mounted file, not those slices,
+  so a run outlasting the first token lost every authenticated broker read
+  while a valid token sat on disk. The clients now hold a
+  `harness.BrokerTokenSource` and consult it per request: production wires the
+  file source, so rotation is picked up with no identity rebuild and no run
+  restart. Two choices are deliberate. There is no cache and no expiry
+  bookkeeping — a cached copy is the frozen-credential bug itself, and a
+  projected-volume read is a cheap local open, while cached-until-expiry adds a
+  second expiry clock that can only disagree with the kubelet's. And a
+  projection that cannot be read fails the request closed with a fixed,
+  retryable category rather than falling back to the last good bytes: during a
+  swap the honest answer is that the credential is unknown, and a stale token
+  earns a 401 that is classified as a definite denial. Startup still validates
+  the projection once, so a control pod that can never authenticate never
+  launches. (#383)

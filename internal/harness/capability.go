@@ -119,12 +119,14 @@ func isProbeRetryable(err error) bool {
 }
 
 // BrokerProbeClient reaches the run's broker's typed API over TLS with the
-// control pod's projected broker-audience token.
+// control pod's projected broker-audience token. The token is read per
+// request from TokenSource: kubelet rotates the projected file, and a probe
+// client holding the bytes it read at startup would report a stale identity.
 type BrokerProbeClient struct {
-	BaseURL string
-	Token   []byte
-	CA      []byte
-	HTTP    *http.Client
+	BaseURL     string
+	TokenSource BrokerTokenSource
+	CA          []byte
+	HTTP        *http.Client
 }
 
 // BrokerCapabilities is the redacted capability report served by the
@@ -149,6 +151,13 @@ type BrokerCapabilities struct {
 // maps to a fixed, safe diagnostic; transport-class failures are marked
 // retryable.
 func (b *BrokerProbeClient) Capabilities(ctx context.Context) (*BrokerCapabilities, error) {
+	token, err := resolveBrokerToken(b.TokenSource)
+	if err != nil {
+		// A probe never fails the run: an unreadable projection reports
+		// unavailable capabilities, retryably, and the underlying read error
+		// text is dropped rather than surfaced.
+		return nil, &BrokerProbeError{Msg: "broker token is unavailable", Retryable: true}
+	}
 	transport := b.HTTP
 	if transport == nil {
 		pool := x509.NewCertPool()
@@ -165,7 +174,7 @@ func (b *BrokerProbeClient) Capabilities(ctx context.Context) (*BrokerCapabiliti
 	if err != nil {
 		return nil, &BrokerProbeError{Msg: "broker capabilities request is malformed"}
 	}
-	req.Header.Set("Authorization", "Bearer "+string(b.Token))
+	req.Header.Set("Authorization", "Bearer "+string(token))
 	resp, err := transport.Do(req)
 	if err != nil {
 		return nil, &BrokerProbeError{Msg: "broker is unreachable", Retryable: true}
