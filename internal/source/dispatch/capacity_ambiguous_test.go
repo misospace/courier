@@ -73,4 +73,10 @@ func TestIssueCapacityHandoffLostResponseWithoutAuditPreservesReplacement(t *tes
 	if owner != "worker-b" || token != "issued-b" || posts != 2 {
 		t.Fatalf("owner=%s token=%s posts=%d", owner, token, posts)
 	}
+	// Adoption was attempted exactly once — only on the rotation-refused
+	// retry, never on the ambiguous first post — and the source's lease fence
+	// stopped it from touching the replacement's claim.
+	if claimAttempts != 1 {
+		t.Fatalf("claimAttempts = %d, want 1", claimAttempts)
+	}
 }
