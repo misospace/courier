@@ -27,12 +27,20 @@ boundary.
 
 ## Status
 
-Bootstrap MVP. Courier can admit a `CoderRun`, claim its source work, derive or
-adopt a branch, launch the temporary OpenCode coordinator, and map the completed
-pod back to review/needs-human state. The resumable custom harness and liveness
-recovery remain later work. See [BOOTSTRAP.md](./BOOTSTRAP.md) for the temporary
-executor contract and a manual first-run example. Contributor conventions are
-in [AGENTS.md](./AGENTS.md). Security issues should be reported privately; see
+Courier is functional end to end. It can admit a `CoderRun`, claim its source
+work, derive or adopt a branch, launch a coordinator, and map the completed pod
+back to review/needs-human state. The legacy single-pod OpenCode coordinator
+remains the default execution path and is explicitly insecure; the resumable
+native harness (trusted control/broker/worker topology in `internal/harness/`
+and `internal/topology/`, served by `cmd/courier-control`,
+`cmd/courier-worker`, and `cmd/courier-broker`) is implemented and available as
+an opt-in deployment-level secure mode (`--secure-mode`). Liveness recovery —
+heartbeat liveness window, crashloop ceiling, and terminal reaping
+(`internal/controller/liveness.go`, `internal/controller/reap.go`) — is
+implemented. See [BOOTSTRAP.md](./BOOTSTRAP.md) for the legacy executor
+contract and a manual first-run example, and [HARNESS.md](./HARNESS.md) for the
+native harness contract. Contributor conventions are in
+[AGENTS.md](./AGENTS.md). Security issues should be reported privately; see
 [SECURITY.md](./SECURITY.md).
 
 ## Prerequisites
