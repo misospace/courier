@@ -14,6 +14,7 @@ import (
 	"strings"
 	"syscall"
 	"testing"
+	"time"
 	"unicode/utf8"
 
 	"github.com/misospace/courier/internal/log"
@@ -657,6 +658,125 @@ func TestCaptureSymlinkSwapRace(t *testing.T) {
 		t.Errorf("totals = %+v, want Files 1, Symlinks 1, Stored 0", got)
 	}
 	assertAbsent(t, bundle, []string{"SWAP-RACE-ORIGINAL"})
+}
+
+// fifoSwapDeadline bounds the swap-race assertions: a read-only open of a fifo
+// blocks until a writer arrives, so a regression that loses O_NONBLOCK stalls
+// here instead of failing.
+const fifoSwapDeadline = 10 * time.Second
+
+// TestReadCappedRejectsNonRegular pins the issue #336 primitive: a path that
+// is a fifo when opened — as after a regular-file-to-fifo swap in the window
+// between Lstat classification and the read — fails with errNotRegular and
+// yields no content, promptly and without waiting for a writer; a plain
+// regular file still reads through the cap.
+func TestReadCappedRejectsNonRegular(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+
+	regular := filepath.Join(dir, "regular.txt")
+	writeFile(t, regular, "regular content\n")
+	data, err := readCapped(regular, MaxFileBytes+1)
+	if err != nil {
+		t.Fatalf("readCapped regular file: %v", err)
+	}
+	if string(data) != "regular content\n" {
+		t.Errorf("readCapped regular file = %q, want %q", data, "regular content\n")
+	}
+
+	fifo := filepath.Join(dir, "fifo.txt")
+	if err := syscall.Mkfifo(fifo, 0o600); err != nil {
+		t.Fatalf("mkfifo: %v", err)
+	}
+
+	type read struct {
+		data []byte
+		err  error
+	}
+	done := make(chan read, 1)
+	go func() {
+		content, rerr := readCapped(fifo, MaxFileBytes+1)
+		done <- read{data: content, err: rerr}
+	}()
+	select {
+	case got := <-done:
+		if !errors.Is(got.err, errNotRegular) {
+			t.Fatalf("readCapped fifo err = %v, want %v", got.err, errNotRegular)
+		}
+		if got.data != nil {
+			t.Errorf("readCapped returned %q for a fifo, want nil", got.data)
+		}
+	case <-time.After(fifoSwapDeadline):
+		t.Fatalf("readCapped blocked on a fifo for more than %s", fifoSwapDeadline)
+	}
+}
+
+// TestCaptureFifoSwapRace is the issue #336 regression: a hostile worktree
+// swaps a classified-regular file for a fifo in the window between the Lstat
+// classification and the read. The open must not block waiting for a writer,
+// and the capture must store nothing for the entry.
+func TestCaptureFifoSwapRace(t *testing.T) {
+	// Not parallel: the test replaces a package-level seam that parallel
+	// captures share.
+	dir := newRepo(t)
+	writeFile(t, filepath.Join(dir, "swap.txt"), "FIFO-SWAP-ORIGINAL\n")
+
+	original := readFileForCapture
+	t.Cleanup(func() { readFileForCapture = original })
+	readFileForCapture = func(path string, limit int) ([]byte, error) {
+		// The swap lands after Lstat classified the path as regular and
+		// before the O_NONBLOCK open, so the descriptor this read opens is a
+		// fifo the classification pass never saw.
+		if err := os.Remove(path); err != nil {
+			t.Errorf("swap remove: %v", err)
+		}
+		if err := syscall.Mkfifo(path, 0o600); err != nil {
+			t.Errorf("swap mkfifo: %v", err)
+		}
+		return original(path, limit)
+	}
+
+	type capture struct {
+		bundle *Bundle
+		err    error
+	}
+	done := make(chan capture, 1)
+	go func() {
+		bundle, cerr := Capture(context.Background(), captureOptions(dir, nil))
+		done <- capture{bundle: bundle, err: cerr}
+	}()
+
+	var bundle *Bundle
+	select {
+	case got := <-done:
+		if got.err != nil {
+			t.Fatalf("capture: %v", got.err)
+		}
+		bundle = got.bundle
+	case <-time.After(fifoSwapDeadline):
+		t.Fatalf("capture blocked on a fifo swap for more than %s", fifoSwapDeadline)
+	}
+
+	entry := findEntry(t, bundle, "swap.txt")
+	if entry.Class != ClassUntracked {
+		t.Errorf("class = %q, want %q", entry.Class, ClassUntracked)
+	}
+	if entry.Disposition != DispositionOmittedBinary {
+		t.Errorf("disposition = %q, want %q", entry.Disposition, DispositionOmittedBinary)
+	}
+	if entry.StoredPath != "" {
+		t.Errorf("fifo entry carries StoredPath %q", entry.StoredPath)
+	}
+	if entry.Bytes != 0 {
+		t.Errorf("fifo entry carries Bytes %d, want 0", entry.Bytes)
+	}
+	if members := untar(t, bundle.Archive); len(members) != 0 {
+		t.Errorf("archive carries %d members for a swapped fifo: %v", len(members), members)
+	}
+	if got := bundle.Manifest.Totals; got.Files != 1 || got.OmittedBinary != 1 || got.Stored != 0 {
+		t.Errorf("totals = %+v, want Files 1, OmittedBinary 1, Stored 0", got)
+	}
+	assertAbsent(t, bundle, []string{"FIFO-SWAP-ORIGINAL"})
 }
 
 // TestRunGitCapped drives the bounded pipe reader directly: a
