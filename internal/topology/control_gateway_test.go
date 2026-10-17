@@ -43,6 +43,7 @@ func TestControlPodCarriesRunContextAndGateway(t *testing.T) {
 		WorkerURL:             "http://worker:8080",
 		BrokerURL:             "https://broker:8443",
 		BrokerStatusURL:       "https://broker:8444",
+		Resources:             courier.DefaultPodResources(),
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -92,6 +93,7 @@ func TestControlPodWithoutGatewayOmitsGatewayMaterial(t *testing.T) {
 		WorkerURL:             "http://worker:8080",
 		BrokerURL:             "https://broker:8443",
 		BrokerStatusURL:       "https://broker:8444",
+		Resources:             courier.DefaultPodResources(),
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -113,6 +115,7 @@ func TestControlPodGatewayWithoutKeyIsValid(t *testing.T) {
 		Image: "harness:test", GatewayURL: "http://gateway:4000/v1",
 		ControlSAUID: "sa", WorkerPodUID: "w", ControlIncarnationUID: "c",
 		WorkerURL: "http://worker:8080", BrokerURL: "https://broker:8443", BrokerStatusURL: "https://broker:8444",
+		Resources: courier.DefaultPodResources(),
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -137,6 +140,7 @@ func TestControlPodKeySecretWithoutURLIsRejected(t *testing.T) {
 		Image: "harness:test", GatewayKeyMounted: true,
 		ControlSAUID: "sa", WorkerPodUID: "w", ControlIncarnationUID: "c",
 		WorkerURL: "http://worker:8080", BrokerURL: "https://broker:8443", BrokerStatusURL: "https://broker:8444",
+		Resources: courier.DefaultPodResources(),
 	}); err == nil {
 		t.Fatal("a gateway key Secret without a gateway URL must fail rendering")
 	}
