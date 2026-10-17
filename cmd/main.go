@@ -240,6 +240,10 @@ func main() {
 		Scheme:    mgr.GetScheme(),
 		Pod:       podConfig,
 	}
+	if err := launcher.Validate(); err != nil {
+		setupLog.Error(err, "unable to configure coordinator launcher")
+		os.Exit(1)
+	}
 
 	evidenceSecretSet := strings.TrimSpace(evidenceIntakeKeySecret) != ""
 	evidenceBindSet := strings.TrimSpace(evidenceIntakeBind) != ""

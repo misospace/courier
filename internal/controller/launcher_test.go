@@ -888,3 +888,14 @@ func TestCoordinatorLauncherCollisionReadBypassesCachedClient(t *testing.T) {
 		t.Fatalf("Launch() error = %v, want ErrProvisioningInFlight; the collision verification must read the API server's current state, not a cached pre-deletion view", err)
 	}
 }
+
+func TestCoordinatorLauncherValidateRequiresAPIReader(t *testing.T) {
+	unwired := &CoordinatorLauncher{}
+	if err := unwired.Validate(); !errors.Is(err, ErrLauncherAPIReaderRequired) {
+		t.Fatalf("Validate() error = %v, want ErrLauncherAPIReaderRequired", err)
+	}
+	wired := &CoordinatorLauncher{APIReader: fake.NewClientBuilder().WithScheme(launcherScheme(t)).Build()}
+	if err := wired.Validate(); err != nil {
+		t.Fatalf("Validate() error = %v", err)
+	}
+}
