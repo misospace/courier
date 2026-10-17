@@ -784,6 +784,27 @@ func (r *CoderRunReconciler) observeRunning(ctx context.Context, run *courierv1a
 		if !terminated {
 			continue
 		}
+		// A coordinator whose deletion is in flight is being deliberately
+		// torn down: its recorded exit belongs to that teardown, not to the
+		// model's work, and the two are indistinguishable — a wedge-reaped
+		// coordinator can carry a cancelled-stream failure exit or even exit
+		// 0 inside the shutdown window. Never map it, exactly as
+		// topologyBroken, coordinatorPodOf and activeOperationValid treat a
+		// terminating pod: checkLiveness re-observes the transition, and the
+		// disappearance backstop takes the deferred relaunch charge once the
+		// object is provably gone. The mirror case — a meaningful exit
+		// followed by deletion of the object (node drain, manual delete) —
+		// takes the same pod-loss relaunch by decision: a timestamp ordering
+		// test cannot separate the cases, because graceful deletion stamps
+		// deletionTimestamp with a value of the request plus the grace
+		// period, while the kubelet may end the SIGTERM'd container at any
+		// point after the request — a teardown exit can therefore read as
+		// finished before the stamp's value. A deleted coordinator is
+		// untrusted by construction, and the resumed run re-reads the
+		// world. (#369)
+		if pod.DeletionTimestamp != nil {
+			continue
+		}
 		phase := phaseForExit(run.Spec.Mode, exitCode, terminationOutcome)
 		if phase == courierv1alpha1.PhaseVerifying {
 			before := run.DeepCopy()
