@@ -85,7 +85,8 @@ mise run test    # authoritative: make test (codegen, fmt, vet, go test -race) w
 
 Later shell commands reuse the same environment with `mise exec -- <command>`;
 `mise run <task>` works without any shell activation. `make` and `git` are host
-prerequisites that bootstrap reports clearly when missing or too old.
+prerequisites that bootstrap fails clearly on when missing or too old; set
+`BOOTSTRAP_ALLOW_OLD_GIT=1` to proceed knowingly on older git.
 
 ## Install
 

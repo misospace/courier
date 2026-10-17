@@ -33,11 +33,14 @@ run_tools_steps() {
 		fail "git is required but not on PATH"
 
 	# internal/harness bundle validation requires git >= 2.41 (README
-	# Prerequisites); warn rather than fail because everything else builds
-	# and tests on older git.
+	# Prerequisites); fail clearly so a host that cannot run the
+	# authoritative suite does not get reported as ready. The override is
+	# for environments where git is known-old and the gap is accepted.
 	git_version=$(git version | awk '{print $3}')
 	if ! printf '%s\n%s\n' '2.41' "$git_version" | sort -V -C; then
-		log "warning: git ${git_version} < 2.41; internal/harness bundle tests fail on this version gap alone (see README Prerequisites)"
+		[ "${BOOTSTRAP_ALLOW_OLD_GIT:-}" = "1" ] ||
+			fail "git ${git_version} < 2.41 (README Prerequisites); internal/harness bundle tests fail on this version gap alone. Upgrade git, or set BOOTSTRAP_ALLOW_OLD_GIT=1 to proceed knowingly."
+		log "warning: BOOTSTRAP_ALLOW_OLD_GIT=1 set; continuing with git ${git_version} < 2.41 (bundle tests fail on this version gap)"
 	fi
 
 	log "installing pinned tools from .mise/config.toml + .mise/mise.lock"
@@ -53,8 +56,9 @@ run_tools_steps() {
 	# own version, so the stamp is the only reliable check for either tool).
 	cg_pin=$(sed -n 's/^CONTROLLER_TOOLS_VERSION ?= //p' Makefile)
 	se_pin=$(sed -n 's/^ENVTEST_VERSION ?= //p' Makefile)
-	[ -n "$cg_pin" ] && [ -n "$se_pin" ] ||
+	if [ -z "$cg_pin" ] || [ -z "$se_pin" ]; then
 		fail "could not read CONTROLLER_TOOLS_VERSION or ENVTEST_VERSION from Makefile"
+	fi
 	pins="controller-gen $cg_pin
 setup-envtest $se_pin"
 	if { [ -x bin/controller-gen ] || [ -x bin/setup-envtest ]; } &&
@@ -75,6 +79,7 @@ setup-envtest $se_pin"
 	printf 'helm: %s (%s)\n' "$(helm version --short)" "$(command -v helm)"
 	printf 'make: %s (%s)\n' "$(make --version | awk 'NR==1{print $3}')" "$(command -v make)"
 	printf 'controller-gen: %s (%s)\n' "$(bin/controller-gen --version)" "$REPO_ROOT/bin/controller-gen"
+	printf 'setup-envtest: pinned %s (%s)\n' "$se_pin" "$REPO_ROOT/bin/setup-envtest"
 	printf 'KUBEBUILDER_ASSETS=%s\n' "$assets"
 	printf 'GOMODCACHE=%s\n' "$(go env GOMODCACHE)"
 	printf 'GOCACHE=%s\n' "$(go env GOCACHE)"

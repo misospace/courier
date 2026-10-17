@@ -1,15 +1,3 @@
-# Repository development environment contract (#416).
-#
-# Local development tool versions live in this file and .mise/mise.lock; CI
-# and the images pin independently, so bump them together. Runtime tools
-# only — optional contributor conveniences do not belong here because they
-# would land in every automated worker.
-#
-# Entry points:
-#   hack/bootstrap.sh   idempotent setup (also `mise run bootstrap`)
-#   mise run check      CI-equivalent checks (generated-code drift included)
-#   mise run test       authoritative suite with envtest assets
-
 min_version = "2026.10.13"
 
 [tools]
@@ -23,9 +11,6 @@ run = "hack/bootstrap.sh tools"
 [tasks.check]
 description = "CI-equivalent checks mirroring the CI static job: generated-code drift, tidy diff, gofmt, vet, build, image-gating scripts"
 run = [
-  # Regenerates first, like CI's static job, so a stale tree fails the
-  # diff check instead of passing with outdated artifacts. Mutates the
-  # working tree only when generated code is actually stale.
   "make manifests generate",
   """git diff --exit-code || { echo "generated code is stale; run 'make manifests generate' and commit" >&2; exit 1; }""",
   "go mod tidy -diff",
