@@ -1,5 +1,63 @@
 # Changelog
 
+## [0.1.10](https://github.com/misospace/courier/compare/v0.1.9...v0.1.10) (2026-10-17)
+
+
+### Features
+
+* bounded identity-checked pre-handoff PR observation in legacy executor ([#247](https://github.com/misospace/courier/issues/247)) ([#342](https://github.com/misospace/courier/issues/342)) ([a587305](https://github.com/misospace/courier/commit/a587305799574f786a5bfc7eb2a0d321a7997a6b))
+* **controller:** terminalize closed-unmerged PRs after AwaitingReview ([#277](https://github.com/misospace/courier/issues/277)) ([#361](https://github.com/misospace/courier/issues/361)) ([e5b2186](https://github.com/misospace/courier/commit/e5b21867776c428340e8b27344e3860f9462204a))
+* **deps:** update dependency astro (5.18.2 → 7.4.0) ([#366](https://github.com/misospace/courier/issues/366)) ([bf57efb](https://github.com/misospace/courier/commit/bf57efb00cd9fab9bf37b5fe0555f9e2b961f5cb))
+* **executor:** check cited evidence paths against the published head ([#367](https://github.com/misospace/courier/issues/367)) ([#422](https://github.com/misospace/courier/issues/422)) ([a377976](https://github.com/misospace/courier/commit/a377976504b17b6dd52806b5fa7473ba24366abe))
+* **executor:** enforce the criterion-evidence contract in the legacy OpenCode handoff ([#348](https://github.com/misospace/courier/issues/348)) ([bad09d1](https://github.com/misospace/courier/commit/bad09d177e58c69996335742b70a10337efb9bd4))
+* **harness:** probe gateway model input limit and gate context budgets ([#296](https://github.com/misospace/courier/issues/296)) ([#382](https://github.com/misospace/courier/issues/382)) ([0a1364f](https://github.com/misospace/courier/commit/0a1364fa7e50f82df98264b63171eedfe87829cd))
+* **harness:** step-boundary compaction with digest preservation and session.compacted telemetry ([#381](https://github.com/misospace/courier/issues/381)) ([542c38a](https://github.com/misospace/courier/commit/542c38a60cd8794af27692fb0b7b69efed97a181))
+* **pods:** size every Courier pod from the lane's resources ([#356](https://github.com/misospace/courier/issues/356)) ([#401](https://github.com/misospace/courier/issues/401)) ([86f1c26](https://github.com/misospace/courier/commit/86f1c26890c50c92e0472d43324db252215acf6c))
+
+
+### Bug Fixes
+
+* **broker:** bound the API server's inbound reads and idle connections ([#357](https://github.com/misospace/courier/issues/357)) ([#433](https://github.com/misospace/courier/issues/433)) ([00981e8](https://github.com/misospace/courier/commit/00981e813d072a593948205ca7c975e86102600b))
+* **controller:** never map a terminating coordinator's exit to a run outcome ([#427](https://github.com/misospace/courier/issues/427)) ([0efe3ba](https://github.com/misospace/courier/commit/0efe3ba624c82935fe131063e7a13ee6546a01a3))
+* **controller:** require CoordinatorLauncher.APIReader at startup ([#430](https://github.com/misospace/courier/issues/430)) ([1b7d48f](https://github.com/misospace/courier/commit/1b7d48f06045e706effbaeb66984df17f7b25b18))
+* **evidence:** bound runGit's copy wait and keep bytes from a succeeded child ([#421](https://github.com/misospace/courier/issues/421)) ([973e5a8](https://github.com/misospace/courier/commit/973e5a86afee128795983ad21d53fe43cba10e46)), closes [#408](https://github.com/misospace/courier/issues/408)
+* **evidence:** bound runGitCapped's stdout read by the capture deadline ([#410](https://github.com/misospace/courier/issues/410)) ([c10e79f](https://github.com/misospace/courier/commit/c10e79fdbe51adef6bba914136dc0217972d0485))
+* **evidence:** bound the classified-regular capture read against a non-regular swap ([#389](https://github.com/misospace/courier/issues/389)) ([9a3ff26](https://github.com/misospace/courier/commit/9a3ff26f0d389ec4a98a3c5cdd0378a90b97a2a6))
+* **executor:** fail closed when classifyUndeclared's branch re-read errors ([#432](https://github.com/misospace/courier/issues/432)) ([2a23dea](https://github.com/misospace/courier/commit/2a23deaf45545683c9eb550c6f9353f398beb994))
+* **executor:** route the adoption guard through the identity-checked forge read ([#363](https://github.com/misospace/courier/issues/363)) ([9ec0de4](https://github.com/misospace/courier/commit/9ec0de49de820f38d99cee2f99b60cd8b3532b31))
+* **github:** bound default GitHub API request duration ([#362](https://github.com/misospace/courier/issues/362)) ([b48585a](https://github.com/misospace/courier/commit/b48585a064592bbcb9ddc8adec13822850bcf85b)), closes [#341](https://github.com/misospace/courier/issues/341)
+* **harness:** read the projected broker token per request ([#383](https://github.com/misospace/courier/issues/383)) ([#405](https://github.com/misospace/courier/issues/405)) ([0d500de](https://github.com/misospace/courier/commit/0d500de7df763fd159b487f9aa8a1fcf97939181))
+* **harness:** reuse one bounded TLS transport per broker client ([#404](https://github.com/misospace/courier/issues/404)) ([a2a4ad0](https://github.com/misospace/courier/commit/a2a4ad083f7b11bbf97c48b2f9362a8b9f3ef36e))
+* **image:** build git v2.47.3 from pinned GitHub release tarball ([#349](https://github.com/misospace/courier/issues/349)) ([cc8854a](https://github.com/misospace/courier/commit/cc8854ae204819c20f426c02f6ba6abdc29a6353))
+* **image:** ship process-tree utilities in coordinator image ([#353](https://github.com/misospace/courier/issues/353)) ([e1de758](https://github.com/misospace/courier/commit/e1de758e03405cff2fa29910d906fca7bf41aec9))
+* **metrics-mcp:** bound inbound HTTP reads and graceful shutdown ([#352](https://github.com/misospace/courier/issues/352)) ([e8daa33](https://github.com/misospace/courier/commit/e8daa33595acca853f11b3091b574425979a22b2))
+* **metrics:** redact query strings and fragments from URL diagnostics ([#350](https://github.com/misospace/courier/issues/350)) ([f8f428b](https://github.com/misospace/courier/commit/f8f428b7db0bebf312fe5cb6691a314478c1e173))
+* **observer:** read the Verifying observation's head listing through the identity-checked forge capability ([#386](https://github.com/misospace/courier/issues/386)) ([60a4fe3](https://github.com/misospace/courier/commit/60a4fe301e8cb50944a6810837676d98de5f12d0))
+* **protocol:** enforce workspace confinement and read bounds for worker artifacts ([#435](https://github.com/misospace/courier/issues/435)) ([998126e](https://github.com/misospace/courier/commit/998126ecf7a6a02516a54b0fced4468ddd6b0668))
+* **protocol:** stop requiring a running status on the dispatch response ([#380](https://github.com/misospace/courier/issues/380)) ([6e549f2](https://github.com/misospace/courier/commit/6e549f2056eb89f537787ed061f8c0177ea2643e))
+* **recovery:** hand off legacy OpenCode quota exhaustion across workers ([#327](https://github.com/misospace/courier/issues/327)) ([#368](https://github.com/misospace/courier/issues/368)) ([a7ab601](https://github.com/misospace/courier/commit/a7ab601eb7d0794cbff5a773232acac0de93bc35))
+* **secure:** decide the relaunch's delete and ceiling from the live world ([#370](https://github.com/misospace/courier/issues/370)) ([#423](https://github.com/misospace/courier/issues/423)) ([ccffb24](https://github.com/misospace/courier/commit/ccffb2413d593b001ab30a11f148a1a6dfc6933e))
+* **secure:** re-confirm the secure control delete and keep the ceiling evidence ([#371](https://github.com/misospace/courier/issues/371)) ([b371e5f](https://github.com/misospace/courier/commit/b371e5f75187d3fce6a809c6c6d1d0643d6f558c))
+* **secure:** route admission and broker clients through the registered forge endpoint ([#378](https://github.com/misospace/courier/issues/378)) ([f67b06e](https://github.com/misospace/courier/commit/f67b06ee5c04d5b30a584a29e9c1c8bd043c2521))
+* **secure:** route operator observation reads through the registered forge endpoint ([#377](https://github.com/misospace/courier/issues/377)) ([#387](https://github.com/misospace/courier/issues/387)) ([115dee2](https://github.com/misospace/courier/commit/115dee2d3ab1948dcd035b55bd04982dd8bd7f10))
+* **topology:** bound the run label value for long CoderRun names ([#428](https://github.com/misospace/courier/issues/428)) ([b00222e](https://github.com/misospace/courier/commit/b00222e26fba47d143ae79e73acb3b3c0ac5c9c4))
+* **topology:** render DNS-label-safe Service names for long or dotted run names ([#418](https://github.com/misospace/courier/issues/418)) ([baff598](https://github.com/misospace/courier/commit/baff59895cf6962ee54b95a350094ba9e304921c)), closes [#385](https://github.com/misospace/courier/issues/385)
+* **worker:** prove native task-tree termination before acknowledging cancellation ([#400](https://github.com/misospace/courier/issues/400)) ([84168c2](https://github.com/misospace/courier/commit/84168c2dfd0b7083c31b0bafe94ece2564f402f0))
+* **worker:** release consumed native worker result payloads ([#373](https://github.com/misospace/courier/issues/373)) ([#426](https://github.com/misospace/courier/issues/426)) ([9e79f65](https://github.com/misospace/courier/commit/9e79f658a18a7d7fa5fa24267d205d02df53b926))
+
+
+### Chores
+
+* **ci:** disable experimental requirement tracing ([#374](https://github.com/misospace/courier/issues/374)) ([3f3e5e1](https://github.com/misospace/courier/commit/3f3e5e1bb7f3b5b5270a27d60859c9cdf72ea3ac))
+* **container:** update image node (d6aa754 → a5f4366) ([#339](https://github.com/misospace/courier/issues/339)) ([36d43b7](https://github.com/misospace/courier/commit/36d43b7f95e953eff5f335174a248bb03bd628da))
+
+
+### Documentation
+
+* correct README Status — native harness and liveness recovery have shipped ([#397](https://github.com/misospace/courier/issues/397)) ([32ad040](https://github.com/misospace/courier/commit/32ad040e93865f4b459535f413bc67f6cf057bfa))
+* correct SECURITY.md supported versions now releases are published ([#434](https://github.com/misospace/courier/issues/434)) ([0eaa3fb](https://github.com/misospace/courier/commit/0eaa3fbbc012e975f0aceb4d421e6815904012ea))
+* correct site Status copy — native harness and liveness recovery shipped ([#398](https://github.com/misospace/courier/issues/398)) ([#431](https://github.com/misospace/courier/issues/431)) ([8c23297](https://github.com/misospace/courier/commit/8c23297734beb3c5aa7709219a0576431bc66688))
+
 ## [0.1.9](https://github.com/misospace/courier/compare/v0.1.8...v0.1.9) (2026-10-14)
 
 
