@@ -1885,6 +1885,23 @@ named items remain unresolved and must not be described as production-ready:
 
 ## Decisions
 
+- **2026-10-17 — #377: the operator's own observation reads resolve their
+  destination through the selected registration, the same routing admission
+  was given in #340/#378.** Post-review PR observation, existing-PR head
+  resolution, post-review merge observation, and the Dispatch PR-state check
+  were built once on the observer's GitHub.com client, so in a secure
+  deployment whose registry serves a GitHub Enterprise host those reads still
+  left for `api.github.com`. The chosen fix is per-read resolution rather than
+  a deployment-wide API-base flag: the loaded registry — already the sole
+  source of truth for where forge traffic goes — is carried onto the GitHub
+  observer (`--forge-providers-file`, loaded once in `cmd/main.go`), and each
+  read selects the registration serving the repository under observation and
+  re-points the client at that registration's endpoint with the operator's own
+  read credential. A loaded registry that cannot settle a repository is a read
+  error, never a silent fallback to the public API; with no registry (legacy
+  wiring) the observer keeps its GitHub.com client unchanged. Rejected: a
+  second deployment flag for an Enterprise-first API base — it would fork the
+  source of truth and still misroute mixed-host registries.
 - **2026-10-16 — #282: the legacy executor enforces the criterion-evidence
   contract in one shared handoff plan, and the pinned envelope binds to the
   trusted source identity.** `applyLinkagePlan` became `applyHandoffPlan`
