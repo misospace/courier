@@ -522,27 +522,77 @@ func processStat(pid int) (state string, pgid int, ok bool) {
 }
 
 // readArtifact reads the declared artifact, refusing anything outside the
-// workspace and over the transport bound.
+// workspace and over the transport bound. The lexical gate is only a first
+// filter; the authoritative confinement check walks the cleaned path from the
+// workspace's own directory descriptor with O_NOFOLLOW, so no component —
+// parent or final — can be a symlink at open time, and validation happens on
+// the opened descriptor rather than on a path a concurrent task could swap.
 func (w *Worker) readArtifact(declared string) ([]byte, error) {
 	clean := filepath.Clean("/" + declared)
+	if clean == "/" {
+		return nil, errors.New("declared artifact is unavailable")
+	}
 	abs := filepath.Join(w.config.WorkspaceDir, clean)
 	rel, err := filepath.Rel(w.config.WorkspaceDir, abs)
 	if err != nil || rel == ".." || strings.HasPrefix(rel, "../") {
 		return nil, errors.New("artifact path escapes the workspace")
 	}
-	info, err := os.Lstat(abs)
+	dir, err := os.Open(w.config.WorkspaceDir)
 	if err != nil {
 		return nil, errors.New("declared artifact is unavailable")
 	}
-	if !info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 {
+	defer dir.Close()
+	dirfd := int(dir.Fd())
+	components := strings.Split(strings.TrimPrefix(clean, "/"), "/")
+	for i, name := range components {
+		flags := syscall.O_NOFOLLOW | syscall.O_CLOEXEC | syscall.O_RDONLY
+		if i < len(components)-1 {
+			flags |= syscall.O_DIRECTORY
+		} else {
+			// O_NONBLOCK keeps a swapped-in FIFO from blocking the open; the
+			// regular-file check on the descriptor rejects it right after.
+			flags |= syscall.O_NONBLOCK
+		}
+		next, openErr := syscall.Openat(dirfd, name, flags, 0)
+		if i > 0 {
+			syscall.Close(dirfd)
+		}
+		if openErr != nil {
+			if errors.Is(openErr, syscall.ELOOP) {
+				if i < len(components)-1 {
+					return nil, errors.New("artifact path escapes the workspace")
+				}
+				return nil, errors.New("artifact must be a regular file")
+			}
+			return nil, errors.New("declared artifact is unavailable")
+		}
+		dirfd = next
+	}
+	f := os.NewFile(uintptr(dirfd), filepath.Join(w.config.WorkspaceDir, clean))
+	defer f.Close()
+	info, err := f.Stat()
+	if err != nil {
+		return nil, errors.New("artifact read failed")
+	}
+	if !info.Mode().IsRegular() {
 		return nil, errors.New("artifact must be a regular file")
 	}
 	if info.Size() > maxArtifactBytes {
 		return nil, errors.New("artifact exceeds the bound and is rejected whole")
 	}
-	data, err := os.ReadFile(abs)
+	return readArtifactBounded(f)
+}
+
+// readArtifactBounded enforces the artifact bound on bytes actually read, not
+// on pre-read metadata: a file that grows past the bound while being read is
+// rejected whole rather than truncated.
+func readArtifactBounded(r io.Reader) ([]byte, error) {
+	data, err := io.ReadAll(io.LimitReader(r, maxArtifactBytes+1))
 	if err != nil {
 		return nil, errors.New("artifact read failed")
+	}
+	if len(data) > maxArtifactBytes {
+		return nil, errors.New("artifact exceeds the bound and is rejected whole")
 	}
 	return data, nil
 }
