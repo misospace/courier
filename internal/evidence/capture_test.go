@@ -12,8 +12,10 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"syscall"
 	"testing"
+	"time"
 	"unicode/utf8"
 
 	"github.com/misospace/courier/internal/log"
@@ -574,7 +576,7 @@ func TestReadCappedNoFollow(t *testing.T) {
 
 	regular := filepath.Join(dir, "regular.txt")
 	writeFile(t, regular, "regular content\n")
-	data, err := readCapped(regular, MaxFileBytes+1)
+	data, err := readCapped(context.Background(), regular, MaxFileBytes+1)
 	if err != nil {
 		t.Fatalf("readCapped regular file: %v", err)
 	}
@@ -594,7 +596,7 @@ func TestReadCappedNoFollow(t *testing.T) {
 	if err := os.Symlink(secret, victim); err != nil {
 		t.Fatal(err)
 	}
-	data, err = readCapped(victim, MaxFileBytes+1)
+	data, err = readCapped(context.Background(), victim, MaxFileBytes+1)
 	if !errors.Is(err, syscall.ELOOP) {
 		t.Fatalf("readCapped swapped symlink err = %v, want ELOOP", err)
 	}
@@ -615,7 +617,7 @@ func TestCaptureSymlinkSwapRace(t *testing.T) {
 
 	original := readFileForCapture
 	t.Cleanup(func() { readFileForCapture = original })
-	readFileForCapture = func(path string, limit int) ([]byte, error) {
+	readFileForCapture = func(ctx context.Context, path string, limit int) ([]byte, error) {
 		// The swap lands after Lstat classified the path as regular and
 		// before the O_NOFOLLOW open.
 		if err := os.Remove(path); err != nil {
@@ -624,7 +626,7 @@ func TestCaptureSymlinkSwapRace(t *testing.T) {
 		if err := os.Symlink("../../../../etc/shadow", path); err != nil {
 			t.Errorf("swap symlink: %v", err)
 		}
-		return original(path, limit)
+		return original(ctx, path, limit)
 	}
 
 	bundle, err := Capture(context.Background(), captureOptions(dir, nil))
@@ -657,6 +659,148 @@ func TestCaptureSymlinkSwapRace(t *testing.T) {
 		t.Errorf("totals = %+v, want Files 1, Symlinks 1, Stored 0", got)
 	}
 	assertAbsent(t, bundle, []string{"SWAP-RACE-ORIGINAL"})
+}
+
+// TestReadCappedAbandonedOnCancel pins the issue #390 primitive: a read that
+// cannot complete on its own is abandoned when its context is done — the
+// context's error, no data, no partial content — and an already-dead context
+// never reaches the filesystem at all.
+func TestReadCappedAbandonedOnCancel(t *testing.T) {
+	t.Parallel()
+	// A fifo stands in for a stalled read: the open succeeds once a writer is
+	// present, and the read then blocks in the kernel until that writer
+	// sends, which the writer below never does.
+	fifo := filepath.Join(t.TempDir(), "stalled.fifo")
+	if err := syscall.Mkfifo(fifo, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	type readResult struct {
+		data []byte
+		err  error
+	}
+	// readInFlight keeps the read off the test goroutine, so a regression that
+	// never returns fails on a guard below instead of hanging the binary.
+	readInFlight := func(ctx context.Context, path string) <-chan readResult {
+		out := make(chan readResult, 1)
+		go func() {
+			data, err := readCapped(ctx, path, MaxFileBytes+1)
+			out <- readResult{data: data, err: err}
+		}()
+		return out
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	inFlight := readInFlight(ctx, fifo)
+
+	// ENXIO on a nonblocking write-end open means nothing has the read end
+	// open yet; the first success proves the read is blocked, and that write
+	// end is held open for the rest of the test so the read cannot complete.
+	var writer int
+	giveUp := time.Now().Add(5 * time.Second)
+	for {
+		fd, err := syscall.Open(fifo, syscall.O_WRONLY|syscall.O_NONBLOCK, 0)
+		if err == nil {
+			writer = fd
+			break
+		}
+		if !errors.Is(err, syscall.ENXIO) {
+			t.Fatalf("open fifo write end: %v", err)
+		}
+		if time.Now().After(giveUp) {
+			t.Fatal("read never reached the fifo")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	defer syscall.Close(writer)
+
+	cancel()
+	select {
+	case got := <-inFlight:
+		if !errors.Is(got.err, context.Canceled) {
+			t.Fatalf("readCapped err = %v, want context.Canceled", got.err)
+		}
+		if got.data != nil {
+			t.Errorf("readCapped returned %d bytes for an abandoned read, want nil", len(got.data))
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("readCapped did not return within 10s of cancellation")
+	}
+
+	// The pre-check is what makes the fast path free of goroutines: a canceled
+	// context returns before the open, and a read that did reach the
+	// filesystem would still be blocked on this same fifo.
+	dead, stop := context.WithCancel(context.Background())
+	stop()
+	select {
+	case got := <-readInFlight(dead, fifo):
+		if !errors.Is(got.err, context.Canceled) {
+			t.Errorf("readCapped with a canceled context err = %v, want context.Canceled", got.err)
+		}
+		if got.data != nil {
+			t.Errorf("readCapped with a canceled context returned %d bytes, want nil", len(got.data))
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("readCapped reached the filesystem with a canceled context")
+	}
+}
+
+// TestCaptureReadPhaseBoundedByDeadline is the issue #390 regression: a read
+// phase that stalls past the operation deadline must fail the capture with the
+// context's error and no bundle, so the executor's manifest-only degradation
+// is reachable instead of the capture running on to SIGKILL.
+func TestCaptureReadPhaseBoundedByDeadline(t *testing.T) {
+	// Not parallel: the test replaces a package-level seam that parallel
+	// captures share.
+	dir := newRepo(t)
+	writeFile(t, filepath.Join(dir, "stall.txt"), "READ-PHASE-STALL\n")
+
+	original := readFileForCapture
+	t.Cleanup(func() { readFileForCapture = original })
+	// reading proves the capture reached the read phase rather than losing the
+	// deadline earlier, in git status, where a kill would not wrap
+	// DeadlineExceeded and this test would fail for the wrong reason.
+	reading := make(chan struct{})
+	var entered sync.Once
+	readFileForCapture = func(ctx context.Context, path string, limit int) ([]byte, error) {
+		// A hostile worktree whose read never returns: only the operation
+		// deadline ends this phase.
+		entered.Do(func() { close(reading) })
+		<-ctx.Done()
+		return nil, ctx.Err()
+	}
+
+	type captureResult struct {
+		bundle *Bundle
+		err    error
+	}
+	// Wide enough that the enumerated git status comfortably fits before the
+	// deadline, so the deadline the test observes is the read phase's.
+	ctx, cancel := context.WithTimeout(context.Background(), 250*time.Millisecond)
+	defer cancel()
+	result := make(chan captureResult, 1)
+	go func() {
+		bundle, err := Capture(ctx, captureOptions(dir, nil))
+		result <- captureResult{bundle: bundle, err: err}
+	}()
+
+	select {
+	case got := <-result:
+		if !errors.Is(got.err, context.DeadlineExceeded) {
+			t.Fatalf("capture err = %v, want context.DeadlineExceeded", got.err)
+		}
+		if got.bundle != nil {
+			t.Errorf("capture returned a bundle alongside a deadline abort, want nil so the caller degrades to manifest-only")
+		}
+		select {
+		case <-reading:
+		default:
+			t.Fatal("capture never entered the read phase, so it did not exercise the bound")
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("capture did not return within 10s of the read phase stalling")
+	}
 }
 
 // TestRunGitCapped drives the bounded pipe reader directly: a

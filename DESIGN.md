@@ -3560,3 +3560,30 @@ was superseded.
   client query had no remaining caller after this change and is gone, so one
   listing seam remains. (#365, closing the `Observer` carve-out left open by
   the #343 entry.)
+- **2026-10-17 — #390: the read phase observes the operation deadline the git
+  calls already observed.**
+  `Capture` bounded its git calls by the 20-second operation deadline
+  (`exec.CommandContext`) but its per-file reads took no context at all, so one
+  stalling read — a hostile worktree, a hung filesystem — carried the capture
+  past that deadline, through the pod's 45-second grace, to SIGKILL, and the
+  manifest went with it: "over deadline the bundle degrades to the manifest
+  alone" was unreachable for the one phase git did not bound. The read is now
+  bounded by the same context. The mechanism is deliberately weak: a pre-check
+  fails fast when the deadline is already gone (no goroutine at all), and
+  otherwise the `O_NOFOLLOW` open and the capped read run in a goroutine whose
+  result is received unless the context is done first. Cancellation abandons
+  that goroutine rather than interrupting it — closing a descriptor from
+  another goroutine is not a reliable way to unblock a read already blocked in
+  the kernel — and the abandoned read's bytes are discarded and never stored,
+  so bounding the wait costs no content risk. A canceled read returns the
+  context's error rather than a read failure to be classified, which is what
+  makes the executor's existing manifest-only degradation reachable here: the
+  same `Capture` error the executor already handles, with the same fresh
+  five-second window the 2026-10-09 decision grants a capture the deadline
+  itself aborted.   Not folded in: the `O_NONBLOCK` open plus non-regular
+  descriptor guard that closes the fifo-swap hole outright. It is a different
+  problem — refusing to open a non-regular file at all, rather than bounding
+  the read that follows — and it stays with #336 (open as #389) rather than
+  widening this change's surface. The two compose, and #389 is the one that
+  changes the other's fixture: its regression stalls a read on a fifo, which an
+  `O_NONBLOCK` open refuses to begin, so that test is #389's to rework. (#390)
