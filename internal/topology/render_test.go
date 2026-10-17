@@ -466,3 +466,75 @@ func TestRenderedServicesCarryValidNames(t *testing.T) {
 		}
 	}
 }
+
+func TestRunLabelValueStaysValidBoundedAndDistinct(t *testing.T) {
+	names := []string{
+		"short",
+		"run.test",
+		strings.Repeat("a", 60),
+		// 64+ characters: valid as a DNS subdomain but over the 63-character
+		// label-value cap.
+		strings.Repeat("a", 63) + "x",
+		strings.Repeat("a", 63) + "y",
+		strings.Repeat("z", 253),
+	}
+	seen := map[string]string{}
+	for _, name := range names {
+		value := RunLabelValue(name)
+		if errs := validation.IsValidLabelValue(value); len(errs) > 0 {
+			t.Errorf("run label value for run %q = %q: %v", name, value, errs)
+		}
+		if again := RunLabelValue(name); again != value {
+			t.Errorf("run label value for run %q is not stable: %q then %q", name, value, again)
+		}
+		if other, clash := seen[value]; clash {
+			t.Errorf("run label value %q collides between runs %q and %q", value, other, name)
+		}
+		seen[value] = name
+	}
+	if RunLabelValue("short") != "short" {
+		t.Fatalf("valid short names must pass through unchanged: %q", RunLabelValue("short"))
+	}
+}
+
+func TestRenderedSelectorsAgreeWithLabels(t *testing.T) {
+	components := map[string]bool{ComponentCoordinator: true, ComponentBroker: true, ComponentWorker: true}
+	for _, name := range []string{"short", "run.test", strings.Repeat("a", 63) + "x", strings.Repeat("z", 253)} {
+		run := testRun(name)
+		runLabel := Labels(run.Name, "")[LabelRun]
+		if len(runLabel) > 63 {
+			t.Fatalf("run %q renders a %d-character label value", name, len(runLabel))
+		}
+		check := func(kind string, got map[string]string) {
+			t.Helper()
+			if got["k8s-app"] == "kube-dns" {
+				return // the DNS egress rule deliberately matches no run pod
+			}
+			if got[LabelRun] != runLabel {
+				t.Errorf("run %q: %s selects run label %q; Labels writes %q", name, kind, got[LabelRun], runLabel)
+			}
+			if !components[got["courier.misospace.dev/component"]] {
+				t.Errorf("run %q: %s selects unknown component %q", name, kind, got["courier.misospace.dev/component"])
+			}
+		}
+		check("broker service selector", BrokerService(run).Spec.Selector)
+		check("worker service selector", WorkerService(run).Spec.Selector)
+		for _, policy := range NetworkPolicies(run, nil, nil) {
+			check(policy.Name+" pod selector", policy.Spec.PodSelector.MatchLabels)
+			for _, ingress := range policy.Spec.Ingress {
+				for _, from := range ingress.From {
+					if from.PodSelector != nil {
+						check(policy.Name+" ingress selector", from.PodSelector.MatchLabels)
+					}
+				}
+			}
+			for _, egress := range policy.Spec.Egress {
+				for _, to := range egress.To {
+					if to.PodSelector != nil {
+						check(policy.Name+" egress selector", to.PodSelector.MatchLabels)
+					}
+				}
+			}
+		}
+	}
+}

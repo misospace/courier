@@ -13,6 +13,7 @@ import (
 	ctrlclient "sigs.k8s.io/controller-runtime/pkg/client"
 
 	courier "github.com/misospace/courier/api/v1alpha1"
+	"github.com/misospace/courier/internal/topology"
 )
 
 const BrokerAudience = "courier-broker"
@@ -99,7 +100,7 @@ func (a *Authenticator) Authenticate(ctx context.Context, token string) (Identit
 	if err := a.reader.Get(ctx, types.NamespacedName{Namespace: a.namespace, Name: podName}, pod); err != nil {
 		return Identity{}, fmt.Errorf("read authenticated control pod: %w", err)
 	}
-	if pod.DeletionTimestamp != nil || string(pod.UID) != podUID || pod.Spec.ServiceAccountName != a.controlSAName || pod.Labels["courier.misospace.dev/coderrun"] != a.runName || pod.Labels["courier.misospace.dev/component"] != "coordinator" {
+	if pod.DeletionTimestamp != nil || string(pod.UID) != podUID || pod.Spec.ServiceAccountName != a.controlSAName || pod.Labels[topology.LabelRun] != topology.RunLabelValue(a.runName) || pod.Labels["courier.misospace.dev/component"] != "coordinator" {
 		return Identity{}, fmt.Errorf("authenticated control pod is stale, terminating, or uses another service account")
 	}
 	runName, runUID, ok := controllerRunOwner(pod)
