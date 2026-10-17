@@ -1312,12 +1312,12 @@ func run(ctx context.Context, stdout, stderr io.Writer) int {
 			if code < 0 {
 				code = exitFailed
 			}
-			// Raw child exit 2 is not a declaration; only the verified outcome
-			// handoff may request NeedsHuman.
-			if code == exitNeedsHuman {
-				report.terminateCaptured(ctx, workspace, startCommit, failedWith(fmt.Sprintf("opencode exited with status %d", code), terminalCategoryModelTransportError))
-				return exitFailed
-			}
+			// Every raw nonzero child status — including 2, which is only
+			// Courier's own exit constant and never a declaration by the
+			// child — takes the shared recovery path below. NeedsHuman is
+			// reserved for verified outcome handoffs; a provider outage or
+			// crash gets its bounded budget and, when spent, the recoverable
+			// availability handoff instead of a stranding Failed.
 			// Availability failures (#327 Scenario D): a provider outage makes
 			// OpenCode exit without ever serving a session id for this
 			// attempt. Those failures get their own bounded, backed-off
