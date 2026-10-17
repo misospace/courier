@@ -26,11 +26,12 @@ import (
 	"github.com/misospace/courier/internal/topology"
 )
 
-// SecureNeedsHumanError marks a permanent, actionable secure-mode failure:
-// a configuration or admission problem that requeueing cannot fix. The
+// SecureNeedsHumanError marks a permanent, actionable deployment failure: a
+// configuration or admission problem that requeueing cannot fix. The
 // reconciler records it as a SecurePreflightFailed condition and terminates
-// the run NeedsHuman. Any other error from the secure path is treated as
-// transient and follows the normal claim/release/retry cycle.
+// the run NeedsHuman, from the secure launch path or the legacy launcher
+// alike. Any other error from these paths is treated as transient and follows
+// the normal claim/release/retry cycle.
 type SecureNeedsHumanError struct {
 	Reason string
 	Detail string

@@ -445,6 +445,9 @@ func (r *CoderRunReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 		if r.Secure != nil {
 			result, err := r.Secure.LaunchSecure(ctx, &run)
 			if err != nil {
+				if permanent := (*SecureNeedsHumanError)(nil); errors.As(err, &permanent) {
+					return r.Secure.transitionNeedsHuman(ctx, &run, permanent.Detail)
+				}
 				return ctrl.Result{}, r.releaseClaim(ctx, &run, adapter, item, err)
 			}
 			if result.Requeue || result.RequeueAfter > 0 {
@@ -453,6 +456,9 @@ func (r *CoderRunReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 				return result, nil
 			}
 		} else if err := r.Launch(ctx, &run); err != nil {
+			if permanent := (*SecureNeedsHumanError)(nil); errors.As(err, &permanent) {
+				return r.terminateNeedsHuman(ctx, &run, adapter, item, permanent)
+			}
 			if errors.Is(err, ErrProvisioningInFlight) {
 				// The deterministic pod name could not be verified as a
 				// live coordinator pod owned by this run: it is being
@@ -532,12 +538,18 @@ func (r *CoderRunReconciler) resumeClaimed(ctx context.Context, run *courierv1al
 	if r.Secure != nil {
 		result, err := r.Secure.LaunchSecure(ctx, run)
 		if err != nil {
+			if permanent := (*SecureNeedsHumanError)(nil); errors.As(err, &permanent) {
+				return r.Secure.transitionNeedsHuman(ctx, run, permanent.Detail)
+			}
 			return ctrl.Result{}, r.releaseClaim(ctx, run, adapter, item, err)
 		}
 		if result.Requeue || result.RequeueAfter > 0 {
 			return result, nil
 		}
 	} else if err := r.Launch(ctx, run); err != nil {
+		if permanent := (*SecureNeedsHumanError)(nil); errors.As(err, &permanent) {
+			return r.terminateNeedsHuman(ctx, run, adapter, item, permanent)
+		}
 		if errors.Is(err, ErrProvisioningInFlight) {
 			// A relaunch's create collided with a slot that could not be
 			// verified as a live pod owned by this run's UID: torn down,
@@ -698,11 +710,25 @@ func (r *CoderRunReconciler) terminateMissingHead(ctx context.Context, run *cour
 	if err != nil {
 		return ctrl.Result{}, err
 	}
+	return r.terminateNeedsHuman(ctx, run, adapter, item, &SecureNeedsHumanError{Reason: "HeadRepositoryGone", Detail: cause.Error()})
+}
+
+// terminateNeedsHuman ends a run whose permanent, actionable deployment
+// failure requeueing cannot fix — a missing pull request head, a rendered pod
+// spec the API server rejects outright. The claim is released and the run
+// terminalizes NeedsHuman naming the cause, rather than cycling claim and
+// release on every reconcile. The secure launch path records its own
+// SecurePreflightFailed condition through the secure patcher; this path
+// carries the detail in the run's terminal diagnostic instead. The cause is
+// handled here, so it is logged and not returned as a reconcile error.
+func (r *CoderRunReconciler) terminateNeedsHuman(ctx context.Context, run *courierv1alpha1.CoderRun, adapter source.Adapter, item source.WorkItem, cause *SecureNeedsHumanError) (ctrl.Result, error) {
+	log.FromContext(ctx).Info("terminating run: permanent deployment failure a human must fix",
+		"run", run.Name, "reason", cause.Reason, "cause", cause.Detail)
 	releaseErr := adapter.Release(ctx, item)
 	run.Status.Branch = ""
 	run.Status.HeadRepo = ""
 	run.Status.HeadSHA = ""
-	terminalResult, terminalErr := r.transitionTerminal(ctx, run, courierv1alpha1.PhaseNeedsHuman, "", terminalLifecycleIntent{}, nil)
+	terminalResult, terminalErr := r.transitionTerminal(ctx, run, courierv1alpha1.PhaseNeedsHuman, "", terminalLifecycleIntent{error: cause.Detail}, nil)
 	return terminalResult, errors.Join(releaseErr, terminalErr)
 }
 

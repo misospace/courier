@@ -59,14 +59,15 @@ func (s *SecureControl) LaunchSecure(ctx context.Context, run *courier.CoderRun)
 	if err := s.ensureFinalizer(ctx, run); err != nil {
 		return ctrl.Result{}, err
 	}
-	if err := s.Preflight(ctx, run, policy, relaunch); err != nil {
-		return ctrl.Result{}, err
-	}
-
-	// The sizing is resolved once for the pods this pass renders; every pod
-	// the launcher creates below carries it.
+	// The sizing is resolved once for the pods this pass renders: the
+	// preflight proof and every pod created below carry the same value, so a
+	// concurrent lane update cannot make the admitted spec differ from the
+	// created one.
 	resources, err := s.laneResources(ctx, run)
 	if err != nil {
+		return ctrl.Result{}, err
+	}
+	if err := s.Preflight(ctx, run, policy, relaunch, resources); err != nil {
 		return ctrl.Result{}, err
 	}
 

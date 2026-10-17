@@ -47,12 +47,14 @@ type probeOutcome struct {
 // topology objects (SAs, RBAC, secrets, services, policies) are already
 // provisioned. relaunch abbreviates the check: replacement launches re-verify
 // the static guarantees but do not repeat the multi-node live probes, which
-// ran before the first workload exposure.
+// ran before the first workload exposure. resources are the lane-configured
+// sizing the caller already resolved for this launch pass, so the dry-run
+// proof and the pods created afterwards are the same artifact.
 //
 // Permanent deployment misconfiguration returns a *SecureNeedsHumanError;
 // transient API or probe failures return an ordinary error so the run requeues
 // without launching.
-func (s *SecureControl) Preflight(ctx context.Context, run *courier.CoderRun, policy *courier.PublicationPolicy, relaunch bool) error {
+func (s *SecureControl) Preflight(ctx context.Context, run *courier.CoderRun, policy *courier.PublicationPolicy, relaunch bool, resources corev1.ResourceRequirements) error {
 	if err := s.checkNamespaceBoundary(ctx); err != nil {
 		return err
 	}
@@ -66,13 +68,13 @@ func (s *SecureControl) Preflight(ctx context.Context, run *courier.CoderRun, po
 	if err != nil {
 		return err
 	}
-	if err := s.checkDryRuns(ctx, run, cache); err != nil {
+	if err := s.checkDryRuns(ctx, run, cache, resources); err != nil {
 		return err
 	}
 	if relaunch || !s.Config.LiveProbes {
 		return nil
 	}
-	return s.runLiveProbes(ctx, run, cache)
+	return s.runLiveProbes(ctx, run, cache, resources)
 }
 
 // checkNamespaceBoundary verifies the dedicated run namespace exists and
@@ -222,19 +224,16 @@ func (s *SecureControl) subjectAccessReviewAs(ctx context.Context, serviceAccoun
 // checkDryRuns proves what the cluster's API admits: the operator's rendered
 // pod specs create under dry-run, and known-bad specs (host path, privileged,
 // host networking) are rejected. A bad spec that the API admits is permanent
-// evidence that the configured admission cannot hold the boundary.
-func (s *SecureControl) checkDryRuns(ctx context.Context, run *courier.CoderRun, cache *topology.CachePin) error {
+// evidence that the configured admission cannot hold the boundary. Every pod
+// the launcher creates is in the proof, probe pods included, so no create path
+// is left unproven. resources are the lane sizing the caller resolved once for
+// this pass.
+func (s *SecureControl) checkDryRuns(ctx context.Context, run *courier.CoderRun, cache *topology.CachePin, resources corev1.ResourceRequirements) error {
 	registration, err := s.Config.Registry.Select(run.Spec.Repo)
 	if err != nil {
 		return secureNeedsHuman("ProviderSelection", "provider selection failed: %v", err)
 	}
 	publicKey, err := s.renderedWorkerPublicKey(ctx, run)
-	if err != nil {
-		return err
-	}
-	// The dry run proves admission for the specs the launcher will really
-	// create, so it renders the lane's sizing rather than an idealized one.
-	resources, err := s.laneResources(ctx, run)
 	if err != nil {
 		return err
 	}
@@ -262,6 +261,11 @@ func (s *SecureControl) checkDryRuns(ctx context.Context, run *courier.CoderRun,
 		return fmt.Errorf("secure preflight: render broker: %w", err)
 	}
 	pods = append(pods, broker)
+	// The probe pod joins the proof because it is created live below, not
+	// through this loop. A placeholder node name is deliberate: admission
+	// does not validate spec.nodeName, and the live probe renders the same
+	// spec modulo node and script.
+	pods = append(pods, topology.ProbePod(run, "dry-run-node", s.Config.ProbeImage, "true", resources))
 
 	for _, pod := range pods {
 		dry := pod.DeepCopy()
@@ -369,8 +373,10 @@ func (s *SecureControl) renderedWorkerPublicKey(ctx context.Context, run *courie
 
 // runLiveProbes executes the multi-node live deny/allow probe phase. Probe
 // pods carry the worker's labels, so the worker's own NetworkPolicy — not an
-// exception — is what the probes exercise.
-func (s *SecureControl) runLiveProbes(ctx context.Context, run *courier.CoderRun, cache *topology.CachePin) error {
+// exception — is what the probes exercise. resources are the lane sizing the
+// caller resolved once for this pass, the same sizing the dry-run proof
+// admitted.
+func (s *SecureControl) runLiveProbes(ctx context.Context, run *courier.CoderRun, cache *topology.CachePin, resources corev1.ResourceRequirements) error {
 	nodes := &corev1.NodeList{}
 	if err := s.Client.List(ctx, nodes); err != nil {
 		return fmt.Errorf("secure preflight: list nodes: %w", err)
@@ -391,10 +397,6 @@ func (s *SecureControl) runLiveProbes(ctx context.Context, run *courier.CoderRun
 	brokerIP, err := s.serviceClusterIP(ctx, run.Namespace, topology.BrokerServiceName(run.Name))
 	if err != nil {
 		return fmt.Errorf("secure preflight: locate the broker service: %w", err)
-	}
-	resources, err := s.laneResources(ctx, run)
-	if err != nil {
-		return err
 	}
 
 	checks := []probeCheck{
@@ -422,6 +424,16 @@ func (s *SecureControl) runLiveProbes(ctx context.Context, run *courier.CoderRun
 			// termination below instead of failing on a name conflict.
 		}
 		if err := s.Client.Create(ctx, pod); err != nil && !apierrors.IsAlreadyExists(err) {
+			if apierrors.IsInvalid(err) {
+				// The dry-run proof already covers this spec, so an
+				// Invalid here means the live create hit something the
+				// dry run could not: permanent, and requeueing cannot
+				// change it. A Forbidden or quota denial stays an
+				// ordinary error — a quota or an RBAC grant can be
+				// raised later, so a requeue is the right answer there.
+				return secureNeedsHuman("PodAdmission",
+					"the API server rejected the live probe pod on node %s: %v", node, err)
+			}
 			return fmt.Errorf("secure preflight: create probe pod on %s: %w", node, err)
 		}
 	}
@@ -478,8 +490,9 @@ func findCheck(checks []probeCheck, name string) *probeCheck {
 
 // collectProbeResults reads every probe pod's termination message. It returns
 // the outcomes and whether any probe is still pending. resources are the
-// lane-configured sizing the probes were rendered with; only the deterministic
-// name is read here, but the rendered spec stays identical to the live one.
+// lane-configured sizing the caller resolved for this pass and the probes were
+// rendered with; only the deterministic name is read here, so the lane is not
+// resolved again and the rendered spec stays identical to the live one.
 func (s *SecureControl) collectProbeResults(ctx context.Context, run *courier.CoderRun, nodes []string, checkCount int, resources corev1.ResourceRequirements) ([]probeOutcome, bool, error) {
 	var outcomes []probeOutcome
 	pending := false

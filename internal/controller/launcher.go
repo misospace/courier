@@ -88,9 +88,12 @@ type CoordinatorLauncher struct {
 }
 
 // Launch implements LaunchFunc. The run is already Claimed when this method
-// is called, so a failed create is returned to the reconciler, which releases
-// the claim back to Pending. Phase transitions are the reconciler's to write
-// through the status contract; the launcher only creates the pod.
+// is called, so a transient failed create is returned to the reconciler, which
+// releases the claim back to Pending. A permanent, actionable deployment
+// failure — a rendered pod spec the API server rejects outright — returns a
+// *SecureNeedsHumanError instead, which the reconciler terminalizes.
+// Phase transitions are the reconciler's to write through the status contract;
+// the launcher only creates the pod.
 func (l *CoordinatorLauncher) Launch(ctx context.Context, run *courierv1alpha1.CoderRun) error {
 	if l == nil || l.Client == nil {
 		return ErrLauncherClientRequired
@@ -154,6 +157,17 @@ func (l *CoordinatorLauncher) Launch(ctx context.Context, run *courierv1alpha1.C
 		return nil
 	}
 	if !apierrors.IsAlreadyExists(err) {
+		if apierrors.IsInvalid(err) {
+			// The rendered spec itself is refused, and requeueing cannot
+			// change it: the lane configures something the API server
+			// rejects outright. Surface it so the reconciler terminalizes
+			// the run instead of cycling claim and release. A Forbidden or
+			// quota denial stays an ordinary error — a quota or an RBAC
+			// grant can be raised later, so a requeue is the right answer
+			// there.
+			return secureNeedsHuman("PodAdmission",
+				"the API server rejected the coordinator pod %s: %v", pod.Name, err)
+		}
 		return err
 	}
 	// The create collided with an existing pod. Three shapes are possible

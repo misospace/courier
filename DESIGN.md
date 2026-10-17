@@ -1337,10 +1337,17 @@ whole; a limits-only lane gets the default requests; a requests-only lane is
 rendered with exactly its own requests plus the floored halves, so its pods
 really do run limit-less by its own choice. One consequence: a limit below the
 floored default request (say `limits.cpu: 100m` on a lane that sets no
-requests) renders requests above limits, which the API server rejects; the
-secure path's preflight dry-run surfaces that as `NeedsHuman` (`PodAdmission`)
-rather than requeueing, since a requeue cannot change a permanently invalid
-spec. One lane-level value sizes every pod on the lane; per-role sizing is
+requests) renders requests above limits, which the API server rejects; every
+create path classifies that as `NeedsHuman` (`PodAdmission`) rather than
+requeueing, since a requeue cannot change a permanently invalid spec. The
+preflight dry-run proof carries the probe pod alongside the control, worker, and
+broker, the live probe create and the legacy coordinator's own create classify
+an `Invalid` themselves, and either classification terminalizes the run
+`NeedsHuman` recording `SecurePreflightFailed` rather than cycling
+claim, preflight, and release on every reconcile. The sizing is resolved once per
+launch pass, so the spec the dry run admits and the pods created afterwards are
+one artifact rather than two reads of a lane that may have moved. One lane-level
+value sizes every pod on the lane; per-role sizing is
 deliberately not modelled.
 
 Roles name whatever models the operator has configured — cloud (`anthropic/...`,
@@ -3605,10 +3612,18 @@ was superseded.
   API server permanently rejects (an operator setting `resources.claims`, which
   the CRD exposes and no renderer honours) surfaces as `NeedsHuman` rather than a
   requeue loop — a quota or RBAC denial stays an ordinary error, because those
-  can be raised later. One lane-level value sizes every pod on the lane; per-role
-  sizing is deliberately unmodelled, and nothing here bounds a run — it bounds
-  what one run can take from the node, which is where #274's unproven OOM
-  candidate had no answer. (#356)
+  can be raised later. The classification sits on every create path, not only the
+  three workload pods' dry runs: the probe pod joins the dry-run proof (under a
+  placeholder node name, since admission does not validate `spec.nodeName`), the
+  live probe create and the legacy coordinator's own create classify an `Invalid`
+  where they happen, and the reconciler terminalizes the run `NeedsHuman` from both
+  `LaunchSecure` call sites and from the legacy launcher instead of releasing the
+  claim back to Pending and spinning. The sizing is resolved once per launch pass
+  and handed down through preflight, so the spec the dry run admits and the spec
+  actually created are the same artifact. One lane-level value sizes every pod on
+  the lane; per-role sizing is deliberately unmodelled, and nothing here bounds a
+  run — it bounds what one run can take from the node, which is where #274's
+  unproven OOM candidate had no answer. (#356)
 - **2026-10-17 — #356 amendment: lane sizing floors CPU/memory requests, superseding
   "never topped up".** Review on #401 caught that the same-day decision above let a
   lane configure a partial request map (cpu without memory, or limits only), so a
@@ -3620,4 +3635,8 @@ was superseded.
   builder and the topology renderers delegate to, keeping the no-BestEffort invariant
   single-sourced. A lane's sizing is still an operator decision; the floor only fills
   what the operator left unsaid about the two resources Kubernetes schedules and evicts
-  on. (#356, PR #401 review)
+  on. The same review closed the proof/create gap this sizing rode in on: a permanent
+  pod rejection is now classified on every create path and terminalizes the run rather
+  than re-queueing it, and the sizing is resolved once per launch pass so the dry-run
+  proof and the created pod are the same artifact rather than two reads of a lane that
+  may have moved between them. (#356, PR #401 review)
