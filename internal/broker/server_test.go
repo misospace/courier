@@ -5,11 +5,14 @@ import (
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
+	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/json"
 	"encoding/pem"
+	"errors"
 	"math/big"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -385,4 +388,94 @@ func mustJSON(t *testing.T, value string) string {
 		t.Fatal(err)
 	}
 	return string(b)
+}
+
+// TestServeTLSBoundsStalledClient: the model-facing API server must bound
+// inbound reads, so a client that completes the TLS handshake and stalls
+// mid-headers is dropped by the header-read bound instead of pinning the
+// connection and its goroutine indefinitely.
+func TestServeTLSBoundsStalledClient(t *testing.T) {
+	s, _ := serverForTest(t)
+	cert, key := testTLSFiles(t)
+	srv := s.newHTTPServer("127.0.0.1:0")
+	for name, production := range map[string]time.Duration{
+		"ReadHeaderTimeout": srv.ReadHeaderTimeout,
+		"ReadTimeout":       srv.ReadTimeout,
+		"WriteTimeout":      srv.WriteTimeout,
+		"IdleTimeout":       srv.IdleTimeout,
+	} {
+		if production <= 0 {
+			t.Fatalf("%s = %v, want a finite inbound bound", name, production)
+		}
+	}
+	// Compress the header bound so the regression does not wait a production window.
+	bound := 500 * time.Millisecond
+	srv.ReadHeaderTimeout = bound
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	serveErr := make(chan error, 1)
+	go func() { serveErr <- srv.ServeTLS(ln, cert, key) }()
+	t.Cleanup(func() {
+		_ = srv.Close()
+		if err := <-serveErr; err != nil && !errors.Is(err, http.ErrServerClosed) {
+			t.Errorf("ServeTLS() = %v", err)
+		}
+	})
+
+	certPEM, err := os.ReadFile(cert)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pool := x509.NewCertPool()
+	if !pool.AppendCertsFromPEM(certPEM) {
+		t.Fatal("test certificate is not PEM")
+	}
+
+	// The bounds do not cut off a valid request: a real TLS round trip still
+	// reaches authentication.
+	client := &http.Client{Transport: &http.Transport{TLSClientConfig: &tls.Config{RootCAs: pool, ServerName: "broker.test"}}}
+	resp, err := client.Post("https://"+ln.Addr().String()+PathPublish, "application/json", strings.NewReader(`{}`))
+	if err != nil {
+		t.Fatalf("valid TLS request: %v", err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("valid TLS request status = %d, want the unauthenticated denial", resp.StatusCode)
+	}
+
+	// A client that completes the handshake and never finishes its request
+	// headers is closed by the bound, not waited on forever.
+	conn, err := tls.Dial("tcp", ln.Addr().String(), &tls.Config{RootCAs: pool, ServerName: "broker.test"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	if _, err := conn.Write([]byte("POST " + PathPublish + " HTTP/1.1\r\nHost: broker.test\r\n")); err != nil {
+		t.Fatal(err)
+	}
+	// The generous read deadline is the failure margin: against an unbounded
+	// server the connection is never closed, so the test must not hang on the
+	// bug it pins.
+	if err := conn.SetReadDeadline(time.Now().Add(bound + 10*time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	start := time.Now()
+	buf := make([]byte, 1)
+	_, readErr := conn.Read(buf)
+	elapsed := time.Since(start)
+	if readErr == nil {
+		t.Fatal("stalled incomplete request received a response")
+	}
+	var ne net.Error
+	if errors.As(readErr, &ne) && ne.Timeout() {
+		t.Fatalf("stalled request was never dropped: read hit the test deadline after %v", elapsed)
+	}
+	if elapsed < bound/2 {
+		t.Fatalf("connection closed after %v, before a %v header-read bound could fire", elapsed, bound)
+	}
+	if elapsed > bound+5*time.Second {
+		t.Fatalf("connection closed after %v, far beyond the %v header-read bound", elapsed, bound)
+	}
 }

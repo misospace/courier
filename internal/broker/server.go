@@ -13,6 +13,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"time"
 
 	couriergit "github.com/misospace/courier/internal/git"
 )
@@ -124,11 +125,34 @@ func NewServer(config ServerConfig) (*Server, error) {
 // Handler exposes the typed HTTP API for embedding and tests; production serves it only over TLS.
 func (s *Server) Handler() http.Handler { return s.handler }
 
+// Inbound HTTP bounds for the model-facing API, matching the evidence intake's
+// treatment of the same bounded-bundle workload: they reclaim stalled and idle
+// connections, and sit far above what a healthy 65 MiB import or snapshot read
+// costs in-cluster.
+const (
+	apiReadHeaderTimeout = 10 * time.Second
+	apiReadTimeout       = 60 * time.Second
+	apiWriteTimeout      = 30 * time.Second
+	apiIdleTimeout       = 120 * time.Second
+)
+
 func (s *Server) ServeTLS(addr string, certFile, keyFile string) error {
 	if s == nil || s.handler == nil {
 		return errors.New("broker server is not initialized")
 	}
-	return (&http.Server{Addr: addr, Handler: s.handler, TLSConfig: &tls.Config{MinVersion: tls.VersionTLS13}}).ListenAndServeTLS(certFile, keyFile)
+	return s.newHTTPServer(addr).ListenAndServeTLS(certFile, keyFile)
+}
+
+func (s *Server) newHTTPServer(addr string) *http.Server {
+	return &http.Server{
+		Addr:              addr,
+		Handler:           s.handler,
+		TLSConfig:         &tls.Config{MinVersion: tls.VersionTLS13},
+		ReadHeaderTimeout: apiReadHeaderTimeout,
+		ReadTimeout:       apiReadTimeout,
+		WriteTimeout:      apiWriteTimeout,
+		IdleTimeout:       apiIdleTimeout,
+	}
 }
 
 func (s *Server) authenticate(w http.ResponseWriter, r *http.Request) (Identity, bool) {
