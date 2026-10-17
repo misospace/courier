@@ -55,8 +55,9 @@ type LaneProfileSpec struct {
 	// Resources sizes the pods Courier creates for runs on this lane. Limits
 	// are used exactly as written and may be omitted; requests keep what the
 	// lane sets, but CPU and memory requests are floored to the built-in
-	// default wherever they are absent, so no lane is BestEffort. A lane that
-	// configures nothing gets the default whole (see DefaultPodResources).
+	// default wherever they are absent or non-positive, so no lane is
+	// BestEffort. A lane that configures nothing gets the default whole (see
+	// DefaultPodResources).
 	// +optional
 	Resources corev1.ResourceRequirements `json:"resources,omitempty"`
 }

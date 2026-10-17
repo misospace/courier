@@ -1335,8 +1335,13 @@ keeps one runaway build from taking a node, and keeps these pods off the front
 of the eviction queue. A lane that configures neither half gets the default
 whole; a limits-only lane gets the default requests; a requests-only lane is
 rendered with exactly its own requests plus the floored halves, so its pods
-really do run limit-less by its own choice. One lane-level value sizes every
-pod on the lane; per-role sizing is deliberately not modelled.
+really do run limit-less by its own choice. One consequence: a limit below the
+floored default request (say `limits.cpu: 100m` on a lane that sets no
+requests) renders requests above limits, which the API server rejects; the
+secure path's preflight dry-run surfaces that as `NeedsHuman` (`PodAdmission`)
+rather than requeueing, since a requeue cannot change a permanently invalid
+spec. One lane-level value sizes every pod on the lane; per-role sizing is
+deliberately not modelled.
 
 Roles name whatever models the operator has configured — cloud (`anthropic/...`,
 `openai/...`, `litellm-anthropic/MiniMax-M3`), local (`litellm/qwen3.8-27b`), or
