@@ -24,6 +24,25 @@ func DefaultPodResources() corev1.ResourceRequirements {
 	}
 }
 
+// ProbePodResources is the fixed sizing of a disposable preflight probe pod.
+// It deliberately does not follow the lane's sizing: a probe is a
+// seconds-lived `sh -c` network check, but preflight creates one per eligible
+// node simultaneously, so reserving lane-scale capacity for it can leave
+// probes Pending on a cluster tight on requests and wedge preflight instead
+// of proving isolation (#402). Requests stay finite so a probe is never
+// BestEffort; limits are deliberately omitted — a seconds-lived network
+// check has no runaway build to bound, and a limit under the probe image's
+// real usage would OOM-kill the probe and falsify the isolation result it
+// exists to produce.
+func ProbePodResources() corev1.ResourceRequirements {
+	return corev1.ResourceRequirements{
+		Requests: corev1.ResourceList{
+			corev1.ResourceCPU:    resource.MustParse("10m"),
+			corev1.ResourceMemory: resource.MustParse("32Mi"),
+		},
+	}
+}
+
 // EffectivePodResources applies Courier's pod-sizing policy to a configured
 // value: a caller that configured nothing gets the built-in default; a caller
 // that configured either half keeps it, but CPU and memory *requests* are
