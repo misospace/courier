@@ -8,6 +8,8 @@ import (
 	"regexp"
 	"sort"
 	"strings"
+
+	"github.com/misospace/courier/internal/broker/grammar"
 )
 
 // The acceptance-criterion evidence contract (#249). One executor-neutral
@@ -98,22 +100,20 @@ func (s CriterionSet) Criterion(id string) (Criterion, bool) {
 // them asserts semantic sufficiency. An absence of automated enforcement
 // must be recorded as manual-verification, not-implemented, or unknown —
 // never as regression-check.
-type CriterionStatus string
+//
+// The type is defined in the grammar leaf and aliased here (#375): the
+// validator and the prompt surfaces that teach its vocabulary must share one
+// definition, and those surfaces reach it through the leaf instead of through
+// this package, whose own in-package tests import the harness that imports
+// the executor.
+type CriterionStatus = grammar.CriterionStatus
 
 const (
-	// StatusImplementationEvidence: the criterion is implemented at the
-	// cited paths/commits; no automated enforcement claimed.
-	StatusImplementationEvidence CriterionStatus = "implementation-evidence"
-	// StatusRegressionCheck: an automated check (test path, workflow step,
-	// or check URL) is cited that the author claims fails if the criterion
-	// regresses. The claim is auditable, not mechanically verified.
-	StatusRegressionCheck CriterionStatus = "regression-check"
-	// StatusManualVerification: a human verified it; no automated check.
-	StatusManualVerification CriterionStatus = "manual-verification"
-	// StatusNotImplemented: intentionally not implemented in this change.
-	StatusNotImplemented CriterionStatus = "not-implemented"
-	// StatusUnknown: not established either way.
-	StatusUnknown CriterionStatus = "unknown"
+	StatusImplementationEvidence = grammar.StatusImplementationEvidence
+	StatusRegressionCheck        = grammar.StatusRegressionCheck
+	StatusManualVerification     = grammar.StatusManualVerification
+	StatusNotImplemented         = grammar.StatusNotImplemented
+	StatusUnknown                = grammar.StatusUnknown
 )
 
 // Coverage values for the evidence-block header. DerivedCoverage is
@@ -137,16 +137,79 @@ const (
 // The separator between status and reference accepts " - " or " — ".
 // Rows are the only machine-read coverage surface in the PR body; prose
 // outside the block is not a coverage claim.
+//
+// The patterns are defined in the grammar leaf and aliased here (#375), so
+// the shapes a run is taught and the shapes this validator matches are one
+// definition rather than two that can drift.
 var (
-	criteriaHeaderPattern = regexp.MustCompile(`^courier-criteria:v1 source=([A-Za-z0-9._-]+)/([A-Za-z0-9._-]+)#(\d+) set=sha256:([0-9a-f]{64}) coverage=(full|partial)$`)
-	criteriaRowPattern    = regexp.MustCompile(`^- AC-(\d+) sha256:([0-9a-f]{64}): (implementation-evidence|regression-check|manual-verification|not-implemented|unknown)(?:\s[-—]\s?(.*))?$`)
+	criteriaHeaderPattern = grammar.HeaderPattern
+	criteriaRowPattern    = grammar.RowPattern
 	// referenceWithLocation requires at least one token naming a file path
 	// (contains "/") or a URL. It is a floor on regression-check and
 	// implementation-evidence claims, not a semantic check: "inspected by
 	// hand" has no location and therefore cannot claim automated
 	// enforcement.
-	referenceWithLocation = regexp.MustCompile(`(?:https?://[^\s]+|[A-Za-z0-9_.-]+(?:/[A-Za-z0-9_.()-]+)+)`)
+	referenceWithLocation = grammar.ReferenceWithLocation
 )
+
+// Placeholders naming each capture group of the taught grammar (#375).
+// Consumers (the repair continuation, the coordinator goal) name the
+// grammar with these instead of restating the patterns: the grammar is
+// derived from the validator patterns, so editing a validator cannot leave
+// a consumer teaching a shape the validator rejects. The two hand-written
+// copies that preceded this had already drifted from the validator and from
+// each other.
+const (
+	SourceReferencePlaceholder = grammar.SourceReferencePlaceholder
+	DigestPlaceholder          = grammar.DigestPlaceholder
+	CriterionPlaceholder       = grammar.CriterionPlaceholder
+	StatusPlaceholder          = grammar.StatusPlaceholder
+	ReferencePlaceholder       = grammar.ReferencePlaceholder
+)
+
+// CriteriaHeaderGrammar returns the header template every capture group of
+// which is replaced by its placeholder, derived from the pattern the
+// validator matches. The derivation lives in the grammar leaf; this is the
+// same surface under this package's names.
+func CriteriaHeaderGrammar() string { return grammar.CriteriaHeaderGrammar() }
+
+// CriteriaHeaderShape renders CriteriaHeaderGrammar with the source
+// reference filled in.
+func CriteriaHeaderShape(source string) string { return grammar.CriteriaHeaderShape(source) }
+
+// CriteriaRowGrammar returns the per-criterion row template derived from the
+// pattern the validator matches.
+func CriteriaRowGrammar() string { return grammar.CriteriaRowGrammar() }
+
+// StatusVocabulary returns the closed status vocabulary in validator order.
+// The returned slice is a copy: the order is shared with the sentences
+// rendered from it.
+func StatusVocabulary() []CriterionStatus { return grammar.StatusVocabulary() }
+
+// StatusVocabularySentence names the closed vocabulary as one prose list, for
+// a prompt or a repair instruction.
+func StatusVocabularySentence() string { return grammar.StatusVocabularySentence() }
+
+// criterionReferenceRequirement is what one status demands of its evidence
+// reference: a note, a nameable location, or nothing.
+type criterionReferenceRequirement = grammar.ReferenceRequirement
+
+const (
+	referenceFree             = grammar.ReferenceFree
+	referenceNoteRequired     = grammar.ReferenceNoteRequired
+	referenceLocationRequired = grammar.ReferenceLocationRequired
+)
+
+// criterionReferenceRequirementFor resolves a status's requirement. A status
+// outside the table has no rule to satisfy and is rejected.
+func criterionReferenceRequirementFor(status CriterionStatus) (criterionReferenceRequirement, bool) {
+	return grammar.ReferenceRequirementFor(status)
+}
+
+// StatusReferenceRuleSentence renders the per-status reference rules as the
+// one sentence the repair instruction, the coordinator goal, and the
+// validator's own rejection reason all carry.
+func StatusReferenceRuleSentence() string { return grammar.StatusReferenceRuleSentence() }
 
 // ErrCriteriaBlockMissing is the sentinel for a PR body with no evidence
 // block while the pinned set is non-empty. The legacy handoff treats it as
@@ -476,7 +539,8 @@ func parseEvidenceBlock(body string) (*CriteriaReport, error) {
 	return report, nil
 }
 
-// validRecordShape enforces the per-status reference rules:
+// validRecordShape enforces the per-status reference rules, which the one
+// table in the grammar leaf states once:
 //
 //   - regression-check and implementation-evidence must name a location
 //     (file path or URL): an automated-enforcement claim with no citable
@@ -484,18 +548,21 @@ func parseEvidenceBlock(body string) (*CriteriaReport, error) {
 //   - manual-verification and not-implemented must carry a non-empty note;
 //   - unknown may be bare.
 //
-// No rule here interprets the reference text.
+// A status outside the table is rejected. No rule here interprets the
+// reference text.
 func validRecordShape(rec CriterionRecord) bool {
-	reference := strings.TrimSpace(rec.Reference)
-	switch rec.Status {
-	case StatusRegressionCheck, StatusImplementationEvidence:
-		return reference != "" && referenceWithLocation.MatchString(reference)
-	case StatusManualVerification, StatusNotImplemented:
-		return reference != ""
-	case StatusUnknown:
-		return true
-	default:
+	requirement, known := grammar.ReferenceRequirementFor(rec.Status)
+	if !known {
 		return false
+	}
+	reference := strings.TrimSpace(rec.Reference)
+	switch requirement {
+	case grammar.ReferenceLocationRequired:
+		return reference != "" && referenceWithLocation.MatchString(reference)
+	case grammar.ReferenceNoteRequired:
+		return reference != ""
+	default:
+		return true
 	}
 }
 
@@ -532,7 +599,7 @@ func describeCriteriaFailure(e *CriteriaError) string {
 		parts = append(parts, fmt.Sprintf("rows pin different criterion text for %s", strings.Join(e.BadDigest, ", ")))
 	}
 	if len(e.BadStatus) > 0 {
-		parts = append(parts, fmt.Sprintf("status/reference shape violated for %s (regression-check and implementation-evidence must cite a file path or check URL; manual-verification and not-implemented must carry a note)", strings.Join(e.BadStatus, ", ")))
+		parts = append(parts, fmt.Sprintf("status/reference shape violated for %s (%s)", strings.Join(e.BadStatus, ", "), grammar.StatusReferenceRuleSentence()))
 	}
 	if e.CoverageClaim != "" {
 		parts = append(parts, fmt.Sprintf("coverage claimed %s but the records derive %s", e.CoverageClaim, e.CoverageDerived))

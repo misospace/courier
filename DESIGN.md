@@ -2113,6 +2113,46 @@ named items remain unresolved and must not be described as production-ready:
 - The exact vLLM gauge for backpressure on the target model server.
 
 ## Decisions
+- **2026-10-18 — #439: a preflight probe's name is a readable prefix plus a
+  digest of the whole node name, and a probe is evidence only for the node it
+  is pinned to.** Probe pod names were derived from the node name by
+  normalizing and truncating to 16 characters, so any two nodes sharing that
+  prefix collided: the second create deleted or collided with the first probe
+  and result collection read one pod for both nodes, which could stall
+  admission or certify multi-node isolation without probing the second node
+  at all. A shorter prefix was rejected — it widens the same collision — and
+  so was dropping the readable prefix altogether, because the name stays a
+  Kubernetes object name inside the same 16-character budget: the digest now
+  follows the truncated normalized prefix instead of replacing the empty case,
+  so the total length does not grow and a name that would have hashed
+  something else still reads as the node it belongs to. Punctuation and case
+  that normalization drops no longer conflate nodes either, because the
+  digest covers the original name rather than the normalized one. That makes
+  the name sufficient, so a second guard makes it checkable:
+  `collectProbeResults` refuses a probe pod whose `spec.nodeName` is not the
+  node under test, and a refused probe contributes nothing rather than
+  counting as pending or as coverage — evidence cannot be transferred
+  between nodes by name alone. The refusal stays an ordinary requeueable
+  error even though a real mismatch does not clear on a later pass;
+  terminalizing that verdict is left to a follow-up rather than guessed at
+  here. (#439)
+
+- **2026-10-18 — #375 review: the cited-evidence path extractor takes the
+  grammar's path alternative, and the reference pattern is composed from its
+  alternatives.** The #367 extractor's `evidencePathCandidatePattern` was a
+  hand-mirrored copy of the file-path alternative inside the validator's
+  `ReferenceWithLocation` — precisely the duplication this PR removes
+  everywhere else, and now that the authoritative regexes moved into
+  `internal/broker/grammar` the mirror sat one edit away from silently
+  probing references the contract no longer accepts, or skipping ones it
+  does. The grammar now exports its two alternatives
+  (`ReferenceURLPattern`, `ReferencePathPattern`) and composes
+  `ReferenceWithLocation` from them, the executor's extractor is an alias
+  of `ReferencePathPattern`, and two tests pin the seam: the grammar's
+  composition is exact, and the executor's pattern keeps the probe-safety
+  charset the #367 boundary argument rests on — whatever it matches stays
+  free of whitespace, `:`, quotes, and shell, glob, and pathspec
+  metacharacters. (#375, #367, #422)
 - **2026-10-18 — #412: on the capped-read over-limit branch, killing an
   over-running child is not a failure, but a child that had already exited
   non-zero keeps its exit status and stderr beside the bounded prefix.**
@@ -2139,6 +2179,7 @@ named items remain unresolved and must not be described as production-ready:
   prove. Rejected: treating any non-zero reap as a failure (every capped run
   would be reported as a failed capture), and discarding the prefix on the
   error path (loses the read that explains the failure).
+
 - **2026-10-18 — #395: adopted-token settlement replays by run-scoped settlement
   identity, not only by the token-derived marker.** Settlement adoption (#388)
   posts the capacity handoff under a marker hashed from the adopted token, but
@@ -2282,6 +2323,44 @@ named items remain unresolved and must not be described as production-ready:
   on unsafe or unverifiable workspace evidence. Chosen because keeping work
   moving outweighs failing fast: an idle local capacity on a claimed item is
   the failure mode this feature exists to end.
+- **2026-10-17 — #375: the criterion-evidence grammar a run is taught is
+  derived from the patterns the broker validates, so a validator edit can no
+  longer leave a prompt teaching a shape the validator refuses.** The grammar
+  was spelled three times — twice as prose baked into the legacy repair
+  continuation and the resolve-issue goal, once as the authoritative regexes
+  in the broker's criterion-evidence contract — and the copies had already
+  diverged from each other and from the broker's own rejection text: the repair
+  continuation taught the per-status rule as "referencing a file path or check
+  URL" where the validator says "must cite", and the goal's status vocabulary
+  dropped the conjunction the repair continuation carried. Constants behind a
+  cross-check test would have left the same failure open; the grammar is now
+  derived. `internal/broker` exports `CriteriaHeaderGrammar`,
+  `CriteriaHeaderShape`, `CriteriaRowGrammar`, `StatusVocabulary`,
+  `StatusVocabularySentence`, and `StatusReferenceRuleSentence`; the header and
+  row templates are rendered from the validator regexes by stripping the
+  anchors and substituting each capture group with the placeholder naming it.
+  Those substitutions are explicit, not automatic: each capture group's regex
+  source is hand-written as a substitution key, so the derivation is a
+  mechanical step over a table a human maintains. Drift between the taught
+  template and the validator is therefore caught rather than structurally
+  impossible — by equality against the pinned `derivedHeaderTemplate` and
+  `derivedRowTemplate`, by the alternation test that reads the row pattern's
+  own vocabulary in both directions, and by the substitution-key test that
+  fails a key occurring twice or a key that is a substring of another. The
+  patterns, the vocabulary, and the rule table live in the leaf package
+  `internal/broker/grammar`, so a prompt surface can render the grammar
+  without importing the broker — whose own in-package tests import the
+  harness — and `internal/broker` re-exports them under its existing names.
+  The per-status reference rule moves the same way: one table maps each
+  status to its requirement, consumed by both `validRecordShape` and the
+  rendered sentence, so the validator's parenthetical and the prose it teaches
+  are one string. Validation outcomes are unchanged — the derivation
+  re-spells how the grammar is taught, not what it accepts — and
+  `internal/broker/criteria_test.go` pins the derivation itself: every
+  instance rendered from a template must satisfy the pattern it claims to
+  describe, and the closed vocabulary must equal the row pattern's
+  alternation in both directions. (#375, #249, #282)
+
 - **2026-10-17 — #377: the operator's own observation reads resolve their
   destination through the selected registration, the same routing admission
   was given in #340/#378.** Post-review PR observation, existing-PR head
@@ -4063,6 +4142,56 @@ was superseded.
   client query had no remaining caller after this change and is gone, so one
   listing seam remains. (#365, closing the `Observer` carve-out left open by
   the #343 entry.)
+- **2026-10-17 — #390: the read phase observes the operation deadline the git
+  calls already observed.**
+  `Capture` bounded its git calls by the 20-second operation deadline
+  (`exec.CommandContext`) but its per-file reads took no context at all, so one
+  stalling read — a regular file on a hung filesystem — carried the capture
+  past that deadline, through the pod's 45-second grace, to SIGKILL, and the
+  manifest went with it: "over deadline the
+  bundle degrades to the manifest alone" was unreachable for the one phase git
+  did not bound. The read is now bounded by the same context. The mechanism is
+  deliberately weak: a pre-check fails fast when the deadline is already gone
+  (no goroutine at all), and otherwise the open and the capped read run in a
+  goroutine whose result is received unless the context is done first — and a
+  result that lands while the context is expired is discarded even when it wins
+  the select, because a completed read and a closed Done are then ready at once
+  and Go breaks that tie at random. Cancellation is therefore settled again
+  after the select and again at the seam call in `Capture`, outside the
+  read-error taxonomy, so no bytes read past the deadline are ever stored and a
+  read that only succeeded because the context was dead cannot masquerade as
+  content.
+  Cancellation abandons that goroutine rather than interrupting it — closing a
+  descriptor from another goroutine is not a reliable way to unblock a read
+  already blocked in the kernel — and the abandoned read's bytes are discarded
+  and never stored, so bounding the wait costs no content risk. A canceled read
+  returns the context's error rather than a read failure to be classified, which
+  is what makes the executor's existing manifest-only degradation reachable
+  here: the same `Capture` error the executor already handles, with the same
+  fresh five-second window the 2026-10-09 decision grants a capture the
+  deadline itself aborted. The `O_NONBLOCK` open plus non-regular descriptor
+  guard that closes the fifo-swap hole (#336, merged as #389) was deliberately
+  kept out of #390's own change rather than folded into it: it is a different
+  problem — refusing to open a non-regular file at all, rather than bounding
+  the read that follows. The two landed independently and this merge composes
+  them in one function: `O_NONBLOCK` keeps a non-regular
+  swap from stalling the open, and the context bounds what survives that check,
+  which is a read of a regular file the kernel has already accepted. As #389
+  predicted, its guard took this regression's fixture with it: a fifo is
+  refused with `errNotRegular` before any read begins, so the abandoned-read
+  primitive is now reachable only by a hung filesystem serving a regular file,
+  which a unit test cannot construct without a privileged mount. The primitive
+  test therefore pins what is still observable — a context that is already
+  done is answered from the context, not with the path's own `errNotRegular`,
+  which is the ordering the taxonomy depends on — and the bound's observable
+  consequence is pinned end to end through the `readFileForCapture` seam. The
+  fast-path pre-check is not pinned by it, and the reason is measured rather
+  than argued: because #389 answers a fifo in two syscalls, without the
+  pre-check the goroutine's `errNotRegular` and the already-done context are
+  sometimes both ready at the select, which breaks that tie at random — about
+  1 run in 25,000 (20 of 500k), far below what a test can detect. The pre-check
+  is kept for the fast path it buys (no goroutine, no syscalls), not because a
+  test fails without it. (#390)
 - **2026-10-17 — #356: pod sizing is a LaneProfile field, and no
   Courier-created pod is BestEffort.** `PodConfig.Resources` existed and was
   applied to the coordinator container, but no production path ever assigned it

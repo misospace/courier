@@ -13,6 +13,7 @@ import (
 	"strings"
 
 	courierv1alpha1 "github.com/misospace/courier/api/v1alpha1"
+	"github.com/misospace/courier/internal/broker/grammar"
 )
 
 // TerminalPhase is the phase an executor reports when its process exits.
@@ -185,10 +186,11 @@ const outcomeFilename = "outcome.json"
 // admission (#249, #280, #282). It is a one-liner extension the goal
 // pastes into a resolve-issue prompt so the model knows the exact shape
 // the legacy and native broker will both refuse to verify against
-// instead of re-deriving it from a repair turn. The grammar is sourced
+// instead of re-deriving it from a repair turn. The grammar is rendered
 // from the broker's evidence-block rules (#249) so the two producers
 // (legacy handoff and native broker) cannot drift.
-const publicationBlockGrammar = "If COURIER_CRITERIA is set, the PR body must carry a criterion-evidence block: a single header line 'courier-criteria:v1 source=<owner/name>#<n> set=sha256:<64hex> coverage=full|partial' followed by one row per pinned criterion, each shaped '- AC-<n> sha256:<64hex>: <status> - <reference>', with the per-criterion digests matching the pinned set; the per-status vocabulary is implementation-evidence, regression-check, manual-verification, not-implemented, unknown; regression-check and implementation-evidence must cite a file path or check URL, and manual-verification and not-implemented must carry a note."
+var publicationBlockGrammar = fmt.Sprintf("If COURIER_CRITERIA is set, the PR body must carry a criterion-evidence block: a single header line '%s' followed by one row per pinned criterion, each shaped '%s', with the per-criterion digests matching the pinned set; the per-status vocabulary is %s; %s.",
+	grammar.CriteriaHeaderGrammar(), grammar.CriteriaRowGrammar(), grammar.StatusVocabularySentence(), grammar.StatusReferenceRuleSentence())
 
 // Goal returns the concise coordinator goal for a run. Lane framing is passed
 // separately so it remains context rather than becoming a hard-coded prompt

@@ -708,9 +708,13 @@ func ProbePod(run *courier.CoderRun, node, image, script string, resources corev
 	return pod
 }
 
-// nodeNameTag produces a short DNS-safe tag for a node name.
+// nodeNameTag produces a short DNS-safe tag for a node name. The normalized
+// name is a readable prefix only: distinct nodes share long prefixes and can
+// normalize to the same string, so an 8-hex digest of the full original name
+// always follows it and keeps the tag one node's own.
 func nodeNameTag(node string) string {
-	tag := strings.Map(func(r rune) rune {
+	const budget = 16
+	prefix := strings.Trim(strings.Map(func(r rune) rune {
 		switch {
 		case r >= 'a' && r <= 'z', r >= '0' && r <= '9', r == '-':
 			return r
@@ -719,14 +723,11 @@ func nodeNameTag(node string) string {
 		default:
 			return -1
 		}
-	}, node)
-	tag = strings.Trim(tag, "-")
-	if len(tag) > 16 {
-		tag = tag[:16]
+	}, node), "-")
+	sum := sha256.Sum256([]byte(node))
+	digest := hex.EncodeToString(sum[:])[:8]
+	if len(prefix) > budget-len(digest) {
+		prefix = prefix[:budget-len(digest)]
 	}
-	if tag == "" {
-		sum := sha256.Sum256([]byte(node))
-		tag = hex.EncodeToString(sum[:])[:8]
-	}
-	return tag
+	return prefix + digest
 }
