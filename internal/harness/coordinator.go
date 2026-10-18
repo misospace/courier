@@ -1196,9 +1196,27 @@ func (c *Coordinator) dispatchAndAwait(ctx context.Context, opID, briefID string
 		// in-flight briefs finish and integrate before the stop boundary.
 		select {
 		case <-ctx.Done():
-			// The context is gone but the operation may still be executing:
-			// its entry is left in place and is superseded by the operator's
-			// own pod observation when this incarnation ends.
+			// Expiry inside the wait must deliver the worker kill exactly
+			// like expiry inside an in-flight poll: the real worker answers
+			// "running" immediately, so the bound usually expires here, and
+			// returning without reconciling would leave the task running
+			// with no cancellation ever reaching the worker. Reconcile
+			// through cancellation on a non-cancellable bounded context —
+			// cancelling an op whose caller context died is always
+			// correct — and treat the reconcile as best-effort: whatever
+			// it observes, the original ctx.Err() is what the caller
+			// classifies, and a reconcile failure must never mask the
+			// bound expiry. A verified observation still closes the
+			// operation's entry through the same path as the other
+			// reconciles, so the state machine stays coherent.
+			reconcileCtx, reconcileCancel := context.WithTimeout(context.WithoutCancel(ctx), reconcileGrace)
+			defer reconcileCancel()
+			reconciled, reconcileErr := c.worker.ReconcileAmbiguous(reconcileCtx, opID, briefID)
+			if reconcileErr == nil {
+				if _, resultErr := c.verifiedResult(reconcileCtx, opID, reconciled); resultErr == nil {
+					c.releaseConsumed(reconcileCtx, opID, briefID)
+				}
+			}
 			return protocol.Result{}, ctx.Err()
 		case <-time.After(200 * time.Millisecond):
 		}

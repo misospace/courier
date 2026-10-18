@@ -1,8 +1,12 @@
 package devenv
 
 import (
+	"bytes"
 	"context"
 	"errors"
+	"os"
+	"os/exec"
+	"path/filepath"
 	"reflect"
 	"strconv"
 	"strings"
@@ -259,10 +263,13 @@ func TestBootstrapAndEnvCaptureScripts(t *testing.T) {
 			t.Errorf("BootstrapScript = %q, want it to contain %q", bootstrap, want)
 		}
 	}
-	// The trusted diagnostics are emitted after the bootstrap run too, so
-	// the terminal emission is last in the captured stdout tail.
-	if strings.Count(bootstrap, "courier_diag\n") != 2 || !strings.HasSuffix(bootstrap, "courier_diag\n") {
-		t.Errorf("BootstrapScript = %q, want diagnostics before AND after the bootstrap run", bootstrap)
+	// The trusted diagnostics are emitted exactly once, from the EXIT trap
+	// after the bootstrap run, so the terminal emission is last in the
+	// captured stdout tail on success and on every failure path.
+	if strings.Count(bootstrap, "courier_diag || true") != 1 ||
+		!strings.Contains(bootstrap, `trap 'rc=$?; rm -rf "$src"; courier_diag || true; exit "$rc"' EXIT`) ||
+		!strings.HasSuffix(bootstrap, "mise run bootstrap\n") {
+		t.Errorf("BootstrapScript = %q, want a single terminal EXIT-trap emission after the bootstrap run", bootstrap)
 	}
 
 	capture, err := EnvCaptureScript(oid)
@@ -366,8 +373,9 @@ func TestParseBootstrapDiagnostics(t *testing.T) {
 	}
 
 	// Last valid occurrence wins: the script emits its trusted diagnostics
-	// before and after the bootstrap run, so a spoofed repo-controlled line
-	// before the run cannot override the trusted terminal emission.
+	// once, from its EXIT trap after everything else it could ever run, so
+	// a spoofed repo-controlled line cannot override the trusted terminal
+	// emission.
 	spoofed := "courier-mise-path=/evil\n" +
 		"courier-mise-version=0.0.0-evil\n" +
 		"courier-mise-path=/usr/bin/mise\n" +
@@ -391,4 +399,205 @@ func equalStrings(a, b []string) bool {
 		}
 	}
 	return true
+}
+
+// scriptToolsRequired reports whether every external tool the scripts rely
+// on is present in this environment; a missing tool skips the real
+// execution tests rather than faking their outcome.
+func scriptToolsRequired() error {
+	for _, bin := range []string{"sh", "git", "tar", "mktemp"} {
+		if _, err := exec.LookPath(bin); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// baseRepoWithContract builds a real git repository whose base commit
+// carries the contract file, and returns the repo directory and the base
+// commit's OID — the materialization the scripts must perform.
+func baseRepoWithContract(t *testing.T) (string, string) {
+	t.Helper()
+	repo := filepath.Join(t.TempDir(), "repo")
+	if err := os.MkdirAll(filepath.Join(repo, ".mise"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	config := "[tasks.bootstrap]\nrun = 'echo bootstrap-ran > marker.txt'\n"
+	if err := os.WriteFile(filepath.Join(repo, ".mise", "config.toml"), []byte(config), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	run := func(args ...string) {
+		cmd := exec.Command("git", args...)
+		cmd.Dir = repo
+		cmd.Env = append(os.Environ(),
+			"GIT_AUTHOR_NAME=courier", "GIT_AUTHOR_EMAIL=courier@invalid",
+			"GIT_COMMITTER_NAME=courier", "GIT_COMMITTER_EMAIL=courier@invalid",
+			"GIT_CONFIG_GLOBAL=/dev/null", "GIT_CONFIG_SYSTEM=/dev/null",
+			"HOME="+repo,
+		)
+		var stderr bytes.Buffer
+		cmd.Stderr = &stderr
+		if err := cmd.Run(); err != nil {
+			t.Fatalf("git %v: %v: %s", args, err, stderr.String())
+		}
+	}
+	run("init", "-q", repo)
+	run("add", ".mise/config.toml")
+	run("commit", "-q", "-m", "base: contract")
+	oid, err := exec.Command("git", "-C", repo, "rev-parse", "HEAD").Output()
+	if err != nil {
+		t.Fatalf("rev-parse HEAD: %v", err)
+	}
+	return repo, strings.TrimSpace(string(oid))
+}
+
+// miseStandIn writes the scripted mise stand-in (the cmd/courier-executor
+// fixture idiom): it answers --version, runs the bootstrap task as a
+// marker print, and emits NUL-separated environment records — oversize
+// when asked — so the scripts are exercised against a real shell without a
+// real mise.
+func miseStandIn(t *testing.T, dir, envPayload string) string {
+	t.Helper()
+	bin := filepath.Join(dir, "mise-bin")
+	if err := os.MkdirAll(bin, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	script := "#!/bin/sh\n" +
+		"case \"$1\" in\n" +
+		"  --version) printf 'mise 2024.10.29 (stand-in)\\n' ;;\n" +
+		"  run) printf 'bootstrap-ran\\n' ;;\n" +
+		"  x) printf 'MISE_STANDIN=active\\000MISE_STANDIN_TWO=2\\000" + envPayload + "' ;;\n" +
+		"  *) printf 'unexpected mise invocation: %s\\n' \"$*\" >&2; exit 64 ;;\n" +
+		"esac\n"
+	path := filepath.Join(bin, "mise")
+	if err := os.WriteFile(path, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	return bin
+}
+
+// runScript executes one generated task script the way the worker would:
+// `sh -c` with the repo as the working directory and the stand-in's bin
+// directory on PATH, with TMPDIR pointed at a scratch dir the test
+// controls so the EXIT trap's cleanup is observable.
+func runScript(t *testing.T, script, repo, binDir, scratch string) (string, error) {
+	t.Helper()
+	cmd := exec.Command("sh", "-c", script)
+	cmd.Dir = repo
+	cmd.Env = append(os.Environ(),
+		"PATH="+binDir+string(os.PathListSeparator)+os.Getenv("PATH"),
+		"TMPDIR="+scratch,
+	)
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+	err := cmd.Run()
+	if err != nil {
+		if exitErr, ok := err.(*exec.ExitError); ok {
+			t.Logf("script stderr: %s", stderr.String())
+			return stdout.String(), exitErr
+		}
+		t.Fatalf("sh -c: %v", err)
+	}
+	return stdout.String(), nil
+}
+
+// TestScriptsExecuteForReal drives both generated task scripts against a
+// real git repository, a real shell, and a scripted mise stand-in: the
+// bootstrap script materializes the base, runs the contract, emits its
+// trusted diagnostics last, and cleans the materialization through its
+// EXIT trap; the capture script emits the NUL record stream; an oversized
+// capture and an absent base object both fail closed.
+func TestScriptsExecuteForReal(t *testing.T) {
+	if err := scriptToolsRequired(); err != nil {
+		t.Skipf("script execution tools unavailable: %v", err)
+	}
+	repo, baseOID := baseRepoWithContract(t)
+
+	t.Run("bootstrap materializes, runs, and cleans up", func(t *testing.T) {
+		binDir := miseStandIn(t, t.TempDir(), "")
+		scratch := filepath.Join(t.TempDir(), "tmp")
+		if err := os.MkdirAll(scratch, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		script, err := BootstrapScript(baseOID)
+		if err != nil {
+			t.Fatalf("BootstrapScript: %v", err)
+		}
+		stdout, runErr := runScript(t, script, repo, binDir, scratch)
+		if runErr != nil {
+			t.Fatalf("bootstrap script failed: %v", runErr)
+		}
+		for _, key := range []string{"courier-mise-path=", "courier-mise-version=", "courier-mise-data-dir="} {
+			if !strings.Contains(stdout, key) {
+				t.Errorf("bootstrap stdout missing diagnostic %q:\n%s", key, stdout)
+			}
+		}
+		if !strings.Contains(stdout, "bootstrap-ran") {
+			t.Errorf("bootstrap stdout missing the contract's own marker:\n%s", stdout)
+		}
+		// The trusted terminal emission is last: whatever the run printed,
+		// the diag lines follow it in the captured tail.
+		if idx := strings.LastIndex(stdout, "courier-mise-path="); idx != -1 && idx < strings.Index(stdout, "bootstrap-ran") {
+			t.Errorf("trusted diagnostics are not terminal in the captured stdout:\n%s", stdout)
+		}
+		// The trap's rm -rf removed the materialized directory: the test's
+		// own TMPDIR is empty after the run.
+		entries, err := os.ReadDir(scratch)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(entries) != 0 {
+			t.Errorf("materialization survived the EXIT trap: %v", entries)
+		}
+	})
+
+	t.Run("env capture emits the NUL record stream", func(t *testing.T) {
+		binDir := miseStandIn(t, t.TempDir(), "")
+		script, err := EnvCaptureScript(baseOID)
+		if err != nil {
+			t.Fatalf("EnvCaptureScript: %v", err)
+		}
+		stdout, runErr := runScript(t, script, repo, binDir, t.TempDir())
+		if runErr != nil {
+			t.Fatalf("capture script failed: %v", runErr)
+		}
+		want := "MISE_STANDIN=active\x00MISE_STANDIN_TWO=2\x00"
+		if stdout != want {
+			t.Errorf("capture stdout = %q, want the NUL record stream %q", stdout, want)
+		}
+	})
+
+	t.Run("oversized capture fails closed", func(t *testing.T) {
+		big := "BIG=" + strings.Repeat("x", 70000) + "\\000"
+		binDir := miseStandIn(t, t.TempDir(), big)
+		script, err := EnvCaptureScript(baseOID)
+		if err != nil {
+			t.Fatalf("EnvCaptureScript: %v", err)
+		}
+		_, runErr := runScript(t, script, repo, binDir, t.TempDir())
+		if runErr == nil {
+			t.Fatal("an oversized capture must fail the task, not be truncated or passed through")
+		}
+	})
+
+	t.Run("absent base object fails closed", func(t *testing.T) {
+		binDir := miseStandIn(t, t.TempDir(), "")
+		const absentOID = "0123456789abcdef0123456789abcdef01234567"
+		script, err := BootstrapScript(absentOID)
+		if err != nil {
+			t.Fatalf("BootstrapScript: %v", err)
+		}
+		stdout, runErr := runScript(t, script, repo, binDir, t.TempDir())
+		if runErr == nil {
+			t.Fatal("a base whose objects are absent must fail the materialization guard")
+		}
+		// Even this failure path carries the trusted diagnostics: the EXIT
+		// trap is terminal in every outcome.
+		for _, key := range []string{"courier-mise-path=", "courier-mise-version=", "courier-mise-data-dir="} {
+			if !strings.Contains(stdout, key) {
+				t.Errorf("failure-path stdout missing diagnostic %q:\n%s", key, stdout)
+			}
+		}
+	})
 }

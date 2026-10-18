@@ -1172,9 +1172,10 @@ and the legacy executor's classification through `internal/devenv`:
   behavior, not a failure); a contract that differs from the base is
   skipped, never executed.
 - **Bounded setup.** The secure harness dispatches the bootstrap task
-  (`mise run bootstrap` plus its fixed diagnostic lines, emitted before and
-  after the run so the trusted terminal emission is last in the captured
-  stdout tail) and the environment capture (`mise x -- env -0`) as TWO
+  (`mise run bootstrap` plus its fixed diagnostic lines, emitted exactly
+  once from the script's EXIT trap — the terminal emission that runs last
+  on success and on every failure path) and the environment capture
+  (`mise x -- env -0`) as TWO
   separately dispatched worker operations, each under its own fixed liveness
   bound (15 minutes) — never one shared budget, so a hung bootstrap cannot
   consume the capture's liveness too. On expiry, control classifies the
@@ -1186,6 +1187,11 @@ and the legacy executor's classification through `internal/devenv`:
   structured reason (fixed text naming the stage and the exit code only —
   untrusted worker output never enters a durable reason), never a
   model-visible retry loop and never a model scavenger hunt for tooling.
+  The expiry is delivered wherever it lands — inside an in-flight poll or
+  inside the poll wait itself: a bound that expires while control merely
+  waits between polls must still reconcile the running operation through
+  cancellation, because the worker answers "running" immediately and only
+  an in-flight poll would otherwise carry the kill.
   The environment capture is size-capped at the source (64 KiB, paired with
   the `Task.Env` dispatch bound and the worker's 64 KiB stdout tail): an
   oversized capture fails the task honestly with a nonzero exit, never a
@@ -1240,7 +1246,11 @@ environment never flows back into a trusted process. Approval covers the
 compared contract paths as regular blobs at the resolved commits — a
 symlinked or substituted contract path fails closed instead of being
 compared through its target — and the base materialization's `test -f`
-proves the contract file is really present in what will run.
+proves the contract file is really present in what will run. The
+materialization assumes the base revision is reachable from the dispatched
+snapshot's work ref — true because integration is built on the base; a
+base whose objects are absent from the worker's store fails closed at the
+materialization guard, never runs something else instead.
 
 ## Commit cadence
 
@@ -4515,9 +4525,10 @@ earns a 401 that is classified as a definite denial (superseded by #406: a
   environment-key count, and the validated mise executable path, version,
   and data dir) emitted best-effort through a sink onto the control pod's
   `workspace.bootstrap` event, the same emitter session compaction uses;
-  the script emits its trusted diagnostics before and after the bootstrap
-  run, so last-occurrence-wins parsing makes the trusted terminal emission
-  override earlier repo-controlled output. Rejected: keeping any legacy
+  the script emits its trusted diagnostics exactly once, from its EXIT trap
+  after everything else it could ever run, so last-occurrence-wins parsing
+  makes the trusted terminal emission override earlier repo-controlled
+  output on success and on every failure path. Rejected: keeping any legacy
   in-process execution engine (the credential-bearing executor of
   repository code is exactly what review blocked), one shared liveness
   budget across the two tasks (a hung bootstrap would consume the capture's

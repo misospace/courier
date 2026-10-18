@@ -586,6 +586,43 @@ func TestBootstrapLivenessBoundIsABlocker(t *testing.T) {
 	}
 }
 
+// TestBootstrapBoundExpiryDeliversTheKill pins the select-wait expiry path
+// (#414 review): the mock answers "running" immediately the way the real
+// worker answers a known operation, so the stage's liveness bound expires
+// inside the poll wait's select — and the reconcile delivered there must
+// still reach the worker: the mock observes a cancellation for the hung op
+// before the blocker is returned. Expiry inside the wait kills the task,
+// not only expiry inside an in-flight poll.
+func TestBootstrapBoundExpiryDeliversTheKill(t *testing.T) {
+	worker, delegator, cleanupWorker := testWorkerAndDelegator(t)
+	defer cleanupWorker()
+	worker.hangResults = true
+
+	gateway, _, cleanup := gatewayFor()
+	defer cleanup()
+	coordinator, err := NewCoordinator(CoordinatorConfig{Gateway: gateway, Bindings: testBindings(), Worker: delegator})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	restored := bootstrapBound
+	bootstrapBound = 100 * time.Millisecond
+	defer func() { bootstrapBound = restored }()
+
+	err = coordinator.bootstrapWorkspace(context.Background(), "b1", testBaseOID)
+	var blocker *bootstrapBlocker
+	if !errors.As(err, &blocker) || !strings.Contains(err.Error(), "exceeded its liveness bound") {
+		t.Fatalf("bound expiry error = %v, want the liveness-bound blocker", err)
+	}
+	worker.mu.Lock()
+	cancels := len(worker.cancels)
+	tombstones := len(worker.tombstones)
+	worker.mu.Unlock()
+	if cancels == 0 || tombstones == 0 {
+		t.Fatalf("cancellations = %d, tombstones = %d, want the bound expiry to deliver the worker kill", cancels, tombstones)
+	}
+}
+
 // TestBootstrapStageBlockerNamesTheHungStage pins the split bounds (#414
 // review): the bootstrap task and the environment-capture task each hang
 // their own liveness bound, and the blocker reason names the stage that

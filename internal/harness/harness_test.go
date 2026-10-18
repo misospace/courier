@@ -166,18 +166,16 @@ type mockWorker struct {
 	// bootstrapResults are consumed in order by the scripted bootstrap task;
 	// with none scripted, a bootstrap task completes with an empty capture.
 	bootstrapResults []protocol.Result
-	// hangResults makes every result poll block until its request context
-	// ends, standing in for a worker whose operation never terminates.
+	// hangResults makes every dispatched operation stay running: result
+	// polls answer "running" immediately, the way the real worker answers
+	// a known operation that has not terminated, until a cancellation
+	// tombstones the op.
 	hangResults bool
-	// hangStage makes only the result polls of one bootstrap stage's
-	// operations ("bootstrap" or "capture") block until their request
-	// context ends, standing in for a worker whose bootstrap task or whose
-	// environment-capture task — but not both — never terminates.
+	// hangStage makes only the operations of one bootstrap stage
+	// ("bootstrap" or "capture") stay running the same way, standing in
+	// for a worker whose bootstrap task or whose environment-capture task
+	// — but not both — never terminates.
 	hangStage string
-	// bootstrapOps and captureOps record the op IDs dispatched for each
-	// bootstrap stage, so hangStage can hang exactly one of them.
-	bootstrapOps map[string]bool
-	captureOps   map[string]bool
 	// tombstones records cancelled op IDs, mirroring the real worker: a
 	// cancellation tombstone is final, and a result poll for a
 	// tombstoned operation answers the verified cancellation instead of
@@ -254,9 +252,19 @@ func (m *mockWorker) handleDispatch(w http.ResponseWriter, r *http.Request) {
 	if m.results == nil {
 		m.results = map[string]protocol.ResultState{}
 	}
+	// A hung operation stays running: like the real worker, its result
+	// polls answer "running" immediately until a cancellation tombstones
+	// the op — the mock never emulates a hang by blocking the poll request.
+	running := m.hangResults ||
+		(m.hangStage == "bootstrap" && isWorkerBootstrapTask(task)) ||
+		(m.hangStage == "capture" && isWorkerEnvCaptureTask(task))
+	if running {
+		m.results[req.Envelope.OpID] = protocol.ResultState{Status: "running"}
+	}
 	// The fixed unpack and pack tasks are answered from their scripted
 	// fields: the unpack echoes the tip, the pack returns the bundle.
 	switch {
+	case running:
 	case isWorkerUnpackTask(task):
 		tip := m.snapshotTip
 		if len(m.snapshotTips) > 0 {
@@ -273,17 +281,6 @@ func (m *mockWorker) handleDispatch(w http.ResponseWriter, r *http.Request) {
 			Result: &protocol.Result{Status: protocol.ResultCompleted, ExitCode: 0, Artifact: m.packArtifact},
 		}
 	case isWorkerBootstrapTask(task), isWorkerEnvCaptureTask(task):
-		if isWorkerBootstrapTask(task) {
-			if m.bootstrapOps == nil {
-				m.bootstrapOps = map[string]bool{}
-			}
-			m.bootstrapOps[req.Envelope.OpID] = true
-		} else {
-			if m.captureOps == nil {
-				m.captureOps = map[string]bool{}
-			}
-			m.captureOps[req.Envelope.OpID] = true
-		}
 		result := protocol.Result{
 			Status:   protocol.ResultCompleted,
 			ExitCode: 0,
@@ -338,30 +335,14 @@ func (m *mockWorker) handleCancel(w http.ResponseWriter, r *http.Request) {
 
 func (m *mockWorker) handleResult(w http.ResponseWriter, r *http.Request) {
 	opID := strings.TrimSuffix(strings.TrimPrefix(r.URL.Path, "/v1/tasks/"), "/result")
-	m.mu.Lock()
-	tombstoned := m.tombstones[opID]
-	m.mu.Unlock()
-	if !tombstoned {
-		if m.hangResults {
-			<-r.Context().Done()
-			return
-		}
-		if m.hangStage != "" {
-			m.mu.Lock()
-			hang := (m.hangStage == "bootstrap" && m.bootstrapOps[opID]) ||
-				(m.hangStage == "capture" && m.captureOps[opID])
-			m.mu.Unlock()
-			if hang {
-				<-r.Context().Done()
-				return
-			}
-		}
-	}
 	// A tombstoned operation answers with the verified cancellation the
 	// real worker reports after its process group is empty — an honest
-	// cancellation is observable, not a hang.
+	// cancellation is observable, not a hang. A running operation answers
+	// "running" immediately, the way the real worker answers a known
+	// operation that has not terminated.
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	tombstoned := m.tombstones[opID]
 	if tombstoned && m.results[opID].Result == nil {
 		m.results[opID] = protocol.ResultState{
 			Status: protocol.ResultCancelled,

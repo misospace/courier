@@ -55,11 +55,15 @@ func validBaseOID(baseOID string) bool {
 // string cannot carry a quote, a dollar, or any metacharacter, so the
 // interpolation can only ever produce the OID itself.
 //
-// The mise diagnostics are emitted BEFORE and AFTER the bootstrap run:
-// before, so a failed bootstrap that produced little output of its own
-// still yields them; after, so on success the trusted terminal emission is
-// always the last thing in the captured stdout tail and earlier,
-// repo-controlled lines cannot override it in ParseBootstrapDiagnostics.
+// The mise diagnostics are emitted exactly once, from the EXIT trap, after
+// everything else the script could ever run: the trap is the script's
+// terminal emission on success and on every failure (`set -e` exits, a
+// failed materialization, a failed bootstrap run), so the trusted emission
+// is always the last thing in the captured stdout tail and earlier
+// repo-controlled lines cannot override it in
+// ParseBootstrapDiagnostics. The trap preserves the original exit code via
+// `exit "$rc"` and keeps a failing diag (`courier_diag || true`) from
+// changing it; no repo code can run after the trap.
 // The bootstrap task and the environment capture are two separately
 // dispatched tasks: each gets its own liveness bound, never one shared
 // budget.
@@ -70,18 +74,19 @@ func BootstrapScript(baseOID string) (string, error) {
 	return "set -eu\n" +
 		"base='" + baseOID + "'\n" +
 		"src=\"$(mktemp -d)\"\n" +
-		"trap 'rm -rf \"$src\"' EXIT\n" +
-		"git archive \"$base\" | tar -x -C \"$src\"\n" +
-		"test -f \"$src/" + ConfigPath + "\"\n" +
-		"cd \"$src\"\n" +
 		"courier_diag() {\n" +
 		"  printf 'courier-mise-path=%s\\n' \"$(command -v mise)\"\n" +
 		"  printf 'courier-mise-version=%s\\n' \"$(mise --version)\"\n" +
 		"  printf 'courier-mise-data-dir=%s\\n' \"${MISE_DATA_DIR:-${XDG_DATA_HOME:-$HOME/.local/share}/mise}\"\n" +
 		"}\n" +
-		"courier_diag\n" +
-		"mise run bootstrap\n" +
-		"courier_diag\n", nil
+		// The trap is the single terminal emission: it runs last on success
+		// and on every failure path, preserves the original exit code, and
+		// a failing diag cannot change it.
+		"trap 'rc=$?; rm -rf \"$src\"; courier_diag || true; exit \"$rc\"' EXIT\n" +
+		"git archive \"$base\" | tar -x -C \"$src\"\n" +
+		"test -f \"$src/" + ConfigPath + "\"\n" +
+		"cd \"$src\"\n" +
+		"mise run bootstrap\n", nil
 }
 
 // EnvCaptureScript returns the fixed POSIX sh environment-capture task
@@ -140,11 +145,11 @@ var errMalformedEnvCapture = errors.New("malformed environment capture")
 // fixed-key facts are ever consumed. A value that is not printable ASCII
 // (0x20–0x7E) or that exceeds 300 bytes is dropped, never truncated. When a
 // key appears more than once, the LAST occurrence that survives validation
-// wins: the script emits its trusted diagnostics both before and after the
-// bootstrap run, so the trusted terminal emission overrides anything repo
-// code printed earlier — and a spoofed line cannot override the trusted
-// terminal emission, because it is last. The returned map is possibly empty
-// and the function never errors.
+// wins: the script emits its trusted diagnostics once, from its EXIT trap
+// after everything else it could ever run, so the trusted terminal emission
+// overrides anything repo code printed earlier — and a spoofed line cannot
+// override the trusted terminal emission, because it is last. The returned
+// map is possibly empty and the function never errors.
 func ParseBootstrapDiagnostics(stdout string) map[string]string {
 	diagnostics := make(map[string]string)
 	for _, line := range strings.Split(stdout, "\n") {
@@ -160,8 +165,9 @@ func ParseBootstrapDiagnostics(stdout string) map[string]string {
 		if len(value) > maxDiagnosticValueBytes || !printableASCII(value) {
 			continue
 		}
-		// Last valid occurrence wins, so the script's trusted post-bootstrap
-		// emission always overrides earlier repo-controlled lines.
+		// Last valid occurrence wins, so the script's single terminal
+		// emission from its EXIT trap always overrides earlier
+		// repo-controlled lines.
 		diagnostics[key] = value
 	}
 	return diagnostics
