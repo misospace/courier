@@ -14,12 +14,13 @@ const bootstrapReasonLimit = 500
 
 // bootstrapContractState classifies the checked-out contract against the
 // operator-approved base revision through the shared devenv orchestration
-// (#414): absent at head → StateAbsent; equal to base, with every referenced
-// script pinned identical, → StateApproved; anything unprovable →
-// StateModified. Resolve and read errors return the zero State with the
-// error: the caller skips bootstrap with a receipt reason and never executes
-// content it cannot prove matches the approved base. The zero State is
-// meaningless on its own; branch on the error first.
+// (#414): absent at head → StateAbsent; config plus a committed lock, both
+// regular and byte-identical to base → StateApproved; anything unprovable,
+// including a contract whose lock is absent → StateModified. Resolve and read
+// errors return the zero State with the error: the caller skips bootstrap with
+// a receipt reason and never executes content it cannot prove matches the
+// approved base. The zero State is meaningless on its own; branch on the
+// error first.
 func bootstrapContractState(ctx context.Context, dir, baseRev, headRev string) (devenv.State, error) {
 	baseOID, err := couriergit.ResolveCommit(ctx, dir, baseRev)
 	if err != nil {

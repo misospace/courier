@@ -1154,8 +1154,13 @@ and the legacy executor's classification through `internal/devenv`:
   `.mise/config.toml` and `.mise/mise.lock` are byte-identical to those at
   the run's operator-approved base revision, read with hardened git reads
   (`git cat-file`) at the resolved head and base commits — never from a
-  working tree, never by executing anything to decide. Every compared
-  contract path must be a regular blob: a symlink (120000) or a gitlink
+  working tree, never by executing anything to decide. The committed
+  lockfile is part of the contract, not an optional companion: a config
+  whose lock is absent or unprovable at either revision is unapproved and
+  skipped, because without the lock the tool versions a bootstrap
+  installs are unpinned, and a repository that has committed a config
+  has a contract rather than none. Every compared contract path must be a
+  regular blob: a symlink (120000) or a gitlink
   (160000) at either revision is unprovable and fails closed. The
   comparison is the APPROVAL GATE only: a contract modified in a PR is an
   untrusted modification and is skipped, never executed. What actually
@@ -1169,8 +1174,9 @@ and the legacy executor's classification through `internal/devenv`:
   discover is attempted, because none can be complete; enumeration-based
   pinning of referenced scripts was tried and removed as unsound.
   Repositories without a contract are skipped (documented no-contract
-  behavior, not a failure); a contract that differs from the base is
-  skipped, never executed.
+  behavior, not a failure); so are a contract that differs from the base
+  and one that is only half-committed (a config with no lock). All three
+  skip classes dispatch nothing and are never executed.
 - **Bounded setup.** The secure harness dispatches the bootstrap task
   (`mise run bootstrap` plus its fixed diagnostic lines, emitted exactly
   once from the script's EXIT trap — the terminal emission that runs last
@@ -4537,3 +4543,30 @@ earns a 401 that is classified as a definite denial (superseded by #406: a
   scripts and configs mise might discover (incomplete by construction —
   materializing the approved base revision needs no enumeration at all).
   (#414, #446)
+- **2026-10-18 — #414 review: the committed lockfile is part of the
+  bootstrap contract, so a config without one is unapproved rather
+  than unpinned-but-allowed.** The first PR #446 review pass held the
+  gate could return StateApproved when `.mise/mise.lock` was absent at
+  both revisions, which let a repository that committed only
+  `.mise/config.toml` execute a bootstrap whose tool versions were
+  never pinned — directly against #414's "new mise dependency must be
+  explicitly vetted/pinned" acceptance. The gate now requires the lock
+  to be present, a regular blob, and byte-identical at both revisions,
+  alongside the config. A lockless repo is NOT reclassified as
+  contract-absent: the absent state stays reserved for a repository
+  that committed no config at all, because absence of the whole contract
+  is a different (and benign) situation from a repository that has
+  half-committed one. The lock is also what makes the executed bytes'
+  tool set knowable at approval time, so permitting its absence would
+  have made "approved" mean "identical" while running something the
+  operator never pinned. Neither
+  call site needed a new branch for this: the legacy executor already
+  emitted its skip-with-reason `workspace.bootstrap` receipt for a
+  modified contract, and the harness already dispatched nothing and
+  cleared any captured environment for one, so the only behavior change
+  is that an unpinned bootstrap is never executed.
+  Rejected: narrowing the contract to config-only in the issue and
+  design (that is a decision for the issue owner, and it forfeits
+  pinning #414 requires), and treating an empty-but-present lock as
+  unapproved (presence and regularity are the gate's job; content
+  validation of the lock format is mise's). (#414, #446)

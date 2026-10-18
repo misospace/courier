@@ -49,10 +49,11 @@ const (
 // Files carries the contract file contents at one revision. Config and Lock
 // are nil when absent; HasConfig and HasLock report presence separately, so
 // a read error is never folded into absence — callers handle read errors
-// themselves and must not call Compare in that case. ConfigRegular
-// and LockRegular report a git regular blob at that revision (filemode
-// 100644 or 100755): an executable contract path that is a symlink or any
-// other non-regular entry is unprovable and must fail closed.
+// themselves and must not call Compare in that case. A contract needs both
+// files: Compare approves a config without a lock at neither revision.
+// ConfigRegular and LockRegular report a git regular blob at that revision
+// (filemode 100644 or 100755): an executable contract path that is a symlink
+// or any other non-regular entry is unprovable and must fail closed.
 type Files struct {
 	Config        []byte
 	Lock          []byte
@@ -66,10 +67,13 @@ type Files struct {
 // operator-approved base revision's contract, failing closed on everything
 // it cannot prove. An absent head is StateAbsent, which covers repositories
 // without a contract. A base that is absent while the head is present is
-// StateModified. Otherwise every compared contract path must be a regular
-// blob at both revisions (a symlinked or otherwise non-regular contract
-// path is an untrusted modification), and the config and lock bytes —
-// including lock presence — must be byte-identical. The comparison is the
+// StateModified. The committed lockfile is part of the contract, not an
+// optional companion: a config whose lock is absent or unprovable at either
+// revision is StateModified, because without it the tool versions a
+// bootstrap installs are unpinned. Otherwise every compared contract path
+// must be a regular blob at both revisions (a symlinked or otherwise
+// non-regular contract path is an untrusted modification), and the config
+// and lock bytes must be byte-identical. The comparison is the
 // APPROVAL GATE only: it decides whether the contract may run at all. What
 // actually executes is never the head's bytes — the worker materializes the
 // approved base revision from the git object store and runs there (see
@@ -87,10 +91,19 @@ func Compare(base, head Files) State {
 	if !base.ConfigRegular || !head.ConfigRegular {
 		return StateModified
 	}
-	if base.HasLock && head.HasLock && (!base.LockRegular || !head.LockRegular) {
+	// The contract is the config plus a COMMITTED lockfile (#414): the lock
+	// is what pins the tool versions the bootstrap installs, so a contract
+	// without one at either revision cannot be pinned and is never approved.
+	// Absence on both sides is not a repo "without a contract" — that is the
+	// absent config above — it is a half-present contract, and the only safe
+	// reading of it is an unapproved one.
+	if !base.HasLock || !head.HasLock {
 		return StateModified
 	}
-	if string(base.Config) != string(head.Config) || base.HasLock != head.HasLock || string(base.Lock) != string(head.Lock) {
+	if !base.LockRegular || !head.LockRegular {
+		return StateModified
+	}
+	if string(base.Config) != string(head.Config) || string(base.Lock) != string(head.Lock) {
 		return StateModified
 	}
 	return StateApproved

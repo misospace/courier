@@ -47,11 +47,21 @@ func TestCompare(t *testing.T) {
 			Files{Config: configA, HasConfig: true},
 			StateModified,
 		},
+		// The contract is the config PLUS a committed lockfile (#414). A
+		// config whose lock is absent at both revisions is a half-present
+		// contract, not a repository without one: approving it would run an
+		// unpinned bootstrap, so it fails closed exactly like a modified one.
 		{
 			"identical without a lock",
 			Files{Config: configA, HasConfig: true, ConfigRegular: true},
 			Files{Config: configA, HasConfig: true, ConfigRegular: true},
-			StateApproved,
+			StateModified,
+		},
+		{
+			"lock unprovable at both revisions",
+			Files{Config: configA, HasConfig: true, Lock: lockA, HasLock: true, ConfigRegular: true},
+			Files{Config: configA, HasConfig: true, Lock: lockA, HasLock: true, ConfigRegular: true},
+			StateModified,
 		},
 	}
 	for _, tt := range tests {
@@ -188,6 +198,17 @@ func TestClassify(t *testing.T) {
 				"head": {ConfigPath: {data: config, regular: true, present: true}, LockPath: {err: errors.New("object read failed")}},
 			},
 			wantError: true,
+		},
+		{
+			// The unpinned-bootstrap hole, end to end through the read: a
+			// lockless repo is not a repository without a contract, and it
+			// must not reach StateApproved.
+			name: "config committed without a lock",
+			entries: map[string]map[string]fakeEntry{
+				"base": {ConfigPath: {data: config, regular: true, present: true}, LockPath: {present: false}},
+				"head": {ConfigPath: {data: config, regular: true, present: true}, LockPath: {present: false}},
+			},
+			want: StateModified,
 		},
 	}
 	for _, tt := range tests {
