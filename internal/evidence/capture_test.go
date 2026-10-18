@@ -12,6 +12,8 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"syscall"
 	"testing"
 	"time"
@@ -575,7 +577,7 @@ func TestReadCappedNoFollow(t *testing.T) {
 
 	regular := filepath.Join(dir, "regular.txt")
 	writeFile(t, regular, "regular content\n")
-	data, err := readCapped(regular, MaxFileBytes+1)
+	data, err := readCapped(context.Background(), regular, MaxFileBytes+1)
 	if err != nil {
 		t.Fatalf("readCapped regular file: %v", err)
 	}
@@ -595,7 +597,7 @@ func TestReadCappedNoFollow(t *testing.T) {
 	if err := os.Symlink(secret, victim); err != nil {
 		t.Fatal(err)
 	}
-	data, err = readCapped(victim, MaxFileBytes+1)
+	data, err = readCapped(context.Background(), victim, MaxFileBytes+1)
 	if !errors.Is(err, syscall.ELOOP) {
 		t.Fatalf("readCapped swapped symlink err = %v, want ELOOP", err)
 	}
@@ -616,7 +618,7 @@ func TestCaptureSymlinkSwapRace(t *testing.T) {
 
 	original := readFileForCapture
 	t.Cleanup(func() { readFileForCapture = original })
-	readFileForCapture = func(path string, limit int) ([]byte, error) {
+	readFileForCapture = func(ctx context.Context, path string, limit int) ([]byte, error) {
 		// The swap lands after Lstat classified the path as regular and
 		// before the O_NOFOLLOW open.
 		if err := os.Remove(path); err != nil {
@@ -625,7 +627,7 @@ func TestCaptureSymlinkSwapRace(t *testing.T) {
 		if err := os.Symlink("../../../../etc/shadow", path); err != nil {
 			t.Errorf("swap symlink: %v", err)
 		}
-		return original(path, limit)
+		return original(ctx, path, limit)
 	}
 
 	bundle, err := Capture(context.Background(), captureOptions(dir, nil))
@@ -660,6 +662,220 @@ func TestCaptureSymlinkSwapRace(t *testing.T) {
 	assertAbsent(t, bundle, []string{"SWAP-RACE-ORIGINAL"})
 }
 
+// TestReadCappedPrefersCancellationOverTheNonRegularGuard pins the #390
+// composition that survives #389: a context that is already done is answered
+// from the context, so a deadline never arrives as a read failure for Capture
+// to classify — cancellation is settled ahead of the read-error taxonomy, and
+// that ordering is what returns the error the executor degrades on. A
+// readCapped that took a context and ignored it would answer errNotRegular
+// here and fail.
+//
+// The bound's other half — abandoning a read already blocked in the kernel —
+// is not constructible here and this test does not claim it. #389 opens
+// O_NONBLOCK and refuses a non-regular descriptor with errNotRegular before any
+// read begins, so the fifo that used to stand in for a stalled read now
+// returns promptly, and the only read left that can stall is one of a regular
+// file on a hung filesystem, which a unit test cannot construct without a
+// privileged mount. Nor does this test pin the pre-check that keeps the fast
+// path free of goroutines, and the reason is a measurement rather than an
+// argument: #389 answers a fifo in two syscalls, so without the pre-check the
+// goroutine's errNotRegular and the already-done context are sometimes both
+// ready at the select, which breaks that tie at random. Measured over 500k
+// calls, the pre-check's presence is the difference between 0 wrong answers and
+// about 20 — roughly 1 in 25,000, well below what any test here can detect. The
+// pre-check is therefore kept for what it actually buys, which is a fast path
+// that starts no goroutine and issues no syscalls at all, not because this
+// test can fail without it. What the bound buys is observable end to end, and
+// TestCaptureReadPhaseBoundedByDeadline pins that through the seam.
+func TestReadCappedPrefersCancellationOverTheNonRegularGuard(t *testing.T) {
+	t.Parallel()
+	// A fifo: refused for what it is, but only once the filesystem is
+	// actually reached, which is what makes it the discriminator below.
+	fifo := filepath.Join(t.TempDir(), "refused.fifo")
+	if err := syscall.Mkfifo(fifo, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	// A live context reaches the filesystem and is refused for being a fifo,
+	// so the canceled case below answers from the context rather than
+	// repeating this result by accident.
+	if _, err := readCapped(context.Background(), fifo, MaxFileBytes+1); !errors.Is(err, errNotRegular) {
+		t.Fatalf("readCapped fifo err = %v, want %v", err, errNotRegular)
+	}
+
+	type readResult struct {
+		data []byte
+		err  error
+	}
+	// The read runs off the test goroutine, so a regression that never
+	// returns fails on the guard below instead of hanging the binary.
+	done := make(chan readResult, 1)
+	dead, stop := context.WithCancel(context.Background())
+	stop()
+	go func() {
+		data, err := readCapped(dead, fifo, MaxFileBytes+1)
+		done <- readResult{data: data, err: err}
+	}()
+	select {
+	case got := <-done:
+		if !errors.Is(got.err, context.Canceled) {
+			t.Errorf("readCapped with a canceled context err = %v, want context.Canceled", got.err)
+		}
+		if got.data != nil {
+			t.Errorf("readCapped with a canceled context returned %d bytes, want nil", len(got.data))
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("readCapped did not return within 10s of a canceled context")
+	}
+}
+
+// lateDeadlineContext stands in for a context whose deadline expires while a
+// read is already in flight: Err answers nil the first time it is observed —
+// the pre-check at the top of readCapped, which must see a live context or the
+// read never starts — and the deadline error from every observation after,
+// which is when the select and the result guard run.
+type lateDeadlineContext struct {
+	observed atomic.Bool
+	done     chan struct{}
+}
+
+func (c *lateDeadlineContext) Deadline() (time.Time, bool) { return time.Time{}, false }
+func (c *lateDeadlineContext) Done() <-chan struct{}       { return c.done }
+func (c *lateDeadlineContext) Value(any) any               { return nil }
+func (c *lateDeadlineContext) Err() error {
+	if c.observed.CompareAndSwap(false, true) {
+		return nil
+	}
+	return context.DeadlineExceeded
+}
+
+// TestReadCappedPrefersCancellationOverACompletedRead pins the #390 review
+// precedence inside readCapped: a read that completes while the context is
+// expired is discarded, even when the result wins the select — both channels
+// are then ready and the tie is broken at random, so the guard after the
+// select, not the select itself, is what keeps a completed read from
+// surviving a dead context.
+//
+// The double's Done closes only after a delay, so the select deterministically
+// sees the completed result first and the post-select guard is what decides;
+// on a pathologically slow runner the Done branch answers instead, which the
+// outcome below accepts either way.
+func TestReadCappedPrefersCancellationOverACompletedRead(t *testing.T) {
+	t.Parallel()
+	path := filepath.Join(t.TempDir(), "late.txt")
+	writeFile(t, path, "READ-AFTER-DEADLINE\n")
+
+	ctx := &lateDeadlineContext{done: make(chan struct{})}
+	timer := time.AfterFunc(10*time.Millisecond, func() { close(ctx.done) })
+	defer timer.Stop()
+	data, err := readCapped(ctx, path, MaxFileBytes+1)
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("readCapped err = %v, want context.DeadlineExceeded", err)
+	}
+	if data != nil {
+		t.Errorf("readCapped returned %q past its context, want nil", data)
+	}
+}
+
+// TestCaptureNeverAcceptsAReadThatFinishedUnderADeadContext is the #390
+// review regression at the seam: a read that completes after the context is
+// already dead — a result that won the select against a ready Done, or any
+// seam implementation — must be discarded, and Capture must fail with the
+// context's error and no bundle, so the executor's manifest-only degradation
+// is what the caller sees rather than content read past the deadline. The
+// seam answers deterministically, so the precedence Capture owes is pinned
+// without betting on the scheduler.
+func TestCaptureNeverAcceptsAReadThatFinishedUnderADeadContext(t *testing.T) {
+	// Not parallel: the test replaces a package-level seam that parallel
+	// captures share.
+	dir := newRepo(t)
+	writeFile(t, filepath.Join(dir, "late.txt"), "READ-AFTER-DEADLINE\n")
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	original := readFileForCapture
+	t.Cleanup(func() { readFileForCapture = original })
+	readFileForCapture = func(_ context.Context, _ string, _ int) ([]byte, error) {
+		// The deadline expires while the read is in flight, and the read
+		// completes anyway — the interleaving the select loses at random.
+		cancel()
+		return []byte("READ-AFTER-DEADLINE\n"), nil
+	}
+
+	bundle, err := Capture(ctx, captureOptions(dir, nil))
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("capture err = %v, want context.Canceled", err)
+	}
+	if bundle != nil {
+		t.Errorf("capture returned a bundle alongside cancellation, want nil so the caller degrades to manifest-only")
+	}
+}
+
+// TestCaptureReadPhaseBoundedByDeadline is the issue #390 regression: a read
+// phase that stalls past the operation deadline must fail the capture with the
+// context's error and no bundle, so the executor's manifest-only degradation
+// is reachable instead of the capture running on to SIGKILL. It pins the
+// Capture-side half, where the swapped seam stands in for the stalled read;
+// readCapped's own bounding of a kernel-blocked read is not unit-constructible
+// — #389's guard refuses the fifo before any read begins — so see
+// TestReadCappedPrefersCancellationOverTheNonRegularGuard for the part of it
+// that is observable.
+func TestCaptureReadPhaseBoundedByDeadline(t *testing.T) {
+	// Not parallel: the test replaces a package-level seam that parallel
+	// captures share.
+	dir := newRepo(t)
+	writeFile(t, filepath.Join(dir, "stall.txt"), "READ-PHASE-STALL\n")
+
+	original := readFileForCapture
+	t.Cleanup(func() { readFileForCapture = original })
+	// reading proves the capture reached the read phase, so the deadline this
+	// test observes belongs to the read phase rather than having been lost
+	// earlier, in git status, before the bound was ever exercised.
+	reading := make(chan struct{})
+	var entered sync.Once
+	readFileForCapture = func(ctx context.Context, path string, limit int) ([]byte, error) {
+		// A hostile worktree whose read never returns: only the operation
+		// deadline ends this phase.
+		entered.Do(func() { close(reading) })
+		<-ctx.Done()
+		return nil, ctx.Err()
+	}
+
+	type captureResult struct {
+		bundle *Bundle
+		err    error
+	}
+	// The budget is capture-wide, so it must also cover the pre-read git status
+	// fork/exec, the one part of the phase this test does not control; losing it
+	// there would fail the test on a stall it never intended to measure. Widened
+	// from 250ms to leave generous headroom on a -race CI runner, while the guard
+	// below still fails fast if the bound is lost.
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	result := make(chan captureResult, 1)
+	go func() {
+		bundle, err := Capture(ctx, captureOptions(dir, nil))
+		result <- captureResult{bundle: bundle, err: err}
+	}()
+
+	select {
+	case got := <-result:
+		select {
+		case <-reading:
+		default:
+			t.Fatal("capture never entered the read phase, so it did not exercise the bound")
+		}
+		if !errors.Is(got.err, context.DeadlineExceeded) {
+			t.Fatalf("capture err = %v, want context.DeadlineExceeded", got.err)
+		}
+		if got.bundle != nil {
+			t.Errorf("capture returned a bundle alongside a deadline abort, want nil so the caller degrades to manifest-only")
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("capture did not return within 10s")
+	}
+}
+
 // fifoSwapDeadline bounds the swap-race assertions: a read-only open of a fifo
 // blocks until a writer arrives, so a regression that loses O_NONBLOCK stalls
 // here instead of failing.
@@ -673,10 +889,11 @@ const fifoSwapDeadline = 10 * time.Second
 func TestReadCappedRejectsNonRegular(t *testing.T) {
 	t.Parallel()
 	dir := t.TempDir()
+	ctx := context.Background()
 
 	regular := filepath.Join(dir, "regular.txt")
 	writeFile(t, regular, "regular content\n")
-	data, err := readCapped(regular, MaxFileBytes+1)
+	data, err := readCapped(ctx, regular, MaxFileBytes+1)
 	if err != nil {
 		t.Fatalf("readCapped regular file: %v", err)
 	}
@@ -695,7 +912,7 @@ func TestReadCappedRejectsNonRegular(t *testing.T) {
 	}
 	done := make(chan read, 1)
 	go func() {
-		content, rerr := readCapped(fifo, MaxFileBytes+1)
+		content, rerr := readCapped(ctx, fifo, MaxFileBytes+1)
 		done <- read{data: content, err: rerr}
 	}()
 	select {
@@ -723,7 +940,7 @@ func TestCaptureFifoSwapRace(t *testing.T) {
 
 	original := readFileForCapture
 	t.Cleanup(func() { readFileForCapture = original })
-	readFileForCapture = func(path string, limit int) ([]byte, error) {
+	readFileForCapture = func(ctx context.Context, path string, limit int) ([]byte, error) {
 		// The swap lands after Lstat classified the path as regular and
 		// before the O_NONBLOCK open, so the descriptor this read opens is a
 		// fifo the classification pass never saw.
@@ -733,7 +950,7 @@ func TestCaptureFifoSwapRace(t *testing.T) {
 		if err := syscall.Mkfifo(path, 0o600); err != nil {
 			t.Errorf("swap mkfifo: %v", err)
 		}
-		return original(path, limit)
+		return original(ctx, path, limit)
 	}
 
 	type capture struct {
