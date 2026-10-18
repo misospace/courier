@@ -2027,6 +2027,30 @@ named items remain unresolved and must not be described as production-ready:
 - The exact vLLM gauge for backpressure on the target model server.
 
 ## Decisions
+- **2026-10-18 — #439: a preflight probe's name is a readable prefix plus a
+  digest of the whole node name, and a probe is evidence only for the node it
+  is pinned to.** Probe pod names were derived from the node name by
+  normalizing and truncating to 16 characters, so any two nodes sharing that
+  prefix collided: the second create deleted or collided with the first probe
+  and result collection read one pod for both nodes, which could stall
+  admission or certify multi-node isolation without probing the second node
+  at all. A shorter prefix was rejected — it widens the same collision — and
+  so was dropping the readable prefix altogether, because the name stays a
+  Kubernetes object name inside the same 16-character budget: the digest now
+  follows the truncated normalized prefix instead of replacing the empty case,
+  so the total length does not grow and a name that would have hashed
+  something else still reads as the node it belongs to. Punctuation and case
+  that normalization drops no longer conflate nodes either, because the
+  digest covers the original name rather than the normalized one. That makes
+  the name sufficient, so a second guard makes it checkable:
+  `collectProbeResults` refuses a probe pod whose `spec.nodeName` is not the
+  node under test, and a refused probe contributes nothing rather than
+  counting as pending or as coverage — evidence cannot be transferred
+  between nodes by name alone. The refusal stays an ordinary requeueable
+  error even though a real mismatch does not clear on a later pass;
+  terminalizing that verdict is left to a follow-up rather than guessed at
+  here. (#439)
+
 - **2026-10-18 — #375 review: the cited-evidence path extractor takes the
   grammar's path alternative, and the reference pattern is composed from its
   alternatives.** The #367 extractor's `evidencePathCandidatePattern` was a
@@ -2069,6 +2093,7 @@ named items remain unresolved and must not be described as production-ready:
   prove. Rejected: treating any non-zero reap as a failure (every capped run
   would be reported as a failed capture), and discarding the prefix on the
   error path (loses the read that explains the failure).
+
 - **2026-10-18 — #395: adopted-token settlement replays by run-scoped settlement
   identity, not only by the token-derived marker.** Settlement adoption (#388)
   posts the capacity handoff under a marker hashed from the adopted token, but
