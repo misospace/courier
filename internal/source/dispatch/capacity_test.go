@@ -131,7 +131,8 @@ func TestIssueCapacityHandoffLostResponseReplaysFromAudit(t *testing.T) {
 	mu.Lock()
 	gotPosts, gotAudits, gotMarker := posts, audits, marker
 	mu.Unlock()
-	if gotPosts != 1 || gotAudits != 3 || gotMarker != capacityReceiptMarker("issued-a", "stable-key", WorkIdentity(id)) {
+	wantNote := capacityReceiptMarker("issued-a", "stable-key", WorkIdentity(id)) + "; settlement:" + capacitySettlementTag("stable-key", WorkIdentity(id))
+	if gotPosts != 1 || gotAudits != 3 || gotMarker != wantNote {
 		t.Fatalf("posts=%d audits=%d marker=%q", gotPosts, gotAudits, gotMarker)
 	}
 }
@@ -232,8 +233,9 @@ func TestIssueCapacityHandoffAdoptsRotatedClaimToken(t *testing.T) {
 	if posts != 2 || claimPosts != 1 {
 		t.Fatalf("posts=%d claimPosts=%d, want 2 and 1", posts, claimPosts)
 	}
-	if want := "live-b|" + capacityReceiptMarker("live-b", "stable-key", WorkIdentity(id)); len(notes) != 2 || notes[1] != want {
-		t.Fatalf("retry token/marker = %q, want %q", notes, want)
+	wantNote := "live-b|" + capacityReceiptMarker("live-b", "stable-key", WorkIdentity(id)) + "; settlement:" + capacitySettlementTag("stable-key", WorkIdentity(id))
+	if len(notes) != 2 || notes[1] != wantNote {
+		t.Fatalf("retry token/marker = %q, want %q", notes, wantNote)
 	}
 }
 
@@ -273,6 +275,186 @@ func TestIssueCapacityHandoffNeverReclaimsNonRotationRefusal(t *testing.T) {
 	}
 	if claimPosts != 0 {
 		t.Fatalf("claimPosts = %d, want 0; settlement may never re-claim over another owner", claimPosts)
+	}
+}
+
+// TestIssueCapacityHandoffAdoptedLandingReplaysWithoutSecondSettlement is the
+// #395 regression: an adopted-token handoff lands while its success is never
+// persisted (lost response and unconfirmable audit), so the run restarts with
+// its original receipt. Dispatch deletes the lease on a successful handoff and
+// the next claim mints a fresh token, so no token-derived marker from a later
+// pass can ever name the landed row; the settlement identity stamped beside
+// every marker must replay it from durable audit evidence without a second
+// successful handoff POST.
+func TestIssueCapacityHandoffAdoptedLandingReplaysWithoutSecondSettlement(t *testing.T) {
+	id := EncodeWorkID(Task{Type: "implement", Issue: &Issue{ID: "issue-a", Repo: "acme/widgets", Number: 42}})
+	var mu sync.Mutex
+	var posts, claimPosts, audits int
+	var landedNote string
+	auditOutage := true
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/issues/state":
+			_ = json.NewEncoder(w).Encode(map[string]any{"issueId": "issue-a", "repoFullName": "acme/widgets", "number": 42})
+		case "/api/issues/capacity-handoff":
+			var body struct {
+				ClaimToken string `json:"claimToken"`
+				Note       string `json:"note"`
+			}
+			_ = json.NewDecoder(r.Body).Decode(&body)
+			mu.Lock()
+			posts++
+			lands := body.ClaimToken == "live-b"
+			if lands {
+				landedNote = body.Note
+			}
+			mu.Unlock()
+			if !lands {
+				w.WriteHeader(http.StatusConflict)
+				_ = json.NewEncoder(w).Encode(map[string]any{"error": "No active tokened claim for this issue"})
+				return
+			}
+			// The settlement lands and consumes the lease; the confirming
+			// response never arrives intact.
+			_ = json.NewEncoder(w).Encode(map[string]any{})
+		case "/api/issues/claim":
+			mu.Lock()
+			claimPosts++
+			token := "live-b"
+			if claimPosts > 1 {
+				token = "live-c"
+			}
+			mu.Unlock()
+			_ = json.NewEncoder(w).Encode(map[string]any{"claimToken": token})
+		case "/api/audit":
+			mu.Lock()
+			audits++
+			outage, note := auditOutage, landedNote
+			mu.Unlock()
+			if outage {
+				w.WriteHeader(http.StatusInternalServerError)
+				return
+			}
+			if note == "" {
+				_ = json.NewEncoder(w).Encode([]map[string]any{})
+				return
+			}
+			_ = json.NewEncoder(w).Encode([]map[string]any{{"action": "issue_capacity_handoff", "success": true, "repoFullName": "acme/widgets", "issueNumber": 42, "issueId": "issue-a", "notes": "capacity=capacity-a; cooldownUntil=none; lease lease-b released by claim-token fence; " + note}})
+		default:
+			t.Errorf("unexpected path %s", r.URL.Path)
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+	c, err := NewClient(server.URL, "worker-a", "auth", time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	receipt := `{"claimToken":"issued-a"}`
+	handoff := source.CapacityHandoff{FenceToken: "issued-a", WorkIdentity: WorkIdentity(id), CapacityIdentity: "capacity-a", IdempotencyKey: "stable-key"}
+	// Pass one: the receipt fence is gone, adoption posts the handoff, the row
+	// lands, and neither the response nor the audit can confirm it.
+	if err := c.SettleCapacityExhaustion(context.Background(), id, receipt, handoff); err == nil {
+		t.Fatal("unconfirmable settlement must not report success")
+	}
+	mu.Lock()
+	gotPosts, gotClaims, gotAudits := posts, claimPosts, audits
+	mu.Unlock()
+	if gotPosts != 2 || gotClaims != 1 || gotAudits != 4 {
+		t.Fatalf("pass one posts=%d claimPosts=%d audits=%d, want 2, 1, and 4", gotPosts, gotClaims, gotAudits)
+	}
+	// CapacityRecovery=True/Settled was never persisted (patch lost / controller
+	// crash). A restarted controller re-drives settlement from the same receipt;
+	// durable audit evidence must resolve it without posting or claiming again.
+	mu.Lock()
+	auditOutage = false
+	mu.Unlock()
+	c, err = NewClient(server.URL, "worker-a", "auth", time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := c.SettleCapacityExhaustion(context.Background(), id, receipt, handoff); err != nil {
+		t.Fatalf("retry must replay the landed adopted settlement, got %v", err)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if posts != 2 || claimPosts != 1 {
+		t.Fatalf("landed settlement was duplicated: posts=%d claimPosts=%d, want 2 and 1", posts, claimPosts)
+	}
+}
+
+// TestIssueCapacityHandoffAuditReplayIgnoresForeignSettlement keeps the
+// settlement-identity replay attempt-scoped: a landed handoff stamped with a
+// different run's settlement identity for the same issue must not silence this
+// attempt's own settlement.
+func TestIssueCapacityHandoffAuditReplayIgnoresForeignSettlement(t *testing.T) {
+	id := EncodeWorkID(Task{Type: "implement", Issue: &Issue{ID: "issue-a", Repo: "acme/widgets", Number: 42}})
+	foreignNote := capacityReceiptMarker("issued-x", "capacity/ns/other-run/00000000-0000-0000-0000-000000000000", WorkIdentity(id)) +
+		"; settlement:" + capacitySettlementTag("capacity/ns/other-run/00000000-0000-0000-0000-000000000000", WorkIdentity(id))
+	var posts int
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/issues/state":
+			_ = json.NewEncoder(w).Encode(map[string]any{"issueId": "issue-a", "repoFullName": "acme/widgets", "number": 42})
+		case "/api/audit":
+			_ = json.NewEncoder(w).Encode([]map[string]any{{"action": "issue_capacity_handoff", "success": true, "repoFullName": "acme/widgets", "issueNumber": 42, "issueId": "issue-a", "notes": "capacity=capacity-a; cooldownUntil=none; lease lease-x released by claim-token fence; " + foreignNote}})
+		case "/api/issues/capacity-handoff":
+			posts++
+			_ = json.NewEncoder(w).Encode(map[string]any{"success": true})
+		default:
+			t.Errorf("unexpected path %s", r.URL.Path)
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+	c, err := NewClient(server.URL, "worker-a", "auth", time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	receipt := `{"claimToken":"issued-a"}`
+	handoff := source.CapacityHandoff{FenceToken: "issued-a", WorkIdentity: WorkIdentity(id), CapacityIdentity: "capacity-a", IdempotencyKey: "stable-key"}
+	if err := c.SettleCapacityExhaustion(context.Background(), id, receipt, handoff); err != nil {
+		t.Fatalf("a foreign settlement identity must not replay as this attempt's success: %v", err)
+	}
+	if posts != 1 {
+		t.Fatalf("posts = %d, want 1; this attempt's settlement must still be posted", posts)
+	}
+}
+
+// TestIssueCapacityHandoffAuditReplayMatchesLegacyReceiptNote pins the upgrade
+// path: rows written before the settlement tag existed carry only the
+// token-specific marker, and a pass holding that token must still replay them
+// without posting again.
+func TestIssueCapacityHandoffAuditReplayMatchesLegacyReceiptNote(t *testing.T) {
+	id := EncodeWorkID(Task{Type: "implement", Issue: &Issue{ID: "issue-a", Repo: "acme/widgets", Number: 42}})
+	legacyNote := capacityReceiptMarker("issued-a", "stable-key", WorkIdentity(id))
+	var posts int
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/issues/state":
+			_ = json.NewEncoder(w).Encode(map[string]any{"issueId": "issue-a", "repoFullName": "acme/widgets", "number": 42})
+		case "/api/audit":
+			_ = json.NewEncoder(w).Encode([]map[string]any{{"action": "issue_capacity_handoff", "success": true, "repoFullName": "acme/widgets", "issueNumber": 42, "issueId": "issue-a", "notes": "capacity=capacity-a; cooldownUntil=none; lease lease-a released by claim-token fence; " + legacyNote}})
+		case "/api/issues/capacity-handoff":
+			posts++
+			_ = json.NewEncoder(w).Encode(map[string]any{"success": true})
+		default:
+			t.Errorf("unexpected path %s", r.URL.Path)
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+	c, err := NewClient(server.URL, "worker-a", "auth", time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	receipt := `{"claimToken":"issued-a"}`
+	handoff := source.CapacityHandoff{FenceToken: "issued-a", WorkIdentity: WorkIdentity(id), CapacityIdentity: "capacity-a", IdempotencyKey: "stable-key"}
+	if err := c.SettleCapacityExhaustion(context.Background(), id, receipt, handoff); err != nil {
+		t.Fatalf("legacy receipt note must still replay: %v", err)
+	}
+	if posts != 0 {
+		t.Fatalf("posts = %d, want 0; replays must never post again", posts)
 	}
 }
 

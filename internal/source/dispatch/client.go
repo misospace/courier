@@ -400,11 +400,16 @@ func (c *HTTPClient) SettleCapacityExhaustion(ctx context.Context, id, opaqueCon
 			return source.ErrUnsupportedCapacityRecovery
 		}
 		marker := capacityReceiptMarker(handoff.FenceToken, handoff.IdempotencyKey, handoff.WorkIdentity)
-		if c.issueCapacityHandoffAudited(ctx, d, marker) {
+		settlement := capacitySettlementTag(handoff.IdempotencyKey, handoff.WorkIdentity)
+		if c.issueCapacityHandoffAudited(ctx, d, marker, settlement) {
 			return nil
 		}
 		postHandoff := func(claimToken, receiptMarker string) error {
-			body := map[string]any{"issueId": d.IssueID, "repoFullName": d.IssueRepo, "issueNumber": d.IssueNumber, "agentName": c.agentName, "claimToken": claimToken, "capacity": handoff.CapacityIdentity, "note": receiptMarker}
+			note := receiptMarker
+			if settlement != "" {
+				note += "; settlement:" + settlement
+			}
+			body := map[string]any{"issueId": d.IssueID, "repoFullName": d.IssueRepo, "issueNumber": d.IssueNumber, "agentName": c.agentName, "claimToken": claimToken, "capacity": handoff.CapacityIdentity, "note": note}
 			var response struct {
 				Success bool `json:"success"`
 			}
@@ -420,7 +425,7 @@ func (c *HTTPClient) SettleCapacityExhaustion(ctx context.Context, id, opaqueCon
 		if err == nil {
 			return nil
 		}
-		if c.issueCapacityHandoffAudited(ctx, d, marker) {
+		if c.issueCapacityHandoffAudited(ctx, d, marker, settlement) {
 			return nil
 		}
 		// Claim churn around admission rotates the lease token after the run's
@@ -434,12 +439,12 @@ func (c *HTTPClient) SettleCapacityExhaustion(ctx context.Context, id, opaqueCon
 		if claimLeaseRotated(err) {
 			if adopted, adoptErr := c.reacquireClaimToken(ctx, d); adoptErr == nil && adopted != "" && adopted != handoff.FenceToken {
 				adoptedMarker := capacityReceiptMarker(adopted, handoff.IdempotencyKey, handoff.WorkIdentity)
-				if c.issueCapacityHandoffAudited(ctx, d, adoptedMarker) {
+				if c.issueCapacityHandoffAudited(ctx, d, adoptedMarker, settlement) {
 					return nil
 				}
 				if retryErr := postHandoff(adopted, adoptedMarker); retryErr == nil {
 					return nil
-				} else if c.issueCapacityHandoffAudited(ctx, d, adoptedMarker) {
+				} else if c.issueCapacityHandoffAudited(ctx, d, adoptedMarker, settlement) {
 					return nil
 				} else {
 					return classifyCapacityHandoff(retryErr)
@@ -473,6 +478,23 @@ func capacityReceiptMarker(claimToken, idempotencyKey, workIdentity string) stri
 	return fmt.Sprintf("capacity-receipt:%x", sum[:])
 }
 
+// capacitySettlementTag is the token-independent identity of one settlement
+// attempt, stamped onto every receipt note beside the token-specific marker.
+// A handoff that lands under an adopted token while its success is never
+// persisted (lost response, controller crash) would otherwise be invisible to
+// later passes, whose receipt still names the original token and whose re-claim
+// mints a third one — each pass deriving a fresh marker and posting a duplicate
+// settlement (#395). The tag lets any pass replay the landed row from durable
+// audit evidence without conflating a previous settlement: the key is the run's
+// settlement identity, unique per attempt, and only this adapter writes it.
+func capacitySettlementTag(idempotencyKey, workIdentity string) string {
+	if idempotencyKey == "" {
+		return ""
+	}
+	sum := sha256.Sum256([]byte("settlement\x00" + idempotencyKey + "\x00" + workIdentity))
+	return fmt.Sprintf("%x", sum[:])
+}
+
 type capacityAuditEntry struct {
 	Action      string `json:"action"`
 	Success     bool   `json:"success"`
@@ -482,15 +504,21 @@ type capacityAuditEntry struct {
 	Notes       string `json:"notes"`
 }
 
-func (c *HTTPClient) issueCapacityHandoffAudited(ctx context.Context, d workDescriptor, marker string) bool {
+func (c *HTTPClient) issueCapacityHandoffAudited(ctx context.Context, d workDescriptor, marker, settlement string) bool {
 	endpoint := "/api/audit?repo=" + url.QueryEscape(d.IssueRepo) + "&limit=100"
 	var entries []capacityAuditEntry
 	if err := c.do(ctx, http.MethodGet, endpoint, nil, &entries); err != nil {
 		return false
 	}
 	for _, entry := range entries {
-		if entry.Action == "issue_capacity_handoff" && entry.Success && entry.Repo == d.IssueRepo && entry.IssueNumber == d.IssueNumber && entry.IssueID == d.IssueID && (entry.Notes == marker || strings.HasSuffix(entry.Notes, "; "+marker)) {
-			return true
+		if entry.Action == "issue_capacity_handoff" && entry.Success && entry.Repo == d.IssueRepo && entry.IssueNumber == d.IssueNumber && entry.IssueID == d.IssueID {
+			// A note carries this settlement if it holds the receipt marker for
+			// a token this pass knows (legacy notes held only the marker), or
+			// the settlement tag written under any token (#395).
+			if entry.Notes == marker || strings.HasSuffix(entry.Notes, "; "+marker) ||
+				(settlement != "" && strings.HasSuffix(entry.Notes, "; settlement:"+settlement)) {
+				return true
+			}
 		}
 	}
 	return false
