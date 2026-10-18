@@ -274,7 +274,8 @@ func TestBootstrapAndEnvCaptureScripts(t *testing.T) {
 	}
 	for _, want := range []string{
 		"base='" + oid + "'",
-		"git archive \"$base\" | tar -x -C \"$src\"",
+		"git archive --format=tar -o \"$archive\" \"$base\"",
+		"tar -xf \"$archive\" -C \"$src\"",
 		"test -f \"$src/" + ConfigPath + "\"",
 		"cd \"$src\"",
 		"mise run bootstrap",
@@ -288,7 +289,7 @@ func TestBootstrapAndEnvCaptureScripts(t *testing.T) {
 	// after the bootstrap run, so the terminal emission is last in the
 	// captured stdout tail on success and on every failure path.
 	if strings.Count(bootstrap, "courier_diag || true") != 1 ||
-		!strings.Contains(bootstrap, `trap 'rc=$?; rm -rf "$src" || true; courier_diag || true; exit "$rc"' EXIT`) ||
+		!strings.Contains(bootstrap, `trap 'rc=$?; rm -rf "$src" "$archive" || true; courier_diag || true; exit "$rc"' EXIT`) ||
 		!strings.HasSuffix(bootstrap, "mise run bootstrap\n") {
 		t.Errorf("BootstrapScript = %q, want a single terminal EXIT-trap emission after the bootstrap run", bootstrap)
 	}
@@ -299,7 +300,8 @@ func TestBootstrapAndEnvCaptureScripts(t *testing.T) {
 	}
 	for _, want := range []string{
 		"base='" + oid + "'",
-		"git archive \"$base\" | tar -x -C \"$src\"",
+		"git archive --format=tar -o \"$archive\" \"$base\"",
+		"tar -xf \"$archive\" -C \"$src\"",
 		"test -f \"$src/" + ConfigPath + "\"",
 		"cd \"$src\"",
 		"mise x -- env -0 > \"$capture\"",
@@ -619,6 +621,64 @@ func TestScriptsExecuteForReal(t *testing.T) {
 			if !strings.Contains(stdout, key) {
 				t.Errorf("failure-path stdout missing diagnostic %q:\n%s", key, stdout)
 			}
+		}
+	})
+
+	t.Run("archive failure after partial output fails closed", func(t *testing.T) {
+		binDir := miseStandIn(t, t.TempDir(), "")
+		// A git stand-in for a corrupted object store: it writes a valid
+		// tar carrying the contract file to the -o path (the partial
+		// archive a mid-stream object failure emits) and then exits
+		// nonzero. A pipeline would hand tar the partial archive and
+		// discard this exit status; the guarded two-step must fail the
+		// task before extraction, so mise never runs against the partial
+		// tree even though the contract file is present in it.
+		gitStub := "#!/bin/sh\n" +
+			"out=\"\"\n" +
+			"prev=\"\"\n" +
+			"for a in \"$@\"; do\n" +
+			"  if [ \"$prev\" = \"-o\" ]; then out=\"$a\"; fi\n" +
+			"  prev=\"$a\"\n" +
+			"done\n" +
+			"stage=\"$(mktemp -d)\"\n" +
+			"mkdir -p \"$stage/.mise\"\n" +
+			"printf '[tasks.bootstrap]\\n' > \"$stage/.mise/config.toml\"\n" +
+			// Emit the archive on whichever channel the caller asked
+			// for: the -o file when given, stdout otherwise. The
+			// stdout branch reproduces the pre-fix pipeline's stream,
+			// so swapping in the pre-fix script demonstrates this
+			// exact failure against the same stand-in.
+			"if [ -n \"$out\" ]; then\n" +
+			"  tar -cf \"$out\" -C \"$stage\" .mise\n" +
+			"else\n" +
+			"  tar -cf - -C \"$stage\" .mise\n" +
+			"fi\n" +
+			"rm -rf \"$stage\"\n" +
+			"exit 1\n"
+		if err := os.WriteFile(filepath.Join(binDir, "git"), []byte(gitStub), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		scratch := filepath.Join(t.TempDir(), "tmp")
+		if err := os.MkdirAll(scratch, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		script, err := BootstrapScript(baseOID)
+		if err != nil {
+			t.Fatalf("BootstrapScript: %v", err)
+		}
+		stdout, runErr := runScript(t, script, repo, binDir, scratch)
+		if runErr == nil {
+			t.Fatal("a git archive that fails after emitting a partial archive must fail the task")
+		}
+		if strings.Contains(stdout, "bootstrap-ran") {
+			t.Errorf("mise ran against the partial materialization:\n%s", stdout)
+		}
+		entries, err := os.ReadDir(scratch)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(entries) != 0 {
+			t.Errorf("materialization or archive survived the EXIT trap: %v", entries)
 		}
 	})
 }

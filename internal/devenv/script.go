@@ -33,14 +33,18 @@ func validBaseOID(baseOID string) bool {
 // BootstrapScript returns the fixed POSIX sh bootstrap task script for the
 // operator-approved base revision baseOID. The script NEVER runs the
 // contract from the worker's head working tree: it materializes the base
-// revision from the git object store (`git archive` piped to tar), proves
+// revision from the git object store in two guarded steps — `git archive`
+// writes a tar to a temporary file, and only after that command succeeds
+// does `tar -x` extract it (a pipeline would discard git's exit status in
+// POSIX sh, so an archive that failed after emitting part of the tree —
+// including the contract file — could otherwise leave mise running against
+// an incomplete base with the `test -f` guard still passing) — then proves
 // the materialization actually happened with `test -f` on the contract file
-// (a `git archive` failure piped to tar without pipefail would otherwise
-// yield an empty directory, and the environment capture in an empty
-// directory must never succeed into a degenerate delta), and runs
-// `mise run bootstrap` inside it. Whatever mise discovers — configs, conf.d
-// fragments, task directories, includes — therefore comes from the approved
-// base revision by construction; mise's task discovery cannot reach head
+// (the environment capture in an empty directory must never succeed into a
+// degenerate delta), and runs `mise run bootstrap` inside it. Whatever mise
+// discovers — configs, conf.d fragments, task directories, includes —
+// therefore comes from the approved base revision by construction; mise's
+// task discovery cannot reach head
 // content, whatever surfaces it reads. Classify guarantees the contract
 // exists at base whenever this script is dispatched: the script is only
 // built and dispatched for a StateApproved snapshot, and an approved state
@@ -82,8 +86,10 @@ func BootstrapScript(baseOID string) (string, error) {
 		// The trap is the single terminal emission: it runs last on success
 		// and on every failure path, preserves the original exit code, and
 		// neither a failing cleanup nor a failing diag can change it.
-		"trap 'rc=$?; rm -rf \"$src\" || true; courier_diag || true; exit \"$rc\"' EXIT\n" +
-		"git archive \"$base\" | tar -x -C \"$src\"\n" +
+		"archive=\"$(mktemp)\"\n" +
+		"trap 'rc=$?; rm -rf \"$src\" \"$archive\" || true; courier_diag || true; exit \"$rc\"' EXIT\n" +
+		"git archive --format=tar -o \"$archive\" \"$base\"\n" +
+		"tar -xf \"$archive\" -C \"$src\"\n" +
 		"test -f \"$src/" + ConfigPath + "\"\n" +
 		"cd \"$src\"\n" +
 		"mise run bootstrap\n", nil
@@ -111,8 +117,10 @@ func EnvCaptureScript(baseOID string) (string, error) {
 		"base='" + baseOID + "'\n" +
 		"src=\"$(mktemp -d)\"\n" +
 		"capture=\"$(mktemp)\"\n" +
-		"trap 'rm -rf \"$src\" \"$capture\" || true' EXIT\n" +
-		"git archive \"$base\" | tar -x -C \"$src\"\n" +
+		"archive=\"$(mktemp)\"\n" +
+		"trap 'rm -rf \"$src\" \"$capture\" \"$archive\" || true' EXIT\n" +
+		"git archive --format=tar -o \"$archive\" \"$base\"\n" +
+		"tar -xf \"$archive\" -C \"$src\"\n" +
 		"test -f \"$src/" + ConfigPath + "\"\n" +
 		"cd \"$src\"\n" +
 		"mise x -- env -0 > \"$capture\"\n" +

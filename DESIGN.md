@@ -1165,8 +1165,10 @@ and the legacy executor's classification through `internal/devenv`:
   comparison is the APPROVAL GATE only: a contract modified in a PR is an
   untrusted modification and is skipped, never executed. What actually
   executes is never the head's bytes — the secure worker materializes the
-  approved base revision from the git object store (`git archive` piped to
-  tar), verifies the contract file exists in the materialization, and runs
+  approved base revision from the git object store (`git archive` to a
+  temporary tar, extracted only after the command succeeds, so a failed
+  archive can never leave a partial tree behind a successful extractor),
+  verifies the contract file exists in the materialization, and runs
   `mise run bootstrap` inside it — so the executed bytes are the approved
   base revision's bytes BY CONSTRUCTION, and mise's task discovery (config
   fragments, `conf.d`, task directories, includes, whatever surfaces it
@@ -4508,7 +4510,9 @@ earns a 401 that is classified as a definite denial (superseded by #406: a
   through its target) and byte-identical between base and head. What
   executes is then the approved base revision's bytes BY CONSTRUCTION, not
   a pinned enumeration: the secure worker materializes the base revision
-  from the git object store (`git archive` piped to tar), verifies the
+  from the git object store (`git archive` to a temporary tar, extracted
+  only after the command succeeds, so a failed archive can never leave a
+  partial tree behind a successful extractor), verifies the
   contract file exists in the materialization, and runs `mise run
   bootstrap` / `mise x -- env -0` inside it — so mise's task discovery
   (configs, conf.d fragments, task directories, includes) cannot reach head
