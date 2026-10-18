@@ -1307,10 +1307,12 @@ enforcement + `session.compacted` emitter). #297 has landed: the session loop
 calls the policy between turns and never mid-turn, per-role budgets are
 resolved once in `NewCoordinator` from an injected `ContextBudgets` map, a
 digest that cannot fit fails the run rather than truncating, and
-`courier-control` emits `session.compacted`. A role with no resolved budget
+`courier-control` emits `session.compacted`. #295 has landed: the declared
+schema is a real CRD field (`LaneProfileSpec.context` plus the `bootstrap.Profile`
+mirror). A role with no resolved budget
 still owns no policy and never compacts: #296 supplies the verified side, but
-nothing populates `ContextBudgets` until #295's declared schema lands, so no
-production session carries a budget yet.
+nothing populates `ContextBudgets` from a lane yet, so no
+production session carries a budget.
 
 ## 6. Long-tool liveness contract (#119)
 

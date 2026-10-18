@@ -784,6 +784,95 @@ func envtestRunInNamespace(name, lane, namespace string) *courierv1alpha1.CoderR
 	}
 }
 
+// TestEnvtestLaneProfileContextRoundTrip pins the declared context budget
+// (#295) against the real API server: a declared policy round-trips with the
+// CRD default applied to the policy-level fraction, per-role unset fields
+// stay zero so they inherit the lane policy, and out-of-range or negative
+// declarations are rejected by the schema rather than stored.
+func TestEnvtestLaneProfileContextRoundTrip(t *testing.T) {
+	if envtestClient == nil {
+		t.Skip("KUBEBUILDER_ASSETS is not set")
+	}
+	ctx := context.Background()
+	lane := envtestLane("context-round-trip")
+	lane.Spec.Context = &courierv1alpha1.ContextPolicy{
+		OutputReservation: 8192,
+		Roles: map[string]courierv1alpha1.ContextBudget{
+			"coder":    {MaxInputTokens: 200000, OutputReservation: 24576},
+			"reviewer": {MaxInputTokens: 100000},
+		},
+	}
+	if err := envtestClient.Create(ctx, lane); err != nil {
+		t.Fatal(err)
+	}
+	var got courierv1alpha1.LaneProfile
+	if err := envtestClient.Get(ctx, envtestKey("context-round-trip"), &got); err != nil {
+		t.Fatal(err)
+	}
+	declared := got.Spec.Context
+	if declared == nil {
+		t.Fatal("spec.context lost through the API server")
+	}
+	if declared.CompactAtPercent != 75 {
+		t.Fatalf("policy compactAtPercent = %d, want the CRD default 75", declared.CompactAtPercent)
+	}
+	if declared.OutputReservation != 8192 {
+		t.Fatalf("policy outputReservation = %d, want 8192", declared.OutputReservation)
+	}
+	coder := declared.Roles["coder"]
+	if coder.MaxInputTokens != 200000 || coder.OutputReservation != 24576 || coder.CompactAtPercent != 0 {
+		t.Fatalf("coder budget = %#v, want the declared ceiling and override with the fraction left zero to inherit", coder)
+	}
+	if reviewer := declared.Roles["reviewer"]; reviewer.MaxInputTokens != 100000 || reviewer.CompactAtPercent != 0 {
+		t.Fatalf("reviewer budget = %#v, want the declared ceiling with the fraction inherited", reviewer)
+	}
+
+	for name, bad := range map[string]courierv1alpha1.ContextPolicy{
+		"percent-over-max": {CompactAtPercent: 100},
+		"percent-negative": {CompactAtPercent: -5},
+		"reservation-neg":  {OutputReservation: -1},
+	} {
+		item := envtestLane("context-bad-" + name)
+		declaredCopy := bad
+		item.Spec.Context = &declaredCopy
+		err := envtestClient.Create(ctx, item)
+		if err == nil {
+			t.Fatalf("context %+v stored, want schema rejection", bad)
+		}
+		if !apierrors.IsInvalid(err) && !apierrors.IsBadRequest(err) {
+			t.Fatalf("error = %v, want an invalid-object rejection", err)
+		}
+	}
+	for name, bad := range map[string]courierv1alpha1.ContextBudget{
+		"role-percent-over-max": {CompactAtPercent: 100},
+		"role-ceiling-zero":     {},
+		"role-reservation-neg":  {OutputReservation: -1},
+	} {
+		item := envtestLane("context-bad-role-" + name)
+		zero := bad
+		if name == "role-ceiling-zero" {
+			zero = courierv1alpha1.ContextBudget{MaxInputTokens: 0}
+		}
+		item.Spec.Context = &courierv1alpha1.ContextPolicy{Roles: map[string]courierv1alpha1.ContextBudget{"coder": zero}}
+		err := envtestClient.Create(ctx, item)
+		if name == "role-ceiling-zero" {
+			// A fully unset per-role entry is legal: it inherits and declares
+			// nothing. Explicit zeros are omitted on the wire, so this is the
+			// same object as `coder: {}`.
+			if err != nil {
+				t.Fatalf("empty per-role budget rejected: %v", err)
+			}
+			continue
+		}
+		if err == nil {
+			t.Fatalf("role budget %+v stored, want schema rejection", bad)
+		}
+		if !apierrors.IsInvalid(err) && !apierrors.IsBadRequest(err) {
+			t.Fatalf("error = %v, want an invalid-object rejection", err)
+		}
+	}
+}
+
 func envtestLane(name string) *courierv1alpha1.LaneProfile {
 	return envtestLaneInNamespace(name, "default")
 }
