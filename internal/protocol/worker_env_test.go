@@ -58,6 +58,17 @@ func TestWorkerBootstrapEnvProtectedKeysNeverReachTheChild(t *testing.T) {
 	// worker's own environment carries; the same protection covers
 	// GIT_CONFIG_COUNT and LD_PRELOAD. IFS is protected too and is likewise
 	// reset by the shell itself, so it can never be observed as overridden.
+	// COURIER_MODEL is pinned to a pod value so the check exercises
+	// protection against a set base and does not depend on the ambient
+	// environment; the other keys' expected child values mirror whatever
+	// the worker inherits, the same way the shell's ${VAR-unset} does.
+	t.Setenv("COURIER_MODEL", "pod-value")
+	shellOrUnset := func(key string) string {
+		if _, ok := os.LookupEnv(key); !ok {
+			return "unset"
+		}
+		return os.Getenv(key)
+	}
 	result := dispatchTaskEnv(t, Task{
 		Command: []string{"sh", "-c", `printf '%s' "count=${GIT_CONFIG_COUNT-unset} model=${COURIER_MODEL-unset} preload=${LD_PRELOAD-unset}"`},
 		Env: []string{
@@ -71,7 +82,7 @@ func TestWorkerBootstrapEnvProtectedKeysNeverReachTheChild(t *testing.T) {
 	if result.Status != ResultCompleted || result.ExitCode != 0 {
 		t.Fatalf("result = %+v, want completed", result)
 	}
-	want := "count=unset model=" + os.Getenv("COURIER_MODEL") + " preload=unset"
+	want := "count=" + shellOrUnset("GIT_CONFIG_COUNT") + " model=pod-value preload=" + shellOrUnset("LD_PRELOAD")
 	if result.StdoutTail != want {
 		t.Fatalf("child environment = %q, want %q (protected keys not overridden)", result.StdoutTail, want)
 	}
