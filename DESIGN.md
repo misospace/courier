@@ -4154,7 +4154,7 @@ earns a 401 that is classified as a definite denial (superseded by #406: a
   limits; no resolution, trigger, or preservation logic moved into the API.
   Nothing yet populates `CoordinatorConfig.ContextBudgets` from the lane —
   that population remains follow-up wiring and must key the map by declared
-     roles only, per #296's gate predicate. (#295, #243, #296)
+  roles only, per #296's gate predicate. (#295, #243, #296)
 - **2026-10-18 — #336: the classified-regular capture read refuses a non-regular
   descriptor rather than blocking on it.** `Capture` classifies each changed path
   with `os.Lstat` and reads a path classified regular through `readCapped`, which
@@ -4185,4 +4185,4 @@ earns a 401 that is classified as a definite denial (superseded by #406: a
   needs to cover. `O_NONBLOCK` is a no-op for those regular files. Regression
   tests: `TestReadCappedRejectsNonRegular` and `TestCaptureFifoSwapRace`, both
   asserting non-blocking with a deadline guard so losing `O_NONBLOCK` fails
-
+  rather than hangs the suite. (#336, #389; composes with #237, #390)
