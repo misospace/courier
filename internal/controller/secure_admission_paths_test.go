@@ -194,8 +194,9 @@ func TestLiveProbeCreateClassifiesOnlyPermanentRejection(t *testing.T) {
 			control, c := secureControl(t)
 			run := secureRun("live-" + name)
 			probeClusterFixture(t, c, run)
+			probe := topology.ProbePod(run, "node-a", control.Config.ProbeImage, "true", courier.DefaultPodResources()).Name
 			rejectPodCreates(t, control, func(podName string) error {
-				if strings.HasSuffix(podName, "-probe-node-a") {
+				if podName == probe {
 					return test.rejection
 				}
 				return nil
