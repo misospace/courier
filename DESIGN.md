@@ -1367,9 +1367,9 @@ probe pod: its sizing is fixed (10m CPU / 32Mi memory requested, no limits) and
 does not follow the lane, because preflight creates one probe per eligible node
 simultaneously and a seconds-lived network check reserving lane-scale capacity
 can stay Pending on a request-tight cluster and wedge preflight; the fixed
-finite requests keep it schedulable and never BestEffort. A lane that configures
-neither half gets the default
-whole; a limits-only lane gets the default requests; a requests-only lane is
+finite requests keep it schedulable and never BestEffort. A lane that
+configures neither half gets the default whole; a limits-only lane gets the
+default requests; a requests-only lane is
 rendered with exactly its own requests plus the floored halves, so its pods
 really do run limit-less by its own choice. One consequence: a limit below the
 floored default request (say `limits.cpu: 100m` on a lane that sets no
