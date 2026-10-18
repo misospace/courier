@@ -53,12 +53,16 @@ func EffectivePodResources(in corev1.ResourceRequirements) corev1.ResourceRequir
 }
 
 // EffectiveResources returns the lane's configured pod resources under
-// Courier's sizing policy (see EffectivePodResources): the configured value
-// with finite CPU and memory requests guaranteed, or the built-in default
-// when the lane configures none. A nil spec is a lane that configures none.
+// Courier's sizing policy (see EffectivePodResources): the narrowed lane
+// vocabulary with finite CPU and memory requests guaranteed, or the built-in
+// default when the lane configures none. A nil spec is a lane that configures
+// none. The result never aliases the LaneProfile's cached resource maps.
 func (s *LaneProfileSpec) EffectiveResources() corev1.ResourceRequirements {
 	if s == nil {
 		return DefaultPodResources()
 	}
-	return EffectivePodResources(s.Resources)
+	return EffectivePodResources(corev1.ResourceRequirements{
+		Requests: s.Resources.Requests,
+		Limits:   s.Resources.Limits,
+	})
 }

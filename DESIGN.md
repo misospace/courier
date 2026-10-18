@@ -1355,10 +1355,22 @@ capability seam, not a Go or Kubernetes requirement: a lane can select a
 repository-specific image containing whatever tools its workflow needs, while
 the deployment default remains the minimal bootstrap image.
 
-`resources` is the lane's pod sizing, and the only source of it. Limits are
-used exactly as written and may be omitted; requests keep whatever the lane
-configured, but CPU and memory requests are floored to Courier's built-in
-default (250m/512Mi requested, 2 CPU/4Gi limited) wherever they are absent or
+`resources` is the lane's pod sizing, and the only source of it. The lane
+vocabulary is a deliberate subset of `corev1.ResourceRequirements`:
+`resources.claims` is not expressible in the CRD because no Courier renderer sets
+`pod.spec.resourceClaims`, so a lane cannot configure a value Courier would
+ignore or that would only fail at pod admission (#403). A LaneProfile stored
+before the narrowing keeps a claims field in etcd until its next write, where
+the API server prunes it; reads drop it silently, which is exactly how a
+claims-only lane behaved before, so nothing regresses. Every requests/limits
+key is honoured, subject only to the CPU and memory request floor described
+below: extended-resource keys pass through to pods and ride normal Kubernetes
+scheduling and quota semantics, and since Kubernetes requires an extended
+resource's requests and limits to match, a key in one map without the other
+makes every pod on the lane invalid at admission. Limits are used exactly as
+written and may be omitted; requests keep whatever the lane configured, but CPU
+and memory requests are floored to Courier's built-in default (250m/512Mi
+requested, 2 CPU/4Gi limited) wherever they are absent or
 non-positive — so every Courier-created pod, the coordinator and the secure
 topology's control, worker, broker, and probe pods, carries finite CPU and
 memory requests whatever the lane says, which lets the scheduler bin-pack,
@@ -2027,6 +2039,13 @@ named items remain unresolved and must not be described as production-ready:
 - The exact vLLM gauge for backpressure on the target model server.
 
 ## Decisions
+- **2026-10-18 — #403: the lane's resources vocabulary is a deliberate subset of
+  ResourceRequirements.** Claims accepted-but-ignored was an invisible failure
+  mode: a claims-only lane silently got the default, while claims plus requests
+  reached the API server invalid. Narrowing makes the CRD unable to express what
+  Courier ignores, so the CRD itself documents the supported vocabulary. This
+  amends #356's vocabulary, not its policy: the floor and PodAdmission
+  classification are unchanged. (#403)
 - **2026-10-18 — #395: adopted-token settlement replays by run-scoped settlement
   identity, not only by the token-derived marker.** Settlement adoption (#388)
   posts the capacity handoff under a marker hashed from the adopted token, but

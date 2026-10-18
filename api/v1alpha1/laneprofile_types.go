@@ -14,6 +14,31 @@ import (
 // toggle it with kubectl without contending with the manifest's owner.
 const SuspendAnnotation = "courier.misospace.dev/suspend"
 
+// PodResources is Courier's pod-sizing vocabulary, a deliberate subset of
+// corev1.ResourceRequirements. The CRD cannot express resource.claims because
+// no Courier renderer sets pod.spec.resourceClaims, so a claim a lane could
+// write would either be silently ignored (a claims-only lane reads as
+// unconfigured and gets the default) or fail at pod admission; making it
+// inexpressible means the CRD itself documents what Courier honours. Every
+// key under requests and limits is honoured, subject only to the CPU and
+// memory request floor described on the fields: extended-resource keys such
+// as nvidia.com/gpu pass through to the pod and use normal Kubernetes
+// scheduling and quota semantics, and since Kubernetes requires an extended
+// resource's requests and limits to match, a key in one map without the
+// other makes every pod on the lane invalid at admission.
+type PodResources struct {
+	// Requests are the resources each pod on this lane requests. CPU and
+	// memory requests are floored to the built-in default wherever absent or
+	// non-positive (see EffectivePodResources); other keys are used as
+	// written.
+	// +optional
+	Requests corev1.ResourceList `json:"requests,omitempty"`
+	// Limits are the resources each pod on this lane is limited to, exactly
+	// as written. Omitting limits is a documented operator choice.
+	// +optional
+	Limits corev1.ResourceList `json:"limits,omitempty"`
+}
+
 // LaneProfileSpec defines a reusable model ensemble and its runtime framing.
 // It is the seam that keeps Courier model-agnostic: roles may name cloud or
 // local models in any mix, and nothing about a lane is baked into the core.
@@ -52,14 +77,15 @@ type LaneProfileSpec struct {
 	// +kubebuilder:validation:MaxLength=253
 	CapacityGroup string `json:"capacityGroup,omitempty"`
 
-	// Resources sizes the pods Courier creates for runs on this lane. Limits
-	// are used exactly as written and may be omitted; requests keep what the
-	// lane sets, but CPU and memory requests are floored to the built-in
-	// default wherever they are absent or non-positive, so no lane is
-	// BestEffort. A lane that configures nothing gets the default whole (see
-	// DefaultPodResources).
+	// Resources sizes the pods Courier creates for runs on this lane using
+	// Courier's narrowed pod-sizing vocabulary: claims are not expressible and
+	// requests/limits keys are honoured verbatim. Limits are used exactly as
+	// written and may be omitted; requests keep what the lane sets, but CPU and
+	// memory requests are floored to the built-in default wherever they are
+	// absent or non-positive, so no lane is BestEffort. A lane that configures
+	// nothing gets the default whole (see DefaultPodResources).
 	// +optional
-	Resources corev1.ResourceRequirements `json:"resources,omitempty"`
+	Resources PodResources `json:"resources,omitempty"`
 }
 
 // CapacityCooldown is a durable pause on new work for one execution-capacity

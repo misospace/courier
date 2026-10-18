@@ -80,44 +80,14 @@ spec:
                 type: string
               resources:
                 description: |-
-                  Resources sizes the pods Courier creates for runs on this lane. Limits
-                  are used exactly as written and may be omitted; requests keep what the
-                  lane sets, but CPU and memory requests are floored to the built-in
-                  default wherever they are absent or non-positive, so no lane is
-                  BestEffort. A lane that configures nothing gets the default whole (see
-                  DefaultPodResources).
+                  Resources sizes the pods Courier creates for runs on this lane using
+                  Courier's narrowed pod-sizing vocabulary: claims are not expressible and
+                  requests/limits keys are honoured verbatim. Limits are used exactly as
+                  written and may be omitted; requests keep what the lane sets, but CPU and
+                  memory requests are floored to the built-in default wherever they are
+                  absent or non-positive, so no lane is BestEffort. A lane that configures
+                  nothing gets the default whole (see DefaultPodResources).
                 properties:
-                  claims:
-                    description: |-
-                      Claims lists the names of resources, defined in spec.resourceClaims,
-                      that are used by this container.
-
-                      This field depends on the
-                      DynamicResourceAllocation feature gate.
-
-                      This field is immutable. It can only be set for containers.
-                    items:
-                      description: ResourceClaim references one entry in PodSpec.ResourceClaims.
-                      properties:
-                        name:
-                          description: |-
-                            Name must match the name of one entry in pod.spec.resourceClaims of
-                            the Pod where this field is used. It makes that resource available
-                            inside a container.
-                          type: string
-                        request:
-                          description: |-
-                            Request is the name chosen for a request in the referenced claim.
-                            If empty, everything from the claim is made available, otherwise
-                            only the result of this request.
-                          type: string
-                      required:
-                      - name
-                      type: object
-                    type: array
-                    x-kubernetes-list-map-keys:
-                    - name
-                    x-kubernetes-list-type: map
                   limits:
                     additionalProperties:
                       anyOf:
@@ -126,8 +96,8 @@ spec:
                       pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
                       x-kubernetes-int-or-string: true
                     description: |-
-                      Limits describes the maximum amount of compute resources allowed.
-                      More info: https://kubernetes.io/docs/concepts/configuration/manage-resources-containers/
+                      Limits are the resources each pod on this lane is limited to, exactly
+                      as written. Omitting limits is a documented operator choice.
                     type: object
                   requests:
                     additionalProperties:
@@ -137,10 +107,10 @@ spec:
                       pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
                       x-kubernetes-int-or-string: true
                     description: |-
-                      Requests describes the minimum amount of compute resources required.
-                      If Requests is omitted for a container, it defaults to Limits if that is explicitly specified,
-                      otherwise to an implementation-defined value. Requests cannot exceed Limits.
-                      More info: https://kubernetes.io/docs/concepts/configuration/manage-resources-containers/
+                      Requests are the resources each pod on this lane requests. CPU and
+                      memory requests are floored to the built-in default wherever absent or
+                      non-positive (see EffectivePodResources); other keys are used as
+                      written.
                     type: object
                 type: object
               roles:

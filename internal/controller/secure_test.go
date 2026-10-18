@@ -819,7 +819,7 @@ func TestLaunchSecureAppliesLaneResources(t *testing.T) {
 		ObjectMeta: metav1.ObjectMeta{Namespace: secureTestNamespace, Name: "sized"},
 		Spec: courier.LaneProfileSpec{
 			Roles: map[string]string{"coordinator": "test/coordinator", "coder": "test/coder"},
-			Resources: corev1.ResourceRequirements{
+			Resources: courier.PodResources{
 				Requests: corev1.ResourceList{
 					corev1.ResourceCPU:    resource.MustParse("750m"),
 					corev1.ResourceMemory: resource.MustParse("1Gi"),

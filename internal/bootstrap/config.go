@@ -13,7 +13,7 @@ import (
 	"os"
 	"strings"
 
-	corev1 "k8s.io/api/core/v1"
+	courierv1alpha1 "github.com/misospace/courier/api/v1alpha1"
 	utilvalidation "k8s.io/apimachinery/pkg/util/validation"
 	"sigs.k8s.io/yaml"
 )
@@ -28,9 +28,9 @@ type Profile struct {
 	// CapacityGroup names the shared execution-capacity pool this lane
 	// draws from (#327); empty means the lane is its own capacity identity.
 	CapacityGroup string `json:"capacityGroup,omitempty"`
-	// Resources sizes the pods Courier creates for runs on this lane;
-	// empty means the lane gets the built-in default.
-	Resources corev1.ResourceRequirements `json:"resources,omitempty"`
+	// Resources sizes the pods Courier creates using Courier's narrowed
+	// requests/limits vocabulary; empty means the lane gets the built-in default.
+	Resources courierv1alpha1.PodResources `json:"resources,omitempty"`
 }
 
 // Parse reads a bootstrap config document: a top-level profiles list of
