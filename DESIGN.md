@@ -2078,13 +2078,16 @@ named items remain unresolved and must not be described as production-ready:
   retained append — delta, tool request, final — goes through one bounded
   helper; the single terminal error `streamError` appends is deliberately exempt
   from the event bound, because a turn that fails at the cap must still be
-  reportable. Because tool requests are emitted only on the success path after
-  the scan loop ends, an overflowing
-  stream can never yield a `KindToolRequest`: no executable partial request,
-  which is the property a per-line cap could not give. Arguments now
+  reportable. Requests are also emitted *atomically*: after the scan loop
+  ends, every fragment's completeness and the whole set's remaining event
+  capacity are checked before the first request is retained, so an overflowing
+  or incomplete stream can never yield a `KindToolRequest` — not even one
+  complete request that happened to fit beside the terminal error, which is
+  the property a per-line cap could not give. Arguments now
   accumulate amortized as per-index `[]byte` in an unexported `toolFragment`
-  and convert to `string` once at emission, with emission order and the existing
-  name/ID completeness checks unchanged. These are transport resource bounds on
+  and convert to `string` once at emission, with emission order unchanged and
+  the name/ID completeness checks hoisted to cover the whole set before any
+  request is kept. These are transport resource bounds on
   untrusted, unbounded input — not work, duration, or model-behavior
   governors — and they say what one well-formed response may retain (text,
   arguments, identity, events), not what a completion costs the control pod in

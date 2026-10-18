@@ -780,6 +780,95 @@ func TestStreamEventsAtBoundStillFinalizes(t *testing.T) {
 	}
 }
 
+func TestStreamEventsOverflowDuringToolEmissionYieldsNoToolRequest(t *testing.T) {
+	// One slot of event capacity left and two complete tool calls to emit:
+	// the set is emitted atomically or not at all, so the overflow must
+	// reject the whole request set, never retain the request that fits.
+	chunks := make([]string, 0, maxStreamEvents+3)
+	for range maxStreamEvents - 1 {
+		chunks = append(chunks, contentChunk("x"))
+	}
+	chunks = append(chunks,
+		toolCallChunk(0, "call-1", "shell", "{}"),
+		toolCallChunk(1, "call-2", "shell", "{}"),
+		finishChunk("tool_calls"),
+	)
+	gateway, _, cleanup := gatewayFor(gatewayResponse{body: sse(chunks...)})
+	defer cleanup()
+	events, err := gateway.StreamChat(context.Background(), ChatRequest{Model: "m"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, event := range events {
+		if event.Kind == KindToolRequest {
+			t.Fatalf("overflowing stream yielded a partial tool request: %+v", event.Tool)
+		}
+	}
+	if last := events[len(events)-1]; last.Kind != KindError || !errors.Is(last.Err, ErrStreamEventOverflow) {
+		t.Fatalf("terminal event = %+v, want event-overflow error", last)
+	}
+}
+
+func TestStreamEventsAtBoundStillEmitsToolRequests(t *testing.T) {
+	// The request set exactly fills the event bound: the preflight must not
+	// reject a set that fits, or the bound is off by one.
+	chunks := make([]string, 0, maxStreamEvents+3)
+	for range maxStreamEvents - 2 {
+		chunks = append(chunks, contentChunk("x"))
+	}
+	chunks = append(chunks,
+		toolCallChunk(0, "call-1", "shell", "{}"),
+		toolCallChunk(1, "call-2", "shell", "{}"),
+		finishChunk("tool_calls"),
+	)
+	gateway, _, cleanup := gatewayFor(gatewayResponse{body: sse(chunks...)})
+	defer cleanup()
+	events, err := gateway.StreamChat(context.Background(), ChatRequest{Model: "m"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(events) != maxStreamEvents {
+		t.Fatalf("retained events = %d, want exactly the bound", len(events))
+	}
+	calls := 0
+	for _, event := range events {
+		switch event.Kind {
+		case KindDelta:
+		case KindToolRequest:
+			calls++
+		default:
+			t.Fatalf("unexpected event kind %q", event.Kind)
+		}
+	}
+	if calls != 2 {
+		t.Fatalf("tool requests = %d, want 2 at exactly the event bound", calls)
+	}
+}
+
+func TestStreamIncompleteToolRequestYieldsNoToolRequest(t *testing.T) {
+	// One complete call and one missing its name: every fragment is checked
+	// before any request is emitted, so the incomplete set yields no
+	// executable request beside the terminal error.
+	gateway, _, cleanup := gatewayFor(gatewayResponse{body: sse(
+		toolCallChunk(0, "call-1", "shell", "{}"),
+		toolCallChunk(1, "call-2", "", "{}"),
+		finishChunk("tool_calls"),
+	)})
+	defer cleanup()
+	events, err := gateway.StreamChat(context.Background(), ChatRequest{Model: "m"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, event := range events {
+		if event.Kind == KindToolRequest {
+			t.Fatalf("incomplete request set yielded an executable tool request: %+v", event.Tool)
+		}
+	}
+	if last := events[len(events)-1]; last.Kind != KindError {
+		t.Fatalf("terminal event = %+v, want error for incomplete request set", last)
+	}
+}
+
 func TestStreamUnderBoundContentStillFinalizes(t *testing.T) {
 	// Ordinary traffic is well inside the aggregate bounds; the bounds are
 	// not trip-wires on a normal completion.

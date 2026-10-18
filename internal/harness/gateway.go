@@ -460,9 +460,11 @@ type toolFragment struct {
 // partial tool request — and the terminal event closes the sequence. The
 // per-line, payload, and event bounds are transport resource bounds: each is
 // checked before the bytes, entry, or event it would retain is kept, so
-// crossing one ends the turn with a redacted error and, because requests are
-// emitted only after the scan loop ends, never with an executable partial
-// tool request.
+// crossing one ends the turn with a redacted error and never with an
+// executable partial tool request: requests are assembled during the scan
+// loop and emitted atomically after it — every fragment's completeness and
+// the whole set's event capacity are checked before the first request is
+// retained.
 func normalizeStream(body io.Reader, signals ExhaustionSignals) ([]Event, error) {
 	scanner := bufio.NewScanner(body)
 	scanner.Buffer(make([]byte, 0, 64*1024), maxStreamLineBytes)
@@ -565,18 +567,25 @@ func normalizeStream(body io.Reader, signals ExhaustionSignals) ([]Event, error)
 		if len(fragments) == 0 {
 			return streamError(events, fmt.Errorf("harness: tool_calls finish without any tool request"))
 		}
-		for _, index := range sortedFragmentIndexes(fragments) {
+		// Requests are emitted atomically. Every fragment's completeness and
+		// the whole set's event capacity are checked before the first request
+		// is retained, so no rejection path can leave one executable request
+		// beside the terminal error.
+		indexes := sortedFragmentIndexes(fragments)
+		for _, index := range indexes {
 			fragment := fragments[index]
 			if fragment.call.Name == "" || fragment.call.ID == "" {
 				return streamError(events, fmt.Errorf("harness: incomplete tool request in provider stream"))
 			}
+		}
+		if len(events)+len(indexes) > maxStreamEvents {
+			return streamError(events, ErrStreamEventOverflow)
+		}
+		for _, index := range indexes {
+			fragment := fragments[index]
 			call := fragment.call
 			call.Arguments = string(fragment.args)
-			next, kept := appendBoundedEvent(events, Event{Kind: KindToolRequest, Tool: call})
-			if !kept {
-				return streamError(events, ErrStreamEventOverflow)
-			}
-			events = next
+			events = append(events, Event{Kind: KindToolRequest, Tool: call})
 		}
 	default:
 		if len(fragments) > 0 {
