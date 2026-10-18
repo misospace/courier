@@ -286,7 +286,7 @@ affirmative trusted safety proof; settle atomically applies it. Incomplete proof
 unsupported capability, or stale fencing retains ownership. Transient settlement
 errors are retried with the same run-scoped idempotency key after controller
 reconstruction. The fake contract exercises both resolve-issue and fix-PR paths,
-including preserved branch/PR metadata; Dispatch implements the interfaces via the merged #1259 receipt-fenced endpoints. Issue settlement is fenced by the issued claim token. If its POST response is lost or cannot be confirmed, the adapter makes one bounded best-effort lookup in the latest 100 audit rows, matching an exact SHA-256 capacity receipt marker and issue identity; a positive match replays success without another POST. This is not durable server-side idempotency: audit pagination/retention, malformed responses, or lookup failures leave the outcome unknown and ownership held for retry. PR-fix capacity settlement uses the issued per-handout receipt. Lifecycle task reports separately support payload-bound replay when given a stable idempotency key. Discovery and dedupe bypass history only for a
+including preserved branch/PR metadata; Dispatch implements the interfaces via the merged #1259 receipt-fenced endpoints. Issue settlement is fenced by the issued claim token; because a re-claim around admission rotates that token while an admission re-claim re-emits the rotated receipt onto the run, a settlement refused for a rotated or gone lease re-presents the claim once and retries against the live token — rotation is adopted, never treated as staleness, while ownership, human-hold, expiry, and closed refusals still stop settlement (#388). If its POST response is lost or cannot be confirmed, the adapter makes one bounded best-effort lookup in the latest 100 audit rows, matching an exact SHA-256 capacity receipt marker and issue identity, or the run-scoped settlement identity tag every receipt note now carries beside its token-specific marker (a settlement presenting no identity key stamps the marker alone, legacy-shaped) — so a handoff that landed under an adopted token replays from durable evidence on later passes whose receipt names only the original token, instead of adopting again under a freshly minted third token and posting a duplicate settlement (#395); a positive match replays success without another POST. This is not durable server-side idempotency: audit pagination/retention, malformed responses, or lookup failures leave the outcome unknown and ownership held for retry. PR-fix capacity settlement uses the issued per-handout receipt. Lifecycle task reports separately support payload-bound replay when given a stable idempotency key. Discovery and dedupe bypass history only for a
 `BlockedExternal` capacity-exhaustion run with `CapacityRecovery=True/Settled`
 and `LifecycleReported=True`; a deterministic predecessor-UID successor name permits stable source IDs while
 retaining diagnostic history and active-run deduplication. Other, incomplete, and human
@@ -375,8 +375,19 @@ to die.
 - A pod's **disappearance** — no coordinator pod **object** at all — is
   infrastructure loss on its own terms, detected without any heartbeat,
   because there is no pod left to heartbeat from. A pod whose coordinator exit
-  state is observable is not pod loss: the recorded exit goes through the
-  exit-code mapping like any other termination. The cache is not trusted for
+  state is observable **and whose deletion is not in flight** is not pod loss:
+  the recorded exit goes through the exit-code mapping like any other
+  termination. A **terminating** coordinator's recorded exit is never mapped
+  to a run outcome — the deletion may itself have produced that exit (a
+  wedge-reaped coordinator carries a cancelled-stream failure exit, or even
+  exits 0 inside the shutdown window), so it is re-observed like any
+  in-flight deletion, and once the object is provably gone the disappearance
+  backstop takes the deferred charge as pod loss. The mirror case is decided
+  with it: a coordinator that exited with a meaningful code and was deleted
+  **afterwards** (node drain, manual delete) takes the same relaunch, because
+  a timestamp ordering test cannot distinguish the two exits, so a deleted
+  coordinator is untrusted and the resumed run re-reads the world. (#369)
+  The cache is not trusted for
   the loss judgement, so the absence of a coordinator is confirmed **against
   the API server** with a live read and no recorded state — one confirmation
   rule for the disappearance signal: a coordinator pod found live means the
@@ -638,7 +649,9 @@ The invariants the mechanism must hold:
    claimed to be a recoverable patch.
 5. Capture is best-effort and bounded; it never changes an ending's phase,
    exit code, or lifecycle report, and never delays termination beyond its
-   20-second operation deadline inside the 45-second grace.
+   20-second operation deadline plus the bounded child-kill waits — the
+   cancellation path's 10-second wait for the model's process group and the
+   capped git reads' 2-second `WaitDelay` — inside the 45-second grace.
 6. Evidence is per-incarnation and slot names are intake-derived; no capture
    — gated, clean, or stolen-token — can destroy another incarnation's
    evidence.
@@ -693,12 +706,15 @@ Capture runs under a 20-second bounded operation deadline (an operation bound,
 not a run wall-clock — the same kind of bound as the 30s MCP preflight); over
 deadline the bundle degrades to the manifest alone. The pod sets
 `terminationGracePeriodSeconds: 45` when capture is enabled, sized to fit the
-deadline plus the child-kill wait plus exit margin. Delivery allows at most two
-attempts inside the deadline, then stops — no cross-reconcile retry, no
-requeue; loss is recorded in a redacted `evidence.capture` event. A capture the
-deadline itself aborts earns one fresh five-second manifest-only delivery
-window inside the grace (2026-10-09 decision); a stalled intake does not.
-Capture never changes a phase, exit code, or lifecycle report.
+deadline plus the child-kill wait plus exit margin. The reads that back the
+bundle are bounded by that same deadline, not by how long a git child keeps
+its pipes: a grandchild outliving git (`git-remote-*`, askpass) adds at most
+the capped read's 2-second child-kill wait inside the grace. Delivery allows
+at most two attempts inside the deadline, then stops — no cross-reconcile
+retry, no requeue; loss is recorded in a redacted `evidence.capture` event. A
+capture the deadline itself aborts earns one fresh five-second manifest-only
+delivery window inside the grace (2026-10-09 decision); a stalled intake does
+not. Capture never changes a phase, exit code, or lifecycle report.
 
 **Bundle, bounds, manifest.** One gzip'd tar plus a JSON manifest; the manifest
 is always present, content is best-effort within constants (these bound storage
@@ -1329,12 +1345,57 @@ spec:
     single 3090, may queue behind a shared pool, keep parallelism modest,
     use the load tool before you fan out
   runtimeImage: <optional image>   # repository-specific coordinator/toolchain image
+  resources:                       # optional CPU/memory sizing for this lane's pods
+    requests: {cpu: 500m, memory: 1Gi}
+    limits: {cpu: "4", memory: 8Gi}
 ```
 
 `runtimeImage` is an optional execution-environment selector. It is an image
 capability seam, not a Go or Kubernetes requirement: a lane can select a
 repository-specific image containing whatever tools its workflow needs, while
 the deployment default remains the minimal bootstrap image.
+
+`resources` is the lane's pod sizing, and the only source of it. Limits are
+used exactly as written and may be omitted; requests keep whatever the lane
+configured, but CPU and memory requests are floored to Courier's built-in
+default (250m/512Mi requested, 2 CPU/4Gi limited) wherever they are absent or
+non-positive — so every Courier-created pod, the coordinator and the secure
+topology's control, worker, broker, and probe pods, carries finite CPU and
+memory requests whatever the lane says, which lets the scheduler bin-pack,
+keeps one runaway build from taking a node, and keeps these pods off the front
+of the eviction queue. A lane that configures neither half gets the default
+whole; a limits-only lane gets the default requests; a requests-only lane is
+rendered with exactly its own requests plus the floored halves, so its pods
+really do run limit-less by its own choice. One consequence: a limit below the
+floored default request (say `limits.cpu: 100m` on a lane that sets no
+requests) renders requests above limits, which the API server rejects. Requeueing
+cannot change a permanently invalid spec, so the rejection is caught where it
+happens and the run stops rather than cycling claim, preflight, and release on
+every reconcile. The secure path's dry-run proof is the primary catch: it admits
+the control, worker, and broker pods, and the probe pod too on the passes that
+create probes live, so no pass creates a spec it has not proved. The secure
+workload creates behind that proof return ordinary errors and rely on it; the two
+creates a dry run cannot stand in for — the live probe create and the legacy
+coordinator's own create — classify an `Invalid` where it happens. That class
+alone, `PodAdmission`, terminalizes: the reconciler ends the run `NeedsHuman`
+from both `LaunchSecure` call sites, recording `SecurePreflightFailed`, and from
+the legacy launcher, which carries the cause in the run's terminal diagnostic
+instead. Every other preflight verdict keeps the claim/release requeue, because
+each of them clears on a later pass — a live probe can outrun the dataplane
+programming of the NetworkPolicy the same reconcile just wrote, and an access
+review can read an informer cache that has not yet caught up with a Role created
+moments ago — so terminalizing them would strand a run that was always going to
+succeed. The secure round is fenced before it terminalizes: a resumed launch
+reaches the launcher with a live worker and a credentialed broker, and a
+`NeedsHuman` run is no longer observed, so a fence deferred past that reconcile
+would leave the untrusted executor running and the broker holding credentials
+until the run's retention window ends. A fence that fails does not terminalize —
+the claim is released and the next pass retries it — and the legacy path needs no
+fence at all, since the create that failed left no pod to tear down. The sizing is
+resolved once per launch pass, so the spec the dry run admits and the pods
+created afterwards are one artifact rather than two reads of a lane that may have
+moved. One lane-level value sizes every pod on the lane; per-role sizing is
+deliberately not modelled.
 
 Roles name whatever models the operator has configured — cloud (`anthropic/...`,
 `openai/...`, `litellm-anthropic/MiniMax-M3`), local (`litellm/qwen3.8-27b`), or
@@ -1966,6 +2027,48 @@ named items remain unresolved and must not be described as production-ready:
 - The exact vLLM gauge for backpressure on the target model server.
 
 ## Decisions
+- **2026-10-18 — #395: adopted-token settlement replays by run-scoped settlement
+  identity, not only by the token-derived marker.** Settlement adoption (#388)
+  posts the capacity handoff under a marker hashed from the adopted token, but
+  replay looked up only the marker derived from the receipt's original token, so
+  a handoff that landed while its success was never persisted (lost response
+  plus lost `CapacityRecovery=True` patch or a crash) was invisible to the next
+  pass: it retried the dead fence, re-claimed — Dispatch deletes the lease on a
+  successful handoff, so the next claim mints a third token — and posted a
+  second successful settlement (extended cooldown, transient re-claim of an
+  issue already back in circulation). Persisting the adopted token onto the run
+  receipt was rejected: adoption happens inside the settlement call, so any
+  write-back that loses its response window reopens the same gap, and it would
+  widen the `source.CapacityRecovery` seam for a source-specific token concept
+  the core must not carry. Instead every settlement receipt note now carries,
+  beside the token-specific marker, a token-independent SHA-256 tag of the run's
+  settlement identity (idempotency key + work identity) — the controller path
+  always presents a key, and without one the client stamps the marker alone,
+  fail-safe to legacy replay — and the audit replay matches that tag on any
+  successful row for the same issue — durable evidence a later pass
+  can always recompute. The key is unique per run attempt, so a previous
+  attempt's landed row is never conflated with a new one, and the unchanged
+  marker match keeps replaying pre-tag rows for the token they name.
+  Non-stealing is untouched: the tag only suppresses this run's own duplicate
+  POST; fencing on the POST itself is unchanged. (#395)
+
+- **2026-10-17 — #392: the capture's capped git read is bounded by the
+  operation deadline, and a pipe outliving its child keeps the bytes
+  rather than the failure.** `runGitCapped` read the child's stdout
+  before reaping it, and the byte cap bounded volume, not blocking: a
+  grandchild outliving git (`git-remote-*`, askpass) parked the read
+  past the 20-second deadline, through the 45-second grace, to SIGKILL
+  — losing the manifest the degradation promise keeps. The read now
+  runs off-thread against the context, `WaitDelay` bounds the reap, and
+  a grandchild that outlives its git costs at most that 2-second
+  child-kill wait, inside the grace already sized for one. `ErrWaitDelay`
+  arrives only for a process that exited successfully with its pipes
+  still open — `os/exec` adopts the copy-goroutine error only when the
+  process error is nil — so the branch that keeps the bytes is gated on
+  the reaped child having succeeded, and a child that exited non-zero
+  keeps its exit status and stderr. Rejected: bounding the read by a
+  duration rather than the deadline (constrains duration, not stuck),
+  and reaping without a delay (reproduces the stall inside `Wait`).
 
 - **2026-10-17 — #367: the legacy pre-handoff plan adds a bounded,
   explicitly non-semantic referential check on cited evidence paths, and
@@ -2103,6 +2206,29 @@ named items remain unresolved and must not be described as production-ready:
   the writer now consumes every chunk whole. No new bound is claimed — the
   grace period already budgets a 2-second child-kill wait; this puts
   `runGit`'s reads inside it.
+
+- **2026-10-16 — #388: claim-token rotation around admission is adopted, not wedged.**
+  A deployed smoke stranded a `BlockedExternal` capacity run permanently: discovery/
+  admission claim churn rotated the Dispatch lease token, while the run's
+  `SourceReceipt` was persisted set-once and settlement retried the inert fence
+  forever (Dispatch's handoff refusals carry no machine-readable code today, so
+  even the stale classification never fired). The fix adopts the winning fence at
+  both ends instead of holding the losing one: the operator status patch now
+  re-emits a changed non-empty `SourceReceipt` so a re-claim at admission records
+  the token the run actually holds, and the Dispatch settlement path, on a
+  rotation-only refusal (`stale_claim_token` / `no_active_claim`), re-presents the
+  claim — Dispatch keeps the token across same-agent renewals, so this adopts the
+  live lease rather than minting a competing one — and retries the fenced handoff
+  exactly once. Ownership-changed, human-hold, expired, and closed/done refusals
+  never re-claim: releasing another owner's claim or reversing a human stays
+  impossible. The squat policy is settled deliberately: an unsettled
+  `BlockedExternal` run remains the identity barrier until its settlement
+  converges — with adoption it does — and only a `CapacityRecovery=True/Settled`
+  exhaustion releases the identity for a successor, so a blocked run never
+  silently swallows rediscovery forever, it stops doing so when settlement lands.
+  The PR-fix follow-up path keeps its per-handout generation fence unchanged:
+  a rotated handout token there means a newer generation owns the work, which is
+  staleness by design, not rotation to adopt. (#388)
 
 - **2026-10-16 — #282: the legacy executor enforces the criterion-evidence
   contract in one shared handoff plan, and the pinned envelope binds to the
@@ -3359,6 +3485,43 @@ was superseded.
   carries the exit-code hazard this arm avoids, and the secure path's cached
   control-pod read and unconditioned delete, as #369 and #370. (#223)
 
+- **2026-10-17 — #369: a terminating coordinator's recorded exit is never
+  mapped, so the deferred wedge charge survives the coordinator's own
+  teardown.** #223 closed the deferred-charge hole on the secure path by
+  restricting the deferral to the inert control object, the one that can
+  never report an outcome; the wedge path deletes a *recoverable*
+  coordinator, so it needed its own repair. `checkLiveness` reaps a live
+  wedged coordinator and defers the charge when the object survives the
+  live re-confirmation, leaving the run `Running` while the pod is torn
+  down, and the Running-phase exit-code loop in `observeRunning` had no
+  `DeletionTimestamp` guard: once the kubelet finished the shutdown, the
+  loop read the teardown's exit and terminalized the run — `Failed` for a
+  cancelled model stream, `Verifying`/`Done` had the coordinator exited 0
+  in the window — instead of letting the disappearance backstop take the
+  deferred relaunch. The loop now skips a pod whose deletion is in flight,
+  the same terminating rule `topologyBroken`, `coordinatorPodOf` and
+  `activeOperationValid` already apply, and the deferred charge lands on
+  the backstop with its pod-loss cause: one credit, relaunch. The
+  mirror case was decided with it: a coordinator that exited with a
+  meaningful code and was deleted *afterwards* (node drain, manual delete)
+  no longer terminalizes through the exit mapping; it converges to the same
+  pod-loss relaunch. A timestamp ordering test cannot separate the cases —
+  graceful deletion stamps `deletionTimestamp` with a value of the request
+  plus the grace period, while the kubelet may end the SIGTERM'd container
+  at any point after the request, so a teardown exit can read as finished
+  before the stamp's value — and the exit of a deleted coordinator is
+  therefore untrusted by construction: the resumed run re-reads git, the
+  PR, and CI and lets the world win. The cost of a misordered success is
+  one crashloop credit against the shared ceiling. The guard sits in the
+  shared loop, so a terminating secure control pod's exit is likewise never
+  mapped — `ObserveTopology`'s existing control-termination branch still
+  fences the round while the object is terminating, and the same backstop
+  charges the loss with its fence; what #223 established is untouched — the
+  secure deferral still guards only the inert control object, so the secure
+  path still never leaves a `Running` run standing over a deferred
+  teardown of a recoverable control object. No timer and no duration bound
+  was added.
+
 - **2026-10-10 — #248 follow-up: legacy linkage check is fail-closed on forge
   read errors, and the declared-changes path routes through the bounded
   repair budget.** The legacy executor's `checkPRLinkage` (since renamed
@@ -3831,6 +3994,98 @@ was superseded.
   1 run in 25,000 (20 of 500k), far below what a test can detect. The pre-check
   is kept for the fast path it buys (no goroutine, no syscalls), not because a
   test fails without it. (#390)
+- **2026-10-17 — #356: pod sizing is a LaneProfile field, and no
+  Courier-created pod is BestEffort.** `PodConfig.Resources` existed and was
+  applied to the coordinator container, but no production path ever assigned it
+  and the secure control, worker, broker, and probe pods set no `Resources` at
+  all, so every pod Courier created was BestEffort: the scheduler could not
+  bin-pack, a runaway model-driven build could take a node, and these pods were
+  the first evicted under pressure. Sizing is now
+  `LaneProfileSpec.Resources` (an optional `corev1.ResourceRequirements`),
+  mirrored into `bootstrap.Profile` so a GitOps-supplied lane can size itself,
+  and applied to the coordinator pod in the pod builder and to all four secure
+  topology pods at the render layer. A lane that configures either half of
+  requests/limits is rendered exactly as written and a lane that configures
+  none gets the built-in default (250m/512Mi requested, 2 CPU/4Gi limited) —
+  the default is applied inside the render helpers, so the invariant cannot
+  depend on each call site remembering to resolve it, and a partial lane config
+  is never topped up, because a lane's sizing is an operator decision rather
+  than a hint. `PodConfig.Resources` is gone: the lane is the single source,
+  no manager flag ever set the field, and a second source would be two truths
+  about one pod. The render layer substitutes the default for an empty sizing
+  argument, so no call site can render a BestEffort pod, and a rendered spec the
+  API server permanently rejects (an operator setting `resources.claims`, which
+  the CRD exposes and no renderer honours) surfaces as `NeedsHuman` rather than a
+  requeue loop — a quota or RBAC denial stays an ordinary error, because those
+  can be raised later. The rejection is caught where it happens and the run stops
+  rather than re-queueing: the secure path's dry-run proof admits the control,
+  worker, and broker pods and, on the passes that create probes live, the probe
+  pod too, while the two creates a dry run cannot stand in for — the live probe
+  create and the legacy coordinator's own create — classify an `Invalid`
+  themselves; the secure workload creates behind the proof rely on it rather than
+  classifying again. Only that pod-admission class terminalizes, from both
+  `LaunchSecure` call sites (which record `SecurePreflightFailed`) and from the
+  legacy launcher (which carries the cause in the run's terminal diagnostic); the
+  other permanent preflight verdicts keep the claim/release requeue because each
+  of them clears on a later pass. The sizing is resolved once per launch pass
+  and handed down through preflight, so the spec the dry run admits and the spec
+  actually created are the same artifact. One lane-level value sizes every pod on
+  the lane; per-role sizing is deliberately unmodelled, and nothing here bounds a
+  run — it bounds what one run can take from the node, which is where #274's
+  unproven OOM candidate had no answer. (#356)
+- **2026-10-17 — #356 amendment: lane sizing floors CPU/memory requests, superseding
+  "never topped up".** Review on #401 caught that the same-day decision above let a
+  lane configure a partial request map (cpu without memory, or limits only), so a
+  Courier pod could still lack a finite CPU or memory request — the exact condition
+  #356's acceptance criterion rules out. `EffectivePodResources` now floors absent or
+  non-positive CPU/memory *requests* to the built-in default wherever a lane omits or
+  zeroes them, while limits remain exactly as written and omitting limits stays a
+  documented operator choice. The floor lives in the one resolver both the coordinator
+  builder and the topology renderers delegate to, keeping the no-BestEffort invariant
+  single-sourced. A lane's sizing is still an operator decision; the floor only fills
+  what the operator left unsaid about the two resources Kubernetes schedules and evicts
+  on. The same review closed the proof/create gap this sizing rode in on: a permanent
+  pod rejection is now classified where the create happens and terminalizes the run rather
+  than re-queueing it, and the sizing is resolved once per launch pass so the dry-run
+  proof and the created pod are the same artifact rather than two reads of a lane that
+  may have moved between them. (#356, PR #401 review)
+- **2026-10-17 — #356 amendment: only the pod-admission class terminalizes a run, and
+  the secure round is fenced before it does.** A later adversarial round on the same PR
+  held the sizing work and rejected the breadth of the amendment above on two counts.
+  The classification was not really on every create path: the secure workload creates
+  return ordinary errors and rely on the dry-run proof, and only the live probe create
+  and the legacy coordinator's own create classify an `Invalid` where they happen. And
+  terminalizing every permanent preflight verdict from the launch paths stranded runs on
+  signals that clear — `IsolationBroken` can fire because a live probe outran the
+  dataplane programming of the NetworkPolicy the same reconcile just wrote,
+  `OperatorRBAC`/`BrokerRBAC` can read an informer cache lagging a Role created moments
+  ago, and both are gone on the next pass. Terminalization is therefore narrowed to the
+  pod-admission class, the one this sizing made newly reachable, and every other class
+  keeps the claim/release requeue. The secure terminalization also now fences first: a
+  resumed launch reaches the launcher with a live worker and a credentialed broker, and
+  a `NeedsHuman` run is no longer observed, so a fence deferred past that reconcile would
+  leave the untrusted executor running and the broker holding credentials until the
+  retention window ended — a requeue loop traded for an unattended topology. A fence that
+  fails releases the claim and retries rather than terminalizing; the legacy path needs
+  no fence, because it terminalizes only once the coordinator slot is proven empty.
+  The probe pod joined the dry-run
+  proof only on passes that create probes, so a deployment with no probe image can no
+  longer fail a run whose probes are disabled, and the placeholder node name stays
+  DNS-subdomain-shaped only because the real probe's name derives from the node — the API
+  server does not validate `spec.nodeName` at all. (#356, PR #401 review)
+- **2026-10-17 — #356 amendment: the pod-admission class requires a proven-empty
+  coordinator slot.** The entry above claimed the legacy path needs no fence because a
+  failed create left no pod behind, which is true of that create and not of the slot. The
+  API server validates an object before its existence check, so a coordinator create on a
+  slot an earlier attempt of the same still-Claimed run already filled answers `Invalid`,
+  not `AlreadyExists`, and a live writer may be running there — the case the ambiguity check
+  on that path exists for. Terminalizing such a run as `NeedsHuman` takes it out from under
+  its own coordinator, which a `NeedsHuman` run never observes again and only the retention
+  window reaps, so the permanent class is now conditional on a proven-empty slot: the
+  launcher reads the slot uncached, and a pod sitting there (or an absence the read cannot
+  establish) returns the same stay-Claimed ambiguity result every other uncertain create
+  does, leaving the run to adopt its own live pod once the lane is fixed. One rule now
+  decides the slot for both outcomes. (#356, PR #401 review)
 - **2026-10-17 — #383: a pod-bound credential is read per request, never
   frozen.** Secure control read its projected broker-audience token once in
   `loadIdentity` and handed the byte slice to the capability, publication and
@@ -3898,3 +4153,34 @@ was superseded.
   (#216) are unchanged; provisioning and the fence's own reads still use the
   cached client, because only the relaunch's delete and ceiling judgement are
   destructive decisions. (#370, #105, #223)
+- **2026-10-18 — #336: the classified-regular capture read refuses a non-regular
+  descriptor rather than blocking on it.** `Capture` classifies each changed path
+  with `os.Lstat` and reads a path classified regular through `readCapped`, which
+  since #237 opened `O_RDONLY|O_NOFOLLOW`. A hostile worktree that swapped such a
+  path for a fifo between the classification and the open blocked that open
+  indefinitely: an `O_RDONLY` open of a fifo waits for a writer that may never
+  come, and no bound — context or otherwise — was consulted there. The window is
+  the same classification-versus-open TOCTOU #237 closed for symlinks. The fix
+  (PR #389) opens `O_RDONLY|O_NOFOLLOW|O_NONBLOCK`, so the open cannot wait for a
+  peer that may never arrive, then `f.Stat()`s the opened descriptor and fails a
+  non-regular result with a new `errNotRegular` sentinel. `fstat` on the
+  descriptor rather than a second `Lstat` on the path is deliberate: it describes
+  the object actually opened, so the check cannot itself be raced the way a
+  path-based re-check could. `Capture` maps `errNotRegular` to
+  `DispositionOmittedBinary` with `totals.OmittedBinary++` and stores nothing —
+  deliberately identical to what the pre-existing non-regular `Lstat` branch does
+  for a path classified non-regular outright, mirroring how #237's `ELOOP` (a
+  swap into a symlink) re-classifies as symlink metadata: each swap class is
+  re-classified exactly as the classification pass would have classified it, so
+  content a hostile tree slipped past classification is never stored. A swap to
+  a socket needs no branch of its own: a read-only open of a socket fails with
+  `ENXIO` before any blocking is possible and falls to the generic failed-read
+  case, which also stores nothing. The guard composes with the capture deadline
+  bound (#390) rather than conflicting with it: `O_NONBLOCK` bounds the *open* by
+  making a wait impossible — it rejects non-regular descriptors before any read
+  begins — while the deadline bounds the *read* of the regular files the guard
+  lets through, which is all the guard leaves unbounded and all the deadline
+  needs to cover. `O_NONBLOCK` is a no-op for those regular files. Regression
+  tests: `TestReadCappedRejectsNonRegular` and `TestCaptureFifoSwapRace`, both
+  asserting non-blocking with a deadline guard so losing `O_NONBLOCK` fails
+  rather than hangs the suite. (#336, #389; composes with #237, #390)

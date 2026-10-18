@@ -1787,8 +1787,14 @@ func (r reporter) classifyUndeclared(ctx context.Context, workspace *git.Workspa
 	case git.WorkStateDirty:
 		return failedWith("opencode exited successfully without declaring an outcome and left uncommitted workspace changes", terminalCategoryUnknown)
 	case git.WorkStateCommitted:
+		// Fail closed on an unreadable branch (#344): only a read that
+		// positively shows work ahead of the start commit can carry the run
+		// to Verifying, never an inconclusive one.
 		ahead, branchErr := workspace.CommitsOnBranchSince(ctx, branch, startCommit)
-		if branchErr == nil && ahead == 0 {
+		if branchErr != nil {
+			return failedWith("could not verify committed work on the run branch: "+branchErr.Error(), terminalCategoryVerifierRejection)
+		}
+		if ahead == 0 {
 			return failedWith(r.offBranchReason(ctx, workspace, branch)+"; no outcome was declared", terminalCategoryVerifierRejection)
 		}
 		// The world shows verified work on the run branch; that ending stands

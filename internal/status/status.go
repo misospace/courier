@@ -86,7 +86,11 @@ type OperatorPatch struct {
 	HeadSHA         *string                                  `json:"headSHA,omitempty"`
 	PR              string                                   `json:"pr,omitempty"`
 	WorkspaceSafety *courierv1alpha1.WorkspaceSafetyEvidence `json:"workspaceSafety,omitempty"`
-	SourceReceipt   *string                                  `json:"sourceReceipt,omitempty"`
+	// SourceReceipt is replaceable: a re-claim rotates the source fencing
+	// token and the caller re-emits the changed value so settlement fences
+	// against the live claim (#388). It is emitted only when non-empty, so a
+	// patch never clears a persisted receipt.
+	SourceReceipt *string `json:"sourceReceipt,omitempty"`
 	// AdmittedAt is set once, when the run leaves Pending past the lane
 	// capacity/suspend gate.
 	AdmittedAt *metav1.Time `json:"admittedAt,omitempty"`

@@ -72,7 +72,6 @@ type PodConfig struct {
 	MetricsMCPURL   string
 	BootstrapBinary string
 	OpenCode        OpenCode
-	Resources       corev1.ResourceRequirements
 	// EvidenceURL, EvidenceToken, and EvidenceNonce enable bounded
 	// failure-evidence capture. Capture is all-or-nothing: all three must
 	// be set together, and leaving them empty keeps the pod on the kubelet's
@@ -260,7 +259,7 @@ func (b *PodBuilder) Build(run *courierv1alpha1.CoderRun, lane *courierv1alpha1.
 				Args:                     append([]string(nil), command.Args...),
 				WorkingDir:               config.WorkspacePath,
 				Env:                      podEnvironment(invocation, executorImpl.Name(), config),
-				Resources:                config.Resources,
+				Resources:                lane.Spec.EffectiveResources(),
 				VolumeMounts: []corev1.VolumeMount{{
 					Name:      "workspace",
 					MountPath: config.WorkspacePath,
