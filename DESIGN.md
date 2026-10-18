@@ -1936,6 +1936,25 @@ only informs.
   holds whatever its lane needs (an Anthropic, OpenAI, or MiniMax token, a
   local endpoint's key, any combination); in the target design the provider key
   belongs to trusted harness control, and workers do not call models directly.
+- The gateway response is untrusted, unbounded input, and trusted control
+  bounds both its shape and what it will hold: one SSE line is capped at 1 MiB,
+  and per completion the buffered content deltas (8 MiB), the buffered
+  tool-call arguments across all fragments (4 MiB), the tool-call identity
+  bytes sent across all fragments (64 KiB), the distinct tool-call indexes
+  (128), and the retained events (65536) are each capped. Each is checked
+  before the bytes, entry, or event that would cross it is retained, so
+  crossing one ends the turn with one fixed error naming the bound and never
+  quoting provider text. Payload bytes alone would not bound retention — an
+  `Event` costs a slot whatever it carries, and identity fields are overwritten
+  rather than accumulated — so the event count and the identity bytes are
+  bounded too. Tool requests are emitted only after the whole stream is read,
+  so an overflowing stream can never yield an executable partial request, and
+  the one terminal error a failed turn appends is exempt from the event bound so
+  the failure is still reportable. These are transport resource bounds, not
+  work, duration, or model-behavior limits: they say what one well-formed
+  response may retain — its text, arguments, identity, and events — not what a
+  completion may cost the control pod in any other way, and never how much work
+  the model may do.
 - Secrets are redacted from logs before stdout.
 - **Failure-evidence surfaces (#115):** the operator serves an authenticated,
   write-only evidence intake listener (in-cluster, token-gated, no read path)
@@ -2025,6 +2044,56 @@ named items remain unresolved and must not be described as production-ready:
 - The exact vLLM gauge for backpressure on the target model server.
 
 ## Decisions
+- **2026-10-18 — #440: one completion's aggregate buffering is bounded in
+  `normalizeStream`, and an over-bound stream ends as a redacted terminal
+  error with no partial tool request.** The per-line SSE cap
+  (`maxStreamLineBytes`, 1 MiB) bounded one line and nothing else: every content
+  delta was appended to an unbounded `events` slice, every tool-call index
+  added a map entry, and `fragment.Arguments += ...` recopied a growing string,
+  so a broken or hostile gateway could exhaust control-pod memory with many
+  individually valid small lines before `StreamChat` returned. Five aggregate
+  bounds now close that: `maxStreamContentBytes` (8 MiB of buffered content
+  deltas), `maxStreamToolArgumentBytes` (4 MiB of buffered tool arguments
+  across all fragments), `maxStreamToolCallCount` (128 distinct tool-call
+  indexes), `maxStreamEvents` (65536 retained events), and
+  `maxStreamToolIdentityBytes` (64 KiB of tool-call identity bytes sent across
+  all fragments). Each is checked *before* the bytes, entry, or event that
+  would cross it is retained, so nothing over the bound is ever held, and each
+  crossing returns `streamError` with one fixed exported sentinel
+  (`ErrStreamContentOverflow`, `ErrStreamToolArgumentOverflow`,
+  `ErrStreamToolCallOverflow`, `ErrStreamEventOverflow`,
+  `ErrStreamToolIdentityOverflow`) — redacted strings that name the bound and
+  carry no provider payload and no counts. Deltas already accepted stay valid
+  `KindDelta` events under that terminal error. The last two bounds exist
+  because payload bytes alone do not bound memory: an `Event` costs its caller
+  a slot whatever it carries, so 400k one-byte deltas — 5% of the content
+  bound — retained ~64 MB, hence `maxStreamEvents` (~11 MB at the cap); and
+  `ID`/`Name` are overwritten per fragment rather than accumulated, so
+  charging only what a call retains would let 128 indexes each carry a large
+  identity for free, hence `maxStreamToolIdentityBytes`, charged as *received*
+  (every non-empty ID and Name, whether or not it overwrites an earlier value)
+  so it bounds what a stream may send rather than only what it keeps. Every
+  retained append — delta, tool request, final — goes through one bounded
+  helper; the single terminal error `streamError` appends is deliberately exempt
+  from the event bound, because a turn that fails at the cap must still be
+  reportable. Because tool requests are emitted only on the success path after
+  the scan loop ends, an overflowing
+  stream can never yield a `KindToolRequest`: no executable partial request,
+  which is the property a per-line cap could not give. Arguments now
+  accumulate amortized as per-index `[]byte` in an unexported `toolFragment`
+  and convert to `string` once at emission, with emission order and the existing
+  name/ID completeness checks unchanged. These are transport resource bounds on
+  untrusted, unbounded input — not work, duration, or model-behavior
+  governors — and they say what one well-formed response may retain (text,
+  arguments, identity, events), not what a completion costs the control pod in
+  any other way. Tests pin the boundary itself: content, arguments, identity,
+  and retained events at exactly the bound succeed, and one past each bound
+  rejects. Rejected: raising the per-line cap (attacking the wrong axis — the
+  aggregate is what a completion can retain), a wall-clock or duration bound
+  on the read (constrains duration, not stuck), and truncating the stream
+  silently or emitting the fragments assembled so far (a partial tool request
+  is executable data, and a silent truncation would read as a completed
+  answer).
 - **2026-10-17 — #392: the capture's capped git read is bounded by the
   operation deadline, and a pipe outliving its child keeps the bytes
   rather than the failure.** `runGitCapped` read the child's stdout
