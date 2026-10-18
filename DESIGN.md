@@ -3962,7 +3962,14 @@ was superseded.
   did not bound. The read is now bounded by the same context. The mechanism is
   deliberately weak: a pre-check fails fast when the deadline is already gone
   (no goroutine at all), and otherwise the open and the capped read run in a
-  goroutine whose result is received unless the context is done first.
+  goroutine whose result is received unless the context is done first — and a
+  result that lands while the context is expired is discarded even when it wins
+  the select, because a completed read and a closed Done are then ready at once
+  and Go breaks that tie at random. Cancellation is therefore settled again
+  after the select and again at the seam call in `Capture`, outside the
+  read-error taxonomy, so no bytes read past the deadline are ever stored and a
+  read that only succeeded because the context was dead cannot masquerade as
+  content.
   Cancellation abandons that goroutine rather than interrupting it — closing a
   descriptor from another goroutine is not a reliable way to unblock a read
   already blocked in the kernel — and the abandoned read's bytes are discarded

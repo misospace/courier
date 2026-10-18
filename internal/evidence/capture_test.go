@@ -13,6 +13,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"testing"
 	"time"
@@ -725,6 +726,88 @@ func TestReadCappedPrefersCancellationOverTheNonRegularGuard(t *testing.T) {
 		}
 	case <-time.After(10 * time.Second):
 		t.Fatal("readCapped did not return within 10s of a canceled context")
+	}
+}
+
+// lateDeadlineContext stands in for a context whose deadline expires while a
+// read is already in flight: Err answers nil the first time it is observed —
+// the pre-check at the top of readCapped, which must see a live context or the
+// read never starts — and the deadline error from every observation after,
+// which is when the select and the result guard run.
+type lateDeadlineContext struct {
+	observed atomic.Bool
+	done     chan struct{}
+}
+
+func (c *lateDeadlineContext) Deadline() (time.Time, bool) { return time.Time{}, false }
+func (c *lateDeadlineContext) Done() <-chan struct{}       { return c.done }
+func (c *lateDeadlineContext) Value(any) any               { return nil }
+func (c *lateDeadlineContext) Err() error {
+	if c.observed.CompareAndSwap(false, true) {
+		return nil
+	}
+	return context.DeadlineExceeded
+}
+
+// TestReadCappedPrefersCancellationOverACompletedRead pins the #390 review
+// precedence inside readCapped: a read that completes while the context is
+// expired is discarded, even when the result wins the select — both channels
+// are then ready and the tie is broken at random, so the guard after the
+// select, not the select itself, is what keeps a completed read from
+// surviving a dead context.
+//
+// The double's Done closes only after a delay, so the select deterministically
+// sees the completed result first and the post-select guard is what decides;
+// on a pathologically slow runner the Done branch answers instead, which the
+// outcome below accepts either way.
+func TestReadCappedPrefersCancellationOverACompletedRead(t *testing.T) {
+	t.Parallel()
+	path := filepath.Join(t.TempDir(), "late.txt")
+	writeFile(t, path, "READ-AFTER-DEADLINE\n")
+
+	ctx := &lateDeadlineContext{done: make(chan struct{})}
+	timer := time.AfterFunc(10*time.Millisecond, func() { close(ctx.done) })
+	defer timer.Stop()
+	data, err := readCapped(ctx, path, MaxFileBytes+1)
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("readCapped err = %v, want context.DeadlineExceeded", err)
+	}
+	if data != nil {
+		t.Errorf("readCapped returned %q past its context, want nil", data)
+	}
+}
+
+// TestCaptureNeverAcceptsAReadThatFinishedUnderADeadContext is the #390
+// review regression at the seam: a read that completes after the context is
+// already dead — a result that won the select against a ready Done, or any
+// seam implementation — must be discarded, and Capture must fail with the
+// context's error and no bundle, so the executor's manifest-only degradation
+// is what the caller sees rather than content read past the deadline. The
+// seam answers deterministically, so the precedence Capture owes is pinned
+// without betting on the scheduler.
+func TestCaptureNeverAcceptsAReadThatFinishedUnderADeadContext(t *testing.T) {
+	// Not parallel: the test replaces a package-level seam that parallel
+	// captures share.
+	dir := newRepo(t)
+	writeFile(t, filepath.Join(dir, "late.txt"), "READ-AFTER-DEADLINE\n")
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	original := readFileForCapture
+	t.Cleanup(func() { readFileForCapture = original })
+	readFileForCapture = func(_ context.Context, _ string, _ int) ([]byte, error) {
+		// The deadline expires while the read is in flight, and the read
+		// completes anyway — the interleaving the select loses at random.
+		cancel()
+		return []byte("READ-AFTER-DEADLINE\n"), nil
+	}
+
+	bundle, err := Capture(ctx, captureOptions(dir, nil))
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("capture err = %v, want context.Canceled", err)
+	}
+	if bundle != nil {
+		t.Errorf("capture returned a bundle alongside cancellation, want nil so the caller degrades to manifest-only")
 	}
 }
 

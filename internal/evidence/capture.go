@@ -118,16 +118,21 @@ func Capture(ctx context.Context, opts Options) (*Bundle, error) {
 			// file is never read into memory whole; both omitted-binary
 			// and omitted-over-limit store nothing.
 			data, rerr := readFileForCapture(ctx, full, MaxFileBytes+1)
+			// Cancellation is settled before the read result itself, not
+			// only before the read-error taxonomy: the read seam may be
+			// answered with completed bytes after the context is already
+			// dead — a real read that won the select below, or any seam
+			// implementation — and storing them would carry the capture
+			// past the deadline its manifest-only degradation promises.
+			// The same check also settles a read abandoned at the operation
+			// deadline, whose context error recorded as an omitted binary
+			// would both mask a stale content classification and keep the
+			// capture going instead of handing the caller the error its
+			// manifest-only degradation already handles.
+			if ctx.Err() != nil {
+				return nil, ctx.Err()
+			}
 			if rerr != nil {
-				// Cancellation is settled before the read-error taxonomy: a
-				// read abandoned at the operation deadline carries a context
-				// error, and recording that as an omitted binary would both
-				// mask a stale content classification and keep the capture
-				// going instead of handing the caller the error its
-				// manifest-only degradation already handles.
-				if ctx.Err() != nil {
-					return nil, ctx.Err()
-				}
 				if errors.Is(rerr, syscall.ELOOP) {
 					// The path was swapped for a symlink between the Lstat
 					// classification and this O_NOFOLLOW open: re-classify as
@@ -529,6 +534,14 @@ func readCapped(ctx context.Context, path string, limit int) ([]byte, error) {
 	case <-ctx.Done():
 		return nil, ctx.Err()
 	case res := <-done:
+		// A read that completed while the context expired leaves both
+		// channels ready, and the select breaks that tie at random —
+		// cancellation is settled here too, so a completed read never
+		// survives a dead context: past the deadline the bytes are
+		// discarded and the capture degrades to the manifest alone.
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
 		return res.data, res.err
 	}
 }
