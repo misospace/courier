@@ -11,6 +11,7 @@ import (
 	"time"
 
 	courierv1alpha1 "github.com/misospace/courier/api/v1alpha1"
+	"github.com/misospace/courier/internal/devenv"
 	"github.com/misospace/courier/internal/executor"
 	"github.com/misospace/courier/internal/protocol"
 )
@@ -72,6 +73,22 @@ type Coordinator struct {
 	// before any further request can burn the exhausted binding.
 	deferredAvailability   error
 	deferredAvailabilityMu sync.Mutex
+
+	// bootstrapBlockerErr carries a terminal environment blocker (#414):
+	// the approved development-bootstrap contract failed, or its captured
+	// environment was unusable. Recorded at the snapshot-preparation
+	// boundary, it ends the run recoverably blocked-external at the next
+	// turn boundary — never a model-visible retry loop — because the
+	// failure is the environment's, not the work's.
+	bootstrapBlockerErr error
+	bootstrapBlockerMu  sync.Mutex
+
+	// bootstrapEnv holds the latest applied development-bootstrap
+	// environment delta (#414): the filtered capture of the approved
+	// contract's activated environment, merged over the worker's own
+	// environment for every subsequent model-influenced task.
+	bootstrapEnv   []string
+	bootstrapEnvMu sync.Mutex
 }
 
 // recordDeferredAvailability keeps the first deferred provider-availability
@@ -94,6 +111,56 @@ func (c *Coordinator) takeDeferredAvailability() error {
 	err := c.deferredAvailability
 	c.deferredAvailability = nil
 	return err
+}
+
+// recordBootstrapBlocker keeps the first bootstrap environment blocker
+// (#414). Only the typed blocker — a fixed reason, never a raw process
+// transcript — crosses this boundary.
+func (c *Coordinator) recordBootstrapBlocker(err error) {
+	c.bootstrapBlockerMu.Lock()
+	defer c.bootstrapBlockerMu.Unlock()
+	if c.bootstrapBlockerErr == nil {
+		c.bootstrapBlockerErr = err
+	}
+}
+
+// takeBootstrapBlocker removes and returns a recorded bootstrap environment
+// blocker, if any.
+func (c *Coordinator) takeBootstrapBlocker() error {
+	c.bootstrapBlockerMu.Lock()
+	defer c.bootstrapBlockerMu.Unlock()
+	err := c.bootstrapBlockerErr
+	c.bootstrapBlockerErr = nil
+	return err
+}
+
+// hasBootstrapBlocker reports whether a bootstrap environment blocker is
+// waiting, without consuming it.
+func (c *Coordinator) hasBootstrapBlocker() bool {
+	c.bootstrapBlockerMu.Lock()
+	defer c.bootstrapBlockerMu.Unlock()
+	return c.bootstrapBlockerErr != nil
+}
+
+// storeBootstrapEnv records the latest applied bootstrap environment delta
+// (#414): it replaces any earlier delta, because each applied bootstrap is
+// the environment's current truth.
+func (c *Coordinator) storeBootstrapEnv(delta []string) {
+	c.bootstrapEnvMu.Lock()
+	defer c.bootstrapEnvMu.Unlock()
+	c.bootstrapEnv = append([]string(nil), delta...)
+}
+
+// currentBootstrapEnv returns a copy of the applied bootstrap environment
+// delta, or nil when none was applied: tasks without a delta run under the
+// worker's own environment.
+func (c *Coordinator) currentBootstrapEnv() []string {
+	c.bootstrapEnvMu.Lock()
+	defer c.bootstrapEnvMu.Unlock()
+	if len(c.bootstrapEnv) == 0 {
+		return nil
+	}
+	return append([]string(nil), c.bootstrapEnv...)
 }
 
 // CoordinatorConfig assembles the harness. Worker, snapshot, forge, and
@@ -220,6 +287,9 @@ func (c *Coordinator) Run(ctx context.Context, inv executor.Invocation) executor
 			session.Append(note)
 		}
 		turn := c.pump(ctx, session, "", c.coordinatorTools())
+		if turn.blocker != nil {
+			return executor.HarnessResult{Outcome: executor.OutcomeBlockedExternal, Reason: turn.blocker.Error()}
+		}
 		if turn.harnessErr != nil {
 			return executor.HarnessResult{Err: fmt.Errorf("harness: step-boundary compaction: %w", turn.harnessErr)}
 		}
@@ -310,6 +380,11 @@ type turnResult struct {
 	// (#243). The transcript is unchanged, so the run ends as an
 	// infrastructure failure rather than continuing on truncated state.
 	harnessErr error
+	// blocker carries a terminal environment blocker recorded at the
+	// snapshot-preparation boundary (#414): the run ends recoverably
+	// blocked-external at this turn boundary, before any further model
+	// request.
+	blocker error
 }
 
 // newSession opens one role-bound session carrying that role's resolved
@@ -385,6 +460,15 @@ func (c *Coordinator) pump(ctx context.Context, session *Session, briefID string
 		if briefID == "" {
 			if deferred := c.takeDeferredAvailability(); deferred != nil {
 				return turnResult{streamErr: deferred, toolResults: toolResults}
+			}
+			// A recorded bootstrap environment blocker (#414) ends the run
+			// the same way deferred availability does: the ending is
+			// scoped to the coordinator's own loop — a sub-agent pump
+			// never consumes it, so it can only abort the session that
+			// owns the run — and the earned events are returned, not
+			// dropped.
+			if blocker := c.takeBootstrapBlocker(); blocker != nil {
+				return turnResult{blocker: blocker, toolResults: toolResults}
 			}
 		}
 	}
@@ -702,7 +786,10 @@ func (c *Coordinator) runShell(ctx context.Context, call ToolCall, briefID strin
 		result.Content = "workspace snapshot is unavailable"
 		return result
 	}
-	task := protocol.Task{Command: []string{"sh", "-c", args.Command}, ArtifactPath: args.ArtifactPath}
+	// Only model-influenced tasks carry the applied bootstrap environment
+	// delta (#414): fixed control scripts (unpack, pack) run under the
+	// worker's own environment.
+	task := protocol.Task{Command: []string{"sh", "-c", args.Command}, ArtifactPath: args.ArtifactPath, Env: c.currentBootstrapEnv()}
 	workerResult, err := c.dispatchAndAwait(ctx, newOpID("shell", briefID), briefID, task)
 	if err != nil {
 		result.IsError = true
@@ -914,6 +1001,13 @@ func (c *Coordinator) runBrief(ctx context.Context, brief Brief) (summary string
 	session.Settle(settledStateBlock(brief))
 	for {
 		turn := c.pump(ctx, session, brief.ID, c.subagentTools())
+		// A bootstrap environment blocker recorded before this brief ran
+		// (#414) aborts it without further model requests: the workspace
+		// it would work in failed to prepare, and the run ends
+		// blocked-external at the coordinator's own turn boundary.
+		if c.hasBootstrapBlocker() {
+			return "workspace bootstrap failed; the brief is aborted", false, nil
+		}
 		if turn.harnessErr != nil {
 			// Compaction could not fit the protected tail (#243). The
 			// transcript is unchanged, so this is a brief failure like any
@@ -1189,9 +1283,114 @@ func (c *Coordinator) prepareSnapshotLocked(ctx context.Context, briefID string)
 	if strings.TrimSpace(result.StdoutTail) != snap.Tip {
 		return "", errors.New("worker workspace does not match the dispatched snapshot tip")
 	}
+	// The workspace is materialized at the dispatched tip: if the approved
+	// development-bootstrap contract applies (#414), it runs now, after
+	// checkout and before anything else is dispatched against this
+	// workspace. A modified or absent contract dispatches nothing.
+	switch snap.ContractState {
+	case devenv.StateApproved:
+		if err := c.bootstrapWorkspace(ctx, briefID); err != nil {
+			// The blocker, if this was one, is recorded before the error
+			// returns: the run ends blocked-external at the next turn
+			// boundary, whatever consumed this preparation.
+			var blocker *bootstrapBlocker
+			if errors.As(err, &blocker) {
+				c.recordBootstrapBlocker(blocker)
+			}
+			return "", err
+		}
+	case devenv.StateAbsent, devenv.StateModified:
+		// Nothing to apply: the contract was never approved, or the work
+		// tip modified it and only a human approval may run it. The
+		// captured environment is cleared with it — an unpack wipes the
+		// workspace a stale delta's paths point at, so feeding it forward
+		// would silently break every later command instead of saying so.
+		c.storeBootstrapEnv(nil)
+	default:
+		// An unclassified contract state skips the same way: fail closed
+		// on the bootstrap and on any environment it once captured.
+		c.storeBootstrapEnv(nil)
+	}
 	c.snapshotReady = true
 	c.snapshotTip = snap.Tip
 	return snap.Tip, nil
+}
+
+// bootstrapBlockerReasonPrefix is the fixed prefix every bootstrap
+// environment blocker reason carries (#414): the durable reason names the
+// class and the exit code only — worker output is untrusted and never
+// enters a durable reason or the model transcript.
+const bootstrapBlockerReasonPrefix = "the approved bootstrap contract failed"
+
+// maxBootstrapEnvBytes bounds the serialized bootstrap environment delta
+// control will dispatch (#414). It is a transport resource bound, like the
+// artifact and stream bounds.
+const maxBootstrapEnvBytes = 64 << 10
+
+// bootstrapBlocker is a terminal environment blocker (#414): the approved
+// bootstrap contract failed, or its captured environment was unusable, so
+// nothing model-influenced may run against this workspace. The reason is
+// fixed text plus, where relevant, the task's own exit status — never an
+// excerpt of untrusted worker output.
+type bootstrapBlocker struct {
+	reason string
+}
+
+func (b *bootstrapBlocker) Error() string { return b.reason }
+
+// bootstrapBound is the development-bootstrap task's liveness bound (#414).
+// It is a var only so the liveness classification is testable; production
+// code never reassigns it.
+var bootstrapBound = devenv.DefaultBound
+
+// bootstrapWorkspace dispatches the fixed control-authored bootstrap task —
+// the contract's own script, run by the worker as `sh -c` with no
+// model-supplied value — and, on success, stores the filtered environment
+// delta the capture produced, so every subsequent model-influenced task
+// merges it over the worker's own environment. A failure is a terminal
+// environment blocker, never a tool error the model could steer: it is
+// recorded before it returns, so the run ends blocked-external at the next
+// turn boundary.
+func (c *Coordinator) bootstrapWorkspace(ctx context.Context, briefID string) error {
+	parent := ctx
+	ctx, cancel := context.WithTimeout(parent, bootstrapBound)
+	defer cancel()
+	task := protocol.Task{Command: []string{"sh", "-c", devenv.Script()}}
+	result, err := c.dispatchAndAwait(ctx, newOpID("bootstrap", briefID), briefID, task)
+	if err != nil {
+		// Only the bound's own expiry is a blocker: a parent cancellation
+		// or a transport failure is an ordinary snapshot-preparation
+		// failure — the run's own liveness path, not the bootstrap's.
+		if errors.Is(err, context.DeadlineExceeded) && parent.Err() == nil {
+			return &bootstrapBlocker{reason: bootstrapBlockerReasonPrefix + ": the bootstrap task exceeded its liveness bound"}
+		}
+		return err
+	}
+	if result.ExitCode != 0 {
+		if result.Status == protocol.ResultCancelled {
+			return &bootstrapBlocker{reason: bootstrapBlockerReasonPrefix + ": the bootstrap task was cancelled before it completed"}
+		}
+		return &bootstrapBlocker{reason: fmt.Sprintf("%s with exit code %d", bootstrapBlockerReasonPrefix, result.ExitCode)}
+	}
+	_, delta, _, err := devenv.ParseScriptOutput(result.StdoutTail, nil)
+	if err != nil {
+		return &bootstrapBlocker{reason: bootstrapBlockerReasonPrefix + ": bootstrap environment capture malformed"}
+	}
+	if bootstrapEnvBytes(delta) > maxBootstrapEnvBytes {
+		return &bootstrapBlocker{reason: bootstrapBlockerReasonPrefix + ": bootstrap environment exceeded the 64 KiB dispatch bound"}
+	}
+	c.storeBootstrapEnv(delta)
+	return nil
+}
+
+// bootstrapEnvBytes returns the serialized size of an environment delta as
+// it travels the protocol: one NUL terminator per KEY=VALUE record.
+func bootstrapEnvBytes(delta []string) int {
+	total := 0
+	for _, record := range delta {
+		total += len(record) + 1
+	}
+	return total
 }
 
 // workerUnpackScript materializes the uploaded snapshot bundle as the
@@ -1268,12 +1467,28 @@ func workerResultToTool(result protocol.Result, tool ToolResult) ToolResult {
 // data; internal error chains can name configuration and identities but
 // never credentials, because no credential reaches this code path.
 func safeToolError(err error) string {
-	message := err.Error()
-	message = strings.ReplaceAll(message, "\n", " ")
-	if len(message) > 500 {
-		message = message[:500]
+	return sanitizeExcerpt(err.Error())
+}
+
+// sanitizeExcerpt bounds untrusted output for a tool-visible message:
+// newlines become spaces, remaining control bytes are dropped, and the
+// excerpt is truncated. safeToolError applies it to an error's text before
+// that text reaches the model transcript.
+func sanitizeExcerpt(value string) string {
+	value = strings.Map(func(r rune) rune {
+		switch {
+		case r == '\n' || r == '\r' || r == '\t':
+			return ' '
+		case r < 0x20 || r == 0x7f:
+			return -1
+		default:
+			return r
+		}
+	}, value)
+	if len(value) > 500 {
+		value = value[:500]
 	}
-	return message
+	return value
 }
 
 // definiteWorkerRejection reports whether the worker definitely refused the

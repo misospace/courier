@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"strings"
 
+	"github.com/misospace/courier/internal/devenv"
 	couriergit "github.com/misospace/courier/internal/git"
 )
 
@@ -174,6 +175,49 @@ func (t *Integrator) Head(ctx context.Context) (string, error) {
 	return couriergit.HeadOID(ctx, t.Dir)
 }
 
+// ContractState compares the development-bootstrap contract at tip against
+// the base tip (#414): approved when the contract matches the one the base
+// approved, modified when it diverged, absent when the tip does not carry
+// it. Both tips are resolved objects in this tree, so the comparison is pure
+// git reads — the contract state is trusted control's own observation, never
+// a claim from the model or the worker. A read failure is also reported as
+// modified: unprovable content is never executed, and a transient git
+// hiccup must not fail the whole snapshot preparation, only the bootstrap it
+// gates.
+func (t *Integrator) ContractState(ctx context.Context, tip string) devenv.State {
+	if t.baseTip == "" {
+		return devenv.StateAbsent
+	}
+	baseFiles, err := t.contractFilesAt(ctx, t.baseTip)
+	if err != nil {
+		return devenv.StateModified
+	}
+	headFiles, err := t.contractFilesAt(ctx, tip)
+	if err != nil {
+		return devenv.StateModified
+	}
+	return devenv.Compare(baseFiles, headFiles)
+}
+
+// contractFilesAt reads the contract's config and lock files at one revision
+// with pure git reads: a path that does not exist there is simply absent.
+func (t *Integrator) contractFilesAt(ctx context.Context, revision string) (devenv.Files, error) {
+	config, hasConfig, err := couriergit.BlobAt(ctx, t.Dir, revision, devenv.ConfigPath)
+	if err != nil {
+		return devenv.Files{}, err
+	}
+	lock, hasLock, err := couriergit.BlobAt(ctx, t.Dir, revision, devenv.LockPath)
+	if err != nil {
+		return devenv.Files{}, err
+	}
+	return devenv.Files{
+		Config:    config,
+		HasConfig: hasConfig,
+		Lock:      lock,
+		HasLock:   hasLock,
+	}, nil
+}
+
 // Render produces the sanitized snapshot bundle for the next dispatch from
 // the current integration head. The snapshot is control-authored: its single
 // ref is the fixed snapshot work ref the worker's unpack fetches.
@@ -205,7 +249,8 @@ func (t *Integrator) Render(ctx context.Context) (Snapshot, error) {
 	if err != nil {
 		return Snapshot{}, fmt.Errorf("harness: snapshot read failed: %w", err)
 	}
-	return Snapshot{Data: data, Tip: head, BaseTip: t.baseTip}, nil
+	state := t.ContractState(ctx, head)
+	return Snapshot{Data: data, Tip: head, BaseTip: t.baseTip, ContractState: state}, nil
 }
 
 // RefreshBase imports a fresh base tip (and its objects) from a newly

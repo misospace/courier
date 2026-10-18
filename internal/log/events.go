@@ -48,6 +48,11 @@ const (
 	EventRunExit = "run.exit"
 	// EventWorkspaceReady reports a prepared or adopted git workspace.
 	EventWorkspaceReady = "workspace.ready"
+	// EventWorkspaceBootstrap reports the bounded workspace
+	// development-bootstrap contract execution (#414): its status
+	// (applied/skipped/failed), elapsed time, exit code, and the filtered
+	// environment-delta key names — never values.
+	EventWorkspaceBootstrap = "workspace.bootstrap"
 	// EventExecutorStart reports an executor process invocation.
 	EventExecutorStart = "executor.start"
 	// EventExecutorContinuation reports a recoverable executor exit that

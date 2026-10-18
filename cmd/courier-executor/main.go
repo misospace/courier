@@ -37,6 +37,7 @@ import (
 
 	courierv1alpha1 "github.com/misospace/courier/api/v1alpha1"
 	"github.com/misospace/courier/internal/broker"
+	"github.com/misospace/courier/internal/devenv"
 	"github.com/misospace/courier/internal/evidence"
 	"github.com/misospace/courier/internal/executor"
 	"github.com/misospace/courier/internal/forge"
@@ -1209,6 +1210,73 @@ func run(ctx context.Context, stdout, stderr io.Writer) int {
 	}
 	report.event(courierlog.EventWorkspaceReady, courierlog.StatusOK, ready)
 
+	// Child output is redacted before it reaches the run streams. The session
+	// tap observes OpenCode's JSON events without changing their bytes. The
+	// wrapping happens once, here: the bootstrap contract execution (#414)
+	// and the model child stream through the same writers.
+	stdoutRedacted := courierlog.NewRedactingWriter(stdout, report.red)
+	stderrTransport := courierlog.NewRedactingWriter(stderr, report.red)
+
+	// The repository-owned development bootstrap contract (#414): execute the
+	// operator-approved `mise run bootstrap` after checkout and before model
+	// work, then adopt its deterministic environment delta into this process.
+	// Every verdict emits one receipt event; only an approved contract runs.
+	state, stateErr := bootstrapContractState(ctx, workspace.Directory, workspace.BaseRevisionRef(), startCommit)
+	switch {
+	case stateErr != nil:
+		reason := report.red.Redact("bootstrap contract state unreadable: " + stateErr.Error())
+		report.eventVerbose(courierlog.EventWorkspaceBootstrap, courierlog.StatusError, map[string]any{
+			"status": "skipped",
+			"reason": truncatedRunes(reason, bootstrapReasonLimit),
+		})
+	case state == devenv.StateAbsent:
+		report.eventVerbose(courierlog.EventWorkspaceBootstrap, courierlog.StatusOK, map[string]any{
+			"status": "skipped",
+			"reason": "",
+		})
+	case state == devenv.StateModified:
+		report.eventVerbose(courierlog.EventWorkspaceBootstrap, courierlog.StatusOK, map[string]any{
+			"status": "skipped",
+			"reason": "bootstrap contract differs approved base revision; not executed",
+		})
+	case state == devenv.StateApproved:
+		// LookPath absence is not a skip: the repository declared the
+		// contract and the environment lacks mise, so the contract run
+		// itself reports the deterministic failure.
+		miseBinary, _ := exec.LookPath("mise")
+		result, runErr := devenv.Run(ctx, miseBinary, devenv.Options{
+			Dir:    workspace.Directory,
+			Bound:  devenv.DefaultBound,
+			Env:    os.Environ(),
+			Stdout: stdoutRedacted,
+			Stderr: stderrTransport,
+		})
+		if runErr != nil {
+			result = devenv.Result{Status: "failed", Reason: "bootstrap execution error: " + runErr.Error(), ExitCode: -1}
+		}
+		status := courierlog.StatusOK
+		if result.Status == "failed" {
+			status = courierlog.StatusError
+		}
+		report.eventVerbose(courierlog.EventWorkspaceBootstrap, status, map[string]any{
+			"status":     result.Status,
+			"elapsed_ms": result.Elapsed.Milliseconds(),
+			"exit_code":  result.ExitCode,
+			"env_keys":   len(result.EnvKeys),
+			"reason":     truncatedRunes(report.red.Redact(result.Reason), bootstrapReasonLimit),
+		})
+		if result.Status == "failed" {
+			report.terminate(bootstrapBlockerTermination(result))
+			return exitNeedsHuman
+		}
+		// Applied: install the deterministic environment into THIS process so
+		// the later direct-argv children (capability preflight, the model
+		// process, any shell it spawns) inherit it.
+		applyBootstrapEnv(result.EnvDelta)
+	}
+	_ = stdoutRedacted.Flush()
+	_ = stderrTransport.Flush()
+
 	runtime := executor.OpenCode{Binary: cfg.OpenCodeBinary, Format: cfg.OpenCodeFormat, Agent: cfg.OpenCodeAgent}
 	caps := preflightCapabilities(ctx, runtime.MCPStatusCommand(), workspace.Directory)
 	if len(caps) > 0 {
@@ -1217,10 +1285,6 @@ func run(ctx context.Context, stdout, stderr io.Writer) int {
 	if note := capabilityNote(caps); note != "" {
 		cfg.Framing = strings.TrimSpace(cfg.Framing + "\n\n" + report.red.Redact(note))
 	}
-	// Child output is redacted before it reaches the run streams. The session tap
-	// observes OpenCode's JSON events without changing their bytes.
-	stdoutRedacted := courierlog.NewRedactingWriter(stdout, report.red)
-	stderrTransport := courierlog.NewRedactingWriter(stderr, report.red)
 	tap := newSessionTap(stdoutRedacted, parseExhaustionSignals(cfg.ExhaustionCodes, cfg.ExhaustionTypes))
 	tap.tel = report.tel
 	var exhaustionSignal atomic.Bool

@@ -3,8 +3,11 @@ package git
 import (
 	"bytes"
 	"context"
+	"errors"
+	"fmt"
 	"os"
 	"os/exec"
+	"strconv"
 	"strings"
 )
 
@@ -59,6 +62,51 @@ func HardenedWithEnv(ctx context.Context, directory string, extra []string, args
 func HardenedExit(ctx context.Context, directory string, args ...string) error {
 	_, _, err := hardened(ctx, directory, nil, args)
 	return err
+}
+
+// maxBlobAtBytes bounds one BlobAt read. The primitive exists to read small
+// repository-owned configuration at a revision; unbounded blob reads would
+// let repository content dictate trusted-process memory (the repo's
+// runGitCapped convention), so an oversized blob is refused, never read.
+const maxBlobAtBytes = 1 << 20
+
+// BlobAt returns the bytes of one path at one revision in directory's object
+// database, or ok=false when that path does not exist at that revision. It is
+// the trusted read primitive for revision-scoped repository content — the
+// runtime bootstrap contract's approval check reads the contract files at the
+// checked-out head and at the operator-approved base revision without ever
+// executing anything (#414). revision and path must be assembled from trusted
+// values: fixed contract paths and control-side refs or resolved OIDs —
+// never model- or repository-supplied text — because git's rev/path syntax is
+// argv here and this package does not sanitize (see Hardened).
+func BlobAt(ctx context.Context, directory, revision, path string) ([]byte, bool, error) {
+	if strings.TrimSpace(revision) == "" || strings.TrimSpace(path) == "" {
+		return nil, false, errors.New("git blob read: revision and path are required")
+	}
+	spec := revision + ":" + path
+	sizeOut, _, err := hardened(ctx, directory, nil, []string{"cat-file", "-s", spec})
+	if err != nil {
+		var commandErr *CommandError
+		if errors.As(err, &commandErr) && commandErr.ExitCode() == 128 {
+			// Exit 128 covers both a missing path and an unresolvable
+			// revision; the approval check treats both as "no contract
+			// content here" and callers classify the surrounding state.
+			return nil, false, nil
+		}
+		return nil, false, err
+	}
+	size, convErr := strconv.Atoi(strings.TrimSpace(string(sizeOut)))
+	if convErr != nil {
+		return nil, false, fmt.Errorf("git blob read: size for %s is not a number", spec)
+	}
+	if size > maxBlobAtBytes {
+		return nil, false, fmt.Errorf("git blob read: %s is %d bytes, over the %d-byte read bound", spec, size, maxBlobAtBytes)
+	}
+	out, _, err := hardened(ctx, directory, nil, []string{"cat-file", "blob", spec})
+	if err != nil {
+		return nil, false, err
+	}
+	return out, true, nil
 }
 
 func hardened(ctx context.Context, directory string, extra []string, args []string) ([]byte, string, error) {

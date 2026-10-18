@@ -20,6 +20,7 @@ import (
 	"time"
 
 	courier "github.com/misospace/courier/api/v1alpha1"
+	"github.com/misospace/courier/internal/devenv"
 	"github.com/misospace/courier/internal/executor"
 	"github.com/misospace/courier/internal/protocol"
 )
@@ -163,6 +164,17 @@ type mockWorker struct {
 	snapshotTip  string
 	packArtifact []byte
 	snapshotTips []string
+	// bootstrapResults are consumed in order by the scripted bootstrap task;
+	// with none scripted, a bootstrap task completes with an empty capture.
+	bootstrapResults []protocol.Result
+	// hangResults makes every result poll block until its request context
+	// ends, standing in for a worker whose operation never terminates.
+	hangResults bool
+}
+
+func isWorkerBootstrapTask(task protocol.Task) bool {
+	return len(task.Command) == 3 && task.Command[0] == "sh" && task.Command[1] == "-c" &&
+		strings.Contains(task.Command[2], "mise run bootstrap")
 }
 
 func isWorkerUnpackTask(task protocol.Task) bool {
@@ -242,6 +254,24 @@ func (m *mockWorker) handleDispatch(w http.ResponseWriter, r *http.Request) {
 			Status: protocol.ResultCompleted,
 			Result: &protocol.Result{Status: protocol.ResultCompleted, ExitCode: 0, Artifact: m.packArtifact},
 		}
+	case isWorkerBootstrapTask(task):
+		result := protocol.Result{
+			Status:   protocol.ResultCompleted,
+			ExitCode: 0,
+			// A default capture the devenv integrity rules accept: the
+			// marker line plus one NUL-terminated record, so a test that
+			// only cares about dispatch shape gets an applied bootstrap.
+			StdoutTail: devenv.EnvMarker + "\nPATH=/mock/shims\x00",
+		}
+		if len(m.bootstrapResults) > 0 {
+			result = m.bootstrapResults[0]
+			m.bootstrapResults = m.bootstrapResults[1:]
+		}
+		status := result.Status
+		if status == "" {
+			status = protocol.ResultCompleted
+		}
+		m.results[req.Envelope.OpID] = protocol.ResultState{Status: status, Result: &result}
 	case m.completeAll:
 		m.results[req.Envelope.OpID] = protocol.ResultState{
 			Status: protocol.ResultCompleted,
@@ -274,6 +304,10 @@ func (m *mockWorker) handleCancel(w http.ResponseWriter, r *http.Request) {
 }
 
 func (m *mockWorker) handleResult(w http.ResponseWriter, r *http.Request) {
+	if m.hangResults {
+		<-r.Context().Done()
+		return
+	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if m.resultFailures > 0 {
