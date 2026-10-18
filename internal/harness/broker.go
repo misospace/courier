@@ -1,6 +1,7 @@
 package harness
 
 import (
+	"bytes"
 	"context"
 	"crypto/tls"
 	"crypto/x509"
@@ -42,7 +43,10 @@ const (
 // 5xx/429/408 failures are retryable; other 4xx responses are definite
 // denials. A local credential-read failure is retryable too — the projected
 // token file comes back when kubelet finishes rotating it, and the run never
-// needs rebuilding to pick the new bytes up. Response bodies are never
+// needs rebuilding to pick the new bytes up. A 401 is a denial except when
+// the projected credential has already been replaced since the refused
+// request read it: that is the kubelet swap window, and the retry is safe
+// because the next attempt carries the fresh bytes. Response bodies are never
 // echoed, and neither is a credential read failure: only a fixed category and
 // the status code travel.
 type BrokerCallError struct {
@@ -178,9 +182,33 @@ func (b *BrokerClient) do(ctx context.Context, method, path string, headers map[
 	}
 	if !okStatus(resp.StatusCode) {
 		resp.Body.Close()
-		return nil, brokerStatusError(resp.StatusCode)
+		return nil, b.statusError(resp.StatusCode, token)
 	}
 	return resp, nil
+}
+
+// statusError classifies one refused response. A 401 is a definite denial —
+// the same status a misconfigured or cross-run caller earns — except when the
+// projected credential has already been replaced since this request read it:
+// then kubelet rotated under the request and the apiserver's refusal of the
+// old bytes is the swap window, not a denial. The evidence is the request's
+// own freshness, re-read per request, never a blanket retry of the status
+// code: only bytes the projection has since replaced mark the window, so a
+// caller whose credential is genuinely not permitted converges to the loud
+// denial on its next attempt, inside the same bounded retry rounds.
+func (b *BrokerClient) statusError(status int, sent []byte) error {
+	if status == http.StatusUnauthorized && rotatedUnder(b.TokenSource, sent) {
+		return &BrokerCallError{StatusCode: status, Category: "refused the rotated-out credential", Retryable: true}
+	}
+	return brokerStatusError(status)
+}
+
+// rotatedUnder reports whether the projected token now holds bytes other than
+// the ones a refused request carried. The comparison never travels: only the
+// caller's fixed category does.
+func rotatedUnder(source BrokerTokenSource, sent []byte) bool {
+	fresh, err := resolveBrokerToken(source)
+	return err == nil && !bytes.Equal(fresh, sent)
 }
 
 // okStatus reports a successful typed-API response. Every typed endpoint
