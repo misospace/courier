@@ -2074,9 +2074,10 @@ named items remain unresolved and must not be described as production-ready:
   charging only what a call retains would let 128 indexes each carry a large
   identity for free, hence `maxStreamToolIdentityBytes`, charged as *received*
   (every non-empty ID and Name, whether or not it overwrites an earlier value)
-  so it bounds what a stream may send rather than only what it keeps. Every
-  retained append — delta, tool request, final — goes through one bounded
-  helper; the single terminal error `streamError` appends is deliberately exempt
+  so it bounds what a stream may send rather than only what it keeps. Delta
+  and final appends go through one bounded helper, and tool-request appends
+  are guarded by the whole-set preflight described below; the single terminal
+  error `streamError` appends is deliberately exempt
   from the event bound, because a turn that fails at the cap must still be
   reportable. Requests are also emitted *atomically*: after the scan loop
   ends, every fragment's completeness and the whole set's remaining event

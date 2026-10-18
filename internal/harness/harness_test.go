@@ -864,8 +864,8 @@ func TestStreamIncompleteToolRequestYieldsNoToolRequest(t *testing.T) {
 			t.Fatalf("incomplete request set yielded an executable tool request: %+v", event.Tool)
 		}
 	}
-	if last := events[len(events)-1]; last.Kind != KindError {
-		t.Fatalf("terminal event = %+v, want error for incomplete request set", last)
+	if last := events[len(events)-1]; last.Kind != KindError || !strings.Contains(last.Err.Error(), "incomplete tool request") {
+		t.Fatalf("terminal event = %+v, want incomplete-request error", last)
 	}
 }
 
