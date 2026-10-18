@@ -3661,14 +3661,15 @@ func TestRunResolveIssueUndeclaredVerifyingTriggersLinkageRepair(t *testing.T) {
 	}
 }
 
-// TestRunResolveIssueLinkageReadFailureFailsClosed proves the executor
-// is fail-closed on a forge read failure (#248 follow-up): an unverifiable
-// PR body cannot quietly become a Verifying success. The run has no
-// captured session (the model exited 0), so the bounded retry has nothing
-// to resume; the run escalates to NeedsHuman with the precise forge
-// error as the reason, and the linkage.read.failed event carries the
-// original error. The declared-changes outcome tag is preserved.
-func TestRunResolveIssueLinkageReadFailureFailsClosed(t *testing.T) {
+// TestRunResolveIssueLinkageReadFailureEndsBlockedExternal proves the
+// executor treats a forge read failure on a transient availability
+// condition as unverifiable, not as a verified contradiction (#455): a
+// persistent HTTP 500 forge never observed the world, so with no captured
+// session (the model exited 0) no in-session retry is possible and the run
+// ends blocked_external / provider-unavailable for the operator's bounded
+// retry — exit 2, not a verifier rejection, and never a claim that the PR
+// is missing. The linkage.read.failed event carries the original error.
+func TestRunResolveIssueLinkageReadFailureEndsBlockedExternal(t *testing.T) {
 	root := t.TempDir()
 	remote := filepath.Join(root, "remote.git")
 	source := filepath.Join(root, "source")
@@ -3689,9 +3690,10 @@ func TestRunResolveIssueLinkageReadFailureFailsClosed(t *testing.T) {
 	writeExecutable(t, fakeOpenCode, "#!/bin/sh\ncase \"$1\" in mcp) exit 0;; esac\nprintf 'completed\\n' > completed.txt\ngit add --all -- .\ngit commit -m 'test: completed work' >/dev/null\nmkdir -p \"$COURIER_SCRATCH_DIR\"\nprintf '{\"outcome\":\"changes\"}' > \"$COURIER_SCRATCH_DIR/outcome.json\"\nexit 0\n")
 
 	// A GitHub server that always 500s: the legacy executor cannot
-	// prove the PR body satisfies authoritative source-issue linkage
-	// when the forge is unreachable, so the run fails closed instead
-	// of becoming a Verifying success on an unverifiable world.
+	// observe the PR state at all, so the world is unverifiable — the
+	// run ends blocked_external for operator retry instead of becoming
+	// a Verifying success on an unobserved world or escalating to a
+	// human as a verification rejection (#455).
 	prServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusInternalServerError)
 	}))
@@ -3719,28 +3721,40 @@ func TestRunResolveIssueLinkageReadFailureFailsClosed(t *testing.T) {
 	var errorsOut bytes.Buffer
 	code := run(context.Background(), &output, &errorsOut)
 	if code != exitNeedsHuman {
-		t.Fatalf("run exit code = %d, want %d (NeedsHuman on fail-closed forge read failure); stderr=%q stdout=%q", code, exitNeedsHuman, errorsOut.String(), output.String())
+		t.Fatalf("run exit code = %d, want %d (blocked-external ending on transient forge unavailability); stderr=%q stdout=%q", code, exitNeedsHuman, errorsOut.String(), output.String())
 	}
 	if !strings.Contains(output.String(), `"phase":"NeedsHuman"`) {
-		t.Fatalf("expected NeedsHuman handoff on forge read failure: %q", output.String())
+		t.Fatalf("expected the handoff phase to stay NeedsHuman on forge unavailability: %q", output.String())
 	}
 	if !strings.Contains(output.String(), `"linkage.read.failed"`) {
 		t.Fatalf("expected the linkage read failure to be logged: %q", output.String())
 	}
-	if !strings.Contains(output.String(), `"outcome":"changes"`) {
-		t.Fatalf("declared outcome tag should be preserved on fail-closed NeedsHuman: %q", output.String())
+	if !strings.Contains(output.String(), `"outcome":"blocked_external"`) {
+		t.Fatalf("expected a blocked_external outcome on transient forge unavailability: %q", output.String())
+	}
+	if !strings.Contains(output.String(), `"category":"provider-unavailable"`) {
+		t.Fatalf("expected the provider-unavailable category on transient forge unavailability: %q", output.String())
+	}
+	if !strings.Contains(output.String(), "temporarily unavailable") {
+		t.Fatalf("reason should name the transient forge unavailability: %q", output.String())
 	}
 	if !strings.Contains(output.String(), "acme/widgets#7") {
-		t.Fatalf("NeedsHuman reason should name the trusted source identity: %q", output.String())
+		t.Fatalf("reason should name the trusted source identity: %q", output.String())
 	}
 	if !strings.Contains(output.String(), "500") {
-		t.Fatalf("NeedsHuman reason should name the forge read error: %q", output.String())
+		t.Fatalf("reason should name the forge read error: %q", output.String())
+	}
+	if strings.Contains(output.String(), "needs a human") {
+		t.Fatalf("a transient forge unavailability must not read as a verification rejection needing a human: %q", output.String())
+	}
+	if strings.Contains(output.String(), "no pull request for that head") {
+		t.Fatalf("a failed read must not claim the pull request is missing: %q", output.String())
 	}
 }
 
-// TestRunResolveIssueLinkageReadFailureRetriesInsideBudget exercises
-// the bounded retry/fail-closed mechanism (#248 follow-up, #247) on the
-// declared-changes path: a forge read failure that is recoverable
+// TestRunResolveIssueLinkageReadFailureRetriesThenEndsBlockedExternal
+// exercises the bounded retry mechanism (#248 follow-up, #247, #455) on
+// the declared-changes path: a forge read failure that is recoverable
 // inside the captured session's continuation budget must route through a
 // re-verify continuation exactly the way the undeclared-Verifying path
 // does. #247 requires that a transient read failure is never dressed up
@@ -3748,8 +3762,11 @@ func TestRunResolveIssueLinkageReadFailureFailsClosed(t *testing.T) {
 // pr-unverified turn that says the read failed, not a missing-PR create
 // prompt. The fake's first turn declares changes; the second turn never
 // declares an outcome, so the run ends after the read-failure retry fires
-// at least once and the budget is then exhausted.
-func TestRunResolveIssueLinkageReadFailureRetriesInsideBudget(t *testing.T) {
+// at least once and the budget is then exhausted — and because the forge
+// never became observable, the exhausted ending is blocked_external /
+// provider-unavailable for the operator's bounded retry, not a
+// verifier rejection (#455).
+func TestRunResolveIssueLinkageReadFailureRetriesThenEndsBlockedExternal(t *testing.T) {
 	root := t.TempDir()
 	remote := filepath.Join(root, "remote.git")
 	source := filepath.Join(root, "source")
@@ -3817,14 +3834,14 @@ func TestRunResolveIssueLinkageReadFailureRetriesInsideBudget(t *testing.T) {
 	// forge — which is still 500-ing — and only one of the two budget
 	// slots is consumed by that retry. The run ends undeclared-Verifying
 	// (success) only if the path mistakenly fell through; the correct
-	// fail-closed path needs a captured session that re-declares. The
-	// fake does not re-declare, so the run ends NeedsHuman after the
-	// budget is exhausted by re-invoking the helper on the undeclared
-	// path. The code is therefore exitNeedsHuman, and the captured-
-	// session budget has been consumed at least once by a linkage-
-	// repair continuation.
+	// ending needs a captured session that re-declares. The fake does
+	// not re-declare, so the run ends after the budget is exhausted by
+	// re-invoking the helper on the undeclared path — blocked_external
+	// because the forge was never observable (#455). The code is
+	// therefore exitNeedsHuman, and the captured-session budget has
+	// been consumed at least once by a linkage-repair continuation.
 	if code != exitNeedsHuman {
-		t.Fatalf("run exit code = %d, want %d (fail-closed on forge read failure); stderr=%q stdout=%q", code, exitNeedsHuman, errorsOut.String(), output.String())
+		t.Fatalf("run exit code = %d, want %d (blocked-external on exhausted forge read retries); stderr=%q stdout=%q", code, exitNeedsHuman, errorsOut.String(), output.String())
 	}
 	if !strings.Contains(output.String(), `"kind":"pr-unverified"`) {
 		t.Fatalf("expected the shared helper to fire a factual pr-unverified continuation: %q", output.String())
@@ -3833,6 +3850,15 @@ func TestRunResolveIssueLinkageReadFailureRetriesInsideBudget(t *testing.T) {
 	// missing pull request.
 	if strings.Contains(output.String(), "no pull request for that head") {
 		t.Fatalf("a failed read must not claim the pull request is missing: %q", output.String())
+	}
+	if !strings.Contains(output.String(), `"outcome":"blocked_external"`) {
+		t.Fatalf("expected a blocked_external outcome once the retries against the unobservable forge are exhausted: %q", output.String())
+	}
+	if !strings.Contains(output.String(), `"category":"provider-unavailable"`) {
+		t.Fatalf("expected the provider-unavailable category once the retries against the unobservable forge are exhausted: %q", output.String())
+	}
+	if strings.Contains(output.String(), "needs a human") {
+		t.Fatalf("a transient forge unavailability must not read as a verification rejection needing a human: %q", output.String())
 	}
 	if !strings.Contains(output.String(), `"linkage.read.failed"`) {
 		t.Fatalf("expected the linkage read failure event: %q", output.String())
@@ -3935,18 +3961,20 @@ func TestRunResolveIssueDeclaredChangesLinkageFailureUsesBoundedRepair(t *testin
 	}
 }
 
-// TestRunResolveIssueUndeclaredLinkageReadFailureFailsClosed proves the
-// undeclared-Verifying path is fail-closed on a forge read failure (#248
-// follow-up): a transient GitHub outage during the authoritative
-// linkage check cannot quietly become a Verifying success even when
-// the coordinator never declared an outcome. The fake leaves the work
-// committed without writing an outcome declaration, so the run takes
-// the undeclared-Verifying route; the GitHub server answers every
-// pull request query with HTTP 500, so the shared repair helper
-// exhausts its bounded budget across the captured session's
-// continuations and the run ends NeedsHuman with the precise forge
-// error as the reason.
-func TestRunResolveIssueUndeclaredLinkageReadFailureFailsClosed(t *testing.T) {
+// TestRunResolveIssueUndeclaredLinkageReadFailureEndsBlockedExternal proves
+// the undeclared-Verifying path treats a forge read failure on a transient
+// availability condition as unverifiable, not as a verified contradiction
+// (#248 follow-up, #455): a persistent GitHub outage during the
+// authoritative linkage check cannot quietly become a Verifying success
+// even when the coordinator never declared an outcome. The fake leaves the
+// work committed without writing an outcome declaration, so the run takes
+// the undeclared-Verifying route; the GitHub server answers every pull
+// request query with HTTP 500, so the shared repair helper exhausts its
+// bounded budget across the captured session's continuations and the run
+// ends blocked_external / provider-unavailable for the operator's bounded
+// retry — never a claim that the PR is missing and never a verifier
+// rejection.
+func TestRunResolveIssueUndeclaredLinkageReadFailureEndsBlockedExternal(t *testing.T) {
 	root := t.TempDir()
 	remote := filepath.Join(root, "remote.git")
 	source := filepath.Join(root, "source")
@@ -4010,10 +4038,10 @@ func TestRunResolveIssueUndeclaredLinkageReadFailureFailsClosed(t *testing.T) {
 	var errorsOut bytes.Buffer
 	code := run(context.Background(), &output, &errorsOut)
 	if code != exitNeedsHuman {
-		t.Fatalf("run exit code = %d, want %d (NeedsHuman on fail-closed undeclared forge read failure); stderr=%q stdout=%q", code, exitNeedsHuman, errorsOut.String(), output.String())
+		t.Fatalf("run exit code = %d, want %d (blocked-external on exhausted undeclared forge read retries); stderr=%q stdout=%q", code, exitNeedsHuman, errorsOut.String(), output.String())
 	}
 	if !strings.Contains(output.String(), `"phase":"NeedsHuman"`) {
-		t.Fatalf("expected NeedsHuman handoff on undeclared forge read failure: %q", output.String())
+		t.Fatalf("expected the handoff phase to stay NeedsHuman on undeclared forge read failure: %q", output.String())
 	}
 	if strings.Contains(output.String(), `"phase":"Verifying"`) {
 		t.Fatalf("undeclared-Verifying must not be handed off as Verifying on a forge read error: %q", output.String())
@@ -4021,11 +4049,177 @@ func TestRunResolveIssueUndeclaredLinkageReadFailureFailsClosed(t *testing.T) {
 	if !strings.Contains(output.String(), `"kind":"pr-unverified"`) {
 		t.Fatalf("expected the undeclared path to fire a factual pr-unverified continuation before exhausting the budget: %q", output.String())
 	}
+	if !strings.Contains(output.String(), `"outcome":"blocked_external"`) {
+		t.Fatalf("expected a blocked_external outcome once the retries against the unobservable forge are exhausted: %q", output.String())
+	}
+	if !strings.Contains(output.String(), `"category":"provider-unavailable"`) {
+		t.Fatalf("expected the provider-unavailable category once the retries against the unobservable forge are exhausted: %q", output.String())
+	}
+	if strings.Contains(output.String(), "needs a human") {
+		t.Fatalf("a transient forge unavailability must not read as a verification rejection needing a human: %q", output.String())
+	}
 	if !strings.Contains(output.String(), `"linkage.read.failed"`) {
 		t.Fatalf("expected the linkage read failure event: %q", output.String())
 	}
 	if !strings.Contains(output.String(), "acme/widgets#7") {
-		t.Fatalf("NeedsHuman reason should name the trusted source identity: %q", output.String())
+		t.Fatalf("reason should name the trusted source identity: %q", output.String())
+	}
+}
+
+// TestRunResolveIssueRateLimitedForgeReadEndsBlockedExternal proves the
+// #455 classification covers GitHub's rate-limit shape: a persistent 403
+// whose message names the rate limit kept the forge read from completing,
+// so with no captured session the run ends blocked_external /
+// provider-unavailable for the operator's bounded retry — not a verifier
+// rejection, and never a claim that the PR is missing.
+func TestRunResolveIssueRateLimitedForgeReadEndsBlockedExternal(t *testing.T) {
+	root := t.TempDir()
+	remote := filepath.Join(root, "remote.git")
+	source := filepath.Join(root, "source")
+	runGit(t, root, "init", "--bare", remote)
+	runGit(t, root, "init", source)
+	configureGit(t, source)
+	write(t, filepath.Join(source, "README.md"), "base\n")
+	commit(t, source, "base: initial")
+	runGit(t, source, "branch", "-M", "main")
+	runGit(t, source, "remote", "add", "origin", remote)
+	runGit(t, source, "push", "-u", "origin", "main")
+
+	fakeOpenCode := filepath.Join(root, "opencode")
+	scratchDirectory := filepath.Join(root, "scratch")
+	if err := os.MkdirAll(scratchDirectory, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	writeExecutable(t, fakeOpenCode, "#!/bin/sh\ncase \"$1\" in mcp) exit 0;; esac\nprintf 'completed\\n' > completed.txt\ngit add --all -- .\ngit commit -m 'test: completed work' >/dev/null\nmkdir -p \"$COURIER_SCRATCH_DIR\"\nprintf '{\"outcome\":\"changes\"}' > \"$COURIER_SCRATCH_DIR/outcome.json\"\nexit 0\n")
+
+	// A GitHub server that always answers 403 with the rate-limit message
+	// GitHub sends when the secondary or primary limit is exhausted: the
+	// forge read never completes, so the world is unobserved.
+	prServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusForbidden)
+		_, _ = io.WriteString(w, `{"message":"API rate limit exceeded for this IP"}`)
+	}))
+	defer prServer.Close()
+
+	workspace := filepath.Join(root, "workspace")
+	termination := filepath.Join(root, "termination")
+	t.Setenv("COURIER_REPO_URL", remote)
+	t.Setenv("COURIER_WORKSPACE", workspace)
+	t.Setenv("COURIER_SCRATCH_DIR", scratchDirectory)
+	t.Setenv("COURIER_BASE", "main")
+	t.Setenv("COURIER_BRANCH", "courier/resolve-issue/acme-widgets/7")
+	t.Setenv("COURIER_GOAL", "Open a PR to address issue #7. Declare the outcome at "+filepath.Join(defaultScratchDirectory, defaultOutcomeFilename)+".")
+	t.Setenv("COURIER_MODEL", "any-model/name")
+	t.Setenv("COURIER_MODE", "resolve-issue")
+	t.Setenv("COURIER_REPO", "acme/widgets")
+	t.Setenv("COURIER_REF", "7")
+	t.Setenv("COURIER_GITHUB_API_BASE", prServer.URL)
+	t.Setenv("COURIER_OPENCODE_BINARY", fakeOpenCode)
+	t.Setenv("COURIER_TERMINATION_FILE", termination)
+	t.Setenv("COURIER_RESUME_BACKOFF_SECONDS", "0")
+	t.Setenv("COURIER_RUN_NAME", "coderrun-linkage-rate-limit")
+
+	var output bytes.Buffer
+	var errorsOut bytes.Buffer
+	code := run(context.Background(), &output, &errorsOut)
+	if code != exitNeedsHuman {
+		t.Fatalf("run exit code = %d, want %d (blocked-external ending on a rate-limited forge read); stderr=%q stdout=%q", code, exitNeedsHuman, errorsOut.String(), output.String())
+	}
+	if !strings.Contains(output.String(), `"outcome":"blocked_external"`) {
+		t.Fatalf("expected a blocked_external outcome on a rate-limited forge read: %q", output.String())
+	}
+	if !strings.Contains(output.String(), `"category":"provider-unavailable"`) {
+		t.Fatalf("expected the provider-unavailable category on a rate-limited forge read: %q", output.String())
+	}
+	if !strings.Contains(output.String(), "temporarily unavailable") {
+		t.Fatalf("reason should name the transient forge unavailability: %q", output.String())
+	}
+	if !strings.Contains(output.String(), "acme/widgets#7") {
+		t.Fatalf("reason should name the trusted source identity: %q", output.String())
+	}
+	if strings.Contains(output.String(), "needs a human") {
+		t.Fatalf("a rate-limited forge read must not read as a verification rejection needing a human: %q", output.String())
+	}
+	if strings.Contains(output.String(), "no pull request for that head") {
+		t.Fatalf("a failed read must not claim the pull request is missing: %q", output.String())
+	}
+}
+
+// TestRunResolveIssueDroppedForgeConnectionEndsBlockedExternal proves the
+// #455 classification covers transport failures: a server that accepts the
+// connection and then closes it abruptly never lets the forge read
+// complete, so with no captured session the run ends blocked_external /
+// provider-unavailable for the operator's bounded retry — not a verifier
+// rejection, and never a claim that the PR is missing.
+func TestRunResolveIssueDroppedForgeConnectionEndsBlockedExternal(t *testing.T) {
+	root := t.TempDir()
+	remote := filepath.Join(root, "remote.git")
+	source := filepath.Join(root, "source")
+	runGit(t, root, "init", "--bare", remote)
+	runGit(t, root, "init", source)
+	configureGit(t, source)
+	write(t, filepath.Join(source, "README.md"), "base\n")
+	commit(t, source, "base: initial")
+	runGit(t, source, "branch", "-M", "main")
+	runGit(t, source, "remote", "add", "origin", remote)
+	runGit(t, source, "push", "-u", "origin", "main")
+
+	fakeOpenCode := filepath.Join(root, "opencode")
+	scratchDirectory := filepath.Join(root, "scratch")
+	if err := os.MkdirAll(scratchDirectory, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	writeExecutable(t, fakeOpenCode, "#!/bin/sh\ncase \"$1\" in mcp) exit 0;; esac\nprintf 'completed\\n' > completed.txt\ngit add --all -- .\ngit commit -m 'test: completed work' >/dev/null\nmkdir -p \"$COURIER_SCRATCH_DIR\"\nprintf '{\"outcome\":\"changes\"}' > \"$COURIER_SCRATCH_DIR/outcome.json\"\nexit 0\n")
+
+	// A server that accepts the connection and then drops it without a
+	// response: the executor's forge read fails inside the HTTP transport.
+	prServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		panic(http.ErrAbortHandler)
+	}))
+	defer prServer.Close()
+
+	workspace := filepath.Join(root, "workspace")
+	termination := filepath.Join(root, "termination")
+	t.Setenv("COURIER_REPO_URL", remote)
+	t.Setenv("COURIER_WORKSPACE", workspace)
+	t.Setenv("COURIER_SCRATCH_DIR", scratchDirectory)
+	t.Setenv("COURIER_BASE", "main")
+	t.Setenv("COURIER_BRANCH", "courier/resolve-issue/acme-widgets/7")
+	t.Setenv("COURIER_GOAL", "Open a PR to address issue #7. Declare the outcome at "+filepath.Join(defaultScratchDirectory, defaultOutcomeFilename)+".")
+	t.Setenv("COURIER_MODEL", "any-model/name")
+	t.Setenv("COURIER_MODE", "resolve-issue")
+	t.Setenv("COURIER_REPO", "acme/widgets")
+	t.Setenv("COURIER_REF", "7")
+	t.Setenv("COURIER_GITHUB_API_BASE", prServer.URL)
+	t.Setenv("COURIER_OPENCODE_BINARY", fakeOpenCode)
+	t.Setenv("COURIER_TERMINATION_FILE", termination)
+	t.Setenv("COURIER_RESUME_BACKOFF_SECONDS", "0")
+	t.Setenv("COURIER_RUN_NAME", "coderrun-linkage-dropped-connection")
+
+	var output bytes.Buffer
+	var errorsOut bytes.Buffer
+	code := run(context.Background(), &output, &errorsOut)
+	if code != exitNeedsHuman {
+		t.Fatalf("run exit code = %d, want %d (blocked-external ending on a dropped forge connection); stderr=%q stdout=%q", code, exitNeedsHuman, errorsOut.String(), output.String())
+	}
+	if !strings.Contains(output.String(), `"outcome":"blocked_external"`) {
+		t.Fatalf("expected a blocked_external outcome on a dropped forge connection: %q", output.String())
+	}
+	if !strings.Contains(output.String(), `"category":"provider-unavailable"`) {
+		t.Fatalf("expected the provider-unavailable category on a dropped forge connection: %q", output.String())
+	}
+	if !strings.Contains(output.String(), "temporarily unavailable") {
+		t.Fatalf("reason should name the transient forge unavailability: %q", output.String())
+	}
+	if !strings.Contains(output.String(), "acme/widgets#7") {
+		t.Fatalf("reason should name the trusted source identity: %q", output.String())
+	}
+	if strings.Contains(output.String(), "needs a human") {
+		t.Fatalf("a dropped forge connection must not read as a verification rejection needing a human: %q", output.String())
+	}
+	if strings.Contains(output.String(), "no pull request for that head") {
+		t.Fatalf("a failed read must not claim the pull request is missing: %q", output.String())
 	}
 }
 
@@ -6629,6 +6823,33 @@ func TestLinkageForgeFailureReason(t *testing.T) {
 		forgeErr.Error() + "; the run needs a human"
 	if got := report.linkageForgeFailureReason(forgeErr); got != want {
 		t.Fatalf("linkageForgeFailureReason = %q, want %q", got, want)
+	}
+}
+
+// TestForgeUnavailableReason pins the blocked-external reason for a forge
+// read that failed on a transient availability condition with no in-session
+// retry possible (#455): the trusted source identity, the forge's error
+// text verbatim, the transient-availability explanation, and the
+// operator-retry parking — and never a verifier-rejection marker.
+func TestForgeUnavailableReason(t *testing.T) {
+	var output, errorsOut bytes.Buffer
+	report := newReporter(&output, &errorsOut, config{
+		Mode: "resolve-issue",
+		Repo: "misospace/miso-gallery",
+		Ref:  502,
+	})
+	forgeErr := errors.New("GitHub API returned HTTP 500")
+	want := "the live pull-request state could not be verified to confirm an open, non-draft pull request with authoritative source-issue linkage to misospace/miso-gallery#502: " +
+		forgeErr.Error() + "; the forge was temporarily unavailable (rate limit, server error, or network failure), so the run is parked for bounded retry by the operator"
+	got := report.forgeUnavailableReason(forgeErr)
+	if got != want {
+		t.Fatalf("forgeUnavailableReason = %q, want %q", got, want)
+	}
+	if strings.Contains(got, "needs a human") {
+		t.Fatalf("forgeUnavailableReason must not read as a verification rejection needing a human: %q", got)
+	}
+	if strings.Contains(got, "no pull request") {
+		t.Fatalf("forgeUnavailableReason must not claim the pull request is missing: %q", got)
 	}
 }
 

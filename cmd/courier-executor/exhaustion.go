@@ -143,6 +143,33 @@ func (r reporter) availabilityRecoveryTermination(ctx context.Context, workspace
 	}
 }
 
+// forgeUnavailableTermination builds the recoverable blocked-external ending
+// for a pre-handoff forge observation that could not complete on a transient
+// availability condition (#455): the world was never observed, so the run
+// ends blocked_external for the operator's bounded retry with the honest
+// provider-unavailable category — never as a verifier rejection, which is
+// reserved for worlds the observation actually read and found contradictory.
+// Exit 2 keeps the handoff vocabulary valid, and the workspace snapshot is
+// the executor's own git-verified evidence. Unlike its capacity siblings it
+// takes no parent context and derives its snapshot deadline from
+// context.Background(): the transient branch fires precisely when the run
+// context is already failing (shutdown) or the budget is spent, and a
+// cancelled parent would degrade the snapshot to unknown instead of
+// capturing the git-verified workspace state the recovery path needs.
+func (r reporter) forgeUnavailableTermination(workspace *git.Workspace, cfg config, startCommit, reason string) termination {
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	return termination{
+		Phase:           "NeedsHuman",
+		Result:          "needs-human",
+		ExitCode:        exitNeedsHuman,
+		Reason:          reason,
+		Outcome:         string(executor.OutcomeBlockedExternal),
+		Category:        terminalCategoryProviderUnavailable,
+		WorkspaceSafety: capacityWorkspaceSafety(ctx, workspace, cfg.RemoteURL, cfg.Branch, startCommit),
+	}
+}
+
 // capacityWorkspaceSafety computes the executor-owned workspace snapshot at
 // the exhaustion stop, using the same bounded vocabulary as the native
 // trusted observer (PublicationEngine.CapacityWorkspaceSafety): uncommitted

@@ -4341,3 +4341,35 @@ earns a 401 that is classified as a definite denial (superseded by #406: a
   tests: `TestReadCappedRejectsNonRegular` and `TestCaptureFifoSwapRace`, both
   asserting non-blocking with a deadline guard so losing `O_NONBLOCK` fails
   rather than hangs the suite. (#336, #389; composes with #237, #390)
+- **2026-10-18 — #455: a Verifying forge read that fails on a transient
+  availability condition ends `blocked_external`, not `verifier-rejection`.**
+  The legacy executor's pre-handoff observation previously collapsed every
+  forge-read failure with no retry remaining into `verifier-rejection`
+  `NeedsHuman`, so three resolve-issue runs whose work was published and
+  correct ended as human parks because GitHub rate-limited the observer
+  (executor 0.1.10, misospace/pr-reviewer-action #1080/#1114/#588). A read
+  that could not complete proves nothing about the world, so it is not a
+  verified contradiction. Forge errors are now self-describing:
+  `internal/github` marks its typed errors — `*APIError` is transient for
+  429, any 5xx, and a 403 whose message or body names the rate limit or
+  abuse protection, while a plain 403 or 401 stays an authoritative verdict
+  the forge did reach — and transport send failures are wrapped in a typed
+  error that is always transient. The forge-generic predicate
+  `forge.IsTransientAvailability` classifies through the redaction
+  boundary's unwrapping, so the contract stays provider-agnostic. When the
+  observation fails with no in-session retry possible (budget spent, no
+  captured session, or shutdown) and the error is transient, the run
+  terminates on the recovery channel — exit 2, `blocked_external` outcome,
+  `provider-unavailable` diagnostic category, workspace-safety snapshot,
+  replacing any declared outcome tag the run had carried, since a world
+  that could not be observed cannot settle a declaration —
+  which the operator already maps to `PhaseBlockedExternal` and the fenced
+  capacity-recovery path (#327); a transient failure with budget remaining
+  still retries factually inside the #170 continuation budget. Fail-closed
+  semantics are unchanged: a failed read never publishes `Verifying`
+  success and never claims the pull request is missing. `verifier-rejection`
+  is reserved for worlds the observation actually read and found
+  contradictory, and the operator envelope faults keep their fail-closed
+  positions (#282). Git-side remote-publication read failures are not yet
+  classified as transient — that is follow-up work if incidents show them.
+  (#455)

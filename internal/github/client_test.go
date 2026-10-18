@@ -14,6 +14,7 @@ import (
 
 	courierv1alpha1 "github.com/misospace/courier/api/v1alpha1"
 	"github.com/misospace/courier/internal/controller"
+	"github.com/misospace/courier/internal/forge"
 )
 
 func TestPullRequestOperations(t *testing.T) {
@@ -1102,5 +1103,54 @@ func TestBoundedRequestStillCompletes(t *testing.T) {
 	}
 	if pull.Number != 7 || pull.Title != "Bound the read" {
 		t.Fatalf("GetPullRequest() = %#v, want the slow response decoded", pull)
+	}
+}
+
+// TestAPIErrorTransientAvailability pins the availability classification
+// the executor's blocked-external ending (#455) relies on: rate limits and
+// server errors kept the forge read from completing, a 403 is transient
+// only when its message or body names the rate limit or abuse protection,
+// and other statuses are verdicts the forge did reach.
+func TestAPIErrorTransientAvailability(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		name string
+		err  *APIError
+		want bool
+	}{
+		{"429", &APIError{StatusCode: 429}, true},
+		{"500", &APIError{StatusCode: 500, Message: "Internal Server Error"}, true},
+		{"502", &APIError{StatusCode: 502, Body: "Bad Gateway"}, true},
+		{"403 rate limit message", &APIError{StatusCode: 403, Message: "API rate limit exceeded for this IP"}, true},
+		{"403 secondary rate body", &APIError{StatusCode: 403, Body: "You have exceeded a secondary rate limit"}, true},
+		{"403 abuse", &APIError{StatusCode: 403, Message: "ABUSE detection triggered"}, true},
+		{"403 plain", &APIError{StatusCode: 403, Message: "Resource not accessible by integration"}, false},
+		{"401", &APIError{StatusCode: 401, Message: "Bad credentials"}, false},
+		{"404", &APIError{StatusCode: 404, Message: "Not Found"}, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := tc.err.TransientAvailability(); got != tc.want {
+				t.Fatalf("TransientAvailability() = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+// TestTransportErrorTransientAvailability proves the transport-send failure
+// the client wraps keeps its human-readable text, unwraps to the original
+// error, and classifies as transient availability (#455).
+func TestTransportErrorTransientAvailability(t *testing.T) {
+	t.Parallel()
+	inner := errors.New(`Get "https://api.example.com/repos/a/b": dial tcp: connection refused`)
+	err := &transportError{err: fmt.Errorf("GitHub request: %w", inner)}
+	if err.Error() != "GitHub request: "+inner.Error() {
+		t.Fatalf("transportError text = %q, want the GitHub request prefix preserved", err.Error())
+	}
+	if !errors.Is(err, inner) {
+		t.Fatal("errors.Is(transportError, inner) = false, want the original unwrapped")
+	}
+	if !forge.IsTransientAvailability(err) {
+		t.Fatal("forge.IsTransientAvailability(transportError) = false, want true")
 	}
 }

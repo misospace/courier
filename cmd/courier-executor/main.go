@@ -1429,7 +1429,8 @@ func run(ctx context.Context, stdout, stderr io.Writer) int {
 			// path therefore participates in the same continuation/repair
 			// loop as the undeclared path — without losing the declared
 			// outcome tag, which applyHandoffPlan preserves on the
-			// terminating terminal. This keeps the legacy executor from
+			// verifier-rejection terminal (a transient forge read instead
+			// ends blocked_external, #455). This keeps the legacy executor from
 			// forcing NeedsHuman on a declared run whose captured
 			// session still has unused continuation budget.
 			if result.Phase == "Verifying" {
@@ -1452,6 +1453,10 @@ func run(ctx context.Context, stdout, stderr io.Writer) int {
 					continue
 				}
 				if verdict.FailReason != "" {
+					if verdict.ProviderUnavailable {
+						report.terminateCaptured(ctx, workspace, startCommit, report.forgeUnavailableTermination(workspace, cfg, startCommit, verdict.FailReason))
+						return exitNeedsHuman
+					}
 					report.terminateCaptured(ctx, workspace, startCommit, termination{Phase: "NeedsHuman", Result: "needs-human", ExitCode: exitNeedsHuman, Reason: verdict.FailReason, Outcome: result.Outcome, Category: terminalCategoryVerifierRejection})
 					return exitNeedsHuman
 				}
@@ -1520,6 +1525,10 @@ func run(ctx context.Context, stdout, stderr io.Writer) int {
 					continue
 				}
 				if verdict.FailReason != "" {
+					if verdict.ProviderUnavailable {
+						report.terminateCaptured(ctx, workspace, startCommit, report.forgeUnavailableTermination(workspace, cfg, startCommit, verdict.FailReason))
+						return exitNeedsHuman
+					}
 					report.terminateCaptured(ctx, workspace, startCommit, termination{Phase: "NeedsHuman", Result: "needs-human", ExitCode: exitNeedsHuman, Reason: verdict.FailReason, Category: terminalCategoryVerifierRejection})
 					return exitNeedsHuman
 				}
@@ -3408,6 +3417,19 @@ func (r reporter) linkageForgeFailureReason(err error) string {
 	return fmt.Sprintf("the live pull-request state could not be verified to confirm an open, non-draft pull request with authoritative source-issue linkage to %s: %s; the run needs a human", target, err.Error())
 }
 
+// forgeUnavailableReason composes the blocked-external reason for a Verifying
+// candidate whose live forge read failed on a transient availability
+// condition — a rate limit, a server error, or a network failure — with no
+// in-session retry possible (#455). The forge was temporarily unavailable,
+// so the world was never observed: the run is parked for bounded retry by
+// the operator rather than failed as a verification rejection, and the
+// reason never claims the pull request is missing.
+func (r reporter) forgeUnavailableReason(err error) string {
+	source := r.sourceIssue()
+	target := sourceIssueTarget(source)
+	return fmt.Sprintf("the live pull-request state could not be verified to confirm an open, non-draft pull request with authoritative source-issue linkage to %s: %s; the forge was temporarily unavailable (rate limit, server error, or network failure), so the run is parked for bounded retry by the operator", target, err.Error())
+}
+
 // draftExhaustedReason composes the NeedsHuman reason for a run whose
 // continuation budget ran out while the run branch's pull request was
 // still a draft (#247).
@@ -3508,6 +3530,13 @@ func (r reporter) closedOnlyPRReason() string {
 // (ambiguous, closed-only, foreign head, wrong base, a head whose
 // current commits the remote does not advertise, or a body whose
 // criterion-evidence block cannot be repaired) (#247, #248, #249).
+// ProviderUnavailable is true when the forge read failed on a transient
+// availability condition — a rate limit, a server error, or a network
+// failure — and no in-session retry is possible, so the world was never
+// observed: the run then ends blocked_external for the operator's
+// bounded retry rather than NeedsHuman, which is reserved for worlds
+// the observation actually read and found contradictory (#455). It is
+// never set alongside a retryable verdict.
 type handoffVerdict struct {
 	Pass        bool
 	ContinueMsg string
@@ -3528,6 +3557,9 @@ type handoffVerdict struct {
 	// criteria check did not run.
 	StatusCounts map[broker.CriterionStatus]int
 	FailReason   string
+	// ProviderUnavailable marks a transient forge-availability ending
+	// (#455); see the struct doc above.
+	ProviderUnavailable bool
 }
 
 // applyHandoffPlan runs the identity-checked pre-handoff forge
@@ -3552,8 +3584,12 @@ type handoffVerdict struct {
 //     creation over an unverifiable or foreign world (#247).
 //   - A failed live observation is never represented as a confirmed
 //     missing PR: it retries inside the bounded budget with a factual
-//     "could not verify" message, and fails closed to NeedsHuman when
-//     no retry is possible (#247, #248).
+//     "could not verify" message. When no retry is possible, a read
+//     that failed on a transient availability condition — a rate limit,
+//     a server error, or a network failure — ends blocked_external for
+//     the operator's bounded retry, because the world was never
+//     observed (#455); any other read failure fails closed to
+//     NeedsHuman (#247, #248).
 //   - Two operator-side envelope faults are not read failures and not
 //     model-repairable defects, so they fail closed to NeedsHuman on
 //     sight without consuming the #170 budget (#282). The
@@ -3612,6 +3648,14 @@ func (r reporter) applyHandoffPlan(ctx context.Context, continuations int, maxCo
 			"error": linkErr.Error(),
 		})
 		if continuations >= maxContinuations || sessionID == "" || ctxErr != nil {
+			if forge.IsTransientAvailability(linkErr) {
+				// The read could not complete on a transient
+				// availability condition, so the world was never
+				// observed: the run ends blocked_external for the
+				// operator's bounded retry instead of escalating to
+				// a human as a verification rejection (#455).
+				return handoffVerdict{FailReason: r.forgeUnavailableReason(linkErr), ProviderUnavailable: true}
+			}
 			return handoffVerdict{FailReason: r.linkageForgeFailureReason(linkErr)}
 		}
 		// The verifier could not read the forge state at all. That is
