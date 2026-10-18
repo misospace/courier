@@ -286,7 +286,7 @@ affirmative trusted safety proof; settle atomically applies it. Incomplete proof
 unsupported capability, or stale fencing retains ownership. Transient settlement
 errors are retried with the same run-scoped idempotency key after controller
 reconstruction. The fake contract exercises both resolve-issue and fix-PR paths,
-including preserved branch/PR metadata; Dispatch implements the interfaces via the merged #1259 receipt-fenced endpoints. Issue settlement is fenced by the issued claim token. If its POST response is lost or cannot be confirmed, the adapter makes one bounded best-effort lookup in the latest 100 audit rows, matching an exact SHA-256 capacity receipt marker and issue identity; a positive match replays success without another POST. This is not durable server-side idempotency: audit pagination/retention, malformed responses, or lookup failures leave the outcome unknown and ownership held for retry. PR-fix capacity settlement uses the issued per-handout receipt. Lifecycle task reports separately support payload-bound replay when given a stable idempotency key. Discovery and dedupe bypass history only for a
+including preserved branch/PR metadata; Dispatch implements the interfaces via the merged #1259 receipt-fenced endpoints. Issue settlement is fenced by the issued claim token; because a re-claim around admission rotates that token while an admission re-claim re-emits the rotated receipt onto the run, a settlement refused for a rotated or gone lease re-presents the claim once and retries against the live token — rotation is adopted, never treated as staleness, while ownership, human-hold, expiry, and closed refusals still stop settlement (#388). If its POST response is lost or cannot be confirmed, the adapter makes one bounded best-effort lookup in the latest 100 audit rows, matching an exact SHA-256 capacity receipt marker and issue identity, or the run-scoped settlement identity tag every receipt note now carries beside its token-specific marker (a settlement presenting no identity key stamps the marker alone, legacy-shaped) — so a handoff that landed under an adopted token replays from durable evidence on later passes whose receipt names only the original token, instead of adopting again under a freshly minted third token and posting a duplicate settlement (#395); a positive match replays success without another POST. This is not durable server-side idempotency: audit pagination/retention, malformed responses, or lookup failures leave the outcome unknown and ownership held for retry. PR-fix capacity settlement uses the issued per-handout receipt. Lifecycle task reports separately support payload-bound replay when given a stable idempotency key. Discovery and dedupe bypass history only for a
 `BlockedExternal` capacity-exhaustion run with `CapacityRecovery=True/Settled`
 and `LifecycleReported=True`; a deterministic predecessor-UID successor name permits stable source IDs while
 retaining diagnostic history and active-run deduplication. Other, incomplete, and human
@@ -649,7 +649,9 @@ The invariants the mechanism must hold:
    claimed to be a recoverable patch.
 5. Capture is best-effort and bounded; it never changes an ending's phase,
    exit code, or lifecycle report, and never delays termination beyond its
-   20-second operation deadline inside the 45-second grace.
+   20-second operation deadline plus the bounded child-kill waits — the
+   cancellation path's 10-second wait for the model's process group and the
+   capped git reads' 2-second `WaitDelay` — inside the 45-second grace.
 6. Evidence is per-incarnation and slot names are intake-derived; no capture
    — gated, clean, or stolen-token — can destroy another incarnation's
    evidence.
@@ -2051,6 +2053,31 @@ named items remain unresolved and must not be described as production-ready:
   prove. Rejected: treating any non-zero reap as a failure (every capped run
   would be reported as a failed capture), and discarding the prefix on the
   error path (loses the read that explains the failure).
+- **2026-10-18 — #395: adopted-token settlement replays by run-scoped settlement
+  identity, not only by the token-derived marker.** Settlement adoption (#388)
+  posts the capacity handoff under a marker hashed from the adopted token, but
+  replay looked up only the marker derived from the receipt's original token, so
+  a handoff that landed while its success was never persisted (lost response
+  plus lost `CapacityRecovery=True` patch or a crash) was invisible to the next
+  pass: it retried the dead fence, re-claimed — Dispatch deletes the lease on a
+  successful handoff, so the next claim mints a third token — and posted a
+  second successful settlement (extended cooldown, transient re-claim of an
+  issue already back in circulation). Persisting the adopted token onto the run
+  receipt was rejected: adoption happens inside the settlement call, so any
+  write-back that loses its response window reopens the same gap, and it would
+  widen the `source.CapacityRecovery` seam for a source-specific token concept
+  the core must not carry. Instead every settlement receipt note now carries,
+  beside the token-specific marker, a token-independent SHA-256 tag of the run's
+  settlement identity (idempotency key + work identity) — the controller path
+  always presents a key, and without one the client stamps the marker alone,
+  fail-safe to legacy replay — and the audit replay matches that tag on any
+  successful row for the same issue — durable evidence a later pass
+  can always recompute. The key is unique per run attempt, so a previous
+  attempt's landed row is never conflated with a new one, and the unchanged
+  marker match keeps replaying pre-tag rows for the token they name.
+  Non-stealing is untouched: the tag only suppresses this run's own duplicate
+  POST; fencing on the POST itself is unchanged. (#395)
+
 - **2026-10-17 — #392: the capture's capped git read is bounded by the
   operation deadline, and a pipe outliving its child keeps the bytes
   rather than the failure.** `runGitCapped` read the child's stdout
@@ -2205,6 +2232,29 @@ named items remain unresolved and must not be described as production-ready:
   the writer now consumes every chunk whole. No new bound is claimed — the
   grace period already budgets a 2-second child-kill wait; this puts
   `runGit`'s reads inside it.
+
+- **2026-10-16 — #388: claim-token rotation around admission is adopted, not wedged.**
+  A deployed smoke stranded a `BlockedExternal` capacity run permanently: discovery/
+  admission claim churn rotated the Dispatch lease token, while the run's
+  `SourceReceipt` was persisted set-once and settlement retried the inert fence
+  forever (Dispatch's handoff refusals carry no machine-readable code today, so
+  even the stale classification never fired). The fix adopts the winning fence at
+  both ends instead of holding the losing one: the operator status patch now
+  re-emits a changed non-empty `SourceReceipt` so a re-claim at admission records
+  the token the run actually holds, and the Dispatch settlement path, on a
+  rotation-only refusal (`stale_claim_token` / `no_active_claim`), re-presents the
+  claim — Dispatch keeps the token across same-agent renewals, so this adopts the
+  live lease rather than minting a competing one — and retries the fenced handoff
+  exactly once. Ownership-changed, human-hold, expired, and closed/done refusals
+  never re-claim: releasing another owner's claim or reversing a human stays
+  impossible. The squat policy is settled deliberately: an unsettled
+  `BlockedExternal` run remains the identity barrier until its settlement
+  converges — with adoption it does — and only a `CapacityRecovery=True/Settled`
+  exhaustion releases the identity for a successor, so a blocked run never
+  silently swallows rediscovery forever, it stops doing so when settlement lands.
+  The PR-fix follow-up path keeps its per-handout generation fence unchanged:
+  a rotated handout token there means a newer generation owns the work, which is
+  staleness by design, not rotation to adopt. (#388)
 
 - **2026-10-16 — #282: the legacy executor enforces the criterion-evidence
   contract in one shared handoff plan, and the pinned envelope binds to the
@@ -4034,9 +4084,32 @@ was superseded.
   projection that cannot be read fails the request closed with a fixed,
   retryable category rather than falling back to the last good bytes: during a
   swap the honest answer is that the credential is unknown, and a stale token
-  earns a 401 that is classified as a definite denial. Startup still validates
+earns a 401 that is classified as a definite denial (superseded by #406: a
+  stale token's 401 is now classified by the request's own freshness, above).
+  Startup still validates
   the projection once, so a control pod that can never authenticate never
   launches. (#383)
+- **2026-10-17 — #406: a broker 401 is a denial unless the projected credential
+  has already been replaced.** With #383's per-request token read, the one
+  remaining 401 a healthy run can earn is the kubelet swap window: the request
+  read the projection before kubelet swapped it, so it carried bytes the
+  apiserver was already refusing, and classifying every 401 as a definite
+  denial converted that window into `PublicationBlockedError` and a human even
+  though a fresh token was on disk by the time the refusal came back. Making
+  401 retryable outright was rejected: the same status is what a misconfigured
+  or cross-run caller earns, and a blanket retry turns a loud block into a
+  silent spin. The distinction therefore comes from the request's own
+  freshness: when a work-path or capabilities read is refused with 401, control
+  re-reads the projected token, and only bytes that differ from the ones the
+  refused request carried mark the rotation window — that refusal is
+  retryable, and the next attempt carries the fresh bytes. Same bytes, or a
+  re-read that fails, keep the denial loud. A misconfigured caller is loud on
+  the first attempt whenever the projection is stable, and in any case
+  converges inside the same bounded retry rounds, so nothing spins silently.
+  The residual ordering — kubelet lagging so far past a token's expiry that
+  the projection still holds the refused bytes at the re-read — also stays
+  loud: no positive freshness evidence exists for it, and the run blocks for a
+  human rather than guessing on a clock the process cannot observe. (#406)
 - **2026-10-17 — #372: native worker cancellation proves the task tree
   is gone, and never claims otherwise.**
   `internal/protocol` ran each task through `exec.CommandContext`, which kills
@@ -4086,3 +4159,34 @@ was superseded.
   (#216) are unchanged; provisioning and the fence's own reads still use the
   cached client, because only the relaunch's delete and ceiling judgement are
   destructive decisions. (#370, #105, #223)
+- **2026-10-18 — #336: the classified-regular capture read refuses a non-regular
+  descriptor rather than blocking on it.** `Capture` classifies each changed path
+  with `os.Lstat` and reads a path classified regular through `readCapped`, which
+  since #237 opened `O_RDONLY|O_NOFOLLOW`. A hostile worktree that swapped such a
+  path for a fifo between the classification and the open blocked that open
+  indefinitely: an `O_RDONLY` open of a fifo waits for a writer that may never
+  come, and no bound — context or otherwise — was consulted there. The window is
+  the same classification-versus-open TOCTOU #237 closed for symlinks. The fix
+  (PR #389) opens `O_RDONLY|O_NOFOLLOW|O_NONBLOCK`, so the open cannot wait for a
+  peer that may never arrive, then `f.Stat()`s the opened descriptor and fails a
+  non-regular result with a new `errNotRegular` sentinel. `fstat` on the
+  descriptor rather than a second `Lstat` on the path is deliberate: it describes
+  the object actually opened, so the check cannot itself be raced the way a
+  path-based re-check could. `Capture` maps `errNotRegular` to
+  `DispositionOmittedBinary` with `totals.OmittedBinary++` and stores nothing —
+  deliberately identical to what the pre-existing non-regular `Lstat` branch does
+  for a path classified non-regular outright, mirroring how #237's `ELOOP` (a
+  swap into a symlink) re-classifies as symlink metadata: each swap class is
+  re-classified exactly as the classification pass would have classified it, so
+  content a hostile tree slipped past classification is never stored. A swap to
+  a socket needs no branch of its own: a read-only open of a socket fails with
+  `ENXIO` before any blocking is possible and falls to the generic failed-read
+  case, which also stores nothing. The guard composes with the capture deadline
+  bound (#390) rather than conflicting with it: `O_NONBLOCK` bounds the *open* by
+  making a wait impossible — it rejects non-regular descriptors before any read
+  begins — while the deadline bounds the *read* of the regular files the guard
+  lets through, which is all the guard leaves unbounded and all the deadline
+  needs to cover. `O_NONBLOCK` is a no-op for those regular files. Regression
+  tests: `TestReadCappedRejectsNonRegular` and `TestCaptureFifoSwapRace`, both
+  asserting non-blocking with a deadline guard so losing `O_NONBLOCK` fails
+  rather than hangs the suite. (#336, #389; composes with #237, #390)

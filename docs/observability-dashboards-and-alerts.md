@@ -123,8 +123,11 @@ the lane is missing, suspended, or at capacity, logging those transitions. It
 logs a discovery error at `internal/source/runner.go:69,80`.
 
 **Retention** (`internal/controller/reap.go`): resolved `Done` runs are deleted
-after five minutes via the `courier.misospace.dev/done-at` annotation.
-`Failed`/`NeedsHuman` runs are reaped after their seven-day default, measured
+after their five-minute default (`defaultDoneRetention`, overridden by
+`--done-retention`) via the `courier.misospace.dev/done-at` annotation.
+`Failed`/`NeedsHuman` runs are reaped after their seven-day defaults
+(`defaultFailedRetention` and `defaultNeedsHumanRetention`, overridden by
+`--failed-retention` and `--needs-human-retention`), measured
 from the `courier.misospace.dev/failed-at` and
 `courier.misospace.dev/needs-human-at` annotations, only once the lifecycle
 report reached a positive settled state, and never out of the per-repository
@@ -272,9 +275,10 @@ stuck?*
 | Oldest retained run | Is retention progressing? | `courier_coderuns_oldest_terminal_age_seconds` | age of oldest retained terminal run per phase | none ⇒ "none retained" | status |
 | Stuck retention | Runs past window but not reaped | annotations + `LifecycleReported` (gap) | count past window with unsettled report | — | **gap** |
 
-The retention design bounds `Done` (five minutes) and
-`Failed`/`NeedsHuman` (seven days); `HandedOff` is explicitly out of scope
-there. The reap counter counts delete requests the API server accepted, so a
+The retention design bounds `Done` (five-minute default, `--done-retention`)
+and `Failed`/`NeedsHuman` (seven-day defaults, `--failed-retention` and
+`--needs-human-retention`); `HandedOff` is explicitly out of scope there. The
+reap counter counts delete requests the API server accepted, so a
 secure run held by its topology finalizer is still counted there; the age gauge
 is what shows such a run is still retained. A growing retained backlog is the
 observable symptom of the class of failure that motivated the umbrella design
@@ -644,8 +648,11 @@ These rules make any two renderings equivalent:
 
 - **No high-cardinality labels.** Run IDs, issue numbers, PR numbers, arbitrary
   error strings, repository names, and secret values must never be metric
-  labels. The existing metrics carry only `lane`, `mode`, and terminal `phase`
-  (plus `lane` alone on the gauges), which is the intended budget.
+  labels. The existing metrics carry only `lane`, `mode`, and terminal `phase`,
+  plus `lane` alone on the gauges and `phase` alone on the retention series
+  (`courier_coderuns_reap_requests_total` and
+  `courier_coderuns_oldest_terminal_age_seconds`, `reapMetricLabels` in
+  `internal/controller/metrics.go:35`), which is the intended budget.
 - **Correlate in logs, not labels.** Per-run correlation (`run_id`) belongs to
   the structured log stream, joined in the dashboard, never promoted to a
   metric dimension.
