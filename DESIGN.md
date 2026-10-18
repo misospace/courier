@@ -286,7 +286,7 @@ affirmative trusted safety proof; settle atomically applies it. Incomplete proof
 unsupported capability, or stale fencing retains ownership. Transient settlement
 errors are retried with the same run-scoped idempotency key after controller
 reconstruction. The fake contract exercises both resolve-issue and fix-PR paths,
-including preserved branch/PR metadata; Dispatch implements the interfaces via the merged #1259 receipt-fenced endpoints. Issue settlement is fenced by the issued claim token. If its POST response is lost or cannot be confirmed, the adapter makes one bounded best-effort lookup in the latest 100 audit rows, matching an exact SHA-256 capacity receipt marker and issue identity; a positive match replays success without another POST. This is not durable server-side idempotency: audit pagination/retention, malformed responses, or lookup failures leave the outcome unknown and ownership held for retry. PR-fix capacity settlement uses the issued per-handout receipt. Lifecycle task reports separately support payload-bound replay when given a stable idempotency key. Discovery and dedupe bypass history only for a
+including preserved branch/PR metadata; Dispatch implements the interfaces via the merged #1259 receipt-fenced endpoints. Issue settlement is fenced by the issued claim token; because a re-claim around admission rotates that token while an admission re-claim re-emits the rotated receipt onto the run, a settlement refused for a rotated or gone lease re-presents the claim once and retries against the live token — rotation is adopted, never treated as staleness, while ownership, human-hold, expiry, and closed refusals still stop settlement (#388). If its POST response is lost or cannot be confirmed, the adapter makes one bounded best-effort lookup in the latest 100 audit rows, matching an exact SHA-256 capacity receipt marker and issue identity; a positive match replays success without another POST. This is not durable server-side idempotency: audit pagination/retention, malformed responses, or lookup failures leave the outcome unknown and ownership held for retry. PR-fix capacity settlement uses the issued per-handout receipt. Lifecycle task reports separately support payload-bound replay when given a stable idempotency key. Discovery and dedupe bypass history only for a
 `BlockedExternal` capacity-exhaustion run with `CapacityRecovery=True/Settled`
 and `LifecycleReported=True`; a deterministic predecessor-UID successor name permits stable source IDs while
 retaining diagnostic history and active-run deduplication. Other, incomplete, and human
@@ -2179,6 +2179,29 @@ named items remain unresolved and must not be described as production-ready:
   the writer now consumes every chunk whole. No new bound is claimed — the
   grace period already budgets a 2-second child-kill wait; this puts
   `runGit`'s reads inside it.
+
+- **2026-10-16 — #388: claim-token rotation around admission is adopted, not wedged.**
+  A deployed smoke stranded a `BlockedExternal` capacity run permanently: discovery/
+  admission claim churn rotated the Dispatch lease token, while the run's
+  `SourceReceipt` was persisted set-once and settlement retried the inert fence
+  forever (Dispatch's handoff refusals carry no machine-readable code today, so
+  even the stale classification never fired). The fix adopts the winning fence at
+  both ends instead of holding the losing one: the operator status patch now
+  re-emits a changed non-empty `SourceReceipt` so a re-claim at admission records
+  the token the run actually holds, and the Dispatch settlement path, on a
+  rotation-only refusal (`stale_claim_token` / `no_active_claim`), re-presents the
+  claim — Dispatch keeps the token across same-agent renewals, so this adopts the
+  live lease rather than minting a competing one — and retries the fenced handoff
+  exactly once. Ownership-changed, human-hold, expired, and closed/done refusals
+  never re-claim: releasing another owner's claim or reversing a human stays
+  impossible. The squat policy is settled deliberately: an unsettled
+  `BlockedExternal` run remains the identity barrier until its settlement
+  converges — with adoption it does — and only a `CapacityRecovery=True/Settled`
+  exhaustion releases the identity for a successor, so a blocked run never
+  silently swallows rediscovery forever, it stops doing so when settlement lands.
+  The PR-fix follow-up path keeps its per-handout generation fence unchanged:
+  a rotated handout token there means a newer generation owns the work, which is
+  staleness by design, not rotation to adopt. (#388)
 
 - **2026-10-16 — #282: the legacy executor enforces the criterion-evidence
   contract in one shared handoff plan, and the pinned envelope binds to the
