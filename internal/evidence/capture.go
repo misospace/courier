@@ -619,7 +619,15 @@ func runGit(ctx context.Context, dir string, args ...string) ([]byte, error) {
 // child is killed and overLimit is set with the bounded prefix returned, so a
 // run that would otherwise buffer an unbounded result stops at the cap.
 // A failing command returns a wrapped error (with the command's trimmed
-// stderr). A canceled context that reached the command returns its own error
+// stderr), including on the over-limit branch: killing an over-running child
+// is not itself a failure, so a child the kill reached returns the prefix
+// with overLimit and no error, while a child that had already exited
+// non-zero returns its exit status and stderr beside that same prefix, so
+// callers must check err before overLimit. A child that exits on its own is
+// *exited* and a child this function kills is *signaled*, which is what
+// separates the two; a still-running child that would have failed is
+// indistinguishable from one that would have succeeded, and is not guessed at.
+// A canceled context that reached the command returns its own error
 // and never overLimit, even when the output had already exceeded the limit
 // before the cancellation or a surviving grandchild left the stdout pipe open.
 func runGitCapped(ctx context.Context, dir string, limit int, args ...string) (out []byte, overLimit bool, err error) {
@@ -662,9 +670,19 @@ func runGitCapped(ctx context.Context, dir string, limit int, args ...string) (o
 	}
 	if len(out) > limit {
 		_ = cmd.Process.Kill()
-		_ = cmd.Wait()
+		waitErr := cmd.Wait()
 		if ctx.Err() != nil {
 			return nil, false, ctx.Err()
+		}
+		// Stopping an over-running child is not itself a failure, so a child
+		// the kill reached is signaled rather than exited and the bounded
+		// prefix stands. A child that had already exited on its own reaps with
+		// its real status — the kill above is a no-op against a pid that is
+		// already a zombie — and a truncated prefix of a failed command is
+		// not a result, so the failure is surfaced beside the prefix instead
+		// of reported as a clean over-limit.
+		if state := cmd.ProcessState; state != nil && state.Exited() && !state.Success() {
+			return out, true, fmt.Errorf("git %s: %w: %s", strings.Join(args, " "), waitErr, strings.TrimSpace(string(stderr.data)))
 		}
 		return out, true, nil
 	}
