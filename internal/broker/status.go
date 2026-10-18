@@ -12,6 +12,7 @@ import (
 	ctrlclient "sigs.k8s.io/controller-runtime/pkg/client"
 
 	courier "github.com/misospace/courier/api/v1alpha1"
+	"github.com/misospace/courier/internal/topology"
 )
 
 // HarnessPatch is the closed set of status fields trusted harness control may
@@ -137,7 +138,7 @@ func (w *StatusWriter) Write(ctx context.Context, identity StatusIdentity, patch
 			return &StatusUnavailableError{Err: fmt.Errorf("read current control pod: %w", err)}
 		}
 		ownerName, ownerUID, ok := controllerRunOwner(pod)
-		if pod.UID != identity.ControlPodUID || pod.DeletionTimestamp != nil || pod.Spec.ServiceAccountName != identity.ControlServiceAccount || !ok || ownerName != w.runName || ownerUID != identity.RunUID || pod.Labels["courier.misospace.dev/coderrun"] != w.runName || pod.Labels["courier.misospace.dev/component"] != "coordinator" {
+		if pod.UID != identity.ControlPodUID || pod.DeletionTimestamp != nil || pod.Spec.ServiceAccountName != identity.ControlServiceAccount || !ok || ownerName != w.runName || ownerUID != identity.RunUID || pod.Labels[topology.LabelRun] != topology.RunLabelValue(w.runName) || pod.Labels["courier.misospace.dev/component"] != "coordinator" {
 			return fmt.Errorf("authenticated control pod is stale or is not owned by this CoderRun")
 		}
 		pods := &corev1.PodList{}

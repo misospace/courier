@@ -13,6 +13,7 @@ import (
 	"testing"
 
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	courierv1alpha1 "github.com/misospace/courier/api/v1alpha1"
@@ -1621,6 +1622,58 @@ func TestPodConfigValidateRejectsPartialEvidence(t *testing.T) {
 				t.Fatalf("Validate() = %v, want no error for %s", err, test.name)
 			}
 		})
+	}
+}
+
+// TestBuildCoordinatorPodUsesLaneResources pins the lane as the single source
+// of pod sizing: what the lane configures is what the container carries.
+func TestBuildCoordinatorPodUsesLaneResources(t *testing.T) {
+	lane := evidenceTestLane()
+	lane.Spec.Resources = corev1.ResourceRequirements{
+		Requests: corev1.ResourceList{
+			corev1.ResourceCPU:    resource.MustParse("1500m"),
+			corev1.ResourceMemory: resource.MustParse("3Gi"),
+		},
+		Limits: corev1.ResourceList{
+			corev1.ResourceCPU:    resource.MustParse("6"),
+			corev1.ResourceMemory: resource.MustParse("12Gi"),
+		},
+	}
+	pod, err := BuildCoordinatorPod(evidenceTestRun("run-lane-resources"), lane, DefaultPodConfig())
+	if err != nil {
+		t.Fatalf("BuildCoordinatorPod() error = %v", err)
+	}
+	resources := pod.Spec.Containers[0].Resources
+	assertContainerCPUAndMemory(t, resources.Requests, "1500m", "3Gi")
+	assertContainerCPUAndMemory(t, resources.Limits, "6", "12Gi")
+}
+
+// TestBuildCoordinatorPodDefaultsLaneResources pins the point of the issue: a
+// lane that configures no resources still yields finite requests and limits,
+// so the coordinator pod is never BestEffort.
+func TestBuildCoordinatorPodDefaultsLaneResources(t *testing.T) {
+	pod, err := BuildCoordinatorPod(evidenceTestRun("run-default-resources"), evidenceTestLane(), DefaultPodConfig())
+	if err != nil {
+		t.Fatalf("BuildCoordinatorPod() error = %v", err)
+	}
+	resources := pod.Spec.Containers[0].Resources
+	if len(resources.Requests) == 0 || len(resources.Limits) == 0 {
+		t.Fatalf("resources = %#v, want non-empty requests and limits for a lane that configures none", resources)
+	}
+	assertContainerCPUAndMemory(t, resources.Requests, "250m", "512Mi")
+	assertContainerCPUAndMemory(t, resources.Limits, "2", "4Gi")
+}
+
+func assertContainerCPUAndMemory(t *testing.T, list corev1.ResourceList, cpu, memory string) {
+	t.Helper()
+	if len(list) == 0 {
+		t.Fatalf("resource list is empty, want cpu %q and memory %q", cpu, memory)
+	}
+	if got := list.Cpu(); got == nil || got.String() != cpu {
+		t.Fatalf("cpu = %v, want %q", list.Cpu(), cpu)
+	}
+	if got := list.Memory(); got == nil || got.String() != memory {
+		t.Fatalf("memory = %v, want %q", list.Memory(), memory)
 	}
 }
 

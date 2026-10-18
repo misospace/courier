@@ -364,7 +364,10 @@ func encodeDispatchContext(existing, token, fixID string, generation int) string
 }
 
 func (c *HTTPClient) PrepareCapacityRecovery(ctx context.Context, id, opaqueContext string) (source.CapacityRecoveryProof, error) {
-	d, err := decodeWorkID(id)
+	// Resolve the issue ID the same way Claim does: Dispatch's task offer may
+	// carry only repo+number, and the fence still rides the claim receipt, so
+	// the state lookup adds no trust the claim did not already establish.
+	d, err := c.resolveIssue(ctx, id)
 	if err != nil {
 		return source.CapacityRecoveryProof{}, err
 	}
@@ -382,7 +385,9 @@ func (c *HTTPClient) PrepareCapacityRecovery(ctx context.Context, id, opaqueCont
 }
 
 func (c *HTTPClient) SettleCapacityExhaustion(ctx context.Context, id, opaqueContext string, handoff source.CapacityHandoff) error {
-	d, err := decodeWorkID(id)
+	// Same resolution as PrepareCapacityRecovery: the server-side lease check
+	// on claimToken remains the authority for both paths.
+	d, err := c.resolveIssue(ctx, id)
 	if err != nil {
 		return err
 	}
@@ -395,28 +400,58 @@ func (c *HTTPClient) SettleCapacityExhaustion(ctx context.Context, id, opaqueCon
 			return source.ErrUnsupportedCapacityRecovery
 		}
 		marker := capacityReceiptMarker(handoff.FenceToken, handoff.IdempotencyKey, handoff.WorkIdentity)
-		if c.issueCapacityHandoffAudited(ctx, d, marker) {
+		settlement := capacitySettlementTag(handoff.IdempotencyKey, handoff.WorkIdentity)
+		if c.issueCapacityHandoffAudited(ctx, d, marker, settlement) {
 			return nil
 		}
-		body := map[string]any{"issueId": d.IssueID, "repoFullName": d.IssueRepo, "issueNumber": d.IssueNumber, "agentName": c.agentName, "claimToken": handoff.FenceToken, "capacity": handoff.CapacityIdentity, "note": marker}
-		var response struct {
-			Success bool `json:"success"`
-		}
-		err := c.do(ctx, http.MethodPost, "/api/issues/capacity-handoff", body, &response)
-		if err == nil && response.Success {
-			return nil
-		}
-		if err != nil {
-			if c.issueCapacityHandoffAudited(ctx, d, marker) {
+		postHandoff := func(claimToken, receiptMarker string) error {
+			note := receiptMarker
+			if settlement != "" {
+				note += "; settlement:" + settlement
+			}
+			body := map[string]any{"issueId": d.IssueID, "repoFullName": d.IssueRepo, "issueNumber": d.IssueNumber, "agentName": c.agentName, "claimToken": claimToken, "capacity": handoff.CapacityIdentity, "note": note}
+			var response struct {
+				Success bool `json:"success"`
+			}
+			if err := c.do(ctx, http.MethodPost, "/api/issues/capacity-handoff", body, &response); err != nil {
+				return err
+			}
+			if response.Success {
 				return nil
 			}
-			return classifyCapacityHandoff(err)
+			return errors.New("dispatch client: capacity handoff response did not confirm success")
 		}
-		malformedErr := errors.New("dispatch client: capacity handoff response did not confirm success")
-		if c.issueCapacityHandoffAudited(ctx, d, marker) {
+		err := postHandoff(handoff.FenceToken, marker)
+		if err == nil {
 			return nil
 		}
-		return malformedErr
+		if c.issueCapacityHandoffAudited(ctx, d, marker, settlement) {
+			return nil
+		}
+		// Claim churn around admission rotates the lease token after the run's
+		// receipt was persisted, and a released claim leaves no fence at all.
+		// Re-presenting the claim recovers the live token — Dispatch keeps the
+		// token across same-agent renewals — so one bounded retry fences
+		// against the live lease instead of an inert one, and settlement of a
+		// BlockedExternal capacity run never wedges (#388). Refusals that are
+		// not rotation (new owner, human hold, expiry, closed issue) never
+		// re-claim.
+		if claimLeaseRotated(err) {
+			if adopted, adoptErr := c.reacquireClaimToken(ctx, d); adoptErr == nil && adopted != "" && adopted != handoff.FenceToken {
+				adoptedMarker := capacityReceiptMarker(adopted, handoff.IdempotencyKey, handoff.WorkIdentity)
+				if c.issueCapacityHandoffAudited(ctx, d, adoptedMarker, settlement) {
+					return nil
+				}
+				if retryErr := postHandoff(adopted, adoptedMarker); retryErr == nil {
+					return nil
+				} else if c.issueCapacityHandoffAudited(ctx, d, adoptedMarker, settlement) {
+					return nil
+				} else {
+					return classifyCapacityHandoff(retryErr)
+				}
+			}
+		}
+		return classifyCapacityHandoff(err)
 	}
 	if d.Type == "followup-pr" && receipt.HandoutToken == handoff.FenceToken && receipt.PRFixID == d.PRFixID && receipt.Generation == d.Generation && d.PRFixID != "" && d.Generation > 0 {
 		body := map[string]any{"taskType": d.Type, "outcome": "capacity-exhausted", "repoFullName": d.Repo, "pullRequestNumber": d.Number, "capacity": handoff.CapacityIdentity, "idempotencyKey": handoff.IdempotencyKey, "prFixItem": map[string]any{"id": d.PRFixID, "generation": d.Generation, "handoutToken": handoff.FenceToken}}
@@ -443,6 +478,23 @@ func capacityReceiptMarker(claimToken, idempotencyKey, workIdentity string) stri
 	return fmt.Sprintf("capacity-receipt:%x", sum[:])
 }
 
+// capacitySettlementTag is the token-independent identity of one settlement
+// attempt, stamped onto every receipt note beside the token-specific marker.
+// A handoff that lands under an adopted token while its success is never
+// persisted (lost response, controller crash) would otherwise be invisible to
+// later passes, whose receipt still names the original token and whose re-claim
+// mints a third one — each pass deriving a fresh marker and posting a duplicate
+// settlement (#395). The tag lets any pass replay the landed row from durable
+// audit evidence without conflating a previous settlement: the key is the run's
+// settlement identity, unique per attempt, and only this adapter writes it.
+func capacitySettlementTag(idempotencyKey, workIdentity string) string {
+	if idempotencyKey == "" {
+		return ""
+	}
+	sum := sha256.Sum256([]byte("settlement\x00" + idempotencyKey + "\x00" + workIdentity))
+	return fmt.Sprintf("%x", sum[:])
+}
+
 type capacityAuditEntry struct {
 	Action      string `json:"action"`
 	Success     bool   `json:"success"`
@@ -452,15 +504,21 @@ type capacityAuditEntry struct {
 	Notes       string `json:"notes"`
 }
 
-func (c *HTTPClient) issueCapacityHandoffAudited(ctx context.Context, d workDescriptor, marker string) bool {
+func (c *HTTPClient) issueCapacityHandoffAudited(ctx context.Context, d workDescriptor, marker, settlement string) bool {
 	endpoint := "/api/audit?repo=" + url.QueryEscape(d.IssueRepo) + "&limit=100"
 	var entries []capacityAuditEntry
 	if err := c.do(ctx, http.MethodGet, endpoint, nil, &entries); err != nil {
 		return false
 	}
 	for _, entry := range entries {
-		if entry.Action == "issue_capacity_handoff" && entry.Success && entry.Repo == d.IssueRepo && entry.IssueNumber == d.IssueNumber && entry.IssueID == d.IssueID && (entry.Notes == marker || strings.HasSuffix(entry.Notes, "; "+marker)) {
-			return true
+		if entry.Action == "issue_capacity_handoff" && entry.Success && entry.Repo == d.IssueRepo && entry.IssueNumber == d.IssueNumber && entry.IssueID == d.IssueID {
+			// A note carries this settlement if it holds the receipt marker for
+			// a token this pass knows (legacy notes held only the marker), or
+			// the settlement tag written under any token (#395).
+			if entry.Notes == marker || strings.HasSuffix(entry.Notes, "; "+marker) ||
+				(settlement != "" && strings.HasSuffix(entry.Notes, "; settlement:"+settlement)) {
+				return true
+			}
 		}
 	}
 	return false
@@ -558,6 +616,52 @@ func asSuperseded(err error) error {
 		return fmt.Errorf("%w: %w", source.ErrSuperseded, err)
 	}
 	return err
+}
+
+// claimLeaseRotated reports a Dispatch 409 proving the receipt's claim token is
+// no longer the live fence: a re-claim rotated the lease (stale_claim_token) or
+// the fenced claim is gone entirely (no_active_claim), leaving the same agent
+// free to re-present its own claim. Ownership changes, human holds, expiry, and
+// closed/done refusals are not rotation — re-claiming through one would
+// overwrite a new owner or reverse a human — so they stay on the ordinary
+// classification path. Dispatch currently returns these refusals as plain
+// {error: message} bodies without machine-readable codes, so the code is
+// honored when present and the message otherwise.
+func claimLeaseRotated(err error) bool {
+	var apiErr *APIError
+	if !errors.As(err, &apiErr) || apiErr.StatusCode != http.StatusConflict {
+		return false
+	}
+	var response struct {
+		Code string `json:"code"`
+	}
+	if json.Unmarshal([]byte(apiErr.Message), &response) == nil {
+		switch response.Code {
+		case "stale_claim_token", "no_active_claim":
+			return true
+		case "claim_expired", "ownership_changed", "human_hold", "issue_done", "issue_closed", "handoff_race_lost":
+			return false
+		}
+	}
+	message := strings.ToLower(apiErr.Message)
+	return strings.Contains(message, "claimtoken does not match") ||
+		strings.Contains(message, "re-issued claim invalidates") ||
+		strings.Contains(message, "no active tokened claim")
+}
+
+// reacquireClaimToken re-presents this agent's claim to recover the token the
+// live lease holds. Dispatch renews a same-agent lease without rotating its
+// token, so this adopts the winning fence rather than stealing a newer claim's.
+// Any refusal fails here and settlement stays on its original error.
+func (c *HTTPClient) reacquireClaimToken(ctx context.Context, d workDescriptor) (string, error) {
+	body := map[string]any{"issueId": d.IssueID, "repoFullName": d.IssueRepo, "issueNumber": d.IssueNumber, "agentName": c.agentName}
+	var response struct {
+		ClaimToken string `json:"claimToken"`
+	}
+	if err := c.do(ctx, http.MethodPost, "/api/issues/claim", body, &response); err != nil {
+		return "", err
+	}
+	return strings.TrimSpace(response.ClaimToken), nil
 }
 
 // classifyCapacityHandoff maps explicit ownership/human conflicts to stale work;

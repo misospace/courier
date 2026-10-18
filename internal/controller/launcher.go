@@ -6,11 +6,15 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"reflect"
 	"strings"
 
 	corev1 "k8s.io/api/core/v1"
+	rbacv1 "k8s.io/api/rbac/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	courierv1alpha1 "github.com/misospace/courier/api/v1alpha1"
@@ -20,6 +24,11 @@ import (
 
 var (
 	ErrLauncherClientRequired = errors.New("coordinator launcher: client is required")
+	// ErrLauncherAPIReaderRequired is returned by Validate when the uncached
+	// API reader is unwired: the collision verification is a liveness check
+	// that gates PhaseRunning, so production use must fail fast at startup
+	// rather than silently falling back to cached state.
+	ErrLauncherAPIReaderRequired = errors.New("coordinator launcher: APIReader is required so the collision verification reads the API server directly and never falls back to cached state")
 	// ErrEvidenceConfiguration is returned when evidence intake is
 	// half-configured: the URL and the HMAC key must be set together, so a
 	// partial setup fails closed instead of minting tokens the intake cannot
@@ -72,9 +81,9 @@ type CoordinatorLauncher struct {
 	// that gates PhaseRunning, so it must see the API server's current
 	// state: a cached pod predating a deletion timestamp would resolve a
 	// terminating slot to a successful launch, the exact false-running
-	// transition #217 exists to prevent. The manager wiring injects it;
-	// when nil the collision read falls back to the cached client, which
-	// serves only direct-construction tests.
+	// transition #217 exists to prevent. Validate rejects a nil reader at
+	// production startup; when nil the collision read falls back to the
+	// cached client, which serves only direct-construction tests.
 	APIReader client.Reader
 	Scheme    *runtime.Scheme
 	Pod       executor.PodConfig
@@ -87,10 +96,28 @@ type CoordinatorLauncher struct {
 	EvidenceKey []byte
 }
 
+// Validate fails fast when the launcher is wired for production without an
+// uncached API reader, mirroring the reconciler's SetupWithManager guard:
+// a future wiring path that forgets the injection must not quietly
+// re-introduce the cached-view false-running risk #217 removed.
+// Direct-construction tests that omit the reader keep working through
+// Launch's runtime fallback; production wiring calls this at startup
+// instead.
+func (l *CoordinatorLauncher) Validate() error {
+	if l == nil || l.APIReader == nil {
+		return ErrLauncherAPIReaderRequired
+	}
+	return nil
+}
+
 // Launch implements LaunchFunc. The run is already Claimed when this method
-// is called, so a failed create is returned to the reconciler, which releases
-// the claim back to Pending. Phase transitions are the reconciler's to write
-// through the status contract; the launcher only creates the pod.
+// is called, so a transient failed create is returned to the reconciler, which
+// releases the claim back to Pending. A permanent, actionable deployment
+// failure — a rendered pod spec the API server rejects outright, with the
+// coordinator slot proven empty — returns a *SecureNeedsHumanError instead,
+// and the reconciler terminalizes the run from that class on this path.
+// Phase transitions are the reconciler's to write through the status contract;
+// the launcher only creates the pod.
 func (l *CoordinatorLauncher) Launch(ctx context.Context, run *courierv1alpha1.CoderRun) error {
 	if l == nil || l.Client == nil {
 		return ErrLauncherClientRequired
@@ -149,12 +176,54 @@ func (l *CoordinatorLauncher) Launch(ctx context.Context, run *courierv1alpha1.C
 	if err != nil {
 		return err
 	}
+	// The isolated legacy observer's run-scoped identity — ServiceAccount,
+	// Role, RoleBinding — is provisioned and ownership-verified BEFORE the
+	// coordinator pod can begin execution (#327 single-writer guarantee).
+	// The API server resolves the ServiceAccount at create time, so a
+	// foreign same-named identity must never be admitted under, and Role or
+	// RoleBinding provisioning must never fail only after a live writer
+	// already exists. The same ensure is idempotent: retries and collision
+	// adoption re-verify existing run-owned resources instead of adopting
+	// anything unowned.
+	if pod.Annotations[executor.ObserverContractAnnotation] == executor.ObserverContractVersion {
+		// The run-scoped identity must be on the pod before it is created;
+		// setting it afterwards would not persist, and the observer would
+		// run as the namespace default SA with no access to its own pod.
+		pod.Spec.ServiceAccountName = legacyObserverResourceName(run.Name)
+		if err := l.ensureLegacyObserverResources(ctx, run, pod); err != nil {
+			return l.provisioningFailure(ctx, pod, err)
+		}
+	}
 	err = l.Client.Create(ctx, pod)
 	if err == nil {
 		return nil
 	}
 	if !apierrors.IsAlreadyExists(err) {
-		return err
+		if apierrors.IsInvalid(err) {
+			// The rendered spec itself is refused, and requeueing cannot
+			// change it: the lane configures something the API server
+			// rejects outright. The class is conditional on the slot, because
+			// validation runs before the API server's existence check: a slot
+			// an earlier attempt of this still-Claimed run already filled
+			// answers Invalid rather than AlreadyExists, and a live writer
+			// may occupy it. Terminalizing there would take the run out from
+			// under that writer — a NeedsHuman run is no longer observed —
+			// so the permanent class applies only to a slot proven empty.
+			// A Forbidden or quota denial stays an ordinary error — a quota
+			// or an RBAC grant can be raised later, so a requeue is the right
+			// answer there.
+			if !l.slotEmpty(ctx, pod) {
+				return ErrProvisioningInFlight
+			}
+			return secureNeedsHuman("PodAdmission",
+				"the API server rejected the coordinator pod %s: %v", pod.Name, err)
+		}
+		// A failed create is normally claim-safe, but an ambiguous failure
+		// (a timeout after the API server persisted the pod, or a pod left
+		// at the deterministic name by an earlier attempt of this still-
+		// Claimed run) must not release the source claim while a writer may
+		// occupy the slot.
+		return l.provisioningFailure(ctx, pod, err)
 	}
 	// The create collided with an existing pod. Three shapes are possible
 	// and each one must surface as "stay Claimed, do not record Running":
@@ -195,19 +264,125 @@ func (l *CoordinatorLauncher) Launch(ctx context.Context, run *courierv1alpha1.C
 	case !podOwnedByRunUID(&existing, run.UID):
 		return ErrProvisioningInFlight
 	}
+	// The observer resources were ensured and verified above, before the
+	// create that produced this collision; the adopted run-owned slot is
+	// fully provisioned.
 	return nil
+}
+
+// provisioningFailure classifies a launch failure that happened while the
+// coordinator slot's state is in question. Releasing the source claim
+// resets the run to Pending and lets another capacity be handed the work —
+// safe only while the slot is proven empty. If a pod exists at the slot
+// (or its absence cannot be proven through the uncached reader), a writer
+// may be live, so the failure surfaces as ErrProvisioningInFlight and the
+// run stays Claimed instead of racing a live coordinator for ownership.
+func (l *CoordinatorLauncher) provisioningFailure(ctx context.Context, pod *corev1.Pod, cause error) error {
+	if l.slotEmpty(ctx, pod) {
+		return cause
+	}
+	return ErrProvisioningInFlight
+}
+
+// slotEmpty reports whether the coordinator slot is proven empty through the
+// uncached reader. A pod sitting at the name, and an absence the read cannot
+// establish at all, both count as occupied: a writer may be live, so the
+// caller must not release the claim or terminalize the run.
+func (l *CoordinatorLauncher) slotEmpty(ctx context.Context, pod *corev1.Pod) bool {
+	var existing corev1.Pod
+	err := l.collisionReader().Get(ctx, client.ObjectKey{Namespace: pod.Namespace, Name: pod.Name}, &existing)
+	return apierrors.IsNotFound(err)
 }
 
 // collisionReader returns the reader the AlreadyExists collision
 // verification goes through, preferring the injected uncached API reader and
-// falling back to the cached client. Production wiring always injects the
-// API reader, so the fallback serves only direct-construction tests; the
-// liveness decision that gates PhaseRunning never runs against cached state.
+// falling back to the cached client. Validate rejects a nil API reader at
+// production startup, so the fallback serves only direct-construction tests;
+// the liveness decision that gates PhaseRunning never runs against cached
+// state in production.
 func (l *CoordinatorLauncher) collisionReader() client.Reader {
 	if l.APIReader != nil {
 		return l.APIReader
 	}
 	return l.Client
+}
+
+func (l *CoordinatorLauncher) ensureLegacyObserverResources(ctx context.Context, run *courierv1alpha1.CoderRun, pod *corev1.Pod) error {
+	name := legacyObserverResourceName(run.Name)
+	if err := l.ensureObserverObject(ctx, run.UID, l.observerServiceAccount(run)); err != nil {
+		return err
+	}
+	role := &rbacv1.Role{ObjectMeta: metav1.ObjectMeta{Namespace: run.Namespace, Name: name, OwnerReferences: l.observerOwner(run)}, Rules: []rbacv1.PolicyRule{{APIGroups: []string{""}, Resources: []string{"pods"}, ResourceNames: []string{pod.Name}, Verbs: []string{"get"}}}}
+	if err := l.ensureObserverObject(ctx, run.UID, role); err != nil {
+		return err
+	}
+	return l.ensureObserverObject(ctx, run.UID, &rbacv1.RoleBinding{ObjectMeta: metav1.ObjectMeta{Namespace: run.Namespace, Name: name, OwnerReferences: l.observerOwner(run)}, RoleRef: rbacv1.RoleRef{APIGroup: rbacv1.GroupName, Kind: "Role", Name: name}, Subjects: []rbacv1.Subject{{Kind: rbacv1.ServiceAccountKind, Name: name, Namespace: run.Namespace}}})
+}
+
+func (l *CoordinatorLauncher) observerOwner(run *courierv1alpha1.CoderRun) []metav1.OwnerReference {
+	return []metav1.OwnerReference{{APIVersion: courierv1alpha1.GroupVersion.String(), Kind: "CoderRun", Name: run.Name, UID: run.UID, Controller: boolPtr(true), BlockOwnerDeletion: boolPtr(true)}}
+}
+
+func (l *CoordinatorLauncher) observerServiceAccount(run *courierv1alpha1.CoderRun) *corev1.ServiceAccount {
+	return &corev1.ServiceAccount{ObjectMeta: metav1.ObjectMeta{Namespace: run.Namespace, Name: legacyObserverResourceName(run.Name), OwnerReferences: l.observerOwner(run)}, AutomountServiceAccountToken: boolPtr(false)}
+}
+
+func (l *CoordinatorLauncher) ensureObserverObject(ctx context.Context, runUID types.UID, desired client.Object) error {
+	if err := l.Client.Create(ctx, desired); err != nil {
+		if !apierrors.IsAlreadyExists(err) {
+			return err
+		}
+		// A same-named leftover from a deleted run must never be adopted:
+		// garbage collection will remove it, and until then the launch
+		// stays unverified.
+		return l.verifyObserverResource(ctx, desired, runUID)
+	}
+	return nil
+}
+
+func (l *CoordinatorLauncher) verifyObserverResource(ctx context.Context, desired client.Object, runUID types.UID) error {
+	key := client.ObjectKeyFromObject(desired)
+	actual := desired.DeepCopyObject().(client.Object)
+	// Ownership is judged through the uncached reader, like the pod-slot
+	// gate: Create already hit the API server, so a cached Get could verify
+	// a deleted-and-replaced same-named resource against a stale owned view
+	// and admit the pod under a live foreign identity.
+	if err := l.collisionReader().Get(ctx, key, actual); err != nil {
+		return err
+	}
+	if !resourceOwnedByUID(actual, runUID) {
+		return fmt.Errorf("legacy observer resource %s is not owned by run UID %q", key.Name, runUID)
+	}
+	switch want := desired.(type) {
+	case *corev1.ServiceAccount:
+		got := actual.(*corev1.ServiceAccount)
+		if !reflect.DeepEqual(want.AutomountServiceAccountToken, got.AutomountServiceAccountToken) {
+			return fmt.Errorf("legacy observer service account %s has unexpected spec", key.Name)
+		}
+	case *rbacv1.Role:
+		if !reflect.DeepEqual(want.Rules, actual.(*rbacv1.Role).Rules) {
+			return fmt.Errorf("legacy observer role %s has unexpected rules", key.Name)
+		}
+	case *rbacv1.RoleBinding:
+		got := actual.(*rbacv1.RoleBinding)
+		if !reflect.DeepEqual(want.RoleRef, got.RoleRef) || !reflect.DeepEqual(want.Subjects, got.Subjects) {
+			return fmt.Errorf("legacy observer role binding %s has unexpected spec", key.Name)
+		}
+	}
+	return nil
+}
+
+func resourceOwnedByUID(obj metav1.Object, uid types.UID) bool {
+	for _, ref := range obj.GetOwnerReferences() {
+		if ref.UID == uid && ref.Kind == "CoderRun" && ref.Controller != nil && *ref.Controller {
+			return true
+		}
+	}
+	return false
+}
+
+func legacyObserverResourceName(runName string) string {
+	return "courier-observer-" + executor.RunLabelValue(runName)
 }
 
 // criteriaEnvelope renders the trusted COURIER_CRITERIA envelope for one run

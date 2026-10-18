@@ -59,7 +59,15 @@ func (s *SecureControl) LaunchSecure(ctx context.Context, run *courier.CoderRun)
 	if err := s.ensureFinalizer(ctx, run); err != nil {
 		return ctrl.Result{}, err
 	}
-	if err := s.Preflight(ctx, run, policy, relaunch); err != nil {
+	// The sizing is resolved once for the pods this pass renders: the
+	// preflight proof and every pod created below carry the same value, so a
+	// concurrent lane update cannot make the admitted spec differ from the
+	// created one.
+	resources, err := s.laneResources(ctx, run)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+	if err := s.Preflight(ctx, run, policy, relaunch, resources); err != nil {
 		return ctrl.Result{}, err
 	}
 
@@ -96,7 +104,7 @@ func (s *SecureControl) LaunchSecure(ctx context.Context, run *courier.CoderRun)
 		if err != nil {
 			return ctrl.Result{}, err
 		}
-		pod, err := topology.BrokerPod(run, s.Config.HarnessImage, registration.Projection(), string(controlSA.UID))
+		pod, err := topology.BrokerPod(run, s.Config.HarnessImage, registration.Projection(), string(controlSA.UID), resources)
 		if err != nil {
 			return ctrl.Result{}, err
 		}
@@ -149,7 +157,7 @@ func (s *SecureControl) LaunchSecure(ctx context.Context, run *courier.CoderRun)
 		if err != nil {
 			return ctrl.Result{}, err
 		}
-		workerPod, err = topology.WorkerPod(run, s.Config.HarnessImage, incarnation, publicKey, cache)
+		workerPod, err = topology.WorkerPod(run, s.Config.HarnessImage, incarnation, publicKey, cache, resources)
 		if err != nil {
 			return ctrl.Result{}, err
 		}
@@ -208,6 +216,7 @@ func (s *SecureControl) LaunchSecure(ctx context.Context, run *courier.CoderRun)
 			WorkerURL:             "http://" + topology.WorkerServiceDNS(run.Namespace, run.Name) + ":" + fmt.Sprint(topology.WorkerPort),
 			BrokerURL:             "https://" + topology.BrokerServiceDNS(run.Namespace, run.Name) + ":8443",
 			BrokerStatusURL:       "https://" + topology.BrokerServiceDNS(run.Namespace, run.Name) + ":8444",
+			Resources:             resources,
 		})
 		if err != nil {
 			return ctrl.Result{}, err
@@ -239,6 +248,18 @@ func (s *SecureControl) controlInvocation(ctx context.Context, run *courier.Code
 	}
 	invocation.Criteria = criteria
 	return invocation, nil
+}
+
+// laneResources reads the pod sizing the run's lane configures. Every pod of
+// the secure topology carries it, so a lane that configures nothing still
+// renders the built-in default rather than a BestEffort pod. Read once per
+// pass and reused across the round's renders.
+func (s *SecureControl) laneResources(ctx context.Context, run *courier.CoderRun) (corev1.ResourceRequirements, error) {
+	lane := &courier.LaneProfile{}
+	if err := s.Client.Get(ctx, types.NamespacedName{Namespace: run.Namespace, Name: run.Spec.Lane}, lane); err != nil {
+		return corev1.ResourceRequirements{}, fmt.Errorf("secure topology: read lane profile %q: %w", run.Spec.Lane, err)
+	}
+	return lane.Spec.EffectiveResources(), nil
 }
 
 type gatewayConfig struct {
@@ -405,11 +426,37 @@ func topologyBroken(pod *corev1.Pod) bool {
 // The charge itself is the reconciler's chargeRelaunch; what stays this path's
 // own is the ceiling hand-off, which records SecurePreflightFailed rather than
 // the reconciler's terminal diagnostic (#223).
+//
+// Both judgements are destructive, so both are made against the API server's
+// own view, never the informer cache (§6): the ceiling is charged against the
+// world's counter, and the control pod is deleted as the live object it is. A
+// failed live read, a run incarnation that changed under this reconcile, and a
+// delete that conflicts with a replacement are all re-observations, never
+// charges — the same discipline checkLiveness applies before it reaps.
 func (s *SecureControl) fenceAndRelaunch(ctx context.Context, run *courier.CoderRun) (ctrl.Result, bool, error) {
+	var fresh courier.CoderRun
+	if err := s.reader().Get(ctx, client.ObjectKeyFromObject(run), &fresh); err != nil {
+		// A failed live read is not evidence of a loss and not evidence of
+		// health; defer rather than charge a cached status.
+		return ctrl.Result{RequeueAfter: secureRequeueDelay}, true, nil
+	}
+	if fresh.UID != run.UID || fresh.Status.Phase != courier.PhaseRunning || !fresh.DeletionTimestamp.IsZero() {
+		// The world moved on — a new run incarnation, a phase this path no
+		// longer owns, or a deleting run, which never relaunches — so the
+		// decision is void and the reconcile re-observes. Handled, because
+		// continuing would map the run's exit codes against a world this
+		// reconcile no longer owns. No fence is owed here: whatever moved
+		// the run out of Running tore the round down on its own reconcile
+		// (a terminated control fences its worker and broker, and both
+		// ceiling hand-offs fence before they terminalize or charge), and a
+		// fence deferred past this one would never run (#215).
+		return ctrl.Result{RequeueAfter: secureRequeueDelay}, true, nil
+	}
+	run = &fresh
 	// Fence leaves the control pod in place (see its doc); relaunch needs
 	// every component torn down so the next LaunchSecure pass produces a
 	// fresh round with a freshly minted signing key.
-	controlPod, err := s.pod(ctx, run, topology.ComponentCoordinator)
+	controlPod, err := s.podLive(ctx, run, topology.ComponentCoordinator)
 	if err != nil {
 		return ctrl.Result{}, true, err
 	}
@@ -433,7 +480,14 @@ func (s *SecureControl) fenceAndRelaunch(ctx context.Context, run *courier.Coder
 	inert := controlPod != nil && coordinatorPodUnrecoverable(controlPod)
 	deleted := false
 	if controlPod != nil && !(atCeiling && inert) {
-		if err := s.Client.Delete(ctx, controlPod); client.IgnoreNotFound(err) != nil {
+		if err := s.deleteObservedPod(ctx, controlPod); err != nil {
+			if apierrors.IsConflict(err) {
+				// The control pod changed between the live read and the
+				// delete, so the decision was made on a world that no longer
+				// exists: re-observe instead of deleting a replacement by
+				// name or charging a loss that did not happen.
+				return ctrl.Result{RequeueAfter: secureRequeueDelay}, true, nil
+			}
 			return ctrl.Result{}, true, err
 		}
 		deleted = true
@@ -889,12 +943,27 @@ func (s *SecureControl) ensureObject(ctx context.Context, object client.Object) 
 	return nil
 }
 
-// pod returns the run's live pod for one component, or nil when absent.
-// Preflight probe pods carry the worker's component label (so the worker's
-// own NetworkPolicy applies to them) and are excluded by the probe label.
+// pod returns the run's cached pod for one component, or nil when absent.
 func (s *SecureControl) pod(ctx context.Context, run *courier.CoderRun, component string) (*corev1.Pod, error) {
+	return podOfComponent(ctx, s.Client, run, component)
+}
+
+// podLive returns the run's pod for one component as the API server itself
+// shows it, or nil when absent. Only the destructive relaunch path reads the
+// control pod this way (§6): the delete that follows is a decision about one
+// specific object, and a cache that has not caught up must never be its
+// witness. Reads that only shape provisioning keep using the cached pod.
+func (s *SecureControl) podLive(ctx context.Context, run *courier.CoderRun, component string) (*corev1.Pod, error) {
+	return podOfComponent(ctx, s.reader(), run, component)
+}
+
+// podOfComponent finds one run-owned pod for a component through the given
+// reader. Preflight probe pods carry the worker's component label (so the
+// worker's own NetworkPolicy applies to them) and are excluded by the probe
+// label.
+func podOfComponent(ctx context.Context, reader client.Reader, run *courier.CoderRun, component string) (*corev1.Pod, error) {
 	var pods corev1.PodList
-	if err := s.Client.List(ctx, &pods, client.InNamespace(run.Namespace)); err != nil {
+	if err := reader.List(ctx, &pods, client.InNamespace(run.Namespace)); err != nil {
 		return nil, err
 	}
 	for i := range pods.Items {
@@ -902,11 +971,18 @@ func (s *SecureControl) pod(ctx context.Context, run *courier.CoderRun, componen
 		if pod.Labels[topology.LabelProbe] == "true" {
 			continue
 		}
-		if pod.Labels[topology.LabelRun] == run.Name && pod.Labels["courier.misospace.dev/component"] == component {
+		if pod.Labels[topology.LabelRun] == topology.RunLabelValue(run.Name) && pod.Labels["courier.misospace.dev/component"] == component {
 			return pod, nil
 		}
 	}
 	return nil, nil
+}
+
+// deleteObservedPod deletes the pod exactly as it was observed, carrying the
+// observed UID as a precondition (§6): a control pod replaced between the live
+// read and the delete conflicts instead of being deleted by name.
+func (s *SecureControl) deleteObservedPod(ctx context.Context, pod *corev1.Pod) error {
+	return client.IgnoreNotFound(s.Client.Delete(ctx, pod, client.Preconditions{UID: &pod.UID}))
 }
 
 func (s *SecureControl) topologyPodsExist(ctx context.Context, run *courier.CoderRun) bool {

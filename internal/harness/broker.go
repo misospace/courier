@@ -40,8 +40,11 @@ const (
 
 // BrokerCallError classifies one broker call failure. Transport-class and
 // 5xx/429/408 failures are retryable; other 4xx responses are definite
-// denials. Response bodies are never echoed: only a fixed category and the
-// status code travel.
+// denials. A local credential-read failure is retryable too — the projected
+// token file comes back when kubelet finishes rotating it, and the run never
+// needs rebuilding to pick the new bytes up. Response bodies are never
+// echoed, and neither is a credential read failure: only a fixed category and
+// the status code travel.
 type BrokerCallError struct {
 	StatusCode int
 	Category   string
@@ -88,12 +91,14 @@ type BrokerSnapshot struct {
 }
 
 // BrokerClient reaches the run's broker's typed publication API over TLS
-// with the control pod's projected broker-audience token.
+// with the control pod's projected broker-audience token. The token is read
+// per request from TokenSource: kubelet rotates the projected file, and a
+// client holding the bytes it read at startup would go stale mid-run.
 type BrokerClient struct {
-	BaseURL string
-	Token   []byte
-	CA      []byte
-	HTTP    *http.Client
+	BaseURL     string
+	TokenSource BrokerTokenSource
+	CA          []byte
+	HTTP        *http.Client
 
 	// mu guards owned, the client built once and shared by every request
 	// this BrokerClient makes for itself, so repeated calls reuse one idle
@@ -149,6 +154,12 @@ func (b *BrokerClient) CloseIdleConnections() {
 }
 
 func (b *BrokerClient) do(ctx context.Context, method, path string, headers map[string]string, body []byte) (*http.Response, error) {
+	token, err := resolveBrokerToken(b.TokenSource)
+	if err != nil {
+		// No request is issued without a fresh token: the projected file may
+		// be mid-rotation, and rotation is a retryable local condition.
+		return nil, &BrokerCallError{Category: "token is unavailable", Retryable: true}
+	}
 	transport, err := b.transport()
 	if err != nil {
 		return nil, err
@@ -157,7 +168,7 @@ func (b *BrokerClient) do(ctx context.Context, method, path string, headers map[
 	if err != nil {
 		return nil, &BrokerCallError{Category: "request is malformed"}
 	}
-	req.Header.Set("Authorization", "Bearer "+string(b.Token))
+	req.Header.Set("Authorization", "Bearer "+string(token))
 	for name, value := range headers {
 		req.Header.Set(name, value)
 	}

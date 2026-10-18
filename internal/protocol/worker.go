@@ -166,6 +166,7 @@ func (w *Worker) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /v1/tasks", w.handleDispatch)
 	mux.HandleFunc("POST /v1/tasks/cancel", w.handleCancel)
+	mux.HandleFunc("POST /v1/tasks/{opID}/release", w.handleRelease)
 	mux.HandleFunc("GET /v1/tasks/{opID}/result", w.handleResult)
 	mux.HandleFunc("POST /v1/snapshot", w.handleSnapshot)
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) {
@@ -521,30 +522,148 @@ func processStat(pid int) (state string, pgid int, ok bool) {
 	return fields[0], group, true
 }
 
+// artifactReadHook, when non-nil, runs between artifact validation and the
+// bounded read; tests install it to land a concurrent swap in exactly that
+// window. It is nil in production.
+var artifactReadHook func()
+
 // readArtifact reads the declared artifact, refusing anything outside the
-// workspace and over the transport bound.
+// workspace and over the transport bound. The lexical gate is only a first
+// filter; the authoritative confinement check walks the cleaned path from the
+// workspace's own directory descriptor with O_NOFOLLOW, so no component —
+// parent or final — can be a symlink at open time, and validation happens on
+// the opened descriptor rather than on a path a concurrent task could swap.
 func (w *Worker) readArtifact(declared string) ([]byte, error) {
 	clean := filepath.Clean("/" + declared)
+	if clean == "/" {
+		return nil, errors.New("declared artifact is unavailable")
+	}
 	abs := filepath.Join(w.config.WorkspaceDir, clean)
 	rel, err := filepath.Rel(w.config.WorkspaceDir, abs)
 	if err != nil || rel == ".." || strings.HasPrefix(rel, "../") {
 		return nil, errors.New("artifact path escapes the workspace")
 	}
-	info, err := os.Lstat(abs)
+	dir, err := os.Open(w.config.WorkspaceDir)
 	if err != nil {
 		return nil, errors.New("declared artifact is unavailable")
 	}
-	if !info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 {
+	defer dir.Close()
+	dirfd := int(dir.Fd())
+	components := strings.Split(strings.TrimPrefix(clean, "/"), "/")
+	for i, name := range components {
+		flags := syscall.O_NOFOLLOW | syscall.O_CLOEXEC | syscall.O_RDONLY
+		if i < len(components)-1 {
+			flags |= syscall.O_DIRECTORY
+		} else {
+			// O_NONBLOCK keeps a swapped-in FIFO from blocking the open; the
+			// regular-file check on the descriptor rejects it right after.
+			flags |= syscall.O_NONBLOCK
+		}
+		next, openErr := syscall.Openat(dirfd, name, flags, 0)
+		if i > 0 {
+			syscall.Close(dirfd)
+		}
+		if openErr != nil {
+			if errors.Is(openErr, syscall.ELOOP) {
+				if i < len(components)-1 {
+					return nil, errors.New("artifact path escapes the workspace")
+				}
+				return nil, errors.New("artifact must be a regular file")
+			}
+			return nil, errors.New("declared artifact is unavailable")
+		}
+		dirfd = next
+	}
+	f := os.NewFile(uintptr(dirfd), filepath.Join(w.config.WorkspaceDir, clean))
+	defer f.Close()
+	info, err := f.Stat()
+	if err != nil {
+		return nil, errors.New("artifact read failed")
+	}
+	if !info.Mode().IsRegular() {
 		return nil, errors.New("artifact must be a regular file")
 	}
 	if info.Size() > maxArtifactBytes {
 		return nil, errors.New("artifact exceeds the bound and is rejected whole")
 	}
-	data, err := os.ReadFile(abs)
+	if artifactReadHook != nil {
+		artifactReadHook()
+	}
+	return readArtifactBounded(f)
+}
+
+// readArtifactBounded enforces the artifact bound on bytes actually read, not
+// on pre-read metadata: a file that grows past the bound while being read is
+// rejected whole rather than truncated.
+func readArtifactBounded(r io.Reader) ([]byte, error) {
+	data, err := io.ReadAll(io.LimitReader(r, maxArtifactBytes+1))
 	if err != nil {
 		return nil, errors.New("artifact read failed")
 	}
+	if len(data) > maxArtifactBytes {
+		return nil, errors.New("artifact exceeds the bound and is rejected whole")
+	}
 	return data, nil
+}
+
+// handleRelease consumes one terminal result's payload on control's
+// instruction. The operation entry is never removed: the compact stub keeps
+// redelivery of the opID rejected by handleDispatch and keeps handleCancel
+// working, so replay protection outlives the payload it protects. Release is
+// idempotent — a repeat release rewrites the same stub.
+func (w *Worker) handleRelease(wr http.ResponseWriter, r *http.Request) {
+	opID := r.PathValue("opID")
+	if opID == "" || len(opID) > 128 || strings.ContainsAny(opID, "/\\") {
+		http.Error(wr, "invalid request", http.StatusBadRequest)
+		return
+	}
+	envelope, _, ok := w.verifySigned(wr, r, KindRelease, 0)
+	if !ok {
+		return
+	}
+	// The URL is not signed; the envelope is. A release addressed to one
+	// operation must not be able to erase another operation's result, so a
+	// path/envelope mismatch is refused before the nonce is consumed or any
+	// operation is touched.
+	if envelope.OpID != opID {
+		http.Error(wr, "release envelope does not address this operation", http.StatusBadRequest)
+		return
+	}
+	accepted, exhausted := w.consumeNonce(envelope)
+	if exhausted {
+		http.Error(wr, "replay state exhausted; worker must be replaced", http.StatusServiceUnavailable)
+		return
+	}
+	if !accepted {
+		http.Error(wr, "nonce replay rejected", http.StatusUnauthorized)
+		return
+	}
+
+	w.mu.Lock()
+	op, known := w.ops[opID]
+	_, tombstoned := w.tombstones[opID]
+	var terminal *Result
+	if known && op != nil && op.result != nil && op.result.LiveDescendants == 0 {
+		terminal = op.result
+		op.result = &Result{Status: op.result.Status}
+	}
+	unverified := known && op != nil && op.result != nil && terminal == nil
+	w.mu.Unlock()
+
+	switch {
+	case known && op != nil && terminal == nil && !unverified:
+		http.Error(wr, "operation has not terminated; nothing to release", http.StatusConflict)
+	case unverified:
+		// An unproven termination is never released: its LiveDescendants
+		// report is the only record that the task tree may still be live
+		// (#372), and dropping it would let a later cancellation read a
+		// verified stop that never happened.
+		http.Error(wr, "termination is unverified; result is retained", http.StatusConflict)
+	case known || tombstoned:
+		w.respondStatus(wr, opID, http.StatusOK)
+	default:
+		http.Error(wr, "unknown operation", http.StatusNotFound)
+	}
 }
 
 func (w *Worker) handleCancel(wr http.ResponseWriter, r *http.Request) {

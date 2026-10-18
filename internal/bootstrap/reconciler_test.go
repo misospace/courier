@@ -7,7 +7,9 @@ import (
 	"time"
 
 	courierv1alpha1 "github.com/misospace/courier/api/v1alpha1"
+	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
@@ -418,6 +420,35 @@ func TestReconcileAllTransientGetErrorKeepsCollisionState(t *testing.T) {
 	if !collidingName(r, "local") {
 		t.Fatal("pass 3: collision state was lost")
 	}
+}
+
+// TestReconcileAllCarriesResourcesOntoSpec pins the mirror direction: what a
+// profile configures is what the managed LaneProfile carries, so the lane stays
+// the single source of pod sizing.
+func TestReconcileAllCarriesResourcesOntoSpec(t *testing.T) {
+	kubeClient := newBootstrapClient(t)
+	provider := &staticProvider{profiles: []Profile{{
+		Name:  "local",
+		Roles: map[string]string{"coordinator": "claude-sonnet-4-5"},
+		Resources: corev1.ResourceRequirements{
+			Requests: corev1.ResourceList{
+				corev1.ResourceCPU:    resource.MustParse("750m"),
+				corev1.ResourceMemory: resource.MustParse("2Gi"),
+			},
+			Limits: corev1.ResourceList{
+				corev1.ResourceCPU:    resource.MustParse("4"),
+				corev1.ResourceMemory: resource.MustParse("8Gi"),
+			},
+		}}}}
+	r := &Reconciler{Client: kubeClient, Namespace: "courier", Provider: provider}
+	if err := r.ReconcileAll(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	var got courierv1alpha1.LaneProfile
+	if err := kubeClient.Get(context.Background(), client.ObjectKey{Namespace: "courier", Name: "local"}, &got); err != nil {
+		t.Fatal(err)
+	}
+	assertResources(t, got.Spec.Resources, "750m", "2Gi", "4", "8Gi")
 }
 
 type staticProvider struct {

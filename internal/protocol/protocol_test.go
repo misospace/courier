@@ -6,6 +6,8 @@ import (
 	"crypto/ed25519"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -111,6 +113,7 @@ func TestEnvelopeValidation(t *testing.T) {
 	cases := map[string]func(*Envelope){
 		"dispatch sequence nonzero": func(e *Envelope) { e.Sequence = 1 },
 		"cancel sequence zero":      func(e *Envelope) { e.Kind = KindCancel; e.BriefID = ""; e.Sequence = 0 },
+		"release sequence zero":     func(e *Envelope) { e.Kind = KindRelease; e.Sequence = 0 },
 		"missing run uid":           func(e *Envelope) { e.RunUID = "" },
 		"missing control uid":       func(e *Envelope) { e.ControlPodUID = "" },
 		"missing worker uid":        func(e *Envelope) { e.WorkerPodUID = "" },
@@ -691,6 +694,215 @@ func TestWorkerArtifactGuards(t *testing.T) {
 	}
 }
 
+// TestWorkerArtifactConfinement pins the readArtifact confinement against
+// paths the lexical check alone cannot see: symlinked parents, non-regular
+// substitutions, and growth past the bound after validation (#411).
+func TestWorkerArtifactConfinement(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("confinement relies on Linux openat O_NOFOLLOW semantics")
+	}
+	worker, priv, server := newTestWorker(t)
+	client := &Client{BaseURL: server.URL}
+	ctx := context.Background()
+
+	outside := filepath.Join(t.TempDir(), "outside")
+	if err := os.MkdirAll(outside, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(outside, "sentinel.txt"), []byte("outside-secret"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(outside, filepath.Join(worker.config.WorkspaceDir, "link")); err != nil {
+		t.Fatal(err)
+	}
+	if err := syscall.Mkfifo(filepath.Join(worker.config.WorkspaceDir, "fifo"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	oversized := filepath.Join(worker.config.WorkspaceDir, "oversized.bin")
+	if err := os.WriteFile(oversized, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Truncate(oversized, maxArtifactBytes+1); err != nil {
+		t.Fatal(err)
+	}
+
+	cases := []struct {
+		artifactPath string
+	}{
+		{artifactPath: "link/sentinel.txt"},
+		{artifactPath: "link"},
+		{artifactPath: "fifo"},
+		{artifactPath: "oversized.bin"},
+		{artifactPath: "."},
+	}
+	for i, tc := range cases {
+		name := tc.artifactPath
+		t.Run(name, func(t *testing.T) {
+			task, _ := json.Marshal(Task{Command: []string{"true"}, ArtifactPath: tc.artifactPath})
+			env := dispatchEnvelope(worker.clock())
+			env.OpID = fmt.Sprintf("op-confinement-%d", i)
+			env.Nonce = fmt.Sprintf("confinement-nonce-%08d", i)
+			env.PayloadDigest = PayloadDigestOf(task)
+			if _, err := client.Dispatch(ctx, priv, env, task); err != nil {
+				t.Fatalf("Dispatch: %v", err)
+			}
+			deadline := time.Now().Add(5 * time.Second)
+			for {
+				state, err := client.Result(ctx, env.OpID)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if state.Status == ResultFailed {
+					result := state.Result
+					if result == nil || result.Artifact != nil {
+						t.Fatalf("rejected artifact must return no bytes: %+v", result)
+					}
+					if strings.Contains(result.StdoutTail, "outside-secret") || strings.Contains(result.StderrTail, "outside-secret") {
+						t.Fatal("outside bytes leaked into the result")
+					}
+					return
+				}
+				if state.Status == ResultCompleted {
+					t.Fatalf("artifact %q must fail the operation: %+v", tc.artifactPath, state.Result)
+				}
+				if time.Now().After(deadline) {
+					t.Fatalf("operation with artifact %q never finished", tc.artifactPath)
+				}
+				time.Sleep(10 * time.Millisecond)
+			}
+		})
+	}
+
+	t.Run("valid artifact inside the workspace still reads", func(t *testing.T) {
+		if err := os.WriteFile(filepath.Join(worker.config.WorkspaceDir, "kept.txt"), []byte("kept"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		task, _ := json.Marshal(Task{Command: []string{"true"}, ArtifactPath: "kept.txt"})
+		env := dispatchEnvelope(worker.clock())
+		env.OpID = "op-confinement-valid"
+		env.Nonce = "confinement-nonce-valid"
+		env.PayloadDigest = PayloadDigestOf(task)
+		if _, err := client.Dispatch(ctx, priv, env, task); err != nil {
+			t.Fatalf("Dispatch: %v", err)
+		}
+		deadline := time.Now().Add(5 * time.Second)
+		for {
+			state, err := client.Result(ctx, env.OpID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if state.Status == ResultCompleted {
+				if string(state.Result.Artifact) != "kept" {
+					t.Fatalf("artifact = %q", state.Result.Artifact)
+				}
+				return
+			}
+			if state.Status == ResultFailed || time.Now().After(deadline) {
+				t.Fatalf("valid artifact must read: %+v", state.Result)
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+	})
+
+	// A FIFO swapped over the artifact path after the descriptor is opened
+	// and validated cannot affect the read: the descriptor still refers to
+	// the opened regular file, so the operation must complete with the
+	// original confined bytes and never block. A regression to a path-based
+	// read after validation would instead open the FIFO and stall to the
+	// deadline.
+	t.Run("a FIFO swapped in after validation cannot redirect the read", func(t *testing.T) {
+		staged := filepath.Join(worker.config.WorkspaceDir, "staged.fifo")
+		if err := syscall.Mkfifo(staged, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(worker.config.WorkspaceDir, "swapped.txt"), []byte("genuine"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		swapped := false
+		previous := artifactReadHook
+		artifactReadHook = func() {
+			if err := os.Rename(staged, filepath.Join(worker.config.WorkspaceDir, "swapped.txt")); err != nil {
+				t.Error(err)
+				return
+			}
+			swapped = true
+		}
+		t.Cleanup(func() { artifactReadHook = previous })
+		task, _ := json.Marshal(Task{Command: []string{"true"}, ArtifactPath: "swapped.txt"})
+		env := dispatchEnvelope(worker.clock())
+		env.OpID = "op-confinement-swap"
+		env.Nonce = "confinement-nonce-swap000"
+		env.PayloadDigest = PayloadDigestOf(task)
+		if _, err := client.Dispatch(ctx, priv, env, task); err != nil {
+			t.Fatalf("Dispatch: %v", err)
+		}
+		deadline := time.Now().Add(5 * time.Second)
+		for {
+			state, err := client.Result(ctx, env.OpID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if state.Status == ResultCompleted {
+				if string(state.Result.Artifact) != "genuine" {
+					t.Fatalf("substitution must not redirect the read: artifact = %q", state.Result.Artifact)
+				}
+				if !swapped {
+					t.Fatal("the swap hook never ran, so the post-validation window was not exercised")
+				}
+				return
+			}
+			if state.Status == ResultFailed || time.Now().After(deadline) {
+				t.Fatalf("a post-validation swap must not block or redirect the read: %+v", state.Result)
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+	})
+}
+
+// growingReader delivers maxArtifactBytes+1 bytes across reads whose sizes
+// grow, so the bound must be enforced on bytes actually read rather than on
+// any pre-read claim about the total.
+type growingReader struct {
+	delivered int
+}
+
+func (g *growingReader) Read(p []byte) (int, error) {
+	if g.delivered >= maxArtifactBytes+1 {
+		return 0, io.EOF
+	}
+	n := len(p)
+	if n > 4096 {
+		n = 4096
+	}
+	if g.delivered+n > maxArtifactBytes+1 {
+		n = maxArtifactBytes + 1 - g.delivered
+	}
+	for i := 0; i < n; i++ {
+		p[i] = 'x'
+	}
+	g.delivered += n
+	return n, nil
+}
+
+func TestReadArtifactBoundedAppliesToBytesRead(t *testing.T) {
+	data, err := readArtifactBounded(bytes.NewReader([]byte("artifact-bytes")))
+	if err != nil || string(data) != "artifact-bytes" {
+		t.Fatalf("readArtifactBounded = %q, %v", data, err)
+	}
+	data, err = readArtifactBounded(bytes.NewReader(make([]byte, maxArtifactBytes)))
+	if err != nil || len(data) != maxArtifactBytes {
+		t.Fatalf("an artifact of exactly the bound must read whole: %d bytes, %v", len(data), err)
+	}
+	data, err = readArtifactBounded(bytes.NewReader(make([]byte, maxArtifactBytes+1)))
+	if err == nil || len(data) != 0 {
+		t.Fatalf("a file truncated past the bound must be rejected whole: %d bytes, %v", len(data), err)
+	}
+	data, err = readArtifactBounded(&growingReader{})
+	if err == nil || len(data) != 0 {
+		t.Fatalf("a reader that grows past the bound must be rejected whole: %d bytes, %v", len(data), err)
+	}
+}
+
 func TestWorkerSnapshotDigestGuard(t *testing.T) {
 	_, _, server := newTestWorker(t)
 	ctx := context.Background()
@@ -731,5 +943,359 @@ func TestWorkerShutdownTerminatesRunningTasks(t *testing.T) {
 	case <-op.wait:
 	default:
 		t.Fatal("shutdown returned before verified process termination")
+	}
+}
+
+// retainedArtifactBytes sums the artifact bytes the worker still retains
+// across every operation it knows.
+func retainedArtifactBytes(w *Worker) int {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	total := 0
+	for _, op := range w.ops {
+		if op != nil && op.result != nil {
+			total += len(op.result.Artifact)
+		}
+	}
+	return total
+}
+
+func releaseEnvelope(base Envelope, nonce string) Envelope {
+	env := base
+	env.Kind = KindRelease
+	env.Sequence = 1
+	env.PayloadDigest = CancelPayloadDigest
+	env.Nonce = nonce
+	return env
+}
+
+func TestWorkerReleaseConsumesResultPayload(t *testing.T) {
+	worker, priv, server := newTestWorker(t)
+	client := &Client{BaseURL: server.URL}
+	ctx := context.Background()
+
+	payload, _ := json.Marshal(Task{
+		Command:      []string{"sh", "-c", "head -c 1048576 /dev/zero > artifact.bin"},
+		ArtifactPath: "artifact.bin",
+	})
+	env := dispatchEnvelope(worker.clock())
+	env.PayloadDigest = PayloadDigestOf(payload)
+	if _, err := client.Dispatch(ctx, priv, env, payload); err != nil {
+		t.Fatalf("Dispatch: %v", err)
+	}
+	deadline := time.Now().Add(10 * time.Second)
+	var first ResultState
+	for {
+		state, err := client.Result(ctx, "op-1")
+		if err != nil {
+			t.Fatalf("Result: %v", err)
+		}
+		if state.Status == ResultCompleted {
+			first = state
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("task never completed")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if len(first.Result.Artifact) != 1<<20 {
+		t.Fatalf("first read artifact = %d bytes", len(first.Result.Artifact))
+	}
+	// Repeated reads before acknowledgement are reliable: the payload is
+	// only consumed by release, never by reading.
+	second, err := client.Result(ctx, "op-1")
+	if err != nil || len(second.Result.Artifact) != 1<<20 {
+		t.Fatalf("second read = %+v, %v", second.Result, err)
+	}
+	if retained := retainedArtifactBytes(worker); retained != 1<<20 {
+		t.Fatalf("retained artifact bytes = %d, want %d", retained, 1<<20)
+	}
+
+	status, err := client.Release(ctx, priv, releaseEnvelope(env, "release-nonce-value-01"))
+	if err != nil || status != ResultCompleted {
+		t.Fatalf("Release = %q, %v", status, err)
+	}
+	state, err := client.Result(ctx, "op-1")
+	if err != nil || state.Status != ResultCompleted {
+		t.Fatalf("released result poll = %+v, %v", state, err)
+	}
+	if state.Result == nil || state.Result.Artifact != nil ||
+		state.Result.StdoutTail != "" || state.Result.StderrTail != "" ||
+		state.Result.Status != ResultCompleted {
+		t.Fatalf("released result must be a compact stub: %+v", state.Result)
+	}
+	if retained := retainedArtifactBytes(worker); retained != 0 {
+		t.Fatalf("retained artifact bytes after release = %d", retained)
+	}
+
+	env2 := env
+	env2.Nonce = "redelivery-nonce-value-1"
+	if _, err := client.Dispatch(ctx, priv, env2, payload); err == nil {
+		t.Fatal("redelivery of a released opID must still be rejected")
+	}
+
+	if _, err := client.Release(ctx, priv, releaseEnvelope(env, "release-nonce-value-02")); err != nil {
+		t.Fatalf("repeat release must be idempotent: %v", err)
+	}
+	cancelEnv := env
+	cancelEnv.Kind = KindCancel
+	cancelEnv.Sequence = 1
+	cancelEnv.PayloadDigest = CancelPayloadDigest
+	cancelEnv.Nonce = "cancel-nonce-value-0001"
+	if _, err := client.Cancel(ctx, priv, cancelEnv); err != nil {
+		t.Fatalf("cancel of a released op must still be acknowledged: %v", err)
+	}
+
+	unknownEnv := releaseEnvelope(env, "release-nonce-value-03")
+	unknownEnv.OpID = "never-dispatched-op"
+	if _, err := client.Release(ctx, priv, unknownEnv); err == nil {
+		t.Fatal("release of an unknown opID must be rejected")
+	} else {
+		var transportErr *TransportError
+		if !errors.As(err, &transportErr) || transportErr.StatusCode != http.StatusNotFound {
+			t.Fatalf("release of an unknown opID = %v, want 404", err)
+		}
+	}
+
+	t.Run("release while running conflicts", func(t *testing.T) {
+		runningPayload, _ := json.Marshal(Task{Command: []string{"sh", "-c", "sleep 30"}})
+		runningEnv := dispatchEnvelope(worker.clock())
+		runningEnv.OpID = "op-running"
+		runningEnv.PayloadDigest = PayloadDigestOf(runningPayload)
+		runningEnv.Nonce = "running-dispatch-nonce-1"
+		if _, err := client.Dispatch(ctx, priv, runningEnv, runningPayload); err != nil {
+			t.Fatalf("Dispatch: %v", err)
+		}
+		_, err := client.Release(ctx, priv, releaseEnvelope(runningEnv, "running-release-nonce-1"))
+		var transportErr *TransportError
+		if !errors.As(err, &transportErr) || transportErr.StatusCode != http.StatusConflict {
+			t.Fatalf("release while running = %v, want 409", err)
+		}
+		cancelEnv := runningEnv
+		cancelEnv.Kind = KindCancel
+		cancelEnv.Sequence = 1
+		cancelEnv.PayloadDigest = CancelPayloadDigest
+		cancelEnv.Nonce = "running-cancel-nonce-1"
+		if status, err := client.Cancel(ctx, priv, cancelEnv); err != nil || status != ResultCancelled {
+			t.Fatalf("Cancel after refused release = %q, %v", status, err)
+		}
+	})
+
+	t.Run("release of a cancelled result", func(t *testing.T) {
+		cancelledPayload, _ := json.Marshal(Task{Command: []string{"sh", "-c", "sleep 30"}})
+		cancelledEnv := dispatchEnvelope(worker.clock())
+		cancelledEnv.OpID = "op-cancelled"
+		cancelledEnv.PayloadDigest = PayloadDigestOf(cancelledPayload)
+		cancelledEnv.Nonce = "cancelled-dispatch-nonce-1"
+		if _, err := client.Dispatch(ctx, priv, cancelledEnv, cancelledPayload); err != nil {
+			t.Fatalf("Dispatch: %v", err)
+		}
+		cancelEnv := cancelledEnv
+		cancelEnv.Kind = KindCancel
+		cancelEnv.Sequence = 1
+		cancelEnv.PayloadDigest = CancelPayloadDigest
+		cancelEnv.Nonce = "cancelled-cancel-nonce-1"
+		if _, err := client.Cancel(ctx, priv, cancelEnv); err != nil {
+			t.Fatalf("Cancel: %v", err)
+		}
+		state, err := client.Result(ctx, "op-cancelled")
+		if err != nil || state.Status != ResultCancelled || state.Result == nil {
+			t.Fatalf("cancelled result poll = %+v, %v", state, err)
+		}
+		if _, err := client.Release(ctx, priv, releaseEnvelope(cancelledEnv, "cancelled-release-nonce-1")); err != nil {
+			t.Fatalf("Release of a cancelled result: %v", err)
+		}
+		state, err = client.Result(ctx, "op-cancelled")
+		if err != nil || state.Status != ResultCancelled || state.Result == nil ||
+			state.Result.Artifact != nil || state.Result.ExitCode != 0 {
+			t.Fatalf("released cancelled result must be a compact stub: %+v, %v", state.Result, err)
+		}
+	})
+
+	t.Run("mismatched path and envelope are refused", func(t *testing.T) {
+		for _, opID := range []string{"op-rel-a", "op-rel-b"} {
+			payload, _ := json.Marshal(Task{
+				Command:      []string{"sh", "-c", "head -c 1048576 /dev/zero > " + opID + ".bin"},
+				ArtifactPath: opID + ".bin",
+			})
+			env := dispatchEnvelope(worker.clock())
+			env.OpID = opID
+			env.PayloadDigest = PayloadDigestOf(payload)
+			env.Nonce = "mismatch-dispatch-" + opID
+			if _, err := client.Dispatch(ctx, priv, env, payload); err != nil {
+				t.Fatalf("Dispatch %s: %v", opID, err)
+			}
+		}
+		waitForCompleted := func(opID string) {
+			t.Helper()
+			deadline := time.Now().Add(10 * time.Second)
+			for {
+				state, err := client.Result(ctx, opID)
+				if err != nil {
+					t.Fatalf("Result %s: %v", opID, err)
+				}
+				if state.Status == ResultCompleted {
+					return
+				}
+				if time.Now().After(deadline) {
+					t.Fatalf("%s never completed", opID)
+				}
+				time.Sleep(10 * time.Millisecond)
+			}
+		}
+		waitForCompleted("op-rel-a")
+		waitForCompleted("op-rel-b")
+
+		// A validly signed release for op-rel-a, posted to op-rel-b's release
+		// URL, must be refused: the signature authorizes one operation, not
+		// whichever operation the URL names.
+		envA := dispatchEnvelope(worker.clock())
+		envA.OpID = "op-rel-a"
+		envA.PayloadDigest = CancelPayloadDigest
+		signature, err := releaseEnvelope(envA, "mismatch-release-a-1").Sign(priv)
+		if err != nil {
+			t.Fatal(err)
+		}
+		body, err := json.Marshal(signedRequest{
+			Envelope:  releaseEnvelope(envA, "mismatch-release-a-1"),
+			Signature: signature,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := client.post(ctx, "/v1/tasks/op-rel-b/release", body, "op-rel-b"); err == nil {
+			t.Fatal("a release for op-rel-a posted to op-rel-b must be refused")
+		} else {
+			var transportErr *TransportError
+			if !errors.As(err, &transportErr) || transportErr.StatusCode != http.StatusBadRequest {
+				t.Fatalf("mismatched release = %v, want 400", err)
+			}
+		}
+		// The refused request must not have consumed its nonce or touched
+		// either operation: both results keep their full payloads.
+		state, err := client.Result(ctx, "op-rel-b")
+		if err != nil || state.Result == nil || len(state.Result.Artifact) != 1<<20 {
+			t.Fatalf("op-rel-b must keep its full payload: %+v, %v", state.Result, err)
+		}
+		if retained := retainedArtifactBytes(worker); retained != 2<<20 {
+			t.Fatalf("retained artifact bytes after refused release = %d, want %d", retained, 2<<20)
+		}
+		// Re-posting the exact same signed envelope, now properly addressed
+		// to op-rel-a, must succeed: a burned nonce would surface as a 401
+		// replay rejection here, proving the refused attempt consumed
+		// nothing. The release compacts only op-rel-a.
+		if _, err := client.post(ctx, "/v1/tasks/op-rel-a/release", body, "op-rel-a"); err != nil {
+			t.Fatalf("properly addressed re-release must succeed: %v", err)
+		}
+		state, err = client.Result(ctx, "op-rel-a")
+		if err != nil || state.Result == nil || state.Result.Artifact != nil {
+			t.Fatalf("released op-rel-a must be a compact stub: %+v, %v", state.Result, err)
+		}
+		state, err = client.Result(ctx, "op-rel-b")
+		if err != nil || state.Result == nil || len(state.Result.Artifact) != 1<<20 {
+			t.Fatalf("op-rel-b must still keep its full payload: %+v, %v", state.Result, err)
+		}
+		if retained := retainedArtifactBytes(worker); retained != 1<<20 {
+			t.Fatalf("retained artifact bytes after addressed release = %d, want %d", retained, 1<<20)
+		}
+	})
+
+	t.Run("release refuses an unverified termination", func(t *testing.T) {
+		if runtime.GOOS != "linux" {
+			t.Skip("unverified-termination assertions read process groups and /proc")
+		}
+		if _, err := exec.LookPath("setsid"); err != nil {
+			t.Skip("setsid is required to leave the task's process group")
+		}
+		unverifiedPayload, _ := json.Marshal(Task{Command: []string{"sh", "-c", `setsid sh -c 'echo $$ > released-escaped.txt; exec sleep 300' & wait`}})
+		unverifiedEnv := dispatchEnvelope(worker.clock())
+		unverifiedEnv.OpID = "op-unverified"
+		unverifiedEnv.PayloadDigest = PayloadDigestOf(unverifiedPayload)
+		unverifiedEnv.Nonce = "unverified-dispatch-nonce-1"
+		if _, err := client.Dispatch(ctx, priv, unverifiedEnv, unverifiedPayload); err != nil {
+			t.Fatalf("Dispatch: %v", err)
+		}
+		waitForDescendantPID(t, filepath.Join(worker.config.WorkspaceDir, "released-escaped.txt"))
+		cancelEnv := unverifiedEnv
+		cancelEnv.Kind = KindCancel
+		cancelEnv.Sequence = 1
+		cancelEnv.PayloadDigest = CancelPayloadDigest
+		cancelEnv.Nonce = "unverified-cancel-nonce-1"
+		if _, err := client.Cancel(ctx, priv, cancelEnv); err == nil {
+			t.Fatal("cancellation with a live escapee must be refused")
+		}
+		state, err := client.Result(ctx, "op-unverified")
+		if err != nil || state.Result == nil || state.Result.LiveDescendants == 0 {
+			t.Fatalf("unverified result must report the live tree: %+v, %v", state.Result, err)
+		}
+		_, err = client.Release(ctx, priv, releaseEnvelope(unverifiedEnv, "unverified-release-nonce-1"))
+		var transportErr *TransportError
+		if !errors.As(err, &transportErr) || transportErr.StatusCode != http.StatusConflict {
+			t.Fatalf("release of an unverified termination = %v, want 409", err)
+		}
+		state, err = client.Result(ctx, "op-unverified")
+		if err != nil || state.Result == nil || state.Result.LiveDescendants == 0 {
+			t.Fatalf("release must retain the live-tree report: %+v, %v", state.Result, err)
+		}
+	})
+}
+
+func TestWorkerReleasedStorageStaysBoundedAcrossTasks(t *testing.T) {
+	worker, priv, server := newTestWorker(t)
+	client := &Client{BaseURL: server.URL}
+	ctx := context.Background()
+
+	opIDs := make([]string, 0, 6)
+	for i := 0; i < 6; i++ {
+		name := "artifact-" + strconv.Itoa(i) + ".bin"
+		payload, _ := json.Marshal(Task{
+			Command:      []string{"sh", "-c", "head -c 1048576 /dev/zero > " + name},
+			ArtifactPath: name,
+		})
+		env := dispatchEnvelope(worker.clock())
+		env.OpID = "op-round-" + strconv.Itoa(i)
+		env.PayloadDigest = PayloadDigestOf(payload)
+		env.Nonce = "round-dispatch-nonce-" + strconv.Itoa(i)
+		opIDs = append(opIDs, env.OpID)
+		if _, err := client.Dispatch(ctx, priv, env, payload); err != nil {
+			t.Fatalf("Dispatch round %d: %v", i, err)
+		}
+		deadline := time.Now().Add(10 * time.Second)
+		for {
+			state, err := client.Result(ctx, env.OpID)
+			if err != nil {
+				t.Fatalf("Result round %d: %v", i, err)
+			}
+			if state.Status == ResultCompleted {
+				if len(state.Result.Artifact) != 1<<20 {
+					t.Fatalf("round %d artifact = %d bytes", i, len(state.Result.Artifact))
+				}
+				break
+			}
+			if time.Now().After(deadline) {
+				t.Fatalf("round %d task never completed", i)
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+		if retained := retainedArtifactBytes(worker); retained != 1<<20 {
+			t.Fatalf("round %d retained artifact bytes = %d, want %d", i, retained, 1<<20)
+		}
+		if _, err := client.Release(ctx, priv, releaseEnvelope(env, "round-release-nonce-"+strconv.Itoa(i))); err != nil {
+			t.Fatalf("Release round %d: %v", i, err)
+		}
+		if retained := retainedArtifactBytes(worker); retained != 0 {
+			t.Fatalf("round %d left %d cumulative retained artifact bytes; retention must stay bounded", i, retained)
+		}
+	}
+
+	for _, opID := range opIDs {
+		env := dispatchEnvelope(worker.clock())
+		env.OpID = opID
+		env.Nonce = "post-release-nonce-" + opID
+		env.PayloadDigest = PayloadDigestOf([]byte(`{"command":["true"]}`))
+		if _, err := client.Dispatch(ctx, priv, env, []byte(`{"command":["true"]}`)); err == nil {
+			t.Fatalf("redispatch of released %s must be rejected", opID)
+		}
 	}
 }

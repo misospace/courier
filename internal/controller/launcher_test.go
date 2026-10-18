@@ -9,6 +9,7 @@ import (
 	"testing"
 
 	corev1 "k8s.io/api/core/v1"
+	rbacv1 "k8s.io/api/rbac/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -75,6 +76,9 @@ func launcherScheme(t *testing.T) *runtime.Scheme {
 	}
 	if err := corev1.AddToScheme(scheme); err != nil {
 		t.Fatalf("add core scheme: %v", err)
+	}
+	if err := rbacv1.AddToScheme(scheme); err != nil {
+		t.Fatalf("add rbac scheme: %v", err)
 	}
 	return scheme
 }
@@ -553,6 +557,162 @@ func TestCoordinatorLauncherProjectsCriteriaEnvelope(t *testing.T) {
 	}
 }
 
+// TestCoordinatorLauncherClassifiesPermanentPodRejection pins the launcher's
+// half of the permanent-rejection invariant: a coordinator pod spec the API
+// server refuses outright, with the slot proven empty, is a permanent,
+// terminalizable failure, because requeueing cannot change it. A Forbidden or
+// quota denial stays an ordinary error — a grant or a quota can still be
+// raised.
+func TestCoordinatorLauncherClassifiesPermanentPodRejection(t *testing.T) {
+	cases := map[string]struct {
+		rejection     error
+		wantPermanent bool
+	}{
+		"invalid": {
+			rejection:     invalidPodRejection("coordinator"),
+			wantPermanent: true,
+		},
+		"forbidden": {
+			rejection:     apierrors.NewForbidden(corev1.Resource("pods"), "coordinator", errors.New("exceeded quota")),
+			wantPermanent: false,
+		},
+	}
+	for name, test := range cases {
+		t.Run(name, func(t *testing.T) {
+			run := &courierv1alpha1.CoderRun{
+				ObjectMeta: metav1.ObjectMeta{Name: "run-1", Namespace: "default", UID: types.UID("run-uid")},
+				Spec: courierv1alpha1.CoderRunSpec{
+					Mode: courierv1alpha1.ModeResolveIssue,
+					Repo: "acme/widgets",
+					Ref:  1,
+					Lane: "local",
+				},
+				Status: courierv1alpha1.CoderRunStatus{Phase: courierv1alpha1.PhaseClaimed},
+			}
+			lane := &courierv1alpha1.LaneProfile{
+				ObjectMeta: metav1.ObjectMeta{Name: "local", Namespace: "default"},
+				Spec:       courierv1alpha1.LaneProfileSpec{Roles: map[string]string{"coordinator": "test-model"}},
+			}
+			fakeClient := fake.NewClientBuilder().
+				WithScheme(launcherScheme(t)).
+				WithStatusSubresource(&courierv1alpha1.CoderRun{}).
+				WithRuntimeObjects(run, lane).
+				Build()
+			launcher := &CoordinatorLauncher{
+				Client: fakeClient,
+				Pod:    executor.PodConfig{Image: "example/opencode:test"},
+			}
+			watcher, ok := fakeClient.(client.WithWatch)
+			if !ok {
+				t.Fatal("the fake client does not support watch")
+			}
+			launcher.Client = interceptor.NewClient(watcher, interceptor.Funcs{
+				Create: func(ctx context.Context, c client.WithWatch, obj client.Object, opts ...client.CreateOption) error {
+					if obj.GetName() == "run-1-coordinator" {
+						return test.rejection
+					}
+					return c.Create(ctx, obj, opts...)
+				},
+			})
+
+			err := launcher.Launch(context.Background(), run)
+			var permanent *SecureNeedsHumanError
+			if test.wantPermanent {
+				if !errors.As(err, &permanent) {
+					t.Fatalf("Launch() error = %v, want a *SecureNeedsHumanError the reconciler can terminalize", err)
+				}
+				if permanent.Reason != "PodAdmission" {
+					t.Fatalf("reason = %q, want PodAdmission", permanent.Reason)
+				}
+				if !strings.Contains(permanent.Detail, "rejected the coordinator pod run-1-coordinator") {
+					t.Fatalf("detail = %q, want it to name the rejected coordinator pod", permanent.Detail)
+				}
+				return
+			}
+			if errors.As(err, &permanent) {
+				t.Fatalf("Launch() error = %v, want an ordinary requeueable error", err)
+			}
+			if !errors.Is(err, test.rejection) {
+				t.Fatalf("Launch() error = %v, want the unchanged create failure %v", err, test.rejection)
+			}
+		})
+	}
+}
+
+// TestCoordinatorLauncherKeepsClaimOnPodAdmissionWithLiveSlot pins the other
+// half of the same decision. The API server validates before its existence
+// check, so a slot an earlier attempt of this still-Claimed run filled answers
+// Invalid rather than AlreadyExists — and a live coordinator may be running
+// there. The permanent class is therefore conditional on a proven-empty slot:
+// with a writer in the slot the launcher stays Claimed (ErrProvisioningInFlight),
+// because a terminalized NeedsHuman run is no longer observed, and the run
+// adopts its own live pod once the lane is fixed.
+func TestCoordinatorLauncherKeepsClaimOnPodAdmissionWithLiveSlot(t *testing.T) {
+	run := &courierv1alpha1.CoderRun{
+		ObjectMeta: metav1.ObjectMeta{Name: "run-1", Namespace: "default", UID: types.UID("run-uid")},
+		Spec: courierv1alpha1.CoderRunSpec{
+			Mode: courierv1alpha1.ModeResolveIssue,
+			Repo: "acme/widgets",
+			Ref:  1,
+			Lane: "local",
+		},
+		Status: courierv1alpha1.CoderRunStatus{Phase: courierv1alpha1.PhaseClaimed},
+	}
+	lane := &courierv1alpha1.LaneProfile{
+		ObjectMeta: metav1.ObjectMeta{Name: "local", Namespace: "default"},
+		Spec:       courierv1alpha1.LaneProfileSpec{Roles: map[string]string{"coordinator": "test-model"}},
+	}
+	// An earlier attempt of this run already created its coordinator, and the
+	// lane has since been edited into a spec the API server refuses.
+	controller := true
+	live := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "run-1-coordinator",
+			Namespace: "default",
+			Labels: map[string]string{
+				executor.LabelRun: run.Name,
+			},
+			OwnerReferences: []metav1.OwnerReference{{
+				APIVersion: courierv1alpha1.GroupVersion.String(),
+				Kind:       "CoderRun",
+				Name:       run.Name,
+				UID:        run.UID,
+				Controller: &controller,
+			}},
+		},
+	}
+	fakeClient := fake.NewClientBuilder().
+		WithScheme(launcherScheme(t)).
+		WithStatusSubresource(&courierv1alpha1.CoderRun{}).
+		WithRuntimeObjects(run, lane, live).
+		Build()
+	launcher := &CoordinatorLauncher{
+		Client: fakeClient,
+		Pod:    executor.PodConfig{Image: "example/opencode:test"},
+	}
+	watcher, ok := fakeClient.(client.WithWatch)
+	if !ok {
+		t.Fatal("the fake client does not support watch")
+	}
+	launcher.Client = interceptor.NewClient(watcher, interceptor.Funcs{
+		Create: func(ctx context.Context, c client.WithWatch, obj client.Object, opts ...client.CreateOption) error {
+			if obj.GetName() == "run-1-coordinator" {
+				return invalidPodRejection("run-1-coordinator")
+			}
+			return c.Create(ctx, obj, opts...)
+		},
+	})
+
+	err := launcher.Launch(context.Background(), run)
+	if !errors.Is(err, ErrProvisioningInFlight) {
+		t.Fatalf("Launch() error = %v, want ErrProvisioningInFlight while this run's own coordinator occupies the slot; terminalizing would strand a live writer", err)
+	}
+	var permanent *SecureNeedsHumanError
+	if errors.As(err, &permanent) {
+		t.Fatalf("Launch() error = %v, want no terminalizable class while the slot is occupied", err)
+	}
+}
+
 func TestCoordinatorLauncherAcceptsExistingPodWhenLive(t *testing.T) {
 	run := &courierv1alpha1.CoderRun{
 		ObjectMeta: metav1.ObjectMeta{Name: "run-1", Namespace: "default", UID: types.UID("run-uid")},
@@ -638,10 +798,16 @@ func TestCoordinatorLauncherReportsProvisioningInFlightWhenExistingPodVanishesBe
 		WithScheme(launcherScheme(t)).
 		WithStatusSubresource(&courierv1alpha1.CoderRun{}).
 		WithInterceptorFuncs(interceptor.Funcs{
-			// Create returns AlreadyExists as if a previous create of the
-			// same name had landed, but the follow-up Get sees nothing.
+			// The pod create collides as if a previous create of the same
+			// name had landed, but the follow-up Get sees nothing.
+			// Scoped to pods: observer identity provisioning now precedes
+			// the pod create, and provisioning its own resources is not
+			// the race under test.
 			Create: func(ctx context.Context, c client.WithWatch, obj client.Object, opts ...client.CreateOption) error {
-				return apierrors.NewAlreadyExists(schema.GroupResource{Group: "", Resource: "pods"}, obj.GetName())
+				if _, ok := obj.(*corev1.Pod); ok {
+					return apierrors.NewAlreadyExists(schema.GroupResource{Group: "", Resource: "pods"}, obj.GetName())
+				}
+				return c.Create(ctx, obj, opts...)
 			},
 		}).
 		WithRuntimeObjects(run, lane).
@@ -876,5 +1042,16 @@ func TestCoordinatorLauncherCollisionReadBypassesCachedClient(t *testing.T) {
 	err := launcher.Launch(context.Background(), run)
 	if !errors.Is(err, ErrProvisioningInFlight) {
 		t.Fatalf("Launch() error = %v, want ErrProvisioningInFlight; the collision verification must read the API server's current state, not a cached pre-deletion view", err)
+	}
+}
+
+func TestCoordinatorLauncherValidateRequiresAPIReader(t *testing.T) {
+	unwired := &CoordinatorLauncher{}
+	if err := unwired.Validate(); !errors.Is(err, ErrLauncherAPIReaderRequired) {
+		t.Fatalf("Validate() error = %v, want ErrLauncherAPIReaderRequired", err)
+	}
+	wired := &CoordinatorLauncher{APIReader: fake.NewClientBuilder().WithScheme(launcherScheme(t)).Build()}
+	if err := wired.Validate(); err != nil {
+		t.Fatalf("Validate() error = %v", err)
 	}
 }

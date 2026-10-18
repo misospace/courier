@@ -26,11 +26,13 @@ import (
 	"github.com/misospace/courier/internal/topology"
 )
 
-// SecureNeedsHumanError marks a permanent, actionable secure-mode failure:
-// a configuration or admission problem that requeueing cannot fix. The
-// reconciler records it as a SecurePreflightFailed condition and terminates
-// the run NeedsHuman. Any other error from the secure path is treated as
-// transient and follows the normal claim/release/retry cycle.
+// SecureNeedsHumanError marks a permanent, actionable deployment failure: a
+// configuration or admission problem that requeueing cannot fix. A run
+// terminalizes NeedsHuman from the launch paths on the pod-admission class
+// alone — podAdmissionRejection narrows it to the case the rendered spec's
+// author must fix. Every other error from those paths is transient and follows
+// the normal claim/release/retry cycle, even when it is itself one of these: a
+// signal that clears on a later pass would strand the run if terminalized.
 type SecureNeedsHumanError struct {
 	Reason string
 	Detail string
@@ -40,6 +42,20 @@ func (e *SecureNeedsHumanError) Error() string { return e.Detail }
 
 func secureNeedsHuman(reason, format string, args ...any) *SecureNeedsHumanError {
 	return &SecureNeedsHumanError{Reason: reason, Detail: fmt.Sprintf(format, args...)}
+}
+
+// podAdmissionRejection returns the permanent pod-admission rejection a
+// rendered spec's author must fix — the class this sizing work made
+// reachable — and nil for every other preflight failure. Only this class
+// terminalizes from the launch paths: a live probe that outran a
+// just-written NetworkPolicy or a stale RBAC informer cache clears on a
+// later pass, and terminalizing those would strand a recoverable run.
+func podAdmissionRejection(err error) *SecureNeedsHumanError {
+	var permanent *SecureNeedsHumanError
+	if !errors.As(err, &permanent) || permanent.Reason != "PodAdmission" {
+		return nil
+	}
+	return permanent
 }
 
 // ProviderFactory constructs the forge provider facets for one selected
@@ -116,9 +132,12 @@ type SecureControl struct {
 	// pod-loss paths (#216). Zero falls back to the package default.
 	MaxRestarts int
 	// APIReader reads the API server directly, bypassing the informer
-	// cache, so the broken-topology relaunch's post-delete
-	// re-confirmation never trusts a lagging cache (§6). Nil falls back
-	// to Client, which serves only direct-construction tests.
+	// cache, so every destructive decision on the broken-topology relaunch
+	// path is made against the world rather than a lagging cache (§6): the
+	// post-delete re-confirmation, the run read the crashloop ceiling is
+	// judged from, and the control-pod read whose delete carries the
+	// observed UID as a precondition. Nil falls back to Client, which serves
+	// only direct-construction tests.
 	APIReader client.Reader
 }
 
@@ -129,11 +148,12 @@ func (s *SecureControl) now() time.Time {
 	return time.Now()
 }
 
-// reader returns the reader the secure path's live re-confirmations go
-// through, preferring the injected API reader and falling back to the cached
-// client. Wired from the manager in production, so the fallback serves only
-// direct-construction tests and the post-delete confirmation never runs
-// against cached state.
+// reader returns the reader the secure path's live reads go through — the
+// post-delete re-confirmation and the run and control-pod reads behind the
+// broken-topology relaunch's destructive decisions — preferring the injected
+// API reader and falling back to the cached client. Wired from the manager in
+// production, so the fallback serves only direct-construction tests and no
+// destructive decision is made against cached state.
 func (s *SecureControl) reader() client.Reader {
 	if s.APIReader != nil {
 		return s.APIReader

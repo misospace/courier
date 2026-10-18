@@ -149,6 +149,10 @@ func (r *CoderRunReconciler) checkLiveness(ctx context.Context, run *courierv1al
 		l.Info("liveness: live pod read failed; deferring the reap decision", "error", err.Error())
 		return ctrl.Result{RequeueAfter: observationRequeueDelay}, true, nil
 	}
+	if err := appendOtherRunLabelSchemePods(ctx, r.reader(), run, &pods); err != nil {
+		l.Info("liveness: live pod read failed; deferring the reap decision", "error", err.Error())
+		return ctrl.Result{RequeueAfter: observationRequeueDelay}, true, nil
+	}
 	if fresh.UID != run.UID || fresh.Status.Phase != courierv1alpha1.PhaseRunning {
 		// The world changed under this reconcile; the next one re-observes.
 		return ctrl.Result{}, false, nil
@@ -473,6 +477,9 @@ func coordinatorObjectPresentLive(ctx context.Context, reader client.Reader, run
 	); err != nil {
 		return false, err
 	}
+	if err := appendOtherRunLabelSchemePods(ctx, reader, run, &pods); err != nil {
+		return false, err
+	}
 	for i := range pods.Items {
 		pod := &pods.Items[i]
 		if podBelongsToRun(pod, run) && hasCoordinatorContainer(pod) {
@@ -480,6 +487,28 @@ func coordinatorObjectPresentLive(ctx context.Context, reader client.Reader, run
 		}
 	}
 	return false, nil
+}
+
+// appendOtherRunLabelSchemePods extends a live list filtered on the executor's
+// run-label value with pods carrying the topology scheme's value when the two
+// differ. Legacy executor pods truncate long run names without a digest
+// suffix while topology pods hash-suffix them, so for a >63-character name a
+// single selector misses the secure control pod and every liveness judgement
+// built on the list is wrong. For names where both schemes agree the list is
+// already complete and no second read happens.
+func appendOtherRunLabelSchemePods(ctx context.Context, reader client.Reader, run *courierv1alpha1.CoderRun, pods *corev1.PodList) error {
+	if topology.RunLabelValue(run.Name) == executor.RunLabelValue(run.Name) {
+		return nil
+	}
+	var more corev1.PodList
+	if err := reader.List(ctx, &more,
+		client.InNamespace(run.Namespace),
+		client.MatchingLabels{executor.LabelRun: topology.RunLabelValue(run.Name)},
+	); err != nil {
+		return err
+	}
+	pods.Items = append(pods.Items, more.Items...)
+	return nil
 }
 
 // observeMissingCoordinator is the disappearance backstop for a Running run
@@ -513,6 +542,10 @@ func (r *CoderRunReconciler) observeMissingCoordinator(ctx context.Context, run 
 		client.InNamespace(run.Namespace),
 		client.MatchingLabels{executor.LabelRun: executor.RunLabelValue(run.Name)},
 	); err != nil {
+		// A read that failed is not evidence of a loss.
+		return ctrl.Result{RequeueAfter: observationRequeueDelay}, nil
+	}
+	if err := appendOtherRunLabelSchemePods(ctx, r.reader(), run, &pods); err != nil {
 		// A read that failed is not evidence of a loss.
 		return ctrl.Result{RequeueAfter: observationRequeueDelay}, nil
 	}

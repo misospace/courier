@@ -21,6 +21,14 @@ const (
 	CoordinatorUID int64 = 65532
 	CoordinatorGID int64 = 65532
 
+	// Legacy observer identity and protected paths are shared with the
+	// coordinator-side evidence reader.
+	ObserverContainerName         = "workspace-observer"
+	ObserverUID             int64 = 65533
+	ObserverStatePath             = "/courier-observer"
+	ObserverTokenPath             = "/var/run/courier-observer-token"
+	ObserverContractVersion       = "1"
+
 	LabelRun               = "courier.misospace.dev/coderrun"
 	LabelComponent         = "courier.misospace.dev/component"
 	LabelExecutor          = "courier.misospace.dev/executor"
@@ -64,7 +72,6 @@ type PodConfig struct {
 	MetricsMCPURL   string
 	BootstrapBinary string
 	OpenCode        OpenCode
-	Resources       corev1.ResourceRequirements
 	// EvidenceURL, EvidenceToken, and EvidenceNonce enable bounded
 	// failure-evidence capture. Capture is all-or-nothing: all three must
 	// be set together, and leaving them empty keeps the pod on the kubelet's
@@ -201,6 +208,7 @@ func (b *PodBuilder) Build(run *courierv1alpha1.CoderRun, lane *courierv1alpha1.
 			Annotations: map[string]string{
 				opencodeConfigAnnotation: string(openCodeConfig),
 			},
+
 			OwnerReferences: []metav1.OwnerReference{{
 				APIVersion:         courierv1alpha1.GroupVersion.String(),
 				Kind:               "CoderRun",
@@ -251,7 +259,7 @@ func (b *PodBuilder) Build(run *courierv1alpha1.CoderRun, lane *courierv1alpha1.
 				Args:                     append([]string(nil), command.Args...),
 				WorkingDir:               config.WorkspacePath,
 				Env:                      podEnvironment(invocation, executorImpl.Name(), config),
-				Resources:                config.Resources,
+				Resources:                lane.Spec.EffectiveResources(),
 				VolumeMounts: []corev1.VolumeMount{{
 					Name:      "workspace",
 					MountPath: config.WorkspacePath,
@@ -282,6 +290,18 @@ func (b *PodBuilder) Build(run *courierv1alpha1.CoderRun, lane *courierv1alpha1.
 	}
 	// A 45-second grace only exists to fit the evidence capture deadline; a
 	// run that does not capture keeps the kubelet's default.
+	observerEnabled := executorImpl.Name() == "opencode"
+	if observerEnabled {
+		pod.Annotations[ObserverContractAnnotation] = ObserverContractVersion
+		pod.Spec.Volumes = append(pod.Spec.Volumes, observerVolumes()...)
+		pod.Spec.InitContainers = append(pod.Spec.InitContainers, observerSeedContainer(config, invocation, pod.Name, string(run.UID)))
+		pod.Spec.Containers = append(pod.Spec.Containers, observerContainer(config, invocation, pod.Name, string(run.UID)))
+		// The pod-level fsGroup (65532) owns the shared emptyDir roots; the
+		// observer's distinct UID/GID (65533) needs that group as a
+		// supplement or it cannot create its private state directory. For
+		// the coordinator it is a no-op (it already runs 65532:65532).
+		pod.Spec.SecurityContext.SupplementalGroups = []int64{CoordinatorGID}
+	}
 	if config.EvidenceEnabled() {
 		pod.Spec.TerminationGracePeriodSeconds = int64Ptr(EvidenceTerminationGracePeriodSeconds)
 	}
