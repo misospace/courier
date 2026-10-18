@@ -286,7 +286,7 @@ affirmative trusted safety proof; settle atomically applies it. Incomplete proof
 unsupported capability, or stale fencing retains ownership. Transient settlement
 errors are retried with the same run-scoped idempotency key after controller
 reconstruction. The fake contract exercises both resolve-issue and fix-PR paths,
-including preserved branch/PR metadata; Dispatch implements the interfaces via the merged #1259 receipt-fenced endpoints. Issue settlement is fenced by the issued claim token. If its POST response is lost or cannot be confirmed, the adapter makes one bounded best-effort lookup in the latest 100 audit rows, matching an exact SHA-256 capacity receipt marker and issue identity; a positive match replays success without another POST. This is not durable server-side idempotency: audit pagination/retention, malformed responses, or lookup failures leave the outcome unknown and ownership held for retry. PR-fix capacity settlement uses the issued per-handout receipt. Lifecycle task reports separately support payload-bound replay when given a stable idempotency key. Discovery and dedupe bypass history only for a
+including preserved branch/PR metadata; Dispatch implements the interfaces via the merged #1259 receipt-fenced endpoints. Issue settlement is fenced by the issued claim token; because a re-claim around admission rotates that token while an admission re-claim re-emits the rotated receipt onto the run, a settlement refused for a rotated or gone lease re-presents the claim once and retries against the live token — rotation is adopted, never treated as staleness, while ownership, human-hold, expiry, and closed refusals still stop settlement (#388). If its POST response is lost or cannot be confirmed, the adapter makes one bounded best-effort lookup in the latest 100 audit rows, matching an exact SHA-256 capacity receipt marker and issue identity; a positive match replays success without another POST. This is not durable server-side idempotency: audit pagination/retention, malformed responses, or lookup failures leave the outcome unknown and ownership held for retry. PR-fix capacity settlement uses the issued per-handout receipt. Lifecycle task reports separately support payload-bound replay when given a stable idempotency key. Discovery and dedupe bypass history only for a
 `BlockedExternal` capacity-exhaustion run with `CapacityRecovery=True/Settled`
 and `LifecycleReported=True`; a deterministic predecessor-UID successor name permits stable source IDs while
 retaining diagnostic history and active-run deduplication. Other, incomplete, and human
@@ -2258,6 +2258,29 @@ named items remain unresolved and must not be described as production-ready:
   grace period already budgets a 2-second child-kill wait; this puts
   `runGit`'s reads inside it.
 
+- **2026-10-16 — #388: claim-token rotation around admission is adopted, not wedged.**
+  A deployed smoke stranded a `BlockedExternal` capacity run permanently: discovery/
+  admission claim churn rotated the Dispatch lease token, while the run's
+  `SourceReceipt` was persisted set-once and settlement retried the inert fence
+  forever (Dispatch's handoff refusals carry no machine-readable code today, so
+  even the stale classification never fired). The fix adopts the winning fence at
+  both ends instead of holding the losing one: the operator status patch now
+  re-emits a changed non-empty `SourceReceipt` so a re-claim at admission records
+  the token the run actually holds, and the Dispatch settlement path, on a
+  rotation-only refusal (`stale_claim_token` / `no_active_claim`), re-presents the
+  claim — Dispatch keeps the token across same-agent renewals, so this adopts the
+  live lease rather than minting a competing one — and retries the fenced handoff
+  exactly once. Ownership-changed, human-hold, expired, and closed/done refusals
+  never re-claim: releasing another owner's claim or reversing a human stays
+  impossible. The squat policy is settled deliberately: an unsettled
+  `BlockedExternal` run remains the identity barrier until its settlement
+  converges — with adoption it does — and only a `CapacityRecovery=True/Settled`
+  exhaustion releases the identity for a successor, so a blocked run never
+  silently swallows rediscovery forever, it stops doing so when settlement lands.
+  The PR-fix follow-up path keeps its per-handout generation fence unchanged:
+  a rotated handout token there means a newer generation owns the work, which is
+  staleness by design, not rotation to adopt. (#388)
+
 - **2026-10-16 — #282: the legacy executor enforces the criterion-evidence
   contract in one shared handoff plan, and the pinned envelope binds to the
   trusted source identity.** `applyLinkagePlan` became `applyHandoffPlan`
@@ -4138,6 +4161,37 @@ was superseded.
   (#216) are unchanged; provisioning and the fence's own reads still use the
   cached client, because only the relaunch's delete and ceiling judgement are
   destructive decisions. (#370, #105, #223)
+- **2026-10-18 — #336: the classified-regular capture read refuses a non-regular
+  descriptor rather than blocking on it.** `Capture` classifies each changed path
+  with `os.Lstat` and reads a path classified regular through `readCapped`, which
+  since #237 opened `O_RDONLY|O_NOFOLLOW`. A hostile worktree that swapped such a
+  path for a fifo between the classification and the open blocked that open
+  indefinitely: an `O_RDONLY` open of a fifo waits for a writer that may never
+  come, and no bound — context or otherwise — was consulted there. The window is
+  the same classification-versus-open TOCTOU #237 closed for symlinks. The fix
+  (PR #389) opens `O_RDONLY|O_NOFOLLOW|O_NONBLOCK`, so the open cannot wait for a
+  peer that may never arrive, then `f.Stat()`s the opened descriptor and fails a
+  non-regular result with a new `errNotRegular` sentinel. `fstat` on the
+  descriptor rather than a second `Lstat` on the path is deliberate: it describes
+  the object actually opened, so the check cannot itself be raced the way a
+  path-based re-check could. `Capture` maps `errNotRegular` to
+  `DispositionOmittedBinary` with `totals.OmittedBinary++` and stores nothing —
+  deliberately identical to what the pre-existing non-regular `Lstat` branch does
+  for a path classified non-regular outright, mirroring how #237's `ELOOP` (a
+  swap into a symlink) re-classifies as symlink metadata: each swap class is
+  re-classified exactly as the classification pass would have classified it, so
+  content a hostile tree slipped past classification is never stored. A swap to
+  a socket needs no branch of its own: a read-only open of a socket fails with
+  `ENXIO` before any blocking is possible and falls to the generic failed-read
+  case, which also stores nothing. The guard composes with the capture deadline
+  bound (#390) rather than conflicting with it: `O_NONBLOCK` bounds the *open* by
+  making a wait impossible — it rejects non-regular descriptors before any read
+  begins — while the deadline bounds the *read* of the regular files the guard
+  lets through, which is all the guard leaves unbounded and all the deadline
+  needs to cover. `O_NONBLOCK` is a no-op for those regular files. Regression
+  tests: `TestReadCappedRejectsNonRegular` and `TestCaptureFifoSwapRace`, both
+  asserting non-blocking with a deadline guard so losing `O_NONBLOCK` fails
+  rather than hangs the suite. (#336, #389; composes with #237, #390)
 - **2026-10-18 — #414: the runtime executes the repository-owned development
   bootstrap contract after checkout and before model work, only when it is
   byte-identical to the run's approved base revision.** The contract is the

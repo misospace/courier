@@ -1675,7 +1675,11 @@ func (r *CoderRunReconciler) patchStatus(ctx context.Context, before, after *cou
 	if !reflect.DeepEqual(before.Status.WorkspaceSafety, after.Status.WorkspaceSafety) {
 		fields.WorkspaceSafety = after.Status.WorkspaceSafety
 	}
-	if before.Status.SourceReceipt == "" && after.Status.SourceReceipt != "" {
+	// SourceReceipt is replaceable, not set-once: a re-claim around admission
+	// rotates the source fencing token, and settlement must fence against the
+	// live claim, so a changed non-empty receipt is re-emitted (#388). An
+	// empty value alone never clears a persisted receipt.
+	if before.Status.SourceReceipt != after.Status.SourceReceipt && after.Status.SourceReceipt != "" {
 		receipt := after.Status.SourceReceipt
 		fields.SourceReceipt = &receipt
 	}
