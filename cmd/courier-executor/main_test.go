@@ -26,6 +26,7 @@ import (
 
 	courierv1alpha1 "github.com/misospace/courier/api/v1alpha1"
 	"github.com/misospace/courier/internal/broker"
+	"github.com/misospace/courier/internal/broker/grammar"
 	"github.com/misospace/courier/internal/evidence"
 	"github.com/misospace/courier/internal/executor"
 	"github.com/misospace/courier/internal/git"
@@ -6280,7 +6281,10 @@ func pinCriteriaEnvelopeForMisoGallery(t *testing.T) string {
 // verbatim pinned criterion texts so the model can verify what it must
 // satisfy, and the grammar the body must satisfy — the
 // "courier-criteria:v1" header, the "AC-n sha256:... status - reference"
-// row form, the closed status vocabulary, and the per-status shape rules.
+// row form, the closed status vocabulary, and the per-status shape rules —
+// each asserted against the grammar leaf's derived exports rather than a copy
+// re-embedded here, so this test fails if the repair message drifts away
+// from the validator it teaches (#375).
 // The continuation number, total, and remaining slots are named so the
 // model sees the remaining budget (#282).
 func TestCriteriaRepairMessagePinsValidatorVocabulary(t *testing.T) {
@@ -6316,11 +6320,10 @@ func TestCriteriaRepairMessagePinsValidatorVocabulary(t *testing.T) {
 		"misospace/miso-gallery#502",
 		ce.Reason,
 		"courier-criteria:v1",
-		"- AC-<n> sha256:<64hex>: <status> - <reference>",
-		"implementation-evidence",
-		"regression-check",
-		"manual-verification",
-		"not-implemented",
+		grammar.CriteriaHeaderShape("misospace/miso-gallery#502"),
+		grammar.CriteriaRowGrammar(),
+		grammar.StatusVocabularySentence(),
+		grammar.StatusReferenceRuleSentence(),
 		"regression-check and implementation-evidence",
 		"file path or check URL",
 		"Update the PR body through the forge capability",
@@ -6336,6 +6339,24 @@ func TestCriteriaRepairMessagePinsValidatorVocabulary(t *testing.T) {
 		if !strings.Contains(msg, want) {
 			t.Fatalf("criteriaRepairMessage missing %q in: %q", want, msg)
 		}
+	}
+	// The closed vocabulary is the validator's, so the repair names every
+	// status and nothing else.
+	for _, status := range grammar.StatusVocabulary() {
+		if !strings.Contains(msg, string(status)) {
+			t.Fatalf("criteriaRepairMessage missing status %q in: %q", status, msg)
+		}
+	}
+	// A rendered repair must not teach a doubled conjunction or a doubled
+	// rule while splicing the derived fragments into the sentence.
+	if strings.Contains(msg, "or or") {
+		t.Fatalf("criteriaRepairMessage renders a doubled conjunction in: %q", msg)
+	}
+	// The count is 1 only because the fixture sets no BadStatus and spells
+	// ce.Reason as a literal: a reason produced by the broker's
+	// describeCriteriaFailure would embed the same sentence.
+	if got := strings.Count(msg, grammar.StatusReferenceRuleSentence()); got != 1 {
+		t.Fatalf("criteriaRepairMessage should carry the per-status reference rule exactly once; got %d in: %q", got, msg)
 	}
 }
 
@@ -7871,6 +7892,37 @@ func TestCriterionEvidenceReferentialCheckFailsOpen(t *testing.T) {
 	}
 }
 
+// TestEvidencePathCandidatePatternStaysProbeSafe pins the safety property
+// the #367 probe rests on, now that the extraction pattern is the grammar
+// leaf's exported path alternative rather than a local literal (#375
+// review): widening the validator's path shape must not quietly admit a
+// character that could turn a model-authored citation into an argv split,
+// an option, or a pathspec expression. Whatever the pattern matches stays
+// inside the charset the probe's safety argument assumes, and "(" and ")"
+// survive as inert; a leading dash never reaches the probe because
+// normalizeEvidencePathCandidate drops it (pinned by the normalization
+// cases above).
+func TestEvidencePathCandidatePatternStaysProbeSafe(t *testing.T) {
+	tokens := []string{
+		"tests/test_packaging.py",
+		"docs/api(v2)/spec.md",
+		"a b/c d", "a:b/c:d", "a'b/c'd", `a"b/c"d`, "a*b/c*d", "a?b/c?d",
+		"a[b/c[d", "a]b/c]d", "a{b/c{d", "a}b/c}d", `a\b/c\d`,
+		"a;b/c;d", "a|b/c|d", "a&b/c&d", "a$b/c$d", "a`b/c`d", "a\tb/c\tb",
+		"-a/b", "https://example.com/a/b",
+	}
+	for _, token := range tokens {
+		for _, match := range evidencePathCandidatePattern.FindAllString(token, -1) {
+			if strings.ContainsAny(match, " \t\n:;'\"*?[]{}\\;|&$`") {
+				t.Fatalf("evidencePathCandidatePattern matched %q from %q; the match carries a character the probe's safety argument excludes", match, token)
+			}
+		}
+	}
+	if matches := evidencePathCandidatePattern.FindAllString("tests/test_packaging.py", -1); len(matches) != 1 || matches[0] != "tests/test_packaging.py" {
+		t.Fatalf("evidencePathCandidatePattern lost the shape it must probe: %q", matches)
+	}
+}
+
 // TestRunResolveIssueMissingCitedEvidencePathTriggersCriteriaRepair proves
 // the #367 finding end to end through the legacy pre-handoff plan. The
 // PR body is the honest-partial fixture — it passes the validator — but
@@ -8071,5 +8123,43 @@ func TestRunResolveIssueCombinedBodyWithMissingCitedPathFiresOneRepair(t *testin
 	}
 	if code != exitNeedsHuman {
 		t.Fatalf("run exit code = %d, want %d (NeedsHuman once the single repair turn is spent); detail: %q", code, exitNeedsHuman, out)
+	}
+}
+
+// TestClassifyUndeclaredCommittedBranchReadBias pins the committed-work
+// branch read in classifyUndeclared (#344): only a read that positively
+// shows work ahead of the start commit may carry the run to Verifying;
+// an unreadable branch fails closed instead of claiming committed work.
+func TestClassifyUndeclaredCommittedBranchReadBias(t *testing.T) {
+	root := t.TempDir()
+	runGit(t, root, "init")
+	configureGit(t, root)
+	runGit(t, root, "branch", "-M", "main")
+	write(t, filepath.Join(root, "one.txt"), "one\n")
+	commit(t, root, "base: one")
+	revOutput, err := exec.Command("git", "-C", root, "rev-parse", "HEAD").Output()
+	if err != nil {
+		t.Fatalf("rev-parse HEAD: %v", err)
+	}
+	startCommit := strings.TrimSpace(string(revOutput))
+	write(t, filepath.Join(root, "two.txt"), "two\n")
+	commit(t, root, "work: two")
+	workspace := &git.Workspace{Directory: root}
+
+	verifying := (reporter{}).classifyUndeclared(context.Background(), workspace, "main", startCommit, git.WorkStateCommitted, nil)
+	if verifying.Phase != "Verifying" || verifying.ExitCode != exitSuccess {
+		t.Fatalf("work ahead of the start commit must verify: %+v", verifying)
+	}
+
+	offBranch := (reporter{}).classifyUndeclared(context.Background(), workspace, "main", "HEAD", git.WorkStateCommitted, nil)
+	if offBranch.Phase != "Failed" || offBranch.Category != terminalCategoryVerifierRejection {
+		t.Fatalf("a read showing no work ahead must fail as off-branch: %+v", offBranch)
+	}
+
+	// An empty start commit makes CommitsOnBranchSince error; the run must
+	// fail closed rather than fall through to Verifying.
+	errored := (reporter{}).classifyUndeclared(context.Background(), workspace, "main", "", git.WorkStateCommitted, nil)
+	if errored.Phase != "Failed" || errored.ExitCode != exitFailed || errored.Category != terminalCategoryVerifierRejection {
+		t.Fatalf("a failed branch re-read must fail closed, not verify: %+v", errored)
 	}
 }

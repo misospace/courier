@@ -604,6 +604,62 @@ func TestResourceNamesStayUniqueAndStable(t *testing.T) {
 	}
 }
 
+// TestProbePodNamesAreUniquePerNode pins the probe name's two jobs at once:
+// two nodes whose names differ past the prefix the tag can keep, or that
+// normalize to the same string, must never render the same probe pod — or one
+// node's probe is created, collected, and deleted for the other. The name must
+// also stay deterministic and DNS-valid, whatever the node looks like.
+func TestProbePodNamesAreUniquePerNode(t *testing.T) {
+	nodes := []string{
+		// Share the prefix the tag can afford to keep.
+		"worker-production-001",
+		"worker-production-002",
+		// Normalize to one string: the dot and the underscore both drop.
+		"worker-prod.001",
+		"worker-prod_001",
+		"9lives",
+		strings.Repeat("a", 253),
+	}
+	// A run name at the object-name limit leaves the probe suffix the same
+	// budget it has for a short run.
+	for _, runName := range []string{"probe-names", strings.Repeat("z", 253)} {
+		run := testRun(runName)
+		seen := map[string]string{}
+		for _, node := range nodes {
+			name := ProbePod(run, node, "busybox:test", "true").Name
+			if again := ProbePod(run, node, "busybox:test", "true").Name; again != name {
+				t.Errorf("probe pod name for node %q is not deterministic: %q then %q", node, name, again)
+			}
+			if errs := validation.IsDNS1123Subdomain(name); len(errs) > 0 {
+				t.Errorf("probe pod name for node %q = %q: %v", node, name, errs)
+			}
+			if len(name) > 253 {
+				t.Errorf("probe pod name for node %q is %d characters: %q", node, len(name), name)
+			}
+			if other, clash := seen[name]; clash {
+				t.Errorf("nodes %q and %q render the same probe pod name %q", other, node, name)
+			}
+			seen[name] = node
+		}
+	}
+	// Names that normalize away to nothing leave the digest as the whole tag.
+	for _, node := range append([]string{"", "-", "---", strings.Repeat("A", 40)}, nodes...) {
+		tag := nodeNameTag(node)
+		if tag == "" {
+			t.Errorf("node %q renders an empty probe tag", node)
+		}
+		if len(tag) > 16 {
+			t.Errorf("probe tag for node %q is %d characters: %q", node, len(tag), tag)
+		}
+		if strings.HasPrefix(tag, "-") || strings.HasSuffix(tag, "-") {
+			t.Errorf("probe tag for node %q starts or ends with a hyphen: %q", node, tag)
+		}
+		if errs := validation.IsDNS1123Label(tag); len(errs) > 0 {
+			t.Errorf("probe tag for node %q = %q: %v", node, tag, errs)
+		}
+	}
+}
+
 func TestServiceNamesAreValidDNSLabels(t *testing.T) {
 	names := []string{
 		"short",
@@ -672,6 +728,78 @@ func TestRenderedServicesCarryValidNames(t *testing.T) {
 		}
 		if errs := validation.IsDNS1035Label(worker.Name); len(errs) > 0 {
 			t.Errorf("rendered worker Service for run %q has invalid name %q: %v", name, worker.Name, errs)
+		}
+	}
+}
+
+func TestRunLabelValueStaysValidBoundedAndDistinct(t *testing.T) {
+	names := []string{
+		"short",
+		"run.test",
+		strings.Repeat("a", 60),
+		// 64+ characters: valid as a DNS subdomain but over the 63-character
+		// label-value cap.
+		strings.Repeat("a", 63) + "x",
+		strings.Repeat("a", 63) + "y",
+		strings.Repeat("z", 253),
+	}
+	seen := map[string]string{}
+	for _, name := range names {
+		value := RunLabelValue(name)
+		if errs := validation.IsValidLabelValue(value); len(errs) > 0 {
+			t.Errorf("run label value for run %q = %q: %v", name, value, errs)
+		}
+		if again := RunLabelValue(name); again != value {
+			t.Errorf("run label value for run %q is not stable: %q then %q", name, value, again)
+		}
+		if other, clash := seen[value]; clash {
+			t.Errorf("run label value %q collides between runs %q and %q", value, other, name)
+		}
+		seen[value] = name
+	}
+	if RunLabelValue("short") != "short" {
+		t.Fatalf("valid short names must pass through unchanged: %q", RunLabelValue("short"))
+	}
+}
+
+func TestRenderedSelectorsAgreeWithLabels(t *testing.T) {
+	components := map[string]bool{ComponentCoordinator: true, ComponentBroker: true, ComponentWorker: true}
+	for _, name := range []string{"short", "run.test", strings.Repeat("a", 63) + "x", strings.Repeat("z", 253)} {
+		run := testRun(name)
+		runLabel := Labels(run.Name, "")[LabelRun]
+		if len(runLabel) > 63 {
+			t.Fatalf("run %q renders a %d-character label value", name, len(runLabel))
+		}
+		check := func(kind string, got map[string]string) {
+			t.Helper()
+			if got["k8s-app"] == "kube-dns" {
+				return // the DNS egress rule deliberately matches no run pod
+			}
+			if got[LabelRun] != runLabel {
+				t.Errorf("run %q: %s selects run label %q; Labels writes %q", name, kind, got[LabelRun], runLabel)
+			}
+			if !components[got["courier.misospace.dev/component"]] {
+				t.Errorf("run %q: %s selects unknown component %q", name, kind, got["courier.misospace.dev/component"])
+			}
+		}
+		check("broker service selector", BrokerService(run).Spec.Selector)
+		check("worker service selector", WorkerService(run).Spec.Selector)
+		for _, policy := range NetworkPolicies(run, nil, nil) {
+			check(policy.Name+" pod selector", policy.Spec.PodSelector.MatchLabels)
+			for _, ingress := range policy.Spec.Ingress {
+				for _, from := range ingress.From {
+					if from.PodSelector != nil {
+						check(policy.Name+" ingress selector", from.PodSelector.MatchLabels)
+					}
+				}
+			}
+			for _, egress := range policy.Spec.Egress {
+				for _, to := range egress.To {
+					if to.PodSelector != nil {
+						check(policy.Name+" egress selector", to.PodSelector.MatchLabels)
+					}
+				}
+			}
 		}
 	}
 }

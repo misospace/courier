@@ -25,7 +25,6 @@ import (
 	"os/exec"
 	"os/signal"
 	"path/filepath"
-	"regexp"
 	"slices"
 	"strconv"
 	"strings"
@@ -37,6 +36,7 @@ import (
 
 	courierv1alpha1 "github.com/misospace/courier/api/v1alpha1"
 	"github.com/misospace/courier/internal/broker"
+	"github.com/misospace/courier/internal/broker/grammar"
 	"github.com/misospace/courier/internal/evidence"
 	"github.com/misospace/courier/internal/executor"
 	"github.com/misospace/courier/internal/forge"
@@ -1787,8 +1787,14 @@ func (r reporter) classifyUndeclared(ctx context.Context, workspace *git.Workspa
 	case git.WorkStateDirty:
 		return failedWith("opencode exited successfully without declaring an outcome and left uncommitted workspace changes", terminalCategoryUnknown)
 	case git.WorkStateCommitted:
+		// Fail closed on an unreadable branch (#344): only a read that
+		// positively shows work ahead of the start commit can carry the run
+		// to Verifying, never an inconclusive one.
 		ahead, branchErr := workspace.CommitsOnBranchSince(ctx, branch, startCommit)
-		if branchErr == nil && ahead == 0 {
+		if branchErr != nil {
+			return failedWith("could not verify committed work on the run branch: "+branchErr.Error(), terminalCategoryVerifierRejection)
+		}
+		if ahead == 0 {
 			return failedWith(r.offBranchReason(ctx, workspace, branch)+"; no outcome was declared", terminalCategoryVerifierRejection)
 		}
 		// The world shows verified work on the run branch; that ending stands
@@ -2650,10 +2656,15 @@ func (r reporter) checkCriterionEvidence(ctx context.Context, head string, set *
 
 // evidencePathCandidatePattern is the *file-path* alternative of the
 // broker validator's referenceWithLocation (internal/broker/criteria.go,
-// #249), mirrored rather than imported: the check probes exactly the
-// references the validator itself accepts as a citable location, so a
-// reference the contract already refused is never probed and a reference
-// it accepted is probed in the same shape it was judged in.
+// #249), taken from the grammar leaf's exported pattern rather than
+// mirrored: the check probes exactly the references the validator itself
+// accepts as a citable location, so a reference the contract already
+// refused is never probed and a reference it accepted is probed in the
+// same shape it was judged in. The grammar composes
+// grammar.ReferenceWithLocation from its exported alternatives and pins
+// that composition by test, so a validator edit cannot leave this
+// extractor probing a shape the contract no longer accepts, or skip one
+// it does (#375 review).
 //
 // The charset — [A-Za-z0-9_.-] segments separated by "/", where only
 // segments after the first may also carry "(" and ")" — is also the
@@ -2666,7 +2677,7 @@ func (r reporter) checkCriterionEvidence(ctx context.Context, head string, set *
 // sees the value. That restriction is what lets sanitized text from a
 // model-authored body reach git at all — see the exception noted on
 // git.Hardened (#367).
-var evidencePathCandidatePattern = regexp.MustCompile(`[A-Za-z0-9_.-]+(?:/[A-Za-z0-9_.()-]+)+`)
+var evidencePathCandidatePattern = grammar.ReferencePathPattern
 
 // missingEvidencePaths reports which of the file paths the body's
 // evidence rows cite are absent from the tree at head, the published
@@ -2971,9 +2982,10 @@ func linkageRepairMessage(source broker.SourceIssue, outcome *handoffCheckOutcom
 // it must satisfy, and the continuation budget. The vocabulary is
 // composed verbatim from the broker error's reason (which
 // describeCriteriaFailure built) so any change to the validator's
-// vocabulary surfaces in both paths. The required shape rules echo
-// the documented header and per-status rules from criteria.go so the
-// model can repair the body without re-deriving the contract.
+// vocabulary surfaces in both paths. The header shape, row shape,
+// status vocabulary, and per-status rules are rendered from the broker's
+// validator (criteria.go) rather than restated, so the model can repair
+// the body without re-deriving the contract.
 //
 // A block the validator accepted but whose citations do not exist in the
 // published head (#367) reaches the same instruction: the reason clause
@@ -2992,15 +3004,16 @@ func criteriaRepairMessage(source broker.SourceIssue, outcome *handoffCheckOutco
 	setDigest, criteriaLines := pinnedSetRepairSnippet(outcome.pinnedSet, outcome.criteria)
 	return fmt.Sprintf(
 		"Courier refused the handoff: PR #%d's body does not satisfy the criterion-evidence contract pinned at admission for %s (pinned set %s): %s.%s "+
-			"Update the PR body through the forge capability so it carries the criterion-evidence block: a single line starting with %q followed by %q, then one %q row per pinned criterion (each row's digest must match the pinned criterion digest below), each carrying a closed status from the vocabulary implementation-evidence, regression-check, manual-verification, not-implemented, or unknown, with regression-check and implementation-evidence referencing a file path or check URL and manual-verification and not-implemented referencing a note. Pinned criteria: %s. "+
+			"Update the PR body through the forge capability so it carries the criterion-evidence block: a single line starting with %q followed by one %q row per pinned criterion (each row's digest must match the pinned criterion digest below), each carrying a closed status from the vocabulary %s; %s. Pinned criteria: %s. "+
 			"Then re-declare the same outcome. (continuation %s)",
 		outcome.pr.Number, target,
 		nonEmptyOr(setDigest, "the admitted set"),
 		reason,
 		observation,
-		"courier-criteria:v1 source="+strings.ToLower(source.Canonical())+"#"+strconv.Itoa(source.Number),
-		"set=sha256:<64hex> coverage=full|partial",
-		"- AC-<n> sha256:<64hex>: <status> - <reference>",
+		grammar.CriteriaHeaderShape(strings.ToLower(source.Canonical())+"#"+strconv.Itoa(source.Number)),
+		grammar.CriteriaRowGrammar(),
+		grammar.StatusVocabularySentence(),
+		grammar.StatusReferenceRuleSentence(),
 		nonEmptyOr(criteriaLines, "(no pinned criteria on this run)"),
 		continuationBudget(continuation, maxContinuations),
 	)

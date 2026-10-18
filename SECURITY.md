@@ -20,9 +20,6 @@ depends on severity and complexity, so no fixed patch deadline is promised.
 - The `main` branch is supported.
 - The most recent published Courier release is supported; older releases are
   not guaranteed security fixes.
-- Courier has not yet published a release, so `main` is currently the
-  supported line. The most recent release becomes the supported stable line
-  once releases exist.
 
 ## Scope
 

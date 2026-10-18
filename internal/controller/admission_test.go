@@ -80,6 +80,46 @@ func (*receiptAdmissionSource) ClaimWithReceipt(_ context.Context, item source.W
 	return item, nil
 }
 
+// rotatingReceiptAdmissionSource issues a fresh claim token per claim, the way
+// Dispatch rotates the lease fence whenever a claim is re-issued (#388).
+type rotatingReceiptAdmissionSource struct {
+	admissionSource
+	tokens []string
+	claims int
+}
+
+func (s *rotatingReceiptAdmissionSource) ClaimWithReceipt(_ context.Context, item source.WorkItem) (source.WorkItem, error) {
+	if s.claims >= len(s.tokens) {
+		panic("rotatingReceiptAdmissionSource exhausted")
+	}
+	item.Context = s.tokens[s.claims]
+	s.claims++
+	return item, nil
+}
+
+// TestAdmissionAdoptsRotatedSourceReceipt is the #388 regression: the receipt a
+// run persisted on an earlier claim is replaced when a re-admission claims
+// again and the source hands back a rotated token, so capacity settlement
+// fences against the live claim instead of an inert one.
+func TestAdmissionAdoptsRotatedSourceReceipt(t *testing.T) {
+	run := admissionRun("rotated", "local", courierv1alpha1.PhasePending)
+	run.Status.SourceReceipt = "issued-a"
+	client := admissionClient(t, admissionLane("local", 1), run)
+	src := &rotatingReceiptAdmissionSource{tokens: []string{"issued-b"}}
+	reconciler := admissionReconciler(client)
+	reconciler.Sources = NewSourceRegistry(map[string]source.Adapter{"test": src})
+	if _, err := reconciler.Reconcile(context.Background(), admissionRequest("rotated")); err != nil {
+		t.Fatalf("Reconcile() error = %v", err)
+	}
+	var got courierv1alpha1.CoderRun
+	if err := client.Get(context.Background(), admissionKey("rotated"), &got); err != nil {
+		t.Fatal(err)
+	}
+	if got.Status.SourceReceipt != "issued-b" {
+		t.Fatalf("SourceReceipt = %q, want issued-b; a rotated claim token must replace the persisted receipt", got.Status.SourceReceipt)
+	}
+}
+
 func TestAdmissionPersistsAndReconstructsSourceReceipt(t *testing.T) {
 	client := admissionClient(t, admissionLane("local", 1), admissionRun("receipt", "local", courierv1alpha1.PhasePending))
 	src := &receiptAdmissionSource{}

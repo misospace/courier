@@ -12,7 +12,10 @@ import (
 // token file is picked up without rebuilding control identity or restarting
 // the run. Implementations must not embed the token bytes in an error, and
 // must be safe to hold by value: a caller detects an unwired source by a nil
-// interface only, so a typed nil must never reach a method here.
+// interface only, so a typed nil must never reach a method here. A caller may
+// hold the returned slice across the request and compare it against a later
+// read, so every return must be freshly owned bytes: never a shared or reused
+// buffer.
 //
 // There is deliberately no cache and no expiry bookkeeping: a per-request read
 // of a projected volume is the simplest correct cadence, and a cached copy is

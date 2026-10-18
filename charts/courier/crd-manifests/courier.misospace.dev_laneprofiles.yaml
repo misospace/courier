@@ -73,6 +73,68 @@ spec:
                   lane. A local lane is typically 1; a cloud lane can be much higher.
                 minimum: 1
                 type: integer
+              context:
+                description: |-
+                  Context declares the per-role context budgets the harness enforces on
+                  runs in this lane (#243, #295). An absent Context leaves the harness
+                  owning no budget and the executor's default compaction standing. The
+                  declared values are resolved at run time against the gateway-verified
+                  model input limits by internal/harness; the API carries declarations
+                  only and resolves nothing.
+                properties:
+                  compactAtPercent:
+                    default: 75
+                    description: |-
+                      CompactAtPercent is the fraction of the effective input limit, as an
+                      integer percent, at which step-boundary compaction fires for roles
+                      that do not override it. The default mirrors the harness default and
+                      is applied only when a Context policy is declared.
+                    maximum: 99
+                    minimum: 1
+                    type: integer
+                  outputReservation:
+                    description: |-
+                      OutputReservation reserves, for every role that does not override it,
+                      the tokens the next turn's maximum output may take, so a prompt under
+                      the effective limit cannot overrun at completion.
+                    minimum: 0
+                    type: integer
+                  roles:
+                    additionalProperties:
+                      description: |-
+                        ContextBudget is one role's declared context policy. A zero value declares
+                        nothing: unset fields inherit the lane policy, which is why
+                        CompactAtPercent carries no default here — a defaulted per-role percent
+                        could not inherit a different lane-wide fraction.
+                      properties:
+                        compactAtPercent:
+                          description: |-
+                            CompactAtPercent overrides the lane's compaction fraction for this
+                            role. Unset inherits the lane policy.
+                          maximum: 99
+                          minimum: 1
+                          type: integer
+                        maxInputTokens:
+                          description: |-
+                            MaxInputTokens declares the input ceiling for the role's bound model.
+                            The effective limit is the minimum of this and the gateway-verified
+                            limit: a lane can lower the limit, never raise it past what the
+                            gateway advertises.
+                          minimum: 1
+                          type: integer
+                        outputReservation:
+                          description: |-
+                            OutputReservation overrides the lane's output reservation for this
+                            role. Unset inherits the lane policy.
+                          minimum: 0
+                          type: integer
+                      type: object
+                    description: |-
+                      Roles maps a coordinator role name to its declared ceiling and
+                      overrides of the lane defaults. A zero-valued entry inherits
+                      everything and declares nothing.
+                    type: object
+                type: object
               framing:
                 description: |-
                   Framing is free-text lane context injected into the coordinator prompt:

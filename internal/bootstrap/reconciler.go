@@ -209,7 +209,11 @@ func desiredSpec(profile *Profile) courierv1alpha1.LaneProfileSpec {
 		Roles:         profile.Roles,
 		Framing:       profile.Framing,
 		CapacityGroup: profile.CapacityGroup,
-		Resources:     profile.Resources,
+		// DeepCopy so the managed object never shares the provider-owned
+		// policy: the client decodes the server response through the spec,
+		// and a cached Provider must not see desired state mutated.
+		Context:   profile.Context.DeepCopy(),
+		Resources: profile.Resources,
 	}
 }
 

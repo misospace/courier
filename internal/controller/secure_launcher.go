@@ -973,7 +973,7 @@ func podOfComponent(ctx context.Context, reader client.Reader, run *courier.Code
 		if pod.Labels[topology.LabelProbe] == "true" {
 			continue
 		}
-		if pod.Labels[topology.LabelRun] == run.Name && pod.Labels["courier.misospace.dev/component"] == component {
+		if pod.Labels[topology.LabelRun] == topology.RunLabelValue(run.Name) && pod.Labels["courier.misospace.dev/component"] == component {
 			return pod, nil
 		}
 	}

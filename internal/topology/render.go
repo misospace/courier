@@ -54,10 +54,13 @@ const (
 	CredKeyGitToken      = "git-token"
 )
 
-// Labels returns the standard label set for one component of one run.
+// Labels returns the standard label set for one component of one run. The
+// run label value is bounded and sanitized (RunLabelValue) so every rendered
+// object passes Kubernetes label validation for every supported CoderRun
+// name.
 func Labels(runName, component string) map[string]string {
 	return map[string]string{
-		LabelRun:                          runName,
+		LabelRun:                          RunLabelValue(runName),
 		"courier.misospace.dev/component": component,
 		labelAppComponent:                 component,
 		labelAppManagedBy:                 "courier",
@@ -332,7 +335,7 @@ func BrokerService(run *courier.CoderRun) *corev1.Service {
 		Spec: corev1.ServiceSpec{
 			Type: corev1.ServiceTypeClusterIP,
 			Selector: map[string]string{
-				LabelRun:                          run.Name,
+				LabelRun:                          RunLabelValue(run.Name),
 				"courier.misospace.dev/component": ComponentBroker,
 			},
 			Ports: []corev1.ServicePort{
@@ -353,7 +356,7 @@ func WorkerService(run *courier.CoderRun) *corev1.Service {
 			Type:      corev1.ServiceTypeClusterIP,
 			ClusterIP: "None",
 			Selector: map[string]string{
-				LabelRun:                          run.Name,
+				LabelRun:                          RunLabelValue(run.Name),
 				"courier.misospace.dev/component": ComponentWorker,
 			},
 			Ports: []corev1.ServicePort{
@@ -707,9 +710,13 @@ func ProbePod(run *courier.CoderRun, node, image, script string) *corev1.Pod {
 	return pod
 }
 
-// nodeNameTag produces a short DNS-safe tag for a node name.
+// nodeNameTag produces a short DNS-safe tag for a node name. The normalized
+// name is a readable prefix only: distinct nodes share long prefixes and can
+// normalize to the same string, so an 8-hex digest of the full original name
+// always follows it and keeps the tag one node's own.
 func nodeNameTag(node string) string {
-	tag := strings.Map(func(r rune) rune {
+	const budget = 16
+	prefix := strings.Trim(strings.Map(func(r rune) rune {
 		switch {
 		case r >= 'a' && r <= 'z', r >= '0' && r <= '9', r == '-':
 			return r
@@ -718,14 +725,11 @@ func nodeNameTag(node string) string {
 		default:
 			return -1
 		}
-	}, node)
-	tag = strings.Trim(tag, "-")
-	if len(tag) > 16 {
-		tag = tag[:16]
+	}, node), "-")
+	sum := sha256.Sum256([]byte(node))
+	digest := hex.EncodeToString(sum[:])[:8]
+	if len(prefix) > budget-len(digest) {
+		prefix = prefix[:budget-len(digest)]
 	}
-	if tag == "" {
-		sum := sha256.Sum256([]byte(node))
-		tag = hex.EncodeToString(sum[:])[:8]
-	}
-	return tag
+	return prefix + digest
 }
