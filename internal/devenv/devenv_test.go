@@ -267,7 +267,7 @@ func TestBootstrapAndEnvCaptureScripts(t *testing.T) {
 	// after the bootstrap run, so the terminal emission is last in the
 	// captured stdout tail on success and on every failure path.
 	if strings.Count(bootstrap, "courier_diag || true") != 1 ||
-		!strings.Contains(bootstrap, `trap 'rc=$?; rm -rf "$src"; courier_diag || true; exit "$rc"' EXIT`) ||
+		!strings.Contains(bootstrap, `trap 'rc=$?; rm -rf "$src" || true; courier_diag || true; exit "$rc"' EXIT`) ||
 		!strings.HasSuffix(bootstrap, "mise run bootstrap\n") {
 		t.Errorf("BootstrapScript = %q, want a single terminal EXIT-trap emission after the bootstrap run", bootstrap)
 	}

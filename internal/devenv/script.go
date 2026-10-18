@@ -81,8 +81,8 @@ func BootstrapScript(baseOID string) (string, error) {
 		"}\n" +
 		// The trap is the single terminal emission: it runs last on success
 		// and on every failure path, preserves the original exit code, and
-		// a failing diag cannot change it.
-		"trap 'rc=$?; rm -rf \"$src\"; courier_diag || true; exit \"$rc\"' EXIT\n" +
+		// neither a failing cleanup nor a failing diag can change it.
+		"trap 'rc=$?; rm -rf \"$src\" || true; courier_diag || true; exit \"$rc\"' EXIT\n" +
 		"git archive \"$base\" | tar -x -C \"$src\"\n" +
 		"test -f \"$src/" + ConfigPath + "\"\n" +
 		"cd \"$src\"\n" +
@@ -110,11 +110,11 @@ func EnvCaptureScript(baseOID string) (string, error) {
 	return "set -eu\n" +
 		"base='" + baseOID + "'\n" +
 		"src=\"$(mktemp -d)\"\n" +
-		"trap 'rm -rf \"$src\"' EXIT\n" +
+		"capture=\"$(mktemp)\"\n" +
+		"trap 'rm -rf \"$src\" \"$capture\" || true' EXIT\n" +
 		"git archive \"$base\" | tar -x -C \"$src\"\n" +
 		"test -f \"$src/" + ConfigPath + "\"\n" +
 		"cd \"$src\"\n" +
-		"capture=\"$(mktemp)\"\n" +
 		"mise x -- env -0 > \"$capture\"\n" +
 		"size=\"$(wc -c < \"$capture\")\"\n" +
 		"test \"$size\" -le " + strconv.Itoa(MaxCaptureBytes) + "\n" +
