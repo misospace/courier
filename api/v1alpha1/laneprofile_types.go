@@ -77,6 +77,15 @@ type LaneProfileSpec struct {
 	// +kubebuilder:validation:MaxLength=253
 	CapacityGroup string `json:"capacityGroup,omitempty"`
 
+	// Context declares the per-role context budgets the harness enforces on
+	// runs in this lane (#243, #295). An absent Context leaves the harness
+	// owning no budget and the executor's default compaction standing. The
+	// declared values are resolved at run time against the gateway-verified
+	// model input limits by internal/harness; the API carries declarations
+	// only and resolves nothing.
+	// +optional
+	Context *ContextPolicy `json:"context,omitempty"`
+
 	// Resources sizes the pods Courier creates for runs on this lane using
 	// Courier's narrowed pod-sizing vocabulary: claims are not expressible and
 	// requests/limits keys are honoured verbatim. Limits are used exactly as
@@ -86,6 +95,62 @@ type LaneProfileSpec struct {
 	// nothing gets the default whole (see DefaultPodResources).
 	// +optional
 	Resources PodResources `json:"resources,omitempty"`
+}
+
+// ContextPolicy is a lane's declared context budget for the harness (#243).
+// It carries declared values only: internal/harness/budget.go resolves them
+// against gateway-verified model input limits, and no resolution or trigger
+// logic belongs here.
+type ContextPolicy struct {
+	// CompactAtPercent is the fraction of the effective input limit, as an
+	// integer percent, at which step-boundary compaction fires for roles
+	// that do not override it. The default mirrors the harness default and
+	// is applied only when a Context policy is declared.
+	// +kubebuilder:default=75
+	// +kubebuilder:validation:Minimum=1
+	// +kubebuilder:validation:Maximum=99
+	// +optional
+	CompactAtPercent int `json:"compactAtPercent,omitempty"`
+
+	// OutputReservation reserves, for every role that does not override it,
+	// the tokens the next turn's maximum output may take, so a prompt under
+	// the effective limit cannot overrun at completion.
+	// +kubebuilder:validation:Minimum=0
+	// +optional
+	OutputReservation int `json:"outputReservation,omitempty"`
+
+	// Roles maps a coordinator role name to its declared ceiling and
+	// overrides of the lane defaults. A zero-valued entry inherits
+	// everything and declares nothing.
+	// +optional
+	Roles map[string]ContextBudget `json:"roles,omitempty"`
+}
+
+// ContextBudget is one role's declared context policy. A zero value declares
+// nothing: unset fields inherit the lane policy, which is why
+// CompactAtPercent carries no default here — a defaulted per-role percent
+// could not inherit a different lane-wide fraction.
+type ContextBudget struct {
+	// MaxInputTokens declares the input ceiling for the role's bound model.
+	// The effective limit is the minimum of this and the gateway-verified
+	// limit: a lane can lower the limit, never raise it past what the
+	// gateway advertises.
+	// +kubebuilder:validation:Minimum=1
+	// +optional
+	MaxInputTokens int `json:"maxInputTokens,omitempty"`
+
+	// CompactAtPercent overrides the lane's compaction fraction for this
+	// role. Unset inherits the lane policy.
+	// +kubebuilder:validation:Minimum=1
+	// +kubebuilder:validation:Maximum=99
+	// +optional
+	CompactAtPercent int `json:"compactAtPercent,omitempty"`
+
+	// OutputReservation overrides the lane's output reservation for this
+	// role. Unset inherits the lane policy.
+	// +kubebuilder:validation:Minimum=0
+	// +optional
+	OutputReservation int `json:"outputReservation,omitempty"`
 }
 
 // CapacityCooldown is a durable pause on new work for one execution-capacity
