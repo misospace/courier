@@ -831,6 +831,60 @@ func TestRunGitCapped(t *testing.T) {
 	}
 }
 
+// TestRunGitCappedOverLimitFailure covers the combination #412 found: a git
+// that writes past the cap AND exits non-zero. The over-limit branch kills and
+// reaps the child, and it used to discard the reap's error, so a child that had
+// already failed came back as a clean over-limit result with a nil error — the
+// caller then recorded the failed patch as a benign over-limit omission with no
+// failure anywhere in the manifest. Reverting the fix fails this on the missing
+// error.
+func TestRunGitCappedOverLimitFailure(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+
+	dir := newRepo(t)
+	// The shell behind the alias fails at once while a backgrounded writer
+	// keeps filling stdout past the cap. The flood is deferred so the child is
+	// provably a reaped exit status by the time the reader reaches the cap:
+	// that is the window this pins. (A child still running when the cap is hit
+	// is killed by the capture, and a signaled reap cannot say what that child
+	// would have done — see the #412 entry in DESIGN.md.)
+	writeFile(t, filepath.Join(dir, "flood-fail.sh"),
+		"#!/bin/sh\n(sleep 0.05; head -c 70000 /dev/zero | tr '\\0' a) &\necho boom >&2\nexit 3\n")
+	git(t, dir, "config", "alias.floodfail", "!sh ./flood-fail.sh")
+
+	out, over, err := runGitCapped(ctx, dir, MaxFileBytes, "floodfail")
+	if err == nil {
+		t.Fatalf("runGitCapped (over-limit failure): err = nil, want the child's failure (over=%v, %d bytes): a failed command is not a clean over-limit", over, len(out))
+	}
+	if got := err.Error(); !strings.Contains(got, "exit status 3") {
+		t.Errorf("err = %q, want it to report the child's exit status", got)
+	} else if !strings.Contains(got, "boom") {
+		t.Errorf("err = %q, want it to report the child's stderr", got)
+	}
+	if !over {
+		t.Errorf("over = false, want true for output past the cap")
+	}
+	if len(out) != MaxFileBytes+1 {
+		t.Errorf("len(out) = %d, want exactly MaxFileBytes+1 = %d", len(out), MaxFileBytes+1)
+	}
+
+	// The sibling case stays a success: killing a child for overrunning the
+	// cap is not itself a failure, so the bounded prefix still comes back
+	// with no error.
+	git(t, dir, "config", "alias.floodok", "!sh -c 'head -c 70000 /dev/zero | tr \"\\0\" a'")
+	out, over, err = runGitCapped(ctx, dir, MaxFileBytes, "floodok")
+	if err != nil {
+		t.Fatalf("runGitCapped (over-limit success): %v", err)
+	}
+	if !over {
+		t.Errorf("over = false, want true for output past the cap")
+	}
+	if len(out) != MaxFileBytes+1 {
+		t.Errorf("len(out) = %d, want exactly MaxFileBytes+1 = %d", len(out), MaxFileBytes+1)
+	}
+}
+
 // TestRunGitCanceledWithHeldPipe covers the stall #408 found one function up
 // from #392: a grandchild outlives git holding the stdout and stderr write
 // ends open, so the copy goroutines inside cmd.Run never reach EOF and Wait

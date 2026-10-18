@@ -2027,6 +2027,32 @@ named items remain unresolved and must not be described as production-ready:
 - The exact vLLM gauge for backpressure on the target model server.
 
 ## Decisions
+- **2026-10-18 — #412: on the capped-read over-limit branch, killing an
+  over-running child is not a failure, but a child that had already exited
+  non-zero keeps its exit status and stderr beside the bounded prefix.**
+  `runGitCapped`'s over-limit branch killed and reaped the child but
+  discarded `Wait`'s error, so a git that *failed and* wrote past
+  `MaxFileBytes` came back as `(prefix, true, nil)` — and the caller, which
+  classifies any over-limit patch `OmittedOverLimit` without scanning or
+  storing it, recorded the failed patch as a benign omission and put no
+  failure in the manifest at all. That fail-open capture is the harm; the
+  over-limit prefix was never stored as evidence. The reap's status now
+  decides, from the same `ProcessState` the #392 fix already relied on: a
+  child that exited on its own is *exited* and keeps its exit status and
+  trimmed stderr, returned beside the bounded prefix (callers must check
+  `err` before `overLimit`), while a child this function killed is
+  *signaled* rather than exited and keeps the old `(prefix, true, nil)`.
+  The cancel contract on the branch is untouched: a canceled context still
+  returns `ctx.Err()` with `overLimit == false`. **Residual, deliberate:** a
+  child still producing when the cap is hit is killed here, and a signaled
+  reap cannot say whether that child would have failed — so a failed
+  `format-patch` that overruns the cap *and* outlives its own output is
+  still reported as an over-limit omission. Closing that would mean either
+  draining past the cap (unbounded work) or a duration bound, both of which
+  this design rejects; the capture stays honest by reporting what it can
+  prove. Rejected: treating any non-zero reap as a failure (every capped run
+  would be reported as a failed capture), and discarding the prefix on the
+  error path (loses the read that explains the failure).
 - **2026-10-18 — #395: adopted-token settlement replays by run-scoped settlement
   identity, not only by the token-derived marker.** Settlement adoption (#388)
   posts the capacity handoff under a marker hashed from the adopted token, but
