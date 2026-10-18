@@ -4108,3 +4108,34 @@ was superseded.
   (#216) are unchanged; provisioning and the fence's own reads still use the
   cached client, because only the relaunch's delete and ceiling judgement are
   destructive decisions. (#370, #105, #223)
+- **2026-10-18 — #336: the classified-regular capture read refuses a non-regular
+  descriptor rather than blocking on it.** `Capture` classifies each changed path
+  with `os.Lstat` and reads a path classified regular through `readCapped`, which
+  since #237 opened `O_RDONLY|O_NOFOLLOW`. A hostile worktree that swapped such a
+  path for a fifo between the classification and the open blocked that open
+  indefinitely: an `O_RDONLY` open of a fifo waits for a writer that may never
+  come, and no bound — context or otherwise — was consulted there. The window is
+  the same classification-versus-open TOCTOU #237 closed for symlinks. The fix
+  (PR #389) opens `O_RDONLY|O_NOFOLLOW|O_NONBLOCK`, so the open cannot wait for a
+  peer that may never arrive, then `f.Stat()`s the opened descriptor and fails a
+  non-regular result with a new `errNotRegular` sentinel. `fstat` on the
+  descriptor rather than a second `Lstat` on the path is deliberate: it describes
+  the object actually opened, so the check cannot itself be raced the way a
+  path-based re-check could. `Capture` maps `errNotRegular` to
+  `DispositionOmittedBinary` with `totals.OmittedBinary++` and stores nothing —
+  deliberately identical to what the pre-existing non-regular `Lstat` branch does
+  for a path classified non-regular outright, mirroring how #237's `ELOOP` (a
+  swap into a symlink) re-classifies as symlink metadata: each swap class is
+  re-classified exactly as the classification pass would have classified it, so
+  content a hostile tree slipped past classification is never stored. A swap to
+  a socket needs no branch of its own: a read-only open of a socket fails with
+  `ENXIO` before any blocking is possible and falls to the generic failed-read
+  case, which also stores nothing. The guard composes with the capture deadline
+  bound (#390) rather than conflicting with it: `O_NONBLOCK` bounds the *open* by
+  making a wait impossible — it rejects non-regular descriptors before any read
+  begins — while the deadline bounds the *read* of the regular files the guard
+  lets through, which is all the guard leaves unbounded and all the deadline
+  needs to cover. `O_NONBLOCK` is a no-op for those regular files. Regression
+  tests: `TestReadCappedRejectsNonRegular` and `TestCaptureFifoSwapRace`, both
+  asserting non-blocking with a deadline guard so losing `O_NONBLOCK` fails
+  rather than hangs the suite. (#336, #389; composes with #237, #390)
