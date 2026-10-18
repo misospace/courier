@@ -7892,6 +7892,37 @@ func TestCriterionEvidenceReferentialCheckFailsOpen(t *testing.T) {
 	}
 }
 
+// TestEvidencePathCandidatePatternStaysProbeSafe pins the safety property
+// the #367 probe rests on, now that the extraction pattern is the grammar
+// leaf's exported path alternative rather than a local literal (#375
+// review): widening the validator's path shape must not quietly admit a
+// character that could turn a model-authored citation into an argv split,
+// an option, or a pathspec expression. Whatever the pattern matches stays
+// inside the charset the probe's safety argument assumes, and "(" and ")"
+// survive as inert; a leading dash never reaches the probe because
+// normalizeEvidencePathCandidate drops it (pinned by the normalization
+// cases above).
+func TestEvidencePathCandidatePatternStaysProbeSafe(t *testing.T) {
+	tokens := []string{
+		"tests/test_packaging.py",
+		"docs/api(v2)/spec.md",
+		"a b/c d", "a:b/c:d", "a'b/c'd", `a"b/c"d`, "a*b/c*d", "a?b/c?d",
+		"a[b/c[d", "a]b/c]d", "a{b/c{d", "a}b/c}d", `a\b/c\d`,
+		"a;b/c;d", "a|b/c|d", "a&b/c&d", "a$b/c$d", "a`b/c`d", "a\tb/c\tb",
+		"-a/b", "https://example.com/a/b",
+	}
+	for _, token := range tokens {
+		for _, match := range evidencePathCandidatePattern.FindAllString(token, -1) {
+			if strings.ContainsAny(match, " \t\n:;'\"*?[]{}\\;|&$`") {
+				t.Fatalf("evidencePathCandidatePattern matched %q from %q; the match carries a character the probe's safety argument excludes", match, token)
+			}
+		}
+	}
+	if matches := evidencePathCandidatePattern.FindAllString("tests/test_packaging.py", -1); len(matches) != 1 || matches[0] != "tests/test_packaging.py" {
+		t.Fatalf("evidencePathCandidatePattern lost the shape it must probe: %q", matches)
+	}
+}
+
 // TestRunResolveIssueMissingCitedEvidencePathTriggersCriteriaRepair proves
 // the #367 finding end to end through the legacy pre-handoff plan. The
 // PR body is the honest-partial fixture — it passes the validator — but

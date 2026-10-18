@@ -2027,6 +2027,22 @@ named items remain unresolved and must not be described as production-ready:
 - The exact vLLM gauge for backpressure on the target model server.
 
 ## Decisions
+- **2026-10-18 — #375 review: the cited-evidence path extractor takes the
+  grammar's path alternative, and the reference pattern is composed from its
+  alternatives.** The #367 extractor's `evidencePathCandidatePattern` was a
+  hand-mirrored copy of the file-path alternative inside the validator's
+  `ReferenceWithLocation` — precisely the duplication this PR removes
+  everywhere else, and now that the authoritative regexes moved into
+  `internal/broker/grammar` the mirror sat one edit away from silently
+  probing references the contract no longer accepts, or skipping ones it
+  does. The grammar now exports its two alternatives
+  (`ReferenceURLPattern`, `ReferencePathPattern`) and composes
+  `ReferenceWithLocation` from them, the executor's extractor is an alias
+  of `ReferencePathPattern`, and two tests pin the seam: the grammar's
+  composition is exact, and the executor's pattern keeps the probe-safety
+  charset the #367 boundary argument rests on — whatever it matches stays
+  free of whitespace, `:`, quotes, and shell, glob, and pathspec
+  metacharacters. (#375, #367, #422)
 - **2026-10-18 — #395: adopted-token settlement replays by run-scoped settlement
   identity, not only by the token-derived marker.** Settlement adoption (#388)
   posts the capacity handoff under a marker hashed from the adopted token, but

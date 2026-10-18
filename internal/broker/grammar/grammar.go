@@ -63,8 +63,29 @@ var (
 	// implementation-evidence claims, not a semantic check: "inspected by
 	// hand" has no location and therefore cannot claim automated
 	// enforcement.
-	ReferenceWithLocation = regexp.MustCompile(`(?:https?://[^\s]+|[A-Za-z0-9_.-]+(?:/[A-Za-z0-9_.()-]+)+)`)
+	//
+	// It is composed from the two exported alternatives below rather
+	// than spelled as one literal, so a consumer that must probe the
+	// same references the validator accepts (the executor's cited-path
+	// check) can take the path alternative itself instead of
+	// hand-mirroring it — a mirrored copy drifts silently when either
+	// side changes (#375 review).
+	ReferenceWithLocation = regexp.MustCompile(`(?:` + ReferenceURLPattern.String() + `|` + ReferencePathPattern.String() + `)`)
 )
+
+// ReferenceURLPattern is the URL alternative of ReferenceWithLocation:
+// the shape the validator accepts as a citable check URL. It is
+// exported so the composition of ReferenceWithLocation from its
+// alternatives is pinned by test rather than assumed.
+var ReferenceURLPattern = regexp.MustCompile(`https?://[^\s]+`)
+
+// ReferencePathPattern is the file-path alternative of
+// ReferenceWithLocation: the shape the validator accepts as a citable
+// path. The executor's cited-evidence extraction (#367, reached by the
+// #375 review) matches this exact pattern, so a reference the contract
+// refuses is never probed and one it accepts is probed in the same
+// shape it was judged in.
+var ReferencePathPattern = regexp.MustCompile(`[A-Za-z0-9_.-]+(?:/[A-Za-z0-9_.()-]+)+`)
 
 // Placeholders naming each capture group of the taught grammar (#375).
 // Consumers (the repair continuation, the coordinator goal) name the

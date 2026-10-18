@@ -42,3 +42,16 @@ func TestSubstitutionKeysAreUnambiguous(t *testing.T) {
 		}
 	}
 }
+
+// TestReferenceWithLocationIsComposed pins that the validator's reference
+// pattern is built from the exported URL and path alternatives rather than
+// spelled as an independent literal. A consumer that must probe exactly the
+// references the validator accepts — the executor's cited-evidence path
+// check (#367, #375 review) — takes ReferencePathPattern itself; editing
+// either side without the other fails here instead of drifting silently.
+func TestReferenceWithLocationIsComposed(t *testing.T) {
+	want := `(?:` + ReferenceURLPattern.String() + `|` + ReferencePathPattern.String() + `)`
+	if got := ReferenceWithLocation.String(); got != want {
+		t.Fatalf("ReferenceWithLocation = %q, want the composition of the exported alternatives %q", got, want)
+	}
+}

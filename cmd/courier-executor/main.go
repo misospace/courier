@@ -25,7 +25,6 @@ import (
 	"os/exec"
 	"os/signal"
 	"path/filepath"
-	"regexp"
 	"slices"
 	"strconv"
 	"strings"
@@ -2657,10 +2656,15 @@ func (r reporter) checkCriterionEvidence(ctx context.Context, head string, set *
 
 // evidencePathCandidatePattern is the *file-path* alternative of the
 // broker validator's referenceWithLocation (internal/broker/criteria.go,
-// #249), mirrored rather than imported: the check probes exactly the
-// references the validator itself accepts as a citable location, so a
-// reference the contract already refused is never probed and a reference
-// it accepted is probed in the same shape it was judged in.
+// #249), taken from the grammar leaf's exported pattern rather than
+// mirrored: the check probes exactly the references the validator itself
+// accepts as a citable location, so a reference the contract already
+// refused is never probed and a reference it accepted is probed in the
+// same shape it was judged in. The grammar composes
+// grammar.ReferenceWithLocation from its exported alternatives and pins
+// that composition by test, so a validator edit cannot leave this
+// extractor probing a shape the contract no longer accepts, or skip one
+// it does (#375 review).
 //
 // The charset — [A-Za-z0-9_.-] segments separated by "/", where only
 // segments after the first may also carry "(" and ")" — is also the
@@ -2673,7 +2677,7 @@ func (r reporter) checkCriterionEvidence(ctx context.Context, head string, set *
 // sees the value. That restriction is what lets sanitized text from a
 // model-authored body reach git at all — see the exception noted on
 // git.Hardened (#367).
-var evidencePathCandidatePattern = regexp.MustCompile(`[A-Za-z0-9_.-]+(?:/[A-Za-z0-9_.()-]+)+`)
+var evidencePathCandidatePattern = grammar.ReferencePathPattern
 
 // missingEvidencePaths reports which of the file paths the body's
 // evidence rows cite are absent from the tree at head, the published
