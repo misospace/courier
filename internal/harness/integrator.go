@@ -188,34 +188,21 @@ func (t *Integrator) ContractState(ctx context.Context, tip string) devenv.State
 	if t.baseTip == "" {
 		return devenv.StateAbsent
 	}
-	baseFiles, err := t.contractFilesAt(ctx, t.baseTip)
+	state, err := devenv.Classify(ctx, t.blobRead, t.baseTip, tip)
 	if err != nil {
+		// A read failure is also modified: unprovable content is never
+		// executed, and a transient git hiccup must not fail the whole
+		// snapshot preparation, only the bootstrap it gates.
 		return devenv.StateModified
 	}
-	headFiles, err := t.contractFilesAt(ctx, tip)
-	if err != nil {
-		return devenv.StateModified
-	}
-	return devenv.Compare(baseFiles, headFiles)
+	return state
 }
 
-// contractFilesAt reads the contract's config and lock files at one revision
-// with pure git reads: a path that does not exist there is simply absent.
-func (t *Integrator) contractFilesAt(ctx context.Context, revision string) (devenv.Files, error) {
-	config, hasConfig, err := couriergit.BlobAt(ctx, t.Dir, revision, devenv.ConfigPath)
-	if err != nil {
-		return devenv.Files{}, err
-	}
-	lock, hasLock, err := couriergit.BlobAt(ctx, t.Dir, revision, devenv.LockPath)
-	if err != nil {
-		return devenv.Files{}, err
-	}
-	return devenv.Files{
-		Config:    config,
-		HasConfig: hasConfig,
-		Lock:      lock,
-		HasLock:   hasLock,
-	}, nil
+// blobRead adapts the hardened regular-blob read to the devenv classification
+// read: bytes, regular-blob flag (never a symlink or gitlink), and presence,
+// with read errors kept errors rather than folded into absence.
+func (t *Integrator) blobRead(ctx context.Context, revision, path string) ([]byte, bool, bool, error) {
+	return couriergit.BlobAtRegular(ctx, t.Dir, revision, path)
 }
 
 // Render produces the sanitized snapshot bundle for the next dispatch from

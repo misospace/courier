@@ -31,28 +31,48 @@ type contractWorld struct {
 
 func newContractWorld(t *testing.T, baseFiles, headFiles map[string]string, headDeletes ...string) *contractWorld {
 	t.Helper()
+	writeFiles := func(files map[string]string) func(dir string) {
+		return func(dir string) {
+			for path, content := range files {
+				if err := os.MkdirAll(filepath.Join(dir, filepath.Dir(path)), 0o755); err != nil {
+					t.Fatal(err)
+				}
+				writeFile(t, filepath.Join(dir, path), content)
+			}
+		}
+	}
+	return newContractWorldTree(t, writeFiles(baseFiles), func(dir string) {
+		writeFiles(headFiles)(dir)
+		for _, path := range headDeletes {
+			gitCmd(t, dir, "rm", "--quiet", path)
+		}
+	})
+}
+
+// newContractWorldTree builds the contract-world fixture with
+// caller-controlled tree mutations: seedBase runs in the upstream
+// repository before the base commit, seedHead between the base and work
+// commits, so a fixture can shape the tree in ways file maps cannot — a
+// symlink, for example. Either seeder may be nil.
+func newContractWorldTree(t *testing.T, seedBase, seedHead func(dir string)) *contractWorld {
+	t.Helper()
 	ctx := context.Background()
 	upstream := t.TempDir()
 	gitCmd(t, upstream, "init", "--quiet", "--initial-branch", "main")
 	gitCmd(t, upstream, "config", "gc.auto", "0")
 	writeFile(t, filepath.Join(upstream, "a.txt"), "a\n")
-	if len(baseFiles) > 0 || len(headFiles) > 0 {
-		if err := os.MkdirAll(filepath.Join(upstream, filepath.Dir(devenv.ConfigPath)), 0o755); err != nil {
-			t.Fatal(err)
-		}
+	if err := os.MkdirAll(filepath.Join(upstream, filepath.Dir(devenv.ConfigPath)), 0o755); err != nil {
+		t.Fatal(err)
 	}
-	for path, content := range baseFiles {
-		writeFile(t, filepath.Join(upstream, path), content)
+	if seedBase != nil {
+		seedBase(upstream)
 	}
 	gitCmd(t, upstream, "add", "-A")
 	gitCommit(t, upstream, "base")
 	base := gitRev(t, upstream, "rev-parse", "HEAD")
 	writeFile(t, filepath.Join(upstream, "b.txt"), "b\n")
-	for path, content := range headFiles {
-		writeFile(t, filepath.Join(upstream, path), content)
-	}
-	for _, path := range headDeletes {
-		gitCmd(t, upstream, "rm", "--quiet", path)
+	if seedHead != nil {
+		seedHead(upstream)
 	}
 	gitCmd(t, upstream, "add", "-A")
 	gitCommit(t, upstream, "work")
@@ -67,6 +87,19 @@ func newContractWorld(t *testing.T, baseFiles, headFiles map[string]string, head
 	gitCmd(t, integrator.Dir, "config", "gc.auto", "0")
 	gitCmd(t, integrator.Dir, "config", "maintenance.auto", "false")
 	return &contractWorld{t: t, integrator: integrator, work: work, base: base, bundle: bundle}
+}
+
+// contractRefConfig is a contract config whose bootstrap task references a
+// repository script, so the classification must pin the referenced bytes at
+// both revisions, not only the two contract files.
+const contractRefConfig = "[tasks.bootstrap]\nrun = 'hack/bootstrap.sh'\n"
+
+// writeSymlink creates a symlink at path pointing to target.
+func writeSymlink(t *testing.T, target, path string) {
+	t.Helper()
+	if err := os.Symlink(target, path); err != nil {
+		t.Fatal(err)
+	}
 }
 
 func contractConfig(t *testing.T) string {
@@ -247,11 +280,10 @@ func contractSnapshotProvider(tip string, state devenv.State) SnapshotProvider {
 	}
 }
 
-// bootstrapCapture renders worker stdout in the shape the fixed bootstrap
-// task produces: a report, the env marker, then NUL-terminated KEY=VALUE
-// records.
+// bootstrapCapture renders worker stdout in the shape the fixed
+// environment-capture task produces: NUL-terminated KEY=VALUE records.
 func bootstrapCapture(entries ...string) string {
-	return "bootstrap report\n" + devenv.EnvMarker + "\n" + strings.Join(entries, "\x00") + "\x00"
+	return strings.Join(entries, "\x00") + "\x00"
 }
 
 func delegateResponse(id string) gatewayResponse {
@@ -267,6 +299,7 @@ func TestCoordinatorBootstrapsApprovedContractAndAttachesEnv(t *testing.T) {
 	worker.completeAll = true
 	worker.snapshotTip = "snap-tip"
 	worker.bootstrapResults = []protocol.Result{
+		{ExitCode: 0, StdoutTail: "courier-mise-path=/usr/bin/mise\nbootstrapped\n"},
 		{ExitCode: 0, StdoutTail: bootstrapCapture("BOOTSTRAP_HOME=/opt/env", "BOOTSTRAP_PATH=/opt/bin")},
 	}
 
@@ -299,13 +332,16 @@ func TestCoordinatorBootstrapsApprovedContractAndAttachesEnv(t *testing.T) {
 	if result.Outcome != executor.OutcomeChanges || result.Err != nil {
 		t.Fatalf("harness result = %+v, want declared changes", result)
 	}
-	if got := worker.dispatchCount(); got != 4 {
-		t.Fatalf("worker dispatches = %d, want 4 (unpack, bootstrap, shell, pack)", got)
+	if got := worker.dispatchCount(); got != 5 {
+		t.Fatalf("worker dispatches = %d, want 5 (unpack, bootstrap, capture, shell, pack)", got)
 	}
 	if !isWorkerBootstrapTask(worker.dispatches[1].task) || worker.dispatches[1].envelope.BriefID != "b1" {
 		t.Fatalf("bootstrap dispatch = %+v", worker.dispatches[1])
 	}
-	shell := worker.dispatches[2]
+	if !isWorkerEnvCaptureTask(worker.dispatches[2].task) {
+		t.Fatalf("capture dispatch = %+v", worker.dispatches[2])
+	}
+	shell := worker.dispatches[3]
 	if strings.Join(shell.task.Command, " ") != "sh -c echo working" {
 		t.Fatalf("shell dispatch = %+v", shell)
 	}
@@ -313,8 +349,8 @@ func TestCoordinatorBootstrapsApprovedContractAndAttachesEnv(t *testing.T) {
 	if strings.Join(shell.task.Env, "\n") != strings.Join(want, "\n") {
 		t.Fatalf("shell task env = %v, want the applied bootstrap delta %v", shell.task.Env, want)
 	}
-	if len(worker.dispatches[3].task.Env) != 0 {
-		t.Fatalf("pack task env = %v, want no environment on a fixed control task", worker.dispatches[3].task.Env)
+	if len(worker.dispatches[4].task.Env) != 0 {
+		t.Fatalf("pack task env = %v, want no environment on a fixed control task", worker.dispatches[4].task.Env)
 	}
 	if gatewayMock.requestCount() == 0 {
 		t.Fatal("test precondition lost: the gateway was never used")
@@ -380,6 +416,7 @@ func TestCoordinatorBlockedExternalOnMalformedBootstrapCapture(t *testing.T) {
 	worker.snapshotTip = "snap-tip"
 	worker.bootstrapResults = []protocol.Result{
 		{ExitCode: 0, StdoutTail: "the script printed no environment marker"},
+		{ExitCode: 0, StdoutTail: "the script printed no environment marker"},
 	}
 
 	gateway, _, cleanup := gatewayFor(delegateResponse("b1"))
@@ -413,6 +450,7 @@ func TestCoordinatorBlockedExternalOnOversizedBootstrapEnv(t *testing.T) {
 		entries = append(entries, "VARIABLE"+pad(i)+"="+strings.Repeat("x", 1024))
 	}
 	worker.bootstrapResults = []protocol.Result{
+		{ExitCode: 0, StdoutTail: "courier-mise-path=/usr/bin/mise\n"},
 		{ExitCode: 0, StdoutTail: bootstrapCapture(entries...)},
 	}
 
@@ -541,5 +579,239 @@ func TestBootstrapLivenessBoundIsABlocker(t *testing.T) {
 	err = coordinator.bootstrapWorkspace(parent, "b1")
 	if errors.As(err, &blocker) {
 		t.Fatalf("parent cancellation error = %v, want an ordinary error", err)
+	}
+}
+
+// TestBootstrapStageBlockerNamesTheHungStage pins the split bounds (#414
+// review): the bootstrap task and the environment-capture task each hang
+// their own liveness bound, and the blocker reason names the stage that
+// actually hung — never the other one.
+func TestBootstrapStageBlockerNamesTheHungStage(t *testing.T) {
+	for _, tc := range []struct {
+		stage     string
+		wantStage string
+		other     string
+		wantDrops int
+	}{
+		{"bootstrap", "the bootstrap task exceeded its liveness bound", "the environment-capture task exceeded its liveness bound", 1},
+		{"capture", "the environment-capture task exceeded its liveness bound", "the bootstrap task exceeded its liveness bound", 2},
+	} {
+		t.Run(tc.stage, func(t *testing.T) {
+			worker, delegator, cleanupWorker := testWorkerAndDelegator(t)
+			defer cleanupWorker()
+			worker.hangStage = tc.stage
+			worker.bootstrapResults = []protocol.Result{
+				{ExitCode: 0, StdoutTail: "courier-mise-path=/usr/bin/mise\n"},
+			}
+
+			gateway, _, cleanup := gatewayFor()
+			defer cleanup()
+			coordinator, err := NewCoordinator(CoordinatorConfig{Gateway: gateway, Bindings: testBindings(), Worker: delegator})
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			restored := bootstrapBound
+			bootstrapBound = 100 * time.Millisecond
+			defer func() { bootstrapBound = restored }()
+
+			err = coordinator.bootstrapWorkspace(context.Background(), "b1")
+			var blocker *bootstrapBlocker
+			if !errors.As(err, &blocker) {
+				t.Fatalf("bound expiry error = %v, want the liveness-bound blocker", err)
+			}
+			if !strings.Contains(err.Error(), tc.wantStage) {
+				t.Fatalf("blocker = %q, want the %s stage named", err, tc.stage)
+			}
+			if strings.Contains(err.Error(), tc.other) {
+				t.Fatalf("blocker = %q, must not name the other stage", err)
+			}
+			if got := worker.dispatchCount(); got != tc.wantDrops {
+				t.Fatalf("worker dispatches = %d, want %d", got, tc.wantDrops)
+			}
+		})
+	}
+}
+
+// recordingBootstrapReceipts is a test BootstrapReceiptSink.
+type recordingBootstrapReceipts struct {
+	receipts []BootstrapReceipt
+}
+
+func (r *recordingBootstrapReceipts) BootstrapRecorded(receipt BootstrapReceipt) {
+	r.receipts = append(r.receipts, receipt)
+}
+
+// TestBootstrapReceiptSinkReceivesAppliedReceipt pins the structured
+// receipt (#414): when both bounded tasks succeed, the sink receives one
+// applied receipt carrying the validated mise diagnostics, the environment
+// key count, and both exit codes — no raw worker output.
+func TestBootstrapReceiptSinkReceivesAppliedReceipt(t *testing.T) {
+	worker, delegator, cleanupWorker := testWorkerAndDelegator(t)
+	defer cleanupWorker()
+	worker.bootstrapResults = []protocol.Result{
+		{ExitCode: 0, StdoutTail: "courier-mise-path=/usr/bin/mise\ncourier-mise-version=2024.10.29\ncourier-mise-data-dir=/home/courier/.local/share/mise\nbootstrapped\n"},
+		{ExitCode: 0, StdoutTail: bootstrapCapture("BOOTSTRAP_HOME=/opt/env", "BOOTSTRAP_PATH=/opt/bin")},
+	}
+
+	gateway, _, cleanup := gatewayFor()
+	defer cleanup()
+	sink := &recordingBootstrapReceipts{}
+	coordinator, err := NewCoordinator(CoordinatorConfig{Gateway: gateway, Bindings: testBindings(), Worker: delegator, BootstrapReceipts: sink})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if err := coordinator.bootstrapWorkspace(context.Background(), "b1"); err != nil {
+		t.Fatalf("bootstrapWorkspace() error = %v", err)
+	}
+	if len(sink.receipts) != 1 {
+		t.Fatalf("receipts = %d, want 1", len(sink.receipts))
+	}
+	receipt := sink.receipts[0]
+	if receipt.Status != BootstrapReceiptApplied {
+		t.Fatalf("status = %q, want applied", receipt.Status)
+	}
+	if receipt.Reason != "" {
+		t.Fatalf("reason = %q, want empty on an applied receipt", receipt.Reason)
+	}
+	if receipt.EnvKeys != 2 {
+		t.Fatalf("env keys = %d, want 2", receipt.EnvKeys)
+	}
+	if receipt.BootstrapExitCode != 0 || receipt.CaptureExitCode != 0 {
+		t.Fatalf("exit codes = (%d, %d), want (0, 0)", receipt.BootstrapExitCode, receipt.CaptureExitCode)
+	}
+	if receipt.BootstrapElapsedMs < 0 || receipt.CaptureElapsedMs < 0 {
+		t.Fatalf("elapsed = (%d, %d), want non-negative", receipt.BootstrapElapsedMs, receipt.CaptureElapsedMs)
+	}
+	wantDiagnostics := map[string]string{
+		"courier-mise-path":     "/usr/bin/mise",
+		"courier-mise-version":  "2024.10.29",
+		"courier-mise-data-dir": "/home/courier/.local/share/mise",
+	}
+	if len(receipt.Diagnostics) != len(wantDiagnostics) {
+		t.Fatalf("diagnostics = %v, want %v", receipt.Diagnostics, wantDiagnostics)
+	}
+	for key, want := range wantDiagnostics {
+		if got := receipt.Diagnostics[key]; got != want {
+			t.Fatalf("diagnostics[%q] = %q, want %q", key, got, want)
+		}
+	}
+}
+
+// TestBootstrapReceiptSinkReceivesFailedReceiptOnNonzeroExit pins the failed
+// receipt (#414): a nonzero bootstrap exit emits a failed receipt with the
+// fixed reason and the failing task's exit code, and the capture is never
+// dispatched.
+func TestBootstrapReceiptSinkReceivesFailedReceiptOnNonzeroExit(t *testing.T) {
+	worker, delegator, cleanupWorker := testWorkerAndDelegator(t)
+	defer cleanupWorker()
+	worker.bootstrapResults = []protocol.Result{
+		{ExitCode: 2, StderrTail: "fatal: mise failed\nsecond line"},
+	}
+
+	gateway, _, cleanup := gatewayFor()
+	defer cleanup()
+	sink := &recordingBootstrapReceipts{}
+	coordinator, err := NewCoordinator(CoordinatorConfig{Gateway: gateway, Bindings: testBindings(), Worker: delegator, BootstrapReceipts: sink})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	err = coordinator.bootstrapWorkspace(context.Background(), "b1")
+	var blocker *bootstrapBlocker
+	if !errors.As(err, &blocker) {
+		t.Fatalf("nonzero exit error = %v, want the bootstrap blocker", err)
+	}
+	if len(sink.receipts) != 1 {
+		t.Fatalf("receipts = %d, want 1", len(sink.receipts))
+	}
+	receipt := sink.receipts[0]
+	if receipt.Status != BootstrapReceiptFailed {
+		t.Fatalf("status = %q, want failed", receipt.Status)
+	}
+	if !strings.HasPrefix(receipt.Reason, "the approved bootstrap contract failed with exit code 2") {
+		t.Fatalf("reason = %q, want the fixed failure reason with the exit code", receipt.Reason)
+	}
+	if receipt.BootstrapExitCode != 2 {
+		t.Fatalf("bootstrap exit code = %d, want 2", receipt.BootstrapExitCode)
+	}
+	if receipt.CaptureExitCode != -1 || receipt.CaptureElapsedMs != 0 {
+		t.Fatalf("capture = (exit %d, elapsed %d), want never reached (-1, 0)", receipt.CaptureExitCode, receipt.CaptureElapsedMs)
+	}
+	if receipt.EnvKeys != 0 {
+		t.Fatalf("env keys = %d, want 0 on a failed receipt", receipt.EnvKeys)
+	}
+	if len(receipt.Diagnostics) != 0 {
+		t.Fatalf("diagnostics = %v, want none when the bootstrap failed before reporting", receipt.Diagnostics)
+	}
+	if got := worker.dispatchCount(); got != 1 {
+		t.Fatalf("worker dispatches = %d, want 1 (no capture after a failed bootstrap)", got)
+	}
+}
+
+// TestIntegratorContractStateModifiedByReferencedScript drives the
+// integrator against a real git repo whose contract config and lock are
+// byte-identical at base and head but whose referenced bootstrap script the
+// PR modified at head: the referenced bytes are part of the contract, so
+// the state is modified (#414).
+func TestIntegratorContractStateModifiedByReferencedScript(t *testing.T) {
+	world := newContractWorld(t,
+		map[string]string{
+			devenv.ConfigPath:   contractRefConfig,
+			devenv.LockPath:     "lock\n",
+			"hack/bootstrap.sh": "#!/bin/sh\necho base\n",
+		},
+		map[string]string{
+			devenv.ConfigPath:   contractRefConfig,
+			devenv.LockPath:     "lock\n",
+			"hack/bootstrap.sh": "#!/bin/sh\necho pwned\n",
+		},
+	)
+	state := world.integrator.ContractState(context.Background(), world.work)
+	if state != devenv.StateModified {
+		t.Fatalf("contract state = %q, want modified", state)
+	}
+}
+
+// TestIntegratorContractStateModifiedBySymlinkedConfigAtBase pins the
+// fail-closed regularity rule (#414 review): a symlinked contract path at
+// the base revision is unprovable even when every byte matches.
+func TestIntegratorContractStateModifiedBySymlinkedConfigAtBase(t *testing.T) {
+	world := newContractWorldTree(t,
+		func(dir string) {
+			writeSymlink(t, "../../outside/mise.toml", filepath.Join(dir, devenv.ConfigPath))
+		},
+		func(dir string) {
+			if err := os.Remove(filepath.Join(dir, devenv.ConfigPath)); err != nil {
+				t.Fatal(err)
+			}
+			writeFile(t, filepath.Join(dir, devenv.ConfigPath), "../../outside/mise.toml")
+		},
+	)
+	state := world.integrator.ContractState(context.Background(), world.work)
+	if state != devenv.StateModified {
+		t.Fatalf("contract state = %q, want modified", state)
+	}
+}
+
+// TestIntegratorContractStateModifiedBySymlinkedConfigAtHead pins the other
+// half of the regularity rule (#414 review): a symlinked contract path at
+// the head revision is a modified contract, never an approved one.
+func TestIntegratorContractStateModifiedBySymlinkedConfigAtHead(t *testing.T) {
+	world := newContractWorldTree(t,
+		func(dir string) {
+			writeFile(t, filepath.Join(dir, devenv.ConfigPath), contractConfig(t))
+		},
+		func(dir string) {
+			if err := os.Remove(filepath.Join(dir, devenv.ConfigPath)); err != nil {
+				t.Fatal(err)
+			}
+			writeSymlink(t, "../../outside/mise.toml", filepath.Join(dir, devenv.ConfigPath))
+		},
+	)
+	state := world.integrator.ContractState(context.Background(), world.work)
+	if state != devenv.StateModified {
+		t.Fatalf("contract state = %q, want modified", state)
 	}
 }

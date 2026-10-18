@@ -1212,15 +1212,17 @@ func run(ctx context.Context, stdout, stderr io.Writer) int {
 
 	// Child output is redacted before it reaches the run streams. The session
 	// tap observes OpenCode's JSON events without changing their bytes. The
-	// wrapping happens once, here: the bootstrap contract execution (#414)
-	// and the model child stream through the same writers.
+	// wrapping happens once, here: the model child streams through the same
+	// writers.
 	stdoutRedacted := courierlog.NewRedactingWriter(stdout, report.red)
 	stderrTransport := courierlog.NewRedactingWriter(stderr, report.red)
 
-	// The repository-owned development bootstrap contract (#414): execute the
-	// operator-approved `mise run bootstrap` after checkout and before model
-	// work, then adopt its deterministic environment delta into this process.
-	// Every verdict emits one receipt event; only an approved contract runs.
+	// The repository-owned development bootstrap contract (#414): the legacy
+	// executor is credential-bearing, so it NEVER executes repository
+	// contract content — it classifies the contract with pure git reads and
+	// emits one receipt event per verdict. Execution happens only in the
+	// secure worker's credential-free context; an approved contract here is
+	// skipped with a receipt that names exactly that.
 	state, stateErr := bootstrapContractState(ctx, workspace.Directory, workspace.BaseRevisionRef(), startCommit)
 	switch {
 	case stateErr != nil:
@@ -1237,42 +1239,18 @@ func run(ctx context.Context, stdout, stderr io.Writer) int {
 	case state == devenv.StateModified:
 		report.eventVerbose(courierlog.EventWorkspaceBootstrap, courierlog.StatusOK, map[string]any{
 			"status": "skipped",
-			"reason": "bootstrap contract differs approved base revision; not executed",
+			"reason": "bootstrap contract is not provably identical to the approved base revision; not executed",
 		})
 	case state == devenv.StateApproved:
-		// LookPath absence is not a skip: the repository declared the
-		// contract and the environment lacks mise, so the contract run
-		// itself reports the deterministic failure.
-		miseBinary, _ := exec.LookPath("mise")
-		result, runErr := devenv.Run(ctx, miseBinary, devenv.Options{
-			Dir:    workspace.Directory,
-			Bound:  devenv.DefaultBound,
-			Env:    os.Environ(),
-			Stdout: stdoutRedacted,
-			Stderr: stderrTransport,
+		// The contract is approved, but this executor is credential-bearing
+		// and must never execute repository contract code (#414 review): the
+		// run continues unbootstrapped — exactly like the absent and
+		// modified branches — and the secure worker topology owns
+		// execution. No exec, no environment application, no termination.
+		report.eventVerbose(courierlog.EventWorkspaceBootstrap, courierlog.StatusOK, map[string]any{
+			"status": "skipped",
+			"reason": "bootstrap contract approved but not executed: the legacy executor is credential-bearing; the approved bootstrap runs only in the secure worker topology",
 		})
-		if runErr != nil {
-			result = devenv.Result{Status: "failed", Reason: "bootstrap execution error: " + runErr.Error(), ExitCode: -1}
-		}
-		status := courierlog.StatusOK
-		if result.Status == "failed" {
-			status = courierlog.StatusError
-		}
-		report.eventVerbose(courierlog.EventWorkspaceBootstrap, status, map[string]any{
-			"status":     result.Status,
-			"elapsed_ms": result.Elapsed.Milliseconds(),
-			"exit_code":  result.ExitCode,
-			"env_keys":   len(result.EnvKeys),
-			"reason":     truncatedRunes(report.red.Redact(result.Reason), bootstrapReasonLimit),
-		})
-		if result.Status == "failed" {
-			report.terminate(bootstrapBlockerTermination(result))
-			return exitNeedsHuman
-		}
-		// Applied: install the deterministic environment into THIS process so
-		// the later direct-argv children (capability preflight, the model
-		// process, any shell it spawns) inherit it.
-		applyBootstrapEnv(result.EnvDelta)
 	}
 	_ = stdoutRedacted.Flush()
 	_ = stderrTransport.Flush()

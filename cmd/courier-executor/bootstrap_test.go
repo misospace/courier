@@ -3,7 +3,6 @@ package main
 import (
 	"bytes"
 	"context"
-	"encoding/json"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -11,7 +10,6 @@ import (
 	"testing"
 
 	"github.com/misospace/courier/internal/devenv"
-	"github.com/misospace/courier/internal/executor"
 	couriergit "github.com/misospace/courier/internal/git"
 )
 
@@ -142,60 +140,15 @@ func TestBootstrapContractStateUnresolvableBaseReturnsError(t *testing.T) {
 	}
 }
 
-func TestBootstrapBlockerTerminationShape(t *testing.T) {
-	result := devenv.Result{Status: "failed", Reason: "bootstrap task exited with status 3", ExitCode: 3}
-	term := bootstrapBlockerTermination(result)
-	if term.Phase != "NeedsHuman" {
-		t.Errorf("Phase = %q, want NeedsHuman", term.Phase)
-	}
-	if term.Result != "needs-human" {
-		t.Errorf("Result = %q, want needs-human", term.Result)
-	}
-	if term.ExitCode != exitNeedsHuman {
-		t.Errorf("ExitCode = %d, want %d", term.ExitCode, exitNeedsHuman)
-	}
-	if term.Outcome != outcomeBlockedExternal {
-		t.Errorf("Outcome = %q, want %q", term.Outcome, outcomeBlockedExternal)
-	}
-	if term.Category != terminalCategoryBlockedExternal {
-		t.Errorf("Category = %q, want %q", term.Category, terminalCategoryBlockedExternal)
-	}
-	if want := "workspace bootstrap failed: bootstrap task exited with status 3"; term.Reason != want {
-		t.Errorf("Reason = %q, want %q", term.Reason, want)
-	}
-}
-
-func TestApplyBootstrapEnvLeavesProtectedKeysUntouched(t *testing.T) {
-	t.Setenv("PATH", "/original/bin")
-	t.Setenv("COURIER_MODEL", "original")
-	t.Setenv("GIT_CONFIG_COUNT", "0")
-	t.Setenv("IFS", "original")
-	t.Setenv("LD_PRELOAD", "original")
-	applyBootstrapEnv([]string{
-		"PATH=/minted/bin",
-		"COURIER_MODEL=pwned",
-		"GIT_CONFIG_COUNT=9",
-		"IFS=pwned",
-		"LD_PRELOAD=/pwned.so",
-		"MYTOOL_VERSION=1.2.3",
-	})
-	for name, want := range map[string]string{
-		"PATH":             "/minted/bin",
-		"COURIER_MODEL":    "original",
-		"GIT_CONFIG_COUNT": "0",
-		"IFS":              "original",
-		"LD_PRELOAD":       "original",
-		"MYTOOL_VERSION":   "1.2.3",
-	} {
-		if got := os.Getenv(name); got != want {
-			t.Errorf("os.Getenv(%q) = %q, want %q", name, got, want)
-		}
-	}
-}
+// contractFixtureConfig is the parseable contract fixture: a
+// [tasks.bootstrap] task referencing a script file the repository carries at
+// both compared revisions, so the classification can pin it.
+const contractFixtureConfig = "[tasks.bootstrap]\nrun = 'hack/bootstrap.sh'\n"
 
 // remoteWithApprovedContract builds the resolve-issue fixture remote whose
 // base (main) and run branch both carry the identical contract, so the
-// checked-out workspace classifies approved and the bootstrap executes.
+// checked-out workspace classifies approved — and, under the legacy gate-off
+// (#414 review), is skipped without executing anything.
 func remoteWithApprovedContract(t *testing.T, root string) string {
 	t.Helper()
 	remote := filepath.Join(root, "remote.git")
@@ -204,7 +157,11 @@ func remoteWithApprovedContract(t *testing.T, root string) string {
 	runGit(t, root, "init", source)
 	configureGit(t, source)
 	write(t, filepath.Join(source, "README.md"), "base one\n")
-	bootstrapContract(t, source, "[tasks]\nbootstrap = 'echo bootstrapped'\n", "lock\n")
+	if err := os.MkdirAll(filepath.Join(source, "hack"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	write(t, filepath.Join(source, "hack", "bootstrap.sh"), "#!/bin/sh\necho bootstrapped\n")
+	bootstrapContract(t, source, contractFixtureConfig, "lock\n")
 	commit(t, source, "base: contract")
 	runGit(t, source, "branch", "-M", "main")
 	runGit(t, source, "remote", "add", "origin", remote)
@@ -219,26 +176,32 @@ func remoteWithApprovedContract(t *testing.T, root string) string {
 	return remote
 }
 
-// TestRunBlocksExternalWhenApprovedBootstrapFails drives run() end to end
-// with an approved contract and a mise that fails deterministically on every
-// host: the failure is a blocked-external NeedsHuman handoff, and the model
-// process never launches — no retry loop, no scavenger hunt (#414).
-func TestRunBlocksExternalWhenApprovedBootstrapFails(t *testing.T) {
+// approvedSkipReason is the fixed skip reason the legacy executor emits when
+// the contract classifies approved (#414 review): the credential-bearing
+// legacy executor never executes repository contract code.
+const approvedSkipReason = "bootstrap contract approved but not executed: the legacy executor is credential-bearing; the approved bootstrap runs only in the secure worker topology"
+
+// TestRunSkipsApprovedContractWithoutExecuting drives run() end to end with
+// an approved contract: the legacy executor is credential-bearing and must
+// never execute repository contract code, so the run proceeds
+// unbootstrapped — the scripted mise stand-in is never invoked — and the
+// receipt names exactly that (#414 review).
+func TestRunSkipsApprovedContractWithoutExecuting(t *testing.T) {
 	root := t.TempDir()
 	remote := remoteWithApprovedContract(t, root)
 
-	// A failing mise shadows whatever the host provides, so the approved
-	// contract's deterministic failure does not depend on the host's PATH.
-	failingBin := filepath.Join(root, "failing-bin")
-	if err := os.MkdirAll(failingBin, 0o755); err != nil {
+	// A mise stand-in shadows whatever the host provides and leaves a marker
+	// if anything ever invokes it: the whole point is that nothing does.
+	miseBin := filepath.Join(root, "mise-bin")
+	if err := os.MkdirAll(miseBin, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	writeExecutable(t, filepath.Join(failingBin, "mise"), "#!/bin/sh\nexit 3\n")
-	t.Setenv("PATH", failingBin+string(os.PathListSeparator)+os.Getenv("PATH"))
+	writeExecutable(t, filepath.Join(miseBin, "mise"), "#!/bin/sh\ntouch "+filepath.Join(root, "mise-invoked")+"\nexit 3\n")
+	t.Setenv("PATH", miseBin+string(os.PathListSeparator)+os.Getenv("PATH"))
 
-	prServer, _ := fakeForgePullRequestServer(t)
+	prServer, prState := fakeForgePullRequestServer(t)
 	fakeOpenCode := filepath.Join(root, "opencode")
-	writeExecutable(t, fakeOpenCode, "#!/bin/sh\ntouch never-launched\n")
+	writeExecutable(t, fakeOpenCode, "#!/bin/sh\ncase \"$1\" in mcp) exit 0;; esac\nprintf 'opencode ran\\n'\nprintf 'completed\\n' > completed.txt\ngit add --all -- .\ngit commit -m 'test: completed work' >/dev/null\ngit push origin \"$COURIER_BRANCH\" >/dev/null 2>&1\n"+writePullRequestScript(prState, pullRequestFixtureJSON(12, "open", false, "Closes #7. The completed turn opened the pull request.")))
 
 	setResolveIssueEnv(t, root, remote, prServer.URL, fakeOpenCode)
 	t.Setenv("COURIER_GIT_TOKEN", testGitToken)
@@ -248,52 +211,30 @@ func TestRunBlocksExternalWhenApprovedBootstrapFails(t *testing.T) {
 
 	var output bytes.Buffer
 	var errorsOut bytes.Buffer
-	if code := run(context.Background(), &output, &errorsOut); code != exitNeedsHuman {
-		t.Fatalf("run exit code = %d, want %d; stderr=%q", code, exitNeedsHuman, errorsOut.String())
+	if code := run(context.Background(), &output, &errorsOut); code != exitSuccess {
+		t.Fatalf("run exit code = %d, want %d; stderr=%q", code, exitSuccess, errorsOut.String())
 	}
-	if _, err := os.Stat(filepath.Join(root, "workspace", "never-launched")); !os.IsNotExist(err) {
-		t.Fatal("the model process launched before the bootstrap blocker ended the run")
-	}
-	raw, err := os.ReadFile(filepath.Join(root, "termination"))
-	if err != nil {
-		t.Fatalf("read termination file: %v", err)
-	}
-	line := strings.TrimPrefix(strings.TrimSpace(string(raw)), executor.TerminationLinePrefix)
-	var message struct {
-		Phase    string `json:"phase"`
-		Result   string `json:"result"`
-		ExitCode int    `json:"exit_code"`
-		Outcome  string `json:"outcome"`
-		Category string `json:"category"`
-		Reason   string `json:"reason"`
-	}
-	if err := json.Unmarshal([]byte(line), &message); err != nil {
-		t.Fatalf("termination line = %q: %v", line, err)
-	}
-	if message.Phase != "NeedsHuman" || message.Result != "needs-human" || message.ExitCode != exitNeedsHuman ||
-		message.Outcome != outcomeBlockedExternal || message.Category != terminalCategoryBlockedExternal {
-		t.Fatalf("termination = %+v, want the blocked-external handoff", message)
-	}
-	if !strings.Contains(message.Reason, "workspace bootstrap failed") {
-		t.Fatalf("termination reason = %q, want the bootstrap failure", message.Reason)
+	if _, err := os.Stat(filepath.Join(root, "mise-invoked")); !os.IsNotExist(err) {
+		t.Fatal("the legacy executor executed the approved contract despite being credential-bearing")
 	}
 	events := parseEvents(t, &output)
 	bootstrap := findEvent(t, events, "workspace.bootstrap")
 	detail, _ := bootstrap["detail"].(map[string]any)
-	if detail["status"] != "failed" {
-		t.Fatalf("workspace.bootstrap status = %v, want failed", detail["status"])
+	if detail["status"] != "skipped" {
+		t.Fatalf("workspace.bootstrap status = %v, want skipped", detail["status"])
 	}
-	if detail["exit_code"] != float64(3) {
-		t.Fatalf("workspace.bootstrap exit_code = %v, want 3", detail["exit_code"])
+	if reason, _ := detail["reason"].(string); reason != approvedSkipReason {
+		t.Fatalf("workspace.bootstrap reason = %q, want the fixed approved-skip reason %q", reason, approvedSkipReason)
 	}
 }
 
-// TestRunApprovesContractAgainstUpstreamOnFork drives run() end to end in
-// the fork topology: the run branch carries the base-approved contract, the
-// fork's own main does not, and the approved contract therefore still runs —
+// TestRunSkipsApprovedContractOnFork drives run() end to end in the fork
+// topology: the run branch carries the base-approved contract, the fork's
+// own main does not, and the receipt must carry the approved-skip reason —
 // the base comparison must resolve through the base remote, never the bare
-// branch name (#414 review).
-func TestRunApprovesContractAgainstUpstreamOnFork(t *testing.T) {
+// branch name, or this run would report the modified-skip reason instead
+// (#414 review).
+func TestRunSkipsApprovedContractOnFork(t *testing.T) {
 	root := t.TempDir()
 	upstream := filepath.Join(root, "upstream.git")
 	fork := filepath.Join(root, "fork.git")
@@ -307,7 +248,11 @@ func TestRunApprovesContractAgainstUpstreamOnFork(t *testing.T) {
 	runGit(t, source, "branch", "-M", "main")
 	runGit(t, source, "remote", "add", "fork", fork)
 	runGit(t, source, "push", "fork", "HEAD:refs/heads/main")
-	bootstrapContract(t, source, "[tasks]\nbootstrap = 'echo bootstrapped'\n", "lock\n")
+	if err := os.MkdirAll(filepath.Join(source, "hack"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	write(t, filepath.Join(source, "hack", "bootstrap.sh"), "#!/bin/sh\necho bootstrapped\n")
+	bootstrapContract(t, source, contractFixtureConfig, "lock\n")
 	commit(t, source, "base: contract")
 	runGit(t, source, "remote", "add", "origin", upstream)
 	runGit(t, source, "push", "origin", "main")
@@ -316,16 +261,16 @@ func TestRunApprovesContractAgainstUpstreamOnFork(t *testing.T) {
 	commit(t, source, "work: previous brief")
 	runGit(t, source, "push", "fork", "HEAD:refs/heads/courier/resolve-issue/acme-widgets/7")
 
-	prServer, _ := fakeForgePullRequestServer(t)
+	prServer, prState := fakeForgePullRequestServer(t)
 	fakeOpenCode := filepath.Join(root, "opencode")
-	writeExecutable(t, fakeOpenCode, "#!/bin/sh\ntouch never-launched\n")
+	writeExecutable(t, fakeOpenCode, "#!/bin/sh\ncase \"$1\" in mcp) exit 0;; esac\nprintf 'opencode ran\\n'\nprintf 'completed\\n' > completed.txt\ngit add --all -- .\ngit commit -m 'test: completed work' >/dev/null\ngit push origin \"$COURIER_BRANCH\" >/dev/null 2>&1\n"+writePullRequestScript(prState, pullRequestFixtureJSON(12, "open", false, "Closes #7. The completed turn opened the pull request.")))
 
-	failingBin := filepath.Join(root, "failing-bin")
-	if err := os.MkdirAll(failingBin, 0o755); err != nil {
+	miseBin := filepath.Join(root, "mise-bin")
+	if err := os.MkdirAll(miseBin, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	writeExecutable(t, filepath.Join(failingBin, "mise"), "#!/bin/sh\nexit 3\n")
-	t.Setenv("PATH", failingBin+string(os.PathListSeparator)+os.Getenv("PATH"))
+	writeExecutable(t, filepath.Join(miseBin, "mise"), "#!/bin/sh\ntouch "+filepath.Join(root, "mise-invoked")+"\nexit 3\n")
+	t.Setenv("PATH", miseBin+string(os.PathListSeparator)+os.Getenv("PATH"))
 
 	setResolveIssueEnv(t, root, fork, prServer.URL, fakeOpenCode)
 	t.Setenv("COURIER_BASE_REPO_URL", upstream)
@@ -336,15 +281,17 @@ func TestRunApprovesContractAgainstUpstreamOnFork(t *testing.T) {
 
 	var output bytes.Buffer
 	var errorsOut bytes.Buffer
-	if code := run(context.Background(), &output, &errorsOut); code != exitNeedsHuman {
-		t.Fatalf("run exit code = %d, want %d; stderr=%q", code, exitNeedsHuman, errorsOut.String())
+	if code := run(context.Background(), &output, &errorsOut); code != exitSuccess {
+		t.Fatalf("run exit code = %d, want %d; stderr=%q", code, exitSuccess, errorsOut.String())
 	}
-	raw, err := os.ReadFile(filepath.Join(root, "termination"))
-	if err != nil {
-		t.Fatalf("read termination file: %v", err)
+	if _, err := os.Stat(filepath.Join(root, "mise-invoked")); !os.IsNotExist(err) {
+		t.Fatal("the legacy executor executed the approved contract despite being credential-bearing")
 	}
-	if !strings.Contains(string(raw), outcomeBlockedExternal) {
-		t.Fatalf("termination = %q, want the approved contract's blocked-external handoff", string(raw))
+	events := parseEvents(t, &output)
+	bootstrap := findEvent(t, events, "workspace.bootstrap")
+	detail, _ := bootstrap["detail"].(map[string]any)
+	if reason, _ := detail["reason"].(string); reason != approvedSkipReason {
+		t.Fatalf("workspace.bootstrap reason = %q, want the approved-skip reason %q", reason, approvedSkipReason)
 	}
 }
 
@@ -382,7 +329,7 @@ func TestRunSkipsModifiedContractAndProceeds(t *testing.T) {
 	if detail["status"] != "skipped" {
 		t.Fatalf("workspace.bootstrap status = %v, want skipped", detail["status"])
 	}
-	if reason, _ := detail["reason"].(string); !strings.Contains(reason, "differs") {
+	if reason, _ := detail["reason"].(string); !strings.Contains(reason, "not provably identical") {
 		t.Fatalf("workspace.bootstrap reason = %q, want the modified-contract skip", reason)
 	}
 	for _, event := range events {

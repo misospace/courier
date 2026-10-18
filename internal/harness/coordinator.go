@@ -60,6 +60,9 @@ type Coordinator struct {
 	budgets map[string]ContextBudget
 	// compactions receives applied-compaction telemetry.
 	compactions CompactionSink
+	// bootstrapReceipts receives one structured receipt per bounded
+	// bootstrap execution.
+	bootstrapReceipts BootstrapReceiptSink
 	// workRefBeyondAnchor is the soft-stop world probe: the broker's live
 	// observation of whether the pinned work ref holds a tip beyond the
 	// admission anchor. The soft-stop finish derives the outcome from that
@@ -199,6 +202,12 @@ type CoordinatorConfig struct {
 	// step-boundary compaction (#243). Emission is best-effort and
 	// observability only: it never changes a transcript or a run outcome.
 	Compactions CompactionSink
+	// BootstrapReceipts optionally receives one structured receipt per
+	// bounded bootstrap execution (#414): statuses, per-task elapsed
+	// times, exit codes, the environment-key count, and the validated
+	// mise diagnostics — no secret values, no raw worker output. Emission
+	// is best-effort and observability only, like the compaction sink.
+	BootstrapReceipts BootstrapReceiptSink
 }
 
 // NewCoordinator fails closed on an unusable model configuration: without a
@@ -232,6 +241,7 @@ func NewCoordinator(config CoordinatorConfig) (*Coordinator, error) {
 		activity:                config.Activity,
 		budgets:                 budgets,
 		compactions:             config.Compactions,
+		bootstrapReceipts:       config.BootstrapReceipts,
 		briefs:                  NewBriefRegistry(),
 		status:                  config.Status,
 		control:                 config.Control,
@@ -1338,47 +1348,175 @@ type bootstrapBlocker struct {
 
 func (b *bootstrapBlocker) Error() string { return b.reason }
 
-// bootstrapBound is the development-bootstrap task's liveness bound (#414).
-// It is a var only so the liveness classification is testable; production
-// code never reassigns it.
+// bootstrapBound is each development-bootstrap task's liveness bound (#414):
+// the bootstrap task and the environment-capture task each get their own
+// bound, never one shared budget. It is a var only so the liveness
+// classification is testable; production code never reassigns it.
 var bootstrapBound = devenv.DefaultBound
 
-// bootstrapWorkspace dispatches the fixed control-authored bootstrap task —
-// the contract's own script, run by the worker as `sh -c` with no
+// recordBootstrapReceipt emits the structured bootstrap receipt (#414)
+// through the optional sink. Best-effort, like the compaction precedent:
+// no sink records nothing, and emission never changes the run's outcome.
+func (c *Coordinator) recordBootstrapReceipt(receipt BootstrapReceipt) {
+	if c.bootstrapReceipts == nil {
+		return
+	}
+	c.bootstrapReceipts.BootstrapRecorded(receipt)
+}
+
+// bootstrapElapsedMs renders one stage's wall time as receipt milliseconds.
+func bootstrapElapsedMs(started time.Time) int64 {
+	return time.Since(started).Milliseconds()
+}
+
+// bootstrapWorkspace dispatches the fixed control-authored bootstrap tasks —
+// the contract's own scripts, run by the worker as `sh -c` with no
 // model-supplied value — and, on success, stores the filtered environment
 // delta the capture produced, so every subsequent model-influenced task
-// merges it over the worker's own environment. A failure is a terminal
-// environment blocker, never a tool error the model could steer: it is
-// recorded before it returns, so the run ends blocked-external at the next
-// turn boundary.
+// merges it over the worker's own environment. The bootstrap task and the
+// environment-capture task are dispatched separately and each bounded on its
+// own. A failure is a terminal environment blocker, never a tool error the
+// model could steer: it is recorded before it returns, so the run ends
+// blocked-external at the next turn boundary. Every terminal outcome —
+// applied and each blocker class — also composes a structured
+// BootstrapReceipt and emits it through the optional sink.
 func (c *Coordinator) bootstrapWorkspace(ctx context.Context, briefID string) error {
 	parent := ctx
-	ctx, cancel := context.WithTimeout(parent, bootstrapBound)
-	defer cancel()
-	task := protocol.Task{Command: []string{"sh", "-c", devenv.Script()}}
-	result, err := c.dispatchAndAwait(ctx, newOpID("bootstrap", briefID), briefID, task)
+	bootstrapStarted := time.Now()
+	bootstrapCtx, cancelBootstrap := context.WithTimeout(parent, bootstrapBound)
+	defer cancelBootstrap()
+	task := protocol.Task{Command: []string{"sh", "-c", devenv.BootstrapScript()}}
+	result, err := c.dispatchAndAwait(bootstrapCtx, newOpID("bootstrap", briefID), briefID, task)
 	if err != nil {
 		// Only the bound's own expiry is a blocker: a parent cancellation
 		// or a transport failure is an ordinary snapshot-preparation
 		// failure — the run's own liveness path, not the bootstrap's.
 		if errors.Is(err, context.DeadlineExceeded) && parent.Err() == nil {
-			return &bootstrapBlocker{reason: bootstrapBlockerReasonPrefix + ": the bootstrap task exceeded its liveness bound"}
+			reason := bootstrapBlockerReasonPrefix + ": the bootstrap task exceeded its liveness bound"
+			c.recordBootstrapReceipt(BootstrapReceipt{
+				Status:             BootstrapReceiptFailed,
+				Reason:             reason,
+				BootstrapElapsedMs: bootstrapElapsedMs(bootstrapStarted),
+				BootstrapExitCode:  -1,
+				CaptureExitCode:    -1,
+			})
+			return &bootstrapBlocker{reason: reason}
 		}
 		return err
 	}
+	// The bootstrap task emitted something; its fixed diagnostic lines are
+	// the receipt's validated facts, whatever the outcome turns out to be.
+	diagnostics := devenv.ParseBootstrapDiagnostics(result.StdoutTail)
+	bootstrapElapsed := bootstrapElapsedMs(bootstrapStarted)
 	if result.ExitCode != 0 {
 		if result.Status == protocol.ResultCancelled {
-			return &bootstrapBlocker{reason: bootstrapBlockerReasonPrefix + ": the bootstrap task was cancelled before it completed"}
+			reason := bootstrapBlockerReasonPrefix + ": the bootstrap task was cancelled before it completed"
+			c.recordBootstrapReceipt(BootstrapReceipt{
+				Status:             BootstrapReceiptFailed,
+				Reason:             reason,
+				BootstrapElapsedMs: bootstrapElapsed,
+				BootstrapExitCode:  result.ExitCode,
+				CaptureExitCode:    -1,
+				Diagnostics:        diagnostics,
+			})
+			return &bootstrapBlocker{reason: reason}
 		}
-		return &bootstrapBlocker{reason: fmt.Sprintf("%s with exit code %d", bootstrapBlockerReasonPrefix, result.ExitCode)}
+		reason := fmt.Sprintf("%s with exit code %d", bootstrapBlockerReasonPrefix, result.ExitCode)
+		c.recordBootstrapReceipt(BootstrapReceipt{
+			Status:             BootstrapReceiptFailed,
+			Reason:             reason,
+			BootstrapElapsedMs: bootstrapElapsed,
+			BootstrapExitCode:  result.ExitCode,
+			CaptureExitCode:    -1,
+			Diagnostics:        diagnostics,
+		})
+		return &bootstrapBlocker{reason: reason}
 	}
-	_, delta, _, err := devenv.ParseScriptOutput(result.StdoutTail, nil)
+	captureStarted := time.Now()
+	captureCtx, cancelCapture := context.WithTimeout(parent, bootstrapBound)
+	defer cancelCapture()
+	captureTask := protocol.Task{Command: []string{"sh", "-c", devenv.EnvCaptureScript()}}
+	capture, err := c.dispatchAndAwait(captureCtx, newOpID("bootstrap-env", briefID), briefID, captureTask)
 	if err != nil {
-		return &bootstrapBlocker{reason: bootstrapBlockerReasonPrefix + ": bootstrap environment capture malformed"}
+		if errors.Is(err, context.DeadlineExceeded) && parent.Err() == nil {
+			reason := bootstrapBlockerReasonPrefix + ": the environment-capture task exceeded its liveness bound"
+			c.recordBootstrapReceipt(BootstrapReceipt{
+				Status:             BootstrapReceiptFailed,
+				Reason:             reason,
+				BootstrapElapsedMs: bootstrapElapsed,
+				BootstrapExitCode:  result.ExitCode,
+				CaptureElapsedMs:   bootstrapElapsedMs(captureStarted),
+				CaptureExitCode:    -1,
+				Diagnostics:        diagnostics,
+			})
+			return &bootstrapBlocker{reason: reason}
+		}
+		return err
+	}
+	captureElapsed := bootstrapElapsedMs(captureStarted)
+	if capture.ExitCode != 0 {
+		if capture.Status == protocol.ResultCancelled {
+			reason := bootstrapBlockerReasonPrefix + ": the environment-capture task was cancelled before it completed"
+			c.recordBootstrapReceipt(BootstrapReceipt{
+				Status:             BootstrapReceiptFailed,
+				Reason:             reason,
+				BootstrapElapsedMs: bootstrapElapsed,
+				BootstrapExitCode:  result.ExitCode,
+				CaptureElapsedMs:   captureElapsed,
+				CaptureExitCode:    capture.ExitCode,
+				Diagnostics:        diagnostics,
+			})
+			return &bootstrapBlocker{reason: reason}
+		}
+		reason := fmt.Sprintf("%s with exit code %d", bootstrapBlockerReasonPrefix, capture.ExitCode)
+		c.recordBootstrapReceipt(BootstrapReceipt{
+			Status:             BootstrapReceiptFailed,
+			Reason:             reason,
+			BootstrapElapsedMs: bootstrapElapsed,
+			BootstrapExitCode:  result.ExitCode,
+			CaptureElapsedMs:   captureElapsed,
+			CaptureExitCode:    capture.ExitCode,
+			Diagnostics:        diagnostics,
+		})
+		return &bootstrapBlocker{reason: reason}
+	}
+	delta, keys, err := devenv.ParseEnvCapture(capture.StdoutTail, nil)
+	if err != nil {
+		reason := bootstrapBlockerReasonPrefix + ": bootstrap environment capture malformed"
+		c.recordBootstrapReceipt(BootstrapReceipt{
+			Status:             BootstrapReceiptFailed,
+			Reason:             reason,
+			BootstrapElapsedMs: bootstrapElapsed,
+			BootstrapExitCode:  result.ExitCode,
+			CaptureElapsedMs:   captureElapsed,
+			CaptureExitCode:    capture.ExitCode,
+			Diagnostics:        diagnostics,
+		})
+		return &bootstrapBlocker{reason: reason}
 	}
 	if bootstrapEnvBytes(delta) > maxBootstrapEnvBytes {
-		return &bootstrapBlocker{reason: bootstrapBlockerReasonPrefix + ": bootstrap environment exceeded the 64 KiB dispatch bound"}
+		reason := bootstrapBlockerReasonPrefix + ": bootstrap environment exceeded the 64 KiB dispatch bound"
+		c.recordBootstrapReceipt(BootstrapReceipt{
+			Status:             BootstrapReceiptFailed,
+			Reason:             reason,
+			BootstrapElapsedMs: bootstrapElapsed,
+			BootstrapExitCode:  result.ExitCode,
+			CaptureElapsedMs:   captureElapsed,
+			CaptureExitCode:    capture.ExitCode,
+			EnvKeys:            len(keys),
+			Diagnostics:        diagnostics,
+		})
+		return &bootstrapBlocker{reason: reason}
 	}
+	c.recordBootstrapReceipt(BootstrapReceipt{
+		Status:             BootstrapReceiptApplied,
+		BootstrapElapsedMs: bootstrapElapsed,
+		BootstrapExitCode:  result.ExitCode,
+		CaptureElapsedMs:   captureElapsed,
+		CaptureExitCode:    capture.ExitCode,
+		EnvKeys:            len(keys),
+		Diagnostics:        diagnostics,
+	})
 	c.storeBootstrapEnv(delta)
 	return nil
 }

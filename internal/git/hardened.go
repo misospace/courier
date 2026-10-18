@@ -109,6 +109,70 @@ func BlobAt(ctx context.Context, directory, revision, path string) ([]byte, bool
 	return out, true, nil
 }
 
+// BlobAtRegular returns the bytes, regular-blob flag, and presence of one
+// path at one revision in directory's object database. It is the hardened
+// read behind the bootstrap contract's trust decision (#414): an executable
+// contract path must be a regular blob at the approved revision, because a
+// symlink (mode 120000), a gitlink (160000), or any other non-regular entry
+// would let the repository redirect the "approved" execution somewhere the
+// approval never saw. Such entries are therefore reported as present but
+// NOT regular — with nil bytes — so callers can fail closed on them instead
+// of reading whatever they point at. A path that does not exist at the
+// revision is present=false, nil bytes, nil error; an unresolvable revision
+// reports the same absence and callers classify the surrounding state. A
+// real read failure is a real error and must never be folded into absence.
+// revision and path must be assembled from trusted values — fixed contract
+// paths and control-side refs or resolved OIDs, never model- or
+// repository-supplied text — because git's rev/path syntax is argv here and
+// this package does not sanitize (see Hardened).
+func BlobAtRegular(ctx context.Context, directory, revision, path string) ([]byte, bool, bool, error) {
+	if strings.TrimSpace(revision) == "" || strings.TrimSpace(path) == "" {
+		return nil, false, false, errors.New("git blob read: revision and path are required")
+	}
+	// One ls-tree answers mode, type, and presence together: the entry's
+	// mode is the trust fact the plain BlobAt read cannot see, and -z keeps
+	// the parse exact even for paths git would otherwise quote.
+	out, _, err := hardened(ctx, directory, nil, []string{"ls-tree", "-z", revision, "--", path})
+	if err != nil {
+		var commandErr *CommandError
+		if errors.As(err, &commandErr) && commandErr.ExitCode() == 128 {
+			// Exit 128 covers an unresolvable revision; like BlobAt, the
+			// caller classifies the surrounding state from the absence.
+			return nil, false, false, nil
+		}
+		return nil, false, false, err
+	}
+	for _, entry := range strings.Split(string(out), "\x00") {
+		if entry == "" {
+			continue
+		}
+		meta, entryPath, found := strings.Cut(entry, "\t")
+		if !found || entryPath != path {
+			// ls-tree matches pathspecs, not only exact paths: an entry
+			// naming something under a queried directory is not the queried
+			// path, and trusting it would read the wrong content.
+			continue
+		}
+		fields := strings.Fields(meta)
+		if len(fields) < 3 {
+			return nil, false, false, fmt.Errorf("git blob read: unparseable ls-tree entry for %s at %s", path, revision)
+		}
+		mode := fields[0]
+		if mode != "100644" && mode != "100755" {
+			// Present but not a regular blob: report the fact and do not
+			// read the content — a symlink's target bytes are exactly what
+			// the caller must not consume.
+			return nil, false, true, nil
+		}
+		data, present, err := BlobAt(ctx, directory, revision, path)
+		if err != nil || !present {
+			return nil, false, present, err
+		}
+		return data, true, true, nil
+	}
+	return nil, false, false, nil
+}
+
 func hardened(ctx context.Context, directory string, extra []string, args []string) ([]byte, string, error) {
 	cmd := exec.CommandContext(ctx, "git", args...)
 	if directory != "" {
