@@ -89,11 +89,6 @@ func newContractWorldTree(t *testing.T, seedBase, seedHead func(dir string)) *co
 	return &contractWorld{t: t, integrator: integrator, work: work, base: base, bundle: bundle}
 }
 
-// contractRefConfig is a contract config whose bootstrap task references a
-// repository script, so the classification must pin the referenced bytes at
-// both revisions, not only the two contract files.
-const contractRefConfig = "[tasks.bootstrap]\nrun = 'hack/bootstrap.sh'\n"
-
 // writeSymlink creates a symlink at path pointing to target.
 func writeSymlink(t *testing.T, target, path string) {
 	t.Helper()
@@ -274,9 +269,14 @@ func TestSeedSnapshotCarriesContractState(t *testing.T) {
 
 // --- coordinator flow ------------------------------------------------------
 
+// testBaseOID is a valid git object ID the test snapshots carry as BaseTip:
+// the bootstrap scripts are parameterized by the control-resolved base OID
+// and refuse anything that is not one.
+const testBaseOID = "0123456789abcdef0123456789abcdef01234567"
+
 func contractSnapshotProvider(tip string, state devenv.State) SnapshotProvider {
 	return func(context.Context) (Snapshot, error) {
-		return Snapshot{Data: []byte("bundle-bytes"), Tip: tip, BaseTip: "base-tip", ContractState: state}, nil
+		return Snapshot{Data: []byte("bundle-bytes"), Tip: tip, BaseTip: testBaseOID, ContractState: state}, nil
 	}
 }
 
@@ -440,18 +440,19 @@ func TestCoordinatorBlockedExternalOnMalformedBootstrapCapture(t *testing.T) {
 	}
 }
 
-func TestCoordinatorBlockedExternalOnOversizedBootstrapEnv(t *testing.T) {
+func TestCoordinatorBlockedExternalOnFailedCaptureStage(t *testing.T) {
+	// The environment capture is size-capped at the source by the fixed
+	// script (devenv.MaxCaptureBytes, paired with protocol's Task.Env
+	// dispatch bound): an oversized capture fails the capture task honestly
+	// with a nonzero exit, which is the fixed exit-code blocker here — the
+	// coordinator no longer re-checks the delta's size itself.
 	worker, delegator, cleanupWorker := testWorkerAndDelegator(t)
 	defer cleanupWorker()
 	worker.completeAll = true
 	worker.snapshotTip = "snap-tip"
-	entries := make([]string, 0, 80)
-	for i := range 80 {
-		entries = append(entries, "VARIABLE"+pad(i)+"="+strings.Repeat("x", 1024))
-	}
 	worker.bootstrapResults = []protocol.Result{
 		{ExitCode: 0, StdoutTail: "courier-mise-path=/usr/bin/mise\n"},
-		{ExitCode: 0, StdoutTail: bootstrapCapture(entries...)},
+		{ExitCode: 1, StderrTail: "capture failed"},
 	}
 
 	gateway, _, cleanup := gatewayFor(delegateResponse("b1"))
@@ -470,8 +471,11 @@ func TestCoordinatorBlockedExternalOnOversizedBootstrapEnv(t *testing.T) {
 	if result.Outcome != executor.OutcomeBlockedExternal {
 		t.Fatalf("outcome = %q (%+v), want blocked_external", result.Outcome, result)
 	}
-	if !strings.Contains(result.Reason, "bootstrap environment exceeded the 64 KiB dispatch bound") {
-		t.Fatalf("reason = %q, want the oversized-delta blocker", result.Reason)
+	if !strings.Contains(result.Reason, "the approved bootstrap contract failed with exit code 1") {
+		t.Fatalf("reason = %q, want the fixed blocker reason with the capture task's exit code", result.Reason)
+	}
+	if got := worker.dispatchCount(); got != 3 {
+		t.Fatalf("worker dispatches = %d, want 3 (unpack, bootstrap, failed capture)", got)
 	}
 }
 
@@ -568,7 +572,7 @@ func TestBootstrapLivenessBoundIsABlocker(t *testing.T) {
 	bootstrapBound = 100 * time.Millisecond
 	defer func() { bootstrapBound = restored }()
 
-	err = coordinator.bootstrapWorkspace(context.Background(), "b1")
+	err = coordinator.bootstrapWorkspace(context.Background(), "b1", testBaseOID)
 	var blocker *bootstrapBlocker
 	if !errors.As(err, &blocker) || !strings.Contains(err.Error(), "exceeded its liveness bound") {
 		t.Fatalf("bound expiry error = %v, want the liveness-bound blocker", err)
@@ -576,7 +580,7 @@ func TestBootstrapLivenessBoundIsABlocker(t *testing.T) {
 
 	parent, cancel := context.WithCancel(context.Background())
 	cancel()
-	err = coordinator.bootstrapWorkspace(parent, "b1")
+	err = coordinator.bootstrapWorkspace(parent, "b1", testBaseOID)
 	if errors.As(err, &blocker) {
 		t.Fatalf("parent cancellation error = %v, want an ordinary error", err)
 	}
@@ -615,7 +619,7 @@ func TestBootstrapStageBlockerNamesTheHungStage(t *testing.T) {
 			bootstrapBound = 100 * time.Millisecond
 			defer func() { bootstrapBound = restored }()
 
-			err = coordinator.bootstrapWorkspace(context.Background(), "b1")
+			err = coordinator.bootstrapWorkspace(context.Background(), "b1", testBaseOID)
 			var blocker *bootstrapBlocker
 			if !errors.As(err, &blocker) {
 				t.Fatalf("bound expiry error = %v, want the liveness-bound blocker", err)
@@ -662,7 +666,7 @@ func TestBootstrapReceiptSinkReceivesAppliedReceipt(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if err := coordinator.bootstrapWorkspace(context.Background(), "b1"); err != nil {
+	if err := coordinator.bootstrapWorkspace(context.Background(), "b1", testBaseOID); err != nil {
 		t.Fatalf("bootstrapWorkspace() error = %v", err)
 	}
 	if len(sink.receipts) != 1 {
@@ -718,7 +722,7 @@ func TestBootstrapReceiptSinkReceivesFailedReceiptOnNonzeroExit(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	err = coordinator.bootstrapWorkspace(context.Background(), "b1")
+	err = coordinator.bootstrapWorkspace(context.Background(), "b1", testBaseOID)
 	var blocker *bootstrapBlocker
 	if !errors.As(err, &blocker) {
 		t.Fatalf("nonzero exit error = %v, want the bootstrap blocker", err)
@@ -747,30 +751,6 @@ func TestBootstrapReceiptSinkReceivesFailedReceiptOnNonzeroExit(t *testing.T) {
 	}
 	if got := worker.dispatchCount(); got != 1 {
 		t.Fatalf("worker dispatches = %d, want 1 (no capture after a failed bootstrap)", got)
-	}
-}
-
-// TestIntegratorContractStateModifiedByReferencedScript drives the
-// integrator against a real git repo whose contract config and lock are
-// byte-identical at base and head but whose referenced bootstrap script the
-// PR modified at head: the referenced bytes are part of the contract, so
-// the state is modified (#414).
-func TestIntegratorContractStateModifiedByReferencedScript(t *testing.T) {
-	world := newContractWorld(t,
-		map[string]string{
-			devenv.ConfigPath:   contractRefConfig,
-			devenv.LockPath:     "lock\n",
-			"hack/bootstrap.sh": "#!/bin/sh\necho base\n",
-		},
-		map[string]string{
-			devenv.ConfigPath:   contractRefConfig,
-			devenv.LockPath:     "lock\n",
-			"hack/bootstrap.sh": "#!/bin/sh\necho pwned\n",
-		},
-	)
-	state := world.integrator.ContractState(context.Background(), world.work)
-	if state != devenv.StateModified {
-		t.Fatalf("contract state = %q, want modified", state)
 	}
 }
 

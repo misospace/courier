@@ -2,33 +2,118 @@ package devenv
 
 import (
 	"errors"
+	"fmt"
+	"regexp"
 	"slices"
+	"strconv"
 	"strings"
 )
 
-// BootstrapScript returns the fixed POSIX sh bootstrap task script: it
-// reports where mise lives and which version and data directory it uses —
-// diagnostics the operator receipt can carry — then runs the repository's
-// `mise run bootstrap` task. It is fixed constants only — no interpolation,
-// no brief- or model-supplied values — because the worker executes whatever
+// MaxCaptureBytes bounds the environment capture at its source: the
+// environment-capture script fails the task before emitting a capture over
+// this bound. It is a build-time constant, paired with protocol's
+// maxTaskEnvBytes dispatch bound (internal/protocol/worker.go, 64 KiB) and
+// with the worker's 64 KiB stdout tail: the capture is capped so it always
+// fits both — the delta applied from it can never exceed the Task.Env
+// dispatch bound, and the whole capture is always inside the bounded tail
+// the parse reads. The two bounds must stay paired; change them together.
+const MaxCaptureBytes = 64 << 10
+
+// oidPattern is the strict shape a base revision OID must have before it is
+// interpolated into a task script: bare lowercase hex, 160-bit (SHA-1) or
+// 256-bit (SHA-256) git object IDs only.
+var oidPattern = regexp.MustCompile(`^[0-9a-f]{40}$|^[0-9a-f]{64}$`)
+
+// validBaseOID reports whether baseOID is a git object ID safe to
+// interpolate into a task script.
+func validBaseOID(baseOID string) bool {
+	return oidPattern.MatchString(baseOID)
+}
+
+// BootstrapScript returns the fixed POSIX sh bootstrap task script for the
+// operator-approved base revision baseOID. The script NEVER runs the
+// contract from the worker's head working tree: it materializes the base
+// revision from the git object store (`git archive` piped to tar), proves
+// the materialization actually happened with `test -f` on the contract file
+// (a `git archive` failure piped to tar without pipefail would otherwise
+// yield an empty directory, and the environment capture in an empty
+// directory must never succeed into a degenerate delta), and runs
+// `mise run bootstrap` inside it. Whatever mise discovers — configs, conf.d
+// fragments, task directories, includes — therefore comes from the approved
+// base revision by construction; mise's task discovery cannot reach head
+// content, whatever surfaces it reads. Classify guarantees the contract
+// exists at base whenever this script is dispatched: the script is only
+// built and dispatched for a StateApproved snapshot, and an approved state
+// implies the base carries the contract file the `test -f` checks.
+//
+// The script is fixed constants plus the validated OID: no brief- or
+// model-supplied value enters it, because the worker executes whatever
 // bytes it is given and the contract's trust comes from the repository, not
-// from this script. The bootstrap task and the environment capture are two
-// separately bounded tasks: each gets its own liveness bound, never one
-// shared budget.
-func BootstrapScript() string {
+// from this script. The OID is interpolated ONLY after strict validation to
+// bare lowercase hex (40 or 64 characters), and only inside shell single
+// quotes, which the shell interprets literally — a validated [0-9a-f]
+// string cannot carry a quote, a dollar, or any metacharacter, so the
+// interpolation can only ever produce the OID itself.
+//
+// The mise diagnostics are emitted BEFORE and AFTER the bootstrap run:
+// before, so a failed bootstrap that produced little output of its own
+// still yields them; after, so on success the trusted terminal emission is
+// always the last thing in the captured stdout tail and earlier,
+// repo-controlled lines cannot override it in ParseBootstrapDiagnostics.
+// The bootstrap task and the environment capture are two separately
+// dispatched tasks: each gets its own liveness bound, never one shared
+// budget.
+func BootstrapScript(baseOID string) (string, error) {
+	if !validBaseOID(baseOID) {
+		return "", fmt.Errorf("bootstrap base revision %q is not a git object ID", baseOID)
+	}
 	return "set -eu\n" +
-		"printf 'courier-mise-path=%s\\n' \"$(command -v mise)\"\n" +
-		"printf 'courier-mise-version=%s\\n' \"$(mise --version)\"\n" +
-		"printf 'courier-mise-data-dir=%s\\n' \"${MISE_DATA_DIR:-${XDG_DATA_HOME:-$HOME/.local/share}/mise}\"\n" +
-		"mise run bootstrap\n"
+		"base='" + baseOID + "'\n" +
+		"src=\"$(mktemp -d)\"\n" +
+		"trap 'rm -rf \"$src\"' EXIT\n" +
+		"git archive \"$base\" | tar -x -C \"$src\"\n" +
+		"test -f \"$src/" + ConfigPath + "\"\n" +
+		"cd \"$src\"\n" +
+		"courier_diag() {\n" +
+		"  printf 'courier-mise-path=%s\\n' \"$(command -v mise)\"\n" +
+		"  printf 'courier-mise-version=%s\\n' \"$(mise --version)\"\n" +
+		"  printf 'courier-mise-data-dir=%s\\n' \"${MISE_DATA_DIR:-${XDG_DATA_HOME:-$HOME/.local/share}/mise}\"\n" +
+		"}\n" +
+		"courier_diag\n" +
+		"mise run bootstrap\n" +
+		"courier_diag\n", nil
 }
 
 // EnvCaptureScript returns the fixed POSIX sh environment-capture task
-// script: `mise x -- env -0`, whose NUL-separated records ParseEnvCapture
-// filters into the delta over the caller's base environment. It is fixed
-// constants only, for the same reason as BootstrapScript.
-func EnvCaptureScript() string {
-	return "mise x -- env -0\n"
+// script for the operator-approved base revision baseOID: like
+// BootstrapScript, it materializes the base revision from the git object
+// store and runs `mise x -- env -0` inside it — never in the head working
+// tree — so the environment captured is the activated environment of the
+// approved base revision's contract, whatever mise discovers. The capture
+// is written to a temporary file and size-checked against MaxCaptureBytes
+// BEFORE it is emitted, so the source-side cap (paired with protocol's
+// Task.Env dispatch bound) fails an oversized capture honestly instead of
+// truncating it. The bound is rendered from the MaxCaptureBytes constant at
+// build time — it is a Go constant, not runtime data, so the script remains
+// fixed. See BootstrapScript for why the OID is validated and single-quoted,
+// and for the Classify coupling that guarantees the contract file exists at
+// base whenever this script is dispatched.
+func EnvCaptureScript(baseOID string) (string, error) {
+	if !validBaseOID(baseOID) {
+		return "", fmt.Errorf("environment-capture base revision %q is not a git object ID", baseOID)
+	}
+	return "set -eu\n" +
+		"base='" + baseOID + "'\n" +
+		"src=\"$(mktemp -d)\"\n" +
+		"trap 'rm -rf \"$src\"' EXIT\n" +
+		"git archive \"$base\" | tar -x -C \"$src\"\n" +
+		"test -f \"$src/" + ConfigPath + "\"\n" +
+		"cd \"$src\"\n" +
+		"capture=\"$(mktemp)\"\n" +
+		"mise x -- env -0 > \"$capture\"\n" +
+		"size=\"$(wc -c < \"$capture\")\"\n" +
+		"test \"$size\" -le " + strconv.Itoa(MaxCaptureBytes) + "\n" +
+		"cat \"$capture\"\n", nil
 }
 
 // The diagnostic keys the bootstrap task's report carries, as fixed in the
@@ -53,8 +138,13 @@ var errMalformedEnvCapture = errors.New("malformed environment capture")
 // courier-mise-data-dir — from the task's stdout. Any other line, of any
 // shape, is ignored: worker output is untrusted and only these three
 // fixed-key facts are ever consumed. A value that is not printable ASCII
-// (0x20–0x7E) or that exceeds 300 bytes is dropped, never truncated. The
-// returned map is possibly empty and the function never errors.
+// (0x20–0x7E) or that exceeds 300 bytes is dropped, never truncated. When a
+// key appears more than once, the LAST occurrence that survives validation
+// wins: the script emits its trusted diagnostics both before and after the
+// bootstrap run, so the trusted terminal emission overrides anything repo
+// code printed earlier — and a spoofed line cannot override the trusted
+// terminal emission, because it is last. The returned map is possibly empty
+// and the function never errors.
 func ParseBootstrapDiagnostics(stdout string) map[string]string {
 	diagnostics := make(map[string]string)
 	for _, line := range strings.Split(stdout, "\n") {
@@ -70,6 +160,8 @@ func ParseBootstrapDiagnostics(stdout string) map[string]string {
 		if len(value) > maxDiagnosticValueBytes || !printableASCII(value) {
 			continue
 		}
+		// Last valid occurrence wins, so the script's trusted post-bootstrap
+		// emission always overrides earlier repo-controlled lines.
 		diagnostics[key] = value
 	}
 	return diagnostics

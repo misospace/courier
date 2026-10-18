@@ -1150,31 +1150,46 @@ plus a committed `.mise/mise.lock`, executed as `mise run bootstrap`. The
 runtime owns four decisions, shared by the integrator, the secure harness,
 and the legacy executor's classification through `internal/devenv`:
 
-- **Trust rule.** The contract is honored only when the checked-out
+- **Trust rule.** The contract is approved only when the checked-out
   `.mise/config.toml` and `.mise/mise.lock` are byte-identical to those at
   the run's operator-approved base revision, read with hardened git reads
   (`git cat-file`) at the resolved head and base commits — never from a
   working tree, never by executing anything to decide. Every compared
   contract path must be a regular blob: a symlink (120000) or a gitlink
-  (160000) at either revision is unprovable and fails closed. The base
-  config's bootstrap task command is parsed for repository-relative script
-  targets, and every referenced target must itself be a regular blob
-  byte-identical between base and head — the referenced bytes are part of
-  the contract, not just the two config files. An unparseable task command
-  fails closed and skips. Repositories without a contract are skipped
-  (documented no-contract behavior, not a failure); a contract that differs
-  from the base — an untrusted PR modification — is skipped, never executed.
+  (160000) at either revision is unprovable and fails closed. The
+  comparison is the APPROVAL GATE only: a contract modified in a PR is an
+  untrusted modification and is skipped, never executed. What actually
+  executes is never the head's bytes — the secure worker materializes the
+  approved base revision from the git object store (`git archive` piped to
+  tar), verifies the contract file exists in the materialization, and runs
+  `mise run bootstrap` inside it — so the executed bytes are the approved
+  base revision's bytes BY CONSTRUCTION, and mise's task discovery (config
+  fragments, `conf.d`, task directories, includes, whatever surfaces it
+  reads) cannot reach head content. No enumeration of what mise might
+  discover is attempted, because none can be complete; enumeration-based
+  pinning of referenced scripts was tried and removed as unsound.
+  Repositories without a contract are skipped (documented no-contract
+  behavior, not a failure); a contract that differs from the base is
+  skipped, never executed.
 - **Bounded setup.** The secure harness dispatches the bootstrap task
-  (`mise run bootstrap` plus its fixed diagnostic lines) and the
-  environment capture (`mise x -- env -0`) as TWO separately dispatched
-  worker operations, each under its own fixed liveness bound (15 minutes,
-  process-group kill on expiry or cancellation) — never one shared budget,
-  so a hung bootstrap cannot consume the capture's liveness too. Failure of
-  the approved contract is an environment blocker: the run ends recoverably
-  blocked-external with a structured reason (fixed text naming the stage
-  and the exit code only — untrusted worker output never enters a durable
-  reason), never a model-visible retry loop and never a model
-  scavenger hunt for tooling.
+  (`mise run bootstrap` plus its fixed diagnostic lines, emitted before and
+  after the run so the trusted terminal emission is last in the captured
+  stdout tail) and the environment capture (`mise x -- env -0`) as TWO
+  separately dispatched worker operations, each under its own fixed liveness
+  bound (15 minutes) — never one shared budget, so a hung bootstrap cannot
+  consume the capture's liveness too. On expiry, control classifies the
+  expiry from the stage's own context and reconciles the operation through
+  cancellation on a fresh bounded context that ignores the expired caller
+  context — a reconcile issued on the expired context could never reach the
+  worker, and the bound must still DELIVER the worker's process-group kill
+  and observe the result before the run ends blocked-external with a
+  structured reason (fixed text naming the stage and the exit code only —
+  untrusted worker output never enters a durable reason), never a
+  model-visible retry loop and never a model scavenger hunt for tooling.
+  The environment capture is size-capped at the source (64 KiB, paired with
+  the `Task.Env` dispatch bound and the worker's 64 KiB stdout tail): an
+  oversized capture fails the task honestly with a nonzero exit, never a
+  truncation.
 - **Deterministic environment.** The captured post-bootstrap environment is
   applied so every subsequent execution inherits it without interactive
   shell activation. Protected keys — Courier's control plane (`COURIER_*`),
@@ -1217,15 +1232,15 @@ and every brief, and each unpack wipes untracked workspace state with
 idempotency plus out-of-workspace caches (user-scoped installs) are what
 keep repeat runs cheap; a workspace-local install that must survive is the
 contract author's problem, not the runtime's. And the executed bytes are
-what the worker materialized, while the approval was computed from
-control's tree: control dispatches only at an approved state and the
-captured environment never flows back into a trusted process, so a race
-between the two grants nothing today — the invariant to preserve if either
-half ever changes is that contract-controlled bytes and contract-controlled
-environment must both stay on the untrusted side. Approval pins every
-executed byte — the config, the lock, and every referenced script target —
-as regular blobs at the resolved commits, so a symlinked or substituted
-contract path fails closed instead of being compared through its target.
+the approved base revision's bytes by construction — the worker
+materializes the base revision from the git object store and runs inside
+it — while the approval gate was computed from control's tree at head and
+base: control dispatches only at an approved state, and the captured
+environment never flows back into a trusted process. Approval covers the
+compared contract paths as regular blobs at the resolved commits — a
+symlinked or substituted contract path fails closed instead of being
+compared through its target — and the base materialization's `test -f`
+proves the contract file is really present in what will run.
 
 ## Commit cadence
 
@@ -4435,10 +4450,10 @@ earns a 401 that is classified as a definite denial (superseded by #406: a
   `internal/devenv` for the decisions that make it safe: the trust rule
   (hardened `git cat-file` reads of the head and base commits, never
   execution, to decide; every compared contract path a regular blob — a
-  symlink or gitlink fails closed — the base task command parsed for
-  repository-relative script targets, every referenced target pinned
-  byte-identical at both revisions, an unparseable command failing closed;
-  absent contracts skip, modified ones are untrusted and skip), the
+  symlink or gitlink fails closed; absent contracts skip, modified ones
+  are untrusted and skip; what executes is the approved base revision's
+  bytes by construction — the worker materializes the base revision from
+  the git object store and runs inside it), the
   liveness bound (each of the two separately dispatched bootstrap tasks
   gets a fixed 15-minute process-group bound), the environment contract
   (the captured post-bootstrap environment reaches every later execution
@@ -4462,31 +4477,52 @@ earns a 401 that is classified as a definite denial (superseded by #406: a
   sticky environment application (would redirect the fixed unpack/pack
   scripts' `git` through a contract-controlled PATH). (#414)
 - **2026-10-18 — #414 review: the legacy executor never executes repository
-  contract code, the executed bytes are bound and symlinks fail closed, the
-  two secure bootstrap tasks get per-command bounds, and every secure
-  outcome emits a structured receipt.** Human review of #446 flagged the
-  legacy executor as credential-bearing: repo-owned contract code must
-  never execute there, so the in-process execution engine was removed — an
-  approved contract in the legacy topology is skipped with a fixed honest
-  receipt reason ("the legacy executor is credential-bearing; the approved
-  bootstrap runs only in the secure worker topology") and the run proceeds
-  unbootstrapped, exactly like the absent and modified branches. The trust
-  rule now binds what would execute: every compared contract path must be
-  a regular blob (a symlink at either revision is a modified contract, not
-  content compared through its target), and every script target referenced
-  by the base task command must be a regular blob byte-identical between
-  base and head — a PR that swaps a referenced `hack/bootstrap.sh` cannot
-  ride an unchanged config. In the secure harness the bootstrap task and
-  the environment capture are dispatched as two separately bounded
-  operations, each with its own 15-minute liveness bound and a blocker
-  reason naming the stage that actually hung, and every terminal outcome —
-  applied and each blocker class — composes a structured BootstrapReceipt
-  (per-task elapsed milliseconds, exit codes, environment-key count, and
-  the validated mise executable path, version, and data dir) emitted
-  best-effort through a sink onto the control pod's `workspace.bootstrap`
-  event, the same emitter session compaction uses. Rejected: keeping any
-  legacy in-process execution engine (the credential-bearing executor of
+  contract code, the executed bytes are the approved base revision's bytes
+  by construction, the two secure bootstrap tasks get per-command bounds
+  whose kill is always delivered, and every secure outcome emits a
+  structured receipt.** Human review of #446 flagged the legacy executor as
+  credential-bearing: repo-owned contract code must never execute there, so
+  the in-process execution engine was removed — an approved contract in the
+  legacy topology is skipped with a fixed honest receipt reason ("the
+  legacy executor is credential-bearing; the approved bootstrap runs only
+  in the secure worker topology") and the run proceeds unbootstrapped,
+  exactly like the absent and modified branches. The trust rule binds the
+  approval gate: every compared contract path must be a regular blob (a
+  symlink at either revision is a modified contract, not content compared
+  through its target) and byte-identical between base and head. What
+  executes is then the approved base revision's bytes BY CONSTRUCTION, not
+  a pinned enumeration: the secure worker materializes the base revision
+  from the git object store (`git archive` piped to tar), verifies the
+  contract file exists in the materialization, and runs `mise run
+  bootstrap` / `mise x -- env -0` inside it — so mise's task discovery
+  (configs, conf.d fragments, task directories, includes) cannot reach head
+  content on any surface, and the earlier parse-based pinning of script
+  targets referenced by the task command was removed as unsound (mise
+  discovers from many repo surfaces no enumeration can complete). The
+  bootstrap task and the environment capture are dispatched as two
+  separately bounded operations, each with its own 15-minute liveness bound
+  and a blocker reason naming the stage that actually hung; on expiry,
+  control reconciles the operation through cancellation on a fresh bounded
+  context that ignores the expired caller context, so the bound DELIVERS
+  the worker's process-group kill and observes the result before the run
+  ends blocked-external — a reconcile issued on the already-expired context
+  could never reach the worker and would classify the run without stopping
+  the task. The environment capture is size-capped at the source (64 KiB,
+  paired with the `Task.Env` dispatch bound), so an oversized capture fails
+  the task honestly instead of being truncated or re-checked control-side.
+  Every terminal outcome — applied and each blocker class — composes a
+  structured BootstrapReceipt (per-task elapsed milliseconds, exit codes,
+  environment-key count, and the validated mise executable path, version,
+  and data dir) emitted best-effort through a sink onto the control pod's
+  `workspace.bootstrap` event, the same emitter session compaction uses;
+  the script emits its trusted diagnostics before and after the bootstrap
+  run, so last-occurrence-wins parsing makes the trusted terminal emission
+  override earlier repo-controlled output. Rejected: keeping any legacy
+  in-process execution engine (the credential-bearing executor of
   repository code is exactly what review blocked), one shared liveness
-  budget across the two tasks (a hung bootstrap would consume the
-  capture's bound), and raw worker output in receipts (diagnostics are
-  validated to a fixed key set and printable-ASCII charset). (#414, #446)
+  budget across the two tasks (a hung bootstrap would consume the capture's
+  bound), raw worker output in receipts (diagnostics are validated to a
+  fixed key set and printable-ASCII charset), and enumerating/pinning the
+  scripts and configs mise might discover (incomplete by construction —
+  materializing the approved base revision needs no enumeration at all).
+  (#414, #446)

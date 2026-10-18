@@ -180,10 +180,7 @@ func (t *Integrator) Head(ctx context.Context) (string, error) {
 // approved, modified when it diverged, absent when the tip does not carry
 // it. Both tips are resolved objects in this tree, so the comparison is pure
 // git reads — the contract state is trusted control's own observation, never
-// a claim from the model or the worker. A read failure is also reported as
-// modified: unprovable content is never executed, and a transient git
-// hiccup must not fail the whole snapshot preparation, only the bootstrap it
-// gates.
+// a claim from the model or the worker.
 func (t *Integrator) ContractState(ctx context.Context, tip string) devenv.State {
 	if t.baseTip == "" {
 		return devenv.StateAbsent

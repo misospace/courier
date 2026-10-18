@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"reflect"
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -11,11 +12,8 @@ import (
 func TestCompare(t *testing.T) {
 	configA := []byte("[tools]\nnode = '22'\n")
 	configB := []byte("[tools]\nnode = '24'\n")
-	configTask := []byte("[tasks.bootstrap]\nrun = 'hack/bootstrap.sh'\n")
 	lockA := []byte("lock-a")
 	lockB := []byte("lock-b")
-	script := ScriptFile{Data: []byte("echo hi\n"), Regular: true, Present: true}
-	scripts := map[string]ScriptFile{"hack/bootstrap.sh": script}
 
 	tests := []struct {
 		name string
@@ -33,58 +31,20 @@ func TestCompare(t *testing.T) {
 		{"config differs", Files{Config: configA, HasConfig: true, ConfigRegular: true}, Files{Config: configB, HasConfig: true, ConfigRegular: true}, StateModified},
 		{"lock present only at head", Files{Config: configA, HasConfig: true, ConfigRegular: true}, Files{Config: configA, HasConfig: true, Lock: lockB, HasLock: true, ConfigRegular: true, LockRegular: true}, StateModified},
 		{"lock present only at base", Files{Config: configA, HasConfig: true, Lock: lockA, HasLock: true, ConfigRegular: true, LockRegular: true}, Files{Config: configA, HasConfig: true, ConfigRegular: true}, StateModified},
+		{"lock bytes differ", Files{Config: configA, HasConfig: true, Lock: lockA, HasLock: true, ConfigRegular: true, LockRegular: true}, Files{Config: configA, HasConfig: true, Lock: lockB, HasLock: true, ConfigRegular: true, LockRegular: true}, StateModified},
 		{"absent base", Files{}, Files{Config: configA, HasConfig: true, ConfigRegular: true}, StateModified},
 		{"config symlink at base", Files{Config: configA, HasConfig: true, ConfigRegular: false}, Files{Config: configA, HasConfig: true, ConfigRegular: true}, StateModified},
 		{"config symlink at head", Files{Config: configA, HasConfig: true, ConfigRegular: true}, Files{Config: configA, HasConfig: true, ConfigRegular: false}, StateModified},
 		{"lock symlink at base", Files{Config: configA, HasConfig: true, Lock: lockA, HasLock: true, ConfigRegular: true, LockRegular: false}, Files{Config: configA, HasConfig: true, Lock: lockA, HasLock: true, ConfigRegular: true, LockRegular: true}, StateModified},
 		{"lock symlink at head", Files{Config: configA, HasConfig: true, Lock: lockA, HasLock: true, ConfigRegular: true, LockRegular: true}, Files{Config: configA, HasConfig: true, Lock: lockA, HasLock: true, ConfigRegular: true, LockRegular: false}, StateModified},
-		{"regularity unprovable", Files{Config: configA, HasConfig: true}, Files{Config: configA, HasConfig: true}, StateModified},
 		{
-			"referenced script pinned identical",
-			Files{Config: configTask, HasConfig: true, ConfigRegular: true, Scripts: scripts},
-			Files{Config: configTask, HasConfig: true, ConfigRegular: true, Scripts: scripts},
-			StateApproved,
-		},
-		{
-			"referenced script differs at head",
-			Files{Config: configTask, HasConfig: true, ConfigRegular: true, Scripts: scripts},
-			Files{Config: configTask, HasConfig: true, ConfigRegular: true, Scripts: map[string]ScriptFile{
-				"hack/bootstrap.sh": {Data: []byte("echo gone\n"), Regular: true, Present: true},
-			}},
+			"regularity unprovable",
+			Files{Config: configA, HasConfig: true},
+			Files{Config: configA, HasConfig: true},
 			StateModified,
 		},
 		{
-			"referenced script absent at head",
-			Files{Config: configTask, HasConfig: true, ConfigRegular: true, Scripts: scripts},
-			Files{Config: configTask, HasConfig: true, ConfigRegular: true, Scripts: map[string]ScriptFile{
-				"hack/bootstrap.sh": {Present: false},
-			}},
-			StateModified,
-		},
-		{
-			"referenced script never read",
-			Files{Config: configTask, HasConfig: true, ConfigRegular: true, Scripts: scripts},
-			Files{Config: configTask, HasConfig: true, ConfigRegular: true},
-			StateModified,
-		},
-		{
-			"referenced script symlink",
-			Files{Config: configTask, HasConfig: true, ConfigRegular: true, Scripts: map[string]ScriptFile{
-				"hack/bootstrap.sh": {Data: []byte("echo hi\n"), Present: true},
-			}},
-			Files{Config: configTask, HasConfig: true, ConfigRegular: true, Scripts: map[string]ScriptFile{
-				"hack/bootstrap.sh": {Data: []byte("echo hi\n"), Present: true},
-			}},
-			StateModified,
-		},
-		{
-			"identical but unparseable bootstrap task",
-			Files{Config: []byte("[tasks.bootstrap]\n"), HasConfig: true, ConfigRegular: true},
-			Files{Config: []byte("[tasks.bootstrap]\n"), HasConfig: true, ConfigRegular: true},
-			StateModified,
-		},
-		{
-			"approved contract without a bootstrap task",
+			"identical without a lock",
 			Files{Config: configA, HasConfig: true, ConfigRegular: true},
 			Files{Config: configA, HasConfig: true, ConfigRegular: true},
 			StateApproved,
@@ -133,121 +93,6 @@ func TestMergeEnv(t *testing.T) {
 	}
 }
 
-func TestBootstrapScriptRefs(t *testing.T) {
-	tests := []struct {
-		name   string
-		config string
-		want   []string
-		wantOK bool
-	}{
-		{
-			name:   "happy path",
-			config: "[tools]\ngo = '1.27'\n\n[tasks.bootstrap]\nrun = \"hack/bootstrap.sh tools\"\n",
-			want:   []string{"hack/bootstrap.sh", "tools"},
-			wantOK: true,
-		},
-		{
-			name:   "multiple refs deduplicated in order",
-			config: "[tasks.bootstrap]\nrun = 'b.sh a.sh b.sh'\n",
-			want:   []string{"b.sh", "a.sh"},
-			wantOK: true,
-		},
-		{
-			name:   "flags and absolute paths skipped",
-			config: "[tasks.bootstrap]\nrun = 'build --verbose /usr/bin/tool script.sh'\n",
-			want:   []string{"build", "script.sh"},
-			wantOK: true,
-		},
-		{
-			name:   "comment after the value",
-			config: "[tasks.bootstrap]\nrun = 'a.sh' # the task\n",
-			want:   []string{"a.sh"},
-			wantOK: true,
-		},
-		{
-			name:   "metacharacter token fails closed",
-			config: "[tasks.bootstrap]\nrun = 'deploy.sh $HOME'\n",
-			wantOK: false,
-		},
-		{
-			name:   "glob token fails closed",
-			config: "[tasks.bootstrap]\nrun = 'scripts/*.sh'\n",
-			wantOK: false,
-		},
-		{
-			name:   "dotdot segment fails closed",
-			config: "[tasks.bootstrap]\nrun = '../secrets.sh'\n",
-			wantOK: false,
-		},
-		{
-			name:   "interior dotdot segment fails closed",
-			config: "[tasks.bootstrap]\nrun = 'a/../b.sh'\n",
-			wantOK: false,
-		},
-		{
-			name:   "backslash escape fails closed",
-			config: "[tasks.bootstrap]\nrun = \"echo \\hi.sh\"\n",
-			wantOK: false,
-		},
-		{
-			name:   "single-quoted literal accepted",
-			config: "[tasks.bootstrap]\nrun = 'hack/bootstrap.sh'\n",
-			want:   []string{"hack/bootstrap.sh"},
-			wantOK: true,
-		},
-		{
-			name:   "no section and no bootstrap mention",
-			config: "[tools]\ngo = '1.27'\n",
-			wantOK: true,
-		},
-		{
-			name:   "no section but bootstrap mentioned fails closed",
-			config: "[tasks]\nbootstrap = 'echo bootstrapped'\n",
-			wantOK: false,
-		},
-		{
-			name:   "section without run fails closed",
-			config: "[tasks.bootstrap]\n[tools]\ngo = '1.27'\n",
-			wantOK: false,
-		},
-		{
-			name:   "section at end without run fails closed",
-			config: "[tools]\n\n[tasks.bootstrap]\n",
-			wantOK: false,
-		},
-		{
-			name:   "unquoted run fails closed",
-			config: "[tasks.bootstrap]\nrun = hack/bootstrap.sh\n",
-			wantOK: false,
-		},
-		{
-			name:   "empty run value fails closed",
-			config: "[tasks.bootstrap]\nrun =\n",
-			wantOK: false,
-		},
-		{
-			name:   "unterminated quote fails closed",
-			config: "[tasks.bootstrap]\nrun = 'a.sh\n",
-			wantOK: false,
-		},
-		{
-			name:   "garbage after the quote fails closed",
-			config: "[tasks.bootstrap]\nrun = 'a.sh' extra\n",
-			wantOK: false,
-		},
-	}
-	for _, tt := range tests {
-		refs, ok := BootstrapScriptRefs([]byte(tt.config))
-		if ok != tt.wantOK {
-			t.Errorf("%s: BootstrapScriptRefs ok = %v, want %v (refs %v)", tt.name, ok, tt.wantOK, refs)
-			continue
-		}
-		if ok && !equalStrings(refs, tt.want) {
-			t.Errorf("%s: BootstrapScriptRefs = %q, want %q", tt.name, refs, tt.want)
-		}
-	}
-}
-
 // fakeEntry is one path at one revision in the fake read's fixture: data,
 // regularity, and presence, or err for a real read failure.
 type fakeEntry struct {
@@ -275,32 +120,16 @@ func fakeRead(entries map[string]map[string]fakeEntry) BlobRead {
 	}
 }
 
-// contractConfig is the fixed task-bearing contract fixture: one referenced
-// script target, parseable by BootstrapScriptRefs.
+// contractConfig is the fixed plain contract fixture: config bytes with no
+// bootstrap-task parsing involved — the comparison is the approval gate,
+// and what executes is the base revision's bytes.
 func contractConfig() []byte {
-	return []byte("[tools]\ngo = '1.27'\n\n[tasks.bootstrap]\nrun = 'hack/bootstrap.sh'\n")
+	return []byte("[tools]\ngo = '1.27'\n")
 }
 
 func TestClassify(t *testing.T) {
 	config := contractConfig()
 	lock := []byte("lock\n")
-	script := []byte("echo hi\n")
-
-	both := func(baseEntry, headEntry fakeEntry) map[string]map[string]fakeEntry {
-		return map[string]map[string]fakeEntry{
-			"base": {
-				ConfigPath:          {data: config, regular: true, present: true},
-				LockPath:            {data: lock, regular: true, present: true},
-				"hack/bootstrap.sh": baseEntry,
-			},
-			"head": {
-				ConfigPath:          {data: config, regular: true, present: true},
-				LockPath:            {data: lock, regular: true, present: true},
-				"hack/bootstrap.sh": headEntry,
-			},
-		}
-	}
-	regularScript := fakeEntry{data: script, regular: true, present: true}
 
 	tests := []struct {
 		name      string
@@ -309,72 +138,42 @@ func TestClassify(t *testing.T) {
 		wantError bool
 	}{
 		{
-			name:    "approved end to end",
-			entries: both(regularScript, regularScript),
-			want:    StateApproved,
+			name: "approved end to end",
+			entries: map[string]map[string]fakeEntry{
+				"base": {ConfigPath: {data: config, regular: true, present: true}, LockPath: {data: lock, regular: true, present: true}},
+				"head": {ConfigPath: {data: config, regular: true, present: true}, LockPath: {data: lock, regular: true, present: true}},
+			},
+			want: StateApproved,
 		},
 		{
 			name: "absent contract at head",
 			entries: map[string]map[string]fakeEntry{
-				"base": {ConfigPath: {data: config, regular: true, present: true}, LockPath: {data: lock, regular: true, present: true}, "hack/bootstrap.sh": regularScript},
+				"base": {ConfigPath: {data: config, regular: true, present: true}, LockPath: {data: lock, regular: true, present: true}},
 				"head": {ConfigPath: {present: false}, LockPath: {present: false}},
 			},
 			want: StateAbsent,
 		},
 		{
-			name:    "referenced script modified at head",
-			entries: both(regularScript, fakeEntry{data: []byte("echo gone\n"), regular: true, present: true}),
-			want:    StateModified,
-		},
-		{
-			name:    "referenced script present at head but absent at base",
-			entries: both(fakeEntry{present: false}, regularScript),
-			want:    StateModified,
-		},
-		{
-			name:    "referenced script absent at both revisions",
-			entries: both(fakeEntry{present: false}, fakeEntry{present: false}),
-			want:    StateModified,
-		},
-		{
-			name:    "referenced script symlink at base",
-			entries: both(fakeEntry{data: script, present: true}, regularScript),
-			want:    StateModified,
-		},
-		{
-			name:    "referenced script symlink at head",
-			entries: both(regularScript, fakeEntry{data: script, present: true}),
-			want:    StateModified,
-		},
-		{
 			name: "config symlink at base",
 			entries: map[string]map[string]fakeEntry{
-				"base": {ConfigPath: {data: config, present: true}, LockPath: {data: lock, regular: true, present: true}, "hack/bootstrap.sh": regularScript},
-				"head": {ConfigPath: {data: config, regular: true, present: true}, LockPath: {data: lock, regular: true, present: true}, "hack/bootstrap.sh": regularScript},
+				"base": {ConfigPath: {data: config, present: true}, LockPath: {data: lock, regular: true, present: true}},
+				"head": {ConfigPath: {data: config, regular: true, present: true}, LockPath: {data: lock, regular: true, present: true}},
 			},
 			want: StateModified,
 		},
 		{
 			name: "config symlink at head",
 			entries: map[string]map[string]fakeEntry{
-				"base": {ConfigPath: {data: config, regular: true, present: true}, LockPath: {data: lock, regular: true, present: true}, "hack/bootstrap.sh": regularScript},
-				"head": {ConfigPath: {data: config, present: true}, LockPath: {data: lock, regular: true, present: true}, "hack/bootstrap.sh": regularScript},
+				"base": {ConfigPath: {data: config, regular: true, present: true}, LockPath: {data: lock, regular: true, present: true}},
+				"head": {ConfigPath: {data: config, present: true}, LockPath: {data: lock, regular: true, present: true}},
 			},
 			want: StateModified,
 		},
 		{
-			name: "unparseable bootstrap task fails closed",
+			name: "read error on the config",
 			entries: map[string]map[string]fakeEntry{
-				"base": {ConfigPath: {data: []byte("[tasks.bootstrap]\nrun = 'a`b'\n"), regular: true, present: true}, LockPath: {data: lock, regular: true, present: true}},
-				"head": {ConfigPath: {data: []byte("[tasks.bootstrap]\nrun = 'a`b'\n"), regular: true, present: true}, LockPath: {data: lock, regular: true, present: true}},
-			},
-			want: StateModified,
-		},
-		{
-			name: "read error on the referenced script",
-			entries: map[string]map[string]fakeEntry{
-				"base": {ConfigPath: {data: config, regular: true, present: true}, LockPath: {data: lock, regular: true, present: true}, "hack/bootstrap.sh": regularScript},
-				"head": {ConfigPath: {data: config, regular: true, present: true}, LockPath: {data: lock, regular: true, present: true}, "hack/bootstrap.sh": {err: errors.New("object read failed")}},
+				"base": {ConfigPath: {data: config, regular: true, present: true}, LockPath: {data: lock, regular: true, present: true}},
+				"head": {ConfigPath: {err: errors.New("object read failed")}, LockPath: {data: lock, regular: true, present: true}},
 			},
 			wantError: true,
 		},
@@ -437,34 +236,93 @@ func TestParseEnvCapture(t *testing.T) {
 	}
 }
 
+// TestBootstrapAndEnvCaptureScripts pins the executed-bytes-by-construction
+// scripts: each materializes the approved base revision from the git object
+// store, proves the materialization happened, and runs only inside it —
+// never in the head working tree. The only interpolated value is the
+// validated, single-quoted base OID.
 func TestBootstrapAndEnvCaptureScripts(t *testing.T) {
-	// The scripts are pinned exactly: their security property is that they
-	// are fixed constants only — never interpolated with brief- or
-	// model-supplied values — and a containment check cannot prove that.
-	wantBootstrap := "set -eu\n" +
-		"printf 'courier-mise-path=%s\\n' \"$(command -v mise)\"\n" +
-		"printf 'courier-mise-version=%s\\n' \"$(mise --version)\"\n" +
-		"printf 'courier-mise-data-dir=%s\\n' \"${MISE_DATA_DIR:-${XDG_DATA_HOME:-$HOME/.local/share}/mise}\"\n" +
-		"mise run bootstrap\n"
-	if got := BootstrapScript(); got != wantBootstrap {
-		t.Errorf("BootstrapScript() = %q, want %q", got, wantBootstrap)
+	const oid = "0123456789abcdef0123456789abcdef01234567"
+	bootstrap, err := BootstrapScript(oid)
+	if err != nil {
+		t.Fatalf("BootstrapScript: %v", err)
 	}
-	if got := EnvCaptureScript(); got != "mise x -- env -0\n" {
-		t.Errorf("EnvCaptureScript() = %q, want %q", got, "mise x -- env -0\n")
+	for _, want := range []string{
+		"base='" + oid + "'",
+		"git archive \"$base\" | tar -x -C \"$src\"",
+		"test -f \"$src/" + ConfigPath + "\"",
+		"cd \"$src\"",
+		"mise run bootstrap",
+		"courier-mise-path=",
+	} {
+		if !strings.Contains(bootstrap, want) {
+			t.Errorf("BootstrapScript = %q, want it to contain %q", bootstrap, want)
+		}
+	}
+	// The trusted diagnostics are emitted after the bootstrap run too, so
+	// the terminal emission is last in the captured stdout tail.
+	if strings.Count(bootstrap, "courier_diag\n") != 2 || !strings.HasSuffix(bootstrap, "courier_diag\n") {
+		t.Errorf("BootstrapScript = %q, want diagnostics before AND after the bootstrap run", bootstrap)
 	}
 
-	// ParseEnvCapture consumes exactly the shape `mise x -- env -0` emits:
-	// NUL-terminated KEY=VALUE records and nothing else.
-	capture := "PATH=/fake/shims\x00NEW=1\x00"
-	delta, keys, err := ParseEnvCapture(capture, []string{"PATH=/old"})
+	capture, err := EnvCaptureScript(oid)
 	if err != nil {
-		t.Fatalf("ParseEnvCapture: %v", err)
+		t.Fatalf("EnvCaptureScript: %v", err)
 	}
-	if !equalStrings(delta, []string{"PATH=/fake/shims", "NEW=1"}) {
-		t.Errorf("delta = %q", delta)
+	for _, want := range []string{
+		"base='" + oid + "'",
+		"git archive \"$base\" | tar -x -C \"$src\"",
+		"test -f \"$src/" + ConfigPath + "\"",
+		"cd \"$src\"",
+		"mise x -- env -0 > \"$capture\"",
+		"test \"$size\" -le " + strconv.Itoa(MaxCaptureBytes),
+		"cat \"$capture\"",
+	} {
+		if !strings.Contains(capture, want) {
+			t.Errorf("EnvCaptureScript = %q, want it to contain %q", capture, want)
+		}
 	}
-	if !equalStrings(keys, []string{"NEW", "PATH"}) {
-		t.Errorf("keys = %q", keys)
+}
+
+// TestScriptsRejectInvalidBaseOID pins the fail-closed validation: only a
+// bare lowercase hex git object ID (40 or 64 characters) may be
+// interpolated into a task script — anything else, including quote and
+// shell metacharacters, errors before dispatch for both functions.
+func TestScriptsRejectInvalidBaseOID(t *testing.T) {
+	invalid := []string{
+		"",
+		"refs/heads/main",
+		"HEAD",
+		"0123456789abcdef0123456789abcdef0123456",   // 39 chars
+		"0123456789abcdef0123456789abcdef012345678", // 41 chars
+		strings.Repeat("a", 39) + "G",               // non-hex
+		"0123456789ABCDEF0123456789ABCDEF01234567",  // uppercase
+		"'; rm -rf / #",
+		"$(rm -rf /)",
+		"`rm -rf /`",
+		"0123456789abcdef0123456789abcdef01234567 ",
+		" 0123456789abcdef0123456789abcdef01234567",
+		"0123456789abcdef0123456789abcdef0123456\n",
+		strings.Repeat("a", 64)[:63] + "g", // 64 chars, non-hex tail
+	}
+	for _, oid := range invalid {
+		if script, err := BootstrapScript(oid); err == nil {
+			t.Errorf("BootstrapScript(%q) = %q, want an error", oid, script)
+		}
+		if script, err := EnvCaptureScript(oid); err == nil {
+			t.Errorf("EnvCaptureScript(%q) = %q, want an error", oid, script)
+		}
+	}
+	for _, oid := range []string{
+		"0123456789abcdef0123456789abcdef01234567",
+		strings.Repeat("a", 64),
+	} {
+		if _, err := BootstrapScript(oid); err != nil {
+			t.Errorf("BootstrapScript(%q) error = %v, want nil", oid, err)
+		}
+		if _, err := EnvCaptureScript(oid); err != nil {
+			t.Errorf("EnvCaptureScript(%q) error = %v, want nil", oid, err)
+		}
 	}
 }
 
@@ -505,6 +363,21 @@ func TestParseBootstrapDiagnostics(t *testing.T) {
 	}
 	if got := ParseBootstrapDiagnostics("courier-mise-path=/usr/bin/mis\u00e9\n"); len(got) != 0 {
 		t.Errorf("non-ASCII value parsed = %v, want dropped", got)
+	}
+
+	// Last valid occurrence wins: the script emits its trusted diagnostics
+	// before and after the bootstrap run, so a spoofed repo-controlled line
+	// before the run cannot override the trusted terminal emission.
+	spoofed := "courier-mise-path=/evil\n" +
+		"courier-mise-version=0.0.0-evil\n" +
+		"courier-mise-path=/usr/bin/mise\n" +
+		"courier-mise-version=2024.10.0\n"
+	wantTrusted := map[string]string{
+		"courier-mise-path":    "/usr/bin/mise",
+		"courier-mise-version": "2024.10.0",
+	}
+	if got := ParseBootstrapDiagnostics(spoofed); !reflect.DeepEqual(got, wantTrusted) {
+		t.Errorf("spoofed diagnostics = %v, want the trusted terminal values %v", got, wantTrusted)
 	}
 }
 

@@ -178,6 +178,11 @@ type mockWorker struct {
 	// bootstrap stage, so hangStage can hang exactly one of them.
 	bootstrapOps map[string]bool
 	captureOps   map[string]bool
+	// tombstones records cancelled op IDs, mirroring the real worker: a
+	// cancellation tombstone is final, and a result poll for a
+	// tombstoned operation answers the verified cancellation instead of
+	// hanging — the reconcile must be able to observe it.
+	tombstones map[string]bool
 }
 
 func isWorkerBootstrapTask(task protocol.Task) bool {
@@ -323,35 +328,52 @@ func (m *mockWorker) handleCancel(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	m.cancels = append(m.cancels, req.Envelope)
+	if m.tombstones == nil {
+		m.tombstones = map[string]bool{}
+	}
+	m.tombstones[req.Envelope.OpID] = true
 	w.Header().Set("Content-Type", "application/json")
 	fmt.Fprint(w, `{"status":"cancelled"}`)
 }
 
 func (m *mockWorker) handleResult(w http.ResponseWriter, r *http.Request) {
-	if m.hangResults {
-		<-r.Context().Done()
-		return
-	}
-	if m.hangStage != "" {
-		m.mu.Lock()
-		opID := strings.TrimSuffix(strings.TrimPrefix(r.URL.Path, "/v1/tasks/"), "/result")
-		hang := (m.hangStage == "bootstrap" && m.bootstrapOps[opID]) ||
-			(m.hangStage == "capture" && m.captureOps[opID])
-		m.mu.Unlock()
-		if hang {
+	opID := strings.TrimSuffix(strings.TrimPrefix(r.URL.Path, "/v1/tasks/"), "/result")
+	m.mu.Lock()
+	tombstoned := m.tombstones[opID]
+	m.mu.Unlock()
+	if !tombstoned {
+		if m.hangResults {
 			<-r.Context().Done()
 			return
 		}
+		if m.hangStage != "" {
+			m.mu.Lock()
+			hang := (m.hangStage == "bootstrap" && m.bootstrapOps[opID]) ||
+				(m.hangStage == "capture" && m.captureOps[opID])
+			m.mu.Unlock()
+			if hang {
+				<-r.Context().Done()
+				return
+			}
+		}
 	}
+	// A tombstoned operation answers with the verified cancellation the
+	// real worker reports after its process group is empty — an honest
+	// cancellation is observable, not a hang.
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	if tombstoned && m.results[opID].Result == nil {
+		m.results[opID] = protocol.ResultState{
+			Status: protocol.ResultCancelled,
+			Result: &protocol.Result{Status: protocol.ResultCancelled, ExitCode: -1},
+		}
+	}
 	if m.resultFailures > 0 {
 		m.resultFailures--
 		w.WriteHeader(http.StatusServiceUnavailable)
 		fmt.Fprint(w, "poll failed transiently")
 		return
 	}
-	opID := strings.TrimSuffix(strings.TrimPrefix(r.URL.Path, "/v1/tasks/"), "/result")
 	state, ok := m.results[opID]
 	if !ok {
 		http.NotFound(w, r)

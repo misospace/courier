@@ -50,8 +50,9 @@ const (
 	EventWorkspaceReady = "workspace.ready"
 	// EventWorkspaceBootstrap reports the bounded workspace
 	// development-bootstrap contract execution (#414): its status
-	// (applied/skipped/failed), elapsed time, exit code, and the filtered
-	// environment-delta key names — never values.
+	// (applied/skipped/failed), per-command elapsed times and exit codes,
+	// the environment-delta key COUNT — never values — and the validated
+	// mise diagnostics (executable path, version, data directory).
 	EventWorkspaceBootstrap = "workspace.bootstrap"
 	// EventExecutorStart reports an executor process invocation.
 	EventExecutorStart = "executor.start"
