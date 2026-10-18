@@ -649,7 +649,9 @@ The invariants the mechanism must hold:
    claimed to be a recoverable patch.
 5. Capture is best-effort and bounded; it never changes an ending's phase,
    exit code, or lifecycle report, and never delays termination beyond its
-   20-second operation deadline inside the 45-second grace.
+   20-second operation deadline plus the bounded child-kill waits — the
+   cancellation path's 10-second wait for the model's process group and the
+   capped git reads' 2-second `WaitDelay` — inside the 45-second grace.
 6. Evidence is per-incarnation and slot names are intake-derived; no capture
    — gated, clean, or stolen-token — can destroy another incarnation's
    evidence.
