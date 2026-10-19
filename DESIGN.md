@@ -1365,9 +1365,10 @@ the API server prunes it; reads drop it silently, which is exactly how a
 claims-only lane behaved before, so nothing regresses. Every requests/limits
 key is honoured, subject only to the CPU and memory request floor described
 below: extended-resource keys pass through to pods and ride normal Kubernetes
-scheduling and quota semantics, and since Kubernetes requires an extended
-resource's requests and limits to match, a key in one map without the other
-makes every pod on the lane invalid at admission. Limits are used exactly as
+scheduling and quota semantics, where Kubernetes defaults an extended
+resource's request to its limit: a key set in limits alone is valid and takes
+that request, a key set in both maps must carry equal quantities, and a key
+set in requests alone makes every pod on the lane invalid at admission. Limits are used exactly as
 written and may be omitted; requests keep whatever the lane configured, but CPU
 and memory requests are floored to Courier's built-in default (250m/512Mi
 requested, 2 CPU/4Gi limited) wherever they are absent or

@@ -23,9 +23,11 @@ const SuspendAnnotation = "courier.misospace.dev/suspend"
 // key under requests and limits is honoured, subject only to the CPU and
 // memory request floor described on the fields: extended-resource keys such
 // as nvidia.com/gpu pass through to the pod and use normal Kubernetes
-// scheduling and quota semantics, and since Kubernetes requires an extended
-// resource's requests and limits to match, a key in one map without the
-// other makes every pod on the lane invalid at admission.
+// scheduling and quota semantics, where Kubernetes defaults an extended
+// resource's request to its limit: a key set in limits alone is valid and
+// takes that request, a key set in both maps must carry equal quantities,
+// and a key set in requests alone makes every pod on the lane invalid at
+// admission.
 type PodResources struct {
 	// Requests are the resources each pod on this lane requests. CPU and
 	// memory requests are floored to the built-in default wherever absent or
