@@ -46,6 +46,7 @@ cmd/main.go            manager entrypoint
 internal/controller/   reconcilers
 config/rbac/           generated RBAC reference
 hack/                  codegen boilerplate
+.mise/                 pinned dev toolchain: config.toml + mise.lock (#416)
 ```
 
 `charts/courier/values.yaml` carries the chart's RBAC rules; when you change a
@@ -54,6 +55,15 @@ change in the chart's values.
 
 ## Build, test, generate
 
+- `hack/bootstrap.sh` — idempotent one-shot dev setup after a fresh checkout
+  (#416): pinned mise/Go/Helm, controller-gen, setup-envtest, and envtest
+  assets. Go and Helm versions live in `.mise/config.toml` + `.mise/mise.lock`
+  and controller-gen/setup-envtest versions in the `Makefile`; do not restate
+  them elsewhere.
+- `mise run check` — CI-equivalent verification (generated-code diff,
+gofmt, vet, build, image-gating scripts). `mise run test` —
+authoritative suite (`make test` with envtest assets). Reuse bootstrap
+environment in later commands with `mise exec -- <command>`.
 - `make build` — generate + fmt + vet + build the manager.
 - `make test` — generate + fmt + vet + `go test ./...`.
 - `make manifests generate` — regenerate CRDs, RBAC, and deepcopy after any
