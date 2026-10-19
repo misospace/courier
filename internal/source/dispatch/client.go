@@ -695,14 +695,17 @@ func classifyCapacityHandoff(err error) error {
 // the stale-handout reclaimer can tell a live attempt from a lost one and a
 // settled park leaves the hand-out fully accounted (#456). The call is
 // generation-pinned and idempotent server-side: a repeat ack is a success,
-// not an error. A refusal proves the hand-out state has already moved on —
-// the item is gone (404), the hand-out was never ours (403), or the
-// generation was re-issued, the item left QUEUED, or the hand-out released
-// (409 with a known moot reason) — so there is nothing outstanding for this
-// agent to acknowledge and the ack degrades to a no-op. An unknown 409
-// reason, transport failure, or server failure returns an error: the
-// hand-out stays in the reclaimable state the reclaimer exists for, and the
-// caller logs without blocking materialization.
+// not an error. Only the endpoint's known moot refusals prove the hand-out
+// state has already moved on and degrade to a no-op: 404 with the known
+// `pr-fix item not found` response (the item is gone), 403 with
+// `reason: "not-handed"` (the hand-out was never ours), or 409 with a known
+// moot reason (the generation was re-issued, the item left QUEUED, or the
+// hand-out released). Any other 403 or 404 — worker-scope or auth
+// rejections, a non-bearer auth mode, an older deployment, or a missing
+// route — is not proof the ledger moved on and returns an error, as does an
+// unknown 409 reason, a transport failure, or a server failure: the hand-out
+// stays in the reclaimable state the reclaimer exists for, and the caller
+// logs without blocking materialization.
 func (c *HTTPClient) AckHandout(ctx context.Context, item source.WorkItem) error {
 	d, err := decodeWorkID(item.ID)
 	if err != nil {
@@ -722,11 +725,23 @@ func (c *HTTPClient) AckHandout(ctx context.Context, item source.WorkItem) error
 	var apiErr *APIError
 	if errors.As(err, &apiErr) {
 		switch apiErr.StatusCode {
-		case http.StatusNotFound, http.StatusForbidden:
-			// The hand-out state has already moved on: item gone, or never
-			// handed to this agent. Nothing outstanding remains to
-			// acknowledge.
-			return nil
+		case http.StatusNotFound:
+			// Only the endpoint's known not-found response proves the item
+			// is gone; a route-level 404 (older deployment, missing route)
+			// is not ledger evidence and must surface.
+			if strings.Contains(strings.ToLower(apiErr.Message), "pr-fix item not found") {
+				return nil
+			}
+		case http.StatusForbidden:
+			// Only the known not-handed refusal proves the hand-out was
+			// never ours; a worker-scope, auth-mode, or other 403 is a
+			// configuration failure, not ledger evidence, and must surface.
+			var response struct {
+				Reason string `json:"reason"`
+			}
+			if json.Unmarshal([]byte(apiErr.Message), &response) == nil && response.Reason == "not-handed" {
+				return nil
+			}
 		case http.StatusConflict:
 			// Only the known moot refusals are no-ops; an unknown refusal
 			// reason must surface, never silently drop ledger evidence.

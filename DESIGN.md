@@ -1837,8 +1837,13 @@ safe to evaluate; a failed ack is logged, never fatal, because a lost
 ack must degrade to the reclaimable state the reclaimer exists for rather
 than block materialization. The ack is attempted at materialization with a
 bounded retry, and re-attempted whenever the source re-offers an item
-whose run already exists: the ack is idempotent and moot refusals are no-ops,
-so a repeat attempt is always safe, and a hand-out whose ack failed at
+whose run already exists: the ack is idempotent and only the endpoint's
+known moot refusals are no-ops — 404 with the known `pr-fix item not found`
+response, 403 with `reason: "not-handed"`, and 409 with a known moot
+reason — so a repeat attempt is always safe, while an unexpected 403 or 404
+(worker-scope or auth rejection, older deployment, missing route) is not
+ledger evidence and surfaces as an error like any other failure, and a
+hand-out whose ack failed at
 materialization is recovered on the next poll that still sees the item rather
 than waiting on the reclaimer. Acknowledgement is a second phase of the
 pass, never inline work: each offered item is queued and every item is
@@ -4436,18 +4441,23 @@ earns a 401 that is classified as a definite denial (superseded by #406: a
   acknowledges a stamped PR-fix hand-out with `POST /api/pr-fix-queue/ack`
   the moment the runner durably materializes the CoderRun that owns the
   attempt — the exact boundary dispatch#1212 named as the rollout gate for
-  the reclaimer sweep. The ack is generation-pinned and idempotent; refusal
-  statuses (item gone, generation moved, hand-out released or never ours)
-  degrade to settled no-ops because nothing outstanding remains, while
-  transport and server failures are logged without blocking materialization:
-  a lost ack degrades to the reclaimable state the reclaimer exists for, and
-  must never couple admission to ack availability. Review feedback showed a
-  lost ack could otherwise persist while the reclaimer stays disabled, so the
+  the reclaimer sweep. The ack is generation-pinned and idempotent; only the
+  endpoint's known moot refusals — 404 with the known `pr-fix item not found`
+  response, 403 with `reason: "not-handed"`, and 409 with a known moot
+  reason — degrade to settled no-ops because nothing outstanding remains,
+  while an unexpected 403 or 404 (worker-scope or auth rejection, older
+  deployment, missing route) is not ledger evidence and surfaces as an
+  error, as do transport and server failures, all logged without blocking
+  materialization: a lost ack degrades to the reclaimable state the
+  reclaimer exists for, and must never couple admission to ack
+  availability. Review feedback showed a lost ack could otherwise persist
+  while the reclaimer stays disabled, so the
   ack is not strictly fire-once: it is retried a bounded number of times
   within the materializing pass and re-attempted on any later poll that still
-  sees the item — the ack is idempotent and moot refusals are no-ops, so a
-  repeat attempt is always safe, and a re-offered item with an outstanding
-  hand-out heals on the next poll instead of starving head-of-line. That
+  sees the item — the ack is idempotent and only known moot refusals are
+  no-ops, so a repeat attempt is always safe, and a re-offered item with an
+  outstanding hand-out heals on the next poll instead of starving
+  head-of-line. That
   retry is a second phase of the pass, not inline work: review showed a
   Dispatch outage could cost each retained offer the full synchronous retry
   budget — three attempts against a 30s shared client timeout — before the

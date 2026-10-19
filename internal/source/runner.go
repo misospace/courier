@@ -370,8 +370,8 @@ func (r *Runner) Poll(ctx context.Context) error {
 			// The run already owns this attempt, but a hand-out whose ack
 			// failed at materialization stays outstanding — exclusions are
 			// hints, so the source can keep offering the item. Re-attempt
-			// the ack: it is idempotent and a moot refusal proves the
-			// ledger already moved on (#456).
+			// the ack: it is idempotent and a known moot refusal proves
+			// the ledger already moved on (#456).
 			pendingAcks = append(pendingAcks, item)
 			continue
 		}
@@ -469,8 +469,8 @@ func (r *Runner) drainHandoutAcks(ctx context.Context, pending []WorkItem) {
 
 // ackHandout acknowledges a stamped hand-out for a queue-backed attempt,
 // retrying a failure a bounded number of times within the pass before giving
-// up: the ack is idempotent and moot refusals collapse to no-ops in the
-// adapter, so a repeat attempt is always safe. A final failure is logged,
+// up: the ack is idempotent and known moot refusals collapse to no-ops in
+// the adapter, so a repeat attempt is always safe. A final failure is logged,
 // never fatal — the hand-out stays in the reclaimable state the
 // stale-handout reclaimer exists for, and terminal settlement reports
 // release it regardless (#456). Each attempt runs under its own deadline so a

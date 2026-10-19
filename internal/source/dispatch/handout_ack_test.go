@@ -55,23 +55,19 @@ func TestHTTPClientAckHandoutPostsGenerationPinnedReceipt(t *testing.T) {
 
 func TestHTTPClientAckHandoutTreatsMovedOnHandOutAsNoOp(t *testing.T) {
 	refusals := []struct {
-		code   int
-		reason string
+		code int
+		body string
 	}{
-		{http.StatusNotFound, ""},
-		{http.StatusForbidden, "not-handed"},
-		{http.StatusConflict, "generation-mismatch"},
-		{http.StatusConflict, "not-queued"},
-		{http.StatusConflict, "not-stamped"},
+		{http.StatusNotFound, `{"error":"pr-fix item not found"}`},
+		{http.StatusForbidden, `{"error":"pr-fix hand-out ack refused","reason":"not-handed"}`},
+		{http.StatusConflict, `{"error":"pr-fix hand-out ack refused","reason":"generation-mismatch"}`},
+		{http.StatusConflict, `{"error":"pr-fix hand-out ack refused","reason":"not-queued"}`},
+		{http.StatusConflict, `{"error":"pr-fix hand-out ack refused","reason":"not-stamped"}`},
 	}
 	for _, refusal := range refusals {
 		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			body := map[string]string{"error": "pr-fix hand-out ack refused"}
-			if refusal.reason != "" {
-				body["reason"] = refusal.reason
-			}
-			payload, _ := json.Marshal(body)
-			http.Error(w, string(payload), refusal.code)
+			w.Header().Set("Content-Type", "application/json")
+			http.Error(w, refusal.body, refusal.code)
 		}))
 		client, err := NewClient(server.URL, "worker", "token", time.Second)
 		if err != nil {
@@ -83,7 +79,44 @@ func TestHTTPClientAckHandoutTreatsMovedOnHandOutAsNoOp(t *testing.T) {
 			PRFixItem:   &PRFixItem{ID: "fix-42", Generation: 3, HandoutToken: "handout-3"},
 		})
 		if err := client.AckHandout(context.Background(), source.WorkItem{ID: id}); err != nil {
-			t.Fatalf("status %d/%s: AckHandout = %v, want settled no-op", refusal.code, refusal.reason, err)
+			t.Fatalf("status %d body %s: AckHandout = %v, want settled no-op", refusal.code, refusal.body, err)
+		}
+		server.Close()
+	}
+}
+
+func TestHTTPClientAckHandoutPropagatesUnexpectedRefusals(t *testing.T) {
+	refusals := []struct {
+		code int
+		body string
+	}{
+		// Auth/scope failures are configuration problems, not proof the
+		// hand-out moved on.
+		{http.StatusForbidden, `{"error":"agent scope does not permit this endpoint"}`},
+		{http.StatusForbidden, `{"error":"unauthorized","reason":"invalid-auth-mode"}`},
+		{http.StatusForbidden, `{"error":"pr-fix hand-out ack refused"}`},
+		// A 404 from a missing route or older deployment is not ledger
+		// evidence.
+		{http.StatusNotFound, `{"error":"Cannot POST /api/pr-fix-queue/ack"}`},
+		{http.StatusNotFound, `{"error":"not found"}`},
+		{http.StatusNotFound, `{"error":"pr-fix hand-out ack refused"}`},
+		{http.StatusNotFound, "route not found"},
+	}
+	for _, refusal := range refusals {
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			http.Error(w, refusal.body, refusal.code)
+		}))
+		client, err := NewClient(server.URL, "worker", "token", time.Second)
+		if err != nil {
+			t.Fatal(err)
+		}
+		id := EncodeWorkID(Task{
+			Type:        "followup-pr",
+			PullRequest: &PullRequest{Repo: "acme/widgets", Number: 42},
+			PRFixItem:   &PRFixItem{ID: "fix-42", Generation: 3, HandoutToken: "handout-3"},
+		})
+		if err := client.AckHandout(context.Background(), source.WorkItem{ID: id}); err == nil {
+			t.Fatalf("status %d body %s: AckHandout = nil, want error", refusal.code, refusal.body)
 		}
 		server.Close()
 	}
