@@ -130,6 +130,8 @@ func (e *APIError) Error() string {
 	return fmt.Sprintf("Dispatch API returned HTTP %d: %s", e.StatusCode, e.Message)
 }
 
+var _ source.HandoutAcker = (*HTTPClient)(nil)
+
 // HTTPClient implements the Dispatch HTTP API behind the source adapter.
 type HTTPClient struct {
 	baseURL                  *url.URL
