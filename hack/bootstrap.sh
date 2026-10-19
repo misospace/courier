@@ -183,15 +183,19 @@ if [ -z "${MISE_INSTALL_DIR:-}" ] && [ -z "${HOME:-}" ]; then
 	fail "HOME is unset; set MISE_INSTALL_DIR to a writable directory for the user-scoped mise install"
 fi
 MISE_BIN=${MISE_INSTALL_DIR:-$HOME/.local/bin}/mise
+replace_mise=
 if [ -x "$MISE_BIN" ] && ! mise_is_pinned "$MISE_BIN"; then
 	log "mise at ${MISE_BIN} does not match the pinned launcher digest; reinstalling"
-	rm -f "$MISE_BIN"
+	replace_mise=1
 fi
-if [ ! -x "$MISE_BIN" ]; then
+# A mismatched launcher is never removed up front: the staged download below
+# replaces it atomically only after the pinned asset verifies, so a host with
+# no downloader keeps its existing mise instead of losing it on a failed run.
+if [ ! -x "$MISE_BIN" ] || [ "$replace_mise" = 1 ]; then
 	resolve_mise_digest
 
 	tmp=$(mktemp -d)
-	trap 'rm -rf "$tmp"' EXIT
+	trap 'rm -rf "$tmp" "$MISE_BIN".tmp.$$' EXIT
 	url="https://github.com/jdx/mise/releases/download/${MISE_VERSION}/${mise_asset}"
 	log "installing pinned mise ${MISE_VERSION} (${mise_asset})"
 	if command -v curl >/dev/null 2>&1; then
