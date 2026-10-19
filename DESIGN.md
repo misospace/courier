@@ -1405,11 +1405,19 @@ the control, worker, and broker pods, and the probe pod too on the passes that
 create probes live, so no pass creates a spec it has not proved. The secure
 workload creates behind that proof return ordinary errors and rely on it; the two
 creates a dry run cannot stand in for — the live probe create and the legacy
-coordinator's own create — classify an `Invalid` where it happens. That class
-alone, `PodAdmission`, terminalizes: the reconciler ends the run `NeedsHuman`
+coordinator's own create — classify an `Invalid` where it happens. That class,
+`PodAdmission`, terminalizes: the reconciler ends the run `NeedsHuman`
 from both `LaunchSecure` call sites, recording `SecurePreflightFailed`, and from
 the legacy launcher, which carries the cause in the run's terminal diagnostic
-instead. Every other preflight verdict keeps the claim/release requeue, because
+instead. One more verdict terminalizes: `ProbeIdentity` — the pod a node's
+probe name resolves to is pinned to another node, so whatever it observed is
+not evidence about the node under test. Its persistent causes — a 32-bit
+digest collision in the probe tag, which re-pins the one shared pod to the
+last node probed on every pass, or a foreign pod holding the name — outlast a
+requeue, and the read cannot tell them from a stray pod a later pass's
+delete-and-create would clear, so the run stops and names the probe and both
+nodes rather than cycling probe phases indefinitely.
+Every other preflight verdict keeps the claim/release requeue, because
 each of them clears on a later pass — a live probe can outrun the dataplane
 programming of the NetworkPolicy the same reconcile just wrote, and an access
 review can read an informer cache that has not yet caught up with a Role created
