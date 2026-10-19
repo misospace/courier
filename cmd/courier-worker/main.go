@@ -64,6 +64,16 @@ func runArgs(args []string) error {
 		return err
 	}
 
+	// The worker is PID 1 of its pod, so it adopts every orphaned descendant
+	// its tasks leave behind; arming makes it collect the zombies those
+	// adoptions produce and keeps adoption true for any shape where it is
+	// not PID 1 (#399). Arming is logged, never fatal: a worker that cannot
+	// reap only accumulates zombies, and restarting it over that would trade
+	// a slow leak for an outage.
+	if err := protocol.ArmAdoptedChildReaper(); err != nil {
+		log.Printf("courier-worker: %v", err)
+	}
+
 	server := &http.Server{
 		Addr:              ":" + addr,
 		Handler:           worker.Handler(),

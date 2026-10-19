@@ -1097,8 +1097,11 @@ func (c *Coordinator) verifiedResult(ctx context.Context, opID string, state pro
 		// The worker reported work that outlived the task, so its terminal
 		// observation is not a verified termination: the entry is retained
 		// and the result is returned as an error, never as a cleared,
-		// suppressible operation (#372).
-		return *state.Result, fmt.Errorf("operation %s ended as %s with %d processes still live in its task tree", opID, state.Status, state.Result.LiveDescendants)
+		// suppressible operation (#372). The count is a pod-level floor —
+		// the worker's sweep reports every unaccounted live process, which
+		// can include another operation's adopted escapee (#399) — so the
+		// wording stays at the pod, not the task tree.
+		return *state.Result, fmt.Errorf("operation %s ended as %s with %d live processes still unaccounted for in the worker pod", opID, state.Status, state.Result.LiveDescendants)
 	}
 	c.closeOperation(ctx, opID, state.Status == protocol.ResultCompleted)
 	return *state.Result, nil

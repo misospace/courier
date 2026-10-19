@@ -38,6 +38,14 @@ func testConfig(t *testing.T) (WorkerConfig, ed25519.PublicKey, ed25519.PrivateK
 
 func newTestWorker(t *testing.T) (*Worker, ed25519.PrivateKey, *httptest.Server) {
 	t.Helper()
+	// Arming here is safe in this package's test binary: every process it
+	// spawns is either a task leader the containment funnel registered or a
+	// helper child the test registered itself, so the reaper can never take
+	// a status os/exec owns. Production arms in cmd/courier-worker instead,
+	// because prctl and SIGCHLD handling are process-global.
+	if err := ArmAdoptedChildReaper(); err != nil {
+		t.Logf("adopted-child reaper not armed: %v", err)
+	}
 	config, _, priv := testConfig(t)
 	worker, err := NewWorker(config)
 	if err != nil {
@@ -404,13 +412,15 @@ func TestWorkerCancelTerminatesTaskDescendants(t *testing.T) {
 	}
 }
 
-// TestWorkerCancelRefusesUnprovenTermination pins the other half of the
-// contract: work that escaped the task's process group cannot be proven gone,
-// so the worker must report the cancellation as unverified instead of
-// acknowledging it (#372).
-func TestWorkerCancelRefusesUnprovenTermination(t *testing.T) {
+// TestWorkerCancelTerminatesSetsidEscapee pins the containment contract of
+// #399: a descendant that made a session of its own and redirected its own
+// output is invisible to the group signal (#372) and invisible to the
+// descriptor proof (#372) — only adoption can stop it. Once the cancellation
+// is acknowledged, the escapee must be gone and must have written its last
+// line before, never after, the acknowledgement.
+func TestWorkerCancelTerminatesSetsidEscapee(t *testing.T) {
 	if runtime.GOOS != "linux" {
-		t.Skip("task-tree assertions read process groups and /proc")
+		t.Skip("escapee assertions read sessions and /proc")
 	}
 	if _, err := exec.LookPath("setsid"); err != nil {
 		t.Skip("setsid is required to leave the task's process group")
@@ -419,14 +429,14 @@ func TestWorkerCancelRefusesUnprovenTermination(t *testing.T) {
 	client := &Client{BaseURL: server.URL}
 	ctx := context.Background()
 
-	// The escapee starts its own session, so the group signal never reaches
-	// it — but it inherits the task's output descriptors, which is what
-	// proves it is still there. It reports its own pid from inside that
-	// session, so the cancellation can never race the moment setsid moves
-	// it out of the task's group: a pid read from the background job would
-	// still be in the group, and the group signal would legitimately kill
-	// it before the test ever asked the worker to refuse anything.
-	task, _ := json.Marshal(Task{Command: []string{"sh", "-c", `setsid sh -c 'echo $$ > escaped.txt; exec sleep 300' & wait`}})
+	// The escapee reports its own pid from inside that session, so the
+	// cancellation can never race the moment setsid moves it out of the
+	// task's group: a pid read from the background job would still be in the
+	// group, and the group signal would legitimately kill it before the test
+	// ever measured containment. Its output is redirected away from the
+	// task's descriptors and into the workspace on a timer, which is exactly
+	// the mutation an acknowledged cancellation must have ended.
+	task, _ := json.Marshal(Task{Command: []string{"sh", "-c", `setsid sh -c 'echo $$ > escaped.txt; while :; do echo late >> late.txt; sleep 0.2; done' >/dev/null 2>&1 & wait`}})
 	env := dispatchEnvelope(worker.clock())
 	env.PayloadDigest = PayloadDigestOf(task)
 	if _, err := client.Dispatch(ctx, priv, env, task); err != nil {
@@ -437,10 +447,8 @@ func TestWorkerCancelRefusesUnprovenTermination(t *testing.T) {
 		t.Fatalf("escapee %d was gone before cancellation", escapee)
 	}
 	// Read the escapee's own session from the kernel: a process still in the
-	// task's session was never out of reach of the group signal, so a
-	// cancellation below would legitimately kill it and the refusal under
-	// test would be measuring nothing. The task inherits this process's
-	// session because the worker gives it a process group, not a session.
+	// task's session was never out of reach of the group signal, so the
+	// containment below would be measuring nothing.
 	workerSession, ok := processSession(os.Getpid())
 	if !ok {
 		t.Fatal("could not read this test's own session")
@@ -452,26 +460,54 @@ func TestWorkerCancelRefusesUnprovenTermination(t *testing.T) {
 	if escapeeSession == workerSession {
 		t.Fatalf("escapee %d never left the task's session (%d)", escapee, escapeeSession)
 	}
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		if data, err := os.ReadFile(filepath.Join(worker.config.WorkspaceDir, "late.txt")); err == nil && len(data) > 0 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("escapee never wrote into the workspace")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
 
 	cancelEnv := env
 	cancelEnv.Kind = KindCancel
 	cancelEnv.Sequence = 1
 	cancelEnv.PayloadDigest = CancelPayloadDigest
 	cancelEnv.Nonce = "cancel-nonce-value-0001"
+	started := time.Now()
 	status, err := client.Cancel(ctx, priv, cancelEnv)
-	if err == nil {
-		t.Fatalf("cancellation was acknowledged with status %q while a task process outlived it", status)
+	if err != nil || status != ResultCancelled {
+		t.Fatalf("Cancel = %q, %v", status, err)
 	}
-	var transportErr *TransportError
-	if !errors.As(err, &transportErr) || transportErr.StatusCode != http.StatusInternalServerError {
-		t.Fatalf("Cancel error = %v, want an unverified-termination rejection", err)
+	if elapsed := time.Since(started); elapsed > 20*time.Second {
+		t.Fatalf("cancellation was not bounded: %s", elapsed)
 	}
 	state, err := client.Result(ctx, "op-1")
-	if err != nil || state.Result == nil || state.Result.LiveDescendants == 0 {
-		t.Fatalf("unverified cancellation must still report the live tree: %+v, %v", state, err)
+	if err != nil || state.Result == nil || state.Result.Status != ResultCancelled {
+		t.Fatalf("cancelled result = %+v, %v", state.Result, err)
 	}
-	if !descendantLive(escapee) {
-		t.Fatalf("escapee %d is gone, so the refusal was not about surviving work", escapee)
+	if state.Result.LiveDescendants != 0 {
+		t.Fatalf("cancellation acknowledged while %d descendants were live", state.Result.LiveDescendants)
+	}
+	if descendantLive(escapee) {
+		t.Fatalf("escapee %d outlived acknowledged cancellation", escapee)
+	}
+	// The escapee is dead and reaped by the time the cancellation was
+	// acknowledged, so the workspace it was writing must have stopped
+	// growing: whatever it wrote before the acknowledgement is all there is.
+	after, err := os.ReadFile(filepath.Join(worker.config.WorkspaceDir, "late.txt"))
+	if err != nil {
+		t.Fatalf("read late.txt after cancellation: %v", err)
+	}
+	time.Sleep(1500 * time.Millisecond)
+	final, err := os.ReadFile(filepath.Join(worker.config.WorkspaceDir, "late.txt"))
+	if err != nil {
+		t.Fatalf("read late.txt after the quiet window: %v", err)
+	}
+	if len(final) != len(after) {
+		t.Fatalf("escapee wrote %d bytes into the workspace after acknowledged cancellation", len(final)-len(after))
 	}
 }
 
@@ -1217,6 +1253,14 @@ func TestWorkerReleaseConsumesResultPayload(t *testing.T) {
 			t.Fatalf("Dispatch: %v", err)
 		}
 		waitForDescendantPID(t, filepath.Join(worker.config.WorkspaceDir, "released-escaped.txt"))
+		// The escapee is containable now (#399): the sweep would kill it and
+		// verify the stop. Blinding the sweep's enumeration is what keeps
+		// this subtest measuring the refusal contract: without a process
+		// listing the worker cannot prove anything about the escapee and
+		// must refuse rather than acknowledge.
+		hook := func() error { return errors.New("enumeration unavailable") }
+		processEnumerationHook.Store(&hook)
+		defer processEnumerationHook.Store(nil)
 		cancelEnv := unverifiedEnv
 		cancelEnv.Kind = KindCancel
 		cancelEnv.Sequence = 1

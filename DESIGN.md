@@ -276,6 +276,58 @@ implied away: an orphan that made a group or session of its own (`setsid`, a
 detached spawn), and the git, ssh and askpass descendants a killed run orphans
 into the executor's own group.
 
+### Worker task containment beyond the process group (#399)
+
+The native worker's tasks run `sh -c ...` in a process group of their own, and
+cancellation kills and proves that group (#372). Two process shapes sit
+outside any group contract, and the worker closes both without granting the
+untrusted pod a single privilege it does not already have — no PID namespace,
+no cgroup, no capability: the worker pod's security context (all capabilities
+dropped, RuntimeDefault seccomp, non-root) is unchanged.
+
+The first shape is the escapee. A descendant that makes a session of its own
+(`setsid`, a daemonising tool) leaves the group, and no group signal reaches
+it. The worker is PID 1 of its pod, so the kernel hands it every orphaned
+descendant its tasks leave behind; the subreaper flag keeps that true for any
+shape where it is not PID 1. At every grouped task's termination — cancelled
+and completed alike — the worker sweeps its adopted trees: it enumerates the
+pod's processes, kills every live process it has adopted regardless of the
+group or session it moved to, and reaps what it killed. A completed task's
+escapee is swept too, deliberately: a daemon a successful task left behind is
+still untrusted work mutating the workspace, and control would otherwise
+clear its suppression on a completion the worker never proved. The sweep's
+count is a pod-level floor, so the sharp edge is real and deliberate: a task
+can be reported unverified — even a successfully completed one — because of
+an unrelated concurrent operation's adopted escapee. That is the containment
+policy, not a false positive to fix; the worker cannot attribute a reparented
+process to its task, so it refuses to promise anything less than a clean pod.
+
+The termination claim stays honest in both directions. What survives the bound
+keeps the result unverified — `LiveDescendants > 0`, retained, exactly #372's
+refusal contract — and a clean sweep is itself the proof that every writer of
+the task's output closed: an escapee that redirected its own output no longer
+forces the unverified verdict #372 had to report, because nothing live is
+left in the pod but the worker and the trees of the still-registered tasks.
+The bounds compose: the descriptor grace (5s), the group proof (5s) and the
+sweep (5s) worst-case stack to 15s per operation against the pod's 30s
+termination budget, which is why all three are ceilings on cleanup, never on
+a run's duration.
+
+The second shape is the zombie. PID 1 reaps nothing on its own, so every
+cancelled or daemonised descendant that dies would pile up as a zombie for the
+pod's lifetime. The worker runs an adopted-child reaper in the same shape as
+the legacy executor's (#347): a SIGCHLD-driven pass that collects zombie
+children, never signals, and never takes the exit status of a supervised task
+leader, whose pid is registered before its start is released and released only
+after its Wait. The sweep reaps what it kills on the same passes, so a
+cancellation converges without waiting on the signal-driven drain.
+
+One ambiguity is stated rather than hidden: a process whose intermediate
+ancestor died while its task still runs is reparented past the live task —
+the kernel offers nothing else — and is therefore indistinguishable from a
+dead task's escapee. The sweep kills it too. Containment of untrusted
+processes wins over a descendant whose supervisor is already gone.
+
 ## Capacity exhaustion and cross-worker recovery (#327)
 
 A structured `capacity_exhausted` outcome is distinct from task failure, an
@@ -4399,3 +4451,24 @@ earns a 401 that is classified as a definite denial (superseded by #406: a
   tests: `TestReadCappedRejectsNonRegular` and `TestCaptureFifoSwapRace`, both
   asserting non-blocking with a deadline guard so losing `O_NONBLOCK` fails
   rather than hangs the suite. (#336, #389; composes with #237, #390)
+- **2026-10-19 — #399: worker task containment is enumeration-based, not
+  namespace-based.** A per-task PID namespace (`CLONE_NEWPID`) or a per-task
+  cgroup would end the escapee class in the kernel, but both need privileges
+  the untrusted worker pod must never hold: `CAP_SYS_ADMIN` for the clone or
+  cgroup delegation, which against an untrusted sandbox means weakening the
+  exact boundary the worker exists to keep. The worker instead adopts its
+  escapees — it is PID 1 of its pod, with the subreaper flag covering any
+  other shape — and at every grouped task's termination (completed tasks
+  included, so a successful task cannot leave untrusted work behind that
+  control would clear suppression on) sweeps the adopted trees: kill,
+  collect, and prove the pod holds nothing live but itself and the
+  still-registered tasks' trees, bounded, with anything unproven still
+  reporting `LiveDescendants > 0` exactly as #372 required — which also
+  supersedes #372's descriptor-holder special case, the container-wide proof
+  being strictly stronger for that class. A SIGCHLD-driven
+  adopted-child reaper (the #347 shape) collects the zombies PID 1 would
+  otherwise accumulate. The worker pod's spec is deliberately unchanged: all
+  capabilities dropped, RuntimeDefault seccomp, non-root. The residual
+  ambiguity — a live task's orphaned grandchild is indistinguishable from a
+  dead task's escapee — is accepted and documented: containment of untrusted
+  processes wins over a descendant whose supervisor is already gone.

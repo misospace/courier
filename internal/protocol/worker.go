@@ -15,7 +15,6 @@ import (
 	"strconv"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"syscall"
 	"time"
 )
@@ -78,11 +77,16 @@ type Result struct {
 	// task declared an artifact path and the file exists within the bound.
 	Artifact []byte `json:"artifact,omitempty"`
 	// LiveDescendants reports work that outlived the task it belonged to:
-	// processes still alive in the task's process group, or a holder of the
-	// task's output descriptors that survived the group entirely. Zero is a
-	// verified stop — nothing of the task was left running before anything
-	// was acknowledged. A nonzero value means termination could not be
-	// proven, so control must treat the operation as unverified (#372).
+	// processes still alive in the task's process group, or adopted escapees
+	// — descendants that left the group for a session of their own — still
+	// alive after the worker's sweep, or a holder of the task's output
+	// descriptors that survived both. The count is a pod-level floor: the
+	// sweep reports every unaccounted live process in the pod, so it can
+	// include another operation's adopted escapee rather than this task's
+	// own descendants. Zero is a verified stop — nothing of the task was
+	// left running before anything was acknowledged. A nonzero value means
+	// termination could not be proven, so control must treat the operation
+	// as unverified (#372, #399).
 	LiveDescendants int `json:"liveDescendants,omitempty"`
 }
 
@@ -287,24 +291,18 @@ func (w *Worker) handleDispatch(wr http.ResponseWriter, r *http.Request) {
 	}
 	// The cancellable context is created before the operation becomes visible
 	// in the map, so a cancellation racing this dispatch can never observe a
-	// nil cancel function.
+	// nil cancel function. The task's own process group dies from the
+	// cancellation signal; anything outside it is the sweep's business, not
+	// the wait's (#399).
 	ctx, cancel := context.WithCancel(context.WithoutCancel(r.Context()))
-	// The cancellation time bounds the wait that follows it: the task's own
-	// process group dies from the cancellation signal, so a wait that outlasts
-	// the grace means something outside that group still held the task's
-	// output (#372).
-	var cancelledAt atomic.Int64
 	op := &operation{envelope: envelope, wait: make(chan struct{})}
-	op.cancel = func() {
-		cancelledAt.CompareAndSwap(0, time.Now().UnixNano())
-		cancel()
-	}
+	op.cancel = cancel
 	w.ops[envelope.OpID] = op
 	w.mu.Unlock()
 
 	go func() {
 		defer close(op.wait)
-		result := w.runTask(ctx, task, &cancelledAt)
+		result := w.runTask(ctx, task)
 		w.mu.Lock()
 		op.result = result
 		w.mu.Unlock()
@@ -312,7 +310,7 @@ func (w *Worker) handleDispatch(wr http.ResponseWriter, r *http.Request) {
 	w.respondStatus(wr, envelope.OpID, http.StatusAccepted)
 }
 
-func (w *Worker) runTask(ctx context.Context, task Task, cancelledAt *atomic.Int64) *Result {
+func (w *Worker) runTask(ctx context.Context, task Task) *Result {
 	stdout := newTailBuffer(maxResultStreamBytes, resultTailBytes)
 	stderr := newTailBuffer(maxResultStreamBytes, resultTailBytes)
 	cmd := exec.CommandContext(ctx, task.Command[0], task.Command[1:]...)
@@ -332,34 +330,27 @@ func (w *Worker) runTask(ctx context.Context, task Task, cancelledAt *atomic.Int
 	cmd.WaitDelay = taskTerminationGrace
 	// The worker container carries no secrets; the child inherits the pod's
 	// environment. Git hardening belongs to trusted integration, not to the
-	// untrusted sandbox.
-	startErr := cmd.Start()
+	// untrusted sandbox. The child goes through the containment funnel: its
+	// pid is registered before the start is released, so no adoption pass
+	// can reap it out from under the Wait that owes it a status (#399).
+	startErr := containment.startTaskChild(cmd)
+	taskPID := 0
+	if startErr == nil {
+		taskPID = cmd.Process.Pid
+		defer containment.releaseTaskChild(taskPID)
+	}
 	// A task that does not lead its own process group cannot have its
 	// descendants terminated at all, so a worker that reported such a task
 	// as stopped would be claiming a termination it never proved.
-	grouped := startErr == nil && leadsOwnProcessGroup(cmd.Process.Pid)
+	grouped := startErr == nil && leadsOwnProcessGroup(taskPID)
 	if startErr == nil && !grouped {
 		_ = cmd.Process.Kill()
 		_ = cmd.Wait()
 		startErr = errNoProcessGroup
 	}
 	exitCode := -1
-	unaccountedWriter := false
 	if grouped {
 		waitErr := cmd.Wait()
-		// A wait that ended on the grace bound rather than on task exit
-		// means a descendant still holds the task's output descriptors: work
-		// outlived the task even when the task itself succeeded.
-		unaccountedWriter = errors.Is(waitErr, exec.ErrWaitDelay)
-		if !unaccountedWriter && ctx.Err() != nil {
-			// Wait only ever outlasts the grace because something outside
-			// the task's group held its output open — the group signal
-			// cannot be waiting on anything. A wait that returned sooner is
-			// proof that every writer closed.
-			if stamp := cancelledAt.Load(); stamp > 0 && !time.Now().Before(time.Unix(0, stamp).Add(taskTerminationGrace)) {
-				unaccountedWriter = true
-			}
-		}
 		if ctx.Err() == nil {
 			var exitErr *exec.ExitError
 			switch {
@@ -389,15 +380,27 @@ func (w *Worker) runTask(ctx context.Context, task Task, cancelledAt *atomic.Int
 	if errors.Is(startErr, errNoProcessGroup) {
 		result.StderrTail = strings.TrimSpace(result.StderrTail + "\n" + errNoProcessGroup.Error())
 	}
-	if grouped && (status == ResultCancelled || unaccountedWriter) {
+	if grouped {
 		// Nothing of the task is acknowledged as stopped until its process
 		// group is empty; anything left behind is reported rather than
-		// counted as verified termination.
+		// counted as verified termination (#372).
 		result.LiveDescendants = awaitProcessGroupEmpty(cmd.Process.Pid)
-		if unaccountedWriter && result.LiveDescendants == 0 {
-			// The group is empty, yet a writer kept the task's descriptors
-			// past the grace: an unaccounted holder is not a proven stop.
-			result.LiveDescendants = 1
+		// A descendant that left the group — a setsid, a daemonising tool —
+		// is beyond every group signal, but once its ancestors are gone the
+		// worker has adopted it. The sweep runs at every grouped task's
+		// termination, completed ones included: a daemon a successful task
+		// left behind is still untrusted work mutating the workspace, and
+		// control would otherwise clear its suppression on a completion the
+		// worker never proved (#399). The sweep terminates the adopted trees
+		// and proves the pod holds nothing live but this worker and the
+		// trees of the tasks still registered.
+		survivors, sweepErr := containment.sweepAdoptedTrees(time.Now().Add(taskTreeVerifyBound))
+		if sweepErr != nil {
+			// Without a process listing nothing about the escapees can be
+			// proven, and an unproven stop must never read as verified.
+			result.LiveDescendants++
+		} else {
+			result.LiveDescendants += survivors
 		}
 	}
 	if task.ArtifactPath != "" && status == ResultCompleted {
@@ -419,7 +422,7 @@ var errNoProcessGroup = errors.New("task process group was not established")
 // leadsOwnProcessGroup reports whether pid leads its own process group, which
 // is what makes a group signal reach the task's descendants.
 func leadsOwnProcessGroup(pid int) bool {
-	_, group, ok := processStat(pid)
+	_, _, group, ok := processStat(pid)
 	return ok && group == pid
 }
 
@@ -447,7 +450,7 @@ func awaitProcessGroupEmpty(pgid int) int {
 		// A recycled pid answers for whatever now owns it: if the old group
 		// leader's entry reports a different group, nothing of the task's
 		// tree can be left in this one.
-		if _, group, ok := processStat(pgid); ok && group != pgid {
+		if _, _, group, ok := processStat(pgid); ok && group != pgid {
 			return 0
 		}
 		_ = signalProcessGroup(pgid, syscall.SIGKILL)
@@ -487,7 +490,7 @@ func liveGroupMembers(pgid int) ([]int, error) {
 		if convErr != nil {
 			continue
 		}
-		state, group, ok := processStat(pid)
+		state, _, group, ok := processStat(pid)
 		if !ok || group != pgid {
 			continue
 		}
@@ -498,28 +501,34 @@ func liveGroupMembers(pgid int) ([]int, error) {
 	return live, nil
 }
 
-// processStat reads one process's run state and process group. The comm field
-// is parenthesized and may contain spaces, so parsing starts after its closing
-// parenthesis: what follows is state, parent, then process group.
-func processStat(pid int) (state string, pgid int, ok bool) {
+// processStat reads one process's run state, parent, and process group. The
+// comm field is parenthesized and may contain spaces, so parsing starts after
+// its closing parenthesis: what follows is state, parent, then process group.
+// The parent is what lets a sweep attribute an orphaned descendant after the
+// kernel reparented it (#399).
+func processStat(pid int) (state string, ppid int, pgid int, ok bool) {
 	data, err := os.ReadFile("/proc/" + strconv.Itoa(pid) + "/stat")
 	if err != nil {
-		return "", 0, false
+		return "", 0, 0, false
 	}
 	stat := string(data)
 	end := strings.LastIndex(stat, ")")
 	if end < 0 {
-		return "", 0, false
+		return "", 0, 0, false
 	}
 	fields := strings.Fields(stat[end+1:])
 	if len(fields) < 3 {
-		return "", 0, false
+		return "", 0, 0, false
+	}
+	parent, err := strconv.Atoi(fields[1])
+	if err != nil {
+		return "", 0, 0, false
 	}
 	group, err := strconv.Atoi(fields[2])
 	if err != nil {
-		return "", 0, false
+		return "", 0, 0, false
 	}
-	return fields[0], group, true
+	return fields[0], parent, group, true
 }
 
 // artifactReadHook, when non-nil, runs between artifact validation and the
