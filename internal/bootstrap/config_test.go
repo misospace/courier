@@ -372,3 +372,118 @@ func TestLoadFile(t *testing.T) {
 		t.Fatalf("profiles = %#v", profiles)
 	}
 }
+
+func TestParseAcceptsContextPolicy(t *testing.T) {
+	data := []byte(`profiles:
+  - name: local
+    roles:
+      coder: gpt-5
+    context:
+      outputReservation: 8192
+      roles:
+        coder:
+          maxInputTokens: 200000
+          compactAtPercent: 60
+          outputReservation: 24576
+        reviewer:
+          maxInputTokens: 100000
+`)
+	profiles, err := Parse(data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := profiles[0].Context
+	if ctx == nil {
+		t.Fatal("context is nil, want the declared policy")
+	}
+	if ctx.CompactAtPercent != 75 {
+		t.Fatalf("policy compactAtPercent = %d, want the CRD default 75 mirrored", ctx.CompactAtPercent)
+	}
+	if ctx.OutputReservation != 8192 {
+		t.Fatalf("policy outputReservation = %d, want 8192", ctx.OutputReservation)
+	}
+	coder := ctx.Roles["coder"]
+	if coder.MaxInputTokens != 200000 || coder.CompactAtPercent != 60 || coder.OutputReservation != 24576 {
+		t.Fatalf("coder budget = %#v, want the declared ceiling and overrides", coder)
+	}
+	reviewer := ctx.Roles["reviewer"]
+	if reviewer.MaxInputTokens != 100000 || reviewer.CompactAtPercent != 0 || reviewer.OutputReservation != 0 {
+		t.Fatalf("reviewer budget = %#v, want the ceiling with unset fields left to inherit the lane policy", reviewer)
+	}
+}
+
+func TestParseContextDefaultsWhenOmitted(t *testing.T) {
+	data := []byte(`profiles:
+  - name: local
+    roles:
+      coder: gpt-5
+    context: {}
+`)
+	profiles, err := Parse(data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := profiles[0].Context
+	if ctx == nil {
+		t.Fatal("context is nil, want the declared empty policy")
+	}
+	if ctx.CompactAtPercent != 75 {
+		t.Fatalf("policy compactAtPercent = %d, want the CRD default 75 mirrored", ctx.CompactAtPercent)
+	}
+	if ctx.OutputReservation != 0 || len(ctx.Roles) != 0 {
+		t.Fatalf("policy = %#v, want zero reservation and no role entries", ctx)
+	}
+}
+
+func TestParseContextAbsent(t *testing.T) {
+	data := []byte(`profiles:
+  - name: local
+    roles:
+      coder: gpt-5
+`)
+	profiles, err := Parse(data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if profiles[0].Context != nil {
+		t.Fatalf("context = %#v, want nil when the config declares none", profiles[0].Context)
+	}
+}
+
+func TestParseRejectsUnknownContextKeys(t *testing.T) {
+	for _, data := range [][]byte{
+		[]byte("profiles:\n  - name: local\n    roles:\n      coder: gpt-5\n    context:\n      compactAtPct: 60\n"),
+		[]byte("profiles:\n  - name: local\n    roles:\n      coder: gpt-5\n    context:\n      roles:\n        coder:\n          maxTokens: 1000\n"),
+	} {
+		if _, err := Parse(data); err == nil || !strings.Contains(err.Error(), "unknown field") {
+			t.Fatalf("error = %v, want unknown context key rejected", err)
+		}
+	}
+}
+
+func TestParseRejectsContextPercentOutOfRange(t *testing.T) {
+	for _, content := range []string{
+		"profiles:\n  - name: local\n    roles:\n      coder: gpt-5\n    context:\n      compactAtPercent: 100\n",
+		"profiles:\n  - name: local\n    roles:\n      coder: gpt-5\n    context:\n      compactAtPercent: -5\n",
+		"profiles:\n  - name: local\n    roles:\n      coder: gpt-5\n    context:\n      roles:\n        coder:\n          compactAtPercent: 100\n",
+		"profiles:\n  - name: local\n    roles:\n      coder: gpt-5\n    context:\n      roles:\n        coder:\n          compactAtPercent: -1\n",
+	} {
+		_, err := Parse([]byte(content))
+		if err == nil || !strings.Contains(err.Error(), "compactAtPercent") {
+			t.Fatalf("error = %v, want out-of-range compactAtPercent rejected: %s", err, content)
+		}
+	}
+}
+
+func TestParseRejectsNegativeContextReservations(t *testing.T) {
+	for _, content := range []string{
+		"profiles:\n  - name: local\n    roles:\n      coder: gpt-5\n    context:\n      outputReservation: -1\n",
+		"profiles:\n  - name: local\n    roles:\n      coder: gpt-5\n    context:\n      roles:\n        coder:\n          outputReservation: -1\n",
+		"profiles:\n  - name: local\n    roles:\n      coder: gpt-5\n    context:\n      roles:\n        coder:\n          maxInputTokens: -1\n",
+	} {
+		_, err := Parse([]byte(content))
+		if err == nil || !strings.Contains(err.Error(), "negative") {
+			t.Fatalf("error = %v, want negative context value rejected: %s", err, content)
+		}
+	}
+}

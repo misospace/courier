@@ -67,20 +67,11 @@ OpenAI-compatible HTTP API, so no Python SDK is needed anywhere.
 
 ## Design principles that constrain code review
 
-These are not style preferences; a change that violates them is wrong.
-
-- **Inform, don't constrain.** Do not add hard caps, gates, or governors on
-  model behavior. Bound *stuck* (liveness), never *duration* (no wall-clock
-  timeouts on runs). Prompts are goals plus tools, not paragraphs of scaffolding.
-- **The world is the source of truth.** Never trust internal/checkpoint state
-  over git, the PR, or CI. On resume, re-read the world and let it win on
-  conflict.
-- **Model- and source-agnostic.** Nothing in the core may hardcode a provider, a
-  model, a forge, or "local." Provider/hardware specifics belong in a
-  `LaneProfile`; source specifics belong in a source adapter.
-- **Thin harness.** Prefer git, the log stack, and Kubernetes primitives over new
-  machinery. Do not add a PVC where git + a CR-status checkpoint suffice.
-- **The coordinator can push and open PRs, never merge.** Merge is a human gate.
+The detailed review checklist lives in
+[.agents/skills/courier-architecture-review/SKILL.md](.agents/skills/courier-architecture-review/SKILL.md).
+Load it for controller, API/CRD, RBAC, Helm chart, coordinator lifecycle, or
+architecture changes. DESIGN.md remains the north star; update it in the same
+PR when a documented architectural decision or capability changes.
 
 ## Git and PR conventions
 

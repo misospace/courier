@@ -247,6 +247,35 @@ an untrusted isolated worker. Its contract and outstanding blockers are detailed
 in [HARNESS.md](./HARNESS.md); describing that target does not imply that its
 executor or worker isolation is implemented or production-ready.
 
+### Coordinator pod process lifetime
+
+The legacy pod runs the executor directly as PID 1 — the pod sets `Command`,
+and the coordinator image declares no entrypoint — so the kernel hands the
+executor every orphaned descendant its model child leaves behind (npm, node,
+esbuild, a `tail` that never exits), and PID 1 reaps none of them on its own.
+The executor therefore reaps: it asks to be a child subreaper, which is a no-op
+when it is already PID 1 and is what makes the same behaviour hold when it is
+not, then re-enumerates its own threads' children on every SIGCHLD and collects
+the dead ones. It only ever collects. A live orphan keeps running exactly as
+long as its dead parent left it running; the reaper never signals, kills, or
+touches a process group, and termination propagation is unchanged.
+
+Collecting never takes a status from a waiter. Every child the executor starts
+goes through one funnel that registers the pid before the start is released, so
+its exit status stays with `Wait`; and a descendant is collectable only when it
+sits in a process group a supervised child led. That last condition is what
+separates the model child's tool tree from the git children `internal/git` and
+the evidence capture start directly: the kernel makes an adopted orphan an
+ordinary child and offers nothing else to tell the two apart, so without it a
+drain pass would consume a real git status and silently change a run's ending.
+Both children the executor starts with their own group — the model child and
+the preflight `mcp list` probe — are therefore covered, and the groups are not
+removed once their children exit, because the orphans worth collecting only
+exist once they have. What that leaves uncollected is stated rather than
+implied away: an orphan that made a group or session of its own (`setsid`, a
+detached spawn), and the git, ssh and askpass descendants a killed run orphans
+into the executor's own group.
+
 ## Capacity exhaustion and cross-worker recovery (#327)
 
 A structured `capacity_exhausted` outcome is distinct from task failure, an
@@ -286,7 +315,7 @@ affirmative trusted safety proof; settle atomically applies it. Incomplete proof
 unsupported capability, or stale fencing retains ownership. Transient settlement
 errors are retried with the same run-scoped idempotency key after controller
 reconstruction. The fake contract exercises both resolve-issue and fix-PR paths,
-including preserved branch/PR metadata; Dispatch implements the interfaces via the merged #1259 receipt-fenced endpoints. Issue settlement is fenced by the issued claim token. If its POST response is lost or cannot be confirmed, the adapter makes one bounded best-effort lookup in the latest 100 audit rows, matching an exact SHA-256 capacity receipt marker and issue identity; a positive match replays success without another POST. This is not durable server-side idempotency: audit pagination/retention, malformed responses, or lookup failures leave the outcome unknown and ownership held for retry. PR-fix capacity settlement uses the issued per-handout receipt. Lifecycle task reports separately support payload-bound replay when given a stable idempotency key. Discovery and dedupe bypass history only for a
+including preserved branch/PR metadata; Dispatch implements the interfaces via the merged #1259 receipt-fenced endpoints. Issue settlement is fenced by the issued claim token; because a re-claim around admission rotates that token while an admission re-claim re-emits the rotated receipt onto the run, a settlement refused for a rotated or gone lease re-presents the claim once and retries against the live token — rotation is adopted, never treated as staleness, while ownership, human-hold, expiry, and closed refusals still stop settlement (#388). If its POST response is lost or cannot be confirmed, the adapter makes one bounded best-effort lookup in the latest 100 audit rows, matching an exact SHA-256 capacity receipt marker and issue identity, or the run-scoped settlement identity tag every receipt note now carries beside its token-specific marker (a settlement presenting no identity key stamps the marker alone, legacy-shaped) — so a handoff that landed under an adopted token replays from durable evidence on later passes whose receipt names only the original token, instead of adopting again under a freshly minted third token and posting a duplicate settlement (#395); a positive match replays success without another POST. This is not durable server-side idempotency: audit pagination/retention, malformed responses, or lookup failures leave the outcome unknown and ownership held for retry. PR-fix capacity settlement uses the issued per-handout receipt. Lifecycle task reports separately support payload-bound replay when given a stable idempotency key. Discovery and dedupe bypass history only for a
 `BlockedExternal` capacity-exhaustion run with `CapacityRecovery=True/Settled`
 and `LifecycleReported=True`; a deterministic predecessor-UID successor name permits stable source IDs while
 retaining diagnostic history and active-run deduplication. Other, incomplete, and human
@@ -649,7 +678,9 @@ The invariants the mechanism must hold:
    claimed to be a recoverable patch.
 5. Capture is best-effort and bounded; it never changes an ending's phase,
    exit code, or lifecycle report, and never delays termination beyond its
-   20-second operation deadline inside the 45-second grace.
+   20-second operation deadline plus the bounded child-kill waits — the
+   cancellation path's 10-second wait for the model's process group and the
+   capped git reads' 2-second `WaitDelay` — inside the 45-second grace.
 6. Evidence is per-incarnation and slot names are intake-derived; no capture
    — gated, clean, or stolen-token — can destroy another incarnation's
    evidence.
@@ -2025,6 +2056,127 @@ named items remain unresolved and must not be described as production-ready:
 - The exact vLLM gauge for backpressure on the target model server.
 
 ## Decisions
+- **2026-10-18 — #347: the executor reaps adopted descendants, and only those
+  whose statuses no waiter owns.** The coordinator pod ran the executor as PID
+  1, so the kernel reparented every orphaned descendant of the model child —
+  npm, node, esbuild, a stuck `tail`, nine hours of them — to a process that
+  reaps nothing, and the pod accumulated zombies for the length of each run.
+  The fix is not "reap faster": a reaper that collects every dead child steals
+  statuses. An adopted orphan is an ordinary child of the executor, and the
+  children the executor spawns itself (the `internal/git` calls, the evidence
+  capture) are ordinary children too, unregistered by anything the reaper can
+  see. Reaping one of those replaces a real git exit status with `ECHILD` — a
+  run's ending decided by a scheduling race, which is the one thing the change
+  must not do, and what a first implementation did until it was bounded. Two
+  conditions make it safe instead of fast: every child the executor starts
+  registers its pid with the reaper before the start is released, so `Wait`
+  keeps its status, and a descendant is collectable only inside a process group
+  a supervised child led. The model child and the preflight `mcp list` probe are
+  the two children the executor starts with their own process group, so that
+  condition covers the tool tree that leaks and provably excludes the executor's
+  own children. The cost of that condition, stated rather than implied away: an
+  orphan that made a group or session of its own (`setsid`, a detached spawn),
+  and the git, ssh and askpass descendants a killed run orphans into the
+  executor's own group, are adopted and then left alone. Signalling a live
+  orphan was rejected outright — an abandoned `npm` or `esbuild` is another
+  process's problem, and killing it would change what the model left running.
+  Arming is `main`'s alone and not the run's: a reaper armed by any caller
+  would turn the test binary, which runs this executor in process, into a
+  subreaper that adopts every orphan its subprocesses leave and then, correctly,
+  declines most of them. (#347)
+
+- **2026-10-18 — #439: a preflight probe's name is a readable prefix plus a
+  digest of the whole node name, and a probe is evidence only for the node it
+  is pinned to.** Probe pod names were derived from the node name by
+  normalizing and truncating to 16 characters, so any two nodes sharing that
+  prefix collided: the second create deleted or collided with the first probe
+  and result collection read one pod for both nodes, which could stall
+  admission or certify multi-node isolation without probing the second node
+  at all. A shorter prefix was rejected — it widens the same collision — and
+  so was dropping the readable prefix altogether, because the name stays a
+  Kubernetes object name inside the same 16-character budget: the digest now
+  follows the truncated normalized prefix instead of replacing the empty case,
+  so the total length does not grow and a name that would have hashed
+  something else still reads as the node it belongs to. Punctuation and case
+  that normalization drops no longer conflate nodes either, because the
+  digest covers the original name rather than the normalized one. That makes
+  the name sufficient, so a second guard makes it checkable:
+  `collectProbeResults` refuses a probe pod whose `spec.nodeName` is not the
+  node under test, and a refused probe contributes nothing rather than
+  counting as pending or as coverage — evidence cannot be transferred
+  between nodes by name alone. The refusal stays an ordinary requeueable
+  error even though a real mismatch does not clear on a later pass;
+  terminalizing that verdict is left to a follow-up rather than guessed at
+  here. (#439)
+
+- **2026-10-18 — #375 review: the cited-evidence path extractor takes the
+  grammar's path alternative, and the reference pattern is composed from its
+  alternatives.** The #367 extractor's `evidencePathCandidatePattern` was a
+  hand-mirrored copy of the file-path alternative inside the validator's
+  `ReferenceWithLocation` — precisely the duplication this PR removes
+  everywhere else, and now that the authoritative regexes moved into
+  `internal/broker/grammar` the mirror sat one edit away from silently
+  probing references the contract no longer accepts, or skipping ones it
+  does. The grammar now exports its two alternatives
+  (`ReferenceURLPattern`, `ReferencePathPattern`) and composes
+  `ReferenceWithLocation` from them, the executor's extractor is an alias
+  of `ReferencePathPattern`, and two tests pin the seam: the grammar's
+  composition is exact, and the executor's pattern keeps the probe-safety
+  charset the #367 boundary argument rests on — whatever it matches stays
+  free of whitespace, `:`, quotes, and shell, glob, and pathspec
+  metacharacters. (#375, #367, #422)
+- **2026-10-18 — #412: on the capped-read over-limit branch, killing an
+  over-running child is not a failure, but a child that had already exited
+  non-zero keeps its exit status and stderr beside the bounded prefix.**
+  `runGitCapped`'s over-limit branch killed and reaped the child but
+  discarded `Wait`'s error, so a git that *failed and* wrote past
+  `MaxFileBytes` came back as `(prefix, true, nil)` — and the caller, which
+  classifies any over-limit patch `OmittedOverLimit` without scanning or
+  storing it, recorded the failed patch as a benign omission and put no
+  failure in the manifest at all. That fail-open capture is the harm; the
+  over-limit prefix was never stored as evidence. The reap's status now
+  decides, from the same `ProcessState` the #392 fix already relied on: a
+  child that exited on its own is *exited* and keeps its exit status and
+  trimmed stderr, returned beside the bounded prefix (callers must check
+  `err` before `overLimit`), while a child this function killed is
+  *signaled* rather than exited and keeps the old `(prefix, true, nil)`.
+  The cancel contract on the branch is untouched: a canceled context still
+  returns `ctx.Err()` with `overLimit == false`. **Residual, deliberate:** a
+  child still producing when the cap is hit is killed here, and a signaled
+  reap cannot say whether that child would have failed — so a failed
+  `format-patch` that overruns the cap *and* outlives its own output is
+  still reported as an over-limit omission. Closing that would mean either
+  draining past the cap (unbounded work) or a duration bound, both of which
+  this design rejects; the capture stays honest by reporting what it can
+  prove. Rejected: treating any non-zero reap as a failure (every capped run
+  would be reported as a failed capture), and discarding the prefix on the
+  error path (loses the read that explains the failure).
+
+- **2026-10-18 — #395: adopted-token settlement replays by run-scoped settlement
+  identity, not only by the token-derived marker.** Settlement adoption (#388)
+  posts the capacity handoff under a marker hashed from the adopted token, but
+  replay looked up only the marker derived from the receipt's original token, so
+  a handoff that landed while its success was never persisted (lost response
+  plus lost `CapacityRecovery=True` patch or a crash) was invisible to the next
+  pass: it retried the dead fence, re-claimed — Dispatch deletes the lease on a
+  successful handoff, so the next claim mints a third token — and posted a
+  second successful settlement (extended cooldown, transient re-claim of an
+  issue already back in circulation). Persisting the adopted token onto the run
+  receipt was rejected: adoption happens inside the settlement call, so any
+  write-back that loses its response window reopens the same gap, and it would
+  widen the `source.CapacityRecovery` seam for a source-specific token concept
+  the core must not carry. Instead every settlement receipt note now carries,
+  beside the token-specific marker, a token-independent SHA-256 tag of the run's
+  settlement identity (idempotency key + work identity) — the controller path
+  always presents a key, and without one the client stamps the marker alone,
+  fail-safe to legacy replay — and the audit replay matches that tag on any
+  successful row for the same issue — durable evidence a later pass
+  can always recompute. The key is unique per run attempt, so a previous
+  attempt's landed row is never conflated with a new one, and the unchanged
+  marker match keeps replaying pre-tag rows for the token they name.
+  Non-stealing is untouched: the tag only suppresses this run's own duplicate
+  POST; fencing on the POST itself is unchanged. (#395)
+
 - **2026-10-17 — #392: the capture's capped git read is bounded by the
   operation deadline, and a pipe outliving its child keeps the bytes
   rather than the failure.** `runGitCapped` read the child's stdout
@@ -2172,6 +2324,44 @@ named items remain unresolved and must not be described as production-ready:
   on unsafe or unverifiable workspace evidence. Chosen because keeping work
   moving outweighs failing fast: an idle local capacity on a claimed item is
   the failure mode this feature exists to end.
+- **2026-10-17 — #375: the criterion-evidence grammar a run is taught is
+  derived from the patterns the broker validates, so a validator edit can no
+  longer leave a prompt teaching a shape the validator refuses.** The grammar
+  was spelled three times — twice as prose baked into the legacy repair
+  continuation and the resolve-issue goal, once as the authoritative regexes
+  in the broker's criterion-evidence contract — and the copies had already
+  diverged from each other and from the broker's own rejection text: the repair
+  continuation taught the per-status rule as "referencing a file path or check
+  URL" where the validator says "must cite", and the goal's status vocabulary
+  dropped the conjunction the repair continuation carried. Constants behind a
+  cross-check test would have left the same failure open; the grammar is now
+  derived. `internal/broker` exports `CriteriaHeaderGrammar`,
+  `CriteriaHeaderShape`, `CriteriaRowGrammar`, `StatusVocabulary`,
+  `StatusVocabularySentence`, and `StatusReferenceRuleSentence`; the header and
+  row templates are rendered from the validator regexes by stripping the
+  anchors and substituting each capture group with the placeholder naming it.
+  Those substitutions are explicit, not automatic: each capture group's regex
+  source is hand-written as a substitution key, so the derivation is a
+  mechanical step over a table a human maintains. Drift between the taught
+  template and the validator is therefore caught rather than structurally
+  impossible — by equality against the pinned `derivedHeaderTemplate` and
+  `derivedRowTemplate`, by the alternation test that reads the row pattern's
+  own vocabulary in both directions, and by the substitution-key test that
+  fails a key occurring twice or a key that is a substring of another. The
+  patterns, the vocabulary, and the rule table live in the leaf package
+  `internal/broker/grammar`, so a prompt surface can render the grammar
+  without importing the broker — whose own in-package tests import the
+  harness — and `internal/broker` re-exports them under its existing names.
+  The per-status reference rule moves the same way: one table maps each
+  status to its requirement, consumed by both `validRecordShape` and the
+  rendered sentence, so the validator's parenthetical and the prose it teaches
+  are one string. Validation outcomes are unchanged — the derivation
+  re-spells how the grammar is taught, not what it accepts — and
+  `internal/broker/criteria_test.go` pins the derivation itself: every
+  instance rendered from a template must satisfy the pattern it claims to
+  describe, and the closed vocabulary must equal the row pattern's
+  alternation in both directions. (#375, #249, #282)
+
 - **2026-10-17 — #377: the operator's own observation reads resolve their
   destination through the selected registration, the same routing admission
   was given in #340/#378.** Post-review PR observation, existing-PR head
@@ -2208,6 +2398,29 @@ named items remain unresolved and must not be described as production-ready:
   the writer now consumes every chunk whole. No new bound is claimed — the
   grace period already budgets a 2-second child-kill wait; this puts
   `runGit`'s reads inside it.
+
+- **2026-10-16 — #388: claim-token rotation around admission is adopted, not wedged.**
+  A deployed smoke stranded a `BlockedExternal` capacity run permanently: discovery/
+  admission claim churn rotated the Dispatch lease token, while the run's
+  `SourceReceipt` was persisted set-once and settlement retried the inert fence
+  forever (Dispatch's handoff refusals carry no machine-readable code today, so
+  even the stale classification never fired). The fix adopts the winning fence at
+  both ends instead of holding the losing one: the operator status patch now
+  re-emits a changed non-empty `SourceReceipt` so a re-claim at admission records
+  the token the run actually holds, and the Dispatch settlement path, on a
+  rotation-only refusal (`stale_claim_token` / `no_active_claim`), re-presents the
+  claim — Dispatch keeps the token across same-agent renewals, so this adopts the
+  live lease rather than minting a competing one — and retries the fenced handoff
+  exactly once. Ownership-changed, human-hold, expired, and closed/done refusals
+  never re-claim: releasing another owner's claim or reversing a human stays
+  impossible. The squat policy is settled deliberately: an unsettled
+  `BlockedExternal` run remains the identity barrier until its settlement
+  converges — with adoption it does — and only a `CapacityRecovery=True/Settled`
+  exhaustion releases the identity for a successor, so a blocked run never
+  silently swallows rediscovery forever, it stops doing so when settlement lands.
+  The PR-fix follow-up path keeps its per-handout generation fence unchanged:
+  a rotated handout token there means a newer generation owns the work, which is
+  staleness by design, not rotation to adopt. (#388)
 
 - **2026-10-16 — #282: the legacy executor enforces the criterion-evidence
   contract in one shared handoff plan, and the pinned envelope binds to the
@@ -3930,6 +4143,56 @@ was superseded.
   client query had no remaining caller after this change and is gone, so one
   listing seam remains. (#365, closing the `Observer` carve-out left open by
   the #343 entry.)
+- **2026-10-17 — #390: the read phase observes the operation deadline the git
+  calls already observed.**
+  `Capture` bounded its git calls by the 20-second operation deadline
+  (`exec.CommandContext`) but its per-file reads took no context at all, so one
+  stalling read — a regular file on a hung filesystem — carried the capture
+  past that deadline, through the pod's 45-second grace, to SIGKILL, and the
+  manifest went with it: "over deadline the
+  bundle degrades to the manifest alone" was unreachable for the one phase git
+  did not bound. The read is now bounded by the same context. The mechanism is
+  deliberately weak: a pre-check fails fast when the deadline is already gone
+  (no goroutine at all), and otherwise the open and the capped read run in a
+  goroutine whose result is received unless the context is done first — and a
+  result that lands while the context is expired is discarded even when it wins
+  the select, because a completed read and a closed Done are then ready at once
+  and Go breaks that tie at random. Cancellation is therefore settled again
+  after the select and again at the seam call in `Capture`, outside the
+  read-error taxonomy, so no bytes read past the deadline are ever stored and a
+  read that only succeeded because the context was dead cannot masquerade as
+  content.
+  Cancellation abandons that goroutine rather than interrupting it — closing a
+  descriptor from another goroutine is not a reliable way to unblock a read
+  already blocked in the kernel — and the abandoned read's bytes are discarded
+  and never stored, so bounding the wait costs no content risk. A canceled read
+  returns the context's error rather than a read failure to be classified, which
+  is what makes the executor's existing manifest-only degradation reachable
+  here: the same `Capture` error the executor already handles, with the same
+  fresh five-second window the 2026-10-09 decision grants a capture the
+  deadline itself aborted. The `O_NONBLOCK` open plus non-regular descriptor
+  guard that closes the fifo-swap hole (#336, merged as #389) was deliberately
+  kept out of #390's own change rather than folded into it: it is a different
+  problem — refusing to open a non-regular file at all, rather than bounding
+  the read that follows. The two landed independently and this merge composes
+  them in one function: `O_NONBLOCK` keeps a non-regular
+  swap from stalling the open, and the context bounds what survives that check,
+  which is a read of a regular file the kernel has already accepted. As #389
+  predicted, its guard took this regression's fixture with it: a fifo is
+  refused with `errNotRegular` before any read begins, so the abandoned-read
+  primitive is now reachable only by a hung filesystem serving a regular file,
+  which a unit test cannot construct without a privileged mount. The primitive
+  test therefore pins what is still observable — a context that is already
+  done is answered from the context, not with the path's own `errNotRegular`,
+  which is the ordering the taxonomy depends on — and the bound's observable
+  consequence is pinned end to end through the `readFileForCapture` seam. The
+  fast-path pre-check is not pinned by it, and the reason is measured rather
+  than argued: because #389 answers a fifo in two syscalls, without the
+  pre-check the goroutine's `errNotRegular` and the already-done context are
+  sometimes both ready at the select, which breaks that tie at random — about
+  1 run in 25,000 (20 of 500k), far below what a test can detect. The pre-check
+  is kept for the fast path it buys (no goroutine, no syscalls), not because a
+  test fails without it. (#390)
 - **2026-10-17 — #356: pod sizing is a LaneProfile field, and no
   Courier-created pod is BestEffort.** `PodConfig.Resources` existed and was
   applied to the coordinator container, but no production path ever assigned it
@@ -4037,9 +4300,32 @@ was superseded.
   projection that cannot be read fails the request closed with a fixed,
   retryable category rather than falling back to the last good bytes: during a
   swap the honest answer is that the credential is unknown, and a stale token
-  earns a 401 that is classified as a definite denial. Startup still validates
+earns a 401 that is classified as a definite denial (superseded by #406: a
+  stale token's 401 is now classified by the request's own freshness, above).
+  Startup still validates
   the projection once, so a control pod that can never authenticate never
   launches. (#383)
+- **2026-10-17 — #406: a broker 401 is a denial unless the projected credential
+  has already been replaced.** With #383's per-request token read, the one
+  remaining 401 a healthy run can earn is the kubelet swap window: the request
+  read the projection before kubelet swapped it, so it carried bytes the
+  apiserver was already refusing, and classifying every 401 as a definite
+  denial converted that window into `PublicationBlockedError` and a human even
+  though a fresh token was on disk by the time the refusal came back. Making
+  401 retryable outright was rejected: the same status is what a misconfigured
+  or cross-run caller earns, and a blanket retry turns a loud block into a
+  silent spin. The distinction therefore comes from the request's own
+  freshness: when a work-path or capabilities read is refused with 401, control
+  re-reads the projected token, and only bytes that differ from the ones the
+  refused request carried mark the rotation window — that refusal is
+  retryable, and the next attempt carries the fresh bytes. Same bytes, or a
+  re-read that fails, keep the denial loud. A misconfigured caller is loud on
+  the first attempt whenever the projection is stable, and in any case
+  converges inside the same bounded retry rounds, so nothing spins silently.
+  The residual ordering — kubelet lagging so far past a token's expiry that
+  the projection still holds the refused bytes at the re-read — also stays
+  loud: no positive freshness evidence exists for it, and the run blocks for a
+  human rather than guessing on a clock the process cannot observe. (#406)
 - **2026-10-17 — #372: native worker cancellation proves the task tree
   is gone, and never claims otherwise.**
   `internal/protocol` ran each task through `exec.CommandContext`, which kills
@@ -4089,3 +4375,56 @@ was superseded.
   (#216) are unchanged; provisioning and the fence's own reads still use the
   cached client, because only the relaunch's delete and ceiling judgement are
   destructive decisions. (#370, #105, #223)
+- **2026-10-17 — #295: the per-role context budget is a declared CRD field;
+  the API carries declarations and resolves nothing.** `LaneProfileSpec`
+  gains an optional `context` policy — `compactAtPercent` (default 75, range
+  1–99), `outputReservation` (≥ 0), and `roles.<role>` entries declaring
+  `maxInputTokens` (≥ 1) with per-role overrides of the fraction and the
+  reservation — and `bootstrap.Profile` mirrors it with strict parsing and
+  the same bounds, so the harness policy finally has a declaration source.
+  One choice the parent left open is settled here: the per-role
+  `compactAtPercent` deliberately carries **no** CRD default while the
+  lane-wide one defaults to 75. A defaulted per-role percent would make
+  `compactAtPercent: 0` mean "75" instead of "inherit the lane policy", so a
+  role named under `roles` could no longer inherit a lane fraction other
+  than 75, and the all-zero entry that `ContextPolicy.declaresRole` (#296)
+  treats as declaring nothing could not exist through the API. The bootstrap
+  parser mirrors only the lane-level default, keeping the desired spec equal
+  to the server-defaulted spec so the reconciler never rewrites an unchanged
+  LaneProfile each pass. Resolution stays exactly where #243 put it:
+  `internal/harness` resolves declared values against gateway-verified
+  limits; no resolution, trigger, or preservation logic moved into the API.
+  Nothing yet populates `CoordinatorConfig.ContextBudgets` from the lane —
+  that population remains follow-up wiring and must key the map by declared
+  roles only, per #296's gate predicate. (#295, #243, #296)
+- **2026-10-18 — #336: the classified-regular capture read refuses a non-regular
+  descriptor rather than blocking on it.** `Capture` classifies each changed path
+  with `os.Lstat` and reads a path classified regular through `readCapped`, which
+  since #237 opened `O_RDONLY|O_NOFOLLOW`. A hostile worktree that swapped such a
+  path for a fifo between the classification and the open blocked that open
+  indefinitely: an `O_RDONLY` open of a fifo waits for a writer that may never
+  come, and no bound — context or otherwise — was consulted there. The window is
+  the same classification-versus-open TOCTOU #237 closed for symlinks. The fix
+  (PR #389) opens `O_RDONLY|O_NOFOLLOW|O_NONBLOCK`, so the open cannot wait for a
+  peer that may never arrive, then `f.Stat()`s the opened descriptor and fails a
+  non-regular result with a new `errNotRegular` sentinel. `fstat` on the
+  descriptor rather than a second `Lstat` on the path is deliberate: it describes
+  the object actually opened, so the check cannot itself be raced the way a
+  path-based re-check could. `Capture` maps `errNotRegular` to
+  `DispositionOmittedBinary` with `totals.OmittedBinary++` and stores nothing —
+  deliberately identical to what the pre-existing non-regular `Lstat` branch does
+  for a path classified non-regular outright, mirroring how #237's `ELOOP` (a
+  swap into a symlink) re-classifies as symlink metadata: each swap class is
+  re-classified exactly as the classification pass would have classified it, so
+  content a hostile tree slipped past classification is never stored. A swap to
+  a socket needs no branch of its own: a read-only open of a socket fails with
+  `ENXIO` before any blocking is possible and falls to the generic failed-read
+  case, which also stores nothing. The guard composes with the capture deadline
+  bound (#390) rather than conflicting with it: `O_NONBLOCK` bounds the *open* by
+  making a wait impossible — it rejects non-regular descriptors before any read
+  begins — while the deadline bounds the *read* of the regular files the guard
+  lets through, which is all the guard leaves unbounded and all the deadline
+  needs to cover. `O_NONBLOCK` is a no-op for those regular files. Regression
+  tests: `TestReadCappedRejectsNonRegular` and `TestCaptureFifoSwapRace`, both
+  asserting non-blocking with a deadline guard so losing `O_NONBLOCK` fails
+  rather than hangs the suite. (#336, #389; composes with #237, #390)

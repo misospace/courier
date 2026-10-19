@@ -271,9 +271,10 @@ func (s *SecureControl) checkDryRuns(ctx context.Context, run *courier.CoderRun,
 		// no probe spec. The placeholder node name is arbitrary as far as
 		// admission is concerned — the API server does not validate
 		// spec.nodeName at all, neither as a DNS subdomain nor as a node
-		// that must exist — but it has to stay DNS-subdomain-shaped anyway,
-		// because the live probe's deterministic name derives from the
-		// node's.
+		// that must exist — and it stays arbitrary here too: the live
+		// probe's deterministic name derives from the node's, but the tag
+		// normalizes and digests whatever the node is named, so the name
+		// is DNS-safe either way.
 		pods = append(pods, topology.ProbePod(run, "dry-run-node", s.Config.ProbeImage, "true", resources))
 	}
 
@@ -515,6 +516,12 @@ func (s *SecureControl) collectProbeResults(ctx context.Context, run *courier.Co
 				continue
 			}
 			return nil, false, fmt.Errorf("secure preflight: read probe pod on %s: %w", node, err)
+		}
+		if pod.Spec.NodeName != node {
+			// The name says node, the schedule says otherwise: whatever this
+			// pod observed is not evidence about the node under test.
+			return nil, false, fmt.Errorf("secure preflight: probe %s is scheduled on node %s, not %s; refusing the result",
+				pod.Name, pod.Spec.NodeName, node)
 		}
 		if pod.Status.Phase != corev1.PodSucceeded && pod.Status.Phase != corev1.PodFailed {
 			pending = true
