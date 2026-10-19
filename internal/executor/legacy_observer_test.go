@@ -4,6 +4,7 @@ import (
 	"testing"
 
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	courierv1alpha1 "github.com/misospace/courier/api/v1alpha1"
@@ -124,4 +125,44 @@ func containerNamed(t *testing.T, containers []corev1.Container, name string) co
 	}
 	t.Fatalf("container %q missing", name)
 	return corev1.Container{}
+}
+
+// TestLegacyObserverContainersCarryBoundedSizing pins the containment
+// invariant for the two Courier-internal observer containers: the seed init
+// container and the observer sidecar always carry finite cpu and memory
+// requests and limits — an unbounded one of them can consume the node past
+// every sized container's limit (the 82GiB starvation class) — and they carry
+// the fixed small Courier-internal sizing, never the lane's, so a big lane
+// does not triple the coordinator pod's scheduler reservation for helper
+// processes and a lane that sizes nothing still does not leave them
+// BestEffort.
+func TestLegacyObserverContainersCarryBoundedSizing(t *testing.T) {
+	newRun := func(name string) *courierv1alpha1.CoderRun {
+		return &courierv1alpha1.CoderRun{ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: "courier-system", UID: "run-uid"}, Spec: courierv1alpha1.CoderRunSpec{Mode: courierv1alpha1.ModeResolveIssue, Repo: "acme/widgets", Ref: 7, Lane: "local"}, Status: courierv1alpha1.CoderRunStatus{Branch: "courier/acme/widgets/issue-7"}}
+	}
+	lanes := map[string]*courierv1alpha1.LaneProfile{
+		"lane configures nothing": {ObjectMeta: metav1.ObjectMeta{Name: "local"}, Spec: courierv1alpha1.LaneProfileSpec{Roles: map[string]string{"coordinator": "model"}}},
+		"lane configures sizing": {ObjectMeta: metav1.ObjectMeta{Name: "local"}, Spec: courierv1alpha1.LaneProfileSpec{
+			Roles: map[string]string{"coordinator": "model"},
+			Resources: corev1.ResourceRequirements{
+				Requests: corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("1500m"), corev1.ResourceMemory: resource.MustParse("3Gi")},
+				Limits:   corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("6"), corev1.ResourceMemory: resource.MustParse("12Gi")},
+			},
+		}},
+	}
+	for name, lane := range lanes {
+		pod, err := BuildCoordinatorPod(newRun("sized-observer-run"), lane, PodConfig{Image: "courier:test", GitRemoteURL: "https://github.com/%s.git", GitCredentialSecret: "git-auth"})
+		if err != nil {
+			t.Fatalf("%s: %v", name, err)
+		}
+		if len(pod.Spec.InitContainers) != 1 {
+			t.Fatalf("%s: init containers = %#v", name, pod.Spec.InitContainers)
+		}
+		seed := pod.Spec.InitContainers[0]
+		observer := containerNamed(t, pod.Spec.Containers, ObserverContainerName)
+		for _, c := range []corev1.Container{seed, observer} {
+			assertContainerCPUAndMemory(t, c.Resources.Requests, "25m", "64Mi")
+			assertContainerCPUAndMemory(t, c.Resources.Limits, "1", "512Mi")
+		}
+	}
 }

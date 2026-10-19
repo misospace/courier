@@ -1366,7 +1366,19 @@ keeps one runaway build from taking a node, and keeps these pods off the front
 of the eviction queue. A lane that configures neither half gets the default
 whole; a limits-only lane gets the default requests; a requests-only lane is
 rendered with exactly its own requests plus the floored halves, so its pods
-really do run limit-less by its own choice. One consequence: a limit below the
+really do run limit-less by its own choice. Zero or negative CPU/memory
+quantities are rejected before launch rather than floored into silence:
+`ValidatePodResources` fires from both launch paths on a lane that declares
+them, terminalizing the run `NeedsHuman` with reason `LaneConfig` before any
+pod is created — a lane's sizing is an operator decision, and an operator who
+wants the default omits the key rather than zeroing it (the render-layer
+floor still backs callers that bypass launch validation). The
+workspace-observer sidecar and its seed init container on the coordinator pod
+are the exception to lane sizing: they are Courier-internal helpers, so they
+always carry the fixed small `DefaultObserverResources` (25m/64Mi requested,
+1 CPU/512Mi limited) whatever the lane says — bounding the two containers a
+lane could otherwise leave unbounded past every sized container's limit. One
+consequence: a limit below the
 floored default request (say `limits.cpu: 100m` on a lane that sets no
 requests) renders requests above limits, which the API server rejects. Requeueing
 cannot change a permanently invalid spec, so the rejection is caught where it
@@ -4341,3 +4353,32 @@ earns a 401 that is classified as a definite denial (superseded by #406: a
   tests: `TestReadCappedRejectsNonRegular` and `TestCaptureFifoSwapRace`, both
   asserting non-blocking with a deadline guard so losing `O_NONBLOCK` fails
   rather than hangs the suite. (#336, #389; composes with #237, #390)
+- **2026-10-18 — pod resource safety: bounded observer/seed containers, invalid
+lane sizing rejected before launch.** A live coordinator pod was reported at
+82GiB during severe node pressure and co-located Ceph stalls. Historical
+limits and the allocation mechanism for that coordinator remain unknown;
+this change does not establish or fix the incident's root cause. Current
+coordinators have enforced 4Gi limits. A separate containment gap exists:
+the workspace-observer sidecar and its seed init container — attached to
+the coordinator pod by the legacy builder — carried no `Resources` at all. An
+unbounded container inside an otherwise Burstable pod can consume the node
+past every sized container's limit, and under memory pressure the unsized one
+is first on the eviction queue ahead of the storage daemons it starved.
+`DefaultObserverResources` gives those two Courier-internal helpers fixed
+small sizing (25m/64Mi requested, 1 CPU/512Mi limited) that never follows the
+lane — the lane sizes the work a model does, not the helper that hashes the
+workspace, and the preflight probe's fixed small sizing is the precedent.
+`ValidatePodResources`, called from both launch paths before any pod renders,
+rejects zero or negative CPU/memory quantities as a `LaneConfig` needs-human
+rejection instead of letting a zero request be floored into silence or a zero
+limit reach the API server mid-provisioning. Validation polices only cpu and
+memory; extended resources keep their limits-only validity (#403), and the
+render-layer floor stays as defence in depth for callers that bypass launch
+validation. No new API surface: the lane's existing `resources` field and the
+built-in defaults remain the only knobs, and an OOM under a limit keeps its
+existing classification (`kubernetes-failure`, infrastructure relaunch under a
+bounded ceiling, then human). Two things deliberately **not** decided here:
+the built-in coordinator default stays exactly the shipped 250m/512Mi and
+2 CPU/4Gi — a larger default (observed proposal: 250m/1Gi requested,
+4 CPU/8Gi limited) needs evidence from the incident's own usage history, not
+an automatic raise; and no live cluster was touched to gather it.

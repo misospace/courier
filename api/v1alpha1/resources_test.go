@@ -1,6 +1,7 @@
 package v1alpha1
 
 import (
+	"strings"
 	"testing"
 
 	corev1 "k8s.io/api/core/v1"
@@ -185,5 +186,110 @@ func assertRequests(t *testing.T, list corev1.ResourceList, cpu, memory string) 
 	}
 	if got := list.Memory(); got == nil || got.String() != memory {
 		t.Fatalf("memory = %v, want %q", list.Memory(), memory)
+	}
+}
+
+// TestDefaultObserverResourcesIsSmallAndIndependent pins the observer/seed
+// sizing: finite requests and limits on both halves, small enough that the
+// Courier-internal helper never reserves lane-sized capacity, and allocated
+// per call so a mutated result cannot change the default for anyone else.
+func TestDefaultObserverResourcesIsSmallAndIndependent(t *testing.T) {
+	first := DefaultObserverResources()
+	assertRequestsAndLimits(t, first, "25m", "64Mi", "1", "512Mi")
+	first.Requests[corev1.ResourceCPU] = resource.MustParse("9")
+	delete(first.Limits, corev1.ResourceMemory)
+	second := DefaultObserverResources()
+	assertRequestsAndLimits(t, second, "25m", "64Mi", "1", "512Mi")
+}
+
+// TestValidatePodResourcesAcceptsRunnableSizing pins what stays valid: a
+// complete configuration, either half alone, an omitted configuration taking
+// the built-in default, and extended-resource entries — cpu/memory
+// validation never polices those (#403).
+func TestValidatePodResourcesAcceptsRunnableSizing(t *testing.T) {
+	cases := map[string]corev1.ResourceRequirements{
+		"empty":              {},
+		"complete":           fullResources("250m", "512Mi", "2", "4Gi"),
+		"limits-only":        {Limits: corev1.ResourceList{corev1.ResourceMemory: resource.MustParse("8Gi")}},
+		"requests-only":      {Requests: corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("1")}},
+		"extended-only":      {Limits: corev1.ResourceList{corev1.ResourceName("nvidia.com/gpu"): resource.MustParse("1")}},
+		"extended-unpoliced": {Requests: corev1.ResourceList{corev1.ResourceEphemeralStorage: resource.MustParse("0")}},
+	}
+	for name, in := range cases {
+		if err := ValidatePodResources(in); err != nil {
+			t.Fatalf("%s: ValidatePodResources() error = %v, want nil", name, err)
+		}
+	}
+}
+
+// TestValidatePodResourcesRejectsNonPositiveCPUAndMemory pins the fail-before-
+// launch contract: every zero or negative cpu/memory quantity a lane could
+// declare — each would produce an instantly-killed, unschedulable, or
+// silently-rewritten container — is a named error, not a silent default.
+func TestValidatePodResourcesRejectsNonPositiveCPUAndMemory(t *testing.T) {
+	cases := []struct {
+		name string
+		in   corev1.ResourceRequirements
+		want string
+	}{
+		{"zero cpu request", corev1.ResourceRequirements{Requests: corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("0")}}, "requests cpu"},
+		{"zero memory request", corev1.ResourceRequirements{Requests: corev1.ResourceList{corev1.ResourceMemory: resource.MustParse("0")}}, "requests memory"},
+		{"negative memory request", corev1.ResourceRequirements{Requests: corev1.ResourceList{corev1.ResourceMemory: resource.MustParse("-1")}}, "requests memory"},
+		{"zero cpu limit", corev1.ResourceRequirements{Limits: corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("0")}}, "limits cpu"},
+		{"zero memory limit", corev1.ResourceRequirements{Limits: corev1.ResourceList{corev1.ResourceMemory: resource.MustParse("0")}}, "limits memory"},
+		{"negative cpu limit", corev1.ResourceRequirements{Limits: corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("-500m")}}, "limits cpu"},
+	}
+	for _, tc := range cases {
+		err := ValidatePodResources(tc.in)
+		if err == nil {
+			t.Fatalf("%s: ValidatePodResources() error = nil, want rejection", tc.name)
+		}
+		if !strings.Contains(err.Error(), tc.want) {
+			t.Fatalf("%s: error = %v, want it to name %q", tc.name, err, tc.want)
+		}
+	}
+}
+
+// TestValidatePodResourcesDoesNotMutateInput pins that validation reads the
+// lane's map without touching it: the controller may hold this LaneProfile in
+// its informer cache.
+func TestValidatePodResourcesDoesNotMutateInput(t *testing.T) {
+	in := fullResources("250m", "512Mi", "2", "4Gi")
+	if err := ValidatePodResources(in); err != nil {
+		t.Fatal(err)
+	}
+	if len(in.Requests) != 2 || len(in.Limits) != 2 {
+		t.Fatalf("input mutated: requests=%#v limits=%#v", in.Requests, in.Limits)
+	}
+}
+
+// TestLaneSpecValidateResources nil-safe wrapper: a nil spec configures no
+// sizing and is valid.
+func TestLaneSpecValidateResources(t *testing.T) {
+	var spec *LaneProfileSpec
+	if err := spec.ValidateResources(); err != nil {
+		t.Fatalf("nil spec ValidateResources() error = %v, want nil", err)
+	}
+	if err := (&LaneProfileSpec{}).ValidateResources(); err != nil {
+		t.Fatalf("empty spec ValidateResources() error = %v, want nil", err)
+	}
+	bad := &LaneProfileSpec{Resources: corev1.ResourceRequirements{
+		Limits: corev1.ResourceList{corev1.ResourceMemory: resource.MustParse("0")},
+	}}
+	if err := bad.ValidateResources(); err == nil {
+		t.Fatal("zero memory limit ValidateResources() error = nil, want rejection")
+	}
+}
+
+func fullResources(cpuReq, memReq, cpuLim, memLim string) corev1.ResourceRequirements {
+	return corev1.ResourceRequirements{
+		Requests: corev1.ResourceList{
+			corev1.ResourceCPU:    resource.MustParse(cpuReq),
+			corev1.ResourceMemory: resource.MustParse(memReq),
+		},
+		Limits: corev1.ResourceList{
+			corev1.ResourceCPU:    resource.MustParse(cpuLim),
+			corev1.ResourceMemory: resource.MustParse(memLim),
+		},
 	}
 }
