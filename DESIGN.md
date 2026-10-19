@@ -2216,7 +2216,12 @@ named items remain unresolved and must not be described as production-ready:
   and `test` (the authoritative `make test` with envtest assets) are
   explicit, and repo-local tools are stamped against the Makefile pins at
   install time so a stale `bin/` binary is reinstalled rather than
-  silently kept. The mise
+  silently kept. The envtest Kubernetes asset version is an exact pin in
+  the Makefile — CI, the `test` task, and bootstrap read that single
+  source — and the ready report prints the resolved version beside the
+  asset path; it also prints the resolved launcher path with a
+  copy/pasteable absolute-path invocation, so follow-up tasks work when
+  the launcher's directory is not on `PATH`. The mise
   dependency itself is pinned and reviewed in `hack/bootstrap.sh` (version,
   per-platform SHA-256) plus `min_version`, per #414's vetting requirement.
   `make` stays a host prerequisite that bootstrap fails on clearly rather

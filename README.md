@@ -84,9 +84,12 @@ mise run test    # authoritative: make test (codegen, fmt, vet, go test -race) w
 ```
 
 Later shell commands reuse the same environment with `mise exec -- <command>`;
-`mise run <task>` works without any shell activation. `make` and `git` are host
-prerequisites that bootstrap fails clearly on when missing or too old; set
-`BOOTSTRAP_ALLOW_OLD_GIT=1` to proceed knowingly on older git.
+`mise run <task>` works without any shell activation. When the launcher's
+directory (default `$HOME/.local/bin`, or `MISE_INSTALL_DIR`) is not on your
+`PATH`, invoke it by the absolute path its ready report prints, e.g.
+`"$HOME/.local/bin/mise" run check` — no shell activation required. `make` and
+`git` are host prerequisites that bootstrap fails clearly on when missing or
+too old; set `BOOTSTRAP_ALLOW_OLD_GIT=1` to proceed knowingly on older git.
 
 ## Install
 

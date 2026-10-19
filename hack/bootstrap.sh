@@ -136,10 +136,28 @@ setup-envtest $se_pin"
 	printf 'make: %s (%s)\n' "$(make --version | awk 'NR==1{print $3}')" "$(command -v make)"
 	printf 'controller-gen: %s (%s)\n' "$(bin/controller-gen --version)" "$REPO_ROOT/bin/controller-gen"
 	printf 'setup-envtest: pinned %s (%s)\n' "$se_pin" "$REPO_ROOT/bin/setup-envtest"
-	printf 'KUBEBUILDER_ASSETS=%s\n' "$assets"
+	printf 'envtest assets: k8s %s (%s)\n' "$k8s" "$assets"
 	printf 'GOMODCACHE=%s\n' "$(go env GOMODCACHE)"
 	printf 'GOCACHE=%s\n' "$(go env GOCACHE)"
-	printf 'To reuse this environment in later commands: mise exec -- <command>\n'
+	# Follow-up commands must work even when the launcher's directory is not
+	# on PATH: print the resolved launcher and a copy/pasteable invocation
+	# for that case.
+	launcher=${BOOTSTRAP_MISE:-mise}
+	case $launcher in
+	*/*) ;;
+	*) launcher=$(command -v "$launcher" 2>/dev/null || printf '%s' "$launcher") ;;
+	esac
+	printf 'mise: %s\n' "$launcher"
+	case ":$PATH:" in
+	*":$(dirname "$launcher"):"*)
+		printf 'To reuse this environment in later commands: mise exec -- <command>\n'
+		;;
+	*)
+		printf '%s is not on PATH; invoke the launcher by absolute path, e.g.\n' "$(dirname "$launcher")"
+		printf '  "%s" run check\n' "$launcher"
+		printf '  "%s" exec -- <command>\n' "$launcher"
+		;;
+	esac
 }
 
 if [ "${1:-}" = "tools" ]; then
