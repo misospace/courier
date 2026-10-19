@@ -4421,9 +4421,21 @@ earns a 401 that is classified as a definite denial (superseded by #406: a
   `provider-unavailable` diagnostic category, workspace-safety snapshot,
   replacing any declared outcome tag the run had carried, since a world
   that could not be observed cannot settle a declaration —
-  which the operator already maps to `PhaseBlockedExternal` and the fenced
+  which the operator maps to `PhaseBlockedExternal` and the fenced
   capacity-recovery path (#327); a transient failure with budget remaining
-  still retries factually inside the #170 continuation budget. Fail-closed
+  still retries factually inside the #170 continuation budget. This ending's
+  recovery depends on a new operator gate: the workspace-safety
+  acquisition/persistence path that had fired only for a confirmed
+  `capacity_exhausted` outcome now also opens for the precise trusted pairing
+  — a declared `blocked_external` outcome carried by a validated termination
+  handoff whose diagnostic category is `provider-unavailable`
+  (`trustedForgeUnavailableHandoff`). It reuses the same secure snapshot or
+  independent legacy isolated-observer proof and the same fail-closed
+  `safeCapacityWorkspace` requirement as capacity exhaustion, so a
+  git-verified pushed or empty workspace lets `recoverCapacityExhaustion`
+  settle and release ownership while an unsafe or unknown one stops at
+  `capacityRecoveryUnsafeWork` and holds it. A task-shaped `blocked_external`
+  with any other category opens nothing, exactly as before. Fail-closed
   semantics are unchanged: a failed read never publishes `Verifying`
   success and never claims the pull request is missing. `verifier-rejection`
   is reserved for worlds the observation actually read and found

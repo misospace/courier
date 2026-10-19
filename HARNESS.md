@@ -749,7 +749,11 @@ failure, classified by `forge.IsTransientAvailability` — the world was never
 observed, so the run ends on the recovery channel (`blocked_external`
 outcome, category `provider-unavailable`) for the operator's bounded retry
 instead of `verifier-rejection` `NeedsHuman`, replacing any declared outcome
-tag the run had carried. A forge verdict the read did
+tag the run had carried. That exact pairing — and only that pairing — opens
+the operator's trusted workspace-safety evidence gate, so the ending
+persists the same secure snapshot or isolated-observer proof a
+`capacity_exhausted` handoff would and stays eligible for the fenced
+capacity-recovery settlement. A forge verdict the read did
 reach (a plain 403, a linkage mismatch) still terminates `NeedsHuman`. A
 pinned envelope
 that decodes but names a source issue other than the run's trusted
