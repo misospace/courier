@@ -170,6 +170,10 @@ func main() {
 	// capture through the run's ordinary exit codes (DESIGN.md, #115).
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM)
 	defer stop()
+	// Armed for the whole run, before any child exists: this process is PID 1
+	// of the coordinator pod, so the kernel hands it every orphaned descendant
+	// and PID 1 reaps none of them on its own (#347).
+	installAdoptedChildReaper()
 	os.Exit(run(ctx, os.Stdout, os.Stderr))
 }
 
@@ -504,7 +508,7 @@ func fetchRunBranch(ctx context.Context, dir, remoteURL, branch string) error {
 	cmd.WaitDelay = 2 * time.Second
 	cmd.Stdout = io.Discard
 	cmd.Stderr = io.Discard
-	return cmd.Run()
+	return childReaper().run(cmd)
 }
 
 // revListCount counts the commits in a rev-list range expression.
@@ -516,7 +520,7 @@ func revListCount(ctx context.Context, dir, span string) (int, error) {
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
-	if err := cmd.Run(); err != nil {
+	if err := childReaper().run(cmd); err != nil {
 		return 0, err
 	}
 	count, err := strconv.Atoi(strings.TrimSpace(stdout.String()))
@@ -535,7 +539,7 @@ func revParse(ctx context.Context, dir, rev string) (string, error) {
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
-	if err := cmd.Run(); err != nil {
+	if err := childReaper().run(cmd); err != nil {
 		return "", err
 	}
 	return strings.TrimSpace(stdout.String()), nil
@@ -811,6 +815,10 @@ func preflightCapabilities(ctx context.Context, command executor.Command, dir st
 	probeCtx, cancel := context.WithTimeout(ctx, mcpPreflightTimeout)
 	defer cancel()
 	probe := exec.CommandContext(probeCtx, command.Binary, command.Args...)
+	// In its own process group so the descendants it leaves behind stay
+	// recognizable as its own after it exits, and the reaper can collect them
+	// instead of retaining them on PID 1 (#347).
+	probe.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	// Bound waiting for a grandchild that holds the output pipe after the
 	// context is done.
 	probe.WaitDelay = 5 * time.Second
@@ -820,7 +828,7 @@ func preflightCapabilities(ctx context.Context, command executor.Command, dir st
 	var out bytes.Buffer
 	probe.Stdout = &out
 	probe.Stderr = io.Discard
-	_ = probe.Run()
+	_ = childReaper().run(probe)
 	return executor.ParseMCPStatus(out.String())
 }
 
@@ -1329,7 +1337,7 @@ func run(ctx context.Context, stdout, stderr io.Writer) int {
 		process.Dir = workspace.Directory
 		process.Stdout = modelStdout
 		process.Stderr = stderrTransport
-		processErr := process.Run()
+		processErr := childReaper().run(process)
 		_ = tap.Flush()
 		tap.setKill(nil)
 		_ = stdoutRedacted.Flush()
