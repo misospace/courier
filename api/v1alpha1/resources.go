@@ -27,18 +27,31 @@ func DefaultPodResources() corev1.ResourceRequirements {
 // ProbePodResources is the fixed sizing of a disposable preflight probe pod.
 // It deliberately does not follow the lane's sizing: a probe is a
 // seconds-lived `sh -c` network check, but preflight creates one per eligible
-// node simultaneously, so reserving lane-scale capacity for it can leave
+// node simultaneously, so reserving lane-scale *requests* for it can leave
 // probes Pending on a cluster tight on requests and wedge preflight instead
 // of proving isolation (#402). Requests stay finite so a probe is never
-// BestEffort; limits are deliberately omitted — a seconds-lived network
-// check has no runaway build to bound, and a limit under the probe image's
-// real usage would OOM-kill the probe and falsify the isolation result it
-// exists to produce.
+// BestEffort.
+//
+// Limits are fixed too, and deliberately generous rather than absent: a
+// ResourceQuota that tracks limits.cpu or limits.memory rejects any container
+// missing the matching limit, so a requests-only probe would be denied with
+// Forbidden on such namespaces — a denial the create paths treat as an
+// ordinary retryable error, wedging preflight instead of proving anything.
+// The limits exist to satisfy that admission requirement with wide headroom
+// over the probe image's real usage (a shell doing DNS and network checks
+// peaks in the tens of MiB), so they cannot OOM-kill the probe and falsify
+// the isolation result it exists to produce. The maps are allocated on every
+// call so a caller that mutates the result cannot change the sizing seen by
+// anyone else.
 func ProbePodResources() corev1.ResourceRequirements {
 	return corev1.ResourceRequirements{
 		Requests: corev1.ResourceList{
 			corev1.ResourceCPU:    resource.MustParse("10m"),
 			corev1.ResourceMemory: resource.MustParse("32Mi"),
+		},
+		Limits: corev1.ResourceList{
+			corev1.ResourceCPU:    resource.MustParse("500m"),
+			corev1.ResourceMemory: resource.MustParse("256Mi"),
 		},
 	}
 }

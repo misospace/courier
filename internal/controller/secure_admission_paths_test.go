@@ -186,9 +186,11 @@ func TestDryRunProofAdmitsTheLiveProbeSpec(t *testing.T) {
 		if gotQuantity.Cmp(wantQuantity) != 0 {
 			t.Fatalf("probe proof %s request = %v, want the fixed probe sizing %v", name, gotQuantity, wantQuantity)
 		}
-	}
-	if len(got.Limits) != 0 {
-		t.Fatalf("probe proof limits = %v, want none: a limit under the probe image's usage would OOM-kill it", got.Limits)
+		wantLimit := want.Limits[name]
+		gotLimit := got.Limits[name]
+		if gotLimit.Cmp(wantLimit) != 0 {
+			t.Fatalf("probe proof %s limit = %v, want the fixed probe sizing %v", name, gotLimit, wantLimit)
+		}
 	}
 	if got.Requests.Cpu().Cmp(*lane.Requests.Cpu()) == 0 || got.Requests.Memory().Cmp(*lane.Requests.Memory()) == 0 {
 		t.Fatalf("probe proof sizing = %v, want it independent of the lane's %v", got.Requests, lane.Requests)

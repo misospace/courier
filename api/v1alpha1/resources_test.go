@@ -171,15 +171,37 @@ func TestEffectiveResourcesDoesNotAliasLaneConfig(t *testing.T) {
 
 // TestProbePodResourcesIsFixed pins the concrete #402 decision at the API
 // layer, where the literals live: a probe pod requests 10m CPU / 32Mi memory
-// and no limits. The values must stay far below the built-in default request
-// (250m/512Mi): preflight creates one probe per eligible node simultaneously,
-// and lane-scale reservations there can leave probes Pending on a
-// request-tight cluster and wedge preflight.
+// and is limited to 500m CPU / 256Mi memory. The requests must stay far below
+// the built-in default request (250m/512Mi): preflight creates one probe per
+// eligible node simultaneously, and lane-scale reservations there can leave
+// probes Pending on a request-tight cluster and wedge preflight. The limits
+// must stay present, because a ResourceQuota tracking limits.cpu or
+// limits.memory rejects any container missing the matching limit — the
+// requests-only probe this pinned before was denied Forbidden there, and
+// preflight treats that denial as an ordinary retryable error.
 func TestProbePodResourcesIsFixed(t *testing.T) {
 	got := ProbePodResources()
-	assertRequests(t, got.Requests, "10m", "32Mi")
-	if len(got.Limits) != 0 {
-		t.Fatalf("limits = %#v, want none: a probe has no runaway build to bound", got.Limits)
+	assertRequestsAndLimits(t, got, "10m", "32Mi", "500m", "256Mi")
+	for _, name := range []corev1.ResourceName{corev1.ResourceCPU, corev1.ResourceMemory} {
+		request, limit := got.Requests[name], got.Limits[name]
+		if request.Cmp(limit) > 0 {
+			t.Fatalf("probe %s request %v exceeds its own limit %v; the API server would reject the pod", name, request, limit)
+		}
+	}
+}
+
+// TestProbePodResourcesLimitsAdmitUnderLimitTrackingQuota pins the quota
+// compatibility the fixed limits exist for: a namespace whose ResourceQuota
+// tracks limits.cpu and limits.memory admits only containers that specify
+// both, so the probe's container-level spec must carry a finite cpu and
+// memory limit no matter how the pod is rendered.
+func TestProbePodResourcesLimitsAdmitUnderLimitTrackingQuota(t *testing.T) {
+	got := ProbePodResources()
+	for _, name := range []corev1.ResourceName{corev1.ResourceCPU, corev1.ResourceMemory} {
+		limit, ok := got.Limits[name]
+		if !ok || limit.Sign() <= 0 {
+			t.Fatalf("probe limit %s = %v, want a finite positive limit: a ResourceQuota tracking limits.%s rejects the container without one", name, limit, name)
+		}
 	}
 }
 
@@ -190,11 +212,16 @@ func TestProbePodResourcesIsIndependentPerCall(t *testing.T) {
 	first := ProbePodResources()
 	first.Requests[corev1.ResourceCPU] = resource.MustParse("64")
 	first.Requests[corev1.ResourceEphemeralStorage] = resource.MustParse("1Gi")
+	first.Limits[corev1.ResourceCPU] = resource.MustParse("128")
+	first.Limits[corev1.ResourceEphemeralStorage] = resource.MustParse("1Gi")
 
 	second := ProbePodResources()
-	assertRequests(t, second.Requests, "10m", "32Mi")
+	assertRequestsAndLimits(t, second, "10m", "32Mi", "500m", "256Mi")
 	if _, ok := second.Requests[corev1.ResourceEphemeralStorage]; ok {
 		t.Fatalf("requests = %#v, want no leakage from a mutated earlier result", second.Requests)
+	}
+	if _, ok := second.Limits[corev1.ResourceEphemeralStorage]; ok {
+		t.Fatalf("limits = %#v, want no leakage from a mutated earlier result", second.Limits)
 	}
 }
 

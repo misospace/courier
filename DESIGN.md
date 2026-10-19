@@ -1392,11 +1392,17 @@ they are absent or non-positive — so every Courier-created pod carries finite
 CPU and memory requests whatever the lane says, which lets the scheduler
 bin-pack, keeps one runaway build from taking a node, and keeps these pods off
 the front of the eviction queue. The one deliberate exception is the preflight
-probe pod: its sizing is fixed (10m CPU / 32Mi memory requested, no limits) and
-does not follow the lane, because preflight creates one probe per eligible node
-simultaneously and a seconds-lived network check reserving lane-scale capacity
-can stay Pending on a request-tight cluster and wedge preflight; the fixed
-finite requests keep it schedulable and never BestEffort. A lane that
+probe pod: its sizing is fixed (10m CPU / 32Mi memory requested, 500m CPU /
+256Mi memory limited) and does not follow the lane, because preflight creates one
+probe per eligible node simultaneously and a seconds-lived network check
+reserving lane-scale capacity can stay Pending on a request-tight cluster and
+wedge preflight; the fixed finite requests keep it schedulable and never
+BestEffort, and the fixed generous limits keep it admissible where a
+ResourceQuota tracks limits.cpu or limits.memory — such a quota rejects any
+container missing the matching limit, and the probe image's real usage (a shell
+doing DNS and network checks) peaks in the tens of MiB, far under the limit, so
+the limit cannot OOM-kill the probe and falsify the isolation result it exists
+to produce. A lane that
 configures neither half gets the default whole; a limits-only lane gets the
 default requests; a requests-only lane is
 rendered with exactly its own requests plus the floored halves, so its pods
@@ -4421,9 +4427,24 @@ earns a 401 that is classified as a definite denial (superseded by #406: a
   Probe pods now carry a fixed small sizing (`ProbePodResources`: 10m CPU /
   32Mi memory requested) that deliberately bypasses `EffectivePodResources`,
   so a probe never reserves lane-scale capacity; the fixed finite requests keep
-  the no-BestEffort invariant, and limits stay omitted because a limit under
-  the probe image's real usage would OOM-kill the probe and falsify the
-  isolation result it exists to produce. Probe sizing is an implementation
+  the no-BestEffort invariant. Probe sizing is an implementation
   constant, not a lane field — a disposable network check does not warrant
   per-operator sizing, and a second sizing source would be two truths about
   one pod. (#402, follow-up to #356/PR #401)
+- **2026-10-19 — #402: probe limits are fixed and generous, superseding this
+  decision's original "limits stay omitted" clause.** The first cut of the fixed
+  probe sizing omitted limits because a limit under the probe image's real usage
+  would OOM-kill the probe and falsify the isolation result it exists to
+  produce. Review of PR #407 caught the admission cost: a ResourceQuota that
+  tracks limits.cpu or limits.memory requires each container to specify the
+  matching limit, so a requests-only probe is denied Forbidden on such
+  namespaces, and the create paths treat that denial as an ordinary retryable
+  error — preflight requeues instead of proving anything. The probe now carries
+  fixed generous limits (500m CPU / 256Mi memory) alongside its fixed small
+  requests (10m CPU / 32Mi memory): the limits exist to satisfy limit-tracking
+  quota admission with wide headroom over the probe image's real usage (a shell
+  doing DNS and network checks peaks in the tens of MiB), so they cannot
+  OOM-kill the probe, and they stay strictly below the built-in default limits
+  (2 CPU/4Gi) so a probe never charges lane-scale limits against a quota.
+  Requests stay the sizing decision — limits do not reserve capacity, so the
+  scheduling problem #402 fixed is untouched. (#402, PR #407 review)

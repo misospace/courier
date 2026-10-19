@@ -364,9 +364,10 @@ func TestPartialLaneResourcesAreFloored(t *testing.T) {
 
 // TestProbePodSizingIsFixed pins the #402 decision: a probe pod carries the
 // fixed small probe sizing, not the lane's. Its requests stay finite so a
-// probe is never BestEffort, and its limits stay absent — a limit under the
-// probe image's real usage would OOM-kill the probe and falsify the
-// isolation result it exists to produce.
+// probe is never BestEffort, and its limits stay fixed too — a ResourceQuota
+// tracking limits.cpu or limits.memory rejects a container missing the
+// matching limit, so a requests-only probe would be denied Forbidden on such
+// namespaces and preflight would requeue on it forever.
 func TestProbePodSizingIsFixed(t *testing.T) {
 	run := testRun("resources-probe")
 	pod := ProbePod(run, "node-a", "busybox:test", "true")
@@ -379,9 +380,13 @@ func TestProbePodSizingIsFixed(t *testing.T) {
 		if !ok || quantity.IsZero() {
 			t.Fatalf("probe container carries no finite %s request: %+v", key, got)
 		}
-	}
-	if len(got.Limits) != 0 {
-		t.Fatalf("probe container limits = %+v, want none: a probe has no runaway build to bound", got.Limits)
+		limit, ok := got.Limits[key]
+		if !ok || limit.IsZero() {
+			t.Fatalf("probe container carries no finite %s limit: a quota tracking limits.%s would reject it", key, key)
+		}
+		if quantity.Cmp(limit) > 0 {
+			t.Fatalf("probe container %s request %v exceeds its limit %v; the API server would reject the pod", key, quantity, limit)
+		}
 	}
 }
 
@@ -390,9 +395,11 @@ func TestProbePodSizingIsFixed(t *testing.T) {
 // creates one probe per eligible node simultaneously and lane-scale
 // reservations there can leave probes Pending on a request-tight cluster.
 // The bound assertions, not just the inequality checks, are the regression
-// guard: a probe regressing to the default *requests* with no limits would
-// dodge an exact-equality check while reintroducing exactly the per-node
-// reservation that wedged preflight.
+// guard: a probe regressing to the default *requests* would dodge an
+// exact-equality check while reintroducing exactly the per-node reservation
+// that wedged preflight; its limits are bounded below the default limits for
+// the same reason — a probe charging 2 CPU/4Gi of limits against a quota is
+// lane-scale by the back door.
 func TestProbePodSizingIgnoresTheLane(t *testing.T) {
 	run := testRun("resources-probe-lane")
 	pod := ProbePod(run, "node-a", "busybox:test", "true")
@@ -409,6 +416,13 @@ func TestProbePodSizingIgnoresTheLane(t *testing.T) {
 	}
 	if got.Requests.Memory().Cmp(*floor.Memory()) >= 0 {
 		t.Fatalf("probe requests memory = %v, want strictly below the default floor %v", got.Requests.Memory(), floor.Memory())
+	}
+	defaultLimits := courier.DefaultPodResources().Limits
+	if got.Limits.Cpu().Cmp(*defaultLimits.Cpu()) >= 0 {
+		t.Fatalf("probe limits cpu = %v, want strictly below the default limit %v", got.Limits.Cpu(), defaultLimits.Cpu())
+	}
+	if got.Limits.Memory().Cmp(*defaultLimits.Memory()) >= 0 {
+		t.Fatalf("probe limits memory = %v, want strictly below the default limit %v", got.Limits.Memory(), defaultLimits.Memory())
 	}
 }
 
