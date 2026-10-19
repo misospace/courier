@@ -453,7 +453,7 @@ func (r *CoderRunReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 				return result, nil
 			}
 		} else if err := r.Launch(ctx, &run); err != nil {
-			if permanent := podAdmissionRejection(err); permanent != nil {
+			if permanent := terminalPreflightVerdict(err); permanent != nil {
 				return r.terminateNeedsHuman(ctx, &run, adapter, item, permanent)
 			}
 			if errors.Is(err, ErrProvisioningInFlight) {
@@ -541,7 +541,7 @@ func (r *CoderRunReconciler) resumeClaimed(ctx context.Context, run *courierv1al
 			return result, nil
 		}
 	} else if err := r.Launch(ctx, run); err != nil {
-		if permanent := podAdmissionRejection(err); permanent != nil {
+		if permanent := terminalPreflightVerdict(err); permanent != nil {
 			return r.terminateNeedsHuman(ctx, run, adapter, item, permanent)
 		}
 		if errors.Is(err, ErrProvisioningInFlight) {
@@ -713,19 +713,22 @@ func (r *CoderRunReconciler) terminateMissingHead(ctx context.Context, run *cour
 	return r.terminateNeedsHuman(ctx, run, adapter, item, &SecureNeedsHumanError{Reason: "HeadRepositoryGone", Detail: cause.Error()})
 }
 
-// secureLaunchFailure handles an error from LaunchSecure. The pod-admission
-// class — a rendered pod spec the API server refuses outright — terminalizes
-// the run, and fences the round first: a resumed launch reaches the launcher
-// with a live worker and a credentialed broker already provisioned, and a
+// secureLaunchFailure handles an error from LaunchSecure. The terminal
+// verdict classes — a rendered pod spec the API server refuses outright, and
+// a probe pod pinned to a node its name does not name — terminalize the run,
+// and fence the round first: a resumed launch reaches the launcher with a
+// live worker and a credentialed broker already provisioned, and a
 // NeedsHuman run is no longer observed and is reaped only after its retention
 // window, so a fence deferred past this reconcile would leave the untrusted
-// executor running and the broker holding credentials for all of it. A fence
+// executor running and the broker holding credentials for all of it. A
+// ProbeIdentity verdict can only arise on a first pass, before any topology
+// pod exists, so its fence is a no-op riding the same branch. A fence
 // that fails does not terminalize: the claim is released and the next pass
 // retries the fence. Every other error keeps the launch path's transient
 // behaviour — the claim is released back to Pending — because a signal that
-// clears on a later pass must not strand the run (podAdmissionRejection).
+// clears on a later pass must not strand the run (terminalPreflightVerdict).
 func (r *CoderRunReconciler) secureLaunchFailure(ctx context.Context, run *courierv1alpha1.CoderRun, adapter source.Adapter, item source.WorkItem, err error) (ctrl.Result, error) {
-	if permanent := podAdmissionRejection(err); permanent != nil {
+	if permanent := terminalPreflightVerdict(err); permanent != nil {
 		if fenceErr := r.Secure.Fence(ctx, run); fenceErr != nil {
 			return ctrl.Result{}, r.releaseClaim(ctx, run, adapter, item, fenceErr)
 		}
