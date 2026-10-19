@@ -1,8 +1,10 @@
 # AGENTS.md
 
 Conventions for anyone — human or model — working in this repository. Read this
-and [DESIGN.md](./DESIGN.md) before starting. DESIGN.md is the north star; when
-code and DESIGN.md disagree, DESIGN.md wins unless an issue says otherwise.
+and [DESIGN.md](./DESIGN.md) before starting. DESIGN.md describes the intended
+current architecture. When code and DESIGN.md disagree, determine which is
+stale and update the appropriate source rather than treating either as
+immutable.
 
 ## Keeping DESIGN.md current
 
