@@ -247,6 +247,35 @@ an untrusted isolated worker. Its contract and outstanding blockers are detailed
 in [HARNESS.md](./HARNESS.md); describing that target does not imply that its
 executor or worker isolation is implemented or production-ready.
 
+### Coordinator pod process lifetime
+
+The legacy pod runs the executor directly as PID 1 — the pod sets `Command`,
+and the coordinator image declares no entrypoint — so the kernel hands the
+executor every orphaned descendant its model child leaves behind (npm, node,
+esbuild, a `tail` that never exits), and PID 1 reaps none of them on its own.
+The executor therefore reaps: it asks to be a child subreaper, which is a no-op
+when it is already PID 1 and is what makes the same behaviour hold when it is
+not, then re-enumerates its own threads' children on every SIGCHLD and collects
+the dead ones. It only ever collects. A live orphan keeps running exactly as
+long as its dead parent left it running; the reaper never signals, kills, or
+touches a process group, and termination propagation is unchanged.
+
+Collecting never takes a status from a waiter. Every child the executor starts
+goes through one funnel that registers the pid before the start is released, so
+its exit status stays with `Wait`; and a descendant is collectable only when it
+sits in a process group a supervised child led. That last condition is what
+separates the model child's tool tree from the git children `internal/git` and
+the evidence capture start directly: the kernel makes an adopted orphan an
+ordinary child and offers nothing else to tell the two apart, so without it a
+drain pass would consume a real git status and silently change a run's ending.
+Both children the executor starts with their own group — the model child and
+the preflight `mcp list` probe — are therefore covered, and the groups are not
+removed once their children exit, because the orphans worth collecting only
+exist once they have. What that leaves uncollected is stated rather than
+implied away: an orphan that made a group or session of its own (`setsid`, a
+detached spawn), and the git, ssh and askpass descendants a killed run orphans
+into the executor's own group.
+
 ## Capacity exhaustion and cross-worker recovery (#327)
 
 A structured `capacity_exhausted` outcome is distinct from task failure, an
@@ -2037,6 +2066,35 @@ named items remain unresolved and must not be described as production-ready:
 - The exact vLLM gauge for backpressure on the target model server.
 
 ## Decisions
+- **2026-10-18 — #347: the executor reaps adopted descendants, and only those
+  whose statuses no waiter owns.** The coordinator pod ran the executor as PID
+  1, so the kernel reparented every orphaned descendant of the model child —
+  npm, node, esbuild, a stuck `tail`, nine hours of them — to a process that
+  reaps nothing, and the pod accumulated zombies for the length of each run.
+  The fix is not "reap faster": a reaper that collects every dead child steals
+  statuses. An adopted orphan is an ordinary child of the executor, and the
+  children the executor spawns itself (the `internal/git` calls, the evidence
+  capture) are ordinary children too, unregistered by anything the reaper can
+  see. Reaping one of those replaces a real git exit status with `ECHILD` — a
+  run's ending decided by a scheduling race, which is the one thing the change
+  must not do, and what a first implementation did until it was bounded. Two
+  conditions make it safe instead of fast: every child the executor starts
+  registers its pid with the reaper before the start is released, so `Wait`
+  keeps its status, and a descendant is collectable only inside a process group
+  a supervised child led. The model child and the preflight `mcp list` probe are
+  the two children the executor starts with their own process group, so that
+  condition covers the tool tree that leaks and provably excludes the executor's
+  own children. The cost of that condition, stated rather than implied away: an
+  orphan that made a group or session of its own (`setsid`, a detached spawn),
+  and the git, ssh and askpass descendants a killed run orphans into the
+  executor's own group, are adopted and then left alone. Signalling a live
+  orphan was rejected outright — an abandoned `npm` or `esbuild` is another
+  process's problem, and killing it would change what the model left running.
+  Arming is `main`'s alone and not the run's: a reaper armed by any caller
+  would turn the test binary, which runs this executor in process, into a
+  subreaper that adopts every orphan its subprocesses leave and then, correctly,
+  declines most of them. (#347)
+
 - **2026-10-18 — #439: a preflight probe's name is a readable prefix plus a
   digest of the whole node name, and a probe is evidence only for the node it
   is pinned to.** Probe pod names were derived from the node name by
