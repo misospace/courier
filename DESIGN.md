@@ -1229,6 +1229,19 @@ and the legacy executor's classification through `internal/devenv`:
   waits between polls must still reconcile the running operation through
   cancellation, because the worker answers "running" immediately and only
   an in-flight poll would otherwise carry the kill.
+  A termination that was never OBSERVED is not an environment blocker:
+  repository-authored work may still be executing, so the run must never be
+  reported blocked-external over it. The stage's active-operation entry
+  stays retained, the worker is fenced against every further dispatch, and
+  the failure fails closed through the ordinary error path carrying the
+  unverified-termination fact. Every path that can leave a termination
+  unobserved produces that fact: a reconciliation that failed, one that
+  observed work still live in the task tree or an operation the worker
+  still reports as running, and an ordinary observation of a task tree that
+  outlived its task. Only an independently observed termination — the worker
+  no longer knows the operation, or a terminal observation with an empty
+  process tree — may classify a bound expiry as the environment blocker it
+  is.
   The environment capture is size-capped at the source (64 KiB, paired with
   the `Task.Env` dispatch bound and the worker's 64 KiB stdout tail): an
   oversized capture fails the task honestly with a nonzero exit, never a

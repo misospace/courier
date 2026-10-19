@@ -135,16 +135,14 @@ func (c *Coordinator) recordBootstrapBlocker(err error) {
 	}
 }
 
-// takeBootstrapBlocker removes and returns a recorded bootstrap environment
-// blocker, if any.
-// fenceWorker records the worker fence (#414 review): once an operation
-// expired with unverified termination, no further dispatch may run against
+// fenceWorker records the worker fence (#414 review): once an operation's
+// termination could not be observed, no further dispatch may run against
 // this worker. First cause wins; fencing never un-fences.
 func (c *Coordinator) fenceWorker(opID string, cause error) {
 	c.workerFenceMu.Lock()
 	defer c.workerFenceMu.Unlock()
 	if c.workerFenceErr == nil {
-		c.workerFenceErr = fmt.Errorf("the worker is fenced: operation %s expired with process termination unverified (%v); no further workspace operation may run against it", opID, cause)
+		c.workerFenceErr = fmt.Errorf("the worker is fenced: termination of operation %s could not be verified (%v); no further workspace operation may run against it", opID, cause)
 	}
 }
 
@@ -155,6 +153,8 @@ func (c *Coordinator) workerFenced() error {
 	return c.workerFenceErr
 }
 
+// takeBootstrapBlocker removes and returns a recorded bootstrap environment
+// blocker, if any.
 func (c *Coordinator) takeBootstrapBlocker() error {
 	c.bootstrapBlockerMu.Lock()
 	defer c.bootstrapBlockerMu.Unlock()
@@ -1145,7 +1145,11 @@ const reconcileGrace = 30 * time.Second
 // writes the earned tool heartbeat in the same update; a verified
 // cancellation or death clears without one. An ambiguous transport failure is
 // reconciled through cancellation — never automatic redelivery — and the
-// observed state is returned either way; a reconciliation that cannot prove
+// observed state is returned when the reconciliation proves the operation
+// stopped; a reconciliation that cannot prove it (it failed, or it observed
+// work still live in the task tree) is an unverified termination: the worker
+// is fenced and the error carries ErrTerminationUnverified, so no caller can
+// treat it as a settled outcome. A reconciliation that cannot prove
 // termination retains the entry, because an operation that may still be
 // executing is never claimed cleared.
 func (c *Coordinator) dispatchAndAwait(ctx context.Context, opID, briefID string, task protocol.Task) (protocol.Result, error) {
@@ -1170,7 +1174,24 @@ func (c *Coordinator) dispatchAndAwait(ctx context.Context, opID, briefID string
 		defer reconcileCancel()
 		state, reconcileErr := c.worker.ReconcileAmbiguous(reconcileCtx, opID, briefID)
 		if reconcileErr != nil {
-			return protocol.Result{}, fmt.Errorf("dispatch of %s failed and reconciliation failed: dispatch: %v; reconcile: %w", opID, err, reconcileErr)
+			// A reconciliation that could not observe termination leaves the
+			// operation's fate unknown: the cancellation may never have
+			// reached the worker. The worker is fenced and the error carries
+			// the unverified-termination fact, so no caller can treat this
+			// as a settled outcome or classify the operation as safely
+			// stopped.
+			c.fenceWorker(opID, reconcileErr)
+			return protocol.Result{}, fmt.Errorf("dispatch of %s failed and reconciliation failed: dispatch: %v; reconcile: %w: %w", opID, err, reconcileErr, ErrTerminationUnverified)
+		}
+		if !terminationObserved(state) {
+			// The reconciliation came back without proving the operation
+			// stopped: work is still live in its task tree, or the worker
+			// still reports it as running. That is an unverified
+			// termination, never a settled outcome: the worker is fenced
+			// and the error carries the unverified-termination fact.
+			detail := unverifiedTerminationDetail(state)
+			c.fenceWorker(opID, detail)
+			return protocol.Result{}, fmt.Errorf("dispatch of %s failed and reconciliation did not observe termination: %v: %w", opID, detail, ErrTerminationUnverified)
 		}
 		result, resultErr := c.verifiedResult(reconcileCtx, opID, state)
 		if resultErr == nil {
@@ -1201,6 +1222,18 @@ func (c *Coordinator) dispatchAndAwait(ctx context.Context, opID, briefID string
 				// as safely stopped.
 				c.fenceWorker(opID, reconcileErr)
 				return protocol.Result{}, fmt.Errorf("result poll for %s failed and reconciliation failed: poll: %v; reconcile: %v: %w", opID, err, reconcileErr, ErrTerminationUnverified)
+			}
+			if !terminationObserved(reconciled) {
+				// The reconciliation came back without proving the operation
+				// stopped: work is still live in its task tree, or the
+				// worker still reports it as running. That is an unverified
+				// termination, never a settled outcome: the entry stays
+				// retained, the worker is fenced against every further
+				// dispatch, and the error carries the unverified-termination
+				// fact.
+				detail := unverifiedTerminationDetail(reconciled)
+				c.fenceWorker(opID, detail)
+				return protocol.Result{}, fmt.Errorf("result poll for %s failed and reconciliation did not observe termination: %v: %w", opID, detail, ErrTerminationUnverified)
 			}
 			result, resultErr := c.verifiedResult(reconcileCtx, opID, reconciled)
 			if resultErr == nil {
@@ -1260,11 +1293,7 @@ func (c *Coordinator) dispatchAndAwait(ctx context.Context, opID, briefID string
 			}
 			detail := reconcileErr
 			if detail == nil {
-				if reconciled.Result != nil && reconciled.Result.LiveDescendants > 0 {
-					detail = fmt.Errorf("%d processes still live in its task tree", reconciled.Result.LiveDescendants)
-				} else {
-					detail = fmt.Errorf("the worker still reports the operation as %q", reconciled.Status)
-				}
+				detail = unverifiedTerminationDetail(reconciled)
 			}
 			c.fenceWorker(opID, detail)
 			return protocol.Result{}, fmt.Errorf("%w: termination of operation %s is unverified: %v: %w", ctx.Err(), opID, detail, ErrTerminationUnverified)
@@ -1272,6 +1301,17 @@ func (c *Coordinator) dispatchAndAwait(ctx context.Context, opID, briefID string
 		}
 		c.control.PollThrottled(ctx)
 	}
+}
+
+// unverifiedTerminationDetail names the observed fact that left an
+// operation's termination unproven: work still live in the task tree, or a
+// worker that still reports the operation as live. Every unverified
+// termination reads alike, whatever path observed it.
+func unverifiedTerminationDetail(state protocol.ResultState) error {
+	if state.Result != nil && state.Result.LiveDescendants > 0 {
+		return fmt.Errorf("%d processes still live in its task tree", state.Result.LiveDescendants)
+	}
+	return fmt.Errorf("the worker still reports the operation as %q", state.Status)
 }
 
 // verifiedResult renders an independently observed terminal state as an
@@ -1292,8 +1332,11 @@ func (c *Coordinator) verifiedResult(ctx context.Context, opID string, state pro
 		// The worker reported work that outlived the task, so its terminal
 		// observation is not a verified termination: the entry is retained
 		// and the result is returned as an error, never as a cleared,
-		// suppressible operation (#372).
-		return *state.Result, fmt.Errorf("operation %s ended as %s with %d processes still live in its task tree", opID, state.Status, state.Result.LiveDescendants)
+		// suppressible operation (#372). The error carries the
+		// unverified-termination fact, so a caller that must not report a
+		// stopped task it never observed stopping — the bootstrap stage —
+		// can fail closed instead of classifying the ending.
+		return *state.Result, fmt.Errorf("operation %s ended as %s with %d processes still live in its task tree: %w", opID, state.Status, state.Result.LiveDescendants, ErrTerminationUnverified)
 	}
 	c.closeOperation(ctx, opID, state.Status == protocol.ResultCompleted)
 	return *state.Result, nil
@@ -1497,17 +1540,21 @@ func (c *Coordinator) bootstrapWorkspace(ctx context.Context, briefID, baseOID s
 		}
 		return err
 	}
-	if bootstrapCtx.Err() != nil {
+	if errors.Is(err, ErrTerminationUnverified) {
 		// Unverified termination is not the bootstrap's own failure (#414
-		// review): if the bound expired without the process-group kill being
-		// observed, repository-authored work may still be executing, and the
-		// run must not classify blocked-external over it. The active-operation
-		// entry stays retained and the worker stays fenced; the error fails
-		// closed through the ordinary snapshot-preparation path, which cannot
-		// dispatch again against a fenced worker.
-		if errors.Is(err, ErrTerminationUnverified) {
-			return err
-		}
+		// review): the process-group kill was never observed, so
+		// repository-authored work may still be executing, and the run must
+		// not classify blocked-external over it. The active-operation entry
+		// stays retained and the worker is fenced — the fence is set here,
+		// not only where the bound expiry produced the error, so an
+		// unverified termination observed on any path stops the next
+		// dispatch against a worker that may still be running repository
+		// work. The error fails closed through the ordinary
+		// snapshot-preparation path.
+		c.fenceWorker(bootstrapOpID, err)
+		return err
+	}
+	if bootstrapCtx.Err() != nil {
 		// Bound expiry is classified from the stage context itself, not by
 		// unwrapping the error: the stage context past its deadline while
 		// the parent is still live is the stage's own liveness bound,
@@ -1515,9 +1562,6 @@ func (c *Coordinator) bootstrapWorkspace(ctx context.Context, briefID, baseOID s
 		// cancellation dispatchAndAwait delivered. A transport failure with
 		// a live parent is an ordinary snapshot-preparation failure.
 		reason := bootstrapBlockerReasonPrefix + ": the bootstrap task exceeded its liveness bound"
-		if errors.Is(err, ErrTerminationUnverified) {
-			reason += " and its process-group termination could not be observed"
-		}
 		c.recordBootstrapReceipt(BootstrapReceipt{
 			Status:             BootstrapReceiptFailed,
 			Reason:             reason,
@@ -1570,18 +1614,16 @@ func (c *Coordinator) bootstrapWorkspace(ctx context.Context, briefID, baseOID s
 		}
 		return err
 	}
+	if errors.Is(err, ErrTerminationUnverified) {
+		// The same unverified-termination rule as the bootstrap stage: a
+		// termination that was never observed is not an environment blocker.
+		// The entry stays retained, the worker is fenced, and the error fails
+		// closed through the ordinary path.
+		c.fenceWorker(captureOpID, err)
+		return err
+	}
 	if captureCtx.Err() != nil {
-		// The same unverified-termination rule as the bootstrap stage: an
-		// expiry whose kill was never observed is not an environment blocker.
-		// The entry stays retained, the worker stays fenced, and the error
-		// fails closed through the ordinary path.
-		if errors.Is(err, ErrTerminationUnverified) {
-			return err
-		}
 		reason := bootstrapBlockerReasonPrefix + ": the environment-capture task exceeded its liveness bound"
-		if errors.Is(err, ErrTerminationUnverified) {
-			reason += " and its process-group termination could not be observed"
-		}
 		c.recordBootstrapReceipt(BootstrapReceipt{
 			Status:             BootstrapReceiptFailed,
 			Reason:             reason,

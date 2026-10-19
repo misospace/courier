@@ -836,33 +836,53 @@ func TestIntegratorContractStateModifiedBySymlinkedConfigAtHead(t *testing.T) {
 // TestBootstrapUnverifiedTerminationIsNotABlocker pins the #414 review
 // regression: when a stage's liveness bound expires and its reconciliation
 // cannot observe the process-group kill — the reconcile's own result poll
-// failing after the cancellation lands — the error must carry
-// ErrTerminationUnverified, must NOT be classified as a bootstrapBlocker,
-// no failed receipt may be recorded, the active-operation entry must stay
-// retained, and the worker fence must reject every further dispatch. A run
-// whose worker may still be executing repository-authored work can never
-// be reported as a settled blocked-external ending.
+// failing after the cancellation lands, or the reconcile observing work
+// still live in the task tree — the error must carry ErrTerminationUnverified,
+// must NOT be classified as a bootstrapBlocker, no failed receipt may be
+// recorded, the active-operation entry must stay retained, and the worker
+// fence must reject every further dispatch. A run whose worker may still be
+// executing repository-authored work can never be reported as a settled
+// blocked-external ending.
 func TestBootstrapUnverifiedTerminationIsNotABlocker(t *testing.T) {
 	for _, tc := range []struct {
 		stage            string
+		variant          string
 		wantDrops        int
 		wantClears       int
 		bootstrapResults []protocol.Result
 	}{
-		{"bootstrap", 1, 0, nil},
-		{"capture", 2, 1, []protocol.Result{
+		{"bootstrap", "reconcile-fails", 1, 0, nil},
+		{"capture", "reconcile-fails", 2, 1, []protocol.Result{
 			// The bootstrap stage completed and was verified, so its entry
 			// is legitimately cleared; only the hung stage's entry must be
 			// retained.
 			{ExitCode: 0, StdoutTail: "courier-mise-path=/usr/bin/mise\n"},
 		}},
+		{"bootstrap", "live-descendants", 1, 0, nil},
+		{"capture", "live-descendants", 2, 1, []protocol.Result{
+			{ExitCode: 0, StdoutTail: "courier-mise-path=/usr/bin/mise\n"},
+		}},
 	} {
-		t.Run(tc.stage, func(t *testing.T) {
+		t.Run(tc.stage+"/"+tc.variant, func(t *testing.T) {
 			worker, delegator, cleanupWorker := testWorkerAndDelegator(t)
 			defer cleanupWorker()
 			worker.hangStage = tc.stage
 			worker.bootstrapResults = tc.bootstrapResults
-			worker.reconcileFails = true
+			switch tc.variant {
+			case "reconcile-fails":
+				// The cancellation lands, but the reconcile cannot observe
+				// what happened to the task afterward.
+				worker.reconcileFails = true
+			case "live-descendants":
+				// The cancellation lands, and the reconcile observes work
+				// still live in the task tree: the observation proves no
+				// termination. The operation's poll stays in flight past
+				// the stage's bound, so the poll-failure path — not the
+				// poll wait — is the one that reconciles.
+				worker.scriptUnobservedTermination(3, 750*time.Millisecond)
+			default:
+				t.Fatalf("unknown variant %q", tc.variant)
+			}
 
 			transport := &recordingTransport{}
 			receipts := &recordingBootstrapReceipts{}
@@ -881,7 +901,11 @@ func TestBootstrapUnverifiedTerminationIsNotABlocker(t *testing.T) {
 			}
 
 			restored := bootstrapBound
-			bootstrapBound = 100 * time.Millisecond
+			// The bound outlives the dispatch, so the case reaches the
+			// operation it scripts; the live-descendants variant's poll
+			// delay outlives the bound, so the bound expires while that poll
+			// is in flight.
+			bootstrapBound = 250 * time.Millisecond
 			defer func() { bootstrapBound = restored }()
 
 			err = coordinator.bootstrapWorkspace(context.Background(), "b1", testBaseOID)
@@ -919,6 +943,10 @@ func TestBootstrapUnverifiedTerminationIsNotABlocker(t *testing.T) {
 			if clears != tc.wantClears {
 				t.Fatalf("status patches record %d cleared operations, want %d — the hung stage's entry must stay retained", clears, tc.wantClears)
 			}
+			// Only the hung stage reached the worker.
+			if got := worker.dispatchCount(); got != tc.wantDrops {
+				t.Fatalf("worker dispatches = %d, want %d", got, tc.wantDrops)
+			}
 			// The worker fence rejects the next dispatch without any
 			// further task reaching the worker.
 			drops := worker.dispatchCount()
@@ -930,5 +958,83 @@ func TestBootstrapUnverifiedTerminationIsNotABlocker(t *testing.T) {
 				t.Fatalf("worker dispatches after fence = %d, want %d — the fence must refuse every dispatch", got, drops)
 			}
 		})
+	}
+}
+
+// TestBootstrapObservedLiveDescendantsIsNotABlocker pins the same #414
+// review invariant for the ORDINARY observation: a bootstrap task whose
+// terminal observation reports work still live in its task tree is not a
+// verified termination either. The ending must not be classified as the
+// environment blocker it is not, no failed receipt may be recorded, the
+// active-operation entry must stay retained, and the worker must be fenced
+// against every further dispatch — the bootstrap stage is dispatched
+// automatically, so a retry against a worker that may still be running
+// repository-authored work is the harness's own decision to make.
+func TestBootstrapObservedLiveDescendantsIsNotABlocker(t *testing.T) {
+	worker, delegator, cleanupWorker := testWorkerAndDelegator(t)
+	defer cleanupWorker()
+	worker.bootstrapResults = []protocol.Result{{
+		Status:     protocol.ResultCompleted,
+		ExitCode:   0,
+		StdoutTail: "courier-mise-path=/usr/bin/mise\n",
+		// The task's process group is not empty: the terminal observation
+		// carries live work, so it proves no termination.
+		LiveDescendants: 2,
+	}}
+
+	transport := &recordingTransport{}
+	receipts := &recordingBootstrapReceipts{}
+
+	gateway, _, cleanup := gatewayFor()
+	defer cleanup()
+	coordinator, err := NewCoordinator(CoordinatorConfig{
+		Gateway:           gateway,
+		Bindings:          testBindings(),
+		Worker:            delegator,
+		Status:            NewStatusReporter(transport, "control-uid", "worker-uid", 0),
+		BootstrapReceipts: receipts,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	err = coordinator.bootstrapWorkspace(context.Background(), "b1", testBaseOID)
+
+	if !errors.Is(err, ErrTerminationUnverified) {
+		t.Fatalf("unobserved termination error = %v, want ErrTerminationUnverified in its chain", err)
+	}
+	var blocker *bootstrapBlocker
+	if errors.As(err, &blocker) {
+		t.Fatalf("unobserved termination error = %v, must not be a bootstrapBlocker", err)
+	}
+	if got := len(receipts.receipts); got != 0 {
+		t.Fatalf("bootstrap receipts = %d, want none for an unobserved termination", got)
+	}
+	transport.mu.Lock()
+	adds, clears := 0, 0
+	for _, p := range transport.patches {
+		if p.AddOperation != nil {
+			adds++
+		}
+		if p.ClearOperation != "" {
+			clears++
+		}
+	}
+	transport.mu.Unlock()
+	if adds == 0 {
+		t.Fatalf("status patches record no begun operation, want the dispatch evidence retained")
+	}
+	if clears != 0 {
+		t.Fatalf("status patches record %d cleared operations, want none — an operation that may still be executing is never claimed cleared", clears)
+	}
+	// The worker fence rejects the next dispatch without any further task
+	// reaching the worker.
+	drops := worker.dispatchCount()
+	err = coordinator.bootstrapWorkspace(context.Background(), "b1", testBaseOID)
+	if err == nil || !strings.Contains(err.Error(), "fenced") {
+		t.Fatalf("post-fence bootstrap error = %v, want the worker fence rejection", err)
+	}
+	if got := worker.dispatchCount(); got != drops {
+		t.Fatalf("worker dispatches after fence = %d, want %d — the fence must refuse every dispatch", got, drops)
 	}
 }
