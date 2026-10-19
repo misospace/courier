@@ -15,7 +15,6 @@ import (
 
 	courierv1alpha1 "github.com/misospace/courier/api/v1alpha1"
 	"github.com/misospace/courier/internal/harness"
-	corev1 "k8s.io/api/core/v1"
 	utilvalidation "k8s.io/apimachinery/pkg/util/validation"
 	"sigs.k8s.io/yaml"
 )
@@ -34,9 +33,9 @@ type Profile struct {
 	// #295); nil means no declared budget. Same bounds as the CRD field it
 	// mirrors; resolution stays in internal/harness.
 	Context *courierv1alpha1.ContextPolicy `json:"context,omitempty"`
-	// Resources sizes the pods Courier creates for runs on this lane;
-	// empty means the lane gets the built-in default.
-	Resources corev1.ResourceRequirements `json:"resources,omitempty"`
+	// Resources sizes the pods Courier creates using Courier's narrowed
+	// requests/limits vocabulary; empty means the lane gets the built-in default.
+	Resources courierv1alpha1.PodResources `json:"resources,omitempty"`
 }
 
 // Parse reads a bootstrap config document: a top-level profiles list of

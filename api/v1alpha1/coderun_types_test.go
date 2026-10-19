@@ -37,6 +37,48 @@ func TestPublicationPolicyWire(t *testing.T) {
 	}
 }
 
+// TestCRDManifestLaneProfileResourcesSchema pins the generated CRD manifest to
+// the narrowed LaneProfile pod-resources vocabulary.
+func TestCRDManifestLaneProfileResourcesSchema(t *testing.T) {
+	manifest, err := os.ReadFile("../../charts/courier/crd-manifests/courier.misospace.dev_laneprofiles.yaml")
+	if err != nil {
+		t.Fatalf("read CRD manifest: %v", err)
+	}
+	lines := strings.Split(string(manifest), "\n")
+	var resources []string
+	inProperties := false
+	inResources := false
+	indent := ""
+	for _, line := range lines {
+		if !inProperties {
+			if strings.Contains(line, "properties:") {
+				inProperties = true
+			}
+			continue
+		}
+		if !inResources {
+			if i := strings.Index(line, "resources:"); i >= 0 {
+				inResources = true
+				indent = line[:i]
+			}
+			continue
+		}
+		if strings.HasPrefix(line, indent) && len(line) > len(indent) && line[len(indent)] != ' ' {
+			break
+		}
+		resources = append(resources, line)
+	}
+	block := strings.Join(resources, "\n")
+	if strings.Contains(block, "claims:") {
+		t.Fatal("LaneProfile CRD resources schema still accepts claims")
+	}
+	for _, key := range []string{"requests:", "limits:"} {
+		if !strings.Contains(block, key) {
+			t.Fatalf("LaneProfile CRD resources schema missing %s", key)
+		}
+	}
+}
+
 // TestCRDManifestPolicySchema pins the generated CRD manifest to the same
 // invariant: no controlPodUID anywhere under the publicationPolicy schema.
 func TestCRDManifestPolicySchema(t *testing.T) {
