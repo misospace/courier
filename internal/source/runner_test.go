@@ -3,8 +3,10 @@ package source
 import (
 	"context"
 	"errors"
+	"fmt"
 	"reflect"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -1533,12 +1535,18 @@ func TestRunnerRecreatesStillOfferedWorkAfterReap(t *testing.T) {
 
 type ackingAdapter struct {
 	testAdapter
+	// mu guards the ack record and the failure budget: the runner drains
+	// pending acks concurrently, so a single Poll can append from several
+	// goroutines at once.
+	mu        sync.Mutex
 	acks      []WorkItem
 	ackError  error
 	failFirst int
 }
 
 func (a *ackingAdapter) AckHandout(_ context.Context, item WorkItem) error {
+	a.mu.Lock()
+	defer a.mu.Unlock()
 	if a.failFirst > 0 {
 		a.failFirst--
 		a.acks = append(a.acks, item)
@@ -1546,6 +1554,26 @@ func (a *ackingAdapter) AckHandout(_ context.Context, item WorkItem) error {
 	}
 	a.acks = append(a.acks, item)
 	return a.ackError
+}
+
+// ackCount reports how many ack attempts the adapter has recorded.
+func (a *ackingAdapter) ackCount() int {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return len(a.acks)
+}
+
+// ackedIDs returns the acked work item IDs. Ordering between distinct items is
+// not part of the contract: the runner drains pending acks concurrently, so
+// assertions must match by work item ID rather than by position.
+func (a *ackingAdapter) ackedIDs() []string {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	ids := make([]string, 0, len(a.acks))
+	for _, item := range a.acks {
+		ids = append(ids, item.ID)
+	}
+	return ids
 }
 
 func TestRunnerPollAcksHandOutWhenRunMaterializes(t *testing.T) {
@@ -1557,8 +1585,8 @@ func TestRunnerPollAcksHandOutWhenRunMaterializes(t *testing.T) {
 	if err := runner.Poll(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	if len(adapter.acks) != 1 || adapter.acks[0].ID != item.ID {
-		t.Fatalf("acks = %#v, want one ack for %q", adapter.acks, item.ID)
+	if ids := adapter.ackedIDs(); len(ids) != 1 || ids[0] != item.ID {
+		t.Fatalf("acks = %v, want one ack for %q", ids, item.ID)
 	}
 }
 
@@ -1575,8 +1603,8 @@ func TestRunnerPollAckFailureDoesNotBlockMaterialization(t *testing.T) {
 	if err := runner.Poll(context.Background()); err != nil {
 		t.Fatalf("Poll: %v", err)
 	}
-	if len(adapter.acks) != len(items)*maxHandoutAckAttempts {
-		t.Fatalf("acks = %d, want %d bounded retries per materialized item", len(adapter.acks), len(items)*maxHandoutAckAttempts)
+	if got := adapter.ackCount(); got != len(items)*maxHandoutAckAttempts {
+		t.Fatalf("acks = %d, want %d bounded retries per materialized item", got, len(items)*maxHandoutAckAttempts)
 	}
 	var runs courierv1alpha1.CoderRunList
 	if err := kubeClient.List(context.Background(), &runs, client.InNamespace("courier")); err != nil {
@@ -1599,8 +1627,8 @@ func TestRunnerPollRetriesFailedHandOutAckUntilSuccess(t *testing.T) {
 	if err := runner.Poll(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	if len(adapter.acks) != maxHandoutAckAttempts {
-		t.Fatalf("acks = %d, want %d attempts", len(adapter.acks), maxHandoutAckAttempts)
+	if got := adapter.ackCount(); got != maxHandoutAckAttempts {
+		t.Fatalf("acks = %d, want %d attempts", got, maxHandoutAckAttempts)
 	}
 	var runs courierv1alpha1.CoderRunList
 	if err := kubeClient.List(context.Background(), &runs, client.InNamespace("courier")); err != nil {
@@ -1623,7 +1651,7 @@ func TestRunnerPollReAcksHandOutWhenRunAlreadyExists(t *testing.T) {
 	if err := runner.Poll(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	firstAcks := len(adapter.acks)
+	firstAcks := adapter.ackCount()
 	// The source keeps offering the item whose run already exists
 	// (exclusions are hints): the ack must be re-attempted, because an
 	// earlier ack failure leaves the hand-out outstanding (#456).
@@ -1632,7 +1660,7 @@ func TestRunnerPollReAcksHandOutWhenRunAlreadyExists(t *testing.T) {
 	if err := runner.Poll(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	if reAcks := len(adapter.acks) - firstAcks; reAcks != 2 {
+	if reAcks := adapter.ackCount() - firstAcks; reAcks != 2 {
 		t.Fatalf("re-acks = %d, want a failed attempt plus a successful retry on the skip path", reAcks)
 	}
 	var runs courierv1alpha1.CoderRunList
@@ -1660,5 +1688,286 @@ func TestRunnerPollSkipsAckForAdaptersWithoutCapability(t *testing.T) {
 	}
 	if len(runs.Items) != 1 {
 		t.Fatalf("created %d runs, want 1", len(runs.Items))
+	}
+}
+
+// ackGateAdapter is an acking adapter whose AckHandout blocks until released
+// or until its context expires, and which records how many acks were ever in
+// flight at once.
+type ackGateAdapter struct {
+	testAdapter
+	release     chan struct{}
+	once        sync.Once
+	mu          sync.Mutex
+	inFlight    int
+	maxInFlight int
+	settled     map[string]bool
+	calls       int
+}
+
+func (a *ackGateAdapter) AckHandout(ctx context.Context, item WorkItem) error {
+	a.mu.Lock()
+	a.calls++
+	a.inFlight++
+	if a.inFlight > a.maxInFlight {
+		a.maxInFlight = a.inFlight
+	}
+	a.mu.Unlock()
+	defer func() {
+		a.mu.Lock()
+		a.inFlight--
+		a.mu.Unlock()
+	}()
+	select {
+	case <-ctx.Done():
+		return errors.New("ack deadline expired")
+	case <-a.release:
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.settled == nil {
+		a.settled = map[string]bool{}
+	}
+	a.settled[item.ID] = true
+	return nil
+}
+
+// releaseGate unblocks the adapter's acks exactly once. Tests register it with
+// t.Cleanup so a failing assertion can never leave a drain goroutine blocked
+// and holding the runner's poll mutex for the rest of the run.
+func (a *ackGateAdapter) releaseGate() {
+	a.once.Do(func() { close(a.release) })
+}
+
+func (a *ackGateAdapter) maxConcurrent() int {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.maxInFlight
+}
+
+func (a *ackGateAdapter) callCount() int {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.calls
+}
+
+func (a *ackGateAdapter) acked() map[string]bool {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	snapshot := make(map[string]bool, len(a.settled))
+	for id := range a.settled {
+		snapshot[id] = true
+	}
+	return snapshot
+}
+
+func ackGateItems(count int) []WorkItem {
+	items := make([]WorkItem, 0, count)
+	for i := 1; i <= count; i++ {
+		items = append(items, WorkItem{
+			ID:   fmt.Sprintf("opaque-%d", i),
+			Mode: "fix-pr", Repo: "acme/widgets", Ref: i, Lane: "source-lane",
+		})
+	}
+	return items
+}
+
+func countRuns(t *testing.T, kubeClient client.Client) int {
+	t.Helper()
+	var runs courierv1alpha1.CoderRunList
+	if err := kubeClient.List(context.Background(), &runs, client.InNamespace("courier")); err != nil {
+		t.Fatal(err)
+	}
+	return len(runs.Items)
+}
+
+// TestRunnerPollMaterializesEveryItemBeforeAckReturns pins the two-phase
+// discovery contract: a Dispatch outage must not delay the materialization of
+// another item's CoderRun. Both budgets are set past the end of the test, so a
+// blocked ack can never return on its own — under inline acking the first item
+// would still be waiting when the last item is due to exist, and the run count
+// would never reach the offered count.
+func TestRunnerPollMaterializesEveryItemBeforeAckReturns(t *testing.T) {
+	items := ackGateItems(3)
+	adapter := &ackGateAdapter{testAdapter: testAdapter{items: items}, release: make(chan struct{})}
+	t.Cleanup(adapter.releaseGate)
+	kubeClient := newTestClient(t, testLane())
+	runner := NewRunner(kubeClient, adapter, RunnerConfig{Source: "dispatch", LaneProfile: "local", Namespace: "courier"})
+	runner.ackAttemptTimeout = time.Minute
+	runner.ackDrainTimeout = time.Minute
+
+	pollDone := make(chan error, 1)
+	go func() { pollDone <- runner.Poll(context.Background()) }()
+
+	// The gate stays closed: every run must exist while no ack has returned.
+	deadline := time.After(20 * time.Second)
+	for {
+		if got := countRuns(t, kubeClient); got == len(items) {
+			break
+		}
+		select {
+		case err := <-pollDone:
+			t.Fatalf("Poll returned (%v) before every item was materialized while acks were blocked", err)
+		case <-deadline:
+			t.Fatalf("materialized %d of %d runs while acks were blocked", countRuns(t, kubeClient), len(items))
+		case <-time.After(5 * time.Millisecond):
+		}
+	}
+	adapter.releaseGate()
+	if err := <-pollDone; err != nil {
+		t.Fatalf("Poll: %v", err)
+	}
+}
+
+// TestRunnerPollAbandonsAcksWhenDrainBudgetExpires pins the drain budget as the
+// only thing that can end a stuck ack. The per-attempt deadline is set past the
+// end of the test, so no attempt can complete: if the drain budget did not bound
+// the pass, Poll would hang instead of abandoning one attempt per item.
+func TestRunnerPollAbandonsAcksWhenDrainBudgetExpires(t *testing.T) {
+	items := ackGateItems(2)
+	adapter := &ackGateAdapter{testAdapter: testAdapter{items: items}, release: make(chan struct{})}
+	t.Cleanup(adapter.releaseGate)
+	kubeClient := newTestClient(t, testLane())
+	runner := NewRunner(kubeClient, adapter, RunnerConfig{Source: "dispatch", LaneProfile: "local", Namespace: "courier"})
+	runner.ackAttemptTimeout = time.Minute
+	runner.ackDrainTimeout = 300 * time.Millisecond
+
+	start := time.Now()
+	if err := runner.Poll(context.Background()); err != nil {
+		t.Fatalf("Poll: %v", err)
+	}
+	elapsed := time.Since(start)
+	if elapsed > 5*time.Second {
+		t.Fatalf("Poll took %s, want the 300ms drain budget to end it", elapsed)
+	}
+	if got := countRuns(t, kubeClient); got != len(items) {
+		t.Fatalf("created %d runs, want %d despite a hanging acker", got, len(items))
+	}
+	// Exactly one attempt per item: the budget expires inside the first attempt,
+	// and the between-attempt guard stops the retries. A pass that kept retrying
+	// would show more calls, and a pass that dropped the queue would show fewer.
+	if calls := adapter.callCount(); calls != len(items) {
+		t.Fatalf("ack calls = %d, want exactly %d — one abandoned attempt per offered item", calls, len(items))
+	}
+	if settled := adapter.acked(); len(settled) != 0 {
+		t.Fatalf("acked %v, want none: the gate never opened", settled)
+	}
+}
+
+// TestRunnerPollBoundsEachAckAttempt pins the per-attempt deadline
+// independently of the drain budget. One item with a drain budget long enough
+// to hold every retry still gets all three attempts, each killed by its own
+// deadline: without that deadline a single stalled attempt would swallow the
+// whole budget and the item would be abandoned after one attempt.
+func TestRunnerPollBoundsEachAckAttempt(t *testing.T) {
+	item := ackGateItems(1)[0]
+	adapter := &ackGateAdapter{testAdapter: testAdapter{items: []WorkItem{item}}, release: make(chan struct{})}
+	t.Cleanup(adapter.releaseGate)
+	kubeClient := newTestClient(t, testLane())
+	runner := NewRunner(kubeClient, adapter, RunnerConfig{Source: "dispatch", LaneProfile: "local", Namespace: "courier"})
+	runner.ackAttemptTimeout = 100 * time.Millisecond
+	runner.ackDrainTimeout = 10 * time.Second
+	runner.ackRetryDelay = 0
+
+	start := time.Now()
+	if err := runner.Poll(context.Background()); err != nil {
+		t.Fatalf("Poll: %v", err)
+	}
+	elapsed := time.Since(start)
+	if calls := adapter.callCount(); calls != 3 {
+		t.Fatalf("ack calls = %d, want the 3 attempts the budget could hold", calls)
+	}
+	if elapsed > 5*time.Second {
+		t.Fatalf("Poll took %s, want the 100ms attempt deadlines rather than the 10s drain budget to end them", elapsed)
+	}
+	if got := countRuns(t, kubeClient); got != 1 {
+		t.Fatalf("created %d runs, want 1", got)
+	}
+}
+
+// TestRunnerPollBoundsAckConcurrency pins the fan-out cap against literals, not
+// against the constant under test: acks must overlap (so a cap of 1, i.e. no
+// bounded drain at all, fails) and must never exceed four in flight (so a cap
+// that does not exist fails).
+func TestRunnerPollBoundsAckConcurrency(t *testing.T) {
+	const offered = 9
+	items := ackGateItems(offered)
+	adapter := &ackGateAdapter{testAdapter: testAdapter{items: items}, release: make(chan struct{})}
+	t.Cleanup(adapter.releaseGate)
+	kubeClient := newTestClient(t, testLane())
+	runner := NewRunner(kubeClient, adapter, RunnerConfig{Source: "dispatch", LaneProfile: "local", Namespace: "courier"})
+	runner.ackAttemptTimeout = time.Minute
+	runner.ackDrainTimeout = time.Minute
+
+	pollDone := make(chan error, 1)
+	go func() { pollDone <- runner.Poll(context.Background()) }()
+
+	// Two acks in flight at once is the lower bound the cap must still allow.
+	deadline := time.After(20 * time.Second)
+	for adapter.maxConcurrent() < 2 {
+		select {
+		case err := <-pollDone:
+			t.Fatalf("Poll returned (%v) before acks overlapped", err)
+		case <-deadline:
+			t.Fatalf("observed max %d concurrent acks, want at least 2", adapter.maxConcurrent())
+		case <-time.After(5 * time.Millisecond):
+		}
+	}
+	adapter.releaseGate()
+	if err := <-pollDone; err != nil {
+		t.Fatalf("Poll: %v", err)
+	}
+	if got := adapter.maxConcurrent(); got > 4 {
+		t.Fatalf("observed %d concurrent acks, want at most 4", got)
+	}
+	acked := adapter.acked()
+	for _, item := range items {
+		if !acked[item.ID] {
+			t.Fatalf("work item %q was never acknowledged", item.ID)
+		}
+	}
+}
+
+// TestRunnerAckBudgetProductionDefaults pins the shipped budget numbers as
+// literals: they are a tuning decision, and a silent change to any of them
+// would quietly rewrite the worst-case ack latency of every poll.
+func TestRunnerAckBudgetProductionDefaults(t *testing.T) {
+	if handoutAckAttemptTimeout != 3*time.Second {
+		t.Fatalf("handoutAckAttemptTimeout = %s, want 3s", handoutAckAttemptTimeout)
+	}
+	if handoutAckDrainTimeout != 15*time.Second {
+		t.Fatalf("handoutAckDrainTimeout = %s, want 15s", handoutAckDrainTimeout)
+	}
+	if handoutAckConcurrency != 4 {
+		t.Fatalf("handoutAckConcurrency = %d, want 4", handoutAckConcurrency)
+	}
+	// A single item's worst case (three 3s attempts plus two 100ms backoffs)
+	// must still fit inside the 15s budget, so an item draining on its own
+	// keeps all three attempts.
+	if worstCase := 3*3*time.Second + 2*100*time.Millisecond; worstCase >= 15*time.Second {
+		t.Fatalf("worst-case item ack cost %s does not fit the 15s drain budget", worstCase)
+	}
+}
+
+// TestRunnerZeroValueAckBudgetsStillBound pins the injectable-budget
+// fallback: tests and callers build Runner values field by field, so a zero
+// budget must resolve to the production default rather than mean "no timeout".
+func TestRunnerZeroValueAckBudgetsStillBound(t *testing.T) {
+	item := WorkItem{ID: "opaque-a", Mode: "fix-pr", Repo: "acme/widgets", Ref: 2, Lane: "source-lane"}
+	adapter := &ackingAdapter{testAdapter: testAdapter{items: []WorkItem{item}}, ackError: errors.New("ack refused")}
+	kubeClient := newTestClient(t, testLane())
+	runner := &Runner{Client: kubeClient, Adapter: adapter, Config: RunnerConfig{Source: "dispatch", LaneProfile: "local", Namespace: "courier"}}
+
+	if got := runner.ackAttemptBudget(); got != handoutAckAttemptTimeout {
+		t.Fatalf("attempt budget = %s, want the production default %s", got, handoutAckAttemptTimeout)
+	}
+	if got := runner.ackDrainBudget(); got != handoutAckDrainTimeout {
+		t.Fatalf("drain budget = %s, want the production default %s", got, handoutAckDrainTimeout)
+	}
+	if err := runner.Poll(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if got := adapter.ackCount(); got != maxHandoutAckAttempts {
+		t.Fatalf("acks = %d, want %d attempts", got, maxHandoutAckAttempts)
 	}
 }

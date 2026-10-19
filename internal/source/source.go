@@ -228,7 +228,10 @@ type CapacityRecovery interface {
 // no dangling outstanding hand-out and a stale-handout reclaimer stays safe
 // to run. Callers must treat it as idempotent best-effort evidence: a failure
 // leaves the hand-out in the reclaimable state the reclaimer exists for and
-// must never block materialization.
+// must never block materialization. Implementations must honour ctx: callers
+// bound each acknowledgement attempt with its own deadline and join the whole
+// drain before the poll returns, so an implementation that ignores
+// cancellation would defeat that bound.
 type HandoutAcker interface {
 	AckHandout(context.Context, WorkItem) error
 }
