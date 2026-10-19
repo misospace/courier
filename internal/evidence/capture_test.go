@@ -1354,6 +1354,137 @@ func TestRunGitCappedFailureWithHeldPipe(t *testing.T) {
 	}
 }
 
+// expiredContext stands in for a context that was already past its deadline by
+// the time runGitCapped reached its post-reap guard: Err answers
+// context.DeadlineExceeded from every observation, the first included, because
+// #448 is about a context that expired while the git read was in flight — a
+// read that completed under a dead context, not a call made under one.
+//
+// lateDeadlineContext cannot express that. Nothing in runGitCapped observes
+// Err before the guard — the select receives on Done, and Start reads Err only
+// when Done is already closed — so the guard would be that double's FIRST
+// observation, its nil, and the guard would pass: these tests would fail
+// against the fixed runGitCapped rather than pin it.
+//
+// Done is supplied by the test and stays open for the whole call, because
+// closing it decides nothing worth pinning: os/exec's Start fails the entire
+// call when Done is already closed, and a Done that closes while the read is
+// in flight makes the select's Done branch answer with the same
+// context.DeadlineExceeded these tests expect, vacuously, against an unfixed
+// runGitCapped as readily as a fixed one. With Done never ready the read
+// branch is the only one the select can take, so the select is deterministic
+// and the guard after the reap is the only thing that can decide either test
+// below.
+type expiredContext struct {
+	done <-chan struct{}
+}
+
+func (c *expiredContext) Deadline() (time.Time, bool) { return time.Time{}, false }
+func (c *expiredContext) Done() <-chan struct{}       { return c.done }
+func (c *expiredContext) Value(any) any               { return nil }
+func (c *expiredContext) Err() error                  { return context.DeadlineExceeded }
+
+// TestRunGitCappedPrefersCancellationOverACompletedRead is the #448 regression
+// on the git side, the twin of the #390/#393 fix in readCapped: a stdout read
+// that completes while the context is already expired leaves both channels
+// ready after the select, the tie is broken at random, and a completed read
+// that wins it reaches the success path with a nil error and bytes produced
+// past the deadline. Cancellation has to be settled again after the reap, so
+// the expired context wins over a read that finished under it and the late
+// bytes are discarded rather than handed back as a result. Restoring
+// capture.go as it stood before #448 fails this test on the returned bytes
+// and error.
+func TestRunGitCappedPrefersCancellationOverACompletedRead(t *testing.T) {
+	t.Parallel()
+
+	dir := newRepo(t)
+	// The alias writes to stdout and exits 0 straight away, so the read
+	// completes on its own with no held pipe and no git failure to report: the
+	// plain success path is the one #448 slips through.
+	git(t, dir, "config", "alias.quickok", "!sh -c 'echo LATE-BYTES'")
+
+	ctx := &expiredContext{done: make(chan struct{})}
+	type capped struct {
+		out  []byte
+		over bool
+		err  error
+	}
+	done := make(chan capped, 1)
+	go func() {
+		out, over, err := runGitCapped(ctx, dir, MaxFileBytes, "quickok")
+		done <- capped{out, over, err}
+	}()
+
+	var got capped
+	select {
+	case got = <-done:
+	case <-time.After(20 * time.Second):
+		t.Fatal("runGitCapped did not return within 20s of a read that completed under an expired context")
+	}
+	if !errors.Is(got.err, context.DeadlineExceeded) {
+		t.Fatalf("err = %v, want context.DeadlineExceeded: a read past the deadline is not a result", got.err)
+	}
+	if got.out != nil {
+		t.Errorf("out = %q, want nil: bytes read under an expired context are discarded", got.out)
+	}
+	if got.over {
+		t.Error("over = true, want false: a canceled context never reports overLimit")
+	}
+}
+
+// TestRunGitCappedExpiredContextBeatsTheErrWaitDelayKeepBytesRule holds the
+// guard as wide as #421's keep-the-bytes branch, which is the one success
+// return a narrower guard would miss: a surviving grandchild holding only the
+// stderr write end makes Wait return exec.ErrWaitDelay with a successful
+// ProcessState, and that branch returns the bytes as a clean success. That
+// branch answered on the context itself before #448 — the error branch
+// above it observed ctx.Err() first — so this test does not pin a pre-#448
+// defect and passes against the old code; it fails a fix that guards only
+// the final `return out, false, nil`, which leaves the rule below reachable
+// with late bytes. #421 remains a claim about a live context — the bytes stand
+// because the timeout was ours rather than git's — so an expired context takes
+// it away, and TestRunGitCappedSurvivingPipeOnSuccess is the live-context half
+// and must keep passing: #421 is narrowed here, not reversed.
+func TestRunGitCappedExpiredContextBeatsTheErrWaitDelayKeepBytesRule(t *testing.T) {
+	t.Parallel()
+
+	dir := newRepo(t)
+	// The alias writes to stdout and exits 0 while sleep keeps only the stderr
+	// write end open — the held-stderr shape of
+	// TestRunGitCappedSurvivingPipeOnSuccess, plus stdout bytes to lose — so the
+	// 2s WaitDelay elapses and Wait reports ErrWaitDelay behind a successful
+	// exit.
+	git(t, dir, "config", "alias.holderr", "!sh -c 'echo LATE-BYTES; sleep 30 >&2 &'")
+
+	ctx := &expiredContext{done: make(chan struct{})}
+	type held struct {
+		out  []byte
+		over bool
+		err  error
+	}
+	done := make(chan held, 1)
+	go func() {
+		out, over, err := runGitCapped(ctx, dir, MaxFileBytes, "holderr")
+		done <- held{out, over, err}
+	}()
+
+	var got held
+	select {
+	case got = <-done:
+	case <-time.After(20 * time.Second):
+		t.Fatal("runGitCapped did not return within 20s while a grandchild held the stderr pipe")
+	}
+	if !errors.Is(got.err, context.DeadlineExceeded) {
+		t.Fatalf("err = %v, want context.DeadlineExceeded: #421's keep-the-bytes rule stands only for a live context (out = %q)", got.err, got.out)
+	}
+	if got.out != nil {
+		t.Errorf("out = %q, want nil: #421's keep-the-bytes rule stands only for a live context", got.out)
+	}
+	if got.over {
+		t.Error("over = true, want false: a canceled context never reports overLimit")
+	}
+}
+
 // TestCappedBufferWrite pins the discard contract of cappedBuffer: a chunk
 // straddling the limit is taken as far as the cap and reported as fully
 // consumed. Reporting the truncated count instead is a short write, and
