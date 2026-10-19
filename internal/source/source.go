@@ -219,6 +219,20 @@ type CapacityRecovery interface {
 	SettleCapacityExhaustion(context.Context, WorkItem, CapacityHandoff) error
 }
 
+// HandoutAcker optionally acknowledges a stamped hand-out once the run that
+// owns the attempt is durably materialized (#456). Queued work that stamps a
+// per-agent hand-out on offer relies on the worker acknowledging it after the
+// run exists: the ack is generation-pinned evidence that the attempt was not
+// lost between offer and materialization, which keeps the hand-out ledger
+// fully accounted so terminal paths (including settled capacity parks) leave
+// no dangling outstanding hand-out and a stale-handout reclaimer stays safe
+// to run. Callers must treat it as idempotent best-effort evidence: a failure
+// leaves the hand-out in the reclaimable state the reclaimer exists for and
+// must never block materialization.
+type HandoutAcker interface {
+	AckHandout(context.Context, WorkItem) error
+}
+
 // Reporter optionally publishes lifecycle results in addition to ordinary
 // source state transitions.
 type Reporter interface {

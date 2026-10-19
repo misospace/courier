@@ -1799,7 +1799,17 @@ duplicate run. Every response must acknowledge `prFixExclusions.version: 1`
 before either a task or idle result is processed. Missing or malformed
 acknowledgements fail
 closed without retry or side effects. Exclusions are dedupe hints, not claims
-or ownership. While
+or ownership. The hand-out itself is acknowledged, not excluded: the moment a
+runner materializes the CoderRun that owns a queue-backed attempt, the adapter
+acks the stamped hand-out through Dispatch's generation-pinned, idempotent
+`pr-fix-queue/ack` endpoint (#456) — the #1211 worker contract that keeps a
+settled park's hand-out fully accounted and keeps the stale-handout reclaimer
+safe to evaluate; a failed ack is logged, never fatal, because a lost
+ack must degrade to the reclaimable state the reclaimer exists for rather
+than block materialization. The ack is fire-once at materialization and is
+deliberately never retried from later polls: items whose run already exists
+are skipped before the ack site, so a lost ack is recovered by the reclaimer
+re-issuing the generation, not by Courier re-acking. While
 discovery is paused, Dispatch `next-task` and stale-item bookkeeping are
 deferred until a later poll.
 
@@ -4341,3 +4351,23 @@ earns a 401 that is classified as a definite denial (superseded by #406: a
   tests: `TestReadCappedRejectsNonRegular` and `TestCaptureFifoSwapRace`, both
   asserting non-blocking with a deadline guard so losing `O_NONBLOCK` fails
   rather than hangs the suite. (#336, #389; composes with #237, #390)
+- **2026-10-19 — #456: PR-fix hand-outs are acknowledged at the durable
+  materialization boundary.** A settled capacity park released its hand-out
+  through the fenced settlement, yet lanes still starved on queue heads:
+  Dispatch's per-agent, per-generation hand-out ledger had no ack evidence at
+  all (`handoutAcks` empty on every item), because Courier never called the
+  #1211 worker contract, and the stale-handout reclaimer that recovers lost
+  hand-outs stays default-disabled until that ack lands. Courier now
+  acknowledges a stamped PR-fix hand-out with `POST /api/pr-fix-queue/ack`
+  the moment the runner durably materializes the CoderRun that owns the
+  attempt — the exact boundary dispatch#1212 named as the rollout gate for
+  the reclaimer sweep. The ack is generation-pinned and idempotent; refusal
+  statuses (item gone, generation moved, hand-out released or never ours)
+  degrade to settled no-ops because nothing outstanding remains, while
+  transport and server failures are logged without blocking materialization:
+  a lost ack degrades to the reclaimable state the reclaimer exists for, and
+  must never couple admission to ack availability. Release semantics are
+  unchanged: the fenced capacity settlement remains the only park-path
+  release, successful and verifier-rejection settlements are untouched, and
+  the head-of-line skip question stays a Dispatch-side follow-up. (#456,
+  dispatch#1211)

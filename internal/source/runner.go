@@ -333,6 +333,17 @@ func (r *Runner) Poll(ctx context.Context) error {
 		if err := r.Create(ctx, run); err != nil && !apierrors.IsAlreadyExists(err) {
 			return fmt.Errorf("create CoderRun for %q: %w", item.ID, err)
 		}
+		// The run now durably owns the attempt: acknowledge the stamped
+		// hand-out so the source can tell a live attempt from a lost one
+		// (#456). A failed ack leaves the hand-out in the reclaimable state
+		// the stale-handout reclaimer exists for; it must never block
+		// materialization or starve the rest of this discovery pass.
+		if acker, ok := r.Adapter.(HandoutAcker); ok {
+			if err := acker.AckHandout(ctx, item); err != nil {
+				log.FromContext(ctx).Info("pr-fix hand-out acknowledgement failed",
+					"workItemID", item.ID, "error", err.Error())
+			}
+		}
 		existing[key] = struct{}{}
 	}
 	return nil

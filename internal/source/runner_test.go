@@ -1530,3 +1530,71 @@ func TestRunnerRecreatesStillOfferedWorkAfterReap(t *testing.T) {
 		t.Fatalf("re-created run workItemID = %q, want %q", runs.Items[0].Spec.WorkItemID, item.ID)
 	}
 }
+
+type ackingAdapter struct {
+	testAdapter
+	acks     []WorkItem
+	ackError error
+}
+
+func (a *ackingAdapter) AckHandout(_ context.Context, item WorkItem) error {
+	a.acks = append(a.acks, item)
+	return a.ackError
+}
+
+func TestRunnerPollAcksHandOutWhenRunMaterializes(t *testing.T) {
+	item := WorkItem{ID: "opaque-a", Context: `{"opaque":"receipt"}`, Mode: "fix-pr", Repo: "acme/widgets", Ref: 2, Lane: "source-lane"}
+	adapter := &ackingAdapter{testAdapter: testAdapter{items: []WorkItem{item}}}
+	kubeClient := newTestClient(t, testLane())
+	runner := NewRunner(kubeClient, adapter, RunnerConfig{Source: "dispatch", LaneProfile: "local", Namespace: "courier"})
+
+	if err := runner.Poll(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if len(adapter.acks) != 1 || adapter.acks[0].ID != item.ID {
+		t.Fatalf("acks = %#v, want one ack for %q", adapter.acks, item.ID)
+	}
+}
+
+func TestRunnerPollAckFailureDoesNotBlockMaterialization(t *testing.T) {
+	items := []WorkItem{
+		{ID: "opaque-a", Mode: "fix-pr", Repo: "acme/widgets", Ref: 2, Lane: "source-lane"},
+		{ID: "opaque-b", Mode: "fix-pr", Repo: "acme/widgets", Ref: 3, Lane: "source-lane"},
+	}
+	adapter := &ackingAdapter{testAdapter: testAdapter{items: items}, ackError: errors.New("ack refused")}
+	kubeClient := newTestClient(t, testLane())
+	runner := NewRunner(kubeClient, adapter, RunnerConfig{Source: "dispatch", LaneProfile: "local", Namespace: "courier"})
+
+	if err := runner.Poll(context.Background()); err != nil {
+		t.Fatalf("Poll: %v", err)
+	}
+	if len(adapter.acks) != 2 {
+		t.Fatalf("acks = %d, want an attempt per materialized item", len(adapter.acks))
+	}
+	var runs courierv1alpha1.CoderRunList
+	if err := kubeClient.List(context.Background(), &runs, client.InNamespace("courier")); err != nil {
+		t.Fatal(err)
+	}
+	if len(runs.Items) != 2 {
+		t.Fatalf("created %d runs, want 2 despite ack failure", len(runs.Items))
+	}
+}
+
+func TestRunnerPollSkipsAckForAdaptersWithoutCapability(t *testing.T) {
+	adapter := &testAdapter{items: []WorkItem{
+		{ID: "opaque-a", Mode: "fix-pr", Repo: "acme/widgets", Ref: 2, Lane: "source-lane"},
+	}}
+	kubeClient := newTestClient(t, testLane())
+	runner := NewRunner(kubeClient, adapter, RunnerConfig{Source: "dispatch", LaneProfile: "local", Namespace: "courier"})
+
+	if err := runner.Poll(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	var runs courierv1alpha1.CoderRunList
+	if err := kubeClient.List(context.Background(), &runs, client.InNamespace("courier")); err != nil {
+		t.Fatal(err)
+	}
+	if len(runs.Items) != 1 {
+		t.Fatalf("created %d runs, want 1", len(runs.Items))
+	}
+}
