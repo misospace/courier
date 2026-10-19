@@ -1629,7 +1629,7 @@ func TestPodConfigValidateRejectsPartialEvidence(t *testing.T) {
 // of pod sizing: what the lane configures is what the container carries.
 func TestBuildCoordinatorPodUsesLaneResources(t *testing.T) {
 	lane := evidenceTestLane()
-	lane.Spec.Resources = corev1.ResourceRequirements{
+	lane.Spec.Resources = courierv1alpha1.PodResources{
 		Requests: corev1.ResourceList{
 			corev1.ResourceCPU:    resource.MustParse("1500m"),
 			corev1.ResourceMemory: resource.MustParse("3Gi"),
