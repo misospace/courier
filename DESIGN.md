@@ -1806,10 +1806,14 @@ acks the stamped hand-out through Dispatch's generation-pinned, idempotent
 settled park's hand-out fully accounted and keeps the stale-handout reclaimer
 safe to evaluate; a failed ack is logged, never fatal, because a lost
 ack must degrade to the reclaimable state the reclaimer exists for rather
-than block materialization. The ack is fire-once at materialization and is
-deliberately never retried from later polls: items whose run already exists
-are skipped before the ack site, so a lost ack is recovered by the reclaimer
-re-issuing the generation, not by Courier re-acking. While
+than block materialization. The ack is attempted at materialization with a
+bounded in-pass retry, and re-attempted whenever the source re-offers an item
+whose run already exists: the ack is idempotent and moot refusals are no-ops,
+so a repeat attempt is always safe, and a hand-out whose ack failed at
+materialization is recovered on the next poll that still sees the item rather
+than waiting on the reclaimer. A persistently failing ack still degrades to
+the reclaimable state the reclaimer exists for, and terminal settlement
+reports release the hand-out regardless. While
 discovery is paused, Dispatch `next-task` and stale-item bookkeeping are
 deferred until a later poll.
 
@@ -4366,7 +4370,15 @@ earns a 401 that is classified as a definite denial (superseded by #406: a
   degrade to settled no-ops because nothing outstanding remains, while
   transport and server failures are logged without blocking materialization:
   a lost ack degrades to the reclaimable state the reclaimer exists for, and
-  must never couple admission to ack availability. Release semantics are
+  must never couple admission to ack availability. Review feedback showed a
+  lost ack could otherwise persist while the reclaimer stays disabled, so the
+  ack is not strictly fire-once: it is retried a bounded number of times
+  within the materializing pass and re-attempted on any later poll that still
+  sees the item — the ack is idempotent and moot refusals are no-ops, so a
+  repeat attempt is always safe, and a re-offered item with an outstanding
+  hand-out heals on the next poll instead of starving head-of-line. Polls
+  that pause discovery (suspension, cooldown, capacity) defer the re-ack
+  with everything else until discovery resumes. Release semantics are
   unchanged: the fenced capacity settlement remains the only park-path
   release, successful and verifier-rejection settlements are untouched, and
   the head-of-line skip question stays a Dispatch-side follow-up. (#456,

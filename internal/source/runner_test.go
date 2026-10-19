@@ -1533,11 +1533,17 @@ func TestRunnerRecreatesStillOfferedWorkAfterReap(t *testing.T) {
 
 type ackingAdapter struct {
 	testAdapter
-	acks     []WorkItem
-	ackError error
+	acks      []WorkItem
+	ackError  error
+	failFirst int
 }
 
 func (a *ackingAdapter) AckHandout(_ context.Context, item WorkItem) error {
+	if a.failFirst > 0 {
+		a.failFirst--
+		a.acks = append(a.acks, item)
+		return errors.New("ack transport blip")
+	}
 	a.acks = append(a.acks, item)
 	return a.ackError
 }
@@ -1564,12 +1570,13 @@ func TestRunnerPollAckFailureDoesNotBlockMaterialization(t *testing.T) {
 	adapter := &ackingAdapter{testAdapter: testAdapter{items: items}, ackError: errors.New("ack refused")}
 	kubeClient := newTestClient(t, testLane())
 	runner := NewRunner(kubeClient, adapter, RunnerConfig{Source: "dispatch", LaneProfile: "local", Namespace: "courier"})
+	runner.ackRetryDelay = 0
 
 	if err := runner.Poll(context.Background()); err != nil {
 		t.Fatalf("Poll: %v", err)
 	}
-	if len(adapter.acks) != 2 {
-		t.Fatalf("acks = %d, want an attempt per materialized item", len(adapter.acks))
+	if len(adapter.acks) != len(items)*maxHandoutAckAttempts {
+		t.Fatalf("acks = %d, want %d bounded retries per materialized item", len(adapter.acks), len(items)*maxHandoutAckAttempts)
 	}
 	var runs courierv1alpha1.CoderRunList
 	if err := kubeClient.List(context.Background(), &runs, client.InNamespace("courier")); err != nil {
@@ -1577,6 +1584,63 @@ func TestRunnerPollAckFailureDoesNotBlockMaterialization(t *testing.T) {
 	}
 	if len(runs.Items) != 2 {
 		t.Fatalf("created %d runs, want 2 despite ack failure", len(runs.Items))
+	}
+}
+
+func TestRunnerPollRetriesFailedHandOutAckUntilSuccess(t *testing.T) {
+	item := WorkItem{ID: "opaque-a", Mode: "fix-pr", Repo: "acme/widgets", Ref: 2, Lane: "source-lane"}
+	// The first two ack attempts fail, the third succeeds: a transient
+	// failure at materialization must not strand the hand-out (#456).
+	adapter := &ackingAdapter{testAdapter: testAdapter{items: []WorkItem{item}}, failFirst: 2}
+	kubeClient := newTestClient(t, testLane())
+	runner := NewRunner(kubeClient, adapter, RunnerConfig{Source: "dispatch", LaneProfile: "local", Namespace: "courier"})
+	runner.ackRetryDelay = 0
+
+	if err := runner.Poll(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if len(adapter.acks) != maxHandoutAckAttempts {
+		t.Fatalf("acks = %d, want %d attempts", len(adapter.acks), maxHandoutAckAttempts)
+	}
+	var runs courierv1alpha1.CoderRunList
+	if err := kubeClient.List(context.Background(), &runs, client.InNamespace("courier")); err != nil {
+		t.Fatal(err)
+	}
+	if len(runs.Items) != 1 {
+		t.Fatalf("created %d runs, want 1", len(runs.Items))
+	}
+}
+
+func TestRunnerPollReAcksHandOutWhenRunAlreadyExists(t *testing.T) {
+	item := WorkItem{ID: "opaque-a", Mode: "fix-pr", Repo: "acme/widgets", Ref: 2, Lane: "source-lane"}
+	adapter := &ackingAdapter{testAdapter: testAdapter{items: []WorkItem{item}}}
+	lane := testLane()
+	lane.Spec.Concurrency = 2
+	kubeClient := newTestClient(t, lane)
+	runner := NewRunner(kubeClient, adapter, RunnerConfig{Source: "dispatch", LaneProfile: "local", Namespace: "courier"})
+	runner.ackRetryDelay = 0
+
+	if err := runner.Poll(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	firstAcks := len(adapter.acks)
+	// The source keeps offering the item whose run already exists
+	// (exclusions are hints): the ack must be re-attempted, because an
+	// earlier ack failure leaves the hand-out outstanding (#456).
+	adapter.failFirst = 1
+	adapter.ackError = nil
+	if err := runner.Poll(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if reAcks := len(adapter.acks) - firstAcks; reAcks != 2 {
+		t.Fatalf("re-acks = %d, want a failed attempt plus a successful retry on the skip path", reAcks)
+	}
+	var runs courierv1alpha1.CoderRunList
+	if err := kubeClient.List(context.Background(), &runs, client.InNamespace("courier")); err != nil {
+		t.Fatal(err)
+	}
+	if len(runs.Items) != 1 {
+		t.Fatalf("found %d runs, want 1 (skip path must not duplicate)", len(runs.Items))
 	}
 }
 

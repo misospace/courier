@@ -30,6 +30,15 @@ var (
 
 const defaultPollInterval = 30 * time.Second
 
+// A failed hand-out acknowledgement is retried a bounded number of times
+// within the poll that materialized the run, because a lost ack otherwise
+// waits on the settlement report or the stale-handout reclaimer to release
+// the outstanding hand-out (#456).
+const (
+	maxHandoutAckAttempts = 3
+	handoutAckRetryDelay  = 100 * time.Millisecond
+)
+
 // RunnerConfig controls one source discovery loop. LaneProfile, when set, is
 // the Courier LaneProfile assigned to every discovered item.
 type RunnerConfig struct {
@@ -54,6 +63,9 @@ type Runner struct {
 	// Now is the runner's time source, injectable so tests never sleep.
 	// Nil falls back to time.Now.
 	Now func() time.Time
+	// ackRetryDelay spaces out bounded hand-out ack retries. NewRunner sets
+	// the production backoff; zero keeps retries immediate, which tests use.
+	ackRetryDelay time.Duration
 }
 
 func (r *Runner) clock() time.Time {
@@ -64,7 +76,7 @@ func (r *Runner) clock() time.Time {
 }
 
 func NewRunner(c client.Client, adapter Adapter, config RunnerConfig) *Runner {
-	return &Runner{Client: c, Adapter: adapter, Config: config}
+	return &Runner{Client: c, Adapter: adapter, Config: config, ackRetryDelay: handoutAckRetryDelay}
 }
 
 func (r *Runner) Start(ctx context.Context) error {
@@ -293,10 +305,15 @@ func (r *Runner) Poll(ctx context.Context) error {
 		}
 		itemIdentity := r.identity(item.ID)
 		key := workKey(r.Config.Source, itemIdentity)
-		if _, ok := legacyIdentities[itemIdentity]; ok {
-			continue
-		}
-		if _, ok := existing[key]; ok {
+		_, hasLegacyIdentity := legacyIdentities[itemIdentity]
+		_, hasExistingRun := existing[key]
+		if hasLegacyIdentity || hasExistingRun {
+			// The run already owns this attempt, but a hand-out whose ack
+			// failed at materialization stays outstanding — exclusions are
+			// hints, so the source can keep offering the item. Re-attempt
+			// the ack: it is idempotent and a moot refusal proves the
+			// ledger already moved on (#456).
+			r.ackHandout(ctx, item)
 			continue
 		}
 		if _, ok := seen[key]; ok {
@@ -338,15 +355,48 @@ func (r *Runner) Poll(ctx context.Context) error {
 		// (#456). A failed ack leaves the hand-out in the reclaimable state
 		// the stale-handout reclaimer exists for; it must never block
 		// materialization or starve the rest of this discovery pass.
-		if acker, ok := r.Adapter.(HandoutAcker); ok {
-			if err := acker.AckHandout(ctx, item); err != nil {
-				log.FromContext(ctx).Info("pr-fix hand-out acknowledgement failed",
-					"workItemID", item.ID, "error", err.Error())
-			}
-		}
+		r.ackHandout(ctx, item)
 		existing[key] = struct{}{}
 	}
 	return nil
+}
+
+// ackHandout acknowledges a stamped hand-out for a queue-backed attempt,
+// retrying a failure a bounded number of times within the pass before giving
+// up: the ack is idempotent and moot refusals collapse to no-ops in the
+// adapter, so a repeat attempt is always safe. A final failure is logged,
+// never fatal — the hand-out stays in the reclaimable state the
+// stale-handout reclaimer exists for, and terminal settlement reports
+// release it regardless (#456).
+func (r *Runner) ackHandout(ctx context.Context, item WorkItem) {
+	acker, ok := r.Adapter.(HandoutAcker)
+	if !ok {
+		return
+	}
+	var err error
+	for attempt := 0; attempt < maxHandoutAckAttempts; attempt++ {
+		if attempt > 0 {
+			if ctxErr := ctx.Err(); ctxErr != nil {
+				log.FromContext(ctx).Info("pr-fix hand-out acknowledgement abandoned",
+					"workItemID", item.ID, "error", ctxErr.Error())
+				return
+			}
+			if r.ackRetryDelay > 0 {
+				select {
+				case <-ctx.Done():
+					log.FromContext(ctx).Info("pr-fix hand-out acknowledgement abandoned",
+						"workItemID", item.ID, "error", ctx.Err().Error())
+					return
+				case <-time.After(r.ackRetryDelay):
+				}
+			}
+		}
+		if err = acker.AckHandout(ctx, item); err == nil {
+			return
+		}
+	}
+	log.FromContext(ctx).Info("pr-fix hand-out acknowledgement failed",
+		"workItemID", item.ID, "attempts", maxHandoutAckAttempts, "error", err.Error())
 }
 
 func (r *Runner) validate() error {
