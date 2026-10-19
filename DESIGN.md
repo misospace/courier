@@ -1384,9 +1384,19 @@ capability seam, not a Go or Kubernetes requirement: a lane can select a
 repository-specific image containing whatever tools its workflow needs, while
 the deployment default remains the minimal bootstrap image.
 
-`resources` is the lane's pod sizing, and the only source of it. Limits are
-used exactly as written and may be omitted; requests keep whatever the lane
-configured, but CPU and memory requests are floored to Courier's built-in
+`resources` is the lane's pod sizing, and the only source of it. The lane's
+vocabulary is a deliberate subset of `corev1.ResourceRequirements`: only
+`requests` and `limits` are expressible, because no Courier renderer sets
+`pod.spec.resourceClaims`, so a lane cannot configure a value Courier would
+ignore or that would only fail at pod admission (#403). Every requests/limits
+key is honoured, subject only to the CPU and memory request floor described
+below: extended-resource keys pass through to pods and ride normal Kubernetes
+scheduling and quota semantics, where Kubernetes defaults an extended
+resource's request to its limit — a key set in limits alone is valid and takes
+that request, a key set in both maps must carry equal quantities, and a key
+set in requests alone makes every pod on the lane invalid at admission. Limits
+are used exactly as written and may be omitted; requests keep whatever the
+lane configured, but CPU and memory requests are floored to Courier's built-in
 default (250m/512Mi requested, 2 CPU/4Gi limited) wherever they are absent or
 non-positive — so every Courier-created pod, the coordinator and the secure
 topology's control, worker, broker, and probe pods, carries finite CPU and
