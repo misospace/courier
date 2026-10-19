@@ -48,7 +48,7 @@ func TestLegacyDispatchCapacityHandoffAdmitsSuccessor(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			ctx := context.Background()
 			var mu sync.Mutex
-			var discoveries, settlements int
+			var discoveries, settlements, handoutAcks int
 			var serverErr string
 			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				mu.Lock()
@@ -104,6 +104,21 @@ func TestLegacyDispatchCapacityHandoffAdmitsSuccessor(t *testing.T) {
 						return
 					}
 					_ = json.NewEncoder(w).Encode(map[string]any{"prFixResolution": map[string]any{"matched": true, "itemId": "fix-42", "action": "deferred"}})
+				case r.Method == http.MethodPost && r.URL.Path == "/api/pr-fix-queue/ack":
+					var body struct {
+						Repo       string `json:"repo"`
+						PR         int    `json:"pr"`
+						Generation int    `json:"generation"`
+						AgentName  string `json:"agentName"`
+					}
+					if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+						t.Errorf("decode hand-out ack: %v", err)
+					}
+					if body.Repo != "acme/widgets" || body.PR != 42 || body.Generation != 4 || body.AgentName != "worker" {
+						t.Errorf("hand-out ack body = %#v, want the successor's queue identity pinned to the agent", body)
+					}
+					handoutAcks++
+					_ = json.NewEncoder(w).Encode(map[string]any{"acknowledged": true})
 				default:
 					t.Errorf("unexpected Dispatch request %s %s", r.Method, r.URL)
 					http.NotFound(w, r)
@@ -212,6 +227,13 @@ func TestLegacyDispatchCapacityHandoffAdmitsSuccessor(t *testing.T) {
 			defer mu.Unlock()
 			if settlements != 2 || discoveries != 1 {
 				t.Fatalf("Dispatch settlements=%d discoveries=%d", settlements, discoveries)
+			}
+			wantAcks := 0
+			if tc.mode == courierv1alpha1.ModeFixPR {
+				wantAcks = 1
+			}
+			if handoutAcks != wantAcks {
+				t.Fatalf("hand-out acks = %d, want %d: exactly the successor materialization", handoutAcks, wantAcks)
 			}
 			if tc.wantIssueHandoff && serverErr == "" {
 				t.Fatal("issue transient settlement failure was not observed")
