@@ -61,6 +61,7 @@ type DispatchAdapter = Adapter
 var _ source.Adapter = (*Adapter)(nil)
 var _ source.Reporter = (*Adapter)(nil)
 var _ source.PreLauncher = (*Adapter)(nil)
+var _ source.HandoutAcker = (*Adapter)(nil)
 var _ source.WorkIdentifier = (*Adapter)(nil)
 var _ source.CapacityRecoveryPreparer = (*Adapter)(nil)
 var _ source.CapacityRecovery = (*Adapter)(nil)
@@ -160,6 +161,23 @@ func (a *Adapter) PreLaunch(ctx context.Context, item source.WorkItem) error {
 		return nil
 	}
 	return checker.PreLaunch(ctx, item.ID)
+}
+
+// AckHandout acknowledges the stamped hand-out of a queue-backed attempt once
+// the runner materializes the run that owns it (#456). Clients that do not
+// implement the capability carry no stamped hand-outs, so the ack is a no-op;
+// otherwise the call forwards to the client's generation-pinned, idempotent
+// ack, whose refusals and failures the runner logs without blocking
+// materialization.
+func (a *Adapter) AckHandout(ctx context.Context, item source.WorkItem) error {
+	if err := a.validate(item); err != nil {
+		return err
+	}
+	acker, ok := a.client.(source.HandoutAcker)
+	if !ok {
+		return nil
+	}
+	return acker.AckHandout(ctx, item)
 }
 
 // Transition publishes a generic Courier lifecycle state to Dispatch.

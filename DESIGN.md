@@ -1828,7 +1828,39 @@ duplicate run. Every response must acknowledge `prFixExclusions.version: 1`
 before either a task or idle result is processed. Missing or malformed
 acknowledgements fail
 closed without retry or side effects. Exclusions are dedupe hints, not claims
-or ownership. While
+or ownership. The hand-out itself is acknowledged, not excluded: the moment a
+runner materializes the CoderRun that owns a queue-backed attempt, the adapter
+acks the stamped hand-out through Dispatch's generation-pinned, idempotent
+`pr-fix-queue/ack` endpoint (#456) — the #1211 worker contract that keeps a
+settled park's hand-out fully accounted and keeps the stale-handout reclaimer
+safe to evaluate; a failed ack is logged, never fatal, because a lost
+ack must degrade to the reclaimable state the reclaimer exists for rather
+than block materialization. The ack is attempted at materialization with a
+bounded retry, and re-attempted whenever the source re-offers an item
+whose run already exists: the ack is idempotent and only the endpoint's
+known moot refusals are no-ops — 404 with the known `pr-fix item not found`
+response, 403 with `reason: "not-handed"`, and 409 with a known moot
+reason — so a repeat attempt is always safe, while an unexpected 403 or 404
+(worker-scope or auth rejection, older deployment, missing route) is not
+ledger evidence and surfaces as an error like any other failure, and a
+hand-out whose ack failed at
+materialization is recovered on the next poll that still sees the item rather
+than waiting on the reclaimer. Acknowledgement is a second phase of the
+pass, never inline work: each offered item is queued and every item is
+materialized first, then the queued acks drain under a concurrency cap (4),
+a per-attempt deadline (3s, so a stalled endpoint cannot spend the shared
+Dispatch client timeout), and one drain budget (15s) for the whole pass.
+The budget is sized so a single item's worst case — three attempts plus two
+backoffs, ~9.2s — still fits inside it, so an item draining on its own keeps
+its full retry budget, while total ack latency per poll stays capped
+regardless of how many items the source offers. Three attempts is an upper
+bound, not a per-item guarantee: an item queued behind a stalled endpoint gets
+fewer — possibly just one — before the budget abandons it, because how many
+attempts an item gets depends on its queue position. Whatever the budget
+does not cover is abandoned with an info log, never an error return, and never
+blocks another item's materialization. A persistently failing ack still
+degrades to the reclaimable state the reclaimer exists for, and terminal
+settlement reports release the hand-out regardless. While
 discovery is paused, Dispatch `next-task` and stale-item bookkeeping are
 deferred until a later poll.
 
@@ -4399,3 +4431,57 @@ earns a 401 that is classified as a definite denial (superseded by #406: a
   tests: `TestReadCappedRejectsNonRegular` and `TestCaptureFifoSwapRace`, both
   asserting non-blocking with a deadline guard so losing `O_NONBLOCK` fails
   rather than hangs the suite. (#336, #389; composes with #237, #390)
+- **2026-10-19 — #456: PR-fix hand-outs are acknowledged at the durable
+  materialization boundary.** A settled capacity park released its hand-out
+  through the fenced settlement, yet lanes still starved on queue heads:
+  Dispatch's per-agent, per-generation hand-out ledger had no ack evidence at
+  all (`handoutAcks` empty on every item), because Courier never called the
+  #1211 worker contract, and the stale-handout reclaimer that recovers lost
+  hand-outs stays default-disabled until that ack lands. Courier now
+  acknowledges a stamped PR-fix hand-out with `POST /api/pr-fix-queue/ack`
+  the moment the runner durably materializes the CoderRun that owns the
+  attempt — the exact boundary dispatch#1212 named as the rollout gate for
+  the reclaimer sweep. The ack is generation-pinned and idempotent; only the
+  endpoint's known moot refusals — 404 with the known `pr-fix item not found`
+  response, 403 with `reason: "not-handed"`, and 409 with a known moot
+  reason — degrade to settled no-ops because nothing outstanding remains,
+  while an unexpected 403 or 404 (worker-scope or auth rejection, older
+  deployment, missing route) is not ledger evidence and surfaces as an
+  error, as do transport and server failures, all logged without blocking
+  materialization: a lost ack degrades to the reclaimable state the
+  reclaimer exists for, and must never couple admission to ack
+  availability. Review feedback showed a lost ack could otherwise persist
+  while the reclaimer stays disabled, so the
+  ack is not strictly fire-once: it is retried a bounded number of times
+  within the materializing pass and re-attempted on any later poll that still
+  sees the item — the ack is idempotent and only known moot refusals are
+  no-ops, so a repeat attempt is always safe, and a re-offered item with an
+  outstanding hand-out heals on the next poll instead of starving
+  head-of-line. That
+  retry is a second phase of the pass, not inline work: review showed a
+  Dispatch outage could cost each retained offer the full synchronous retry
+  budget — three attempts against a 30s shared client timeout — before the
+  next offer was even looked at, so the "never starves the rest of the
+  discovery pass" contract did not actually hold. Offered items are queued
+  and materialized first; the queued acks then drain with bounded
+  concurrency (4), a per-attempt deadline (3s) that a stalled endpoint
+  cannot stretch to the shared client timeout, and a single drain budget
+  (15s) for the whole pass. The budget is deliberately wider than one item's
+  worst case (3 x 3s + 2 x 100ms ~= 9.2s), so an item draining on its own
+  keeps all three attempts, while total ack latency per poll stays capped no
+  matter how many items the source offers. Three is an upper bound rather
+  than a per-item promise: the context guard between attempts only applies
+  from the second attempt on, so under a total outage an item late in the
+  queue is abandoned after fewer attempts — possibly just one — and the count
+  it gets depends on its queue position behind the acks ahead of it. Acks the
+  budget does not cover are abandoned with an info log naming the work item —
+  never an error return, and never a reason to abandon another item's ack —
+  and every drain goroutine is joined before the poll returns. Ordering
+  between distinct items' acks is therefore not part of the contract; the ack
+  body, count, and single-pass behaviour are. Polls
+  that pause discovery (suspension, cooldown, capacity) defer the re-ack
+  with everything else until discovery resumes. Release semantics are
+  unchanged: the fenced capacity settlement remains the only park-path
+  release, successful and verifier-rejection settlements are untouched, and
+  the head-of-line skip question stays a Dispatch-side follow-up. (#456,
+  dispatch#1211)
