@@ -196,7 +196,12 @@ func categoryDiagnosticReason(category courierv1alpha1.TerminalDiagnosticCategor
 	case courierv1alpha1.TerminalDiagnosticCategoryCapacityExhaustion:
 		return "execution capacity was confirmed exhausted"
 	case courierv1alpha1.TerminalDiagnosticCategoryProviderUnavailable:
-		return "model provider repeatedly failed to serve this attempt; work released for another capacity"
+		// The category is shared by two trusted endings on the fenced
+		// capacity-recovery channel (#327/#455): the model provider
+		// repeatedly failed to serve this attempt, and a forge read could
+		// not complete on a transient availability condition. The label
+		// must not name one cause when either can produce the ending.
+		return "a remote provider (model or forge) repeatedly failed to serve this attempt; work released for another capacity"
 	case courierv1alpha1.TerminalDiagnosticCategoryExecutorCrash:
 		return "coordinator exited without a valid handoff"
 	case courierv1alpha1.TerminalDiagnosticCategoryUnknown:
