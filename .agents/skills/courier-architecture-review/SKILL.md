@@ -22,7 +22,7 @@ These are not style preferences; a change that violates them is wrong.
 
 ## Focused review procedure
 
-- Treat DESIGN.md as the architecture source of truth. Read the sections relevant to the changed subsystem, not the entire document blindly. If a PR changes an architectural decision or a capability documented there, require the same PR to update the current-state prose and add a dated decision-log entry with the rationale and linked issue.
+- Treat DESIGN.md as the current-state architecture source of truth. Read the sections relevant to the changed subsystem, not the entire document blindly. If a PR materially changes a documented architectural boundary, contract, security property, durable invariant, or capability, require the same PR to update the current-state prose. Do not require a dated decision-log entry: Git history and linked issues/PRs preserve implementation history. A separate architecture decision record is optional and reserved for rare, durable cross-cutting trade-offs that cannot be understood from the current design and its history.
 - For API changes under api/, verify generated deepcopy/manifests output is refreshed with make manifests generate and committed. Do not hand-edit generated CRDs in charts/courier/crd-manifests/.
 - For RBAC changes, verify the kubebuilder marker, generated config/rbac/role.yaml, and charts/courier/values.yaml remain in sync.
 - For controller changes, follow the reconciliation path and state transitions through success, retry, failure, cancellation, and terminal states. Check idempotency and whether observed Git/PR/CI state remains authoritative where DESIGN.md says it is.
