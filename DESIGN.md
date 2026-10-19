@@ -2052,6 +2052,3 @@ only informs.
   cannot safely distinguish a slow operation from a dead one. Human
   intervention remains the escape; Courier deliberately avoids wall-clock run
   deadlines.
-- Implementation backlog and delivery status belong in GitHub issues and PRs,
-  not here. Keep this section limited to enduring system limitations, not
-  per-issue status.
