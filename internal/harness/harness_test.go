@@ -176,6 +176,12 @@ type mockWorker struct {
 	// for a worker whose bootstrap task or whose environment-capture task
 	// — but not both — never terminates.
 	hangStage string
+	// reconcileFails makes the result poll for a tombstoned operation fail
+	// with 503: the cancellation landed and the worker tombstoned the op,
+	// but the reconcile cannot observe what happened to the task afterward.
+	// It stands in for a worker whose reconciliation cannot verify
+	// termination — the case where control must fence rather than classify.
+	reconcileFails bool
 	// tombstones records cancelled op IDs, mirroring the real worker: a
 	// cancellation tombstone is final, and a result poll for a
 	// tombstoned operation answers the verified cancellation instead of
@@ -343,6 +349,13 @@ func (m *mockWorker) handleResult(w http.ResponseWriter, r *http.Request) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	tombstoned := m.tombstones[opID]
+	if tombstoned && m.reconcileFails {
+		// The cancellation landed, but observing the operation afterward
+		// fails: reconciliation that cannot verify termination.
+		w.WriteHeader(http.StatusServiceUnavailable)
+		fmt.Fprint(w, "reconcile cannot observe the operation")
+		return
+	}
 	if tombstoned && m.results[opID].Result == nil {
 		m.results[opID] = protocol.ResultState{
 			Status: protocol.ResultCancelled,

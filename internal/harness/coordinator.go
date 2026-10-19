@@ -1193,7 +1193,14 @@ func (c *Coordinator) dispatchAndAwait(ctx context.Context, opID, briefID string
 			defer reconcileCancel()
 			reconciled, reconcileErr := c.worker.ReconcileAmbiguous(reconcileCtx, opID, briefID)
 			if reconcileErr != nil {
-				return protocol.Result{}, fmt.Errorf("result poll for %s failed and reconciliation failed: poll: %v; reconcile: %w", opID, err, reconcileErr)
+				// A reconcile that could not observe termination leaves the
+				// operation's fate unknown: the cancellation may never have
+				// reached the worker. The worker is fenced and the error
+				// carries the unverified-termination fact, so no caller can
+				// treat this as a settled outcome or classify the operation
+				// as safely stopped.
+				c.fenceWorker(opID, reconcileErr)
+				return protocol.Result{}, fmt.Errorf("result poll for %s failed and reconciliation failed: poll: %v; reconcile: %v: %w", opID, err, reconcileErr, ErrTerminationUnverified)
 			}
 			result, resultErr := c.verifiedResult(reconcileCtx, opID, reconciled)
 			if resultErr == nil {
@@ -1491,6 +1498,16 @@ func (c *Coordinator) bootstrapWorkspace(ctx context.Context, briefID, baseOID s
 		return err
 	}
 	if bootstrapCtx.Err() != nil {
+		// Unverified termination is not the bootstrap's own failure (#414
+		// review): if the bound expired without the process-group kill being
+		// observed, repository-authored work may still be executing, and the
+		// run must not classify blocked-external over it. The active-operation
+		// entry stays retained and the worker stays fenced; the error fails
+		// closed through the ordinary snapshot-preparation path, which cannot
+		// dispatch again against a fenced worker.
+		if errors.Is(err, ErrTerminationUnverified) {
+			return err
+		}
 		// Bound expiry is classified from the stage context itself, not by
 		// unwrapping the error: the stage context past its deadline while
 		// the parent is still live is the stage's own liveness bound,
@@ -1554,6 +1571,13 @@ func (c *Coordinator) bootstrapWorkspace(ctx context.Context, briefID, baseOID s
 		return err
 	}
 	if captureCtx.Err() != nil {
+		// The same unverified-termination rule as the bootstrap stage: an
+		// expiry whose kill was never observed is not an environment blocker.
+		// The entry stays retained, the worker stays fenced, and the error
+		// fails closed through the ordinary path.
+		if errors.Is(err, ErrTerminationUnverified) {
+			return err
+		}
 		reason := bootstrapBlockerReasonPrefix + ": the environment-capture task exceeded its liveness bound"
 		if errors.Is(err, ErrTerminationUnverified) {
 			reason += " and its process-group termination could not be observed"

@@ -100,7 +100,8 @@ event, carrying `time`, `event`, `run_id`, `repo`, `ref`, `mode`, `brief`,
 `run.start`, `run.exit`, `workspace.ready`, `executor.start`,
 `executor.continuation`, `model.call`, `tool.call`, `tool.result`,
 `brief.start`, `brief.complete`, `phase.transition`, `capability.status`,
-`outcome.declared`, `outcome.comment`, `linkage.read.failed`, `run.summary`, and
+`outcome.declared`, `outcome.comment`, `linkage.read.failed`, `run.summary`,
+`workspace.bootstrap`, and
 `evidence.capture`. Log verbosity is set by `COURIER_LOG_LEVEL`, with a per-run
 `debug` flag gating `detail` inclusion. Courier does **not** emit Kubernetes
 Events; all controller "events" are these stdout lines.

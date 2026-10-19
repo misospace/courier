@@ -832,3 +832,103 @@ func TestIntegratorContractStateModifiedBySymlinkedConfigAtHead(t *testing.T) {
 		t.Fatalf("contract state = %q, want modified", state)
 	}
 }
+
+// TestBootstrapUnverifiedTerminationIsNotABlocker pins the #414 review
+// regression: when a stage's liveness bound expires and its reconciliation
+// cannot observe the process-group kill — the reconcile's own result poll
+// failing after the cancellation lands — the error must carry
+// ErrTerminationUnverified, must NOT be classified as a bootstrapBlocker,
+// no failed receipt may be recorded, the active-operation entry must stay
+// retained, and the worker fence must reject every further dispatch. A run
+// whose worker may still be executing repository-authored work can never
+// be reported as a settled blocked-external ending.
+func TestBootstrapUnverifiedTerminationIsNotABlocker(t *testing.T) {
+	for _, tc := range []struct {
+		stage            string
+		wantDrops        int
+		wantClears       int
+		bootstrapResults []protocol.Result
+	}{
+		{"bootstrap", 1, 0, nil},
+		{"capture", 2, 1, []protocol.Result{
+			// The bootstrap stage completed and was verified, so its entry
+			// is legitimately cleared; only the hung stage's entry must be
+			// retained.
+			{ExitCode: 0, StdoutTail: "courier-mise-path=/usr/bin/mise\n"},
+		}},
+	} {
+		t.Run(tc.stage, func(t *testing.T) {
+			worker, delegator, cleanupWorker := testWorkerAndDelegator(t)
+			defer cleanupWorker()
+			worker.hangStage = tc.stage
+			worker.bootstrapResults = tc.bootstrapResults
+			worker.reconcileFails = true
+
+			transport := &recordingTransport{}
+			receipts := &recordingBootstrapReceipts{}
+
+			gateway, _, cleanup := gatewayFor()
+			defer cleanup()
+			coordinator, err := NewCoordinator(CoordinatorConfig{
+				Gateway:           gateway,
+				Bindings:          testBindings(),
+				Worker:            delegator,
+				Status:            NewStatusReporter(transport, "control-uid", "worker-uid", 0),
+				BootstrapReceipts: receipts,
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			restored := bootstrapBound
+			bootstrapBound = 100 * time.Millisecond
+			defer func() { bootstrapBound = restored }()
+
+			err = coordinator.bootstrapWorkspace(context.Background(), "b1", testBaseOID)
+
+			// The error carries the unverified-termination fact.
+			if !errors.Is(err, ErrTerminationUnverified) {
+				t.Fatalf("unverified expiry error = %v, want ErrTerminationUnverified in its chain", err)
+			}
+			// It is not the bootstrap's environment blocker.
+			var blocker *bootstrapBlocker
+			if errors.As(err, &blocker) {
+				t.Fatalf("unverified expiry error = %v, must not be a bootstrapBlocker", err)
+			}
+			// No failed receipt is recorded for an outcome the run never
+			// verified.
+			if got := len(receipts.receipts); got != 0 {
+				t.Fatalf("bootstrap receipts = %d, want none for an unverified termination", got)
+			}
+			// The active-operation entry is retained: it was begun, and
+			// nothing cleared it.
+			transport.mu.Lock()
+			adds, clears := 0, 0
+			for _, p := range transport.patches {
+				if p.AddOperation != nil {
+					adds++
+				}
+				if p.ClearOperation != "" {
+					clears++
+				}
+			}
+			transport.mu.Unlock()
+			if adds == 0 {
+				t.Fatalf("status patches record no begun operation, want the dispatch evidence retained")
+			}
+			if clears != tc.wantClears {
+				t.Fatalf("status patches record %d cleared operations, want %d — the hung stage's entry must stay retained", clears, tc.wantClears)
+			}
+			// The worker fence rejects the next dispatch without any
+			// further task reaching the worker.
+			drops := worker.dispatchCount()
+			err = coordinator.bootstrapWorkspace(context.Background(), "b1", testBaseOID)
+			if err == nil || !strings.Contains(err.Error(), "fenced") {
+				t.Fatalf("post-fence bootstrap error = %v, want the worker fence rejection", err)
+			}
+			if got := worker.dispatchCount(); got != drops {
+				t.Fatalf("worker dispatches after fence = %d, want %d — the fence must refuse every dispatch", got, drops)
+			}
+		})
+	}
+}
