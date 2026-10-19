@@ -30,6 +30,9 @@ func DefaultPodResources() corev1.ResourceRequirements {
 // floored to the default wherever they are absent or non-positive, so every
 // Courier-created pod carries finite CPU and memory requests (#356). Limits
 // stay exactly as written — omitting them is a documented operator choice.
+// Every other key passes through unchanged in both halves: the floor covers
+// CPU and memory only, and this resolver neither validates nor rejects a
+// key, so an extended resource's own requests/limits rules stay Kubernetes'.
 // The result is a deep copy, so a caller that renders and mutates it cannot
 // write through to the object it read — which may be the informer cache's
 // copy of a LaneProfile, never the caller's to modify.

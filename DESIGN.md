@@ -1388,8 +1388,9 @@ the deployment default remains the minimal bootstrap image.
 vocabulary is a deliberate subset of `corev1.ResourceRequirements`: only
 `requests` and `limits` are expressible, because no Courier renderer sets
 `pod.spec.resourceClaims`, so a lane cannot configure a value Courier would
-ignore or that would only fail at pod admission. Every requests/limits key is
-honoured, subject only to the CPU and memory request floor described below:
+ignore or that would only fail at pod admission (#403). Every requests/limits
+key is honoured, subject only to the CPU and memory request floor described
+below:
 extended-resource keys pass through to pods and ride normal Kubernetes
 scheduling and quota semantics, where Kubernetes defaults an extended
 resource's request to its limit — a key set in limits alone is valid and takes
