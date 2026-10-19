@@ -382,6 +382,39 @@ func toolsToWire(tools []ToolDef) []wireTool {
 // a hostile or broken gateway response.
 const maxStreamLineBytes = 1 << 20
 
+// maxStreamContentBytes bounds the total content-delta bytes one completion
+// may hold. It is a transport resource bound, not a work or model-behavior
+// limit: a per-line bound says nothing about a stream of many individually
+// valid lines, and one that exceeds this is a hostile or broken gateway
+// response.
+const maxStreamContentBytes = 8 << 20
+
+// maxStreamToolArgumentBytes bounds the tool-argument bytes one completion
+// may hold across every fragment. It is a transport resource bound, not a
+// work or model-behavior limit: it says what a single turn may cost the
+// control pod to assemble, never how much work the model may do.
+const maxStreamToolArgumentBytes = 4 << 20
+
+// maxStreamToolCallCount bounds the distinct tool-call indexes one completion
+// may hold. It is a transport resource bound, not a work or model-behavior
+// limit: it bounds the fragment table a stream can grow, not the tool calls
+// a model is allowed to make.
+const maxStreamToolCallCount = 128
+
+// maxStreamEvents bounds the events one completion may retain. It is a
+// transport resource bound, not a work, duration, or model-behavior limit: an
+// Event costs its caller a slot whatever it carries, so a payload-byte bound
+// does not bound retention on its own — at this cap the retained events cost
+// roughly 11 MB even when every one of them carries a single byte.
+const maxStreamEvents = 1 << 16
+
+// maxStreamToolIdentityBytes bounds the tool-call identity bytes one
+// completion may send. It is a transport resource bound, not a work,
+// duration, or model-behavior limit: identity fields are overwritten per
+// fragment rather than accumulated, so a budget charged only against what a
+// call retains would let a stream send unbounded identity bytes for free.
+const maxStreamToolIdentityBytes = 64 << 10
+
 type wireChunk struct {
 	Choices []wireChoice `json:"choices"`
 	Error   *wireError   `json:"error"`
@@ -414,9 +447,24 @@ type wireError struct {
 	Code    any    `json:"code"`
 }
 
+// toolFragment is one tool call still under assembly: identity fields arrive
+// whole, arguments arrive in fragments appended to args and become a string
+// only when the request is emitted.
+type toolFragment struct {
+	call ToolCall
+	args []byte
+}
+
 // normalizeStream reads an SSE body and produces the normalized event
 // sequence. Tool-call fragments are assembled here — consumers never see a
-// partial tool request — and the terminal event closes the sequence.
+// partial tool request — and the terminal event closes the sequence. The
+// per-line, payload, and event bounds are transport resource bounds: each is
+// checked before the bytes, entry, or event it would retain is kept, so
+// crossing one ends the turn with a redacted error and never with an
+// executable partial tool request: requests are assembled during the scan
+// loop and emitted atomically after it — every fragment's completeness and
+// the whole set's event capacity are checked before the first request is
+// retained.
 func normalizeStream(body io.Reader, signals ExhaustionSignals) ([]Event, error) {
 	scanner := bufio.NewScanner(body)
 	scanner.Buffer(make([]byte, 0, 64*1024), maxStreamLineBytes)
@@ -424,7 +472,8 @@ func normalizeStream(body io.Reader, signals ExhaustionSignals) ([]Event, error)
 	var events []Event
 	// Tool-call fragments are accumulated per index and emitted, in index
 	// order, once the stream closes the turn.
-	fragments := map[int]*ToolCall{}
+	fragments := map[int]*toolFragment{}
+	var contentBytes, argumentBytes, identityBytes int
 	var finish string
 
 	for scanner.Scan() {
@@ -458,21 +507,47 @@ func normalizeStream(body io.Reader, signals ExhaustionSignals) ([]Event, error)
 				return streamError(events, fmt.Errorf("harness: unexpected stream choice index %d", choice.Index))
 			}
 			if choice.Delta.Content != "" {
-				events = append(events, Event{Kind: KindDelta, Text: choice.Delta.Content})
+				if contentBytes+len(choice.Delta.Content) > maxStreamContentBytes {
+					return streamError(events, ErrStreamContentOverflow)
+				}
+				contentBytes += len(choice.Delta.Content)
+				next, kept := appendBoundedEvent(events, Event{Kind: KindDelta, Text: choice.Delta.Content})
+				if !kept {
+					return streamError(events, ErrStreamEventOverflow)
+				}
+				events = next
 			}
 			for _, call := range choice.Delta.ToolCalls {
 				fragment, ok := fragments[call.Index]
 				if !ok {
-					fragment = &ToolCall{}
+					if len(fragments) >= maxStreamToolCallCount {
+						return streamError(events, ErrStreamToolCallOverflow)
+					}
+					fragment = &toolFragment{}
 					fragments[call.Index] = fragment
 				}
+				// Identity is charged as received, not as retained: a stream may
+				// overwrite these fields, but every byte it sends costs the
+				// control pod to receive and parse. Empty fields are free, so
+				// this charges exactly the non-empty ID and Name.
+				identity := len(call.ID) + len(call.Function.Name)
+				if identityBytes+identity > maxStreamToolIdentityBytes {
+					return streamError(events, ErrStreamToolIdentityOverflow)
+				}
+				identityBytes += identity
 				if call.ID != "" {
-					fragment.ID = call.ID
+					fragment.call.ID = call.ID
 				}
 				if call.Function.Name != "" {
-					fragment.Name = call.Function.Name
+					fragment.call.Name = call.Function.Name
 				}
-				fragment.Arguments += call.Function.Arguments
+				if call.Function.Arguments != "" {
+					if argumentBytes+len(call.Function.Arguments) > maxStreamToolArgumentBytes {
+						return streamError(events, ErrStreamToolArgumentOverflow)
+					}
+					argumentBytes += len(call.Function.Arguments)
+					fragment.args = append(fragment.args, call.Function.Arguments...)
+				}
 			}
 			if choice.FinishReason != "" {
 				finish = choice.FinishReason
@@ -492,30 +567,60 @@ func normalizeStream(body io.Reader, signals ExhaustionSignals) ([]Event, error)
 		if len(fragments) == 0 {
 			return streamError(events, fmt.Errorf("harness: tool_calls finish without any tool request"))
 		}
-		for _, index := range sortedFragmentIndexes(fragments) {
-			call := fragments[index]
-			if call.Name == "" || call.ID == "" {
+		// Requests are emitted atomically. Every fragment's completeness and
+		// the whole set's event capacity are checked before the first request
+		// is retained, so no rejection path can leave one executable request
+		// beside the terminal error.
+		indexes := sortedFragmentIndexes(fragments)
+		for _, index := range indexes {
+			fragment := fragments[index]
+			if fragment.call.Name == "" || fragment.call.ID == "" {
 				return streamError(events, fmt.Errorf("harness: incomplete tool request in provider stream"))
 			}
-			events = append(events, Event{Kind: KindToolRequest, Tool: *call})
+		}
+		if len(events)+len(indexes) > maxStreamEvents {
+			return streamError(events, ErrStreamEventOverflow)
+		}
+		for _, index := range indexes {
+			fragment := fragments[index]
+			call := fragment.call
+			call.Arguments = string(fragment.args)
+			events = append(events, Event{Kind: KindToolRequest, Tool: call})
 		}
 	default:
 		if len(fragments) > 0 {
 			return streamError(events, fmt.Errorf("harness: incomplete tool request in provider stream"))
 		}
-		events = append(events, Event{Kind: KindFinal, FinishReason: finish})
+		next, kept := appendBoundedEvent(events, Event{Kind: KindFinal, FinishReason: finish})
+		if !kept {
+			return streamError(events, ErrStreamEventOverflow)
+		}
+		events = next
 	}
 	return events, nil
 }
 
+// appendBoundedEvent appends one retained event unless the per-response event
+// bound is already reached, in which case it appends nothing and reports
+// false. Only the events a turn keeps as data go through it: the terminal
+// error streamError appends is deliberately exempt, because a turn that fails
+// at the cap must still be reportable.
+func appendBoundedEvent(events []Event, event Event) ([]Event, bool) {
+	if len(events) >= maxStreamEvents {
+		return events, false
+	}
+	return append(events, event), true
+}
+
 // streamError appends exactly one terminal error event to whatever events
 // already arrived. Deltas already emitted remain valid data; the turn failed
-// and is reported as such, never masked as a final.
+// and is reported as such, never masked as a final. This one append is exempt
+// from maxStreamEvents on purpose: it is the report, not data.
 func streamError(events []Event, err error) ([]Event, error) {
 	return append(events, Event{Kind: KindError, Err: err}), nil
 }
 
-func sortedFragmentIndexes(fragments map[int]*ToolCall) []int {
+func sortedFragmentIndexes(fragments map[int]*toolFragment) []int {
 	indexes := make([]int, 0, len(fragments))
 	for index := range fragments {
 		indexes = append(indexes, index)

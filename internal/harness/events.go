@@ -69,3 +69,31 @@ type Event struct {
 
 // ErrStreamTruncated reports a stream that ended without a terminal event.
 var ErrStreamTruncated = errors.New("harness: provider stream ended without a terminal event")
+
+// The stream-overflow errors report a completion that crossed a transport
+// resource bound. Their strings are fixed and redacted: they name the bound,
+// never provider text or the size observed. A stream that crossed one is a
+// hostile or broken gateway response, and the deltas already accepted remain
+// valid data under a terminal error — never a tool request, because requests
+// are emitted only after the whole stream is read.
+var (
+	// ErrStreamContentOverflow reports content deltas over the buffered
+	// content bound.
+	ErrStreamContentOverflow = errors.New("harness: provider stream exceeded the buffered content bound")
+
+	// ErrStreamToolArgumentOverflow reports tool-call arguments over the
+	// buffered tool-argument bound.
+	ErrStreamToolArgumentOverflow = errors.New("harness: provider stream exceeded the buffered tool-argument bound")
+
+	// ErrStreamToolCallOverflow reports more distinct tool-call indexes than
+	// the buffered tool-call bound allows.
+	ErrStreamToolCallOverflow = errors.New("harness: provider stream exceeded the buffered tool-call count bound")
+
+	// ErrStreamEventOverflow reports more retained events than the buffered
+	// event bound allows.
+	ErrStreamEventOverflow = errors.New("harness: provider stream exceeded the buffered event bound")
+
+	// ErrStreamToolIdentityOverflow reports more tool-call identity bytes than
+	// the buffered tool-identity bound allows.
+	ErrStreamToolIdentityOverflow = errors.New("harness: provider stream exceeded the buffered tool-identity bound")
+)
