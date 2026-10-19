@@ -553,6 +553,62 @@ func TestResourceNamesStayUniqueAndStable(t *testing.T) {
 	}
 }
 
+// TestProbePodNamesAreUniquePerNode pins the probe name's two jobs at once:
+// two nodes whose names differ past the prefix the tag can keep, or that
+// normalize to the same string, must never render the same probe pod — or one
+// node's probe is created, collected, and deleted for the other. The name must
+// also stay deterministic and DNS-valid, whatever the node looks like.
+func TestProbePodNamesAreUniquePerNode(t *testing.T) {
+	nodes := []string{
+		// Share the prefix the tag can afford to keep.
+		"worker-production-001",
+		"worker-production-002",
+		// Normalize to one string: the dot and the underscore both drop.
+		"worker-prod.001",
+		"worker-prod_001",
+		"9lives",
+		strings.Repeat("a", 253),
+	}
+	// A run name at the object-name limit leaves the probe suffix the same
+	// budget it has for a short run.
+	for _, runName := range []string{"probe-names", strings.Repeat("z", 253)} {
+		run := testRun(runName)
+		seen := map[string]string{}
+		for _, node := range nodes {
+			name := ProbePod(run, node, "busybox:test", "true", configuredResources()).Name
+			if again := ProbePod(run, node, "busybox:test", "true", configuredResources()).Name; again != name {
+				t.Errorf("probe pod name for node %q is not deterministic: %q then %q", node, name, again)
+			}
+			if errs := validation.IsDNS1123Subdomain(name); len(errs) > 0 {
+				t.Errorf("probe pod name for node %q = %q: %v", node, name, errs)
+			}
+			if len(name) > 253 {
+				t.Errorf("probe pod name for node %q is %d characters: %q", node, len(name), name)
+			}
+			if other, clash := seen[name]; clash {
+				t.Errorf("nodes %q and %q render the same probe pod name %q", other, node, name)
+			}
+			seen[name] = node
+		}
+	}
+	// Names that normalize away to nothing leave the digest as the whole tag.
+	for _, node := range append([]string{"", "-", "---", strings.Repeat("A", 40)}, nodes...) {
+		tag := nodeNameTag(node)
+		if tag == "" {
+			t.Errorf("node %q renders an empty probe tag", node)
+		}
+		if len(tag) > 16 {
+			t.Errorf("probe tag for node %q is %d characters: %q", node, len(tag), tag)
+		}
+		if strings.HasPrefix(tag, "-") || strings.HasSuffix(tag, "-") {
+			t.Errorf("probe tag for node %q starts or ends with a hyphen: %q", node, tag)
+		}
+		if errs := validation.IsDNS1123Label(tag); len(errs) > 0 {
+			t.Errorf("probe tag for node %q = %q: %v", node, tag, errs)
+		}
+	}
+}
+
 func TestServiceNamesAreValidDNSLabels(t *testing.T) {
 	names := []string{
 		"short",

@@ -130,6 +130,8 @@ func (e *APIError) Error() string {
 	return fmt.Sprintf("Dispatch API returned HTTP %d: %s", e.StatusCode, e.Message)
 }
 
+var _ source.HandoutAcker = (*HTTPClient)(nil)
+
 // HTTPClient implements the Dispatch HTTP API behind the source adapter.
 type HTTPClient struct {
 	baseURL                  *url.URL
@@ -685,6 +687,76 @@ func classifyCapacityHandoff(err error) error {
 	default:
 		return err
 	}
+}
+
+// AckHandout acknowledges the PR-fix hand-out stamped on a queue-backed
+// follow-up attempt (dispatch#1211). Dispatch records the ack per
+// `(agent, generation)` the moment the worker's run durably materializes, so
+// the stale-handout reclaimer can tell a live attempt from a lost one and a
+// settled park leaves the hand-out fully accounted (#456). The call is
+// generation-pinned and idempotent server-side: a repeat ack is a success,
+// not an error. Only the endpoint's known moot refusals prove the hand-out
+// state has already moved on and degrade to a no-op: 404 with the known
+// `pr-fix item not found` response (the item is gone), 403 with
+// `reason: "not-handed"` (the hand-out was never ours), or 409 with a known
+// moot reason (the generation was re-issued, the item left QUEUED, or the
+// hand-out released). Any other 403 or 404 — worker-scope or auth
+// rejections, a non-bearer auth mode, an older deployment, or a missing
+// route — is not proof the ledger moved on and returns an error, as does an
+// unknown 409 reason, a transport failure, or a server failure: the hand-out
+// stays in the reclaimable state the reclaimer exists for, and the caller
+// logs without blocking materialization.
+func (c *HTTPClient) AckHandout(ctx context.Context, item source.WorkItem) error {
+	d, err := decodeWorkID(item.ID)
+	if err != nil {
+		return fmt.Errorf("dispatch client: decode work item for hand-out ack: %w", err)
+	}
+	if d.Type != "followup-pr" || d.PRFixID == "" || d.Generation < 1 {
+		// Not a queue-backed PR-fix attempt: nothing to acknowledge.
+		return nil
+	}
+	repo := strings.ToLower(d.Repo)
+	if d.Repo == "" || !dispatchRepoPattern.MatchString(repo) || d.Number <= 0 || d.Number > maxSafeInteger || d.Generation > maxSafeInteger {
+		return fmt.Errorf("dispatch client: invalid PR-fix hand-out descriptor")
+	}
+	err = c.do(ctx, http.MethodPost, "/api/pr-fix-queue/ack", map[string]any{
+		"repo": repo, "pr": d.Number, "generation": d.Generation, "agentName": c.agentName,
+	}, nil)
+	var apiErr *APIError
+	if errors.As(err, &apiErr) {
+		switch apiErr.StatusCode {
+		case http.StatusNotFound:
+			// Only the endpoint's known not-found response proves the item
+			// is gone; a route-level 404 (older deployment, missing route)
+			// is not ledger evidence and must surface.
+			if strings.Contains(strings.ToLower(apiErr.Message), "pr-fix item not found") {
+				return nil
+			}
+		case http.StatusForbidden:
+			// Only the known not-handed refusal proves the hand-out was
+			// never ours; a worker-scope, auth-mode, or other 403 is a
+			// configuration failure, not ledger evidence, and must surface.
+			var response struct {
+				Reason string `json:"reason"`
+			}
+			if json.Unmarshal([]byte(apiErr.Message), &response) == nil && response.Reason == "not-handed" {
+				return nil
+			}
+		case http.StatusConflict:
+			// Only the known moot refusals are no-ops; an unknown refusal
+			// reason must surface, never silently drop ledger evidence.
+			var response struct {
+				Reason string `json:"reason"`
+			}
+			if json.Unmarshal([]byte(apiErr.Message), &response) == nil {
+				switch response.Reason {
+				case "generation-mismatch", "not-queued", "not-stamped":
+					return nil
+				}
+			}
+		}
+	}
+	return err
 }
 
 func (c *HTTPClient) markPRFixBlocked(ctx context.Context, d workDescriptor, note string) error {

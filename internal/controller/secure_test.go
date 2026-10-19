@@ -1321,6 +1321,222 @@ func TestProbeCoverageIsIncompleteWithoutEveryNode(t *testing.T) {
 	}
 }
 
+// eligibleProbeCluster seeds what runLiveProbes reads before it creates
+// anything: the named eligible nodes and the three ClusterIPs the checks
+// target.
+func eligibleProbeCluster(t *testing.T, c client.Client, run *courier.CoderRun, nodes ...string) {
+	t.Helper()
+	for _, name := range nodes {
+		if err := c.Create(context.Background(), &corev1.Node{
+			ObjectMeta: metav1.ObjectMeta{Name: name},
+			Status: corev1.NodeStatus{Conditions: []corev1.NodeCondition{{
+				Type: corev1.NodeReady, Status: corev1.ConditionTrue,
+			}}},
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, service := range []*corev1.Service{
+		{ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "kubernetes"}, Spec: corev1.ServiceSpec{ClusterIP: "10.0.0.1"}},
+		{ObjectMeta: metav1.ObjectMeta{Namespace: "kube-system", Name: "kube-dns"}, Spec: corev1.ServiceSpec{ClusterIP: "10.0.0.10"}},
+		{ObjectMeta: metav1.ObjectMeta{Namespace: run.Namespace, Name: topology.BrokerServiceName(run.Name)}, Spec: corev1.ServiceSpec{ClusterIP: "10.0.0.20"}},
+	} {
+		if err := c.Create(context.Background(), service); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+// denyResults renders the probe termination message for a node that observed
+// the expected deny on each named check.
+func denyResults(checks ...string) string {
+	var out strings.Builder
+	for _, check := range checks {
+		fmt.Fprintf(&out, "{\"name\":%q,\"got\":\"deny\"}\n", check)
+	}
+	return out.String()
+}
+
+// stampProbeCreates stands in for the kubelet: every probe pod the live pass
+// creates comes back terminal carrying the results keyed by the node it was
+// pinned to, so the pass reads exactly what its own pods reported. It returns
+// the probe pod name each node's create produced.
+func stampProbeCreates(t *testing.T, control *SecureControl, results map[string]string) map[string]string {
+	t.Helper()
+	watcher, ok := control.Client.(client.WithWatch)
+	if !ok {
+		t.Fatal("the fake client does not support watch")
+	}
+	created := map[string]string{}
+	control.Client = interceptor.NewClient(watcher, interceptor.Funcs{
+		Create: func(ctx context.Context, c client.WithWatch, obj client.Object, opts ...client.CreateOption) error {
+			if err := c.Create(ctx, obj, opts...); err != nil {
+				return err
+			}
+			pod, isProbe := obj.(*corev1.Pod)
+			if !isProbe || pod.Labels[topology.LabelProbe] != "true" {
+				return nil
+			}
+			node := pod.Spec.NodeName
+			if _, twice := created[node]; twice {
+				t.Errorf("node %q was probed twice in one pass", node)
+			}
+			created[node] = pod.Name
+			stamped := pod.DeepCopy()
+			stamped.Status.Phase = corev1.PodSucceeded
+			stamped.Status.ContainerStatuses = []corev1.ContainerStatus{{
+				Name: "probe",
+				State: corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{
+					Message: results[node],
+				}},
+			}}
+			return c.Status().Update(ctx, stamped)
+		},
+	})
+	return created
+}
+
+// TestLiveProbePodsStaySeparatePerNode drives the real live-probe pass over two
+// nodes whose names differ past the prefix a probe tag can keep. One shared
+// probe name means one node's probe is created, read, and deleted for the
+// other, so each node must get its own pod, pinned to the node it was asked
+// about, and each node must be judged on its own pod's results.
+func TestLiveProbePodsStaySeparatePerNode(t *testing.T) {
+	// Both names normalize to themselves and share their first 16
+	// characters — the whole tag budget a probe name used to spend on the
+	// normalized name alone.
+	const (
+		first  = "worker-production-001"
+		second = "worker-production-002"
+	)
+	checks := []string{"api-server", "cluster-dns", "cloud-metadata", "broker-service"}
+
+	t.Run("every node gets its own probe", func(t *testing.T) {
+		control, c := secureControl(t)
+		run := secureRun("probe-per-node")
+		eligibleProbeCluster(t, c, run, first, second)
+		created := stampProbeCreates(t, control, map[string]string{
+			first:  denyResults(checks...),
+			second: denyResults(checks...),
+		})
+
+		if err := control.runLiveProbes(context.Background(), run, nil, courier.DefaultPodResources()); err != nil {
+			t.Fatalf("runLiveProbes: %v", err)
+		}
+		if len(created) != 2 {
+			t.Fatalf("the pass probed %v, want one probe each for %q and %q", created, first, second)
+		}
+		if created[first] == created[second] {
+			t.Fatalf("nodes %q and %q shared probe pod %q", first, second, created[first])
+		}
+		for _, node := range []string{first, second} {
+			want := topology.ProbePod(run, node, control.Config.ProbeImage, "true", courier.DefaultPodResources()).Name
+			if created[node] != want {
+				t.Errorf("node %q got probe pod %q, want the one its own name derives: %q", node, created[node], want)
+			}
+			pod := &corev1.Pod{}
+			err := c.Get(context.Background(), types.NamespacedName{Namespace: run.Namespace, Name: created[node]}, pod)
+			if !apierrors.IsNotFound(err) {
+				t.Errorf("probe pod for node %q outlived the pass: %v", node, err)
+			}
+		}
+	})
+
+	t.Run("every node is judged on its own results", func(t *testing.T) {
+		control, c := secureControl(t)
+		run := secureRun("probe-per-node-gaps")
+		eligibleProbeCluster(t, c, run, first, second)
+		// The first node's probe reports one check short of the full set.
+		// Under one shared probe name the surviving pod is the second's
+		// complete result set, read for both nodes, and the pass would pass.
+		stampProbeCreates(t, control, map[string]string{
+			first:  denyResults(checks[:3]...),
+			second: denyResults(checks...),
+		})
+
+		err := control.runLiveProbes(context.Background(), run, nil, courier.DefaultPodResources())
+		if err == nil {
+			t.Fatal("an incomplete result set for one node must not pass the whole pass")
+		}
+		if !strings.Contains(err.Error(), first) || !strings.Contains(err.Error(), "3 of 4") {
+			t.Fatalf("error = %v, want it to name node %q and its incomplete coverage", err, first)
+		}
+	})
+}
+
+// TestProbeResultsRefuseAnotherNodesPod pins the check that a probe pod's name
+// alone cannot make: the pod a name resolves to must be pinned to the node
+// under test. A collision, or a pod bound elsewhere, says nothing about that
+// node's isolation, so its results are refused rather than counted — and
+// terminally (#449): the mismatch's persistent causes outlast a requeue, and
+// the read cannot tell them from a stray pod a later pass would clear.
+func TestProbeResultsRefuseAnotherNodesPod(t *testing.T) {
+	control, c := secureControl(t)
+	run := secureRun("probe-elsewhere")
+	if err := c.Create(context.Background(), run); err != nil {
+		t.Fatal(err)
+	}
+	// A complete, passing result set — from a pod that never ran on node-a.
+	pod := topology.ProbePod(run, "node-a", "busybox:test", "true", courier.DefaultPodResources())
+	pod.Spec.NodeName = "node-b"
+	if err := c.Create(context.Background(), pod); err != nil {
+		t.Fatal(err)
+	}
+	pod.Status.Phase = corev1.PodSucceeded
+	pod.Status.ContainerStatuses = []corev1.ContainerStatus{{
+		Name: "probe",
+		State: corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{
+			Message: denyResults("api-server", "cluster-dns"),
+		}},
+	}}
+	if err := c.Status().Update(context.Background(), pod); err != nil {
+		t.Fatal(err)
+	}
+
+	outcomes, pending, err := control.collectProbeResults(context.Background(), run, []string{"node-a"}, 2, courier.DefaultPodResources())
+	if err == nil {
+		t.Fatal("a probe running on another node must not be counted as this node's result")
+	}
+	var permanent *SecureNeedsHumanError
+	if !errors.As(err, &permanent) || permanent.Reason != "ProbeIdentity" {
+		t.Fatalf("error = %v, want a terminal *SecureNeedsHumanError reason ProbeIdentity", err)
+	}
+	if !strings.Contains(permanent.Detail, pod.Name) ||
+		!strings.Contains(permanent.Detail, "scheduled on node node-b, not node-a") {
+		t.Fatalf("detail = %q, want it to name probe %q, the node it is pinned to, and the node under test",
+			permanent.Detail, pod.Name)
+	}
+	if pending {
+		t.Fatal("a terminal probe is not pending; it was refused")
+	}
+	if len(outcomes) > 0 {
+		t.Fatalf("a refused probe must contribute no outcomes, got %v", outcomes)
+	}
+}
+
+// TestTerminalPreflightVerdictClassifications pins the launch paths'
+// terminalization predicate itself: the probe-identity refusal joins
+// PodAdmission as a terminal verdict, and every other secure-preflight reason
+// keeps its claim/release requeue (#449).
+func TestTerminalPreflightVerdictClassifications(t *testing.T) {
+	terminal := map[string]bool{
+		"PodAdmission":  true,
+		"ProbeIdentity": true,
+	}
+	for _, reason := range []string{
+		"PodAdmission", "ProbeIdentity",
+		"PodSecurity", "OperatorRBAC", "BrokerRBAC", "AdmissionBroken",
+		"IsolationBroken", "RunNamespace", "ProviderSelection",
+	} {
+		if got := terminalPreflightVerdict(secureNeedsHuman(reason, "synthetic %s", reason)) != nil; got != terminal[reason] {
+			t.Errorf("reason %q terminalizes = %v, want %v", reason, got, terminal[reason])
+		}
+	}
+	if terminalPreflightVerdict(errors.New("ordinary preflight failure")) != nil {
+		t.Error("an ordinary error must not terminalize")
+	}
+}
+
 // TestPublicationPolicyPersistsEmptyToSetOnly drives resolvePersistSecurePolicy
 // through the real production patch path — patchStatus into a
 // status.KubePatchWriter issuing a JSON merge patch against the API client,

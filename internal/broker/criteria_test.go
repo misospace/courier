@@ -3,6 +3,7 @@ package broker
 import (
 	"errors"
 	"os"
+	"regexp"
 	"strconv"
 	"strings"
 	"testing"
@@ -583,5 +584,200 @@ func TestValidateCriterionEvidenceIgnoresProseOutsideBlock(t *testing.T) {
 	_, err := ValidateCriterionEvidence(body, set)
 	if !errors.Is(err, ErrCriteriaBlockMissing) {
 		t.Fatalf("prose rows without a header should read as a missing block, got %v", err)
+	}
+}
+
+// The taught grammar (#375). Consumers render the grammar instead of
+// restating it, so the derivation below is the only copy of the shape and
+// these tests are what pin the derivation itself: a rendered template must
+// still satisfy the validator it claims to describe, the closed vocabulary
+// must be the validator's, and the per-status rule sentence must be the
+// rule the validator enforces.
+
+const (
+	derivedHeaderTemplate = "courier-criteria:v1 source=<owner/name>#<n> set=sha256:<64hex> coverage=full|partial"
+	derivedRowTemplate    = "- AC-<n> sha256:<64hex>: <status> - <reference>"
+	derivedVocabulary     = "implementation-evidence, regression-check, manual-verification, not-implemented, or unknown"
+	derivedRuleSentence   = "regression-check and implementation-evidence must cite a file path or check URL; manual-verification and not-implemented must carry a note"
+)
+
+// rowStatusAlternation extracts the status vocabulary in the order the row
+// pattern spells it, so the drift guard reads the validator rather than a
+// constant next to it.
+var rowStatusAlternation = regexp.MustCompile(`\(([a-z-]+(?:\|[a-z-]+)+)\)`)
+
+// renderHeader fills the header template's placeholders for a concrete
+// source reference and coverage claim; the template's own alternation is
+// the vocabulary, so the caller names the one it means.
+func renderHeader(source, coverage string) string {
+	header := strings.Replace(CriteriaHeaderGrammar(), "coverage=full|partial", "coverage="+coverage, 1)
+	return strings.ReplaceAll(header, SourceReferencePlaceholder, source)
+}
+
+// renderRow fills the row template's placeholders for a concrete criterion.
+func renderRow(number, status, reference string) string {
+	row := strings.ReplaceAll(CriteriaRowGrammar(), CriterionPlaceholder, number)
+	row = strings.ReplaceAll(row, DigestPlaceholder, strings.Repeat("a", 64))
+	row = strings.ReplaceAll(row, StatusPlaceholder, status)
+	return strings.ReplaceAll(row, ReferencePlaceholder, reference)
+}
+
+// TestCriteriaGrammarMatchesValidatorPatterns pins the derivation: the
+// taught templates are exactly the expected shapes, and every concrete
+// instance rendered from them is accepted by the pattern the validator
+// matches — including the placeholders' own vocabulary, which must not
+// smuggle a status outside the closed set past the row pattern.
+func TestCriteriaGrammarMatchesValidatorPatterns(t *testing.T) {
+	if got := CriteriaHeaderGrammar(); got != derivedHeaderTemplate {
+		t.Fatalf("CriteriaHeaderGrammar() = %q, want %q", got, derivedHeaderTemplate)
+	}
+	if got := CriteriaRowGrammar(); got != derivedRowTemplate {
+		t.Fatalf("CriteriaRowGrammar() = %q, want %q", got, derivedRowTemplate)
+	}
+
+	source := "misospace/miso-gallery#502"
+	shape := CriteriaHeaderShape(source)
+	if !strings.Contains(shape, source) || strings.Contains(shape, SourceReferencePlaceholder) {
+		t.Fatalf("CriteriaHeaderShape(%q) = %q, which does not name the source in place of the placeholder", source, shape)
+	}
+	for _, coverage := range []string{CoverageFull, CoveragePartial} {
+		rendered := strings.ReplaceAll(renderHeader(source, coverage), DigestPlaceholder, strings.Repeat("a", 64))
+		if !criteriaHeaderPattern.MatchString(rendered) {
+			t.Fatalf("header claiming coverage=%s is not accepted by the header pattern: %q", coverage, rendered)
+		}
+	}
+
+	for _, status := range StatusVocabulary() {
+		row := renderRow("1", string(status), "internal/broker/criteria.go")
+		if !criteriaRowPattern.MatchString(row) {
+			t.Fatalf("row rendered from the grammar template for status %q is not accepted by the row pattern: %q", status, row)
+		}
+	}
+	if criteriaRowPattern.MatchString(renderRow("1", "not-a-status", "internal/broker/criteria.go")) {
+		t.Fatal("a row rendered with an out-of-vocabulary status must not satisfy the row pattern")
+	}
+}
+
+// TestStatusVocabularyMatchesRowPatternAlternation is the bidirectional
+// drift guard for the closed vocabulary: the order and the membership must
+// agree with the row pattern's alternation in both directions, so a status
+// added to one side and not the other fails here.
+func TestStatusVocabularyMatchesRowPatternAlternation(t *testing.T) {
+	match := rowStatusAlternation.FindStringSubmatch(criteriaRowPattern.String())
+	if match == nil {
+		t.Fatalf("row pattern carries no literal alternation: %q", criteriaRowPattern.String())
+	}
+	inPattern := strings.Split(match[1], "|")
+	taught := StatusVocabulary()
+	if len(taught) != len(inPattern) {
+		t.Fatalf("StatusVocabulary() has %d statuses, the row pattern alternation has %d: %q", len(taught), len(inPattern), inPattern)
+	}
+	for i, status := range taught {
+		if string(status) != inPattern[i] {
+			t.Fatalf("status %d: StatusVocabulary() = %q, row pattern alternation = %q", i, status, inPattern[i])
+		}
+		if !criteriaRowPattern.MatchString(renderRow("1", string(status), "internal/broker/criteria.go")) {
+			t.Fatalf("row pattern rejects its own alternation member %q", status)
+		}
+	}
+}
+
+// TestStatusVocabularySentenceCoversClosedVocabulary pins the prose list:
+// it names every status exactly once, in the validator's order, and no
+// other token.
+func TestStatusVocabularySentenceCoversClosedVocabulary(t *testing.T) {
+	sentence := StatusVocabularySentence()
+	if sentence != derivedVocabulary {
+		t.Fatalf("StatusVocabularySentence() = %q, want %q", sentence, derivedVocabulary)
+	}
+	match := rowStatusAlternation.FindStringSubmatch(criteriaRowPattern.String())
+	if match == nil {
+		t.Fatalf("row pattern carries no literal alternation: %q", criteriaRowPattern.String())
+	}
+	taught := strings.Split(strings.ReplaceAll(sentence, ", or ", ", "), ", ")
+	inPattern := strings.Split(match[1], "|")
+	if len(taught) != len(inPattern) {
+		t.Fatalf("sentence names %d statuses, the row pattern alternation has %d: %q", len(taught), len(inPattern), taught)
+	}
+	for i, name := range taught {
+		if name != inPattern[i] {
+			t.Fatalf("sentence token %d = %q, row pattern alternation = %q", i, name, inPattern[i])
+		}
+		if got := strings.Count(sentence, name); got != 1 {
+			t.Fatalf("sentence names %q %d times: %q", name, got, sentence)
+		}
+	}
+}
+
+// TestStatusReferenceRuleSentenceMatchesValidator pins the rule sentence
+// against the rule the validator enforces: a status is named iff
+// validRecordShape imposes a non-free requirement on it, and the sentence's
+// two clauses group exactly the statuses validRecordShape separates —
+// location, note, and unconstrained.
+func TestStatusReferenceRuleSentenceMatchesValidator(t *testing.T) {
+	sentence := StatusReferenceRuleSentence()
+	if sentence != derivedRuleSentence {
+		t.Fatalf("StatusReferenceRuleSentence() = %q, want %q", sentence, derivedRuleSentence)
+	}
+	const (
+		located = "internal/broker/criteria.go"
+		note    = "inspected by hand"
+	)
+	for _, status := range StatusVocabulary() {
+		requirement, known := criterionReferenceRequirementFor(status)
+		if !known {
+			t.Fatalf("status %q is in the vocabulary but has no reference rule", status)
+		}
+		mentioned := strings.Contains(sentence, string(status))
+		if mentioned != (requirement != referenceFree) {
+			t.Fatalf("status %q: sentence names it = %t, rule = %v", status, mentioned, requirement)
+		}
+		switch requirement {
+		case referenceLocationRequired:
+			if !strings.Contains(sentence, "must cite a file path or check URL") {
+				t.Fatalf("location rule missing from sentence: %q", sentence)
+			}
+			if validRecordShape(CriterionRecord{Status: status}) {
+				t.Fatalf("%q must reject an empty reference", status)
+			}
+			if !validRecordShape(CriterionRecord{Status: status, Reference: located}) {
+				t.Fatalf("%q must accept a located reference", status)
+			}
+			if validRecordShape(CriterionRecord{Status: status, Reference: note}) {
+				t.Fatalf("%q must reject a reference with no location", status)
+			}
+		case referenceNoteRequired:
+			if !strings.Contains(sentence, "must carry a note") {
+				t.Fatalf("note rule missing from sentence: %q", sentence)
+			}
+			if validRecordShape(CriterionRecord{Status: status}) {
+				t.Fatalf("%q must reject an empty reference", status)
+			}
+			if !validRecordShape(CriterionRecord{Status: status, Reference: note}) {
+				t.Fatalf("%q must accept a bare note", status)
+			}
+		default:
+			if !validRecordShape(CriterionRecord{Status: status}) {
+				t.Fatalf("%q must accept an empty reference", status)
+			}
+		}
+	}
+	// A status outside the closed vocabulary is rejected, and named in
+	// neither clause.
+	if validRecordShape(CriterionRecord{Status: CriterionStatus("not-a-status"), Reference: located}) {
+		t.Fatal("a status outside the vocabulary must not satisfy the shape rules")
+	}
+	if strings.Contains(sentence, "not-a-status") {
+		t.Fatalf("sentence names a status outside the vocabulary: %q", sentence)
+	}
+	locationClause, noteClause, ok := strings.Cut(sentence, "; ")
+	if !ok || !strings.HasSuffix(locationClause, "must cite a file path or check URL") || !strings.HasSuffix(noteClause, "must carry a note") {
+		t.Fatalf("sentence is not the location clause followed by the note clause: %q", sentence)
+	}
+	if got := strings.TrimSuffix(locationClause, " must cite a file path or check URL"); got != "regression-check and implementation-evidence" {
+		t.Fatalf("location clause names %q", got)
+	}
+	if got := strings.TrimSuffix(noteClause, " must carry a note"); got != "manual-verification and not-implemented" {
+		t.Fatalf("note clause names %q", got)
 	}
 }

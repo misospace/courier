@@ -25,7 +25,6 @@ import (
 	"os/exec"
 	"os/signal"
 	"path/filepath"
-	"regexp"
 	"slices"
 	"strconv"
 	"strings"
@@ -37,6 +36,7 @@ import (
 
 	courierv1alpha1 "github.com/misospace/courier/api/v1alpha1"
 	"github.com/misospace/courier/internal/broker"
+	"github.com/misospace/courier/internal/broker/grammar"
 	"github.com/misospace/courier/internal/evidence"
 	"github.com/misospace/courier/internal/executor"
 	"github.com/misospace/courier/internal/forge"
@@ -169,6 +169,10 @@ func main() {
 	// capture through the run's ordinary exit codes (DESIGN.md, #115).
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM)
 	defer stop()
+	// Armed for the whole run, before any child exists: this process is PID 1
+	// of the coordinator pod, so the kernel hands it every orphaned descendant
+	// and PID 1 reaps none of them on its own (#347).
+	installAdoptedChildReaper()
 	os.Exit(run(ctx, os.Stdout, os.Stderr))
 }
 
@@ -503,7 +507,7 @@ func fetchRunBranch(ctx context.Context, dir, remoteURL, branch string) error {
 	cmd.WaitDelay = 2 * time.Second
 	cmd.Stdout = io.Discard
 	cmd.Stderr = io.Discard
-	return cmd.Run()
+	return childReaper().run(cmd)
 }
 
 // revListCount counts the commits in a rev-list range expression.
@@ -515,7 +519,7 @@ func revListCount(ctx context.Context, dir, span string) (int, error) {
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
-	if err := cmd.Run(); err != nil {
+	if err := childReaper().run(cmd); err != nil {
 		return 0, err
 	}
 	count, err := strconv.Atoi(strings.TrimSpace(stdout.String()))
@@ -534,7 +538,7 @@ func revParse(ctx context.Context, dir, rev string) (string, error) {
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
-	if err := cmd.Run(); err != nil {
+	if err := childReaper().run(cmd); err != nil {
 		return "", err
 	}
 	return strings.TrimSpace(stdout.String()), nil
@@ -810,6 +814,10 @@ func preflightCapabilities(ctx context.Context, command executor.Command, dir st
 	probeCtx, cancel := context.WithTimeout(ctx, mcpPreflightTimeout)
 	defer cancel()
 	probe := exec.CommandContext(probeCtx, command.Binary, command.Args...)
+	// In its own process group so the descendants it leaves behind stay
+	// recognizable as its own after it exits, and the reaper can collect them
+	// instead of retaining them on PID 1 (#347).
+	probe.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	// Bound waiting for a grandchild that holds the output pipe after the
 	// context is done.
 	probe.WaitDelay = 5 * time.Second
@@ -819,7 +827,7 @@ func preflightCapabilities(ctx context.Context, command executor.Command, dir st
 	var out bytes.Buffer
 	probe.Stdout = &out
 	probe.Stderr = io.Discard
-	_ = probe.Run()
+	_ = childReaper().run(probe)
 	return executor.ParseMCPStatus(out.String())
 }
 
@@ -1287,7 +1295,7 @@ func run(ctx context.Context, stdout, stderr io.Writer) int {
 		process.Dir = workspace.Directory
 		process.Stdout = modelStdout
 		process.Stderr = stderrTransport
-		processErr := process.Run()
+		processErr := childReaper().run(process)
 		_ = tap.Flush()
 		tap.setKill(nil)
 		_ = stdoutRedacted.Flush()
@@ -2656,10 +2664,15 @@ func (r reporter) checkCriterionEvidence(ctx context.Context, head string, set *
 
 // evidencePathCandidatePattern is the *file-path* alternative of the
 // broker validator's referenceWithLocation (internal/broker/criteria.go,
-// #249), mirrored rather than imported: the check probes exactly the
-// references the validator itself accepts as a citable location, so a
-// reference the contract already refused is never probed and a reference
-// it accepted is probed in the same shape it was judged in.
+// #249), taken from the grammar leaf's exported pattern rather than
+// mirrored: the check probes exactly the references the validator itself
+// accepts as a citable location, so a reference the contract already
+// refused is never probed and a reference it accepted is probed in the
+// same shape it was judged in. The grammar composes
+// grammar.ReferenceWithLocation from its exported alternatives and pins
+// that composition by test, so a validator edit cannot leave this
+// extractor probing a shape the contract no longer accepts, or skip one
+// it does (#375 review).
 //
 // The charset — [A-Za-z0-9_.-] segments separated by "/", where only
 // segments after the first may also carry "(" and ")" — is also the
@@ -2672,7 +2685,7 @@ func (r reporter) checkCriterionEvidence(ctx context.Context, head string, set *
 // sees the value. That restriction is what lets sanitized text from a
 // model-authored body reach git at all — see the exception noted on
 // git.Hardened (#367).
-var evidencePathCandidatePattern = regexp.MustCompile(`[A-Za-z0-9_.-]+(?:/[A-Za-z0-9_.()-]+)+`)
+var evidencePathCandidatePattern = grammar.ReferencePathPattern
 
 // missingEvidencePaths reports which of the file paths the body's
 // evidence rows cite are absent from the tree at head, the published
@@ -2977,9 +2990,10 @@ func linkageRepairMessage(source broker.SourceIssue, outcome *handoffCheckOutcom
 // it must satisfy, and the continuation budget. The vocabulary is
 // composed verbatim from the broker error's reason (which
 // describeCriteriaFailure built) so any change to the validator's
-// vocabulary surfaces in both paths. The required shape rules echo
-// the documented header and per-status rules from criteria.go so the
-// model can repair the body without re-deriving the contract.
+// vocabulary surfaces in both paths. The header shape, row shape,
+// status vocabulary, and per-status rules are rendered from the broker's
+// validator (criteria.go) rather than restated, so the model can repair
+// the body without re-deriving the contract.
 //
 // A block the validator accepted but whose citations do not exist in the
 // published head (#367) reaches the same instruction: the reason clause
@@ -2998,15 +3012,16 @@ func criteriaRepairMessage(source broker.SourceIssue, outcome *handoffCheckOutco
 	setDigest, criteriaLines := pinnedSetRepairSnippet(outcome.pinnedSet, outcome.criteria)
 	return fmt.Sprintf(
 		"Courier refused the handoff: PR #%d's body does not satisfy the criterion-evidence contract pinned at admission for %s (pinned set %s): %s.%s "+
-			"Update the PR body through the forge capability so it carries the criterion-evidence block: a single line starting with %q followed by %q, then one %q row per pinned criterion (each row's digest must match the pinned criterion digest below), each carrying a closed status from the vocabulary implementation-evidence, regression-check, manual-verification, not-implemented, or unknown, with regression-check and implementation-evidence referencing a file path or check URL and manual-verification and not-implemented referencing a note. Pinned criteria: %s. "+
+			"Update the PR body through the forge capability so it carries the criterion-evidence block: a single line starting with %q followed by one %q row per pinned criterion (each row's digest must match the pinned criterion digest below), each carrying a closed status from the vocabulary %s; %s. Pinned criteria: %s. "+
 			"Then re-declare the same outcome. (continuation %s)",
 		outcome.pr.Number, target,
 		nonEmptyOr(setDigest, "the admitted set"),
 		reason,
 		observation,
-		"courier-criteria:v1 source="+strings.ToLower(source.Canonical())+"#"+strconv.Itoa(source.Number),
-		"set=sha256:<64hex> coverage=full|partial",
-		"- AC-<n> sha256:<64hex>: <status> - <reference>",
+		grammar.CriteriaHeaderShape(strings.ToLower(source.Canonical())+"#"+strconv.Itoa(source.Number)),
+		grammar.CriteriaRowGrammar(),
+		grammar.StatusVocabularySentence(),
+		grammar.StatusReferenceRuleSentence(),
 		nonEmptyOr(criteriaLines, "(no pinned criteria on this run)"),
 		continuationBudget(continuation, maxContinuations),
 	)

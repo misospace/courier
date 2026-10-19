@@ -65,9 +65,9 @@ type change struct {
 
 // Capture snapshots the worktree and local commits into a manifest plus a tar
 // of admitted content. It is read-only on the repository (status, rev-list,
-// format-patch, and file reads) and honours ctx cancellation on git calls.
-// The order of operations is normative: enumerate, classify, scan, then build
-// the tar and the budget-bounded manifest.
+// format-patch, and file reads) and honours ctx cancellation on git calls and
+// on the per-file reads. The order of operations is normative: enumerate,
+// classify, scan, then build the tar and the budget-bounded manifest.
 func Capture(ctx context.Context, opts Options) (*Bundle, error) {
 	scanner := opts.Scanner
 	if scanner == nil {
@@ -117,7 +117,21 @@ func Capture(ctx context.Context, opts Options) (*Bundle, error) {
 			// omitted-over-limit WITHOUT a content scan, so an oversized
 			// file is never read into memory whole; both omitted-binary
 			// and omitted-over-limit store nothing.
-			data, rerr := readFileForCapture(full, MaxFileBytes+1)
+			data, rerr := readFileForCapture(ctx, full, MaxFileBytes+1)
+			// Cancellation is settled before the read result itself, not
+			// only before the read-error taxonomy: the read seam may be
+			// answered with completed bytes after the context is already
+			// dead — a real read that won the select below, or any seam
+			// implementation — and storing them would carry the capture
+			// past the deadline its manifest-only degradation promises.
+			// The same check also settles a read abandoned at the operation
+			// deadline, whose context error recorded as an omitted binary
+			// would both mask a stale content classification and keep the
+			// capture going instead of handing the caller the error its
+			// manifest-only degradation already handles.
+			if ctx.Err() != nil {
+				return nil, ctx.Err()
+			}
 			if rerr != nil {
 				if errors.Is(rerr, syscall.ELOOP) {
 					// The path was swapped for a symlink between the Lstat
@@ -451,9 +465,9 @@ func truncateDisplay(s string) string {
 // regular file, so nothing was read and nothing can be stored.
 var errNotRegular = errors.New("evidence: opened file is not regular")
 
-// readFileForCapture reads the content of a file classified as regular.
-// Tests swap it to simulate a hostile worktree mutating a path between the
-// Lstat classification and the read.
+// readFileForCapture reads, under the capture's own context, the content of a
+// file classified as regular. Tests swap it to simulate a hostile worktree
+// mutating a path between the Lstat classification and the read.
 var readFileForCapture = readCapped
 
 // readCapped opens path without following a trailing symlink (O_NOFOLLOW)
@@ -469,20 +483,67 @@ var readFileForCapture = readCapped
 // Lstat could. O_NONBLOCK is a no-op for the regular files this is reached
 // for. A swap to a socket never reaches this check: a read-only open of a
 // socket fails with ENXIO before any blocking is possible.
-func readCapped(path string, limit int) ([]byte, error) {
-	f, err := os.OpenFile(path, os.O_RDONLY|syscall.O_NOFOLLOW|syscall.O_NONBLOCK, 0)
-	if err != nil {
+//
+// The read is bounded by ctx and not by the file: one stalling read — a
+// regular file on a hung filesystem — must not carry the capture past its
+// operation deadline to the pod's SIGKILL, which would lose the manifest too.
+// The two bounds are independent and compose: O_NONBLOCK keeps a non-regular
+// swap from stalling the open, and the context bounds what survives that
+// check, which is a read of a regular file the kernel has already accepted.
+// Cancellation is checked before any filesystem work, so an already-expired
+// context starts no goroutine at all. Otherwise the open and the capped read
+// run in a goroutine whose result is received unless ctx is done first; on
+// cancellation the abandoned goroutine and its descriptor are left to finish
+// on their own, since closing a descriptor from another goroutine is not a
+// reliable way to interrupt a read already blocked in the kernel. Its bytes
+// are discarded and never stored. The pile-up question has a structural
+// answer rather than a bounded one: reads are sequential and Capture returns
+// at the first canceled read, so a capture abandons at most one goroutine and
+// holds at most its capped prefix.
+func readCapped(ctx context.Context, path string, limit int) ([]byte, error) {
+	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	defer f.Close()
-	info, err := f.Stat()
-	if err != nil {
-		return nil, err
+	type readResult struct {
+		data []byte
+		err  error
 	}
-	if !info.Mode().IsRegular() {
-		return nil, errNotRegular
+	// Buffered so the abandoned goroutine's send never blocks on a receiver
+	// that is already gone.
+	done := make(chan readResult, 1)
+	go func() {
+		f, err := os.OpenFile(path, os.O_RDONLY|syscall.O_NOFOLLOW|syscall.O_NONBLOCK, 0)
+		if err != nil {
+			done <- readResult{err: err}
+			return
+		}
+		defer f.Close()
+		info, err := f.Stat()
+		if err != nil {
+			done <- readResult{err: err}
+			return
+		}
+		if !info.Mode().IsRegular() {
+			done <- readResult{err: errNotRegular}
+			return
+		}
+		data, err := io.ReadAll(io.LimitReader(f, int64(limit)))
+		done <- readResult{data: data, err: err}
+	}()
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	case res := <-done:
+		// A read that completed while the context expired leaves both
+		// channels ready, and the select breaks that tie at random —
+		// cancellation is settled here too, so a completed read never
+		// survives a dead context: past the deadline the bytes are
+		// discarded and the capture degrades to the manifest alone.
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		return res.data, res.err
 	}
-	return io.ReadAll(io.LimitReader(f, int64(limit)))
 }
 
 // buildTar gzips a tar archive of the admitted entries only. An empty set
@@ -630,6 +691,9 @@ func runGit(ctx context.Context, dir string, args ...string) ([]byte, error) {
 // A canceled context that reached the command returns its own error
 // and never overLimit, even when the output had already exceeded the limit
 // before the cancellation or a surviving grandchild left the stdout pipe open.
+// A read that wins the select against an already-expired context does not
+// settle cancellation either: a completed read never survives a dead context,
+// so bytes read past the deadline are discarded rather than returned.
 func runGitCapped(ctx context.Context, dir string, limit int, args ...string) (out []byte, overLimit bool, err error) {
 	cmd := exec.CommandContext(ctx, "git", args...)
 	cmd.Dir = dir
@@ -686,20 +750,36 @@ func runGitCapped(ctx context.Context, dir string, limit int, args ...string) (o
 		}
 		return out, true, nil
 	}
-	if err := cmd.Wait(); err != nil {
-		if ctx.Err() != nil {
-			return nil, false, ctx.Err()
-		}
+	// The reap comes first, deliberately: this tail returns on the context as
+	// well as on Wait, and skipping Wait strands the child as a zombie and
+	// leaves os/exec's watchCtx goroutine blocked forever, so the guard below
+	// decides only what is returned, never whether the child is reaped.
+	waitErr := cmd.Wait()
+	// The select settles cancellation in its Done branch, but a read that
+	// completes under an already-expired context leaves both channels ready and
+	// the tie is broken at random, so this success path can be handed bytes
+	// produced past the deadline. A read past the deadline is not a result, and
+	// the guard that answers that is observed once, after the reap and ahead of
+	// every return below, so the expired context wins all of them. The #421 rule
+	// that follows — a grandchild-held pipe timing out Wait on a child that
+	// already exited successfully is our timeout, not git's, and its bytes stand
+	// — is a statement about a live context, so it applies only once this guard
+	// has passed. Its branch already answered on the context itself before this
+	// guard existed; hoisting keeps one observation, not two, per call.
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		return nil, false, ctxErr
+	}
+	if waitErr != nil {
 		// ErrWaitDelay arrives only for a process that exited successfully with
 		// its pipes still open — a surviving grandchild — and ProcessState
 		// confirms that here rather than leaning on that precedence. stdout
 		// reached EOF, so the bytes are the complete result and the timeout is
 		// ours, not git's: keep them. A child that exited non-zero keeps its
 		// exit status in the wrapped error below.
-		if errors.Is(err, exec.ErrWaitDelay) && cmd.ProcessState != nil && cmd.ProcessState.Success() {
+		if errors.Is(waitErr, exec.ErrWaitDelay) && cmd.ProcessState != nil && cmd.ProcessState.Success() {
 			return out, false, nil
 		}
-		return nil, false, fmt.Errorf("git %s: %w: %s", strings.Join(args, " "), err, strings.TrimSpace(string(stderr.data)))
+		return nil, false, fmt.Errorf("git %s: %w: %s", strings.Join(args, " "), waitErr, strings.TrimSpace(string(stderr.data)))
 	}
 	return out, false, nil
 }

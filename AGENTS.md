@@ -1,24 +1,32 @@
 # AGENTS.md
 
 Conventions for anyone — human or model — working in this repository. Read this
-and [DESIGN.md](./DESIGN.md) before starting. DESIGN.md is the north star; when
-code and DESIGN.md disagree, DESIGN.md wins unless an issue says otherwise.
+and [DESIGN.md](./DESIGN.md) before starting. DESIGN.md describes the intended
+current architecture. When code and DESIGN.md disagree, determine which is
+stale and update the appropriate source rather than treating either as
+immutable.
 
 ## Keeping DESIGN.md current
 
-DESIGN.md is a living document, not a one-time spec. Keep it in step with the
-code in the same change that moves it:
+`DESIGN.md` describes the current architecture, contracts, invariants, and
+rationale maintainers need to understand the system. It is not a changelog or
+an issue-by-issue history.
 
-- If a PR alters an architectural decision, or adds or removes a capability
-  DESIGN.md describes, **update DESIGN.md in that same PR.** A change that drifts
-  from the doc without updating it is incomplete.
-- When a decision is made, reversed, or superseded, add a dated entry (with the
-  *why*, and a linked issue) to the **Decisions** log at the end of DESIGN.md.
-  The body of the doc describes what is true now; the log preserves the
-  reasoning, and git history holds what was superseded — so edit the body freely
-  rather than accreting caveats.
-- Reviewers: check whether a change contradicts or extends DESIGN.md and whether
-  the doc was updated to match.
+- Update `DESIGN.md` in the same PR only when a change materially alters a
+  documented architectural boundary, public contract, security property,
+  durable invariant, or capability.
+- Edit the relevant current-state section in place. Keep the rationale needed
+  to understand the design; do not narrate the implementation history.
+- **Do not append dated entries for individual PRs, issues, bug fixes, tests, or
+  routine implementation decisions.** Git history and linked issues/PRs are
+  the historical record.
+- A separate architecture decision record is optional and should be rare:
+  use one only for a durable cross-cutting trade-off whose rationale cannot be
+  understood from the current design and its history. Never create one by
+  default.
+- Reviewers: check that the resulting document remains accurate. Do not require
+  a documentation edit for a local implementation detail or a change already
+  covered by the current-state prose.
 
 ## What this is
 
@@ -57,20 +65,11 @@ OpenAI-compatible HTTP API, so no Python SDK is needed anywhere.
 
 ## Design principles that constrain code review
 
-These are not style preferences; a change that violates them is wrong.
-
-- **Inform, don't constrain.** Do not add hard caps, gates, or governors on
-  model behavior. Bound *stuck* (liveness), never *duration* (no wall-clock
-  timeouts on runs). Prompts are goals plus tools, not paragraphs of scaffolding.
-- **The world is the source of truth.** Never trust internal/checkpoint state
-  over git, the PR, or CI. On resume, re-read the world and let it win on
-  conflict.
-- **Model- and source-agnostic.** Nothing in the core may hardcode a provider, a
-  model, a forge, or "local." Provider/hardware specifics belong in a
-  `LaneProfile`; source specifics belong in a source adapter.
-- **Thin harness.** Prefer git, the log stack, and Kubernetes primitives over new
-  machinery. Do not add a PVC where git + a CR-status checkpoint suffice.
-- **The coordinator can push and open PRs, never merge.** Merge is a human gate.
+The detailed review checklist lives in
+[.agents/skills/courier-architecture-review/SKILL.md](.agents/skills/courier-architecture-review/SKILL.md).
+Load it for controller, API/CRD, RBAC, Helm chart, coordinator lifecycle, or
+architecture changes. DESIGN.md remains the north star; update it in the same
+PR when a documented architectural decision or capability changes.
 
 ## Git and PR conventions
 
