@@ -23,6 +23,8 @@ type fakeClient struct {
 	resolveErr   error
 	preLaunchErr error
 	preLaunches  []string
+	ackErr       error
+	acked        []source.WorkItem
 }
 
 type statusUpdate struct {
@@ -57,6 +59,11 @@ func (f *fakeClient) Report(_ context.Context, _ string, lifecycle source.Lifecy
 func (f *fakeClient) PreLaunch(_ context.Context, id string) error {
 	f.preLaunches = append(f.preLaunches, id)
 	return f.preLaunchErr
+}
+
+func (f *fakeClient) AckHandout(_ context.Context, item source.WorkItem) error {
+	f.acked = append(f.acked, item)
+	return f.ackErr
 }
 
 func (f *fakeClient) Resolve(_ context.Context, id string) error {
@@ -105,6 +112,31 @@ func TestAdapterPreLaunch(t *testing.T) {
 	}
 	if !reflect.DeepEqual(client.preLaunches, []string{"work-123"}) {
 		t.Fatalf("pre-launch IDs = %#v, want %#v", client.preLaunches, []string{"work-123"})
+	}
+}
+
+func TestAdapterAckHandoutForwardsToClient(t *testing.T) {
+	client := &fakeClient{ackErr: errors.New("transport")}
+	adapter := New(client)
+	item := source.WorkItem{ID: "work-123"}
+	if err := adapter.AckHandout(context.Background(), item); err == nil {
+		t.Fatal("AckHandout() error = nil, want client error forwarded")
+	}
+	if !reflect.DeepEqual(client.acked, []source.WorkItem{item}) {
+		t.Fatalf("acked items = %#v, want %#v", client.acked, []source.WorkItem{item})
+	}
+}
+
+func TestAdapterAckHandoutNoOpsWithoutClientCapability(t *testing.T) {
+	adapter := New(&basicClient{})
+	if err := adapter.AckHandout(context.Background(), source.WorkItem{ID: "work-123"}); err != nil {
+		t.Fatalf("AckHandout() error = %v, want nil", err)
+	}
+}
+
+func TestAdapterAckHandoutRejectsEmptyItem(t *testing.T) {
+	if err := New(&fakeClient{}).AckHandout(context.Background(), source.WorkItem{}); !errors.Is(err, ErrEmptyWorkItemID) {
+		t.Fatalf("AckHandout() error = %v, want ErrEmptyWorkItemID", err)
 	}
 }
 
@@ -210,3 +242,13 @@ func TestAdapterRejectsInvalidConfigurationAndItems(t *testing.T) {
 		})
 	}
 }
+
+// basicClient implements only the original Dispatch client contract, without
+// any optional capability interfaces.
+type basicClient struct{}
+
+func (basicClient) Discover(context.Context) ([]source.WorkItem, error) { return nil, nil }
+func (basicClient) Claim(context.Context, string) error                 { return nil }
+func (basicClient) Release(context.Context, string) error               { return nil }
+func (basicClient) SetStatus(context.Context, string, string) error     { return nil }
+func (basicClient) Resolve(context.Context, string) error               { return nil }

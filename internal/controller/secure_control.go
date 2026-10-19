@@ -28,11 +28,13 @@ import (
 
 // SecureNeedsHumanError marks a permanent, actionable deployment failure: a
 // configuration or admission problem that requeueing cannot fix. A run
-// terminalizes NeedsHuman from the launch paths on the pod-admission class
-// alone — podAdmissionRejection narrows it to the case the rendered spec's
-// author must fix. Every other error from those paths is transient and follows
-// the normal claim/release/retry cycle, even when it is itself one of these: a
-// signal that clears on a later pass would strand the run if terminalized.
+// terminalizes NeedsHuman from the launch paths on the verdict classes
+// terminalPreflightVerdict selects — the pod-admission rejections the
+// rendered spec's author must fix, and the probe-identity refusals no
+// cluster-side action clears. Every other error from those paths is
+// transient and follows the normal claim/release/retry cycle, even when it
+// is itself one of these: a signal that clears on a later pass would strand
+// the run if terminalized.
 type SecureNeedsHumanError struct {
 	Reason string
 	Detail string
@@ -44,21 +46,29 @@ func secureNeedsHuman(reason, format string, args ...any) *SecureNeedsHumanError
 	return &SecureNeedsHumanError{Reason: reason, Detail: fmt.Sprintf(format, args...)}
 }
 
-// podAdmissionRejection returns the permanent pod-admission rejection a
-// rendered spec's author must fix — the class this sizing work made
-// reachable — and nil for every other preflight failure. A probe pod is in the
-// class although no lane configures it: its spec is an implementation constant,
-// so a rejection there implicates the probe image or the cluster, and neither
-// clears on a later pass. Only this class terminalizes from the launch paths: a
-// live probe that outran a just-written NetworkPolicy or a stale RBAC informer
-// cache clears on a later pass, and terminalizing those would strand a
-// recoverable run.
-func podAdmissionRejection(err error) *SecureNeedsHumanError {
+// terminalPreflightVerdict returns the permanent secure-preflight verdicts
+// requeueing cannot fix, and nil for every other preflight failure. Only this
+// class terminalizes from the launch paths: a live probe that outran a
+// just-written NetworkPolicy or a stale RBAC informer cache clears on a later
+// pass, and terminalizing those would strand a recoverable run. PodAdmission
+// covers a rendered spec the API server rejects outright — only its author
+// can fix that. A probe pod is in the class although no lane configures it:
+// its spec is an implementation constant, so a rejection there implicates the
+// probe image or the cluster, and neither clears on a later pass.
+// ProbeIdentity covers a probe pod whose deterministic name resolves to a pod
+// pinned to another node: its persistent causes (a digest collision in the
+// probe tag, a foreign pod holding the name) outlast a requeue, and the read
+// cannot tell them from a stray pod a later pass would clear.
+func terminalPreflightVerdict(err error) *SecureNeedsHumanError {
 	var permanent *SecureNeedsHumanError
-	if !errors.As(err, &permanent) || permanent.Reason != "PodAdmission" {
+	if !errors.As(err, &permanent) {
 		return nil
 	}
-	return permanent
+	switch permanent.Reason {
+	case "PodAdmission", "ProbeIdentity":
+		return permanent
+	}
+	return nil
 }
 
 // ProviderFactory constructs the forge provider facets for one selected
