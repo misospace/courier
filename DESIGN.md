@@ -1402,16 +1402,16 @@ ResourceQuota tracks limits.cpu or limits.memory — such a quota rejects any
 container missing the matching limit, and the probe image's real usage (a shell
 doing DNS and network checks) peaks in the tens of MiB, far under the limit, so
 the limit cannot OOM-kill the probe and falsify the isolation result it exists
-to produce. A lane that
-configures neither half gets the default whole; a limits-only lane gets the
-default requests; a requests-only lane is
-rendered with exactly its own requests plus the floored halves, so its pods
+to produce. A lane that configures neither half gets the default whole; a
+limits-only lane gets the default requests; a requests-only lane is rendered
+with exactly its own requests plus the floored halves, so its pods
 really do run limit-less by its own choice. One consequence: a limit below the
 floored default request (say `limits.cpu: 100m` on a lane that sets no
-requests) renders requests above limits, which the API server rejects. Requeueing
-cannot change a permanently invalid spec, so the rejection is caught where it
-happens and the run stops rather than cycling claim, preflight, and release on
-every reconcile. The secure path's dry-run proof is the primary catch: it admits
+requests) renders requests above limits, which the API server rejects.
+Requeueing cannot change a permanently invalid spec, so the rejection is caught
+where it happens and the run stops rather than cycling claim, preflight, and
+release on every reconcile. The secure path's dry-run proof is the primary
+catch: it admits
 the control, worker, and broker pods, and the probe pod too on the passes that
 create probes live, so no pass creates a spec it has not proved. The secure
 workload creates behind that proof return ordinary errors and rely on it; the two
