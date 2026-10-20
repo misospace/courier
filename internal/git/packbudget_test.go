@@ -148,6 +148,56 @@ func TestUnbundleAndInventoryWithinLimits(t *testing.T) {
 	}
 }
 
+// TestUnbundleRefusesDeclaredSizeBeforePayload proves the per-object bound
+// is read from the pack's own declaration and not from the inflated bytes:
+// a pack that declares an object over the bound is refused even though no
+// payload follows the declaration at all, so nothing is inflated and nothing
+// lands in the quarantine.
+func TestUnbundleRefusesDeclaredSizeBeforePayload(t *testing.T) {
+	ctx := context.Background()
+	bundle := filepath.Join(t.TempDir(), "declared.bundle")
+	if err := os.WriteFile(bundle, declaredSizeBundle(1<<30), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	quarantine := t.TempDir()
+	limits := generousLimits()
+	limits.MaxObjectBytes = 1 << 20
+	// The declared size is over the bound, so the bundle is refused on the
+	// declaration. A scanner that read the payload first would report the
+	// missing payload as a malformed pack instead.
+	requireLimit(t, Unbundle(ctx, quarantine, bundle, limits), LimitObjectBytes)
+	assertEmptyDirectory(t, quarantine)
+}
+
+// declaredSizeBundle builds a bundle whose pack declares one blob of the
+// given size and carries no payload for it. The pack is malformed and the
+// only thing it can be read for is the declaration itself.
+func declaredSizeBundle(size uint64) []byte {
+	var out bytes.Buffer
+	out.WriteString("# v2 git bundle\n\n")
+	out.WriteString("PACK")
+	out.Write([]byte{0, 0, 0, 2}) // pack version 2
+	out.Write([]byte{0, 0, 0, 1}) // one object
+	// The object header: the type in the top three bits, then the size in
+	// git's variable length encoding — four bits in the first byte and
+	// seven in every continuation byte.
+	first := byte(packTypeBlob)<<4 | byte(size&0x0f)
+	rest := size >> 4
+	if rest > 0 {
+		first |= 0x80
+	}
+	out.WriteByte(first)
+	for rest > 0 {
+		next := byte(rest & 0x7f)
+		rest >>= 7
+		if rest > 0 {
+			next |= 0x80
+		}
+		out.WriteByte(next)
+	}
+	return out.Bytes()
+}
+
 // TestUnbundleRejectsMalformedBundle proves a file that is not a bundle is
 // an ordinary failure, not a budget violation.
 func TestUnbundleRejectsMalformedBundle(t *testing.T) {

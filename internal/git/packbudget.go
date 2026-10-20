@@ -15,7 +15,15 @@ import (
 // ObjectLimits bounds an untrusted object set. Every field must be positive:
 // an unset bound is rejected rather than read as "unbounded".
 type ObjectLimits struct {
-	MaxObjects     int
+	MaxObjects int
+	// MaxTotalBytes bounds two things at once: the unpacked size of the
+	// delivered object set, and the bytes the scan itself may inflate. The
+	// two are close but not identical — a delta's declared size is the size
+	// of its delta stream, not of the object the delta reconstructs — so a
+	// bundle can trip the byte bound before its delivered total is over it.
+	// The bound fails closed either way: the scan never inflates more than
+	// the byte budget allows, and a bundle it refuses is never handed to
+	// git.
 	MaxTotalBytes  int64
 	MaxObjectBytes int64
 }
@@ -110,6 +118,18 @@ func findPackStart(file *os.File) (int64, error) {
 
 // scanPackfile walks every object of one packfile and enforces the budget.
 // The walk stops at the first violation; nothing after a violation is read.
+//
+// The scanner reads the pack's own declarations and is deliberately not
+// identical to what git accepts. It refuses a pack with trailing bytes after
+// its trailer, which git's index-pack tolerates, and it never applies a
+// delta, so it does not prove that a delta reconstructs its base — git does
+// that when it unpacks, and the pack's own checksum is checked there too.
+// Both differences fail closed: a bundle this scanner accepts is one git
+// still verifies, and a bundle this scanner refuses never reaches git.
+//
+// The pack is SHA-1: the trailer and a reference delta's base object ID are
+// SHA-1 sized, so a SHA-256 bundle is refused as malformed rather than
+// misread.
 func scanPackfile(ctx context.Context, reader *bufio.Reader, limits ObjectLimits) error {
 	header := make([]byte, 12)
 	if _, err := io.ReadFull(reader, header); err != nil {

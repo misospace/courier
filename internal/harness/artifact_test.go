@@ -392,6 +392,83 @@ func TestArtifactRejectsCompressibleOversizedBlob(t *testing.T) {
 	assertPrivateTreeUnchanged(t, w, before)
 }
 
+// TestArtifactRejectsOverBudgetDeclarationBeforeUnpack proves the budget
+// envelope is what refuses an over-budget artifact, not the inventory that
+// follows it. The bundle's pack declares an object far over the per-object
+// bound and carries no payload for it: git's own verify step passes it —
+// that step reads the bundle's header, not its pack — so the artifact
+// reaches the envelope, and the envelope refuses it on the declaration
+// alone. A pipeline that unpacked first would fail on the missing payload
+// and report a malformed bundle instead.
+func TestArtifactRejectsOverBudgetDeclarationBeforeUnpack(t *testing.T) {
+	w := newArtifactWorld(t, nil)
+	before := capturePrivateTree(t, w)
+	bundle := w.simulateWorker("b1", func(dir string) {
+		writeFile(t, filepath.Join(dir, "declared.txt"), "declared\n")
+		gitCmd(t, dir, "add", "declared.txt")
+		gitCommit(t, dir, "declared size")
+	})
+	_, err := w.integrate("b1", overBudgetDeclaration(t, bundle), "summary")
+	requireRejected(t, err, rejectBlob)
+	assertPrivateTreeUnchanged(t, w, before)
+}
+
+// overBudgetDeclaration rewrites the first object header of a valid bundle
+// so the pack declares an object far over the per-object bound, and drops the
+// payload behind the declaration. The bundle's header still advertises the
+// expected ref, so the artifact is only refused by the budget envelope.
+func overBudgetDeclaration(t *testing.T, bundle []byte) []byte {
+	t.Helper()
+	// The header block ends at the first blank line; the pack follows it.
+	packStart := bytes.Index(bundle, []byte("\n\n"))
+	if packStart < 0 {
+		t.Fatal("bundle has no header block")
+	}
+	packStart += 2
+	if !bytes.HasPrefix(bundle[packStart:], []byte("PACK")) {
+		t.Fatal("bundle has no packfile")
+	}
+	// The pack header is twelve bytes; the first object header follows it.
+	objectHeader := packStart + 12
+	if objectHeader >= len(bundle) {
+		t.Fatal("bundle has no object header")
+	}
+	objectType := (bundle[objectHeader] >> 4) & 0x07
+	// The declared size: git's variable length encoding, four bits in the
+	// first byte and seven in every continuation byte.
+	const declared = uint64(1) << 30
+	header := []byte{objectType<<4 | byte(declared&0x0f) | 0x80}
+	for rest := declared >> 4; rest > 0; {
+		next := byte(rest & 0x7f)
+		rest >>= 7
+		if rest > 0 {
+			next |= 0x80
+		}
+		header = append(header, next)
+	}
+	// The declaration and nothing else: the payload is gone.
+	return append(append([]byte(nil), bundle[:objectHeader]...), header...)
+}
+
+// TestRejectCategoryForMapsEveryLimit proves each budget violation maps to
+// its own fixed category, and that every other failure is malformed input.
+func TestRejectCategoryForMapsEveryLimit(t *testing.T) {
+	cases := []struct {
+		err      error
+		category string
+	}{
+		{&couriergit.LimitError{Limit: couriergit.LimitObjects}, rejectObjects},
+		{&couriergit.LimitError{Limit: couriergit.LimitBytes}, rejectUnpacked},
+		{&couriergit.LimitError{Limit: couriergit.LimitObjectBytes}, rejectBlob},
+		{errors.New("ordinary failure"), rejectMalformed},
+	}
+	for _, c := range cases {
+		if got := rejectCategoryFor(c.err); got != c.category {
+			t.Fatalf("category for %v = %q, want %q", c.err, got, c.category)
+		}
+	}
+}
+
 func TestArtifactRejectsOversizedBundleFile(t *testing.T) {
 	w := newArtifactWorld(t, nil)
 	big := make([]byte, MaxArtifactBundleBytes+1024)
