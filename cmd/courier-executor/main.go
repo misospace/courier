@@ -3620,10 +3620,21 @@ type handoffVerdict struct {
 //
 // The call site signals the budget consumed so far through continuations
 // (so the helper consumes one slot when it asks for a continue); ctxErr
-// is the run context's current error (non-nil when the run is shutting
-// down) and sessionID gates the resume path.
+// is the run context's error as the caller observed it (non-nil when the
+// run is already shutting down), and the helper folds in the live
+// context error observed after the forge read so a cancellation that
+// occurred during the read still gates the resume path. sessionID gates
+// the resume path.
 func (r reporter) applyHandoffPlan(ctx context.Context, continuations int, maxContinuations int, sessionID string, ctxErr error) handoffVerdict {
 	linkOutcome, linkErr := r.checkHandoff(ctx)
+	// The caller's ctxErr snapshot predates the forge read: shutdown can
+	// cancel the run context while that read is in flight, so the live
+	// error is folded in before any verdict decision — a continuation
+	// decided on a stale nil would hand a canceled context back to the
+	// session loop.
+	if ctxErr == nil {
+		ctxErr = ctx.Err()
+	}
 	if errors.Is(linkErr, criteriaEnvelopeIdentityErr) {
 		// The operator-pinned envelope disagrees with the run's trusted
 		// source identity. That is not a forge read failure the captured

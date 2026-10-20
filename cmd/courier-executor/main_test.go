@@ -3925,6 +3925,123 @@ func TestRunResolveIssueLinkageReadFailureRetriesThenEndsBlockedExternal(t *test
 	}
 }
 
+// TestRunForgeReadCanceledDuringRequestDoesNotContinue pins the
+// cancellation-during-read contract on the pre-handoff plan: the caller's
+// ctxErr snapshot predates the forge read, so a run context canceled while
+// the observation is in flight must still suppress the in-session retry —
+// a continuation decided on the stale nil would hand a canceled context
+// back to the session loop. The child captures a session and declares
+// changes on turn 1 (so the buggy path would fire a pr-unverified
+// continuation with budget remaining), and the forge blocks the linkage
+// read until the run context is canceled, so the read fails mid-flight
+// on a transport error while the context is already dead: the run ends
+// blocked_external / forge-unavailable exactly once, with no second
+// child turn.
+func TestRunForgeReadCanceledDuringRequestDoesNotContinue(t *testing.T) {
+	root := t.TempDir()
+	remote := filepath.Join(root, "remote.git")
+	source := filepath.Join(root, "source")
+	runGit(t, root, "init", "--bare", remote)
+	runGit(t, root, "init", source)
+	configureGit(t, source)
+	write(t, filepath.Join(source, "README.md"), "base\n")
+	commit(t, source, "base: initial")
+	runGit(t, source, "branch", "-M", "main")
+	runGit(t, source, "remote", "add", "origin", remote)
+	runGit(t, source, "push", "-u", "origin", "main")
+
+	stateDir := filepath.Join(root, "fakestate")
+	if err := os.MkdirAll(stateDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	fakeOpenCode := filepath.Join(root, "opencode")
+	scratchDirectory := filepath.Join(root, "scratch")
+	if err := os.MkdirAll(scratchDirectory, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	argvLog := filepath.Join(stateDir, "argv.log")
+	writeExecutable(t, fakeOpenCode, "#!/bin/sh\ncase \"$1\" in mcp) exit 0;; esac\necho \"$*\" >> \""+argvLog+"\"\necho '{\"sessionID\":\"ses_cancel_midread\"}'\nmkdir -p \"$COURIER_SCRATCH_DIR\"\nprintf 'completed\\n' > completed.txt\ngit add --all -- .\ngit commit -m 'test: completed work' >/dev/null\nprintf '{\"outcome\":\"changes\"}' > \"$COURIER_SCRATCH_DIR/outcome.json\"\nexit 0\n")
+
+	// The forge read blocks until the run context is canceled: the
+	// client's aborted request surfaces as a transport error — a
+	// transient availability condition (#455) — decided while the
+	// context is already dead.
+	readStarted := make(chan struct{}, 1)
+	prServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		select {
+		case readStarted <- struct{}{}:
+		default:
+		}
+		<-r.Context().Done()
+	}))
+	defer prServer.Close()
+
+	workspace := filepath.Join(root, "workspace")
+	termination := filepath.Join(root, "termination")
+	t.Setenv("COURIER_REPO_URL", remote)
+	t.Setenv("COURIER_WORKSPACE", workspace)
+	t.Setenv("COURIER_SCRATCH_DIR", scratchDirectory)
+	t.Setenv("COURIER_BASE", "main")
+	t.Setenv("COURIER_BRANCH", "courier/resolve-issue/acme-widgets/7")
+	t.Setenv("COURIER_GOAL", "Open a PR to address issue #7. Declare the outcome at "+filepath.Join(defaultScratchDirectory, defaultOutcomeFilename)+".")
+	t.Setenv("COURIER_MODEL", "any-model/name")
+	t.Setenv("COURIER_MODE", "resolve-issue")
+	t.Setenv("COURIER_REPO", "acme/widgets")
+	t.Setenv("COURIER_REF", "7")
+	t.Setenv("COURIER_GITHUB_API_BASE", prServer.URL)
+	t.Setenv("COURIER_OPENCODE_BINARY", fakeOpenCode)
+	t.Setenv("COURIER_TERMINATION_FILE", termination)
+	t.Setenv("COURIER_RESUME_BACKOFF_SECONDS", "0")
+	t.Setenv("COURIER_MAX_CONTINUATIONS", "2")
+	t.Setenv("COURIER_FAKE_STATE", stateDir)
+	t.Setenv("COURIER_RUN_NAME", "coderrun-cancel-midread")
+	t.Setenv("COURIER_LOG_LEVEL", "debug")
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	type runResult struct {
+		code   int
+		output string
+		stderr string
+	}
+	done := make(chan runResult, 1)
+	var output bytes.Buffer
+	var errorsOut bytes.Buffer
+	go func() {
+		code := run(ctx, &output, &errorsOut)
+		done <- runResult{code, output.String(), errorsOut.String()}
+	}()
+	<-readStarted
+	cancel()
+	result := <-done
+
+	if result.code != exitNeedsHuman {
+		t.Fatalf("run exit code = %d, want %d (blocked-external ending on the canceled forge read); stdout=%q stderr=%q", result.code, exitNeedsHuman, result.output, result.stderr)
+	}
+	if !strings.Contains(result.output, `"linkage.read.failed"`) {
+		t.Fatalf("expected the linkage read failure to be logged: %q", result.output)
+	}
+	if !strings.Contains(result.output, `"outcome":"blocked_external"`) {
+		t.Fatalf("expected a blocked_external outcome on the canceled forge read: %q", result.output)
+	}
+	if !strings.Contains(result.output, `"category":"forge-unavailable"`) {
+		t.Fatalf("expected the forge-unavailable category on the canceled forge read: %q", result.output)
+	}
+	if strings.Contains(result.output, `"kind":"pr-unverified"`) {
+		t.Fatalf("a read decided on a canceled context must not fire an in-session retry continuation: %q", result.output)
+	}
+	invocations, err := os.ReadFile(argvLog)
+	if err != nil {
+		t.Fatalf("read child argv log: %v", err)
+	}
+	// Each child invocation appends one record starting with the
+	// binary's first argument; the goal text carries embedded newlines,
+	// so count records rather than lines.
+	if got := strings.Count(string(invocations), "\nrun --model ") + 1; got != 1 {
+		t.Fatalf("child invocations = %d, want 1 (no continuation turn on a canceled context): %q", got, string(invocations))
+	}
+}
+
 // TestRunResolveIssueDeclaredChangesLinkageFailureUsesBoundedRepair
 // proves the declared-changes Verifying candidate participates in the
 // same bounded continuation/repair mechanism as the undeclared path
