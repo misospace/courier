@@ -11,6 +11,7 @@ import (
 	"time"
 
 	courierv1alpha1 "github.com/misospace/courier/api/v1alpha1"
+	"github.com/misospace/courier/internal/devenv"
 	"github.com/misospace/courier/internal/executor"
 	"github.com/misospace/courier/internal/protocol"
 )
@@ -59,6 +60,9 @@ type Coordinator struct {
 	budgets map[string]ContextBudget
 	// compactions receives applied-compaction telemetry.
 	compactions CompactionSink
+	// bootstrapReceipts receives one structured receipt per bounded
+	// bootstrap execution.
+	bootstrapReceipts BootstrapReceiptSink
 	// workRefBeyondAnchor is the soft-stop world probe: the broker's live
 	// observation of whether the pinned work ref holds a tip beyond the
 	// admission anchor. The soft-stop finish derives the outcome from that
@@ -72,6 +76,30 @@ type Coordinator struct {
 	// before any further request can burn the exhausted binding.
 	deferredAvailability   error
 	deferredAvailabilityMu sync.Mutex
+
+	// bootstrapBlockerErr carries a terminal environment blocker (#414):
+	// the approved development-bootstrap contract failed, or its captured
+	// environment was unusable. Recorded at the snapshot-preparation
+	// boundary, it ends the run recoverably blocked-external at the next
+	// turn boundary — never a model-visible retry loop — because the
+	// failure is the environment's, not the work's.
+	bootstrapBlockerErr error
+	bootstrapBlockerMu  sync.Mutex
+
+	// workerFenceErr, once set, refuses every further worker dispatch
+	// (#414 review): an operation expired with unverified termination, so
+	// the worker may still be running repository-authored work. The fence
+	// is sticky for this incarnation — the honest recovery is worker
+	// replacement, not another dispatch onto possibly-live work.
+	workerFenceErr error
+	workerFenceMu  sync.Mutex
+
+	// bootstrapEnv holds the latest applied development-bootstrap
+	// environment delta (#414): the filtered capture of the approved
+	// contract's activated environment, merged over the worker's own
+	// environment for every subsequent model-influenced task.
+	bootstrapEnv   []string
+	bootstrapEnvMu sync.Mutex
 }
 
 // recordDeferredAvailability keeps the first deferred provider-availability
@@ -94,6 +122,74 @@ func (c *Coordinator) takeDeferredAvailability() error {
 	err := c.deferredAvailability
 	c.deferredAvailability = nil
 	return err
+}
+
+// recordBootstrapBlocker keeps the first bootstrap environment blocker
+// (#414). Only the typed blocker — a fixed reason, never a raw process
+// transcript — crosses this boundary.
+func (c *Coordinator) recordBootstrapBlocker(err error) {
+	c.bootstrapBlockerMu.Lock()
+	defer c.bootstrapBlockerMu.Unlock()
+	if c.bootstrapBlockerErr == nil {
+		c.bootstrapBlockerErr = err
+	}
+}
+
+// fenceWorker records the worker fence (#414 review): once an operation's
+// termination could not be observed, no further dispatch may run against
+// this worker. First cause wins; fencing never un-fences.
+func (c *Coordinator) fenceWorker(opID string, cause error) {
+	c.workerFenceMu.Lock()
+	defer c.workerFenceMu.Unlock()
+	if c.workerFenceErr == nil {
+		c.workerFenceErr = fmt.Errorf("the worker is fenced: termination of operation %s could not be verified (%v); no further workspace operation may run against it", opID, cause)
+	}
+}
+
+// workerFenced returns the sticky worker fence error, if set.
+func (c *Coordinator) workerFenced() error {
+	c.workerFenceMu.Lock()
+	defer c.workerFenceMu.Unlock()
+	return c.workerFenceErr
+}
+
+// takeBootstrapBlocker removes and returns a recorded bootstrap environment
+// blocker, if any.
+func (c *Coordinator) takeBootstrapBlocker() error {
+	c.bootstrapBlockerMu.Lock()
+	defer c.bootstrapBlockerMu.Unlock()
+	err := c.bootstrapBlockerErr
+	c.bootstrapBlockerErr = nil
+	return err
+}
+
+// hasBootstrapBlocker reports whether a bootstrap environment blocker is
+// waiting, without consuming it.
+func (c *Coordinator) hasBootstrapBlocker() bool {
+	c.bootstrapBlockerMu.Lock()
+	defer c.bootstrapBlockerMu.Unlock()
+	return c.bootstrapBlockerErr != nil
+}
+
+// storeBootstrapEnv records the latest applied bootstrap environment delta
+// (#414): it replaces any earlier delta, because each applied bootstrap is
+// the environment's current truth.
+func (c *Coordinator) storeBootstrapEnv(delta []string) {
+	c.bootstrapEnvMu.Lock()
+	defer c.bootstrapEnvMu.Unlock()
+	c.bootstrapEnv = append([]string(nil), delta...)
+}
+
+// currentBootstrapEnv returns a copy of the applied bootstrap environment
+// delta, or nil when none was applied: tasks without a delta run under the
+// worker's own environment.
+func (c *Coordinator) currentBootstrapEnv() []string {
+	c.bootstrapEnvMu.Lock()
+	defer c.bootstrapEnvMu.Unlock()
+	if len(c.bootstrapEnv) == 0 {
+		return nil
+	}
+	return append([]string(nil), c.bootstrapEnv...)
 }
 
 // CoordinatorConfig assembles the harness. Worker, snapshot, forge, and
@@ -132,6 +228,12 @@ type CoordinatorConfig struct {
 	// step-boundary compaction (#243). Emission is best-effort and
 	// observability only: it never changes a transcript or a run outcome.
 	Compactions CompactionSink
+	// BootstrapReceipts optionally receives one structured receipt per
+	// bounded bootstrap execution (#414): statuses, per-task elapsed
+	// times, exit codes, the environment-key count, and the validated
+	// mise diagnostics — no secret values, no raw worker output. Emission
+	// is best-effort and observability only, like the compaction sink.
+	BootstrapReceipts BootstrapReceiptSink
 }
 
 // NewCoordinator fails closed on an unusable model configuration: without a
@@ -165,6 +267,7 @@ func NewCoordinator(config CoordinatorConfig) (*Coordinator, error) {
 		activity:                config.Activity,
 		budgets:                 budgets,
 		compactions:             config.Compactions,
+		bootstrapReceipts:       config.BootstrapReceipts,
 		briefs:                  NewBriefRegistry(),
 		status:                  config.Status,
 		control:                 config.Control,
@@ -220,6 +323,9 @@ func (c *Coordinator) Run(ctx context.Context, inv executor.Invocation) executor
 			session.Append(note)
 		}
 		turn := c.pump(ctx, session, "", c.coordinatorTools())
+		if turn.blocker != nil {
+			return executor.HarnessResult{Outcome: executor.OutcomeBlockedExternal, Reason: turn.blocker.Error()}
+		}
 		if turn.harnessErr != nil {
 			return executor.HarnessResult{Err: fmt.Errorf("harness: step-boundary compaction: %w", turn.harnessErr)}
 		}
@@ -310,6 +416,11 @@ type turnResult struct {
 	// (#243). The transcript is unchanged, so the run ends as an
 	// infrastructure failure rather than continuing on truncated state.
 	harnessErr error
+	// blocker carries a terminal environment blocker recorded at the
+	// snapshot-preparation boundary (#414): the run ends recoverably
+	// blocked-external at this turn boundary, before any further model
+	// request.
+	blocker error
 }
 
 // newSession opens one role-bound session carrying that role's resolved
@@ -385,6 +496,16 @@ func (c *Coordinator) pump(ctx context.Context, session *Session, briefID string
 		if briefID == "" {
 			if deferred := c.takeDeferredAvailability(); deferred != nil {
 				return turnResult{streamErr: deferred, toolResults: toolResults}
+			}
+			// A recorded bootstrap environment blocker (#414) ends the run
+			// the same way deferred availability does: the ending is
+			// scoped to the coordinator's own loop — a sub-agent pump
+			// never consumes it, so it can only abort the session that
+			// owns the run. The ending carries only the fixed blocker
+			// reason; the turn's earned tool results are already in the
+			// transcript, and the ending discards the session with it.
+			if blocker := c.takeBootstrapBlocker(); blocker != nil {
+				return turnResult{blocker: blocker, toolResults: toolResults}
 			}
 		}
 	}
@@ -702,7 +823,10 @@ func (c *Coordinator) runShell(ctx context.Context, call ToolCall, briefID strin
 		result.Content = "workspace snapshot is unavailable"
 		return result
 	}
-	task := protocol.Task{Command: []string{"sh", "-c", args.Command}, ArtifactPath: args.ArtifactPath}
+	// Only model-influenced tasks carry the applied bootstrap environment
+	// delta (#414): fixed control scripts (unpack, pack) run under the
+	// worker's own environment.
+	task := protocol.Task{Command: []string{"sh", "-c", args.Command}, ArtifactPath: args.ArtifactPath, Env: c.currentBootstrapEnv()}
 	workerResult, err := c.dispatchAndAwait(ctx, newOpID("shell", briefID), briefID, task)
 	if err != nil {
 		result.IsError = true
@@ -914,6 +1038,13 @@ func (c *Coordinator) runBrief(ctx context.Context, brief Brief) (summary string
 	session.Settle(settledStateBlock(brief))
 	for {
 		turn := c.pump(ctx, session, brief.ID, c.subagentTools())
+		// A bootstrap environment blocker recorded before this brief ran
+		// (#414) aborts it without further model requests: the workspace
+		// it would work in failed to prepare, and the run ends
+		// blocked-external at the coordinator's own turn boundary.
+		if c.hasBootstrapBlocker() {
+			return "workspace bootstrap failed; the brief is aborted", false, nil
+		}
 		if turn.harnessErr != nil {
 			// Compaction could not fit the protected tail (#243). The
 			// transcript is unchanged, so this is a brief failure like any
@@ -995,6 +1126,18 @@ func (c *Coordinator) runForge(ctx context.Context, call ToolCall, result ToolRe
 	return result
 }
 
+// reconcileGrace is the fixed bound for a cancellation reconciliation
+// issued on an already-expired or cancelled caller context (#414): a bound
+// expiry or a parent cancellation must still DELIVER the worker
+// cancellation — the worker kills the task's process group — and observe
+// the result. A reconcile issued on the already-expired context can never
+// reach the worker, so the liveness bound would classify the run without
+// ever stopping the task. The reconcile context ignores the caller
+// context's deadline and cancellation but carries its own fixed grace, and
+// verifiedResult is called with the reconcile state through it, so the
+// verified termination lands even though the caller's context is gone.
+const reconcileGrace = 30 * time.Second
+
 // dispatchAndAwait dispatches one operation and polls it to termination. The
 // operation's active-operation entry is persisted through the trusted status
 // path before the task is sent (§6: persist before dispatch), and cleared
@@ -1002,10 +1145,17 @@ func (c *Coordinator) runForge(ctx context.Context, call ToolCall, result ToolRe
 // writes the earned tool heartbeat in the same update; a verified
 // cancellation or death clears without one. An ambiguous transport failure is
 // reconciled through cancellation — never automatic redelivery — and the
-// observed state is returned either way; a reconciliation that cannot prove
+// observed state is returned when the reconciliation proves the operation
+// stopped; a reconciliation that cannot prove it (it failed, or it observed
+// work still live in the task tree) is an unverified termination: the worker
+// is fenced and the error carries ErrTerminationUnverified, so no caller can
+// treat it as a settled outcome. A reconciliation that cannot prove
 // termination retains the entry, because an operation that may still be
 // executing is never claimed cleared.
 func (c *Coordinator) dispatchAndAwait(ctx context.Context, opID, briefID string, task protocol.Task) (protocol.Result, error) {
+	if err := c.workerFenced(); err != nil {
+		return protocol.Result{}, err
+	}
 	if err := c.status.BeginOperation(ctx, opID, briefID); err != nil {
 		return protocol.Result{}, fmt.Errorf("operation %s was not dispatched because its status entry could not be persisted: %w", opID, err)
 	}
@@ -1017,14 +1167,35 @@ func (c *Coordinator) dispatchAndAwait(ctx context.Context, opID, briefID string
 			return protocol.Result{}, err
 		}
 		// Ambiguous transport: the worker may have accepted the task.
-		// Reconcile through cancellation; never redeliver.
-		state, reconcileErr := c.worker.ReconcileAmbiguous(ctx, opID, briefID)
+		// Reconcile through cancellation; never redeliver. The reconcile
+		// runs on its own bounded context (reconcileGrace) so it still
+		// reaches the worker when the caller's context is already expired.
+		reconcileCtx, reconcileCancel := context.WithTimeout(context.WithoutCancel(ctx), reconcileGrace)
+		defer reconcileCancel()
+		state, reconcileErr := c.worker.ReconcileAmbiguous(reconcileCtx, opID, briefID)
 		if reconcileErr != nil {
-			return protocol.Result{}, fmt.Errorf("dispatch of %s failed and reconciliation failed: dispatch: %v; reconcile: %w", opID, err, reconcileErr)
+			// A reconciliation that could not observe termination leaves the
+			// operation's fate unknown: the cancellation may never have
+			// reached the worker. The worker is fenced and the error carries
+			// the unverified-termination fact, so no caller can treat this
+			// as a settled outcome or classify the operation as safely
+			// stopped.
+			c.fenceWorker(opID, reconcileErr)
+			return protocol.Result{}, fmt.Errorf("dispatch of %s failed and reconciliation failed: dispatch: %v; reconcile: %w: %w", opID, err, reconcileErr, ErrTerminationUnverified)
 		}
-		result, resultErr := c.verifiedResult(ctx, opID, state)
+		if !terminationObserved(state) {
+			// The reconciliation came back without proving the operation
+			// stopped: work is still live in its task tree, or the worker
+			// still reports it as running. That is an unverified
+			// termination, never a settled outcome: the worker is fenced
+			// and the error carries the unverified-termination fact.
+			detail := unverifiedTerminationDetail(state)
+			c.fenceWorker(opID, detail)
+			return protocol.Result{}, fmt.Errorf("dispatch of %s failed and reconciliation did not observe termination: %v: %w", opID, detail, ErrTerminationUnverified)
+		}
+		result, resultErr := c.verifiedResult(reconcileCtx, opID, state)
 		if resultErr == nil {
-			c.releaseConsumed(ctx, opID, briefID)
+			c.releaseConsumed(reconcileCtx, opID, briefID)
 		}
 		return result, resultErr
 	}
@@ -1034,14 +1205,39 @@ func (c *Coordinator) dispatchAndAwait(ctx context.Context, opID, briefID string
 			// A failed poll leaves the operation unobserved — it may still
 			// be running. Reconcile through cancellation so termination is
 			// proven (or observed absence) before this call gives up;
-			// abandoning the op here would orphan live work.
-			reconciled, reconcileErr := c.worker.ReconcileAmbiguous(ctx, opID, briefID)
+			// abandoning the op here would orphan live work. The reconcile
+			// runs on its own bounded context (reconcileGrace) so it still
+			// reaches the worker — and delivers the cancellation that kills
+			// the task's process group — when the caller's liveness bound
+			// has already expired.
+			reconcileCtx, reconcileCancel := context.WithTimeout(context.WithoutCancel(ctx), reconcileGrace)
+			defer reconcileCancel()
+			reconciled, reconcileErr := c.worker.ReconcileAmbiguous(reconcileCtx, opID, briefID)
 			if reconcileErr != nil {
-				return protocol.Result{}, fmt.Errorf("result poll for %s failed and reconciliation failed: poll: %v; reconcile: %w", opID, err, reconcileErr)
+				// A reconcile that could not observe termination leaves the
+				// operation's fate unknown: the cancellation may never have
+				// reached the worker. The worker is fenced and the error
+				// carries the unverified-termination fact, so no caller can
+				// treat this as a settled outcome or classify the operation
+				// as safely stopped.
+				c.fenceWorker(opID, reconcileErr)
+				return protocol.Result{}, fmt.Errorf("result poll for %s failed and reconciliation failed: poll: %v; reconcile: %v: %w", opID, err, reconcileErr, ErrTerminationUnverified)
 			}
-			result, resultErr := c.verifiedResult(ctx, opID, reconciled)
+			if !terminationObserved(reconciled) {
+				// The reconciliation came back without proving the operation
+				// stopped: work is still live in its task tree, or the
+				// worker still reports it as running. That is an unverified
+				// termination, never a settled outcome: the entry stays
+				// retained, the worker is fenced against every further
+				// dispatch, and the error carries the unverified-termination
+				// fact.
+				detail := unverifiedTerminationDetail(reconciled)
+				c.fenceWorker(opID, detail)
+				return protocol.Result{}, fmt.Errorf("result poll for %s failed and reconciliation did not observe termination: %v: %w", opID, detail, ErrTerminationUnverified)
+			}
+			result, resultErr := c.verifiedResult(reconcileCtx, opID, reconciled)
 			if resultErr == nil {
-				c.releaseConsumed(ctx, opID, briefID)
+				c.releaseConsumed(reconcileCtx, opID, briefID)
 			}
 			return result, resultErr
 		}
@@ -1069,20 +1265,63 @@ func (c *Coordinator) dispatchAndAwait(ctx context.Context, opID, briefID string
 		// in-flight briefs finish and integrate before the stop boundary.
 		select {
 		case <-ctx.Done():
-			// The context is gone but the operation may still be executing:
-			// its entry is left in place and is superseded by the operator's
-			// own pod observation when this incarnation ends.
-			return protocol.Result{}, ctx.Err()
+			// Expiry inside the wait must deliver the worker kill exactly
+			// like expiry inside an in-flight poll: the real worker answers
+			// "running" immediately, so the bound usually expires here, and
+			// returning without reconciling would leave the task running
+			// with no cancellation ever reaching the worker. Reconcile
+			// through cancellation on a non-cancellable bounded context —
+			// cancelling an op whose caller context died is always
+			// correct. Only a reconciliation that OBSERVES termination
+			// (the worker no longer knows the op, or the op ended with an
+			// empty process tree) may classify as the plain bound expiry:
+			// the bound's contract is that expiry delivers and observes the
+			// process-group kill. A reconcile that fails or observes live
+			// work keeps the operation's entry retained, fences the worker
+			// against every further dispatch, and returns an error that
+			// carries both the bound expiry and the unverified-termination
+			// fact, so no caller can report a stopped task it never
+			// observed stopping.
+			reconcileCtx, reconcileCancel := context.WithTimeout(context.WithoutCancel(ctx), reconcileGrace)
+			defer reconcileCancel()
+			reconciled, reconcileErr := c.worker.ReconcileAmbiguous(reconcileCtx, opID, briefID)
+			if reconcileErr == nil && terminationObserved(reconciled) {
+				if _, resultErr := c.verifiedResult(reconcileCtx, opID, reconciled); resultErr == nil {
+					c.releaseConsumed(reconcileCtx, opID, briefID)
+				}
+				return protocol.Result{}, ctx.Err()
+			}
+			detail := reconcileErr
+			if detail == nil {
+				detail = unverifiedTerminationDetail(reconciled)
+			}
+			c.fenceWorker(opID, detail)
+			return protocol.Result{}, fmt.Errorf("%w: termination of operation %s is unverified: %v: %w", ctx.Err(), opID, detail, ErrTerminationUnverified)
 		case <-time.After(200 * time.Millisecond):
 		}
 		c.control.PollThrottled(ctx)
 	}
 }
 
+// unverifiedTerminationDetail names the observed fact that left an
+// operation's termination unproven: work still live in the task tree, or a
+// worker that still reports the operation as live. Every unverified
+// termination reads alike, whatever path observed it.
+func unverifiedTerminationDetail(state protocol.ResultState) error {
+	if state.Result != nil && state.Result.LiveDescendants > 0 {
+		return fmt.Errorf("%d live processes still unaccounted for in the worker pod", state.Result.LiveDescendants)
+	}
+	return fmt.Errorf("the worker still reports the operation as %q", state.Status)
+}
+
 // verifiedResult renders an independently observed terminal state as an
 // execution result. It clears the operation's entry — with the earned tool
 // heartbeat on a verified completion, without one on a verified cancellation
-// or failure — before the result travels.
+// or failure — before the result travels. A terminal observation that
+// carries live descendants is never a verified termination: the entry stays
+// retained and the worker is fenced here, for every caller, so no path that
+// observed this state can leave a further dispatch running against a worker
+// whose task tree may still hold live work (#414 review).
 func (c *Coordinator) verifiedResult(ctx context.Context, opID string, state protocol.ResultState) (protocol.Result, error) {
 	if state.Result == nil {
 		// Reconciliation observed the operation's definitive non-execution —
@@ -1097,8 +1336,19 @@ func (c *Coordinator) verifiedResult(ctx context.Context, opID string, state pro
 		// The worker reported work that outlived the task, so its terminal
 		// observation is not a verified termination: the entry is retained
 		// and the result is returned as an error, never as a cleared,
-		// suppressible operation (#372).
-		return *state.Result, fmt.Errorf("operation %s ended as %s with %d processes still live in its task tree", opID, state.Status, state.Result.LiveDescendants)
+		// suppressible operation (#372). The count is a pod-level floor —
+		// the worker's sweep reports every unaccounted live process, which
+		// can include another operation's adopted escapee (#399) — so the
+		// wording stays at the pod, not the task tree. The error carries the
+		// unverified-termination fact, and the fence is set HERE, for every
+		// caller of dispatchAndAwait — not only the bootstrap stage that
+		// re-fences on the sentinel it receives (#414 review): descendants
+		// of the ended task may still be executing repository-authored
+		// work, so no further dispatch may run against this worker on any
+		// path that observed this state.
+		err := fmt.Errorf("operation %s ended as %s with %d live processes still unaccounted for in the worker pod: %w", opID, state.Status, state.Result.LiveDescendants, ErrTerminationUnverified)
+		c.fenceWorker(opID, err)
+		return *state.Result, err
 	}
 	c.closeOperation(ctx, opID, state.Status == protocol.ResultCompleted)
 	return *state.Result, nil
@@ -1189,9 +1439,269 @@ func (c *Coordinator) prepareSnapshotLocked(ctx context.Context, briefID string)
 	if strings.TrimSpace(result.StdoutTail) != snap.Tip {
 		return "", errors.New("worker workspace does not match the dispatched snapshot tip")
 	}
+	// The workspace is materialized at the dispatched tip: if the approved
+	// development-bootstrap contract applies (#414), it runs now, after
+	// checkout and before anything else is dispatched against this
+	// workspace. A modified or absent contract dispatches nothing.
+	switch snap.ContractState {
+	case devenv.StateApproved:
+		if err := c.bootstrapWorkspace(ctx, briefID, snap.BaseTip); err != nil {
+			// The blocker, if this was one, is recorded before the error
+			// returns: the run ends blocked-external at the next turn
+			// boundary, whatever consumed this preparation.
+			var blocker *bootstrapBlocker
+			if errors.As(err, &blocker) {
+				c.recordBootstrapBlocker(blocker)
+			}
+			return "", err
+		}
+	case devenv.StateAbsent, devenv.StateModified:
+		// Nothing to apply: the contract was never approved, or the work
+		// tip modified it and only a human approval may run it. The
+		// captured environment is cleared with it — an unpack wipes the
+		// workspace a stale delta's paths point at, so feeding it forward
+		// would silently break every later command instead of saying so.
+		c.storeBootstrapEnv(nil)
+	default:
+		// An unclassified contract state skips the same way: fail closed
+		// on the bootstrap and on any environment it once captured.
+		c.storeBootstrapEnv(nil)
+	}
 	c.snapshotReady = true
 	c.snapshotTip = snap.Tip
 	return snap.Tip, nil
+}
+
+// bootstrapBlockerReasonPrefix is the fixed prefix every bootstrap
+// environment blocker reason carries (#414): the durable reason names the
+// class and the exit code only — worker output is untrusted and never
+// enters a durable reason or the model transcript.
+const bootstrapBlockerReasonPrefix = "the approved bootstrap contract failed"
+
+// bootstrapBlocker is a terminal environment blocker (#414): the approved
+// bootstrap contract failed, or its captured environment was unusable, so
+// nothing model-influenced may run against this workspace. The reason is
+// fixed text plus, where relevant, the task's own exit status — never an
+// excerpt of untrusted worker output.
+type bootstrapBlocker struct {
+	reason string
+}
+
+func (b *bootstrapBlocker) Error() string { return b.reason }
+
+// bootstrapBound is each development-bootstrap task's liveness bound (#414):
+// the bootstrap task and the environment-capture task each get their own
+// bound, never one shared budget. It is a var only so the liveness
+// classification is testable; production code never reassigns it.
+var bootstrapBound = devenv.DefaultBound
+
+// recordBootstrapReceipt emits the structured bootstrap receipt (#414)
+// through the optional sink. Best-effort, like the compaction precedent:
+// no sink records nothing, and emission never changes the run's outcome.
+func (c *Coordinator) recordBootstrapReceipt(receipt BootstrapReceipt) {
+	if c.bootstrapReceipts == nil {
+		return
+	}
+	c.bootstrapReceipts.BootstrapRecorded(receipt)
+}
+
+// bootstrapElapsedMs renders one stage's wall time as receipt milliseconds.
+func bootstrapElapsedMs(started time.Time) int64 {
+	return time.Since(started).Milliseconds()
+}
+
+// bootstrapWorkspace dispatches the fixed control-authored bootstrap tasks —
+// the contract's own scripts for the operator-approved base revision
+// baseOID, run by the worker as `sh -c` with no model-supplied value — and,
+// on success, stores the filtered environment delta the capture produced, so
+// every subsequent model-influenced task merges it over the worker's own
+// environment. The scripts materialize the base revision from the git
+// object store and run inside it (see devenv.BootstrapScript), so the
+// executed bytes are the approved base revision's bytes by construction.
+// The two tasks are dispatched separately and each bounded on its own. A
+// failure is a terminal environment blocker, never a tool error the model
+// could steer: it is recorded before it returns, so the run ends
+// blocked-external at the next turn boundary. Every terminal outcome —
+// applied and each blocker class — also composes a structured
+// BootstrapReceipt and emits it through the optional sink.
+func (c *Coordinator) bootstrapWorkspace(ctx context.Context, briefID, baseOID string) error {
+	parent := ctx
+	bootstrapScript, err := devenv.BootstrapScript(baseOID)
+	if err != nil {
+		// A base OID that fails script validation is an ordinary
+		// snapshot-preparation error, not a bootstrap blocker: the dispatch
+		// is refused before any task exists to fail.
+		return fmt.Errorf("bootstrap task could not be prepared: %w", err)
+	}
+	captureScript, err := devenv.EnvCaptureScript(baseOID)
+	if err != nil {
+		return fmt.Errorf("environment-capture task could not be prepared: %w", err)
+	}
+	bootstrapStarted := time.Now()
+	bootstrapCtx, cancelBootstrap := context.WithTimeout(parent, bootstrapBound)
+	defer cancelBootstrap()
+	bootstrapOpID := newOpID("bootstrap", briefID)
+	task := protocol.Task{Command: []string{"sh", "-c", bootstrapScript}}
+	result, err := c.dispatchAndAwait(bootstrapCtx, bootstrapOpID, briefID, task)
+	if parent.Err() != nil {
+		// The run's own cancellation superseded the stage: an ordinary
+		// snapshot-preparation error, never the bootstrap's blocker — the
+		// blocker classes name the bootstrap's own failures only.
+		if err == nil {
+			err = fmt.Errorf("operation %s was cancelled with the run", bootstrapOpID)
+		}
+		return err
+	}
+	if errors.Is(err, ErrTerminationUnverified) {
+		// Unverified termination is not the bootstrap's own failure (#414
+		// review): the process-group kill was never observed, so
+		// repository-authored work may still be executing, and the run must
+		// not classify blocked-external over it. The active-operation entry
+		// stays retained and the worker is fenced — the fence is set here,
+		// not only where the bound expiry produced the error, so an
+		// unverified termination observed on any path stops the next
+		// dispatch against a worker that may still be running repository
+		// work. The error fails closed through the ordinary
+		// snapshot-preparation path.
+		c.fenceWorker(bootstrapOpID, err)
+		return err
+	}
+	if bootstrapCtx.Err() != nil {
+		// Bound expiry is classified from the stage context itself, not by
+		// unwrapping the error: the stage context past its deadline while
+		// the parent is still live is the stage's own liveness bound,
+		// whether the expiry surfaced as an error or as the reconciled
+		// cancellation dispatchAndAwait delivered. A transport failure with
+		// a live parent is an ordinary snapshot-preparation failure.
+		reason := bootstrapBlockerReasonPrefix + ": the bootstrap task exceeded its liveness bound"
+		c.recordBootstrapReceipt(BootstrapReceipt{
+			Status:             BootstrapReceiptFailed,
+			Reason:             reason,
+			BootstrapElapsedMs: bootstrapElapsedMs(bootstrapStarted),
+			BootstrapExitCode:  -1,
+			CaptureExitCode:    -1,
+		})
+		return &bootstrapBlocker{reason: reason}
+	}
+	if err != nil {
+		return err
+	}
+	// The bootstrap task emitted something; its fixed diagnostic lines are
+	// the receipt's validated facts, whatever the outcome turns out to be.
+	diagnostics := devenv.ParseBootstrapDiagnostics(result.StdoutTail)
+	bootstrapElapsed := bootstrapElapsedMs(bootstrapStarted)
+	if result.ExitCode != 0 {
+		if result.Status == protocol.ResultCancelled {
+			reason := bootstrapBlockerReasonPrefix + ": the bootstrap task was cancelled before it completed"
+			c.recordBootstrapReceipt(BootstrapReceipt{
+				Status:             BootstrapReceiptFailed,
+				Reason:             reason,
+				BootstrapElapsedMs: bootstrapElapsed,
+				BootstrapExitCode:  result.ExitCode,
+				CaptureExitCode:    -1,
+				Diagnostics:        diagnostics,
+			})
+			return &bootstrapBlocker{reason: reason}
+		}
+		reason := fmt.Sprintf("%s with exit code %d", bootstrapBlockerReasonPrefix, result.ExitCode)
+		c.recordBootstrapReceipt(BootstrapReceipt{
+			Status:             BootstrapReceiptFailed,
+			Reason:             reason,
+			BootstrapElapsedMs: bootstrapElapsed,
+			BootstrapExitCode:  result.ExitCode,
+			CaptureExitCode:    -1,
+			Diagnostics:        diagnostics,
+		})
+		return &bootstrapBlocker{reason: reason}
+	}
+	captureStarted := time.Now()
+	captureCtx, cancelCapture := context.WithTimeout(parent, bootstrapBound)
+	defer cancelCapture()
+	captureOpID := newOpID("bootstrap-env", briefID)
+	captureTask := protocol.Task{Command: []string{"sh", "-c", captureScript}}
+	capture, err := c.dispatchAndAwait(captureCtx, captureOpID, briefID, captureTask)
+	if parent.Err() != nil {
+		if err == nil {
+			err = fmt.Errorf("operation %s was cancelled with the run", captureOpID)
+		}
+		return err
+	}
+	if errors.Is(err, ErrTerminationUnverified) {
+		// The same unverified-termination rule as the bootstrap stage: a
+		// termination that was never observed is not an environment blocker.
+		// The entry stays retained, the worker is fenced, and the error fails
+		// closed through the ordinary path.
+		c.fenceWorker(captureOpID, err)
+		return err
+	}
+	if captureCtx.Err() != nil {
+		reason := bootstrapBlockerReasonPrefix + ": the environment-capture task exceeded its liveness bound"
+		c.recordBootstrapReceipt(BootstrapReceipt{
+			Status:             BootstrapReceiptFailed,
+			Reason:             reason,
+			BootstrapElapsedMs: bootstrapElapsed,
+			BootstrapExitCode:  result.ExitCode,
+			CaptureElapsedMs:   bootstrapElapsedMs(captureStarted),
+			CaptureExitCode:    -1,
+			Diagnostics:        diagnostics,
+		})
+		return &bootstrapBlocker{reason: reason}
+	}
+	if err != nil {
+		return err
+	}
+	captureElapsed := bootstrapElapsedMs(captureStarted)
+	if capture.ExitCode != 0 {
+		if capture.Status == protocol.ResultCancelled {
+			reason := bootstrapBlockerReasonPrefix + ": the environment-capture task was cancelled before it completed"
+			c.recordBootstrapReceipt(BootstrapReceipt{
+				Status:             BootstrapReceiptFailed,
+				Reason:             reason,
+				BootstrapElapsedMs: bootstrapElapsed,
+				BootstrapExitCode:  result.ExitCode,
+				CaptureElapsedMs:   captureElapsed,
+				CaptureExitCode:    capture.ExitCode,
+				Diagnostics:        diagnostics,
+			})
+			return &bootstrapBlocker{reason: reason}
+		}
+		reason := fmt.Sprintf("%s with exit code %d", bootstrapBlockerReasonPrefix, capture.ExitCode)
+		c.recordBootstrapReceipt(BootstrapReceipt{
+			Status:             BootstrapReceiptFailed,
+			Reason:             reason,
+			BootstrapElapsedMs: bootstrapElapsed,
+			BootstrapExitCode:  result.ExitCode,
+			CaptureElapsedMs:   captureElapsed,
+			CaptureExitCode:    capture.ExitCode,
+			Diagnostics:        diagnostics,
+		})
+		return &bootstrapBlocker{reason: reason}
+	}
+	delta, keys, err := devenv.ParseEnvCapture(capture.StdoutTail, nil)
+	if err != nil {
+		reason := bootstrapBlockerReasonPrefix + ": bootstrap environment capture malformed"
+		c.recordBootstrapReceipt(BootstrapReceipt{
+			Status:             BootstrapReceiptFailed,
+			Reason:             reason,
+			BootstrapElapsedMs: bootstrapElapsed,
+			BootstrapExitCode:  result.ExitCode,
+			CaptureElapsedMs:   captureElapsed,
+			CaptureExitCode:    capture.ExitCode,
+			Diagnostics:        diagnostics,
+		})
+		return &bootstrapBlocker{reason: reason}
+	}
+	c.recordBootstrapReceipt(BootstrapReceipt{
+		Status:             BootstrapReceiptApplied,
+		BootstrapElapsedMs: bootstrapElapsed,
+		BootstrapExitCode:  result.ExitCode,
+		CaptureElapsedMs:   captureElapsed,
+		CaptureExitCode:    capture.ExitCode,
+		EnvKeys:            len(keys),
+		Diagnostics:        diagnostics,
+	})
+	c.storeBootstrapEnv(delta)
+	return nil
 }
 
 // workerUnpackScript materializes the uploaded snapshot bundle as the
@@ -1268,12 +1778,28 @@ func workerResultToTool(result protocol.Result, tool ToolResult) ToolResult {
 // data; internal error chains can name configuration and identities but
 // never credentials, because no credential reaches this code path.
 func safeToolError(err error) string {
-	message := err.Error()
-	message = strings.ReplaceAll(message, "\n", " ")
-	if len(message) > 500 {
-		message = message[:500]
+	return sanitizeExcerpt(err.Error())
+}
+
+// sanitizeExcerpt bounds untrusted output for a tool-visible message:
+// newlines become spaces, remaining control bytes are dropped, and the
+// excerpt is truncated. safeToolError applies it to an error's text before
+// that text reaches the model transcript.
+func sanitizeExcerpt(value string) string {
+	value = strings.Map(func(r rune) rune {
+		switch {
+		case r == '\n' || r == '\r' || r == '\t':
+			return ' '
+		case r < 0x20 || r == 0x7f:
+			return -1
+		default:
+			return r
+		}
+	}, value)
+	if len(value) > 500 {
+		value = value[:500]
 	}
-	return message
+	return value
 }
 
 // definiteWorkerRejection reports whether the worker definitely refused the

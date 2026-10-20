@@ -545,6 +545,114 @@ func TestBoundedContainerTerminationReason(t *testing.T) {
 	}
 }
 
+// TestCategoryDiagnosticReasonNamesEachCause pins the operator-visible label
+// of every availability-related category: each one names its own cause, so a
+// future change cannot silently re-merge the model provider, the forge, and
+// the model/agent child process under one shared wording.
+func TestCategoryDiagnosticReasonNamesEachCause(t *testing.T) {
+	tests := []struct {
+		category courierv1alpha1.TerminalDiagnosticCategory
+		want     string
+	}{
+		{
+			courierv1alpha1.TerminalDiagnosticCategoryProviderUnavailable,
+			"the model provider did not serve this attempt; work released for another capacity",
+		},
+		{
+			courierv1alpha1.TerminalDiagnosticCategoryForgeUnavailable,
+			"a forge read could not complete on a transient availability condition; the world was never observed; work released for another capacity",
+		},
+		{
+			courierv1alpha1.TerminalDiagnosticCategoryModelTransportError,
+			"coordinator model transport exited with a non-zero status",
+		},
+	}
+	labels := map[string]courierv1alpha1.TerminalDiagnosticCategory{}
+	for _, tt := range tests {
+		got := categoryDiagnosticReason(tt.category)
+		if got != tt.want {
+			t.Errorf("categoryDiagnosticReason(%q) = %q, want %q", tt.category, got, tt.want)
+		}
+		if other, ok := labels[got]; ok {
+			t.Errorf("categories %q and %q share one label: %q", tt.category, other, got)
+		}
+		labels[got] = tt.category
+	}
+	transport := categoryDiagnosticReason(courierv1alpha1.TerminalDiagnosticCategoryModelTransportError)
+	if strings.Contains(transport, "provider") || strings.Contains(transport, "forge") {
+		t.Errorf("model-transport-error label names a remote provider: %q", transport)
+	}
+}
+
+// TestEveryTerminalDiagnosticCategoryIsTrusted proves the operator trusts
+// every category the API vocabulary defines. A category the operator does not
+// know is silently dropped from the validated handoff, so the ending would
+// lose its cause and its recovery channel without any error.
+func TestEveryTerminalDiagnosticCategoryIsTrusted(t *testing.T) {
+	categories := []courierv1alpha1.TerminalDiagnosticCategory{
+		courierv1alpha1.TerminalDiagnosticCategoryExecutorCrash,
+		courierv1alpha1.TerminalDiagnosticCategoryModelTransportError,
+		courierv1alpha1.TerminalDiagnosticCategoryContinuationExhaustion,
+		courierv1alpha1.TerminalDiagnosticCategoryVerifierRejection,
+		courierv1alpha1.TerminalDiagnosticCategoryKubernetesFailure,
+		courierv1alpha1.TerminalDiagnosticCategoryNeedsDecision,
+		courierv1alpha1.TerminalDiagnosticCategoryBlockedExternal,
+		courierv1alpha1.TerminalDiagnosticCategoryCapacityExhaustion,
+		courierv1alpha1.TerminalDiagnosticCategoryProviderUnavailable,
+		courierv1alpha1.TerminalDiagnosticCategoryForgeUnavailable,
+		courierv1alpha1.TerminalDiagnosticCategoryUnknown,
+	}
+	for _, category := range categories {
+		if !knownTerminalDiagnosticCategory(category) {
+			t.Errorf("the operator does not trust the %q category", category)
+		}
+		if categoryDiagnosticReason(category) == "" {
+			t.Errorf("the %q category has no operator-visible reason", category)
+		}
+	}
+}
+
+// TestReconcilePersistsChildCrashBudgetReason proves the spent child-crash
+// budget is not mislabeled as a remote-provider outage: the handoff's
+// model-transport-error category persists with the reason that names the
+// coordinator's model transport, never with the provider- or
+// forge-availability labels.
+func TestReconcilePersistsChildCrashBudgetReason(t *testing.T) {
+	run := admissionRun("crash-budget", "local", courierv1alpha1.PhaseRunning)
+	pod := coordinatorPod(run, exitNeedsHuman)
+	payload, err := json.Marshal(terminationMessage{
+		Phase:    "NeedsHuman",
+		Result:   "needs-human",
+		ExitCode: exitNeedsHuman,
+		Outcome:  outcomeCapacityExhausted,
+		Reason:   "opencode exited with status 1 after 2 continuations",
+		Category: string(courierv1alpha1.TerminalDiagnosticCategoryModelTransportError),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	pod.Status.ContainerStatuses[0].State.Terminated.Message = handoffPrefix + string(payload)
+	kube := phaseClient(t, run, pod)
+	reconciler := diagnosticReconciler(kube, &admissionSource{})
+	if _, err := reconciler.Reconcile(context.Background(), admissionRequest(run.Name)); err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+	var updated courierv1alpha1.CoderRun
+	if err := kube.Get(context.Background(), admissionKey(run.Name), &updated); err != nil {
+		t.Fatal(err)
+	}
+	diagnostic := updated.Status.TerminalDiagnostic
+	if diagnostic == nil || diagnostic.Category != courierv1alpha1.TerminalDiagnosticCategoryModelTransportError {
+		t.Fatalf("terminal diagnostic = %#v, want the model-transport-error category", diagnostic)
+	}
+	if diagnostic.Reason != "coordinator model transport exited with a non-zero status" {
+		t.Fatalf("terminal diagnostic reason = %q, want the child-process label", diagnostic.Reason)
+	}
+	if strings.Contains(diagnostic.Reason, "provider") || strings.Contains(diagnostic.Reason, "forge") {
+		t.Fatalf("terminal diagnostic reason names a remote provider: %q", diagnostic.Reason)
+	}
+}
+
 // TestOperatorDiagnosticReasonAllowlistsKubernetesReasons proves the
 // allowlist is real (not just claimed): arbitrary kubelet
 // `Terminated.Reason` and arbitrary `pod.Status.Reason` values are

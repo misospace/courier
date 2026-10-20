@@ -660,3 +660,38 @@ func gitOutput(directory string, args ...string) ([]byte, error) {
 	}
 	return stdout.Bytes(), nil
 }
+
+func TestBlobAtReadsRevisionScopedContentAndClassifiesAbsence(t *testing.T) {
+	repo := t.TempDir()
+	initRepo(t, repo)
+	writeFile(t, filepath.Join(repo, "tracked.txt"), "base\n")
+	git(t, repo, "add", "--all", "--", ".")
+	git(t, repo, "commit", "-m", "base")
+	base, err := HeadOID(context.Background(), repo)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(repo, ".mise"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	writeFile(t, filepath.Join(repo, ".mise", "config.toml"), "[tools]\ngo = \"1.27\"\n")
+	git(t, repo, "add", "--all", "--", ".")
+	git(t, repo, "commit", "-m", "contract")
+
+	content, ok, err := BlobAt(context.Background(), repo, "HEAD", ".mise/config.toml")
+	if err != nil || !ok {
+		t.Fatalf("BlobAt HEAD = (%q, %v, %v)", content, ok, err)
+	}
+	if string(content) != "[tools]\ngo = \"1.27\"\n" {
+		t.Fatalf("BlobAt content = %q", content)
+	}
+	if _, ok, _ := BlobAt(context.Background(), repo, base, ".mise/config.toml"); ok {
+		t.Fatal("BlobAt reported a contract path at a revision without one")
+	}
+	if _, ok, _ := BlobAt(context.Background(), repo, "HEAD", "missing.txt"); ok {
+		t.Fatal("BlobAt reported a path the revision does not carry")
+	}
+	if _, _, err := BlobAt(context.Background(), repo, "", ".mise/config.toml"); err == nil {
+		t.Fatal("BlobAt accepted an empty revision")
+	}
+}

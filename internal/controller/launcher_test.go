@@ -1076,7 +1076,7 @@ func TestCoordinatorLauncherRejectsUnlaunchableLaneSizing(t *testing.T) {
 		ObjectMeta: metav1.ObjectMeta{Name: "broken", Namespace: "default"},
 		Spec: courierv1alpha1.LaneProfileSpec{
 			Roles: map[string]string{"coordinator": "test-model"},
-			Resources: corev1.ResourceRequirements{
+			Resources: courierv1alpha1.PodResources{
 				Limits: corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("0")},
 			},
 		},

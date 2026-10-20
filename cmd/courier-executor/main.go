@@ -37,6 +37,7 @@ import (
 	courierv1alpha1 "github.com/misospace/courier/api/v1alpha1"
 	"github.com/misospace/courier/internal/broker"
 	"github.com/misospace/courier/internal/broker/grammar"
+	"github.com/misospace/courier/internal/devenv"
 	"github.com/misospace/courier/internal/evidence"
 	"github.com/misospace/courier/internal/executor"
 	"github.com/misospace/courier/internal/forge"
@@ -139,9 +140,10 @@ type termination struct {
 	// declaration drove the ending (#169); empty when classified from the
 	// world alone.
 	Outcome string `json:"outcome,omitempty"`
-	// Category is the stable, machine-readable cause classification (#272),
-	// matching the TerminalDiagnosticCategory values the operator persists.
-	Category string `json:"category,omitempty"`
+	// Category is the stable, machine-readable cause classification (#272).
+	// It is typed as the operator's TerminalDiagnosticCategory vocabulary, so
+	// the executor can only declare a cause the operator persists.
+	Category courierv1alpha1.TerminalDiagnosticCategory `json:"category,omitempty"`
 	// Summary is the compact per-run telemetry tallied from the OpenCode event
 	// stream (#172). Omitted when the run recorded no activity.
 	Summary *courierv1alpha1.RunTelemetry `json:"summary,omitempty"`
@@ -169,6 +171,10 @@ func main() {
 	// capture through the run's ordinary exit codes (DESIGN.md, #115).
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM)
 	defer stop()
+	// Armed for the whole run, before any child exists: this process is PID 1
+	// of the coordinator pod, so the kernel hands it every orphaned descendant
+	// and PID 1 reaps none of them on its own (#347).
+	installAdoptedChildReaper()
 	os.Exit(run(ctx, os.Stdout, os.Stderr))
 }
 
@@ -503,7 +509,7 @@ func fetchRunBranch(ctx context.Context, dir, remoteURL, branch string) error {
 	cmd.WaitDelay = 2 * time.Second
 	cmd.Stdout = io.Discard
 	cmd.Stderr = io.Discard
-	return cmd.Run()
+	return childReaper().run(cmd)
 }
 
 // revListCount counts the commits in a rev-list range expression.
@@ -515,7 +521,7 @@ func revListCount(ctx context.Context, dir, span string) (int, error) {
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
-	if err := cmd.Run(); err != nil {
+	if err := childReaper().run(cmd); err != nil {
 		return 0, err
 	}
 	count, err := strconv.Atoi(strings.TrimSpace(stdout.String()))
@@ -534,7 +540,7 @@ func revParse(ctx context.Context, dir, rev string) (string, error) {
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
-	if err := cmd.Run(); err != nil {
+	if err := childReaper().run(cmd); err != nil {
 		return "", err
 	}
 	return strings.TrimSpace(stdout.String()), nil
@@ -810,6 +816,10 @@ func preflightCapabilities(ctx context.Context, command executor.Command, dir st
 	probeCtx, cancel := context.WithTimeout(ctx, mcpPreflightTimeout)
 	defer cancel()
 	probe := exec.CommandContext(probeCtx, command.Binary, command.Args...)
+	// In its own process group so the descendants it leaves behind stay
+	// recognizable as its own after it exits, and the reaper can collect them
+	// instead of retaining them on PID 1 (#347).
+	probe.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	// Bound waiting for a grandchild that holds the output pipe after the
 	// context is done.
 	probe.WaitDelay = 5 * time.Second
@@ -819,7 +829,7 @@ func preflightCapabilities(ctx context.Context, command executor.Command, dir st
 	var out bytes.Buffer
 	probe.Stdout = &out
 	probe.Stderr = io.Discard
-	_ = probe.Run()
+	_ = childReaper().run(probe)
 	return executor.ParseMCPStatus(out.String())
 }
 
@@ -1209,6 +1219,51 @@ func run(ctx context.Context, stdout, stderr io.Writer) int {
 	}
 	report.event(courierlog.EventWorkspaceReady, courierlog.StatusOK, ready)
 
+	// Child output is redacted before it reaches the run streams. The session
+	// tap observes OpenCode's JSON events without changing their bytes. The
+	// wrapping happens once, here: the model child streams through the same
+	// writers.
+	stdoutRedacted := courierlog.NewRedactingWriter(stdout, report.red)
+	stderrTransport := courierlog.NewRedactingWriter(stderr, report.red)
+
+	// The repository-owned development bootstrap contract (#414): the legacy
+	// executor is credential-bearing, so it NEVER executes repository
+	// contract content — it classifies the contract with pure git reads and
+	// emits one receipt event per verdict. Execution happens only in the
+	// secure worker's credential-free context; an approved contract here is
+	// skipped with a receipt that names exactly that.
+	state, stateErr := bootstrapContractState(ctx, workspace.Directory, workspace.BaseRevisionRef(), startCommit)
+	switch {
+	case stateErr != nil:
+		reason := report.red.Redact("bootstrap contract state unreadable: " + stateErr.Error())
+		report.eventVerbose(courierlog.EventWorkspaceBootstrap, courierlog.StatusError, map[string]any{
+			"status": "skipped",
+			"reason": truncatedRunes(reason, bootstrapReasonLimit),
+		})
+	case state == devenv.StateAbsent:
+		report.eventVerbose(courierlog.EventWorkspaceBootstrap, courierlog.StatusOK, map[string]any{
+			"status": "skipped",
+			"reason": "",
+		})
+	case state == devenv.StateModified:
+		report.eventVerbose(courierlog.EventWorkspaceBootstrap, courierlog.StatusOK, map[string]any{
+			"status": "skipped",
+			"reason": "bootstrap contract is not provably identical to the approved base revision; not executed",
+		})
+	case state == devenv.StateApproved:
+		// The contract is approved, but this executor is credential-bearing
+		// and must never execute repository contract code (#414 review): the
+		// run continues unbootstrapped — exactly like the absent and
+		// modified branches — and the secure worker topology owns
+		// execution. No exec, no environment application, no termination.
+		report.eventVerbose(courierlog.EventWorkspaceBootstrap, courierlog.StatusOK, map[string]any{
+			"status": "skipped",
+			"reason": "bootstrap contract approved but not executed: the legacy executor is credential-bearing; the approved bootstrap runs only in the secure worker topology",
+		})
+	}
+	_ = stdoutRedacted.Flush()
+	_ = stderrTransport.Flush()
+
 	runtime := executor.OpenCode{Binary: cfg.OpenCodeBinary, Format: cfg.OpenCodeFormat, Agent: cfg.OpenCodeAgent}
 	caps := preflightCapabilities(ctx, runtime.MCPStatusCommand(), workspace.Directory)
 	if len(caps) > 0 {
@@ -1217,10 +1272,6 @@ func run(ctx context.Context, stdout, stderr io.Writer) int {
 	if note := capabilityNote(caps); note != "" {
 		cfg.Framing = strings.TrimSpace(cfg.Framing + "\n\n" + report.red.Redact(note))
 	}
-	// Child output is redacted before it reaches the run streams. The session tap
-	// observes OpenCode's JSON events without changing their bytes.
-	stdoutRedacted := courierlog.NewRedactingWriter(stdout, report.red)
-	stderrTransport := courierlog.NewRedactingWriter(stderr, report.red)
 	tap := newSessionTap(stdoutRedacted, parseExhaustionSignals(cfg.ExhaustionCodes, cfg.ExhaustionTypes))
 	tap.tel = report.tel
 	var exhaustionSignal atomic.Bool
@@ -1287,7 +1338,7 @@ func run(ctx context.Context, stdout, stderr io.Writer) int {
 		process.Dir = workspace.Directory
 		process.Stdout = modelStdout
 		process.Stderr = stderrTransport
-		processErr := process.Run()
+		processErr := childReaper().run(process)
 		_ = tap.Flush()
 		tap.setKill(nil)
 		_ = stdoutRedacted.Flush()
@@ -1353,7 +1404,7 @@ func run(ctx context.Context, stdout, stderr io.Writer) int {
 					continue
 				}
 				if ctx.Err() == nil {
-					report.terminateCaptured(ctx, workspace, startCommit, report.availabilityRecoveryTermination(ctx, workspace, cfg, startCommit, fmt.Sprintf("model provider failed to serve %d consecutive attempts without a session (last exit %d)", cfg.MaxAvailabilityRetries, code)))
+					report.terminateCaptured(ctx, workspace, startCommit, report.availabilityRecoveryTermination(ctx, workspace, cfg, startCommit, terminalCategoryProviderUnavailable, fmt.Sprintf("model provider failed to serve %d consecutive attempts without a session (last exit %d)", cfg.MaxAvailabilityRetries, code)))
 					return exitNeedsHuman
 				}
 			} else {
@@ -1387,10 +1438,11 @@ func run(ctx context.Context, stdout, stderr io.Writer) int {
 			// provable task defect must not become a permanent Failed: a
 			// Failed run holds its claim and strands the work (#327). End
 			// on the recoverable availability-handoff channel — the same
-			// honest provider-unavailable verdict, never a quota claim —
-			// so fenced recovery can move the work to a healthy capacity.
-			// A canceled context is not provider trouble: it stays a plain
-			// Failed, since the operator chose to stop this run.
+			// honest child-process verdict the canceled-context path already
+			// uses, never a quota claim — so fenced recovery can move the
+			// work to a healthy capacity. A canceled context is not provider
+			// trouble: it stays a plain Failed, since the operator chose to
+			// stop this run.
 			reason := fmt.Sprintf("opencode exited with status %d", code)
 			if continuations > 0 {
 				reason += fmt.Sprintf(" after %d continuations", continuations)
@@ -1400,7 +1452,7 @@ func run(ctx context.Context, stdout, stderr io.Writer) int {
 				report.terminateCaptured(ctx, workspace, startCommit, failedWith(reason, terminalCategoryModelTransportError))
 				return exitFailed
 			}
-			report.terminateCaptured(ctx, workspace, startCommit, report.availabilityRecoveryTermination(ctx, workspace, cfg, startCommit, reason))
+			report.terminateCaptured(ctx, workspace, startCommit, report.availabilityRecoveryTermination(ctx, workspace, cfg, startCommit, terminalCategoryModelTransportError, reason))
 			return exitNeedsHuman
 		}
 
@@ -1429,7 +1481,8 @@ func run(ctx context.Context, stdout, stderr io.Writer) int {
 			// path therefore participates in the same continuation/repair
 			// loop as the undeclared path — without losing the declared
 			// outcome tag, which applyHandoffPlan preserves on the
-			// terminating terminal. This keeps the legacy executor from
+			// verifier-rejection terminal (a transient forge read instead
+			// ends blocked_external, #455). This keeps the legacy executor from
 			// forcing NeedsHuman on a declared run whose captured
 			// session still has unused continuation budget.
 			if result.Phase == "Verifying" {
@@ -1452,6 +1505,10 @@ func run(ctx context.Context, stdout, stderr io.Writer) int {
 					continue
 				}
 				if verdict.FailReason != "" {
+					if verdict.ForgeUnavailable {
+						report.terminateCaptured(ctx, workspace, startCommit, report.forgeUnavailableTermination(workspace, cfg, startCommit, verdict.FailReason))
+						return exitNeedsHuman
+					}
 					report.terminateCaptured(ctx, workspace, startCommit, termination{Phase: "NeedsHuman", Result: "needs-human", ExitCode: exitNeedsHuman, Reason: verdict.FailReason, Outcome: result.Outcome, Category: terminalCategoryVerifierRejection})
 					return exitNeedsHuman
 				}
@@ -1520,6 +1577,10 @@ func run(ctx context.Context, stdout, stderr io.Writer) int {
 					continue
 				}
 				if verdict.FailReason != "" {
+					if verdict.ForgeUnavailable {
+						report.terminateCaptured(ctx, workspace, startCommit, report.forgeUnavailableTermination(workspace, cfg, startCommit, verdict.FailReason))
+						return exitNeedsHuman
+					}
 					report.terminateCaptured(ctx, workspace, startCommit, termination{Phase: "NeedsHuman", Result: "needs-human", ExitCode: exitNeedsHuman, Reason: verdict.FailReason, Category: terminalCategoryVerifierRejection})
 					return exitNeedsHuman
 				}
@@ -1620,16 +1681,21 @@ func run(ctx context.Context, stdout, stderr io.Writer) int {
 
 }
 
+// The terminal-diagnostic categories the executor may declare. They are
+// bound to the operator's vocabulary, so a category can never drift from the
+// value the operator persists: an unmatched category would be dropped by the
+// operator and the ending would silently lose its cause.
 const (
-	terminalCategoryExecutorCrash          = "executor-crash"
-	terminalCategoryModelTransportError    = "model-transport-error"
-	terminalCategoryContinuationExhaustion = "continuation-exhaustion"
-	terminalCategoryVerifierRejection      = "verifier-rejection"
-	terminalCategoryUnknown                = "unknown"
-	terminalCategoryNeedsDecision          = "needs-decision"
-	terminalCategoryBlockedExternal        = "blocked-external"
-	terminalCategoryCapacityExhaustion     = "capacity-exhaustion"
-	terminalCategoryProviderUnavailable    = "provider-unavailable"
+	terminalCategoryExecutorCrash          = courierv1alpha1.TerminalDiagnosticCategoryExecutorCrash
+	terminalCategoryModelTransportError    = courierv1alpha1.TerminalDiagnosticCategoryModelTransportError
+	terminalCategoryContinuationExhaustion = courierv1alpha1.TerminalDiagnosticCategoryContinuationExhaustion
+	terminalCategoryVerifierRejection      = courierv1alpha1.TerminalDiagnosticCategoryVerifierRejection
+	terminalCategoryUnknown                = courierv1alpha1.TerminalDiagnosticCategoryUnknown
+	terminalCategoryNeedsDecision          = courierv1alpha1.TerminalDiagnosticCategoryNeedsDecision
+	terminalCategoryBlockedExternal        = courierv1alpha1.TerminalDiagnosticCategoryBlockedExternal
+	terminalCategoryCapacityExhaustion     = courierv1alpha1.TerminalDiagnosticCategoryCapacityExhaustion
+	terminalCategoryProviderUnavailable    = courierv1alpha1.TerminalDiagnosticCategoryProviderUnavailable
+	terminalCategoryForgeUnavailable       = courierv1alpha1.TerminalDiagnosticCategoryForgeUnavailable
 )
 
 // The outcome kinds the coordinator may declare (#169).
@@ -1709,7 +1775,7 @@ func failed(reason string) termination {
 	return failedWith(reason, terminalCategoryExecutorCrash)
 }
 
-func failedWith(reason, category string) termination {
+func failedWith(reason string, category courierv1alpha1.TerminalDiagnosticCategory) termination {
 	return termination{Phase: "Failed", Result: "failure", ExitCode: exitFailed, Reason: reason, Category: category}
 }
 
@@ -3408,6 +3474,19 @@ func (r reporter) linkageForgeFailureReason(err error) string {
 	return fmt.Sprintf("the live pull-request state could not be verified to confirm an open, non-draft pull request with authoritative source-issue linkage to %s: %s; the run needs a human", target, err.Error())
 }
 
+// forgeUnavailableReason composes the blocked-external reason for a Verifying
+// candidate whose live forge read failed on a transient availability
+// condition — a rate limit, a server error, or a network failure — with no
+// in-session retry possible (#455). The forge was temporarily unavailable,
+// so the world was never observed: the run is parked for bounded retry by
+// the operator rather than failed as a verification rejection, and the
+// reason never claims the pull request is missing.
+func (r reporter) forgeUnavailableReason(err error) string {
+	source := r.sourceIssue()
+	target := sourceIssueTarget(source)
+	return fmt.Sprintf("the live pull-request state could not be verified to confirm an open, non-draft pull request with authoritative source-issue linkage to %s: %s; the forge was temporarily unavailable (rate limit, server error, or network failure), so the run is parked for bounded retry by the operator", target, err.Error())
+}
+
 // draftExhaustedReason composes the NeedsHuman reason for a run whose
 // continuation budget ran out while the run branch's pull request was
 // still a draft (#247).
@@ -3508,6 +3587,13 @@ func (r reporter) closedOnlyPRReason() string {
 // (ambiguous, closed-only, foreign head, wrong base, a head whose
 // current commits the remote does not advertise, or a body whose
 // criterion-evidence block cannot be repaired) (#247, #248, #249).
+// ForgeUnavailable is true when the forge read failed on a transient
+// availability condition — a rate limit, a server error, or a network
+// failure — and no in-session retry is possible, so the world was never
+// observed: the run then ends blocked_external for the operator's
+// bounded retry rather than NeedsHuman, which is reserved for worlds
+// the observation actually read and found contradictory (#455). It is
+// never set alongside a retryable verdict.
 type handoffVerdict struct {
 	Pass        bool
 	ContinueMsg string
@@ -3528,6 +3614,9 @@ type handoffVerdict struct {
 	// criteria check did not run.
 	StatusCounts map[broker.CriterionStatus]int
 	FailReason   string
+	// ForgeUnavailable marks a transient forge-availability ending
+	// (#455); see the struct doc above.
+	ForgeUnavailable bool
 }
 
 // applyHandoffPlan runs the identity-checked pre-handoff forge
@@ -3552,8 +3641,12 @@ type handoffVerdict struct {
 //     creation over an unverifiable or foreign world (#247).
 //   - A failed live observation is never represented as a confirmed
 //     missing PR: it retries inside the bounded budget with a factual
-//     "could not verify" message, and fails closed to NeedsHuman when
-//     no retry is possible (#247, #248).
+//     "could not verify" message. When no retry is possible, a read
+//     that failed on a transient availability condition — a rate limit,
+//     a server error, or a network failure — ends blocked_external for
+//     the operator's bounded retry, because the world was never
+//     observed (#455); any other read failure fails closed to
+//     NeedsHuman (#247, #248).
 //   - Two operator-side envelope faults are not read failures and not
 //     model-repairable defects, so they fail closed to NeedsHuman on
 //     sight without consuming the #170 budget (#282). The
@@ -3569,10 +3662,21 @@ type handoffVerdict struct {
 //
 // The call site signals the budget consumed so far through continuations
 // (so the helper consumes one slot when it asks for a continue); ctxErr
-// is the run context's current error (non-nil when the run is shutting
-// down) and sessionID gates the resume path.
+// is the run context's error as the caller observed it (non-nil when the
+// run is already shutting down), and the helper folds in the live
+// context error observed after the forge read so a cancellation that
+// occurred during the read still gates the resume path. sessionID gates
+// the resume path.
 func (r reporter) applyHandoffPlan(ctx context.Context, continuations int, maxContinuations int, sessionID string, ctxErr error) handoffVerdict {
 	linkOutcome, linkErr := r.checkHandoff(ctx)
+	// The caller's ctxErr snapshot predates the forge read: shutdown can
+	// cancel the run context while that read is in flight, so the live
+	// error is folded in before any verdict decision — a continuation
+	// decided on a stale nil would hand a canceled context back to the
+	// session loop.
+	if ctxErr == nil {
+		ctxErr = ctx.Err()
+	}
 	if errors.Is(linkErr, criteriaEnvelopeIdentityErr) {
 		// The operator-pinned envelope disagrees with the run's trusted
 		// source identity. That is not a forge read failure the captured
@@ -3612,6 +3716,14 @@ func (r reporter) applyHandoffPlan(ctx context.Context, continuations int, maxCo
 			"error": linkErr.Error(),
 		})
 		if continuations >= maxContinuations || sessionID == "" || ctxErr != nil {
+			if forge.IsTransientAvailability(linkErr) {
+				// The read could not complete on a transient
+				// availability condition, so the world was never
+				// observed: the run ends blocked_external for the
+				// operator's bounded retry instead of escalating to
+				// a human as a verification rejection (#455).
+				return handoffVerdict{FailReason: r.forgeUnavailableReason(linkErr), ForgeUnavailable: true}
+			}
 			return handoffVerdict{FailReason: r.linkageForgeFailureReason(linkErr)}
 		}
 		// The verifier could not read the forge state at all. That is

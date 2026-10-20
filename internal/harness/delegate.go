@@ -17,6 +17,32 @@ import (
 // process termination is proven, and only then may new work start.
 var ErrAmbiguousDispatch = errors.New("harness: dispatch transport failed ambiguously; cancel and reconcile before retrying")
 
+// ErrTerminationUnverified marks a bound-expiry or cancellation whose
+// reconciliation could not observe process termination: the cancellation
+// may never have reached the worker, or the worker reported work that
+// outlived the task. Callers may classify the deadline, but never claim
+// the task stopped; the coordinator fences the worker until its termination
+// is independently observed or the worker itself is replaced.
+var ErrTerminationUnverified = errors.New("harness: operation termination could not be verified")
+
+// terminationObserved reports whether a reconciled state proves nothing
+// from the operation is still live: the worker definitively does not know
+// the operation (observed absence), or the operation reached a terminal
+// status and either carried no result (a cancelled or unknown observation,
+// which is a definitive non-execution) or reported an empty process tree.
+// Anything else — still running, or an unrecognized status — is not
+// observed termination.
+func terminationObserved(state protocol.ResultState) bool {
+	switch state.Status {
+	case "":
+		return true
+	case protocol.ResultCompleted, protocol.ResultFailed, protocol.ResultCancelled:
+		return state.Result == nil || state.Result.LiveDescendants == 0
+	default:
+		return false
+	}
+}
+
 // WorkerIdentity is the identity material every signed envelope binds: the
 // run, the current control incarnation, and the worker pod incarnation.
 type WorkerIdentity struct {

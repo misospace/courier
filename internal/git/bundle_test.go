@@ -2,6 +2,7 @@ package git
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -75,15 +76,59 @@ func TestBundleCreateHeadsVerifyInventory(t *testing.T) {
 	// The inventory covers exactly the delivered object set: two commits,
 	// two trees, two blobs.
 	quarantine := t.TempDir()
-	if err := Unbundle(ctx, quarantine, bundle); err != nil {
+	if err := Unbundle(ctx, quarantine, bundle, generousLimits()); err != nil {
 		t.Fatal(err)
 	}
-	inventory, err := InventoryObjects(ctx, fresh, quarantine)
+	inventory, err := InventoryObjects(ctx, fresh, quarantine, generousLimits())
 	if err != nil {
 		t.Fatal(err)
 	}
 	if inventory.Count != 6 || inventory.TotalBytes <= 0 || inventory.MaxBlobBytes != 1 {
 		t.Fatalf("inventory = %+v, want 6 objects, 1-byte blobs, positive total", inventory)
+	}
+}
+
+// generousLimits returns bounds that no fixture in this package exceeds.
+func generousLimits() ObjectLimits {
+	return ObjectLimits{
+		MaxObjects:     10000,
+		MaxTotalBytes:  64 << 20,
+		MaxObjectBytes: 16 << 20,
+	}
+}
+
+// TestInventoryObjectsEnforcesObjectCount proves the listing is bounded
+// while it streams: a tight object-count bound stops the scan instead of
+// letting the whole listing be read.
+func TestInventoryObjectsEnforcesObjectCount(t *testing.T) {
+	ctx := context.Background()
+	dir, _ := seedRepo(t, t.TempDir(), "a.txt", "a")
+	commitFile(t, dir, "b.txt", "b", "second")
+	bundle := filepath.Join(t.TempDir(), "many.bundle")
+	if err := BundleCreate(ctx, dir, bundle, "HEAD"); err != nil {
+		t.Fatal(err)
+	}
+	quarantine := t.TempDir()
+	if err := Unbundle(ctx, quarantine, bundle, generousLimits()); err != nil {
+		t.Fatal(err)
+	}
+	fresh := t.TempDir()
+	git(t, fresh, "init", "--quiet", "--initial-branch", "main")
+	limits := generousLimits()
+	limits.MaxObjects = 1
+	inventory, err := InventoryObjects(ctx, fresh, quarantine, limits)
+	var limitErr *LimitError
+	if !errors.As(err, &limitErr) {
+		t.Fatalf("inventory error = %v, want a LimitError", err)
+	}
+	if limitErr.Limit != LimitObjects {
+		t.Fatalf("limit = %q, want %q", limitErr.Limit, LimitObjects)
+	}
+	// The listing stopped at the bound: the bundle holds six objects, and
+	// only the ones past the bound were ever read.
+	if inventory.Count != limits.MaxObjects+1 {
+		t.Fatalf("inventory count = %d, want %d: the listing did not stop at the bound",
+			inventory.Count, limits.MaxObjects+1)
 	}
 }
 

@@ -713,17 +713,20 @@ func (r *CoderRunReconciler) terminateMissingHead(ctx context.Context, run *cour
 	return r.terminateNeedsHuman(ctx, run, adapter, item, &SecureNeedsHumanError{Reason: "HeadRepositoryGone", Detail: cause.Error()})
 }
 
-// secureLaunchFailure handles an error from LaunchSecure. The pod-admission
-// class — a rendered pod spec the API server refuses outright — terminalizes
-// the run, and fences the round first: a resumed launch reaches the launcher
-// with a live worker and a credentialed broker already provisioned, and a
+// secureLaunchFailure handles an error from LaunchSecure. The terminal
+// verdict classes — a rendered pod spec the API server refuses outright, and
+// a probe pod pinned to a node its name does not name — terminalize the run,
+// and fence the round first: a resumed launch reaches the launcher with a
+// live worker and a credentialed broker already provisioned, and a
 // NeedsHuman run is no longer observed and is reaped only after its retention
 // window, so a fence deferred past this reconcile would leave the untrusted
-// executor running and the broker holding credentials for all of it. A fence
+// executor running and the broker holding credentials for all of it. A
+// ProbeIdentity verdict can only arise on a first pass, before any topology
+// pod exists, so its fence is a no-op riding the same branch. A fence
 // that fails does not terminalize: the claim is released and the next pass
 // retries the fence. Every other error keeps the launch path's transient
 // behaviour — the claim is released back to Pending — because a signal that
-// clears on a later pass must not strand the run (podAdmissionRejection).
+// clears on a later pass must not strand the run (terminalPreflightVerdict).
 func (r *CoderRunReconciler) secureLaunchFailure(ctx context.Context, run *courierv1alpha1.CoderRun, adapter source.Adapter, item source.WorkItem, err error) (ctrl.Result, error) {
 	if permanent := launchRejection(err); permanent != nil {
 		if fenceErr := r.Secure.Fence(ctx, run); fenceErr != nil {
@@ -876,7 +879,13 @@ func (r *CoderRunReconciler) observeRunning(ctx context.Context, run *courierv1a
 		// A no_change_needed fix-pr run no longer terminalizes directly: it
 		// is routed to Verifying, which settles it against the world.
 		intent := terminalLifecycleIntent{}
-		if terminationOutcome == string(executor.OutcomeCapacityExhausted) {
+		// Workspace-safety evidence is acquired only for the endings whose
+		// recovery channel is the fenced capacity path: the confirmed
+		// capacity-exhausted handoff, and the exact #455 forge-unavailability
+		// pairing (declared blocked_external carried by a validated
+		// forge-unavailable handoff category). A task-shaped blocked_external
+		// declaration opens nothing here.
+		if terminationOutcome == string(executor.OutcomeCapacityExhausted) || trustedForgeUnavailableHandoff(pod, terminationOutcome) {
 			evidenceBefore := run.DeepCopy()
 			if r.Secure != nil {
 				if message, valid := parseCoordinatorTermination(pod); valid {
@@ -1981,6 +1990,18 @@ const outcomeBlockedExternal = "blocked_external"
 // exitNeedsHuman is the executor's NeedsHuman exit: a declared decision or
 // external block, or a guard refusal.
 const exitNeedsHuman = 2
+
+// trustedForgeUnavailableHandoff reports the exact #455 pairing that shares
+// the capacity-exhausted workspace-safety evidence gate: the executor
+// declared blocked_external while the same validated termination handoff
+// carries the forge-unavailable diagnostic category — the transient
+// forge-read ending where the world was never observed and the published
+// work must stay recoverable. Any other blocked_external declaration is a
+// task-shaped prerequisite block and never opens this gate.
+func trustedForgeUnavailableHandoff(pod *corev1.Pod, terminationOutcome string) bool {
+	return terminationOutcome == string(executor.OutcomeBlockedExternal) &&
+		coordinatorHandoffCategory(pod) == string(courierv1alpha1.TerminalDiagnosticCategoryForgeUnavailable)
+}
 
 // outcomeCapacityExhausted is the executor's affirmative structured
 // declaration that execution capacity was confirmed exhausted (#320/#327).

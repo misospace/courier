@@ -163,6 +163,58 @@ type mockWorker struct {
 	snapshotTip  string
 	packArtifact []byte
 	snapshotTips []string
+	// bootstrapResults are consumed in order by the scripted bootstrap task;
+	// with none scripted, a bootstrap task completes with an empty capture.
+	bootstrapResults []protocol.Result
+	// ordinaryResults are consumed in order by any task that matches no
+	// fixed control-task shape, standing in for a terminal observation whose
+	// process group still holds live work; scripted so the state-based
+	// invariants are pinned deterministically rather than only through the
+	// reconcile-failure variants.
+	ordinaryResults []protocol.Result
+	// hangResults makes every dispatched operation stay running: result
+	// polls answer "running" immediately, the way the real worker answers
+	// a known operation that has not terminated, until a cancellation
+	// tombstones the op.
+	hangResults bool
+	// hangStage makes only the operations of one bootstrap stage
+	// ("bootstrap" or "capture") stay running the same way, standing in
+	// for a worker whose bootstrap task or whose environment-capture task
+	// — but not both — never terminates.
+	hangStage string
+	// reconcileFails makes the result poll for a tombstoned operation fail
+	// with 503: the cancellation landed and the worker tombstoned the op,
+	// but the reconcile cannot observe what happened to the task afterward.
+	// It stands in for a worker whose reconciliation cannot verify
+	// termination — the case where control must fence rather than classify.
+	reconcileFails bool
+	// liveDescendants makes a tombstoned operation report a terminal state
+	// that still carries live work in its task tree: the cancellation
+	// landed, but the worker's process group is not empty, so the
+	// reconciliation observes NO termination.
+	liveDescendants int
+	// pollDelay makes an in-flight result poll for a still-running (not
+	// tombstoned) operation fail with 503 only after the delay: the
+	// caller's liveness bound expires while the poll is in flight, so the
+	// poll-failure path — not the poll wait — is the one that reconciles.
+	// It never delays a tombstoned poll, so a reconcile's own observation
+	// answers immediately.
+	pollDelay time.Duration
+	// tombstones records cancelled op IDs, mirroring the real worker: a
+	// cancellation tombstone is final, and a result poll for a
+	// tombstoned operation answers the verified cancellation instead of
+	// hanging — the reconcile must be able to observe it.
+	tombstones map[string]bool
+}
+
+func isWorkerBootstrapTask(task protocol.Task) bool {
+	return len(task.Command) == 3 && task.Command[0] == "sh" && task.Command[1] == "-c" &&
+		strings.Contains(task.Command[2], "mise run bootstrap")
+}
+
+func isWorkerEnvCaptureTask(task protocol.Task) bool {
+	return len(task.Command) == 3 && task.Command[0] == "sh" && task.Command[1] == "-c" &&
+		strings.Contains(task.Command[2], "mise x -- env -0")
 }
 
 func isWorkerUnpackTask(task protocol.Task) bool {
@@ -224,9 +276,19 @@ func (m *mockWorker) handleDispatch(w http.ResponseWriter, r *http.Request) {
 	if m.results == nil {
 		m.results = map[string]protocol.ResultState{}
 	}
+	// A hung operation stays running: like the real worker, its result
+	// polls answer "running" immediately until a cancellation tombstones
+	// the op — the mock never emulates a hang by blocking the poll request.
+	running := m.hangResults ||
+		(m.hangStage == "bootstrap" && isWorkerBootstrapTask(task)) ||
+		(m.hangStage == "capture" && isWorkerEnvCaptureTask(task))
+	if running {
+		m.results[req.Envelope.OpID] = protocol.ResultState{Status: "running"}
+	}
 	// The fixed unpack and pack tasks are answered from their scripted
 	// fields: the unpack echoes the tip, the pack returns the bundle.
 	switch {
+	case running:
 	case isWorkerUnpackTask(task):
 		tip := m.snapshotTip
 		if len(m.snapshotTips) > 0 {
@@ -242,6 +304,32 @@ func (m *mockWorker) handleDispatch(w http.ResponseWriter, r *http.Request) {
 			Status: protocol.ResultCompleted,
 			Result: &protocol.Result{Status: protocol.ResultCompleted, ExitCode: 0, Artifact: m.packArtifact},
 		}
+	case isWorkerBootstrapTask(task), isWorkerEnvCaptureTask(task):
+		result := protocol.Result{
+			Status:   protocol.ResultCompleted,
+			ExitCode: 0,
+			// A default capture the devenv integrity rules accept: one
+			// NUL-terminated record, so a test that only cares about
+			// dispatch shape gets an applied bootstrap.
+			StdoutTail: "PATH=/mock/shims\x00",
+		}
+		if len(m.bootstrapResults) > 0 {
+			result = m.bootstrapResults[0]
+			m.bootstrapResults = m.bootstrapResults[1:]
+		}
+		status := result.Status
+		if status == "" {
+			status = protocol.ResultCompleted
+		}
+		m.results[req.Envelope.OpID] = protocol.ResultState{Status: status, Result: &result}
+	case len(m.ordinaryResults) > 0:
+		result := m.ordinaryResults[0]
+		m.ordinaryResults = m.ordinaryResults[1:]
+		status := result.Status
+		if status == "" {
+			status = protocol.ResultCompleted
+		}
+		m.results[req.Envelope.OpID] = protocol.ResultState{Status: status, Result: &result}
 	case m.completeAll:
 		m.results[req.Envelope.OpID] = protocol.ResultState{
 			Status: protocol.ResultCompleted,
@@ -269,23 +357,67 @@ func (m *mockWorker) handleCancel(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	m.cancels = append(m.cancels, req.Envelope)
+	if m.tombstones == nil {
+		m.tombstones = map[string]bool{}
+	}
+	m.tombstones[req.Envelope.OpID] = true
 	w.Header().Set("Content-Type", "application/json")
 	fmt.Fprint(w, `{"status":"cancelled"}`)
 }
 
 func (m *mockWorker) handleResult(w http.ResponseWriter, r *http.Request) {
+	opID := strings.TrimSuffix(strings.TrimPrefix(r.URL.Path, "/v1/tasks/"), "/result")
+	// A tombstoned operation answers with the verified cancellation the
+	// real worker reports after its process group is empty — an honest
+	// cancellation is observable, not a hang. A running operation answers
+	// "running" immediately, the way the real worker answers a known
+	// operation that has not terminated.
 	m.mu.Lock()
-	defer m.mu.Unlock()
+	if m.results == nil {
+		m.results = map[string]protocol.ResultState{}
+	}
+	tombstoned := m.tombstones[opID]
+	pollDelay := m.pollDelay
+	if tombstoned && m.reconcileFails {
+		// The cancellation landed, but observing the operation afterward
+		// fails: reconciliation that cannot verify termination.
+		m.mu.Unlock()
+		w.WriteHeader(http.StatusServiceUnavailable)
+		fmt.Fprint(w, "reconcile cannot observe the operation")
+		return
+	}
+	if tombstoned && m.results[opID].Result == nil {
+		result := &protocol.Result{Status: protocol.ResultCancelled, ExitCode: -1}
+		if m.liveDescendants > 0 {
+			// The cancellation landed, but the task's process group is not
+			// empty: the observation carries live work, so it proves no
+			// termination.
+			result.LiveDescendants = m.liveDescendants
+		}
+		m.results[opID] = protocol.ResultState{
+			Status: protocol.ResultCancelled,
+			Result: result,
+		}
+	}
 	if m.resultFailures > 0 {
 		m.resultFailures--
+		m.mu.Unlock()
 		w.WriteHeader(http.StatusServiceUnavailable)
 		fmt.Fprint(w, "poll failed transiently")
 		return
 	}
-	opID := strings.TrimSuffix(strings.TrimPrefix(r.URL.Path, "/v1/tasks/"), "/result")
 	state, ok := m.results[opID]
+	m.mu.Unlock()
 	if !ok {
 		http.NotFound(w, r)
+		return
+	}
+	if !tombstoned && state.Status == "running" && pollDelay > 0 {
+		// The poll stays in flight past the caller's liveness bound and
+		// then fails: the bound expires while the poll is outstanding.
+		time.Sleep(pollDelay)
+		w.WriteHeader(http.StatusServiceUnavailable)
+		fmt.Fprint(w, "poll failed while in flight")
 		return
 	}
 	w.Header().Set("Content-Type", "application/json")
@@ -304,6 +436,18 @@ func (m *mockWorker) cancelCount() int {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	return len(m.cancels)
+}
+
+// scriptUnobservedTermination scripts the worker whose cancellation lands
+// but whose task tree is not empty, and whose result poll for a running
+// operation stays in flight for the given delay. The knobs are written
+// under the mock's lock and read under the same lock, so the worker
+// goroutine and the test never race over them.
+func (m *mockWorker) scriptUnobservedTermination(liveDescendants int, pollDelay time.Duration) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.liveDescendants = liveDescendants
+	m.pollDelay = pollDelay
 }
 
 // --- recording activity sink ----------------------------------------------
@@ -515,6 +659,422 @@ func TestStreamErrorChunkIsRedacted(t *testing.T) {
 		if strings.Contains(last.Err.Error(), leaked) {
 			t.Fatalf("error echoed provider payload %q: %v", leaked, last.Err)
 		}
+	}
+}
+
+func TestStreamContentOverBoundIsATerminalError(t *testing.T) {
+	// Every line is individually valid and well under the per-line bound; only
+	// the total the completion would hold crosses the aggregate bound.
+	block := strings.Repeat("c", 1_000_000)
+	// One line more than the bound takes in whole blocks.
+	lines := maxStreamContentBytes/len(block) + 1
+	chunks := make([]string, 0, lines+1)
+	for range lines {
+		chunks = append(chunks, contentChunk(block))
+	}
+	chunks = append(chunks, finishChunk("stop"))
+	gateway, _, cleanup := gatewayFor(gatewayResponse{body: sse(chunks...)})
+	defer cleanup()
+	events, err := gateway.StreamChat(context.Background(), ChatRequest{Model: "m"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	deltas := 0
+	for _, event := range events {
+		switch event.Kind {
+		case KindDelta:
+			deltas++
+		case KindError:
+			if !errors.Is(event.Err, ErrStreamContentOverflow) {
+				t.Fatalf("terminal error = %v, want content overflow", event.Err)
+			}
+			if strings.Contains(event.Err.Error(), block[:64]) {
+				t.Fatalf("error echoed provider content: %v", event.Err)
+			}
+		default:
+			t.Fatalf("unexpected event kind %q", event.Kind)
+		}
+	}
+	if last := events[len(events)-1]; last.Kind != KindError || !errors.Is(last.Err, ErrStreamContentOverflow) {
+		t.Fatalf("terminal event = %+v, want content-overflow error", last)
+	}
+	if deltas == 0 {
+		t.Fatal("deltas accepted before the bound must stay valid events")
+	}
+}
+
+func TestStreamToolArgumentOverBoundYieldsNoToolRequest(t *testing.T) {
+	// One tool call split across fragments: each line is under the per-line
+	// bound and only the assembled arguments cross the aggregate bound.
+	fragment := strings.Repeat("a", 1_000_000)
+	lines := maxStreamToolArgumentBytes/len(fragment) + 1
+	chunks := make([]string, 0, lines+1)
+	for line := 0; line < lines; line++ {
+		id, name := "", ""
+		if line == 0 {
+			id, name = "call-1", "shell"
+		}
+		chunks = append(chunks, toolCallChunk(0, id, name, fragment))
+	}
+	chunks = append(chunks, finishChunk("tool_calls"))
+	gateway, _, cleanup := gatewayFor(gatewayResponse{body: sse(chunks...)})
+	defer cleanup()
+	events, err := gateway.StreamChat(context.Background(), ChatRequest{Model: "m"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, event := range events {
+		if event.Kind == KindToolRequest {
+			t.Fatalf("overflowing stream yielded a partial tool request: %+v", event.Tool)
+		}
+	}
+	if last := events[len(events)-1]; last.Kind != KindError || !errors.Is(last.Err, ErrStreamToolArgumentOverflow) {
+		t.Fatalf("terminal event = %+v, want tool-argument-overflow error", last)
+	}
+}
+
+func TestStreamToolCallCountOverBoundYieldsNoToolRequest(t *testing.T) {
+	// One index past the bound.
+	chunks := make([]string, 0, maxStreamToolCallCount+2)
+	for index := 0; index <= maxStreamToolCallCount; index++ {
+		chunks = append(chunks, toolCallChunk(index, fmt.Sprintf("call-%d", index), "shell", "{}"))
+	}
+	chunks = append(chunks, finishChunk("tool_calls"))
+	gateway, _, cleanup := gatewayFor(gatewayResponse{body: sse(chunks...)})
+	defer cleanup()
+	events, err := gateway.StreamChat(context.Background(), ChatRequest{Model: "m"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, event := range events {
+		if event.Kind == KindToolRequest {
+			t.Fatalf("overflowing stream yielded a partial tool request: %+v", event.Tool)
+		}
+	}
+	if last := events[len(events)-1]; last.Kind != KindError || !errors.Is(last.Err, ErrStreamToolCallOverflow) {
+		t.Fatalf("terminal event = %+v, want tool-call-overflow error", last)
+	}
+}
+
+func TestStreamToolIdentityOverBoundYieldsNoToolRequest(t *testing.T) {
+	// Identity exactly at the bound is accepted, and one byte past it is not.
+	// Every index is distinct so the count bound cannot be what rejects it.
+	id := strings.Repeat("i", maxStreamToolIdentityBytes/(2*maxStreamToolCallCount))
+	name := strings.Repeat("n", maxStreamToolIdentityBytes/(2*maxStreamToolCallCount))
+	chunks := make([]string, 0, maxStreamToolCallCount+2)
+	for index := range maxStreamToolCallCount {
+		chunks = append(chunks, toolCallChunk(index, id, name, "{}"))
+	}
+	chunks = append(chunks, toolCallChunk(0, "", "x", "{}"), finishChunk("tool_calls"))
+	gateway, _, cleanup := gatewayFor(gatewayResponse{body: sse(chunks...)})
+	defer cleanup()
+	events, err := gateway.StreamChat(context.Background(), ChatRequest{Model: "m"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, event := range events {
+		if event.Kind == KindToolRequest {
+			t.Fatalf("overflowing stream yielded a partial tool request: %+v", event.Tool)
+		}
+	}
+	if last := events[len(events)-1]; last.Kind != KindError || !errors.Is(last.Err, ErrStreamToolIdentityOverflow) {
+		t.Fatalf("terminal event = %+v, want tool-identity-overflow error", last)
+	}
+}
+
+func TestStreamEventsOverBoundIsATerminalError(t *testing.T) {
+	// One-byte deltas: the payload bound is nowhere near reached, so only the
+	// retained-event bound can reject this stream.
+	chunks := make([]string, 0, maxStreamEvents+2)
+	for range maxStreamEvents {
+		chunks = append(chunks, contentChunk("x"))
+	}
+	chunks = append(chunks, finishChunk("stop"))
+	gateway, _, cleanup := gatewayFor(gatewayResponse{body: sse(chunks...)})
+	defer cleanup()
+	events, err := gateway.StreamChat(context.Background(), ChatRequest{Model: "m"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The terminal error itself is exempt from the bound: the failure must
+	// still be reported, one event past the cap.
+	if len(events) != maxStreamEvents+1 {
+		t.Fatalf("retained events = %d, want %d plus the exempt terminal error", len(events), maxStreamEvents)
+	}
+	if last := events[len(events)-1]; last.Kind != KindError || !errors.Is(last.Err, ErrStreamEventOverflow) {
+		t.Fatalf("terminal event = %+v, want event-overflow error", last)
+	}
+}
+
+func TestStreamContentAtBoundStillFinalizes(t *testing.T) {
+	block := strings.Repeat("c", 1_000_000)
+	chunks := make([]string, 0, 10)
+	for range 8 {
+		chunks = append(chunks, contentChunk(block))
+	}
+	chunks = append(chunks, contentChunk(strings.Repeat("c", maxStreamContentBytes-8*len(block))), finishChunk("stop"))
+	gateway, _, cleanup := gatewayFor(gatewayResponse{body: sse(chunks...)})
+	defer cleanup()
+	events, err := gateway.StreamChat(context.Background(), ChatRequest{Model: "m"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	held := 0
+	for _, event := range events {
+		switch event.Kind {
+		case KindDelta:
+			held += len(event.Text)
+		case KindFinal:
+		default:
+			t.Fatalf("unexpected event kind %q", event.Kind)
+		}
+	}
+	if last := events[len(events)-1]; last.Kind != KindFinal {
+		t.Fatalf("terminal event = %+v, want final at exactly the content bound", last)
+	}
+	if held != maxStreamContentBytes {
+		t.Fatalf("retained content bytes = %d, want %d", held, maxStreamContentBytes)
+	}
+}
+
+func TestStreamToolArgumentsAtBoundStillEmitRequest(t *testing.T) {
+	fragment := strings.Repeat("a", 1_000_000)
+	tail := strings.Repeat("a", maxStreamToolArgumentBytes-4*len(fragment))
+	gateway, _, cleanup := gatewayFor(gatewayResponse{body: sse(
+		toolCallChunk(0, "call-1", "shell", fragment),
+		toolCallChunk(0, "", "", fragment),
+		toolCallChunk(0, "", "", fragment),
+		toolCallChunk(0, "", "", fragment),
+		toolCallChunk(0, "", "", tail),
+		finishChunk("tool_calls"),
+	)})
+	defer cleanup()
+	events, err := gateway.StreamChat(context.Background(), ChatRequest{Model: "m"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var calls []ToolCall
+	for _, event := range events {
+		switch event.Kind {
+		case KindToolRequest:
+			calls = append(calls, event.Tool)
+		default:
+			t.Fatalf("unexpected event kind %q", event.Kind)
+		}
+	}
+	if len(calls) != 1 {
+		t.Fatalf("tool requests = %d, want 1 at exactly the argument bound", len(calls))
+	}
+	if len(calls[0].Arguments) != maxStreamToolArgumentBytes || calls[0].Name != "shell" {
+		t.Fatalf("assembled tool call = name %q arguments %d bytes", calls[0].Name, len(calls[0].Arguments))
+	}
+}
+
+func TestStreamToolIdentityAtBoundStillEmitsRequests(t *testing.T) {
+	// Every index at once spends exactly the identity budget; the requests
+	// must still be assembled and emitted with identity intact.
+	half := maxStreamToolIdentityBytes / (2 * maxStreamToolCallCount)
+	id := strings.Repeat("i", half)
+	name := strings.Repeat("n", half)
+	chunks := make([]string, 0, maxStreamToolCallCount+1)
+	for index := range maxStreamToolCallCount {
+		chunks = append(chunks, toolCallChunk(index, id, name, "{}"))
+	}
+	chunks = append(chunks, finishChunk("tool_calls"))
+	gateway, _, cleanup := gatewayFor(gatewayResponse{body: sse(chunks...)})
+	defer cleanup()
+	events, err := gateway.StreamChat(context.Background(), ChatRequest{Model: "m"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	calls := 0
+	for _, event := range events {
+		switch event.Kind {
+		case KindToolRequest:
+			calls++
+			if event.Tool.ID != id || event.Tool.Name != name {
+				t.Fatalf("assembled identity = id %q name %q, want the sent identity", event.Tool.ID, event.Tool.Name)
+			}
+		default:
+			t.Fatalf("unexpected event kind %q", event.Kind)
+		}
+	}
+	if calls != maxStreamToolCallCount {
+		t.Fatalf("tool requests = %d, want %d at exactly the identity bound", calls, maxStreamToolCallCount)
+	}
+}
+
+func TestStreamEventsAtBoundStillFinalizes(t *testing.T) {
+	chunks := make([]string, 0, maxStreamEvents+1)
+	for range maxStreamEvents - 1 {
+		chunks = append(chunks, contentChunk("x"))
+	}
+	chunks = append(chunks, finishChunk("stop"))
+	gateway, _, cleanup := gatewayFor(gatewayResponse{body: sse(chunks...)})
+	defer cleanup()
+	events, err := gateway.StreamChat(context.Background(), ChatRequest{Model: "m"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(events) != maxStreamEvents {
+		t.Fatalf("retained events = %d, want exactly the bound", len(events))
+	}
+	if last := events[len(events)-1]; last.Kind != KindFinal {
+		t.Fatalf("terminal event = %+v, want final at exactly the event bound", last)
+	}
+}
+
+func TestStreamEventsOverflowDuringToolEmissionYieldsNoToolRequest(t *testing.T) {
+	// One slot of event capacity left and two complete tool calls to emit:
+	// the set is emitted atomically or not at all, so the overflow must
+	// reject the whole request set, never retain the request that fits.
+	chunks := make([]string, 0, maxStreamEvents+3)
+	for range maxStreamEvents - 1 {
+		chunks = append(chunks, contentChunk("x"))
+	}
+	chunks = append(chunks,
+		toolCallChunk(0, "call-1", "shell", "{}"),
+		toolCallChunk(1, "call-2", "shell", "{}"),
+		finishChunk("tool_calls"),
+	)
+	gateway, _, cleanup := gatewayFor(gatewayResponse{body: sse(chunks...)})
+	defer cleanup()
+	events, err := gateway.StreamChat(context.Background(), ChatRequest{Model: "m"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, event := range events {
+		if event.Kind == KindToolRequest {
+			t.Fatalf("overflowing stream yielded a partial tool request: %+v", event.Tool)
+		}
+	}
+	if last := events[len(events)-1]; last.Kind != KindError || !errors.Is(last.Err, ErrStreamEventOverflow) {
+		t.Fatalf("terminal event = %+v, want event-overflow error", last)
+	}
+}
+
+func TestStreamEventsAtBoundStillEmitsToolRequests(t *testing.T) {
+	// The request set exactly fills the event bound: the preflight must not
+	// reject a set that fits, or the bound is off by one.
+	chunks := make([]string, 0, maxStreamEvents+3)
+	for range maxStreamEvents - 2 {
+		chunks = append(chunks, contentChunk("x"))
+	}
+	chunks = append(chunks,
+		toolCallChunk(0, "call-1", "shell", "{}"),
+		toolCallChunk(1, "call-2", "shell", "{}"),
+		finishChunk("tool_calls"),
+	)
+	gateway, _, cleanup := gatewayFor(gatewayResponse{body: sse(chunks...)})
+	defer cleanup()
+	events, err := gateway.StreamChat(context.Background(), ChatRequest{Model: "m"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(events) != maxStreamEvents {
+		t.Fatalf("retained events = %d, want exactly the bound", len(events))
+	}
+	calls := 0
+	for _, event := range events {
+		switch event.Kind {
+		case KindDelta:
+		case KindToolRequest:
+			calls++
+		default:
+			t.Fatalf("unexpected event kind %q", event.Kind)
+		}
+	}
+	if calls != 2 {
+		t.Fatalf("tool requests = %d, want 2 at exactly the event bound", calls)
+	}
+}
+
+func TestStreamIncompleteToolRequestYieldsNoToolRequest(t *testing.T) {
+	// One complete call and one missing its name: every fragment is checked
+	// before any request is emitted, so the incomplete set yields no
+	// executable request beside the terminal error.
+	gateway, _, cleanup := gatewayFor(gatewayResponse{body: sse(
+		toolCallChunk(0, "call-1", "shell", "{}"),
+		toolCallChunk(1, "call-2", "", "{}"),
+		finishChunk("tool_calls"),
+	)})
+	defer cleanup()
+	events, err := gateway.StreamChat(context.Background(), ChatRequest{Model: "m"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, event := range events {
+		if event.Kind == KindToolRequest {
+			t.Fatalf("incomplete request set yielded an executable tool request: %+v", event.Tool)
+		}
+	}
+	if last := events[len(events)-1]; last.Kind != KindError || !strings.Contains(last.Err.Error(), "incomplete tool request") {
+		t.Fatalf("terminal event = %+v, want incomplete-request error", last)
+	}
+}
+
+func TestStreamUnderBoundContentStillFinalizes(t *testing.T) {
+	// Ordinary traffic is well inside the aggregate bounds; the bounds are
+	// not trip-wires on a normal completion.
+	block := strings.Repeat("x", 128*1024)
+	gateway, _, cleanup := gatewayFor(gatewayResponse{body: sse(
+		contentChunk(block),
+		contentChunk(block),
+		contentChunk(block),
+		contentChunk(block),
+		finishChunk("stop"),
+	)})
+	defer cleanup()
+	events, err := gateway.StreamChat(context.Background(), ChatRequest{Model: "m"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var text strings.Builder
+	for _, event := range events {
+		switch event.Kind {
+		case KindDelta:
+			text.WriteString(event.Text)
+		case KindFinal:
+		default:
+			t.Fatalf("unexpected event kind %q", event.Kind)
+		}
+	}
+	if last := events[len(events)-1]; last.Kind != KindFinal {
+		t.Fatalf("terminal event = %+v, want final", last)
+	}
+	if text.String() != strings.Repeat("x", 4*128*1024) {
+		t.Fatalf("assembled content length = %d, want %d", text.Len(), 4*128*1024)
+	}
+}
+
+func TestStreamUnderBoundToolArgumentsStillEmitRequest(t *testing.T) {
+	fragment := strings.Repeat("y", 64*1024)
+	gateway, _, cleanup := gatewayFor(gatewayResponse{body: sse(
+		toolCallChunk(0, "call-1", "shell", fragment),
+		toolCallChunk(0, "", "", fragment),
+		toolCallChunk(0, "", "", fragment),
+		toolCallChunk(0, "", "", fragment),
+		finishChunk("tool_calls"),
+	)})
+	defer cleanup()
+	events, err := gateway.StreamChat(context.Background(), ChatRequest{Model: "m"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var calls []ToolCall
+	for _, event := range events {
+		switch event.Kind {
+		case KindToolRequest:
+			calls = append(calls, event.Tool)
+		default:
+			t.Fatalf("unexpected event kind %q", event.Kind)
+		}
+	}
+	if len(calls) != 1 {
+		t.Fatalf("tool requests = %d, want 1", len(calls))
+	}
+	if calls[0].Name != "shell" || calls[0].ID != "call-1" || calls[0].Arguments != strings.Repeat("y", 4*64*1024) {
+		t.Fatalf("assembled tool call = name %q id %q arguments %d bytes", calls[0].Name, calls[0].ID, len(calls[0].Arguments))
 	}
 }
 
@@ -789,6 +1349,200 @@ func TestAmbiguousDispatchReconcilesWithoutRedelivery(t *testing.T) {
 	}
 	if got := worker.cancelCount(); got != 1 {
 		t.Fatalf("worker cancels = %d, want the reconciling cancel", got)
+	}
+}
+
+// --- acceptance: an unobserved termination is an unverified termination -----
+
+// TestDispatchAndAwaitUnobservedTerminationIsUnverified pins the #414
+// review invariant at the unit level: a reconciliation whose OBSERVED state
+// does not prove termination — the worker's task tree still holds live work
+// — is an unverified termination, never a settled outcome. The error must
+// carry ErrTerminationUnverified, the worker must be fenced against every
+// further dispatch, and the operation's active-operation entry must stay
+// retained, because an operation that may still be executing is never
+// claimed cleared.
+//
+// The mock's shape is the one the real worker cannot produce by itself: the
+// real worker refuses a cancellation whose task tree outlived it (a 500 on
+// the cancel, which the reconciliation reports as a failure), so the
+// "live work in the task tree" observation is defence in depth. It is
+// scripted here so the state-based check is pinned rather than only the
+// failure-based one.
+func TestDispatchAndAwaitUnobservedTerminationIsUnverified(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		// prepare scripts the worker and returns the caller's context, so
+		// the reconciliation observes live work in the task tree.
+		prepare func(worker *mockWorker) (context.Context, context.CancelFunc)
+		// wantDispatches pins the path the case exercises: the ambiguous
+		// dispatch never reaches the worker, the in-flight poll failure
+		// happens after the task was accepted.
+		wantDispatches int
+	}{
+		{
+			name: "ambiguous dispatch",
+			prepare: func(worker *mockWorker) (context.Context, context.CancelFunc) {
+				// The dispatch fails ambiguously: the worker may have
+				// accepted the task, so control reconciles through
+				// cancellation instead of redelivering.
+				worker.dispatchPlan = []int{http.StatusServiceUnavailable}
+				worker.scriptUnobservedTermination(3, 0)
+				return context.WithCancel(context.Background())
+			},
+			wantDispatches: 0,
+		},
+		{
+			name: "in-flight poll failure",
+			prepare: func(worker *mockWorker) (context.Context, context.CancelFunc) {
+				// The operation keeps running and its poll stays in flight
+				// past the caller's bound, so the poll-failure path — not
+				// the poll wait — is the one that reconciles.
+				worker.hangResults = true
+				worker.scriptUnobservedTermination(3, 750*time.Millisecond)
+				return context.WithTimeout(context.Background(), 250*time.Millisecond)
+			},
+			wantDispatches: 1,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			worker, delegator, cleanupWorker := testWorkerAndDelegator(t)
+			defer cleanupWorker()
+			ctx, cancel := tc.prepare(worker)
+			defer cancel()
+
+			transport := &recordingTransport{}
+			coordinator, err := NewCoordinator(CoordinatorConfig{
+				Gateway:  &Gateway{BaseURL: "http://unused.invalid"},
+				Bindings: testBindings(),
+				Worker:   delegator,
+				Status:   NewStatusReporter(transport, "control-uid", "worker-uid", 0),
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			_, err = coordinator.dispatchAndAwait(ctx, "op-1", "b1", protocol.Task{Command: []string{"true"}})
+			if !errors.Is(err, ErrTerminationUnverified) {
+				t.Fatalf("dispatchAndAwait() error = %v, want ErrTerminationUnverified in its chain", err)
+			}
+			// The case exercised the path it scripted: the ambiguous
+			// dispatch never reached the worker, the in-flight poll failure
+			// happened after the task was accepted.
+			if got := worker.dispatchCount(); got != tc.wantDispatches {
+				t.Fatalf("worker dispatches = %d, want %d — the case must exercise the path it scripts", got, tc.wantDispatches)
+			}
+			// The worker is fenced: no further dispatch may run against it.
+			dispatches := worker.dispatchCount()
+			_, err = coordinator.dispatchAndAwait(context.Background(), "op-2", "b1", protocol.Task{Command: []string{"true"}})
+			if err == nil || !strings.Contains(err.Error(), "fenced") {
+				t.Fatalf("post-fence dispatch error = %v, want the worker fence rejection", err)
+			}
+			if got := worker.dispatchCount(); got != dispatches {
+				t.Fatalf("worker dispatches after fence = %d, want %d — the fence must refuse every dispatch", got, dispatches)
+			}
+			// The active-operation entry is retained: it was begun, and
+			// nothing cleared it.
+			transport.mu.Lock()
+			adds, clears := 0, 0
+			for _, p := range transport.patches {
+				if p.AddOperation != nil {
+					adds++
+				}
+				if p.ClearOperation != "" {
+					clears++
+				}
+			}
+			transport.mu.Unlock()
+			if adds == 0 {
+				t.Fatalf("status patches record no begun operation, want the dispatch evidence retained")
+			}
+			if clears != 0 {
+				t.Fatalf("status patches record %d cleared operations, want none — an operation that may still be executing is never claimed cleared", clears)
+			}
+		})
+	}
+}
+
+// TestDispatchAndAwaitTerminalLiveDescendantsFencesTheWorker pins the #414
+// review invariant for the ORDINARY terminal-result path: an operation whose
+// terminal observation still carries live descendants is an unverified
+// termination for EVERY caller of dispatchAndAwait, not only the bootstrap
+// stage that re-fences on the sentinel it receives. The error carries
+// ErrTerminationUnverified, the operation's active-operation entry stays
+// retained, and the worker is fenced: the next dispatch is rejected before
+// it reaches the worker, because descendants of the ended task may still be
+// executing repository-authored work.
+//
+// The mock scripts the shape directly — a terminal status whose result still
+// carries live descendants (the real worker produces it when an unaccounted
+// writer outlives the group-empty grace) — so the state-based invariant is
+// pinned deterministically rather than only through the reconcile-failure
+// variants.
+func TestDispatchAndAwaitTerminalLiveDescendantsFencesTheWorker(t *testing.T) {
+	worker, delegator, cleanupWorker := testWorkerAndDelegator(t)
+	defer cleanupWorker()
+	worker.ordinaryResults = []protocol.Result{{
+		Status:     protocol.ResultCompleted,
+		ExitCode:   0,
+		StdoutTail: "background work continued past the task",
+		// The task's process group is not empty: the terminal observation
+		// carries live work, so it proves no termination.
+		LiveDescendants: 2,
+	}}
+
+	transport := &recordingTransport{}
+	coordinator, err := NewCoordinator(CoordinatorConfig{
+		Gateway:  &Gateway{BaseURL: "http://unused.invalid"},
+		Bindings: testBindings(),
+		Worker:   delegator,
+		Status:   NewStatusReporter(transport, "control-uid", "worker-uid", 0),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	_, err = coordinator.dispatchAndAwait(context.Background(), "op-1", "b1", protocol.Task{Command: []string{"true"}})
+	if !errors.Is(err, ErrTerminationUnverified) {
+		t.Fatalf("dispatchAndAwait() error = %v, want ErrTerminationUnverified in its chain", err)
+	}
+	// The task reached the worker exactly once and was never cancelled: the
+	// ending was observed on the poll path, not reconciled.
+	if got := worker.dispatchCount(); got != 1 {
+		t.Fatalf("worker dispatches = %d, want 1", got)
+	}
+	if got := worker.cancelCount(); got != 0 {
+		t.Fatalf("worker cancels = %d, want 0 — the case must exercise the poll path, not a reconciliation", got)
+	}
+	// The active-operation entry is retained: it was begun, and nothing
+	// cleared it — an operation that may still be executing is never
+	// claimed cleared.
+	transport.mu.Lock()
+	adds, clears := 0, 0
+	for _, p := range transport.patches {
+		if p.AddOperation != nil {
+			adds++
+		}
+		if p.ClearOperation != "" {
+			clears++
+		}
+	}
+	transport.mu.Unlock()
+	if adds == 0 {
+		t.Fatalf("status patches record no begun operation, want the dispatch evidence retained")
+	}
+	if clears != 0 {
+		t.Fatalf("status patches record %d cleared operations, want none — an operation that may still be executing is never claimed cleared", clears)
+	}
+	// The worker fence rejects the next dispatch without any further task
+	// reaching the worker.
+	dispatches := worker.dispatchCount()
+	_, err = coordinator.dispatchAndAwait(context.Background(), "op-2", "b1", protocol.Task{Command: []string{"true"}})
+	if err == nil || !strings.Contains(err.Error(), "fenced") {
+		t.Fatalf("post-fence dispatch error = %v, want the worker fence rejection", err)
+	}
+	if got := worker.dispatchCount(); got != dispatches {
+		t.Fatalf("worker dispatches after fence = %d, want %d — the fence must refuse every dispatch", got, dispatches)
 	}
 }
 

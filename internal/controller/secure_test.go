@@ -819,7 +819,7 @@ func TestLaunchSecureAppliesLaneResources(t *testing.T) {
 		ObjectMeta: metav1.ObjectMeta{Namespace: secureTestNamespace, Name: "sized"},
 		Spec: courier.LaneProfileSpec{
 			Roles: map[string]string{"coordinator": "test/coordinator", "coder": "test/coder"},
-			Resources: corev1.ResourceRequirements{
+			Resources: courier.PodResources{
 				Requests: corev1.ResourceList{
 					corev1.ResourceCPU:    resource.MustParse("750m"),
 					corev1.ResourceMemory: resource.MustParse("1Gi"),
@@ -859,7 +859,7 @@ func TestLaunchSecureAppliesLaneResources(t *testing.T) {
 // created, not cycle claim/release and not leave pod creation to surface an
 // opaque API-server rejection mid-provisioning.
 func TestLaunchSecureRejectsUnlaunchableLaneSizing(t *testing.T) {
-	cases := map[string]corev1.ResourceRequirements{
+	cases := map[string]courier.PodResources{
 		"zero memory limit": {Limits: corev1.ResourceList{
 			corev1.ResourceMemory: resource.MustParse("0"),
 		}},
@@ -1301,7 +1301,7 @@ func TestProbePodsAreExcludedFromWorkloadLookups(t *testing.T) {
 	}
 	// A leftover probe pod from a crashed preflight pass: worker labels, but
 	// marked as a probe.
-	probe := topology.ProbePod(run, "node-a", "busybox:test", "true", courier.DefaultPodResources())
+	probe := topology.ProbePod(run, "node-a", "busybox:test", "true")
 	if probe.Labels[topology.LabelProbe] != "true" {
 		t.Fatal("probe pods must carry the probe label")
 	}
@@ -1333,11 +1333,11 @@ func TestProbeCoverageIsIncompleteWithoutEveryNode(t *testing.T) {
 	// Two eligible nodes; only node-a produced a complete result set (two
 	// checks), node-b's probe crashed without a readable result.
 	for _, node := range []string{"node-a", "node-b"} {
-		if err := c.Create(context.Background(), topology.ProbePod(run, node, "busybox:test", "true", courier.DefaultPodResources())); err != nil {
+		if err := c.Create(context.Background(), topology.ProbePod(run, node, "busybox:test", "true")); err != nil {
 			t.Fatal(err)
 		}
 	}
-	a := topology.ProbePod(run, "node-a", "busybox:test", "true", courier.DefaultPodResources())
+	a := topology.ProbePod(run, "node-a", "busybox:test", "true")
 	a.Status.Phase = corev1.PodSucceeded
 	a.Status.ContainerStatuses = []corev1.ContainerStatus{{
 		Name:  "probe",
@@ -1346,7 +1346,7 @@ func TestProbeCoverageIsIncompleteWithoutEveryNode(t *testing.T) {
 	if err := c.Status().Update(context.Background(), a); err != nil {
 		t.Fatal(err)
 	}
-	b := topology.ProbePod(run, "node-b", "busybox:test", "true", courier.DefaultPodResources())
+	b := topology.ProbePod(run, "node-b", "busybox:test", "true")
 	b.Status.Phase = corev1.PodFailed
 	b.Status.ContainerStatuses = []corev1.ContainerStatus{{
 		Name:  "probe",
@@ -1355,7 +1355,7 @@ func TestProbeCoverageIsIncompleteWithoutEveryNode(t *testing.T) {
 	if err := c.Status().Update(context.Background(), b); err != nil {
 		t.Fatal(err)
 	}
-	_, pending, err := control.collectProbeResults(context.Background(), run, []string{"node-a", "node-b"}, 2, courier.DefaultPodResources())
+	_, pending, err := control.collectProbeResults(context.Background(), run, []string{"node-a", "node-b"}, 2)
 	if err == nil {
 		t.Fatal("incomplete probe coverage must not be treated as evidence")
 	}
@@ -1463,7 +1463,7 @@ func TestLiveProbePodsStaySeparatePerNode(t *testing.T) {
 			second: denyResults(checks...),
 		})
 
-		if err := control.runLiveProbes(context.Background(), run, nil, courier.DefaultPodResources()); err != nil {
+		if err := control.runLiveProbes(context.Background(), run, nil); err != nil {
 			t.Fatalf("runLiveProbes: %v", err)
 		}
 		if len(created) != 2 {
@@ -1473,7 +1473,7 @@ func TestLiveProbePodsStaySeparatePerNode(t *testing.T) {
 			t.Fatalf("nodes %q and %q shared probe pod %q", first, second, created[first])
 		}
 		for _, node := range []string{first, second} {
-			want := topology.ProbePod(run, node, control.Config.ProbeImage, "true", courier.DefaultPodResources()).Name
+			want := topology.ProbePod(run, node, control.Config.ProbeImage, "true").Name
 			if created[node] != want {
 				t.Errorf("node %q got probe pod %q, want the one its own name derives: %q", node, created[node], want)
 			}
@@ -1497,7 +1497,7 @@ func TestLiveProbePodsStaySeparatePerNode(t *testing.T) {
 			second: denyResults(checks...),
 		})
 
-		err := control.runLiveProbes(context.Background(), run, nil, courier.DefaultPodResources())
+		err := control.runLiveProbes(context.Background(), run, nil)
 		if err == nil {
 			t.Fatal("an incomplete result set for one node must not pass the whole pass")
 		}
@@ -1510,7 +1510,9 @@ func TestLiveProbePodsStaySeparatePerNode(t *testing.T) {
 // TestProbeResultsRefuseAnotherNodesPod pins the check that a probe pod's name
 // alone cannot make: the pod a name resolves to must be pinned to the node
 // under test. A collision, or a pod bound elsewhere, says nothing about that
-// node's isolation, so its results are refused rather than counted.
+// node's isolation, so its results are refused rather than counted — and
+// terminally (#449): the mismatch's persistent causes outlast a requeue, and
+// the read cannot tell them from a stray pod a later pass would clear.
 func TestProbeResultsRefuseAnotherNodesPod(t *testing.T) {
 	control, c := secureControl(t)
 	run := secureRun("probe-elsewhere")
@@ -1518,7 +1520,7 @@ func TestProbeResultsRefuseAnotherNodesPod(t *testing.T) {
 		t.Fatal(err)
 	}
 	// A complete, passing result set — from a pod that never ran on node-a.
-	pod := topology.ProbePod(run, "node-a", "busybox:test", "true", courier.DefaultPodResources())
+	pod := topology.ProbePod(run, "node-a", "busybox:test", "true")
 	pod.Spec.NodeName = "node-b"
 	if err := c.Create(context.Background(), pod); err != nil {
 		t.Fatal(err)
@@ -1534,18 +1536,47 @@ func TestProbeResultsRefuseAnotherNodesPod(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	outcomes, pending, err := control.collectProbeResults(context.Background(), run, []string{"node-a"}, 2, courier.DefaultPodResources())
+	outcomes, pending, err := control.collectProbeResults(context.Background(), run, []string{"node-a"}, 2)
 	if err == nil {
 		t.Fatal("a probe running on another node must not be counted as this node's result")
 	}
-	if !strings.Contains(err.Error(), pod.Name) || !strings.Contains(err.Error(), "node-b") {
-		t.Fatalf("error = %v, want it to name probe %q and the node it is scheduled on", err, pod.Name)
+	var permanent *SecureNeedsHumanError
+	if !errors.As(err, &permanent) || permanent.Reason != "ProbeIdentity" {
+		t.Fatalf("error = %v, want a terminal *SecureNeedsHumanError reason ProbeIdentity", err)
+	}
+	if !strings.Contains(permanent.Detail, pod.Name) ||
+		!strings.Contains(permanent.Detail, "scheduled on node node-b, not node-a") {
+		t.Fatalf("detail = %q, want it to name probe %q, the node it is pinned to, and the node under test",
+			permanent.Detail, pod.Name)
 	}
 	if pending {
 		t.Fatal("a terminal probe is not pending; it was refused")
 	}
 	if len(outcomes) > 0 {
 		t.Fatalf("a refused probe must contribute no outcomes, got %v", outcomes)
+	}
+}
+
+// TestTerminalPreflightVerdictClassifications pins the launch paths'
+// terminalization predicate itself: the probe-identity refusal joins
+// PodAdmission as a terminal verdict, and every other secure-preflight reason
+// keeps its claim/release requeue (#449).
+func TestTerminalPreflightVerdictClassifications(t *testing.T) {
+	terminal := map[string]bool{
+		"PodAdmission":  true,
+		"ProbeIdentity": true,
+	}
+	for _, reason := range []string{
+		"PodAdmission", "ProbeIdentity",
+		"PodSecurity", "OperatorRBAC", "BrokerRBAC", "AdmissionBroken",
+		"IsolationBroken", "RunNamespace", "ProviderSelection",
+	} {
+		if got := terminalPreflightVerdict(secureNeedsHuman(reason, "synthetic %s", reason)) != nil; got != terminal[reason] {
+			t.Errorf("reason %q terminalizes = %v, want %v", reason, got, terminal[reason])
+		}
+	}
+	if terminalPreflightVerdict(errors.New("ordinary preflight failure")) != nil {
+		t.Error("an ordinary error must not terminalize")
 	}
 }
 

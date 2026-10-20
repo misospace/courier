@@ -8,6 +8,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/misospace/courier/internal/devenv"
 	"github.com/misospace/courier/internal/executor"
 	couriergit "github.com/misospace/courier/internal/git"
 )
@@ -26,6 +27,11 @@ type Snapshot struct {
 	Tip string
 	// BaseTip is the pinned base ref's tip at snapshot time.
 	BaseTip string
+	// ContractState is the development-bootstrap contract's state at the
+	// snapshot tip relative to the base tip (#414). Trusted control computes
+	// it from its own tree with pure git reads before any dispatch; it is
+	// never a claim from the model or the worker.
+	ContractState devenv.State
 }
 
 type SnapshotProvider func(context.Context) (Snapshot, error)
@@ -110,7 +116,11 @@ func (e *PublicationEngine) seed(ctx context.Context) (Snapshot, error) {
 	// The seed is the world at incarnation start: nothing this
 	// incarnation published is confirmed yet.
 	e.lastConfirmed = ""
-	return Snapshot{Data: snap.Data, Tip: tip, BaseTip: e.tree.BaseTip()}, nil
+	// The seed snapshot dispatches too, so it carries the contract state
+	// the same way a rendered snapshot does (#414): the first dispatch of
+	// an incarnation is the one that must bootstrap the workspace.
+	state := e.tree.ContractState(ctx, tip)
+	return Snapshot{Data: snap.Data, Tip: tip, BaseTip: e.tree.BaseTip(), ContractState: state}, nil
 }
 
 // WorkRefBeyondAnchor reports the broker's live observation of the pinned

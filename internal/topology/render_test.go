@@ -269,8 +269,9 @@ func configuredResources() corev1.ResourceRequirements {
 	}
 }
 
-// renderEveryPod builds all four rendered pods with one sizing value, keyed by
-// container name.
+// renderEveryPod builds the three lane-sized rendered pods with one sizing
+// value, keyed by container name. Probe pods are deliberately absent: their
+// sizing is fixed, not the lane's, and has its own tests below.
 func renderEveryPod(t *testing.T, run *courier.CoderRun, resources corev1.ResourceRequirements) map[string]*corev1.Pod {
 	t.Helper()
 	pub, _, err := protocol.GenerateKey()
@@ -301,12 +302,12 @@ func renderEveryPod(t *testing.T, run *courier.CoderRun, resources corev1.Resour
 		WorkerContainerName:  worker,
 		ControlContainerName: control,
 		BrokerContainerName:  broker,
-		"probe":              ProbePod(run, "node-a", "busybox:test", "true", resources),
 	}
 }
 
 // TestConfiguredLaneResourcesReachEveryPod pins that the lane's sizing is the
-// sizing of every pod, not just the coordinator's.
+// sizing of every lane-sized pod — worker, control, and broker — not just the
+// coordinator's. Probe pods are the deliberate exception, tested separately.
 func TestConfiguredLaneResourcesReachEveryPod(t *testing.T) {
 	run := testRun("resources-configured")
 	want := configuredResources()
@@ -358,6 +359,70 @@ func TestPartialLaneResourcesAreFloored(t *testing.T) {
 		if len(resources.Limits) != 0 {
 			t.Fatalf("%s container limits = %+v, want none: omitting limits is the lane's choice", container, resources.Limits)
 		}
+	}
+}
+
+// TestProbePodSizingIsFixed pins the #402 decision: a probe pod carries the
+// fixed small probe sizing, not the lane's. Its requests stay finite so a
+// probe is never BestEffort, and its limits stay fixed too — a ResourceQuota
+// tracking limits.cpu or limits.memory rejects a container missing the
+// matching limit, so a requests-only probe would be denied Forbidden on such
+// namespaces and preflight would requeue on it forever.
+func TestProbePodSizingIsFixed(t *testing.T) {
+	run := testRun("resources-probe")
+	pod := ProbePod(run, "node-a", "busybox:test", "true")
+	got := pod.Spec.Containers[0].Resources
+	if want := courier.ProbePodResources(); !reflect.DeepEqual(got, want) {
+		t.Fatalf("probe container resources = %+v, want the fixed probe sizing %+v", got, want)
+	}
+	for _, key := range []corev1.ResourceName{corev1.ResourceCPU, corev1.ResourceMemory} {
+		quantity, ok := got.Requests[key]
+		if !ok || quantity.IsZero() {
+			t.Fatalf("probe container carries no finite %s request: %+v", key, got)
+		}
+		limit, ok := got.Limits[key]
+		if !ok || limit.IsZero() {
+			t.Fatalf("probe container carries no finite %s limit: a quota tracking limits.%s would reject it", key, key)
+		}
+		if quantity.Cmp(limit) > 0 {
+			t.Fatalf("probe container %s request %v exceeds its limit %v; the API server would reject the pod", key, quantity, limit)
+		}
+	}
+}
+
+// TestProbePodSizingIgnoresTheLane pins the deliberate #402 exception: probe
+// sizing is never the lane's or the built-in default, because preflight
+// creates one probe per eligible node simultaneously and lane-scale
+// reservations there can leave probes Pending on a request-tight cluster.
+// The bound assertions, not just the inequality checks, are the regression
+// guard: a probe regressing to the default *requests* would dodge an
+// exact-equality check while reintroducing exactly the per-node reservation
+// that wedged preflight; its limits are bounded below the default limits for
+// the same reason — a probe charging 2 CPU/4Gi of limits against a quota is
+// lane-scale by the back door.
+func TestProbePodSizingIgnoresTheLane(t *testing.T) {
+	run := testRun("resources-probe-lane")
+	pod := ProbePod(run, "node-a", "busybox:test", "true")
+	got := pod.Spec.Containers[0].Resources
+	if reflect.DeepEqual(got, courier.DefaultPodResources()) {
+		t.Fatal("probe container carries the built-in default sizing; probes must not reserve lane-scale capacity")
+	}
+	if reflect.DeepEqual(got, courier.EffectivePodResources(configuredResources())) {
+		t.Fatal("probe container carries the lane's sizing; probes must not reserve lane-scale capacity")
+	}
+	floor := courier.DefaultPodResources().Requests
+	if got.Requests.Cpu().Cmp(*floor.Cpu()) >= 0 {
+		t.Fatalf("probe requests cpu = %v, want strictly below the default floor %v", got.Requests.Cpu(), floor.Cpu())
+	}
+	if got.Requests.Memory().Cmp(*floor.Memory()) >= 0 {
+		t.Fatalf("probe requests memory = %v, want strictly below the default floor %v", got.Requests.Memory(), floor.Memory())
+	}
+	defaultLimits := courier.DefaultPodResources().Limits
+	if got.Limits.Cpu().Cmp(*defaultLimits.Cpu()) >= 0 {
+		t.Fatalf("probe limits cpu = %v, want strictly below the default limit %v", got.Limits.Cpu(), defaultLimits.Cpu())
+	}
+	if got.Limits.Memory().Cmp(*defaultLimits.Memory()) >= 0 {
+		t.Fatalf("probe limits memory = %v, want strictly below the default limit %v", got.Limits.Memory(), defaultLimits.Memory())
 	}
 }
 
@@ -575,8 +640,8 @@ func TestProbePodNamesAreUniquePerNode(t *testing.T) {
 		run := testRun(runName)
 		seen := map[string]string{}
 		for _, node := range nodes {
-			name := ProbePod(run, node, "busybox:test", "true", configuredResources()).Name
-			if again := ProbePod(run, node, "busybox:test", "true", configuredResources()).Name; again != name {
+			name := ProbePod(run, node, "busybox:test", "true").Name
+			if again := ProbePod(run, node, "busybox:test", "true").Name; again != name {
 				t.Errorf("probe pod name for node %q is not deterministic: %q then %q", node, name, again)
 			}
 			if errs := validation.IsDNS1123Subdomain(name); len(errs) > 0 {

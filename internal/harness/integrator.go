@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"strings"
 
+	"github.com/misospace/courier/internal/devenv"
 	couriergit "github.com/misospace/courier/internal/git"
 )
 
@@ -174,6 +175,33 @@ func (t *Integrator) Head(ctx context.Context) (string, error) {
 	return couriergit.HeadOID(ctx, t.Dir)
 }
 
+// ContractState compares the development-bootstrap contract at tip against
+// the base tip (#414): approved when the contract matches the one the base
+// approved, modified when it diverged, absent when the tip does not carry
+// it. Both tips are resolved objects in this tree, so the comparison is pure
+// git reads — the contract state is trusted control's own observation, never
+// a claim from the model or the worker.
+func (t *Integrator) ContractState(ctx context.Context, tip string) devenv.State {
+	if t.baseTip == "" {
+		return devenv.StateAbsent
+	}
+	state, err := devenv.Classify(ctx, t.blobRead, t.baseTip, tip)
+	if err != nil {
+		// A read failure is also modified: unprovable content is never
+		// executed, and a transient git hiccup must not fail the whole
+		// snapshot preparation, only the bootstrap it gates.
+		return devenv.StateModified
+	}
+	return state
+}
+
+// blobRead adapts the hardened regular-blob read to the devenv classification
+// read: bytes, regular-blob flag (never a symlink or gitlink), and presence,
+// with read errors kept errors rather than folded into absence.
+func (t *Integrator) blobRead(ctx context.Context, revision, path string) ([]byte, bool, bool, error) {
+	return couriergit.BlobAtRegular(ctx, t.Dir, revision, path)
+}
+
 // Render produces the sanitized snapshot bundle for the next dispatch from
 // the current integration head. The snapshot is control-authored: its single
 // ref is the fixed snapshot work ref the worker's unpack fetches.
@@ -205,7 +233,8 @@ func (t *Integrator) Render(ctx context.Context) (Snapshot, error) {
 	if err != nil {
 		return Snapshot{}, fmt.Errorf("harness: snapshot read failed: %w", err)
 	}
-	return Snapshot{Data: data, Tip: head, BaseTip: t.baseTip}, nil
+	state := t.ContractState(ctx, head)
+	return Snapshot{Data: data, Tip: head, BaseTip: t.baseTip, ContractState: state}, nil
 }
 
 // RefreshBase imports a fresh base tip (and its objects) from a newly

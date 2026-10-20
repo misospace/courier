@@ -144,7 +144,7 @@ func TestLegacyObserverContainersCarryBoundedSizing(t *testing.T) {
 		"lane configures nothing": {ObjectMeta: metav1.ObjectMeta{Name: "local"}, Spec: courierv1alpha1.LaneProfileSpec{Roles: map[string]string{"coordinator": "model"}}},
 		"lane configures sizing": {ObjectMeta: metav1.ObjectMeta{Name: "local"}, Spec: courierv1alpha1.LaneProfileSpec{
 			Roles: map[string]string{"coordinator": "model"},
-			Resources: corev1.ResourceRequirements{
+			Resources: courierv1alpha1.PodResources{
 				Requests: corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("1500m"), corev1.ResourceMemory: resource.MustParse("3Gi")},
 				Limits:   corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("6"), corev1.ResourceMemory: resource.MustParse("12Gi")},
 			},

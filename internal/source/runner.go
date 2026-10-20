@@ -30,6 +30,37 @@ var (
 
 const defaultPollInterval = 30 * time.Second
 
+// A failed hand-out acknowledgement is retried a bounded number of times
+// within the poll that materialized the run, because a lost ack otherwise
+// waits on the settlement report or the stale-handout reclaimer to release
+// the outstanding hand-out (#456). Retries run after the whole discovery pass
+// has materialized, under a concurrency cap and an explicit budget, so a
+// stalled Dispatch endpoint can never hold up another item's run (#456).
+// maxHandoutAckAttempts is an upper bound, not a per-item guarantee: an item
+// gets at most that many attempts and fewer when the drain budget expires
+// first, and how many it gets depends on where it lands in the queue behind
+// the acks ahead of it.
+const (
+	maxHandoutAckAttempts = 3
+	handoutAckRetryDelay  = 100 * time.Millisecond
+	// handoutAckConcurrency caps how many hand-out acks are in flight at once
+	// during the drain, so a source offering many items cannot turn the drain
+	// into an unbounded fan-out against Dispatch.
+	handoutAckConcurrency = 4
+	// handoutAckAttemptTimeout bounds a single AckHandout call, independent of
+	// the shared Dispatch HTTP client's own timeout: one stalled endpoint must
+	// not be able to spend that budget on every attempt of every item.
+	handoutAckAttemptTimeout = 3 * time.Second
+	// handoutAckDrainTimeout bounds the whole post-pass drain. It is sized so
+	// one item's worst case — maxHandoutAckAttempts attempts of
+	// handoutAckAttemptTimeout plus maxHandoutAckAttempts-1 backoffs — fits
+	// inside it, so an item draining on its own keeps its full retry budget
+	// while total ack latency per poll stays capped at the budget regardless
+	// of how many items the source offers. Items queued behind a stalled
+	// endpoint get fewer attempts, never more.
+	handoutAckDrainTimeout = 15 * time.Second
+)
+
 // RunnerConfig controls one source discovery loop. LaneProfile, when set, is
 // the Courier LaneProfile assigned to every discovered item.
 type RunnerConfig struct {
@@ -54,6 +85,17 @@ type Runner struct {
 	// Now is the runner's time source, injectable so tests never sleep.
 	// Nil falls back to time.Now.
 	Now func() time.Time
+	// ackRetryDelay spaces out bounded hand-out ack retries. NewRunner sets
+	// the production backoff; zero keeps retries immediate, which tests use.
+	ackRetryDelay time.Duration
+	// ackAttemptTimeout bounds one AckHandout call. NewRunner sets the
+	// production attempt deadline; values <= 0 fall back to it at use time,
+	// because a zero-value Runner must not mean "no deadline".
+	ackAttemptTimeout time.Duration
+	// ackDrainTimeout bounds the whole acknowledgement drain for one poll.
+	// NewRunner sets the production budget; values <= 0 fall back to it at use
+	// time, for the same reason.
+	ackDrainTimeout time.Duration
 }
 
 func (r *Runner) clock() time.Time {
@@ -64,7 +106,30 @@ func (r *Runner) clock() time.Time {
 }
 
 func NewRunner(c client.Client, adapter Adapter, config RunnerConfig) *Runner {
-	return &Runner{Client: c, Adapter: adapter, Config: config}
+	return &Runner{
+		Client:            c,
+		Adapter:           adapter,
+		Config:            config,
+		ackRetryDelay:     handoutAckRetryDelay,
+		ackAttemptTimeout: handoutAckAttemptTimeout,
+		ackDrainTimeout:   handoutAckDrainTimeout,
+	}
+}
+
+// ackAttemptBudget and ackDrainBudget never return a non-positive duration: a
+// Runner built field-by-field (as tests do) must still bound its acks.
+func (r *Runner) ackAttemptBudget() time.Duration {
+	if r.ackAttemptTimeout > 0 {
+		return r.ackAttemptTimeout
+	}
+	return handoutAckAttemptTimeout
+}
+
+func (r *Runner) ackDrainBudget() time.Duration {
+	if r.ackDrainTimeout > 0 {
+		return r.ackDrainTimeout
+	}
+	return handoutAckDrainTimeout
 }
 
 func (r *Runner) Start(ctx context.Context) error {
@@ -283,6 +348,12 @@ func (r *Runner) Poll(ctx context.Context) error {
 		}
 	}
 
+	// Hand-out acknowledgements are queued here and drained once the whole
+	// pass has materialized, so an ack that blocks on a stalled Dispatch
+	// endpoint can never delay the materialization of another item (#456).
+	pendingAcks := make([]WorkItem, 0, len(items))
+	defer func() { r.drainHandoutAcks(ctx, pendingAcks) }()
+
 	seen := make(map[string]struct{}, len(items))
 	for _, item := range items {
 		if err := ctx.Err(); err != nil {
@@ -293,10 +364,15 @@ func (r *Runner) Poll(ctx context.Context) error {
 		}
 		itemIdentity := r.identity(item.ID)
 		key := workKey(r.Config.Source, itemIdentity)
-		if _, ok := legacyIdentities[itemIdentity]; ok {
-			continue
-		}
-		if _, ok := existing[key]; ok {
+		_, hasLegacyIdentity := legacyIdentities[itemIdentity]
+		_, hasExistingRun := existing[key]
+		if hasLegacyIdentity || hasExistingRun {
+			// The run already owns this attempt, but a hand-out whose ack
+			// failed at materialization stays outstanding — exclusions are
+			// hints, so the source can keep offering the item. Re-attempt
+			// the ack: it is idempotent and a known moot refusal proves
+			// the ledger already moved on (#456).
+			pendingAcks = append(pendingAcks, item)
 			continue
 		}
 		if _, ok := seen[key]; ok {
@@ -333,8 +409,98 @@ func (r *Runner) Poll(ctx context.Context) error {
 		if err := r.Create(ctx, run); err != nil && !apierrors.IsAlreadyExists(err) {
 			return fmt.Errorf("create CoderRun for %q: %w", item.ID, err)
 		}
+		// The run now durably owns the attempt: acknowledge the stamped
+		// hand-out so the source can tell a live attempt from a lost one
+		// (#456). A failed ack leaves the hand-out in the reclaimable state
+		// the stale-handout reclaimer exists for; it must never block
+		// materialization or starve the rest of this discovery pass, so the
+		// ack is queued and drained once every item has been materialized.
+		pendingAcks = append(pendingAcks, item)
 		existing[key] = struct{}{}
 	}
+	return nil
+}
+
+// drainHandoutAcks acknowledges the pass's stamped hand-outs after every item
+// has been materialized, so a stalled Dispatch endpoint can never delay the
+// materialization of another item (#456). At most handoutAckConcurrency acks
+// run at once, every attempt carries its own deadline, and the whole drain runs
+// under one budget sized so a single stalled item still fits inside it. Items
+// still outstanding when the budget expires are abandoned with an Info log and
+// stay in the reclaimable state the stale-handout reclaimer exists for — never
+// an error return, and never a reason to abandon another item's ack. Every
+// goroutine started here is joined before the poll returns.
+func (r *Runner) drainHandoutAcks(ctx context.Context, pending []WorkItem) {
+	if len(pending) == 0 {
+		return
+	}
+	acker, ok := r.Adapter.(HandoutAcker)
+	if !ok {
+		return
+	}
+	// A poll cancelled before the drain cannot ack anything; issuing the calls
+	// anyway would only burn a futile attempt per pending item.
+	if ctx.Err() != nil {
+		return
+	}
+	drainCtx, cancel := context.WithTimeout(ctx, r.ackDrainBudget())
+	defer cancel()
+
+	var wg sync.WaitGroup
+	slots := make(chan struct{}, handoutAckConcurrency)
+	for i := range pending {
+		wg.Add(1)
+		// Acquiring the slot here, rather than inside the goroutine, bounds
+		// both the in-flight acks and the goroutines this poll creates.
+		slots <- struct{}{}
+		go func(item WorkItem) {
+			defer wg.Done()
+			defer func() { <-slots }()
+			if err := r.ackHandout(drainCtx, acker, item); err != nil {
+				// The drain budget expired (or the poll was cancelled)
+				// before this hand-out settled. Abandoned, never fatal.
+				log.FromContext(ctx).Info("pr-fix hand-out acknowledgement abandoned",
+					"workItemID", item.ID, "error", err.Error())
+			}
+		}(pending[i])
+	}
+	wg.Wait()
+}
+
+// ackHandout acknowledges a stamped hand-out for a queue-backed attempt,
+// retrying a failure a bounded number of times within the pass before giving
+// up: the ack is idempotent and known moot refusals collapse to no-ops in
+// the adapter, so a repeat attempt is always safe. A final failure is logged,
+// never fatal — the hand-out stays in the reclaimable state the
+// stale-handout reclaimer exists for, and terminal settlement reports
+// release it regardless (#456). Each attempt runs under its own deadline so a
+// stalled endpoint cannot consume the shared Dispatch client timeout. A
+// non-nil return means the context expired first and the caller must treat the
+// hand-out as abandoned.
+func (r *Runner) ackHandout(ctx context.Context, acker HandoutAcker, item WorkItem) error {
+	var err error
+	for attempt := 0; attempt < maxHandoutAckAttempts; attempt++ {
+		if attempt > 0 {
+			if ctxErr := ctx.Err(); ctxErr != nil {
+				return ctxErr
+			}
+			if r.ackRetryDelay > 0 {
+				select {
+				case <-ctx.Done():
+					return ctx.Err()
+				case <-time.After(r.ackRetryDelay):
+				}
+			}
+		}
+		attemptCtx, cancelAttempt := context.WithTimeout(ctx, r.ackAttemptBudget())
+		err = acker.AckHandout(attemptCtx, item)
+		cancelAttempt()
+		if err == nil {
+			return nil
+		}
+	}
+	log.FromContext(ctx).Info("pr-fix hand-out acknowledgement failed",
+		"workItemID", item.ID, "attempts", maxHandoutAckAttempts, "error", err.Error())
 	return nil
 }
 
@@ -370,15 +536,19 @@ func (r *Runner) identity(workItemID string) string {
 
 // settledCapacityExhaustion is the sole history state that permits discovery
 // past the semantic identity barrier. Incomplete, negative, or human-marked
-// settlement records remain barriers. Both recoverable categories count —
-// a confirmed quota exhaustion and an availability handoff
-// (provider-unavailable, #327) settle through the same fenced channel, and a
+// settlement records remain barriers. Every recoverable capacity category
+// counts — a confirmed quota exhaustion, a model-provider availability handoff
+// (provider-unavailable, #327), a forge-read availability handoff
+// (forge-unavailable, #455), and a spent model/agent child-process budget
+// (model-transport-error) settle through the same fenced channel, and a
 // settled outage run must not strand the work item forever.
 func settledCapacityExhaustion(run *courierv1alpha1.CoderRun) bool {
 	if run.Status.Phase != courierv1alpha1.PhaseBlockedExternal ||
 		run.Status.TerminalDiagnostic == nil ||
 		(run.Status.TerminalDiagnostic.Category != courierv1alpha1.TerminalDiagnosticCategoryCapacityExhaustion &&
-			run.Status.TerminalDiagnostic.Category != courierv1alpha1.TerminalDiagnosticCategoryProviderUnavailable) {
+			run.Status.TerminalDiagnostic.Category != courierv1alpha1.TerminalDiagnosticCategoryProviderUnavailable &&
+			run.Status.TerminalDiagnostic.Category != courierv1alpha1.TerminalDiagnosticCategoryForgeUnavailable &&
+			run.Status.TerminalDiagnostic.Category != courierv1alpha1.TerminalDiagnosticCategoryModelTransportError) {
 		return false
 	}
 	recovery := apimeta.FindStatusCondition(run.Status.Conditions, courierv1alpha1.ConditionCapacityRecovery)
