@@ -453,7 +453,7 @@ func (r *CoderRunReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 				return result, nil
 			}
 		} else if err := r.Launch(ctx, &run); err != nil {
-			if permanent := terminalPreflightVerdict(err); permanent != nil {
+			if permanent := launchRejection(err); permanent != nil {
 				return r.terminateNeedsHuman(ctx, &run, adapter, item, permanent)
 			}
 			if errors.Is(err, ErrProvisioningInFlight) {
@@ -541,7 +541,7 @@ func (r *CoderRunReconciler) resumeClaimed(ctx context.Context, run *courierv1al
 			return result, nil
 		}
 	} else if err := r.Launch(ctx, run); err != nil {
-		if permanent := terminalPreflightVerdict(err); permanent != nil {
+		if permanent := launchRejection(err); permanent != nil {
 			return r.terminateNeedsHuman(ctx, run, adapter, item, permanent)
 		}
 		if errors.Is(err, ErrProvisioningInFlight) {
@@ -728,7 +728,7 @@ func (r *CoderRunReconciler) terminateMissingHead(ctx context.Context, run *cour
 // behaviour — the claim is released back to Pending — because a signal that
 // clears on a later pass must not strand the run (terminalPreflightVerdict).
 func (r *CoderRunReconciler) secureLaunchFailure(ctx context.Context, run *courierv1alpha1.CoderRun, adapter source.Adapter, item source.WorkItem, err error) (ctrl.Result, error) {
-	if permanent := terminalPreflightVerdict(err); permanent != nil {
+	if permanent := launchRejection(err); permanent != nil {
 		if fenceErr := r.Secure.Fence(ctx, run); fenceErr != nil {
 			return ctrl.Result{}, r.releaseClaim(ctx, run, adapter, item, fenceErr)
 		}

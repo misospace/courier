@@ -853,6 +853,49 @@ func TestLaunchSecureAppliesLaneResources(t *testing.T) {
 	}
 }
 
+// A lane whose CPU/memory sizing could never launch — a zero or negative
+// quantity — is a permanent lane misconfiguration the lane's author must fix.
+// It must terminalize as a LaneConfig needs-human rejection before any pod is
+// created, not cycle claim/release and not leave pod creation to surface an
+// opaque API-server rejection mid-provisioning.
+func TestLaunchSecureRejectsUnlaunchableLaneSizing(t *testing.T) {
+	cases := map[string]courier.PodResources{
+		"zero memory limit": {Limits: corev1.ResourceList{
+			corev1.ResourceMemory: resource.MustParse("0"),
+		}},
+		"negative cpu request": {Requests: corev1.ResourceList{
+			corev1.ResourceCPU: resource.MustParse("-1"),
+		}},
+	}
+	for name, sizing := range cases {
+		t.Run(name, func(t *testing.T) {
+			control, c := secureControl(t, &courier.LaneProfile{
+				ObjectMeta: metav1.ObjectMeta{Namespace: secureTestNamespace, Name: "broken"},
+				Spec: courier.LaneProfileSpec{
+					Roles:     map[string]string{"coordinator": "test/coordinator", "coder": "test/coder"},
+					Resources: sizing,
+				},
+			})
+			run := launchedSecureRun(t, c, "broken-sizing", "broken")
+			_, err := control.LaunchSecure(context.Background(), run)
+			var permanent *SecureNeedsHumanError
+			if !errors.As(err, &permanent) || permanent.Reason != "LaneConfig" {
+				t.Fatalf("error = %v, want a *SecureNeedsHumanError with reason LaneConfig", err)
+			}
+			if !strings.Contains(permanent.Detail, "broken") {
+				t.Fatalf("detail = %q, want it to name the offending lane", permanent.Detail)
+			}
+			pods := &corev1.PodList{}
+			if err := c.List(context.Background(), pods, client.InNamespace(secureTestNamespace)); err != nil {
+				t.Fatal(err)
+			}
+			if len(pods.Items) != 0 {
+				t.Fatalf("created %d pods despite unlaunchable lane sizing", len(pods.Items))
+			}
+		})
+	}
+}
+
 // A rendered spec the API server rejects as Invalid is permanent — the lane
 // configures sizing the cluster refuses outright — so it surfaces as
 // NeedsHuman instead of requeueing forever. A Forbidden or quota denial may be

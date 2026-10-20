@@ -71,6 +71,33 @@ func terminalPreflightVerdict(err error) *SecureNeedsHumanError {
 	return nil
 }
 
+// laneConfigReason marks a permanent lane-profile misconfiguration — pod
+// sizing that could never launch — raised by the launch paths before any pod
+// is created.
+const laneConfigReason = "LaneConfig"
+
+// laneConfigRejection returns the permanent lane-profile misconfiguration the
+// lane's author must fix, and nil for every other launch failure. Like a
+// pod-admission rejection this is permanent: requeueing cannot change a lane
+// the operator does not edit, so the run terminalizes NeedsHuman naming the
+// offending lane rather than cycling claim and release.
+func laneConfigRejection(err error) *SecureNeedsHumanError {
+	var permanent *SecureNeedsHumanError
+	if !errors.As(err, &permanent) || permanent.Reason != laneConfigReason {
+		return nil
+	}
+	return permanent
+}
+
+// launchRejection returns the permanent, human-fixable launch failure — a
+// terminal preflight verdict or a misconfigured lane — and nil otherwise.
+func launchRejection(err error) *SecureNeedsHumanError {
+	if permanent := terminalPreflightVerdict(err); permanent != nil {
+		return permanent
+	}
+	return laneConfigRejection(err)
+}
+
 // ProviderFactory constructs the forge provider facets for one selected
 // registration over the operator's read identity. The operator never resolves
 // a provider credential: the factory receives the registration's references

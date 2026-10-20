@@ -146,6 +146,11 @@ func (l *CoordinatorLauncher) Launch(ctx context.Context, run *courierv1alpha1.C
 	if err := l.Client.Get(ctx, client.ObjectKey{Namespace: run.Namespace, Name: run.Spec.Lane}, &lane); err != nil {
 		return err
 	}
+	// Permanent lane misconfiguration: sizing that could never launch fails
+	// the run NeedsHuman before the coordinator pod is built or created.
+	if err := lane.Spec.ValidateResources(); err != nil {
+		return secureNeedsHuman(laneConfigReason, "lane profile %q: %v", lane.Name, err)
+	}
 	// The nonce is minted here, per build, because the pod UID does not
 	// exist until the API server assigns it after create: the intake needs a
 	// per-incarnation secret before the pod exists, so it cannot be derived

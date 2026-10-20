@@ -2,6 +2,8 @@ package executor
 
 import (
 	corev1 "k8s.io/api/core/v1"
+
+	courierv1alpha1 "github.com/misospace/courier/api/v1alpha1"
 )
 
 const ObserverContractAnnotation = "courier.misospace.dev/observer-contract"
@@ -50,7 +52,11 @@ func observerSeedContainer(config PodConfig, invocation Invocation, podName, run
 		TerminationMessagePath:   ObserverStatePath + "/seed-termination",
 		TerminationMessagePolicy: corev1.TerminationMessageReadFile,
 		VolumeMounts:             []corev1.VolumeMount{{Name: observerStateVolume, MountPath: ObserverStatePath}},
-		SecurityContext:          observerSecurityContext(false),
+		// Fixed small Courier-internal sizing, never the lane's: see
+		// courierv1alpha1.DefaultObserverResources. An unbounded seed could
+		// otherwise consume the node past every sized container's limit.
+		Resources:       courierv1alpha1.DefaultObserverResources(),
+		SecurityContext: observerSecurityContext(false),
 	}
 }
 
@@ -62,7 +68,10 @@ func observerContainer(config PodConfig, invocation Invocation, podName, runUID 
 		TerminationMessagePath:   ObserverStatePath + "/termination",
 		TerminationMessagePolicy: corev1.TerminationMessageReadFile,
 		VolumeMounts:             []corev1.VolumeMount{{Name: observerStateVolume, MountPath: ObserverStatePath}, {Name: "workspace", MountPath: config.WorkspacePath, ReadOnly: true}, {Name: observerTokenVolume, MountPath: ObserverTokenPath, ReadOnly: true}},
-		SecurityContext:          observerSecurityContext(true),
+		// Fixed small Courier-internal sizing, never the lane's: see
+		// courierv1alpha1.DefaultObserverResources.
+		Resources:       courierv1alpha1.DefaultObserverResources(),
+		SecurityContext: observerSecurityContext(true),
 	}
 }
 

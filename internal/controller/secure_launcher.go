@@ -261,6 +261,13 @@ func (s *SecureControl) laneResources(ctx context.Context, run *courier.CoderRun
 	if err := s.Client.Get(ctx, types.NamespacedName{Namespace: run.Namespace, Name: run.Spec.Lane}, lane); err != nil {
 		return corev1.ResourceRequirements{}, fmt.Errorf("secure topology: read lane profile %q: %w", run.Spec.Lane, err)
 	}
+	// A lane whose CPU/memory sizing could never launch — negative or zero
+	// quantities — is a permanent configuration error the lane's author must
+	// fix: fail here, before any pod is rendered or created, rather than
+	// mid-provisioning on a spec the API server rejects.
+	if err := lane.Spec.ValidateResources(); err != nil {
+		return corev1.ResourceRequirements{}, secureNeedsHuman(laneConfigReason, "lane profile %q: %v", lane.Name, err)
+	}
 	return lane.Spec.EffectiveResources(), nil
 }
 
