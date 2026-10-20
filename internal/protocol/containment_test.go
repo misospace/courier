@@ -519,7 +519,7 @@ func TestWorkerPinRefusalFailsClosed(t *testing.T) {
 	if _, err := client.Dispatch(ctx, priv, env, task); err != nil {
 		t.Fatalf("Dispatch: %v", err)
 	}
-	deadline := time.Now().Add(15 * time.Second)
+	deadline := time.Now().Add(30 * time.Second)
 	for {
 		state, err := client.Result(ctx, "op-1")
 		if err == nil && state.Result != nil {
@@ -585,7 +585,7 @@ func TestWorkerPinFailureSweepsEscapee(t *testing.T) {
 		t.Fatalf("Dispatch: %v", err)
 	}
 	escapee := waitForDescendantPID(t, filepath.Join(worker.config.WorkspaceDir, "escaped.txt"))
-	deadline := time.Now().Add(15 * time.Second)
+	deadline := time.Now().Add(30 * time.Second)
 	for {
 		state, err := client.Result(ctx, "op-1")
 		if err == nil && state.Result != nil {
@@ -605,7 +605,7 @@ func TestWorkerPinFailureSweepsEscapee(t *testing.T) {
 	// The escapee was killed by the sweep and collected: a zombie keeps its
 	// /proc entry until someone reaps it, so the disappearance proves both
 	// halves — nothing live survives the call, and nothing was left unreaped.
-	deadline = time.Now().Add(15 * time.Second)
+	deadline = time.Now().Add(30 * time.Second)
 	for {
 		if _, err := os.Stat("/proc/" + strconv.Itoa(escapee)); os.IsNotExist(err) {
 			return

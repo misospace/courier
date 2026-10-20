@@ -95,23 +95,37 @@ func (c *taskContainment) startTaskChild(cmd *exec.Cmd) error {
 // whose number cannot be recycled, so descendants holding the task's output
 // descriptors die before the bounded Wait rather than a full grace after
 // it; the direct child then dies and is waited under the gate, so no
-// adoption pass can collect the status os/exec owes. The sweep terminates
-// the escapees the child already forked or daemonised, which the worker has
-// adopted now that their ancestors are gone. The returned error is the
-// registration failure when the proof succeeds, and an unproven marker when
-// it cannot: an unproven stop must never read as a clean failure (#399).
+// adoption pass can collect the status os/exec owes. The teardown pins the
+// leader itself with its own pidfd before reaping: registration failed, but
+// the descriptor still keeps the number unrecyclable while
+// awaitProcessGroupEmpty re-signals and proves the group empty. The sweep
+// terminates the escapees the child already forked or daemonised, which the
+// worker has adopted now that their ancestors are gone. The returned error
+// is the registration failure when the proof succeeds, and an unproven
+// marker when it cannot — including when the leader cannot be pinned, since
+// an unpinned group proof would reopen the recycled-pid window the pin
+// closes (#399).
 func (c *taskContainment) terminateUnregistered(pid int, cmd *exec.Cmd, cause error) error {
 	_ = cmd.Process.Kill()
 	_ = signalProcessGroup(pid, syscall.SIGKILL)
+	pin, pinErr := openPidfd(pid)
 	_ = cmd.Wait()
 	c.gate.Unlock()
-	if live := awaitProcessGroupEmpty(pid); live > 0 {
-		return &containmentUnprovenError{survivors: live, cause: cause}
-	}
-	survivors, sweepErr := c.sweepAdoptedTrees(time.Now().Add(taskTreeVerifyBound))
-	if sweepErr != nil {
+	if pinErr != nil {
+		// Without a pin the group number is recyclable the moment the
+		// reaped leader's pid is freed, so the group proof cannot be
+		// signalled or claimed; the sweep still terminates what it can,
+		// but the teardown stays unproven.
+		_, _ = c.sweepAdoptedTrees(time.Now().Add(taskTreeVerifyBound))
 		return &containmentUnprovenError{survivors: 1, cause: cause}
 	}
+	defer syscall.Close(pin)
+	survivors := awaitProcessGroupEmpty(pid)
+	sweepSurvivors, sweepErr := c.sweepAdoptedTrees(time.Now().Add(taskTreeVerifyBound))
+	if sweepErr != nil {
+		return &containmentUnprovenError{survivors: survivors + 1, cause: cause}
+	}
+	survivors += sweepSurvivors
 	if survivors > 0 {
 		return &containmentUnprovenError{survivors: survivors, cause: cause}
 	}
@@ -180,9 +194,9 @@ func supervisedPin(pid int) (int, error) {
 }
 
 // taskPin returns the containment pidfd pinning a supervised pid, or -1
-// when the pid is not registered. Holding
-// the pin across a process-group cleanup is what keeps the group number
-// from being reused by a concurrent task while the cleanup still signals it.
+// when the pid is not registered. Holding the pin across a process-group
+// cleanup is what keeps the group number from being reused by a concurrent
+// task while the cleanup still signals it.
 func (c *taskContainment) taskPin(pid int) int {
 	c.mu.Lock()
 	defer c.mu.Unlock()
