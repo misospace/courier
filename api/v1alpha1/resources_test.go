@@ -20,7 +20,7 @@ func TestEffectiveResourcesDefaultsWhenLaneConfiguresNone(t *testing.T) {
 // lane wins wholesale: with finite CPU and memory requests present, the floor
 // changes nothing and no limit is merged in.
 func TestEffectiveResourcesReturnsConfigVerbatim(t *testing.T) {
-	spec := &LaneProfileSpec{Resources: corev1.ResourceRequirements{
+	spec := &LaneProfileSpec{Resources: PodResources{
 		Requests: corev1.ResourceList{
 			corev1.ResourceCPU:    resource.MustParse("4"),
 			corev1.ResourceMemory: resource.MustParse("16Gi"),
@@ -37,7 +37,7 @@ func TestEffectiveResourcesReturnsConfigVerbatim(t *testing.T) {
 // sets only requests does not silently acquire default limits: omitting
 // limits is a documented operator choice.
 func TestEffectiveResourcesKeepsPartialConfigUnpinned(t *testing.T) {
-	spec := &LaneProfileSpec{Resources: corev1.ResourceRequirements{
+	spec := &LaneProfileSpec{Resources: PodResources{
 		Requests: corev1.ResourceList{
 			corev1.ResourceCPU:    resource.MustParse("1"),
 			corev1.ResourceMemory: resource.MustParse("2Gi"),
@@ -55,7 +55,7 @@ func TestEffectiveResourcesKeepsPartialConfigUnpinned(t *testing.T) {
 // on every pod with finite CPU *and* memory requests. The configured half of
 // the requests is preserved; only the absent half is floored.
 func TestEffectiveResourcesFloorsCPUMemoryRequests(t *testing.T) {
-	spec := &LaneProfileSpec{Resources: corev1.ResourceRequirements{
+	spec := &LaneProfileSpec{Resources: PodResources{
 		Requests: corev1.ResourceList{
 			corev1.ResourceCPU: resource.MustParse("1"),
 		},
@@ -77,7 +77,7 @@ func TestEffectiveResourcesFloorsCPUMemoryRequests(t *testing.T) {
 // limits is not BestEffort on the requests side: the default requests appear
 // while the configured limits stay exactly as written.
 func TestEffectiveResourcesFloorsLimitsOnlyConfig(t *testing.T) {
-	spec := &LaneProfileSpec{Resources: corev1.ResourceRequirements{
+	spec := &LaneProfileSpec{Resources: PodResources{
 		Limits: corev1.ResourceList{
 			corev1.ResourceMemory: resource.MustParse("8Gi"),
 		},
@@ -96,7 +96,7 @@ func TestEffectiveResourcesFloorsLimitsOnlyConfig(t *testing.T) {
 // more than present: a zeroed or negative CPU/memory request is replaced by
 // the floor rather than rendering a pod that reserves nothing.
 func TestEffectiveResourcesFloorsNonPositiveRequests(t *testing.T) {
-	spec := &LaneProfileSpec{Resources: corev1.ResourceRequirements{
+	spec := &LaneProfileSpec{Resources: PodResources{
 		Requests: corev1.ResourceList{
 			corev1.ResourceCPU:    resource.MustParse("0"),
 			corev1.ResourceMemory: resource.MustParse("-1"),
@@ -109,7 +109,7 @@ func TestEffectiveResourcesFloorsNonPositiveRequests(t *testing.T) {
 // TestEffectiveResourcesKeepsUnrelatedRequestKeys pins that the floor touches
 // only CPU and memory: any other request key the lane configured survives.
 func TestEffectiveResourcesKeepsUnrelatedRequestKeys(t *testing.T) {
-	spec := &LaneProfileSpec{Resources: corev1.ResourceRequirements{
+	spec := &LaneProfileSpec{Resources: PodResources{
 		Requests: corev1.ResourceList{
 			corev1.ResourceCPU:              resource.MustParse("1"),
 			corev1.ResourceEphemeralStorage: resource.MustParse("10Gi"),
@@ -148,7 +148,7 @@ func TestDefaultPodResourcesIsIndependentPerCall(t *testing.T) {
 // corrupt the LaneProfile object it read, which controller-runtime may have
 // served from its informer cache.
 func TestEffectiveResourcesDoesNotAliasLaneConfig(t *testing.T) {
-	spec := &LaneProfileSpec{Resources: corev1.ResourceRequirements{
+	spec := &LaneProfileSpec{Resources: PodResources{
 		Requests: corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("1")},
 		Limits:   corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("2")},
 	}}

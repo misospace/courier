@@ -1516,9 +1516,19 @@ capability seam, not a Go or Kubernetes requirement: a lane can select a
 repository-specific image containing whatever tools its workflow needs, while
 the deployment default remains the minimal bootstrap image.
 
-`resources` is the lane's pod sizing, and the only source of it. Limits are
-used exactly as written and may be omitted; requests keep whatever the lane
-configured, but CPU and memory requests are floored to Courier's built-in
+`resources` is the lane's pod sizing, and the only source of it. The lane's
+vocabulary is a deliberate subset of `corev1.ResourceRequirements`: only
+`requests` and `limits` are expressible, because no Courier renderer sets
+`pod.spec.resourceClaims`, so a lane cannot configure a value Courier would
+ignore or that would only fail at pod admission (#403). Every requests/limits
+key is honoured, subject only to the CPU and memory request floor described
+below: extended-resource keys pass through to pods and ride normal Kubernetes
+scheduling and quota semantics, where Kubernetes defaults an extended
+resource's request to its limit — a key set in limits alone is valid and takes
+that request, a key set in both maps must carry equal quantities, and a key
+set in requests alone makes every pod on the lane invalid at admission. Limits
+are used exactly as written and may be omitted; requests keep whatever the
+lane configured, but CPU and memory requests are floored to Courier's built-in
 default (250m/512Mi requested, 2 CPU/4Gi limited) wherever they are absent or
 non-positive — so every Courier-created pod, the coordinator and the secure
 topology's control, worker, broker, and probe pods, carries finite CPU and
@@ -2139,6 +2149,25 @@ only informs.
   holds whatever its lane needs (an Anthropic, OpenAI, or MiniMax token, a
   local endpoint's key, any combination); in the target design the provider key
   belongs to trusted harness control, and workers do not call models directly.
+- The gateway response is untrusted, unbounded input, and trusted control
+  bounds both its shape and what it will hold: one SSE line is capped at 1 MiB,
+  and per completion the buffered content deltas (8 MiB), the buffered
+  tool-call arguments across all fragments (4 MiB), the tool-call identity
+  bytes sent across all fragments (64 KiB), the distinct tool-call indexes
+  (128), and the retained events (65536) are each capped. Each is checked
+  before the bytes, entry, or event that would cross it is retained, so
+  crossing one ends the turn with one fixed error naming the bound and never
+  quoting provider text. Payload bytes alone would not bound retention — an
+  `Event` costs a slot whatever it carries, and identity fields are overwritten
+  rather than accumulated — so the event count and the identity bytes are
+  bounded too. Tool requests are emitted only after the whole stream is read,
+  so an overflowing stream can never yield an executable partial request, and
+  the one terminal error a failed turn appends is exempt from the event bound so
+  the failure is still reportable. These are transport resource bounds, not
+  work, duration, or model-behavior limits: they say what one well-formed
+  response may retain — its text, arguments, identity, and events — not what a
+  completion may cost the control pod in any other way, and never how much work
+  the model may do.
 - Secrets are redacted from logs before stdout.
 - **Failure-evidence surfaces (#115):** the operator serves an authenticated,
   write-only evidence intake listener (in-cluster, token-gated, no read path)

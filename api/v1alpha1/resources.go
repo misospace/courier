@@ -30,6 +30,9 @@ func DefaultPodResources() corev1.ResourceRequirements {
 // floored to the default wherever they are absent or non-positive, so every
 // Courier-created pod carries finite CPU and memory requests (#356). Limits
 // stay exactly as written — omitting them is a documented operator choice.
+// Every other key passes through unchanged in both halves: the floor covers
+// CPU and memory only, and this resolver neither validates nor rejects a
+// key, so an extended resource's own requests/limits rules stay Kubernetes'.
 // The result is a deep copy, so a caller that renders and mutates it cannot
 // write through to the object it read — which may be the informer cache's
 // copy of a LaneProfile, never the caller's to modify.
@@ -53,12 +56,16 @@ func EffectivePodResources(in corev1.ResourceRequirements) corev1.ResourceRequir
 }
 
 // EffectiveResources returns the lane's configured pod resources under
-// Courier's sizing policy (see EffectivePodResources): the configured value
-// with finite CPU and memory requests guaranteed, or the built-in default
-// when the lane configures none. A nil spec is a lane that configures none.
+// Courier's sizing policy (see EffectivePodResources): the narrowed lane
+// vocabulary with finite CPU and memory requests guaranteed, or the built-in
+// default when the lane configures none. A nil spec is a lane that configures
+// none. The result never aliases the LaneProfile's cached resource maps.
 func (s *LaneProfileSpec) EffectiveResources() corev1.ResourceRequirements {
 	if s == nil {
 		return DefaultPodResources()
 	}
-	return EffectivePodResources(s.Resources)
+	return EffectivePodResources(corev1.ResourceRequirements{
+		Requests: s.Resources.Requests,
+		Limits:   s.Resources.Limits,
+	})
 }

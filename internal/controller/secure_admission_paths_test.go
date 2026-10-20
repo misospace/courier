@@ -233,8 +233,8 @@ func TestLiveProbeCreateClassifiesOnlyPermanentRejection(t *testing.T) {
 // and the create: a launcher that resolved sizing per step would create pods
 // the proof never admitted, and would read the lane more than once per pass.
 func TestLaunchSecureResolvesLaneResourcesOncePerPass(t *testing.T) {
-	sizing := func(cpuRequest, memoryRequest, cpuLimit, memoryLimit string) corev1.ResourceRequirements {
-		return corev1.ResourceRequirements{
+	sizing := func(cpuRequest, memoryRequest, cpuLimit, memoryLimit string) courier.PodResources {
+		return courier.PodResources{
 			Requests: corev1.ResourceList{
 				corev1.ResourceCPU:    resource.MustParse(cpuRequest),
 				corev1.ResourceMemory: resource.MustParse(memoryRequest),

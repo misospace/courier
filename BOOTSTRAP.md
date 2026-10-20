@@ -285,7 +285,10 @@ GitOps-safe path is the manager's bootstrap config file
 `courier.misospace.dev/bootstrap-managed`), which the manager creates and
 updates itself after install. Chart plumbing for the file lands with
 follow-up work (#74). A bad config file at startup prevents the manager from
-starting; a bad edit afterwards is logged and retried on the next pass.
+starting; a bad edit afterwards is logged and retried on the next pass. The
+config's `resources` carries requests and limits only — the same narrowed
+vocabulary as the LaneProfile CRD — so a `claims` key is rejected at parse
+time rather than silently ignored (#403).
 
 ```yaml
 apiVersion: courier.misospace.dev/v1alpha1
