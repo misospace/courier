@@ -71,12 +71,26 @@ func validBaseOID(baseOID string) bool {
 // The bootstrap task and the environment capture are two separately
 // dispatched tasks: each gets its own liveness bound, never one shared
 // budget.
+//
+// On success the script transfers the materialization's repository-local
+// bin/ outputs into the workspace checkout the task started in. A contract
+// whose bootstrap installs tools under the repository root's bin/ (the
+// repo-root bin/ convention, e.g. hack/bootstrap.sh writing
+// bin/controller-gen) otherwise produces those outputs inside the temporary
+// materialization the EXIT trap deletes, and the workspace every later
+// command runs in still lacks them. The transferred bytes are outputs of
+// the approved base revision's own bootstrap — the trusted chain the
+// executed-bytes rule already establishes — so the transfer extends the
+// contract's purpose without ever executing or copying head content into
+// the trusted run, and it runs only after the bootstrap succeeded: a failed
+// bootstrap leaves the workspace untouched.
 func BootstrapScript(baseOID string) (string, error) {
 	if !validBaseOID(baseOID) {
 		return "", fmt.Errorf("bootstrap base revision %q is not a git object ID", baseOID)
 	}
 	return "set -eu\n" +
 		"base='" + baseOID + "'\n" +
+		"workspace=\"$PWD\"\n" +
 		"src=\"$(mktemp -d)\"\n" +
 		"courier_diag() {\n" +
 		"  printf 'courier-mise-path=%s\\n' \"$(command -v mise)\"\n" +
@@ -92,7 +106,11 @@ func BootstrapScript(baseOID string) (string, error) {
 		"tar -xf \"$archive\" -C \"$src\"\n" +
 		"test -f \"$src/" + ConfigPath + "\"\n" +
 		"cd \"$src\"\n" +
-		"mise run bootstrap\n", nil
+		"mise run bootstrap\n" +
+		"if [ -d \"$src/bin\" ]; then\n" +
+		"  mkdir -p \"$workspace/bin\"\n" +
+		"  cp -a \"$src/bin/.\" \"$workspace/bin/\"\n" +
+		"fi\n", nil
 }
 
 // EnvCaptureScript returns the fixed POSIX sh environment-capture task

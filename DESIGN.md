@@ -1297,9 +1297,18 @@ and the legacy executor's classification through `internal/devenv`:
   `mise run bootstrap` inside it — so the executed bytes are the approved
   base revision's bytes BY CONSTRUCTION, and mise's task discovery (config
   fragments, `conf.d`, task directories, includes, whatever surfaces it
-  reads) cannot reach head content. No enumeration of what mise might
+  reads)   cannot reach head content. No enumeration of what mise might
   discover is attempted, because none can be complete; enumeration-based
-  pinning of referenced scripts was tried and removed as unsound.
+  pinning of referenced scripts was tried and removed as unsound. On
+  success the task transfers the materialization's repository-local `bin/`
+  outputs into the workspace checkout: a contract whose bootstrap installs
+  tools under the repository root's `bin/` (Courier's own `hack/bootstrap.sh`
+  writes `bin/controller-gen`, `bin/setup-envtest`, and `bin/.tool-pins`)
+  would otherwise produce them inside the temporary materialization its EXIT
+  trap deletes, leaving every later workspace command to reinstall them.
+  The transferred bytes are outputs of the approved base's own bootstrap —
+  the same trusted chain as the executed bytes — a failed bootstrap
+  transfers nothing, and nothing is copied from head.
   Repositories without a contract are skipped (documented no-contract
   behavior, not a failure); so are a contract that differs from the base
   and one that is only half-committed (a config with no lock). All three

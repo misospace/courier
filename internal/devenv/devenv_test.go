@@ -274,6 +274,7 @@ func TestBootstrapAndEnvCaptureScripts(t *testing.T) {
 	}
 	for _, want := range []string{
 		"base='" + oid + "'",
+		`workspace="$PWD"`,
 		"git archive --format=tar -o \"$archive\" \"$base\"",
 		"tar -xf \"$archive\" -C \"$src\"",
 		"test -f \"$src/" + ConfigPath + "\"",
@@ -287,11 +288,14 @@ func TestBootstrapAndEnvCaptureScripts(t *testing.T) {
 	}
 	// The trusted diagnostics are emitted exactly once, from the EXIT trap
 	// after the bootstrap run, so the terminal emission is last in the
-	// captured stdout tail on success and on every failure path.
+	// captured stdout tail on success and on every failure path. The
+	// repository-local bin/ transfer (#446 review) runs only after a
+	// successful bootstrap and before the trap deletes the materialization.
 	if strings.Count(bootstrap, "courier_diag || true") != 1 ||
 		!strings.Contains(bootstrap, `trap 'rc=$?; rm -rf "$src" "$archive" || true; courier_diag || true; exit "$rc"' EXIT`) ||
-		!strings.HasSuffix(bootstrap, "mise run bootstrap\n") {
-		t.Errorf("BootstrapScript = %q, want a single terminal EXIT-trap emission after the bootstrap run", bootstrap)
+		!strings.Contains(bootstrap, "mise run bootstrap\nif [ -d \"$src/bin\" ]; then\n  mkdir -p \"$workspace/bin\"\n  cp -a \"$src/bin/.\" \"$workspace/bin/\"\nfi\n") ||
+		!strings.HasSuffix(bootstrap, "fi\n") {
+		t.Errorf("BootstrapScript = %q, want a single terminal EXIT-trap emission, and a post-bootstrap bin/ transfer as the final statement", bootstrap)
 	}
 
 	capture, err := EnvCaptureScript(oid)
@@ -679,6 +683,134 @@ func TestScriptsExecuteForReal(t *testing.T) {
 		}
 		if len(entries) != 0 {
 			t.Errorf("materialization or archive survived the EXIT trap: %v", entries)
+		}
+	})
+}
+
+// binInstallingMise writes a mise stand-in whose bootstrap task follows the
+// repo-root bin/ convention (#446 review): it installs bin/controller-gen,
+// bin/setup-envtest, and bin/.tool-pins under the materialization root.
+// When failAfter is set, it installs and then exits nonzero, the way a
+// bootstrap that dies mid-install does.
+func binInstallingMise(t *testing.T, dir string, failAfter bool) string {
+	t.Helper()
+	bin := filepath.Join(dir, "mise-bin")
+	if err := os.MkdirAll(bin, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	run := "  run) mkdir -p bin\n" +
+		"    printf '#!/bin/sh\\nprintf \"controller-gen fake\\n\"\\n' > bin/controller-gen\n" +
+		"    chmod 755 bin/controller-gen\n" +
+		"    printf '#!/bin/sh\\nprintf \"setup-envtest fake\\n\"\\n' > bin/setup-envtest\n" +
+		"    chmod 755 bin/setup-envtest\n" +
+		"    printf 'fake-tool-pins\\n' > bin/.tool-pins\n" +
+		"    printf 'bootstrap-ran\\n' ;;\n"
+	if failAfter {
+		run = "  run) mkdir -p bin; printf 'x' > bin/controller-gen; printf 'bootstrap-failing\\n'; exit 3 ;;\n"
+	}
+	script := "#!/bin/sh\n" +
+		"case \"$1\" in\n" +
+		"  --version) printf 'mise 2024.10.29 (stand-in)\\n' ;;\n" +
+		run +
+		"  *) printf 'unexpected mise invocation: %s\\n' \"$*\" >&2; exit 64 ;;\n" +
+		"esac\n"
+	path := filepath.Join(bin, "mise")
+	if err := os.WriteFile(path, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	return bin
+}
+
+// TestBootstrapTransferMakesToolsUsableInWorkspace is the #446 review
+// integration regression: a contract whose bootstrap installs repository-
+// local tools under the materialization's bin/ must leave those outputs
+// present and usable to subsequent workspace commands, not deleted with
+// the temporary materialization. It pins the four workspace outcomes of
+// the transfer: success moves the tools (executable, runnable from the
+// workspace, merged into a pre-existing bin/ without nesting), a failed
+// bootstrap transfers nothing, and a bootstrap that installs nothing
+// leaves the workspace untouched.
+func TestBootstrapTransferMakesToolsUsableInWorkspace(t *testing.T) {
+	if err := scriptToolsRequired(); err != nil {
+		t.Skipf("script execution tools unavailable: %v", err)
+	}
+	t.Run("installed tools survive into the workspace and run there", func(t *testing.T) {
+		repo, baseOID := baseRepoWithContract(t)
+		if err := os.MkdirAll(filepath.Join(repo, "bin"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(repo, "bin", "pre-existing.txt"), []byte("keep\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		binDir := binInstallingMise(t, t.TempDir(), false)
+		script, err := BootstrapScript(baseOID)
+		if err != nil {
+			t.Fatalf("BootstrapScript: %v", err)
+		}
+		if _, runErr := runScript(t, script, repo, binDir, t.TempDir()); runErr != nil {
+			t.Fatalf("bootstrap script failed: %v", runErr)
+		}
+		for _, name := range []string{"controller-gen", "setup-envtest", ".tool-pins"} {
+			info, err := os.Stat(filepath.Join(repo, "bin", name))
+			if err != nil {
+				t.Fatalf("workspace bin/%s missing after bootstrap: %v", name, err)
+			}
+			if name != ".tool-pins" && info.Mode()&0o111 == 0 {
+				t.Errorf("workspace bin/%s lost its executable bit: %v", name, info.Mode())
+			}
+		}
+		if _, err := os.Stat(filepath.Join(repo, "bin", "pre-existing.txt")); err != nil {
+			t.Errorf("transfer removed a pre-existing bin/ entry: %v", err)
+		}
+		if _, err := os.Stat(filepath.Join(repo, "bin", "bin")); !os.IsNotExist(err) {
+			t.Errorf("transfer nested bin inside the workspace bin/")
+		}
+		// Usable by a subsequent workspace command — exactly what a later
+		// make controller-gen does from the workspace root.
+		cmd := exec.Command("sh", "-c", "./bin/controller-gen")
+		cmd.Dir = repo
+		out, err := cmd.Output()
+		if err != nil {
+			t.Fatalf("subsequent workspace command could not run bin/controller-gen: %v", err)
+		}
+		if got := string(out); got != "controller-gen fake\n" {
+			t.Errorf("workspace command output = %q, want the transferred tool's output", got)
+		}
+	})
+
+	t.Run("failed bootstrap transfers nothing", func(t *testing.T) {
+		repo, baseOID := baseRepoWithContract(t)
+		binDir := binInstallingMise(t, t.TempDir(), true)
+		script, err := BootstrapScript(baseOID)
+		if err != nil {
+			t.Fatalf("BootstrapScript: %v", err)
+		}
+		stdout, runErr := runScript(t, script, repo, binDir, t.TempDir())
+		if runErr == nil {
+			t.Fatal("a failing bootstrap task must fail the task")
+		}
+		if _, err := os.Stat(filepath.Join(repo, "bin")); !os.IsNotExist(err) {
+			t.Errorf("a failed bootstrap must transfer nothing into the workspace; bin/ exists: %v", err)
+		}
+		for _, key := range []string{"courier-mise-path=", "courier-mise-version=", "courier-mise-data-dir="} {
+			if !strings.Contains(stdout, key) {
+				t.Errorf("failure-path stdout missing diagnostic %q:\n%s", key, stdout)
+			}
+		}
+	})
+
+	t.Run("bootstrap installing nothing leaves the workspace untouched", func(t *testing.T) {
+		repo, baseOID := baseRepoWithContract(t)
+		binDir := miseStandIn(t, t.TempDir(), "")
+		script, err := BootstrapScript(baseOID)
+		if err != nil {
+			t.Fatalf("BootstrapScript: %v", err)
+		}
+		if _, runErr := runScript(t, script, repo, binDir, t.TempDir()); runErr != nil {
+			t.Fatalf("bootstrap script failed: %v", runErr)
+		}
+		if _, err := os.Stat(filepath.Join(repo, "bin")); !os.IsNotExist(err) {
+			t.Errorf("a contract with no bin/ output must not gain one in the workspace: %v", err)
 		}
 	})
 }
