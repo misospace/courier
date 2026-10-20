@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"os"
@@ -420,10 +421,12 @@ func (w *Worker) runTask(ctx context.Context, task Task) *Result {
 var errNoProcessGroup = errors.New("task process group was not established")
 
 // leadsOwnProcessGroup reports whether pid leads its own process group, which
-// is what makes a group signal reach the task's descendants.
+// is what makes a group signal reach the task's descendants. A pid that
+// cannot be read at all does not lead anything: the caller fails such a task
+// closed rather than claim a group it cannot see.
 func leadsOwnProcessGroup(pid int) bool {
-	_, _, group, ok := processStat(pid)
-	return ok && group == pid
+	info, err := processStat(pid)
+	return err == nil && info.pgid == pid
 }
 
 // signalProcessGroup delivers sig to the whole process group led by pid. A
@@ -444,13 +447,17 @@ func signalProcessGroup(pid int, sig syscall.Signal) error {
 // group led by pgid and returns how many were still live when the bound
 // expired. The group is re-signalled while it waits, so a descendant that
 // raced the cancellation signal cannot outlive the acknowledgement (#372).
+// The caller holds containment's pidfd pin for the group leader across this
+// call: the pin keeps the leader's numeric pid — and therefore the group
+// number — from being reused by any new process or new group, so every
+// group signal here can only reach the task's own group.
 func awaitProcessGroupEmpty(pgid int) int {
 	deadline := time.Now().Add(taskTreeVerifyBound)
 	for {
-		// A recycled pid answers for whatever now owns it: if the old group
-		// leader's entry reports a different group, nothing of the task's
-		// tree can be left in this one.
-		if _, _, group, ok := processStat(pgid); ok && group != pgid {
+		// Second identity check under the pin: if the number no longer
+		// answers for this group, nothing of the task's tree can be left in
+		// whatever holds it.
+		if info, err := processStat(pgid); err == nil && info.pgid != pgid {
 			return 0
 		}
 		_ = signalProcessGroup(pgid, syscall.SIGKILL)
@@ -477,8 +484,10 @@ func awaitProcessGroupEmpty(pgid int) int {
 // liveGroupMembers lists the processes still in the process group led by
 // pgid, excluding zombies: a zombie has already exited and holds no
 // descriptors, so it mutates nothing even before its new parent reaps it.
-// Failing to read the listing is an error rather than a silent empty group —
-// unproven termination must never read as verified termination.
+// Failing to read the listing — the directory or any member that has not
+// been confirmed gone — is an error rather than a silent empty group: an
+// unreadable process is not evidence of absence, and unproven termination
+// must never read as verified termination.
 func liveGroupMembers(pgid int) ([]int, error) {
 	entries, err := os.ReadDir("/proc")
 	if err != nil {
@@ -490,11 +499,17 @@ func liveGroupMembers(pgid int) ([]int, error) {
 		if convErr != nil {
 			continue
 		}
-		state, _, group, ok := processStat(pid)
-		if !ok || group != pgid {
+		info, statErr := processStat(pid)
+		if statErr != nil {
+			if errors.Is(statErr, errProcessGone) {
+				continue
+			}
+			return nil, statErr
+		}
+		if info.pgid != pgid {
 			continue
 		}
-		if state != "Z" && state != "X" {
+		if info.state != "Z" && info.state != "X" {
 			live = append(live, pid)
 		}
 	}
@@ -505,30 +520,42 @@ func liveGroupMembers(pgid int) ([]int, error) {
 // comm field is parenthesized and may contain spaces, so parsing starts after
 // its closing parenthesis: what follows is state, parent, then process group.
 // The parent is what lets a sweep attribute an orphaned descendant after the
-// kernel reparented it (#399).
-func processStat(pid int) (state string, ppid int, pgid int, ok bool) {
+// kernel reparented it (#399). A confirmed disappearance answers
+// errProcessGone — that is evidence, and a reader may treat the process as
+// absent. Every other failure (a refused or broken read, a malformed stat)
+// is not evidence of absence and must fail the surrounding proof closed
+// rather than be skipped.
+func processStat(pid int) (procInfo, error) {
+	if hook := processStatFailureHook.Load(); hook != nil {
+		if err := (*hook)(pid); err != nil {
+			return procInfo{}, fmt.Errorf("stat of pid %d is unreadable: %w", pid, err)
+		}
+	}
 	data, err := os.ReadFile("/proc/" + strconv.Itoa(pid) + "/stat")
 	if err != nil {
-		return "", 0, 0, false
+		if errors.Is(err, os.ErrNotExist) || errors.Is(err, syscall.ESRCH) {
+			return procInfo{}, errProcessGone
+		}
+		return procInfo{}, fmt.Errorf("stat of pid %d is unreadable: %w", pid, err)
 	}
 	stat := string(data)
 	end := strings.LastIndex(stat, ")")
 	if end < 0 {
-		return "", 0, 0, false
+		return procInfo{}, fmt.Errorf("stat of pid %d is malformed", pid)
 	}
 	fields := strings.Fields(stat[end+1:])
 	if len(fields) < 3 {
-		return "", 0, 0, false
+		return procInfo{}, fmt.Errorf("stat of pid %d is malformed", pid)
 	}
 	parent, err := strconv.Atoi(fields[1])
 	if err != nil {
-		return "", 0, 0, false
+		return procInfo{}, fmt.Errorf("stat of pid %d is malformed", pid)
 	}
 	group, err := strconv.Atoi(fields[2])
 	if err != nil {
-		return "", 0, 0, false
+		return procInfo{}, fmt.Errorf("stat of pid %d is malformed", pid)
 	}
-	return fields[0], parent, group, true
+	return procInfo{state: fields[0], ppid: parent, pgid: group, fd: -1}, nil
 }
 
 // artifactReadHook, when non-nil, runs between artifact validation and the

@@ -296,7 +296,15 @@ descendant its tasks leave behind; the subreaper flag keeps that true for any
 shape where it is not PID 1. At every grouped task's termination — cancelled
 and completed alike — the worker sweeps its adopted trees: it enumerates the
 pod's processes, kills every live process it has adopted regardless of the
-group or session it moved to, and reaps what it killed. A completed task's
+group or session it moved to, and reaps what it killed. Termination is by
+identity, never by number: every process the worker snapshots or supervises
+is pinned with a pidfd before it is read or signalled, the kernel keeps a
+pinned pid from being recycled while the pin lives, and a signal travels
+through the descriptor — so a recycled pid can never receive an old task's
+group signal or sweep kill, and a supervised release can never claim a new
+task's entry. A process whose state cannot be read for any reason other than
+a confirmed disappearance fails the whole proof: an unreadable process is
+not evidence of absence. A completed task's
 escapee is swept too, deliberately: a daemon a successful task left behind is
 still untrusted work mutating the workspace, and control would otherwise
 clear its suppression on a completion the worker never proved. The sweep's

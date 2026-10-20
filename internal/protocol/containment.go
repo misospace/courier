@@ -52,16 +52,20 @@ type taskContainment struct {
 	// mu guards supervised.
 	mu sync.Mutex
 	// supervised holds the pids whose exit status os/exec owns: the task
-	// leaders whose Wait is still owed. Everything else this process could
-	// see as a zombie child is an adopted orphan, and collecting it is the
+	// leaders whose Wait is still owed, each mapped to a pidfd pinning the
+	// process. The pin keeps the numeric pid unrecyclable for exactly as
+	// long as the registration lives, so a late release can never delete a
+	// different task's entry and no new process or process group can take
+	// a supervised leader's number. Everything else this process could see
+	// as a zombie child is an adopted orphan, and collecting it is the
 	// reaper's whole job.
-	supervised map[int]struct{}
+	supervised map[int]int
 	// reaped counts the adopted descendants collected. It is the observable
 	// the tests use; nothing reads it in the run itself.
 	reaped atomic.Uint64
 }
 
-var containment = &taskContainment{supervised: make(map[int]struct{})}
+var containment = &taskContainment{supervised: make(map[int]int)}
 
 // startTaskChild is the single funnel for a task child: Start, register,
 // return. Registration happens under the gate, so no adoption pass can see
@@ -76,20 +80,48 @@ func (c *taskContainment) startTaskChild(cmd *exec.Cmd) error {
 	return nil
 }
 
-// releaseTaskChild hands the pid back once Wait has taken its status.
+// releaseTaskChild hands the pid back once Wait has taken its status. The
+// entry is removed before the pin closes, and while the pin was held no new
+// process could take this pid, so the delete can only remove this task's
+// entry. Closing the pin is what makes the number available again.
 func (c *taskContainment) releaseTaskChild(pid int) {
 	c.mu.Lock()
+	pin, ok := c.supervised[pid]
 	delete(c.supervised, pid)
+	c.mu.Unlock()
+	if ok && pin >= 0 {
+		_ = syscall.Close(pin)
+	}
+}
+
+// registerSupervised records a pid whose exit status os/exec owns and pins
+// it with a pidfd, so the number stays this task's for the whole life of
+// the registration. A platform that cannot open the pidfd registers
+// without a pin (-1); on Linux a process always opens pidfds for its own
+// children. Only the funnel calls it in the run; tests register the helper
+// children they Wait on, which is the same discipline those children
+// deserve.
+func (c *taskContainment) registerSupervised(pid int) {
+	pin := -1
+	if fd, err := openPidfd(pid); err == nil {
+		pin = fd
+	}
+	c.mu.Lock()
+	c.supervised[pid] = pin
 	c.mu.Unlock()
 }
 
-// registerSupervised records a pid whose exit status os/exec owns. Only the
-// funnel calls it in the run; tests register the helper children they Wait
-// on, which is the same discipline those children deserve.
-func (c *taskContainment) registerSupervised(pid int) {
+// taskPin returns the containment pidfd pinning a supervised pid, or -1
+// when the pid is not registered or was registered without a pin. Holding
+// the pin across a process-group cleanup is what keeps the group number
+// from being reused by a concurrent task while the cleanup still signals it.
+func (c *taskContainment) taskPin(pid int) int {
 	c.mu.Lock()
-	c.supervised[pid] = struct{}{}
-	c.mu.Unlock()
+	defer c.mu.Unlock()
+	if pin, ok := c.supervised[pid]; ok {
+		return pin
+	}
+	return -1
 }
 
 func (c *taskContainment) supervises(pid int) bool {
@@ -161,16 +193,21 @@ func (c *taskContainment) sweepAdoptedTrees(deadline time.Time) (int, error) {
 		c.reapAdoptedZombies(snapshot, self)
 		live := c.adoptedLiveProcesses(snapshot, self)
 		if len(live) > 0 && time.Now().Before(deadline) {
-			for _, pid := range live {
-				// A pid can die between the snapshot and its kill, and its
-				// number stays unrecyclable until it is reaped; re-reading
-				// the stat immediately before the kill keeps the signal off
-				// anything that is no longer the process observed.
-				if state, _, _, ok := processStat(pid); ok && state != "Z" && state != "X" {
-					_ = syscall.Kill(pid, syscall.SIGKILL)
+			for _, entry := range live {
+				// The signal goes through the pidfd the snapshot opened for
+				// this process, so it can never reach a process that reused
+				// the number: the open pins the target, and a target that
+				// died since the snapshot answers ESRCH, which is exactly a
+				// containment success for this entry. Anything else is a
+				// failed containment and fails the proof closed.
+				if err := pidfdSignal(entry.fd, syscall.SIGKILL); err != nil && !errors.Is(err, syscall.ESRCH) {
+					closeProcFds(snapshot)
+					c.gate.Unlock()
+					return 0, err
 				}
 			}
 		}
+		closeProcFds(snapshot)
 		c.gate.Unlock()
 		if len(live) == 0 {
 			return 0, nil
@@ -179,6 +216,16 @@ func (c *taskContainment) sweepAdoptedTrees(deadline time.Time) (int, error) {
 			return len(live), nil
 		}
 		time.Sleep(taskTreeVerifyPoll)
+	}
+}
+
+// closeProcFds releases every pidfd a snapshot opened. A pin must never
+// outlive the pass that needed the identity it guarantees.
+func closeProcFds(snapshot map[int]procInfo) {
+	for _, info := range snapshot {
+		if info.fd >= 0 {
+			_ = syscall.Close(info.fd)
+		}
 	}
 }
 
@@ -206,7 +253,7 @@ func (c *taskContainment) reapAdoptedZombies(snapshot map[int]procInfo, self int
 // descendant of theirs. A zombie holds no descriptors and writes nothing,
 // so it is not a surviving descendant; it was collected above, and its
 // descendants were reparented to this process the moment it exited.
-func (c *taskContainment) adoptedLiveProcesses(snapshot map[int]procInfo, self int) []int {
+func (c *taskContainment) adoptedLiveProcesses(snapshot map[int]procInfo, self int) []procInfo {
 	children := make(map[int][]int, len(snapshot))
 	for pid, info := range snapshot {
 		children[info.ppid] = append(children[info.ppid], pid)
@@ -218,7 +265,7 @@ func (c *taskContainment) adoptedLiveProcesses(snapshot map[int]procInfo, self i
 		}
 		queue = append(queue, pid)
 	}
-	live := make([]int, 0, 4)
+	live := make([]procInfo, 0, 4)
 	seen := make(map[int]struct{}, len(queue))
 	for len(queue) > 0 {
 		pid := queue[len(queue)-1]
@@ -232,7 +279,7 @@ func (c *taskContainment) adoptedLiveProcesses(snapshot map[int]procInfo, self i
 			continue
 		}
 		if info.state != "Z" && info.state != "X" {
-			live = append(live, pid)
+			live = append(live, info)
 		}
 		queue = append(queue, children[pid]...)
 	}
@@ -279,17 +326,28 @@ func directChildPIDs() ([]int, error) {
 }
 
 // procInfo is one process's run state, parent, and process group, read from
-// a single /proc pass.
+// a single /proc pass, together with the pidfd that pins the process the
+// entry describes. The snapshot entry and the descriptor are the same
+// identity: the entry was read after the pin was opened, and the pin keeps
+// the number from being recycled while the descriptor is held.
 type procInfo struct {
 	state string
 	ppid  int
 	pgid  int
+	fd    int
 }
 
-// processSnapshot reads every process's stat in one /proc walk. A process
-// that vanished mid-walk contributes nothing; failing to read the directory
-// itself is an error — without a listing, nothing about the pod's processes
-// can be proven.
+// processSnapshot pins and then reads every process in one /proc walk.
+// Opening the pidfd before the read is what makes the entry authoritative:
+// a pid that dies after the open can never be reused while the descriptor
+// is held, so the stat read that follows describes exactly the process the
+// descriptor will signal. A process already gone at the open, or gone by
+// the time its stat is read, contributes nothing — a disappearance is not a
+// survivor. Anything else — a refused or failing stat read, a malformed
+// stat, a pidfd the kernel refused for a live process — fails the whole
+// snapshot: an unreadable process is not evidence of absence, and a proof
+// of a clean pod must not be built from a partial view. The caller owns
+// every descriptor in the map and must release them with closeProcFds.
 func processSnapshot() (map[int]procInfo, error) {
 	entries, err := os.ReadDir("/proc")
 	if err != nil {
@@ -301,14 +359,43 @@ func processSnapshot() (map[int]procInfo, error) {
 		if convErr != nil {
 			continue
 		}
-		state, ppid, pgid, ok := processStat(pid)
-		if !ok {
-			continue
+		fd, openErr := openPidfd(pid)
+		if openErr != nil {
+			// ESRCH: the process was already reaped, and a reaped pid has
+			// nothing left to prove. Any other refusal means a live process
+			// the sweep cannot see or safely signal, which is exactly the
+			// partial view that must not read as clean.
+			if errors.Is(openErr, syscall.ESRCH) {
+				continue
+			}
+			closeProcFds(snapshot)
+			return nil, fmt.Errorf("pid %d could not be pinned: %w", pid, openErr)
 		}
-		snapshot[pid] = procInfo{state: state, ppid: ppid, pgid: pgid}
+		info, statErr := processStat(pid)
+		if statErr != nil {
+			_ = syscall.Close(fd)
+			if errors.Is(statErr, errProcessGone) {
+				continue
+			}
+			closeProcFds(snapshot)
+			return nil, statErr
+		}
+		info.fd = fd
+		snapshot[pid] = info
 	}
 	return snapshot, nil
 }
+
+// errProcessGone marks the one per-process read failure that is evidence:
+// the process is confirmed absent, so nothing it could have been is left to
+// account for. Every other failure is not evidence of absence and fails the
+// proof closed.
+var errProcessGone = errors.New("process is gone")
+
+// processStatFailureHook, when non-nil, reports a pid's stat as unreadable
+// (a failure that is not a confirmed disappearance). Tests install it to pin
+// the fail-closed contract on a partial /proc view. It is nil in production.
+var processStatFailureHook atomic.Pointer[func(pid int) error]
 
 // processEnumerationHook, when non-nil, fails the sweep's process
 // enumeration. Tests install it to pin the conservative contract: without a

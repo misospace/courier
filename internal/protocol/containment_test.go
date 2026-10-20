@@ -363,3 +363,137 @@ func TestWorkerCancelRefusesWhenEnumerationFails(t *testing.T) {
 		t.Fatalf("escapee %d is gone, so the refusal was not about surviving work", escapee)
 	}
 }
+
+// TestWorkerSweepFailsClosedOnUnreadableStat pins the fail-closed half of
+// the snapshot contract: a per-process stat that fails for any reason other
+// than a confirmed disappearance is not evidence of absence. While a live
+// escapee remains, making its stat unreadable must fail the whole sweep
+// proof — the cancellation stays unverified exactly as when the enumeration
+// itself fails — and must never collapse into the sweep claiming a clean pod
+// because it silently dropped the one process it could not read.
+func TestWorkerSweepFailsClosedOnUnreadableStat(t *testing.T) {
+	if _, err := exec.LookPath("setsid"); err != nil {
+		t.Skip("setsid is required to leave the task's process group")
+	}
+	worker, priv, server := newTestWorker(t)
+	client := &Client{BaseURL: server.URL}
+	ctx := context.Background()
+
+	task, _ := json.Marshal(Task{Command: []string{"sh", "-c", `setsid sh -c 'echo $$ > unreadable.txt; exec sleep 300' & wait`}})
+	env := dispatchEnvelope(worker.clock())
+	env.OpID = "op-unreadable"
+	env.PayloadDigest = PayloadDigestOf(task)
+	env.Nonce = "unreadable-dispatch-nonce-1"
+	if _, err := client.Dispatch(ctx, priv, env, task); err != nil {
+		t.Fatalf("Dispatch: %v", err)
+	}
+	escapee := waitForDescendantPID(t, filepath.Join(worker.config.WorkspaceDir, "unreadable.txt"))
+	if !descendantLive(escapee) {
+		t.Fatalf("escapee %d was gone before cancellation", escapee)
+	}
+	// The hook reports exactly the live escapee's stat as unreadable while
+	// every other process — the sweep's own view of the rest of the pod
+	// included — stays readable. That is the partial view the sweep must
+	// refuse to treat as proof.
+	hook := func(pid int) error {
+		if pid == escapee {
+			return errors.New("injected unreadable stat")
+		}
+		return nil
+	}
+	processStatFailureHook.Store(&hook)
+
+	cancelEnv := env
+	cancelEnv.Kind = KindCancel
+	cancelEnv.Sequence = 1
+	cancelEnv.PayloadDigest = CancelPayloadDigest
+	cancelEnv.Nonce = "unreadable-cancel-nonce-1"
+	status, err := client.Cancel(ctx, priv, cancelEnv)
+	processStatFailureHook.Store(nil)
+	if err == nil {
+		t.Fatalf("cancellation was acknowledged with status %q while a live process was unreadable", status)
+	}
+	var transportErr *TransportError
+	if !errors.As(err, &transportErr) || transportErr.StatusCode != http.StatusInternalServerError {
+		t.Fatalf("Cancel error = %v, want an unverified-termination rejection", err)
+	}
+	state, err := client.Result(ctx, "op-unreadable")
+	if err != nil || state.Result == nil || state.Result.LiveDescendants == 0 {
+		t.Fatalf("unverified cancellation must still report the live tree: %+v, %v", state.Result, err)
+	}
+	if !descendantLive(escapee) {
+		t.Fatalf("escapee %d is gone, so the refusal was not about surviving work", escapee)
+	}
+}
+
+// TestTaskPinIdentity pins the identity guarantee the containment kills
+// depend on: a supervised task holds a pidfd for its leader, and a signal
+// sent through that descriptor reaches the process it was opened for and
+// never a process that later reused the number. After the leader has been
+// reaped, the pin answers ESRCH — the proof that a recycled pid can never
+// receive the old task's group signal, its sweep kill, or a stale release
+// of its supervised entry.
+func TestTaskPinIdentity(t *testing.T) {
+	if containment.taskPin(os.Getpid()) != -1 {
+		t.Fatal("taskPin answered for a pid that was never registered")
+	}
+	child := exec.Command("sh", "-c", "exec sleep 30")
+	if err := containment.startTaskChild(child); err != nil {
+		t.Fatalf("start task child: %v", err)
+	}
+	pid := child.Process.Pid
+	pin := containment.taskPin(pid)
+	if pin < 0 {
+		containment.releaseTaskChild(pid)
+		_ = child.Wait()
+		t.Fatal("a supervised task started without a pidfd pin")
+	}
+	if err := pidfdSignal(pin, 0); err != nil {
+		containment.releaseTaskChild(pid)
+		_ = child.Wait()
+		t.Fatalf("signal through the live pin: %v", err)
+	}
+	if err := syscall.Kill(pid, syscall.SIGKILL); err != nil {
+		containment.releaseTaskChild(pid)
+		_ = child.Wait()
+		t.Fatalf("kill task child: %v", err)
+	}
+	// Wait reaps the leader completely: the number is now free for the
+	// kernel to hand out, and only the still-open pin keeps this signal
+	// path pointed at the process it was opened for.
+	if err := child.Wait(); err == nil {
+		containment.releaseTaskChild(pid)
+		t.Fatal("task child exited without an error after SIGKILL")
+	}
+	if err := pidfdSignal(pin, 0); !errors.Is(err, syscall.ESRCH) {
+		containment.releaseTaskChild(pid)
+		t.Fatalf("signal through the pin of a reaped process = %v, want ESRCH", err)
+	}
+	// The pin also keeps the number itself out of circulation: fresh
+	// children cannot be allocated a pid the kernel still pins.
+	for i := 0; i < 32; i++ {
+		probe := exec.Command("true")
+		// Through the funnel: the reaper may already be armed in this
+		// binary, and an unregistered child's status is exactly what a
+		// drain pass is entitled to collect.
+		if err := containment.startTaskChild(probe); err != nil {
+			containment.releaseTaskChild(pid)
+			t.Fatalf("start probe: %v", err)
+		}
+		probePID := probe.Process.Pid
+		err := probe.Wait()
+		containment.releaseTaskChild(probePID)
+		if err != nil {
+			containment.releaseTaskChild(pid)
+			t.Fatalf("wait probe: %v", err)
+		}
+		if probePID == pid {
+			containment.releaseTaskChild(pid)
+			t.Fatalf("a fresh child took the pinned pid %d while its pin was open", pid)
+		}
+	}
+	containment.releaseTaskChild(pid)
+	if containment.taskPin(pid) != -1 {
+		t.Fatal("release left a supervised entry or its pin behind")
+	}
+}
