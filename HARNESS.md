@@ -1576,11 +1576,14 @@ for a normal failure: the Dispatch adapter publishes a dedicated
 generation-fenced `WAITING_EXTERNAL` queue mark, so the prerequisite wait does
 not advance the issued generation or burn fix-attempt budget.
 
-Outcome comments carry the full declared evidence, question, or missing
-explanation after redaction. They are not shortened to the termination reason;
-that separate reason is bounded and redacted before publication. Comment posting
-is best-effort: failures are logged as `outcome.comment` and do not change the
-run ending.
+Outcome comments are human-attention requests the executor can authoritatively
+stand behind: `needs_decision` and `blocked_external` carry the full declared
+question or missing explanation after redaction, never shortened to the
+termination reason. The executor publishes no comment for `no_change_needed`:
+the controller settles that success claim against the world (#474), and the
+evidence rides the bounded, redacted termination reason in `run.exit` telemetry
+and the `COURIER_TERMINATION` handoff. Comment posting is best-effort: failures
+are logged as `outcome.comment` and do not change the run ending.
 
 The criterion-evidence contract (#249, §4) adds one classification: a
 Verifying handoff whose criterion evidence is missing or malformed beyond
