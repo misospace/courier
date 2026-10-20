@@ -115,6 +115,49 @@ func requireRejected(t *testing.T, err error, category string) {
 	}
 }
 
+// privateTreeState is the observable state of the private integration tree:
+// every object it holds, every ref it carries, and its branch tip.
+type privateTreeState struct {
+	objects string
+	refs    string
+	tip     string
+}
+
+// capturePrivateTree reads the private integration tree's whole observable
+// state. It is the baseline a rejected artifact must leave untouched.
+func capturePrivateTree(t *testing.T, w *artifactWorld) privateTreeState {
+	t.Helper()
+	return privateTreeState{
+		objects: gitRev(t, w.integrator.Dir, "cat-file", "--batch-all-objects", "--batch-check=%(objectname)"),
+		refs:    gitRev(t, w.integrator.Dir, "for-each-ref", "--format=%(refname)"),
+		tip:     gitRev(t, w.integrator.Dir, "rev-parse", integrationBranch),
+	}
+}
+
+// assertPrivateTreeUnchanged proves a rejected artifact imported nothing
+// into the private integration tree: the tree holds exactly the same
+// objects, carries exactly the same refs, and its branch tip did not move.
+// The artifact's own ref namespace never appears either.
+func assertPrivateTreeUnchanged(t *testing.T, w *artifactWorld, before privateTreeState) {
+	t.Helper()
+	after := capturePrivateTree(t, w)
+	if after.objects != before.objects {
+		t.Fatalf("private tree objects changed after the rejection:\nbefore:\n%s\nafter:\n%s",
+			before.objects, after.objects)
+	}
+	if after.refs != before.refs {
+		t.Fatalf("private tree refs changed after the rejection: before %q, after %q", before.refs, after.refs)
+	}
+	if after.tip != before.tip {
+		t.Fatalf("private tree tip = %s, want the unchanged %s", after.tip, before.tip)
+	}
+	// No ref under the artifact's own courier namespace exists: the
+	// artifact's ref was never applied to the private tree.
+	if refs := gitRev(t, w.integrator.Dir, "for-each-ref", "--format=%(refname)", ResultRefPrefix); refs != "" {
+		t.Fatalf("a ref under %s exists in the private tree: %s", ResultRefPrefix, refs)
+	}
+}
+
 // The honest-bundle happy path: one integration commit per brief, the
 // worker's own commits left behind, the bundle's ref never applied.
 func TestArtifactHappyPathIntegratesOneCommit(t *testing.T) {
@@ -319,6 +362,36 @@ func TestArtifactRejectsOversizedBlob(t *testing.T) {
 	requireRejected(t, err, rejectBlob)
 }
 
+// A highly compressible oversized object: the bundle on the wire is tiny —
+// far under the bundle bound — while the object it carries is over the
+// per-blob bound. Only the object budget can catch it, and it must be
+// caught against the pack, before git inflates the bomb. Nothing of it may
+// reach the private integration tree.
+func TestArtifactRejectsCompressibleOversizedBlob(t *testing.T) {
+	w := newArtifactWorld(t, nil)
+	before := capturePrivateTree(t, w)
+	bundle := w.simulateWorker("b1", func(dir string) {
+		// One repeated byte: the wire form compresses away, the object
+		// does not shrink.
+		blob := bytes.Repeat([]byte("x"), MaxArtifactBlobBytes+1)
+		if err := os.WriteFile(filepath.Join(dir, "bomb.bin"), blob, 0o644); err != nil {
+			t.Fatal(err)
+		}
+		gitCmd(t, dir, "add", "bomb.bin")
+		gitCommit(t, dir, "compressible bomb")
+	})
+	// The transport bound never sees this artifact: the bundle is tiny.
+	if len(bundle) >= MaxArtifactBundleBytes {
+		t.Fatalf("bundle is %d bytes, want well under the %d-byte bound",
+			len(bundle), MaxArtifactBundleBytes)
+	}
+	_, err := w.integrate("b1", bundle, "summary")
+	requireRejected(t, err, rejectBlob)
+	// The rejection was bounded and early: nothing was imported into the
+	// private integration tree.
+	assertPrivateTreeUnchanged(t, w, before)
+}
+
 func TestArtifactRejectsOversizedBundleFile(t *testing.T) {
 	w := newArtifactWorld(t, nil)
 	big := make([]byte, MaxArtifactBundleBytes+1024)
@@ -333,6 +406,7 @@ func TestArtifactRejectsOversizedBundleFile(t *testing.T) {
 
 func TestArtifactRejectsObjectCountBound(t *testing.T) {
 	w := newArtifactWorld(t, nil)
+	before := capturePrivateTree(t, w)
 	bundle := w.simulateWorker("b1", func(dir string) {
 		// One commit with more objects than the bound allows: 1-byte files
 		// keep the unpacked total under its own bound so the count is what
@@ -348,6 +422,9 @@ func TestArtifactRejectsObjectCountBound(t *testing.T) {
 	})
 	_, err := w.integrate("b1", bundle, "summary")
 	requireRejected(t, err, rejectObjects)
+	// The excess object set was refused early: nothing was imported into
+	// the private integration tree.
+	assertPrivateTreeUnchanged(t, w, before)
 }
 
 func TestArtifactRejectsUnpackedSizeBound(t *testing.T) {

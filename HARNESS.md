@@ -1116,7 +1116,20 @@ Validation runs in trusted control, in order, before any integration:
    object count, and per-blob size (initially 64 MiB bundle, 64 MiB unpacked,
    10⁵ objects, 16 MiB per blob). A bundle over any bound is rejected whole,
    never truncated; objects beyond the result ref's closure are ignored and
-   never integrated, and bounds apply regardless.
+   never integrated, and bounds apply regardless. The budget envelope is
+   enforced against the bundle's own pack **before** git inflates anything: an
+   object count or an object size over budget is refused from the pack's own
+   declarations, and the scan itself never inflates more than the byte budget
+   allows, so an over-budget bundle cannot cost the operator more than that
+   budget — never the size of what it claims to carry. The envelope bounds
+   every delivered object, not only blobs: a delta's result type is not
+   knowable from the pack, so the per-blob size applies to any object the
+   bundle delivers. The objects that survive the envelope are unpacked into a
+   quarantined object directory, and the object inventory is streamed from
+   that quarantine, bounded incrementally with early rejection at the count,
+   byte, and per-blob bounds rather than after the whole object set is
+   collected. The quarantine is discarded with the staging directory, so
+   nothing hostile reaches the private tree.
 3. Ref-set equality: the bundle advertises exactly the expected result ref —
    no extra refs, no unexpected names, no ref outside the `refs/courier/`
    namespace. The import is **refless**: control fetches exactly the expected
@@ -1672,7 +1685,10 @@ and the acceptance tests below are satisfied.
   or treated as data. The artifact contract (§5) is exercised directly: a
   bundle built on any base other than the dispatched snapshot tip is rejected
   without interpretation; a bundle over any bound (bundle size, unpacked size,
-  object count, blob size) is rejected whole; extra refs, unexpected ref
+  object count, blob size) is rejected whole, bounded and early — the envelope
+  is enforced against the pack's own declarations before git inflates it, and
+  no object of a rejected artifact reaches the private tree; extra refs,
+  unexpected ref
   names, or refs outside the `refs/courier/` namespace are rejected, and
   bundle-declared refs are never applied to the private tree (refless import);
   a changed-path set outside the operator-resolved path scope is rejected,

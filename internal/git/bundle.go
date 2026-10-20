@@ -67,9 +67,22 @@ func BundleHeads(ctx context.Context, bundlePath string) ([]BundleRef, error) {
 // is intended. The directory must be empty or dedicated: objects beyond any
 // result ref's closure land there too, because bounds apply to the whole
 // delivered set.
-func Unbundle(ctx context.Context, objectDir, bundlePath string) error {
+//
+// The budget envelope is enforced BEFORE the pack is unpacked: the bundle's
+// pack is scanned against limits first, so a bundle that breaks the object
+// count or an object size is refused from the pack's own declarations and
+// git never inflates it at all. The scan inflates no more than the byte
+// budget allows, so an over-budget bundle can never cost the operator more
+// than that budget, never the size of what it claims to carry.
+func Unbundle(ctx context.Context, objectDir, bundlePath string, limits ObjectLimits) error {
+	if err := validObjectLimits(limits); err != nil {
+		return err
+	}
 	path, err := localBundlePath(bundlePath)
 	if err != nil {
+		return err
+	}
+	if err := scanBundlePack(ctx, path, limits); err != nil {
 		return err
 	}
 	scratch, err := os.MkdirTemp(filepath.Dir(objectDir), "courier-unbundle-")
@@ -98,34 +111,60 @@ type ObjectInventory struct {
 // configured there) and applies git's hash checks while reading them. It runs
 // inside repoDir because cat-file requires a repository even with an explicit
 // object directory; GIT_OBJECT_DIRECTORY still fully isolates the listing to
-// the quarantine. The caller applies the §5 bounds to the result.
-func InventoryObjects(ctx context.Context, repoDir, objectDir string) (ObjectInventory, error) {
-	env := []string{"GIT_OBJECT_DIRECTORY=" + objectDir}
-	// The inventory is bounded by the caller's object-count check on a shared
-	// read budget: a hostile bundle cannot force an unbounded scan here.
-	out, err := HardenedWithEnv(ctx, repoDir, env, "cat-file", "--batch-all-objects", "--batch-check=%(objectname) %(objecttype) %(objectsize)")
-	if err != nil {
-		return ObjectInventory{}, fmt.Errorf("git inventory objects: %w", err)
+// the quarantine.
+//
+// The listing is streamed line by line and the bounds are enforced against
+// git's own numbers as they arrive, so the whole listing is never held: a
+// bound that trips stops git at once. The bounds are the caller's, and they
+// are passed in rather than applied afterwards; a listing that trips a bound
+// is reported as *LimitError.
+func InventoryObjects(ctx context.Context, repoDir, objectDir string, limits ObjectLimits) (ObjectInventory, error) {
+	if err := validObjectLimits(limits); err != nil {
+		return ObjectInventory{}, err
 	}
+	env := []string{"GIT_OBJECT_DIRECTORY=" + objectDir}
 	inventory := ObjectInventory{}
-	for _, line := range strings.Split(string(out), "\n") {
-		line = strings.TrimSpace(line)
-		if line == "" {
-			continue
+	var total uint64
+	err := hardenedLines(ctx, repoDir, env,
+		[]string{"cat-file", "--batch-all-objects", "--batch-check=%(objectname) %(objecttype) %(objectsize)"},
+		func(line string) (bool, error) {
+			line = strings.TrimSpace(line)
+			if line == "" {
+				return false, nil
+			}
+			fields := strings.SplitN(line, " ", 3)
+			if len(fields) != 3 || validOID(fields[0]) != nil {
+				return true, errors.New("malformed listing")
+			}
+			size, err := strconv.ParseInt(fields[2], 10, 64)
+			if err != nil || size < 0 {
+				return true, errors.New("malformed object size")
+			}
+			inventory.Count++
+			if inventory.Count > limits.MaxObjects {
+				return true, &LimitError{Limit: LimitObjects}
+			}
+			if fields[1] == "blob" && size > limits.MaxObjectBytes {
+				return true, &LimitError{Limit: LimitObjectBytes}
+			}
+			if uint64(size) > uint64(limits.MaxTotalBytes)-total {
+				return true, &LimitError{Limit: LimitBytes}
+			}
+			total += uint64(size)
+			inventory.TotalBytes = int64(total)
+			if fields[1] == "blob" && size > inventory.MaxBlobBytes {
+				inventory.MaxBlobBytes = size
+			}
+			return false, nil
+		})
+	if err != nil {
+		var limitErr *LimitError
+		if errors.As(err, &limitErr) {
+			// The partial inventory accompanies the violation; callers
+			// ignore it on error.
+			return inventory, err
 		}
-		fields := strings.SplitN(line, " ", 3)
-		if len(fields) != 3 || validOID(fields[0]) != nil {
-			return ObjectInventory{}, errors.New("git inventory objects: malformed listing")
-		}
-		size, err := strconv.ParseInt(fields[2], 10, 64)
-		if err != nil || size < 0 {
-			return ObjectInventory{}, errors.New("git inventory objects: malformed object size")
-		}
-		inventory.Count++
-		inventory.TotalBytes += size
-		if fields[1] == "blob" && size > inventory.MaxBlobBytes {
-			inventory.MaxBlobBytes = size
-		}
+		return ObjectInventory{}, fmt.Errorf("git inventory objects: %w", err)
 	}
 	if inventory.Count == 0 {
 		return ObjectInventory{}, errors.New("git inventory objects: no objects found")
