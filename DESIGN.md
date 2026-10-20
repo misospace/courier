@@ -176,6 +176,26 @@ published PR has stable, confirmed red checks reaches **HandedOff** and hands
 the PR to the source's independent repair mechanism. The source decides how to
 handle the failure; queue-backed PR-fix work follows its existing retry policy.
 
+A park-and-resume mechanical CI repair loop (#475) extends this boundary with
+contracts the operator and sources implement against; the operator's park,
+resume, and handoff wiring around them lands in follow-up work. The durable
+record is `CoderRun.status.cipark`: the exact published head the park observes,
+when the park began, how many repair opportunities the run consumed, and the
+outcome of the most recent one — enough to survive pod deletion and controller
+restart, with repo, PR, branch, and head identity already carried by existing
+status fields. Strict trigger separation is a pure classification, not a
+watcher behavior: only explicitly configured mechanical checks failing on the
+exact recorded head, with repair budget remaining, may wake a coordinator;
+pending or unregistered checks hold the park, and a merged, unobservable, or
+superseded-head observation, a non-mechanical failure, or an exhausted budget
+always finishes without waking. The optional source-side counterpart is the
+`CIParkLifecycle` capability: a fenced, idempotent park notice, repair-opportunity
+reservation, and outcome report so a connector that manages PR-fix queues can
+defer dispatch while a Courier repair opportunity is active and refuse stale
+generations instead of racing them. Sources that cannot fence must not
+implement the capability, and the core never emulates it with ordinary
+lifecycle calls.
+
 The coordinator declares its ending in the executor-provided outcome file,
 whose exact path is in the goal. The executor validates the declaration against
 the world: git state remains authoritative for whether declared changes exist

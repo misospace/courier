@@ -234,6 +234,41 @@ spec:
                     description: Plan is the coordinator's working plan.
                     type: string
                 type: object
+              cipark:
+                description: |-
+                  CIPark is the durable park-and-resume record while the run waits on
+                  CI in Verifying. Nil means the run is not parked (#475).
+                properties:
+                  attempts:
+                    description: |-
+                      Attempts counts consumed repair opportunities. The operator's
+                      finite retry/no-progress budget is enforced against this count.
+                    minimum: 0
+                    type: integer
+                  head:
+                    description: |-
+                      Head is the exact published head commit whose checks decide park,
+                      resume, or handoff. A later observation of a different head never
+                      triggers repair: the run fails closed to handoff instead.
+                    type: string
+                  lastOutcome:
+                    description: |-
+                      LastOutcome records the outcome of the most recent repair attempt;
+                      empty until one occurred.
+                    enum:
+                    - repushed
+                    - exhausted
+                    - unsupported
+                    type: string
+                  parkedAt:
+                    description: ParkedAt is when the operator parked the run.
+                    format: date-time
+                    type: string
+                required:
+                - attempts
+                - head
+                - parkedAt
+                type: object
               conditions:
                 description: Conditions is the standard condition set.
                 items:
