@@ -217,6 +217,47 @@ type Heartbeat struct {
 	CoordinatorPodUID string `json:"coordinatorPodUID"`
 }
 
+// CIParkOutcome is the outcome of the most recent mechanical CI repair
+// attempt of a parked run.
+// +kubebuilder:validation:Enum=repushed;exhausted;unsupported
+type CIParkOutcome string
+
+const (
+	// CIParkOutcomeRepushed: the coordinator fixed, revalidated, and pushed
+	// a new head; CI observation starts over on that head.
+	CIParkOutcomeRepushed CIParkOutcome = "repushed"
+	// CIParkOutcomeExhausted: the operator's retry/no-progress budget ran
+	// out without a repairable failure; the run hands off.
+	CIParkOutcomeExhausted CIParkOutcome = "exhausted"
+	// CIParkOutcomeUnsupported: recovery was not possible (unsupported
+	// checks, unobservable PR, superseded head, or a safe handoff boundary);
+	// the run hands off.
+	CIParkOutcomeUnsupported CIParkOutcome = "unsupported"
+)
+
+// CIParkState is the durable park-and-resume record for a run whose
+// published head is under mechanical CI observation (#475). It exists so
+// parking survives pod deletion and controller restart: the exact head,
+// when the park began, how many repair opportunities the run consumed,
+// and the outcome of the most recent one. Operator-owned; the harness
+// never writes it.
+type CIParkState struct {
+	// Head is the exact published head commit whose checks decide park,
+	// resume, or handoff. A later observation of a different head never
+	// triggers repair: the run fails closed to handoff instead.
+	Head string `json:"head"`
+	// ParkedAt is when the operator parked the run.
+	ParkedAt metav1.Time `json:"parkedAt"`
+	// Attempts counts consumed repair opportunities. The operator's
+	// finite retry/no-progress budget is enforced against this count.
+	// +kubebuilder:validation:Minimum=0
+	Attempts int `json:"attempts"`
+	// LastOutcome records the outcome of the most recent repair attempt;
+	// empty until one occurred.
+	// +optional
+	LastOutcome CIParkOutcome `json:"lastOutcome,omitempty"`
+}
+
 // TerminalDiagnosticCategory is the stable classification of a terminal run's
 // cause, derived only from evidence the operator observed. Unknown is used
 // whenever evidence is missing or ambiguous; a cause is never invented.
@@ -622,6 +663,11 @@ type CoderRunStatus struct {
 	// absent when no evidence was available, never fabricated.
 	// +optional
 	TerminalDiagnostic *TerminalDiagnostic `json:"terminalDiagnostic,omitempty"`
+
+	// CIPark is the durable park-and-resume record while the run waits on
+	// CI in Verifying. Nil means the run is not parked (#475).
+	// +optional
+	CIPark *CIParkState `json:"cipark,omitempty"`
 
 	// Conditions is the standard condition set.
 	// +optional

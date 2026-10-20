@@ -469,11 +469,12 @@ func TestCommitStatusesRejectPrematureEmptyPage(t *testing.T) {
 
 func TestCommitStatusStateMapsGitHubState(t *testing.T) {
 	for state, want := range map[string]controller.CheckState{
-		"pending": controller.CheckStatePending,
-		"success": controller.CheckStatePassed,
-		"failure": controller.CheckStateFailed,
-		"error":   controller.CheckStateFailed,
-		"unknown": controller.CheckStateFailed,
+		"pending":      controller.CheckStatePending,
+		"success":      controller.CheckStatePassed,
+		"failure":      controller.CheckStateFailed,
+		"error":        controller.CheckStateFailed,
+		"future-state": controller.CheckStateUnknown,
+		"":             controller.CheckStateUnknown,
 	} {
 		if got := commitStatusState(state); got != want {
 			t.Fatalf("commitStatusState(%q) = %q, want %q", state, got, want)
@@ -494,7 +495,11 @@ func TestCheckStateMapsGitHubStatusAndConclusion(t *testing.T) {
 		{name: "skipped", status: "completed", conclusion: "skipped", want: controller.CheckStatePassed},
 		{name: "neutral", status: "completed", conclusion: "neutral", want: controller.CheckStatePassed},
 		{name: "cancelled", status: "completed", conclusion: "cancelled", want: controller.CheckStateFailed},
-		{name: "unknown", status: "completed", conclusion: "future-result", want: controller.CheckStateFailed},
+		{name: "timed out", status: "completed", conclusion: "timed_out", want: controller.CheckStateFailed},
+		{name: "startup failure", status: "completed", conclusion: "startup_failure", want: controller.CheckStateFailed},
+		{name: "unknown conclusion stays unknown", status: "completed", conclusion: "future-result", want: controller.CheckStateUnknown},
+		{name: "missing conclusion stays unknown", status: "completed", want: controller.CheckStateUnknown},
+		{name: "unrecognized status defers to conclusion", status: "weird", conclusion: "success", want: controller.CheckStatePassed},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

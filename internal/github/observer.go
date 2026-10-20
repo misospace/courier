@@ -226,6 +226,10 @@ func splitRepository(repository string) (string, string, error) {
 	return parts[0], parts[1], nil
 }
 
+// checkState maps a GitHub check run's status and conclusion to a
+// CheckState. Unrecognized upstream values map to CheckStateUnknown, not
+// failed, so an uncertain verdict stays uncertain for fail-closed consumers
+// instead of masquerading as a failure.
 func checkState(status, conclusion string) controller.CheckState {
 	switch strings.ToLower(status) {
 	case "queued", "in_progress", "pending", "requested", "waiting":
@@ -234,18 +238,24 @@ func checkState(status, conclusion string) controller.CheckState {
 	switch strings.ToLower(conclusion) {
 	case "success", "skipped", "neutral":
 		return controller.CheckStatePassed
-	default:
+	case "failure", "timed_out", "cancelled", "startup_failure":
 		return controller.CheckStateFailed
+	default:
+		return controller.CheckStateUnknown
 	}
 }
 
+// commitStatusState maps a GitHub commit status's state to a CheckState with
+// the same unrecognized-to-unknown rule as checkState.
 func commitStatusState(state string) controller.CheckState {
 	switch strings.ToLower(state) {
 	case "pending":
 		return controller.CheckStatePending
 	case "success":
 		return controller.CheckStatePassed
-	default:
+	case "failure", "error":
 		return controller.CheckStateFailed
+	default:
+		return controller.CheckStateUnknown
 	}
 }

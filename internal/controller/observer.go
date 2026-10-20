@@ -14,6 +14,10 @@ const (
 	CheckStatePending CheckState = "pending"
 	CheckStatePassed  CheckState = "passed"
 	CheckStateFailed  CheckState = "failed"
+	// CheckStateUnknown marks a check whose upstream state is unrecognized.
+	// It must survive adapter normalization so downstream fail-closed
+	// consumers can finish rather than act on an uncertain verdict.
+	CheckStateUnknown CheckState = "unknown"
 )
 
 type CheckObservation struct {
