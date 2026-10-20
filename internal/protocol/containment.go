@@ -67,16 +67,22 @@ type taskContainment struct {
 
 var containment = &taskContainment{supervised: make(map[int]int)}
 
-// startTaskChild is the single funnel for a task child: Start, register,
-// return. Registration happens under the gate, so no adoption pass can see
-// the process's children without this task's pid in it.
+// startTaskChild is the single funnel for a task child: Start, register with
+// its identity pin, return. Registration happens under the gate, so no
+// adoption pass can see the process's children without this task's pid in it.
+// A registration that cannot pin terminates the child it just started rather
+// than run a task whose containment the worker cannot prove.
 func (c *taskContainment) startTaskChild(cmd *exec.Cmd) error {
 	c.gate.Lock()
 	defer c.gate.Unlock()
 	if err := cmd.Start(); err != nil {
 		return err
 	}
-	c.registerSupervised(cmd.Process.Pid)
+	if err := c.registerSupervised(cmd.Process.Pid); err != nil {
+		_ = cmd.Process.Kill()
+		_ = cmd.Wait()
+		return err
+	}
 	return nil
 }
 
@@ -96,19 +102,27 @@ func (c *taskContainment) releaseTaskChild(pid int) {
 
 // registerSupervised records a pid whose exit status os/exec owns and pins
 // it with a pidfd, so the number stays this task's for the whole life of
-// the registration. A platform that cannot open the pidfd registers
-// without a pin (-1); on Linux a process always opens pidfds for its own
-// children. Only the funnel calls it in the run; tests register the helper
-// children they Wait on, which is the same discipline those children
-// deserve.
-func (c *taskContainment) registerSupervised(pid int) {
+// the registration. The pin is what makes the containment kills identity-safe,
+// so a refused open (other than a platform without pidfds) fails the
+// registration rather than leave an unpinned supervised entry: an unpinned
+// registration would reopen exactly the recycled-pid window the pin closes.
+// Only the funnel calls it in the run.
+func (c *taskContainment) registerSupervised(pid int) error {
 	pin := -1
-	if fd, err := openPidfd(pid); err == nil {
+	fd, err := openPidfd(pid)
+	switch {
+	case err == nil:
 		pin = fd
+	case errors.Is(err, syscall.ENOSYS):
+		// A platform without pidfds has no /proc to enumerate either, so
+		// the containment proof fails closed at the snapshot regardless.
+	default:
+		return fmt.Errorf("protocol: could not pin supervised pid %d: %w", pid, err)
 	}
 	c.mu.Lock()
 	c.supervised[pid] = pin
 	c.mu.Unlock()
+	return nil
 }
 
 // taskPin returns the containment pidfd pinning a supervised pid, or -1

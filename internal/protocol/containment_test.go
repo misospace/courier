@@ -402,6 +402,7 @@ func TestWorkerSweepFailsClosedOnUnreadableStat(t *testing.T) {
 		return nil
 	}
 	processStatFailureHook.Store(&hook)
+	defer processStatFailureHook.Store(nil)
 
 	cancelEnv := env
 	cancelEnv.Kind = KindCancel
@@ -409,7 +410,6 @@ func TestWorkerSweepFailsClosedOnUnreadableStat(t *testing.T) {
 	cancelEnv.PayloadDigest = CancelPayloadDigest
 	cancelEnv.Nonce = "unreadable-cancel-nonce-1"
 	status, err := client.Cancel(ctx, priv, cancelEnv)
-	processStatFailureHook.Store(nil)
 	if err == nil {
 		t.Fatalf("cancellation was acknowledged with status %q while a live process was unreadable", status)
 	}
