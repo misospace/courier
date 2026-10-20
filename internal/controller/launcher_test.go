@@ -11,6 +11,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	rbacv1 "k8s.io/api/rbac/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
@@ -1053,5 +1054,49 @@ func TestCoordinatorLauncherValidateRequiresAPIReader(t *testing.T) {
 	wired := &CoordinatorLauncher{APIReader: fake.NewClientBuilder().WithScheme(launcherScheme(t)).Build()}
 	if err := wired.Validate(); err != nil {
 		t.Fatalf("Validate() error = %v", err)
+	}
+}
+
+// TestCoordinatorLauncherRejectsUnlaunchableLaneSizing pins the legacy launch
+// path's counterpart of the secure path's LaneConfig rejection: a lane whose
+// CPU/memory sizing could never launch fails the run NeedsHuman with a
+// permanent, terminalizable error before the coordinator pod is created.
+func TestCoordinatorLauncherRejectsUnlaunchableLaneSizing(t *testing.T) {
+	run := &courierv1alpha1.CoderRun{
+		ObjectMeta: metav1.ObjectMeta{Name: "run-1", Namespace: "default", UID: types.UID("run-uid")},
+		Spec: courierv1alpha1.CoderRunSpec{
+			Mode: courierv1alpha1.ModeResolveIssue,
+			Repo: "acme/widgets",
+			Ref:  1,
+			Lane: "broken",
+		},
+		Status: courierv1alpha1.CoderRunStatus{Phase: courierv1alpha1.PhaseClaimed},
+	}
+	lane := &courierv1alpha1.LaneProfile{
+		ObjectMeta: metav1.ObjectMeta{Name: "broken", Namespace: "default"},
+		Spec: courierv1alpha1.LaneProfileSpec{
+			Roles: map[string]string{"coordinator": "test-model"},
+			Resources: courierv1alpha1.PodResources{
+				Limits: corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("0")},
+			},
+		},
+	}
+	fakeClient := fake.NewClientBuilder().
+		WithScheme(launcherScheme(t)).
+		WithStatusSubresource(&courierv1alpha1.CoderRun{}).
+		WithRuntimeObjects(run, lane).
+		Build()
+	launcher := &CoordinatorLauncher{
+		Client: fakeClient,
+		Pod:    executor.PodConfig{Image: "example/opencode:test"},
+	}
+	err := launcher.Launch(context.Background(), run)
+	var permanent *SecureNeedsHumanError
+	if !errors.As(err, &permanent) || permanent.Reason != "LaneConfig" {
+		t.Fatalf("Launch() error = %v, want a *SecureNeedsHumanError with reason LaneConfig", err)
+	}
+	var podPod corev1.Pod
+	if err := fakeClient.Get(context.Background(), client.ObjectKey{Namespace: "default", Name: "run-1-coordinator"}, &podPod); !apierrors.IsNotFound(err) {
+		t.Fatalf("coordinator pod present after unlaunchable lane sizing: %v", err)
 	}
 }

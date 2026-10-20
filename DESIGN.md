@@ -1645,23 +1645,37 @@ Courier-created pod, the coordinator and the secure topology's control,
 worker, broker, and probe pods, carries finite CPU and memory requests
 whatever the lane says, which lets the scheduler bin-pack, keeps one runaway
 build from taking a node, and keeps these pods off the front of the eviction
-queue. The one deliberate exception is the preflight probe pod: its sizing is
-fixed (10m CPU / 32Mi memory requested, 500m CPU / 256Mi memory limited) and
-does not follow the lane, because preflight creates one probe per eligible
-node simultaneously and a seconds-lived network check reserving lane-scale
-capacity can stay Pending on a request-tight cluster and wedge preflight; the
-fixed finite requests keep it schedulable and never BestEffort, and the fixed
+queue. Two deliberate exceptions do not follow the lane. The preflight probe
+pod's sizing is fixed (10m CPU / 32Mi memory requested, 500m CPU / 256Mi
+memory limited), because preflight creates one probe per eligible node
+simultaneously and a seconds-lived network check reserving lane-scale capacity
+can stay Pending on a request-tight cluster and wedge preflight; the fixed
+finite requests keep it schedulable and never BestEffort, and the fixed
 generous limits keep it admissible where a ResourceQuota tracks limits.cpu or
 limits.memory — such a quota rejects any container missing the matching
 limit, and the probe image's real usage (a shell doing DNS and network
 checks) peaks in the tens of MiB, far under the limit, so the limit cannot
-OOM-kill the probe and falsify the isolation result it exists to produce. A
-lane that configures neither half gets the default whole; a limits-only lane
+OOM-kill the probe and falsify the isolation result it exists to produce.
+Likewise the workspace-observer sidecar and its seed init container on the
+coordinator pod always carry the fixed small `DefaultObserverResources`
+(25m/64Mi requested, 1 CPU/512Mi limited) whatever the lane says: they are
+Courier-internal helpers — baseline capture and workspace observation — and
+the lane sizes the work a model does, not the helper that hashes the
+workspace, so sizing them from the lane would multiply the pod's scheduler
+reservation for processes that never grow with it. Unsized, they were the one
+container class a fully-sized lane could still leave unbounded on a node.
+A lane that configures neither half gets the default whole; a limits-only lane
 gets the default requests; a requests-only lane is rendered with exactly its
 own requests plus the floored halves, so its pods
-really do run limit-less by its own choice. One consequence: a limit below the
-floored default request (say `limits.cpu: 100m` on a lane that sets no
-requests) renders requests above limits, which the API server rejects.
+really do run limit-less by its own choice. Zero or negative CPU/memory
+quantities are rejected before launch rather than floored into silence:
+`ValidatePodResources` fires from both launch paths on a lane that declares
+them, terminalizing the run `NeedsHuman` with reason `LaneConfig` before any
+pod is created — a lane's sizing is an operator decision, and an operator who
+wants the default omits the key rather than zeroing it (the render-layer
+floor still backs callers that bypass launch validation). One consequence: a
+limit below the floored default request (say `limits.cpu: 100m` on a lane that
+sets no requests) renders requests above limits, which the API server rejects.
 Requeueing cannot change a permanently invalid spec, so the rejection is caught
 where it happens and the run stops rather than cycling claim, preflight, and
 release on every reconcile. The secure path's dry-run proof is the primary
