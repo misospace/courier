@@ -163,6 +163,51 @@ func TestTaskShapedBlockedExternalOpensNoEvidenceGate(t *testing.T) {
 	}
 }
 
+// TestCapacityCategoryOnBlockedExternalOpensNoEvidenceGate proves the gate
+// needs the exact pairing, not merely a capacity category: a blocked_external
+// declaration that carries another capacity category (here the
+// model-provider availability handoff) is not the #455 forge ending, so it
+// opens no workspace-safety evidence gate, never carries the isolated
+// observer's proof, and never releases ownership.
+func TestCapacityCategoryOnBlockedExternalOpensNoEvidenceGate(t *testing.T) {
+	run := admissionRun("provider-blocked", "pool-a", courierv1alpha1.PhaseRunning)
+	run.UID = types.UID("run-uid")
+	run.Spec.Mode, run.Spec.Source, run.Spec.WorkItemID = courierv1alpha1.ModeResolveIssue, "fake", "provider-work"
+	run.Status.Branch = "branch"
+	lane := admissionLaneWithCoordinator("pool-a", 1)
+	lane.Spec.CapacityGroup = "shared-pool"
+	head := strings.Repeat("b", 40)
+	handoff := `COURIER_TERMINATION {"phase":"NeedsHuman","result":"needs-human","exit_code":2,"reason":"the model provider did not serve this attempt","outcome":"blocked_external","category":"provider-unavailable","workspace_safety":{"state":"pushed","branch":"branch","head":"` + head + `","remoteHead":"` + head + `"}}`
+	pod := forgeUnavailableCoordinatorPod(t, run, lane, handoff, "pushed")
+	c := capacityTestClient(t, lane, run, pod)
+	s := &capacitySource{admissionSource: &admissionSource{}}
+	r := &CoderRunReconciler{Client: c, APIReader: c, Sources: NewSourceRegistry(map[string]source.Adapter{"fake": s}), Now: func() time.Time { return time.Date(2026, 10, 18, 0, 0, 0, 0, time.UTC) }}
+	for attempt := 0; attempt < 2; attempt++ {
+		if _, err := r.Reconcile(context.Background(), admissionRequest(run.Name)); err != nil {
+			t.Fatalf("Reconcile attempt %d: %v", attempt+1, err)
+		}
+	}
+	var stored courierv1alpha1.CoderRun
+	if err := c.Get(context.Background(), admissionKey(run.Name), &stored); err != nil {
+		t.Fatal(err)
+	}
+	if stored.Status.Phase != courierv1alpha1.PhaseBlockedExternal {
+		t.Fatalf("phase = %q, want blocked-external", stored.Status.Phase)
+	}
+	if stored.Status.WorkspaceSafety != nil {
+		t.Fatalf("workspace safety = %#v, want none: only the forge-unavailable pairing opens the evidence gate", stored.Status.WorkspaceSafety)
+	}
+	if cond := apimeta.FindStatusCondition(stored.Status.Conditions, "LegacyWorkspaceObserved"); cond != nil {
+		t.Fatalf("legacy observation condition = %#v, want none", cond)
+	}
+	if stored.Status.TerminalDiagnostic == nil || stored.Status.TerminalDiagnostic.Category != courierv1alpha1.TerminalDiagnosticCategoryProviderUnavailable {
+		t.Fatalf("terminal diagnostic = %#v, want the trusted provider-unavailable category", stored.Status.TerminalDiagnostic)
+	}
+	if len(s.settled) != 0 {
+		t.Fatalf("settlement handoffs = %#v, want none: an unobserved ending never releases ownership", s.settled)
+	}
+}
+
 // forgeUnavailableDiagnosticReason is the operator's own label for the #455
 // forge-read ending: the forge read could not complete on a transient
 // availability condition, so the world was never observed and the work was

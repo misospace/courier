@@ -132,7 +132,7 @@ func (r reporter) capacityExhaustedTermination(ctx context.Context, workspace *g
 // outage, model-transport-error for a spent child-crash budget. `detail`
 // carries why this attempt stream ended (outage retries or a spent crash
 // budget).
-func (r reporter) availabilityRecoveryTermination(ctx context.Context, workspace *git.Workspace, cfg config, startCommit, category, detail string) termination {
+func (r reporter) availabilityRecoveryTermination(ctx context.Context, workspace *git.Workspace, cfg config, startCommit string, category courierv1alpha1.TerminalDiagnosticCategory, detail string) termination {
 	ctx, cancel := context.WithTimeout(ctx, 20*time.Second)
 	defer cancel()
 	return termination{

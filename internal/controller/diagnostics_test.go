@@ -556,7 +556,7 @@ func TestCategoryDiagnosticReasonNamesEachCause(t *testing.T) {
 	}{
 		{
 			courierv1alpha1.TerminalDiagnosticCategoryProviderUnavailable,
-			"the model provider repeatedly failed to serve this attempt; work released for another capacity",
+			"the model provider did not serve this attempt; work released for another capacity",
 		},
 		{
 			courierv1alpha1.TerminalDiagnosticCategoryForgeUnavailable,
@@ -581,6 +581,34 @@ func TestCategoryDiagnosticReasonNamesEachCause(t *testing.T) {
 	transport := categoryDiagnosticReason(courierv1alpha1.TerminalDiagnosticCategoryModelTransportError)
 	if strings.Contains(transport, "provider") || strings.Contains(transport, "forge") {
 		t.Errorf("model-transport-error label names a remote provider: %q", transport)
+	}
+}
+
+// TestEveryTerminalDiagnosticCategoryIsTrusted proves the operator trusts
+// every category the API vocabulary defines. A category the operator does not
+// know is silently dropped from the validated handoff, so the ending would
+// lose its cause and its recovery channel without any error.
+func TestEveryTerminalDiagnosticCategoryIsTrusted(t *testing.T) {
+	categories := []courierv1alpha1.TerminalDiagnosticCategory{
+		courierv1alpha1.TerminalDiagnosticCategoryExecutorCrash,
+		courierv1alpha1.TerminalDiagnosticCategoryModelTransportError,
+		courierv1alpha1.TerminalDiagnosticCategoryContinuationExhaustion,
+		courierv1alpha1.TerminalDiagnosticCategoryVerifierRejection,
+		courierv1alpha1.TerminalDiagnosticCategoryKubernetesFailure,
+		courierv1alpha1.TerminalDiagnosticCategoryNeedsDecision,
+		courierv1alpha1.TerminalDiagnosticCategoryBlockedExternal,
+		courierv1alpha1.TerminalDiagnosticCategoryCapacityExhaustion,
+		courierv1alpha1.TerminalDiagnosticCategoryProviderUnavailable,
+		courierv1alpha1.TerminalDiagnosticCategoryForgeUnavailable,
+		courierv1alpha1.TerminalDiagnosticCategoryUnknown,
+	}
+	for _, category := range categories {
+		if !knownTerminalDiagnosticCategory(category) {
+			t.Errorf("the operator does not trust the %q category", category)
+		}
+		if categoryDiagnosticReason(category) == "" {
+			t.Errorf("the %q category has no operator-visible reason", category)
+		}
 	}
 }
 

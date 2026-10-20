@@ -1053,21 +1053,24 @@ Several endings share the recoverable capacity channel, and each names the
 cause it can actually evidence, so the durable diagnostic points at the
 dependency that failed instead of at whichever one shares the channel. A
 confirmed structured exhaustion is `capacity-exhaustion`. A model provider
-that repeatedly failed to serve an attempt without ever producing a session id
-is `provider-unavailable`. A model/agent child process that kept exiting
+that never served an attempt — no session id was ever produced — is
+`provider-unavailable`. A model/agent child process that kept exiting
 non-zero until its repair budget was spent is `model-transport-error` — a
-local execution-process failure, never a provider outage. A forge read that
-could not complete on a transient availability condition — a rate limit, a
-server error, or a transport failure — is `forge-unavailable`: the world was
-never observed, so the run ends as a `blocked_external` declaration on the
-recovery channel, never as a `verifier-rejection`, which stays reserved for
-worlds the observation actually read and found contradictory. Only that exact
-pairing — a declared `blocked_external` outcome carried by a validated
-termination handoff whose category is `forge-unavailable` — opens the
-workspace-safety evidence gate; a task-shaped `blocked_external` with any
-other category opens nothing and never enters capacity recovery. A failed read
-never publishes a `Verifying` success and never claims the pull request is
-missing.
+local execution-process failure, never a provider outage. A forge **API** read
+that could not complete on a transient availability condition — a rate limit,
+a server error, or a transport failure — is `forge-unavailable`: the world
+was never observed, so the run ends as a `blocked_external` declaration on
+the recovery channel, never as a `verifier-rejection`, which stays reserved
+for worlds the observation actually read and found contradictory. The
+git-side remote-publication read behind the same observation is not classified
+that way yet: the git transport cannot yet tell an unreachable remote from a
+command that ran and failed, so its failures stay a fail-closed
+`verifier-rejection`. Only the exact pairing — a declared `blocked_external`
+outcome carried by a validated termination handoff whose category is
+`forge-unavailable` — opens the workspace-safety evidence gate; a
+task-shaped `blocked_external` with any other category opens nothing and
+never enters capacity recovery. A failed read never publishes a `Verifying`
+success and never claims the pull request is missing.
 
 The diagnostic carries the observed exit code, the executor-declared outcome
 kind when any, an **operator-derived** short reason (a category label, the

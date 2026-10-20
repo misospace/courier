@@ -725,7 +725,7 @@ func TestRunDeclaredNeedsDecisionReachesNeedsHumanAndComments(t *testing.T) {
 	if !strings.Contains(output.String(), "coordinator needs a decision: Which payment provider should the run use?") {
 		t.Fatalf("needs-decision reason = %q", output.String())
 	}
-	if got := terminationLineJSON(t, output.String())["category"]; got != terminalCategoryNeedsDecision {
+	if got := terminationLineJSON(t, output.String())["category"]; got != string(terminalCategoryNeedsDecision) {
 		t.Fatalf("termination category = %v, want %q", got, terminalCategoryNeedsDecision)
 	}
 	mu.Lock()
@@ -945,7 +945,7 @@ func TestRunDeclaredNoChangeNeededButCommittedBecomesFailed(t *testing.T) {
 	if !strings.Contains(output.String(), "opencode declared no change needed but the workspace has new commits or uncommitted changes") {
 		t.Fatalf("no-change-needed-committed reason = %q", output.String())
 	}
-	if got := terminationLineJSON(t, output.String())["category"]; got != terminalCategoryVerifierRejection {
+	if got := terminationLineJSON(t, output.String())["category"]; got != string(terminalCategoryVerifierRejection) {
 		t.Fatalf("termination category = %v, want %q", got, terminalCategoryVerifierRejection)
 	}
 }
@@ -2637,7 +2637,7 @@ func TestRunConfigFailureKeepsRunScope(t *testing.T) {
 	if exit["run_id"] != "coderrun-it-7" || exit["status"] != "error" {
 		t.Fatalf("run.exit event lost run scope or status: run_id=%v status=%v", exit["run_id"], exit["status"])
 	}
-	if got := terminationLineJSON(t, output.String())["category"]; got != terminalCategoryExecutorCrash {
+	if got := terminationLineJSON(t, output.String())["category"]; got != string(terminalCategoryExecutorCrash) {
 		t.Fatalf("termination category = %v, want %q", got, terminalCategoryExecutorCrash)
 	}
 }

@@ -250,11 +250,11 @@ const (
 	// signal that execution capacity (not task correctness) was exhausted.
 	TerminalDiagnosticCategoryCapacityExhaustion TerminalDiagnosticCategory = "capacity-exhaustion"
 	// TerminalDiagnosticCategoryProviderUnavailable is a model-provider
-	// availability handoff: the model provider repeatedly failed to serve
-	// this attempt (no structured allowance-exhaustion signal was
-	// observed), so the work is released recoverably for another capacity
-	// instead of failing permanently. It never claims the quota itself is
-	// exhausted.
+	// availability handoff: the attempt was never served by the model
+	// provider (no session id was produced and no structured
+	// allowance-exhaustion signal was observed), so the work is released
+	// recoverably for another capacity instead of failing permanently. It
+	// never claims the quota itself is exhausted.
 	TerminalDiagnosticCategoryProviderUnavailable TerminalDiagnosticCategory = "provider-unavailable"
 	// TerminalDiagnosticCategoryForgeUnavailable is a forge-read
 	// availability handoff: a forge read could not complete on a transient

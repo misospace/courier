@@ -310,7 +310,7 @@ func (r *CoderRunReconciler) recordCapacityCooldownLane(ctx context.Context, run
 	} else {
 		lane.Status.CapacityCooldown = &courierv1alpha1.CapacityCooldown{
 			CapacityID:       identity,
-			Reason:           fmt.Sprintf("run %s reported confirmed execution-capacity exhaustion", latestRun),
+			Reason:           fmt.Sprintf("run %s reported a recoverable capacity handoff", latestRun),
 			LastExhaustedRun: latestRun,
 			ExhaustionCount:  count,
 			NextEligibleAt:   metav1.NewTime(latest.Add(r.capacityCooldownWindow())),

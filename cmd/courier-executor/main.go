@@ -139,9 +139,10 @@ type termination struct {
 	// declaration drove the ending (#169); empty when classified from the
 	// world alone.
 	Outcome string `json:"outcome,omitempty"`
-	// Category is the stable, machine-readable cause classification (#272),
-	// matching the TerminalDiagnosticCategory values the operator persists.
-	Category string `json:"category,omitempty"`
+	// Category is the stable, machine-readable cause classification (#272).
+	// It is typed as the operator's TerminalDiagnosticCategory vocabulary, so
+	// the executor can only declare a cause the operator persists.
+	Category courierv1alpha1.TerminalDiagnosticCategory `json:"category,omitempty"`
 	// Summary is the compact per-run telemetry tallied from the OpenCode event
 	// stream (#172). Omitted when the run recorded no activity.
 	Summary *courierv1alpha1.RunTelemetry `json:"summary,omitempty"`
@@ -1462,7 +1463,7 @@ func run(ctx context.Context, stdout, stderr io.Writer) int {
 					continue
 				}
 				if verdict.FailReason != "" {
-					if verdict.ProviderUnavailable {
+					if verdict.ForgeUnavailable {
 						report.terminateCaptured(ctx, workspace, startCommit, report.forgeUnavailableTermination(workspace, cfg, startCommit, verdict.FailReason))
 						return exitNeedsHuman
 					}
@@ -1534,7 +1535,7 @@ func run(ctx context.Context, stdout, stderr io.Writer) int {
 					continue
 				}
 				if verdict.FailReason != "" {
-					if verdict.ProviderUnavailable {
+					if verdict.ForgeUnavailable {
 						report.terminateCaptured(ctx, workspace, startCommit, report.forgeUnavailableTermination(workspace, cfg, startCommit, verdict.FailReason))
 						return exitNeedsHuman
 					}
@@ -1638,17 +1639,21 @@ func run(ctx context.Context, stdout, stderr io.Writer) int {
 
 }
 
+// The terminal-diagnostic categories the executor may declare. They are
+// bound to the operator's vocabulary, so a category can never drift from the
+// value the operator persists: an unmatched category would be dropped by the
+// operator and the ending would silently lose its cause.
 const (
-	terminalCategoryExecutorCrash          = "executor-crash"
-	terminalCategoryModelTransportError    = "model-transport-error"
-	terminalCategoryContinuationExhaustion = "continuation-exhaustion"
-	terminalCategoryVerifierRejection      = "verifier-rejection"
-	terminalCategoryUnknown                = "unknown"
-	terminalCategoryNeedsDecision          = "needs-decision"
-	terminalCategoryBlockedExternal        = "blocked-external"
-	terminalCategoryCapacityExhaustion     = "capacity-exhaustion"
-	terminalCategoryProviderUnavailable    = "provider-unavailable"
-	terminalCategoryForgeUnavailable       = "forge-unavailable"
+	terminalCategoryExecutorCrash          = courierv1alpha1.TerminalDiagnosticCategoryExecutorCrash
+	terminalCategoryModelTransportError    = courierv1alpha1.TerminalDiagnosticCategoryModelTransportError
+	terminalCategoryContinuationExhaustion = courierv1alpha1.TerminalDiagnosticCategoryContinuationExhaustion
+	terminalCategoryVerifierRejection      = courierv1alpha1.TerminalDiagnosticCategoryVerifierRejection
+	terminalCategoryUnknown                = courierv1alpha1.TerminalDiagnosticCategoryUnknown
+	terminalCategoryNeedsDecision          = courierv1alpha1.TerminalDiagnosticCategoryNeedsDecision
+	terminalCategoryBlockedExternal        = courierv1alpha1.TerminalDiagnosticCategoryBlockedExternal
+	terminalCategoryCapacityExhaustion     = courierv1alpha1.TerminalDiagnosticCategoryCapacityExhaustion
+	terminalCategoryProviderUnavailable    = courierv1alpha1.TerminalDiagnosticCategoryProviderUnavailable
+	terminalCategoryForgeUnavailable       = courierv1alpha1.TerminalDiagnosticCategoryForgeUnavailable
 )
 
 // The outcome kinds the coordinator may declare (#169).
@@ -1728,7 +1733,7 @@ func failed(reason string) termination {
 	return failedWith(reason, terminalCategoryExecutorCrash)
 }
 
-func failedWith(reason, category string) termination {
+func failedWith(reason string, category courierv1alpha1.TerminalDiagnosticCategory) termination {
 	return termination{Phase: "Failed", Result: "failure", ExitCode: exitFailed, Reason: reason, Category: category}
 }
 
@@ -3540,7 +3545,7 @@ func (r reporter) closedOnlyPRReason() string {
 // (ambiguous, closed-only, foreign head, wrong base, a head whose
 // current commits the remote does not advertise, or a body whose
 // criterion-evidence block cannot be repaired) (#247, #248, #249).
-// ProviderUnavailable is true when the forge read failed on a transient
+// ForgeUnavailable is true when the forge read failed on a transient
 // availability condition — a rate limit, a server error, or a network
 // failure — and no in-session retry is possible, so the world was never
 // observed: the run then ends blocked_external for the operator's
@@ -3567,9 +3572,9 @@ type handoffVerdict struct {
 	// criteria check did not run.
 	StatusCounts map[broker.CriterionStatus]int
 	FailReason   string
-	// ProviderUnavailable marks a transient forge-availability ending
+	// ForgeUnavailable marks a transient forge-availability ending
 	// (#455); see the struct doc above.
-	ProviderUnavailable bool
+	ForgeUnavailable bool
 }
 
 // applyHandoffPlan runs the identity-checked pre-handoff forge
@@ -3664,7 +3669,7 @@ func (r reporter) applyHandoffPlan(ctx context.Context, continuations int, maxCo
 				// observed: the run ends blocked_external for the
 				// operator's bounded retry instead of escalating to
 				// a human as a verification rejection (#455).
-				return handoffVerdict{FailReason: r.forgeUnavailableReason(linkErr), ProviderUnavailable: true}
+				return handoffVerdict{FailReason: r.forgeUnavailableReason(linkErr), ForgeUnavailable: true}
 			}
 			return handoffVerdict{FailReason: r.linkageForgeFailureReason(linkErr)}
 		}

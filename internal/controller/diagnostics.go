@@ -197,11 +197,11 @@ func categoryDiagnosticReason(category courierv1alpha1.TerminalDiagnosticCategor
 	case courierv1alpha1.TerminalDiagnosticCategoryCapacityExhaustion:
 		return "execution capacity was confirmed exhausted"
 	case courierv1alpha1.TerminalDiagnosticCategoryProviderUnavailable:
-		// The model provider repeatedly failed to serve this attempt
-		// without ever producing a session; no structured
-		// allowance-exhaustion signal was observed, so the work is
-		// released for another capacity.
-		return "the model provider repeatedly failed to serve this attempt; work released for another capacity"
+		// The attempt was never served by the model provider: no session
+		// id was produced and no structured allowance-exhaustion signal
+		// was observed, so the work is released for another capacity. The
+		// label states what the evidence shows, not a quota verdict.
+		return "the model provider did not serve this attempt; work released for another capacity"
 	case courierv1alpha1.TerminalDiagnosticCategoryForgeUnavailable:
 		// A forge read could not complete on a transient availability
 		// condition, so the world was never observed; the work is

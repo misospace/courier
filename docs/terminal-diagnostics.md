@@ -1,12 +1,13 @@
 # Terminal runtime diagnostics
 
-When a `CoderRun` ends in a non-success terminal phase (`Failed` or
-`NeedsHuman`), the operator records `status.terminalDiagnostic`: a bounded,
-redacted snapshot of how the coordinator ended. It is captured **before pod
-cleanup**, is set once, and survives pod deletion and controller restart. The
-purpose is to distinguish an executor crash, a model transport error,
-continuation exhaustion, a verifier rejection, and a Kubernetes/container
-failure after the pod needed to diagnose them is gone.
+When a `CoderRun` ends in a non-success terminal phase (`Failed`,
+`NeedsHuman`, or `BlockedExternal`), the operator records
+`status.terminalDiagnostic`: a bounded, redacted snapshot of how the
+coordinator ended. It is captured **before pod cleanup**, is set once, and
+survives pod deletion and controller restart. The purpose is to distinguish an
+executor crash, a model transport error, continuation exhaustion, a verifier
+rejection, and a Kubernetes/container failure after the pod needed to
+diagnose them is gone.
 
 ## Categories
 
