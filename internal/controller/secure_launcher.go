@@ -59,10 +59,11 @@ func (s *SecureControl) LaunchSecure(ctx context.Context, run *courier.CoderRun)
 	if err := s.ensureFinalizer(ctx, run); err != nil {
 		return ctrl.Result{}, err
 	}
-	// The sizing is resolved once for the pods this pass renders: the
-	// preflight proof and every pod created below carry the same value, so a
-	// concurrent lane update cannot make the admitted spec differ from the
-	// created one.
+	// The sizing is resolved once for the lane-sized pods this pass renders:
+	// the preflight proof and the control, worker, and broker pods created
+	// below carry the same value, so a concurrent lane update cannot make the
+	// admitted spec differ from the created one. Probe pods carry their own
+	// fixed sizing on both paths.
 	resources, err := s.laneResources(ctx, run)
 	if err != nil {
 		return ctrl.Result{}, err
@@ -250,10 +251,11 @@ func (s *SecureControl) controlInvocation(ctx context.Context, run *courier.Code
 	return invocation, nil
 }
 
-// laneResources reads the pod sizing the run's lane configures. Every pod of
-// the secure topology carries it, so a lane that configures nothing still
-// renders the built-in default rather than a BestEffort pod. Read once per
-// pass and reused across the round's renders.
+// laneResources reads the pod sizing the run's lane configures. Every
+// lane-sized pod of the secure topology carries it — control, worker, and
+// broker; probe pods deliberately carry their own fixed sizing instead — so a
+// lane that configures nothing still renders the built-in default rather than
+// a BestEffort pod. Read once per pass and reused across the round's renders.
 func (s *SecureControl) laneResources(ctx context.Context, run *courier.CoderRun) (corev1.ResourceRequirements, error) {
 	lane := &courier.LaneProfile{}
 	if err := s.Client.Get(ctx, types.NamespacedName{Namespace: run.Namespace, Name: run.Spec.Lane}, lane); err != nil {

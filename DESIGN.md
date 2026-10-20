@@ -1626,33 +1626,46 @@ capability seam, not a Go or Kubernetes requirement: a lane can select a
 repository-specific image containing whatever tools its workflow needs, while
 the deployment default remains the minimal bootstrap image.
 
-`resources` is the lane's pod sizing, and the only source of it. The lane's
-vocabulary is a deliberate subset of `corev1.ResourceRequirements`: only
-`requests` and `limits` are expressible, because no Courier renderer sets
-`pod.spec.resourceClaims`, so a lane cannot configure a value Courier would
-ignore or that would only fail at pod admission (#403). Every requests/limits
-key is honoured, subject only to the CPU and memory request floor described
-below: extended-resource keys pass through to pods and ride normal Kubernetes
-scheduling and quota semantics, where Kubernetes defaults an extended
-resource's request to its limit — a key set in limits alone is valid and takes
-that request, a key set in both maps must carry equal quantities, and a key
-set in requests alone makes every pod on the lane invalid at admission. Limits
-are used exactly as written and may be omitted; requests keep whatever the
-lane configured, but CPU and memory requests are floored to Courier's built-in
-default (250m/512Mi requested, 2 CPU/4Gi limited) wherever they are absent or
-non-positive — so every Courier-created pod, the coordinator and the secure
-topology's control, worker, broker, and probe pods, carries finite CPU and
-memory requests whatever the lane says, which lets the scheduler bin-pack,
-keeps one runaway build from taking a node, and keeps these pods off the front
-of the eviction queue. A lane that configures neither half gets the default
-whole; a limits-only lane gets the default requests; a requests-only lane is
-rendered with exactly its own requests plus the floored halves, so its pods
+`resources` is the lane's pod sizing, and the only source of the lane-sized
+pods' sizing. The lane's vocabulary is a deliberate subset of
+`corev1.ResourceRequirements`: only `requests` and `limits` are expressible,
+because no Courier renderer sets `pod.spec.resourceClaims`, so a lane cannot
+configure a value Courier would ignore or that would only fail at pod
+admission (#403). Every requests/limits key is honoured, subject only to the
+CPU and memory request floor described below: extended-resource keys pass
+through to pods and ride normal Kubernetes scheduling and quota semantics,
+where Kubernetes defaults an extended resource's request to its limit — a key
+set in limits alone is valid and takes that request, a key set in both maps
+must carry equal quantities, and a key set in requests alone makes every pod
+on the lane invalid at admission. Limits are used exactly as written and may
+be omitted; requests keep whatever the lane configured, but CPU and memory
+requests are floored to Courier's built-in default (250m/512Mi requested,
+2 CPU/4Gi limited) wherever they are absent or non-positive — so every
+Courier-created pod, the coordinator and the secure topology's control,
+worker, broker, and probe pods, carries finite CPU and memory requests
+whatever the lane says, which lets the scheduler bin-pack, keeps one runaway
+build from taking a node, and keeps these pods off the front of the eviction
+queue. The one deliberate exception is the preflight probe pod: its sizing is
+fixed (10m CPU / 32Mi memory requested, 500m CPU / 256Mi memory limited) and
+does not follow the lane, because preflight creates one probe per eligible
+node simultaneously and a seconds-lived network check reserving lane-scale
+capacity can stay Pending on a request-tight cluster and wedge preflight; the
+fixed finite requests keep it schedulable and never BestEffort, and the fixed
+generous limits keep it admissible where a ResourceQuota tracks limits.cpu or
+limits.memory — such a quota rejects any container missing the matching
+limit, and the probe image's real usage (a shell doing DNS and network
+checks) peaks in the tens of MiB, far under the limit, so the limit cannot
+OOM-kill the probe and falsify the isolation result it exists to produce. A
+lane that configures neither half gets the default whole; a limits-only lane
+gets the default requests; a requests-only lane is rendered with exactly its
+own requests plus the floored halves, so its pods
 really do run limit-less by its own choice. One consequence: a limit below the
 floored default request (say `limits.cpu: 100m` on a lane that sets no
-requests) renders requests above limits, which the API server rejects. Requeueing
-cannot change a permanently invalid spec, so the rejection is caught where it
-happens and the run stops rather than cycling claim, preflight, and release on
-every reconcile. The secure path's dry-run proof is the primary catch: it admits
+requests) renders requests above limits, which the API server rejects.
+Requeueing cannot change a permanently invalid spec, so the rejection is caught
+where it happens and the run stops rather than cycling claim, preflight, and
+release on every reconcile. The secure path's dry-run proof is the primary
+catch: it admits
 the control, worker, and broker pods, and the probe pod too on the passes that
 create probes live, so no pass creates a spec it has not proved. The secure
 workload creates behind that proof return ordinary errors and rely on it; the two
@@ -1661,7 +1674,11 @@ coordinator's own create — classify an `Invalid` where it happens. That class,
 `PodAdmission`, terminalizes: the reconciler ends the run `NeedsHuman`
 from both `LaunchSecure` call sites, recording `SecurePreflightFailed`, and from
 the legacy launcher, which carries the cause in the run's terminal diagnostic
-instead. One more verdict terminalizes: `ProbeIdentity` — the pod a node's
+instead. A lane-sized pod in that class names something the operator can change;
+a probe pod in it does not, because its sizing is an implementation constant, so
+its rejection implicates the probe image or the cluster rather than the lane —
+which is why the probe is in the class at all, and stopping is still right
+there. One more verdict terminalizes: `ProbeIdentity` — the pod a node's
 probe name resolves to is pinned to another node, so whatever it observed is
 not evidence about the node under test. Its persistent causes — a 32-bit
 digest collision in the probe tag, which re-pins the one shared pod to the
@@ -1683,8 +1700,9 @@ the claim is released and the next pass retries it — and the legacy path needs
 fence at all, since the create that failed left no pod to tear down. The sizing is
 resolved once per launch pass, so the spec the dry run admits and the pods
 created afterwards are one artifact rather than two reads of a lane that may have
-moved. One lane-level value sizes every pod on the lane; per-role sizing is
-deliberately not modelled.
+moved. One lane-level value sizes every lane-sized pod on the lane; per-role
+sizing is deliberately not modelled, and the probe pods above are the one
+role-level exception.
 
 Roles name whatever models the operator has configured — cloud (`anthropic/...`,
 `openai/...`, `litellm-anthropic/MiniMax-M3`), local (`litellm/qwen3.8-27b`), or

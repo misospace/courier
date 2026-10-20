@@ -142,17 +142,21 @@ spec:
                 type: string
               resources:
                 description: |-
-                  Resources sizes the pods Courier creates for runs on this lane using
-                  Courier's narrowed pod-sizing vocabulary: claims are not expressible.
-                  Limits are used exactly as written and may be omitted; requests keep what
-                  the lane sets, but CPU and memory requests are floored to the built-in
-                  default wherever they are absent or non-positive, so no lane is
-                  BestEffort. A lane that configures nothing gets the default whole (see
-                  DefaultPodResources). Extended-resource keys such as nvidia.com/gpu pass
-                  through to the pod under normal Kubernetes scheduling and quota
-                  semantics: a key set in limits alone is valid and takes its request from
-                  that limit, a key set in both maps must carry equal quantities, and a key
-                  set in requests alone makes every pod on the lane invalid at admission.
+                  Resources sizes the lane-sized pods Courier creates for runs on this
+                  lane — the coordinator and the secure topology's control, worker, and
+                  broker pods — using Courier's narrowed pod-sizing vocabulary: claims
+                  are not expressible. Limits are used exactly as written and may be
+                  omitted; requests keep what the lane sets, but CPU and memory requests
+                  are floored to the built-in default wherever they are absent or
+                  non-positive, so no lane is BestEffort. A lane that configures nothing
+                  gets the default whole (see DefaultPodResources). Extended-resource
+                  keys such as nvidia.com/gpu pass through to the pod under normal
+                  Kubernetes scheduling and quota semantics: a key set in limits alone
+                  is valid and takes its request from that limit, a key set in both
+                  maps must carry equal quantities, and a key set in requests alone
+                  makes every pod on the lane invalid at admission. Preflight probe
+                  pods are the deliberate exception: they carry a small fixed sizing
+                  (ProbePodResources) that does not follow the lane.
                 properties:
                   limits:
                     additionalProperties:

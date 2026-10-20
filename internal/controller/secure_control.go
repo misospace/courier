@@ -52,11 +52,13 @@ func secureNeedsHuman(reason, format string, args ...any) *SecureNeedsHumanError
 // just-written NetworkPolicy or a stale RBAC informer cache clears on a later
 // pass, and terminalizing those would strand a recoverable run. PodAdmission
 // covers a rendered spec the API server rejects outright — only its author
-// can fix that. ProbeIdentity covers a probe pod whose deterministic name
-// resolves to a pod pinned to another node: its persistent causes (a digest
-// collision in the probe tag, a foreign pod holding the name) outlast a
-// requeue, and the read cannot tell them from a stray pod a later pass would
-// clear.
+// can fix that. A probe pod is in the class although no lane configures it:
+// its spec is an implementation constant, so a rejection there implicates the
+// probe image or the cluster, and neither clears on a later pass.
+// ProbeIdentity covers a probe pod whose deterministic name resolves to a pod
+// pinned to another node: its persistent causes (a digest collision in the
+// probe tag, a foreign pod holding the name) outlast a requeue, and the read
+// cannot tell them from a stray pod a later pass would clear.
 func terminalPreflightVerdict(err error) *SecureNeedsHumanError {
 	var permanent *SecureNeedsHumanError
 	if !errors.As(err, &permanent) {

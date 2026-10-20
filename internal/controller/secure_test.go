@@ -1258,7 +1258,7 @@ func TestProbePodsAreExcludedFromWorkloadLookups(t *testing.T) {
 	}
 	// A leftover probe pod from a crashed preflight pass: worker labels, but
 	// marked as a probe.
-	probe := topology.ProbePod(run, "node-a", "busybox:test", "true", courier.DefaultPodResources())
+	probe := topology.ProbePod(run, "node-a", "busybox:test", "true")
 	if probe.Labels[topology.LabelProbe] != "true" {
 		t.Fatal("probe pods must carry the probe label")
 	}
@@ -1290,11 +1290,11 @@ func TestProbeCoverageIsIncompleteWithoutEveryNode(t *testing.T) {
 	// Two eligible nodes; only node-a produced a complete result set (two
 	// checks), node-b's probe crashed without a readable result.
 	for _, node := range []string{"node-a", "node-b"} {
-		if err := c.Create(context.Background(), topology.ProbePod(run, node, "busybox:test", "true", courier.DefaultPodResources())); err != nil {
+		if err := c.Create(context.Background(), topology.ProbePod(run, node, "busybox:test", "true")); err != nil {
 			t.Fatal(err)
 		}
 	}
-	a := topology.ProbePod(run, "node-a", "busybox:test", "true", courier.DefaultPodResources())
+	a := topology.ProbePod(run, "node-a", "busybox:test", "true")
 	a.Status.Phase = corev1.PodSucceeded
 	a.Status.ContainerStatuses = []corev1.ContainerStatus{{
 		Name:  "probe",
@@ -1303,7 +1303,7 @@ func TestProbeCoverageIsIncompleteWithoutEveryNode(t *testing.T) {
 	if err := c.Status().Update(context.Background(), a); err != nil {
 		t.Fatal(err)
 	}
-	b := topology.ProbePod(run, "node-b", "busybox:test", "true", courier.DefaultPodResources())
+	b := topology.ProbePod(run, "node-b", "busybox:test", "true")
 	b.Status.Phase = corev1.PodFailed
 	b.Status.ContainerStatuses = []corev1.ContainerStatus{{
 		Name:  "probe",
@@ -1312,7 +1312,7 @@ func TestProbeCoverageIsIncompleteWithoutEveryNode(t *testing.T) {
 	if err := c.Status().Update(context.Background(), b); err != nil {
 		t.Fatal(err)
 	}
-	_, pending, err := control.collectProbeResults(context.Background(), run, []string{"node-a", "node-b"}, 2, courier.DefaultPodResources())
+	_, pending, err := control.collectProbeResults(context.Background(), run, []string{"node-a", "node-b"}, 2)
 	if err == nil {
 		t.Fatal("incomplete probe coverage must not be treated as evidence")
 	}
@@ -1420,7 +1420,7 @@ func TestLiveProbePodsStaySeparatePerNode(t *testing.T) {
 			second: denyResults(checks...),
 		})
 
-		if err := control.runLiveProbes(context.Background(), run, nil, courier.DefaultPodResources()); err != nil {
+		if err := control.runLiveProbes(context.Background(), run, nil); err != nil {
 			t.Fatalf("runLiveProbes: %v", err)
 		}
 		if len(created) != 2 {
@@ -1430,7 +1430,7 @@ func TestLiveProbePodsStaySeparatePerNode(t *testing.T) {
 			t.Fatalf("nodes %q and %q shared probe pod %q", first, second, created[first])
 		}
 		for _, node := range []string{first, second} {
-			want := topology.ProbePod(run, node, control.Config.ProbeImage, "true", courier.DefaultPodResources()).Name
+			want := topology.ProbePod(run, node, control.Config.ProbeImage, "true").Name
 			if created[node] != want {
 				t.Errorf("node %q got probe pod %q, want the one its own name derives: %q", node, created[node], want)
 			}
@@ -1454,7 +1454,7 @@ func TestLiveProbePodsStaySeparatePerNode(t *testing.T) {
 			second: denyResults(checks...),
 		})
 
-		err := control.runLiveProbes(context.Background(), run, nil, courier.DefaultPodResources())
+		err := control.runLiveProbes(context.Background(), run, nil)
 		if err == nil {
 			t.Fatal("an incomplete result set for one node must not pass the whole pass")
 		}
@@ -1477,7 +1477,7 @@ func TestProbeResultsRefuseAnotherNodesPod(t *testing.T) {
 		t.Fatal(err)
 	}
 	// A complete, passing result set — from a pod that never ran on node-a.
-	pod := topology.ProbePod(run, "node-a", "busybox:test", "true", courier.DefaultPodResources())
+	pod := topology.ProbePod(run, "node-a", "busybox:test", "true")
 	pod.Spec.NodeName = "node-b"
 	if err := c.Create(context.Background(), pod); err != nil {
 		t.Fatal(err)
@@ -1493,7 +1493,7 @@ func TestProbeResultsRefuseAnotherNodesPod(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	outcomes, pending, err := control.collectProbeResults(context.Background(), run, []string{"node-a"}, 2, courier.DefaultPodResources())
+	outcomes, pending, err := control.collectProbeResults(context.Background(), run, []string{"node-a"}, 2)
 	if err == nil {
 		t.Fatal("a probe running on another node must not be counted as this node's result")
 	}
