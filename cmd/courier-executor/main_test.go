@@ -4011,7 +4011,11 @@ func TestRunForgeReadCanceledDuringRequestDoesNotContinue(t *testing.T) {
 		code := run(ctx, &output, &errorsOut)
 		done <- runResult{code, output.String(), errorsOut.String()}
 	}()
-	<-readStarted
+	select {
+	case <-readStarted:
+	case <-time.After(30 * time.Second):
+		t.Fatal("run never issued the linkage forge read, so the cancellation window was never reached")
+	}
 	cancel()
 	result := <-done
 
@@ -4036,7 +4040,11 @@ func TestRunForgeReadCanceledDuringRequestDoesNotContinue(t *testing.T) {
 	}
 	// Each child invocation appends one record starting with the
 	// binary's first argument; the goal text carries embedded newlines,
-	// so count records rather than lines.
+	// so count records rather than lines, and fail fast when the child
+	// never ran at all instead of letting the count pass vacuously.
+	if len(invocations) == 0 {
+		t.Fatal("child argv log is empty; want exactly one child invocation (the declaring turn)")
+	}
 	if got := strings.Count(string(invocations), "\nrun --model ") + 1; got != 1 {
 		t.Fatalf("child invocations = %d, want 1 (no continuation turn on a canceled context): %q", got, string(invocations))
 	}
