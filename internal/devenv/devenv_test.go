@@ -274,7 +274,7 @@ func TestBootstrapAndEnvCaptureScripts(t *testing.T) {
 	}
 	for _, want := range []string{
 		"base='" + oid + "'",
-		`workspace="$PWD"`,
+		`workspace="$(pwd)"`,
 		"git archive --format=tar -o \"$archive\" \"$base\"",
 		"tar -xf \"$archive\" -C \"$src\"",
 		"test -f \"$src/" + ConfigPath + "\"",

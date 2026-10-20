@@ -90,7 +90,7 @@ func BootstrapScript(baseOID string) (string, error) {
 	}
 	return "set -eu\n" +
 		"base='" + baseOID + "'\n" +
-		"workspace=\"$PWD\"\n" +
+		"workspace=\"$(pwd)\"\n" +
 		"src=\"$(mktemp -d)\"\n" +
 		"courier_diag() {\n" +
 		"  printf 'courier-mise-path=%s\\n' \"$(command -v mise)\"\n" +

@@ -1297,7 +1297,7 @@ and the legacy executor's classification through `internal/devenv`:
   `mise run bootstrap` inside it — so the executed bytes are the approved
   base revision's bytes BY CONSTRUCTION, and mise's task discovery (config
   fragments, `conf.d`, task directories, includes, whatever surfaces it
-  reads)   cannot reach head content. No enumeration of what mise might
+  reads) cannot reach head content. No enumeration of what mise might
   discover is attempted, because none can be complete; enumeration-based
   pinning of referenced scripts was tried and removed as unsound. On
   success the task transfers the materialization's repository-local `bin/`
