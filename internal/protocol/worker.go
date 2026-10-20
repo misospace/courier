@@ -348,6 +348,15 @@ func (w *Worker) runTask(ctx context.Context, task Task) *Result {
 		_ = cmd.Process.Kill()
 		_ = cmd.Wait()
 		startErr = errNoProcessGroup
+		// The child never led a group, so no group signal covered its
+		// descendants; the sweep is what terminates the escapees it left
+		// behind. Survivors keep the failure unproven, never clean (#399).
+		survivors, sweepErr := containment.sweepAdoptedTrees(time.Now().Add(taskTreeVerifyBound))
+		if sweepErr != nil {
+			startErr = &containmentUnprovenError{survivors: 1, cause: errNoProcessGroup}
+		} else if survivors > 0 {
+			startErr = &containmentUnprovenError{survivors: survivors, cause: errNoProcessGroup}
+		}
 	}
 	exitCode := -1
 	if grouped {
@@ -402,6 +411,17 @@ func (w *Worker) runTask(ctx context.Context, task Task) *Result {
 			result.LiveDescendants++
 		} else {
 			result.LiveDescendants += survivors
+		}
+	}
+	// A start that failed after the child was already running proved its own
+	// teardown in the funnel; when that proof could not be made, the result
+	// reports the survivors so it stays unverified and is never released
+	// (#372, #399).
+	var unproven *containmentUnprovenError
+	if errors.As(startErr, &unproven) {
+		result.LiveDescendants = unproven.survivors
+		if result.LiveDescendants < 1 {
+			result.LiveDescendants = 1
 		}
 	}
 	if task.ArtifactPath != "" && status == ResultCompleted {

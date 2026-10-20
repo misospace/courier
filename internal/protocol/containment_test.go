@@ -497,3 +497,122 @@ func TestTaskPinIdentity(t *testing.T) {
 		t.Fatal("release left a supervised entry or its pin behind")
 	}
 }
+
+// TestWorkerPinRefusalFailsClosed pins the fail-closed half of the pin
+// contract: a registration that cannot open the pidfd never leaves an
+// unpinned supervised entry behind — tolerance for a refused open was the
+// recycled-pid race this pin exists to close. The funnel kills the child it
+// just started and proves its tree dead, so the failure result reports a
+// verified stop, and no supervised entry survives the run.
+func TestWorkerPinRefusalFailsClosed(t *testing.T) {
+	worker, priv, server := newTestWorker(t)
+	client := &Client{BaseURL: server.URL}
+	ctx := context.Background()
+
+	hook := func(int) (int, error) { return -1, syscall.ENOSYS }
+	pidfdOpenHook.Store(&hook)
+	defer pidfdOpenHook.Store(nil)
+
+	task, _ := json.Marshal(Task{Command: []string{"sh", "-c", "exec sleep 300"}})
+	env := dispatchEnvelope(worker.clock())
+	env.PayloadDigest = PayloadDigestOf(task)
+	if _, err := client.Dispatch(ctx, priv, env, task); err != nil {
+		t.Fatalf("Dispatch: %v", err)
+	}
+	deadline := time.Now().Add(15 * time.Second)
+	for {
+		state, err := client.Result(ctx, "op-1")
+		if err == nil && state.Result != nil {
+			if state.Result.Status != ResultFailed || state.Result.ExitCode != -1 {
+				t.Fatalf("pin-failure result = %+v, want a failed start", state.Result)
+			}
+			if state.Result.LiveDescendants != 0 {
+				t.Fatalf("pin-failure teardown did not prove the tree dead: %+v", state.Result)
+			}
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("task never failed after the pin was refused")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	// An unpinned entry cannot exist: the refused registration never stored
+	// one, and the funnel's teardown left nothing supervised behind.
+	if len(containment.supervised) != 0 {
+		t.Fatalf("a failed registration left supervised entries behind: %v", containment.supervised)
+	}
+}
+
+// TestWorkerPinFailureSweepsEscapee pins the sweep half of the funnel's
+// teardown: a task child that started, daemonised an escapee into a session
+// of its own, and then failed its pin registration must not leave that
+// escapee running behind a clean report. The escaped pid is written from
+// inside the new session, so by the time registration fails the group signal
+// can no longer reach the escapee — only the sweep can.
+func TestWorkerPinFailureSweepsEscapee(t *testing.T) {
+	if _, err := exec.LookPath("setsid"); err != nil {
+		t.Skip("setsid is required to leave the task's process group")
+	}
+	worker, priv, server := newTestWorker(t)
+	client := &Client{BaseURL: server.URL}
+	ctx := context.Background()
+
+	// The hook holds registration open until the escapee has reported its
+	// pid from inside its own session, so the teardown below really races a
+	// live escapee rather than a child killed before it forked anything.
+	// The error is deliberately not ENOSYS: every pin refusal now fails
+	// closed the same way.
+	hook := func(int) (int, error) {
+		deadline := time.Now().Add(10 * time.Second)
+		for {
+			if _, err := os.Stat(filepath.Join(worker.config.WorkspaceDir, "escaped.txt")); err == nil {
+				break
+			}
+			if time.Now().After(deadline) {
+				break
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+		return -1, errors.New("too many open files")
+	}
+	pidfdOpenHook.Store(&hook)
+	defer pidfdOpenHook.Store(nil)
+
+	task, _ := json.Marshal(Task{Command: []string{"sh", "-c", `setsid sh -c 'echo $$ > escaped.txt; while :; do sleep 0.2; done' >/dev/null 2>&1 & sleep 5`}})
+	env := dispatchEnvelope(worker.clock())
+	env.PayloadDigest = PayloadDigestOf(task)
+	if _, err := client.Dispatch(ctx, priv, env, task); err != nil {
+		t.Fatalf("Dispatch: %v", err)
+	}
+	escapee := waitForDescendantPID(t, filepath.Join(worker.config.WorkspaceDir, "escaped.txt"))
+	deadline := time.Now().Add(15 * time.Second)
+	for {
+		state, err := client.Result(ctx, "op-1")
+		if err == nil && state.Result != nil {
+			if state.Result.Status != ResultFailed || state.Result.ExitCode != -1 {
+				t.Fatalf("pin-failure result = %+v, want a failed start", state.Result)
+			}
+			if state.Result.LiveDescendants != 0 {
+				t.Fatalf("funnel teardown did not prove the escapee dead: %+v", state.Result)
+			}
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("task never failed after the pin was refused")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	// The escapee was killed by the sweep and collected: a zombie keeps its
+	// /proc entry until someone reaps it, so the disappearance proves both
+	// halves — nothing live survives the call, and nothing was left unreaped.
+	deadline = time.Now().Add(15 * time.Second)
+	for {
+		if _, err := os.Stat("/proc/" + strconv.Itoa(escapee)); os.IsNotExist(err) {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("escapee %d outlived the funnel's containment proof", escapee)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+}

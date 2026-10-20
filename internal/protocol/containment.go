@@ -70,20 +70,70 @@ var containment = &taskContainment{supervised: make(map[int]int)}
 // startTaskChild is the single funnel for a task child: Start, register with
 // its identity pin, return. Registration happens under the gate, so no
 // adoption pass can see the process's children without this task's pid in it.
-// A registration that cannot pin terminates the child it just started rather
-// than run a task whose containment the worker cannot prove.
+// A registration that cannot pin terminates the child it just started and
+// proves its whole tree dead rather than run a task whose containment the
+// worker cannot prove; a proof that cannot be made is reported as unproven,
+// never as a clean failure.
 func (c *taskContainment) startTaskChild(cmd *exec.Cmd) error {
 	c.gate.Lock()
-	defer c.gate.Unlock()
 	if err := cmd.Start(); err != nil {
+		c.gate.Unlock()
 		return err
 	}
-	if err := c.registerSupervised(cmd.Process.Pid); err != nil {
-		_ = cmd.Process.Kill()
-		_ = cmd.Wait()
-		return err
+	pid := cmd.Process.Pid
+	regErr := c.registerSupervised(pid)
+	if regErr == nil {
+		c.gate.Unlock()
+		return nil
 	}
-	return nil
+	return c.terminateUnregistered(pid, cmd, regErr)
+}
+
+// terminateUnregistered tears down a child that started but could not be
+// registered. The group it led — the child started with Setpgid, so it led
+// its own — is signalled while the direct child is still an unreaped zombie
+// whose number cannot be recycled, so descendants holding the task's output
+// descriptors die before the bounded Wait rather than a full grace after
+// it; the direct child then dies and is waited under the gate, so no
+// adoption pass can collect the status os/exec owes. The sweep terminates
+// the escapees the child already forked or daemonised, which the worker has
+// adopted now that their ancestors are gone. The returned error is the
+// registration failure when the proof succeeds, and an unproven marker when
+// it cannot: an unproven stop must never read as a clean failure (#399).
+func (c *taskContainment) terminateUnregistered(pid int, cmd *exec.Cmd, cause error) error {
+	_ = cmd.Process.Kill()
+	_ = signalProcessGroup(pid, syscall.SIGKILL)
+	_ = cmd.Wait()
+	c.gate.Unlock()
+	if live := awaitProcessGroupEmpty(pid); live > 0 {
+		return &containmentUnprovenError{survivors: live, cause: cause}
+	}
+	survivors, sweepErr := c.sweepAdoptedTrees(time.Now().Add(taskTreeVerifyBound))
+	if sweepErr != nil {
+		return &containmentUnprovenError{survivors: 1, cause: cause}
+	}
+	if survivors > 0 {
+		return &containmentUnprovenError{survivors: survivors, cause: cause}
+	}
+	return cause
+}
+
+// containmentUnprovenError marks a teardown that could not prove every
+// descendant of a terminated task is dead. Survivors is a floor on the live
+// processes left behind, and cause is the failure that started the teardown;
+// the run reports the survivors so an unproven termination is never
+// acknowledged as verified (#372, #399).
+type containmentUnprovenError struct {
+	survivors int
+	cause     error
+}
+
+func (e *containmentUnprovenError) Error() string {
+	return fmt.Sprintf("protocol: containment unproven, %d live descendant(s) may remain: %v", e.survivors, e.cause)
+}
+
+func (e *containmentUnprovenError) Unwrap() error {
+	return e.cause
 }
 
 // releaseTaskChild hands the pid back once Wait has taken its status. The
@@ -103,30 +153,34 @@ func (c *taskContainment) releaseTaskChild(pid int) {
 // registerSupervised records a pid whose exit status os/exec owns and pins
 // it with a pidfd, so the number stays this task's for the whole life of
 // the registration. The pin is what makes the containment kills identity-safe,
-// so a refused open (other than a platform without pidfds) fails the
-// registration rather than leave an unpinned supervised entry: an unpinned
-// registration would reopen exactly the recycled-pid window the pin closes.
-// Only the funnel calls it in the run.
+// so a refused open fails the registration rather than leave an unpinned
+// supervised entry: an unpinned registration would reopen exactly the
+// recycled-pid window the pin closes, and a task that cannot be pinned is
+// killed and proven instead of run unpinned. Only the funnel calls it in the
+// run.
 func (c *taskContainment) registerSupervised(pid int) error {
-	pin := -1
-	fd, err := openPidfd(pid)
-	switch {
-	case err == nil:
-		pin = fd
-	case errors.Is(err, syscall.ENOSYS):
-		// A platform without pidfds has no /proc to enumerate either, so
-		// the containment proof fails closed at the snapshot regardless.
-	default:
+	fd, err := supervisedPin(pid)
+	if err != nil {
 		return fmt.Errorf("protocol: could not pin supervised pid %d: %w", pid, err)
 	}
 	c.mu.Lock()
-	c.supervised[pid] = pin
+	c.supervised[pid] = fd
 	c.mu.Unlock()
 	return nil
 }
 
+// supervisedPin opens the pidfd that pins a supervised pid. Tests install
+// pidfdOpenHook to force the pin-failure paths; production always opens the
+// real descriptor.
+func supervisedPin(pid int) (int, error) {
+	if hook := pidfdOpenHook.Load(); hook != nil {
+		return (*hook)(pid)
+	}
+	return openPidfd(pid)
+}
+
 // taskPin returns the containment pidfd pinning a supervised pid, or -1
-// when the pid is not registered or was registered without a pin. Holding
+// when the pid is not registered. Holding
 // the pin across a process-group cleanup is what keeps the group number
 // from being reused by a concurrent task while the cleanup still signals it.
 func (c *taskContainment) taskPin(pid int) int {
@@ -416,6 +470,13 @@ var processStatFailureHook atomic.Pointer[func(pid int) error]
 // process listing nothing about the escapees can be proven, and unproven
 // termination must never read as verified. It is nil in production.
 var processEnumerationHook atomic.Pointer[func() error]
+
+// pidfdOpenHook, when non-nil, answers for a supervised pid's pin open.
+// Tests install it to force the pin-failure paths without waiting on kernel
+// conditions. It is nil in production, and it is atomic because a task's
+// goroutine reads it long after the test goroutine that installed it has
+// moved on.
+var pidfdOpenHook atomic.Pointer[func(pid int) (int, error)]
 
 var (
 	armOnce sync.Once
