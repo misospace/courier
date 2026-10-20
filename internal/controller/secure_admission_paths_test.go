@@ -233,8 +233,8 @@ func TestLiveProbeCreateClassifiesOnlyPermanentRejection(t *testing.T) {
 // and the create: a launcher that resolved sizing per step would create pods
 // the proof never admitted, and would read the lane more than once per pass.
 func TestLaunchSecureResolvesLaneResourcesOncePerPass(t *testing.T) {
-	sizing := func(cpuRequest, memoryRequest, cpuLimit, memoryLimit string) corev1.ResourceRequirements {
-		return corev1.ResourceRequirements{
+	sizing := func(cpuRequest, memoryRequest, cpuLimit, memoryLimit string) courier.PodResources {
+		return courier.PodResources{
 			Requests: corev1.ResourceList{
 				corev1.ResourceCPU:    resource.MustParse(cpuRequest),
 				corev1.ResourceMemory: resource.MustParse(memoryRequest),
@@ -378,6 +378,79 @@ func TestLaunchSecurePermanentRejectionTerminalizesRun(t *testing.T) {
 				t.Fatalf("transitions = %#v, want the source settled NeedsHuman", item.transitions)
 			}
 		})
+	}
+}
+
+// TestProbeIdentityMismatchTerminalizesRun is the reconciler half of the
+// probe-identity verdict (#449): a probe pod whose deterministic name resolves
+// to a pod pinned elsewhere is refused terminally, so the run ends NeedsHuman
+// naming the probe and both nodes instead of releasing the claim back to
+// Pending and cycling probe phases around a mismatch whose persistent causes
+// a requeue cannot clear.
+func TestProbeIdentityMismatchTerminalizesRun(t *testing.T) {
+	ctx := context.Background()
+	control, c := secureControl(t)
+	control.Config.LiveProbes = true
+	run := launchedSecureRun(t, c, "probe-identity-terminalizes", "local")
+	eligibleProbeCluster(t, c, run, "node-a")
+	probe := topology.ProbePod(run, "node-a", control.Config.ProbeImage, "true", courier.DefaultPodResources()).Name
+	// Stand in for the collision outcome: the pod the probe name resolves to
+	// survived pinned to a node the pass never asked about. The dry-run probe
+	// copy is left alone — only the live create is misplaced.
+	watcher, ok := control.Client.(client.WithWatch)
+	if !ok {
+		t.Fatal("the fake client does not support watch")
+	}
+	control.Client = interceptor.NewClient(watcher, interceptor.Funcs{
+		Create: func(ctx context.Context, c client.WithWatch, obj client.Object, opts ...client.CreateOption) error {
+			if err := c.Create(ctx, obj, opts...); err != nil {
+				return err
+			}
+			pod, isProbe := obj.(*corev1.Pod)
+			if !isProbe || pod.Name != probe {
+				return nil
+			}
+			misplaced := pod.DeepCopy()
+			misplaced.Spec.NodeName = "node-b"
+			return c.Update(ctx, misplaced)
+		},
+	})
+
+	item := &admissionSource{}
+	reconciler := &CoderRunReconciler{
+		Client:       c,
+		Launch:       func(context.Context, *courier.CoderRun) error { return nil },
+		Sources:      NewSourceRegistry(map[string]source.Adapter{"manual": item}),
+		StatusWriter: fakeStatusWriter{client: c},
+		Secure:       control,
+	}
+	control.Patcher = reconciler
+
+	if _, err := reconciler.Reconcile(ctx, ctrl.Request{NamespacedName: client.ObjectKeyFromObject(run)}); err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	var updated courier.CoderRun
+	if err := c.Get(ctx, client.ObjectKeyFromObject(run), &updated); err != nil {
+		t.Fatal(err)
+	}
+	if updated.Status.Phase != courier.PhaseNeedsHuman {
+		t.Fatalf("phase = %q, want NeedsHuman; a probe-identity mismatch must not cycle back to Pending", updated.Status.Phase)
+	}
+	condition := apimeta.FindStatusCondition(updated.Status.Conditions, "SecurePreflightFailed")
+	if condition == nil {
+		t.Fatal("the NeedsHuman terminalization must record SecurePreflightFailed")
+	}
+	if !strings.Contains(condition.Message, probe) ||
+		!strings.Contains(condition.Message, "scheduled on node node-b, not node-a") {
+		t.Fatalf("condition message = %q, want it to name the probe %q, the node it is pinned to, and the node under test", condition.Message, probe)
+	}
+	// The secure hand-off settles the source with a NeedsHuman transition,
+	// not a release back to Pending.
+	if len(item.released) != 0 {
+		t.Fatalf("released = %#v, want the claim settled by the transition, never released", item.released)
+	}
+	if len(item.transitions) == 0 || item.transitions[len(item.transitions)-1] != source.StateNeedsHuman {
+		t.Fatalf("transitions = %#v, want the source settled NeedsHuman", item.transitions)
 	}
 }
 

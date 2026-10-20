@@ -7,6 +7,7 @@ import (
 	"strings"
 	"testing"
 
+	courierv1alpha1 "github.com/misospace/courier/api/v1alpha1"
 	corev1 "k8s.io/api/core/v1"
 )
 
@@ -157,6 +158,25 @@ func TestParseRejectsUnknownFields(t *testing.T) {
 	}
 }
 
+// TestParseRejectsResourcesClaims pins the narrowed bootstrap vocabulary: the
+// config parses into PodResources, so resources.claims is an unknown field
+// and the strict parse rejects it at startup rather than silently ignoring a
+// value no renderer honours (#403).
+func TestParseRejectsResourcesClaims(t *testing.T) {
+	data := []byte(`profiles:
+  - name: local
+    roles:
+      coder: gpt-5
+    resources:
+      claims:
+        - name: gpu
+`)
+	_, err := Parse(data)
+	if err == nil || !strings.Contains(err.Error(), "claims") {
+		t.Fatalf("error = %v, want unknown field claims rejected", err)
+	}
+}
+
 func TestParseRejectsInvalidNameShapes(t *testing.T) {
 	// DNS-1123 label violations: the error must name the requirement.
 	dnsCases := []string{
@@ -291,7 +311,7 @@ func TestParseStoresResources(t *testing.T) {
 	}
 }
 
-func assertResources(t *testing.T, got corev1.ResourceRequirements, cpuReq, memReq, cpuLim, memLim string) {
+func assertResources(t *testing.T, got courierv1alpha1.PodResources, cpuReq, memReq, cpuLim, memLim string) {
 	t.Helper()
 	if got.Requests.Cpu().String() != cpuReq {
 		t.Fatalf("cpu request = %s, want %s", got.Requests.Cpu(), cpuReq)

@@ -519,8 +519,16 @@ func (s *SecureControl) collectProbeResults(ctx context.Context, run *courier.Co
 		}
 		if pod.Spec.NodeName != node {
 			// The name says node, the schedule says otherwise: whatever this
-			// pod observed is not evidence about the node under test.
-			return nil, false, fmt.Errorf("secure preflight: probe %s is scheduled on node %s, not %s; refusing the result",
+			// pod observed is not evidence about the node under test. The
+			// mismatch's persistent causes outlast a requeue — a digest
+			// collision in the probe tag re-pins the one shared pod to the
+			// last node probed on every pass, and a foreign pod holding the
+			// name may be recreated — and this read cannot tell them from a
+			// stray pod the next pass's delete-and-create would clear. Refuse
+			// terminally rather than cycling probe phases around an identity
+			// the run cannot vouch for, naming the probe and both nodes.
+			return nil, false, secureNeedsHuman("ProbeIdentity",
+				"probe %s is scheduled on node %s, not %s; refusing the result",
 				pod.Name, pod.Spec.NodeName, node)
 		}
 		if pod.Status.Phase != corev1.PodSucceeded && pod.Status.Phase != corev1.PodFailed {

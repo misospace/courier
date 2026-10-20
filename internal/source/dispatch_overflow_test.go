@@ -83,10 +83,22 @@ func TestRunnerMakesProgressAfterExclusionOverflow(t *testing.T) {
 	}
 	var mu sync.Mutex
 	var wire [][]string
+	var acks []map[string]any
 	step := 0
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		mu.Lock()
 		defer mu.Unlock()
+		if r.Method == http.MethodPost && r.URL.Path == "/api/pr-fix-queue/ack" {
+			// Hand-out acks accompany discovery but never consume a scripted
+			// discovery step.
+			var ack map[string]any
+			if err := json.NewDecoder(r.Body).Decode(&ack); err != nil {
+				t.Errorf("decode hand-out ack: %v", err)
+			}
+			acks = append(acks, ack)
+			_ = json.NewEncoder(w).Encode(map[string]any{"acknowledged": true})
+			return
+		}
 		wire = append(wire, r.URL.Query()["exclude_pr_fix"])
 		current := step
 		step++
@@ -161,6 +173,12 @@ func TestRunnerMakesProgressAfterExclusionOverflow(t *testing.T) {
 	if countWorkItem(followupID(omittedNumber)) != 1 {
 		t.Fatal("re-handed omitted generation was not absorbed by same-identity dedupe")
 	}
+	mu.Lock()
+	poll1Acks := len(acks)
+	mu.Unlock()
+	if poll1Acks != 1 {
+		t.Fatalf("hand-out acks after re-offer poll = %d, want the skip-path re-ack", poll1Acks)
+	}
 	if got := len(listRuns()); got != retainedTotal {
 		t.Fatalf("runs = %d after re-handed generation, want %d", got, retainedTotal)
 	}
@@ -186,8 +204,20 @@ func TestRunnerMakesProgressAfterExclusionOverflow(t *testing.T) {
 	}
 	mu.Lock()
 	requests := len(wire)
+	acked := append([]map[string]any(nil), acks...)
 	mu.Unlock()
 	if requests != 3 {
 		t.Fatalf("discovery requests = %d, want 3", requests)
+	}
+	if len(acked) != 2 {
+		t.Fatalf("hand-out acks = %d, want one skip-path re-ack and one materialization ack", len(acked))
+	}
+	for _, ack := range acked {
+		if ack["repo"] != "acme/widgets" || ack["generation"] != float64(1) || ack["agentName"] != "worker" {
+			t.Fatalf("hand-out ack body = %#v, want the queue identity pinned to the agent", ack)
+		}
+	}
+	if acked[0]["pr"] != float64(omittedNumber) || acked[1]["pr"] != float64(freshNumber) {
+		t.Fatalf("ack order = %v, %v, want the re-offered generation then the new offer", acked[0]["pr"], acked[1]["pr"])
 	}
 }

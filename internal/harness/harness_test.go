@@ -518,6 +518,422 @@ func TestStreamErrorChunkIsRedacted(t *testing.T) {
 	}
 }
 
+func TestStreamContentOverBoundIsATerminalError(t *testing.T) {
+	// Every line is individually valid and well under the per-line bound; only
+	// the total the completion would hold crosses the aggregate bound.
+	block := strings.Repeat("c", 1_000_000)
+	// One line more than the bound takes in whole blocks.
+	lines := maxStreamContentBytes/len(block) + 1
+	chunks := make([]string, 0, lines+1)
+	for range lines {
+		chunks = append(chunks, contentChunk(block))
+	}
+	chunks = append(chunks, finishChunk("stop"))
+	gateway, _, cleanup := gatewayFor(gatewayResponse{body: sse(chunks...)})
+	defer cleanup()
+	events, err := gateway.StreamChat(context.Background(), ChatRequest{Model: "m"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	deltas := 0
+	for _, event := range events {
+		switch event.Kind {
+		case KindDelta:
+			deltas++
+		case KindError:
+			if !errors.Is(event.Err, ErrStreamContentOverflow) {
+				t.Fatalf("terminal error = %v, want content overflow", event.Err)
+			}
+			if strings.Contains(event.Err.Error(), block[:64]) {
+				t.Fatalf("error echoed provider content: %v", event.Err)
+			}
+		default:
+			t.Fatalf("unexpected event kind %q", event.Kind)
+		}
+	}
+	if last := events[len(events)-1]; last.Kind != KindError || !errors.Is(last.Err, ErrStreamContentOverflow) {
+		t.Fatalf("terminal event = %+v, want content-overflow error", last)
+	}
+	if deltas == 0 {
+		t.Fatal("deltas accepted before the bound must stay valid events")
+	}
+}
+
+func TestStreamToolArgumentOverBoundYieldsNoToolRequest(t *testing.T) {
+	// One tool call split across fragments: each line is under the per-line
+	// bound and only the assembled arguments cross the aggregate bound.
+	fragment := strings.Repeat("a", 1_000_000)
+	lines := maxStreamToolArgumentBytes/len(fragment) + 1
+	chunks := make([]string, 0, lines+1)
+	for line := 0; line < lines; line++ {
+		id, name := "", ""
+		if line == 0 {
+			id, name = "call-1", "shell"
+		}
+		chunks = append(chunks, toolCallChunk(0, id, name, fragment))
+	}
+	chunks = append(chunks, finishChunk("tool_calls"))
+	gateway, _, cleanup := gatewayFor(gatewayResponse{body: sse(chunks...)})
+	defer cleanup()
+	events, err := gateway.StreamChat(context.Background(), ChatRequest{Model: "m"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, event := range events {
+		if event.Kind == KindToolRequest {
+			t.Fatalf("overflowing stream yielded a partial tool request: %+v", event.Tool)
+		}
+	}
+	if last := events[len(events)-1]; last.Kind != KindError || !errors.Is(last.Err, ErrStreamToolArgumentOverflow) {
+		t.Fatalf("terminal event = %+v, want tool-argument-overflow error", last)
+	}
+}
+
+func TestStreamToolCallCountOverBoundYieldsNoToolRequest(t *testing.T) {
+	// One index past the bound.
+	chunks := make([]string, 0, maxStreamToolCallCount+2)
+	for index := 0; index <= maxStreamToolCallCount; index++ {
+		chunks = append(chunks, toolCallChunk(index, fmt.Sprintf("call-%d", index), "shell", "{}"))
+	}
+	chunks = append(chunks, finishChunk("tool_calls"))
+	gateway, _, cleanup := gatewayFor(gatewayResponse{body: sse(chunks...)})
+	defer cleanup()
+	events, err := gateway.StreamChat(context.Background(), ChatRequest{Model: "m"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, event := range events {
+		if event.Kind == KindToolRequest {
+			t.Fatalf("overflowing stream yielded a partial tool request: %+v", event.Tool)
+		}
+	}
+	if last := events[len(events)-1]; last.Kind != KindError || !errors.Is(last.Err, ErrStreamToolCallOverflow) {
+		t.Fatalf("terminal event = %+v, want tool-call-overflow error", last)
+	}
+}
+
+func TestStreamToolIdentityOverBoundYieldsNoToolRequest(t *testing.T) {
+	// Identity exactly at the bound is accepted, and one byte past it is not.
+	// Every index is distinct so the count bound cannot be what rejects it.
+	id := strings.Repeat("i", maxStreamToolIdentityBytes/(2*maxStreamToolCallCount))
+	name := strings.Repeat("n", maxStreamToolIdentityBytes/(2*maxStreamToolCallCount))
+	chunks := make([]string, 0, maxStreamToolCallCount+2)
+	for index := range maxStreamToolCallCount {
+		chunks = append(chunks, toolCallChunk(index, id, name, "{}"))
+	}
+	chunks = append(chunks, toolCallChunk(0, "", "x", "{}"), finishChunk("tool_calls"))
+	gateway, _, cleanup := gatewayFor(gatewayResponse{body: sse(chunks...)})
+	defer cleanup()
+	events, err := gateway.StreamChat(context.Background(), ChatRequest{Model: "m"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, event := range events {
+		if event.Kind == KindToolRequest {
+			t.Fatalf("overflowing stream yielded a partial tool request: %+v", event.Tool)
+		}
+	}
+	if last := events[len(events)-1]; last.Kind != KindError || !errors.Is(last.Err, ErrStreamToolIdentityOverflow) {
+		t.Fatalf("terminal event = %+v, want tool-identity-overflow error", last)
+	}
+}
+
+func TestStreamEventsOverBoundIsATerminalError(t *testing.T) {
+	// One-byte deltas: the payload bound is nowhere near reached, so only the
+	// retained-event bound can reject this stream.
+	chunks := make([]string, 0, maxStreamEvents+2)
+	for range maxStreamEvents {
+		chunks = append(chunks, contentChunk("x"))
+	}
+	chunks = append(chunks, finishChunk("stop"))
+	gateway, _, cleanup := gatewayFor(gatewayResponse{body: sse(chunks...)})
+	defer cleanup()
+	events, err := gateway.StreamChat(context.Background(), ChatRequest{Model: "m"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The terminal error itself is exempt from the bound: the failure must
+	// still be reported, one event past the cap.
+	if len(events) != maxStreamEvents+1 {
+		t.Fatalf("retained events = %d, want %d plus the exempt terminal error", len(events), maxStreamEvents)
+	}
+	if last := events[len(events)-1]; last.Kind != KindError || !errors.Is(last.Err, ErrStreamEventOverflow) {
+		t.Fatalf("terminal event = %+v, want event-overflow error", last)
+	}
+}
+
+func TestStreamContentAtBoundStillFinalizes(t *testing.T) {
+	block := strings.Repeat("c", 1_000_000)
+	chunks := make([]string, 0, 10)
+	for range 8 {
+		chunks = append(chunks, contentChunk(block))
+	}
+	chunks = append(chunks, contentChunk(strings.Repeat("c", maxStreamContentBytes-8*len(block))), finishChunk("stop"))
+	gateway, _, cleanup := gatewayFor(gatewayResponse{body: sse(chunks...)})
+	defer cleanup()
+	events, err := gateway.StreamChat(context.Background(), ChatRequest{Model: "m"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	held := 0
+	for _, event := range events {
+		switch event.Kind {
+		case KindDelta:
+			held += len(event.Text)
+		case KindFinal:
+		default:
+			t.Fatalf("unexpected event kind %q", event.Kind)
+		}
+	}
+	if last := events[len(events)-1]; last.Kind != KindFinal {
+		t.Fatalf("terminal event = %+v, want final at exactly the content bound", last)
+	}
+	if held != maxStreamContentBytes {
+		t.Fatalf("retained content bytes = %d, want %d", held, maxStreamContentBytes)
+	}
+}
+
+func TestStreamToolArgumentsAtBoundStillEmitRequest(t *testing.T) {
+	fragment := strings.Repeat("a", 1_000_000)
+	tail := strings.Repeat("a", maxStreamToolArgumentBytes-4*len(fragment))
+	gateway, _, cleanup := gatewayFor(gatewayResponse{body: sse(
+		toolCallChunk(0, "call-1", "shell", fragment),
+		toolCallChunk(0, "", "", fragment),
+		toolCallChunk(0, "", "", fragment),
+		toolCallChunk(0, "", "", fragment),
+		toolCallChunk(0, "", "", tail),
+		finishChunk("tool_calls"),
+	)})
+	defer cleanup()
+	events, err := gateway.StreamChat(context.Background(), ChatRequest{Model: "m"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var calls []ToolCall
+	for _, event := range events {
+		switch event.Kind {
+		case KindToolRequest:
+			calls = append(calls, event.Tool)
+		default:
+			t.Fatalf("unexpected event kind %q", event.Kind)
+		}
+	}
+	if len(calls) != 1 {
+		t.Fatalf("tool requests = %d, want 1 at exactly the argument bound", len(calls))
+	}
+	if len(calls[0].Arguments) != maxStreamToolArgumentBytes || calls[0].Name != "shell" {
+		t.Fatalf("assembled tool call = name %q arguments %d bytes", calls[0].Name, len(calls[0].Arguments))
+	}
+}
+
+func TestStreamToolIdentityAtBoundStillEmitsRequests(t *testing.T) {
+	// Every index at once spends exactly the identity budget; the requests
+	// must still be assembled and emitted with identity intact.
+	half := maxStreamToolIdentityBytes / (2 * maxStreamToolCallCount)
+	id := strings.Repeat("i", half)
+	name := strings.Repeat("n", half)
+	chunks := make([]string, 0, maxStreamToolCallCount+1)
+	for index := range maxStreamToolCallCount {
+		chunks = append(chunks, toolCallChunk(index, id, name, "{}"))
+	}
+	chunks = append(chunks, finishChunk("tool_calls"))
+	gateway, _, cleanup := gatewayFor(gatewayResponse{body: sse(chunks...)})
+	defer cleanup()
+	events, err := gateway.StreamChat(context.Background(), ChatRequest{Model: "m"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	calls := 0
+	for _, event := range events {
+		switch event.Kind {
+		case KindToolRequest:
+			calls++
+			if event.Tool.ID != id || event.Tool.Name != name {
+				t.Fatalf("assembled identity = id %q name %q, want the sent identity", event.Tool.ID, event.Tool.Name)
+			}
+		default:
+			t.Fatalf("unexpected event kind %q", event.Kind)
+		}
+	}
+	if calls != maxStreamToolCallCount {
+		t.Fatalf("tool requests = %d, want %d at exactly the identity bound", calls, maxStreamToolCallCount)
+	}
+}
+
+func TestStreamEventsAtBoundStillFinalizes(t *testing.T) {
+	chunks := make([]string, 0, maxStreamEvents+1)
+	for range maxStreamEvents - 1 {
+		chunks = append(chunks, contentChunk("x"))
+	}
+	chunks = append(chunks, finishChunk("stop"))
+	gateway, _, cleanup := gatewayFor(gatewayResponse{body: sse(chunks...)})
+	defer cleanup()
+	events, err := gateway.StreamChat(context.Background(), ChatRequest{Model: "m"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(events) != maxStreamEvents {
+		t.Fatalf("retained events = %d, want exactly the bound", len(events))
+	}
+	if last := events[len(events)-1]; last.Kind != KindFinal {
+		t.Fatalf("terminal event = %+v, want final at exactly the event bound", last)
+	}
+}
+
+func TestStreamEventsOverflowDuringToolEmissionYieldsNoToolRequest(t *testing.T) {
+	// One slot of event capacity left and two complete tool calls to emit:
+	// the set is emitted atomically or not at all, so the overflow must
+	// reject the whole request set, never retain the request that fits.
+	chunks := make([]string, 0, maxStreamEvents+3)
+	for range maxStreamEvents - 1 {
+		chunks = append(chunks, contentChunk("x"))
+	}
+	chunks = append(chunks,
+		toolCallChunk(0, "call-1", "shell", "{}"),
+		toolCallChunk(1, "call-2", "shell", "{}"),
+		finishChunk("tool_calls"),
+	)
+	gateway, _, cleanup := gatewayFor(gatewayResponse{body: sse(chunks...)})
+	defer cleanup()
+	events, err := gateway.StreamChat(context.Background(), ChatRequest{Model: "m"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, event := range events {
+		if event.Kind == KindToolRequest {
+			t.Fatalf("overflowing stream yielded a partial tool request: %+v", event.Tool)
+		}
+	}
+	if last := events[len(events)-1]; last.Kind != KindError || !errors.Is(last.Err, ErrStreamEventOverflow) {
+		t.Fatalf("terminal event = %+v, want event-overflow error", last)
+	}
+}
+
+func TestStreamEventsAtBoundStillEmitsToolRequests(t *testing.T) {
+	// The request set exactly fills the event bound: the preflight must not
+	// reject a set that fits, or the bound is off by one.
+	chunks := make([]string, 0, maxStreamEvents+3)
+	for range maxStreamEvents - 2 {
+		chunks = append(chunks, contentChunk("x"))
+	}
+	chunks = append(chunks,
+		toolCallChunk(0, "call-1", "shell", "{}"),
+		toolCallChunk(1, "call-2", "shell", "{}"),
+		finishChunk("tool_calls"),
+	)
+	gateway, _, cleanup := gatewayFor(gatewayResponse{body: sse(chunks...)})
+	defer cleanup()
+	events, err := gateway.StreamChat(context.Background(), ChatRequest{Model: "m"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(events) != maxStreamEvents {
+		t.Fatalf("retained events = %d, want exactly the bound", len(events))
+	}
+	calls := 0
+	for _, event := range events {
+		switch event.Kind {
+		case KindDelta:
+		case KindToolRequest:
+			calls++
+		default:
+			t.Fatalf("unexpected event kind %q", event.Kind)
+		}
+	}
+	if calls != 2 {
+		t.Fatalf("tool requests = %d, want 2 at exactly the event bound", calls)
+	}
+}
+
+func TestStreamIncompleteToolRequestYieldsNoToolRequest(t *testing.T) {
+	// One complete call and one missing its name: every fragment is checked
+	// before any request is emitted, so the incomplete set yields no
+	// executable request beside the terminal error.
+	gateway, _, cleanup := gatewayFor(gatewayResponse{body: sse(
+		toolCallChunk(0, "call-1", "shell", "{}"),
+		toolCallChunk(1, "call-2", "", "{}"),
+		finishChunk("tool_calls"),
+	)})
+	defer cleanup()
+	events, err := gateway.StreamChat(context.Background(), ChatRequest{Model: "m"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, event := range events {
+		if event.Kind == KindToolRequest {
+			t.Fatalf("incomplete request set yielded an executable tool request: %+v", event.Tool)
+		}
+	}
+	if last := events[len(events)-1]; last.Kind != KindError || !strings.Contains(last.Err.Error(), "incomplete tool request") {
+		t.Fatalf("terminal event = %+v, want incomplete-request error", last)
+	}
+}
+
+func TestStreamUnderBoundContentStillFinalizes(t *testing.T) {
+	// Ordinary traffic is well inside the aggregate bounds; the bounds are
+	// not trip-wires on a normal completion.
+	block := strings.Repeat("x", 128*1024)
+	gateway, _, cleanup := gatewayFor(gatewayResponse{body: sse(
+		contentChunk(block),
+		contentChunk(block),
+		contentChunk(block),
+		contentChunk(block),
+		finishChunk("stop"),
+	)})
+	defer cleanup()
+	events, err := gateway.StreamChat(context.Background(), ChatRequest{Model: "m"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var text strings.Builder
+	for _, event := range events {
+		switch event.Kind {
+		case KindDelta:
+			text.WriteString(event.Text)
+		case KindFinal:
+		default:
+			t.Fatalf("unexpected event kind %q", event.Kind)
+		}
+	}
+	if last := events[len(events)-1]; last.Kind != KindFinal {
+		t.Fatalf("terminal event = %+v, want final", last)
+	}
+	if text.String() != strings.Repeat("x", 4*128*1024) {
+		t.Fatalf("assembled content length = %d, want %d", text.Len(), 4*128*1024)
+	}
+}
+
+func TestStreamUnderBoundToolArgumentsStillEmitRequest(t *testing.T) {
+	fragment := strings.Repeat("y", 64*1024)
+	gateway, _, cleanup := gatewayFor(gatewayResponse{body: sse(
+		toolCallChunk(0, "call-1", "shell", fragment),
+		toolCallChunk(0, "", "", fragment),
+		toolCallChunk(0, "", "", fragment),
+		toolCallChunk(0, "", "", fragment),
+		finishChunk("tool_calls"),
+	)})
+	defer cleanup()
+	events, err := gateway.StreamChat(context.Background(), ChatRequest{Model: "m"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var calls []ToolCall
+	for _, event := range events {
+		switch event.Kind {
+		case KindToolRequest:
+			calls = append(calls, event.Tool)
+		default:
+			t.Fatalf("unexpected event kind %q", event.Kind)
+		}
+	}
+	if len(calls) != 1 {
+		t.Fatalf("tool requests = %d, want 1", len(calls))
+	}
+	if calls[0].Name != "shell" || calls[0].ID != "call-1" || calls[0].Arguments != strings.Repeat("y", 4*64*1024) {
+		t.Fatalf("assembled tool call = name %q id %q arguments %d bytes", calls[0].Name, calls[0].ID, len(calls[0].Arguments))
+	}
+}
+
 func TestGatewayStatusErrorIsRedacted(t *testing.T) {
 	gateway, _, cleanup := gatewayFor(gatewayResponse{status: http.StatusForbidden})
 	defer cleanup()
