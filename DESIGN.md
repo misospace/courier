@@ -1234,7 +1234,12 @@ and the legacy executor's classification through `internal/devenv`:
   reported blocked-external over it. The stage's active-operation entry
   stays retained, the worker is fenced against every further dispatch, and
   the failure fails closed through the ordinary error path carrying the
-  unverified-termination fact. Every path that can leave a termination
+  unverified-termination fact. The fence for a terminal observation that
+  still carries live descendants is set centrally where the terminal result
+  is verified, so every caller of the dispatch-and-await path — not only the
+  bootstrap stage that re-fences on the sentinel it receives — stops further
+  dispatch against a worker whose task tree still holds live work. Every
+  path that can leave a termination
   unobserved produces that fact: a reconciliation that failed, one that
   observed work still live in the task tree or an operation the worker
   still reports as running, and an ordinary observation of a task tree that

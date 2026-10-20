@@ -166,6 +166,12 @@ type mockWorker struct {
 	// bootstrapResults are consumed in order by the scripted bootstrap task;
 	// with none scripted, a bootstrap task completes with an empty capture.
 	bootstrapResults []protocol.Result
+	// ordinaryResults are consumed in order by any task that matches no
+	// fixed control-task shape, standing in for a terminal observation whose
+	// process group still holds live work; scripted so the state-based
+	// invariants are pinned deterministically rather than only through the
+	// reconcile-failure variants.
+	ordinaryResults []protocol.Result
 	// hangResults makes every dispatched operation stay running: result
 	// polls answer "running" immediately, the way the real worker answers
 	// a known operation that has not terminated, until a cancellation
@@ -311,6 +317,14 @@ func (m *mockWorker) handleDispatch(w http.ResponseWriter, r *http.Request) {
 			result = m.bootstrapResults[0]
 			m.bootstrapResults = m.bootstrapResults[1:]
 		}
+		status := result.Status
+		if status == "" {
+			status = protocol.ResultCompleted
+		}
+		m.results[req.Envelope.OpID] = protocol.ResultState{Status: status, Result: &result}
+	case len(m.ordinaryResults) > 0:
+		result := m.ordinaryResults[0]
+		m.ordinaryResults = m.ordinaryResults[1:]
 		status := result.Status
 		if status == "" {
 			status = protocol.ResultCompleted
@@ -1447,6 +1461,88 @@ func TestDispatchAndAwaitUnobservedTerminationIsUnverified(t *testing.T) {
 				t.Fatalf("status patches record %d cleared operations, want none — an operation that may still be executing is never claimed cleared", clears)
 			}
 		})
+	}
+}
+
+// TestDispatchAndAwaitTerminalLiveDescendantsFencesTheWorker pins the #414
+// review invariant for the ORDINARY terminal-result path: an operation whose
+// terminal observation still carries live descendants is an unverified
+// termination for EVERY caller of dispatchAndAwait, not only the bootstrap
+// stage that re-fences on the sentinel it receives. The error carries
+// ErrTerminationUnverified, the operation's active-operation entry stays
+// retained, and the worker is fenced: the next dispatch is rejected before
+// it reaches the worker, because descendants of the ended task may still be
+// executing repository-authored work.
+//
+// The mock scripts the shape directly — a terminal status whose result still
+// carries live descendants (the real worker produces it when an unaccounted
+// writer outlives the group-empty grace) — so the state-based invariant is
+// pinned deterministically rather than only through the reconcile-failure
+// variants.
+func TestDispatchAndAwaitTerminalLiveDescendantsFencesTheWorker(t *testing.T) {
+	worker, delegator, cleanupWorker := testWorkerAndDelegator(t)
+	defer cleanupWorker()
+	worker.ordinaryResults = []protocol.Result{{
+		Status:     protocol.ResultCompleted,
+		ExitCode:   0,
+		StdoutTail: "background work continued past the task",
+		// The task's process group is not empty: the terminal observation
+		// carries live work, so it proves no termination.
+		LiveDescendants: 2,
+	}}
+
+	transport := &recordingTransport{}
+	coordinator, err := NewCoordinator(CoordinatorConfig{
+		Gateway:  &Gateway{BaseURL: "http://unused.invalid"},
+		Bindings: testBindings(),
+		Worker:   delegator,
+		Status:   NewStatusReporter(transport, "control-uid", "worker-uid", 0),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	_, err = coordinator.dispatchAndAwait(context.Background(), "op-1", "b1", protocol.Task{Command: []string{"true"}})
+	if !errors.Is(err, ErrTerminationUnverified) {
+		t.Fatalf("dispatchAndAwait() error = %v, want ErrTerminationUnverified in its chain", err)
+	}
+	// The task reached the worker exactly once and was never cancelled: the
+	// ending was observed on the poll path, not reconciled.
+	if got := worker.dispatchCount(); got != 1 {
+		t.Fatalf("worker dispatches = %d, want 1", got)
+	}
+	if got := worker.cancelCount(); got != 0 {
+		t.Fatalf("worker cancels = %d, want 0 — the case must exercise the poll path, not a reconciliation", got)
+	}
+	// The active-operation entry is retained: it was begun, and nothing
+	// cleared it — an operation that may still be executing is never
+	// claimed cleared.
+	transport.mu.Lock()
+	adds, clears := 0, 0
+	for _, p := range transport.patches {
+		if p.AddOperation != nil {
+			adds++
+		}
+		if p.ClearOperation != "" {
+			clears++
+		}
+	}
+	transport.mu.Unlock()
+	if adds == 0 {
+		t.Fatalf("status patches record no begun operation, want the dispatch evidence retained")
+	}
+	if clears != 0 {
+		t.Fatalf("status patches record %d cleared operations, want none — an operation that may still be executing is never claimed cleared", clears)
+	}
+	// The worker fence rejects the next dispatch without any further task
+	// reaching the worker.
+	dispatches := worker.dispatchCount()
+	_, err = coordinator.dispatchAndAwait(context.Background(), "op-2", "b1", protocol.Task{Command: []string{"true"}})
+	if err == nil || !strings.Contains(err.Error(), "fenced") {
+		t.Fatalf("post-fence dispatch error = %v, want the worker fence rejection", err)
+	}
+	if got := worker.dispatchCount(); got != dispatches {
+		t.Fatalf("worker dispatches after fence = %d, want %d — the fence must refuse every dispatch", got, dispatches)
 	}
 }
 

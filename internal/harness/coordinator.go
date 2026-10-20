@@ -1317,7 +1317,11 @@ func unverifiedTerminationDetail(state protocol.ResultState) error {
 // verifiedResult renders an independently observed terminal state as an
 // execution result. It clears the operation's entry — with the earned tool
 // heartbeat on a verified completion, without one on a verified cancellation
-// or failure — before the result travels.
+// or failure — before the result travels. A terminal observation that
+// carries live descendants is never a verified termination: the entry stays
+// retained and the worker is fenced here, for every caller, so no path that
+// observed this state can leave a further dispatch running against a worker
+// whose task tree may still hold live work (#414 review).
 func (c *Coordinator) verifiedResult(ctx context.Context, opID string, state protocol.ResultState) (protocol.Result, error) {
 	if state.Result == nil {
 		// Reconciliation observed the operation's definitive non-execution —
@@ -1333,10 +1337,15 @@ func (c *Coordinator) verifiedResult(ctx context.Context, opID string, state pro
 		// observation is not a verified termination: the entry is retained
 		// and the result is returned as an error, never as a cleared,
 		// suppressible operation (#372). The error carries the
-		// unverified-termination fact, so a caller that must not report a
-		// stopped task it never observed stopping — the bootstrap stage —
-		// can fail closed instead of classifying the ending.
-		return *state.Result, fmt.Errorf("operation %s ended as %s with %d processes still live in its task tree: %w", opID, state.Status, state.Result.LiveDescendants, ErrTerminationUnverified)
+		// unverified-termination fact, and the fence is set HERE, for every
+		// caller of dispatchAndAwait — not only the bootstrap stage that
+		// re-fences on the sentinel it receives (#414 review): descendants
+		// of the ended task may still be executing repository-authored
+		// work, so no further dispatch may run against this worker on any
+		// path that observed this state.
+		err := fmt.Errorf("operation %s ended as %s with %d processes still live in its task tree: %w", opID, state.Status, state.Result.LiveDescendants, ErrTerminationUnverified)
+		c.fenceWorker(opID, err)
+		return *state.Result, err
 	}
 	c.closeOperation(ctx, opID, state.Status == protocol.ResultCompleted)
 	return *state.Result, nil
