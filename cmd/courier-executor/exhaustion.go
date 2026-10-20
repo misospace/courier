@@ -123,13 +123,16 @@ func (r reporter) capacityExhaustedTermination(ctx context.Context, workspace *g
 }
 
 // availabilityRecoveryTermination builds the recoverable availability-handoff
-// ending (#327 Scenario D): the provider or the child kept failing without
-// ever producing a structured allowance-exhaustion signal, so the run ends on
-// the same fenced capacity-recovery channel — exit 2, the capacity-handoff
-// outcome — but with the honest provider-unavailable category, never claiming
-// a quota verdict the evidence does not support. `detail` carries why this
-// attempt stream ended (outage retries or a spent crash budget).
-func (r reporter) availabilityRecoveryTermination(ctx context.Context, workspace *git.Workspace, cfg config, startCommit string, detail string) termination {
+// ending (#327 Scenario D): the model provider or the child kept failing
+// without ever producing a structured allowance-exhaustion signal, so the run
+// ends on the same fenced capacity-recovery channel — exit 2, the
+// capacity-handoff outcome — with the caller's own category, never claiming a
+// quota verdict the evidence does not support. `category` names the cause the
+// evidence actually supports: provider-unavailable for a model-provider
+// outage, model-transport-error for a spent child-crash budget. `detail`
+// carries why this attempt stream ended (outage retries or a spent crash
+// budget).
+func (r reporter) availabilityRecoveryTermination(ctx context.Context, workspace *git.Workspace, cfg config, startCommit string, category courierv1alpha1.TerminalDiagnosticCategory, detail string) termination {
 	ctx, cancel := context.WithTimeout(ctx, 20*time.Second)
 	defer cancel()
 	return termination{
@@ -138,7 +141,34 @@ func (r reporter) availabilityRecoveryTermination(ctx context.Context, workspace
 		ExitCode:        exitNeedsHuman,
 		Reason:          fmt.Sprintf("%s; releasing work for another capacity without a structured exhaustion signal", detail),
 		Outcome:         string(executor.OutcomeCapacityExhausted),
-		Category:        terminalCategoryProviderUnavailable,
+		Category:        category,
+		WorkspaceSafety: capacityWorkspaceSafety(ctx, workspace, cfg.RemoteURL, cfg.Branch, startCommit),
+	}
+}
+
+// forgeUnavailableTermination builds the recoverable blocked-external ending
+// for a pre-handoff forge observation that could not complete on a transient
+// availability condition (#455): the world was never observed, so the run
+// ends blocked_external for the operator's bounded retry with the honest
+// forge-unavailable category — never as a verifier rejection, which is
+// reserved for worlds the observation actually read and found contradictory.
+// Exit 2 keeps the handoff vocabulary valid, and the workspace snapshot is
+// the executor's own git-verified evidence. Unlike its capacity siblings it
+// takes no parent context and derives its snapshot deadline from
+// context.Background(): the transient branch fires precisely when the run
+// context is already failing (shutdown) or the budget is spent, and a
+// cancelled parent would degrade the snapshot to unknown instead of
+// capturing the git-verified workspace state the recovery path needs.
+func (r reporter) forgeUnavailableTermination(workspace *git.Workspace, cfg config, startCommit, reason string) termination {
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	return termination{
+		Phase:           "NeedsHuman",
+		Result:          "needs-human",
+		ExitCode:        exitNeedsHuman,
+		Reason:          reason,
+		Outcome:         string(executor.OutcomeBlockedExternal),
+		Category:        terminalCategoryForgeUnavailable,
 		WorkspaceSafety: capacityWorkspaceSafety(ctx, workspace, cfg.RemoteURL, cfg.Branch, startCommit),
 	}
 }

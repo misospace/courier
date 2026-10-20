@@ -15,7 +15,8 @@ import (
 // implementation does not derive from model or worker input. A bundle over
 // any bound is rejected whole, never truncated, and bounds apply to every
 // object the bundle delivers — objects beyond the result ref's closure are
-// ignored for integration but still count against the bounds.
+// ignored for integration but still count against the bounds. These are the
+// budget envelope enforced against a bundle's pack before git inflates it.
 const (
 	// MaxArtifactBundleBytes bounds the bundle file itself. It matches the
 	// worker protocol's artifact transport bound and the broker's import
@@ -62,6 +63,35 @@ const (
 
 func rejected(category string) error {
 	return &ArtifactRejectedError{Category: category}
+}
+
+// artifactObjectLimits is the budget envelope the harness enforces on every
+// delivered object set. Its numbers are the harness's own fixed constants:
+// never derived from model or worker input.
+func artifactObjectLimits() couriergit.ObjectLimits {
+	return couriergit.ObjectLimits{
+		MaxObjects:     MaxArtifactObjects,
+		MaxTotalBytes:  MaxArtifactUnpackedBytes,
+		MaxObjectBytes: MaxArtifactBlobBytes,
+	}
+}
+
+// rejectCategoryFor maps a validation failure to its fixed rejection
+// category. A budget violation names the bound it tripped, and every other
+// failure is malformed input: no untrusted text ever reaches a category.
+func rejectCategoryFor(err error) string {
+	var limitErr *couriergit.LimitError
+	if errors.As(err, &limitErr) {
+		switch limitErr.Limit {
+		case couriergit.LimitObjects:
+			return rejectObjects
+		case couriergit.LimitBytes:
+			return rejectUnpacked
+		case couriergit.LimitObjectBytes:
+			return rejectBlob
+		}
+	}
+	return rejectMalformed
 }
 
 // PathScope is the operator-resolved path policy for one run's artifacts
@@ -161,20 +191,32 @@ func validateAndImportArtifact(ctx context.Context, tree *Integrator, briefID, d
 	if err := couriergit.VerifyBundle(ctx, tree.Dir, path); err != nil {
 		return "", rejected(rejectVerify)
 	}
-	// 2. Bounds, in a quarantine object directory: every object the bundle
-	// delivers is unpacked there and counted, so off-closure objects cannot
-	// evade the bounds and nothing hostile reaches the private tree yet.
+	// 2. Budget envelope, then unpack into a quarantine object directory.
+	// The envelope is enforced against the bundle's own pack BEFORE git
+	// inflates anything: an object count or an object size over budget is
+	// refused from the pack's own declarations, and the envelope's own
+	// work never exceeds the byte budget. The objects that survive the
+	// envelope are then unpacked into the quarantine, where the inventory is
+	// streamed and stopped at the first bound it trips rather than after the
+	// whole object set is collected.
+	// Nothing hostile reaches the private tree yet: the quarantine is
+	// discarded with the staging directory.
+	limits := artifactObjectLimits()
 	objectsDir := filepath.Join(workDir, "objects")
 	if err := os.MkdirAll(objectsDir, 0o700); err != nil {
 		return "", fmt.Errorf("harness: quarantine unavailable: %w", err)
 	}
-	if err := couriergit.Unbundle(ctx, objectsDir, path); err != nil {
-		return "", rejected(rejectMalformed)
+	if err := couriergit.Unbundle(ctx, objectsDir, path, limits); err != nil {
+		return "", rejected(rejectCategoryFor(err))
 	}
-	inventory, err := couriergit.InventoryObjects(ctx, tree.Dir, objectsDir)
+	inventory, err := couriergit.InventoryObjects(ctx, tree.Dir, objectsDir, limits)
 	if err != nil {
-		return "", rejected(rejectMalformed)
+		return "", rejected(rejectCategoryFor(err))
 	}
+	// Defence in depth: the same bounds are re-checked against git's own
+	// numbers once the inventory is complete. The bounded cases never reach
+	// these checks; they exist so a future accounting change cannot widen
+	// the envelope unnoticed.
 	if inventory.Count > MaxArtifactObjects {
 		return "", rejected(rejectObjects)
 	}

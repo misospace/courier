@@ -686,6 +686,7 @@ spec:
                     - blocked-external
                     - capacity-exhaustion
                     - provider-unavailable
+                    - forge-unavailable
                     - unknown
                     type: string
                   container:

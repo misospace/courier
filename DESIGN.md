@@ -276,6 +276,70 @@ implied away: an orphan that made a group or session of its own (`setsid`, a
 detached spawn), and the git, ssh and askpass descendants a killed run orphans
 into the executor's own group.
 
+### Worker task containment beyond the process group
+
+The native worker's tasks run `sh -c ...` in a process group of their own, and
+cancellation kills and proves that group (#372). Two process shapes sit
+outside any group contract, and the worker closes both without granting the
+untrusted pod a single privilege it does not already have — no PID namespace,
+no cgroup, no capability: the worker pod's security context (all capabilities
+dropped, RuntimeDefault seccomp, non-root) is unchanged. A per-task PID
+namespace (`CLONE_NEWPID`) or a per-task cgroup would end the escapee class in
+the kernel, but both need `CAP_SYS_ADMIN` for the clone or cgroup delegation,
+and against an untrusted sandbox that means weakening the exact boundary the
+worker exists to keep.
+
+The first shape is the escapee. A descendant that makes a session of its own
+(`setsid`, a daemonising tool) leaves the group, and no group signal reaches
+it. The worker is PID 1 of its pod, so the kernel hands it every orphaned
+descendant its tasks leave behind; the subreaper flag keeps that true for any
+shape where it is not PID 1. At every grouped task's termination — cancelled
+and completed alike — the worker sweeps its adopted trees: it enumerates the
+pod's processes, kills every live process it has adopted regardless of the
+group or session it moved to, and reaps what it killed. Termination is by
+identity, never by number: every process the worker snapshots or supervises
+is pinned with a pidfd before it is read or signalled, the kernel keeps a
+pinned pid from being recycled while the pin lives, and a signal travels
+through the descriptor — so a recycled pid can never receive an old task's
+group signal or sweep kill, and a supervised release can never claim a new
+task's entry. A process whose state cannot be read for any reason other than
+a confirmed disappearance fails the whole proof: an unreadable process is
+not evidence of absence. A completed task's
+escapee is swept too, deliberately: a daemon a successful task left behind is
+still untrusted work mutating the workspace, and control would otherwise
+clear its suppression on a completion the worker never proved. The sweep's
+count is a pod-level floor, so the sharp edge is real and deliberate: a task
+can be reported unverified — even a successfully completed one — because of
+an unrelated concurrent operation's adopted escapee. That is the containment
+policy, not a false positive to fix; the worker cannot attribute a reparented
+process to its task, so it refuses to promise anything less than a clean pod.
+
+The termination claim stays honest in both directions. What survives the bound
+keeps the result unverified — `LiveDescendants > 0`, retained, exactly #372's
+refusal contract — and a clean sweep is itself the proof that every writer of
+the task's output closed: an escapee that redirected its own output no longer
+forces the unverified verdict #372 had to report, because nothing live is
+left in the pod but the worker and the trees of the still-registered tasks.
+The bounds compose: the descriptor grace (5s), the group proof (5s) and the
+sweep (5s) worst-case stack to 15s per operation against the pod's 30s
+termination budget, which is why all three are ceilings on cleanup, never on
+a run's duration.
+
+The second shape is the zombie. PID 1 reaps nothing on its own, so every
+cancelled or daemonised descendant that dies would pile up as a zombie for the
+pod's lifetime. The worker runs an adopted-child reaper in the same shape as
+the legacy executor's (#347): a SIGCHLD-driven pass that collects zombie
+children, never signals, and never takes the exit status of a supervised task
+leader, whose pid is registered before its start is released and released only
+after its Wait. The sweep reaps what it kills on the same passes, so a
+cancellation converges without waiting on the signal-driven drain.
+
+One ambiguity is stated rather than hidden: a process whose intermediate
+ancestor died while its task still runs is reparented past the live task —
+the kernel offers nothing else — and is therefore indistinguishable from a
+dead task's escapee. The sweep kills it too. Containment of untrusted
+processes wins over a descendant whose supervisor is already gone.
+
 ## Capacity exhaustion and cross-worker recovery
 
 A structured `capacity_exhausted` outcome is distinct from task failure, an
@@ -291,7 +355,15 @@ continuation budget and backed off exponentially (capped, never a tight loop).
 Exhausting it ends the run on the same recovery channel — the
 `capacity_exhausted` outcome with the honest `provider-unavailable` diagnostic
 category — never a quota verdict the evidence does not support, never
-`Failed`, never NeedsHuman-for-model-outage. A raw child process status is
+`Failed`, never NeedsHuman-for-model-outage. The other ending on that channel
+names its own cause instead: a model/agent child that kept exiting non-zero
+until its repair budget was spent carries the `model-transport-error`
+category, so the durable diagnostic never tells an operator a remote provider
+failed when the failure was local. A forge read that could not complete on a
+transient availability condition joins the same channel as a `blocked_external`
+declaration with the `forge-unavailable` category, and only that pairing opens
+the workspace-safety evidence gate described under Terminal runtime
+diagnostics. A raw child process status is
 never an outcome declaration: exit `2`, which merely matches Courier's own
 NeedsHuman exit constant, takes this same shared recovery path like any other
 unclassified nonzero exit; only a verified outcome declaration may request a
@@ -1038,7 +1110,31 @@ but do not alone establish infrastructure failure; pod reason `Shutdown` is
 display-only as well. Missing or
 ambiguous evidence is `unknown`. Categories: `executor-crash`,
 `model-transport-error`, `continuation-exhaustion`, `verifier-rejection`,
-`kubernetes-failure`, `needs-decision`, `blocked-external`, `unknown`.
+`kubernetes-failure`, `needs-decision`, `blocked-external`,
+`capacity-exhaustion`, `provider-unavailable`, `forge-unavailable`, `unknown`.
+
+Several endings share the recoverable capacity channel, and each names the
+cause it can actually evidence, so the durable diagnostic points at the
+dependency that failed instead of at whichever one shares the channel. A
+confirmed structured exhaustion is `capacity-exhaustion`. A model provider
+that never served an attempt — no session id was ever produced — is
+`provider-unavailable`. A model/agent child process that kept exiting
+non-zero until its repair budget was spent is `model-transport-error` — a
+local execution-process failure, never a provider outage. A forge **API** read
+that could not complete on a transient availability condition — a rate limit,
+a server error, or a transport failure — is `forge-unavailable`: the world
+was never observed, so the run ends as a `blocked_external` declaration on
+the recovery channel, never as a `verifier-rejection`, which stays reserved
+for worlds the observation actually read and found contradictory. The
+git-side remote-publication read behind the same observation is not classified
+that way yet: the git transport cannot yet tell an unreachable remote from a
+command that ran and failed, so its failures stay a fail-closed
+`verifier-rejection`. Only the exact pairing — a declared `blocked_external`
+outcome carried by a validated termination handoff whose category is
+`forge-unavailable` — opens the workspace-safety evidence gate; a
+task-shaped `blocked_external` with any other category opens nothing and
+never enters capacity recovery. A failed read never publishes a `Verifying`
+success and never claims the pull request is missing.
 
 The diagnostic carries the observed exit code, the executor-declared outcome
 kind when any, an **operator-derived** short reason (a category label, the

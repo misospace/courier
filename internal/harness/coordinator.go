@@ -1309,7 +1309,7 @@ func (c *Coordinator) dispatchAndAwait(ctx context.Context, opID, briefID string
 // termination reads alike, whatever path observed it.
 func unverifiedTerminationDetail(state protocol.ResultState) error {
 	if state.Result != nil && state.Result.LiveDescendants > 0 {
-		return fmt.Errorf("%d processes still live in its task tree", state.Result.LiveDescendants)
+		return fmt.Errorf("%d live processes still unaccounted for in the worker pod", state.Result.LiveDescendants)
 	}
 	return fmt.Errorf("the worker still reports the operation as %q", state.Status)
 }
@@ -1336,14 +1336,17 @@ func (c *Coordinator) verifiedResult(ctx context.Context, opID string, state pro
 		// The worker reported work that outlived the task, so its terminal
 		// observation is not a verified termination: the entry is retained
 		// and the result is returned as an error, never as a cleared,
-		// suppressible operation (#372). The error carries the
+		// suppressible operation (#372). The count is a pod-level floor —
+		// the worker's sweep reports every unaccounted live process, which
+		// can include another operation's adopted escapee (#399) — so the
+		// wording stays at the pod, not the task tree. The error carries the
 		// unverified-termination fact, and the fence is set HERE, for every
 		// caller of dispatchAndAwait — not only the bootstrap stage that
 		// re-fences on the sentinel it receives (#414 review): descendants
 		// of the ended task may still be executing repository-authored
 		// work, so no further dispatch may run against this worker on any
 		// path that observed this state.
-		err := fmt.Errorf("operation %s ended as %s with %d processes still live in its task tree: %w", opID, state.Status, state.Result.LiveDescendants, ErrTerminationUnverified)
+		err := fmt.Errorf("operation %s ended as %s with %d live processes still unaccounted for in the worker pod: %w", opID, state.Status, state.Result.LiveDescendants, ErrTerminationUnverified)
 		c.fenceWorker(opID, err)
 		return *state.Result, err
 	}

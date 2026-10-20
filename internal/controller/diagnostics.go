@@ -115,6 +115,7 @@ func knownTerminalDiagnosticCategory(category courierv1alpha1.TerminalDiagnostic
 		courierv1alpha1.TerminalDiagnosticCategoryBlockedExternal,
 		courierv1alpha1.TerminalDiagnosticCategoryCapacityExhaustion,
 		courierv1alpha1.TerminalDiagnosticCategoryProviderUnavailable,
+		courierv1alpha1.TerminalDiagnosticCategoryForgeUnavailable,
 		courierv1alpha1.TerminalDiagnosticCategoryUnknown:
 		return true
 	default:
@@ -196,7 +197,16 @@ func categoryDiagnosticReason(category courierv1alpha1.TerminalDiagnosticCategor
 	case courierv1alpha1.TerminalDiagnosticCategoryCapacityExhaustion:
 		return "execution capacity was confirmed exhausted"
 	case courierv1alpha1.TerminalDiagnosticCategoryProviderUnavailable:
-		return "model provider repeatedly failed to serve this attempt; work released for another capacity"
+		// The attempt was never served by the model provider: no session
+		// id was produced and no structured allowance-exhaustion signal
+		// was observed, so the work is released for another capacity. The
+		// label states what the evidence shows, not a quota verdict.
+		return "the model provider did not serve this attempt; work released for another capacity"
+	case courierv1alpha1.TerminalDiagnosticCategoryForgeUnavailable:
+		// A forge read could not complete on a transient availability
+		// condition, so the world was never observed; the work is
+		// released for another capacity.
+		return "a forge read could not complete on a transient availability condition; the world was never observed; work released for another capacity"
 	case courierv1alpha1.TerminalDiagnosticCategoryExecutorCrash:
 		return "coordinator exited without a valid handoff"
 	case courierv1alpha1.TerminalDiagnosticCategoryUnknown:

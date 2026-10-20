@@ -266,6 +266,46 @@ func (e *APIError) Error() string {
 	return fmt.Sprintf("GitHub API returned HTTP %d", e.StatusCode)
 }
 
+// TransientAvailability reports whether the API error describes a condition
+// that kept the forge read from completing — a rate limit, a server error,
+// or a 403 whose message or body names GitHub's rate-limit or abuse
+// protection — rather than an authoritative answer about the requested
+// resource. A plain 403 is an authorization verdict the forge did reach, so
+// it is not transient.
+func (e *APIError) TransientAvailability() bool {
+	if e.StatusCode == http.StatusTooManyRequests {
+		return true
+	}
+	if e.StatusCode >= http.StatusInternalServerError {
+		return true
+	}
+	if e.StatusCode != http.StatusForbidden {
+		return false
+	}
+	haystack := strings.ToLower(e.Message + "\n" + e.Body)
+	for _, phrase := range []string{"rate limit", "secondary rate", "abuse"} {
+		if strings.Contains(haystack, phrase) {
+			return true
+		}
+	}
+	return false
+}
+
+// transportError reports a failure the HTTP transport raised on the way to
+// a decoded response: the request never reached the forge, or the
+// connection was lost before or while the response body was read, so the
+// world was not observed and the error is transient availability evidence
+// for forge.IsTransientAvailability.
+type transportError struct {
+	err error
+}
+
+func (e *transportError) Error() string { return e.err.Error() }
+
+func (e *transportError) Unwrap() error { return e.err }
+
+func (e *transportError) TransientAvailability() bool { return true }
+
 // CreatePullRequest opens a pull request from head into base.
 func (c *Client) CreatePullRequest(ctx context.Context, owner, repo string, in CreatePullRequestRequest) (PullRequest, error) {
 	var out PullRequest
@@ -546,7 +586,7 @@ func (c *Client) doJSONQuery(ctx context.Context, method, relative, query string
 	}
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
-		return fmt.Errorf("GitHub request: %w", err)
+		return &transportError{err: fmt.Errorf("GitHub request: %w", err)}
 	}
 	if resp == nil {
 		return errors.New("GitHub request: HTTP client returned a nil response")
@@ -554,7 +594,7 @@ func (c *Client) doJSONQuery(ctx context.Context, method, relative, query string
 	defer resp.Body.Close()
 	data, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 	if err != nil {
-		return fmt.Errorf("read GitHub response: %w", err)
+		return &transportError{err: fmt.Errorf("read GitHub response: %w", err)}
 	}
 	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
 		apiErr := &APIError{StatusCode: resp.StatusCode, Body: forge.RedactDetail(string(data))}
