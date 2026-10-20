@@ -742,7 +742,23 @@ no session was captured, or the run is shutting down, the legacy path
 terminates `NeedsHuman` with reason `incomplete handoff: criterion
 evidence …` (category `verifier-rejection`), preserving the declared
 outcome tag exactly as the linkage plan does. A forge read failure during
-the legacy check is fail-closed exactly as #248's is. A pinned envelope
+the legacy check is fail-closed exactly as #248's is, with one #455
+refinement: when no retry remains and the read failed on a transient
+availability condition — a rate limit, a server error, or a transport
+failure of the forge API read, classified by `forge.IsTransientAvailability`
+— the world was never observed, so the run ends on the recovery channel
+(`blocked_external` outcome, category `forge-unavailable`) for the operator's
+bounded retry instead of `verifier-rejection` `NeedsHuman`, replacing any
+declared outcome tag the run had carried. The git-side remote-publication read
+behind the same observation is not classified that way yet — the git transport
+cannot yet tell an unreachable remote from a command that ran and failed — so
+its failures stay a fail-closed `verifier-rejection`. That exact pairing — and
+only that pairing — opens the operator's trusted workspace-safety evidence
+gate, so the ending persists the same secure snapshot or isolated-observer
+proof a `capacity_exhausted` handoff would and stays eligible for the fenced
+capacity-recovery settlement. A forge verdict the read did
+reach (a plain 403, a linkage mismatch) still terminates `NeedsHuman`. A
+pinned envelope
 that decodes but names a source issue other than the run's trusted
 `COURIER_REPO`/`COURIER_REF` identity — or that cannot be bound because
 the run carries no valid trusted identity — is not a repairable defect:

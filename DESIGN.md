@@ -291,7 +291,15 @@ continuation budget and backed off exponentially (capped, never a tight loop).
 Exhausting it ends the run on the same recovery channel — the
 `capacity_exhausted` outcome with the honest `provider-unavailable` diagnostic
 category — never a quota verdict the evidence does not support, never
-`Failed`, never NeedsHuman-for-model-outage. A raw child process status is
+`Failed`, never NeedsHuman-for-model-outage. The other ending on that channel
+names its own cause instead: a model/agent child that kept exiting non-zero
+until its repair budget was spent carries the `model-transport-error`
+category, so the durable diagnostic never tells an operator a remote provider
+failed when the failure was local. A forge read that could not complete on a
+transient availability condition joins the same channel as a `blocked_external`
+declaration with the `forge-unavailable` category, and only that pairing opens
+the workspace-safety evidence gate described under Terminal runtime
+diagnostics. A raw child process status is
 never an outcome declaration: exit `2`, which merely matches Courier's own
 NeedsHuman exit constant, takes this same shared recovery path like any other
 unclassified nonzero exit; only a verified outcome declaration may request a
@@ -1038,7 +1046,31 @@ but do not alone establish infrastructure failure; pod reason `Shutdown` is
 display-only as well. Missing or
 ambiguous evidence is `unknown`. Categories: `executor-crash`,
 `model-transport-error`, `continuation-exhaustion`, `verifier-rejection`,
-`kubernetes-failure`, `needs-decision`, `blocked-external`, `unknown`.
+`kubernetes-failure`, `needs-decision`, `blocked-external`,
+`capacity-exhaustion`, `provider-unavailable`, `forge-unavailable`, `unknown`.
+
+Several endings share the recoverable capacity channel, and each names the
+cause it can actually evidence, so the durable diagnostic points at the
+dependency that failed instead of at whichever one shares the channel. A
+confirmed structured exhaustion is `capacity-exhaustion`. A model provider
+that never served an attempt — no session id was ever produced — is
+`provider-unavailable`. A model/agent child process that kept exiting
+non-zero until its repair budget was spent is `model-transport-error` — a
+local execution-process failure, never a provider outage. A forge **API** read
+that could not complete on a transient availability condition — a rate limit,
+a server error, or a transport failure — is `forge-unavailable`: the world
+was never observed, so the run ends as a `blocked_external` declaration on
+the recovery channel, never as a `verifier-rejection`, which stays reserved
+for worlds the observation actually read and found contradictory. The
+git-side remote-publication read behind the same observation is not classified
+that way yet: the git transport cannot yet tell an unreachable remote from a
+command that ran and failed, so its failures stay a fail-closed
+`verifier-rejection`. Only the exact pairing — a declared `blocked_external`
+outcome carried by a validated termination handoff whose category is
+`forge-unavailable` — opens the workspace-safety evidence gate; a
+task-shaped `blocked_external` with any other category opens nothing and
+never enters capacity recovery. A failed read never publishes a `Verifying`
+success and never claims the pull request is missing.
 
 The diagnostic carries the observed exit code, the executor-declared outcome
 kind when any, an **operator-derived** short reason (a category label, the

@@ -1,12 +1,13 @@
 # Terminal runtime diagnostics
 
-When a `CoderRun` ends in a non-success terminal phase (`Failed` or
-`NeedsHuman`), the operator records `status.terminalDiagnostic`: a bounded,
-redacted snapshot of how the coordinator ended. It is captured **before pod
-cleanup**, is set once, and survives pod deletion and controller restart. The
-purpose is to distinguish an executor crash, a model transport error,
-continuation exhaustion, a verifier rejection, and a Kubernetes/container
-failure after the pod needed to diagnose them is gone.
+When a `CoderRun` ends in a non-success terminal phase (`Failed`,
+`NeedsHuman`, or `BlockedExternal`), the operator records
+`status.terminalDiagnostic`: a bounded, redacted snapshot of how the
+coordinator ended. It is captured **before pod cleanup**, is set once, and
+survives pod deletion and controller restart. The purpose is to distinguish an
+executor crash, a model transport error, continuation exhaustion, a verifier
+rejection, and a Kubernetes/container failure after the pod needed to
+diagnose them is gone.
 
 ## Categories
 
@@ -19,6 +20,9 @@ failure after the pod needed to diagnose them is gone.
 | `kubernetes-failure` | Eviction, failed scheduling, OOMKill, or a lost pod. |
 | `needs-decision` | The coordinator declared it needed a human decision. |
 | `blocked-external` | The coordinator declared it was blocked on an external prerequisite. |
+| `capacity-exhaustion` | Execution capacity, not task correctness, was confirmed exhausted by a structured provider signal. |
+| `provider-unavailable` | The model provider repeatedly failed to serve this attempt without producing a structured allowance-exhaustion signal; the work was released for another capacity. |
+| `forge-unavailable` | A forge read could not complete on a transient availability condition, so the world was never observed; the work was released for another capacity. |
 | `unknown` | Evidence was missing or ambiguous. The operator never invents a cause. |
 
 Classification uses the strongest available evidence: a concrete category the

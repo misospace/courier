@@ -261,6 +261,8 @@ func TestRunnerSettledCapacityExhaustionAllowsSameOfferWithSuccessorUIDName(t *t
 	for _, category := range []courierv1alpha1.TerminalDiagnosticCategory{
 		courierv1alpha1.TerminalDiagnosticCategoryCapacityExhaustion,
 		courierv1alpha1.TerminalDiagnosticCategoryProviderUnavailable,
+		courierv1alpha1.TerminalDiagnosticCategoryForgeUnavailable,
+		courierv1alpha1.TerminalDiagnosticCategoryModelTransportError,
 	} {
 		t.Run(string(category), func(t *testing.T) {
 			lane := testLane()

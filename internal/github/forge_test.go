@@ -477,3 +477,40 @@ func TestListPullRequestsWithForeignAllForeignIsNotEmptyFailure(t *testing.T) {
 		t.Fatalf("filtered = %#v, want none", filtered)
 	}
 }
+
+// forge.IsTransientAvailability must reach the typed errors through the
+// redaction boundary wrappers (#455): a rate-limited or server-errored read
+// stays transient after sanitization, a plain authorization verdict stays
+// non-transient, and a transport failure the provider read wraps classifies
+// without unwrapping by hand.
+func TestBoundaryErrorPreservesTransientAvailability(t *testing.T) {
+	rateLimited := boundaryError(&APIError{StatusCode: 429, Message: "rate limit exceeded"})
+	if !forge.IsTransientAvailability(rateLimited) {
+		t.Fatalf("forge.IsTransientAvailability(boundary(429)) = false, want true: %v", rateLimited)
+	}
+	serverError := boundaryError(&APIError{StatusCode: 500, Message: "Internal Server Error"})
+	if !forge.IsTransientAvailability(serverError) {
+		t.Fatalf("forge.IsTransientAvailability(boundary(500)) = false, want true: %v", serverError)
+	}
+	forbidden := boundaryError(&APIError{StatusCode: 403, Message: "Resource not accessible by integration"})
+	if forge.IsTransientAvailability(forbidden) {
+		t.Fatalf("forge.IsTransientAvailability(boundary(plain 403)) = true, want false: %v", forbidden)
+	}
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		panic(http.ErrAbortHandler)
+	}))
+	defer server.Close()
+	client, err := NewClient(server.URL, "token")
+	if err != nil {
+		t.Fatal(err)
+	}
+	p := NewProvider(forge.ProviderConfig{Name: "gh", Endpoint: server.URL, CredentialRef: "secret/gh"}, client)
+	_, err = p.ReadPullRequest(context.Background(), forge.PullRequestRef{Repo: "acme/demo", Number: 7})
+	if err == nil {
+		t.Fatal("ReadPullRequest() error = nil, want a transport error")
+	}
+	if !forge.IsTransientAvailability(err) {
+		t.Fatalf("forge.IsTransientAvailability(dropped connection) = false, want true: %v", err)
+	}
+}
