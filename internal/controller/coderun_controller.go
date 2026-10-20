@@ -883,8 +883,8 @@ func (r *CoderRunReconciler) observeRunning(ctx context.Context, run *courierv1a
 		// recovery channel is the fenced capacity path: the confirmed
 		// capacity-exhausted handoff, and the exact #455 forge-unavailability
 		// pairing (declared blocked_external carried by a validated
-		// provider-unavailable handoff category). A task-shaped
-		// blocked_external declaration opens nothing here.
+		// forge-unavailable handoff category). A task-shaped blocked_external
+		// declaration opens nothing here.
 		if terminationOutcome == string(executor.OutcomeCapacityExhausted) || trustedForgeUnavailableHandoff(pod, terminationOutcome) {
 			evidenceBefore := run.DeepCopy()
 			if r.Secure != nil {
@@ -1994,13 +1994,13 @@ const exitNeedsHuman = 2
 // trustedForgeUnavailableHandoff reports the exact #455 pairing that shares
 // the capacity-exhausted workspace-safety evidence gate: the executor
 // declared blocked_external while the same validated termination handoff
-// carries the provider-unavailable diagnostic category — the transient
+// carries the forge-unavailable diagnostic category — the transient
 // forge-read ending where the world was never observed and the published
 // work must stay recoverable. Any other blocked_external declaration is a
 // task-shaped prerequisite block and never opens this gate.
 func trustedForgeUnavailableHandoff(pod *corev1.Pod, terminationOutcome string) bool {
 	return terminationOutcome == string(executor.OutcomeBlockedExternal) &&
-		coordinatorHandoffCategory(pod) == string(courierv1alpha1.TerminalDiagnosticCategoryProviderUnavailable)
+		coordinatorHandoffCategory(pod) == string(courierv1alpha1.TerminalDiagnosticCategoryForgeUnavailable)
 }
 
 // outcomeCapacityExhausted is the executor's affirmative structured

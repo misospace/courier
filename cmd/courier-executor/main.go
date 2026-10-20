@@ -1361,7 +1361,7 @@ func run(ctx context.Context, stdout, stderr io.Writer) int {
 					continue
 				}
 				if ctx.Err() == nil {
-					report.terminateCaptured(ctx, workspace, startCommit, report.availabilityRecoveryTermination(ctx, workspace, cfg, startCommit, fmt.Sprintf("model provider failed to serve %d consecutive attempts without a session (last exit %d)", cfg.MaxAvailabilityRetries, code)))
+					report.terminateCaptured(ctx, workspace, startCommit, report.availabilityRecoveryTermination(ctx, workspace, cfg, startCommit, terminalCategoryProviderUnavailable, fmt.Sprintf("model provider failed to serve %d consecutive attempts without a session (last exit %d)", cfg.MaxAvailabilityRetries, code)))
 					return exitNeedsHuman
 				}
 			} else {
@@ -1395,10 +1395,11 @@ func run(ctx context.Context, stdout, stderr io.Writer) int {
 			// provable task defect must not become a permanent Failed: a
 			// Failed run holds its claim and strands the work (#327). End
 			// on the recoverable availability-handoff channel — the same
-			// honest provider-unavailable verdict, never a quota claim —
-			// so fenced recovery can move the work to a healthy capacity.
-			// A canceled context is not provider trouble: it stays a plain
-			// Failed, since the operator chose to stop this run.
+			// honest child-process verdict the canceled-context path already
+			// uses, never a quota claim — so fenced recovery can move the
+			// work to a healthy capacity. A canceled context is not provider
+			// trouble: it stays a plain Failed, since the operator chose to
+			// stop this run.
 			reason := fmt.Sprintf("opencode exited with status %d", code)
 			if continuations > 0 {
 				reason += fmt.Sprintf(" after %d continuations", continuations)
@@ -1408,7 +1409,7 @@ func run(ctx context.Context, stdout, stderr io.Writer) int {
 				report.terminateCaptured(ctx, workspace, startCommit, failedWith(reason, terminalCategoryModelTransportError))
 				return exitFailed
 			}
-			report.terminateCaptured(ctx, workspace, startCommit, report.availabilityRecoveryTermination(ctx, workspace, cfg, startCommit, reason))
+			report.terminateCaptured(ctx, workspace, startCommit, report.availabilityRecoveryTermination(ctx, workspace, cfg, startCommit, terminalCategoryModelTransportError, reason))
 			return exitNeedsHuman
 		}
 
@@ -1647,6 +1648,7 @@ const (
 	terminalCategoryBlockedExternal        = "blocked-external"
 	terminalCategoryCapacityExhaustion     = "capacity-exhaustion"
 	terminalCategoryProviderUnavailable    = "provider-unavailable"
+	terminalCategoryForgeUnavailable       = "forge-unavailable"
 )
 
 // The outcome kinds the coordinator may declare (#169).

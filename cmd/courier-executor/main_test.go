@@ -1462,7 +1462,9 @@ func TestRunChildExitTwoConsumesAvailabilityBudget(t *testing.T) {
 // TestRunChildExitTwoWithSessionUsesTaskBudgetThenHandsOff proves exit 2 is
 // an ordinary unclassified crash once a session exists: it consumes the
 // task-repair continuation budget, and a spent budget recovers through the
-// fenced availability handoff rather than a permanent Failed.
+// fenced availability handoff rather than a permanent Failed. The child
+// crashed, so the handoff carries the model-transport-error category — the
+// same one the canceled-context path uses — and never a provider label.
 func TestRunChildExitTwoWithSessionUsesTaskBudgetThenHandsOff(t *testing.T) {
 	root := t.TempDir()
 	remote := remoteWithExistingBranch(t, root)
@@ -1479,8 +1481,11 @@ func TestRunChildExitTwoWithSessionUsesTaskBudgetThenHandsOff(t *testing.T) {
 		t.Fatalf("run exit code = %d, want %d (recoverable handoff after the task budget); stderr=%q stdout=%q", code, exitNeedsHuman, errorsOut.String(), output.String())
 	}
 	out := output.String()
-	if !strings.Contains(out, "after 1 continuations") || !strings.Contains(out, `"category":"provider-unavailable"`) {
+	if !strings.Contains(out, "after 1 continuations") || !strings.Contains(out, `"category":"model-transport-error"`) {
 		t.Fatalf("session-crash handoff missing the task-budget detail: %q", out)
+	}
+	if strings.Contains(out, `"category":"provider-unavailable"`) || strings.Contains(out, `"category":"forge-unavailable"`) {
+		t.Fatalf("a child-process crash must not be labeled a provider outage: %q", out)
 	}
 	if strings.Contains(out, `"phase":"Failed"`) {
 		t.Fatalf("a spent crash budget on exit 2 must not end as Failed: %q", out)
@@ -1501,6 +1506,53 @@ func TestRunChildExitTwoWithSessionUsesTaskBudgetThenHandsOff(t *testing.T) {
 	if crash != 1 || avail != 0 {
 		t.Fatalf("crash continuations = %d (want 1), availability retries = %d (want 0: every attempt served a session)", crash, avail)
 	}
+}
+
+// TestAvailabilityEndingCategoriesNameTheirCause pins the durable category
+// of the two endings that share the fenced capacity-recovery channel: a
+// model-provider outage (the child never served a session) is
+// provider-unavailable, while a spent child-crash budget (a session existed
+// and the child kept crashing) is model-transport-error. The two causes must
+// never share one label again, or the operator would name the wrong cause
+// for one of them.
+func TestAvailabilityEndingCategoriesNameTheirCause(t *testing.T) {
+	outage := runAvailabilityEnding(t, "#!/bin/sh\ncase \"$1\" in mcp) exit 0;; esac\nexit 2\n",
+		"COURIER_MAX_AVAILABILITY_RETRIES", "1")
+	if !strings.Contains(outage, `"category":"provider-unavailable"`) {
+		t.Fatalf("model-provider outage handoff = %q, want the provider-unavailable category", outage)
+	}
+	if strings.Contains(outage, `"category":"model-transport-error"`) || strings.Contains(outage, `"category":"forge-unavailable"`) {
+		t.Fatalf("model-provider outage handoff carries another cause's category: %q", outage)
+	}
+	crash := runAvailabilityEnding(t, "#!/bin/sh\ncase \"$1\" in mcp) exit 0;; esac\nprintf '{\"type\":\"text\",\"sessionID\":\"ses_causes\",\"part\":{\"type\":\"text\",\"text\":\"crashing\"}}\\n'\nexit 1\n",
+		"COURIER_MAX_CONTINUATIONS", "1")
+	if !strings.Contains(crash, `"category":"model-transport-error"`) {
+		t.Fatalf("spent crash-budget handoff = %q, want the model-transport-error category", crash)
+	}
+	if strings.Contains(crash, `"category":"provider-unavailable"`) || strings.Contains(crash, `"category":"forge-unavailable"`) {
+		t.Fatalf("spent crash-budget handoff carries another cause's category: %q", crash)
+	}
+}
+
+// runAvailabilityEnding runs the executor against a fake OpenCode child
+// under the given budget and returns the handoff it emitted.
+func runAvailabilityEnding(t *testing.T, script, budgetEnv, budget string) string {
+	t.Helper()
+	root := t.TempDir()
+	remote := remoteWithExistingBranch(t, root)
+	fakeOpenCode := filepath.Join(root, "opencode")
+	writeExecutable(t, fakeOpenCode, script)
+	prServer := fakeLinkedPRServer(t)
+	setContinuationEnv(t, root, remote, prServer.URL, fakeOpenCode)
+	t.Setenv(budgetEnv, budget)
+	t.Setenv("COURIER_RESUME_BACKOFF_SECONDS", "0")
+
+	var output bytes.Buffer
+	var errorsOut bytes.Buffer
+	if code := run(context.Background(), &output, &errorsOut); code != exitNeedsHuman {
+		t.Fatalf("run exit code = %d, want %d (recoverable handoff); stderr=%q stdout=%q", code, exitNeedsHuman, errorsOut.String(), output.String())
+	}
+	return output.String()
 }
 
 // TestRunCanceledContextStaysFailedOnExitTwo pins the operator-cancellation
@@ -1916,7 +1968,9 @@ exit 1
 // TestRunCrashHandsOffRecoverablyAfterBudget proves a run that keeps
 // crashing consumes the continuation budget and then ends on the recoverable
 // availability handoff — reporting the number of continuations — instead of
-// terminalizing as Failed and stranding the claim (#327).
+// terminalizing as Failed and stranding the claim (#327). The cause is the
+// crashing child process, so the handoff carries the model-transport-error
+// category, never a remote-provider label.
 func TestRunCrashHandsOffRecoverablyAfterBudget(t *testing.T) {
 	root := t.TempDir()
 	remote := remoteWithExistingBranch(t, root)
@@ -1937,8 +1991,11 @@ exit 1
 		t.Fatalf("run exit code = %d, want %d (recoverable handoff); stderr=%q stdout=%q", code, exitNeedsHuman, errorsOut.String(), output.String())
 	}
 	out := output.String()
-	if !strings.Contains(out, `"outcome":"capacity_exhausted"`) || !strings.Contains(out, `"category":"provider-unavailable"`) {
+	if !strings.Contains(out, `"outcome":"capacity_exhausted"`) || !strings.Contains(out, `"category":"model-transport-error"`) {
 		t.Fatalf("missing recoverable availability handoff: %q", out)
+	}
+	if strings.Contains(out, `"category":"provider-unavailable"`) || strings.Contains(out, `"category":"forge-unavailable"`) {
+		t.Fatalf("a crashing child must not be labeled a provider outage: %q", out)
 	}
 	if strings.Contains(out, `"phase":"Failed"`) {
 		t.Fatalf("a crashed child must not strand the work as Failed: %q", out)
@@ -2073,7 +2130,7 @@ exit 1
 		t.Fatalf("run exit code = %d, want %d (recoverable handoff after the task budget); stderr=%q stdout=%q", code, exitNeedsHuman, errorsOut.String(), output.String())
 	}
 	out := output.String()
-	if !strings.Contains(out, "after 1 continuations") || !strings.Contains(out, `"category":"provider-unavailable"`) {
+	if !strings.Contains(out, "after 1 continuations") || !strings.Contains(out, `"category":"model-transport-error"`) {
 		t.Fatalf("terminal handoff missing the task-budget detail: %q", out)
 	}
 	// Budget separation: the two no-session crashes rode the availability
@@ -3666,7 +3723,7 @@ func TestRunResolveIssueUndeclaredVerifyingTriggersLinkageRepair(t *testing.T) {
 // condition as unverifiable, not as a verified contradiction (#455): a
 // persistent HTTP 500 forge never observed the world, so with no captured
 // session (the model exited 0) no in-session retry is possible and the run
-// ends blocked_external / provider-unavailable for the operator's bounded
+// ends blocked_external / forge-unavailable for the operator's bounded
 // retry — exit 2, not a verifier rejection, and never a claim that the PR
 // is missing. The linkage.read.failed event carries the original error.
 func TestRunResolveIssueLinkageReadFailureEndsBlockedExternal(t *testing.T) {
@@ -3732,8 +3789,8 @@ func TestRunResolveIssueLinkageReadFailureEndsBlockedExternal(t *testing.T) {
 	if !strings.Contains(output.String(), `"outcome":"blocked_external"`) {
 		t.Fatalf("expected a blocked_external outcome on transient forge unavailability: %q", output.String())
 	}
-	if !strings.Contains(output.String(), `"category":"provider-unavailable"`) {
-		t.Fatalf("expected the provider-unavailable category on transient forge unavailability: %q", output.String())
+	if !strings.Contains(output.String(), `"category":"forge-unavailable"`) {
+		t.Fatalf("expected the forge-unavailable category on transient forge unavailability: %q", output.String())
 	}
 	if !strings.Contains(output.String(), "temporarily unavailable") {
 		t.Fatalf("reason should name the transient forge unavailability: %q", output.String())
@@ -3764,7 +3821,7 @@ func TestRunResolveIssueLinkageReadFailureEndsBlockedExternal(t *testing.T) {
 // declares an outcome, so the run ends after the read-failure retry fires
 // at least once and the budget is then exhausted — and because the forge
 // never became observable, the exhausted ending is blocked_external /
-// provider-unavailable for the operator's bounded retry, not a
+// forge-unavailable for the operator's bounded retry, not a
 // verifier rejection (#455).
 func TestRunResolveIssueLinkageReadFailureRetriesThenEndsBlockedExternal(t *testing.T) {
 	root := t.TempDir()
@@ -3854,8 +3911,8 @@ func TestRunResolveIssueLinkageReadFailureRetriesThenEndsBlockedExternal(t *test
 	if !strings.Contains(output.String(), `"outcome":"blocked_external"`) {
 		t.Fatalf("expected a blocked_external outcome once the retries against the unobservable forge are exhausted: %q", output.String())
 	}
-	if !strings.Contains(output.String(), `"category":"provider-unavailable"`) {
-		t.Fatalf("expected the provider-unavailable category once the retries against the unobservable forge are exhausted: %q", output.String())
+	if !strings.Contains(output.String(), `"category":"forge-unavailable"`) {
+		t.Fatalf("expected the forge-unavailable category once the retries against the unobservable forge are exhausted: %q", output.String())
 	}
 	if strings.Contains(output.String(), "needs a human") {
 		t.Fatalf("a transient forge unavailability must not read as a verification rejection needing a human: %q", output.String())
@@ -3971,7 +4028,7 @@ func TestRunResolveIssueDeclaredChangesLinkageFailureUsesBoundedRepair(t *testin
 // the undeclared-Verifying route; the GitHub server answers every pull
 // request query with HTTP 500, so the shared repair helper exhausts its
 // bounded budget across the captured session's continuations and the run
-// ends blocked_external / provider-unavailable for the operator's bounded
+// ends blocked_external / forge-unavailable for the operator's bounded
 // retry — never a claim that the PR is missing and never a verifier
 // rejection.
 func TestRunResolveIssueUndeclaredLinkageReadFailureEndsBlockedExternal(t *testing.T) {
@@ -4052,8 +4109,8 @@ func TestRunResolveIssueUndeclaredLinkageReadFailureEndsBlockedExternal(t *testi
 	if !strings.Contains(output.String(), `"outcome":"blocked_external"`) {
 		t.Fatalf("expected a blocked_external outcome once the retries against the unobservable forge are exhausted: %q", output.String())
 	}
-	if !strings.Contains(output.String(), `"category":"provider-unavailable"`) {
-		t.Fatalf("expected the provider-unavailable category once the retries against the unobservable forge are exhausted: %q", output.String())
+	if !strings.Contains(output.String(), `"category":"forge-unavailable"`) {
+		t.Fatalf("expected the forge-unavailable category once the retries against the unobservable forge are exhausted: %q", output.String())
 	}
 	if strings.Contains(output.String(), "needs a human") {
 		t.Fatalf("a transient forge unavailability must not read as a verification rejection needing a human: %q", output.String())
@@ -4070,7 +4127,7 @@ func TestRunResolveIssueUndeclaredLinkageReadFailureEndsBlockedExternal(t *testi
 // #455 classification covers GitHub's rate-limit shape: a persistent 403
 // whose message names the rate limit kept the forge read from completing,
 // so with no captured session the run ends blocked_external /
-// provider-unavailable for the operator's bounded retry — not a verifier
+// forge-unavailable for the operator's bounded retry — not a verifier
 // rejection, and never a claim that the PR is missing.
 func TestRunResolveIssueRateLimitedForgeReadEndsBlockedExternal(t *testing.T) {
 	root := t.TempDir()
@@ -4129,8 +4186,8 @@ func TestRunResolveIssueRateLimitedForgeReadEndsBlockedExternal(t *testing.T) {
 	if !strings.Contains(output.String(), `"outcome":"blocked_external"`) {
 		t.Fatalf("expected a blocked_external outcome on a rate-limited forge read: %q", output.String())
 	}
-	if !strings.Contains(output.String(), `"category":"provider-unavailable"`) {
-		t.Fatalf("expected the provider-unavailable category on a rate-limited forge read: %q", output.String())
+	if !strings.Contains(output.String(), `"category":"forge-unavailable"`) {
+		t.Fatalf("expected the forge-unavailable category on a rate-limited forge read: %q", output.String())
 	}
 	if !strings.Contains(output.String(), "temporarily unavailable") {
 		t.Fatalf("reason should name the transient forge unavailability: %q", output.String())
@@ -4150,7 +4207,7 @@ func TestRunResolveIssueRateLimitedForgeReadEndsBlockedExternal(t *testing.T) {
 // #455 classification covers transport failures: a server that accepts the
 // connection and then closes it abruptly never lets the forge read
 // complete, so with no captured session the run ends blocked_external /
-// provider-unavailable for the operator's bounded retry — not a verifier
+// forge-unavailable for the operator's bounded retry — not a verifier
 // rejection, and never a claim that the PR is missing.
 func TestRunResolveIssueDroppedForgeConnectionEndsBlockedExternal(t *testing.T) {
 	root := t.TempDir()
@@ -4206,8 +4263,8 @@ func TestRunResolveIssueDroppedForgeConnectionEndsBlockedExternal(t *testing.T) 
 	if !strings.Contains(output.String(), `"outcome":"blocked_external"`) {
 		t.Fatalf("expected a blocked_external outcome on a dropped forge connection: %q", output.String())
 	}
-	if !strings.Contains(output.String(), `"category":"provider-unavailable"`) {
-		t.Fatalf("expected the provider-unavailable category on a dropped forge connection: %q", output.String())
+	if !strings.Contains(output.String(), `"category":"forge-unavailable"`) {
+		t.Fatalf("expected the forge-unavailable category on a dropped forge connection: %q", output.String())
 	}
 	if !strings.Contains(output.String(), "temporarily unavailable") {
 		t.Fatalf("reason should name the transient forge unavailability: %q", output.String())

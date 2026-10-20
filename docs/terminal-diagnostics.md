@@ -19,6 +19,9 @@ failure after the pod needed to diagnose them is gone.
 | `kubernetes-failure` | Eviction, failed scheduling, OOMKill, or a lost pod. |
 | `needs-decision` | The coordinator declared it needed a human decision. |
 | `blocked-external` | The coordinator declared it was blocked on an external prerequisite. |
+| `capacity-exhaustion` | Execution capacity, not task correctness, was confirmed exhausted by a structured provider signal. |
+| `provider-unavailable` | The model provider repeatedly failed to serve this attempt without producing a structured allowance-exhaustion signal; the work was released for another capacity. |
+| `forge-unavailable` | A forge read could not complete on a transient availability condition, so the world was never observed; the work was released for another capacity. |
 | `unknown` | Evidence was missing or ambiguous. The operator never invents a cause. |
 
 Classification uses the strongest available evidence: a concrete category the

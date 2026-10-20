@@ -20,11 +20,11 @@ import (
 // TestForgeUnavailableTerminationPersistsWorkspaceSafetyAndSettles is the
 // #455 cross-component regression: a legacy executor that ends a Verifying
 // observation on a transient forge read (here the rate-limit 403 ending)
-// terminates exit 2, outcome blocked_external, category provider-unavailable,
+// terminates exit 2, outcome blocked_external, category forge-unavailable,
 // with a git-verified workspace snapshot. The operator must open the same
 // trusted workspace-safety acquisition gate capacity exhaustion uses, persist
 // the isolated observer's pushed evidence, terminalize as BlockedExternal with
-// the trusted provider-unavailable diagnostic, and remain eligible for the
+// the trusted forge-unavailable diagnostic, and remain eligible for the
 // fenced capacity-recovery settlement that releases the work.
 func TestForgeUnavailableTerminationPersistsWorkspaceSafetyAndSettles(t *testing.T) {
 	run := admissionRun("forge-blocked", "pool-a", courierv1alpha1.PhaseRunning)
@@ -49,8 +49,11 @@ func TestForgeUnavailableTerminationPersistsWorkspaceSafetyAndSettles(t *testing
 	if stored.Status.Phase != courierv1alpha1.PhaseBlockedExternal {
 		t.Fatalf("phase = %q, want blocked-external", stored.Status.Phase)
 	}
-	if stored.Status.TerminalDiagnostic == nil || stored.Status.TerminalDiagnostic.Category != courierv1alpha1.TerminalDiagnosticCategoryProviderUnavailable {
-		t.Fatalf("terminal diagnostic = %#v, want trusted provider-unavailable", stored.Status.TerminalDiagnostic)
+	if stored.Status.TerminalDiagnostic == nil || stored.Status.TerminalDiagnostic.Category != courierv1alpha1.TerminalDiagnosticCategoryForgeUnavailable {
+		t.Fatalf("terminal diagnostic = %#v, want trusted forge-unavailable", stored.Status.TerminalDiagnostic)
+	}
+	if stored.Status.TerminalDiagnostic.Reason != forgeUnavailableDiagnosticReason {
+		t.Fatalf("terminal diagnostic reason = %q, want %q", stored.Status.TerminalDiagnostic.Reason, forgeUnavailableDiagnosticReason)
 	}
 	if stored.Status.WorkspaceSafety == nil || stored.Status.WorkspaceSafety.State != "pushed" ||
 		stored.Status.WorkspaceSafety.Head == "" || stored.Status.WorkspaceSafety.RemoteHead != stored.Status.WorkspaceSafety.Head {
@@ -94,8 +97,11 @@ func TestForgeUnavailableTerminationUnsafeWorkspaceRefusesSettlement(t *testing.
 	if stored.Status.Phase != courierv1alpha1.PhaseBlockedExternal {
 		t.Fatalf("phase = %q, want blocked-external", stored.Status.Phase)
 	}
-	if stored.Status.TerminalDiagnostic == nil || stored.Status.TerminalDiagnostic.Category != courierv1alpha1.TerminalDiagnosticCategoryProviderUnavailable {
-		t.Fatalf("terminal diagnostic = %#v, want trusted provider-unavailable", stored.Status.TerminalDiagnostic)
+	if stored.Status.TerminalDiagnostic == nil || stored.Status.TerminalDiagnostic.Category != courierv1alpha1.TerminalDiagnosticCategoryForgeUnavailable {
+		t.Fatalf("terminal diagnostic = %#v, want trusted forge-unavailable", stored.Status.TerminalDiagnostic)
+	}
+	if stored.Status.TerminalDiagnostic.Reason != forgeUnavailableDiagnosticReason {
+		t.Fatalf("terminal diagnostic reason = %q, want %q", stored.Status.TerminalDiagnostic.Reason, forgeUnavailableDiagnosticReason)
 	}
 	if stored.Status.WorkspaceSafety == nil || stored.Status.WorkspaceSafety.State != "unknown" {
 		t.Fatalf("workspace safety = %#v, want persisted unknown evidence", stored.Status.WorkspaceSafety)
@@ -111,7 +117,7 @@ func TestForgeUnavailableTerminationUnsafeWorkspaceRefusesSettlement(t *testing.
 
 // TestTaskShapedBlockedExternalOpensNoEvidenceGate proves the pairing is
 // exact: a plain external-prerequisite block (blocked_external with no
-// provider-unavailable handoff category) never opens the workspace-safety
+// forge-unavailable handoff category) never opens the workspace-safety
 // acquisition gate, never carries the isolated-observer observation, and
 // never enters capacity recovery — its ending stays the ordinary recoverable
 // dependency block the source already reports.
@@ -157,6 +163,13 @@ func TestTaskShapedBlockedExternalOpensNoEvidenceGate(t *testing.T) {
 	}
 }
 
+// forgeUnavailableDiagnosticReason is the operator's own label for the #455
+// forge-read ending: the forge read could not complete on a transient
+// availability condition, so the world was never observed and the work was
+// released for another capacity. It names the forge, never the model
+// provider.
+const forgeUnavailableDiagnosticReason = "a forge read could not complete on a transient availability condition; the world was never observed; work released for another capacity"
+
 // forgeUnavailableHandoffMessage renders the exact exit-2 handoff the legacy
 // executor's forgeUnavailableTermination writes for a transient forge read.
 func forgeUnavailableHandoffMessage(state string) string {
@@ -167,7 +180,7 @@ func forgeUnavailableHandoffMessage(state string) string {
 		"exit_code":        2,
 		"reason":           "the live pull-request state could not be verified to confirm an open, non-draft pull request with authoritative source-issue linkage to #7: GET https://api.github.com/repos/acme/widgets/pulls/7: HTTP 403 rate limit; the forge was temporarily unavailable (rate limit, server error, or network failure), so the run is parked for bounded retry by the operator",
 		"outcome":          "blocked_external",
-		"category":         "provider-unavailable",
+		"category":         "forge-unavailable",
 		"workspace_safety": map[string]any{"state": state, "branch": "branch", "head": head, "remoteHead": head},
 	}
 	payload, err := json.Marshal(message)

@@ -220,7 +220,7 @@ type Heartbeat struct {
 // TerminalDiagnosticCategory is the stable classification of a terminal run's
 // cause, derived only from evidence the operator observed. Unknown is used
 // whenever evidence is missing or ambiguous; a cause is never invented.
-// +kubebuilder:validation:Enum=executor-crash;model-transport-error;continuation-exhaustion;verifier-rejection;kubernetes-failure;needs-decision;blocked-external;capacity-exhaustion;provider-unavailable;unknown
+// +kubebuilder:validation:Enum=executor-crash;model-transport-error;continuation-exhaustion;verifier-rejection;kubernetes-failure;needs-decision;blocked-external;capacity-exhaustion;provider-unavailable;forge-unavailable;unknown
 type TerminalDiagnosticCategory string
 
 const (
@@ -249,12 +249,20 @@ const (
 	// TerminalDiagnosticCategoryCapacityExhaustion is a structured, affirmative
 	// signal that execution capacity (not task correctness) was exhausted.
 	TerminalDiagnosticCategoryCapacityExhaustion TerminalDiagnosticCategory = "capacity-exhaustion"
-	// TerminalDiagnosticCategoryProviderUnavailable is an availability
-	// handoff: the provider repeatedly failed to serve this attempt (no
-	// structured allowance-exhaustion signal was observed), so the work is
-	// released recoverably for another capacity instead of failing
-	// permanently. It never claims the quota itself is exhausted.
+	// TerminalDiagnosticCategoryProviderUnavailable is a model-provider
+	// availability handoff: the model provider repeatedly failed to serve
+	// this attempt (no structured allowance-exhaustion signal was
+	// observed), so the work is released recoverably for another capacity
+	// instead of failing permanently. It never claims the quota itself is
+	// exhausted.
 	TerminalDiagnosticCategoryProviderUnavailable TerminalDiagnosticCategory = "provider-unavailable"
+	// TerminalDiagnosticCategoryForgeUnavailable is a forge-read
+	// availability handoff: a forge read could not complete on a transient
+	// availability condition, so the world was never observed and the work
+	// is released recoverably for another capacity instead of failing
+	// permanently. It never claims the world was read and found
+	// contradictory.
+	TerminalDiagnosticCategoryForgeUnavailable TerminalDiagnosticCategory = "forge-unavailable"
 	// TerminalDiagnosticCategoryUnknown: the evidence was missing or
 	// ambiguous.
 	TerminalDiagnosticCategoryUnknown TerminalDiagnosticCategory = "unknown"

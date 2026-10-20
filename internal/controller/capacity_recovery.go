@@ -59,20 +59,24 @@ func (r *CoderRunReconciler) capacityCooldownWindow() time.Duration {
 }
 
 // isCapacityExhaustionRun reports a run that ended on a recoverable capacity
-// handoff: the BlockedExternal phase carrying either the confirmed
-// capacity-exhaustion diagnostic or the availability handoff
-// (provider-unavailable). Both mean "this capacity could not complete the
-// attempt for availability reasons"; neither is a task-correctness verdict.
-// Neither half is sufficient — a plain external block is not a capacity
-// event, and a capacity category on any other phase proves nothing this path
-// may act on.
+// handoff: the BlockedExternal phase carrying one of the durable capacity
+// categories — the confirmed capacity exhaustion, the model-provider
+// availability handoff (provider-unavailable), the forge-read availability
+// handoff (forge-unavailable), or the spent model/agent child-process budget
+// (model-transport-error). All of them mean "this capacity could not complete
+// the attempt for availability reasons"; none is a task-correctness verdict.
+// Phase and category are both required — a plain external block is not a
+// capacity event, and a capacity category on any other phase proves nothing
+// this path may act on.
 func isCapacityExhaustionRun(run *courierv1alpha1.CoderRun) bool {
 	if run == nil || run.Status.Phase != courierv1alpha1.PhaseBlockedExternal || run.Status.TerminalDiagnostic == nil {
 		return false
 	}
 	switch run.Status.TerminalDiagnostic.Category {
 	case courierv1alpha1.TerminalDiagnosticCategoryCapacityExhaustion,
-		courierv1alpha1.TerminalDiagnosticCategoryProviderUnavailable:
+		courierv1alpha1.TerminalDiagnosticCategoryProviderUnavailable,
+		courierv1alpha1.TerminalDiagnosticCategoryForgeUnavailable,
+		courierv1alpha1.TerminalDiagnosticCategoryModelTransportError:
 		return true
 	}
 	return false

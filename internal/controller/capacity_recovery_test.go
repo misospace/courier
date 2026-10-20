@@ -105,17 +105,57 @@ func TestCapacityRecoverySettlesIssueAndExistingPRFixWithFence(t *testing.T) {
 }
 
 // TestCapacityRecoveryAcceptsAvailabilityHandoff proves the Scenario D gate:
-// a run terminalized as provider-unavailable (an outage without a structured
-// quota signal) drives the same fenced settlement and capacity cooldown as a
-// confirmed exhaustion — work must move — while any other category on the
-// same phase remains outside this path.
+// every recoverable availability category — a model-provider outage without a
+// structured quota signal, a forge read that could not complete, and a spent
+// model-transport budget — drives the same fenced settlement and capacity
+// cooldown as a confirmed exhaustion, so work must move. Any other category
+// on the same phase remains outside this path.
 func TestCapacityRecoveryAcceptsAvailabilityHandoff(t *testing.T) {
+	for _, category := range []courierv1alpha1.TerminalDiagnosticCategory{
+		courierv1alpha1.TerminalDiagnosticCategoryProviderUnavailable,
+		courierv1alpha1.TerminalDiagnosticCategoryForgeUnavailable,
+		courierv1alpha1.TerminalDiagnosticCategoryModelTransportError,
+	} {
+		t.Run(string(category), func(t *testing.T) {
+			run := admissionRun("exhausted", "pool-a", courierv1alpha1.PhaseBlockedExternal)
+			run.UID = "run-uid"
+			run.Spec.Mode, run.Spec.Source, run.Spec.WorkItemID = courierv1alpha1.ModeResolveIssue, "fake", "availability-work"
+			run.Status.Branch = "branch"
+			run.Status.WorkspaceSafety = &courierv1alpha1.WorkspaceSafetyEvidence{State: "empty"}
+			run.Status.TerminalDiagnostic = &courierv1alpha1.TerminalDiagnostic{Category: category}
+			run.Status.Conditions = append(run.Status.Conditions, metav1.Condition{Type: lifecycleReportedCondition, Status: metav1.ConditionTrue, Reason: "Published"})
+			lane := admissionLane("pool-a", 1)
+			lane.Spec.CapacityGroup = "shared-pool"
+			c := capacityTestClient(t, lane, run)
+			s := &capacitySource{admissionSource: &admissionSource{}}
+			r := &CoderRunReconciler{Client: c, Sources: NewSourceRegistry(map[string]source.Adapter{"fake": s}), StatusWriter: fakeStatusWriter{client: c}, Now: func() time.Time { return time.Date(2026, 10, 13, 0, 0, 0, 0, time.UTC) }}
+			if _, err := r.Reconcile(context.Background(), admissionRequest(run.Name)); err != nil {
+				t.Fatalf("Reconcile() error = %v", err)
+			}
+			if len(s.settled) != 1 {
+				t.Fatalf("availability handoff did not settle: %#v", s.settled)
+			}
+			var stored courierv1alpha1.CoderRun
+			if err := c.Get(context.Background(), client.ObjectKeyFromObject(run), &stored); err != nil {
+				t.Fatal(err)
+			}
+			if cond := apimeta.FindStatusCondition(stored.Status.Conditions, courierv1alpha1.ConditionCapacityRecovery); cond == nil || cond.Reason != capacityRecoverySettled {
+				t.Fatalf("condition = %#v", cond)
+			}
+		})
+	}
+}
+
+// TestCapacityRecoveryRefusesNonCapacityCategory proves the allowlist is
+// exact: a run on the same phase whose diagnostic carries a category that is
+// not a recoverable capacity cause stays out of the fenced settlement path.
+func TestCapacityRecoveryRefusesNonCapacityCategory(t *testing.T) {
 	run := admissionRun("exhausted", "pool-a", courierv1alpha1.PhaseBlockedExternal)
 	run.UID = "run-uid"
-	run.Spec.Mode, run.Spec.Source, run.Spec.WorkItemID = courierv1alpha1.ModeResolveIssue, "fake", "availability-work"
+	run.Spec.Mode, run.Spec.Source, run.Spec.WorkItemID = courierv1alpha1.ModeResolveIssue, "fake", "verifier-work"
 	run.Status.Branch = "branch"
 	run.Status.WorkspaceSafety = &courierv1alpha1.WorkspaceSafetyEvidence{State: "empty"}
-	run.Status.TerminalDiagnostic = &courierv1alpha1.TerminalDiagnostic{Category: courierv1alpha1.TerminalDiagnosticCategoryProviderUnavailable}
+	run.Status.TerminalDiagnostic = &courierv1alpha1.TerminalDiagnostic{Category: courierv1alpha1.TerminalDiagnosticCategoryVerifierRejection}
 	run.Status.Conditions = append(run.Status.Conditions, metav1.Condition{Type: lifecycleReportedCondition, Status: metav1.ConditionTrue, Reason: "Published"})
 	lane := admissionLane("pool-a", 1)
 	lane.Spec.CapacityGroup = "shared-pool"
@@ -125,15 +165,15 @@ func TestCapacityRecoveryAcceptsAvailabilityHandoff(t *testing.T) {
 	if _, err := r.Reconcile(context.Background(), admissionRequest(run.Name)); err != nil {
 		t.Fatalf("Reconcile() error = %v", err)
 	}
-	if len(s.settled) != 1 {
-		t.Fatalf("availability handoff did not settle: %#v", s.settled)
+	if len(s.settled) != 0 {
+		t.Fatalf("a non-capacity category settled anyway: %#v", s.settled)
 	}
 	var stored courierv1alpha1.CoderRun
 	if err := c.Get(context.Background(), client.ObjectKeyFromObject(run), &stored); err != nil {
 		t.Fatal(err)
 	}
-	if cond := apimeta.FindStatusCondition(stored.Status.Conditions, courierv1alpha1.ConditionCapacityRecovery); cond == nil || cond.Reason != capacityRecoverySettled {
-		t.Fatalf("condition = %#v", cond)
+	if cond := apimeta.FindStatusCondition(stored.Status.Conditions, courierv1alpha1.ConditionCapacityRecovery); cond != nil {
+		t.Fatalf("capacity recovery condition = %#v, want none", cond)
 	}
 }
 
