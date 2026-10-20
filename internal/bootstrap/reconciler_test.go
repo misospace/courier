@@ -430,7 +430,7 @@ func TestReconcileAllCarriesResourcesOntoSpec(t *testing.T) {
 	provider := &staticProvider{profiles: []Profile{{
 		Name:  "local",
 		Roles: map[string]string{"coordinator": "claude-sonnet-4-5"},
-		Resources: corev1.ResourceRequirements{
+		Resources: courierv1alpha1.PodResources{
 			Requests: corev1.ResourceList{
 				corev1.ResourceCPU:    resource.MustParse("750m"),
 				corev1.ResourceMemory: resource.MustParse("2Gi"),

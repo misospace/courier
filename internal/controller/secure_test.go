@@ -819,7 +819,7 @@ func TestLaunchSecureAppliesLaneResources(t *testing.T) {
 		ObjectMeta: metav1.ObjectMeta{Namespace: secureTestNamespace, Name: "sized"},
 		Spec: courier.LaneProfileSpec{
 			Roles: map[string]string{"coordinator": "test/coordinator", "coder": "test/coder"},
-			Resources: corev1.ResourceRequirements{
+			Resources: courier.PodResources{
 				Requests: corev1.ResourceList{
 					corev1.ResourceCPU:    resource.MustParse("750m"),
 					corev1.ResourceMemory: resource.MustParse("1Gi"),
@@ -1467,7 +1467,9 @@ func TestLiveProbePodsStaySeparatePerNode(t *testing.T) {
 // TestProbeResultsRefuseAnotherNodesPod pins the check that a probe pod's name
 // alone cannot make: the pod a name resolves to must be pinned to the node
 // under test. A collision, or a pod bound elsewhere, says nothing about that
-// node's isolation, so its results are refused rather than counted.
+// node's isolation, so its results are refused rather than counted — and
+// terminally (#449): the mismatch's persistent causes outlast a requeue, and
+// the read cannot tell them from a stray pod a later pass would clear.
 func TestProbeResultsRefuseAnotherNodesPod(t *testing.T) {
 	control, c := secureControl(t)
 	run := secureRun("probe-elsewhere")
@@ -1495,14 +1497,43 @@ func TestProbeResultsRefuseAnotherNodesPod(t *testing.T) {
 	if err == nil {
 		t.Fatal("a probe running on another node must not be counted as this node's result")
 	}
-	if !strings.Contains(err.Error(), pod.Name) || !strings.Contains(err.Error(), "node-b") {
-		t.Fatalf("error = %v, want it to name probe %q and the node it is scheduled on", err, pod.Name)
+	var permanent *SecureNeedsHumanError
+	if !errors.As(err, &permanent) || permanent.Reason != "ProbeIdentity" {
+		t.Fatalf("error = %v, want a terminal *SecureNeedsHumanError reason ProbeIdentity", err)
+	}
+	if !strings.Contains(permanent.Detail, pod.Name) ||
+		!strings.Contains(permanent.Detail, "scheduled on node node-b, not node-a") {
+		t.Fatalf("detail = %q, want it to name probe %q, the node it is pinned to, and the node under test",
+			permanent.Detail, pod.Name)
 	}
 	if pending {
 		t.Fatal("a terminal probe is not pending; it was refused")
 	}
 	if len(outcomes) > 0 {
 		t.Fatalf("a refused probe must contribute no outcomes, got %v", outcomes)
+	}
+}
+
+// TestTerminalPreflightVerdictClassifications pins the launch paths'
+// terminalization predicate itself: the probe-identity refusal joins
+// PodAdmission as a terminal verdict, and every other secure-preflight reason
+// keeps its claim/release requeue (#449).
+func TestTerminalPreflightVerdictClassifications(t *testing.T) {
+	terminal := map[string]bool{
+		"PodAdmission":  true,
+		"ProbeIdentity": true,
+	}
+	for _, reason := range []string{
+		"PodAdmission", "ProbeIdentity",
+		"PodSecurity", "OperatorRBAC", "BrokerRBAC", "AdmissionBroken",
+		"IsolationBroken", "RunNamespace", "ProviderSelection",
+	} {
+		if got := terminalPreflightVerdict(secureNeedsHuman(reason, "synthetic %s", reason)) != nil; got != terminal[reason] {
+			t.Errorf("reason %q terminalizes = %v, want %v", reason, got, terminal[reason])
+		}
+	}
+	if terminalPreflightVerdict(errors.New("ordinary preflight failure")) != nil {
+		t.Error("an ordinary error must not terminalize")
 	}
 }
 
