@@ -472,6 +472,13 @@ spec:
                 - Failed
                 - BlockedExternal
                 type: string
+              phaseEnteredAt:
+                description: |-
+                  PhaseEnteredAt is when the run most recently entered its current phase.
+                  It is replaceable, not set-once: it is restamped on every phase change,
+                  so phase-age observability can measure time in the current phase.
+                format: date-time
+                type: string
               pr:
                 description: PR is the pull request opened by this run (number or
                   URL).

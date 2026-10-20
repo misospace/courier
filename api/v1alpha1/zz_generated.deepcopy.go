@@ -203,6 +203,10 @@ func (in *CoderRunStatus) DeepCopyInto(out *CoderRunStatus) {
 		in, out := &in.FinishedAt, &out.FinishedAt
 		*out = (*in).DeepCopy()
 	}
+	if in.PhaseEnteredAt != nil {
+		in, out := &in.PhaseEnteredAt, &out.PhaseEnteredAt
+		*out = (*in).DeepCopy()
+	}
 	if in.Checkpoint != nil {
 		in, out := &in.Checkpoint, &out.Checkpoint
 		*out = new(Checkpoint)

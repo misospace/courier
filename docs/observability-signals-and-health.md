@@ -172,15 +172,16 @@ subset of phases only; what is recoverable from `Status` today is:
 | `AwaitingReview` / `HandedOff` / `Failed` / `NeedsHuman` / `BlockedExternal` | partial — `FinishedAt` is the run's first terminal transition (set-once, `internal/controller/coderun_controller.go:1014-1023`); a later `AwaitingReview → Done` does **not** move `FinishedAt` and never records a `Done`-entry timestamp, so `now − FinishedAt` overstates a `Done` run's age by the gap from `AwaitingReview` to merge | a per-phase entry timestamp |
 | `Done` | **no** — never an entry timestamp; the terminal histogram captures aggregate distribution, not per-run age | the `Done`-entry timestamp |
 
-The recoverable cells are the only safe derivations; the **unknown** cells
-are exactly the cases the rule in §4.3 demands: uncertainty is a state, not
-a measured zero (a view that shows `now − StartedAt` as `Verifying` age is
-silently wrong, not just imprecise). The histogram in this section captures
-aggregate distribution without a per-run label; per-run accurate phase age
-requires either the `phase.transition` log event
-(`internal/log/events.go:67-68`), joined on `run_id`, or a proposed
-durable `Status.PhaseEnteredAt` per phase, neither of which is authorized
-here.
+The recoverable cells are the only safe derivations from the pre-#324 status
+shape; the **unknown** cells are exactly the cases the rule in §4.3 demands:
+uncertainty is a state, not a measured zero (a view that shows `now −
+StartedAt` as `Verifying` age is silently wrong, not just imprecise). The
+histogram in this section captures aggregate distribution without a per-run
+label. Per-run phase age across restart is answered by the durable
+`Status.PhaseEnteredAt` marker shipped with #324: it is restamped on every
+phase change inside the status patch, so `now − PhaseEnteredAt` is truthful
+for every phase, and a run recorded before the marker existed reports no
+duration rather than a fabricated one.
 
 ### 3.5 Execution outcomes (core)
 
@@ -205,7 +206,7 @@ condition `LifecycleReportSupported`
 | Signal | Kind | Unit | Labels | Semantics |
 | --- | --- | --- | --- | --- |
 | `courier_source_lifecycle_report_outcomes_total` | counter | reports | `source`, `lane`, `mode`, `result` | One per terminal report attempt outcome; `result` ∈ `published`, `superseded`, `unsupported`, `retryable`. |
-| `courier_coderuns_lifecycle_pending` | gauge | runs | `lane` | Terminal runs with `LifecycleReported=False` — the unsettled-report backlog. |
+| `courier_coderuns_lifecycle_pending` | gauge | runs | `lane` | Terminal runs whose lifecycle report is not positively settled (condition not `True` with reason `Published`/`Superseded`) — the unsettled-report backlog, mirroring the retention hold gate. |
 | `courier_coderuns_lifecycle_pending_oldest_age_seconds` | gauge | seconds | `lane` | Age of the oldest unsettled report, from `FinishedAt`. Evidence for the reporting-failure condition. |
 
 The metric `result` vocabulary is a bounded projection of the two existing
@@ -261,7 +262,7 @@ policy.
 | --- | --- | --- | --- | --- |
 | `courier_coderuns_reap_requests_total` | counter | requests | `phase` | Existing: terminal-run deletions the reaper asked the API server to accept, by the terminal phase they were requested from. It counts **requests, not deletions** — the API server accepts a delete while a finalizer still holds the object, so a securely-topology-held run is counted here and not yet gone. |
 | `courier_coderuns_oldest_terminal_age_seconds` | gauge | seconds | `phase` | Existing: age of the oldest retained terminal run per phase, read live from the cluster at scrape time, so it survives an operator restart. Paired with the counter above it is what separates "the reaper is asking" from "the run is actually still there". |
-| `courier_coderuns_awaiting_reap` | gauge | runs | `phase` | Proposed: terminal runs retained for inspection and not yet reaped. The age gauge answers *how stale* the oldest retained run is; this answers *how many* runs are held, which is the retained-backlog view #292 needs. |
+| `courier_coderuns_awaiting_reap` | gauge | runs | `phase` | Shipped with #324: terminal runs retained for inspection and not yet reaped. The age gauge answers *how stale* the oldest retained run is; this answers *how many* runs are held, which is the retained-backlog view #292 needs. |
 
 Both shipped retention signals are labelled `phase` only, never `lane`
 (`reapMetricLabels`, `internal/controller/metrics.go:35`): retention is a

@@ -341,6 +341,7 @@ func (w fakeStatusWriter) PatchStatus(ctx context.Context, name types.Namespaced
 			AdmittedAt                      *metav1.Time                       `json:"admittedAt,omitempty"`
 			StartedAt                       *metav1.Time                       `json:"startedAt,omitempty"`
 			FinishedAt                      *metav1.Time                       `json:"finishedAt,omitempty"`
+			PhaseEnteredAt                  *metav1.Time                       `json:"phaseEnteredAt,omitempty"`
 			WaitDuration                    string                             `json:"waitDuration,omitempty"`
 			RunDuration                     string                             `json:"runDuration,omitempty"`
 			CheckFingerprint                *string                            `json:"checkFingerprint,omitempty"`
@@ -389,6 +390,9 @@ func (w fakeStatusWriter) PatchStatus(ctx context.Context, name types.Namespaced
 	}
 	if document.Status.FinishedAt != nil {
 		run.Status.FinishedAt = document.Status.FinishedAt
+	}
+	if document.Status.PhaseEnteredAt != nil {
+		run.Status.PhaseEnteredAt = document.Status.PhaseEnteredAt
 	}
 	if document.Status.WaitDuration != "" {
 		run.Status.WaitDuration = document.Status.WaitDuration
