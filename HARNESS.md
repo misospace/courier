@@ -1090,7 +1090,13 @@ worker acknowledges cancellation only after it has proven that no live process
 remains in that group (or confirmation it never started). Work that leaves the
 group cannot be proven gone, so it is reported as unverified rather than
 acknowledged, and trusted control keeps the operation's active status until
-termination is verified. Only then may trusted control clear
+termination is verified. Wherever control observes an unverified
+termination, it also fences the worker against every further dispatch —
+including on a terminal result whose process group still holds live work
+(#414 review): the next dispatch is refused before it reaches the worker, so
+new workspace work never starts on a worker that may still hold live
+repository-authored processes, and the fence refusal surfaces as the next
+tool failure. Only then may trusted control clear
 active-operation status. A replacement worker (new pod UID) that never saw
 that `opID` treats a late cancel as unknown data and runs nothing; the
 authoritative termination of a fenced stale worker is the operator's pod kill,

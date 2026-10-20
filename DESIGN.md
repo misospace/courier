@@ -1266,6 +1266,152 @@ duplicate materialization. At rollout, runners also recognize prior
 identity. The CRD must be installed before an operator that writes
 `sourceAgent` is rolled out.
 
+### Repository development bootstrap execution
+
+Courier executes an opt-in, repository-owned development bootstrap after
+checkout and before model work. The contract is the convention settled with
+the per-repo implementations (#416 and the linked repos): `.mise/config.toml`
+plus a committed `.mise/mise.lock`, executed as `mise run bootstrap`. The
+runtime owns four decisions, shared by the integrator, the secure harness,
+and the legacy executor's classification through `internal/devenv`:
+
+- **Trust rule.** The contract is approved only when the checked-out
+  `.mise/config.toml` and `.mise/mise.lock` are byte-identical to those at
+  the run's operator-approved base revision, read with hardened git reads
+  (`git cat-file`) at the resolved head and base commits — never from a
+  working tree, never by executing anything to decide. The committed
+  lockfile is part of the contract, not an optional companion: a config
+  whose lock is absent or unprovable at either revision is unapproved and
+  skipped, because without the lock the tool versions a bootstrap
+  installs are unpinned, and a repository that has committed a config
+  has a contract rather than none. Every compared contract path must be a
+  regular blob: a symlink (120000) or a gitlink
+  (160000) at either revision is unprovable and fails closed. The
+  comparison is the APPROVAL GATE only: a contract modified in a PR is an
+  untrusted modification and is skipped, never executed. What actually
+  executes is never the head's bytes — the secure worker materializes the
+  approved base revision from the git object store (`git archive` to a
+  temporary tar, extracted only after the command succeeds, so a failed
+  archive can never leave a partial tree behind a successful extractor),
+  verifies the contract file exists in the materialization, and runs
+  `mise run bootstrap` inside it — so the executed bytes are the approved
+  base revision's bytes BY CONSTRUCTION, and mise's task discovery (config
+  fragments, `conf.d`, task directories, includes, whatever surfaces it
+  reads) cannot reach head content. No enumeration of what mise might
+  discover is attempted, because none can be complete; enumeration-based
+  pinning of referenced scripts was tried and removed as unsound. On
+  success the task transfers the materialization's repository-local `bin/`
+  outputs into the workspace checkout: a contract whose bootstrap installs
+  tools under the repository root's `bin/` (Courier's own `hack/bootstrap.sh`
+  writes `bin/controller-gen`, `bin/setup-envtest`, and `bin/.tool-pins`)
+  would otherwise produce them inside the temporary materialization its EXIT
+  trap deletes, leaving every later workspace command to reinstall them.
+  The transferred bytes are outputs of the approved base's own bootstrap —
+  the same trusted chain as the executed bytes — a failed bootstrap
+  transfers nothing, and nothing is copied from head.
+  Repositories without a contract are skipped (documented no-contract
+  behavior, not a failure); so are a contract that differs from the base
+  and one that is only half-committed (a config with no lock). All three
+  skip classes dispatch nothing and are never executed.
+- **Bounded setup.** The secure harness dispatches the bootstrap task
+  (`mise run bootstrap` plus its fixed diagnostic lines, emitted exactly
+  once from the script's EXIT trap — the terminal emission that runs last
+  on success and on every failure path) and the environment capture
+  (`mise x -- env -0`) as TWO
+  separately dispatched worker operations, each under its own fixed liveness
+  bound (15 minutes) — never one shared budget, so a hung bootstrap cannot
+  consume the capture's liveness too. On expiry, control classifies the
+  expiry from the stage's own context and reconciles the operation through
+  cancellation on a fresh bounded context that ignores the expired caller
+  context — a reconcile issued on the expired context could never reach the
+  worker, and the bound must still DELIVER the worker's process-group kill
+  and observe the result before the run ends blocked-external with a
+  structured reason (fixed text naming the stage and the exit code only —
+  untrusted worker output never enters a durable reason), never a
+  model-visible retry loop and never a model scavenger hunt for tooling.
+  The expiry is delivered wherever it lands — inside an in-flight poll or
+  inside the poll wait itself: a bound that expires while control merely
+  waits between polls must still reconcile the running operation through
+  cancellation, because the worker answers "running" immediately and only
+  an in-flight poll would otherwise carry the kill.
+  A termination that was never OBSERVED is not an environment blocker:
+  repository-authored work may still be executing, so the run must never be
+  reported blocked-external over it. The stage's active-operation entry
+  stays retained, the worker is fenced against every further dispatch, and
+  the failure fails closed through the ordinary error path carrying the
+  unverified-termination fact. The fence for a terminal observation that
+  still carries live descendants is set centrally where the terminal result
+  is verified, so every caller of the dispatch-and-await path — not only the
+  bootstrap stage that re-fences on the sentinel it receives — stops further
+  dispatch against a worker whose task tree still holds live work. Every
+  path that can leave a termination
+  unobserved produces that fact: a reconciliation that failed, one that
+  observed work still live in the task tree or an operation the worker
+  still reports as running, and an ordinary observation of a task tree that
+  outlived its task. Only an independently observed termination — the worker
+  no longer knows the operation, or a terminal observation with an empty
+  process tree — may classify a bound expiry as the environment blocker it
+  is.
+  The environment capture is size-capped at the source (64 KiB, paired with
+  the `Task.Env` dispatch bound and the worker's 64 KiB stdout tail): an
+  oversized capture fails the task honestly with a nonzero exit, never a
+  truncation.
+- **Deterministic environment.** The captured post-bootstrap environment is
+  applied so every subsequent execution inherits it without interactive
+  shell activation. Protected keys — Courier's control plane (`COURIER_*`),
+  git plumbing (`GIT_*`), dynamic-loader injection (`LD_*`, `DYLD_*`),
+  `IFS`, `SHELL` — are never overridden; `PATH` deliberately is, because
+  deterministic PATH replacement is the point. The secure harness attaches
+  the filtered capture to model-influenced worker tasks (`Task.Env`), and
+  the worker merges it over its own environment with the same filter —
+  fixed control scripts (unpack, pack) never carry it, so a poisoned PATH
+  cannot redirect the trusted git plumbing.
+- **Boundaries.** The legacy executor pod is credential-bearing and NEVER
+  executes repository contract content: it classifies the contract with
+  pure git reads, and an approved contract there is skipped with an honest
+  receipt naming exactly that — execution happens only in the secure
+  worker's credential-free context, which honors the existing
+  dependency-egress policy (no bypass and no extra grant; a bootstrap that
+  cannot reach its pinned downloads fails as the environment blocker
+  above). Receipts carry no secret values and no raw worker output: the
+  legacy executor emits a `workspace.bootstrap` structured event with a
+  fixed skip reason; the control pod emits a structured `workspace.bootstrap`
+  receipt (status, failure reason, per-task elapsed time, exit codes,
+  environment-key count, and the mise executable path, version, and cache
+  location) through the same best-effort event emitter as session
+  compaction, with diagnostic values validated to a fixed key set and a
+  printable-ASCII charset.
+
+mise provisioning for the runtime images is #415's coordinated work; until
+it lands, an approved contract on an unprovisioned environment ends
+deterministically blocked-external naming the missing mise executable. The
+same holds for the tool artifacts a contract installs: the secure worker's
+dependency-egress policy admits no arbitrary fetch, so a secure-mode
+contract is expected to be pre-materialized in the provisioned image —
+runtime downloads are not an affordance either topology grants, and their
+absence is the same honest blocker, not an egress bypass.
+
+Two cost/trust properties are deliberate. The secure workspace is
+re-materialized from a fresh snapshot for every coordinator shell command
+and every brief, and each unpack wipes untracked workspace state with
+`git clean -qfdx` — so the bootstrap runs after every unpack, and its
+idempotency plus out-of-workspace caches (user-scoped installs) are what
+keep repeat runs cheap; a workspace-local install that must survive is the
+contract author's problem, not the runtime's. And the executed bytes are
+the approved base revision's bytes by construction — the worker
+materializes the base revision from the git object store and runs inside
+it — while the approval gate was computed from control's tree at head and
+base: control dispatches only at an approved state, and the captured
+environment never flows back into a trusted process. Approval covers the
+compared contract paths as regular blobs at the resolved commits — a
+symlinked or substituted contract path fails closed instead of being
+compared through its target — and the base materialization's `test -f`
+proves the contract file is really present in what will run. The
+materialization assumes the base revision is reachable from the dispatched
+snapshot's work ref — true because integration is built on the base; a
+base whose objects are absent from the worker's store fails closed at the
+materialization guard, never runs something else instead.
+
 ## Commit cadence
 
 Commit at **completed-brief boundaries** — not mid-thought (a foot-gun for a long

@@ -2544,7 +2544,7 @@ func TestRunEmitsRunScopedEventsWithoutDetail(t *testing.T) {
 
 	events := parseEvents(t, &output)
 	wantTypes := map[string]bool{
-		"run.start": false, "workspace.ready": false, "executor.start": false, "run.exit": false,
+		"run.start": false, "workspace.ready": false, "workspace.bootstrap": false, "executor.start": false, "run.exit": false,
 	}
 	for _, event := range events {
 		eventType, _ := event["event"].(string)
@@ -2558,8 +2558,14 @@ func TestRunEmitsRunScopedEventsWithoutDetail(t *testing.T) {
 		if event["repo"] != "acme/widgets" || event["ref"] != float64(7) || event["mode"] != "resolve-issue" {
 			t.Fatalf("event %s is missing repo/ref/mode metadata", eventType)
 		}
-		if _, ok := event["detail"]; ok {
-			t.Fatalf("info-level event %s must not carry detail", eventType)
+		// workspace.bootstrap is a designated verbose event (#414): its
+		// receipt is the operator's triage surface and survives info level.
+		if eventType != "workspace.bootstrap" {
+			if _, ok := event["detail"]; ok {
+				t.Fatalf("info-level event %s must not carry detail", eventType)
+			}
+		} else if _, ok := event["detail"]; !ok {
+			t.Fatalf("verbose event %s must carry its receipt detail", eventType)
 		}
 	}
 	for eventType, seen := range wantTypes {

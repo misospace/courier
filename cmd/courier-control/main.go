@@ -236,6 +236,11 @@ func runArgs(args []string) error {
 			stderr:     os.Stderr,
 			invocation: invocation,
 		},
+		BootstrapReceipts: bootstrapReceiptSink{
+			emitter:    courierlog.NewEmitter(os.Stdout, courierlog.ParseLevel(os.Getenv("COURIER_LOG_LEVEL"))),
+			stderr:     os.Stderr,
+			invocation: invocation,
+		},
 	})
 	if err != nil {
 		return fmt.Errorf("courier-control: %w", err)
@@ -309,6 +314,53 @@ func (s compactionSink) SessionCompacted(event harness.CompactEvent) {
 	})
 	if err != nil {
 		fmt.Fprintf(s.stderr, "courier-control: dropped %s event: %v\n", courierlog.EventSessionCompacted, err)
+	}
+}
+
+// bootstrapReceiptSink adapts the harness's structured bootstrap receipts
+// (#414) onto the run's structured event log: one workspace.bootstrap line
+// carrying the status, the fixed failure reason when failed, each bounded
+// task's elapsed milliseconds and exit code, the environment-key count, and
+// the validated mise diagnostics (executable path, version, data dir). The
+// receipt is composed trusted-side and carries no secret values and no raw
+// worker output. The status maps onto the event's status vocabulary —
+// "applied" emits ok, "failed" emits error — and detail is Verbose so the
+// receipt reaches the log store at info level. Emission is best-effort: a
+// dropped event is noted on stderr and the run continues.
+type bootstrapReceiptSink struct {
+	emitter    *courierlog.Emitter
+	stderr     io.Writer
+	invocation executor.Invocation
+}
+
+// BootstrapRecorded implements harness.BootstrapReceiptSink.
+func (s bootstrapReceiptSink) BootstrapRecorded(receipt harness.BootstrapReceipt) {
+	status := courierlog.StatusOK
+	if receipt.Status != harness.BootstrapReceiptApplied {
+		status = courierlog.StatusError
+	}
+	detail := map[string]any{
+		"status":               receipt.Status,
+		"reason":               receipt.Reason,
+		"bootstrap_elapsed_ms": receipt.BootstrapElapsedMs,
+		"capture_elapsed_ms":   receipt.CaptureElapsedMs,
+		"bootstrap_exit_code":  receipt.BootstrapExitCode,
+		"capture_exit_code":    receipt.CaptureExitCode,
+		"env_keys":             receipt.EnvKeys,
+		"mise_diagnostics":     receipt.Diagnostics,
+	}
+	err := s.emitter.Emit(courierlog.Event{
+		Type:    courierlog.EventWorkspaceBootstrap,
+		RunID:   s.invocation.RunName,
+		Repo:    s.invocation.Repo,
+		Ref:     s.invocation.Ref,
+		Mode:    string(s.invocation.Mode),
+		Status:  status,
+		Detail:  detail,
+		Verbose: true,
+	})
+	if err != nil {
+		fmt.Fprintf(s.stderr, "courier-control: dropped %s event: %v\n", courierlog.EventWorkspaceBootstrap, err)
 	}
 }
 

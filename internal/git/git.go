@@ -88,6 +88,17 @@ func (w *Workspace) baseRemoteRef(ref string) string {
 	return w.baseRemote() + "/" + ref
 }
 
+// BaseRevisionRef returns the workspace-local ref the run's base branch is
+// anchored to: the base remote's ref when the base lives on a separate
+// upstream (the fork topology), the work-branch remote's otherwise. Trusted
+// callers that resolve run-scoped base content — such as the development
+// bootstrap contract's approval check (#414) — resolve through this ref,
+// never through the bare branch name, which on a fork workspace resolves to
+// the fork's own branch rather than the operator-approved base.
+func (w *Workspace) BaseRevisionRef() string {
+	return w.baseRemoteRef(w.Base)
+}
+
 // ensureBaseRemote adds the base remote when Base does not live on the
 // work-branch remote. An existing remote is updated, so re-preparing a
 // workspace is idempotent.

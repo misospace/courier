@@ -37,6 +37,7 @@ import (
 	courierv1alpha1 "github.com/misospace/courier/api/v1alpha1"
 	"github.com/misospace/courier/internal/broker"
 	"github.com/misospace/courier/internal/broker/grammar"
+	"github.com/misospace/courier/internal/devenv"
 	"github.com/misospace/courier/internal/evidence"
 	"github.com/misospace/courier/internal/executor"
 	"github.com/misospace/courier/internal/forge"
@@ -1218,6 +1219,51 @@ func run(ctx context.Context, stdout, stderr io.Writer) int {
 	}
 	report.event(courierlog.EventWorkspaceReady, courierlog.StatusOK, ready)
 
+	// Child output is redacted before it reaches the run streams. The session
+	// tap observes OpenCode's JSON events without changing their bytes. The
+	// wrapping happens once, here: the model child streams through the same
+	// writers.
+	stdoutRedacted := courierlog.NewRedactingWriter(stdout, report.red)
+	stderrTransport := courierlog.NewRedactingWriter(stderr, report.red)
+
+	// The repository-owned development bootstrap contract (#414): the legacy
+	// executor is credential-bearing, so it NEVER executes repository
+	// contract content — it classifies the contract with pure git reads and
+	// emits one receipt event per verdict. Execution happens only in the
+	// secure worker's credential-free context; an approved contract here is
+	// skipped with a receipt that names exactly that.
+	state, stateErr := bootstrapContractState(ctx, workspace.Directory, workspace.BaseRevisionRef(), startCommit)
+	switch {
+	case stateErr != nil:
+		reason := report.red.Redact("bootstrap contract state unreadable: " + stateErr.Error())
+		report.eventVerbose(courierlog.EventWorkspaceBootstrap, courierlog.StatusError, map[string]any{
+			"status": "skipped",
+			"reason": truncatedRunes(reason, bootstrapReasonLimit),
+		})
+	case state == devenv.StateAbsent:
+		report.eventVerbose(courierlog.EventWorkspaceBootstrap, courierlog.StatusOK, map[string]any{
+			"status": "skipped",
+			"reason": "",
+		})
+	case state == devenv.StateModified:
+		report.eventVerbose(courierlog.EventWorkspaceBootstrap, courierlog.StatusOK, map[string]any{
+			"status": "skipped",
+			"reason": "bootstrap contract is not provably identical to the approved base revision; not executed",
+		})
+	case state == devenv.StateApproved:
+		// The contract is approved, but this executor is credential-bearing
+		// and must never execute repository contract code (#414 review): the
+		// run continues unbootstrapped — exactly like the absent and
+		// modified branches — and the secure worker topology owns
+		// execution. No exec, no environment application, no termination.
+		report.eventVerbose(courierlog.EventWorkspaceBootstrap, courierlog.StatusOK, map[string]any{
+			"status": "skipped",
+			"reason": "bootstrap contract approved but not executed: the legacy executor is credential-bearing; the approved bootstrap runs only in the secure worker topology",
+		})
+	}
+	_ = stdoutRedacted.Flush()
+	_ = stderrTransport.Flush()
+
 	runtime := executor.OpenCode{Binary: cfg.OpenCodeBinary, Format: cfg.OpenCodeFormat, Agent: cfg.OpenCodeAgent}
 	caps := preflightCapabilities(ctx, runtime.MCPStatusCommand(), workspace.Directory)
 	if len(caps) > 0 {
@@ -1226,10 +1272,6 @@ func run(ctx context.Context, stdout, stderr io.Writer) int {
 	if note := capabilityNote(caps); note != "" {
 		cfg.Framing = strings.TrimSpace(cfg.Framing + "\n\n" + report.red.Redact(note))
 	}
-	// Child output is redacted before it reaches the run streams. The session tap
-	// observes OpenCode's JSON events without changing their bytes.
-	stdoutRedacted := courierlog.NewRedactingWriter(stdout, report.red)
-	stderrTransport := courierlog.NewRedactingWriter(stderr, report.red)
 	tap := newSessionTap(stdoutRedacted, parseExhaustionSignals(cfg.ExhaustionCodes, cfg.ExhaustionTypes))
 	tap.tel = report.tel
 	var exhaustionSignal atomic.Bool

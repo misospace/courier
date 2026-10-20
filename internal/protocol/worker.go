@@ -18,6 +18,8 @@ import (
 	"sync"
 	"syscall"
 	"time"
+
+	"github.com/misospace/courier/internal/devenv"
 )
 
 // Worker configuration and transport bounds.
@@ -61,6 +63,15 @@ type Task struct {
 	// workspace, whose bytes are returned as the untrusted artifact.
 	// +optional
 	ArtifactPath string `json:"artifactPath,omitempty"`
+	// Env optionally carries the development-bootstrap environment delta the
+	// task's child should be merged over (#414). Control composes it from
+	// the approved contract's captured environment with protected keys
+	// (Courier's control plane, git plumbing, dynamic-loader injection)
+	// already filtered, and the worker filters again before merging — both
+	// sides call devenv.ProtectedKeys so neither can drift. Fixed control
+	// scripts (unpack, pack) never carry it.
+	// +optional
+	Env []string `json:"env,omitempty"`
 }
 
 // Result is the untrusted execution result. Worker-declared fields are never
@@ -331,9 +342,25 @@ func (w *Worker) runTask(ctx context.Context, task Task) *Result {
 	cmd.WaitDelay = taskTerminationGrace
 	// The worker container carries no secrets; the child inherits the pod's
 	// environment. Git hardening belongs to trusted integration, not to the
-	// untrusted sandbox. The child goes through the containment funnel: its
-	// pid is registered before the start is released, so no adoption pass
-	// can reap it out from under the Wait that owes it a status (#399).
+	// untrusted sandbox.
+	// An optional bootstrap environment delta (#414) merges over that
+	// environment. Protected keys are filtered again here — both sides call
+	// devenv.ProtectedKeys so neither can drift — and an oversized delta
+	// fails the task closed: a delta over the bound is not executed, never
+	// truncated.
+	if len(task.Env) > 0 {
+		if taskEnvBytes(task.Env) > maxTaskEnvBytes {
+			return &Result{
+				Status:     ResultFailed,
+				ExitCode:   -1,
+				StderrTail: "task environment exceeds the 64 KiB dispatch bound and the task was rejected before execution",
+			}
+		}
+		cmd.Env = devenv.MergeEnv(os.Environ(), task.Env)
+	}
+	// The child goes through the containment funnel: its pid is registered
+	// before the start is released, so no adoption pass can reap it out from
+	// under the Wait that owes it a status (#399).
 	startErr := containment.startTaskChild(cmd)
 	taskPID := 0
 	if startErr == nil {
@@ -439,6 +466,22 @@ func (w *Worker) runTask(ctx context.Context, task Task) *Result {
 // errNoProcessGroup reports a task that started without leading its own
 // process group. It is the worker's own fixed diagnostic, never task output.
 var errNoProcessGroup = errors.New("task process group was not established")
+
+// maxTaskEnvBytes bounds the serialized task environment delta (#414). It is
+// a transport resource bound, like the artifact and stream bounds: an
+// environment over the bound fails the task closed rather than being
+// truncated.
+const maxTaskEnvBytes = 64 << 10
+
+// taskEnvBytes returns the serialized size of an environment delta as it
+// travels the protocol: one NUL terminator per KEY=VALUE record.
+func taskEnvBytes(env []string) int {
+	total := 0
+	for _, record := range env {
+		total += len(record) + 1
+	}
+	return total
+}
 
 // leadsOwnProcessGroup reports whether pid leads its own process group, which
 // is what makes a group signal reach the task's descendants. A pid that
