@@ -5,9 +5,10 @@ package controller
 type CIParkTrigger string
 
 const (
-	// CIParkHold keeps the run parked: checks are pending or not yet
-	// registered, so no decision is possible yet. The caller owns the
-	// bounded external observation window that eventually ends the hold.
+	// CIParkHold keeps the run parked: a configured mechanical check is
+	// still pending, or no checks are registered yet, so no decision is
+	// possible yet. The caller owns the bounded external observation window
+	// that eventually ends the hold.
 	CIParkHold CIParkTrigger = "hold"
 	// CIParkResumeRepair wakes the coordinator for one bounded repair.
 	CIParkResumeRepair CIParkTrigger = "resume-repair"
@@ -30,8 +31,10 @@ type MechanicalCheckSelector func(name string) bool
 // of the parked head: only configured mechanical checks failing on the exact
 // parked head, with repair budget remaining, may wake the coordinator.
 // parkedHead is the recorded park head; repairsRemaining is the operator's
-// remaining budget. Never re-reads world state and never writes: the caller
-// re-reads fresh state and fails closed on any contradiction between calls.
+// remaining budget. Pending checks hold only when the selector accepts them,
+// and an unrecognized check state fails closed to finish, never wake. Never
+// re-reads world state and never writes: the caller re-reads fresh state and
+// fails closed on any contradiction between calls.
 func ClassifyCIParkTrigger(observation PRObservation, parkedHead string, selector MechanicalCheckSelector, repairsRemaining int) CIParkTrigger {
 	if observation.Merged {
 		return CIParkFinish
@@ -48,14 +51,39 @@ func ClassifyCIParkTrigger(observation PRObservation, parkedHead string, selecto
 	if len(observation.Checks) == 0 {
 		return CIParkHold
 	}
+	// The hold and fail-closed decisions read only the flags collected in
+	// the pass below; the failure verdict afterwards re-consults the
+	// selector so a mixed failure set still finishes instead of waking.
+	// Precedence is fixed regardless of check order: unknown states fail
+	// closed first, a pending configured mechanical check holds next, and
+	// only then does a failure verdict form.
+	hasUnknown := false
+	hasMechanicalPending := false
 	hasFailed := false
 	for _, check := range observation.Checks {
-		if check.State == CheckStatePending {
-			return CIParkHold
-		}
-		if check.State == CheckStateFailed {
+		switch check.State {
+		case CheckStatePassed:
+		case CheckStateFailed:
 			hasFailed = true
+		case CheckStatePending:
+			// Only a configured mechanical check's pending state holds
+			// the park; any other pending check — an AI-review workflow,
+			// for example — neither extends the repair window nor blocks
+			// a mechanical verdict (#475).
+			if selector != nil && selector(check.Name) {
+				hasMechanicalPending = true
+			}
+		default:
+			// An unrecognized state is unclassifiable: fail closed by
+			// finishing rather than waking.
+			hasUnknown = true
 		}
+	}
+	if hasUnknown {
+		return CIParkFinish
+	}
+	if hasMechanicalPending {
+		return CIParkHold
 	}
 	if !hasFailed {
 		return CIParkFinish
