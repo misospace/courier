@@ -9,6 +9,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	courierv1alpha1 "github.com/misospace/courier/api/v1alpha1"
+	"github.com/misospace/courier/internal/source"
 	crlog "sigs.k8s.io/controller-runtime/pkg/log"
 	crmetrics "sigs.k8s.io/controller-runtime/pkg/metrics"
 )
@@ -70,6 +71,30 @@ var (
 		"courier_coderuns_oldest_terminal_age_seconds",
 		"Age of the oldest retained terminal CoderRun, by terminal phase.",
 		reapMetricLabels,
+		nil,
+	)
+	laneConcurrencyDesc = prometheus.NewDesc(
+		"courier_lane_concurrency",
+		"Configured LaneProfile concurrency slots; a non-positive setting is reported as the runner's default of 1.",
+		laneMetricLabels,
+		nil,
+	)
+	laneReservationsDesc = prometheus.NewDesc(
+		"courier_lane_reservations",
+		"CoderRuns per lane that currently reserve discovery capacity, including not-yet-admitted Pending and empty-phase runs.",
+		laneMetricLabels,
+		nil,
+	)
+	coderunsPendingDesc = prometheus.NewDesc(
+		"courier_coderuns_pending",
+		"CoderRuns per lane in PhasePending, the queue display subset of lane reservations.",
+		laneMetricLabels,
+		nil,
+	)
+	laneOldestReservationAgeDesc = prometheus.NewDesc(
+		"courier_lane_oldest_reservation_age_seconds",
+		"Age of the oldest CoderRun reserving discovery capacity on the lane; absent when there are none.",
+		laneMetricLabels,
 		nil,
 	)
 )
@@ -182,15 +207,19 @@ func nonNegativeSeconds(d time.Duration) float64 {
 // failed List increments the scrape-errors counter instead of silently
 // dropping the scrape. Capacity consumption follows phaseConsumesCapacity:
 // only Claimed and Running runs count, so a Verifying run no longer blocks new
-// admissions.
+// admissions. The discovery-side reservation gauges are deliberately broader:
+// source.PhaseReservesDiscovery also counts Pending and empty-phase runs, so a
+// binding does not hoard materialized-but-unadmitted work.
 type LaneCollector struct {
 	client       client.Client
+	now          func() time.Time
 	scrapeErrors prometheus.Counter
 }
 
 func NewLaneCollector(c client.Client) *LaneCollector {
 	return &LaneCollector{
 		client: c,
+		now:    time.Now,
 		scrapeErrors: prometheus.NewCounter(prometheus.CounterOpts{
 			Name: "courier_metrics_scrape_errors_total",
 			Help: "List calls that failed while the LaneCollector collected lane metrics.",
@@ -202,6 +231,10 @@ func NewLaneCollector(c client.Client) *LaneCollector {
 func (c *LaneCollector) Describe(ch chan<- *prometheus.Desc) {
 	ch <- inFlightDesc
 	ch <- laneSuspendedDesc
+	ch <- laneConcurrencyDesc
+	ch <- laneReservationsDesc
+	ch <- coderunsPendingDesc
+	ch <- laneOldestReservationAgeDesc
 	ch <- c.scrapeErrors.Desc()
 }
 
@@ -220,8 +253,19 @@ func (c *LaneCollector) Collect(ch chan<- prometheus.Metric) {
 	// Seed every lane at zero so a lane whose runs all drained keeps
 	// reporting 0 instead of disappearing from the series.
 	inFlight := make(map[string]int, len(lanes.Items))
+	reservations := make(map[string]int, len(lanes.Items))
+	pending := make(map[string]int, len(lanes.Items))
+	concurrency := make(map[string]float64, len(lanes.Items))
 	for i := range lanes.Items {
-		inFlight[lanes.Items[i].Name] = 0
+		lane := lanes.Items[i].Name
+		inFlight[lane] = 0
+		reservations[lane] = 0
+		pending[lane] = 0
+		slots := lanes.Items[i].Spec.Concurrency
+		if slots <= 0 {
+			slots = 1
+		}
+		concurrency[lane] = float64(slots)
 	}
 
 	runs := &courierv1alpha1.CoderRunList{}
@@ -230,15 +274,44 @@ func (c *LaneCollector) Collect(ch chan<- prometheus.Metric) {
 		crlog.Log.Error(err, "metrics scrape: listing CoderRuns failed")
 		return
 	}
+	oldestReservation := make(map[string]time.Time)
 	for i := range runs.Items {
-		if !phaseConsumesCapacity(runs.Items[i].Status.Phase) {
-			continue
+		run := &runs.Items[i]
+		if phaseConsumesCapacity(run.Status.Phase) {
+			inFlight[run.Spec.Lane]++
 		}
-		inFlight[runs.Items[i].Spec.Lane]++
+		if source.PhaseReservesDiscovery(run.Status.Phase) {
+			reservations[run.Spec.Lane]++
+			if current, ok := oldestReservation[run.Spec.Lane]; !ok || run.CreationTimestamp.Time.Before(current) {
+				oldestReservation[run.Spec.Lane] = run.CreationTimestamp.Time
+			}
+		}
+		if run.Status.Phase == courierv1alpha1.PhasePending {
+			pending[run.Spec.Lane]++
+		}
 	}
 	for lane, count := range inFlight {
 		ch <- prometheus.MustNewConstMetric(
 			inFlightDesc, prometheus.GaugeValue, float64(count), lane)
+	}
+	for lane, slots := range concurrency {
+		ch <- prometheus.MustNewConstMetric(
+			laneConcurrencyDesc, prometheus.GaugeValue, slots, lane)
+	}
+	for lane, count := range reservations {
+		ch <- prometheus.MustNewConstMetric(
+			laneReservationsDesc, prometheus.GaugeValue, float64(count), lane)
+	}
+	for lane, count := range pending {
+		ch <- prometheus.MustNewConstMetric(
+			coderunsPendingDesc, prometheus.GaugeValue, float64(count), lane)
+	}
+	// A lane with no reservations reports no age series: absence is "no
+	// reservation", never a zero age.
+	now := c.now()
+	for lane, at := range oldestReservation {
+		ch <- prometheus.MustNewConstMetric(
+			laneOldestReservationAgeDesc, prometheus.GaugeValue, nonNegativeSeconds(now.Sub(at)), lane)
 	}
 
 	for i := range lanes.Items {

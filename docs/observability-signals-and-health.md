@@ -120,7 +120,12 @@ The `reason` tokens in this catalogue are a **structured metric vocabulary**
 owned by the emitter. They are deliberately kebab-case and distinct from the
 free-form log prose the runner prints today (for example the runner logs
 `"waiting for LaneProfile"` at `internal/source/runner.go:97`, which the metric
-emits as `reason="lane-waiting"`); the log message is not a label.
+emits as `reason="lane-waiting"`); the log message is not a label. The
+implemented vocabulary (`internal/source/metrics.go`, #323) carries a fourth
+pause reason the design text predates: `capacity-cooldown`, for the
+confirmed capacity-exhaustion cooldown pause (#327). The vocabulary stays
+closed; a new reason means extending that slice, not a new string at an
+emission site.
 
 ### 3.3 Lane capacity and reservations (core)
 

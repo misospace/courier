@@ -96,6 +96,9 @@ type Runner struct {
 	// NewRunner sets the production budget; values <= 0 fall back to it at use
 	// time, for the same reason.
 	ackDrainTimeout time.Duration
+	// Metrics emits the discovery signal layer (§3.2). Nil means emit nothing:
+	// nothing is registered by default, and the process wires it explicitly.
+	Metrics *DiscoveryMetrics
 }
 
 func (r *Runner) clock() time.Time {
@@ -174,6 +177,7 @@ func (r *Runner) Poll(ctx context.Context) error {
 				log.FromContext(ctx).Info("waiting for LaneProfile before source discovery", "laneProfile", r.Config.LaneProfile, "namespace", r.Config.Namespace)
 				r.laneWaiting = true
 			}
+			r.Metrics.SetPaused(r.Config.Source, r.Config.LaneProfile, "lane-waiting")
 			return nil
 		}
 		return fmt.Errorf("get LaneProfile %s/%s: %w", r.Config.Namespace, r.Config.LaneProfile, err)
@@ -188,6 +192,7 @@ func (r *Runner) Poll(ctx context.Context) error {
 			log.FromContext(ctx).Info("lane suspended, pausing source discovery", "laneProfile", r.Config.LaneProfile, "annotation", courierv1alpha1.SuspendAnnotation)
 			r.laneSuspended = true
 		}
+		r.Metrics.SetPaused(r.Config.Source, r.Config.LaneProfile, "lane-suspended")
 		return nil
 	}
 	if r.laneSuspended {
@@ -212,6 +217,7 @@ func (r *Runner) Poll(ctx context.Context) error {
 				"nextEligibleAt", cooldown.NextEligibleAt.Time)
 			r.laneCooling = true
 		}
+		r.Metrics.SetPaused(r.Config.Source, r.Config.LaneProfile, "capacity-cooldown")
 		return nil
 	}
 	if r.laneCooling {
@@ -233,12 +239,15 @@ func (r *Runner) Poll(ctx context.Context) error {
 			log.FromContext(ctx).Info("lane at capacity, pausing source discovery", "laneProfile", r.Config.LaneProfile, "capacity", capacity, "reserved", reserved)
 			r.laneAtCapacity = true
 		}
+		r.Metrics.SetPaused(r.Config.Source, r.Config.LaneProfile, "lane-at-capacity")
 		return nil
 	}
 	if r.laneAtCapacity {
 		log.FromContext(ctx).Info("lane capacity available, resuming source discovery", "laneProfile", r.Config.LaneProfile, "capacity", capacity, "reserved", reserved)
 		r.laneAtCapacity = false
 	}
+	// All four pause gates passed: the binding is not paused for any reason.
+	r.Metrics.ClearPaused(r.Config.Source, r.Config.LaneProfile)
 
 	type rankedExclusion struct {
 		item      WorkItem
@@ -295,6 +304,8 @@ func (r *Runner) Poll(ctx context.Context) error {
 	}
 	var items []WorkItem
 	var err error
+	r.Metrics.IncAttempts(r.Config.Source, r.Config.LaneProfile)
+	r.Metrics.SetLastAttempt(r.Config.Source, r.Config.LaneProfile, r.clock().Unix())
 	if discoverer, ok := r.Adapter.(CapacityAwareDiscoverer); ok {
 		items, err = discoverer.DiscoverForCapacity(ctx, lane.CapacityIdentity(), exclusions)
 	} else if excluder, ok := r.Adapter.(DiscoveryExcluder); ok {
@@ -303,8 +314,15 @@ func (r *Runner) Poll(ctx context.Context) error {
 		items, err = r.Adapter.Discover(ctx)
 	}
 	if err != nil {
+		r.Metrics.IncFailures(r.Config.Source, r.Config.LaneProfile)
 		return err
 	}
+	// The source call itself returned: count the success before any abort
+	// checks, so attempts = successes + failures holds even when item
+	// processing is cut short by a cancelled context.
+	r.Metrics.IncSuccesses(r.Config.Source, r.Config.LaneProfile)
+	r.Metrics.SetLastSuccess(r.Config.Source, r.Config.LaneProfile, r.clock().Unix())
+	r.Metrics.AddOffered(r.Config.Source, r.Config.LaneProfile, len(items))
 	if err := ctx.Err(); err != nil {
 		return err
 	}
@@ -312,14 +330,17 @@ func (r *Runner) Poll(ctx context.Context) error {
 	for _, item := range items {
 		if strings.TrimSpace(item.ID) == "" {
 			log.FromContext(ctx).Info("skipping malformed source work item", "reason", "missing ID")
+			r.Metrics.IncSkipped(r.Config.Source, r.Config.LaneProfile, "missing-id")
 			continue
 		}
 		if item.Mode != string(courierv1alpha1.ModeResolveIssue) && item.Mode != string(courierv1alpha1.ModeFixPR) {
 			log.FromContext(ctx).Info("skipping malformed source work item", "workItemID", item.ID, "reason", "unsupported mode", "mode", item.Mode)
+			r.Metrics.IncSkipped(r.Config.Source, r.Config.LaneProfile, "unsupported-mode")
 			continue
 		}
 		if strings.TrimSpace(item.Repo) == "" || item.Ref < 1 {
 			log.FromContext(ctx).Info("skipping malformed source work item", "workItemID", item.ID, "reason", "invalid repository or reference")
+			r.Metrics.IncSkipped(r.Config.Source, r.Config.LaneProfile, "invalid-ref")
 			continue
 		}
 		validItems = append(validItems, item)
@@ -408,6 +429,8 @@ func (r *Runner) Poll(ctx context.Context) error {
 		run.Name = name
 		if err := r.Create(ctx, run); err != nil && !apierrors.IsAlreadyExists(err) {
 			return fmt.Errorf("create CoderRun for %q: %w", item.ID, err)
+		} else if err == nil {
+			r.Metrics.IncMaterialized(r.Config.Source, r.Config.LaneProfile)
 		}
 		// The run now durably owns the attempt: acknowledge the stamped
 		// hand-out so the source can tell a live attempt from a lost one
@@ -572,17 +595,24 @@ func phaseUnsettled(phase courierv1alpha1.Phase) bool {
 	return false
 }
 
-// laneCapacityReservations conservatively counts empty-phase and Pending runs as
-// discovery reservations, in addition to the Claimed and Running phases admitted
-// by the operator. Verifying and later phases reserve no discovery capacity.
+// PhaseReservesDiscovery reports whether a run in the given phase reserves
+// discovery capacity on its lane: empty-phase and Pending runs conservatively
+// count alongside the Claimed and Running phases admitted by the operator.
+// Verifying and later phases reserve no discovery capacity.
+func PhaseReservesDiscovery(phase courierv1alpha1.Phase) bool {
+	switch phase {
+	case "", courierv1alpha1.PhasePending, courierv1alpha1.PhaseClaimed, courierv1alpha1.PhaseRunning:
+		return true
+	}
+	return false
+}
+
+// laneCapacityReservations counts the runs on the lane that currently reserve
+// discovery capacity, via PhaseReservesDiscovery.
 func laneCapacityReservations(runs []courierv1alpha1.CoderRun, lane string) int {
 	reserved := 0
 	for i := range runs {
-		if runs[i].Spec.Lane != lane {
-			continue
-		}
-		switch runs[i].Status.Phase {
-		case "", courierv1alpha1.PhasePending, courierv1alpha1.PhaseClaimed, courierv1alpha1.PhaseRunning:
+		if runs[i].Spec.Lane == lane && PhaseReservesDiscovery(runs[i].Status.Phase) {
 			reserved++
 		}
 	}
