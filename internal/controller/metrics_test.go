@@ -278,6 +278,24 @@ func TestMetricLabelsExcludeIdentity(t *testing.T) {
 	recorder.ObserveReapRequest(courierv1alpha1.PhaseFailed)
 	assertGatheredLabelSet(t, registry, "courier_coderuns_reap_requests_total", "phase")
 
+	// The transition-path signals and their exact label-name sets.
+	recorder.ObservePhaseTransition("local", run.Spec.Mode, courierv1alpha1.PhaseRunning, courierv1alpha1.PhaseFailed)
+	assertGatheredLabelSet(t, registry, "courier_coderun_phase_transitions_total", "lane", "mode", "from", "to")
+	recorder.ObservePhaseDuration("local", run.Spec.Mode, courierv1alpha1.PhaseRunning, time.Minute)
+	assertGatheredLabelSet(t, registry, "courier_coderun_phase_duration_seconds", "lane", "mode", "phase")
+	recorder.ObserveTerminalDiagnostic(run)
+	assertGatheredLabelSet(t, registry, "courier_coderun_terminal_diagnostics_total", "lane", "mode", "category")
+	recorder.ObserveInfraRestarts("local", run.Spec.Mode, 2)
+	assertGatheredLabelSet(t, registry, "courier_coderun_infra_restarts_total", "lane", "mode")
+	recorder.ObserveVerificationOutcome("local", run.Spec.Mode, verificationOutcomeGreen)
+	assertGatheredLabelSet(t, registry, "courier_coderun_verification_outcomes_total", "lane", "mode", "result")
+	for _, kind := range tokenKinds {
+		recorder.ObserveTokenDelta("local", run.Spec.Mode, kind, 5)
+	}
+	assertGatheredLabelSet(t, registry, "courier_coderun_tokens_total", "lane", "mode", "kind")
+	recorder.ObserveLifecycleReportOutcome(run.Spec.Source, "local", run.Spec.Mode, lifecycleOutcomePublished)
+	assertGatheredLabelSet(t, registry, "courier_source_lifecycle_report_outcomes_total", "source", "lane", "mode", "result")
+
 	// A drained lane must still appear on both lane gauges, reporting 0.
 	doneRun := admissionRun("run2", "local", courierv1alpha1.PhaseDone)
 	doneRun.Status.FinishedAt = &metav1.Time{Time: timestampClock.Add(-time.Hour)}
@@ -299,6 +317,15 @@ func TestMetricLabelsExcludeIdentity(t *testing.T) {
 	ageRegistry.MustRegister(NewTerminalAgeCollector(runsClient))
 	assertGatheredLabelSet(t, ageRegistry, "courier_coderuns_oldest_terminal_age_seconds", "phase")
 
+	// The terminal-backlog gauges carry only bounded phase and lane labels.
+	backlogRegistry := prometheus.NewRegistry()
+	backlogCollector := NewTerminalBacklogCollector(runsClient)
+	backlogCollector.now = func() time.Time { return timestampClock }
+	backlogRegistry.MustRegister(backlogCollector)
+	assertGatheredLabelSet(t, backlogRegistry, "courier_coderuns_awaiting_reap", "phase")
+	assertGatheredLabelSet(t, backlogRegistry, "courier_coderuns_lifecycle_pending", "lane")
+	assertGatheredLabelSet(t, backlogRegistry, "courier_coderuns_lifecycle_pending_oldest_age_seconds", "lane")
+
 	// No label value may carry work-item identity.
 	identity := map[string]bool{
 		run.Spec.Repo:       true,
@@ -306,7 +333,7 @@ func TestMetricLabelsExcludeIdentity(t *testing.T) {
 		run.Name:            true,
 		"1":                 true,
 	}
-	for _, g := range []prometheus.Gatherer{registry, laneRegistry, ageRegistry} {
+	for _, g := range []prometheus.Gatherer{registry, laneRegistry, ageRegistry, backlogRegistry} {
 		families, err := g.Gather()
 		if err != nil {
 			t.Fatalf("gather: %v", err)
@@ -423,9 +450,19 @@ func TestTerminalStatusPatchFailureRecordsNoMetrics(t *testing.T) {
 	if err != nil {
 		t.Fatalf("gather: %v", err)
 	}
+	forbidden := map[string]bool{
+		"courier_coderuns_total":                         true,
+		"courier_coderun_phase_transitions_total":        true,
+		"courier_coderun_phase_duration_seconds":         true,
+		"courier_coderun_terminal_diagnostics_total":     true,
+		"courier_coderun_infra_restarts_total":           true,
+		"courier_coderun_verification_outcomes_total":    true,
+		"courier_coderun_tokens_total":                   true,
+		"courier_source_lifecycle_report_outcomes_total": true,
+	}
 	for _, f := range families {
-		if f.GetName() == "courier_coderuns_total" {
-			t.Fatalf("courier_coderuns_total observed after a failed terminal status patch: %#v", f)
+		if forbidden[f.GetName()] {
+			t.Fatalf("%s observed after a failed terminal status patch: %#v", f.GetName(), f)
 		}
 	}
 }
@@ -500,5 +537,552 @@ func TestTerminalAgeCollectorListFailure(t *testing.T) {
 	m := gatherMetric(t, registry, "courier_terminal_age_scrape_errors_total", map[string]string{})
 	if m.GetCounter() == nil || m.GetCounter().GetValue() != 1 {
 		t.Fatalf("courier_terminal_age_scrape_errors_total = %v, want 1", m.GetCounter())
+	}
+}
+
+func patchReconciler(t *testing.T, c client.Client, now time.Time) (*CoderRunReconciler, *prometheus.Registry) {
+	t.Helper()
+	registry := prometheus.NewRegistry()
+	r := timestampReconciler(c, now)
+	r.Metrics = NewRunRecorder(registry)
+	return r, registry
+}
+
+// TestPhaseTransitionsRecordPerChange drives a run through the phase writes
+// the reconciler itself performs (Pending→Claimed→Running→terminal) and
+// checks each observed change records exactly one transition with the right
+// from/to, and that re-patching an unchanged phase records nothing.
+func TestPhaseTransitionsRecordPerChange(t *testing.T) {
+	run := admissionRun("run", "local", courierv1alpha1.PhasePending)
+	client := phaseClient(t, run)
+	r, registry := patchReconciler(t, client, timestampClock)
+	ctx := context.Background()
+
+	advance := func(to courierv1alpha1.Phase) {
+		before := run.DeepCopy()
+		run.Status.Phase = to
+		if err := r.patchStatus(ctx, before, run); err != nil {
+			t.Fatalf("patchStatus(%s): %v", to, err)
+		}
+	}
+	advance(courierv1alpha1.PhaseClaimed)
+	advance(courierv1alpha1.PhaseRunning)
+	advance(courierv1alpha1.PhaseVerifying)
+	advance(courierv1alpha1.PhaseFailed)
+
+	expect := map[[2]string]float64{
+		{couriverb(courierv1alpha1.PhasePending), couriverb(courierv1alpha1.PhaseClaimed)}:   1,
+		{couriverb(courierv1alpha1.PhaseClaimed), couriverb(courierv1alpha1.PhaseRunning)}:   1,
+		{couriverb(courierv1alpha1.PhaseRunning), couriverb(courierv1alpha1.PhaseVerifying)}: 1,
+		{couriverb(courierv1alpha1.PhaseVerifying), couriverb(courierv1alpha1.PhaseFailed)}:  1,
+	}
+	for edge, want := range expect {
+		m := gatherMetric(t, registry, "courier_coderun_phase_transitions_total", map[string]string{
+			"lane": "local", "mode": "resolve-issue", "from": edge[0], "to": edge[1],
+		})
+		if m.GetCounter().GetValue() != want {
+			t.Fatalf("transition %v→%v = %v, want %v", edge[0], edge[1], m.GetCounter().GetValue(), want)
+		}
+	}
+
+	// Re-patching an unchanged phase (the re-reconcile case) must not record
+	// a new transition, and must not restamp PhaseEnteredAt — a restamp on
+	// every re-reconcile would silently reset phase age.
+	before := run.DeepCopy()
+	enteredAt := run.Status.PhaseEnteredAt
+	if err := r.patchStatus(ctx, before, run); err != nil {
+		t.Fatalf("unchanged patchStatus: %v", err)
+	}
+	if run.Status.PhaseEnteredAt != enteredAt {
+		t.Fatalf("unchanged re-patch restamped PhaseEnteredAt: %v → %v", enteredAt, run.Status.PhaseEnteredAt)
+	}
+	m := gatherMetric(t, registry, "courier_coderun_phase_transitions_total", map[string]string{
+		"lane": "local", "mode": "resolve-issue", "from": "Verifying", "to": "Failed",
+	})
+	if m.GetCounter().GetValue() != 1 {
+		t.Fatalf("re-reconcile double-counted a transition: %v", m.GetCounter().GetValue())
+	}
+}
+
+func couriverb(p courierv1alpha1.Phase) string { return string(p) }
+
+// TestPhaseDurationObservedOnLeavingPhase checks the duration histogram: a
+// run with a durable PhaseEnteredAt observes now−PhaseEnteredAt for the phase
+// it left; a pre-upgrade run without the marker records its transition but no
+// fabricated duration.
+func TestPhaseDurationObservedOnLeavingPhase(t *testing.T) {
+	run := admissionRun("run", "local", courierv1alpha1.PhaseRunning)
+	run.Status.PhaseEnteredAt = &metav1.Time{Time: timestampClock.Add(-10 * time.Minute)}
+	client := phaseClient(t, run)
+	r, registry := patchReconciler(t, client, timestampClock)
+
+	before := run.DeepCopy()
+	run.Status.Phase = courierv1alpha1.PhaseVerifying
+	if err := r.patchStatus(context.Background(), before, run); err != nil {
+		t.Fatalf("patchStatus: %v", err)
+	}
+	if count, sum := histogramSample(t, registry, "courier_coderun_phase_duration_seconds", map[string]string{
+		"lane": "local", "mode": "resolve-issue", "phase": "Running",
+	}); count != 1 || sum != 600 {
+		t.Fatalf("phase duration = (count %d, sum %v), want (1, 600)", count, sum)
+	}
+
+	// A pre-upgrade run without the marker: transition recorded, no duration.
+	old := admissionRun("old", "local", courierv1alpha1.PhaseRunning)
+	client2 := phaseClient(t, old)
+	r2, registry2 := patchReconciler(t, client2, timestampClock)
+	before = old.DeepCopy()
+	old.Status.Phase = courierv1alpha1.PhaseVerifying
+	if err := r2.patchStatus(context.Background(), before, old); err != nil {
+		t.Fatalf("patchStatus: %v", err)
+	}
+	if got := gaugeCounterNamed(t, registry2, "courier_coderun_phase_transitions_total", map[string]string{
+		"lane": "local", "mode": "resolve-issue", "from": "Running", "to": "Verifying",
+	}); got != 1 {
+		t.Fatalf("transition = %v, want 1", got)
+	}
+	if count := histogramSampleCount(t, registry2, "courier_coderun_phase_duration_seconds", map[string]string{
+		"lane": "local", "mode": "resolve-issue", "phase": "Running",
+	}); count != 0 {
+		t.Fatalf("phase duration sample count = %d, want 0 for a run without PhaseEnteredAt", count)
+	}
+}
+
+// TestPhaseDurationPinsVerifyingAgainstStartedAt covers the issue-324
+// acceptance regression: a run waits in Verifying and merges after a timed
+// AwaitingReview interval. The Verifying histogram sample must be
+// now−PhaseEnteredAt, never now−StartedAt (the executor may have started
+// long before verification began), and the AwaitingReview interval must be
+// measured from the marker restamped at the Verifying→AwaitingReview write.
+func TestPhaseDurationPinsVerifyingAgainstStartedAt(t *testing.T) {
+	run := admissionRun("run", "local", courierv1alpha1.PhaseVerifying)
+	run.Status.StartedAt = &metav1.Time{Time: timestampClock.Add(-30 * time.Minute)}
+	run.Status.PhaseEnteredAt = &metav1.Time{Time: timestampClock.Add(-10 * time.Minute)}
+	client := phaseClient(t, run)
+	r, registry := patchReconciler(t, client, timestampClock)
+	ctx := context.Background()
+
+	// Verification passes; the run parks in AwaitingReview.
+	before := run.DeepCopy()
+	run.Status.Phase = courierv1alpha1.PhaseAwaitingReview
+	if err := r.patchStatus(ctx, before, run); err != nil {
+		t.Fatalf("patchStatus(AwaitingReview): %v", err)
+	}
+	if count, sum := histogramSample(t, registry, "courier_coderun_phase_duration_seconds", map[string]string{
+		"lane": "local", "mode": "resolve-issue", "phase": "Verifying",
+	}); count != 1 || sum != 600 {
+		t.Fatalf("Verifying duration = (count %d, sum %v), want (1, 600); now−StartedAt would be 1800", count, sum)
+	}
+
+	// The merge lands after a timed AwaitingReview interval.
+	r2 := timestampReconciler(client, timestampClock.Add(5*time.Minute))
+	r2.Metrics = r.Metrics
+	before = run.DeepCopy()
+	run.Status.Phase = courierv1alpha1.PhaseDone
+	if err := r2.patchStatus(ctx, before, run); err != nil {
+		t.Fatalf("patchStatus(Done): %v", err)
+	}
+	if count, sum := histogramSample(t, registry, "courier_coderun_phase_duration_seconds", map[string]string{
+		"lane": "local", "mode": "resolve-issue", "phase": "AwaitingReview",
+	}); count != 1 || sum != 300 {
+		t.Fatalf("AwaitingReview duration = (count %d, sum %v), want (1, 300)", count, sum)
+	}
+}
+
+func gaugeCounterNamed(t *testing.T, reg *prometheus.Registry, name string, labels map[string]string) float64 {
+	t.Helper()
+	m := gatherMetric(t, reg, name, labels)
+	if m.GetCounter() == nil {
+		t.Fatalf("%s is not a counter", name)
+	}
+	return m.GetCounter().GetValue()
+}
+
+// TestPhaseEnteredAtStampedAndPersisted checks the durable marker: it is
+// stamped on the first observed phase change, moves on every later change,
+// and reaches the persisted status.
+func TestPhaseEnteredAtStampedAndPersisted(t *testing.T) {
+	run := admissionRun("run", "local", courierv1alpha1.PhasePending)
+	client := phaseClient(t, run)
+	r, _ := patchReconciler(t, client, timestampClock)
+	ctx := context.Background()
+
+	before := run.DeepCopy()
+	run.Status.Phase = courierv1alpha1.PhaseClaimed
+	if err := r.patchStatus(ctx, before, run); err != nil {
+		t.Fatalf("patchStatus: %v", err)
+	}
+	if run.Status.PhaseEnteredAt == nil || !run.Status.PhaseEnteredAt.Time.Equal(timestampClock) {
+		t.Fatalf("PhaseEnteredAt = %v, want %v", run.Status.PhaseEnteredAt, timestampClock)
+	}
+
+	// The marker moves on the next transition, never staying behind.
+	advance := timestampClock.Add(5 * time.Minute)
+	r.Now = func() time.Time { return advance }
+	before = run.DeepCopy()
+	run.Status.Phase = courierv1alpha1.PhaseRunning
+	if err := r.patchStatus(ctx, before, run); err != nil {
+		t.Fatalf("patchStatus: %v", err)
+	}
+	if run.Status.PhaseEnteredAt == nil || !run.Status.PhaseEnteredAt.Time.Equal(advance) {
+		t.Fatalf("PhaseEnteredAt = %v, want %v after the second transition", run.Status.PhaseEnteredAt, advance)
+	}
+
+	var persisted courierv1alpha1.CoderRun
+	if err := client.Get(ctx, admissionKey("run"), &persisted); err != nil {
+		t.Fatalf("get run: %v", err)
+	}
+	if persisted.Status.PhaseEnteredAt == nil || !persisted.Status.PhaseEnteredAt.Time.Equal(advance) {
+		t.Fatalf("persisted PhaseEnteredAt = %v, want %v", persisted.Status.PhaseEnteredAt, advance)
+	}
+}
+
+// TestVerificationOutcomesRecordedFromTransition checks the derived
+// verification dispositions: green on AwaitingReview, red on Failed and
+// HandedOff, unobservable on NeedsHuman, and no counting for Verifying exits
+// that are not verification verdicts.
+func TestVerificationOutcomesRecordedFromTransition(t *testing.T) {
+	cases := []struct {
+		to     courierv1alpha1.Phase
+		result string
+		want   bool
+	}{
+		{courierv1alpha1.PhaseAwaitingReview, "green", true},
+		{courierv1alpha1.PhaseFailed, "red", true},
+		{courierv1alpha1.PhaseHandedOff, "red", true},
+		{courierv1alpha1.PhaseNeedsHuman, "unobservable", true},
+		{courierv1alpha1.PhaseDone, "green", false},
+	}
+	for _, tc := range cases {
+		t.Run(string(tc.to), func(t *testing.T) {
+			run := admissionRun("run", "local", courierv1alpha1.PhaseVerifying)
+			client := phaseClient(t, run)
+			r, registry := patchReconciler(t, client, timestampClock)
+			before := run.DeepCopy()
+			run.Status.Phase = tc.to
+			if err := r.patchStatus(context.Background(), before, run); err != nil {
+				t.Fatalf("patchStatus: %v", err)
+			}
+			if tc.want {
+				if got := gaugeCounterNamed(t, registry, "courier_coderun_verification_outcomes_total", map[string]string{
+					"lane": "local", "mode": "resolve-issue", "result": tc.result,
+				}); got != 1 {
+					t.Fatalf("verification outcome %s = %v, want 1", tc.result, got)
+				}
+			}
+			// No other result series may appear for this exit.
+			for _, result := range []string{"green", "red", "unobservable"} {
+				if result == tc.result && tc.want {
+					continue
+				}
+				if _, present := counterValueIfPresent(t, registry, "courier_coderun_verification_outcomes_total", map[string]string{
+					"lane": "local", "mode": "resolve-issue", "result": result,
+				}); present {
+					t.Fatalf("result %s must not be recorded for a Verifying→%s exit", result, tc.to)
+				}
+			}
+		})
+	}
+}
+
+func counterValueIfPresent(t *testing.T, reg *prometheus.Registry, name string, labels map[string]string) (float64, bool) {
+	t.Helper()
+	families, err := reg.Gather()
+	if err != nil {
+		t.Fatalf("gather: %v", err)
+	}
+	for _, f := range families {
+		if f.GetName() != name {
+			continue
+		}
+		for _, m := range f.GetMetric() {
+			if len(m.GetLabel()) != len(labels) {
+				continue
+			}
+			match := true
+			for _, lp := range m.GetLabel() {
+				if labels[lp.GetName()] != lp.GetValue() {
+					match = false
+					break
+				}
+			}
+			if match && m.GetCounter() != nil {
+				return m.GetCounter().GetValue(), true
+			}
+		}
+	}
+	return 0, false
+}
+
+// TestInfraRestartsCounterRecordsDelta checks that a relaunch's charged
+// Restarts delta lands on the counter, and a reset back to zero does not.
+func TestInfraRestartsCounterRecordsDelta(t *testing.T) {
+	run := admissionRun("run", "local", courierv1alpha1.PhaseClaimed)
+	run.Status.Restarts = 1
+	client := phaseClient(t, run)
+	r, registry := patchReconciler(t, client, timestampClock)
+
+	before := run.DeepCopy()
+	run.Status.Restarts = 3
+	if err := r.patchStatus(context.Background(), before, run); err != nil {
+		t.Fatalf("patchStatus: %v", err)
+	}
+	if got := gaugeCounterNamed(t, registry, "courier_coderun_infra_restarts_total", map[string]string{
+		"lane": "local", "mode": "resolve-issue",
+	}); got != 2 {
+		t.Fatalf("infra restarts = %v, want 2 (the delta)", got)
+	}
+
+	// A liveness reset back to zero never records a negative delta.
+	before = run.DeepCopy()
+	run.Status.Restarts = 0
+	if err := r.patchStatus(context.Background(), before, run); err != nil {
+		t.Fatalf("patchStatus: %v", err)
+	}
+	if got := gaugeCounterNamed(t, registry, "courier_coderun_infra_restarts_total", map[string]string{
+		"lane": "local", "mode": "resolve-issue",
+	}); got != 2 {
+		t.Fatalf("infra restarts after reset = %v, want 2", got)
+	}
+}
+
+// TestTerminalDiagnosticsRecordedOnce checks the diagnostic counter: a
+// terminal run with a durable diagnostic counts its category, one without
+// counts "unknown", and a re-reconcile of the same terminal phase counts
+// nothing new.
+func TestTerminalDiagnosticsRecordedOnce(t *testing.T) {
+	run := admissionRun("run", "local", courierv1alpha1.PhaseVerifying)
+	run.Status.PR = "7"
+	run.Status.TerminalDiagnostic = &courierv1alpha1.TerminalDiagnostic{
+		Category: courierv1alpha1.TerminalDiagnosticCategoryVerifierRejection,
+	}
+	client := phaseClient(t, run)
+	r, registry := patchReconciler(t, client, timestampClock)
+	ctx := context.Background()
+
+	if _, err := r.transitionTerminal(ctx, run, courierv1alpha1.PhaseFailed, "7", terminalLifecycleIntent{}, nil); err != nil {
+		t.Fatalf("transitionTerminal: %v", err)
+	}
+	if got := gaugeCounterNamed(t, registry, "courier_coderun_terminal_diagnostics_total", map[string]string{
+		"lane": "local", "mode": "resolve-issue", "category": "verifier-rejection",
+	}); got != 1 {
+		t.Fatalf("terminal diagnostics = %v, want 1", got)
+	}
+
+	// Re-reconciling the already-terminal run must not count it again.
+	if _, err := r.transitionTerminal(ctx, run, courierv1alpha1.PhaseFailed, "7", terminalLifecycleIntent{}, nil); err != nil {
+		t.Fatalf("second transitionTerminal: %v", err)
+	}
+	if got := gaugeCounterNamed(t, registry, "courier_coderun_terminal_diagnostics_total", map[string]string{
+		"lane": "local", "mode": "resolve-issue", "category": "verifier-rejection",
+	}); got != 1 {
+		t.Fatalf("terminal diagnostics after re-reconcile = %v, want 1", got)
+	}
+
+	// A terminal run without a diagnostic counts "unknown".
+	plain := admissionRun("plain", "local", courierv1alpha1.PhaseVerifying)
+	plain.Status.PR = "8"
+	clientPlain := phaseClient(t, plain)
+	rPlain, registryPlain := patchReconciler(t, clientPlain, timestampClock)
+	if _, err := rPlain.transitionTerminal(ctx, plain, courierv1alpha1.PhaseFailed, "8", terminalLifecycleIntent{}, nil); err != nil {
+		t.Fatalf("transitionTerminal(plain): %v", err)
+	}
+	if got := gaugeCounterNamed(t, registryPlain, "courier_coderun_terminal_diagnostics_total", map[string]string{
+		"lane": "local", "mode": "resolve-issue", "category": "unknown",
+	}); got != 1 {
+		t.Fatalf("terminal diagnostics unknown = %v, want 1", got)
+	}
+}
+
+// TestTokenDeltasRecordedFromTelemetryPatch checks the token counter's delta
+// path: telemetry landing at terminal records the full amounts exactly once,
+// a later growth records only the delta, and an identical re-patch records
+// nothing. The derived Total is never emitted.
+func TestTokenDeltasRecordedFromTelemetryPatch(t *testing.T) {
+	run := admissionRun("run", "local", courierv1alpha1.PhaseVerifying)
+	run.Status.PR = "7"
+	client := phaseClient(t, run)
+	r, registry := patchReconciler(t, client, timestampClock)
+	ctx := context.Background()
+
+	_, err := r.transitionTerminal(ctx, run, courierv1alpha1.PhaseFailed, "7", terminalLifecycleIntent{},
+		&courierv1alpha1.RunTelemetry{Tokens: &courierv1alpha1.TokenUsage{Input: 100, Output: 50, Reasoning: 10, CacheRead: 5}})
+	if err != nil {
+		t.Fatalf("transitionTerminal: %v", err)
+	}
+	want := map[string]float64{"input": 100, "output": 50, "reasoning": 10, "cache-read": 5}
+	for kind, value := range want {
+		if got := gaugeCounterNamed(t, registry, "courier_coderun_tokens_total", map[string]string{
+			"lane": "local", "mode": "resolve-issue", "kind": kind,
+		}); got != value {
+			t.Fatalf("tokens kind %s = %v, want %v", kind, got, value)
+		}
+	}
+	if _, present := counterValueIfPresent(t, registry, "courier_coderun_tokens_total", map[string]string{
+		"lane": "local", "mode": "resolve-issue", "kind": "total",
+	}); present {
+		t.Fatal("the derived token Total must never be emitted")
+	}
+
+	// A later telemetry patch records only the grown delta.
+	before := run.DeepCopy()
+	run.Status.Telemetry.Tokens.Input += 20
+	run.Status.Telemetry.Tokens.CacheWrite = 30
+	if err := r.patchStatus(ctx, before, run); err != nil {
+		t.Fatalf("patchStatus: %v", err)
+	}
+	if got := gaugeCounterNamed(t, registry, "courier_coderun_tokens_total", map[string]string{
+		"lane": "local", "mode": "resolve-issue", "kind": "input",
+	}); got != 120 {
+		t.Fatalf("tokens input after delta = %v, want 120", got)
+	}
+	if got := gaugeCounterNamed(t, registry, "courier_coderun_tokens_total", map[string]string{
+		"lane": "local", "mode": "resolve-issue", "kind": "cache-write",
+	}); got != 30 {
+		t.Fatalf("tokens cache-write = %v, want 30", got)
+	}
+	if got := gaugeCounterNamed(t, registry, "courier_coderun_tokens_total", map[string]string{
+		"lane": "local", "mode": "resolve-issue", "kind": "output",
+	}); got != 50 {
+		t.Fatalf("tokens output after unchanged re-patch = %v, want 50", got)
+	}
+
+	// An identical re-patch records nothing.
+	before = run.DeepCopy()
+	if err := r.patchStatus(ctx, before, run); err != nil {
+		t.Fatalf("identical patchStatus: %v", err)
+	}
+	if got := gaugeCounterNamed(t, registry, "courier_coderun_tokens_total", map[string]string{
+		"lane": "local", "mode": "resolve-issue", "kind": "input",
+	}); got != 120 {
+		t.Fatalf("tokens input after identical re-patch = %v, want 120", got)
+	}
+}
+
+// TestLifecycleReportOutcomesRecordedPerAttempt checks the four report
+// outcomes, counted from the source identity the report is published under,
+// and that each attempt resolves to exactly one counted outcome (a settled
+// report never re-enters the publish path, so re-reconciles never recount).
+func TestLifecycleReportOutcomesRecordedPerAttempt(t *testing.T) {
+	cases := []struct {
+		name      string
+		reportErr error
+		result    string
+	}{
+		{"published", nil, "published"},
+		{"superseded", source.ErrSuperseded, "superseded"},
+		{"unsupported", source.ErrUnsupportedOutcome, "unsupported"},
+		{"retryable", errors.New("transient source failure"), "retryable"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			run := admissionRun("run", "local", courierv1alpha1.PhaseFailed)
+			run.Status.PR = "7"
+			run.Status.FinishedAt = &metav1.Time{Time: timestampClock}
+			run.Status.Conditions = append(run.Status.Conditions, metav1.Condition{
+				Type:               courierv1alpha1.ConditionLifecycleReported,
+				Status:             metav1.ConditionFalse,
+				Reason:             lifecycleReportPendingReason,
+				LastTransitionTime: metav1.NewTime(timestampClock),
+			})
+			src := &admissionSource{reportErr: tc.reportErr}
+			client := phaseClient(t, run)
+			r, registry := patchReconciler(t, client, timestampClock)
+			r.Sources = NewSourceRegistry(map[string]source.Adapter{"test": src})
+
+			if _, err := r.publishTerminalLifecycle(context.Background(), run, src, sourceWorkItemForTest(t, run), run.Status.Phase, terminalLifecycleIntent{}); err != nil {
+				t.Fatalf("publishTerminalLifecycle: %v", err)
+			}
+			if got := gaugeCounterNamed(t, registry, "courier_source_lifecycle_report_outcomes_total", map[string]string{
+				"source": "test", "lane": "local", "mode": "resolve-issue", "result": tc.result,
+			}); got != 1 {
+				t.Fatalf("lifecycle outcome %s = %v, want 1", tc.result, got)
+			}
+
+			// One attempt resolves to one counted outcome; a re-attempt is a
+			// distinct attempt and counts again. A settled report never
+			// re-enters publishTerminalLifecycle: the reconcile gates skip a
+			// run whose LifecycleReported is positively settled, so
+			// re-reconciles never double-count.
+			if _, err := r.publishTerminalLifecycle(context.Background(), run, src, sourceWorkItemForTest(t, run), run.Status.Phase, terminalLifecycleIntent{}); err != nil {
+				t.Fatalf("second publishTerminalLifecycle: %v", err)
+			}
+			if got := gaugeCounterNamed(t, registry, "courier_source_lifecycle_report_outcomes_total", map[string]string{
+				"source": "test", "lane": "local", "mode": "resolve-issue", "result": tc.result,
+			}); got != 2 {
+				t.Fatalf("lifecycle outcome %s after re-attempt = %v, want 2", tc.result, got)
+			}
+		})
+	}
+}
+
+func sourceWorkItemForTest(t *testing.T, run *courierv1alpha1.CoderRun) source.WorkItem {
+	t.Helper()
+	item, err := sourceWorkItem(run)
+	if err != nil {
+		t.Fatalf("sourceWorkItem: %v", err)
+	}
+	return item
+}
+
+// TestTerminalBacklogCollector checks the scrape-time backlog gauges: the
+// per-phase count of retained terminal runs, the per-lane count of terminal
+// runs whose lifecycle report has not settled, and the age of the oldest
+// unsettled run from FinishedAt — with runs lacking FinishedAt skipped for
+// age and settled runs excluded from the pending gauges.
+func TestTerminalBacklogCollector(t *testing.T) {
+	now := timestampClock
+	settled := withLifecycleSettled(terminalReapRun("settled", courierv1alpha1.PhaseFailed, now.Add(-3*time.Hour)))
+	pendingAged := withLifecycleReported(admissionRun("pending-aged", "local", courierv1alpha1.PhaseNeedsHuman), metav1.ConditionFalse, lifecycleReportPendingReason)
+	pendingAged.Status.FinishedAt = &metav1.Time{Time: now.Add(-2 * time.Hour)}
+	pendingNoFinish := withLifecycleReported(admissionRun("pending-nofinish", "cloud", courierv1alpha1.PhaseAwaitingReview), metav1.ConditionFalse, lifecycleReportPendingReason)
+	running := admissionRun("running", "local", courierv1alpha1.PhaseRunning)
+
+	c := phaseClient(t, settled, pendingAged, pendingNoFinish, running)
+	collector := NewTerminalBacklogCollector(c)
+	collector.now = func() time.Time { return now }
+
+	registry := prometheus.NewRegistry()
+	registry.MustRegister(collector)
+
+	if got := gaugeValue(t, gatherMetric(t, registry, "courier_coderuns_awaiting_reap", map[string]string{"phase": "Failed"}), "courier_coderuns_awaiting_reap"); got != 1 {
+		t.Fatalf("awaiting reap Failed = %v, want 1", got)
+	}
+	if got := gaugeValue(t, gatherMetric(t, registry, "courier_coderuns_awaiting_reap", map[string]string{"phase": "NeedsHuman"}), "courier_coderuns_awaiting_reap"); got != 1 {
+		t.Fatalf("awaiting reap NeedsHuman = %v, want 1", got)
+	}
+	if got := gaugeValue(t, gatherMetric(t, registry, "courier_coderuns_lifecycle_pending", map[string]string{"lane": "local"}), "courier_coderuns_lifecycle_pending"); got != 1 {
+		t.Fatalf("lifecycle pending local = %v, want 1 (the settled run is excluded)", got)
+	}
+	if got := gaugeValue(t, gatherMetric(t, registry, "courier_coderuns_lifecycle_pending", map[string]string{"lane": "cloud"}), "courier_coderuns_lifecycle_pending"); got != 1 {
+		t.Fatalf("lifecycle pending cloud = %v, want 1", got)
+	}
+	if got := gaugeValue(t, gatherMetric(t, registry, "courier_coderuns_lifecycle_pending_oldest_age_seconds", map[string]string{"lane": "local"}), "courier_coderuns_lifecycle_pending_oldest_age_seconds"); got != (2 * time.Hour).Seconds() {
+		t.Fatalf("oldest pending age local = %v, want %v", got, (2 * time.Hour).Seconds())
+	}
+	if _, present := gaugeValueIfPresent(t, registry, "courier_coderuns_lifecycle_pending_oldest_age_seconds", map[string]string{"lane": "cloud"}); present {
+		t.Fatal("a pending run without FinishedAt must be skipped for the oldest-age gauge")
+	}
+}
+
+// TestTerminalBacklogCollectorListFailure checks the scrape-error path.
+func TestTerminalBacklogCollectorListFailure(t *testing.T) {
+	base := phaseClient(t)
+	withWatch, ok := base.(client.WithWatch)
+	if !ok {
+		t.Fatal("fake client does not implement client.WithWatch")
+	}
+	failing := interceptor.NewClient(withWatch, interceptor.Funcs{
+		List: func(context.Context, client.WithWatch, client.ObjectList, ...client.ListOption) error {
+			return errors.New("list failed")
+		},
+	})
+
+	registry := prometheus.NewRegistry()
+	registry.MustRegister(NewTerminalBacklogCollector(failing))
+
+	m := gatherMetric(t, registry, "courier_terminal_backlog_scrape_errors_total", map[string]string{})
+	if m.GetCounter() == nil || m.GetCounter().GetValue() != 1 {
+		t.Fatalf("courier_terminal_backlog_scrape_errors_total = %v, want 1", m.GetCounter())
 	}
 }

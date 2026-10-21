@@ -85,9 +85,27 @@ controller-runtime on the `--metrics-bind-address` endpoint (default `:8080`,
 | `courier_coderun_run_duration_seconds` | histogram | `lane`, `mode`, `phase` | `StartedAt`→`FinishedAt`, observed once on terminal transition |
 | `courier_coderun_queue_wait_seconds` | histogram | `lane`, `mode`, `phase` | creation→`AdmittedAt`, observed once on terminal transition |
 | `courier_coderuns_total` | counter | `lane`, `mode`, `phase` | runs reaching a terminal phase — label is the **first** terminal phase (one increment per run; a later `AwaitingReview → Done` does not increment `{phase="Done"}`, per #290 §3.4/§4.1) |
+| `courier_coderun_phase_transitions_total` | counter | `lane`, `mode`, `from`, `to` | one per observed phase change |
+| `courier_coderun_phase_duration_seconds` | histogram | `lane`, `mode`, `phase` | time spent in a phase, observed once on leaving it, and only when the phase had a durable entry marker; same buckets as the run-duration histogram |
+| `courier_coderun_terminal_diagnostics_total` | counter | `lane`, `mode`, `category` | one per terminal run, by its durable `TerminalDiagnostic` category (`unknown` when none was recorded) |
+| `courier_coderun_infra_restarts_total` | counter | `lane`, `mode` | positive `Status.Restarts` deltas — coordinator infra relaunches charged to a run |
+| `courier_coderun_verification_outcomes_total` | counter | `lane`, `mode`, `result` | `Verifying` exits: `green` (→`AwaitingReview`), `red` (→`Failed`/`HandedOff`), `unobservable` (→`NeedsHuman`); `Verifying` exits outside that vocabulary are not counted |
+| `courier_coderun_tokens_total` | counter | `lane`, `mode`, `kind` | per-kind token deltas from `status.telemetry.tokens` (`input`, `output`, `reasoning`, `cache-read`, `cache-write`); the derived `total` is not a series |
+| `courier_source_lifecycle_report_outcomes_total` | counter | `source`, `lane`, `mode`, `result` | one per lifecycle-report attempt outcome: `published`, `superseded`, `unsupported`, `retryable` |
 | `courier_coderuns_in_flight` | gauge | `lane` | live cluster read at scrape; counts `Claimed`+`Running` |
 | `courier_lane_suspended` | gauge | `lane` | 1 suspended, 0 active; live read at scrape |
 | `courier_metrics_scrape_errors_total` | counter | — | failed `List` calls during lane collection |
+
+**Scrape-time signals** from the terminal collectors (read from the cluster at
+scrape time, so they survive an operator restart):
+
+| Metric | Type | Labels | Semantics |
+| --- | --- | --- | --- |
+| `courier_coderuns_awaiting_reap` | gauge | `phase` | terminal runs retained for inspection and not yet reaped, per terminal phase |
+| `courier_coderuns_lifecycle_pending` | gauge | `lane` | terminal runs whose lifecycle report has not settled, per lane — mirrors the reaper's hold gate |
+| `courier_coderuns_lifecycle_pending_oldest_age_seconds` | gauge | `lane` | age of the oldest unsettled-report run (from `FinishedAt`), per lane |
+| `courier_terminal_age_scrape_errors_total` | counter | — | failed `List` calls during terminal-age collection |
+| `courier_terminal_backlog_scrape_errors_total` | counter | — | failed `List` calls during terminal-backlog collection |
 
 controller-runtime additionally exposes `go_*`, `process_*`, and
 `controller_runtime_*` series on the same registry. The chart's
@@ -109,7 +127,8 @@ Events; all controller "events" are these stdout lines.
 **`CoderRun` status** (`api/v1alpha1/coderun_types.go`): the phase
 (`Pending`, `Claimed`, `Running`, `Verifying`, `AwaitingReview`, `HandedOff`,
 `NeedsHuman`, `Done`, `Failed`, `BlockedExternal`); the timestamps `AdmittedAt`,
-`StartedAt`, `FinishedAt`, and the derived `WaitDuration`/`RunDuration`;
+`StartedAt`, `FinishedAt`, and `PhaseEnteredAt` (the replaceable marker of when
+the run entered its current phase), and the derived `WaitDuration`/`RunDuration`;
 liveness state (`Checkpoint`, `Heartbeat`, `ActiveOperations`, `Restarts`);
 per-run `Telemetry`; the `TerminalDiagnostic` category; `Conditions` including
 `LifecycleReported`; the lifecycle retry tokens; `DeclaredNoChange`; the CI
@@ -134,7 +153,10 @@ from the `courier.misospace.dev/failed-at` and
 report reached a positive settled state, and never out of the per-repository
 audit floor; the reaper emits `courier_coderuns_reap_requests_total` (accepted
 delete requests) and `courier_coderuns_oldest_terminal_age_seconds` (age of the
-oldest retained terminal run per phase). `HandedOff` is not reaped.
+oldest retained terminal run per phase). A scrape-time
+`courier_coderuns_awaiting_reap{phase}` gauge counts the terminal runs the
+policy still holds, and `courier_coderuns_lifecycle_pending{lane}` counts the
+ones held for an unsettled lifecycle report. `HandedOff` is not reaped.
 
 ### Instrumentation gaps
 
@@ -148,21 +170,24 @@ decision needs, and the reason several views below are marked "gap".
   yield zero new runs; today only the latter writes an error log.
 - **Reservations:** no metric for claimed-but-unlaunched age or stale
   reservations.
-- **Lifecycle reporting:** no counter of report outcomes (published,
-  superseded, unsupported, retryable) or report failures, and no report
-  latency histogram.
-- **Retention:** `courier_coderuns_reap_requests_total` and
-  `courier_coderuns_oldest_terminal_age_seconds` exist, but there is no gauge of
-  retained-run backlog (a count of terminal runs by phase).
-- **Per-phase timing:** run duration is only observed at the terminal
-  transition; there is no histogram of time spent in each non-terminal phase.
-- **Liveness:** `Restarts` is in status but not exported; no restart-cause
-  distribution.
+- **Lifecycle reporting:** the report-outcome counter ships
+  (`courier_source_lifecycle_report_outcomes_total`, by `source`/`lane`/`mode`/
+  `result`); there is still no report-latency histogram.
+- **Retention:** the retained-run backlog gauge (`courier_coderuns_awaiting_reap`)
+  and the unsettled-report backlog gauges (`courier_coderuns_lifecycle_pending`,
+  `courier_coderuns_lifecycle_pending_oldest_age_seconds`) ship; there is still
+  no gauge of runs past their retention window.
+- **Per-phase timing:** `courier_coderun_phase_duration_seconds` ships, backed by
+  the durable `status.phaseEnteredAt` marker; a run recorded before that marker
+  existed contributes no phase-duration sample, so its earliest phases are
+  absent rather than zero.
+- **Liveness:** `Restarts` is exported (`courier_coderun_infra_restarts_total`,
+  per `lane`/`mode`); there is no restart-cause distribution.
 - **Connectors/MCP:** `capability.status` is logged but not aggregated per
   server; no per-connector availability or latency.
-- **Model/token accounting:** token totals are collected per run into
-  `status.telemetry` but are not exported as metrics; no per-lane token or
-  model-error metric.
+- **Model/token accounting:** token totals are exported as metrics
+  (`courier_coderun_tokens_total`, by `lane`/`mode`/`kind`); there is still no
+  per-lane or per-model error metric.
 - **Evidence:** no success/failure/deadline metric for evidence capture.
 
 ## 3. Dashboard information architecture
@@ -230,10 +255,10 @@ Run execution answers: *what happened to the runs, and why?*
 | Terminal outcomes | Outcome mix over time | `courier_coderuns_total` | rate of terminal runs by `lane`,`mode`,`phase` (label = first terminal phase; a later `AwaitingReview → Done` does not increment `{phase="Done"}` — merge throughput has no panel here; see the disposition split below) | no runs ⇒ zero | today |
 | Run duration | How long runs take | `courier_coderun_run_duration_seconds` | histogram quantiles, seconds, by lane/mode/phase | no samples ⇒ "no completed runs" | today |
 | Queue wait | Admission delay | `courier_coderun_queue_wait_seconds` | histogram quantiles, seconds | no samples ⇒ "no recent admissions" | today |
-| Terminal diagnostic mix | Why runs ended badly | `TerminalDiagnostic` category (status), `run.exit` log | counts by category | absent diagnostic ⇒ "unknown", never "success" | log/status |
+| Terminal diagnostic mix | Why runs ended badly | `courier_coderun_terminal_diagnostics_total`, `TerminalDiagnostic` category (status), `run.exit` log | counts by category | absent diagnostic ⇒ "unknown", never "success" | today |
 | Per-run timeline | One run's phases | `phase.transition` log, `run_id` correlation | event sequence for a run id | run absent ⇒ "not found" | log |
-| Liveness/restarts | Runs losing their coordinator | `Restarts` status (gap: not exported) | restart counts by cause | — | **gap** |
-| Token/model usage | Cost and model behaviour | `status.telemetry`, `run.summary` log (gap: not exported) | tokens by type, per lane/mode where exported | absent telemetry ⇒ "not reported" | log/status |
+| Liveness/restarts | Runs losing their coordinator | `courier_coderun_infra_restarts_total`, `Restarts` status | restart counts per lane/mode (cause not exported) | — | partial |
+| Token/model usage | Cost and model behaviour | `courier_coderun_tokens_total`, `status.telemetry`, `run.summary` log | tokens by kind, per lane/mode | absent telemetry ⇒ "not reported" | today |
 
 Outcomes are split deliberately: **executor completion** (the run reached a
 terminal phase — the run's first terminal phase, per #290 §3.4/§4.1, which
@@ -253,8 +278,8 @@ Lifecycle reporting answers: *did the operator tell the source what happened?*
 | Panel | Intent | Backing signals | Portable semantics | Empty / unknown | Status |
 | --- | --- | --- | --- | --- | --- |
 | `LifecycleReported` condition | Report settlement per run | `Conditions` | condition status/reason per terminal run | missing condition ⇒ "unknown", never "reported" | status |
-| Pending reports | Reports not yet settled | `LifecycleReported=False`, retry tokens | count and age of unsettled reports | none ⇒ zero | status/gap for age |
-| Report outcome mix | Published/superseded/unsupported/retryable | report counters (gap) | counts by outcome | — | **gap** |
+| Pending reports | Reports not yet settled | `courier_coderuns_lifecycle_pending`, `courier_coderuns_lifecycle_pending_oldest_age_seconds`, `LifecycleReported=False`, retry tokens | count and age of unsettled reports | none ⇒ zero | today |
+| Report outcome mix | Published/superseded/unsupported/retryable | `courier_source_lifecycle_report_outcomes_total` | counts by outcome | — | today |
 | Report latency | Time from terminal to settled | report latency histogram (gap) | seconds | — | **gap** |
 
 A terminal run whose report never settles is a real degradation: the source
@@ -271,10 +296,10 @@ stuck?*
 
 | Panel | Intent | Backing signals | Portable semantics | Empty / unknown | Status |
 | --- | --- | --- | --- | --- | --- |
-| Retained-run backlog | How many terminal runs persist | `CoderRun` list / count gauge (gap) | runs by terminal phase | none ⇒ zero | **gap** |
+| Retained-run backlog | How many terminal runs persist | `courier_coderuns_awaiting_reap` | runs by terminal phase | none ⇒ zero | today |
 | Reap rate | Runs reclaimed over time | `courier_coderuns_reap_requests_total` | rate of accepted delete requests by retention class | — | status |
 | Oldest retained run | Is retention progressing? | `courier_coderuns_oldest_terminal_age_seconds` | age of oldest retained terminal run per phase | none ⇒ "none retained" | status |
-| Stuck retention | Runs past window but not reaped | annotations + `LifecycleReported` (gap) | count past window with unsettled report | — | **gap** |
+| Stuck retention | Runs past window but not reaped | `courier_coderuns_lifecycle_pending`, annotations + `LifecycleReported` (gap: no past-window count) | count past window with unsettled report | — | partial |
 
 The retention design bounds `Done` (five-minute default, `--done-retention`)
 and `Failed`/`NeedsHuman` (seven-day defaults, `--failed-retention` and
@@ -283,8 +308,8 @@ reap counter counts delete requests the API server accepted, so a
 secure run held by its topology finalizer is still counted there; the age gauge
 is what shows such a run is still retained. A growing retained backlog is the
 observable symptom of the class of failure that motivated the umbrella design
-(#289), so it belongs on the dashboard even though its count is currently
-uninstrumented.
+(#289), so it belongs on the dashboard; its count is exported as
+`courier_coderuns_awaiting_reap`.
 
 ### 3.6 Optional connector panels
 
@@ -394,13 +419,13 @@ Common rules that apply to every alert:
 | Field | Value |
 | --- | --- |
 | Condition | terminal runs with `LifecycleReported` in `False`/`Unknown` (or missing) exceed the threshold and are older than the settle window |
-| Evidence | `Conditions`, retry tokens; report-age metric (gap) |
+| Evidence | `Conditions`, retry tokens, `courier_coderuns_lifecycle_pending_oldest_age_seconds` |
 | Window | 15m sustained, plus an age floor of one report retry cadence plus headroom (operator-tuned) |
 | Threshold rationale | reports legitimately retry; a report still unsettled well past the retry cadence indicates a broken source contract or credentials |
 | Recovery | the condition reaches `True` with a permitted settled reason, or the run is superseded |
 | Severity | warning |
 | Expected action | inspect the source report path and the `LifecycleReported` reason |
-| Missing telemetry | without a report-age metric, derive age from status timestamps where present; otherwise this alert is **unavailable** |
+| Missing telemetry | without `courier_coderuns_lifecycle_pending_oldest_age_seconds`, derive age from status timestamps where present; otherwise this alert is **unavailable** |
 | Startup | legacy/partially-upgraded runs with no condition are excluded by requiring a condition to exist |
 | Disabled source | if the source is disabled, exclude its runs |
 | Empty queue | does not fire |
@@ -411,7 +436,7 @@ Common rules that apply to every alert:
 | Field | Value |
 | --- | --- |
 | Condition | failures in a single `TerminalDiagnostic` category (for example `kubernetes-failure` or `model-transport-error`) exceed the threshold over the window |
-| Evidence | `TerminalDiagnostic` category, `run.exit` log |
+| Evidence | `courier_coderun_terminal_diagnostics_total`, `TerminalDiagnostic` category, `run.exit` log |
 | Window | 1h |
 | Threshold rationale | a category spike points at one cause (infra, transport) faster than a flat failure rate does |
 | Recovery | category count returns below threshold |
@@ -428,9 +453,9 @@ Common rules that apply to every alert:
 | Field | Value |
 | --- | --- |
 | Condition | `courier_metrics_scrape_errors_total` increases over the window |
-| Evidence | `courier_metrics_scrape_errors_total` |
+| Evidence | `courier_metrics_scrape_errors_total`, `courier_terminal_age_scrape_errors_total`, `courier_terminal_backlog_scrape_errors_total` |
 | Window | 10m |
-| Threshold rationale | a failing scrape means lane gauges are stale; even a low rate is worth surfacing because it silently degrades sections 3.2 |
+| Threshold rationale | a failing scrape means lane gauges are stale; even a low rate is worth surfacing because it silently degrades sections 3.2 and 3.5 |
 | Recovery | counter stops increasing |
 | Severity | warning |
 | Expected action | inspect the operator's RBAC and API server reachability for `LaneProfile`/`CoderRun` list calls |
@@ -604,13 +629,11 @@ open:
   unadmitted reservation and no `Claimed` progress, backed by a reservation-age
   signal), matching this document's A3 alert.
 - Per-phase timing and token metrics with bounded dimensions — settled by #290
-  (`courier_coderun_phase_duration_seconds` by `lane`/`mode`/`phase`;
-  `courier_coderun_tokens_total` by `lane`/`mode`/`kind`).
+  and shipped by the operator (`courier_coderun_phase_duration_seconds` by
+  `lane`/`mode`/`phase`; `courier_coderun_tokens_total` by `lane`/`mode`/`kind`).
 
 Still open on the siblings' own unknown lists, and consumed as such:
 
-- Whether per-phase duration and token counters ship in a first cut or after
-  the discovery/lane layer (#290).
 - Whether the connector capability catalogue is a scrape-time gauge, a startup
   event, or both (#291).
 
@@ -635,6 +658,8 @@ These rules make any two renderings equivalent:
   run-duration buckets top out at 4h and the queue-wait buckets at 1h; a value
   above the last bucket is reported in the `+Inf` bucket and must be shown as
   "≥ top bucket", not a precise duration.
+  The per-phase histogram `courier_coderun_phase_duration_seconds` is observed
+  once per phase exit, not per reconcile, and reuses the run-duration buckets.
 - **Timestamps** are recorded by the controller; durations are derived from
   them, so clock skew is clamped (negative durations fold to zero).
 - **Missing series vs zero:** an absent series means "no data" (unknown), while
@@ -654,6 +679,9 @@ These rules make any two renderings equivalent:
   (`courier_coderuns_reap_requests_total` and
   `courier_coderuns_oldest_terminal_age_seconds`, `reapMetricLabels` in
   `internal/controller/metrics.go:35`), which is the intended budget.
+  The run-signal set adds only bounded enums on top of those: `from`/`to`
+  (phase), terminal `category`, verification and lifecycle `result`, token
+  `kind`, and the configured `source`.
 - **Correlate in logs, not labels.** Per-run correlation (`run_id`) belongs to
   the structured log stream, joined in the dashboard, never promoted to a
   metric dimension.

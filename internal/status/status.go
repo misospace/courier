@@ -98,6 +98,10 @@ type OperatorPatch struct {
 	StartedAt *metav1.Time `json:"startedAt,omitempty"`
 	// FinishedAt is set once, when the run reaches a terminal phase.
 	FinishedAt *metav1.Time `json:"finishedAt,omitempty"`
+	// PhaseEnteredAt is replaceable, not set-once: it is re-emitted on every
+	// phase change so the persisted marker always matches the current phase.
+	// Like the other replaceable fields, the diff is on non-nil inequality.
+	PhaseEnteredAt *metav1.Time `json:"phaseEnteredAt,omitempty"`
 	// WaitDuration is set once, when StartedAt is recorded.
 	WaitDuration string `json:"waitDuration,omitempty"`
 	// RunDuration is set once, when FinishedAt is recorded.

@@ -51,6 +51,10 @@ const (
 	lifecycleReportPendingWithErrorReason                   = "PendingWithError"
 	lifecycleReportPendingExternalVerificationFailureReason = "PendingExternalVerificationFailure"
 	lifecycleReportUnsupportedOutcomeReason                 = "UnsupportedOutcome"
+	lifecycleReportPublishedReason                          = "Published"
+	lifecycleReportSupersededReason                         = "Superseded"
+	lifecycleReportRetryableReason                          = "Retryable"
+	lifecycleReportAcceptedSupportReason                    = "Accepted"
 	retryLifecycleReportAnnotation                          = "courier.misospace.dev/retry-lifecycle-report"
 	externalVerificationFailureReason                       = "external verification failed"
 )
@@ -1255,6 +1259,7 @@ func (r *CoderRunReconciler) transitionTerminal(ctx context.Context, run *courie
 	// twice.
 	if firstTerminal {
 		r.metrics().ObserveTerminal(run)
+		r.metrics().ObserveTerminalDiagnostic(run)
 	}
 	return r.publishTerminalLifecycle(ctx, run, adapter, item, phase, intent)
 }
@@ -1303,7 +1308,7 @@ func (r *CoderRunReconciler) publishTerminalLifecycle(ctx context.Context, run *
 	}
 	switch {
 	case err == nil:
-		if markErr := r.markLifecycleReportOutcome(ctx, run, true, "Published", "", retryToken, "Accepted"); markErr != nil {
+		if markErr := r.markLifecycleReportOutcome(ctx, run, true, lifecycleReportPublishedReason, "", retryToken, lifecycleReportAcceptedSupportReason); markErr != nil {
 			return ctrl.Result{}, markErr
 		}
 		// A capacity-exhaustion ending is not finished with the source until
@@ -1317,7 +1322,7 @@ func (r *CoderRunReconciler) publishTerminalLifecycle(ctx context.Context, run *
 	case errors.Is(err, source.ErrSuperseded):
 		log.FromContext(ctx).Info("dropping superseded source lifecycle report",
 			"run", run.Name, "phase", phase, "error", err.Error())
-		return ctrl.Result{}, r.markLifecycleReportOutcome(ctx, run, true, "Superseded", err.Error(), "", "Superseded")
+		return ctrl.Result{}, r.markLifecycleReportOutcome(ctx, run, true, lifecycleReportSupersededReason, err.Error(), "", lifecycleReportSupersededReason)
 	case errors.Is(err, source.ErrUnsupportedOutcome):
 		log.FromContext(ctx).Info("source does not support terminal lifecycle outcome; awaiting explicit retry",
 			"run", run.Name, "phase", phase, "error", err.Error())
@@ -1331,7 +1336,7 @@ func (r *CoderRunReconciler) publishTerminalLifecycle(ctx context.Context, run *
 		if retryToken == "" && lifecycleReportUnsupported(run) && lifecycleReportRetryRequested(run) {
 			retryToken = run.Annotations[retryLifecycleReportAnnotation]
 		}
-		return ctrl.Result{RequeueAfter: lifecycleReportRequeueDelay}, r.markLifecycleReportOutcome(ctx, run, false, pendingLifecycleReason(intent), intent.error, retryToken, "Retryable")
+		return ctrl.Result{RequeueAfter: lifecycleReportRequeueDelay}, r.markLifecycleReportOutcome(ctx, run, false, pendingLifecycleReason(intent), intent.error, retryToken, lifecycleReportRetryableReason)
 	}
 }
 
@@ -1434,14 +1439,14 @@ func (r *CoderRunReconciler) markLifecycleReportOutcome(ctx context.Context, run
 	switch supportReason {
 	case lifecycleReportUnsupportedOutcomeReason:
 		r.setLifecycleReportCapability(run, metav1.ConditionFalse, lifecycleReportUnsupportedOutcomeReason, "source rejected this lifecycle outcome as unsupported")
-	case "Accepted":
-		r.setLifecycleReportCapability(run, metav1.ConditionTrue, "Accepted", "source accepted this lifecycle outcome")
-	case "Superseded":
-		r.setLifecycleReportCapability(run, metav1.ConditionUnknown, "Superseded", "source lifecycle report was superseded before acceptance could be determined")
-	case "Retryable":
-		r.setLifecycleReportCapability(run, metav1.ConditionUnknown, "Retryable", "source report failed transiently; automatic retry remains enabled")
+	case lifecycleReportAcceptedSupportReason:
+		r.setLifecycleReportCapability(run, metav1.ConditionTrue, lifecycleReportAcceptedSupportReason, "source accepted this lifecycle outcome")
+	case lifecycleReportSupersededReason:
+		r.setLifecycleReportCapability(run, metav1.ConditionUnknown, lifecycleReportSupersededReason, "source lifecycle report was superseded before acceptance could be determined")
+	case lifecycleReportRetryableReason:
+		r.setLifecycleReportCapability(run, metav1.ConditionUnknown, lifecycleReportRetryableReason, "source report failed transiently; automatic retry remains enabled")
 	}
-	if supportReason == "Retryable" {
+	if supportReason == lifecycleReportRetryableReason {
 		if retryToken != "" {
 			run.Status.LifecycleReportActiveRetryToken = retryToken
 		}
@@ -1451,7 +1456,37 @@ func (r *CoderRunReconciler) markLifecycleReportOutcome(ctx context.Context, run
 		}
 		run.Status.LifecycleReportActiveRetryToken = ""
 	}
-	return r.patchStatus(ctx, before, run)
+	err := r.patchStatus(ctx, before, run)
+	if err == nil {
+		// Every call to markLifecycleReportOutcome resolves exactly one
+		// report attempt — the first publication at terminalization or one
+		// retry via retryTerminalLifecycle — so one attempt outcome is
+		// counted per call. A settled report never re-enters here: the
+		// reconcile gates skip a run whose LifecycleReported is positively
+		// settled, so re-reconciles never double-count. Pending outcomes are
+		// not results; the unsettled backlog is observable through
+		// courier_coderuns_lifecycle_pending.
+		r.recordLifecycleReportOutcome(run.Spec.Source, run.Spec.Lane, run.Spec.Mode, reason, supportReason)
+	}
+	return err
+}
+
+// recordLifecycleReportOutcome maps one report attempt's outcome arguments to
+// one of the four bounded report outcomes: Published and Superseded are
+// terminal report states, while UnsupportedOutcome and Retryable arrive on the
+// capability condition.
+func (r *CoderRunReconciler) recordLifecycleReportOutcome(sourceName, lane string, mode courierv1alpha1.Mode, reason, supportReason string) {
+	rec := r.metrics()
+	switch {
+	case supportReason == lifecycleReportUnsupportedOutcomeReason:
+		rec.ObserveLifecycleReportOutcome(sourceName, lane, mode, lifecycleOutcomeUnsupported)
+	case supportReason == lifecycleReportRetryableReason:
+		rec.ObserveLifecycleReportOutcome(sourceName, lane, mode, lifecycleOutcomeRetryable)
+	case reason == lifecycleReportPublishedReason:
+		rec.ObserveLifecycleReportOutcome(sourceName, lane, mode, lifecycleOutcomePublished)
+	case reason == lifecycleReportSupersededReason:
+		rec.ObserveLifecycleReportOutcome(sourceName, lane, mode, lifecycleOutcomeSuperseded)
+	}
 }
 
 func (r *CoderRunReconciler) setLifecycleReportCapability(run *courierv1alpha1.CoderRun, statusValue metav1.ConditionStatus, reason, message string) {
@@ -1489,7 +1524,7 @@ func lifecycleReportSettled(run *courierv1alpha1.CoderRun) bool {
 	if cond == nil || cond.Status != metav1.ConditionTrue {
 		return false
 	}
-	return cond.Reason == "Published" || cond.Reason == "Superseded"
+	return cond.Reason == lifecycleReportPublishedReason || cond.Reason == lifecycleReportSupersededReason
 }
 
 // lifecycleReportConditionState renders the LifecycleReported condition as a
@@ -1662,9 +1697,20 @@ func (r *CoderRunReconciler) patchStatus(ctx context.Context, before, after *cou
 	if before == nil || after == nil {
 		return errors.New("coderun controller: status patch requires a run")
 	}
+	// PhaseEnteredAt is replaceable, not set-once: every phase change
+	// restamps it with the reconciler clock's now in the same write, so the
+	// persisted marker always matches the persisted phase.
+	now := r.clock().UTC()
+	phaseChanged := before.Status.Phase != after.Status.Phase
+	if phaseChanged {
+		after.Status.PhaseEnteredAt = &metav1.Time{Time: now}
+	}
 	var fields status.OperatorPatch
 	if before.Status.Phase != after.Status.Phase {
 		fields.Phase = after.Status.Phase
+	}
+	if before.Status.PhaseEnteredAt != after.Status.PhaseEnteredAt {
+		fields.PhaseEnteredAt = after.Status.PhaseEnteredAt
 	}
 	if before.Status.Branch != after.Status.Branch {
 		branch := after.Status.Branch
@@ -1779,7 +1825,78 @@ func (r *CoderRunReconciler) patchStatus(ctx context.Context, before, after *cou
 		return nil
 	}
 	writer := status.NewOperatorWriter(r.statusWriter())
-	return writer.Patch(ctx, client.ObjectKeyFromObject(after), fields)
+	if err := writer.Patch(ctx, client.ObjectKeyFromObject(after), fields); err != nil {
+		return err
+	}
+	// Metrics are recorded only after a successful status write, matching the
+	// terminal-observation contract: a failed patch must not record anything
+	// (see TestTerminalStatusPatchFailureRecordsNoMetrics).
+	r.recordStatusMetrics(before, after, now)
+	return nil
+}
+
+// recordStatusMetrics derives the transition-path observability signals from
+// the same status diff the patch applied. It runs only after the patch
+// succeeded, so a failed write never records a signal the persisted status
+// does not back. The phase duration is observed for the phase the run left,
+// and only when a durable PhaseEnteredAt marker existed for it — a run whose
+// previous phase had no marker (a pre-upgrade run, or any run's first
+// transition into a phase, such as Pending) records its transition but no
+// fabricated duration.
+func (r *CoderRunReconciler) recordStatusMetrics(before, after *courierv1alpha1.CoderRun, now time.Time) {
+	rec := r.metrics()
+	if before.Status.Phase != after.Status.Phase {
+		if before.Status.Phase != "" && after.Status.Phase != "" {
+			rec.ObservePhaseTransition(after.Spec.Lane, after.Spec.Mode, before.Status.Phase, after.Status.Phase)
+			switch {
+			case before.Status.Phase == courierv1alpha1.PhaseVerifying &&
+				after.Status.Phase == courierv1alpha1.PhaseAwaitingReview:
+				rec.ObserveVerificationOutcome(after.Spec.Lane, after.Spec.Mode, verificationOutcomeGreen)
+			case before.Status.Phase == courierv1alpha1.PhaseVerifying &&
+				(after.Status.Phase == courierv1alpha1.PhaseFailed || after.Status.Phase == courierv1alpha1.PhaseHandedOff):
+				rec.ObserveVerificationOutcome(after.Spec.Lane, after.Spec.Mode, verificationOutcomeRed)
+			case before.Status.Phase == courierv1alpha1.PhaseVerifying &&
+				after.Status.Phase == courierv1alpha1.PhaseNeedsHuman:
+				rec.ObserveVerificationOutcome(after.Spec.Lane, after.Spec.Mode, verificationOutcomeUnobservable)
+			}
+		}
+		if before.Status.PhaseEnteredAt != nil && !before.Status.PhaseEnteredAt.IsZero() {
+			rec.ObservePhaseDuration(after.Spec.Lane, after.Spec.Mode,
+				before.Status.Phase, now.Sub(before.Status.PhaseEnteredAt.Time))
+		}
+	}
+	if after.Status.Restarts > before.Status.Restarts {
+		rec.ObserveInfraRestarts(after.Spec.Lane, after.Spec.Mode, after.Status.Restarts-before.Status.Restarts)
+	}
+	// Telemetry can land after the first terminal transition (the harness
+	// termination handoff patches status later), so tokens are counted as
+	// per-kind deltas on every telemetry change: a nil→set telemetry with
+	// values yields exactly the full amounts, later growth yields increments,
+	// and an identical re-patch yields nothing. The derived Total is never
+	// emitted.
+	if !reflect.DeepEqual(before.Status.Telemetry, after.Status.Telemetry) &&
+		after.Status.Telemetry != nil && after.Status.Telemetry.Tokens != nil {
+		var beforeTokens courierv1alpha1.TokenUsage
+		if before.Status.Telemetry != nil && before.Status.Telemetry.Tokens != nil {
+			beforeTokens = *before.Status.Telemetry.Tokens
+		}
+		afterTokens := after.Status.Telemetry.Tokens
+		pairs := []struct {
+			kind          string
+			after, before int64
+		}{
+			{tokenKinds[0], afterTokens.Input, beforeTokens.Input},
+			{tokenKinds[1], afterTokens.Output, beforeTokens.Output},
+			{tokenKinds[2], afterTokens.Reasoning, beforeTokens.Reasoning},
+			{tokenKinds[3], afterTokens.CacheRead, beforeTokens.CacheRead},
+			{tokenKinds[4], afterTokens.CacheWrite, beforeTokens.CacheWrite},
+		}
+		for _, p := range pairs {
+			if d := p.after - p.before; d > 0 {
+				rec.ObserveTokenDelta(after.Spec.Lane, after.Spec.Mode, p.kind, d)
+			}
+		}
+	}
 }
 
 // reader returns the reader world reads go through, preferring the injected
