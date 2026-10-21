@@ -688,7 +688,7 @@ const LabelProbe = "courier.misospace.dev/probe"
 func ProbePod(run *courier.CoderRun, node, image, script string) *corev1.Pod {
 	suffix := "-probe-" + nodeNameTag(node)
 	pod := &corev1.Pod{
-		ObjectMeta: objectMeta(run, resourceName(run.Name, suffix), ComponentWorker),
+		ObjectMeta: objectMeta(run, podResourceName(run.Name, suffix), ComponentWorker),
 		Spec: corev1.PodSpec{
 			NodeName:                     node,
 			ServiceAccountName:           WorkerSAName(run.Name),

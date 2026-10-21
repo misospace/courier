@@ -31,17 +31,46 @@ const (
 // Resource names are derived from the run name with a fixed suffix. Long run
 // names are truncated with a digest so every derived name stays a valid
 // DNS-1123 subdomain and remains unique and stable per run. Objects with a
-// stricter naming rule (the Services, which must be RFC-1035 DNS labels)
-// derive their names through serviceResourceName instead.
+// stricter naming rule derive their names through podResourceName (the Pods,
+// whose first label must fit the 63-character DNS-label bound a pod's
+// hostname is drawn from) or serviceResourceName (the Services, which must be
+// RFC-1035 DNS labels) instead.
 func resourceName(runName, suffix string) string {
 	base := strings.Trim(strings.ToLower(runName), "-")
 	maxBase := 253 - len(suffix) - 9
 	if len(base) > maxBase {
 		digest := sha256.Sum256([]byte(runName))
 		hash := hex.EncodeToString(digest[:])[:8]
-		base = strings.TrimRight(base[:maxBase-len(hash)-1], "-") + "-" + hash
+		// Trailing dots are trimmed with the hyphens: a label may not begin
+		// with a hyphen, and the digest is joined after this prefix.
+		base = strings.TrimRight(base[:maxBase-len(hash)-1], "-.") + "-" + hash
 	}
 	return base + suffix
+}
+
+// podResourceName derives a Pod object name. Pods are validated as DNS-1123
+// subdomains like every other object here, but a pod's hostname is the first
+// label of its name truncated to 63 characters, and in-cluster consumers read
+// that hostname, so the first label is held to the 63-character DNS-label
+// bound for the two to agree. Names whose first label already fits pass
+// through resourceName unchanged; an overflowing first label is truncated and
+// digest-suffixed with a digest of the full run name, the way
+// serviceResourceName bounds Service names, and the suffix keeps the
+// per-component and probe tags distinct.
+func podResourceName(runName, suffix string) string {
+	const maxLabelLen = 63
+	name := resourceName(runName, suffix)
+	label := name
+	if dot := strings.IndexByte(label, '.'); dot >= 0 {
+		label = label[:dot]
+	}
+	if len(label) <= maxLabelLen {
+		return name
+	}
+	digest := sha256.Sum256([]byte(runName))
+	hash := hex.EncodeToString(digest[:])[:8]
+	keep := maxLabelLen - len(suffix) - len(hash) - 1
+	return strings.TrimRight(label[:keep], "-") + "-" + hash + suffix
 }
 
 // serviceResourceName derives a Service object name. Kubernetes validates
@@ -135,12 +164,14 @@ func sanitizeLabelValue(value string) string {
 }
 
 // ControlPodName, BrokerPodName, WorkerPodName and the rest name every
-// object the operator provisions for one run.
-func ControlPodName(runName string) string { return resourceName(runName, "-control") }
+// object the operator provisions for one run. Pod names go through
+// podResourceName so the first label stays a valid DNS label; objects
+// validated only as DNS subdomains stay on resourceName.
+func ControlPodName(runName string) string { return podResourceName(runName, "-control") }
 
-func BrokerPodName(runName string) string { return resourceName(runName, "-broker") }
+func BrokerPodName(runName string) string { return podResourceName(runName, "-broker") }
 
-func WorkerPodName(runName string) string { return resourceName(runName, "-worker") }
+func WorkerPodName(runName string) string { return podResourceName(runName, "-worker") }
 
 func ControlSAName(runName string) string { return resourceName(runName, "-control") }
 
