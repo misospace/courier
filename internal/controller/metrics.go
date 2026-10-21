@@ -282,8 +282,14 @@ func (c *LaneCollector) Collect(ch chan<- prometheus.Metric) {
 		}
 		if source.PhaseReservesDiscovery(run.Status.Phase) {
 			reservations[run.Spec.Lane]++
-			if current, ok := oldestReservation[run.Spec.Lane]; !ok || run.CreationTimestamp.Time.Before(current) {
-				oldestReservation[run.Spec.Lane] = run.CreationTimestamp.Time
+			// A run without a creation timestamp has an unknown age, not a
+			// zero age: it is skipped for the age series only, so the
+			// reservation counts stay truthful (the same rule the
+			// TerminalAgeCollector applies to terminal timestamps).
+			if !run.CreationTimestamp.IsZero() {
+				if current, ok := oldestReservation[run.Spec.Lane]; !ok || run.CreationTimestamp.Time.Before(current) {
+					oldestReservation[run.Spec.Lane] = run.CreationTimestamp.Time
+				}
 			}
 		}
 		if run.Status.Phase == courierv1alpha1.PhasePending {

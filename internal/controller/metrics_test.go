@@ -309,6 +309,18 @@ func TestLaneCollectorCapacitySignals(t *testing.T) {
 	if got := gaugeValue(t, gatherMetric(t, registry, "courier_lane_oldest_reservation_age_seconds", map[string]string{"lane": "cloud"}), "courier_lane_oldest_reservation_age_seconds"); got != (2 * time.Hour).Seconds() {
 		t.Fatalf("oldest reservation age cloud = %v, want %v", got, (2 * time.Hour).Seconds())
 	}
+	// The zero lane's only reservation has no creation timestamp: its age is
+	// unknown, not zero, so the age series is absent while the reservation
+	// and pending counts still count the run.
+	if got := gaugeValue(t, gatherMetric(t, registry, "courier_lane_reservations", map[string]string{"lane": "zero"}), "courier_lane_reservations"); got != 1 {
+		t.Fatalf("reservations zero = %v, want 1 (the run still reserves the lane)", got)
+	}
+	if got := gaugeValue(t, gatherMetric(t, registry, "courier_coderuns_pending", map[string]string{"lane": "zero"}), "courier_coderuns_pending"); got != 1 {
+		t.Fatalf("pending zero = %v, want 1", got)
+	}
+	if _, present := gaugeValueIfPresent(t, registry, "courier_lane_oldest_reservation_age_seconds", map[string]string{"lane": "zero"}); present {
+		t.Fatal("oldest reservation age series present for a run without a creation timestamp, want absent")
+	}
 	// The existing gauges are unchanged by the new signals.
 	if got := gaugeValue(t, gatherMetric(t, registry, "courier_coderuns_in_flight", map[string]string{"lane": "local"}), "courier_coderuns_in_flight"); got != 2 {
 		t.Fatalf("in-flight local = %v, want 2 (Claimed + Running only)", got)
@@ -367,13 +379,17 @@ func TestMetricLabelsExcludeIdentity(t *testing.T) {
 
 	// A drained lane must still appear on both lane gauges, reporting 0.
 	// A pending run makes every new reservation gauge observable too; it does
-	// not consume admission capacity, so in-flight stays 0.
+	// not consume admission capacity, so in-flight stays 0. Its creation
+	// timestamp is stamped so the oldest-reservation age series exists —
+	// without one the age is unknown and the series is absent.
 	doneRun := admissionRun("run2", "local", courierv1alpha1.PhaseDone)
 	doneRun.Status.FinishedAt = &metav1.Time{Time: timestampClock.Add(-time.Hour)}
+	pendingRun := admissionRun("run3", "local", courierv1alpha1.PhasePending)
+	pendingRun.CreationTimestamp = metav1.NewTime(timestampClock.Add(-time.Minute))
 	runsClient := phaseClient(t,
 		admissionLane("local", 2),
 		doneRun,
-		admissionRun("run3", "local", courierv1alpha1.PhasePending),
+		pendingRun,
 	)
 	laneRegistry := prometheus.NewRegistry()
 	laneRegistry.MustRegister(NewLaneCollector(runsClient))

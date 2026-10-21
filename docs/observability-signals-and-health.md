@@ -38,21 +38,19 @@ views. Where this document answers a question #292 recorded as open, it says so.
 
 ## 2. The core problem: a source-level health view that exists with no runs
 
-Courier's current observability is run-centric. `courier_coderuns_total`,
+Courier's run-centric observability — `courier_coderuns_total`,
 `courier_coderun_run_duration_seconds`, and `courier_coderun_queue_wait_seconds`
 are observed only when a run reaches a terminal phase
-(`internal/controller/metrics.go:128-152`); `courier_coderuns_in_flight` and
+(`internal/controller/metrics.go:158-177`); `courier_coderuns_in_flight` and
 `courier_lane_suspended` are read live from the cluster
-(`internal/controller/metrics.go:209-252`). **None of these can distinguish an
-idle, healthy, empty queue from a broken discovery loop**, because discovery
-failures are logged and then discarded
-(`internal/source/runner.go:68-70,79-81`) and never reach a counter, condition,
-or status.
+(`internal/controller/metrics.go:242-331`) — **cannot distinguish an idle,
+healthy, empty queue from a broken discovery loop**. The source-level layer
+below does, because a discovery failure is counted
+(`courier_source_discovery_failures_total`) as well as logged.
 
-The design therefore introduces a **source-level** layer, `courier_source_*`,
-that is emitted by the discovery runner independently of whether any `CoderRun`
-is created. Three outcomes that look identical in a run-centric view become
-distinguishable:
+That **source-level** layer, `courier_source_*`, is emitted by the discovery
+runner independently of whether any `CoderRun` is created. Three outcomes that
+look identical in a run-centric view become distinguishable:
 
 | Situation | What is true | What the source view must say |
 | --- | --- | --- |
@@ -84,7 +82,8 @@ produces no `CoderRun`.
   summed (§10).
 
 Every label in the catalogue is drawn from a **closed, bounded vocabulary**:
-`source` (configured adapters), `lane` (configured profiles), `mode`
+`source` (the configured source identity — the `CoderRun.spec.source` value,
+never the agent name), `lane` (configured profiles), `mode`
 (`resolve-issue` | `fix-pr`), `phase` (§3.4), `from`/`to` (phase), `category`
 (§3.5), `result` (§3.5, §3.6), and per-signal `reason` enums. §7 states the
 forbidden values and the budget.
@@ -101,15 +100,18 @@ source runner is not configured emits nothing.
 | `courier_source_discovery_successes_total` | counter | polls | `source`, `lane` | Source calls that returned without error, **including zero items**. This is what makes an idle queue observable as healthy. |
 | `courier_source_discovery_failures_total` | counter | polls | `source`, `lane` | Source calls that returned an error. The authoritative discovery-failure rate (#291 §6.2). |
 | `courier_source_items_offered_total` | counter | items | `source`, `lane` | Items returned by discovery before core validation and dedupe. |
-| `courier_source_discovery_skipped_total` | counter | items | `source`, `lane`, `reason` | Items dropped by runner validation; `reason` ∈ `missing-id`, `unsupported-mode`, `invalid-ref` (`internal/source/runner.go:210-220`). |
-| `courier_source_items_materialized_total` | counter | runs | `source`, `lane` | Items that became `CoderRun`s. Dedupe and exclusions may make this smaller than `items_offered_total` (`internal/source/runner.go:226-291`). |
+| `courier_source_discovery_skipped_total` | counter | items | `source`, `lane`, `reason` | Items dropped by runner validation; `reason` ∈ `missing-id`, `unsupported-mode`, `invalid-ref` (`internal/source/runner.go:330-345`). |
+| `courier_source_items_materialized_total` | counter | runs | `source`, `lane` | Items that became `CoderRun`s. Dedupe and exclusions may make this smaller than `items_offered_total` (`internal/source/runner.go:350-443`). |
 | `courier_source_last_attempt_timestamp_seconds` | gauge | unix seconds | `source`, `lane` | When the source was last called. |
 | `courier_source_last_success_timestamp_seconds` | gauge | unix seconds | `source`, `lane` | When discovery last succeeded. **Absent until the first success** — absence is `starting`/`unknown`, never `idle`. |
-| `courier_source_discovery_paused_total` | counter | polls | `source`, `lane`, `reason` | Polls skipped before the source was called; `reason` ∈ `lane-waiting`, `lane-suspended`, `lane-at-capacity` (`internal/source/runner.go:92-139`). |
+| `courier_source_discovery_paused_total` | counter | polls | `source`, `lane`, `reason` | Polls skipped before the source was called; `reason` ∈ `lane-waiting`, `lane-suspended`, `lane-at-capacity`, `capacity-cooldown` (`internal/source/runner.go:174-250`). |
 | `courier_source_discovery_paused` | gauge | 0/1 | `source`, `lane`, `reason` | 1 while the runner is currently paused before calling the source, 0 otherwise. Exactly one reason is 1 per paused binding; all are 0 when not paused. This is the current-state half of the counter above. |
 
 `attempts = successes + failures` at steady state; skipped polls are counted
-under `discovery_paused_total`, not as attempts. The gap between
+under `discovery_paused_total`, not as attempts. The current-state
+`discovery_paused` gauge is published as one atomic snapshot per binding: a
+scrape never observes two reasons at 1, nor a half-applied reason transition,
+even when several runners share one `(source, lane)` pair. The gap between
 `items_offered_total` and `items_materialized_total` is the observable cost of
 dedupe/exclusion, not an error. The failure **cause** (transport, auth, HTTP
 class, malformed response) is deliberately **not** a core label: it is the
@@ -119,27 +121,27 @@ shared adapter name.
 The `reason` tokens in this catalogue are a **structured metric vocabulary**
 owned by the emitter. They are deliberately kebab-case and distinct from the
 free-form log prose the runner prints today (for example the runner logs
-`"waiting for LaneProfile"` at `internal/source/runner.go:97`, which the metric
+`"waiting for LaneProfile"` at `internal/source/runner.go:177`, which the metric
 emits as `reason="lane-waiting"`); the log message is not a label. The
-implemented vocabulary (`internal/source/metrics.go`, #323) carries a fourth
-pause reason the design text predates: `capacity-cooldown`, for the
-confirmed capacity-exhaustion cooldown pause (#327). The vocabulary stays
-closed; a new reason means extending that slice, not a new string at an
-emission site.
+implemented vocabulary (`internal/source/metrics.go`) carries a fourth pause
+reason, `capacity-cooldown`, for the confirmed capacity-exhaustion cooldown
+pause (#327). The vocabulary stays closed; a new reason means extending that
+slice, not a new string at an emission site.
 
 ### 3.3 Lane capacity and reservations (core)
 
-Reservations already exist as an internal predicate
-(`laneCapacityReservations`, `internal/source/runner.go:343-355`) and are only
-visible through one log line (`internal/source/runner.go:125-138`). They are
-promoted to a signal so the lane's queue is observable.
+Reservations exist as an internal predicate
+(`laneCapacityReservations`, `internal/source/runner.go:610-620`). The runner
+reports a lane at capacity in one log line
+(`internal/source/runner.go:237-244`); the collector exports the reservation
+count and the oldest-reservation age, so the lane's queue is observable.
 
 | Signal | Kind | Unit | Labels | Semantics |
 | --- | --- | --- | --- | --- |
 | `courier_lane_concurrency` | gauge | slots | `lane` | Configured `LaneProfile.Spec.Concurrency` (default 1). Closes the gap #292 recorded for the saturation alert. |
 | `courier_lane_suspended` | gauge | 0/1 | `lane` | Existing: `LaneProfile.Suspended()` (`api/v1alpha1/laneprofile_types.go:13,71`). |
 | `courier_coderuns_in_flight` | gauge | runs | `lane` | Existing: runs admitted by the operator, i.e. `Claimed` + `Running` (`internal/controller/admission.go:21-23`). |
-| `courier_lane_reservations` | gauge | runs | `lane` | Discovery reservations: empty-phase + `Pending` + `Claimed` + `Running` (`internal/source/runner.go:343-355`). Deliberately broader than `in_flight`. |
+| `courier_lane_reservations` | gauge | runs | `lane` | Discovery reservations: empty-phase + `Pending` + `Claimed` + `Running` (`internal/source/runner.go:610-620`). Deliberately broader than `in_flight`. |
 | `courier_coderuns_pending` | gauge | runs | `lane` | Runs in `PhasePending` (a precise subset of reservations, for the queue display). |
 | `courier_lane_oldest_reservation_age_seconds` | gauge | seconds | `lane` | Age of the oldest reservation by `metadata.creationTimestamp`; absent when there are none. The evidence for the stale-reservation condition (§5). |
 
@@ -159,7 +161,7 @@ Phases are the existing enum (`api/v1alpha1/coderun_types.go:83-104`): `Pending`
 | Signal | Kind | Unit | Labels | Semantics |
 | --- | --- | --- | --- | --- |
 | `courier_coderun_phase_transitions_total` | counter | transitions | `lane`, `mode`, `from`, `to` | One per observed phase change. `from`/`to` are the bounded phase enum. |
-| `courier_coderun_phase_duration_seconds` | histogram | seconds | `lane`, `mode`, `phase` | Time spent in a phase, observed once on leaving it. Buckets are a candidate; the existing run/queue buckets are a starting shape (`internal/controller/metrics.go:19-28`). |
+| `courier_coderun_phase_duration_seconds` | histogram | seconds | `lane`, `mode`, `phase` | Time spent in a phase, observed once on leaving it. Buckets are a candidate; the existing run/queue buckets are a starting shape (`internal/controller/metrics.go:20-29`). |
 | `courier_coderuns_total` | counter | runs | `lane`, `mode`, `phase` | Existing: terminal runs by **first** terminal phase. The label is set once — `transitionTerminal` records the metric exactly once on the run's first terminal transition (`firstTerminal := FinishedAt == nil`, `internal/controller/coderun_controller.go:999-1053`), and a later transition that corrects the ending (for example `AwaitingReview → Done`, #250) does not increment the new phase. The label preserved is the phase at the first terminal transition, not the run's final disposition. |
 | `courier_coderun_run_duration_seconds` | histogram | seconds | `lane`, `mode`, `phase` | Existing: `StartedAt`→`FinishedAt`. |
 | `courier_coderun_queue_wait_seconds` | histogram | seconds | `lane`, `mode`, `phase` | Existing: creation→`AdmittedAt`. |
@@ -269,7 +271,7 @@ policy.
 | `courier_coderuns_awaiting_reap` | gauge | runs | `phase` | Proposed: terminal runs retained for inspection and not yet reaped. The age gauge answers *how stale* the oldest retained run is; this answers *how many* runs are held, which is the retained-backlog view #292 needs. |
 
 Both shipped retention signals are labelled `phase` only, never `lane`
-(`reapMetricLabels`, `internal/controller/metrics.go:35`): retention is a
+(`reapMetricLabels`, `internal/controller/metrics.go:36`): retention is a
 per-terminal-phase property, and a `lane` label would multiply the series by
 lane for no diagnostic gain.
 
@@ -305,7 +307,7 @@ collapse into one "done".
   first *terminal* transition (`transitionTerminal`,
   `internal/controller/coderun_controller.go:988-1055`) and
   `courier_coderuns_total` plus the run-duration histogram are recorded at the
-  same point (`ObserveTerminal`, `internal/controller/metrics.go:128-152`); the
+  same point (`ObserveTerminal`, `internal/controller/metrics.go:158-177`); the
   `Running → Verifying` transition (`internal/controller/coderun_controller.go:691-708`)
   records neither. So a run parked in `Verifying` is not yet counted, and its
   eventual `StartedAt → FinishedAt` duration includes the `Verifying`
@@ -328,7 +330,7 @@ collapse into one "done".
   `transitionTerminal`'s `firstTerminal := FinishedAt == nil`
   (`internal/controller/coderun_controller.go:999-1053`) gates the
   `ObserveTerminal` call, and `ObserveTerminal`'s own comment
-  (`internal/controller/metrics.go:128-132`) is explicit that a later
+  (`internal/controller/metrics.go:153-157`) is explicit that a later
   `AwaitingReview → Done` must not count again. The terminal histogram
   keeps the first terminal-phase label as well. Treating the metric as
   "runs by final phase" would invite a dashboard to read `{phase="Done"}`
@@ -587,8 +589,8 @@ through the gates — the backlog drains as the reservation is claimed and the
 
 ### 7.1 Allowed labels
 
-Only the closed vocabularies in §3.1 may appear as label values: configured
-`source` and `lane`, `mode`, `phase`/`from`/`to`, terminal `category`,
+Only the closed vocabularies in §3.1 may appear as label values: the configured
+`source` identity and `lane`, `mode`, `phase`/`from`/`to`, terminal `category`,
 verification/lifecycle `result`, and each signal's closed `reason` enum.
 
 ### 7.2 Forbidden labels
@@ -643,7 +645,7 @@ free-form text becomes a metric label or a structured field.
 - `*_timestamp_seconds` gauges are emitted from the operator clock and are used
   for **freshness only**, never for authoritative durations.
 - Negative durations from clock skew clamp to zero, matching existing helpers
-  (`nonNegativeSeconds`, `internal/controller/metrics.go:169-177`;
+  (`nonNegativeSeconds`, `internal/controller/metrics.go:194-202`;
   `durationString`, `internal/controller/coderun_controller.go:1664-1671`).
 
 ### 8.2 Units

@@ -87,12 +87,31 @@ controller-runtime on the `--metrics-bind-address` endpoint (default `:8080`,
 | `courier_coderuns_total` | counter | `lane`, `mode`, `phase` | runs reaching a terminal phase — label is the **first** terminal phase (one increment per run; a later `AwaitingReview → Done` does not increment `{phase="Done"}`, per #290 §3.4/§4.1) |
 | `courier_coderuns_in_flight` | gauge | `lane` | live cluster read at scrape; counts `Claimed`+`Running` |
 | `courier_lane_suspended` | gauge | `lane` | 1 suspended, 0 active; live read at scrape |
+| `courier_lane_concurrency` | gauge | `lane` | configured `LaneProfile.Spec.Concurrency` (a non-positive setting is reported as 1); live read at scrape |
+| `courier_lane_reservations` | gauge | `lane` | runs reserving discovery capacity — empty-phase + `Pending` + `Claimed` + `Running`; live read at scrape |
+| `courier_coderuns_pending` | gauge | `lane` | runs in `PhasePending`, the queue-display subset of reservations; live read at scrape |
+| `courier_lane_oldest_reservation_age_seconds` | gauge | `lane` | age of the oldest reservation by `metadata.creationTimestamp`; absent when the lane has none |
 | `courier_metrics_scrape_errors_total` | counter | — | failed `List` calls during lane collection |
 
 controller-runtime additionally exposes `go_*`, `process_*`, and
 `controller_runtime_*` series on the same registry. The chart's
 `serviceMonitor.enabled` renders a metrics `Service` and a Prometheus Operator
 `ServiceMonitor`; it is off by default, so scraping is opt-in.
+
+**Discovery signals** (`internal/source/metrics.go`), registered on the same
+registry and emitted by the discovery runner for each `(source, lane)` binding:
+`courier_source_discovery_attempts_total`,
+`courier_source_discovery_successes_total`,
+`courier_source_discovery_failures_total`,
+`courier_source_discovery_skipped_total`,
+`courier_source_discovery_paused_total`, `courier_source_discovery_paused`
+(a 0/1 gauge of the current pause reason), `courier_source_items_offered_total`,
+`courier_source_items_materialized_total`,
+`courier_source_last_attempt_timestamp_seconds`, and
+`courier_source_last_success_timestamp_seconds` (absent until the first
+success). Every series carries the bounded `source` and `lane` labels —
+`source` is the configured source identity, never the agent name — plus a
+closed `reason` on the skipped and paused series.
 
 **Structured stdout log events** (`internal/log/events.go`): one JSON line per
 event, carrying `time`, `event`, `run_id`, `repo`, `ref`, `mode`, `brief`,
@@ -120,8 +139,10 @@ check fingerprints; and publication state (`Branch`, `HeadRepo`, `HeadSHA`,
 `Claim`, `Release`, `Transition`, `Resolve`; the optional `Reporter`,
 `WorkIdentifier`, `DiscoveryExcluder`, and `PreLauncher` interfaces. The
 discovery runner (`internal/source/runner.go`) polls every 30s and pauses when
-the lane is missing, suspended, or at capacity, logging those transitions. It
-logs a discovery error at `internal/source/runner.go:69,80`.
+the lane profile is missing, the lane is suspended, the lane is at capacity, or
+the capacity identity is cooling down — logging those transitions and
+exporting them as the discovery signals above. It logs a discovery error at
+`internal/source/runner.go:149,160`.
 
 **Retention** (`internal/controller/reap.go`): resolved `Done` runs are deleted
 after their five-minute default (`defaultDoneRetention`, overridden by
@@ -142,12 +163,17 @@ These are the gaps that constrain which views are implementable today. They are
 **not** authorized work; they are the evidence base a future instrumentation
 decision needs, and the reason several views below are marked "gap".
 
-- **Source/discovery health:** no metric for discovery attempts, successes,
-  failures, returned items, or filtered/materialized counts; no per-source
-  availability or latency. An empty discovery and a failed discovery both
-  yield zero new runs; today only the latter writes an error log.
-- **Reservations:** no metric for claimed-but-unlaunched age or stale
-  reservations.
+- **Source/discovery health:** discovery attempts, successes, failures, offered
+  and materialized items, and the pause state are exported (see "Discovery
+  signals" above); what is still missing is per-source availability and
+  discovery latency. An empty discovery and a failed discovery both yield zero
+  new runs; only the latter writes an error log.
+- **Reservations:** reservation counts and the oldest-reservation age are
+  exported (`courier_lane_reservations`,
+  `courier_lane_oldest_reservation_age_seconds`), but there is no
+  admission-progress signal
+  (`courier_coderun_phase_transitions_total{to="Claimed"}`) to tell a wedged
+  reservation from a progressing one.
 - **Lifecycle reporting:** no counter of report outcomes (published,
   superseded, unsupported, retryable) or report failures, and no report
   latency histogram.
@@ -186,9 +212,9 @@ no runs.
 
 | Panel | Intent | Backing signals | Portable semantics | Empty / unknown | Status |
 | --- | --- | --- | --- | --- | --- |
-| Discovery outcomes | Show whether discovery is succeeding, failing, or idle | discovery counters (gap), `source discovery failed` log | attempts, successes, failures per source over a window; failure ratio | no attempts ⇒ "not yet polled"; never render as healthy | **gap** |
-| Discovery freshness | Age of the last successful discovery | last-success timestamp (gap) | seconds since last success; compare to poll interval | no success yet ⇒ "unknown" | **gap** |
-| Discovered vs materialized | Are items offered but not becoming runs? | discovery counts (gap), CoderRun creation | offered, deduped/excluded, created | zero offered ⇒ "idle", distinct from "failed" | **gap** |
+| Discovery outcomes | Show whether discovery is succeeding, failing, or idle | `courier_source_discovery_attempts_total`, `courier_source_discovery_successes_total`, `courier_source_discovery_failures_total`, `source discovery failed` log | attempts, successes, failures per source over a window; failure ratio | no attempts ⇒ "not yet polled"; never render as healthy | today |
+| Discovery freshness | Age of the last successful discovery | `courier_source_last_success_timestamp_seconds` | seconds since last success; compare to poll interval | no success yet ⇒ "unknown" | today |
+| Discovered vs materialized | Are items offered but not becoming runs? | `courier_source_items_offered_total`, `courier_source_items_materialized_total`, CoderRun creation | offered, deduped/excluded, created | zero offered ⇒ "idle", distinct from "failed" | today |
 | Source enabled/disabled | Is a source configured at all? | configuration / lane bindings | enabled boolean per source | disabled ⇒ panels show "disabled", not "down" | partial |
 | Source-level run counts | Runs by source and mode | `courier_coderuns_total` (by lane/mode/phase) | terminal counts per lane/mode | no runs ⇒ zero, not absent | today |
 
@@ -197,8 +223,9 @@ discovers nothing is **idle**, not failing. A source whose discovery call errors
 is **degraded**, becoming **unavailable** once no success falls within the
 window (#290's source-state model). These must render differently: idle is a
 normal steady state (no alert), degraded and unavailable are actionable (alert,
-section 4). The distinction is lost
-today because both produce zero runs and only the error path logs.
+section 4). The distinction is observable today: the discovery counters and the
+last-success timestamp separate an idle source from a failing one, even though
+both produce zero runs.
 
 ### 3.2 Lane capacity
 
@@ -208,18 +235,19 @@ Lane capacity answers: *are lanes admitting work, saturated, or suspended?*
 | --- | --- | --- | --- | --- | --- |
 | In-flight per lane | Execution capacity in use | `courier_coderuns_in_flight` | gauge, runs per lane consuming capacity (`Claimed`+`Running`) | no lane ⇒ no series | today |
 | Lane suspension | Lanes intentionally paused | `courier_lane_suspended` | gauge 0/1 per lane | — | today |
-| Admission saturation | Time spent at capacity | `courier_coderuns_in_flight`, lane concurrency, `courier_coderun_queue_wait_seconds` | in-flight vs concurrency; queue-wait distribution | no queue-wait samples ⇒ "no recent admissions" | today/partial |
-| Reservation pressure | Materialized-but-unadmitted work | reservation counts (gap; runner counts empty/`Pending`/`Claimed`/`Running`, `internal/source/runner.go`) | reservations vs concurrency | — | **gap** |
+| Admission saturation | Time spent at capacity | `courier_coderuns_in_flight`, `courier_lane_concurrency`, `courier_coderun_queue_wait_seconds` | in-flight vs concurrency; queue-wait distribution | no queue-wait samples ⇒ "no recent admissions" | today/partial |
+| Reservation pressure | Materialized-but-unadmitted work | `courier_lane_reservations`, `courier_lane_concurrency` (runner counts empty/`Pending`/`Claimed`/`Running`, `internal/source/runner.go`) | reservations vs concurrency | — | today |
 
 Capacity saturation is a **supply** condition, not a failure: a lane pinned at
 its concurrency limit with a healthy source is doing its job. It becomes
 interesting only in combination with rising queue wait or with a source that is
 *also* failing. The dashboard must not paint saturation as an incident by
 itself. The reservation-pressure panel pairs with A3 (stuck reservation) once
-the reservation-age and admission-progress signals are exposed; A3 covers work
-that is materialised but wedged unadmitted — at or below lane capacity — while
-A2 covers healthy saturation with rising queue wait. Until those signals exist
-the panel is informational only.
+the admission-progress signal is exposed — the reservation-age signal is
+exported, so A3's age gate is computable today; A3 covers work that is
+materialised but wedged unadmitted — at or below lane capacity — while A2
+covers healthy saturation with rising queue wait. Until that signal exists the
+panel is informational only.
 
 ### 3.3 Run execution and outcomes
 
@@ -325,7 +353,7 @@ Common rules that apply to every alert:
 | Field | Value |
 | --- | --- |
 | Condition | the source is enabled, the binding is **not paused** (every `courier_source_discovery_paused{reason}` is zero — neither `lane-suspended` nor `lane-at-capacity` and not otherwise paused), the lane has free capacity (`courier_lane_reservations < courier_lane_concurrency` for the lane), **and** within the window the failure counter is strictly rising (covers at least one additional `courier_source_discovery_failures_total` increment) **with no success** in the same evaluation window (no new `courier_source_discovery_successes_total` and `courier_source_last_success_timestamp_seconds` older than the window, or absent — a binding that has never succeeded satisfies the no-success gate, subject to the startup grace below) |
-| Evidence | `courier_source_discovery_attempts_total`, `courier_source_discovery_successes_total`, `courier_source_discovery_failures_total`, `courier_source_last_success_timestamp_seconds` (gap), `courier_source_discovery_paused{reason}` (gap), `courier_lane_concurrency` (gap; not exported today — `LaneProfile.Spec.Concurrency`), `courier_lane_reservations`, `courier_lane_suspended`, `source discovery failed` log lines |
+| Evidence | `courier_source_discovery_attempts_total`, `courier_source_discovery_successes_total`, `courier_source_discovery_failures_total`, `courier_source_last_success_timestamp_seconds`, `courier_source_discovery_paused{reason}`, `courier_lane_concurrency`, `courier_lane_reservations`, `courier_lane_suspended`, `source discovery failed` log lines |
 | Window | 3× the configured poll interval (default 90s at the 30s poll) |
 | Threshold rationale | One failed poll can be a transient API blip; three consecutive windows with capacity available **and** no successful discovery indicates a persistent supply failure (a success anywhere in the window resets the predicate so an isolated blip does not latch) |
 | Recovery | the predicate clears when **any** of: a successful discovery is observed in the evaluation window (`courier_source_last_success_timestamp_seconds` refreshes), the binding becomes paused (a non-zero `reason` appears in `courier_source_discovery_paused`), or the lane loses free capacity (`courier_lane_reservations >= courier_lane_concurrency`) |
@@ -342,7 +370,7 @@ Common rules that apply to every alert:
 | Field | Value |
 | --- | --- |
 | Condition | in-flight equals lane concurrency for a sustained window **and** queue-wait quantiles are rising |
-| Evidence | `courier_coderuns_in_flight`, lane concurrency (gap; not exported today — `LaneProfile.Spec.Concurrency`), `courier_coderun_queue_wait_seconds` |
+| Evidence | `courier_coderuns_in_flight`, `courier_lane_concurrency`, `courier_coderun_queue_wait_seconds` |
 | Window | 15m |
 | Threshold rationale | saturation alone is normal; pairing it with a rising wait distinguishes healthy full utilisation from work that cannot start |
 | Recovery | in-flight drops below concurrency and queue-wait quantiles stop rising for the window |
@@ -359,7 +387,7 @@ Common rules that apply to every alert:
 | Field | Value |
 | --- | --- |
 | Condition | the lane is not suspended (`courier_lane_suspended == 0`), **capacity is free but unused** (`courier_coderuns_in_flight < courier_lane_concurrency`), **at least one reservation is unadmitted** (`courier_lane_reservations > courier_coderuns_in_flight`: reservations span empty-phase + `Pending` + `Claimed` + `Running` while in-flight counts only `Claimed` + `Running`, so the difference is exactly the materialised-but-unadmitted work), **admission has not progressed** in the window (no `Claimed` transition for the lane: `increase(courier_coderun_phase_transitions_total{to="Claimed"}[window]) == 0`), **and** the oldest reservation is older than the freshness window (`courier_lane_oldest_reservation_age_seconds` ≥ window). Deliberately *not* gated on the lane being `open` (#290 §4.5: `courier_lane_reservations < courier_lane_concurrency`): the fully reserved wedge — concurrency 1, one `Pending` reservation, in-flight 0 — must fire here, and an open-lane gate would reject it (`1 < 1` false) while A2 sees no in-flight run and A1 is paused for capacity. The discriminator against capacity-blocking is `in_flight` vs `concurrency`, not `reservations` vs `concurrency`: work waiting because every slot is genuinely busy is an availability fact (A2's territory), work waiting *while a slot is free* is the wedge |
-| Evidence | `courier_lane_reservations`, `courier_coderuns_in_flight`, `courier_coderun_phase_transitions_total{to="Claimed"}` (admission-progress gate), `courier_lane_oldest_reservation_age_seconds` (gap), `courier_coderuns_pending` (gap; narrows the unadmitted set to `Pending` for display), `courier_lane_concurrency` (gap), `courier_lane_suspended`, `phase.transition` log lines for the affected `run_id`s |
+| Evidence | `courier_lane_reservations`, `courier_coderuns_in_flight`, `courier_coderun_phase_transitions_total{to="Claimed"}` (admission-progress gate), `courier_lane_oldest_reservation_age_seconds`, `courier_coderuns_pending` (narrows the unadmitted set to `Pending` for display), `courier_lane_concurrency`, `courier_lane_suspended`, `phase.transition` log lines for the affected `run_id`s |
 | Window | 15m (operator-tuned; the reservation-freshness window is independent of the 30s poll interval because the failure mode is admission, not discovery) |
 | Threshold rationale | `courier_coderuns_in_flight` excludes `Pending` and the queue-wait histogram only advances on terminalization, so a lane that has materialised work but cannot start any run — at *or below* capacity — looks *idle* on the existing panels. The free-capacity + unadmitted gates (`in_flight < concurrency` **and** `reservations > in_flight`) are what distinguish this failure from every healthy shape: a saturated lane whose reservations are all `Claimed`/`Running` and progressing (no unadmitted work), a 2-slot lane with one 20-minute `Running` task (no unadmitted work), and a genuinely busy lane with a legitimate `Pending` backlog (all slots held, `in_flight == concurrency` — #290 classes capacity-blocked `Pending` as an availability fact, surfaced by A2's rising queue wait, not a page). The age gate carries the duration; the stalled-admission gate carries "no progress" |
 | Caveats | `courier_lane_oldest_reservation_age_seconds` is creation-time age of the oldest reservation across **all** reservation phases: it does **not** reset on admission or any phase transition, and it does not isolate the unadmitted subset. The alert therefore uses it as a duration floor and relies on the free-capacity + unadmitted + stalled-admission gates for precision; a per-phase reservation age is a candidate refinement. A freshly materialised item is normally admitted within one reconcile, so the just-arrived sliver is self-limiting: the first `Claimed` transition clears the predicate. #290's `StaleReservation` now uses the same `in_flight` vs `concurrency` discriminator and the same stalled-admission gate (#290 §4.5/§5, [#318](https://github.com/misospace/courier/issues/318)); the two documents must not diverge on this predicate |
@@ -519,7 +547,7 @@ sum(rate(courier_coderuns_total{phase="Failed"}[1h]))
 # Lane saturation (A2)
 courier_coderuns_in_flight
   / on(lane) group_left()
-max by (lane) (courier_lane_concurrency)   # concurrency exposure is a gap
+max by (lane) (courier_lane_concurrency)
 
 # Scrape errors (A7)
 increase(courier_metrics_scrape_errors_total[10m]) > 0
@@ -653,7 +681,8 @@ These rules make any two renderings equivalent:
   plus `lane` alone on the gauges and `phase` alone on the retention series
   (`courier_coderuns_reap_requests_total` and
   `courier_coderuns_oldest_terminal_age_seconds`, `reapMetricLabels` in
-  `internal/controller/metrics.go:35`), which is the intended budget.
+  `internal/controller/metrics.go:36`), and the discovery family adds only the
+  configured `source` and a closed `reason` — which is the intended budget.
 - **Correlate in logs, not labels.** Per-run correlation (`run_id`) belongs to
   the structured log stream, joined in the dashboard, never promoted to a
   metric dimension.

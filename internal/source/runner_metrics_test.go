@@ -3,6 +3,11 @@ package source
 import (
 	"context"
 	"errors"
+	"fmt"
+	"runtime"
+	"slices"
+	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -111,6 +116,13 @@ func pausedGaugeSamples(t *testing.T, reg *prometheus.Registry, sourceName, lane
 	if err != nil {
 		t.Fatalf("gather: %v", err)
 	}
+	return pausedSamplesFromFamilies(families, sourceName, lane)
+}
+
+// pausedSamplesFromFamilies extracts the paused-gauge samples of one binding
+// from already-gathered families, so a concurrent scraper can assert on a
+// snapshot without gathering the registry a second time.
+func pausedSamplesFromFamilies(families []*dto.MetricFamily, sourceName, lane string) map[string]float64 {
 	samples := map[string]float64{}
 	for _, f := range families {
 		if f.GetName() != "courier_source_discovery_paused" {
@@ -130,6 +142,110 @@ func pausedGaugeSamples(t *testing.T, reg *prometheus.Registry, sourceName, lane
 		}
 	}
 	return samples
+}
+
+// checkPausedInvariant asserts the current-state invariant on one snapshot of
+// the paused gauge: the binding carries one series per reason of the closed
+// vocabulary, every series is 0 or 1, and at most one reason is 1 — a paused
+// binding has exactly one reason at 1, an unpaused one has none. It returns an
+// empty string when the snapshot holds, and the violation otherwise.
+func checkPausedInvariant(samples map[string]float64) string {
+	if len(samples) != len(DiscoveryPauseReasons) {
+		return fmt.Sprintf("paused gauge samples %v, want one series per reason %v", samples, DiscoveryPauseReasons)
+	}
+	sum := 0.0
+	for _, reason := range DiscoveryPauseReasons {
+		value, ok := samples[reason]
+		if !ok {
+			return fmt.Sprintf("paused gauge is missing reason %q: %v", reason, samples)
+		}
+		if value != 0 && value != 1 {
+			return fmt.Sprintf("paused gauge[%s] = %v, want 0 or 1", reason, value)
+		}
+		sum += value
+	}
+	for reason, value := range samples {
+		if value == 1 && !slices.Contains(DiscoveryPauseReasons, reason) {
+			return fmt.Sprintf("paused gauge reason %q is at 1 but outside the closed vocabulary %v", reason, DiscoveryPauseReasons)
+		}
+	}
+	if sum > 1 {
+		return fmt.Sprintf("paused gauge samples sum = %v, want at most one reason at 1: %v", sum, samples)
+	}
+	return ""
+}
+
+// checkPausedSum asserts the binding carries one series per reason of the
+// closed vocabulary and that the reason series sum to exactly want: one while
+// the binding is paused, none while it is not. It returns an empty string when
+// the snapshot holds, and the violation otherwise.
+func checkPausedSum(samples map[string]float64, want float64) string {
+	if len(samples) != len(DiscoveryPauseReasons) {
+		return fmt.Sprintf("paused gauge samples %v, want one series per reason %v", samples, DiscoveryPauseReasons)
+	}
+	sum := 0.0
+	for _, reason := range DiscoveryPauseReasons {
+		value, ok := samples[reason]
+		if !ok {
+			return fmt.Sprintf("paused gauge is missing reason %q: %v", reason, samples)
+		}
+		if value != 0 && value != 1 {
+			return fmt.Sprintf("paused gauge[%s] = %v, want 0 or 1", reason, value)
+		}
+		sum += value
+	}
+	if sum != want {
+		return fmt.Sprintf("paused gauge samples sum = %v, want exactly %v: %v", sum, want, samples)
+	}
+	return ""
+}
+
+// pausedGaugePhase drives one phase of the paused-gauge concurrency test:
+// seed puts the binding into the phase's starting state, every worker then
+// calls apply — which only pauses or only clears the binding — while the
+// scraper gathers the registry. It returns the first invariant violation, or
+// an empty string when every snapshot held.
+func pausedGaugePhase(t *testing.T, reg *prometheus.Registry, sourceName, laneName string, wantSum float64, seed func(), apply func(worker int)) string {
+	t.Helper()
+	seed()
+
+	stop := make(chan struct{})
+	var writers sync.WaitGroup
+	for worker := 0; worker < len(DiscoveryPauseReasons); worker++ {
+		writers.Add(1)
+		go func() {
+			defer writers.Done()
+			for {
+				select {
+				case <-stop:
+					return
+				default:
+				}
+				apply(worker)
+				// Yield, so the scraper samples the binding while the
+				// writers transition it instead of after them.
+				runtime.Gosched()
+			}
+		}()
+	}
+
+	const scrapes = 1000
+	failure := ""
+	for i := 0; i < scrapes && failure == ""; i++ {
+		families, err := reg.Gather()
+		if err != nil {
+			failure = fmt.Sprintf("gather: %v", err)
+			break
+		}
+		samples := pausedSamplesFromFamilies(families, sourceName, laneName)
+		if msg := checkPausedSum(samples, wantSum); msg != "" {
+			failure = msg
+			break
+		}
+	}
+	close(stop)
+	writers.Wait()
+	return failure
 }
 
 // assertExactlyOnePausedReason asserts the current-state invariant: while
@@ -534,5 +650,274 @@ func TestDiscoveryMetricsFreshRegistryStartsAtZero(t *testing.T) {
 	}
 	if v, ok := counterValueIfPresent(t, reg, "courier_source_items_offered_total", map[string]string{"source": "dispatch", "lane": "local"}); !ok || v != 0 {
 		t.Fatalf("offered on a fresh registry = (%v, %v), want (0, true)", v, ok)
+	}
+}
+
+// TestDiscoveryMetricsPausedGaugeConcurrentTransitions pins the paused gauge
+// while one binding flips between pause reasons and the unpaused state.
+//
+// The test runs two sequential phases on one binding. Phase 1 only pauses —
+// rotating over the closed reason vocabulary — so every snapshot must carry
+// exactly one reason at 1 and every reason series must be present. Phase 2
+// only clears, so every snapshot must carry no reason at 1 while the series
+// stay present.
+//
+// The old implementation zeroed the non-active reasons and raised the active
+// one as separate gauge writes, so a scrape between the writes saw every
+// reason at 0: a half-applied transition. Phase 1 catches exactly that — it
+// fails on a snapshot with no reason at 1.
+func TestDiscoveryMetricsPausedGaugeConcurrentTransitions(t *testing.T) {
+	reg := prometheus.NewRegistry()
+	metrics := NewDiscoveryMetrics(reg)
+	const (
+		sourceName = "dispatch"
+		laneName   = "local"
+	)
+
+	// Phase 1: paused. The writers rotate over the reasons of the closed
+	// vocabulary, so the active reason keeps changing under the scraper.
+	if failure := pausedGaugePhase(t, reg, sourceName, laneName, 1,
+		func() { metrics.SetPaused(sourceName, laneName, DiscoveryPauseReasons[0]) },
+		func(worker int) {
+			metrics.SetPaused(sourceName, laneName, DiscoveryPauseReasons[worker%len(DiscoveryPauseReasons)])
+		},
+	); failure != "" {
+		t.Fatalf("paused gauge invariant violated under concurrent pauses: %s", failure)
+	}
+
+	// Phase 2: unpaused. The writers only clear the binding, so every
+	// snapshot must show every reason at 0.
+	if failure := pausedGaugePhase(t, reg, sourceName, laneName, 0,
+		func() { metrics.ClearPaused(sourceName, laneName) },
+		func(int) { metrics.ClearPaused(sourceName, laneName) },
+	); failure != "" {
+		t.Fatalf("paused gauge invariant violated under concurrent clears: %s", failure)
+	}
+}
+
+// TestDiscoveryMetricsPausedGaugeSharedBindingTwoRunners pins the same
+// invariant for two runners bound to one (source, lane) pair: the pair carries
+// a single pause state, so the gauge can never show two reasons at 1 for it.
+func TestDiscoveryMetricsPausedGaugeSharedBindingTwoRunners(t *testing.T) {
+	reg := prometheus.NewRegistry()
+	metrics := NewDiscoveryMetrics(reg)
+	const (
+		sourceName = "dispatch"
+		laneName   = "local"
+	)
+
+	// Two runners on the same binding, in two namespaces: one waits for a
+	// LaneProfile that does not exist there, the other polls a suspended
+	// lane, so the one binding carries two different pause reasons.
+	waiting := NewRunner(newTestClient(t), &testAdapter{}, RunnerConfig{Source: sourceName, LaneProfile: laneName, Namespace: "missing-ns"})
+	waiting.Metrics = metrics
+	suspendedLane := testLane()
+	suspendedLane.Namespace = "suspended-ns"
+	suspendedLane.Annotations = map[string]string{courierv1alpha1.SuspendAnnotation: "true"}
+	suspended := NewRunner(newTestClient(t, suspendedLane), &testAdapter{}, RunnerConfig{Source: sourceName, LaneProfile: laneName, Namespace: "suspended-ns"})
+	suspended.Metrics = metrics
+	runners := []*Runner{waiting, suspended}
+
+	// Seed the binding, so its series exist before the scraper starts.
+	for _, runner := range runners {
+		if err := runner.Poll(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	violation := make(chan string, 1)
+	done := make(chan struct{})
+	scraped := make(chan struct{})
+	go func() {
+		defer close(scraped)
+		for {
+			select {
+			case <-done:
+				return
+			default:
+			}
+			families, err := reg.Gather()
+			if err != nil {
+				select {
+				case violation <- fmt.Sprintf("gather: %v", err):
+				default:
+				}
+				return
+			}
+			samples := pausedSamplesFromFamilies(families, sourceName, laneName)
+			if msg := checkPausedInvariant(samples); msg != "" {
+				select {
+				case violation <- msg:
+				default:
+				}
+				return
+			}
+		}
+	}()
+
+	const rounds = 300
+	for round := 0; round < rounds; round++ {
+		var polls sync.WaitGroup
+		for _, runner := range runners {
+			polls.Add(1)
+			go func(runner *Runner) {
+				defer polls.Done()
+				if err := runner.Poll(context.Background()); err != nil {
+					t.Errorf("poll: %v", err)
+				}
+			}(runner)
+		}
+		polls.Wait()
+	}
+	close(done)
+	<-scraped
+
+	select {
+	case msg := <-violation:
+		t.Fatalf("paused gauge invariant violated for a shared binding: %s", msg)
+	default:
+	}
+	// The settled state of the shared binding is a single reason at 1.
+	samples := pausedGaugeSamples(t, reg, sourceName, laneName)
+	sum := 0.0
+	for _, value := range samples {
+		sum += value
+	}
+	if sum > 1 {
+		t.Fatalf("paused gauge samples %v sum to %v, want at most one reason at 1", samples, sum)
+	}
+}
+
+// discoveryLabelSets pins the label keys every discovery family carries. The
+// binding families carry source and lane; the per-reason families carry
+// source, lane, and reason. Nothing else may appear on them.
+var discoveryLabelSets = map[string][]string{
+	"courier_source_discovery_attempts_total":       {"source", "lane"},
+	"courier_source_discovery_successes_total":      {"source", "lane"},
+	"courier_source_discovery_failures_total":       {"source", "lane"},
+	"courier_source_items_offered_total":            {"source", "lane"},
+	"courier_source_items_materialized_total":       {"source", "lane"},
+	"courier_source_last_attempt_timestamp_seconds": {"source", "lane"},
+	"courier_source_last_success_timestamp_seconds": {"source", "lane"},
+	"courier_source_discovery_skipped_total":        {"source", "lane", "reason"},
+	"courier_source_discovery_paused_total":         {"source", "lane", "reason"},
+	"courier_source_discovery_paused":               {"source", "lane", "reason"},
+}
+
+// discoveryReasonVocabularies pins the closed vocabulary of every reason
+// label the discovery layer emits.
+var discoveryReasonVocabularies = map[string][]string{
+	"courier_source_discovery_skipped_total": DiscoverySkipReasons,
+	"courier_source_discovery_paused_total":  DiscoveryPauseReasons,
+	"courier_source_discovery_paused":        DiscoveryPauseReasons,
+}
+
+// assertDiscoveryLabelVocabulary pins the label vocabulary of the discovery
+// layer: every courier_source_* family carries exactly its documented label
+// keys, the source and lane labels name the binding the runner was built
+// with, and every reason label is a member of that family's closed
+// vocabulary.
+func assertDiscoveryLabelVocabulary(t *testing.T, families []*dto.MetricFamily, sourceName, lane string) {
+	t.Helper()
+	seen := 0
+	for _, f := range families {
+		name := f.GetName()
+		if !strings.HasPrefix(name, "courier_source_") {
+			continue
+		}
+		wantKeys, ok := discoveryLabelSets[name]
+		if !ok {
+			t.Fatalf("discovery family %q is not part of the documented signal set", name)
+		}
+		vocabulary, hasReason := discoveryReasonVocabularies[name]
+		for _, m := range f.GetMetric() {
+			seen++
+			labels := map[string]string{}
+			for _, lp := range m.GetLabel() {
+				if _, duplicate := labels[lp.GetName()]; duplicate {
+					t.Fatalf("family %q repeats label %q", name, lp.GetName())
+				}
+				labels[lp.GetName()] = lp.GetValue()
+			}
+			if len(labels) != len(wantKeys) {
+				t.Fatalf("family %q carries labels %v, want exactly %v", name, labels, wantKeys)
+			}
+			for _, key := range wantKeys {
+				if _, ok := labels[key]; !ok {
+					t.Fatalf("family %q is missing label %q: %v", name, key, labels)
+				}
+			}
+			if labels["source"] != sourceName {
+				t.Fatalf("family %q source label = %q, want %q", name, labels["source"], sourceName)
+			}
+			if labels["lane"] != lane {
+				t.Fatalf("family %q lane label = %q, want %q", name, labels["lane"], lane)
+			}
+			if hasReason && !slices.Contains(vocabulary, labels["reason"]) {
+				t.Fatalf("family %q reason label = %q, want a member of %v", name, labels["reason"], vocabulary)
+			}
+		}
+	}
+	if seen == 0 {
+		t.Fatal("no discovery metrics gathered, want the discovery families")
+	}
+}
+
+// TestDiscoveryMetricsLabelVocabulary pins the label vocabulary of the
+// discovery layer: the source and lane labels name the binding the runner
+// was built with, and every reason label is a member of its closed
+// vocabulary.
+func TestDiscoveryMetricsLabelVocabulary(t *testing.T) {
+	reg := prometheus.NewRegistry()
+	metrics := NewDiscoveryMetrics(reg)
+	const (
+		sourceName = "dispatch"
+		laneName   = "local"
+	)
+
+	// A successful poll with a skipped item: exercises the binding families
+	// and the skip-reason vocabulary.
+	adapter := &testAdapter{items: []WorkItem{
+		{ID: "", Mode: "resolve-issue", Repo: "acme/widgets", Ref: 1},
+		{ID: "unsupported", Mode: "unknown", Repo: "acme/widgets", Ref: 1},
+		{ID: "invalid-ref", Mode: "resolve-issue", Repo: "", Ref: 0},
+		{ID: "opaque-a", Mode: "resolve-issue", Repo: "acme/widgets", Ref: 1},
+	}}
+	runner := NewRunner(newTestClient(t, testLane()), adapter, RunnerConfig{Source: sourceName, LaneProfile: laneName, Namespace: "courier"})
+	runner.Metrics = metrics
+	runner.Now = func() time.Time { return metricsClock }
+	if err := runner.Poll(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	// A failing poll: exercises the failure family.
+	failing := NewRunner(newTestClient(t, testLane()), &testAdapter{err: errors.New("upstream failure")}, RunnerConfig{Source: sourceName, LaneProfile: laneName, Namespace: "courier"})
+	failing.Metrics = metrics
+	failing.Now = func() time.Time { return metricsClock }
+	if err := failing.Poll(context.Background()); err == nil {
+		t.Fatal("failing poll returned no error")
+	}
+
+	// A paused poll: exercises the paused families.
+	paused := NewRunner(newTestClient(t), &testAdapter{}, RunnerConfig{Source: sourceName, LaneProfile: laneName, Namespace: "courier"})
+	paused.Metrics = metrics
+	paused.Now = func() time.Time { return metricsClock }
+	if err := paused.Poll(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	families := gatherFamilies(t, reg)
+	assertDiscoveryLabelVocabulary(t, families, sourceName, laneName)
+
+	// Every documented family was gathered, so the vocabulary check above
+	// covered the whole discovery layer and not just part of it.
+	gathered := map[string]bool{}
+	for _, f := range families {
+		gathered[f.GetName()] = true
+	}
+	for name := range discoveryLabelSets {
+		if !gathered[name] {
+			t.Fatalf("family %q absent from the registry, want it gathered", name)
+		}
 	}
 }
