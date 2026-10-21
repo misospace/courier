@@ -648,6 +648,47 @@ func TestPhaseDurationObservedOnLeavingPhase(t *testing.T) {
 	}
 }
 
+// TestPhaseDurationPinsVerifyingAgainstStartedAt covers the issue-324
+// acceptance regression: a run waits in Verifying and merges after a timed
+// AwaitingReview interval. The Verifying histogram sample must be
+// now−PhaseEnteredAt, never now−StartedAt (the executor may have started
+// long before verification began), and the AwaitingReview interval must be
+// measured from the marker restamped at the Verifying→AwaitingReview write.
+func TestPhaseDurationPinsVerifyingAgainstStartedAt(t *testing.T) {
+	run := admissionRun("run", "local", courierv1alpha1.PhaseVerifying)
+	run.Status.StartedAt = &metav1.Time{Time: timestampClock.Add(-30 * time.Minute)}
+	run.Status.PhaseEnteredAt = &metav1.Time{Time: timestampClock.Add(-10 * time.Minute)}
+	client := phaseClient(t, run)
+	r, registry := patchReconciler(t, client, timestampClock)
+	ctx := context.Background()
+
+	// Verification passes; the run parks in AwaitingReview.
+	before := run.DeepCopy()
+	run.Status.Phase = courierv1alpha1.PhaseAwaitingReview
+	if err := r.patchStatus(ctx, before, run); err != nil {
+		t.Fatalf("patchStatus(AwaitingReview): %v", err)
+	}
+	if count, sum := histogramSample(t, registry, "courier_coderun_phase_duration_seconds", map[string]string{
+		"lane": "local", "mode": "resolve-issue", "phase": "Verifying",
+	}); count != 1 || sum != 600 {
+		t.Fatalf("Verifying duration = (count %d, sum %v), want (1, 600); now−StartedAt would be 1800", count, sum)
+	}
+
+	// The merge lands after a timed AwaitingReview interval.
+	r2 := timestampReconciler(client, timestampClock.Add(5*time.Minute))
+	r2.Metrics = r.Metrics
+	before = run.DeepCopy()
+	run.Status.Phase = courierv1alpha1.PhaseDone
+	if err := r2.patchStatus(ctx, before, run); err != nil {
+		t.Fatalf("patchStatus(Done): %v", err)
+	}
+	if count, sum := histogramSample(t, registry, "courier_coderun_phase_duration_seconds", map[string]string{
+		"lane": "local", "mode": "resolve-issue", "phase": "AwaitingReview",
+	}); count != 1 || sum != 300 {
+		t.Fatalf("AwaitingReview duration = (count %d, sum %v), want (1, 300)", count, sum)
+	}
+}
+
 func gaugeCounterNamed(t *testing.T, reg *prometheus.Registry, name string, labels map[string]string) float64 {
 	t.Helper()
 	m := gatherMetric(t, reg, name, labels)
