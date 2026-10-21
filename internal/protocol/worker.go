@@ -123,7 +123,6 @@ const WorkspaceSnapshotName = "snapshot.pack"
 type operation struct {
 	envelope Envelope
 	cancel   context.CancelFunc
-	cmd      *exec.Cmd
 	wait     chan struct{}
 	result   *Result
 }

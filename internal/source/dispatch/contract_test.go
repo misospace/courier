@@ -265,15 +265,6 @@ func sortedOutcomeKeys(m map[string]struct{}) []string {
 	return keys
 }
 
-func sortedGapKeys(m map[string]string) []string {
-	keys := make([]string, 0, len(m))
-	for k := range m {
-		keys = append(keys, k)
-	}
-	sort.Strings(keys)
-	return keys
-}
-
 func encodeWorkIDForTaskType(t *testing.T, taskType string) string {
 	t.Helper()
 	switch taskType {

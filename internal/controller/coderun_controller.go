@@ -1424,13 +1424,6 @@ func (r *CoderRunReconciler) setLifecycleReport(run *courierv1alpha1.CoderRun, p
 	})
 }
 
-// markLifecycleReported records whether the terminal lifecycle report for the
-// run's current phase has been published. Published means done or intentionally
-// dropped (superseded); False means a later reconcile must retry it.
-func (r *CoderRunReconciler) markLifecycleReported(ctx context.Context, run *courierv1alpha1.CoderRun, published bool, reason, message string) error {
-	return r.markLifecycleReportOutcome(ctx, run, published, reason, message, "", "")
-}
-
 func (r *CoderRunReconciler) markLifecycleReportOutcome(ctx context.Context, run *courierv1alpha1.CoderRun, published bool, reason, message, retryToken, supportReason string) error {
 	before := run.DeepCopy()
 	if reason != lifecycleReportUnsupportedOutcomeReason {

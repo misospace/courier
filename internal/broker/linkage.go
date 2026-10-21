@@ -86,19 +86,6 @@ type LinkageObservation struct {
 // closing-keyword reference at all.
 var ErrLinkageMissing = errors.New("publication denied: pull request body has no supported closing-keyword reference to the source issue")
 
-// closingKeywordPattern matches a supported closing keyword as a
-// word-bounded token. The vocabulary mirrors GitHub's documented
-// supported set: close, closes, closed, fix, fixes, fixed, resolve,
-// resolves, resolved. The case-insensitive flag lets the body write the
-// keyword in any case; the word boundary is the only thing that
-// protects against "discloses" / "refixes" substring matches.
-//
-// The leading word boundary keeps a preceding token (e.g. an attribute
-// name "auto-closes:") from accidentally making "closes" a closing
-// reference; the trailing one keeps a following alnum run (e.g.
-// "closes-door") from forming a fake one.
-var closingKeywordPattern = regexp.MustCompile(`(?i)\b(close|closes|closed|fix|fixes|fixed|resolve|resolves|resolved)\b`)
-
 // bareClosingReferencePattern matches the simple form
 // "<keyword> #<number>". The # must be the only thing between the
 // keyword and the digits; the digits must be a non-empty positive

@@ -107,12 +107,6 @@ func compactBudget(t *testing.T, limit int) ContextBudget {
 	return budget
 }
 
-// fixedMessage is a message with a predictable token cost: role (4 chars for
-// "user"/"tool"), a content run of chars/4 tokens, and no tool calls.
-func fixedMessage(role string, tokens int) Message {
-	return Message{Role: role, Content: strings.Repeat("x", tokens*tokensPerChar)}
-}
-
 // appendTurns grows the transcript by n assistant/tool turn pairs of a
 // predictable cost. The pairs are appended in order so the last one is the
 // session's most recent turn.

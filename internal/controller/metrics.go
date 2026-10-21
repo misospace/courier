@@ -43,24 +43,6 @@ var (
 )
 
 var (
-	runDurationDesc = prometheus.NewDesc(
-		"courier_coderun_run_duration_seconds",
-		"Duration of a CoderRun from StartedAt to FinishedAt, by lane, mode, and terminal phase.",
-		terminalMetricLabels,
-		nil,
-	)
-	queueWaitDesc = prometheus.NewDesc(
-		"courier_coderun_queue_wait_seconds",
-		"Time a CoderRun spent waiting for admission, from creation to AdmittedAt, by lane, mode, and terminal phase.",
-		terminalMetricLabels,
-		nil,
-	)
-	runsTotalDesc = prometheus.NewDesc(
-		"courier_coderuns_total",
-		"Total CoderRuns that reached a terminal phase, by lane, mode, and terminal phase.",
-		terminalMetricLabels,
-		nil,
-	)
 	inFlightDesc = prometheus.NewDesc(
 		"courier_coderuns_in_flight",
 		"CoderRuns per lane that currently consume the lane's admission capacity.",

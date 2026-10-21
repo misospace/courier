@@ -67,19 +67,6 @@ func dispatchEnvelope(now time.Time) Envelope {
 	return env
 }
 
-func signedBody(t *testing.T, key ed25519.PrivateKey, env Envelope, payload []byte) []byte {
-	t.Helper()
-	signature, err := env.Sign(key)
-	if err != nil {
-		t.Fatal(err)
-	}
-	body, err := json.Marshal(signedRequest{Envelope: env, Signature: signature, Payload: payload})
-	if err != nil {
-		t.Fatal(err)
-	}
-	return body
-}
-
 func TestEnvelopeSignVerifyAndTamper(t *testing.T) {
 	env := dispatchEnvelope(time.Now())
 	payload := []byte(`{"command":["true"]}`)

@@ -507,11 +507,6 @@ func (c *Client) GetChecks(ctx context.Context, owner, repo, ref string) (CheckR
 	return c.GetCheckRuns(ctx, owner, repo, ref)
 }
 
-// ReadChecks is a short alias for GetCheckRuns.
-func (c *Client) ReadChecks(ctx context.Context, owner, repo, ref string) (CheckRuns, error) {
-	return c.GetCheckRuns(ctx, owner, repo, ref)
-}
-
 func repoEndpoint(owner, repo string, parts ...string) string {
 	all := []string{"repos", owner, repo}
 	all = append(all, parts...)
@@ -519,10 +514,6 @@ func repoEndpoint(owner, repo string, parts ...string) string {
 		all[i] = url.PathEscape(all[i])
 	}
 	return strings.Join(all, "/")
-}
-
-func (c *Client) endpoint(relative string) *url.URL {
-	return c.endpointWithQuery(relative, "")
 }
 
 func (c *Client) endpointWithQuery(relative, query string) *url.URL {
