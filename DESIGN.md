@@ -1559,8 +1559,21 @@ read live at scrape time (`internal/controller/metrics.go`) — and the phase,
 execution-outcome, lifecycle-report, and retention additions of §3.4–§3.7.
 #291 owns the connector diagnostics and #292 the views and alerts that consume
 these signals; the thresholds and windows are design candidates, not defaults.
-The dashboards and the alert rules themselves remain unimplemented design, and
-nothing here authorizes them.
+
+The portable rendering of that specification ships in-repo under
+[observability/](./observability/README.md): a Prometheus/VictoriaMetrics
+alert-rule file (`observability/rules/courier-alerts.yml`, catalogue A1–A8) and
+a standalone Grafana dashboard (`observability/dashboards/courier-overview.json`,
+sections 3.1–3.5), both strictly optional — Courier never depends on Grafana,
+Alertmanager, or Dispatch, and no chart or manifest wires them in. The OTel
+path stays transport-plus-named-evaluator (Prometheus server, `vmalert`, or a
+Mimir ruler); OTLP with no evaluator cannot evaluate the alert catalogue. The
+connector panels and alert A9 remain unimplemented until #291's connector
+diagnostic signals exist. `go test ./observability/` exercises the shipped
+expressions across fire/recover scenarios with a real PromQL engine and pins
+both assets against accidental edits; every
+expression may reference only metrics the operator's collectors actually
+register, within the bounded label budget.
 
 **Connector diagnostics without core coupling (#291).**
 [docs/connector-diagnostics.md](./docs/connector-diagnostics.md) specifies

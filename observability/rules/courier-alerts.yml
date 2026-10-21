@@ -1,0 +1,193 @@
+# Courier portable alert rules (docs/observability-dashboards-and-alerts.md section 4, A1-A8).
+# Prometheus / VictoriaMetrics compatible. Thresholds and windows are starting
+# points an operator tunes; severities are advisory. A9 (connector) is not
+# implemented: connector diagnostics signals do not exist yet (#291).
+groups:
+  - name: courier
+    interval: 30s
+    rules:
+      - alert: CourierSourceDiscoveryFailing
+        expr: |
+          (
+            (
+              (increase(courier_source_discovery_failures_total[90s]) > 0)
+              and
+              ((time() - courier_source_last_success_timestamp_seconds) > 90)
+            )
+            or
+            (
+              (increase(courier_source_discovery_failures_total[300s]) > 0)
+              unless on(source, lane) courier_source_last_success_timestamp_seconds
+            )
+          )
+          and on(source, lane) (max by (source, lane) (courier_source_discovery_paused) == 0)
+          and on(lane) (courier_lane_reservations < courier_lane_concurrency)
+          and on(lane) (courier_lane_suspended == 0)
+        for: 90s
+        labels:
+          severity: warning
+        annotations:
+          summary: Discovery failing for enabled source {{ $labels.source }} on lane {{ $labels.lane }} with free capacity
+          description: >-
+            Discovery for source {{ $labels.source }} on lane {{ $labels.lane }} is failing
+            with no success in the evidence window while the binding is enabled, not paused,
+            and the lane has free capacity. Evidence: courier_source_discovery_failures_total,
+            courier_source_last_success_timestamp_seconds, courier_source_discovery_paused,
+            courier_lane_reservations, courier_lane_concurrency, courier_lane_suspended.
+            Encoding: the failure evidence window is 90s (3x the 30s poll). A binding that
+            has ever succeeded fires when failures rose in the last 90s and
+            courier_source_last_success_timestamp_seconds is older than 90s. A binding that
+            has never succeeded fires when failures rose in the last 300s and no success
+            timestamp exists; the 300s failure window is the computable stand-in for the
+            10x-poll startup grace because no first-attempt timestamp exists, and it also
+            self-suppresses until at least one attempt is recorded and keeps an all-failing
+            source alerting instead of staying silent forever. A paused binding
+            (courier_source_discovery_paused non-zero for any reason), a lane without free
+            capacity, or a suspended lane does not fire. Disabled sources emit no series and
+            thus cannot fire. Recovery: any success inside the window refreshing
+            courier_source_last_success_timestamp_seconds, the binding pausing, or the lane
+            losing free capacity.
+      - alert: CourierLaneSaturatedQueueWaitRising
+        expr: |
+          (
+            courier_coderuns_in_flight >= courier_lane_concurrency
+            and on(lane) (courier_lane_suspended == 0)
+            and on(lane) (
+              (sum by (lane) (rate(courier_coderun_queue_wait_seconds_sum[10m])) / sum by (lane) (rate(courier_coderun_queue_wait_seconds_count[10m])))
+              > on(lane)
+              (sum by (lane) (rate(courier_coderun_queue_wait_seconds_sum[10m] offset 10m)) / sum by (lane) (rate(courier_coderun_queue_wait_seconds_count[10m] offset 10m)))
+            )
+          )
+        for: 15m
+        labels:
+          severity: info
+        annotations:
+          summary: Lane {{ $labels.lane }} is saturated and queue wait is rising
+          description: >-
+            Lane {{ $labels.lane }} is at its concurrency limit and the mean queue wait over
+            the recent 10m exceeds the previous 10m. Evidence: courier_coderuns_in_flight,
+            courier_lane_concurrency, courier_lane_suspended,
+            courier_coderun_queue_wait_seconds_sum, courier_coderun_queue_wait_seconds_count.
+            Saturation alone is a supply condition, not a failure; the rising-wait comparison
+            is the discriminator. If wait samples are absent the comparison is empty and the
+            alert does not fire: it is suppressed rather than inferred. A suspended lane does
+            not fire (no admissions are expected). Info severity: confirm the lane is
+            intentionally sized; not a page.
+      - alert: CourierLaneReservationWedge
+        expr: |
+          (courier_lane_suspended == 0)
+          and on(lane) (courier_coderuns_in_flight < courier_lane_concurrency)
+          and on(lane) (courier_lane_reservations > courier_coderuns_in_flight)
+          and on(lane) (((sum by (lane) (increase(courier_coderun_phase_transitions_total{to="Claimed"}[15m]))) or on(lane) (0 * courier_lane_reservations)) == 0)
+          and on(lane) (courier_lane_oldest_reservation_age_seconds >= 900)
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: Lane {{ $labels.lane }} has unadmitted reservations wedged while capacity is free
+          description: >-
+            Lane {{ $labels.lane }} holds materialised-but-unadmitted work while a slot is
+            free and no admission (Claimed transition) has progressed in the window.
+            Evidence: courier_lane_reservations, courier_coderuns_in_flight,
+            courier_lane_concurrency, courier_coderun_phase_transitions_total{to="Claimed"},
+            courier_lane_oldest_reservation_age_seconds, courier_lane_suspended. The age
+            gauge does not reset on admission; the free-capacity, unadmitted, and
+            stalled-admission gates are the discriminators against healthy saturation, and
+            the age gate only carries the duration. The
+            or on(lane) (0 * courier_lane_reservations) fallback is required: a lane whose
+            only reservations were never admitted has no Claimed-transition series at all,
+            and increase() of an absent series is empty, not zero, so the fully reserved
+            wedge (concurrency 1, one Pending reservation, in-flight 0) could never fire
+            without it. Recovery: the backlog draining to in-flight, a Claimed transition in
+            the window, the lane suspending, or the reservation terminating.
+      - alert: CourierRunFailureRateElevated
+        expr: |
+          (
+            sum by (lane, mode) (increase(courier_coderuns_total{phase="Failed"}[1h]))
+            / sum by (lane, mode) (increase(courier_coderuns_total[1h]))
+          ) > 0.5
+          and on(lane, mode) (
+            sum by (lane, mode) (increase(courier_coderuns_total{phase="Failed"}[1h])) >= 3
+          )
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: Elevated run failure rate on lane {{ $labels.lane }} mode {{ $labels.mode }}
+          description: >-
+            More than half of the terminal runs on lane {{ $labels.lane }} mode
+            {{ $labels.mode }} in the last hour failed. Evidence: courier_coderuns_total.
+            The phase label is the run's FIRST terminal phase; merge disposition is
+            deliberately not represented here. Zero terminal runs over the window yields a
+            0/0 NaN ratio which never fires: low traffic is not failure. The absolute floor
+            (at least 3 failures) keeps a single failure in a handful of runs from paging.
+            Inspect the terminal diagnostic mix (CourierTerminalDiagnosticConcentration) and
+            recent run.exit events for a common cause.
+      - alert: CourierLifecycleReportsStuck
+        expr: |
+          (courier_coderuns_lifecycle_pending > 0)
+          and on(lane) (courier_coderuns_lifecycle_pending_oldest_age_seconds > 1800)
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: Lifecycle reports not settling on lane {{ $labels.lane }}
+          description: >-
+            Terminal runs on lane {{ $labels.lane }} have had an unsettled lifecycle report
+            for over 30 minutes. Evidence: courier_coderuns_lifecycle_pending,
+            courier_coderuns_lifecycle_pending_oldest_age_seconds. The 15m sustained window
+            plus the 30m age floor is the retry-cadence-plus-headroom floor: reports
+            legitimately retry, so a report still unsettled well past it indicates a broken
+            source contract or credentials. The pending gauge mirrors the reaper's hold
+            gate, so this backlog also delays reaping of the retained runs. Inspect the
+            source report path and the LifecycleReported reason.
+      - alert: CourierTerminalDiagnosticConcentration
+        expr: |
+          increase(courier_coderun_terminal_diagnostics_total{category!="unknown"}[1h]) > 5
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: Terminal diagnostic category {{ $labels.category }} spiking on lane {{ $labels.lane }}
+          description: >-
+            More than 5 terminal runs on lane {{ $labels.lane }} in the last hour carry
+            diagnostic category {{ $labels.category }}. Evidence:
+            courier_coderun_terminal_diagnostics_total. A category spike points at one cause
+            (infrastructure for kubernetes-failure, provider/transport for
+            model-transport-error) faster than a flat failure rate does. Absent diagnostics
+            are category "unknown" and are deliberately excluded: unknown is not a known
+            category. Act per category.
+      - alert: CourierMetricsScrapeErrors
+        expr: |
+          increase(courier_metrics_scrape_errors_total[10m]) > 0
+          or increase(courier_terminal_age_scrape_errors_total[10m]) > 0
+          or increase(courier_terminal_backlog_scrape_errors_total[10m]) > 0
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: Courier internal metric collection is failing
+          description: >-
+            A Courier List call failed during internal metric collection, so the lane and
+            backlog gauges are stale. Evidence: courier_metrics_scrape_errors_total,
+            courier_terminal_age_scrape_errors_total,
+            courier_terminal_backlog_scrape_errors_total. Even a low rate is worth
+            surfacing because it silently degrades lane capacity and retention views.
+            Inspect the operator's RBAC and API server reachability for LaneProfile and
+            CoderRun list calls.
+      - alert: CourierControllerDown
+        expr: |
+          (max by (job) (up{job=~".*courier.*"}) == 0)
+          or absent(up{job=~".*courier.*"})
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: Courier controller metrics target is down
+          description: >-
+            The Courier metrics target is unscrapable: no up series matches, or every
+            matching target reports 0. Evidence: up. The job regex matcher is the ONE
+            deployment-specific knob in this rule file: adjust the job matcher to your
+            scrape configuration. A target that has never been up is a deployment problem,
+            not a false positive; without the controller nothing else is observed. Inspect
+            the operator deployment and pod.
