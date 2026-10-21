@@ -9,7 +9,7 @@
 ARG BINARIES=builder
 
 # Build the manager and executor binaries.
-FROM golang:1.27.3@sha256:957861185dbf29d93668ace41e011d091c6e779953d47f0316ef2cc58e28fe2b AS builder
+FROM golang:1.27.3@sha256:f24164268fc1e741bbdc0066dbadcf1c8426c5a8489f0729c02c3905a53032fd AS builder
 ARG TARGETOS
 ARG TARGETARCH
 
@@ -41,7 +41,7 @@ COPY dist/ /workspace/
 
 FROM binaries-${BINARIES} AS binaries
 
-FROM golang:1.27.3@sha256:957861185dbf29d93668ace41e011d091c6e779953d47f0316ef2cc58e28fe2b AS toolchain
+FROM golang:1.27.3@sha256:f24164268fc1e741bbdc0066dbadcf1c8426c5a8489f0729c02c3905a53032fd AS toolchain
 ARG CONTROLLER_TOOLS_VERSION=v0.16.5
 ARG HELM_VERSION=v3.18.6
 
@@ -54,7 +54,7 @@ RUN --mount=type=cache,target=/go/pkg/mod \
 # Coordinator image: the bootstrap OpenCode runtime. The executor contract
 # (BOOTSTRAP.md) requires courier-executor, git, and opencode in one image.
 # Debian (not alpine) because the opencode npm package ships glibc binaries.
-FROM node:24-bookworm-slim@sha256:a5f4366e834695d5f363b920c104953a535d3a9864d1bdf74566a0ebe01daee5 AS coordinator
+FROM node:24-bookworm-slim@sha256:8cabefbd444809cf0e319b5831c65da1ea202200ca552a5e75fd7938a6f86658 AS coordinator
 ARG OPENCODE_VERSION=1.18.31
 
 RUN set -eux; \
@@ -139,7 +139,7 @@ USER 65532:65532
 # Manager image: distroless, manager binary only. Kept last so a bare
 # `docker build .` produces the operator image; build paths still pass
 # --target explicitly.
-FROM gcr.io/distroless/static:nonroot@sha256:516757106de35205efb70b91ba03f6f1298424a0678c603255cf2852a7000087 AS manager
+FROM gcr.io/distroless/static:nonroot@sha256:d62067879de890a1def9da0e7766b7d20810a5e5555cef8506b752437d7a3e88 AS manager
 WORKDIR /
 COPY --from=binaries /workspace/manager .
 USER 65532:65532
