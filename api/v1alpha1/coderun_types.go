@@ -562,6 +562,12 @@ type CoderRunStatus struct {
 	// +optional
 	FinishedAt *metav1.Time `json:"finishedAt,omitempty"`
 
+	// PhaseEnteredAt is when the run most recently entered its current phase.
+	// It is replaceable, not set-once: it is restamped on every phase change,
+	// so phase-age observability can measure time in the current phase.
+	// +optional
+	PhaseEnteredAt *metav1.Time `json:"phaseEnteredAt,omitempty"`
+
 	// WaitDuration is the human-readable time between creation and StartedAt,
 	// in Go duration format (e.g. "3m5s"). Written once when StartedAt is
 	// recorded.

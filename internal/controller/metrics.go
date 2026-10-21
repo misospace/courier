@@ -31,9 +31,15 @@ var queueWaitBuckets = []float64{
 // The label sets are shared between the metric constructors and the
 // cardinality guard test so both reference one source of truth.
 var (
-	terminalMetricLabels = []string{"lane", "mode", "phase"}
-	laneMetricLabels     = []string{"lane"}
-	reapMetricLabels     = []string{"phase"}
+	terminalMetricLabels     = []string{"lane", "mode", "phase"}
+	laneMetricLabels         = []string{"lane"}
+	reapMetricLabels         = []string{"phase"}
+	transitionMetricLabels   = []string{"lane", "mode", "from", "to"}
+	laneModeMetricLabels     = []string{"lane", "mode"}
+	diagnosticMetricLabels   = []string{"lane", "mode", "category"}
+	verificationMetricLabels = []string{"lane", "mode", "result"}
+	tokenMetricLabels        = []string{"lane", "mode", "kind"}
+	lifecycleMetricLabels    = []string{"source", "lane", "mode", "result"}
 )
 
 var (
@@ -97,6 +103,24 @@ var (
 		laneMetricLabels,
 		nil,
 	)
+	awaitingReapDesc = prometheus.NewDesc(
+		"courier_coderuns_awaiting_reap",
+		"Terminal CoderRuns retained and not yet reaped, by terminal phase.",
+		reapMetricLabels,
+		nil,
+	)
+	lifecyclePendingDesc = prometheus.NewDesc(
+		"courier_coderuns_lifecycle_pending",
+		"Terminal CoderRuns whose lifecycle report has not settled, by lane.",
+		laneMetricLabels,
+		nil,
+	)
+	lifecyclePendingOldestDesc = prometheus.NewDesc(
+		"courier_coderuns_lifecycle_pending_oldest_age_seconds",
+		"Age of the oldest terminal CoderRun with an unsettled lifecycle report, from FinishedAt, by lane.",
+		laneMetricLabels,
+		nil,
+	)
 )
 
 // RunRecorder observes CoderRuns as they reach their terminal phase. The
@@ -104,10 +128,17 @@ var (
 // default bound to the controller-runtime metrics registry is used when a
 // reconciler has no explicit recorder (see CoderRunReconciler.metrics).
 type RunRecorder struct {
-	RunDuration  *prometheus.HistogramVec
-	QueueWait    *prometheus.HistogramVec
-	Total        *prometheus.CounterVec
-	ReapRequests *prometheus.CounterVec
+	RunDuration             *prometheus.HistogramVec
+	QueueWait               *prometheus.HistogramVec
+	Total                   *prometheus.CounterVec
+	ReapRequests            *prometheus.CounterVec
+	PhaseTransitions        *prometheus.CounterVec
+	PhaseDuration           *prometheus.HistogramVec
+	TerminalDiagnostics     *prometheus.CounterVec
+	InfraRestarts           *prometheus.CounterVec
+	VerificationOutcomes    *prometheus.CounterVec
+	Tokens                  *prometheus.CounterVec
+	LifecycleReportOutcomes *prometheus.CounterVec
 }
 
 func NewRunRecorder(reg prometheus.Registerer) *RunRecorder {
@@ -130,8 +161,40 @@ func NewRunRecorder(reg prometheus.Registerer) *RunRecorder {
 			Name: "courier_coderuns_reap_requests_total",
 			Help: "Terminal CoderRun deletions requested by the retention reaper, by terminal phase. The API server accepts a request even while a finalizer still holds the object; courier_coderuns_oldest_terminal_age_seconds shows what is actually retained.",
 		}, reapMetricLabels),
+		PhaseTransitions: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "courier_coderun_phase_transitions_total",
+			Help: "Observed CoderRun phase changes, by lane, mode, and the from/to phases.",
+		}, transitionMetricLabels),
+		PhaseDuration: prometheus.NewHistogramVec(prometheus.HistogramOpts{
+			Name:    "courier_coderun_phase_duration_seconds",
+			Help:    "Time a CoderRun spent in a phase, observed once on leaving it, by lane, mode, and phase.",
+			Buckets: runDurationBuckets,
+		}, terminalMetricLabels),
+		TerminalDiagnostics: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "courier_coderun_terminal_diagnostics_total",
+			Help: "Terminal CoderRuns by their durable terminal diagnostic category, or unknown when none was recorded.",
+		}, diagnosticMetricLabels),
+		InfraRestarts: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "courier_coderun_infra_restarts_total",
+			Help: "Coordinator infra relaunches charged to CoderRuns, by lane and mode.",
+		}, laneModeMetricLabels),
+		VerificationOutcomes: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "courier_coderun_verification_outcomes_total",
+			Help: "External verification dispositions observed on Verifying exits, by lane, mode, and result (green, red, unobservable).",
+		}, verificationMetricLabels),
+		Tokens: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "courier_coderun_tokens_total",
+			Help: "Aggregate CoderRun token usage from RunTelemetry, by lane, mode, and kind (input, output, reasoning, cache-read, cache-write).",
+		}, tokenMetricLabels),
+		LifecycleReportOutcomes: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "courier_source_lifecycle_report_outcomes_total",
+			Help: "Terminal source lifecycle report attempt outcomes, by source, lane, mode, and result (published, superseded, unsupported, retryable).",
+		}, lifecycleMetricLabels),
 	}
-	reg.MustRegister(rec.RunDuration, rec.QueueWait, rec.Total, rec.ReapRequests)
+	reg.MustRegister(rec.RunDuration, rec.QueueWait, rec.Total, rec.ReapRequests,
+		rec.PhaseTransitions, rec.PhaseDuration, rec.TerminalDiagnostics,
+		rec.InfraRestarts, rec.VerificationOutcomes, rec.Tokens,
+		rec.LifecycleReportOutcomes)
 	return rec
 }
 
@@ -189,6 +252,122 @@ func (r *RunRecorder) ObserveReapRequest(phase courierv1alpha1.Phase) {
 		return
 	}
 	r.ReapRequests.With(prometheus.Labels{"phase": string(phase)}).Inc()
+}
+
+// Verification outcome values are a closed set derived from the observed
+// Verifying exit, not free-form labels.
+const (
+	verificationOutcomeGreen        = "green"
+	verificationOutcomeRed          = "red"
+	verificationOutcomeUnobservable = "unobservable"
+
+	lifecycleOutcomePublished   = "published"
+	lifecycleOutcomeSuperseded  = "superseded"
+	lifecycleOutcomeUnsupported = "unsupported"
+	lifecycleOutcomeRetryable   = "retryable"
+)
+
+// Token kinds are the bounded TokenUsage fields; the derived Total is never
+// emitted as its own series.
+var tokenKinds = []string{"input", "output", "reasoning", "cache-read", "cache-write"}
+
+// ObservePhaseTransition records one observed phase change. Callers skip
+// empty phases so a legacy run recorded mid-lifecycle does not fabricate a
+// transition from nothing.
+func (r *RunRecorder) ObservePhaseTransition(lane string, mode courierv1alpha1.Mode, from, to courierv1alpha1.Phase) {
+	if r == nil {
+		return
+	}
+	r.PhaseTransitions.With(prometheus.Labels{
+		"lane": lane,
+		"mode": string(mode),
+		"from": string(from),
+		"to":   string(to),
+	}).Inc()
+}
+
+// ObservePhaseDuration records the time a run spent in the phase it just
+// left, observed once per transition.
+func (r *RunRecorder) ObservePhaseDuration(lane string, mode courierv1alpha1.Mode, phase courierv1alpha1.Phase, d time.Duration) {
+	if r == nil {
+		return
+	}
+	r.PhaseDuration.With(prometheus.Labels{
+		"lane":  lane,
+		"mode":  string(mode),
+		"phase": string(phase),
+	}).Observe(nonNegativeSeconds(d))
+}
+
+// ObserveTerminalDiagnostic records one terminal run by its durable terminal
+// diagnostic category; a run without a diagnostic counts under the closed
+// "unknown" category.
+func (r *RunRecorder) ObserveTerminalDiagnostic(run *courierv1alpha1.CoderRun) {
+	if r == nil || run == nil {
+		return
+	}
+	category := courierv1alpha1.TerminalDiagnosticCategoryUnknown
+	if run.Status.TerminalDiagnostic != nil && run.Status.TerminalDiagnostic.Category != "" {
+		category = run.Status.TerminalDiagnostic.Category
+	}
+	r.TerminalDiagnostics.With(prometheus.Labels{
+		"lane":     run.Spec.Lane,
+		"mode":     string(run.Spec.Mode),
+		"category": string(category),
+	}).Inc()
+}
+
+// ObserveInfraRestarts records coordinator infra relaunches charged to a run
+// as the delta observed on the run's status.
+func (r *RunRecorder) ObserveInfraRestarts(lane string, mode courierv1alpha1.Mode, delta int) {
+	if r == nil || delta <= 0 {
+		return
+	}
+	r.InfraRestarts.With(prometheus.Labels{
+		"lane": lane,
+		"mode": string(mode),
+	}).Add(float64(delta))
+}
+
+// ObserveVerificationOutcome records the external verification disposition
+// of a Verifying exit.
+func (r *RunRecorder) ObserveVerificationOutcome(lane string, mode courierv1alpha1.Mode, result string) {
+	if r == nil {
+		return
+	}
+	r.VerificationOutcomes.With(prometheus.Labels{
+		"lane":   lane,
+		"mode":   string(mode),
+		"result": result,
+	}).Inc()
+}
+
+// ObserveTokenDelta records a positive per-kind token delta from the run's
+// telemetry. Zero and negative deltas are skipped: missing series are zero in
+// PromQL, and the derived Total is never emitted.
+func (r *RunRecorder) ObserveTokenDelta(lane string, mode courierv1alpha1.Mode, kind string, delta int64) {
+	if r == nil || delta <= 0 {
+		return
+	}
+	r.Tokens.With(prometheus.Labels{
+		"lane": lane,
+		"mode": string(mode),
+		"kind": kind,
+	}).Add(float64(delta))
+}
+
+// ObserveLifecycleReportOutcome records one freshly applied terminal source
+// lifecycle report attempt outcome.
+func (r *RunRecorder) ObserveLifecycleReportOutcome(sourceName, lane string, mode courierv1alpha1.Mode, result string) {
+	if r == nil {
+		return
+	}
+	r.LifecycleReportOutcomes.With(prometheus.Labels{
+		"source": sourceName,
+		"lane":   lane,
+		"mode":   string(mode),
+		"result": result,
+	}).Inc()
 }
 
 // nonNegativeSeconds clamps a duration to zero for the negative case, which
@@ -392,5 +571,88 @@ func (c *TerminalAgeCollector) Collect(ch chan<- prometheus.Metric) {
 	for phase, at := range oldest {
 		ch <- prometheus.MustNewConstMetric(
 			oldestTerminalAgeDesc, prometheus.GaugeValue, nonNegativeSeconds(now.Sub(at)), string(phase))
+	}
+}
+
+// TerminalBacklogCollector reports the terminal-run backlog at scrape time:
+// how many terminal runs the retention policy still holds, and how many of
+// those carry an unsettled source lifecycle report — the pending-report
+// backlog the retention reaper holds runs for — with the age of the oldest
+// unsettled run per lane. It mirrors TerminalAgeCollector: a failed List
+// increments the dedicated scrape-errors counter instead of silently
+// dropping the scrape.
+type TerminalBacklogCollector struct {
+	client       client.Client
+	now          func() time.Time
+	scrapeErrors prometheus.Counter
+}
+
+func NewTerminalBacklogCollector(c client.Client) *TerminalBacklogCollector {
+	return &TerminalBacklogCollector{
+		client: c,
+		now:    time.Now,
+		scrapeErrors: prometheus.NewCounter(prometheus.CounterOpts{
+			Name: "courier_terminal_backlog_scrape_errors_total",
+			Help: "List calls that failed while the TerminalBacklogCollector collected terminal-backlog metrics.",
+		}),
+	}
+}
+
+// Describe implements prometheus.Collector.
+func (c *TerminalBacklogCollector) Describe(ch chan<- *prometheus.Desc) {
+	ch <- awaitingReapDesc
+	ch <- lifecyclePendingDesc
+	ch <- lifecyclePendingOldestDesc
+	ch <- c.scrapeErrors.Desc()
+}
+
+// Collect implements prometheus.Collector.
+func (c *TerminalBacklogCollector) Collect(ch chan<- prometheus.Metric) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	defer func() { ch <- c.scrapeErrors }()
+
+	var runs courierv1alpha1.CoderRunList
+	if err := c.client.List(ctx, &runs); err != nil {
+		c.scrapeErrors.Inc()
+		crlog.Log.Error(err, "metrics scrape: listing CoderRuns failed")
+		return
+	}
+	awaitingReap := make(map[courierv1alpha1.Phase]int, 6)
+	pending := make(map[string]int)
+	oldest := make(map[string]time.Time)
+	for i := range runs.Items {
+		run := &runs.Items[i]
+		if !terminalPhase(run.Status.Phase) {
+			continue
+		}
+		awaitingReap[run.Status.Phase]++
+		// Mirror the reaper's hold gate: only a positively settled report
+		// (True with reason Published or Superseded) leaves the backlog, so a
+		// True condition with an unexpected reason stays counted, exactly as
+		// lifecycleReportSettled holds the run in place.
+		if lifecycleReportSettled(run) {
+			continue
+		}
+		pending[run.Spec.Lane]++
+		if run.Status.FinishedAt == nil {
+			continue
+		}
+		if current, ok := oldest[run.Spec.Lane]; !ok || run.Status.FinishedAt.Time.Before(current) {
+			oldest[run.Spec.Lane] = run.Status.FinishedAt.Time
+		}
+	}
+	now := c.now()
+	for phase, count := range awaitingReap {
+		ch <- prometheus.MustNewConstMetric(
+			awaitingReapDesc, prometheus.GaugeValue, float64(count), string(phase))
+	}
+	for lane, count := range pending {
+		ch <- prometheus.MustNewConstMetric(
+			lifecyclePendingDesc, prometheus.GaugeValue, float64(count), lane)
+	}
+	for lane, at := range oldest {
+		ch <- prometheus.MustNewConstMetric(
+			lifecyclePendingOldestDesc, prometheus.GaugeValue, nonNegativeSeconds(now.Sub(at)), lane)
 	}
 }

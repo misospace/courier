@@ -1508,6 +1508,27 @@ the world. `courier_metrics_scrape_errors_total` counts scrape failures. Scrapin
 is opt-in: the chart's `serviceMonitor.enabled` renders a metrics `Service` and a
 Prometheus Operator `ServiceMonitor`, off by default.
 
+Alongside those, the operator exports the run-signal set the catalogue in
+[docs/observability-signals-and-health.md](./docs/observability-signals-and-health.md)
+specifies: `courier_coderun_phase_transitions_total{lane,mode,from,to}` and
+`courier_coderun_phase_duration_seconds{lane,mode,phase}` for the phase path,
+`courier_coderun_terminal_diagnostics_total{lane,mode,category}`,
+`courier_coderun_infra_restarts_total{lane,mode}`,
+`courier_coderun_verification_outcomes_total{lane,mode,result}` and
+`courier_coderun_tokens_total{lane,mode,kind}` for execution outcomes, and
+`courier_source_lifecycle_report_outcomes_total{source,lane,mode,result}` for
+lifecycle-report attempts. Every label is a bounded enum — lane, mode, phase,
+category, result, kind, source — never a repo, issue, or run id, so the series
+count stays bounded. The transition-path signals are derived from the same status
+diff the patch applied and are recorded only after that status write succeeds, so
+a failed patch records nothing, and the durable `status.phaseEnteredAt` marker
+is what makes the per-phase duration truthful across a restart. The scrape-time
+gauges `courier_coderuns_awaiting_reap{phase}`,
+`courier_coderuns_lifecycle_pending{lane}` and
+`courier_coderuns_lifecycle_pending_oldest_age_seconds{lane}` are the
+count-side companion to the per-phase terminal-age gauge: they read live cluster
+state, so they survive an operator restart.
+
 **Source-agnostic telemetry and health semantics (#290).**
 [docs/observability-signals-and-health.md](./docs/observability-signals-and-health.md)
 specifies Courier's own signal catalogue and health model: a source-neutral
@@ -1520,16 +1541,18 @@ model that separates executor completion from external disposition and renders
 unknown/stale/absent as states distinct from idle or healthy. It defines units,
 clocks, counter/gauge reset behaviour, and a bounded-label privacy budget that
 keeps run ids, issue/PR numbers, repo names, arbitrary error strings, and secrets
-out of labels, with per-run correlation left to the structured log. The
-discovery (§3.2) and lane-capacity/reservation (§3.3) layers are implemented —
-`courier_source_*` emitted nil-safely by the discovery runner
-(`internal/source/metrics.go`), and `courier_lane_concurrency`,
-`courier_lane_reservations`, `courier_coderuns_pending`, and
-`courier_lane_oldest_reservation_age_seconds` read live at scrape time
-(`internal/controller/metrics.go`); the phase, execution-outcome,
-lifecycle-report, and retention additions of §3.4–§3.7 remain design-only.
+out of labels, with per-run correlation left to the structured log. Every
+signal layer of the catalogue now ships with the operator: the discovery
+(§3.2) and lane-capacity/reservation (§3.3) layers — `courier_source_*` emitted
+nil-safely by the discovery runner (`internal/source/metrics.go`), and
+`courier_lane_concurrency`, `courier_lane_reservations`,
+`courier_coderuns_pending`, and `courier_lane_oldest_reservation_age_seconds`
+read live at scrape time (`internal/controller/metrics.go`) — and the phase,
+execution-outcome, lifecycle-report, and retention additions of §3.4–§3.7.
 #291 owns the connector diagnostics and #292 the views and alerts that consume
 these signals; the thresholds and windows are design candidates, not defaults.
+The dashboards and the alert rules themselves remain unimplemented design, and
+nothing here authorizes them.
 
 **Connector diagnostics without core coupling (#291).**
 [docs/connector-diagnostics.md](./docs/connector-diagnostics.md) specifies
@@ -1562,12 +1585,10 @@ execution and outcomes, lifecycle reporting, retention, and optional connector
 panels. It separates the portable specification from optional executable
 dashboard/rule assets, names the evaluator an OTel-based integration must
 supply (OTLP is transport, not an alert engine), and records the
-instrumentation gaps — no lifecycle-report or retention metrics, with the
-discovery and reservation gaps closed by #323 — that a later instrumentation
-decision must close before
-those views exist. #290 owns the signal/health semantics and #291 the connector
-diagnostics this layer consumes; neither is required for a Courier dashboard to
-be useful standalone.
+instrumentation gaps — the dashboards and the alert rules themselves — that a
+later instrumentation decision must close before those views exist. #290 owns
+the signal/health semantics and #291 the connector diagnostics this layer
+consumes; neither is required for a Courier dashboard to be useful standalone.
 
 ### Per-run telemetry
 
@@ -1586,7 +1607,8 @@ coordinator's own steps. The compact status/report form is integers and small (a
 bounded per-agent list): it rides the pod termination-message budget alongside
 the reason, and durations are milliseconds so the CRD stays float-free. Only the
 rich form reaches the (uncapped) log. Continuations are counted from the
-executor's own counter; metrics export lands with #168.
+executor's own counter; the bounded token totals are exported as
+`courier_coderun_tokens_total`.
 
 ## Custom resources
 
@@ -1615,6 +1637,7 @@ status:
   admittedAt: <ts>                 # set-once: left Pending past the lane gate
   startedAt: <ts>                  # set-once: observed from the coordinator container status
   finishedAt: <ts>                 # set-once: the run's own execution ended (any terminal phase)
+  phaseEnteredAt: <ts>             # replaceable: restamped on every phase change, so it matches the current phase
   waitDuration: <Go duration>      # derived once: creation to start, the Waited column
   runDuration: <Go duration>       # derived once: start to finish, the Ran column
   lastCommit: <sha>
@@ -1625,6 +1648,13 @@ status:
   restarts: <n>                    # consecutive infra crashloop counter, reset by a fresh heartbeat while a coordinator is observable
   conditions: [...]
 ```
+
+`phaseEnteredAt` is replaceable, not set-once: the operator restamps it with its
+own clock in the same status write that changes the phase, so the persisted
+marker always matches the persisted phase and the age of the current phase is
+`now` minus `phaseEnteredAt` — truthful for every phase, an operator restart
+included. A phase with no marker (a run recorded before the field existed, or a
+run's first transition) reports no phase duration rather than a fabricated one.
 
 ### `LaneProfile`
 
@@ -1902,6 +1932,10 @@ there is no delete verb because active runs reference lanes. (#73)
   never-reaped phases cannot drain the quota. It emits
   `courier_coderuns_reap_requests_total` (accepted delete requests) and
   `courier_coderuns_oldest_terminal_age_seconds` (what is still retained).
+  The scrape-time backlog gauges are the count-side companion to that age
+  gauge: how many terminal runs the policy still holds, and how many of them
+  are held for an unsettled lifecycle report — the pending count mirrors this
+  reaper's own hold gate, so a run leaves it only when its report is settled.
   AwaitingReview is kept until the world moves it; HandedOff and BlockedExternal
   are still kept (not reaped) — HandedOff is deleted on request, and
   BlockedExternal stays recoverable so its source can re-issue it; see
@@ -1923,7 +1957,7 @@ terminal phase with the report retried on a later reconcile. (#178)
 
 **Retention clock:** Retention is a bounded inspection window keyed to a durable, **per-phase "reap-eligible" annotation** — not `FinishedAt`, not `CreationTimestamp`, and not the source report condition alone. `FinishedAt` records the run's execution end and is set-once on the first terminal transition (`AwaitingReview`, `HandedOff`, `NeedsHuman`, or `Failed`); it must remain immutable so a later transition (notably the months-late `AwaitingReview → NeedsHuman` from a closed-unmerged PR) does not distort `RunDuration` or the merge-to-`Done` semantics, and so `Done`'s `RunDuration` is always the work's wall-clock cost rather than the reaper's view of it. Therefore `FinishedAt` is **not** the retention clock for `NeedsHuman`/`Failed`. The controller instead writes a new set-once annotation when the run becomes reap-eligible for that phase: `courier.misospace.dev/needs-human-at` on entry to `NeedsHuman` and `courier.misospace.dev/failed-at` on entry to `Failed`, each an RFC3339 timestamp stamped once after the lifecycle report reaches a settled state (see Deletion gates). For a direct `Running`/`Verifying → NeedsHuman`/`Failed`, the annotation is written on the first reconcile after the lifecycle report settles — the reconcile immediately after `FinishedAt` is set — so the window starts at the actual end of execution; for a late `AwaitingReview → NeedsHuman` (the closed-unmerged case), the annotation is written on the first reap-eligible reconcile after the close-unmerged transition's report settles, **not** the original `FinishedAt`, so the seven-day window is the operator's inspection window for the new outcome, not a zero-length residue of months-old execution time. `Done` keeps its existing separate `courier.misospace.dev/done-at` annotation (`doneAtAnnotation`) because a `Done` transition can occur long after `FinishedAt` (and the source `Resolve` precedes the marker, not the phase change). A missing or malformed marker starts a fresh window and never deletes on the same pass; a future-dated marker (clock skew) is capped at the window and never deletes early — the same fail-safe rules `reapDone` already applies. `AwaitingReview` is deliberately outside this window: it is a success ending awaiting a human merge, not a terminal failure, so it is kept until the world moves it — #250 resolves a merge to `Done`, and this design resolves a closed-unmerged PR to `NeedsHuman`; only then does a retention window start. A PR that stays open keeps its run, which is the run's live-work record and the human gate. The annotations live on the object, so controller restart re-derives the remaining window from the durable marker without re-stamping, re-arming, or distorting `FinishedAt`.
 
-**Defaults and deployment knob:** `Done` stays five minutes. `Failed` and `NeedsHuman` default to 168 hours (seven days), measured from each run's per-phase annotation (`courier.misospace.dev/failed-at` and `courier.misospace.dev/needs-human-at`) rather than from `FinishedAt`, so a late `AwaitingReview → NeedsHuman` transition starts a fresh window. Expose four manager flags (`--done-retention`, `--failed-retention`, `--needs-human-retention`, `--terminal-audit-keep`) and a chart `retention:` block (`done`, `failed`, `needsHuman`, `auditKeep`) rendered into `controllers.main.containers.main.args` like the existing `evidence:` block. `CoderRunReconciler` carries `DoneRetention`, `FailedRetention`, `NeedsHumanRetention`, and `TerminalAuditKeep` fields with zero-falls-back-to-default semantics; a negative `TerminalAuditKeep` disables the audit floor. **The audit floor's candidate set is exactly the phases it governs:** a run counts toward — and is protected by — the floor only in `Failed` or `NeedsHuman`. `Done` runs are exempt from the floor (their source work is already resolved) and `AwaitingReview`, `HandedOff`, and `BlockedExternal` are never reaped at all, so counting either as a newer entry would let a burst of short-lived Done runs, or one permanently held run, drain the protected quota and permanently delete the runs the floor promises to keep. **The metric contract is a request, not a removal:** the reaper increments `courier_coderuns_reap_requests_total{phase}` on every accepted delete request — the API server accepts the delete on a secure run while the topology finalizer still holds the object — and the scrape-time `TerminalAgeCollector` reports `courier_coderuns_oldest_terminal_age_seconds{phase}` so an operator can see what is actually retained (a finalizer-held object stays on the gauge) and whether anything is aging past its window (a stuck report or an audit-floor hold).
+**Defaults and deployment knob:** `Done` stays five minutes. `Failed` and `NeedsHuman` default to 168 hours (seven days), measured from each run's per-phase annotation (`courier.misospace.dev/failed-at` and `courier.misospace.dev/needs-human-at`) rather than from `FinishedAt`, so a late `AwaitingReview → NeedsHuman` transition starts a fresh window. Expose four manager flags (`--done-retention`, `--failed-retention`, `--needs-human-retention`, `--terminal-audit-keep`) and a chart `retention:` block (`done`, `failed`, `needsHuman`, `auditKeep`) rendered into `controllers.main.containers.main.args` like the existing `evidence:` block. `CoderRunReconciler` carries `DoneRetention`, `FailedRetention`, `NeedsHumanRetention`, and `TerminalAuditKeep` fields with zero-falls-back-to-default semantics; a negative `TerminalAuditKeep` disables the audit floor. **The audit floor's candidate set is exactly the phases it governs:** a run counts toward — and is protected by — the floor only in `Failed` or `NeedsHuman`. `Done` runs are exempt from the floor (their source work is already resolved) and `AwaitingReview`, `HandedOff`, and `BlockedExternal` are never reaped at all, so counting either as a newer entry would let a burst of short-lived Done runs, or one permanently held run, drain the protected quota and permanently delete the runs the floor promises to keep. **The metric contract is a request, not a removal:** the reaper increments `courier_coderuns_reap_requests_total{phase}` on every accepted delete request — the API server accepts the delete on a secure run while the topology finalizer still holds the object — and the scrape-time `TerminalAgeCollector` reports `courier_coderuns_oldest_terminal_age_seconds{phase}` so an operator can see what is actually retained (a finalizer-held object stays on the gauge) and whether anything is aging past its window (a stuck report or an audit-floor hold). The scrape-time backlog gauges `courier_coderuns_awaiting_reap{phase}`, `courier_coderuns_lifecycle_pending{lane}`, and `courier_coderuns_lifecycle_pending_oldest_age_seconds{lane}` are the count-side companion to that age gauge: they count what the policy still holds and how much of it is held for an unsettled lifecycle report, the pending count mirroring the reaper's own hold gate, so a run leaves the backlog only when its report is positively settled.
 
 **Closed-unmerged PRs:** A run terminalizes as `NeedsHuman` with a precise reason; no new CRD phase. Today a `Verifying` run whose PR is closed without merge observes an empty `PRObservation` and transitions to `NeedsHuman` (#146); the gap is a PR closed after the run already settled `AwaitingReview`, which is never observed. The slow, bounded world observation added for #250 (merged -> `Done`) classifies the run's exact recorded PR identity as: merged -> `Done` (existing resolve + reap); open -> stay `AwaitingReview`; closed without merge -> `NeedsHuman` with a new `PullRequestClosedUnmerged` condition (`Status=True`, reason `ClosedUnmerged`) whose message carries the recorded PR identity, under the existing needs-human source policy (a `blocked` lifecycle report; the source parks the item and owns retry/escalation); absent, ambiguous, or a transient forge error -> no transition, stay `AwaitingReview`, and retry the observation later. A missing or unreadable PR is never treated as closed. The `NeedsHuman` transition publishes a `blocked` source lifecycle, and the per-phase `courier.misospace.dev/needs-human-at` annotation is stamped by the reaper on the first reap-eligible reconcile after that report settles (not derived from the original `FinishedAt`), so the seven-day inspection window starts at the operator-visible close event. No new CRD phase: `Done` would falsely attest shipped work, and a bespoke `Closed` phase is unnecessary because an existing non-successful phase already covers it. Implementation hook (#277): the `AwaitingReview` observation branch reads the run's exact recorded pull request through the configured forge `read-pull-request` capability (`PullRequestReader` / `forge.PullRequest`, the same #250 seam), where `State` distinguishes a closed pull request from an open or absent one; no `PRObservation` signal is needed, because the `Verifying` path already maps a missing pull request to `NeedsHuman`.
 
