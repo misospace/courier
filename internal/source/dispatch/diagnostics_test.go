@@ -780,6 +780,77 @@ func TestConfiguredAdaptersKeepIndependentSeries(t *testing.T) {
 	}
 }
 
+// TestLegacyAndShorthandAdaptersShareOneConnectorIdentity pins the one
+// connector identity Dispatch adapters share on purpose. The manager keeps a
+// legacy bare adapter for runs retained from before source-agent routing, and
+// in the single-binding shorthand the lane binding carries no source agent —
+// so both adapters talk to the same Dispatch agent and both report under the
+// bare "dispatch" identity, on one shared series. That is a deliberate
+// single-agent identity, not a collision between independent connectors: a
+// configured binding keeps its own identity and never lands on that series.
+func TestLegacyAndShorthandAdaptersShareOneConnectorIdentity(t *testing.T) {
+	reg := prometheus.NewRegistry()
+	em := connector.NewEmitter(reg, nil)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		http.Error(w, "boom", http.StatusInternalServerError)
+	}))
+	defer server.Close()
+
+	// The legacy bare adapter and the shorthand lane binding: same agent,
+	// same bare connector identity, exactly as cmd/main.go builds them when
+	// the binding carries no source agent.
+	adapters := []*HTTPClient{}
+	for _, agent := range []string{"worker", "worker"} {
+		client, err := NewClient(server.URL, agent, "token", time.Second)
+		if err != nil {
+			t.Fatal(err)
+		}
+		New(client, WithConnectorDiagnostics(em))
+		adapters = append(adapters, client)
+	}
+	for _, client := range adapters {
+		if _, err := client.Discover(context.Background()); err == nil {
+			t.Fatal("failing poll unexpectedly succeeded")
+		}
+	}
+
+	// Both adapters' diagnostics land on the one shared bare series.
+	if got, ok := counterValue(t, reg, map[string]string{
+		"connector": defaultConnectorName, "signal": connector.SignalProtocolError, "reason": reasonHTTP5xx,
+	}); !ok || got != 2 {
+		t.Fatalf("bare dispatch protocol-error counter = %v, ok=%v; want 2 on the one shared series", got, ok)
+	}
+	if _, ok := gaugeValue(t, reg, connector.MetricExclusionLimit, map[string]string{"connector": defaultConnectorName}); !ok {
+		t.Fatal("bare dispatch exclusion limit gauge missing")
+	}
+	if _, ok := findSeries(t, reg, connector.MetricCapabilityInfo, map[string]string{
+		"connector": defaultConnectorName, "capability": connector.CapabilityDiscovery, "state": connector.CapabilitySupported,
+	}); !ok {
+		t.Fatal("bare dispatch capability catalogue missing")
+	}
+
+	// A configured binding keeps its own identity and stays off the shared
+	// series, so the sharing above stays bounded to one Dispatch agent.
+	configured, err := NewClient(server.URL, "cloud-worker", "token", time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	New(configured, WithConnectorDiagnostics(em), WithConnectorName("dispatch:cloud"))
+	if _, err := configured.Discover(context.Background()); err == nil {
+		t.Fatal("failing poll unexpectedly succeeded")
+	}
+	if got, ok := counterValue(t, reg, map[string]string{
+		"connector": defaultConnectorName, "signal": connector.SignalProtocolError, "reason": reasonHTTP5xx,
+	}); !ok || got != 2 {
+		t.Fatalf("bare dispatch protocol-error counter = %v, ok=%v; want 2, the configured adapter must not land on it", got, ok)
+	}
+	if got, ok := counterValue(t, reg, map[string]string{
+		"connector": "dispatch:cloud", "signal": connector.SignalProtocolError, "reason": reasonHTTP5xx,
+	}); !ok || got != 1 {
+		t.Fatalf("dispatch:cloud protocol-error counter = %v, ok=%v; want 1 under its own series", got, ok)
+	}
+}
+
 // TestWithConnectorNameRejectsUnboundedIdentity pins the loud-failure
 // contract for configured connector identities: an empty, over-long, or
 // out-of-charset label value fails at construction instead of silently

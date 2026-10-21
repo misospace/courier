@@ -1581,10 +1581,10 @@ stay bounded (each configured connector instance reports under its own bounded
 identity, so independent configured adapters never share metric series), and
 trace correlation is optional and never a metric label. §11
 of that document names the bounded-label, duplicate-counting, privacy, and
-correlation assertions the instrumentation must satisfy; the unit-level subset
-of those assertions runs as `go test` checks today (the envtest no-double-count
-fixture, the AST-walk free-form-label check, and the scrape-time images-job
-invariants remain the contract for later follow-ups). The
+correlation assertions the instrumentation must satisfy, and every one of
+them is checked into the test tree as a `go test` assertion today: the
+no-double-count fixture, the AST-walk free-form-label check, and the
+scrape-time invariants over the manager's own metric registry. The
 envelope is implemented in
 `internal/connector`, and the Dispatch and manual adapters declare their
 capability catalogues and emit their diagnostics through it at construction and

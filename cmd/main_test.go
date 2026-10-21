@@ -207,6 +207,71 @@ func TestResolveDispatchBindings(t *testing.T) {
 	}
 }
 
+// TestResolveDispatchBindingsBoundsTheBareConnectorIdentity pins the bound on
+// the one connector identity Dispatch adapters share on purpose. The manager
+// registers a legacy bare adapter for retained runs, and a binding with no
+// source agent registers under the same bare "dispatch" identity because both
+// talk to the same Dispatch agent. That sharing is only sound while at most
+// one binding carries the bare identity: two adapters under one identity
+// would merge independent connectors' series.
+func TestResolveDispatchBindingsBoundsTheBareConnectorIdentity(t *testing.T) {
+	tests := []struct {
+		name      string
+		queueLane string
+		lane      string
+		repeated  []string
+		wantBare  int
+	}{
+		{
+			name:      "shorthand keeps the bare identity",
+			queueLane: "queue-a",
+			lane:      "lane-a",
+			wantBare:  1,
+		},
+		{
+			name:     "single repeated binding keeps the bare identity",
+			repeated: []string{"queue-a:lane-a"},
+			wantBare: 1,
+		},
+		{
+			name:     "repeated bindings derive one identity each",
+			repeated: []string{"queue-a:lane-a", "queue-b:lane-b"},
+			wantBare: 0,
+		},
+		{
+			name:     "explicit agent identities keep the bare identity free",
+			repeated: []string{"queue-a:lane-a:agent-a", "queue-b:lane-b:agent-b"},
+			wantBare: 0,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			bindings, err := resolveDispatchBindings("courier", test.queueLane, test.lane, test.repeated)
+			if err != nil {
+				t.Fatalf("resolveDispatchBindings() error = %v", err)
+			}
+			bare := 0
+			for _, binding := range bindings {
+				if binding.sourceAgent != "" {
+					continue
+				}
+				bare++
+				// The bare identity is one Dispatch agent's identity, so the
+				// binding must use the same agent name the legacy client uses.
+				if binding.agentName != "courier" {
+					t.Fatalf("bare binding agent name = %q, want the base agent name %q", binding.agentName, "courier")
+				}
+			}
+			if bare != test.wantBare {
+				t.Fatalf("bindings sharing the bare identity = %d, want %d", bare, test.wantBare)
+			}
+			if bare > 1 {
+				t.Fatalf("%d bindings share the bare connector identity, want at most 1", bare)
+			}
+		})
+	}
+}
+
 func TestBuildSecureControlRejectsTaintedLegacyCredential(t *testing.T) {
 	registryFile := filepath.Join(t.TempDir(), "providers.json")
 	providers := `{"providers":[{"name":"github","type":"github","endpoint":"https://api.github.com/","credentials":{"forge-api":{"secretName":"courier-github","key":"token"}},"serves":["*"]}]}`
