@@ -66,10 +66,6 @@ func unavailable(name string, required bool, detail string) Capability {
 	return Capability{Name: name, State: StateUnavailable, Detail: detail, Required: required}
 }
 
-func unavailableRetryable(name string, required bool, detail string) Capability {
-	return Capability{Name: name, State: StateUnavailable, Detail: detail, Required: required, Retryable: true}
-}
-
 // unavailableClassified emits an unavailable required capability carrying the
 // probe's retryability class.
 func unavailableClassified(name, detail string, retryable bool) Capability {
