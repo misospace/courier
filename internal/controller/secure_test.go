@@ -29,6 +29,7 @@ import (
 
 	courier "github.com/misospace/courier/api/v1alpha1"
 	"github.com/misospace/courier/internal/broker"
+	"github.com/misospace/courier/internal/executor"
 	"github.com/misospace/courier/internal/forge"
 	"github.com/misospace/courier/internal/source"
 	"github.com/misospace/courier/internal/status"
@@ -850,6 +851,89 @@ func TestLaunchSecureAppliesLaneResources(t *testing.T) {
 		for _, container := range pod.Spec.Containers {
 			assertSized(t, component+" container "+container.Name, container.Resources)
 		}
+	}
+}
+
+// The lane's runtimeImage is the secure path's execution-environment seam: it
+// selects the worker image only, while control and broker stay on the
+// deployment harness image — they carry Courier's trusted binaries and fixed
+// trust contracts. The selected image must carry /usr/local/bin/courier-worker
+// (the published harness-go image is that contract), and the worker carries
+// the same per-pod toolchain-cache mounts as the legacy coordinator pod.
+func TestLaunchSecureAppliesLaneRuntimeImage(t *testing.T) {
+	control, c := secureControl(t, &courier.LaneProfile{
+		ObjectMeta: metav1.ObjectMeta{Namespace: secureTestNamespace, Name: "go-lane"},
+		Spec: courier.LaneProfileSpec{
+			Roles:        map[string]string{"coordinator": "test/coordinator", "coder": "test/coder"},
+			RuntimeImage: "toolchain:test",
+		},
+	})
+	run := launchedSecureRun(t, c, "go-lane", "go-lane")
+	if _, err := control.LaunchSecure(context.Background(), run); err != nil {
+		t.Fatalf("LaunchSecure: %v", err)
+	}
+	images := map[string]string{}
+	for component, name := range map[string]string{
+		topology.ComponentWorker:      topology.WorkerPodName(run.Name),
+		topology.ComponentBroker:      topology.BrokerPodName(run.Name),
+		topology.ComponentCoordinator: topology.ControlPodName(run.Name),
+	} {
+		pod := &corev1.Pod{}
+		if err := c.Get(context.Background(), client.ObjectKey{Namespace: secureTestNamespace, Name: name}, pod); err != nil {
+			t.Fatalf("read %s pod: %v", component, err)
+		}
+		images[component] = pod.Spec.Containers[0].Image
+	}
+	if images[topology.ComponentWorker] != "toolchain:test" {
+		t.Fatalf("worker image = %q, want the lane's runtimeImage", images[topology.ComponentWorker])
+	}
+	for _, component := range []string{topology.ComponentCoordinator, topology.ComponentBroker} {
+		if images[component] != "harness:test" {
+			t.Fatalf("%s image = %q, want the deployment harness image", component, images[component])
+		}
+	}
+	worker := &corev1.Pod{}
+	if err := c.Get(context.Background(), client.ObjectKey{Namespace: secureTestNamespace, Name: topology.WorkerPodName(run.Name)}, worker); err != nil {
+		t.Fatal(err)
+	}
+	cacheMounts := 0
+	reference := false
+	for _, mount := range worker.Spec.Containers[0].VolumeMounts {
+		switch mount.MountPath {
+		case executor.ToolchainCachePath:
+			cacheMounts++
+		case executor.ToolchainReferencePath:
+			reference = true
+		}
+	}
+	if cacheMounts != 1 || !reference {
+		t.Fatalf("worker toolchain mounts: %d cache, reference present = %t", cacheMounts, reference)
+	}
+	toolchainDir := ""
+	for _, env := range worker.Spec.Containers[0].Env {
+		if env.Name == "COURIER_TOOLCHAIN_DIR" {
+			toolchainDir = env.Value
+		}
+	}
+	if toolchainDir != executor.ToolchainReferencePath {
+		t.Fatalf("worker COURIER_TOOLCHAIN_DIR = %q", toolchainDir)
+	}
+}
+
+// An empty lane runtimeImage keeps the deployment harness image as the worker
+// runtime: the fallback, not a blank image reference.
+func TestLaunchSecureWorkerImageFallsBackToHarness(t *testing.T) {
+	control, c := secureControl(t)
+	run := launchedSecureRun(t, c, "default-image", "local")
+	if _, err := control.LaunchSecure(context.Background(), run); err != nil {
+		t.Fatalf("LaunchSecure: %v", err)
+	}
+	worker := &corev1.Pod{}
+	if err := c.Get(context.Background(), client.ObjectKey{Namespace: secureTestNamespace, Name: topology.WorkerPodName(run.Name)}, worker); err != nil {
+		t.Fatal(err)
+	}
+	if worker.Spec.Containers[0].Image != "harness:test" {
+		t.Fatalf("worker image = %q, want the harness image fallback", worker.Spec.Containers[0].Image)
 	}
 }
 

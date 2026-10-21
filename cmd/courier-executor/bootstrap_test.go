@@ -181,6 +181,21 @@ func remoteWithApprovedContract(t *testing.T, root string) string {
 // legacy executor never executes repository contract code.
 const approvedSkipReason = "bootstrap contract approved but not executed: the legacy executor is credential-bearing; the approved bootstrap runs only in the secure worker topology"
 
+// approvedSkipReasonUnprovisioned is the approved-skip reason on a runtime
+// environment with no mise executable: the skip verdict stands, but the
+// receipt names the missing provisioning so an underprovisioned image is
+// visible before model work (#415).
+const approvedSkipReasonUnprovisioned = approvedSkipReason + "; the runtime environment has no mise executable on PATH"
+
+func TestApprovedContractSkipReasonNamesUnprovisionedEnvironment(t *testing.T) {
+	if got := approvedContractSkipReason(true); got != approvedSkipReason {
+		t.Fatalf("approvedContractSkipReason(true) = %q, want the fixed approved-skip reason", got)
+	}
+	if got := approvedContractSkipReason(false); got != approvedSkipReasonUnprovisioned {
+		t.Fatalf("approvedContractSkipReason(false) = %q, want the unprovisioned reason", got)
+	}
+}
+
 // TestRunSkipsApprovedContractWithoutExecuting drives run() end to end with
 // an approved contract: the legacy executor is credential-bearing and must
 // never execute repository contract code, so the run proceeds
@@ -225,6 +240,56 @@ func TestRunSkipsApprovedContractWithoutExecuting(t *testing.T) {
 	}
 	if reason, _ := detail["reason"].(string); reason != approvedSkipReason {
 		t.Fatalf("workspace.bootstrap reason = %q, want the fixed approved-skip reason %q", reason, approvedSkipReason)
+	}
+}
+
+// TestRunApprovedContractReceiptNamesUnprovisionedEnvironment drives run()
+// end to end on a PATH that provably carries no mise: the skip verdict is
+// unchanged — the legacy executor never executes contract content — but the
+// receipt must name the missing mise executable so an underprovisioned
+// runtime image is visible before model work (#415).
+func TestRunApprovedContractReceiptNamesUnprovisionedEnvironment(t *testing.T) {
+	root := t.TempDir()
+	remote := remoteWithApprovedContract(t, root)
+
+	// A PATH with exactly one entry: a directory whose only member is git,
+	// so LookPath("mise") cannot resolve to anything but a host leak.
+	gitOnly := filepath.Join(root, "git-only-bin")
+	if err := os.MkdirAll(gitOnly, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	gitPath, err := exec.LookPath("git")
+	if err != nil {
+		t.Skip("git not found on PATH")
+	}
+	if err := os.Symlink(gitPath, filepath.Join(gitOnly, "git")); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", gitOnly)
+
+	prServer, prState := fakeForgePullRequestServer(t)
+	fakeOpenCode := filepath.Join(root, "opencode")
+	writeExecutable(t, fakeOpenCode, "#!/bin/sh\ncase \"$1\" in mcp) exit 0;; esac\nprintf 'opencode ran\\n'\nprintf 'completed\\n' > completed.txt\ngit add --all -- .\ngit commit -m 'test: completed work' >/dev/null\ngit push origin \"$COURIER_BRANCH\" >/dev/null 2>&1\n"+writePullRequestScript(prState, pullRequestFixtureJSON(13, "open", false, "Closes #7. The completed turn opened the pull request.")))
+
+	setResolveIssueEnv(t, root, remote, prServer.URL, fakeOpenCode)
+	t.Setenv("COURIER_GIT_TOKEN", testGitToken)
+	t.Setenv("GITHUB_TOKEN", testGitHubTokn)
+	t.Setenv("COURIER_RUN_NAME", "coderrun-it-13")
+	t.Setenv("COURIER_REF", "7")
+
+	var output bytes.Buffer
+	var errorsOut bytes.Buffer
+	if code := run(context.Background(), &output, &errorsOut); code != exitSuccess {
+		t.Fatalf("run exit code = %d, want %d; stderr=%q", code, exitSuccess, errorsOut.String())
+	}
+	events := parseEvents(t, &output)
+	bootstrap := findEvent(t, events, "workspace.bootstrap")
+	detail, _ := bootstrap["detail"].(map[string]any)
+	if detail["status"] != "skipped" {
+		t.Fatalf("workspace.bootstrap status = %v, want skipped", detail["status"])
+	}
+	if reason, _ := detail["reason"].(string); reason != approvedSkipReasonUnprovisioned {
+		t.Fatalf("workspace.bootstrap reason = %q, want the unprovisioned reason %q", reason, approvedSkipReasonUnprovisioned)
 	}
 }
 

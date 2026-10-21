@@ -56,6 +56,11 @@ RUN --mount=type=cache,target=/go/pkg/mod \
 # Debian (not alpine) because the opencode npm package ships glibc binaries.
 FROM node:24-bookworm-slim@sha256:55fb5f5a527ea2c5c4a95f963e48ef90aa38c7b346054fdc8ee9957a2b55d205 AS coordinator
 ARG OPENCODE_VERSION=1.18.31
+# mise is pinned because the repository development bootstrap contract (#414)
+# dispatches `mise run bootstrap` in the secure worker; the binary downloads at
+# build time only, never at runtime. linux-x64 matches the amd64-only image
+# builds.
+ARG MISE_VERSION=v2026.10.17
 
 RUN set -eux; \
 	apt-get update && \
@@ -78,6 +83,11 @@ RUN set -eux; \
 	make -j"$(nproc)" -C /tmp/git-src prefix=/usr/local NO_GETTEXT=YesPlease NO_TCLTK=YesPlease all && \
 	make -C /tmp/git-src prefix=/usr/local NO_GETTEXT=YesPlease NO_TCLTK=YesPlease install && \
 	rm -rf /tmp/git-src && \
+	mise_url="https://github.com/jdx/mise/releases/download/${MISE_VERSION}/mise-${MISE_VERSION}-linux-x64" && \
+	wget -qO /tmp/mise "$mise_url" && \
+	echo '239bdfd0fee73beff7c6ce30dcbeed5000af9dbcd0c0dba6e5b93959df741877  /tmp/mise' | sha256sum -c - && \
+	install -m 0755 /tmp/mise /usr/local/bin/mise && \
+	rm /tmp/mise && \
 	apt-get purge -y --auto-remove \
 		build-essential \
 		libssl-dev \
@@ -127,8 +137,22 @@ USER 65532:65532
 
 # Harness image: the secure topology's control, worker, and broker binaries
 # on the coordinator base (git + ca-certificates; no opencode usage). One
-# image for all three components keeps the release unit single.
+# image for all three components keeps the release unit single. harness-go
+# layers the same binaries onto the Go toolchain base for lanes that select
+# a Go runtime.
 FROM coordinator AS harness
+
+COPY --from=binaries /workspace/courier-control /usr/local/bin/courier-control
+COPY --from=binaries /workspace/courier-worker /usr/local/bin/courier-worker
+COPY --from=binaries /workspace/courier-broker /usr/local/bin/courier-broker
+
+USER 65532:65532
+
+# Secure Go toolchain image: the harness topology binaries on the
+# coordinator-go base, so a lane that selects a Go runtime provisions its
+# secure workers too. A worker image selected this way must carry
+# /usr/local/bin/courier-worker; this stage is the published contract.
+FROM coordinator-go AS harness-go
 
 COPY --from=binaries /workspace/courier-control /usr/local/bin/courier-control
 COPY --from=binaries /workspace/courier-worker /usr/local/bin/courier-worker
