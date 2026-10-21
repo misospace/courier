@@ -2,15 +2,50 @@ package dispatch
 
 import (
 	"errors"
+	"fmt"
 	"net/http"
 
 	"github.com/misospace/courier/internal/connector"
 )
 
-// connectorName is the bounded connector label value this adapter reports
-// under. It is the configured adapter name, not a Dispatch endpoint, agent,
-// or queue lane.
-const connectorName = "dispatch"
+// defaultConnectorName is the bounded connector label value an adapter
+// reports under when no configured identity overrides it: the legacy bare
+// Dispatch source. Multiple configured adapters must each carry their own
+// identity (see WithConnectorName) so their metric series stay independent;
+// the label is the configured adapter, never a Dispatch endpoint, agent
+// queue, or lane.
+const defaultConnectorName = "dispatch"
+
+// MaxConnectorNameLength bounds the configured connector label value.
+const MaxConnectorNameLength = 64
+
+// validateConnectorName fails loudly on a configured connector identity that
+// is empty, over-long, or outside the bounded label charset. A connector is
+// identified by its label, so an unbounded or colliding identity is a
+// configuration conflict that would silently merge independent metric
+// series; it panics instead.
+func validateConnectorName(name string) {
+	if name == "" {
+		panic("dispatch source: connector name must not be empty")
+	}
+	if len(name) > MaxConnectorNameLength {
+		panic(fmt.Sprintf("dispatch source: connector name %q exceeds %d characters", name, MaxConnectorNameLength))
+	}
+	alphanumeric := false
+	for _, r := range name {
+		if r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z' || r >= '0' && r <= '9' {
+			alphanumeric = true
+			continue
+		}
+		if r == '.' || r == '_' || r == '-' || r == ':' {
+			continue
+		}
+		panic(fmt.Sprintf("dispatch source: invalid connector name %q: use letters, digits, dot, underscore, hyphen, or colon", name))
+	}
+	if !alphanumeric {
+		panic(fmt.Sprintf("dispatch source: invalid connector name %q: must contain at least one letter or digit", name))
+	}
+}
 
 // Connector-declared reason vocabulary (§3). These values are owned by this
 // connector; the envelope package owns only the signal names. They are closed
@@ -120,7 +155,7 @@ func (c *HTTPClient) countExchangeError(ex *exchangeError) {
 		return
 	}
 	ex.counted = true
-	c.diagnostics.Diagnostic(connectorName, connector.SignalProtocolError, ex.reason)
+	c.diagnostics.Diagnostic(c.connectorName, connector.SignalProtocolError, ex.reason)
 }
 
 // absorbExchange marks a classified exchange as counted under the caller's

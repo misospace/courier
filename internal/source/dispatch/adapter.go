@@ -53,8 +53,9 @@ type API = Client
 // Adapter translates Courier's generic source lifecycle into Dispatch API
 // calls.
 type Adapter struct {
-	client      Client
-	diagnostics *connector.Emitter
+	client        Client
+	diagnostics   *connector.Emitter
+	connectorName string
 }
 
 // Option configures an Adapter at construction.
@@ -73,6 +74,20 @@ func WithConnectorDiagnostics(em *connector.Emitter) Option {
 	}
 }
 
+// WithConnectorName sets the bounded connector identity this adapter reports
+// under. Deployments that configure multiple Dispatch adapters must give each
+// a distinct identity (the configured adapter name, e.g. "dispatch:<agent>"),
+// so their metric series stay independent; a single legacy adapter keeps the
+// default. An empty, over-long, or out-of-charset identity would silently
+// merge or corrupt another connector's series, so it fails loudly at
+// construction.
+func WithConnectorName(name string) Option {
+	return func(a *Adapter) {
+		validateConnectorName(name)
+		a.connectorName = name
+	}
+}
+
 // DispatchAdapter is a descriptive alias for Adapter.
 type DispatchAdapter = Adapter
 
@@ -86,7 +101,7 @@ var _ source.CapacityRecovery = (*Adapter)(nil)
 
 // New creates a Dispatch adapter around an injected API client.
 func New(client Client, opts ...Option) *Adapter {
-	a := &Adapter{client: client}
+	a := &Adapter{client: client, connectorName: defaultConnectorName}
 	for _, opt := range opts {
 		if opt != nil {
 			opt(a)
@@ -112,32 +127,32 @@ func (a *Adapter) declareCapabilities() {
 	if em == nil {
 		return
 	}
-	em.RegisterConnector(connectorName, reasonVocabulary())
+	em.RegisterConnector(a.connectorName, reasonVocabulary())
 	if hc, ok := a.client.(*HTTPClient); ok {
-		hc.WithConnectorDiagnostics(em)
-		em.ExclusionLimit(connectorName, hc.prFixExclusionLimit)
+		hc.WithConnectorDiagnostics(em, a.connectorName)
+		em.ExclusionLimit(a.connectorName, hc.prFixExclusionLimit)
 		if hc.prFixExclusionsEnabled {
-			em.Capability(connectorName, connector.CapabilityDiscoveryExclusions, connector.CapabilitySupported)
+			em.Capability(a.connectorName, connector.CapabilityDiscoveryExclusions, connector.CapabilitySupported)
 		} else {
-			em.Capability(connectorName, connector.CapabilityDiscoveryExclusions, connector.CapabilityUnsupported)
+			em.Capability(a.connectorName, connector.CapabilityDiscoveryExclusions, connector.CapabilityUnsupported)
 		}
 	} else {
-		em.Capability(connectorName, connector.CapabilityDiscoveryExclusions, connector.CapabilityUnsupported)
+		em.Capability(a.connectorName, connector.CapabilityDiscoveryExclusions, connector.CapabilityUnsupported)
 	}
-	em.Capability(connectorName, connector.CapabilityDiscovery, connector.CapabilitySupported)
+	em.Capability(a.connectorName, connector.CapabilityDiscovery, connector.CapabilitySupported)
 	if _, ok := a.client.(ReporterClient); ok {
-		em.Capability(connectorName, connector.CapabilityLifecycleReport, connector.CapabilitySupported)
+		em.Capability(a.connectorName, connector.CapabilityLifecycleReport, connector.CapabilitySupported)
 	} else {
-		em.Capability(connectorName, connector.CapabilityLifecycleReport, connector.CapabilityUnsupported)
+		em.Capability(a.connectorName, connector.CapabilityLifecycleReport, connector.CapabilityUnsupported)
 	}
 	if _, ok := a.client.(PreLauncherClient); ok {
-		em.Capability(connectorName, connector.CapabilityPreLaunchRevalidation, connector.CapabilitySupported)
+		em.Capability(a.connectorName, connector.CapabilityPreLaunchRevalidation, connector.CapabilitySupported)
 	} else {
-		em.Capability(connectorName, connector.CapabilityPreLaunchRevalidation, connector.CapabilityUnsupported)
+		em.Capability(a.connectorName, connector.CapabilityPreLaunchRevalidation, connector.CapabilityUnsupported)
 	}
-	em.Capability(connectorName, connector.CapabilityWorkIdentity, connector.CapabilitySupported)
-	em.Capability(connectorName, connector.CapabilityAvailability, connector.CapabilitySupported)
-	em.Availability(connectorName, connector.AvailabilityUnknown)
+	em.Capability(a.connectorName, connector.CapabilityWorkIdentity, connector.CapabilitySupported)
+	em.Capability(a.connectorName, connector.CapabilityAvailability, connector.CapabilitySupported)
+	em.Availability(a.connectorName, connector.AvailabilityUnknown)
 }
 
 // Discover returns Dispatch work that the operator can materialize as

@@ -107,7 +107,11 @@ Naming rule: the metric family is `courier_connector_*` (Courier owns the
 transport and shape), and the connector's identity is a bounded label, so a
 dashboard can discover and render any connector without a Dispatch-specific
 code path. The connector never ships a metric name that core must know, and core
-never ships a rule that mentions Dispatch.
+never ships a rule that mentions Dispatch. When a connector type admits several
+configured instances, each instance carries its own bounded identity (the
+Dispatch adapter uses its configured adapter name, e.g. `dispatch:<agent>`),
+so independent configured connectors never share — or overwrite — each
+other's series.
 
 ## 3. Connector signal / capability catalogue
 

@@ -1563,7 +1563,9 @@ as a core constant or label. A dashboard enumerates connectors from
 capabilities, so a non-Dispatch connector needs no Dispatch panel and Courier
 works with an alternate source. Absent and unsupported diagnostics are distinct
 from success, core and connector counters are joined rather than summed, labels
-stay bounded, and trace correlation is optional and never a metric label. §11
+stay bounded (each configured connector instance reports under its own bounded
+identity, so independent configured adapters never share metric series), and
+trace correlation is optional and never a metric label. §11
 of that document names the bounded-label, duplicate-counting, privacy, and
 correlation assertions the instrumentation must satisfy; the unit-level subset
 of those assertions runs as `go test` checks today (the envtest no-double-count

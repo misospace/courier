@@ -388,7 +388,14 @@ func main() {
 			if dispatchPRFixExclusions {
 				bindingClient.WithPRFixExclusions(true)
 			}
-			adapter := dispatch.New(bindingClient, dispatch.WithConnectorDiagnostics(diagnostics))
+			opts := []dispatch.Option{dispatch.WithConnectorDiagnostics(diagnostics)}
+			if binding.sourceAgent != "" {
+				// Each configured adapter reports under its own bounded
+				// identity so independent connectors never share metric
+				// series.
+				opts = append(opts, dispatch.WithConnectorName("dispatch:"+binding.sourceAgent))
+			}
+			adapter := dispatch.New(bindingClient, opts...)
 			if binding.sourceAgent != "" {
 				sources.Register("dispatch:"+binding.sourceAgent, adapter)
 			}
@@ -570,6 +577,12 @@ func resolveDispatchBindings(baseAgentName, queueLane, laneProfile string, repea
 		}
 		if !validDispatchAgentName(binding.agentName) {
 			return nil, fmt.Errorf("dispatch: invalid agent name %q: use letters, digits, dot, underscore, or hyphen", binding.agentName)
+		}
+		// The composed connector identity "dispatch:<agent>" must fit the
+		// adapter's bounded connector label, otherwise startup would panic
+		// inside dispatch.New instead of failing fast with a setup error.
+		if len("dispatch:"+binding.agentName) > dispatch.MaxConnectorNameLength {
+			return nil, fmt.Errorf("dispatch: agent name %q exceeds %d characters", binding.agentName, dispatch.MaxConnectorNameLength-len("dispatch:"))
 		}
 		if _, ok := seenAgents[binding.agentName]; ok {
 			return nil, fmt.Errorf("dispatch: duplicate agent identity %q", binding.agentName)

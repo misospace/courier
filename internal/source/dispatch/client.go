@@ -145,6 +145,7 @@ type HTTPClient struct {
 	prFixExclusionLimit      int
 	reportIdempotencyEnabled bool
 	diagnostics              *connector.Emitter
+	connectorName            string
 }
 
 // NewClient creates a Dispatch HTTP client without a queue lane override.
@@ -188,12 +189,15 @@ func (c *HTTPClient) WithPRFixExclusionLimit(limit int) *HTTPClient {
 }
 
 // WithConnectorDiagnostics attaches the connector diagnostic envelope the
-// client emits its own diagnostics through. A nil emitter leaves every
+// client emits its own diagnostics through, together with the bounded
+// connector identity every emission carries. A nil emitter leaves every
 // emission a no-op, so existing call sites are unchanged. Registration of the
 // connector name, vocabulary, exclusion limit, and capability catalogue
 // happens once at adapter construction.
-func (c *HTTPClient) WithConnectorDiagnostics(em *connector.Emitter) *HTTPClient {
+func (c *HTTPClient) WithConnectorDiagnostics(em *connector.Emitter, connectorName string) *HTTPClient {
+	validateConnectorName(connectorName)
 	c.diagnostics = em
+	c.connectorName = connectorName
 	return c
 }
 
@@ -229,6 +233,7 @@ func newClient(baseURL, agentName, queueLane, token string, timeout time.Duratio
 		queueLane:                strings.TrimSpace(queueLane),
 		httpClient:               httpClient,
 		prFixExclusionLimit:      maxPRFixExclusions,
+		connectorName:            defaultConnectorName,
 	}, nil
 }
 
@@ -272,12 +277,12 @@ func (c *HTTPClient) discoverWithExclusions(ctx context.Context, query url.Value
 		}
 		repo := strings.ToLower(d.Repo)
 		if !dispatchRepoPattern.MatchString(repo) || d.Number > maxSafeInteger || d.Generation > maxSafeInteger {
-			c.diagnostics.Diagnostic(connectorName, connector.SignalProtocolError, reasonInvalidDescriptor)
+			c.diagnostics.Diagnostic(c.connectorName, connector.SignalProtocolError, reasonInvalidDescriptor)
 			return nil, fmt.Errorf("dispatch client: invalid PR-fix exclusion descriptor")
 		}
 		value := fmt.Sprintf("%s#%d@%d", repo, d.Number, d.Generation)
 		if len(value) > 300 {
-			c.diagnostics.Diagnostic(connectorName, connector.SignalProtocolError, reasonInvalidDescriptor)
+			c.diagnostics.Diagnostic(c.connectorName, connector.SignalProtocolError, reasonInvalidDescriptor)
 			return nil, fmt.Errorf("dispatch client: PR-fix exclusion exceeds maximum 300 characters")
 		}
 		if _, exists := seen[value]; exists {
@@ -291,7 +296,7 @@ func (c *HTTPClient) discoverWithExclusions(ctx context.Context, query url.Value
 	if dropped := len(seen) - c.prFixExclusionLimit; dropped > 0 {
 		log.FromContext(ctx).Info("dispatch client: PR-fix exclusions exceed contract maximum, keeping the most relevant", "agent", c.agentName, "kept", c.prFixExclusionLimit, "dropped", dropped)
 	}
-	c.diagnostics.ExclusionCycle(connectorName, len(seen), len(values))
+	c.diagnostics.ExclusionCycle(c.connectorName, len(seen), len(values))
 	for _, value := range values {
 		query.Add("exclude_pr_fix", value)
 	}
@@ -318,13 +323,13 @@ func (c *HTTPClient) discover(ctx context.Context, query url.Values) (items []so
 	defer func() {
 		if err != nil {
 			if ex := exchangeOf(err); ex != nil && ex.reason == reasonTransportError {
-				c.diagnostics.Availability(connectorName, connector.AvailabilityUnreachable)
+				c.diagnostics.Availability(c.connectorName, connector.AvailabilityUnreachable)
 				return
 			}
-			c.diagnostics.Availability(connectorName, connector.AvailabilityDegraded)
+			c.diagnostics.Availability(c.connectorName, connector.AvailabilityDegraded)
 			return
 		}
-		c.diagnostics.Availability(connectorName, connector.AvailabilityAvailable)
+		c.diagnostics.Availability(c.connectorName, connector.AvailabilityAvailable)
 	}()
 	var response nextTaskResponse
 	endpoint := "/api/agents/" + url.PathEscape(c.agentName) + "/next-task"
@@ -337,27 +342,27 @@ func (c *HTTPClient) discover(ctx context.Context, query url.Values) (items []so
 	if query != nil && query.Has("exclude_pr_fix_version") {
 		var ack map[string]json.RawMessage
 		if len(response.PRFixExclusions) == 0 {
-			c.diagnostics.Diagnostic(connectorName, connector.SignalAck, reasonAckMissing)
+			c.diagnostics.Diagnostic(c.connectorName, connector.SignalAck, reasonAckMissing)
 			return nil, fmt.Errorf("dispatch client: missing or invalid PR-fix exclusions acknowledgment")
 		}
 		if json.Unmarshal(response.PRFixExclusions, &ack) != nil || ack == nil {
-			c.diagnostics.Diagnostic(connectorName, connector.SignalAck, reasonAckInvalid)
+			c.diagnostics.Diagnostic(c.connectorName, connector.SignalAck, reasonAckInvalid)
 			return nil, fmt.Errorf("dispatch client: missing or invalid PR-fix exclusions acknowledgment")
 		}
 		version, ok := ack["version"]
 		var versionValue int
 		if !ok || json.Unmarshal(version, &versionValue) != nil || versionValue != 1 {
-			c.diagnostics.Diagnostic(connectorName, connector.SignalAck, reasonAckVersionUnsupported)
+			c.diagnostics.Diagnostic(c.connectorName, connector.SignalAck, reasonAckVersionUnsupported)
 			return nil, fmt.Errorf("dispatch client: unsupported PR-fix exclusions acknowledgment")
 		}
-		c.diagnostics.Diagnostic(connectorName, connector.SignalAck, reasonAckOK)
+		c.diagnostics.Diagnostic(c.connectorName, connector.SignalAck, reasonAckOK)
 	}
 	task := response.Task
 	if !task.ShouldRun || task.Type == "idle" {
 		return nil, nil
 	}
 	if task.Type != "implement" && task.Type != "followup-pr" {
-		c.diagnostics.Diagnostic(connectorName, connector.SignalProtocolError, reasonUnsupportedTaskType)
+		c.diagnostics.Diagnostic(c.connectorName, connector.SignalProtocolError, reasonUnsupportedTaskType)
 		return nil, fmt.Errorf("dispatch client: unsupported task type %q", task.Type)
 	}
 	itemID, err := taskWorkItem(task)
@@ -671,7 +676,7 @@ func (c *HTTPClient) asSuperseded(err error) error {
 	var apiErr *APIError
 	if errors.As(err, &apiErr) && apiErr.StatusCode == http.StatusConflict &&
 		(strings.Contains(strings.ToLower(apiErr.Message), "generation mismatch") || strings.Contains(strings.ToLower(apiErr.Message), "expected generation")) {
-		c.diagnostics.Diagnostic(connectorName, connector.SignalIdentity, reasonIdentityGenerationAdvanced)
+		c.diagnostics.Diagnostic(c.connectorName, connector.SignalIdentity, reasonIdentityGenerationAdvanced)
 		absorbExchange(err)
 		return fmt.Errorf("%w: %w", source.ErrSuperseded, err)
 	}
@@ -920,7 +925,7 @@ func (c *HTTPClient) reportTaskWithPR(ctx context.Context, d workDescriptor, out
 		// The source rejected the outcome; this classification path owns the
 		// exchange's diagnostic under the unsupported-task-type class, and
 		// the report outcome itself is counted at the Report boundary.
-		c.diagnostics.Diagnostic(connectorName, connector.SignalProtocolError, reasonUnsupportedTaskType)
+		c.diagnostics.Diagnostic(c.connectorName, connector.SignalProtocolError, reasonUnsupportedTaskType)
 		absorbExchange(err)
 		return fmt.Errorf("%w: %w", source.ErrUnsupportedOutcome, apiErr)
 	}
@@ -967,7 +972,7 @@ func (c *HTTPClient) PreLaunch(ctx context.Context, id string) error {
 		return err
 	}
 	if d.Type != "followup-pr" {
-		c.diagnostics.Diagnostic(connectorName, connector.SignalRevalidation, reasonRevalidationCurrent)
+		c.diagnostics.Diagnostic(c.connectorName, connector.SignalRevalidation, reasonRevalidationCurrent)
 		return nil
 	}
 	pullRequest := &PullRequest{Repo: d.Repo, Number: d.Number}
@@ -983,16 +988,16 @@ func (c *HTTPClient) PreLaunch(ctx context.Context, id string) error {
 			// The STALE mark released the queue-backed attempt's hand-out,
 			// so the compare-and-set claim of this attempt is gone before
 			// launch (§3.4): a normal outcome, counted under identity.
-			c.diagnostics.Diagnostic(connectorName, connector.SignalIdentity, reasonIdentityClaimReleased)
+			c.diagnostics.Diagnostic(c.connectorName, connector.SignalIdentity, reasonIdentityClaimReleased)
 		}
 		reason := reasonRevalidationClosedUnmerged
 		if state.Merged {
 			reason = reasonRevalidationMerged
 		}
-		c.diagnostics.Diagnostic(connectorName, connector.SignalRevalidation, reason)
+		c.diagnostics.Diagnostic(c.connectorName, connector.SignalRevalidation, reason)
 		return fmt.Errorf("%w: upstream pull request %s#%d is no longer open", source.ErrStaleWork, d.Repo, d.Number)
 	}
-	c.diagnostics.Diagnostic(connectorName, connector.SignalRevalidation, reasonRevalidationCurrent)
+	c.diagnostics.Diagnostic(c.connectorName, connector.SignalRevalidation, reasonRevalidationCurrent)
 	return nil
 }
 
@@ -1058,13 +1063,13 @@ func (c *HTTPClient) Report(ctx context.Context, id string, lifecycle source.Lif
 func (c *HTTPClient) emitReportOutcome(final error) {
 	switch {
 	case final == nil:
-		c.diagnostics.Diagnostic(connectorName, connector.SignalReport, reasonReportPublished)
+		c.diagnostics.Diagnostic(c.connectorName, connector.SignalReport, reasonReportPublished)
 	case errors.Is(final, source.ErrSuperseded):
-		c.diagnostics.Diagnostic(connectorName, connector.SignalIdentity, reasonIdentitySuperseded)
+		c.diagnostics.Diagnostic(c.connectorName, connector.SignalIdentity, reasonIdentitySuperseded)
 	case errors.Is(final, source.ErrUnsupportedOutcome):
-		c.diagnostics.Diagnostic(connectorName, connector.SignalReport, reasonReportUnsupported)
+		c.diagnostics.Diagnostic(c.connectorName, connector.SignalReport, reasonReportUnsupported)
 	default:
-		c.diagnostics.Diagnostic(connectorName, connector.SignalReport, reasonReportRetryable)
+		c.diagnostics.Diagnostic(c.connectorName, connector.SignalReport, reasonReportRetryable)
 	}
 }
 

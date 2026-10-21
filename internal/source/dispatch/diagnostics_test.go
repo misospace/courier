@@ -133,7 +133,7 @@ func gaugeValue(t *testing.T, reg *prometheus.Registry, name string, labels map[
 func diagnosticsCounter(t *testing.T, f *diagnosticsFixture, signal, reason string) float64 {
 	t.Helper()
 	got, ok := counterValue(t, f.reg, map[string]string{
-		"connector": connectorName, "signal": signal, "reason": reason,
+		"connector": defaultConnectorName, "signal": signal, "reason": reason,
 	})
 	if !ok {
 		return -1
@@ -191,7 +191,7 @@ func TestOneOverflowDiagnosticPerExclusionCycle(t *testing.T) {
 	if got := diagnosticsCounter(t, f, connector.SignalExclusion, connector.ReasonOverflow); got != 1 {
 		t.Fatalf("overflow counter = %v, want exactly 1", got)
 	}
-	conn := map[string]string{"connector": connectorName}
+	conn := map[string]string{"connector": defaultConnectorName}
 	for name, want := range map[string]float64{
 		connector.MetricExclusionRequested: 34,
 		connector.MetricExclusionAccepted:  32,
@@ -224,7 +224,7 @@ func TestExclusionLimitExportedAndTruncationConfigurable(t *testing.T) {
 	if got := len(f.excluded[0]); got != 5 {
 		t.Fatalf("request carried %d exclusions, want 5", got)
 	}
-	conn := map[string]string{"connector": connectorName}
+	conn := map[string]string{"connector": defaultConnectorName}
 	for name, want := range map[string]float64{
 		connector.MetricExclusionLimit:     5,
 		connector.MetricExclusionRequested: 7,
@@ -352,18 +352,18 @@ func TestUndeclaredReasonFoldsToOther(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	client.WithConnectorDiagnostics(em)
+	client.WithConnectorDiagnostics(em, defaultConnectorName)
 	if _, err := client.Discover(context.Background()); err == nil {
 		t.Fatal("failing poll unexpectedly succeeded")
 	}
 	got, ok := counterValue(t, reg, map[string]string{
-		"connector": connectorName, "signal": connector.SignalProtocolError, "reason": connector.ReasonOther,
+		"connector": defaultConnectorName, "signal": connector.SignalProtocolError, "reason": connector.ReasonOther,
 	})
 	if !ok || got != 1 {
 		t.Fatalf("unregistered vocabulary counter = %v, ok=%v; want reason=other at 1", got, ok)
 	}
 	if _, ok := counterValue(t, reg, map[string]string{
-		"connector": connectorName, "signal": connector.SignalProtocolError, "reason": reasonHTTP5xx,
+		"connector": defaultConnectorName, "signal": connector.SignalProtocolError, "reason": reasonHTTP5xx,
 	}); ok {
 		t.Fatal("undeclared reason leaked past the envelope boundary")
 	}
@@ -421,7 +421,7 @@ func TestCapabilityCatalogueAndClosedLabels(t *testing.T) {
 
 	declaredReasons := reasonVocabulary()
 	closedValues := map[string][]string{
-		"connector":  {connectorName},
+		"connector":  {defaultConnectorName},
 		"signal":     append(slices.Clone(connector.Signals), connector.ReasonOther),
 		"state":      slices.Concat(connector.CapabilityStates, connector.AvailabilityStates),
 		"capability": connector.Capabilities,
@@ -478,7 +478,7 @@ func TestUntracedDeploymentEmitsWithoutCorrelationLabels(t *testing.T) {
 		t.Fatal(err)
 	}
 	if _, ok := findSeries(t, f.reg, connector.MetricCapabilityInfo, map[string]string{
-		"connector": connectorName, "capability": connector.CapabilityDiscovery, "state": connector.CapabilitySupported,
+		"connector": defaultConnectorName, "capability": connector.CapabilityDiscovery, "state": connector.CapabilitySupported,
 	}); !ok {
 		t.Fatal("capability catalogue did not emit")
 	}
@@ -488,7 +488,7 @@ func TestUntracedDeploymentEmitsWithoutCorrelationLabels(t *testing.T) {
 	if got := diagnosticsCounter(t, f, connector.SignalAvailability, connector.AvailabilityAvailable); got != 1 {
 		t.Fatalf("availability/available counter = %v, want 1", got)
 	}
-	conn := map[string]string{"connector": connectorName}
+	conn := map[string]string{"connector": defaultConnectorName}
 	for _, name := range []string{
 		connector.MetricExclusionRequested, connector.MetricExclusionAccepted,
 		connector.MetricExclusionOverflow, connector.MetricExclusionLimit,
@@ -531,7 +531,7 @@ func TestInvalidDescriptorFailsClosedWithDiagnostic(t *testing.T) {
 	if polls != 0 {
 		t.Fatalf("discovery requests = %d, want 0 (failed closed before send)", polls)
 	}
-	if got, ok := gaugeValue(t, f.reg, connector.MetricExclusionRequested, map[string]string{"connector": connectorName}); ok {
+	if got, ok := gaugeValue(t, f.reg, connector.MetricExclusionRequested, map[string]string{"connector": defaultConnectorName}); ok {
 		t.Errorf("aborted cycle exported exclusion_requested = %v, want no cycle observation", got)
 	}
 }
@@ -719,4 +719,84 @@ func TestDefaultDiscoveryAvailabilityStates(t *testing.T) {
 			t.Fatalf("protocol-error/transport-error counter = %v, want 1", got)
 		}
 	})
+}
+
+// TestConfiguredAdaptersKeepIndependentSeries is the connector-identity
+// regression (§2): two configured Dispatch adapters sharing one emitter each
+// emit under their own bounded connector label, so neither adapter's
+// diagnostics, exclusion gauges, capability catalogue, or availability state
+// collide with — or overwrite — the other's.
+func TestConfiguredAdaptersKeepIndependentSeries(t *testing.T) {
+	reg := prometheus.NewRegistry()
+	em := connector.NewEmitter(reg, nil)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		http.Error(w, "boom", http.StatusInternalServerError)
+	}))
+	defer server.Close()
+
+	for _, name := range []string{"dispatch:cloud", "dispatch:local"} {
+		client, err := NewClient(server.URL, strings.TrimPrefix(name, "dispatch:"), "token", time.Second)
+		if err != nil {
+			t.Fatal(err)
+		}
+		New(client, WithConnectorDiagnostics(em), WithConnectorName(name))
+		if _, err := client.Discover(context.Background()); err == nil {
+			t.Fatal("failing poll unexpectedly succeeded")
+		}
+	}
+
+	for _, name := range []string{"dispatch:cloud", "dispatch:local"} {
+		if got, ok := counterValue(t, reg, map[string]string{
+			"connector": name, "signal": connector.SignalProtocolError, "reason": reasonHTTP5xx,
+		}); !ok || got != 1 {
+			t.Fatalf("%s protocol-error/http-5xx counter = %v, ok=%v; want 1 under its own series", name, got, ok)
+		}
+		if got, ok := counterValue(t, reg, map[string]string{
+			"connector": name, "signal": connector.SignalAvailability, "reason": connector.AvailabilityUnknown,
+		}); !ok || got != 1 {
+			t.Fatalf("%s availability/unknown counter = %v, ok=%v; want 1 under its own series", name, got, ok)
+		}
+		if _, ok := gaugeValue(t, reg, connector.MetricExclusionLimit, map[string]string{"connector": name}); !ok {
+			t.Fatalf("%s exclusion limit gauge missing", name)
+		}
+		if _, ok := gaugeValue(t, reg, connector.MetricExclusionPressure, map[string]string{"connector": name}); ok {
+			t.Fatalf("%s exclusion pressure gauge exists without a cycle; series leaked from another connector", name)
+		}
+		if _, ok := findSeries(t, reg, connector.MetricCapabilityInfo, map[string]string{
+			"connector": name, "capability": connector.CapabilityDiscovery, "state": connector.CapabilitySupported,
+		}); !ok {
+			t.Fatalf("%s capability catalogue missing", name)
+		}
+	}
+	if _, ok := counterValue(t, reg, map[string]string{
+		"connector": defaultConnectorName, "signal": connector.SignalProtocolError, "reason": reasonHTTP5xx,
+	}); ok {
+		t.Fatal("configured adapters leaked diagnostics onto the legacy bare dispatch series")
+	}
+	if _, ok := findSeries(t, reg, connector.MetricCapabilityInfo, map[string]string{
+		"connector": defaultConnectorName, "capability": connector.CapabilityDiscovery,
+	}); ok {
+		t.Fatal("configured adapters leaked capability series onto the legacy bare dispatch series")
+	}
+}
+
+// TestWithConnectorNameRejectsUnboundedIdentity pins the loud-failure
+// contract for configured connector identities: an empty, over-long, or
+// out-of-charset label value fails at construction instead of silently
+// merging independent metric series.
+func TestWithConnectorNameRejectsUnboundedIdentity(t *testing.T) {
+	for _, name := range []string{"", ":", strings.Repeat("a", MaxConnectorNameLength+1), "has space", "bad/slash"} {
+		client, err := NewClient("http://localhost", "worker", "token", time.Second)
+		if err != nil {
+			t.Fatal(err)
+		}
+		func() {
+			defer func() {
+				if recover() == nil {
+					t.Fatalf("connector name %q unexpectedly accepted", name)
+				}
+			}()
+			New(client, WithConnectorName(name))
+		}()
+	}
 }
