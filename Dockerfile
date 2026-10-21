@@ -85,7 +85,7 @@ RUN set -eux; \
 	rm -rf /tmp/git-src && \
 	mise_url="https://github.com/jdx/mise/releases/download/${MISE_VERSION}/mise-${MISE_VERSION}-linux-x64" && \
 	wget -qO /tmp/mise "$mise_url" && \
-	echo '239bdfd0fee73beff7c6ce30dcbeed5000af9dbcd0c0dba6e5b93959df741877  /tmp/mise' | sha256sum -c - && \
+	echo 'fe6dd17e68e09682b31d2e7bb7bb755d22636ac1af5d94621e300f2ca9e9fe8a  /tmp/mise' | sha256sum -c - && \
 	install -m 0755 /tmp/mise /usr/local/bin/mise && \
 	rm /tmp/mise && \
 	apt-get purge -y --auto-remove \
