@@ -206,8 +206,12 @@ on the run branch; the declaration never substitutes for that check (#169):
   committed and pushed and the pull request is opened or updated. Verified
   commits reachable from the run branch → exit `0`, **Verifying**. Work committed
   only elsewhere is not run success.
-- **`no_change_needed`** — nothing to do, with evidence. The executor posts the
-  complete evidence as a redacted issue/PR comment, then exits `3`. A
+- **`no_change_needed`** — nothing to do, with evidence. The executor posts no
+  comment for this outcome: it cannot authoritatively verify a success claim,
+  and the controller's lifecycle settlement is authoritative (#474). The
+  evidence rides the redacted, bounded termination reason — `run.exit`
+  telemetry and the `COURIER_TERMINATION` handoff — and the executor exits
+  `3`. A
   resolve-issue run ends in **AwaitingReview** and moves the source to
   `in-review` for a human to settle. A fix-pr run is settled against the world
   through **Verifying**: a merged/already-addressed pull request reaches
@@ -237,8 +241,12 @@ on the run branch; the declaration never substitutes for that check (#169):
   failure discovered after publication is not this outcome: it follows the
   operator's verification and source failure policy.
 
-Comments preserve the full declared evidence, question, or missing explanation
-after redaction; they are not shortened to the termination reason. Comment
+Outcome comments are human-attention requests the executor can authoritatively
+stand behind: `needs_decision` and `blocked_external` preserve the full declared
+question or missing explanation after redaction; they are not shortened to the
+termination reason. The executor never publishes a comment for a success claim
+(`no_change_needed`) — the controller settles that ending against the world
+(#474). Comment
 posting is best-effort: failures are logged as `outcome.comment` and do not change
 the run ending. The separate termination reason is bounded and redacted before it
 is published. An undeclared ending is not interpreted as a coordinator's human
@@ -1541,12 +1549,18 @@ model that separates executor completion from external disposition and renders
 unknown/stale/absent as states distinct from idle or healthy. It defines units,
 clocks, counter/gauge reset behaviour, and a bounded-label privacy budget that
 keeps run ids, issue/PR numbers, repo names, arbitrary error strings, and secrets
-out of labels, with per-run correlation left to the structured log. #291 owns
-the connector diagnostics and #292 the views and alerts that consume these
-signals; the thresholds and windows are design candidates, not defaults. The
-core run, execution, lifecycle-report, and retention exporters ship with the
-operator; the source-discovery and reservation signals, the dashboards, and the
-alert rules remain unimplemented design, and nothing here authorizes them.
+out of labels, with per-run correlation left to the structured log. Every
+signal layer of the catalogue now ships with the operator: the discovery
+(§3.2) and lane-capacity/reservation (§3.3) layers — `courier_source_*` emitted
+nil-safely by the discovery runner (`internal/source/metrics.go`), and
+`courier_lane_concurrency`, `courier_lane_reservations`,
+`courier_coderuns_pending`, and `courier_lane_oldest_reservation_age_seconds`
+read live at scrape time (`internal/controller/metrics.go`) — and the phase,
+execution-outcome, lifecycle-report, and retention additions of §3.4–§3.7.
+#291 owns the connector diagnostics and #292 the views and alerts that consume
+these signals; the thresholds and windows are design candidates, not defaults.
+The dashboards and the alert rules themselves remain unimplemented design, and
+nothing here authorizes them.
 
 **Connector diagnostics without core coupling (#291).**
 [docs/connector-diagnostics.md](./docs/connector-diagnostics.md) specifies
@@ -1590,12 +1604,10 @@ execution and outcomes, lifecycle reporting, retention, and optional connector
 panels. It separates the portable specification from optional executable
 dashboard/rule assets, names the evaluator an OTel-based integration must
 supply (OTLP is transport, not an alert engine), and records the
-instrumentation gaps — no discovery or reservation metrics — that a later
-instrumentation decision must close before those views exist. The
-lifecycle-report and retention metrics those views need ship with the operator;
-the dashboards and alert rules themselves do not. #290 owns the signal/health
-semantics and #291 the connector diagnostics this layer consumes; neither is
-required for a Courier dashboard to be useful standalone.
+instrumentation gaps — the dashboards and the alert rules themselves — that a
+later instrumentation decision must close before those views exist. #290 owns
+the signal/health semantics and #291 the connector diagnostics this layer
+consumes; neither is required for a Courier dashboard to be useful standalone.
 
 ### Per-run telemetry
 

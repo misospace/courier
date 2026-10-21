@@ -635,7 +635,15 @@ func TestRunCommittedDeclarationWithWorkStaysVerifying(t *testing.T) {
 	}
 }
 
-func TestRunDeclaredNoChangeNeededExitsThreeAndComments(t *testing.T) {
+// TestRunDeclaredNoChangeNeededExitsThreeWithoutComment pins the #474
+// outcome/comment contract: a clean no_change_needed declaration is a success
+// claim the executor cannot authoritatively verify, so the executor publishes
+// no terminal comment for it. The evidence rides the termination reason —
+// run.exit telemetry and the COURIER_TERMINATION handoff — and the public
+// record stays the coordinator's own handoff plus the controller's lifecycle
+// report, which is the single publication that may contradict a generic
+// comment.
+func TestRunDeclaredNoChangeNeededExitsThreeWithoutComment(t *testing.T) {
 	root := t.TempDir()
 	remote := remoteWithExistingBranch(t, root)
 	fakeOpenCode := filepath.Join(root, "opencode")
@@ -677,11 +685,66 @@ func TestRunDeclaredNoChangeNeededExitsThreeAndComments(t *testing.T) {
 	}
 	mu.Lock()
 	defer mu.Unlock()
-	if len(comments) != 1 {
-		t.Fatalf("comments = %d, want 1", len(comments))
+	if len(comments) != 0 {
+		t.Fatalf("comments = %d, want 0: the executor must not publish a terminal comment for a no_change_needed declaration (#474); posted %q", len(comments), comments)
 	}
-	if !strings.Contains(comments[0], "already addressed") || !strings.Contains(comments[0], "already fixed in v2") {
-		t.Fatalf("comment = %q", comments[0])
+}
+
+// TestRunFixPRDeclaredNoChangeNeededNeverClaimsAddressed proves the open
+// fix-pr half of the #474 contract: a fix-pr run declaring no_change_needed
+// exits 3 for the controller's Verifying settlement and publishes no comment.
+// The controller can still end such a run BlockedExternal because a clean
+// workspace does not verify queued feedback resolution, so an executor
+// comment claiming the work is already addressed could contradict the run's
+// authoritative lifecycle state.
+func TestRunFixPRDeclaredNoChangeNeededNeverClaimsAddressed(t *testing.T) {
+	root := t.TempDir()
+	remote := remoteWithExistingBranch(t, root)
+	fakeOpenCode := filepath.Join(root, "opencode")
+	writeExecutable(t, fakeOpenCode, "#!/bin/sh\ncase \"$1\" in mcp) exit 0;; esac\nmkdir -p \"$COURIER_SCRATCH_DIR\"\nprintf '{\"outcome\":\"no_change_needed\",\"evidence\":\"feedback looks addressed\"}' > \"$COURIER_SCRATCH_DIR/outcome.json\"\nexit 0\n")
+
+	var mu sync.Mutex
+	var comments []string
+	api := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/comments") {
+			body, _ := io.ReadAll(r.Body)
+			mu.Lock()
+			comments = append(comments, string(body))
+			mu.Unlock()
+			_, _ = w.Write([]byte(`{"id":1}`))
+			return
+		}
+		_, _ = io.WriteString(w, `[]`)
+	}))
+	defer api.Close()
+	setResolveIssueEnv(t, root, remote, api.URL, fakeOpenCode)
+	t.Setenv("COURIER_MODE", "fix-pr")
+	// A same-repo head identity keeps the fix-pr head guard out of the way;
+	// the run still exercises the fix-pr classify path.
+	t.Setenv("COURIER_HEAD_REPO", "acme/widgets")
+	t.Setenv("COURIER_REF", "7")
+	t.Setenv("COURIER_RUN_NAME", "coderrun-it-7")
+	t.Setenv("GITHUB_TOKEN", "test-token")
+
+	var output bytes.Buffer
+	var errorsOut bytes.Buffer
+	if code := run(context.Background(), &output, &errorsOut); code != exitNoChangeNeeded {
+		t.Fatalf("run exit code = %d, want %d; stderr=%q stdout=%q", code, exitNoChangeNeeded, errorsOut.String(), output.String())
+	}
+	if !strings.Contains(output.String(), `"phase":"NoChangeNeeded"`) {
+		t.Fatalf("no-change-needed phase = %q", output.String())
+	}
+	if !strings.Contains(output.String(), `"outcome":"no_change_needed"`) {
+		t.Fatalf("termination missing outcome: %q", output.String())
+	}
+	if !strings.Contains(output.String(), "opencode declared no change needed: feedback looks addressed") {
+		t.Fatalf("no-change-needed reason = %q", output.String())
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if len(comments) != 0 {
+		t.Fatalf("comments = %d, want 0: a fix-pr no_change_needed run must never publish a comment that could claim the work is already addressed (#474); posted %q", len(comments), comments)
 	}
 }
 
