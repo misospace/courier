@@ -799,16 +799,18 @@ func TestLegacyAndShorthandAdaptersShareOneConnectorIdentity(t *testing.T) {
 	// The legacy bare adapter and the shorthand lane binding: same agent,
 	// same bare connector identity, exactly as cmd/main.go builds them when
 	// the binding carries no source agent.
-	adapters := []*HTTPClient{}
-	for _, agent := range []string{"worker", "worker"} {
-		client, err := NewClient(server.URL, agent, "token", time.Second)
-		if err != nil {
-			t.Fatal(err)
-		}
-		New(client, WithConnectorDiagnostics(em))
-		adapters = append(adapters, client)
+	legacyClient, err := NewClient(server.URL, "worker", "token", time.Second)
+	if err != nil {
+		t.Fatal(err)
 	}
-	for _, client := range adapters {
+	New(legacyClient, WithConnectorDiagnostics(em))
+	shorthandClient, err := NewClient(server.URL, "worker", "token", time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	New(shorthandClient, WithConnectorDiagnostics(em))
+
+	for _, client := range []*HTTPClient{legacyClient, shorthandClient} {
 		if _, err := client.Discover(context.Background()); err == nil {
 			t.Fatal("failing poll unexpectedly succeeded")
 		}

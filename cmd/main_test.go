@@ -214,7 +214,11 @@ func TestResolveDispatchBindings(t *testing.T) {
 // talk to the same Dispatch agent. That sharing is only sound while at most
 // one binding carries the bare identity: two adapters under one identity
 // would merge independent connectors' series.
+//
+// The table is a characterisation of today's binding derivation, read
+// through the invariant: the count of bindings that carry no source agent.
 func TestResolveDispatchBindingsBoundsTheBareConnectorIdentity(t *testing.T) {
+	const baseAgent = "courier"
 	tests := []struct {
 		name      string
 		queueLane string
@@ -246,7 +250,7 @@ func TestResolveDispatchBindingsBoundsTheBareConnectorIdentity(t *testing.T) {
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			bindings, err := resolveDispatchBindings("courier", test.queueLane, test.lane, test.repeated)
+			bindings, err := resolveDispatchBindings(baseAgent, test.queueLane, test.lane, test.repeated)
 			if err != nil {
 				t.Fatalf("resolveDispatchBindings() error = %v", err)
 			}
@@ -258,8 +262,8 @@ func TestResolveDispatchBindingsBoundsTheBareConnectorIdentity(t *testing.T) {
 				bare++
 				// The bare identity is one Dispatch agent's identity, so the
 				// binding must use the same agent name the legacy client uses.
-				if binding.agentName != "courier" {
-					t.Fatalf("bare binding agent name = %q, want the base agent name %q", binding.agentName, "courier")
+				if binding.agentName != baseAgent {
+					t.Fatalf("bare binding agent name = %q, want the base agent name %q", binding.agentName, baseAgent)
 				}
 			}
 			if bare != test.wantBare {

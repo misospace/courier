@@ -179,22 +179,17 @@ func TestNoDoubleCountBetweenCoreAndConnectorDiagnostics(t *testing.T) {
 	}
 
 	// The two sides observed the same cycle: joining them on
-	// (connector, cycle id) yields one logical failure, not two.
+	// (connector, cycle id) yields one logical failure, not two. The
+	// observations come from the exported state — one per side — and the
+	// cycle id is the fixture's: no cycle identifier crosses the metric
+	// boundary, because it must never become a label.
 	cycle := connectortest.Cycle{Connector: defaultConnectorName, ID: duplicateCountingCycleID}
-	observations := make([]connectortest.Observation, 0, 2)
-	for i := 0; i < int(coreDelta); i++ {
-		observations = append(observations, connectortest.Observation{
-			Cycle:  cycle,
-			Side:   connectortest.SideCore,
-			Reason: coreFailureReason,
-		})
+	observations := []connectortest.Observation{
+		{Cycle: cycle, Side: connectortest.SideCore, Reason: coreFailureReason},
+		{Cycle: cycle, Side: connectortest.SideConnector, Reason: reasonHTTP5xx},
 	}
-	for i := 0; i < int(connectorDelta); i++ {
-		observations = append(observations, connectortest.Observation{
-			Cycle:  cycle,
-			Side:   connectortest.SideConnector,
-			Reason: reasonHTTP5xx,
-		})
+	if len(observations) != 2 {
+		t.Fatalf("observations = %d, want one per side", len(observations))
 	}
 	if joined := connectortest.Join(observations); joined != 1 {
 		t.Fatalf("joined failures = %d, want 1 (not 2) for one logical failure", joined)
@@ -257,16 +252,15 @@ func TestNoDoubleCountJoinsOneFailurePerCycle(t *testing.T) {
 	}
 
 	observations := make([]connectortest.Observation, 0, 4)
-	for i := range int(coreDelta) {
+	for cycle := range 2 {
+		id := fmt.Sprintf("cycle-%d", cycle+1)
 		observations = append(observations, connectortest.Observation{
-			Cycle:  connectortest.Cycle{Connector: defaultConnectorName, ID: fmt.Sprintf("cycle-%d", i+1)},
+			Cycle:  connectortest.Cycle{Connector: defaultConnectorName, ID: id},
 			Side:   connectortest.SideCore,
 			Reason: coreFailureReason,
 		})
-	}
-	for i := range int(connectorDelta) {
 		observations = append(observations, connectortest.Observation{
-			Cycle:  connectortest.Cycle{Connector: defaultConnectorName, ID: fmt.Sprintf("cycle-%d", i+1)},
+			Cycle:  connectortest.Cycle{Connector: defaultConnectorName, ID: id},
 			Side:   connectortest.SideConnector,
 			Reason: reasonHTTP5xx,
 		})

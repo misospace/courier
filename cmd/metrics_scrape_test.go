@@ -20,6 +20,12 @@ package main
 //
 // The invariant is about the metric exposition surface, not about cluster
 // state, so the fixture needs no API server: the test always runs.
+//
+// The manager's registry is process-global, so the fixture registers the
+// manager's families once per test binary. A future test in this package that
+// drives the reconciler must not register them again: the controller's run
+// recorder already registers its families on the manager's registry
+// (internal/controller/metrics.go), and a second registration would panic.
 
 import (
 	"bytes"
@@ -27,6 +33,7 @@ import (
 	"fmt"
 	"slices"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -111,6 +118,12 @@ var scrapeExpectedFamilies = []string{
 	"courier_coderun_verification_outcomes_total",
 	"courier_coderun_tokens_total",
 	"courier_source_lifecycle_report_outcomes_total",
+	// The controllers' own scrape-failure counters: a collector that cannot
+	// read the API server still exports its failure count, so the family is
+	// present even when the read succeeds.
+	"courier_metrics_scrape_errors_total",
+	"courier_terminal_age_scrape_errors_total",
+	"courier_terminal_backlog_scrape_errors_total",
 }
 
 // scrapeConnectorFamilies lists the connector envelope's families. The
@@ -427,6 +440,12 @@ func TestScrapeExportsFullMetricSetWithoutCorrelationLabels(t *testing.T) {
 
 	var correlationViolations []string
 	for _, name := range sortedFamilyNames(dump) {
+		// Courier's own families are the contract's subject. Third-party and
+		// Go-runtime families are not: a dependency that labels a series
+		// `request_id` is not this contract's business.
+		if !strings.HasPrefix(name, "courier_") {
+			continue
+		}
 		for _, key := range dump[name] {
 			if correlationShapedLabel(key) {
 				correlationViolations = append(correlationViolations, fmt.Sprintf("%s{%s}", name, key))
@@ -446,6 +465,35 @@ func TestScrapeExportsFullMetricSetWithoutCorrelationLabels(t *testing.T) {
 			t.Errorf("connector family uses a label key outside the allowlist: %v\ngathered label dump:%s", err, renderLabelDump(dump))
 		}
 	}
+
+	// Numeric observations ride metric values, never label values (§11.1):
+	// a numeric label value would multiply the series count.
+	if violations := numericLabelValues(families); len(violations) > 0 {
+		t.Errorf("the exported metric set carries numeric label values: %s\ngathered label dump:%s",
+			strings.Join(violations, ", "), renderLabelDump(dump))
+	}
+}
+
+// numericLabelValues returns the courier families whose label values parse as
+// numbers. Third-party and Go-runtime families are excluded: they are not
+// Courier's signal vocabulary, and their label values are not Courier's
+// contract.
+func numericLabelValues(families []*dto.MetricFamily) []string {
+	var violations []string
+	for _, family := range families {
+		name := family.GetName()
+		if !strings.HasPrefix(name, "courier_") {
+			continue
+		}
+		for _, metric := range family.GetMetric() {
+			for _, label := range metric.GetLabel() {
+				if _, err := strconv.ParseFloat(label.GetValue(), 64); err == nil {
+					violations = append(violations, fmt.Sprintf("%s{%s=%q}", name, label.GetName(), label.GetValue()))
+				}
+			}
+		}
+	}
+	return violations
 }
 
 // TestScrapeWithoutTracingBackendStillEmitsBoundedSignals is the

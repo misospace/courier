@@ -1,7 +1,7 @@
 // Package connectortest provides the reusable assertions of the connector
 // diagnostic verification contract (docs/connector-diagnostics.md §11).
 //
-// It is test support only: production code never imports it, and it imports no
+// It is test support only: no production package imports it, and it imports no
 // production package. It exists so every connector package can inherit the
 // same duplicate-counting assertion instead of re-deriving it per connector.
 package connectortest

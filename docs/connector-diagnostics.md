@@ -529,7 +529,10 @@ metrics.
   single source-of-truth slice used by the test and by the helper that
   validates a family's labels at registration time.
   *(Implemented by `TestMetricFamiliesWithinLabelAllowlist` in
-  `internal/connector/diagnostics_test.go`, and re-checked at scrape time by
+  `internal/connector/diagnostics_test.go` for the connector families and by
+  `TestDiscoveryMetricsLabelVocabulary` in
+  `internal/source/runner_metrics_test.go` for the `courier_source_*`
+  families, and re-checked over the whole exported set by
   `TestScrapeExportsFullMetricSetWithoutCorrelationLabels` in
   `cmd/metrics_scrape_test.go`.)*
 - **Closed-reason assertion.** A table-driven test asserts that, for every
@@ -549,7 +552,10 @@ metrics.
   (`requested`, `limit`, `accepted`, `pressure`, latency) live as metric
   **values**, never as label values.
   *(Implemented by `TestMetricFamiliesWithinLabelAllowlist`, which parses the
-  gathered families and asserts no label carries a numeric value.)*
+  gathered connector families and asserts no label carries a numeric value,
+  and by `TestScrapeExportsFullMetricSetWithoutCorrelationLabels`, which
+  parses every exported `courier_*` family and fails on any numeric label
+  value.)*
 
 ### 11.2 Duplicate-counting (§6.2)
 
@@ -565,7 +571,10 @@ metrics.
   `TestNoDoubleCountJoinsOneFailurePerCycle` in
   `internal/source/dispatch/duplicate_counting_test.go`, driving the real
   Dispatch adapter through the real `source.Runner`. The join helper is
-  `connectortest.Join` in `internal/connector/connectortest`.)*
+  `connectortest.Join` in `internal/connector/connectortest`; its own
+  semantics are pinned by `internal/connector/connectortest/cycle_test.go`.
+  The cycle id is the fixture's, because no cycle identifier may cross the
+  metric boundary — a cycle label would be unbounded cardinality.)*
 - **One overflow per cycle.** A separate fixture forces
   `requested > limit` and asserts that
   `courier_connector_diagnostics_total{...,reason="overflow"}` increments
@@ -603,11 +612,14 @@ metrics.
   build if any label value is built from `fmt.Sprintf` over a string
   that is not in the connector's declared closed vocabulary or one of the
   bounded enums.
-  *(Implemented by `TestNoFreeFormLabelValues`,
-  `TestFreeFormLabelGuardDetectsViolation`, and
-  `TestFreeFormLabelGrepDetectsSingleLinePairing` in
-  `internal/connector/label_guard_test.go`. The negative cases prove the
-  guard reports a planted violation instead of passing vacuously.)*
+  *(Implemented by `TestNoFreeFormLabelValues` and the negative cases beside
+  it in `internal/connector/label_guard_test.go`. The AST half rejects a
+  `fmt.Sprintf` — or a same-file helper that formats — in a label position:
+  a `WithLabelValues` argument, a key or value of a `prometheus.Labels` or
+  `map[string]string` literal, or a write into a label map. The grep half
+  rejects the single-line shapes of the same rules across the metric
+  registration helpers. The negative cases prove the guard reports a planted
+  violation instead of passing vacuously.)*
 - **Detail-channel assertion.** A unit test asserts that the only field
   on the `connector.diagnostic` event that carries a free-form string is
   the debug `detail`, that `detail` is debug-gated (never emitted at the
@@ -645,7 +657,10 @@ metrics.
   *(Implemented by `TestScrapeWithoutTracingBackendStillEmitsBoundedSignals`
   in `cmd/metrics_scrape_test.go` and
   `TestUntracedDeploymentEmitsWithoutCorrelationLabels` in
-  `internal/source/dispatch/diagnostics_test.go`.)*
+  `internal/source/dispatch/diagnostics_test.go`. There is no tracing backend
+  in the operator to configure — correlation rides the log half only — so
+  the assertion is that every bounded signal still emits with correlation
+  confined to the log half.)*
 
 The instrumentation PR is not complete until every assertion above is
 checked into the test tree and passing in `go test`; the scrape-time checks

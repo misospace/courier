@@ -20,9 +20,25 @@ import (
 // The guard has two independent halves, exactly as the contract describes:
 //
 //   - an AST walk (go/parser + go/ast) over the connector and adapter
-//     packages that finds a fmt.Sprintf in a label-value position, and
+//     packages that finds a formatted string in a label position, and
 //   - a CI grep over the metric registration helpers that rejects a single
-//     line pairing a prometheus.Labels literal with fmt.Sprintf.
+//     line pairing a label-map literal with fmt.Sprintf.
+//
+// A label position is one of:
+//
+//   - an argument of a WithLabelValues call,
+//   - the key or the value of an element of a label-map literal, where a
+//     label-map literal is a composite literal of type prometheus.Labels
+//     or of type map[string]string, and
+//   - the right-hand side of an assignment whose left-hand side indexes a
+//     label map.
+//
+// A label position builds a free-form label when the expression, at any
+// nesting depth, holds a call to fmt.Sprintf or a call to a formatting
+// helper: a function or method declared in the same file whose body
+// formats. The helper rule is a deliberately conservative, fail-closed
+// approximation: a label position fed by a same-file helper that formats
+// is a violation even when the helper launders the format away.
 //
 // The halves are independent on purpose: the AST half is precise but only
 // sees syntactically obvious label positions, the grep half is blunt but
@@ -38,8 +54,6 @@ import (
 // which is the working directory of the test binary.
 var labelScanRoots = []string{
 	"../connector",
-	"../source/dispatch",
-	"../source/manual",
 	"../source",
 	"../controller",
 }
@@ -57,6 +71,7 @@ var metricHelperMarkers = []string{
 	"prometheus.NewGauge(",
 	".WithLabelValues(",
 	"prometheus.Labels{",
+	"map[string]string{",
 }
 
 // labelViolation is one free-form label construction site.
@@ -123,14 +138,16 @@ func scanLabelSourcesDetailed(roots []string) (labelScanResult, error) {
 		}
 		result.astFiles++
 		scanner := &labelScanner{
-			fset:      fset,
-			file:      parsed,
-			path:      displayPath(path, root),
-			src:       src,
-			root:      root,
-			labelMaps: map[string]struct{}{},
+			fset:          fset,
+			file:          parsed,
+			path:          displayPath(path, root),
+			src:           src,
+			root:          root,
+			labelMaps:     map[string]struct{}{},
+			formatHelpers: map[string]struct{}{},
 		}
 		scanner.collectLabelMaps()
+		scanner.collectFormatHelpers()
 		scanner.scan()
 		result.violations = append(result.violations, scanner.violations...)
 		if isMetricHelper(src) {
@@ -214,6 +231,10 @@ type labelScanner struct {
 	// labelMaps holds the names of the file's map[string]string and
 	// prometheus.Labels variables.
 	labelMaps map[string]struct{}
+	// formatHelpers holds the names of the file's functions and methods
+	// whose body formats: a label position fed by one of them carries a
+	// free-form label even when the format is laundered through the call.
+	formatHelpers map[string]struct{}
 	// violations holds what this file's walk found.
 	violations []labelViolation
 }
@@ -273,8 +294,25 @@ func (s *labelScanner) collectParams(fields *ast.FieldList) {
 	}
 }
 
-// scan walks the file and reports every label-value position that builds a
-// value with fmt.Sprintf.
+// collectFormatHelpers records the file's formatting helpers: the functions
+// and methods declared in this file whose body calls fmt.Sprintf. A label
+// position fed by one of them carries a free-form label, so the helper is
+// treated as a format even when the format is laundered through the call.
+func (s *labelScanner) collectFormatHelpers() {
+	for _, decl := range s.file.Decls {
+		fn, ok := decl.(*ast.FuncDecl)
+		if !ok || fn.Body == nil {
+			continue
+		}
+		if !containsSprintf(fn.Body) {
+			continue
+		}
+		s.formatHelpers[fn.Name.Name] = struct{}{}
+	}
+}
+
+// scan walks the file and reports every label position that builds a
+// free-form label value or key.
 func (s *labelScanner) scan() {
 	ast.Inspect(s.file, func(node ast.Node) bool {
 		switch typed := node.(type) {
@@ -289,39 +327,43 @@ func (s *labelScanner) scan() {
 	})
 }
 
-// checkCall flags a fmt.Sprintf passed to a WithLabelValues call.
+// checkCall flags a free-form label value passed to a WithLabelValues call.
 func (s *labelScanner) checkCall(call *ast.CallExpr) {
 	selector, ok := call.Fun.(*ast.SelectorExpr)
 	if !ok || selector.Sel.Name != "WithLabelValues" {
 		return
 	}
 	for _, arg := range call.Args {
-		if !containsSprintf(arg) {
+		if !s.buildsLabelValue(arg) {
 			continue
 		}
-		s.report(arg, "fmt.Sprintf label value passed to WithLabelValues")
+		s.report(arg, "free-form label value passed to WithLabelValues")
 	}
 }
 
-// checkCompositeLit flags a fmt.Sprintf used as the value of an element of
-// a prometheus.Labels literal.
+// checkCompositeLit flags a free-form label value or key used in an element
+// of a label-map literal: a prometheus.Labels literal or a map[string]string
+// literal.
 func (s *labelScanner) checkCompositeLit(lit *ast.CompositeLit) {
-	if !isPrometheusLabels(lit.Type) {
+	if !isLabelMapType(lit.Type) {
 		return
 	}
+	kind := labelLiteralKind(lit)
 	for _, element := range lit.Elts {
 		pair, ok := element.(*ast.KeyValueExpr)
 		if !ok {
 			continue
 		}
-		if !containsSprintf(pair.Value) {
-			continue
+		if s.buildsLabelValue(pair.Value) {
+			s.report(pair.Value, fmt.Sprintf("free-form label value in a %s literal", kind))
 		}
-		s.report(pair.Value, "fmt.Sprintf label value in a prometheus.Labels literal")
+		if s.buildsLabelValue(pair.Key) {
+			s.report(pair.Key, fmt.Sprintf("free-form label key in a %s literal", kind))
+		}
 	}
 }
 
-// checkAssign flags a fmt.Sprintf written into a label map.
+// checkAssign flags a free-form label value written into a label map.
 func (s *labelScanner) checkAssign(assign *ast.AssignStmt) {
 	for i, lhs := range assign.Lhs {
 		index, ok := lhs.(*ast.IndexExpr)
@@ -331,10 +373,10 @@ func (s *labelScanner) checkAssign(assign *ast.AssignStmt) {
 		if !s.isLabelMap(index.X) {
 			continue
 		}
-		if !containsSprintf(assign.Rhs[i]) {
+		if !s.buildsLabelValue(assign.Rhs[i]) {
 			continue
 		}
-		s.report(assign.Rhs[i], "fmt.Sprintf label value assigned into a label map")
+		s.report(assign.Rhs[i], "free-form label value assigned into a label map")
 	}
 }
 
@@ -376,9 +418,10 @@ func (s *labelScanner) sourceOf(node ast.Node) string {
 	return strings.TrimSpace(string(s.src[start:end]))
 }
 
-// containsSprintf reports whether the expression builds a value with
-// fmt.Sprintf anywhere inside it.
-func containsSprintf(expr ast.Expr) bool {
+// buildsLabelValue reports whether the expression builds a free-form label
+// value: it holds a call to fmt.Sprintf, or a call to a formatting helper
+// declared in the same file, at any nesting depth.
+func (s *labelScanner) buildsLabelValue(expr ast.Expr) bool {
 	found := false
 	ast.Inspect(expr, func(node ast.Node) bool {
 		if found {
@@ -388,18 +431,67 @@ func containsSprintf(expr ast.Expr) bool {
 		if !ok {
 			return true
 		}
-		selector, ok := call.Fun.(*ast.SelectorExpr)
-		if !ok || selector.Sel.Name != "Sprintf" {
-			return true
+		if isFmtSprintf(call) || s.isFormatHelperCall(call) {
+			found = true
+			return false
 		}
-		pkg, ok := selector.X.(*ast.Ident)
-		if !ok || pkg.Name != "fmt" {
-			return true
-		}
-		found = true
-		return false
+		return true
 	})
 	return found
+}
+
+// isFormatHelperCall reports whether the call reaches a formatting helper
+// declared in the same file, by function or by method.
+func (s *labelScanner) isFormatHelperCall(call *ast.CallExpr) bool {
+	switch fun := call.Fun.(type) {
+	case *ast.Ident:
+		_, ok := s.formatHelpers[fun.Name]
+		return ok
+	case *ast.SelectorExpr:
+		_, ok := s.formatHelpers[fun.Sel.Name]
+		return ok
+	}
+	return false
+}
+
+// containsSprintf reports whether the node builds a value with fmt.Sprintf
+// anywhere inside it.
+func containsSprintf(node ast.Node) bool {
+	found := false
+	ast.Inspect(node, func(node ast.Node) bool {
+		if found {
+			return false
+		}
+		call, ok := node.(*ast.CallExpr)
+		if !ok {
+			return true
+		}
+		if isFmtSprintf(call) {
+			found = true
+			return false
+		}
+		return true
+	})
+	return found
+}
+
+// isFmtSprintf reports whether the call is a call to fmt.Sprintf.
+func isFmtSprintf(call *ast.CallExpr) bool {
+	selector, ok := call.Fun.(*ast.SelectorExpr)
+	if !ok || selector.Sel.Name != "Sprintf" {
+		return false
+	}
+	pkg, ok := selector.X.(*ast.Ident)
+	return ok && pkg.Name == "fmt"
+}
+
+// labelLiteralKind names the kind of a label-map literal for a violation
+// message.
+func labelLiteralKind(lit *ast.CompositeLit) string {
+	if isPrometheusLabels(lit.Type) {
+		return "prometheus.Labels"
+	}
+	return "map[string]string"
 }
 
 // isLabelMapType reports whether a type is a label map: map[string]string
@@ -453,8 +545,8 @@ func isMetricHelper(src []byte) bool {
 }
 
 // grepLabelViolations is the CI grep half of the guard: it rejects a
-// metric registration helper line that pairs a prometheus.Labels literal
-// with fmt.Sprintf. The gate is deliberately blunt and line-scoped; the AST
+// metric registration helper line that pairs a label-map literal with
+// fmt.Sprintf. The gate is deliberately blunt and line-scoped; the AST
 // half is the precise one.
 func grepLabelViolations(path string, src []byte) []labelViolation {
 	var violations []labelViolation
@@ -465,6 +557,8 @@ func grepLabelViolations(path string, src []byte) []labelViolation {
 			reason = "fmt.Sprintf label value passed to WithLabelValues"
 		case strings.Contains(line, "prometheus.Labels{") && strings.Contains(line, "fmt.Sprintf"):
 			reason = "prometheus.Labels literal paired with fmt.Sprintf on one line"
+		case strings.Contains(line, "map[string]string{") && strings.Contains(line, "fmt.Sprintf"):
+			reason = "map[string]string literal paired with fmt.Sprintf on one line"
 		}
 		if reason == "" {
 			continue
@@ -590,8 +684,12 @@ func emit(vec *prometheus.CounterVec, name string) {
 // TestFreeFormLabelGrepDetectsSingleLinePairing proves the CI grep half
 // works on its own: a metric registration helper line that pairs a
 // prometheus.Labels literal with fmt.Sprintf is rejected even where the
-// AST half cannot attribute the fmt.Sprintf to a label value — here it
-// builds the label key, not the label value.
+// AST half cannot attribute the fmt.Sprintf to a label value — here the
+// line builds the label set and the formatted string side by side, so only
+// the grep half sees the pairing. The fixture keeps the label literal's
+// own key and value free of formatting on purpose: the AST half checks
+// both positions, so a formatted key there would be attributed by both
+// halves and would prove nothing about the grep half's independence.
 func TestFreeFormLabelGrepDetectsSingleLinePairing(t *testing.T) {
 	dir := t.TempDir()
 	source := `package sample
@@ -603,8 +701,8 @@ import (
 )
 
 func emit(key string) {
-	labels := prometheus.Labels{fmt.Sprintf("%s", key): "value"}
-	_ = labels
+	labels, summary := prometheus.Labels{"connector": key}, fmt.Sprintf("%s", key)
+	_, _ = labels, summary
 }
 `
 	path := filepath.Join(dir, "violation.go")
@@ -630,5 +728,174 @@ func emit(key string) {
 	}
 	if astHits != 0 {
 		t.Errorf("AST half flagged %d violations in the grep fixture: the two halves must stay independent", astHits)
+	}
+}
+
+// TestFreeFormLabelGuardDetectsStringMapLiteral proves the AST half checks
+// every label-map literal, not only prometheus.Labels: a map[string]string
+// literal that formats a label value is a violation too. A guard that only
+// knows the prometheus.Labels spelling misses the same mistake written the
+// other way.
+func TestFreeFormLabelGuardDetectsStringMapLiteral(t *testing.T) {
+	dir := t.TempDir()
+	source := `package sample
+
+import "fmt"
+
+func emit(name string) {
+	labels := map[string]string{"connector": fmt.Sprintf("dispatch-%s", name)}
+	_ = labels
+}
+`
+	path := filepath.Join(dir, "violation.go")
+	if err := os.WriteFile(path, []byte(source), 0o600); err != nil {
+		t.Fatalf("write fixture: %v", err)
+	}
+	violations, err := scanLabelSources([]string{dir})
+	if err != nil {
+		t.Fatalf("label guard: %v", err)
+	}
+	var astHits int
+	for _, violation := range violations {
+		t.Logf("detected: %s", violation)
+		if violation.half == "ast" {
+			astHits++
+		}
+	}
+	if astHits == 0 {
+		t.Fatal("guard reported no AST violation for a map[string]string label literal built with fmt.Sprintf")
+	}
+}
+
+// TestFreeFormLabelGuardDetectsFormattedLabelKey proves the AST half checks
+// the key position of a label-map literal, not only the value: a formatted
+// key is as unbounded as a formatted value. The literal is written across
+// several lines so the CI grep half cannot be what catches it — no single
+// line holds both the literal and the format — which proves the AST half
+// reaches the key on its own.
+func TestFreeFormLabelGuardDetectsFormattedLabelKey(t *testing.T) {
+	dir := t.TempDir()
+	source := `package sample
+
+import (
+	"fmt"
+
+	"github.com/prometheus/client_golang/prometheus"
+)
+
+func emit(key string) {
+	labels := prometheus.Labels{
+		fmt.Sprintf("x-%s", key): "value",
+	}
+	_ = labels
+}
+`
+	path := filepath.Join(dir, "violation.go")
+	if err := os.WriteFile(path, []byte(source), 0o600); err != nil {
+		t.Fatalf("write fixture: %v", err)
+	}
+	violations, err := scanLabelSources([]string{dir})
+	if err != nil {
+		t.Fatalf("label guard: %v", err)
+	}
+	var grepHits, astHits int
+	for _, violation := range violations {
+		t.Logf("detected: %s", violation)
+		switch violation.half {
+		case "grep":
+			grepHits++
+		case "ast":
+			astHits++
+		}
+	}
+	if astHits == 0 {
+		t.Fatal("guard reported no AST violation for a formatted label key in a prometheus.Labels literal")
+	}
+	if grepHits != 0 {
+		t.Errorf("CI grep half flagged %d violations in the multi-line key fixture: the AST half must be what catches it", grepHits)
+	}
+}
+
+// TestFreeFormLabelGuardDetectsHelperIndirection proves the AST half sees
+// through a same-file formatting helper: a label position fed by a helper
+// whose body formats is a violation even though the format never appears
+// at the label position itself.
+func TestFreeFormLabelGuardDetectsHelperIndirection(t *testing.T) {
+	dir := t.TempDir()
+	source := `package sample
+
+import (
+	"fmt"
+
+	"github.com/prometheus/client_golang/prometheus"
+)
+
+func helper(x string) string {
+	return fmt.Sprintf("x-%s", x)
+}
+
+func emit(vec *prometheus.CounterVec, x string) {
+	vec.WithLabelValues(helper(x)).Inc()
+}
+`
+	path := filepath.Join(dir, "violation.go")
+	if err := os.WriteFile(path, []byte(source), 0o600); err != nil {
+		t.Fatalf("write fixture: %v", err)
+	}
+	violations, err := scanLabelSources([]string{dir})
+	if err != nil {
+		t.Fatalf("label guard: %v", err)
+	}
+	var astHits int
+	for _, violation := range violations {
+		t.Logf("detected: %s", violation)
+		if violation.half == "ast" {
+			astHits++
+		}
+	}
+	if astHits == 0 {
+		t.Fatal("guard reported no AST violation for a label value built by a same-file formatting helper")
+	}
+}
+
+// TestFreeFormLabelGrepDetectsStringMapPairing proves the CI grep half
+// stands on its own for the map[string]string literal: a single line that
+// pairs the literal with fmt.Sprintf is rejected by the grep half even
+// though the AST half reports the same construction. The half must not
+// depend on the other half having run.
+func TestFreeFormLabelGrepDetectsStringMapPairing(t *testing.T) {
+	dir := t.TempDir()
+	source := `package sample
+
+import "fmt"
+
+func emit(name string) {
+	labels := map[string]string{"connector": fmt.Sprintf("dispatch-%s", name)}
+	_ = labels
+}
+`
+	path := filepath.Join(dir, "violation.go")
+	if err := os.WriteFile(path, []byte(source), 0o600); err != nil {
+		t.Fatalf("write fixture: %v", err)
+	}
+	violations, err := scanLabelSources([]string{dir})
+	if err != nil {
+		t.Fatalf("label guard: %v", err)
+	}
+	var grepHits, astHits int
+	for _, violation := range violations {
+		t.Logf("detected: %s", violation)
+		switch violation.half {
+		case "grep":
+			grepHits++
+		case "ast":
+			astHits++
+		}
+	}
+	if grepHits == 0 {
+		t.Fatal("CI grep half did not flag a line pairing map[string]string{ with fmt.Sprintf")
+	}
+	if astHits == 0 {
+		t.Fatal("AST half did not flag a line pairing map[string]string{ with fmt.Sprintf")
 	}
 }
