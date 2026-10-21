@@ -226,6 +226,11 @@ type Check struct {
 	State      string
 	Conclusion string
 	URL        string
+	// Output is the check's bounded log evidence: the provider's published
+	// diagnostic output, cut to a fixed bound by the provider that reads
+	// it. It is evidence for a report or a prompt, never an input to a
+	// verdict: only Name and State classify a check.
+	Output string
 }
 
 // CreatePullRequestInput is the provider-neutral request to open a pull

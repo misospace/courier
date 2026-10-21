@@ -258,6 +258,37 @@ type CIParkState struct {
 	LastOutcome CIParkOutcome `json:"lastOutcome,omitempty"`
 }
 
+// CIRepairContext is the bounded repair context handed to a resumed
+// coordinator (#494). It records what the operator observed on the parked
+// head, so the resumed attempt knows which checks failed and which head it
+// repairs without re-reading the issue or any earlier transcript.
+type CIRepairContext struct {
+	// Head is the exact parked head whose checks failed. The repair belongs
+	// to this head: an observation of any other head is not this run's work.
+	// +kubebuilder:validation:MinLength=1
+	Head string `json:"head"`
+	// Attempt is the 1-based repair attempt this context belongs to.
+	// +kubebuilder:validation:Minimum=1
+	Attempt int `json:"attempt"`
+	// FailedChecks are the names of the failed configured mechanical checks,
+	// and only those: a check the lane never named is never evidence here.
+	// +optional
+	FailedChecks []string `json:"failedChecks,omitempty"`
+	// Logs is the bounded log evidence of those checks.
+	// +optional
+	Logs string `json:"logs,omitempty"`
+	// FenceToken is the token the source issued when it reserved this
+	// repair opportunity. The outcome report must present it back, so it
+	// travels with the attempt rather than being recomputed at the end.
+	// Empty when the source cannot fence a repair.
+	// +optional
+	FenceToken string `json:"fenceToken,omitempty"`
+	// MaxAttempts is the lane's repair budget, so a resumed coordinator
+	// knows how many attempts remain.
+	// +optional
+	MaxAttempts int `json:"maxAttempts,omitempty"`
+}
+
 // TerminalDiagnosticCategory is the stable classification of a terminal run's
 // cause, derived only from evidence the operator observed. Unknown is used
 // whenever evidence is missing or ambiguous; a cause is never invented.
@@ -674,6 +705,14 @@ type CoderRunStatus struct {
 	// CI in Verifying. Nil means the run is not parked (#475).
 	// +optional
 	CIPark *CIParkState `json:"cipark,omitempty"`
+
+	// CIRepair is the bounded repair context the operator hands to a resumed
+	// coordinator (#494). It is set only for a run that resumes a
+	// mechanical-CI repair, and cleared once that repair attempt has been
+	// observed, so a relaunch before that still finds the repair goal it
+	// needs.
+	// +optional
+	CIRepair *CIRepairContext `json:"ciRepair,omitempty"`
 
 	// Conditions is the standard condition set.
 	// +optional

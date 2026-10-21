@@ -677,6 +677,7 @@ func (r *CoderRunReconciler) rejectClaim(ctx context.Context, run *courierv1alph
 	run.Status.Branch = ""
 	run.Status.HeadRepo = ""
 	run.Status.HeadSHA = ""
+	run.Status.CIRepair = nil
 	statusErr := r.patchStatus(ctx, before, run)
 	return errors.Join(cause, releaseErr, statusErr)
 }
@@ -691,6 +692,7 @@ func (r *CoderRunReconciler) releaseClaim(ctx context.Context, run *courierv1alp
 	run.Status.Branch = ""
 	run.Status.HeadRepo = ""
 	run.Status.HeadSHA = ""
+	run.Status.CIRepair = nil
 	statusErr := r.patchStatus(ctx, before, run)
 	return errors.Join(cause, releaseErr, statusErr)
 }
@@ -1100,6 +1102,17 @@ func (r *CoderRunReconciler) observeVerifying(ctx context.Context, run *courierv
 		// Done resolves the source and applies the reap policy; it is not a
 		// case for a human.
 		return r.transitionTerminal(ctx, run, courierv1alpha1.PhaseDone, pr, terminalLifecycleIntent{}, nil)
+	}
+	// The mechanical-CI park-and-resume policy, when the lane declares one,
+	// owns every observation that is not already terminal. It reports
+	// handled=false when no policy applies, and the ordinary grading path
+	// below is then unchanged.
+	handled, result, err := r.observeCIPark(ctx, run, observation)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+	if handled {
+		return result, nil
 	}
 	if state == observationFailed {
 		// Queue-backed fix-pr work has a source-owned retry policy. Keep
@@ -1781,6 +1794,28 @@ func (r *CoderRunReconciler) patchStatus(ctx context.Context, before, after *cou
 	}
 	if before.Status.TerminalDiagnostic == nil && after.Status.TerminalDiagnostic != nil {
 		fields.TerminalDiagnostic = after.Status.TerminalDiagnostic
+	}
+	// CIPark is the operator-owned park record (#475). It is replaceable,
+	// not set-once: the operator rewrites it as the park advances, and an
+	// explicit null clears it, because a merge patch leaves an omitted
+	// nested object untouched.
+	if !reflect.DeepEqual(before.Status.CIPark, after.Status.CIPark) {
+		if after.Status.CIPark == nil {
+			fields.ClearCIPark()
+		} else {
+			fields.CIPark = after.Status.CIPark
+		}
+	}
+	// CIRepair is the operator-owned repair context (#494). The record is
+	// cleared once the repair attempt it describes has been observed, so a
+	// relaunch before that still finds the repair goal it needs. It follows
+	// the same explicit-null clear semantics as CIPark.
+	if !reflect.DeepEqual(before.Status.CIRepair, after.Status.CIRepair) {
+		if after.Status.CIRepair == nil {
+			fields.ClearCIRepair()
+		} else {
+			fields.CIRepair = after.Status.CIRepair
+		}
 	}
 	// ControlRequest is replaceable, not set-once: a changed value replaces
 	// the record and a cleared record emits an explicit null, because a merge

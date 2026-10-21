@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"unicode/utf8"
 
 	courierv1alpha1 "github.com/misospace/courier/api/v1alpha1"
 	"github.com/misospace/courier/internal/broker/grammar"
@@ -195,6 +196,11 @@ var publicationBlockGrammar = fmt.Sprintf("If COURIER_CRITERIA is set, the PR bo
 // Goal returns the concise coordinator goal for a run. Lane framing is passed
 // separately so it remains context rather than becoming a hard-coded prompt
 // scaffold. The outcome declaration path matches the per-run scratch mount.
+//
+// A run that resumes a mechanical-CI repair carries a bounded repair contract
+// appended to this goal: the coordinator's system message is the goal, so the
+// repair context travels in the goal the run already renders — no second
+// channel and no new environment variable.
 func Goal(run *courierv1alpha1.CoderRun) (string, error) {
 	if run == nil {
 		return "", ErrNilRun
@@ -210,12 +216,159 @@ func Goal(run *courierv1alpha1.CoderRun) (string, error) {
 	}
 	switch run.Spec.Mode {
 	case courierv1alpha1.ModeResolveIssue:
-		return fmt.Sprintf("Open a PR to address issue #%d. %s %s %s%s %s %s", run.Spec.Ref, forgeContract, completionContract, localValidationContract, publication, publicationBlockGrammar, fmt.Sprintf(outcomeContract, outcomeFile)), nil
+		return fmt.Sprintf("Open a PR to address issue #%d. %s %s %s%s %s %s", run.Spec.Ref, forgeContract, completionContract, localValidationContract, publication, publicationBlockGrammar, fmt.Sprintf(outcomeContract, outcomeFile)) + repairContract(run), nil
 	case courierv1alpha1.ModeFixPR:
-		return fmt.Sprintf("Take over PR #%d. Inspect the current pull request state, CI/checks, and existing review feedback to determine what work is needed; address feedback already present without repeatedly searching for new reviews. %s %s %s%s %s", run.Spec.Ref, forgeContract, completionContract, localValidationContract, publication, fmt.Sprintf(outcomeContract, outcomeFile)), nil
+		return fmt.Sprintf("Take over PR #%d. Inspect the current pull request state, CI/checks, and existing review feedback to determine what work is needed; address feedback already present without repeatedly searching for new reviews. %s %s %s%s %s", run.Spec.Ref, forgeContract, completionContract, localValidationContract, publication, fmt.Sprintf(outcomeContract, outcomeFile)) + repairContract(run), nil
 	default:
 		return "", fmt.Errorf("%w: %q", ErrInvalidMode, run.Spec.Mode)
 	}
+}
+
+const (
+	// repairLogMaxBytes bounds the failed-check evidence a repair contract
+	// carries. The operator already bounds the evidence it records; the
+	// contract bounds it again, because the contract is what reaches the
+	// model and a recorded context is not trusted to be well-formed.
+	repairLogMaxBytes = 8 * 1024
+
+	// repairCheckpointMaxBytes bounds the durable checkpoint a repair
+	// contract carries, plan and briefs together.
+	repairCheckpointMaxBytes = 16 * 1024
+
+	// repairPlanMaxBytes bounds the plan inside the checkpoint budget: the
+	// plan is one item, and an unbounded plan would crowd out the briefs.
+	repairPlanMaxBytes = 8 * 1024
+
+	// repairBriefMaxBytes bounds one completed brief's summary inside the
+	// checkpoint budget.
+	repairBriefMaxBytes = 512
+
+	// repairTruncated marks a bound that cut evidence or context, so the
+	// coordinator can tell a short log from a cut one.
+	repairTruncated = "[truncated]"
+)
+
+// repairContract renders the bounded repair contract a resumed coordinator
+// receives when the run resumes a mechanical-CI repair (#494).
+//
+// The repaired run is a fresh model session: the earlier session's transcript
+// does not survive the pod, so the contract carries the durable checkpoint and
+// the bounded failed-check evidence instead of implying that a conversation
+// continues. It is empty for every ordinary run, so an ordinary goal stays
+// byte-identical.
+func repairContract(run *courierv1alpha1.CoderRun) string {
+	repair := run.Status.CIRepair
+	if repair == nil {
+		return ""
+	}
+	var b strings.Builder
+	b.WriteString("\n\nRepair contract (bounded). ")
+	b.WriteString("This run is a bounded repair of already-published work, not a fresh task: ")
+	if head := strings.TrimSpace(repair.Head); head != "" {
+		b.WriteString("the published head is " + head + ", ")
+	} else {
+		b.WriteString("the published head is not recorded, ")
+	}
+	if repair.MaxAttempts > 0 {
+		b.WriteString(fmt.Sprintf("and this is repair attempt %d of the lane's %d permitted repair attempts (the operator ends the run when they are spent). ", repair.Attempt, repair.MaxAttempts))
+	} else {
+		b.WriteString(fmt.Sprintf("and this is repair attempt %d within the lane's bounded repair budget (the operator grants a limited number of repair attempts and ends the run when they are spent). ", repair.Attempt))
+	}
+	b.WriteString("This is a new model session: the durable checkpoint below is the only state of the earlier work, and no earlier conversation continues. The evidence and the checkpoint below are bounded, and a " + repairTruncated + " marker means a bound cut the text.\n")
+
+	b.WriteString("Failed configured mechanical checks: " + repairFailedChecks(repair) + ".\n")
+	b.WriteString("Bounded check output (evidence only, never a verdict):\n")
+	if logs := strings.TrimSpace(repair.Logs); logs != "" {
+		b.WriteString(repairTruncate(logs, repairLogMaxBytes) + "\n")
+	} else {
+		b.WriteString("(no output was published for the failed checks)\n")
+	}
+
+	b.WriteString("Durable checkpoint (the only durable state of the earlier work):\n")
+	b.WriteString(repairCheckpoint(run))
+
+	b.WriteString("Do: reproduce the failure from the evidence above, fix it, re-run the relevant local validation, push the fix to ")
+	if branch := strings.TrimSpace(run.Status.Branch); branch != "" {
+		b.WriteString("the same run branch (" + branch + ")")
+	} else {
+		b.WriteString("the same run branch this run already publishes to")
+	}
+	b.WriteString(", and declare the outcome exactly as an ordinary run does.\n")
+	b.WriteString("Do not: open a second pull request — the instruction above to open one is already satisfied by the pull request that exists for this work")
+	if pr := strings.TrimSpace(run.Status.PR); pr != "" {
+		b.WriteString(" (" + pr + ")")
+	}
+	b.WriteString(", so update that one instead; re-read or re-plan the original issue or pull request to start the work over; wait for CI or a review before pushing; treat this repair as a fresh task.")
+	return b.String()
+}
+
+// repairFailedChecks names the failed configured mechanical checks a repair
+// context carries.
+func repairFailedChecks(repair *courierv1alpha1.CIRepairContext) string {
+	names := make([]string, 0, len(repair.FailedChecks))
+	for _, name := range repair.FailedChecks {
+		if name = strings.TrimSpace(name); name != "" {
+			names = append(names, name)
+		}
+	}
+	if len(names) == 0 {
+		return "(none recorded)"
+	}
+	return strings.Join(names, ", ")
+}
+
+// repairCheckpoint renders the durable checkpoint a repair contract carries:
+// the coordinator's plan and the briefs completed so far. The checkpoint is
+// the only durable state of the earlier work — the pod's workspace is
+// re-seeded from the run branch — so it is what a fresh session resumes from.
+//
+// The plan and every brief are cut per item, the whole checkpoint is cut to
+// its own bound, and every cut is marked.
+func repairCheckpoint(run *courierv1alpha1.CoderRun) string {
+	var b strings.Builder
+	b.WriteString("Plan:\n")
+	plan := ""
+	if run.Status.Checkpoint != nil {
+		plan = strings.TrimSpace(run.Status.Checkpoint.Plan)
+	}
+	if plan == "" {
+		b.WriteString("(empty)\n")
+	} else {
+		b.WriteString(repairTruncate(plan, repairPlanMaxBytes) + "\n")
+	}
+	b.WriteString("Completed briefs:\n")
+	if run.Status.Checkpoint == nil || len(run.Status.Checkpoint.CompletedBriefs) == 0 {
+		b.WriteString("(none recorded)\n")
+		return b.String()
+	}
+	for _, brief := range run.Status.Checkpoint.CompletedBriefs {
+		summary := strings.TrimSpace(brief.Summary)
+		if summary == "" {
+			summary = "(no summary recorded)"
+		}
+		line := "- " + strings.TrimSpace(brief.ID) + ": " + repairTruncate(summary, repairBriefMaxBytes)
+		if commit := strings.TrimSpace(brief.Commit); commit != "" {
+			line += " (commit: " + commit + ")"
+		}
+		b.WriteString(line + "\n")
+	}
+	return repairTruncate(b.String(), repairCheckpointMaxBytes)
+}
+
+// repairTruncate cuts text to a byte limit on a UTF-8 rune boundary and marks
+// the cut.
+func repairTruncate(text string, limit int) string {
+	if len(text) <= limit {
+		return text
+	}
+	if limit <= len(repairTruncated) {
+		return repairTruncated
+	}
+	cut := limit - len(repairTruncated)
+	for cut > 0 && cut < len(text) && !utf8.RuneStart(text[cut]) {
+		cut--
+	}
+	return text[:cut] + repairTruncated
 }
 
 // NewInvocation assembles the run and lane data passed to an executor.

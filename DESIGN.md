@@ -176,25 +176,69 @@ published PR has stable, confirmed red checks reaches **HandedOff** and hands
 the PR to the source's independent repair mechanism. The source decides how to
 handle the failure; queue-backed PR-fix work follows its existing retry policy.
 
-A park-and-resume mechanical CI repair loop (#475) extends this boundary with
-contracts the operator and sources implement against; the operator's park,
-resume, and handoff wiring around them lands in follow-up work. The durable
-record is `CoderRun.status.cipark`: the exact published head the park observes,
-when the park began, how many repair opportunities the run consumed, and the
-outcome of the most recent one — enough to survive pod deletion and controller
-restart, with repo, PR, branch, and head identity already carried by existing
-status fields. Strict trigger separation is a pure classification, not a
-watcher behavior: only explicitly configured mechanical checks failing on the
-exact recorded head, with repair budget remaining, may wake a coordinator;
-pending or unregistered checks hold the park, and a merged, unobservable, or
+A lane may declare a mechanical-CI repair policy (#475, #494), and the loop that
+policy enables extends this boundary: a run that published its pull request
+waits on CI without holding a coordinator pod or a lane slot, and one eligible
+failed mechanical check on the exact published head wakes the same run for one
+bounded repair. The policy is opt-in and operator-owned —
+`LaneProfile.spec.ciRepair` names the exact checks a lane repairs, the per-run
+repair budget, and the window that bounds the wait — and a lane that declares
+no policy, names no check, or grants no attempt leaves every run on it on the
+ordinary post-publication grading path, unchanged.
+
+The durable record is `CoderRun.status.cipark`: the exact published head the
+park observes, when the park began, how many repair opportunities the run
+consumed, and the outcome of the most recent one — enough to survive pod
+deletion and controller restart, with repo, PR, branch, and head identity
+already carried by existing status fields. The park holds the run without a
+coordinator pod and without a lane slot, and it re-reads the world on its own
+30-second cadence rather than the 5-second grading cadence the run would
+otherwise use.
+
+Strict trigger separation is a pure classification, not a watcher behavior: only
+explicitly configured mechanical checks failing on the exact recorded head, with
+repair budget remaining, may wake a coordinator; a pending configured check or
+an unregistered check set holds the park, and a merged, unobservable, or
 superseded-head observation, a non-mechanical failure, or an exhausted budget
-always finishes without waking. The optional source-side counterpart is the
-`CIParkLifecycle` capability: a fenced, idempotent park notice, repair-opportunity
-reservation, and outcome report so a connector that manages PR-fix queues can
-defer dispatch while a Courier repair opportunity is active and refuse stale
-generations instead of racing them. Sources that cannot fence must not
-implement the capability, and the core never emulates it with ordinary
-lifecycle calls.
+always finishes without waking. A wake needs more than the verdict. The failure
+must be settled — two consecutive identical failed observations, so a flapping
+report never repairs — the lane must have capacity right now, because a repair
+reacquires the slot it needs rather than assuming it, and the budget must have
+room. The attempt is consumed in the same status patch as the phase change back
+to **Claimed** — the admission reservation the repair needs, and the phase the
+next reconcile launches a coordinator from — so a controller restart during the
+park cannot wake the coordinator twice for one attempt.
+
+The head that decides must be the run's own, and it is attributable only
+through durable publication evidence: the confirmed `status.lastCommit` — a
+write the broker accepts only while the live work ref still carries that
+commit — or a completed brief's commit. A head the run cannot account for is
+somebody else's work, and the run never repairs it: it fails closed to handoff
+once the run is parked, and before a park exists the ordinary grading path
+decides it. A repair attempt that publishes a new head advances the park to
+that head, records the attempt as `repushed`, and the loop runs again while
+budget remains; one that publishes nothing earns no further attempt on the
+same head. Every other outcome ends the run without waking the coordinator:
+configured mechanical checks that all passed settle to **AwaitingReview** on the
+same two-consecutive-identical-observation rule the ordinary path uses, and a
+non-mechanical failure, a configured check that never registered, an exhausted
+budget, no progress, a superseded head, an expired window, or an unrecognized
+check state hand off — **HandedOff** for a resolve-issue run, **Failed** for a
+fix-pr run — with the park recording why, as `exhausted` or `unsupported`.
+AI-review checks and comments, human reviews, `CHANGES_REQUESTED`, merge state,
+and pending non-mechanical checks never wake a coordinator and never extend the
+window.
+
+The optional source-side counterpart is the `CIParkLifecycle` capability: a
+fenced, idempotent park notice, repair-opportunity reservation, and outcome
+report so a connector that manages PR-fix queues can defer dispatch while a
+Courier repair opportunity is active and refuse stale generations instead of
+racing them. Sources that cannot fence must not implement the capability, and
+the core never emulates it with ordinary lifecycle calls. The capability is
+optional in use as well as in definition, and no source adapter implements it
+yet: an adapter without it parks and repairs all the same, and a connector
+whose own PR-fix dispatch it cannot defer may race the repair. A reservation
+the source refuses on a superseded generation fails the run closed to handoff.
 
 The coordinator declares its ending in the executor-provided outcome file,
 whose exact path is in the goal. The executor validates the declaration against
@@ -730,6 +774,15 @@ world wins on conflict.
   source/dispatch state. Never checkpointed; always looked up.
 - **Workspace: ephemeral `emptyDir`,** rebuilt from git on every start. Nothing
   durable lives on disk, so there is no workspace PVC to sprawl.
+
+A mechanical-CI repair resume is the same discipline in its smallest form. What
+survives is the durable checkpoint — the plan and the completed briefs — plus
+the bounded failed-check evidence the operator recorded, and the git and forge
+world is re-read fresh. The pod's transcript does not survive the pod, so the
+resumed coordinator is a new model session that receives the repair contract in
+its goal, and the workspace is re-seeded from the run branch, so the git state
+is fresh as well. A repair resume is not a resumed conversation, and no part of
+the design may imply one.
 
 ### Uncommitted failure work
 
@@ -1663,6 +1716,16 @@ status:
   checkpoint:
     plan: <...>
     completedBriefs: [{id, summary, commit}]
+  cipark:                         # durable park record while the run waits on CI
+    head: <sha>
+    parkedAt: <ts>
+    attempts: <n>
+    lastOutcome: repushed | exhausted | unsupported
+  ciRepair:                       # bounded repair context for a resumed coordinator
+    head: <sha>
+    attempt: <n>
+    failedChecks: [<check name>, ...]
+    logs: <bounded check output>
   heartbeat: {at: <ts>, kind: stream | tool}
   restarts: <n>                    # consecutive infra crashloop counter, reset by a fresh heartbeat while a coordinator is observable
   conditions: [...]
@@ -1674,6 +1737,17 @@ marker always matches the persisted phase and the age of the current phase is
 `now` minus `phaseEnteredAt` — truthful for every phase, an operator restart
 included. A phase with no marker (a run recorded before the field existed, or a
 run's first transition) reports no phase duration rather than a fabricated one.
+
+`status.cipark` is the operator's durable account of a run waiting on CI: the
+exact published head under observation, when the park began, how many repair
+attempts the run consumed, and the outcome of the most recent one (`repushed`,
+`exhausted`, `unsupported`). `status.ciRepair` is the bounded repair context
+of an attempt in flight: the head it repairs, the attempt number, the failed
+configured mechanical checks, and their bounded log evidence. Both are
+operator-owned — the harness never writes them — and the repair context
+outlives a relaunch, so a coordinator that restarts mid-attempt still finds the
+repair goal it needs; the operator clears it once that attempt has been
+observed.
 
 ### `LaneProfile`
 
@@ -1695,6 +1769,10 @@ spec:
   resources:                       # optional CPU/memory sizing for this lane's pods
     requests: {cpu: 500m, memory: 1Gi}
     limits: {cpu: "4", memory: 8Gi}
+  ciRepair:                        # optional mechanical-CI repair policy
+    mechanicalChecks: [build, test]  # exact check names, matched case-sensitively
+    maxAttempts: 2                  # repair budget per run (0..5; 0 leaves the loop off)
+    observationWindowSeconds: 1800  # how long a run may wait on CI (60..21600)
 ```
 
 `runtimeImage` is an optional execution-environment selector. It is an image
@@ -1794,6 +1872,18 @@ moved. One lane-level value sizes every lane-sized pod on the lane; per-role
 sizing is deliberately not modelled, and the probe pods above are the one
 role-level exception.
 
+`ciRepair` is the lane's mechanical-CI repair policy: the exact names of the
+checks a lane is willing to have repaired, the repair budget one run may
+consume, and the window that bounds how long a run may wait on CI. Check names
+match exactly and case-sensitively — no globbing, no regex — so the policy
+stays auditable and can never widen to a check the lane did not name, and an
+AI-review workflow or a human review is not selectable by construction. An
+absent policy, a policy naming no check, and a policy granting no attempt all
+leave the repair loop disabled, and every run on the lane then behaves exactly
+as it does without one. The deployment-managed lane config mirrors the same
+field under the same bounds, so a bootstrap-managed lane can declare it
+without drifting from the schema.
+
 Roles name whatever models the operator has configured — cloud (`anthropic/...`,
 `openai/...`, `litellm-anthropic/MiniMax-M3`), local (`litellm/qwen3.8-27b`), or
 a mix. A cloud lane's `framing` reads more like "capacity is elastic, fan out
@@ -1866,9 +1956,11 @@ there is no delete verb because active runs reference lanes. (#73)
   stall relaunches/resumes it; a crashloop reaches NeedsHuman.
 - **Verifying** — no coordinator pod or liveness meaning. The operator polls
   the external PR and CI world indefinitely, with a reconciliation cadence and
-  no deadline. Observer errors remain Verifying and requeue. The poll reads the
-  run head's pull requests through the identity-checked forge listing, so a
-  record whose base or head repository identity differs from the run's — a
+  no deadline, unless the lane declares a mechanical-CI repair policy, in which
+  case the park window bounds the wait. Observer errors remain Verifying and
+  requeue. The poll reads the run head's pull requests through the
+  identity-checked forge listing, so a record whose base or head repository
+  identity differs from the run's — a
   same-owner fork claiming `owner:branch` — and a response carrying no
   repository identity at all both fail the poll closed: they are the same
   unverifiable world as a read error, never a "no pull request" claim
@@ -1913,6 +2005,24 @@ there is no delete verb because active runs reference lanes. (#73)
   publishes `in-review` after stable green observations. Fix-pr attempts receive
   `failed` if checks turn red; a resolve-issue run hands off to **HandedOff**
   instead.
+
+  A lane that declares a mechanical-CI repair policy replaces that grading path
+  with the park-and-resume path, and only for observations that are not already
+  terminal: a merged pull request still reaches **Done**, and a missing or draft
+  pull request still settles the way the ordinary path settles it. The park
+  owns every other observation it can attribute to the run's own published
+  head — a head the run cannot account for leaves the ordinary path to decide
+  until a park record exists, and fails the run closed to handoff afterwards.
+  It establishes or advances the park record on that head, classifies the check
+  set, and then either holds the run — a configured mechanical check is still
+  pending, on the park cadence and inside the park window — resumes it, when
+  the settled-failure, capacity, and budget conditions all hold, or finishes it
+  without waking the coordinator. A resume consumes the attempt in the same
+  status patch as the phase change back to **Claimed**, which reacquires the
+  lane slot the repair needs and makes the next reconcile launch a coordinator
+  for the same run; the resumed coordinator receives the bounded repair contract
+  in its goal. A lane that declares no policy takes none of this path: its runs
+  are graded exactly as above.
 - **AwaitingReview** is terminal for this run. For a PR, human merges → a slow,
   bounded world observation (#250) reads the run's **exact recorded PR identity**
   — base repository plus `status.pr` number through the forge read-pull-request

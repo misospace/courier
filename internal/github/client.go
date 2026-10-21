@@ -17,6 +17,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/misospace/courier/internal/forge"
 )
@@ -230,6 +231,61 @@ type CheckRun struct {
 	DetailsURL string `json:"details_url"`
 	HTMLURL    string `json:"html_url"`
 	HeadSHA    string `json:"head_sha"`
+	// Output is the diagnostic output the check published. GitHub sends it
+	// only when the check published some, so it is a pointer.
+	Output *CheckRunOutput `json:"output"`
+}
+
+// CheckRunOutput is the diagnostic output a GitHub check run publishes.
+type CheckRunOutput struct {
+	Title   string `json:"title"`
+	Summary string `json:"summary"`
+	Text    string `json:"text"`
+}
+
+const (
+	// checkOutputMaxBytes bounds the log evidence one GitHub check carries
+	// out of this package. A check run's published output is unbounded
+	// upstream, and the evidence is only ever an input to a prompt or a
+	// report: a bound keeps one chatty check from crowding out the rest of
+	// a repair context.
+	checkOutputMaxBytes = 2 * 1024
+
+	// checkOutputTruncated marks evidence this package cut at the bound,
+	// so a reader can tell a short log from a cut one.
+	checkOutputTruncated = "[truncated]"
+)
+
+// checkOutput renders a check run's published output as bounded log
+// evidence: title, summary, and text, in that order, cut to the per-check
+// bound. It is the single renderer the forge capability and the controller
+// observer share, so the evidence a capability read carries and the evidence
+// an observation carries cannot drift.
+//
+// An absent or empty output yields an empty string: a check without
+// evidence stays evidence-free rather than carrying placeholders.
+func checkOutput(out *CheckRunOutput) string {
+	if out == nil {
+		return ""
+	}
+	parts := make([]string, 0, 3)
+	for _, part := range []string{out.Title, out.Summary, out.Text} {
+		if part = strings.TrimSpace(part); part != "" {
+			parts = append(parts, part)
+		}
+	}
+	if len(parts) == 0 {
+		return ""
+	}
+	text := strings.Join(parts, "\n")
+	if len(text) <= checkOutputMaxBytes {
+		return text
+	}
+	cut := checkOutputMaxBytes - len(checkOutputTruncated)
+	for cut > 0 && !utf8.RuneStart(text[cut]) {
+		cut--
+	}
+	return text[:cut] + checkOutputTruncated
 }
 
 // CheckRuns is the response from GitHub's check-runs endpoint.

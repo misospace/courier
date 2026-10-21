@@ -146,6 +146,75 @@ type OperatorPatch struct {
 	// SetConditions rather than by hand.
 	// +optional
 	Conditions json.RawMessage `json:"conditions,omitempty"`
+	// CIPark is the operator-owned park record (#475). The pointer carries
+	// the record when it is set; a cleared record is expressed by
+	// ClearCIPark, because a merge patch removes a nested object only when
+	// the patch carries an explicit null.
+	// +optional
+	CIPark *courierv1alpha1.CIParkState `json:"cipark,omitempty"`
+	// CIRepair is the operator-owned repair context (#494). It follows the
+	// same clear semantics as CIPark: assign the pointer to set the record
+	// and call ClearCIRepair to remove it.
+	// +optional
+	CIRepair *courierv1alpha1.CIRepairContext `json:"ciRepair,omitempty"`
+
+	// clearCIPark and clearCIRepair distinguish a record the operator
+	// cleared from a record it never mentioned: only the former may be
+	// encoded as an explicit null, because an omitted key leaves the
+	// persisted record untouched.
+	clearCIPark   bool
+	clearCIRepair bool
+}
+
+// MarshalJSON encodes the operator patch. CIPark and CIRepair are nested
+// objects the operator must be able to clear, and a JSON merge patch removes
+// a key only when the patch carries an explicit null — an omitted key leaves
+// the record untouched. A plain pointer cannot express that third state, so
+// the two records are encoded here: the typed pointer carries the record and
+// the cleared flag carries the explicit null. Every other field keeps the
+// default encoding.
+func (p OperatorPatch) MarshalJSON() ([]byte, error) {
+	type alias OperatorPatch
+	document := struct {
+		alias
+		CIPark   json.RawMessage `json:"cipark,omitempty"`
+		CIRepair json.RawMessage `json:"ciRepair,omitempty"`
+	}{alias: alias(p)}
+	if p.CIPark != nil {
+		encoded, err := json.Marshal(p.CIPark)
+		if err != nil {
+			return nil, fmt.Errorf("status: encode cipark: %w", err)
+		}
+		document.CIPark = encoded
+	} else if p.clearCIPark {
+		document.CIPark = json.RawMessage("null")
+	}
+	if p.CIRepair != nil {
+		encoded, err := json.Marshal(p.CIRepair)
+		if err != nil {
+			return nil, fmt.Errorf("status: encode ciRepair: %w", err)
+		}
+		document.CIRepair = encoded
+	} else if p.clearCIRepair {
+		document.CIRepair = json.RawMessage("null")
+	}
+	return json.Marshal(document)
+}
+
+// ClearCIPark emits an explicit JSON null for the park record, clearing it:
+// a merge patch leaves an omitted nested object untouched, so only null
+// removes it.
+func (p *OperatorPatch) ClearCIPark() {
+	p.CIPark = nil
+	p.clearCIPark = true
+}
+
+// ClearCIRepair emits an explicit JSON null for the repair context, clearing
+// it: a merge patch leaves an omitted nested object untouched, so only null
+// removes it.
+func (p *OperatorPatch) ClearCIRepair() {
+	p.CIRepair = nil
+	p.clearCIRepair = true
 }
 
 // SetControlRequest encodes one operator control request into the patch,
