@@ -186,6 +186,10 @@ func main() {
 	// cluster at scrape time, so the retention reaper's observability half
 	// needs only the manager's client.
 	crmetrics.Registry.MustRegister(controller.NewTerminalAgeCollector(mgr.GetClient()))
+	// The terminal-run backlog (held runs and the unsettled lifecycle-report
+	// queue they wait on) is likewise read from the live cluster at scrape
+	// time.
+	crmetrics.Registry.MustRegister(controller.NewTerminalBacklogCollector(mgr.GetClient()))
 
 	bootstrapProfilesFile := strings.TrimSpace(bootstrapLaneProfilesFile)
 	if bootstrapProfilesFile != "" {
