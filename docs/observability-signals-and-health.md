@@ -154,16 +154,17 @@ Phases are the existing enum (`api/v1alpha1/coderun_types.go:83-104`): `Pending`
 | Signal | Kind | Unit | Labels | Semantics |
 | --- | --- | --- | --- | --- |
 | `courier_coderun_phase_transitions_total` | counter | transitions | `lane`, `mode`, `from`, `to` | One per observed phase change. `from`/`to` are the bounded phase enum. |
-| `courier_coderun_phase_duration_seconds` | histogram | seconds | `lane`, `mode`, `phase` | Time spent in a phase, observed once on leaving it. Buckets are a candidate; the existing run/queue buckets are a starting shape (`internal/controller/metrics.go:19-28`). |
+| `courier_coderun_phase_duration_seconds` | histogram | seconds | `lane`, `mode`, `phase` | Time spent in a phase, observed once on leaving it, and only when the phase had a durable entry marker. Buckets are the run-duration buckets (`internal/controller/metrics.go:19-21`). |
 | `courier_coderuns_total` | counter | runs | `lane`, `mode`, `phase` | Existing: terminal runs by **first** terminal phase. The label is set once — `transitionTerminal` records the metric exactly once on the run's first terminal transition (`firstTerminal := FinishedAt == nil`, `internal/controller/coderun_controller.go:999-1053`), and a later transition that corrects the ending (for example `AwaitingReview → Done`, #250) does not increment the new phase. The label preserved is the phase at the first terminal transition, not the run's final disposition. |
 | `courier_coderun_run_duration_seconds` | histogram | seconds | `lane`, `mode`, `phase` | Existing: `StartedAt`→`FinishedAt`. |
 | `courier_coderun_queue_wait_seconds` | histogram | seconds | `lane`, `mode`, `phase` | Existing: creation→`AdmittedAt`. |
 
 Phase **age** (how long a run has been in its current phase) is not a metric
-dimension: a per-run label would be unbounded. The status timestamps cover a
-subset of phases only; what is recoverable from `Status` today is:
+dimension: a per-run label would be unbounded. Before the durable
+`Status.PhaseEnteredAt` marker, the status timestamps covered a subset of
+phases only; what is recoverable from `Status` without it is:
 
-| Phase | Recoverable from `Status` today | What is missing |
+| Phase | Recoverable from `Status` without the marker | What was missing |
 | --- | --- | --- |
 | `Pending` | yes — `now − metadata.creationTimestamp` | — |
 | `Claimed` | partial — `now − AdmittedAt` overstates `Claimed` age once the run advances to `Running` | a `Claimed`-entry timestamp |
@@ -309,12 +310,11 @@ collapse into one "done".
   disposition, not executor time alone. For runs that terminalize directly
   from `Running` without a `Verifying` stop, the first terminal transition *is*
   the end of execution and `FinishedAt` equals executor completion there.
-  Executor completion as such is evidenced today only by the `phase.transition`
-  log event entering `Verifying` (§3.8). If it must be separately visible as a
-  signal, the evidence is §3.4's proposed
+  Executor completion as such is evidenced by the `phase.transition`
+  log event entering `Verifying` (§3.8) and by §3.4's shipped
   `courier_coderun_phase_transitions_total` /
   `courier_coderun_phase_duration_seconds` — the `Running` phase's duration is
-  observed on leaving it — not a reinterpretation of the terminal duration.
+  observed on leaving it — not by a reinterpretation of the terminal duration.
 
   The **`phase` label** of `courier_coderuns_total` is the phase at the
   first terminal transition, **not** the run's final disposition. A run
@@ -608,8 +608,8 @@ Series are bounded by configuration, not by traffic or history:
 - terminal diagnostics: `O(L · M · |category|)`, `|category| = 8`;
 - phase transitions: `O(L · M · |phase|²)` — the dominant term. With
   `|phase| = 10` this is `200·L` series; if `L` grows or the term is judged too
-  costly, dropping `from` (entering-phase only) reduces it to `20·L`. This is
-  recorded as an open question (§11).
+  costly, dropping `from` (entering-phase only) reduces it to `20·L`. The
+  shipped counter keeps `from`/`to`, so this is its standing cardinality cost.
 - lifecycle outcomes: `O(S · L · M · |result|)`; verification outcomes
   `O(L · M · |result|)`;
 - retention/reaping: `O(|terminal phase|)` — the retention signals are
@@ -722,26 +722,21 @@ authorized here:
 
 - The exact bounded `reason` vocabularies and cardinality caps (working figure:
   ≤ 16 values per signal, every unrecognised value mapped to `other`).
-- Whether `courier_coderun_phase_transitions_total` ships with `from`/`to` or
-  is reduced to entering-phase, or is log-derived instead, given its `O(|phase|²)`
-  cardinality.
-- Whether `courier_coderun_phase_duration_seconds` and the token counters ship
-  in the first cut or after the discovery/lane layer.
-- Whether external verification disposition is a counter (as designed here) or
-  derived from phase plus logs.
 - How "enabled/disabled" is declared to a view: a configuration source, or a
   startup info metric.
 - Whether a source's primary freshness signal is the `last_success` timestamp
   gauge or an info-state gauge.
-- Whether `courier_source_lifecycle_report_outcomes_total` carries a `source`
-  label (as designed here) or only `lane`/`mode`, given it is emitted by the
-  controller rather than the discovery runner.
 - The backend target-health signal `ControllerDown` depends on (for example
   Prometheus `up`) — the only backend-specific item, recorded here so no backend
   is hardcoded into core.
 - The exact thresholds and evaluation windows in §5 — all candidates.
 - How #290 source states and #291 connector states compose in #292's views
   without double counting, beyond the join-not-sum rule.
+
+Settled by the shipped run-signal exporter (#324), and no longer open: the
+phase-transition counter carries `from`/`to`, the phase-duration histogram and
+the token counters are exported, external verification disposition is a counter,
+and the lifecycle-report outcome counter carries a `source` label.
 
 ## 12. Non-goals
 
