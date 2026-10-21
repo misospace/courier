@@ -206,8 +206,12 @@ on the run branch; the declaration never substitutes for that check (#169):
   committed and pushed and the pull request is opened or updated. Verified
   commits reachable from the run branch → exit `0`, **Verifying**. Work committed
   only elsewhere is not run success.
-- **`no_change_needed`** — nothing to do, with evidence. The executor posts the
-  complete evidence as a redacted issue/PR comment, then exits `3`. A
+- **`no_change_needed`** — nothing to do, with evidence. The executor posts no
+  comment for this outcome: it cannot authoritatively verify a success claim,
+  and the controller's lifecycle settlement is authoritative (#474). The
+  evidence rides the redacted, bounded termination reason — `run.exit`
+  telemetry and the `COURIER_TERMINATION` handoff — and the executor exits
+  `3`. A
   resolve-issue run ends in **AwaitingReview** and moves the source to
   `in-review` for a human to settle. A fix-pr run is settled against the world
   through **Verifying**: a merged/already-addressed pull request reaches
@@ -237,8 +241,12 @@ on the run branch; the declaration never substitutes for that check (#169):
   failure discovered after publication is not this outcome: it follows the
   operator's verification and source failure policy.
 
-Comments preserve the full declared evidence, question, or missing explanation
-after redaction; they are not shortened to the termination reason. Comment
+Outcome comments are human-attention requests the executor can authoritatively
+stand behind: `needs_decision` and `blocked_external` preserve the full declared
+question or missing explanation after redaction; they are not shortened to the
+termination reason. The executor never publishes a comment for a success claim
+(`no_change_needed`) — the controller settles that ending against the world
+(#474). Comment
 posting is best-effort: failures are logged as `outcome.comment` and do not change
 the run ending. The separate termination reason is bounded and redacted before it
 is published. An undeclared ending is not interpreted as a coordinator's human

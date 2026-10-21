@@ -342,10 +342,13 @@ an unobservable PR reaches `NeedsHuman`. Green CI cannot certify queued review
 feedback was addressed, so open no-change attempts report `waiting-external`
 rather than authorizing `already_addressed` or claiming a push. Recovery requires
 a fresh source attempt identity; prior runs and evidence remain retained.
-The evidence, question,
-or missing explanation is posted in full after redaction; only the separate
-termination reason is bounded and redacted. Comment posting is best-effort:
-failures are logged as `outcome.comment` and do not change the ending.
+Outcome comments are limited to human-attention requests: `needs_decision` and
+`blocked_external` post the question or missing explanation in full after
+redaction. A `no_change_needed` run posts no comment — the executor cannot
+authoritatively verify a success claim, so the evidence rides the redacted,
+bounded termination reason and the controller's lifecycle settlement stays
+authoritative (#474). Comment posting is best-effort: failures are logged as
+`outcome.comment` and do not change the ending.
 
 When no outcome is declared, recoverable endings — uncommitted changes, commits
 off the run branch, or no commit and no workspace changes — resume the same

@@ -1826,8 +1826,14 @@ func (r reporter) classifyDeclared(ctx context.Context, workspace *git.Workspace
 		}
 	case outcomeNoChangeNeeded:
 		r.emitOutcomeDeclared(outcomeNoChangeNeeded)
+		// No outcome comment: the executor cannot authoritatively verify a
+		// success claim, and the controller settles this ending against the
+		// world (a fix-pr run routes to Verifying and can still end
+		// BlockedExternal when queued feedback is unverified, #474). The
+		// evidence rides the termination reason — run.exit telemetry and the
+		// COURIER_TERMINATION handoff — and the public record stays the
+		// coordinator's own handoff plus the controller's lifecycle report.
 		if workState == git.WorkStateNone {
-			r.postOutcomeComment(ctx, "**Courier: already addressed** (run "+r.cfg.RunID+")\n\n"+decl.Evidence)
 			return termination{Phase: "NoChangeNeeded", Result: "success", ExitCode: exitNoChangeNeeded, Reason: "opencode declared no change needed: " + decl.Evidence, Outcome: outcomeNoChangeNeeded}
 		}
 		return failedWith("opencode declared no change needed but the workspace has new commits or uncommitted changes", terminalCategoryVerifierRejection)
@@ -1903,6 +1909,16 @@ func (r reporter) emitOutcomeDeclared(kind string) {
 // outcome.comment error event and never changes the run's ending. The body is
 // model-authored and passes through the redactor before it leaves the
 // process, like every other external path.
+//
+// Publication contract (#474): declared-outcome comments carry human-attention
+// requests the executor can authoritatively stand behind — needs_decision and
+// blocked_external, whose claims match the run's NeedsHuman/BlockedExternal
+// lifecycle. A success claim (no_change_needed) is never published here: the
+// controller settles it against the world, and a generic terminal comment
+// would duplicate the coordinator's detailed handoff or contradict the final
+// lifecycle state. The criterion-coverage handoff comment (Verifying path) is
+// a separate publication: it restates validator-derived verdict data, not a
+// declared-outcome claim.
 func (r reporter) postOutcomeComment(ctx context.Context, body string) {
 	if r.cfg.Ref < 1 {
 		r.event(courierlog.EventOutcomeComment, courierlog.StatusError, map[string]any{"status": "error", "reason": "no issue/PR reference to comment on"})
