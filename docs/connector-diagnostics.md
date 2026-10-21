@@ -108,7 +108,11 @@ Naming rule: the metric family is `courier_connector_*` (Courier owns the
 transport and shape), and the connector's identity is a bounded label, so a
 dashboard can discover and render any connector without a Dispatch-specific
 code path. The connector never ships a metric name that core must know, and core
-never ships a rule that mentions Dispatch.
+never ships a rule that mentions Dispatch. When a connector type admits several
+configured instances, each instance carries its own bounded identity (the
+Dispatch adapter uses its configured adapter name, e.g. `dispatch:<agent>`),
+so independent configured connectors never share — or overwrite — each
+other's series.
 
 ## 3. Connector signal / capability catalogue
 
@@ -473,11 +477,11 @@ These are recorded so a later instrumentation ticket can settle them; none is
 authorized by this document:
 
 - Which signals become Prometheus metrics versus log-only events. The envelope
-  is designed for both; the core discovery and reservation signals are metrics
-  today, but the connector envelope itself has no instrumentation yet, so its
-  first cut may be log-only.
+  is designed for both, and the instrumentation now ships both halves: the
+  connector envelope emits `courier_connector_*` metrics and the bounded
+  `connector.diagnostic` log stream, while correlation stays on the log half.
 - Whether the capability catalogue is a scrape-time gauge, a startup event, or
-  both.
+  both. It ships as a scrape-time gauge, `courier_connector_capability_info`.
 - The exact cardinality cap for connector-declared `reason` vocabularies. The
   design's guideline is that each capability declares a closed `reason`
   vocabulary of at most a small fixed size (working figure: 16 per signal), with
@@ -491,16 +495,27 @@ authorized by this document:
 §6 fixes rules that are easy to violate by accident: a label key slips in,
 a connector sums its diagnostic onto the core failure counter, a free-form
 string becomes a label value, or a `run_id` turns into a high-cardinality
-metric label. This section is the **contract a later instrumentation ticket
-must satisfy before it can close**. None of the assertions below runs in this
-PR — this PR is documentation only — but every checklist item names the test
-or scrape-time invariant that will trip CI when the rule is broken.
+metric label. The instrumentation that emits `courier_connector_*` and
+`connector.diagnostic` is now implemented (`internal/connector`, with the
+Dispatch and manual adapters as emitters), and **every** assertion below is
+checked into the test tree and passing in `go test`. Each checklist item
+names the test that trips CI when the rule is broken, so the list is
+traceable to a checked-in assertion rather than a promise.
 
-A future instrumentation PR (the one that actually emits
-`courier_connector_*` and `connector.diagnostic`) lands only when each rule
+A connector change lands only when each rule
 in §6 has a passing assertion of the form listed below. New connectors that
 declare new capabilities inherit the same assertions. The list is the
 requirement-trace target the design itself closes against.
+
+Two environment notes for the checklist below. The no-double-count fixture
+runs against the envtest API server when `KUBEBUILDER_ASSETS` provides one
+and against the controller-runtime fake client otherwise, so the assertion
+never stops running in a plain `go test`. The scrape-time invariants gather
+the manager's own registry — the one the `/metrics` endpoint serves — in the
+`test` job; they are not gated on an API server, because the invariant is
+about the metric exposition surface rather than cluster state, and the
+`images` job gates image builds without running the manager or scraping
+metrics.
 
 ### 11.1 Bounded labels (§6.1)
 
@@ -513,6 +528,13 @@ requirement-trace target the design itself closes against.
   elsewhere in this document). The set itself is defined in code by a
   single source-of-truth slice used by the test and by the helper that
   validates a family's labels at registration time.
+  *(Implemented by `TestMetricFamiliesWithinLabelAllowlist` in
+  `internal/connector/diagnostics_test.go` for the connector families and by
+  `TestDiscoveryMetricsLabelVocabulary` in
+  `internal/source/runner_metrics_test.go` for the `courier_source_*`
+  families, and re-checked over the whole exported set by
+  `TestScrapeExportsFullMetricSetWithoutCorrelationLabels` in
+  `cmd/metrics_scrape_test.go`.)*
 - **Closed-reason assertion.** A table-driven test asserts that, for every
   `(connector, capability, signal)` tuple registered, the connector
   declares a closed `reason` vocabulary of small bounded size, and that the
@@ -520,11 +542,20 @@ requirement-trace target the design itself closes against.
   the event crosses the metric/log boundary. The test fails if a connector
   ships a `reason` label whose value is not in its declared vocabulary or
   `other`.
+  *(Implemented by `TestClosedReasonVocabulary`,
+  `TestUnrecognisedSignalFoldsToOther` in `internal/connector/diagnostics_test.go`
+  and `TestUndeclaredReasonFoldsToOther` in
+  `internal/source/dispatch/diagnostics_test.go`.)*
 - **Numeric-as-value assertion.** A static check (CI unit test) parses every
   registered metric family and fails the build if any label has a `float64`
   or `int64` value at runtime — i.e., asserts that numeric observations
   (`requested`, `limit`, `accepted`, `pressure`, latency) live as metric
   **values**, never as label values.
+  *(Implemented by `TestMetricFamiliesWithinLabelAllowlist`, which parses the
+  gathered connector families and asserts no label carries a numeric value,
+  and by `TestScrapeExportsFullMetricSetWithoutCorrelationLabels`, which
+  parses every exported `courier_*` family and fails on any numeric label
+  value.)*
 
 ### 11.2 Duplicate-counting (§6.2)
 
@@ -536,6 +567,14 @@ requirement-trace target the design itself closes against.
   increments by exactly one, and a helper that joins the two on
   `(connector, cycle_id)` returns 1, not 2. The fixture's pre-baked
   expected series is checked with `testutil.CollectAndCompare`.
+  *(Implemented by `TestNoDoubleCountBetweenCoreAndConnectorDiagnostics` and
+  `TestNoDoubleCountJoinsOneFailurePerCycle` in
+  `internal/source/dispatch/duplicate_counting_test.go`, driving the real
+  Dispatch adapter through the real `source.Runner`. The join helper is
+  `connectortest.Join` in `internal/connector/connectortest`; its own
+  semantics are pinned by `internal/connector/connectortest/cycle_test.go`.
+  The cycle id is the fixture's, because no cycle identifier may cross the
+  metric boundary — a cycle label would be unbounded cardinality.)*
 - **One overflow per cycle.** A separate fixture forces
   `requested > limit` and asserts that
   `courier_connector_diagnostics_total{...,reason="overflow"}` increments
@@ -544,11 +583,17 @@ requirement-trace target the design itself closes against.
   equivalents), not in additional events. The fixture also asserts that
   `accepted < requested ⇒ overflow >= 1`, so a partial exclusion set can
   never be reported as full coverage.
+  *(Implemented by `TestOneOverflowPerCycle` in
+  `internal/connector/diagnostics_test.go` and
+  `TestOneOverflowDiagnosticPerExclusionCycle` in
+  `internal/source/dispatch/diagnostics_test.go`.)*
 - **Bounded-retry assertion.** A test fixture with a bounded retry policy
   asserts that each attempt increments the connector diagnostic once per
   attempt, distinguished by `signal`/`reason` where the design calls for
   it, and that the total equals the number of attempts the fixture
   recorded (no coalescing, no fan-out).
+  *(Implemented by `TestOneProtocolErrorPerFailingPoll` in
+  `internal/source/dispatch/diagnostics_test.go`.)*
 
 ### 11.3 Privacy (§6.3)
 
@@ -560,39 +605,65 @@ requirement-trace target the design itself closes against.
   wired to metric output. The same corpus is run against the metric
   emitter with a mock registry; the collector's label-set dump must
   contain none of the forbidden substrings.
+  *(Implemented by `TestDetailRedactedBeforeLogAndAbsentFromMetrics` in
+  `internal/connector/diagnostics_test.go`.)*
 - **No-free-form-label assertion.** A static check (Go AST walk over the
-  connectors and a CI grep over the metric registration helpers) fails
-  the build if any label value is built from `fmt.Sprintf` over a string
+  connectors and a CI grep over the metric registration helpers) fails the
+  build if any label value is built from `fmt.Sprintf` over a string
   that is not in the connector's declared closed vocabulary or one of the
   bounded enums.
+  *(Implemented by `TestNoFreeFormLabelValues` and the negative cases beside
+  it in `internal/connector/label_guard_test.go`. The AST half rejects a
+  `fmt.Sprintf` — or a same-file helper that formats — in a label position:
+  a `WithLabelValues` argument, a key or value of a `prometheus.Labels` or
+  `map[string]string` literal, or a write into a label map. The grep half
+  rejects the single-line shapes of the same rules across the metric
+  registration helpers. The negative cases prove the guard reports a planted
+  violation instead of passing vacuously.)*
 - **Detail-channel assertion.** A unit test asserts that the only field
   on the `connector.diagnostic` event that carries a free-form string is
   the debug `detail`, that `detail` is debug-gated (never emitted at the
   default log level), and that the existing redactor still passes
   before write.
+  *(Implemented by `TestDetailOnlyAtDebugLevel` in
+  `internal/connector/diagnostics_test.go`.)*
 
 ### 11.4 Optional trace correlation (§6.4)
 
-- **No-correlation-label invariant.** A scrape-time test in envtest
+- **No-correlation-label invariant.** A scrape-time test
   exports the full metric set with a `run_id` populated on every
   connector diagnostic log line and asserts that no `courier_connector_*`
   metric family has a `run_id`, `trace_id`, `span_id`, or any other
   correlation identifier as a label. The collector's label dump is the
   evidence.
+  *(Implemented by `TestScrapeExportsFullMetricSetWithoutCorrelationLabels`
+  in `cmd/metrics_scrape_test.go`. It gathers the manager's own registry —
+  the one the `/metrics` endpoint serves — with the connector, discovery,
+  and controller families the manager registers, and prints the complete
+  family-to-label dump when a correlation identifier appears.)*
 - **Log-only assertion.** A unit test asserts that the only code path
   that writes a correlation identifier is the logging half of the
   envelope; the metric half's emitter helper rejects any event whose
   payload contains a correlation key, with a clear error in unit tests
   (it is unreachable in production).
+  *(Implemented by `TestCorrelationRidesLogHalfOnly` in
+  `internal/connector/diagnostics_test.go`.)*
 - **Untraced-deployment compatibility.** An end-to-end test runs the
   executor with no tracing backend configured and asserts that
   `courier_connector_capability_info`, `courier_connector_*` counters
   and gauges, and the bounded `connector.diagnostic` log stream still
   emit normally. Absence of a tracing pipeline must not silence any
   bounded signal.
+  *(Implemented by `TestScrapeWithoutTracingBackendStillEmitsBoundedSignals`
+  in `cmd/metrics_scrape_test.go` and
+  `TestUntracedDeploymentEmitsWithoutCorrelationLabels` in
+  `internal/source/dispatch/diagnostics_test.go`. There is no tracing backend
+  in the operator to configure — correlation rides the log half only — so
+  the assertion is that every bounded signal still emits with correlation
+  confined to the log half.)*
 
 The instrumentation PR is not complete until every assertion above is
-checked into the test tree and passing in `go test` (and, for the
-scrape-time checks, in the `images` job that already runs the live
-manager). Until then, every signal in §3 is a paper contract; the §11
-checklist is the only thing that turns it into enforced behavior.
+checked into the test tree and passing in `go test`; the scrape-time checks
+run there too, over the manager's own registry. Until then, every signal in
+§3 is a paper contract; the §11 checklist is the only thing that turns it
+into enforced behavior.

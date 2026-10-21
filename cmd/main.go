@@ -24,6 +24,7 @@ import (
 
 	courierv1alpha1 "github.com/misospace/courier/api/v1alpha1"
 	"github.com/misospace/courier/internal/bootstrap"
+	"github.com/misospace/courier/internal/connector"
 	"github.com/misospace/courier/internal/controller"
 	"github.com/misospace/courier/internal/executor"
 	"github.com/misospace/courier/internal/forge"
@@ -327,8 +328,14 @@ func main() {
 	// setting into another run's noise.
 	runEvents := courierlog.NewEmitter(os.Stdout, courierlog.ParseLevel(os.Getenv("COURIER_LOG_LEVEL")))
 
+	// Connector diagnostics (docs/connector-diagnostics.md) share the run
+	// event emitter for their log half and the manager's metric registry for
+	// their metric half. The envelope is generic: core wires it, but the
+	// signal vocabularies and capability declarations belong to each adapter.
+	diagnostics := connector.NewEmitter(crmetrics.Registry, connector.NewEventLogSink(runEvents))
+
 	sources := controller.NewSourceRegistry(map[string]source.Adapter{
-		"manual": manual.Adapter{},
+		"manual": manual.New(diagnostics),
 	})
 	if dispatchEnabled {
 		if strings.TrimSpace(dispatchBaseURL) == "" || strings.TrimSpace(dispatchAgentName) == "" {
@@ -370,7 +377,7 @@ func main() {
 		if dispatchPRFixExclusions {
 			legacyClient.WithPRFixExclusions(true)
 		}
-		sources.Register("dispatch", dispatch.New(legacyClient))
+		sources.Register("dispatch", dispatch.New(legacyClient, dispatch.WithConnectorDiagnostics(diagnostics)))
 		// Discovery metrics are process-wide and registered once; each
 		// binding's runner emits into them nil-safely via the shared instance.
 		discoveryMetrics := source.NewDiscoveryMetrics(crmetrics.Registry)
@@ -384,7 +391,14 @@ func main() {
 			if dispatchPRFixExclusions {
 				bindingClient.WithPRFixExclusions(true)
 			}
-			adapter := dispatch.New(bindingClient)
+			opts := []dispatch.Option{dispatch.WithConnectorDiagnostics(diagnostics)}
+			if binding.sourceAgent != "" {
+				// Each configured adapter reports under its own bounded
+				// identity so independent connectors never share metric
+				// series.
+				opts = append(opts, dispatch.WithConnectorName("dispatch:"+binding.sourceAgent))
+			}
+			adapter := dispatch.New(bindingClient, opts...)
 			if binding.sourceAgent != "" {
 				sources.Register("dispatch:"+binding.sourceAgent, adapter)
 			}
@@ -567,6 +581,12 @@ func resolveDispatchBindings(baseAgentName, queueLane, laneProfile string, repea
 		}
 		if !validDispatchAgentName(binding.agentName) {
 			return nil, fmt.Errorf("dispatch: invalid agent name %q: use letters, digits, dot, underscore, or hyphen", binding.agentName)
+		}
+		// The composed connector identity "dispatch:<agent>" must fit the
+		// adapter's bounded connector label, otherwise startup would panic
+		// inside dispatch.New instead of failing fast with a setup error.
+		if len("dispatch:"+binding.agentName) > dispatch.MaxConnectorNameLength {
+			return nil, fmt.Errorf("dispatch: agent name %q exceeds %d characters", binding.agentName, dispatch.MaxConnectorNameLength-len("dispatch:"))
 		}
 		if _, ok := seenAgents[binding.agentName]; ok {
 			return nil, fmt.Errorf("dispatch: duplicate agent identity %q", binding.agentName)
