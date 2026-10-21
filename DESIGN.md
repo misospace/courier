@@ -1549,12 +1549,18 @@ model that separates executor completion from external disposition and renders
 unknown/stale/absent as states distinct from idle or healthy. It defines units,
 clocks, counter/gauge reset behaviour, and a bounded-label privacy budget that
 keeps run ids, issue/PR numbers, repo names, arbitrary error strings, and secrets
-out of labels, with per-run correlation left to the structured log. #291 owns
-the connector diagnostics and #292 the views and alerts that consume these
-signals; the thresholds and windows are design candidates, not defaults. The
-core run, execution, lifecycle-report, and retention exporters ship with the
-operator; the source-discovery and reservation signals, the dashboards, and the
-alert rules remain unimplemented design, and nothing here authorizes them.
+out of labels, with per-run correlation left to the structured log. Every
+signal layer of the catalogue now ships with the operator: the discovery
+(§3.2) and lane-capacity/reservation (§3.3) layers — `courier_source_*` emitted
+nil-safely by the discovery runner (`internal/source/metrics.go`), and
+`courier_lane_concurrency`, `courier_lane_reservations`,
+`courier_coderuns_pending`, and `courier_lane_oldest_reservation_age_seconds`
+read live at scrape time (`internal/controller/metrics.go`) — and the phase,
+execution-outcome, lifecycle-report, and retention additions of §3.4–§3.7.
+#291 owns the connector diagnostics and #292 the views and alerts that consume
+these signals; the thresholds and windows are design candidates, not defaults.
+The dashboards and the alert rules themselves remain unimplemented design, and
+nothing here authorizes them.
 
 **Connector diagnostics without core coupling (#291).**
 [docs/connector-diagnostics.md](./docs/connector-diagnostics.md) specifies
@@ -1587,12 +1593,10 @@ execution and outcomes, lifecycle reporting, retention, and optional connector
 panels. It separates the portable specification from optional executable
 dashboard/rule assets, names the evaluator an OTel-based integration must
 supply (OTLP is transport, not an alert engine), and records the
-instrumentation gaps — no discovery or reservation metrics — that a later
-instrumentation decision must close before those views exist. The
-lifecycle-report and retention metrics those views need ship with the operator;
-the dashboards and alert rules themselves do not. #290 owns the signal/health
-semantics and #291 the connector diagnostics this layer consumes; neither is
-required for a Courier dashboard to be useful standalone.
+instrumentation gaps — the dashboards and the alert rules themselves — that a
+later instrumentation decision must close before those views exist. #290 owns
+the signal/health semantics and #291 the connector diagnostics this layer
+consumes; neither is required for a Courier dashboard to be useful standalone.
 
 ### Per-run telemetry
 

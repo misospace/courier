@@ -253,6 +253,105 @@ func TestLaneCollectorInFlightAndSuspended(t *testing.T) {
 	}
 }
 
+// TestLaneCollectorCapacitySignals covers the discovery-side lane gauges:
+// configured concurrency (defaulting a non-positive setting to 1), the
+// deliberately broad reservation count, the Pending subset, and the oldest
+// reservation age.
+func TestLaneCollectorCapacitySignals(t *testing.T) {
+	local := admissionLane("local", 2)
+	zero := admissionLane("zero", 0)
+	cloud := admissionLane("cloud", 3)
+	// Creation timestamps pin the oldest-reservation ages.
+	emptyPhase := admissionRun("local-empty", "local", "")
+	emptyPhase.CreationTimestamp = metav1.NewTime(timestampClock.Add(-time.Hour))
+	localPending := admissionRun("local-pending", "local", courierv1alpha1.PhasePending)
+	localPending.CreationTimestamp = metav1.NewTime(timestampClock.Add(-30 * time.Minute))
+	localClaimed := admissionRun("local-claimed", "local", courierv1alpha1.PhaseClaimed)
+	localClaimed.CreationTimestamp = metav1.NewTime(timestampClock.Add(-45 * time.Minute))
+	localRunning := admissionRun("local-running", "local", courierv1alpha1.PhaseRunning)
+	localRunning.CreationTimestamp = metav1.NewTime(timestampClock.Add(-15 * time.Minute))
+	localVerifying := admissionRun("local-verifying", "local", courierv1alpha1.PhaseVerifying)
+	cloudPending := admissionRun("cloud-pending", "cloud", courierv1alpha1.PhasePending)
+	cloudPending.CreationTimestamp = metav1.NewTime(timestampClock.Add(-2 * time.Hour))
+	zeroPending := admissionRun("zero-pending", "zero", courierv1alpha1.PhasePending)
+
+	client := phaseClient(t, local, zero, cloud,
+		emptyPhase, localPending, localClaimed, localRunning, localVerifying,
+		cloudPending, zeroPending,
+	)
+	collector := NewLaneCollector(client)
+	collector.now = func() time.Time { return timestampClock }
+
+	registry := prometheus.NewRegistry()
+	registry.MustRegister(collector)
+
+	if got := gaugeValue(t, gatherMetric(t, registry, "courier_lane_concurrency", map[string]string{"lane": "local"}), "courier_lane_concurrency"); got != 2 {
+		t.Fatalf("concurrency local = %v, want 2", got)
+	}
+	if got := gaugeValue(t, gatherMetric(t, registry, "courier_lane_concurrency", map[string]string{"lane": "zero"}), "courier_lane_concurrency"); got != 1 {
+		t.Fatalf("concurrency zero = %v, want 1 (runner default)", got)
+	}
+	if got := gaugeValue(t, gatherMetric(t, registry, "courier_lane_reservations", map[string]string{"lane": "local"}), "courier_lane_reservations"); got != 4 {
+		t.Fatalf("reservations local = %v, want 4 (empty + Pending + Claimed + Running)", got)
+	}
+	if got := gaugeValue(t, gatherMetric(t, registry, "courier_lane_reservations", map[string]string{"lane": "cloud"}), "courier_lane_reservations"); got != 1 {
+		t.Fatalf("reservations cloud = %v, want 1", got)
+	}
+	if got := gaugeValue(t, gatherMetric(t, registry, "courier_coderuns_pending", map[string]string{"lane": "local"}), "courier_coderuns_pending"); got != 1 {
+		t.Fatalf("pending local = %v, want 1", got)
+	}
+	if got := gaugeValue(t, gatherMetric(t, registry, "courier_coderuns_pending", map[string]string{"lane": "cloud"}), "courier_coderuns_pending"); got != 1 {
+		t.Fatalf("pending cloud = %v, want 1", got)
+	}
+	if got := gaugeValue(t, gatherMetric(t, registry, "courier_lane_oldest_reservation_age_seconds", map[string]string{"lane": "local"}), "courier_lane_oldest_reservation_age_seconds"); got != time.Hour.Seconds() {
+		t.Fatalf("oldest reservation age local = %v, want %v", got, time.Hour.Seconds())
+	}
+	if got := gaugeValue(t, gatherMetric(t, registry, "courier_lane_oldest_reservation_age_seconds", map[string]string{"lane": "cloud"}), "courier_lane_oldest_reservation_age_seconds"); got != (2 * time.Hour).Seconds() {
+		t.Fatalf("oldest reservation age cloud = %v, want %v", got, (2 * time.Hour).Seconds())
+	}
+	// The zero lane's only reservation has no creation timestamp: its age is
+	// unknown, not zero, so the age series is absent while the reservation
+	// and pending counts still count the run.
+	if got := gaugeValue(t, gatherMetric(t, registry, "courier_lane_reservations", map[string]string{"lane": "zero"}), "courier_lane_reservations"); got != 1 {
+		t.Fatalf("reservations zero = %v, want 1 (the run still reserves the lane)", got)
+	}
+	if got := gaugeValue(t, gatherMetric(t, registry, "courier_coderuns_pending", map[string]string{"lane": "zero"}), "courier_coderuns_pending"); got != 1 {
+		t.Fatalf("pending zero = %v, want 1", got)
+	}
+	if _, present := gaugeValueIfPresent(t, registry, "courier_lane_oldest_reservation_age_seconds", map[string]string{"lane": "zero"}); present {
+		t.Fatal("oldest reservation age series present for a run without a creation timestamp, want absent")
+	}
+	// The existing gauges are unchanged by the new signals.
+	if got := gaugeValue(t, gatherMetric(t, registry, "courier_coderuns_in_flight", map[string]string{"lane": "local"}), "courier_coderuns_in_flight"); got != 2 {
+		t.Fatalf("in-flight local = %v, want 2 (Claimed + Running only)", got)
+	}
+	if got := gaugeValue(t, gatherMetric(t, registry, "courier_lane_suspended", map[string]string{"lane": "local"}), "courier_lane_suspended"); got != 0 {
+		t.Fatalf("suspended local = %v, want 0", got)
+	}
+}
+
+// A lane with no reservations must not report an age series at all: absence
+// is "no reservation", never a zero age.
+func TestLaneCollectorOldestReservationAbsentWithoutReservations(t *testing.T) {
+	local := admissionLane("local", 2)
+	doneRun := admissionRun("local-done", "local", courierv1alpha1.PhaseDone)
+	verifyingRun := admissionRun("local-verifying", "local", courierv1alpha1.PhaseVerifying)
+
+	client := phaseClient(t, local, doneRun, verifyingRun)
+	collector := NewLaneCollector(client)
+	collector.now = func() time.Time { return timestampClock }
+
+	registry := prometheus.NewRegistry()
+	registry.MustRegister(collector)
+
+	if _, present := gaugeValueIfPresent(t, registry, "courier_lane_oldest_reservation_age_seconds", map[string]string{"lane": "local"}); present {
+		t.Fatal("oldest reservation age series present with no reservations, want absent")
+	}
+	if got := gaugeValue(t, gatherMetric(t, registry, "courier_lane_reservations", map[string]string{"lane": "local"}), "courier_lane_reservations"); got != 0 {
+		t.Fatalf("reservations local = %v, want 0 for a drained lane", got)
+	}
+}
+
 // The metrics must stay aggregatable: no label may carry work-item identity
 // (repo, ref, work item, run name, PR), or cardinality would grow with the
 // number of runs instead of staying bounded by lanes, modes, and phases. The
@@ -297,15 +396,29 @@ func TestMetricLabelsExcludeIdentity(t *testing.T) {
 	assertGatheredLabelSet(t, registry, "courier_source_lifecycle_report_outcomes_total", "source", "lane", "mode", "result")
 
 	// A drained lane must still appear on both lane gauges, reporting 0.
+	// A pending run makes every new reservation gauge observable too; it does
+	// not consume admission capacity, so in-flight stays 0. Its creation
+	// timestamp is stamped so the oldest-reservation age series exists —
+	// without one the age is unknown and the series is absent.
 	doneRun := admissionRun("run2", "local", courierv1alpha1.PhaseDone)
 	doneRun.Status.FinishedAt = &metav1.Time{Time: timestampClock.Add(-time.Hour)}
+	pendingRun := admissionRun("run3", "local", courierv1alpha1.PhasePending)
+	pendingRun.CreationTimestamp = metav1.NewTime(timestampClock.Add(-time.Minute))
 	runsClient := phaseClient(t,
 		admissionLane("local", 2),
 		doneRun,
+		pendingRun,
 	)
 	laneRegistry := prometheus.NewRegistry()
 	laneRegistry.MustRegister(NewLaneCollector(runsClient))
-	for _, name := range []string{"courier_coderuns_in_flight", "courier_lane_suspended"} {
+	for _, name := range []string{
+		"courier_coderuns_in_flight",
+		"courier_lane_suspended",
+		"courier_lane_concurrency",
+		"courier_lane_reservations",
+		"courier_coderuns_pending",
+		"courier_lane_oldest_reservation_age_seconds",
+	} {
 		assertGatheredLabelSet(t, laneRegistry, name, "lane")
 	}
 	if got := gaugeValue(t, gatherMetric(t, laneRegistry, "courier_coderuns_in_flight", map[string]string{"lane": "local"}), "courier_coderuns_in_flight"); got != 0 {

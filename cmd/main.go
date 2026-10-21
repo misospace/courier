@@ -371,6 +371,9 @@ func main() {
 			legacyClient.WithPRFixExclusions(true)
 		}
 		sources.Register("dispatch", dispatch.New(legacyClient))
+		// Discovery metrics are process-wide and registered once; each
+		// binding's runner emits into them nil-safely via the shared instance.
+		discoveryMetrics := source.NewDiscoveryMetrics(crmetrics.Registry)
 		for _, binding := range bindings {
 			bindingClient, err := dispatch.NewClientWithLane(dispatchBaseURL, binding.agentName, binding.queueLane, token, dispatchHTTPTimeout)
 			if err != nil {
@@ -392,6 +395,7 @@ func main() {
 				Namespace:    namespace,
 				PollInterval: dispatchPollInterval,
 			})
+			runner.Metrics = discoveryMetrics
 			if err := mgr.Add(runner); err != nil {
 				setupLog.Error(err, "unable to add Dispatch discovery runner", "queueLane", binding.queueLane)
 				os.Exit(1)

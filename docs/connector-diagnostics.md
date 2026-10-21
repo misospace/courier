@@ -63,8 +63,9 @@ with different owners and different naming.
 These describe *Courier's own* relationship to whatever source is configured.
 They exist for every adapter, including a connector that offers nothing beyond
 `Discover`. They are named `courier_source_*` and carry only bounded labels
-(`source` = the configured adapter name, `mode`, `lane`, `phase`, plus closed
-enums). The source-neutral seams already exist in `internal/source/source.go`
+(`source` = the configured source identity, i.e. the `CoderRun.spec.source`
+value and never the agent name; `mode`, `lane`, `phase`, plus closed enums).
+The source-neutral seams already exist in `internal/source/source.go`
 (`Adapter`, `Reporter`, `WorkIdentifier`, `DiscoveryExcluder`, `PreLauncher`)
 and the runner already owns the lifecycle boundaries in
 `internal/source/runner.go` (poll, lane gate, materialize, dedupe).
@@ -74,16 +75,16 @@ and the runner already owns the lifecycle boundaries in
 | `courier_source_discovery_attempts_total` | one poll of the source | core runner | not yet polled |
 | `courier_source_discovery_successes_total` | a poll that returned without error | core runner | — |
 | `courier_source_discovery_failures_total` | a poll whose `Discover`/`DiscoverExcluding` returned an error | core runner | — |
-| `courier_source_discovery_paused_total` | polls skipped by the lane gate (missing/suspended/at capacity) | core runner | — |
+| `courier_source_discovery_paused_total` | polls skipped by the lane gate (missing/suspended/at capacity/capacity cooldown) | core runner | — |
 | `courier_source_items_offered_total` | items returned before core validation/dedupe | core runner | — |
 | `courier_source_items_materialized_total` | items that became `CoderRun`s | core runner | — |
 | `courier_source_lifecycle_report_outcomes_total` | report result (`published`, `superseded`, `unsupported`, `retryable`) | core controller | no report attempted |
 
 These are the signals #290 owns semantically; #291 only fixes their boundary
-against connector diagnostics. Today none exist as metrics — the runner logs
-discovery failures (`internal/source/runner.go:68,79`) and the controller records
-lifecycle conditions on `CoderRun` status. That gap is recorded, not closed,
-here.
+against connector diagnostics. The discovery signals above are exported as
+metrics today (`internal/source/metrics.go`); the lifecycle-report outcome
+signal is not — the controller still records lifecycle conditions on
+`CoderRun` status instead. That remaining gap is recorded, not closed, here.
 
 ### 2.2 Layer 2 — connector diagnostics (adapter-owned)
 
@@ -472,8 +473,9 @@ These are recorded so a later instrumentation ticket can settle them; none is
 authorized by this document:
 
 - Which signals become Prometheus metrics versus log-only events. The envelope
-  is designed for both, but the existing instrumentation gap (no discovery,
-  reservation, or report metrics) means the first cut may be log-only.
+  is designed for both; the core discovery and reservation signals are metrics
+  today, but the connector envelope itself has no instrumentation yet, so its
+  first cut may be log-only.
 - Whether the capability catalogue is a scrape-time gauge, a startup event, or
   both.
 - The exact cardinality cap for connector-declared `reason` vocabularies. The
