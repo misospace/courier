@@ -343,6 +343,7 @@ func TestAlertScenarios(t *testing.T) {
 
 	t.Run("A1 discovery outage fires and recovers after a success", func(t *testing.T) {
 		script := `load 30s
+  courier_source_discovery_attempts_total{source="src",lane="main"} 0x44
   courier_source_discovery_failures_total{source="src",lane="main"} 0+1x44
   courier_source_last_success_timestamp_seconds{source="src",lane="main"} ` + stalePrefix(21) + `630+30x23
   courier_source_discovery_paused{source="src",lane="main",reason="lane-suspended"} 0x44
@@ -399,6 +400,32 @@ func TestAlertScenarios(t *testing.T) {
 		st := loadStorage(t, script)
 		assertFiring(t, evalAt(t, st, exprFor(t, "CourierSourceDiscoveryFailing"), 300*time.Second),
 			[]string{"src/main//"})
+	})
+
+	t.Run("A1 never-successful source stays silent during the 300s startup grace then fires", func(t *testing.T) {
+		script := `load 30s
+  courier_source_discovery_attempts_total{source="src",lane="main"} 0x44
+  courier_source_discovery_failures_total{source="src",lane="main"} 0+1x44
+  courier_source_discovery_paused{source="src",lane="main",reason="lane-suspended"} 0x44
+` + baseLane
+		st := loadStorage(t, script)
+		for _, at := range []time.Duration{120 * time.Second, 240 * time.Second, 285 * time.Second} {
+			assertSilent(t, evalAt(t, st, exprFor(t, "CourierSourceDiscoveryFailing"), at))
+		}
+		assertFiring(t, evalAt(t, st, exprFor(t, "CourierSourceDiscoveryFailing"), 360*time.Second),
+			[]string{"src/main//"})
+		assertFiring(t, evalAt(t, st, exprFor(t, "CourierSourceDiscoveryFailing"), 600*time.Second),
+			[]string{"src/main//"})
+	})
+
+	t.Run("A1 never-successful source without any attempt stays silent past the grace", func(t *testing.T) {
+		script := `load 30s
+  courier_source_discovery_paused{source="src",lane="main",reason="lane-suspended"} 0x44
+` + baseLane
+		st := loadStorage(t, script)
+		for _, at := range []time.Duration{300 * time.Second, 600 * time.Second} {
+			assertSilent(t, evalAt(t, st, exprFor(t, "CourierSourceDiscoveryFailing"), at))
+		}
 	})
 
 	t.Run("A2 saturated lane with rising queue wait fires", func(t *testing.T) {

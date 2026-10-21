@@ -17,8 +17,9 @@ groups:
             or
             (
               (increase(courier_source_discovery_failures_total[300s]) > 0)
-              unless on(source, lane) courier_source_last_success_timestamp_seconds
+              and on(source, lane) (courier_source_discovery_attempts_total offset 300s)
             )
+            unless on(source, lane) courier_source_last_success_timestamp_seconds
           )
           and on(source, lane) (max by (source, lane) (courier_source_discovery_paused) == 0)
           and on(lane) (courier_lane_reservations < courier_lane_concurrency)
@@ -38,10 +39,14 @@ groups:
             has ever succeeded fires when failures rose in the last 90s and
             courier_source_last_success_timestamp_seconds is older than 90s. A binding that
             has never succeeded fires when failures rose in the last 300s and no success
-            timestamp exists; the 300s failure window is the computable stand-in for the
-            10x-poll startup grace because no first-attempt timestamp exists, and it also
-            self-suppresses until at least one attempt is recorded and keeps an all-failing
-            source alerting instead of staying silent forever. A paused binding
+            timestamp exists, but only after the 10x-poll startup grace: the binding's
+            attempts counter series first appears at the first real poll, so requiring it to
+            exist at least 300s ago (default ~5m lookback in Prometheus; VictoriaMetrics
+            auto-detects a similar window) marks the grace as elapsed without a
+            first-attempt timestamp, and keeps the alert suppressed until at least one
+            attempt is recorded. The 300s failure window is that branch's evidence window
+            and keeps an all-failing source alerting instead of staying silent forever. A
+            paused binding
             (courier_source_discovery_paused non-zero for any reason), a lane without free
             capacity, or a suspended lane does not fire. Disabled sources emit no series and
             thus cannot fire. Recovery: any success inside the window refreshing
