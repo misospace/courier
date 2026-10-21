@@ -17,6 +17,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/misospace/courier/internal/connector"
 	"github.com/misospace/courier/internal/source"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 )
@@ -141,7 +142,9 @@ type HTTPClient struct {
 	httpClient               HTTPDoer
 	prStateChecker           PullRequestStateChecker
 	prFixExclusionsEnabled   bool
+	prFixExclusionLimit      int
 	reportIdempotencyEnabled bool
+	diagnostics              *connector.Emitter
 }
 
 // NewClient creates a Dispatch HTTP client without a queue lane override.
@@ -170,6 +173,27 @@ func (c *HTTPClient) WithReportIdempotency(enabled bool) *HTTPClient {
 // Enable only after deployment has confirmed support for that contract.
 func (c *HTTPClient) WithPRFixExclusions(enabled bool) *HTTPClient {
 	c.prFixExclusionsEnabled = enabled
+	return c
+}
+
+// WithPRFixExclusionLimit overrides the exclusion contract maximum for this
+// client. The limit is connector-declared data exported through
+// ExclusionLimit; the truncation behavior itself is unchanged. A limit below
+// one is ignored and keeps the existing default of maxPRFixExclusions.
+func (c *HTTPClient) WithPRFixExclusionLimit(limit int) *HTTPClient {
+	if limit >= 1 {
+		c.prFixExclusionLimit = limit
+	}
+	return c
+}
+
+// WithConnectorDiagnostics attaches the connector diagnostic envelope the
+// client emits its own diagnostics through. A nil emitter leaves every
+// emission a no-op, so existing call sites are unchanged. Registration of the
+// connector name, vocabulary, exclusion limit, and capability catalogue
+// happens once at adapter construction.
+func (c *HTTPClient) WithConnectorDiagnostics(em *connector.Emitter) *HTTPClient {
+	c.diagnostics = em
 	return c
 }
 
@@ -204,6 +228,7 @@ func newClient(baseURL, agentName, queueLane, token string, timeout time.Duratio
 		agentName:                strings.TrimSpace(agentName),
 		queueLane:                strings.TrimSpace(queueLane),
 		httpClient:               httpClient,
+		prFixExclusionLimit:      maxPRFixExclusions,
 	}, nil
 }
 
@@ -239,7 +264,7 @@ func (c *HTTPClient) discoverWithExclusions(ctx context.Context, query url.Value
 	}
 	query.Set("exclude_pr_fix_version", "1")
 	seen := make(map[string]struct{})
-	values := make([]string, 0, min(len(exclusions), maxPRFixExclusions))
+	values := make([]string, 0, min(len(exclusions), c.prFixExclusionLimit))
 	for _, item := range exclusions {
 		d, err := decodeWorkID(item.ID)
 		if err != nil || d.Type != "followup-pr" || d.PRFixID == "" || d.Generation < 1 || d.Repo == "" {
@@ -247,23 +272,26 @@ func (c *HTTPClient) discoverWithExclusions(ctx context.Context, query url.Value
 		}
 		repo := strings.ToLower(d.Repo)
 		if !dispatchRepoPattern.MatchString(repo) || d.Number > maxSafeInteger || d.Generation > maxSafeInteger {
+			c.diagnostics.Diagnostic(connectorName, connector.SignalProtocolError, reasonInvalidDescriptor)
 			return nil, fmt.Errorf("dispatch client: invalid PR-fix exclusion descriptor")
 		}
 		value := fmt.Sprintf("%s#%d@%d", repo, d.Number, d.Generation)
 		if len(value) > 300 {
+			c.diagnostics.Diagnostic(connectorName, connector.SignalProtocolError, reasonInvalidDescriptor)
 			return nil, fmt.Errorf("dispatch client: PR-fix exclusion exceeds maximum 300 characters")
 		}
 		if _, exists := seen[value]; exists {
 			continue
 		}
 		seen[value] = struct{}{}
-		if len(seen) <= maxPRFixExclusions {
+		if len(seen) <= c.prFixExclusionLimit {
 			values = append(values, value)
 		}
 	}
-	if dropped := len(seen) - maxPRFixExclusions; dropped > 0 {
-		log.FromContext(ctx).Info("dispatch client: PR-fix exclusions exceed contract maximum, keeping the most relevant", "agent", c.agentName, "kept", maxPRFixExclusions, "dropped", dropped)
+	if dropped := len(seen) - c.prFixExclusionLimit; dropped > 0 {
+		log.FromContext(ctx).Info("dispatch client: PR-fix exclusions exceed contract maximum, keeping the most relevant", "agent", c.agentName, "kept", c.prFixExclusionLimit, "dropped", dropped)
 	}
+	c.diagnostics.ExclusionCycle(connectorName, len(seen), len(values))
 	for _, value := range values {
 		query.Add("exclude_pr_fix", value)
 	}
@@ -283,7 +311,21 @@ type nextTaskResponse struct {
 	PRFixExclusions json.RawMessage `json:"prFixExclusions"`
 }
 
-func (c *HTTPClient) discover(ctx context.Context, query url.Values) ([]source.WorkItem, error) {
+func (c *HTTPClient) discover(ctx context.Context, query url.Values) (items []source.WorkItem, err error) {
+	// Availability is connector-declared (§3.5), observed per discovery
+	// attempt: a successful read of any shape is available, a transport
+	// failure is unreachable, and every other failure is degraded.
+	defer func() {
+		if err != nil {
+			if ex := exchangeOf(err); ex != nil && ex.reason == reasonTransportError {
+				c.diagnostics.Availability(connectorName, connector.AvailabilityUnreachable)
+				return
+			}
+			c.diagnostics.Availability(connectorName, connector.AvailabilityDegraded)
+			return
+		}
+		c.diagnostics.Availability(connectorName, connector.AvailabilityAvailable)
+	}()
 	var response nextTaskResponse
 	endpoint := "/api/agents/" + url.PathEscape(c.agentName) + "/next-task"
 	if query != nil {
@@ -294,20 +336,28 @@ func (c *HTTPClient) discover(ctx context.Context, query url.Values) ([]source.W
 	}
 	if query != nil && query.Has("exclude_pr_fix_version") {
 		var ack map[string]json.RawMessage
-		if len(response.PRFixExclusions) == 0 || json.Unmarshal(response.PRFixExclusions, &ack) != nil || ack == nil {
+		if len(response.PRFixExclusions) == 0 {
+			c.diagnostics.Diagnostic(connectorName, connector.SignalAck, reasonAckMissing)
+			return nil, fmt.Errorf("dispatch client: missing or invalid PR-fix exclusions acknowledgment")
+		}
+		if json.Unmarshal(response.PRFixExclusions, &ack) != nil || ack == nil {
+			c.diagnostics.Diagnostic(connectorName, connector.SignalAck, reasonAckInvalid)
 			return nil, fmt.Errorf("dispatch client: missing or invalid PR-fix exclusions acknowledgment")
 		}
 		version, ok := ack["version"]
 		var versionValue int
 		if !ok || json.Unmarshal(version, &versionValue) != nil || versionValue != 1 {
+			c.diagnostics.Diagnostic(connectorName, connector.SignalAck, reasonAckVersionUnsupported)
 			return nil, fmt.Errorf("dispatch client: unsupported PR-fix exclusions acknowledgment")
 		}
+		c.diagnostics.Diagnostic(connectorName, connector.SignalAck, reasonAckOK)
 	}
 	task := response.Task
 	if !task.ShouldRun || task.Type == "idle" {
 		return nil, nil
 	}
 	if task.Type != "implement" && task.Type != "followup-pr" {
+		c.diagnostics.Diagnostic(connectorName, connector.SignalProtocolError, reasonUnsupportedTaskType)
 		return nil, fmt.Errorf("dispatch client: unsupported task type %q", task.Type)
 	}
 	itemID, err := taskWorkItem(task)
@@ -610,13 +660,22 @@ func (c *HTTPClient) checkPullRequestState(ctx context.Context, pullRequest *Pul
 	return c.prStateChecker.CheckPullRequestState(ctx, pullRequest.Repo, pullRequest.Number)
 }
 
-// asSuperseded maps only an explicitly stale generation to a terminal source result.
-func asSuperseded(err error) error {
+// asSuperseded maps only an explicitly stale generation to a terminal source
+// result. A superseded generation is a normal, expected identity outcome
+// (§3.4): it counts under identity/generation-advanced, and the underlying
+// 409 exchange — deferred past the do() choke point — is absorbed rather
+// than also counted as a protocol error. A 409 that is not a stale
+// generation is an ordinary failure and counts under its HTTP class here,
+// where the classification is final.
+func (c *HTTPClient) asSuperseded(err error) error {
 	var apiErr *APIError
 	if errors.As(err, &apiErr) && apiErr.StatusCode == http.StatusConflict &&
 		(strings.Contains(strings.ToLower(apiErr.Message), "generation mismatch") || strings.Contains(strings.ToLower(apiErr.Message), "expected generation")) {
+		c.diagnostics.Diagnostic(connectorName, connector.SignalIdentity, reasonIdentityGenerationAdvanced)
+		absorbExchange(err)
 		return fmt.Errorf("%w: %w", source.ErrSuperseded, err)
 	}
+	c.countPendingExchange(err)
 	return err
 }
 
@@ -756,6 +815,10 @@ func (c *HTTPClient) AckHandout(ctx context.Context, item source.WorkItem) error
 			}
 		}
 	}
+	// A 4xx refusal that reached here is a real failure, not ledger evidence;
+	// its protocol-error class was deferred past the choke point and is
+	// counted now, once.
+	c.countPendingExchange(err)
 	return err
 }
 
@@ -766,7 +829,7 @@ func (c *HTTPClient) markPRFixBlocked(ctx context.Context, d workDescriptor, not
 	if strings.TrimSpace(note) == "" {
 		note = "Courier run requires human intervention"
 	}
-	return asSuperseded(c.do(ctx, http.MethodPost, "/api/pr-fix-queue/mark", map[string]any{
+	return c.asSuperseded(c.do(ctx, http.MethodPost, "/api/pr-fix-queue/mark", map[string]any{
 		"repo": d.Repo, "pr": d.Number, "status": "BLOCKED", "note": note,
 		"generation": d.Generation,
 	}, nil))
@@ -786,7 +849,7 @@ func (c *HTTPClient) markPRFixWaitingExternal(ctx context.Context, d workDescrip
 	if strings.TrimSpace(note) == "" {
 		note = "Courier run is waiting on an external prerequisite"
 	}
-	return asSuperseded(c.do(ctx, http.MethodPost, "/api/pr-fix-queue/mark", map[string]any{
+	return c.asSuperseded(c.do(ctx, http.MethodPost, "/api/pr-fix-queue/mark", map[string]any{
 		"repo": d.Repo, "pr": d.Number, "status": "WAITING_EXTERNAL", "note": note,
 		"generation": d.Generation,
 	}, nil))
@@ -800,7 +863,7 @@ func (c *HTTPClient) markPRFixStale(ctx context.Context, pullRequest *PullReques
 	if state.Merged {
 		note = "upstream pull request is merged"
 	}
-	return asSuperseded(c.do(ctx, http.MethodPost, "/api/pr-fix-queue/mark", map[string]any{
+	return c.asSuperseded(c.do(ctx, http.MethodPost, "/api/pr-fix-queue/mark", map[string]any{
 		"repo": pullRequest.Repo, "pr": pullRequest.Number, "status": "STALE", "note": note,
 		"generation": generation,
 	}, nil))
@@ -854,6 +917,11 @@ func (c *HTTPClient) reportTaskWithPR(ctx context.Context, d workDescriptor, out
 	err := c.do(ctx, http.MethodPost, "/api/agents/"+url.PathEscape(c.agentName)+"/tasks/report", body, nil)
 	var apiErr *APIError
 	if errors.As(err, &apiErr) && apiErr.StatusCode == http.StatusBadRequest && isInvalidOutcomeResponse(apiErr.Message) {
+		// The source rejected the outcome; this classification path owns the
+		// exchange's diagnostic under the unsupported-task-type class, and
+		// the report outcome itself is counted at the Report boundary.
+		c.diagnostics.Diagnostic(connectorName, connector.SignalProtocolError, reasonUnsupportedTaskType)
+		absorbExchange(err)
 		return fmt.Errorf("%w: %w", source.ErrUnsupportedOutcome, apiErr)
 	}
 	return err
@@ -899,6 +967,7 @@ func (c *HTTPClient) PreLaunch(ctx context.Context, id string) error {
 		return err
 	}
 	if d.Type != "followup-pr" {
+		c.diagnostics.Diagnostic(connectorName, connector.SignalRevalidation, reasonRevalidationCurrent)
 		return nil
 	}
 	pullRequest := &PullRequest{Repo: d.Repo, Number: d.Number}
@@ -911,9 +980,19 @@ func (c *HTTPClient) PreLaunch(ctx context.Context, id string) error {
 			if err := c.markPRFixStale(ctx, pullRequest, state, d.Generation); err != nil {
 				return err
 			}
+			// The STALE mark released the queue-backed attempt's hand-out,
+			// so the compare-and-set claim of this attempt is gone before
+			// launch (§3.4): a normal outcome, counted under identity.
+			c.diagnostics.Diagnostic(connectorName, connector.SignalIdentity, reasonIdentityClaimReleased)
 		}
+		reason := reasonRevalidationClosedUnmerged
+		if state.Merged {
+			reason = reasonRevalidationMerged
+		}
+		c.diagnostics.Diagnostic(connectorName, connector.SignalRevalidation, reason)
 		return fmt.Errorf("%w: upstream pull request %s#%d is no longer open", source.ErrStaleWork, d.Repo, d.Number)
 	}
+	c.diagnostics.Diagnostic(connectorName, connector.SignalRevalidation, reasonRevalidationCurrent)
 	return nil
 }
 
@@ -922,22 +1001,25 @@ func (c *HTTPClient) Report(ctx context.Context, id string, lifecycle source.Lif
 	if err != nil {
 		return err
 	}
+	var final error
 	switch lifecycle.Result {
 	case source.ResultReady:
 		outcome := "pr_updated"
 		if d.Type == "implement" {
 			outcome = "pr_opened"
 		}
-		return c.reportTaskWithPR(ctx, d, outcome, "", lifecycle.PR, lifecycle.IdempotencyKey, lifecycle.Telemetry, lifecycle.StartedAt)
+		final = c.reportTaskWithPR(ctx, d, outcome, "", lifecycle.PR, lifecycle.IdempotencyKey, lifecycle.Telemetry, lifecycle.StartedAt)
 	case source.ResultBlocked:
 		reportErr := c.reportTaskWithPR(ctx, d, "blocked", lifecycle.Error, lifecycle.PR, lifecycle.IdempotencyKey, lifecycle.Telemetry, lifecycle.StartedAt)
 		if lifecycle.BlockedReportParksPRFix {
-			return reportErr
+			final = reportErr
+		} else {
+			final = errors.Join(reportErr, c.markPRFixBlocked(ctx, d, lifecycle.Error))
 		}
-		return errors.Join(reportErr, c.markPRFixBlocked(ctx, d, lifecycle.Error))
 	case source.ResultCapacityExhausted:
 		// Do not publish a waiting-external report: settlement is exclusively
-		// performed by the fenced CapacityRecovery capability.
+		// performed by the fenced CapacityRecovery capability. No report was
+		// attempted, so no report outcome is fabricated here.
 		return nil
 	case source.ResultBlockedExternal:
 		// Recoverable dependency block. The task report uses a dedicated
@@ -948,23 +1030,41 @@ func (c *HTTPClient) Report(ctx context.Context, id string, lifecycle source.Lif
 		// contract this depends on and the failure modes each signal rules
 		// out.
 		reportErr := c.reportTaskWithPR(ctx, d, outcomeWaitingExternal, lifecycle.Error, lifecycle.PR, lifecycle.IdempotencyKey, lifecycle.Telemetry, lifecycle.StartedAt)
-		return errors.Join(reportErr, c.markPRFixWaitingExternal(ctx, d, lifecycle.Error))
+		final = errors.Join(reportErr, c.markPRFixWaitingExternal(ctx, d, lifecycle.Error))
 	case source.ResultFailed:
 		// Dispatch's failed report requeues eligible PR-fix work under its
 		// existing attempt cap. A separate BLOCKED mark can target a stale
 		// generation after the report advances the queue item.
-		return c.reportTaskWithPR(ctx, d, "failed", lifecycle.Error, lifecycle.PR, lifecycle.IdempotencyKey, lifecycle.Telemetry, lifecycle.StartedAt)
+		final = c.reportTaskWithPR(ctx, d, "failed", lifecycle.Error, lifecycle.PR, lifecycle.IdempotencyKey, lifecycle.Telemetry, lifecycle.StartedAt)
 	case source.ResultHandedOff:
 		// This is truthful, non-parking evidence; Dispatch discovers red checks
 		// through its own PR-followup sync. It must not be Ready (green) or
 		// BLOCKED (which parks the issue).
-		return c.reportTaskWithPR(ctx, d, "handed-off", lifecycle.Error, lifecycle.PR, lifecycle.IdempotencyKey, lifecycle.Telemetry, lifecycle.StartedAt)
+		final = c.reportTaskWithPR(ctx, d, "handed-off", lifecycle.Error, lifecycle.PR, lifecycle.IdempotencyKey, lifecycle.Telemetry, lifecycle.StartedAt)
 	case source.ResultNoChange:
 		// Retain enum compatibility, but a bare no-change assertion carries
 		// no source-verified feedback evidence and cannot authorize FIXED.
-		return source.ErrUnsupportedOutcome
+		final = source.ErrUnsupportedOutcome
 	default:
 		return nil
+	}
+	c.emitReportOutcome(final)
+	return final
+}
+
+// emitReportOutcome counts one lifecycle-report outcome (§3) at the Report
+// boundary. A superseded report must be dropped rather than retried, so it
+// counts under its identity signal instead of a report reason.
+func (c *HTTPClient) emitReportOutcome(final error) {
+	switch {
+	case final == nil:
+		c.diagnostics.Diagnostic(connectorName, connector.SignalReport, reasonReportPublished)
+	case errors.Is(final, source.ErrSuperseded):
+		c.diagnostics.Diagnostic(connectorName, connector.SignalIdentity, reasonIdentitySuperseded)
+	case errors.Is(final, source.ErrUnsupportedOutcome):
+		c.diagnostics.Diagnostic(connectorName, connector.SignalReport, reasonReportUnsupported)
+	default:
+		c.diagnostics.Diagnostic(connectorName, connector.SignalReport, reasonReportRetryable)
 	}
 }
 
@@ -1107,19 +1207,52 @@ func (c *HTTPClient) do(ctx context.Context, method, requestPath string, body an
 	}
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
-		return err
+		return c.failExchange(err, reasonTransportError)
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
 		data, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
 		message := strings.TrimSpace(string(data))
 		message = strings.ReplaceAll(message, c.token, "[redacted]")
-		return &APIError{StatusCode: resp.StatusCode, Message: message}
+		apiErr := &APIError{StatusCode: resp.StatusCode, Message: message}
+		reason := httpReason(resp.StatusCode)
+		if exchangeReclassified(method, requestPath, apiErr) {
+			// The caller reclassifies this exchange into an identity or
+			// report outcome and owns its diagnostic; the protocol-error
+			// class is deferred to that site so one exchange counts once.
+			return newExchange(apiErr, reason)
+		}
+		return c.failExchange(apiErr, reason)
 	}
 	if response == nil || resp.StatusCode == http.StatusNoContent {
 		return nil
 	}
-	return json.NewDecoder(resp.Body).Decode(response)
+	if err := json.NewDecoder(resp.Body).Decode(response); err != nil {
+		return c.failExchange(err, reasonMalformedResponse)
+	}
+	return nil
+}
+
+// exchangeReclassified reports whether a failed exchange's diagnostic is
+// owned by its caller rather than the choke point in do(), so one exchange
+// counts exactly once (§6.2): a superseded PR-fix mark reclassifies into an
+// identity outcome (§3.4), a report whose outcome the source rejects
+// reclassifies into ErrUnsupportedOutcome, and the hand-out ack endpoint's
+// known refusals are moot no-ops that AckHandout settles — counting their
+// 4xx classes here would fabricate failures for successful no-ops.
+func exchangeReclassified(method, requestPath string, apiErr *APIError) bool {
+	if method != http.MethodPost {
+		return false
+	}
+	if requestPath == "/api/pr-fix-queue/mark" && apiErr.StatusCode == http.StatusConflict {
+		return true
+	}
+	if requestPath == "/api/pr-fix-queue/ack" && apiErr.StatusCode >= http.StatusBadRequest && apiErr.StatusCode < http.StatusMultipleChoices {
+		return true
+	}
+	return strings.HasSuffix(requestPath, "/tasks/report") &&
+		apiErr.StatusCode == http.StatusBadRequest &&
+		isInvalidOutcomeResponse(apiErr.Message)
 }
 
 func taskWorkItem(task Task) (string, error) {

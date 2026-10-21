@@ -1542,9 +1542,18 @@ works with an alternate source. Absent and unsupported diagnostics are distinct
 from success, core and connector counters are joined rather than summed, labels
 stay bounded, and trace correlation is optional and never a metric label. §11
 of that document names the bounded-label, duplicate-counting, privacy, and
-correlation assertions the future instrumentation PR must satisfy — the
-requirement-trace target for #291 lives in the doc, not in code that does not
-yet exist. The design records the #286 exclusion-overflow outage as the
+correlation assertions the instrumentation must satisfy; the unit-level subset
+of those assertions runs as `go test` checks today (the envtest no-double-count
+fixture, the AST-walk free-form-label check, and the scrape-time images-job
+invariants remain the contract for later follow-ups). The
+envelope is implemented in
+`internal/connector`, and the Dispatch and manual adapters declare their
+capability catalogues and emit their diagnostics through it at construction and
+at the exchange classification sites in `internal/source/dispatch`. Core wiring
+is generic — the operator builds one emitter on the manager's metric registry
+and the shared run-event log and passes it to the adapters; the connector
+names, reason vocabularies, and capability states belong to each adapter. The
+design records the #286 exclusion-overflow outage as the
 motivating case while leaving the overflow *strategy* to #286 and retention to
 #287; #290 owns the source-health semantics and #292 the views this layer feeds.
 
@@ -2125,7 +2134,10 @@ that needs Dispatch-side queue exclusion. Where supported, discovery passes
 retained same-source work IDs as opaque exclusions when the Dispatch client is
 explicitly opted in; exclusion support defaults off and must be enabled only
 after deployment has confirmed the Dispatch contract. Enabled requests are
-bounded to 32 unique valid entries of 300 characters each. The runner orders
+bounded to a maximum of 32 unique valid entries of 300 characters each — the
+historical contract ceiling, kept as the default and overridable per client
+(`WithPRFixExclusionLimit`) with the configured maximum exported as
+`courier_connector_exclusion_limit` data. The runner orders
 exclusions most-relevant-first — pre-terminal runs before terminal retained
 runs (whose attempts are usually settled; ranking is a truncation heuristic,
 not settlement authority, and a terminal run with a still-pending report ranks

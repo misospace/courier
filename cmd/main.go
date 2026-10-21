@@ -24,6 +24,7 @@ import (
 
 	courierv1alpha1 "github.com/misospace/courier/api/v1alpha1"
 	"github.com/misospace/courier/internal/bootstrap"
+	"github.com/misospace/courier/internal/connector"
 	"github.com/misospace/courier/internal/controller"
 	"github.com/misospace/courier/internal/executor"
 	"github.com/misospace/courier/internal/forge"
@@ -323,8 +324,14 @@ func main() {
 	// setting into another run's noise.
 	runEvents := courierlog.NewEmitter(os.Stdout, courierlog.ParseLevel(os.Getenv("COURIER_LOG_LEVEL")))
 
+	// Connector diagnostics (docs/connector-diagnostics.md) share the run
+	// event emitter for their log half and the manager's metric registry for
+	// their metric half. The envelope is generic: core wires it, but the
+	// signal vocabularies and capability declarations belong to each adapter.
+	diagnostics := connector.NewEmitter(crmetrics.Registry, connector.NewEventLogSink(runEvents))
+
 	sources := controller.NewSourceRegistry(map[string]source.Adapter{
-		"manual": manual.Adapter{},
+		"manual": manual.New(diagnostics),
 	})
 	if dispatchEnabled {
 		if strings.TrimSpace(dispatchBaseURL) == "" || strings.TrimSpace(dispatchAgentName) == "" {
@@ -366,7 +373,7 @@ func main() {
 		if dispatchPRFixExclusions {
 			legacyClient.WithPRFixExclusions(true)
 		}
-		sources.Register("dispatch", dispatch.New(legacyClient))
+		sources.Register("dispatch", dispatch.New(legacyClient, dispatch.WithConnectorDiagnostics(diagnostics)))
 		for _, binding := range bindings {
 			bindingClient, err := dispatch.NewClientWithLane(dispatchBaseURL, binding.agentName, binding.queueLane, token, dispatchHTTPTimeout)
 			if err != nil {
@@ -377,7 +384,7 @@ func main() {
 			if dispatchPRFixExclusions {
 				bindingClient.WithPRFixExclusions(true)
 			}
-			adapter := dispatch.New(bindingClient)
+			adapter := dispatch.New(bindingClient, dispatch.WithConnectorDiagnostics(diagnostics))
 			if binding.sourceAgent != "" {
 				sources.Register("dispatch:"+binding.sourceAgent, adapter)
 			}

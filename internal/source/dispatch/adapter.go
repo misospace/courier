@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 
+	"github.com/misospace/courier/internal/connector"
 	"github.com/misospace/courier/internal/source"
 )
 
@@ -52,7 +53,24 @@ type API = Client
 // Adapter translates Courier's generic source lifecycle into Dispatch API
 // calls.
 type Adapter struct {
-	client Client
+	client      Client
+	diagnostics *connector.Emitter
+}
+
+// Option configures an Adapter at construction.
+type Option func(*Adapter)
+
+// WithConnectorDiagnostics attaches the connector diagnostic envelope
+// (docs/connector-diagnostics.md). A nil emitter leaves the adapter
+// diagnostic-free, so existing call sites are unchanged. When the client is
+// the concrete HTTP client the emitter also reaches its runtime emission
+// points, the exclusion contract maximum is exported once, and the
+// capability catalogue and initial availability are declared here — the one
+// canonical construction site.
+func WithConnectorDiagnostics(em *connector.Emitter) Option {
+	return func(a *Adapter) {
+		a.diagnostics = em
+	}
 }
 
 // DispatchAdapter is a descriptive alias for Adapter.
@@ -67,14 +85,59 @@ var _ source.CapacityRecoveryPreparer = (*Adapter)(nil)
 var _ source.CapacityRecovery = (*Adapter)(nil)
 
 // New creates a Dispatch adapter around an injected API client.
-func New(client Client) *Adapter {
-	return &Adapter{client: client}
+func New(client Client, opts ...Option) *Adapter {
+	a := &Adapter{client: client}
+	for _, opt := range opts {
+		if opt != nil {
+			opt(a)
+		}
+	}
+	a.declareCapabilities()
+	return a
 }
 
 // NewAdapter is an explicit constructor alias for callers that prefer the
 // adapter's role in the name.
-func NewAdapter(client Client) *Adapter {
-	return New(client)
+func NewAdapter(client Client, opts ...Option) *Adapter {
+	return New(client, opts...)
+}
+
+// declareCapabilities publishes the capability catalogue (§5) and the
+// connector's identity: the closed reason vocabulary is registered, the
+// exclusion contract maximum is exported as data, and availability starts
+// unknown until the first discovery attempt observes a state. Without an
+// emitter this is a no-op.
+func (a *Adapter) declareCapabilities() {
+	em := a.diagnostics
+	if em == nil {
+		return
+	}
+	em.RegisterConnector(connectorName, reasonVocabulary())
+	if hc, ok := a.client.(*HTTPClient); ok {
+		hc.WithConnectorDiagnostics(em)
+		em.ExclusionLimit(connectorName, hc.prFixExclusionLimit)
+		if hc.prFixExclusionsEnabled {
+			em.Capability(connectorName, connector.CapabilityDiscoveryExclusions, connector.CapabilitySupported)
+		} else {
+			em.Capability(connectorName, connector.CapabilityDiscoveryExclusions, connector.CapabilityUnsupported)
+		}
+	} else {
+		em.Capability(connectorName, connector.CapabilityDiscoveryExclusions, connector.CapabilityUnsupported)
+	}
+	em.Capability(connectorName, connector.CapabilityDiscovery, connector.CapabilitySupported)
+	if _, ok := a.client.(ReporterClient); ok {
+		em.Capability(connectorName, connector.CapabilityLifecycleReport, connector.CapabilitySupported)
+	} else {
+		em.Capability(connectorName, connector.CapabilityLifecycleReport, connector.CapabilityUnsupported)
+	}
+	if _, ok := a.client.(PreLauncherClient); ok {
+		em.Capability(connectorName, connector.CapabilityPreLaunchRevalidation, connector.CapabilitySupported)
+	} else {
+		em.Capability(connectorName, connector.CapabilityPreLaunchRevalidation, connector.CapabilityUnsupported)
+	}
+	em.Capability(connectorName, connector.CapabilityWorkIdentity, connector.CapabilitySupported)
+	em.Capability(connectorName, connector.CapabilityAvailability, connector.CapabilitySupported)
+	em.Availability(connectorName, connector.AvailabilityUnknown)
 }
 
 // Discover returns Dispatch work that the operator can materialize as

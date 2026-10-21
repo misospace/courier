@@ -489,13 +489,15 @@ authorized by this document:
 §6 fixes rules that are easy to violate by accident: a label key slips in,
 a connector sums its diagnostic onto the core failure counter, a free-form
 string becomes a label value, or a `run_id` turns into a high-cardinality
-metric label. This section is the **contract a later instrumentation ticket
-must satisfy before it can close**. None of the assertions below runs in this
-PR — this PR is documentation only — but every checklist item names the test
+metric label. The instrumentation that emits `courier_connector_*` and
+`connector.diagnostic` is now implemented (`internal/connector`, with the
+Dispatch and manual adapters as emitters), and the unit-level subset of the
+assertions below runs in `go test`; the envtest fixtures, AST/grep static
+checks, and scrape-time images-job invariants remain the contract items still
+to land. Every checklist item names the test
 or scrape-time invariant that will trip CI when the rule is broken.
 
-A future instrumentation PR (the one that actually emits
-`courier_connector_*` and `connector.diagnostic`) lands only when each rule
+A connector change lands only when each rule
 in §6 has a passing assertion of the form listed below. New connectors that
 declare new capabilities inherit the same assertions. The list is the
 requirement-trace target the design itself closes against.
