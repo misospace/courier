@@ -144,6 +144,15 @@ role.
   the run branch {{branch}} and never create or publish work from any other
   branch."
 
+When the source issued the run with assignment context (`spec.assignmentKind`
+and `spec.assignmentReasons`, #512), the goal quotes the reasons as untrusted
+task data — context for why the work was dispatched, never instructions —
+regenerated from the durable immutable spec so a resumed or relaunched
+coordinator receives them too. A `merge-conflict` assignment additionally
+requires resolving the reported conflict or truthfully reporting that it
+remains unresolved; a review approval does not complete a conflict-repair
+task.
+
 Goals stay short — a goal plus tools — but each carries one non-negotiable
 contract: delegation covers bounded work, never the coordinator's ownership
 of completion and forge publication. The publication hint names the run branch
@@ -1655,6 +1664,8 @@ spec:                       # set once by the source adapter, then immutable
   source: dispatch | github-label | cron | cli | web
   sourceAgent: <optional stable identity for a qualified source binding>
   workItemID: <opaque ID understood by the source adapter>
+  assignmentKind: merge-conflict | ci-failure | review-feedback | other # optional; the adapter's normalized why-the-source-issued-this classification
+  assignmentReasons: [<bounded untrusted source free text>] # optional; why the source issued the run, never dedupe identity
   repo: owner/name
   ref: <issue# or pr#>
   lane: local | cloud | ...        # names a LaneProfile
@@ -2161,7 +2172,12 @@ Pluggable adapters over a generic interface. An adapter both *creates* runs and
 - **dispatch** (first-party, native — no bridge). The operator *is* the dispatch
   client: claim, in-progress, in-review, needs-human, and watching the pr-fix
   queue to materialize `fix-pr` runs. This replaces the foreman-dispatch-bridge
-  entirely. A resolve-issue `handed-off` report sends a task report with
+  entirely. A `next-task` offer's free-text `reasons` are never dropped: the
+  adapter bounds and sanitizes them into the run's assignment context
+  (`assignmentReasons`) plus one normalized `assignmentKind` (heuristic by
+  contract — Dispatch documents reasons as free text, not an enum), carried on
+  the immutable spec and never part of work identity or fencing.
+  A resolve-issue `handed-off` report sends a task report with
   `outcome="handed-off"`, the PR, and the verification error; it is neither
   `ready` nor a `BLOCKED` queue mark, because Dispatch discovers the failed
   checks through its own `POST /api/pr-followup/sync` and enqueues repair
