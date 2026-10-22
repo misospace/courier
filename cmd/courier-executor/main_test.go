@@ -651,8 +651,14 @@ func TestRunDeclaredNoChangeNeededExitsThreeWithoutComment(t *testing.T) {
 
 	var mu sync.Mutex
 	var comments []string
+	var pullReads int
 	api := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
+		if strings.Contains(r.URL.Path, "/pulls/") {
+			mu.Lock()
+			pullReads++
+			mu.Unlock()
+		}
 		if r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/comments") {
 			body, _ := io.ReadAll(r.Body)
 			mu.Lock()
@@ -685,6 +691,9 @@ func TestRunDeclaredNoChangeNeededExitsThreeWithoutComment(t *testing.T) {
 	}
 	mu.Lock()
 	defer mu.Unlock()
+	if pullReads != 0 {
+		t.Fatalf("pull reads = %d, want 0: a resolve-issue no_change_needed claim pins no pull request, so the executor must not verify it against one (#513)", pullReads)
+	}
 	if len(comments) != 0 {
 		t.Fatalf("comments = %d, want 0: the executor must not publish a terminal comment for a no_change_needed declaration (#474); posted %q", len(comments), comments)
 	}
@@ -693,10 +702,12 @@ func TestRunDeclaredNoChangeNeededExitsThreeWithoutComment(t *testing.T) {
 // TestRunFixPRDeclaredNoChangeNeededNeverClaimsAddressed proves the open
 // fix-pr half of the #474 contract: a fix-pr run declaring no_change_needed
 // exits 3 for the controller's Verifying settlement and publishes no comment.
-// The controller can still end such a run BlockedExternal because a clean
-// workspace does not verify queued feedback resolution, so an executor
-// comment claiming the work is already addressed could contradict the run's
-// authoritative lifecycle state.
+// The pinned pull request is served open and mergeable, so the executor's
+// #513 claim verification passes and the claim stands; the controller can
+// still end such a run BlockedExternal because a clean workspace does not
+// verify queued feedback resolution, so an executor comment claiming the
+// work is already addressed could contradict the run's authoritative
+// lifecycle state.
 func TestRunFixPRDeclaredNoChangeNeededNeverClaimsAddressed(t *testing.T) {
 	root := t.TempDir()
 	remote := remoteWithExistingBranch(t, root)
@@ -713,6 +724,10 @@ func TestRunFixPRDeclaredNoChangeNeededNeverClaimsAddressed(t *testing.T) {
 			comments = append(comments, string(body))
 			mu.Unlock()
 			_, _ = w.Write([]byte(`{"id":1}`))
+			return
+		}
+		if r.Method == http.MethodGet && strings.HasSuffix(r.URL.Path, "/pulls/7") {
+			_, _ = io.WriteString(w, `{"number":7,"state":"open","mergeable":true,"mergeable_state":"clean","base":{"ref":"main","repo":{"full_name":"acme/widgets"}},"head":{"ref":"feature","repo":{"full_name":"acme/widgets"}}}`)
 			return
 		}
 		_, _ = io.WriteString(w, `[]`)
@@ -745,6 +760,150 @@ func TestRunFixPRDeclaredNoChangeNeededNeverClaimsAddressed(t *testing.T) {
 	defer mu.Unlock()
 	if len(comments) != 0 {
 		t.Fatalf("comments = %d, want 0: a fix-pr no_change_needed run must never publish a comment that could claim the work is already addressed (#474); posted %q", len(comments), comments)
+	}
+}
+
+// runFixPRDeclaredNoChange drives a fix-pr run whose coordinator declares
+// no_change_needed with clean workspace, against a fake GitHub API whose
+// GET pulls/7 answer is scripted by pull (nil pull leaves every request
+// answered with `[]`), and returns the run's exit code, its output, and
+// every comment body the fake forge received. It is the shared fixture for
+// the #513 claim-verification tests.
+func runFixPRDeclaredNoChange(t *testing.T, pull func(w http.ResponseWriter, r *http.Request) bool) (int, string, []string) {
+	t.Helper()
+	root := t.TempDir()
+	remote := remoteWithExistingBranch(t, root)
+	fakeOpenCode := filepath.Join(root, "opencode")
+	writeExecutable(t, fakeOpenCode, "#!/bin/sh\ncase \"$1\" in mcp) exit 0;; esac\nmkdir -p \"$COURIER_SCRATCH_DIR\"\nprintf '{\"outcome\":\"no_change_needed\",\"evidence\":\"feedback looks addressed\"}' > \"$COURIER_SCRATCH_DIR/outcome.json\"\nexit 0\n")
+
+	var mu sync.Mutex
+	var comments []string
+	api := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/comments") {
+			body, _ := io.ReadAll(r.Body)
+			mu.Lock()
+			comments = append(comments, string(body))
+			mu.Unlock()
+			_, _ = w.Write([]byte(`{"id":1}`))
+			return
+		}
+		if pull != nil && r.Method == http.MethodGet && strings.HasSuffix(r.URL.Path, "/pulls/7") && pull(w, r) {
+			return
+		}
+		_, _ = io.WriteString(w, `[]`)
+	}))
+	defer api.Close()
+	setResolveIssueEnv(t, root, remote, api.URL, fakeOpenCode)
+	t.Setenv("COURIER_MODE", "fix-pr")
+	// A same-repo head identity keeps the fix-pr head guard out of the way;
+	// the run still exercises the fix-pr classify path.
+	t.Setenv("COURIER_HEAD_REPO", "acme/widgets")
+	t.Setenv("COURIER_REF", "7")
+	t.Setenv("COURIER_RUN_NAME", "coderrun-it-7")
+	t.Setenv("GITHUB_TOKEN", "test-token")
+
+	var output bytes.Buffer
+	var errorsOut bytes.Buffer
+	code := run(context.Background(), &output, &errorsOut)
+	mu.Lock()
+	defer mu.Unlock()
+	return code, output.String(), comments
+}
+
+// TestRunFixPRDeclaredNoChangeNeededRejectedWhenConflicting pins the first
+// #513 acceptance condition: a fix-pr run whose pinned pull request still
+// conflicts with its base cannot exit 3 on the coordinator's word — review
+// approval and an unchanged head prove nothing once the forge reports the
+// conflict — so the run fails with a reason that stands on the forge state,
+// never on the model-authored evidence, and publishes no comment.
+func TestRunFixPRDeclaredNoChangeNeededRejectedWhenConflicting(t *testing.T) {
+	code, output, comments := runFixPRDeclaredNoChange(t, func(w http.ResponseWriter, r *http.Request) bool {
+		_, _ = io.WriteString(w, `{"number":7,"state":"open","mergeable":false,"mergeable_state":"dirty","base":{"ref":"main","repo":{"full_name":"acme/widgets"}},"head":{"ref":"feature","repo":{"full_name":"acme/widgets"}}}`)
+		return true
+	})
+	if code != exitFailed {
+		t.Fatalf("run exit code = %d, want %d; output=%q", code, exitFailed, output)
+	}
+	if !strings.Contains(output, `"phase":"Failed"`) {
+		t.Fatalf("conflicting-claim phase = %q", output)
+	}
+	if !strings.Contains(output, "still conflicts with base main") || !strings.Contains(output, "acme/widgets#7") {
+		t.Fatalf("conflicting-claim reason = %q", output)
+	}
+	if strings.Contains(output, "feedback looks addressed") {
+		t.Fatalf("rejection must stand on forge state, not the coordinator's model-authored evidence: %q", output)
+	}
+	if len(comments) != 0 {
+		t.Fatalf("comments = %d, want 0: an unsatisfied no-change claim must not publish a success observation; posted %q", len(comments), comments)
+	}
+}
+
+// TestRunFixPRDeclaredNoChangeNeededRejectedWhenMergeabilityUnknown pins the
+// second #513 acceptance condition: an unknown mergeability answer is not
+// conflict resolution. The pull request scripts the adversarial shape — a
+// stale mergeable=true left over while GitHub recomputes (mergeable_state
+// "unknown") — and the unverified claim still fails closed instead of
+// exiting 3.
+func TestRunFixPRDeclaredNoChangeNeededRejectedWhenMergeabilityUnknown(t *testing.T) {
+	code, output, comments := runFixPRDeclaredNoChange(t, func(w http.ResponseWriter, r *http.Request) bool {
+		_, _ = io.WriteString(w, `{"number":7,"state":"open","mergeable":true,"mergeable_state":"unknown","base":{"ref":"main","repo":{"full_name":"acme/widgets"}},"head":{"ref":"feature","repo":{"full_name":"acme/widgets"}}}`)
+		return true
+	})
+	if code != exitFailed {
+		t.Fatalf("run exit code = %d, want %d; output=%q", code, exitFailed, output)
+	}
+	if !strings.Contains(output, `"phase":"Failed"`) {
+		t.Fatalf("unknown-mergeability phase = %q", output)
+	}
+	if !strings.Contains(output, "mergeability against base main is unknown") {
+		t.Fatalf("unknown-mergeability reason = %q", output)
+	}
+	if len(comments) != 0 {
+		t.Fatalf("comments = %d, want 0: an unverified no-change claim must not publish a success observation; posted %q", len(comments), comments)
+	}
+}
+
+// TestRunFixPRDeclaredNoChangeNeededRejectedWhenForgeReadFails pins the
+// #513 fail-closed rule for an unverifiable claim: a forge read that did not
+// happen proves nothing, so the run may not exit 3 on a claim it could not
+// check.
+func TestRunFixPRDeclaredNoChangeNeededRejectedWhenForgeReadFails(t *testing.T) {
+	code, output, comments := runFixPRDeclaredNoChange(t, func(w http.ResponseWriter, r *http.Request) bool {
+		w.WriteHeader(http.StatusInternalServerError)
+		return true
+	})
+	if code != exitFailed {
+		t.Fatalf("run exit code = %d, want %d; output=%q", code, exitFailed, output)
+	}
+	if !strings.Contains(output, `"phase":"Failed"`) {
+		t.Fatalf("failed-read phase = %q", output)
+	}
+	if !strings.Contains(output, "could not verify the no-change claim") {
+		t.Fatalf("failed-read reason = %q", output)
+	}
+	if len(comments) != 0 {
+		t.Fatalf("comments = %d, want 0: an unverifiable no-change claim must not publish a success observation; posted %q", len(comments), comments)
+	}
+}
+
+// TestRunFixPRDeclaredNoChangeNeededSatisfiedWhenMerged pins the third #513
+// acceptance condition: a satisfied claim remains possible without
+// manufacturing commits — a pinned request the forge reports merged is moot
+// as a repair condition, so the run still exits 3 and publishes no comment.
+func TestRunFixPRDeclaredNoChangeNeededSatisfiedWhenMerged(t *testing.T) {
+	code, output, comments := runFixPRDeclaredNoChange(t, func(w http.ResponseWriter, r *http.Request) bool {
+		_, _ = io.WriteString(w, `{"number":7,"state":"closed","merged_at":"2026-10-22T00:00:00Z","mergeable":null,"base":{"ref":"main","repo":{"full_name":"acme/widgets"}},"head":{"ref":"feature","repo":{"full_name":"acme/widgets"}}}`)
+		return true
+	})
+	if code != exitNoChangeNeeded {
+		t.Fatalf("run exit code = %d, want %d; output=%q", code, exitNoChangeNeeded, output)
+	}
+	if !strings.Contains(output, `"phase":"NoChangeNeeded"`) {
+		t.Fatalf("merged-claim phase = %q", output)
+	}
+	if len(comments) != 0 {
+		t.Fatalf("comments = %d, want 0: even a satisfied no-change claim publishes no executor comment (#474); posted %q", len(comments), comments)
 	}
 }
 

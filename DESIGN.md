@@ -211,7 +211,17 @@ on the run branch; the declaration never substitutes for that check (#169):
   and the controller's lifecycle settlement is authoritative (#474). The
   evidence rides the redacted, bounded termination reason — `run.exit`
   telemetry and the `COURIER_TERMINATION` handoff — and the executor exits
-  `3`. A
+  `3`. Before a fix-pr claim may exit `3`, the executor verifies it against
+  the assigned repair condition using current authoritative forge state: the
+  pinned pull request is read through the forge `read-pull-request`
+  capability, and a request the forge reports still conflicting with its
+  base fails the run, while an unknown mergeability answer or an unreadable
+  forge fails closed — review approval and an unchanged head prove nothing,
+  and a claim the forge cannot verify never publishes the success (#513). A
+  merged, closed, or mergeable request lets the claim stand, so a satisfied
+  no-change ending remains possible without manufacturing commits; a
+  resolve-issue claim pins no pull request and is not verified this way.
+  A
   resolve-issue run ends in **AwaitingReview** and moves the source to
   `in-review` for a human to settle. A fix-pr run is settled against the world
   through **Verifying**: a merged/already-addressed pull request reaches
