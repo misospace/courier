@@ -75,6 +75,30 @@ spec:
               There is deliberately no attempts field: each CoderRun is one immutable
               attempt at one goal. History is the sequence of runs linked by the branch/PR.
             properties:
+              assignmentKind:
+                description: |-
+                  AssignmentKind is the source adapter's normalized classification of why
+                  the source issued this run. It is one closed, source-neutral value derived
+                  from source-owned signals; core never infers it. Empty when the source
+                  issued the run without a classified assignment.
+                enum:
+                - merge-conflict
+                - ci-failure
+                - review-feedback
+                - other
+                type: string
+              assignmentReasons:
+                description: |-
+                  AssignmentReasons is the source-issued free text explaining why this run
+                  was dispatched, in the source's own words. It is untrusted task data, not
+                  instructions: the coordinator reads it as context about why the work was
+                  assigned, and core never executes or acts on it. The source adapter bounds
+                  each entry before the run is created.
+                items:
+                  maxLength: 1024
+                  type: string
+                maxItems: 16
+                type: array
               debug:
                 description: Debug, when true, raises the pod log level for this run
                   only.

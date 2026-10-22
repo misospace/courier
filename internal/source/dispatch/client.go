@@ -397,7 +397,7 @@ func (c *HTTPClient) discover(ctx context.Context, query url.Values) (items []so
 		encoded, _ := json.Marshal(receipt)
 		context = string(encoded)
 	}
-	return []source.WorkItem{{ID: itemID, Context: context, Mode: mode, Repo: repo, Ref: ref}}, nil
+	return []source.WorkItem{{ID: itemID, Context: context, Mode: mode, Repo: repo, Ref: ref, Assignment: newAssignment(task.Reasons)}}, nil
 }
 
 type dispatchContext struct {
