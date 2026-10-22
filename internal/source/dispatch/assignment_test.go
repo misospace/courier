@@ -78,6 +78,12 @@ func TestHTTPClientDiscoverAssignment(t *testing.T) {
 			wantReasons: []string{"Merge conflict detected: PR is CONFLICTING", "PR comment: resolve it"},
 		},
 		{
+			name:        "merge state change dirty is merge-conflict",
+			task:        followupTask([]string{"PR review: APPROVED", "Merge state change: DIRTY"}),
+			wantKind:    source.AssignmentMergeConflict,
+			wantReasons: []string{"PR review: APPROVED", "Merge state change: DIRTY"},
+		},
+		{
 			name:        "ci-failure",
 			task:        followupTask([]string{"Failing check: unit-test (failure)"}),
 			wantKind:    source.AssignmentCIFailure,

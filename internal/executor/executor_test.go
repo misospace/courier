@@ -795,6 +795,28 @@ func TestGoalCarriesAssignmentContext(t *testing.T) {
 			AssignmentReasons: []string{"Failing check: unit-test (failure)"},
 		},
 	}
+	// A review-approved but conflicting PR stays a conflict-repair task:
+	// the approval text never displaces the conflict requirement (#512).
+	approved := &courierv1alpha1.CoderRun{
+		Spec: courierv1alpha1.CoderRunSpec{
+			Mode:              courierv1alpha1.ModeFixPR,
+			Ref:               1342,
+			AssignmentKind:    "merge-conflict",
+			AssignmentReasons: []string{"PR review: APPROVED", "Merge state change: DIRTY"},
+		},
+	}
+	approvedGoal, err := Goal(approved)
+	if err != nil {
+		t.Fatalf("Goal() error = %v", err)
+	}
+	for _, fragment := range []string{`"PR review: APPROVED"`, "merge-conflict repair assignment", "a review approval is not task completion"} {
+		if !strings.Contains(approvedGoal, fragment) {
+			t.Fatalf("approved-but-conflicting goal %q missing %q", approvedGoal, fragment)
+		}
+	}
+	if strings.Contains(approvedGoal, `\u003c`) || strings.Contains(approvedGoal, `\u003e`) {
+		t.Fatalf("approved-but-conflicting goal unexpectedly HTML-escaped its data: %q", approvedGoal)
+	}
 	ciGoal, err := Goal(ci)
 	if err != nil {
 		t.Fatalf("Goal() error = %v", err)

@@ -68,7 +68,9 @@ func sanitizeReason(reason string) string {
 		return ""
 	}
 	if runes := []rune(entry); len(runes) > assignmentMaxCodePoints {
-		return string(runes[:assignmentMaxCodePoints])
+		// Re-trim after the cut so a boundary that lands inside whitespace
+		// does not persist a trailing blank into the bounded entry.
+		return strings.TrimSpace(string(runes[:assignmentMaxCodePoints]))
 	}
 	return entry
 }
@@ -84,7 +86,9 @@ func classifyAssignment(reasons []string) string {
 		entries[i] = strings.ToLower(reason)
 	}
 	for _, entry := range entries {
-		if strings.Contains(entry, "conflict") {
+		// "merge state change: dirty" is the GitHub mergeability marker a
+		// conflicting PR produces without ever naming a conflict.
+		if strings.Contains(entry, "conflict") || strings.Contains(entry, "merge state change: dirty") {
 			return source.AssignmentMergeConflict
 		}
 	}

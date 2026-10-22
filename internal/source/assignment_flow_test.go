@@ -79,7 +79,13 @@ func TestAssignmentFlowsFromDispatchOfferToCoordinatorGoal(t *testing.T) {
 	if len(runs.Items) != 1 {
 		t.Fatalf("materialized %d runs, want 1", len(runs.Items))
 	}
-	run := runs.Items[0]
+	// Re-read the persisted run through the API client rather than reusing
+	// the in-memory object: the reasons must survive durable storage.
+	persisted := &courierv1alpha1.CoderRun{}
+	if err := kubeClient.Get(context.Background(), client.ObjectKeyFromObject(&runs.Items[0]), persisted); err != nil {
+		t.Fatal(err)
+	}
+	run := *persisted
 	if run.Spec.Mode != courierv1alpha1.ModeFixPR || run.Spec.Ref != 1342 {
 		t.Fatalf("run identity = %#v", run.Spec)
 	}
@@ -114,5 +120,29 @@ func TestAssignmentFlowsFromDispatchOfferToCoordinatorGoal(t *testing.T) {
 	}
 	if resumed != goal {
 		t.Fatalf("resumed goal drifted from materialized goal:\n%s\n%s", goal, resumed)
+	}
+
+	// And it survives the run-context environment transport the native
+	// harness control pod uses to reconstruct its Invocation.
+	inv := executor.Invocation{
+		RunName:   run.Name,
+		Namespace: run.Namespace,
+		Mode:      run.Spec.Mode,
+		Repo:      run.Spec.Repo,
+		Ref:       run.Spec.Ref,
+		Goal:      goal,
+		Model:     "test/model",
+		Workspace: "/workspace",
+	}
+	env := map[string]string{}
+	for _, variable := range executor.RunContextEnvironment(inv) {
+		env[variable.Name] = variable.Value
+	}
+	rebuilt, err := executor.InvocationFromEnv(func(name string) string { return env[name] })
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rebuilt.Goal != goal || !strings.Contains(rebuilt.Goal, conflictReason) {
+		t.Fatalf("goal lost through the environment transport: %q", rebuilt.Goal)
 	}
 }
