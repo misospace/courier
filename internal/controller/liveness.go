@@ -490,24 +490,29 @@ func coordinatorObjectPresentLive(ctx context.Context, reader client.Reader, run
 }
 
 // appendOtherRunLabelSchemePods extends a live list filtered on the executor's
-// run-label value with pods carrying the topology scheme's value when the two
-// differ. Legacy executor pods truncate long run names without a digest
-// suffix while topology pods hash-suffix them, so for a >63-character name a
-// single selector misses the secure control pod and every liveness judgement
-// built on the list is wrong. For names where both schemes agree the list is
-// already complete and no second read happens.
+// digest-bounded run-label value with pods carrying the run label under the
+// other schemes a reader must honor: the topology scheme, equal to the
+// executor's by construction but read defensively, and the legacy pre-digest
+// truncation that executor pods created before long run names were
+// hash-suffixed carry. For a >63-character name the digest and truncated
+// values differ, so a single selector misses one scheme's pods and every
+// liveness judgement built on the list is wrong. For names where all schemes
+// agree the list is already complete and no second read happens.
 func appendOtherRunLabelSchemePods(ctx context.Context, reader client.Reader, run *courierv1alpha1.CoderRun, pods *corev1.PodList) error {
-	if topology.RunLabelValue(run.Name) == executor.RunLabelValue(run.Name) {
-		return nil
+	primary := executor.RunLabelValue(run.Name)
+	for _, value := range []string{topology.RunLabelValue(run.Name), executor.LegacyRunLabelValue(run.Name)} {
+		if value == primary {
+			continue
+		}
+		var more corev1.PodList
+		if err := reader.List(ctx, &more,
+			client.InNamespace(run.Namespace),
+			client.MatchingLabels{executor.LabelRun: value},
+		); err != nil {
+			return err
+		}
+		pods.Items = append(pods.Items, more.Items...)
 	}
-	var more corev1.PodList
-	if err := reader.List(ctx, &more,
-		client.InNamespace(run.Namespace),
-		client.MatchingLabels{executor.LabelRun: topology.RunLabelValue(run.Name)},
-	); err != nil {
-		return err
-	}
-	pods.Items = append(pods.Items, more.Items...)
 	return nil
 }
 
