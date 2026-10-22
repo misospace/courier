@@ -695,6 +695,9 @@ func TestProbePodNamesAreUniquePerNode(t *testing.T) {
 			if errs := validation.IsDNS1123Subdomain(name); len(errs) > 0 {
 				t.Errorf("probe pod name for node %q = %q: %v", node, name, errs)
 			}
+			if label, _, _ := strings.Cut(name, "."); len(label) > 63 {
+				t.Errorf("probe pod name for node %q has a %d-character first label: %q", node, len(label), name)
+			}
 			if len(name) > 253 {
 				t.Errorf("probe pod name for node %q is %d characters: %q", node, len(name), name)
 			}
@@ -719,6 +722,66 @@ func TestProbePodNamesAreUniquePerNode(t *testing.T) {
 		if errs := validation.IsDNS1123Label(tag); len(errs) > 0 {
 			t.Errorf("probe tag for node %q = %q: %v", node, tag, errs)
 		}
+	}
+}
+
+// TestPodNamesAreValidDNSLabels pins the pod half of the naming bound: a
+// pod's hostname is the first label of its name truncated to 63 characters,
+// and in-cluster consumers read that hostname, so the first label of every
+// rendered pod name is held to the DNS-label bound and the hostname the
+// cluster reports matches the object name — for any supported CoderRun name.
+func TestPodNamesAreValidDNSLabels(t *testing.T) {
+	names := []string{
+		"short",
+		"run.test",
+		"9lives",
+		strings.Repeat("a", 60),
+		strings.Repeat("a", 63) + "x",
+		strings.Repeat("a", 63) + "y",
+		strings.Repeat("z", 253),
+		strings.Repeat("a", 100) + ".test",
+		strings.Repeat("a.b", 84) + "c",
+	}
+	for _, name := range names {
+		if errs := validation.IsDNS1123Subdomain(name); len(errs) > 0 {
+			t.Fatalf("test input %q is not a supported CoderRun name: %v", name, errs)
+		}
+		for _, got := range []struct {
+			kind string
+			fn   func(string) string
+		}{{"control", ControlPodName}, {"broker", BrokerPodName}, {"worker", WorkerPodName}} {
+			pod := got.fn(name)
+			if errs := validation.IsDNS1123Subdomain(pod); len(errs) > 0 {
+				t.Errorf("%s pod name for run %q = %q: %v", got.kind, name, pod, errs)
+			}
+			label, _, _ := strings.Cut(pod, ".")
+			if errs := validation.IsDNS1123Label(label); len(errs) > 0 {
+				t.Errorf("%s pod name for run %q has first label %q: %v", got.kind, name, label, errs)
+			}
+			if len(label) > 63 {
+				t.Errorf("%s pod name for run %q has a %d-character first label: %q", got.kind, name, len(label), pod)
+			}
+			if again := got.fn(name); again != pod {
+				t.Errorf("%s pod name for run %q is not stable: %q then %q", got.kind, name, pod, again)
+			}
+		}
+	}
+	if ControlPodName("short") != "short-control" {
+		t.Fatalf("valid short names must pass through unchanged: %q", ControlPodName("short"))
+	}
+	if ControlPodName(strings.Repeat("a", 63)+"x") == ControlPodName(strings.Repeat("a", 63)+"y") {
+		t.Fatal("run names differing past the label bound collide")
+	}
+	for _, name := range []string{"short", "run.test", strings.Repeat("z", 253)} {
+		pods := []string{ControlPodName(name), BrokerPodName(name), WorkerPodName(name)}
+		if pods[0] == pods[1] || pods[1] == pods[2] || pods[0] == pods[2] {
+			t.Fatalf("run %q pod names collide: %q", name, pods)
+		}
+	}
+	run := testRun(strings.Repeat("z", 253))
+	probe := ProbePod(run, "node-a", "busybox:test", "true").Name
+	if label, _, _ := strings.Cut(probe, "."); len(label) > 63 {
+		t.Errorf("probe pod name for a 253-character run has a %d-character first label: %q", len(label), probe)
 	}
 }
 
