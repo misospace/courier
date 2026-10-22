@@ -40,6 +40,26 @@ var ErrUnsupportedOutcome = errors.New("source: unsupported lifecycle outcome")
 // a source's queue or API types.
 const MaxSourceContextBytes = 16 * 1024
 
+// Assignment classification vocabulary. A source adapter normalizes its own
+// signals into exactly one of these values so core can present a precise
+// completion requirement without pattern-matching source-owned free text.
+const (
+	AssignmentMergeConflict  = "merge-conflict"
+	AssignmentCIFailure      = "ci-failure"
+	AssignmentReviewFeedback = "review-feedback"
+	AssignmentOther          = "other"
+)
+
+// Assignment is why a source issued a work item. Kind is the adapter's
+// normalized classification (one of the Assignment* constants, or empty);
+// Reasons is the source's own free text, bounded by the adapter. Reasons is
+// untrusted task data: it is presented to the coordinator as context and is
+// never instructions.
+type Assignment struct {
+	Kind    string
+	Reasons []string
+}
+
 // WorkItem carries source-owned opaque context. Core code copies it without decoding.
 type WorkItem struct {
 	Context string
@@ -53,6 +73,9 @@ type WorkItem struct {
 	Ref   int
 	Lane  string
 	Debug bool
+	// Assignment carries why the source issued this item. It is durable run
+	// data, never dedupe identity: it must not affect ID or WorkIdentity.
+	Assignment Assignment
 }
 
 // RunSpec is the source-neutral input from which the operator creates a
@@ -69,6 +92,9 @@ type RunSpec struct {
 	Ref        int
 	Lane       string
 	Debug      bool
+	// Assignment is copied from WorkItem.Assignment so the reason the source
+	// issued the work survives materialization into the run's immutable spec.
+	Assignment Assignment
 }
 
 // Spec returns the immutable run data carried by a discovered work item.
@@ -82,6 +108,7 @@ func (w WorkItem) Spec(sourceName string) RunSpec {
 		Ref:        w.Ref,
 		Lane:       w.Lane,
 		Debug:      w.Debug,
+		Assignment: w.Assignment,
 	}
 }
 
