@@ -802,14 +802,14 @@ func TestGoalCarriesAssignmentContext(t *testing.T) {
 			Mode:              courierv1alpha1.ModeFixPR,
 			Ref:               1342,
 			AssignmentKind:    "merge-conflict",
-			AssignmentReasons: []string{"PR review: APPROVED", "Merge state change: DIRTY"},
+			AssignmentReasons: []string{"PR review: APPROVED", "Merge state change: DIRTY", "PR comment: handle <nil> & retry"},
 		},
 	}
 	approvedGoal, err := Goal(approved)
 	if err != nil {
 		t.Fatalf("Goal() error = %v", err)
 	}
-	for _, fragment := range []string{`"PR review: APPROVED"`, "merge-conflict repair assignment", "a review approval is not task completion"} {
+	for _, fragment := range []string{`"PR review: APPROVED"`, `"PR comment: handle <nil> & retry"`, "merge-conflict repair assignment", "a review approval is not task completion"} {
 		if !strings.Contains(approvedGoal, fragment) {
 			t.Fatalf("approved-but-conflicting goal %q missing %q", approvedGoal, fragment)
 		}
