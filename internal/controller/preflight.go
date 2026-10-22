@@ -341,7 +341,7 @@ func (s *SecureControl) checkDryRuns(ctx context.Context, run *courier.CoderRun,
 		func(p *corev1.Pod) *corev1.Pod {
 			credentialMount.Spec.Containers = append(credentialMount.Spec.Containers, corev1.Container{
 				Name:  "injected",
-				Image: "busybox:test",
+				Image: "example.invalid/unpullable:0",
 				VolumeMounts: []corev1.VolumeMount{{
 					Name:      "stolen-creds",
 					MountPath: "/stolen-creds",

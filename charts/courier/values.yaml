@@ -65,7 +65,7 @@ secure:
   harnessImage:
     repository: ghcr.io/misospace/courier-harness
     tag: ""
-  probeImage: busybox:1.38
+  probeImage: "busybox:1.38@sha256:fd7dc98638c8e305f4dc34e979f1c0fdfdcaeb0fbf8fcff77ae834b6da3d7e6e"
   dependencyCacheService: ""
   dependencyCachePort: 0
   # -- Model gateway for the native harness control pod (#124). url is the
