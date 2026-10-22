@@ -1098,13 +1098,14 @@ exit 0
 // other test covers: a fix-pr run's committed, pushed, and declared
 // changes hand off as Verifying only after the identity-checked listing
 // confirmed exactly one open, non-draft pull request whose full head
-// identity and base ref match the pinned contract and only after the
-// run's commit is confirmed published — and the passing handoff
+// identity and base ref match the pinned contract — and whose number is
+// the pinned pull request the run was admitted against — and only after
+// the run's commit is confirmed published, and the passing handoff
 // publishes no forge comment. The pulls-list count makes the assertion
 // feature-sensitive: without checkFixPRHandoff no listing happens (the
 // run still exits 0, so exit codes alone cannot prove the re-check).
 func TestRunFixPRChangesHandsOffVerifiedPR(t *testing.T) {
-	code, output, comments, listed := runFixPRHandoff(t, pullRequestFixtureJSON(12, "open", false, "Feedback applied."), true, nil)
+	code, output, comments, listed := runFixPRHandoff(t, pullRequestFixtureJSON(7, "open", false, "Feedback applied."), true, nil)
 	if code != exitSuccess {
 		t.Fatalf("run exit code = %d, want %d; output=%q", code, exitSuccess, output)
 	}
@@ -1127,10 +1128,10 @@ func TestRunFixPRChangesHandsOffVerifiedPR(t *testing.T) {
 // with a reason naming the pinned base, publishing no success comment.
 func TestRunFixPRHandoffWrongBase(t *testing.T) {
 	code, output, comments, _ := runFixPRHandoff(t,
-		pullRequestFixtureJSON(12, "open", false, "Feedback applied."),
+		pullRequestFixtureJSON(7, "open", false, "Feedback applied."),
 		true,
 		func(prState string) string {
-			return writePullRequestScript(prState, "["+pullRequestFixtureObjectJSONWithBase(12, "open", false, "release-9", "Feedback applied, retargeted.")+"]")
+			return writePullRequestScript(prState, "["+pullRequestFixtureObjectJSONWithBase(7, "open", false, "release-9", "Feedback applied, retargeted.")+"]")
 		},
 	)
 	if code != exitNeedsHuman {
@@ -1153,6 +1154,12 @@ func TestRunFixPRHandoffWrongBase(t *testing.T) {
 // ready/create continuations, like the ambiguous, closed-only,
 // foreign-head, and unpublished worlds. One run per world, every one
 // NeedsHuman.
+//
+// Every fixture names the pinned pull request (#7 — the run's COURIER_REF)
+// except the two worlds that are about a pull request the run was never
+// admitted against: the observed PR carries another number, so the pinned
+// assignment stays unverified and the handoff fails closed instead of
+// verifying a pull request nobody pinned.
 func TestRunFixPRHandoffFailClosedWorlds(t *testing.T) {
 	cases := []struct {
 		name   string
@@ -1162,7 +1169,7 @@ func TestRunFixPRHandoffFailClosedWorlds(t *testing.T) {
 	}{
 		{
 			name: "draft pinned PR",
-			seed: "[" + pullRequestFixtureObjectJSON(12, "open", true, "Feedback applied.") + "]",
+			seed: "[" + pullRequestFixtureObjectJSON(7, "open", true, "Feedback applied.") + "]",
 			want: "is a draft at handoff",
 		},
 		{
@@ -1171,18 +1178,21 @@ func TestRunFixPRHandoffFailClosedWorlds(t *testing.T) {
 			want: "neither opens a replacement nor adopts another pull request",
 		},
 		{
+			// The pinned PR and a sibling PR both carry the run's head:
+			// two open pull requests claim the assignment, so the
+			// executor adopts neither (#247).
 			name: "ambiguous open PRs",
-			seed: "[" + pullRequestFixtureObjectJSON(12, "open", false, "Feedback applied.") + "," + pullRequestFixtureObjectJSON(13, "open", false, "Feedback applied.") + "]",
+			seed: "[" + pullRequestFixtureObjectJSON(7, "open", false, "Feedback applied.") + "," + pullRequestFixtureObjectJSON(13, "open", false, "Feedback applied.") + "]",
 			want: "more than one open pull request",
 		},
 		{
 			name: "closed-only head",
-			seed: "[" + pullRequestFixtureObjectJSON(12, "closed", false, "Feedback applied.") + "]",
+			seed: "[" + pullRequestFixtureObjectJSON(7, "closed", false, "Feedback applied.") + "]",
 			want: "only closed or merged pull requests",
 		},
 		{
 			name: "foreign same-owner fork head",
-			seed: "[" + pullRequestFixtureObjectJSONWithHeadRepo(12, "open", false, "acme/widgets-fork", "Feedback applied.") + "]",
+			seed: "[" + pullRequestFixtureObjectJSONWithHeadRepo(7, "open", false, "acme/widgets-fork", "Feedback applied.") + "]",
 			want: "claiming the head selector",
 		},
 		{
@@ -1192,9 +1202,29 @@ func TestRunFixPRHandoffFailClosedWorlds(t *testing.T) {
 			// — a commit the remote never advertised cannot carry
 			// reviewable work (#247, #517).
 			name:   "unpublished open PR",
-			seed:   pullRequestFixtureJSON(12, "open", false, "Feedback applied."),
+			seed:   pullRequestFixtureJSON(7, "open", false, "Feedback applied."),
 			nopush: true,
 			want:   "does not carry the run's pushed work",
+		},
+		{
+			// The only open pull request on the run's head is not the
+			// pinned assignment: the head is right and the base is
+			// right, but the run was admitted against PR #7 and the
+			// forge reports #12, so the handoff must not verify a pull
+			// request nobody pinned (#517).
+			name: "open PR that is not the pinned assignment",
+			seed: pullRequestFixtureJSON(12, "open", false, "Feedback applied."),
+			want: "not the pinned pull request #7",
+		},
+		{
+			name: "draft PR that is not the pinned assignment",
+			seed: "[" + pullRequestFixtureObjectJSON(12, "open", true, "Feedback applied.") + "]",
+			want: "not the pinned pull request #7",
+		},
+		{
+			name: "closed-only head without the pinned PR",
+			seed: "[" + pullRequestFixtureObjectJSON(12, "closed", false, "Feedback applied.") + "]",
+			want: "not the pinned pull request #7",
 		},
 	}
 	for _, tc := range cases {
@@ -7367,6 +7397,21 @@ func TestFixPRHandoffMessages(t *testing.T) {
 			t.Fatalf("pinned-PR-draft reason lost %q: %q", want, draft)
 		}
 	}
+
+	mismatch := report.pinnedPRNumberMismatchReason(502, 513)
+	for _, want := range []string{
+		"pull request #513",
+		"not the pinned pull request #502",
+		`head branch "fix/gallery-feedback/502"`,
+		"head octocat/widgets-fork",
+		"verifies the pinned assignment only",
+		"never adopts another pull request",
+		"the run needs a human",
+	} {
+		if !strings.Contains(mismatch, want) {
+			t.Fatalf("pinned-PR-number-mismatch reason lost %q: %q", want, mismatch)
+		}
+	}
 }
 
 // TestObserveRunBranchPullRequestIdentity pins the identity rules of the
@@ -7495,6 +7540,94 @@ func TestObserveRunBranchPullRequestFixPRHead(t *testing.T) {
 	wrongBase := `[{"number":23,"state":"open","draft":false,"base":{"ref":"release-9","repo":{"full_name":"acme/widgets"}},"head":{"ref":"fix/pr-7","sha":"deadbeef","repo":{"full_name":"octocat/widgets"}},"body":"Applies the pinned feedback."}]`
 	if got := newObserved(wrongBase); got.kind != prStateWrongBase {
 		t.Fatalf("retargeted fork-head PR classified as %+v, want prStateWrongBase (fail-closed, never adopted)", got)
+	}
+}
+
+// TestCheckFixPRHandoffPinnedPullRequestNumber pins the #517 pinned-
+// assignment contract: the fix-pr handoff verifies the pull request the
+// run was admitted against (COURIER_REF), not merely some pull request on
+// the run's head. A pull request carrying another number leaves the
+// pinned assignment unverified and fails closed, while the pinned pull
+// request itself still settles its own world (draft, closed) as before.
+// The number is the assignment; the head listing alone never proves it.
+func TestCheckFixPRHandoffPinnedPullRequestNumber(t *testing.T) {
+	fixture := func(number int, state string, draft bool) string {
+		return fmt.Sprintf(`[{"number":%d,"state":%q,"draft":%t,"title":"Fix","base":{"ref":"main","repo":{"full_name":"acme/widgets"}},"head":{"ref":"fix/pr-7","sha":"deadbeef","repo":{"full_name":"octocat/widgets"}},"body":"Applies the pinned feedback."}]`, number, state, draft)
+	}
+	newOutcome := func(body string) (*handoffCheckOutcome, error) {
+		t.Helper()
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = io.WriteString(w, body)
+		}))
+		t.Cleanup(server.Close)
+		var output, errorsOut bytes.Buffer
+		report := newReporter(&output, &errorsOut, config{
+			Mode:          "fix-pr",
+			Repo:          "acme/widgets",
+			HeadRepo:      "octocat/widgets",
+			Branch:        "fix/pr-7",
+			Ref:           7,
+			Base:          "main",
+			GitHubAPIBase: server.URL,
+		})
+		return report.checkFixPRHandoff(context.Background())
+	}
+
+	for _, tc := range []struct {
+		name           string
+		body           string
+		wantObserved   int
+		wantMismatch   bool
+		wantDraft      bool
+		wantClosedOnly bool
+	}{
+		{
+			name:         "open PR is not the pinned assignment",
+			body:         fixture(12, "open", false),
+			wantObserved: 12,
+			wantMismatch: true,
+		},
+		{
+			name:         "draft PR is not the pinned assignment",
+			body:         fixture(12, "open", true),
+			wantObserved: 12,
+			wantMismatch: true,
+		},
+		{
+			name:         "closed PR is not the pinned assignment",
+			body:         fixture(12, "closed", false),
+			wantObserved: 12,
+			wantMismatch: true,
+		},
+		{
+			name:         "the pinned PR is a draft",
+			body:         fixture(7, "open", true),
+			wantObserved: 7,
+			wantDraft:    true,
+		},
+		{
+			name:           "the pinned PR is closed",
+			body:           fixture(7, "closed", false),
+			wantObserved:   7,
+			wantClosedOnly: true,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			outcome, err := newOutcome(tc.body)
+			if err != nil {
+				t.Fatalf("checkFixPRHandoff() error = %v", err)
+			}
+			if outcome == nil {
+				t.Fatalf("checkFixPRHandoff() outcome = nil, want a fail-closed outcome")
+			}
+			if outcome.pinnedMismatch != tc.wantMismatch || outcome.pinnedDraft != tc.wantDraft || outcome.closedOnly != tc.wantClosedOnly {
+				t.Fatalf("outcome = %+v, want mismatch=%v draft=%v closedOnly=%v", outcome, tc.wantMismatch, tc.wantDraft, tc.wantClosedOnly)
+			}
+			if (tc.wantMismatch || tc.wantDraft) && (outcome.pr == nil || outcome.pr.Number != tc.wantObserved) {
+				t.Fatalf("outcome.pr = %+v, want the observed pull request #%d", outcome.pr, tc.wantObserved)
+			}
+		})
 	}
 }
 

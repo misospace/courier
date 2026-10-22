@@ -2273,6 +2273,14 @@ type handoffCheckOutcome struct {
 	// executor never opens a replacement for a pinned PR — that would
 	// duplicate or silently re-target the assignment.
 	pinnedMissing bool
+	// pinnedMismatch reports a fix-pr run whose observed pull request is
+	// not the pinned assignment (#517): the forge reports another pull
+	// request on the run's head, so the pinned pull request the run was
+	// admitted against is unverified. The executor verifies the pinned
+	// assignment only and never adopts another pull request. pr carries
+	// the observed pull request so the terminal reason can name both the
+	// observed and the pinned number.
+	pinnedMismatch bool
 	// criteria is the criterion-evidence report when the criteria check
 	// ran against the open PR's body and the pinned set was non-empty.
 	// nil when no set was pinned, when the set was empty (vacuous pass),
@@ -2677,6 +2685,16 @@ func (r reporter) checkHandoff(ctx context.Context) (*handoffCheckOutcome, error
 // executor never opens a replacement for a pinned PR, which would
 // duplicate or silently re-target the assignment. An unverifiable read
 // is returned as an error, never as a confirmed missing PR (#247).
+//
+// The listing settles the run's HEAD, not the run's ASSIGNMENT: a fix-pr
+// run is admitted against one pinned pull request (COURIER_REF), so the
+// observed pull request must be that exact pull request before the
+// handoff may verify it — the same exact-number, base, and head identity
+// the native broker path enforces in checkPR/matchesPR. A head whose
+// pull request is some other pull request fails closed (pinnedMismatch)
+// instead of handing off a verification of an assignment nobody made.
+// An unverifiable read is returned as an error, never as a confirmed
+// missing PR (#247).
 func (r reporter) checkFixPRHandoff(ctx context.Context) (*handoffCheckOutcome, error) {
 	observation, err := r.observeRunBranchPullRequest(ctx)
 	if err != nil {
@@ -2684,6 +2702,13 @@ func (r reporter) checkFixPRHandoff(ctx context.Context) (*handoffCheckOutcome, 
 	}
 	switch observation.kind {
 	case prStateOpen:
+		// The pinned assignment is the pull request the run was admitted
+		// against, so the head's only open pull request must be that
+		// pull request: verifying a different one would hand off a
+		// contract the operator never pinned (#517).
+		if observation.open.Number != r.cfg.Ref {
+			return &handoffCheckOutcome{pinnedMismatch: true, pr: observation.open}, nil
+		}
 		// Same #247 rule as resolve-issue: the pinned head's published
 		// state is part of the world being verified, so no Verifying
 		// handoff may carry local commits the remote never advertised.
@@ -2702,16 +2727,42 @@ func (r reporter) checkFixPRHandoff(ctx context.Context) (*handoffCheckOutcome, 
 	case prStateAmbiguous:
 		return &handoffCheckOutcome{ambiguous: true}, nil
 	case prStateClosedOnly:
+		// A closed-only head settles the assignment only when the closed
+		// pull request IS the pinned one; a head that never carried the
+		// pinned pull request leaves the assignment unverified rather
+		// than closed (#517).
+		if !carriesPullRequestNumber(observation.closed, r.cfg.Ref) {
+			return &handoffCheckOutcome{pinnedMismatch: true, pr: observation.closed[0]}, nil
+		}
 		return &handoffCheckOutcome{closedOnly: true}, nil
 	case prStateForeignHead:
 		return &handoffCheckOutcome{foreignHead: true}, nil
 	case prStateDraft:
+		// A draft is a settled-by-human anomaly only when it is the
+		// pinned pull request; a draft on the run's head that is some
+		// other pull request leaves the assignment unverified (#517).
+		if observation.draft.Number != r.cfg.Ref {
+			return &handoffCheckOutcome{pinnedMismatch: true, pr: observation.draft}, nil
+		}
 		return &handoffCheckOutcome{pinnedDraft: true, pr: observation.draft}, nil
 	case prStateMissing:
 		return &handoffCheckOutcome{pinnedMissing: true}, nil
 	}
 	// Unreachable: every observation kind is handled above.
 	return nil, fmt.Errorf("unclassified fix-pr pull-request observation state for run branch %s", r.cfg.Branch)
+}
+
+// carriesPullRequestNumber reports whether the observed pull requests
+// include the run's pinned pull request number (#517). The fix-pr handoff
+// uses it to tell a closed pinned pull request from a head that never
+// carried the pinned assignment at all.
+func carriesPullRequestNumber(observed []*prLinkageObservation, number int) bool {
+	for _, pull := range observed {
+		if pull != nil && pull.Number == number {
+			return true
+		}
+	}
+	return false
 }
 
 // pinnedCriterionSet returns the run's operator-pinned criterion envelope,
@@ -3791,6 +3842,17 @@ func (r reporter) pinnedPRDraftReason(number int) string {
 	return fmt.Sprintf("the pinned pull request #%d for the run branch %q is a draft at handoff, so the handoff was refused; readiness is a human settlement, never a continuation's unilateral flip; the run needs a human", number, r.cfg.Branch)
 }
 
+// pinnedPRNumberMismatchReason composes the NeedsHuman reason for a fix-pr
+// run whose observed pull request is not the pinned assignment (#517): the
+// forge reports another pull request on the run's head, so the pinned pull
+// request the run was admitted against is unverified. The executor verifies
+// the pinned assignment only — the same exact-number, base, and head identity
+// the native broker path enforces in checkPR/matchesPR — and never adopts
+// another pull request in its place.
+func (r reporter) pinnedPRNumberMismatchReason(pinned, observed int) string {
+	return fmt.Sprintf("the forge reports pull request #%d on the run's head branch %q (head %s), not the pinned pull request #%d the run was admitted against; the executor verifies the pinned assignment only and never adopts another pull request; the run needs a human", observed, r.cfg.Branch, runHeadRepo(r.cfg), pinned)
+}
+
 // handoffVerdict is the legacy executor's pre-handoff forge-observation
 // decision for a Verifying candidate. Pass and FailReason are mutually
 // exclusive with ContinueMsg: the run loop interprets exactly one signal
@@ -3873,11 +3935,13 @@ type handoffVerdict struct {
 //     NeedsHuman (#247, #248).
 //   - A fix-pr run has no trusted source issue to enforce the body
 //     contracts against (#517), so checkHandoff instead re-verifies
-//     its pinned head through the same listing: only an open,
-//     non-draft PR on the pinned base with the run's commit published
-//     passes, every other world fails closed to NeedsHuman (draft and
-//     missing without the resolve-issue continuations), and a
-//     resumable read failure retries with the fix-pr unverified
+//     its pinned head through the same listing: only the run's pinned
+//     pull request — the exact number the run was admitted against,
+//     open, non-draft, on the pinned base, with the run's commit
+//     published — passes, every other world fails closed to
+//     NeedsHuman (a pull request that is not the pinned assignment,
+//     draft and missing without the resolve-issue continuations), and
+//     a resumable read failure retries with the fix-pr unverified
 //     message naming the pinned identity.
 //   - Two operator-side envelope faults are not read failures and not
 //     model-repairable defects, so they fail closed to NeedsHuman on
@@ -4001,6 +4065,12 @@ func (r reporter) applyHandoffPlan(ctx context.Context, continuations int, maxCo
 		// never opened as a replacement, and a draft pinned PR is
 		// never readied unilaterally.
 		return handoffVerdict{FailReason: r.pinnedPRMissingReason()}
+	case linkOutcome.pinnedMismatch:
+		// The observed pull request is not the pinned assignment (#517):
+		// the head's pull request is never a substitute for the pull
+		// request the run was admitted against, so the handoff fails
+		// closed instead of verifying an assignment nobody pinned.
+		return handoffVerdict{PRNumber: linkOutcome.pr.Number, FailReason: r.pinnedPRNumberMismatchReason(r.cfg.Ref, linkOutcome.pr.Number)}
 	case linkOutcome.pinnedDraft:
 		return handoffVerdict{PRNumber: linkOutcome.pr.Number, FailReason: r.pinnedPRDraftReason(linkOutcome.pr.Number)}
 	}
