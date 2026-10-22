@@ -996,6 +996,56 @@ func TestCaptureFifoSwapRace(t *testing.T) {
 	assertAbsent(t, bundle, []string{"FIFO-SWAP-ORIGINAL"})
 }
 
+// TestCaptureNonRegularAtClassification is the issue #391 regression: a path
+// that is non-regular at the Lstat classification itself — no seam, no swap
+// race — is classified omitted-binary the same way a path swapped after
+// classification is. A committed regular file replaced by a fifo in the
+// worktree still lists in porcelain (as " M", the only listed form: an
+// untracked fifo is not listed at all), so the !info.Mode().IsRegular branch
+// has been reached without replacing readFileForCapture.
+func TestCaptureNonRegularAtClassification(t *testing.T) {
+	t.Parallel()
+	dir := newRepo(t)
+	writeFile(t, filepath.Join(dir, "regular-swap.txt"), "TRACKED-REGULAR-ORIGINAL\n")
+	commit(t, dir, "feat: tracked regular file")
+	// The commit is pushed so the capture sees no local commits and the
+	// manifest holds exactly this one file entry.
+	git(t, dir, "push", "origin", "courier/run")
+
+	if err := os.Remove(filepath.Join(dir, "regular-swap.txt")); err != nil {
+		t.Fatalf("remove: %v", err)
+	}
+	if err := syscall.Mkfifo(filepath.Join(dir, "regular-swap.txt"), 0o600); err != nil {
+		t.Fatalf("mkfifo: %v", err)
+	}
+
+	bundle, err := Capture(context.Background(), captureOptions(dir, nil))
+	if err != nil {
+		t.Fatalf("capture: %v", err)
+	}
+
+	entry := findEntry(t, bundle, "regular-swap.txt")
+	if entry.Class != ClassModified {
+		t.Errorf("class = %q, want %q", entry.Class, ClassModified)
+	}
+	if entry.Disposition != DispositionOmittedBinary {
+		t.Errorf("disposition = %q, want %q", entry.Disposition, DispositionOmittedBinary)
+	}
+	if entry.StoredPath != "" {
+		t.Errorf("fifo entry carries StoredPath %q", entry.StoredPath)
+	}
+	if entry.Bytes != 0 {
+		t.Errorf("fifo entry carries Bytes %d, want 0", entry.Bytes)
+	}
+	if members := untar(t, bundle.Archive); len(members) != 0 {
+		t.Errorf("archive carries %d members for a classified-non-regular path: %v", len(members), members)
+	}
+	if got := bundle.Manifest.Totals; got.Files != 1 || got.OmittedBinary != 1 || got.Stored != 0 {
+		t.Errorf("totals = %+v, want Files 1, OmittedBinary 1, Stored 0", got)
+	}
+	assertAbsent(t, bundle, []string{"TRACKED-REGULAR-ORIGINAL"})
+}
+
 // TestRunGitCapped drives the bounded pipe reader directly: a
 // substantially-oversized patch stops at exactly the cap with overLimit set,
 // a small patch is returned in full, and a failing command wraps its stderr
