@@ -1831,6 +1831,18 @@ func (r reporter) classifyDeclared(ctx context.Context, workspace *git.Workspace
 		}
 	case outcomeNoChangeNeeded:
 		r.emitOutcomeDeclared(outcomeNoChangeNeeded)
+		// The workspace check stays local: commits or dirty paths are a
+		// rejection on their own, before any forge read.
+		if workState != git.WorkStateNone {
+			return failedWith("opencode declared no change needed but the workspace has new commits or uncommitted changes", terminalCategoryVerifierRejection)
+		}
+		// A clean workspace alone is not a verified claim: before the
+		// success termination is published, the declared no-change ending
+		// is checked against the assigned repair condition using current
+		// authoritative forge state (#513).
+		if reason := r.verifyNoChangeClaim(ctx); reason != "" {
+			return failedWith(reason, terminalCategoryVerifierRejection)
+		}
 		// No outcome comment: the executor cannot authoritatively verify a
 		// success claim, and the controller settles this ending against the
 		// world (a fix-pr run routes to Verifying and can still end
@@ -1838,10 +1850,7 @@ func (r reporter) classifyDeclared(ctx context.Context, workspace *git.Workspace
 		// evidence rides the termination reason — run.exit telemetry and the
 		// COURIER_TERMINATION handoff — and the public record stays the
 		// coordinator's own handoff plus the controller's lifecycle report.
-		if workState == git.WorkStateNone {
-			return termination{Phase: "NoChangeNeeded", Result: "success", ExitCode: exitNoChangeNeeded, Reason: "opencode declared no change needed: " + decl.Evidence, Outcome: outcomeNoChangeNeeded}
-		}
-		return failedWith("opencode declared no change needed but the workspace has new commits or uncommitted changes", terminalCategoryVerifierRejection)
+		return termination{Phase: "NoChangeNeeded", Result: "success", ExitCode: exitNoChangeNeeded, Reason: "opencode declared no change needed: " + decl.Evidence, Outcome: outcomeNoChangeNeeded}
 	case outcomeNeedsDecision:
 		r.emitOutcomeDeclared(outcomeNeedsDecision)
 		r.postOutcomeComment(ctx, "**Courier needs a decision** (run "+r.cfg.RunID+")\n\n"+decl.Question)
@@ -2386,6 +2395,54 @@ func (r reporter) observeRunBranchPullRequest(ctx context.Context) (runBranchPRO
 	default:
 		return runBranchPRObservation{kind: prStateMissing}, nil
 	}
+}
+
+// verifyNoChangeClaim checks a declared no_change_needed ending against the
+// assigned repair condition using current authoritative forge state before
+// the executor publishes the success termination (#513). For a fix-pr run
+// the pinned pull request is the repair condition: a request the forge
+// reports merged or closed makes the claim moot, and an open request must be
+// mergeable into its actual base — a forge-reported conflict is unsatisfied,
+// and an unknown answer is not proof, because review approval and an
+// unchanged head prove nothing about mergeability. The read goes through the
+// configured forge read-pull-request capability, never a forge-specific CLI.
+// The method returns "" when the claim may stand and otherwise a rejection
+// reason for a failed ending; a claim the forge cannot verify fails closed
+// and never publishes the success, and the rejection reason stands on the
+// forge state, never on the coordinator's model-authored evidence.
+func (r reporter) verifyNoChangeClaim(ctx context.Context) string {
+	// A resolve-issue run pins no pull request: its repair condition is the
+	// issue itself, and the controller settles that ending against the world
+	// through AwaitingReview's human gate, so there is nothing to verify
+	// here without inferring a PR from the issue number.
+	if r.cfg.Mode != "fix-pr" || r.cfg.Ref < 1 {
+		return ""
+	}
+	client, err := github.NewClient(r.cfg.GitHubAPIBase, r.cfg.GitHubToken)
+	if err != nil {
+		return fmt.Sprintf("could not verify the no-change claim against pull request %s#%d: %v", r.cfg.Repo, r.cfg.Ref, err)
+	}
+	provider := github.NewProvider(forge.ProviderConfig{Name: "github", Endpoint: r.cfg.GitHubAPIBase}, client)
+	if !provider.Capabilities().Available(forge.CapabilityReadPullRequest).Available {
+		return fmt.Sprintf("could not verify the no-change claim against pull request %s#%d: the forge read-pull-request capability is unavailable", r.cfg.Repo, r.cfg.Ref)
+	}
+	pull, err := provider.ReadPullRequest(ctx, forge.PullRequestRef{Repo: r.cfg.Repo, Number: r.cfg.Ref})
+	if err != nil {
+		return fmt.Sprintf("could not verify the no-change claim against pull request %s#%d: %v", r.cfg.Repo, r.cfg.Ref, err)
+	}
+	if pull.Merged || strings.EqualFold(strings.TrimSpace(pull.State), "closed") {
+		// The repair condition is moot: a merged or closed request can no
+		// longer be conflicted, so the claim stands without manufacturing a
+		// commit.
+		return ""
+	}
+	if pull.Mergeable == nil {
+		return fmt.Sprintf("opencode declared no change needed but pull request %s#%d mergeability against base %s is unknown; an unverified mergeability cannot settle the assignment", r.cfg.Repo, r.cfg.Ref, pull.BaseRef)
+	}
+	if !*pull.Mergeable {
+		return fmt.Sprintf("opencode declared no change needed but pull request %s#%d still conflicts with base %s; the assignment is not satisfied", r.cfg.Repo, r.cfg.Ref, pull.BaseRef)
+	}
+	return ""
 }
 
 // confirmRemotePublication proves the run's current commit is published on
