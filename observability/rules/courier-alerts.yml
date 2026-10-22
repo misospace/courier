@@ -58,9 +58,17 @@ groups:
             courier_coderuns_in_flight >= courier_lane_concurrency
             and on(lane) (courier_lane_suspended == 0)
             and on(lane) (
-              (sum by (lane) (rate(courier_coderun_queue_wait_seconds_sum[10m])) / sum by (lane) (rate(courier_coderun_queue_wait_seconds_count[10m])))
-              > on(lane)
-              (sum by (lane) (rate(courier_coderun_queue_wait_seconds_sum[10m] offset 10m)) / sum by (lane) (rate(courier_coderun_queue_wait_seconds_count[10m] offset 10m)))
+              (
+                histogram_quantile(0.5, sum by (le, lane) (rate(courier_coderun_queue_wait_seconds_bucket[10m])))
+                > on(lane)
+                histogram_quantile(0.5, sum by (le, lane) (rate(courier_coderun_queue_wait_seconds_bucket[10m] offset 10m)))
+              )
+              or on(lane)
+              (
+                histogram_quantile(0.9, sum by (le, lane) (rate(courier_coderun_queue_wait_seconds_bucket[10m])))
+                > on(lane)
+                histogram_quantile(0.9, sum by (le, lane) (rate(courier_coderun_queue_wait_seconds_bucket[10m] offset 10m)))
+              )
             )
           )
         for: 15m
@@ -69,13 +77,24 @@ groups:
         annotations:
           summary: Lane {{ $labels.lane }} is saturated and queue wait is rising
           description: >-
-            Lane {{ $labels.lane }} is at its concurrency limit and the mean queue wait over
-            the recent 10m exceeds the previous 10m. Evidence: courier_coderuns_in_flight,
-            courier_lane_concurrency, courier_lane_suspended,
-            courier_coderun_queue_wait_seconds_sum, courier_coderun_queue_wait_seconds_count.
-            Saturation alone is a supply condition, not a failure; the rising-wait comparison
-            is the discriminator. If wait samples are absent the comparison is empty and the
-            alert does not fire: it is suppressed rather than inferred. A suspended lane does
+            Lane {{ $labels.lane }} is at its concurrency limit and its queue wait is
+            getting worse. Evidence: courier_coderuns_in_flight, courier_lane_concurrency,
+            courier_lane_suspended, courier_coderun_queue_wait_seconds_bucket. The rising
+            comparison reads the p50 and the p90 of the queue wait, each over two
+            consecutive 10m windows (the recent window against the window 10m earlier),
+            and holds when either quantile is higher in the recent window. The arithmetic
+            mean of the queue wait (the _sum and _count series) is deliberately not used:
+            under skewed queue waits the mean hides the tail, so a lane whose admissions
+            move from typical to extreme keeps a flat mean and would never be seen.
+            Saturation alone is a supply condition, not a failure; the rising-wait
+            comparison is the discriminator. A window without queue-wait samples yields no
+            quantile value (NaN when the bucket series exist without observations, no series
+            at all when they do not exist), so the comparison is false and the alert is
+            suppressed rather than inferred. The quantile saturates at the highest
+            configured bucket (3600s): once more than a tenth of a window's admissions
+            exceed it, that window reports the top bucket, so two windows beyond it
+            compare equal and a tail that keeps worsening past an hour is not visible in
+            the p90 arm; the p50 arm still catches a broad shift. A suspended lane does
             not fire (no admissions are expected). Info severity: confirm the lane is
             intentionally sized; not a page.
       - alert: CourierLaneReservationWedge

@@ -2,10 +2,14 @@ package observability_test
 
 import (
 	"encoding/json"
+	"math"
 	"os"
 	"sort"
 	"strings"
 	"testing"
+	"time"
+
+	"github.com/prometheus/prometheus/promql"
 )
 
 type dashRef struct {
@@ -14,6 +18,7 @@ type dashRef struct {
 }
 
 type dashTarget struct {
+	RefID        string  `json:"refId"`
 	Expr         string  `json:"expr"`
 	LegendFormat string  `json:"legendFormat"`
 	Datasource   dashRef `json:"datasource"`
@@ -169,6 +174,175 @@ func TestDashboardExprMetricsAreRegistered(t *testing.T) {
 			t.Errorf("panel expr references excluded metric %q", m)
 		}
 	}
+}
+
+func TestDashboardExprLabelsAreBounded(t *testing.T) {
+	d := loadDashboard(t)
+	labels := map[string]struct{}{}
+	metrics := map[string]struct{}{}
+	for _, p := range d.Panels {
+		for _, tgt := range p.Targets {
+			node, err := exprParser.ParseExpr(tgt.Expr)
+			if err != nil {
+				t.Errorf("panel %q: expr does not parse: %v\n%s", p.Title, err, tgt.Expr)
+				continue
+			}
+			collect(node, labels, metrics)
+		}
+	}
+	for l := range labels {
+		if _, ok := allowedExprLabels[l]; !ok {
+			t.Errorf("dashboard expr uses unbounded label %q", l)
+		}
+	}
+}
+
+func panelByID(t *testing.T, d dashDoc, id int) dashPanel {
+	t.Helper()
+	for _, p := range d.Panels {
+		if p.ID == id {
+			return p
+		}
+	}
+	t.Fatalf("dashboard has no panel %d", id)
+	return dashPanel{}
+}
+
+func targetByRefID(t *testing.T, p dashPanel, refID string) dashTarget {
+	t.Helper()
+	for _, tgt := range p.Targets {
+		if tgt.RefID == refID {
+			return tgt
+		}
+	}
+	t.Fatalf("panel %d (%q) has no target %q", p.ID, p.Title, refID)
+	return dashTarget{}
+}
+
+// assertNaNIdentity asserts that the vector holds exactly one sample, that it
+// belongs to the given identity, and that its value is NaN: the value the
+// backend emits for a missing state. It must never be a measured zero.
+func assertNaNIdentity(t *testing.T, v promql.Vector, want map[string]string) {
+	t.Helper()
+	if len(v) != 1 {
+		t.Fatalf("want exactly one sample, got %v", sampleKeys(v))
+	}
+	s := v[0]
+	for label, value := range want {
+		if got := s.Metric.Get(label); got != value {
+			t.Fatalf("want %s=%q, got %q", label, value, got)
+		}
+	}
+	if !math.IsNaN(s.F) {
+		t.Fatalf("want a NaN (no value) sample for %v, got %v", want, s.F)
+	}
+}
+
+// assertSingleIdentity asserts that the vector holds exactly one sample and
+// that it belongs to the given identity.
+func assertSingleIdentity(t *testing.T, v promql.Vector, want map[string]string) {
+	t.Helper()
+	if len(v) != 1 {
+		t.Fatalf("want exactly one sample, got %v", sampleKeys(v))
+	}
+	for label, value := range want {
+		if got := v[0].Metric.Get(label); got != value {
+			t.Fatalf("want %s=%q, got %q", label, value, got)
+		}
+	}
+}
+
+// assertNoIdentity asserts that the vector carries no sample for the given
+// identity: the primary target omits the missing state, and the fallback
+// target is what carries it.
+func assertNoIdentity(t *testing.T, v promql.Vector, label, unwanted string) {
+	t.Helper()
+	for _, s := range v {
+		if s.Metric.Get(label) == unwanted {
+			t.Fatalf("want no sample for %s=%q, got %v", label, unwanted, s.F)
+		}
+	}
+}
+
+func TestDashboardHasNoGlobalAbsentFallback(t *testing.T) {
+	d := loadDashboard(t)
+	for _, p := range d.Panels {
+		for _, tgt := range p.Targets {
+			if strings.Contains(tgt.Expr, "absent(") {
+				t.Errorf("panel %d (%q) target %q uses absent(): a global fallback hides a peer identity",
+					p.ID, p.Title, tgt.LegendFormat)
+			}
+		}
+	}
+}
+
+// TestDashboardMissingStateKeepsEveryIdentity covers the three panels that
+// render a state with no metric of its own. The missing state must be shown
+// per identity: a source/lane binding that never succeeded, a lane whose
+// unsettled report has no age, a lane with no unsettled report, a phase
+// retained without an age, a phase with no retained run. A global absent()
+// would drop the missing identity as soon as any peer identity had a series.
+func TestDashboardMissingStateKeepsEveryIdentity(t *testing.T) {
+	d := loadDashboard(t)
+
+	t.Run("discovery freshness keeps the never-succeeded binding", func(t *testing.T) {
+		script := `load 30s
+  courier_source_discovery_attempts_total{source="dispatch",lane="main"} 4x20
+  courier_source_discovery_attempts_total{source="dispatch",lane="other"} 7x20
+  courier_source_last_success_timestamp_seconds{source="dispatch",lane="main"} 1700000000x20
+`
+		st := loadStorage(t, script)
+		panel := panelByID(t, d, 3)
+		primary := evalAt(t, st, targetByRefID(t, panel, "A").Expr, 300*time.Second)
+		assertSingleIdentity(t, primary, map[string]string{"source": "dispatch", "lane": "main"})
+		assertNoIdentity(t, primary, "lane", "other")
+		assertNaNIdentity(t, evalAt(t, st, targetByRefID(t, panel, "B").Expr, 300*time.Second),
+			map[string]string{"source": "dispatch", "lane": "other"})
+	})
+
+	t.Run("lifecycle keeps the lane with an unknown age and the lane with no unsettled report", func(t *testing.T) {
+		script := `load 30s
+  courier_lane_concurrency{lane="main"} 2x20
+  courier_lane_concurrency{lane="unfinished"} 2x20
+  courier_lane_concurrency{lane="settled"} 2x20
+  courier_coderuns_lifecycle_pending_oldest_age_seconds{lane="main"} 900x20
+  courier_coderuns_lifecycle_pending{lane="main"} 1x20
+  courier_coderuns_lifecycle_pending{lane="unfinished"} 1x20
+`
+		st := loadStorage(t, script)
+		panel := panelByID(t, d, 17)
+		primary := evalAt(t, st, targetByRefID(t, panel, "A").Expr, 300*time.Second)
+		assertSingleIdentity(t, primary, map[string]string{"lane": "main"})
+		assertNoIdentity(t, primary, "lane", "unfinished")
+		// An unsettled report whose run has no FinishedAt yet: pending, no age.
+		assertNaNIdentity(t, evalAt(t, st, targetByRefID(t, panel, "B").Expr, 300*time.Second),
+			map[string]string{"lane": "unfinished"})
+		// No unsettled report at all.
+		assertNaNIdentity(t, evalAt(t, st, targetByRefID(t, panel, "C").Expr, 300*time.Second),
+			map[string]string{"lane": "settled"})
+	})
+
+	t.Run("retention keeps the phase without an age and the phase without a retained run", func(t *testing.T) {
+		script := `load 30s
+  courier_coderuns_oldest_terminal_age_seconds{phase="Done"} 120x20
+  courier_coderuns_awaiting_reap{phase="Done"} 1x20
+  courier_coderuns_awaiting_reap{phase="Failed"} 1x20
+  courier_coderuns_total{lane="main",mode="resolve",phase="Done"} 3x20
+  courier_coderuns_total{lane="main",mode="resolve",phase="Failed"} 1x20
+  courier_coderuns_total{lane="main",mode="resolve",phase="Cancelled"} 2x20
+`
+		st := loadStorage(t, script)
+		panel := panelByID(t, d, 21)
+		primary := evalAt(t, st, targetByRefID(t, panel, "A").Expr, 300*time.Second)
+		assertSingleIdentity(t, primary, map[string]string{"phase": "Done"})
+		assertNoIdentity(t, primary, "phase", "Failed")
+		// Retained, but its age is unknown.
+		assertNaNIdentity(t, evalAt(t, st, targetByRefID(t, panel, "B").Expr, 300*time.Second),
+			map[string]string{"phase": "Failed"})
+		// Terminalized, but nothing is retained any more.
+		assertNaNIdentity(t, evalAt(t, st, targetByRefID(t, panel, "C").Expr, 300*time.Second),
+			map[string]string{"phase": "Cancelled"})
+	})
 }
 
 func TestDashboardSummaryGolden(t *testing.T) {

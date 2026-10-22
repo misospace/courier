@@ -3,6 +3,7 @@ package observability_test
 import (
 	"context"
 	"fmt"
+	"math"
 	"os"
 	"reflect"
 	"regexp"
@@ -330,6 +331,151 @@ const baseLane = `  courier_lane_reservations{lane="main"} 0x44
   courier_lane_suspended{lane="main"} 0x44
 `
 
+// queueWaitBucketBounds mirrors internal/controller/metrics.go queueWaitBuckets.
+var queueWaitBucketBounds = []float64{1, 5, 15, 30, 60, 120, 300, 600, 1800, 3600}
+
+// The queue-wait counters start from a non-zero baseline so that rate()'s
+// zero-point extrapolation never applies: the zero point it derives from the
+// first sample lies far beyond the window start for every bucket, so each
+// bucket rate is the same uniform multiple of the observations counted in the
+// window and the quantiles stay exact.
+const (
+	queueWaitBucketBaseline = 1000
+	queueWaitSumBaseline    = 1000000
+	queueWaitCountBaseline  = 100000
+)
+
+// queueWaitSeries renders the promqltest load lines for one identity's
+// queue-wait histogram across the two consecutive 10m windows the A2 rule
+// compares. previous holds the observations counted in the window
+// (T-20m, T-10m] and recent those in (T-10m, T], where T is the evaluation
+// time. Every bucket boundary gets a cumulative counter series, +Inf included,
+// because histogram_quantile returns NaN without the +Inf bucket. The _sum and
+// _count series are rendered too, so the mean the alert deliberately does not
+// use can be evaluated against the same data.
+func queueWaitSeries(lane, mode, phase string, previous, recent []float64) []string {
+	labels := fmt.Sprintf("lane=%q,mode=%q,phase=%q", lane, mode, phase)
+	cumulative := func(observations []float64) []int {
+		counts := make([]int, len(queueWaitBucketBounds)+1)
+		for _, o := range observations {
+			counts[sort.SearchFloat64s(queueWaitBucketBounds, o)]++
+		}
+		for i := 1; i < len(counts); i++ {
+			counts[i] += counts[i-1]
+		}
+		return counts
+	}
+	total := func(observations []float64) int {
+		sum := 0
+		for _, o := range observations {
+			sum += int(o)
+		}
+		return sum
+	}
+	prevCum := cumulative(previous)
+	recentCum := cumulative(recent)
+	prevSum := total(previous)
+	recentSum := total(recent)
+	lines := make([]string, 0, len(queueWaitBucketBounds)+3)
+	for i, bound := range queueWaitBucketBounds {
+		lines = append(lines, fmt.Sprintf(
+			"  courier_coderun_queue_wait_seconds_bucket{%s,le=\"%g\"} %dx10 %dx20 %dx15",
+			labels, bound,
+			queueWaitBucketBaseline,
+			queueWaitBucketBaseline+prevCum[i],
+			queueWaitBucketBaseline+prevCum[i]+recentCum[i]))
+	}
+	lines = append(lines, fmt.Sprintf(
+		"  courier_coderun_queue_wait_seconds_bucket{%s,le=\"+Inf\"} %dx10 %dx20 %dx15",
+		labels,
+		queueWaitBucketBaseline,
+		queueWaitBucketBaseline+prevCum[len(prevCum)-1],
+		queueWaitBucketBaseline+prevCum[len(prevCum)-1]+recentCum[len(recentCum)-1]))
+	lines = append(lines, fmt.Sprintf(
+		"  courier_coderun_queue_wait_seconds_sum{%s} %dx10 %dx20 %dx15",
+		labels, queueWaitSumBaseline,
+		queueWaitSumBaseline+prevSum,
+		queueWaitSumBaseline+prevSum+recentSum))
+	lines = append(lines, fmt.Sprintf(
+		"  courier_coderun_queue_wait_seconds_count{%s} %dx10 %dx20 %dx15",
+		labels, queueWaitCountBaseline,
+		queueWaitCountBaseline+len(previous),
+		queueWaitCountBaseline+len(previous)+len(recent)))
+	return lines
+}
+
+// meanQueueWaitPredicate is the mean-based queue-wait comparison the A2 rule
+// carried before the quantile rewrite. The skewed scenario evaluates it as the
+// control that proves the rewrite changes the outcome.
+const meanQueueWaitPredicate = `(
+  courier_coderuns_in_flight >= courier_lane_concurrency
+  and on(lane) (courier_lane_suspended == 0)
+  and on(lane) (
+    (sum by (lane) (rate(courier_coderun_queue_wait_seconds_sum[10m])) / sum by (lane) (rate(courier_coderun_queue_wait_seconds_count[10m])))
+    > on(lane)
+    (sum by (lane) (rate(courier_coderun_queue_wait_seconds_sum[10m] offset 10m)) / sum by (lane) (rate(courier_coderun_queue_wait_seconds_count[10m] offset 10m)))
+  )
+)`
+
+// comparison is one greater-than comparison taken from an alert expression.
+type comparison struct {
+	expr     string
+	lhs      string
+	rhs      string
+	quantile string
+}
+
+// greaterThanComparisons returns every greater-than comparison in an
+// expression, rendered back from its parsed form so the tests evaluate the
+// rule's own operands instead of copies of them.
+func greaterThanComparisons(t *testing.T, expr string) []comparison {
+	t.Helper()
+	node, err := exprParser.ParseExpr(expr)
+	if err != nil {
+		t.Fatalf("parse expr: %v\n%s", err, expr)
+	}
+	var out []comparison
+	var walk func(parser.Node)
+	walk = func(n parser.Node) {
+		if bin, ok := n.(*parser.BinaryExpr); ok && bin.Op == parser.GTR {
+			c := comparison{expr: bin.String(), lhs: bin.LHS.String(), rhs: bin.RHS.String()}
+			if call, ok := bin.LHS.(*parser.Call); ok &&
+				call.Func.Name == "histogram_quantile" && len(call.Args) > 0 {
+				if num, ok := call.Args[0].(*parser.NumberLiteral); ok {
+					c.quantile = fmt.Sprintf("%g", num.Val)
+				}
+			}
+			out = append(out, c)
+		}
+		for _, child := range parser.Children(n) {
+			walk(child)
+		}
+	}
+	walk(node)
+	return out
+}
+
+func quantileArms(t *testing.T, expr string) map[string]comparison {
+	t.Helper()
+	arms := map[string]comparison{}
+	for _, c := range greaterThanComparisons(t, expr) {
+		if c.quantile != "" {
+			arms[c.quantile] = c
+		}
+	}
+	return arms
+}
+
+// laneValue evaluates expr and returns the value of its single sample.
+func laneValue(t *testing.T, st storage.Queryable, expr string, at time.Duration) float64 {
+	t.Helper()
+	v := evalAt(t, st, expr, at)
+	if len(v) != 1 {
+		t.Fatalf("want exactly one sample for %q, got %v", expr, sampleKeys(v))
+	}
+	return v[0].F
+}
+
 func TestAlertScenarios(t *testing.T) {
 	t.Run("A1 healthy idle stays silent", func(t *testing.T) {
 		script := `load 30s
@@ -433,9 +579,9 @@ func TestAlertScenarios(t *testing.T) {
   courier_coderuns_in_flight{lane="main"} 2x44
   courier_lane_concurrency{lane="main"} 2x44
   courier_lane_suspended{lane="main"} 0x44
-  courier_coderun_queue_wait_seconds_sum{lane="main",mode="resolve",phase="Failed"} 0+4x20 92+12x23
-  courier_coderun_queue_wait_seconds_count{lane="main",mode="resolve",phase="Failed"} 0+2x44
-`
+` + strings.Join(queueWaitSeries("main", "resolve", "Failed",
+			[]float64{4, 4, 4, 4, 4, 4, 4, 4, 10, 10},
+			[]float64{40, 40, 40, 40, 40, 40, 40, 40, 100, 100}), "\n") + "\n"
 		st := loadStorage(t, script)
 		assertFiring(t, evalAt(t, st, exprFor(t, "CourierLaneSaturatedQueueWaitRising"), 1320*time.Second),
 			[]string{"/main//"})
@@ -446,9 +592,108 @@ func TestAlertScenarios(t *testing.T) {
   courier_coderuns_in_flight{lane="main"} 2x44
   courier_lane_concurrency{lane="main"} 2x44
   courier_lane_suspended{lane="main"} 0x44
-  courier_coderun_queue_wait_seconds_sum{lane="main",mode="resolve",phase="Failed"} 0+12x20 244+4x23
-  courier_coderun_queue_wait_seconds_count{lane="main",mode="resolve",phase="Failed"} 0+2x44
+` + strings.Join(queueWaitSeries("main", "resolve", "Failed",
+			[]float64{40, 40, 40, 40, 40, 40, 40, 40, 100, 100},
+			[]float64{4, 4, 4, 4, 4, 4, 4, 4, 10, 10}), "\n") + "\n"
+		st := loadStorage(t, script)
+		assertSilent(t, evalAt(t, st, exprFor(t, "CourierLaneSaturatedQueueWaitRising"), 1320*time.Second))
+	})
+
+	t.Run("A2 skewed queue wait fires on the p90 while the p50 and the mean stay flat", func(t *testing.T) {
+		// The previous window holds five typical waits and five waits just
+		// under the 30s bucket edge; the recent window holds the same five
+		// typical waits, three waits below that edge, and two waits in the
+		// 60s bucket. The median sits in the same bucket in both windows, so
+		// the p50 is unchanged; the tail moves up, so the p90 rises; the
+		// total wait is identical, so the arithmetic mean is unchanged.
+		// Only the quantile comparison can see this: the mean-based
+		// predicate below stays silent on exactly this data.
+		script := `load 30s
+  courier_coderuns_in_flight{lane="main"} 2x44
+  courier_lane_concurrency{lane="main"} 2x44
+  courier_lane_suspended{lane="main"} 0x44
+` + strings.Join(queueWaitSeries("main", "resolve", "Failed",
+			[]float64{4, 4, 4, 4, 4, 22, 22, 22, 22, 22},
+			[]float64{4, 4, 4, 4, 4, 16, 16, 16, 31, 31}), "\n") + "\n"
+		st := loadStorage(t, script)
+		at := 1320 * time.Second
+
+		arms := quantileArms(t, exprFor(t, "CourierLaneSaturatedQueueWaitRising"))
+		p50, ok50 := arms["0.5"]
+		p90, ok90 := arms["0.9"]
+		if !ok50 || !ok90 {
+			t.Fatalf("A2 must compare the p50 and the p90, got arms %v", arms)
+		}
+		recentP50 := laneValue(t, st, p50.lhs, at)
+		previousP50 := laneValue(t, st, p50.rhs, at)
+		if recentP50 != previousP50 {
+			t.Fatalf("p50 must stay flat, got recent %v previous %v", recentP50, previousP50)
+		}
+		recentP90 := laneValue(t, st, p90.lhs, at)
+		previousP90 := laneValue(t, st, p90.rhs, at)
+		if recentP90 <= previousP90 {
+			t.Fatalf("p90 must rise, got recent %v previous %v", recentP90, previousP90)
+		}
+		assertSilent(t, evalAt(t, st, p50.expr, at))
+		assertFiring(t, evalAt(t, st, p90.expr, at), []string{"/main//"})
+		assertFiring(t, evalAt(t, st, exprFor(t, "CourierLaneSaturatedQueueWaitRising"), at),
+			[]string{"/main//"})
+
+		meanArms := greaterThanComparisons(t, meanQueueWaitPredicate)
+		if len(meanArms) != 1 {
+			t.Fatalf("mean predicate must hold one comparison, got %d", len(meanArms))
+		}
+		recentMean := laneValue(t, st, meanArms[0].lhs, at)
+		previousMean := laneValue(t, st, meanArms[0].rhs, at)
+		if recentMean != previousMean {
+			t.Fatalf("mean must stay flat, got recent %v previous %v", recentMean, previousMean)
+		}
+		assertSilent(t, evalAt(t, st, meanQueueWaitPredicate, at))
+	})
+
+	t.Run("A2 without queue-wait samples stays silent", func(t *testing.T) {
+		script := `load 30s
+  courier_coderuns_in_flight{lane="main"} 2x44
+  courier_lane_concurrency{lane="main"} 2x44
+  courier_lane_suspended{lane="main"} 0x44
 `
+		st := loadStorage(t, script)
+		assertSilent(t, evalAt(t, st, exprFor(t, "CourierLaneSaturatedQueueWaitRising"), 1320*time.Second))
+	})
+
+	t.Run("A2 with queue-wait samples only in the previous window stays silent", func(t *testing.T) {
+		// The lane went idle: the histogram records its last admissions in
+		// the previous window and nothing afterwards, so the recent window
+		// has no quantile value and the rising comparison cannot hold.
+		script := `load 30s
+  courier_coderuns_in_flight{lane="main"} 2x44
+  courier_lane_concurrency{lane="main"} 2x44
+  courier_lane_suspended{lane="main"} 0x44
+` + strings.Join(queueWaitSeries("main", "resolve", "Failed",
+			[]float64{4, 4, 4, 4, 4, 4, 4, 4, 10, 10}, nil), "\n") + "\n"
+		st := loadStorage(t, script)
+		at := 1320 * time.Second
+
+		arms := quantileArms(t, exprFor(t, "CourierLaneSaturatedQueueWaitRising"))
+		recent := evalAt(t, st, arms["0.5"].lhs, at)
+		if len(recent) != 1 || !math.IsNaN(recent[0].F) {
+			t.Fatalf("want no recent quantile value, got %v", recent)
+		}
+		previous := evalAt(t, st, arms["0.5"].rhs, at)
+		if len(previous) != 1 || math.IsNaN(previous[0].F) {
+			t.Fatalf("want a previous quantile value, got %v", previous)
+		}
+		assertSilent(t, evalAt(t, st, exprFor(t, "CourierLaneSaturatedQueueWaitRising"), at))
+	})
+
+	t.Run("A2 saturated lane with a constant queue wait distribution stays silent", func(t *testing.T) {
+		script := `load 30s
+  courier_coderuns_in_flight{lane="main"} 2x44
+  courier_lane_concurrency{lane="main"} 2x44
+  courier_lane_suspended{lane="main"} 0x44
+` + strings.Join(queueWaitSeries("main", "resolve", "Failed",
+			[]float64{4, 4, 4, 4, 4, 4, 4, 4, 10, 10},
+			[]float64{4, 4, 4, 4, 4, 4, 4, 4, 10, 10}), "\n") + "\n"
 		st := loadStorage(t, script)
 		assertSilent(t, evalAt(t, st, exprFor(t, "CourierLaneSaturatedQueueWaitRising"), 1320*time.Second))
 	})

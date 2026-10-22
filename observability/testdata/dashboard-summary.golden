@@ -7,11 +7,13 @@ Lane capacity: queue wait quantiles|histogram_quantile(0.95, sum by (le, lane) (
 Lane capacity: reservation pressure|max by (lane) (courier_coderuns_pending)
 Lane capacity: reservation pressure|max by (lane) (courier_lane_concurrency)
 Lane capacity: reservation pressure|max by (lane) (courier_lane_reservations)
-Lifecycle: oldest unsettled report age (unknown when absent)|absent(courier_coderuns_lifecycle_pending_oldest_age_seconds)
-Lifecycle: oldest unsettled report age (unknown when absent)|max(courier_coderuns_lifecycle_pending_oldest_age_seconds)
+Lifecycle: oldest unsettled report age (unknown when absent)|((max by (lane) (courier_coderuns_lifecycle_pending) unless on(lane) (max by (lane) (courier_coderuns_lifecycle_pending_oldest_age_seconds))) * 0) / 0
+Lifecycle: oldest unsettled report age (unknown when absent)|((max by (lane) (courier_lane_concurrency) unless on(lane) (max by (lane) (courier_coderuns_lifecycle_pending))) * 0) / 0
+Lifecycle: oldest unsettled report age (unknown when absent)|max by (lane) (courier_coderuns_lifecycle_pending_oldest_age_seconds)
 Lifecycle: pending reports|max by (lane) (courier_coderuns_lifecycle_pending)
 Lifecycle: report outcome mix|sum by (result) (rate(courier_source_lifecycle_report_outcomes_total[10m]))
-Retention: oldest retained run (none retained when absent)|absent(courier_coderuns_oldest_terminal_age_seconds)
+Retention: oldest retained run (none retained when absent)|((max by (phase) (courier_coderuns_awaiting_reap) unless on(phase) (max by (phase) (courier_coderuns_oldest_terminal_age_seconds))) * 0) / 0
+Retention: oldest retained run (none retained when absent)|((max by (phase) (courier_coderuns_total) unless on(phase) (max by (phase) (courier_coderuns_awaiting_reap))) * 0) / 0
 Retention: oldest retained run (none retained when absent)|max by (phase) (courier_coderuns_oldest_terminal_age_seconds)
 Retention: reap rate|sum by (phase) (rate(courier_coderuns_reap_requests_total[10m]))
 Retention: retained-run backlog|max by (phase) (courier_coderuns_awaiting_reap)
@@ -24,8 +26,8 @@ Run execution: token usage by kind|sum by (kind) (rate(courier_coderun_tokens_to
 Source health: discovered vs materialized|sum by (source) (rate(courier_source_items_materialized_total[10m]))
 Source health: discovered vs materialized|sum by (source) (rate(courier_source_items_offered_total[10m]))
 Source health: discovery failure ratio|sum by (source) (rate(courier_source_discovery_failures_total[10m])) / sum by (source) (rate(courier_source_discovery_attempts_total[10m]))
-Source health: discovery freshness (unknown until first success)|absent(courier_source_last_success_timestamp_seconds)
-Source health: discovery freshness (unknown until first success)|min by (source) (time() - courier_source_last_success_timestamp_seconds)
+Source health: discovery freshness (unknown until first success)|((max by (source, lane) (courier_source_discovery_attempts_total) unless on(source, lane) courier_source_last_success_timestamp_seconds) * 0) / 0
+Source health: discovery freshness (unknown until first success)|min by (source, lane) (time() - courier_source_last_success_timestamp_seconds)
 Source health: discovery outcomes|sum by (source) (rate(courier_source_discovery_attempts_total[10m]))
 Source health: discovery outcomes|sum by (source) (rate(courier_source_discovery_failures_total[10m]))
 Source health: discovery outcomes|sum by (source) (rate(courier_source_discovery_successes_total[10m]))

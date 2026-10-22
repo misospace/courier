@@ -121,7 +121,7 @@
       "id": 3,
       "type": "stat",
       "title": "Source health: discovery freshness (unknown until first success)",
-      "description": "Seconds since the last successful discovery, compared against the 30s poll interval. The last-success timestamp is absent until the first success, so absence is unknown (starting), never idle and never healthy; the second target surfaces that absence explicitly.",
+      "description": "Seconds since the last successful discovery of a source/lane binding, compared against the 30s poll interval. The last-success timestamp is absent until that binding's first success, so absence is unknown (starting), never idle and never healthy; the second target emits one NaN-valued series per polled binding that has never succeeded, so the missing state is never a measured zero and never a number that could read as healthy. How a dashboard renders a NaN is renderer-dependent. The enumeration covers bindings that have been polled at least once; a binding that has never been polled has no series anywhere.",
       "datasource": {
         "type": "prometheus",
         "uid": "${DS_PROMETHEUS}"
@@ -176,8 +176,8 @@
             "type": "prometheus",
             "uid": "${DS_PROMETHEUS}"
           },
-          "expr": "min by (source) (time() - courier_source_last_success_timestamp_seconds)",
-          "legendFormat": "{{source}} since last success",
+          "expr": "min by (source, lane) (time() - courier_source_last_success_timestamp_seconds)",
+          "legendFormat": "{{source}}/{{lane}} since last success",
           "refId": "A"
         },
         {
@@ -185,8 +185,8 @@
             "type": "prometheus",
             "uid": "${DS_PROMETHEUS}"
           },
-          "expr": "absent(courier_source_last_success_timestamp_seconds)",
-          "legendFormat": "unknown: no successful discovery yet",
+          "expr": "((max by (source, lane) (courier_source_discovery_attempts_total) unless on(source, lane) courier_source_last_success_timestamp_seconds) * 0) / 0",
+          "legendFormat": "{{source}}/{{lane}}: no successful discovery yet (unknown)",
           "refId": "B"
         }
       ]
@@ -869,7 +869,7 @@
       "id": 17,
       "type": "stat",
       "title": "Lifecycle: oldest unsettled report age (unknown when absent)",
-      "description": "Age of the oldest terminal run with an unsettled lifecycle report, measured from FinishedAt. When no reports are unsettled the series is absent: that is none pending, not zero age, and the second target surfaces the distinction.",
+      "description": "Age of the oldest terminal run with an unsettled lifecycle report, measured from FinishedAt, per lane. Three states are distinguished. A lane with an unsettled report that has no FinishedAt yet has no age series: the second target emits one NaN-valued series for that lane. A lane with no unsettled report at all: the third target emits one NaN-valued series for that lane. Each such series is a value the backend never measured, never a zero that could read as healthy; how a dashboard renders a NaN is renderer-dependent.",
       "datasource": {
         "type": "prometheus",
         "uid": "${DS_PROMETHEUS}"
@@ -925,8 +925,8 @@
             "type": "prometheus",
             "uid": "${DS_PROMETHEUS}"
           },
-          "expr": "max(courier_coderuns_lifecycle_pending_oldest_age_seconds)",
-          "legendFormat": "oldest unsettled report",
+          "expr": "max by (lane) (courier_coderuns_lifecycle_pending_oldest_age_seconds)",
+          "legendFormat": "{{lane}} oldest unsettled report",
           "refId": "A"
         },
         {
@@ -934,9 +934,18 @@
             "type": "prometheus",
             "uid": "${DS_PROMETHEUS}"
           },
-          "expr": "absent(courier_coderuns_lifecycle_pending_oldest_age_seconds)",
-          "legendFormat": "no unsettled reports",
+          "expr": "((max by (lane) (courier_coderuns_lifecycle_pending) unless on(lane) (max by (lane) (courier_coderuns_lifecycle_pending_oldest_age_seconds))) * 0) / 0",
+          "legendFormat": "{{lane}}: unsettled report, age unknown",
           "refId": "B"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
+          "expr": "((max by (lane) (courier_lane_concurrency) unless on(lane) (max by (lane) (courier_coderuns_lifecycle_pending))) * 0) / 0",
+          "legendFormat": "{{lane}}: no unsettled report (none pending)",
+          "refId": "C"
         }
       ]
     },
@@ -1088,7 +1097,7 @@
       "id": 21,
       "type": "stat",
       "title": "Retention: oldest retained run (none retained when absent)",
-      "description": "Age of the oldest retained terminal run per phase, read live at scrape time, so it reflects what is actually retained even when a finalizer holds a run past an accepted delete request. Absent means none retained, not zero age.",
+      "description": "Age of the oldest retained terminal run per phase, read live at scrape time, so it reflects what is actually retained even when a finalizer holds a run past an accepted delete request. The second target emits one NaN-valued series per phase that is retained without an age, and the third one NaN-valued series per phase with no retained run; each is a value the backend never measured, never a zero that could read as healthy, and how a dashboard renders a NaN is renderer-dependent. The phase identity of the no-retained-run state comes from the terminal counts, which carry a run's first terminal phase, while the retention series carry the current phase, so the two are not the same identity set.",
       "datasource": {
         "type": "prometheus",
         "uid": "${DS_PROMETHEUS}"
@@ -1149,9 +1158,18 @@
             "type": "prometheus",
             "uid": "${DS_PROMETHEUS}"
           },
-          "expr": "absent(courier_coderuns_oldest_terminal_age_seconds)",
-          "legendFormat": "none retained",
+          "expr": "((max by (phase) (courier_coderuns_awaiting_reap) unless on(phase) (max by (phase) (courier_coderuns_oldest_terminal_age_seconds))) * 0) / 0",
+          "legendFormat": "{{phase}}: retained run, age unknown",
           "refId": "B"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
+          "expr": "((max by (phase) (courier_coderuns_total) unless on(phase) (max by (phase) (courier_coderuns_awaiting_reap))) * 0) / 0",
+          "legendFormat": "{{phase}}: no retained run in this phase",
+          "refId": "C"
         }
       ]
     }
