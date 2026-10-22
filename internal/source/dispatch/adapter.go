@@ -98,6 +98,7 @@ var _ source.HandoutAcker = (*Adapter)(nil)
 var _ source.WorkIdentifier = (*Adapter)(nil)
 var _ source.CapacityRecoveryPreparer = (*Adapter)(nil)
 var _ source.CapacityRecovery = (*Adapter)(nil)
+var _ source.CIParkLifecycle = (*Adapter)(nil)
 
 // New creates a Dispatch adapter around an injected API client.
 func New(client Client, opts ...Option) *Adapter {
@@ -149,6 +150,11 @@ func (a *Adapter) declareCapabilities() {
 		em.Capability(a.connectorName, connector.CapabilityPreLaunchRevalidation, connector.CapabilitySupported)
 	} else {
 		em.Capability(a.connectorName, connector.CapabilityPreLaunchRevalidation, connector.CapabilityUnsupported)
+	}
+	if _, ok := a.client.(ParkLifecycleClient); ok {
+		em.Capability(a.connectorName, connector.CapabilityCIParkLifecycle, connector.CapabilitySupported)
+	} else {
+		em.Capability(a.connectorName, connector.CapabilityCIParkLifecycle, connector.CapabilityUnsupported)
 	}
 	em.Capability(a.connectorName, connector.CapabilityWorkIdentity, connector.CapabilitySupported)
 	em.Capability(a.connectorName, connector.CapabilityAvailability, connector.CapabilitySupported)

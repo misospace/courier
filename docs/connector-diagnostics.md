@@ -123,6 +123,7 @@ cannot advertise a capability Courier has no seam for.
 
 | Capability | Courier seam | Signals it may emit | Owner of values |
 | --- | --- | --- | --- |
+| `ci-park-lifecycle` | `source.CIParkLifecycle` | `identity` (generation-advanced), `protocol-error` | connector |
 | `discovery` | `source.Adapter.Discover` | `discovery` (attempts/success/failure), `protocol-error` | connector |
 | `discovery-exclusions` | `source.DiscoveryExcluder` | `exclusion` (requested/accepted/overflow), `ack` (ok/missing/invalid/version-unsupported) | connector |
 | `lifecycle-report` | `source.Reporter` | `report` (published/superseded/unsupported/retryable), `protocol-error` | connector |
@@ -392,6 +393,7 @@ set and supplies Dispatch-specific values:
 
 | Capability | State | Connector-owned values |
 | --- | --- | --- |
+| `ci-park-lifecycle` | supported | generation-fenced deferral via `CIParkLifecycle`; refusal vocabulary pinned by internal/source/dispatch/cipark_test.go |
 | `discovery` | supported | task types `implement`/`followup-pr`; idle vs task |
 | `discovery-exclusions` | supported (opt-in) | `exclude_pr_fix_version=1`; descriptor `<repo>#<number>@<generation>`; limit **32**; max value length 300 |
 | `lifecycle-report` | supported | outcomes `ready`/`blocked`/`blocked-external`/`failed`/`handed-off`; `waiting-external` |
@@ -444,6 +446,7 @@ required methods but no optional interface.
 | --- | --- | --- |
 | `discovery` | supported | emits generic core signals; `protocol-error` reasons from its forge client |
 | `discovery-exclusions` | unsupported | no exclusion panel; `requested`/`limit` absent, not zero |
+| `ci-park-lifecycle` | unsupported | no CI park notice; a failing queued PR is reissued normally |
 | `lifecycle-report` | unsupported | no report-outcome signal; `CoderRun` status still records the local result |
 | `pre-launch-revalidation` | unsupported | no revalidation signal |
 | `work-identity` | unsupported (or supported) | identity churn is core-dedupe, not a connector diagnostic |

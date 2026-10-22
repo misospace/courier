@@ -1247,7 +1247,10 @@ func (c *HTTPClient) do(ctx context.Context, method, requestPath string, body an
 // identity outcome (§3.4), a report whose outcome the source rejects
 // reclassifies into ErrUnsupportedOutcome, and the hand-out ack endpoint's
 // known refusals are moot no-ops that AckHandout settles — counting their
-// 4xx classes here would fabricate failures for successful no-ops.
+// 4xx classes here would fabricate failures for successful no-ops. The CI
+// park family's coded refusals reclassify like the mark family: the caller
+// maps them into identity or stale-work outcomes (classifyCIRefusal) and
+// owns the diagnostic.
 func exchangeReclassified(method, requestPath string, apiErr *APIError) bool {
 	if method != http.MethodPost {
 		return false
@@ -1257,6 +1260,10 @@ func exchangeReclassified(method, requestPath string, apiErr *APIError) bool {
 	}
 	if requestPath == "/api/pr-fix-queue/ack" && apiErr.StatusCode >= http.StatusBadRequest && apiErr.StatusCode < http.StatusMultipleChoices {
 		return true
+	}
+	switch requestPath {
+	case "/api/pr-fix-queue/cipark", "/api/pr-fix-queue/cireserve", "/api/pr-fix-queue/cirepair":
+		return apiErr.StatusCode == http.StatusConflict
 	}
 	return strings.HasSuffix(requestPath, "/tasks/report") &&
 		apiErr.StatusCode == http.StatusBadRequest &&

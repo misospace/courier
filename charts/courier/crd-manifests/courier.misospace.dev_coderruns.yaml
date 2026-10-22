@@ -303,6 +303,44 @@ spec:
                 - attempt
                 - head
                 type: object
+              ciSettlement:
+                description: |-
+                  CISettlement is the fenced outcome whose delivery to the source is
+                  still outstanding (#475). It is recorded in the same status write that
+                  settles the attempt — before the report is attempted — so a lost
+                  response, a restart, or an unavailable source leaves durable retry
+                  intent on the run instead of a deferral nobody will ever release. The
+                  operator re-presents the record on later reconciles until the source
+                  accepts it — same fence, same idempotency key, so the source replays
+                  the committed transition — and clearing the record is the proof of
+                  delivery.
+                properties:
+                  fenceToken:
+                    description: |-
+                      FenceToken is the token the source issued when it reserved the repair
+                      attempt this settlement answers.
+                    minLength: 1
+                    type: string
+                  head:
+                    description: Head is the republished head when Result is repushed;
+                      empty otherwise.
+                    type: string
+                  result:
+                    allOf:
+                    - enum:
+                      - repushed
+                      - exhausted
+                      - unsupported
+                    - enum:
+                      - repushed
+                      - exhausted
+                      - unsupported
+                    description: Result is the outcome kind being reported.
+                    type: string
+                required:
+                - fenceToken
+                - result
+                type: object
               cipark:
                 description: |-
                   CIPark is the durable park-and-resume record while the run waits on
@@ -337,6 +375,29 @@ spec:
                 - attempts
                 - head
                 - parkedAt
+                type: object
+              ciparkDeferral:
+                description: |-
+                  CIParkDeferral is the park notice whose acceptance by the source is
+                  still outstanding (#475). It is recorded in the same status write that
+                  establishes the park — before the notice is attempted — so a lost
+                  response leaves durable retry intent instead of a duplicate-worker
+                  window nobody will ever close. The operator re-presents the notice on
+                  later reconciles while the repair opportunity is active, and drops it
+                  once that opportunity has ended: a late notice would defer the source
+                  against nothing.
+                properties:
+                  head:
+                    description: Head is the exact parked head the notice announced.
+                    minLength: 1
+                    type: string
+                  idempotencyKey:
+                    description: IdempotencyKey deduplicates the notice at the source.
+                    minLength: 1
+                    type: string
+                required:
+                - head
+                - idempotencyKey
                 type: object
               conditions:
                 description: Conditions is the standard condition set.

@@ -246,10 +246,22 @@ report so a connector that manages PR-fix queues can defer dispatch while a
 Courier repair opportunity is active and refuse stale generations instead of
 racing them. Sources that cannot fence must not implement the capability, and
 the core never emulates it with ordinary lifecycle calls. The capability is
-optional in use as well as in definition, and no source adapter implements it
-yet: an adapter without it parks and repairs all the same, and a connector
-whose own PR-fix dispatch it cannot defer may race the repair. A reservation
+optional in use as well as in definition, and an adapter without it parks and
+repairs all the same. The Dispatch connector implements it (#495): the park
+notice, reservation, and outcome ride generation-fenced `pr-fix-queue` routes
+with a required idempotency key, refusals fail closed with the existing
+`ErrSuperseded`/`ErrStaleWork` semantics, and work Dispatch cannot defer
+(implement and queue-less items) reports `ErrUnsupportedCIPark`. A reservation
 the source refuses on a superseded generation fails the run closed to handoff.
+A settled outcome the source has not accepted — a lost response, a restart, a
+report that never landed — stays pending on the run as durable retry intent:
+the fence travels with the record, later reconciles re-present it with the
+same idempotency key so the source replays the committed transition, and
+clearing the record is the proof of delivery. The park notice carries the
+same durability while the opportunity is active and expires with it — a late
+notice would defer the source against nothing. The ending itself never waits
+on the source. The contract still has no release for a deferral whose
+opportunity ends without a reservation; #534 tracks that extension.
 
 The coordinator declares its ending in the executor-provided outcome file,
 whose exact path is in the goal. The executor validates the declaration against

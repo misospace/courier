@@ -157,13 +157,25 @@ type OperatorPatch struct {
 	// and call ClearCIRepair to remove it.
 	// +optional
 	CIRepair *courierv1alpha1.CIRepairContext `json:"ciRepair,omitempty"`
+	// CISettlement is the operator-owned pending settlement record (#475). It
+	// follows the same clear semantics as CIRepair: assign the pointer to set
+	// the record and call ClearCISettlement to remove it.
+	// +optional
+	CISettlement *courierv1alpha1.CISettlement `json:"ciSettlement,omitempty"`
+	// CIParkDeferral is the operator-owned pending park-notice record (#475).
+	// It follows the same clear semantics as CIRepair: assign the pointer to
+	// set the record and call ClearCIParkDeferral to remove it.
+	// +optional
+	CIParkDeferral *courierv1alpha1.CIParkDeferral `json:"ciparkDeferral,omitempty"`
 
-	// clearCIPark and clearCIRepair distinguish a record the operator
-	// cleared from a record it never mentioned: only the former may be
-	// encoded as an explicit null, because an omitted key leaves the
-	// persisted record untouched.
-	clearCIPark   bool
-	clearCIRepair bool
+	// clearCIPark, clearCIRepair, clearCISettlement, and clearCIParkDeferral
+	// distinguish a record the operator cleared from a record it never
+	// mentioned: only the former may be encoded as an explicit null, because
+	// an omitted key leaves the persisted record untouched.
+	clearCIPark         bool
+	clearCIRepair       bool
+	clearCISettlement   bool
+	clearCIParkDeferral bool
 }
 
 // MarshalJSON encodes the operator patch. CIPark and CIRepair are nested
@@ -177,8 +189,10 @@ func (p OperatorPatch) MarshalJSON() ([]byte, error) {
 	type alias OperatorPatch
 	document := struct {
 		alias
-		CIPark   json.RawMessage `json:"cipark,omitempty"`
-		CIRepair json.RawMessage `json:"ciRepair,omitempty"`
+		CIPark         json.RawMessage `json:"cipark,omitempty"`
+		CIRepair       json.RawMessage `json:"ciRepair,omitempty"`
+		CISettlement   json.RawMessage `json:"ciSettlement,omitempty"`
+		CIParkDeferral json.RawMessage `json:"ciparkDeferral,omitempty"`
 	}{alias: alias(p)}
 	if p.CIPark != nil {
 		encoded, err := json.Marshal(p.CIPark)
@@ -198,6 +212,24 @@ func (p OperatorPatch) MarshalJSON() ([]byte, error) {
 	} else if p.clearCIRepair {
 		document.CIRepair = json.RawMessage("null")
 	}
+	if p.CISettlement != nil {
+		encoded, err := json.Marshal(p.CISettlement)
+		if err != nil {
+			return nil, fmt.Errorf("status: encode ciSettlement: %w", err)
+		}
+		document.CISettlement = encoded
+	} else if p.clearCISettlement {
+		document.CISettlement = json.RawMessage("null")
+	}
+	if p.CIParkDeferral != nil {
+		encoded, err := json.Marshal(p.CIParkDeferral)
+		if err != nil {
+			return nil, fmt.Errorf("status: encode ciparkDeferral: %w", err)
+		}
+		document.CIParkDeferral = encoded
+	} else if p.clearCIParkDeferral {
+		document.CIParkDeferral = json.RawMessage("null")
+	}
 	return json.Marshal(document)
 }
 
@@ -215,6 +247,22 @@ func (p *OperatorPatch) ClearCIPark() {
 func (p *OperatorPatch) ClearCIRepair() {
 	p.CIRepair = nil
 	p.clearCIRepair = true
+}
+
+// ClearCISettlement emits an explicit JSON null for the pending settlement
+// record, clearing it: a merge patch leaves an omitted nested object
+// untouched, so only null removes it.
+func (p *OperatorPatch) ClearCISettlement() {
+	p.CISettlement = nil
+	p.clearCISettlement = true
+}
+
+// ClearCIParkDeferral emits an explicit JSON null for the pending park-notice
+// record, clearing it: a merge patch leaves an omitted nested object
+// untouched, so only null removes it.
+func (p *OperatorPatch) ClearCIParkDeferral() {
+	p.CIParkDeferral = nil
+	p.clearCIParkDeferral = true
 }
 
 // SetControlRequest encodes one operator control request into the patch,

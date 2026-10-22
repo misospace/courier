@@ -12,6 +12,9 @@ package controller
 
 import (
 	"context"
+	"errors"
+	"reflect"
+	"strings"
 	"testing"
 	"time"
 
@@ -776,6 +779,19 @@ func (s *ciparkSource) ReportCIRepair(_ context.Context, item source.WorkItem, o
 	return nil
 }
 
+// unsupportedParkSource models a source whose park capability cannot defer
+// this run's work at all: the reserve reports source.ErrUnsupportedCIPark,
+// the sentinel a Dispatch adapter returns for implement and queue-less items.
+type unsupportedParkSource struct {
+	ciparkSource
+}
+
+func (s *unsupportedParkSource) ReserveCIRepair(ctx context.Context, item source.WorkItem, reservation source.CIRepairReservation) (source.CIRepairGrant, error) {
+	s.items = append(s.items, item)
+	s.reservations = append(s.reservations, reservation)
+	return source.CIRepairGrant{}, source.ErrUnsupportedCIPark
+}
+
 // TestEnvtestCIParkSourceCapability pins the optional source capability: a
 // source that implements it is told about the park, the reservation, and the
 // outcome, and a source that does not implement it still completes the run.
@@ -867,6 +883,422 @@ func TestEnvtestCIParkSourceCapability(t *testing.T) {
 			t.Fatalf("outcome result = %q, want %q", outcome.Result, source.CIRepairRepushed)
 		}
 	})
+
+	t.Run("a source that cannot defer the run finishes it", func(t *testing.T) {
+		adapter := &unsupportedParkSource{}
+		h := newCIParkHarness(t, "cipark-unsupported-reserve", ciparkPolicy(2), adapter)
+		h.park("sha-1", CheckObservation{Name: "build", State: CheckStatePending})
+		h.settleFailure("sha-1", "build")
+		if got := h.phase(); got != courierv1alpha1.PhaseHandedOff {
+			t.Fatalf("phase after the unsupported reservation = %q, want HandedOff", got)
+		}
+		parked := h.run()
+		if parked.Status.CIPark.LastOutcome != courierv1alpha1.CIParkOutcomeUnsupported {
+			t.Fatalf("park outcome = %q, want %q", parked.Status.CIPark.LastOutcome, courierv1alpha1.CIParkOutcomeUnsupported)
+		}
+		if len(adapter.reservations) != 1 {
+			t.Fatalf("reservations = %d, want exactly one (an unsupported reserve finishes the run, never retries)", len(adapter.reservations))
+		}
+	})
+}
+
+// flakySettlementSource models one lost report for the park notice and one
+// for the settlement. The default mode commits the report at the source and
+// loses only its response, so a replay must collapse into the committed
+// transition; lostBeforeCommit makes the first report of its kind fail
+// before the source records anything, so the replay is the first successful
+// delivery. Every report the source saw is recorded.
+type flakySettlementSource struct {
+	ciparkSource
+	noticeLostBeforeCommit     bool
+	settlementLostBeforeCommit bool
+	firstNoticeLost            bool
+	firstReportLost            bool
+}
+
+func (s *flakySettlementSource) ReportCIParked(ctx context.Context, item source.WorkItem, notice source.CIParkNotice) error {
+	s.items = append(s.items, item)
+	if !s.firstNoticeLost {
+		s.firstNoticeLost = true
+		if !s.noticeLostBeforeCommit {
+			s.parks = append(s.parks, notice)
+		}
+		return errors.New("dispatch server: response lost")
+	}
+	s.parks = append(s.parks, notice)
+	return nil
+}
+
+func (s *flakySettlementSource) ReportCIRepair(ctx context.Context, item source.WorkItem, outcome source.CIRepairOutcome) error {
+	s.items = append(s.items, item)
+	if !s.firstReportLost {
+		s.firstReportLost = true
+		if !s.settlementLostBeforeCommit {
+			s.outcomes = append(s.outcomes, outcome)
+		}
+		return errors.New("dispatch server: response lost")
+	}
+	s.outcomes = append(s.outcomes, outcome)
+	return nil
+}
+
+// TestEnvtestCIParkLostSettlementReplays pins the durable settlement: a
+// repair outcome whose report is lost — with the response lost after the
+// source committed it, or the report lost before it committed — leaves
+// durable retry intent on the run (the fence travels with the record), a
+// later reconcile re-presents it after a controller restart, and the source
+// ends up with the outcome delivered exactly once with the fence it issued.
+func TestEnvtestCIParkLostSettlementReplays(t *testing.T) {
+	if envtestClient == nil {
+		t.Skip("KUBEBUILDER_ASSETS is not set")
+	}
+	for name, lostBeforeCommit := range map[string]bool{
+		"response lost after commit": false,
+		"failure before commit":      true,
+	} {
+		lostBeforeCommit := lostBeforeCommit
+		t.Run(name, func(t *testing.T) {
+			adapter := &flakySettlementSource{settlementLostBeforeCommit: lostBeforeCommit}
+			h := newCIParkHarness(t, "cipark-lost-settlement-"+strings.ReplaceAll(name, " ", "-"), ciparkPolicy(2), adapter)
+			h.park("sha-1", CheckObservation{Name: "build", State: CheckStatePending})
+			h.settleFailure("sha-1", "build")
+			h.reconcile()
+			h.reconcile()
+			// The repair publishes nothing: the same red head is a settled
+			// failure with no progress, so the attempt ends as exhausted and
+			// the settlement carries the fence the reservation granted.
+			h.world.set(redObservation("sha-1", "build"))
+			h.reconcile()
+			if got := h.phase(); got != courierv1alpha1.PhaseHandedOff {
+				t.Fatalf("phase after the repair published nothing = %q, want HandedOff", got)
+			}
+			ended := h.run()
+			if ended.Status.CISettlement == nil {
+				t.Fatal("status.ciSettlement = nil after the lost report, want the pending settlement")
+			}
+			if ended.Status.CISettlement.Result != courierv1alpha1.CIParkOutcomeExhausted {
+				t.Fatalf("pending settlement result = %q, want exhausted", ended.Status.CISettlement.Result)
+			}
+			if ended.Status.CISettlement.FenceToken == "" {
+				t.Fatal("pending settlement fence token = empty, want the reserved fence")
+			}
+			// The retry re-presents the same settlement; the source accepts it
+			// once. A controller restart in between changes nothing: the
+			// pending settlement is durable intent on the run, and a fresh
+			// reconciler delivers it.
+			h.reconciler = h.newReconciler()
+			h.reconcile()
+			if got := h.phase(); got != courierv1alpha1.PhaseHandedOff {
+				t.Fatalf("phase after the settlement replay = %q, want HandedOff", got)
+			}
+			delivered := h.run()
+			if delivered.Status.CISettlement != nil {
+				t.Fatalf("status.ciSettlement = %#v after the replay, want nil (the clear is the proof of delivery)", delivered.Status.CISettlement)
+			}
+			wantOutcomes := 2
+			if lostBeforeCommit {
+				wantOutcomes = 1
+			}
+			if len(adapter.outcomes) != wantOutcomes {
+				t.Fatalf("source outcomes = %#v, want %d", adapter.outcomes, wantOutcomes)
+			}
+			if !lostBeforeCommit && !reflect.DeepEqual(adapter.outcomes[0], adapter.outcomes[1]) {
+				t.Fatalf("replayed outcome = %#v, want byte-identical to the committed one %#v (the same idempotency key collapses into one transition)", adapter.outcomes[1], adapter.outcomes[0])
+			}
+			outcome := adapter.outcomes[len(adapter.outcomes)-1]
+			if outcome.Result != source.CIRepairExhausted {
+				t.Fatalf("delivered outcome result = %q, want exhausted", outcome.Result)
+			}
+			if outcome.FenceToken == "" || outcome.IdempotencyKey == "" {
+				t.Fatalf("delivered outcome = %#v, want the fence and the stable idempotency key", outcome)
+			}
+			// The settled run stays settled: further reconciles spend no
+			// further attempt and re-deliver nothing.
+			h.reconcile()
+			settled := h.run()
+			if settled.Status.CIPark.Attempts != 1 {
+				t.Fatalf("park attempts = %d, want 1 (a settlement replay never wakes a coordinator)", settled.Status.CIPark.Attempts)
+			}
+			if len(adapter.outcomes) != wantOutcomes {
+				t.Fatalf("source outcomes = %d, want %d after a further reconcile", len(adapter.outcomes), wantOutcomes)
+			}
+		})
+	}
+}
+
+// TestEnvtestCIParkLostRepushSettlementReplays pins the durable settlement on
+// the repush path: the repushed outcome of a repair whose report is lost is
+// re-presented on the next observation before the loop decides anything
+// else, so the next reservation can never race a deferral the source still
+// holds.
+func TestEnvtestCIParkLostRepushSettlementReplays(t *testing.T) {
+	if envtestClient == nil {
+		t.Skip("KUBEBUILDER_ASSETS is not set")
+	}
+	adapter := &flakySettlementSource{}
+	h := newCIParkHarness(t, "cipark-lost-repush", ciparkPolicy(2), adapter)
+	h.park("sha-1", CheckObservation{Name: "build", State: CheckStatePending})
+	h.settleFailure("sha-1", "build")
+	h.reconcile()
+	h.reconcile()
+	// The repair publishes a new head: the repushed outcome's report is the
+	// one that gets lost.
+	h.publishHead("sha-2")
+	h.world.set(redObservation("sha-2", "build"))
+	h.reconcile()
+	parked := h.run()
+	if parked.Status.CISettlement == nil {
+		t.Fatal("status.ciSettlement = nil after the lost repush report, want the pending settlement")
+	}
+	if parked.Status.CISettlement.Result != courierv1alpha1.CIParkOutcomeRepushed {
+		t.Fatalf("pending settlement result = %q, want repushed", parked.Status.CISettlement.Result)
+	}
+	if parked.Status.CISettlement.Head != "sha-2" {
+		t.Fatalf("pending settlement head = %q, want the republished head sha-2", parked.Status.CISettlement.Head)
+	}
+	if parked.Status.CIPark.Head != "sha-2" {
+		t.Fatalf("park head = %q, want the republished head sha-2", parked.Status.CIPark.Head)
+	}
+	// The next observation delivers the pending settlement before the park
+	// loop decides on the run, and the loop continues on the repushed head.
+	// A controller restart in between changes nothing: the pending
+	// settlement is durable intent on the run.
+	h.reconciler = h.newReconciler()
+	h.world.set(greenObservation("sha-2", "build"))
+	h.reconcile()
+	h.reconcile()
+	if got := h.phase(); got != courierv1alpha1.PhaseAwaitingReview {
+		t.Fatalf("phase after the settled green observation = %q, want AwaitingReview", got)
+	}
+	if len(adapter.outcomes) != 2 {
+		t.Fatalf("source outcomes = %#v, want the committed repush report and its replay", adapter.outcomes)
+	}
+	if !reflect.DeepEqual(adapter.outcomes[0], adapter.outcomes[1]) {
+		t.Fatalf("replayed outcome = %#v, want byte-identical to the committed one %#v", adapter.outcomes[1], adapter.outcomes[0])
+	}
+	if adapter.outcomes[0].Result != source.CIRepairRepushed || adapter.outcomes[0].Head != "sha-2" {
+		t.Fatalf("delivered outcome = %#v, want the repushed outcome on sha-2", adapter.outcomes[0])
+	}
+	delivered := h.run()
+	if delivered.Status.CISettlement != nil {
+		t.Fatalf("status.ciSettlement = %#v after the replay, want nil", delivered.Status.CISettlement)
+	}
+}
+
+// TestEnvtestCIParkLostNoticeReplays pins the durable park notice: a park
+// notice whose response is lost leaves durable retry intent on the run, the
+// next reconcile re-presents it, and the source sees byte-identical notices
+// — the same deferral re-established, never double-booked — while the
+// repair cycle itself proceeds unchanged.
+func TestEnvtestCIParkLostNoticeReplays(t *testing.T) {
+	if envtestClient == nil {
+		t.Skip("KUBEBUILDER_ASSETS is not set")
+	}
+	for name, lostBeforeCommit := range map[string]bool{
+		"response lost after commit": false,
+		"failure before commit":      true,
+	} {
+		lostBeforeCommit := lostBeforeCommit
+		t.Run(name, func(t *testing.T) {
+			adapter := &flakySettlementSource{noticeLostBeforeCommit: lostBeforeCommit}
+			h := newCIParkHarness(t, "cipark-lost-notice-"+strings.ReplaceAll(name, " ", "-"), ciparkPolicy(2), adapter)
+			h.park("sha-1", CheckObservation{Name: "build", State: CheckStatePending})
+			parked := h.run()
+			if parked.Status.CIParkDeferral == nil {
+				t.Fatal("status.ciparkDeferral = nil after the lost notice, want the pending notice")
+			}
+			if parked.Status.CIParkDeferral.Head != "sha-1" {
+				t.Fatalf("pending notice head = %q, want the parked head sha-1", parked.Status.CIParkDeferral.Head)
+			}
+			if parked.Status.CIParkDeferral.IdempotencyKey == "" {
+				t.Fatal("pending notice idempotency key = empty, want a stable key")
+			}
+			// The retry re-presents the same notice; the source accepts it
+			// once. A controller restart in between changes nothing: the
+			// pending notice is durable intent on the run, and a fresh
+			// reconciler delivers it.
+			h.reconciler = h.newReconciler()
+			h.reconcile()
+			if got := h.phase(); got != courierv1alpha1.PhaseVerifying {
+				t.Fatalf("phase after the notice replay = %q, want Verifying (the run stays parked)", got)
+			}
+			wantNotices := 2
+			if lostBeforeCommit {
+				wantNotices = 1
+			}
+			if len(adapter.parks) != wantNotices {
+				t.Fatalf("source park notices = %#v, want %d", adapter.parks, wantNotices)
+			}
+			if !lostBeforeCommit && !reflect.DeepEqual(adapter.parks[0], adapter.parks[1]) {
+				t.Fatalf("replayed notice = %#v, want byte-identical to the committed one %#v (the same idempotency key re-establishes one deferral)", adapter.parks[1], adapter.parks[0])
+			}
+			if adapter.parks[len(adapter.parks)-1].Head != "sha-1" {
+				t.Fatalf("delivered notice head = %q, want sha-1", adapter.parks[len(adapter.parks)-1].Head)
+			}
+			delivered := h.run()
+			if delivered.Status.CIParkDeferral != nil {
+				t.Fatalf("status.ciparkDeferral = %#v after the replay, want nil (the clear is the proof of delivery)", delivered.Status.CIParkDeferral)
+			}
+			// The repair cycle is unaffected: a settled failure still wakes
+			// exactly one bounded repair.
+			h.settleFailure("sha-1", "build")
+			if got := h.phase(); got != courierv1alpha1.PhaseClaimed {
+				t.Fatalf("phase after the settled failure = %q, want Claimed", got)
+			}
+			h.reconcile()
+			if got := h.phase(); got != courierv1alpha1.PhaseRunning {
+				t.Fatalf("phase after the resumed launch = %q, want Running", got)
+			}
+			if got := h.launchCount(h.name); got != 2 {
+				t.Fatalf("launches = %d, want 2 (the initial launch and one repair)", got)
+			}
+		})
+	}
+}
+
+// refusingParkSource models a source whose adapter implements the park
+// capability but whose work the source cannot defer at all: the lifecycle
+// reports are refused permanently with source.ErrUnsupportedCIPark, the
+// sentinel a Dispatch adapter returns for implement and queue-less items.
+// A refusal is permanent, so the source never records one.
+type refusingParkSource struct {
+	ciparkSource
+	noticeRefused     bool
+	settlementRefused bool
+}
+
+func (s *refusingParkSource) ReportCIParked(ctx context.Context, item source.WorkItem, notice source.CIParkNotice) error {
+	if s.noticeRefused {
+		return source.ErrUnsupportedCIPark
+	}
+	return s.ciparkSource.ReportCIParked(ctx, item, notice)
+}
+
+func (s *refusingParkSource) ReportCIRepair(ctx context.Context, item source.WorkItem, outcome source.CIRepairOutcome) error {
+	if s.settlementRefused {
+		return source.ErrUnsupportedCIPark
+	}
+	return s.ciparkSource.ReportCIRepair(ctx, item, outcome)
+}
+
+// TestEnvtestCIParkUnsupportedNoticeStopsRetrying pins the permanent refusal:
+// a park notice refused with source.ErrUnsupportedCIPark drops the pending
+// notice instead of retrying forever, so the run's own park loop stays
+// reachable and the window can still hand the run off.
+func TestEnvtestCIParkUnsupportedNoticeStopsRetrying(t *testing.T) {
+	if envtestClient == nil {
+		t.Skip("KUBEBUILDER_ASSETS is not set")
+	}
+	adapter := &refusingParkSource{noticeRefused: true}
+	h := newCIParkHarness(t, "cipark-unsupported-notice", &courierv1alpha1.CIRepairPolicy{
+		MechanicalChecks:         []string{"build"},
+		MaxAttempts:              1,
+		ObservationWindowSeconds: 60,
+	}, adapter)
+	now := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	h.reconciler.Now = func() time.Time { return now }
+	h.park("sha-1", CheckObservation{Name: "build", State: CheckStatePending})
+	parked := h.run()
+	if parked.Status.CIParkDeferral != nil {
+		t.Fatalf("status.ciparkDeferral = %#v after the permanent refusal, want nil (nothing is owed)", parked.Status.CIParkDeferral)
+	}
+	if len(adapter.parks) != 0 {
+		t.Fatalf("source park notices = %d, want 0 (a permanent refusal is never recorded)", len(adapter.parks))
+	}
+	// The park loop is reachable again: the window expires and hands off
+	// instead of the delivery hook holding the run parked forever.
+	now = now.Add(2 * time.Minute)
+	h.reconcile()
+	if got := h.phase(); got != courierv1alpha1.PhaseHandedOff {
+		t.Fatalf("phase after the park window closed = %q, want HandedOff", got)
+	}
+	if len(adapter.parks) != 0 {
+		t.Fatalf("source park notices = %d, want 0 after further reconciles", len(adapter.parks))
+	}
+}
+
+// TestEnvtestCIParkUnsupportedSettlementStopsRetrying pins the permanent
+// refusal on the settlement path: a fenced outcome refused with
+// source.ErrUnsupportedCIPark drops the pending settlement instead of
+// retrying forever behind a terminal run.
+func TestEnvtestCIParkUnsupportedSettlementStopsRetrying(t *testing.T) {
+	if envtestClient == nil {
+		t.Skip("KUBEBUILDER_ASSETS is not set")
+	}
+	adapter := &refusingParkSource{settlementRefused: true}
+	h := newCIParkHarness(t, "cipark-unsupported-settlement", ciparkPolicy(2), adapter)
+	h.park("sha-1", CheckObservation{Name: "build", State: CheckStatePending})
+	h.settleFailure("sha-1", "build")
+	h.reconcile()
+	h.reconcile()
+	// The repair publishes nothing: the attempt ends as exhausted, and the
+	// settlement carries the fence the reservation granted.
+	h.world.set(redObservation("sha-1", "build"))
+	h.reconcile()
+	if got := h.phase(); got != courierv1alpha1.PhaseHandedOff {
+		t.Fatalf("phase after the repair published nothing = %q, want HandedOff", got)
+	}
+	ended := h.run()
+	if ended.Status.CISettlement != nil {
+		t.Fatalf("status.ciSettlement = %#v after the permanent refusal, want nil (nothing is owed)", ended.Status.CISettlement)
+	}
+	if len(adapter.outcomes) != 0 {
+		t.Fatalf("source outcomes = %d, want 0 (a permanent refusal is never recorded)", len(adapter.outcomes))
+	}
+	// The terminal run stays terminal: no reconcile re-presents anything.
+	h.reconcile()
+	settled := h.run()
+	if got := settled.Status.Phase; got != courierv1alpha1.PhaseHandedOff {
+		t.Fatalf("phase after a further reconcile = %q, want HandedOff", got)
+	}
+	if settled.Status.CISettlement != nil {
+		t.Fatalf("status.ciSettlement = %#v after a further reconcile, want nil", settled.Status.CISettlement)
+	}
+}
+
+// failingNoticeSource fails every park notice with an ordinary — retryable,
+// never-permanent — error, modeling a source that answers but never accepts
+// the notice.
+type failingNoticeSource struct {
+	ciparkSource
+}
+
+func (s *failingNoticeSource) ReportCIParked(ctx context.Context, item source.WorkItem, notice source.CIParkNotice) error {
+	return errors.New("dispatch server: unavailable")
+}
+
+// TestEnvtestCIParkFailingNoticeNeverBlocksTheWindow pins the park loop's
+// liveness against its own reporting: a park notice that keeps failing with
+// ordinary errors is retried on the run's own cadence and never preempts the
+// observation window, so a source that never accepts the notice still hands
+// the run back when the window closes.
+func TestEnvtestCIParkFailingNoticeNeverBlocksTheWindow(t *testing.T) {
+	if envtestClient == nil {
+		t.Skip("KUBEBUILDER_ASSETS is not set")
+	}
+	adapter := &failingNoticeSource{}
+	h := newCIParkHarness(t, "cipark-failing-notice", &courierv1alpha1.CIRepairPolicy{
+		MechanicalChecks:         []string{"build"},
+		MaxAttempts:              1,
+		ObservationWindowSeconds: 60,
+	}, adapter)
+	now := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	h.reconciler.Now = func() time.Time { return now }
+	h.park("sha-1", CheckObservation{Name: "build", State: CheckStatePending})
+	parked := h.run()
+	if parked.Status.CIParkDeferral == nil {
+		t.Fatal("status.ciparkDeferral = nil while the notice keeps failing, want the pending notice")
+	}
+	// The window closes while the notice is still undelivered: the retry
+	// must not hold the run parked past it.
+	now = now.Add(2 * time.Minute)
+	h.reconcile()
+	if got := h.phase(); got != courierv1alpha1.PhaseHandedOff {
+		t.Fatalf("phase after the park window closed = %q, want HandedOff", got)
+	}
+	if len(adapter.parks) != 0 {
+		t.Fatalf("source park notices = %d, want 0 (the source never accepted one)", len(adapter.parks))
+	}
 }
 
 // TestEnvtestCIParkObservationWindowExpires pins the bounded park wait: a

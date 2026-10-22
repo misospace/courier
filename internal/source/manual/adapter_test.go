@@ -63,6 +63,7 @@ func TestManualCapabilityCatalogue(t *testing.T) {
 		connector.CapabilityDiscoveryExclusions:   connector.CapabilityUnsupported,
 		connector.CapabilityLifecycleReport:       connector.CapabilityUnsupported,
 		connector.CapabilityPreLaunchRevalidation: connector.CapabilityUnsupported,
+		connector.CapabilityCIParkLifecycle:       connector.CapabilityUnsupported,
 		connector.CapabilityWorkIdentity:          connector.CapabilityUnsupported,
 		connector.CapabilityAvailability:          connector.CapabilitySupported,
 	}
