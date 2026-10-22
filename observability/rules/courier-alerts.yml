@@ -149,7 +149,7 @@ groups:
             recent run.exit events for a common cause.
       - alert: CourierLifecycleReportsStuck
         expr: |
-          (courier_coderuns_lifecycle_pending > 0)
+          (courier_coderuns_lifecycle_pending >= 2)
           and on(lane) (courier_coderuns_lifecycle_pending_oldest_age_seconds > 1800)
         for: 15m
         labels:
@@ -162,9 +162,12 @@ groups:
             courier_coderuns_lifecycle_pending_oldest_age_seconds. The 15m sustained window
             plus the 30m age floor is the retry-cadence-plus-headroom floor: reports
             legitimately retry, so a report still unsettled well past it indicates a broken
-            source contract or credentials. The pending gauge mirrors the reaper's hold
-            gate, so this backlog also delays reaping of the retained runs. Inspect the
-            source report path and the LifecycleReported reason.
+            source contract or credentials. The absolute floor (at least 2 pending
+            reports) keeps a single slow report from paging; one report stuck past the
+            age floor stays visible on the pending-reports panel without firing. The
+            pending gauge mirrors the reaper's hold gate, so this backlog also delays
+            reaping of the retained runs. Inspect the source report path and the
+            LifecycleReported reason.
       - alert: CourierTerminalDiagnosticConcentration
         expr: |
           increase(courier_coderun_terminal_diagnostics_total{category!="unknown"}[1h]) > 5

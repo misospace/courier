@@ -738,6 +738,22 @@ func TestAlertScenarios(t *testing.T) {
 		assertSilent(t, evalAt(t, drained, exprFor(t, "CourierLifecycleReportsStuck"), 300*time.Second))
 	})
 
+	t.Run("A5 single slow report stays silent below the absolute floor", func(t *testing.T) {
+		st := loadStorage(t, `load 30s
+  courier_coderuns_lifecycle_pending{lane="main"} 1x44
+  courier_coderuns_lifecycle_pending_oldest_age_seconds{lane="main"} 2000x44
+`)
+		assertSilent(t, evalAt(t, st, exprFor(t, "CourierLifecycleReportsStuck"), 300*time.Second))
+	})
+
+	t.Run("A5 backlog younger than the age floor stays silent", func(t *testing.T) {
+		st := loadStorage(t, `load 30s
+  courier_coderuns_lifecycle_pending{lane="main"} 2x44
+  courier_coderuns_lifecycle_pending_oldest_age_seconds{lane="main"} 900x44
+`)
+		assertSilent(t, evalAt(t, st, exprFor(t, "CourierLifecycleReportsStuck"), 300*time.Second))
+	})
+
 	t.Run("A6 diagnostic concentration fires above threshold", func(t *testing.T) {
 		st := loadStorage(t, `load 30s
   courier_coderun_terminal_diagnostics_total{lane="main",mode="resolve",category="kubernetes-failure"} 0+1x44
