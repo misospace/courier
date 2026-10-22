@@ -529,16 +529,17 @@ paths share acceptance, not implementation.
   enforces — is the single open, non-draft PR whose full base/head
   identity matches — the pinned fork head when COURIER_HEAD_REPO
   points at a fork — and whose base ref equals COURIER_BASE carries
-  the run's published commit. The wrong-base, draft, missing,
-  ambiguous, closed-or-merged-only, foreign-head, unpublished, and
-  not-the-pinned-PR worlds all fail closed to `NeedsHuman`: a pull
-  request on the run's head that is not the pinned assignment is
-  never adopted in its place, a draft pinned PR is a settled-by-human
-  anomaly (no readying continuation), a missing pinned PR is never
-  replaced (the executor neither opens a duplicate nor adopts
-  another PR), and a failed read retries inside the bounded budget
-  with an unverified message that names the pinned identity rather
-  than a source issue; only at exhaustion (or when no captured
+  the run's published commit; a fix-pr run that cannot name its pinned
+  pull request fails closed at configuration instead. The wrong-base,
+  draft, missing, ambiguous, closed-or-merged-only, foreign-head,
+  unpublished, and not-the-pinned-PR worlds all fail closed to
+  `NeedsHuman`: a pull request on the run's head that is not the
+  pinned assignment is never adopted in its place, a draft pinned PR is
+  a settled-by-human anomaly (no readying continuation), a missing
+  pinned PR is never replaced (the executor neither opens a duplicate
+  nor adopts another PR), and a failed read retries inside the bounded
+  budget with an unverified message that names the pinned identity
+  rather than a source issue; only at exhaustion (or when no captured
   session can be resumed) does a transient forge outage still end
   `blocked_external` for the operator's bounded retry, like the
   resolve-issue branch.

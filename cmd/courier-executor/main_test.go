@@ -2804,6 +2804,42 @@ func TestReadConfigFixPRRequiresHeadRepo(t *testing.T) {
 	}
 }
 
+// TestReadConfigFixPRRequiresPinnedReference pins the #517 admission
+// invariant: a fix-pr run is admitted against one pinned pull request, so
+// a run that cannot name it fails closed at configuration instead of
+// reaching a Verifying handoff whose pinned-PR verification it can never
+// perform.
+func TestReadConfigFixPRRequiresPinnedReference(t *testing.T) {
+	base := map[string]string{
+		"COURIER_REPO_URL":  "https://git.example/acme/widgets.git",
+		"COURIER_BRANCH":    "fix/pr-12",
+		"COURIER_GOAL":      "goal",
+		"COURIER_MODEL":     "model",
+		"COURIER_MODE":      "fix-pr",
+		"COURIER_REPO":      "acme/widgets",
+		"COURIER_HEAD_REPO": "octocat/widgets",
+	}
+	for _, ref := range []string{"", "0", "PR-12"} {
+		values := map[string]string{}
+		for name, value := range base {
+			values[name] = value
+		}
+		values["COURIER_REF"] = ref
+		_, err := readConfig(func(name string) string { return values[name] })
+		if err == nil || !strings.Contains(err.Error(), "COURIER_REF") {
+			t.Fatalf("readConfig() error = %v for COURIER_REF %q, want missing pinned pull request reference for fix-pr", err, ref)
+		}
+	}
+	values := map[string]string{}
+	for name, value := range base {
+		values[name] = value
+	}
+	values["COURIER_REF"] = "12"
+	if _, err := readConfig(func(name string) string { return values[name] }); err != nil {
+		t.Fatalf("readConfig() error = %v, want a pinned pull request reference to admit the fix-pr run", err)
+	}
+}
+
 func TestRunResolveIssueFailsWhenGitHubErrors(t *testing.T) {
 	root := t.TempDir()
 	remote := remoteWithExistingBranch(t, root)
@@ -7342,8 +7378,10 @@ func TestFixPRHandoffMessages(t *testing.T) {
 		`branch "fix/gallery-feedback/502" on head octocat/widgets-fork`,
 		"GitHub API returned HTTP 500",
 		"this is not proof that the pinned pull request is missing",
+		"the pinned pull request #502",
 		"open, non-draft pull request",
 		`base "main"`,
+		"is not the pinned assignment",
 		"Do not adopt another repository's pull request",
 		"do not change an existing pull request's base or head",
 		"declare blocked_external",
@@ -7410,6 +7448,19 @@ func TestFixPRHandoffMessages(t *testing.T) {
 	} {
 		if !strings.Contains(mismatch, want) {
 			t.Fatalf("pinned-PR-number-mismatch reason lost %q: %q", want, mismatch)
+		}
+	}
+
+	unsettled := report.fixPRUnsettledReason(&handoffCheckOutcome{pr: &prLinkageObservation{Number: 513}})
+	for _, want := range []string{
+		"did not settle a known pull-request world",
+		"observed pull request #513",
+		"fix/gallery-feedback/502",
+		"will not hand off over a pull request it did not settle",
+		"the run needs a human",
+	} {
+		if !strings.Contains(unsettled, want) {
+			t.Fatalf("fix-pr unsettled reason lost %q: %q", want, unsettled)
 		}
 	}
 }
