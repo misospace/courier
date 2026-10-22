@@ -31,3 +31,18 @@ func bootstrapContractState(ctx context.Context, dir, baseRev, headRev string) (
 	}
 	return devenv.Classify(ctx, read, baseOID, headRev)
 }
+
+// approvedContractSkipReason is the workspace.bootstrap receipt reason for an
+// approved contract: the legacy executor is credential-bearing and never
+// executes repository contract content, so the verdict is always a skip —
+// but the receipt names whether the runtime environment could provision the
+// contract's tools at all, so an operator selecting an unprovisioned image
+// sees the missing mise executable before model work rather than a mid-run
+// tool hunt.
+func approvedContractSkipReason(misePresent bool) string {
+	reason := "bootstrap contract approved but not executed: the legacy executor is credential-bearing; the approved bootstrap runs only in the secure worker topology"
+	if !misePresent {
+		reason += "; the runtime environment has no mise executable on PATH"
+	}
+	return reason
+}

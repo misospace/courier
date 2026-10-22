@@ -59,16 +59,16 @@ func (s *SecureControl) LaunchSecure(ctx context.Context, run *courier.CoderRun)
 	if err := s.ensureFinalizer(ctx, run); err != nil {
 		return ctrl.Result{}, err
 	}
-	// The sizing is resolved once for the lane-sized pods this pass renders:
-	// the preflight proof and the control, worker, and broker pods created
-	// below carry the same value, so a concurrent lane update cannot make the
-	// admitted spec differ from the created one. Probe pods carry their own
-	// fixed sizing on both paths.
-	resources, err := s.laneResources(ctx, run)
+	// The sizing and worker image are resolved once for the lane-sized pods
+	// this pass renders: the preflight proof and the control, worker, and
+	// broker pods created below carry the same values, so a concurrent lane
+	// update cannot make the admitted spec differ from the created one. Probe
+	// pods carry their own fixed sizing on both paths.
+	spec, err := s.laneLaunchSpec(ctx, run)
 	if err != nil {
 		return ctrl.Result{}, err
 	}
-	if err := s.Preflight(ctx, run, policy, relaunch, resources); err != nil {
+	if err := s.Preflight(ctx, run, policy, relaunch, spec.resources, spec.workerImage); err != nil {
 		return ctrl.Result{}, err
 	}
 
@@ -105,7 +105,7 @@ func (s *SecureControl) LaunchSecure(ctx context.Context, run *courier.CoderRun)
 		if err != nil {
 			return ctrl.Result{}, err
 		}
-		pod, err := topology.BrokerPod(run, s.Config.HarnessImage, registration.Projection(), string(controlSA.UID), resources)
+		pod, err := topology.BrokerPod(run, s.Config.HarnessImage, registration.Projection(), string(controlSA.UID), spec.resources)
 		if err != nil {
 			return ctrl.Result{}, err
 		}
@@ -158,7 +158,7 @@ func (s *SecureControl) LaunchSecure(ctx context.Context, run *courier.CoderRun)
 		if err != nil {
 			return ctrl.Result{}, err
 		}
-		workerPod, err = topology.WorkerPod(run, s.Config.HarnessImage, incarnation, publicKey, cache, resources)
+		workerPod, err = topology.WorkerPod(run, spec.workerImage, incarnation, publicKey, cache, spec.resources)
 		if err != nil {
 			return ctrl.Result{}, err
 		}
@@ -217,7 +217,7 @@ func (s *SecureControl) LaunchSecure(ctx context.Context, run *courier.CoderRun)
 			WorkerURL:             "http://" + topology.WorkerServiceDNS(run.Namespace, run.Name) + ":" + fmt.Sprint(topology.WorkerPort),
 			BrokerURL:             "https://" + topology.BrokerServiceDNS(run.Namespace, run.Name) + ":8443",
 			BrokerStatusURL:       "https://" + topology.BrokerServiceDNS(run.Namespace, run.Name) + ":8444",
-			Resources:             resources,
+			Resources:             spec.resources,
 		})
 		if err != nil {
 			return ctrl.Result{}, err
@@ -251,24 +251,42 @@ func (s *SecureControl) controlInvocation(ctx context.Context, run *courier.Code
 	return invocation, nil
 }
 
-// laneResources reads the pod sizing the run's lane configures. Every
-// lane-sized pod of the secure topology carries it — control, worker, and
-// broker; probe pods deliberately carry their own fixed sizing instead — so a
-// lane that configures nothing still renders the built-in default rather than
-// a BestEffort pod. Read once per pass and reused across the round's renders.
-func (s *SecureControl) laneResources(ctx context.Context, run *courier.CoderRun) (corev1.ResourceRequirements, error) {
+// laneLaunchSpec is the lane-resolved execution environment one launch pass
+// renders: the pod sizing and the worker image.
+type laneLaunchSpec struct {
+	resources corev1.ResourceRequirements
+	// workerImage is the operator-approved execution-environment seam: the
+	// lane's RuntimeImage when set, the deployment harness image otherwise.
+	// It selects the WORKER image only — control and broker always render
+	// the deployment HarnessImage, because they carry Courier's trusted
+	// binaries and fixed trust contracts, while the worker is the untrusted
+	// execution environment the lane sizes. A selected image must carry
+	// /usr/local/bin/courier-worker; the published harness-go image is the
+	// shipped contract that layers the harness binaries onto the Go
+	// toolchain base.
+	workerImage string
+}
+
+// laneLaunchSpec reads the run's lane and resolves the sizing and worker
+// image every lane-sized pod of this pass carries. Read once per pass and
+// reused across the round's renders and the preflight proof.
+func (s *SecureControl) laneLaunchSpec(ctx context.Context, run *courier.CoderRun) (laneLaunchSpec, error) {
 	lane := &courier.LaneProfile{}
 	if err := s.Client.Get(ctx, types.NamespacedName{Namespace: run.Namespace, Name: run.Spec.Lane}, lane); err != nil {
-		return corev1.ResourceRequirements{}, fmt.Errorf("secure topology: read lane profile %q: %w", run.Spec.Lane, err)
+		return laneLaunchSpec{}, fmt.Errorf("secure topology: read lane profile %q: %w", run.Spec.Lane, err)
 	}
 	// A lane whose CPU/memory sizing could never launch — negative or zero
 	// quantities — is a permanent configuration error the lane's author must
 	// fix: fail here, before any pod is rendered or created, rather than
 	// mid-provisioning on a spec the API server rejects.
 	if err := lane.Spec.ValidateResources(); err != nil {
-		return corev1.ResourceRequirements{}, secureNeedsHuman(laneConfigReason, "lane profile %q: %v", lane.Name, err)
+		return laneLaunchSpec{}, secureNeedsHuman(laneConfigReason, "lane profile %q: %v", lane.Name, err)
 	}
-	return lane.Spec.EffectiveResources(), nil
+	image := strings.TrimSpace(lane.Spec.RuntimeImage)
+	if image == "" {
+		image = s.Config.HarnessImage
+	}
+	return laneLaunchSpec{resources: lane.Spec.EffectiveResources(), workerImage: image}, nil
 }
 
 type gatewayConfig struct {

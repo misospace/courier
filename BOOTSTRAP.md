@@ -21,7 +21,9 @@ The image selected with `--executor-image` must contain:
 - the `opencode` binary;
 - process-tree utilities `ps`, `pgrep`, and `pkill` (the OpenCode runtime's
   subprocess preflight refuses tree-owning launches when they are missing,
-  so a runtime image without them fails launches outright); and
+  so a runtime image without them fails launches outright);
+- a `mise` executable (the repository development bootstrap contract runs
+  `mise run bootstrap`; the published images pin it at build time); and
 - any OpenCode configuration needed to reach the models named by a
   `LaneProfile`.
 
@@ -63,6 +65,20 @@ spec:
 
 The image deliberately does not require the `gh` CLI. Forge operations use the
 configured forge capability; `git` remains the local repository transport.
+
+`spec.runtimeImage` also selects the secure worker's image: the control and
+broker pods always render the deployment `--harness-image` (they carry
+Courier's trusted binaries), while the worker — the untrusted execution
+environment — renders the lane's image when set. A secure worker image must
+carry `/usr/local/bin/courier-worker`; Courier publishes
+`ghcr.io/misospace/courier-harness-go:<version>` as the secure Go toolchain
+option, layering the harness binaries onto the same toolchain base as
+`courier-go`, so one lane selection provisions both execution modes:
+
+```yaml
+spec:
+  runtimeImage: ghcr.io/misospace/courier-harness-go:<release version>
+```
 
 Where this repository's own tests run — a contributor host or a lane toolchain
 image — `git` must be >= 2.41 (see README Prerequisites): `internal/harness`

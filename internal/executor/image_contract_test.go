@@ -142,6 +142,75 @@ func TestCoordinatorGoDockerfilePinsToolchainCachePath(t *testing.T) {
 	}
 }
 
+// coordinatorStage returns the Dockerfile text of the bootstrap coordinator
+// stage: everything from its FROM line to the next FROM.
+func coordinatorStage(t *testing.T, dockerfile string) string {
+	t.Helper()
+	stageStart := strings.Index(dockerfile, "AS coordinator\n")
+	if stageStart < 0 {
+		t.Fatal("Dockerfile does not define the coordinator stage")
+	}
+	stage := dockerfile[stageStart:]
+	stageEnd := strings.Index(stage, "\nFROM ")
+	if stageEnd < 0 {
+		stageEnd = len(stage)
+	}
+	return stage[:stageEnd]
+}
+
+// The repository development bootstrap contract (#414) dispatches
+// `mise run bootstrap`; the runtime images must ship a pinned mise binary
+// downloaded at build time with checksum verification — never fetched at
+// runtime.
+func TestCoordinatorDockerfileShipsPinnedMise(t *testing.T) {
+	data, err := os.ReadFile(filepath.Join("..", "..", "Dockerfile"))
+	if err != nil {
+		t.Fatalf("read Dockerfile: %v", err)
+	}
+	stage := coordinatorStage(t, string(data))
+	if !strings.Contains(stage, "ARG MISE_VERSION=") {
+		t.Fatal("coordinator stage does not pin a MISE_VERSION")
+	}
+	if !strings.Contains(stage, "sha256sum -c -") ||
+		!strings.Contains(stage, "mise-") {
+		t.Fatal("coordinator stage does not verify a downloaded mise binary against a pinned checksum")
+	}
+	if !strings.Contains(stage, "install -m 0755 /tmp/mise /usr/local/bin/mise") {
+		t.Fatal("coordinator stage does not install mise to /usr/local/bin/mise")
+	}
+}
+
+// The harness-go stage is the secure path's Go toolchain contract: the
+// harness binaries on the coordinator-go base, so a lane that selects a Go
+// runtime provisions its secure workers with the same pinned toolchain as
+// legacy lanes.
+func TestHarnessGoDockerfileLayersBinariesOnToolchainBase(t *testing.T) {
+	data, err := os.ReadFile(filepath.Join("..", "..", "Dockerfile"))
+	if err != nil {
+		t.Fatalf("read Dockerfile: %v", err)
+	}
+	dockerfile := string(data)
+	stageStart := strings.Index(dockerfile, "FROM coordinator-go AS harness-go")
+	if stageStart < 0 {
+		t.Fatal("Dockerfile does not define the harness-go stage on the coordinator-go base")
+	}
+	stage := dockerfile[stageStart:]
+	stageEnd := strings.Index(stage, "\nFROM ")
+	if stageEnd < 0 {
+		stageEnd = len(stage)
+	}
+	stage = stage[:stageEnd]
+
+	for _, binary := range []string{"courier-control", "courier-worker", "courier-broker"} {
+		if !strings.Contains(stage, "/usr/local/bin/"+binary) {
+			t.Fatalf("harness-go stage does not copy %s", binary)
+		}
+	}
+	if !strings.Contains(stage, "USER 65532:65532") {
+		t.Fatal("harness-go stage does not select the numeric 65532:65532 user")
+	}
+}
+
 func TestCoordinatorImageScratchBoundary(t *testing.T) {
 	image := os.Getenv("COURIER_COORDINATOR_IMAGE")
 	if image == "" {

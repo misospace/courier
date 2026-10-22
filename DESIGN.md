@@ -1279,6 +1279,16 @@ unparsed-bash reachability matches the pre-change baseline (no new hole).
 This is bootstrap ergonomics for the pinned runtime, distinct from the #136
 secure dependency cache.
 
+The secure topology's worker pod carries the identical contract: the same
+per-run `emptyDir` mounted read-write at the cache path and read-only at the
+reference twin, with `COURIER_TOOLCHAIN_DIR` in the worker environment. These
+are **per-pod scratch caches**: the emptyDir is recreated with the pod, so a
+cache warms only within one run's lifetime, and durable shared writable
+storage remains deliberately out of scope (#415). The mounts cannot shadow
+baked tool installations: tools install outside both cache paths
+(`/usr/local/go`, `/usr/local/bin`), and the image contract tests pin that
+separation.
+
 #### Dispatch binding identity
 
 Dispatch discovery bindings all persist `spec.source: dispatch`; the optional,
@@ -1410,14 +1420,17 @@ and the legacy executor's classification through `internal/devenv`:
   compaction, with diagnostic values validated to a fixed key set and a
   printable-ASCII charset.
 
-mise provisioning for the runtime images is #415's coordinated work; until
-it lands, an approved contract on an unprovisioned environment ends
-deterministically blocked-external naming the missing mise executable. The
-same holds for the tool artifacts a contract installs: the secure worker's
-dependency-egress policy admits no arbitrary fetch, so a secure-mode
-contract is expected to be pre-materialized in the provisioned image —
-runtime downloads are not an affordance either topology grants, and their
-absence is the same honest blocker, not an egress bypass.
+Every runtime image ships a pinned `mise` binary downloaded with checksum
+verification at build time — never fetched at runtime — so the approved
+contract above executes on provisioned images, and the tool versions it
+installs stay pinned by the repository's committed lockfile. Only an
+operator-selected worker image without mise ends deterministically
+blocked-external naming the missing mise executable; the same holds for the
+tool artifacts a contract installs: the secure worker's dependency-egress
+policy admits no arbitrary fetch, so a secure-mode contract is expected to be
+pre-materialized in the provisioned image — runtime downloads are not an
+affordance either topology grants, and their absence is the same honest
+blocker, not an egress bypass.
 
 Two cost/trust properties are deliberate. The secure workspace is
 re-materialized from a fresh snapshot for every coordinator shell command
@@ -1713,7 +1726,16 @@ spec:
 `runtimeImage` is an optional execution-environment selector. It is an image
 capability seam, not a Go or Kubernetes requirement: a lane can select a
 repository-specific image containing whatever tools its workflow needs, while
-the deployment default remains the minimal bootstrap image.
+the deployment default remains the minimal bootstrap image. Its reach is
+mode-specific. On the legacy path it selects the coordinator pod's image
+directly. On the secure path it selects the **worker** image only — the
+untrusted execution environment the lane sizes — while the control and broker
+pods always render the deployment `--harness-image`, because they carry
+Courier's trusted binaries and fixed trust contracts. A secure worker image
+selected this way must carry `/usr/local/bin/courier-worker`; the published
+`courier-harness-go` image is the shipped contract that layers the harness
+binaries onto the Go toolchain base, so one lane image selection provisions
+both modes with the same pinned toolchain.
 
 `resources` is the lane's pod sizing, and the only source of the lane-sized
 pods' sizing. The lane's vocabulary is a deliberate subset of

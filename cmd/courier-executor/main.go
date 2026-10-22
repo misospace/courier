@@ -1256,9 +1256,14 @@ func run(ctx context.Context, stdout, stderr io.Writer) int {
 		// run continues unbootstrapped — exactly like the absent and
 		// modified branches — and the secure worker topology owns
 		// execution. No exec, no environment application, no termination.
+		// The receipt still names whether the environment could provision
+		// the contract's tools at all, so an underprovisioned runtime image
+		// is visible before model work instead of surfacing as a mid-run
+		// missing-tool hunt.
+		_, miseErr := exec.LookPath("mise")
 		report.eventVerbose(courierlog.EventWorkspaceBootstrap, courierlog.StatusOK, map[string]any{
 			"status": "skipped",
-			"reason": "bootstrap contract approved but not executed: the legacy executor is credential-bearing; the approved bootstrap runs only in the secure worker topology",
+			"reason": approvedContractSkipReason(miseErr == nil),
 		})
 	}
 	_ = stdoutRedacted.Flush()

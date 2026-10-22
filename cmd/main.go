@@ -727,7 +727,12 @@ type secureConfig struct {
 
 const (
 	defaultsHarnessImage = "ghcr.io/misospace/courier-harness:latest"
-	defaultsProbeImage   = "busybox:1.36"
+	// defaultsProbeImage pins the network-probe image by digest. The probe
+	// decides whether a node passes preflight, so a republished tag must not
+	// change the code that decides it. The chart's secure.probeImage must
+	// carry the same reference; cmd/main_test.go fails the build when the
+	// two drift apart or either loses its digest.
+	defaultsProbeImage = "busybox:1.38@sha256:fd7dc98638c8e305f4dc34e979f1c0fdfdcaeb0fbf8fcff77ae834b6da3d7e6e"
 	// startupReadTimeout bounds the pre-start credential Secret reads so a
 	// stalled API server surfaces as a setup error instead of a silent hang.
 	startupReadTimeout = 30 * time.Second
