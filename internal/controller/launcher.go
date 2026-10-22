@@ -175,6 +175,21 @@ func (l *CoordinatorLauncher) Launch(ctx context.Context, run *courierv1alpha1.C
 		return err
 	}
 	podConfig.Criteria = criteria
+	// The run's base is pinned at admission — resolve-issue: the
+	// provider-canonical default ref; fix-pr: the PR's actual target ref,
+	// including stacked and fork PRs. The pod must carry that pin, never
+	// the deployment default, so the in-pod workspace synchronizes against
+	// the base the PR actually names. An empty persisted ref fails the
+	// launch closed rather than substituting the default branch.
+	if policy := run.Status.PublicationPolicy; policy != nil {
+		ref := strings.TrimSpace(policy.BaseRef)
+		if ref == "" {
+			return secureNeedsHuman("PolicyCorrupt",
+				"the persisted publication policy for %s/%s carries no base ref; the launcher refuses to launch with a substituted default branch",
+				run.Namespace, run.Name)
+		}
+		podConfig.BaseBranch = ref
+	}
 	builder := executor.NewPodBuilder(podConfig)
 	builder.Executor = l.Executor
 	pod, err := builder.Build(run, &lane)

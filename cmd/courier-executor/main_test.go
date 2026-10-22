@@ -715,6 +715,13 @@ func TestRunFixPRDeclaredNoChangeNeededNeverClaimsAddressed(t *testing.T) {
 			_, _ = w.Write([]byte(`{"id":1}`))
 			return
 		}
+		// The fix-pr base guard reads the pull request the run repairs
+		// before workspace preparation; the fixture serves that PR open on
+		// the run's pinned base so the run reaches the outcome path.
+		if r.Method == http.MethodGet && r.URL.Path == "/repos/acme/widgets/pulls/7" {
+			_, _ = io.WriteString(w, `{"number":7,"state":"open","base":{"ref":"main","sha":"a","repo":{"full_name":"acme/widgets"}},"head":{"ref":"courier/resolve-issue/acme-widgets/7","sha":"b","repo":{"full_name":"acme/widgets"}}}`)
+			return
+		}
 		_, _ = io.WriteString(w, `[]`)
 	}))
 	defer api.Close()
@@ -2517,6 +2524,183 @@ func TestGuardFixPRHead(t *testing.T) {
 			})
 			if code := report.guardFixPRHead(context.Background()); code != test.want {
 				t.Fatalf("guardFixPRHead exit code = %d, want %d; stdout=%q stderr=%q", code, test.want, output.String(), errorsOut.String())
+			}
+			for _, fragment := range test.wantOut {
+				if !strings.Contains(output.String(), fragment) {
+					t.Fatalf("output missing %q: %q", fragment, output.String())
+				}
+			}
+		})
+	}
+}
+
+// TestGuardFixPRBase exercises the fix-pr base guard against a scripted
+// GitHub fixture. Every case stands up a server for the pull request the
+// guard reads; a failIfHit handler fails the test on any request, pinning
+// the cases that must never reach the forge.
+func TestGuardFixPRBase(t *testing.T) {
+	for _, test := range []struct {
+		name         string
+		mode         string
+		ref          int
+		base         string
+		prState      string
+		prBaseRef    string
+		prBaseRepo   string
+		prMerged     bool
+		serverStatus int
+		failIfHit    bool
+		want         int
+		wantOut      []string
+	}{
+		{
+			name:      "resolve-issue mode proceeds without a forge read",
+			mode:      "resolve-issue",
+			ref:       12,
+			base:      "main",
+			failIfHit: true,
+			want:      0,
+		},
+		{
+			name:      "stacked base equal to the pinned base proceeds",
+			mode:      "fix-pr",
+			ref:       12,
+			base:      "courier/acme/widgets/issue-9",
+			prState:   "open",
+			prBaseRef: "courier/acme/widgets/issue-9",
+			want:      0,
+		},
+		{
+			name:      "open PR targeting another base fails closed",
+			mode:      "fix-pr",
+			ref:       12,
+			base:      "courier/acme/widgets/issue-9",
+			prState:   "open",
+			prBaseRef: "main",
+			want:      exitNeedsHuman,
+			wantOut:   []string{`"phase":"NeedsHuman"`, "main", "courier/acme/widgets/issue-9"},
+		},
+		{
+			name:      "non-default simple base equal to the pinned base proceeds",
+			mode:      "fix-pr",
+			ref:       12,
+			base:      "release/2.0",
+			prState:   "open",
+			prBaseRef: "release/2.0",
+			want:      0,
+		},
+		{
+			name:      "closed pull request fails closed",
+			mode:      "fix-pr",
+			ref:       12,
+			base:      "main",
+			prState:   "closed",
+			prBaseRef: "main",
+			want:      exitNeedsHuman,
+			wantOut:   []string{`"phase":"NeedsHuman"`, "closed"},
+		},
+		{
+			name:      "merged pull request names the state the operator can act on",
+			mode:      "fix-pr",
+			ref:       12,
+			base:      "main",
+			prState:   "closed",
+			prMerged:  true,
+			prBaseRef: "main",
+			want:      exitNeedsHuman,
+			wantOut:   []string{`"phase":"NeedsHuman"`, "merged"},
+		},
+		{
+			name:       "base repository differing from the run repository fails closed",
+			mode:       "fix-pr",
+			ref:        12,
+			base:       "main",
+			prState:    "open",
+			prBaseRef:  "main",
+			prBaseRepo: "other/widgets",
+			want:       exitNeedsHuman,
+			wantOut:    []string{`"phase":"NeedsHuman"`, "retargeted"},
+		},
+		{
+			name:         "transient forge read failure parks the run for retry",
+			mode:         "fix-pr",
+			ref:          12,
+			base:         "main",
+			serverStatus: http.StatusInternalServerError,
+			want:         exitNeedsHuman,
+			wantOut:      []string{`"phase":"NeedsHuman"`, `"outcome":"blocked_external"`, `"category":"forge-unavailable"`, "parked"},
+		},
+		{
+			name:         "permanent forge read failure fails the run",
+			mode:         "fix-pr",
+			ref:          12,
+			base:         "main",
+			serverStatus: http.StatusBadRequest,
+			want:         exitFailed,
+			wantOut:      []string{`"phase":"Failed"`},
+		},
+		{
+			name:      "fix-pr run without a pull request number fails closed",
+			mode:      "fix-pr",
+			ref:       0,
+			base:      "main",
+			failIfHit: true,
+			want:      exitFailed,
+			wantOut:   []string{`"phase":"Failed"`, "COURIER_REF"},
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if test.failIfHit {
+					t.Errorf("forge read in a case that must not reach the forge: %s %s", r.Method, r.URL.Path)
+					http.NotFound(w, r)
+					return
+				}
+				if r.URL.EscapedPath() != "/repos/acme/widgets/pulls/12" {
+					t.Errorf("unexpected forge path: %s", r.URL.Path)
+					http.NotFound(w, r)
+					return
+				}
+				w.Header().Set("Content-Type", "application/json")
+				if test.serverStatus != 0 {
+					w.WriteHeader(test.serverStatus)
+					_, _ = io.WriteString(w, `{"message":"internal error"}`)
+					return
+				}
+				state := test.prState
+				if state == "" {
+					state = "open"
+				}
+				baseRef := test.prBaseRef
+				if baseRef == "" {
+					baseRef = "main"
+				}
+				baseRepo := test.prBaseRepo
+				if baseRepo == "" {
+					baseRepo = "acme/widgets"
+				}
+				mergedAt := ""
+				if test.prMerged {
+					mergedAt = "2026-10-22T00:00:00Z"
+				}
+				_, _ = io.WriteString(w, fmt.Sprintf(
+					`{"number":12,"state":%q,"merged_at":%q,"head":{"ref":"fix/one","sha":"b","repo":{"full_name":"octocat/widgets"}},"base":{"ref":%q,"sha":"a","repo":{"full_name":%q}}}`,
+					state, mergedAt, baseRef, baseRepo))
+			}))
+			t.Cleanup(server.Close)
+
+			var output bytes.Buffer
+			var errorsOut bytes.Buffer
+			report := newReporter(&output, &errorsOut, config{
+				Mode:          test.mode,
+				Repo:          "acme/widgets",
+				Ref:           test.ref,
+				Base:          test.base,
+				GitHubAPIBase: server.URL,
+				GitHubToken:   "t",
+			})
+			if code := report.guardFixPRBase(context.Background()); code != test.want {
+				t.Fatalf("guardFixPRBase exit code = %d, want %d; stdout=%q stderr=%q", code, test.want, output.String(), errorsOut.String())
 			}
 			for _, fragment := range test.wantOut {
 				if !strings.Contains(output.String(), fragment) {

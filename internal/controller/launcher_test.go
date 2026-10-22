@@ -442,9 +442,9 @@ func TestCoordinatorLauncherReportsProvisioningInFlightWhenExistingPodIsTerminat
 	}
 }
 
-// pinnedCriteriaPolicy builds a persisted policy whose criterion pin mirrors
-// admission's mapping of an extracted set, so launcher tests exercise the
-// same shape the operator writes (#280).
+// pinnedCriteriaPolicy builds a persisted policy whose criterion pin and
+// base ref mirror admission's mapping of an extracted set, so launcher
+// tests exercise the same shape the operator writes (#280).
 func pinnedCriteriaPolicy(t *testing.T, body string) *courierv1alpha1.PublicationPolicy {
 	t.Helper()
 	set, err := broker.ExtractCriteria(body, broker.SourceIssue{Owner: "acme", Name: "widgets", Number: 1})
@@ -453,6 +453,7 @@ func pinnedCriteriaPolicy(t *testing.T, body string) *courierv1alpha1.Publicatio
 	}
 	policy := &courierv1alpha1.PublicationPolicy{
 		SourceIssue: &courierv1alpha1.SourceIssueRef{Owner: "acme", Name: "widgets", Number: 1},
+		BaseRef:     "main",
 	}
 	for _, criterion := range set.Criteria {
 		policy.AcceptanceCriteria = append(policy.AcceptanceCriteria, courierv1alpha1.Criterion{
@@ -555,6 +556,99 @@ func TestCoordinatorLauncherProjectsCriteriaEnvelope(t *testing.T) {
 	orphaned.Status.PublicationPolicy.AcceptanceCriteriaDigest = ""
 	if err := launcher.Launch(context.Background(), orphaned); err == nil {
 		t.Fatal("orphaned criterion pin fields must fail the launch")
+	}
+}
+
+// The coordinator pod carries the run's admission-pinned base, never the
+// deployment default: a fix-pr run's persisted policy pins the PR's actual
+// target ref, a run without a persisted policy keeps the deployment default,
+// and a persisted policy with an empty ref fails the launch closed with no
+// pod created.
+func TestCoordinatorLauncherProjectsPolicyBaseBranch(t *testing.T) {
+	lane := &courierv1alpha1.LaneProfile{
+		ObjectMeta: metav1.ObjectMeta{Name: "local", Namespace: "default"},
+		Spec:       courierv1alpha1.LaneProfileSpec{Roles: map[string]string{"coordinator": "test-model"}},
+	}
+	newRun := func(name string) *courierv1alpha1.CoderRun {
+		return &courierv1alpha1.CoderRun{
+			ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: "default", UID: types.UID(name + "-uid")},
+			Spec: courierv1alpha1.CoderRunSpec{
+				Mode: courierv1alpha1.ModeFixPR,
+				Repo: "acme/widgets",
+				Ref:  7,
+				Lane: "local",
+			},
+			Status: courierv1alpha1.CoderRunStatus{Phase: courierv1alpha1.PhaseClaimed},
+		}
+	}
+	newPolicy := func(run *courierv1alpha1.CoderRun) *courierv1alpha1.PublicationPolicy {
+		return &courierv1alpha1.PublicationPolicy{
+			RunUID:              string(run.UID),
+			ProviderConfigRef:   "github",
+			ProviderEndpoint:    "https://api.github.com/",
+			BaseRepo:            "acme/widgets",
+			BaseRef:             "release/2.0",
+			BaseOID:             "baseoid",
+			WorkRepo:            "acme/widgets",
+			WorkRef:             "acme/widgets/courier/pr-7",
+			WorkInitiallyAbsent: false,
+			PRNumber:            7,
+		}
+	}
+	pinned := newRun("run-1")
+	pinned.Status.PublicationPolicy = newPolicy(pinned)
+	unpinned := newRun("run-2")
+	corrupt := newRun("run-3")
+	corrupt.Status.PublicationPolicy = newPolicy(corrupt)
+	corrupt.Status.PublicationPolicy.BaseRef = "  "
+	fakeClient := fake.NewClientBuilder().
+		WithScheme(launcherScheme(t)).
+		WithStatusSubresource(&courierv1alpha1.CoderRun{}).
+		WithRuntimeObjects(pinned, unpinned, corrupt, lane).
+		Build()
+	launcher := &CoordinatorLauncher{
+		Client: fakeClient,
+		Pod:    executor.PodConfig{Image: "example/opencode:test", BaseBranch: "main"},
+	}
+
+	// The fix-pr run's pod carries the PR's actual target ref, not the
+	// deployment default the launcher is configured with.
+	if err := launcher.Launch(context.Background(), pinned); err != nil {
+		t.Fatalf("Launch() pinned error = %v", err)
+	}
+	var pinnedPod corev1.Pod
+	if err := fakeClient.Get(context.Background(), client.ObjectKey{Namespace: "default", Name: "run-1-coordinator"}, &pinnedPod); err != nil {
+		t.Fatalf("get coordinator pod: %v", err)
+	}
+	if base, ok := podEnvironmentByName(t, &pinnedPod)["COURIER_BASE"]; !ok || base.Value != "release/2.0" {
+		t.Fatalf("COURIER_BASE = %+v, want the persisted policy's target ref release/2.0, not the deployment default", base)
+	}
+
+	// A run without a persisted policy keeps the deployment default.
+	if err := launcher.Launch(context.Background(), unpinned); err != nil {
+		t.Fatalf("Launch() unpinned error = %v", err)
+	}
+	var barePod corev1.Pod
+	if err := fakeClient.Get(context.Background(), client.ObjectKey{Namespace: "default", Name: "run-2-coordinator"}, &barePod); err != nil {
+		t.Fatalf("get coordinator pod: %v", err)
+	}
+	if base, ok := podEnvironmentByName(t, &barePod)["COURIER_BASE"]; !ok || base.Value != "main" {
+		t.Fatalf("COURIER_BASE = %+v, want the launcher's configured base main", base)
+	}
+
+	// A persisted policy with an empty ref fails the launch closed and no
+	// pod is created: the empty pin must not fall back to the default.
+	err := launcher.Launch(context.Background(), corrupt)
+	var permanent *SecureNeedsHumanError
+	if !errors.As(err, &permanent) {
+		t.Fatalf("Launch() empty-pin error = %v, want a *SecureNeedsHumanError the reconciler can terminalize", err)
+	}
+	if permanent.Reason != "PolicyCorrupt" {
+		t.Fatalf("reason = %q, want PolicyCorrupt", permanent.Reason)
+	}
+	var corruptPod corev1.Pod
+	if err := fakeClient.Get(context.Background(), client.ObjectKey{Namespace: "default", Name: "run-3-coordinator"}, &corruptPod); !apierrors.IsNotFound(err) {
+		t.Fatalf("coordinator pod present after an empty base pin: %v", err)
 	}
 }
 
