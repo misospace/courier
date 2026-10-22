@@ -146,6 +146,40 @@ func rejectProbeDryRun(control *SecureControl, run *courier.CoderRun) func(strin
 	}
 }
 
+// The dry-run proof must prove the worker artifact the launch will create:
+// when the lane selects a runtime image, the proved worker spec carries that
+// image, not the deployment harness image.
+func TestDryRunProofProvesTheLaneWorkerImage(t *testing.T) {
+	control, c := secureControl(t, &courier.LaneProfile{
+		ObjectMeta: metav1.ObjectMeta{Namespace: secureTestNamespace, Name: "proof-image"},
+		Spec: courier.LaneProfileSpec{
+			Roles:        map[string]string{"coordinator": "test/coordinator", "coder": "test/coder"},
+			RuntimeImage: "toolchain:test",
+		},
+	})
+	run := launchedSecureRun(t, c, "proof-image", "proof-image")
+	var proofImage string
+	watcher, ok := control.Client.(client.WithWatch)
+	if !ok {
+		t.Fatal("the fake client does not support watch")
+	}
+	control.Client = interceptor.NewClient(watcher, interceptor.Funcs{
+		Create: func(ctx context.Context, c client.WithWatch, obj client.Object, opts ...client.CreateOption) error {
+			if pod, isPod := obj.(*corev1.Pod); isPod && strings.HasSuffix(pod.Name, "-dryrun") &&
+				pod.Spec.Containers[0].Name == topology.WorkerContainerName {
+				proofImage = pod.Spec.Containers[0].Image
+			}
+			return c.Create(ctx, obj, opts...)
+		},
+	})
+	if _, err := control.LaunchSecure(context.Background(), run); err != nil {
+		t.Fatalf("LaunchSecure: %v", err)
+	}
+	if proofImage != "toolchain:test" {
+		t.Fatalf("dry-run worker image = %q, want the lane's runtimeImage", proofImage)
+	}
+}
+
 // TestDryRunProofAdmitsTheLiveProbeSpec pins the artifact claim at the probe
 // boundary, where the lane-sizing guarantee does not reach: the spec the proof
 // admits is the spec the live phase creates, and it is sized as a probe rather
@@ -172,7 +206,7 @@ func TestDryRunProofAdmitsTheLiveProbeSpec(t *testing.T) {
 		},
 	})
 	lane := courier.DefaultPodResources()
-	if err := control.checkDryRuns(context.Background(), run, nil, lane, true); err != nil {
+	if err := control.checkDryRuns(context.Background(), run, nil, lane, "harness:test", true); err != nil {
 		t.Fatalf("checkDryRuns: %v", err)
 	}
 	if proof == nil {

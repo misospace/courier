@@ -47,17 +47,17 @@ type probeOutcome struct {
 // topology objects (SAs, RBAC, secrets, services, policies) are already
 // provisioned. relaunch abbreviates the check: replacement launches re-verify
 // the static guarantees but do not repeat the multi-node live probes, which
-// ran before the first workload exposure. resources are the lane-configured
-// sizing the caller already resolved for this launch pass, so the dry-run
-// proof and the pods created afterwards are the same artifact. The proof
-// carries the probe pod only on a pass that will create probes live, so a
-// deployment with no probe image never proves — and is never failed by — a
+// ran before the first workload exposure. resources and workerImage are the
+// lane-resolved values the caller already holds for this launch pass, so the
+// dry-run proof and the pods created afterwards are the same artifacts. The
+// proof carries the probe pod only on a pass that will create probes live, so
+// a deployment with no probe image never proves — and is never failed by — a
 // spec it will not create.
 //
 // Permanent deployment misconfiguration returns a *SecureNeedsHumanError;
 // transient API or probe failures return an ordinary error so the run requeues
 // without launching.
-func (s *SecureControl) Preflight(ctx context.Context, run *courier.CoderRun, policy *courier.PublicationPolicy, relaunch bool, resources corev1.ResourceRequirements) error {
+func (s *SecureControl) Preflight(ctx context.Context, run *courier.CoderRun, policy *courier.PublicationPolicy, relaunch bool, resources corev1.ResourceRequirements, workerImage string) error {
 	if err := s.checkNamespaceBoundary(ctx); err != nil {
 		return err
 	}
@@ -71,7 +71,7 @@ func (s *SecureControl) Preflight(ctx context.Context, run *courier.CoderRun, po
 	if err != nil {
 		return err
 	}
-	if err := s.checkDryRuns(ctx, run, cache, resources, !relaunch && s.Config.LiveProbes); err != nil {
+	if err := s.checkDryRuns(ctx, run, cache, resources, workerImage, !relaunch && s.Config.LiveProbes); err != nil {
 		return err
 	}
 	if relaunch || !s.Config.LiveProbes {
@@ -230,9 +230,10 @@ func (s *SecureControl) subjectAccessReviewAs(ctx context.Context, serviceAccoun
 // evidence that the configured admission cannot hold the boundary. Every pod
 // the launcher creates is in the proof; proveProbes adds the probe pod, which
 // is created live rather than through this loop, and only on a pass that will
-// create probes. resources are the lane sizing the caller resolved once for
-// this pass.
-func (s *SecureControl) checkDryRuns(ctx context.Context, run *courier.CoderRun, cache *topology.CachePin, resources corev1.ResourceRequirements, proveProbes bool) error {
+// create probes. resources and workerImage are the lane-resolved values the
+// caller holds for this pass; the dry-run worker renders with the same image
+// the launch path will create, so the proof proves the real artifact.
+func (s *SecureControl) checkDryRuns(ctx context.Context, run *courier.CoderRun, cache *topology.CachePin, resources corev1.ResourceRequirements, workerImage string, proveProbes bool) error {
 	registration, err := s.Config.Registry.Select(run.Spec.Repo)
 	if err != nil {
 		return secureNeedsHuman("ProviderSelection", "provider selection failed: %v", err)
@@ -242,7 +243,7 @@ func (s *SecureControl) checkDryRuns(ctx context.Context, run *courier.CoderRun,
 		return err
 	}
 	pods := []*corev1.Pod{}
-	worker, err := topology.WorkerPod(run, s.Config.HarnessImage, "dry-run-incarnation", publicKey, cache, resources)
+	worker, err := topology.WorkerPod(run, workerImage, "dry-run-incarnation", publicKey, cache, resources)
 	if err != nil {
 		return fmt.Errorf("secure preflight: render worker: %w", err)
 	}

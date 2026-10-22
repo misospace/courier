@@ -45,10 +45,10 @@ func marshalOpenCodeConfig(roles map[string]string, githubURL, context7URL, metr
 		"github_merge*":             "deny",
 		"external_directory": map[string]string{
 			scratchPath + "/**":            "allow",
-			toolchainReferencePath + "/**": "allow",
+			ToolchainReferencePath + "/**": "allow",
 		},
 		"edit": map[string]string{
-			toolchainReferencePath + "/**": "deny",
+			ToolchainReferencePath + "/**": "deny",
 		},
 	}
 	agents := make(map[string]openCodeAgent, len(roles))

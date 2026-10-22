@@ -38,8 +38,8 @@ const (
 	LabelDebug             = "courier.misospace.dev/debug"
 	runtimePath            = "/courier-runtime"
 	scratchPath            = "/var/tmp/courier-scratch"
-	toolchainCachePath     = "/courier-toolchain-cache" // read-write; lane toolchain caches (GOMODCACHE etc.) live here, path pinned by the runtime image
-	toolchainReferencePath = "/courier-toolchain"       // same volume, read-only; the coordinator's inspection entry point
+	ToolchainCachePath     = "/courier-toolchain-cache" // read-write; lane toolchain caches (GOMODCACHE etc.) live here, path pinned by the runtime image
+	ToolchainReferencePath = "/courier-toolchain"       // same volume, read-only; the coordinator's inspection entry point
 )
 
 // PodConfig controls runtime-specific details without putting provider or
@@ -275,10 +275,10 @@ func (b *PodBuilder) Build(run *courierv1alpha1.CoderRun, lane *courierv1alpha1.
 					MountPath: scratchPath,
 				}, {
 					Name:      "toolchain-cache",
-					MountPath: toolchainCachePath,
+					MountPath: ToolchainCachePath,
 				}, {
 					Name:      "toolchain-cache",
-					MountPath: toolchainReferencePath,
+					MountPath: ToolchainReferencePath,
 					ReadOnly:  true,
 				}},
 				SecurityContext: &corev1.SecurityContext{
@@ -392,7 +392,7 @@ func podEnvironment(invocation Invocation, executorName string, config PodConfig
 		corev1.EnvVar{Name: "TMP", Value: scratchPath},
 		corev1.EnvVar{Name: "TEMP", Value: scratchPath},
 		corev1.EnvVar{Name: "COURIER_SCRATCH_DIR", Value: scratchPath},
-		corev1.EnvVar{Name: "COURIER_TOOLCHAIN_DIR", Value: toolchainReferencePath},
+		corev1.EnvVar{Name: "COURIER_TOOLCHAIN_DIR", Value: ToolchainReferencePath},
 	)
 	// Per-key credential references come from the shared helper so the pod
 	// builder and the evidence intake can never enumerate the same Secret keys
@@ -510,10 +510,10 @@ func (c PodConfig) Validate() error {
 	if pathsOverlap(c.WorkspacePath, scratchPath) {
 		return errors.New("executor: workspace path must not overlap the scratch path")
 	}
-	if pathsOverlap(c.WorkspacePath, toolchainCachePath) {
+	if pathsOverlap(c.WorkspacePath, ToolchainCachePath) {
 		return errors.New("executor: workspace path must not overlap the toolchain cache path")
 	}
-	if pathsOverlap(c.WorkspacePath, toolchainReferencePath) {
+	if pathsOverlap(c.WorkspacePath, ToolchainReferencePath) {
 		return errors.New("executor: workspace path must not overlap the toolchain reference path")
 	}
 	if err := c.Git.Validate(); err != nil {

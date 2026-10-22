@@ -132,6 +132,54 @@ func TestWorkerPodCachePin(t *testing.T) {
 	}
 }
 
+// The worker carries the same per-pod toolchain-cache contract as the legacy
+// coordinator pod: one emptyDir writable at the pinned cache path and
+// read-only at the reference twin, with COURIER_TOOLCHAIN_DIR pointing at the
+// read-only side. The mounts cannot shadow baked tool installations because
+// tools install outside both cache paths.
+func TestWorkerPodToolchainCacheContract(t *testing.T) {
+	run := testRun("worker-toolchain")
+	pub, _, _ := protocol.GenerateKey()
+	pod, err := WorkerPod(run, "toolchain:test", "incarnation-1", pub, nil, courier.DefaultPodResources())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if pod.Spec.Containers[0].Image != "toolchain:test" {
+		t.Fatalf("worker image = %q, want the caller-resolved argument", pod.Spec.Containers[0].Image)
+	}
+	cache := 0
+	reference := false
+	for _, mount := range pod.Spec.Containers[0].VolumeMounts {
+		switch mount.MountPath {
+		case executor.ToolchainCachePath:
+			if mount.ReadOnly {
+				t.Fatalf("toolchain cache mount at %s must be writable", mount.MountPath)
+			}
+			cache++
+		case executor.ToolchainReferencePath:
+			if !mount.ReadOnly {
+				t.Fatal("toolchain reference mount must be read-only")
+			}
+			reference = true
+		}
+	}
+	if cache != 1 || !reference {
+		t.Fatalf("toolchain mounts: %d writable cache, reference present = %t", cache, reference)
+	}
+	for _, v := range pod.Spec.Volumes {
+		if v.Name == "toolchain-cache" && v.EmptyDir == nil {
+			t.Fatal("toolchain-cache volume must be an emptyDir (per-pod scratch cache)")
+		}
+	}
+	env := map[string]string{}
+	for _, e := range pod.Spec.Containers[0].Env {
+		env[e.Name] = e.Value
+	}
+	if env["COURIER_TOOLCHAIN_DIR"] != executor.ToolchainReferencePath {
+		t.Fatalf("COURIER_TOOLCHAIN_DIR = %q", env["COURIER_TOOLCHAIN_DIR"])
+	}
+}
+
 func TestControlPodIdentityContract(t *testing.T) {
 	run := testRun("control-pod")
 	pod, err := ControlPod(run, ControlInputs{

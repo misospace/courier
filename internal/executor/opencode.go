@@ -18,7 +18,7 @@ const (
 // boundary; the boundary is the OpenCode permission config.
 var scratchHint = fmt.Sprintf("Use the Courier scratch directory at %s (also set as TMPDIR) for all temporary work, and tell any delegated sub-agents to do the same.", scratchPath)
 
-var toolchainHint = fmt.Sprintf("The lane may mount toolchain reference sources (module and toolchain caches) read-only at %s (also set as COURIER_TOOLCHAIN_DIR); when present, inspect them there instead of reaching for paths outside the checkout.", toolchainReferencePath)
+var toolchainHint = fmt.Sprintf("The lane may mount toolchain reference sources (module and toolchain caches) read-only at %s (also set as COURIER_TOOLCHAIN_DIR); when present, inspect them there instead of reaching for paths outside the checkout.", ToolchainReferencePath)
 
 // OpenCode is the temporary headless executor. It intentionally only wraps
 // one non-interactive invocation; checkpointing and resume belong to the

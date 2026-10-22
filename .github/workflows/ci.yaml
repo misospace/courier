@@ -212,7 +212,7 @@ jobs:
       - name: Validate coordinator image
         run: >-
           docker run --rm --entrypoint sh courier-coordinator:ci
-          -c 'test -x /usr/local/bin/courier-executor && opencode --help'
+          -c 'test -x /usr/local/bin/courier-executor && opencode --help && mise --version'
       - name: Validate coordinator identity
         run: test "$(docker inspect --format '{{.Config.User}}' courier-coordinator:ci)" = "65532:65532"
 
@@ -262,6 +262,30 @@ jobs:
           -c 'test -x /usr/local/bin/courier-control && test -x /usr/local/bin/courier-worker && test -x /usr/local/bin/courier-broker'
       - name: Validate harness identity
         run: test "$(docker inspect --format '{{.Config.User}}' courier-harness:ci)" = "65532:65532"
+
+      - name: Build Go toolchain harness image
+        uses: docker/build-push-action@v7.4.0
+        with:
+          context: .
+          target: harness-go
+          build-args: BINARIES=prebuilt
+          tags: courier-harness-go:ci
+          load: true
+          cache-from: type=gha,scope=harness-go
+          cache-to: type=gha,mode=max,scope=harness-go
+
+      - name: Validate Go toolchain harness image
+        run: >-
+          docker run --rm --entrypoint sh courier-harness-go:ci
+          -c 'test -x /usr/local/bin/courier-control && test -x /usr/local/bin/courier-worker && test -x /usr/local/bin/courier-broker'
+      - name: Validate Go toolchain harness identity
+        run: test "$(docker inspect --format '{{.Config.User}}' courier-harness-go:ci)" = "65532:65532"
+      # Clean-pod smoke receipt for the secure Go worker: toolchain versions
+      # must come from the image itself, with no runtime downloads (#415).
+      - name: Validate Go toolchain harness provisioning
+        run: >-
+          docker run --rm --entrypoint sh courier-harness-go:ci
+          -c 'test "$(id -u)" = 65532 && go version && make --version >/dev/null && helm version --short >/dev/null && controller-gen --version >/dev/null && mise --version'
       - name: Validate broker fail-closed startup
         run: >-
           docker run --rm courier-harness:ci /usr/local/bin/courier-broker 2>&1
