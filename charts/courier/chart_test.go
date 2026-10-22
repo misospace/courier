@@ -4,8 +4,11 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"testing"
+
+	"sigs.k8s.io/yaml"
 )
 
 func TestChartRendersDispatchConfiguration(t *testing.T) {
@@ -174,6 +177,27 @@ func mustReadRepositoryFile(t *testing.T, path string) string {
 		t.Fatalf("read repository file %s: %v", path, err)
 	}
 	return string(data)
+}
+
+// chartProbeImage returns the chart's secure.probeImage value.
+func chartProbeImage(t *testing.T) string {
+	t.Helper()
+	var values struct {
+		Secure struct {
+			ProbeImage string `json:"probeImage"`
+		} `json:"secure"`
+	}
+	if err := yaml.Unmarshal([]byte(mustReadRepositoryFile(t, "charts/courier/values.yaml")), &values); err != nil {
+		t.Fatalf("parse chart values: %v", err)
+	}
+	image := strings.TrimSpace(values.Secure.ProbeImage)
+	if image == "" {
+		t.Fatal("chart values carry no secure.probeImage")
+	}
+	if !regexp.MustCompile(`^[^@\s]+@sha256:[0-9a-f]{64}$`).MatchString(image) {
+		t.Fatalf("chart secure.probeImage = %q, want a digest-pinned image reference", image)
+	}
+	return image
 }
 
 func runHelm(t *testing.T, chartDir string, args ...string) string {
@@ -647,6 +671,7 @@ func TestChartRendersSecureTopologyConfiguration(t *testing.T) {
 		"--model-gateway-key-secret=gateway-key",
 		"--model-gateway-cidr=10.10.0.0/32",
 		"--model-gateway-port=4000",
+		"--probe-image=" + chartProbeImage(t),
 		"name: courier-forge-providers",
 		"courier-broker-tokenreview",
 		"mountPath: /etc/courier",

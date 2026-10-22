@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"regexp"
 	"strings"
 	"testing"
 	"time"
@@ -25,6 +26,7 @@ import (
 	"k8s.io/client-go/rest"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+	"sigs.k8s.io/yaml"
 )
 
 type observerWithHeadResolver struct{}
@@ -620,6 +622,40 @@ func TestObserverRegistryWithoutMatchFailsClosed(t *testing.T) {
 	}
 	if len(transport.requests) != 0 {
 		t.Fatalf("an unsettled repository made %d requests; it must make none, not fall back to the default host", len(transport.requests))
+	}
+}
+
+// TestDefaultProbeImageMatchesChartValue keeps the manager's built-in probe
+// image and the chart's secure.probeImage in lockstep. A deployment through
+// the chart and a bare binary with defaults must probe with the same image,
+// and that image must be pinned by digest so a republished tag cannot change
+// the code that decides whether a node passes preflight. The digest is what
+// pins the image; the tag beside it is documentation of which release that
+// digest belongs to.
+func TestDefaultProbeImageMatchesChartValue(t *testing.T) {
+	pinned := regexp.MustCompile(`^[^@\s]+@sha256:[0-9a-f]{64}$`)
+	if !pinned.MatchString(defaultsProbeImage) {
+		t.Fatalf("defaultsProbeImage = %q, want a digest-pinned image reference", defaultsProbeImage)
+	}
+
+	data, err := os.ReadFile(filepath.Join("..", "charts", "courier", "values.yaml"))
+	if err != nil {
+		t.Fatalf("read chart values: %v", err)
+	}
+	var values struct {
+		Secure struct {
+			ProbeImage string `json:"probeImage"`
+		} `json:"secure"`
+	}
+	if err := yaml.Unmarshal(data, &values); err != nil {
+		t.Fatalf("parse chart values: %v", err)
+	}
+	chartImage := strings.TrimSpace(values.Secure.ProbeImage)
+	if !pinned.MatchString(chartImage) {
+		t.Fatalf("chart secure.probeImage = %q, want a digest-pinned image reference", chartImage)
+	}
+	if chartImage != defaultsProbeImage {
+		t.Fatalf("chart secure.probeImage = %q, manager default = %q; they must name the same pinned image", chartImage, defaultsProbeImage)
 	}
 }
 
