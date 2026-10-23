@@ -174,6 +174,44 @@ func TestGoalBoundsTheRepairEvidence(t *testing.T) {
 	}
 }
 
+// TestGoalPreservesFailedCheckNamesExactly pins that the failed configured
+// mechanical checks reach the coordinator under the exact names the lane
+// declared.
+//
+// A recorded name is the lane's own configured name, matched exactly against
+// the forge's checks. A name that carries surrounding space is therefore the
+// lane's name, and the repair contract must not rename the very check the
+// coordinator is asked to repair — the operator's selector and verdict share
+// one exact-match rule, and the contract that reports their verdict has to
+// share it too.
+func TestGoalPreservesFailedCheckNamesExactly(t *testing.T) {
+	run := &courierv1alpha1.CoderRun{
+		Spec: courierv1alpha1.CoderRunSpec{
+			Mode: courierv1alpha1.ModeResolveIssue,
+			Ref:  7,
+		},
+		Status: courierv1alpha1.CoderRunStatus{
+			CIRepair: &courierv1alpha1.CIRepairContext{
+				Head:    "abc123",
+				Attempt: 1,
+				// A padded name is the lane's own exact name, and a fully
+				// empty name is dropped.
+				FailedChecks: []string{" test ", "unit", ""},
+			},
+		},
+	}
+	goal, err := Goal(run)
+	if err != nil {
+		t.Fatalf("Goal() error = %v", err)
+	}
+	if !strings.Contains(goal, "Failed configured mechanical checks:  test , unit.") {
+		t.Fatalf("repair goal %q must carry the failed check names exactly as recorded", goal)
+	}
+	if strings.Contains(goal, "Failed configured mechanical checks: test,") {
+		t.Fatalf("repair goal %q trimmed a declared check name", goal)
+	}
+}
+
 // TestGoalRendersAnEmptyCheckpoint pins that a repair without a checkpoint
 // still renders the checkpoint section: the plan may be empty and no brief
 // may have been completed, and the coordinator must be told that rather than

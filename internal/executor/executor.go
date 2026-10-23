@@ -307,12 +307,19 @@ func repairContract(run *courierv1alpha1.CoderRun) string {
 
 // repairFailedChecks names the failed configured mechanical checks a repair
 // context carries.
+//
+// The names are rendered exactly as recorded, never trimmed: the operator
+// matches configured mechanical checks exactly and case-sensitively (see
+// internal/controller/cipark.go), so a recorded name is the lane's own name
+// and trimming it here would rename the very check the coordinator was asked
+// to repair. Only a fully empty name is dropped.
 func repairFailedChecks(repair *courierv1alpha1.CIRepairContext) string {
 	names := make([]string, 0, len(repair.FailedChecks))
 	for _, name := range repair.FailedChecks {
-		if name = strings.TrimSpace(name); name != "" {
-			names = append(names, name)
+		if name == "" {
+			continue
 		}
+		names = append(names, name)
 	}
 	if len(names) == 0 {
 		return "(none recorded)"
