@@ -520,6 +520,29 @@ paths share acceptance, not implementation.
   closing keywords, the bare and cross-repo forms, and the
   existing PR number so the model can fix the body
   deterministically rather than re-derive the requirement.
+  The same identity-checked head listing also re-verifies the fix-pr
+  handoff (#517): a fix-pr run carries no trusted source-issue body
+  contract, so it classifies its pinned head's pull requests through
+  the same forge capability and hands off only when the run's pinned
+  pull request — the number the run was admitted against, the same
+  exact-number, base, and head identity the native broker path
+  enforces — is the single open, non-draft PR whose full base/head
+  identity matches — the pinned fork head when COURIER_HEAD_REPO
+  points at a fork — and whose base ref equals COURIER_BASE carries
+  the run's published commit; a fix-pr run that cannot name its pinned
+  pull request fails closed at configuration instead. The wrong-base,
+  draft, missing, ambiguous, closed-or-merged-only, foreign-head,
+  unpublished, and not-the-pinned-PR worlds all fail closed to
+  `NeedsHuman`: a pull request on the run's head that is not the
+  pinned assignment is never adopted in its place, a draft pinned PR is
+  a settled-by-human anomaly (no readying continuation), a missing
+  pinned PR is never replaced (the executor neither opens a duplicate
+  nor adopts another PR), and a failed read retries inside the bounded
+  budget with an unverified message that names the pinned identity
+  rather than a source issue; only at exhaustion (or when no captured
+  session can be resumed) does a transient forge outage still end
+  `blocked_external` for the operator's bounded retry, like the
+  resolve-issue branch.
 - **Shared truth table.** `internal/broker/linkage_test.go`
   covers the accepted keyword vocabulary, vague and substring
   rejections, the wrong-number and wrong-repository failure

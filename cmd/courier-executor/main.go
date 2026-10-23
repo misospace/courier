@@ -284,6 +284,16 @@ func readConfig(getenv func(string) string) (config, error) {
 	if strings.EqualFold(cfg.Mode, "fix-pr") && cfg.HeadRepo == "" {
 		return config{}, errors.New("COURIER_HEAD_REPO is required for fix-pr runs")
 	}
+	if strings.EqualFold(cfg.Mode, "fix-pr") && cfg.Ref < 1 {
+		// A fix-pr run is admitted against one pinned pull request, and
+		// the pre-handoff observation verifies exactly that pull request
+		// (#517). Without a usable pinned reference there is nothing to
+		// verify, so the run must not proceed to a Verifying handoff it
+		// can never prove: it fails closed here, where the malformed
+		// input is still visible, instead of silently skipping the
+		// verification it exists to perform.
+		return config{}, errors.New("COURIER_REF must be the pinned pull request number for fix-pr runs")
+	}
 	scratchRelative, err := filepath.Rel(cfg.Directory, cfg.ScratchDirectory)
 	if err != nil {
 		return config{}, fmt.Errorf("compare scratch and workspace paths: %w", err)
@@ -2260,6 +2270,27 @@ type handoffCheckOutcome struct {
 	// base other than the run's pinned base: fail-closed, never adopted or
 	// re-targeted (#247).
 	wrongBase bool
+	// pinnedDraft reports a fix-pr run's pinned pull request still a
+	// draft at handoff (#517): the resolve-issue ready-continuation is
+	// deliberately unavailable here, because a fix-pr run is admitted
+	// against a live PR, so a draft at handoff is a settled-by-human
+	// anomaly, and the draft continuation's message is source-issue-
+	// shaped. pr carries the draft observation for the verdict.
+	pinnedDraft bool
+	// pinnedMissing reports a fix-pr run whose pinned head carries no
+	// pull request at handoff (#517): the resolve-issue creation
+	// continuation is deliberately unavailable here, because the
+	// executor never opens a replacement for a pinned PR — that would
+	// duplicate or silently re-target the assignment.
+	pinnedMissing bool
+	// pinnedMismatch reports a fix-pr run whose observed pull request is
+	// not the pinned assignment (#517): the forge reports another pull
+	// request on the run's head, so the pinned pull request the run was
+	// admitted against is unverified. The executor verifies the pinned
+	// assignment only and never adopts another pull request. pr carries
+	// the observed pull request so the terminal reason can name both the
+	// observed and the pinned number.
+	pinnedMismatch bool
 	// criteria is the criterion-evidence report when the criteria check
 	// ran against the open PR's body and the pinned set was non-empty.
 	// nil when no set was pinned, when the set was empty (vacuous pass),
@@ -2338,10 +2369,37 @@ func trustedSourceIssue(cfg config) (broker.SourceIssue, bool) {
 	return broker.SourceIssue{Owner: owner, Name: name, Number: cfg.Ref}, true
 }
 
+// runHeadRepo returns the repository identity whose owner:branch head
+// selector the forge listing queries: the run's own repository for
+// resolve-issue runs, and the pinned fork head repository for fix-pr
+// runs (guardFixPRHead's cross-fork invariant). Empty HEAD_REPO inputs
+// fall back to the run repository (#517).
+func runHeadRepo(cfg config) string {
+	if strings.TrimSpace(cfg.HeadRepo) != "" {
+		return cfg.HeadRepo
+	}
+	return cfg.Repo
+}
+
+// isFixPRRun reports whether the run is a genuine fix-pr run admitted
+// against a pinned pull request: a fix-pr mode with a positive pinned
+// reference (#517). readConfig rejects a fix-pr run that cannot name
+// its pinned pull request, so the pinned reference is an admission
+// invariant, not a runtime hope — a mode without one is not a fix-pr
+// run this executor may verify, because there is no pinned pull
+// request to re-verify.
+func isFixPRRun(cfg config) bool {
+	return strings.EqualFold(cfg.Mode, "fix-pr") && cfg.Ref >= 1
+}
+
 // observeRunBranchPullRequest reads every pull request whose head carries
 // the run's branch through the configured forge capability
 // (forge.PullRequestHeadLister, never a forge-specific CLI) and classifies
-// the set (#247). The provider compares the full base- and head-repository
+// the set (#247). The queried head identity is runHeadRepo — the run's own
+// repository, or the pinned fork head repository for fix-pr runs — so the
+// observation settles the fix-pr head the same identity-checked way as the
+// resolve-issue head rather than skipping it (#517). The provider
+// compares the full base- and head-repository
 // and ref identities carried in the forge response and refuses a response
 // missing either identity, so a foreign or fork head can never be mistaken
 // for the run's own PR. A record that claims the owner:branch head selector
@@ -2360,7 +2418,7 @@ func (r reporter) observeRunBranchPullRequest(ctx context.Context) (runBranchPRO
 		return runBranchPRObservation{}, err
 	}
 	provider := github.NewProvider(forge.ProviderConfig{Name: "github", Endpoint: r.cfg.GitHubAPIBase}, client)
-	pulls, foreign, err := provider.ListPullRequestsWithForeign(ctx, forge.PullRequestRef{Repo: r.cfg.Repo}, r.cfg.Repo, r.cfg.Branch)
+	pulls, foreign, err := provider.ListPullRequestsWithForeign(ctx, forge.PullRequestRef{Repo: r.cfg.Repo}, runHeadRepo(r.cfg), r.cfg.Branch)
 	if err != nil {
 		return runBranchPRObservation{}, err
 	}
@@ -2527,8 +2585,18 @@ func (r reporter) checkHandoff(ctx context.Context) (*handoffCheckOutcome, error
 		// silently: the run would otherwise hand off as Verifying
 		// having enforced neither body contract. pinnedCriterionSet
 		// already settled that case above, so the only envelope-free
-		// way to reach here is a run with nothing pinned, whose
-		// pre-handoff plan is skipped exactly as before.
+		// way to reach here is a run with nothing pinned to enforce —
+		// or a fix-pr run, whose pinned pull request is the contract it
+		// must verify.
+		//
+		// A fix-pr run carries no source-issue body contract, but the
+		// pinned pull request itself is the handoff contract, so the
+		// same identity-checked observation re-verifies it at handoff
+		// (#517); an envelope already failed closed above via
+		// pinnedCriterionSet.
+		if isFixPRRun(r.cfg) {
+			return r.checkFixPRHandoff(ctx)
+		}
 		return nil, nil
 	}
 	observation, err := r.observeRunBranchPullRequest(ctx)
@@ -2616,6 +2684,99 @@ func (r reporter) checkHandoff(ctx context.Context) (*handoffCheckOutcome, error
 	}
 	// Unreachable: every observation kind is handled above.
 	return nil, fmt.Errorf("unclassified pull-request observation state for run branch %s", r.cfg.Branch)
+}
+
+// checkFixPRHandoff is the fix-pr run's pre-handoff observation (#517):
+// the same identity-checked head listing as the resolve-issue branch
+// (#247) classifies the pull requests that carry the run's pinned head,
+// and every world that does not match the handoff contract — an open,
+// non-draft pull request on the pinned base with the run's commit
+// published (the same #247 publication sha-proof) — fails closed to a
+// NeedsHuman world the executor never papers over with a retry or a
+// creation. Draft and missing differ deliberately from resolve-issue:
+// a fix-pr run is admitted against a live PR, so a draft at handoff is
+// a settled-by-human anomaly — no readying continuation — and the
+// executor never opens a replacement for a pinned PR, which would
+// duplicate or silently re-target the assignment. An unverifiable read
+// is returned as an error, never as a confirmed missing PR (#247).
+//
+// The listing settles the run's HEAD, not the run's ASSIGNMENT: a fix-pr
+// run is admitted against one pinned pull request (COURIER_REF), so the
+// observed pull request must be that exact pull request before the
+// handoff may verify it — the same exact-number, base, and head identity
+// the native broker path enforces in checkPR/matchesPR. A head whose
+// pull request is some other pull request fails closed (pinnedMismatch)
+// instead of handing off a verification of an assignment nobody made.
+// An unverifiable read is returned as an error, never as a confirmed
+// missing PR (#247).
+func (r reporter) checkFixPRHandoff(ctx context.Context) (*handoffCheckOutcome, error) {
+	observation, err := r.observeRunBranchPullRequest(ctx)
+	if err != nil {
+		return nil, err
+	}
+	switch observation.kind {
+	case prStateOpen:
+		// The pinned assignment is the pull request the run was admitted
+		// against, so the head's only open pull request must be that
+		// pull request: verifying a different one would hand off a
+		// contract the operator never pinned (#517).
+		if observation.open.Number != r.cfg.Ref {
+			return &handoffCheckOutcome{pinnedMismatch: true, pr: observation.open}, nil
+		}
+		// Same #247 rule as resolve-issue: the pinned head's published
+		// state is part of the world being verified, so no Verifying
+		// handoff may carry local commits the remote never advertised.
+		publication, err := r.confirmRemotePublication(ctx)
+		if err != nil {
+			return nil, err
+		}
+		if !publication.published {
+			return &handoffCheckOutcome{unpublished: true, publication: publication}, nil
+		}
+		// The pinned PR is open, non-draft, on the pinned base, under
+		// the verified head, and the run's commit is published: hand off.
+		return nil, nil
+	case prStateWrongBase:
+		return &handoffCheckOutcome{wrongBase: true}, nil
+	case prStateAmbiguous:
+		return &handoffCheckOutcome{ambiguous: true}, nil
+	case prStateClosedOnly:
+		// A closed-only head settles the assignment only when the closed
+		// pull request IS the pinned one; a head that never carried the
+		// pinned pull request leaves the assignment unverified rather
+		// than closed (#517).
+		if !carriesPullRequestNumber(observation.closed, r.cfg.Ref) {
+			return &handoffCheckOutcome{pinnedMismatch: true, pr: observation.closed[0]}, nil
+		}
+		return &handoffCheckOutcome{closedOnly: true}, nil
+	case prStateForeignHead:
+		return &handoffCheckOutcome{foreignHead: true}, nil
+	case prStateDraft:
+		// A draft is a settled-by-human anomaly only when it is the
+		// pinned pull request; a draft on the run's head that is some
+		// other pull request leaves the assignment unverified (#517).
+		if observation.draft.Number != r.cfg.Ref {
+			return &handoffCheckOutcome{pinnedMismatch: true, pr: observation.draft}, nil
+		}
+		return &handoffCheckOutcome{pinnedDraft: true, pr: observation.draft}, nil
+	case prStateMissing:
+		return &handoffCheckOutcome{pinnedMissing: true}, nil
+	}
+	// Unreachable: every observation kind is handled above.
+	return nil, fmt.Errorf("unclassified fix-pr pull-request observation state for run branch %s", r.cfg.Branch)
+}
+
+// carriesPullRequestNumber reports whether the observed pull requests
+// include the run's pinned pull request number (#517). The fix-pr handoff
+// uses it to tell a closed pinned pull request from a head that never
+// carried the pinned assignment at all.
+func carriesPullRequestNumber(observed []*prLinkageObservation, number int) bool {
+	for _, pull := range observed {
+		if pull != nil && pull.Number == number {
+			return true
+		}
+	}
+	return false
 }
 
 // pinnedCriterionSet returns the run's operator-pinned criterion envelope,
@@ -3614,12 +3775,13 @@ func (r reporter) unpublishedBranchReason(publication remotePublicationState) st
 }
 
 // foreignHeadPRReason composes the NeedsHuman reason for a forge record
-// that claims the run branch's owner:head selector from a different
+// that claims the run branch's runHeadRepo:head selector from a different
 // repository (#247). The executor neither adopts such a pull request nor
 // deletes it toward a "missing" claim that would prompt a creation over a
-// world it cannot reconcile.
+// world it cannot reconcile; for a fix-pr run the queried head selector is
+// the pinned fork head (runHeadRepo), not the base repository (#517).
 func (r reporter) foreignHeadPRReason() string {
-	return fmt.Sprintf("the forge reported a pull request claiming the head selector %s:%s from a different repository, so the observation cannot settle this run's own pull-request state; the executor refuses to adopt a foreign head or open another pull request; the run needs a human", r.cfg.Repo, r.cfg.Branch)
+	return fmt.Sprintf("the forge reported a pull request claiming the head selector %s:%s from a different repository, so the observation cannot settle this run's own pull-request state; the executor refuses to adopt a foreign head or open another pull request; the run needs a human", runHeadRepo(r.cfg), r.cfg.Branch)
 }
 
 // wrongBasePRReason composes the NeedsHuman reason for an open pull request
@@ -3643,6 +3805,82 @@ func (r reporter) prAmbiguousReason() string {
 // adoption guard's refusal to reopen or duplicate a closed PR.
 func (r reporter) closedOnlyPRReason() string {
 	return fmt.Sprintf("the run branch %q on %s has only closed or merged pull requests and no open one; the executor refuses adoption, reopening, or duplicate creation; the run needs a human", r.cfg.Branch, r.cfg.Repo)
+}
+
+// fixPRUnverifiedMessage composes the fix-pr run's retry continuation
+// message for a failed live forge observation (#517). Like prUnverified
+// message (#247) it is explicitly not a missing-PR claim — a failed
+// read proves nothing about the pinned pull request — but it stays
+// source-issue-free, because a fix-pr run has no trusted source issue:
+// it names the pinned head identity (runHeadRepo) and the pinned pull
+// request number instead, and demands, through the forge capability,
+// that the pinned pull request is the one open, non-draft pull request
+// whose full head identity matches that head and whose base ref is the
+// pinned base. Any other pull request on the head is not the pinned
+// assignment, so it is never the one the model verifies.
+func (r reporter) fixPRUnverifiedMessage(err error, continuation int) string {
+	return fmt.Sprintf(
+		"Courier could not verify the pull-request state for the run branch %q on head %s (%s); this is not proof that the pinned pull request is missing. "+
+			"Confirm through the forge capability that the run branch is published and that the pinned pull request #%d is the one open, non-draft pull request with the run's full head identity against base %q. "+
+			"Any other pull request on that head is not the pinned assignment: do not adopt it. "+
+			"Do not adopt another repository's pull request, and do not change an existing pull request's base or head. "+
+			"If the forge stays unreachable, declare blocked_external naming the block. "+
+			"Then re-declare the same outcome. (continuation %d)",
+		r.cfg.Branch, runHeadRepo(r.cfg), err.Error(), r.cfg.Ref, r.cfg.Base, continuation,
+	)
+}
+
+// fixPRForgeFailureReason composes the NeedsHuman reason when a fix-pr
+// run's pre-handoff forge read failed with no retry left — the budget
+// is spent or no captured session exists (#517). Like
+// linkageForgeFailureReason (#248) it never claims the pinned pull
+// request is missing — a read that did not happen proves nothing about
+// it — but it names the pinned branch/head identity instead of a
+// trusted source issue, because a fix-pr run has none.
+func (r reporter) fixPRForgeFailureReason(err error) string {
+	return fmt.Sprintf("the live pull-request state could not be verified for the run branch %q on %s (head %s): %s; a read that did not happen proves nothing about the pinned pull request; the run needs a human", r.cfg.Branch, r.cfg.Repo, runHeadRepo(r.cfg), err.Error())
+}
+
+// pinnedPRMissingReason composes the NeedsHuman reason for a fix-pr run
+// whose pinned head carries no pull request of any state at handoff
+// (#517). The pinned pull request is the assignment, so the executor
+// neither opens a replacement — which would duplicate or silently
+// re-target the assignment — nor adopts another pull request; the
+// unverified pinned contract is left for a human to settle.
+func (r reporter) pinnedPRMissingReason() string {
+	return fmt.Sprintf("no pull request carries the run's head branch %q (head %s) on the base repository %s, so the pinned pull request is unverified; the executor neither opens a replacement nor adopts another pull request; the run needs a human", r.cfg.Branch, runHeadRepo(r.cfg), r.cfg.Repo)
+}
+
+// pinnedPRDraftReason composes the NeedsHuman reason for a fix-pr run
+// whose pinned pull request is still a draft at handoff (#517). Readiness
+// is a human settlement, never a continuation's unilateral flip, so no
+// readying continuation runs here.
+func (r reporter) pinnedPRDraftReason(number int) string {
+	return fmt.Sprintf("the pinned pull request #%d for the run branch %q is a draft at handoff, so the handoff was refused; readiness is a human settlement, never a continuation's unilateral flip; the run needs a human", number, r.cfg.Branch)
+}
+
+// pinnedPRNumberMismatchReason composes the NeedsHuman reason for a fix-pr
+// run whose observed pull request is not the pinned assignment (#517): the
+// forge reports another pull request on the run's head, so the pinned pull
+// request the run was admitted against is unverified. The executor verifies
+// the pinned assignment only — the same exact-number, base, and head identity
+// the native broker path enforces in checkPR/matchesPR — and never adopts
+// another pull request in its place.
+func (r reporter) pinnedPRNumberMismatchReason(pinned, observed int) string {
+	return fmt.Sprintf("the forge reports pull request #%d on the run's head branch %q (head %s), not the pinned pull request #%d the run was admitted against; the executor verifies the pinned assignment only and never adopts another pull request; the run needs a human", observed, r.cfg.Branch, runHeadRepo(r.cfg), pinned)
+}
+
+// fixPRUnsettledReason composes the NeedsHuman reason for a fix-pr
+// pre-handoff observation that named none of the known fail-closed worlds
+// (#517). The fix-pr observation settles exactly one world or passes, so
+// an outcome this plan cannot read is one the executor must not turn into
+// a Verifying handoff over an unverified pull request.
+func (r reporter) fixPRUnsettledReason(outcome *handoffCheckOutcome) string {
+	number := 0
+	if outcome != nil && outcome.pr != nil {
+		number = outcome.pr.Number
+	}
+	return fmt.Sprintf("the fix-pr pre-handoff observation did not settle a known pull-request world (observed pull request #%d on branch %q); the executor will not hand off over a pull request it did not settle; the run needs a human", number, r.cfg.Branch)
 }
 
 // handoffVerdict is the legacy executor's pre-handoff forge-observation
@@ -3725,6 +3963,16 @@ type handoffVerdict struct {
 //     the operator's bounded retry, because the world was never
 //     observed (#455); any other read failure fails closed to
 //     NeedsHuman (#247, #248).
+//   - A fix-pr run has no trusted source issue to enforce the body
+//     contracts against (#517), so checkHandoff instead re-verifies
+//     its pinned head through the same listing: only the run's pinned
+//     pull request — the exact number the run was admitted against,
+//     open, non-draft, on the pinned base, with the run's commit
+//     published — passes, every other world fails closed to
+//     NeedsHuman (a pull request that is not the pinned assignment,
+//     draft and missing without the resolve-issue continuations), and
+//     a resumable read failure retries with the fix-pr unverified
+//     message naming the pinned identity.
 //   - Two operator-side envelope faults are not read failures and not
 //     model-repairable defects, so they fail closed to NeedsHuman on
 //     sight without consuming the #170 budget (#282). The
@@ -3802,14 +4050,27 @@ func (r reporter) applyHandoffPlan(ctx context.Context, continuations int, maxCo
 				// a human as a verification rejection (#455).
 				return handoffVerdict{FailReason: r.forgeUnavailableReason(linkErr), ForgeUnavailable: true}
 			}
+			// A fix-pr run has no trusted source issue for the linkage
+			// failure reason to cite (#517): its unresolvable read
+			// failure names the pinned head identity in the same
+			// not-a-missing-PR terms (#247).
+			if isFixPRRun(r.cfg) {
+				return handoffVerdict{FailReason: r.fixPRForgeFailureReason(linkErr)}
+			}
 			return handoffVerdict{FailReason: r.linkageForgeFailureReason(linkErr)}
 		}
 		// The verifier could not read the forge state at all. That is
 		// not a confirmed missing PR (#247), so the retry message says
 		// what is known — the observation failed — rather than asserting
 		// absence; the captured session re-verifies and repairs inside
-		// the bounded budget.
+		// the bounded budget. A fix-pr run has no source issue for that
+		// message to name (#517), so its instruction asserts the pinned
+		// head identity instead, under the same "pr-unverified" kind
+		// for the event audit.
 		next := continuations + 1
+		if isFixPRRun(r.cfg) {
+			return handoffVerdict{Kind: "pr-unverified", ContinueMsg: r.fixPRUnverifiedMessage(linkErr, next)}
+		}
 		return handoffVerdict{Kind: "pr-unverified", ContinueMsg: r.prUnverifiedMessage(r.sourceIssue(), linkErr, next)}
 	}
 	if linkOutcome == nil {
@@ -3828,6 +4089,35 @@ func (r reporter) applyHandoffPlan(ctx context.Context, continuations int, maxCo
 		return handoffVerdict{FailReason: r.wrongBasePRReason()}
 	case linkOutcome.unpublished:
 		return handoffVerdict{FailReason: r.unpublishedBranchReason(linkOutcome.publication)}
+	case linkOutcome.pinnedMissing:
+		// fix-pr-only worlds whose fixed consequences no resolve-issue
+		// continuation may stand in for (#517): a missing pinned PR is
+		// never opened as a replacement, and a draft pinned PR is
+		// never readied unilaterally.
+		return handoffVerdict{FailReason: r.pinnedPRMissingReason()}
+	case linkOutcome.pinnedMismatch:
+		// The observed pull request is not the pinned assignment (#517):
+		// the head's pull request is never a substitute for the pull
+		// request the run was admitted against, so the handoff fails
+		// closed instead of verifying an assignment nobody pinned. The
+		// verdict carries no PR number: the observed pull request is
+		// not this run's pull request, and the reason names both
+		// numbers instead.
+		return handoffVerdict{FailReason: r.pinnedPRNumberMismatchReason(r.cfg.Ref, linkOutcome.pr.Number)}
+	case linkOutcome.pinnedDraft:
+		return handoffVerdict{PRNumber: linkOutcome.pr.Number, FailReason: r.pinnedPRDraftReason(linkOutcome.pr.Number)}
+	}
+	// A fix-pr observation settles one world or none: it either passes
+	// (no outcome at all, handled above) or names exactly one of the
+	// fail-closed worlds above. An outcome that names none of them is a
+	// world this plan cannot read, and the resolve-issue machinery below
+	// — the ready/create continuations and the body-contract verdict —
+	// does not apply to a fix-pr run, whose assignment is the pinned
+	// pull request rather than a pull-request body. Reading it as a
+	// Verifying handoff would verify a pull request nobody pinned, so
+	// it fails closed instead (#517).
+	if isFixPRRun(r.cfg) {
+		return handoffVerdict{FailReason: r.fixPRUnsettledReason(linkOutcome)}
 	}
 	resumable := sessionID != "" && ctxErr == nil && continuations < maxContinuations
 	switch {
