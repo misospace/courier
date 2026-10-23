@@ -98,7 +98,11 @@ func serviceResourceName(runName, suffix string) string {
 	if len(base) > maxBase {
 		base = base[:maxBase]
 	}
-	base = strings.Trim(base, "-")
+	// Trailing dots are trimmed along with the hyphens before the digest is
+	// joined, the way resourceName does it: normalization replaces dots with
+	// hyphens first, but the cut prefix handed to the join is never allowed
+	// to end in a dot, which would follow a run name's label with a hyphen.
+	base = strings.Trim(base, "-.")
 	if base == "" {
 		base = "run"
 	} else if base[0] < 'a' || base[0] > 'z' {

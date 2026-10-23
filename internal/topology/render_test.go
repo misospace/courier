@@ -797,6 +797,16 @@ func TestServiceNamesAreValidDNSLabels(t *testing.T) {
 		strings.Repeat("a", 59) + "y",
 		strings.Repeat("z", 253),
 		strings.Repeat("a.b", 84) + "c",
+		// Dotted names whose normalized prefix outgrows the label budget with
+		// the truncation cut landing immediately after a dot: normalization
+		// replaces dots with hyphens, so the cut must trim that trailing
+		// hyphen rather than join the digest right after it. "-broker" and
+		// "-worker" both leave a 47-character budget for a letter-leading
+		// name and 46 after the digit-leading letter-prefix reserve, and
+		// both of these names are 48 characters normalized, so the cut lands
+		// immediately after a former dot in each.
+		strings.Repeat("a.b", 16),
+		strings.Repeat("1.", 23) + "12",
 	}
 	for _, name := range names {
 		if errs := validation.IsDNS1123Subdomain(name); len(errs) > 0 {
