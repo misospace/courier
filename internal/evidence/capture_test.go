@@ -1276,12 +1276,13 @@ func TestRunGitPrefersCancellationOverACompletedSuccess(t *testing.T) {
 // ProcessState, and that branch returns the bytes as a clean success. That
 // branch answered on the context itself before #469 — the error branch above
 // it observed ctx.Err() first — so this test does not pin a pre-#469 defect
-// and passes against the old code; it fails a fix that guards only the final
-// `return stdout.Bytes(), nil`, which leaves the rule below reachable with
-// late bytes. #421 remains a claim about a live context — the bytes stand
-// because the timeout was ours rather than git's — so an expired context takes
-// it away, and TestRunGitSurvivingPipeOnSuccess is the live-context half and
-// must keep passing: #421 is narrowed here, not reversed.
+// and passes against the old code; it fails a fix that narrows the guard to
+// the final `return stdout.Bytes(), nil` and drops the error branch's own
+// context check, which leaves the rule below reachable with late bytes. #421
+// remains a claim about a live context — the bytes stand because the timeout
+// was ours rather than git's — so an expired context takes it away, and
+// TestRunGitSurvivingPipeOnSuccess is the live-context half and must keep
+// passing: #421 is narrowed here, not reversed.
 func TestRunGitExpiredContextBeatsTheErrWaitDelayKeepBytesRule(t *testing.T) {
 	t.Parallel()
 
