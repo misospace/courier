@@ -85,7 +85,7 @@ func (r *CoderRunReconciler) ciRepairPolicy(ctx context.Context, run *courierv1a
 		return nil, err
 	}
 	policy := lane.Spec.CIRepair
-	if policy == nil || len(policy.MechanicalChecks) == 0 || policy.MaxAttempts <= 0 {
+	if policy == nil || len(normalizedMechanicalChecks(policy.MechanicalChecks)) == 0 || policy.MaxAttempts <= 0 {
 		return nil, nil
 	}
 	return policy, nil

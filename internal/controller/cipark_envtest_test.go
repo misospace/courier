@@ -611,6 +611,63 @@ func TestEnvtestCIParkForeignHeadFailsClosed(t *testing.T) {
 	}
 }
 
+// TestEnvtestCIParkSupersededHeadFailsClosed pins the ownership boundary a
+// stale observation crosses: a completed brief's commit stays in the run's
+// durable account, but once the broker-verified publication record names a
+// newer head, an observation of the older one is superseded — the run hands
+// off instead of resuming a repair of a head its own account has moved past.
+func TestEnvtestCIParkSupersededHeadFailsClosed(t *testing.T) {
+	if envtestClient == nil {
+		t.Skip("KUBEBUILDER_ASSETS is not set")
+	}
+	h := newCIParkHarness(t, "cipark-superseded", ciparkPolicy(2), &admissionSource{})
+
+	h.park("sha-1", CheckObservation{Name: "build", State: CheckStatePending})
+
+	// The completed brief's durable record carries the parked head, exactly
+	// as the harness leaves it alongside the confirmed published commit.
+	withCompletedBrief(t, h, "sha-1")
+
+	// The run publishes a newer head: the broker-verified account now names
+	// sha-2, which supersedes every older commit the run accounts for.
+	h.publishHead("sha-2")
+
+	// A stale observation of the superseded head reports its mechanical
+	// check red. It must fail closed, not resume a repair of a head the
+	// run's own publication record has moved past.
+	h.world.set(redObservation("sha-1", "build"))
+	h.reconcile()
+	if got := h.phase(); got != courierv1alpha1.PhaseHandedOff {
+		t.Fatalf("phase after the superseded head = %q, want HandedOff", got)
+	}
+	final := h.run()
+	if final.Status.CIPark == nil {
+		t.Fatal("status.cipark = nil after the handoff, want the park record")
+	}
+	if final.Status.CIPark.LastOutcome != courierv1alpha1.CIParkOutcomeUnsupported {
+		t.Fatalf("park outcome = %q, want %q", final.Status.CIPark.LastOutcome, courierv1alpha1.CIParkOutcomeUnsupported)
+	}
+	if final.Status.CIPark.Attempts != 0 {
+		t.Fatalf("park attempts = %d, want 0 (a superseded head never repairs)", final.Status.CIPark.Attempts)
+	}
+	if got := h.launchCount(h.name); got != 1 {
+		t.Fatalf("launches = %d, want 1 (a superseded head never wakes the coordinator)", got)
+	}
+}
+
+// withCompletedBrief records a completed brief carrying the given commit in
+// the harness run's durable checkpoint, the way CheckpointPublished leaves it.
+func withCompletedBrief(t *testing.T, h *ciparkHarness, commit string) {
+	t.Helper()
+	run := h.run()
+	run.Status.Checkpoint = &courierv1alpha1.Checkpoint{
+		CompletedBriefs: []courierv1alpha1.Brief{{ID: "brief-1", Commit: commit}},
+	}
+	if err := envtestClient.Status().Update(context.Background(), run); err != nil {
+		t.Fatal(err)
+	}
+}
+
 // TestEnvtestCIParkHoldsNoLaneCapacity pins the capacity boundary: a parked
 // run holds no lane slot, so the lane still admits another run.
 func TestEnvtestCIParkHoldsNoLaneCapacity(t *testing.T) {
