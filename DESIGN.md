@@ -221,10 +221,12 @@ park cannot wake the coordinator twice for one attempt.
 The head that decides must be the run's own, and it is attributable only
 through durable publication evidence: the confirmed `status.lastCommit` — a
 write the broker accepts only while the live work ref still carries that
-commit — or a completed brief's commit. A head the run cannot account for is
-somebody else's work, and the run never repairs it: it fails closed to handoff
-once the run is parked, and before a park exists the ordinary grading path
-decides it. A repair attempt that publishes a new head advances the park to
+commit — which, once recorded, supersedes every older commit the run accounts
+for; a completed brief's commit attributes a head only while no published head
+is recorded. A head the run cannot currently account for is somebody else's
+work or a superseded head, and the run never repairs it: it fails closed to
+handoff once the run is parked, and before a park exists the ordinary grading
+path decides it. A repair attempt that publishes a new head advances the park to
 that head, records the attempt as `repushed`, and the loop runs again while
 budget remains; one that publishes nothing earns no further attempt on the
 same head. Every other outcome ends the run without waking the coordinator:

@@ -31,6 +31,13 @@ func TestPublishedHead(t *testing.T) {
 			wantAttributed: true,
 		},
 		{
+			name:           "a completed brief's commit older than the published head is superseded",
+			lastCommit:     "aaa",
+			briefCommits:   []string{"old", "aaa"},
+			observed:       "old",
+			wantAttributed: false,
+		},
+		{
 			name:           "a head the run cannot account for is foreign",
 			lastCommit:     "aaa",
 			briefCommits:   []string{"bbb"},
@@ -77,16 +84,26 @@ func TestPublishedHead(t *testing.T) {
 }
 
 func TestMechanicalSelectorMatchesExactly(t *testing.T) {
-	selector := mechanicalSelector([]string{"build", " test ", ""})
+	selector := mechanicalSelector([]string{"build", "test", "", "build"})
 	for _, name := range []string{"build", "test"} {
 		if !selector(name) {
 			t.Fatalf("selector(%q) = false, want true", name)
 		}
 	}
-	for _, name := range []string{"Build", "BUILD", "build ", " unit-test", "ai-review", ""} {
+	for _, name := range []string{"Build", "BUILD", "build ", "build\t", " test", "unit-test", "ai-review", ""} {
 		if selector(name) {
 			t.Fatalf("selector(%q) = true, want false", name)
 		}
+	}
+	// A declared name padded with space is its own exact name: it never
+	// widens to the unpadded check, so a misdeclared lane fails closed with
+	// a check that can never register instead of silently matching.
+	padded := mechanicalSelector([]string{" test "})
+	if padded("test") {
+		t.Fatal(`selector("test") = true for a lane declaring " test ", want false`)
+	}
+	if !padded(" test ") {
+		t.Fatal(`selector(" test ") = false, want the exact declared name to match`)
 	}
 }
 
@@ -168,6 +185,16 @@ func TestMechanicalVerdict(t *testing.T) {
 			configured: []string{"build", "test"},
 			checks: []CheckObservation{
 				{Name: "build", State: CheckStatePassed},
+			},
+			wantGreen:    false,
+			wantEligible: 1,
+		},
+		{
+			name:       "a space-padded registration does not cover the unpadded check",
+			configured: []string{"build", " test"},
+			checks: []CheckObservation{
+				{Name: "build", State: CheckStatePassed},
+				{Name: "test", State: CheckStatePassed},
 			},
 			wantGreen:    false,
 			wantEligible: 1,

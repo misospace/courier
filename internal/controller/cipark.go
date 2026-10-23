@@ -92,14 +92,20 @@ func (r *CoderRunReconciler) ciRepairPolicy(ctx context.Context, run *courierv1a
 }
 
 // normalizedMechanicalChecks returns the lane's configured mechanical check
-// names, trimmed of surrounding space with empty and duplicate names dropped.
-// Selection and verdicts share this one normalization so the predicate and
-// the coverage rule can never disagree about what the lane configured.
+// names, with empty and duplicate names dropped and every other name kept
+// exactly as declared. Selection and verdicts share this one normalization so
+// the predicate and the coverage rule can never disagree about what the lane
+// configured.
+//
+// Names are never trimmed: a declared name that carries surrounding space is
+// its own exact name, so it can never widen to a differently spelled forge
+// check. Such a declaration simply never registers, and the run fails closed
+// to handoff instead of silently repairing under a name the lane did not
+// write.
 func normalizedMechanicalChecks(names []string) []string {
 	seen := make(map[string]struct{}, len(names))
 	normalized := make([]string, 0, len(names))
 	for _, name := range names {
-		name = strings.TrimSpace(name)
 		if name == "" {
 			continue
 		}
@@ -133,15 +139,21 @@ func mechanicalSelector(names []string) MechanicalCheckSelector {
 //
 // Attribution uses durable, run-owned publication evidence only: the last
 // commit the harness reported as published, which the broker verified against
-// the live work ref, and the commits of the run's completed briefs. A head
-// the run cannot account for is somebody else's work, and a repair of it
-// would be a repair of the wrong commit.
+// the live work ref, and — only while no published head is recorded — the
+// commits of the run's completed briefs. Once a published head is recorded it
+// supersedes every older commit the run accounts for: an observation of one
+// is the world having moved on (or a stale read of it), and a head the run
+// cannot currently account for is somebody else's work or a superseded head,
+// either of which fails closed instead of parking or repairing.
 func publishedHead(run *courierv1alpha1.CoderRun, observed string) (string, bool) {
 	if observed == "" {
 		return "", false
 	}
-	if run.Status.LastCommit == observed {
-		return observed, true
+	if run.Status.LastCommit != "" {
+		if run.Status.LastCommit == observed {
+			return observed, true
+		}
+		return "", false
 	}
 	if run.Status.Checkpoint != nil {
 		briefs := run.Status.Checkpoint.CompletedBriefs
