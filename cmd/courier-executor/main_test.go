@@ -3178,6 +3178,208 @@ func TestGuardFixPRBase(t *testing.T) {
 	}
 }
 
+// TestRunFixPRWrongBaseWorkspaceFailsClosedOnLiveBaseMismatch is the #514
+// regression the reviewer asked for: a fix-pr run finds a workspace that
+// already holds the incident's shape — a local merge of the wrong base that
+// the remote never advertised — and the pinned pull request's live base
+// differs from the run's pinned base. The run must fail closed before the
+// coordinator can continue under the wrong base assumption: it never starts
+// the coordinator, and it leaves the stale merge untouched for a human to
+// settle. No salvage machinery is implied; the run simply refuses.
+func TestRunFixPRWrongBaseWorkspaceFailsClosedOnLiveBaseMismatch(t *testing.T) {
+	root := t.TempDir()
+	remote := remoteWithExistingBranch(t, root)
+
+	// The default branch moves past the published run branch, so merging
+	// it into the workspace's run branch is a real merge commit — the
+	// shape the incident's coordinator found, not a no-op.
+	source := filepath.Join(root, "source")
+	write(t, filepath.Join(source, "README.md"), "base edit\n")
+	commit(t, source, "base: edit readme")
+	runGit(t, source, "push", "origin", "main")
+
+	workspace := filepath.Join(root, "workspace")
+	runGit(t, root, "clone", remote, workspace)
+	configureGit(t, workspace)
+	runGit(t, workspace, "checkout", "-B", "courier/resolve-issue/acme-widgets/7", "origin/courier/resolve-issue/acme-widgets/7")
+	runGit(t, workspace, "merge", "--no-edit", "origin/main")
+	staleMerge, _ := gitResult(t, workspace, "rev-parse", "HEAD")
+	parents, _ := gitResult(t, workspace, "rev-list", "--parents", "-n", "1", "HEAD")
+	if len(strings.Fields(parents)) != 3 {
+		t.Fatalf("workspace HEAD = %q is not a merge commit (%q): the fixture must reproduce the incident's wrong-base merge", staleMerge, parents)
+	}
+	publishedHead := remoteHeadSHA(t, remote, "courier/resolve-issue/acme-widgets/7")
+	if publishedHead == staleMerge {
+		t.Fatalf("published head = %q, want a commit the remote never advertised: the stale merge must be local-only", publishedHead)
+	}
+
+	marker := filepath.Join(root, "scratch", "coordinator-ran")
+	fakeOpenCode := filepath.Join(root, "opencode")
+	writeExecutable(t, fakeOpenCode, "#!/bin/sh\ncase \"$1\" in mcp) exit 0;; esac\nmkdir -p \"$COURIER_SCRATCH_DIR\"\nprintf 'coordinator ran\\n' > \"$COURIER_SCRATCH_DIR/coordinator-ran\"\nexit 0\n")
+
+	// The pinned pull request is live on the default branch while the run
+	// pinned a stacked base, so the live base and the pinned base disagree.
+	prServer, prState := fakeForgePullRequestServer(t)
+	write(t, prState, "["+pullRequestFixtureObjectJSONWithBase(7, "open", false, "main", "Feedback pending.")+"]")
+
+	setResolveIssueEnv(t, root, remote, prServer.URL, fakeOpenCode)
+	t.Setenv("COURIER_MODE", "fix-pr")
+	// A same-repo head identity keeps the fix-pr head guard out of the way.
+	t.Setenv("COURIER_HEAD_REPO", "acme/widgets")
+	t.Setenv("COURIER_BASE", "courier/acme/widgets/issue-9")
+	t.Setenv("COURIER_REF", "7")
+	t.Setenv("COURIER_RUN_NAME", "coderrun-it-7")
+	t.Setenv("GITHUB_TOKEN", "test-token")
+
+	var output bytes.Buffer
+	var errorsOut bytes.Buffer
+	if code := run(context.Background(), &output, &errorsOut); code != exitNeedsHuman {
+		t.Fatalf("run exit code = %d, want %d; stdout=%q stderr=%q", code, exitNeedsHuman, output.String(), errorsOut.String())
+	}
+	if !strings.Contains(output.String(), `"phase":"NeedsHuman"`) {
+		t.Fatalf("needs-human phase missing: %q", output.String())
+	}
+	if !strings.Contains(output.String(), `targets base \"main\"`) {
+		t.Fatalf("termination must name the pull request's live base: %q", output.String())
+	}
+	if !strings.Contains(output.String(), `pinned base \"courier/acme/widgets/issue-9\"`) {
+		t.Fatalf("termination must name the run's pinned base: %q", output.String())
+	}
+	if _, err := os.Stat(marker); !os.IsNotExist(err) {
+		t.Fatalf("coordinator ran under a wrong base assumption: marker %q exists (stat error %v)", marker, err)
+	}
+	head, _ := gitResult(t, workspace, "rev-parse", "HEAD")
+	if head != staleMerge {
+		t.Fatalf("workspace HEAD = %q, want the untouched stale merge %q: the run refused before it touched the workspace", head, staleMerge)
+	}
+}
+
+// TestRunFixPRStackedBasePreparationLeavesNoWrongBaseMerge is the other half
+// of the #514 regression the reviewer asked for: when the pinned pull
+// request's live base is the run's pinned base, the preparation syncs that
+// base, so the wrong-base merge the incident saw can no longer be produced.
+// The workspace ends on the published head of the run branch with no merge
+// commit anywhere in its history, and the default branch was never merged
+// in. This is the "rebuild from the published head and sync against the
+// pinned base" the reviewer accepted, not salvage machinery.
+func TestRunFixPRStackedBasePreparationLeavesNoWrongBaseMerge(t *testing.T) {
+	root := t.TempDir()
+	stackedBase := "courier/acme/widgets/issue-9"
+	remote := remoteWithDivergingStackedBase(t, root, stackedBase)
+	publishedHead := remoteHeadSHA(t, remote, "courier/resolve-issue/acme-widgets/7")
+	defaultHead := remoteHeadSHA(t, remote, "main")
+
+	fakeOpenCode := filepath.Join(root, "opencode")
+	writeExecutable(t, fakeOpenCode, "#!/bin/sh\ncase \"$1\" in mcp) exit 0;; esac\nmkdir -p \"$COURIER_SCRATCH_DIR\"\nprintf 'coordinator ran\\n' > \"$COURIER_SCRATCH_DIR/coordinator-ran\"\nprintf '{\"outcome\":\"no_change_needed\",\"evidence\":\"feedback looks addressed\"}' > \"$COURIER_SCRATCH_DIR/outcome.json\"\nexit 0\n")
+
+	// The pinned pull request is live on the run's pinned base and mergeable,
+	// so the guard passes and the run reaches its outcome path.
+	prServer, prState := fakeForgePullRequestServer(t)
+	write(t, prState, `[{"number":7,"state":"open","mergeable":true,"mergeable_state":"clean","base":{"ref":"courier/acme/widgets/issue-9","sha":"b","repo":{"full_name":"acme/widgets"}},"head":{"ref":"courier/resolve-issue/acme-widgets/7","sha":"c","repo":{"full_name":"acme/widgets"}}}]`)
+
+	workspace := setResolveIssueEnv(t, root, remote, prServer.URL, fakeOpenCode)
+	t.Setenv("COURIER_MODE", "fix-pr")
+	// A same-repo head identity keeps the fix-pr head guard out of the way.
+	t.Setenv("COURIER_HEAD_REPO", "acme/widgets")
+	t.Setenv("COURIER_BASE", stackedBase)
+	t.Setenv("COURIER_REF", "7")
+	t.Setenv("COURIER_RUN_NAME", "coderrun-it-7")
+	t.Setenv("GITHUB_TOKEN", "test-token")
+
+	var output bytes.Buffer
+	var errorsOut bytes.Buffer
+	if code := run(context.Background(), &output, &errorsOut); code != exitNoChangeNeeded {
+		t.Fatalf("run exit code = %d, want %d; stdout=%q stderr=%q", code, exitNoChangeNeeded, output.String(), errorsOut.String())
+	}
+	if !strings.Contains(output.String(), `"phase":"NoChangeNeeded"`) {
+		t.Fatalf("no-change-needed phase missing: %q", output.String())
+	}
+	if _, err := os.Stat(filepath.Join(root, "scratch", "coordinator-ran")); err != nil {
+		t.Fatalf("coordinator did not run: marker missing (stat error %v); the preparation never happened", err)
+	}
+	head, _ := gitResult(t, workspace, "rev-parse", "HEAD")
+	if head != publishedHead {
+		t.Fatalf("workspace HEAD = %q, want the published head %q: the preparation must not move the branch off the published head", head, publishedHead)
+	}
+	merges, _ := gitResult(t, workspace, "log", "--merges", "--oneline")
+	if merges != "" {
+		t.Fatalf("workspace history holds merge commits %q, want none: the preparation must not merge any base into the run branch", merges)
+	}
+	if _, code := gitResult(t, workspace, "merge-base", "--is-ancestor", defaultHead, "HEAD"); code == 0 {
+		t.Fatalf("the default branch tip %q is an ancestor of the workspace HEAD %q: the wrong base was merged in", defaultHead, head)
+	}
+}
+
+// remoteWithDivergingStackedBase builds a bare remote whose default branch
+// and the run's stacked base branch diverge from the same initial commit,
+// with the run branch published from the stacked base plus one work commit:
+// the world a stacked pull request's head lives in.
+func remoteWithDivergingStackedBase(t *testing.T, root, stackedBase string) string {
+	t.Helper()
+	remote := filepath.Join(root, "remote.git")
+	source := filepath.Join(root, "source")
+	runGit(t, root, "init", "--bare", remote)
+	runGit(t, root, "init", source)
+	configureGit(t, source)
+	write(t, filepath.Join(source, "README.md"), "base one\n")
+	commit(t, source, "base: initial")
+	runGit(t, source, "branch", "-M", "main")
+	runGit(t, source, "remote", "add", "origin", remote)
+	runGit(t, source, "push", "-u", "origin", "main")
+
+	// The two sides edit README.md in disjoint regions, so the divergence
+	// is a mergeable one: a wrong-base merge of the default branch into
+	// the run branch would succeed and be observable in the workspace,
+	// which is what makes the assertions on the prepared workspace mean
+	// something.
+	runGit(t, source, "checkout", "-b", stackedBase)
+	write(t, filepath.Join(source, "README.md"), "stacked side\nbase one\n")
+	commit(t, source, "stacked: base side")
+	runGit(t, source, "push", "origin", stackedBase)
+	runGit(t, source, "checkout", "main")
+	write(t, filepath.Join(source, "README.md"), "base one\nmain side\n")
+	commit(t, source, "main: default side")
+	runGit(t, source, "push", "origin", "main")
+
+	runGit(t, source, "checkout", "-b", "courier/resolve-issue/acme-widgets/7", stackedBase)
+	write(t, filepath.Join(source, "work.txt"), "stacked work\n")
+	commit(t, source, "work: stacked brief")
+	runGit(t, source, "push", "origin", "courier/resolve-issue/acme-widgets/7")
+	return remote
+}
+
+// remoteHeadSHA reports the commit the remote advertises for a branch.
+func remoteHeadSHA(t *testing.T, remote, branch string) string {
+	t.Helper()
+	out, code := gitResult(t, "", "ls-remote", "--heads", "--", remote, "refs/heads/"+branch)
+	if code != 0 {
+		t.Fatalf("git ls-remote %s: exit code %d: %q", branch, code, out)
+	}
+	fields := strings.Fields(out)
+	if len(fields) == 0 {
+		t.Fatalf("remote %s does not advertise branch %q", remote, branch)
+	}
+	return fields[0]
+}
+
+// gitResult runs git in directory and returns its trimmed output and exit
+// code, so a test can assert on a git refusal as well as on what git printed.
+func gitResult(t *testing.T, directory string, args ...string) (string, int) {
+	t.Helper()
+	cmd := exec.Command("git", args...)
+	cmd.Dir = directory
+	out, err := cmd.CombinedOutput()
+	if err == nil {
+		return strings.TrimSpace(string(out)), 0
+	}
+	var exitErr *exec.ExitError
+	if errors.As(err, &exitErr) {
+		return strings.TrimSpace(string(out)), exitErr.ExitCode()
+	}
+	t.Fatalf("git %s: %v (%s)", strings.Join(args, " "), err, out)
+	return "", -1
+}
+
 // gitRemoteWithBranch builds a bare remote with main and the named branch
 // published, the state a fork head carries when the PR head is reachable.
 func gitRemoteWithBranch(t *testing.T, root, branch string) string {
