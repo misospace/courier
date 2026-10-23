@@ -365,6 +365,11 @@ func (p *Provider) CommentPullRequest(ctx context.Context, ref forge.PullRequest
 // from the repository the request was made against. A missing head (for
 // example a deleted fork) or base repository identity is an error, so
 // incomplete API data stays detectable rather than being silently backfilled.
+// Mergeability maps conservatively: GitHub's mergeable_state "dirty" is the
+// authoritative conflict signal and wins over the boolean, the "unknown"
+// state means the answer is still being computed and maps to nil even when a
+// stale boolean is present, and a pending or absent answer maps to nil —
+// callers must treat nil as unverifiable rather than satisfied (#513).
 func toForgePR(pr PullRequest) (forge.PullRequest, error) {
 	baseRepo := pr.Base.Repo.FullName
 	if baseRepo == "" {
@@ -374,20 +379,29 @@ func toForgePR(pr PullRequest) (forge.PullRequest, error) {
 	if headRepo == "" {
 		return forge.PullRequest{}, fmt.Errorf("pull request %d: response is missing the head repository identity", pr.Number)
 	}
+	mergeable := pr.Mergeable
+	switch pr.MergeableState {
+	case "dirty":
+		conflicting := false
+		mergeable = &conflicting
+	case "unknown":
+		mergeable = nil
+	}
 	return forge.PullRequest{
-		Number:   pr.Number,
-		Repo:     baseRepo,
-		BaseRepo: baseRepo,
-		BaseRef:  pr.Base.Ref,
-		BaseSHA:  pr.Base.SHA,
-		HeadRepo: headRepo,
-		HeadRef:  pr.Head.Ref,
-		HeadSHA:  pr.Head.SHA,
-		Title:    pr.Title,
-		Body:     pr.Body,
-		State:    pr.State,
-		Draft:    pr.Draft,
-		URL:      pr.HTMLURL,
-		Merged:   pr.MergedAt != "",
+		Number:    pr.Number,
+		Repo:      baseRepo,
+		BaseRepo:  baseRepo,
+		BaseRef:   pr.Base.Ref,
+		BaseSHA:   pr.Base.SHA,
+		HeadRepo:  headRepo,
+		HeadRef:   pr.Head.Ref,
+		HeadSHA:   pr.Head.SHA,
+		Title:     pr.Title,
+		Body:      pr.Body,
+		State:     pr.State,
+		Draft:     pr.Draft,
+		URL:       pr.HTMLURL,
+		Merged:    pr.MergedAt != "",
+		Mergeable: mergeable,
 	}, nil
 }

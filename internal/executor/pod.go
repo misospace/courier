@@ -38,8 +38,8 @@ const (
 	LabelDebug             = "courier.misospace.dev/debug"
 	runtimePath            = "/courier-runtime"
 	scratchPath            = "/var/tmp/courier-scratch"
-	toolchainCachePath     = "/courier-toolchain-cache" // read-write; lane toolchain caches (GOMODCACHE etc.) live here, path pinned by the runtime image
-	toolchainReferencePath = "/courier-toolchain"       // same volume, read-only; the coordinator's inspection entry point
+	ToolchainCachePath     = "/courier-toolchain-cache" // read-write; lane toolchain caches (GOMODCACHE etc.) live here, path pinned by the runtime image
+	ToolchainReferencePath = "/courier-toolchain"       // same volume, read-only; the coordinator's inspection entry point
 )
 
 // PodConfig controls runtime-specific details without putting provider or
@@ -188,7 +188,7 @@ func (b *PodBuilder) Build(run *courierv1alpha1.CoderRun, lane *courierv1alpha1.
 	}
 
 	labels := map[string]string{
-		LabelRun:                       labelValue(run.Name),
+		LabelRun:                       RunLabelValue(run.Name),
 		LabelComponent:                 "coordinator",
 		LabelExecutor:                  labelValue(executorImpl.Name()),
 		LabelRepo:                      labelValue(run.Spec.Repo),
@@ -275,10 +275,10 @@ func (b *PodBuilder) Build(run *courierv1alpha1.CoderRun, lane *courierv1alpha1.
 					MountPath: scratchPath,
 				}, {
 					Name:      "toolchain-cache",
-					MountPath: toolchainCachePath,
+					MountPath: ToolchainCachePath,
 				}, {
 					Name:      "toolchain-cache",
-					MountPath: toolchainReferencePath,
+					MountPath: ToolchainReferencePath,
 					ReadOnly:  true,
 				}},
 				SecurityContext: &corev1.SecurityContext{
@@ -392,7 +392,7 @@ func podEnvironment(invocation Invocation, executorName string, config PodConfig
 		corev1.EnvVar{Name: "TMP", Value: scratchPath},
 		corev1.EnvVar{Name: "TEMP", Value: scratchPath},
 		corev1.EnvVar{Name: "COURIER_SCRATCH_DIR", Value: scratchPath},
-		corev1.EnvVar{Name: "COURIER_TOOLCHAIN_DIR", Value: toolchainReferencePath},
+		corev1.EnvVar{Name: "COURIER_TOOLCHAIN_DIR", Value: ToolchainReferencePath},
 	)
 	// Per-key credential references come from the shared helper so the pod
 	// builder and the evidence intake can never enumerate the same Secret keys
@@ -450,12 +450,41 @@ func podName(runName string) string {
 }
 
 // RunLabelValue is the value the run label (LabelRun) is written with, so a
-// reader selecting on it matches the pods the operator creates.
+// reader selecting on it matches the pods the operator creates. All runs in
+// one namespace share the label, so the value must stay a correct run
+// selector: it is sanitized to a label-safe form and, when that overflows
+// the 63-character label cap, truncated and hash-suffixed with a digest of
+// the full run name so two runs sharing a long prefix do not collide. The
+// scheme mirrors topology.RunLabelValue, which renders the same label on
+// secure pods; executor cannot import topology (topology imports executor),
+// so the two hold the construction in parallel, and controller readers
+// accept both schemes plus LegacyRunLabelValue, which pods created before
+// the digest scheme carry.
 func RunLabelValue(name string) string {
+	sanitized := sanitizeLabelValue(name)
+	const max = 63
+	if len(sanitized) <= max {
+		return sanitized
+	}
+	digest := sha256.Sum256([]byte(name))
+	hash := hex.EncodeToString(digest[:])[:8]
+	cut := max - len(hash) - 1
+	return strings.TrimRight(sanitized[:cut], "-_.") + "-" + hash
+}
+
+// LegacyRunLabelValue is the run-label scheme that predates the digest:
+// sanitized and truncated to 63 characters, so two run names sharing a
+// 63-character prefix collide. Nothing writes it any more; readers accept
+// it only so executor pods created before the digest scheme stay attributed
+// to their run until they are replaced.
+func LegacyRunLabelValue(name string) string {
 	return labelValue(name)
 }
 
-func labelValue(value string) string {
+// sanitizeLabelValue lowercases a value and replaces any character outside
+// the allowed label set with a hyphen, trimming the ends. It returns
+// "unknown" for an empty result.
+func sanitizeLabelValue(value string) string {
 	value = strings.ToLower(strings.TrimSpace(value))
 	var b strings.Builder
 	for _, char := range value {
@@ -469,10 +498,19 @@ func labelValue(value string) string {
 	if value == "" {
 		return "unknown"
 	}
-	if len(value) > 63 {
-		value = strings.TrimRight(value[:63], "-_.")
-	}
 	return value
+}
+
+// labelValue is the bounded non-identity form: sanitized and truncated to
+// the 63-character label cap without a digest. It bounds labels that group
+// rather than select run identity (executor, repo, mode, lane), and it is
+// the legacy run-label scheme readers still accept via LegacyRunLabelValue.
+func labelValue(value string) string {
+	sanitized := sanitizeLabelValue(value)
+	if len(sanitized) > 63 {
+		sanitized = strings.TrimRight(sanitized[:63], "-_.")
+	}
+	return sanitized
 }
 
 func nonEmpty(value string) string { return strings.TrimSpace(value) }
@@ -510,10 +548,10 @@ func (c PodConfig) Validate() error {
 	if pathsOverlap(c.WorkspacePath, scratchPath) {
 		return errors.New("executor: workspace path must not overlap the scratch path")
 	}
-	if pathsOverlap(c.WorkspacePath, toolchainCachePath) {
+	if pathsOverlap(c.WorkspacePath, ToolchainCachePath) {
 		return errors.New("executor: workspace path must not overlap the toolchain cache path")
 	}
-	if pathsOverlap(c.WorkspacePath, toolchainReferencePath) {
+	if pathsOverlap(c.WorkspacePath, ToolchainReferencePath) {
 		return errors.New("executor: workspace path must not overlap the toolchain reference path")
 	}
 	if err := c.Git.Validate(); err != nil {

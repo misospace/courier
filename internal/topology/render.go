@@ -377,6 +377,12 @@ func WorkerService(run *courier.CoderRun) *corev1.Service {
 //
 // resources is the lane-configured sizing; the zero value renders the
 // built-in default rather than a BestEffort pod.
+//
+// image is the caller-resolved worker runtime: the deployment harness image
+// by default, or the lane's RuntimeImage. Whatever it names must carry
+// /usr/local/bin/courier-worker; the mounts below cannot shadow baked tool
+// installations because tools install outside the toolchain cache paths
+// (/usr/local/go, /usr/local/bin) — the contract the Dockerfile pins.
 func WorkerPod(run *courier.CoderRun, image string, controlIncarnationUID string, publicKey ed25519.PublicKey, cache *CachePin, resources corev1.ResourceRequirements) (*corev1.Pod, error) {
 	if controlIncarnationUID == "" {
 		return nil, errors.New("topology: worker pod requires the control incarnation identifier")
@@ -390,6 +396,8 @@ func WorkerPod(run *courier.CoderRun, image string, controlIncarnationUID string
 		{Name: EnvWorkerPodUID, ValueFrom: fieldRef("metadata.uid")},
 		{Name: EnvWorkerPodName, ValueFrom: fieldRef("metadata.name")},
 		{Name: EnvWorkerPublicKey, Value: base64.StdEncoding.EncodeToString(publicKey)},
+		// The same toolchain reference the legacy coordinator env carries.
+		{Name: "COURIER_TOOLCHAIN_DIR", Value: executor.ToolchainReferencePath},
 	}
 	if cache != nil && cache.IP != "" {
 		env = append(env,
@@ -407,6 +415,13 @@ func WorkerPod(run *courier.CoderRun, image string, controlIncarnationUID string
 			Volumes: []corev1.Volume{{
 				Name:         "workspace",
 				VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{}},
+			}, {
+				// Per-pod scratch caches (GOMODCACHE, GOCACHE): recreated with
+				// the pod, writable through the pod's fsGroup identity, and
+				// read-only at the reference twin. Durable shared writable
+				// storage is deliberately out of scope (#415).
+				Name:         "toolchain-cache",
+				VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{}},
 			}},
 			Containers: []corev1.Container{{
 				Name:    WorkerContainerName,
@@ -422,6 +437,13 @@ func WorkerPod(run *courier.CoderRun, image string, controlIncarnationUID string
 				VolumeMounts: []corev1.VolumeMount{{
 					Name:      "workspace",
 					MountPath: workerWorkspacePath,
+				}, {
+					Name:      "toolchain-cache",
+					MountPath: executor.ToolchainCachePath,
+				}, {
+					Name:      "toolchain-cache",
+					MountPath: executor.ToolchainReferencePath,
+					ReadOnly:  true,
 				}},
 				Resources:       podResources(resources),
 				SecurityContext: containerSecurityContext(),
@@ -688,7 +710,7 @@ const LabelProbe = "courier.misospace.dev/probe"
 func ProbePod(run *courier.CoderRun, node, image, script string) *corev1.Pod {
 	suffix := "-probe-" + nodeNameTag(node)
 	pod := &corev1.Pod{
-		ObjectMeta: objectMeta(run, resourceName(run.Name, suffix), ComponentWorker),
+		ObjectMeta: objectMeta(run, podResourceName(run.Name, suffix), ComponentWorker),
 		Spec: corev1.PodSpec{
 			NodeName:                     node,
 			ServiceAccountName:           WorkerSAName(run.Name),

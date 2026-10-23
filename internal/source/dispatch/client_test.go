@@ -756,7 +756,7 @@ func TestHTTPClientReportBlockedExternalIsWaitingExternal(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		id := EncodeWorkID(Task{Type: "followup-pr", PullRequest: &PullRequest{Repo: "acme/widgets", Number: 42}, PRFixItem: &PRFixItem{ID: "item-1", Generation: 3}})
+		id := EncodeWorkID(Task{Type: "followup-pr", PullRequest: &PullRequest{Repo: "acme/widgets", Number: 42}, PRFixItem: &PRFixItem{ID: "item-1", Generation: 3, HandoutToken: "fence-token"}})
 		if err := client.Report(context.Background(), id, source.Lifecycle{State: source.StateInProgress, Result: source.ResultBlockedExternal, Error: "missing prerequisite: secrets/prod"}); err != nil {
 			t.Fatal(err)
 		}
@@ -775,6 +775,9 @@ func TestHTTPClientReportBlockedExternalIsWaitingExternal(t *testing.T) {
 		}
 		if got := report["prFixItem"]; got == nil {
 			t.Fatalf("report must echo the prFixItem so Dispatch settles the issued attempt, got %#v", got)
+		}
+		if item := report["prFixItem"].(map[string]any); item["handoutToken"] != "fence-token" {
+			t.Fatalf("prFixItem handoutToken = %#v, want the issued token echoed on every outcome so Dispatch fences the hand-out release to the exact issuance", item["handoutToken"])
 		}
 		if len(marks) != 1 {
 			t.Fatalf("marks = %#v, want exactly one WAITING_EXTERNAL queue mark", marks)
@@ -1356,14 +1359,14 @@ func TestHTTPClientQueueBackedFollowupEchoesAttemptToken(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	id := EncodeWorkID(Task{Type: "followup-pr", PullRequest: &PullRequest{Repo: "acme/widgets", Number: 77}, PRFixItem: &PRFixItem{ID: "queue-item", Generation: 3}})
+	id := EncodeWorkID(Task{Type: "followup-pr", PullRequest: &PullRequest{Repo: "acme/widgets", Number: 77}, PRFixItem: &PRFixItem{ID: "queue-item", Generation: 3, HandoutToken: "fence-token"}})
 	for _, result := range []source.Result{source.ResultReady, source.ResultBlocked, source.ResultFailed} {
 		if err := client.Report(context.Background(), id, source.Lifecycle{Result: result, Error: "why", IdempotencyKey: "run-1/" + string(result)}); err != nil {
 			t.Fatalf("Report(%s) error = %v", result, err)
 		}
 	}
 
-	want := map[string]any{"id": "queue-item", "generation": float64(3)}
+	want := map[string]any{"id": "queue-item", "generation": float64(3), "handoutToken": "fence-token"}
 	if len(reports) != 3 {
 		t.Fatalf("reports = %#v, want one per result", reports)
 	}

@@ -201,6 +201,14 @@ type PullRequest struct {
 	Draft    bool
 	URL      string
 	Merged   bool
+	// Mergeable is the forge's current answer to whether the request's head
+	// can merge into its base ref. Nil means the forge gave no answer — the
+	// computation is still pending, or the provider does not report
+	// mergeability — and a caller must treat it as unverifiable, never as
+	// satisfied (#513). False is the forge's authoritative no: the head
+	// cannot merge into the base as it stands, which for GitHub is a merge
+	// conflict with the base branch.
+	Mergeable *bool
 }
 
 // Review is a provider-neutral review on a pull request.

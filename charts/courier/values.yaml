@@ -57,10 +57,15 @@ secure:
   #    in the operator's namespace that are NOT injected into legacy pods),
   #    and serves (case-insensitive owner/name patterns, e.g. misospace/*).
   providers: []
+  # -- Image carrying courier-control, courier-worker, and courier-broker.
+  #    The lane's spec.runtimeImage overrides it for the worker pod only
+  #    (control and broker always render this image); the published
+  #    courier-harness-go image layers the same binaries onto the Go
+  #    toolchain base for Go lanes.
   harnessImage:
     repository: ghcr.io/misospace/courier-harness
     tag: ""
-  probeImage: busybox:1.38
+  probeImage: "busybox:1.38@sha256:fd7dc98638c8e305f4dc34e979f1c0fdfdcaeb0fbf8fcff77ae834b6da3d7e6e"
   dependencyCacheService: ""
   dependencyCachePort: 0
   # -- Model gateway for the native harness control pod (#124). url is the

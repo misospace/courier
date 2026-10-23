@@ -144,6 +144,15 @@ role.
   the run branch {{branch}} and never create or publish work from any other
   branch."
 
+When the source issued the run with assignment context (`spec.assignmentKind`
+and `spec.assignmentReasons`, #512), the goal quotes the reasons as untrusted
+task data — context for why the work was dispatched, never instructions —
+regenerated from the durable immutable spec so a resumed or relaunched
+coordinator receives them too. A `merge-conflict` assignment additionally
+requires resolving the reported conflict or truthfully reporting that it
+remains unresolved; a review approval does not complete a conflict-repair
+task.
+
 Goals stay short — a goal plus tools — but each carries one non-negotiable
 contract: delegation covers bounded work, never the coordinator's ownership
 of completion and forge publication. The publication hint names the run branch
@@ -255,7 +264,17 @@ on the run branch; the declaration never substitutes for that check (#169):
   and the controller's lifecycle settlement is authoritative (#474). The
   evidence rides the redacted, bounded termination reason — `run.exit`
   telemetry and the `COURIER_TERMINATION` handoff — and the executor exits
-  `3`. A
+  `3`. Before a fix-pr claim may exit `3`, the executor verifies it against
+  the assigned repair condition using current authoritative forge state: the
+  pinned pull request is read through the forge `read-pull-request`
+  capability, and a request the forge reports still conflicting with its
+  base fails the run, while an unknown mergeability answer or an unreadable
+  forge fails closed — review approval and an unchanged head prove nothing,
+  and a claim the forge cannot verify never publishes the success (#513). A
+  merged, closed, or mergeable request lets the claim stand, so a satisfied
+  no-change ending remains possible without manufacturing commits; a
+  resolve-issue claim pins no pull request and is not verified this way.
+  A
   resolve-issue run ends in **AwaitingReview** and moves the source to
   `in-review` for a human to settle. A fix-pr run is settled against the world
   through **Verifying**: a merged/already-addressed pull request reaches
@@ -1332,6 +1351,16 @@ unparsed-bash reachability matches the pre-change baseline (no new hole).
 This is bootstrap ergonomics for the pinned runtime, distinct from the #136
 secure dependency cache.
 
+The secure topology's worker pod carries the identical contract: the same
+per-run `emptyDir` mounted read-write at the cache path and read-only at the
+reference twin, with `COURIER_TOOLCHAIN_DIR` in the worker environment. These
+are **per-pod scratch caches**: the emptyDir is recreated with the pod, so a
+cache warms only within one run's lifetime, and durable shared writable
+storage remains deliberately out of scope (#415). The mounts cannot shadow
+baked tool installations: tools install outside both cache paths
+(`/usr/local/go`, `/usr/local/bin`), and the image contract tests pin that
+separation.
+
 #### Dispatch binding identity
 
 Dispatch discovery bindings all persist `spec.source: dispatch`; the optional,
@@ -1463,14 +1492,17 @@ and the legacy executor's classification through `internal/devenv`:
   compaction, with diagnostic values validated to a fixed key set and a
   printable-ASCII charset.
 
-mise provisioning for the runtime images is #415's coordinated work; until
-it lands, an approved contract on an unprovisioned environment ends
-deterministically blocked-external naming the missing mise executable. The
-same holds for the tool artifacts a contract installs: the secure worker's
-dependency-egress policy admits no arbitrary fetch, so a secure-mode
-contract is expected to be pre-materialized in the provisioned image —
-runtime downloads are not an affordance either topology grants, and their
-absence is the same honest blocker, not an egress bypass.
+Every runtime image ships a pinned `mise` binary downloaded with checksum
+verification at build time — never fetched at runtime — so the approved
+contract above executes on provisioned images, and the tool versions it
+installs stay pinned by the repository's committed lockfile. Only an
+operator-selected worker image without mise ends deterministically
+blocked-external naming the missing mise executable; the same holds for the
+tool artifacts a contract installs: the secure worker's dependency-egress
+policy admits no arbitrary fetch, so a secure-mode contract is expected to be
+pre-materialized in the provisioned image — runtime downloads are not an
+affordance either topology grants, and their absence is the same honest
+blocker, not an egress bypass.
 
 Two cost/trust properties are deliberate. The secure workspace is
 re-materialized from a fresh snapshot for every coordinator shell command
@@ -1612,8 +1644,21 @@ read live at scrape time (`internal/controller/metrics.go`) — and the phase,
 execution-outcome, lifecycle-report, and retention additions of §3.4–§3.7.
 #291 owns the connector diagnostics and #292 the views and alerts that consume
 these signals; the thresholds and windows are design candidates, not defaults.
-The dashboards and the alert rules themselves remain unimplemented design, and
-nothing here authorizes them.
+
+The portable rendering of that specification ships in-repo under
+[observability/](./observability/README.md): a Prometheus/VictoriaMetrics
+alert-rule file (`observability/rules/courier-alerts.yml`, catalogue A1–A8) and
+a standalone Grafana dashboard (`observability/dashboards/courier-overview.json`,
+sections 3.1–3.5), both strictly optional — Courier never depends on Grafana,
+Alertmanager, or Dispatch, and no chart or manifest wires them in. The OTel
+path stays transport-plus-named-evaluator (Prometheus server, `vmalert`, or a
+Mimir ruler); OTLP with no evaluator cannot evaluate the alert catalogue. The
+connector panels and alert A9 remain unimplemented until #291's connector
+diagnostic signals exist. `go test ./observability/` exercises the shipped
+expressions across fire/recover scenarios with a real PromQL engine and pins
+both assets against accidental edits; every
+expression may reference only metrics the operator's collectors actually
+register, within the bounded label budget.
 
 **Connector diagnostics without core coupling (#291).**
 [docs/connector-diagnostics.md](./docs/connector-diagnostics.md) specifies
@@ -1695,6 +1740,8 @@ spec:                       # set once by the source adapter, then immutable
   source: dispatch | github-label | cron | cli | web
   sourceAgent: <optional stable identity for a qualified source binding>
   workItemID: <opaque ID understood by the source adapter>
+  assignmentKind: merge-conflict | ci-failure | review-feedback | other # optional; the adapter's normalized why-the-source-issued-this classification
+  assignmentReasons: [<bounded untrusted source free text>] # optional; why the source issued the run, never dedupe identity
   repo: owner/name
   ref: <issue# or pr#>
   lane: local | cloud | ...        # names a LaneProfile
@@ -1778,7 +1825,16 @@ spec:
 `runtimeImage` is an optional execution-environment selector. It is an image
 capability seam, not a Go or Kubernetes requirement: a lane can select a
 repository-specific image containing whatever tools its workflow needs, while
-the deployment default remains the minimal bootstrap image.
+the deployment default remains the minimal bootstrap image. Its reach is
+mode-specific. On the legacy path it selects the coordinator pod's image
+directly. On the secure path it selects the **worker** image only — the
+untrusted execution environment the lane sizes — while the control and broker
+pods always render the deployment `--harness-image`, because they carry
+Courier's trusted binaries and fixed trust contracts. A secure worker image
+selected this way must carry `/usr/local/bin/courier-worker`; the published
+`courier-harness-go` image is the shipped contract that layers the harness
+binaries onto the Go toolchain base, so one lane image selection provisions
+both modes with the same pinned toolchain.
 
 `resources` is the lane's pod sizing, and the only source of the lane-sized
 pods' sizing. The lane's vocabulary is a deliberate subset of
@@ -2249,7 +2305,12 @@ Pluggable adapters over a generic interface. An adapter both *creates* runs and
 - **dispatch** (first-party, native — no bridge). The operator *is* the dispatch
   client: claim, in-progress, in-review, needs-human, and watching the pr-fix
   queue to materialize `fix-pr` runs. This replaces the foreman-dispatch-bridge
-  entirely. A resolve-issue `handed-off` report sends a task report with
+  entirely. A `next-task` offer's free-text `reasons` are never dropped: the
+  adapter bounds and sanitizes them into the run's assignment context
+  (`assignmentReasons`) plus one normalized `assignmentKind` (heuristic by
+  contract — Dispatch documents reasons as free text, not an enum), carried on
+  the immutable spec and never part of work identity or fencing.
+  A resolve-issue `handed-off` report sends a task report with
   `outcome="handed-off"`, the PR, and the verification error; it is neither
   `ready` nor a `BLOCKED` queue mark, because Dispatch discovers the failed
   checks through its own `POST /api/pr-followup/sync` and enqueues repair
