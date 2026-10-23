@@ -3386,6 +3386,120 @@ func TestRunFixPRStackedBasePreparationRebuildsOverStaleWrongBaseMerge(t *testin
 		t.Fatalf("workspace history holds merge commits %q, want none: the stale wrong-base merge must not survive preparation", merges)
 	}
 	if _, code := gitResult(t, workspace, "merge-base", "--is-ancestor", defaultHead, "HEAD"); code == 0 {
+		t.Fatalf("the default branch tip %q is an ancestor of the workspace HEAD %q: the stale base was merged in", defaultHead, head)
+	}
+}
+
+// TestRunFixPRForkHeadPreparationSyncsPinnedBase is the run-level answer to
+// the AI-review finding on PR #518: every existing fix-pr run test ends
+// fork-free, so a fork PR's pinned base flowing through preparation's
+// upstream-remote merge was covered only by the guard/observation fixtures.
+// Because the base guard fails closed before preparation on a base identity
+// other than the run's own repository, the only fork topology that reaches
+// preparation is a fork HEAD over a base the run's repository owns: the head
+// lives on the fork remote (COURIER_REPO_URL points there, as the pod builder
+// does for fix-pr runs), the pinned base lives on the run's repository
+// through the dedicated base remote COURIER_BASE_REPO_URL, and the workspace
+// is adopted from the fork's published run-branch head with the pinned base
+// synced across that base remote.
+func TestRunFixPRForkHeadPreparationSyncsPinnedBase(t *testing.T) {
+	root := t.TempDir()
+	stackedBase := "courier/acme/widgets/issue-9"
+
+	// origin stands in for acme/widgets, the run's own repository: the
+	// default branch and the pinned stacked base branch diverge from the
+	// same initial commit in disjoint README regions, so a wrong-base merge
+	// of the default branch would be observable — which is what gives the
+	// not-an-ancestor assertion force. The run branch itself is absent:
+	// only the fork carries it.
+	origin := filepath.Join(root, "origin.git")
+	source := filepath.Join(root, "source")
+	runGit(t, root, "init", "--bare", origin)
+	runGit(t, root, "init", source)
+	configureGit(t, source)
+	write(t, filepath.Join(source, "README.md"), "base one\n")
+	commit(t, source, "base: initial")
+	runGit(t, source, "branch", "-M", "main")
+	runGit(t, source, "remote", "add", "origin", origin)
+	runGit(t, source, "push", "-u", "origin", "main")
+	runGit(t, source, "checkout", "-b", stackedBase)
+	write(t, filepath.Join(source, "README.md"), "stacked side\nbase one\n")
+	commit(t, source, "stacked: base side")
+	runGit(t, source, "push", "origin", stackedBase)
+	runGit(t, source, "checkout", "main")
+	write(t, filepath.Join(source, "README.md"), "base one\nmain side\n")
+	commit(t, source, "main: default side")
+	runGit(t, source, "push", "origin", "main")
+
+	// fork stands in for octocat/widgets: it holds only the run branch,
+	// created from the origin's stacked base tip so the pinned base is real
+	// ancestry of the published head. The fork advertises the run branch as
+	// its default ref so the clone has a branch to check out.
+	fork := filepath.Join(root, "fork.git")
+	runGit(t, root, "init", "--bare", fork)
+	runGit(t, source, "checkout", "-b", "courier/resolve-issue/acme-widgets/7", stackedBase)
+	write(t, filepath.Join(source, "work.txt"), "stacked work\n")
+	commit(t, source, "work: stacked brief")
+	runGit(t, source, "push", fork, "courier/resolve-issue/acme-widgets/7")
+	runGit(t, fork, "symbolic-ref", "HEAD", "refs/heads/courier/resolve-issue/acme-widgets/7")
+
+	publishedHead := remoteHeadSHA(t, fork, "courier/resolve-issue/acme-widgets/7")
+	defaultHead := remoteHeadSHA(t, origin, "main")
+
+	fakeOpenCode := filepath.Join(root, "opencode")
+	writeExecutable(t, fakeOpenCode, "#!/bin/sh\ncase \"$1\" in mcp) exit 0;; esac\nmkdir -p \"$COURIER_SCRATCH_DIR\"\nprintf 'coordinator ran\\n' > \"$COURIER_SCRATCH_DIR/coordinator-ran\"\nprintf '{\"outcome\":\"no_change_needed\",\"evidence\":\"feedback looks addressed\"}' > \"$COURIER_SCRATCH_DIR/outcome.json\"\nexit 0\n")
+
+	// The pinned pull request is fork-shaped: its base identity and ref name
+	// the run's own repository and pinned base, while its head repository
+	// names the fork. Both guards pass and the run reaches its outcome path.
+	prServer, prState := fakeForgePullRequestServer(t)
+	write(t, prState, `[{"number":7,"state":"open","mergeable":true,"mergeable_state":"clean","base":{"ref":"courier/acme/widgets/issue-9","sha":"b","repo":{"full_name":"acme/widgets"}},"head":{"ref":"courier/resolve-issue/acme-widgets/7","sha":"c","repo":{"full_name":"octocat/widgets"}}}]`)
+
+	workspace := setResolveIssueEnv(t, root, fork, prServer.URL, fakeOpenCode)
+	t.Setenv("COURIER_MODE", "fix-pr")
+	// A head repository identity distinct from COURIER_REPO mirrors the pod
+	// builder's fix-pr wiring: COURIER_REPO_URL points at the fork while the
+	// base stays owned by the run's own repository.
+	t.Setenv("COURIER_HEAD_REPO", "octocat/widgets")
+	// Production always derives COURIER_BASE_REPO_URL from the run's own
+	// repository, never from the fork, so the workspace prepares the
+	// dedicated upstream remote preparation syncs the pinned base against.
+	t.Setenv("COURIER_BASE_REPO_URL", origin)
+	t.Setenv("COURIER_BASE", stackedBase)
+	t.Setenv("COURIER_REF", "7")
+	t.Setenv("COURIER_RUN_NAME", "coderrun-it-7")
+	t.Setenv("GITHUB_TOKEN", "test-token")
+
+	var output bytes.Buffer
+	var errorsOut bytes.Buffer
+	if code := run(context.Background(), &output, &errorsOut); code != exitNoChangeNeeded {
+		t.Fatalf("run exit code = %d, want %d; stdout=%q stderr=%q", code, exitNoChangeNeeded, output.String(), errorsOut.String())
+	}
+	if !strings.Contains(output.String(), `"phase":"NoChangeNeeded"`) {
+		t.Fatalf("no-change-needed phase missing: %q", output.String())
+	}
+	if _, err := os.Stat(filepath.Join(root, "scratch", "coordinator-ran")); err != nil {
+		t.Fatalf("coordinator did not run: marker missing (stat error %v); the preparation never happened", err)
+	}
+	baseURL, _ := gitResult(t, workspace, "remote", "get-url", "upstream")
+	if baseURL != origin {
+		t.Fatalf("upstream remote URL = %q, want the pinned base repository %q: the fork workspace must carry the dedicated base remote preparation syncs against", baseURL, origin)
+	}
+	head, _ := gitResult(t, workspace, "rev-parse", "HEAD")
+	if head != publishedHead {
+		t.Fatalf("workspace HEAD = %q, want the fork's published head %q: the preparation must adopt the run branch at the fork's head", head, publishedHead)
+	}
+	merges, _ := gitResult(t, workspace, "log", "--merges", "--oneline")
+	if merges != "" {
+		t.Fatalf("workspace history holds merge commits %q, want none: the pinned base is already contained in the fork's branch, so the upstream base sync must land up to date", merges)
+	}
+	// In the prepared workspace the pinned base is reachable through the
+	// base remote's ref, not origin's: origin is the fork, which holds only
+	// the run branch.
+	if _, code := gitResult(t, workspace, "merge-base", "--is-ancestor", "upstream/"+stackedBase, "HEAD"); code != 0 {
+		t.Fatalf("the pinned stacked base branch %q is not an ancestor of the workspace HEAD %q: the upstream base sync did not resolve", "upstream/"+stackedBase, head)
+	}
+	if _, code := gitResult(t, workspace, "merge-base", "--is-ancestor", defaultHead, "HEAD"); code == 0 {
 		t.Fatalf("the default branch tip %q is an ancestor of the workspace HEAD %q: the wrong base was merged in", defaultHead, head)
 	}
 }
