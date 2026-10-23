@@ -3317,6 +3317,79 @@ func TestRunFixPRStackedBasePreparationLeavesNoWrongBaseMerge(t *testing.T) {
 	}
 }
 
+// TestRunFixPRStackedBasePreparationRebuildsOverStaleWrongBaseMerge is the
+// remaining half of the #514 regression: a fix-pr run finds a workspace that
+// already holds a checkout left behind by an earlier attempt, carrying a
+// local-only merge of the wrong base. Preparation must rebuild the work
+// branch from the published head instead of failing on the clone, so the
+// stale merge cannot survive the run and the coordinator continues on the
+// published head with the pinned base.
+func TestRunFixPRStackedBasePreparationRebuildsOverStaleWrongBaseMerge(t *testing.T) {
+	root := t.TempDir()
+	stackedBase := "courier/acme/widgets/issue-9"
+	remote := remoteWithDivergingStackedBase(t, root, stackedBase)
+	publishedHead := remoteHeadSHA(t, remote, "courier/resolve-issue/acme-widgets/7")
+	defaultHead := remoteHeadSHA(t, remote, "main")
+
+	fakeOpenCode := filepath.Join(root, "opencode")
+	writeExecutable(t, fakeOpenCode, "#!/bin/sh\ncase \"$1\" in mcp) exit 0;; esac\nmkdir -p \"$COURIER_SCRATCH_DIR\"\nprintf 'coordinator ran\\n' > \"$COURIER_SCRATCH_DIR/coordinator-ran\"\nprintf '{\"outcome\":\"no_change_needed\",\"evidence\":\"feedback looks addressed\"}' > \"$COURIER_SCRATCH_DIR/outcome.json\"\nexit 0\n")
+
+	// The pinned pull request is live on the run's pinned base and mergeable,
+	// so the guard passes and the run reaches its outcome path.
+	prServer, prState := fakeForgePullRequestServer(t)
+	write(t, prState, `[{"number":7,"state":"open","mergeable":true,"mergeable_state":"clean","base":{"ref":"courier/acme/widgets/issue-9","sha":"b","repo":{"full_name":"acme/widgets"}},"head":{"ref":"courier/resolve-issue/acme-widgets/7","sha":"c","repo":{"full_name":"acme/widgets"}}}]`)
+
+	workspace := setResolveIssueEnv(t, root, remote, prServer.URL, fakeOpenCode)
+
+	// The workspace already holds a checkout left behind by an earlier
+	// attempt, carrying a local-only merge of the wrong base: the incident's
+	// shape. Preparation must rebuild the branch from the published head
+	// rather than fail on the clone.
+	runGit(t, root, "clone", remote, workspace)
+	configureGit(t, workspace)
+	runGit(t, workspace, "checkout", "-B", "courier/resolve-issue/acme-widgets/7", "origin/courier/resolve-issue/acme-widgets/7")
+	runGit(t, workspace, "merge", "--no-edit", "origin/main")
+	staleMerge, _ := gitResult(t, workspace, "rev-parse", "HEAD")
+	parents, _ := gitResult(t, workspace, "rev-list", "--parents", "-n", "1", "HEAD")
+	if len(strings.Fields(parents)) != 3 {
+		t.Fatalf("workspace HEAD = %q is not a merge commit (%q): the fixture must reproduce the incident's wrong-base merge", staleMerge, parents)
+	}
+	if staleMerge == publishedHead {
+		t.Fatalf("workspace HEAD = %q is the published head: the stale merge must be local-only", staleMerge)
+	}
+
+	t.Setenv("COURIER_MODE", "fix-pr")
+	// A same-repo head identity keeps the fix-pr head guard out of the way.
+	t.Setenv("COURIER_HEAD_REPO", "acme/widgets")
+	t.Setenv("COURIER_BASE", stackedBase)
+	t.Setenv("COURIER_REF", "7")
+	t.Setenv("COURIER_RUN_NAME", "coderrun-it-7")
+	t.Setenv("GITHUB_TOKEN", "test-token")
+
+	var output bytes.Buffer
+	var errorsOut bytes.Buffer
+	if code := run(context.Background(), &output, &errorsOut); code != exitNoChangeNeeded {
+		t.Fatalf("run exit code = %d, want %d; stdout=%q stderr=%q", code, exitNoChangeNeeded, output.String(), errorsOut.String())
+	}
+	if !strings.Contains(output.String(), `"phase":"NoChangeNeeded"`) {
+		t.Fatalf("no-change-needed phase missing: %q", output.String())
+	}
+	if _, err := os.Stat(filepath.Join(root, "scratch", "coordinator-ran")); err != nil {
+		t.Fatalf("coordinator did not run: marker missing (stat error %v); the preparation never happened", err)
+	}
+	head, _ := gitResult(t, workspace, "rev-parse", "HEAD")
+	if head != publishedHead {
+		t.Fatalf("workspace HEAD = %q, want the published head %q: the preparation must rebuild the branch from the published head", head, publishedHead)
+	}
+	merges, _ := gitResult(t, workspace, "log", "--merges", "--oneline")
+	if merges != "" {
+		t.Fatalf("workspace history holds merge commits %q, want none: the stale wrong-base merge must not survive preparation", merges)
+	}
+	if _, code := gitResult(t, workspace, "merge-base", "--is-ancestor", defaultHead, "HEAD"); code == 0 {
+		t.Fatalf("the default branch tip %q is an ancestor of the workspace HEAD %q: the wrong base was merged in", defaultHead, head)
+	}
+}
+
 // remoteWithDivergingStackedBase builds a bare remote whose default branch
 // and the run's stacked base branch diverge from the same initial commit,
 // with the run branch published from the stacked base plus one work commit:
