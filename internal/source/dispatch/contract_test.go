@@ -98,6 +98,12 @@ func TestDispatchTasksReportContractGuard(t *testing.T) {
 			if _, ok := dispatchAcceptedOutcomes[outcome]; !ok {
 				t.Fatalf("emitted outcome %q is not accepted by Dispatch; update the fixture", outcome)
 			}
+			if pair.taskType == "followup-pr" {
+				item, _ := captured["prFixItem"].(map[string]any)
+				if item == nil || item["handoutToken"] != "fence-token" {
+					t.Fatalf("followup-pr %s report prFixItem = %#v, want the issued handoutToken echoed so Dispatch fences the hand-out release to the exact issuance", outcome, captured["prFixItem"])
+				}
+			}
 		})
 	}
 }
@@ -109,6 +115,7 @@ func TestDispatchTasksReportContractGuard(t *testing.T) {
 // Dispatch validates, and to lock the rejection shape so a future
 // upstream change to the validation contract surfaces in CI.
 func TestDispatchTasksReportContractRejectsUnknownOutcomes(t *testing.T) {
+	var reported map[string]any
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		var body map[string]any
 		_ = json.NewDecoder(r.Body).Decode(&body)
@@ -122,6 +129,7 @@ func TestDispatchTasksReportContractRejectsUnknownOutcomes(t *testing.T) {
 			_, _ = w.Write([]byte(fmt.Sprintf(`{"error":"Invalid outcome. Must be one of: %s"}`, strings.Join(sortedOutcomeKeys(dispatchAcceptedOutcomes), ", "))))
 			return
 		}
+		reported = body
 		w.WriteHeader(http.StatusNoContent)
 	}))
 	defer server.Close()
@@ -136,9 +144,16 @@ func TestDispatchTasksReportContractRejectsUnknownOutcomes(t *testing.T) {
 		t.Fatalf("Report(pr_opened via implement) error = %v; want nil — Dispatch's accepted allowlist must match", err)
 	}
 
+	// A queue-backed follow-up whose id predates hand-out tokens has no token
+	// to echo; legibility of the fence depends on the key staying absent, not
+	// on an empty-string echo that Dispatch would read as a bogus receipt.
 	followupID := EncodeWorkID(Task{Type: "followup-pr", PullRequest: &PullRequest{Repo: "acme/widgets", Number: 77}, PRFixItem: &PRFixItem{ID: "queue-item", Generation: 1}})
 	if err := client.Report(context.Background(), followupID, source.Lifecycle{Result: source.ResultReady, PR: "1"}); err != nil {
 		t.Fatalf("Report(pr_updated via followup-pr) error = %v; want nil", err)
+	}
+	item, _ := reported["prFixItem"].(map[string]any)
+	if item == nil || item["handoutToken"] != nil {
+		t.Fatalf("token-less followup-pr report prFixItem = %#v, want no handoutToken key", reported["prFixItem"])
 	}
 }
 
@@ -271,7 +286,7 @@ func encodeWorkIDForTaskType(t *testing.T, taskType string) string {
 	case "implement":
 		return EncodeWorkID(Task{Type: "implement", Issue: &Issue{ID: "issue-1", Repo: "acme/widgets", Number: 42}})
 	case "followup-pr":
-		return EncodeWorkID(Task{Type: "followup-pr", PullRequest: &PullRequest{Repo: "acme/widgets", Number: 77, URL: "https://github.com/acme/widgets/pull/77"}, PRFixItem: &PRFixItem{ID: "queue-item", Generation: 1}})
+		return EncodeWorkID(Task{Type: "followup-pr", PullRequest: &PullRequest{Repo: "acme/widgets", Number: 77, URL: "https://github.com/acme/widgets/pull/77"}, PRFixItem: &PRFixItem{ID: "queue-item", Generation: 1, HandoutToken: "fence-token"}})
 	default:
 		t.Fatalf("unknown taskType: %q", taskType)
 		return ""
