@@ -377,9 +377,123 @@ func RemoteBranchExists(ctx context.Context, remoteURL, branch string) (bool, er
 	return exists, err
 }
 
+// destinationState describes what a preparation destination already holds.
+type destinationState int
+
+const (
+	// destinationFree means the destination is missing or holds no entries,
+	// so a clone can populate it.
+	destinationFree destinationState = iota
+	// destinationCheckout means the destination holds a git checkout, whose
+	// contents preparation clears before cloning.
+	destinationCheckout
+	// destinationOccupied means the destination holds entries but no git
+	// checkout.
+	destinationOccupied
+)
+
+// inspectDestination classifies a preparation destination.  A missing or empty
+// directory is free, a directory holding a .git entry — a directory or the
+// gitdir-pointer file of a linked worktree — is a checkout, and a directory
+// holding anything else is occupied.  The .git entry is inspected without
+// following symlinks, so a linked entry is judged by what it is.
+func inspectDestination(directory string) (destinationState, error) {
+	info, err := os.Stat(directory)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return destinationFree, nil
+		}
+		return destinationFree, err
+	}
+	if !info.IsDir() {
+		return destinationOccupied, nil
+	}
+	entries, err := os.ReadDir(directory)
+	if err != nil {
+		return destinationFree, err
+	}
+	if len(entries) == 0 {
+		return destinationFree, nil
+	}
+	if _, err := os.Lstat(filepath.Join(directory, ".git")); err != nil {
+		if os.IsNotExist(err) {
+			return destinationOccupied, nil
+		}
+		return destinationFree, err
+	}
+	return destinationCheckout, nil
+}
+
+// clearableDirectory reports whether a destination may be emptied.  The clear
+// step removes everything under the path, so the filesystem root and a
+// top-level system directory are refused: a misconfigured workspace path must
+// never be able to wipe one.
+//
+// A mounted volume root is the workspace the design contemplates — the pod
+// mounts the workspace volume at /workspace, a single-segment path — so it is
+// allowed: a mount root is a volume's own root, not a system directory, and
+// the clear step only empties it, never removes it.
+func clearableDirectory(directory string) (bool, error) {
+	cleaned := filepath.Clean(directory)
+	if cleaned == string(filepath.Separator) {
+		return false, nil
+	}
+	if pathSegments(cleaned) >= 2 {
+		return true, nil
+	}
+	return isMountRoot(cleaned)
+}
+
+// pathSegments counts the non-empty components of a cleaned path.
+func pathSegments(cleaned string) int {
+	segments := 0
+	for _, segment := range strings.Split(cleaned, string(filepath.Separator)) {
+		if segment != "" {
+			segments++
+		}
+	}
+	return segments
+}
+
+// clearWorkspace empties a directory that holds a git checkout, so the clone
+// that follows starts from nothing: no stale commit, no stale merge, no
+// uncommitted edit, no untracked file, no stale remote, and no stale index.
+//
+// Only the directory's entries are removed, never the directory itself: the
+// workspace is a mounted volume root in the pod, and removing the mount point
+// fails with EBUSY.  Removal never follows symlinks: os.RemoveAll unlinks a
+// symlink and leaves its target alone.
+func clearWorkspace(directory string) error {
+	clearable, err := clearableDirectory(directory)
+	if err != nil {
+		return err
+	}
+	if !clearable {
+		return fmt.Errorf("refusing to clear %q: a workspace path must not be the filesystem root or a top-level system directory", directory)
+	}
+	entries, err := os.ReadDir(directory)
+	if err != nil {
+		return err
+	}
+	for _, entry := range entries {
+		if err := os.RemoveAll(filepath.Join(directory, entry.Name())); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 // Prepare clones a repository and checks out its deterministic work branch.
 // If the branch already exists on the remote, it is adopted and synchronized
 // with Base before returning.  New branches are created from the fetched Base.
+//
+// A destination that already holds a git checkout is rebuilt rather than
+// reused: an earlier attempt can leave one behind, carrying commits, merges,
+// uncommitted edits, untracked files, and remotes the run must not inherit.
+// Preparation clears the checkout's contents and clones afresh, so the
+// workspace ends up indistinguishable from a fresh clone.  A destination that
+// holds files but no git checkout is refused: preparation never deletes
+// anything it did not create.
 func Prepare(ctx context.Context, options PrepareOptions) (*Workspace, error) {
 	if strings.TrimSpace(options.RemoteURL) == "" {
 		return nil, errors.New("prepare: remote URL is required")
@@ -401,6 +515,18 @@ func Prepare(ctx context.Context, options PrepareOptions) (*Workspace, error) {
 		return nil, err
 	}
 
+	state, err := inspectDestination(options.Directory)
+	if err != nil {
+		return nil, err
+	}
+	switch state {
+	case destinationOccupied:
+		return nil, fmt.Errorf("prepare: directory %q already holds files and is not a git checkout", options.Directory)
+	case destinationCheckout:
+		if err := clearWorkspace(options.Directory); err != nil {
+			return nil, fmt.Errorf("prepare: clear the workspace directory %q: %w", options.Directory, err)
+		}
+	}
 	if err := Clone(ctx, options.RemoteURL, options.Directory); err != nil {
 		return nil, err
 	}
