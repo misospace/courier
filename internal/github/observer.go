@@ -158,7 +158,7 @@ func (o Observer) Observe(ctx context.Context, base string, head controller.Head
 		}
 		observed := controller.PRObservation{PR: strconv.Itoa(pull.Number), Draft: pull.Draft, Head: pull.HeadSHA}
 		for _, check := range checks.CheckRuns {
-			observed.Checks = append(observed.Checks, controller.CheckObservation{Name: check.Name, State: checkState(check.Status, check.Conclusion)})
+			observed.Checks = append(observed.Checks, controller.CheckObservation{Name: check.Name, State: checkState(check.Status, check.Conclusion), Output: checkOutput(check.Output)})
 		}
 		for _, status := range statuses.Statuses {
 			observed.Checks = append(observed.Checks, controller.CheckObservation{Name: status.Context, State: commitStatusState(status.State)})

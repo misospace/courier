@@ -1131,6 +1131,20 @@ control returns; local validation therefore runs on a freshly materialized
 snapshot of the published integration head before declaring completion, not as
 a claim that every publication was preceded by coordinator validation.
 
+**Repair resumes.** A run the operator resumes for a mechanical-CI repair is a
+new model session, not a continued one. The earlier session's transcript does
+not survive the pod, so the resumed coordinator receives the repair context as
+part of its goal: the exact published head under repair, the attempt number,
+the failed configured mechanical checks and their bounded output, and the
+durable checkpoint — the plan and the completed briefs — plus the instruction
+to reproduce the failure from that evidence, fix it, re-run the relevant local
+validation, and push to the same run branch rather than open a second pull
+request. The goal is the coordinator's system message, so the contract travels
+in the goal the run already renders (`COURIER_GOAL`): no second channel and no
+new environment variable. The contract is bounded — per-item and in total, with
+every cut marked — and a run with no repair context renders the goal it
+rendered before, byte for byte.
+
 **Spawn brief schema and authenticated worker protocol.** Each delegation is a
 typed brief carrying a stable `briefID` (unique within the run), objective,
 settled decisions with exact values, owned files, non-goals, and an observable
@@ -1609,6 +1623,14 @@ then use checkpoint and branch history as recovery hints. Do not promise
 atomicity between a forge push and Kubernetes status: those are two systems.
 Use idempotent retries and reconciliation.
 
+A mechanical-CI repair resume follows the same rule in its smallest form. What
+survives the pod is the checkpoint — `plan` plus the ordered `completedBriefs` —
+and the bounded failed-check evidence the operator recorded; the transcript
+does not survive it, and the workspace is re-seeded from the run branch, so the
+git state is fresh and the forge state is re-read. The resumed coordinator is
+handed that context as a contract in its goal, and inherits no conversation
+from the session that published the work.
+
 ## 8. Failure classification
 
 The coordinator declares its outcome in the exact file path supplied in its
@@ -1627,10 +1649,13 @@ feedback was addressed, so open no-change attempts report `waiting-external`
 rather than authorizing `already_addressed` or claiming a push. Recovery requires
 a fresh source attempt identity; prior runs and evidence remain retained.
 An externally observed failed check reaches `Failed` and follows the source's
-failure policy, while other nonzero exits also reach `Failed`. Session recovery
-for undeclared recoverable endings is shipped: with a captured session, dirty,
-off-branch, and no-work states resume under the #170 continuation budget and
-no-progress guard; without a captured session, those endings fail as
+failure policy, while other nonzero exits also reach `Failed`; where the lane
+declares a mechanical-CI repair policy, the operator's park path owns that
+observation first and may resume the run for one bounded repair instead of
+failing it. Session recovery for undeclared recoverable endings is shipped:
+with a captured session, dirty, off-branch, and no-work states resume under the
+#170 continuation budget and no-progress guard; without a captured session,
+those endings fail as
 incomplete. This does not change the declared-outcome exit mapping above. A
 `no_change_needed` result never resolves the source on the coordinator's word
 alone. A `blocked_external` result keeps the source item active (`in-progress`)

@@ -19,6 +19,20 @@ import (
 	"sigs.k8s.io/yaml"
 )
 
+// The bounds of the declared repair policy, mirroring the CRD's own bounds
+// (api/v1alpha1.CIRepairPolicy). The bootstrap config is validated against
+// the same numbers so a managed LaneProfile never drifts from the schema.
+const (
+	// maxCIRepairAttempts is the largest repair budget one lane may grant.
+	maxCIRepairAttempts = 5
+	// minCIRepairObservationWindowSeconds is the shortest park window.
+	minCIRepairObservationWindowSeconds = 60
+	// maxCIRepairObservationWindowSeconds is the longest park window.
+	maxCIRepairObservationWindowSeconds = 21600
+	// defaultCIRepairObservationWindowSeconds mirrors the CRD default.
+	defaultCIRepairObservationWindowSeconds = 1800
+)
+
 // Profile is the bootstrap-config form of a deployment-managed LaneProfile.
 type Profile struct {
 	Name         string            `json:"name"`
@@ -36,6 +50,10 @@ type Profile struct {
 	// Resources sizes the pods Courier creates using Courier's narrowed
 	// requests/limits vocabulary; empty means the lane gets the built-in default.
 	Resources courierv1alpha1.PodResources `json:"resources,omitempty"`
+	// CIRepair declares the lane's mechanical-CI repair policy (#494); nil
+	// means the lane repairs nothing and every run on it behaves exactly as
+	// it does without a policy. Same bounds as the CRD field it mirrors.
+	CIRepair *courierv1alpha1.CIRepairPolicy `json:"ciRepair,omitempty"`
 }
 
 // Parse reads a bootstrap config document: a top-level profiles list of
@@ -101,9 +119,46 @@ func Parse(data []byte) ([]Profile, error) {
 				return nil, err
 			}
 		}
+		if profile.CIRepair != nil {
+			if err := normalizeCIRepair(name, profile.CIRepair); err != nil {
+				return nil, err
+			}
+		}
 		profiles = append(profiles, profile)
 	}
 	return profiles, nil
+}
+
+// normalizeCIRepair validates the declared repair policy against the same
+// bounds the CRD enforces, and mirrors the CRD defaults so the desired spec
+// matches the server-defaulted spec and the bootstrap reconciler does not
+// rewrite an unchanged LaneProfile on every pass.
+//
+// A policy that names no mechanical check, or grants no attempt, disables the
+// repair loop; it is accepted rather than rejected, because a disabled policy
+// is a legitimate declaration.
+func normalizeCIRepair(name string, policy *courierv1alpha1.CIRepairPolicy) error {
+	if policy.MaxAttempts < 0 || policy.MaxAttempts > maxCIRepairAttempts {
+		return fmt.Errorf("bootstrap profile %q: ciRepair.maxAttempts %d outside [0,%d]", name, policy.MaxAttempts, maxCIRepairAttempts)
+	}
+	if policy.ObservationWindowSeconds == 0 {
+		policy.ObservationWindowSeconds = defaultCIRepairObservationWindowSeconds
+	} else if policy.ObservationWindowSeconds < minCIRepairObservationWindowSeconds || policy.ObservationWindowSeconds > maxCIRepairObservationWindowSeconds {
+		return fmt.Errorf("bootstrap profile %q: ciRepair.observationWindowSeconds %d outside [%d,%d]", name, policy.ObservationWindowSeconds, minCIRepairObservationWindowSeconds, maxCIRepairObservationWindowSeconds)
+	}
+	// Names are kept exactly as declared, never trimmed: the controller
+	// matches configured names exactly and case-sensitively, so a padded
+	// declaration must stay its own exact name on a managed lane too,
+	// failing closed instead of silently widening to another check.
+	checks := make([]string, 0, len(policy.MechanicalChecks))
+	for _, check := range policy.MechanicalChecks {
+		if check == "" {
+			return fmt.Errorf("bootstrap profile %q: ciRepair.mechanicalChecks must not contain an empty name", name)
+		}
+		checks = append(checks, check)
+	}
+	policy.MechanicalChecks = checks
+	return nil
 }
 
 // normalizeContext validates a declared context policy against the same

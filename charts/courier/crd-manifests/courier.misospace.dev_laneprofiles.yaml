@@ -66,6 +66,41 @@ spec:
                   name.
                 maxLength: 253
                 type: string
+              ciRepair:
+                description: |-
+                  CIRepair declares the lane's mechanical-CI repair policy (#475, #494).
+                  An absent policy — or a policy that names no mechanical check — leaves
+                  the CI park-and-resume loop disabled, and a run on the lane behaves
+                  exactly as it does without one.
+                properties:
+                  maxAttempts:
+                    default: 0
+                    description: |-
+                      MaxAttempts is the repair budget of a single run: how many repair
+                      attempts one run may consume before it hands off. Zero leaves repair
+                      disabled.
+                    maximum: 5
+                    minimum: 0
+                    type: integer
+                  mechanicalChecks:
+                    description: |-
+                      MechanicalChecks are the exact check names this lane repairs. Names
+                      are matched exactly and case-sensitively, so the policy stays
+                      auditable and can never widen to a check the lane did not name. An
+                      empty list disables the repair loop entirely.
+                    items:
+                      type: string
+                    type: array
+                  observationWindowSeconds:
+                    default: 1800
+                    description: |-
+                      ObservationWindowSeconds bounds how long a run may stay parked waiting
+                      for CI. A run whose park window expires hands off instead of waiting
+                      for a check that may never report.
+                    maximum: 21600
+                    minimum: 60
+                    type: integer
+                type: object
               concurrency:
                 default: 1
                 description: |-

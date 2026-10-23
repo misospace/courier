@@ -507,3 +507,83 @@ func TestParseRejectsNegativeContextReservations(t *testing.T) {
 		}
 	}
 }
+
+func TestParseAcceptsCIRepairPolicy(t *testing.T) {
+	data := []byte(`profiles:
+  - name: local
+    roles:
+      coordinator: claude-sonnet-4-5
+    ciRepair:
+      mechanicalChecks:
+        - build
+        - " test "
+      maxAttempts: 2
+      observationWindowSeconds: 900
+`)
+	profiles, err := Parse(data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	policy := profiles[0].CIRepair
+	if policy == nil {
+		t.Fatal("ciRepair = nil, want the declared policy")
+	}
+	if len(policy.MechanicalChecks) != 2 || policy.MechanicalChecks[0] != "build" || policy.MechanicalChecks[1] != " test " {
+		t.Fatalf("mechanicalChecks = %#v, want [build \" test \"] kept exactly as declared", policy.MechanicalChecks)
+	}
+	if policy.MaxAttempts != 2 {
+		t.Fatalf("maxAttempts = %d, want 2", policy.MaxAttempts)
+	}
+	if policy.ObservationWindowSeconds != 900 {
+		t.Fatalf("observationWindowSeconds = %d, want 900", policy.ObservationWindowSeconds)
+	}
+}
+
+func TestParseCIRepairDefaultsObservationWindow(t *testing.T) {
+	data := []byte(`profiles:
+  - name: local
+    roles:
+      coordinator: claude-sonnet-4-5
+    ciRepair:
+      mechanicalChecks:
+        - build
+`)
+	profiles, err := Parse(data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	policy := profiles[0].CIRepair
+	if policy == nil {
+		t.Fatal("ciRepair = nil, want the declared policy")
+	}
+	if policy.ObservationWindowSeconds != defaultCIRepairObservationWindowSeconds {
+		t.Fatalf("observationWindowSeconds = %d, want %d", policy.ObservationWindowSeconds, defaultCIRepairObservationWindowSeconds)
+	}
+}
+
+func TestParseRejectsOutOfBoundsCIRepairPolicy(t *testing.T) {
+	cases := map[string]string{
+		"maxAttempts": `    ciRepair:
+      mechanicalChecks:
+        - build
+      maxAttempts: 9
+`,
+		"observationWindowSeconds": `    ciRepair:
+      mechanicalChecks:
+        - build
+      observationWindowSeconds: 30
+`,
+		"emptyMechanicalCheck": `    ciRepair:
+      mechanicalChecks:
+        - ""
+`,
+	}
+	for name, block := range cases {
+		t.Run(name, func(t *testing.T) {
+			data := []byte("profiles:\n  - name: local\n    roles:\n      coordinator: claude-sonnet-4-5\n" + block)
+			if _, err := Parse(data); err == nil {
+				t.Fatal("error = nil, want the out-of-bounds repair policy rejected")
+			}
+		})
+	}
+}

@@ -292,7 +292,7 @@ func (p *Provider) ReadChecks(ctx context.Context, ref forge.PullRequestRef, hea
 		if url == "" {
 			url = run.DetailsURL
 		}
-		checks = append(checks, forge.Check{Name: run.Name, State: run.Status, Conclusion: run.Conclusion, URL: url})
+		checks = append(checks, forge.Check{Name: run.Name, State: run.Status, Conclusion: run.Conclusion, URL: url, Output: checkOutput(run.Output)})
 	}
 	return checks, nil
 }

@@ -448,3 +448,135 @@ func TestOperatorWriterCarriesPublicationPolicy(t *testing.T) {
 		t.Fatalf("patched policy = %+v", document.Status.PublicationPolicy)
 	}
 }
+
+// decodeCIRecords decodes the park and repair records of a status patch and
+// returns them along with whether their keys were present at all.
+func decodeCIRecords(t *testing.T, patch []byte) (park *courierv1alpha1.CIParkState, repair *courierv1alpha1.CIRepairContext, parkPresent, repairPresent bool) {
+	t.Helper()
+	var payload struct {
+		Status map[string]json.RawMessage `json:"status"`
+	}
+	if err := json.Unmarshal(patch, &payload); err != nil {
+		t.Fatalf("decode patch: %v", err)
+	}
+	if raw, ok := payload.Status["cipark"]; ok {
+		parkPresent = true
+		if err := json.Unmarshal(raw, &park); err != nil {
+			t.Fatalf("decode cipark: %v", err)
+		}
+	}
+	if raw, ok := payload.Status["ciRepair"]; ok {
+		repairPresent = true
+		if err := json.Unmarshal(raw, &repair); err != nil {
+			t.Fatalf("decode ciRepair: %v", err)
+		}
+	}
+	return park, repair, parkPresent, repairPresent
+}
+
+// TestOperatorPatchCIParkAndCIRepairRecords pins the patch semantics of the
+// two CI records: an unmentioned record is omitted so a narrow patch never
+// disturbs it, a set record is carried, and a cleared record is carried as an
+// explicit null — a merge patch removes a nested object only on null.
+func TestOperatorPatchCIParkAndCIRepairRecords(t *testing.T) {
+	name := types.NamespacedName{Namespace: "default", Name: "run"}
+
+	patch, err := marshalPatch(name, OperatorPatch{})
+	if err != nil {
+		t.Fatalf("marshal empty patch: %v", err)
+	}
+	if _, _, parkPresent, repairPresent := decodeCIRecords(t, patch); parkPresent || repairPresent {
+		t.Fatalf("empty patch carries the CI records: %s", patch)
+	}
+
+	park := &courierv1alpha1.CIParkState{Head: "abc123", Attempts: 1}
+	repair := &courierv1alpha1.CIRepairContext{Head: "abc123", Attempt: 1, FailedChecks: []string{"unit"}}
+	patch, err = marshalPatch(name, OperatorPatch{CIPark: park, CIRepair: repair})
+	if err != nil {
+		t.Fatalf("marshal records patch: %v", err)
+	}
+	gotPark, gotRepair, parkPresent, repairPresent := decodeCIRecords(t, patch)
+	if !parkPresent || !repairPresent {
+		t.Fatalf("patch omits the set CI records: %s", patch)
+	}
+	if gotPark == nil || gotPark.Head != park.Head || gotPark.Attempts != park.Attempts {
+		t.Fatalf("cipark = %#v, want %#v", gotPark, park)
+	}
+	if gotRepair == nil || gotRepair.Head != repair.Head || gotRepair.Attempt != repair.Attempt {
+		t.Fatalf("ciRepair = %#v, want %#v", gotRepair, repair)
+	}
+
+	cleared := OperatorPatch{}
+	cleared.ClearCIPark()
+	cleared.ClearCIRepair()
+	patch, err = marshalPatch(name, cleared)
+	if err != nil {
+		t.Fatalf("marshal cleared patch: %v", err)
+	}
+	var document struct {
+		Status map[string]json.RawMessage `json:"status"`
+	}
+	if err := json.Unmarshal(patch, &document); err != nil {
+		t.Fatalf("decode cleared patch: %v", err)
+	}
+	for _, key := range []string{"cipark", "ciRepair"} {
+		if string(document.Status[key]) != "null" {
+			t.Fatalf("%s = %s, want an explicit null: %s", key, document.Status[key], patch)
+		}
+	}
+}
+
+// TestOperatorPatchClearsCIParkAndCIRepairRecords drives the two records
+// through a real merge patch: a set record is persisted, and a cleared record
+// is removed from the status instead of surviving as a stale record.
+func TestOperatorPatchClearsCIParkAndCIRepairRecords(t *testing.T) {
+	name := types.NamespacedName{Namespace: "default", Name: "run"}
+	kube := statusClient(t, statusTestRun())
+	writer := NewOperatorWriter(KubePatchWriter{Client: kube})
+	ctx := context.Background()
+
+	park := &courierv1alpha1.CIParkState{Head: "abc123", ParkedAt: metav1.Now(), Attempts: 1}
+	repair := &courierv1alpha1.CIRepairContext{Head: "abc123", Attempt: 1, FailedChecks: []string{"unit"}}
+	if err := writer.Patch(ctx, name, OperatorPatch{CIPark: park, CIRepair: repair}); err != nil {
+		t.Fatalf("records write: %v", err)
+	}
+	var run courierv1alpha1.CoderRun
+	if err := kube.Get(ctx, name, &run); err != nil {
+		t.Fatalf("get run: %v", err)
+	}
+	if run.Status.CIPark == nil || run.Status.CIPark.Head != park.Head {
+		t.Fatalf("cipark = %#v, want the written park record", run.Status.CIPark)
+	}
+	if run.Status.CIRepair == nil || run.Status.CIRepair.Head != repair.Head {
+		t.Fatalf("ciRepair = %#v, want the written repair context", run.Status.CIRepair)
+	}
+
+	// A patch that mentions neither record must leave both untouched: the
+	// operator patch is narrow, so an unrelated write never drops the park
+	// record of a run that is still parked.
+	if err := writer.Patch(ctx, name, OperatorPatch{Phase: courierv1alpha1.PhaseVerifying}); err != nil {
+		t.Fatalf("phase write: %v", err)
+	}
+	if err := kube.Get(ctx, name, &run); err != nil {
+		t.Fatalf("get run: %v", err)
+	}
+	if run.Status.CIPark == nil || run.Status.CIRepair == nil {
+		t.Fatalf("unrelated patch dropped the CI records: %#v", run.Status)
+	}
+
+	cleared := OperatorPatch{}
+	cleared.ClearCIPark()
+	cleared.ClearCIRepair()
+	if err := writer.Patch(ctx, name, cleared); err != nil {
+		t.Fatalf("records clear: %v", err)
+	}
+	if err := kube.Get(ctx, name, &run); err != nil {
+		t.Fatalf("get run: %v", err)
+	}
+	if run.Status.CIPark != nil {
+		t.Fatalf("cipark = %#v, want the record cleared", run.Status.CIPark)
+	}
+	if run.Status.CIRepair != nil {
+		t.Fatalf("ciRepair = %#v, want the record cleared", run.Status.CIRepair)
+	}
+}

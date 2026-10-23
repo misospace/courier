@@ -26,6 +26,12 @@ type CheckObservation struct {
 	// — not state — is what a settle decision can be built on.
 	Name  string
 	State CheckState
+	// Output is the check's bounded log evidence: the provider's published
+	// diagnostic output, cut to a fixed bound by the provider that read it.
+	// It is evidence for a report or a prompt and never decides anything:
+	// only Name and State classify a check, so a missing, misleading, or
+	// enormous output cannot change a run's fate.
+	Output string
 }
 
 type PRObservation struct {
