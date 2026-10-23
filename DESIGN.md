@@ -1996,7 +1996,11 @@ there is no delete verb because active runs reference lanes. (#73)
   a terminating control pod rather than inventing a second shape (#217).
 - **Running** — pod launches: ephemeral workspace, clone, **adopt the branch if it
   exists and base-sync first**, inject LaneProfile framing + roles, wire the MCP
-  tools, set log level from `debug`. For a fork PR the workspace's `origin` is
+  tools, set log level from `debug`. A workspace that is not empty when
+  preparation starts — a leftover an earlier attempt left in the pod's volume —
+  is rebuilt rather than reused: preparation clears the directory and clones
+  afresh, so nothing local survives it, a stale merge of the wrong base
+  included. For a fork PR the workspace's `origin` is
   the fork and base-sync fetches a second fetch-only `upstream` remote pointing
   at the base repository, so the merge-before-work invariant always merges the
   real base rather than the fork's possibly stale base branch. The target

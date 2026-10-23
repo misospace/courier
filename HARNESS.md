@@ -558,21 +558,27 @@ branch: stacked request targets another request's branch, fork
 request targets the upstream's branch. two invariants follow,
 and legacy path enforces both.
 - **Pod carries the request's base, never the deployment
-  default.** legacy launcher resolves the pinned pull request's
-  live target ref through the same identity-checked forge
-  capability admission resolves the run's head through (one
-  pull-request read, never a forge-specific CLI) and pins it
-  into the coordinator pod as `COURIER_BASE`, so workspace
-  preparation synchronizes against the base the request names.
-  `resolve-issue` run keeps the deployment default. legacy path
-  has no persisted publication policy to project a base from, so
-  an unverified base has no other answer: missing resolver,
-  failed resolution, or request naming no base ref fails the
-  launch closed with `BaseUnverified` (terminal — a retry cannot
-  change what the request names), never with a substituted
-  default. transient forge read that never completed is the one
-  exception: it proves nothing about the base, so the claim is
-  released and the run retried (#455).
+  default.** legacy launcher reads the pinned pull request through
+  the same identity-checked forge capability admission resolves
+  the run's head through (never a forge-specific CLI) and pins the
+  request's live target ref into the coordinator pod as
+  `COURIER_BASE`, so workspace preparation synchronizes against
+  the base the request names. the launch's read is its own:
+  admission resolved the run's head earlier and persisted only
+  branch, repository, and commit, so a request retargeted between
+  admission and launch is pinned with the base it targets now.
+  the base observed at admission instead would not repair the
+  request: the executor's startup guard fails closed on any
+  mismatch, so the run would terminalize a request that merely
+  moved base. `resolve-issue` run keeps the deployment default.
+  legacy path has no persisted publication policy to project a
+  base from, so an unverified base has no other answer: missing
+  resolver, failed resolution, or request naming no base ref
+  fails the launch closed with `BaseUnverified` (terminal — a
+  retry cannot change what the request names), never with a
+  substituted default. transient forge read that never completed
+  is the one exception: it proves nothing about the base, so the
+  claim is released and the run retried (#455).
 - **Run re-reads the live base before it prepares anything.**
   executor reads the pinned pull request through the forge
   capability before workspace preparation fetches or merges
@@ -592,7 +598,10 @@ and legacy path enforces both.
   an incorrect base assumption: the run fails closed before the
   coordinator starts, and preparation otherwise rebuilds the
   branch from the published head and synchronizes against the
-  pinned base.
+  pinned base. a workspace left behind by an earlier attempt is
+  rebuilt, never reused: preparation clears it and clones afresh,
+  so no stale merge, uncommitted edit, or untracked file survives
+  into the coordinator's checkout.
 
 ### Acceptance-criterion evidence contract (#249)
 
