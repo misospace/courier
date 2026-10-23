@@ -625,6 +625,12 @@ func processStat(pid int) (procInfo, error) {
 // window. It is nil in production.
 var artifactReadHook func()
 
+// errOpenatUnsupported marks the platform gap in readArtifact's confinement
+// walk: the artifact read fails closed with the explicit cause rather than
+// open without boundary or disguise the gap as a missing file. It can never
+// come from Linux syscall.Openat, so the pass-through below is inert there.
+var errOpenatUnsupported = errors.New("artifact confinement openat is unsupported on this platform")
+
 // readArtifact reads the declared artifact, refusing anything outside the
 // workspace and over the transport bound. The lexical gate is only a first
 // filter; the authoritative confinement check walks the cleaned path from the
@@ -657,11 +663,14 @@ func (w *Worker) readArtifact(declared string) ([]byte, error) {
 			// regular-file check on the descriptor rejects it right after.
 			flags |= syscall.O_NONBLOCK
 		}
-		next, openErr := syscall.Openat(dirfd, name, flags, 0)
+		next, openErr := openat(dirfd, name, flags)
 		if i > 0 {
 			syscall.Close(dirfd)
 		}
 		if openErr != nil {
+			if errors.Is(openErr, errOpenatUnsupported) {
+				return nil, errOpenatUnsupported
+			}
 			if errors.Is(openErr, syscall.ELOOP) {
 				if i < len(components)-1 {
 					return nil, errors.New("artifact path escapes the workspace")
