@@ -619,7 +619,7 @@ func TestCoordinatorLauncherProjectsFixPRBaseRef(t *testing.T) {
 		t.Fatalf("COURIER_BASE = %+v, want the pull request's live target ref courier/acme/widgets/issue-9, not the deployment default", base)
 	}
 	if resolutions != 1 {
-		t.Fatalf("pull-request resolutions = %d, want 1; the launch must cost one pull-request read", resolutions)
+		t.Fatalf("pull-request resolutions = %d, want 1; the launch must cost one pull-request read of its own", resolutions)
 	}
 
 	// A resolve-issue run keeps the deployment default: no pull request
@@ -636,6 +636,70 @@ func TestCoordinatorLauncherProjectsFixPRBaseRef(t *testing.T) {
 	}
 	if resolutions != 1 {
 		t.Fatalf("pull-request resolutions = %d, want 1; a resolve-issue run resolves no base", resolutions)
+	}
+}
+
+// The base a fix-pr pod carries comes from the launch's own read of the pull
+// request, not from an earlier observation of it. Admission resolves the
+// run's head and persists only branch, repository, and commit, so the launch
+// reads the request again and pins the base it targets now: a request
+// retargeted between admission and launch must reach the coordinator with its
+// live base, never with the one observed at admission and never with the
+// deployment default.
+func TestCoordinatorLauncherPinsBaseFromItsOwnLaunchTimeRead(t *testing.T) {
+	lane := &courierv1alpha1.LaneProfile{
+		ObjectMeta: metav1.ObjectMeta{Name: "local", Namespace: "default"},
+		Spec:       courierv1alpha1.LaneProfileSpec{Roles: map[string]string{"coordinator": "test-model"}},
+	}
+	run := &courierv1alpha1.CoderRun{
+		ObjectMeta: metav1.ObjectMeta{Name: "run-1", Namespace: "default", UID: types.UID("run-1-uid")},
+		Spec: courierv1alpha1.CoderRunSpec{
+			Mode: courierv1alpha1.ModeFixPR,
+			Repo: "acme/widgets",
+			Ref:  7,
+			Lane: "local",
+		},
+		// Admission already resolved the run's head and persisted it. It
+		// persists no base, so the launch must read the request itself.
+		Status: courierv1alpha1.CoderRunStatus{
+			Phase:    courierv1alpha1.PhaseClaimed,
+			Branch:   "courier/fix/acme-widgets/7",
+			HeadRepo: "acme/widgets",
+			HeadSHA:  "admission-sha",
+		},
+	}
+	fakeClient := fake.NewClientBuilder().
+		WithScheme(launcherScheme(t)).
+		WithStatusSubresource(&courierv1alpha1.CoderRun{}).
+		WithRuntimeObjects(run, lane).
+		Build()
+	resolutions := 0
+	launcher := &CoordinatorLauncher{
+		Client: fakeClient,
+		Pod:    executor.PodConfig{Image: "example/opencode:test", BaseBranch: "main"},
+		PRHeadResolver: ExistingPRHeadResolverFunc(func(_ context.Context, _ *courierv1alpha1.CoderRun) (HeadRef, error) {
+			resolutions++
+			return HeadRef{
+				Repo:    "acme/widgets",
+				Branch:  "courier/fix/acme-widgets/7",
+				SHA:     "launch-sha",
+				BaseRef: "release/2.0",
+			}, nil
+		}),
+	}
+
+	if err := launcher.Launch(context.Background(), run); err != nil {
+		t.Fatalf("Launch() error = %v", err)
+	}
+	var pod corev1.Pod
+	if err := fakeClient.Get(context.Background(), client.ObjectKey{Namespace: "default", Name: "run-1-coordinator"}, &pod); err != nil {
+		t.Fatalf("get coordinator pod: %v", err)
+	}
+	if base, ok := podEnvironmentByName(t, &pod)["COURIER_BASE"]; !ok || base.Value != "release/2.0" {
+		t.Fatalf("COURIER_BASE = %+v, want the base the launch's own read observed (release/2.0)", base)
+	}
+	if resolutions != 1 {
+		t.Fatalf("pull-request resolutions = %d, want 1; the launch reads the request itself even though admission already resolved the head", resolutions)
 	}
 }
 

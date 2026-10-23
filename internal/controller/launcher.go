@@ -93,7 +93,10 @@ type CoordinatorLauncher struct {
 	// through the configured forge capability. The legacy launch path has no
 	// persisted publication policy to project a base from, so a fix-pr run's
 	// coordinator pod is pinned to the pull request's live target ref
-	// resolved here — one pull-request read, never a forge-specific CLI.
+	// resolved here — the launch's own pull-request read, never a
+	// forge-specific CLI. Admission resolved the run's head earlier and
+	// persisted only branch, repository, and commit, so this read is what
+	// the launch pins the base from.
 	// Nil means no forge read is possible at all, and a fix-pr run then
 	// fails its launch closed rather than guessing a base.
 	PRHeadResolver ExistingPRHeadResolver
@@ -198,8 +201,14 @@ func (l *CoordinatorLauncher) Launch(ctx context.Context, run *courierv1alpha1.C
 	// request names a base the default does not. The legacy path has no
 	// persisted publication policy to project the base from, so the ref is
 	// resolved here through the same identity-checked forge capability
-	// admission uses — one pull-request read. A resolve-issue run keeps the
-	// deployment default.
+	// admission uses — never a forge-specific CLI. This read is the launch's
+	// own, not admission's: admission resolved the run's head earlier and
+	// persisted only branch, repository, and commit, so a request retargeted
+	// between admission and launch would reach the coordinator with the base
+	// observed at admission — and the executor's startup guard, which fails
+	// closed on any mismatch, would terminalize a request that merely moved
+	// base instead of following it to the base it targets now. A
+	// resolve-issue run keeps the deployment default.
 	if run.Spec.Mode == courierv1alpha1.ModeFixPR {
 		base, err := l.resolveFixPRBase(ctx, run)
 		if err != nil {
