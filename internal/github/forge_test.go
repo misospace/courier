@@ -201,6 +201,58 @@ func TestProviderForkIdentity(t *testing.T) {
 	}
 }
 
+// boolPtr is a test helper for expected Mergeable values.
+func boolPtr(b bool) *bool { return &b }
+
+// TestProviderReadPullRequestMergeability pins the provider's conservative
+// mergeability mapping (#513): GitHub's mergeable_state "dirty" is the
+// authoritative conflict signal and wins over the boolean, a pending or
+// absent answer maps to nil (unverifiable, never satisfied), and a computed
+// answer passes through unchanged.
+func TestProviderReadPullRequestMergeability(t *testing.T) {
+	cases := []struct {
+		name string
+		body string
+		want *bool
+	}{
+		{"dirty wins over mergeable true", `{"number":7,"state":"open","mergeable":true,"mergeable_state":"dirty","head":{"ref":"work","repo":{"full_name":"acme/demo"}},"base":{"ref":"main","repo":{"full_name":"acme/demo"}}}`, boolPtr(false)},
+		{"unknown state wins over stale mergeable true", `{"number":7,"state":"open","mergeable":true,"mergeable_state":"unknown","head":{"ref":"work","repo":{"full_name":"acme/demo"}},"base":{"ref":"main","repo":{"full_name":"acme/demo"}}}`, nil},
+		{"mergeable true stays true", `{"number":7,"state":"open","mergeable":true,"mergeable_state":"clean","head":{"ref":"work","repo":{"full_name":"acme/demo"}},"base":{"ref":"main","repo":{"full_name":"acme/demo"}}}`, boolPtr(true)},
+		{"mergeable false stays false", `{"number":7,"state":"open","mergeable":false,"mergeable_state":"clean","head":{"ref":"work","repo":{"full_name":"acme/demo"}},"base":{"ref":"main","repo":{"full_name":"acme/demo"}}}`, boolPtr(false)},
+		{"pending answer stays nil", `{"number":7,"state":"open","mergeable":null,"mergeable_state":"unknown","head":{"ref":"work","repo":{"full_name":"acme/demo"}},"base":{"ref":"main","repo":{"full_name":"acme/demo"}}}`, nil},
+		{"absent answer stays nil", `{"number":7,"state":"open","head":{"ref":"work","repo":{"full_name":"acme/demo"}},"base":{"ref":"main","repo":{"full_name":"acme/demo"}}}`, nil},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.Method != http.MethodGet || r.URL.Path != "/repos/acme/demo/pulls/7" {
+					http.NotFound(w, r)
+					return
+				}
+				_, _ = io.WriteString(w, tc.body)
+			}))
+			defer server.Close()
+			client, err := NewClient(server.URL, "token")
+			if err != nil {
+				t.Fatal(err)
+			}
+			p := NewProvider(forge.ProviderConfig{Name: "gh", Endpoint: server.URL}, client)
+			got, err := p.ReadPullRequest(context.Background(), forge.PullRequestRef{Repo: "acme/demo", Number: 7})
+			if err != nil {
+				t.Fatal(err)
+			}
+			switch {
+			case tc.want == nil && got.Mergeable != nil:
+				t.Fatalf("Mergeable = %v, want nil (unverifiable)", *got.Mergeable)
+			case tc.want != nil && got.Mergeable == nil:
+				t.Fatalf("Mergeable = nil, want %v", *tc.want)
+			case tc.want != nil && *got.Mergeable != *tc.want:
+				t.Fatalf("Mergeable = %v, want %v", *got.Mergeable, *tc.want)
+			}
+		})
+	}
+}
+
 func TestProviderMissingBaseRepository(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		_, _ = io.WriteString(w, `{"number":7,"head":{"ref":"work","sha":"fork123","repo":{"full_name":"other/demo"}},"base":{"ref":"main","sha":"base123","repo":null}}`)

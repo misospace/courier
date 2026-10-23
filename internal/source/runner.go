@@ -411,15 +411,17 @@ func (r *Runner) Poll(ctx context.Context) error {
 		run := &courierv1alpha1.CoderRun{
 			ObjectMeta: metav1.ObjectMeta{Namespace: r.Config.Namespace},
 			Spec: courierv1alpha1.CoderRunSpec{
-				Mode:          courierv1alpha1.Mode(spec.Mode),
-				Source:        spec.Source,
-				SourceAgent:   r.Config.SourceAgent,
-				WorkItemID:    spec.WorkItemID,
-				SourceContext: spec.Context,
-				Repo:          spec.Repo,
-				Ref:           spec.Ref,
-				Lane:          spec.Lane,
-				Debug:         spec.Debug,
+				Mode:              courierv1alpha1.Mode(spec.Mode),
+				Source:            spec.Source,
+				SourceAgent:       r.Config.SourceAgent,
+				WorkItemID:        spec.WorkItemID,
+				SourceContext:     spec.Context,
+				AssignmentKind:    spec.Assignment.Kind,
+				AssignmentReasons: spec.Assignment.Reasons,
+				Repo:              spec.Repo,
+				Ref:               spec.Ref,
+				Lane:              spec.Lane,
+				Debug:             spec.Debug,
 			},
 		}
 		name := runName(r.Config.Source, itemIdentity)

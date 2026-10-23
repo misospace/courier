@@ -18,6 +18,7 @@ import (
 	"reflect"
 	"regexp"
 	"runtime"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -651,8 +652,14 @@ func TestRunDeclaredNoChangeNeededExitsThreeWithoutComment(t *testing.T) {
 
 	var mu sync.Mutex
 	var comments []string
+	var pullReads int
 	api := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
+		if strings.Contains(r.URL.Path, "/pulls/") {
+			mu.Lock()
+			pullReads++
+			mu.Unlock()
+		}
 		if r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/comments") {
 			body, _ := io.ReadAll(r.Body)
 			mu.Lock()
@@ -685,6 +692,9 @@ func TestRunDeclaredNoChangeNeededExitsThreeWithoutComment(t *testing.T) {
 	}
 	mu.Lock()
 	defer mu.Unlock()
+	if pullReads != 0 {
+		t.Fatalf("pull reads = %d, want 0: a resolve-issue no_change_needed claim pins no pull request, so the executor must not verify it against one (#513)", pullReads)
+	}
 	if len(comments) != 0 {
 		t.Fatalf("comments = %d, want 0: the executor must not publish a terminal comment for a no_change_needed declaration (#474); posted %q", len(comments), comments)
 	}
@@ -693,10 +703,12 @@ func TestRunDeclaredNoChangeNeededExitsThreeWithoutComment(t *testing.T) {
 // TestRunFixPRDeclaredNoChangeNeededNeverClaimsAddressed proves the open
 // fix-pr half of the #474 contract: a fix-pr run declaring no_change_needed
 // exits 3 for the controller's Verifying settlement and publishes no comment.
-// The controller can still end such a run BlockedExternal because a clean
-// workspace does not verify queued feedback resolution, so an executor
-// comment claiming the work is already addressed could contradict the run's
-// authoritative lifecycle state.
+// The pinned pull request is served open and mergeable, so the executor's
+// #513 claim verification passes and the claim stands; the controller can
+// still end such a run BlockedExternal because a clean workspace does not
+// verify queued feedback resolution, so an executor comment claiming the
+// work is already addressed could contradict the run's authoritative
+// lifecycle state.
 func TestRunFixPRDeclaredNoChangeNeededNeverClaimsAddressed(t *testing.T) {
 	root := t.TempDir()
 	remote := remoteWithExistingBranch(t, root)
@@ -716,10 +728,12 @@ func TestRunFixPRDeclaredNoChangeNeededNeverClaimsAddressed(t *testing.T) {
 			return
 		}
 		// The fix-pr base guard reads the pull request the run repairs
-		// before workspace preparation; the fixture serves that PR open on
-		// the run's pinned base so the run reaches the outcome path.
-		if r.Method == http.MethodGet && r.URL.Path == "/repos/acme/widgets/pulls/7" {
-			_, _ = io.WriteString(w, `{"number":7,"state":"open","base":{"ref":"main","sha":"a","repo":{"full_name":"acme/widgets"}},"head":{"ref":"courier/resolve-issue/acme-widgets/7","sha":"b","repo":{"full_name":"acme/widgets"}}}`)
+		// before workspace preparation, and the no-change claim is verified
+		// against that pull request's mergeability (#513); the fixture
+		// serves that PR open, mergeable, and on the run's pinned base so
+		// the run reaches the outcome path.
+		if r.Method == http.MethodGet && strings.HasSuffix(r.URL.Path, "/pulls/7") {
+			_, _ = io.WriteString(w, `{"number":7,"state":"open","mergeable":true,"mergeable_state":"clean","base":{"ref":"main","sha":"a","repo":{"full_name":"acme/widgets"}},"head":{"ref":"courier/resolve-issue/acme-widgets/7","sha":"b","repo":{"full_name":"acme/widgets"}}}`)
 			return
 		}
 		_, _ = io.WriteString(w, `[]`)
@@ -752,6 +766,161 @@ func TestRunFixPRDeclaredNoChangeNeededNeverClaimsAddressed(t *testing.T) {
 	defer mu.Unlock()
 	if len(comments) != 0 {
 		t.Fatalf("comments = %d, want 0: a fix-pr no_change_needed run must never publish a comment that could claim the work is already addressed (#474); posted %q", len(comments), comments)
+	}
+}
+
+// runFixPRDeclaredNoChange drives a fix-pr run whose coordinator declares
+// no_change_needed with clean workspace, against a fake GitHub API whose
+// GET pulls/7 answer is scripted by pull (nil pull leaves every request
+// answered with `[]`), and returns the run's exit code, its output, and
+// every comment body the fake forge received. It is the shared fixture for
+// the #513 claim-verification tests.
+func runFixPRDeclaredNoChange(t *testing.T, pull func(w http.ResponseWriter, r *http.Request) bool) (int, string, []string) {
+	t.Helper()
+	root := t.TempDir()
+	remote := remoteWithExistingBranch(t, root)
+	fakeOpenCode := filepath.Join(root, "opencode")
+	writeExecutable(t, fakeOpenCode, "#!/bin/sh\ncase \"$1\" in mcp) exit 0;; esac\nmkdir -p \"$COURIER_SCRATCH_DIR\"\nprintf '{\"outcome\":\"no_change_needed\",\"evidence\":\"feedback looks addressed\"}' > \"$COURIER_SCRATCH_DIR/outcome.json\"\nexit 0\n")
+
+	var mu sync.Mutex
+	var comments []string
+	api := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/comments") {
+			body, _ := io.ReadAll(r.Body)
+			mu.Lock()
+			comments = append(comments, string(body))
+			mu.Unlock()
+			_, _ = w.Write([]byte(`{"id":1}`))
+			return
+		}
+		if pull != nil && r.Method == http.MethodGet && strings.HasSuffix(r.URL.Path, "/pulls/7") && pull(w, r) {
+			return
+		}
+		_, _ = io.WriteString(w, `[]`)
+	}))
+	defer api.Close()
+	setResolveIssueEnv(t, root, remote, api.URL, fakeOpenCode)
+	t.Setenv("COURIER_MODE", "fix-pr")
+	// A same-repo head identity keeps the fix-pr head guard out of the way;
+	// the run still exercises the fix-pr classify path.
+	t.Setenv("COURIER_HEAD_REPO", "acme/widgets")
+	t.Setenv("COURIER_REF", "7")
+	t.Setenv("COURIER_RUN_NAME", "coderrun-it-7")
+	t.Setenv("GITHUB_TOKEN", "test-token")
+
+	var output bytes.Buffer
+	var errorsOut bytes.Buffer
+	code := run(context.Background(), &output, &errorsOut)
+	mu.Lock()
+	defer mu.Unlock()
+	return code, output.String(), comments
+}
+
+// TestRunFixPRDeclaredNoChangeNeededRejectedWhenConflicting pins the first
+// #513 acceptance condition: a fix-pr run whose pinned pull request still
+// conflicts with its base cannot exit 3 on the coordinator's word — review
+// approval and an unchanged head prove nothing once the forge reports the
+// conflict — so the run fails with a reason that stands on the forge state,
+// never on the model-authored evidence, and publishes no comment.
+func TestRunFixPRDeclaredNoChangeNeededRejectedWhenConflicting(t *testing.T) {
+	code, output, comments := runFixPRDeclaredNoChange(t, func(w http.ResponseWriter, r *http.Request) bool {
+		_, _ = io.WriteString(w, `{"number":7,"state":"open","mergeable":false,"mergeable_state":"dirty","base":{"ref":"main","repo":{"full_name":"acme/widgets"}},"head":{"ref":"feature","repo":{"full_name":"acme/widgets"}}}`)
+		return true
+	})
+	if code != exitFailed {
+		t.Fatalf("run exit code = %d, want %d; output=%q", code, exitFailed, output)
+	}
+	if !strings.Contains(output, `"phase":"Failed"`) {
+		t.Fatalf("conflicting-claim phase = %q", output)
+	}
+	if !strings.Contains(output, "still conflicts with base main") || !strings.Contains(output, "acme/widgets#7") {
+		t.Fatalf("conflicting-claim reason = %q", output)
+	}
+	if strings.Contains(output, "feedback looks addressed") {
+		t.Fatalf("rejection must stand on forge state, not the coordinator's model-authored evidence: %q", output)
+	}
+	if len(comments) != 0 {
+		t.Fatalf("comments = %d, want 0: an unsatisfied no-change claim must not publish a success observation; posted %q", len(comments), comments)
+	}
+}
+
+// TestRunFixPRDeclaredNoChangeNeededRejectedWhenMergeabilityUnknown pins the
+// second #513 acceptance condition: an unknown mergeability answer is not
+// conflict resolution. The pull request scripts the adversarial shape — a
+// stale mergeable=true left over while GitHub recomputes (mergeable_state
+// "unknown") — and the unverified claim still fails closed instead of
+// exiting 3.
+func TestRunFixPRDeclaredNoChangeNeededRejectedWhenMergeabilityUnknown(t *testing.T) {
+	code, output, comments := runFixPRDeclaredNoChange(t, func(w http.ResponseWriter, r *http.Request) bool {
+		_, _ = io.WriteString(w, `{"number":7,"state":"open","mergeable":true,"mergeable_state":"unknown","base":{"ref":"main","repo":{"full_name":"acme/widgets"}},"head":{"ref":"feature","repo":{"full_name":"acme/widgets"}}}`)
+		return true
+	})
+	if code != exitFailed {
+		t.Fatalf("run exit code = %d, want %d; output=%q", code, exitFailed, output)
+	}
+	if !strings.Contains(output, `"phase":"Failed"`) {
+		t.Fatalf("unknown-mergeability phase = %q", output)
+	}
+	if !strings.Contains(output, "mergeability against base main is unknown") {
+		t.Fatalf("unknown-mergeability reason = %q", output)
+	}
+	if len(comments) != 0 {
+		t.Fatalf("comments = %d, want 0: an unverified no-change claim must not publish a success observation; posted %q", len(comments), comments)
+	}
+}
+
+// TestRunFixPRDeclaredNoChangeNeededRejectedWhenForgeReadFails pins the
+// #513 fail-closed rule for an unverifiable claim: a forge read that did not
+// happen proves nothing, so the run may not exit 3 on a claim it could not
+// check.
+//
+// The startup guard (#514) reads the same pull request before the run
+// reaches the claim verification, so the fixture answers the guard's read
+// with an open request on the pinned base and fails the verification's own
+// read: the claim verification, not the guard, is what this case exercises.
+func TestRunFixPRDeclaredNoChangeNeededRejectedWhenForgeReadFails(t *testing.T) {
+	reads := 0
+	code, output, comments := runFixPRDeclaredNoChange(t, func(w http.ResponseWriter, r *http.Request) bool {
+		reads++
+		if reads == 1 {
+			_, _ = io.WriteString(w, `{"number":7,"state":"open","mergeable":true,"mergeable_state":"clean","base":{"ref":"main","repo":{"full_name":"acme/widgets"}},"head":{"ref":"feature","repo":{"full_name":"acme/widgets"}}}`)
+			return true
+		}
+		w.WriteHeader(http.StatusInternalServerError)
+		return true
+	})
+	if code != exitFailed {
+		t.Fatalf("run exit code = %d, want %d; output=%q", code, exitFailed, output)
+	}
+	if !strings.Contains(output, `"phase":"Failed"`) {
+		t.Fatalf("failed-read phase = %q", output)
+	}
+	if !strings.Contains(output, "could not verify the no-change claim") {
+		t.Fatalf("failed-read reason = %q", output)
+	}
+	if len(comments) != 0 {
+		t.Fatalf("comments = %d, want 0: an unverifiable no-change claim must not publish a success observation; posted %q", len(comments), comments)
+	}
+}
+
+// TestRunFixPRDeclaredNoChangeNeededSatisfiedWhenMerged pins the third #513
+// acceptance condition: a satisfied claim remains possible without
+// manufacturing commits — a pinned request the forge reports merged is moot
+// as a repair condition, so the run still exits 3 and publishes no comment.
+func TestRunFixPRDeclaredNoChangeNeededSatisfiedWhenMerged(t *testing.T) {
+	code, output, comments := runFixPRDeclaredNoChange(t, func(w http.ResponseWriter, r *http.Request) bool {
+		_, _ = io.WriteString(w, `{"number":7,"state":"closed","merged_at":"2026-10-22T00:00:00Z","mergeable":null,"base":{"ref":"main","repo":{"full_name":"acme/widgets"}},"head":{"ref":"feature","repo":{"full_name":"acme/widgets"}}}`)
+		return true
+	})
+	if code != exitNoChangeNeeded {
+		t.Fatalf("run exit code = %d, want %d; output=%q", code, exitNoChangeNeeded, output)
+	}
+	if !strings.Contains(output, `"phase":"NoChangeNeeded"`) {
+		t.Fatalf("merged-claim phase = %q", output)
+	}
+	if len(comments) != 0 {
+		t.Fatalf("comments = %d, want 0: even a satisfied no-change claim publishes no executor comment (#474); posted %q", len(comments), comments)
 	}
 }
 
@@ -865,6 +1034,255 @@ exit 0
 	}
 	if !strings.Contains(comments[0], "Which payment provider") {
 		t.Fatalf("comment lost the question around the redaction: %q", comments[0])
+	}
+}
+
+// The #517 fix-pr handoff family: a fix-pr run carries no trusted source
+// issue, so the pre-handoff plan instead re-verifies its pinned head
+// through the same identity-checked forge listing (#247) and fails
+// closed on every world that does not match the pinned contract — only
+// an open, non-draft pull request on COURIER_BASE with the run's commit
+// published hands off as Verifying.
+
+// runFixPRHandoff drives a fix-pr run whose first turn commits work,
+// pushes the run branch when push is set, and declares changes, against
+// the state-file forge fixture pre-seeded with seed (nothing pre-seeded
+// when seed is empty). buildExtra, when non-nil, receives the fixtures'
+// state-file path and returns a shell snippet run inside the workspace
+// after the push and before the outcome declaration — the handoff
+// window where a real forge's pull-request world can move under the
+// run's startup guards (#517). It returns the run's exit code, its
+// output, every comment body the fake forge received, and the number of
+// pulls-list requests the forge answered, so the tests that assert the
+// observation ran can prove the read happened rather than merely that
+// no defect fired.
+func runFixPRHandoff(t *testing.T, seed string, push bool, buildExtra func(prState string) string) (int, string, []string, int) {
+	t.Helper()
+	root := t.TempDir()
+	remote := remoteWithExistingBranch(t, root)
+	prServer, prState := fakeForgePullRequestServer(t)
+	if seed != "" {
+		write(t, prState, seed)
+	}
+	var mu sync.Mutex
+	pullsListed := 0
+	pullCountingServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodGet && strings.Contains(r.URL.RawQuery, "head=acme:") {
+			mu.Lock()
+			pullsListed++
+			mu.Unlock()
+		}
+		prServer.Config.Handler.ServeHTTP(w, r)
+	}))
+	t.Cleanup(pullCountingServer.Close)
+	extraScript := ""
+	if buildExtra != nil {
+		extraScript = buildExtra(prState)
+	}
+	fakeOpenCode := filepath.Join(root, "opencode")
+	script := `#!/bin/sh
+case "$1" in mcp) exit 0;; esac
+printf 'work\n' > fixwork.txt
+git add --all -- .
+git commit -m 'fix: apply feedback' >/dev/null
+` + extraScript + `mkdir -p "$COURIER_SCRATCH_DIR"
+printf '{"outcome":"changes"}' > "$COURIER_SCRATCH_DIR/outcome.json"
+exit 0
+`
+	if push {
+		script = strings.Replace(script, "git commit -m 'fix: apply feedback' >/dev/null\n", "git commit -m 'fix: apply feedback' >/dev/null\ngit push origin \"$COURIER_BRANCH\" >/dev/null 2>&1\n", 1)
+	}
+	writeExecutable(t, fakeOpenCode, script)
+	setResolveIssueEnv(t, root, remote, pullCountingServer.URL, fakeOpenCode)
+	t.Setenv("COURIER_MODE", "fix-pr")
+	// A same-repo head identity keeps the fix-pr head guard out of the
+	// way; the handoff observation still classifies the pinned head.
+	t.Setenv("COURIER_HEAD_REPO", "acme/widgets")
+	t.Setenv("COURIER_REF", "7")
+	t.Setenv("COURIER_RUN_NAME", "coderrun-it-7")
+	t.Setenv("GITHUB_TOKEN", "test-token")
+
+	var output bytes.Buffer
+	var errorsOut bytes.Buffer
+	code := run(context.Background(), &output, &errorsOut)
+	mu.Lock()
+	listed := pullsListed
+	mu.Unlock()
+	return code, output.String(), readForgeComments(t, prState), listed
+}
+
+// TestRunFixPRChangesHandsOffVerifiedPR proves the #517 happy path no
+// other test covers: a fix-pr run's committed, pushed, and declared
+// changes hand off as Verifying only after the identity-checked listing
+// confirmed exactly one open, non-draft pull request whose full head
+// identity and base ref match the pinned contract — and whose number is
+// the pinned pull request the run was admitted against — and only after
+// the run's commit is confirmed published, and the passing handoff
+// publishes no forge comment. The pulls-list count makes the assertion
+// feature-sensitive: without checkFixPRHandoff no listing happens (the
+// run still exits 0, so exit codes alone cannot prove the re-check).
+func TestRunFixPRChangesHandsOffVerifiedPR(t *testing.T) {
+	code, output, comments, listed := runFixPRHandoff(t, pullRequestFixtureJSON(7, "open", false, "Feedback applied."), true, nil)
+	if code != exitSuccess {
+		t.Fatalf("run exit code = %d, want %d; output=%q", code, exitSuccess, output)
+	}
+	if !strings.Contains(output, `"phase":"Verifying"`) {
+		t.Fatalf("verifying phase missing: %q", output)
+	}
+	if listed < 1 {
+		t.Fatalf("pulls-list reads = %d, want >= 1: the fix-pr handoff must read the forge before the Verifying handoff (#517)", listed)
+	}
+	if len(comments) != 0 {
+		t.Fatalf("comments = %d, want 0: a passing fix-pr handoff must not publish a comment; posted %q", len(comments), comments)
+	}
+}
+
+// TestRunFixPRHandoffWrongBase is the #517 regression: the run is
+// admitted against a live pull request on the pinned base, the forge
+// world moves under it during the captured turn — the same window
+// between the startup checks and the pre-handoff observation the issue
+// describes — and the handoff re-observation fails closed to NeedsHuman
+// with a reason naming the pinned base, publishing no success comment.
+func TestRunFixPRHandoffWrongBase(t *testing.T) {
+	code, output, comments, _ := runFixPRHandoff(t,
+		pullRequestFixtureJSON(7, "open", false, "Feedback applied."),
+		true,
+		func(prState string) string {
+			return writePullRequestScript(prState, "["+pullRequestFixtureObjectJSONWithBase(7, "open", false, "release-9", "Feedback applied, retargeted.")+"]")
+		},
+	)
+	if code != exitNeedsHuman {
+		t.Fatalf("run exit code = %d, want %d; output=%q", code, exitNeedsHuman, output)
+	}
+	if !strings.Contains(output, `"phase":"NeedsHuman"`) {
+		t.Fatalf("needs-human phase missing: %q", output)
+	}
+	if !strings.Contains(output, "targets a base other than the pinned base") || !strings.Contains(output, `pinned base \"main\"`) {
+		t.Fatalf("termination must name the pinned base with the wrong-base wording: %q", output)
+	}
+	if len(comments) != 0 {
+		t.Fatalf("comments = %d, want 0: the refused handoff must not publish success comments; posted %q", len(comments), comments)
+	}
+}
+
+// TestRunFixPRHandoffFailClosedWorlds pins the fixed #517 consequences
+// for the worlds the resolve-issue plan would offer a continuation for:
+// a draft pinned PR and a missing pinned PR fail closed without the
+// ready/create continuations, like the ambiguous, closed-only,
+// foreign-head, and unpublished worlds. One run per world, every one
+// NeedsHuman.
+//
+// Every fixture names the pinned pull request (#7 — the run's COURIER_REF)
+// except the two worlds that are about a pull request the run was never
+// admitted against: the observed PR carries another number, so the pinned
+// assignment stays unverified and the handoff fails closed instead of
+// verifying a pull request nobody pinned.
+//
+// The worlds that reach the handoff are the ones that appear during the
+// captured turn: the startup guard (#514) settles a world that is already
+// there when the run starts — a closed or merged pinned request is a moot
+// repair condition, and a pinned request the forge does not have is an
+// unverifiable assignment — so the handoff re-check (#517, #524) exists
+// for the world that moves under the run, which each case scripts by
+// rewriting the forge fixture from inside the coordinator turn.
+func TestRunFixPRHandoffFailClosedWorlds(t *testing.T) {
+	cases := []struct {
+		name   string
+		seed   string
+		extra  func(prState string) string
+		nopush bool
+		want   string
+	}{
+		{
+			name: "draft pinned PR",
+			seed: "[" + pullRequestFixtureObjectJSON(7, "open", true, "Feedback applied.") + "]",
+			want: "is a draft at handoff",
+		},
+		{
+			name: "missing pinned PR",
+			seed: "",
+			want: "neither opens a replacement nor adopts another pull request",
+		},
+		{
+			// The pinned PR and a sibling PR both carry the run's head:
+			// two open pull requests claim the assignment, so the
+			// executor adopts neither (#247).
+			name: "ambiguous open PRs",
+			seed: "[" + pullRequestFixtureObjectJSON(7, "open", false, "Feedback applied.") + "," + pullRequestFixtureObjectJSON(13, "open", false, "Feedback applied.") + "]",
+			want: "more than one open pull request",
+		},
+		{
+			// The pinned request closes during the captured turn: the
+			// handoff re-check finds a closed-only head and refuses it.
+			name: "closed-only head",
+			seed: "[" + pullRequestFixtureObjectJSON(7, "open", false, "Feedback applied.") + "]",
+			extra: func(prState string) string {
+				return writePullRequestScript(prState, "["+pullRequestFixtureObjectJSON(7, "closed", false, "Feedback applied.")+"]")
+			},
+			want: "only closed or merged pull requests",
+		},
+		{
+			name: "foreign same-owner fork head",
+			seed: "[" + pullRequestFixtureObjectJSONWithHeadRepo(7, "open", false, "acme/widgets-fork", "Feedback applied.") + "]",
+			want: "claiming the head selector",
+		},
+		{
+			// An open PR over a head the remote does not advertise: the
+			// run commits work but never pushes, so the listing finds the
+			// pinned PR and the publication sha-proof refuses the handoff
+			// — a commit the remote never advertised cannot carry
+			// reviewable work (#247, #517).
+			name:   "unpublished open PR",
+			seed:   pullRequestFixtureJSON(7, "open", false, "Feedback applied."),
+			nopush: true,
+			want:   "does not carry the run's pushed work",
+		},
+		{
+			// The only open pull request on the run's head is not the
+			// pinned assignment: the head is right and the base is
+			// right, but the run was admitted against PR #7 and the
+			// forge reports #12, so the handoff must not verify a pull
+			// request nobody pinned (#517).
+			name: "open PR that is not the pinned assignment",
+			seed: pullRequestFixtureJSON(7, "open", false, "Feedback applied."),
+			extra: func(prState string) string {
+				return writePullRequestScript(prState, "["+pullRequestFixtureObjectJSON(12, "open", false, "Feedback applied.")+"]")
+			},
+			want: "not the pinned pull request #7",
+		},
+		{
+			name: "draft PR that is not the pinned assignment",
+			seed: "[" + pullRequestFixtureObjectJSON(7, "open", false, "Feedback applied.") + "]",
+			extra: func(prState string) string {
+				return writePullRequestScript(prState, "["+pullRequestFixtureObjectJSON(12, "open", true, "Feedback applied.")+"]")
+			},
+			want: "not the pinned pull request #7",
+		},
+		{
+			name: "closed-only head without the pinned PR",
+			seed: "[" + pullRequestFixtureObjectJSON(7, "open", false, "Feedback applied.") + "]",
+			extra: func(prState string) string {
+				return writePullRequestScript(prState, "["+pullRequestFixtureObjectJSON(12, "closed", false, "Feedback applied.")+"]")
+			},
+			want: "not the pinned pull request #7",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			code, output, comments, _ := runFixPRHandoff(t, tc.seed, !tc.nopush, tc.extra)
+			if code != exitNeedsHuman {
+				t.Fatalf("run exit code = %d, want %d; output=%q", code, exitNeedsHuman, output)
+			}
+			if !strings.Contains(output, `"phase":"NeedsHuman"`) {
+				t.Fatalf("needs-human phase missing: %q", output)
+			}
+			if !strings.Contains(output, tc.want) {
+				t.Fatalf("termination reason lost %q: %q", tc.want, output)
+			}
+			if len(comments) != 0 {
+				t.Fatalf("comments = %d, want 0: a fail-closed fix-pr handoff must not publish comments; posted %q", len(comments), comments)
+			}
+		})
 	}
 }
 
@@ -2426,6 +2844,42 @@ func TestReadConfigFixPRRequiresHeadRepo(t *testing.T) {
 	}
 }
 
+// TestReadConfigFixPRRequiresPinnedReference pins the #517 admission
+// invariant: a fix-pr run is admitted against one pinned pull request, so
+// a run that cannot name it fails closed at configuration instead of
+// reaching a Verifying handoff whose pinned-PR verification it can never
+// perform.
+func TestReadConfigFixPRRequiresPinnedReference(t *testing.T) {
+	base := map[string]string{
+		"COURIER_REPO_URL":  "https://git.example/acme/widgets.git",
+		"COURIER_BRANCH":    "fix/pr-12",
+		"COURIER_GOAL":      "goal",
+		"COURIER_MODEL":     "model",
+		"COURIER_MODE":      "fix-pr",
+		"COURIER_REPO":      "acme/widgets",
+		"COURIER_HEAD_REPO": "octocat/widgets",
+	}
+	for _, ref := range []string{"", "0", "PR-12"} {
+		values := map[string]string{}
+		for name, value := range base {
+			values[name] = value
+		}
+		values["COURIER_REF"] = ref
+		_, err := readConfig(func(name string) string { return values[name] })
+		if err == nil || !strings.Contains(err.Error(), "COURIER_REF") {
+			t.Fatalf("readConfig() error = %v for COURIER_REF %q, want missing pinned pull request reference for fix-pr", err, ref)
+		}
+	}
+	values := map[string]string{}
+	for name, value := range base {
+		values[name] = value
+	}
+	values["COURIER_REF"] = "12"
+	if _, err := readConfig(func(name string) string { return values[name] }); err != nil {
+		t.Fatalf("readConfig() error = %v, want a pinned pull request reference to admit the fix-pr run", err)
+	}
+}
+
 func TestRunResolveIssueFailsWhenGitHubErrors(t *testing.T) {
 	root := t.TempDir()
 	remote := remoteWithExistingBranch(t, root)
@@ -2590,14 +3044,14 @@ func TestGuardFixPRBase(t *testing.T) {
 			want:      0,
 		},
 		{
-			name:      "closed pull request fails closed",
+			name:      "closed pull request is a moot repair condition",
 			mode:      "fix-pr",
 			ref:       12,
 			base:      "main",
 			prState:   "closed",
 			prBaseRef: "main",
-			want:      exitNeedsHuman,
-			wantOut:   []string{`"phase":"NeedsHuman"`, "closed"},
+			want:      exitNoChangeNeeded,
+			wantOut:   []string{`"phase":"NoChangeNeeded"`, "closed"},
 		},
 		{
 			name:      "merged pull request names the state the operator can act on",
@@ -2607,8 +3061,8 @@ func TestGuardFixPRBase(t *testing.T) {
 			prState:   "closed",
 			prMerged:  true,
 			prBaseRef: "main",
-			want:      exitNeedsHuman,
-			wantOut:   []string{`"phase":"NeedsHuman"`, "merged"},
+			want:      exitNoChangeNeeded,
+			wantOut:   []string{`"phase":"NoChangeNeeded"`, "merged"},
 		},
 		{
 			name:       "base repository differing from the run repository fails closed",
@@ -2638,6 +3092,19 @@ func TestGuardFixPRBase(t *testing.T) {
 			serverStatus: http.StatusBadRequest,
 			want:         exitFailed,
 			wantOut:      []string{`"phase":"Failed"`},
+		},
+		{
+			// The forge's authoritative answer is that the pinned pull
+			// request does not exist: the assignment is gone, so the run
+			// has no base to validate and nothing to repair. That is a
+			// world fact for a human to settle, not an executor crash.
+			name:         "missing pinned pull request fails closed for a human",
+			mode:         "fix-pr",
+			ref:          12,
+			base:         "main",
+			serverStatus: http.StatusNotFound,
+			want:         exitNeedsHuman,
+			wantOut:      []string{`"phase":"NeedsHuman"`, "does not exist", "neither opens a replacement nor adopts another pull request"},
 		},
 		{
 			name:      "fix-pr run without a pull request number fails closed",
@@ -3414,7 +3881,14 @@ func fakeForgePullRequestServer(t *testing.T) (*httptest.Server, string) {
 		}
 		data, err := os.ReadFile(statePath)
 		w.Header().Set("Content-Type", "application/json")
+		number, single := pullRequestReadNumber(r.URL.Path)
 		if err != nil || len(bytes.TrimSpace(data)) == 0 {
+			if single {
+				// The forge has no pull request to answer a read with.
+				w.WriteHeader(http.StatusNotFound)
+				_, _ = io.WriteString(w, `{"message":"Not Found"}`)
+				return
+			}
 			_, _ = io.WriteString(w, `[]`)
 			return
 		}
@@ -3422,10 +3896,52 @@ func fakeForgePullRequestServer(t *testing.T) (*httptest.Server, string) {
 			w.WriteHeader(http.StatusInternalServerError)
 			return
 		}
+		if single {
+			serveSinglePullRequest(w, data, number)
+			return
+		}
 		_, _ = w.Write(data)
 	}))
 	t.Cleanup(server.Close)
 	return server, statePath
+}
+
+// pullRequestReadNumber reports the pull-request number a single
+// pull-request read addresses ("/repos/owner/repo/pulls/7" → 7) and whether
+// the path is such a read at all. The forge answers a single-pull-request
+// read with one object and a head listing with an array, so the fake forge
+// answers both shapes the way the forge does.
+func pullRequestReadNumber(path string) (int, bool) {
+	segments := strings.Split(strings.Trim(path, "/"), "/")
+	if len(segments) != 5 || segments[0] != "repos" || segments[3] != "pulls" {
+		return 0, false
+	}
+	number, err := strconv.Atoi(segments[4])
+	if err != nil {
+		return 0, false
+	}
+	return number, true
+}
+
+// serveSinglePullRequest answers a single-pull-request read with the
+// matching record of the fixture list, the way the forge answers one read
+// with one object. A fixture that names no such record is a pull request the
+// forge does not have, which it reports as 404.
+func serveSinglePullRequest(w http.ResponseWriter, data []byte, number int) {
+	var records []json.RawMessage
+	if err := json.Unmarshal(data, &records); err == nil {
+		for _, record := range records {
+			var probe struct {
+				Number int `json:"number"`
+			}
+			if err := json.Unmarshal(record, &probe); err == nil && probe.Number == number {
+				_, _ = w.Write(record)
+				return
+			}
+		}
+	}
+	w.WriteHeader(http.StatusNotFound)
+	_, _ = io.WriteString(w, `{"message":"Not Found"}`)
 }
 
 // pullRequestFixtureObjectJSON renders one pull request on the run branch
@@ -7116,6 +7632,118 @@ func TestPullRequestStateMessages(t *testing.T) {
 	}
 }
 
+// TestFixPRHandoffMessages pins the #517 fix-pr handoff wording: the
+// retry continuation is a factual unverified message that names the
+// pinned head identity, never a missing-PR claim and never a source
+// issue (a fix-pr run has none); the exhausted and continuation-less
+// forge-failure reason carries the same disclaimer; and the two
+// fail-closed worlds name the unverified pinned contract a human must
+// settle.
+func TestFixPRHandoffMessages(t *testing.T) {
+	var output, errorsOut bytes.Buffer
+	report := newReporter(&output, &errorsOut, config{
+		Mode:     "fix-pr",
+		Repo:     "misospace/miso-gallery",
+		HeadRepo: "octocat/widgets-fork",
+		Branch:   "fix/gallery-feedback/502",
+		Base:     "main",
+		Ref:      502,
+	})
+	forgeErr := errors.New("GitHub API returned HTTP 500")
+
+	unverified := report.fixPRUnverifiedMessage(forgeErr, 3)
+	for _, want := range []string{
+		"could not verify the pull-request state",
+		`branch "fix/gallery-feedback/502" on head octocat/widgets-fork`,
+		"GitHub API returned HTTP 500",
+		"this is not proof that the pinned pull request is missing",
+		"the pinned pull request #502",
+		"open, non-draft pull request",
+		`base "main"`,
+		"is not the pinned assignment",
+		"Do not adopt another repository's pull request",
+		"do not change an existing pull request's base or head",
+		"declare blocked_external",
+		"(continuation 3)",
+	} {
+		if !strings.Contains(unverified, want) {
+			t.Fatalf("fix-pr unverified message lost %q: %q", want, unverified)
+		}
+	}
+	if strings.Contains(unverified, "source issue") {
+		t.Fatalf("fix-pr unverified message must stay source-issue-free: %q", unverified)
+	}
+
+	forgeFailure := report.fixPRForgeFailureReason(forgeErr)
+	for _, want := range []string{
+		`branch "fix/gallery-feedback/502"`,
+		"misospace/miso-gallery",
+		"head octocat/widgets-fork",
+		"GitHub API returned HTTP 500",
+		"a read that did not happen proves nothing about the pinned pull request",
+		"the run needs a human",
+	} {
+		if !strings.Contains(forgeFailure, want) {
+			t.Fatalf("fix-pr forge-failure reason lost %q: %q", want, forgeFailure)
+		}
+	}
+
+	missing := report.pinnedPRMissingReason()
+	for _, want := range []string{
+		`head branch "fix/gallery-feedback/502"`,
+		"head octocat/widgets-fork",
+		"the base repository misospace/miso-gallery",
+		"the pinned pull request is unverified",
+		"neither opens a replacement nor adopts another pull request",
+		"the run needs a human",
+	} {
+		if !strings.Contains(missing, want) {
+			t.Fatalf("pinned-PR-missing reason lost %q: %q", want, missing)
+		}
+	}
+
+	draft := report.pinnedPRDraftReason(44)
+	for _, want := range []string{
+		"pull request #44",
+		"fix/gallery-feedback/502",
+		"draft at handoff",
+		"readiness is a human settlement, never a continuation's unilateral flip",
+		"the run needs a human",
+	} {
+		if !strings.Contains(draft, want) {
+			t.Fatalf("pinned-PR-draft reason lost %q: %q", want, draft)
+		}
+	}
+
+	mismatch := report.pinnedPRNumberMismatchReason(502, 513)
+	for _, want := range []string{
+		"pull request #513",
+		"not the pinned pull request #502",
+		`head branch "fix/gallery-feedback/502"`,
+		"head octocat/widgets-fork",
+		"verifies the pinned assignment only",
+		"never adopts another pull request",
+		"the run needs a human",
+	} {
+		if !strings.Contains(mismatch, want) {
+			t.Fatalf("pinned-PR-number-mismatch reason lost %q: %q", want, mismatch)
+		}
+	}
+
+	unsettled := report.fixPRUnsettledReason(&handoffCheckOutcome{pr: &prLinkageObservation{Number: 513}})
+	for _, want := range []string{
+		"did not settle a known pull-request world",
+		"observed pull request #513",
+		"fix/gallery-feedback/502",
+		"will not hand off over a pull request it did not settle",
+		"the run needs a human",
+	} {
+		if !strings.Contains(unsettled, want) {
+			t.Fatalf("fix-pr unsettled reason lost %q: %q", want, unsettled)
+		}
+	}
+}
+
 // TestObserveRunBranchPullRequestIdentity pins the identity rules of the
 // executor's pre-handoff forge read (#247): only a pull request whose
 // full base- and head-repository identity matches the run's pinned
@@ -7182,6 +7810,154 @@ func TestObserveRunBranchPullRequestIdentity(t *testing.T) {
 	ambiguous := "[" + pullRequestFixtureObjectJSON(12, "open", false, "Closes #7.") + "," + pullRequestFixtureObjectJSON(13, "open", false, "Closes #7.") + "]"
 	if got := newObserved(ambiguous); got.kind != prStateAmbiguous {
 		t.Fatalf("two open PRs on the verified head classified as %+v, want prStateAmbiguous", got)
+	}
+}
+
+// TestObserveRunBranchPullRequestFixPRHead pins the fix-pr half of the
+// observation contract (#517): the forge listing queries the pinned fork
+// head's owner:branch selector (runHeadRepo, not the base repository), and
+// the same identity rules classify the resulting set as the resolve-issue
+// observation (#247) — a fork head carrying the pinned identity is the
+// run's own open PR, a record claiming that fork selector from another
+// repository is foreign (never adopted), and a fork head PR re-targeted
+// onto another base is wrong-base.
+func TestObserveRunBranchPullRequestFixPRHead(t *testing.T) {
+	var queries, paths []string
+	var mu sync.Mutex
+	newObserved := func(body string) runBranchPRObservation {
+		t.Helper()
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			mu.Lock()
+			queries = append(queries, r.URL.RawQuery)
+			paths = append(paths, r.URL.Path)
+			mu.Unlock()
+			_, _ = io.WriteString(w, body)
+		}))
+		t.Cleanup(server.Close)
+		var output, errorsOut bytes.Buffer
+		report := newReporter(&output, &errorsOut, config{
+			Mode:          "fix-pr",
+			Repo:          "acme/widgets",
+			HeadRepo:      "octocat/widgets",
+			Branch:        "fix/pr-7",
+			Ref:           7,
+			Base:          "main",
+			GitHubAPIBase: server.URL,
+		})
+		observation, err := report.observeRunBranchPullRequest(context.Background())
+		if err != nil {
+			t.Fatalf("observeRunBranchPullRequest() error = %v", err)
+		}
+		return observation
+	}
+
+	pinnedHead := `[{"number":21,"state":"open","draft":false,"title":"Fix","base":{"ref":"main","repo":{"full_name":"acme/widgets"}},"head":{"ref":"fix/pr-7","sha":"deadbeef","repo":{"full_name":"octocat/widgets"}},"body":"Applies the pinned feedback."}]`
+	if got := newObserved(pinnedHead); got.kind != prStateOpen || got.open == nil || got.open.Number != 21 {
+		t.Fatalf("fork-head PR classified as %+v, want prStateOpen #21", got)
+	}
+	if len(queries) != 1 || !strings.Contains(queries[0], "head=octocat:fix%2Fpr-7&state=all") {
+		t.Fatalf("fix-pr listing must query the fork head selector head owner:branch, got queries %v", queries)
+	}
+	if len(paths) != 1 || !strings.HasSuffix(paths[0], "/repos/acme/widgets/pulls") {
+		t.Fatalf("fix-pr listing must query the base repository's pulls endpoint, got paths %v", paths)
+	}
+
+	foreign := `[{"number":22,"state":"open","draft":false,"base":{"ref":"main","repo":{"full_name":"acme/widgets"}},"head":{"ref":"fix/pr-7","sha":"deadbeef","repo":{"full_name":"octocat/widgets-other"}},"body":"Applies the pinned feedback."}]`
+	if got := newObserved(foreign); got.kind != prStateForeignHead {
+		t.Fatalf("record claiming the fork head selector from another repository classified as %+v, want prStateForeignHead (never adopted)", got)
+	}
+	wrongBase := `[{"number":23,"state":"open","draft":false,"base":{"ref":"release-9","repo":{"full_name":"acme/widgets"}},"head":{"ref":"fix/pr-7","sha":"deadbeef","repo":{"full_name":"octocat/widgets"}},"body":"Applies the pinned feedback."}]`
+	if got := newObserved(wrongBase); got.kind != prStateWrongBase {
+		t.Fatalf("retargeted fork-head PR classified as %+v, want prStateWrongBase (fail-closed, never adopted)", got)
+	}
+}
+
+// TestCheckFixPRHandoffPinnedPullRequestNumber pins the #517 pinned-
+// assignment contract: the fix-pr handoff verifies the pull request the
+// run was admitted against (COURIER_REF), not merely some pull request on
+// the run's head. A pull request carrying another number leaves the
+// pinned assignment unverified and fails closed, while the pinned pull
+// request itself still settles its own world (draft, closed) as before.
+// The number is the assignment; the head listing alone never proves it.
+func TestCheckFixPRHandoffPinnedPullRequestNumber(t *testing.T) {
+	fixture := func(number int, state string, draft bool) string {
+		return fmt.Sprintf(`[{"number":%d,"state":%q,"draft":%t,"title":"Fix","base":{"ref":"main","repo":{"full_name":"acme/widgets"}},"head":{"ref":"fix/pr-7","sha":"deadbeef","repo":{"full_name":"octocat/widgets"}},"body":"Applies the pinned feedback."}]`, number, state, draft)
+	}
+	newOutcome := func(body string) (*handoffCheckOutcome, error) {
+		t.Helper()
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = io.WriteString(w, body)
+		}))
+		t.Cleanup(server.Close)
+		var output, errorsOut bytes.Buffer
+		report := newReporter(&output, &errorsOut, config{
+			Mode:          "fix-pr",
+			Repo:          "acme/widgets",
+			HeadRepo:      "octocat/widgets",
+			Branch:        "fix/pr-7",
+			Ref:           7,
+			Base:          "main",
+			GitHubAPIBase: server.URL,
+		})
+		return report.checkFixPRHandoff(context.Background())
+	}
+
+	for _, tc := range []struct {
+		name           string
+		body           string
+		wantObserved   int
+		wantMismatch   bool
+		wantDraft      bool
+		wantClosedOnly bool
+	}{
+		{
+			name:         "open PR is not the pinned assignment",
+			body:         fixture(12, "open", false),
+			wantObserved: 12,
+			wantMismatch: true,
+		},
+		{
+			name:         "draft PR is not the pinned assignment",
+			body:         fixture(12, "open", true),
+			wantObserved: 12,
+			wantMismatch: true,
+		},
+		{
+			name:         "closed PR is not the pinned assignment",
+			body:         fixture(12, "closed", false),
+			wantObserved: 12,
+			wantMismatch: true,
+		},
+		{
+			name:         "the pinned PR is a draft",
+			body:         fixture(7, "open", true),
+			wantObserved: 7,
+			wantDraft:    true,
+		},
+		{
+			name:           "the pinned PR is closed",
+			body:           fixture(7, "closed", false),
+			wantObserved:   7,
+			wantClosedOnly: true,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			outcome, err := newOutcome(tc.body)
+			if err != nil {
+				t.Fatalf("checkFixPRHandoff() error = %v", err)
+			}
+			if outcome == nil {
+				t.Fatalf("checkFixPRHandoff() outcome = nil, want a fail-closed outcome")
+			}
+			if outcome.pinnedMismatch != tc.wantMismatch || outcome.pinnedDraft != tc.wantDraft || outcome.closedOnly != tc.wantClosedOnly {
+				t.Fatalf("outcome = %+v, want mismatch=%v draft=%v closedOnly=%v", outcome, tc.wantMismatch, tc.wantDraft, tc.wantClosedOnly)
+			}
+			if (tc.wantMismatch || tc.wantDraft) && (outcome.pr == nil || outcome.pr.Number != tc.wantObserved) {
+				t.Fatalf("outcome.pr = %+v, want the observed pull request #%d", outcome.pr, tc.wantObserved)
+			}
+		})
 	}
 }
 

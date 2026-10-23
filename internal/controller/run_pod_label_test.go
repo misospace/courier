@@ -58,6 +58,19 @@ func TestPodBelongsToRunMatchesBoundedRunLabel(t *testing.T) {
 			}},
 		},
 		{
+			name: "legacy truncated label still matches until the pod is replaced",
+			pod: &corev1.Pod{ObjectMeta: metav1.ObjectMeta{
+				Namespace: "runs", Labels: map[string]string{executor.LabelRun: executor.LegacyRunLabelValue(longRunName)},
+			}},
+			match: true,
+		},
+		{
+			name: "another run's legacy truncated label never matches",
+			pod: &corev1.Pod{ObjectMeta: metav1.ObjectMeta{
+				Namespace: "runs", Labels: map[string]string{executor.LabelRun: executor.LegacyRunLabelValue("other-run")},
+			}},
+		},
+		{
 			name: "owner reference still decides without a label",
 			pod: &corev1.Pod{ObjectMeta: metav1.ObjectMeta{
 				Namespace:       "runs",
@@ -78,6 +91,29 @@ func TestPodBelongsToRunMatchesBoundedRunLabel(t *testing.T) {
 				t.Fatalf("podBelongsToRun = %v; want %v", got, tt.match)
 			}
 		})
+	}
+}
+
+func TestPodBelongsToRunSeparatesPrefixSharingLongRuns(t *testing.T) {
+	// Two supported 64+ character names sharing their first 63 characters
+	// must not attribute each other's pods once labeled under the digest
+	// scheme (#429).
+	prefix := strings.Repeat("a", 63)
+	nameOne, nameTwo := prefix+"-one", prefix+"-two"
+	pod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{
+		Namespace: "runs", Labels: map[string]string{executor.LabelRun: executor.RunLabelValue(nameOne)},
+	}}
+	for _, tt := range []struct {
+		runName string
+		match   bool
+	}{
+		{runName: nameOne, match: true},
+		{runName: nameTwo, match: false},
+	} {
+		run := &courier.CoderRun{ObjectMeta: metav1.ObjectMeta{Name: tt.runName, Namespace: "runs", UID: "run-uid"}}
+		if got := podBelongsToRun(pod, run); got != tt.match {
+			t.Fatalf("podBelongsToRun for run %q = %v; want %v", tt.runName, got, tt.match)
+		}
 	}
 }
 
@@ -129,20 +165,21 @@ func TestAppendOtherRunLabelSchemePods(t *testing.T) {
 		wantList []string
 	}{
 		{
-			name:     "short name: both schemes agree, single list suffices",
+			name:     "short name: all schemes agree, single list suffices",
 			runName:  "short",
 			pods:     []*corev1.Pod{pod("a", executor.RunLabelValue("short"))},
 			wantList: []string{"a"},
 		},
 		{
-			name:    "long name: both label schemes are listed",
+			name:    "long name: digest and legacy schemes are both listed",
 			runName: longRunName,
 			pods: []*corev1.Pod{
-				pod("legacy", executor.RunLabelValue(longRunName)),
+				pod("digest", executor.RunLabelValue(longRunName)),
 				pod("topology", topology.RunLabelValue(longRunName)),
+				pod("legacy", executor.LegacyRunLabelValue(longRunName)),
 				pod("foreign", topology.RunLabelValue("other-run")),
 			},
-			wantList: []string{"legacy", "topology"},
+			wantList: []string{"digest", "topology", "legacy"},
 		},
 	}
 	for _, tt := range tests {
@@ -169,10 +206,10 @@ func TestAppendOtherRunLabelSchemePods(t *testing.T) {
 			if err := appendOtherRunLabelSchemePods(context.Background(), client, run, &list); err != nil {
 				t.Fatal(err)
 			}
-			// One list when both schemes agree; a second only for names the
-			// schemes render differently.
+			// One list when the digest and legacy schemes agree; a second
+			// only for names the pre-digest truncation renders differently.
 			wantLists := 1
-			if topology.RunLabelValue(tt.runName) != executor.RunLabelValue(tt.runName) {
+			if executor.LegacyRunLabelValue(tt.runName) != executor.RunLabelValue(tt.runName) {
 				wantLists = 2
 			}
 			if lists != wantLists {

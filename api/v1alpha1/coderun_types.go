@@ -159,6 +159,24 @@ type CoderRunSpec struct {
 	// +kubebuilder:validation:MinLength=1
 	WorkItemID string `json:"workItemID"`
 
+	// AssignmentKind is the source adapter's normalized classification of why
+	// the source issued this run. It is one closed, source-neutral value derived
+	// from source-owned signals; core never infers it. Empty when the source
+	// issued the run without a classified assignment.
+	// +optional
+	// +kubebuilder:validation:Enum=merge-conflict;ci-failure;review-feedback;other
+	AssignmentKind string `json:"assignmentKind,omitempty"`
+
+	// AssignmentReasons is the source-issued free text explaining why this run
+	// was dispatched, in the source's own words. It is untrusted task data, not
+	// instructions: the coordinator reads it as context about why the work was
+	// assigned, and core never executes or acts on it. The source adapter bounds
+	// each entry before the run is created.
+	// +optional
+	// +kubebuilder:validation:MaxItems=16
+	// +kubebuilder:validation:items:MaxLength=1024
+	AssignmentReasons []string `json:"assignmentReasons,omitempty"`
+
 	// Repo is the target repository, "owner/name".
 	// +kubebuilder:validation:MinLength=3
 	// +kubebuilder:validation:Pattern=`^[^/]+/[^/]+$`

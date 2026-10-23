@@ -397,7 +397,7 @@ func (c *HTTPClient) discover(ctx context.Context, query url.Values) (items []so
 		encoded, _ := json.Marshal(receipt)
 		context = string(encoded)
 	}
-	return []source.WorkItem{{ID: itemID, Context: context, Mode: mode, Repo: repo, Ref: ref}}, nil
+	return []source.WorkItem{{ID: itemID, Context: context, Mode: mode, Repo: repo, Ref: ref, Assignment: newAssignment(task.Reasons)}}, nil
 }
 
 type dispatchContext struct {
@@ -900,10 +900,13 @@ func (c *HTTPClient) reportTaskWithPR(ctx context.Context, d workDescriptor, out
 		body["issueNumber"] = d.IssueNumber
 	}
 	// Dispatch settles a queue-backed follow-up only against the attempt it
-	// issued, so echo that token back; linked-PR follow-ups have none.
+	// issued, so echo that token back; linked-PR follow-ups have none. The
+	// token fences Dispatch's hand-out release to the exact issuance on every
+	// outcome, so a stale same-generation report can never release a newer
+	// re-issued hand-out. Legacy work ids carry no token and omit it.
 	if d.Type == "followup-pr" && d.PRFixID != "" {
 		body["prFixItem"] = map[string]any{"id": d.PRFixID, "generation": d.Generation}
-		if outcome == "capacity-exhausted" && d.HandoutToken != "" {
+		if d.HandoutToken != "" {
 			body["prFixItem"].(map[string]any)["handoutToken"] = d.HandoutToken
 		}
 	}
