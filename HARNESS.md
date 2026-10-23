@@ -598,10 +598,13 @@ and legacy path enforces both.
   an incorrect base assumption: the run fails closed before the
   coordinator starts, and preparation otherwise rebuilds the
   branch from the published head and synchronizes against the
-  pinned base. a workspace left behind by an earlier attempt is
-  rebuilt, never reused: preparation clears it and clones afresh,
-  so no stale merge, uncommitted edit, or untracked file survives
-  into the coordinator's checkout.
+   pinned base. a workspace left behind by an earlier attempt is
+   rebuilt, never reused: preparation clears it and clones afresh,
+   so no stale merge, uncommitted edit, or untracked file survives
+   into the coordinator's checkout. a symlink standing at the
+   workspace path is refused, never followed, and the clear is
+   anchored to the opened directory, so no leftover link can
+   redirect a deletion outside the workspace.
 
 ### Acceptance-criterion evidence contract (#249)
 

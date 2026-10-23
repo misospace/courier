@@ -435,6 +435,92 @@ func TestPrepareRebuildDoesNotFollowSymlinks(t *testing.T) {
 	}
 }
 
+// A symlink standing at the workspace path is refused: clearing through it
+// would empty the checkout the link points at, a directory outside the
+// configured workspace, so preparation fails closed and leaves the target
+// untouched.
+func TestPrepareRefusesSymlinkedWorkspacePath(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	root := t.TempDir()
+	remote := filepath.Join(root, "remote.git")
+	source := filepath.Join(root, "source")
+	initBare(t, remote)
+	initRepo(t, source)
+	writeFile(t, filepath.Join(source, "README.md"), "base one\n")
+	commit(t, source, "base: initial")
+	git(t, source, "branch", "-M", "main")
+	git(t, source, "remote", "add", "origin", remote)
+	git(t, source, "push", "-u", "origin", "main")
+
+	// The destination path is a symlink to a git checkout elsewhere.
+	target := filepath.Join(root, "elsewhere")
+	git(t, root, "clone", remote, target)
+	git(t, target, "checkout", "main")
+	headBefore := strings.TrimSpace(string(mustGit(t, target, "rev-parse", "HEAD")))
+	link := filepath.Join(root, "workspace")
+	if err := os.Symlink(target, link); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err := Prepare(ctx, PrepareOptions{
+		RemoteURL: remote,
+		Directory: link,
+		Base:      "main",
+		Branch:    "courier/resolve-issue/acme-widget/19",
+	})
+	if err == nil {
+		t.Fatal("preparing into a symlinked workspace path succeeded, want refusal")
+	}
+	if !strings.Contains(err.Error(), link) {
+		t.Fatalf("error %q does not name the refused path %q", err, link)
+	}
+	if !strings.Contains(err.Error(), "symlink") {
+		t.Fatalf("error %q does not state that the path is a symlink", err)
+	}
+	if got := strings.TrimSpace(string(mustGit(t, target, "rev-parse", "HEAD"))); got != headBefore {
+		t.Fatalf("the linked checkout moved from %q to %q: preparation must not touch it", headBefore, got)
+	}
+	if _, statErr := os.Stat(filepath.Join(target, "README.md")); statErr != nil {
+		t.Fatalf("preparation cleared the linked checkout: %v", statErr)
+	}
+}
+
+// A workspace path carrying a null byte is refused before any filesystem
+// interpretation: no lookup, clone, or clear touches anything.
+func TestPrepareRefusesNullByteWorkspacePath(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	root := t.TempDir()
+	remote := filepath.Join(root, "remote.git")
+	source := filepath.Join(root, "source")
+	initBare(t, remote)
+	initRepo(t, source)
+	writeFile(t, filepath.Join(source, "README.md"), "base one\n")
+	commit(t, source, "base: initial")
+	git(t, source, "branch", "-M", "main")
+	git(t, source, "remote", "add", "origin", remote)
+	git(t, source, "push", "-u", "origin", "main")
+
+	directory := filepath.Join(root, "workspace") + "\x00trailing"
+	_, err := Prepare(ctx, PrepareOptions{
+		RemoteURL: remote,
+		Directory: directory,
+		Base:      "main",
+		Branch:    "courier/resolve-issue/acme-widget/20",
+	})
+	if err == nil {
+		t.Fatal("preparing into a path with a null byte succeeded, want refusal")
+	}
+	entries, readErr := os.ReadDir(root)
+	if readErr != nil {
+		t.Fatal(readErr)
+	}
+	if len(entries) != 2 {
+		t.Fatalf("the refused preparation created entries in %q: %v", root, entries)
+	}
+}
+
 // A destination that holds files but no git checkout is refused: preparation
 // never deletes anything it did not create, so it fails closed and names the
 // path it refused.

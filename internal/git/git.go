@@ -397,13 +397,21 @@ const (
 // gitdir-pointer file of a linked worktree — is a checkout, and a directory
 // holding anything else is occupied.  The .git entry is inspected without
 // following symlinks, so a linked entry is judged by what it is.
+//
+// The destination itself is inspected with os.Lstat for the same reason: a
+// symlink standing at the workspace path is refused rather than followed,
+// because preparation of a checkout would then clear the contents of the
+// directory the link points at — a checkout outside the configured workspace.
 func inspectDestination(directory string) (destinationState, error) {
-	info, err := os.Stat(directory)
+	info, err := os.Lstat(directory)
 	if err != nil {
 		if os.IsNotExist(err) {
 			return destinationFree, nil
 		}
 		return destinationFree, err
+	}
+	if info.Mode()&os.ModeSymlink != 0 {
+		return destinationFree, fmt.Errorf("prepare: workspace path %q is a symlink; preparation refuses it instead of following it into another directory", directory)
 	}
 	if !info.IsDir() {
 		return destinationOccupied, nil
@@ -461,8 +469,11 @@ func pathSegments(cleaned string) int {
 //
 // Only the directory's entries are removed, never the directory itself: the
 // workspace is a mounted volume root in the pod, and removing the mount point
-// fails with EBUSY.  Removal never follows symlinks: os.RemoveAll unlinks a
-// symlink and leaves its target alone.
+// fails with EBUSY.  The directory is opened once, refusing a symlink at the
+// path, and every removal is anchored to that open directory: no entry — a
+// symlink inside the checkout or a symlink swapped in after the destination
+// was classified — can redirect a removal to another directory, and an
+// anchored removal unlinks a symlink while leaving its target alone.
 func clearWorkspace(directory string) error {
 	clearable, err := clearableDirectory(directory)
 	if err != nil {
@@ -471,12 +482,32 @@ func clearWorkspace(directory string) error {
 	if !clearable {
 		return fmt.Errorf("refusing to clear %q: a workspace path must not be the filesystem root or a top-level system directory", directory)
 	}
-	entries, err := os.ReadDir(directory)
+	info, err := os.Lstat(directory)
 	if err != nil {
 		return err
 	}
-	for _, entry := range entries {
-		if err := os.RemoveAll(filepath.Join(directory, entry.Name())); err != nil {
+	if info.Mode()&os.ModeSymlink != 0 {
+		return fmt.Errorf("refusing to clear %q: the workspace path is a symlink", directory)
+	}
+	root, err := os.OpenRoot(directory)
+	if err != nil {
+		return err
+	}
+	defer root.Close()
+	dir, err := root.Open(".")
+	if err != nil {
+		return err
+	}
+	entries, err := dir.Readdirnames(-1)
+	closeErr := dir.Close()
+	if err != nil {
+		return err
+	}
+	if closeErr != nil {
+		return closeErr
+	}
+	for _, name := range entries {
+		if err := root.RemoveAll(name); err != nil {
 			return err
 		}
 	}
@@ -493,7 +524,9 @@ func clearWorkspace(directory string) error {
 // Preparation clears the checkout's contents and clones afresh, so the
 // workspace ends up indistinguishable from a fresh clone.  A destination that
 // holds files but no git checkout is refused: preparation never deletes
-// anything it did not create.
+// anything it did not create.  A symlink standing at the destination is
+// refused too: clearing through it would empty the directory it points at,
+// not the workspace.
 func Prepare(ctx context.Context, options PrepareOptions) (*Workspace, error) {
 	if strings.TrimSpace(options.RemoteURL) == "" {
 		return nil, errors.New("prepare: remote URL is required")
