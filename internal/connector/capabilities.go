@@ -10,6 +10,7 @@ import (
 // interfaces Courier already defines, so a connector cannot advertise a
 // capability Courier has no seam for.
 const (
+	CapabilityCIParkLifecycle       = "ci-park-lifecycle"
 	CapabilityDiscovery             = "discovery"
 	CapabilityDiscoveryExclusions   = "discovery-exclusions"
 	CapabilityLifecycleReport       = "lifecycle-report"
@@ -21,6 +22,7 @@ const (
 // Capabilities is the closed capability catalogue, the single source of
 // truth for the capability label values of the info gauge.
 var Capabilities = []string{
+	CapabilityCIParkLifecycle,
 	CapabilityDiscovery,
 	CapabilityDiscoveryExclusions,
 	CapabilityLifecycleReport,

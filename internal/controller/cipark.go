@@ -44,6 +44,12 @@ const (
 	// forge.
 	ciparkPollDelay = 30 * time.Second
 
+	// ciparkSettlementRetryDelay is how often a run whose fenced outcome the
+	// source has not accepted yet re-presents that settlement. The report is
+	// idempotent — same fence, same idempotency key — so a retry replays the
+	// committed transition instead of double-applying it.
+	ciparkSettlementRetryDelay = 30 * time.Second
+
 	// ciparkMaxFailedChecks bounds how many failed check names one repair
 	// context carries. The context is a prompt input, not an archive.
 	ciparkMaxFailedChecks = 20
@@ -417,6 +423,34 @@ func (r *CoderRunReconciler) observeCIPark(ctx context.Context, run *courierv1al
 		run.Status.CIRepair = nil
 		changed = true
 	}
+	if republished && fenceToken != "" {
+		// The repushed outcome is owed to the source. Recording it in the
+		// same write that advances the park and ends the attempt is what
+		// makes a lost response durable retry intent rather than a leak:
+		// the fence travels with the record, and a later reconcile
+		// re-presents it until the source accepts it.
+		run.Status.CISettlement = &courierv1alpha1.CISettlement{
+			FenceToken: fenceToken,
+			Result:     courierv1alpha1.CIParkOutcomeRepushed,
+			Head:       head,
+		}
+		changed = true
+	}
+	if established {
+		if adapter, _, err := r.adapterAndWorkItem(run); err == nil {
+			if _, ok := adapter.(source.CIParkLifecycle); ok {
+				// The deferral is owed to the source. Recording it in the
+				// same write that establishes the park is what makes a lost
+				// notice durable retry intent rather than a duplicate-worker
+				// window nobody will ever close.
+				run.Status.CIParkDeferral = &courierv1alpha1.CIParkDeferral{
+					Head:           park.Head,
+					IdempotencyKey: ciparkParkKey(run, park.Head),
+				}
+				changed = true
+			}
+		}
+	}
 	// The settle candidates follow the ordinary path's rule: a failed check
 	// set records the failed candidate, a mechanically green one records the
 	// green candidate, and anything else clears both. A flapping report
@@ -440,10 +474,14 @@ func (r *CoderRunReconciler) observeCIPark(ctx context.Context, run *courierv1al
 		}
 	}
 	if established {
-		r.reportCIParked(ctx, run, park, observation.PR)
+		if delivered, err := r.deliverCIParkNotice(ctx, run); !delivered {
+			log.FromContext(ctx).V(1).Info("source park notice not delivered", "run", run.Name, "error", err.Error())
+		}
 	}
-	if republished {
-		r.reportCIRepair(ctx, run, observation.PR, head, source.CIRepairRepushed, fenceToken)
+	if republished && fenceToken != "" {
+		if delivered, err := r.deliverCISettlement(ctx, run); !delivered {
+			log.FromContext(ctx).V(1).Info("source repair settlement not delivered", "run", run.Name, "error", err.Error())
+		}
 	}
 	remaining := policy.MaxAttempts - park.Attempts
 	trigger := ClassifyCIParkTrigger(observation, park.Head, selector, remaining)
@@ -609,9 +647,11 @@ func (r *CoderRunReconciler) resumeCIPark(ctx context.Context, run *courierv1alp
 	attempt := park.Attempts + 1
 	fenceToken, err := r.reserveCIRepair(ctx, run, observation.PR, park.Head, attempt)
 	if err != nil {
-		if errors.Is(err, source.ErrSuperseded) || errors.Is(err, source.ErrStaleWork) {
-			// A newer generation owns the work now. Fail closed rather than
-			// race it.
+		if errors.Is(err, source.ErrSuperseded) || errors.Is(err, source.ErrStaleWork) || errors.Is(err, source.ErrUnsupportedCIPark) {
+			// A newer generation owns the work now, or the source cannot
+			// defer this work at all: fail closed and hand stewardship back
+			// rather than race the newer owner or error forever on work the
+			// source will never fence.
 			return r.finishCIPark(ctx, run, observation, courierv1alpha1.CIParkOutcomeUnsupported, "")
 		}
 		return ctrl.Result{}, err
@@ -654,40 +694,75 @@ func (r *CoderRunReconciler) finishCIPark(ctx context.Context, run *courierv1alp
 		run.Status.CIRepair = nil
 		changed = true
 	}
+	if run.Status.CIPark != nil && fenceToken != "" {
+		// The outcome is owed to the source. Recording it in the same write
+		// as the outcome, before the report is attempted, is what makes a
+		// lost response durable retry intent rather than a leak.
+		run.Status.CISettlement = &courierv1alpha1.CISettlement{
+			FenceToken: fenceToken,
+			Result:     outcome,
+		}
+		changed = true
+	}
 	if changed {
 		if err := r.patchStatus(ctx, before, run); err != nil {
 			return ctrl.Result{}, err
 		}
 	}
-	result := source.CIRepairUnsupported
-	if outcome == courierv1alpha1.CIParkOutcomeExhausted {
-		result = source.CIRepairExhausted
+	if run.Status.CISettlement != nil {
+		if delivered, err := r.deliverCISettlement(ctx, run); !delivered {
+			log.FromContext(ctx).V(1).Info("source repair settlement not delivered", "run", run.Name, "error", err.Error())
+		}
 	}
-	// Nothing was published by the attempt, so the outcome carries no head.
-	r.reportCIRepair(ctx, run, observation.PR, "", result, fenceToken)
 	if run.Spec.Mode == courierv1alpha1.ModeFixPR {
 		return r.transitionTerminal(ctx, run, courierv1alpha1.PhaseFailed, observation.PR, terminalLifecycleIntent{ciFailure: true}, nil)
 	}
 	return r.transitionTerminal(ctx, run, courierv1alpha1.PhaseHandedOff, observation.PR, terminalLifecycleIntent{}, nil)
 }
 
-// reportCIParked tells the source that the run parked on pending CI, when the
-// source can represent that at all. The notice is advisory: a source that
-// cannot fence a park never gets one, and a failed notice never blocks the
-// run.
-func (r *CoderRunReconciler) reportCIParked(ctx context.Context, run *courierv1alpha1.CoderRun, park *courierv1alpha1.CIParkState, pr string) {
+// deliverCIParkNotice announces the park to the source, when the source can
+// fence a deferral at all, and clears the pending notice once the source
+// accepts it. The notice is idempotent — same key — so a retry after a lost
+// response re-establishes the same deferral instead of double-booking it. A
+// source that cannot fence never gets a notice, and nothing is recorded for
+// one, so there is nothing to retry.
+func (r *CoderRunReconciler) deliverCIParkNotice(ctx context.Context, run *courierv1alpha1.CoderRun) (bool, error) {
+	record := run.Status.CIParkDeferral
+	if record == nil {
+		return true, nil
+	}
 	adapter, item, err := r.adapterAndWorkItem(run)
 	if err != nil {
-		return
+		return false, err
 	}
 	lifecycle, ok := adapter.(source.CIParkLifecycle)
 	if !ok {
-		return
+		return false, fmt.Errorf("coderun controller: source %q does not implement the CI park lifecycle", run.Spec.Source)
 	}
-	notice := source.CIParkNotice{PR: pr, Head: park.Head, IdempotencyKey: ciparkParkKey(run, park.Head)}
+	notice := source.CIParkNotice{PR: run.Status.PR, Head: record.Head, IdempotencyKey: record.IdempotencyKey}
 	if err := lifecycle.ReportCIParked(ctx, item, notice); err != nil {
-		log.FromContext(ctx).V(1).Info("source park notice failed", "run", run.Name, "error", err.Error())
+		if errors.Is(err, source.ErrUnsupportedCIPark) {
+			// The source cannot represent this park at all — implement and
+			// queue-less work behind a Dispatch adapter — and the refusal is
+			// permanent: retrying would wedge the run's own park loop, which
+			// requeues ahead of every phase dispatch. Stewardship stays with
+			// the core, exactly as for a source without the capability.
+			log.FromContext(ctx).V(1).Info("source cannot represent the CI park; dropping the pending notice", "run", run.Name)
+			before := run.DeepCopy()
+			run.Status.CIParkDeferral = nil
+			if err := r.patchStatus(ctx, before, run); err != nil {
+				return false, err
+			}
+			return true, nil
+		}
+		return false, err
 	}
+	before := run.DeepCopy()
+	run.Status.CIParkDeferral = nil
+	if err := r.patchStatus(ctx, before, run); err != nil {
+		return false, err
+	}
+	return true, nil
 }
 
 // reserveCIRepair reserves the repair opportunity at the source, when the
@@ -699,7 +774,9 @@ func (r *CoderRunReconciler) reportCIParked(ctx context.Context, run *courierv1a
 // never asked, and the core never emulates it with ordinary lifecycle calls.
 //
 // A superseded or stale reservation fails closed: a newer generation owns
-// the work, and a repair would race it.
+// the work, and a repair would race it. A source that reports the work
+// unsupported — it cannot defer this item at all — ends the run the same
+// way, so the sentinel never loops as a reconcile error.
 func (r *CoderRunReconciler) reserveCIRepair(ctx context.Context, run *courierv1alpha1.CoderRun, pr, head string, attempt int) (string, error) {
 	adapter, item, err := r.adapterAndWorkItem(run)
 	if err != nil {
@@ -725,32 +802,33 @@ func (r *CoderRunReconciler) reserveCIRepair(ctx context.Context, run *courierv1
 	return reservation.FenceToken, nil
 }
 
-// reportCIRepair publishes the fenced outcome of the last repair attempt to
-// the source, when the source can fence one. The report is advisory: the
-// operator's own park record is the authoritative account of the attempt, and
-// a failed report never blocks the run's ending.
+// reportCIRepair publishes the fenced outcome of one repair attempt to the
+// source, when the source can fence one. The report is idempotent: the
+// idempotency key is derived from the run and the attempt it settles, so a
+// re-presented settlement replays the committed transition instead of
+// double-applying it.
 //
 // The outcome presents the token the source issued for the attempt. An
 // attempt that no source fenced carries no token, and nothing is reported:
 // there is no grant to answer.
-func (r *CoderRunReconciler) reportCIRepair(ctx context.Context, run *courierv1alpha1.CoderRun, pr, head string, result source.CIRepairResult, fenceToken string) {
+func (r *CoderRunReconciler) reportCIRepair(ctx context.Context, run *courierv1alpha1.CoderRun, pr, head string, result source.CIRepairResult, fenceToken string) error {
 	if fenceToken == "" {
-		return
+		return nil
 	}
 	attempts := 0
 	if run.Status.CIPark != nil {
 		attempts = run.Status.CIPark.Attempts
 	}
 	if attempts == 0 {
-		return
+		return nil
 	}
 	adapter, item, err := r.adapterAndWorkItem(run)
 	if err != nil {
-		return
+		return err
 	}
 	lifecycle, ok := adapter.(source.CIParkLifecycle)
 	if !ok {
-		return
+		return fmt.Errorf("coderun controller: source %q does not implement the CI park lifecycle", run.Spec.Source)
 	}
 	report := source.CIRepairOutcome{
 		FenceToken:     fenceToken,
@@ -759,7 +837,41 @@ func (r *CoderRunReconciler) reportCIRepair(ctx context.Context, run *courierv1a
 		Head:           head,
 		Result:         result,
 	}
-	if err := lifecycle.ReportCIRepair(ctx, item, report); err != nil {
-		log.FromContext(ctx).V(1).Info("source repair outcome report failed", "run", run.Name, "error", err.Error())
+	return lifecycle.ReportCIRepair(ctx, item, report)
+}
+
+// deliverCISettlement re-presents the fenced outcome a run still owes the
+// source — recorded on the run when the attempt settled, before the report
+// was attempted — and clears the record once the source accepts it. A lost
+// response, a restart, or an unavailable source therefore leaves durable
+// retry intent rather than a deferral nobody will ever release: the retry
+// presents the same fence and the same idempotency key, so the source
+// replays the committed transition instead of double-booking it.
+func (r *CoderRunReconciler) deliverCISettlement(ctx context.Context, run *courierv1alpha1.CoderRun) (bool, error) {
+	record := run.Status.CISettlement
+	if record == nil {
+		return true, nil
 	}
+	err := r.reportCIRepair(ctx, run, run.Status.PR, record.Head, source.CIRepairResult(record.Result), record.FenceToken)
+	if err != nil {
+		if errors.Is(err, source.ErrUnsupportedCIPark) {
+			// The source cannot represent the park/repair lifecycle for this
+			// work at all, and the refusal is permanent: nothing is owed, and
+			// retrying would wedge the run's ending behind it forever.
+			log.FromContext(ctx).V(1).Info("source cannot represent the CI park; dropping the pending settlement", "run", run.Name)
+			before := run.DeepCopy()
+			run.Status.CISettlement = nil
+			if err := r.patchStatus(ctx, before, run); err != nil {
+				return false, err
+			}
+			return true, nil
+		}
+		return false, err
+	}
+	before := run.DeepCopy()
+	run.Status.CISettlement = nil
+	if err := r.patchStatus(ctx, before, run); err != nil {
+		return false, err
+	}
+	return true, nil
 }

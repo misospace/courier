@@ -49,6 +49,7 @@ func New(diagnostics *connector.Emitter) Adapter {
 	diagnostics.Capability(connectorName, connector.CapabilityDiscoveryExclusions, connector.CapabilityUnsupported)
 	diagnostics.Capability(connectorName, connector.CapabilityLifecycleReport, connector.CapabilityUnsupported)
 	diagnostics.Capability(connectorName, connector.CapabilityPreLaunchRevalidation, connector.CapabilityUnsupported)
+	diagnostics.Capability(connectorName, connector.CapabilityCIParkLifecycle, connector.CapabilityUnsupported)
 	diagnostics.Capability(connectorName, connector.CapabilityWorkIdentity, connector.CapabilityUnsupported)
 	diagnostics.Capability(connectorName, connector.CapabilityAvailability, connector.CapabilitySupported)
 	return a

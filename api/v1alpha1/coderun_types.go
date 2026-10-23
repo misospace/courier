@@ -732,11 +732,64 @@ type CoderRunStatus struct {
 	// +optional
 	CIRepair *CIRepairContext `json:"ciRepair,omitempty"`
 
+	// CISettlement is the fenced outcome whose delivery to the source is
+	// still outstanding (#475). It is recorded in the same status write that
+	// settles the attempt — before the report is attempted — so a lost
+	// response, a restart, or an unavailable source leaves durable retry
+	// intent on the run instead of a deferral nobody will ever release. The
+	// operator re-presents the record on later reconciles until the source
+	// accepts it — same fence, same idempotency key, so the source replays
+	// the committed transition — and clearing the record is the proof of
+	// delivery.
+	// +optional
+	CISettlement *CISettlement `json:"ciSettlement,omitempty"`
+
+	// CIParkDeferral is the park notice whose acceptance by the source is
+	// still outstanding (#475). It is recorded in the same status write that
+	// establishes the park — before the notice is attempted — so a lost
+	// response leaves durable retry intent instead of a duplicate-worker
+	// window nobody will ever close. The operator re-presents the notice on
+	// later reconciles while the repair opportunity is active, and drops it
+	// once that opportunity has ended: a late notice would defer the source
+	// against nothing.
+	// +optional
+	CIParkDeferral *CIParkDeferral `json:"ciparkDeferral,omitempty"`
+
 	// Conditions is the standard condition set.
 	// +optional
 	// +listType=map
 	// +listMapKey=type
 	Conditions []metav1.Condition `json:"conditions,omitempty"`
+}
+
+// CISettlement is one fenced repair outcome the source has not accepted yet.
+// It exists to outlive the reconcile that produced it: the fence travels
+// with the record, so a retry presents exactly what the original report
+// presented and the source's own idempotency does the collapsing.
+type CISettlement struct {
+	// FenceToken is the token the source issued when it reserved the repair
+	// attempt this settlement answers.
+	// +kubebuilder:validation:MinLength=1
+	FenceToken string `json:"fenceToken"`
+	// Result is the outcome kind being reported.
+	// +kubebuilder:validation:Enum=repushed;exhausted;unsupported
+	Result CIParkOutcome `json:"result"`
+	// Head is the republished head when Result is repushed; empty otherwise.
+	// +optional
+	Head string `json:"head,omitempty"`
+}
+
+// CIParkDeferral is one park notice the source has not accepted yet. It
+// exists to outlive the reconcile that produced it: the announced head and
+// the idempotency key travel with the record, so a retry re-establishes the
+// same deferral instead of double-booking it.
+type CIParkDeferral struct {
+	// Head is the exact parked head the notice announced.
+	// +kubebuilder:validation:MinLength=1
+	Head string `json:"head"`
+	// IdempotencyKey deduplicates the notice at the source.
+	// +kubebuilder:validation:MinLength=1
+	IdempotencyKey string `json:"idempotencyKey"`
 }
 
 // +kubebuilder:object:root=true
