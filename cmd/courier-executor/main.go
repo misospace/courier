@@ -1188,6 +1188,10 @@ func run(ctx context.Context, stdout, stderr io.Writer) int {
 		return code
 	}
 
+	if code := report.guardFixPRBase(ctx); code != 0 {
+		return code
+	}
+
 	workspace, err := git.Prepare(ctx, git.PrepareOptions{
 		RemoteURL:     cfg.RemoteURL,
 		BaseRemoteURL: cfg.BaseRemoteURL,
@@ -2144,6 +2148,88 @@ func (r reporter) guardFixPRHead(ctx context.Context) int {
 	}
 	if !exists {
 		r.terminate(termination{Phase: "NeedsHuman", Result: "needs-human", ExitCode: exitNeedsHuman, Reason: fmt.Sprintf("PR head branch %s was not found on the fork head repo %s; refusing to fall back to a same-named base branch", r.cfg.Branch, r.cfg.HeadRepo), Category: terminalCategoryUnknown})
+		return exitNeedsHuman
+	}
+	return 0
+}
+
+// guardFixPRBase enforces the fix-pr invariant that the run's pinned base is
+// the pull request's live target ref — stacked (non-default) and fork pull
+// requests included — before workspace preparation fetches or merges
+// anything. The target ref is read through the configured forge capability,
+// never a forge-specific CLI, and compared by ref rather than by SHA: the
+// base tip legitimately moves and the preparation step fetches it fresh.
+// Repository identity is compared byte-exactly, as admission compared it when
+// it pinned the base. A mismatch is fail-closed, because continuing under a
+// wrong base silently rewrites the diff contract the pull request was opened
+// against. A read that never completed proves nothing about the world, so it
+// parks the run for the operator's bounded retry instead of failing it
+// (#455). A pinned request that is no longer open is a moot repair condition:
+// there is nothing left to repair, so the run ends without changing it, the
+// same world the no-change claim is verified against (#515). It returns 0
+// when the run may proceed.
+func (r reporter) guardFixPRBase(ctx context.Context) int {
+	if !strings.EqualFold(r.cfg.Mode, "fix-pr") {
+		return 0
+	}
+	if r.cfg.Ref < 1 {
+		r.terminate(termination{Phase: "Failed", Result: "failure", ExitCode: 1, Reason: "COURIER_REF is not set; a fix-pr run without a pull request number cannot be validated", Category: terminalCategoryExecutorCrash})
+		return 1
+	}
+	client, err := github.NewClient(r.cfg.GitHubAPIBase, r.cfg.GitHubToken)
+	if err != nil {
+		r.terminate(termination{Phase: "Failed", Result: "failure", ExitCode: 1, Reason: err.Error(), Category: terminalCategoryExecutorCrash})
+		return 1
+	}
+	provider := github.NewProvider(forge.ProviderConfig{Name: "github", Endpoint: r.cfg.GitHubAPIBase}, client)
+	pr, err := provider.ReadPullRequest(ctx, forge.PullRequestRef{Repo: r.cfg.Repo, Number: r.cfg.Ref})
+	if err != nil {
+		if forge.IsTransientAvailability(err) {
+			// The read could not complete, so the base was never
+			// observed: park for the operator's bounded retry under the
+			// forge-unavailable category rather than Failed, and never
+			// proceed on an unverified base (#455).
+			reason := fmt.Sprintf("pull request #%d of %q could not be read to validate the run's base: %s; the forge was temporarily unavailable, so the run is parked for bounded retry by the operator", r.cfg.Ref, r.cfg.Repo, err.Error())
+			r.terminate(termination{Phase: "NeedsHuman", Result: "needs-human", ExitCode: exitNeedsHuman, Reason: reason, Outcome: outcomeBlockedExternal, Category: terminalCategoryForgeUnavailable})
+			return exitNeedsHuman
+		}
+		var apiErr *github.APIError
+		if errors.As(err, &apiErr) && apiErr.StatusCode == http.StatusNotFound {
+			// The pinned pull request does not exist: the assignment the
+			// run was admitted against is gone, so there is no live base
+			// to validate and nothing to repair. The run fails closed for
+			// a human, stating the same restraint the handoff states — it
+			// neither opens a replacement nor adopts another pull request.
+			r.terminate(termination{Phase: "NeedsHuman", Result: "needs-human", ExitCode: exitNeedsHuman, Reason: fmt.Sprintf("pull request #%d of %q does not exist, so the pinned pull request is unverified; the executor neither opens a replacement nor adopts another pull request; the run needs a human", r.cfg.Ref, r.cfg.Repo), Category: terminalCategoryUnknown})
+			return exitNeedsHuman
+		}
+		r.terminate(termination{Phase: "Failed", Result: "failure", ExitCode: 1, Reason: err.Error(), Category: terminalCategoryExecutorCrash})
+		return 1
+	}
+	observedState := pr.State
+	if pr.Merged {
+		// GitHub reports a merged pull request as closed; name the state
+		// the operator can act on.
+		observedState = "merged"
+	}
+	switch {
+	case !strings.EqualFold(pr.State, "open"):
+		// A pinned request the forge no longer reports open is a moot
+		// repair condition: a merged or closed request cannot be
+		// conflicted, so there is nothing for this run to repair. The
+		// world settles this ending exactly as it settles a verified
+		// no-change claim (#515), and the controller still settles it
+		// against the world afterwards (#267). The run ends here rather
+		// than preparing a workspace and starting a coordinator turn
+		// against a request it may not touch. The ending is classified by
+		// the world alone, so it carries no declared outcome.
+		r.terminate(termination{Phase: "NoChangeNeeded", Result: "success", ExitCode: exitNoChangeNeeded, Reason: fmt.Sprintf("pull request #%d on %s is %s, not open; the repair condition is moot, so the run ends without changing it", r.cfg.Ref, r.cfg.Repo, observedState)})
+		return exitNoChangeNeeded
+	case pr.BaseRepo == "" || pr.BaseRef == "" || pr.BaseRepo != r.cfg.Repo:
+		r.terminate(termination{Phase: "NeedsHuman", Result: "needs-human", ExitCode: exitNeedsHuman, Reason: fmt.Sprintf("pull request #%d of %q has an incomplete or retargeted base identity", r.cfg.Ref, r.cfg.Repo), Category: terminalCategoryUnknown})
+		return exitNeedsHuman
+	case pr.BaseRef != r.cfg.Base:
+		r.terminate(termination{Phase: "NeedsHuman", Result: "needs-human", ExitCode: exitNeedsHuman, Reason: fmt.Sprintf("pull request #%d targets base %q, not the run's pinned base %q; refusing to synchronize against or complete under a base the pull request does not name", r.cfg.Ref, pr.BaseRef, r.cfg.Base), Category: terminalCategoryUnknown})
 		return exitNeedsHuman
 	}
 	return 0

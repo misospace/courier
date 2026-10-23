@@ -442,9 +442,9 @@ func TestCoordinatorLauncherReportsProvisioningInFlightWhenExistingPodIsTerminat
 	}
 }
 
-// pinnedCriteriaPolicy builds a persisted policy whose criterion pin mirrors
-// admission's mapping of an extracted set, so launcher tests exercise the
-// same shape the operator writes (#280).
+// pinnedCriteriaPolicy builds a persisted policy whose criterion pin and
+// base ref mirror admission's mapping of an extracted set, so launcher
+// tests exercise the same shape the operator writes (#280).
 func pinnedCriteriaPolicy(t *testing.T, body string) *courierv1alpha1.PublicationPolicy {
 	t.Helper()
 	set, err := broker.ExtractCriteria(body, broker.SourceIssue{Owner: "acme", Name: "widgets", Number: 1})
@@ -453,6 +453,7 @@ func pinnedCriteriaPolicy(t *testing.T, body string) *courierv1alpha1.Publicatio
 	}
 	policy := &courierv1alpha1.PublicationPolicy{
 		SourceIssue: &courierv1alpha1.SourceIssueRef{Owner: "acme", Name: "widgets", Number: 1},
+		BaseRef:     "main",
 	}
 	for _, criterion := range set.Criteria {
 		policy.AcceptanceCriteria = append(policy.AcceptanceCriteria, courierv1alpha1.Criterion{
@@ -555,6 +556,292 @@ func TestCoordinatorLauncherProjectsCriteriaEnvelope(t *testing.T) {
 	orphaned.Status.PublicationPolicy.AcceptanceCriteriaDigest = ""
 	if err := launcher.Launch(context.Background(), orphaned); err == nil {
 		t.Fatal("orphaned criterion pin fields must fail the launch")
+	}
+}
+
+// The legacy coordinator pod of a fix-pr run carries the pinned pull
+// request's live target ref — a stacked base included — never the
+// deployment default, because the run repairs a request that was opened
+// against that base. A resolve-issue run keeps the deployment default: it
+// works from the repository's default branch, not from a pull request.
+func TestCoordinatorLauncherProjectsFixPRBaseRef(t *testing.T) {
+	lane := &courierv1alpha1.LaneProfile{
+		ObjectMeta: metav1.ObjectMeta{Name: "local", Namespace: "default"},
+		Spec:       courierv1alpha1.LaneProfileSpec{Roles: map[string]string{"coordinator": "test-model"}},
+	}
+	newRun := func(name string, mode courierv1alpha1.Mode) *courierv1alpha1.CoderRun {
+		return &courierv1alpha1.CoderRun{
+			ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: "default", UID: types.UID(name + "-uid")},
+			Spec: courierv1alpha1.CoderRunSpec{
+				Mode: mode,
+				Repo: "acme/widgets",
+				Ref:  7,
+				Lane: "local",
+			},
+			Status: courierv1alpha1.CoderRunStatus{Phase: courierv1alpha1.PhaseClaimed},
+		}
+	}
+	fixRun := newRun("run-1", courierv1alpha1.ModeFixPR)
+	issueRun := newRun("run-2", courierv1alpha1.ModeResolveIssue)
+	fakeClient := fake.NewClientBuilder().
+		WithScheme(launcherScheme(t)).
+		WithStatusSubresource(&courierv1alpha1.CoderRun{}).
+		WithRuntimeObjects(fixRun, issueRun, lane).
+		Build()
+	// The resolver answers with the pull request's live identity: a stacked
+	// base the deployment default does not name, and the head the request
+	// carries.
+	resolutions := 0
+	launcher := &CoordinatorLauncher{
+		Client: fakeClient,
+		Pod:    executor.PodConfig{Image: "example/opencode:test", BaseBranch: "main"},
+		PRHeadResolver: ExistingPRHeadResolverFunc(func(_ context.Context, run *courierv1alpha1.CoderRun) (HeadRef, error) {
+			resolutions++
+			return HeadRef{
+				Repo:    "acme/widgets",
+				Branch:  "courier/fix/acme-widgets/7",
+				SHA:     "headsha",
+				BaseRef: "courier/acme/widgets/issue-9",
+			}, nil
+		}),
+	}
+
+	// The fix-pr run's pod carries the pull request's live target ref, not
+	// the deployment default the launcher is configured with.
+	if err := launcher.Launch(context.Background(), fixRun); err != nil {
+		t.Fatalf("Launch() fix-pr error = %v", err)
+	}
+	var fixPod corev1.Pod
+	if err := fakeClient.Get(context.Background(), client.ObjectKey{Namespace: "default", Name: "run-1-coordinator"}, &fixPod); err != nil {
+		t.Fatalf("get coordinator pod: %v", err)
+	}
+	if base, ok := podEnvironmentByName(t, &fixPod)["COURIER_BASE"]; !ok || base.Value != "courier/acme/widgets/issue-9" {
+		t.Fatalf("COURIER_BASE = %+v, want the pull request's live target ref courier/acme/widgets/issue-9, not the deployment default", base)
+	}
+	if resolutions != 1 {
+		t.Fatalf("pull-request resolutions = %d, want 1; the launch must cost one pull-request read of its own", resolutions)
+	}
+
+	// A resolve-issue run keeps the deployment default: no pull request
+	// names its base, so the resolver is never consulted for it.
+	if err := launcher.Launch(context.Background(), issueRun); err != nil {
+		t.Fatalf("Launch() resolve-issue error = %v", err)
+	}
+	var issuePod corev1.Pod
+	if err := fakeClient.Get(context.Background(), client.ObjectKey{Namespace: "default", Name: "run-2-coordinator"}, &issuePod); err != nil {
+		t.Fatalf("get coordinator pod: %v", err)
+	}
+	if base, ok := podEnvironmentByName(t, &issuePod)["COURIER_BASE"]; !ok || base.Value != "main" {
+		t.Fatalf("COURIER_BASE = %+v, want the launcher's configured base main", base)
+	}
+	if resolutions != 1 {
+		t.Fatalf("pull-request resolutions = %d, want 1; a resolve-issue run resolves no base", resolutions)
+	}
+}
+
+// The base a fix-pr pod carries comes from the launch's own read of the pull
+// request, never projected from a persisted publication policy. Secure
+// admission is the only writer of a persisted publication policy, and the
+// secure world it serves launches through secure control, so the launch's own
+// read is the base's source on this path; where a run carries policy state
+// from an earlier secure incarnation anyway, the pod still carries the base
+// the request targets now: the executor's startup guard fails closed on any
+// mismatch, so a request retargeted after the policy's base was recorded must
+// reach the coordinator with its live base, never the recorded one and never
+// the deployment default.
+func TestCoordinatorLauncherPinsBaseFromItsOwnLaunchTimeRead(t *testing.T) {
+	lane := &courierv1alpha1.LaneProfile{
+		ObjectMeta: metav1.ObjectMeta{Name: "local", Namespace: "default"},
+		Spec:       courierv1alpha1.LaneProfileSpec{Roles: map[string]string{"coordinator": "test-model"}},
+	}
+	run := &courierv1alpha1.CoderRun{
+		ObjectMeta: metav1.ObjectMeta{Name: "run-1", Namespace: "default", UID: types.UID("run-1-uid")},
+		Spec: courierv1alpha1.CoderRunSpec{
+			Mode: courierv1alpha1.ModeFixPR,
+			Repo: "acme/widgets",
+			Ref:  7,
+			Lane: "local",
+		},
+		Status: courierv1alpha1.CoderRunStatus{
+			Phase:    courierv1alpha1.PhaseClaimed,
+			Branch:   "courier/fix/acme-widgets/7",
+			HeadRepo: "acme/widgets",
+			HeadSHA:  "admission-sha",
+			// The shape a fix-pr run can carry from an earlier secure
+			// incarnation: a persisted publication policy already naming the
+			// base. The launch must not project it; the launch-time read
+			// wins.
+			PublicationPolicy: &courierv1alpha1.PublicationPolicy{
+				BaseRef: "main",
+				BaseOID: "admission-base-oid",
+			},
+		},
+	}
+	fakeClient := fake.NewClientBuilder().
+		WithScheme(launcherScheme(t)).
+		WithStatusSubresource(&courierv1alpha1.CoderRun{}).
+		WithRuntimeObjects(run, lane).
+		Build()
+	resolutions := 0
+	launcher := &CoordinatorLauncher{
+		Client: fakeClient,
+		Pod:    executor.PodConfig{Image: "example/opencode:test", BaseBranch: "main"},
+		PRHeadResolver: ExistingPRHeadResolverFunc(func(_ context.Context, _ *courierv1alpha1.CoderRun) (HeadRef, error) {
+			resolutions++
+			return HeadRef{
+				Repo:    "acme/widgets",
+				Branch:  "courier/fix/acme-widgets/7",
+				SHA:     "launch-sha",
+				BaseRef: "release/2.0",
+			}, nil
+		}),
+	}
+
+	if err := launcher.Launch(context.Background(), run); err != nil {
+		t.Fatalf("Launch() error = %v", err)
+	}
+	var pod corev1.Pod
+	if err := fakeClient.Get(context.Background(), client.ObjectKey{Namespace: "default", Name: "run-1-coordinator"}, &pod); err != nil {
+		t.Fatalf("get coordinator pod: %v", err)
+	}
+	if base, ok := podEnvironmentByName(t, &pod)["COURIER_BASE"]; !ok || base.Value != "release/2.0" {
+		t.Fatalf("COURIER_BASE = %+v, want the base the launch's own read observed (release/2.0), not the deployment default or the persisted policy's main", base)
+	}
+	if resolutions != 1 {
+		t.Fatalf("pull-request resolutions = %d, want 1; the launch reads the request itself instead of projecting the persisted policy", resolutions)
+	}
+}
+
+// An unverifiable base fails the launch closed. A missing resolver, a
+// failed resolution, and a resolved pull request that names no base ref all
+// leave the run's base unknown, and the deployment default must never
+// stand in for it: a coordinator launched against the default would repair
+// the pull request under a base it does not name.
+func TestCoordinatorLauncherFailsClosedWhenFixPRBaseCannotBeVerified(t *testing.T) {
+	resolutionErr := errors.New("the forge read failed")
+	for _, tc := range []struct {
+		name     string
+		resolver ExistingPRHeadResolver
+	}{
+		{
+			name:     "no resolver wired",
+			resolver: nil,
+		},
+		{
+			name: "resolution failed",
+			resolver: ExistingPRHeadResolverFunc(func(context.Context, *courierv1alpha1.CoderRun) (HeadRef, error) {
+				return HeadRef{}, resolutionErr
+			}),
+		},
+		{
+			name: "resolved pull request names no base",
+			resolver: ExistingPRHeadResolverFunc(func(context.Context, *courierv1alpha1.CoderRun) (HeadRef, error) {
+				return HeadRef{Repo: "acme/widgets", Branch: "courier/fix/acme-widgets/7", SHA: "headsha"}, nil
+			}),
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			run := &courierv1alpha1.CoderRun{
+				ObjectMeta: metav1.ObjectMeta{Name: "run-1", Namespace: "default", UID: types.UID("run-uid")},
+				Spec: courierv1alpha1.CoderRunSpec{
+					Mode: courierv1alpha1.ModeFixPR,
+					Repo: "acme/widgets",
+					Ref:  7,
+					Lane: "local",
+				},
+				Status: courierv1alpha1.CoderRunStatus{Phase: courierv1alpha1.PhaseClaimed},
+			}
+			lane := &courierv1alpha1.LaneProfile{
+				ObjectMeta: metav1.ObjectMeta{Name: "local", Namespace: "default"},
+				Spec:       courierv1alpha1.LaneProfileSpec{Roles: map[string]string{"coordinator": "test-model"}},
+			}
+			fakeClient := fake.NewClientBuilder().
+				WithScheme(launcherScheme(t)).
+				WithStatusSubresource(&courierv1alpha1.CoderRun{}).
+				WithRuntimeObjects(run, lane).
+				Build()
+			launcher := &CoordinatorLauncher{
+				Client:         fakeClient,
+				Pod:            executor.PodConfig{Image: "example/opencode:test", BaseBranch: "main"},
+				PRHeadResolver: tc.resolver,
+			}
+
+			err := launcher.Launch(context.Background(), run)
+			var permanent *SecureNeedsHumanError
+			if !errors.As(err, &permanent) {
+				t.Fatalf("Launch() error = %v, want a *SecureNeedsHumanError the reconciler can terminalize", err)
+			}
+			if permanent.Reason != baseUnverifiedReason {
+				t.Fatalf("reason = %q, want %q", permanent.Reason, baseUnverifiedReason)
+			}
+			// The rejection must terminalize the run: a class the launch
+			// paths do not terminalize only cycles the claim.
+			if launchRejection(err) == nil {
+				t.Fatalf("reason %q is not a terminal launch rejection; the run would cycle claim and release instead of settling", permanent.Reason)
+			}
+			var pod corev1.Pod
+			if err := fakeClient.Get(context.Background(), client.ObjectKey{Namespace: "default", Name: "run-1-coordinator"}, &pod); !apierrors.IsNotFound(err) {
+				t.Fatalf("coordinator pod present after an unverifiable base: %v", err)
+			}
+		})
+	}
+}
+
+// transientResolutionError is a forge read that never completed: the base
+// was never observed, so the launch must be retried rather than settled.
+type transientResolutionError struct{}
+
+func (transientResolutionError) Error() string { return "the forge was temporarily unavailable" }
+
+func (transientResolutionError) TransientAvailability() bool { return true }
+
+// TestCoordinatorLauncherRetriesTransientFixPRBaseResolution proves the
+// launcher's transient branch of the base contract: a read that never
+// completed proves nothing about the pull request's base, so the launch
+// fails with an ordinary retryable error and creates no pod, and the run is
+// never settled on an unobserved base (#455).
+func TestCoordinatorLauncherRetriesTransientFixPRBaseResolution(t *testing.T) {
+	run := &courierv1alpha1.CoderRun{
+		ObjectMeta: metav1.ObjectMeta{Name: "run-1", Namespace: "default", UID: types.UID("run-uid")},
+		Spec: courierv1alpha1.CoderRunSpec{
+			Mode: courierv1alpha1.ModeFixPR,
+			Repo: "acme/widgets",
+			Ref:  7,
+			Lane: "local",
+		},
+		Status: courierv1alpha1.CoderRunStatus{Phase: courierv1alpha1.PhaseClaimed},
+	}
+	lane := &courierv1alpha1.LaneProfile{
+		ObjectMeta: metav1.ObjectMeta{Name: "local", Namespace: "default"},
+		Spec:       courierv1alpha1.LaneProfileSpec{Roles: map[string]string{"coordinator": "test-model"}},
+	}
+	fakeClient := fake.NewClientBuilder().
+		WithScheme(launcherScheme(t)).
+		WithStatusSubresource(&courierv1alpha1.CoderRun{}).
+		WithRuntimeObjects(run, lane).
+		Build()
+	launcher := &CoordinatorLauncher{
+		Client: fakeClient,
+		Pod:    executor.PodConfig{Image: "example/opencode:test", BaseBranch: "main"},
+		PRHeadResolver: ExistingPRHeadResolverFunc(func(context.Context, *courierv1alpha1.CoderRun) (HeadRef, error) {
+			return HeadRef{}, transientResolutionError{}
+		}),
+	}
+
+	err := launcher.Launch(context.Background(), run)
+	if err == nil {
+		t.Fatal("Launch() error = nil, want the transient read failure")
+	}
+	var permanent *SecureNeedsHumanError
+	if errors.As(err, &permanent) {
+		t.Fatalf("Launch() error = %v, want a retryable error: a read that never completed settles nothing", err)
+	}
+	if launchRejection(err) != nil {
+		t.Fatalf("Launch() error = %v, want no terminal rejection: the run must be retried", err)
+	}
+	var pod corev1.Pod
+	if err := fakeClient.Get(context.Background(), client.ObjectKey{Namespace: "default", Name: "run-1-coordinator"}, &pod); !apierrors.IsNotFound(err) {
+		t.Fatalf("coordinator pod present after an unobserved base: %v", err)
 	}
 }
 

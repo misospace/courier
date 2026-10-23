@@ -279,6 +279,357 @@ func TestSyncToBaseNonConflictFailureFailsClosed(t *testing.T) {
 	}
 }
 
+// A preparation destination that already holds a checkout is rebuilt from
+// the remote rather than reused: an earlier attempt can leave one behind
+// carrying a local-only merge of the wrong base, an uncommitted edit, and an
+// untracked file, and none of it may reach the run.
+func TestPrepareRebuildsWorkspaceOverLeftoverCheckout(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	root := t.TempDir()
+	remote := filepath.Join(root, "remote.git")
+	source := filepath.Join(root, "source")
+	initBare(t, remote)
+	initRepo(t, source)
+	writeFile(t, filepath.Join(source, "README.md"), "base one\n")
+	commit(t, source, "base: initial")
+	git(t, source, "branch", "-M", "main")
+	git(t, source, "remote", "add", "origin", remote)
+	git(t, source, "push", "-u", "origin", "main")
+
+	const branch = "courier/resolve-issue/acme-widget/14"
+	work := filepath.Join(root, "work")
+	git(t, root, "clone", remote, work)
+	git(t, work, "config", "user.name", "Courier Test")
+	git(t, work, "config", "user.email", "courier-test@example.invalid")
+	git(t, work, "checkout", "-b", branch, "origin/main")
+	writeFile(t, filepath.Join(work, "work.txt"), "completed brief\n")
+	commit(t, work, "work: previous brief")
+	git(t, work, "push", "origin", "HEAD:refs/heads/"+branch)
+	publishedHead := strings.TrimSpace(string(mustGit(t, work, "rev-parse", branch)))
+
+	// The destination holds a checkout left behind by an earlier attempt: a
+	// local-only merge of a base the run must not have, an uncommitted edit
+	// to a tracked file, and an untracked file.
+	workspaceDir := filepath.Join(root, "workspace")
+	git(t, root, "clone", remote, workspaceDir)
+	git(t, workspaceDir, "config", "user.name", "Courier Test")
+	git(t, workspaceDir, "config", "user.email", "courier-test@example.invalid")
+	git(t, workspaceDir, "checkout", "-B", branch, "origin/"+branch)
+	git(t, workspaceDir, "checkout", "-b", "stale-base", "origin/main")
+	writeFile(t, filepath.Join(workspaceDir, "stale-base.txt"), "stale base\n")
+	commit(t, workspaceDir, "stale: base the run must not merge")
+	git(t, workspaceDir, "checkout", branch)
+	git(t, workspaceDir, "merge", "--no-edit", "stale-base")
+	staleMerge := strings.TrimSpace(string(mustGit(t, workspaceDir, "rev-parse", "HEAD")))
+	parents := strings.Fields(string(mustGit(t, workspaceDir, "rev-list", "--parents", "-n", "1", "HEAD")))
+	if len(parents) != 3 {
+		t.Fatalf("workspace HEAD = %q is not a merge commit: the fixture must reproduce the incident's local-only merge", staleMerge)
+	}
+	writeFile(t, filepath.Join(workspaceDir, "README.md"), "edited by an earlier attempt\n")
+	writeFile(t, filepath.Join(workspaceDir, "untracked.txt"), "scratch\n")
+
+	workspace, err := Prepare(ctx, PrepareOptions{
+		RemoteURL: remote,
+		Directory: workspaceDir,
+		Base:      "main",
+		Branch:    branch,
+	})
+	if err != nil {
+		t.Fatalf("prepare over a leftover checkout: %v", err)
+	}
+	if !workspace.Adopted {
+		t.Fatal("expected the published branch to be adopted")
+	}
+	head := strings.TrimSpace(string(mustGit(t, workspaceDir, "rev-parse", "HEAD")))
+	if head != publishedHead {
+		t.Fatalf("workspace HEAD = %q, want the published head %q: preparation must rebuild the branch from the published head", head, publishedHead)
+	}
+	merges := strings.TrimSpace(string(mustGit(t, workspaceDir, "log", "--merges", "--oneline")))
+	if merges != "" {
+		t.Fatalf("workspace history holds merge commits %q, want none: the stale merge must not survive preparation", merges)
+	}
+	if _, err := gitOutput(workspaceDir, "merge-base", "--is-ancestor", staleMerge, "HEAD"); err == nil {
+		t.Fatalf("the stale local-only merge %q survived preparation", staleMerge)
+	}
+	if _, err := gitOutput(workspaceDir, "merge-base", "--is-ancestor", "origin/main", "HEAD"); err != nil {
+		t.Fatalf("base is not an ancestor after preparation: %v", err)
+	}
+	if got := strings.TrimSpace(string(mustRead(t, filepath.Join(workspaceDir, "README.md")))); got != "base one" {
+		t.Fatalf("tracked file content = %q, want the published content: the uncommitted edit must not survive preparation", got)
+	}
+	if _, err := os.Stat(filepath.Join(workspaceDir, "untracked.txt")); !os.IsNotExist(err) {
+		t.Fatalf("the untracked file survived preparation (stat error %v)", err)
+	}
+	url := strings.TrimSpace(string(mustGit(t, workspaceDir, "remote", "get-url", "origin")))
+	if url != remote {
+		t.Fatalf("work remote url = %q, want the configured remote %q", url, remote)
+	}
+}
+
+// The clear step refuses paths that could wipe a system directory: the
+// filesystem root, and a top-level path that is not a mounted volume root.
+func TestClearableDirectoryRefusesSystemPaths(t *testing.T) {
+	t.Parallel()
+	clearable, err := clearableDirectory("/")
+	if err != nil || clearable {
+		t.Fatalf("clearableDirectory(/) = (%v, %v), want (false, nil)", clearable, err)
+	}
+	clearable, err = clearableDirectory("/courier-no-such-workspace")
+	if err == nil && clearable {
+		t.Fatal("clearableDirectory(/courier-no-such-workspace) = true, want a top-level path refused")
+	}
+	clearable, err = clearableDirectory(t.TempDir())
+	if err != nil || !clearable {
+		t.Fatalf("clearableDirectory(temp dir) = (%v, %v), want (true, nil)", clearable, err)
+	}
+	// /proc is a mounted volume root in every Linux environment: the pod
+	// mounts its workspace volume the same way, at a single-segment path.
+	clearable, err = clearableDirectory("/proc")
+	if err != nil || !clearable {
+		t.Fatalf("clearableDirectory(/proc) = (%v, %v), want a mount root allowed", clearable, err)
+	}
+}
+
+// The rebuild removes a symlink inside the workspace but never follows it: a
+// link pointing outside the workspace leaves its target alone.
+func TestPrepareRebuildDoesNotFollowSymlinks(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	root := t.TempDir()
+	remote := filepath.Join(root, "remote.git")
+	source := filepath.Join(root, "source")
+	initBare(t, remote)
+	initRepo(t, source)
+	writeFile(t, filepath.Join(source, "README.md"), "base one\n")
+	commit(t, source, "base: initial")
+	git(t, source, "branch", "-M", "main")
+	git(t, source, "remote", "add", "origin", remote)
+	git(t, source, "push", "-u", "origin", "main")
+
+	outside := filepath.Join(root, "outside.txt")
+	writeFile(t, outside, "outside the workspace\n")
+
+	workspaceDir := filepath.Join(root, "workspace")
+	git(t, root, "clone", remote, workspaceDir)
+	git(t, workspaceDir, "config", "user.name", "Courier Test")
+	git(t, workspaceDir, "config", "user.email", "courier-test@example.invalid")
+	link := filepath.Join(workspaceDir, "link.txt")
+	if err := os.Symlink(outside, link); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := Prepare(ctx, PrepareOptions{
+		RemoteURL: remote,
+		Directory: workspaceDir,
+		Base:      "main",
+		Branch:    "courier/resolve-issue/acme-widget/18",
+	}); err != nil {
+		t.Fatalf("prepare over a leftover checkout: %v", err)
+	}
+	if _, err := os.Lstat(link); !os.IsNotExist(err) {
+		t.Fatalf("the symlink survived preparation (stat error %v)", err)
+	}
+	if got := strings.TrimSpace(string(mustRead(t, outside))); got != "outside the workspace" {
+		t.Fatalf("the symlink target was followed and altered: %q", got)
+	}
+}
+
+// A symlink standing at the workspace path is refused: clearing through it
+// would empty the checkout the link points at, a directory outside the
+// configured workspace, so preparation fails closed and leaves the target
+// untouched.
+func TestPrepareRefusesSymlinkedWorkspacePath(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	root := t.TempDir()
+	remote := filepath.Join(root, "remote.git")
+	source := filepath.Join(root, "source")
+	initBare(t, remote)
+	initRepo(t, source)
+	writeFile(t, filepath.Join(source, "README.md"), "base one\n")
+	commit(t, source, "base: initial")
+	git(t, source, "branch", "-M", "main")
+	git(t, source, "remote", "add", "origin", remote)
+	git(t, source, "push", "-u", "origin", "main")
+
+	// The destination path is a symlink to a git checkout elsewhere.
+	target := filepath.Join(root, "elsewhere")
+	git(t, root, "clone", remote, target)
+	git(t, target, "checkout", "main")
+	headBefore := strings.TrimSpace(string(mustGit(t, target, "rev-parse", "HEAD")))
+	link := filepath.Join(root, "workspace")
+	if err := os.Symlink(target, link); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err := Prepare(ctx, PrepareOptions{
+		RemoteURL: remote,
+		Directory: link,
+		Base:      "main",
+		Branch:    "courier/resolve-issue/acme-widget/19",
+	})
+	if err == nil {
+		t.Fatal("preparing into a symlinked workspace path succeeded, want refusal")
+	}
+	if !strings.Contains(err.Error(), link) {
+		t.Fatalf("error %q does not name the refused path %q", err, link)
+	}
+	if !strings.Contains(err.Error(), "symlink") {
+		t.Fatalf("error %q does not state that the path is a symlink", err)
+	}
+	if got := strings.TrimSpace(string(mustGit(t, target, "rev-parse", "HEAD"))); got != headBefore {
+		t.Fatalf("the linked checkout moved from %q to %q: preparation must not touch it", headBefore, got)
+	}
+	if _, statErr := os.Stat(filepath.Join(target, "README.md")); statErr != nil {
+		t.Fatalf("preparation cleared the linked checkout: %v", statErr)
+	}
+}
+
+// A workspace path carrying a null byte is refused before any filesystem
+// interpretation: no lookup, clone, or clear touches anything.
+func TestPrepareRefusesNullByteWorkspacePath(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	root := t.TempDir()
+	remote := filepath.Join(root, "remote.git")
+	source := filepath.Join(root, "source")
+	initBare(t, remote)
+	initRepo(t, source)
+	writeFile(t, filepath.Join(source, "README.md"), "base one\n")
+	commit(t, source, "base: initial")
+	git(t, source, "branch", "-M", "main")
+	git(t, source, "remote", "add", "origin", remote)
+	git(t, source, "push", "-u", "origin", "main")
+
+	directory := filepath.Join(root, "workspace") + "\x00trailing"
+	_, err := Prepare(ctx, PrepareOptions{
+		RemoteURL: remote,
+		Directory: directory,
+		Base:      "main",
+		Branch:    "courier/resolve-issue/acme-widget/20",
+	})
+	if err == nil {
+		t.Fatal("preparing into a path with a null byte succeeded, want refusal")
+	}
+	entries, readErr := os.ReadDir(root)
+	if readErr != nil {
+		t.Fatal(readErr)
+	}
+	if len(entries) != 2 {
+		t.Fatalf("the refused preparation created entries in %q: %v", root, entries)
+	}
+}
+
+// A destination that holds files but no git checkout is refused: preparation
+// never deletes anything it did not create, so it fails closed and names the
+// path it refused.
+func TestPrepareRefusesNonCheckoutDestination(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	root := t.TempDir()
+	remote := filepath.Join(root, "remote.git")
+	source := filepath.Join(root, "source")
+	initBare(t, remote)
+	initRepo(t, source)
+	writeFile(t, filepath.Join(source, "README.md"), "base one\n")
+	commit(t, source, "base: initial")
+	git(t, source, "branch", "-M", "main")
+	git(t, source, "remote", "add", "origin", remote)
+	git(t, source, "push", "-u", "origin", "main")
+
+	workspaceDir := filepath.Join(root, "workspace")
+	if err := os.MkdirAll(workspaceDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	writeFile(t, filepath.Join(workspaceDir, "leftover.txt"), "not a checkout\n")
+
+	_, err := Prepare(ctx, PrepareOptions{
+		RemoteURL: remote,
+		Directory: workspaceDir,
+		Base:      "main",
+		Branch:    "courier/resolve-issue/acme-widget/15",
+	})
+	if err == nil {
+		t.Fatal("preparing into a non-checkout directory succeeded")
+	}
+	if !strings.Contains(err.Error(), workspaceDir) {
+		t.Fatalf("error %q does not name the refused path %q", err, workspaceDir)
+	}
+	if !strings.Contains(err.Error(), "not a git checkout") {
+		t.Fatalf("error %q does not state that the directory holds no git checkout", err)
+	}
+	if _, statErr := os.Stat(filepath.Join(workspaceDir, "leftover.txt")); statErr != nil {
+		t.Fatalf("preparation removed a file it did not create: %v", statErr)
+	}
+}
+
+// A leftover checkout can belong to another repository.  The rebuild leaves
+// the workspace bound to the configured remote and holding that remote's
+// published head: the other repository's content is gone.
+func TestPrepareRebuildsWorkspaceBoundToConfiguredRemote(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	root := t.TempDir()
+	remote := filepath.Join(root, "remote.git")
+	other := filepath.Join(root, "other.git")
+	source := filepath.Join(root, "source")
+	initBare(t, remote)
+	initBare(t, other)
+	initRepo(t, source)
+	writeFile(t, filepath.Join(source, "README.md"), "base one\n")
+	commit(t, source, "base: initial")
+	git(t, source, "branch", "-M", "main")
+	git(t, source, "remote", "add", "origin", remote)
+	git(t, source, "push", "-u", "origin", "main")
+	writeFile(t, filepath.Join(source, "other-repo.txt"), "other repository\n")
+	commit(t, source, "other: repository content")
+	git(t, source, "remote", "add", "other", other)
+	git(t, source, "push", "other", "main")
+
+	const branch = "courier/resolve-issue/acme-widget/16"
+	work := filepath.Join(root, "work")
+	git(t, root, "clone", remote, work)
+	git(t, work, "config", "user.name", "Courier Test")
+	git(t, work, "config", "user.email", "courier-test@example.invalid")
+	git(t, work, "checkout", "-b", branch, "origin/main")
+	writeFile(t, filepath.Join(work, "work.txt"), "completed brief\n")
+	commit(t, work, "work: previous brief")
+	git(t, work, "push", "origin", "HEAD:refs/heads/"+branch)
+	publishedHead := strings.TrimSpace(string(mustGit(t, work, "rev-parse", branch)))
+
+	// The leftover checkout belongs to the other repository.
+	workspaceDir := filepath.Join(root, "workspace")
+	git(t, root, "clone", other, workspaceDir)
+	git(t, workspaceDir, "config", "user.name", "Courier Test")
+	git(t, workspaceDir, "config", "user.email", "courier-test@example.invalid")
+	git(t, workspaceDir, "checkout", "main")
+
+	workspace, err := Prepare(ctx, PrepareOptions{
+		RemoteURL: remote,
+		Directory: workspaceDir,
+		Base:      "main",
+		Branch:    branch,
+	})
+	if err != nil {
+		t.Fatalf("prepare over a leftover checkout: %v", err)
+	}
+	if !workspace.Adopted {
+		t.Fatal("expected the published branch to be adopted")
+	}
+	url := strings.TrimSpace(string(mustGit(t, workspaceDir, "remote", "get-url", "origin")))
+	if url != remote {
+		t.Fatalf("work remote url = %q, want the configured remote %q", url, remote)
+	}
+	head := strings.TrimSpace(string(mustGit(t, workspaceDir, "rev-parse", "HEAD")))
+	if head != publishedHead {
+		t.Fatalf("workspace HEAD = %q, want the published head %q", head, publishedHead)
+	}
+	if _, err := os.Stat(filepath.Join(workspaceDir, "other-repo.txt")); !os.IsNotExist(err) {
+		t.Fatalf("the other repository's content survived preparation (stat error %v)", err)
+	}
+}
+
 func TestPrepareCreatesBranchFromBase(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()

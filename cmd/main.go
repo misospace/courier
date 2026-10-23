@@ -320,6 +320,12 @@ func main() {
 	if githubObserver == nil {
 		setupLog.Info("GitHub observer disabled; no API credential Secret configured")
 	}
+	// The legacy coordinator launcher pins a fix-pr run's coordinator pod to
+	// the pinned pull request's live target ref, which it resolves through
+	// the same identity-checked forge capability the reconciler resolves the
+	// run's head through. Without that resolver a fix-pr run's launch fails
+	// closed instead of guessing a base.
+	launcher.PRHeadResolver = existingPRHeadResolver(githubObserver)
 	// Structured run events go to stdout as JSON lines alongside
 	// controller-runtime's ordinary operational logs; the deployment's log
 	// collection stack is the transport. Verbosity is per run: the
