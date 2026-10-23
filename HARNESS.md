@@ -673,20 +673,31 @@ model cannot change it.
 machine-read coverage surface; prose outside it is not a coverage claim:
 
 ```
-courier-criteria:v1 source=<owner/name>#<n> set=sha256:<64hex> coverage=<full|partial>
+courier-criteria:v1 source=<owner/name>#<n> set=sha256:<64hex> coverage=full|partial
 
 - AC-<n> sha256:<64hex>: <status> - <reference>
 ```
 
-The header names the trusted source identity and the pinned set digest;
-each row names the criterion's pinned digest, one status from a closed
-vocabulary — `implementation-evidence`, `regression-check`,
-`manual-verification`, `not-implemented`, `unknown` — and a bounded
-(≤400-byte) reference. `regression-check` and `implementation-evidence`
-must cite at least one file path or check URL; `manual-verification` and
-`not-implemented` must carry a non-empty note; `unknown` may be bare. A
-criterion's status says what *kind* of evidence exists, never that the
-evidence is semantically sufficient.
+The header names the trusted source identity and the pinned set digest,
+and its coverage value is `full` or `partial`; each row names the
+criterion's pinned digest, one status from a closed vocabulary, and a
+bounded (≤400-byte) reference, separated from the status by ` - ` (or
+` — `).
+
+That grammar is **not restated here**: `internal/broker/grammar` derives
+it from the validator's own patterns and owns it — the validator matches
+the derived patterns, and the `criteria-repair` continuation and the
+resolve-issue goal render the templates and the two sentences from there
+— so this section is a rendering of that package, not a third copy to
+keep in sync. The two prose sentences that complete the block are
+rendered from it the same way, and each is reproduced here word for word.
+
+The closed status vocabulary is implementation-evidence, regression-check, manual-verification, not-implemented, or unknown (`grammar.StatusVocabularySentence()`).
+
+The per-status reference rule is: regression-check and implementation-evidence must cite a file path or check URL; manual-verification and not-implemented must carry a note (`grammar.StatusReferenceRuleSentence()`).
+
+`unknown` may be bare. A criterion's status says what *kind* of evidence
+exists, never that the evidence is semantically sufficient.
 
 **What the validator mechanically proves — and what it does not.**
 `ValidateCriterionEvidence(prBody, set)` enforces: exactly one block; the
