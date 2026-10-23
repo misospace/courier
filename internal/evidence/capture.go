@@ -241,6 +241,17 @@ func localCommitEntries(ctx context.Context, dir string, opts Options, scanner *
 	if !refResolvable(ctx, dir, ref) {
 		ref = strings.TrimSpace(opts.StartSHA)
 		if ref == "" || !refResolvable(ctx, dir, ref) {
+			// An unresolvable ref and a dead context are different answers,
+			// and only one of them means "no commits here": refResolvable maps
+			// every error, the context's included, to "not resolvable", so a
+			// deadline that has already passed would leave the commit phase
+			// reporting an empty commit list. The capture would then deliver
+			// a manifest that reports the run's commits as absent while
+			// looking like a success, where the design asks for the manifest
+			// alone over the deadline. The dead context answers loudly.
+			if ctxErr := ctx.Err(); ctxErr != nil {
+				return out, ctxErr
+			}
 			return out, nil
 		}
 	}

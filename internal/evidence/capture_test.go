@@ -1318,6 +1318,35 @@ func TestRunGitExpiredContextBeatsTheErrWaitDelayKeepBytesRule(t *testing.T) {
 	}
 }
 
+// TestLocalCommitEntriesFailsLoudlyOnADeadContext pins the call-site
+// consequence of #469's guard: refResolvable maps every error, the context's
+// included, to "not resolvable", so a deadline that has already passed when
+// the commit phase starts would leave that phase reporting an empty commit
+// list and the capture delivering a manifest that reports the run's commits
+// as absent while looking like a success. The design asks for the manifest
+// alone over the deadline, which means the commit phase has to fail loudly
+// rather than answer "no commits here".
+func TestLocalCommitEntriesFailsLoudlyOnADeadContext(t *testing.T) {
+	t.Parallel()
+
+	dir := newRepo(t)
+	ctx := &expiredContext{done: make(chan struct{})}
+	opts := captureOptions(dir, nil)
+	var (
+		items    []tarItem
+		totals   Totals
+		stored   int
+		runningB int64
+	)
+	commits, err := localCommitEntries(ctx, dir, opts, NewScanner(), &items, &totals, &stored, &runningB)
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("err = %v, want context.DeadlineExceeded: a dead context at the commit phase is not an unresolvable ref", err)
+	}
+	if commits != nil {
+		t.Errorf("commits = %v, want nil", commits)
+	}
+}
+
 // TestRunGitCappedCanceledWithHeldPipe covers the stall where a grandchild
 // outlives git holding the stdout pipe open with no output: the cap bounds
 // bytes, not blocking, so the read must end with the context instead of parking
