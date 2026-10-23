@@ -551,6 +551,49 @@ paths share acceptance, not implementation.
   repair-message tests assert the same vocabulary, so a
   regression in the validator fails both paths simultaneously.
 
+### Fix-pr base contract (#514)
+fix-pr run repairs a pull request opened against a *specific*
+base, and that base is frequently not the repository's default
+branch: stacked request targets another request's branch, fork
+request targets the upstream's branch. two invariants follow,
+and legacy path enforces both.
+- **Pod carries the request's base, never the deployment
+  default.** legacy launcher resolves the pinned pull request's
+  live target ref through the same identity-checked forge
+  capability admission resolves the run's head through (one
+  pull-request read, never a forge-specific CLI) and pins it
+  into the coordinator pod as `COURIER_BASE`, so workspace
+  preparation synchronizes against the base the request names.
+  `resolve-issue` run keeps the deployment default. legacy path
+  has no persisted publication policy to project a base from, so
+  an unverified base has no other answer: missing resolver,
+  failed resolution, or request naming no base ref fails the
+  launch closed with `BaseUnverified` (terminal — a retry cannot
+  change what the request names), never with a substituted
+  default. transient forge read that never completed is the one
+  exception: it proves nothing about the base, so the claim is
+  released and the run retried (#455).
+- **Run re-reads the live base before it prepares anything.**
+  executor reads the pinned pull request through the forge
+  capability before workspace preparation fetches or merges
+  anything, and compares the request's live base repository
+  identity (byte-exact) and base ref (exact) with the pinned
+  base the pod carries. four endings, all fail-closed: base
+  mismatch or incomplete/retargeted base identity ends
+  `NeedsHuman` naming both refs; request the forge no longer
+  reports open is a moot repair condition and ends
+  no-change-needed (the world the no-change claim is verified
+  against); request the forge does not have is an unverifiable
+  assignment and ends `NeedsHuman`; transient read failure parks
+  the run for the operator's bounded retry (#455). a run
+  therefore never prepares a workspace against a base its
+  request does not name, and a workspace still holding a stale
+  wrong-base merge from an earlier attempt cannot continue under
+  an incorrect base assumption: the run fails closed before the
+  coordinator starts, and preparation otherwise rebuilds the
+  branch from the published head and synchronizes against the
+  pinned base.
+
 ### Acceptance-criterion evidence contract (#249)
 
 Linkage (#248) guarantees the PR *names* the trusted source issue; it says

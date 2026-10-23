@@ -1199,9 +1199,16 @@ func TestRunFixPRHandoffFailClosedWorlds(t *testing.T) {
 			want: "is a draft at handoff",
 		},
 		{
+			// The pinned pull request is there when the run starts and
+			// disappears during the captured turn: the handoff's own
+			// observation then finds no pull request on the run's head
+			// and fails closed on that, not on the startup guard.
 			name: "missing pinned PR",
-			seed: "",
-			want: "neither opens a replacement nor adopts another pull request",
+			seed: "[" + pullRequestFixtureObjectJSON(7, "open", false, "Feedback applied.") + "]",
+			extra: func(prState string) string {
+				return writePullRequestScript(prState, "[]")
+			},
+			want: "no pull request carries the run's head branch",
 		},
 		{
 			// The pinned PR and a sibling PR both carry the run's head:

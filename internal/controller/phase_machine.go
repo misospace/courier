@@ -75,10 +75,16 @@ func (r *SourceRegistry) lookupRun(run *courierv1alpha1.CoderRun) (source.Adapte
 // HeadRef identifies the exact head of a pull request: the repository that
 // owns the branch, the branch itself, and the head commit. A fix-pr run must
 // prepare from this identity rather than resolving a branch by name alone.
+// BaseRef names the pull request's live target ref — the base the request
+// currently targets, a stacked or fork request included — so a consumer can
+// pin the same base the pull request names instead of a deployment default.
+// It is empty when the resolution did not read a pull request that names a
+// base.
 type HeadRef struct {
-	Repo   string
-	Branch string
-	SHA    string
+	Repo    string
+	Branch  string
+	SHA     string
+	BaseRef string
 }
 
 // ExistingPRHeadResolver resolves the head currently attached to an

@@ -299,6 +299,46 @@ func testForgeRegistry(t *testing.T, endpoint string) *forge.Registry {
 	return registry
 }
 
+// TestResolveHeadReturnsThePullRequestsLiveBaseRef proves the resolution
+// carries the pull request's live target ref — a stacked base included — so
+// a consumer can pin the same base the request names. The base travels with
+// the head because the pull request was already read: the resolution costs
+// one pull-request read.
+func TestResolveHeadReturnsThePullRequestsLiveBaseRef(t *testing.T) {
+	reads := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		reads++
+		w.Header().Set("Content-Type", "application/json")
+		if r.URL.Path != "/repos/acme/demo/pulls/7" {
+			t.Errorf("unexpected request %s", r.URL.Path)
+			http.NotFound(w, r)
+			return
+		}
+		_, _ = io.WriteString(w, `{"number":7,"state":"open","head":{"ref":"work","sha":"sha-7","repo":{"full_name":"acme/demo"}},"base":{"ref":"courier/acme/demo/issue-9","repo":{"full_name":"acme/demo"}}}`)
+	}))
+	t.Cleanup(server.Close)
+	client, err := NewClient(server.URL, "token")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	head, err := Observer{Client: client}.ResolveHead(context.Background(), &courierv1alpha1.CoderRun{
+		Spec: courierv1alpha1.CoderRunSpec{Repo: "acme/demo", Ref: 7},
+	})
+	if err != nil {
+		t.Fatalf("ResolveHead() error = %v", err)
+	}
+	if head.Repo != "acme/demo" || head.Branch != "work" || head.SHA != "sha-7" {
+		t.Fatalf("head = %#v, want the pull request's head identity", head)
+	}
+	if head.BaseRef != "courier/acme/demo/issue-9" {
+		t.Fatalf("head.BaseRef = %q, want the pull request's live target ref courier/acme/demo/issue-9", head.BaseRef)
+	}
+	if reads != 1 {
+		t.Fatalf("forge reads = %d, want 1: the base travels with the head the resolution already read", reads)
+	}
+}
+
 func TestObserverRoutesReadsToRegistrationEndpoint(t *testing.T) {
 	transport := &recordingObserverTransport{}
 	client, err := New("token", transport)

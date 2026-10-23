@@ -175,6 +175,12 @@ func (o Observer) Observe(ctx context.Context, base string, head controller.Head
 	return controller.PRObservation{}, nil
 }
 
+// ResolveHead resolves the head identity of the pull request the run was
+// admitted against: the head repository, branch, and commit, plus the live
+// base ref the pull request currently targets. The pull request is read
+// through the forge capability on the operator's own read identity, so the
+// resolution is the same identity-checked read admission performs and never
+// a forge-specific CLI.
 func (o Observer) ResolveHead(ctx context.Context, run *courierv1alpha1.CoderRun) (controller.HeadRef, error) {
 	if o.Client == nil {
 		return controller.HeadRef{}, fmt.Errorf("GitHub observer: nil client")
@@ -197,7 +203,10 @@ func (o Observer) ResolveHead(ctx context.Context, run *courierv1alpha1.CoderRun
 	if strings.TrimSpace(pull.Head.Ref) == "" {
 		return controller.HeadRef{}, fmt.Errorf("GitHub observer: pull request %d has no head ref", run.Spec.Ref)
 	}
-	return controller.HeadRef{Repo: pull.Head.Repo.FullName, Branch: pull.Head.Ref, SHA: pull.Head.SHA}, nil
+	// The base the pull request currently targets travels with the head: the
+	// pull request was already read, so the live target ref costs no second
+	// read and reaches a consumer that must pin the same base.
+	return controller.HeadRef{Repo: pull.Head.Repo.FullName, Branch: pull.Head.Ref, SHA: pull.Head.SHA, BaseRef: pull.Base.Ref}, nil
 }
 
 // Capabilities reports the forge capabilities of the observer's provider. The

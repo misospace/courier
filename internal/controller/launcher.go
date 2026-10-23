@@ -20,6 +20,7 @@ import (
 	courierv1alpha1 "github.com/misospace/courier/api/v1alpha1"
 	"github.com/misospace/courier/internal/broker"
 	"github.com/misospace/courier/internal/executor"
+	"github.com/misospace/courier/internal/forge"
 )
 
 var (
@@ -88,6 +89,14 @@ type CoordinatorLauncher struct {
 	Scheme    *runtime.Scheme
 	Pod       executor.PodConfig
 	Executor  executor.Executor
+	// PRHeadResolver resolves the pinned pull request's live identity
+	// through the configured forge capability. The legacy launch path has no
+	// persisted publication policy to project a base from, so a fix-pr run's
+	// coordinator pod is pinned to the pull request's live target ref
+	// resolved here — one pull-request read, never a forge-specific CLI.
+	// Nil means no forge read is possible at all, and a fix-pr run then
+	// fails its launch closed rather than guessing a base.
+	PRHeadResolver ExistingPRHeadResolver
 	// EvidenceURL is the intake endpoint handed to coordinator pods for
 	// failure-evidence capture. Empty leaves capture disabled.
 	EvidenceURL string
@@ -95,6 +104,14 @@ type CoordinatorLauncher struct {
 	// minted in Launch.
 	EvidenceKey []byte
 }
+
+// baseUnverifiedReason marks the permanent launch rejection of a fix-pr run
+// whose base could not be verified: the launcher has no pull-request
+// resolver, the resolution failed, or the resolved pull request names no
+// base ref. The class is about the unresolved base, not about a persisted
+// publication policy — the legacy path has none — so it never borrows the
+// PolicyCorrupt class.
+const baseUnverifiedReason = "BaseUnverified"
 
 // Validate fails fast when the launcher is wired for production without an
 // uncached API reader, mirroring the reconciler's SetupWithManager guard:
@@ -175,20 +192,20 @@ func (l *CoordinatorLauncher) Launch(ctx context.Context, run *courierv1alpha1.C
 		return err
 	}
 	podConfig.Criteria = criteria
-	// The run's base is pinned at admission — resolve-issue: the
-	// provider-canonical default ref; fix-pr: the PR's actual target ref,
-	// including stacked and fork PRs. The pod must carry that pin, never
-	// the deployment default, so the in-pod workspace synchronizes against
-	// the base the PR actually names. An empty persisted ref fails the
-	// launch closed rather than substituting the default branch.
-	if policy := run.Status.PublicationPolicy; policy != nil {
-		ref := strings.TrimSpace(policy.BaseRef)
-		if ref == "" {
-			return secureNeedsHuman("PolicyCorrupt",
-				"the persisted publication policy for %s/%s carries no base ref; the launcher refuses to launch with a substituted default branch",
-				run.Namespace, run.Name)
+	// A fix-pr run's coordinator pod must carry the pinned pull request's
+	// live target ref, never the deployment default: the run repairs a
+	// request that was opened against that base, and a stacked or fork
+	// request names a base the default does not. The legacy path has no
+	// persisted publication policy to project the base from, so the ref is
+	// resolved here through the same identity-checked forge capability
+	// admission uses — one pull-request read. A resolve-issue run keeps the
+	// deployment default.
+	if run.Spec.Mode == courierv1alpha1.ModeFixPR {
+		base, err := l.resolveFixPRBase(ctx, run)
+		if err != nil {
+			return err
 		}
-		podConfig.BaseBranch = ref
+		podConfig.BaseBranch = base
 	}
 	builder := executor.NewPodBuilder(podConfig)
 	builder.Executor = l.Executor
@@ -288,6 +305,43 @@ func (l *CoordinatorLauncher) Launch(ctx context.Context, run *courierv1alpha1.C
 	// create that produced this collision; the adopted run-owned slot is
 	// fully provisioned.
 	return nil
+}
+
+// resolveFixPRBase resolves the live target ref of the pull request the run
+// was admitted against, through the configured forge capability. The
+// resolution fails the launch closed whenever the base stays unverified: a
+// missing resolver, a failed resolution, and a resolved pull request that
+// names no base ref all mean the run's base is unknown, and an unknown base
+// must never become the deployment default — a coordinator launched against
+// the default would repair the pull request under a base it does not name.
+// A transient availability failure is the one exception: the read never
+// completed, so it proves nothing about the base and the run is retried
+// rather than terminalized (#455).
+func (l *CoordinatorLauncher) resolveFixPRBase(ctx context.Context, run *courierv1alpha1.CoderRun) (string, error) {
+	if l.PRHeadResolver == nil {
+		return "", secureNeedsHuman(baseUnverifiedReason,
+			"no pull-request resolver is wired, so the base of pull request #%d of %s/%s cannot be verified; the launcher refuses to launch with a substituted default branch",
+			run.Spec.Ref, run.Namespace, run.Name)
+	}
+	head, err := l.PRHeadResolver.ResolveHead(ctx, run)
+	if err != nil {
+		if forge.IsTransientAvailability(err) {
+			// The read never completed, so the base was never observed:
+			// the reconciler releases the claim and retries, and the run
+			// is never launched against an unverified base (#455).
+			return "", err
+		}
+		return "", secureNeedsHuman(baseUnverifiedReason,
+			"the base of pull request #%d of %s/%s could not be resolved: %v; the launcher refuses to launch with a substituted default branch",
+			run.Spec.Ref, run.Namespace, run.Name, err)
+	}
+	base := strings.TrimSpace(head.BaseRef)
+	if base == "" {
+		return "", secureNeedsHuman(baseUnverifiedReason,
+			"pull request #%d of %s/%s names no base ref; the launcher refuses to launch with a substituted default branch",
+			run.Spec.Ref, run.Namespace, run.Name)
+	}
+	return base, nil
 }
 
 // provisioningFailure classifies a launch failure that happened while the

@@ -1508,7 +1508,14 @@ dead 12-hour run straight to Tier 3.
   the eventual PR reverts what landed on main in the meantime. Adoption's first
   step is always sync-to-base. A sync that stops on conflicts is handed to the
   coordinator mid-merge, with the base and conflicted paths in its goal; the run
-  cannot leave a success phase until the base is merged into HEAD.
+  cannot leave a success phase until the base is merged into HEAD. The base that
+  is synced is the run's *pinned* base, never the repository default: a fix-pr
+  run's pinned base is the live target ref of the pull request it repairs (a
+  stacked or fork request names a base the default does not), resolved through
+  the forge capability and pinned into the coordinator pod at launch; a base
+  that cannot be verified fails that launch closed rather than substituting the
+  default. The executor re-reads the live base before it prepares anything and
+  fails closed when it no longer matches the pinned one.
 
 Scope: **resolve-issue** adopts an orphaned branch only when a branch exists but
 no pull request points at it. When the deterministic branch already carries an
@@ -1832,6 +1839,13 @@ last node probed on every pass, or a foreign pod holding the name — outlast a
 requeue, and the read cannot tell them from a stray pod a later pass's
 delete-and-create would clear, so the run stops and names the probe and both
 nodes rather than cycling probe phases indefinitely.
+One more verdict terminalizes: `BaseUnverified` — a fix-pr run's launch could
+not verify the base the pinned pull request names, so a coordinator launched
+against the deployment default would repair the request under a base it does
+not name. No retry can change what the request names, so the run stops and
+names the request instead of launching against an unverified base. A transient
+forge read that never completed is not that verdict: it proves nothing about
+the base, so the claim is released and the run is retried.
 Every other preflight verdict keeps the claim/release requeue, because
 each of them clears on a later pass — a live probe can outrun the dataplane
 programming of the NetworkPolicy the same reconcile just wrote, and an access

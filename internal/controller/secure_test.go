@@ -1642,16 +1642,17 @@ func TestProbeResultsRefuseAnotherNodesPod(t *testing.T) {
 }
 
 // TestTerminalPreflightVerdictClassifications pins the launch paths'
-// terminalization predicate itself: the probe-identity refusal joins
-// PodAdmission as a terminal verdict, and every other secure-preflight reason
-// keeps its claim/release requeue (#449).
+// terminalization predicate itself: the probe-identity refusal and the
+// unverifiable fix-pr base join PodAdmission as a terminal verdict, and
+// every other secure-preflight reason keeps its claim/release requeue (#449).
 func TestTerminalPreflightVerdictClassifications(t *testing.T) {
 	terminal := map[string]bool{
-		"PodAdmission":  true,
-		"ProbeIdentity": true,
+		"PodAdmission":   true,
+		"ProbeIdentity":  true,
+		"BaseUnverified": true,
 	}
 	for _, reason := range []string{
-		"PodAdmission", "ProbeIdentity",
+		"PodAdmission", "ProbeIdentity", "BaseUnverified",
 		"PodSecurity", "OperatorRBAC", "BrokerRBAC", "AdmissionBroken",
 		"IsolationBroken", "RunNamespace", "ProviderSelection",
 	} {

@@ -59,13 +59,18 @@ func secureNeedsHuman(reason, format string, args ...any) *SecureNeedsHumanError
 // pinned to another node: its persistent causes (a digest collision in the
 // probe tag, a foreign pod holding the name) outlast a requeue, and the read
 // cannot tell them from a stray pod a later pass would clear.
+// BaseUnverified covers a fix-pr run whose launch could not verify the pinned
+// pull request's live base: the legacy launch path has no persisted policy to
+// fall back on, so an unverified base has no other answer, and launching
+// against the deployment default would repair the pull request under a base
+// it does not name.
 func terminalPreflightVerdict(err error) *SecureNeedsHumanError {
 	var permanent *SecureNeedsHumanError
 	if !errors.As(err, &permanent) {
 		return nil
 	}
 	switch permanent.Reason {
-	case "PodAdmission", "ProbeIdentity":
+	case "PodAdmission", "ProbeIdentity", baseUnverifiedReason:
 		return permanent
 	}
 	return nil
