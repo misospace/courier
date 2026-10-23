@@ -258,6 +258,51 @@ spec:
                     description: Plan is the coordinator's working plan.
                     type: string
                 type: object
+              ciRepair:
+                description: |-
+                  CIRepair is the bounded repair context the operator hands to a resumed
+                  coordinator (#494). It is set only for a run that resumes a
+                  mechanical-CI repair, and cleared once that repair attempt has been
+                  observed, so a relaunch before that still finds the repair goal it
+                  needs.
+                properties:
+                  attempt:
+                    description: Attempt is the 1-based repair attempt this context
+                      belongs to.
+                    minimum: 1
+                    type: integer
+                  failedChecks:
+                    description: |-
+                      FailedChecks are the names of the failed configured mechanical checks,
+                      and only those: a check the lane never named is never evidence here.
+                    items:
+                      type: string
+                    type: array
+                  fenceToken:
+                    description: |-
+                      FenceToken is the token the source issued when it reserved this
+                      repair opportunity. The outcome report must present it back, so it
+                      travels with the attempt rather than being recomputed at the end.
+                      Empty when the source cannot fence a repair.
+                    type: string
+                  head:
+                    description: |-
+                      Head is the exact parked head whose checks failed. The repair belongs
+                      to this head: an observation of any other head is not this run's work.
+                    minLength: 1
+                    type: string
+                  logs:
+                    description: Logs is the bounded log evidence of those checks.
+                    type: string
+                  maxAttempts:
+                    description: |-
+                      MaxAttempts is the lane's repair budget, so a resumed coordinator
+                      knows how many attempts remain.
+                    type: integer
+                required:
+                - attempt
+                - head
+                type: object
               cipark:
                 description: |-
                   CIPark is the durable park-and-resume record while the run waits on

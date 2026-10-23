@@ -105,6 +105,13 @@ type LaneProfileSpec struct {
 	// (ProbePodResources) that does not follow the lane.
 	// +optional
 	Resources PodResources `json:"resources,omitempty"`
+
+	// CIRepair declares the lane's mechanical-CI repair policy (#475, #494).
+	// An absent policy — or a policy that names no mechanical check — leaves
+	// the CI park-and-resume loop disabled, and a run on the lane behaves
+	// exactly as it does without one.
+	// +optional
+	CIRepair *CIRepairPolicy `json:"ciRepair,omitempty"`
 }
 
 // ContextPolicy is a lane's declared context budget for the harness (#243).
@@ -161,6 +168,37 @@ type ContextBudget struct {
 	// +kubebuilder:validation:Minimum=0
 	// +optional
 	OutputReservation int `json:"outputReservation,omitempty"`
+}
+
+// CIRepairPolicy is a lane's declared mechanical-CI repair policy (#475,
+// #494). It carries declarations only: the operator resolves them against
+// what it observes on a run's published head, and nothing here is derived
+// from a model or a coordinator.
+type CIRepairPolicy struct {
+	// MechanicalChecks are the exact check names this lane repairs. Names
+	// are matched exactly and case-sensitively, so the policy stays
+	// auditable and can never widen to a check the lane did not name. An
+	// empty list disables the repair loop entirely.
+	// +optional
+	MechanicalChecks []string `json:"mechanicalChecks,omitempty"`
+
+	// MaxAttempts is the repair budget of a single run: how many repair
+	// attempts one run may consume before it hands off. Zero leaves repair
+	// disabled.
+	// +kubebuilder:default=0
+	// +kubebuilder:validation:Minimum=0
+	// +kubebuilder:validation:Maximum=5
+	// +optional
+	MaxAttempts int `json:"maxAttempts,omitempty"`
+
+	// ObservationWindowSeconds bounds how long a run may stay parked waiting
+	// for CI. A run whose park window expires hands off instead of waiting
+	// for a check that may never report.
+	// +kubebuilder:default=1800
+	// +kubebuilder:validation:Minimum=60
+	// +kubebuilder:validation:Maximum=21600
+	// +optional
+	ObservationWindowSeconds int `json:"observationWindowSeconds,omitempty"`
 }
 
 // CapacityCooldown is a durable pause on new work for one execution-capacity

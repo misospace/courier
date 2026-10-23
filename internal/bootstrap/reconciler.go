@@ -214,6 +214,9 @@ func desiredSpec(profile *Profile) courierv1alpha1.LaneProfileSpec {
 		// and a cached Provider must not see desired state mutated.
 		Context:   profile.Context.DeepCopy(),
 		Resources: profile.Resources,
+		// DeepCopy for the same reason: the managed object must never share
+		// provider-owned policy with the cached profile.
+		CIRepair: profile.CIRepair.DeepCopy(),
 	}
 }
 

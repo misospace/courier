@@ -109,3 +109,66 @@ func TestCRDManifestContextSchema(t *testing.T) {
 		t.Fatal("spec.context.roles defaults compactAtPercent; unset must inherit the lane policy")
 	}
 }
+
+// TestLaneProfileCIRepairPolicyDeepCopyIndependence pins that a copied lane
+// owns its repair policy: the check names of a copy must not be shared with
+// the lane it was copied from, or a policy edit would rewrite the checks of
+// the lane a running run is bound to.
+func TestLaneProfileCIRepairPolicyDeepCopyIndependence(t *testing.T) {
+	profile := &LaneProfile{
+		Spec: LaneProfileSpec{
+			CIRepair: &CIRepairPolicy{
+				MechanicalChecks:         []string{"unit", "lint"},
+				MaxAttempts:              2,
+				ObservationWindowSeconds: 900,
+			},
+		},
+	}
+	copied := profile.DeepCopy()
+	copied.Spec.CIRepair.MechanicalChecks[0] = "mutated"
+	copied.Spec.CIRepair.MaxAttempts = 5
+	if profile.Spec.CIRepair.MechanicalChecks[0] != "unit" {
+		t.Fatalf("original mechanical checks mutated through the copy: %v", profile.Spec.CIRepair.MechanicalChecks)
+	}
+	if profile.Spec.CIRepair.MaxAttempts != 2 {
+		t.Fatalf("original max attempts mutated through the copy: %d", profile.Spec.CIRepair.MaxAttempts)
+	}
+}
+
+// TestCRDManifestCIRepairPolicySchema pins the generated LaneProfile CRD to
+// the declared repair-policy bounds: the budget defaults to zero, so a lane
+// that declares the policy without a budget repairs nothing, and the
+// observation window defaults to half an hour within [60, 21600] seconds.
+func TestCRDManifestCIRepairPolicySchema(t *testing.T) {
+	manifest, err := os.ReadFile("../../charts/courier/crd-manifests/courier.misospace.dev_laneprofiles.yaml")
+	if err != nil {
+		t.Fatalf("read CRD manifest: %v", err)
+	}
+	lines := strings.Split(string(manifest), "\n")
+	var block []string
+	inRepair := false
+	indent := ""
+	for _, line := range lines {
+		if !inRepair {
+			if i := strings.Index(line, "ciRepair:"); i >= 0 {
+				inRepair = true
+				indent = line[:i]
+			}
+			continue
+		}
+		// A sibling key at the same indent ends the repair-policy block.
+		if strings.HasPrefix(line, indent) && len(line) > len(indent) && line[len(indent)] != ' ' {
+			break
+		}
+		block = append(block, line)
+	}
+	if !inRepair {
+		t.Fatal("CRD manifest has no spec.ciRepair schema")
+	}
+	text := strings.Join(block, "\n")
+	for _, want := range []string{"mechanicalChecks:", "maxAttempts:", "default: 0", "maximum: 5", "minimum: 0", "observationWindowSeconds:", "default: 1800", "maximum: 21600", "minimum: 60"} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("spec.ciRepair schema missing %q:\n%s", want, text)
+		}
+	}
+}
