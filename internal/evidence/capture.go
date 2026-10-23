@@ -640,7 +640,10 @@ func manifestFits(manifest *Manifest, entries []Entry, omittedByBudget int) (boo
 // with the command's trimmed, capped stderr. A canceled context returns its
 // own error even while a surviving grandchild holds a pipe open, and a command
 // that exited successfully before its pipe was held returns its output rather
-// than an exec.ErrWaitDelay error.
+// than an exec.ErrWaitDelay error. An expired context discards the bytes on
+// every success path: a completed command never survives a dead context, so
+// bytes produced past the deadline are discarded rather than returned, and the
+// keep-the-bytes rule above stands only for a live context.
 func runGit(ctx context.Context, dir string, args ...string) ([]byte, error) {
 	cmd := exec.CommandContext(ctx, "git", args...)
 	cmd.Dir = dir
@@ -655,10 +658,22 @@ func runGit(ctx context.Context, dir string, args ...string) ([]byte, error) {
 	stderr.limit = stderrLimit
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
-	if err := cmd.Run(); err != nil {
-		if ctx.Err() != nil {
-			return nil, ctx.Err()
-		}
+	err := cmd.Run()
+	// The guard that answers cancellation is observed once, after the reap and
+	// ahead of every return below, so the expired context wins all of them:
+	// bytes produced past the deadline are not a result. cmd.Run returns only
+	// after Wait, so the read-versus-deadline race runGitCapped has to guard
+	// against does not exist here; what remains is the policy question #448
+	// answered for the git-side twin — a command that finished before the
+	// deadline but whose caller returned after it does not hand its bytes
+	// back under a dead context. The #421 rule below is a statement about a
+	// live context — a grandchild-held pipe timing out Wait on a child that
+	// already exited successfully is our timeout, not git's, and its bytes
+	// stand — so it applies only once this guard has passed.
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		return nil, ctxErr
+	}
+	if err != nil {
 		// ErrWaitDelay arrives only for a process that exited successfully with
 		// its pipes still open — a surviving grandchild — and ProcessState
 		// confirms that here rather than leaning on os/exec's precedence. git
