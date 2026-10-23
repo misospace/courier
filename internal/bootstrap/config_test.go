@@ -528,8 +528,8 @@ func TestParseAcceptsCIRepairPolicy(t *testing.T) {
 	if policy == nil {
 		t.Fatal("ciRepair = nil, want the declared policy")
 	}
-	if len(policy.MechanicalChecks) != 2 || policy.MechanicalChecks[0] != "build" || policy.MechanicalChecks[1] != "test" {
-		t.Fatalf("mechanicalChecks = %#v, want [build test]", policy.MechanicalChecks)
+	if len(policy.MechanicalChecks) != 2 || policy.MechanicalChecks[0] != "build" || policy.MechanicalChecks[1] != " test " {
+		t.Fatalf("mechanicalChecks = %#v, want [build \" test \"] kept exactly as declared", policy.MechanicalChecks)
 	}
 	if policy.MaxAttempts != 2 {
 		t.Fatalf("maxAttempts = %d, want 2", policy.MaxAttempts)
@@ -575,7 +575,7 @@ func TestParseRejectsOutOfBoundsCIRepairPolicy(t *testing.T) {
 `,
 		"emptyMechanicalCheck": `    ciRepair:
       mechanicalChecks:
-        - "  "
+        - ""
 `,
 	}
 	for name, block := range cases {

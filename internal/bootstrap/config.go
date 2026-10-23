@@ -146,13 +146,16 @@ func normalizeCIRepair(name string, policy *courierv1alpha1.CIRepairPolicy) erro
 	} else if policy.ObservationWindowSeconds < minCIRepairObservationWindowSeconds || policy.ObservationWindowSeconds > maxCIRepairObservationWindowSeconds {
 		return fmt.Errorf("bootstrap profile %q: ciRepair.observationWindowSeconds %d outside [%d,%d]", name, policy.ObservationWindowSeconds, minCIRepairObservationWindowSeconds, maxCIRepairObservationWindowSeconds)
 	}
+	// Names are kept exactly as declared, never trimmed: the controller
+	// matches configured names exactly and case-sensitively, so a padded
+	// declaration must stay its own exact name on a managed lane too,
+	// failing closed instead of silently widening to another check.
 	checks := make([]string, 0, len(policy.MechanicalChecks))
 	for _, check := range policy.MechanicalChecks {
-		trimmed := strings.TrimSpace(check)
-		if trimmed == "" {
+		if check == "" {
 			return fmt.Errorf("bootstrap profile %q: ciRepair.mechanicalChecks must not contain an empty name", name)
 		}
-		checks = append(checks, trimmed)
+		checks = append(checks, check)
 	}
 	policy.MechanicalChecks = checks
 	return nil
