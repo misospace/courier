@@ -90,13 +90,13 @@ type CoordinatorLauncher struct {
 	Pod       executor.PodConfig
 	Executor  executor.Executor
 	// PRHeadResolver resolves the pinned pull request's live identity
-	// through the configured forge capability. The legacy launch path has no
-	// persisted publication policy to project a base from, so a fix-pr run's
-	// coordinator pod is pinned to the pull request's live target ref
-	// resolved here — the launch's own pull-request read, never a
-	// forge-specific CLI. Admission resolved the run's head earlier and
-	// persisted only branch, repository, and commit, so this read is what
-	// the launch pins the base from.
+	// through the configured forge capability. A fix-pr run's coordinator
+	// pod is pinned to the pull request's live target ref resolved here —
+	// the launch's own pull-request read, never a forge-specific CLI. This
+	// launcher runs where secure control is not wired, and secure admission
+	// is the only writer of a persisted publication policy, so the launch
+	// path has no base it could project from persisted state: the launch
+	// reads the request itself and pins the base the request targets now.
 	// Nil means no forge read is possible at all, and a fix-pr run then
 	// fails its launch closed rather than guessing a base.
 	PRHeadResolver ExistingPRHeadResolver
@@ -111,9 +111,9 @@ type CoordinatorLauncher struct {
 // baseUnverifiedReason marks the permanent launch rejection of a fix-pr run
 // whose base could not be verified: the launcher has no pull-request
 // resolver, the resolution failed, or the resolved pull request names no
-// base ref. The class is about the unresolved base, not about a persisted
-// publication policy — the legacy path has none — so it never borrows the
-// PolicyCorrupt class.
+// base ref. The class is about the unresolved base, not about any stored
+// publication policy field's state, so it never borrows the PolicyCorrupt
+// class.
 const baseUnverifiedReason = "BaseUnverified"
 
 // Validate fails fast when the launcher is wired for production without an
@@ -198,17 +198,20 @@ func (l *CoordinatorLauncher) Launch(ctx context.Context, run *courierv1alpha1.C
 	// A fix-pr run's coordinator pod must carry the pinned pull request's
 	// live target ref, never the deployment default: the run repairs a
 	// request that was opened against that base, and a stacked or fork
-	// request names a base the default does not. The legacy path has no
-	// persisted publication policy to project the base from, so the ref is
-	// resolved here through the same identity-checked forge capability
-	// admission uses — never a forge-specific CLI. This read is the launch's
-	// own, not admission's: admission resolved the run's head earlier and
-	// persisted only branch, repository, and commit, so a request retargeted
-	// between admission and launch would reach the coordinator with the base
-	// observed at admission — and the executor's startup guard, which fails
-	// closed on any mismatch, would terminalize a request that merely moved
-	// base instead of following it to the base it targets now. A
-	// resolve-issue run keeps the deployment default.
+	// request names a base the default does not. The ref is resolved here
+	// through the same identity-checked forge capability the controller
+	// wires for admissions — never a forge-specific CLI. This read is the
+	// launch's own, not a projection of persisted state: this launcher
+	// runs where secure control is absent, and secure admission — the only
+	// writer of a persisted publication policy, including its base —
+	// serves the secure launch path, so nothing on this launch path names
+	// the request's base; the controller's head resolution persists only
+	// the run's head branch, repository, and commit. The launch-time read
+	// is deliberate rather than incidental even so: the executor's startup
+	// guard fails closed on any mismatch, so a base observed earlier would
+	// terminalize a request that merely moved base instead of following it
+	// to the base it targets now. A resolve-issue run keeps the
+	// deployment default.
 	if run.Spec.Mode == courierv1alpha1.ModeFixPR {
 		base, err := l.resolveFixPRBase(ctx, run)
 		if err != nil {

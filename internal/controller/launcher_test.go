@@ -640,12 +640,15 @@ func TestCoordinatorLauncherProjectsFixPRBaseRef(t *testing.T) {
 }
 
 // The base a fix-pr pod carries comes from the launch's own read of the pull
-// request, not from an earlier observation of it. Admission resolves the
-// run's head and persists only branch, repository, and commit, so the launch
-// reads the request again and pins the base it targets now: a request
-// retargeted between admission and launch must reach the coordinator with its
-// live base, never with the one observed at admission and never with the
-// deployment default.
+// request, never projected from a persisted publication policy. Secure
+// admission is the only writer of a persisted publication policy, and the
+// secure world it serves launches through secure control, so the launch's own
+// read is the base's source on this path; where a run carries policy state
+// from an earlier secure incarnation anyway, the pod still carries the base
+// the request targets now: the executor's startup guard fails closed on any
+// mismatch, so a request retargeted after the policy's base was recorded must
+// reach the coordinator with its live base, never the recorded one and never
+// the deployment default.
 func TestCoordinatorLauncherPinsBaseFromItsOwnLaunchTimeRead(t *testing.T) {
 	lane := &courierv1alpha1.LaneProfile{
 		ObjectMeta: metav1.ObjectMeta{Name: "local", Namespace: "default"},
@@ -659,13 +662,19 @@ func TestCoordinatorLauncherPinsBaseFromItsOwnLaunchTimeRead(t *testing.T) {
 			Ref:  7,
 			Lane: "local",
 		},
-		// Admission already resolved the run's head and persisted it. It
-		// persists no base, so the launch must read the request itself.
 		Status: courierv1alpha1.CoderRunStatus{
 			Phase:    courierv1alpha1.PhaseClaimed,
 			Branch:   "courier/fix/acme-widgets/7",
 			HeadRepo: "acme/widgets",
 			HeadSHA:  "admission-sha",
+			// The shape a fix-pr run can carry from an earlier secure
+			// incarnation: a persisted publication policy already naming the
+			// base. The launch must not project it; the launch-time read
+			// wins.
+			PublicationPolicy: &courierv1alpha1.PublicationPolicy{
+				BaseRef: "main",
+				BaseOID: "admission-base-oid",
+			},
 		},
 	}
 	fakeClient := fake.NewClientBuilder().
@@ -696,10 +705,10 @@ func TestCoordinatorLauncherPinsBaseFromItsOwnLaunchTimeRead(t *testing.T) {
 		t.Fatalf("get coordinator pod: %v", err)
 	}
 	if base, ok := podEnvironmentByName(t, &pod)["COURIER_BASE"]; !ok || base.Value != "release/2.0" {
-		t.Fatalf("COURIER_BASE = %+v, want the base the launch's own read observed (release/2.0)", base)
+		t.Fatalf("COURIER_BASE = %+v, want the base the launch's own read observed (release/2.0), not the deployment default or the persisted policy's main", base)
 	}
 	if resolutions != 1 {
-		t.Fatalf("pull-request resolutions = %d, want 1; the launch reads the request itself even though admission already resolved the head", resolutions)
+		t.Fatalf("pull-request resolutions = %d, want 1; the launch reads the request itself instead of projecting the persisted policy", resolutions)
 	}
 }
 

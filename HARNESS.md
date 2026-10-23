@@ -559,26 +559,29 @@ request targets the upstream's branch. two invariants follow,
 and legacy path enforces both.
 - **Pod carries the request's base, never the deployment
   default.** legacy launcher reads the pinned pull request through
-  the same identity-checked forge capability admission resolves
-  the run's head through (never a forge-specific CLI) and pins the
+  the same identity-checked forge capability the controller wires
+  for admissions (never a forge-specific CLI) and pins the
   request's live target ref into the coordinator pod as
   `COURIER_BASE`, so workspace preparation synchronizes against
-  the base the request names. the launch's read is its own:
-  admission resolved the run's head earlier and persisted only
-  branch, repository, and commit, so a request retargeted between
-  admission and launch is pinned with the base it targets now.
-  the base observed at admission instead would not repair the
-  request: the executor's startup guard fails closed on any
-  mismatch, so the run would terminalize a request that merely
-  moved base. `resolve-issue` run keeps the deployment default.
-  legacy path has no persisted publication policy to project a
-  base from, so an unverified base has no other answer: missing
-  resolver, failed resolution, or request naming no base ref
-  fails the launch closed with `BaseUnverified` (terminal — a
-  retry cannot change what the request names), never with a
-  substituted default. transient forge read that never completed
-  is the one exception: it proves nothing about the base, so the
-  claim is released and the run retried (#455).
+  the base the request names. the launch's read is its own, never
+  a projection of persisted state: this launcher runs where
+  secure control is absent, and secure admission — the only
+  writer of a persisted publication policy, including its base —
+  serves the secure launch path, so nothing on this path names
+  the request's base (the legacy flow persists only the run's
+  head branch, repository, and commit). even where a run carries
+  policy state from an earlier secure incarnation, the pod still
+  carries the base the request targets now: the executor's
+  startup guard fails closed on any mismatch, so a base observed
+  earlier would terminalize a request that merely moved base.
+  `resolve-issue` run keeps the deployment default. with no
+  persisted base to fall back on, an unverified base has no other
+  answer: missing resolver, failed resolution, or request naming
+  no base ref fails the launch closed with `BaseUnverified`
+  (terminal — a retry cannot change what the request names),
+  never with a substituted default. transient forge read that
+  never completed is the one exception: it proves nothing about
+  the base, so the claim is released and the run retried (#455).
 - **Run re-reads the live base before it prepares anything.**
   executor reads the pinned pull request through the forge
   capability before workspace preparation fetches or merges
