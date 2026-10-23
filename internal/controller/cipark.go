@@ -91,18 +91,36 @@ func (r *CoderRunReconciler) ciRepairPolicy(ctx context.Context, run *courierv1a
 	return policy, nil
 }
 
+// normalizedMechanicalChecks returns the lane's configured mechanical check
+// names, trimmed of surrounding space with empty and duplicate names dropped.
+// Selection and verdicts share this one normalization so the predicate and
+// the coverage rule can never disagree about what the lane configured.
+func normalizedMechanicalChecks(names []string) []string {
+	seen := make(map[string]struct{}, len(names))
+	normalized := make([]string, 0, len(names))
+	for _, name := range names {
+		name = strings.TrimSpace(name)
+		if name == "" {
+			continue
+		}
+		if _, dup := seen[name]; dup {
+			continue
+		}
+		seen[name] = struct{}{}
+		normalized = append(normalized, name)
+	}
+	return normalized
+}
+
 // mechanicalSelector returns the strict trigger separator for the lane's
 // configured mechanical checks. Names match exactly and case-sensitively, so
 // the policy stays auditable and can never widen to a check the lane did not
 // name — an AI-review workflow, a human review, or any other non-mechanical
 // check is simply not selectable.
 func mechanicalSelector(names []string) MechanicalCheckSelector {
-	configured := make(map[string]struct{}, len(names))
-	for _, name := range names {
-		name = strings.TrimSpace(name)
-		if name != "" {
-			configured[name] = struct{}{}
-		}
+	configured := make(map[string]struct{})
+	for _, name := range normalizedMechanicalChecks(names) {
+		configured[name] = struct{}{}
 	}
 	return func(name string) bool {
 		_, ok := configured[name]
@@ -212,29 +230,40 @@ func ciparkCutLog(text string, limit int) string {
 	return text[:cut] + ciparkTruncatedLog
 }
 
-// mechanicalVerdict reports whether every configured mechanical check the
-// observation carries passed, and how many of them there were.
+// mechanicalVerdict reports whether every configured mechanical check is
+// present in the observation and passed, and how many configured checks the
+// observation carried.
 //
-// A run whose configured mechanical checks never registered has no eligible
-// check to grade, and it never claims green: an unobserved check set is not
-// a passing check set. A failed check of any kind — mechanical or not — also
-// keeps the run from claiming green, because a failed AI-review check is
-// still a failed check.
-func mechanicalVerdict(observation PRObservation, selector MechanicalCheckSelector) (green bool, eligible int) {
-	if selector == nil {
+// Green requires coverage, not just the passage of whatever happened to be
+// observed: a configured check that never registered means the observation
+// is partial, and a partial observation is not a passing check set. A run
+// whose configured mechanical checks never registered at all has no eligible
+// check to grade and never claims green for the same reason. A failed check
+// of any kind — mechanical or not — also keeps the run from claiming green,
+// because a failed AI-review check is still a failed check.
+func mechanicalVerdict(observation PRObservation, configuredNames []string) (green bool, eligible int) {
+	configured := normalizedMechanicalChecks(configuredNames)
+	if len(configured) == 0 {
 		return false, 0
 	}
-	passed := 0
+	states := make(map[string]CheckState, len(observation.Checks))
 	for _, check := range observation.Checks {
-		if !selector(check.Name) {
+		if _, seen := states[check.Name]; !seen {
+			states[check.Name] = check.State
+		}
+	}
+	passed := 0
+	for _, name := range configured {
+		state, present := states[name]
+		if !present {
 			continue
 		}
 		eligible++
-		if check.State == CheckStatePassed {
+		if state == CheckStatePassed {
 			passed++
 		}
 	}
-	if eligible == 0 || passed != eligible {
+	if eligible != len(configured) || passed != eligible {
 		return false, eligible
 	}
 	for _, check := range observation.Checks {
@@ -382,7 +411,7 @@ func (r *CoderRunReconciler) observeCIPark(ctx context.Context, run *courierv1al
 	// therefore never settles twice, and a check set that is still
 	// registering never settles green.
 	selector := mechanicalSelector(policy.MechanicalChecks)
-	failedCandidate, greenCandidate := ciparkFingerprints(observation, selector)
+	failedCandidate, greenCandidate := ciparkFingerprints(observation, policy.MechanicalChecks)
 	failureSettled := failedCandidate != "" && run.Status.FailedCheckFingerprint == failedCandidate
 	greenSettled := greenCandidate != "" && run.Status.CheckFingerprint == greenCandidate
 	if run.Status.FailedCheckFingerprint != failedCandidate {
@@ -414,7 +443,7 @@ func (r *CoderRunReconciler) observeCIPark(ctx context.Context, run *courierv1al
 		result, err := r.resumeCIPark(ctx, run, park, policy, observation, selector, failureSettled)
 		return true, result, err
 	default:
-		result, err := r.settleCIPark(ctx, run, park, observation, selector, remaining, failureSettled, greenSettled)
+		result, err := r.settleCIPark(ctx, run, park, observation, policy.MechanicalChecks, remaining, failureSettled, greenSettled)
 		return true, result, err
 	}
 }
@@ -428,8 +457,8 @@ func (r *CoderRunReconciler) observeCIPark(ctx context.Context, run *courierv1al
 // neither failed nor green — a pending check, an unregistered check set —
 // clears it, so a failure that flaps red → pending → red never settles and
 // never wakes a coordinator.
-func ciparkFingerprints(observation PRObservation, selector MechanicalCheckSelector) (failed, green string) {
-	mechanicallyGreen, _ := mechanicalVerdict(observation, selector)
+func ciparkFingerprints(observation PRObservation, configuredNames []string) (failed, green string) {
+	mechanicallyGreen, _ := mechanicalVerdict(observation, configuredNames)
 	switch {
 	case anyCheckFailed(observation):
 		return checkSetFingerprint(observation), ""
@@ -492,12 +521,13 @@ func (r *CoderRunReconciler) ciparkWindowExpired(park *courierv1alpha1.CIParkSta
 
 // settleCIPark ends a parked attempt that may not wake the coordinator.
 //
-// A run whose configured mechanical checks all passed is green and hands the
-// pull request on for review. Every other outcome — a non-mechanical failure,
-// no eligible check at all, an exhausted budget — hands the work off without
+// A run whose configured mechanical checks are all present and passed is
+// green and hands the pull request on for review. Every other outcome — a
+// non-mechanical failure, a configured check that never registered, no
+// eligible check at all, an exhausted budget — hands the work off without
 // waking the model, and says so in the park record.
-func (r *CoderRunReconciler) settleCIPark(ctx context.Context, run *courierv1alpha1.CoderRun, park *courierv1alpha1.CIParkState, observation PRObservation, selector MechanicalCheckSelector, remaining int, failureSettled, greenSettled bool) (ctrl.Result, error) {
-	green, _ := mechanicalVerdict(observation, selector)
+func (r *CoderRunReconciler) settleCIPark(ctx context.Context, run *courierv1alpha1.CoderRun, park *courierv1alpha1.CIParkState, observation PRObservation, configuredNames []string, remaining int, failureSettled, greenSettled bool) (ctrl.Result, error) {
+	green, _ := mechanicalVerdict(observation, configuredNames)
 	if green {
 		return r.settleCIParkGreen(ctx, run, observation, greenSettled)
 	}

@@ -163,10 +163,29 @@ func TestMechanicalVerdict(t *testing.T) {
 			wantGreen:    false,
 			wantEligible: 0,
 		},
+		{
+			name:       "a configured check that never registered is never green even when the observed ones passed",
+			configured: []string{"build", "test"},
+			checks: []CheckObservation{
+				{Name: "build", State: CheckStatePassed},
+			},
+			wantGreen:    false,
+			wantEligible: 1,
+		},
+		{
+			name:       "a case-mismatched registration does not cover the configured check",
+			configured: []string{"build", "Test"},
+			checks: []CheckObservation{
+				{Name: "build", State: CheckStatePassed},
+				{Name: "test", State: CheckStatePassed},
+			},
+			wantGreen:    false,
+			wantEligible: 1,
+		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			green, eligible := mechanicalVerdict(PRObservation{Checks: tc.checks}, mechanicalSelector(tc.configured))
+			green, eligible := mechanicalVerdict(PRObservation{Checks: tc.checks}, tc.configured)
 			if green != tc.wantGreen {
 				t.Fatalf("mechanicalVerdict() green = %v, want %v", green, tc.wantGreen)
 			}

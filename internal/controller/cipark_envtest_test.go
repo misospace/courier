@@ -404,6 +404,42 @@ func TestEnvtestCIParkWithoutEligibleChecksHandsOff(t *testing.T) {
 	}
 }
 
+// TestEnvtestCIParkPartialRegistrationNeverSettlesGreen pins the coverage
+// rule: a lane configuring two mechanical checks whose observation carries
+// only one of them passing is not mechanically green, even observed twice.
+// The run hands off instead of settling onto review with a check that never
+// registered.
+func TestEnvtestCIParkPartialRegistrationNeverSettlesGreen(t *testing.T) {
+	if envtestClient == nil {
+		t.Skip("KUBEBUILDER_ASSETS is not set")
+	}
+	policy := ciparkPolicy(2)
+	policy.MechanicalChecks = []string{"build", "test"}
+	h := newCIParkHarness(t, "cipark-partial-green", policy, &admissionSource{})
+
+	h.publishHead("sha-1")
+	h.world.set(greenObservation("sha-1", "build"))
+	h.toVerifying()
+	h.reconcile()
+	h.reconcile()
+	if got := h.phase(); got != courierv1alpha1.PhaseHandedOff {
+		t.Fatalf("phase after the partial green observation = %q, want HandedOff", got)
+	}
+	final := h.run()
+	if final.Status.CIPark == nil {
+		t.Fatal("status.cipark = nil after the handoff, want the park record")
+	}
+	if final.Status.CIPark.LastOutcome != courierv1alpha1.CIParkOutcomeUnsupported {
+		t.Fatalf("park outcome = %q, want %q", final.Status.CIPark.LastOutcome, courierv1alpha1.CIParkOutcomeUnsupported)
+	}
+	if final.Status.CIPark.Attempts != 0 {
+		t.Fatalf("park attempts = %d, want 0 (a partial check set never repairs)", final.Status.CIPark.Attempts)
+	}
+	if got := h.launchCount(h.name); got != 1 {
+		t.Fatalf("launches = %d, want 1 (a partial check set never wakes the coordinator)", got)
+	}
+}
+
 // TestEnvtestCIParkExhaustedBudgetHandsOff pins the budget boundary: with one
 // repair allowed, the second failure of the same head ends the run instead of
 // waking the coordinator again.
