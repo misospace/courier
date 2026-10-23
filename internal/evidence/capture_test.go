@@ -1220,6 +1220,133 @@ func TestRunGitFailureWithHeldPipe(t *testing.T) {
 	}
 }
 
+// TestRunGitPrefersCancellationOverACompletedSuccess is the #469 regression on
+// the git side, the sibling of the #448 fix in runGitCapped: a command that
+// finished before the deadline but whose caller returned after it handed its
+// bytes back with a nil error, because runGit guarded ctx.Err() only in its
+// error branch. cmd.Run returns only after Wait, so the read-versus-deadline
+// race runGitCapped has to guard against does not exist here; the guard is a
+// policy answer, not a race answer — a completed command never survives a dead
+// context — so the expired context wins and the late bytes are discarded.
+//
+// The double's Done never closes, so os/exec's Start does not reject the call
+// on an already-done context and the alias really runs: the plain success
+// return is the one #469 slips through, and the returned error is what
+// distinguishes the guarded answer (the context's error) from the unfixed one
+// (nil). Restoring capture.go as it stood before #469 fails this test: the
+// unfixed code answers with a nil error and the bytes it kept.
+func TestRunGitPrefersCancellationOverACompletedSuccess(t *testing.T) {
+	t.Parallel()
+
+	dir := newRepo(t)
+	// The alias writes to stdout and exits 0 straight away, so the command
+	// completes with real output, no held pipe, and no git failure to report:
+	// the plain success path is the one #469 slips through.
+	git(t, dir, "config", "alias.quickok", "!sh -c 'echo LATE-BYTES'")
+
+	ctx := &expiredContext{done: make(chan struct{})}
+	type result struct {
+		out []byte
+		err error
+	}
+	done := make(chan result, 1)
+	go func() {
+		out, err := runGit(ctx, dir, "quickok")
+		done <- result{out, err}
+	}()
+
+	var got result
+	select {
+	case got = <-done:
+	case <-time.After(20 * time.Second):
+		t.Fatal("runGit did not return within 20s of a command that completed under an expired context")
+	}
+	if !errors.Is(got.err, context.DeadlineExceeded) {
+		t.Fatalf("err = %v, want context.DeadlineExceeded: a command that returned past the deadline is not a result", got.err)
+	}
+	if got.out != nil {
+		t.Errorf("out = %q, want nil: bytes produced under an expired context are discarded", got.out)
+	}
+}
+
+// TestRunGitExpiredContextBeatsTheErrWaitDelayKeepBytesRule holds the guard
+// as wide as #421's keep-the-bytes branch, which is the one success return a
+// narrower guard would miss: a surviving grandchild holding only the stderr
+// write end makes Wait return exec.ErrWaitDelay with a successful
+// ProcessState, and that branch returns the bytes as a clean success. That
+// branch answered on the context itself before #469 — the error branch above
+// it observed ctx.Err() first — so this test does not pin a pre-#469 defect
+// and passes against the old code; it fails a fix that narrows the guard to
+// the final `return stdout.Bytes(), nil` and drops the error branch's own
+// context check, which leaves the rule below reachable with late bytes. #421
+// remains a claim about a live context — the bytes stand because the timeout
+// was ours rather than git's — so an expired context takes it away, and
+// TestRunGitSurvivingPipeOnSuccess is the live-context half and must keep
+// passing: #421 is narrowed here, not reversed.
+func TestRunGitExpiredContextBeatsTheErrWaitDelayKeepBytesRule(t *testing.T) {
+	t.Parallel()
+
+	dir := newRepo(t)
+	// The alias writes to stdout and exits 0 while sleep keeps only the stderr
+	// write end open — the held-stderr shape of TestRunGitSurvivingPipeOnSuccess,
+	// plus stdout bytes to lose — so the 2s WaitDelay elapses and Wait reports
+	// ErrWaitDelay behind a successful exit.
+	git(t, dir, "config", "alias.holderr", "!sh -c 'echo LATE-BYTES; sleep 30 >&2 &'")
+
+	ctx := &expiredContext{done: make(chan struct{})}
+	type result struct {
+		out []byte
+		err error
+	}
+	done := make(chan result, 1)
+	go func() {
+		out, err := runGit(ctx, dir, "holderr")
+		done <- result{out, err}
+	}()
+
+	var got result
+	select {
+	case got = <-done:
+	case <-time.After(20 * time.Second):
+		t.Fatal("runGit did not return within 20s while a grandchild held the stderr pipe")
+	}
+	if !errors.Is(got.err, context.DeadlineExceeded) {
+		t.Fatalf("err = %v, want context.DeadlineExceeded: #421's keep-the-bytes rule stands only for a live context (out = %q)", got.err, got.out)
+	}
+	if got.out != nil {
+		t.Errorf("out = %q, want nil: #421's keep-the-bytes rule stands only for a live context", got.out)
+	}
+}
+
+// TestLocalCommitEntriesFailsLoudlyOnADeadContext pins the call-site
+// consequence of #469's guard: refResolvable maps every error, the context's
+// included, to "not resolvable", so a deadline that has already passed when
+// the commit phase starts would leave that phase reporting an empty commit
+// list and the capture delivering a manifest that reports the run's commits
+// as absent while looking like a success. The design asks for the manifest
+// alone over the deadline, which means the commit phase has to fail loudly
+// rather than answer "no commits here".
+func TestLocalCommitEntriesFailsLoudlyOnADeadContext(t *testing.T) {
+	t.Parallel()
+
+	dir := newRepo(t)
+	ctx := &expiredContext{done: make(chan struct{})}
+	opts := captureOptions(dir, nil)
+	var (
+		items    []tarItem
+		totals   Totals
+		stored   int
+		runningB int64
+	)
+	commits, err := localCommitEntries(ctx, dir, opts, NewScanner(), &items, &totals, &stored, &runningB)
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("err = %v, want context.DeadlineExceeded: a dead context at the commit phase is not an unresolvable ref", err)
+	}
+	if commits != nil {
+		t.Errorf("commits = %v, want nil", commits)
+	}
+}
+
 // TestRunGitCappedCanceledWithHeldPipe covers the stall where a grandchild
 // outlives git holding the stdout pipe open with no output: the cap bounds
 // bytes, not blocking, so the read must end with the context instead of parking
@@ -1355,7 +1482,7 @@ func TestRunGitCappedFailureWithHeldPipe(t *testing.T) {
 }
 
 // expiredContext stands in for a context that was already past its deadline by
-// the time runGitCapped reached its post-reap guard: Err answers
+// the time runGitCapped or runGit reached its post-reap guard: Err answers
 // context.DeadlineExceeded from every observation, the first included, because
 // #448 is about a context that expired while the git read was in flight — a
 // read that completed under a dead context, not a call made under one.
@@ -1364,7 +1491,8 @@ func TestRunGitCappedFailureWithHeldPipe(t *testing.T) {
 // Err before the guard — the select receives on Done, and Start reads Err only
 // when Done is already closed — so the guard would be that double's FIRST
 // observation, its nil, and the guard would pass: these tests would fail
-// against the fixed runGitCapped rather than pin it.
+// against the fixed runGitCapped rather than pin it. runGit observes Err only
+// in its guard for the same reason, so the same double pins #469.
 //
 // Done is supplied by the test and stays open for the whole call, because
 // closing it decides nothing worth pinning: os/exec's Start fails the entire
@@ -1374,7 +1502,9 @@ func TestRunGitCappedFailureWithHeldPipe(t *testing.T) {
 // runGitCapped as readily as a fixed one. With Done never ready the read
 // branch is the only one the select can take, so the select is deterministic
 // and the guard after the reap is the only thing that can decide either test
-// below.
+// below. runGit has no select to force: cmd.Run returns only after Wait, so
+// the command runs to completion and the guard after the reap is the only
+// thing that can decide its tests too.
 type expiredContext struct {
 	done <-chan struct{}
 }
