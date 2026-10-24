@@ -26,6 +26,13 @@ const tapLastTextLimit = 200
 // session error events (#327): only runtime-authored structured error
 // events can prove exhaustion, never model prose.
 type sessionTap struct {
+	// tel is write-once: it is published without mu before the first
+	// attempt and never reassigned, so no reader exists to race the
+	// unlocked write. scan reads it with mu held by its caller (consume
+	// and Flush), but the publish side never takes mu, so reassigning tel
+	// once an attempt runs would race that read. It sits deliberately
+	// outside the guarded fields below.
+	tel *telemetry.Tracker
 	// mu guards every mutable field below: after WaitDelay fires, os/exec
 	// returns from Run while the previous attempt's stdout copy goroutine
 	// can still be mid-Write, so scan must never race the next attempt's
@@ -35,7 +42,6 @@ type sessionTap struct {
 	pending   []byte
 	sessionID string
 	lastText  string
-	tel       *telemetry.Tracker
 	signals   exhaustionSignals
 	// kill stops the currently running attempt's process group; only bytes
 	// from that same generation may invoke it.
