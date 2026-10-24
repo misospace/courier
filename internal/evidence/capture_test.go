@@ -1000,9 +1000,12 @@ func TestCaptureFifoSwapRace(t *testing.T) {
 // that is non-regular at the Lstat classification itself — no seam, no swap
 // race — is classified omitted-binary the same way a path swapped after
 // classification is. A committed regular file replaced by a fifo in the
-// worktree still lists in porcelain (as " M", the only listed form: an
-// untracked fifo is not listed at all), so the !info.Mode().IsRegular branch
-// has been reached without replacing readFileForCapture.
+// worktree still lists in porcelain, as " M" — not the typechange " T" that
+// a symlink swap produces: git normalizes every non-symlink worktree type to
+// a regular-file mode, so the swap is invisible to the mode comparison and
+// only the failing content hash marks the path. An untracked fifo, by
+// contrast, is not listed at all. The listed entry reaches the
+// !info.Mode().IsRegular branch without replacing readFileForCapture.
 func TestCaptureNonRegularAtClassification(t *testing.T) {
 	t.Parallel()
 	dir := newRepo(t)
