@@ -124,21 +124,6 @@ func revListCount(ctx context.Context, dir, span string) (int, error) {
 	return count, nil
 }
 
-// revParse resolves one rev to its full object name.
-func revParse(ctx context.Context, dir, rev string) (string, error) {
-	cmd := exec.CommandContext(ctx, "git", "-C", dir, "rev-parse", rev)
-	// Same WaitDelay bound as every spawned git call: a remote helper or
-	// askpass grandchild holding the pipe must not outlive the context.
-	cmd.WaitDelay = 2 * time.Second
-	var stdout, stderr bytes.Buffer
-	cmd.Stdout = &stdout
-	cmd.Stderr = &stderr
-	if err := childReaper().run(cmd); err != nil {
-		return "", err
-	}
-	return strings.TrimSpace(stdout.String()), nil
-}
-
 // captureGate is the single place deciding whether a capture is warranted at
 // a moment. A clean, remote-held worktree never captures: only unrecoverable
 // state — uncommitted edits, local commits the remote run branch does not
