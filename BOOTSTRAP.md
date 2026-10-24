@@ -295,16 +295,35 @@ helm dependency build charts/courier
 helm install courier charts/courier --namespace courier-system --create-namespace
 ```
 
-Applying the LaneProfile directly works once the CRD is established; the
-GitOps-safe path is the manager's bootstrap config file
-(`--bootstrap-lane-profiles-file`, with profiles labeled
-`courier.misospace.dev/bootstrap-managed`), which the manager creates and
-updates itself after install. Chart plumbing for the file lands with
-follow-up work (#74). A bad config file at startup prevents the manager from
-starting; a bad edit afterwards is logged and retried on the next pass. The
-config's `resources` carries requests and limits only — the same narrowed
-vocabulary as the LaneProfile CRD — so a `claims` key is rejected at parse
-time rather than silently ignored (#403).
+Applying the LaneProfile directly works once the CRD is established. The
+GitOps-safe paths never put a `LaneProfile` in the same render/apply set as
+the release, where the CRD may not be established yet. The chart carries the
+lanes natively: set `laneProfiles` in the chart values and the manager creates
+and updates those LaneProfiles itself after install, labeled
+`courier.misospace.dev/bootstrap-managed`; a values change updates the
+manager's config ConfigMap and its pod-template checksum, so a normal
+`helm upgrade` rolls the manager. Non-chart installs hand the manager the
+same config as a plain file (`--bootstrap-lane-profiles-file`). A bad config
+at startup prevents the manager from starting; a bad edit afterwards is
+logged and retried on the next pass. The config's `resources` carries
+requests and limits only — the same narrowed vocabulary as the LaneProfile
+CRD — so a `claims` key is rejected at parse time rather than silently
+ignored (#403).
+
+```yaml
+# charts/courier values
+laneProfiles:
+  bootstrap:
+    concurrency: 1
+    runtimeImage: ghcr.io/misospace/courier-go:0.1.0
+    roles:
+      coordinator: litellm/your-model
+    framing: |
+      keep parallelism modest and leave the pull request ready for review
+```
+
+A separately managed lane is instead applied directly, beside — never inside —
+the release:
 
 ```yaml
 apiVersion: courier.misospace.dev/v1alpha1

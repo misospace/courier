@@ -225,6 +225,49 @@
   "globalMounts" (list (dict "path" "/etc/courier" "readOnly" true))) }}
 {{- $_ := set .Values "persistence" $persistence }}
 {{- end }}
+{{- /* Bootstrap laneProfiles serialize into a chart ConfigMap mounted into
+  the manager and passed through the source-neutral
+  --bootstrap-lane-profiles-file seam. The library's built-in configMaps
+  checksum annotates the pod template, so a values change rolls the manager
+  on a normal upgrade. Helm never renders LaneProfile resources, so the
+  CRD-ordering race stays structurally closed. */}}
+{{- $laneProfiles := .Values.laneProfiles | default (dict) }}
+{{- if $laneProfiles }}
+{{- $hasBootstrapLaneFile := false }}
+{{- range $arg := $args }}
+{{- if or (eq $arg "--bootstrap-lane-profiles-file") (hasPrefix "--bootstrap-lane-profiles-file=" $arg) }}{{- $hasBootstrapLaneFile = true }}{{- end }}
+{{- end }}
+{{- if not $hasBootstrapLaneFile }}
+{{- $profiles := list }}
+{{- range $name, $spec := $laneProfiles }}
+{{- if not (kindIs "map" $spec) }}
+{{- fail (printf "laneProfiles entry %q must be a mapping of lane spec fields" $name) }}
+{{- end }}
+{{- if or (not (regexMatch "^[a-z0-9]([-a-z0-9]*[a-z0-9])?$" $name)) (gt (len $name) 63) }}
+{{- fail (printf "laneProfiles name %q must be a valid DNS-1123 label (lowercase alphanumeric or '-', at most 63 characters, starting and ending with an alphanumeric)" $name) }}
+{{- end }}
+{{- if not (index $spec "roles") }}
+{{- fail (printf "laneProfiles entry %q requires at least one entry under roles" $name) }}
+{{- end }}
+{{- $entry := deepCopy $spec }}
+{{- $_ := set $entry "name" $name }}
+{{- $profiles = append $profiles $entry }}
+{{- end }}
+{{- $laneConfig := toYaml (dict "profiles" $profiles) }}
+{{- $configMaps := deepCopy (.Values.configMaps | default dict) }}
+{{- $_ := set $configMaps "bootstrap-lane-profiles" (dict
+  "suffix" "bootstrap-lane-profiles"
+  "data" (dict "profiles.yaml" $laneConfig)) }}
+{{- $_ := set .Values "configMaps" $configMaps }}
+{{- $persistence := deepCopy (.Values.persistence | default dict) }}
+{{- $_ := set $persistence "bootstrap-lane-profiles" (dict
+  "type" "configMap"
+  "identifier" "bootstrap-lane-profiles"
+  "globalMounts" (list (dict "path" "/etc/courier/lane-profiles" "readOnly" true))) }}
+{{- $_ := set .Values "persistence" $persistence }}
+{{- $args = append $args "--bootstrap-lane-profiles-file=/etc/courier/lane-profiles/profiles.yaml" }}
+{{- end }}
+{{- end }}
 {{- $evidence := .Values.evidence }}
 {{- if $evidence.enabled }}
 {{- if not $evidence.keySecret }}
