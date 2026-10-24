@@ -684,7 +684,7 @@ criterion's pinned digest, one status from a closed vocabulary, and a
 bounded (≤400-byte) reference, separated from the status by ` - ` (or
 ` — `).
 
-That grammar is **not restated here**: `internal/broker/grammar` derives
+That grammar is **not independently specified here**: `internal/broker/grammar` derives
 it from the validator's own patterns and owns it — the validator matches
 the derived patterns, and the `criteria-repair` continuation and the
 resolve-issue goal render the templates and the two sentences from there
