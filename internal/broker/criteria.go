@@ -128,7 +128,7 @@ const (
 
 // Evidence-block grammar. The header is one line:
 //
-//	courier-criteria:v1 source=<owner/name>#<n> set=sha256:<64hex> coverage=<full|partial>
+//	courier-criteria:v1 source=<owner/name>#<n> set=sha256:<64hex> coverage=full|partial
 //
 // followed by one row per pinned criterion:
 //
