@@ -1,9 +1,11 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
+	"os/exec"
 	"strings"
 	"time"
 
@@ -235,4 +237,19 @@ func capacityWorkspaceSafety(ctx context.Context, workspace *git.Workspace, remo
 		}
 		return &courierv1alpha1.WorkspaceSafetyEvidence{State: "pushed", Branch: current, Head: head, RemoteHead: remoteHead}
 	}
+}
+
+// revParse resolves one rev to its full object name.
+func revParse(ctx context.Context, dir, rev string) (string, error) {
+	cmd := exec.CommandContext(ctx, "git", "-C", dir, "rev-parse", rev)
+	// Same WaitDelay bound as every spawned git call: a remote helper or
+	// askpass grandchild holding the pipe must not outlive the context.
+	cmd.WaitDelay = 2 * time.Second
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+	if err := childReaper().run(cmd); err != nil {
+		return "", err
+	}
+	return strings.TrimSpace(stdout.String()), nil
 }

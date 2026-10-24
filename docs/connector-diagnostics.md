@@ -123,7 +123,7 @@ cannot advertise a capability Courier has no seam for.
 
 | Capability | Courier seam | Signals it may emit | Owner of values |
 | --- | --- | --- | --- |
-| `ci-park-lifecycle` | `source.CIParkLifecycle` | `identity` (generation-advanced), `protocol-error` | connector |
+| `ci-park-lifecycle` | `source.CIParkLifecycle` | `identity` (generation-advanced, fence-held, fence-gone, opportunity-missing, head-superseded, fence-settled), `revalidation` (closed-unmerged/merged on reserve refusal), `protocol-error` | connector |
 | `discovery` | `source.Adapter.Discover` | `discovery` (attempts/success/failure), `protocol-error` | connector |
 | `discovery-exclusions` | `source.DiscoveryExcluder` | `exclusion` (requested/accepted/overflow), `ack` (ok/missing/invalid/version-unsupported) | connector |
 | `lifecycle-report` | `source.Reporter` | `report` (published/superseded/unsupported/retryable), `protocol-error` | connector |
@@ -243,6 +243,11 @@ semantics, and the connector reports a bounded reason beneath them:
 | `stale-head` | `ErrStaleWork` | the observed head no longer matches the attempt's start head |
 | `closed-unmerged` | `ErrStaleWork` | the linked PR closed without merging |
 | `claim-released` | `ErrStaleWork` | a compare-and-set claim was released before launch |
+| `fence-held` | `ErrSuperseded` | a coded 409 refusal: a competing reservation held the fence |
+| `fence-gone` | `ErrSuperseded` | a coded 409 refusal: the fence is no longer recorded |
+| `opportunity-missing` | `ErrStaleWork` | a coded 409 refusal: no active repair opportunity for the head |
+| `head-superseded` | `ErrStaleWork` | a coded 409 refusal: the head was superseded |
+| `fence-settled` | `ErrStaleWork` | a coded 409 refusal: the repair opportunity already settled |
 
 A superseded or stale identity is a **normal, expected** outcome, not an error;
 it is counted so an operator can tell churn from failure, and the two sentinels
@@ -393,7 +398,7 @@ set and supplies Dispatch-specific values:
 
 | Capability | State | Connector-owned values |
 | --- | --- | --- |
-| `ci-park-lifecycle` | supported | generation-fenced deferral via `CIParkLifecycle`; refusal vocabulary pinned by internal/source/dispatch/cipark_test.go |
+| `ci-park-lifecycle` | supported | generation-fenced deferral via `CIParkLifecycle`; coded 409 refusal vocabulary (fence-held, fence-gone, opportunity-missing, head-superseded, fence-settled) counted once under `identity` with the code as reason, pinned by internal/source/dispatch/cipark_test.go; reserve-side closed/merged refusals count `revalidation` (closed-unmerged/merged); unknown codes stay `protocol-error`/`http-4xx` |
 | `discovery` | supported | task types `implement`/`followup-pr`; idle vs task |
 | `discovery-exclusions` | supported (opt-in) | `exclude_pr_fix_version=1`; descriptor `<repo>#<number>@<generation>`; limit **32**; max value length 300 |
 | `lifecycle-report` | supported | outcomes `ready`/`blocked`/`blocked-external`/`failed`/`handed-off`; `waiting-external` |

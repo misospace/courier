@@ -542,7 +542,10 @@ func ciParkRefused(t *testing.T, status int, body string) func(*diagnosticsFixtu
 }
 
 // TestDispatchCIParkCodedRefusals pins the coded {"reason": "<code>"} 409
-// refusal vocabulary and the refusal census other statuses keep out of it.
+// refusal vocabulary and its census: a recognizable code counts one
+// identity diagnostic under the code itself, while other statuses — and
+// unrecognized codes — keep only the protocol-error class the exchange
+// would carry.
 func TestDispatchCIParkCodedRefusals(t *testing.T) {
 	calls := []struct {
 		endpoint string
@@ -578,19 +581,16 @@ func TestDispatchCIParkCodedRefusals(t *testing.T) {
 					if !errors.Is(err, tc.want) {
 						t.Fatalf("reason %q err = %v, want %v", tc.reason, err, tc.want)
 					}
-					// The refusal reclassifies into a source outcome, so only
-					// one protocol-error class counted (once) and it carries
-					// no identity signal.
-					for _, series := range gatheredConnectorSeries(t, f.reg) {
-						if series["signal"] == connector.SignalIdentity && series["connector"] == defaultConnectorName {
-							t.Errorf("coded refusal %q fabricated identity series %v", tc.reason, series)
-						}
+					// The census: the coded refusal reclassifies into a source
+					// outcome and the census reason is the refusal code
+					// itself, counted once under identity; the absorbed
+					// deferred exchange is never also counted as a
+					// protocol-error class.
+					if got := diagnosticsCounter(t, f, connector.SignalIdentity, tc.reason); got != 1 {
+						t.Fatalf("reason %q identity/%s counter = %v, want exactly 1", tc.reason, tc.reason, got)
 					}
-					if got := diagnosticsCounter(t, f, connector.SignalProtocolError, reasonHTTP4xx); got != 1 {
-						t.Fatalf("reason %q protocol-error/http-4xx counter = %v, want exactly 1", tc.reason, got)
-					}
-					if total := totalProtocolErrors(t, f); total != 1 {
-						t.Fatalf("reason %q counted %v protocol-error diagnostics, want exactly 1", tc.reason, total)
+					if total := totalProtocolErrors(t, f); total != 0 {
+						t.Fatalf("reason %q reclassified refusal counted %v protocol-error diagnostics, want 0 (absorbed)", tc.reason, total)
 					}
 				}
 			})
@@ -614,9 +614,11 @@ func TestDispatchCIParkCodedRefusals(t *testing.T) {
 					if !errors.As(err, &apiErr) || apiErr.StatusCode != tc.status {
 						t.Fatalf("%s err = %v, want an APIError with status %d", tc.name, err, tc.status)
 					}
-					// The census: an exchange the park family cannot reclassify
-					// counts exactly one protocol error under its HTTP class
-					// and never fabricates an identity signal.
+					// The census: an exchange the park family cannot
+					// reclassify counts exactly one protocol error under its
+					// HTTP class and never fabricates an identity signal —
+					// none of the coded refusal's identity census reasons
+					// gains a count either.
 					wantReason := reasonHTTP4xx
 					if tc.status >= http.StatusInternalServerError {
 						wantReason = reasonHTTP5xx
@@ -626,6 +628,14 @@ func TestDispatchCIParkCodedRefusals(t *testing.T) {
 					}
 					if total := totalProtocolErrors(t, f); total != 1 {
 						t.Errorf("%s: total protocol-error diagnostics = %v, want exactly 1", tc.name, total)
+					}
+					for _, reason := range []string{
+						reasonIdentityFenceHeld, reasonIdentityFenceGone, reasonIdentityOpportunityMissing,
+						reasonIdentityHeadSuperseded, reasonIdentityFenceSettled,
+					} {
+						if got := diagnosticsCounter(t, f, connector.SignalIdentity, reason); got != -1 {
+							t.Errorf("%s: fabricated identity/%s count = %v, want none", tc.name, reason, got)
+						}
 					}
 				}
 			})
@@ -939,9 +949,10 @@ func TestDispatchCIParkCoordination(t *testing.T) {
 
 // TestDispatchCIParkDiagnostics pins the exact-once diagnostic accounting of
 // the lifecycle endpoints (§3): a generation fence counts identity exactly
-// once and never as a protocol error, a coded refusal counts its protocol
-// error class exactly once and carries no identity signal, a server failure
-// counts http-5xx once, and the capability catalogue declares the new seam.
+// once and never as a protocol error, a coded refusal counts its identity
+// census class — the refusal code itself — exactly once and never a
+// protocol error, a server failure counts http-5xx once, and the
+// capability catalogue declares the new seam.
 func TestDispatchCIParkDiagnostics(t *testing.T) {
 	t.Run("capability-catalogue", func(t *testing.T) {
 		f := newDiagnosticsFixture(t, nil, ciParkRefused(t, http.StatusInternalServerError, "boom"))
@@ -979,16 +990,16 @@ func TestDispatchCIParkDiagnostics(t *testing.T) {
 			}
 		}
 	})
-	t.Run("coded-refusal-counts-protocol-error-once", func(t *testing.T) {
+	t.Run("coded-refusal-counts-identity-once", func(t *testing.T) {
 		f := newDiagnosticsFixture(t, openChecker(), ciParkRefused(t, http.StatusConflict, `{"reason":"fence-held"}`))
 		if _, err := f.adapter.ReserveCIRepair(context.Background(), ciparkWorkItem(), source.CIRepairReservation{FenceToken: "fence", IdempotencyKey: "k", PR: "77", Head: ciparkHead1}); !errors.Is(err, source.ErrSuperseded) {
 			t.Fatalf("err = %v, want ErrSuperseded", err)
 		}
-		if got := diagnosticsCounter(t, f, connector.SignalProtocolError, reasonHTTP4xx); got != 1 {
-			t.Fatalf("protocol-error/http-4xx counter = %v, want exactly 1", got)
+		if got := diagnosticsCounter(t, f, connector.SignalIdentity, reasonIdentityFenceHeld); got != 1 {
+			t.Fatalf("identity/%s counter = %v, want exactly 1", reasonIdentityFenceHeld, got)
 		}
-		if total := totalProtocolErrors(t, f); total != 1 {
-			t.Fatalf("total protocol-error diagnostics = %v, want exactly 1", total)
+		if total := totalProtocolErrors(t, f); total != 0 {
+			t.Fatalf("total protocol-error diagnostics = %v, want 0 (the census counts the identity class, not the exchange)", total)
 		}
 	})
 	t.Run("server-error-counts-http-5xx-once", func(t *testing.T) {
@@ -1007,7 +1018,7 @@ func TestDispatchCIParkDiagnostics(t *testing.T) {
 	t.Run("coded-refusal-embedding-mismatch-literal-maps-once", func(t *testing.T) {
 		// A coded body that embeds the generation mismatch literal in other
 		// fields is classified by its reason code alone: exactly one
-		// sentinel, exactly one counted diagnostic.
+		// sentinel, exactly one counted identity census diagnostic.
 		f := newDiagnosticsFixture(t, openChecker(), ciParkRefused(t, http.StatusConflict, `{"reason":"head-superseded","detail":"generation mismatch: expected 4"}`))
 		_, err := f.adapter.ReserveCIRepair(context.Background(), ciparkWorkItem(), source.CIRepairReservation{FenceToken: "fence", IdempotencyKey: "k", PR: "77", Head: ciparkHead1})
 		if !errors.Is(err, source.ErrStaleWork) {
@@ -1016,11 +1027,68 @@ func TestDispatchCIParkDiagnostics(t *testing.T) {
 		if errors.Is(err, source.ErrSuperseded) {
 			t.Fatal("err also satisfies ErrSuperseded; the reason code must own the classification")
 		}
-		if got := diagnosticsCounter(t, f, connector.SignalProtocolError, reasonHTTP4xx); got != 1 {
-			t.Fatalf("protocol-error/http-4xx counter = %v, want exactly 1", got)
+		if got := diagnosticsCounter(t, f, connector.SignalIdentity, reasonIdentityHeadSuperseded); got != 1 {
+			t.Fatalf("identity/%s counter = %v, want exactly 1", reasonIdentityHeadSuperseded, got)
 		}
-		if total := totalProtocolErrors(t, f); total != 1 {
-			t.Fatalf("total protocol-error diagnostics = %v, want exactly 1 (no double count)", total)
+		if total := totalProtocolErrors(t, f); total != 0 {
+			t.Fatalf("total protocol-error diagnostics = %v, want 0 (the code's census absorbs the exchange)", total)
 		}
 	})
+}
+
+// ciParkPRStateChecker pins one fixed pull request state for a reserve test's
+// revalidation read; the checker read is a local function, not a counted
+// exchange.
+func ciParkPRStateChecker(t *testing.T, state PullRequestState) func(*HTTPClient) {
+	t.Helper()
+	return func(c *HTTPClient) {
+		c.WithPullRequestStateChecker(PullRequestStateCheckerFunc(func(_ context.Context, repo string, number int) (PullRequestState, error) {
+			if repo != "acme/widgets" || number != 77 {
+				t.Errorf("pull request check = %s#%d, want acme/widgets#77", repo, number)
+			}
+			return state, nil
+		}))
+	}
+}
+
+// TestDispatchCIReserveClosedPullRequestCensus pins the reserve-side
+// revalidation census (§3.4): a reservation against a closed or merged pull
+// request is refused before any POST and counts revalidation under the
+// actual staleness cause exactly like PreLaunch does; no exchange is
+// involved, so no protocol-error or identity census is fabricated.
+func TestDispatchCIReserveClosedPullRequestCensus(t *testing.T) {
+	cases := []struct {
+		name       string
+		state      PullRequestState
+		wantReason string
+	}{
+		{"closed-pr", PullRequestState{State: "closed"}, reasonRevalidationClosedUnmerged},
+		{"merged-pr", PullRequestState{State: "", Merged: true}, reasonRevalidationMerged},
+		// Merged wins over a closed spelling, the same priority PreLaunch
+		// uses for the identical condition.
+		{"closed-and-merged-pr", PullRequestState{State: "closed", Merged: true}, reasonRevalidationMerged},
+	}
+	for _, tc := range cases {
+		f := newDiagnosticsFixture(t, ciParkPRStateChecker(t, tc.state), func(_ *diagnosticsFixture, _ http.ResponseWriter, r *http.Request) {
+			t.Errorf("unexpected request %s %s: the reserve refusal precedes the POST", r.Method, r.URL.Path)
+		})
+		_, err := f.adapter.ReserveCIRepair(context.Background(), ciparkWorkItem(), source.CIRepairReservation{FenceToken: "fence", IdempotencyKey: "k", PR: "77", Head: ciparkHead1})
+		if !errors.Is(err, source.ErrStaleWork) {
+			t.Fatalf("%s: err = %v, want ErrStaleWork", tc.name, err)
+		}
+		if got := diagnosticsCounter(t, f, connector.SignalRevalidation, tc.wantReason); got != 1 {
+			t.Fatalf("%s: revalidation/%s counter = %v, want exactly 1", tc.name, tc.wantReason, got)
+		}
+		for _, reason := range []string{
+			reasonIdentityFenceHeld, reasonIdentityFenceGone, reasonIdentityOpportunityMissing,
+			reasonIdentityHeadSuperseded, reasonIdentityFenceSettled,
+		} {
+			if got := diagnosticsCounter(t, f, connector.SignalIdentity, reason); got != -1 {
+				t.Errorf("%s: fabricated identity/%s count = %v, want none", tc.name, reason, got)
+			}
+		}
+		if total := totalProtocolErrors(t, f); total != 0 {
+			t.Errorf("%s: counted %v protocol-error diagnostics, want 0 (a refused checker read is no exchange)", tc.name, total)
+		}
+	}
 }
