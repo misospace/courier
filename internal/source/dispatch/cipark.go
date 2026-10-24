@@ -10,6 +10,7 @@ import (
 	"regexp"
 	"strings"
 
+	"github.com/misospace/courier/internal/connector"
 	"github.com/misospace/courier/internal/source"
 )
 
@@ -235,6 +236,14 @@ func (c *HTTPClient) ReserveCIRepair(ctx context.Context, id string, reservation
 		return source.CIRepairGrant{}, err
 	}
 	if state.Merged || strings.EqualFold(state.State, "closed") {
+		// The refusal is a checker read, not a counted exchange, but it is
+		// the same revalidation census PreLaunch emits for a closed or
+		// merged pull request, named with the actual staleness cause.
+		reason := reasonRevalidationClosedUnmerged
+		if state.Merged {
+			reason = reasonRevalidationMerged
+		}
+		c.diagnostics.Diagnostic(c.connectorName, connector.SignalRevalidation, reason)
 		return source.CIRepairGrant{}, fmt.Errorf("%w: upstream pull request %s#%d is no longer open", source.ErrStaleWork, d.Repo, d.Number)
 	}
 	var response struct {
@@ -306,14 +315,18 @@ func (c *HTTPClient) SettleCIRepair(ctx context.Context, id string, outcome sour
 //	opportunity-missing / head-superseded / fence-settled — no active
 //	  deferral for this head, or the work already settled → source.ErrStaleWork
 //
-// A coded refusal — even when its body happens to embed the generation
-// mismatch literal — is classified by its reason code alone, so one refusal
-// maps to exactly one sentinel; the exchange was deferred past the do()
-// choke point (exchangeReclassified) and this site counts it once
-// (countPendingExchange). Bodies without a coded reason are left to the
-// caller's asSuperseded sniff: the generation-mismatch literal
-// ("generation mismatch: expected N") still classifies as identity under
-// the mark family's semantics.
+// A coded refusal is classified by its reason code alone, and that same
+// reason is the refusal's census: this site counts identity/<code> once
+// (§3.4), so an operator tells competing fences from failures. Under the
+// exchange-reclassified contract the exchange was deferred past the do()
+// choke point (exchangeReclassified) and this site owns it: the census
+// counts here and the exchange is absorbed, so it is never also counted a
+// second time as protocol-error/http-4xx. Bodies without a recognized code
+// stay outside the identity census: an unrecognized code keeps a deferred
+// exchange counted once as protocol-error/http-4xx and returns it
+// unchanged, and code-less bodies are left to the caller's asSuperseded
+// sniff — the generation-mismatch literal ("generation mismatch: expected
+// N") still classifies as identity under the mark family's semantics.
 func (c *HTTPClient) classifyCIRefusal(err error) error {
 	if err == nil {
 		return nil
@@ -322,15 +335,37 @@ func (c *HTTPClient) classifyCIRefusal(err error) error {
 	if !ok {
 		return err
 	}
-	c.countPendingExchange(err)
+	// One switch names a code's census reason and sentinel together, so a
+	// future code addition cannot be half-wired.
+	var reason string
+	var superseded bool
 	switch code {
-	case "fence-held", "fence-gone":
-		return fmt.Errorf("%w: %w", source.ErrSuperseded, err)
-	case "opportunity-missing", "head-superseded", "fence-settled":
-		return fmt.Errorf("%w: %w", source.ErrStaleWork, err)
+	case "fence-held":
+		reason, superseded = reasonIdentityFenceHeld, true
+	case "fence-gone":
+		reason, superseded = reasonIdentityFenceGone, true
+	case "opportunity-missing":
+		reason = reasonIdentityOpportunityMissing
+	case "head-superseded":
+		reason = reasonIdentityHeadSuperseded
+	case "fence-settled":
+		reason = reasonIdentityFenceSettled
 	default:
+		// An unrecognized code is no identity evidence: the exchange was
+		// still deferred to this site, so it counts its pending 4xx class
+		// once and returns unchanged.
+		c.countPendingExchange(err)
 		return err
 	}
+	// Count the identity census for the refusal, then absorb the deferred
+	// exchange so its protocol-error class is never also counted: one
+	// refusal, one counted diagnostic.
+	c.diagnostics.Diagnostic(c.connectorName, connector.SignalIdentity, reason)
+	absorbExchange(err)
+	if superseded {
+		return fmt.Errorf("%w: %w", source.ErrSuperseded, err)
+	}
+	return fmt.Errorf("%w: %w", source.ErrStaleWork, err)
 }
 
 // classifyCIExchange classifies one deferred CI park family exchange whose

@@ -77,6 +77,11 @@ const (
 	reasonIdentityGenerationAdvanced = "generation-advanced"
 	reasonIdentitySuperseded         = "identity-superseded"
 	reasonIdentityClaimReleased      = "claim-released"
+	reasonIdentityFenceHeld          = "fence-held"
+	reasonIdentityFenceGone          = "fence-gone"
+	reasonIdentityOpportunityMissing = "opportunity-missing"
+	reasonIdentityHeadSuperseded     = "head-superseded"
+	reasonIdentityFenceSettled       = "fence-settled"
 )
 
 // reasonVocabulary is the closed reason vocabulary declared per signal at
@@ -89,7 +94,7 @@ func reasonVocabulary() map[string][]string {
 		connector.SignalProtocolError: {reasonTransportError, reasonAuthError, reasonHTTP4xx, reasonHTTP5xx, reasonMalformedResponse, reasonUnsupportedTaskType, reasonInvalidDescriptor},
 		connector.SignalReport:        {reasonReportPublished, reasonReportUnsupported, reasonReportRetryable},
 		connector.SignalRevalidation:  {reasonRevalidationCurrent, reasonRevalidationStaleHead, reasonRevalidationClosedUnmerged, reasonRevalidationMerged},
-		connector.SignalIdentity:      {reasonIdentityGenerationAdvanced, reasonIdentitySuperseded, reasonIdentityClaimReleased},
+		connector.SignalIdentity:      {reasonIdentityGenerationAdvanced, reasonIdentitySuperseded, reasonIdentityClaimReleased, reasonIdentityFenceHeld, reasonIdentityFenceGone, reasonIdentityOpportunityMissing, reasonIdentityHeadSuperseded, reasonIdentityFenceSettled},
 		connector.SignalAvailability:  {connector.AvailabilityAvailable, connector.AvailabilityDegraded, connector.AvailabilityUnreachable, connector.AvailabilityUnknown},
 	}
 }
