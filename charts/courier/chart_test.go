@@ -910,16 +910,37 @@ func TestChartRejectsInvalidBootstrapLaneValues(t *testing.T) {
 		"--set", "laneProfiles.local.roles.coordinator=litellm/qwen3.8-27b",
 		"--set", "controllers.main.containers.main.args={--leader-elect,--bootstrap-lane-profiles-file=/custom/profiles.yaml}",
 	)
+	assertNoBootstrapTransport(t, overridden)
+	if !strings.Contains(overridden, "--bootstrap-lane-profiles-file=/custom/profiles.yaml") {
+		t.Fatalf("explicit --bootstrap-lane-profiles-file arg missing from output")
+	}
+
+	// The two-argument flag form must be recognized too: Go's flag package
+	// takes the last occurrence, so an undetected split-form override would
+	// let the chart's appended flag silently replace the user's path.
+	split := runHelm(t, chartDir, "template", "courier", ".",
+		"--set", "laneProfiles.local.roles.coordinator=litellm/qwen3.8-27b",
+		"--set", "controllers.main.containers.main.args={--leader-elect,--bootstrap-lane-profiles-file,/custom/profiles.yaml}",
+	)
+	assertNoBootstrapTransport(t, split)
+	if !strings.Contains(split, "/custom/profiles.yaml") {
+		t.Fatalf("split-form --bootstrap-lane-profiles-file path missing from output")
+	}
+}
+
+// assertNoBootstrapTransport fails when a rendered chart still carries any
+// part of the laneProfiles transport: the ConfigMap, the volume mount, or the
+// pod template's configMaps checksum.
+func assertNoBootstrapTransport(t *testing.T, output string) {
+	t.Helper()
 	for _, unwanted := range []string{
 		"courier-bootstrap-lane-profiles",
 		"/etc/courier/lane-profiles",
+		"checksum/configMaps",
 	} {
-		if strings.Contains(overridden, unwanted) {
+		if strings.Contains(output, unwanted) {
 			t.Fatalf("explicit file arg did not disable the laneProfiles transport: output contains %q", unwanted)
 		}
-	}
-	if !strings.Contains(overridden, "--bootstrap-lane-profiles-file=/custom/profiles.yaml") {
-		t.Fatalf("explicit --bootstrap-lane-profiles-file arg missing from output")
 	}
 }
 

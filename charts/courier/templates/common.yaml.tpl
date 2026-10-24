@@ -235,7 +235,7 @@
 {{- if $laneProfiles }}
 {{- $hasBootstrapLaneFile := false }}
 {{- range $arg := $args }}
-{{- if hasPrefix "--bootstrap-lane-profiles-file=" $arg }}{{- $hasBootstrapLaneFile = true }}{{- end }}
+{{- if or (eq $arg "--bootstrap-lane-profiles-file") (hasPrefix "--bootstrap-lane-profiles-file=" $arg) }}{{- $hasBootstrapLaneFile = true }}{{- end }}
 {{- end }}
 {{- if not $hasBootstrapLaneFile }}
 {{- $profiles := list }}
