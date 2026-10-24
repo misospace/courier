@@ -39,6 +39,31 @@ dispatch:
     name: ""
     key: token
 
+# -- Deployment-managed bootstrap LaneProfiles. A map of lane name to the
+#    lane's portable spec, serialized into a release ConfigMap mounted into
+#    the manager and passed through --bootstrap-lane-profiles-file; the
+#    manager creates and updates those LaneProfile objects itself, labeled
+#    courier.misospace.dev/bootstrap-managed. Helm never renders LaneProfile
+#    resources, so lanes can never race the CRD during install. Entries carry
+#    the full portable spec: optional runtimeImage, concurrency, required
+#    roles (role name -> model), multi-line framing, and the optional
+#    capacityGroup, context, resources, and ciRepair fields documented in
+#    BOOTSTRAP.md. No secrets belong on this surface. A values change updates
+#    the ConfigMap and the pod template's configMaps checksum, so a normal
+#    helm upgrade rolls the manager without an external reloader. An explicit
+#    --bootstrap-lane-profiles-file arg under
+#    controllers.main.containers.main.args takes precedence and disables this
+#    transport. Separately applied (user-managed) LaneProfile CRs remain
+#    supported and are never touched by either mechanism.
+laneProfiles: {}
+  # bootstrap:
+  #   concurrency: 1
+  #   runtimeImage: ghcr.io/misospace/courier-go:0.1.0
+  #   roles:
+  #     coordinator: litellm/your-model
+  #   framing: |
+  #     keep parallelism modest and leave the pull request ready for review
+
 # -- Secure topology (HARNESS.md). Disabled by default: the legacy
 # single-pod coordinator remains explicitly insecure. When enabled, every
 # run is provisioned as one trusted control pod, one untrusted worker pod,

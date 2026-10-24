@@ -1984,6 +1984,13 @@ the label is never adopted or overwritten — the name collision surfaces as an
 actionable error. Removal from the config intentionally leaves the CR in place;
 there is no delete verb because active runs reference lanes. (#73)
 
+The Helm chart exposes the same seam natively: a `laneProfiles` value map
+serializes into a release ConfigMap mounted into the manager and passed through
+the same file flag, and the chart library's config-map checksum annotates the
+pod template, so a values change rolls the manager on a normal upgrade. The
+chart never renders LaneProfile objects, keeping the CRD-ordering hazard
+structurally closed. (#74)
+
 ## Reconcile loop
 
 - **Pending** — created by a source. The operator checks the lane's `concurrency`

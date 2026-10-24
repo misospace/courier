@@ -4,10 +4,12 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"regexp"
 	"strings"
 	"testing"
 
+	bootstrap "github.com/misospace/courier/internal/bootstrap"
 	"sigs.k8s.io/yaml"
 )
 
@@ -696,4 +698,251 @@ func TestChartRendersSecureTopologyConfiguration(t *testing.T) {
 			t.Fatalf("secure-disabled chart output unexpectedly contains %q", unwanted)
 		}
 	}
+}
+
+// TestChartRendersBootstrapLaneProfiles checks the #74 laneProfiles values
+// transport: the values serialize into a release ConfigMap that the manager
+// reads through the --bootstrap-lane-profiles-file seam, the rendered output
+// never contains a LaneProfile manifest (the original CRD-ordering race stays
+// closed), and the full portable spec — runtimeImage, multiple roles, and
+// multi-line framing — round-trips exactly through the manager's own parser.
+func TestChartRendersBootstrapLaneProfiles(t *testing.T) {
+	if _, err := exec.LookPath("helm"); err != nil {
+		t.Skip("helm is not installed")
+	}
+
+	chartDir := copyChart(t)
+	if err := exec.Command("helm", "repo", "add", "bjw-s-labs", "https://bjw-s-labs.github.io/helm-charts").Run(); err != nil {
+		t.Fatalf("configure chart repository: %v", err)
+	}
+	runHelm(t, chartDir, "dependency", "build")
+
+	valuesFile := filepath.Join(chartDir, "values-lanes.yaml")
+	values := `laneProfiles:
+  bootstrap:
+    runtimeImage: ghcr.io/misospace/courier-go:0.1.0
+    concurrency: 2
+    roles:
+      coordinator: litellm/qwen3.8-27b
+      reviewer: litellm-anthropic/MiniMax-M3
+    framing: |
+      keep parallelism modest
+      and leave the pull request ready for review
+  cloud:
+    concurrency: 4
+    roles:
+      coordinator: openai/gpt-5
+    framing: elastic capacity, fan out freely
+`
+	if err := os.WriteFile(valuesFile, []byte(values), 0o600); err != nil {
+		t.Fatalf("write lane values: %v", err)
+	}
+
+	out := runHelm(t, chartDir, "template", "courier", ".", "--values", "values-lanes.yaml")
+	assertNoLaneProfileManifest(t, out)
+	for _, want := range []string{
+		"--bootstrap-lane-profiles-file=/etc/courier/lane-profiles/profiles.yaml",
+		"name: courier-bootstrap-lane-profiles",
+		"mountPath: /etc/courier/lane-profiles",
+		"checksum/configMaps:",
+	} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("bootstrap-lanes chart output is missing %q", want)
+		}
+	}
+
+	configMap := findDocument(t, out, "kind: ConfigMap", "name: courier-bootstrap-lane-profiles")
+	var rendered struct {
+		Data map[string]string `json:"data"`
+	}
+	if err := yaml.Unmarshal([]byte(configMap), &rendered); err != nil {
+		t.Fatalf("parse rendered bootstrap ConfigMap: %v", err)
+	}
+	config, ok := rendered.Data["profiles.yaml"]
+	if !ok {
+		t.Fatalf("bootstrap ConfigMap carries no profiles.yaml key:\n%s", configMap)
+	}
+	profiles, err := bootstrap.Parse([]byte(config))
+	if err != nil {
+		t.Fatalf("manager parser rejected the rendered bootstrap config: %v", err)
+	}
+	wantProfiles := []bootstrap.Profile{
+		{
+			Name:         "bootstrap",
+			RuntimeImage: "ghcr.io/misospace/courier-go:0.1.0",
+			Concurrency:  2,
+			Roles: map[string]string{
+				"coordinator": "litellm/qwen3.8-27b",
+				"reviewer":    "litellm-anthropic/MiniMax-M3",
+			},
+			Framing: "keep parallelism modest\nand leave the pull request ready for review\n",
+		},
+		{
+			Name:        "cloud",
+			Concurrency: 4,
+			Roles:       map[string]string{"coordinator": "openai/gpt-5"},
+			Framing:     "elastic capacity, fan out freely",
+		},
+	}
+	if !reflect.DeepEqual(profiles, wantProfiles) {
+		t.Fatalf("bootstrap config round-trip mismatch:\n got: %#v\nwant: %#v", profiles, wantProfiles)
+	}
+
+	// Dispatch stays decoupled from the bootstrap lanes: referencing a
+	// bootstrap lane name by laneProfile renders both features together.
+	combined := runHelm(t, chartDir, "template", "courier", ".",
+		"--values", "values-lanes.yaml",
+		"--set", "dispatch.enabled=true",
+		"--set", "dispatch.baseURL=https://dispatch.example.test",
+		"--set", "dispatch.agentName=example-agent",
+		"--set", "dispatch.queueLane=queue-x",
+		"--set", "dispatch.laneProfile=bootstrap",
+		"--set", "dispatch.tokenSecret.name=dispatch-token-secret",
+	)
+	assertNoLaneProfileManifest(t, combined)
+	for _, want := range []string{
+		"--dispatch-queue-lane=queue-x",
+		"--dispatch-lane=bootstrap",
+		"--bootstrap-lane-profiles-file=/etc/courier/lane-profiles/profiles.yaml",
+	} {
+		if !strings.Contains(combined, want) {
+			t.Fatalf("dispatch-plus-lanes chart output is missing %q", want)
+		}
+	}
+}
+
+// TestChartRollsManagerOnBootstrapLaneChanges pins the #74 upgrade contract:
+// changing the laneProfiles values changes the manager pod template (via the
+// library's configMaps checksum), identical values render a stable checksum,
+// and the default render carries no bootstrap transport at all.
+func TestChartRollsManagerOnBootstrapLaneChanges(t *testing.T) {
+	if _, err := exec.LookPath("helm"); err != nil {
+		t.Skip("helm is not installed")
+	}
+
+	chartDir := copyChart(t)
+	if err := exec.Command("helm", "repo", "add", "bjw-s-labs", "https://bjw-s-labs.github.io/helm-charts").Run(); err != nil {
+		t.Fatalf("configure chart repository: %v", err)
+	}
+	runHelm(t, chartDir, "dependency", "build")
+
+	writeLaneValues := func(framing string) string {
+		t.Helper()
+		path := filepath.Join(chartDir, "values-lanes.yaml")
+		values := "laneProfiles:\n  local:\n    concurrency: 1\n    roles:\n      coordinator: litellm/qwen3.8-27b\n    framing: " + framing + "\n"
+		if err := os.WriteFile(path, []byte(values), 0o600); err != nil {
+			t.Fatalf("write lane values: %v", err)
+		}
+		return path
+	}
+
+	first := configMapsChecksum(t, runHelm(t, chartDir, "template", "courier", ".", "--values", writeLaneValues("keep it modest")))
+	repeat := configMapsChecksum(t, runHelm(t, chartDir, "template", "courier", ".", "--values", writeLaneValues("keep it modest")))
+	if first != repeat {
+		t.Fatalf("identical lane values produced different pod-template checksums: %s vs %s", first, repeat)
+	}
+	changed := configMapsChecksum(t, runHelm(t, chartDir, "template", "courier", ".", "--values", writeLaneValues("capacity is elastic, fan out freely")))
+	if first == changed {
+		t.Fatalf("changed lane values did not change the pod-template checksum %s", first)
+	}
+
+	defaultRender := runHelm(t, chartDir, "template", "courier", ".")
+	if strings.Contains(defaultRender, "checksum/configMaps") {
+		t.Fatal("default render unexpectedly carries a configMaps checksum annotation")
+	}
+	for _, unwanted := range []string{
+		"--bootstrap-lane-profiles-file",
+		"courier-bootstrap-lane-profiles",
+		"/etc/courier/lane-profiles",
+	} {
+		if strings.Contains(defaultRender, unwanted) {
+			t.Fatalf("default render unexpectedly contains %q", unwanted)
+		}
+	}
+}
+
+// TestChartRejectsInvalidBootstrapLaneValues covers the render-time lane
+// validation and the explicit-arg precedence: a user-supplied
+// --bootstrap-lane-profiles-file arg wins over the laneProfiles values, which
+// then render no ConfigMap, mount, or flag of their own.
+func TestChartRejectsInvalidBootstrapLaneValues(t *testing.T) {
+	if _, err := exec.LookPath("helm"); err != nil {
+		t.Skip("helm is not installed")
+	}
+
+	chartDir := copyChart(t)
+	if err := exec.Command("helm", "repo", "add", "bjw-s-labs", "https://bjw-s-labs.github.io/helm-charts").Run(); err != nil {
+		t.Fatalf("configure chart repository: %v", err)
+	}
+	runHelm(t, chartDir, "dependency", "build")
+
+	out, err := runHelmOutput(t, chartDir, "template", "courier", ".",
+		"--set", "laneProfiles.Local.roles.coordinator=litellm/qwen3.8-27b",
+	)
+	if err == nil {
+		t.Fatalf("expected helm template to fail for an invalid lane name, but it succeeded:\n%s", out)
+	}
+	if !strings.Contains(out, "must be a valid DNS-1123 label") {
+		t.Fatalf("helm template failed without the expected DNS-1123 message:\n%s", out)
+	}
+
+	out, err = runHelmOutput(t, chartDir, "template", "courier", ".",
+		"--set", "laneProfiles.local.concurrency=1",
+	)
+	if err == nil {
+		t.Fatalf("expected helm template to fail for a lane without roles, but it succeeded:\n%s", out)
+	}
+	if !strings.Contains(out, "requires at least one entry under roles") {
+		t.Fatalf("helm template failed without the expected roles message:\n%s", out)
+	}
+
+	out, err = runHelmOutput(t, chartDir, "template", "courier", ".",
+		"--set", "laneProfiles.local=null",
+	)
+	if err == nil {
+		t.Fatalf("expected helm template to fail for a non-mapping lane entry, but it succeeded:\n%s", out)
+	}
+	if !strings.Contains(out, "must be a mapping of lane spec fields") {
+		t.Fatalf("helm template failed without the expected mapping message:\n%s", out)
+	}
+
+	overridden := runHelm(t, chartDir, "template", "courier", ".",
+		"--set", "laneProfiles.local.roles.coordinator=litellm/qwen3.8-27b",
+		"--set", "controllers.main.containers.main.args={--leader-elect,--bootstrap-lane-profiles-file=/custom/profiles.yaml}",
+	)
+	for _, unwanted := range []string{
+		"courier-bootstrap-lane-profiles",
+		"/etc/courier/lane-profiles",
+	} {
+		if strings.Contains(overridden, unwanted) {
+			t.Fatalf("explicit file arg did not disable the laneProfiles transport: output contains %q", unwanted)
+		}
+	}
+	if !strings.Contains(overridden, "--bootstrap-lane-profiles-file=/custom/profiles.yaml") {
+		t.Fatalf("explicit --bootstrap-lane-profiles-file arg missing from output")
+	}
+}
+
+// assertNoLaneProfileManifest fails when any rendered document is a LaneProfile
+// object. The check is line-anchored: the LaneProfile CRD itself renders an
+// indented names.kind field, which must not trip the guard.
+func assertNoLaneProfileManifest(t *testing.T, output string) {
+	t.Helper()
+	manifest := regexp.MustCompile(`(?m)^kind: LaneProfile$`)
+	for _, doc := range strings.Split(output, "\n---") {
+		if manifest.MatchString(doc) {
+			t.Fatalf("chart rendered a LaneProfile manifest:\n%s", doc)
+		}
+	}
+}
+
+// configMapsChecksum returns the pod template's configMaps checksum annotation
+// value from a rendered chart.
+func configMapsChecksum(t *testing.T, output string) string {
+	t.Helper()
+	match := regexp.MustCompile(`checksum/configMaps: ([0-9a-f]{64})`).FindStringSubmatch(output)
+	if match == nil {
+		t.Fatalf("rendered output carries no checksum/configMaps annotation")
+	}
+	return match[1]
 }
