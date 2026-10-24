@@ -523,7 +523,12 @@ func readCapped(ctx context.Context, path string, limit int) ([]byte, error) {
 	// that is already gone.
 	done := make(chan readResult, 1)
 	go func() {
-		f, err := os.OpenFile(path, os.O_RDONLY|syscall.O_NOFOLLOW|syscall.O_NONBLOCK, 0)
+		flags, ferr := captureOpenFlags()
+		if ferr != nil {
+			done <- readResult{err: ferr}
+			return
+		}
+		f, err := os.OpenFile(path, flags, 0)
 		if err != nil {
 			done <- readResult{err: err}
 			return

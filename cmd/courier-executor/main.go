@@ -449,7 +449,7 @@ func preflightCapabilities(ctx context.Context, command executor.Command, dir st
 	// In its own process group so the descendants it leaves behind stay
 	// recognizable as its own after it exits, and the reaper can collect them
 	// instead of retaining them on PID 1 (#347).
-	probe.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	probe.SysProcAttr = processGroupSysProcAttr()
 	// Bound waiting for a grandchild that holds the output pipe after the
 	// context is done.
 	probe.WaitDelay = 5 * time.Second
@@ -740,12 +740,12 @@ func run(ctx context.Context, stdout, stderr io.Writer) int {
 		// child, and a grandchild (git, a compiler, a stuck tool) would keep
 		// writing into the workspace while a cancellation-triggered capture
 		// snapshots it (DESIGN.md, #115).
-		process.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+		process.SysProcAttr = processGroupSysProcAttr()
 		process.Cancel = func() error {
 			if process.Process == nil {
 				return os.ErrProcessDone
 			}
-			return syscall.Kill(-process.Process.Pid, syscall.SIGKILL)
+			return killProcessGroup(process.Process.Pid, syscall.SIGKILL)
 		}
 		tap.setKill(func() { exhaustionSignal.Store(true); _ = process.Cancel() })
 		// Bound the wait for the group after the context is done; the margin
