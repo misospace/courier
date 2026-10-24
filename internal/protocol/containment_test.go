@@ -53,6 +53,11 @@ const containmentChurnTurns = 25
 // polls at.
 const containmentPoll = 20 * time.Millisecond
 
+// containmentHelperLimit bounds the parent's wait on the helper itself. It
+// sits above every bound the helper enforces on its own waits, so the
+// deadline fires only on a helper that has wedged for real.
+const containmentHelperLimit = 2 * time.Minute
+
 // containmentHelperStartErr marks a helper that never started: the
 // environment refused the process shape, not the contract the helper checks.
 var containmentHelperStartErr = errors.New("containment helper did not start")
@@ -61,15 +66,19 @@ var containmentHelperStartErr = errors.New("containment helper did not start")
 // helper in the given mode and returns everything it printed.
 func runContainmentHelper(t *testing.T, mode string, attr *syscall.SysProcAttr) (string, error) {
 	t.Helper()
-	cmd := exec.Command(os.Args[0], "-test.run=TestWorkerContainmentHelper", "-test.count=1")
+	// WaitDelay does not bound Wait while the helper is still alive, so the
+	// lifetime bound is the context's: a wedged helper is killed and the
+	// deadline fails the test instead of hanging it. WaitDelay still bounds
+	// the pipe drain after the helper's exit, which a descendant holding the
+	// helper's output would otherwise stretch past the helper's own death.
+	ctx, cancel := context.WithTimeout(context.Background(), containmentHelperLimit)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, os.Args[0], "-test.run=TestWorkerContainmentHelper", "-test.count=1")
 	cmd.Env = append(os.Environ(), containmentHelperEnv+"="+mode)
 	cmd.SysProcAttr = attr
 	var out bytes.Buffer
 	cmd.Stdout = &out
 	cmd.Stderr = &out
-	// A helper that leaves a descendant holding its output would hold the
-	// parent's pipe open long past its own exit, so the wait is bounded: a
-	// helper that wedges fails the test instead of hanging it.
 	cmd.WaitDelay = 30 * time.Second
 	// Arming is process-wide and sticky, so a drain pass may already be
 	// running in this binary from an earlier test: the helper goes through
@@ -81,6 +90,9 @@ func runContainmentHelper(t *testing.T, mode string, attr *syscall.SysProcAttr) 
 	}
 	defer containment.releaseTaskChild(cmd.Process.Pid)
 	err := cmd.Wait()
+	if err != nil && ctx.Err() != nil {
+		return out.String(), fmt.Errorf("containment helper did not exit within %s: %w", containmentHelperLimit, err)
+	}
 	return out.String(), err
 }
 
