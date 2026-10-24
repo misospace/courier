@@ -689,8 +689,9 @@ func run(ctx context.Context, stdout, stderr io.Writer) int {
 		cfg.Framing = strings.TrimSpace(cfg.Framing + "\n\n" + report.red.Redact(note))
 	}
 	tap := newSessionTap(stdoutRedacted, parseExhaustionSignals(cfg.ExhaustionCodes, cfg.ExhaustionTypes))
-	// Publish tel once, before any attempt can run: scan reads it without
-	// the tap lock, so it must never be reassigned inside the retry loop.
+	// Publish tel once, before any attempt can run: this write does not
+	// take the tap lock, so reassigning it inside the retry loop would
+	// race scan's read. See sessionTap.tel.
 	tap.tel = report.tel
 	var exhaustionSignal atomic.Bool
 
