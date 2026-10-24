@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
-	"os/signal"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -119,7 +118,7 @@ func (c *taskContainment) terminateUnregistered(pid int, cmd *exec.Cmd, cause er
 		_, _ = c.sweepAdoptedTrees(time.Now().Add(taskTreeVerifyBound))
 		return &containmentUnprovenError{survivors: 1, cause: cause}
 	}
-	defer syscall.Close(pin)
+	defer closeFd(pin)
 	survivors := awaitProcessGroupEmpty(pid)
 	sweepSurvivors, sweepErr := c.sweepAdoptedTrees(time.Now().Add(taskTreeVerifyBound))
 	if sweepErr != nil {
@@ -160,7 +159,7 @@ func (c *taskContainment) releaseTaskChild(pid int) {
 	delete(c.supervised, pid)
 	c.mu.Unlock()
 	if ok && pin >= 0 {
-		_ = syscall.Close(pin)
+		closeFd(pin)
 	}
 }
 
@@ -231,12 +230,7 @@ func (c *taskContainment) drain() {
 			if c.supervises(pid) {
 				continue
 			}
-			var status syscall.WaitStatus
-			// WNOHANG: a live orphan is not this pass's business, and ECHILD
-			// (already collected) and EINTR (a signal beat us to it) are not
-			// failures worth reporting.
-			reaped, err := syscall.Wait4(pid, &status, syscall.WNOHANG, nil)
-			if err != nil || reaped <= 0 {
+			if !reapNoHang(pid) {
 				continue
 			}
 			c.reaped.Add(1)
@@ -306,7 +300,7 @@ func (c *taskContainment) sweepAdoptedTrees(deadline time.Time) (int, error) {
 func closeProcFds(snapshot map[int]procInfo) {
 	for _, info := range snapshot {
 		if info.fd >= 0 {
-			_ = syscall.Close(info.fd)
+			closeFd(info.fd)
 		}
 	}
 }
@@ -323,8 +317,7 @@ func (c *taskContainment) reapAdoptedZombies(snapshot map[int]procInfo, self int
 		if info.state != "Z" && info.state != "X" {
 			continue
 		}
-		var status syscall.WaitStatus
-		if reaped, err := syscall.Wait4(pid, &status, syscall.WNOHANG, nil); err == nil && reaped > 0 {
+		if reapNoHang(pid) {
 			c.reaped.Add(1)
 		}
 	}
@@ -455,7 +448,7 @@ func processSnapshot() (map[int]procInfo, error) {
 		}
 		info, statErr := processStat(pid)
 		if statErr != nil {
-			_ = syscall.Close(fd)
+			closeFd(fd)
 			if errors.Is(statErr, errProcessGone) {
 				continue
 			}
@@ -518,17 +511,7 @@ func ArmAdoptedChildReaper() error {
 		if err := becomeChildSubreaper(); err != nil {
 			armErr = fmt.Errorf("protocol: could not become an adopted-child subreaper: %w", err)
 		}
-		ch := make(chan os.Signal, 1)
-		signal.Notify(ch, syscall.SIGCHLD)
-		go func() {
-			for range ch {
-				// Standard signals coalesce, so a delivered SIGCHLD may
-				// stand for several dead descendants; each pass
-				// re-enumerates rather than trusting the count of
-				// deliveries.
-				containment.drain()
-			}
-		}()
+		watchChildSignals()
 		containment.drain()
 	})
 	return armErr

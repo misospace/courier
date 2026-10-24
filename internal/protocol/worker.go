@@ -333,7 +333,7 @@ func (w *Worker) runTask(ctx context.Context, task Task) *Result {
 	// would leave those descendants mutating the workspace after
 	// cancellation claimed to be verified: the task gets its own process
 	// group and cancellation kills the whole group (#372).
-	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	cmd.SysProcAttr = taskSysProcAttr()
 	cmd.Cancel = func() error { return signalProcessGroup(cmd.Process.Pid, syscall.SIGKILL) }
 	// A descendant that inherited the task's output descriptors keeps the
 	// wait open after the task itself is gone, so cleanup is bounded rather
@@ -491,20 +491,6 @@ func leadsOwnProcessGroup(pid int) bool {
 	return err == nil && info.pgid == pid
 }
 
-// signalProcessGroup delivers sig to the whole process group led by pid. A
-// group that is already gone counts as success: there is nothing left to
-// terminate, and reporting it as a failure would mask a completed cleanup.
-func signalProcessGroup(pid int, sig syscall.Signal) error {
-	if pid <= 0 {
-		return nil
-	}
-	err := syscall.Kill(-pid, sig)
-	if errors.Is(err, syscall.ESRCH) {
-		return nil
-	}
-	return err
-}
-
 // awaitProcessGroupEmpty proves that no live process remains in the process
 // group led by pgid and returns how many were still live when the bound
 // expired. The group is re-signalled while it waits, so a descendant that
@@ -528,7 +514,7 @@ func awaitProcessGroupEmpty(pgid int) int {
 			// Without a process listing the only answer available is the
 			// kernel's, and a group signal that finds no member proves the
 			// group empty. Anything short of that proof stays unverified.
-			if errors.Is(syscall.Kill(-pgid, syscall.Signal(0)), syscall.ESRCH) {
+			if errors.Is(probeProcessGroup(pgid), syscall.ESRCH) {
 				return 0
 			}
 			return 1
@@ -655,17 +641,10 @@ func (w *Worker) readArtifact(declared string) ([]byte, error) {
 	dirfd := int(dir.Fd())
 	components := strings.Split(strings.TrimPrefix(clean, "/"), "/")
 	for i, name := range components {
-		flags := syscall.O_NOFOLLOW | syscall.O_CLOEXEC | syscall.O_RDONLY
-		if i < len(components)-1 {
-			flags |= syscall.O_DIRECTORY
-		} else {
-			// O_NONBLOCK keeps a swapped-in FIFO from blocking the open; the
-			// regular-file check on the descriptor rejects it right after.
-			flags |= syscall.O_NONBLOCK
-		}
+		flags := walkOpenFlags(i < len(components)-1)
 		next, openErr := openat(dirfd, name, flags)
 		if i > 0 {
-			syscall.Close(dirfd)
+			closeFd(dirfd)
 		}
 		if openErr != nil {
 			if errors.Is(openErr, errOpenatUnsupported) {
