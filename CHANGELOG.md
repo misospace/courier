@@ -1,5 +1,93 @@
 # Changelog
 
+## [0.1.11](https://github.com/misospace/courier/compare/v0.1.10...v0.1.11) (2026-10-24)
+
+
+### Features
+
+* **controller:** add CI park-and-resume lifecycle and persistence contracts ([#485](https://github.com/misospace/courier/issues/485)) ([7ca9c94](https://github.com/misospace/courier/commit/7ca9c94d0e500c056cdee7e500d5a8eaef88ed5d))
+* **controller:** wire mechanical CI park and bounded same-run repair ([#504](https://github.com/misospace/courier/issues/504)) ([f710a64](https://github.com/misospace/courier/commit/f710a64571b6f08bd8f8174859eb7ca35fdc06ec))
+* **dispatch:** adopt the CI park lifecycle for fenced PR-fix coordination ([4b403b4](https://github.com/misospace/courier/commit/4b403b41e4ceef0e1b63a7b7c73745215ec17565))
+* **dispatch:** adopt the CI park lifecycle for fenced PR-fix coordination ([d4fdc37](https://github.com/misospace/courier/commit/d4fdc37e7ffb834afe0005419429d72f54d0d734))
+* **github-release:** update release helm (3.18.6 → 3.22.1) ([#472](https://github.com/misospace/courier/issues/472)) ([bf81a3d](https://github.com/misospace/courier/commit/bf81a3df36f3fa543f0073978504bea90240fc31))
+* **github-release:** update release helm (3.22.1 → 4.3.1) ([#473](https://github.com/misospace/courier/issues/473)) ([11c5cb3](https://github.com/misospace/courier/commit/11c5cb33bc36c1864b63a1b475753af3cd9ef310))
+* **observability:** emit connector diagnostics and capability state ([#493](https://github.com/misospace/courier/issues/493)) ([cacdcdb](https://github.com/misospace/courier/commit/cacdcdb2ecffe28edc5e5bfc8b6e30653c469bcb))
+* **observability:** export phase, execution, lifecycle and reaping signals ([#491](https://github.com/misospace/courier/issues/491)) ([3331216](https://github.com/misospace/courier/commit/33312167c8433cd832b6bde277d20c6475a7f2e7))
+* **observability:** export source discovery and lane-capacity signals ([#492](https://github.com/misospace/courier/issues/492)) ([4129c25](https://github.com/misospace/courier/commit/4129c25974b501a5c700567c6973af74d963d267))
+* **observability:** publish portable dashboard and alert-rule assets ([#503](https://github.com/misospace/courier/issues/503)) ([57474d8](https://github.com/misospace/courier/commit/57474d848bebba30c0167d6970a25ecb04b79890))
+* **review:** adopt repository skills and v3.6.0 ([#457](https://github.com/misospace/courier/issues/457)) ([dfc10c6](https://github.com/misospace/courier/commit/dfc10c657555a6af54d049cd3628fb05e4553e53))
+* **runtime:** execute the repository's approved development bootstrap after checkout ([#446](https://github.com/misospace/courier/issues/446)) ([e0b9cd3](https://github.com/misospace/courier/commit/e0b9cd3dba6bfc1fb727b813f5688a6b2c0f70a9))
+* **runtime:** provision approved execution toolchains ([#505](https://github.com/misospace/courier/issues/505)) ([564c176](https://github.com/misospace/courier/commit/564c176b25e7700c43cf24f591d808a604856402))
+
+
+### Bug Fixes
+
+* **api:** narrow lane resources vocabulary to requests and limits ([#403](https://github.com/misospace/courier/issues/403)) ([#452](https://github.com/misospace/courier/issues/452)) ([5dcf63e](https://github.com/misospace/courier/commit/5dcf63e68d05fab37b493c359498f5d7034d791c))
+* **container:** update image golang (1.27.2 → 1.27.3) ([#478](https://github.com/misospace/courier/issues/478)) ([88afe20](https://github.com/misospace/courier/commit/88afe2080efd80d407be84967ad3024f55677a8e))
+* **controller:** make preflight probe names unique per node ([#451](https://github.com/misospace/courier/issues/451)) ([4315959](https://github.com/misospace/courier/commit/4315959da18ee575a7ed37b9e4fc41ff507b289f))
+* **controller:** terminalize probe-identity mismatch in secure preflight ([#467](https://github.com/misospace/courier/issues/467)) ([1eb97d3](https://github.com/misospace/courier/commit/1eb97d3db38e68d6120fc44275bbe3f865bf210d))
+* **deps:** update dependency astro (7.4.0 → 7.4.1) ([#470](https://github.com/misospace/courier/issues/470)) ([39eab81](https://github.com/misospace/courier/commit/39eab8117d891ea2d905ae84a130a862cc7eb3e2))
+* **deps:** update dependency astro (7.4.1 → 7.4.2) ([#498](https://github.com/misospace/courier/issues/498)) ([b581015](https://github.com/misospace/courier/commit/b581015b885e5d62a2d0e32e048e3f0aa1f205ed))
+* **deps:** update dependency go (1.27.2 → 1.27.3) ([#477](https://github.com/misospace/courier/issues/477)) ([53fbe1d](https://github.com/misospace/courier/commit/53fbe1d7ef7420b0894305aae4a4b769fe536d05))
+* **dispatch:** carry issued repair reasons into coordinator goals ([#519](https://github.com/misospace/courier/issues/519)) ([778b6eb](https://github.com/misospace/courier/commit/778b6eb9a3540695eca114849c9750b460f9f4c3))
+* **dispatch:** echo handout token on every followup-pr report ([#523](https://github.com/misospace/courier/issues/523)) ([2ea7504](https://github.com/misospace/courier/commit/2ea7504e51d6aa8df7500b96d4722777c60163f3))
+* **evidence:** discard runGit's late bytes under an expired context ([#527](https://github.com/misospace/courier/issues/527)) ([68b156e](https://github.com/misospace/courier/commit/68b156e7d00d93f087d8039428bc0532730940b8))
+* **evidence:** discard runGitCapped's late bytes under an expired context ([#468](https://github.com/misospace/courier/issues/468)) ([e894c28](https://github.com/misospace/courier/commit/e894c281f9f91ac06308814e8c90ce816524d95e))
+* **executor:** digest-suffix overflowing run-label values ([#429](https://github.com/misospace/courier/issues/429)) ([#526](https://github.com/misospace/courier/issues/526)) ([b3db72a](https://github.com/misospace/courier/commit/b3db72a8b58b71e8790f46a63f321a5bbd5fa9a6))
+* **executor:** re-check the live PR base at the legacy fix-pr handoff ([#524](https://github.com/misospace/courier/issues/524)) ([16ce7e8](https://github.com/misospace/courier/commit/16ce7e802f89b3807d675c595a54cab832b195e3))
+* **executor:** reap adopted child processes ([#461](https://github.com/misospace/courier/issues/461)) ([e534d9c](https://github.com/misospace/courier/commit/e534d9cd73a20260d1048a922dbe8e222809fd0e))
+* **executor:** stop publishing already-addressed comment for no-change runs ([#474](https://github.com/misospace/courier/issues/474)) ([#486](https://github.com/misospace/courier/issues/486)) ([a6b8114](https://github.com/misospace/courier/commit/a6b8114cfd613cd9b3df2bb6c5f961cb34ae2a38))
+* **executor:** verify no-change claims against forge mergeability ([#515](https://github.com/misospace/courier/issues/515)) ([65cfc24](https://github.com/misospace/courier/commit/65cfc2455116072e14a2c2b23032a9dd5d98bc98))
+* **harness:** bound one gateway completion's aggregate buffering ([#440](https://github.com/misospace/courier/issues/440)) ([#447](https://github.com/misospace/courier/issues/447)) ([3fd0d92](https://github.com/misospace/courier/commit/3fd0d92d21e33c6230e40097a5f4f5b9d7b0e168))
+* **harness:** enforce artifact budgets before unpacking and inventory ([#441](https://github.com/misospace/courier/issues/441)) ([#481](https://github.com/misospace/courier/issues/481)) ([f032209](https://github.com/misospace/courier/commit/f0322093c60dd81594700e0cbe270979a810676b))
+* **images:** pin the preflight probe image by digest ([#508](https://github.com/misospace/courier/issues/508)) ([f12168a](https://github.com/misospace/courier/commit/f12168aa4f8eccfe3b72f990e545545fa7ba29e7))
+* **pods:** size preflight probe pods with a fixed small sizing, not the lane's ([#407](https://github.com/misospace/courier/issues/407)) ([31f0db8](https://github.com/misospace/courier/commit/31f0db88c6bdf707ec983060573ce65630890dfb))
+* **protocol:** contain task trees beyond their process group ([#399](https://github.com/misospace/courier/issues/399)) ([#463](https://github.com/misospace/courier/issues/463)) ([f2c538f](https://github.com/misospace/courier/commit/f2c538f1cb12885df8d9bc67f746d49347501a8f))
+* **protocol:** cross-compile the containment syscalls for windows ([#541](https://github.com/misospace/courier/issues/541)) ([775a0fa](https://github.com/misospace/courier/commit/775a0fa1ac7d368b24fddaa98b2a98c9e2fee4f8))
+* **protocol:** fail the openat artifact walk closed on non-Linux ([82449a5](https://github.com/misospace/courier/commit/82449a50f875dfcbb0cfd46787c3be0a0794da6a))
+* **protocol:** fail the openat artifact walk closed on non-Linux ([ab2bcc8](https://github.com/misospace/courier/commit/ab2bcc8a310ed4d87047967ee81f40f06fc4c2da)), closes [#479](https://github.com/misospace/courier/issues/479)
+* **resources:** bound workspace observer memory ([#464](https://github.com/misospace/courier/issues/464)) ([3db4608](https://github.com/misospace/courier/commit/3db4608c45c837032a86549c577ac61916c7fe43))
+* **review:** enable specialist Anthropic effort support ([#520](https://github.com/misospace/courier/issues/520)) ([249f266](https://github.com/misospace/courier/commit/249f26691aa60f3dd22fa8ac1806cd7c393c5276))
+* **source:** ack PR-fix hand-outs at durable materialization ([#462](https://github.com/misospace/courier/issues/462)) ([55c637b](https://github.com/misospace/courier/commit/55c637b5c86478cd66e6f81041e5acd3c011d1a7))
+* **topology:** hold pod names' first label to the 63-character bound ([#506](https://github.com/misospace/courier/issues/506)) ([9d291e4](https://github.com/misospace/courier/commit/9d291e4657f2169df7dd02951661b795cfdb6f8f))
+* **topology:** trim truncated service names of trailing dots ([8267227](https://github.com/misospace/courier/commit/8267227060b798fdc6f9b4cda8e437ad42d8baaf))
+* **topology:** trim truncated service names of trailing dots ([388c9c9](https://github.com/misospace/courier/commit/388c9c9def55ef5a763cca50432f3a7cedab3804))
+* **verifier:** transient forge-read failure ends blocked_external, not NeedsHuman ([#459](https://github.com/misospace/courier/issues/459)) ([c1ebee3](https://github.com/misospace/courier/commit/c1ebee375d70a8d009a1300bdae8962fa5edd586))
+* **workspace:** validate the live PR base for fix-pr runs ([#518](https://github.com/misospace/courier/issues/518)) ([1db24ab](https://github.com/misospace/courier/commit/1db24abbaa0936d4c7affacf84a7c02c8a6eb67a))
+
+
+### Chores
+
+* **container:** update image gcr.io/distroless/static (5167571 → d620678) ([#499](https://github.com/misospace/courier/issues/499)) ([2ef4767](https://github.com/misospace/courier/commit/2ef4767764b1886659a8d22e3f44b1122170bb32))
+* **container:** update image gcr.io/distroless/static (d620678 → 18f4cc2) ([#535](https://github.com/misospace/courier/issues/535)) ([37b6604](https://github.com/misospace/courier/commit/37b66045f4644aae748b5e7a8ec8c7800f41d53f))
+* **container:** update image gcr.io/distroless/static (e2e927e → 5167571) ([#480](https://github.com/misospace/courier/issues/480)) ([a5b2279](https://github.com/misospace/courier/commit/a5b2279fd377d3eae3fc680a68a32a3c11fe234a))
+* **container:** update image golang (9578611 → f241642) ([#496](https://github.com/misospace/courier/issues/496)) ([512b4fe](https://github.com/misospace/courier/commit/512b4fee8eb1d910489bdb03d32bd84b139edea2))
+* **container:** update image golang (f241642 → f20d83a) ([#500](https://github.com/misospace/courier/issues/500)) ([11e1505](https://github.com/misospace/courier/commit/11e1505dfbf7b9eda4ef2f6975034f7869c2c78f))
+* **container:** update image node (8cabefb → 55fb5f5) ([#502](https://github.com/misospace/courier/issues/502)) ([fad24aa](https://github.com/misospace/courier/commit/fad24aad1b8eb1a32c52f41a848c560adf0f758f))
+* **container:** update image node (a5f4366 → 8cabefb) ([#497](https://github.com/misospace/courier/issues/497)) ([4c7a44f](https://github.com/misospace/courier/commit/4c7a44fb914e949cab61274e2a7f459b492aceaf))
+* **deps:** lock file maintenance ([#466](https://github.com/misospace/courier/issues/466)) ([854b4c9](https://github.com/misospace/courier/commit/854b4c9548f973d4f5c688e6c6809fd28ff8ed56))
+* **dev:** add reproducible Go development bootstrap ([#436](https://github.com/misospace/courier/issues/436)) ([55a8308](https://github.com/misospace/courier/commit/55a8308654786701bef81b16c4964abb99535888))
+* **dispatch:** give CI park lifecycle refusals a distinct identity-class census ([0ec3f3c](https://github.com/misospace/courier/commit/0ec3f3cf392aa7c7734c7745d5e7aab03e736341))
+* **dispatch:** give CI park lifecycle refusals a distinct identity-class census ([6adc195](https://github.com/misospace/courier/commit/6adc1955840d936a31d4d24ba9563e23d5608135)), closes [#522](https://github.com/misospace/courier/issues/522)
+* **envtest:** align envtest assets with k8s 1.37 and derive the CI cache key from the Makefile pin ([d2fa1b7](https://github.com/misospace/courier/commit/d2fa1b7de0f55ca9a5bdff957024cfd47fe2508e))
+* **envtest:** align envtest assets with k8s 1.37 and derive the CI cache key from the Makefile pin ([68e75a6](https://github.com/misospace/courier/commit/68e75a687f7f5a628174d93c6cb35a8be74cc920))
+* **executor:** state the write-once publish rule for sessionTap.tel ([#542](https://github.com/misospace/courier/issues/542)) ([92fd524](https://github.com/misospace/courier/commit/92fd5245f8c402d60b5bc18fc83da7e16eefb641))
+
+
+### Documentation
+
+* **harness:** reconcile the criterion-evidence block with the derived grammar ([#425](https://github.com/misospace/courier/issues/425)) ([7756c1a](https://github.com/misospace/courier/commit/7756c1a1ca2c0006a0284b9752ab434d3831d01f))
+* **harness:** reconcile the criterion-evidence block with the derived grammar ([#425](https://github.com/misospace/courier/issues/425)) ([6fb2947](https://github.com/misospace/courier/commit/6fb2947be1c4969cebbf19a86603fad7733a0f80))
+* **harness:** the section renders the grammar, it does not restate it ([27eaafc](https://github.com/misospace/courier/commit/27eaafc572f01d16bd4e91fc6eca6a09fb210620))
+* stop treating DESIGN.md as a PR decision log ([#465](https://github.com/misospace/courier/issues/465)) ([01d3a94](https://github.com/misospace/courier/commit/01d3a94784d087c5b49ffa7338082a1ed836475d))
+
+
+### Refactors
+
+* **executor:** extract evidence capture, session tap, and cited-path checks out of main.go ([706164c](https://github.com/misospace/courier/commit/706164cfe2b3e526a333bf8cd4bf2521a3a39b95))
+* **executor:** extract evidence capture, session tap, and cited-path checks out of main.go ([a05fcee](https://github.com/misospace/courier/commit/a05fcee62634b890c272ba5910f3c68f948fb67f))
+* **executor:** move revParse to exhaustion.go beside its only caller ([754a5f4](https://github.com/misospace/courier/commit/754a5f47a607e32c5890267a56adcf5872dee7f1))
+
 ## [0.1.10](https://github.com/misospace/courier/compare/v0.1.9...v0.1.10) (2026-10-18)
 
 
