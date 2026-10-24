@@ -26,38 +26,86 @@ import (
 // never runs the helper's body in process.
 const containmentHelperEnv = "TEST_WORKER_CONTAINMENT_HELPER"
 
+// containmentHelperPIDOne is the production shape: the helper is PID 1 of a
+// fresh PID namespace, so the kernel reparents orphans to it on its own, with
+// no subreaper flag involved.
+const containmentHelperPIDOne = "pid1"
+
+// containmentHelperSubreaper is the shape a host that forbids user namespaces
+// can still exercise: the helper is an ordinary process with a living
+// ancestor, and the child-subreaper flag hands it the orphans its own
+// descendants leave behind.
+const containmentHelperSubreaper = "subreaper"
+
 // containmentAdoptLimit bounds every wait in the helper and its parent: an
 // unproven claim is a failure, not a hang.
 const containmentAdoptLimit = 5 * time.Second
 
+// containmentChurnLimit bounds the churn's wait: a slow host must not turn a
+// proven collection into a flake, but the wait still ends.
+const containmentChurnLimit = 30 * time.Second
+
+// containmentChurnTurns is how many task trees the churn case creates: the
+// shape a real run produces over hours.
+const containmentChurnTurns = 25
+
+// containmentPoll is the interval every bounded wait in the containment tests
+// polls at.
+const containmentPoll = 20 * time.Millisecond
+
+// containmentHelperLimit bounds the parent's wait on the helper itself. It
+// sits above every bound the helper enforces on its own waits, so the
+// deadline fires only on a helper that has wedged for real.
+const containmentHelperLimit = 2 * time.Minute
+
+// containmentHelperStartErr marks a helper that never started: the
+// environment refused the process shape, not the contract the helper checks.
+var containmentHelperStartErr = errors.New("containment helper did not start")
+
 // runContainmentHelper re-executes this test binary as the containment
-// helper and returns everything it printed.
-func runContainmentHelper(t *testing.T, attr *syscall.SysProcAttr) (string, error) {
+// helper in the given mode and returns everything it printed.
+func runContainmentHelper(t *testing.T, mode string, attr *syscall.SysProcAttr) (string, error) {
 	t.Helper()
-	cmd := exec.Command(os.Args[0], "-test.run=TestWorkerContainmentHelper", "-test.count=1")
-	cmd.Env = append(os.Environ(), containmentHelperEnv+"=pid1")
+	// WaitDelay does not bound Wait while the helper is still alive, so the
+	// lifetime bound is the context's: a wedged helper is killed and the
+	// deadline fails the test instead of hanging it. WaitDelay still bounds
+	// the pipe drain after the helper's exit, which a descendant holding the
+	// helper's output would otherwise stretch past the helper's own death.
+	ctx, cancel := context.WithTimeout(context.Background(), containmentHelperLimit)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, os.Args[0], "-test.run=TestWorkerContainmentHelper", "-test.count=1")
+	cmd.Env = append(os.Environ(), containmentHelperEnv+"="+mode)
 	cmd.SysProcAttr = attr
 	var out bytes.Buffer
 	cmd.Stdout = &out
 	cmd.Stderr = &out
+	cmd.WaitDelay = 30 * time.Second
 	// Arming is process-wide and sticky, so a drain pass may already be
 	// running in this binary from an earlier test: the helper goes through
 	// the same funnel every task child does — its pid is registered before
 	// the start is released and released only after Wait — so no pass can
 	// reap the status cmd.Wait owes.
 	if err := containment.startTaskChild(cmd); err != nil {
-		return "", err
+		return "", fmt.Errorf("%w: %w", containmentHelperStartErr, err)
 	}
 	defer containment.releaseTaskChild(cmd.Process.Pid)
 	err := cmd.Wait()
+	if err != nil && ctx.Err() != nil {
+		return out.String(), fmt.Errorf("containment helper did not exit within %s: %w", containmentHelperLimit, err)
+	}
 	return out.String(), err
 }
 
-// TestWorkerReaperCollectsAsPIDOne runs the reaper's contract as PID 1 of a
-// fresh PID namespace, which is the production shape: the kernel reparents
-// orphans to PID 1 on its own, with no subreaper flag involved. An
-// environment that forbids the namespace is skipped, never failed.
-func TestWorkerReaperCollectsAsPIDOne(t *testing.T) {
+// TestWorkerReaperKeepsTaskStatusesAsPIDOne runs the reaper's own claims as
+// PID 1 of a fresh PID namespace, which is the production shape: the kernel
+// reparents orphans to PID 1 on its own, with no subreaper flag involved. The
+// collection claims live in TestWorkerReaperCollectsAdoptedChildren instead,
+// because a procfs instance belongs to the pid namespace it was mounted in and
+// a test-created PID namespace leaves /proc bound to the outer one: there the
+// worker's own child enumeration cannot name what its wait collects. An
+// environment that forbids the namespace is skipped, never failed, and the
+// skip names the restriction it was.
+func TestWorkerReaperKeepsTaskStatusesAsPIDOne(t *testing.T) {
 	attr := &syscall.SysProcAttr{
 		Cloneflags:   syscall.CLONE_NEWPID | syscall.CLONE_NEWUSER,
 		Unshareflags: syscall.CLONE_NEWUSER,
@@ -69,34 +117,122 @@ func TestWorkerReaperCollectsAsPIDOne(t *testing.T) {
 		},
 		GidMappingsEnableSetgroups: false,
 	}
-	out, err := runContainmentHelper(t, attr)
-	if err != nil && (errors.Is(err, syscall.EPERM) || errors.Is(err, syscall.EINVAL)) {
-		t.Skipf("cannot run the helper as PID 1 of a new PID namespace: %v", err)
+	out, err := runContainmentHelper(t, containmentHelperPIDOne, attr)
+	if err != nil && errors.Is(err, containmentHelperStartErr) &&
+		(errors.Is(err, syscall.EPERM) || errors.Is(err, syscall.EINVAL)) {
+		t.Skipf("environment forbids creating a user+PID namespace (%s); the living-ancestor adoption path is covered by TestWorkerReaperCollectsAdoptedChildren",
+			errnoName(err))
 	}
 	if err != nil {
 		t.Fatalf("containment helper as PID 1 failed: %v\n%s", err, out)
 	}
-	if !strings.Contains(out, "reaped=") {
+	// The helper's own exit status is the claim: it fails loudly when a
+	// supervised task leader's exit or signal status is not the one os/exec
+	// produced.
+}
+
+// TestWorkerReaperCollectsAdoptedChildren runs the same reaper contract as an
+// ordinary process with a living ancestor, which is the shape a host that
+// forbids user namespaces can still exercise: the child-subreaper flag hands
+// the helper the orphans its own task trees leave behind, and the reaper
+// collects them. The contract is asserted on every host, so the worker's
+// reaping behaviour never rests on a namespace the environment may refuse.
+func TestWorkerReaperCollectsAdoptedChildren(t *testing.T) {
+	out, err := runContainmentHelper(t, containmentHelperSubreaper, nil)
+	if err != nil {
+		t.Fatalf("containment helper as an adopted-child subreaper failed: %v\n%s", err, out)
+	}
+	reaped, ok := containmentReapedTally(out)
+	if !ok {
 		t.Fatalf("containment helper printed no reaped=<n> tally:\n%s", out)
 	}
+	if reaped < containmentChurnTurns {
+		t.Fatalf("the reaper collected %d adopted descendants, want at least the %d the churn alone creates:\n%s",
+			reaped, containmentChurnTurns, out)
+	}
+}
+
+// containmentReapedTally reads the reaped=<n> tally the helper printed.
+func containmentReapedTally(out string) (uint64, bool) {
+	for _, line := range strings.Split(out, "\n") {
+		rest, found := strings.CutPrefix(line, "reaped=")
+		if !found {
+			continue
+		}
+		count, err := strconv.ParseUint(strings.TrimSpace(rest), 10, 64)
+		if err != nil {
+			continue
+		}
+		return count, true
+	}
+	return 0, false
+}
+
+// errnoName renders the errno behind err, so a skipped environment
+// restriction says which restriction it was.
+func errnoName(err error) string {
+	var errno syscall.Errno
+	if errors.As(err, &errno) {
+		return errno.Error()
+	}
+	return "no errno in " + err.Error()
 }
 
 // TestWorkerContainmentHelper is the adopted-child reaper's contract, run in
 // a process of its own so the subreaper flag and the adopted orphans are
-// really its own.
+// really its own. The mode in the environment selects the shape the helper
+// runs in: PID 1 of a fresh PID namespace, or an ordinary process with a
+// living ancestor, which is the shape a host that forbids user namespaces can
+// still exercise and the shape in which the worker's own process accounting
+// closes.
 func TestWorkerContainmentHelper(t *testing.T) {
-	if os.Getenv(containmentHelperEnv) == "" {
+	mode := os.Getenv(containmentHelperEnv)
+	if mode == "" {
 		return
 	}
-	if os.Getpid() != 1 {
-		t.Fatalf("helper is pid %d, not 1: the PID namespace was not obtained", os.Getpid())
+	switch mode {
+	case containmentHelperPIDOne:
+		if os.Getpid() != 1 {
+			t.Fatalf("helper is pid %d, not 1: the PID namespace was not obtained", os.Getpid())
+		}
+	case containmentHelperSubreaper:
+		if os.Getpid() == 1 {
+			t.Fatalf("helper is pid 1: the living-ancestor path must run as an ordinary process")
+		}
+	default:
+		t.Fatalf("unknown containment helper mode %q", mode)
 	}
 	if err := ArmAdoptedChildReaper(); err != nil {
 		t.Fatalf("arm adopted-child reaper: %v", err)
 	}
+	// The funnel's own claims hold in either shape: a supervised task leader
+	// keeps the exit status os/exec produced for it, and it keeps the signal
+	// status os/exec reports.
+	helperKeepsExitStatus(t)
+	helperKeepsSignalStatus(t)
+	// The collection claims belong to the living-ancestor mode alone. The
+	// worker reads its children through the procfs instance, and a procfs
+	// instance belongs to the pid namespace it was mounted in: in the
+	// PID-namespace mode that is the outer namespace, so the pids the worker
+	// enumerates are not the pids its own wait can name and its reaper cannot
+	// collect anything there. The living-ancestor mode shares one namespace
+	// between the process and the procfs — the pod's own namespace
+	// relationship — and there the reaper's bookkeeping closes.
+	if mode == containmentHelperSubreaper {
+		helperReapsUnsupervisedChild(t)
+		helperReapsOrphanedTree(t)
+		helperSurvivesChurn(t)
+		helperLeavesLiveChildAlone(t)
+	}
+	fmt.Printf("reaped=%d\n", containment.reaped.Load())
+}
 
-	// A supervised task leader keeps the exit status os/exec produced for it,
-	// even while the reaper is collecting orphans around it.
+// helperKeepsExitStatus is the first half of the contract: a supervised task
+// leader keeps the exit status os/exec produced for it, even while the reaper
+// is collecting orphans around it. The child goes through the funnel, so the
+// status is the funnel's to protect.
+func helperKeepsExitStatus(t *testing.T) {
+	t.Helper()
 	supervised := exec.Command("sh", "-c", "exit 7")
 	if err := containment.startTaskChild(supervised); err != nil {
 		t.Fatalf("start supervised child: %v", err)
@@ -107,90 +243,248 @@ func TestWorkerContainmentHelper(t *testing.T) {
 	if !errors.As(waitErr, &exitErr) || exitErr.ExitCode() != 7 {
 		t.Fatalf("supervised child's status = %v, want exit 7 owned by os/exec", waitErr)
 	}
+}
 
-	// A child nobody waits for becomes a zombie adopted child, and the
-	// reaper — not the test — is what collects it. A zombie's /proc entry
-	// stays until someone reaps it, so the entry's disappearance is the
-	// proof.
+// helperKeepsSignalStatus is the signal half of the same contract: a task
+// leader that dies by a signal keeps the signal status os/exec reports, not a
+// substitute the reaper produced on its way past.
+func helperKeepsSignalStatus(t *testing.T) {
+	t.Helper()
+	killed := exec.Command("sh", "-c", "kill -9 $$")
+	if err := containment.startTaskChild(killed); err != nil {
+		t.Fatalf("start self-signalled child: %v", err)
+	}
+	waitErr := killed.Wait()
+	containment.releaseTaskChild(killed.Process.Pid)
+	var exitErr *exec.ExitError
+	if !errors.As(waitErr, &exitErr) {
+		t.Fatalf("self-signalled child's status = %v, want a death by signal", waitErr)
+	}
+	status, ok := exitErr.Sys().(syscall.WaitStatus)
+	if !ok || !status.Signaled() || status.Signal() != syscall.SIGKILL {
+		t.Fatalf("self-signalled child's status = %v, want death by SIGKILL", exitErr.Sys())
+	}
+}
+
+// helperReapsUnsupervisedChild is the reaper's own claim: a child nobody
+// waits for becomes a zombie adopted child, and the reaper — not the test —
+// is what collects it. A zombie's /proc entry stays until someone reaps it,
+// so the entry's disappearance is the proof. The child is deliberately
+// started outside the funnel: its exit status belongs to the reaper, and the
+// test asserts none for it.
+func helperReapsUnsupervisedChild(t *testing.T) {
+	t.Helper()
 	orphan := exec.Command("sh", "-c", "exit 0")
 	if err := orphan.Start(); err != nil {
 		t.Fatalf("start unsupervised child: %v", err)
 	}
 	waitForGone(t, orphan.Process.Pid, "zombie child")
+}
 
-	// A deeper tree converges the same way: the parent is collected first,
-	// its orphaned descendant is adopted in turn, and the reaper collects it
-	// too instead of leaving it behind for the pod's lifetime.
+// helperReapsOrphanedTree is the deeper shape: a task tree whose parent
+// exits normally leaves its descendant orphaned, the kernel hands that
+// descendant to the helper, and the reaper collects it too instead of leaving
+// it behind for the pod's lifetime. The parent's own status is the funnel's
+// to keep, so the parent goes through the funnel as well.
+func helperReapsOrphanedTree(t *testing.T) {
+	t.Helper()
+	before := containment.reaped.Load()
 	dir := t.TempDir()
-	tree := exec.Command("sh", "-c", "sleep 1 & echo $! > tree-child.txt; wait")
+	// The descendant outlives the adoption bound, so the adoption is
+	// observed on a live process rather than raced against its death.
+	tree := exec.Command("sh", "-c", "sleep 30 & echo $! > tree-child.txt; exit 0")
 	tree.Dir = dir
-	if err := tree.Start(); err != nil {
-		t.Fatalf("start unsupervised tree: %v", err)
+	if err := containment.startTaskChild(tree); err != nil {
+		t.Fatalf("start task tree: %v", err)
 	}
 	treePID := tree.Process.Pid
-	if err := syscall.Kill(treePID, syscall.SIGKILL); err != nil {
-		t.Fatalf("kill unsupervised tree: %v", err)
+	waitErr := tree.Wait()
+	containment.releaseTaskChild(treePID)
+	if waitErr != nil {
+		t.Fatalf("task tree's status = %v, want the exit 0 its own shell produced", waitErr)
 	}
-	grandchild := 0
-	deadline := time.Now().Add(containmentAdoptLimit)
-	for grandchild == 0 {
-		if time.Now().After(deadline) {
-			t.Fatal("orphaned grandchild never reported its pid")
-		}
-		if data, err := os.ReadFile(filepath.Join(dir, "tree-child.txt")); err == nil {
-			grandchild, _ = strconv.Atoi(strings.TrimSpace(string(data)))
-		}
-		time.Sleep(20 * time.Millisecond)
+	grandchild := waitForTreeChildPID(t, filepath.Join(dir, "tree-child.txt"))
+	t.Cleanup(func() { _ = syscall.Kill(grandchild, syscall.SIGKILL) })
+	// The kernel hands the orphan over: the descendant's parent becomes the
+	// helper's own pid, which is the adoption the child-subreaper flag buys
+	// when the helper is not PID 1.
+	waitForAdoption(t, grandchild)
+	// The descendant dies only once its adoption is proven, and the reaper
+	// is what collects it: the entry's disappearance is the descendant's
+	// proof, and the counter's movement is the reaper's own claim beside it.
+	if err := syscall.Kill(grandchild, syscall.SIGKILL); err != nil {
+		t.Fatalf("kill orphaned grandchild %d: %v", grandchild, err)
 	}
-	deadline = time.Now().Add(containmentAdoptLimit)
-	for {
-		_, treeGone := os.Stat("/proc/" + strconv.Itoa(treePID))
-		_, childGone := os.Stat("/proc/" + strconv.Itoa(grandchild))
-		if os.IsNotExist(treeGone) && os.IsNotExist(childGone) {
-			break
-		}
-		if time.Now().After(deadline) {
-			t.Fatalf("adopted tree %d/%d was never fully reaped", treePID, grandchild)
-		}
-		time.Sleep(20 * time.Millisecond)
-	}
+	waitForGone(t, grandchild, "orphaned grandchild")
+	waitForReapedCount(t, before+1, containmentAdoptLimit)
+}
 
-	// The live-orphan half of the contract: a live adopted descendant is
-	// never signalled by the reaper. Reaping is the whole job.
+// helperSurvivesChurn is the shape a real run produces over hours: a task
+// that forks a short-lived descendant and exits, turn after turn. Every one of
+// those descendants is adopted by the helper and collected, and none of them
+// may be left behind as a zombie.
+func helperSurvivesChurn(t *testing.T) {
+	t.Helper()
+	before := containment.reaped.Load()
+	for turn := 0; turn < containmentChurnTurns; turn++ {
+		child := exec.Command("sh", "-c", "sleep 0.05 & exit 0")
+		if err := containment.startTaskChild(child); err != nil {
+			t.Fatalf("start churn turn %d: %v", turn, err)
+		}
+		waitErr := child.Wait()
+		containment.releaseTaskChild(child.Process.Pid)
+		if waitErr != nil {
+			t.Fatalf("churn turn %d status = %v, want the exit 0 its own shell produced", turn, waitErr)
+		}
+	}
+	waitForReapedCount(t, before+containmentChurnTurns, containmentChurnLimit)
+	waitForNoZombieChildren(t)
+}
+
+// helperLeavesLiveChildAlone is the live-child half of the contract: a
+// descendant that is still running is never signalled by the reaper. Reaping
+// is the whole job.
+func helperLeavesLiveChildAlone(t *testing.T) {
+	t.Helper()
 	live := exec.Command("sh", "-c", "exec sleep 30")
 	if err := live.Start(); err != nil {
-		t.Fatalf("start live orphan: %v", err)
+		t.Fatalf("start live child: %v", err)
 	}
 	livePID := live.Process.Pid
-	time.Sleep(300 * time.Millisecond)
-	if !descendantLive(livePID) {
-		t.Fatalf("live orphan %d was disturbed by the reaper", livePID)
+	// The child holds the helper's output descriptors, so a failed
+	// assertion must not leave it behind: the cleanup kills it whatever the
+	// assertion says.
+	t.Cleanup(func() { _ = syscall.Kill(livePID, syscall.SIGKILL) })
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		if !descendantLive(livePID) {
+			t.Fatalf("live child %d was disturbed by the reaper", livePID)
+		}
+		time.Sleep(containmentPoll)
 	}
-	// Nothing outlives the helper: the live orphan is killed here and the
+	// Nothing outlives the helper: the live child is killed here and the
 	// reaper is what collects it, so the test leaves no process of its own.
 	if err := syscall.Kill(livePID, syscall.SIGKILL); err != nil {
-		t.Fatalf("kill live orphan %d: %v", livePID, err)
+		t.Fatalf("kill live child %d: %v", livePID, err)
 	}
-	waitForGone(t, livePID, "killed live orphan")
-	if containment.reaped.Load() < 3 {
-		t.Fatalf("reaper collected %d orphans, want at least 3", containment.reaped.Load())
-	}
-	fmt.Printf("reaped=%d\n", containment.reaped.Load())
+	waitForGone(t, livePID, "killed live child")
 }
 
 // waitForGone asserts that a pid's /proc entry has disappeared — reaped,
-// not merely stopped: a zombie keeps its entry.
+// not merely stopped: a zombie keeps its entry. The read is the worker's own
+// process reader, and a read that fails for any reason other than a
+// confirmed disappearance is not evidence of absence: it fails the assertion
+// closed.
 func waitForGone(t *testing.T, pid int, what string) {
 	t.Helper()
 	deadline := time.Now().Add(containmentAdoptLimit)
 	for {
-		if _, err := os.Stat("/proc/" + strconv.Itoa(pid)); os.IsNotExist(err) {
-			return
+		_, err := processStat(pid)
+		if err != nil {
+			if errors.Is(err, errProcessGone) {
+				return
+			}
+			t.Fatalf("stat of %s %d is unreadable: %v", what, pid, err)
 		}
 		if time.Now().After(deadline) {
 			t.Fatalf("%s %d was never reaped", what, pid)
 		}
-		time.Sleep(20 * time.Millisecond)
+		time.Sleep(containmentPoll)
+	}
+}
+
+// waitForAdoption waits until the kernel has handed pid to this process,
+// which is the adoption the child-subreaper flag buys when the helper is not
+// PID 1. The stat is the worker's own reader, so a read that fails for any
+// reason other than a confirmed disappearance fails the wait closed.
+func waitForAdoption(t *testing.T, pid int) {
+	t.Helper()
+	deadline := time.Now().Add(containmentAdoptLimit)
+	for {
+		info, err := processStat(pid)
+		if err != nil {
+			if errors.Is(err, errProcessGone) {
+				t.Fatalf("descendant %d was gone before it was adopted", pid)
+			}
+			t.Fatalf("stat of descendant %d is unreadable: %v", pid, err)
+		}
+		if info.ppid == os.Getpid() {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("descendant %d was not adopted by pid %d within %s (its parent is %d)",
+				pid, os.Getpid(), containmentAdoptLimit, info.ppid)
+		}
+		time.Sleep(containmentPoll)
+	}
+}
+
+// waitForTreeChildPID reads the pid a task tree reported for its descendant.
+// A pid that never arrives is a failure, not a hang.
+func waitForTreeChildPID(t *testing.T, path string) int {
+	t.Helper()
+	deadline := time.Now().Add(containmentAdoptLimit)
+	for {
+		data, err := os.ReadFile(path)
+		if err == nil {
+			if pid, convErr := strconv.Atoi(strings.TrimSpace(string(data))); convErr == nil && pid > 0 {
+				return pid
+			}
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("task tree never reported its descendant's pid in %s", path)
+		}
+		time.Sleep(containmentPoll)
+	}
+}
+
+// waitForReapedCount waits until the reaper has collected at least want
+// adopted descendants.
+func waitForReapedCount(t *testing.T, want uint64, limit time.Duration) {
+	t.Helper()
+	deadline := time.Now().Add(limit)
+	for containment.reaped.Load() < want {
+		if time.Now().After(deadline) {
+			t.Fatalf("the reaper collected %d adopted descendants, want %d within %s",
+				containment.reaped.Load(), want, limit)
+		}
+		time.Sleep(containmentPoll)
+	}
+}
+
+// waitForNoZombieChildren waits until no child of this process is a zombie:
+// the accumulation the reaper exists to prevent. The listing is the worker's
+// own enumeration, and a stat that cannot be read for any reason other than
+// a confirmed disappearance fails the wait closed.
+func waitForNoZombieChildren(t *testing.T) {
+	t.Helper()
+	deadline := time.Now().Add(containmentChurnLimit)
+	for {
+		pids, err := directChildPIDs()
+		if err != nil {
+			t.Fatalf("enumerate the helper's children: %v", err)
+		}
+		var zombies []int
+		for _, pid := range pids {
+			info, statErr := processStat(pid)
+			if statErr != nil {
+				if errors.Is(statErr, errProcessGone) {
+					continue
+				}
+				t.Fatalf("stat of child %d is unreadable: %v", pid, statErr)
+			}
+			if info.state == "Z" {
+				zombies = append(zombies, pid)
+			}
+		}
+		if len(zombies) == 0 {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("children %v are still zombies %s after the turns that created them exited",
+				zombies, containmentChurnLimit)
+		}
+		time.Sleep(containmentPoll)
 	}
 }
 
