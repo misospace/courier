@@ -953,7 +953,7 @@
       "id": 18,
       "type": "timeseries",
       "title": "Lifecycle: report outcome mix",
-      "description": "Lifecycle report attempt outcomes per source over the last 10m: published, superseded, unsupported, and retryable. A sustained retryable stream is a broken source contract or credential problem.",
+      "description": "Lifecycle report attempt outcomes per source over the last 10m: published, superseded, unsupported, retryable, and permanent-refusal. A sustained retryable stream is a broken source contract or credential problem.",
       "datasource": {
         "type": "prometheus",
         "uid": "${DS_PROMETHEUS}"

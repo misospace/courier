@@ -91,7 +91,7 @@ controller-runtime on the `--metrics-bind-address` endpoint (default `:8080`,
 | `courier_coderun_infra_restarts_total` | counter | `lane`, `mode` | positive `Status.Restarts` deltas — coordinator infra relaunches charged to a run |
 | `courier_coderun_verification_outcomes_total` | counter | `lane`, `mode`, `result` | `Verifying` exits: `green` (→`AwaitingReview`), `red` (→`Failed`/`HandedOff`), `unobservable` (→`NeedsHuman`); `Verifying` exits outside that vocabulary are not counted |
 | `courier_coderun_tokens_total` | counter | `lane`, `mode`, `kind` | per-kind token deltas from `status.telemetry.tokens` (`input`, `output`, `reasoning`, `cache-read`, `cache-write`); the derived `total` is not a series |
-| `courier_source_lifecycle_report_outcomes_total` | counter | `source`, `lane`, `mode`, `result` | one per lifecycle-report attempt outcome: `published`, `superseded`, `unsupported`, `retryable` |
+| `courier_source_lifecycle_report_outcomes_total` | counter | `source`, `lane`, `mode`, `result` | one per lifecycle-report attempt outcome: `published`, `superseded`, `unsupported`, `retryable`, `permanent-refusal` |
 | `courier_coderuns_in_flight` | gauge | `lane` | live cluster read at scrape; counts `Claimed`+`Running` |
 | `courier_lane_suspended` | gauge | `lane` | 1 suspended, 0 active; live read at scrape |
 | `courier_lane_concurrency` | gauge | `lane` | configured `LaneProfile.Spec.Concurrency` (a non-positive setting is reported as 1); live read at scrape |
@@ -305,7 +305,7 @@ Lifecycle reporting answers: *did the operator tell the source what happened?*
 | --- | --- | --- | --- | --- | --- |
 | `LifecycleReported` condition | Report settlement per run | `Conditions` | condition status/reason per terminal run | missing condition ⇒ "unknown", never "reported" | status |
 | Pending reports | Reports not yet settled | `courier_coderuns_lifecycle_pending`, `courier_coderuns_lifecycle_pending_oldest_age_seconds`, `LifecycleReported=False`, retry tokens | count and age of unsettled reports | none ⇒ zero | today |
-| Report outcome mix | Published/superseded/unsupported/retryable | `courier_source_lifecycle_report_outcomes_total` | counts by outcome | — | today |
+| Report outcome mix | Published/superseded/unsupported/retryable/permanent-refusal | `courier_source_lifecycle_report_outcomes_total` | counts by outcome | — | today |
 | Report latency | Time from terminal to settled | report latency histogram (gap) | seconds | — | **gap** |
 
 A terminal run whose report never settles is a real degradation: the source
