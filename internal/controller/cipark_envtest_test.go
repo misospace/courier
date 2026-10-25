@@ -21,10 +21,12 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	courierv1alpha1 "github.com/misospace/courier/api/v1alpha1"
 	"github.com/misospace/courier/internal/executor"
+	"github.com/misospace/courier/internal/forge"
 	"github.com/misospace/courier/internal/source"
 	"github.com/misospace/courier/internal/status"
 )
@@ -59,13 +61,14 @@ func (w *ciparkWorld) set(observation PRObservation) {
 // ciparkHarness drives one run through the park-and-resume loop against the
 // real API server.
 type ciparkHarness struct {
-	t          *testing.T
-	name       string
-	laneName   string
-	adapter    source.Adapter
-	world      *ciparkWorld
-	launched   []string
-	reconciler *CoderRunReconciler
+	t            *testing.T
+	name         string
+	laneName     string
+	adapter      source.Adapter
+	world        *ciparkWorld
+	launched     []string
+	pullRequests *fakePullRequestReader
+	reconciler   *CoderRunReconciler
 }
 
 // newCIParkHarness creates the lane, the run, and the reconciler that drives
@@ -99,7 +102,18 @@ func (h *ciparkHarness) newReconciler() *CoderRunReconciler {
 		StatusWriter: status.KubePatchWriter{Client: envtestClient},
 		Observer:     h.world,
 		Launch:       h.launch,
+		PullRequests: h.pullRequests,
 	}
+}
+
+// usePullRequests gives the harness's reconciler the forge read-pull-request
+// capability the post-review merge observation reads through. The reconciler
+// is rebuilt the way a deployment wires it, so the capability is present from
+// the start of the scenario.
+func (h *ciparkHarness) usePullRequests(reader *fakePullRequestReader) {
+	h.t.Helper()
+	h.pullRequests = reader
+	h.reconciler = h.newReconciler()
 }
 
 // launch starts the coordinator of one run. A repair relaunches the same run,
@@ -149,15 +163,47 @@ func (h *ciparkHarness) reconcile() {
 // reconcileRun runs one reconcile of another run on the harness's lane.
 func (h *ciparkHarness) reconcileRun(name string) {
 	h.t.Helper()
-	if _, err := h.reconciler.Reconcile(context.Background(), envtestRequest(name)); err != nil {
+	h.reconcileResultOf(name)
+}
+
+// reconcileResult runs one reconcile of the harness's run and returns its
+// result, so a scenario can pin the wake interval the reconcile asks for.
+func (h *ciparkHarness) reconcileResult() ctrl.Result {
+	h.t.Helper()
+	return h.reconcileResultOf(h.name)
+}
+
+// reconcileResultOf runs one reconcile of another run on the harness's lane
+// and returns its result.
+func (h *ciparkHarness) reconcileResultOf(name string) ctrl.Result {
+	h.t.Helper()
+	result, err := h.reconciler.Reconcile(context.Background(), envtestRequest(name))
+	if err != nil {
 		h.t.Fatal(err)
 	}
+	return result
 }
 
 // run reads the harness's run back from the API server.
 func (h *ciparkHarness) run() *courierv1alpha1.CoderRun {
 	h.t.Helper()
 	return h.runNamed(h.name)
+}
+
+// runExists reports whether the harness's run is still in the API server, so
+// a scenario can pin whether the reaper took it away.
+func (h *ciparkHarness) runExists() bool {
+	h.t.Helper()
+	var run courierv1alpha1.CoderRun
+	err := envtestClient.Get(context.Background(), envtestKey(h.name), &run)
+	if err == nil {
+		return true
+	}
+	if apierrors.IsNotFound(err) {
+		return false
+	}
+	h.t.Fatal(err)
+	return false
 }
 
 // runNamed reads another run back from the API server.
@@ -241,6 +287,46 @@ func (h *ciparkHarness) settleFailure(head string, names ...string) {
 	h.world.set(redObservation(head, names...))
 	h.reconcile()
 	h.reconcile()
+}
+
+// closeOwedReview drives the harness's run into the shape a terminal run
+// carries when it still owes the source a park close: the repair consumed an
+// attempt, so the settlement carries the fence the reservation granted, and
+// the source's refusal to accept it keeps the close pending on the run.
+//
+// The run ends in AwaitingReview with the exact pull-request identity it
+// published, so a scenario can observe that identity for a merge.
+func (h *ciparkHarness) closeOwedReview() {
+	h.t.Helper()
+	h.park("sha-1", CheckObservation{Name: "build", State: CheckStatePending})
+	h.settleFailure("sha-1", "build")
+	// The repair wakes the same run for one bounded attempt.
+	h.reconcile()
+	h.reconcile()
+	// The repair republishes a new head, and the repushed outcome is the
+	// close the source refuses to accept.
+	h.publishHead("sha-2")
+	h.world.set(greenObservation("sha-2", "build"))
+	h.reconcile()
+	h.reconcile()
+	if got := h.phase(); got != courierv1alpha1.PhaseAwaitingReview {
+		h.t.Fatalf("phase after the settled green observation = %q, want AwaitingReview", got)
+	}
+	owed := h.run()
+	if owed.Status.CISettlement == nil {
+		h.t.Fatal("status.ciSettlement = nil, want the pending close the source refuses")
+	}
+	if owed.Status.CISettlement.FenceToken == "" {
+		h.t.Fatal("pending close fence token = empty, want the reserved fence")
+	}
+	if owed.Status.CIPark == nil || owed.Status.CIPark.Attempts == 0 {
+		h.t.Fatalf("park record = %#v, want a consumed attempt the close reports", owed.Status.CIPark)
+	}
+	// The recorded pull-request identity the merge observation reads by.
+	if owed.Status.PR != "42" || owed.Status.Branch != "courier/acme/widgets/issue-14" || owed.Status.HeadRepo != "acme/widgets" {
+		h.t.Fatalf("recorded pull-request identity = PR %q branch %q head repo %q, want the identity the observation reads",
+			owed.Status.PR, owed.Status.Branch, owed.Status.HeadRepo)
+	}
 }
 
 // TestEnvtestCIParkRepairsRedMechanicalCI pins the whole repair loop: a red
@@ -1440,5 +1526,262 @@ func TestEnvtestCIParkWindowBoundsTheWaitForCapacity(t *testing.T) {
 	run := h.run()
 	if run.Status.CIPark == nil || run.Status.CIPark.LastOutcome != courierv1alpha1.CIParkOutcomeUnsupported {
 		t.Fatalf("park record = %#v, want the unsupported outcome", run.Status.CIPark)
+	}
+}
+
+// failingSettlementSource models a source that answers the park close report
+// with an ordinary — retryable, never-permanent — error: the close stays owed
+// on the run, so the operator keeps re-presenting it. The refusal is
+// deliberately not source.ErrUnsupportedCIPark, which is permanent and drops
+// the pending record instead of retrying it. Flipping accepted lets the close
+// land, so a scenario can watch the owed close reach the source.
+type failingSettlementSource struct {
+	ciparkSource
+	accepted bool
+}
+
+func (s *failingSettlementSource) ReportCIRepair(_ context.Context, item source.WorkItem, outcome source.CIRepairOutcome) error {
+	s.items = append(s.items, item)
+	s.outcomes = append(s.outcomes, outcome)
+	if s.accepted {
+		return nil
+	}
+	return errors.New("dispatch server: unavailable")
+}
+
+// reviewPullRequest is the pull request the harness's merge observation reads:
+// the run's own recorded identity, in the state the scenario needs.
+func reviewPullRequest(state string, merged bool) forge.PullRequest {
+	return forge.PullRequest{
+		Number:   42,
+		Repo:     "acme/widgets",
+		BaseRepo: "acme/widgets",
+		HeadRepo: "acme/widgets",
+		HeadRef:  "courier/acme/widgets/issue-14",
+		HeadSHA:  "sha-2",
+		State:    state,
+		Merged:   merged,
+	}
+}
+
+// TestEnvtestCIParkPendingCloseNeverPreemptsLifecycleReport pins the first
+// clause of the terminal posture: a park close the source keeps refusing
+// never stands in front of a terminal run's pending lifecycle report. The
+// report is retried on the very reconcile that re-presents the close.
+func TestEnvtestCIParkPendingCloseNeverPreemptsLifecycleReport(t *testing.T) {
+	if envtestClient == nil {
+		t.Skip("KUBEBUILDER_ASSETS is not set")
+	}
+	adapter := &failingSettlementSource{}
+	// The source never accepts the in-review lifecycle either, so the run
+	// keeps a pending report to retry.
+	adapter.reportErr = errors.New("dispatch server: unavailable")
+	h := newCIParkHarness(t, "cipark-close-lifecycle", ciparkPolicy(2), adapter)
+	now := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	h.reconciler.Now = func() time.Time { return now }
+	h.closeOwedReview()
+
+	if !lifecycleReportPending(h.run()) {
+		t.Fatal("lifecycleReported is not pending, want the pending in-review report")
+	}
+
+	reportsBefore := len(adapter.reports)
+	closesBefore := len(adapter.outcomes)
+	h.reconcileResult()
+	if len(adapter.reports) != reportsBefore+1 {
+		t.Fatalf("source lifecycle reports = %d, want the pending report retried (%d before)", len(adapter.reports), reportsBefore)
+	}
+	if len(adapter.outcomes) != closesBefore+1 {
+		t.Fatalf("source close reports = %d, want the close re-presented (%d before)", len(adapter.outcomes), closesBefore)
+	}
+	if got := h.phase(); got != courierv1alpha1.PhaseAwaitingReview {
+		t.Fatalf("phase after the report retry = %q, want AwaitingReview", got)
+	}
+	if h.run().Status.CISettlement == nil {
+		t.Fatal("status.ciSettlement = nil, want the pending close to stay owed")
+	}
+	// The wake interval is not asserted here: the report retry and the close
+	// re-presentation share one 30s cadence, so the value cannot
+	// discriminate. The cadence scenario pins the cap against the
+	// observation's uncapped five-minute wake.
+}
+
+// TestEnvtestCIParkPendingCloseNeverPreemptsMergeObservation pins the second
+// clause: a park close the source keeps refusing never stands in front of a
+// terminal run's merge observation. The recorded pull request is still read,
+// and a confirmed merge still finishes the run.
+func TestEnvtestCIParkPendingCloseNeverPreemptsMergeObservation(t *testing.T) {
+	if envtestClient == nil {
+		t.Skip("KUBEBUILDER_ASSETS is not set")
+	}
+	adapter := &failingSettlementSource{}
+	h := newCIParkHarness(t, "cipark-close-observation", ciparkPolicy(2), adapter)
+	reader := &fakePullRequestReader{pull: reviewPullRequest("closed", true)}
+	h.usePullRequests(reader)
+	now := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	h.reconciler.Now = func() time.Time { return now }
+	h.closeOwedReview()
+
+	// The source accepted the in-review lifecycle, so the merge observation
+	// may read the recorded pull request.
+	if !lifecycleReportSettled(h.run()) {
+		t.Fatal("lifecycleReported is not settled, want the published in-review report")
+	}
+
+	result := h.reconcileResult()
+	if reader.calls != 1 {
+		t.Fatalf("pull-request reads = %d, want exactly one exact read", reader.calls)
+	}
+	if len(reader.requests) != 1 || reader.requests[0] != (forge.PullRequestRef{Repo: "acme/widgets", Number: 42}) {
+		t.Fatalf("reads = %#v, want one exact read of PR 42 in the run's base repository", reader.requests)
+	}
+	if got := h.phase(); got != courierv1alpha1.PhaseDone {
+		t.Fatalf("phase after the confirmed merge = %q, want Done", got)
+	}
+	if result.RequeueAfter != ciparkSettlementRetryDelay {
+		t.Fatalf("RequeueAfter = %v, want the settlement cadence %v", result.RequeueAfter, ciparkSettlementRetryDelay)
+	}
+	// The close is still owed: a Done run keeps re-presenting it instead of
+	// resolving and reaping the source work with the close outstanding.
+	if h.run().Status.CISettlement == nil {
+		t.Fatal("status.ciSettlement = nil, want the pending close to stay owed")
+	}
+}
+
+// TestEnvtestCIParkPendingCloseKeepsTheSlowObservationCadence pins the
+// cadence: the close retry wakes the reconcile every settlement interval, but
+// the merge observation keeps its own slow cadence under a durable marker, so
+// the forge is not sampled faster than the observation allows.
+func TestEnvtestCIParkPendingCloseKeepsTheSlowObservationCadence(t *testing.T) {
+	if envtestClient == nil {
+		t.Skip("KUBEBUILDER_ASSETS is not set")
+	}
+	adapter := &failingSettlementSource{}
+	h := newCIParkHarness(t, "cipark-close-cadence", ciparkPolicy(2), adapter)
+	reader := &fakePullRequestReader{pull: reviewPullRequest("open", false)}
+	h.usePullRequests(reader)
+	now := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	h.reconciler.Now = func() time.Time { return now }
+	h.closeOwedReview()
+
+	closesBefore := len(adapter.outcomes)
+	first := h.reconcileResult()
+	if reader.calls != 1 {
+		t.Fatalf("pull-request reads = %d, want exactly one observation", reader.calls)
+	}
+	if len(adapter.outcomes) != closesBefore+1 {
+		t.Fatalf("source close reports = %d, want the close re-presented on the reconcile (%d before)", len(adapter.outcomes), closesBefore)
+	}
+	if first.RequeueAfter != ciparkSettlementRetryDelay {
+		t.Fatalf("first RequeueAfter = %v, want the settlement cadence cap %v", first.RequeueAfter, ciparkSettlementRetryDelay)
+	}
+
+	// The next reconcile comes well inside the slow cadence. The close is
+	// re-presented, but the observation must not sample the forge again.
+	now = now.Add(20 * time.Second)
+	second := h.reconcileResult()
+	if reader.calls != 1 {
+		t.Fatalf("pull-request reads = %d, want the slow observation cadence to hold", reader.calls)
+	}
+	if len(adapter.outcomes) != closesBefore+2 {
+		t.Fatalf("source close reports = %d, want the close re-presented on every reconcile", len(adapter.outcomes))
+	}
+	if second.RequeueAfter != ciparkSettlementRetryDelay {
+		t.Fatalf("second RequeueAfter = %v, want the settlement cadence cap %v", second.RequeueAfter, ciparkSettlementRetryDelay)
+	}
+
+	// The marker is durable and the observation is due again once the slow
+	// cadence has passed.
+	now = now.Add(mergeObservationRequeueDelay)
+	h.reconcileResult()
+	if reader.calls != 2 {
+		t.Fatalf("pull-request reads = %d, want the observation to be due again", reader.calls)
+	}
+}
+
+// TestEnvtestCIParkOwedCloseIsNeverReapedAway pins the retention gate: a
+// terminal run that still owes the source a park close is not reaped while
+// the close is outstanding, because deleting the run would drop the owed
+// close with the object. Its retention window starts only once the close has
+// landed, so the gate never wedges the run forever.
+func TestEnvtestCIParkOwedCloseIsNeverReapedAway(t *testing.T) {
+	if envtestClient == nil {
+		t.Skip("KUBEBUILDER_ASSETS is not set")
+	}
+	adapter := &failingSettlementSource{}
+	h := newCIParkHarness(t, "cipark-close-reap", ciparkPolicy(2), adapter)
+	now := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	h.reconciler.Now = func() time.Time { return now }
+	// A short retention and no audit floor, so the retention window is the
+	// only thing that decides the run's life.
+	h.reconciler.FailedRetention = time.Minute
+	h.reconciler.TerminalAuditKeep = -1
+	h.closeOwedReview()
+
+	// The run terminalizes with its close outstanding: the pending settlement
+	// is the owed close the source keeps refusing.
+	terminal := h.run()
+	terminal.Status.Phase = courierv1alpha1.PhaseFailed
+	if err := envtestClient.Status().Update(context.Background(), terminal); err != nil {
+		t.Fatal(err)
+	}
+	if !lifecycleReportSettled(h.run()) {
+		t.Fatal("lifecycleReported is not settled, want the published report the reap path requires")
+	}
+
+	// The first reconcile of the terminal run: the close is re-presented, and
+	// the retention window never starts while the close is owed.
+	closesBefore := len(adapter.outcomes)
+	h.reconcileResult()
+	if !h.runExists() {
+		t.Fatal("run deleted while the park close was still owed")
+	}
+	if len(adapter.outcomes) != closesBefore+1 {
+		t.Fatalf("source close reports = %d, want the close re-presented on the reconcile (%d before)", len(adapter.outcomes), closesBefore)
+	}
+	if h.run().Status.CISettlement == nil {
+		t.Fatal("status.ciSettlement = nil, want the pending close to stay owed")
+	}
+
+	// The retention window expires while the close is still owed: the run
+	// survives, and the close is still owed.
+	now = now.Add(2 * time.Minute)
+	closesBefore = len(adapter.outcomes)
+	result := h.reconcileResult()
+	if !h.runExists() {
+		t.Fatal("run deleted while the park close was still owed")
+	}
+	if len(adapter.outcomes) != closesBefore+1 {
+		t.Fatalf("source close reports = %d, want the close re-presented on the reconcile (%d before)", len(adapter.outcomes), closesBefore)
+	}
+	if h.run().Status.CISettlement == nil {
+		t.Fatal("status.ciSettlement = nil, want the pending close to stay owed")
+	}
+	if result.RequeueAfter != ciparkSettlementRetryDelay {
+		t.Fatalf("RequeueAfter = %v, want the settlement cadence %v", result.RequeueAfter, ciparkSettlementRetryDelay)
+	}
+
+	// The source accepts the close: the record clears, and the retention
+	// window starts from that moment.
+	adapter.accepted = true
+	closesBefore = len(adapter.outcomes)
+	h.reconcileResult()
+	if len(adapter.outcomes) != closesBefore+1 {
+		t.Fatalf("source close reports = %d, want the close re-presented on the reconcile (%d before)", len(adapter.outcomes), closesBefore)
+	}
+	delivered := h.run()
+	if delivered.Status.CISettlement != nil {
+		t.Fatalf("status.ciSettlement = %#v after the source accepted the close, want nil", delivered.Status.CISettlement)
+	}
+	if !h.runExists() {
+		t.Fatal("run deleted by the first reap-eligible reconcile; the retention window must start instead")
+	}
+
+	// Past the fresh window the run is reaped on the normal schedule: the
+	// gate held it only while the close was outstanding.
+	now = now.Add(2 * time.Minute)
+	h.reconcileResult()
+	if h.runExists() {
+		t.Fatal("run still present past the retention window, want the reaped run")
 	}
 }
