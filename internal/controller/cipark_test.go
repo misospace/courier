@@ -307,3 +307,26 @@ func TestCIParkCapacityReacquisitionReadsLiveReaderNotLaggingCache(t *testing.T)
 		t.Fatal("ciparkCapacityAvailable() = false after the slot freed, want true")
 	}
 }
+
+// TestSettleCIRollbackWithoutAFence pins the no-op guard: a claim rollback
+// whose cleared repair context carries no source-granted fence records
+// nothing, because there is no grant to answer.
+func TestSettleCIRollbackWithoutAFence(t *testing.T) {
+	reconciler := &CoderRunReconciler{}
+
+	noContext := &courierv1alpha1.CoderRun{}
+	reconciler.settleCIRollback(noContext)
+	if noContext.Status.CISettlement != nil {
+		t.Fatalf("settlement = %#v with no repair context, want nil", noContext.Status.CISettlement)
+	}
+
+	unfenced := &courierv1alpha1.CoderRun{}
+	unfenced.Status.CIRepair = &courierv1alpha1.CIRepairContext{Head: "abc123", Attempt: 1}
+	reconciler.settleCIRollback(unfenced)
+	if unfenced.Status.CISettlement != nil {
+		t.Fatalf("settlement = %#v for an unfenced context, want nil", unfenced.Status.CISettlement)
+	}
+	if unfenced.Status.CIRepair != nil {
+		t.Fatalf("repair context = %#v, want cleared", unfenced.Status.CIRepair)
+	}
+}
