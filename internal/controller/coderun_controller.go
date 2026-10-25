@@ -80,10 +80,12 @@ type CoderRunReconciler struct {
 	// The pod-loss backstop uses it to confirm a missing coordinator really is
 	// gone before charging a relaunch: a cache that has not caught up must not
 	// be mistaken for infrastructure loss, and infrastructure loss must not be
-	// hidden by a cache that never delivers the pod. It is required in
-	// production — SetupWithManager rejects a nil reader so the pod-loss
-	// confirmation can never fall back to cached state; the reader()
-	// fallback serves only direct-construction tests.
+	// hidden by a cache that never delivers the pod. The lane capacity count —
+	// ordinary admission and CI-repair reacquisition alike — reads through it
+	// too, so a just-persisted Claimed admission is never missed by a lagging
+	// cache (#548). It is required in production — SetupWithManager rejects a
+	// nil reader so neither confirmation can fall back to cached state; the
+	// reader() fallback serves only direct-construction tests.
 	APIReader client.Reader
 
 	// Launch is injected by the coordinator launcher. It is optional while
@@ -403,8 +405,12 @@ func (r *CoderRunReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 		return ctrl.Result{RequeueAfter: capacityRequeueDelay}, nil
 	}
 
+	// The admitted count goes through the uncached reader: a cached List can
+	// lag a sibling run's just-persisted Claimed admission by the informer's
+	// relist window, and a lagging count lets a competing run claim the final
+	// slot of a concurrency-1 lane (#548).
 	var runs courierv1alpha1.CoderRunList
-	if err := r.List(ctx, &runs, client.InNamespace(run.Namespace)); err != nil {
+	if err := r.reader().List(ctx, &runs, client.InNamespace(run.Namespace)); err != nil {
 		return ctrl.Result{}, err
 	}
 	if !laneHasCapacity(runs.Items, run.Spec.Lane, lane.Spec.Concurrency) {
@@ -651,7 +657,7 @@ func (r *CoderRunReconciler) resolvePersistSecurePolicy(ctx context.Context, run
 // SetupWithManager registers the controller with the manager.
 func (r *CoderRunReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	if r.APIReader == nil {
-		return errors.New("coderun controller: APIReader is required so the pod-loss confirmation reads the API server directly and never falls back to cached state")
+		return errors.New("coderun controller: APIReader is required so the pod-loss confirmation and the lane capacity count read the API server directly and never fall back to cached state")
 	}
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&courierv1alpha1.CoderRun{}).

@@ -335,6 +335,11 @@ func ciparkDigest(parts ...string) string {
 // A suspended lane and a lane under an active capacity cooldown both admit
 // nothing new, so neither admits a repair: the cooldown bounds re-claim of
 // work on an exhausted capacity, and a repair is work.
+//
+// The admitted count goes through the uncached reader, exactly as ordinary
+// admission does: a cached List can lag another run's just-persisted Claimed
+// admission, and a lagging count would oversubscribe the lane on reacquisition
+// (#548).
 func (r *CoderRunReconciler) ciparkCapacityAvailable(ctx context.Context, run *courierv1alpha1.CoderRun) (bool, error) {
 	var lane courierv1alpha1.LaneProfile
 	if err := r.Get(ctx, client.ObjectKey{Namespace: run.Namespace, Name: run.Spec.Lane}, &lane); err != nil {
@@ -351,7 +356,7 @@ func (r *CoderRunReconciler) ciparkCapacityAvailable(ctx context.Context, run *c
 		return false, nil
 	}
 	var runs courierv1alpha1.CoderRunList
-	if err := r.List(ctx, &runs, client.InNamespace(run.Namespace)); err != nil {
+	if err := r.reader().List(ctx, &runs, client.InNamespace(run.Namespace)); err != nil {
 		return false, err
 	}
 	return laneHasCapacity(runs.Items, run.Spec.Lane, lane.Spec.Concurrency), nil

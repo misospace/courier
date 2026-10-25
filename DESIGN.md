@@ -506,7 +506,11 @@ Two different problems, two different owners.
 limit (default 1 for a local lane). The operator admits at most that many
 `Claimed` + `Running` runs on the lane. `Verifying` runs do not consume
 LaneProfile execution capacity because their coordinator pods have exited. This
-is a plain count, not a slot object. Its real purpose is to guarantee there is
+is a plain count, not a slot object. The count is read from the API server
+through the uncached reader at ordinary admission and at CI-repair
+reacquisition alike, so an admission the operator just persisted is visible to
+the next admission decision; a lagging informer cache would over-admit the
+lane. Its real purpose is to guarantee there is
 exactly one controller reasoning about a given GPU at a time, so the within-run
 throttle below never has to reason about competing controllers.
 
