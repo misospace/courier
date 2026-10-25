@@ -788,6 +788,11 @@ func preLaunch(ctx context.Context, adapter source.Adapter, item source.WorkItem
 func (r *CoderRunReconciler) rejectClaim(ctx context.Context, run *courierv1alpha1.CoderRun, adapter source.Adapter, item source.WorkItem, cause error) error {
 	releaseErr := adapter.Release(ctx, item)
 	if errors.Is(cause, source.ErrStaleWork) {
+		// No settlement is recorded here: the source itself has invalidated
+		// the work — its settlement contract refuses outcome reports on
+		// stale work (classifyCIRefusal maps those refusals to
+		// ErrStaleWork) — and a deleted run has no status to carry durable
+		// retry intent.
 		deleteErr := r.Delete(ctx, run)
 		return errors.Join(cause, releaseErr, deleteErr)
 	}
@@ -796,7 +801,7 @@ func (r *CoderRunReconciler) rejectClaim(ctx context.Context, run *courierv1alph
 	run.Status.Branch = ""
 	run.Status.HeadRepo = ""
 	run.Status.HeadSHA = ""
-	run.Status.CIRepair = nil
+	r.settleCIRollback(run)
 	statusErr := r.patchStatus(ctx, before, run)
 	return errors.Join(cause, releaseErr, statusErr)
 }
@@ -811,9 +816,25 @@ func (r *CoderRunReconciler) releaseClaim(ctx context.Context, run *courierv1alp
 	run.Status.Branch = ""
 	run.Status.HeadRepo = ""
 	run.Status.HeadSHA = ""
-	run.Status.CIRepair = nil
+	r.settleCIRollback(run)
 	statusErr := r.patchStatus(ctx, before, run)
 	return errors.Join(cause, releaseErr, statusErr)
+}
+
+// settleCIRollback settles the repair reservation a rolled-back run still
+// holds before the context that carries its fence token is cleared. A
+// repair-resumed run holds a source-granted reservation; clearing the token
+// without a settlement would strand the deferral the source holds. Result
+// unsupported names a rollback that published nothing, and carries no head —
+// matching the non-repushed endings finishCIPark records.
+func (r *CoderRunReconciler) settleCIRollback(run *courierv1alpha1.CoderRun) {
+	if run.Status.CIRepair != nil && run.Status.CIRepair.FenceToken != "" {
+		run.Status.CISettlement = &courierv1alpha1.CISettlement{
+			FenceToken: run.Status.CIRepair.FenceToken,
+			Result:     courierv1alpha1.CIParkOutcomeUnsupported,
+		}
+	}
+	run.Status.CIRepair = nil
 }
 
 // terminateMissingHead ends a fix-pr run whose pull request head repository is

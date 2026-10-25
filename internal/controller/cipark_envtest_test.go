@@ -1120,6 +1120,96 @@ func TestEnvtestCIParkLostSettlementReplays(t *testing.T) {
 	}
 }
 
+// TestEnvtestCIParkRollbackSettlesGrantedFence pins the rollback's
+// settlement: a repair-resumed run whose claim is rolled back to Pending
+// after the source granted its reservation records the settlement for that
+// fence. A rollback publishes nothing, so the outcome arrives as unsupported
+// with no head, and the following reconcile delivers it to the source before
+// the run is admitted again — the cleared record is the proof of delivery.
+func TestEnvtestCIParkRollbackSettlesGrantedFence(t *testing.T) {
+	if envtestClient == nil {
+		t.Skip("KUBEBUILDER_ASSETS is not set")
+	}
+	adapter := &ciparkSource{}
+	h := newCIParkHarness(t, "cipark-rollback-settlement", ciparkPolicy(2), adapter)
+
+	h.park("sha-1", CheckObservation{Name: "build", State: CheckStatePending})
+	h.settleFailure("sha-1", "build")
+	if got := h.phase(); got != courierv1alpha1.PhaseClaimed {
+		t.Fatalf("phase after the settled failure = %q, want Claimed", got)
+	}
+	resumed := h.run()
+	if resumed.Status.CIRepair == nil {
+		t.Fatal("status.ciRepair = nil after the resume, want the repair context")
+	}
+	if len(adapter.reservations) != 1 {
+		t.Fatalf("repair reservations = %#v, want exactly one", adapter.reservations)
+	}
+	granted := adapter.reservations[0].FenceToken
+	if granted == "" {
+		t.Fatal("reservation fence token = empty, want the source-granted fence")
+	}
+	if resumed.Status.CIRepair.FenceToken != granted {
+		t.Fatalf("repair fence token = %q, want the granted token %q", resumed.Status.CIRepair.FenceToken, granted)
+	}
+
+	// The launch of the resumed coordinator fails, and the claim rolls back
+	// to Pending. The rollback carries the granted fence out of the context
+	// it was about to lose into the settlement, in the same status write.
+	wantErr := errors.New("cipark envtest launch failed")
+	h.reconciler.Launch = func(context.Context, *courierv1alpha1.CoderRun) error { return wantErr }
+	if _, err := h.reconcileOutcome(); !errors.Is(err, wantErr) {
+		t.Fatalf("Reconcile() error = %v, want %v", err, wantErr)
+	}
+	rolledBack := h.run()
+	if got := rolledBack.Status.Phase; got != courierv1alpha1.PhasePending {
+		t.Fatalf("phase after the failed launch = %q, want Pending", got)
+	}
+	if rolledBack.Status.CIRepair != nil {
+		t.Fatalf("status.ciRepair = %#v after the rollback, want nil", rolledBack.Status.CIRepair)
+	}
+	if rolledBack.Status.CISettlement == nil {
+		t.Fatal("status.ciSettlement = nil after the rollback, want the settlement for the granted fence")
+	}
+	if rolledBack.Status.CISettlement.FenceToken != granted {
+		t.Fatalf("settlement fence token = %q, want the granted token %q", rolledBack.Status.CISettlement.FenceToken, granted)
+	}
+	if rolledBack.Status.CISettlement.Result != courierv1alpha1.CIParkOutcomeUnsupported {
+		t.Fatalf("settlement result = %q, want unsupported (a rollback publishes nothing)", rolledBack.Status.CISettlement.Result)
+	}
+	if rolledBack.Status.CISettlement.Head != "" {
+		t.Fatalf("settlement head = %q, want empty (only a repush carries a head)", rolledBack.Status.CISettlement.Head)
+	}
+
+	// The following reconcile delivers the settlement to the source before
+	// the run is admitted again.
+	h.reconciler.Launch = h.launch
+	h.reconcile()
+	delivered := h.run()
+	if delivered.Status.CISettlement != nil {
+		t.Fatalf("status.ciSettlement = %#v after the delivery reconcile, want nil", delivered.Status.CISettlement)
+	}
+	if len(adapter.outcomes) != 1 {
+		t.Fatalf("source outcomes = %#v, want exactly one", adapter.outcomes)
+	}
+	outcome := adapter.outcomes[0]
+	if outcome.FenceToken != granted {
+		t.Fatalf("delivered outcome fence token = %q, want the granted token %q", outcome.FenceToken, granted)
+	}
+	if outcome.IdempotencyKey != adapter.reservations[0].IdempotencyKey {
+		t.Fatalf("delivered outcome idempotency key = %q, want the reservation key %q", outcome.IdempotencyKey, adapter.reservations[0].IdempotencyKey)
+	}
+	if outcome.Result != source.CIRepairUnsupported {
+		t.Fatalf("delivered outcome result = %q, want unsupported", outcome.Result)
+	}
+	if outcome.Head != "" {
+		t.Fatalf("delivered outcome head = %q, want empty (only a repush carries a head)", outcome.Head)
+	}
+	if outcome.PR != "42" {
+		t.Fatalf("delivered outcome PR = %q, want 42", outcome.PR)
+	}
+}
+
 // TestEnvtestCIParkLostRepushSettlementReplays pins the durable settlement on
 // the repush path: the repushed outcome of a repair whose report is lost is
 // re-presented on the next observation before the loop decides anything
