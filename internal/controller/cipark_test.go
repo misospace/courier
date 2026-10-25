@@ -1,6 +1,7 @@
 package controller
 
 import (
+	"context"
 	"strings"
 	"testing"
 
@@ -245,5 +246,87 @@ func TestCIParkFenceTokenIsDerivedFromRunIdentityOnly(t *testing.T) {
 		if strings.Contains(first, forbidden) {
 			t.Fatalf("ciparkFenceToken() leaked %q", forbidden)
 		}
+	}
+}
+
+// TestCIParkCapacityReacquisitionReadsLiveReaderNotLaggingCache is the #548
+// repair-side regression: a competing run claims the final slot of a
+// concurrency-1 lane and the informer has not caught up. The reacquisition
+// check must see the live admitted count and refuse the slot, then grant it
+// once the competitor genuinely stops consuming capacity.
+func TestCIParkCapacityReacquisitionReadsLiveReaderNotLaggingCache(t *testing.T) {
+	ctx := context.Background()
+	live := admissionClient(t,
+		admissionLane("local", 1),
+		admissionRun("parked", "local", courierv1alpha1.PhaseVerifying),
+		admissionRun("competitor", "local", courierv1alpha1.PhasePending),
+	)
+	cached := newLaggingRunCache(ctx, t, live)
+
+	// The competitor claims the slot after the cache snapshot was pinned.
+	var competitor courierv1alpha1.CoderRun
+	if err := live.Get(ctx, admissionKey("competitor"), &competitor); err != nil {
+		t.Fatalf("get competitor run: %v", err)
+	}
+	competitor.Status.Phase = courierv1alpha1.PhaseClaimed
+	if err := live.Status().Update(ctx, &competitor); err != nil {
+		t.Fatalf("claim the competitor run: %v", err)
+	}
+	var stale courierv1alpha1.CoderRunList
+	if err := cached.List(ctx, &stale); err != nil {
+		t.Fatalf("lagging cached list: %v", err)
+	}
+	if got := admittedCount(stale.Items, "local"); got != 0 {
+		t.Fatalf("lagging cache admittedCount = %d, want 0; the test must model a cache that has not caught up", got)
+	}
+
+	reconciler := &CoderRunReconciler{Client: cached, APIReader: live}
+	var parked courierv1alpha1.CoderRun
+	if err := live.Get(ctx, admissionKey("parked"), &parked); err != nil {
+		t.Fatalf("get parked run: %v", err)
+	}
+
+	available, err := reconciler.ciparkCapacityAvailable(ctx, &parked)
+	if err != nil {
+		t.Fatalf("ciparkCapacityAvailable() error = %v", err)
+	}
+	if available {
+		t.Fatal("ciparkCapacityAvailable() = true, want false; a lagging cache must not grant the final slot of a full concurrency-1 lane to a repair")
+	}
+
+	// The lane frees for real and the same check grants the slot.
+	competitor.Status.Phase = courierv1alpha1.PhaseVerifying
+	if err := live.Status().Update(ctx, &competitor); err != nil {
+		t.Fatalf("release the competitor's slot: %v", err)
+	}
+	available, err = reconciler.ciparkCapacityAvailable(ctx, &parked)
+	if err != nil {
+		t.Fatalf("ciparkCapacityAvailable() error = %v", err)
+	}
+	if !available {
+		t.Fatal("ciparkCapacityAvailable() = false after the slot freed, want true")
+	}
+}
+
+// TestSettleCIRollbackWithoutAFence pins the no-op guard: a claim rollback
+// whose cleared repair context carries no source-granted fence records
+// nothing, because there is no grant to answer.
+func TestSettleCIRollbackWithoutAFence(t *testing.T) {
+	reconciler := &CoderRunReconciler{}
+
+	noContext := &courierv1alpha1.CoderRun{}
+	reconciler.settleCIRollback(noContext)
+	if noContext.Status.CISettlement != nil {
+		t.Fatalf("settlement = %#v with no repair context, want nil", noContext.Status.CISettlement)
+	}
+
+	unfenced := &courierv1alpha1.CoderRun{}
+	unfenced.Status.CIRepair = &courierv1alpha1.CIRepairContext{Head: "abc123", Attempt: 1}
+	reconciler.settleCIRollback(unfenced)
+	if unfenced.Status.CISettlement != nil {
+		t.Fatalf("settlement = %#v for an unfenced context, want nil", unfenced.Status.CISettlement)
+	}
+	if unfenced.Status.CIRepair != nil {
+		t.Fatalf("repair context = %#v, want cleared", unfenced.Status.CIRepair)
 	}
 }

@@ -53,6 +53,7 @@ const (
 	lifecycleReportUnsupportedOutcomeReason                 = "UnsupportedOutcome"
 	lifecycleReportPublishedReason                          = "Published"
 	lifecycleReportSupersededReason                         = "Superseded"
+	lifecycleReportPermanentRefusalReason                   = "PermanentRefusal"
 	lifecycleReportRetryableReason                          = "Retryable"
 	lifecycleReportAcceptedSupportReason                    = "Accepted"
 	retryLifecycleReportAnnotation                          = "courier.misospace.dev/retry-lifecycle-report"
@@ -80,10 +81,12 @@ type CoderRunReconciler struct {
 	// The pod-loss backstop uses it to confirm a missing coordinator really is
 	// gone before charging a relaunch: a cache that has not caught up must not
 	// be mistaken for infrastructure loss, and infrastructure loss must not be
-	// hidden by a cache that never delivers the pod. It is required in
-	// production — SetupWithManager rejects a nil reader so the pod-loss
-	// confirmation can never fall back to cached state; the reader()
-	// fallback serves only direct-construction tests.
+	// hidden by a cache that never delivers the pod. The lane capacity count —
+	// ordinary admission and CI-repair reacquisition alike — reads through it
+	// too, so a just-persisted Claimed admission is never missed by a lagging
+	// cache (#548). It is required in production — SetupWithManager rejects a
+	// nil reader so neither confirmation can fall back to cached state; the
+	// reader() fallback serves only direct-construction tests.
 	APIReader client.Reader
 
 	// Launch is injected by the coordinator launcher. It is optional while
@@ -302,7 +305,8 @@ func (r *CoderRunReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 	// lifecycle report is still pending: then the report alone is retried, since
 	// the run already reached its phase and freed capacity. An AwaitingReview
 	// run whose LifecycleReported condition has reached a positive, settled
-	// state (Status=True with reason Published or Superseded) additionally takes
+	// state (Status=True with reason Published, Superseded, or
+	// PermanentRefusal) additionally takes
 	// one slow, bounded read of its recorded pull request, so a human merge can
 	// finish and reap it.
 	if run.Status.Phase != "" && run.Status.Phase != courierv1alpha1.PhasePending {
@@ -359,8 +363,12 @@ func (r *CoderRunReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 		return ctrl.Result{RequeueAfter: capacityRequeueDelay}, nil
 	}
 
+	// The admitted count goes through the uncached reader: a cached List can
+	// lag a sibling run's just-persisted Claimed admission by the informer's
+	// relist window, and a lagging count lets a competing run claim the final
+	// slot of a concurrency-1 lane (#548).
 	var runs courierv1alpha1.CoderRunList
-	if err := r.List(ctx, &runs, client.InNamespace(run.Namespace)); err != nil {
+	if err := r.reader().List(ctx, &runs, client.InNamespace(run.Namespace)); err != nil {
 		return ctrl.Result{}, err
 	}
 	if !laneHasCapacity(runs.Items, run.Spec.Lane, lane.Spec.Concurrency) {
@@ -524,8 +532,9 @@ func (r *CoderRunReconciler) reconcileTerminal(ctx context.Context, run *courier
 		// prove the source saw the in-review lifecycle either, so the
 		// post-review merge observation must wait too: a legacy or partially
 		// upgraded AwaitingReview run without a positively settled
-		// LifecycleReported (Published or Superseded) cannot transition to
-		// Done without first proving its in-review lifecycle. The run stays
+		// LifecycleReported (Published, Superseded, or PermanentRefusal)
+		// cannot transition to Done without first proving its in-review
+		// lifecycle. The run stays
 		// parked without a timer; the report-retry path above re-arms any
 		// pending report, and a run whose condition is missing/Unknown/other
 		// remains unobserved until the source publishes the report or an
@@ -709,7 +718,7 @@ func (r *CoderRunReconciler) resolvePersistSecurePolicy(ctx context.Context, run
 // SetupWithManager registers the controller with the manager.
 func (r *CoderRunReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	if r.APIReader == nil {
-		return errors.New("coderun controller: APIReader is required so the pod-loss confirmation reads the API server directly and never falls back to cached state")
+		return errors.New("coderun controller: APIReader is required so the pod-loss confirmation and the lane capacity count read the API server directly and never fall back to cached state")
 	}
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&courierv1alpha1.CoderRun{}).
@@ -766,6 +775,11 @@ func preLaunch(ctx context.Context, adapter source.Adapter, item source.WorkItem
 func (r *CoderRunReconciler) rejectClaim(ctx context.Context, run *courierv1alpha1.CoderRun, adapter source.Adapter, item source.WorkItem, cause error) error {
 	releaseErr := adapter.Release(ctx, item)
 	if errors.Is(cause, source.ErrStaleWork) {
+		// No settlement is recorded here: the source itself has invalidated
+		// the work — its settlement contract refuses outcome reports on
+		// stale work (classifyCIRefusal maps those refusals to
+		// ErrStaleWork) — and a deleted run has no status to carry durable
+		// retry intent.
 		deleteErr := r.Delete(ctx, run)
 		return errors.Join(cause, releaseErr, deleteErr)
 	}
@@ -774,7 +788,7 @@ func (r *CoderRunReconciler) rejectClaim(ctx context.Context, run *courierv1alph
 	run.Status.Branch = ""
 	run.Status.HeadRepo = ""
 	run.Status.HeadSHA = ""
-	run.Status.CIRepair = nil
+	r.settleCIRollback(run)
 	statusErr := r.patchStatus(ctx, before, run)
 	return errors.Join(cause, releaseErr, statusErr)
 }
@@ -789,9 +803,25 @@ func (r *CoderRunReconciler) releaseClaim(ctx context.Context, run *courierv1alp
 	run.Status.Branch = ""
 	run.Status.HeadRepo = ""
 	run.Status.HeadSHA = ""
-	run.Status.CIRepair = nil
+	r.settleCIRollback(run)
 	statusErr := r.patchStatus(ctx, before, run)
 	return errors.Join(cause, releaseErr, statusErr)
+}
+
+// settleCIRollback settles the repair reservation a rolled-back run still
+// holds before the context that carries its fence token is cleared. A
+// repair-resumed run holds a source-granted reservation; clearing the token
+// without a settlement would strand the deferral the source holds. Result
+// unsupported names a rollback that published nothing, and carries no head —
+// matching the non-repushed endings finishCIPark records.
+func (r *CoderRunReconciler) settleCIRollback(run *courierv1alpha1.CoderRun) {
+	if run.Status.CIRepair != nil && run.Status.CIRepair.FenceToken != "" {
+		run.Status.CISettlement = &courierv1alpha1.CISettlement{
+			FenceToken: run.Status.CIRepair.FenceToken,
+			Result:     courierv1alpha1.CIParkOutcomeUnsupported,
+		}
+	}
+	run.Status.CIRepair = nil
 }
 
 // terminateMissingHead ends a fix-pr run whose pull request head repository is
@@ -1405,11 +1435,11 @@ func pendingLifecycleIntent(run *courierv1alpha1.CoderRun) terminalLifecycleInte
 // records the outcome on the run's LifecycleReported condition. The run is
 // already in its terminal phase, so no outcome here blocks terminalization.
 // A superseded rejection means this attempt was replaced by a newer generation
-// of the same work: the report is dropped, not retried. A transient failure
-// leaves a pending report that a later reconcile retries; the source's
-// idempotency key makes the retry safe. A permanent failure retries at the
-// bounded interval, mirroring how waiting-for-capacity requeues work — the run
-// itself is never held by the report.
+// of the same work: the report is dropped, not retried. A permanent refusal
+// means the source rejected the report for a durable reason: the report
+// settles as refused, not retried. A transient failure leaves a pending
+// report that a later reconcile retries; the source's idempotency key makes
+// the retry safe. The run itself is never held by the report.
 func (r *CoderRunReconciler) publishTerminalLifecycle(ctx context.Context, run *courierv1alpha1.CoderRun, adapter source.Adapter, item source.WorkItem, phase courierv1alpha1.Phase, intent terminalLifecycleIntent) (ctrl.Result, error) {
 	err := r.publishSourceLifecycle(ctx, run, adapter, item, phase, intent)
 	retryToken := run.Status.LifecycleReportActiveRetryToken
@@ -1437,6 +1467,15 @@ func (r *CoderRunReconciler) publishTerminalLifecycle(ctx context.Context, run *
 		log.FromContext(ctx).Info("source does not support terminal lifecycle outcome; awaiting explicit retry",
 			"run", run.Name, "phase", phase, "error", err.Error())
 		return ctrl.Result{}, r.markLifecycleReportOutcome(ctx, run, false, pendingLifecycleReason(intent), intent.error, retryToken, lifecycleReportUnsupportedOutcomeReason)
+	case errors.Is(err, source.ErrPermanentRefusal):
+		// The source refused the report for a durable reason — a closed
+		// target or a worker identity that no longer owns the work — and
+		// retrying the same report can never change that. Settle it so the
+		// run's retention clock starts instead of retrying every
+		// lifecycleReportRequeueDelay forever (#561).
+		log.FromContext(ctx).Info("settling terminal lifecycle report permanently refused by the source",
+			"run", run.Name, "phase", phase, "error", err.Error())
+		return ctrl.Result{}, r.markLifecycleReportOutcome(ctx, run, true, lifecycleReportPermanentRefusalReason, err.Error(), "", lifecycleReportPermanentRefusalReason)
 	default:
 		log.FromContext(ctx).Info("terminal lifecycle report failed; will retry",
 			"run", run.Name, "phase", phase, "error", err.Error())
@@ -1546,6 +1585,8 @@ func (r *CoderRunReconciler) markLifecycleReportOutcome(ctx context.Context, run
 		r.setLifecycleReportCapability(run, metav1.ConditionTrue, lifecycleReportAcceptedSupportReason, "source accepted this lifecycle outcome")
 	case lifecycleReportSupersededReason:
 		r.setLifecycleReportCapability(run, metav1.ConditionUnknown, lifecycleReportSupersededReason, "source lifecycle report was superseded before acceptance could be determined")
+	case lifecycleReportPermanentRefusalReason:
+		r.setLifecycleReportCapability(run, metav1.ConditionUnknown, lifecycleReportPermanentRefusalReason, "source permanently refused this lifecycle report; retrying the same report cannot succeed")
 	case lifecycleReportRetryableReason:
 		r.setLifecycleReportCapability(run, metav1.ConditionUnknown, lifecycleReportRetryableReason, "source report failed transiently; automatic retry remains enabled")
 	}
@@ -1575,9 +1616,9 @@ func (r *CoderRunReconciler) markLifecycleReportOutcome(ctx context.Context, run
 }
 
 // recordLifecycleReportOutcome maps one report attempt's outcome arguments to
-// one of the four bounded report outcomes: Published and Superseded are
-// terminal report states, while UnsupportedOutcome and Retryable arrive on the
-// capability condition.
+// one of the five bounded report outcomes: Published, Superseded, and
+// PermanentRefusal are terminal report states, while UnsupportedOutcome and
+// Retryable arrive on the capability condition.
 func (r *CoderRunReconciler) recordLifecycleReportOutcome(sourceName, lane string, mode courierv1alpha1.Mode, reason, supportReason string) {
 	rec := r.metrics()
 	switch {
@@ -1589,6 +1630,8 @@ func (r *CoderRunReconciler) recordLifecycleReportOutcome(sourceName, lane strin
 		rec.ObserveLifecycleReportOutcome(sourceName, lane, mode, lifecycleOutcomePublished)
 	case reason == lifecycleReportSupersededReason:
 		rec.ObserveLifecycleReportOutcome(sourceName, lane, mode, lifecycleOutcomeSuperseded)
+	case reason == lifecycleReportPermanentRefusalReason:
+		rec.ObserveLifecycleReportOutcome(sourceName, lane, mode, lifecycleOutcomePermanentRefusal)
 	}
 }
 
@@ -1615,19 +1658,19 @@ func lifecycleReportPending(run *courierv1alpha1.CoderRun) bool {
 // lifecycleReportSettled reports whether the run's source lifecycle report has
 // reached the positive, settled state DESIGN.md §1291 demands before world
 // observation can close the loop: the LifecycleReported condition carries
-// Status=True with reason Published or Superseded. A missing, Unknown, or False
-// condition does not satisfy the gate, and Status=True with any other reason is
-// treated as not yet settled too — only Published/Superseded are the reasons
-// the condition's Status=True carries in practice, but the helper defends the
-// invariant by name. The gate keeps a legacy, partially upgraded, or corrupted
-// terminal CoderRun from being finished by world observation before the source
-// has proof of the in-review lifecycle.
+// Status=True with reason Published, Superseded, or PermanentRefusal. A
+// missing, Unknown, or False condition does not satisfy the gate, and
+// Status=True with any other reason is treated as not yet settled too — only
+// these are the reasons the condition's Status=True carries in practice, but
+// the helper defends the invariant by name. The gate keeps a legacy,
+// partially upgraded, or corrupted terminal CoderRun from being finished by
+// world observation before the source has proof of the in-review lifecycle.
 func lifecycleReportSettled(run *courierv1alpha1.CoderRun) bool {
 	cond := apimeta.FindStatusCondition(run.Status.Conditions, lifecycleReportedCondition)
 	if cond == nil || cond.Status != metav1.ConditionTrue {
 		return false
 	}
-	return cond.Reason == lifecycleReportPublishedReason || cond.Reason == lifecycleReportSupersededReason
+	return cond.Reason == lifecycleReportPublishedReason || cond.Reason == lifecycleReportSupersededReason || cond.Reason == lifecycleReportPermanentRefusalReason
 }
 
 // lifecycleReportConditionState renders the LifecycleReported condition as a

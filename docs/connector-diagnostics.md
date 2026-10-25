@@ -78,7 +78,7 @@ and the runner already owns the lifecycle boundaries in
 | `courier_source_discovery_paused_total` | polls skipped by the lane gate (missing/suspended/at capacity/capacity cooldown) | core runner | — |
 | `courier_source_items_offered_total` | items returned before core validation/dedupe | core runner | — |
 | `courier_source_items_materialized_total` | items that became `CoderRun`s | core runner | — |
-| `courier_source_lifecycle_report_outcomes_total` | report result (`published`, `superseded`, `unsupported`, `retryable`) | core controller | no report attempted |
+| `courier_source_lifecycle_report_outcomes_total` | report result (`published`, `superseded`, `unsupported`, `retryable`, `permanent-refusal`) | core controller | no report attempted |
 
 These are the signals #290 owns semantically; #291 only fixes their boundary
 against connector diagnostics. The discovery signals above are exported as
@@ -126,7 +126,7 @@ cannot advertise a capability Courier has no seam for.
 | `ci-park-lifecycle` | `source.CIParkLifecycle` | `identity` (generation-advanced, fence-held, fence-gone, opportunity-missing, head-superseded, fence-settled), `revalidation` (closed-unmerged/merged on reserve refusal), `protocol-error` | connector |
 | `discovery` | `source.Adapter.Discover` | `discovery` (attempts/success/failure), `protocol-error` | connector |
 | `discovery-exclusions` | `source.DiscoveryExcluder` | `exclusion` (requested/accepted/overflow), `ack` (ok/missing/invalid/version-unsupported) | connector |
-| `lifecycle-report` | `source.Reporter` | `report` (published/superseded/unsupported/retryable), `protocol-error` | connector |
+| `lifecycle-report` | `source.Reporter` | `report` (published/superseded/unsupported/retryable/permanent-refusal), `protocol-error` | connector |
 | `pre-launch-revalidation` | `source.PreLauncher` | `revalidation` (stale/current/error) | connector |
 | `work-identity` | `source.WorkIdentifier` | `identity` (superseded) | connector |
 | `availability` | always declared | `availability` (available/degraded/unreachable/unsupported) | connector |

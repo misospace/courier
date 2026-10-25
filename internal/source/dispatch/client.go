@@ -131,6 +131,16 @@ func (e *APIError) Error() string {
 	return fmt.Sprintf("Dispatch API returned HTTP %d: %s", e.StatusCode, e.Message)
 }
 
+// isPermanentRefusal reports the status codes that classify a failed
+// exchange as a durable source refusal. 400 covers closed targets and
+// request validation an identical report payload trips again; 403 covers a
+// worker-bound identity acting on work it no longer owns. Contention, rate
+// limits, and upstream outages arrive as 409, 429, or 5xx and stay
+// retryable.
+func isPermanentRefusal(statusCode int) bool {
+	return statusCode == http.StatusBadRequest || statusCode == http.StatusForbidden
+}
+
 var _ source.HandoutAcker = (*HTTPClient)(nil)
 
 // HTTPClient implements the Dispatch HTTP API behind the source adapter.
@@ -1071,6 +1081,10 @@ func (c *HTTPClient) emitReportOutcome(final error) {
 		c.diagnostics.Diagnostic(c.connectorName, connector.SignalIdentity, reasonIdentitySuperseded)
 	case errors.Is(final, source.ErrUnsupportedOutcome):
 		c.diagnostics.Diagnostic(c.connectorName, connector.SignalReport, reasonReportUnsupported)
+	case errors.Is(final, source.ErrPermanentRefusal):
+		// The source refused the report for a durable reason: settled, not
+		// an ambiguous transient the next retry might clear.
+		c.diagnostics.Diagnostic(c.connectorName, connector.SignalReport, reasonReportPermanentRefusal)
 	default:
 		c.diagnostics.Diagnostic(c.connectorName, connector.SignalReport, reasonReportRetryable)
 	}
@@ -1224,13 +1238,30 @@ func (c *HTTPClient) do(ctx context.Context, method, requestPath string, body an
 		message = strings.ReplaceAll(message, c.token, "[redacted]")
 		apiErr := &APIError{StatusCode: resp.StatusCode, Message: message}
 		reason := httpReason(resp.StatusCode)
+		var failure error
 		if exchangeReclassified(method, requestPath, apiErr) {
 			// The caller reclassifies this exchange into an identity or
 			// report outcome and owns its diagnostic; the protocol-error
 			// class is deferred to that site so one exchange counts once.
-			return newExchange(apiErr, reason)
+			failure = newExchange(apiErr, reason)
+		} else {
+			failure = c.failExchange(apiErr, reason)
 		}
-		return c.failExchange(apiErr, reason)
+		if isPermanentRefusal(resp.StatusCode) {
+			// 400 and 403 name a refusal whose cause lives in source
+			// state, not the transport: a closed target, a validation the
+			// same payload trips again, or a worker-bound identity that no
+			// longer owns the work. Dispatch codes every transient
+			// condition — lease contention, rate limits, upstream
+			// unavailability — as 409, 429, or 5xx, so an identical retry
+			// can never clear these. The sentinel lets a terminal
+			// lifecycle report settle instead of retrying forever. Sites
+			// that reclassify a specific 4xx into their own terminal
+			// outcome re-wrap the bare APIError, keeping that
+			// classification disjoint from this one.
+			return fmt.Errorf("%w: %w", source.ErrPermanentRefusal, failure)
+		}
+		return failure
 	}
 	if response == nil || resp.StatusCode == http.StatusNoContent {
 		return nil

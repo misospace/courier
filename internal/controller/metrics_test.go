@@ -1072,7 +1072,7 @@ func TestTokenDeltasRecordedFromTelemetryPatch(t *testing.T) {
 	}
 }
 
-// TestLifecycleReportOutcomesRecordedPerAttempt checks the four report
+// TestLifecycleReportOutcomesRecordedPerAttempt checks the five report
 // outcomes, counted from the source identity the report is published under,
 // and that each attempt resolves to exactly one counted outcome (a settled
 // report never re-enters the publish path, so re-reconciles never recount).
@@ -1086,6 +1086,7 @@ func TestLifecycleReportOutcomesRecordedPerAttempt(t *testing.T) {
 		{"superseded", source.ErrSuperseded, "superseded"},
 		{"unsupported", source.ErrUnsupportedOutcome, "unsupported"},
 		{"retryable", errors.New("transient source failure"), "retryable"},
+		{"permanent-refusal", source.ErrPermanentRefusal, "permanent-refusal"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

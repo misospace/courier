@@ -2208,6 +2208,88 @@ func TestTransitionSupersededReportCompletesTerminalAndDrops(t *testing.T) {
 	}
 }
 
+func TestPermanentRefusalReportSettlesTerminalRun(t *testing.T) {
+	item := &admissionSource{reportErr: fmt.Errorf("%w: cannot set status on a closed issue", source.ErrPermanentRefusal)}
+	run := admissionRun("run", "local", courierv1alpha1.PhaseRunning)
+	run.Spec.Source = "test"
+	run.Spec.WorkItemID = "opaque-work-item"
+	client := phaseClient(t, run, coordinatorPod(run, 2))
+	reconciler := &CoderRunReconciler{
+		Client:       client,
+		Sources:      NewSourceRegistry(map[string]source.Adapter{"test": item}),
+		StatusWriter: status.KubePatchWriter{Client: client},
+	}
+	result, err := reconciler.Reconcile(context.Background(), admissionRequest("run"))
+	if err != nil {
+		t.Fatalf("Reconcile() error = %v, want nil (a permanently refused report settles, it is not an error)", err)
+	}
+	if result.RequeueAfter != 0 {
+		t.Fatalf("RequeueAfter = %v, want 0 (a permanent refusal must not re-arm the retry timer)", result.RequeueAfter)
+	}
+	var updated courierv1alpha1.CoderRun
+	if err := client.Get(context.Background(), admissionKey("run"), &updated); err != nil {
+		t.Fatalf("get run: %v", err)
+	}
+	if updated.Status.Phase != courierv1alpha1.PhaseNeedsHuman {
+		t.Fatalf("phase = %q, want NeedsHuman (terminal despite the refused report)", updated.Status.Phase)
+	}
+	cond := apimeta.FindStatusCondition(updated.Status.Conditions, lifecycleReportedCondition)
+	if cond == nil {
+		t.Fatal("LifecycleReported condition = nil, want a condition")
+	}
+	if cond.Status != metav1.ConditionTrue || cond.Reason != lifecycleReportPermanentRefusalReason {
+		t.Fatalf("LifecycleReported = %s %q, want True %s", cond.Status, cond.Reason, lifecycleReportPermanentRefusalReason)
+	}
+	capability := apimeta.FindStatusCondition(updated.Status.Conditions, lifecycleReportSupportedCondition)
+	if capability == nil || capability.Status != metav1.ConditionUnknown || capability.Reason != lifecycleReportPermanentRefusalReason {
+		t.Fatalf("LifecycleReportSupported = %#v, want Unknown %s", capability, lifecycleReportPermanentRefusalReason)
+	}
+	if !lifecycleReportSettled(&updated) {
+		t.Fatal("lifecycleReportSettled = false, want a permanently refused report to settle the run for reaping")
+	}
+}
+
+func TestPendingReportRetriedThenPermanentlyRefusalSettles(t *testing.T) {
+	item := &admissionSource{reportErr: errors.New("dispatch unavailable")}
+	run := admissionRun("run", "local", courierv1alpha1.PhaseRunning)
+	run.Spec.Source = "test"
+	run.Spec.WorkItemID = "opaque-work-item"
+	client := phaseClient(t, run, coordinatorPod(run, 2))
+	reconciler := &CoderRunReconciler{
+		Client:       client,
+		Sources:      NewSourceRegistry(map[string]source.Adapter{"test": item}),
+		StatusWriter: status.KubePatchWriter{Client: client},
+	}
+	result, err := reconciler.Reconcile(context.Background(), admissionRequest("run"))
+	if err != nil {
+		t.Fatalf("first Reconcile() error = %v", err)
+	}
+	if result.RequeueAfter != lifecycleReportRequeueDelay {
+		t.Fatalf("first RequeueAfter = %v, want the bounded retry delay", result.RequeueAfter)
+	}
+	// The source answers, but its refusal is durable: the retry settles the
+	// report instead of re-arming the timer.
+	item.reportErr = fmt.Errorf("%w: bound worker is not the assigned agent", source.ErrPermanentRefusal)
+	result, err = reconciler.Reconcile(context.Background(), admissionRequest("run"))
+	if err != nil {
+		t.Fatalf("second Reconcile() error = %v", err)
+	}
+	if result.RequeueAfter != 0 {
+		t.Fatalf("second RequeueAfter = %v, want 0 (the report settled)", result.RequeueAfter)
+	}
+	var updated courierv1alpha1.CoderRun
+	if err := client.Get(context.Background(), admissionKey("run"), &updated); err != nil {
+		t.Fatalf("get run: %v", err)
+	}
+	cond := apimeta.FindStatusCondition(updated.Status.Conditions, lifecycleReportedCondition)
+	if cond == nil || cond.Status != metav1.ConditionTrue || cond.Reason != lifecycleReportPermanentRefusalReason {
+		t.Fatalf("LifecycleReported = %#v, want True %s", cond, lifecycleReportPermanentRefusalReason)
+	}
+	if !lifecycleReportSettled(&updated) {
+		t.Fatal("lifecycleReportSettled = false, want the retried permanent refusal to settle the run")
+	}
+}
+
 func TestTransientReportKeepsRunTerminalAndRetriesSeparately(t *testing.T) {
 	item := &admissionSource{reportErr: errors.New("dispatch unavailable")}
 	run := admissionRun("run", "local", courierv1alpha1.PhaseRunning)

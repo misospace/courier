@@ -554,6 +554,24 @@ func TestReapFailedSupersededReportReaps(t *testing.T) {
 	}
 }
 
+func TestReapFailedPermanentRefusalReportReaps(t *testing.T) {
+	src := &admissionSource{}
+	run := admissionRun("refused", "local", courierv1alpha1.PhaseFailed)
+	run.CreationTimestamp = metav1.NewTime(reapClock.Add(-72 * time.Hour))
+	run.Status.FinishedAt = &metav1.Time{Time: reapClock.Add(-11 * time.Minute)}
+	withLifecycleReported(run, metav1.ConditionTrue, lifecycleReportPermanentRefusalReason)
+	withReapMarker(run, failedAtAnnotation, reapClock.Add(-11*time.Minute))
+	c := phaseClient(t, run)
+	reconciler := terminalReapReconciler(c, src, reapClock, -1)
+
+	if _, err := reconciler.Reconcile(context.Background(), admissionRequest("refused")); err != nil {
+		t.Fatalf("Reconcile() error = %v", err)
+	}
+	if err := c.Get(context.Background(), admissionKey("refused"), &courierv1alpha1.CoderRun{}); !apierrors.IsNotFound(err) {
+		t.Fatalf("get run = %v, want NotFound; a permanently refused report satisfies the settled gate", err)
+	}
+}
+
 func TestReapFailedUnknownReportParks(t *testing.T) {
 	src := &admissionSource{}
 	run := admissionRun("unknown", "local", courierv1alpha1.PhaseFailed)
