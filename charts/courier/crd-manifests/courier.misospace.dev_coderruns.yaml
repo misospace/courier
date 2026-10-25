@@ -399,6 +399,33 @@ spec:
                 - head
                 - idempotencyKey
                 type: object
+              ciparkRelease:
+                description: |-
+                  CIParkRelease is the fence-less deferral close whose delivery to the
+                  source is still outstanding (#534). It is recorded in the same status
+                  write that ends a run's park without a reservation — before the close
+                  is attempted — so a lost response, a restart, or an unavailable source
+                  leaves durable retry intent instead of a deferral nobody will ever
+                  release. The operator re-presents the close on later reconciles with
+                  the park notice's own idempotency key, and clearing the record is the
+                  proof of delivery; a source with no such deferral refuses it moot —
+                  the close is advisory and the record is dropped either way.
+                properties:
+                  head:
+                    description: Head is the exact parked head the released deferral
+                      announced.
+                    minLength: 1
+                    type: string
+                  idempotencyKey:
+                    description: |-
+                      IdempotencyKey is the park notice's own key, so the close is keyed by
+                      the deferral the notice established and a retry replays one close.
+                    minLength: 1
+                    type: string
+                required:
+                - head
+                - idempotencyKey
+                type: object
               conditions:
                 description: Conditions is the standard condition set.
                 items:

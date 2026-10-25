@@ -755,6 +755,18 @@ type CoderRunStatus struct {
 	// +optional
 	CIParkDeferral *CIParkDeferral `json:"ciparkDeferral,omitempty"`
 
+	// CIParkRelease is the fence-less deferral close whose delivery to the
+	// source is still outstanding (#534). It is recorded in the same status
+	// write that ends a run's park without a reservation — before the close
+	// is attempted — so a lost response, a restart, or an unavailable source
+	// leaves durable retry intent instead of a deferral nobody will ever
+	// release. The operator re-presents the close on later reconciles with
+	// the park notice's own idempotency key, and clearing the record is the
+	// proof of delivery; a source with no such deferral refuses it moot —
+	// the close is advisory and the record is dropped either way.
+	// +optional
+	CIParkRelease *CIParkRelease `json:"ciparkRelease,omitempty"`
+
 	// Conditions is the standard condition set.
 	// +optional
 	// +listType=map
@@ -788,6 +800,21 @@ type CIParkDeferral struct {
 	// +kubebuilder:validation:MinLength=1
 	Head string `json:"head"`
 	// IdempotencyKey deduplicates the notice at the source.
+	// +kubebuilder:validation:MinLength=1
+	IdempotencyKey string `json:"idempotencyKey"`
+}
+
+// CIParkRelease is one fence-less deferral close the source has not accepted
+// yet (#534). It exists to outlive the reconcile that produced it: the
+// parked head and the park notice's own idempotency key travel with the
+// record, so a retry replays the same fence-less close instead of a second
+// one.
+type CIParkRelease struct {
+	// Head is the exact parked head the released deferral announced.
+	// +kubebuilder:validation:MinLength=1
+	Head string `json:"head"`
+	// IdempotencyKey is the park notice's own key, so the close is keyed by
+	// the deferral the notice established and a retry replays one close.
 	// +kubebuilder:validation:MinLength=1
 	IdempotencyKey string `json:"idempotencyKey"`
 }

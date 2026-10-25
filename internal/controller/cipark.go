@@ -603,12 +603,48 @@ func (r *CoderRunReconciler) settleCIPark(ctx context.Context, run *courierv1alp
 // passed. Green settles only onto an identical candidate — two consecutive
 // observations of the same check set — so checks that are still registering
 // cannot pass.
+//
+// A green ending is still a park that ended without a reservation, so it
+// converts the park's deferral into the fence-less close exactly as the
+// plain finish does (#534): no reservation was granted, so no fenced
+// outcome will ever release the deferral, and a deferral nobody releases
+// defers the source's handout race past the run's own ending. The close is
+// recorded before it is attempted and the run's ending never waits on it —
+// an undelivered close stays durable retry intent that the run's own
+// reconciles re-present.
 func (r *CoderRunReconciler) settleCIParkGreen(ctx context.Context, run *courierv1alpha1.CoderRun, observation PRObservation, greenSettled bool) (ctrl.Result, error) {
 	if !greenSettled {
 		// Green settles only onto an identical candidate — two consecutive
 		// observations of the same check set — so checks that are still
 		// registering cannot pass.
 		return ctrl.Result{RequeueAfter: ciparkPollDelay}, nil
+	}
+	before := run.DeepCopy()
+	changed := false
+	if run.Status.CIParkDeferral != nil {
+		// The pending notice is cleared exactly when the close it owes is
+		// recorded, in the same write, as on the plain finish: a source
+		// lookup that cannot answer the capability question returns the
+		// error before any status write and persists no half-conversion.
+		run.Status.CIParkDeferral = nil
+		changed = true
+	}
+	if run.Status.CIPark != nil {
+		recorded, err := r.recordCIParkRelease(run)
+		if err != nil {
+			return ctrl.Result{}, err
+		}
+		changed = changed || recorded
+	}
+	if changed {
+		if err := r.patchStatus(ctx, before, run); err != nil {
+			return ctrl.Result{}, err
+		}
+	}
+	if run.Status.CIParkRelease != nil {
+		if delivered, err := r.deliverCIParkRelease(ctx, run); !delivered {
+			log.FromContext(ctx).V(1).Info("source deferral release not delivered", "run", run.Name, "error", err.Error())
+		}
 	}
 	if run.Status.DeclaredNoChange && run.Spec.Mode == courierv1alpha1.ModeFixPR {
 		// A no-change attempt on an open pull request waits for
@@ -685,11 +721,31 @@ func (r *CoderRunReconciler) resumeCIPark(ctx context.Context, run *courierv1alp
 // finishCIPark ends a parked attempt without waking the coordinator and
 // records why. The park record is the run's durable account of the attempt:
 // what it observed and how it ended.
+//
+// The park's deferral ends with the park. Where the attempt was fenced, the
+// fenced outcome releases the deferral at the source. Where no reservation
+// was granted — every caller that lands here with an empty fence token —
+// there is no fence to settle, so the close is sent fence-less instead
+// (#534): the deferral the park notice established is released by the
+// notice's own identity, and the record of the pending notice itself is
+// folded into the same write (a late notice must never defer the source
+// against an opportunity that is already over).
 func (r *CoderRunReconciler) finishCIPark(ctx context.Context, run *courierv1alpha1.CoderRun, observation PRObservation, outcome courierv1alpha1.CIParkOutcome, fenceToken string) (ctrl.Result, error) {
 	before := run.DeepCopy()
 	changed := false
 	if run.Status.CIPark != nil {
 		run.Status.CIPark.LastOutcome = outcome
+		changed = true
+	}
+	if run.Status.CIParkDeferral != nil {
+		// The opportunity the pending notice described just ended. Whether
+		// the notice was accepted or is still pending, the deferral it
+		// names is released from here: the pending notice itself would
+		// defer the source against nothing, so it is cleared in the same
+		// write that records the release intent the fence-less close
+		// realizes (the close is advisory when the notice was never
+		// accepted).
+		run.Status.CIParkDeferral = nil
 		changed = true
 	}
 	if run.Status.CIRepair != nil {
@@ -709,6 +765,23 @@ func (r *CoderRunReconciler) finishCIPark(ctx context.Context, run *courierv1alp
 		}
 		changed = true
 	}
+	if run.Status.CIPark != nil && fenceToken == "" {
+		// The park ends with no granted reservation, so no fenced outcome
+		// can release it and none is owed; the fence-less close is owed
+		// instead, recorded in this same write before it is attempted, so
+		// a lost response stays durable retry intent rather than a
+		// deferral nobody will ever release. A source lookup that cannot
+		// answer the capability question ends nothing: the deferral is
+		// converted into the release as one write — cleared exactly when
+		// the close it owes is recorded — so a failed lookup returns the
+		// error and persists no half-conversion, and the whole finish
+		// retries.
+		recorded, err := r.recordCIParkRelease(run)
+		if err != nil {
+			return ctrl.Result{}, err
+		}
+		changed = changed || recorded
+	}
 	if changed {
 		if err := r.patchStatus(ctx, before, run); err != nil {
 			return ctrl.Result{}, err
@@ -719,10 +792,40 @@ func (r *CoderRunReconciler) finishCIPark(ctx context.Context, run *courierv1alp
 			log.FromContext(ctx).V(1).Info("source repair settlement not delivered", "run", run.Name, "error", err.Error())
 		}
 	}
+	if run.Status.CIParkRelease != nil {
+		if delivered, err := r.deliverCIParkRelease(ctx, run); !delivered {
+			log.FromContext(ctx).V(1).Info("source deferral release not delivered", "run", run.Name, "error", err.Error())
+		}
+	}
 	if run.Spec.Mode == courierv1alpha1.ModeFixPR {
 		return r.transitionTerminal(ctx, run, courierv1alpha1.PhaseFailed, observation.PR, terminalLifecycleIntent{ciFailure: true}, nil)
 	}
 	return r.transitionTerminal(ctx, run, courierv1alpha1.PhaseHandedOff, observation.PR, terminalLifecycleIntent{}, nil)
+}
+
+// recordCIParkRelease records the fence-less close a park that ended
+// without a reservation owes the source (#534). The close is keyed by the
+// park notice's own identity — that key derives from the run and the parked
+// head, not from the notice record — so it releases the deferral the notice
+// established even when the notice record itself is already gone. The
+// source lookup gates the record: a source without the capability never had
+// a deferral settled at it and nothing is recorded for one, and the lookup
+// error lets the caller persist no half-conversion. The release is advisory
+// by nature: the source refuses it moot when no deferral for this notice
+// exists, and deliverCIParkRelease drops the record either way.
+func (r *CoderRunReconciler) recordCIParkRelease(run *courierv1alpha1.CoderRun) (bool, error) {
+	adapter, _, err := r.adapterAndWorkItem(run)
+	if err != nil {
+		return false, err
+	}
+	if _, ok := adapter.(source.CIParkLifecycle); !ok {
+		return false, nil
+	}
+	run.Status.CIParkRelease = &courierv1alpha1.CIParkRelease{
+		Head:           run.Status.CIPark.Head,
+		IdempotencyKey: ciparkParkKey(run, run.Status.CIPark.Head),
+	}
+	return true, nil
 }
 
 // deliverCIParkNotice announces the park to the source, when the source can
@@ -875,6 +978,105 @@ func (r *CoderRunReconciler) deliverCISettlement(ctx context.Context, run *couri
 	}
 	before := run.DeepCopy()
 	run.Status.CISettlement = nil
+	if err := r.patchStatus(ctx, before, run); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+// deliverCIParkRelease closes the deferral a finished park still owes the
+// source (#534) and clears the record once the close resolves. The close is
+// fence-less and keyed by the park notice's own idempotency key, so a retry
+// after a lost response re-presents the same close for the same deferral.
+//
+// The release never waits on the source — the run is already ending — and
+// it is advisory by nature: a refusal saying the deferral is not there
+// resolves the intent as moot. Three refusals mean exactly that, and the
+// record is dropped as the proof of delivery in each:
+//
+//   - source.ErrStaleWork — the deferral does not exist (the notice was
+//     never accepted, an unknown key, or it was already released or
+//     settled): there is nothing to close;
+//   - source.ErrSuperseded — the deferral is no longer ours to close (a
+//     newer generation owns the work, or a granted reservation holds it:
+//     that reservation's own fenced outcome releases it);
+//   - source.ErrUnsupportedCIPark — the source cannot represent the
+//     release at all, and that refusal is permanent: retrying would wedge
+//     the run's ending behind a close it will never take;
+//   - source.ErrPermanentRefusal — a 400 or 403 an identical retry can
+//     never clear (a route that cannot represent the fence-less close
+//     under version skew, or an identity that no longer owns the work):
+//     the same never-deliverable posture, dropped the same way so the
+//     release stays advisory.
+//
+// Every other failure keeps the record: the close is re-presented on the
+// run's own cadence with the same key, and the source's idempotency makes
+// the replay collapse into the one close.
+func (r *CoderRunReconciler) deliverCIParkRelease(ctx context.Context, run *courierv1alpha1.CoderRun) (bool, error) {
+	record := run.Status.CIParkRelease
+	if record == nil {
+		return true, nil
+	}
+	adapter, item, err := r.adapterAndWorkItem(run)
+	if err != nil {
+		return false, err
+	}
+	lifecycle, ok := adapter.(source.CIParkLifecycle)
+	if !ok {
+		// The gate that recorded the release is also the one that could
+		// have established a deferral; a source without the capability can
+		// never owe one, so a stale record from before resolves as
+		// nothing owed rather than wedging the ending behind it.
+		log.FromContext(ctx).V(1).Info("source does not implement the CI park lifecycle; dropping the pending release", "run", run.Name)
+		before := run.DeepCopy()
+		run.Status.CIParkRelease = nil
+		if err := r.patchStatus(ctx, before, run); err != nil {
+			return false, err
+		}
+		return true, nil
+	}
+	release := source.CIParkRelease{PR: run.Status.PR, Head: record.Head, IdempotencyKey: record.IdempotencyKey}
+	if err := lifecycle.ReleaseCIPark(ctx, item, release); err != nil {
+		switch {
+		case errors.Is(err, source.ErrUnsupportedCIPark):
+			log.FromContext(ctx).V(1).Info("source cannot represent the CI deferral release; dropping the pending release", "run", run.Name)
+			before := run.DeepCopy()
+			run.Status.CIParkRelease = nil
+			if err := r.patchStatus(ctx, before, run); err != nil {
+				return false, err
+			}
+			return true, nil
+		case errors.Is(err, source.ErrPermanentRefusal):
+			// A 400 or 403 refusal is equally never-deliverable: a route
+			// that cannot represent the fence-less close (version skew) or
+			// an identity that no longer owns the work refuses this exact
+			// close on every retry. The release is advisory, so the record
+			// drops instead of holding the run's terminal lifecycle behind
+			// a close the source will never take.
+			log.FromContext(ctx).V(1).Info("source refuses the CI deferral release permanently; dropping the pending release", "run", run.Name, "error", err.Error())
+			before := run.DeepCopy()
+			run.Status.CIParkRelease = nil
+			if err := r.patchStatus(ctx, before, run); err != nil {
+				return false, err
+			}
+			return true, nil
+		case errors.Is(err, source.ErrStaleWork), errors.Is(err, source.ErrSuperseded):
+			// The close resolved moot — there was nothing to release, or
+			// the deferral is no longer this run's. Dropping the record is
+			// the proof of delivery: nothing is owed for a deferral the
+			// source never held.
+			log.FromContext(ctx).V(1).Info("source deferral already gone; release resolved moot", "run", run.Name, "error", err.Error())
+			before := run.DeepCopy()
+			run.Status.CIParkRelease = nil
+			if err := r.patchStatus(ctx, before, run); err != nil {
+				return false, err
+			}
+			return true, nil
+		}
+		return false, err
+	}
+	before := run.DeepCopy()
+	run.Status.CIParkRelease = nil
 	if err := r.patchStatus(ctx, before, run); err != nil {
 		return false, err
 	}
