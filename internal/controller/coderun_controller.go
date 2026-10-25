@@ -324,19 +324,22 @@ func (r *CoderRunReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 	if run.Status.Phase != "" && run.Status.Phase != courierv1alpha1.PhasePending {
 		result, err := r.reconcileTerminal(ctx, &run)
 		if err != nil {
-			return ctrl.Result{}, err
+			if closeRetry == 0 {
+				return ctrl.Result{}, err
+			}
+			// The close the source keeps refusing still owes a bounded
+			// retry, and the workqueue's rate-limited backoff on this error
+			// can outlast that bound: the error's own delay would push the
+			// close's re-presentation past the settlement cadence. The close
+			// owns the wake instead — the failure is logged and the
+			// reconcile returns at the cadence, so the close is never
+			// re-presented later than the bound allows. A run that owes no
+			// close keeps the error, and with it the workqueue's backoff.
+			log.FromContext(ctx).Error(err, "terminal dispatch failed; retrying at the settlement cadence",
+				"run", run.Name, "phase", run.Status.Phase)
+			return capCloseRetry(result, closeRetry), nil
 		}
-		// A park close the source keeps refusing rides along as a cap on the
-		// wake interval: the terminal path's own wake wins when it is sooner,
-		// and the close is never re-presented later than the bounded
-		// settlement cadence. The cap covers this success path only: a
-		// terminal dispatch that fails returns the error, and the close then
-		// rides the workqueue's backoff — sooner than the cadence, never
-		// later — so the bounded cadence still holds as an upper bound.
-		if closeRetry > 0 && (result.RequeueAfter == 0 || result.RequeueAfter > closeRetry) {
-			result.RequeueAfter = closeRetry
-		}
-		return result, nil
+		return capCloseRetry(result, closeRetry), nil
 	}
 
 	adapter, item, err := r.adapterAndWorkItem(&run)
@@ -591,6 +594,18 @@ func (r *CoderRunReconciler) reconcileTerminal(ctx context.Context, run *courier
 	}
 	log.FromContext(ctx).V(1).Info("reconcile", "phase", run.Status.Phase)
 	return ctrl.Result{}, nil
+}
+
+// capCloseRetry bounds a terminal reconcile's wake interval by the park
+// close's bounded retry. The terminal path's own wake wins whenever it is
+// sooner, and the close is never re-presented later than the settlement
+// cadence allows. A wake of zero means the terminal path asked for no timer
+// of its own, so the close's cadence supplies the wake.
+func capCloseRetry(result ctrl.Result, closeRetry time.Duration) ctrl.Result {
+	if closeRetry > 0 && (result.RequeueAfter == 0 || result.RequeueAfter > closeRetry) {
+		result.RequeueAfter = closeRetry
+	}
+	return result
 }
 
 // resumeClaimed closes the small crash/conflict window between reserving a run

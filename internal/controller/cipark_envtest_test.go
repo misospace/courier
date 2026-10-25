@@ -184,6 +184,14 @@ func (h *ciparkHarness) reconcileResultOf(name string) ctrl.Result {
 	return result
 }
 
+// reconcileOutcome runs one reconcile of the harness's run and returns both
+// its result and its error, so a scenario can pin the failure the reconcile
+// reports as well as the wake interval it asks for.
+func (h *ciparkHarness) reconcileOutcome() (ctrl.Result, error) {
+	h.t.Helper()
+	return h.reconciler.Reconcile(context.Background(), envtestRequest(h.name))
+}
+
 // run reads the harness's run back from the API server.
 func (h *ciparkHarness) run() *courierv1alpha1.CoderRun {
 	h.t.Helper()
@@ -1783,5 +1791,44 @@ func TestEnvtestCIParkOwedCloseIsNeverReapedAway(t *testing.T) {
 	h.reconcileResult()
 	if h.runExists() {
 		t.Fatal("run still present past the retention window, want the reaped run")
+	}
+}
+
+// TestEnvtestCIParkPendingCloseKeepsItsBoundWhenTheTerminalDispatchFails pins
+// the bound on the failure path: a terminal dispatch that fails must not hand
+// the wake to the workqueue's rate-limited backoff, which grows past the
+// settlement cadence as the failures repeat. The close owns the wake while it
+// is owed, so the reconcile asks for the settlement cadence and reports no
+// error, and the close stays owed.
+func TestEnvtestCIParkPendingCloseKeepsItsBoundWhenTheTerminalDispatchFails(t *testing.T) {
+	if envtestClient == nil {
+		t.Skip("KUBEBUILDER_ASSETS is not set")
+	}
+	adapter := &failingSettlementSource{}
+	// The source never accepts the in-review lifecycle either, so the run
+	// keeps a pending report to retry.
+	adapter.reportErr = errors.New("dispatch server: unavailable")
+	h := newCIParkHarness(t, "cipark-close-error-bound", ciparkPolicy(2), adapter)
+	now := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	h.reconciler.Now = func() time.Time { return now }
+	h.closeOwedReview()
+	if !lifecycleReportPending(h.run()) {
+		t.Fatal("lifecycleReported is not pending, want the pending in-review report")
+	}
+
+	// The operator's source adapter is gone: the run's source no longer
+	// resolves, so the close cannot be presented and the terminal dispatch
+	// fails on the same missing source.
+	h.reconciler.Sources = NewSourceRegistry(map[string]source.Adapter{})
+
+	result, err := h.reconcileOutcome()
+	if err != nil {
+		t.Fatalf("reconcile error = %v, want the close's bounded wake to govern the failure path", err)
+	}
+	if result.RequeueAfter != ciparkSettlementRetryDelay {
+		t.Fatalf("RequeueAfter = %v, want the settlement cadence %v", result.RequeueAfter, ciparkSettlementRetryDelay)
+	}
+	if h.run().Status.CISettlement == nil {
+		t.Fatal("status.ciSettlement = nil, want the pending close to stay owed")
 	}
 }

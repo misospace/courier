@@ -260,25 +260,34 @@ same idempotency key so the source replays the committed transition, and
 clearing the record is the proof of delivery. The park notice carries the
 same durability while the opportunity is active and expires with it — a late
 notice would defer the source against nothing. The ending itself never waits
-on the source, and a pending close never preempts a terminal run's own
-obligations: a lifecycle report that is due a retry is retried on the
-reconcile that re-presents the close, and a positively settled in-review
-lifecycle lets the run's slow merge observation read its recorded pull
-request on that same reconcile. A report that is not due a retry — one
-awaiting an explicit operator retry, or one whose condition is missing or
-`Unknown` — and an observation whose in-review lifecycle is not positively
-settled both wait, exactly as they do without a close outstanding. The
-close's bounded retry rides along as a cap on the reconcile's wake interval —
-never later than the settlement cadence, and the terminal path's own wake
-wins whenever it is sooner — so the close never delays the work the run
-still owes. The merge observation keeps its slow cadence under a durable
-marker on the run, and that marker gates every wake: no wake reads the
-recorded pull request before the cadence has passed, whatever caused the
-wake. A run that still owes a close is not reaped while the close is
-outstanding, because deletion would drop the owed close with the object; its
-retention window starts only once the close has landed. The contract still
-has no release for a deferral whose opportunity ends without a reservation;
-#534 tracks that extension.
+on the source, and a pending close never preempts a terminal run's lifecycle
+report or merge observation: a lifecycle report that is due a retry is
+retried on the reconcile that re-presents the close, and a positively
+settled in-review lifecycle lets the run's slow merge observation read its
+recorded pull request on that same reconcile. A report that is not due a
+retry — one awaiting an explicit operator retry, or one whose condition is
+missing or `Unknown` — and an observation whose in-review lifecycle is not
+positively settled both wait, exactly as they do without a close
+outstanding. The close's bounded retry rides along as a cap on the
+reconcile's wake interval — never later than the settlement cadence, and the
+terminal path's own wake wins whenever it is sooner — so the close never
+delays the work the run still owes. A `Done` run keeps the dedicated requeue
+instead: resolving and reaping its source work while a close is owed could
+delete the run, and the owed close with it. The cap holds on every path of
+the terminal dispatch, including one that fails: the failure is logged
+rather than returned — the manager's reconcile-error counter does not see it
+— and the reconcile returns at the cadence instead of handing the error to
+the workqueue's rate-limited backoff, whose delay grows past the cadence as
+failures repeat. A run that owes no close keeps the error, and with it that
+backoff. The merge observation keeps its slow cadence under a durable marker
+on the run, and that marker gates every wake: no wake reads the recorded
+pull request before the cadence has passed, whatever caused the wake. A
+marker write that fails leaves the observation due, so the cadence fails
+open to observing, never to never observing. A run that still owes a close is
+not reaped while the close is outstanding, because deletion would drop the
+owed close with the object; its retention window starts only once the close
+has landed. The contract still has no release for a deferral whose
+opportunity ends without a reservation; #534 tracks that extension.
 
 The coordinator declares its ending in the executor-provided outcome file,
 whose exact path is in the goal. The executor validates the declaration against
