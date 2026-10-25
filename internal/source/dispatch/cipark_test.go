@@ -739,6 +739,25 @@ func TestDispatchCIParkReleaseRouteAbsentIsUnsupported(t *testing.T) {
 	if err := f.adapter.ReportCIRepair(context.Background(), ciparkWorkItem(), source.CIRepairOutcome{FenceToken: "fence", IdempotencyKey: "k", PR: "77", Result: source.CIRepairExhausted}); errors.Is(err, source.ErrUnsupportedCIPark) {
 		t.Fatalf("ReportCIRepair() = %v, want an ordinary error, not the unsupported sentinel", err)
 	}
+
+	// The sibling never-deliverable refusal: a 400 from a #495-era route
+	// that validates a required fence token arrives wrapped in the choke
+	// point's permanent-refusal sentinel, the posture the controller's
+	// release delivery also drops on. The close never claims the
+	// unsupported sentinel here — the two classifications stay disjoint.
+	f400 := newDiagnosticsFixture(t, openChecker(), ciParkRefused(t, http.StatusBadRequest, "fence token required"))
+	if err := f400.adapter.ReleaseCIPark(context.Background(), ciparkWorkItem(), source.CIParkRelease{PR: "77", Head: ciparkHead1, IdempotencyKey: "k"}); !errors.Is(err, source.ErrPermanentRefusal) || errors.Is(err, source.ErrUnsupportedCIPark) {
+		t.Fatalf("ReleaseCIPark(400) = %v, want ErrPermanentRefusal and not ErrUnsupportedCIPark", err)
+	}
+	if got := diagnosticsCounter(t, f400, connector.SignalProtocolError, reasonHTTP4xx); got != 1 {
+		t.Fatalf("400 protocol-error/http-4xx counter = %v, want exactly 1 (counted at the choke point)", got)
+	}
+	if total := totalProtocolErrors(t, f400); total != 1 {
+		t.Fatalf("400 total protocol-error diagnostics = %v, want exactly 1", total)
+	}
+	if err := f400.adapter.ReportCIRepair(context.Background(), ciparkWorkItem(), source.CIRepairOutcome{FenceToken: "fence", IdempotencyKey: "k", PR: "77", Result: source.CIRepairExhausted}); errors.Is(err, source.ErrUnsupportedCIPark) {
+		t.Fatalf("ReportCIRepair(400) = %v, want an ordinary permanent refusal, not the unsupported sentinel", err)
+	}
 }
 
 type ciParkRequest struct {

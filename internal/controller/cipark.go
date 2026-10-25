@@ -1002,7 +1002,12 @@ func (r *CoderRunReconciler) deliverCISettlement(ctx context.Context, run *couri
 //     that reservation's own fenced outcome releases it);
 //   - source.ErrUnsupportedCIPark — the source cannot represent the
 //     release at all, and that refusal is permanent: retrying would wedge
-//     the run's ending behind a close it will never take.
+//     the run's ending behind a close it will never take;
+//   - source.ErrPermanentRefusal — a 400 or 403 an identical retry can
+//     never clear (a route that cannot represent the fence-less close
+//     under version skew, or an identity that no longer owns the work):
+//     the same never-deliverable posture, dropped the same way so the
+//     release stays advisory.
 //
 // Every other failure keeps the record: the close is re-presented on the
 // run's own cadence with the same key, and the source's idempotency makes
@@ -1035,6 +1040,20 @@ func (r *CoderRunReconciler) deliverCIParkRelease(ctx context.Context, run *cour
 		switch {
 		case errors.Is(err, source.ErrUnsupportedCIPark):
 			log.FromContext(ctx).V(1).Info("source cannot represent the CI deferral release; dropping the pending release", "run", run.Name)
+			before := run.DeepCopy()
+			run.Status.CIParkRelease = nil
+			if err := r.patchStatus(ctx, before, run); err != nil {
+				return false, err
+			}
+			return true, nil
+		case errors.Is(err, source.ErrPermanentRefusal):
+			// A 400 or 403 refusal is equally never-deliverable: a route
+			// that cannot represent the fence-less close (version skew) or
+			// an identity that no longer owns the work refuses this exact
+			// close on every retry. The release is advisory, so the record
+			// drops instead of holding the run's terminal lifecycle behind
+			// a close the source will never take.
+			log.FromContext(ctx).V(1).Info("source refuses the CI deferral release permanently; dropping the pending release", "run", run.Name, "error", err.Error())
 			before := run.DeepCopy()
 			run.Status.CIParkRelease = nil
 			if err := r.patchStatus(ctx, before, run); err != nil {

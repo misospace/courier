@@ -352,8 +352,14 @@ func (c *HTTPClient) SettleCIRepair(ctx context.Context, id string, outcome sour
 // lifecycle behind a close the server can never take, so the exchange is
 // reclassified into source.ErrUnsupportedCIPark — the same permanent
 // unsupported posture the capability gate already produces — and the caller
-// drops the pending release. A fenced outcome keeps its ordinary 404
-// posture: only the fence-less close is advisory.
+// drops the pending release. The same advisory reading covers the other
+// never-deliverable refusals: a 400 (a #495-era route validating a required
+// fence token rejects the fence-less body — the same version skew under a
+// sibling status code) or a 403 (the identity no longer owns the work)
+// already arrive wrapped in source.ErrPermanentRefusal from the do() choke
+// point, and the caller drops the pending release on that sentinel too. A
+// fenced outcome keeps its ordinary 404 and 400/403 postures: only the
+// fence-less close is advisory.
 func (c *HTTPClient) ReleaseCIPark(ctx context.Context, id string, release source.CIParkRelease) error {
 	d, err := parkQueueDescriptor(id)
 	if err != nil {
@@ -372,10 +378,10 @@ func (c *HTTPClient) ReleaseCIPark(ctx context.Context, id string, release sourc
 	}, nil)
 	var apiErr *APIError
 	if errors.As(err, &apiErr) && apiErr.StatusCode == http.StatusNotFound {
-		// The exchange was deferred past the do() choke point and this site
-		// reclassifies it: count its pending 4xx class once, then wrap the
-		// permanent unsupported sentinel the caller drops on.
-		c.countPendingExchange(err)
+		// The 4xx class of a non-reclassified exchange was already counted
+		// once at the do() choke point (failExchange marks it counted), so
+		// wrapping the sentinel here adds no diagnostic; the caller drops
+		// the pending release on this permanent unsupported posture.
 		return fmt.Errorf("%w: %w", source.ErrUnsupportedCIPark, err)
 	}
 	return c.classifyCIExchange(err)
