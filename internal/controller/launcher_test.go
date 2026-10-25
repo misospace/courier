@@ -7,6 +7,7 @@ import (
 	"errors"
 	"strings"
 	"testing"
+	"time"
 
 	corev1 "k8s.io/api/core/v1"
 	rbacv1 "k8s.io/api/rbac/v1"
@@ -439,6 +440,100 @@ func TestCoordinatorLauncherReportsProvisioningInFlightWhenExistingPodIsTerminat
 	err := launcher.Launch(context.Background(), run)
 	if !errors.Is(err, ErrProvisioningInFlight) {
 		t.Fatalf("Launch() error = %v, want ErrProvisioningInFlight; a colliding terminating pod must not be treated as a successful launch", err)
+	}
+}
+
+// TestCoordinatorLauncherTypesRunOwnedTerminatingCollision is the #560
+// refinement: a run-owned terminating pod surfaces as the typed
+// ProvisioningCollisionError — still matching ErrProvisioningInFlight —
+// carrying the pod identity and deletion timestamp so the reconciler can
+// bound the wait. A terminating pod not owned by the run keeps the bare
+// sentinel: the operator cannot safely bound a foreign pod's lifetime.
+func TestCoordinatorLauncherTypesRunOwnedTerminatingCollision(t *testing.T) {
+	run := &courierv1alpha1.CoderRun{
+		ObjectMeta: metav1.ObjectMeta{Name: "run-1", Namespace: "default", UID: types.UID("run-uid")},
+		Spec: courierv1alpha1.CoderRunSpec{
+			Mode: courierv1alpha1.ModeResolveIssue,
+			Repo: "acme/widgets",
+			Ref:  1,
+			Lane: "local",
+		},
+		Status: courierv1alpha1.CoderRunStatus{Phase: courierv1alpha1.PhaseClaimed},
+	}
+	lane := &courierv1alpha1.LaneProfile{
+		ObjectMeta: metav1.ObjectMeta{Name: "local", Namespace: "default"},
+		Spec:       courierv1alpha1.LaneProfileSpec{Roles: map[string]string{"coordinator": "test-model"}},
+	}
+	controller := true
+	since := metav1.NewTime(time.Now().Add(-30 * time.Minute)).Rfc3339Copy()
+	owned := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:              "run-1-coordinator",
+			Namespace:         "default",
+			UID:               types.UID("blocking-pod-uid"),
+			DeletionTimestamp: &since,
+			Finalizers:        []string{"keep.test/deletion"},
+			Labels: map[string]string{
+				executor.LabelRun: run.Name,
+			},
+			OwnerReferences: []metav1.OwnerReference{{
+				APIVersion: courierv1alpha1.GroupVersion.String(),
+				Kind:       "CoderRun",
+				Name:       run.Name,
+				UID:        run.UID,
+				Controller: &controller,
+			}},
+		},
+	}
+	fakeClient := fake.NewClientBuilder().
+		WithScheme(launcherScheme(t)).
+		WithStatusSubresource(&courierv1alpha1.CoderRun{}).
+		WithRuntimeObjects(run, lane, owned).
+		Build()
+	launcher := &CoordinatorLauncher{
+		Client: fakeClient,
+		Pod:    executor.PodConfig{Image: "example/opencode:test"},
+	}
+
+	err := launcher.Launch(context.Background(), run)
+	var collision *ProvisioningCollisionError
+	if !errors.As(err, &collision) {
+		t.Fatalf("Launch() error = %v, want a *ProvisioningCollisionError for a run-owned terminating pod", err)
+	}
+	if collision.PodName != "run-1-coordinator" {
+		t.Fatalf("collision.PodName = %q, want run-1-coordinator", collision.PodName)
+	}
+	if collision.PodUID != string(types.UID("blocking-pod-uid")) {
+		t.Fatalf("collision.PodUID = %q, want the blocking pod's UID", collision.PodUID)
+	}
+	if !collision.Since.Equal(since.Time) {
+		t.Fatalf("collision.Since = %v, want %v", collision.Since, since.Time)
+	}
+	if !errors.Is(err, ErrProvisioningInFlight) {
+		t.Fatalf("Launch() error = %v, want it to satisfy errors.Is against ErrProvisioningInFlight so existing handling is unchanged", err)
+	}
+
+	// A terminating pod NOT owned by this run keeps the bare sentinel: the
+	// slot is foreign state the run must never adopt or bound for someone
+	// else.
+	foreign := owned.DeepCopy()
+	foreign.OwnerReferences[0].UID = types.UID("other-run-uid")
+	foreignClient := fake.NewClientBuilder().
+		WithScheme(launcherScheme(t)).
+		WithStatusSubresource(&courierv1alpha1.CoderRun{}).
+		WithRuntimeObjects(run, lane, foreign).
+		Build()
+	foreignLauncher := &CoordinatorLauncher{
+		Client: foreignClient,
+		Pod:    executor.PodConfig{Image: "example/opencode:test"},
+	}
+	foreignErr := foreignLauncher.Launch(context.Background(), run)
+	var foreignCollision *ProvisioningCollisionError
+	if errors.As(foreignErr, &foreignCollision) {
+		t.Fatalf("Launch() error = %v, want no *ProvisioningCollisionError for a terminating pod owned by another run", foreignErr)
+	}
+	if !errors.Is(foreignErr, ErrProvisioningInFlight) {
+		t.Fatalf("Launch() error = %v, want ErrProvisioningInFlight for a foreign terminating pod; the collision shape is unchanged", foreignErr)
 	}
 }
 

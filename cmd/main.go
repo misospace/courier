@@ -92,6 +92,7 @@ func main() {
 	var doneRetention time.Duration
 	var failedRetention time.Duration
 	var needsHumanRetention time.Duration
+	var provisioningCollisionGrace time.Duration
 	var terminalAuditKeep int
 	var secureMode bool
 	var forgeProvidersFile string
@@ -153,6 +154,7 @@ func main() {
 	flag.DurationVar(&doneRetention, "done-retention", 5*time.Minute, "How long a resolved Done CoderRun is kept before the retention reaper deletes it.")
 	flag.DurationVar(&failedRetention, "failed-retention", 168*time.Hour, "How long a Failed CoderRun is kept, once its lifecycle report has settled, before the retention reaper deletes it.")
 	flag.DurationVar(&needsHumanRetention, "needs-human-retention", 168*time.Hour, "How long a NeedsHuman CoderRun is kept, once its lifecycle report has settled, before the retention reaper deletes it.")
+	flag.DurationVar(&provisioningCollisionGrace, "provisioning-collision-grace", 6*time.Hour, "How long a run-owned coordinator pod may stay Terminating while blocking a run's slot before the run escalates to NeedsHuman.")
 	flag.IntVar(&terminalAuditKeep, "terminal-audit-keep", 5, "Number of most recent terminal CoderRuns per repository the retention reaper always retains, even past their retention window.")
 	opts := zap.Options{Development: true}
 	opts.BindFlags(flag.CommandLine)
@@ -425,21 +427,22 @@ func main() {
 	}
 
 	reconciler := &controller.CoderRunReconciler{
-		Client:              mgr.GetClient(),
-		Scheme:              mgr.GetScheme(),
-		APIReader:           mgr.GetAPIReader(),
-		Launch:              launcher.Launch,
-		Sources:             sources,
-		StatusWriter:        status.KubePatchWriter{Client: mgr.GetClient()},
-		Observer:            githubObserver,
-		PullRequests:        pullRequestReader(githubObserver),
-		Events:              runEvents,
-		Evidence:            evidenceIntake,
-		PRHeadResolver:      existingPRHeadResolver(githubObserver),
-		DoneRetention:       doneRetention,
-		FailedRetention:     failedRetention,
-		NeedsHumanRetention: needsHumanRetention,
-		TerminalAuditKeep:   terminalAuditKeep,
+		Client:                     mgr.GetClient(),
+		Scheme:                     mgr.GetScheme(),
+		APIReader:                  mgr.GetAPIReader(),
+		Launch:                     launcher.Launch,
+		Sources:                    sources,
+		StatusWriter:               status.KubePatchWriter{Client: mgr.GetClient()},
+		Observer:                   githubObserver,
+		PullRequests:               pullRequestReader(githubObserver),
+		Events:                     runEvents,
+		Evidence:                   evidenceIntake,
+		PRHeadResolver:             existingPRHeadResolver(githubObserver),
+		DoneRetention:              doneRetention,
+		FailedRetention:            failedRetention,
+		NeedsHumanRetention:        needsHumanRetention,
+		ProvisioningCollisionGrace: provisioningCollisionGrace,
+		TerminalAuditKeep:          terminalAuditKeep,
 	}
 	if secureMode {
 		secure, err := buildSecureControl(secureConfig{
