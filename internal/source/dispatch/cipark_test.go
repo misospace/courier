@@ -3,11 +3,12 @@ package dispatch
 // The three CI-park routes (/api/pr-fix-queue/cipark, cireserve, cirepair),
 // their wire shapes, and their coded refusal reasons exercised below are
 // Courier's proposed cross-repo contract for the Dispatch server's PR-fix
-// queue deferral (connector side tracked as misospace/courier#495; no
-// upstream issue number exists yet). Until the server lands, these fixtures
-// are the pin: update this file in lockstep with the dispatch
-// implementation, as internal/source/dispatch/contract_test.go does for its
-// mirrored upstream allowlist.
+// queue deferral (connector side tracked as misospace/courier#495; the
+// fence-less close on cirepair that releases a deferral whose opportunity
+// ended without a reservation, as misospace/courier#534). Until the server
+// lands, these fixtures are the pin: update this file in lockstep with the
+// dispatch implementation, as internal/source/dispatch/contract_test.go does
+// for its mirrored upstream allowlist.
 
 import (
 	"context"
@@ -83,7 +84,9 @@ func ciParkDiscover(t *testing.T, adapter *Adapter) []source.WorkItem {
 // TestDispatchCIParkWireBodies pins the exact request bodies of the three
 // lifecycle endpoints: the queue item pivots by repo+pr+generation exactly
 // like the mark/ack family, so no prFixId or handoutToken travels, the park
-// carries no fence, and only a repushed outcome carries a head.
+// carries no fence, only a repushed outcome carries a head, and the
+// deferral's fence-less close (#534) travels on cirepair with no fence and
+// no head, keyed by the park notice's own idempotency key.
 func TestDispatchCIParkWireBodies(t *testing.T) {
 	var mu sync.Mutex
 	bodies := map[string][]map[string]any{}
@@ -123,12 +126,18 @@ func TestDispatchCIParkWireBodies(t *testing.T) {
 	if err := client.SettleCIRepair(ctx, item.ID, source.CIRepairOutcome{FenceToken: "fence-one", IdempotencyKey: "unsupported-key", PR: "77", Result: source.CIRepairUnsupported}); err != nil {
 		t.Fatalf("SettleCIRepair(unsupported): %v", err)
 	}
+	// The fence-less close rides the same route with no fence and no head:
+	// releasing a deferral settles no attempt, so nothing fenced travels.
+	if err := client.ReleaseCIPark(ctx, item.ID, source.CIParkRelease{PR: "77", Head: ciparkHead1, IdempotencyKey: "park-key"}); err != nil {
+		t.Fatalf("ReleaseCIPark: %v", err)
+	}
 
 	park := map[string]any{"repo": "acme/widgets", "generation": float64(ciparkGen), "agentName": "worker", "head": ciparkHead1, "idempotencyKey": "park-key"}
 	reserve := map[string]any{"repo": "acme/widgets", "generation": float64(ciparkGen), "agentName": "worker", "head": ciparkHead1, "idempotencyKey": "reserve-key", "fenceToken": "fence-one"}
 	repushed := map[string]any{"repo": "acme/widgets", "generation": float64(ciparkGen), "agentName": "worker", "head": ciparkHead2, "idempotencyKey": "outcome-key", "fenceToken": "fence-one", "result": "repushed"}
 	exhausted := map[string]any{"repo": "acme/widgets", "generation": float64(ciparkGen), "agentName": "worker", "idempotencyKey": "outcome-key", "fenceToken": "fence-one", "result": "exhausted"}
 	unsupported := map[string]any{"repo": "acme/widgets", "generation": float64(ciparkGen), "agentName": "worker", "idempotencyKey": "unsupported-key", "fenceToken": "fence-one", "result": "unsupported"}
+	release := map[string]any{"repo": "acme/widgets", "generation": float64(ciparkGen), "agentName": "worker", "idempotencyKey": "park-key", "result": "unsupported"}
 	for endpoint, want := range map[string]map[string]any{
 		"/api/pr-fix-queue/cipark":    park,
 		"/api/pr-fix-queue/cireserve": reserve,
@@ -137,10 +146,10 @@ func TestDispatchCIParkWireBodies(t *testing.T) {
 			t.Errorf("%s body = %#v, want %#v", endpoint, got, want)
 		}
 	}
-	if got := bodies["/api/pr-fix-queue/cirepair"]; len(got) != 3 {
-		t.Fatalf("cirepair bodies = %d, want 3", len(got))
-	} else if !reflect.DeepEqual(got[0], repushed) || !reflect.DeepEqual(got[1], exhausted) || !reflect.DeepEqual(got[2], unsupported) {
-		t.Errorf("cirepair bodies = %#v/%#v/%#v, want the repushed, exhausted, and unsupported shapes", got[0], got[1], got[2])
+	if got := bodies["/api/pr-fix-queue/cirepair"]; len(got) != 4 {
+		t.Fatalf("cirepair bodies = %d, want 4", len(got))
+	} else if !reflect.DeepEqual(got[0], repushed) || !reflect.DeepEqual(got[1], exhausted) || !reflect.DeepEqual(got[2], unsupported) || !reflect.DeepEqual(got[3], release) {
+		t.Errorf("cirepair bodies = %#v/%#v/%#v/%#v, want the repushed, exhausted, unsupported, and fence-less close shapes", got[0], got[1], got[2], got[3])
 	}
 	for endpoint, captures := range bodies {
 		for _, captured := range captures {
@@ -156,6 +165,12 @@ func TestDispatchCIParkWireBodies(t *testing.T) {
 	}
 	if _, ok := bodies["/api/pr-fix-queue/cirepair"][1]["head"]; ok {
 		t.Error("exhausted outcome carries a head")
+	}
+	if _, ok := bodies["/api/pr-fix-queue/cirepair"][3]["fenceToken"]; ok {
+		t.Error("the fence-less close carries a fenceToken")
+	}
+	if _, ok := bodies["/api/pr-fix-queue/cirepair"][3]["head"]; ok {
+		t.Error("the fence-less close carries a head")
 	}
 }
 
@@ -218,15 +233,23 @@ func TestDispatchCIParkAdapterLifecycle(t *testing.T) {
 			if err := lifecycle.ReportCIRepair(ctx, item, source.CIRepairOutcome{FenceToken: "fence-one", IdempotencyKey: "outcome-key", PR: "77", Head: ciparkHead2, Result: source.CIRepairRepushed}); err != nil {
 				t.Fatalf("ReportCIRepair: %v", err)
 			}
+			// The release rides the same lifecycle without a fence, and the
+			// close POST is the only request beyond the park, reservation,
+			// and outcome.
+			if err := lifecycle.ReleaseCIPark(ctx, item, source.CIParkRelease{PR: "77", Head: ciparkHead1, IdempotencyKey: "park-key"}); err != nil {
+				t.Fatalf("ReleaseCIPark: %v", err)
+			}
 			if f.checks != 1 {
 				t.Fatalf("pull request state re-reads = %d, want 1 (only the reservation re-validates)", f.checks)
 			}
 			if !tc.wantOpen {
 				// The refusal fired before the reservation POST, so only the
-				// park and the outcome reached the server.
-				if requests != 2 {
-					t.Fatalf("requests = %d, want 2 (park and outcome only)", requests)
+				// park, the outcome, and the close reached the server.
+				if requests != 3 {
+					t.Fatalf("requests = %d, want 3 (park, outcome, and close only)", requests)
 				}
+			} else if requests != 4 {
+				t.Fatalf("requests = %d, want 4 (park, reservation, outcome, and close)", requests)
 			}
 		})
 	}
@@ -282,6 +305,9 @@ func TestDispatchCIParkUnsupported(t *testing.T) {
 			if err := adapter.ReportCIRepair(ctx, item, source.CIRepairOutcome{FenceToken: "fence", IdempotencyKey: "k", PR: "42", Head: ciparkHead1, Result: source.CIRepairUnsupported}); !errors.Is(err, source.ErrUnsupportedCIPark) {
 				t.Errorf("ReportCIRepair() = %v, want ErrUnsupportedCIPark", err)
 			}
+			if err := adapter.ReleaseCIPark(ctx, item, source.CIParkRelease{PR: "42", Head: ciparkHead1, IdempotencyKey: "k"}); !errors.Is(err, source.ErrUnsupportedCIPark) {
+				t.Errorf("ReleaseCIPark() = %v, want ErrUnsupportedCIPark", err)
+			}
 			if requests != 0 {
 				t.Errorf("requests = %d, want 0 (the gate refuses before any API call)", requests)
 			}
@@ -308,6 +334,9 @@ func TestDispatchCIParkUnsupported(t *testing.T) {
 				if err := client.ParkCI(context.Background(), id, source.CIParkNotice{PR: "77", Head: ciparkHead1, IdempotencyKey: "k"}); errors.Is(err, source.ErrUnsupportedCIPark) || !strings.Contains(err.Error(), "invalid PR-fix descriptor") {
 					t.Errorf("ParkCI(over-range) = %v, want a plain invalid-descriptor error", err)
 				}
+				if err := client.ReleaseCIPark(context.Background(), id, source.CIParkRelease{PR: "77", Head: ciparkHead1, IdempotencyKey: "k"}); errors.Is(err, source.ErrUnsupportedCIPark) || !strings.Contains(err.Error(), "invalid PR-fix descriptor") {
+					t.Errorf("ReleaseCIPark(over-range) = %v, want a plain invalid-descriptor error", err)
+				}
 			})
 		}
 	})
@@ -327,6 +356,9 @@ func TestDispatchCIParkUnsupported(t *testing.T) {
 		}
 		if err := lifecycle.ReportCIRepair(ctx, item, source.CIRepairOutcome{FenceToken: "fence", IdempotencyKey: "k", PR: "1", Result: source.CIRepairUnsupported}); !errors.Is(err, source.ErrUnsupportedCIPark) {
 			t.Errorf("ReportCIRepair() = %v, want ErrUnsupportedCIPark", err)
+		}
+		if err := lifecycle.ReleaseCIPark(ctx, item, source.CIParkRelease{PR: "1", Head: ciparkHead1, IdempotencyKey: "k"}); !errors.Is(err, source.ErrUnsupportedCIPark) {
+			t.Errorf("ReleaseCIPark() = %v, want ErrUnsupportedCIPark", err)
 		}
 		if _, ok := findSeries(t, reg, connector.MetricCapabilityInfo, map[string]string{
 			"connector": defaultConnectorName, "capability": connector.CapabilityCIParkLifecycle, "state": connector.CapabilityUnsupported,
@@ -419,6 +451,30 @@ func TestDispatchCIParkValidationFailures(t *testing.T) {
 		{"empty-result", func(c *HTTPClient) error {
 			return c.SettleCIRepair(context.Background(), item.ID, source.CIRepairOutcome{FenceToken: "fence", IdempotencyKey: "k", PR: "77"})
 		}},
+		// The fence-less close is validated on the same descriptor, pull
+		// request, and key gates, and none of the fence gates: there is no
+		// fence to validate, and no validation may require one.
+		{"release-pull-request-mismatch", func(c *HTTPClient) error {
+			return c.ReleaseCIPark(context.Background(), item.ID, source.CIParkRelease{PR: "99", Head: head, IdempotencyKey: "k"})
+		}},
+		{"release-pull-request-missing", func(c *HTTPClient) error {
+			return c.ReleaseCIPark(context.Background(), item.ID, source.CIParkRelease{Head: head, IdempotencyKey: "k"})
+		}},
+		{"release-pull-request-repo-mismatch", func(c *HTTPClient) error {
+			return c.ReleaseCIPark(context.Background(), item.ID, source.CIParkRelease{PR: "https://github.com/evil/other/pull/77", Head: head, IdempotencyKey: "k"})
+		}},
+		{"release-idempotency-key-empty", func(c *HTTPClient) error {
+			return c.ReleaseCIPark(context.Background(), item.ID, source.CIParkRelease{PR: "77", Head: head})
+		}},
+		{"release-idempotency-key-blank", func(c *HTTPClient) error {
+			return c.ReleaseCIPark(context.Background(), item.ID, source.CIParkRelease{PR: "77", Head: head, IdempotencyKey: "   "})
+		}},
+		{"release-idempotency-key-over-limit", func(c *HTTPClient) error {
+			return c.ReleaseCIPark(context.Background(), item.ID, source.CIParkRelease{PR: "77", Head: head, IdempotencyKey: strings.Repeat("k", maxCIIdempotencyKeyLength+1)})
+		}},
+		{"release-corrupt-work-id", func(c *HTTPClient) error {
+			return c.ReleaseCIPark(context.Background(), "not-a-work-id", source.CIParkRelease{PR: "77", Head: head, IdempotencyKey: "k"})
+		}},
 	}
 	for _, tc := range cases {
 		tc := tc
@@ -503,6 +559,9 @@ func TestDispatchCIParkGenerationMismatch(t *testing.T) {
 		{"outcome", func(a *Adapter) error {
 			return a.ReportCIRepair(context.Background(), ciparkWorkItem(), source.CIRepairOutcome{FenceToken: "fence", IdempotencyKey: "k", PR: "77", Result: source.CIRepairExhausted})
 		}},
+		{"close", func(a *Adapter) error {
+			return a.ReleaseCIPark(context.Background(), ciparkWorkItem(), source.CIParkRelease{PR: "77", Head: ciparkHead1, IdempotencyKey: "k"})
+		}},
 	}
 	for _, tc := range cases {
 		tc := tc
@@ -560,6 +619,9 @@ func TestDispatchCIParkCodedRefusals(t *testing.T) {
 		}},
 		{"cirepair", func(a *Adapter) error {
 			return a.ReportCIRepair(context.Background(), ciparkWorkItem(), source.CIRepairOutcome{FenceToken: "fence", IdempotencyKey: "k", PR: "77", Result: source.CIRepairExhausted})
+		}},
+		{"cirepair-close", func(a *Adapter) error {
+			return a.ReleaseCIPark(context.Background(), ciparkWorkItem(), source.CIParkRelease{PR: "77", Head: ciparkHead1, IdempotencyKey: "k"})
 		}},
 	}
 	for _, call := range calls {
@@ -653,12 +715,13 @@ type ciParkRequest struct {
 	Result         string `json:"result"`
 }
 
-// ciParkDispatch models Dispatch's CI-park deferral contract (issue #495)
-// with in-memory state: the three generation-fenced, idempotent lifecycle
-// endpoints plus the next-task handout, which stays quiet while the deferral
-// is active and hands out again only after settlement. A committed
-// idempotency key replays its original acceptance without touching state, so
-// retries after a lost response never double-apply a transition.
+// ciParkDispatch models Dispatch's CI-park deferral contract (issues
+// #495/#534) with in-memory state: the three generation-fenced, idempotent
+// lifecycle endpoints plus the next-task handout, which stays quiet while
+// the deferral is active and hands out again only after settlement or the
+// fence-less close. A committed idempotency key replays its original
+// acceptance without touching state, so retries after a lost response never
+// double-apply a transition.
 type ciParkDispatch struct {
 	mu sync.Mutex
 
@@ -677,6 +740,7 @@ type ciParkDispatch struct {
 
 	bookings int
 	handouts int
+	closes   int
 }
 
 func newCIParkDispatch() *ciParkDispatch {
@@ -738,6 +802,13 @@ func (s *ciParkDispatch) cipark(w http.ResponseWriter, body ciParkRequest) {
 	s.parkKeys[body.IdempotencyKey] = true
 	s.parked = true
 	s.head = body.Head
+	// A fresh notice re-establishes the deferral for the key it presents:
+	// whatever closure state the previous deferral of this queue item
+	// reached — settled or released — is its own, and the new deferral
+	// starts open until it is settled or closed again.
+	s.reserved = false
+	s.fence = ""
+	s.settled = false
 	w.WriteHeader(http.StatusNoContent)
 }
 
@@ -777,6 +848,29 @@ func (s *ciParkDispatch) cirepair(w http.ResponseWriter, body ciParkRequest) {
 		return
 	}
 	if s.fenceRefused(body.Generation, w) {
+		return
+	}
+	if body.FenceToken == "" {
+		// The fence-less close (#534): a deferral whose opportunity ended
+		// without a reservation is released by the park notice's own
+		// idempotency key. The close never settles a granted reservation,
+		// so a live fence holds the deferral out of reach, and a deferral
+		// that is absent — never established, unknown key, released, or
+		// already settled — is refused advisory with the "no deferral
+		// exists" vocabulary.
+		if s.reserved {
+			s.refuse(w, "fence-held")
+			return
+		}
+		if !s.parked || !s.parkKeys[body.IdempotencyKey] {
+			s.refuse(w, "opportunity-missing")
+			return
+		}
+		s.outcomeKeys[body.IdempotencyKey] = true
+		s.settled = true
+		s.parked = false // stewardship back to Dispatch without a booking
+		s.closes++
+		w.WriteHeader(http.StatusNoContent)
 		return
 	}
 	if s.settled {
@@ -820,6 +914,7 @@ type ciParkState struct {
 	parked, reserved, settled  bool
 	head                       string
 	bookings, budget, handouts int
+	closes                     int
 }
 
 func (s *ciParkDispatch) snapshot() ciParkState {
@@ -827,7 +922,7 @@ func (s *ciParkDispatch) snapshot() ciParkState {
 	defer s.mu.Unlock()
 	return ciParkState{
 		parked: s.parked, reserved: s.reserved, settled: s.settled, head: s.head,
-		bookings: s.bookings, budget: s.budget, handouts: s.handouts,
+		bookings: s.bookings, budget: s.budget, handouts: s.handouts, closes: s.closes,
 	}
 }
 
@@ -944,6 +1039,63 @@ func TestDispatchCIParkCoordination(t *testing.T) {
 	}
 	if got := fake.snapshot(); got.bookings != 2 || got.budget != 1 || got.handouts != 1 || !got.settled || got.parked || got.head != ciparkHead2 {
 		t.Fatalf("state after replay = %#v, want the cycle's bookings, budget, handout, and settlement untouched", got)
+	}
+
+	// The release cycle (#534): a deferral whose opportunity ends without a
+	// reservation is closed fence-lessly, keyed by the park notice's own
+	// idempotency key, and the handout resumes with no budget spent.
+	if err := adapter.ReportCIParked(ctx, item, source.CIParkNotice{PR: "77", Head: ciparkHead1, IdempotencyKey: "park-3"}); err != nil {
+		t.Fatalf("ReportCIParked(pre-release): %v", err)
+	}
+	if items := ciParkDiscover(t, adapter); len(items) != 0 {
+		t.Fatalf("discover while re-parked = %d items, want none", len(items))
+	}
+	if err := adapter.ReleaseCIPark(ctx, item, source.CIParkRelease{PR: "77", Head: ciparkHead1, IdempotencyKey: "park-3"}); err != nil {
+		t.Fatalf("ReleaseCIPark: %v", err)
+	}
+	if items := ciParkDiscover(t, adapter); len(items) != 1 || items[0].ID != item.ID {
+		t.Fatalf("discover after the close = %#v, want the resumed handout", items)
+	}
+	// A committed close replays its acceptance for a retry that lost the
+	// response; a never-established key is refused advisory as stale work.
+	if err := replay.ReleaseCIPark(ctx, item, source.CIParkRelease{PR: "77", Head: ciparkHead1, IdempotencyKey: "park-3"}); err != nil {
+		t.Fatalf("replay ReleaseCIPark: %v", err)
+	}
+	if err := replay.ReleaseCIPark(ctx, item, source.CIParkRelease{PR: "77", Head: ciparkHead1, IdempotencyKey: "park-never"}); !errors.Is(err, source.ErrStaleWork) {
+		t.Fatalf("close on a never-established key = %v, want ErrStaleWork (the refusal is advisory on this route)", err)
+	}
+	if got := fake.snapshot(); got.closes != 1 || !got.settled || got.parked || got.bookings != 2 || got.budget != 1 {
+		t.Fatalf("state after the close cycle = %#v, want one close, no bookings or budget spent, and a released deferral", got)
+	}
+
+	// Fenced settlement keeps its own semantics: a granted reservation is
+	// settled by the fenced outcome's fence alone, a close cannot release a
+	// deferral out from under it, and after settlement the same close is
+	// refused advisory (the deferral no longer exists).
+	heldModel := newCIParkDispatch()
+	heldServer := httptest.NewServer(heldModel.serve(t))
+	defer heldServer.Close()
+	_, heldAdapter := ciParkClient(t, heldServer.URL)
+	if err := heldAdapter.ReportCIParked(ctx, item, source.CIParkNotice{PR: "77", Head: ciparkHead1, IdempotencyKey: "park-4"}); err != nil {
+		t.Fatalf("ReportCIParked(held): %v", err)
+	}
+	if _, err := heldAdapter.ReserveCIRepair(ctx, item, source.CIRepairReservation{FenceToken: "fence-three", IdempotencyKey: "reserve-4", PR: "77", Head: ciparkHead1}); err != nil {
+		t.Fatalf("ReserveCIRepair(held): %v", err)
+	}
+	if err := heldAdapter.ReleaseCIPark(ctx, item, source.CIParkRelease{PR: "77", Head: ciparkHead1, IdempotencyKey: "park-4"}); !errors.Is(err, source.ErrSuperseded) {
+		t.Fatalf("close under a live reservation = %v, want ErrSuperseded (fence-held)", err)
+	}
+	if err := heldAdapter.ReportCIRepair(ctx, item, source.CIRepairOutcome{FenceToken: "fence-three", IdempotencyKey: "outcome-4", PR: "77", Result: source.CIRepairExhausted}); err != nil {
+		t.Fatalf("ReportCIRepair(held, exhausted): %v", err)
+	}
+	if items := ciParkDiscover(t, heldAdapter); len(items) != 1 || items[0].ID != item.ID {
+		t.Fatalf("discover after the settled held-deferral = %#v, want the resumed handout", items)
+	}
+	if err := heldAdapter.ReleaseCIPark(ctx, item, source.CIParkRelease{PR: "77", Head: ciparkHead1, IdempotencyKey: "park-4"}); !errors.Is(err, source.ErrStaleWork) {
+		t.Fatalf("close after settlement = %v, want ErrStaleWork (the deferral no longer exists)", err)
+	}
+	if got := heldModel.snapshot(); got.bookings != 1 || got.budget != 2 || got.handouts != 1 || got.closes != 0 || !got.settled || got.parked {
+		t.Fatalf("held model state = %#v, want one booking, one handout, no committed close, settled deferral", got)
 	}
 }
 

@@ -78,17 +78,42 @@ type CIRepairOutcome struct {
 	Result         CIRepairResult
 }
 
+// CIParkRelease is the fence-less close of one deferral (#534). It releases
+// the deferral a park notice established when the repair opportunity ends
+// without a reservation: an expired window, a check that never registered, a
+// non-mechanical failure that settled, or capacity that never freed. It is
+// keyed by the park notice's own identity — IdempotencyKey is the key the
+// notice presented — and carries no fence because it settles no attempt. It
+// is advisory by nature: a source with no such deferral — the notice was
+// never accepted, or the deferral was already closed — refuses the release,
+// and the caller treats that refusal as the deferral already being gone. A
+// reservation that was granted is never released this way: the fenced
+// outcome remains the only route that settles a granted attempt.
+type CIParkRelease struct {
+	// PR is the run's pull request identity, matching the park notice.
+	PR string
+	// Head is the exact parked head the deferral announced.
+	Head string
+	// IdempotencyKey deduplicates the release at the source: it is the park
+	// notice's own key, so a retried release replays the same close instead
+	// of touching the deferral twice.
+	IdempotencyKey string
+}
+
 // CIParkLifecycle is the optional source capability for the CI
 // park-and-resume loop (#475). ReportCIParked announces the park so a
 // connector can defer its own PR-fix dispatch; ReserveCIRepair atomically
 // reserves one repair opportunity or refuses with ErrSuperseded or
 // ErrStaleWork; ReportCIRepair publishes the fenced, idempotent outcome of
-// that attempt. A source that cannot provide claim/generation-fenced,
-// idempotent transitions must not implement the interface, and must never
-// emulate it with ordinary lifecycle calls: the core treats a missing
-// implementation as unsupported.
+// that attempt; ReleaseCIPark closes the deferral the notice established
+// when the opportunity ends without a reservation (#534), keyed by the
+// notice's own idempotency key and carrying no fence. A source that cannot
+// provide claim/generation-fenced, idempotent transitions must not implement
+// the interface, and must never emulate it with ordinary lifecycle calls:
+// the core treats a missing implementation as unsupported.
 type CIParkLifecycle interface {
 	ReportCIParked(context.Context, WorkItem, CIParkNotice) error
 	ReserveCIRepair(context.Context, WorkItem, CIRepairReservation) (CIRepairGrant, error)
+	ReleaseCIPark(context.Context, WorkItem, CIParkRelease) error
 	ReportCIRepair(context.Context, WorkItem, CIRepairOutcome) error
 }

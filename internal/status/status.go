@@ -167,6 +167,11 @@ type OperatorPatch struct {
 	// set the record and call ClearCIParkDeferral to remove it.
 	// +optional
 	CIParkDeferral *courierv1alpha1.CIParkDeferral `json:"ciparkDeferral,omitempty"`
+	// CIParkRelease is the operator-owned pending deferral-release record
+	// (#534). It follows the same clear semantics as CIRepair: assign the
+	// pointer to set the record and call ClearCIParkRelease to remove it.
+	// +optional
+	CIParkRelease *courierv1alpha1.CIParkRelease `json:"ciparkRelease,omitempty"`
 
 	// clearCIPark, clearCIRepair, clearCISettlement, and clearCIParkDeferral
 	// distinguish a record the operator cleared from a record it never
@@ -176,6 +181,7 @@ type OperatorPatch struct {
 	clearCIRepair       bool
 	clearCISettlement   bool
 	clearCIParkDeferral bool
+	clearCIParkRelease  bool
 }
 
 // MarshalJSON encodes the operator patch. CIPark and CIRepair are nested
@@ -193,6 +199,7 @@ func (p OperatorPatch) MarshalJSON() ([]byte, error) {
 		CIRepair       json.RawMessage `json:"ciRepair,omitempty"`
 		CISettlement   json.RawMessage `json:"ciSettlement,omitempty"`
 		CIParkDeferral json.RawMessage `json:"ciparkDeferral,omitempty"`
+		CIParkRelease  json.RawMessage `json:"ciparkRelease,omitempty"`
 	}{alias: alias(p)}
 	if p.CIPark != nil {
 		encoded, err := json.Marshal(p.CIPark)
@@ -230,6 +237,15 @@ func (p OperatorPatch) MarshalJSON() ([]byte, error) {
 	} else if p.clearCIParkDeferral {
 		document.CIParkDeferral = json.RawMessage("null")
 	}
+	if p.CIParkRelease != nil {
+		encoded, err := json.Marshal(p.CIParkRelease)
+		if err != nil {
+			return nil, fmt.Errorf("status: encode ciparkRelease: %w", err)
+		}
+		document.CIParkRelease = encoded
+	} else if p.clearCIParkRelease {
+		document.CIParkRelease = json.RawMessage("null")
+	}
 	return json.Marshal(document)
 }
 
@@ -263,6 +279,14 @@ func (p *OperatorPatch) ClearCISettlement() {
 func (p *OperatorPatch) ClearCIParkDeferral() {
 	p.CIParkDeferral = nil
 	p.clearCIParkDeferral = true
+}
+
+// ClearCIParkRelease emits an explicit JSON null for the pending
+// deferral-release record, clearing it: a merge patch leaves an omitted
+// nested object untouched, so only null removes it.
+func (p *OperatorPatch) ClearCIParkRelease() {
+	p.CIParkRelease = nil
+	p.clearCIParkRelease = true
 }
 
 // SetControlRequest encodes one operator control request into the patch,

@@ -240,14 +240,11 @@ func (r *CoderRunReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 		return ctrl.Result{}, err
 	}
 
-	// Source-facing park reports the run still owes — the park notice and
-	// the fenced outcome — are durable retry intent. Neither report may
-	// preempt the run's own progression: the park window bounds every wait
-	// the loop takes, and a report that cannot be delivered must never hold
-	// that window hostage. The notice therefore retries on the run's own
-	// cadence — the park poll, pod events, observations — and expires with
-	// the opportunity it describes. The settlement keeps a dedicated requeue
-	// only where the run would otherwise never reconcile again.
+	// Source-facing park reports the run still owes — the park notice, the
+	// fenced outcome, and the fence-less deferral release — are durable retry
+	// intent. Neither close may preempt the run's own progression or terminal
+	// obligations. Pending closes are both attempted on each reconcile, then
+	// share the bounded retry from #557.
 	if run.Status.CIParkDeferral != nil {
 		switch run.Status.Phase {
 		case courierv1alpha1.PhaseVerifying, courierv1alpha1.PhaseClaimed, courierv1alpha1.PhaseRunning:
@@ -255,8 +252,6 @@ func (r *CoderRunReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 				log.FromContext(ctx).V(1).Info("source park notice not delivered", "run", run.Name, "error", err.Error())
 			}
 		default:
-			// The repair opportunity the notice described is over: a late
-			// notice would defer the source against nothing.
 			before := run.DeepCopy()
 			run.Status.CIParkDeferral = nil
 			if err := r.patchStatus(ctx, before, &run); err != nil {
@@ -264,39 +259,28 @@ func (r *CoderRunReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 			}
 		}
 	}
-	// closeRetry is the bounded retry a park close report the source has not
-	// accepted yet still owes. It rides along as a cap on the reconcile's wake
-	// interval instead of preempting the run's own work: a terminal run still
-	// owes the source its lifecycle report and its slow merge observation, and
-	// neither may wait behind a close the source keeps refusing. Only a run
-	// whose own lifecycle is still ahead of it — one that resolves and reaps
-	// the source work — keeps the dedicated requeue.
 	closeRetry := time.Duration(0)
+	closePending := false
 	if run.Status.CISettlement != nil {
 		if delivered, err := r.deliverCISettlement(ctx, &run); !delivered {
 			log.FromContext(ctx).V(1).Info("source repair settlement not delivered", "run", run.Name, "error", err.Error())
-			switch run.Status.Phase {
-			case courierv1alpha1.PhaseVerifying, courierv1alpha1.PhaseClaimed, courierv1alpha1.PhaseRunning:
-				// The run's own progression owns the cadence: the park
-				// window bounds every wait, and pod events drive a running
-				// run. Preempting them for a report would hold the loop
-				// hostage to the source.
-			case courierv1alpha1.PhaseAwaitingReview, courierv1alpha1.PhaseHandedOff,
-				courierv1alpha1.PhaseNeedsHuman, courierv1alpha1.PhaseFailed, courierv1alpha1.PhaseBlockedExternal:
-				// A terminal run's own obligations come first: the pending
-				// lifecycle report and the slow merge observation are
-				// retried on this very reconcile. The close only bounds the
-				// wake interval, so it is re-presented within the bounded
-				// settlement cadence without ever preempting them.
-				closeRetry = ciparkSettlementRetryDelay
-			default:
-				// A run whose own lifecycle is still ahead of it — a Done
-				// run that resolves and reaps the source work, or a run
-				// that is not admitted yet — keeps the dedicated requeue:
-				// proceeding while a close is owed could resolve and delete
-				// the run, and the pending close would be lost with it.
-				return ctrl.Result{RequeueAfter: ciparkSettlementRetryDelay}, nil
-			}
+			closePending = true
+		}
+	}
+	if run.Status.CIParkRelease != nil {
+		if delivered, err := r.deliverCIParkRelease(ctx, &run); !delivered {
+			log.FromContext(ctx).V(1).Info("source deferral release not delivered", "run", run.Name, "error", err.Error())
+			closePending = true
+		}
+	}
+	if closePending {
+		switch run.Status.Phase {
+		case courierv1alpha1.PhaseVerifying, courierv1alpha1.PhaseClaimed, courierv1alpha1.PhaseRunning:
+		case courierv1alpha1.PhaseAwaitingReview, courierv1alpha1.PhaseHandedOff,
+			courierv1alpha1.PhaseNeedsHuman, courierv1alpha1.PhaseFailed, courierv1alpha1.PhaseBlockedExternal:
+			closeRetry = ciparkSettlementRetryDelay
+		default:
+			return ctrl.Result{RequeueAfter: ciparkSettlementRetryDelay}, nil
 		}
 	}
 
@@ -565,7 +549,7 @@ func (r *CoderRunReconciler) reconcileTerminal(ctx context.Context, run *courier
 				"phase", run.Status.Phase, "lifecycleReported", lifecycleReportConditionState(run))
 			return ctrl.Result{}, nil
 		}
-		if run.Status.CISettlement != nil {
+		if run.Status.CISettlement != nil || run.Status.CIParkRelease != nil {
 			// The run still owes the source a park close. Deleting it would
 			// drop the owed close with the object, so the retention window
 			// starts only once the close has landed — the same posture a
@@ -1950,6 +1934,17 @@ func (r *CoderRunReconciler) patchStatus(ctx context.Context, before, after *cou
 			fields.ClearCIParkDeferral()
 		} else {
 			fields.CIParkDeferral = after.Status.CIParkDeferral
+		}
+	}
+	// CIParkRelease is the operator-owned pending deferral-release record
+	// (#534). It follows the CISettlement's explicit-null clear semantics:
+	// recorded before the close is attempted and cleared only once the close
+	// resolves at the source — accepted or moot.
+	if !reflect.DeepEqual(before.Status.CIParkRelease, after.Status.CIParkRelease) {
+		if after.Status.CIParkRelease == nil {
+			fields.ClearCIParkRelease()
+		} else {
+			fields.CIParkRelease = after.Status.CIParkRelease
 		}
 	}
 	// ControlRequest is replaceable, not set-once: a changed value replaces

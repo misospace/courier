@@ -22,6 +22,7 @@ import (
 type ParkLifecycleClient interface {
 	ParkCI(ctx context.Context, id string, notice source.CIParkNotice) error
 	ReserveCIRepair(ctx context.Context, id string, reservation source.CIRepairReservation) (source.CIRepairGrant, error)
+	ReleaseCIPark(ctx context.Context, id string, release source.CIParkRelease) error
 	SettleCIRepair(ctx context.Context, id string, outcome source.CIRepairOutcome) error
 }
 
@@ -50,6 +51,29 @@ func (a *Adapter) ReportCIParked(ctx context.Context, item source.WorkItem, noti
 		return source.ErrUnsupportedCIPark
 	}
 	return client.ParkCI(ctx, item.ID, notice)
+}
+
+// ReleaseCIPark closes the deferral the accepted park notice established
+// (#534), keyed by the park notice's own idempotency key, when the park's
+// repair opportunity ended without a reservation — an expired window, a check
+// that never registered, a settled non-mechanical failure, or capacity that
+// never freed. The close travels fence-less: no attempt was reserved, so
+// nothing is settled the way the fenced outcome settles it, and releasing
+// needs no fence. Clients without the park lifecycle capability release
+// nothing. The adapter keeps the family's refusal semantics —
+// source.ErrStaleWork for a deferral that does not exist and
+// source.ErrSuperseded for a deferral a newer generation or a live
+// reservation owns — and the advisory reading ("the deferral is already
+// gone: nothing owed") belongs to the caller.
+func (a *Adapter) ReleaseCIPark(ctx context.Context, item source.WorkItem, release source.CIParkRelease) error {
+	if err := a.validate(item); err != nil {
+		return err
+	}
+	client, ok := a.client.(ParkLifecycleClient)
+	if !ok {
+		return source.ErrUnsupportedCIPark
+	}
+	return client.ReleaseCIPark(ctx, item.ID, release)
 }
 
 // ReserveCIRepair fences one bounded repair opportunity against Dispatch's
@@ -303,6 +327,38 @@ func (c *HTTPClient) SettleCIRepair(ctx context.Context, id string, outcome sour
 		return fmt.Errorf("dispatch client: CI repair %q outcome carries a head; only %q repushes one", outcome.Result, source.CIRepairRepushed)
 	}
 	return c.classifyCIExchange(c.do(ctx, http.MethodPost, "/api/pr-fix-queue/cirepair", body, nil))
+}
+
+// ReleaseCIPark posts the fence-less close of one deferral to the same
+// /api/pr-fix-queue/cirepair route (misospace/courier#534): a park whose
+// repair opportunity ended without a reservation releases the deferral it
+// established with a body keyed by the park notice's own identity — the
+// notice's idempotency key and the queue's usual repo+generation pivot —
+// carrying result "unsupported" and no fence token. The idempotency key is
+// the one the park notice presented: a committed notice and its release are
+// the only operators on that key's deferral, so a retried close replays the
+// committed close instead of touching the deferral twice. A fenced outcome
+// remains the only route that settles a granted reservation; a release is
+// never sent for one. The close is validated on the descriptor, the pull
+// request identity guard, and the key alone — there is no fence to validate,
+// no head to validate (the wire carries none), and no pull-request state to
+// re-read (only the reservation re-reads it).
+func (c *HTTPClient) ReleaseCIPark(ctx context.Context, id string, release source.CIParkRelease) error {
+	d, err := parkQueueDescriptor(id)
+	if err != nil {
+		return err
+	}
+	if err := matchParkPRIdentity(d, release.PR); err != nil {
+		return err
+	}
+	key, err := validateCIIdempotencyKey(release.IdempotencyKey)
+	if err != nil {
+		return err
+	}
+	return c.classifyCIExchange(c.do(ctx, http.MethodPost, "/api/pr-fix-queue/cirepair", map[string]any{
+		"repo": strings.ToLower(d.Repo), "generation": d.Generation, "agentName": c.agentName,
+		"idempotencyKey": key, "result": source.CIRepairUnsupported,
+	}, nil))
 }
 
 // classifyCIRefusal maps the CI park family's coded 409 refusals to the

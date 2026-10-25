@@ -76,6 +76,13 @@ type ciparkHarness struct {
 // lane that never declared one does.
 func newCIParkHarness(t *testing.T, name string, policy *courierv1alpha1.CIRepairPolicy, adapter source.Adapter) *ciparkHarness {
 	t.Helper()
+	return newCIParkHarnessMode(t, name, policy, adapter, courierv1alpha1.ModeResolveIssue)
+}
+
+// newCIParkHarnessMode creates the same scenario for a run of a chosen mode,
+// the spec being immutable after creation.
+func newCIParkHarnessMode(t *testing.T, name string, policy *courierv1alpha1.CIRepairPolicy, adapter source.Adapter, mode courierv1alpha1.Mode) *ciparkHarness {
+	t.Helper()
 	ctx := context.Background()
 	laneName := name + "-lane"
 	lane := envtestLane(laneName)
@@ -83,7 +90,9 @@ func newCIParkHarness(t *testing.T, name string, policy *courierv1alpha1.CIRepai
 	if err := envtestClient.Create(ctx, lane); err != nil {
 		t.Fatal(err)
 	}
-	if err := envtestClient.Create(ctx, envtestRun(name, laneName)); err != nil {
+	run := envtestRun(name, laneName)
+	run.Spec.Mode = mode
+	if err := envtestClient.Create(ctx, run); err != nil {
 		t.Fatal(err)
 	}
 	h := &ciparkHarness{t: t, name: name, laneName: laneName, adapter: adapter, world: &ciparkWorld{}}
@@ -853,6 +862,7 @@ type ciparkSource struct {
 	items        []source.WorkItem
 	reservations []source.CIRepairReservation
 	outcomes     []source.CIRepairOutcome
+	releases     []source.CIParkRelease
 }
 
 func (s *ciparkSource) ReportCIParked(_ context.Context, item source.WorkItem, notice source.CIParkNotice) error {
@@ -870,6 +880,58 @@ func (s *ciparkSource) ReserveCIRepair(_ context.Context, item source.WorkItem, 
 func (s *ciparkSource) ReportCIRepair(_ context.Context, item source.WorkItem, outcome source.CIRepairOutcome) error {
 	s.items = append(s.items, item)
 	s.outcomes = append(s.outcomes, outcome)
+	return nil
+}
+
+func (s *ciparkSource) ReleaseCIPark(_ context.Context, item source.WorkItem, release source.CIParkRelease) error {
+	s.items = append(s.items, item)
+	s.releases = append(s.releases, release)
+	return nil
+}
+
+// staleReleaseSource models a source whose deferral is already gone: the
+// release resolves with the advisory refusal the close's vocabulary calls
+// "no deferral exists". A refusal is not a delivery, so nothing is recorded.
+type staleReleaseSource struct {
+	ciparkSource
+}
+
+func (s *staleReleaseSource) ReleaseCIPark(ctx context.Context, item source.WorkItem, release source.CIParkRelease) error {
+	s.items = append(s.items, item)
+	return source.ErrStaleWork
+}
+
+// supersededReleaseSource models a source whose deferral is not this run's
+// to close: the release resolves with ErrSuperseded — a newer generation or
+// a granted reservation owns the deferral, and its own lifecycle releases
+// it. A refusal is not a delivery, so nothing is recorded.
+type supersededReleaseSource struct {
+	ciparkSource
+}
+
+func (s *supersededReleaseSource) ReleaseCIPark(ctx context.Context, item source.WorkItem, release source.CIParkRelease) error {
+	s.items = append(s.items, item)
+	return source.ErrSuperseded
+}
+
+// flakyReleaseSource models one lost close response for the release path:
+// the source commits the close and loses the response, so the re-presented
+// release must be byte-identical — the same key collapsing into the one
+// committed close. The default mode is a single loss; every close the source
+// saw is recorded.
+type flakyReleaseSource struct {
+	ciparkSource
+	firstCloseLost bool
+}
+
+func (s *flakyReleaseSource) ReleaseCIPark(ctx context.Context, item source.WorkItem, release source.CIParkRelease) error {
+	s.items = append(s.items, item)
+	if !s.firstCloseLost {
+		s.firstCloseLost = true
+		s.releases = append(s.releases, release)
+		return errors.New("dispatch server: response lost")
+	}
+	s.releases = append(s.releases, release)
 	return nil
 }
 
@@ -1259,6 +1321,7 @@ type refusingParkSource struct {
 	ciparkSource
 	noticeRefused     bool
 	settlementRefused bool
+	releaseRefused    bool
 }
 
 func (s *refusingParkSource) ReportCIParked(ctx context.Context, item source.WorkItem, notice source.CIParkNotice) error {
@@ -1273,6 +1336,13 @@ func (s *refusingParkSource) ReportCIRepair(ctx context.Context, item source.Wor
 		return source.ErrUnsupportedCIPark
 	}
 	return s.ciparkSource.ReportCIRepair(ctx, item, outcome)
+}
+
+func (s *refusingParkSource) ReleaseCIPark(_ context.Context, item source.WorkItem, release source.CIParkRelease) error {
+	if s.releaseRefused {
+		return source.ErrUnsupportedCIPark
+	}
+	return s.ciparkSource.ReleaseCIPark(context.Background(), item, release)
 }
 
 // TestEnvtestCIParkUnsupportedNoticeStopsRetrying pins the permanent refusal:
@@ -1427,6 +1497,591 @@ func TestEnvtestCIParkObservationWindowExpires(t *testing.T) {
 	if got := h.launchCount(name); got != 1 {
 		t.Fatalf("launch count = %d, want 1: an expired window never wakes the coordinator", got)
 	}
+}
+
+// windowExpiryPolicy is the one-check policy whose window expires inside an
+// envtest scenario with two reconciles, ending the park without a
+// reservation — the fence-less close's own precondition (#534).
+func windowExpiryPolicy() *courierv1alpha1.CIRepairPolicy {
+	return &courierv1alpha1.CIRepairPolicy{
+		MechanicalChecks:         []string{"build"},
+		MaxAttempts:              1,
+		ObservationWindowSeconds: 60,
+	}
+}
+
+// advancePastWindow fast-forwards the scenario's clock past the window.
+func advancePastWindow(now *time.Time, reconciler *CoderRunReconciler) {
+	*now = now.Add(2 * time.Minute)
+	reconciler.Now = func() time.Time { return *now }
+}
+
+// TestEnvtestCIParkDeferralReleasedWithoutReservation pins the release path
+// (#534): a park whose notice the source accepted ends without a reservation
+// — the window expires — and the deferral is released with the fence-less
+// close, keyed by the very identity the park notice carried. The pending
+// release is cleared in the same pass, so the close delivered exactly once
+// and further reconciles re-present nothing.
+func TestEnvtestCIParkDeferralReleasedWithoutReservation(t *testing.T) {
+	if envtestClient == nil {
+		t.Skip("KUBEBUILDER_ASSETS is not set")
+	}
+	adapter := &ciparkSource{}
+	h := newCIParkHarness(t, "cipark-deferral-release", windowExpiryPolicy(), adapter)
+	now := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	h.reconciler.Now = func() time.Time { return now }
+	h.park("sha-1", CheckObservation{Name: "build", State: CheckStatePending})
+	if len(adapter.parks) != 1 {
+		t.Fatalf("park notices = %#v, want exactly one delivered notice", adapter.parks)
+	}
+	advancePastWindow(&now, h.reconciler)
+	h.reconcile()
+	if got := h.phase(); got != courierv1alpha1.PhaseHandedOff {
+		t.Fatalf("phase after the park window closed = %q, want HandedOff", got)
+	}
+	ended := h.run()
+	if ended.Status.CIPark == nil || ended.Status.CIPark.LastOutcome != courierv1alpha1.CIParkOutcomeUnsupported {
+		t.Fatalf("park record = %#v, want the unsupported outcome", ended.Status.CIPark)
+	}
+	if ended.Status.CIParkRelease != nil {
+		t.Fatalf("status.ciparkRelease = %#v at the finish, want nil (the delivery cleared it)", ended.Status.CIParkRelease)
+	}
+	if len(adapter.releases) != 1 {
+		t.Fatalf("releases = %#v, want exactly one close", adapter.releases)
+	}
+	release := adapter.releases[0]
+	notice := adapter.parks[0]
+	// The close is keyed by the park notice's own identity: the idempotency
+	// key is the notice's own, the parked head is the one it announced, and
+	// the pull request is the run's.
+	if release.IdempotencyKey != notice.IdempotencyKey {
+		t.Fatalf("release key = %q, want the parking notice's own key %q", release.IdempotencyKey, notice.IdempotencyKey)
+	}
+	if release.Head != "sha-1" {
+		t.Fatalf("release head = %q, want the parked head sha-1", release.Head)
+	}
+	if release.PR != "42" {
+		t.Fatalf("release PR = %q, want 42", release.PR)
+	}
+	// The run stays settled: further reconciles re-present nothing.
+	h.reconcile()
+	if len(adapter.releases) != 1 {
+		t.Fatalf("releases after a further reconcile = %d, want exactly one", len(adapter.releases))
+	}
+	if final := h.run(); final.Status.CIParkRelease != nil {
+		t.Fatalf("status.ciparkRelease = %#v after a further reconcile, want nil", final.Status.CIParkRelease)
+	}
+}
+
+// TestEnvtestCIParkPendingNoticeBecomesReleaseAtFinish pins the conversion:
+// a park whose notice the source never accepted still leaves durable retry
+// intent for the release, and the finish clears the pending notice in the
+// same write — the release, not the notice, is what over, and the close is
+// advisory when the source never saw the notice. Nothing is wedged, and the
+// source sees no notice at all.
+func TestEnvtestCIParkPendingNoticeBecomesReleaseAtFinish(t *testing.T) {
+	if envtestClient == nil {
+		t.Skip("KUBEBUILDER_ASSETS is not set")
+	}
+	adapter := &failingNoticeSource{}
+	h := newCIParkHarness(t, "cipark-pending-notice-release", windowExpiryPolicy(), adapter)
+	now := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	h.reconciler.Now = func() time.Time { return now }
+	h.park("sha-1", CheckObservation{Name: "build", State: CheckStatePending})
+	parked := h.run()
+	if parked.Status.CIParkDeferral == nil {
+		t.Fatal("status.ciparkDeferral = nil while the notice keeps failing, want the pending notice")
+	}
+	pendingKey := parked.Status.CIParkDeferral.IdempotencyKey
+	advancePastWindow(&now, h.reconciler)
+	h.reconcile()
+	if got := h.phase(); got != courierv1alpha1.PhaseHandedOff {
+		t.Fatalf("phase after the park window closed = %q, want HandedOff", got)
+	}
+	ended := h.run()
+	// The pending notice is converted, not left to drop on a later
+	// reconcile: the finish write clears it together with the release.
+	if ended.Status.CIParkDeferral != nil {
+		t.Fatalf("status.ciparkDeferral = %#v at the finish, want nil (converted into the release)", ended.Status.CIParkDeferral)
+	}
+	if len(adapter.releases) != 1 {
+		t.Fatalf("releases = %#v, want exactly one close even though the notice never landed", adapter.releases)
+	}
+	if adapter.releases[0].IdempotencyKey != pendingKey {
+		t.Fatalf("release key = %q, want the pending notice's own key %q", adapter.releases[0].IdempotencyKey, pendingKey)
+	}
+	// The close is advisory: the source never had a deferral of this
+	// identity, and the still-delivered close clears the release record
+	// either way.
+	if ended.Status.CIParkRelease != nil {
+		t.Fatalf("status.ciparkRelease = %#v at the finish, want nil", ended.Status.CIParkRelease)
+	}
+	if len(adapter.parks) != 0 {
+		t.Fatalf("park notices = %d, want 0 (never delivered)", len(adapter.parks))
+	}
+}
+
+// TestEnvtestCIParkFinishLookupFailureKeepsTheConversionAtomic pins the
+// finish's atomicity against a source lookup that cannot answer the
+// capability question: the pending notice is cleared exactly when the
+// fence-less release is recorded, so a failing lookup ends nothing — no
+// half-conversion is persisted — and a later finish with a working lookup
+// converts the notice into the release exactly once.
+func TestEnvtestCIParkFinishLookupFailureKeepsTheConversionAtomic(t *testing.T) {
+	if envtestClient == nil {
+		t.Skip("KUBEBUILDER_ASSETS is not set")
+	}
+	adapter := &failingNoticeSource{}
+	h := newCIParkHarness(t, "cipark-finish-lookup-fails", windowExpiryPolicy(), adapter)
+	now := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	h.reconciler.Now = func() time.Time { return now }
+	h.park("sha-1", CheckObservation{Name: "build", State: CheckStatePending})
+	parked := h.run()
+	if parked.Status.CIParkDeferral == nil {
+		t.Fatal("status.ciparkDeferral = nil while the notice keeps failing, want the pending notice")
+	}
+	pendingKey := parked.Status.CIParkDeferral.IdempotencyKey
+	advancePastWindow(&now, h.reconciler)
+	// A reconciler whose registry no longer names the run's source is how a
+	// source lookup failure reaches the finish.
+	broken := h.newReconciler()
+	broken.Sources = NewSourceRegistry(map[string]source.Adapter{})
+	if _, err := broken.finishCIPark(context.Background(), h.run(), PRObservation{PR: "42", Head: "sha-1"}, courierv1alpha1.CIParkOutcomeUnsupported, ""); err == nil {
+		t.Fatal("finishCIPark with an unresolvable source = nil error, want the lookup error")
+	}
+	// Nothing was persisted: the deferral is still owed, no release record
+	// exists, and the run is not ended.
+	half := h.run()
+	if half.Status.CIParkDeferral == nil {
+		t.Fatal("status.ciparkDeferral = nil after the failed lookup, want the pending notice (no half-conversion)")
+	}
+	if half.Status.CIParkRelease != nil {
+		t.Fatalf("status.ciparkRelease = %#v after the failed lookup, want nil (no record without the lookup)", half.Status.CIParkRelease)
+	}
+	if half.Status.Phase != courierv1alpha1.PhaseVerifying {
+		t.Fatalf("phase after the failed lookup = %q, want Verifying (the finish did not end the run)", half.Status.Phase)
+	}
+	// With the lookup working again, the finish converts the notice into
+	// the release exactly once, and the close carries the notice's key.
+	h.reconcile()
+	if got := h.phase(); got != courierv1alpha1.PhaseHandedOff {
+		t.Fatalf("phase after the retried finish = %q, want HandedOff", got)
+	}
+	ended := h.run()
+	if ended.Status.CIParkDeferral != nil {
+		t.Fatalf("status.ciparkDeferral = %#v after the retried finish, want nil (converted into the release)", ended.Status.CIParkDeferral)
+	}
+	if ended.Status.CIParkRelease != nil {
+		t.Fatalf("status.ciparkRelease = %#v at the finish, want nil (the delivery cleared it)", ended.Status.CIParkRelease)
+	}
+	if len(adapter.releases) != 1 {
+		t.Fatalf("releases = %#v, want exactly one close keyed by the pending notice", adapter.releases)
+	}
+	if adapter.releases[0].IdempotencyKey != pendingKey {
+		t.Fatalf("release key = %q, want the pending notice's own key %q", adapter.releases[0].IdempotencyKey, pendingKey)
+	}
+}
+
+// TestEnvtestCIParkLostReleaseReplays pins the durable release: a close
+// whose response is lost after the source committed it leaves the pending
+// release on the run — the key travels with the record — a controller
+// restart changes nothing, and the re-presented close is byte-identical, so
+// the source's own idempotency collapses the retry into the one committed
+// close.
+func TestEnvtestCIParkLostReleaseReplays(t *testing.T) {
+	if envtestClient == nil {
+		t.Skip("KUBEBUILDER_ASSETS is not set")
+	}
+	adapter := &flakyReleaseSource{}
+	h := newCIParkHarness(t, "cipark-lost-release", windowExpiryPolicy(), adapter)
+	now := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	h.reconciler.Now = func() time.Time { return now }
+	h.park("sha-1", CheckObservation{Name: "build", State: CheckStatePending})
+	advancePastWindow(&now, h.reconciler)
+	h.reconcile()
+	if got := h.phase(); got != courierv1alpha1.PhaseHandedOff {
+		t.Fatalf("phase after the park window closed = %q, want HandedOff", got)
+	}
+	ended := h.run()
+	if ended.Status.CIParkRelease == nil {
+		t.Fatal("status.ciparkRelease = nil after the lost close, want the pending release")
+	}
+	if ended.Status.CIParkRelease.Head != "sha-1" {
+		t.Fatalf("pending release head = %q, want the parked head sha-1", ended.Status.CIParkRelease.Head)
+	}
+	pendingKey := ended.Status.CIParkRelease.IdempotencyKey
+	if pendingKey == "" {
+		t.Fatal("pending release idempotency key = empty, want the park notice's key")
+	}
+	// A controller restart changes nothing: the pending release is durable
+	// intent on the run, and a fresh reconciler re-presents it byte-identical.
+	h.reconciler = h.newReconciler()
+	h.reconcile()
+	if got := h.phase(); got != courierv1alpha1.PhaseHandedOff {
+		t.Fatalf("phase after the release replay = %q, want HandedOff", got)
+	}
+	delivered := h.run()
+	if delivered.Status.CIParkRelease != nil {
+		t.Fatalf("status.ciparkRelease = %#v after the replay, want nil (the clear is the proof of delivery)", delivered.Status.CIParkRelease)
+	}
+	if len(adapter.releases) != 2 {
+		t.Fatalf("source releases = %#v, want the committed close and its replay", adapter.releases)
+	}
+	if adapter.releases[0] != adapter.releases[1] {
+		t.Fatalf("replayed release = %#v, want byte-identical to the committed one %#v (the same key collapses into one close)", adapter.releases[1], adapter.releases[0])
+	}
+	// The settled run stays settled: further reconciles re-deliver nothing.
+	h.reconcile()
+	if len(adapter.releases) != 2 {
+		t.Fatalf("source releases after a further reconcile = %d, want 2", len(adapter.releases))
+	}
+}
+
+// TestEnvtestCIParkGreenSettlementReleasesDeferral pins the green ending of
+// the release path (#534): a park whose notice the source accepted ends
+// green — a park that ended with no reservation, so no fenced outcome will
+// ever release the deferral — and the deferral is released with the
+// fence-less close keyed by the very identity the park notice carried,
+// before the run reaches review. The delivery clears the pending release in
+// the same pass, and further reconciles re-present nothing.
+func TestEnvtestCIParkGreenSettlementReleasesDeferral(t *testing.T) {
+	if envtestClient == nil {
+		t.Skip("KUBEBUILDER_ASSETS is not set")
+	}
+	adapter := &ciparkSource{}
+	h := newCIParkHarness(t, "cipark-green-release", ciparkPolicy(2), adapter)
+	h.park("sha-1", CheckObservation{Name: "build", State: CheckStatePending})
+	if len(adapter.parks) != 1 {
+		t.Fatalf("park notices = %#v, want exactly one delivered notice", adapter.parks)
+	}
+	h.world.set(greenObservation("sha-1", "build"))
+	h.reconcile()
+	if got := h.phase(); got != courierv1alpha1.PhaseVerifying {
+		t.Fatalf("phase after the first green observation = %q, want Verifying", got)
+	}
+	h.reconcile()
+	if got := h.phase(); got != courierv1alpha1.PhaseAwaitingReview {
+		t.Fatalf("phase after the settled green observation = %q, want AwaitingReview", got)
+	}
+	ended := h.run()
+	if ended.Status.CIParkDeferral != nil {
+		t.Fatalf("status.ciparkDeferral = %#v at the green settle, want nil", ended.Status.CIParkDeferral)
+	}
+	if ended.Status.CIParkRelease != nil {
+		t.Fatalf("status.ciparkRelease = %#v at the green settle, want nil (the delivery cleared it)", ended.Status.CIParkRelease)
+	}
+	if len(adapter.releases) != 1 {
+		t.Fatalf("releases = %#v, want exactly one close", adapter.releases)
+	}
+	release := adapter.releases[0]
+	notice := adapter.parks[0]
+	if release.IdempotencyKey != notice.IdempotencyKey {
+		t.Fatalf("release key = %q, want the parking notice's own key %q", release.IdempotencyKey, notice.IdempotencyKey)
+	}
+	if release.Head != "sha-1" {
+		t.Fatalf("release head = %q, want the parked head sha-1", release.Head)
+	}
+	if release.PR != "42" {
+		t.Fatalf("release PR = %q, want 42", release.PR)
+	}
+	h.reconcile()
+	if len(adapter.releases) != 1 {
+		t.Fatalf("releases after a further reconcile = %d, want exactly one", len(adapter.releases))
+	}
+}
+
+// TestEnvtestCIParkGreenSettlementConvertsPendingNotice pins the conversion
+// on the green ending: a park whose notice the source never accepted still
+// leaves durable close intent when the checks settle green, the pending
+// notice is cleared in the same write as the release, and the close carries
+// the pending notice's own key — advisory, since the source never saw the
+// notice.
+func TestEnvtestCIParkGreenSettlementConvertsPendingNotice(t *testing.T) {
+	if envtestClient == nil {
+		t.Skip("KUBEBUILDER_ASSETS is not set")
+	}
+	adapter := &failingNoticeSource{}
+	h := newCIParkHarness(t, "cipark-green-pending-release", ciparkPolicy(2), adapter)
+	h.park("sha-1", CheckObservation{Name: "build", State: CheckStatePending})
+	parked := h.run()
+	if parked.Status.CIParkDeferral == nil {
+		t.Fatal("status.ciparkDeferral = nil while the notice keeps failing, want the pending notice")
+	}
+	pendingKey := parked.Status.CIParkDeferral.IdempotencyKey
+	h.world.set(greenObservation("sha-1", "build"))
+	h.reconcile()
+	h.reconcile()
+	if got := h.phase(); got != courierv1alpha1.PhaseAwaitingReview {
+		t.Fatalf("phase after the settled green observation = %q, want AwaitingReview", got)
+	}
+	ended := h.run()
+	if ended.Status.CIParkDeferral != nil {
+		t.Fatalf("status.ciparkDeferral = %#v at the green settle, want nil (converted into the release)", ended.Status.CIParkDeferral)
+	}
+	if ended.Status.CIParkRelease != nil {
+		t.Fatalf("status.ciparkRelease = %#v at the green settle, want nil (the delivery cleared it)", ended.Status.CIParkRelease)
+	}
+	if len(adapter.releases) != 1 {
+		t.Fatalf("releases = %#v, want exactly one close even though the notice never landed", adapter.releases)
+	}
+	if adapter.releases[0].IdempotencyKey != pendingKey {
+		t.Fatalf("release key = %q, want the pending notice's own key %q", adapter.releases[0].IdempotencyKey, pendingKey)
+	}
+	if len(adapter.parks) != 0 {
+		t.Fatalf("park notices = %d, want 0 (never delivered)", len(adapter.parks))
+	}
+}
+
+// TestEnvtestCIParkLostGreenReleaseReplays pins the green ending's durable
+// close: a release whose response is lost at the green settle never holds
+// the run's ending — the review transition completes with the close still
+// pending — and the review-phase run re-presents it byte-identical across a
+// controller restart, the same key collapsing into the one committed close.
+func TestEnvtestCIParkLostGreenReleaseReplays(t *testing.T) {
+	if envtestClient == nil {
+		t.Skip("KUBEBUILDER_ASSETS is not set")
+	}
+	adapter := &flakyReleaseSource{}
+	h := newCIParkHarness(t, "cipark-lost-green-release", ciparkPolicy(2), adapter)
+	h.park("sha-1", CheckObservation{Name: "build", State: CheckStatePending})
+	h.world.set(greenObservation("sha-1", "build"))
+	h.reconcile()
+	h.reconcile()
+	if got := h.phase(); got != courierv1alpha1.PhaseAwaitingReview {
+		t.Fatalf("phase after the settled green observation = %q, want AwaitingReview (the ending never waits on the close)", got)
+	}
+	ended := h.run()
+	if ended.Status.CIParkRelease == nil {
+		t.Fatal("status.ciparkRelease = nil after the lost close, want the pending release")
+	}
+	if ended.Status.CIParkRelease.Head != "sha-1" {
+		t.Fatalf("pending release head = %q, want the parked head sha-1", ended.Status.CIParkRelease.Head)
+	}
+	if ended.Status.CIParkRelease.IdempotencyKey != adapter.parks[0].IdempotencyKey {
+		t.Fatalf("pending release key = %q, want the park notice's own key %q", ended.Status.CIParkRelease.IdempotencyKey, adapter.parks[0].IdempotencyKey)
+	}
+	// A controller restart changes nothing: the pending close is durable
+	// intent on the review-phase run, and a fresh reconciler re-presents it
+	// byte-identical.
+	h.reconciler = h.newReconciler()
+	h.reconcile()
+	if got := h.phase(); got != courierv1alpha1.PhaseAwaitingReview {
+		t.Fatalf("phase after the release replay = %q, want AwaitingReview", got)
+	}
+	delivered := h.run()
+	if delivered.Status.CIParkRelease != nil {
+		t.Fatalf("status.ciparkRelease = %#v after the replay, want nil (the clear is the proof of delivery)", delivered.Status.CIParkRelease)
+	}
+	if len(adapter.releases) != 2 {
+		t.Fatalf("source releases = %#v, want the committed close and its replay", adapter.releases)
+	}
+	if adapter.releases[0] != adapter.releases[1] {
+		t.Fatalf("replayed release = %#v, want byte-identical to the committed one %#v (the same key collapses into one close)", adapter.releases[1], adapter.releases[0])
+	}
+	// The settled run stays settled: further reconciles re-deliver nothing.
+	h.reconcile()
+	if len(adapter.releases) != 2 {
+		t.Fatalf("source releases after a further reconcile = %d, want 2", len(adapter.releases))
+	}
+}
+
+// TestEnvtestCIParkGreenLookupFailureKeepsTheConversionAtomic pins the green
+// settle's atomicity against a source lookup that cannot answer the
+// capability question: the green ending persists no half-conversion — the
+// deferral stays and no release record appears — and a later green settle
+// with a working lookup converts exactly once.
+func TestEnvtestCIParkGreenLookupFailureKeepsTheConversionAtomic(t *testing.T) {
+	if envtestClient == nil {
+		t.Skip("KUBEBUILDER_ASSETS is not set")
+	}
+	adapter := &failingNoticeSource{}
+	h := newCIParkHarness(t, "cipark-green-lookup-fails", ciparkPolicy(2), adapter)
+	h.park("sha-1", CheckObservation{Name: "build", State: CheckStatePending})
+	parked := h.run()
+	if parked.Status.CIParkDeferral == nil {
+		t.Fatal("status.ciparkDeferral = nil while the notice keeps failing, want the pending notice")
+	}
+	pendingKey := parked.Status.CIParkDeferral.IdempotencyKey
+	// A reconciler whose registry no longer names the run's source is how a
+	// source lookup failure reaches the green settle.
+	broken := h.newReconciler()
+	broken.Sources = NewSourceRegistry(map[string]source.Adapter{})
+	if _, err := broken.settleCIParkGreen(context.Background(), h.run(), greenObservation("sha-1", "build"), true); err == nil {
+		t.Fatal("settleCIParkGreen with an unresolvable source = nil error, want the lookup error")
+	}
+	// Nothing was persisted: the deferral is still owed, no release record
+	// exists, and the run is not ended.
+	half := h.run()
+	if half.Status.CIParkDeferral == nil {
+		t.Fatal("status.ciparkDeferral = nil after the failed lookup, want the pending notice (no half-conversion)")
+	}
+	if half.Status.CIParkRelease != nil {
+		t.Fatalf("status.ciparkRelease = %#v after the failed lookup, want nil (no record without the lookup)", half.Status.CIParkRelease)
+	}
+	if half.Status.Phase != courierv1alpha1.PhaseVerifying {
+		t.Fatalf("phase after the failed lookup = %q, want Verifying (the green settle did not end the run)", half.Status.Phase)
+	}
+	// With the lookup working again, the green settle converts the notice
+	// into the release exactly once, and the close carries the notice's key.
+	h.world.set(greenObservation("sha-1", "build"))
+	h.reconcile()
+	h.reconcile()
+	if got := h.phase(); got != courierv1alpha1.PhaseAwaitingReview {
+		t.Fatalf("phase after the retried green settle = %q, want AwaitingReview", got)
+	}
+	ended := h.run()
+	if ended.Status.CIParkDeferral != nil {
+		t.Fatalf("status.ciparkDeferral = %#v after the retried green settle, want nil (converted into the release)", ended.Status.CIParkDeferral)
+	}
+	if ended.Status.CIParkRelease != nil {
+		t.Fatalf("status.ciparkRelease = %#v at the green settle, want nil (the delivery cleared it)", ended.Status.CIParkRelease)
+	}
+	if len(adapter.releases) != 1 {
+		t.Fatalf("releases = %#v, want exactly one close keyed by the pending notice", adapter.releases)
+	}
+	if adapter.releases[0].IdempotencyKey != pendingKey {
+		t.Fatalf("release key = %q, want the pending notice's own key %q", adapter.releases[0].IdempotencyKey, pendingKey)
+	}
+}
+
+// TestEnvtestCIParkNoChangeGreenStillReleasesDeferral pins the green
+// ending's other terminal branch: a fix-PR run whose checks settle green on
+// a declared no-change blocks on authoritative feedback resolution instead
+// of claiming a push — and that ending, too, is a park that ended without a
+// reservation, so the deferral is released before the run blocks.
+func TestEnvtestCIParkNoChangeGreenStillReleasesDeferral(t *testing.T) {
+	if envtestClient == nil {
+		t.Skip("KUBEBUILDER_ASSETS is not set")
+	}
+	adapter := &ciparkSource{}
+	h := newCIParkHarnessMode(t, "cipark-nochange-green", ciparkPolicy(2), adapter, courierv1alpha1.ModeFixPR)
+	h.reconciler.PRHeadResolver = ExistingPRHeadResolverFunc(func(_ context.Context, run *courierv1alpha1.CoderRun) (HeadRef, error) {
+		return HeadRef{Repo: run.Spec.Repo, Branch: "refs/pull/14/head", SHA: "sha-1"}, nil
+	})
+	h.park("sha-1", CheckObservation{Name: "build", State: CheckStatePending})
+	declared := h.run()
+	declared.Status.DeclaredNoChange = true
+	if err := envtestClient.Status().Update(context.Background(), declared); err != nil {
+		t.Fatal(err)
+	}
+	h.world.set(greenObservation("sha-1", "build"))
+	h.reconcile()
+	h.reconcile()
+	if got := h.phase(); got != courierv1alpha1.PhaseBlockedExternal {
+		t.Fatalf("phase after the settled green no-change observation = %q, want BlockedExternal", got)
+	}
+	ended := h.run()
+	if ended.Status.CIParkDeferral != nil {
+		t.Fatalf("status.ciparkDeferral = %#v at the blocked ending, want nil", ended.Status.CIParkDeferral)
+	}
+	if len(adapter.releases) != 1 {
+		t.Fatalf("releases = %#v, want exactly one close", adapter.releases)
+	}
+	if adapter.releases[0].IdempotencyKey != adapter.parks[0].IdempotencyKey {
+		t.Fatalf("release key = %q, want the parking notice's own key %q", adapter.releases[0].IdempotencyKey, adapter.parks[0].IdempotencyKey)
+	}
+	if ended.Status.CIParkRelease != nil {
+		t.Fatalf("status.ciparkRelease = %#v at the blocked ending, want nil (the delivery cleared it)", ended.Status.CIParkRelease)
+	}
+}
+
+// TestEnvtestCIParkFencedSettledEndNeverReportsRelease pins the closed
+// boundary of the release: an ending that carries the reservation's fence
+// keeps the fenced outcome as its only route, and no fence-less close is
+// converted on its behalf.
+func TestEnvtestCIParkFencedSettledEndNeverReportsRelease(t *testing.T) {
+	if envtestClient == nil {
+		t.Skip("KUBEBUILDER_ASSETS is not set")
+	}
+	adapter := &ciparkSource{}
+	h := newCIParkHarness(t, "cipark-fenced-end", ciparkPolicy(2), adapter)
+	h.park("sha-1", CheckObservation{Name: "build", State: CheckStatePending})
+	h.settleFailure("sha-1", "build")
+	if got := h.phase(); got != courierv1alpha1.PhaseClaimed {
+		t.Fatalf("phase after the settled failure = %q, want Claimed", got)
+	}
+	h.reconcile()
+	h.reconcile()
+	// The repair publishes nothing: the attempt ends as exhausted with the
+	// fence the reservation granted — the fenced outcome releases the
+	// deferral, not a fence-less close.
+	h.world.set(redObservation("sha-1", "build"))
+	h.reconcile()
+	if got := h.phase(); got != courierv1alpha1.PhaseHandedOff {
+		t.Fatalf("phase after the repair published nothing = %q, want HandedOff", got)
+	}
+	if len(adapter.releases) != 0 {
+		t.Fatalf("releases = %d, want 0 (a fenced ending carries no release)", len(adapter.releases))
+	}
+	if len(adapter.outcomes) != 1 {
+		t.Fatalf("outcomes = %d, want exactly one fenced outcome", len(adapter.outcomes))
+	}
+}
+
+// TestEnvtestCIParkReleaseRefusalsResolveMoot pins the advisory refusals on
+// the release path: a close that the source refuses because the deferral is
+// already gone, is owned by a newer generation or a granted reservation, or
+// cannot be represented at all drops the pending release instead of
+// retrying forever behind a terminal run — the run is over, and nothing it
+// can do changes the deferral's fate.
+func TestEnvtestCIParkReleaseRefusalsResolveMoot(t *testing.T) {
+	if envtestClient == nil {
+		t.Skip("KUBEBUILDER_ASSETS is not set")
+	}
+	t.Run("deferral-already-gone", func(t *testing.T) {
+		adapter := &staleReleaseSource{}
+		h := newCIParkHarness(t, "cipark-release-stale", windowExpiryPolicy(), adapter)
+		now := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+		h.reconciler.Now = func() time.Time { return now }
+		h.park("sha-1", CheckObservation{Name: "build", State: CheckStatePending})
+		advancePastWindow(&now, h.reconciler)
+		h.reconcile()
+		if got := h.phase(); got != courierv1alpha1.PhaseHandedOff {
+			t.Fatalf("phase after the refused close = %q, want HandedOff (the refusal is advisory)", got)
+		}
+		if got := h.run().Status.CIParkRelease; got != nil {
+			t.Fatalf("status.ciparkRelease = %#v after the refusal, want nil (dropped)", got)
+		}
+		if got := h.run().Status.CIParkDeferral; got != nil {
+			t.Fatalf("status.ciparkDeferral = %#v after the finish, want nil", got)
+		}
+		if len(adapter.parks) != 1 {
+			t.Fatalf("park notices = %d, want 1 (the notice was delivered)", len(adapter.parks))
+		}
+	})
+	t.Run("deferral-not-ours", func(t *testing.T) {
+		adapter := &supersededReleaseSource{}
+		h := newCIParkHarness(t, "cipark-release-superseded", windowExpiryPolicy(), adapter)
+		now := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+		h.reconciler.Now = func() time.Time { return now }
+		h.park("sha-1", CheckObservation{Name: "build", State: CheckStatePending})
+		advancePastWindow(&now, h.reconciler)
+		h.reconcile()
+		if got := h.phase(); got != courierv1alpha1.PhaseHandedOff {
+			t.Fatalf("phase after the close = %q, want HandedOff", got)
+		}
+		if got := h.run().Status.CIParkRelease; got != nil {
+			t.Fatalf("status.ciparkRelease = %#v after the refusal, want nil (dropped)", got)
+		}
+	})
+	t.Run("release-unsupported", func(t *testing.T) {
+		adapter := &refusingParkSource{releaseRefused: true}
+		h := newCIParkHarness(t, "cipark-release-unsupported", windowExpiryPolicy(), adapter)
+		now := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+		h.reconciler.Now = func() time.Time { return now }
+		h.park("sha-1", CheckObservation{Name: "build", State: CheckStatePending})
+		advancePastWindow(&now, h.reconciler)
+		h.reconcile()
+		if got := h.phase(); got != courierv1alpha1.PhaseHandedOff {
+			t.Fatalf("phase after the refused close = %q, want HandedOff (the refusal is permanent)", got)
+		}
+		if got := h.run().Status.CIParkRelease; got != nil {
+			t.Fatalf("status.ciparkRelease = %#v after the refusal, want nil (dropped)", got)
+		}
+		if len(adapter.releases) != 0 {
+			t.Fatalf("releases = %d, want 0 (a permanent refusal never records)", len(adapter.releases))
+		}
+	})
 }
 
 // TestEnvtestCIParkWithoutPolicyKeepsTheOrdinaryPath pins the opt-in
