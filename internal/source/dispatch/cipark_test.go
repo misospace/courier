@@ -664,9 +664,16 @@ func TestDispatchCIParkCodedRefusals(t *testing.T) {
 				}{
 					{"plain-body-409", http.StatusConflict, "fence conflict"},
 					{"unknown-code-409", http.StatusConflict, `{"reason":"something-else"}`},
+					// The fence-less close reclassifies its own bare 404 into
+					// the permanent unsupported sentinel (#534): it is pinned
+					// by TestDispatchCIParkReleaseRouteAbsentIsUnsupported
+					// instead of here.
 					{"not-found", http.StatusNotFound, "no such queue item"},
 					{"server-error", http.StatusInternalServerError, "boom"},
 				} {
+					if call.endpoint == "cirepair-close" && tc.name == "not-found" {
+						continue
+					}
 					f := newDiagnosticsFixture(t, openChecker(), ciParkRefused(t, tc.status, tc.body))
 					err := call.call(f.adapter)
 					if err == nil || errors.Is(err, source.ErrSuperseded) || errors.Is(err, source.ErrStaleWork) || errors.Is(err, source.ErrUnsupportedCIPark) {
@@ -702,6 +709,35 @@ func TestDispatchCIParkCodedRefusals(t *testing.T) {
 				}
 			})
 		})
+	}
+}
+
+// TestDispatchCIParkReleaseRouteAbsentIsUnsupported pins the advisory
+// release's version-skew posture (#534): a bare 404 on the fence-less close
+// reclassifies into the permanent source.ErrUnsupportedCIPark. Under the
+// pinned contract a deferral that does not exist is a 409-coded refusal, so
+// a bare 404 is evidence the deployment has not adopted the release at all
+// (an older Dispatch), and retrying it forever would hold Courier's terminal
+// lifecycle behind a close the server can never take. The exchange's
+// deferred 4xx class is counted once by the reclassification site. The
+// fenced outcome on the same absent route keeps its ordinary 404 posture:
+// only the close is advisory.
+func TestDispatchCIParkReleaseRouteAbsentIsUnsupported(t *testing.T) {
+	f := newDiagnosticsFixture(t, openChecker(), ciParkRefused(t, http.StatusNotFound, "no such queue item"))
+	if err := f.adapter.ReleaseCIPark(context.Background(), ciparkWorkItem(), source.CIParkRelease{PR: "77", Head: ciparkHead1, IdempotencyKey: "k"}); !errors.Is(err, source.ErrUnsupportedCIPark) {
+		t.Fatalf("ReleaseCIPark() = %v, want ErrUnsupportedCIPark", err)
+	}
+	if got := diagnosticsCounter(t, f, connector.SignalProtocolError, reasonHTTP4xx); got != 1 {
+		t.Fatalf("protocol-error/http-4xx counter = %v, want exactly 1 (the reclassified exchange counts once)", got)
+	}
+	if total := totalProtocolErrors(t, f); total != 1 {
+		t.Fatalf("total protocol-error diagnostics = %v, want exactly 1", total)
+	}
+	if got := diagnosticsCounter(t, f, connector.SignalIdentity, reasonIdentityOpportunityMissing); got != -1 {
+		t.Fatalf("fabricated identity/%s count = %v, want none", reasonIdentityOpportunityMissing, got)
+	}
+	if err := f.adapter.ReportCIRepair(context.Background(), ciparkWorkItem(), source.CIRepairOutcome{FenceToken: "fence", IdempotencyKey: "k", PR: "77", Result: source.CIRepairExhausted}); errors.Is(err, source.ErrUnsupportedCIPark) {
+		t.Fatalf("ReportCIRepair() = %v, want an ordinary error, not the unsupported sentinel", err)
 	}
 }
 

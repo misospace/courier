@@ -103,7 +103,7 @@ func newCIParkHarnessMode(t *testing.T, name string, policy *courierv1alpha1.CIR
 // newReconciler builds a reconciler over the harness's world and launch
 // function. A second instance is how a controller restart is simulated.
 func (h *ciparkHarness) newReconciler() *CoderRunReconciler {
-	return &CoderRunReconciler{
+	reconciler := &CoderRunReconciler{
 		Client: envtestClient,
 		Sources: NewSourceRegistry(map[string]source.Adapter{
 			"manual": h.adapter,
@@ -111,8 +111,14 @@ func (h *ciparkHarness) newReconciler() *CoderRunReconciler {
 		StatusWriter: status.KubePatchWriter{Client: envtestClient},
 		Observer:     h.world,
 		Launch:       h.launch,
-		PullRequests: h.pullRequests,
 	}
+	// Only a constructed reader is wired: a nil *fakePullRequestReader field
+	// would otherwise enter the interface as a typed nil and defeat the
+	// merge observation's own nil guard.
+	if h.pullRequests != nil {
+		reconciler.PullRequests = h.pullRequests
+	}
+	return reconciler
 }
 
 // usePullRequests gives the harness's reconciler the forge read-pull-request
@@ -2363,6 +2369,86 @@ func TestEnvtestCIParkPendingCloseNeverPreemptsLifecycleReport(t *testing.T) {
 // clause: a park close the source keeps refusing never stands in front of a
 // terminal run's merge observation. The recorded pull request is still read,
 // and a confirmed merge still finishes the run.
+// olderDispatchReleaseSource models a Dispatch deployment that accepted the
+// park notice (a pre-existing route) but never adopted the fence-less
+// release: the close exchange 404s on the wire, the connector reclassifies
+// that into the permanent source.ErrUnsupportedCIPark, and the advisory
+// posture drops the pending release. The source never records a close. The
+// wrapper also counts the source resolves, so a scenario can prove the run
+// resolved its work with the close permanently undeliverable.
+type olderDispatchReleaseSource struct {
+	refusingParkSource
+	resolves int
+}
+
+func (s *olderDispatchReleaseSource) Resolve(ctx context.Context, item source.WorkItem) error {
+	s.resolves++
+	return s.admissionSource.Resolve(ctx, item)
+}
+
+// TestEnvtestCIParkOlderDispatchReleaseNeverWedgesTheTerminalLifecycle pins
+// the release's advisory posture under version skew: a source that accepted
+// the park notice but never adopted the release keeps refusing the close
+// permanently, the pending release drops instead of retrying forever, and
+// the run still walks its full terminal lifecycle — AwaitingReview observes
+// the merged pull request, transitions to Done, and resolves the source
+// work. An older source can hold a deferral; it can never hold Courier's
+// completion.
+func TestEnvtestCIParkOlderDispatchReleaseNeverWedgesTheTerminalLifecycle(t *testing.T) {
+	if envtestClient == nil {
+		t.Skip("KUBEBUILDER_ASSETS is not set")
+	}
+	adapter := &olderDispatchReleaseSource{refusingParkSource: refusingParkSource{releaseRefused: true}}
+	h := newCIParkHarness(t, "cipark-old-dispatch-release", ciparkPolicy(2), adapter)
+	reader := &fakePullRequestReader{pull: reviewPullRequest("closed", true)}
+	h.usePullRequests(reader)
+	now := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	h.reconciler.Now = func() time.Time { return now }
+	h.park("sha-1", CheckObservation{Name: "build", State: CheckStatePending})
+	h.world.set(greenObservation("sha-1", "build"))
+	h.reconcile()
+	h.reconcile()
+	if got := h.phase(); got != courierv1alpha1.PhaseAwaitingReview {
+		t.Fatalf("phase after the settled green observation = %q, want AwaitingReview (the ending never waits on the close)", got)
+	}
+	ended := h.run()
+	if ended.Status.CIParkDeferral != nil {
+		t.Fatalf("status.ciparkDeferral = %#v at the green settle, want nil", ended.Status.CIParkDeferral)
+	}
+	if ended.Status.CIParkRelease != nil {
+		t.Fatalf("status.ciparkRelease = %#v after the permanent refusal, want nil (the advisory release dropped it)", ended.Status.CIParkRelease)
+	}
+	if len(adapter.releases) != 0 {
+		t.Fatalf("releases = %#v, want 0 (a route-absent close is never recorded)", adapter.releases)
+	}
+	if !lifecycleReportSettled(h.run()) {
+		t.Fatal("lifecycleReported is not settled, want the published in-review report")
+	}
+
+	// The merged pull request ends the work, and the Done lifecycle resolves
+	// the source with the close permanently undeliverable.
+	h.reconcileResult()
+	if got := h.phase(); got != courierv1alpha1.PhaseDone {
+		t.Fatalf("phase after the confirmed merge = %q, want Done", got)
+	}
+	h.reconcileResult()
+	if adapter.resolves != 1 {
+		t.Fatalf("source resolves = %d, want exactly 1 (the run resolved with the close permanently undeliverable)", adapter.resolves)
+	}
+	resolved := h.run()
+	if _, ok := doneAtMarker(resolved); !ok {
+		t.Fatalf("done-at marker = %#v, want the retention window started on the resolved run", resolved.Annotations)
+	}
+	if resolved.Status.CIParkRelease != nil {
+		t.Fatalf("status.ciparkRelease = %#v on the resolved run, want nil", resolved.Status.CIParkRelease)
+	}
+	// A resolved run re-presents nothing.
+	h.reconcile()
+	if adapter.resolves != 1 {
+		t.Fatalf("source resolves after a further reconcile = %d, want still 1", adapter.resolves)
+	}
+}
+
 func TestEnvtestCIParkPendingCloseNeverPreemptsMergeObservation(t *testing.T) {
 	if envtestClient == nil {
 		t.Skip("KUBEBUILDER_ASSETS is not set")

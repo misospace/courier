@@ -343,6 +343,17 @@ func (c *HTTPClient) SettleCIRepair(ctx context.Context, id string, outcome sour
 // request identity guard, and the key alone — there is no fence to validate,
 // no head to validate (the wire carries none), and no pull-request state to
 // re-read (only the reservation re-reads it).
+//
+// The close is advisory, so a bare 404 is permanent under version skew: the
+// contract's refusal vocabulary is 409-coded, so a 404 on this exchange is
+// evidence the deployment has not adopted the release at all (an older
+// Dispatch), and the deferral it would close is exactly as unreleased as it
+// was before the family existed. Retrying would hold Courier's terminal
+// lifecycle behind a close the server can never take, so the exchange is
+// reclassified into source.ErrUnsupportedCIPark — the same permanent
+// unsupported posture the capability gate already produces — and the caller
+// drops the pending release. A fenced outcome keeps its ordinary 404
+// posture: only the fence-less close is advisory.
 func (c *HTTPClient) ReleaseCIPark(ctx context.Context, id string, release source.CIParkRelease) error {
 	d, err := parkQueueDescriptor(id)
 	if err != nil {
@@ -355,10 +366,19 @@ func (c *HTTPClient) ReleaseCIPark(ctx context.Context, id string, release sourc
 	if err != nil {
 		return err
 	}
-	return c.classifyCIExchange(c.do(ctx, http.MethodPost, "/api/pr-fix-queue/cirepair", map[string]any{
+	err = c.do(ctx, http.MethodPost, "/api/pr-fix-queue/cirepair", map[string]any{
 		"repo": strings.ToLower(d.Repo), "generation": d.Generation, "agentName": c.agentName,
 		"idempotencyKey": key, "result": source.CIRepairUnsupported,
-	}, nil))
+	}, nil)
+	var apiErr *APIError
+	if errors.As(err, &apiErr) && apiErr.StatusCode == http.StatusNotFound {
+		// The exchange was deferred past the do() choke point and this site
+		// reclassifies it: count its pending 4xx class once, then wrap the
+		// permanent unsupported sentinel the caller drops on.
+		c.countPendingExchange(err)
+		return fmt.Errorf("%w: %w", source.ErrUnsupportedCIPark, err)
+	}
+	return c.classifyCIExchange(err)
 }
 
 // classifyCIRefusal maps the CI park family's coded 409 refusals to the
@@ -433,7 +453,9 @@ func (c *HTTPClient) classifyCIRefusal(err error) error {
 // expected N" under the mark family's identity semantics). A 404 stays an
 // ordinary error: a route the server has not adopted and a queue item that
 // no longer exists are indistinguishable at this layer, and the park
-// window — not a retry loop — bounds either one.
+// window — not a retry loop — bounds either one. The fence-less release
+// exchange does not route through here: its advisory posture reclassifies
+// its own 404 into the permanent unsupported sentinel above.
 func (c *HTTPClient) classifyCIExchange(err error) error {
 	if err == nil {
 		return nil
