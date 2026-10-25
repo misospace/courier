@@ -264,6 +264,14 @@ func (r *CoderRunReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 			}
 		}
 	}
+	// closeRetry is the bounded retry a park close report the source has not
+	// accepted yet still owes. It rides along as a cap on the reconcile's wake
+	// interval instead of preempting the run's own work: a terminal run still
+	// owes the source its lifecycle report and its slow merge observation, and
+	// neither may wait behind a close the source keeps refusing. Only a run
+	// whose own lifecycle is still ahead of it — one that resolves and reaps
+	// the source work — keeps the dedicated requeue.
+	closeRetry := time.Duration(0)
 	if run.Status.CISettlement != nil {
 		if delivered, err := r.deliverCISettlement(ctx, &run); !delivered {
 			log.FromContext(ctx).V(1).Info("source repair settlement not delivered", "run", run.Name, "error", err.Error())
@@ -273,7 +281,20 @@ func (r *CoderRunReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 				// window bounds every wait, and pod events drive a running
 				// run. Preempting them for a report would hold the loop
 				// hostage to the source.
+			case courierv1alpha1.PhaseAwaitingReview, courierv1alpha1.PhaseHandedOff,
+				courierv1alpha1.PhaseNeedsHuman, courierv1alpha1.PhaseFailed, courierv1alpha1.PhaseBlockedExternal:
+				// A terminal run's own obligations come first: the pending
+				// lifecycle report and the slow merge observation are
+				// retried on this very reconcile. The close only bounds the
+				// wake interval, so it is re-presented within the bounded
+				// settlement cadence without ever preempting them.
+				closeRetry = ciparkSettlementRetryDelay
 			default:
+				// A run whose own lifecycle is still ahead of it — a Done
+				// run that resolves and reaps the source work, or a run
+				// that is not admitted yet — keeps the dedicated requeue:
+				// proceeding while a close is owed could resolve and delete
+				// the run, and the pending close would be lost with it.
 				return ctrl.Result{RequeueAfter: ciparkSettlementRetryDelay}, nil
 			}
 		}
@@ -301,73 +322,24 @@ func (r *CoderRunReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 	// one slow, bounded read of its recorded pull request, so a human merge can
 	// finish and reap it.
 	if run.Status.Phase != "" && run.Status.Phase != courierv1alpha1.PhasePending {
-		// Capacity availability is independent of source reporting. Persist it
-		// before a pending or unsupported lifecycle report can return early.
-		if isCapacityExhaustionRun(&run) {
-			if err := r.recordCapacityCooldown(ctx, &run); err != nil {
+		result, err := r.reconcileTerminal(ctx, &run)
+		if err != nil {
+			if closeRetry == 0 {
 				return ctrl.Result{}, err
 			}
+			// The close the source keeps refusing still owes a bounded
+			// retry, and the workqueue's rate-limited backoff on this error
+			// can outlast that bound: the error's own delay would push the
+			// close's re-presentation past the settlement cadence. The close
+			// owns the wake instead — the failure is logged and the
+			// reconcile returns at the cadence, so the close is never
+			// re-presented later than the bound allows. A run that owes no
+			// close keeps the error, and with it the workqueue's backoff.
+			log.FromContext(ctx).Error(err, "terminal dispatch failed; retrying at the settlement cadence",
+				"run", run.Name, "phase", run.Status.Phase)
+			return capCloseRetry(result, closeRetry), nil
 		}
-		if lifecycleReportPending(&run) {
-			if lifecycleReportUnsupported(&run) {
-				if lifecycleReportRetryTokenInvalid(&run) {
-					log.FromContext(ctx).Info("ignoring invalid lifecycle retry token; token must be non-empty and at most 128 Unicode code points")
-				}
-				if !lifecycleReportRetryRequested(&run) {
-					return ctrl.Result{}, nil
-				}
-			}
-			return r.retryTerminalLifecycle(ctx, &run)
-		}
-		if run.Status.Phase == courierv1alpha1.PhaseAwaitingReview {
-			// The pending-report retry above handles a False LifecycleReported.
-			// A missing, Unknown, or True-with-another-reason condition does not
-			// prove the source saw the in-review lifecycle either, so the
-			// post-review merge observation must wait too: a legacy or partially
-			// upgraded AwaitingReview run without a positively settled
-			// LifecycleReported (Published or Superseded) cannot transition to
-			// Done without first proving its in-review lifecycle. The run stays
-			// parked without a timer; the report-retry path above re-arms any
-			// pending report, and a run whose condition is missing/Unknown/other
-			// remains unobserved until the source publishes the report or an
-			// operator intervenes.
-			if !lifecycleReportSettled(&run) {
-				log.FromContext(ctx).V(1).Info("awaiting-review run observed without a positively settled LifecycleReported; leaving in awaiting-review",
-					"lifecycleReported", lifecycleReportConditionState(&run))
-				return ctrl.Result{}, nil
-			}
-			return r.observeMergedReviewPR(ctx, &run)
-		}
-		if (run.Status.Phase == courierv1alpha1.PhaseFailed || run.Status.Phase == courierv1alpha1.PhaseNeedsHuman) && !isCapacityExhaustionRun(&run) {
-			// A Failed or NeedsHuman run is reaped only once its source
-			// lifecycle report reached a positive, settled state: while the
-			// report is pending the run is the only durable retry intent, and a
-			// missing, Unknown, or False condition proves nothing. Such a run
-			// is parked without a timer; the report-retry path above re-arms a
-			// pending report, and an operator settles a missing condition.
-			if !lifecycleReportSettled(&run) {
-				l.V(1).Info("terminal run observed without a positively settled LifecycleReported; leaving for retention",
-					"phase", run.Status.Phase, "lifecycleReported", lifecycleReportConditionState(&run))
-				return ctrl.Result{}, nil
-			}
-			if run.Status.Phase == courierv1alpha1.PhaseFailed {
-				return r.reapTerminal(ctx, &run, failedAtAnnotation, r.failedRetention(), true)
-			}
-			return r.reapTerminal(ctx, &run, needsHumanAtAnnotation, r.needsHumanRetention(), true)
-		}
-		if isCapacityExhaustionRun(&run) && capacityRecoveryPending(&run) {
-			// A capacity settlement left retryable (transient source error or
-			// writers still draining) is durable intent on the run: an
-			// operator restart re-derives it from the condition and retries
-			// here, after the lifecycle report itself has settled.
-			adapter, item, err := r.adapterAndWorkItem(&run)
-			if err != nil {
-				return ctrl.Result{}, err
-			}
-			return r.recoverCapacityExhaustion(ctx, &run, adapter, item)
-		}
-		l.V(1).Info("reconcile", "phase", run.Status.Phase)
-		return ctrl.Result{}, nil
+		return capCloseRetry(result, closeRetry), nil
 	}
 
 	adapter, item, err := r.adapterAndWorkItem(&run)
@@ -532,6 +504,108 @@ func (r *CoderRunReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 		"lane", run.Spec.Lane,
 	)
 	return ctrl.Result{}, nil
+}
+
+// reconcileTerminal owns the terminal-phase dispatch of a run that already
+// reached its phase and freed capacity.
+//
+// The terminal run is not finished: it still owes the source its lifecycle
+// report, its slow merge observation, its retention reap, or its capacity
+// recovery. None of those is preempted by the run's other durable duties — a
+// park close the source keeps refusing rides along as a cap on the reconcile's
+// wake interval, never as an early return in front of this dispatch — so the
+// report retry and the merge observation always get their turn.
+func (r *CoderRunReconciler) reconcileTerminal(ctx context.Context, run *courierv1alpha1.CoderRun) (ctrl.Result, error) {
+	// Capacity availability is independent of source reporting. Persist it
+	// before a pending or unsupported lifecycle report can return early.
+	if isCapacityExhaustionRun(run) {
+		if err := r.recordCapacityCooldown(ctx, run); err != nil {
+			return ctrl.Result{}, err
+		}
+	}
+	if lifecycleReportPending(run) {
+		if lifecycleReportUnsupported(run) {
+			if lifecycleReportRetryTokenInvalid(run) {
+				log.FromContext(ctx).Info("ignoring invalid lifecycle retry token; token must be non-empty and at most 128 Unicode code points")
+			}
+			if !lifecycleReportRetryRequested(run) {
+				return ctrl.Result{}, nil
+			}
+		}
+		return r.retryTerminalLifecycle(ctx, run)
+	}
+	if run.Status.Phase == courierv1alpha1.PhaseAwaitingReview {
+		// The pending-report retry above handles a False LifecycleReported.
+		// A missing, Unknown, or True-with-another-reason condition does not
+		// prove the source saw the in-review lifecycle either, so the
+		// post-review merge observation must wait too: a legacy or partially
+		// upgraded AwaitingReview run without a positively settled
+		// LifecycleReported (Published or Superseded) cannot transition to
+		// Done without first proving its in-review lifecycle. The run stays
+		// parked without a timer; the report-retry path above re-arms any
+		// pending report, and a run whose condition is missing/Unknown/other
+		// remains unobserved until the source publishes the report or an
+		// operator intervenes.
+		if !lifecycleReportSettled(run) {
+			log.FromContext(ctx).V(1).Info("awaiting-review run observed without a positively settled LifecycleReported; leaving in awaiting-review",
+				"lifecycleReported", lifecycleReportConditionState(run))
+			return ctrl.Result{}, nil
+		}
+		return r.observeMergedReviewPR(ctx, run)
+	}
+	if (run.Status.Phase == courierv1alpha1.PhaseFailed || run.Status.Phase == courierv1alpha1.PhaseNeedsHuman) && !isCapacityExhaustionRun(run) {
+		// A Failed or NeedsHuman run is reaped only once its source
+		// lifecycle report reached a positive, settled state: while the
+		// report is pending the run is the only durable retry intent, and a
+		// missing, Unknown, or False condition proves nothing. Such a run
+		// is parked without a timer; the report-retry path above re-arms a
+		// pending report, and an operator settles a missing condition.
+		if !lifecycleReportSettled(run) {
+			log.FromContext(ctx).V(1).Info("terminal run observed without a positively settled LifecycleReported; leaving for retention",
+				"phase", run.Status.Phase, "lifecycleReported", lifecycleReportConditionState(run))
+			return ctrl.Result{}, nil
+		}
+		if run.Status.CISettlement != nil {
+			// The run still owes the source a park close. Deleting it would
+			// drop the owed close with the object, so the retention window
+			// starts only once the close has landed — the same posture a
+			// Done run keeps while its close is outstanding. The pending
+			// record is the owed-close signal: it is cleared only by a
+			// successful delivery, which is the proof of delivery.
+			log.FromContext(ctx).V(1).Info("terminal run still owes the source a park close; leaving it for retention",
+				"run", run.Name, "phase", run.Status.Phase)
+			return ctrl.Result{}, nil
+		}
+		if run.Status.Phase == courierv1alpha1.PhaseFailed {
+			return r.reapTerminal(ctx, run, failedAtAnnotation, r.failedRetention(), true)
+		}
+		return r.reapTerminal(ctx, run, needsHumanAtAnnotation, r.needsHumanRetention(), true)
+	}
+	if isCapacityExhaustionRun(run) && capacityRecoveryPending(run) {
+		// A capacity settlement left retryable (transient source error or
+		// writers still draining) is durable intent on the run: an
+		// operator restart re-derives it from the condition and retries
+		// here, after the lifecycle report itself has settled.
+		adapter, item, err := r.adapterAndWorkItem(run)
+		if err != nil {
+			return ctrl.Result{}, err
+		}
+		return r.recoverCapacityExhaustion(ctx, run, adapter, item)
+	}
+	log.FromContext(ctx).V(1).Info("reconcile", "phase", run.Status.Phase)
+	return ctrl.Result{}, nil
+}
+
+// capCloseRetry bounds a terminal reconcile's wake interval by the park
+// close's bounded retry. The terminal path's own wake wins whenever it is
+// sooner, and the close is never re-presented later than the settlement
+// cadence allows. A wake of zero means the terminal path asked for no timer
+// of its own, so the close's cadence supplies the wake.
+func capCloseRetry(result ctrl.Result, closeRetry time.Duration) ctrl.Result {
+	if closeRetry > 0 && (result.RequeueAfter == 0 || result.RequeueAfter > closeRetry) {
+		result.RequeueAfter = closeRetry
+	}
+	return result
 }
 
 // resumeClaimed closes the small crash/conflict window between reserving a run

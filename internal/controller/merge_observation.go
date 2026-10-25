@@ -9,6 +9,7 @@ import (
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
 	courierv1alpha1 "github.com/misospace/courier/api/v1alpha1"
@@ -21,6 +22,15 @@ import (
 // for one authoritative pull-request read, never for CI-state polling, so the
 // observation loop stays bounded no matter how long a PR waits for review.
 const mergeObservationRequeueDelay = 5 * time.Minute
+
+// mergeObservedAtAnnotation records, as an RFC3339 timestamp, when the merge
+// observation last read the run's recorded pull request. The observation is
+// deliberately slow, and the marker keeps it slow: a wake the run's own
+// duties cause — a park close the source keeps refusing, a requeued reconcile
+// — must never sample the forge faster than the cadence allows. The marker
+// lives on the object because process memory dies with the controller, and a
+// restart must not turn the slow cadence into a poll.
+const mergeObservedAtAnnotation = "courier.misospace.dev/merge-observed-at"
 
 // PullRequestReader is the forge capability seam the post-review merge
 // observation reads through: the configured provider's exact pull-request
@@ -58,6 +68,15 @@ func (r *CoderRunReconciler) observeMergedReviewPR(ctx context.Context, run *cou
 	if err != nil || number <= 0 || strings.TrimSpace(run.Status.Branch) == "" {
 		return ctrl.Result{}, nil
 	}
+	// The slow cadence is durable. The marker on the run records when the
+	// last observation happened, so a wake the run's own duties cause — a
+	// park close the source keeps refusing, a requeued reconcile — never
+	// samples the forge faster than the cadence allows. A missing or
+	// unreadable marker is due: the observation fails open to observing, not
+	// to never observing.
+	if remaining, ok := r.mergeObservationRemaining(run); ok {
+		return ctrl.Result{RequeueAfter: remaining}, nil
+	}
 	pull, err := r.PullRequests.ReadPullRequest(ctx, forge.PullRequestRef{Repo: run.Spec.Repo, Number: number})
 	if err != nil {
 		// A forge failure proves nothing about the pull request, so the run
@@ -65,6 +84,9 @@ func (r *CoderRunReconciler) observeMergedReviewPR(ctx context.Context, run *cou
 		// error, which would burn the workqueue's backoff on a healthy run.
 		log.FromContext(ctx).V(1).Info("awaiting-review merge observation failed; retrying at the slow cadence",
 			"repo", run.Spec.Repo, "pr", run.Status.PR, "error", err.Error())
+		if err := r.stampMergeObserved(ctx, run); err != nil {
+			return ctrl.Result{}, err
+		}
 		return ctrl.Result{RequeueAfter: mergeObservationRequeueDelay}, nil
 	}
 	if !exactPullRequestIdentity(run, number, pull) {
@@ -75,6 +97,9 @@ func (r *CoderRunReconciler) observeMergedReviewPR(ctx context.Context, run *cou
 			log.FromContext(ctx).Info("recorded pull request is merged but no longer matches the run's head identity; leaving the run in awaiting-review",
 				"repo", run.Spec.Repo, "pr", run.Status.PR, "recordedHeadRepo", run.Status.HeadRepo, "recordedBranch", run.Status.Branch,
 				"observedHeadRepo", pull.HeadRepo, "observedBranch", pull.HeadRef)
+		}
+		if err := r.stampMergeObserved(ctx, run); err != nil {
+			return ctrl.Result{}, err
 		}
 		return ctrl.Result{RequeueAfter: mergeObservationRequeueDelay}, nil
 	}
@@ -105,7 +130,49 @@ func (r *CoderRunReconciler) observeMergedReviewPR(ctx context.Context, run *cou
 			}},
 		}, nil)
 	}
+	// The pull request is still open: the run stays in AwaitingReview, and
+	// the observation is marked so the slow cadence survives the wakes the
+	// run's own duties cause.
+	if err := r.stampMergeObserved(ctx, run); err != nil {
+		return ctrl.Result{}, err
+	}
 	return ctrl.Result{RequeueAfter: mergeObservationRequeueDelay}, nil
+}
+
+// mergeObservationRemaining reports how long the slow merge observation must
+// still wait before it may read the recorded pull request again, and whether
+// it must wait at all. A missing marker, an unreadable one, or one the clock
+// has not reached is due: the observation fails open to observing.
+func (r *CoderRunReconciler) mergeObservationRemaining(run *courierv1alpha1.CoderRun) (time.Duration, bool) {
+	raw, ok := run.Annotations[mergeObservedAtAnnotation]
+	if !ok {
+		return 0, false
+	}
+	stampedAt, err := time.Parse(time.RFC3339, raw)
+	if err != nil {
+		return 0, false
+	}
+	elapsed := r.clock().UTC().Sub(stampedAt)
+	if elapsed < 0 || elapsed >= mergeObservationRequeueDelay {
+		return 0, false
+	}
+	return mergeObservationRequeueDelay - elapsed, true
+}
+
+// stampMergeObserved records the durable merge-observation marker on the run.
+//
+// It is written only on the paths where the observation leaves the run in
+// AwaitingReview: a run that transitions to Done or NeedsHuman leaves the
+// observation behind, and the marker would be a wasted write. The write is a
+// narrow merge patch of the run's own metadata, exactly as the reaper's
+// retention markers are written.
+func (r *CoderRunReconciler) stampMergeObserved(ctx context.Context, run *courierv1alpha1.CoderRun) error {
+	before := run.DeepCopy()
+	if run.Annotations == nil {
+		run.Annotations = map[string]string{}
+	}
+	run.Annotations[mergeObservedAtAnnotation] = r.clock().UTC().Format(time.RFC3339)
+	return r.Patch(ctx, run, client.MergeFrom(before))
 }
 
 // exactPullRequestIdentity reports whether the read pull request is the exact
