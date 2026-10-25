@@ -1229,6 +1229,17 @@ func (r *CoderRunReconciler) observeVerifying(ctx context.Context, run *courierv
 		// Someone merged the PR while this run was working: the work shipped.
 		// Done resolves the source and applies the reap policy; it is not a
 		// case for a human.
+		//
+		// The merged branch is checked before the park loop runs, so a parked
+		// run reaches Done here with its park record and its deferral intact
+		// — exactly the shape every loop bail-out hands to the abandon. The
+		// deferral must be settled the same way before the run terminalizes:
+		// the abandon is a no-op without a park record and a live fence, and
+		// it settles the reservation under a live one rather than leaving it
+		// stranded against a run that is now Done (#555).
+		if _, err := r.abandonCIPark(ctx, run, observation); err != nil {
+			return ctrl.Result{}, err
+		}
 		return r.transitionTerminal(ctx, run, courierv1alpha1.PhaseDone, pr, terminalLifecycleIntent{}, nil)
 	}
 	// The mechanical-CI park-and-resume policy, when the lane declares one,
