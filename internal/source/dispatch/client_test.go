@@ -1451,6 +1451,78 @@ func TestHTTPClientRedactsTokenFromAPIError(t *testing.T) {
 	}
 }
 
+func TestHTTPClientClassifiesPermanentRefusal(t *testing.T) {
+	workID := EncodeWorkID(Task{Type: "implement", Issue: &Issue{ID: "issue-1", Repo: "acme/widgets", Number: 7}})
+	for _, tc := range []struct {
+		name       string
+		status     int
+		wantRefuse bool
+	}{
+		{name: "closed issue 400", status: http.StatusBadRequest, wantRefuse: true},
+		{name: "moved owner 403", status: http.StatusForbidden, wantRefuse: true},
+		{name: "contention 409", status: http.StatusConflict, wantRefuse: false},
+		{name: "server error 500", status: http.StatusInternalServerError, wantRefuse: false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.URL.Path == "/api/issues/state" {
+					_, _ = w.Write([]byte(`{"issueId":"issue-1"}`))
+					return
+				}
+				w.WriteHeader(tc.status)
+				_, _ = w.Write([]byte(`{"error":"refused"}`))
+			}))
+			defer server.Close()
+			client, err := NewClient(server.URL, "worker", "secret-token", time.Second)
+			if err != nil {
+				t.Fatal(err)
+			}
+			err = client.SetStatus(context.Background(), workID, "in-review")
+			if err == nil {
+				t.Fatal("SetStatus() error = nil, want the refusal")
+			}
+			if got := errors.Is(err, source.ErrPermanentRefusal); got != tc.wantRefuse {
+				t.Fatalf("errors.Is(ErrPermanentRefusal) = %t for %v, want %t", got, err, tc.wantRefuse)
+			}
+			var apiErr *APIError
+			if !errors.As(err, &apiErr) || apiErr.StatusCode != tc.status {
+				t.Fatalf("error = %v, want an APIError with status %d", err, tc.status)
+			}
+		})
+	}
+	t.Run("transport failure stays transient", func(t *testing.T) {
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {}))
+		client, err := NewClient(server.URL, "worker", "secret-token", time.Second)
+		if err != nil {
+			t.Fatal(err)
+		}
+		server.Close()
+		if err := client.SetStatus(context.Background(), workID, "in-review"); err == nil {
+			t.Fatal("SetStatus() error = nil, want the transport failure")
+		} else if errors.Is(err, source.ErrPermanentRefusal) {
+			t.Fatalf("SetStatus() error = %v, a transport failure must not be a permanent refusal", err)
+		}
+	})
+	t.Run("unsupported outcome 400 is not a permanent refusal", func(t *testing.T) {
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(http.StatusBadRequest)
+			_, _ = w.Write([]byte(`{"error":"Invalid outcome. Must be one of: pr_opened, pr_updated, blocked, failed"}`))
+		}))
+		defer server.Close()
+		client, err := NewClient(server.URL, "worker", "secret-token", time.Second)
+		if err != nil {
+			t.Fatal(err)
+		}
+		err = client.Report(context.Background(), workID, source.Lifecycle{Result: source.ResultReady})
+		if !errors.Is(err, source.ErrUnsupportedOutcome) {
+			t.Fatalf("Report() error = %v, want ErrUnsupportedOutcome", err)
+		}
+		if errors.Is(err, source.ErrPermanentRefusal) {
+			t.Fatalf("Report() error = %v, an unsupported outcome must keep its own terminal classification", err)
+		}
+	})
+}
+
 func TestHTTPClientReportMapsPRFixGenerationMismatchToSuperseded(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/api/agents/worker/tasks/report" {

@@ -65,9 +65,10 @@ const (
 	reasonUnsupportedTaskType = "unsupported-task-type"
 	reasonInvalidDescriptor   = "invalid-descriptor"
 
-	reasonReportPublished   = "published"
-	reasonReportUnsupported = "unsupported"
-	reasonReportRetryable   = "retryable"
+	reasonReportPublished        = "published"
+	reasonReportUnsupported      = "unsupported"
+	reasonReportRetryable        = "retryable"
+	reasonReportPermanentRefusal = "permanent-refusal"
 
 	reasonRevalidationCurrent        = "current"
 	reasonRevalidationStaleHead      = "stale-head"
@@ -92,7 +93,7 @@ func reasonVocabulary() map[string][]string {
 		connector.SignalExclusion:     {connector.ReasonOverflow},
 		connector.SignalAck:           {reasonAckOK, reasonAckMissing, reasonAckInvalid, reasonAckVersionUnsupported},
 		connector.SignalProtocolError: {reasonTransportError, reasonAuthError, reasonHTTP4xx, reasonHTTP5xx, reasonMalformedResponse, reasonUnsupportedTaskType, reasonInvalidDescriptor},
-		connector.SignalReport:        {reasonReportPublished, reasonReportUnsupported, reasonReportRetryable},
+		connector.SignalReport:        {reasonReportPublished, reasonReportUnsupported, reasonReportRetryable, reasonReportPermanentRefusal},
 		connector.SignalRevalidation:  {reasonRevalidationCurrent, reasonRevalidationStaleHead, reasonRevalidationClosedUnmerged, reasonRevalidationMerged},
 		connector.SignalIdentity:      {reasonIdentityGenerationAdvanced, reasonIdentitySuperseded, reasonIdentityClaimReleased, reasonIdentityFenceHeld, reasonIdentityFenceGone, reasonIdentityOpportunityMissing, reasonIdentityHeadSuperseded, reasonIdentityFenceSettled},
 		connector.SignalAvailability:  {connector.AvailabilityAvailable, connector.AvailabilityDegraded, connector.AvailabilityUnreachable, connector.AvailabilityUnknown},

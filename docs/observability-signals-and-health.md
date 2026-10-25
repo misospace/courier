@@ -213,15 +213,16 @@ condition `LifecycleReportSupported`
 
 | Signal | Kind | Unit | Labels | Semantics |
 | --- | --- | --- | --- | --- |
-| `courier_source_lifecycle_report_outcomes_total` | counter | reports | `source`, `lane`, `mode`, `result` | One per terminal report attempt outcome; `result` ∈ `published`, `superseded`, `unsupported`, `retryable`. |
-| `courier_coderuns_lifecycle_pending` | gauge | runs | `lane` | Terminal runs whose lifecycle report is not positively settled (condition not `True` with reason `Published`/`Superseded`) — the unsettled-report backlog, mirroring the retention hold gate. |
+| `courier_source_lifecycle_report_outcomes_total` | counter | reports | `source`, `lane`, `mode`, `result` | One per terminal report attempt outcome; `result` ∈ `published`, `superseded`, `unsupported`, `retryable`, `permanent-refusal`. |
+| `courier_coderuns_lifecycle_pending` | gauge | runs | `lane` | Terminal runs whose lifecycle report is not positively settled (condition not `True` with reason `Published`/`Superseded`/`PermanentRefusal`) — the unsettled-report backlog, mirroring the retention hold gate. |
 | `courier_coderuns_lifecycle_pending_oldest_age_seconds` | gauge | seconds | `lane` | Age of the oldest unsettled report, from `FinishedAt`. Evidence for the reporting-failure condition. |
 
 The metric `result` vocabulary is a bounded projection of the two existing
 conditions, not a new source of truth. It maps to the code's reasons
 (`internal/controller/coderun_controller.go:1099-1121`):
 `published` ← `LifecycleReported=True` reason `Published`; `superseded` ←
-`LifecycleReported=True` reason `Superseded`; `unsupported` ←
+`LifecycleReported=True` reason `Superseded`; `permanent-refusal` ←
+`LifecycleReported=True` reason `PermanentRefusal`; `unsupported` ←
 `LifecycleReportSupported=False` reason `UnsupportedOutcome`; `retryable` ←
 `LifecycleReportSupported` reason `Retryable`. The `Pending*` reasons (`Pending`,
 `PendingBlockedReportParksPRFix`, `PendingWithError`,

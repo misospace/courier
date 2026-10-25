@@ -35,6 +35,12 @@ var ErrUnsupportedCapacityRecovery = errors.New("source: fenced capacity recover
 // operator supplies a new explicit retry token on the CoderRun.
 var ErrUnsupportedOutcome = errors.New("source: unsupported lifecycle outcome")
 
+// ErrPermanentRefusal means the source refused the lifecycle call for a
+// durable reason that retrying the same report can never resolve: the target
+// is closed, or this worker no longer owns the work. A terminal lifecycle
+// report carrying it settles as refused rather than retrying indefinitely.
+var ErrPermanentRefusal = errors.New("source: lifecycle report permanently refused")
+
 // WorkItem identifies work in a source. ID is intentionally opaque: sources
 // are free to choose their identifier format, and the core must not know about
 // a source's queue or API types.

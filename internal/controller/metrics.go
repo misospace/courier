@@ -170,7 +170,7 @@ func NewRunRecorder(reg prometheus.Registerer) *RunRecorder {
 		}, tokenMetricLabels),
 		LifecycleReportOutcomes: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "courier_source_lifecycle_report_outcomes_total",
-			Help: "Terminal source lifecycle report attempt outcomes, by source, lane, mode, and result (published, superseded, unsupported, retryable).",
+			Help: "Terminal source lifecycle report attempt outcomes, by source, lane, mode, and result (published, superseded, unsupported, retryable, permanent-refusal).",
 		}, lifecycleMetricLabels),
 	}
 	reg.MustRegister(rec.RunDuration, rec.QueueWait, rec.Total, rec.ReapRequests,
@@ -243,10 +243,11 @@ const (
 	verificationOutcomeRed          = "red"
 	verificationOutcomeUnobservable = "unobservable"
 
-	lifecycleOutcomePublished   = "published"
-	lifecycleOutcomeSuperseded  = "superseded"
-	lifecycleOutcomeUnsupported = "unsupported"
-	lifecycleOutcomeRetryable   = "retryable"
+	lifecycleOutcomePublished        = "published"
+	lifecycleOutcomeSuperseded       = "superseded"
+	lifecycleOutcomeUnsupported      = "unsupported"
+	lifecycleOutcomeRetryable        = "retryable"
+	lifecycleOutcomePermanentRefusal = "permanent-refusal"
 )
 
 // Token kinds are the bounded TokenUsage fields; the derived Total is never
@@ -610,9 +611,10 @@ func (c *TerminalBacklogCollector) Collect(ch chan<- prometheus.Metric) {
 		}
 		awaitingReap[run.Status.Phase]++
 		// Mirror the reaper's hold gate: only a positively settled report
-		// (True with reason Published or Superseded) leaves the backlog, so a
-		// True condition with an unexpected reason stays counted, exactly as
-		// lifecycleReportSettled holds the run in place.
+		// (True with reason Published, Superseded, or PermanentRefusal)
+		// leaves the backlog, so a True condition with an unexpected reason
+		// stays counted, exactly as lifecycleReportSettled holds the run in
+		// place.
 		if lifecycleReportSettled(run) {
 			continue
 		}
