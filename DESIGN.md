@@ -251,7 +251,17 @@ repairs all the same. The Dispatch connector implements it (#495): the park
 notice, reservation, and outcome ride generation-fenced `pr-fix-queue` routes
 with a required idempotency key, refusals fail closed with the existing
 `ErrSuperseded`/`ErrStaleWork` semantics, and work Dispatch cannot defer
-(implement and queue-less items) reports `ErrUnsupportedCIPark`. A reservation
+(implement and queue-less items) reports `ErrUnsupportedCIPark`. A bare 404
+on any park-family route is permanent version-skew evidence — the refusal
+vocabulary is 409-coded, so a 404 means the deployment adopted none of the
+routes — and the connector latches it for the process: every further
+park-family exchange short-circuits without an HTTP round trip, the
+capability catalogue flips to unsupported, and while no park is in flight
+the run takes the ordinary post-publication grading path instead of
+establishing a park the source could never fence. An in-flight park keeps
+the fail-closed sentinels: a refused reservation finishes it as
+`unsupported` without consuming an attempt, and pending notices,
+settlements, and closes are dropped on the same sentinel. A reservation
 the source refuses on a superseded generation fails the run closed to handoff.
 A settled outcome the source has not accepted — a lost response, a restart, a
 report that never landed — stays pending on the run as durable retry intent:

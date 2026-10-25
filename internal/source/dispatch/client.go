@@ -15,6 +15,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/misospace/courier/internal/connector"
@@ -156,6 +157,13 @@ type HTTPClient struct {
 	reportIdempotencyEnabled bool
 	diagnostics              *connector.Emitter
 	connectorName            string
+	// ciParkUnsupported latches the permanent observation that this
+	// Dispatch deployment has not adopted the CI park lifecycle routes at
+	// all (internal/source/dispatch/cipark.go): a bare 404 on a park-family
+	// POST is version-skew evidence, never a per-item condition, and once
+	// latched every park-family exchange short-circuits without an HTTP
+	// round trip for the rest of the process.
+	ciParkUnsupported atomic.Bool
 }
 
 // NewClient creates a Dispatch HTTP client without a queue lane override.

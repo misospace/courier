@@ -954,6 +954,53 @@ func (s *unsupportedParkSource) ReserveCIRepair(ctx context.Context, item source
 	return source.CIRepairGrant{}, source.ErrUnsupportedCIPark
 }
 
+// latchedParkSource models a source whose adapter has latched the CI park
+// lifecycle as unsupported — the permanent, per-process observation a
+// Dispatch deployment earns by answering a park-family route with a bare
+// 404 (#559). While the latch is unset the source behaves exactly like
+// ciparkSource; once set, every lifecycle exchange reports
+// source.ErrUnsupportedCIPark, and the probe reports the latch to the core.
+type latchedParkSource struct {
+	ciparkSource
+	unsupported bool
+}
+
+func (s *latchedParkSource) CIParkLifecycleUnsupported() bool {
+	return s.unsupported
+}
+
+func (s *latchedParkSource) ReportCIParked(ctx context.Context, item source.WorkItem, notice source.CIParkNotice) error {
+	if s.unsupported {
+		return source.ErrUnsupportedCIPark
+	}
+	return s.ciparkSource.ReportCIParked(ctx, item, notice)
+}
+
+func (s *latchedParkSource) ReserveCIRepair(ctx context.Context, item source.WorkItem, reservation source.CIRepairReservation) (source.CIRepairGrant, error) {
+	if s.unsupported {
+		s.items = append(s.items, item)
+		s.reservations = append(s.reservations, reservation)
+		return source.CIRepairGrant{}, source.ErrUnsupportedCIPark
+	}
+	return s.ciparkSource.ReserveCIRepair(ctx, item, reservation)
+}
+
+func (s *latchedParkSource) ReportCIRepair(ctx context.Context, item source.WorkItem, outcome source.CIRepairOutcome) error {
+	if s.unsupported {
+		return source.ErrUnsupportedCIPark
+	}
+	return s.ciparkSource.ReportCIRepair(ctx, item, outcome)
+}
+
+func (s *latchedParkSource) ReleaseCIPark(ctx context.Context, item source.WorkItem, release source.CIParkRelease) error {
+	if s.unsupported {
+		s.items = append(s.items, item)
+		s.releases = append(s.releases, release)
+		return source.ErrUnsupportedCIPark
+	}
+	return s.ciparkSource.ReleaseCIPark(ctx, item, release)
+}
+
 // TestEnvtestCIParkSourceCapability pins the optional source capability: a
 // source that implements it is told about the park, the reservation, and the
 // outcome, and a source that does not implement it still completes the run.
@@ -1060,6 +1107,99 @@ func TestEnvtestCIParkSourceCapability(t *testing.T) {
 		}
 		if len(adapter.reservations) != 1 {
 			t.Fatalf("reservations = %d, want exactly one (an unsupported reserve finishes the run, never retries)", len(adapter.reservations))
+		}
+	})
+}
+
+// TestEnvtestCIParkLatchedUnsupportedTakesTheOrdinaryPath pins the safe
+// degradation (#559): a source whose adapter has latched the CI park
+// lifecycle as unsupported — permanent version-skew evidence for the
+// process — never establishes a park again. A fresh run with a repair policy
+// takes the ordinary post-publication grading path (no park record, no
+// deferral, no reservation, no burned attempt), a park already in flight
+// when the latch flips still finishes fail-closed without consuming an
+// attempt, and a probe that reports not-known-unsupported parks exactly as
+// today.
+func TestEnvtestCIParkLatchedUnsupportedTakesTheOrdinaryPath(t *testing.T) {
+	if envtestClient == nil {
+		t.Skip("KUBEBUILDER_ASSETS is not set")
+	}
+
+	t.Run("a fresh run never establishes a park on a latched source", func(t *testing.T) {
+		adapter := &latchedParkSource{unsupported: true}
+		h := newCIParkHarness(t, "cipark-probe-latched-fresh", ciparkPolicy(2), adapter)
+		h.publishHead("sha-1")
+		h.world.set(PRObservation{PR: "42", Head: "sha-1", Checks: []CheckObservation{{Name: "build", State: CheckStatePending}}})
+		h.toVerifying()
+		h.reconcile()
+		run := h.run()
+		if run.Status.CIPark != nil {
+			t.Fatalf("status.cipark = %#v on a latched source, want no park record", run.Status.CIPark)
+		}
+		if run.Status.CIParkDeferral != nil {
+			t.Fatalf("status.ciparkDeferral = %#v on a latched source, want no deferral record", run.Status.CIParkDeferral)
+		}
+		if len(adapter.parks) != 0 {
+			t.Fatalf("park notices = %d, want 0", len(adapter.parks))
+		}
+		// The ordinary path decides: a red check hands the run off without
+		// waking a coordinator or spending a repair attempt.
+		h.world.set(redObservation("sha-1", "build"))
+		h.reconcile()
+		h.reconcile()
+		if got := h.phase(); got != courierv1alpha1.PhaseHandedOff {
+			t.Fatalf("phase after a red check on a latched source = %q, want HandedOff", got)
+		}
+		if got := h.launchCount(h.name); got != 1 {
+			t.Fatalf("launch count = %d, want 1: the ordinary path never wakes a coordinator", got)
+		}
+		if len(adapter.reservations) != 0 {
+			t.Fatalf("reservations = %d, want 0: the latch never burns a repair attempt", len(adapter.reservations))
+		}
+		if run := h.run(); run.Status.CIPark != nil {
+			t.Fatalf("status.cipark = %#v, want no park record", run.Status.CIPark)
+		}
+	})
+
+	t.Run("a park in flight finishes unsupported without an attempt", func(t *testing.T) {
+		adapter := &latchedParkSource{}
+		h := newCIParkHarness(t, "cipark-probe-latched-inflight", ciparkPolicy(2), adapter)
+		h.park("sha-1", CheckObservation{Name: "build", State: CheckStatePending})
+		if len(adapter.parks) != 1 {
+			t.Fatalf("park notices = %d, want exactly one while the source is not latched", len(adapter.parks))
+		}
+		// The latch flips mid-flight, the way a first bare 404 lands: the
+		// in-flight park keeps today's fail-closed behavior.
+		adapter.unsupported = true
+		h.settleFailure("sha-1", "build")
+		if got := h.phase(); got != courierv1alpha1.PhaseHandedOff {
+			t.Fatalf("phase after the unsupported reservation = %q, want HandedOff", got)
+		}
+		parked := h.run()
+		if parked.Status.CIPark.LastOutcome != courierv1alpha1.CIParkOutcomeUnsupported {
+			t.Fatalf("park outcome = %q, want %q", parked.Status.CIPark.LastOutcome, courierv1alpha1.CIParkOutcomeUnsupported)
+		}
+		if parked.Status.CIPark.Attempts != 0 {
+			t.Fatalf("park attempts = %d, want 0: the latch never consumes an attempt", parked.Status.CIPark.Attempts)
+		}
+		if got := h.launchCount(h.name); got != 1 {
+			t.Fatalf("launch count = %d, want 1: the sentinel never wakes the coordinator", got)
+		}
+		if len(adapter.reservations) != 1 {
+			t.Fatalf("reservations = %d, want exactly one (the refused reserve, never retried)", len(adapter.reservations))
+		}
+	})
+
+	t.Run("a probe that reports not-known-unsupported parks as today", func(t *testing.T) {
+		adapter := &latchedParkSource{}
+		h := newCIParkHarness(t, "cipark-probe-unknown", ciparkPolicy(2), adapter)
+		h.park("sha-1", CheckObservation{Name: "build", State: CheckStatePending})
+		h.settleFailure("sha-1", "build")
+		if got := h.phase(); got != courierv1alpha1.PhaseClaimed {
+			t.Fatalf("phase after the settled failure = %q, want Claimed", got)
+		}
+		if len(adapter.parks) != 1 || len(adapter.reservations) != 1 {
+			t.Fatalf("park notices = %d reservations = %d, want one of each", len(adapter.parks), len(adapter.reservations))
 		}
 	})
 }

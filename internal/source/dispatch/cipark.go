@@ -205,8 +205,14 @@ func validateCIFenceToken(token string) (string, error) {
 
 // ParkCI posts the CI park notice to /api/pr-fix-queue/cipark
 // (misospace/courier#495). The queue item pivots by repo+pr+generation
-// exactly like the mark/ack family, so the body carries no prFixId.
+// exactly like the mark/ack family, so the body carries no prFixId. Once the
+// client has latched the park lifecycle as unsupported
+// (reclassifyCIParkRoute404) the park is never sent again: a deployment that
+// answered one park-family route with a bare 404 has adopted none of them.
 func (c *HTTPClient) ParkCI(ctx context.Context, id string, notice source.CIParkNotice) error {
+	if c.ciParkUnsupported.Load() {
+		return source.ErrUnsupportedCIPark
+	}
 	d, err := parkQueueDescriptor(id)
 	if err != nil {
 		return err
@@ -231,8 +237,15 @@ func (c *HTTPClient) ParkCI(ctx context.Context, id string, notice source.CIPark
 // ReserveCIRepair posts the fenced repair reservation to
 // /api/pr-fix-queue/cireserve (misospace/courier#495). Before the POST the
 // pull request state is re-read like PreLaunch does; a grant echoes back the
-// fence token Dispatch pinned for the one repair opportunity.
+// fence token Dispatch pinned for the one repair opportunity. A latched
+// park lifecycle short-circuits before both the state re-read and the
+// reservation POST (reclassifyCIParkRoute404), while the pre-read's own 404
+// keeps its stale-work semantics: a pull request that no longer exists is
+// stale work, not evidence about the routes.
 func (c *HTTPClient) ReserveCIRepair(ctx context.Context, id string, reservation source.CIRepairReservation) (source.CIRepairGrant, error) {
+	if c.ciParkUnsupported.Load() {
+		return source.CIRepairGrant{}, source.ErrUnsupportedCIPark
+	}
 	d, err := parkQueueDescriptor(id)
 	if err != nil {
 		return source.CIRepairGrant{}, err
@@ -291,8 +304,13 @@ func (c *HTTPClient) ReserveCIRepair(ctx context.Context, id string, reservation
 
 // SettleCIRepair posts the fenced, idempotent outcome of one repair attempt
 // to /api/pr-fix-queue/cirepair (misospace/courier#495). The head travels
-// only with a repush, per source.CIRepairOutcome.
+// only with a repush, per source.CIRepairOutcome. Once the park lifecycle is
+// latched unsupported the outcome is never sent: the fence was granted by a
+// route this deployment does not have, so no settlement can ever land there.
 func (c *HTTPClient) SettleCIRepair(ctx context.Context, id string, outcome source.CIRepairOutcome) error {
+	if c.ciParkUnsupported.Load() {
+		return source.ErrUnsupportedCIPark
+	}
 	d, err := parkQueueDescriptor(id)
 	if err != nil {
 		return err
@@ -344,23 +362,27 @@ func (c *HTTPClient) SettleCIRepair(ctx context.Context, id string, outcome sour
 // no head to validate (the wire carries none), and no pull-request state to
 // re-read (only the reservation re-reads it).
 //
-// The close is advisory, so a bare 404 is permanent under version skew: the
-// contract's refusal vocabulary is 409-coded, so a 404 on this exchange is
-// evidence the deployment has not adopted the release at all (an older
-// Dispatch), and the deferral it would close is exactly as unreleased as it
-// was before the family existed. Retrying would hold Courier's terminal
-// lifecycle behind a close the server can never take, so the exchange is
-// reclassified into source.ErrUnsupportedCIPark — the same permanent
-// unsupported posture the capability gate already produces — and the caller
-// drops the pending release. The same advisory reading covers the other
-// never-deliverable refusals: a 400 (a #495-era route validating a required
-// fence token rejects the fence-less body — the same version skew under a
-// sibling status code) or a 403 (the identity no longer owns the work)
-// already arrive wrapped in source.ErrPermanentRefusal from the do() choke
-// point, and the caller drops the pending release on that sentinel too. A
-// fenced outcome keeps its ordinary 404 and 400/403 postures: only the
-// fence-less close is advisory.
+// A bare 404 on this exchange is permanent under version skew, exactly as
+// for the rest of the park family (reclassifyCIParkRoute404): the contract's
+// refusal vocabulary is 409-coded, so a 404 on this route is evidence the
+// deployment has not adopted the family at all (an older Dispatch), and the
+// deferral it would close is exactly as unreleased as it was before the
+// family existed. Retrying would hold Courier's terminal lifecycle behind a
+// close the server can never take, so the exchange is reclassified into
+// source.ErrUnsupportedCIPark — the same permanent unsupported posture the
+// capability gate already produces — the client latches the capability as
+// absent, and the caller drops the pending release. The same advisory
+// reading covers the other never-deliverable refusals: a 400 (a #495-era
+// route validating a required fence token rejects the fence-less body — the
+// same version skew under a sibling status code) or a 403 (the identity no
+// longer owns the work) already arrive wrapped in source.ErrPermanentRefusal
+// from the do() choke point, and the caller drops the pending release on
+// that sentinel too. Those rejections say nothing about whether the routes
+// exist, so neither latches anything.
 func (c *HTTPClient) ReleaseCIPark(ctx context.Context, id string, release source.CIParkRelease) error {
+	if c.ciParkUnsupported.Load() {
+		return source.ErrUnsupportedCIPark
+	}
 	d, err := parkQueueDescriptor(id)
 	if err != nil {
 		return err
@@ -372,19 +394,10 @@ func (c *HTTPClient) ReleaseCIPark(ctx context.Context, id string, release sourc
 	if err != nil {
 		return err
 	}
-	err = c.do(ctx, http.MethodPost, "/api/pr-fix-queue/cirepair", map[string]any{
+	return c.classifyCIExchange(c.do(ctx, http.MethodPost, "/api/pr-fix-queue/cirepair", map[string]any{
 		"repo": strings.ToLower(d.Repo), "generation": d.Generation, "agentName": c.agentName,
 		"idempotencyKey": key, "result": source.CIRepairUnsupported,
-	}, nil)
-	var apiErr *APIError
-	if errors.As(err, &apiErr) && apiErr.StatusCode == http.StatusNotFound {
-		// The 4xx class of a non-reclassified exchange was already counted
-		// once at the do() choke point (failExchange marks it counted), so
-		// wrapping the sentinel here adds no diagnostic; the caller drops
-		// the pending release on this permanent unsupported posture.
-		return fmt.Errorf("%w: %w", source.ErrUnsupportedCIPark, err)
-	}
-	return c.classifyCIExchange(err)
+	}, nil))
 }
 
 // classifyCIRefusal maps the CI park family's coded 409 refusals to the
@@ -450,21 +463,61 @@ func (c *HTTPClient) classifyCIRefusal(err error) error {
 	return fmt.Errorf("%w: %w", source.ErrStaleWork, err)
 }
 
+// reclassifyCIParkRoute404 reclassifies a bare 404 on a park-family POST
+// into the permanent unsupported sentinel and latches the observation
+// (ciParkUnsupported): the park family's refusal vocabulary is 409-coded,
+// so a bare 404 on one of these routes is evidence the deployment has not
+// adopted the routes at all — version skew, not a per-item condition — and
+// every further park-family exchange against it would retry the same 404
+// forever. The reclassification follows the pattern the fence-less release
+// established: the 404's exchange diagnostic was already counted once at the
+// do() choke point (a park-family 404 is not an exchangeReclassified
+// status), so wrapping the sentinel here adds no diagnostic; on the first
+// latch the capability catalogue gauge flips to the unsupported posture the
+// exchange just proved. Anything else — a 5xx, a transport failure, a 409
+// refusal, a 400/403 — is not route evidence and is returned unchanged. The
+// boolean reports whether the error was reclassified, so the caller never
+// has to compare error identities.
+func (c *HTTPClient) reclassifyCIParkRoute404(err error) (error, bool) {
+	var apiErr *APIError
+	if !errors.As(err, &apiErr) || apiErr.StatusCode != http.StatusNotFound {
+		return err, false
+	}
+	if c.ciParkUnsupported.CompareAndSwap(false, true) {
+		c.diagnostics.Capability(c.connectorName, connector.CapabilityCIParkLifecycle, connector.CapabilityUnsupported)
+	}
+	return fmt.Errorf("%w: %w", source.ErrUnsupportedCIPark, err), true
+}
+
+// ciParkLifecycleUnsupported reports the latched version-skew observation
+// behind source.CIParkLifecycleProbe: whether this client has seen a bare
+// 404 on a park-family POST and therefore knows the deployment has not
+// adopted the CI park lifecycle routes at all. False until observed, and
+// permanent once latched, for the life of the process.
+func (c *HTTPClient) ciParkLifecycleUnsupported() bool {
+	return c.ciParkUnsupported.Load()
+}
+
 // classifyCIExchange classifies one deferred CI park family exchange whose
-// diagnostic the caller owns: a reason-coded 409 body maps through
-// classifyCIRefusal — the code wins over any embedded text, keeping one
-// refusal one sentinel, so a coded body embedding the generation mismatch
-// literal never satisfies both sentinels — and a body without a coded
-// reason falls to the shared asSuperseded sniff ("generation mismatch:
-// expected N" under the mark family's identity semantics). A 404 stays an
-// ordinary error: a route the server has not adopted and a queue item that
-// no longer exists are indistinguishable at this layer, and the park
-// window — not a retry loop — bounds either one. The fence-less release
-// exchange does not route through here: its advisory posture reclassifies
-// its own 404 into the permanent unsupported sentinel above.
+// diagnostic the caller owns: a bare 404 on the park-family POST reclassifies
+// first (reclassifyCIParkRoute404) into the permanent unsupported sentinel,
+// latching the capability as absent — the deployment that answered one
+// park-family route with a 404 has adopted none of them, and a retry loop
+// would only churn the same 404 through the park window. A reason-coded 409
+// body then maps through classifyCIRefusal — the code wins over any embedded
+// text, keeping one refusal one sentinel, so a coded body embedding the
+// generation mismatch literal never satisfies both sentinels — and a body
+// without a coded reason falls to the shared asSuperseded sniff ("generation
+// mismatch: expected N" under the mark family's identity semantics). Every
+// other exchange keeps its ordinary classification: a 5xx or transport
+// failure stays transient, a 400/403 stays the choke point's permanent
+// refusal, and none of them is evidence about the routes.
 func (c *HTTPClient) classifyCIExchange(err error) error {
 	if err == nil {
 		return nil
+	}
+	if reclassified, ok := c.reclassifyCIParkRoute404(err); ok {
+		return reclassified
 	}
 	if _, coded := ciRefusalCode(err); coded {
 		return c.classifyCIRefusal(err)

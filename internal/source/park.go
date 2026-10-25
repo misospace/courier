@@ -100,6 +100,19 @@ type CIParkRelease struct {
 	IdempotencyKey string
 }
 
+// CIParkLifecycleProbe is the optional question the core asks a source
+// before establishing a CI park: whether the CI park lifecycle is
+// KNOWN-unsupported for this source. An adapter that does not implement the
+// probe, and one whose answer is false, means "not known unsupported": the
+// park proceeds exactly as it does today. True means the source itself
+// observed the capability absent — a permanent, per-process observation, such
+// as a Dispatch deployment that answered a park-family route with a bare 404
+// — and the core takes the ordinary post-publication grading path instead of
+// establishing a park the source could never fence.
+type CIParkLifecycleProbe interface {
+	CIParkLifecycleUnsupported() bool
+}
+
 // CIParkLifecycle is the optional source capability for the CI
 // park-and-resume loop (#475). ReportCIParked announces the park so a
 // connector can defer its own PR-fix dispatch; ReserveCIRepair atomically
