@@ -1612,6 +1612,20 @@ func advancePastWindow(now *time.Time, reconciler *CoderRunReconciler) {
 	reconciler.Now = func() time.Time { return *now }
 }
 
+// removeCIParkPolicy strips the lane's declared repair policy: the removal
+// that takes a parked run out of the park loop on the ordinary path (#553).
+func removeCIParkPolicy(t *testing.T, laneName string) {
+	t.Helper()
+	var lane courierv1alpha1.LaneProfile
+	if err := envtestClient.Get(context.Background(), envtestKey(laneName), &lane); err != nil {
+		t.Fatal(err)
+	}
+	lane.Spec.CIRepair = nil
+	if err := envtestClient.Update(context.Background(), &lane); err != nil {
+		t.Fatal(err)
+	}
+}
+
 // TestEnvtestCIParkDeferralReleasedWithoutReservation pins the release path
 // (#534): a park whose notice the source accepted ends without a reservation
 // — the window expires — and the deferral is released with the fence-less
@@ -2180,6 +2194,672 @@ func TestEnvtestCIParkReleaseRefusalsResolveMoot(t *testing.T) {
 	})
 }
 
+// TestEnvtestCIParkAbandonedParkReleasesAcceptedDeferral pins the abandon
+// (#553): a run that leaves the park loop without going through a park
+// ending — because the lane's repair policy was removed, or because the
+// pull request is no longer parkable — releases the accepted deferral with
+// the fence-less close keyed by the park notice's own identity, instead of
+// leaving the source deferred against an opportunity that is over while the
+// ordinary path transitions the run. The abandon itself fires once: the
+// cleared park record fences every later entry, on any reconcile, from any
+// controller incarnation.
+func TestEnvtestCIParkAbandonedParkReleasesAcceptedDeferral(t *testing.T) {
+	if envtestClient == nil {
+		t.Skip("KUBEBUILDER_ASSETS is not set")
+	}
+
+	t.Run("policy-removed", func(t *testing.T) {
+		adapter := &ciparkSource{}
+		h := newCIParkHarness(t, "cipark-abandon-policy", ciparkPolicy(2), adapter)
+		h.park("sha-1", CheckObservation{Name: "build", State: CheckStatePending})
+		if len(adapter.parks) != 1 {
+			t.Fatalf("park notices = %#v, want exactly one delivered notice", adapter.parks)
+		}
+		removeCIParkPolicy(t, h.laneName)
+		h.reconcile()
+		// The ordinary path takes over with its pending observation, but
+		// only after the abandon converted the accepted deferral into the
+		// fence-less close.
+		if got := h.phase(); got != courierv1alpha1.PhaseVerifying {
+			t.Fatalf("phase after the abandon = %q, want Verifying (the ordinary path stays on it)", got)
+		}
+		if len(adapter.releases) != 1 {
+			t.Fatalf("releases = %#v, want exactly one close for the abandoned park", adapter.releases)
+		}
+		delivered := adapter.releases[0]
+		if delivered.Head != "sha-1" {
+			t.Fatalf("close head = %q, want the parked head sha-1", delivered.Head)
+		}
+		if delivered.IdempotencyKey != adapter.parks[0].IdempotencyKey {
+			t.Fatalf("close key = %q, want the park notice's own key %q", delivered.IdempotencyKey, adapter.parks[0].IdempotencyKey)
+		}
+		abandoned := h.run()
+		if abandoned.Status.CIPark != nil {
+			t.Fatalf("status.cipark = %#v after the abandon, want nil (the record's absence fences a re-conversion)", abandoned.Status.CIPark)
+		}
+		if abandoned.Status.CIParkDeferral != nil {
+			t.Fatalf("status.ciparkDeferral = %#v after the abandon, want nil (converted into the close)", abandoned.Status.CIParkDeferral)
+		}
+		if abandoned.Status.CIParkRelease != nil {
+			t.Fatalf("status.ciparkRelease = %#v after the abandon, want nil (the delivery cleared it)", abandoned.Status.CIParkRelease)
+		}
+
+		// The ordinary path settles the abandoned run on its own terms: two
+		// consecutive green observations, exactly as if no policy was ever
+		// declared.
+		h.world.set(greenObservation("sha-1", "build"))
+		h.reconcile()
+		if got := h.phase(); got != courierv1alpha1.PhaseVerifying {
+			t.Fatalf("phase after the first green observation = %q, want Verifying", got)
+		}
+		h.reconcile()
+		if got := h.phase(); got != courierv1alpha1.PhaseAwaitingReview {
+			t.Fatalf("phase after the settled green observation = %q, want AwaitingReview", got)
+		}
+		if got := h.launchCount(h.name); got != 1 {
+			t.Fatalf("launches = %d, want 1 (the abandoned park never woke a coordinator)", got)
+		}
+
+		// The delivered close never re-fires: not on later reconciles, and
+		// not across a controller restart.
+		h.reconcile()
+		h.reconciler = h.newReconciler()
+		h.reconcile()
+		if len(adapter.releases) != 1 {
+			t.Fatalf("releases after the terminal settle = %d, want exactly one", len(adapter.releases))
+		}
+		if final := h.run(); final.Status.CIPark != nil || final.Status.CIParkRelease != nil || final.Status.CIParkDeferral != nil {
+			t.Fatalf("run status after the restart = park %#v deferral %#v release %#v, want all nil", final.Status.CIPark, final.Status.CIParkDeferral, final.Status.CIParkRelease)
+		}
+	})
+
+	t.Run("pull-request-unparkable", func(t *testing.T) {
+		adapter := &ciparkSource{}
+		h := newCIParkHarness(t, "cipark-abandon-draft", ciparkPolicy(2), adapter)
+		h.park("sha-1", CheckObservation{Name: "build", State: CheckStatePending})
+		if len(adapter.parks) != 1 {
+			t.Fatalf("park notices = %#v, want exactly one delivered notice", adapter.parks)
+		}
+		// The pull request the park established itself on is now a draft: the
+		// ordinary path owns the observation and transitions NeedsHuman.
+		h.world.set(PRObservation{PR: "42", Head: "sha-1", Draft: true})
+		h.reconcile()
+		if got := h.phase(); got != courierv1alpha1.PhaseNeedsHuman {
+			t.Fatalf("phase after the draft observation = %q, want NeedsHuman", got)
+		}
+		if len(adapter.releases) != 1 {
+			t.Fatalf("releases = %#v, want exactly one close for the abandoned park", adapter.releases)
+		}
+		if adapter.releases[0].IdempotencyKey != adapter.parks[0].IdempotencyKey {
+			t.Fatalf("close key = %q, want the park notice's own key %q", adapter.releases[0].IdempotencyKey, adapter.parks[0].IdempotencyKey)
+		}
+		if head := adapter.releases[0].Head; head != "sha-1" {
+			t.Fatalf("close head = %q, want the parked head sha-1", head)
+		}
+		abandoned := h.run()
+		if abandoned.Status.CIPark != nil || abandoned.Status.CIParkDeferral != nil || abandoned.Status.CIParkRelease != nil {
+			t.Fatalf("run status after the abandon = park %#v deferral %#v release %#v, want all nil", abandoned.Status.CIPark, abandoned.Status.CIParkDeferral, abandoned.Status.CIParkRelease)
+		}
+		if got := h.launchCount(h.name); got != 1 {
+			t.Fatalf("launches = %d, want 1 (the abandoned park never woke a coordinator)", got)
+		}
+		// The terminal run re-presents nothing, on any later reconcile or
+		// controller restart.
+		h.reconcile()
+		h.reconciler = h.newReconciler()
+		h.reconcile()
+		if len(adapter.releases) != 1 {
+			t.Fatalf("releases after further reconciles = %d, want exactly one", len(adapter.releases))
+		}
+		if final := h.run(); final.Status.CIPark != nil || final.Status.CIParkRelease != nil || final.Status.CIParkDeferral != nil {
+			t.Fatalf("run status after the restart = park %#v deferral %#v release %#v, want all nil", final.Status.CIPark, final.Status.CIParkDeferral, final.Status.CIParkRelease)
+		}
+	})
+
+	// The lost-close variant: the source commits the close and loses the
+	// response, so the abandon leaves durable retry intent — re-presented
+	// byte-identical on the run's next reconcile, the same key collapsing
+	// into the one committed close — and the ending never waits on it.
+	t.Run("policy-removed-replays-lost-close", func(t *testing.T) {
+		adapter := &flakyReleaseSource{}
+		h := newCIParkHarness(t, "cipark-abandon-lost-close", ciparkPolicy(2), adapter)
+		h.park("sha-1", CheckObservation{Name: "build", State: CheckStatePending})
+		if len(adapter.parks) != 1 {
+			t.Fatalf("park notices = %#v, want exactly one delivered notice", adapter.parks)
+		}
+		removeCIParkPolicy(t, h.laneName)
+		h.reconcile()
+		pendingRelease := h.run().Status.CIParkRelease
+		if pendingRelease == nil {
+			t.Fatal("status.ciparkRelease = nil after the lost close, want the pending release")
+		}
+		if pendingRelease.IdempotencyKey != adapter.parks[0].IdempotencyKey {
+			t.Fatalf("pending release key = %q, want the park notice's own key %q", pendingRelease.IdempotencyKey, adapter.parks[0].IdempotencyKey)
+		}
+		// The next reconcile re-presents the close byte-identical, before the
+		// ordinary path has settled anything.
+		h.reconcile()
+		if len(adapter.releases) != 2 {
+			t.Fatalf("releases = %#v, want the committed close and its replay", adapter.releases)
+		}
+		if adapter.releases[0] != adapter.releases[1] {
+			t.Fatalf("replayed close = %#v, want byte-identical to the committed one %#v (the same key collapses into one close)", adapter.releases[1], adapter.releases[0])
+		}
+		if final := h.run(); final.Status.CIParkRelease != nil {
+			t.Fatalf("status.ciparkRelease = %#v after the replay, want nil (the clear is the proof of delivery)", final.Status.CIParkRelease)
+		}
+	})
+}
+
+// TestEnvtestCIParkAbandonedParkWithoutDeferralRecordsNothing pins the gated
+// boundary of the abandon: a source without the CIParkLifecycle capability
+// never had a notice recorded for the park — there is no accepted deferral
+// and nothing to close — so the abandoned park records and delivers nothing,
+// and the ordinary path terminalizes the run with its lifecycle untouched.
+func TestEnvtestCIParkAbandonedParkWithoutDeferralRecordsNothing(t *testing.T) {
+	if envtestClient == nil {
+		t.Skip("KUBEBUILDER_ASSETS is not set")
+	}
+	// admissionSource is the plain stub that predates the park capability:
+	// implementing no CIParkLifecycle method is the gate itself.
+	adapter := &admissionSource{}
+	h := newCIParkHarness(t, "cipark-abandon-plain-source", ciparkPolicy(2), adapter)
+	h.park("sha-1", CheckObservation{Name: "build", State: CheckStatePending})
+	parked := h.run()
+	if parked.Status.CIPark == nil {
+		t.Fatal("status.cipark = nil while parked, want the park record")
+	}
+	if parked.Status.CIParkDeferral != nil {
+		t.Fatalf("status.ciparkDeferral = %#v on a source without the capability, want nil (no notice was ever recorded)", parked.Status.CIParkDeferral)
+	}
+	// The ordinary surface saw the claim and the launch, and nothing else.
+	if len(adapter.claimed) != 1 {
+		t.Fatalf("source claims = %#v, want exactly one (the plain source never hears about a park)", adapter.claimed)
+	}
+	removeCIParkPolicy(t, h.laneName)
+	h.reconcile()
+	if got := h.phase(); got != courierv1alpha1.PhaseVerifying {
+		t.Fatalf("phase after the abandon = %q, want Verifying (the ordinary path stays on it)", got)
+	}
+	abandoned := h.run()
+	if abandoned.Status.CIPark != nil {
+		t.Fatalf("status.cipark = %#v after the abandon, want nil", abandoned.Status.CIPark)
+	}
+	if abandoned.Status.CIParkRelease != nil {
+		t.Fatalf("status.ciparkRelease = %#v after the abandon, want nil (nothing was owed)", abandoned.Status.CIParkRelease)
+	}
+	// The abandon called the source for nothing: only the park capability
+	// ever would have been asked, and the plain source has none.
+	if len(adapter.claimed) != 1 || len(adapter.transitions) != 1 {
+		t.Fatalf("source surface after the abandon = claims %#v transitions %#v, want launch-only (claims one, in-progress once)", adapter.claimed, adapter.transitions)
+	}
+	if len(adapter.reports) != 0 {
+		t.Fatalf("source reports after the abandon = %#v, want none before the terminal settle", adapter.reports)
+	}
+
+	// The ordinary path terminalizes with its own lifecycle, exactly as a
+	// never-parked run would.
+	h.world.set(greenObservation("sha-1", "build"))
+	h.reconcile()
+	h.reconcile()
+	if got := h.phase(); got != courierv1alpha1.PhaseAwaitingReview {
+		t.Fatalf("phase after the settled green observation = %q, want AwaitingReview", got)
+	}
+	final := h.run()
+	if final.Status.CIPark != nil || final.Status.CIParkRelease != nil || final.Status.CIParkDeferral != nil {
+		t.Fatalf("run status at the terminal settle = park %#v deferral %#v release %#v, want all nil", final.Status.CIPark, final.Status.CIParkDeferral, final.Status.CIParkRelease)
+	}
+	if len(adapter.reports) != 1 {
+		t.Fatalf("source reports at the terminal settle = %#v, want exactly one (the ordinary ending's own report)", adapter.reports)
+	}
+}
+
+// TestEnvtestCIParkAbandonedParkConvertsPendingNotice pins the conversion
+// the abandon inherits from the finish (#545): a park whose notice the
+// source never accepted still leaves durable close intent when the loop
+// abandons the run, and the abandon clears the pending notice in the same
+// write as the release — the close, not the notice, is what is owed once the
+// opportunity is over; advisory when the notice never landed (#534).
+func TestEnvtestCIParkAbandonedParkConvertsPendingNotice(t *testing.T) {
+	if envtestClient == nil {
+		t.Skip("KUBEBUILDER_ASSETS is not set")
+	}
+	adapter := &failingNoticeSource{}
+	h := newCIParkHarness(t, "cipark-abandon-pending-notice", ciparkPolicy(2), adapter)
+	h.park("sha-1", CheckObservation{Name: "build", State: CheckStatePending})
+	parked := h.run()
+	if parked.Status.CIParkDeferral == nil {
+		t.Fatal("status.ciparkDeferral = nil while the notice keeps failing, want the pending notice")
+	}
+	pendingKey := parked.Status.CIParkDeferral.IdempotencyKey
+	removeCIParkPolicy(t, h.laneName)
+	h.reconcile()
+	if got := h.phase(); got != courierv1alpha1.PhaseVerifying {
+		t.Fatalf("phase after the abandon = %q, want Verifying (the ordinary path stays on it)", got)
+	}
+	abandoned := h.run()
+	if abandoned.Status.CIPark != nil {
+		t.Fatalf("status.cipark = %#v after the abandon, want nil (the record's absence fences a re-conversion)", abandoned.Status.CIPark)
+	}
+	if abandoned.Status.CIParkDeferral != nil {
+		t.Fatalf("status.ciparkDeferral = %#v after the abandon, want nil (converted into the close)", abandoned.Status.CIParkDeferral)
+	}
+	if abandoned.Status.CIParkRelease != nil {
+		t.Fatalf("status.ciparkRelease = %#v after the abandon, want nil (the delivery cleared it)", abandoned.Status.CIParkRelease)
+	}
+	// The close is what converts the never-accepted pending notice into, and
+	// it carries the notice's own key.
+	if len(adapter.releases) != 1 {
+		t.Fatalf("releases = %#v, want exactly one close even though the notice never landed", adapter.releases)
+	}
+	if adapter.releases[0].IdempotencyKey != pendingKey {
+		t.Fatalf("close key = %q, want the pending notice's own key %q", adapter.releases[0].IdempotencyKey, pendingKey)
+	}
+	if len(adapter.parks) != 0 {
+		t.Fatalf("park notices = %d, want 0 (the source never accepted one)", len(adapter.parks))
+	}
+
+	// The ordinary path terminalizes, and the delivered close never re-fires.
+	h.world.set(greenObservation("sha-1", "build"))
+	h.reconcile()
+	h.reconcile()
+	if got := h.phase(); got != courierv1alpha1.PhaseAwaitingReview {
+		t.Fatalf("phase after the settled green observation = %q, want AwaitingReview", got)
+	}
+	h.reconcile()
+	if len(adapter.releases) != 1 {
+		t.Fatalf("releases after the terminal settle = %d, want exactly one", len(adapter.releases))
+	}
+}
+
+// TestEnvtestCIParkAbandonedParkWithLiveFenceSettlesTheReservation pins the
+// abandon's armed branch (#553): a repair attempt whose coordinator just
+// exited reaches Verifying with its fence still live — the exit handler
+// writes the phase alone and the loop clears the context only when its next
+// observation consumes the attempt — and an abandon reaching that
+// observation settles the reservation exactly as the loop's own endings
+// would. The mapped outcome rides the fence as durable intent while the
+// attempt context, the pending notice, and the park record die with it in
+// the same write; no fence-less close is recorded on its behalf, because a
+// granted reservation is never released fence-less. The ordinary path takes
+// over on the same observation, and the delivered settlement never re-fires.
+func TestEnvtestCIParkAbandonedParkWithLiveFenceSettlesTheReservation(t *testing.T) {
+	if envtestClient == nil {
+		t.Skip("KUBEBUILDER_ASSETS is not set")
+	}
+
+	// abandonedWithLiveFence drives one flow both bail-outs share: the run
+	// parks, a settled failure wakes the coordinator for one fence-backed
+	// repair, the coordinator exits back to Verifying with the fence still
+	// live, and the named trigger walks the run out of the loop under that
+	// fence. It returns the harness and the fence the attempt carried, so
+	// the subtests can tie the surfaces they assert on to that fence.
+	abandonedWithLiveFence := func(t *testing.T, name string, adapter source.Adapter, trigger func(t *testing.T, h *ciparkHarness)) (*ciparkHarness, string) {
+		t.Helper()
+		h := newCIParkHarness(t, name, ciparkPolicy(2), adapter)
+		h.park("sha-1", CheckObservation{Name: "build", State: CheckStatePending})
+		h.settleFailure("sha-1", "build")
+		// The settled failure wakes the run for one repair; the reservation
+		// is fenced.
+		if got := h.phase(); got != courierv1alpha1.PhaseClaimed {
+			t.Fatalf("phase after the settled failure = %q, want Claimed", got)
+		}
+		resumed := h.run()
+		if resumed.Status.CIRepair == nil {
+			t.Fatal("status.ciRepair = nil after the resume, want the repair context")
+		}
+		if resumed.Status.CIRepair.FenceToken == "" {
+			t.Fatal("repair fence token = empty after the resume, want the grant the reserve returned")
+		}
+		attemptFence := resumed.Status.CIRepair.FenceToken
+		// The resumed coordinator runs and exits; the phase write carries the
+		// attempt context across untouched — Verifying is exactly where a
+		// live fence is observable.
+		h.reconcile()
+		if got := h.phase(); got != courierv1alpha1.PhaseRunning {
+			t.Fatalf("phase after the resumed launch = %q, want Running", got)
+		}
+		h.reconcile()
+		if got := h.phase(); got != courierv1alpha1.PhaseVerifying {
+			t.Fatalf("phase after the resumed coordinator exited = %q, want Verifying", got)
+		}
+		if exited := h.run(); exited.Status.CIRepair == nil || exited.Status.CIRepair.FenceToken != attemptFence {
+			t.Fatalf("attempt context after the exit = %+v, want the attempt and its fence still live", exited.Status.CIRepair)
+		}
+		// The abort trigger works from a calm pending world, so the ordinary
+		// path it hands to does not settle the still-red observation in the
+		// same reconcile.
+		h.world.set(PRObservation{PR: "42", Head: "sha-1", Checks: []CheckObservation{{Name: "build", State: CheckStatePending}}})
+		trigger(t, h)
+		h.reconcile()
+		return h, attemptFence
+	}
+
+	t.Run("policy-removed", func(t *testing.T) {
+		adapter := &ciparkSource{}
+		h, attemptFence := abandonedWithLiveFence(t, "cipark-abandon-fenced-policy", adapter, func(t *testing.T, h *ciparkHarness) {
+			removeCIParkPolicy(t, h.laneName)
+		})
+		if attemptFence != adapter.reservations[0].FenceToken {
+			t.Fatalf("repair fence token = %q, want the reserved fence %q", attemptFence, adapter.reservations[0].FenceToken)
+		}
+		// The armed abandon settles the reservation: the mapped no-progress
+		// outcome (the attempt published nothing on its head) rides the
+		// fence as durable intent, and the attempt context dies with it.
+		// The record is nil by the time this read lands — the delivery in
+		// the same reconcile answered, and the clear is the proof of
+		// delivery; the lost-response subtest below pins the record's
+		// pending state.
+		abandoned := h.run()
+		if abandoned.Status.CISettlement != nil {
+			t.Fatalf("status.ciSettlement = %#v after the abandon, want nil (the delivery cleared it)", abandoned.Status.CISettlement)
+		}
+		if abandoned.Status.CIRepair != nil {
+			t.Fatalf("status.ciRepair = %#v after the abandon, want nil (the attempt is settled)", abandoned.Status.CIRepair)
+		}
+		if abandoned.Status.CIPark != nil {
+			t.Fatalf("status.cipark = %#v after the abandon, want nil (uniform fire-once fence)", abandoned.Status.CIPark)
+		}
+		if abandoned.Status.CIParkDeferral != nil {
+			t.Fatalf("status.ciparkDeferral = %#v after the abandon, want nil", abandoned.Status.CIParkDeferral)
+		}
+		if abandoned.Status.CIParkRelease != nil {
+			t.Fatalf("status.ciparkRelease = %#v after the abandon, want nil (a fenced outcome is the release; no close is recorded)", abandoned.Status.CIParkRelease)
+		}
+		// The settlement was delivered, carrying the reservation's fence and
+		// the mapped result; the close route is never touched.
+		if len(adapter.outcomes) != 1 {
+			t.Fatalf("source outcomes = %#v, want exactly one settled fence", adapter.outcomes)
+		}
+		outcome := adapter.outcomes[0]
+		if outcome.FenceToken != adapter.reservations[0].FenceToken {
+			t.Fatalf("delivered fence = %q, want the reserved fence %q", outcome.FenceToken, adapter.reservations[0].FenceToken)
+		}
+		if outcome.Result != source.CIRepairExhausted {
+			t.Fatalf("delivered result = %q, want %q", outcome.Result, source.CIRepairExhausted)
+		}
+		if outcome.Head != "" {
+			t.Fatalf("delivered head = %q, want none (only a repush carries one)", outcome.Head)
+		}
+		if len(adapter.releases) != 0 {
+			t.Fatalf("releases = %d, want 0 (the fenced outcome releases the deferral)", len(adapter.releases))
+		}
+
+		// The ordinary path proceeds on its own terms: two consecutive green
+		// observations, with the abandoned park never re-engaged and the
+		// settled reservation never re-reported.
+		h.world.set(greenObservation("sha-1", "build"))
+		h.reconcile()
+		if got := h.phase(); got != courierv1alpha1.PhaseVerifying {
+			t.Fatalf("phase after the first green observation = %q, want Verifying", got)
+		}
+		h.reconcile()
+		if got := h.phase(); got != courierv1alpha1.PhaseAwaitingReview {
+			t.Fatalf("phase after the settled green observation = %q, want AwaitingReview", got)
+		}
+		if got := h.launchCount(h.name); got != 2 {
+			t.Fatalf("launches = %d, want 2 (the wake plus the attempted repair stand; the abandon wakes nobody)", got)
+		}
+		h.reconcile()
+		h.reconciler = h.newReconciler()
+		h.reconcile()
+		if len(adapter.outcomes) != 1 || len(adapter.releases) != 0 {
+			t.Fatalf("source surface after the terminal settle = %d outcomes/%d releases, want 1/0", len(adapter.outcomes), len(adapter.releases))
+		}
+		if final := h.run(); final.Status.CIPark != nil || final.Status.CIRepair != nil || final.Status.CISettlement != nil || final.Status.CIParkDeferral != nil || final.Status.CIParkRelease != nil {
+			t.Fatalf("run status after the restart = park %#v attempt %#v settlement %#v deferral %#v release %#v, want all nil", final.Status.CIPark, final.Status.CIRepair, final.Status.CISettlement, final.Status.CIParkDeferral, final.Status.CIParkRelease)
+		}
+	})
+
+	t.Run("pull-request-unparkable", func(t *testing.T) {
+		adapter := &ciparkSource{}
+		h, attemptFence := abandonedWithLiveFence(t, "cipark-abandon-fenced-draft", adapter, func(t *testing.T, h *ciparkHarness) {
+			// The policy stands; the pull request went draft mid-attempt —
+			// the second bail-out owns the run now.
+			h.world.set(PRObservation{PR: "42", Head: "sha-1", Draft: true})
+		})
+		if attemptFence != adapter.reservations[0].FenceToken {
+			t.Fatalf("repair fence token = %q, want the reserved fence %q", attemptFence, adapter.reservations[0].FenceToken)
+		}
+		// The armed abandon settles under the draft observation, and the
+		// ordinary path turns the run NeedsHuman exactly as an unparkable
+		// request always does.
+		if got := h.phase(); got != courierv1alpha1.PhaseNeedsHuman {
+			t.Fatalf("phase after the abandon = %q, want NeedsHuman", got)
+		}
+		abandoned := h.run()
+		// The delivered settlement left its record cleared (the clear is the
+		// proof of delivery), so the delivered outcome is asserted on the
+		// source's own recording; only the lost-response subtest sees the
+		// record pending.
+		if abandoned.Status.CISettlement != nil {
+			t.Fatalf("status.ciSettlement = %#v after the abandon, want nil (the delivery cleared it)", abandoned.Status.CISettlement)
+		}
+		if abandoned.Status.CIRepair != nil || abandoned.Status.CIPark != nil || abandoned.Status.CIParkDeferral != nil || abandoned.Status.CIParkRelease != nil {
+			t.Fatalf("run status after the abandon = attempt %#v park %#v deferral %#v release %#v, want all nil", abandoned.Status.CIRepair, abandoned.Status.CIPark, abandoned.Status.CIParkDeferral, abandoned.Status.CIParkRelease)
+		}
+		if len(adapter.outcomes) != 1 || len(adapter.releases) != 0 {
+			t.Fatalf("source surface = %d outcomes/%d releases, want 1/0 (the fenced outcome is the release)", len(adapter.outcomes), len(adapter.releases))
+		}
+		if outcome := adapter.outcomes[0]; outcome.Result != source.CIRepairExhausted || outcome.FenceToken != attemptFence || outcome.Head != "" {
+			t.Fatalf("delivered outcome = %#v, want the reserved fence settled exhausted with no head", outcome)
+		}
+		// The terminal run re-reports nothing, across reconciles and a
+		// restart.
+		h.reconcile()
+		h.reconciler = h.newReconciler()
+		h.reconcile()
+		if len(adapter.outcomes) != 1 || len(adapter.releases) != 0 {
+			t.Fatalf("source surface after further reconciles = %d outcomes/%d releases, want 1/0", len(adapter.outcomes), len(adapter.releases))
+		}
+	})
+
+	// The armed abandon's durable intent: the settlement's commit lost its
+	// response, so the record rides the fence it presents and a later
+	// reconcile re-presents it byte-identical, park record gone or not.
+	t.Run("lost-settlement-replays", func(t *testing.T) {
+		adapter := &flakySettlementSource{}
+		h, attemptFence := abandonedWithLiveFence(t, "cipark-abandon-fenced-lost", adapter, func(t *testing.T, h *ciparkHarness) {
+			removeCIParkPolicy(t, h.laneName)
+		})
+		if attemptFence != adapter.reservations[0].FenceToken {
+			t.Fatalf("repair fence token = %q, want the reserved fence %q", attemptFence, adapter.reservations[0].FenceToken)
+		}
+		// The abandoning reconcile recorded the settlement and lost the
+		// response: the record stays, and the ordinary path still proceeds.
+		pending := h.run()
+		if pending.Status.CISettlement == nil {
+			t.Fatal("status.ciSettlement = nil after the lost close, want the pending settlement")
+		}
+		if pending.Status.CISettlement.FenceToken != attemptFence {
+			t.Fatalf("pending settlement fence = %q, want the reserved fence %q", pending.Status.CISettlement.FenceToken, attemptFence)
+		}
+		if got := h.phase(); got != courierv1alpha1.PhaseVerifying {
+			t.Fatalf("phase after the lost settlement response = %q, want Verifying (the ending never waits on the report)", got)
+		}
+		// The next reconcile re-presents the settlement byte-identical — the
+		// fence inside the record keys it, not the cleared park record's
+		// attempt count.
+		h.reconcile()
+		if len(adapter.outcomes) != 2 {
+			t.Fatalf("source outcomes = %#v, want the committed settlement and its replay", adapter.outcomes)
+		}
+		if !reflect.DeepEqual(adapter.outcomes[0], adapter.outcomes[1]) {
+			t.Fatalf("replayed settlement = %#v, want byte-identical to the committed one %#v (the same fence collapses into one settled outcome)", adapter.outcomes[1], adapter.outcomes[0])
+		}
+		if delivered := h.run(); delivered.Status.CISettlement != nil {
+			t.Fatalf("status.ciSettlement = %#v after the replay, want nil (the clear is the proof of delivery)", delivered.Status.CISettlement)
+		}
+	})
+
+	// A republish across the abandon: the attempt's coordinator exited and
+	// only its publication is unrecorded — the world reports the new head
+	// under the abandon, with its check still pending so the ordinary path
+	// settles nothing in the same reconcile. The mapped outcome is the
+	// repushed one naming the new head, and the ordinary path then settles
+	// the run's green set on its own terms.
+	t.Run("repushed", func(t *testing.T) {
+		adapter := &ciparkSource{}
+		h, attemptFence := abandonedWithLiveFence(t, "cipark-abandon-fenced-repushed", adapter, func(t *testing.T, h *ciparkHarness) {
+			// The push the abandoned attempt made, with the publication
+			// record shadowing it: the head is this run's own published one
+			// now, and the check is still pending.
+			h.publishHead("sha-2")
+			h.world.set(PRObservation{PR: "42", Head: "sha-2", Checks: []CheckObservation{{Name: "build", State: CheckStatePending}}})
+			removeCIParkPolicy(t, h.laneName)
+		})
+		if attemptFence != adapter.reservations[0].FenceToken {
+			t.Fatalf("repair fence token = %q, want the reserved fence %q", attemptFence, adapter.reservations[0].FenceToken)
+		}
+		if got := h.phase(); got != courierv1alpha1.PhaseVerifying {
+			t.Fatalf("phase after the abandoned republish = %q, want Verifying (the pending check never settles)", got)
+		}
+		abandoned := h.run()
+		if abandoned.Status.CISettlement != nil {
+			t.Fatalf("status.ciSettlement = %#v after the abandon, want nil (the delivery cleared it)", abandoned.Status.CISettlement)
+		}
+		if len(adapter.outcomes) != 1 {
+			t.Fatalf("source outcomes = %#v, want exactly one settled fence", adapter.outcomes)
+		}
+		if outcome := adapter.outcomes[0]; outcome.Result != source.CIRepairRepushed || outcome.Head != "sha-2" || outcome.FenceToken != attemptFence {
+			t.Fatalf("delivered outcome = %#v, want the reserved fence settled repushed with the new head sha-2", outcome)
+		}
+		if abandoned.Status.CIRepair != nil || abandoned.Status.CIPark != nil || abandoned.Status.CIParkDeferral != nil || abandoned.Status.CIParkRelease != nil {
+			t.Fatalf("run status after the abandon = attempt %#v park %#v deferral %#v release %#v, want all nil", abandoned.Status.CIRepair, abandoned.Status.CIPark, abandoned.Status.CIParkDeferral, abandoned.Status.CIParkRelease)
+		}
+		if len(adapter.releases) != 0 {
+			t.Fatalf("releases = %d, want 0 (the fenced outcome is the release)", len(adapter.releases))
+		}
+
+		// The ordinary path settles the abandoned run on its own terms: two
+		// consecutive green observations on the new head.
+		h.world.set(greenObservation("sha-2", "build"))
+		h.reconcile()
+		if got := h.phase(); got != courierv1alpha1.PhaseVerifying {
+			t.Fatalf("phase after the first green observation = %q, want Verifying", got)
+		}
+		h.reconcile()
+		if got := h.phase(); got != courierv1alpha1.PhaseAwaitingReview {
+			t.Fatalf("phase after the settled green observation = %q, want AwaitingReview", got)
+		}
+		h.reconcile()
+		if len(adapter.outcomes) != 1 || len(adapter.releases) != 0 {
+			t.Fatalf("source surface after the terminal settle = %d outcomes/%d releases, want 1/0", len(adapter.outcomes), len(adapter.releases))
+		}
+	})
+
+	// A foreign head across the abandon: the policy was removed while the
+	// observed head is one the run never published — the same failed-closed
+	// classification the loop's own observation would record, and the
+	// ordinary path, not the loop, owns the run from here.
+	t.Run("unsupported", func(t *testing.T) {
+		adapter := &ciparkSource{}
+		h, attemptFence := abandonedWithLiveFence(t, "cipark-abandon-fenced-unsupported", adapter, func(t *testing.T, h *ciparkHarness) {
+			// The recorded head is gone from the world: the observation
+			// reports a head the run never published, so the attempt cannot
+			// be graded a republish and no progress can be consumed either.
+			h.world.set(PRObservation{PR: "42", Head: "sha-9", Checks: []CheckObservation{{Name: "build", State: CheckStatePending}}})
+			removeCIParkPolicy(t, h.laneName)
+		})
+		if attemptFence != adapter.reservations[0].FenceToken {
+			t.Fatalf("repair fence token = %q, want the reserved fence %q", attemptFence, adapter.reservations[0].FenceToken)
+		}
+		if got := h.phase(); got != courierv1alpha1.PhaseVerifying {
+			t.Fatalf("phase after the abandoned foreign head = %q, want Verifying", got)
+		}
+		abandoned := h.run()
+		if abandoned.Status.CISettlement != nil {
+			t.Fatalf("status.ciSettlement = %#v after the abandon, want nil (the delivery cleared it)", abandoned.Status.CISettlement)
+		}
+		if len(adapter.outcomes) != 1 {
+			t.Fatalf("source outcomes = %#v, want exactly one settled fence", adapter.outcomes)
+		}
+		if outcome := adapter.outcomes[0]; outcome.Result != source.CIRepairUnsupported || outcome.Head != "" || outcome.FenceToken != attemptFence {
+			t.Fatalf("delivered outcome = %#v, want the reserved fence settled unsupported with no head", outcome)
+		}
+		if abandoned.Status.CIRepair != nil || abandoned.Status.CIPark != nil || abandoned.Status.CIParkDeferral != nil || abandoned.Status.CIParkRelease != nil {
+			t.Fatalf("run status after the abandon = attempt %#v park %#v deferral %#v release %#v, want all nil", abandoned.Status.CIRepair, abandoned.Status.CIPark, abandoned.Status.CIParkDeferral, abandoned.Status.CIParkRelease)
+		}
+		if len(adapter.releases) != 0 {
+			t.Fatalf("releases = %d, want 0 (the fenced outcome is the release)", len(adapter.releases))
+		}
+		// The delivered settlement never re-fires: a later reconcile, and a
+		// controller restart, re-present nothing.
+		h.reconcile()
+		h.reconciler = h.newReconciler()
+		h.reconcile()
+		if len(adapter.outcomes) != 1 || len(adapter.releases) != 0 {
+			t.Fatalf("source surface after the restart = %d outcomes/%d releases, want 1/0", len(adapter.outcomes), len(adapter.releases))
+		}
+	})
+}
+
+// TestEnvtestCIParkAbandonLookupFailureKeepsTheConversionAtomic pins the
+// abandon's own lookup boundary (#553), mirroring the green settle's: a
+// source lookup that cannot answer the capability question ends nothing —
+// the park, the pending notice, the release record, and the fenced
+// settlement are all unchanged, no half-conversion is persisted — and a
+// later abandon with a working lookup converts the notice into the release
+// exactly once.
+func TestEnvtestCIParkAbandonLookupFailureKeepsTheConversionAtomic(t *testing.T) {
+	if envtestClient == nil {
+		t.Skip("KUBEBUILDER_ASSETS is not set")
+	}
+	adapter := &failingNoticeSource{}
+	h := newCIParkHarness(t, "cipark-abandon-lookup-fails", ciparkPolicy(2), adapter)
+	h.park("sha-1", CheckObservation{Name: "build", State: CheckStatePending})
+	parked := h.run()
+	if parked.Status.CIParkDeferral == nil {
+		t.Fatal("status.ciparkDeferral = nil while the notice keeps failing, want the pending notice")
+	}
+	pendingKey := parked.Status.CIParkDeferral.IdempotencyKey
+	removeCIParkPolicy(t, h.laneName)
+	// A reconciler whose registry no longer names the run's source is how a
+	// source lookup failure reaches the abandon.
+	broken := h.newReconciler()
+	broken.Sources = NewSourceRegistry(map[string]source.Adapter{})
+	if _, err := broken.abandonCIPark(context.Background(), h.run(), PRObservation{PR: "42", Head: "sha-1"}); err == nil {
+		t.Fatal("abandonCIPark with an unresolvable source = nil error, want the lookup error")
+	}
+	// Nothing was persisted: the park and the pending notice are untouched,
+	// no release or settlement record exists, and the run is not ended.
+	half := h.run()
+	if half.Status.CIPark == nil {
+		t.Fatal("status.cipark = nil after the failed lookup, want the park record (no half-conversion)")
+	}
+	if half.Status.CIParkDeferral == nil || half.Status.CIParkDeferral.IdempotencyKey != pendingKey {
+		t.Fatalf("status.ciparkDeferral = %#v after the failed lookup, want the pending notice unchanged (no half-conversion)", half.Status.CIParkDeferral)
+	}
+	if half.Status.CIParkRelease != nil || half.Status.CISettlement != nil {
+		t.Fatalf("records after the failed lookup = release %#v settlement %#v, want neither (no record without the lookup)", half.Status.CIParkRelease, half.Status.CISettlement)
+	}
+	if half.Status.Phase != courierv1alpha1.PhaseVerifying {
+		t.Fatalf("phase after the failed lookup = %q, want Verifying (the abandon did not end the run)", half.Status.Phase)
+	}
+	// With the lookup working again, the abandon converts the notice into
+	// the release exactly once, and the close carries the notice's key.
+	h.reconcile()
+	if got := h.phase(); got != courierv1alpha1.PhaseVerifying {
+		t.Fatalf("phase after the retried abandon = %q, want Verifying (the ordinary path keeps the pending world)", got)
+	}
+	converted := h.run()
+	if converted.Status.CIPark != nil {
+		t.Fatalf("status.cipark = %#v after the retried abandon, want nil (the record's absence fences a re-conversion)", converted.Status.CIPark)
+	}
+	if converted.Status.CIParkDeferral != nil {
+		t.Fatalf("status.ciparkDeferral = %#v after the retried abandon, want nil (converted into the release)", converted.Status.CIParkDeferral)
+	}
+	if converted.Status.CIParkRelease != nil {
+		t.Fatalf("status.ciparkRelease = %#v at the abandon, want nil (the delivery cleared it)", converted.Status.CIParkRelease)
+	}
+	if len(adapter.releases) != 1 {
+		t.Fatalf("releases = %#v, want exactly one close keyed by the pending notice", adapter.releases)
+	}
+	if adapter.releases[0].IdempotencyKey != pendingKey {
+		t.Fatalf("release key = %q, want the pending notice's own key %q", adapter.releases[0].IdempotencyKey, pendingKey)
+	}
+}
+
 // TestEnvtestCIParkWithoutPolicyKeepsTheOrdinaryPath pins the opt-in
 // boundary: a lane that declares no repair policy leaves the run on the
 // ordinary post-publication grading path, with no park record and no
@@ -2303,6 +2983,24 @@ func (s *failingSettlementSource) ReportCIRepair(_ context.Context, item source.
 	s.items = append(s.items, item)
 	s.outcomes = append(s.outcomes, outcome)
 	if s.accepted {
+		return nil
+	}
+	return errors.New("dispatch server: unavailable")
+}
+
+// stubbornCloseSource keeps both park close reports refused: the fenced
+// settlement fails like failingSettlementSource, and the fence-less deferral
+// release fails with an ordinary retryable error until releaseAccepted lets
+// it land. A scenario can pin the postures the two close reports share while
+// each is the only one owed.
+type stubbornCloseSource struct {
+	failingSettlementSource
+	releaseAccepted bool
+}
+
+func (s *stubbornCloseSource) ReleaseCIPark(_ context.Context, _ source.WorkItem, release source.CIParkRelease) error {
+	s.releases = append(s.releases, release)
+	if s.releaseAccepted {
 		return nil
 	}
 	return errors.New("dispatch server: unavailable")
@@ -2642,6 +3340,88 @@ func TestEnvtestCIParkOwedCloseIsNeverReapedAway(t *testing.T) {
 
 	// Past the fresh window the run is reaped on the normal schedule: the
 	// gate held it only while the close was outstanding.
+	now = now.Add(2 * time.Minute)
+	h.reconcileResult()
+	if h.runExists() {
+		t.Fatal("run still present past the retention window, want the reaped run")
+	}
+}
+
+// TestEnvtestCIParkOwedReleaseIsNeverReapedAway pins the same retention gate
+// for the fence-less deferral close: a terminal run that owes only a
+// CIParkRelease — the shape #553's abandon leaves behind — is not reaped while
+// that close is outstanding, and its retention window starts only once the
+// release has landed.
+func TestEnvtestCIParkOwedReleaseIsNeverReapedAway(t *testing.T) {
+	if envtestClient == nil {
+		t.Skip("KUBEBUILDER_ASSETS is not set")
+	}
+	adapter := &stubbornCloseSource{}
+	h := newCIParkHarness(t, "cipark-release-reap", ciparkPolicy(2), adapter)
+	now := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	h.reconciler.Now = func() time.Time { return now }
+	h.reconciler.FailedRetention = time.Minute
+	h.reconciler.TerminalAuditKeep = -1
+	h.closeOwedReview()
+
+	// The run terminalizes owing only the fence-less release: the owed fenced
+	// settlement the harness leaves behind is replaced by the release record
+	// an abandon would have recorded, keyed by the park notice's own key.
+	noticeKey := adapter.parks[0].IdempotencyKey
+	terminal := h.run()
+	terminal.Status.Phase = courierv1alpha1.PhaseFailed
+	terminal.Status.CISettlement = nil
+	terminal.Status.CIParkRelease = &courierv1alpha1.CIParkRelease{Head: "sha-2", IdempotencyKey: noticeKey}
+	if err := envtestClient.Status().Update(context.Background(), terminal); err != nil {
+		t.Fatal(err)
+	}
+	if !lifecycleReportSettled(h.run()) {
+		t.Fatal("lifecycleReported is not settled, want the published report the reap path requires")
+	}
+
+	// The first reconcile of the terminal run: the release is re-presented,
+	// and the retention window never starts while the close is owed.
+	releasesBefore := len(adapter.releases)
+	result := h.reconcileResult()
+	if !h.runExists() {
+		t.Fatal("run deleted while the deferral release was still owed")
+	}
+	if len(adapter.releases) != releasesBefore+1 {
+		t.Fatalf("source deferral releases = %d, want the release re-presented on the reconcile (%d before)", len(adapter.releases), releasesBefore)
+	}
+	if h.run().Status.CIParkRelease == nil {
+		t.Fatal("status.ciparkRelease = nil, want the pending release to stay owed")
+	}
+	if result.RequeueAfter != ciparkSettlementRetryDelay {
+		t.Fatalf("RequeueAfter = %v, want the settlement cadence %v", result.RequeueAfter, ciparkSettlementRetryDelay)
+	}
+
+	// The retention window expires while the release is still owed: the run
+	// survives, and the release is still owed.
+	now = now.Add(2 * time.Minute)
+	releasesBefore = len(adapter.releases)
+	h.reconcileResult()
+	if !h.runExists() {
+		t.Fatal("run deleted while the deferral release was still owed")
+	}
+	if len(adapter.releases) != releasesBefore+1 {
+		t.Fatalf("source deferral releases = %d, want the release re-presented on the reconcile (%d before)", len(adapter.releases), releasesBefore)
+	}
+
+	// The source accepts the release: the record clears, and the retention
+	// window starts from that moment.
+	adapter.releaseAccepted = true
+	h.reconcileResult()
+	delivered := h.run()
+	if delivered.Status.CIParkRelease != nil {
+		t.Fatalf("status.ciparkRelease = %#v after the source accepted the release, want nil", delivered.Status.CIParkRelease)
+	}
+	if !h.runExists() {
+		t.Fatal("run deleted by the first reap-eligible reconcile; the retention window must start instead")
+	}
+
+	// Past the fresh window the run is reaped on the normal schedule: the
+	// gate held it only while the release was outstanding.
 	now = now.Add(2 * time.Minute)
 	h.reconcileResult()
 	if h.runExists() {

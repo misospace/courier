@@ -286,12 +286,20 @@ marker write that fails leaves the observation due, so the cadence fails
 open to observing, never to never observing. A run that still owes a close is
 not reaped while the close is outstanding, because deletion would drop the
 owed close with the object; its retention window starts only once the close
-has landed. A deferral whose opportunity ends without a reservation is released by a
-fence-less close on the same route, keyed by the park notice's own idempotency
-key and recorded as durable intent before it is sent (#534). No reservation
-was granted, so no fence settles it; the close is advisory, and a source with
-no such deferral refuses it moot.
-
+has landed. A deferral whose opportunity ends without a reservation is
+released by a fence-less close on the same route, keyed by the park notice's
+own idempotency key and recorded as durable intent before it is sent (#534):
+no reservation was granted, so no fence settles it, and the close is
+advisory — a source with no such deferral refuses it moot and the record
+drops either way; a reservation that was granted is settled only by its own
+fenced outcome. The same liability is settled when the park loop abandons a
+parked run outright (#553): the observation that takes the run off the loop
+— the lane's ciRepair policy removed, or the pull request no longer
+parkable — settles it in the same write before the ordinary grading path
+decides the outcome, recording the live reservation's fenced outcome when
+the run still carries one and the fence-less close otherwise, and clearing
+the park record either way, so the abandoned park's absence fences a
+re-conversion across the ordinary reconciles that follow.
 
 The coordinator declares its ending in the executor-provided outcome file,
 whose exact path is in the goal. The executor validates the declaration against
