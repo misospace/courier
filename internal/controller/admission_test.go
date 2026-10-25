@@ -467,6 +467,107 @@ func admissionKey(name string) types.NamespacedName {
 	return types.NamespacedName{Name: name, Namespace: admissionNamespace}
 }
 
+// laggingRunCache simulates an informer cache that has not caught up with the
+// API server: every read passes through except CoderRun lists, which serve
+// the snapshot pinned when the cache was built, for every list option. It is
+// the capacity-admission stand-in for relist lag (#548); the CI-repair
+// reacquisition test shares it. All tests using it are single-namespace, so
+// ignoring the namespace option cannot hide a capacity-consuming run.
+type laggingRunCache struct {
+	client.Client
+	snapshot []courierv1alpha1.CoderRun
+}
+
+func newLaggingRunCache(ctx context.Context, t *testing.T, live client.Client) *laggingRunCache {
+	t.Helper()
+	var runs courierv1alpha1.CoderRunList
+	if err := live.List(ctx, &runs); err != nil {
+		t.Fatalf("pin lagging cache snapshot: %v", err)
+	}
+	return &laggingRunCache{Client: live, snapshot: runs.Items}
+}
+
+func (l *laggingRunCache) List(ctx context.Context, list client.ObjectList, opts ...client.ListOption) error {
+	if runs, ok := list.(*courierv1alpha1.CoderRunList); ok {
+		runs.Items = make([]courierv1alpha1.CoderRun, 0, len(l.snapshot))
+		for i := range l.snapshot {
+			runs.Items = append(runs.Items, *l.snapshot[i].DeepCopy())
+		}
+		return nil
+	}
+	return l.Client.List(ctx, list, opts...)
+}
+
+// TestReconcileAdmissionCountsLiveReaderNotLaggingCache is the #548
+// admission-side regression: run "first" claims the final slot of a
+// concurrency-1 lane and the informer has not caught up when run "second"
+// reconciles. The admitted count must come from the uncached reader, so
+// "second" waits on a bounded requeue instead of oversubscribing the lane —
+// and is admitted normally once the slot is genuinely free.
+func TestReconcileAdmissionCountsLiveReaderNotLaggingCache(t *testing.T) {
+	ctx := context.Background()
+	live := admissionClient(t,
+		admissionLane("local", 1),
+		admissionRun("first", "local", courierv1alpha1.PhasePending),
+		admissionRun("second", "local", courierv1alpha1.PhasePending),
+	)
+	cached := newLaggingRunCache(ctx, t, live)
+	reconciler := admissionReconciler(cached)
+	reconciler.APIReader = live
+
+	if _, err := reconciler.Reconcile(ctx, admissionRequest("first")); err != nil {
+		t.Fatalf("Reconcile() error = %v", err)
+	}
+	var first courierv1alpha1.CoderRun
+	if err := live.Get(ctx, admissionKey("first"), &first); err != nil {
+		t.Fatalf("get first run: %v", err)
+	}
+	if first.Status.Phase != courierv1alpha1.PhaseClaimed {
+		t.Fatalf("first phase = %q, want Claimed", first.Status.Phase)
+	}
+
+	// The lag is real: the cached view still shows the slot free, so a
+	// capacity count through the cached client would admit the second run.
+	var stale courierv1alpha1.CoderRunList
+	if err := cached.List(ctx, &stale); err != nil {
+		t.Fatalf("lagging cached list: %v", err)
+	}
+	if got := admittedCount(stale.Items, "local"); got != 0 {
+		t.Fatalf("lagging cache admittedCount = %d, want 0; the test must model a cache that has not caught up", got)
+	}
+
+	result, err := reconciler.Reconcile(ctx, admissionRequest("second"))
+	if err != nil {
+		t.Fatalf("Reconcile() error = %v", err)
+	}
+	if result.RequeueAfter != capacityRequeueDelay {
+		t.Fatalf("RequeueAfter = %v, want %v; the lane-full wait must stay bounded", result.RequeueAfter, capacityRequeueDelay)
+	}
+	var second courierv1alpha1.CoderRun
+	if err := live.Get(ctx, admissionKey("second"), &second); err != nil {
+		t.Fatalf("get second run: %v", err)
+	}
+	if second.Status.Phase != courierv1alpha1.PhasePending {
+		t.Fatalf("second phase = %q, want Pending; a lagging cache must not admit onto a full concurrency-1 lane", second.Status.Phase)
+	}
+
+	// Once the slot is genuinely free the withheld admission proceeds: the
+	// live count bounds the lane without leaking the slot.
+	first.Status.Phase = courierv1alpha1.PhaseVerifying
+	if err := live.Status().Update(ctx, &first); err != nil {
+		t.Fatalf("release first run's slot: %v", err)
+	}
+	if _, err := reconciler.Reconcile(ctx, admissionRequest("second")); err != nil {
+		t.Fatalf("Reconcile() after the slot freed: %v", err)
+	}
+	if err := live.Get(ctx, admissionKey("second"), &second); err != nil {
+		t.Fatalf("get second run: %v", err)
+	}
+	if second.Status.Phase != courierv1alpha1.PhaseClaimed {
+		t.Fatalf("second phase after the slot freed = %q, want Claimed", second.Status.Phase)
+	}
+}
+
 func admissionRequest(name string) ctrl.Request {
 	return ctrl.Request{NamespacedName: admissionKey(name)}
 }
