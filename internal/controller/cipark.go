@@ -852,23 +852,29 @@ func (r *CoderRunReconciler) finishCIPark(ctx context.Context, run *courierv1alp
 //
 // Both conversions are one write: the intent the source is owed is recorded,
 // the pending notice a late acceptance would defer against nothing is
-// cleared with it, and the park record is cleared in the same patch rather
-// than annotated with an outcome. That clearance is also the fire-once
-// fence — the conversion happens while the run may still be Verifying for
-// several more ordinary reconciles (the two-consecutive-green settle is
-// still counting, the pre-dispatch hooks still retry pending reports), and
-// each of them walks the same bail-out again, so the record's absence keeps
-// every later entry a no-op instead of a second conversion on every poll;
-// clearing it retires the park's attempt account with the loop. Neither
-// ending ever waits on the source: an undelivered report stays durable
-// retry intent, re-presented by the pre-dispatch hook on later reconciles —
-// including reconciles while the run is still in Verifying.
+// cleared with it, the attempt context that ended with the park dies with it,
+// and the park record is cleared in the same patch rather than annotated with
+// an outcome. That clearance is also the fire-once fence — the conversion
+// happens while the run may still be Verifying for several more ordinary
+// reconciles (the two-consecutive-green settle is still counting, the
+// pre-dispatch hooks still retry pending reports), and each of them walks the
+// same bail-out again, so the record's absence keeps every later entry a
+// no-op instead of a second conversion on every poll; clearing it retires the
+// park's attempt account with the loop. Neither ending ever waits on the
+// source: an undelivered report stays durable retry intent, re-presented by
+// the pre-dispatch hook on later reconciles — including reconciles while the
+// run is still in Verifying.
 func (r *CoderRunReconciler) abandonCIPark(ctx context.Context, run *courierv1alpha1.CoderRun, observation PRObservation) (ctrl.Result, error) {
-	if run.Status.CIPark == nil {
-		return ctrl.Result{}, nil
-	}
+	// The live fence is read before the park record's absence ends the
+	// abandon: a granted reservation is settled even when the park record
+	// is gone, because the fence is the reservation's own and the armed
+	// branch settles it without the park record. A reservation is never
+	// left unsettled.
 	if attempt := run.Status.CIRepair; attempt != nil && attempt.FenceToken != "" {
 		return r.abandonFencedCIPark(ctx, run, attempt, observation)
+	}
+	if run.Status.CIPark == nil {
+		return ctrl.Result{}, nil
 	}
 	before := run.DeepCopy()
 	// The close is recorded first, while the park record still carries the
@@ -876,11 +882,33 @@ func (r *CoderRunReconciler) abandonCIPark(ctx context.Context, run *courierv1al
 	if _, err := r.recordCIParkRelease(run); err != nil {
 		return ctrl.Result{}, err
 	}
+	if run.Status.CISettlement != nil && run.Status.CISettlement.IdempotencyKey == "" &&
+		run.Status.CIPark != nil && run.Status.CIPark.Attempts > 0 {
+		// A settlement record written by an older controller carries no
+		// idempotency key: its delivery derives the key from the park
+		// account, and the abandon is the last moment that account exists.
+		// The missing key is adopted here — exactly the key the older
+		// controller derived at delivery time from the same attempt account.
+		// Without it the record is dropped instead of replayed: the delivery
+		// finds no account to derive a key from, reports nothing, and the
+		// settlement is silently lost with the source-side reservation it
+		// answers. An account that never consumed an attempt derives no key
+		// either — the older controller reported nothing for it — so no key
+		// is adopted here: a key it never used would be a fresh keyspace.
+		run.Status.CISettlement.IdempotencyKey = ciparkRepairKey(run, run.Status.CIPark.Attempts)
+	}
 	if run.Status.CIParkDeferral != nil {
 		// The opportunity the pending notice described is over with the
 		// park: the notice is cleared in the same write that records the
 		// release intent the fence-less close realizes, as on every finish.
 		run.Status.CIParkDeferral = nil
+	}
+	if run.Status.CIRepair != nil {
+		// The attempt ended with the park. Its context is cleared in the
+		// same write as the release intent and the park record, so a restart
+		// cannot leave a stale context that reads as an attempt still in
+		// flight.
+		run.Status.CIRepair = nil
 	}
 	// The record's absence is what fences the next abandon against the
 	// ordinary reconciles that follow while the run is still Verifying; it

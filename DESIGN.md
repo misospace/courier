@@ -298,8 +298,8 @@ parked run outright (#553): the observation that takes the run off the loop
 parkable — settles it in the same write before the ordinary grading path
 decides the outcome, recording the live reservation's fenced outcome when
 the run still carries one and the fence-less close otherwise, and clearing
-the park record either way, so the abandoned park's absence fences a
-re-conversion across the ordinary reconciles that follow.
+the park record and the attempt context either way, so the abandoned park's
+absence fences a re-conversion across the ordinary reconciles that follow.
 
 The coordinator declares its ending in the executor-provided outcome file,
 whose exact path is in the goal. The executor validates the declaration against
@@ -1857,7 +1857,7 @@ configured mechanical checks, and their bounded log evidence. Both are
 operator-owned — the harness never writes them — and the repair context
 outlives a relaunch, so a coordinator that restarts mid-attempt still finds the
 repair goal it needs; the operator clears it once that attempt has been
-observed.
+observed, or once the park that carried it ends (#553).
 
 ### `LaneProfile`
 

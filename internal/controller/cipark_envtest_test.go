@@ -1104,6 +1104,26 @@ func (s *flakySettlementSource) ReportCIRepair(ctx context.Context, item source.
 	return nil
 }
 
+// refusingSettlementSource models a source that refuses the first settlement
+// report outright: the outcome is not committed and the record stays pending
+// on the run. That is the state a settlement record is in when the park
+// account it derives its key from is about to disappear — the record outlives
+// the account, and every later report is accepted.
+type refusingSettlementSource struct {
+	ciparkSource
+	firstReportRefused bool
+}
+
+func (s *refusingSettlementSource) ReportCIRepair(_ context.Context, item source.WorkItem, outcome source.CIRepairOutcome) error {
+	s.items = append(s.items, item)
+	if !s.firstReportRefused {
+		s.firstReportRefused = true
+		return errors.New("dispatch server: report refused")
+	}
+	s.outcomes = append(s.outcomes, outcome)
+	return nil
+}
+
 // TestEnvtestCIParkLostSettlementReplays pins the durable settlement: a
 // repair outcome whose report is lost — with the response lost after the
 // source committed it, or the report lost before it committed — leaves
@@ -2795,6 +2815,209 @@ func TestEnvtestCIParkAbandonedParkWithLiveFenceSettlesTheReservation(t *testing
 			t.Fatalf("source surface after the restart = %d outcomes/%d releases, want 1/0", len(adapter.outcomes), len(adapter.releases))
 		}
 	})
+}
+
+// TestEnvtestCIParkAbandonedParkClearsTheStaleAttemptContext pins the
+// fence-less arm's attempt context: the attempt ended with the park, so its
+// context dies in the same write that records the release intent and clears
+// the park record. A stale context left behind reads as an attempt still in
+// flight — and the executor renders a repair contract from it on a later
+// coordinator resume — so the restart after the abandon must find no attempt
+// at all.
+func TestEnvtestCIParkAbandonedParkClearsTheStaleAttemptContext(t *testing.T) {
+	if envtestClient == nil {
+		t.Skip("KUBEBUILDER_ASSETS is not set")
+	}
+	adapter := &ciparkSource{}
+	h := newCIParkHarness(t, "cipark-abandon-stale-attempt", ciparkPolicy(2), adapter)
+	h.park("sha-1", CheckObservation{Name: "build", State: CheckStatePending})
+	if len(adapter.parks) != 1 {
+		t.Fatalf("park notices = %#v, want exactly one delivered notice", adapter.parks)
+	}
+	// A stale attempt context: it names the parked head and the attempt it
+	// belongs to, and it carries no fence — no reservation was granted, so
+	// the fence-less arm owns the abandon.
+	stale := h.run()
+	stale.Status.CIRepair = &courierv1alpha1.CIRepairContext{
+		Head:         "sha-1",
+		Attempt:      1,
+		FailedChecks: []string{"build"},
+		MaxAttempts:  2,
+	}
+	if err := envtestClient.Status().Update(context.Background(), stale); err != nil {
+		t.Fatal(err)
+	}
+	removeCIParkPolicy(t, h.laneName)
+	h.reconcile()
+	abandoned := h.run()
+	if abandoned.Status.CIRepair != nil {
+		t.Fatalf("status.ciRepair = %#v after the abandon, want nil (the attempt ended with the park)", abandoned.Status.CIRepair)
+	}
+	if abandoned.Status.CIPark != nil {
+		t.Fatalf("status.cipark = %#v after the abandon, want nil (the record's absence fences a re-conversion)", abandoned.Status.CIPark)
+	}
+	// The fence-less close is still what the park owed the source.
+	if len(adapter.releases) != 1 {
+		t.Fatalf("releases = %#v, want exactly one close for the abandoned park", adapter.releases)
+	}
+	if adapter.releases[0].IdempotencyKey != adapter.parks[0].IdempotencyKey {
+		t.Fatalf("close key = %q, want the park notice's own key %q", adapter.releases[0].IdempotencyKey, adapter.parks[0].IdempotencyKey)
+	}
+	// A restart reads the same cleared context: the run carries no attempt a
+	// resumed coordinator could render a repair contract from.
+	h.reconciler = h.newReconciler()
+	h.reconcile()
+	if got := h.run().Status.CIRepair; got != nil {
+		t.Fatalf("status.ciRepair = %#v after the restart, want nil (no attempt is in flight)", got)
+	}
+}
+
+// TestEnvtestCIParkAbandonedParkAdoptsTheLegacySettlementKey pins the
+// fence-less arm's adoption of a legacy settlement key: a settlement record
+// written by an older controller carries no idempotency key, because its
+// delivery derived the key from the park account — and the abandon is the
+// last moment that account exists. The key is adopted from the very account
+// the older controller would have derived it from, so the settlement is
+// replayed to the source instead of being dropped as delivered, and the
+// source-side reservation it answers is settled.
+func TestEnvtestCIParkAbandonedParkAdoptsTheLegacySettlementKey(t *testing.T) {
+	if envtestClient == nil {
+		t.Skip("KUBEBUILDER_ASSETS is not set")
+	}
+	adapter := &refusingSettlementSource{}
+	h := newCIParkHarness(t, "cipark-abandon-legacy-key", ciparkPolicy(2), adapter)
+	h.park("sha-1", CheckObservation{Name: "build", State: CheckStatePending})
+	h.settleFailure("sha-1", "build")
+	// The settled failure woke the run for one fence-backed repair.
+	resumed := h.run()
+	if resumed.Status.CIRepair == nil || resumed.Status.CIRepair.FenceToken == "" {
+		t.Fatalf("repair context after the resume = %#v, want the attempt and the fence the reservation granted", resumed.Status.CIRepair)
+	}
+	if resumed.Status.CIPark == nil || resumed.Status.CIPark.Attempts != 1 {
+		t.Fatalf("park account = %#v, want one consumed attempt", resumed.Status.CIPark)
+	}
+	attemptFence := resumed.Status.CIRepair.FenceToken
+	if attemptFence != adapter.reservations[0].FenceToken {
+		t.Fatalf("repair fence token = %q, want the reserved fence %q", attemptFence, adapter.reservations[0].FenceToken)
+	}
+	// The resumed coordinator runs and exits; the phase write carries the
+	// attempt context across untouched.
+	h.reconcile()
+	h.reconcile()
+	if got := h.phase(); got != courierv1alpha1.PhaseVerifying {
+		t.Fatalf("phase after the resumed coordinator exited = %q, want Verifying", got)
+	}
+	// An older controller wrote the settlement: the outcome is on the run and
+	// the attempt is over — its context is gone — but the record carries no
+	// idempotency key, because the older controller derived the key from the
+	// park account at delivery time.
+	legacy := h.run()
+	legacy.Status.CIRepair = nil
+	legacy.Status.CISettlement = &courierv1alpha1.CISettlement{
+		FenceToken: attemptFence,
+		Result:     courierv1alpha1.CIParkOutcomeExhausted,
+	}
+	if err := envtestClient.Status().Update(context.Background(), legacy); err != nil {
+		t.Fatal(err)
+	}
+	removeCIParkPolicy(t, h.laneName)
+	// A calm pending world, so the ordinary path the abandon hands to settles
+	// nothing in the same reconcile.
+	h.world.set(PRObservation{PR: "42", Head: "sha-1", Checks: []CheckObservation{{Name: "build", State: CheckStatePending}}})
+	h.reconcile()
+	// The source refused the report, so the record is still pending — and the
+	// park account it would be derived from is gone with the abandoned park.
+	abandoned := h.run()
+	if abandoned.Status.CIPark != nil {
+		t.Fatalf("status.cipark = %#v after the abandon, want nil (the record's absence fences a re-conversion)", abandoned.Status.CIPark)
+	}
+	pending := abandoned.Status.CISettlement
+	if pending == nil {
+		t.Fatal("status.ciSettlement = nil after the abandon, want the pending settlement (the source refused its report)")
+	}
+	wantKey := ciparkRepairKey(abandoned, 1)
+	if pending.IdempotencyKey != wantKey {
+		t.Fatalf("pending settlement idempotency key = %q, want the key adopted from the park account %q", pending.IdempotencyKey, wantKey)
+	}
+	if len(adapter.outcomes) != 0 {
+		t.Fatalf("source outcomes = %#v, want none (the source refused the report)", adapter.outcomes)
+	}
+	// The next reconcile replays the settlement with the adopted key: the
+	// record is delivered, not dropped, and the reservation it answers is
+	// settled at the source.
+	h.reconcile()
+	if len(adapter.outcomes) != 1 {
+		t.Fatalf("source outcomes = %#v, want exactly one settled fence (the settlement was replayed, not dropped)", adapter.outcomes)
+	}
+	outcome := adapter.outcomes[0]
+	if outcome.FenceToken != attemptFence {
+		t.Fatalf("delivered fence = %q, want the reserved fence %q", outcome.FenceToken, attemptFence)
+	}
+	if outcome.IdempotencyKey != wantKey {
+		t.Fatalf("delivered idempotency key = %q, want the adopted key %q", outcome.IdempotencyKey, wantKey)
+	}
+	if outcome.Result != source.CIRepairExhausted {
+		t.Fatalf("delivered result = %q, want %q", outcome.Result, source.CIRepairExhausted)
+	}
+	if got := h.run().Status.CISettlement; got != nil {
+		t.Fatalf("status.ciSettlement = %#v after the delivery, want nil (the clear is the proof of delivery)", got)
+	}
+}
+
+// TestEnvtestCIParkAbandonedParkSettlesAFenceWithoutAParkRecord pins the
+// abandon's armed branch when the park record is gone: a run that still
+// carries a granted reservation is settled by the fenced outcome anyway, so
+// a reservation is never left unsettled. The park record's absence ends the
+// fence-less arm only — the live fence is read first.
+func TestEnvtestCIParkAbandonedParkSettlesAFenceWithoutAParkRecord(t *testing.T) {
+	if envtestClient == nil {
+		t.Skip("KUBEBUILDER_ASSETS is not set")
+	}
+	adapter := &ciparkSource{}
+	h := newCIParkHarness(t, "cipark-abandon-fence-no-park", ciparkPolicy(2), adapter)
+	h.park("sha-1", CheckObservation{Name: "build", State: CheckStatePending})
+	parked := h.run()
+	// The park record is gone, but the attempt's granted fence is not: the
+	// reservation the source holds is still outstanding.
+	fence := ciparkFenceToken(parked, 1)
+	parked.Status.CIPark = nil
+	parked.Status.CIRepair = &courierv1alpha1.CIRepairContext{
+		Head:        "sha-1",
+		Attempt:     1,
+		FenceToken:  fence,
+		MaxAttempts: 2,
+	}
+	if err := envtestClient.Status().Update(context.Background(), parked); err != nil {
+		t.Fatal(err)
+	}
+	removeCIParkPolicy(t, h.laneName)
+	h.world.set(PRObservation{PR: "42", Head: "sha-1", Checks: []CheckObservation{{Name: "build", State: CheckStatePending}}})
+	h.reconcile()
+	abandoned := h.run()
+	if abandoned.Status.CIRepair != nil {
+		t.Fatalf("status.ciRepair = %#v after the abandon, want nil (the reservation is settled)", abandoned.Status.CIRepair)
+	}
+	if len(adapter.outcomes) != 1 {
+		t.Fatalf("source outcomes = %#v, want exactly one settled fence", adapter.outcomes)
+	}
+	outcome := adapter.outcomes[0]
+	if outcome.FenceToken != fence {
+		t.Fatalf("delivered fence = %q, want the granted fence %q", outcome.FenceToken, fence)
+	}
+	if outcome.IdempotencyKey != ciparkRepairKey(abandoned, 1) {
+		t.Fatalf("delivered idempotency key = %q, want the attempt's own key %q", outcome.IdempotencyKey, ciparkRepairKey(abandoned, 1))
+	}
+	if outcome.Result != source.CIRepairExhausted {
+		t.Fatalf("delivered result = %q, want %q", outcome.Result, source.CIRepairExhausted)
+	}
+	if got := abandoned.Status.CISettlement; got != nil {
+		t.Fatalf("status.ciSettlement = %#v after the delivery, want nil (the clear is the proof of delivery)", got)
+	}
+	// A granted reservation is never released fence-less: the fenced outcome
+	// is the release.
+	if len(adapter.releases) != 0 {
+		t.Fatalf("releases = %d, want 0 (the fenced outcome releases the deferral)", len(adapter.releases))
+	}
 }
 
 // TestEnvtestCIParkAbandonLookupFailureKeepsTheConversionAtomic pins the
