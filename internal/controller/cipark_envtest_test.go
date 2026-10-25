@@ -2674,6 +2674,9 @@ func TestEnvtestCIParkAbandonedParkWithLiveFenceSettlesTheReservation(t *testing
 		if pending.Status.CISettlement.FenceToken != attemptFence {
 			t.Fatalf("pending settlement fence = %q, want the reserved fence %q", pending.Status.CISettlement.FenceToken, attemptFence)
 		}
+		if pending.Status.CISettlement.IdempotencyKey != adapter.reservations[0].IdempotencyKey {
+			t.Fatalf("pending settlement idempotency key = %q, want the reservation key %q", pending.Status.CISettlement.IdempotencyKey, adapter.reservations[0].IdempotencyKey)
+		}
 		if got := h.phase(); got != courierv1alpha1.PhaseVerifying {
 			t.Fatalf("phase after the lost settlement response = %q, want Verifying (the ending never waits on the report)", got)
 		}

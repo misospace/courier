@@ -817,8 +817,9 @@ func (r *CoderRunReconciler) releaseClaim(ctx context.Context, run *courierv1alp
 func (r *CoderRunReconciler) settleCIRollback(run *courierv1alpha1.CoderRun) {
 	if run.Status.CIRepair != nil && run.Status.CIRepair.FenceToken != "" {
 		run.Status.CISettlement = &courierv1alpha1.CISettlement{
-			FenceToken: run.Status.CIRepair.FenceToken,
-			Result:     courierv1alpha1.CIParkOutcomeUnsupported,
+			FenceToken:     run.Status.CIRepair.FenceToken,
+			IdempotencyKey: ciparkRepairKey(run, run.Status.CIRepair.Attempt),
+			Result:         courierv1alpha1.CIParkOutcomeUnsupported,
 		}
 	}
 	run.Status.CIRepair = nil

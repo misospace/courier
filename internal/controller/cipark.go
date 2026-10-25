@@ -322,20 +322,6 @@ func ciparkRepairKey(run *courierv1alpha1.CoderRun, attempt int) string {
 	return ciparkDigest(string(run.UID), "repair-key", strconv.Itoa(attempt))
 }
 
-// ciparkSettleKey derives the idempotency key of a fenced outcome report
-// from the fence token the report presents. The fence is the attempt's own
-// identity — it travels inside the recorded settlement, unlike the park
-// record the attempt count used to be read from, so a settlement recorded by
-// an ending that clears the park against a granted reservation can still be
-// re-presented byte-identical from the record alone. The reserve call's key
-// stays derived from run and attempt; nothing couples the two, and the
-// source contract treats them as independent transitions with independent
-// keys. A distinct digest salt keeps the settle key out of every other
-// derivation's namespace.
-func ciparkSettleKey(fenceToken string) string {
-	return ciparkDigest("settle", fenceToken)
-}
-
 // ciparkDigest hashes the parts of a derived identifier.
 func ciparkDigest(parts ...string) string {
 	digest := sha256.Sum256([]byte(strings.Join(parts, "\x00")))
@@ -469,9 +455,10 @@ func (r *CoderRunReconciler) observeCIPark(ctx context.Context, run *courierv1al
 		// the fence travels with the record, and a later reconcile
 		// re-presents it until the source accepts it.
 		run.Status.CISettlement = &courierv1alpha1.CISettlement{
-			FenceToken: fenceToken,
-			Result:     courierv1alpha1.CIParkOutcomeRepushed,
-			Head:       head,
+			FenceToken:     fenceToken,
+			IdempotencyKey: ciparkRepairKey(run, attempt.Attempt),
+			Result:         courierv1alpha1.CIParkOutcomeRepushed,
+			Head:           head,
 		}
 		changed = true
 	}
@@ -794,8 +781,9 @@ func (r *CoderRunReconciler) finishCIPark(ctx context.Context, run *courierv1alp
 		// as the outcome, before the report is attempted, is what makes a
 		// lost response durable retry intent rather than a leak.
 		run.Status.CISettlement = &courierv1alpha1.CISettlement{
-			FenceToken: fenceToken,
-			Result:     outcome,
+			FenceToken:     fenceToken,
+			IdempotencyKey: ciparkRepairKey(run, run.Status.CIPark.Attempts),
+			Result:         outcome,
 		}
 		changed = true
 	}
@@ -936,7 +924,10 @@ func (r *CoderRunReconciler) abandonCIPark(ctx context.Context, run *courierv1al
 func (r *CoderRunReconciler) abandonFencedCIPark(ctx context.Context, run *courierv1alpha1.CoderRun, attempt *courierv1alpha1.CIRepairContext, observation PRObservation) (ctrl.Result, error) {
 	before := run.DeepCopy()
 	head, attributable := publishedHead(run, observation.Head)
-	settlement := &courierv1alpha1.CISettlement{FenceToken: attempt.FenceToken}
+	settlement := &courierv1alpha1.CISettlement{
+		FenceToken:     attempt.FenceToken,
+		IdempotencyKey: ciparkRepairKey(run, attempt.Attempt),
+	}
 	switch {
 	case attributable && head != attempt.Head:
 		settlement.Result = courierv1alpha1.CIParkOutcomeRepushed
@@ -1084,9 +1075,23 @@ func (r *CoderRunReconciler) reserveCIRepair(ctx context.Context, run *courierv1
 // The outcome presents the token the source issued for the attempt. An
 // attempt that no source fenced carries no token, and nothing is reported:
 // there is no grant to answer.
-func (r *CoderRunReconciler) reportCIRepair(ctx context.Context, run *courierv1alpha1.CoderRun, pr, head string, result source.CIRepairResult, fenceToken string) error {
+func (r *CoderRunReconciler) reportCIRepair(ctx context.Context, run *courierv1alpha1.CoderRun, pr, head string, result source.CIRepairResult, fenceToken, idempotencyKey string) error {
 	if fenceToken == "" {
 		return nil
+	}
+	// New settlement records carry the reservation key explicitly so their
+	// replay does not depend on CIRepair/CIPark records that an ending may
+	// clear. Records written by an older controller did not carry the key;
+	// preserve their old behavior while the park account is still available.
+	if idempotencyKey == "" {
+		attempts := 0
+		if run.Status.CIPark != nil {
+			attempts = run.Status.CIPark.Attempts
+		}
+		if attempts == 0 {
+			return nil
+		}
+		idempotencyKey = ciparkRepairKey(run, attempts)
 	}
 	adapter, item, err := r.adapterAndWorkItem(run)
 	if err != nil {
@@ -1098,7 +1103,7 @@ func (r *CoderRunReconciler) reportCIRepair(ctx context.Context, run *courierv1a
 	}
 	report := source.CIRepairOutcome{
 		FenceToken:     fenceToken,
-		IdempotencyKey: ciparkSettleKey(fenceToken),
+		IdempotencyKey: idempotencyKey,
 		PR:             pr,
 		Head:           head,
 		Result:         result,
@@ -1118,7 +1123,7 @@ func (r *CoderRunReconciler) deliverCISettlement(ctx context.Context, run *couri
 	if record == nil {
 		return true, nil
 	}
-	err := r.reportCIRepair(ctx, run, run.Status.PR, record.Head, source.CIRepairResult(record.Result), record.FenceToken)
+	err := r.reportCIRepair(ctx, run, run.Status.PR, record.Head, source.CIRepairResult(record.Result), record.FenceToken, record.IdempotencyKey)
 	if err != nil {
 		if errors.Is(err, source.ErrUnsupportedCIPark) {
 			// The source cannot represent the park/repair lifecycle for this
