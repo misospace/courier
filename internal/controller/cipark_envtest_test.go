@@ -3226,6 +3226,154 @@ func TestEnvtestCIParkAbandonLookupFailureKeepsTheConversionAtomic(t *testing.T)
 	}
 }
 
+// TestEnvtestCIParkMergedBeforeTheLoopSettlesTheDeferral pins the merged
+// branch's own conversion (#555): the merged check in observeVerifying runs
+// before the park loop, so a parked run whose pull request is reported merged
+// terminalizes Done on a path every loop bail-out conversion was written to
+// guard. The abandon runs there exactly as it does on the bail-outs — the
+// accepted deferral is closed fence-less, a notice the source never accepted
+// is converted into the advisory close without fabricating a settlement, and
+// a live repair fence settles its reservation instead of stranding it against
+// a run that is already Done.
+func TestEnvtestCIParkMergedBeforeTheLoopSettlesTheDeferral(t *testing.T) {
+	if envtestClient == nil {
+		t.Skip("KUBEBUILDER_ASSETS is not set")
+	}
+
+	t.Run("accepted-deferral", func(t *testing.T) {
+		adapter := &ciparkSource{}
+		h := newCIParkHarness(t, "cipark-merged-accepted", ciparkPolicy(2), adapter)
+		h.park("sha-1", CheckObservation{Name: "build", State: CheckStatePending})
+		if len(adapter.parks) != 1 {
+			t.Fatalf("park notices = %#v, want exactly one delivered notice", adapter.parks)
+		}
+		if h.run().Status.CIParkDeferral != nil {
+			t.Fatal("status.ciparkDeferral = non-nil after the accepted notice, want nil")
+		}
+		// The merge arrives while the run is parked: the merged branch owns
+		// the observation before the loop ever sees it.
+		h.world.set(PRObservation{PR: "42", Head: "sha-1", Merged: true})
+		h.reconcile()
+		if got := h.phase(); got != courierv1alpha1.PhaseDone {
+			t.Fatalf("phase after the merged observation = %q, want Done", got)
+		}
+		// The reconcile after the terminal transition resolves the source
+		// work and starts the retention window.
+		h.reconcile()
+		done := h.run()
+		if _, ok := doneAtMarker(done); !ok {
+			t.Fatalf("done-at marker = %#v, want the retention window started on the resolved run", done.Annotations)
+		}
+		// The fence-less close went out keyed by the park notice's own
+		// identity, and the delivery cleared the record that carried it.
+		if len(adapter.releases) != 1 {
+			t.Fatalf("releases = %#v, want exactly one close for the parked run's deferral", adapter.releases)
+		}
+		if adapter.releases[0].IdempotencyKey != adapter.parks[0].IdempotencyKey {
+			t.Fatalf("close key = %q, want the park notice's own key %q", adapter.releases[0].IdempotencyKey, adapter.parks[0].IdempotencyKey)
+		}
+		if head := adapter.releases[0].Head; head != "sha-1" {
+			t.Fatalf("close head = %q, want the parked head sha-1", head)
+		}
+		if done.Status.CIPark != nil || done.Status.CIParkDeferral != nil || done.Status.CIParkRelease != nil || done.Status.CIRepair != nil {
+			t.Fatalf("run status at Done = park %#v deferral %#v release %#v attempt %#v, want all nil", done.Status.CIPark, done.Status.CIParkDeferral, done.Status.CIParkRelease, done.Status.CIRepair)
+		}
+		if done.Status.CISettlement != nil {
+			t.Fatalf("status.ciSettlement = %#v at Done, want nil (no reservation was ever granted)", done.Status.CISettlement)
+		}
+		// The terminal run re-presents nothing.
+		h.reconcile()
+		h.reconciler = h.newReconciler()
+		h.reconcile()
+		if len(adapter.releases) != 1 {
+			t.Fatalf("releases after further reconciles = %d, want exactly one", len(adapter.releases))
+		}
+	})
+
+	t.Run("pending-notice", func(t *testing.T) {
+		adapter := &failingNoticeSource{}
+		h := newCIParkHarness(t, "cipark-merged-pending-notice", ciparkPolicy(2), adapter)
+		h.park("sha-1", CheckObservation{Name: "build", State: CheckStatePending})
+		parked := h.run()
+		if parked.Status.CIParkDeferral == nil {
+			t.Fatal("status.ciparkDeferral = nil while the notice keeps failing, want the pending notice")
+		}
+		pendingKey := parked.Status.CIParkDeferral.IdempotencyKey
+		h.world.set(PRObservation{PR: "42", Head: "sha-1", Merged: true})
+		h.reconcile()
+		if got := h.phase(); got != courierv1alpha1.PhaseDone {
+			t.Fatalf("phase after the merged observation = %q, want Done", got)
+		}
+		done := h.run()
+		if done.Status.CIPark != nil || done.Status.CIParkDeferral != nil || done.Status.CIParkRelease != nil {
+			t.Fatalf("run status at Done = park %#v deferral %#v release %#v, want all nil", done.Status.CIPark, done.Status.CIParkDeferral, done.Status.CIParkRelease)
+		}
+		// The advisory close went out keyed by the never-accepted notice, and
+		// the merged branch records nothing it does not owe: no reservation
+		// was ever granted, so no settlement is fabricated.
+		if len(adapter.releases) != 1 {
+			t.Fatalf("releases = %#v, want exactly one advisory close even though the notice never landed", adapter.releases)
+		}
+		if adapter.releases[0].IdempotencyKey != pendingKey {
+			t.Fatalf("close key = %q, want the pending notice's own key %q", adapter.releases[0].IdempotencyKey, pendingKey)
+		}
+		if len(adapter.parks) != 0 {
+			t.Fatalf("park notices = %d, want 0 (the source never accepted one)", len(adapter.parks))
+		}
+		if len(adapter.outcomes) != 0 || done.Status.CISettlement != nil {
+			t.Fatalf("settlement surface = outcomes %#v record %#v, want none (the merged branch owes no settlement)", adapter.outcomes, done.Status.CISettlement)
+		}
+	})
+
+	t.Run("live-fence", func(t *testing.T) {
+		adapter := &ciparkSource{}
+		h := newCIParkHarness(t, "cipark-merged-live-fence", ciparkPolicy(2), adapter)
+		h.park("sha-1", CheckObservation{Name: "build", State: CheckStatePending})
+		h.settleFailure("sha-1", "build")
+		// The settled failure wakes the run for one repair; the reservation
+		// is fenced.
+		if got := h.phase(); got != courierv1alpha1.PhaseClaimed {
+			t.Fatalf("phase after the settled failure = %q, want Claimed", got)
+		}
+		attemptFence := h.run().Status.CIRepair.FenceToken
+		if attemptFence == "" {
+			t.Fatal("repair fence token = empty after the resume, want the grant the reserve returned")
+		}
+		// The resumed coordinator runs and exits; the fence rides the phase
+		// write into Verifying untouched.
+		h.reconcile()
+		if got := h.phase(); got != courierv1alpha1.PhaseRunning {
+			t.Fatalf("phase after the resumed launch = %q, want Running", got)
+		}
+		h.reconcile()
+		if got := h.phase(); got != courierv1alpha1.PhaseVerifying {
+			t.Fatalf("phase after the resumed coordinator exited = %q, want Verifying", got)
+		}
+		// The merge arrives while the fence is still live.
+		h.world.set(PRObservation{PR: "42", Head: "sha-1", Merged: true})
+		h.reconcile()
+		if got := h.phase(); got != courierv1alpha1.PhaseDone {
+			t.Fatalf("phase after the merged observation = %q, want Done", got)
+		}
+		done := h.run()
+		// The armed branch settled the reservation: the mapped no-progress
+		// outcome rides the fence, and the record's absence is the proof of
+		// delivery. No fence-less close is recorded on its behalf.
+		if len(adapter.outcomes) != 1 {
+			t.Fatalf("source outcomes = %#v, want exactly one settled fence", adapter.outcomes)
+		}
+		if outcome := adapter.outcomes[0]; outcome.Result != source.CIRepairExhausted || outcome.FenceToken != attemptFence || outcome.Head != "" {
+			t.Fatalf("delivered outcome = %#v, want the reserved fence settled exhausted with no head", outcome)
+		}
+		if len(adapter.releases) != 0 {
+			t.Fatalf("releases = %d, want 0 (the fenced outcome releases the deferral)", len(adapter.releases))
+		}
+		if done.Status.CIPark != nil || done.Status.CIParkDeferral != nil || done.Status.CIParkRelease != nil || done.Status.CIRepair != nil || done.Status.CISettlement != nil {
+			t.Fatalf("run status at Done = park %#v deferral %#v release %#v attempt %#v settlement %#v, want all nil", done.Status.CIPark, done.Status.CIParkDeferral, done.Status.CIParkRelease, done.Status.CIRepair, done.Status.CISettlement)
+		}
+	})
+}
+
 // TestEnvtestCIParkWithoutPolicyKeepsTheOrdinaryPath pins the opt-in
 // boundary: a lane that declares no repair policy leaves the run on the
 // ordinary post-publication grading path, with no park record and no

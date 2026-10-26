@@ -309,7 +309,10 @@ parkable — settles it in the same write before the ordinary grading path
 decides the outcome, recording the live reservation's fenced outcome when
 the run still carries one and the fence-less close otherwise, and clearing
 the park record and the attempt context either way, so the abandoned park's
-absence fences a re-conversion across the ordinary reconciles that follow.
+absence fences a re-conversion across the ordinary reconciles that follow. The
+merged observation that terminalizes Done is checked before the loop runs
+(#555), and the same conversion settles the liability there before the run
+terminalizes.
 
 The coordinator declares its ending in the executor-provided outcome file,
 whose exact path is in the goal. The executor validates the declaration against
