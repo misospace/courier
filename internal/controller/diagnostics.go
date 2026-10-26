@@ -116,6 +116,8 @@ func knownTerminalDiagnosticCategory(category courierv1alpha1.TerminalDiagnostic
 		courierv1alpha1.TerminalDiagnosticCategoryCapacityExhaustion,
 		courierv1alpha1.TerminalDiagnosticCategoryProviderUnavailable,
 		courierv1alpha1.TerminalDiagnosticCategoryForgeUnavailable,
+		courierv1alpha1.TerminalDiagnosticCategoryWorkloadFailure,
+		courierv1alpha1.TerminalDiagnosticCategoryInfrastructureFailure,
 		courierv1alpha1.TerminalDiagnosticCategoryUnknown:
 		return true
 	default:
@@ -123,10 +125,37 @@ func knownTerminalDiagnosticCategory(category courierv1alpha1.TerminalDiagnostic
 	}
 }
 
-func classifyTerminalDiagnostic(handoffCategory string, exitCode *int32, outcome string, kubernetesFailure bool) courierv1alpha1.TerminalDiagnosticCategory {
+// categoryForNativeResultKind maps the trusted native terminal result kind
+// onto the durable diagnostic category (#127). The kind is trusted-control
+// evidence — the coordinator's explicit classification of its own ending —
+// so it outranks every exit-code heuristic but not a validated handoff
+// category, which carries finer distinctions on the endings they share.
+func categoryForNativeResultKind(kind courierv1alpha1.NativeResultKind) courierv1alpha1.TerminalDiagnosticCategory {
+	switch kind {
+	case courierv1alpha1.NativeResultNeedsHuman:
+		return courierv1alpha1.TerminalDiagnosticCategoryNeedsDecision
+	case courierv1alpha1.NativeResultBlockedExternal:
+		return courierv1alpha1.TerminalDiagnosticCategoryBlockedExternal
+	case courierv1alpha1.NativeResultCapacityExhausted:
+		return courierv1alpha1.TerminalDiagnosticCategoryCapacityExhaustion
+	case courierv1alpha1.NativeResultWorkloadFailed:
+		return courierv1alpha1.TerminalDiagnosticCategoryWorkloadFailure
+	case courierv1alpha1.NativeResultInfrastructureFailed:
+		return courierv1alpha1.TerminalDiagnosticCategoryInfrastructureFailure
+	default:
+		// published and no_change are successful handoffs and never reach a
+		// failure diagnostic; an empty or unmapped kind classifies nothing.
+		return ""
+	}
+}
+
+func classifyTerminalDiagnostic(handoffCategory string, exitCode *int32, outcome string, kubernetesFailure bool, trustedKind courierv1alpha1.NativeResultKind) courierv1alpha1.TerminalDiagnosticCategory {
 	category := courierv1alpha1.TerminalDiagnosticCategory(strings.TrimSpace(handoffCategory))
 	if category != "" && category != courierv1alpha1.TerminalDiagnosticCategoryUnknown && knownTerminalDiagnosticCategory(category) {
 		return category
+	}
+	if trusted := categoryForNativeResultKind(trustedKind); trusted != "" {
+		return trusted
 	}
 	if kubernetesFailure {
 		return courierv1alpha1.TerminalDiagnosticCategoryKubernetesFailure
@@ -207,6 +236,15 @@ func categoryDiagnosticReason(category courierv1alpha1.TerminalDiagnosticCategor
 		// condition, so the world was never observed; the work is
 		// released for another capacity.
 		return "a forge read could not complete on a transient availability condition; the world was never observed; work released for another capacity"
+	case courierv1alpha1.TerminalDiagnosticCategoryWorkloadFailure:
+		// The trusted native result classified the ending as the work's own
+		// failure (#127): a verdict on the work, never on the infrastructure.
+		return "the coordinator reported a workload failure: a verdict on the work, not the infrastructure"
+	case courierv1alpha1.TerminalDiagnosticCategoryInfrastructureFailure:
+		// The trusted native result classified the ending as an
+		// infrastructure failure (#127): the relaunch/resume case bounded by
+		// the crashloop counter, never a terminal verdict on the work.
+		return "the coordinator reported an infrastructure failure; recovery is a bounded relaunch and resume"
 	case courierv1alpha1.TerminalDiagnosticCategoryExecutorCrash:
 		return "coordinator exited without a valid handoff"
 	case courierv1alpha1.TerminalDiagnosticCategoryUnknown:
@@ -264,8 +302,8 @@ func operatorDiagnosticReason(category courierv1alpha1.TerminalDiagnosticCategor
 	return strings.Join(parts, "; ")
 }
 
-func buildTerminalDiagnostic(now time.Time, exitCode *int32, reasonOverride, outcome, handoffCategory string, kubernetesFailure bool, pod *corev1.Pod) *courierv1alpha1.TerminalDiagnostic {
-	category := classifyTerminalDiagnostic(handoffCategory, exitCode, outcome, kubernetesFailure)
+func buildTerminalDiagnostic(now time.Time, exitCode *int32, reasonOverride, outcome, handoffCategory string, kubernetesFailure bool, pod *corev1.Pod, trustedKind courierv1alpha1.NativeResultKind) *courierv1alpha1.TerminalDiagnostic {
+	category := classifyTerminalDiagnostic(handoffCategory, exitCode, outcome, kubernetesFailure, trustedKind)
 	diagnostic := &courierv1alpha1.TerminalDiagnostic{
 		Category:   category,
 		ExitCode:   exitCode,

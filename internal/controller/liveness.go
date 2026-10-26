@@ -204,7 +204,7 @@ func (r *CoderRunReconciler) checkLiveness(ctx context.Context, run *courierv1al
 						return ctrl.Result{}, true, err
 					}
 				}
-				result, err := r.relaunchAfterInfraLoss(ctx, run, podLostReason, podLostEventReason, buildTerminalDiagnostic(r.clock(), nil, podLostReason, "", "", true, cached))
+				result, err := r.relaunchAfterInfraLoss(ctx, run, podLostReason, podLostEventReason, buildTerminalDiagnostic(r.clock(), nil, podLostReason, "", "", true, cached, ""))
 				return result, true, err
 			}
 			return ctrl.Result{RequeueAfter: observationRequeueDelay}, true, nil
@@ -366,7 +366,7 @@ func (r *CoderRunReconciler) checkLiveness(ctx context.Context, run *courierv1al
 			return ctrl.Result{}, true, err
 		}
 	}
-	result, err := r.relaunchAfterInfraLoss(ctx, run, "", "", buildTerminalDiagnostic(r.clock(), nil, wedgedReapDiagnosticReason, "", "", false, coordinatorPodOf(livePods, run)))
+	result, err := r.relaunchAfterInfraLoss(ctx, run, "", "", buildTerminalDiagnostic(r.clock(), nil, wedgedReapDiagnosticReason, "", "", false, coordinatorPodOf(livePods, run), ""))
 	return result, true, err
 }
 
@@ -619,7 +619,7 @@ func (r *CoderRunReconciler) observeMissingCoordinator(ctx context.Context, run 
 	if len(dead) > 0 {
 		deadPodPtr = &dead[0]
 	}
-	return r.relaunchAfterInfraLoss(ctx, run, podLostReason, podLostEventReason, buildTerminalDiagnostic(r.clock(), nil, podLostReason, "", "", true, deadPodPtr))
+	return r.relaunchAfterInfraLoss(ctx, run, podLostReason, podLostEventReason, buildTerminalDiagnostic(r.clock(), nil, podLostReason, "", "", true, deadPodPtr, ""))
 }
 
 // relaunchAfterInfraLoss returns a run to Claimed so the next reconcile

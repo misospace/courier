@@ -44,6 +44,11 @@ type HarnessPatch struct {
 	// control request the live incarnation served. The writer fences it to a
 	// matching live request on every CAS attempt.
 	ControlRequestAck *courier.ControlRequestAck `json:"controlRequestAck,omitempty"`
+	// TerminalResult persists the trusted native coordinator terminal result
+	// (#127). The writer fences it to the authenticated control incarnation:
+	// a stale incarnation cannot record a result, one incarnation's recorded
+	// result is final, and a replacement incarnation records its own.
+	TerminalResult *courier.NativeResult `json:"terminalResult,omitempty"`
 }
 
 // OperationAddition carries the operation ID (the map key) and the entry.
@@ -92,7 +97,8 @@ func (w *StatusWriter) Write(ctx context.Context, identity StatusIdentity, patch
 		return fmt.Errorf("authenticated status identity is incomplete")
 	}
 	if patch.Checkpoint == nil && patch.Heartbeat == nil && patch.LastCommit == nil &&
-		patch.AddOperation == nil && patch.ClearOperation == "" && !patch.ReconcileOperations && patch.ControlRequestAck == nil {
+		patch.AddOperation == nil && patch.ClearOperation == "" && !patch.ReconcileOperations &&
+		patch.ControlRequestAck == nil && patch.TerminalResult == nil {
 		return fmt.Errorf("empty harness status patch")
 	}
 	// An acknowledgement names the request it acknowledges and carries its
@@ -101,6 +107,18 @@ func (w *StatusWriter) Write(ctx context.Context, identity StatusIdentity, patch
 	// miscategorized as transient availability.
 	if patch.ControlRequestAck != nil && (patch.ControlRequestAck.ID == "" || patch.ControlRequestAck.At.IsZero()) {
 		return fmt.Errorf("control request acknowledgement is malformed")
+	}
+	// A terminal result must carry a known kind, its own time, and the
+	// authenticated control incarnation's UID: the fence that keeps a stale
+	// or foreign writer from recording a result for this run (#127). The
+	// set-once check against the fresh run runs inside the CAS loop below.
+	if patch.TerminalResult != nil {
+		if err := validTerminalResult(patch.TerminalResult); err != nil {
+			return err
+		}
+		if patch.TerminalResult.CoordinatorPodUID != string(identity.ControlPodUID) {
+			return fmt.Errorf("terminal result UID does not match the authenticated control incarnation")
+		}
 	}
 	if patch.LastCommit != nil && validate == nil {
 		return fmt.Errorf("lastCommit requires live-world validation")
@@ -196,6 +214,20 @@ func (w *StatusWriter) Write(ctx context.Context, identity StatusIdentity, patch
 		if patch.ControlRequestAck != nil {
 			run.Status.ControlRequestAck = patch.ControlRequestAck.DeepCopy()
 		}
+		if patch.TerminalResult != nil {
+			// Set-once per incarnation: re-writing the identical result is the
+			// idempotent retry (a lost acknowledgment resolves the same way a
+			// re-added operation does); a different result for the same
+			// incarnation is refused, because one control process cannot
+			// honestly end twice. A replacement incarnation — a different UID
+			// after a relaunch — records its own result over the stale one.
+			if existing := run.Status.NativeResult; existing != nil && existing.CoordinatorPodUID == patch.TerminalResult.CoordinatorPodUID {
+				if !sameTerminalResult(existing, patch.TerminalResult) {
+					return fmt.Errorf("a terminal result is already recorded for this control incarnation")
+				}
+			}
+			run.Status.NativeResult = patch.TerminalResult.DeepCopy()
+		}
 		if patch.ReconcileOperations {
 			run.Status.ActiveOperations = nil
 		}
@@ -256,14 +288,41 @@ func (e *StatusConflictError) Unwrap() error { return e.Err }
 
 // sameOperationEvidence reports whether two records of one operation carry
 // identical evidence. Timestamps compare as instants, not as struct values:
-// a re-acknowledged write may carry a different clock representation of the
-// same second, and refusing it would break the idempotent re-add that
+// a re-acknowledged write may carry a different clock representation of
+// the same second, and refusing it would break the idempotent re-add that
 // resolves an uncertain acknowledgment.
 func sameOperationEvidence(a, b courier.ActiveOperation) bool {
 	return a.BriefID == b.BriefID &&
 		a.CoordinatorPodUID == b.CoordinatorPodUID &&
 		a.WorkerPodUID == b.WorkerPodUID &&
 		a.DispatchedAt.Equal(&b.DispatchedAt)
+}
+
+// validTerminalResult checks one terminal result's structural identity: a
+// known kind, a non-zero timestamp, and a bounded reason (#127).
+func validTerminalResult(result *courier.NativeResult) error {
+	switch result.Kind {
+	case courier.NativeResultPublished, courier.NativeResultNoChange,
+		courier.NativeResultNeedsHuman, courier.NativeResultBlockedExternal,
+		courier.NativeResultCapacityExhausted, courier.NativeResultWorkloadFailed,
+		courier.NativeResultInfrastructureFailed:
+	default:
+		return fmt.Errorf("terminal result kind is malformed")
+	}
+	if result.At.IsZero() {
+		return fmt.Errorf("terminal result carries no time")
+	}
+	if len(result.Reason) > 1024 {
+		return fmt.Errorf("terminal result reason exceeds its bound")
+	}
+	return nil
+}
+
+// sameTerminalResult reports whether two records of one incarnation's
+// terminal result carry identical evidence. Timestamps compare as instants,
+// so the idempotent retry of one write resolves cleanly.
+func sameTerminalResult(a, b *courier.NativeResult) bool {
+	return a.Kind == b.Kind && a.Reason == b.Reason && a.CoordinatorPodUID == b.CoordinatorPodUID && a.At.Equal(&b.At)
 }
 
 // maxActiveOperations bounds the per-run active-operation set. It is a fixed

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"strings"
 	"sync"
@@ -234,6 +235,12 @@ func TestStatusPatchWireContract(t *testing.T) {
 		},
 		ClearOperation:      "shell.b2.bbbb",
 		ReconcileOperations: true,
+		TerminalResult: &courierv1alpha1.NativeResult{
+			Kind:              courierv1alpha1.NativeResultPublished,
+			Reason:            "published through the broker",
+			CoordinatorPodUID: testControlUID,
+			At:                metav1Now(),
+		},
 	}
 	raw, err := json.Marshal(patch)
 	if err != nil {
@@ -256,6 +263,10 @@ func TestStatusPatchWireContract(t *testing.T) {
 	}
 	if decoded.Checkpoint == nil || decoded.Checkpoint.Plan != "plan" || decoded.LastCommit == nil || *decoded.LastCommit != "abc" {
 		t.Fatalf("decoded checkpoint/lastCommit = %#v", decoded.Checkpoint)
+	}
+	if decoded.TerminalResult == nil || decoded.TerminalResult.Kind != courierv1alpha1.NativeResultPublished ||
+		decoded.TerminalResult.CoordinatorPodUID != testControlUID {
+		t.Fatalf("decoded terminal result = %#v, want the fenced published kind", decoded.TerminalResult)
 	}
 }
 
@@ -679,5 +690,162 @@ func delegateChangesScript() []gatewayResponse {
 		)},
 		{body: sse(contentChunk("work done"), finishChunk("stop"))},
 		{body: sse(contentChunk(`{"outcome":"changes"}`), finishChunk("stop"))},
+	}
+}
+
+// TestStatusReporterTerminalResultPersistsBeforeExit proves the trusted
+// native terminal result (#127) rides the same identity-fenced status path:
+// one write carrying the kind, the reason, and the control incarnation's UID,
+// retried through transient availability, and skipped entirely for an unset
+// kind — the legacy shape whose classification stays with the exit code.
+func TestStatusReporterTerminalResultPersistsBeforeExit(t *testing.T) {
+	transport := &recordingStatusTransport{errs: []error{brokerUnavailable()}}
+	reporter := testReporter(transport)
+	result := courierv1alpha1.NativeResult{
+		Kind:              courierv1alpha1.NativeResultInfrastructureFailed,
+		Reason:            "harness: model stream failed",
+		CoordinatorPodUID: testControlUID,
+		At:                metav1Now(),
+	}
+	if err := reporter.TerminalResult(context.Background(), result); err != nil {
+		t.Fatalf("TerminalResult after one transient failure: %v", err)
+	}
+	sent := transport.sent()
+	if len(sent) != 2 {
+		t.Fatalf("writes = %d, want the failed attempt plus the retry", len(sent))
+	}
+	last := sent[len(sent)-1]
+	if last.TerminalResult == nil || last.TerminalResult.Kind != courierv1alpha1.NativeResultInfrastructureFailed ||
+		last.TerminalResult.CoordinatorPodUID != testControlUID {
+		t.Fatalf("persisted result = %#v, want the fenced infrastructure failure", last.TerminalResult)
+	}
+	if last.Heartbeat != nil || last.Checkpoint != nil || last.ControlRequestAck != nil {
+		t.Fatalf("terminal-result patch carried unrelated fields: %#v", last)
+	}
+
+	// An unset kind is the legacy shape: nothing is written, so the absence
+	// of a persisted result never pretends to be one.
+	empty := &recordingStatusTransport{}
+	if err := testReporter(empty).TerminalResult(context.Background(), courierv1alpha1.NativeResult{Reason: "undeclared"}); err != nil {
+		t.Fatalf("TerminalResult with no kind: %v", err)
+	}
+	if got := empty.sent(); len(got) != 0 {
+		t.Fatalf("unset kind wrote %d patches, want none", len(got))
+	}
+}
+
+// TestFinishClassifiesTrustedTerminalResults proves the trusted native
+// terminal result kind (#127) is explicit at every ending: a broker-confirmed
+// publication is published, a blocked world is recoverably blocked-external,
+// a publication transport failure is an infrastructure failure for the
+// operator to relaunch, a declared changes with nothing integrated is a
+// workload failure, and the declared non-work endings keep their routes.
+func TestFinishClassifiesTrustedTerminalResults(t *testing.T) {
+	invocation := testInvocation()
+	tests := []struct {
+		name        string
+		outcome     executor.DeclaredOutcome
+		summary     string
+		publishErr  error
+		wantKind    courierv1alpha1.NativeResultKind
+		wantOutcome executor.DeclaredOutcome
+	}{
+		{
+			name:        "confirmed publication is a published ending",
+			outcome:     executor.OutcomeChanges,
+			summary:     "declared",
+			wantKind:    courierv1alpha1.NativeResultPublished,
+			wantOutcome: executor.OutcomeChanges,
+		},
+		{
+			name:        "a blocked world ends blocked-external",
+			outcome:     executor.OutcomeChanges,
+			summary:     "declared",
+			publishErr:  &PublicationBlockedError{Reason: "foreign tip"},
+			wantKind:    courierv1alpha1.NativeResultBlockedExternal,
+			wantOutcome: executor.OutcomeBlockedExternal,
+		},
+		{
+			name:        "a publication transport failure is an infrastructure failure",
+			outcome:     executor.OutcomeChanges,
+			summary:     "declared",
+			publishErr:  errors.New("broker unreachable"),
+			wantKind:    courierv1alpha1.NativeResultInfrastructureFailed,
+			wantOutcome: executor.OutcomeChanges,
+		},
+		{
+			name:        "declared changes with nothing integrated is a workload failure",
+			outcome:     executor.OutcomeChanges,
+			summary:     "declared",
+			publishErr:  ErrNothingToPublish,
+			wantKind:    courierv1alpha1.NativeResultWorkloadFailed,
+			wantOutcome: "",
+		},
+		{
+			name:        "no_change_needed keeps its route",
+			outcome:     executor.OutcomeNoChangeNeeded,
+			summary:     "evidence",
+			wantKind:    courierv1alpha1.NativeResultNoChange,
+			wantOutcome: executor.OutcomeNoChangeNeeded,
+		},
+		{
+			name:        "needs_decision is a genuine needs-human ending",
+			outcome:     executor.OutcomeNeedsDecision,
+			summary:     "which base?",
+			wantKind:    courierv1alpha1.NativeResultNeedsHuman,
+			wantOutcome: executor.OutcomeNeedsDecision,
+		},
+		{
+			name:        "blocked_external keeps its route",
+			outcome:     executor.OutcomeBlockedExternal,
+			summary:     "missing approval",
+			wantKind:    courierv1alpha1.NativeResultBlockedExternal,
+			wantOutcome: executor.OutcomeBlockedExternal,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			publisher := &mockPublisher{}
+			if tt.publishErr != nil {
+				publisher.publishErr = tt.publishErr
+			}
+			coordinator, err := NewCoordinator(CoordinatorConfig{
+				Gateway:   &Gateway{BaseURL: "http://gateway.invalid"},
+				Bindings:  testBindings(),
+				Publisher: publisher,
+				Status:    NewStatusReporter(&recordingStatusTransport{}, testControlUID, testWorkerUID, 0),
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			result := coordinator.finish(context.Background(), invocation, tt.outcome, tt.summary)
+			if result.Kind != tt.wantKind {
+				t.Fatalf("kind = %q, want %q (result %+v)", result.Kind, tt.wantKind, result)
+			}
+			if result.Outcome != tt.wantOutcome {
+				t.Fatalf("outcome = %q, want %q", result.Outcome, tt.wantOutcome)
+			}
+		})
+	}
+}
+
+// TestAvailabilityEndingClassifiesRecoverableKinds proves the deferred
+// provider-availability endings (#320) carry their trusted kinds: a confirmed
+// allowance exhaustion is capacity-exhausted, any other deferred availability
+// failure is recoverably blocked-external, and a non-deferred failure is
+// never an availability ending.
+func TestAvailabilityEndingClassifiesRecoverableKinds(t *testing.T) {
+	exhausted := &GatewayError{Availability: ProviderAllowanceExhausted, Retryable: true}
+	deferred := &GatewayError{Availability: ProviderTransientRateLimit, Retryable: true}
+	if result, ok := availabilityEnding(exhausted); !ok || result.Kind != courierv1alpha1.NativeResultCapacityExhausted ||
+		result.Outcome != executor.OutcomeCapacityExhausted {
+		t.Fatalf("exhausted ending = (%+v, %v), want capacity exhausted", result, ok)
+	}
+	if result, ok := availabilityEnding(deferred); !ok || result.Kind != courierv1alpha1.NativeResultBlockedExternal ||
+		result.Outcome != executor.OutcomeBlockedExternal {
+		t.Fatalf("deferred ending = (%+v, %v), want blocked external", result, ok)
+	}
+	if _, ok := availabilityEnding(errors.New("not an availability failure")); ok {
+		t.Fatal("an ordinary failure classified as an availability ending")
 	}
 }

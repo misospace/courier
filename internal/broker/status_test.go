@@ -425,3 +425,144 @@ type failingListReader struct {
 func (failingListReader) List(context.Context, client.ObjectList, ...client.ListOption) error {
 	return errors.New("api server unavailable")
 }
+
+// TestStatusWriterAppliesTerminalResult proves the trusted native terminal
+// result (#127) lands on the run's status through the same fenced write as
+// every other harness field: the kind, reason, and incarnation UID persist,
+// and the idempotent retry of the identical write succeeds — a lost
+// acknowledgment must resolve, not deny.
+func TestStatusWriterAppliesTerminalResult(t *testing.T) {
+	w, c, identity := statusFixture(t)
+	result := &courier.NativeResult{
+		Kind:              courier.NativeResultPublished,
+		Reason:            "published through the broker",
+		CoordinatorPodUID: string(identity.ControlPodUID),
+		At:                metav1.NewTime(metav1.Now().Rfc3339Copy().Time),
+	}
+	if err := w.Write(context.Background(), identity, HarnessPatch{TerminalResult: result}, nil); err != nil {
+		t.Fatalf("write terminal result: %v", err)
+	}
+	if err := w.Write(context.Background(), identity, HarnessPatch{TerminalResult: result.DeepCopy()}, nil); err != nil {
+		t.Fatalf("idempotent rewrite of the identical result: %v", err)
+	}
+	var run courier.CoderRun
+	if err := c.Get(context.Background(), client.ObjectKey{Namespace: testNamespace, Name: testRunName}, &run); err != nil {
+		t.Fatal(err)
+	}
+	if run.Status.NativeResult == nil || run.Status.NativeResult.Kind != courier.NativeResultPublished ||
+		run.Status.NativeResult.CoordinatorPodUID != string(identity.ControlPodUID) {
+		t.Fatalf("persisted result = %#v, want the fenced published result", run.Status.NativeResult)
+	}
+}
+
+// TestStatusWriterTerminalResultIsSetOncePerIncarnation proves one control
+// incarnation cannot honestly end twice: a different result for the same
+// incarnation is refused, and the recorded one stands.
+func TestStatusWriterTerminalResultIsSetOncePerIncarnation(t *testing.T) {
+	w, c, identity := statusFixture(t)
+	first := &courier.NativeResult{
+		Kind:              courier.NativeResultPublished,
+		Reason:            "published through the broker",
+		CoordinatorPodUID: string(identity.ControlPodUID),
+		At:                metav1.NewTime(metav1.Now().Rfc3339Copy().Time),
+	}
+	if err := w.Write(context.Background(), identity, HarnessPatch{TerminalResult: first}, nil); err != nil {
+		t.Fatalf("write first result: %v", err)
+	}
+	conflicting := &courier.NativeResult{
+		Kind:              courier.NativeResultWorkloadFailed,
+		Reason:            "undeclared ending",
+		CoordinatorPodUID: string(identity.ControlPodUID),
+		At:                metav1.NewTime(metav1.Now().Rfc3339Copy().Time),
+	}
+	if err := w.Write(context.Background(), identity, HarnessPatch{TerminalResult: conflicting}, nil); err == nil {
+		t.Fatal("conflicting result for the same incarnation was accepted")
+	}
+	var run courier.CoderRun
+	if err := c.Get(context.Background(), client.ObjectKey{Namespace: testNamespace, Name: testRunName}, &run); err != nil {
+		t.Fatal(err)
+	}
+	if run.Status.NativeResult == nil || run.Status.NativeResult.Kind != courier.NativeResultPublished {
+		t.Fatalf("recorded result = %#v, want the first result left standing", run.Status.NativeResult)
+	}
+}
+
+// TestStatusWriterTerminalResultReplacedByNewIncarnation proves a replacement
+// incarnation records its own result over the stale one: the same-name
+// replacement after an infrastructure relaunch must not inherit its
+// predecessor's classification (#127).
+func TestStatusWriterTerminalResultReplacedByNewIncarnation(t *testing.T) {
+	w, c, identity := statusFixture(t)
+	stale := &courier.NativeResult{
+		Kind:              courier.NativeResultInfrastructureFailed,
+		Reason:            "harness: model stream failed",
+		CoordinatorPodUID: string(identity.ControlPodUID),
+		At:                metav1.NewTime(metav1.Now().Rfc3339Copy().Time),
+	}
+	if err := w.Write(context.Background(), identity, HarnessPatch{TerminalResult: stale}, nil); err != nil {
+		t.Fatalf("write stale-incarnation result: %v", err)
+	}
+	// A second control pod for the same run, authenticated as itself.
+	controller := true
+	pod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{
+		Namespace: testNamespace, Name: "control-b", UID: "pod-uid-b",
+		Labels:          map[string]string{"courier.misospace.dev/coderrun": testRunName, "courier.misospace.dev/component": "coordinator"},
+		OwnerReferences: []metav1.OwnerReference{{APIVersion: courier.GroupVersion.String(), Kind: "CoderRun", Name: testRunName, UID: identity.RunUID, Controller: &controller}},
+	}, Spec: corev1.PodSpec{ServiceAccountName: "control-sa"}}
+	if err := c.Create(context.Background(), pod); err != nil {
+		t.Fatal(err)
+	}
+	var run courier.CoderRun
+	if err := c.Get(context.Background(), client.ObjectKey{Namespace: testNamespace, Name: testRunName}, &run); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.Delete(context.Background(), &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Namespace: testNamespace, Name: "control-a"}}); err != nil {
+		t.Fatal(err)
+	}
+	// Re-read the run so its resourceVersion is current for the next write.
+	if err := c.Get(context.Background(), client.ObjectKey{Namespace: testNamespace, Name: testRunName}, &run); err != nil {
+		t.Fatal(err)
+	}
+	fresh := &courier.NativeResult{
+		Kind:              courier.NativeResultPublished,
+		Reason:            "soft stop: published through the broker",
+		CoordinatorPodUID: "pod-uid-b",
+		At:                metav1.NewTime(metav1.Now().Rfc3339Copy().Time),
+	}
+	if err := w.Write(context.Background(), StatusIdentity{RunUID: identity.RunUID, ControlPod: "control-b", ControlPodUID: "pod-uid-b", ControlServiceAccount: "control-sa"}, HarnessPatch{TerminalResult: fresh}, nil); err != nil {
+		t.Fatalf("new incarnation recording its own result: %v", err)
+	}
+	if err := c.Get(context.Background(), client.ObjectKey{Namespace: testNamespace, Name: testRunName}, &run); err != nil {
+		t.Fatal(err)
+	}
+	if run.Status.NativeResult == nil || run.Status.NativeResult.CoordinatorPodUID != "pod-uid-b" ||
+		run.Status.NativeResult.Kind != courier.NativeResultPublished {
+		t.Fatalf("recorded result = %#v, want the new incarnation's result", run.Status.NativeResult)
+	}
+}
+
+// TestStatusWriterFencesTerminalResultIdentity proves the fence: a result
+// attributing itself to any other incarnation is refused, an unknown kind is
+// refused, and a result-less patch shape is still an empty patch.
+func TestStatusWriterFencesTerminalResultIdentity(t *testing.T) {
+	w, _, identity := statusFixture(t)
+	foreign := &courier.NativeResult{
+		Kind:              courier.NativeResultPublished,
+		CoordinatorPodUID: "pod-uid-not-this-incarnation",
+		At:                metav1.NewTime(metav1.Now().Rfc3339Copy().Time),
+	}
+	if err := w.Write(context.Background(), identity, HarnessPatch{TerminalResult: foreign}, nil); err == nil {
+		t.Fatal("a foreign incarnation's terminal result was accepted")
+	}
+	unknown := &courier.NativeResult{
+		Kind:              courier.NativeResultKind("genuinely_done"),
+		CoordinatorPodUID: string(identity.ControlPodUID),
+		At:                metav1.NewTime(metav1.Now().Rfc3339Copy().Time),
+	}
+	if err := w.Write(context.Background(), identity, HarnessPatch{TerminalResult: unknown}, nil); err == nil {
+		t.Fatal("an unknown result kind was accepted")
+	}
+	if err := w.Write(context.Background(), identity, HarnessPatch{TerminalResult: &courier.NativeResult{Kind: courier.NativeResultPublished, CoordinatorPodUID: string(identity.ControlPodUID)}}, nil); err == nil {
+		t.Fatal("a result with no time was accepted")
+	}
+}

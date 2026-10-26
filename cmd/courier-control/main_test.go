@@ -18,7 +18,26 @@ import (
 	courierlog "github.com/misospace/courier/internal/log"
 	"github.com/misospace/courier/internal/protocol"
 	"github.com/misospace/courier/internal/topology"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
+
+// recordingTransport is the fake trusted status path the terminal-result
+// persistence tests use: it records patches and serves a scripted error
+// queue, one error per PostStatus until the queue is empty.
+type recordingTransport struct {
+	patches []harness.StatusPatch
+	errs    []error
+}
+
+func (r *recordingTransport) PostStatus(_ context.Context, patch harness.StatusPatch) error {
+	r.patches = append(r.patches, patch)
+	if len(r.errs) > 0 {
+		err := r.errs[0]
+		r.errs = r.errs[1:]
+		return err
+	}
+	return nil
+}
 
 func TestControlFailsClosedWithoutIdentity(t *testing.T) {
 	if err := runArgs(nil); err == nil || !strings.Contains(err.Error(), "identity environment") {
@@ -438,4 +457,75 @@ func TestCompactionSinkEmitsSessionCompacted(t *testing.T) {
 			t.Fatalf("detail[%q] = %v, want %v", key, detail[key], want)
 		}
 	}
+}
+
+// TestTerminationForCarriesTrustedResultKind proves the trusted native
+// terminal result kind (#127) rides the handoff line alongside the legacy
+// phase/result/exit vocabulary, so an infrastructure failure stays
+// distinguishable from a workload failure on the fallback channel too.
+func TestTerminationForCarriesTrustedResultKind(t *testing.T) {
+	tests := []struct {
+		name   string
+		result executor.HarnessResult
+		want   courierv1alpha1.NativeResultKind
+	}{
+		{"published", executor.HarnessResult{Outcome: executor.OutcomeChanges, Kind: courierv1alpha1.NativeResultPublished}, courierv1alpha1.NativeResultPublished},
+		{"no change", executor.HarnessResult{Outcome: executor.OutcomeNoChangeNeeded, Kind: courierv1alpha1.NativeResultNoChange}, courierv1alpha1.NativeResultNoChange},
+		{"needs human", executor.HarnessResult{Outcome: executor.OutcomeNeedsDecision, Kind: courierv1alpha1.NativeResultNeedsHuman}, courierv1alpha1.NativeResultNeedsHuman},
+		{"blocked external", executor.HarnessResult{Outcome: executor.OutcomeBlockedExternal, Kind: courierv1alpha1.NativeResultBlockedExternal}, courierv1alpha1.NativeResultBlockedExternal},
+		{"capacity exhausted", executor.HarnessResult{Outcome: executor.OutcomeCapacityExhausted, Kind: courierv1alpha1.NativeResultCapacityExhausted}, courierv1alpha1.NativeResultCapacityExhausted},
+		{"workload failure", executor.HarnessResult{Kind: courierv1alpha1.NativeResultWorkloadFailed, Reason: "undeclared ending"}, courierv1alpha1.NativeResultWorkloadFailed},
+		{"infrastructure failure", executor.HarnessResult{Kind: courierv1alpha1.NativeResultInfrastructureFailed, Err: errors.New("harness: model stream failed")}, courierv1alpha1.NativeResultInfrastructureFailed},
+		{"legacy shape carries no kind", executor.HarnessResult{Outcome: executor.OutcomeChanges}, ""},
+	}
+	for _, tt := range tests {
+		got := terminationFor(tt.result)
+		if got.ResultKind != string(tt.want) {
+			t.Fatalf("%s: result_kind = %q, want %q", tt.name, got.ResultKind, tt.want)
+		}
+	}
+}
+
+// TestPersistTerminalResultWritesThroughTheTrustedPath proves the pre-exit
+// persistence (#127): the bounded result travels through the harness status
+// reporter with this incarnation's fencing UID, a failed write is reported
+// and not fatal (the termination handoff remains the fallback channel), and
+// a kindless payload writes nothing.
+func TestPersistTerminalResultWritesThroughTheTrustedPath(t *testing.T) {
+	identity := &controlIdentity{controlKubeUID: "control-kube-uid"}
+	result := courierv1alpha1.NativeResult{
+		Kind:              courierv1alpha1.NativeResultInfrastructureFailed,
+		Reason:            "harness: model stream failed",
+		CoordinatorPodUID: "control-kube-uid",
+		At:                metav1.NewTime(time.Date(2026, 10, 26, 12, 0, 0, 0, time.UTC)),
+	}
+	t.Run("write lands", func(t *testing.T) {
+		transport := &recordingTransport{}
+		persistTerminalResult(terminationFor(executor.HarnessResult{
+			Kind:   courierv1alpha1.NativeResultInfrastructureFailed,
+			Reason: result.Reason,
+		}), harness.NewStatusReporter(transport, "control-kube-uid", "worker", 0), identity)
+		if len(transport.patches) != 1 || transport.patches[0].TerminalResult == nil ||
+			transport.patches[0].TerminalResult.Kind != courierv1alpha1.NativeResultInfrastructureFailed ||
+			transport.patches[0].TerminalResult.CoordinatorPodUID != "control-kube-uid" {
+			t.Fatalf("persisted patches = %#v, want one fenced infrastructure failure", transport.patches)
+		}
+	})
+	t.Run("failed write is not fatal", func(t *testing.T) {
+		transport := &recordingTransport{errs: []error{&harness.BrokerCallError{Category: "unavailable", Retryable: true}, &harness.BrokerCallError{Category: "unavailable", Retryable: true}, &harness.BrokerCallError{Category: "unavailable", Retryable: true}, &harness.BrokerCallError{Category: "unavailable", Retryable: true}}}
+		persistTerminalResult(terminationFor(executor.HarnessResult{
+			Kind:   courierv1alpha1.NativeResultInfrastructureFailed,
+			Reason: result.Reason,
+		}), harness.NewStatusReporter(transport, "control-kube-uid", "worker", 0), identity)
+		if len(transport.patches) == 0 {
+			t.Fatal("no write attempt was made")
+		}
+	})
+	t.Run("kindless payload writes nothing", func(t *testing.T) {
+		transport := &recordingTransport{}
+		persistTerminalResult(termination{Phase: "Failed", Result: "failure", ExitCode: 1, Reason: "x"}, harness.NewStatusReporter(transport, "control-kube-uid", "worker", 0), identity)
+		if len(transport.patches) != 0 {
+			t.Fatalf("patches = %d, want none for a legacy-shaped payload", len(transport.patches))
+		}
+	})
 }

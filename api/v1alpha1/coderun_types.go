@@ -310,7 +310,7 @@ type CIRepairContext struct {
 // TerminalDiagnosticCategory is the stable classification of a terminal run's
 // cause, derived only from evidence the operator observed. Unknown is used
 // whenever evidence is missing or ambiguous; a cause is never invented.
-// +kubebuilder:validation:Enum=executor-crash;model-transport-error;continuation-exhaustion;verifier-rejection;kubernetes-failure;needs-decision;blocked-external;capacity-exhaustion;provider-unavailable;forge-unavailable;unknown
+// +kubebuilder:validation:Enum=executor-crash;model-transport-error;continuation-exhaustion;verifier-rejection;kubernetes-failure;needs-decision;blocked-external;capacity-exhaustion;provider-unavailable;forge-unavailable;workload-failure;infrastructure-failure;unknown
 type TerminalDiagnosticCategory string
 
 const (
@@ -353,6 +353,17 @@ const (
 	// permanently. It never claims the world was read and found
 	// contradictory.
 	TerminalDiagnosticCategoryForgeUnavailable TerminalDiagnosticCategory = "forge-unavailable"
+	// TerminalDiagnosticCategoryWorkloadFailure is the trusted native
+	// coordinator's explicit workload-failure classification (#127): the
+	// run's work failed — an undeclared ending, a declared changes with
+	// nothing integrated, or another ending that is a verdict on the work.
+	TerminalDiagnosticCategoryWorkloadFailure TerminalDiagnosticCategory = "workload-failure"
+	// TerminalDiagnosticCategoryInfrastructureFailure is the trusted native
+	// coordinator's explicit infrastructure-failure classification (#127):
+	// the infrastructure failed around the work, and recovery is the
+	// relaunch/resume case bounded by the crashloop counter, never a
+	// terminal verdict on the work.
+	TerminalDiagnosticCategoryInfrastructureFailure TerminalDiagnosticCategory = "infrastructure-failure"
 	// TerminalDiagnosticCategoryUnknown: the evidence was missing or
 	// ambiguous.
 	TerminalDiagnosticCategoryUnknown TerminalDiagnosticCategory = "unknown"
@@ -437,6 +448,77 @@ type TerminalContainerDiagnostic struct {
 	// +optional
 	// +kubebuilder:validation:MaxLength=128
 	TerminationReason string `json:"terminationReason,omitempty"`
+}
+
+// NativeResultKind is the trusted native coordinator's explicit terminal
+// classification (#127). It is set by trusted control at every ending, before
+// process exit, and persists through the run's broker status path, so the
+// operator classifies from that evidence plus its own world verification —
+// never from the model's prose or the process exit code alone. The kinds
+// mirror the operator's existing routes exactly; the one behavioral addition
+// is the workload/infrastructure split: an infrastructure failure is the
+// relaunch/resume case bounded by the crashloop counter (HARNESS.md §8), not
+// a terminal verdict on the work.
+// +kubebuilder:validation:Enum=published;no_change;needs_human;blocked_external;capacity_exhausted;workload_failed;infrastructure_failed
+type NativeResultKind string
+
+const (
+	// NativeResultPublished: the coordinator declared changes and the broker
+	// confirmed publication of the integrated head. It is still only a
+	// handoff: the operator's own PR/head/check observation remains the
+	// authority for Verifying.
+	NativeResultPublished NativeResultKind = "published"
+	// NativeResultNoChange: the coordinator declared no_change_needed with
+	// evidence. It never resolves the source on the coordinator's word
+	// alone; the operator settles it against the world exactly as the
+	// declared exit-3 ending.
+	NativeResultNoChange NativeResultKind = "no_change"
+	// NativeResultNeedsHuman: a genuine human decision the run cannot make.
+	NativeResultNeedsHuman NativeResultKind = "needs_human"
+	// NativeResultBlockedExternal: a recoverable wait on an external
+	// prerequisite; the source item stays active.
+	NativeResultBlockedExternal NativeResultKind = "blocked_external"
+	// NativeResultCapacityExhausted: confirmed execution-capacity exhaustion
+	// (#320/#327); a recoverable wait on an external resource.
+	NativeResultCapacityExhausted NativeResultKind = "capacity_exhausted"
+	// NativeResultWorkloadFailed: the run's work failed — an undeclared
+	// ending, a declared changes with nothing integrated, or another ending
+	// that is a verdict on the work, never on the infrastructure.
+	NativeResultWorkloadFailed NativeResultKind = "workload_failed"
+	// NativeResultInfrastructureFailed: the infrastructure failed around the
+	// work — a model gateway or stream failure, a status write that will not
+	// land, a publication transport failure. This is the relaunch/resume
+	// case bounded by the crashloop counter (HARNESS.md §8), never a terminal
+	// verdict on the work.
+	NativeResultInfrastructureFailed NativeResultKind = "infrastructure_failed"
+)
+
+// NativeResult is the trusted native coordinator's structured terminal
+// result (#127), written by trusted control through the run's broker status
+// path before the control process exits. The broker fences it to the
+// authenticated control incarnation, so a stale incarnation cannot record a
+// result, and the operator consumes it only when it fences to the coordinator
+// pod whose termination it is classifying. It supplements, never replaces,
+// the operator's own world verification: a published result still only hands
+// the run to Verifying.
+type NativeResult struct {
+	// Kind is the explicit terminal classification.
+	Kind NativeResultKind `json:"kind"`
+	// Reason is a short, bounded, operator-legible explanation of the ending.
+	// It carries fixed categories and redacted diagnostics, never model
+	// output.
+	// +optional
+	// +kubebuilder:validation:MaxLength=1024
+	Reason string `json:"reason,omitempty"`
+	// CoordinatorPodUID is the control incarnation that produced the result.
+	// It is the fence: the broker refuses a result attributing itself to any
+	// other incarnation, and the operator trusts a result only for the
+	// coordinator pod whose termination carries the same UID.
+	// +kubebuilder:validation:MinLength=1
+	// +kubebuilder:validation:MaxLength=128
+	CoordinatorPodUID string `json:"coordinatorPodUID"`
+	// At is when trusted control produced the result, before process exit.
+	At metav1.Time `json:"at"`
 }
 
 // ActiveOperation is one concurrently dispatched tool/subagent operation in
@@ -718,6 +800,16 @@ type CoderRunStatus struct {
 	// absent when no evidence was available, never fabricated.
 	// +optional
 	TerminalDiagnostic *TerminalDiagnostic `json:"terminalDiagnostic,omitempty"`
+
+	// NativeResult is the trusted native coordinator's structured terminal
+	// result (#127), persisted through the run's broker status path before
+	// the control process exited. The trusted broker is the only writer; a
+	// result is fenced to one control incarnation and a replacement
+	// incarnation records its own. Absent for legacy executors and for runs
+	// whose terminal write failed — the operator then classifies from the
+	// kubelet termination handoff as before.
+	// +optional
+	NativeResult *NativeResult `json:"nativeResult,omitempty"`
 
 	// CIPark is the durable park-and-resume record while the run waits on
 	// CI in Verifying. Nil means the run is not parked (#475).

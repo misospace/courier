@@ -610,7 +610,7 @@ func (r *CoderRunReconciler) settleCIParkGreen(ctx context.Context, run *courier
 		// authoritative resolution instead of claiming a push.
 		return r.transitionTerminal(ctx, run, courierv1alpha1.PhaseBlockedExternal, observation.PR, terminalLifecycleIntent{
 			error:      "no changes pushed; queued feedback resolution is not verified",
-			diagnostic: buildTerminalDiagnostic(r.clock(), nil, "", "", "", false, nil),
+			diagnostic: buildTerminalDiagnostic(r.clock(), nil, "", "", "", false, nil, ""),
 		}, nil)
 	}
 	return r.transitionTerminal(ctx, run, courierv1alpha1.PhaseAwaitingReview, observation.PR, terminalLifecycleIntent{}, nil)

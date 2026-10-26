@@ -1727,6 +1727,51 @@ its own world verification, keeping two failure kinds distinct:
 A raw nonzero exit is not a classification; the explicit result plus the world
 is.
 
+**Implemented contract (#127).** Trusted control classifies every ending
+explicitly into a `NativeResult` kind — `published`, `no_change`,
+`needs_human`, `blocked_external`, `capacity_exhausted`, `workload_failed`,
+`infrastructure_failed` — set at every terminal site in the coordinator and
+persisted through the run's broker status path (`StatusReporter.TerminalResult`)
+before the control process exits, fenced to the authenticated control
+incarnation like every other trusted status write. One incarnation's recorded
+result is final: a conflicting rewrite is refused, an idempotent rewrite of the
+identical result resolves a lost acknowledgment, and a replacement incarnation
+after a relaunch records its own. The pre-exit write is best-effort with a
+bounded, cancellation-proof window; when it never lands, the pod's
+`COURIER_TERMINATION` handoff carries the kind as the fallback channel
+(`result_kind`), and a run with neither keeps the legacy exit-code
+classification — the absence of a persisted result never grants trust.
+
+The operator consumes the result only when it fences to the coordinator pod
+whose termination it is classifying, so a stale incarnation's result can never
+classify a replacement's ending, and classifies from it — never from the exit
+code or the model's prose alone. The phase routes mirror the legacy exit-code
+contract exactly: a `published` or `no_change` result still only hands the run
+to `Verifying` (or, for a resolve-issue `no_change`, `AwaitingReview`), where
+the operator's own PR/head/check observation remains the authority — a zero
+exit with no verified PR, a wrong repo/ref/head, a declined forge capability,
+a stale incarnation, or an unverifiable forge read never reaches a falsely
+successful `AwaitingReview`. The one behavioral addition is the
+workload/infrastructure split: a `workload_failed` result terminalizes `Failed`
+with its own durable diagnostic category, while an `infrastructure_failed`
+result is never a terminal verdict — the operator deletes the terminated pod
+once so the deterministic name is free, then relaunches and resumes from
+durable state through the same crashloop-bounded path pod loss uses, handing
+the run to a human at the ceiling with the terminated pod preserved as the
+ending's evidence.
+
+**Interaction with #246 (red-CI resolve-issue handoff).** The trusted result
+and the CI observation classify two different things and never override each
+other. A `published` result attests that the coordinator's own publication was
+broker-confirmed; it says nothing about checks. Red CI on a published PR is
+therefore still settled by the operator's stable-failed-check-set observation
+through the source-neutral `HandedOff` outcome (#246) — the trusted result
+never settles red CI as verified success, and pending checks still hold the
+run in `Verifying` until the existing two-observation stable-check-set rule
+resolves them. Conversely, a stable red observation never retro-classifies the
+coordinator's ending: the run's own trusted result remains the record of how
+the coordinator process ended.
+
 ## 9. Migration
 
 - **Legacy mode (current):** OpenCode and model-controlled tools share a pod

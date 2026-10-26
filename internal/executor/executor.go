@@ -119,8 +119,15 @@ const (
 // Outcome carries the coordinator's own declaration; Err carries an
 // infrastructure failure (pod, gateway, status path) that the operator
 // relaunches under the crashloop backstop — it is never a verdict on the work.
+// Kind is the trusted terminal classification (#127): explicit at every
+// ending, set by trusted control, and persisted through the run's broker
+// status path before process exit, so the operator classifies from that
+// evidence plus its own world verification — never from the model's prose or
+// the exit code alone. An unset Kind (the legacy shape) keeps the exit-code
+// classification contract.
 type HarnessResult struct {
 	Outcome         DeclaredOutcome
+	Kind            courierv1alpha1.NativeResultKind
 	Reason          string
 	Err             error
 	WorkspaceSafety *WorkspaceSafetyEvidence

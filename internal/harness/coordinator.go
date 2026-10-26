@@ -306,7 +306,7 @@ const subagentFraming = `You are a bounded delegate running inside Courier's con
 func (c *Coordinator) Run(ctx context.Context, inv executor.Invocation) executor.HarnessResult {
 	session, err := c.newSession(RoleCoordinator)
 	if err != nil {
-		return executor.HarnessResult{Err: err}
+		return executor.HarnessResult{Kind: courierv1alpha1.NativeResultInfrastructureFailed, Err: err}
 	}
 	session.Pin(Message{Role: "system", Content: strings.TrimSpace(inv.Goal) + "\n\n" + harnessFraming})
 	if strings.TrimSpace(inv.Framing) != "" {
@@ -324,10 +324,10 @@ func (c *Coordinator) Run(ctx context.Context, inv executor.Invocation) executor
 		}
 		turn := c.pump(ctx, session, "", c.coordinatorTools())
 		if turn.blocker != nil {
-			return executor.HarnessResult{Outcome: executor.OutcomeBlockedExternal, Reason: turn.blocker.Error()}
+			return executor.HarnessResult{Kind: courierv1alpha1.NativeResultBlockedExternal, Outcome: executor.OutcomeBlockedExternal, Reason: turn.blocker.Error()}
 		}
 		if turn.harnessErr != nil {
-			return executor.HarnessResult{Err: fmt.Errorf("harness: step-boundary compaction: %w", turn.harnessErr)}
+			return executor.HarnessResult{Kind: courierv1alpha1.NativeResultInfrastructureFailed, Err: fmt.Errorf("harness: step-boundary compaction: %w", turn.harnessErr)}
 		}
 		if turn.streamErr != nil {
 			if result, ok := availabilityEnding(turn.streamErr); ok {
@@ -342,7 +342,7 @@ func (c *Coordinator) Run(ctx context.Context, inv executor.Invocation) executor
 				}
 				return result
 			}
-			return executor.HarnessResult{Err: fmt.Errorf("harness: model stream failed: %w", turn.streamErr)}
+			return executor.HarnessResult{Kind: courierv1alpha1.NativeResultInfrastructureFailed, Err: fmt.Errorf("harness: model stream failed: %w", turn.streamErr)}
 		}
 		if turn.final {
 			if c.control.Stopped() {
@@ -364,6 +364,7 @@ func (c *Coordinator) Run(ctx context.Context, inv executor.Invocation) executor
 				continue
 			}
 			return executor.HarnessResult{
+				Kind:   courierv1alpha1.NativeResultWorkloadFailed,
 				Reason: fmt.Sprintf("undeclared ending: the coordinator's final message was not a valid outcome declaration: %v", parseErr),
 			}
 		}
@@ -382,10 +383,12 @@ func availabilityEnding(err error) (executor.HarnessResult, bool) {
 		return executor.HarnessResult{}, false
 	}
 	outcome := executor.OutcomeBlockedExternal
+	kind := courierv1alpha1.NativeResultBlockedExternal
 	if classification.Availability == ProviderAllowanceExhausted {
 		outcome = executor.OutcomeCapacityExhausted
+		kind = courierv1alpha1.NativeResultCapacityExhausted
 	}
-	result := executor.HarnessResult{Outcome: outcome, Reason: providerAvailabilityReason(classification)}
+	result := executor.HarnessResult{Outcome: outcome, Kind: kind, Reason: providerAvailabilityReason(classification)}
 	return result, true
 }
 
@@ -532,12 +535,13 @@ func (c *Coordinator) finish(ctx context.Context, inv executor.Invocation, outco
 	// persistent failure is an infrastructure failure for the operator to
 	// relaunch, which resumes remote-first.
 	if err := c.status.ReconcileDebt(ctx); err != nil {
-		return executor.HarnessResult{Err: fmt.Errorf("harness: a completed brief lacks a durable status record: %w", err)}
+		return executor.HarnessResult{Kind: courierv1alpha1.NativeResultInfrastructureFailed, Err: fmt.Errorf("harness: a completed brief lacks a durable status record: %w", err)}
 	}
 	switch outcome {
 	case executor.OutcomeChanges:
 		if c.publisher == nil {
 			return executor.HarnessResult{
+				Kind:   courierv1alpha1.NativeResultInfrastructureFailed,
 				Reason: "the coordinator declared changes but this build has no publication path",
 				Err:    errors.New("harness: publication is not configured"),
 			}
@@ -546,27 +550,36 @@ func (c *Coordinator) finish(ctx context.Context, inv executor.Invocation, outco
 		if err != nil {
 			if errors.Is(err, ErrNothingToPublish) {
 				return executor.HarnessResult{
+					Kind:   courierv1alpha1.NativeResultWorkloadFailed,
 					Reason: "the coordinator declared changes but no work was integrated or published in this incarnation: " + err.Error(),
 				}
 			}
 			var blocked *PublicationBlockedError
 			if errors.As(err, &blocked) {
 				return executor.HarnessResult{
+					Kind:    courierv1alpha1.NativeResultBlockedExternal,
 					Outcome: executor.OutcomeBlockedExternal,
 					Reason:  blocked.Error(),
 				}
 			}
-			return executor.HarnessResult{Outcome: outcome, Err: fmt.Errorf("harness: publication failed: %w", err)}
+			return executor.HarnessResult{Kind: courierv1alpha1.NativeResultInfrastructureFailed, Outcome: outcome, Err: fmt.Errorf("harness: publication failed: %w", err)}
 		}
 		reason := "published through the broker"
 		if publication.AlreadyPublished {
 			reason = "publication already confirmed at " + publication.OID
 		}
-		return executor.HarnessResult{Outcome: outcome, Reason: reason}
+		return executor.HarnessResult{Kind: courierv1alpha1.NativeResultPublished, Outcome: outcome, Reason: reason}
 	case executor.OutcomeNoChangeNeeded, executor.OutcomeNeedsDecision, executor.OutcomeBlockedExternal:
-		return executor.HarnessResult{Outcome: outcome, Reason: summary}
+		kind := courierv1alpha1.NativeResultNoChange
+		if outcome == executor.OutcomeNeedsDecision {
+			kind = courierv1alpha1.NativeResultNeedsHuman
+		}
+		if outcome == executor.OutcomeBlockedExternal {
+			kind = courierv1alpha1.NativeResultBlockedExternal
+		}
+		return executor.HarnessResult{Kind: kind, Outcome: outcome, Reason: summary}
 	default:
-		return executor.HarnessResult{Reason: fmt.Sprintf("undeclared outcome %q", outcome)}
+		return executor.HarnessResult{Kind: courierv1alpha1.NativeResultWorkloadFailed, Reason: fmt.Sprintf("undeclared outcome %q", outcome)}
 	}
 }
 
@@ -581,27 +594,29 @@ func (c *Coordinator) finish(ctx context.Context, inv executor.Invocation, outco
 // soft-stop outcome.
 func (c *Coordinator) finishSoftStop(ctx context.Context) executor.HarnessResult {
 	if err := ctx.Err(); err != nil {
-		return executor.HarnessResult{Err: fmt.Errorf("harness: model stream failed: %w", err)}
+		return executor.HarnessResult{Kind: courierv1alpha1.NativeResultInfrastructureFailed, Err: fmt.Errorf("harness: model stream failed: %w", err)}
 	}
 	_ = c.status.Flush(ctx)
 	if err := c.status.ReconcileDebt(ctx); err != nil {
-		return executor.HarnessResult{Err: fmt.Errorf("harness: a completed brief lacks a durable status record: %w", err)}
+		return executor.HarnessResult{Kind: courierv1alpha1.NativeResultInfrastructureFailed, Err: fmt.Errorf("harness: a completed brief lacks a durable status record: %w", err)}
 	}
 	if c.workRefBeyondAnchor == nil {
-		return executor.HarnessResult{Err: errors.New("harness: soft stop has no work-ref observation configured")}
+		return executor.HarnessResult{Kind: courierv1alpha1.NativeResultInfrastructureFailed, Err: errors.New("harness: soft stop has no work-ref observation configured")}
 	}
 	beyond, err := c.workRefBeyondAnchor(ctx)
 	if err != nil {
-		return executor.HarnessResult{Err: fmt.Errorf("harness: soft stop could not observe the work ref: %w", err)}
+		return executor.HarnessResult{Kind: courierv1alpha1.NativeResultInfrastructureFailed, Err: fmt.Errorf("harness: soft stop could not observe the work ref: %w", err)}
 	}
 	if !beyond {
 		return executor.HarnessResult{
+			Kind:    courierv1alpha1.NativeResultNoChange,
 			Outcome: executor.OutcomeNoChangeNeeded,
 			Reason:  "soft stop: the work ref holds no tip beyond the admission anchor",
 		}
 	}
 	if c.publisher == nil {
 		return executor.HarnessResult{
+			Kind:   courierv1alpha1.NativeResultInfrastructureFailed,
 			Reason: "soft stop found work beyond the admission anchor but this build has no publication path",
 			Err:    errors.New("harness: publication is not configured"),
 		}
@@ -611,17 +626,18 @@ func (c *Coordinator) finishSoftStop(ctx context.Context) executor.HarnessResult
 		var blocked *PublicationBlockedError
 		if errors.As(err, &blocked) {
 			return executor.HarnessResult{
+				Kind:    courierv1alpha1.NativeResultBlockedExternal,
 				Outcome: executor.OutcomeBlockedExternal,
 				Reason:  blocked.Error(),
 			}
 		}
-		return executor.HarnessResult{Err: fmt.Errorf("harness: soft stop publication failed: %w", err)}
+		return executor.HarnessResult{Kind: courierv1alpha1.NativeResultInfrastructureFailed, Err: fmt.Errorf("harness: soft stop publication failed: %w", err)}
 	}
 	reason := "soft stop: published through the broker"
 	if publication.AlreadyPublished {
 		reason = "soft stop: publication already confirmed at " + publication.OID
 	}
-	return executor.HarnessResult{Outcome: executor.OutcomeChanges, Reason: reason}
+	return executor.HarnessResult{Kind: courierv1alpha1.NativeResultPublished, Outcome: executor.OutcomeChanges, Reason: reason}
 }
 
 // parseOutcome parses the model's final message as the outcome declaration.
