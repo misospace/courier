@@ -20,6 +20,7 @@ import (
 
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	apimeta "k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -711,6 +712,11 @@ func TestEnvtestCIParkForeignHeadFailsClosed(t *testing.T) {
 	final := h.run()
 	if final.Status.CIPark == nil {
 		t.Fatal("status.cipark = nil after the handoff, want the park record")
+	}
+	// A park record carrying the unsupported outcome is the durable account
+	// here; the inapplicability condition is never set alongside it.
+	if cond := apimeta.FindStatusCondition(final.Status.Conditions, courierv1alpha1.ConditionCIRepairInapplicable); cond != nil {
+		t.Fatalf("condition = %#v, want none when a park record already accounts for the foreign head", cond)
 	}
 	if final.Status.CIPark.LastOutcome != courierv1alpha1.CIParkOutcomeUnsupported {
 		t.Fatalf("park outcome = %q, want %q", final.Status.CIPark.LastOutcome, courierv1alpha1.CIParkOutcomeUnsupported)
@@ -4191,5 +4197,201 @@ func TestEnvtestCIParkPendingCloseKeepsItsBoundWhenTheTerminalDispatchFails(t *t
 	}
 	if h.run().Status.CISettlement == nil {
 		t.Fatal("status.ciSettlement = nil, want the pending close to stay owed")
+	}
+}
+
+// TestEnvtestCIParkLegacyHeadSignalsInapplicablePolicy pins the legacy
+// coordinator's signal (#550): a run on a policy-declaring lane that reaches
+// Verifying with an observable pull request but no publication evidence the
+// loop can attribute gets a durable condition saying the ci-repair policy
+// cannot apply, and the ordinary grading path still owns the observation,
+// fail-closed — no park record, no fabricated head, no repair.
+func TestEnvtestCIParkLegacyHeadSignalsInapplicablePolicy(t *testing.T) {
+	if envtestClient == nil {
+		t.Skip("KUBEBUILDER_ASSETS is not set")
+	}
+	h := newCIParkHarness(t, "cipark-legacy-head", ciparkPolicy(2), &admissionSource{})
+
+	// A legacy coordinator published its pull request without ever writing
+	// the broker-verified commit record the loop attributes heads from.
+	h.world.set(PRObservation{PR: "42", Head: "sha-legacy", Checks: []CheckObservation{{Name: "build", State: CheckStatePending}}})
+	h.toVerifying()
+	h.reconcile()
+
+	run := h.run()
+	if run.Status.CIPark != nil {
+		t.Fatalf("park record = %#v, want none: an unattributable head never parks", run.Status.CIPark)
+	}
+	cond := apimeta.FindStatusCondition(run.Status.Conditions, courierv1alpha1.ConditionCIRepairInapplicable)
+	if cond == nil || cond.Status != metav1.ConditionTrue || cond.Reason != courierv1alpha1.ConditionReasonHeadUnattributable {
+		t.Fatalf("condition = %#v, want %q True with reason %q", cond, courierv1alpha1.ConditionCIRepairInapplicable, courierv1alpha1.ConditionReasonHeadUnattributable)
+	}
+	if cond.ObservedGeneration != run.Generation {
+		t.Fatalf("condition observedGeneration = %d, want %d", cond.ObservedGeneration, run.Generation)
+	}
+
+	// The signal is idempotent across the run's own poll cadence.
+	h.reconcile()
+	if got := h.launchCount(h.name); got != 1 {
+		t.Fatalf("launches after the idempotent poll = %d, want 1 (the ordinary path never wakes the coordinator)", got)
+	}
+
+	// The ordinary path still owns the observation, fail-closed: a settled
+	// red observation hands the run off without a repair.
+	h.world.set(redObservation("sha-legacy", "build"))
+	h.reconcile()
+	h.reconcile()
+	if got := h.phase(); got != courierv1alpha1.PhaseHandedOff {
+		t.Fatalf("phase after the settled red observation = %q, want HandedOff", got)
+	}
+	final := h.run()
+	if final.Status.CIPark != nil {
+		t.Fatalf("park record = %#v, want none: the ordinary path decided", final.Status.CIPark)
+	}
+	if got := apimeta.FindStatusCondition(final.Status.Conditions, courierv1alpha1.ConditionCIRepairInapplicable); got == nil {
+		t.Fatal("condition = nil after the handoff, want the durable record of why the loop never engaged")
+	}
+}
+
+// TestEnvtestCIParkAttributableHeadLeavesNoInapplicability pins the secure
+// mode's silence: a run whose broker-verified publication record names the
+// observed head parks as usual and never carries the inapplicability
+// condition.
+func TestEnvtestCIParkAttributableHeadLeavesNoInapplicability(t *testing.T) {
+	if envtestClient == nil {
+		t.Skip("KUBEBUILDER_ASSETS is not set")
+	}
+	h := newCIParkHarness(t, "cipark-attributed-head", ciparkPolicy(2), &admissionSource{})
+
+	h.park("sha-1", CheckObservation{Name: "build", State: CheckStatePending})
+
+	run := h.run()
+	if cond := apimeta.FindStatusCondition(run.Status.Conditions, courierv1alpha1.ConditionCIRepairInapplicable); cond != nil {
+		t.Fatalf("condition = %#v, want none on an attributable head", cond)
+	}
+}
+
+// TestEnvtestCIParkLateEvidenceClearsInapplicability pins the recovery: a
+// legacy run carrying the inapplicability condition whose publication
+// evidence arrives late becomes attributable, parks on its own head, and
+// loses the obsolete condition in the same write that establishes the park.
+func TestEnvtestCIParkLateEvidenceClearsInapplicability(t *testing.T) {
+	if envtestClient == nil {
+		t.Skip("KUBEBUILDER_ASSETS is not set")
+	}
+	h := newCIParkHarness(t, "cipark-late-evidence", ciparkPolicy(2), &admissionSource{})
+
+	h.world.set(PRObservation{PR: "42", Head: "sha-1", Checks: []CheckObservation{{Name: "build", State: CheckStatePending}}})
+	h.toVerifying()
+	h.reconcile()
+	if cond := apimeta.FindStatusCondition(h.run().Status.Conditions, courierv1alpha1.ConditionCIRepairInapplicable); cond == nil {
+		t.Fatal("condition = nil before the evidence, want the legacy signal first")
+	}
+
+	// The broker-verified publication record arrives: the head becomes
+	// attributable and the park engages normally.
+	h.publishHead("sha-1")
+	h.reconcile()
+
+	run := h.run()
+	if run.Status.CIPark == nil || run.Status.CIPark.Head != "sha-1" {
+		t.Fatalf("park record = %#v, want a park on sha-1", run.Status.CIPark)
+	}
+	if cond := apimeta.FindStatusCondition(run.Status.Conditions, courierv1alpha1.ConditionCIRepairInapplicable); cond != nil {
+		t.Fatalf("condition = %#v, want none once the head is attributable", cond)
+	}
+}
+
+// TestEnvtestCIParkRemovedPolicyClearsInapplicability pins the stale
+// condition's end: a lane that stops declaring a repair policy leaves a run
+// carrying the inapplicability condition with it removed, since the premise
+// it recorded no longer holds.
+func TestEnvtestCIParkRemovedPolicyClearsInapplicability(t *testing.T) {
+	if envtestClient == nil {
+		t.Skip("KUBEBUILDER_ASSETS is not set")
+	}
+	ctx := context.Background()
+	h := newCIParkHarness(t, "cipark-policy-removed", ciparkPolicy(2), &admissionSource{})
+
+	h.world.set(PRObservation{PR: "42", Head: "sha-legacy", Checks: []CheckObservation{{Name: "build", State: CheckStatePending}}})
+	h.toVerifying()
+	h.reconcile()
+	if cond := apimeta.FindStatusCondition(h.run().Status.Conditions, courierv1alpha1.ConditionCIRepairInapplicable); cond == nil {
+		t.Fatal("condition = nil before the policy change, want the legacy signal first")
+	}
+
+	lane := &courierv1alpha1.LaneProfile{}
+	if err := envtestClient.Get(ctx, envtestKey(h.laneName), lane); err != nil {
+		t.Fatal(err)
+	}
+	lane.Spec.CIRepair = nil
+	if err := envtestClient.Update(ctx, lane); err != nil {
+		t.Fatal(err)
+	}
+
+	h.reconcile()
+	if cond := apimeta.FindStatusCondition(h.run().Status.Conditions, courierv1alpha1.ConditionCIRepairInapplicable); cond != nil {
+		t.Fatalf("condition = %#v, want none once the lane stopped declaring a policy", cond)
+	}
+}
+
+// TestEnvtestCIParkUnsupportedLifecycleStillSignalsInapplicable pins the
+// diagnostic across a source whose CI-park lifecycle is latched unsupported:
+// the fallback to the ordinary path is the source's, but the unaccountable
+// head's record is the observation's own, so the condition is still set on a
+// legacy head, still idempotent across the poll cadence, and still cleared
+// when the publication evidence arrives late — with no lifecycle exchange
+// ever offered to a source that cannot answer one.
+func TestEnvtestCIParkUnsupportedLifecycleStillSignalsInapplicable(t *testing.T) {
+	if envtestClient == nil {
+		t.Skip("KUBEBUILDER_ASSETS is not set")
+	}
+
+	adapter := &latchedParkSource{unsupported: true}
+	h := newCIParkHarness(t, "cipark-unsupported-lifecycle", ciparkPolicy(2), adapter)
+
+	h.world.set(PRObservation{PR: "42", Head: "sha-legacy", Checks: []CheckObservation{{Name: "build", State: CheckStatePending}}})
+	h.toVerifying()
+	h.reconcile()
+
+	run := h.run()
+	if run.Status.CIPark != nil {
+		t.Fatalf("park record = %#v, want none: the source cannot support the lifecycle", run.Status.CIPark)
+	}
+	cond := apimeta.FindStatusCondition(run.Status.Conditions, courierv1alpha1.ConditionCIRepairInapplicable)
+	if cond == nil || cond.Status != metav1.ConditionTrue || cond.Reason != courierv1alpha1.ConditionReasonHeadUnattributable {
+		t.Fatalf("condition = %#v, want %q True with reason %q despite the unsupported lifecycle", cond, courierv1alpha1.ConditionCIRepairInapplicable, courierv1alpha1.ConditionReasonHeadUnattributable)
+	}
+
+	// The signal is idempotent across the run's own poll cadence: the
+	// condition's transition time is not restamped by the poll.
+	first := h.run()
+	before := apimeta.FindStatusCondition(first.Status.Conditions, courierv1alpha1.ConditionCIRepairInapplicable)
+	h.reconcile()
+	if got := h.launchCount(h.name); got != 1 {
+		t.Fatalf("launches after the idempotent poll = %d, want 1 (the fallback never wakes the coordinator)", got)
+	}
+	if after := apimeta.FindStatusCondition(h.run().Status.Conditions, courierv1alpha1.ConditionCIRepairInapplicable); after == nil ||
+		!before.LastTransitionTime.Equal(&after.LastTransitionTime) {
+		t.Fatalf("condition transition time = %v, want the unstamped %v after the idempotent poll", after, before.LastTransitionTime)
+	}
+
+	// The publication evidence arrives: the head becomes attributable, the
+	// obsolete condition clears even though no park will ever be
+	// established on this source, and no lifecycle exchange was ever
+	// offered to it.
+	h.publishHead("sha-legacy")
+	h.reconcile()
+
+	final := h.run()
+	if cond := apimeta.FindStatusCondition(final.Status.Conditions, courierv1alpha1.ConditionCIRepairInapplicable); cond != nil {
+		t.Fatalf("condition = %#v, want none once the head is attributable", cond)
+	}
+	if final.Status.CIPark != nil {
+		t.Fatalf("park record = %#v, want none: the source cannot support the lifecycle", final.Status.CIPark)
+	}
+	if len(adapter.parks) != 0 || len(adapter.reservations) != 0 || len(adapter.releases) != 0 {
+		t.Fatalf("lifecycle exchanges = %d parks, %d reservations, %d releases, want none offered to a latched-unsupported source",
+			len(adapter.parks), len(adapter.reservations), len(adapter.releases))
 	}
 }

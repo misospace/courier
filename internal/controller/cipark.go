@@ -28,6 +28,7 @@ import (
 	"unicode/utf8"
 
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	apimeta "k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -170,6 +171,59 @@ func publishedHead(run *courierv1alpha1.CoderRun, observed string) (string, bool
 		}
 	}
 	return "", false
+}
+
+// markCIParkInapplicable records, as a durable condition, that a
+// policy-declaring lane's run reached Verifying with an observable pull
+// request whose head it cannot attribute to its own publication evidence
+// (#550). A legacy coordinator never wrote that evidence, so the
+// park-and-resume loop silently cannot engage on such a run; the condition
+// says so instead of leaving the inapplicability undiscoverable. It decides
+// nothing: the ordinary post-publication grading path still owns the
+// observation, unchanged and fail-closed, and no head is ever fabricated for
+// the loop to park on. The write is idempotent, so the run's own reconcile
+// cadence cannot stamp the condition's transition time on every poll.
+func (r *CoderRunReconciler) markCIParkInapplicable(ctx context.Context, run *courierv1alpha1.CoderRun, observation PRObservation) error {
+	if observation.Head == "" {
+		// No head was observed at all. That is not the legacy case the
+		// condition exists to name — there is no head to be unattributable —
+		// and the ordinary path already owns an observation with nothing to
+		// grade.
+		return nil
+	}
+	message := fmt.Sprintf("the lane's ci-repair policy cannot apply: observed head %q is not attributable to this run's publication evidence; the ordinary verification path decides the run", observation.Head)
+	if cond := apimeta.FindStatusCondition(run.Status.Conditions, courierv1alpha1.ConditionCIRepairInapplicable); cond != nil &&
+		cond.Status == metav1.ConditionTrue &&
+		cond.Reason == courierv1alpha1.ConditionReasonHeadUnattributable &&
+		cond.ObservedGeneration == run.Generation &&
+		cond.Message == message {
+		return nil
+	}
+	before := run.DeepCopy()
+	apimeta.SetStatusCondition(&run.Status.Conditions, metav1.Condition{
+		Type:               courierv1alpha1.ConditionCIRepairInapplicable,
+		Status:             metav1.ConditionTrue,
+		Reason:             courierv1alpha1.ConditionReasonHeadUnattributable,
+		Message:            message,
+		ObservedGeneration: run.Generation,
+		LastTransitionTime: metav1.NewTime(r.clock()),
+	})
+	log.FromContext(ctx).Info("ci-repair policy inapplicable: the observed head is not attributable to the run's publication evidence",
+		"run", run.Name, "observedHead", observation.Head)
+	return r.patchStatus(ctx, before, run)
+}
+
+// clearCIParkInapplicable removes the inapplicability condition from a run in
+// memory and reports whether it was there. It is called when the condition's
+// premise no longer holds — the head became attributable, or the lane stopped
+// declaring a repair policy — and folds into whatever status write the
+// caller is already making.
+func clearCIParkInapplicable(run *courierv1alpha1.CoderRun) bool {
+	if apimeta.FindStatusCondition(run.Status.Conditions, courierv1alpha1.ConditionCIRepairInapplicable) == nil {
+		return false
+	}
+	apimeta.RemoveStatusCondition(&run.Status.Conditions, courierv1alpha1.ConditionCIRepairInapplicable)
+	return true
 }
 
 // failedMechanicalChecks returns the names of the failed checks the lane
@@ -384,6 +438,17 @@ func (r *CoderRunReconciler) observeCIPark(ctx context.Context, run *courierv1al
 		// side first (#553), as every one of the loop's own endings would
 		// have, and only then hands the observation to the ordinary path
 		// unchanged.
+		//
+		// No repair policy applies — the lane never declared one, no longer
+		// declares one, or its declaration is degenerate — so an
+		// inapplicability condition recorded while a policy still applied
+		// is obsolete, and is cleared ahead of the abandon.
+		before := run.DeepCopy()
+		if clearCIParkInapplicable(run) {
+			if err := r.patchStatus(ctx, before, run); err != nil {
+				return false, ctrl.Result{}, err
+			}
+		}
 		result, err := r.abandonCIPark(ctx, run, observation)
 		if err != nil {
 			return false, ctrl.Result{}, err
@@ -402,6 +467,15 @@ func (r *CoderRunReconciler) observeCIPark(ctx context.Context, run *courierv1al
 		}
 		return false, result, nil
 	}
+	// The attempt in flight, if any. Its head is what the park decides on
+	// whether that attempt made progress, and its fence token is what the
+	// source must be handed back when the attempt ends.
+	attempt := run.Status.CIRepair
+	fenceToken := ""
+	if attempt != nil {
+		fenceToken = attempt.FenceToken
+	}
+	head, attributable := publishedHead(run, observation.Head)
 	// Version skew is latched at the source: a deployment that answered one
 	// park-family route with a bare 404 has adopted none of them, and that
 	// observation is permanent for the process. A park established against
@@ -413,27 +487,46 @@ func (r *CoderRunReconciler) observeCIPark(ctx context.Context, run *courierv1al
 	// The refusal sentinels below keep every in-flight exchange failing
 	// closed, and a lookup that cannot answer the capability question
 	// proceeds with today's behavior rather than guessing.
+	//
+	// The unaccountable head's diagnostic is not the fallback's to skip: it
+	// records why the loop never engaged, whatever engagement the source
+	// could support, so the attribution above is decided before the early
+	// return (#550).
 	if run.Status.CIPark == nil && run.Status.CIRepair == nil {
 		adapter, _, err := r.adapterAndWorkItem(run)
 		if err != nil {
 			log.FromContext(ctx).V(1).Info("source adapter lookup failed; CI park degradation unknown", "run", run.Name, "error", err.Error())
 		} else if probe, ok := adapter.(source.CIParkLifecycleProbe); ok && probe.CIParkLifecycleUnsupported() {
+			if !attributable {
+				if err := r.markCIParkInapplicable(ctx, run, observation); err != nil {
+					return false, ctrl.Result{}, err
+				}
+				return false, ctrl.Result{}, nil
+			}
+			// The head is attributable, so any inapplicability recorded
+			// while the evidence was missing is obsolete — cleared here,
+			// ahead of the fallback's ordinary grading, because no park
+			// will ever be established on this source to clear it.
+			before := run.DeepCopy()
+			if clearCIParkInapplicable(run) {
+				if err := r.patchStatus(ctx, before, run); err != nil {
+					return false, ctrl.Result{}, err
+				}
+			}
 			return false, ctrl.Result{}, nil
 		}
 	}
-	// The attempt in flight, if any. Its head is what the park decides on
-	// whether that attempt made progress, and its fence token is what the
-	// source must be handed back when the attempt ends.
-	attempt := run.Status.CIRepair
-	fenceToken := ""
-	if attempt != nil {
-		fenceToken = attempt.FenceToken
-	}
-	head, attributable := publishedHead(run, observation.Head)
 	if !attributable {
 		if run.Status.CIPark == nil {
 			// The run published nothing this operator can account for:
 			// there is no head to park on, and the ordinary path decides.
+			// A legacy coordinator publishes its pull request without the
+			// broker-verified commit record the loop requires, so this is
+			// the loop's steady answer on such a run — recorded as a
+			// durable condition instead of silence (#550).
+			if err := r.markCIParkInapplicable(ctx, run, observation); err != nil {
+				return false, ctrl.Result{}, err
+			}
 			return false, ctrl.Result{}, nil
 		}
 		// The recorded head is gone. The world moved on, and a repair of a
@@ -447,7 +540,7 @@ func (r *CoderRunReconciler) observeCIPark(ctx context.Context, run *courierv1al
 	// fact that an attempt was consumed on this head, and spend the budget
 	// again on a head that never moved.
 	before := run.DeepCopy()
-	changed := false
+	changed := clearCIParkInapplicable(run)
 	if observation.PR != run.Status.PR {
 		run.Status.PR = observation.PR
 		changed = true

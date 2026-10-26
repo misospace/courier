@@ -105,6 +105,23 @@ const ConditionPullRequestClosedUnmerged = "PullRequestClosedUnmerged"
 // was observed closed without merge (#277).
 const ConditionReasonClosedUnmerged = "ClosedUnmerged"
 
+// ConditionCIRepairInapplicable is the status condition type the operator
+// writes on a Verifying run whose lane declares a mechanical-CI repair policy
+// but whose observed head cannot be attributed to the run's own publication
+// evidence (#550). A legacy coordinator publishes a pull request without the
+// broker-verified commit record the park-and-resume loop requires, so the
+// loop silently cannot engage on it. Status True with reason
+// HeadUnattributable says so durably instead: the ordinary post-publication
+// grading path decides the run, unchanged and fail-closed, and no head is
+// ever fabricated to park on. The condition clears once the head becomes
+// attributable or the lane stops declaring a policy.
+const ConditionCIRepairInapplicable = "CIRepairInapplicable"
+
+// ConditionReasonHeadUnattributable is the reason carried by a
+// ConditionCIRepairInapplicable condition when the observed head matches no
+// commit the run accounts for.
+const ConditionReasonHeadUnattributable = "HeadUnattributable"
+
 // Phase is the lifecycle phase of a CoderRun.
 // +kubebuilder:validation:Enum=Pending;Claimed;Running;Verifying;AwaitingReview;HandedOff;NeedsHuman;Done;Failed;BlockedExternal
 type Phase string
