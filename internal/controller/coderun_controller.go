@@ -522,7 +522,12 @@ func (r *CoderRunReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 // recovery. None of those is preempted by the run's other durable duties — a
 // park close the source keeps refusing rides along as a cap on the reconcile's
 // wake interval, never as an early return in front of this dispatch — so the
-// report retry and the merge observation always get their turn.
+// report retry and the merge observation always get their turn. The one early
+// return is the #564 fence backfill below, which holds the dispatch for one
+// settlement cadence and no more. A Done run never reaches this dispatch (the
+// resolveCompleted path owns it) and cannot carry a live attempt: every path
+// to Done grades the in-flight attempt through publication observation or the
+// terminal write, each of which settles or clears it.
 func (r *CoderRunReconciler) reconcileTerminal(ctx context.Context, run *courierv1alpha1.CoderRun) (ctrl.Result, error) {
 	// A run that terminalized before the terminal write began settling an
 	// in-flight repair attempt can still carry a live fence, and the source
@@ -536,11 +541,11 @@ func (r *CoderRunReconciler) reconcileTerminal(ctx context.Context, run *courier
 	if run.Status.CIRepair != nil {
 		before := run.DeepCopy()
 		abandonCIRepairAttempt(run)
-		log.FromContext(ctx).Info("terminal run still held a repair fence; settling it as owed",
-			"run", run.Name, "phase", run.Status.Phase)
 		if err := r.patchStatus(ctx, before, run); err != nil {
 			return ctrl.Result{}, err
 		}
+		log.FromContext(ctx).Info("terminal run still held a repair fence; settled it as owed",
+			"run", run.Name, "phase", run.Status.Phase)
 		if run.Status.CISettlement != nil {
 			return ctrl.Result{RequeueAfter: ciparkSettlementRetryDelay}, nil
 		}
