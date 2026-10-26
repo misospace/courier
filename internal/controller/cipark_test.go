@@ -308,25 +308,84 @@ func TestCIParkCapacityReacquisitionReadsLiveReaderNotLaggingCache(t *testing.T)
 	}
 }
 
-// TestSettleCIRollbackWithoutAFence pins the no-op guard: a claim rollback
-// whose cleared repair context carries no source-granted fence records
-// nothing, because there is no grant to answer.
-func TestSettleCIRollbackWithoutAFence(t *testing.T) {
-	reconciler := &CoderRunReconciler{}
-
+// TestAbandonCIRepairAttempt pins the terminal abandonment of a repair
+// attempt still in flight: a fenced context is carried into the unsupported
+// settlement the source is owed, an unfenced context is cleared without
+// recording anything because there is no grant to answer, and a fenced
+// abandonment replaces a moot owed close while an unfenced one never
+// disturbs it.
+func TestAbandonCIRepairAttempt(t *testing.T) {
 	noContext := &courierv1alpha1.CoderRun{}
-	reconciler.settleCIRollback(noContext)
+	abandonCIRepairAttempt(noContext)
 	if noContext.Status.CISettlement != nil {
 		t.Fatalf("settlement = %#v with no repair context, want nil", noContext.Status.CISettlement)
 	}
 
 	unfenced := &courierv1alpha1.CoderRun{}
 	unfenced.Status.CIRepair = &courierv1alpha1.CIRepairContext{Head: "abc123", Attempt: 1}
-	reconciler.settleCIRollback(unfenced)
+	abandonCIRepairAttempt(unfenced)
 	if unfenced.Status.CISettlement != nil {
 		t.Fatalf("settlement = %#v for an unfenced context, want nil", unfenced.Status.CISettlement)
 	}
 	if unfenced.Status.CIRepair != nil {
 		t.Fatalf("repair context = %#v, want cleared", unfenced.Status.CIRepair)
+	}
+
+	fenced := &courierv1alpha1.CoderRun{}
+	fenced.Status.CIRepair = &courierv1alpha1.CIRepairContext{Head: "abc123", Attempt: 2, FenceToken: "fence-two"}
+	abandonCIRepairAttempt(fenced)
+	if fenced.Status.CIRepair != nil {
+		t.Fatalf("repair context = %#v, want cleared", fenced.Status.CIRepair)
+	}
+	if fenced.Status.CISettlement == nil {
+		t.Fatal("settlement = nil for a fenced context, want the unsupported abandonment")
+	}
+	if fenced.Status.CISettlement.FenceToken != "fence-two" {
+		t.Fatalf("settlement fence = %q, want the granted fence", fenced.Status.CISettlement.FenceToken)
+	}
+	if fenced.Status.CISettlement.Result != courierv1alpha1.CIParkOutcomeUnsupported {
+		t.Fatalf("settlement result = %q, want unsupported (an abandonment publishes nothing)", fenced.Status.CISettlement.Result)
+	}
+	if fenced.Status.CISettlement.Head != "" {
+		t.Fatalf("settlement head = %q, want empty (only a repush carries a head)", fenced.Status.CISettlement.Head)
+	}
+
+	// A fenced in-flight attempt carries the newest owed close: a source
+	// grants a later reservation only after the earlier outcome committed,
+	// so the stale record is moot and the live fence is the one that must
+	// not outlive the run.
+	owed := &courierv1alpha1.CoderRun{}
+	owed.Status.CIRepair = &courierv1alpha1.CIRepairContext{Head: "abc123", Attempt: 2, FenceToken: "fence-one"}
+	owed.Status.CISettlement = &courierv1alpha1.CISettlement{
+		FenceToken: "fence-zero",
+		Result:     courierv1alpha1.CIParkOutcomeRepushed,
+		Head:       "def456",
+	}
+	abandonCIRepairAttempt(owed)
+	if owed.Status.CIRepair != nil {
+		t.Fatalf("repair context = %#v, want cleared", owed.Status.CIRepair)
+	}
+	if owed.Status.CISettlement == nil ||
+		owed.Status.CISettlement.FenceToken != "fence-one" ||
+		owed.Status.CISettlement.Result != courierv1alpha1.CIParkOutcomeUnsupported ||
+		owed.Status.CISettlement.Head != "" {
+		t.Fatalf("settlement = %#v, want the live fence's unsupported abandonment to replace the moot owed close", owed.Status.CISettlement)
+	}
+
+	// An unfenced context owes nothing and never destroys an owed close.
+	unfencedOwed := &courierv1alpha1.CoderRun{}
+	unfencedOwed.Status.CIRepair = &courierv1alpha1.CIRepairContext{Head: "abc123", Attempt: 1}
+	unfencedOwed.Status.CISettlement = &courierv1alpha1.CISettlement{
+		FenceToken: "fence-zero",
+		Result:     courierv1alpha1.CIParkOutcomeRepushed,
+		Head:       "def456",
+	}
+	abandonCIRepairAttempt(unfencedOwed)
+	if unfencedOwed.Status.CIRepair != nil {
+		t.Fatalf("repair context = %#v, want cleared", unfencedOwed.Status.CIRepair)
+	}
+	if unfencedOwed.Status.CISettlement.Result != courierv1alpha1.CIParkOutcomeRepushed ||
+		unfencedOwed.Status.CISettlement.FenceToken != "fence-zero" || unfencedOwed.Status.CISettlement.Head != "def456" {
+		t.Fatalf("settlement = %#v, want the already-owed close untouched", unfencedOwed.Status.CISettlement)
 	}
 }
