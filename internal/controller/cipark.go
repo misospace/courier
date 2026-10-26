@@ -467,6 +467,15 @@ func (r *CoderRunReconciler) observeCIPark(ctx context.Context, run *courierv1al
 		}
 		return false, result, nil
 	}
+	// The attempt in flight, if any. Its head is what the park decides on
+	// whether that attempt made progress, and its fence token is what the
+	// source must be handed back when the attempt ends.
+	attempt := run.Status.CIRepair
+	fenceToken := ""
+	if attempt != nil {
+		fenceToken = attempt.FenceToken
+	}
+	head, attributable := publishedHead(run, observation.Head)
 	// Version skew is latched at the source: a deployment that answered one
 	// park-family route with a bare 404 has adopted none of them, and that
 	// observation is permanent for the process. A park established against
@@ -478,23 +487,35 @@ func (r *CoderRunReconciler) observeCIPark(ctx context.Context, run *courierv1al
 	// The refusal sentinels below keep every in-flight exchange failing
 	// closed, and a lookup that cannot answer the capability question
 	// proceeds with today's behavior rather than guessing.
+	//
+	// The unaccountable head's diagnostic is not the fallback's to skip: it
+	// records why the loop never engaged, whatever engagement the source
+	// could support, so the attribution below is decided before the early
+	// return (#550).
 	if run.Status.CIPark == nil && run.Status.CIRepair == nil {
 		adapter, _, err := r.adapterAndWorkItem(run)
 		if err != nil {
 			log.FromContext(ctx).V(1).Info("source adapter lookup failed; CI park degradation unknown", "run", run.Name, "error", err.Error())
 		} else if probe, ok := adapter.(source.CIParkLifecycleProbe); ok && probe.CIParkLifecycleUnsupported() {
+			if !attributable {
+				if err := r.markCIParkInapplicable(ctx, run, observation); err != nil {
+					return false, ctrl.Result{}, err
+				}
+				return false, ctrl.Result{}, nil
+			}
+			// The head is attributable, so any inapplicability recorded
+			// while the evidence was missing is obsolete — cleared here,
+			// ahead of the fallback's ordinary grading, because no park
+			// will ever be established on this source to clear it.
+			before := run.DeepCopy()
+			if clearCIParkInapplicable(run) {
+				if err := r.patchStatus(ctx, before, run); err != nil {
+					return false, ctrl.Result{}, err
+				}
+			}
 			return false, ctrl.Result{}, nil
 		}
 	}
-	// The attempt in flight, if any. Its head is what the park decides on
-	// whether that attempt made progress, and its fence token is what the
-	// source must be handed back when the attempt ends.
-	attempt := run.Status.CIRepair
-	fenceToken := ""
-	if attempt != nil {
-		fenceToken = attempt.FenceToken
-	}
-	head, attributable := publishedHead(run, observation.Head)
 	if !attributable {
 		if run.Status.CIPark == nil {
 			// The run published nothing this operator can account for:

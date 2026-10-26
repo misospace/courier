@@ -4334,3 +4334,57 @@ func TestEnvtestCIParkRemovedPolicyClearsInapplicability(t *testing.T) {
 		t.Fatalf("condition = %#v, want none once the lane stopped declaring a policy", cond)
 	}
 }
+
+// TestEnvtestCIParkUnsupportedLifecycleStillSignalsInapplicable pins the
+// diagnostic across a source whose CI-park lifecycle is latched unsupported:
+// the fallback to the ordinary path is the source's, but the unaccountable
+// head's record is the observation's own, so the condition is still set on a
+// legacy head, still idempotent across the poll cadence, and still cleared
+// when the publication evidence arrives late — with no lifecycle exchange
+// ever offered to a source that cannot answer one.
+func TestEnvtestCIParkUnsupportedLifecycleStillSignalsInapplicable(t *testing.T) {
+	if envtestClient == nil {
+		t.Skip("KUBEBUILDER_ASSETS is not set")
+	}
+
+	adapter := &latchedParkSource{unsupported: true}
+	h := newCIParkHarness(t, "cipark-unsupported-lifecycle", ciparkPolicy(2), adapter)
+
+	h.world.set(PRObservation{PR: "42", Head: "sha-legacy", Checks: []CheckObservation{{Name: "build", State: CheckStatePending}}})
+	h.toVerifying()
+	h.reconcile()
+
+	run := h.run()
+	if run.Status.CIPark != nil {
+		t.Fatalf("park record = %#v, want none: the source cannot support the lifecycle", run.Status.CIPark)
+	}
+	cond := apimeta.FindStatusCondition(run.Status.Conditions, courierv1alpha1.ConditionCIRepairInapplicable)
+	if cond == nil || cond.Status != metav1.ConditionTrue || cond.Reason != courierv1alpha1.ConditionReasonHeadUnattributable {
+		t.Fatalf("condition = %#v, want %q True with reason %q despite the unsupported lifecycle", cond, courierv1alpha1.ConditionCIRepairInapplicable, courierv1alpha1.ConditionReasonHeadUnattributable)
+	}
+
+	// The signal is idempotent across the run's own poll cadence.
+	h.reconcile()
+	if got := h.launchCount(h.name); got != 1 {
+		t.Fatalf("launches after the idempotent poll = %d, want 1 (the fallback never wakes the coordinator)", got)
+	}
+
+	// The publication evidence arrives: the head becomes attributable, the
+	// obsolete condition clears even though no park will ever be
+	// established on this source, and no lifecycle exchange was ever
+	// offered to it.
+	h.publishHead("sha-legacy")
+	h.reconcile()
+
+	final := h.run()
+	if cond := apimeta.FindStatusCondition(final.Status.Conditions, courierv1alpha1.ConditionCIRepairInapplicable); cond != nil {
+		t.Fatalf("condition = %#v, want none once the head is attributable", cond)
+	}
+	if final.Status.CIPark != nil {
+		t.Fatalf("park record = %#v, want none: the source cannot support the lifecycle", final.Status.CIPark)
+	}
+	if len(adapter.parks) != 0 || len(adapter.reservations) != 0 || len(adapter.releases) != 0 {
+		t.Fatalf("lifecycle exchanges = %d parks, %d reservations, %d releases, want none offered to a latched-unsupported source",
+			len(adapter.parks), len(adapter.reservations), len(adapter.releases))
+	}
+}

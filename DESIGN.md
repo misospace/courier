@@ -244,7 +244,9 @@ decides nothing: no head is fabricated for the loop to park on, the ordinary
 post-publication grading path is unchanged, and it is never set alongside a
 park record. An observation with no head at all never sets it. It clears when
 its premise ends — the head becomes attributable, folded into the same status
-write that establishes or advances the park, or the lane stops declaring a
+write that establishes or advances the park, or, when the source's CI-park
+lifecycle is latched unsupported and no park can ever be established, folded
+ahead of that fallback to the ordinary path — or the lane stops declaring a
 repair policy, folded ahead of the abandon (#553) that returns the run to the
 ordinary path. A
 repair attempt that publishes a new head advances the park to
