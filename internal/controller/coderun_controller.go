@@ -580,7 +580,8 @@ func (r *CoderRunReconciler) reconcileTerminal(ctx context.Context, run *courier
 			// starts only once the close has landed — the same posture a
 			// Done run keeps while its close is outstanding. The pending
 			// record is the owed-close signal: it is cleared only by a
-			// successful delivery, which is the proof of delivery.
+			// delivery the source accepted or a refusal proving the owed
+			// transition moot, each the proof of delivery.
 			log.FromContext(ctx).V(1).Info("terminal run still owes the source a park close; leaving it for retention",
 				"run", run.Name, "phase", run.Status.Phase)
 			return ctrl.Result{}, nil

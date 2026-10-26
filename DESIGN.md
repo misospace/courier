@@ -267,7 +267,17 @@ A settled outcome the source has not accepted — a lost response, a restart, a
 report that never landed — stays pending on the run as durable retry intent:
 the fence travels with the record, later reconciles re-present it with the
 same idempotency key so the source replays the committed transition, and
-clearing the record is the proof of delivery. The park notice carries the
+clearing the record is the proof of delivery. A refusal proving the fenced
+transition is not this record's to make any more resolves the settlement as
+moot instead: a refusal classified as `ErrStaleWork` or `ErrSuperseded` —
+Dispatch's cirepair vocabulary for a transition already committed
+(`fence-settled`), a fence consumed or no longer ours (`fence-gone`,
+generation mismatch), or work the queue no longer holds
+(`opportunity-missing`) — can never land on retry, and holding the record
+would keep the terminal reap gate re-presenting it at the settlement cadence
+forever; the record drops as the proof of delivery, exactly as the advisory
+release resolves moot. Every other failure, which may be transient, keeps
+the retry posture. The park notice carries the
 same durability while the opportunity is active and expires with it — a late
 notice would defer the source against nothing. The ending itself never waits
 on the source, and a pending close never preempts a terminal run's lifecycle

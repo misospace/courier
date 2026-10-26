@@ -1676,6 +1676,84 @@ func TestEnvtestCIParkUnsupportedSettlementStopsRetrying(t *testing.T) {
 	}
 }
 
+// mootSettlementSource models a source whose fence no longer accepts this
+// run's settlement: the fenced outcome is refused with the coded refusal
+// Dispatch's cirepair route answers a settled-or-vacated fence with —
+// fence-settled mapped to source.ErrStaleWork (the transition is already
+// committed) or fence-gone mapped to source.ErrSuperseded (the fence is
+// consumed or gone). Neither can ever clear on retry, and a refusal is not
+// a delivery, so nothing is recorded.
+type mootSettlementSource struct {
+	ciparkSource
+	refusal error
+}
+
+func (s *mootSettlementSource) ReportCIRepair(_ context.Context, item source.WorkItem, outcome source.CIRepairOutcome) error {
+	s.items = append(s.items, item)
+	return s.refusal
+}
+
+// TestEnvtestCIParkMootSettlementStopsRetrying pins the moot settlement: a
+// pending settlement refused fence-settled (source.ErrStaleWork) or
+// fence-gone (source.ErrSuperseded) proves the fenced transition is not
+// this record's to deliver any more, so the record drops as the proof of
+// delivery — mirroring the release path — instead of the terminal reap gate
+// re-presenting it at the settlement cadence forever. The fix-PR case pins
+// the release of the Failed-run retention gate itself, where the run is
+// reaped only once it owes no close.
+func TestEnvtestCIParkMootSettlementStopsRetrying(t *testing.T) {
+	if envtestClient == nil {
+		t.Skip("KUBEBUILDER_ASSETS is not set")
+	}
+	for name, tc := range map[string]struct {
+		refusal error
+		mode    courierv1alpha1.Mode
+		phase   courierv1alpha1.Phase
+	}{
+		"settled-fence":        {source.ErrStaleWork, courierv1alpha1.ModeResolveIssue, courierv1alpha1.PhaseHandedOff},
+		"gone-fence":           {source.ErrSuperseded, courierv1alpha1.ModeResolveIssue, courierv1alpha1.PhaseHandedOff},
+		"failed-run-retention": {source.ErrStaleWork, courierv1alpha1.ModeFixPR, courierv1alpha1.PhaseFailed},
+	} {
+		t.Run(name, func(t *testing.T) {
+			adapter := &mootSettlementSource{refusal: tc.refusal}
+			h := newCIParkHarnessMode(t, "cipark-moot-settlement-"+name, ciparkPolicy(2), adapter, tc.mode)
+			if tc.mode == courierv1alpha1.ModeFixPR {
+				h.reconciler.PRHeadResolver = ExistingPRHeadResolverFunc(func(_ context.Context, run *courierv1alpha1.CoderRun) (HeadRef, error) {
+					return HeadRef{Repo: run.Spec.Repo, Branch: "refs/pull/14/head", SHA: "sha-1"}, nil
+				})
+			}
+			h.park("sha-1", CheckObservation{Name: "build", State: CheckStatePending})
+			h.settleFailure("sha-1", "build")
+			h.reconcile()
+			h.reconcile()
+			// The repair publishes nothing: the attempt ends exhausted, and
+			// the settlement carries the fence the reservation granted.
+			h.world.set(redObservation("sha-1", "build"))
+			h.reconcile()
+			if got := h.phase(); got != tc.phase {
+				t.Fatalf("phase after the repair published nothing = %q, want %s", got, tc.phase)
+			}
+			ended := h.run()
+			if ended.Status.CISettlement != nil {
+				t.Fatalf("status.ciSettlement = %#v after the moot refusal, want nil (the drop is the proof of delivery)", ended.Status.CISettlement)
+			}
+			if len(adapter.outcomes) != 0 {
+				t.Fatalf("source outcomes = %d, want 0 (a refusal is never recorded)", len(adapter.outcomes))
+			}
+			// The terminal run stays terminal and owes nothing: a further
+			// reconcile never re-presents the moot settlement.
+			h.reconcile()
+			settled := h.run()
+			if got := settled.Status.Phase; got != tc.phase {
+				t.Fatalf("phase after a further reconcile = %q, want %s", got, tc.phase)
+			}
+			if settled.Status.CISettlement != nil {
+				t.Fatalf("status.ciSettlement = %#v after a further reconcile, want nil", settled.Status.CISettlement)
+			}
+		})
+	}
+}
+
 // failingNoticeSource fails every park notice with an ordinary — retryable,
 // never-permanent — error, modeling a source that answers but never accepts
 // the notice.
