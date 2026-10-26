@@ -382,6 +382,25 @@ func (r *CoderRunReconciler) observeCIPark(ctx context.Context, run *courierv1al
 		// ordinary path settles it as a human-facing condition.
 		return false, ctrl.Result{}, nil
 	}
+	// Version skew is latched at the source: a deployment that answered one
+	// park-family route with a bare 404 has adopted none of them, and that
+	// observation is permanent for the process. A park established against
+	// it could only churn 404s through the park window and burn a repair
+	// attempt against a queue that can never fence anything, so while
+	// nothing is in flight — no park to advance, no attempt to settle — the
+	// ordinary post-publication grading path is the safe fallback: no park
+	// record, no notice, no reservation, nothing the source could refuse.
+	// The refusal sentinels below keep every in-flight exchange failing
+	// closed, and a lookup that cannot answer the capability question
+	// proceeds with today's behavior rather than guessing.
+	if run.Status.CIPark == nil && run.Status.CIRepair == nil {
+		adapter, _, err := r.adapterAndWorkItem(run)
+		if err != nil {
+			log.FromContext(ctx).V(1).Info("source adapter lookup failed; CI park degradation unknown", "run", run.Name, "error", err.Error())
+		} else if probe, ok := adapter.(source.CIParkLifecycleProbe); ok && probe.CIParkLifecycleUnsupported() {
+			return false, ctrl.Result{}, nil
+		}
+	}
 	// The attempt in flight, if any. Its head is what the park decides on
 	// whether that attempt made progress, and its fence token is what the
 	// source must be handed back when the attempt ends.

@@ -99,6 +99,7 @@ var _ source.WorkIdentifier = (*Adapter)(nil)
 var _ source.CapacityRecoveryPreparer = (*Adapter)(nil)
 var _ source.CapacityRecovery = (*Adapter)(nil)
 var _ source.CIParkLifecycle = (*Adapter)(nil)
+var _ source.CIParkLifecycleProbe = (*Adapter)(nil)
 
 // New creates a Dispatch adapter around an injected API client.
 func New(client Client, opts ...Option) *Adapter {
@@ -159,6 +160,22 @@ func (a *Adapter) declareCapabilities() {
 	em.Capability(a.connectorName, connector.CapabilityWorkIdentity, connector.CapabilitySupported)
 	em.Capability(a.connectorName, connector.CapabilityAvailability, connector.CapabilitySupported)
 	em.Availability(a.connectorName, connector.AvailabilityUnknown)
+}
+
+// CIParkLifecycleUnsupported answers source.CIParkLifecycleProbe: whether
+// the concrete client has latched the park lifecycle as unsupported — a bare
+// 404 on a park-family route, permanent version-skew evidence for the
+// process (internal/source/dispatch/cipark.go). Unknown until observed, and
+// a client that is not the concrete HTTP client — every fake — reports
+// not-known-unsupported, so the core parks exactly as it does today.
+func (a *Adapter) CIParkLifecycleUnsupported() bool {
+	probe, ok := a.client.(interface {
+		ciParkLifecycleUnsupported() bool
+	})
+	if !ok {
+		return false
+	}
+	return probe.ciParkLifecycleUnsupported()
 }
 
 // Discover returns Dispatch work that the operator can materialize as
