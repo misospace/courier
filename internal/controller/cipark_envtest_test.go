@@ -1700,6 +1700,86 @@ func TestEnvtestCIParkTerminalAbandonmentSettlesFence(t *testing.T) {
 	}
 }
 
+// TestEnvtestCIParkTerminalBackfillSettlesInheritedFence pins the #564
+// backfill: a run terminalized by a controller predating #570's terminal-write
+// settlement can still carry a live repair fence, and with no expiry on an
+// active deferral the source would defer its hand-out against a run that can
+// never report. The first terminal reconcile records the same unsupported
+// abandonment the terminal write now carries and wakes at the settlement
+// cadence; the next reconcile delivers the recorded close through the source
+// capability; a further reconcile settles nothing again.
+func TestEnvtestCIParkTerminalBackfillSettlesInheritedFence(t *testing.T) {
+	if envtestClient == nil {
+		t.Skip("KUBEBUILDER_ASSETS is not set")
+	}
+	adapter := &ciparkSource{}
+	h := newCIParkHarness(t, "cipark-terminal-backfill", ciparkPolicy(2), adapter)
+
+	// The shape an older controller left behind: the run reached its terminal
+	// phase with the repair attempt — and the source's live fence — still on
+	// the status. No current path produces it, so the scenario writes it the
+	// way the pre-#570 terminal write did.
+	inherited := h.run()
+	inherited.Status.Phase = courierv1alpha1.PhaseHandedOff
+	inherited.Status.CIRepair = &courierv1alpha1.CIRepairContext{Head: "sha-1", Attempt: 1, FenceToken: "fence-one"}
+	if err := envtestClient.Status().Update(context.Background(), inherited); err != nil {
+		t.Fatal(err)
+	}
+
+	result := h.reconcileResult()
+	if result.RequeueAfter != ciparkSettlementRetryDelay {
+		t.Fatalf("requeue = %v, want the settlement cadence %v", result.RequeueAfter, ciparkSettlementRetryDelay)
+	}
+	settled := h.run()
+	if settled.Status.Phase != courierv1alpha1.PhaseHandedOff {
+		t.Fatalf("phase after the backfill = %q, want the run's terminal phase untouched", settled.Status.Phase)
+	}
+	if settled.Status.CIRepair != nil {
+		t.Fatalf("status.ciRepair = %#v after the backfill, want cleared", settled.Status.CIRepair)
+	}
+	if settled.Status.CISettlement == nil {
+		t.Fatal("status.ciSettlement = nil after the backfill, want the unsupported abandonment of the live fence")
+	}
+	if settled.Status.CISettlement.FenceToken != "fence-one" {
+		t.Fatalf("settlement fence token = %q, want the inherited fence fence-one", settled.Status.CISettlement.FenceToken)
+	}
+	if settled.Status.CISettlement.Result != courierv1alpha1.CIParkOutcomeUnsupported {
+		t.Fatalf("settlement result = %q, want unsupported (an abandonment publishes nothing)", settled.Status.CISettlement.Result)
+	}
+	if settled.Status.CISettlement.IdempotencyKey != ciparkRepairKey(settled, 1) {
+		t.Fatalf("settlement idempotency key = %q, want the attempt's own repair key", settled.Status.CISettlement.IdempotencyKey)
+	}
+	if len(adapter.outcomes) != 0 {
+		t.Fatalf("source outcomes = %#v at the backfill write, want the record to precede the delivery attempt", adapter.outcomes)
+	}
+
+	// The following reconcile delivers the recorded abandonment through the
+	// ordinary close delivery, and the cleared record is the proof of
+	// delivery.
+	h.reconcile()
+	delivered := h.run()
+	if delivered.Status.CISettlement != nil {
+		t.Fatalf("status.ciSettlement = %#v after the delivery reconcile, want nil", delivered.Status.CISettlement)
+	}
+	if len(adapter.outcomes) != 1 {
+		t.Fatalf("source outcomes = %#v, want exactly one", adapter.outcomes)
+	}
+	outcome := adapter.outcomes[0]
+	if outcome.FenceToken != "fence-one" || outcome.Result != source.CIRepairUnsupported || outcome.Head != "" {
+		t.Fatalf("delivered outcome = %#v, want the unsupported abandonment of fence-one with no head", outcome)
+	}
+
+	// A further reconcile settles nothing again: the abandonment is
+	// idempotent, and the source is asked exactly once.
+	quiet := h.reconcileResult()
+	if quiet.RequeueAfter != 0 {
+		t.Fatalf("requeue after the quiet reconcile = %v, want no timer", quiet.RequeueAfter)
+	}
+	if len(adapter.outcomes) != 1 {
+		t.Fatalf("source outcomes = %d, want still exactly one", len(adapter.outcomes))
+	}
+}
+
 // TestEnvtestCIParkLostRepushSettlementReplays pins the durable settlement on
 // the repush path: the repushed outcome of a repair whose report is lost is
 // re-presented on the next observation before the loop decides anything

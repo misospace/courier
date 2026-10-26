@@ -524,6 +524,27 @@ func (r *CoderRunReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 // wake interval, never as an early return in front of this dispatch — so the
 // report retry and the merge observation always get their turn.
 func (r *CoderRunReconciler) reconcileTerminal(ctx context.Context, run *courierv1alpha1.CoderRun) (ctrl.Result, error) {
+	// A run that terminalized before the terminal write began settling an
+	// in-flight repair attempt can still carry a live fence, and the source
+	// holds no expiry on an active deferral: it would defer its hand-out
+	// against a run that can never report. Settle the fence the way
+	// transitionTerminal now does, and wake at the settlement cadence so the
+	// recorded close is delivered — from the patch on, the ordinary close
+	// delivery ahead of this dispatch owns every later retry. The
+	// abandonment is idempotent: once patched the attempt is nil and this
+	// path never fires again (#564).
+	if run.Status.CIRepair != nil {
+		before := run.DeepCopy()
+		abandonCIRepairAttempt(run)
+		log.FromContext(ctx).Info("terminal run still held a repair fence; settling it as owed",
+			"run", run.Name, "phase", run.Status.Phase)
+		if err := r.patchStatus(ctx, before, run); err != nil {
+			return ctrl.Result{}, err
+		}
+		if run.Status.CISettlement != nil {
+			return ctrl.Result{RequeueAfter: ciparkSettlementRetryDelay}, nil
+		}
+	}
 	// Capacity availability is independent of source reporting. Persist it
 	// before a pending or unsupported lifecycle report can return early.
 	if isCapacityExhaustionRun(run) {
