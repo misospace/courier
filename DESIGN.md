@@ -216,7 +216,15 @@ reacquires the slot it needs rather than assuming it, and the budget must have
 room. The attempt is consumed in the same status patch as the phase change back
 to **Claimed** — the admission reservation the repair needs, and the phase the
 next reconcile launches a coordinator from — so a controller restart during the
-park cannot wake the coordinator twice for one attempt.
+park cannot wake the coordinator twice for one attempt. A transient launch or
+pre-launch failure rolls a repair-resumed run back to Pending without ending
+the attempt: the context, its evidence, and the source's reservation survive,
+so the re-admitted coordinator launches on the same repair contract and fence
+instead of the original goal, and the no-progress guard still reads the
+attempt as in flight on the head it repairs. The reservation stays held
+through that deferral — the observation window bounds the park loop's own
+waits, not a rolled-back run's wait for re-admission — and it is released
+early only by the run terminalizing and abandoning the attempt.
 
 The head that decides must be the run's own, and it is attributable only
 through durable publication evidence: the confirmed `status.lastCommit` — a
@@ -276,8 +284,11 @@ generation mismatch), or work the queue no longer holds
 (`opportunity-missing`) — can never land on retry, and holding the record
 would keep the terminal reap gate re-presenting it at the settlement cadence
 forever; the record drops as the proof of delivery, exactly as the advisory
-release resolves moot. Every other failure, which may be transient, keeps
-the retry posture. The park notice carries the
+release resolves moot. Every other failure, which may be transient, keeps the retry posture. An
+attempt still in flight when the run ends on a path outside the loop's graded
+endings ends with it: the terminal write settles its fence as `unsupported`,
+so no run that can never report leaves the source deferring its hand-out. The
+park notice carries the
 same durability while the opportunity is active and expires with it — a late
 notice would defer the source against nothing. The ending itself never waits
 on the source, and a pending close never preempts a terminal run's lifecycle
@@ -1878,9 +1889,12 @@ attempts the run consumed, and the outcome of the most recent one (`repushed`,
 of an attempt in flight: the head it repairs, the attempt number, the failed
 configured mechanical checks, and their bounded log evidence. Both are
 operator-owned — the harness never writes them — and the repair context
-outlives a relaunch, so a coordinator that restarts mid-attempt still finds the
-repair goal it needs; the operator clears it once that attempt has been
-observed, or once the park that carried it ends (#553).
+outlives a relaunch and a retryable claim rollback alike, so a coordinator
+that restarts or is re-admitted mid-attempt still finds the repair goal it
+needs. Only documented endings clear it: the attempt's observed end, the park
+that carried it ending (#553), or the terminal write that abandons an attempt
+still in flight when the run terminalizes, which records the abandonment
+settlement the source is owed.
 
 ### `LaneProfile`
 

@@ -1348,18 +1348,24 @@ func TestEnvtestCIParkLostSettlementReplays(t *testing.T) {
 	}
 }
 
-// TestEnvtestCIParkRollbackSettlesGrantedFence pins the rollback's
-// settlement: a repair-resumed run whose claim is rolled back to Pending
-// after the source granted its reservation records the settlement for that
-// fence. A rollback publishes nothing, so the outcome arrives as unsupported
-// with no head, and the following reconcile delivers it to the source before
-// the run is admitted again — the cleared record is the proof of delivery.
-func TestEnvtestCIParkRollbackSettlesGrantedFence(t *testing.T) {
+// TestEnvtestCIParkRollbackPreservesRepairContext pins #547's rollback
+// posture: a repair-resumed run whose launch fails transiently keeps the
+// repair context intact through the rollback to Pending — the attempt is
+// deferred, not over. Neither the failed launch (releaseClaim) nor a failed
+// pre-launch guard (rejectClaim) reports anything to the source or records a
+// settlement: the reservation stays held for the outcome the park loop will
+// eventually present. The re-admitted run launches on the same fence with
+// the same context, re-derives the branch identity the rollback cleared, and
+// when its session publishes nothing the preserved attempt fires the
+// no-progress guard: the run hands off exhausted with red CI instead of
+// reaching review, and the delivered outcome carries the one fence the
+// source granted.
+func TestEnvtestCIParkRollbackPreservesRepairContext(t *testing.T) {
 	if envtestClient == nil {
 		t.Skip("KUBEBUILDER_ASSETS is not set")
 	}
 	adapter := &ciparkSource{}
-	h := newCIParkHarness(t, "cipark-rollback-settlement", ciparkPolicy(2), adapter)
+	h := newCIParkHarness(t, "cipark-rollback-preserve", ciparkPolicy(2), adapter)
 
 	h.park("sha-1", CheckObservation{Name: "build", State: CheckStatePending})
 	h.settleFailure("sha-1", "build")
@@ -1373,17 +1379,18 @@ func TestEnvtestCIParkRollbackSettlesGrantedFence(t *testing.T) {
 	if len(adapter.reservations) != 1 {
 		t.Fatalf("repair reservations = %#v, want exactly one", adapter.reservations)
 	}
-	granted := adapter.reservations[0].FenceToken
+	granted := resumed.Status.CIRepair.FenceToken
 	if granted == "" {
-		t.Fatal("reservation fence token = empty, want the source-granted fence")
+		t.Fatal("repair fence token = empty, want the source-granted fence")
 	}
-	if resumed.Status.CIRepair.FenceToken != granted {
-		t.Fatalf("repair fence token = %q, want the granted token %q", resumed.Status.CIRepair.FenceToken, granted)
-	}
+	wantContext := resumed.Status.CIRepair.DeepCopy()
+	branchBefore := resumed.Status.Branch
 
-	// The launch of the resumed coordinator fails, and the claim rolls back
-	// to Pending. The rollback carries the granted fence out of the context
-	// it was about to lose into the settlement, in the same status write.
+	// The launch of the resumed coordinator fails transiently, and the claim
+	// rolls back to Pending. The repair context survives intact: it carries
+	// the repair goal, the evidence, and the fence of an attempt the operator
+	// intends to resume. The branch identity is still rolled back, because
+	// re-admission re-derives it.
 	wantErr := errors.New("cipark envtest launch failed")
 	h.reconciler.Launch = func(context.Context, *courierv1alpha1.CoderRun) error { return wantErr }
 	if _, err := h.reconcileOutcome(); !errors.Is(err, wantErr) {
@@ -1393,25 +1400,152 @@ func TestEnvtestCIParkRollbackSettlesGrantedFence(t *testing.T) {
 	if got := rolledBack.Status.Phase; got != courierv1alpha1.PhasePending {
 		t.Fatalf("phase after the failed launch = %q, want Pending", got)
 	}
-	if rolledBack.Status.CIRepair != nil {
-		t.Fatalf("status.ciRepair = %#v after the rollback, want nil", rolledBack.Status.CIRepair)
+	if !reflect.DeepEqual(rolledBack.Status.CIRepair, wantContext) {
+		t.Fatalf("status.ciRepair = %#v after the rollback, want the attempt context %#v intact", rolledBack.Status.CIRepair, wantContext)
 	}
-	if rolledBack.Status.CISettlement == nil {
-		t.Fatal("status.ciSettlement = nil after the rollback, want the settlement for the granted fence")
+	if rolledBack.Status.CISettlement != nil {
+		t.Fatalf("status.ciSettlement = %#v after a transient rollback, want nil (a deferred attempt owes no outcome yet)", rolledBack.Status.CISettlement)
 	}
-	if rolledBack.Status.CISettlement.FenceToken != granted {
-		t.Fatalf("settlement fence token = %q, want the granted token %q", rolledBack.Status.CISettlement.FenceToken, granted)
+	if rolledBack.Status.Branch != "" || rolledBack.Status.HeadRepo != "" || rolledBack.Status.HeadSHA != "" {
+		t.Fatalf("branch identity after the rollback = %q/%q/%q, want cleared for re-derivation",
+			rolledBack.Status.Branch, rolledBack.Status.HeadRepo, rolledBack.Status.HeadSHA)
 	}
-	if rolledBack.Status.CISettlement.Result != courierv1alpha1.CIParkOutcomeUnsupported {
-		t.Fatalf("settlement result = %q, want unsupported (a rollback publishes nothing)", rolledBack.Status.CISettlement.Result)
+	if rolledBack.Status.CIPark == nil || rolledBack.Status.CIPark.Head != "sha-1" || rolledBack.Status.CIPark.Attempts != 1 {
+		t.Fatalf("park record after the rollback = %#v, want the sha-1 park with its consumed attempt", rolledBack.Status.CIPark)
 	}
-	if rolledBack.Status.CISettlement.Head != "" {
-		t.Fatalf("settlement head = %q, want empty (only a repush carries a head)", rolledBack.Status.CISettlement.Head)
+	if len(adapter.outcomes) != 0 {
+		t.Fatalf("source outcomes = %#v, want none (a deferred attempt reports nothing)", adapter.outcomes)
 	}
 
-	// The following reconcile delivers the settlement to the source before
-	// the run is admitted again.
+	// The pre-launch guard's transient refusal rolls back the same way: the
+	// re-admission that reaches it must not drop the context either.
 	h.reconciler.Launch = h.launch
+	preErr := errors.New("cipark envtest pre-launch refused")
+	adapter.preLaunchErr = preErr
+	if _, err := h.reconcileOutcome(); !errors.Is(err, preErr) {
+		t.Fatalf("Reconcile() error = %v, want %v", err, preErr)
+	}
+	guarded := h.run()
+	if got := guarded.Status.Phase; got != courierv1alpha1.PhasePending {
+		t.Fatalf("phase after the failed pre-launch = %q, want Pending", got)
+	}
+	if !reflect.DeepEqual(guarded.Status.CIRepair, wantContext) {
+		t.Fatalf("status.ciRepair = %#v after the failed pre-launch, want the attempt context %#v intact", guarded.Status.CIRepair, wantContext)
+	}
+	if guarded.Status.CISettlement != nil || len(adapter.outcomes) != 0 {
+		t.Fatalf("settlement = %#v outcomes = %#v after the failed pre-launch, want no settlement and no report", guarded.Status.CISettlement, adapter.outcomes)
+	}
+
+	// Re-admission runs the repair, not the original task: the same context
+	// is in place when the coordinator launches, the branch identity is
+	// re-derived to the run's own published branch, and the source is asked
+	// for no second reservation — the fence travels with the run.
+	adapter.preLaunchErr = nil
+	h.reconcile()
+	if got := h.phase(); got != courierv1alpha1.PhaseRunning {
+		t.Fatalf("phase after the re-admission = %q, want Running", got)
+	}
+	relaunched := h.run()
+	if relaunched.Status.Branch != branchBefore {
+		t.Fatalf("branch after re-admission = %q, want %q (the repair keeps publishing to the run's own branch)", relaunched.Status.Branch, branchBefore)
+	}
+	if !reflect.DeepEqual(relaunched.Status.CIRepair, wantContext) {
+		t.Fatalf("status.ciRepair = %#v at the relaunch, want the attempt context %#v intact", relaunched.Status.CIRepair, wantContext)
+	}
+	if len(adapter.reservations) != 1 {
+		t.Fatalf("repair reservations = %#v, want exactly one across the rollback", adapter.reservations)
+	}
+	if got := h.launchCount(h.name); got != 2 {
+		t.Fatalf("launches = %d, want 2 (the initial launch and the repaired relaunch)", got)
+	}
+
+	// The relaunched session publishes nothing. The preserved attempt is what
+	// lets the loop see that: the same red head is no progress, the attempt
+	// ends exhausted with the fence it carried, and a red-CI resolve-issue
+	// run hands off — it never reaches review on the original goal.
+	h.reconcile()
+	if got := h.phase(); got != courierv1alpha1.PhaseVerifying {
+		t.Fatalf("phase after the relaunched coordinator exited = %q, want Verifying", got)
+	}
+	h.reconcile()
+	if got := h.phase(); got != courierv1alpha1.PhaseHandedOff {
+		t.Fatalf("phase after the no-progress repair = %q, want HandedOff (red CI never settles onto review)", got)
+	}
+	ended := h.run()
+	if ended.Status.CIPark == nil || ended.Status.CIPark.LastOutcome != courierv1alpha1.CIParkOutcomeExhausted {
+		t.Fatalf("park record after the no-progress repair = %#v, want lastOutcome exhausted", ended.Status.CIPark)
+	}
+	if ended.Status.CIRepair != nil {
+		t.Fatalf("status.ciRepair = %#v after the attempt ended, want nil", ended.Status.CIRepair)
+	}
+	if ended.Status.CISettlement != nil {
+		t.Fatalf("status.ciSettlement = %#v after the delivered settlement, want nil", ended.Status.CISettlement)
+	}
+	if len(adapter.outcomes) != 1 {
+		t.Fatalf("source outcomes = %#v, want exactly one", adapter.outcomes)
+	}
+	outcome := adapter.outcomes[0]
+	if outcome.FenceToken != granted {
+		t.Fatalf("delivered outcome fence token = %q, want the granted token %q (the fence survived the rollback)", outcome.FenceToken, granted)
+	}
+	if outcome.IdempotencyKey != adapter.reservations[0].IdempotencyKey {
+		t.Fatalf("delivered outcome idempotency key = %q, want the reservation key %q", outcome.IdempotencyKey, adapter.reservations[0].IdempotencyKey)
+	}
+	if outcome.Result != source.CIRepairExhausted {
+		t.Fatalf("delivered outcome result = %q, want exhausted", outcome.Result)
+	}
+}
+
+// TestEnvtestCIParkTerminalAbandonmentSettlesFence pins #547's abandonment
+// posture: a repair-resumed run whose launch fails with a permanent
+// rejection terminalizes NeedsHuman without ever reaching the park loop's
+// graded endings, and the terminal write carries the unsupported settlement
+// for the attempt still in flight. The following reconcile delivers it —
+// a run that can never report must not leave the source deferring its
+// hand-out against the granted reservation.
+func TestEnvtestCIParkTerminalAbandonmentSettlesFence(t *testing.T) {
+	if envtestClient == nil {
+		t.Skip("KUBEBUILDER_ASSETS is not set")
+	}
+	adapter := &ciparkSource{}
+	h := newCIParkHarness(t, "cipark-terminal-abandon", ciparkPolicy(2), adapter)
+
+	h.park("sha-1", CheckObservation{Name: "build", State: CheckStatePending})
+	h.settleFailure("sha-1", "build")
+	resumed := h.run()
+	granted := resumed.Status.CIRepair.FenceToken
+	if granted == "" {
+		t.Fatal("repair fence token = empty, want the source-granted fence")
+	}
+
+	h.reconciler.Launch = func(context.Context, *courierv1alpha1.CoderRun) error {
+		return secureNeedsHuman(laneConfigReason, "lane %q cannot launch this run", h.laneName)
+	}
+	if _, err := h.reconcileOutcome(); err != nil {
+		t.Fatalf("Reconcile() error = %v, want the permanent rejection handled", err)
+	}
+	ended := h.run()
+	if got := ended.Status.Phase; got != courierv1alpha1.PhaseNeedsHuman {
+		t.Fatalf("phase after the permanent rejection = %q, want NeedsHuman", got)
+	}
+	if ended.Status.CIRepair != nil {
+		t.Fatalf("status.ciRepair = %#v after the terminal abandonment, want nil", ended.Status.CIRepair)
+	}
+	if ended.Status.CISettlement == nil {
+		t.Fatal("status.ciSettlement = nil after the terminal abandonment, want the unsupported settlement for the granted fence")
+	}
+	if ended.Status.CISettlement.FenceToken != granted {
+		t.Fatalf("settlement fence token = %q, want the granted token %q", ended.Status.CISettlement.FenceToken, granted)
+	}
+	if ended.Status.CISettlement.Result != courierv1alpha1.CIParkOutcomeUnsupported {
+		t.Fatalf("settlement result = %q, want unsupported (an abandonment publishes nothing)", ended.Status.CISettlement.Result)
+	}
+	if len(adapter.outcomes) != 0 {
+		t.Fatalf("source outcomes = %#v at the terminal write, want the record to precede the delivery attempt", adapter.outcomes)
+	}
+
+	// The following reconcile delivers the recorded abandonment before the
+	// terminal dispatch, and the cleared record is the proof of delivery.
 	h.reconcile()
 	delivered := h.run()
 	if delivered.Status.CISettlement != nil {
