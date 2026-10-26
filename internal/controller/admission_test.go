@@ -4,10 +4,13 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"strings"
 	"testing"
+	"time"
 
 	corev1 "k8s.io/api/core/v1"
 	rbacv1 "k8s.io/api/rbac/v1"
+	apimeta "k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
@@ -683,6 +686,163 @@ func TestResumeClaimedStaysClaimedWhenCoordinatorSlotIsTerminating(t *testing.T)
 	}
 	if next.Status.Phase != courierv1alpha1.PhaseClaimed {
 		t.Fatalf("next phase = %q, want Claimed; the run must not record Running while the slot is being torn down", next.Status.Phase)
+	}
+}
+
+// TestReconcileEscalatesStuckTerminatingCollisionToNeedsHuman is the #560
+// bound: a run-owned coordinator pod whose deletion is in flight holds the
+// deterministic slot, so the Claimed run requeues as provisioning-in-flight
+// forever while the pod lingers. Once the pod has been terminating longer
+// than the configured grace the run terminalizes NeedsHuman naming the
+// blocking pod, which frees the lane slot and releases the source claim.
+func TestReconcileEscalatesStuckTerminatingCollisionToNeedsHuman(t *testing.T) {
+	controller := true
+	run := admissionRun("next", "local", courierv1alpha1.PhasePending)
+	run.UID = types.UID("run-uid")
+	since := metav1.NewTime(time.Now().Add(-10 * time.Minute))
+	existing := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:              "next-coordinator",
+			Namespace:         admissionNamespace,
+			UID:               types.UID("blocking-pod-uid"),
+			DeletionTimestamp: &since,
+			Finalizers:        []string{"keep.test/deletion"},
+			Labels:            map[string]string{executor.LabelRun: "next"},
+			OwnerReferences: []metav1.OwnerReference{{
+				APIVersion: courierv1alpha1.GroupVersion.String(),
+				Kind:       "CoderRun",
+				Name:       "next",
+				UID:        run.UID,
+				Controller: &controller,
+			}},
+		},
+	}
+	client := launcherClientForAdmission(t,
+		admissionLaneWithCoordinator("local", 1),
+		run,
+		existing,
+	)
+	src := &admissionSource{}
+	reconciler := &CoderRunReconciler{
+		Client:                     client,
+		Sources:                    NewSourceRegistry(map[string]source.Adapter{"test": src}),
+		StatusWriter:               fakeStatusWriter{client: client},
+		Launch:                     launchFuncForAdmission(client, "example/opencode:test"),
+		ProvisioningCollisionGrace: 5 * time.Minute,
+	}
+
+	result, err := reconciler.Reconcile(context.Background(), admissionRequest("next"))
+	if err != nil {
+		t.Fatalf("Reconcile() error = %v, want nil; the escalation is a terminal transition, not a reconcile failure", err)
+	}
+	if result.RequeueAfter != 0 {
+		t.Fatalf("RequeueAfter = %v, want 0; a NeedsHuman run must not keep cycling the 5s provisioning-in-flight requeue", result.RequeueAfter)
+	}
+
+	var next courierv1alpha1.CoderRun
+	if err := client.Get(context.Background(), admissionKey("next"), &next); err != nil {
+		t.Fatalf("get next run: %v", err)
+	}
+	if next.Status.Phase != courierv1alpha1.PhaseNeedsHuman {
+		t.Fatalf("next phase = %q, want NeedsHuman; a slot blocked past the grace must surface for a human", next.Status.Phase)
+	}
+	cond := apimeta.FindStatusCondition(next.Status.Conditions, provisioningCollisionCondition)
+	if cond == nil {
+		t.Fatalf("ProvisioningCollision condition missing; the operator needs the blocking pod's identity in status")
+	}
+	if cond.Reason != provisioningCollisionStuckTerminatingReason {
+		t.Fatalf("condition reason = %q, want StuckTerminatingPod", cond.Reason)
+	}
+	if !strings.Contains(cond.Message, "next-coordinator") || !strings.Contains(cond.Message, "blocking-pod-uid") {
+		t.Fatalf("condition message = %q, want it to name the blocking pod and its UID", cond.Message)
+	}
+
+	var runs courierv1alpha1.CoderRunList
+	if err := client.List(context.Background(), &runs); err != nil {
+		t.Fatalf("list runs: %v", err)
+	}
+	if got := admittedCount(runs.Items, "local"); got != 0 {
+		t.Fatalf("admittedCount(local) after escalation = %d, want 0; a terminal run must not consume capacity", got)
+	}
+	if len(src.released) != 1 {
+		t.Fatalf("source releases = %v, want exactly one; the terminal transition must release the source claim", src.released)
+	}
+}
+
+// TestResumeClaimedEscalatesStuckTerminatingCollisionToNeedsHuman covers the
+// relaunch path of the #560 bound: resumeClaimed hits the same stuck
+// terminating slot and must terminalize the same way once the grace expires.
+func TestResumeClaimedEscalatesStuckTerminatingCollisionToNeedsHuman(t *testing.T) {
+	controller := true
+	run := admissionRun("next", "local", courierv1alpha1.PhaseClaimed)
+	run.UID = types.UID("run-uid")
+	since := metav1.NewTime(time.Now().Add(-10 * time.Minute))
+	existing := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:              "next-coordinator",
+			Namespace:         admissionNamespace,
+			UID:               types.UID("blocking-pod-uid"),
+			DeletionTimestamp: &since,
+			Finalizers:        []string{"keep.test/deletion"},
+			Labels:            map[string]string{executor.LabelRun: "next"},
+			OwnerReferences: []metav1.OwnerReference{{
+				APIVersion: courierv1alpha1.GroupVersion.String(),
+				Kind:       "CoderRun",
+				Name:       "next",
+				UID:        run.UID,
+				Controller: &controller,
+			}},
+		},
+	}
+	client := launcherClientForAdmission(t,
+		admissionLaneWithCoordinator("local", 1),
+		run,
+		existing,
+	)
+	src := &admissionSource{}
+	reconciler := &CoderRunReconciler{
+		Client:                     client,
+		Sources:                    NewSourceRegistry(map[string]source.Adapter{"test": src}),
+		StatusWriter:               fakeStatusWriter{client: client},
+		Launch:                     launchFuncForAdmission(client, "example/opencode:test"),
+		ProvisioningCollisionGrace: 5 * time.Minute,
+	}
+
+	result, err := reconciler.Reconcile(context.Background(), admissionRequest("next"))
+	if err != nil {
+		t.Fatalf("Reconcile() error = %v, want nil; the escalation is a terminal transition, not a reconcile failure", err)
+	}
+	if result.RequeueAfter != 0 {
+		t.Fatalf("RequeueAfter = %v, want 0; a NeedsHuman run must not keep cycling the 5s provisioning-in-flight requeue", result.RequeueAfter)
+	}
+
+	var next courierv1alpha1.CoderRun
+	if err := client.Get(context.Background(), admissionKey("next"), &next); err != nil {
+		t.Fatalf("get next run: %v", err)
+	}
+	if next.Status.Phase != courierv1alpha1.PhaseNeedsHuman {
+		t.Fatalf("next phase = %q, want NeedsHuman; a slot blocked past the grace must surface for a human", next.Status.Phase)
+	}
+	cond := apimeta.FindStatusCondition(next.Status.Conditions, provisioningCollisionCondition)
+	if cond == nil {
+		t.Fatalf("ProvisioningCollision condition missing; the operator needs the blocking pod's identity in status")
+	}
+	if cond.Reason != provisioningCollisionStuckTerminatingReason {
+		t.Fatalf("condition reason = %q, want StuckTerminatingPod", cond.Reason)
+	}
+	if !strings.Contains(cond.Message, "next-coordinator") || !strings.Contains(cond.Message, "blocking-pod-uid") {
+		t.Fatalf("condition message = %q, want it to name the blocking pod and its UID", cond.Message)
+	}
+
+	var runs courierv1alpha1.CoderRunList
+	if err := client.List(context.Background(), &runs); err != nil {
+		t.Fatalf("list runs: %v", err)
+	}
+	if got := admittedCount(runs.Items, "local"); got != 0 {
+		t.Fatalf("admittedCount(local) after escalation = %d, want 0; a terminal run must not consume capacity", got)
+	}
+	if len(src.released) != 1 {
+		t.Fatalf("source releases = %v, want exactly one; the terminal transition must release the source claim", src.released)
 	}
 }
 

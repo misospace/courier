@@ -2054,8 +2054,15 @@ structurally closed. (#74)
   deleted-and-recreated same-name run) — surfaces as **provisioning in
   flight**: the run stays **Claimed** and requeues, and `Running` is never
   written over a slot not verified as a live, run-owned pod. The wait rides
-  the pod's delete event with a bounded requeue as the backstop; no wall-clock
-  bound is introduced. This mirrors the secure topology's in-flight signal for
+  the pod's delete event with a bounded requeue as the backstop. A run-owned
+  pod being torn down is the one shape with a wall-clock bound: once it has
+  been terminating longer than the provisioning-collision grace (default 6h,
+  `--provisioning-collision-grace`), the run terminalizes **NeedsHuman**
+  recording the blocking pod's name and UID in a
+  `ProvisioningCollision` status condition — terminal phases do not consume
+  lane capacity, so a stuck deletion cannot pin a slot forever, and the pod
+  itself is never deleted by the operator. The other shapes keep the
+  unbounded requeue. This mirrors the secure topology's in-flight signal for
   a terminating control pod rather than inventing a second shape (#217).
 - **Running** — pod launches: ephemeral workspace, clone, **adopt the branch if it
   exists and base-sync first**, inject LaneProfile framing + roles, wire the MCP

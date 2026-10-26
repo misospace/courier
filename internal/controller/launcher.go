@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"reflect"
 	"strings"
+	"time"
 
 	corev1 "k8s.io/api/core/v1"
 	rbacv1 "k8s.io/api/rbac/v1"
@@ -71,6 +72,27 @@ var (
 	// charge as before.
 	ErrProvisioningInFlight = errors.New("coordinator launcher: provisioning in flight; slot could not be verified as a live run-owned pod")
 )
+
+// ProvisioningCollisionError reports that Launch collided with a run-owned
+// coordinator pod whose deletion is already in flight (DeletionTimestamp
+// set) and which has not gone away. It satisfies errors.Is against
+// ErrProvisioningInFlight so existing handling is unchanged.
+type ProvisioningCollisionError struct {
+	// PodName is the deterministic slot name of the blocking pod.
+	PodName string
+	// PodUID is the UID of the blocking pod.
+	PodUID string
+	// Since is the blocking pod's DeletionTimestamp.Time: how long the pod
+	// has been terminating.
+	Since time.Time
+}
+
+func (e *ProvisioningCollisionError) Error() string {
+	return fmt.Sprintf("coordinator launcher: run-owned pod %s (uid %s) has been terminating since %s; the slot stays held until its deletion completes",
+		e.PodName, e.PodUID, e.Since.UTC().Format(time.RFC3339))
+}
+
+func (e *ProvisioningCollisionError) Is(target error) bool { return target == ErrProvisioningInFlight }
 
 // CoordinatorLauncher creates the ephemeral coordinator Pod for an admitted
 // run. The runtime configuration is deployment-specific; the default is the
@@ -286,7 +308,12 @@ func (l *CoordinatorLauncher) Launch(ctx context.Context, run *courierv1alpha1.C
 	//     torn down and the next reconcile could terminalize a freshly
 	//     relaunched run as Failed off the dying pod's own termination,
 	//     or charge a second infrastructure loss if the pod vanishes
-	//     before the wedge path observes it.
+	//     before the wedge path observes it. When the dying pod is
+	//     run-owned the error is the typed ProvisioningCollisionError —
+	//     still matching ErrProvisioningInFlight, so the stay-Claimed
+	//     shape is unchanged — carrying the pod identity and deletion
+	//     timestamp so the reconciler can bound how long a stuck
+	//     deletion may hold the slot (#560).
 	//   - The existing pod is not owned by this run's UID (no controller
 	//     OwnerReference whose UID is the run's). The deterministic slot
 	//     name can collide with stale or unrelated state — including a
@@ -308,6 +335,15 @@ func (l *CoordinatorLauncher) Launch(ctx context.Context, run *courierv1alpha1.C
 		// follow-up Get; transient API errors fall here too). Stay
 		// Claimed and let the bounded requeue / pod watch resolve it.
 		return ErrProvisioningInFlight
+	case existing.DeletionTimestamp != nil && podOwnedByRunUID(&existing, run.UID):
+		// A run-owned pod whose deletion is in flight still holds the
+		// deterministic slot. The stay-Claimed shape is unchanged, but the
+		// typed error lets the reconciler bound the wait (#560).
+		return &ProvisioningCollisionError{
+			PodName: existing.Name,
+			PodUID:  string(existing.UID),
+			Since:   existing.DeletionTimestamp.Time,
+		}
 	case existing.DeletionTimestamp != nil:
 		return ErrProvisioningInFlight
 	case !podOwnedByRunUID(&existing, run.UID):
