@@ -580,7 +580,8 @@ func (r *CoderRunReconciler) reconcileTerminal(ctx context.Context, run *courier
 			// starts only once the close has landed — the same posture a
 			// Done run keeps while its close is outstanding. The pending
 			// record is the owed-close signal: it is cleared only by a
-			// successful delivery, which is the proof of delivery.
+			// delivery the source accepted or a refusal proving the owed
+			// transition moot, each the proof of delivery.
 			log.FromContext(ctx).V(1).Info("terminal run still owes the source a park close; leaving it for retention",
 				"run", run.Name, "phase", run.Status.Phase)
 			return ctrl.Result{}, nil
@@ -792,6 +793,16 @@ func preLaunch(ctx context.Context, adapter source.Adapter, item source.WorkItem
 // source has marked the work stale, so the run is deleted instead of being
 // left Pending where it would be re-admitted into the same rejection. Any
 // other cause leaves the run retryable at Pending.
+// A repair attempt in flight survives a retryable rollback intact (#547).
+// The context carries the repair goal the relaunch renders, its bounded
+// evidence, and the fence token of the reservation the source still holds —
+// the attempt is deferred, not over. Clearing it here would drop the repair
+// goal (the re-admitted run would run the original task), bypass the
+// no-progress guard (which reads the attempt in flight), and let an
+// unchanged attempt settle a red-CI pull request onto review. Only the
+// park loop's documented endings — finishCIPark, an observed republish or
+// no-progress, and abandonCIRepairAttempt on terminalization — end the
+// attempt and settle its fence.
 func (r *CoderRunReconciler) rejectClaim(ctx context.Context, run *courierv1alpha1.CoderRun, adapter source.Adapter, item source.WorkItem, cause error) error {
 	releaseErr := adapter.Release(ctx, item)
 	if errors.Is(cause, source.ErrStaleWork) {
@@ -808,11 +819,18 @@ func (r *CoderRunReconciler) rejectClaim(ctx context.Context, run *courierv1alph
 	run.Status.Branch = ""
 	run.Status.HeadRepo = ""
 	run.Status.HeadSHA = ""
-	r.settleCIRollback(run)
 	statusErr := r.patchStatus(ctx, before, run)
 	return errors.Join(cause, releaseErr, statusErr)
 }
 
+// releaseClaim rolls a retryable launch failure back to Pending, attempting
+// both sides even if one fails. Returning the joined error keeps the
+// original launch/branch failure visible while exposing a stranded source
+// claim or status update to the controller. A repair attempt in flight, if
+// any, survives intact exactly as rejectClaim leaves it (#547): the attempt
+// is deferred, its reservation stays held at the source for the outcome the
+// parked loop will eventually report, and the relaunch renders the same
+// repair contract.
 func (r *CoderRunReconciler) releaseClaim(ctx context.Context, run *courierv1alpha1.CoderRun, adapter source.Adapter, item source.WorkItem, cause error) error {
 	// Attempt both sides of the rollback even if one fails. Returning the
 	// joined error keeps the original launch/branch failure visible while
@@ -823,19 +841,33 @@ func (r *CoderRunReconciler) releaseClaim(ctx context.Context, run *courierv1alp
 	run.Status.Branch = ""
 	run.Status.HeadRepo = ""
 	run.Status.HeadSHA = ""
-	r.settleCIRollback(run)
 	statusErr := r.patchStatus(ctx, before, run)
 	return errors.Join(cause, releaseErr, statusErr)
 }
 
-// settleCIRollback settles the repair reservation a rolled-back run still
-// holds before the context that carries its fence token is cleared. A
-// repair-resumed run holds a source-granted reservation; clearing the token
-// without a settlement would strand the deferral the source holds. Result
-// unsupported names a rollback that published nothing, and carries no head —
-// matching the non-repushed endings finishCIPark records.
-func (r *CoderRunReconciler) settleCIRollback(run *courierv1alpha1.CoderRun) {
-	if run.Status.CIRepair != nil && run.Status.CIRepair.FenceToken != "" {
+// abandonCIRepairAttempt ends a repair attempt that was still in flight when
+// the run terminalized for a reason the park loop never graded — a permanent
+// launch rejection, a missing head, a wedged coordinator, or an ordinary
+// path that ended the run outside the loop. The attempt's fence must not
+// outlive the run: an unsettled reservation would defer the source's
+// hand-out against a run that can never report, so the abandonment is
+// recorded on the terminal status write as durable retry intent, and the
+// reap gate that blocks deletion while a close is owed covers it like every
+// other settlement. Result unsupported names an attempt that ended without
+// a documented ending and carries no head — the vocabulary finishCIPark
+// records for the non-repushed endings.
+//
+// A fenced in-flight attempt overwrites a settlement the run already owes:
+// the record carries one owed close, and a source grants a later reservation
+// only after the earlier outcome committed (a deferral with a held fence
+// refuses the next reservation), so the owed record is already moot at the
+// source while the live fence is not. An unfenced context is cleared without
+// touching an owed close: there is no grant to answer.
+func abandonCIRepairAttempt(run *courierv1alpha1.CoderRun) {
+	if run.Status.CIRepair == nil {
+		return
+	}
+	if run.Status.CIRepair.FenceToken != "" {
 		run.Status.CISettlement = &courierv1alpha1.CISettlement{
 			FenceToken:     run.Status.CIRepair.FenceToken,
 			IdempotencyKey: ciparkRepairKey(run, run.Status.CIRepair.Attempt),
@@ -1416,6 +1448,10 @@ func (r *CoderRunReconciler) transitionTerminal(ctx context.Context, run *courie
 	// acknowledgement so the terminal state carries no live request (#238).
 	run.Status.ControlRequest = nil
 	run.Status.ControlRequestAck = nil
+	// A repair attempt still in flight is abandoned, not left dangling: its
+	// fence is settled as unsupported on this same write so the source stops
+	// deferring against a run that can never report (#547).
+	abandonCIRepairAttempt(run)
 	run.Status.Phase = phase
 	if pr != "" {
 		run.Status.PR = pr
@@ -1449,7 +1485,7 @@ func (r *CoderRunReconciler) transitionTerminal(ctx context.Context, run *courie
 	// Write the terminal phase first so the run stops holding lane capacity
 	// regardless of whether the source lifecycle report below succeeds. The
 	// run's own terminalization must never depend on the source.
-	if run.Status.Phase != before.Status.Phase || run.Status.PR != before.Status.PR || !reflect.DeepEqual(run.Status.Telemetry, before.Status.Telemetry) || !reflect.DeepEqual(run.Status.TerminalDiagnostic, before.Status.TerminalDiagnostic) || !reflect.DeepEqual(run.Status.ControlRequest, before.Status.ControlRequest) || !reflect.DeepEqual(run.Status.ControlRequestAck, before.Status.ControlRequestAck) || !reflect.DeepEqual(run.Status.WorkspaceSafety, before.Status.WorkspaceSafety) || !reflect.DeepEqual(run.Status.Conditions, before.Status.Conditions) {
+	if run.Status.Phase != before.Status.Phase || run.Status.PR != before.Status.PR || !reflect.DeepEqual(run.Status.Telemetry, before.Status.Telemetry) || !reflect.DeepEqual(run.Status.TerminalDiagnostic, before.Status.TerminalDiagnostic) || !reflect.DeepEqual(run.Status.ControlRequest, before.Status.ControlRequest) || !reflect.DeepEqual(run.Status.ControlRequestAck, before.Status.ControlRequestAck) || !reflect.DeepEqual(run.Status.WorkspaceSafety, before.Status.WorkspaceSafety) || !reflect.DeepEqual(run.Status.Conditions, before.Status.Conditions) || !reflect.DeepEqual(run.Status.CIRepair, before.Status.CIRepair) || !reflect.DeepEqual(run.Status.CISettlement, before.Status.CISettlement) {
 		if err := r.patchStatus(ctx, before, run); err != nil {
 			return ctrl.Result{}, err
 		}

@@ -1244,19 +1244,30 @@ func (r *CoderRunReconciler) deliverCISettlement(ctx context.Context, run *couri
 	}
 	err := r.reportCIRepair(ctx, run, run.Status.PR, record.Head, source.CIRepairResult(record.Result), record.FenceToken, record.IdempotencyKey)
 	if err != nil {
-		if errors.Is(err, source.ErrUnsupportedCIPark) {
+		switch {
+		case errors.Is(err, source.ErrUnsupportedCIPark):
 			// The source cannot represent the park/repair lifecycle for this
 			// work at all, and the refusal is permanent: nothing is owed, and
 			// retrying would wedge the run's ending behind it forever.
 			log.FromContext(ctx).V(1).Info("source cannot represent the CI park; dropping the pending settlement", "run", run.Name)
-			before := run.DeepCopy()
-			run.Status.CISettlement = nil
-			if err := r.patchStatus(ctx, before, run); err != nil {
-				return false, err
-			}
-			return true, nil
+		case errors.Is(err, source.ErrStaleWork), errors.Is(err, source.ErrSuperseded):
+			// The refusal proves the fenced transition is moot: fence-settled
+			// says it is already committed, fence-gone that no outcome
+			// against this fence can ever commit. Re-presenting the same
+			// settlement can never clear either, so the drop is the proof of
+			// delivery — and keeping the record instead would hold the
+			// terminal reap gate re-presenting it at the settlement cadence
+			// forever.
+			log.FromContext(ctx).V(1).Info("settlement fence already settled or gone; settlement resolved moot", "run", run.Name, "error", err.Error())
+		default:
+			return false, err
 		}
-		return false, err
+		before := run.DeepCopy()
+		run.Status.CISettlement = nil
+		if err := r.patchStatus(ctx, before, run); err != nil {
+			return false, err
+		}
+		return true, nil
 	}
 	before := run.DeepCopy()
 	run.Status.CISettlement = nil
