@@ -35,6 +35,11 @@ const (
 	observationRequeueDelay          = 5 * time.Second
 	lifecycleReportRequeueDelay      = 30 * time.Second
 	provisioningInFlightRequeueDelay = 5 * time.Second
+
+	// defaultProvisioningCollisionGrace is how long a run-owned coordinator
+	// pod may stay Terminating while blocking its run's slot before the run
+	// escalates to NeedsHuman (#560).
+	defaultProvisioningCollisionGrace = 6 * time.Hour
 )
 
 // coordinatorContainerName is the coordinator's container name, shared by the
@@ -45,6 +50,8 @@ const coordinatorContainerName = "coordinator"
 // report has been published; a False status means a later reconcile retries it.
 const (
 	lifecycleReportedCondition                              = courierv1alpha1.ConditionLifecycleReported
+	provisioningCollisionCondition                          = "ProvisioningCollision"
+	provisioningCollisionStuckTerminatingReason             = "StuckTerminatingPod"
 	lifecycleReportSupportedCondition                       = "LifecycleReportSupported"
 	lifecycleReportPendingReason                            = "Pending"
 	lifecycleReportPendingBlockedReportParksPRFixReason     = "PendingBlockedReportParksPRFix"
@@ -139,6 +146,11 @@ type CoderRunReconciler struct {
 	// its lifecycle report has reached a positive, settled state. Zero uses the
 	// package default.
 	FailedRetention time.Duration
+
+	// ProvisioningCollisionGrace is how long a run-owned coordinator pod may
+	// stay Terminating while blocking this run's slot before the run escalates
+	// to NeedsHuman (#560). Zero uses the package default.
+	ProvisioningCollisionGrace time.Duration
 
 	// NeedsHumanRetention is how long a NeedsHuman run is kept before deletion,
 	// once its lifecycle report has reached a positive, settled state. Zero
@@ -464,6 +476,10 @@ func (r *CoderRunReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 				return r.terminateNeedsHuman(ctx, &run, adapter, item, permanent)
 			}
 			if errors.Is(err, ErrProvisioningInFlight) {
+				var collision *ProvisioningCollisionError
+				if errors.As(err, &collision) {
+					return r.terminateStuckTerminatingCollision(ctx, &run, adapter, item, collision)
+				}
 				// The deterministic pod name could not be verified as a
 				// live coordinator pod owned by this run: it is being
 				// torn down, unreadable, or owned by something else
@@ -655,6 +671,10 @@ func (r *CoderRunReconciler) resumeClaimed(ctx context.Context, run *courierv1al
 			return r.terminateNeedsHuman(ctx, run, adapter, item, permanent)
 		}
 		if errors.Is(err, ErrProvisioningInFlight) {
+			var collision *ProvisioningCollisionError
+			if errors.As(err, &collision) {
+				return r.terminateStuckTerminatingCollision(ctx, run, adapter, item, collision)
+			}
 			// A relaunch's create collided with a slot that could not be
 			// verified as a live pod owned by this run's UID: torn down,
 			// unreadable, or foreign. The next reconcile either rides the
@@ -817,8 +837,9 @@ func (r *CoderRunReconciler) releaseClaim(ctx context.Context, run *courierv1alp
 func (r *CoderRunReconciler) settleCIRollback(run *courierv1alpha1.CoderRun) {
 	if run.Status.CIRepair != nil && run.Status.CIRepair.FenceToken != "" {
 		run.Status.CISettlement = &courierv1alpha1.CISettlement{
-			FenceToken: run.Status.CIRepair.FenceToken,
-			Result:     courierv1alpha1.CIParkOutcomeUnsupported,
+			FenceToken:     run.Status.CIRepair.FenceToken,
+			IdempotencyKey: ciparkRepairKey(run, run.Status.CIRepair.Attempt),
+			Result:         courierv1alpha1.CIParkOutcomeUnsupported,
 		}
 	}
 	run.Status.CIRepair = nil
@@ -886,6 +907,43 @@ func (r *CoderRunReconciler) terminateNeedsHuman(ctx context.Context, run *couri
 		"run", run.Name, "reason", cause.Reason, "cause", cause.Detail)
 	releaseErr := adapter.Release(ctx, item)
 	terminalResult, terminalErr := r.transitionTerminal(ctx, run, courierv1alpha1.PhaseNeedsHuman, "", terminalLifecycleIntent{error: cause.Detail}, nil)
+	return terminalResult, errors.Join(releaseErr, terminalErr)
+}
+
+// terminateStuckTerminatingCollision bounds the stuck-terminating provisioning
+// collision (#560). A run-owned coordinator pod whose deletion is in flight
+// holds the deterministic slot; while it stays Terminating (finalizer, delayed
+// node eviction) the run requeues as provisioning-in-flight forever. Once the
+// pod has been terminating longer than the configured grace, the run
+// terminalizes NeedsHuman naming the blocking pod, which frees the lane slot
+// (terminal phases do not consume admission capacity) and releases the source
+// claim through the terminal lifecycle. The pod itself is never deleted here.
+func (r *CoderRunReconciler) terminateStuckTerminatingCollision(ctx context.Context, run *courierv1alpha1.CoderRun, adapter source.Adapter, item source.WorkItem, collision *ProvisioningCollisionError) (ctrl.Result, error) {
+	grace := r.provisioningCollisionGrace()
+	terminating := r.clock().Sub(collision.Since)
+	if terminating < grace {
+		// Still inside the grace window: the ordinary 5s
+		// provisioning-in-flight requeue continues unchanged.
+		return ctrl.Result{RequeueAfter: provisioningInFlightRequeueDelay}, nil
+	}
+	cause := secureNeedsHuman("ProvisioningCollisionStuckTerminating",
+		"coordinator pod %s (uid %s) has been Terminating since %s, beyond the %s provisioning-collision grace; the slot is blocked and a human must clear it",
+		collision.PodName, collision.PodUID, collision.Since.UTC().Format(time.RFC3339), grace)
+	log.FromContext(ctx).Info("terminating run: coordinator pod stuck Terminating beyond provisioning-collision grace",
+		"run", run.Name, "pod", collision.PodName, "podUID", collision.PodUID, "terminating", terminating.String(), "grace", grace.String())
+	releaseErr := adapter.Release(ctx, item)
+	// The cause Detail alone lives only in the pending LifecycleReported
+	// message and can be replaced when the report publishes, so the blocking
+	// pod's identity rides its own condition in the same status patch.
+	intent := terminalLifecycleIntent{error: cause.Detail}
+	intent.conditions = []metav1.Condition{{
+		Type:               provisioningCollisionCondition,
+		Status:             metav1.ConditionTrue,
+		Reason:             provisioningCollisionStuckTerminatingReason,
+		Message:            fmt.Sprintf("coordinator pod %s (uid %s) stuck Terminating beyond %s provisioning-collision grace", collision.PodName, collision.PodUID, grace),
+		LastTransitionTime: metav1.NewTime(r.clock()),
+	}}
+	terminalResult, terminalErr := r.transitionTerminal(ctx, run, courierv1alpha1.PhaseNeedsHuman, "", intent, nil)
 	return terminalResult, errors.Join(releaseErr, terminalErr)
 }
 
@@ -1228,6 +1286,17 @@ func (r *CoderRunReconciler) observeVerifying(ctx context.Context, run *courierv
 		// Someone merged the PR while this run was working: the work shipped.
 		// Done resolves the source and applies the reap policy; it is not a
 		// case for a human.
+		//
+		// The merged branch is checked before the park loop runs, so a parked
+		// run reaches Done here with its park record and its deferral intact
+		// — exactly the shape every loop bail-out hands to the abandon. The
+		// deferral must be settled the same way before the run terminalizes:
+		// the abandon is a no-op without a park record and a live fence, and
+		// it settles the reservation under a live one rather than leaving it
+		// stranded against a run that is now Done (#555).
+		if _, err := r.abandonCIPark(ctx, run, observation); err != nil {
+			return ctrl.Result{}, err
+		}
 		return r.transitionTerminal(ctx, run, courierv1alpha1.PhaseDone, pr, terminalLifecycleIntent{}, nil)
 	}
 	// The mechanical-CI park-and-resume policy, when the lane declares one,

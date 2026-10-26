@@ -800,6 +800,14 @@ type CISettlement struct {
 	// attempt this settlement answers.
 	// +kubebuilder:validation:MinLength=1
 	FenceToken string `json:"fenceToken"`
+	// IdempotencyKey is the reservation key this outcome answers. New
+	// settlements always record it before clearing the repair/park context so
+	// a durable retry remains byte-identical even when those records are gone.
+	// It is optional only for compatibility with settlement records written by
+	// older controllers, which can still derive the key while a park remains.
+	// +optional
+	// +kubebuilder:validation:MinLength=1
+	IdempotencyKey string `json:"idempotencyKey,omitempty"`
 	// Result is the outcome kind being reported.
 	// +kubebuilder:validation:Enum=repushed;exhausted;unsupported
 	Result CIParkOutcome `json:"result"`

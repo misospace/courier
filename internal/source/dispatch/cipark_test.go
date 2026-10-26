@@ -664,14 +664,17 @@ func TestDispatchCIParkCodedRefusals(t *testing.T) {
 				}{
 					{"plain-body-409", http.StatusConflict, "fence conflict"},
 					{"unknown-code-409", http.StatusConflict, `{"reason":"something-else"}`},
-					// The fence-less close reclassifies its own bare 404 into
-					// the permanent unsupported sentinel (#534): it is pinned
-					// by TestDispatchCIParkReleaseRouteAbsentIsUnsupported
-					// instead of here.
+					// A bare 404 on any park-family route reclassifies into
+					// the permanent unsupported sentinel: the refusal
+					// vocabulary is 409-coded, so a 404 is version-skew
+					// evidence the deployment adopted none of the routes.
+					// It is pinned by
+					// TestDispatchCIParkRoute404LatchesUnsupported instead
+					// of here.
 					{"not-found", http.StatusNotFound, "no such queue item"},
 					{"server-error", http.StatusInternalServerError, "boom"},
 				} {
-					if call.endpoint == "cirepair-close" && tc.name == "not-found" {
+					if tc.name == "not-found" {
 						continue
 					}
 					f := newDiagnosticsFixture(t, openChecker(), ciParkRefused(t, tc.status, tc.body))
@@ -719,9 +722,9 @@ func TestDispatchCIParkCodedRefusals(t *testing.T) {
 // a bare 404 is evidence the deployment has not adopted the release at all
 // (an older Dispatch), and retrying it forever would hold Courier's terminal
 // lifecycle behind a close the server can never take. The exchange's
-// deferred 4xx class is counted once by the reclassification site. The
-// fenced outcome on the same absent route keeps its ordinary 404 posture:
-// only the close is advisory.
+// deferred 4xx class is counted once by the reclassification site, and the
+// observation latches: every park-family exchange afterwards short-circuits
+// with the sentinel instead of churning the same 404.
 func TestDispatchCIParkReleaseRouteAbsentIsUnsupported(t *testing.T) {
 	f := newDiagnosticsFixture(t, openChecker(), ciParkRefused(t, http.StatusNotFound, "no such queue item"))
 	if err := f.adapter.ReleaseCIPark(context.Background(), ciparkWorkItem(), source.CIParkRelease{PR: "77", Head: ciparkHead1, IdempotencyKey: "k"}); !errors.Is(err, source.ErrUnsupportedCIPark) {
@@ -736,8 +739,11 @@ func TestDispatchCIParkReleaseRouteAbsentIsUnsupported(t *testing.T) {
 	if got := diagnosticsCounter(t, f, connector.SignalIdentity, reasonIdentityOpportunityMissing); got != -1 {
 		t.Fatalf("fabricated identity/%s count = %v, want none", reasonIdentityOpportunityMissing, got)
 	}
-	if err := f.adapter.ReportCIRepair(context.Background(), ciparkWorkItem(), source.CIRepairOutcome{FenceToken: "fence", IdempotencyKey: "k", PR: "77", Result: source.CIRepairExhausted}); errors.Is(err, source.ErrUnsupportedCIPark) {
-		t.Fatalf("ReportCIRepair() = %v, want an ordinary error, not the unsupported sentinel", err)
+	if err := f.adapter.ReportCIRepair(context.Background(), ciparkWorkItem(), source.CIRepairOutcome{FenceToken: "fence", IdempotencyKey: "k", PR: "77", Result: source.CIRepairExhausted}); !errors.Is(err, source.ErrUnsupportedCIPark) {
+		t.Fatalf("ReportCIRepair() = %v, want the latched ErrUnsupportedCIPark without another exchange", err)
+	}
+	if got := diagnosticsCounter(t, f, connector.SignalProtocolError, reasonHTTP4xx); got != 1 {
+		t.Fatalf("protocol-error/http-4xx counter after the latch = %v, want still 1 (the short-circuit performs no exchange)", got)
 	}
 
 	// The sibling never-deliverable refusal: a 400 from a #495-era route
@@ -758,6 +764,278 @@ func TestDispatchCIParkReleaseRouteAbsentIsUnsupported(t *testing.T) {
 	if err := f400.adapter.ReportCIRepair(context.Background(), ciparkWorkItem(), source.CIRepairOutcome{FenceToken: "fence", IdempotencyKey: "k", PR: "77", Result: source.CIRepairExhausted}); errors.Is(err, source.ErrUnsupportedCIPark) {
 		t.Fatalf("ReportCIRepair(400) = %v, want an ordinary permanent refusal, not the unsupported sentinel", err)
 	}
+}
+
+// assertCIParkCapability pins the capability catalogue series the CI park
+// lifecycle currently advertises: exactly one state series for the
+// capability under the fixture's connector identity.
+func assertCIParkCapability(t *testing.T, f *diagnosticsFixture, wantState string) {
+	t.Helper()
+	if _, ok := findSeries(t, f.reg, connector.MetricCapabilityInfo, map[string]string{
+		"connector": defaultConnectorName, "capability": connector.CapabilityCIParkLifecycle, "state": wantState,
+	}); !ok {
+		t.Fatalf("capability catalogue missing ci-park-lifecycle state %q", wantState)
+	}
+	for _, state := range connector.CapabilityStates {
+		if state == wantState {
+			continue
+		}
+		if _, ok := findSeries(t, f.reg, connector.MetricCapabilityInfo, map[string]string{
+			"connector": defaultConnectorName, "capability": connector.CapabilityCIParkLifecycle, "state": state,
+		}); ok {
+			t.Fatalf("capability catalogue still reports ci-park-lifecycle state %q alongside %q", state, wantState)
+		}
+	}
+}
+
+// TestDispatchCIParkRoute404LatchesUnsupported pins the safe-degradation
+// posture for a Dispatch deployment that has not adopted the CI-park routes
+// at all (#559): the family's refusal vocabulary is 409-coded, so a bare 404
+// on any park-family POST is permanent version-skew evidence, never a
+// per-item condition. The exchange reclassifies into the permanent
+// source.ErrUnsupportedCIPark and the client latches the capability as
+// absent for the process — the capability catalogue gauge flips from
+// supported to unsupported, and the latch adds no diagnostic of its own
+// because the 404's protocol-error class was already counted once at the
+// do() choke point. Every park-family exchange afterwards short-circuits at
+// entry with no HTTP round trip, ending the retry churn and never spending a
+// repair attempt against a queue that can never fence anything. Temporary
+// failures keep today's semantics: a 5xx, a transport failure, a timeout,
+// and a 409-coded refusal are not route evidence and latch nothing, and the
+// reservation's pull-request state pre-read keeps its own 404 semantics —
+// a pull request that no longer exists is stale work, not route absence.
+func TestDispatchCIParkRoute404LatchesUnsupported(t *testing.T) {
+	calls := []struct {
+		name string
+		call func(*Adapter) error
+	}{
+		{"park", func(a *Adapter) error {
+			return a.ReportCIParked(context.Background(), ciparkWorkItem(), source.CIParkNotice{PR: "77", Head: ciparkHead1, IdempotencyKey: "k"})
+		}},
+		{"reserve", func(a *Adapter) error {
+			_, err := a.ReserveCIRepair(context.Background(), ciparkWorkItem(), source.CIRepairReservation{FenceToken: "fence", IdempotencyKey: "k", PR: "77", Head: ciparkHead1})
+			return err
+		}},
+		{"settle", func(a *Adapter) error {
+			return a.ReportCIRepair(context.Background(), ciparkWorkItem(), source.CIRepairOutcome{FenceToken: "fence", IdempotencyKey: "k", PR: "77", Result: source.CIRepairExhausted})
+		}},
+		{"release", func(a *Adapter) error {
+			return a.ReleaseCIPark(context.Background(), ciparkWorkItem(), source.CIParkRelease{PR: "77", Head: ciparkHead1, IdempotencyKey: "k"})
+		}},
+	}
+	for _, first := range calls {
+		first := first
+		t.Run(first.name, func(t *testing.T) {
+			requests := 0
+			f := newDiagnosticsFixture(t, openChecker(), func(_ *diagnosticsFixture, w http.ResponseWriter, r *http.Request) {
+				if !strings.HasPrefix(r.URL.Path, "/api/pr-fix-queue/ci") {
+					t.Errorf("unexpected request %s %s", r.Method, r.URL.Path)
+					http.Error(w, "not found", http.StatusNotFound)
+					return
+				}
+				requests++
+				w.WriteHeader(http.StatusNotFound)
+				_, _ = w.Write([]byte("no such queue item"))
+			})
+			if f.adapter.CIParkLifecycleUnsupported() {
+				t.Fatal("CIParkLifecycleUnsupported() = true before any exchange, want not-known-unsupported")
+			}
+			firstErr := first.call(f.adapter)
+			if !errors.Is(firstErr, source.ErrUnsupportedCIPark) {
+				t.Fatalf("%s on an unadopted route = %v, want ErrUnsupportedCIPark", first.name, firstErr)
+			}
+			var apiErr *APIError
+			if !errors.As(firstErr, &apiErr) || apiErr.StatusCode != http.StatusNotFound {
+				t.Fatalf("reclassified %s error chain = %v, want the wrapped 404 APIError to remain inspectable", first.name, firstErr)
+			}
+			if requests != 1 {
+				t.Fatalf("park-family requests = %d, want exactly 1", requests)
+			}
+			if !f.adapter.CIParkLifecycleUnsupported() {
+				t.Fatal("CIParkLifecycleUnsupported() = false after the route's 404, want latched")
+			}
+			// The census: the 404's exchange class was counted once at the
+			// do() choke point, and the latch adds no diagnostic of its own.
+			if got := diagnosticsCounter(t, f, connector.SignalProtocolError, reasonHTTP4xx); got != 1 {
+				t.Fatalf("protocol-error/http-4xx counter = %v, want exactly 1", got)
+			}
+			if total := totalProtocolErrors(t, f); total != 1 {
+				t.Fatalf("total protocol-error diagnostics = %v, want exactly 1", total)
+			}
+			assertCIParkCapability(t, f, connector.CapabilityUnsupported)
+
+			// The latch ends the churn: every park-family exchange
+			// short-circuits at entry, with no HTTP round trip and no
+			// further diagnostic.
+			for _, then := range calls {
+				if err := then.call(f.adapter); !errors.Is(err, source.ErrUnsupportedCIPark) {
+					t.Fatalf("latched %s = %v, want ErrUnsupportedCIPark", then.name, err)
+				}
+			}
+			grant, err := f.adapter.ReserveCIRepair(context.Background(), ciparkWorkItem(), source.CIRepairReservation{FenceToken: "fence", IdempotencyKey: "k", PR: "77", Head: ciparkHead1})
+			if !errors.Is(err, source.ErrUnsupportedCIPark) || grant != (source.CIRepairGrant{}) {
+				t.Fatalf("latched reserve = (%#v, %v), want a zero grant with ErrUnsupportedCIPark", grant, err)
+			}
+			if requests != 1 {
+				t.Fatalf("park-family requests after the latch = %d, want still 1 (the short-circuit performs no exchange)", requests)
+			}
+			if got := diagnosticsCounter(t, f, connector.SignalProtocolError, reasonHTTP4xx); got != 1 {
+				t.Fatalf("protocol-error/http-4xx counter after the latch = %v, want still 1", got)
+			}
+			if total := totalProtocolErrors(t, f); total != 1 {
+				t.Fatalf("total protocol-error diagnostics after the latch = %v, want still 1", total)
+			}
+		})
+	}
+
+	t.Run("server error keeps the ordinary retry semantics", func(t *testing.T) {
+		requests := 0
+		f := newDiagnosticsFixture(t, openChecker(), func(_ *diagnosticsFixture, w http.ResponseWriter, r *http.Request) {
+			requests++
+			w.WriteHeader(http.StatusInternalServerError)
+			_, _ = w.Write([]byte("boom"))
+		})
+		park := func() error {
+			return f.adapter.ReportCIParked(context.Background(), ciparkWorkItem(), source.CIParkNotice{PR: "77", Head: ciparkHead1, IdempotencyKey: "k"})
+		}
+		if err := park(); err == nil || errors.Is(err, source.ErrUnsupportedCIPark) {
+			t.Fatalf("park against a 500 = %v, want the ordinary server error", err)
+		}
+		if err := park(); err == nil || errors.Is(err, source.ErrUnsupportedCIPark) {
+			t.Fatalf("park again against a 500 = %v, want the ordinary server error without a short-circuit", err)
+		}
+		if requests != 2 {
+			t.Fatalf("park-family requests = %d, want 2 (a 5xx latches nothing and short-circuits nothing)", requests)
+		}
+		if got := diagnosticsCounter(t, f, connector.SignalProtocolError, reasonHTTP5xx); got != 2 {
+			t.Fatalf("protocol-error/http-5xx counter = %v, want 2", got)
+		}
+		if f.adapter.CIParkLifecycleUnsupported() {
+			t.Fatal("CIParkLifecycleUnsupported() = true after a 5xx, want not-known-unsupported")
+		}
+		assertCIParkCapability(t, f, connector.CapabilitySupported)
+	})
+
+	t.Run("transport failure latches nothing", func(t *testing.T) {
+		f := newDiagnosticsFixture(t, openChecker(), func(_ *diagnosticsFixture, w http.ResponseWriter, r *http.Request) {
+			t.Errorf("unexpected request %s %s", r.Method, r.URL.Path)
+			http.Error(w, "gone", http.StatusNotFound)
+		})
+		f.server.Close()
+		if err := f.adapter.ReportCIParked(context.Background(), ciparkWorkItem(), source.CIParkNotice{PR: "77", Head: ciparkHead1, IdempotencyKey: "k"}); err == nil || errors.Is(err, source.ErrUnsupportedCIPark) {
+			t.Fatalf("park against a dead server = %v, want the transport failure", err)
+		}
+		if f.adapter.CIParkLifecycleUnsupported() {
+			t.Fatal("CIParkLifecycleUnsupported() = true after a transport failure, want not-known-unsupported")
+		}
+		assertCIParkCapability(t, f, connector.CapabilitySupported)
+	})
+
+	t.Run("timeout latches nothing", func(t *testing.T) {
+		f := &diagnosticsFixture{}
+		f.server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			time.Sleep(time.Second)
+			w.WriteHeader(http.StatusNoContent)
+		}))
+		t.Cleanup(f.server.Close)
+		f.reg = prometheus.NewRegistry()
+		f.em = connector.NewEmitter(f.reg, nil)
+		client, err := NewClient(f.server.URL, "worker", "secret-token", 50*time.Millisecond)
+		if err != nil {
+			t.Fatal(err)
+		}
+		client.WithPullRequestStateChecker(PullRequestStateCheckerFunc(func(context.Context, string, int) (PullRequestState, error) {
+			return PullRequestState{State: "open"}, nil
+		}))
+		f.client = client
+		f.adapter = New(client, WithConnectorDiagnostics(f.em))
+		if err := f.adapter.ReportCIParked(context.Background(), ciparkWorkItem(), source.CIParkNotice{PR: "77", Head: ciparkHead1, IdempotencyKey: "k"}); err == nil || errors.Is(err, source.ErrUnsupportedCIPark) {
+			t.Fatalf("park across a timeout = %v, want the transient timeout failure", err)
+		}
+		if f.adapter.CIParkLifecycleUnsupported() {
+			t.Fatal("CIParkLifecycleUnsupported() = true after a timeout, want not-known-unsupported")
+		}
+		assertCIParkCapability(t, f, connector.CapabilitySupported)
+	})
+
+	t.Run("coded refusal latches nothing", func(t *testing.T) {
+		refusalCodes := []struct {
+			code      string
+			wantError error
+		}{
+			{"fence-held", source.ErrSuperseded},
+			{"opportunity-missing", source.ErrStaleWork},
+			{"head-superseded", source.ErrStaleWork},
+			{"fence-settled", source.ErrStaleWork},
+		}
+		for _, code := range refusalCodes {
+			requests := 0
+			f := newDiagnosticsFixture(t, openChecker(), func(_ *diagnosticsFixture, w http.ResponseWriter, r *http.Request) {
+				requests++
+				w.WriteHeader(http.StatusConflict)
+				_ = json.NewEncoder(w).Encode(map[string]string{"reason": code.code})
+			})
+			park := func() error {
+				return f.adapter.ReportCIParked(context.Background(), ciparkWorkItem(), source.CIParkNotice{PR: "77", Head: ciparkHead1, IdempotencyKey: "k"})
+			}
+			if err := park(); !errors.Is(err, code.wantError) {
+				t.Fatalf("park against a %q refusal = %v, want %v", code.code, err, code.wantError)
+			}
+			if err := park(); !errors.Is(err, code.wantError) {
+				t.Fatalf("park again against a %q refusal = %v, want %v without a short-circuit", code.code, err, code.wantError)
+			}
+			if requests != 2 {
+				t.Fatalf("park-family requests for %q = %d, want 2 (a coded refusal latches nothing)", code.code, requests)
+			}
+			if f.adapter.CIParkLifecycleUnsupported() {
+				t.Fatalf("CIParkLifecycleUnsupported() = true after a %q coded refusal, want not-known-unsupported", code.code)
+			}
+			assertCIParkCapability(t, f, connector.CapabilitySupported)
+		}
+	})
+
+	t.Run("reservation pre-read 404 is stale work, not route absence", func(t *testing.T) {
+		requests := 0
+		checks := 0
+		f := newDiagnosticsFixture(t, func(c *HTTPClient) {
+			c.WithPullRequestStateChecker(PullRequestStateCheckerFunc(func(_ context.Context, _ string, _ int) (PullRequestState, error) {
+				checks++
+				if checks == 1 {
+					return PullRequestState{}, &APIError{StatusCode: http.StatusNotFound, Message: "no such pull request"}
+				}
+				return PullRequestState{State: "open"}, nil
+			}))
+		}, func(_ *diagnosticsFixture, w http.ResponseWriter, r *http.Request) {
+			requests++
+			w.WriteHeader(http.StatusNotFound)
+			_, _ = w.Write([]byte("no such queue item"))
+		})
+		item := ciparkWorkItem()
+		_, err := f.adapter.ReserveCIRepair(context.Background(), item, source.CIRepairReservation{FenceToken: "fence", IdempotencyKey: "k", PR: "77", Head: ciparkHead1})
+		if err == nil || errors.Is(err, source.ErrUnsupportedCIPark) {
+			t.Fatalf("reserve with a 404 pre-read = %v, want the pre-read's own ordinary 404", err)
+		}
+		var apiErr *APIError
+		if !errors.As(err, &apiErr) || apiErr.StatusCode != http.StatusNotFound {
+			t.Fatalf("reserve with a 404 pre-read = %v, want the pre-read APIError unchanged", err)
+		}
+		if requests != 0 {
+			t.Fatalf("park-family requests after a 404 pre-read = %d, want 0 (the reservation never POSTed)", requests)
+		}
+		if f.adapter.CIParkLifecycleUnsupported() {
+			t.Fatal("CIParkLifecycleUnsupported() = true after a pre-read 404, want not-known-unsupported")
+		}
+		assertCIParkCapability(t, f, connector.CapabilitySupported)
+		// The pre-read's 404 latched nothing: the next reservation reaches
+		// the route, and that route's own 404 is what latches.
+		if _, err := f.adapter.ReserveCIRepair(context.Background(), item, source.CIRepairReservation{FenceToken: "fence", IdempotencyKey: "k2", PR: "77", Head: ciparkHead1}); !errors.Is(err, source.ErrUnsupportedCIPark) {
+			t.Fatalf("reserve after the pre-read 404 = %v, want the route's own ErrUnsupportedCIPark", err)
+		}
+		if requests != 1 {
+			t.Fatalf("park-family requests = %d, want 1 (the second reservation POSTed)", requests)
+		}
+		assertCIParkCapability(t, f, connector.CapabilityUnsupported)
+	})
 }
 
 type ciParkRequest struct {

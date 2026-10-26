@@ -429,22 +429,62 @@ func (r *CoderRunReconciler) observeCIPark(ctx context.Context, run *courierv1al
 		return false, ctrl.Result{}, err
 	}
 	if policy == nil {
+		// A run that is not parked owes the loop nothing and stays on the
+		// ordinary path untouched. A parked run walks out of the loop it
+		// just left carrying its park and its deferral, and no ordinary
+		// ending releases the latter — the ordinary path would transition
+		// the run while the source stays deferred against an opportunity
+		// that is already over. So the abandon settles the park's source
+		// side first (#553), as every one of the loop's own endings would
+		// have, and only then hands the observation to the ordinary path
+		// unchanged.
+		//
 		// No repair policy applies — the lane never declared one, no longer
-		// declares one, or its declaration is degenerate — so the loop is
-		// disabled, and an inapplicability condition recorded while a policy
-		// still applied is obsolete.
+		// declares one, or its declaration is degenerate — so an
+		// inapplicability condition recorded while a policy still applied
+		// is obsolete, and is cleared ahead of the abandon.
 		before := run.DeepCopy()
 		if clearCIParkInapplicable(run) {
 			if err := r.patchStatus(ctx, before, run); err != nil {
 				return false, ctrl.Result{}, err
 			}
 		}
-		return false, ctrl.Result{}, nil
+		result, err := r.abandonCIPark(ctx, run, observation)
+		if err != nil {
+			return false, ctrl.Result{}, err
+		}
+		return false, result, nil
 	}
 	if observation.PR == "" || observation.Draft {
 		// An unobservable pull request is not this loop's business: the
-		// ordinary path settles it as a human-facing condition.
-		return false, ctrl.Result{}, nil
+		// ordinary path settles it as a human-facing condition. A park
+		// established on the request leaves the loop with it, so like every
+		// out-of-loop ending its source side is settled first (#553), and
+		// the ordinary path decides the transitions unchanged afterwards.
+		result, err := r.abandonCIPark(ctx, run, observation)
+		if err != nil {
+			return false, ctrl.Result{}, err
+		}
+		return false, result, nil
+	}
+	// Version skew is latched at the source: a deployment that answered one
+	// park-family route with a bare 404 has adopted none of them, and that
+	// observation is permanent for the process. A park established against
+	// it could only churn 404s through the park window and burn a repair
+	// attempt against a queue that can never fence anything, so while
+	// nothing is in flight — no park to advance, no attempt to settle — the
+	// ordinary post-publication grading path is the safe fallback: no park
+	// record, no notice, no reservation, nothing the source could refuse.
+	// The refusal sentinels below keep every in-flight exchange failing
+	// closed, and a lookup that cannot answer the capability question
+	// proceeds with today's behavior rather than guessing.
+	if run.Status.CIPark == nil && run.Status.CIRepair == nil {
+		adapter, _, err := r.adapterAndWorkItem(run)
+		if err != nil {
+			log.FromContext(ctx).V(1).Info("source adapter lookup failed; CI park degradation unknown", "run", run.Name, "error", err.Error())
+		} else if probe, ok := adapter.(source.CIParkLifecycleProbe); ok && probe.CIParkLifecycleUnsupported() {
+			return false, ctrl.Result{}, nil
+		}
 	}
 	// The attempt in flight, if any. Its head is what the park decides on
 	// whether that attempt made progress, and its fence token is what the
@@ -506,9 +546,10 @@ func (r *CoderRunReconciler) observeCIPark(ctx context.Context, run *courierv1al
 		// the fence travels with the record, and a later reconcile
 		// re-presents it until the source accepts it.
 		run.Status.CISettlement = &courierv1alpha1.CISettlement{
-			FenceToken: fenceToken,
-			Result:     courierv1alpha1.CIParkOutcomeRepushed,
-			Head:       head,
+			FenceToken:     fenceToken,
+			IdempotencyKey: ciparkRepairKey(run, attempt.Attempt),
+			Result:         courierv1alpha1.CIParkOutcomeRepushed,
+			Head:           head,
 		}
 		changed = true
 	}
@@ -831,8 +872,9 @@ func (r *CoderRunReconciler) finishCIPark(ctx context.Context, run *courierv1alp
 		// as the outcome, before the report is attempted, is what makes a
 		// lost response durable retry intent rather than a leak.
 		run.Status.CISettlement = &courierv1alpha1.CISettlement{
-			FenceToken: fenceToken,
-			Result:     outcome,
+			FenceToken:     fenceToken,
+			IdempotencyKey: ciparkRepairKey(run, run.Status.CIPark.Attempts),
+			Result:         outcome,
 		}
 		changed = true
 	}
@@ -872,6 +914,168 @@ func (r *CoderRunReconciler) finishCIPark(ctx context.Context, run *courierv1alp
 		return r.transitionTerminal(ctx, run, courierv1alpha1.PhaseFailed, observation.PR, terminalLifecycleIntent{ciFailure: true}, nil)
 	}
 	return r.transitionTerminal(ctx, run, courierv1alpha1.PhaseHandedOff, observation.PR, terminalLifecycleIntent{}, nil)
+}
+
+// abandonCIPark releases the source-side park a run carries with it out of
+// the CI park loop when the loop abandons the run without a park-ending of
+// its own (#553): the lane's ciRepair policy is gone — an operator removed or
+// emptied it, or the lane itself disappeared — or the pull request the run
+// parked behind is no longer parkable, observed without a pull request or as
+// a draft. Both bail-outs hand the observation to the ordinary grading path,
+// which then transitions the run (AwaitingReview, NeedsHuman, HandedOff)
+// while the park record and its accepted deferral stay intact — and nothing
+// on that path ever releases the deferral the park notice established, so
+// the source stays deferred against an opportunity that is already over
+// until the run is reaped.
+//
+// A live repair fence reaches here: the coordinator's exit handler turns a
+// finished exit back to Verifying alone, and the repair context is meant to
+// survive exactly that — the loop clears it in the write of the reconcile
+// whose observation consumes the attempt, so an attempt whose coordinator
+// just exited carries its fence into Verifying untouched. A policy removed
+// across the exit, or a pull request that went unparkable under it, makes
+// this abandon the observe that attempt waited for: the armed branch settles
+// the reservation exactly as the loop's own endings would rather than
+// silently killing it. Releasing a deferral a live fence holds would strand
+// it — the fence-less close's moot reading of ErrSuperseded presumes the
+// reservation's own fenced outcome will follow, and the abandon kills that
+// premise unless it records the outcome itself.
+//
+// Both conversions are one write: the intent the source is owed is recorded,
+// the pending notice a late acceptance would defer against nothing is
+// cleared with it, the attempt context that ended with the park dies with it,
+// and the park record is cleared in the same patch rather than annotated with
+// an outcome. That clearance is also the fire-once fence — the conversion
+// happens while the run may still be Verifying for several more ordinary
+// reconciles (the two-consecutive-green settle is still counting, the
+// pre-dispatch hooks still retry pending reports), and each of them walks the
+// same bail-out again, so the record's absence keeps every later entry a
+// no-op instead of a second conversion on every poll; clearing it retires the
+// park's attempt account with the loop. Neither ending ever waits on the
+// source: an undelivered report stays durable retry intent, re-presented by
+// the pre-dispatch hook on later reconciles — including reconciles while the
+// run is still in Verifying.
+func (r *CoderRunReconciler) abandonCIPark(ctx context.Context, run *courierv1alpha1.CoderRun, observation PRObservation) (ctrl.Result, error) {
+	// The live fence is read before the park record's absence ends the
+	// abandon: a granted reservation is settled even when the park record
+	// is gone, because the fence is the reservation's own and the armed
+	// branch settles it without the park record. A reservation is never
+	// left unsettled.
+	if attempt := run.Status.CIRepair; attempt != nil && attempt.FenceToken != "" {
+		return r.abandonFencedCIPark(ctx, run, attempt, observation)
+	}
+	if run.Status.CIPark == nil {
+		return ctrl.Result{}, nil
+	}
+	before := run.DeepCopy()
+	// The close is recorded first, while the park record still carries the
+	// head it is keyed on; a lookup error abandons nothing.
+	if _, err := r.recordCIParkRelease(run); err != nil {
+		return ctrl.Result{}, err
+	}
+	if run.Status.CISettlement != nil && run.Status.CISettlement.IdempotencyKey == "" &&
+		run.Status.CIPark != nil && run.Status.CIPark.Attempts > 0 {
+		// A settlement record written by an older controller carries no
+		// idempotency key: its delivery derives the key from the park
+		// account, and the abandon is the last moment that account exists.
+		// The missing key is adopted here — exactly the key the older
+		// controller derived at delivery time from the same attempt account.
+		// Without it the record is dropped instead of replayed: the delivery
+		// finds no account to derive a key from, reports nothing, and the
+		// settlement is silently lost with the source-side reservation it
+		// answers. An account that never consumed an attempt derives no key
+		// either — the older controller reported nothing for it — so no key
+		// is adopted here: a key it never used would be a fresh keyspace.
+		run.Status.CISettlement.IdempotencyKey = ciparkRepairKey(run, run.Status.CIPark.Attempts)
+	}
+	if run.Status.CIParkDeferral != nil {
+		// The opportunity the pending notice described is over with the
+		// park: the notice is cleared in the same write that records the
+		// release intent the fence-less close realizes, as on every finish.
+		run.Status.CIParkDeferral = nil
+	}
+	if run.Status.CIRepair != nil {
+		// The attempt ended with the park. Its context is cleared in the
+		// same write as the release intent and the park record, so a restart
+		// cannot leave a stale context that reads as an attempt still in
+		// flight.
+		run.Status.CIRepair = nil
+	}
+	// The record's absence is what fences the next abandon against the
+	// ordinary reconciles that follow while the run is still Verifying; it
+	// is also the attempt account going away.
+	run.Status.CIPark = nil
+	if err := r.patchStatus(ctx, before, run); err != nil {
+		return ctrl.Result{}, err
+	}
+	if run.Status.CIParkRelease != nil {
+		if delivered, err := r.deliverCIParkRelease(ctx, run); !delivered {
+			log.FromContext(ctx).V(1).Info("source deferral release not delivered", "run", run.Name, "error", err.Error())
+		}
+	}
+	return ctrl.Result{}, nil
+}
+
+// abandonFencedCIPark is the abandon's armed branch: a repair attempt is
+// still in flight with the fence the source granted its reservation. The
+// attempt's outcome is never ambiguous at the abandon — the observation that
+// walks the run out of the loop is exactly the observation the loop's own
+// endings would grade the attempt against, and the mapping reads the
+// attempt's own fields, not the park record the same write clears — so the
+// mapping is the loop's own:
+//
+//   - a new head the run still attributes as its own published head is the
+//     repair's republish, and the settlement is what the park advance would
+//     have recorded — the repushed outcome naming the new head;
+//   - the recorded head gone from the world is the same failed-closed
+//     finish the loop performs for a head it cannot own — unsupported;
+//   - otherwise the attempt published nothing on its head — the loop's
+//     no-progress finish, exhausted.
+//
+// The settlement is recorded, and the attempt context, the pending notice,
+// and the park record die with it in the same write. No fence-less close is
+// recorded here — a granted reservation is never released fence-less, the
+// fenced outcome is the release, and the delivery core is exactly the
+// finish's: best-effort, with an undelivered report left as durable intent
+// the pre-dispatch hook re-presents. The close's best-effort call is no
+// counterpart: its record is provably nil after this branch, so calling it
+// would only be dead code that reads like a second owed delivery.
+func (r *CoderRunReconciler) abandonFencedCIPark(ctx context.Context, run *courierv1alpha1.CoderRun, attempt *courierv1alpha1.CIRepairContext, observation PRObservation) (ctrl.Result, error) {
+	before := run.DeepCopy()
+	head, attributable := publishedHead(run, observation.Head)
+	settlement := &courierv1alpha1.CISettlement{
+		FenceToken:     attempt.FenceToken,
+		IdempotencyKey: ciparkRepairKey(run, attempt.Attempt),
+	}
+	switch {
+	case attributable && head != attempt.Head:
+		settlement.Result = courierv1alpha1.CIParkOutcomeRepushed
+		settlement.Head = head
+	case !attributable:
+		settlement.Result = courierv1alpha1.CIParkOutcomeUnsupported
+	default:
+		settlement.Result = courierv1alpha1.CIParkOutcomeExhausted
+	}
+	run.Status.CISettlement = settlement
+	if run.Status.CIParkDeferral != nil {
+		// The opportunity ends with the attempt: the settlement releases the
+		// deferral the source keeps on the reservation, so the pending
+		// notice is cleared in the same write, as on every finish — a late
+		// notice must never defer the source against an opportunity that is
+		// over.
+		run.Status.CIParkDeferral = nil
+	}
+	run.Status.CIRepair = nil
+	run.Status.CIPark = nil
+	if err := r.patchStatus(ctx, before, run); err != nil {
+		return ctrl.Result{}, err
+	}
+	if run.Status.CISettlement != nil {
+		if delivered, err := r.deliverCISettlement(ctx, run); !delivered {
+			log.FromContext(ctx).V(1).Info("source repair settlement not delivered", "run", run.Name, "error", err.Error())
+		}
+	}
+	return ctrl.Result{}, nil
 }
 
 // recordCIParkRelease records the fence-less close a park that ended
@@ -990,16 +1194,23 @@ func (r *CoderRunReconciler) reserveCIRepair(ctx context.Context, run *courierv1
 // The outcome presents the token the source issued for the attempt. An
 // attempt that no source fenced carries no token, and nothing is reported:
 // there is no grant to answer.
-func (r *CoderRunReconciler) reportCIRepair(ctx context.Context, run *courierv1alpha1.CoderRun, pr, head string, result source.CIRepairResult, fenceToken string) error {
+func (r *CoderRunReconciler) reportCIRepair(ctx context.Context, run *courierv1alpha1.CoderRun, pr, head string, result source.CIRepairResult, fenceToken, idempotencyKey string) error {
 	if fenceToken == "" {
 		return nil
 	}
-	attempts := 0
-	if run.Status.CIPark != nil {
-		attempts = run.Status.CIPark.Attempts
-	}
-	if attempts == 0 {
-		return nil
+	// New settlement records carry the reservation key explicitly so their
+	// replay does not depend on CIRepair/CIPark records that an ending may
+	// clear. Records written by an older controller did not carry the key;
+	// preserve their old behavior while the park account is still available.
+	if idempotencyKey == "" {
+		attempts := 0
+		if run.Status.CIPark != nil {
+			attempts = run.Status.CIPark.Attempts
+		}
+		if attempts == 0 {
+			return nil
+		}
+		idempotencyKey = ciparkRepairKey(run, attempts)
 	}
 	adapter, item, err := r.adapterAndWorkItem(run)
 	if err != nil {
@@ -1011,7 +1222,7 @@ func (r *CoderRunReconciler) reportCIRepair(ctx context.Context, run *courierv1a
 	}
 	report := source.CIRepairOutcome{
 		FenceToken:     fenceToken,
-		IdempotencyKey: ciparkRepairKey(run, attempts),
+		IdempotencyKey: idempotencyKey,
 		PR:             pr,
 		Head:           head,
 		Result:         result,
@@ -1031,7 +1242,7 @@ func (r *CoderRunReconciler) deliverCISettlement(ctx context.Context, run *couri
 	if record == nil {
 		return true, nil
 	}
-	err := r.reportCIRepair(ctx, run, run.Status.PR, record.Head, source.CIRepairResult(record.Result), record.FenceToken)
+	err := r.reportCIRepair(ctx, run, run.Status.PR, record.Head, source.CIRepairResult(record.Result), record.FenceToken, record.IdempotencyKey)
 	if err != nil {
 		if errors.Is(err, source.ErrUnsupportedCIPark) {
 			// The source cannot represent the park/repair lifecycle for this

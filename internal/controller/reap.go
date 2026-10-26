@@ -258,6 +258,15 @@ func (r *CoderRunReconciler) needsHumanRetention() time.Duration {
 	return defaultNeedsHumanRetention
 }
 
+// provisioningCollisionGrace returns the configured stuck-terminating
+// collision grace. Zero falls back to the package default.
+func (r *CoderRunReconciler) provisioningCollisionGrace() time.Duration {
+	if r.ProvisioningCollisionGrace > 0 {
+		return r.ProvisioningCollisionGrace
+	}
+	return defaultProvisioningCollisionGrace
+}
+
 // terminalAuditKeep returns the configured per-repository audit floor. Zero
 // falls back to the package default; a negative value disables the floor.
 func (r *CoderRunReconciler) terminalAuditKeep() int {

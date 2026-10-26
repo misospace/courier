@@ -251,7 +251,17 @@ repairs all the same. The Dispatch connector implements it (#495): the park
 notice, reservation, and outcome ride generation-fenced `pr-fix-queue` routes
 with a required idempotency key, refusals fail closed with the existing
 `ErrSuperseded`/`ErrStaleWork` semantics, and work Dispatch cannot defer
-(implement and queue-less items) reports `ErrUnsupportedCIPark`. A reservation
+(implement and queue-less items) reports `ErrUnsupportedCIPark`. A bare 404
+on any park-family route is permanent version-skew evidence — the refusal
+vocabulary is 409-coded, so a 404 means the deployment adopted none of the
+routes — and the connector latches it for the process: every further
+park-family exchange short-circuits without an HTTP round trip, the
+capability catalogue flips to unsupported, and while no park is in flight
+the run takes the ordinary post-publication grading path instead of
+establishing a park the source could never fence. An in-flight park keeps
+the fail-closed sentinels: a refused reservation finishes it as
+`unsupported` without consuming an attempt, and pending notices,
+settlements, and closes are dropped on the same sentinel. A reservation
 the source refuses on a superseded generation fails the run closed to handoff.
 A settled outcome the source has not accepted — a lost response, a restart, a
 report that never landed — stays pending on the run as durable retry intent:
@@ -286,12 +296,23 @@ marker write that fails leaves the observation due, so the cadence fails
 open to observing, never to never observing. A run that still owes a close is
 not reaped while the close is outstanding, because deletion would drop the
 owed close with the object; its retention window starts only once the close
-has landed. A deferral whose opportunity ends without a reservation is released by a
-fence-less close on the same route, keyed by the park notice's own idempotency
-key and recorded as durable intent before it is sent (#534). No reservation
-was granted, so no fence settles it; the close is advisory, and a source with
-no such deferral refuses it moot.
-
+has landed. A deferral whose opportunity ends without a reservation is
+released by a fence-less close on the same route, keyed by the park notice's
+own idempotency key and recorded as durable intent before it is sent (#534):
+no reservation was granted, so no fence settles it, and the close is
+advisory — a source with no such deferral refuses it moot and the record
+drops either way; a reservation that was granted is settled only by its own
+fenced outcome. The same liability is settled when the park loop abandons a
+parked run outright (#553): the observation that takes the run off the loop
+— the lane's ciRepair policy removed, or the pull request no longer
+parkable — settles it in the same write before the ordinary grading path
+decides the outcome, recording the live reservation's fenced outcome when
+the run still carries one and the fence-less close otherwise, and clearing
+the park record and the attempt context either way, so the abandoned park's
+absence fences a re-conversion across the ordinary reconciles that follow. The
+merged observation that terminalizes Done is checked before the loop runs
+(#555), and the same conversion settles the liability there before the run
+terminalizes.
 
 The coordinator declares its ending in the executor-provided outcome file,
 whose exact path is in the goal. The executor validates the declaration against
@@ -1849,7 +1870,7 @@ configured mechanical checks, and their bounded log evidence. Both are
 operator-owned — the harness never writes them — and the repair context
 outlives a relaunch, so a coordinator that restarts mid-attempt still finds the
 repair goal it needs; the operator clears it once that attempt has been
-observed.
+observed, or once the park that carried it ends (#553).
 
 ### `LaneProfile`
 
@@ -2044,8 +2065,15 @@ structurally closed. (#74)
   deleted-and-recreated same-name run) — surfaces as **provisioning in
   flight**: the run stays **Claimed** and requeues, and `Running` is never
   written over a slot not verified as a live, run-owned pod. The wait rides
-  the pod's delete event with a bounded requeue as the backstop; no wall-clock
-  bound is introduced. This mirrors the secure topology's in-flight signal for
+  the pod's delete event with a bounded requeue as the backstop. A run-owned
+  pod being torn down is the one shape with a wall-clock bound: once it has
+  been terminating longer than the provisioning-collision grace (default 6h,
+  `--provisioning-collision-grace`), the run terminalizes **NeedsHuman**
+  recording the blocking pod's name and UID in a
+  `ProvisioningCollision` status condition — terminal phases do not consume
+  lane capacity, so a stuck deletion cannot pin a slot forever, and the pod
+  itself is never deleted by the operator. The other shapes keep the
+  unbounded requeue. This mirrors the secure topology's in-flight signal for
   a terminating control pod rather than inventing a second shape (#217).
 - **Running** — pod launches: ephemeral workspace, clone, **adopt the branch if it
   exists and base-sync first**, inject LaneProfile framing + roles, wire the MCP
