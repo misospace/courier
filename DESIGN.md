@@ -234,7 +234,20 @@ for; a completed brief's commit attributes a head only while no published head
 is recorded. A head the run cannot currently account for is somebody else's
 work or a superseded head, and the run never repairs it: it fails closed to
 handoff once the run is parked, and before a park exists the ordinary grading
-path decides it. A repair attempt that publishes a new head advances the park to
+path decides it. On a lane that declares a repair policy, that fallback is
+made discoverable: a **Verifying** run observed with a pull request whose head
+it cannot attribute, and no park record, records the `CIRepairInapplicable`
+condition (reason `HeadUnattributable`) instead of failing closed in silence —
+the steady state a legacy coordinator's publication lands in, since one without
+the broker-verified commit record can never be attributed. The condition
+decides nothing: no head is fabricated for the loop to park on, the ordinary
+post-publication grading path is unchanged, and it is never set alongside a
+park record. An observation with no head at all never sets it. It clears when
+its premise ends — the head becomes attributable, folded into the same status
+write that establishes or advances the park, or the lane stops declaring a
+repair policy, folded ahead of the abandon (#553) that returns the run to the
+ordinary path. A
+repair attempt that publishes a new head advances the park to
 that head, records the attempt as `repushed`, and the loop runs again while
 budget remains; one that publishes nothing earns no further attempt on the
 same head. Every other outcome ends the run without waking the coordinator:
