@@ -4363,10 +4363,17 @@ func TestEnvtestCIParkUnsupportedLifecycleStillSignalsInapplicable(t *testing.T)
 		t.Fatalf("condition = %#v, want %q True with reason %q despite the unsupported lifecycle", cond, courierv1alpha1.ConditionCIRepairInapplicable, courierv1alpha1.ConditionReasonHeadUnattributable)
 	}
 
-	// The signal is idempotent across the run's own poll cadence.
+	// The signal is idempotent across the run's own poll cadence: the
+	// condition's transition time is not restamped by the poll.
+	first := h.run()
+	before := apimeta.FindStatusCondition(first.Status.Conditions, courierv1alpha1.ConditionCIRepairInapplicable)
 	h.reconcile()
 	if got := h.launchCount(h.name); got != 1 {
 		t.Fatalf("launches after the idempotent poll = %d, want 1 (the fallback never wakes the coordinator)", got)
+	}
+	if after := apimeta.FindStatusCondition(h.run().Status.Conditions, courierv1alpha1.ConditionCIRepairInapplicable); after == nil ||
+		!before.LastTransitionTime.Equal(&after.LastTransitionTime) {
+		t.Fatalf("condition transition time = %v, want the unstamped %v after the idempotent poll", after, before.LastTransitionTime)
 	}
 
 	// The publication evidence arrives: the head becomes attributable, the

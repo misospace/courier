@@ -490,7 +490,7 @@ func (r *CoderRunReconciler) observeCIPark(ctx context.Context, run *courierv1al
 	//
 	// The unaccountable head's diagnostic is not the fallback's to skip: it
 	// records why the loop never engaged, whatever engagement the source
-	// could support, so the attribution below is decided before the early
+	// could support, so the attribution above is decided before the early
 	// return (#550).
 	if run.Status.CIPark == nil && run.Status.CIRepair == nil {
 		adapter, _, err := r.adapterAndWorkItem(run)
