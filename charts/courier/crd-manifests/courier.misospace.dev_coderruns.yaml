@@ -325,6 +325,15 @@ spec:
                     description: Head is the republished head when Result is repushed;
                       empty otherwise.
                     type: string
+                  idempotencyKey:
+                    description: |-
+                      IdempotencyKey is the reservation key this outcome answers. New
+                      settlements always record it before clearing the repair/park context so
+                      a durable retry remains byte-identical even when those records are gone.
+                      It is optional only for compatibility with settlement records written by
+                      older controllers, which can still derive the key while a park remains.
+                    minLength: 1
+                    type: string
                   result:
                     allOf:
                     - enum:
