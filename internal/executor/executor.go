@@ -125,6 +125,14 @@ const (
 // evidence plus its own world verification — never from the model's prose or
 // the exit code alone. An unset Kind (the legacy shape) keeps the exit-code
 // classification contract.
+//
+// Reason is the pre-exit handoff text and the only place the coordinator's
+// declared evidence, question, or missing-dependency text (model data) may
+// travel: it feeds the kubelet termination handoff and the source report.
+// The durable NativeResult reason is code-owned — NativeResultReason of Kind
+// — so model-authored text never lands on CoderRun status; the operator's
+// own terminal diagnostic derives only from operator evidence, exactly as
+// before.
 type HarnessResult struct {
 	Outcome         DeclaredOutcome
 	Kind            courierv1alpha1.NativeResultKind

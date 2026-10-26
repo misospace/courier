@@ -1740,7 +1740,12 @@ after a relaunch records its own. The pre-exit write is best-effort with a
 bounded, cancellation-proof window; when it never lands, the pod's
 `COURIER_TERMINATION` handoff carries the kind as the fallback channel
 (`result_kind`), and a run with neither keeps the legacy exit-code
-classification — the absence of a persisted result never grants trust.
+classification — the absence of a persisted result never grants trust. The
+durable reason is code-owned per kind (`NativeResultReason`), bounded by the
+shared `MaxNativeResultReasonBytes` contract the CRD validation, the broker
+writer, and the control binary all use; the coordinator's declared evidence,
+question, or missing-dependency text (model data) stays on the termination
+handoff and the source report and never lands on durable status.
 
 The operator consumes the result only when it fences to the coordinator pod
 whose termination it is classifying, so a stale incarnation's result can never

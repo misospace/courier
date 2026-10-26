@@ -625,9 +625,11 @@ spec:
                     type: string
                   reason:
                     description: |-
-                      Reason is a short, bounded, operator-legible explanation of the ending.
-                      It carries fixed categories and redacted diagnostics, never model
-                      output.
+                      Reason is a fixed, code-owned operator label derived from Kind
+                      (NativeResultReason), bounded by MaxNativeResultReasonBytes. It never
+                      carries model output: the coordinator's declared evidence, question, or
+                      missing-dependency text stays on the termination handoff and the source
+                      report, never on durable status.
                     maxLength: 1024
                     type: string
                 required:

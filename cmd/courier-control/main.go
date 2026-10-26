@@ -298,12 +298,17 @@ func declare(result executor.HarnessResult, reporter *harness.StatusReporter, id
 }
 
 // persistTerminalResult writes the trusted native terminal result through
-// the broker's status path before process exit (#127). The write is bounded
-// and runs on a context that survives the caller's cancellation so a
-// SIGTERM'd exit still records durable intent; a failure is reported on
-// stderr and the exit proceeds — the operator then falls back to the
-// termination handoff, and the absence of a persisted result never grants
-// trust.
+// the broker's status path before process exit (#127). The durable reason is
+// the code-owned label derived from the result kind (NativeResultReason) —
+// never the termination handoff's reason, which may carry the coordinator's
+// declared evidence, question, or missing-dependency text (model data) for
+// the kubelet handoff and the source report. Keeping the two channels apart
+// is the trust boundary: model-authored text never lands on durable status.
+// The write is bounded and runs on a context that survives the caller's
+// cancellation so a SIGTERM'd exit still records durable intent; a failure
+// is reported on stderr and the exit proceeds — the operator then falls back
+// to the termination handoff, and the absence of a persisted result never
+// grants trust.
 func persistTerminalResult(payload termination, reporter *harness.StatusReporter, identity *controlIdentity) {
 	if reporter == nil || identity == nil || payload.ResultKind == "" {
 		return
@@ -312,7 +317,7 @@ func persistTerminalResult(payload termination, reporter *harness.StatusReporter
 	defer cancel()
 	result := courierv1alpha1.NativeResult{
 		Kind:              courierv1alpha1.NativeResultKind(payload.ResultKind),
-		Reason:            payload.Reason,
+		Reason:            courierv1alpha1.NativeResultReason(courierv1alpha1.NativeResultKind(payload.ResultKind)),
 		CoordinatorPodUID: identity.controlKubeUID,
 		At:                metav1.NewTime(clockNow()),
 	}

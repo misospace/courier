@@ -529,3 +529,70 @@ func TestPersistTerminalResultWritesThroughTheTrustedPath(t *testing.T) {
 		}
 	})
 }
+
+// TestPersistTerminalResultKeepsModelTextOutOfDurableReason pins the trust
+// boundary (#127 review): the coordinator's declared evidence, question, or
+// missing-dependency text rides the termination handoff — the pre-existing
+// surface for it — but never the durable nativeResult.reason, which is the
+// fixed code-owned label for the kind. The kind, fencing UID, and timestamp
+// behavior are unchanged.
+func TestPersistTerminalResultKeepsModelTextOutOfDurableReason(t *testing.T) {
+	tests := []struct {
+		name    string
+		outcome executor.DeclaredOutcome
+		kind    courierv1alpha1.NativeResultKind
+		summary string
+	}{
+		{
+			name:    "no_change evidence",
+			outcome: executor.OutcomeNoChangeNeeded,
+			kind:    courierv1alpha1.NativeResultNoChange,
+			summary: `{"outcome":"no_change_needed","evidence":"the fix already landed in commit abcdef0 last Tuesday"}`,
+		},
+		{
+			name:    "needs_decision question",
+			outcome: executor.OutcomeNeedsDecision,
+			kind:    courierv1alpha1.NativeResultNeedsHuman,
+			summary: `{"outcome":"needs_decision","question":"which base branch should this target, release-1 or main?"}`,
+		},
+		{
+			name:    "blocked_external missing dependency",
+			outcome: executor.OutcomeBlockedExternal,
+			kind:    courierv1alpha1.NativeResultBlockedExternal,
+			summary: `{"outcome":"blocked_external","missing":"approval from the security team on the signing policy"}`,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			identity := &controlIdentity{controlKubeUID: "control-kube-uid"}
+			payload := terminationFor(executor.HarnessResult{
+				Outcome: tt.outcome,
+				Kind:    tt.kind,
+				Reason:  tt.summary,
+			})
+			// The handoff channel keeps the model-authored text: it feeds the
+			// kubelet termination message and the operator's source report.
+			if !strings.Contains(payload.Reason, tt.summary) {
+				t.Fatalf("handoff reason %q lost the coordinator's declared text — the termination handoff is the surface for it", payload.Reason)
+			}
+			transport := &recordingTransport{}
+			persistTerminalResult(payload, harness.NewStatusReporter(transport, "control-kube-uid", "worker", 0), identity)
+			if len(transport.patches) != 1 || transport.patches[0].TerminalResult == nil {
+				t.Fatalf("persisted patches = %#v, want exactly one terminal result", transport.patches)
+			}
+			result := transport.patches[0].TerminalResult
+			if result.Kind != tt.kind {
+				t.Fatalf("kind = %q, want %q", result.Kind, tt.kind)
+			}
+			if result.Reason != courierv1alpha1.NativeResultReason(tt.kind) {
+				t.Fatalf("durable reason = %q, want the fixed code-owned label %q", result.Reason, courierv1alpha1.NativeResultReason(tt.kind))
+			}
+			if strings.Contains(result.Reason, "last Tuesday") || strings.Contains(result.Reason, "which base branch") || strings.Contains(result.Reason, "security team") {
+				t.Fatalf("durable reason %q carries model-authored text", result.Reason)
+			}
+			if result.CoordinatorPodUID != "control-kube-uid" || result.At.IsZero() {
+				t.Fatalf("fencing = %#v, want the incarnation UID and a timestamp", result)
+			}
+		})
+	}
+}

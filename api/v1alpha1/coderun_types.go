@@ -493,6 +493,41 @@ const (
 	NativeResultInfrastructureFailed NativeResultKind = "infrastructure_failed"
 )
 
+// MaxNativeResultReasonBytes is the durable-reason bound shared by the
+// NativeResult CRD validation, the broker's trusted status writer, and the
+// control binary's pre-exit persistence (#127): one constant so the three
+// ends of the status path cannot drift. The kubebuilder MaxLength on the
+// Reason field below is this value's validated copy and must move with it.
+const MaxNativeResultReasonBytes = 1024
+
+// NativeResultReason returns the fixed, code-owned durable reason for a
+// trusted native terminal result kind (#127). The durable reason is a stable
+// operator label — never model output: the coordinator's declared evidence,
+// question, or missing-dependency text stays on the termination handoff and
+// the source report, which are the surfaces for it, while
+// status.nativeResult.reason remains a fixed diagnostic trusted control can
+// authoritatively stand behind. An unknown kind has no durable reason.
+func NativeResultReason(kind NativeResultKind) string {
+	switch kind {
+	case NativeResultPublished:
+		return "coordinator published through the broker"
+	case NativeResultNoChange:
+		return "coordinator declared no change needed"
+	case NativeResultNeedsHuman:
+		return "coordinator requested a human decision"
+	case NativeResultBlockedExternal:
+		return "coordinator blocked on an external prerequisite"
+	case NativeResultCapacityExhausted:
+		return "execution capacity was confirmed exhausted"
+	case NativeResultWorkloadFailed:
+		return "coordinator reported a workload failure"
+	case NativeResultInfrastructureFailed:
+		return "coordinator reported an infrastructure failure"
+	default:
+		return ""
+	}
+}
+
 // NativeResult is the trusted native coordinator's structured terminal
 // result (#127), written by trusted control through the run's broker status
 // path before the control process exits. The broker fences it to the
@@ -504,9 +539,11 @@ const (
 type NativeResult struct {
 	// Kind is the explicit terminal classification.
 	Kind NativeResultKind `json:"kind"`
-	// Reason is a short, bounded, operator-legible explanation of the ending.
-	// It carries fixed categories and redacted diagnostics, never model
-	// output.
+	// Reason is a fixed, code-owned operator label derived from Kind
+	// (NativeResultReason), bounded by MaxNativeResultReasonBytes. It never
+	// carries model output: the coordinator's declared evidence, question, or
+	// missing-dependency text stays on the termination handoff and the source
+	// report, never on durable status.
 	// +optional
 	// +kubebuilder:validation:MaxLength=1024
 	Reason string `json:"reason,omitempty"`

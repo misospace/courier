@@ -566,3 +566,37 @@ func TestStatusWriterFencesTerminalResultIdentity(t *testing.T) {
 		t.Fatal("a result with no time was accepted")
 	}
 }
+
+// TestStatusWriterBoundsTerminalResultReason proves the durable-reason bound
+// is the shared MaxNativeResultReasonBytes contract (#127 review): exactly at
+// the bound the write lands, one byte over is a definite refusal — and the
+// constant the broker enforces is the same one the CRD annotation and the
+// control binary's persistence derive from, so the three ends cannot drift.
+func TestStatusWriterBoundsTerminalResultReason(t *testing.T) {
+	w, c, identity := statusFixture(t)
+	atBound := &courier.NativeResult{
+		Kind:              courier.NativeResultInfrastructureFailed,
+		Reason:            strings.Repeat("a", courier.MaxNativeResultReasonBytes),
+		CoordinatorPodUID: string(identity.ControlPodUID),
+		At:                metav1.NewTime(metav1.Now().Rfc3339Copy().Time),
+	}
+	if err := w.Write(context.Background(), identity, HarnessPatch{TerminalResult: atBound}, nil); err != nil {
+		t.Fatalf("reason at the shared bound was refused: %v", err)
+	}
+	var run courier.CoderRun
+	if err := c.Get(context.Background(), client.ObjectKey{Namespace: testNamespace, Name: testRunName}, &run); err != nil {
+		t.Fatal(err)
+	}
+	if run.Status.NativeResult == nil || len(run.Status.NativeResult.Reason) != courier.MaxNativeResultReasonBytes {
+		t.Fatalf("persisted reason length = %d, want the full at-bound reason", len(run.Status.NativeResult.Reason))
+	}
+	overBound := &courier.NativeResult{
+		Kind:              courier.NativeResultInfrastructureFailed,
+		Reason:            strings.Repeat("a", courier.MaxNativeResultReasonBytes+1),
+		CoordinatorPodUID: string(identity.ControlPodUID),
+		At:                metav1.NewTime(metav1.Now().Rfc3339Copy().Time),
+	}
+	if err := w.Write(context.Background(), identity, HarnessPatch{TerminalResult: overBound}, nil); err == nil {
+		t.Fatal("a reason over the shared bound was accepted")
+	}
+}

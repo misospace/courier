@@ -299,7 +299,9 @@ func sameOperationEvidence(a, b courier.ActiveOperation) bool {
 }
 
 // validTerminalResult checks one terminal result's structural identity: a
-// known kind, a non-zero timestamp, and a bounded reason (#127).
+// known kind, a non-zero timestamp, and a reason within the shared durable
+// bound (#127) — the same constant the CRD validation and the control
+// binary's persistence use, so the three ends cannot drift.
 func validTerminalResult(result *courier.NativeResult) error {
 	switch result.Kind {
 	case courier.NativeResultPublished, courier.NativeResultNoChange,
@@ -312,7 +314,7 @@ func validTerminalResult(result *courier.NativeResult) error {
 	if result.At.IsZero() {
 		return fmt.Errorf("terminal result carries no time")
 	}
-	if len(result.Reason) > 1024 {
+	if len(result.Reason) > courier.MaxNativeResultReasonBytes {
 		return fmt.Errorf("terminal result reason exceeds its bound")
 	}
 	return nil
