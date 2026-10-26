@@ -457,6 +457,128 @@ func TestEnvtestCIParkRepairsRedMechanicalCI(t *testing.T) {
 	}
 }
 
+// applyCIParkPolicy sets the lane's declared repair policy on a run already
+// in flight: the dynamic enablement a park's settle window must treat as a
+// transition, not as history it can settle onto (#551).
+func applyCIParkPolicy(t *testing.T, laneName string, policy *courierv1alpha1.CIRepairPolicy) {
+	t.Helper()
+	var lane courierv1alpha1.LaneProfile
+	if err := envtestClient.Get(context.Background(), envtestKey(laneName), &lane); err != nil {
+		t.Fatal(err)
+	}
+	lane.Spec.CIRepair = policy
+	if err := envtestClient.Update(context.Background(), &lane); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// TestEnvtestCIParkFreshSettleWindowOnLateEnablement pins the failed half of
+// the fresh settle window a park's creation owes (#551): a failure the
+// ordinary path recorded before the lane declared a repair policy is not a
+// prior observation the park made, so the park's first red observation
+// records the candidate without settling, and only a second genuinely
+// separate identical park observation wakes the repair.
+func TestEnvtestCIParkFreshSettleWindowOnLateEnablement(t *testing.T) {
+	if envtestClient == nil {
+		t.Skip("KUBEBUILDER_ASSETS is not set")
+	}
+	h := newCIParkHarness(t, "cipark-late-policy", nil, &admissionSource{})
+
+	// The ordinary path owns the red observation while no policy applies: it
+	// records the failed candidate and requeues, unsettled.
+	h.publishHead("sha-1")
+	h.world.set(redObservation("sha-1", "build"))
+	h.toVerifying()
+	h.reconcile()
+	ordinary := h.run()
+	if ordinary.Status.FailedCheckFingerprint == "" {
+		t.Fatal("status.failedCheckFingerprint = empty after the ordinary red observation, want the recorded candidate")
+	}
+	if got := h.phase(); got != courierv1alpha1.PhaseVerifying {
+		t.Fatalf("phase after the ordinary red observation = %q, want Verifying", got)
+	}
+
+	// The policy is enabled mid-Verifying. The park it establishes on the
+	// same red observation starts its own settle window: the ordinary
+	// fingerprint is not one of the park's own observations, so the failure
+	// does not settle and the coordinator is never woken.
+	applyCIParkPolicy(t, h.laneName, ciparkPolicy(2))
+	h.reconcile()
+	if got := h.phase(); got != courierv1alpha1.PhaseVerifying {
+		t.Fatalf("phase after the park's first red observation = %q, want Verifying", got)
+	}
+	parked := h.run()
+	if parked.Status.CIPark == nil || parked.Status.CIPark.Head != "sha-1" {
+		t.Fatalf("park record = %#v, want a park on the published head sha-1", parked.Status.CIPark)
+	}
+	if parked.Status.CIRepair != nil {
+		t.Fatalf("status.ciRepair = %#v on the park's first observation, want nil", parked.Status.CIRepair)
+	}
+	if parked.Status.FailedCheckFingerprint == "" {
+		t.Fatal("status.failedCheckFingerprint = empty after the park's first red observation, want the stored diagnostic")
+	}
+	if got := h.launchCount(h.name); got != 1 {
+		t.Fatalf("launches = %d after the park's first red observation, want 1", got)
+	}
+
+	// A second genuinely separate identical park observation settles the
+	// failure, and the run wakes for one bounded repair.
+	h.reconcile()
+	if got := h.phase(); got != courierv1alpha1.PhaseClaimed {
+		t.Fatalf("phase after the settled failure = %q, want Claimed", got)
+	}
+	resumed := h.run()
+	if resumed.Status.CIRepair == nil || resumed.Status.CIRepair.Attempt != 1 {
+		t.Fatalf("repair context = %#v, want attempt 1", resumed.Status.CIRepair)
+	}
+	// The claimed repair launches the coordinator on the next reconcile.
+	h.reconcile()
+	if got := h.launchCount(h.name); got != 2 {
+		t.Fatalf("launches = %d after the claimed repair, want 2 (the initial launch and one repair)", got)
+	}
+}
+
+// TestEnvtestCIParkFreshGreenSettleWindowOnLateEnablement pins the green
+// half of the fresh settle window (#551): a green candidate the ordinary
+// path recorded before the policy applied is not a prior observation the
+// park made, so the park's first green observation keeps the run parked, and
+// only the second settles it into review.
+func TestEnvtestCIParkFreshGreenSettleWindowOnLateEnablement(t *testing.T) {
+	if envtestClient == nil {
+		t.Skip("KUBEBUILDER_ASSETS is not set")
+	}
+	h := newCIParkHarness(t, "cipark-late-green", nil, &admissionSource{})
+
+	h.publishHead("sha-1")
+	h.world.set(greenObservation("sha-1", "build"))
+	h.toVerifying()
+	h.reconcile()
+	ordinary := h.run()
+	if ordinary.Status.CheckFingerprint == "" {
+		t.Fatal("status.checkFingerprint = empty after the ordinary green observation, want the recorded candidate")
+	}
+	if got := h.phase(); got != courierv1alpha1.PhaseVerifying {
+		t.Fatalf("phase after the ordinary green observation = %q, want Verifying", got)
+	}
+
+	applyCIParkPolicy(t, h.laneName, ciparkPolicy(2))
+	h.reconcile()
+	if got := h.phase(); got != courierv1alpha1.PhaseVerifying {
+		t.Fatalf("phase after the park's first green observation = %q, want Verifying", got)
+	}
+	if h.run().Status.CIPark == nil {
+		t.Fatal("status.cipark = nil after the park's first green observation, want the park record")
+	}
+	if got := h.launchCount(h.name); got != 1 {
+		t.Fatalf("launches = %d after the park's first green observation, want 1", got)
+	}
+
+	h.reconcile()
+	if got := h.phase(); got != courierv1alpha1.PhaseAwaitingReview {
+		t.Fatalf("phase after the settled green observation = %q, want AwaitingReview", got)
+	}
+}
+
 // TestEnvtestCIParkGreenFinishesWithoutRepair pins the cheapest ending: a
 // green mechanical check settles the run without ever waking the coordinator.
 func TestEnvtestCIParkGreenFinishesWithoutRepair(t *testing.T) {

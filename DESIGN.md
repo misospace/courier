@@ -211,7 +211,11 @@ an unregistered check set holds the park, and a merged, unobservable, or
 superseded-head observation, a non-mechanical failure, or an exhausted budget
 always finishes without waking. A wake needs more than the verdict. The failure
 must be settled — two consecutive identical failed observations, so a flapping
-report never repairs — the lane must have capacity right now, because a repair
+report never repairs — and the settle window belongs to the park itself: it
+starts when the park is established, so a matching observation recorded before
+the loop owned the run (the ordinary path's, under a lane that then declared no
+policy, or a park the run has since left) is never the settle's first half
+(#551). The lane must have capacity right now, because a repair
 reacquires the slot it needs rather than assuming it, and the budget must have
 room. The attempt is consumed in the same status patch as the phase change back
 to **Claimed** — the admission reservation the repair needs, and the phase the

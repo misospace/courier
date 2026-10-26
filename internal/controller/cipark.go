@@ -596,8 +596,17 @@ func (r *CoderRunReconciler) observeCIPark(ctx context.Context, run *courierv1al
 	// registering never settles green.
 	selector := mechanicalSelector(policy.MechanicalChecks)
 	failedCandidate, greenCandidate := ciparkFingerprints(observation, policy.MechanicalChecks)
-	failureSettled := failedCandidate != "" && run.Status.FailedCheckFingerprint == failedCandidate
-	greenSettled := greenCandidate != "" && run.Status.CheckFingerprint == greenCandidate
+	// A park this observation establishes starts its own settle window. The
+	// fingerprints in the status were recorded by whoever owned the
+	// observation before the loop did — the ordinary path while no policy
+	// applied, or a park the run has since left — so they are not prior
+	// observations this park made, and counting one as the settle's first
+	// half would wake a repair (or settle green) on the park's very first
+	// observation (#551). Recording the candidate now and settling only on
+	// the next identical observation keeps the ordinary two-consecutive
+	// rule intact inside the park.
+	failureSettled := !established && failedCandidate != "" && run.Status.FailedCheckFingerprint == failedCandidate
+	greenSettled := !established && greenCandidate != "" && run.Status.CheckFingerprint == greenCandidate
 	if run.Status.FailedCheckFingerprint != failedCandidate {
 		run.Status.FailedCheckFingerprint = failedCandidate
 		changed = true
