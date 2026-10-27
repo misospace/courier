@@ -352,6 +352,45 @@ an untrusted isolated worker. Its contract and outstanding blockers are detailed
 in [HARNESS.md](./HARNESS.md); describing that target does not imply that its
 executor or worker isolation is implemented or production-ready.
 
+### Trusted native terminal results
+
+The native harness ends with an explicit, structured terminal result, not a
+bare exit code (#127; the full contract is HARNESS.md §8). Trusted control
+classifies every ending into a `status.nativeResult` kind — `published`,
+`no_change`, `needs_human`, `blocked_external`, `capacity_exhausted`,
+`workload_failed`, or `infrastructure_failed` — and persists it through the
+run's broker status path before the control process exits. The broker fences
+the write to the authenticated control incarnation, so a stale pod cannot
+record a result, and one incarnation's recorded result is final: an identical
+rewrite is the idempotent retry that resolves a lost acknowledgment, a
+conflicting rewrite is refused, and a replacement incarnation after a
+relaunch records its own over the stale one.
+
+The durable reason is code-owned per kind (`NativeResultReason`), never
+model-authored prose: the coordinator's declared evidence, question, or
+missing-dependency text keeps its established surfaces — the
+`COURIER_TERMINATION` handoff and the source report — and never lands on
+CoderRun status. When the status write fails, the pod's termination handoff
+carries the kind as `result_kind`, the operator's fallback channel; a run
+with neither keeps the legacy exit-code classification, so the absence of a
+persisted result never grants trust.
+
+The operator consumes the result only when it fences to the coordinator pod
+whose termination it is classifying, and classifies from that evidence —
+never from the exit code or the model's prose alone. The phase routes mirror
+the legacy exit contract exactly: a `published` or `no_change` result still
+only hands the run to **Verifying** (a resolve-issue `no_change` to
+**AwaitingReview**), where the operator's own PR/head/check observation
+remains the authority — a zero exit with no verified PR never reaches a
+falsely successful **AwaitingReview**. The one behavioral addition is the
+failure split: `workload_failed` terminalizes **Failed** with its own
+diagnostic category, a verdict on the work; `infrastructure_failed` is never
+a terminal verdict — the operator deletes the terminated pod once so the
+deterministic name is free, then relaunches and resumes from durable state
+through the same crashloop-bounded path pod loss uses, handing the run to a
+human at the ceiling with the terminated pod preserved as the ending's
+evidence.
+
 ### Coordinator pod process lifetime
 
 The legacy pod runs the executor directly as PID 1 — the pod sets `Command`,
