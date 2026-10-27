@@ -1404,7 +1404,16 @@ outcome carried by a validated termination handoff whose category is
 `forge-unavailable` — opens the workspace-safety evidence gate; a
 task-shaped `blocked_external` with any other category opens nothing and
 never enters capacity recovery. A failed read never publishes a `Verifying`
-success and never claims the pull request is missing.
+success and never claims the pull request is missing. The launch-time adoption
+and fix-pr head guards read the run branch through this same git-side
+`RemoteBranchExists` and consume the classification identically (#580): a read
+that could not complete on a transient availability condition — before the
+workspace was even prepared — ends the run on this same `blocked_external` /
+`forge-unavailable` recovery channel with the executor's workspace snapshot,
+never the `executor-crash` those guards give a read that reached the forge and
+returned its own verdict. Their fail-closed (non-transient) ending stays
+`executor-crash` rather than the observation's `verifier-rejection`, because no
+handoff is ever in flight at launch.
 
 The diagnostic carries the observed exit code, the executor-declared outcome
 kind when any, an **operator-derived** short reason (a category label, the

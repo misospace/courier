@@ -1490,6 +1490,23 @@ func envIdentity() config {
 	}
 }
 
+// transientLaunchReadTermination builds the recoverable ending for a launch
+// guard whose remote branch read could not complete on a transient availability
+// condition (#580). The world the read was meant to observe was never observed,
+// so — mirroring the pre-handoff forge observation's #455 refinement — the run
+// ends on the recovery channel: a blocked_external ending with the honest
+// forge-unavailable category for the operator's bounded retry, never the
+// executor-crash a guard gives a read that reached the forge and returned its
+// own verdict. It reuses forgeUnavailableTermination so the launch guards share
+// the handoff path's exact ending and its git-verified workspace-safety
+// snapshot. The launch guards run before git.Prepare, so that snapshot carries
+// no start commit and reports unknown unless the workspace directory already
+// holds verifiable work.
+func (r reporter) transientLaunchReadTermination(reason string) termination {
+	workspace := &git.Workspace{Directory: r.cfg.Directory, RemoteURL: r.cfg.RemoteURL, Branch: r.cfg.Branch}
+	return r.forgeUnavailableTermination(workspace, r.cfg, "", reason)
+}
+
 // guardAdoption enforces the resolve-issue invariant that a deterministic
 // branch may be adopted only when it is orphaned. When the branch already
 // exists on the remote, the guard reads the run branch's pull requests
@@ -1504,15 +1521,30 @@ func envIdentity() config {
 // and heads whose only pull requests are closed or merged terminate
 // NeedsHuman with the precise state, mirroring the observation's fixed
 // consequences (#247). Body linkage is not checked here: the controller's
-// `Verifying` observation settles what this early handoff leaves open. It
-// returns (0, false) when the run may proceed to Prepare, or a terminal
-// (code, true) once it has emitted the run's handoff.
+// `Verifying` observation settles what this early handoff leaves open. The
+// launch-time read that decides whether the branch exists at all is the same
+// git-side remote read the handoff classifies: when it could not complete on a
+// transient availability condition the world was never observed, so the guard
+// ends the run on the recovery channel — a forge-unavailable blocked_external
+// for the operator's bounded retry — rather than as an executor crash, while a
+// read that reached the forge and returned its own verdict keeps the fail-closed
+// crash ending (#580). It returns (0, false) when the run may proceed to Prepare,
+// or a terminal (code, true) once it has emitted the run's handoff.
 func (r reporter) guardAdoption(ctx context.Context) (int, bool) {
 	if r.cfg.Mode != "resolve-issue" {
 		return 0, false
 	}
 	exists, err := git.RemoteBranchExists(ctx, r.cfg.RemoteURL, r.cfg.Branch)
 	if err != nil {
+		if forge.IsTransientAvailability(err) {
+			// The read never reached the forge's answer, so adoption cannot
+			// be decided from it: park for the operator's bounded retry under
+			// the forge-unavailable category rather than crash, and never
+			// adopt or proceed on an unobserved remote (#580).
+			reason := fmt.Sprintf("the run branch %s could not be read on the remote to decide adoption: %s; the forge was temporarily unavailable, so the run is parked for bounded retry by the operator", r.cfg.Branch, err.Error())
+			r.terminate(r.transientLaunchReadTermination(reason))
+			return exitNeedsHuman, true
+		}
 		r.terminate(termination{Phase: "Failed", Result: "failure", ExitCode: 1, Reason: err.Error(), Category: terminalCategoryExecutorCrash})
 		return 1, true
 	}
@@ -1553,15 +1585,29 @@ func (r reporter) guardAdoption(ctx context.Context) (int, bool) {
 // guardFixPRHead enforces the fix-pr invariant that a run must operate on the
 // fork that owns the PR head. If the head branch is missing on that fork, the
 // run must stop and ask for a human; it must never adopt a same-named base
-// branch or force-push elsewhere. It returns 0 when the run may proceed. The
-// guard assumes pod.go points COURIER_REPO_URL at the head repo for fix-pr
-// runs; single-remote deployments without a %s placeholder are out of scope.
+// branch or force-push elsewhere. The launch-time head read is the same git-side
+// remote read the handoff classifies: a transient availability failure parks the
+// run for the operator's bounded retry under the forge-unavailable category
+// rather than crashing it, while a read that reached the fork and returned its
+// own verdict keeps the fail-closed crash ending (#580). It returns 0 when the
+// run may proceed. The guard assumes pod.go points COURIER_REPO_URL at the head
+// repo for fix-pr runs; single-remote deployments without a %s placeholder are
+// out of scope.
 func (r reporter) guardFixPRHead(ctx context.Context) int {
 	if r.cfg.Mode != "fix-pr" || r.cfg.HeadRepo == "" || strings.EqualFold(r.cfg.HeadRepo, r.cfg.Repo) {
 		return 0
 	}
 	exists, err := git.RemoteBranchExists(ctx, r.cfg.RemoteURL, r.cfg.Branch)
 	if err != nil {
+		if forge.IsTransientAvailability(err) {
+			// The read never reached the fork's answer, so the head's
+			// presence is unobserved: park for the operator's bounded retry
+			// under the forge-unavailable category rather than crash, and
+			// never fall back to a same-named base branch (#580).
+			reason := fmt.Sprintf("the PR head branch %s could not be read on the fork head repo %s: %s; the forge was temporarily unavailable, so the run is parked for bounded retry by the operator", r.cfg.Branch, r.cfg.HeadRepo, err.Error())
+			r.terminate(r.transientLaunchReadTermination(reason))
+			return exitNeedsHuman
+		}
 		r.terminate(termination{Phase: "Failed", Result: "failure", ExitCode: 1, Reason: err.Error(), Category: terminalCategoryExecutorCrash})
 		return 1
 	}
