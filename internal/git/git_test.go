@@ -1983,6 +1983,39 @@ func TestSSHProbeCommandYieldsNothingItCannotFaithfullyEmulate(t *testing.T) {
 			t.Fatal("a blank GIT_SSH is not a path git could exec: the probe must yield no evidence")
 		}
 	})
+	t.Run("a set-but-blank core.sshCommand resolves nothing", func(t *testing.T) {
+		_, _ = stubSSHBinary(t, "ssh", "echo \"hostname forge.internal\"\necho \"port 2222\"\n")
+		useCoreSSHCommand(t, "")
+		if _, ok := sshEffectiveAddress(ctx, target, ""); ok {
+			t.Fatal("git runs a blank core.sshCommand as the command itself and dials nothing: the probe must not fall through to plain ssh")
+		}
+	})
+	t.Run("a set-but-blank core.sshCommand does not fall through to GIT_SSH", func(t *testing.T) {
+		directory, _ := stubSSHBinary(t, "never-invoked", "echo \"hostname forge.internal\"\necho \"port 2222\"\n")
+		useCoreSSHCommand(t, "")
+		t.Setenv("GIT_SSH", filepath.Join(directory, "never-invoked"))
+		if _, ok := sshEffectiveAddress(ctx, target, ""); ok {
+			t.Fatal("a blank core.sshCommand outranks GIT_SSH as git's precedence does: the probe must yield no evidence, not dial where git would not")
+		}
+	})
+	t.Run("a whitespace-only core.sshCommand resolves nothing", func(t *testing.T) {
+		_, _ = stubSSHBinary(t, "ssh", "echo \"hostname forge.internal\"\necho \"port 2222\"\n")
+		useCoreSSHCommand(t, "   ")
+		if _, ok := sshEffectiveAddress(ctx, target, ""); ok {
+			t.Fatal("git runs a whitespace-only core.sshCommand as nothing after word splitting: the probe must yield no evidence")
+		}
+	})
+	t.Run("an unreadable git configuration resolves nothing", func(t *testing.T) {
+		_, _ = stubSSHBinary(t, "ssh", "echo \"hostname forge.internal\"\necho \"port 2222\"\n")
+		corrupt := filepath.Join(t.TempDir(), "gitconfig")
+		if err := os.WriteFile(corrupt, []byte("[invalid\n"), 0o600); err != nil {
+			t.Fatalf("write corrupt gitconfig: %v", err)
+		}
+		t.Setenv("GIT_CONFIG_GLOBAL", corrupt)
+		if _, ok := sshEffectiveAddress(ctx, target, ""); ok {
+			t.Fatal("a core.sshCommand lookup git itself dies on is not an unset key: the probe must yield no evidence")
+		}
+	})
 	t.Run("a command separator resolves nothing", func(t *testing.T) {
 		t.Setenv("PATH", t.TempDir())
 		t.Setenv("GIT_SSH_COMMAND", "ssh\ngit@forge584.invalid")
@@ -2069,6 +2102,37 @@ func TestSSHEffectiveEndpointYieldsNoEndpointBehindAProxy(t *testing.T) {
 			t.Fatal("a dump without a proxy configuration must resolve normally")
 		}
 	})
+	// OpenSSH clears the documented keyword value "none" to unset while
+	// parsing (case-insensitively, like the comparison below), so a real
+	// `ssh -G` never dumps it; a dump that carries it names no proxy, and
+	// resolving it as one would make the ordinary endpoint fail closed on
+	// evidence ssh itself rejects. A value merely shaped like the keyword
+	// still names a proxy.
+	for name, tc := range map[string]struct {
+		line string
+		want string
+	}{
+		"a none proxycommand names no proxy":         {line: "proxycommand none", want: "forge.internal:2222"},
+		"a none proxyjump names no proxy":            {line: "proxyjump none", want: "forge.internal:2222"},
+		"a cased None names no proxy":                {line: "proxycommand None", want: "forge.internal:2222"},
+		"a none with trailing blanks names no proxy": {line: "proxyjump none ", want: "forge.internal:2222"},
+		"a none list is still a proxy":               {line: "proxycommand none,other", want: ""},
+		"a near-none value is still a proxy":         {line: "proxyjump nonex", want: ""},
+	} {
+		t.Run(name, func(t *testing.T) {
+			stubSSHBinary(t, "ssh", "echo \"hostname forge.internal\"\necho \"port 2222\"\necho \""+tc.line+"\"\n")
+			endpoint, ok := sshEffectiveAddress(ctx, target, "")
+			if tc.want == "" {
+				if ok {
+					t.Fatalf("a dumped %q routes ssh through a proxy: no endpoint is evidence", tc.line)
+				}
+				return
+			}
+			if !ok || endpoint != tc.want {
+				t.Fatalf("a dumped %q must keep the resolution, got %q %v", tc.line, endpoint, ok)
+			}
+		})
+	}
 }
 
 // TestSplitShellTokens pins the tokenizer the ssh-command selection rests

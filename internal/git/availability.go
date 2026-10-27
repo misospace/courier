@@ -239,7 +239,11 @@ func sshEffectiveAddress(ctx context.Context, target, urlPort string) (string, b
 // endpoint that process would never dial. The read runs outside any
 // repository — the remote-publication read passes no directory — so
 // core.sshCommand is read from git's system and global configuration alone,
-// exactly the scopes that read would apply.
+// exactly the scopes that read would apply. A key present with a blank or
+// whitespace-only value answers false rather than falling through: git takes
+// that value as the command it runs, dials nothing with it, and an endpoint
+// resolved through a command git never selected is evidence of the wrong
+// target.
 //
 // A shell-command value — GIT_SSH_COMMAND or core.sshCommand, which git runs
 // through the shell — is resolved as the shell resolves it for word
@@ -266,11 +270,14 @@ func sshProbeCommand(ctx context.Context) (string, []string, bool) {
 	if value, ok := os.LookupEnv("GIT_SSH_COMMAND"); ok {
 		return sshCommandLine(ctx, value)
 	}
-	value, err := gitConfigSSHCommand(ctx)
+	value, set, err := gitConfigSSHCommand(ctx)
 	if err != nil {
 		return "", nil, false
 	}
-	if value != "" {
+	if set {
+		if value == "" {
+			return "", nil, false
+		}
 		return sshCommandLine(ctx, value)
 	}
 	if path, ok := os.LookupEnv("GIT_SSH"); ok {
@@ -296,21 +303,25 @@ func sshCommandLine(ctx context.Context, command string) (string, []string, bool
 }
 
 // gitConfigSSHCommand reads core.sshCommand from git's system and global
-// configuration the way a remote read with no repository would see it. An
-// empty answer with a nil error means the key is unset; any other failure is
-// an error the caller fails closed on.
-func gitConfigSSHCommand(ctx context.Context) (string, error) {
+// configuration the way a remote read with no repository would see it. The
+// boolean reports whether the key is present: git config --get exits 1 when
+// the key is unset (false with a nil error) and exits 0 with an empty value
+// when the key is present but blank (true with an empty string), and the
+// caller must tell those apart because git runs a present blank value as the
+// command itself rather than falling through. Any other failure is an error
+// the caller fails closed on.
+func gitConfigSSHCommand(ctx context.Context) (string, bool, error) {
 	ctx, cancel := context.WithTimeout(ctx, remoteProbeTimeout)
 	defer cancel()
 	out, err := exec.CommandContext(ctx, "git", "config", "--get", "core.sshCommand").Output()
 	if err != nil {
 		var exitErr *exec.ExitError
 		if errors.As(err, &exitErr) && exitErr.ExitCode() == 1 {
-			return "", nil
+			return "", false, nil
 		}
-		return "", err
+		return "", false, err
 	}
-	return strings.TrimSpace(string(out)), nil
+	return strings.TrimSpace(string(out)), true, nil
 }
 
 // splitShellTokens splits a shell command line into tokens the way a shell's
@@ -374,13 +385,18 @@ func splitShellTokens(command string) ([]string, bool) {
 // no endpoint either: ssh's real connection is routed through the proxy or
 // jump host, so a direct dial to the resolved host and port would observe a
 // network path ssh never takes, and `ssh -G` prints those lines only when
-// they are set.
+// they are set: OpenSSH omits an unset string option from the dump and
+// clears the documented keyword value "none" to unset while parsing, so a
+// dumped "none" names no proxy rather than one — treated as unset here, it
+// keeps the ordinary resolution rather than failing it closed.
 func sshEffectiveEndpoint(out []byte) (string, bool) {
 	host, port := "", ""
 	for _, line := range strings.Split(string(out), "\n") {
 		for _, proxy := range []string{"proxycommand", "proxyjump"} {
-			if value, found := strings.CutPrefix(line, proxy+" "); found && strings.TrimRight(value, " \t\r") != "" {
-				return "", false
+			if value, found := strings.CutPrefix(line, proxy+" "); found {
+				if value = strings.TrimRight(value, " \t\r"); value != "" && !strings.EqualFold(value, "none") {
+					return "", false
+				}
 			}
 		}
 		if host == "" {
