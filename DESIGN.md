@@ -1399,7 +1399,14 @@ leaves git's own verdict standing; a probe the caller's own cancellation
 or deadline cut short yields no evidence at all, so git's own verdict
 stands there too; and a remote with no probeable network endpoint stays a
 fail-closed
-`verifier-rejection`. Only the exact pairing — a declared `blocked_external`
+`verifier-rejection`. For ssh remotes the probe dials the endpoint git
+itself would dial: the effective host and port ssh selects for the
+destination after applying the user's ssh configuration, resolved through
+`ssh -G` and never guessed from the URL alone — an ssh remote whose
+effective endpoint cannot be resolved (no ssh binary, a configuration ssh
+rejects) yields no evidence, so a completed git verdict is never flipped
+by a probe of an endpoint ssh would never connect to. Only the exact
+pairing — a declared `blocked_external`
 outcome carried by a validated termination handoff whose category is
 `forge-unavailable` — opens the workspace-safety evidence gate; a
 task-shaped `blocked_external` with any other category opens nothing and

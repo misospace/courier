@@ -1425,20 +1425,22 @@ func TestRemoteBranchHeadNeverStartedFailsClosed(t *testing.T) {
 	}
 }
 
-// TestScpLikeHostExtractsGitScpLikeForms pins the scp-like host extraction
-// behind the ssh probe: git accepts the scp-like ssh form both with and
-// without a user — user@host:path and host:path — so a userless host must
-// still produce the dial target, while anything git itself would not treat
-// as a remote host (a local path, a slash or space before the separator, a
-// bracketed IPv6 literal) yields the empty string and fails closed.
-func TestScpLikeHostExtractsGitScpLikeForms(t *testing.T) {
+// TestScpLikeTargetExtractsGitScpLikeDestinations pins the ssh destination
+// extraction behind the ssh probe: git accepts the scp-like ssh form both
+// with and without a user — user@host:path and host:path — and hands that
+// part to ssh as the destination, so the probe must extract exactly what
+// ssh would match its configuration against, user included, while anything
+// git itself would not treat as a remote host (a local path, a slash or
+// space before the separator, a bracketed IPv6 literal) yields the empty
+// string and fails closed.
+func TestScpLikeTargetExtractsGitScpLikeDestinations(t *testing.T) {
 	t.Parallel()
 	cases := []struct {
 		name      string
 		remoteURL string
-		host      string
+		target    string
 	}{
-		{"user at host path", "git@github.com:owner/repo.git", "github.com"},
+		{"user at host path", "git@github.com:owner/repo.git", "git@github.com"},
 		{"userless host path", "github.com:owner/repo.git", "github.com"},
 		{"userless bare host", "host:repo", "host"},
 		{"at in the path is not a user", "host:pa@th", "host"},
@@ -1450,15 +1452,15 @@ func TestScpLikeHostExtractsGitScpLikeForms(t *testing.T) {
 		{"empty host", "user@:repo", ""},
 		{"bracketed ipv6 literal", "[::1]:repo", ""},
 		{"unbracketed ipv6 literal", "::1:repo", ""},
-		{"ipv6 literal splits as git splits", "user@fe80::1:repo", "fe80"},
+		{"ipv6 literal splits as git splits", "user@fe80::1:repo", "user@fe80"},
 		{"no colon", "github.com/owner/repo.git", ""},
 		{"empty", "", ""},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
-			if got := scpLikeHost(tc.remoteURL); got != tc.host {
-				t.Fatalf("scpLikeHost(%q) = %q, want %q", tc.remoteURL, got, tc.host)
+			if got := scpLikeTarget(tc.remoteURL); got != tc.target {
+				t.Fatalf("scpLikeTarget(%q) = %q, want %q", tc.remoteURL, got, tc.target)
 			}
 		})
 	}
@@ -1469,8 +1471,13 @@ func TestScpLikeHostExtractsGitScpLikeForms(t *testing.T) {
 // against, or one that closes the connection before its identification
 // banner, classifies transient availability — the handshake went unobserved;
 // an endpoint that answers keeps git's own fail-closed verdict.
+//
+// The probe resolves the effective endpoint through ssh before dialing, so
+// these cases need the ssh binary: without it the probe resolves nothing and
+// yields no evidence at all.
 func TestRemoteBranchHeadClassifiesSSHEndpointEvidence(t *testing.T) {
 	t.Parallel()
+	requireSSH(t)
 	ctx := context.Background()
 
 	refused := func(t *testing.T) string {
@@ -1587,4 +1594,314 @@ func accepting(t *testing.T, handle func(net.Conn)) string {
 		}
 	}()
 	return listener.Addr().String()
+}
+
+// requireSSH skips the test when the machine has no ssh binary: the ssh
+// probe resolves the effective endpoint through ssh, and without it the
+// probe resolves no endpoint and yields no evidence, so the behavior under
+// test cannot be observed.
+func requireSSH(t *testing.T) {
+	t.Helper()
+	if _, err := exec.LookPath("ssh"); err != nil {
+		t.Skip("the ssh endpoint probe resolves the effective endpoint through ssh; this machine has no ssh binary")
+	}
+}
+
+// useSSHUserConfig makes the real ssh binary read an isolated test
+// configuration without relying on HOME. OpenSSH does not consistently use
+// the HOME environment variable to locate ~/.ssh/config across platforms
+// (notably the Linux CI runner), so a PATH wrapper injects -F explicitly
+// while preserving the production call shape: sshEffectiveAddress still
+// executes "ssh -G ..." and the real OpenSSH parser resolves the endpoint.
+func useSSHUserConfig(t *testing.T, config string) {
+	t.Helper()
+	realSSH, err := exec.LookPath("ssh")
+	if err != nil {
+		t.Skip("the ssh endpoint probe resolves the effective endpoint through ssh; this machine has no ssh binary")
+	}
+
+	configPath := filepath.Join(t.TempDir(), "config")
+	if err := os.WriteFile(configPath, []byte(config), 0o600); err != nil {
+		t.Fatalf("write ssh test config: %v", err)
+	}
+
+	wrapperDir := t.TempDir()
+	wrapper := filepath.Join(wrapperDir, "ssh")
+	script := "#!/bin/sh\nexec \"$COURIER_TEST_REAL_SSH\" -F \"$COURIER_TEST_SSH_CONFIG\" \"$@\"\n"
+	if err := os.WriteFile(wrapper, []byte(script), 0o700); err != nil {
+		t.Fatalf("write ssh config wrapper: %v", err)
+	}
+
+	t.Setenv("COURIER_TEST_REAL_SSH", realSSH)
+	t.Setenv("COURIER_TEST_SSH_CONFIG", configPath)
+	t.Setenv("PATH", wrapperDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+}
+
+// writeFakeSSH installs an executable stand-in for the ssh binary on PATH
+// and returns the directory holding it, so a test can pin the arguments the
+// probe hands ssh and the output it reads back without a real ssh client.
+func writeFakeSSH(t *testing.T, script string) string {
+	t.Helper()
+	directory := t.TempDir()
+	executable := filepath.Join(directory, "ssh")
+	if err := os.WriteFile(executable, []byte("#!/bin/sh\n"+script), 0o700); err != nil {
+		t.Fatalf("write fake ssh: %v", err)
+	}
+	return directory
+}
+
+// TestSSHEffectiveAddressResolvesTheConfiguredEndpoint pins the resolution
+// the ssh probe's evidence rests on: git hands the destination to ssh, which
+// applies the user's ssh configuration before connecting, so the probe must
+// dial the endpoint ssh resolves to — not the literal URL host at port 22 —
+// and an unconfigured destination must keep today's literal behavior.
+func TestSSHEffectiveAddressResolvesTheConfiguredEndpoint(t *testing.T) {
+	requireSSH(t)
+	address := accepting(t, func(conn net.Conn) { _ = conn.Close() })
+	host, port, err := net.SplitHostPort(address)
+	if err != nil {
+		t.Fatalf("split listener address: %v", err)
+	}
+	useSSHUserConfig(t, fmt.Sprintf(
+		"Host forge584.invalid\n HostName %s\n Port %s\n", host, port))
+
+	t.Run("the configured HostName and Port are the endpoint", func(t *testing.T) {
+		endpoint, ok := sshEffectiveAddress(context.Background(), "git@forge584.invalid", "")
+		if !ok {
+			t.Fatal("a destination with a configured HostName and Port must resolve an effective endpoint")
+		}
+		if endpoint != address {
+			t.Fatalf("sshEffectiveAddress = %q, want the configured endpoint %q", endpoint, address)
+		}
+	})
+	t.Run("the url port overrides the configured port as it does for git", func(t *testing.T) {
+		endpoint, ok := sshEffectiveAddress(context.Background(), "git@forge584.invalid", "8022")
+		if !ok {
+			t.Fatal("a destination with a configured HostName and an explicit url port must resolve an effective endpoint")
+		}
+		if want := net.JoinHostPort(host, "8022"); endpoint != want {
+			t.Fatalf("sshEffectiveAddress = %q, want the url port over the configured host %q", endpoint, want)
+		}
+	})
+	t.Run("an unconfigured destination keeps the literal host at port 22", func(t *testing.T) {
+		endpoint, ok := sshEffectiveAddress(context.Background(), "plain584.example", "")
+		if !ok {
+			t.Fatal("an unconfigured destination must still resolve to its literal endpoint")
+		}
+		if want := "plain584.example:22"; endpoint != want {
+			t.Fatalf("sshEffectiveAddress = %q, want %q", endpoint, want)
+		}
+	})
+}
+
+// TestSSHEffectiveAddressYieldsNoEndpointWhenUnresolvable pins the
+// fail-closed half of the resolution: when the effective endpoint cannot be
+// resolved there is no endpoint to probe, and the probe must yield no
+// endpoint rather than guess one.
+func TestSSHEffectiveAddressYieldsNoEndpointWhenUnresolvable(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("no ssh binary", func(t *testing.T) {
+		t.Setenv("PATH", t.TempDir())
+		if _, ok := sshEffectiveAddress(ctx, "forge584.invalid", ""); ok {
+			t.Fatal("without an ssh binary the effective endpoint cannot be resolved; the probe must yield no endpoint, not guess one")
+		}
+	})
+	t.Run("a destination starting with a dash never reaches ssh as an option", func(t *testing.T) {
+		if _, ok := sshEffectiveAddress(ctx, "-oProxyCommand=touch-pwned", ""); ok {
+			t.Fatal("a destination that would reach ssh as an option resolves no endpoint")
+		}
+	})
+	t.Run("a non-numeric url port resolves no endpoint", func(t *testing.T) {
+		if _, ok := sshEffectiveAddress(ctx, "forge584.invalid", "not-a-port"); ok {
+			t.Fatal("a port git could not hand to ssh resolves no endpoint")
+		}
+	})
+	t.Run("ssh rejects its configuration", func(t *testing.T) {
+		requireSSH(t)
+		useSSHUserConfig(t, "Host forge584.invalid\n\tNoSuchKeyword yes\n")
+		if _, ok := sshEffectiveAddress(ctx, "forge584.invalid", ""); ok {
+			t.Fatal("ssh rejecting the configuration means the effective endpoint cannot be resolved: the probe must yield no endpoint")
+		}
+	})
+}
+
+// TestSSHEffectiveAddressAsksSSHForTheGitDestination pins the exchange with
+// ssh through a stand-in: the probe hands ssh exactly the destination and
+// explicit port git would, and only a usable hostname and port in ssh's
+// answer produce an endpoint.
+func TestSSHEffectiveAddressAsksSSHForTheGitDestination(t *testing.T) {
+	ctx := context.Background()
+	stubSSH := func(t *testing.T, output string) string {
+		t.Helper()
+		argsFile := filepath.Join(t.TempDir(), "args")
+		t.Setenv("COURIER_SSH_STUB_ARGS", argsFile)
+		t.Setenv("PATH", writeFakeSSH(t, fmt.Sprintf(`printf '%%s\n' "$@" > "$COURIER_SSH_STUB_ARGS"
+%s`, output)))
+		return argsFile
+	}
+
+	t.Run("the destination and the url port reach ssh as git hands them", func(t *testing.T) {
+		argsFile := stubSSH(t, "echo \"hostname forge.internal\"\necho \"port 2222\"\n")
+		endpoint, ok := sshEffectiveAddress(ctx, "git@forge584.invalid", "2222")
+		if !ok {
+			t.Fatal("a usable hostname and port must produce an effective endpoint")
+		}
+		if want := "forge.internal:2222"; endpoint != want {
+			t.Fatalf("sshEffectiveAddress = %q, want %q", endpoint, want)
+		}
+		args, err := os.ReadFile(argsFile)
+		if err != nil {
+			t.Fatalf("read ssh stub args: %v", err)
+		}
+		if want := "-G\n-p\n2222\ngit@forge584.invalid\n"; string(args) != want {
+			t.Fatalf("ssh received %q, want %q", args, want)
+		}
+	})
+	t.Run("a url without a port hands ssh no port override", func(t *testing.T) {
+		argsFile := stubSSH(t, "echo \"hostname forge.internal\"\necho \"port 22\"\n")
+		if _, ok := sshEffectiveAddress(ctx, "git@forge584.invalid", ""); !ok {
+			t.Fatal("a usable hostname and port must produce an effective endpoint")
+		}
+		args, err := os.ReadFile(argsFile)
+		if err != nil {
+			t.Fatalf("read ssh stub args: %v", err)
+		}
+		if want := "-G\ngit@forge584.invalid\n"; string(args) != want {
+			t.Fatalf("ssh received %q, want %q", args, want)
+		}
+	})
+	t.Run("output without a usable port yields no endpoint", func(t *testing.T) {
+		stubSSH(t, "echo \"hostname forge.internal\"\necho \"ciphers aes256-ctr\"\n")
+		if _, ok := sshEffectiveAddress(ctx, "git@forge584.invalid", ""); ok {
+			t.Fatal("output ssh did not answer with a port is not an effective endpoint")
+		}
+	})
+	t.Run("output with an out-of-range port yields no endpoint", func(t *testing.T) {
+		stubSSH(t, "echo \"hostname forge.internal\"\necho \"port 70000\"\n")
+		if _, ok := sshEffectiveAddress(ctx, "git@forge584.invalid", ""); ok {
+			t.Fatal("a port outside the TCP range is not an effective endpoint")
+		}
+	})
+}
+
+// TestRemoteEndpointAvailableDialsTheResolvedEndpoint pins the regression
+// from issue #584: a remote whose ssh configuration redirects the connection
+// must be probed at the configured endpoint. The alias below resolves to
+// nothing on its own — a probe of the literal host at port 22 could only
+// ever answer "unreachable" — so an available answer proves the probe dialed
+// where ssh would, and a refused configured endpoint is evidence about the
+// endpoint git would actually reach.
+func TestRemoteEndpointAvailableDialsTheResolvedEndpoint(t *testing.T) {
+	requireSSH(t)
+	ctx := context.Background()
+	answering := accepting(t, func(conn net.Conn) {
+		_, _ = conn.Write([]byte("SSH-2.0-probe\r\n"))
+		_ = conn.Close()
+	})
+	answerHost, answerPort, err := net.SplitHostPort(answering)
+	if err != nil {
+		t.Fatalf("split answering address: %v", err)
+	}
+	refused, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("reserve a port: %v", err)
+	}
+	refusedAddress := refused.Addr().String()
+	if err := refused.Close(); err != nil {
+		t.Fatalf("release the reserved port: %v", err)
+	}
+	refusedHost, refusedPort, err := net.SplitHostPort(refusedAddress)
+	if err != nil {
+		t.Fatalf("split refused address: %v", err)
+	}
+	useSSHUserConfig(t, fmt.Sprintf(
+		"Host answer584.invalid\n HostName %s\n Port %s\nHost refused584.invalid\n HostName %s\n Port %s\n",
+		answerHost, answerPort, refusedHost, refusedPort))
+
+	t.Run("the ssh url form probes the configured endpoint", func(t *testing.T) {
+		if !remoteEndpointAvailable(ctx, "ssh://answer584.invalid/owner/repo.git") {
+			t.Fatal("an answering configured endpoint must report no evidence of unavailability")
+		}
+	})
+	t.Run("the scp-like form resolves through the configuration too", func(t *testing.T) {
+		if !remoteEndpointAvailable(ctx, "git@answer584.invalid:owner/repo.git") {
+			t.Fatal("the scp-like destination must be resolved through the ssh configuration like the url form")
+		}
+	})
+	t.Run("an unreachable configured endpoint is evidence", func(t *testing.T) {
+		if remoteEndpointAvailable(ctx, "ssh://refused584.invalid/owner/repo.git") {
+			t.Fatal("a configured endpoint that refuses the dial is evidence of unavailability")
+		}
+	})
+}
+
+// TestRemoteEndpointAvailableYieldsNoEvidenceWhenEndpointCannotResolve pins
+// the consequence of an unresolvable effective endpoint at the probe
+// boundary: with no ssh binary there is no resolution, so even a remote
+// whose literal host would refuse any dial yields no evidence — git's own
+// verdict stands.
+func TestRemoteEndpointAvailableYieldsNoEvidenceWhenEndpointCannotResolve(t *testing.T) {
+	t.Setenv("PATH", t.TempDir())
+	ctx := context.Background()
+	if !remoteEndpointAvailable(ctx, "ssh://127.0.0.1:1/owner/repo.git") {
+		t.Fatal("without an ssh binary the effective endpoint cannot be resolved: the probe must yield no evidence")
+	}
+	if !remoteEndpointAvailable(ctx, "git@127.0.0.1:owner/repo.git") {
+		t.Fatal("the scp-like form must yield no evidence too when the effective endpoint cannot be resolved")
+	}
+}
+
+// TestRemoteBranchHeadKeepsGitVerdictWhenConfigurationRedirectsTheProbe pins
+// the classification-level consequence of issue #584: an ssh remote whose
+// configuration redirects it to an endpoint that answered keeps git's own
+// completed verdict. The old probe dialed the literal URL host at port 22 —
+// a host the ssh configuration says nobody dials — answered "unavailable",
+// and flipped a completed git verdict into transient availability for a
+// forge that was never shown to be unavailable.
+func TestRemoteBranchHeadKeepsGitVerdictWhenConfigurationRedirectsTheProbe(t *testing.T) {
+	requireSSH(t)
+	ctx := context.Background()
+	answering := accepting(t, func(conn net.Conn) {
+		_, _ = conn.Write([]byte("SSH-2.0-probe\r\n"))
+		_ = conn.Close()
+	})
+	answerHost, answerPort, err := net.SplitHostPort(answering)
+	if err != nil {
+		t.Fatalf("split answering address: %v", err)
+	}
+	refused, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("reserve a port: %v", err)
+	}
+	refusedAddress := refused.Addr().String()
+	if err := refused.Close(); err != nil {
+		t.Fatalf("release the reserved port: %v", err)
+	}
+	refusedHost, refusedPort, err := net.SplitHostPort(refusedAddress)
+	if err != nil {
+		t.Fatalf("split refused address: %v", err)
+	}
+	useSSHUserConfig(t, fmt.Sprintf(
+		"Host answer584.invalid\n HostName %s\n Port %s\nHost refused584.invalid\n HostName %s\n Port %s\n",
+		answerHost, answerPort, refusedHost, refusedPort))
+
+	t.Run("a configured endpoint that answered keeps git's verdict", func(t *testing.T) {
+		_, _, err := RemoteBranchHead(ctx, "ssh://answer584.invalid/owner/repo.git", "main")
+		if err == nil {
+			t.Fatal("expected the remote read to fail")
+		}
+		if forge.IsTransientAvailability(err) {
+			t.Fatalf("the probe resolved the endpoint git itself would dial and it answered, so git's completed verdict must stand: %v", err)
+		}
+	})
+	t.Run("a configured endpoint that is unreachable is evidence", func(t *testing.T) {
+		_, _, err := RemoteBranchHead(ctx, "ssh://refused584.invalid/owner/repo.git", "main")
+		if err == nil {
+			t.Fatal("expected the remote read to fail")
+		}
+		if !forge.IsTransientAvailability(err) {
+			t.Fatalf("a failed read whose configured endpoint could not be reached is transient availability: %v", err)
+		}
+	})
 }
