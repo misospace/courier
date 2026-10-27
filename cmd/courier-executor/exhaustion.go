@@ -149,9 +149,10 @@ func (r reporter) availabilityRecoveryTermination(ctx context.Context, workspace
 }
 
 // forgeUnavailableTermination builds the recoverable blocked-external ending
-// for a pre-handoff forge observation that could not complete on a transient
-// availability condition (#455): the world was never observed, so the run
-// ends blocked_external for the operator's bounded retry with the honest
+// for a forge observation that could not complete on a transient availability
+// condition — pre-handoff observation or launch-time guard read
+// (#455, #580, #585): the world was never observed, so the run ends
+// blocked_external for the operator's bounded retry with the honest
 // forge-unavailable category — never as a verifier rejection, which is
 // reserved for worlds the observation actually read and found contradictory.
 // Exit 2 keeps the handoff vocabulary valid, and the workspace snapshot is
