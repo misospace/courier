@@ -306,7 +306,11 @@ forever; the record drops as the proof of delivery, exactly as the advisory
 release resolves moot. Every other failure, which may be transient, keeps the retry posture. An
 attempt still in flight when the run ends on a path outside the loop's graded
 endings ends with it: the terminal write settles its fence as `unsupported`,
-so no run that can never report leaves the source deferring its hand-out. The
+so no run that can never report leaves the source deferring its hand-out. A
+terminal reconcile that finds an attempt still open — one terminalized by a
+controller predating that terminal-write settlement — records the same
+abandonment and defers the rest of the terminal dispatch to the settlement
+cadence, so the owed close is delivered from the write on. The
 park notice carries the
 same durability while the opportunity is active and expires with it — a late
 notice would defer the source against nothing. The ending itself never waits
