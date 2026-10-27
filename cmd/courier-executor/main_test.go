@@ -379,6 +379,81 @@ func TestRunResolveIssueAdoptionGuardRejectsUnidentifiedPullRequest(t *testing.T
 	}
 }
 
+// TestGuardAdoptionPullRequestObservationAvailability pins the resolve-issue
+// adoption guard's failure vocabulary for its pull-request observation read
+// (#585): a transient failure never observed the PR set and therefore parks
+// on the forge-unavailable recovery channel; an authoritative plain 403 keeps
+// the existing fail-closed executor-crash ending. Neither path may adopt.
+func TestGuardAdoptionPullRequestObservationAvailability(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		statusCode int
+		body       string
+		wantCode   int
+		wantOut    []string
+		notOut     []string
+	}{
+		{
+			name:       "transient observation read parks the run",
+			statusCode: http.StatusServiceUnavailable,
+			wantCode:   exitNeedsHuman,
+			wantOut:    []string{`"phase":"NeedsHuman"`, `"outcome":"blocked_external"`, `"category":"forge-unavailable"`, "parked for bounded retry", `"workspace_safety":{"state":"unknown"}`},
+		},
+		{
+			name:       "rate-limited observation read parks the run",
+			statusCode: http.StatusForbidden,
+			body:       `{"message":"API rate limit exceeded for this IP"}`,
+			wantCode:   exitNeedsHuman,
+			wantOut:    []string{`"phase":"NeedsHuman"`, `"outcome":"blocked_external"`, `"category":"forge-unavailable"`, "parked for bounded retry"},
+		},
+		{
+			name:       "answered observation read keeps the crash ending",
+			statusCode: http.StatusForbidden,
+			wantCode:   1,
+			wantOut:    []string{`"phase":"Failed"`, `"category":"executor-crash"`},
+			notOut:     []string{"forge-unavailable", `"outcome":"blocked_external"`},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			root := t.TempDir()
+			remote := remoteWithExistingBranch(t, root)
+
+			fakeOpenCode := filepath.Join(root, "opencode")
+			writeExecutable(t, fakeOpenCode, "#!/bin/sh\nexit 99\n")
+
+			prServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.WriteHeader(tc.statusCode)
+				_, _ = io.WriteString(w, tc.body)
+			}))
+			defer prServer.Close()
+
+			setResolveIssueEnv(t, root, remote, prServer.URL, fakeOpenCode)
+
+			var output bytes.Buffer
+			var errorsOut bytes.Buffer
+			code := run(context.Background(), &output, &errorsOut)
+			if code != tc.wantCode {
+				t.Fatalf("guardAdoption exit code = %d, want %d; stderr=%q stdout=%q", code, tc.wantCode, errorsOut.String(), output.String())
+			}
+			for _, fragment := range tc.wantOut {
+				if !strings.Contains(output.String(), fragment) {
+					t.Fatalf("output missing %q: %q", fragment, output.String())
+				}
+			}
+			for _, fragment := range tc.notOut {
+				if strings.Contains(output.String(), fragment) {
+					t.Fatalf("output must not contain %q: %q", fragment, output.String())
+				}
+			}
+			for _, event := range parseEvents(t, &output) {
+				if name, _ := event["event"].(string); name == "workspace.ready" || name == "executor.start" {
+					t.Fatalf("run reached %s despite an unresolved adoption world: %v", name, event)
+				}
+			}
+		})
+	}
+}
+
 func TestRunResolveIssueAdoptsBranchWithoutPullRequest(t *testing.T) {
 	root := t.TempDir()
 	remote := remoteWithExistingBranch(t, root)
@@ -2955,7 +3030,10 @@ func TestReadConfigFixPRRequiresPinnedReference(t *testing.T) {
 	}
 }
 
-func TestRunResolveIssueFailsWhenGitHubErrors(t *testing.T) {
+// TestRunResolveIssueParksRunWhenGitHubTransientlyErrors pins the adoption
+// guard's ending for a transient GitHub API error on the pull-request
+// observation read (#585).
+func TestRunResolveIssueParksRunWhenGitHubTransientlyErrors(t *testing.T) {
 	root := t.TempDir()
 	remote := remoteWithExistingBranch(t, root)
 
@@ -2973,11 +3051,14 @@ func TestRunResolveIssueFailsWhenGitHubErrors(t *testing.T) {
 	var output bytes.Buffer
 	var errorsOut bytes.Buffer
 	code := run(context.Background(), &output, &errorsOut)
-	if code != 1 {
-		t.Fatalf("run exit code = %d, want 1 (Failed); stderr=%q stdout=%q", code, errorsOut.String(), output.String())
+	if code != exitNeedsHuman {
+		t.Fatalf("run exit code = %d, want %d (needs-human recovery); stderr=%q stdout=%q", code, exitNeedsHuman, errorsOut.String(), output.String())
 	}
-	if !strings.Contains(output.String(), `"phase":"Failed"`) {
-		t.Fatalf("expected Failed termination: %q", output.String())
+	if !strings.Contains(output.String(), `"phase":"NeedsHuman"`) || !strings.Contains(output.String(), `"category":"forge-unavailable"`) || !strings.Contains(output.String(), `"outcome":"blocked_external"`) {
+		t.Fatalf("expected the forge-unavailable recovery termination: %q", output.String())
+	}
+	if !strings.Contains(output.String(), "internal error") {
+		t.Fatalf("termination should carry the forge's error detail: %q", output.String())
 	}
 	if strings.Contains(output.String(), "opencode argv") || code == 99 {
 		t.Fatalf("opencode was invoked despite a GitHub API error: %q", output.String())
