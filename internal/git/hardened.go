@@ -191,13 +191,21 @@ func hardened(ctx context.Context, directory string, extra []string, args []stri
 	stderr.limit = maxStderrBytes
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
-	if err := cmd.Run(); err != nil {
+	// Start and Wait are separated so a start failure — the local executor
+	// could not launch git at all — is distinguishable from a process that
+	// ran and was killed, which carry different availability evidence.
+	if err := cmd.Start(); err != nil {
+		// Stderr is dropped: it routinely carries repository, bundle, or
+		// transport content that must never enter trusted error strings.
+		return nil, strings.TrimSpace(stderr.String()), &CommandError{Args: append([]string(nil), args...), Err: err}
+	}
+	if err := cmd.Wait(); err != nil {
 		if stdout.overflow {
 			return nil, "", errOutputTooLarge
 		}
 		// Stderr is dropped: it routinely carries repository, bundle, or
 		// transport content that must never enter trusted error strings.
-		return nil, strings.TrimSpace(stderr.String()), &CommandError{Args: append([]string(nil), args...), Err: err}
+		return nil, strings.TrimSpace(stderr.String()), &CommandError{Args: append([]string(nil), args...), Err: err, started: true}
 	}
 	if stdout.overflow {
 		return nil, "", errOutputTooLarge
@@ -261,7 +269,7 @@ func hardenedLines(ctx context.Context, directory string, extra []string, args [
 		return scanErr
 	}
 	if waitErr != nil {
-		return &CommandError{Args: append([]string(nil), args...), Err: waitErr}
+		return &CommandError{Args: append([]string(nil), args...), Err: waitErr, started: true}
 	}
 	return nil
 }

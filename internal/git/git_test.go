@@ -1069,11 +1069,13 @@ func writeFakeGit(t *testing.T, script string) string {
 
 // TestCommandErrorTransientAvailabilityClassification pins the process-level
 // evidence rule behind CommandError.TransientAvailability: a git process that
-// never ran to completion — it did not start, or it was killed by its context
-// deadline — left the world unobserved and classifies transient through
-// forge.IsTransientAvailability, while a process that ran and exited under
-// its own control is git's own verdict and never does. The classification
-// reads the process state, never git's stderr text.
+// started and was killed by its context deadline left the world unobserved
+// and classifies transient through forge.IsTransientAvailability, while a
+// process that ran and exited under its own control is git's own verdict and
+// never does. A process that never started failed inside the local executor
+// — a missing git binary, for instance — which is evidence about this
+// machine's configuration, not about any remote, so it fails closed. The
+// classification reads the process state, never git's stderr text.
 func TestCommandErrorTransientAvailabilityClassification(t *testing.T) {
 	t.Run("killed by the context deadline", func(t *testing.T) {
 		t.Setenv("PATH", writeFakeGit(t, "#!/bin/sh\nexec /bin/sleep 30\n"))
@@ -1103,8 +1105,8 @@ func TestCommandErrorTransientAvailabilityClassification(t *testing.T) {
 		if err == nil {
 			t.Fatal("expected the missing git binary to fail")
 		}
-		if !forge.IsTransientAvailability(err) {
-			t.Fatalf("a git process that never started must classify transient: %v", err)
+		if forge.IsTransientAvailability(err) {
+			t.Fatalf("a git process that never started is a permanent local executor failure, not a transient availability failure: %v", err)
 		}
 	})
 }
@@ -1165,6 +1167,27 @@ func TestRemoteBranchHeadClassifiesEndpointEvidence(t *testing.T) {
 			t.Fatalf("a remote with no probeable network endpoint must keep the fail-closed classification: %v", err)
 		}
 	})
+}
+
+// TestRemoteBranchHeadNeverStartedFailsClosed pins the boundary between a
+// failed remote read and a local executor failure: when the git process
+// never started — a missing binary on PATH, for instance — the read carried
+// no transport evidence at all, so it must fail closed to the
+// verifier-rejection ending even when the remote's endpoint is genuinely
+// unreachable, rather than masquerading as forge unavailability.
+func TestRemoteBranchHeadNeverStartedFailsClosed(t *testing.T) {
+	endpoint := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	endpoint.Close()
+	t.Setenv("PATH", t.TempDir())
+	_, _, err := RemoteBranchHead(context.Background(), endpoint.URL, "main")
+	if err == nil {
+		t.Fatal("expected the remote read to fail")
+	}
+	if forge.IsTransientAvailability(err) {
+		t.Fatalf("a remote read whose git process never started is a local executor failure, not transient availability: %v", err)
+	}
 }
 
 // TestScpLikeHostExtractsGitScpLikeForms pins the scp-like host extraction

@@ -295,6 +295,11 @@ type CommandError struct {
 	Args   []string
 	Err    error
 	Stderr string
+	// started records whether the git process started. A process that
+	// never started failed inside the local executor — a missing or
+	// non-executable git binary, for instance — which is evidence about
+	// this machine's configuration, never about the remote.
+	started bool
 }
 
 func (e *CommandError) Error() string {
@@ -317,13 +322,19 @@ func (e *CommandError) ExitCode() int {
 
 // TransientAvailability reports whether the command failed before git could
 // produce a verdict of its own. The evidence is the process state alone,
-// never a text match on git's stderr: a process that never started, and a
-// process killed by its context deadline, cancellation, or a signal — which
-// carries no exit code — left the world unobserved and classify as transient
-// availability. A process that ran to completion and exited non-zero is
-// git's own verdict about whatever it reached, which is never transient here;
-// remote reads add network-level evidence on top in RemoteBranchHead.
+// never a text match on git's stderr. A process that started but was killed
+// by its context deadline, cancellation, or a signal — which carries no exit
+// code — left the world unobserved and classifies as transient availability.
+// A process that never started failed inside the local executor — a missing
+// or non-executable git binary, for instance — which is a permanent local
+// failure, not evidence about any remote, and fails closed. A process that
+// ran to completion and exited non-zero is git's own verdict about whatever
+// it reached, which is never transient here; remote reads add network-level
+// evidence on top in RemoteBranchHead.
 func (e *CommandError) TransientAvailability() bool {
+	if !e.started {
+		return false
+	}
 	var exitErr *exec.ExitError
 	if !errors.As(e.Err, &exitErr) {
 		return true
@@ -339,8 +350,14 @@ func run(ctx context.Context, directory string, args ...string) ([]byte, error) 
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
-	if err := cmd.Run(); err != nil {
+	// Start and Wait are separated so a start failure — the local executor
+	// could not launch git at all — is distinguishable from a process that
+	// ran and was killed, which carry different availability evidence.
+	if err := cmd.Start(); err != nil {
 		return nil, &CommandError{Args: append([]string(nil), args...), Err: err, Stderr: strings.TrimSpace(stderr.String())}
+	}
+	if err := cmd.Wait(); err != nil {
+		return nil, &CommandError{Args: append([]string(nil), args...), Err: err, Stderr: strings.TrimSpace(stderr.String()), started: true}
 	}
 	return stdout.Bytes(), nil
 }
@@ -374,16 +391,19 @@ func RemoteBranchHead(ctx context.Context, remoteURL, branch string) (string, bo
 	}
 	out, err := run(ctx, "", "ls-remote", "--heads", "--", remoteURL, "refs/heads/"+branch)
 	if err != nil {
-		// A git process that never produced a verdict of its own is
-		// transport evidence already (TransientAvailability); a process
-		// that ran and failed is classified by the remote's own network
-		// endpoint, not by git's stderr text: an endpoint that cannot be
-		// reached, or answers 429/5xx, kept the read from observing the
-		// world, while an endpoint that answered leaves git's verdict
-		// standing. A remote with no probeable network endpoint (a local
-		// path, an unknown scheme) fails closed to the unclassified error.
+		// A git process that started but never produced a verdict of its
+		// own is transport evidence already (TransientAvailability); a
+		// process that started, ran, and failed is classified by the
+		// remote's own network endpoint, not by git's stderr text: an
+		// endpoint that cannot be reached, or answers 429/5xx, kept the
+		// read from observing the world, while an endpoint that answered
+		// leaves git's verdict standing. A process that never started
+		// failed inside the local executor and carries no transport
+		// evidence at all, so it fails closed without probing the
+		// endpoint, as does a remote with no probeable network endpoint
+		// (a local path, an unknown scheme).
 		var commandErr *CommandError
-		if errors.As(err, &commandErr) && !commandErr.TransientAvailability() && !remoteEndpointAvailable(ctx, remoteURL) {
+		if errors.As(err, &commandErr) && commandErr.started && !commandErr.TransientAvailability() && !remoteEndpointAvailable(ctx, remoteURL) {
 			err = &remoteUnavailableError{err: commandErr}
 		}
 		return "", false, err

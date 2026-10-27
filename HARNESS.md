@@ -843,9 +843,9 @@ failure, classified by `forge.IsTransientAvailability`
 bounded retry instead of `verifier-rejection` `NeedsHuman`, replacing any
 declared outcome tag the run had carried. The git-side remote-publication read
 behind the same observation is classified by the same evidence rule, never by
-git's stderr text: a git process that never ran to completion — it did not
-start, or it was killed by its deadline, cancellation, or a signal — is transport
-evidence on its own, and a ran-and-failed read is classified by probing the
+git's stderr text: a git process that started but was killed by its deadline, cancellation, or a signal is transport
+evidence on its own; a process that never started failed inside the local
+executor and fails closed; and a ran-and-failed read is classified by probing the
 remote's endpoint directly, where an endpoint that cannot be reached or
 answers 429 or 5xx is transient availability and an endpoint that answers
 leaves git's verdict standing; a remote with no probeable network endpoint

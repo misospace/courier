@@ -1378,9 +1378,9 @@ was never observed, so the run ends as a `blocked_external` declaration on
 the recovery channel, never as a `verifier-rejection`, which stays reserved
 for worlds the observation actually read and found contradictory. The
 git-side remote-publication read behind the same observation is classified
-by evidence, never by git's stderr text: a git process that never ran to
-completion — it did not start, or it was killed by its deadline,
-cancellation, or a signal — is transport evidence on its own, and a git process that ran
+by evidence, never by git's stderr text: a git process that started but was killed by its deadline,
+cancellation, or a signal is transport evidence on its own; a process that never started failed inside the local executor — a missing or
+non-executable git binary, for instance — and carries no transport evidence, so it fails closed; and a git process that ran
 and failed is classified by probing the remote's endpoint directly (an HTTP
 availability request to the smart-HTTP endpoint for http(s) remotes, a TCP
 dial for ssh/git), where an endpoint that cannot be reached or answers 429
