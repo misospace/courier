@@ -1068,16 +1068,21 @@ func writeFakeGit(t *testing.T, script string) string {
 	return directory
 }
 
-// TestCommandErrorTransientAvailabilityClassification pins the process-level
-// evidence rule behind CommandError.TransientAvailability: a git process that
-// started and was killed by its context deadline left the world unobserved
-// and classifies transient through forge.IsTransientAvailability, while a
-// process that ran and exited under its own control is git's own verdict and
-// never does. A process that never started failed inside the local executor
-// — a missing git binary, for instance — which is evidence about this
-// machine's configuration, not about any remote, so it fails closed. The
-// classification reads the process state, never git's stderr text.
-func TestCommandErrorTransientAvailabilityClassification(t *testing.T) {
+// TestLocalGitFailureNeverClassifiesAsTransientAvailability pins the
+// boundary the transient-availability marker must not cross: the marker
+// belongs to the remote-publication read alone, so no local git command
+// carries it.
+//
+// A git process that started and was killed by its context deadline — an
+// OOM-kill, a pod eviction, or the run's own budget — says nothing about
+// any forge, and the run must never end blocked_external /
+// forge-unavailable on its account. A process that ran and exited under its
+// own control is git's own verdict and never transient. A process that never
+// started failed inside the local executor — a missing git binary, for
+// instance — which is evidence about this machine's configuration, not about
+// any remote, so it fails closed. The classification reads the process
+// state, never git's stderr text.
+func TestLocalGitFailureNeverClassifiesAsTransientAvailability(t *testing.T) {
 	t.Run("killed by the context deadline", func(t *testing.T) {
 		t.Setenv("PATH", writeFakeGit(t, "#!/bin/sh\nexec /bin/sleep 30\n"))
 		ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
@@ -1086,8 +1091,22 @@ func TestCommandErrorTransientAvailabilityClassification(t *testing.T) {
 		if err == nil {
 			t.Fatal("expected the killed git process to fail")
 		}
-		if !forge.IsTransientAvailability(err) {
-			t.Fatalf("a git process killed by its context deadline must classify transient: %v", err)
+		if forge.IsTransientAvailability(err) {
+			t.Fatalf("a local git command killed by its context deadline must not classify as transient availability: %v", err)
+		}
+
+		// The workspace head read is a local read of this machine: it
+		// never reaches a forge, so a forge must never be blamed for
+		// it.
+		headCtx, headCancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
+		defer headCancel()
+		workspace := &Workspace{Directory: t.TempDir()}
+		_, err = workspace.Head(headCtx)
+		if err == nil {
+			t.Fatal("expected the killed workspace head read to fail")
+		}
+		if forge.IsTransientAvailability(err) {
+			t.Fatalf("a local workspace head read killed by its context deadline must not classify as transient availability: %v", err)
 		}
 	})
 	t.Run("ran and exited", func(t *testing.T) {
@@ -1110,6 +1129,24 @@ func TestCommandErrorTransientAvailabilityClassification(t *testing.T) {
 			t.Fatalf("a git process that never started is a permanent local executor failure, not a transient availability failure: %v", err)
 		}
 	})
+}
+
+// TestRemoteBranchHeadCutShortIsTransientAvailability pins the other side of
+// that boundary: a remote read whose git process was cut short — killed by
+// its deadline, its cancellation, or a signal — never observed the remote,
+// so it is transport evidence on its own and classifies transient without any
+// endpoint probe. The remote's own verdict cannot stand here: there is none.
+func TestRemoteBranchHeadCutShortIsTransientAvailability(t *testing.T) {
+	t.Setenv("PATH", writeFakeGit(t, "#!/bin/sh\ncase \"$1\" in\ncheck-ref-format) exit 0 ;;\n*) exec /bin/sleep 30 ;;\nesac\n"))
+	ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
+	defer cancel()
+	_, _, err := RemoteBranchHead(ctx, "https://example.invalid/owner/repo.git", "main")
+	if err == nil {
+		t.Fatal("expected the cut-short remote read to fail")
+	}
+	if !forge.IsTransientAvailability(err) {
+		t.Fatalf("a remote read cut short before git answered must classify transient: %v", err)
+	}
 }
 
 // TestRemoteBranchHeadClassifiesEndpointEvidence pins the network-level
@@ -1170,6 +1207,159 @@ func TestRemoteBranchHeadClassifiesEndpointEvidence(t *testing.T) {
 	})
 }
 
+// TestEndpointProbeYieldsNoEvidenceWhenCallerContextEnded pins the probe's
+// evidence rule: the probe's answer is the evidence, and a probe the
+// caller's own cancellation cut short observed nothing at all.
+//
+// Each helper therefore reports the same value for an endpoint that answered
+// as for a probe that never got to ask — no evidence that the endpoint was
+// unavailable — so a completed git verdict is never reclassified on the
+// strength of the caller's own cancellation, deadline, or pod shutdown.
+func TestEndpointProbeYieldsNoEvidenceWhenCallerContextEnded(t *testing.T) {
+	t.Parallel()
+	canceled, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	t.Run("http", func(t *testing.T) {
+		t.Parallel()
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(http.StatusOK)
+		}))
+		t.Cleanup(server.Close)
+		parsed, err := url.Parse(server.URL)
+		if err != nil {
+			t.Fatalf("parse probe URL: %v", err)
+		}
+		answered := httpEndpointAvailable(context.Background(), parsed)
+		if !answered {
+			t.Fatal("an endpoint that answered must report no evidence of unavailability")
+		}
+		if got := httpEndpointAvailable(canceled, parsed); got != answered {
+			t.Fatalf("httpEndpointAvailable(canceled caller) = %v, want %v: a probe the caller's cancellation cut short observed nothing", got, answered)
+		}
+	})
+
+	t.Run("ssh", func(t *testing.T) {
+		t.Parallel()
+		address := accepting(t, func(conn net.Conn) {
+			_, _ = conn.Write([]byte("SSH-2.0-probe\r\n"))
+			_ = conn.Close()
+		})
+		answered := sshEndpointAvailable(context.Background(), address)
+		if !answered {
+			t.Fatal("an ssh endpoint that answered its banner must report no evidence of unavailability")
+		}
+		if got := sshEndpointAvailable(canceled, address); got != answered {
+			t.Fatalf("sshEndpointAvailable(canceled caller) = %v, want %v: a probe the caller's cancellation cut short observed nothing", got, answered)
+		}
+	})
+
+	t.Run("git protocol", func(t *testing.T) {
+		t.Parallel()
+		address := accepting(t, func(conn net.Conn) {
+			buf := make([]byte, 128)
+			_, _ = conn.Read(buf)
+			_, _ = conn.Write([]byte("ERR access denied or repository not exported\n"))
+			_ = conn.Close()
+		})
+		answered := gitEndpointAvailable(context.Background(), address, "127.0.0.1")
+		if !answered {
+			t.Fatal("a git:// endpoint that answered the probe request must report no evidence of unavailability")
+		}
+		if got := gitEndpointAvailable(canceled, address, "127.0.0.1"); got != answered {
+			t.Fatalf("gitEndpointAvailable(canceled caller) = %v, want %v: a probe the caller's cancellation cut short observed nothing", got, answered)
+		}
+	})
+}
+
+// TestEndpointProbeYieldsNoEvidenceWhenCallerDeadlineEndsTheHandshake pins
+// the deadline half of the same rule: a handshake the caller's own deadline
+// ended observed nothing, so it is not evidence that the endpoint was
+// unavailable. The endpoint here accepts the connection and stays silent, so
+// the caller's deadline is the only thing that can end the wait.
+func TestEndpointProbeYieldsNoEvidenceWhenCallerDeadlineEndsTheHandshake(t *testing.T) {
+	t.Parallel()
+	address := accepting(t, func(conn net.Conn) {
+		<-time.After(5 * time.Second)
+		_ = conn.Close()
+	})
+	ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
+	defer cancel()
+	if !sshEndpointAvailable(ctx, address) {
+		t.Fatal("a handshake the caller's deadline ended must report no evidence of unavailability")
+	}
+}
+
+// TestEndpointProbeYieldsNoEvidenceWhenCallerCancelsMidHandshake pins the
+// handshake half of the caller's-context rule: the caller's context can end
+// after the connection is established but before the peer answers, and such
+// a probe observed nothing at all — it must not be read as evidence that the
+// endpoint was unavailable.
+func TestEndpointProbeYieldsNoEvidenceWhenCallerCancelsMidHandshake(t *testing.T) {
+	t.Parallel()
+	silent := func(conn net.Conn) {
+		<-time.After(5 * time.Second)
+		_ = conn.Close()
+	}
+
+	t.Run("ssh", func(t *testing.T) {
+		t.Parallel()
+		address := accepting(t, silent)
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		// The connection is established first; the cancellation lands
+		// while the handshake still waits for the peer's first byte.
+		time.AfterFunc(100*time.Millisecond, cancel)
+		if !sshEndpointAvailable(ctx, address) {
+			t.Fatal("a handshake the caller's cancellation cut short must report no evidence of unavailability")
+		}
+	})
+
+	t.Run("git protocol", func(t *testing.T) {
+		t.Parallel()
+		address := accepting(t, silent)
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		time.AfterFunc(100*time.Millisecond, cancel)
+		if !gitEndpointAvailable(ctx, address, "127.0.0.1") {
+			t.Fatal("a git:// handshake the caller's cancellation cut short must report no evidence of unavailability")
+		}
+	})
+}
+
+// TestRemoteBranchHeadKeepsGitVerdictWhenProbeIsCutShort pins the rule that
+// keeps a completed git verdict standing: the endpoint probe must not read
+// the caller's own cancellation as evidence that the endpoint was
+// unavailable.
+//
+// The remote here answers git with a completed non-zero verdict, and the
+// probe's request is cut short by the caller's context ending mid-probe. The
+// probe observed nothing, so the read stays a fail-closed verdict rather
+// than becoming transient availability.
+func TestRemoteBranchHeadKeepsGitVerdictWhenProbeIsCutShort(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// The caller's context ends while the probe is in flight, so
+		// the probe's request fails with the context error and the
+		// probe never observed the endpoint.
+		cancel()
+		select {
+		case <-r.Context().Done():
+		case <-time.After(5 * time.Second):
+		}
+	}))
+	t.Cleanup(server.Close)
+	t.Setenv("PATH", writeFakeGit(t, "#!/bin/sh\ncase \"$1\" in\ncheck-ref-format) exit 0 ;;\nls-remote) exit 128 ;;\n*) exit 1 ;;\nesac\n"))
+	_, _, err := RemoteBranchHead(ctx, server.URL, "main")
+	if err == nil {
+		t.Fatal("expected the remote read to fail")
+	}
+	if forge.IsTransientAvailability(err) {
+		t.Fatalf("a completed git verdict must not be reclassified when the caller's context ends during the probe: %v", err)
+	}
+}
+
 // TestHTTPEndpointProbeDoesNotFollowRedirects pins the probe's shape: it is
 // exactly one request to the endpoint git itself would read, never a
 // redirect chain to another host. A redirect answer proves the endpoint
@@ -1209,15 +1399,26 @@ func TestHTTPEndpointProbeDoesNotFollowRedirects(t *testing.T) {
 // no transport evidence at all, so it must fail closed to the
 // verifier-rejection ending even when the remote's endpoint is genuinely
 // unreachable, rather than masquerading as forge unavailability.
+//
+// The stand-in git removes itself once the ref has been validated, so the
+// remote read itself cannot start a process: the local executor failed
+// before any remote was contacted.
 func TestRemoteBranchHeadNeverStartedFailsClosed(t *testing.T) {
 	endpoint := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusInternalServerError)
 	}))
 	endpoint.Close()
-	t.Setenv("PATH", t.TempDir())
+	t.Setenv("PATH", writeFakeGit(t, "#!/bin/sh\ncase \"$1\" in\ncheck-ref-format) /bin/rm -f \"$0\" ;;\nesac\nexit 0\n"))
 	_, _, err := RemoteBranchHead(context.Background(), endpoint.URL, "main")
 	if err == nil {
 		t.Fatal("expected the remote read to fail")
+	}
+	var commandErr *CommandError
+	if !errors.As(err, &commandErr) {
+		t.Fatalf("expected a git command error, got %T: %v", err, err)
+	}
+	if commandErr.started {
+		t.Fatalf("the remote read's git process started; the fixture must make it fail before the process starts: %v", err)
 	}
 	if forge.IsTransientAvailability(err) {
 		t.Fatalf("a remote read whose git process never started is a local executor failure, not transient availability: %v", err)

@@ -11,16 +11,22 @@ import (
 	"time"
 )
 
-// remoteUnavailableError marks a remote read whose git process ran to
-// completion and failed while the remote's own network endpoint was not
-// available to a direct probe: the endpoint could not be reached, the
-// connection was lost before an answer, or the endpoint answered with a
-// rate limit or a server error. The probe's observation — not a text match
-// on git's stderr — is the evidence, so the error is transient availability
-// evidence for forge.IsTransientAvailability: the world the read was meant
-// to observe was never observed. An endpoint that answered with any other
-// status never produces this error, because there git's non-zero exit is
-// its own verdict about a world it reached.
+// remoteUnavailableError marks a remote read that left the world unobserved.
+// It covers both shapes of that condition: the read was cut short before git
+// answered — the git process was killed by its deadline, by its
+// cancellation, or by a signal — and the read ran and failed while the
+// remote's own network endpoint was not available to a direct probe: the
+// endpoint could not be reached, the connection was lost before an answer,
+// or the endpoint answered with a rate limit or a server error.
+//
+// The probe's observation — not a text match on git's stderr — is the
+// evidence, so the error is transient availability evidence for
+// forge.IsTransientAvailability: the world the read was meant to observe was
+// never observed. An endpoint that answered with any other status never
+// produces this error, because there git's non-zero exit is its own verdict
+// about a world it reached; neither does a probe the caller's own
+// cancellation or deadline cut short, because such a probe yields no evidence
+// at all.
 type remoteUnavailableError struct {
 	err *CommandError
 }
@@ -37,20 +43,29 @@ func (e *remoteUnavailableError) TransientAvailability() bool { return true }
 // caller's own context deadline.
 const remoteProbeTimeout = 5 * time.Second
 
-// remoteEndpointAvailable reports whether the remote's network endpoint was
-// available to a direct probe. For http(s) remotes the probe is one
-// unauthenticated request to the smart-HTTP endpoint git itself would
-// read: any completed response proves the endpoint was reached and answered,
-// while a request that could not complete, and a 429 or 5xx response, match
-// the forge API's own transient-availability vocabulary. For ssh and git
-// remotes the probe is a minimal handshake over a TCP connection to the
-// endpoint — the ssh server's own identification banner, and a probe request
-// plus the daemon's answer for git:// — so an endpoint that answers proves
-// it was reached, while one that closes or stalls before answering left the
-// handshake unobserved. A remote with no
-// probeable network endpoint — a local path, file://, an unknown scheme,
-// or a URL that does not parse — reports available so the classification
-// fails closed to the caller's pre-existing behavior instead of guessing.
+// remoteEndpointAvailable reports the probe's evidence about the remote's
+// network endpoint.
+//
+// A false answer is the transient-availability evidence: the endpoint was
+// unavailable to a direct probe — it could not be reached, it closed or
+// reset before answering, it stalled past the probe's own bound, or it
+// answered 429/5xx. A true answer means the probe found no evidence of
+// unavailability: the endpoint answered, the remote has no probeable network
+// endpoint at all (a local path, file://, an unknown scheme, or a URL that
+// does not parse), or the caller's own cancellation or deadline cut the probe
+// short before it could observe anything. No evidence leaves git's own verdict
+// standing, so the classification fails closed to the caller's pre-existing
+// behavior instead of guessing.
+//
+// For http(s) remotes the probe is one unauthenticated request to the
+// smart-HTTP endpoint git itself would read: any completed response proves
+// the endpoint was reached and answered, while a request that could not
+// complete, and a 429 or 5xx response, match the forge API's own
+// transient-availability vocabulary. For ssh and git remotes the probe is a
+// minimal handshake over a TCP connection to the endpoint — the ssh server's
+// own identification banner, and a probe request plus the daemon's answer
+// for git:// — so an endpoint that answers proves it was reached, while one
+// that closes or stalls before answering left the handshake unobserved.
 func remoteEndpointAvailable(ctx context.Context, remoteURL string) bool {
 	trimmed := strings.TrimSpace(remoteURL)
 	if !strings.Contains(trimmed, "://") {
@@ -83,12 +98,22 @@ func remoteEndpointAvailable(ctx context.Context, remoteURL string) bool {
 	}
 }
 
-// httpEndpointAvailable probes the smart-HTTP ref advertisement endpoint
-// and reports whether the endpoint was available to it: the request must
-// complete with a status the endpoint's operator, not the network, chose.
-// Redirects are not followed — the probe is exactly one request to the
-// endpoint git itself would read, never a chain to another host — and a
-// redirect answer proves the endpoint answered, so it is available.
+// httpEndpointAvailable probes the smart-HTTP ref advertisement endpoint and
+// reports the probe's evidence about it.
+//
+// A false answer means the endpoint was unavailable: the request could not
+// complete, or the endpoint answered with a rate limit or a server error.
+// A true answer means the probe found no evidence of unavailability: the
+// endpoint answered, the request could not even be built, or the caller's own
+// context ended before the request could complete — a probe the caller's
+// cancellation or deadline cut short observed nothing, so it must not be read
+// as evidence that the endpoint was down.
+//
+// The request must complete with a status the endpoint's operator, not the
+// network, chose. Redirects are not followed — the probe is exactly one
+// request to the endpoint git itself would read, never a chain to another
+// host — and a redirect answer proves the endpoint answered, so it is
+// available.
 func httpEndpointAvailable(ctx context.Context, parsed *url.URL) bool {
 	endpoint := parsed.Scheme + "://" + parsed.Host + strings.TrimSuffix(parsed.Path, "/") + "/info/refs?service=git-upload-pack"
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
@@ -102,6 +127,11 @@ func httpEndpointAvailable(ctx context.Context, parsed *url.URL) bool {
 		},
 	}).Do(req)
 	if err != nil {
+		if callerContextEnded(ctx) {
+			// The caller's context ended: the probe observed nothing,
+			// so it yields no evidence about the endpoint.
+			return true
+		}
 		return false
 	}
 	defer resp.Body.Close()
@@ -112,44 +142,69 @@ func httpEndpointAvailable(ctx context.Context, parsed *url.URL) bool {
 	return true
 }
 
-// sshEndpointAvailable reports whether an ssh endpoint answers a minimal
-// handshake: an ssh server speaks first (RFC 4253 sends its identification
-// string before any client input), so after the dial one byte from the peer
-// proves the endpoint was reached and answered, while a connection that is
-// closed, reset, or left silent past the probe deadline before any byte
-// proves only that the handshake went unobserved.
+// sshEndpointAvailable reports the probe's evidence about an ssh endpoint.
+//
+// A false answer means the endpoint was unavailable: the dial could not
+// complete, or the connection closed, reset, or stayed silent past the
+// probe's own bound before any byte arrived. A true answer means the probe
+// found no evidence of unavailability: the server spoke its identification
+// banner — an ssh server speaks first (RFC 4253 sends its identification
+// string before any client input), so one byte from the peer proves the
+// endpoint was reached and answered — or the caller's own context ended the
+// handshake before it could observe anything.
 func sshEndpointAvailable(ctx context.Context, address string) bool {
 	conn, err := (&net.Dialer{Timeout: remoteProbeTimeout}).DialContext(ctx, "tcp", address)
 	if err != nil {
+		if callerContextEnded(ctx) {
+			// The caller's context ended: the probe observed nothing.
+			return true
+		}
 		return false
 	}
 	defer conn.Close()
 	return endpointAnswered(ctx, conn)
 }
 
-// gitEndpointAvailable reports whether a git:// daemon answers a minimal
-// handshake: the git protocol makes the client speak first, so the probe
-// sends a pkt-line request for a path it cannot resolve and then reads; any
-// byte back — a ref advertisement or an error line — proves the endpoint was
-// reached and answered, while a connection lost or left silent before an
-// answer proves only that the handshake went unobserved.
+// gitEndpointAvailable reports the probe's evidence about a git:// daemon.
+//
+// A false answer means the endpoint was unavailable: the dial could not
+// complete, the probe request could not be written, or the daemon's answer
+// never arrived. A true answer means the probe found no evidence of
+// unavailability: any byte back — a ref advertisement or an error line —
+// proves the endpoint was reached and answered, since the git protocol
+// makes the client speak first; or the caller's own context ended the
+// handshake before it could observe anything.
 func gitEndpointAvailable(ctx context.Context, address, host string) bool {
 	conn, err := (&net.Dialer{Timeout: remoteProbeTimeout}).DialContext(ctx, "tcp", address)
 	if err != nil {
+		if callerContextEnded(ctx) {
+			// The caller's context ended: the probe observed nothing.
+			return true
+		}
 		return false
 	}
 	defer conn.Close()
 	_ = conn.SetDeadline(probeDeadline(ctx))
 	_, err = conn.Write([]byte(pktLine("git-upload-pack /probe-invalid\x00host=" + host + "\x00")))
 	if err != nil {
+		if callerContextEnded(ctx) {
+			// The caller's context ended: the probe observed nothing.
+			return true
+		}
 		return false
 	}
 	return endpointAnswered(ctx, conn)
 }
 
-// endpointAnswered reads once and reports whether the peer sent any byte
-// before the connection was lost, the probe deadline passed, or the
-// caller's context ended — the same cancellation the HTTP probe honors.
+// endpointAnswered reads once and reports the probe's evidence about the
+// peer.
+//
+// A true answer means the peer answered — one byte arrived — or the wait was
+// cut short by the caller's own context, which observed nothing and so
+// yields no evidence of unavailability. A false answer means the endpoint was
+// unavailable: the peer sent no byte and the probe's own bound ended the
+// wait, whether the connection was lost, reset, or simply silent.
+//
 // The read keeps its deadline so the helper's goroutine, if the caller's
 // context ends first, still finishes when the deadline does.
 func endpointAnswered(ctx context.Context, conn net.Conn) bool {
@@ -163,14 +218,46 @@ func endpointAnswered(ctx context.Context, conn net.Conn) bool {
 	}()
 	select {
 	case result := <-answered:
-		return result
+		if result {
+			return true
+		}
+		// The peer sent nothing. Only the probe's own bound ending the
+		// wait makes that evidence of unavailability; the caller's own
+		// context ending it yields no evidence.
+		return callerContextEnded(ctx)
 	case <-ctx.Done():
-		return false
+		// The caller's cancellation ended the wait before the peer
+		// answered: the probe observed nothing.
+		return true
 	}
 }
 
+// callerContextEnded reports whether the caller's own context ended before
+// the probe could observe anything: it was canceled, or its deadline passed.
+// The deadline instant decides the deadline half, so the answer does not race
+// the context's cancellation goroutine — a context whose deadline has passed
+// may not have observed it yet, and reading that as "the endpoint was
+// unavailable" would flip a completed git verdict to transient.
+func callerContextEnded(ctx context.Context) bool {
+	return ctx.Err() != nil || callerDeadlineEnded(ctx)
+}
+
+// callerDeadlineEnded reports whether the caller's own deadline ended the
+// probe's wait. The deadline instant decides it, so the answer does not race
+// the context's cancellation goroutine: a deadline at or before now means
+// the caller's deadline ended the wait, and the probe observed nothing.
+// A caller with no deadline, or one whose deadline is still in the future,
+// left the probe's own bound to end the wait.
+func callerDeadlineEnded(ctx context.Context) bool {
+	deadline, ok := ctx.Deadline()
+	return ok && !deadline.After(time.Now())
+}
+
 // probeDeadline bounds the probe's own I/O: the earlier of the caller's
-// deadline, if any, and remoteProbeTimeout from now.
+// deadline, if any, and remoteProbeTimeout from now. The bound is the
+// probe's own, so a wait the caller's own deadline ends is reported as the
+// caller cutting the probe short rather than as the endpoint being
+// unavailable.
 func probeDeadline(ctx context.Context) time.Time {
 	deadline := time.Now().Add(remoteProbeTimeout)
 	if d, ok := ctx.Deadline(); ok && d.Before(deadline) {
