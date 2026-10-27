@@ -931,6 +931,18 @@ func run(ctx context.Context, stdout, stderr io.Writer) int {
 					report.terminateCaptured(ctx, workspace, startCommit, termination{Phase: "NeedsHuman", Result: "needs-human", ExitCode: exitNeedsHuman, Reason: verdict.FailReason, Outcome: result.Outcome, Category: terminalCategoryVerifierRejection})
 					return exitNeedsHuman
 				}
+				if verdict.Superseded {
+					// The pinned pull request merged during the run:
+					// the world settled the repair assignment, so this
+					// ending is classified from the world alone and
+					// carries no declared outcome (#582) — the same
+					// NoChangeNeeded terminal the startup guard gives a
+					// pinned request already merged at admission
+					// (#515), never a delivery claim for post-merge
+					// commits.
+					report.terminateCaptured(ctx, workspace, startCommit, termination{Phase: "NoChangeNeeded", Result: "success", ExitCode: exitNoChangeNeeded, Reason: report.mergedPinnedPRReason()})
+					return exitNoChangeNeeded
+				}
 				if verdict.Pass {
 					if verdict.Coverage != "" {
 						report.handoffCoverage = verdict.Coverage
@@ -1002,6 +1014,13 @@ func run(ctx context.Context, stdout, stderr io.Writer) int {
 					}
 					report.terminateCaptured(ctx, workspace, startCommit, termination{Phase: "NeedsHuman", Result: "needs-human", ExitCode: exitNeedsHuman, Reason: verdict.FailReason, Category: terminalCategoryVerifierRejection})
 					return exitNeedsHuman
+				}
+				if verdict.Superseded {
+					// The undeclared Verifying path shares the #582
+					// superseded ending with the declared path: the
+					// merge, not the model, classifies this world.
+					report.terminateCaptured(ctx, workspace, startCommit, termination{Phase: "NoChangeNeeded", Result: "success", ExitCode: exitNoChangeNeeded, Reason: report.mergedPinnedPRReason()})
+					return exitNoChangeNeeded
 				}
 				if verdict.Pass {
 					if verdict.Coverage != "" {
@@ -1746,8 +1765,20 @@ type handoffCheckOutcome struct {
 	// fail-closed, never a silent adoption (#247).
 	ambiguous bool
 	// closedOnly reports a head whose only PRs are closed or merged:
-	// fail-closed, never a duplicate creation (#247).
+	// fail-closed, never a duplicate creation (#247). For a fix-pr run
+	// this is the pinned pull request confirmed closed-unmerged: the
+	// authoritative merged/closed discrimination in checkFixPRHandoff
+	// settles a merged pinned request as pinnedMerged instead (#582).
 	closedOnly bool
+	// pinnedMerged reports a fix-pr run whose pinned pull request — the
+	// exact assignment the run was admitted against — merged during the
+	// run before the handoff (#582). The merge is the authoritative
+	// settlement of the repair assignment: the verdict ends the run as
+	// superseded terminal work, never a NeedsHuman solely because it
+	// merged, and never a Verifying handoff claiming post-merge commits
+	// shipped in the merged head. pr carries the pinned observation for
+	// the diagnostics.
+	pinnedMerged bool
 	// foreignHead reports a forge record that claims the head selector
 	// from another repository: fail-closed, never deleted toward a
 	// missing claim (#247).
@@ -2234,6 +2265,28 @@ func (r reporter) checkFixPRHandoff(ctx context.Context) (*handoffCheckOutcome, 
 		if !carriesPullRequestNumber(observation.closed, r.cfg.Ref) {
 			return &handoffCheckOutcome{pinnedMismatch: true, pr: observation.closed[0]}, nil
 		}
+		// The listing settles that the pinned request is terminal, not
+		// which terminal state: GitHub reports a merged request as
+		// closed. The authoritative read of the pinned assignment
+		// discriminates the two worlds (#582): a pinned request that
+		// merged during the run superseded the repair assignment while
+		// the run worked, the same moot world the startup guard settles
+		// as NoChangeNeeded before a turn ever starts (#515), so the
+		// verdict ends the run as superseded terminal work instead of a
+		// verifier-rejection that demands a human for a world the world
+		// already settled. A closed-unmerged request keeps the #247
+		// fail-closed ending — reopening or duplicating it is a human
+		// settlement. A read that cannot complete proves nothing about
+		// which terminal state the pinned request holds, so it surfaces
+		// as the bounded retry/forge-unavailable path (#247, #455) and
+		// never a guessed merge.
+		merged, err := r.pinnedPullRequestMerged(ctx)
+		if err != nil {
+			return nil, err
+		}
+		if merged {
+			return &handoffCheckOutcome{pinnedMerged: true, pr: carryRecordOfPullRequest(observation.closed, r.cfg.Ref)}, nil
+		}
 		return &handoffCheckOutcome{closedOnly: true}, nil
 	case prStateForeignHead:
 		return &handoffCheckOutcome{foreignHead: true}, nil
@@ -2263,6 +2316,52 @@ func carriesPullRequestNumber(observed []*prLinkageObservation, number int) bool
 		}
 	}
 	return false
+}
+
+// carryRecordOfPullRequest returns the observation of the given pinned
+// number within a closed-only observation set, for the diagnostics a
+// superseded terminal records (#582). The fix-pr handoff only calls it
+// after carriesPullRequestNumber confirmed the record exists; a set that
+// somehow no longer names the number yields nil rather than a foreign
+// record standing in for the pinned assignment.
+func carryRecordOfPullRequest(observed []*prLinkageObservation, number int) *prLinkageObservation {
+	for _, pull := range observed {
+		if pull != nil && pull.Number == number {
+			return pull
+		}
+	}
+	return nil
+}
+
+// pinnedPullRequestMerged authoritatively reads the run's pinned pull
+// request through the configured forge read-pull-request capability —
+// never a forge-specific CLI — and reports whether the forge says it
+// merged (#582). The head listing reports a merged request as closed, so
+// only this exact-number read tells the merged world (the repair
+// assignment superseded by the merge) from the closed-unmerged world
+// (reopening or duplicating is a human settlement). Any read failure —
+// an unavailable capability, a transport or decode fault, a response
+// naming a different pull request — is returned as an error: a read that
+// did not complete proves nothing about which terminal state the pinned
+// request holds, and the caller must retry inside the bounded budget or
+// fail closed, never guess a merge.
+func (r reporter) pinnedPullRequestMerged(ctx context.Context) (bool, error) {
+	client, err := github.NewClient(r.cfg.GitHubAPIBase, r.cfg.GitHubToken)
+	if err != nil {
+		return false, err
+	}
+	provider := github.NewProvider(forge.ProviderConfig{Name: "github", Endpoint: r.cfg.GitHubAPIBase}, client)
+	if !provider.Capabilities().Available(forge.CapabilityReadPullRequest).Available {
+		return false, fmt.Errorf("the forge read-pull-request capability is unavailable, so pull request #%d of %q cannot be authoritatively read", r.cfg.Ref, r.cfg.Repo)
+	}
+	pr, err := provider.ReadPullRequest(ctx, forge.PullRequestRef{Repo: r.cfg.Repo, Number: r.cfg.Ref})
+	if err != nil {
+		return false, err
+	}
+	if pr.Number != r.cfg.Ref {
+		return false, fmt.Errorf("pull request read for %s#%d returned number %d; the response does not name the pinned assignment", r.cfg.Repo, r.cfg.Ref, pr.Number)
+	}
+	return pr.Merged, nil
 }
 
 // pinnedCriterionSet returns the run's operator-pinned criterion envelope,
@@ -3008,6 +3107,18 @@ func (r reporter) closedOnlyPRReason() string {
 	return fmt.Sprintf("the run branch %q on %s has only closed or merged pull requests and no open one; the executor refuses adoption, reopening, or duplicate creation; the run needs a human", r.cfg.Branch, r.cfg.Repo)
 }
 
+// mergedPinnedPRReason composes the terminal reason for a fix-pr run
+// whose pinned pull request merged during the run (#582). The reason is
+// deliberately not a delivery claim: the authoritative merge settled the
+// repair assignment, but commits the run pushed after the merge are not
+// proven to be part of the merged head, so the run states that the
+// assignment was superseded and names the branch whose later commits are
+// not claimed as shipped. It also states the restraint the run kept —
+// no reopening, no duplicate — so the diagnostics stand on their own.
+func (r reporter) mergedPinnedPRReason() string {
+	return fmt.Sprintf("pull request #%d of %s merged during the run, so the repair assignment was superseded by the merge and the run ends as terminal without requiring a human; commits the run branch %q carries beyond the merged head are not claimed as shipped; the executor did not reopen the pull request or create a duplicate", r.cfg.Ref, r.cfg.Repo, r.cfg.Branch)
+}
+
 // fixPRUnverifiedMessage composes the fix-pr run's retry continuation
 // message for a failed live forge observation (#517). Like prUnverified
 // message (#247) it is explicitly not a missing-PR claim — a failed
@@ -3134,6 +3245,15 @@ type handoffVerdict struct {
 	// ForgeUnavailable marks a transient forge-availability ending
 	// (#455); see the struct doc above.
 	ForgeUnavailable bool
+	// Superseded marks the fix-pr world where the pinned pull request
+	// merged during the run (#582): the merge authoritatively settles
+	// the repair assignment, so the run ends as truthful terminal work
+	// (the same NoChangeNeeded ending the startup guard gives a pinned
+	// request already merged at admission, #515) rather than a
+	// NeedsHuman solely because it merged. It is never a Verifying
+	// handoff: commits the merged head does not carry are not claimed
+	// as shipped. PRNumber carries the pinned pull request.
+	Superseded bool
 }
 
 // applyHandoffPlan runs the identity-checked pre-handoff forge
@@ -3171,9 +3291,12 @@ type handoffVerdict struct {
 //     open, non-draft, on the pinned base, with the run's commit
 //     published — passes, every other world fails closed to
 //     NeedsHuman (a pull request that is not the pinned assignment,
-//     draft and missing without the resolve-issue continuations), and
-//     a resumable read failure retries with the fix-pr unverified
-//     message naming the pinned identity.
+//     draft and missing without the resolve-issue continuations), a
+//     closed-only head carrying the pinned request is read
+//     authoritatively so a request that merged during the run ends the
+//     run as Superseded terminal work rather than a human-required
+//     failure (#582), and a resumable read failure retries with the
+//     fix-pr unverified message naming the pinned identity.
 //   - Two operator-side envelope faults are not read failures and not
 //     model-repairable defects, so they fail closed to NeedsHuman on
 //     sight without consuming the #170 budget (#282). The
@@ -3280,6 +3403,14 @@ func (r reporter) applyHandoffPlan(ctx context.Context, continuations int, maxCo
 	// Fail-closed worlds first: none of these is a condition the model
 	// may resolve by retrying or creating (#247).
 	switch {
+	case linkOutcome.pinnedMerged:
+		// Not a failure world at all: the authoritative read of the
+		// pinned assignment settled the repair condition as merged
+		// during the run, so the verdict ends the run as superseded
+		// terminal work instead of demanding a human for a world the
+		// merge already settled (#582). It still short-circuits the
+		// switch because no Verifying handoff may follow.
+		return handoffVerdict{PRNumber: r.cfg.Ref, Superseded: true}
 	case linkOutcome.ambiguous:
 		return handoffVerdict{FailReason: r.prAmbiguousReason()}
 	case linkOutcome.closedOnly:

@@ -1292,6 +1292,75 @@ func TestRunFixPRHandoffFailClosedWorlds(t *testing.T) {
 	}
 }
 
+// TestRunFixPRPinnedPRMergedDuringRunEndsSuperseded is the #582
+// reproduction: the pinned assignment is open at admission, merges during
+// the captured turn, and the run (which kept working and pushed) reaches
+// the handoff verifier against a closed-only head. The authoritative read
+// settles the merge as superseding the repair assignment, so the run ends
+// with the same truthful NoChangeNeeded terminal the startup guard gives a
+// pinned request already merged at admission (#515) — not the
+// verifier-rejection NeedsHuman the production incident recorded. The
+// ending is not a delivery claim: no Verifying phase appears, and the
+// reason refuses to label post-merge commits as shipped. The run posts no
+// forge comment, because nothing was delivered to the merged request.
+func TestRunFixPRPinnedPRMergedDuringRunEndsSuperseded(t *testing.T) {
+	code, output, comments, _ := runFixPRHandoff(t,
+		"["+pullRequestFixtureObjectJSON(7, "open", false, "Feedback applied.")+"]",
+		true,
+		func(prState string) string {
+			return writePullRequestScript(prState, "["+pullRequestFixtureObjectJSONMerged(7, true, "Feedback applied, merged.")+"]")
+		},
+	)
+	if code != exitNoChangeNeeded {
+		t.Fatalf("run exit code = %d, want %d (NoChangeNeeded superseded terminal); output=%q", code, exitNoChangeNeeded, output)
+	}
+	if !strings.Contains(output, `"phase":"NoChangeNeeded"`) {
+		t.Fatalf("no-change-needed phase missing: %q", output)
+	}
+	if !strings.Contains(output, "superseded by the merge") {
+		t.Fatalf("termination reason must name the superseding merge: %q", output)
+	}
+	if !strings.Contains(output, "not claimed as shipped") {
+		t.Fatalf("termination reason must refuse to claim post-merge commits shipped: %q", output)
+	}
+	if strings.Contains(output, `"category":"verifier-rejection"`) {
+		t.Fatalf("a merged pinned pull request must not end as a verifier-rejection: %q", output)
+	}
+	if strings.Contains(output, `"phase":"Verifying"`) {
+		t.Fatalf("a superseded run must not hand off Verifying: %q", output)
+	}
+	if len(comments) != 0 {
+		t.Fatalf("comments = %d, want 0: a superseded ending publishes nothing; posted %q", len(comments), comments)
+	}
+}
+
+// TestRunFixPRPinnedPRClosedUnmergedStillNeedsHuman is the #582
+// discrimination guard at the run level: the same closed-only head whose
+// authoritative read says NOT merged keeps the #247 fail-closed ending —
+// reopening or duplicating a closed-unmerged request stays a human
+// settlement, and no superseded terminal may paper over it.
+func TestRunFixPRPinnedPRClosedUnmergedStillNeedsHuman(t *testing.T) {
+	code, output, comments, _ := runFixPRHandoff(t,
+		"["+pullRequestFixtureObjectJSON(7, "open", false, "Feedback applied.")+"]",
+		true,
+		func(prState string) string {
+			return writePullRequestScript(prState, "["+pullRequestFixtureObjectJSONMerged(7, false, "Feedback applied, closed.")+"]")
+		},
+	)
+	if code != exitNeedsHuman {
+		t.Fatalf("run exit code = %d, want %d; output=%q", code, exitNeedsHuman, output)
+	}
+	if !strings.Contains(output, `"phase":"NeedsHuman"`) || !strings.Contains(output, "only closed or merged pull requests") {
+		t.Fatalf("closed-unmerged pinned PR must keep the fail-closed closed-only ending: %q", output)
+	}
+	if strings.Contains(output, `"phase":"NoChangeNeeded"`) {
+		t.Fatalf("a closed-unmerged request is not a superseded ending: %q", output)
+	}
+	if len(comments) != 0 {
+		t.Fatalf("comments = %d, want 0; posted %q", len(comments), comments)
+	}
+}
+
 // TestRunMissingRefOutcomeCommentEmitsErrorEvent proves a terminal outcome that
 // wants to comment without a positive reference is not skipped silently: an
 // outcome.comment error event names the missing reference, and the run's
@@ -4369,6 +4438,20 @@ func pullRequestFixtureObjectJSONWithHeadRepo(number int, state string, draft bo
 	return fmt.Sprintf(`{"number":%d,"state":%q,"draft":%t,"title":"Work","base":{"ref":"main","repo":{"full_name":"acme/widgets"}},"head":{"ref":"courier/resolve-issue/acme-widgets/7","sha":"deadbeef","repo":{"full_name":%q}},"body":%q}`, number, state, draft, headRepo, body)
 }
 
+// pullRequestFixtureObjectJSONMerged renders one closed pull request
+// carrying the merge answer the authoritative single-pull-request read
+// serves (#582): the head listing reports a merged request as closed, and
+// the forge client reads the merge from merged_at, so the discrimination
+// between the superseded-by-merge world and the closed-unmerged
+// fail-closed world rides that field on the read.
+func pullRequestFixtureObjectJSONMerged(number int, merged bool, body string) string {
+	mergedAt := "null"
+	if merged {
+		mergedAt = `"2026-10-27T00:00:00Z"`
+	}
+	return fmt.Sprintf(`{"number":%d,"state":"closed","draft":false,"merged_at":%s,"title":"Work","base":{"ref":"main","repo":{"full_name":"acme/widgets"}},"head":{"ref":"courier/resolve-issue/acme-widgets/7","sha":"deadbeef","repo":{"full_name":"acme/widgets"}},"body":%q}`, number, mergedAt, body)
+}
+
 // writePullRequestScript is the shell line a fake OpenCode script uses to
 // stand in for the model opening or readying the run-branch pull request
 // through the forge capability: it writes the fixture JSON to the state
@@ -6936,17 +7019,50 @@ func TestObserveRunBranchPullRequestFixPRHead(t *testing.T) {
 // run was admitted against (COURIER_REF), not merely some pull request on
 // the run's head. A pull request carrying another number leaves the
 // pinned assignment unverified and fails closed, while the pinned pull
-// request itself still settles its own world (draft, closed) as before.
-// The number is the assignment; the head listing alone never proves it.
+// request itself still settles its own world (draft, closed). The number
+// is the assignment; the head listing alone never proves it.
+//
+// A closed head carrying the pinned number is additionally read through
+// the authoritative single-pull-request capability (#582), because the
+// listing reports a merged request as closed: the read's "merged" answer
+// separates the superseded-by-merge world from the closed-unmerged
+// fail-closed world, and a read that fails or names another pull request
+// is returned as an error — never guessed toward either ending. Worlds
+// that are not the pinned assignment never reach that read.
 func TestCheckFixPRHandoffPinnedPullRequestNumber(t *testing.T) {
 	fixture := func(number int, state string, draft bool) string {
 		return fmt.Sprintf(`[{"number":%d,"state":%q,"draft":%t,"title":"Fix","base":{"ref":"main","repo":{"full_name":"acme/widgets"}},"head":{"ref":"fix/pr-7","sha":"deadbeef","repo":{"full_name":"octocat/widgets"}},"body":"Applies the pinned feedback."}]`, number, state, draft)
 	}
-	newOutcome := func(body string) (*handoffCheckOutcome, error) {
+	fixtureObject := func(number int, state string, draft, merged bool) string {
+		mergedAt := "null"
+		if merged {
+			mergedAt = `"2026-10-27T00:00:00Z"`
+		}
+		return fmt.Sprintf(`{"number":%d,"state":%q,"draft":%t,"merged_at":%s,"title":"Fix","base":{"ref":"main","repo":{"full_name":"acme/widgets"}},"head":{"ref":"fix/pr-7","sha":"deadbeef","repo":{"full_name":"octocat/widgets"}},"body":"Applies the pinned feedback."}`, number, state, draft, mergedAt)
+	}
+	type readAnswer struct {
+		status int    // 0 → serve body
+		body   string // single-pull-request read answer
+	}
+	newOutcome := func(listBody string, read *readAnswer) (*handoffCheckOutcome, error, int) {
 		t.Helper()
+		singleReads := 0
 		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			w.Header().Set("Content-Type", "application/json")
-			_, _ = io.WriteString(w, body)
+			if _, isSingle := pullRequestReadNumber(r.URL.Path); isSingle {
+				singleReads++
+				if read == nil {
+					w.WriteHeader(http.StatusInternalServerError)
+					return
+				}
+				if read.status != 0 {
+					w.WriteHeader(read.status)
+					return
+				}
+				_, _ = io.WriteString(w, read.body)
+				return
+			}
+			_, _ = io.WriteString(w, listBody)
 		}))
 		t.Cleanup(server.Close)
 		var output, errorsOut bytes.Buffer
@@ -6959,61 +7075,105 @@ func TestCheckFixPRHandoffPinnedPullRequestNumber(t *testing.T) {
 			Base:          "main",
 			GitHubAPIBase: server.URL,
 		})
-		return report.checkFixPRHandoff(context.Background())
+		outcome, err := report.checkFixPRHandoff(context.Background())
+		return outcome, err, singleReads
 	}
 
 	for _, tc := range []struct {
 		name           string
 		body           string
+		read           *readAnswer
 		wantObserved   int
 		wantMismatch   bool
 		wantDraft      bool
 		wantClosedOnly bool
+		wantMerged     bool
+		wantReadErr    bool
+		wantNoRead     bool
 	}{
 		{
 			name:         "open PR is not the pinned assignment",
 			body:         fixture(12, "open", false),
 			wantObserved: 12,
 			wantMismatch: true,
+			wantNoRead:   true,
 		},
 		{
 			name:         "draft PR is not the pinned assignment",
 			body:         fixture(12, "open", true),
 			wantObserved: 12,
 			wantMismatch: true,
+			wantNoRead:   true,
 		},
 		{
 			name:         "closed PR is not the pinned assignment",
 			body:         fixture(12, "closed", false),
 			wantObserved: 12,
 			wantMismatch: true,
+			wantNoRead:   true,
 		},
 		{
 			name:         "the pinned PR is a draft",
 			body:         fixture(7, "open", true),
 			wantObserved: 7,
 			wantDraft:    true,
+			wantNoRead:   true,
 		},
 		{
-			name:           "the pinned PR is closed",
+			name:           "the pinned PR is closed-unmerged",
 			body:           fixture(7, "closed", false),
+			read:           &readAnswer{body: fixtureObject(7, "closed", false, false)},
 			wantObserved:   7,
 			wantClosedOnly: true,
 		},
+		{
+			name:         "the pinned PR merged during the run",
+			body:         fixture(7, "closed", false),
+			read:         &readAnswer{body: fixtureObject(7, "closed", false, true)},
+			wantObserved: 7,
+			wantMerged:   true,
+		},
+		{
+			// A read that did not complete proves nothing about which
+			// terminal state the pinned request holds: it surfaces as the
+			// bounded retry path (#247, #455), never a guessed merge and
+			// never a confirmed closed-unmerged refusal.
+			name:        "an unreadable pinned request is an error, not a merge claim",
+			body:        fixture(7, "closed", false),
+			read:        &readAnswer{status: http.StatusInternalServerError},
+			wantReadErr: true,
+		},
+		{
+			// A read answering with another pull request cannot settle
+			// the pinned assignment's terminal state.
+			name:        "a read naming another pull request is an error",
+			body:        fixture(7, "closed", false),
+			read:        &readAnswer{body: fixtureObject(8, "closed", false, true)},
+			wantReadErr: true,
+		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			outcome, err := newOutcome(tc.body)
+			outcome, err, singleReads := newOutcome(tc.body, tc.read)
+			if tc.wantReadErr {
+				if err == nil {
+					t.Fatalf("checkFixPRHandoff() error = nil, outcome = %+v; want the read failure returned, never a settled world", outcome)
+				}
+				return
+			}
 			if err != nil {
 				t.Fatalf("checkFixPRHandoff() error = %v", err)
 			}
 			if outcome == nil {
 				t.Fatalf("checkFixPRHandoff() outcome = nil, want a fail-closed outcome")
 			}
-			if outcome.pinnedMismatch != tc.wantMismatch || outcome.pinnedDraft != tc.wantDraft || outcome.closedOnly != tc.wantClosedOnly {
-				t.Fatalf("outcome = %+v, want mismatch=%v draft=%v closedOnly=%v", outcome, tc.wantMismatch, tc.wantDraft, tc.wantClosedOnly)
+			if outcome.pinnedMismatch != tc.wantMismatch || outcome.pinnedDraft != tc.wantDraft || outcome.closedOnly != tc.wantClosedOnly || outcome.pinnedMerged != tc.wantMerged {
+				t.Fatalf("outcome = %+v, want mismatch=%v draft=%v closedOnly=%v merged=%v", outcome, tc.wantMismatch, tc.wantDraft, tc.wantClosedOnly, tc.wantMerged)
 			}
-			if (tc.wantMismatch || tc.wantDraft) && (outcome.pr == nil || outcome.pr.Number != tc.wantObserved) {
+			if (tc.wantMismatch || tc.wantDraft || tc.wantMerged) && (outcome.pr == nil || outcome.pr.Number != tc.wantObserved) {
 				t.Fatalf("outcome.pr = %+v, want the observed pull request #%d", outcome.pr, tc.wantObserved)
+			}
+			if tc.wantNoRead && singleReads != 0 {
+				t.Fatalf("single-pull-request reads = %d, want 0: a world that is not the pinned assignment never reaches the #582 discrimination read", singleReads)
 			}
 		})
 	}
@@ -7184,6 +7344,67 @@ func TestPreHandoffFailClosedReasons(t *testing.T) {
 				t.Fatalf("%s reason = %q, want %q", tc.name, tc.got, tc.want)
 			}
 		})
+	}
+}
+
+// TestMergedPinnedPRReason pins the #582 superseded terminal's exact
+// reason: it names the pinned pull request and repository, states the
+// merge superseded the assignment without requiring a human, refuses to
+// claim the run branch's post-merge commits as shipped, and records the
+// restraint the executor kept — no reopening, no duplicate.
+func TestMergedPinnedPRReason(t *testing.T) {
+	var output, errorsOut bytes.Buffer
+	report := newReporter(&output, &errorsOut, config{
+		Mode:   "fix-pr",
+		Repo:   "misospace/widgets",
+		Branch: "courier/fix-pr/misospace-widgets/44",
+		Ref:    44,
+		Base:   "main",
+	})
+	want := `pull request #44 of misospace/widgets merged during the run, so the repair assignment was superseded by the merge and the run ends as terminal without requiring a human; commits the run branch "courier/fix-pr/misospace-widgets/44" carries beyond the merged head are not claimed as shipped; the executor did not reopen the pull request or create a duplicate`
+	if got := report.mergedPinnedPRReason(); got != want {
+		t.Fatalf("merged pinned PR reason = %q, want %q", got, want)
+	}
+}
+
+// TestApplyHandoffPlanMergedDiscriminationReadTransientEndsBlockedExternal
+// pins the #582 unknown-read world at the verdict level: the listing says
+// closed-only with the pinned number, the authoritative merged/closed read
+// fails on a transient availability condition (an HTTP 500), and no
+// continuation remains. The world was never observed, so the verdict is
+// the #455 blocked-external ending for the operator's bounded retry —
+// never Superseded (a read that did not complete proves no merge), never
+// a fail-closed human rejection (the terminal state was never read), and
+// never a Verifying pass.
+func TestApplyHandoffPlanMergedDiscriminationReadTransientEndsBlockedExternal(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if _, isSingle := pullRequestReadNumber(r.URL.Path); isSingle {
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `[{"number":7,"state":"closed","draft":false,"title":"Fix","base":{"ref":"main","repo":{"full_name":"acme/widgets"}},"head":{"ref":"fix/pr-7","sha":"deadbeef","repo":{"full_name":"octocat/widgets"}},"body":"Applies the pinned feedback."}]`)
+	}))
+	t.Cleanup(server.Close)
+	var output, errorsOut bytes.Buffer
+	report := newReporter(&output, &errorsOut, config{
+		Mode:          "fix-pr",
+		Repo:          "acme/widgets",
+		HeadRepo:      "octocat/widgets",
+		Branch:        "fix/pr-7",
+		Ref:           7,
+		Base:          "main",
+		GitHubAPIBase: server.URL,
+	})
+	verdict := report.applyHandoffPlan(context.Background(), 1, 1, "", nil)
+	if !verdict.ForgeUnavailable {
+		t.Fatalf("verdict = %+v, want the #455 blocked-external verdict for an uncompleted discrimination read", verdict)
+	}
+	if verdict.Superseded || verdict.Pass || verdict.ContinueMsg != "" {
+		t.Fatalf("an unread discrimination cannot settle any handoff world: %+v", verdict)
+	}
+	if verdict.FailReason == "" {
+		t.Fatal("the blocked-external verdict must carry its reason")
 	}
 }
 
