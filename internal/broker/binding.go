@@ -80,7 +80,7 @@ func PolicyFromRun(run *v1alpha1.CoderRun, providerConfigRef, canonicalSpecRepo 
 
 	switch mode {
 	case ModeResolveIssue:
-		derived := branch.ResolveIssue(persisted.BaseRepo, run.Spec.Ref)
+		derived := branch.ResolveIssueBranch(persisted.BaseRepo, run.Spec.Ref)
 		if derived == "" || persisted.WorkRepo != persisted.BaseRepo || persisted.WorkRef != derived {
 			return Policy{}, errors.New("broker binding: resolve-issue work identity does not match derived destination")
 		}
