@@ -7,6 +7,8 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"os/exec"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -40,7 +42,9 @@ func (e *remoteUnavailableError) TransientAvailability() bool { return true }
 // remoteProbeTimeout bounds one endpoint availability probe. It runs only
 // on a failed remote read, so a short bound keeps the failure path from
 // outliving the caller's patience without deciding anything about the
-// caller's own context deadline.
+// caller's own context deadline. The ssh path resolves the effective
+// endpoint through ssh before the handshake probe, so that remote's failure
+// path can use up to two such bounds in sequence, each still the probe's own.
 const remoteProbeTimeout = 5 * time.Second
 
 // remoteEndpointAvailable reports the probe's evidence about the remote's
@@ -52,7 +56,8 @@ const remoteProbeTimeout = 5 * time.Second
 // answered 429/5xx. A true answer means the probe found no evidence of
 // unavailability: the endpoint answered, the remote has no probeable network
 // endpoint at all (a local path, file://, an unknown scheme, or a URL that
-// does not parse), or the caller's own cancellation or deadline cut the probe
+// does not parse), the effective ssh endpoint of an ssh remote could not be
+// resolved, or the caller's own cancellation or deadline cut the probe
 // short before it could observe anything. No evidence leaves git's own verdict
 // standing, so the classification fails closed to the caller's pre-existing
 // behavior instead of guessing.
@@ -66,11 +71,17 @@ const remoteProbeTimeout = 5 * time.Second
 // own identification banner, and a probe request plus the daemon's answer
 // for git:// — so an endpoint that answers proves it was reached, while one
 // that closes or stalls before answering left the handshake unobserved.
+// For ssh remotes the address dialed is not the literal URL host: git hands
+// the destination to ssh, which applies the user's ssh configuration — a
+// HostName rewrite, a Port — before connecting, so the probe resolves the
+// effective endpoint the same way (see sshEffectiveAddress) and dials that.
+// An ssh remote whose effective endpoint cannot be resolved yields no
+// evidence rather than a probe of an endpoint ssh would never dial.
 func remoteEndpointAvailable(ctx context.Context, remoteURL string) bool {
 	trimmed := strings.TrimSpace(remoteURL)
 	if !strings.Contains(trimmed, "://") {
-		if host := scpLikeHost(trimmed); host != "" {
-			return sshEndpointAvailable(ctx, net.JoinHostPort(host, "22"))
+		if target := scpLikeTarget(trimmed); target != "" {
+			return sshRemoteAvailable(ctx, target, "")
 		}
 		return true
 	}
@@ -82,11 +93,11 @@ func remoteEndpointAvailable(ctx context.Context, remoteURL string) bool {
 	case "http", "https":
 		return httpEndpointAvailable(ctx, parsed)
 	case "ssh":
-		port := parsed.Port()
-		if port == "" {
-			port = "22"
+		target := parsed.Hostname()
+		if user := parsed.User.Username(); user != "" {
+			target = user + "@" + target
 		}
-		return sshEndpointAvailable(ctx, net.JoinHostPort(parsed.Hostname(), port))
+		return sshRemoteAvailable(ctx, target, parsed.Port())
 	case "git":
 		port := parsed.Port()
 		if port == "" {
@@ -140,6 +151,98 @@ func httpEndpointAvailable(ctx context.Context, parsed *url.URL) bool {
 		return false
 	}
 	return true
+}
+
+// sshRemoteAvailable reports the probe's evidence about the ssh endpoint git
+// itself would dial: the effective host and port ssh selects for the
+// destination after applying the user's ssh configuration. target is the
+// ssh destination git hands to ssh — host or user@host — and urlPort is an
+// explicit port from the remote URL, empty when the URL names none.
+//
+// An effective endpoint that cannot be resolved yields no evidence: git's
+// verdict stands. Dialing a literal URL host ssh would never connect to is
+// not evidence about the remote — it is a probe of an endpoint chosen by
+// this code alone.
+func sshRemoteAvailable(ctx context.Context, target, urlPort string) bool {
+	address, ok := sshEffectiveAddress(ctx, target, urlPort)
+	if !ok {
+		return true
+	}
+	return sshEndpointAvailable(ctx, address)
+}
+
+// sshConfigOutputLimit caps the ssh configuration output the probe reads.
+// The effective configuration is a fixed set of keyword lines, so anything
+// past the cap means the probe cannot trust the output.
+const sshConfigOutputLimit = 1 << 16
+
+// sshEffectiveAddress resolves the host:port git itself would dial for an
+// ssh remote: `ssh -G` prints the destination's effective configuration
+// after the user's ssh configuration — HostName rewrites, Port, and Match
+// blocks — is applied, without connecting. An explicit URL port is passed
+// with -p because git passes it to ssh, where it overrides the
+// configuration's Port.
+//
+// The answer is false — no endpoint, so the caller yields no evidence —
+// when ssh cannot start at all, exits non-zero on an unreadable or invalid
+// configuration, produces output past the probe's cap or without a usable
+// hostname and port, or the caller's context ends before ssh answers. The
+// probe never guesses an endpoint: what ssh resolves to is the only address
+// it will dial.
+func sshEffectiveAddress(ctx context.Context, target, urlPort string) (string, bool) {
+	// A destination starting with "-" would reach ssh as an option rather
+	// than a host, and a non-numeric URL port is not something git could
+	// hand to ssh either: neither is a destination whose endpoint this
+	// probe can resolve.
+	if target == "" || strings.HasPrefix(target, "-") {
+		return "", false
+	}
+	args := []string{"-G"}
+	if urlPort != "" {
+		port, err := strconv.Atoi(urlPort)
+		if err != nil || port < 1 || port > 65535 {
+			return "", false
+		}
+		args = append(args, "-p", strconv.Itoa(port))
+	}
+	args = append(args, target)
+	ctx, cancel := context.WithTimeout(ctx, remoteProbeTimeout)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, "ssh", args...)
+	var stdout boundedBuffer
+	stdout.limit = sshConfigOutputLimit
+	cmd.Stdout = &stdout
+	if err := cmd.Run(); err != nil || stdout.overflow {
+		return "", false
+	}
+	return sshEffectiveEndpoint(stdout.Bytes())
+}
+
+// sshEffectiveEndpoint reads the hostname and port out of `ssh -G` output.
+// The first value for each keyword wins, as ssh_config's first-obtained
+// value does; a missing or unusable value means no effective endpoint.
+func sshEffectiveEndpoint(out []byte) (string, bool) {
+	host, port := "", ""
+	for _, line := range strings.Split(string(out), "\n") {
+		if host == "" {
+			if value, found := strings.CutPrefix(line, "hostname "); found {
+				host = strings.TrimRight(value, " \t\r")
+			}
+		}
+		if port == "" {
+			if value, found := strings.CutPrefix(line, "port "); found {
+				port = strings.TrimRight(value, " \t\r")
+			}
+		}
+	}
+	if host == "" {
+		return "", false
+	}
+	number, err := strconv.Atoi(port)
+	if err != nil || number < 1 || number > 65535 {
+		return "", false
+	}
+	return net.JoinHostPort(host, strconv.Itoa(number)), true
 }
 
 // sshEndpointAvailable reports the probe's evidence about an ssh endpoint.
@@ -271,29 +374,37 @@ func pktLine(payload string) string {
 	return fmt.Sprintf("%04x%s", len(payload)+4, payload)
 }
 
-// scpLikeHost extracts the host from the scp-like remote form git accepts
-// for ssh remotes without an explicit scheme — user@host:path and the
-// userless host:path form alike — and returns the empty string when the URL
-// does not have that shape. Git treats a colon before any slash as the
-// scp-like separator, so a prefix containing a slash is a local path, not a
-// host; a space or backslash in the prefix is rejected too, since neither
-// can appear in a dialable host. An unbracketed IPv6 literal whose first
-// segment is empty (::1) has its separator before any host text, and a
-// bracketed literal is rejected by its bracket: both fail closed to git's
-// own verdict. A literal with a non-empty first segment (fe80::1) splits at
-// the first colon exactly as git itself splits it, so the extracted host
-// always matches the host git would dial.
-func scpLikeHost(remoteURL string) string {
+// scpLikeTarget extracts the ssh destination — the user@host or host part —
+// from the scp-like remote form git accepts for ssh remotes without an
+// explicit scheme: user@host:path and the userless host:path form alike. Git
+// hands that part to ssh as the destination, and ssh matches its
+// configuration against the destination, so the probe resolves the effective
+// endpoint from exactly what ssh would see. The function returns the empty
+// string when the URL does not have that shape. Git treats a colon before
+// any slash as the scp-like separator, so a prefix containing a slash is a
+// local path, not a host; a space or backslash in the prefix is rejected
+// too, since neither can appear in a dialable host. An unbracketed IPv6
+// literal whose first segment is empty (::1) has its separator before any
+// host text, and a bracketed literal is rejected by its bracket: both fail
+// closed to git's own verdict. A literal with a non-empty first segment
+// (fe80::1) splits at the first colon exactly as git itself splits it, so
+// the extracted destination always matches the destination git would hand
+// to ssh.
+func scpLikeTarget(remoteURL string) string {
 	colon := strings.Index(remoteURL, ":")
 	if colon < 1 || strings.ContainsAny(remoteURL[:colon], "/\\ [") {
 		return ""
 	}
-	host := remoteURL[:colon]
+	target := remoteURL[:colon]
+	host := target
 	if at := strings.Index(host, "@"); at >= 0 {
 		if at == 0 {
 			return ""
 		}
 		host = host[at+1:]
 	}
-	return host
+	if host == "" {
+		return ""
+	}
+	return target
 }
