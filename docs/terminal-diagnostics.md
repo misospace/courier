@@ -23,10 +23,18 @@ diagnose them is gone.
 | `capacity-exhaustion` | Execution capacity, not task correctness, was confirmed exhausted by a structured provider signal. |
 | `provider-unavailable` | The model provider repeatedly failed to serve this attempt without producing a structured allowance-exhaustion signal; the work was released for another capacity. |
 | `forge-unavailable` | A forge read could not complete on a transient availability condition, so the world was never observed; the work was released for another capacity. |
+| `workload-failure` | The trusted native coordinator explicitly classified its ending as the work's own failure — an undeclared ending, a declared `changes` with nothing integrated, or another verdict on the work, never on the infrastructure (#127). |
+| `infrastructure-failure` | The trusted native coordinator explicitly classified its ending as an infrastructure failure around the work — a model gateway or stream failure, a status write that will not land, a publication transport failure. Recovery is the crashloop-bounded relaunch and resume, never a terminal verdict on the work (#127). |
 | `unknown` | Evidence was missing or ambiguous. The operator never invents a cause. |
 
 Classification uses the strongest available evidence: a concrete category the
-executor emitted in its handoff wins; otherwise causal Kubernetes/container
+executor emitted in its handoff wins; otherwise the trusted native terminal
+result (#127) — `status.nativeResult` when it fences to the terminated pod's
+incarnation, else the handoff's `result_kind` fallback — maps `needs_human`,
+`blocked_external`, `capacity_exhausted`, `workload_failed`, and
+`infrastructure_failed` onto their categories, ahead of every
+runtime-failure and exit-code heuristic; otherwise causal
+Kubernetes/container
 failure evidence (`OOMKilled`, `ContainerStatusUnknown`, authoritative eviction,
 scheduling, or node-loss reasons; a `PodFailed` with no recorded terminated
 state and no valid handoff; or a missing pod); otherwise a declared decision
@@ -34,6 +42,12 @@ or external block; otherwise a non-zero exit with no valid handoff is
 `executor-crash`; otherwise `unknown`. `Error`, `Completed`, and `Shutdown` remain safe to display but do
 not by themselves establish an infrastructure cause. The exact causal subsets
 are maintained separately from the broader display allowlists in the operator.
+
+The trusted result is recorded separately from this diagnostic, and its own
+durable reason (`status.nativeResult.reason`) is a fixed code-owned label per
+kind — the coordinator's declared evidence, question, or missing text stays
+on the termination handoff and the source report, consistent with the
+redaction policy below.
 
 ## Inspecting a run
 

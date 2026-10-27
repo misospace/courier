@@ -37,6 +37,13 @@ type StatusPatch struct {
 	ClearOperation      string             `json:"clearOperation,omitempty"`
 	ReconcileOperations bool               `json:"reconcileOperations,omitempty"`
 
+	// TerminalResult persists the trusted native coordinator terminal result
+	// (#127) before the control process exits. The broker fences it to the
+	// authenticated control incarnation, so a stale incarnation cannot
+	// record a result, and one incarnation's recorded result is final.
+	// +optional
+	TerminalResult *courierv1alpha1.NativeResult `json:"terminalResult,omitempty"`
+
 	// ControlRequestAck acknowledges the control request this incarnation
 	// served. The broker fences it to the live request the ack names, so it
 	// can never acknowledge a request that was not served to this
@@ -262,6 +269,24 @@ func (r *StatusReporter) ControlRequestAck(ctx context.Context, id string) error
 		ID: id,
 		At: metav1.NewTime(r.now()),
 	}})
+}
+
+// TerminalResult persists the trusted native coordinator terminal result
+// (#127) through the broker's trusted status path, before the control
+// process exits. The result is the durable intent the operator classifies
+// from — the exit code and the kubelet termination handoff are only the
+// fallback channels when this write never landed. A failed write is
+// reported to the caller, which proceeds to exit with the termination
+// handoff; the absence of a persisted result never grants trust, it only
+// keeps the legacy classification.
+func (r *StatusReporter) TerminalResult(ctx context.Context, result courierv1alpha1.NativeResult) error {
+	if r == nil || r.transport == nil {
+		return nil
+	}
+	if result.Kind == "" {
+		return nil
+	}
+	return r.retried(ctx, StatusPatch{TerminalResult: &result})
 }
 
 // ReconcileDebt retries a retained checkpoint write. The broker's

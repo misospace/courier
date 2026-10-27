@@ -207,3 +207,41 @@ func TestCRDManifestCIRepairStatusSchema(t *testing.T) {
 		}
 	}
 }
+
+// TestNativeResultReasonContract pins the durable-reason contract (#127):
+// every trusted kind carries a fixed, non-empty, code-owned reason within the
+// shared MaxNativeResultReasonBytes bound, an unknown kind carries none, and
+// the bound equals the kubebuilder MaxLength on the CRD field — one contract
+// the CRD, the broker writer, and the control binary's persistence all share.
+func TestNativeResultReasonContract(t *testing.T) {
+	if MaxNativeResultReasonBytes != 1024 {
+		t.Fatalf("MaxNativeResultReasonBytes = %d, want 1024: the kubebuilder MaxLength on NativeResult.Reason is its validated copy and they must move together", MaxNativeResultReasonBytes)
+	}
+	kinds := []NativeResultKind{
+		NativeResultPublished,
+		NativeResultNoChange,
+		NativeResultNeedsHuman,
+		NativeResultBlockedExternal,
+		NativeResultCapacityExhausted,
+		NativeResultWorkloadFailed,
+		NativeResultInfrastructureFailed,
+	}
+	for _, kind := range kinds {
+		reason := NativeResultReason(kind)
+		if reason == "" {
+			t.Fatalf("%q has no durable reason; every trusted kind carries its fixed code-owned label", kind)
+		}
+		if len(reason) > MaxNativeResultReasonBytes {
+			t.Fatalf("%q reason is %d bytes, over the shared %d-byte durable bound", kind, len(reason), MaxNativeResultReasonBytes)
+		}
+		if again := NativeResultReason(kind); again != reason {
+			t.Fatalf("%q reason is not stable: %q then %q", kind, reason, again)
+		}
+	}
+	if NativeResultReason(NativeResultKind("genuinely_done")) != "" {
+		t.Fatal("an unknown kind produced a durable reason")
+	}
+	if NativeResultReason("") != "" {
+		t.Fatal("the empty kind produced a durable reason")
+	}
+}

@@ -11,6 +11,7 @@ import (
 	"unicode/utf8"
 
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	apimeta "k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -1078,13 +1079,30 @@ func (r *CoderRunReconciler) observeRunning(ctx context.Context, run *courierv1a
 		if pod.DeletionTimestamp != nil {
 			continue
 		}
+		// The trusted native terminal result (#127) classifies the ending when
+		// one exists for this incarnation: the persisted status result fenced
+		// to this pod's UID, or the pod's own validated termination handoff as
+		// the fallback channel. The operator classifies from that evidence —
+		// never from the exit code or the model's prose alone — and keeps the
+		// legacy exit-code mapping for every run without one. An
+		// infrastructure failure never terminalizes here: it is the
+		// relaunch/resume case bounded by the crashloop counter (HARNESS.md
+		// §8), and the world observation that follows a published handoff
+		// stays the only route to a successful AwaitingReview.
+		trusted, hasTrusted := trustedNativeResult(run, pod)
+		if hasTrusted && trusted.Kind == courierv1alpha1.NativeResultInfrastructureFailed {
+			return r.relaunchInfrastructureFailure(ctx, run, pod, trusted)
+		}
 		phase := phaseForExit(run.Spec.Mode, exitCode, terminationOutcome)
+		if hasTrusted {
+			phase = phaseForNativeResult(run.Spec.Mode, trusted.Kind)
+		}
 		if phase == courierv1alpha1.PhaseVerifying {
 			before := run.DeepCopy()
 			// Record a declared no_change_needed fix-pr run (exit 3) so its terminal
 			// report can say no change was pushed; exit 0 also lands here but may have
 			// pushed a fix, so only the declared exit sets the flag.
-			if run.Spec.Mode == courierv1alpha1.ModeFixPR && exitCode == exitDeclaredNoChange {
+			if run.Spec.Mode == courierv1alpha1.ModeFixPR && (exitCode == exitDeclaredNoChange || (hasTrusted && trusted.Kind == courierv1alpha1.NativeResultNoChange)) {
 				run.Status.DeclaredNoChange = true
 			}
 			run.Status.Phase = courierv1alpha1.PhaseVerifying
@@ -1108,7 +1126,7 @@ func (r *CoderRunReconciler) observeRunning(ctx context.Context, run *courierv1a
 		// pairing (declared blocked_external carried by a validated
 		// forge-unavailable handoff category). A task-shaped blocked_external
 		// declaration opens nothing here.
-		if terminationOutcome == string(executor.OutcomeCapacityExhausted) || trustedForgeUnavailableHandoff(pod, terminationOutcome) {
+		if terminationOutcome == string(executor.OutcomeCapacityExhausted) || (hasTrusted && trusted.Kind == courierv1alpha1.NativeResultCapacityExhausted) || trustedForgeUnavailableHandoff(pod, terminationOutcome) {
 			evidenceBefore := run.DeepCopy()
 			if r.Secure != nil {
 				if message, valid := parseCoordinatorTermination(pod); valid {
@@ -1147,7 +1165,11 @@ func (r *CoderRunReconciler) observeRunning(ctx context.Context, run *courierv1a
 			handoffCategory := coordinatorHandoffCategory(pod)
 			handoffValid := coordinatorHandoffValid(pod)
 			k8sFailure := kubernetesFailureEvidence(pod, handoffValid)
-			intent.diagnostic = buildTerminalDiagnostic(r.clock(), &exit, "", terminationOutcome, handoffCategory, k8sFailure, pod)
+			trustedKind := courierv1alpha1.NativeResultKind("")
+			if hasTrusted {
+				trustedKind = trusted.Kind
+			}
+			intent.diagnostic = buildTerminalDiagnostic(r.clock(), &exit, "", terminationOutcome, handoffCategory, k8sFailure, pod, trustedKind)
 		}
 		return r.transitionTerminal(ctx, run, phase, "", intent, terminationSummary)
 	}
@@ -1398,7 +1420,7 @@ func (r *CoderRunReconciler) observeVerifying(ctx context.Context, run *courierv
 		if run.Status.DeclaredNoChange && run.Spec.Mode == courierv1alpha1.ModeFixPR {
 			return r.transitionTerminal(ctx, run, courierv1alpha1.PhaseBlockedExternal, pr, terminalLifecycleIntent{
 				error:      "no changes pushed; queued feedback resolution is not verified",
-				diagnostic: buildTerminalDiagnostic(r.clock(), nil, "", "", "", false, nil),
+				diagnostic: buildTerminalDiagnostic(r.clock(), nil, "", "", "", false, nil, ""),
 			}, nil)
 		}
 		return r.transitionTerminal(ctx, run, courierv1alpha1.PhaseAwaitingReview, pr, terminalLifecycleIntent{}, nil)
@@ -2295,6 +2317,7 @@ type terminationMessage struct {
 	ExitCode        int32                                    `json:"exit_code"`
 	Reason          string                                   `json:"reason"`
 	Outcome         string                                   `json:"outcome"`
+	ResultKind      string                                   `json:"result_kind,omitempty"`
 	Category        string                                   `json:"category,omitempty"`
 	Summary         *courierv1alpha1.RunTelemetry            `json:"summary"`
 	WorkspaceSafety *courierv1alpha1.WorkspaceSafetyEvidence `json:"workspace_safety,omitempty"`
@@ -2446,7 +2469,9 @@ const outcomeCapacityExhausted = "capacity_exhausted"
 // green checks. A blocked_external declaration becomes a recoverable
 // dependency block; a needs_decision declaration (or any exit 2 without a
 // recognized external-block outcome) remains NeedsHuman. Other failure exits
-// remain Failed.
+// remain Failed. This is the legacy classification contract: a native run
+// whose trusted terminal result exists is classified by
+// phaseForNativeResult instead (#127).
 func phaseForExit(mode courierv1alpha1.Mode, exitCode int32, outcome string) courierv1alpha1.Phase {
 	switch exitCode {
 	case 0:
@@ -2468,4 +2493,122 @@ func phaseForExit(mode courierv1alpha1.Mode, exitCode int32, outcome string) cou
 	default:
 		return courierv1alpha1.PhaseFailed
 	}
+}
+
+// nativeResultKindOf reports the trusted native terminal result kind a valid
+// termination handoff carries (#127), or empty when the message carries none
+// or an unrecognized one — an unknown kind is never a classification.
+func nativeResultKindOf(message terminationMessage) courierv1alpha1.NativeResultKind {
+	switch kind := courierv1alpha1.NativeResultKind(strings.TrimSpace(message.ResultKind)); kind {
+	case courierv1alpha1.NativeResultPublished, courierv1alpha1.NativeResultNoChange,
+		courierv1alpha1.NativeResultNeedsHuman, courierv1alpha1.NativeResultBlockedExternal,
+		courierv1alpha1.NativeResultCapacityExhausted, courierv1alpha1.NativeResultWorkloadFailed,
+		courierv1alpha1.NativeResultInfrastructureFailed:
+		return kind
+	default:
+		return ""
+	}
+}
+
+// trustedNativeResult returns the trusted native coordinator terminal result
+// that classifies this coordinator pod's termination, when one exists (#127).
+// The persisted status result is authoritative when it fences to this pod's
+// UID — the fence that keeps a stale incarnation's result from classifying a
+// replacement's termination; otherwise the pod's own validated termination
+// handoff carries the kind as the fallback channel for a status write that
+// never landed. A run with neither has no trusted result and keeps the legacy
+// exit-code classification.
+func trustedNativeResult(run *courierv1alpha1.CoderRun, pod *corev1.Pod) (courierv1alpha1.NativeResult, bool) {
+	if pod == nil {
+		return courierv1alpha1.NativeResult{}, false
+	}
+	if result := run.Status.NativeResult; result != nil &&
+		result.CoordinatorPodUID == string(pod.UID) && nativeResultKindOf(terminationMessage{ResultKind: string(result.Kind)}) != "" {
+		return *result, true
+	}
+	if message, valid := parseCoordinatorTermination(pod); valid {
+		if kind := nativeResultKindOf(message); kind != "" {
+			return courierv1alpha1.NativeResult{Kind: kind, Reason: strings.TrimSpace(message.Reason)}, true
+		}
+	}
+	return courierv1alpha1.NativeResult{}, false
+}
+
+// phaseForNativeResult maps the trusted native terminal result onto the run's
+// next phase (#127). The routes mirror the legacy exit-code mapping exactly —
+// a published or no-change result still only hands the run to the operator's
+// own world verification, never to a successful AwaitingReview on the
+// coordinator's word. An infrastructure failure is not mapped here: it is the
+// relaunch/resume case the caller routes through the crashloop-bounded
+// relaunch before any terminal phase is chosen (HARNESS.md §8).
+func phaseForNativeResult(mode courierv1alpha1.Mode, kind courierv1alpha1.NativeResultKind) courierv1alpha1.Phase {
+	switch kind {
+	case courierv1alpha1.NativeResultPublished:
+		return courierv1alpha1.PhaseVerifying
+	case courierv1alpha1.NativeResultNoChange:
+		if mode == courierv1alpha1.ModeFixPR {
+			return courierv1alpha1.PhaseVerifying
+		}
+		return courierv1alpha1.PhaseAwaitingReview
+	case courierv1alpha1.NativeResultNeedsHuman:
+		return courierv1alpha1.PhaseNeedsHuman
+	case courierv1alpha1.NativeResultBlockedExternal, courierv1alpha1.NativeResultCapacityExhausted:
+		return courierv1alpha1.PhaseBlockedExternal
+	default:
+		// workload_failed and any unmapped kind fail closed onto the terminal
+		// failure verdict on the work.
+		return courierv1alpha1.PhaseFailed
+	}
+}
+
+// infrastructureFailureReason is the human-facing cause a trusted
+// infrastructure-failure relaunch event carries (#127).
+const infrastructureFailureEventReason = "coordinator reported an infrastructure failure"
+
+// infrastructureFailureCeilingReason is the human-facing cause the ceiling
+// hand-off carries when trusted infrastructure failures accumulated to the
+// restart ceiling (#127).
+const infrastructureFailureCeilingReason = "coordinator infrastructure failures reached the infrastructure restart ceiling"
+
+// relaunchInfrastructureFailure is the recovery route for a coordinator that
+// ended with a trusted infrastructure-failure result (#127): the
+// infrastructure failed around the work — a model gateway or stream failure,
+// a status write that will not land, a publication transport failure — so the
+// ending is never a terminal verdict on the work. The run relaunches and
+// resumes from durable state exactly like pod loss, bounded by the same
+// crashloop ceiling, after the terminated pod is deleted so the
+// deterministic name is free for the replacement. At the ceiling the run is
+// handed to a human and the terminated pod is preserved as the ending's only
+// record of the cause, exactly as the wedge and pod-loss paths preserve an
+// unrecoverable object. A delete that conflicts re-observes instead of
+// charging: the next reconcile re-classifies the same terminated pod.
+func (r *CoderRunReconciler) relaunchInfrastructureFailure(ctx context.Context, run *courierv1alpha1.CoderRun, pod *corev1.Pod, trusted courierv1alpha1.NativeResult) (ctrl.Result, error) {
+	// For secure runs the surviving round — the untrusted worker and the
+	// credentialed broker — must not outlive the supervisor: the loss is
+	// confirmed by the trusted result, so the fence runs on this reconcile
+	// exactly as the pod-loss paths do (#215).
+	if r.Secure != nil {
+		if err := r.Secure.Fence(ctx, run); err != nil {
+			return ctrl.Result{}, err
+		}
+	}
+	diagnostic := buildTerminalDiagnostic(r.clock(), nil, "", "", "", false, pod, trusted.Kind)
+	if run.Status.Restarts < r.maxRestarts() {
+		if err := r.deleteObservedPod(ctx, pod); err != nil {
+			if apierrors.IsConflict(err) {
+				// The pod changed between observation and deletion: re-observe
+				// instead of acting on a world that no longer exists.
+				return ctrl.Result{RequeueAfter: observationRequeueDelay}, nil
+			}
+			return ctrl.Result{}, err
+		}
+		present, err := coordinatorObjectPresentLive(ctx, r.reader(), run)
+		if err != nil || present {
+			// The deterministic name is not provably free yet; the charge is
+			// deferred until a live read shows the object gone, so one
+			// physical ending is charged exactly once.
+			return ctrl.Result{RequeueAfter: observationRequeueDelay}, nil
+		}
+	}
+	return r.relaunchAfterInfraLoss(ctx, run, infrastructureFailureCeilingReason, infrastructureFailureEventReason, diagnostic)
 }

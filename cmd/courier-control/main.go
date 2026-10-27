@@ -31,17 +31,23 @@ import (
 	courierlog "github.com/misospace/courier/internal/log"
 	"github.com/misospace/courier/internal/protocol"
 	"github.com/misospace/courier/internal/topology"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
 // termination mirrors the operator's terminationMessage contract: the
 // phase/result pair must satisfy validTerminationPhaseResult for the exit
-// code, and the declared outcome travels in Outcome.
+// code, and the declared outcome travels in Outcome. ResultKind carries the
+// trusted native terminal result kind (#127): the fallback copy of the
+// classification when the persisted status write never landed, so an
+// infrastructure failure remains distinguishable from a workload failure on
+// the fallback channel too.
 type termination struct {
 	Phase           string                            `json:"phase"`
 	Result          string                            `json:"result"`
 	ExitCode        int32                             `json:"exit_code"`
 	Reason          string                            `json:"reason"`
 	Outcome         string                            `json:"outcome,omitempty"`
+	ResultKind      string                            `json:"result_kind,omitempty"`
 	WorkspaceSafety *executor.WorkspaceSafetyEvidence `json:"workspace_safety,omitempty"`
 	// Category is the structured diagnostic vocabulary the operator persists
 	// verbatim when it is one it knows (TerminalDiagnosticCategory). Only
@@ -133,6 +139,12 @@ func runArgs(args []string) error {
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
 	defer cancel()
 
+	// The trusted status reporter is created before the capability probe: a
+	// gate that fails closed must still persist its trusted terminal result
+	// (#127) through the broker before the process exits, exactly as a run
+	// that ends through the coordinator loop does.
+	reporter := harness.NewStatusReporter(identity.brokerStatusClient(), identity.controlKubeUID, identity.workerUID, 0)
+
 	// Startup capability health (§5): every semantic capability the harness
 	// depends on is probed and named. Required and unavailable fails closed
 	// before any model work starts; optional capabilities proceed degraded.
@@ -169,14 +181,14 @@ func runArgs(args []string) error {
 			// a blocked-external ending so the source re-offers the work once
 			// capacity returns (#320).
 			if exhaustedGate(err) {
-				return declareBlockedExternal(reason, caps)
+				return declareBlockedExternal(reason, caps, reporter, identity)
 			}
-			return declareNeedsHuman(reason, caps)
+			return declareNeedsHuman(reason, caps, reporter, identity)
 		}
 		fmt.Printf("transient capability failure, re-probing: %s\n", reason)
 		select {
 		case <-ctx.Done():
-			return declareNeedsHuman(reason, caps)
+			return declareNeedsHuman(reason, caps, reporter, identity)
 		case <-time.After(probeRetryDelay):
 		}
 	}
@@ -202,7 +214,6 @@ func runArgs(args []string) error {
 	// asks the broker's trusted status listener, which alone holds the
 	// status-write identity (§6). Earned heartbeats and dispatch evidence
 	// travel through it; the worker has no path to any of it.
-	reporter := harness.NewStatusReporter(identity.brokerStatusClient(), identity.controlKubeUID, identity.workerUID, 0)
 	if err := reporter.ReconcileOperations(ctx); err != nil {
 		// Best-effort hygiene: a fresh process holds no in-flight operations,
 		// and stale entries are ignored by the operator's validity rules. A
@@ -246,7 +257,7 @@ func runArgs(args []string) error {
 		return fmt.Errorf("courier-control: %w", err)
 	}
 	result := coordinator.Run(ctx, invocation)
-	return declare(result)
+	return declare(result, reporter, identity)
 }
 
 // classifyGateFailure decides, for a harness.Gate failure, the reason the
@@ -274,12 +285,54 @@ func exhaustedGate(err error) bool {
 // changes exits 0 (Verifying), no_change_needed exits 3 (AwaitingReview),
 // needs_decision and blocked_external exit 2 (NeedsHuman), and an
 // infrastructure failure or undeclared ending exits 1 so the operator's
-// relaunch and crashloop backstop own the recovery. The structured result is
-// written to the termination file in every case — the exit code alone is
-// never the classification.
-func declare(result executor.HarnessResult) error {
-	return handoff(terminationFor(result))
+// relaunch and crashloop backstop own the recovery. Before the process
+// exits, the trusted terminal result is persisted through the run's broker
+// status path (#127): the exit code alone is never the classification, and
+// the persisted result is the durable intent the operator classifies from —
+// the termination handoff below is the fallback channel for a write that
+// never landed.
+func declare(result executor.HarnessResult, reporter *harness.StatusReporter, identity *controlIdentity) error {
+	payload := terminationFor(result)
+	persistTerminalResult(payload, reporter, identity)
+	return handoff(payload)
 }
+
+// persistTerminalResult writes the trusted native terminal result through
+// the broker's status path before process exit (#127). The durable reason is
+// the code-owned label derived from the result kind (NativeResultReason) —
+// never the termination handoff's reason, which may carry the coordinator's
+// declared evidence, question, or missing-dependency text (model data) for
+// the kubelet handoff and the source report. Keeping the two channels apart
+// is the trust boundary: model-authored text never lands on durable status.
+// The write is bounded and runs on a context that survives the caller's
+// cancellation so a SIGTERM'd exit still records durable intent; a failure
+// is reported on stderr and the exit proceeds — the operator then falls back
+// to the termination handoff, and the absence of a persisted result never
+// grants trust.
+func persistTerminalResult(payload termination, reporter *harness.StatusReporter, identity *controlIdentity) {
+	if reporter == nil || identity == nil || payload.ResultKind == "" {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(context.Background()), terminalResultWriteTimeout)
+	defer cancel()
+	result := courierv1alpha1.NativeResult{
+		Kind:              courierv1alpha1.NativeResultKind(payload.ResultKind),
+		Reason:            courierv1alpha1.NativeResultReason(courierv1alpha1.NativeResultKind(payload.ResultKind)),
+		CoordinatorPodUID: identity.controlKubeUID,
+		At:                metav1.NewTime(clockNow()),
+	}
+	if err := reporter.TerminalResult(ctx, result); err != nil {
+		fmt.Fprintf(os.Stderr, "courier-control: trusted terminal result was not persisted: %v\n", err)
+	}
+}
+
+// terminalResultWriteTimeout bounds the pre-exit terminal-result write. It
+// is an availability bound on one durable write, not a work limit.
+const terminalResultWriteTimeout = 15 * time.Second
+
+// clockNow is the time source for the terminal result's At stamp, a var so
+// tests can pin it.
+var clockNow = time.Now
 
 // compactionSink adapts the harness's applied-compaction telemetry onto the
 // run's structured event log (#243): one session.compacted line carrying
@@ -367,13 +420,15 @@ func (s bootstrapReceiptSink) BootstrapRecorded(receipt harness.BootstrapReceipt
 // terminationFor renders the operator handoff payload. Its phase/result pair
 // must satisfy validTerminationPhaseResult for the exit code — the operator
 // discards the trusted reason and outcome otherwise — and the coordinator's
-// own declared outcome travels in Outcome.
+// own declared outcome travels in Outcome. The trusted native terminal
+// result kind (#127) travels in ResultKind.
 func terminationFor(result executor.HarnessResult) termination {
 	reason := result.Reason
 	exit := int32(1)
 	phase := "Failed"
 	handoffResult := "failure"
 	outcome := ""
+	resultKind := string(result.Kind)
 	category := ""
 	switch {
 	case result.Err != nil && result.Outcome == executor.OutcomeChanges:
@@ -404,6 +459,7 @@ func terminationFor(result executor.HarnessResult) termination {
 		ExitCode:        exit,
 		Reason:          boundReason(reason),
 		Outcome:         outcome,
+		ResultKind:      resultKind,
 		Category:        category,
 		WorkspaceSafety: result.WorkspaceSafety,
 	}
@@ -440,28 +496,36 @@ func handoff(payload termination) error {
 // capability table as the reason, then exits 2. The operator maps exit 2 plus
 // the blocked_external outcome to a recoverable external-dependency block, so
 // a confirmed provider allowance exhaustion waits for capacity instead of
-// parking the run for a human (#320).
-func declareBlockedExternal(reason string, caps []harness.Capability) error {
+// parking the run for a human (#320). The trusted terminal result is
+// persisted through the broker first (#127).
+func declareBlockedExternal(reason string, caps []harness.Capability, reporter *harness.StatusReporter, identity *controlIdentity) error {
 	table, _ := json.Marshal(caps)
 	fmt.Printf("capability health: %s\n", table)
-	return handoff(terminationFor(executor.HarnessResult{
+	payload := terminationFor(executor.HarnessResult{
 		Outcome: executor.OutcomeBlockedExternal,
+		Kind:    courierv1alpha1.NativeResultBlockedExternal,
 		Reason:  reason,
-	}))
+	})
+	persistTerminalResult(payload, reporter, identity)
+	return handoff(payload)
 }
 
 // declareNeedsHuman writes the structured NeedsHuman handoff with the
 // capability table as the reason, then exits 2 — the operator's fail-closed
-// contract for a run that cannot proceed.
-func declareNeedsHuman(reason string, caps []harness.Capability) error {
+// contract for a run that cannot proceed. The trusted terminal result is
+// persisted through the broker first (#127).
+func declareNeedsHuman(reason string, caps []harness.Capability, reporter *harness.StatusReporter, identity *controlIdentity) error {
 	table, _ := json.Marshal(caps)
 	fmt.Printf("capability health: %s\n", table)
-	return handoff(termination{
-		Phase:    "NeedsHuman",
-		Result:   "needs-human",
-		ExitCode: 2,
-		Reason:   boundReason(reason),
-	})
+	payload := termination{
+		Phase:      "NeedsHuman",
+		Result:     "needs-human",
+		ExitCode:   2,
+		Reason:     boundReason(reason),
+		ResultKind: string(courierv1alpha1.NativeResultNeedsHuman),
+	}
+	persistTerminalResult(payload, reporter, identity)
+	return handoff(payload)
 }
 
 func mustJSON(value any) string {

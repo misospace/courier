@@ -48,7 +48,7 @@ func TestClassifyTerminalDiagnostic(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			if got := classifyTerminalDiagnostic(tt.handoff, tt.exit, tt.outcome, tt.kubernetes); got != tt.want {
+			if got := classifyTerminalDiagnostic(tt.handoff, tt.exit, tt.outcome, tt.kubernetes, ""); got != tt.want {
 				t.Fatalf("category = %q, want %q", got, tt.want)
 			}
 		})
@@ -75,7 +75,7 @@ func TestBoundedDiagnosticReason(t *testing.T) {
 func TestBuildTerminalDiagnostic(t *testing.T) {
 	exit := int32(1)
 	now := time.Date(2026, 10, 12, 1, 2, 3, 0, time.FixedZone("offset", 3600))
-	missing := buildTerminalDiagnostic(now, &exit, "", "", "", true, nil)
+	missing := buildTerminalDiagnostic(now, &exit, "", "", "", true, nil, "")
 	if missing.Container != nil || missing.ExitCode != &exit && (missing.ExitCode == nil || *missing.ExitCode != exit) {
 		t.Fatalf("missing-pod diagnostic = %#v", missing)
 	}
@@ -87,7 +87,7 @@ func TestBuildTerminalDiagnostic(t *testing.T) {
 	}
 	pod := diagnosticPod()
 	pod.Status.ContainerStatuses[0].State.Terminated.Reason = "OOMKilled"
-	got := buildTerminalDiagnostic(now, &exit, "", "", "", kubernetesFailureEvidence(pod, false), pod)
+	got := buildTerminalDiagnostic(now, &exit, "", "", "", kubernetesFailureEvidence(pod, false), pod, "")
 	if got.Category != courierv1alpha1.TerminalDiagnosticCategoryKubernetesFailure {
 		t.Fatalf("OOM category = %q", got.Category)
 	}
@@ -230,7 +230,7 @@ func TestRelaunchCeilingPersistsWedgedDiagnostic(t *testing.T) {
 	run.Status.Restarts = defaultMaxRestarts
 	kube := phaseClient(t, run)
 	reconciler := diagnosticReconciler(kube, &admissionSource{})
-	diagnostic := buildTerminalDiagnostic(reconciler.clock(), nil, wedgedReapDiagnosticReason, "", "", false, nil)
+	diagnostic := buildTerminalDiagnostic(reconciler.clock(), nil, wedgedReapDiagnosticReason, "", "", false, nil, "")
 	if _, err := reconciler.relaunchAfterInfraLoss(context.Background(), run, "", "", diagnostic); err != nil {
 		t.Fatalf("relaunch at ceiling: %v", err)
 	}
@@ -970,7 +970,7 @@ func TestClassifyAllowsAllKubernetesFailureIndicators(t *testing.T) {
 			pod.Status.ContainerStatuses[0].State.Terminated.Reason = reason
 			if tt.exit == 0 {
 				// A zero exit without a handoff is not terminalized by reconcile.
-				diag := buildTerminalDiagnostic(time.Now(), &tt.exit, "", "", "", kubernetesFailureEvidence(pod, false), pod)
+				diag := buildTerminalDiagnostic(time.Now(), &tt.exit, "", "", "", kubernetesFailureEvidence(pod, false), pod, "")
 				if diag.Category != tt.want || !strings.Contains(diag.Reason, "container: "+reason) {
 					t.Fatalf("zero-exit diagnostic = %#v, want display-only reason and category %q", diag, tt.want)
 				}

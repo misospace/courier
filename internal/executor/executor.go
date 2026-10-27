@@ -119,8 +119,23 @@ const (
 // Outcome carries the coordinator's own declaration; Err carries an
 // infrastructure failure (pod, gateway, status path) that the operator
 // relaunches under the crashloop backstop — it is never a verdict on the work.
+// Kind is the trusted terminal classification (#127): explicit at every
+// ending, set by trusted control, and persisted through the run's broker
+// status path before process exit, so the operator classifies from that
+// evidence plus its own world verification — never from the model's prose or
+// the exit code alone. An unset Kind (the legacy shape) keeps the exit-code
+// classification contract.
+//
+// Reason is the pre-exit handoff text and the only place the coordinator's
+// declared evidence, question, or missing-dependency text (model data) may
+// travel: it feeds the kubelet termination handoff and the source report.
+// The durable NativeResult reason is code-owned — NativeResultReason of Kind
+// — so model-authored text never lands on CoderRun status; the operator's
+// own terminal diagnostic derives only from operator evidence, exactly as
+// before.
 type HarnessResult struct {
 	Outcome         DeclaredOutcome
+	Kind            courierv1alpha1.NativeResultKind
 	Reason          string
 	Err             error
 	WorkspaceSafety *WorkspaceSafetyEvidence

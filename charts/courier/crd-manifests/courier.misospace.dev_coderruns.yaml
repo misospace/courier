@@ -624,6 +624,55 @@ spec:
                   non-secret value limited to 128 Unicode code points.
                 maxLength: 128
                 type: string
+              nativeResult:
+                description: |-
+                  NativeResult is the trusted native coordinator's structured terminal
+                  result (#127), persisted through the run's broker status path before
+                  the control process exited. The trusted broker is the only writer; a
+                  result is fenced to one control incarnation and a replacement
+                  incarnation records its own. Absent for legacy executors and for runs
+                  whose terminal write failed — the operator then classifies from the
+                  kubelet termination handoff as before.
+                properties:
+                  at:
+                    description: At is when trusted control produced the result, before
+                      process exit.
+                    format: date-time
+                    type: string
+                  coordinatorPodUID:
+                    description: |-
+                      CoordinatorPodUID is the control incarnation that produced the result.
+                      It is the fence: the broker refuses a result attributing itself to any
+                      other incarnation, and the operator trusts a result only for the
+                      coordinator pod whose termination carries the same UID.
+                    maxLength: 128
+                    minLength: 1
+                    type: string
+                  kind:
+                    description: Kind is the explicit terminal classification.
+                    enum:
+                    - published
+                    - no_change
+                    - needs_human
+                    - blocked_external
+                    - capacity_exhausted
+                    - workload_failed
+                    - infrastructure_failed
+                    type: string
+                  reason:
+                    description: |-
+                      Reason is a fixed, code-owned operator label derived from Kind
+                      (NativeResultReason), bounded by MaxNativeResultReasonBytes. It never
+                      carries model output: the coordinator's declared evidence, question, or
+                      missing-dependency text stays on the termination handoff and the source
+                      report, never on durable status.
+                    maxLength: 1024
+                    type: string
+                required:
+                - at
+                - coordinatorPodUID
+                - kind
+                type: object
               phase:
                 description: Phase is the current lifecycle phase.
                 enum:
@@ -895,6 +944,8 @@ spec:
                     - capacity-exhaustion
                     - provider-unavailable
                     - forge-unavailable
+                    - workload-failure
+                    - infrastructure-failure
                     - unknown
                     type: string
                   container:
