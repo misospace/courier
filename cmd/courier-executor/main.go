@@ -1553,6 +1553,16 @@ func (r reporter) guardAdoption(ctx context.Context) (int, bool) {
 	}
 	observation, err := r.observeRunBranchPullRequest(ctx)
 	if err != nil {
+		if forge.IsTransientAvailability(err) {
+			// The read never reached the forge's answer, so the pull
+			// request set on the run branch was never observed: park for
+			// the operator's bounded retry under the forge-unavailable
+			// category rather than crash, and never adopt on an
+			// unobserved world (#585).
+			reason := fmt.Sprintf("the pull requests on run branch %s could not be read to decide adoption: %s; the forge was temporarily unavailable, so the run is parked for bounded retry by the operator", r.cfg.Branch, err.Error())
+			r.terminate(r.transientLaunchReadTermination(reason))
+			return exitNeedsHuman, true
+		}
 		r.terminate(termination{Phase: "Failed", Result: "failure", ExitCode: 1, Reason: err.Error(), Category: terminalCategoryExecutorCrash})
 		return 1, true
 	}
