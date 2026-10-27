@@ -837,14 +837,27 @@ outcome tag exactly as the linkage plan does. A forge read failure during
 the legacy check is fail-closed exactly as #248's is, with one #455
 refinement: when no retry remains and the read failed on a transient
 availability condition — a rate limit, a server error, or a transport
-failure of the forge API read, classified by `forge.IsTransientAvailability`
+failure, classified by `forge.IsTransientAvailability`
 — the world was never observed, so the run ends on the recovery channel
 (`blocked_external` outcome, category `forge-unavailable`) for the operator's
 bounded retry instead of `verifier-rejection` `NeedsHuman`, replacing any
-declared outcome tag the run had carried. The git-side remote-publication read
-behind the same observation is not classified that way yet — the git transport
-cannot yet tell an unreachable remote from a command that ran and failed — so
-its failures stay a fail-closed `verifier-rejection`. That exact pairing — and
+declared outcome tag the run had carried. The git-side remote-publication
+read behind the same observation carries that classification itself, decided
+by evidence and never by a text match on git's stderr. The marker belongs
+to that remote read alone: a failed local workspace read is evidence about
+this machine and never classifies as forge unavailability. A remote read
+cut short before git answered — the git process killed by its deadline, its
+cancellation, or a signal — never observed the remote, which is transport
+evidence on its own; a read whose git process never started failed inside
+the local executor and fails closed; and a read that ran and failed is
+classified by probing the remote's endpoint directly, where the probe's own
+answer is the evidence: an endpoint that cannot be reached, closes, resets,
+or stalls past the probe's own bound, or answers 429 or 5xx, is transient
+availability; an endpoint that answers leaves git's own verdict standing;
+a probe the caller's own cancellation or deadline cut short yields no
+evidence and leaves git's own verdict standing as well; and a remote with no
+probeable network endpoint stays a fail-closed `verifier-rejection`. That
+exact pairing — and
 only that pairing — opens the operator's trusted workspace-safety evidence
 gate, so the ending persists the same secure snapshot or isolated-observer
 proof a `capacity_exhausted` handoff would and stays eligible for the fenced

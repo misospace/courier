@@ -5652,6 +5652,175 @@ func TestRunResolveIssueDroppedForgeConnectionEndsBlockedExternal(t *testing.T) 
 	}
 }
 
+// dumbGitEndpointServer serves a bare repository's files over plain HTTP,
+// which git can read over the dumb protocol, so a run can clone from the
+// URL it will later have to re-read. Once sentinelPath exists, every
+// /info/refs request — the endpoint both git's ls-remote and the
+// availability probe read — fails with status instead, so the handoff-time
+// git read meets an endpoint whose behavior the test controls.
+func dumbGitEndpointServer(t *testing.T, remote, sentinelPath string, status int) *httptest.Server {
+	t.Helper()
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/info/refs" {
+			if _, err := os.Stat(sentinelPath); err == nil {
+				w.WriteHeader(status)
+				return
+			}
+		}
+		candidate := filepath.Join(remote, filepath.Clean("/"+r.URL.Path))
+		info, err := os.Stat(candidate)
+		if err != nil || info.IsDir() {
+			http.NotFound(w, r)
+			return
+		}
+		http.ServeFile(w, r, candidate)
+	}))
+	t.Cleanup(server.Close)
+	return server
+}
+
+// TestRunResolveIssueUnavailableGitRemoteEndsBlockedExternal proves the
+// #476 classification covers the git side of the handoff observation: the
+// forge API answers, but the git endpoint the remote-publication read
+// needs answers 500, so the read could not observe the world. With no
+// captured session the run ends blocked_external / forge-unavailable for
+// the operator's bounded retry — not a verifier rejection, and never a
+// claim that the PR is missing.
+func TestRunResolveIssueUnavailableGitRemoteEndsBlockedExternal(t *testing.T) {
+	root := t.TempDir()
+	remote := filepath.Join(root, "remote.git")
+	source := filepath.Join(root, "source")
+	runGit(t, root, "init", "--bare", remote)
+	runGit(t, root, "init", source)
+	configureGit(t, source)
+	write(t, filepath.Join(source, "README.md"), "base\n")
+	commit(t, source, "base: initial")
+	runGit(t, source, "branch", "-M", "main")
+	runGit(t, source, "remote", "add", "origin", remote)
+	runGit(t, source, "push", "-u", "origin", "main")
+	runGit(t, remote, "update-server-info")
+
+	// The fake child flips the git endpoint as its first action, after the
+	// clone and adoption reads completed against the healthy endpoint:
+	// every later /info/refs read answers 500.
+	sentinel := filepath.Join(root, "git-endpoint-flipped")
+	gitServer := dumbGitEndpointServer(t, remote, sentinel, http.StatusInternalServerError)
+
+	fakeOpenCode := filepath.Join(root, "opencode")
+	scratchDirectory := filepath.Join(root, "scratch")
+	if err := os.MkdirAll(scratchDirectory, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	writeExecutable(t, fakeOpenCode, "#!/bin/sh\ncase \"$1\" in mcp) exit 0;; esac\n: > "+sentinel+"\nprintf 'completed\\n' > completed.txt\ngit add --all -- .\ngit commit -m 'test: completed work' >/dev/null\nmkdir -p \"$COURIER_SCRATCH_DIR\"\nprintf '{\"outcome\":\"changes\"}' > \"$COURIER_SCRATCH_DIR/outcome.json\"\nexit 0\n")
+
+	workspace := filepath.Join(root, "workspace")
+	termination := filepath.Join(root, "termination")
+	t.Setenv("COURIER_REPO_URL", gitServer.URL)
+	t.Setenv("COURIER_WORKSPACE", workspace)
+	t.Setenv("COURIER_SCRATCH_DIR", scratchDirectory)
+	t.Setenv("COURIER_BASE", "main")
+	t.Setenv("COURIER_BRANCH", "courier/resolve-issue/acme-widgets/7")
+	t.Setenv("COURIER_GOAL", "Open a PR to address issue #7. Declare the outcome at "+filepath.Join(defaultScratchDirectory, defaultOutcomeFilename)+".")
+	t.Setenv("COURIER_MODEL", "any-model/name")
+	t.Setenv("COURIER_MODE", "resolve-issue")
+	t.Setenv("COURIER_REPO", "acme/widgets")
+	t.Setenv("COURIER_REF", "7")
+	t.Setenv("COURIER_GITHUB_API_BASE", fakeGitHubAPI(t).URL)
+	t.Setenv("COURIER_OPENCODE_BINARY", fakeOpenCode)
+	t.Setenv("COURIER_TERMINATION_FILE", termination)
+	t.Setenv("COURIER_RESUME_BACKOFF_SECONDS", "0")
+	t.Setenv("COURIER_RUN_NAME", "coderrun-linkage-git-endpoint-500")
+
+	var output bytes.Buffer
+	var errorsOut bytes.Buffer
+	code := run(context.Background(), &output, &errorsOut)
+	if code != exitNeedsHuman {
+		t.Fatalf("run exit code = %d, want %d (blocked-external ending on an unavailable git endpoint); stderr=%q stdout=%q", code, exitNeedsHuman, errorsOut.String(), output.String())
+	}
+	if !strings.Contains(output.String(), `"outcome":"blocked_external"`) {
+		t.Fatalf("expected a blocked_external outcome on an unavailable git endpoint: %q", output.String())
+	}
+	if !strings.Contains(output.String(), `"category":"forge-unavailable"`) {
+		t.Fatalf("expected the forge-unavailable category on an unavailable git endpoint: %q", output.String())
+	}
+	if !strings.Contains(output.String(), "temporarily unavailable") {
+		t.Fatalf("reason should name the transient forge unavailability: %q", output.String())
+	}
+	if !strings.Contains(output.String(), "acme/widgets#7") {
+		t.Fatalf("reason should name the trusted source identity: %q", output.String())
+	}
+	if strings.Contains(output.String(), "needs a human") {
+		t.Fatalf("an unavailable git endpoint must not read as a verification rejection needing a human: %q", output.String())
+	}
+	if strings.Contains(output.String(), "no pull request for that head") {
+		t.Fatalf("a failed read must not claim the pull request is missing: %q", output.String())
+	}
+}
+
+// TestRunResolveIssueGitEndpointVerdictStaysNeedsHuman proves the other
+// branch of the #476 classification: the git endpoint answers the probe
+// with a status its operator chose (404), so git's non-zero exit is its own
+// verdict about a world it reached, and the run keeps the fail-closed
+// verifier-rejection ending instead of the recovery channel.
+func TestRunResolveIssueGitEndpointVerdictStaysNeedsHuman(t *testing.T) {
+	root := t.TempDir()
+	remote := filepath.Join(root, "remote.git")
+	source := filepath.Join(root, "source")
+	runGit(t, root, "init", "--bare", remote)
+	runGit(t, root, "init", source)
+	configureGit(t, source)
+	write(t, filepath.Join(source, "README.md"), "base\n")
+	commit(t, source, "base: initial")
+	runGit(t, source, "branch", "-M", "main")
+	runGit(t, source, "remote", "add", "origin", remote)
+	runGit(t, source, "push", "-u", "origin", "main")
+	runGit(t, remote, "update-server-info")
+
+	sentinel := filepath.Join(root, "git-endpoint-flipped")
+	gitServer := dumbGitEndpointServer(t, remote, sentinel, http.StatusNotFound)
+
+	fakeOpenCode := filepath.Join(root, "opencode")
+	scratchDirectory := filepath.Join(root, "scratch")
+	if err := os.MkdirAll(scratchDirectory, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	writeExecutable(t, fakeOpenCode, "#!/bin/sh\ncase \"$1\" in mcp) exit 0;; esac\n: > "+sentinel+"\nprintf 'completed\\n' > completed.txt\ngit add --all -- .\ngit commit -m 'test: completed work' >/dev/null\nmkdir -p \"$COURIER_SCRATCH_DIR\"\nprintf '{\"outcome\":\"changes\"}' > \"$COURIER_SCRATCH_DIR/outcome.json\"\nexit 0\n")
+
+	workspace := filepath.Join(root, "workspace")
+	termination := filepath.Join(root, "termination")
+	t.Setenv("COURIER_REPO_URL", gitServer.URL)
+	t.Setenv("COURIER_WORKSPACE", workspace)
+	t.Setenv("COURIER_SCRATCH_DIR", scratchDirectory)
+	t.Setenv("COURIER_BASE", "main")
+	t.Setenv("COURIER_BRANCH", "courier/resolve-issue/acme-widgets/7")
+	t.Setenv("COURIER_GOAL", "Open a PR to address issue #7. Declare the outcome at "+filepath.Join(defaultScratchDirectory, defaultOutcomeFilename)+".")
+	t.Setenv("COURIER_MODEL", "any-model/name")
+	t.Setenv("COURIER_MODE", "resolve-issue")
+	t.Setenv("COURIER_REPO", "acme/widgets")
+	t.Setenv("COURIER_REF", "7")
+	t.Setenv("COURIER_GITHUB_API_BASE", fakeGitHubAPI(t).URL)
+	t.Setenv("COURIER_OPENCODE_BINARY", fakeOpenCode)
+	t.Setenv("COURIER_TERMINATION_FILE", termination)
+	t.Setenv("COURIER_RESUME_BACKOFF_SECONDS", "0")
+	t.Setenv("COURIER_RUN_NAME", "coderrun-linkage-git-endpoint-404")
+
+	var output bytes.Buffer
+	var errorsOut bytes.Buffer
+	code := run(context.Background(), &output, &errorsOut)
+	if code != exitNeedsHuman {
+		t.Fatalf("run exit code = %d, want %d (fail-closed verifier rejection on a reached git endpoint); stderr=%q stdout=%q", code, exitNeedsHuman, errorsOut.String(), output.String())
+	}
+	if strings.Contains(output.String(), `"outcome":"blocked_external"`) {
+		t.Fatalf("a git endpoint that answered must not end blocked_external: %q", output.String())
+	}
+	if strings.Contains(output.String(), `"category":"forge-unavailable"`) {
+		t.Fatalf("a git endpoint that answered must not carry the forge-unavailable category: %q", output.String())
+	}
+	if !strings.Contains(output.String(), "needs a human") {
+		t.Fatalf("a git verdict about a world it reached must fail closed to NeedsHuman: %q", output.String())
+	}
+}
+
 // The #247 tests below pin the post-turn, pre-handoff forge observation for
 // legacy resolve-issue runs: a confirmed missing or draft pull request
 // resumes the captured session with a factual state message inside #170's

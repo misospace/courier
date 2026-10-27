@@ -5,6 +5,10 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net"
+	"net/http"
+	"net/http/httptest"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -12,6 +16,9 @@ import (
 	"slices"
 	"strings"
 	"testing"
+	"time"
+
+	"github.com/misospace/courier/internal/forge"
 )
 
 // TestMain isolates git from the developer's global and system config and pins
@@ -1045,4 +1052,539 @@ func TestBlobAtReadsRevisionScopedContentAndClassifiesAbsence(t *testing.T) {
 	if _, _, err := BlobAt(context.Background(), repo, "", ".mise/config.toml"); err == nil {
 		t.Fatal("BlobAt accepted an empty revision")
 	}
+}
+
+// writeFakeGit installs an executable stand-in for the git binary on PATH and
+// returns the directory holding it, so a test can drive run()'s process-level
+// outcomes — a process that never starts, one that runs and exits, and one
+// killed by its context — without reaching the network.
+func writeFakeGit(t *testing.T, script string) string {
+	t.Helper()
+	directory := t.TempDir()
+	executable := filepath.Join(directory, "git")
+	if err := os.WriteFile(executable, []byte(script), 0o700); err != nil {
+		t.Fatalf("write fake git: %v", err)
+	}
+	return directory
+}
+
+// TestLocalGitFailureNeverClassifiesAsTransientAvailability pins the
+// boundary the transient-availability marker must not cross: the marker
+// belongs to the remote-publication read alone, so no local git command
+// carries it.
+//
+// A git process that started and was killed by its context deadline — an
+// OOM-kill, a pod eviction, or the run's own budget — says nothing about
+// any forge, and the run must never end blocked_external /
+// forge-unavailable on its account. A process that ran and exited under its
+// own control is git's own verdict and never transient. A process that never
+// started failed inside the local executor — a missing git binary, for
+// instance — which is evidence about this machine's configuration, not about
+// any remote, so it fails closed. The classification reads the process
+// state, never git's stderr text.
+func TestLocalGitFailureNeverClassifiesAsTransientAvailability(t *testing.T) {
+	t.Run("killed by the context deadline", func(t *testing.T) {
+		t.Setenv("PATH", writeFakeGit(t, "#!/bin/sh\nexec /bin/sleep 30\n"))
+		ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
+		defer cancel()
+		_, err := run(ctx, "", "sleep")
+		if err == nil {
+			t.Fatal("expected the killed git process to fail")
+		}
+		if forge.IsTransientAvailability(err) {
+			t.Fatalf("a local git command killed by its context deadline must not classify as transient availability: %v", err)
+		}
+
+		// The workspace head read is a local read of this machine: it
+		// never reaches a forge, so a forge must never be blamed for
+		// it.
+		headCtx, headCancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
+		defer headCancel()
+		workspace := &Workspace{Directory: t.TempDir()}
+		_, err = workspace.Head(headCtx)
+		if err == nil {
+			t.Fatal("expected the killed workspace head read to fail")
+		}
+		if forge.IsTransientAvailability(err) {
+			t.Fatalf("a local workspace head read killed by its context deadline must not classify as transient availability: %v", err)
+		}
+	})
+	t.Run("ran and exited", func(t *testing.T) {
+		t.Setenv("PATH", writeFakeGit(t, "#!/bin/sh\nexit 3\n"))
+		_, err := run(context.Background(), "", "status")
+		if err == nil {
+			t.Fatal("expected the failing git process to fail")
+		}
+		if forge.IsTransientAvailability(err) {
+			t.Fatalf("a git process that ran and exited carries its own verdict, not a transient availability failure: %v", err)
+		}
+	})
+	t.Run("never started", func(t *testing.T) {
+		t.Setenv("PATH", t.TempDir())
+		_, err := run(context.Background(), "", "status")
+		if err == nil {
+			t.Fatal("expected the missing git binary to fail")
+		}
+		if forge.IsTransientAvailability(err) {
+			t.Fatalf("a git process that never started is a permanent local executor failure, not a transient availability failure: %v", err)
+		}
+	})
+}
+
+// TestRemoteBranchHeadCutShortIsTransientAvailability pins the other side of
+// that boundary: a remote read whose git process was cut short — killed by
+// its deadline, its cancellation, or a signal — never observed the remote,
+// so it is transport evidence on its own and classifies transient without any
+// endpoint probe. The remote's own verdict cannot stand here: there is none.
+func TestRemoteBranchHeadCutShortIsTransientAvailability(t *testing.T) {
+	t.Setenv("PATH", writeFakeGit(t, "#!/bin/sh\ncase \"$1\" in\ncheck-ref-format) exit 0 ;;\n*) exec /bin/sleep 30 ;;\nesac\n"))
+	ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
+	defer cancel()
+	_, _, err := RemoteBranchHead(ctx, "https://example.invalid/owner/repo.git", "main")
+	if err == nil {
+		t.Fatal("expected the cut-short remote read to fail")
+	}
+	if !forge.IsTransientAvailability(err) {
+		t.Fatalf("a remote read cut short before git answered must classify transient: %v", err)
+	}
+}
+
+// TestRemoteBranchHeadClassifiesEndpointEvidence pins the network-level
+// evidence rule behind the git-side remote-publication read: a git process
+// that ran and failed is classified by the remote's own endpoint, never by
+// git's stderr text. An endpoint that answers with 429 or 5xx, and an
+// endpoint the probe cannot complete against, classify transient
+// availability; an endpoint that answered with any other status carries
+// git's verdict and keeps the fail-closed behavior, as does a remote with no
+// probeable network endpoint.
+func TestRemoteBranchHeadClassifiesEndpointEvidence(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	statusServer := func(status int) *httptest.Server {
+		return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(status)
+		}))
+	}
+	resetServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, _, err := http.NewResponseController(w).Hijack()
+		if err != nil {
+			t.Errorf("hijack: %v", err)
+			return
+		}
+		_ = conn.Close()
+	}))
+	t.Cleanup(resetServer.Close)
+
+	cases := []struct {
+		name      string
+		remoteURL string
+		transient bool
+	}{
+		{"endpoint answers 500", statusServer(http.StatusInternalServerError).URL, true},
+		{"endpoint answers 429", statusServer(http.StatusTooManyRequests).URL, true},
+		{"endpoint drops the connection", resetServer.URL, true},
+		{"endpoint answers 404", statusServer(http.StatusNotFound).URL, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, _, err := RemoteBranchHead(ctx, tc.remoteURL, "main")
+			if err == nil {
+				t.Fatal("expected the remote read to fail")
+			}
+			if got := forge.IsTransientAvailability(err); got != tc.transient {
+				t.Fatalf("RemoteBranchHead(%s) transient availability = %v, want %v: %v", tc.remoteURL, got, tc.transient, err)
+			}
+		})
+	}
+	t.Run("local path carries no network endpoint", func(t *testing.T) {
+		_, _, err := RemoteBranchHead(ctx, t.TempDir(), "main")
+		if err == nil {
+			t.Fatal("expected the remote read against a non-repository path to fail")
+		}
+		if forge.IsTransientAvailability(err) {
+			t.Fatalf("a remote with no probeable network endpoint must keep the fail-closed classification: %v", err)
+		}
+	})
+}
+
+// TestEndpointProbeYieldsNoEvidenceWhenCallerContextEnded pins the probe's
+// evidence rule: the probe's answer is the evidence, and a probe the
+// caller's own cancellation cut short observed nothing at all.
+//
+// Each helper therefore reports the same value for an endpoint that answered
+// as for a probe that never got to ask — no evidence that the endpoint was
+// unavailable — so a completed git verdict is never reclassified on the
+// strength of the caller's own cancellation, deadline, or pod shutdown.
+func TestEndpointProbeYieldsNoEvidenceWhenCallerContextEnded(t *testing.T) {
+	t.Parallel()
+	canceled, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	t.Run("http", func(t *testing.T) {
+		t.Parallel()
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(http.StatusOK)
+		}))
+		t.Cleanup(server.Close)
+		parsed, err := url.Parse(server.URL)
+		if err != nil {
+			t.Fatalf("parse probe URL: %v", err)
+		}
+		answered := httpEndpointAvailable(context.Background(), parsed)
+		if !answered {
+			t.Fatal("an endpoint that answered must report no evidence of unavailability")
+		}
+		if got := httpEndpointAvailable(canceled, parsed); got != answered {
+			t.Fatalf("httpEndpointAvailable(canceled caller) = %v, want %v: a probe the caller's cancellation cut short observed nothing", got, answered)
+		}
+	})
+
+	t.Run("ssh", func(t *testing.T) {
+		t.Parallel()
+		address := accepting(t, func(conn net.Conn) {
+			_, _ = conn.Write([]byte("SSH-2.0-probe\r\n"))
+			_ = conn.Close()
+		})
+		answered := sshEndpointAvailable(context.Background(), address)
+		if !answered {
+			t.Fatal("an ssh endpoint that answered its banner must report no evidence of unavailability")
+		}
+		if got := sshEndpointAvailable(canceled, address); got != answered {
+			t.Fatalf("sshEndpointAvailable(canceled caller) = %v, want %v: a probe the caller's cancellation cut short observed nothing", got, answered)
+		}
+	})
+
+	t.Run("git protocol", func(t *testing.T) {
+		t.Parallel()
+		address := accepting(t, func(conn net.Conn) {
+			buf := make([]byte, 128)
+			_, _ = conn.Read(buf)
+			_, _ = conn.Write([]byte("ERR access denied or repository not exported\n"))
+			_ = conn.Close()
+		})
+		answered := gitEndpointAvailable(context.Background(), address, "127.0.0.1")
+		if !answered {
+			t.Fatal("a git:// endpoint that answered the probe request must report no evidence of unavailability")
+		}
+		if got := gitEndpointAvailable(canceled, address, "127.0.0.1"); got != answered {
+			t.Fatalf("gitEndpointAvailable(canceled caller) = %v, want %v: a probe the caller's cancellation cut short observed nothing", got, answered)
+		}
+	})
+}
+
+// TestEndpointProbeYieldsNoEvidenceWhenCallerDeadlineEndsTheHandshake pins
+// the deadline half of the same rule: a handshake the caller's own deadline
+// ended observed nothing, so it is not evidence that the endpoint was
+// unavailable. The endpoint here accepts the connection and stays silent, so
+// the caller's deadline is the only thing that can end the wait.
+func TestEndpointProbeYieldsNoEvidenceWhenCallerDeadlineEndsTheHandshake(t *testing.T) {
+	t.Parallel()
+	address := accepting(t, func(conn net.Conn) {
+		<-time.After(5 * time.Second)
+		_ = conn.Close()
+	})
+	ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
+	defer cancel()
+	if !sshEndpointAvailable(ctx, address) {
+		t.Fatal("a handshake the caller's deadline ended must report no evidence of unavailability")
+	}
+}
+
+// TestEndpointProbeYieldsNoEvidenceWhenCallerCancelsMidHandshake pins the
+// handshake half of the caller's-context rule: the caller's context can end
+// after the connection is established but before the peer answers, and such
+// a probe observed nothing at all — it must not be read as evidence that the
+// endpoint was unavailable.
+func TestEndpointProbeYieldsNoEvidenceWhenCallerCancelsMidHandshake(t *testing.T) {
+	t.Parallel()
+	silent := func(conn net.Conn) {
+		<-time.After(5 * time.Second)
+		_ = conn.Close()
+	}
+
+	t.Run("ssh", func(t *testing.T) {
+		t.Parallel()
+		address := accepting(t, silent)
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		// The connection is established first; the cancellation lands
+		// while the handshake still waits for the peer's first byte.
+		time.AfterFunc(100*time.Millisecond, cancel)
+		if !sshEndpointAvailable(ctx, address) {
+			t.Fatal("a handshake the caller's cancellation cut short must report no evidence of unavailability")
+		}
+	})
+
+	t.Run("git protocol", func(t *testing.T) {
+		t.Parallel()
+		address := accepting(t, silent)
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		time.AfterFunc(100*time.Millisecond, cancel)
+		if !gitEndpointAvailable(ctx, address, "127.0.0.1") {
+			t.Fatal("a git:// handshake the caller's cancellation cut short must report no evidence of unavailability")
+		}
+	})
+}
+
+// TestRemoteBranchHeadKeepsGitVerdictWhenProbeIsCutShort pins the rule that
+// keeps a completed git verdict standing: the endpoint probe must not read
+// the caller's own cancellation as evidence that the endpoint was
+// unavailable.
+//
+// The remote here answers git with a completed non-zero verdict, and the
+// probe's request is cut short by the caller's context ending mid-probe. The
+// probe observed nothing, so the read stays a fail-closed verdict rather
+// than becoming transient availability.
+func TestRemoteBranchHeadKeepsGitVerdictWhenProbeIsCutShort(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// The caller's context ends while the probe is in flight, so
+		// the probe's request fails with the context error and the
+		// probe never observed the endpoint.
+		cancel()
+		select {
+		case <-r.Context().Done():
+		case <-time.After(5 * time.Second):
+		}
+	}))
+	t.Cleanup(server.Close)
+	t.Setenv("PATH", writeFakeGit(t, "#!/bin/sh\ncase \"$1\" in\ncheck-ref-format) exit 0 ;;\nls-remote) exit 128 ;;\n*) exit 1 ;;\nesac\n"))
+	_, _, err := RemoteBranchHead(ctx, server.URL, "main")
+	if err == nil {
+		t.Fatal("expected the remote read to fail")
+	}
+	if forge.IsTransientAvailability(err) {
+		t.Fatalf("a completed git verdict must not be reclassified when the caller's context ends during the probe: %v", err)
+	}
+}
+
+// TestHTTPEndpointProbeDoesNotFollowRedirects pins the probe's shape: it is
+// exactly one request to the endpoint git itself would read, never a
+// redirect chain to another host. A redirect answer proves the endpoint
+// answered, so it classifies available and leaves git's verdict standing.
+func TestHTTPEndpointProbeDoesNotFollowRedirects(t *testing.T) {
+	t.Parallel()
+	var hits, escapeHatches int
+	target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		escapeHatches++
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	t.Cleanup(target.Close)
+	redirector := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits++
+		http.Redirect(w, r, target.URL+"/escape", http.StatusFound)
+	}))
+	t.Cleanup(redirector.Close)
+
+	parsed, err := url.Parse(redirector.URL)
+	if err != nil {
+		t.Fatalf("parse probe URL: %v", err)
+	}
+	if !httpEndpointAvailable(context.Background(), parsed) {
+		t.Fatal("a redirect answer proves the endpoint answered, so the probe must classify it available")
+	}
+	if hits != 1 {
+		t.Fatalf("probe request count = %d, want exactly 1", hits)
+	}
+	if escapeHatches != 0 {
+		t.Fatalf("the probe followed the redirect to another host %d time(s)", escapeHatches)
+	}
+}
+
+// TestRemoteBranchHeadNeverStartedFailsClosed pins the boundary between a
+// failed remote read and a local executor failure: when the git process
+// never started — a missing binary on PATH, for instance — the read carried
+// no transport evidence at all, so it must fail closed to the
+// verifier-rejection ending even when the remote's endpoint is genuinely
+// unreachable, rather than masquerading as forge unavailability.
+//
+// The stand-in git removes itself once the ref has been validated, so the
+// remote read itself cannot start a process: the local executor failed
+// before any remote was contacted.
+func TestRemoteBranchHeadNeverStartedFailsClosed(t *testing.T) {
+	endpoint := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	endpoint.Close()
+	t.Setenv("PATH", writeFakeGit(t, "#!/bin/sh\ncase \"$1\" in\ncheck-ref-format) /bin/rm -f \"$0\" ;;\nesac\nexit 0\n"))
+	_, _, err := RemoteBranchHead(context.Background(), endpoint.URL, "main")
+	if err == nil {
+		t.Fatal("expected the remote read to fail")
+	}
+	var commandErr *CommandError
+	if !errors.As(err, &commandErr) {
+		t.Fatalf("expected a git command error, got %T: %v", err, err)
+	}
+	if commandErr.started {
+		t.Fatalf("the remote read's git process started; the fixture must make it fail before the process starts: %v", err)
+	}
+	if forge.IsTransientAvailability(err) {
+		t.Fatalf("a remote read whose git process never started is a local executor failure, not transient availability: %v", err)
+	}
+}
+
+// TestScpLikeHostExtractsGitScpLikeForms pins the scp-like host extraction
+// behind the ssh probe: git accepts the scp-like ssh form both with and
+// without a user — user@host:path and host:path — so a userless host must
+// still produce the dial target, while anything git itself would not treat
+// as a remote host (a local path, a slash or space before the separator, a
+// bracketed IPv6 literal) yields the empty string and fails closed.
+func TestScpLikeHostExtractsGitScpLikeForms(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		name      string
+		remoteURL string
+		host      string
+	}{
+		{"user at host path", "git@github.com:owner/repo.git", "github.com"},
+		{"userless host path", "github.com:owner/repo.git", "github.com"},
+		{"userless bare host", "host:repo", "host"},
+		{"at in the path is not a user", "host:pa@th", "host"},
+		{"absolute local path", "/tmp/checkout:thing", ""},
+		{"relative local path", "dir/file:thing", ""},
+		{"space in the host", "my host:repo", ""},
+		{"backslash in the host", `dir\file:thing`, ""},
+		{"empty user", "@github.com:repo", ""},
+		{"empty host", "user@:repo", ""},
+		{"bracketed ipv6 literal", "[::1]:repo", ""},
+		{"unbracketed ipv6 literal", "::1:repo", ""},
+		{"ipv6 literal splits as git splits", "user@fe80::1:repo", "fe80"},
+		{"no colon", "github.com/owner/repo.git", ""},
+		{"empty", "", ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			if got := scpLikeHost(tc.remoteURL); got != tc.host {
+				t.Fatalf("scpLikeHost(%q) = %q, want %q", tc.remoteURL, got, tc.host)
+			}
+		})
+	}
+}
+
+// TestRemoteBranchHeadClassifiesSSHEndpointEvidence pins the ssh handshake
+// probe for scheme-carrying ssh remotes: an endpoint the dial cannot complete
+// against, or one that closes the connection before its identification
+// banner, classifies transient availability — the handshake went unobserved;
+// an endpoint that answers keeps git's own fail-closed verdict.
+func TestRemoteBranchHeadClassifiesSSHEndpointEvidence(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+
+	refused := func(t *testing.T) string {
+		t.Helper()
+		listener, err := net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			t.Fatalf("reserve a port: %v", err)
+		}
+		addr := listener.Addr().String()
+		if err := listener.Close(); err != nil {
+			t.Fatalf("release the reserved port: %v", err)
+		}
+		return "ssh://" + addr + "/owner/repo.git"
+	}
+	closing := func(t *testing.T) string {
+		t.Helper()
+		return "ssh://" + accepting(t, func(conn net.Conn) { _ = conn.Close() }) + "/owner/repo.git"
+	}
+	answering := func(t *testing.T) string {
+		t.Helper()
+		return "ssh://" + accepting(t, func(conn net.Conn) {
+			_, _ = conn.Write([]byte("SSH-2.0-probe\r\n"))
+			_ = conn.Close()
+		}) + "/owner/repo.git"
+	}
+
+	t.Run("dial cannot complete", func(t *testing.T) {
+		t.Parallel()
+		_, _, err := RemoteBranchHead(ctx, refused(t), "main")
+		if err == nil {
+			t.Fatal("expected the remote read to fail")
+		}
+		if !forge.IsTransientAvailability(err) {
+			t.Fatalf("an ssh endpoint the dial cannot reach must classify transient: %v", err)
+		}
+	})
+	t.Run("connection lost before an answer", func(t *testing.T) {
+		t.Parallel()
+		_, _, err := RemoteBranchHead(ctx, closing(t), "main")
+		if err == nil {
+			t.Fatal("expected the remote read to fail")
+		}
+		if !forge.IsTransientAvailability(err) {
+			t.Fatalf("an ssh endpoint that closes before its banner must classify transient: %v", err)
+		}
+	})
+	t.Run("endpoint answers", func(t *testing.T) {
+		t.Parallel()
+		_, _, err := RemoteBranchHead(ctx, answering(t), "main")
+		if err == nil {
+			t.Fatal("expected the remote read to fail")
+		}
+		if forge.IsTransientAvailability(err) {
+			t.Fatalf("an ssh endpoint that answered its banner must keep the fail-closed classification: %v", err)
+		}
+	})
+}
+
+// TestRemoteBranchHeadClassifiesGitProtocolEndpointEvidence pins the git://
+// handshake probe: the git protocol makes the client speak first, so a
+// daemon that answers the probe request keeps git's own fail-closed verdict,
+// while one that closes or is unreachable before any answer classifies
+// transient availability.
+func TestRemoteBranchHeadClassifiesGitProtocolEndpointEvidence(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+
+	t.Run("endpoint answers", func(t *testing.T) {
+		t.Parallel()
+		addr := accepting(t, func(conn net.Conn) {
+			buf := make([]byte, 128)
+			_, _ = conn.Read(buf)
+			_, _ = conn.Write([]byte("ERR access denied or repository not exported\n"))
+			_ = conn.Close()
+		})
+		_, _, err := RemoteBranchHead(ctx, "git://"+addr+"/owner/repo.git", "main")
+		if err == nil {
+			t.Fatal("expected the remote read to fail")
+		}
+		if forge.IsTransientAvailability(err) {
+			t.Fatalf("a git:// endpoint that answered the probe request must keep the fail-closed classification: %v", err)
+		}
+	})
+	t.Run("connection lost before an answer", func(t *testing.T) {
+		t.Parallel()
+		addr := accepting(t, func(conn net.Conn) { _ = conn.Close() })
+		_, _, err := RemoteBranchHead(ctx, "git://"+addr+"/owner/repo.git", "main")
+		if err == nil {
+			t.Fatal("expected the remote read to fail")
+		}
+		if !forge.IsTransientAvailability(err) {
+			t.Fatalf("a git:// endpoint that closes before answering must classify transient: %v", err)
+		}
+	})
+}
+
+// accepting serves one-shot TCP connections on an ephemeral loopback
+// listener, handling each accepted connection with handle, and returns the
+// listener's address.
+func accepting(t *testing.T, handle func(net.Conn)) string {
+	t.Helper()
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	t.Cleanup(func() { _ = listener.Close() })
+	go func() {
+		for {
+			conn, err := listener.Accept()
+			if err != nil {
+				return
+			}
+			handle(conn)
+		}
+	}()
+	return listener.Addr().String()
 }

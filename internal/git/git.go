@@ -291,10 +291,20 @@ type Brief struct {
 
 // CommandError preserves git's stderr and exit code for callers that need to
 // distinguish a missing ref from an actual command failure.
+//
+// A command error carries no availability marker of its own: the transient
+// classification belongs to the remote-publication read alone, so a failed
+// local git command — a workspace head read, a merge, a status — can never
+// be mistaken for evidence about a forge.
 type CommandError struct {
 	Args   []string
 	Err    error
 	Stderr string
+	// started records whether the git process started. A process that
+	// never started failed inside the local executor — a missing or
+	// non-executable git binary, for instance — which is evidence about
+	// this machine's configuration, never about the remote.
+	started bool
 }
 
 func (e *CommandError) Error() string {
@@ -315,6 +325,22 @@ func (e *CommandError) ExitCode() int {
 	return exitErr.ExitCode()
 }
 
+// cutShort reports whether the command's process started but produced no
+// verdict of its own: it was killed by a signal, by its deadline, or by its
+// cancellation before git answered, so the world the command meant to
+// observe was never observed. A process that never started is a local
+// executor failure and is never cut short.
+func (e *CommandError) cutShort() bool {
+	if !e.started {
+		return false
+	}
+	var exitErr *exec.ExitError
+	if !errors.As(e.Err, &exitErr) {
+		return true
+	}
+	return exitErr.ExitCode() == -1
+}
+
 func run(ctx context.Context, directory string, args ...string) ([]byte, error) {
 	cmd := exec.CommandContext(ctx, "git", args...)
 	if directory != "" {
@@ -323,8 +349,14 @@ func run(ctx context.Context, directory string, args ...string) ([]byte, error) 
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
-	if err := cmd.Run(); err != nil {
+	// Start and Wait are separated so a start failure — the local executor
+	// could not launch git at all — is distinguishable from a process that
+	// ran and was killed, which carry different availability evidence.
+	if err := cmd.Start(); err != nil {
 		return nil, &CommandError{Args: append([]string(nil), args...), Err: err, Stderr: strings.TrimSpace(stderr.String())}
+	}
+	if err := cmd.Wait(); err != nil {
+		return nil, &CommandError{Args: append([]string(nil), args...), Err: err, Stderr: strings.TrimSpace(stderr.String()), started: true}
 	}
 	return stdout.Bytes(), nil
 }
@@ -349,6 +381,12 @@ func Clone(ctx context.Context, remoteURL, destination string) error {
 // without requiring a local clone. An absent branch returns an empty sha and
 // false; a failed read is an error, never a guess about what the remote holds.
 // Deciding what the advertised commit means for a run is the caller's job.
+//
+// This is the boundary the transient-availability marker lives at, and it
+// lives here alone: a remote read that left the remote unobserved is
+// transport evidence, while a read of the local workspace — or any other
+// local git command — is evidence about this machine and never classifies as
+// forge unavailability.
 func RemoteBranchHead(ctx context.Context, remoteURL, branch string) (string, bool, error) {
 	if strings.TrimSpace(remoteURL) == "" {
 		return "", false, errors.New("remote URL is required")
@@ -358,6 +396,29 @@ func RemoteBranchHead(ctx context.Context, remoteURL, branch string) (string, bo
 	}
 	out, err := run(ctx, "", "ls-remote", "--heads", "--", remoteURL, "refs/heads/"+branch)
 	if err != nil {
+		// The marker is decided here, at the remote-read boundary, and
+		// only here. A git process that never started failed inside the
+		// local executor and carries no transport evidence at all, so it
+		// fails closed without probing the endpoint. A process that
+		// started and was cut short before git answered left the remote
+		// unobserved, which is transport evidence on its own. A process
+		// that ran and failed is classified by the remote's own network
+		// endpoint, never by git's stderr text: an endpoint that cannot
+		// be reached, closes or stalls before answering, or answers
+		// 429/5xx kept the read from observing the world, while an
+		// endpoint that answered — and a probe the caller's own
+		// cancellation cut short, which yields no evidence — leaves
+		// git's verdict standing. A remote with no probeable network
+		// endpoint (a local path, an unknown scheme) fails closed too.
+		var commandErr *CommandError
+		if errors.As(err, &commandErr) {
+			switch {
+			case commandErr.cutShort():
+				err = &remoteUnavailableError{err: commandErr}
+			case commandErr.started && !remoteEndpointAvailable(ctx, remoteURL):
+				err = &remoteUnavailableError{err: commandErr}
+			}
+		}
 		return "", false, err
 	}
 	trimmed := strings.TrimSpace(string(out))
