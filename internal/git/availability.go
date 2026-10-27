@@ -2,11 +2,13 @@ package git
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net"
 	"net/http"
 	"net/url"
+	"os"
 	"os/exec"
 	"strconv"
 	"strings"
@@ -72,9 +74,11 @@ const remoteProbeTimeout = 5 * time.Second
 // for git:// — so an endpoint that answers proves it was reached, while one
 // that closes or stalls before answering left the handshake unobserved.
 // For ssh remotes the address dialed is not the literal URL host: git hands
-// the destination to ssh, which applies the user's ssh configuration — a
-// HostName rewrite, a Port — before connecting, so the probe resolves the
-// effective endpoint the same way (see sshEffectiveAddress) and dials that.
+// the destination to ssh — the command its environment and configuration
+// select, the same one the probe resolves through (see sshProbeCommand) —
+// which applies the user's ssh configuration — a HostName rewrite, a Port —
+// before connecting, so the probe resolves the effective endpoint the same
+// way (see sshEffectiveAddress) and dials that.
 // An ssh remote whose effective endpoint cannot be resolved yields no
 // evidence rather than a probe of an endpoint ssh would never dial.
 func remoteEndpointAvailable(ctx context.Context, remoteURL string) bool {
@@ -177,18 +181,23 @@ func sshRemoteAvailable(ctx context.Context, target, urlPort string) bool {
 const sshConfigOutputLimit = 1 << 16
 
 // sshEffectiveAddress resolves the host:port git itself would dial for an
-// ssh remote: `ssh -G` prints the destination's effective configuration
-// after the user's ssh configuration — HostName rewrites, Port, and Match
-// blocks — is applied, without connecting. An explicit URL port is passed
-// with -p because git passes it to ssh, where it overrides the
-// configuration's Port.
+// ssh remote: the probe asks the same ssh command git would invoke (see
+// sshProbeCommand), and `ssh -G` prints the destination's effective
+// configuration after the user's ssh configuration — HostName rewrites,
+// Port, and Match blocks — is applied, without connecting. An explicit URL
+// port is passed with -p after the command's own options because git passes
+// it to ssh after the same options: both processes hand the user's options
+// the same precedence position, so where they overlap — a -p in
+// GIT_SSH_COMMAND, say — ssh's own option precedence resolves the conflict
+// identically for both, and the configuration's Port is overridden alike.
 //
 // The answer is false — no endpoint, so the caller yields no evidence —
-// when ssh cannot start at all, exits non-zero on an unreadable or invalid
-// configuration, produces output past the probe's cap or without a usable
-// hostname and port, or the caller's context ends before ssh answers. The
-// probe never guesses an endpoint: what ssh resolves to is the only address
-// it will dial.
+// when the ssh command cannot start at all, exits non-zero on an unreadable
+// or invalid configuration, reports an effective connection routed through
+// a proxy or jump host the probe cannot mirror, produces output past the
+// probe's cap or without a usable hostname and port, or the caller's
+// context ends before ssh answers. The probe never guesses an endpoint:
+// what the resolved ssh command reports is the only address it will dial.
 func sshEffectiveAddress(ctx context.Context, target, urlPort string) (string, bool) {
 	// A destination starting with "-" would reach ssh as an option rather
 	// than a host, and a non-numeric URL port is not something git could
@@ -197,7 +206,12 @@ func sshEffectiveAddress(ctx context.Context, target, urlPort string) (string, b
 	if target == "" || strings.HasPrefix(target, "-") {
 		return "", false
 	}
-	args := []string{"-G"}
+	binary, preArgs, ok := sshProbeCommand(ctx)
+	if !ok {
+		return "", false
+	}
+	args := append([]string(nil), preArgs...)
+	args = append(args, "-G")
 	if urlPort != "" {
 		port, err := strconv.Atoi(urlPort)
 		if err != nil || port < 1 || port > 65535 {
@@ -208,7 +222,7 @@ func sshEffectiveAddress(ctx context.Context, target, urlPort string) (string, b
 	args = append(args, target)
 	ctx, cancel := context.WithTimeout(ctx, remoteProbeTimeout)
 	defer cancel()
-	cmd := exec.CommandContext(ctx, "ssh", args...)
+	cmd := exec.CommandContext(ctx, binary, args...)
 	var stdout boundedBuffer
 	stdout.limit = sshConfigOutputLimit
 	cmd.Stdout = &stdout
@@ -218,12 +232,157 @@ func sshEffectiveAddress(ctx context.Context, target, urlPort string) (string, b
 	return sshEffectiveEndpoint(stdout.Bytes())
 }
 
+// sshProbeCommand resolves the ssh command the probe must invoke so it reads
+// the configuration of the ssh process git itself would run: git honors
+// GIT_SSH_COMMAND, core.sshCommand, GIT_SSH, and plain ssh, in that order of
+// precedence, and a probe of a different ssh command could resolve an
+// endpoint that process would never dial. The read runs outside any
+// repository — the remote-publication read passes no directory — so
+// core.sshCommand is read from git's system and global configuration alone,
+// exactly the scopes that read would apply.
+//
+// A shell-command value — GIT_SSH_COMMAND or core.sshCommand, which git runs
+// through the shell — is resolved as the shell resolves it for word
+// splitting only: quoted segments group their characters into one token,
+// adjacent quoted and unquoted parts concatenate, and the first token is the
+// binary. A value that relies on any other shell feature — command
+// substitution, expansion, control operators, a metacharacter or a command
+// separator outside quotes — or that resolves to no first token at all,
+// answers false, because the probe cannot faithfully emulate it and would
+// rather yield no evidence than resolve an endpoint that command line would
+// never dial; a value git itself could not run dials nothing, so no evidence
+// is the truthful answer there too. The same doubt governs a first token
+// starting with "-": neither can name an ssh binary whose configuration the
+// probe could read. GIT_SSH is taken as one literal path — git exec's it
+// directly, never through a shell, so no splitting happens and the value is
+// not trimmed — and a value that is present but blank is not a path git
+// could exec, so it answers false rather than falling through to plain ssh.
+// The answer is false whenever the environment names a command the probe
+// cannot mirror; the "ssh" fallback is the case where git itself would run
+// plain ssh. An unreadable git configuration (git itself failing on the
+// core.sshCommand lookup with anything but "key unset") is also no endpoint:
+// the probe cannot rule out a command it could not read.
+func sshProbeCommand(ctx context.Context) (string, []string, bool) {
+	if value, ok := os.LookupEnv("GIT_SSH_COMMAND"); ok {
+		return sshCommandLine(ctx, value)
+	}
+	value, err := gitConfigSSHCommand(ctx)
+	if err != nil {
+		return "", nil, false
+	}
+	if value != "" {
+		return sshCommandLine(ctx, value)
+	}
+	if path, ok := os.LookupEnv("GIT_SSH"); ok {
+		if path == "" || strings.HasPrefix(path, "-") {
+			return "", nil, false
+		}
+		return path, nil, true
+	}
+	return "ssh", nil, true
+}
+
+// sshCommandLine resolves one shell-command-line ssh selection (a
+// GIT_SSH_COMMAND or core.sshCommand value) into the binary and leading
+// arguments the probe must invoke. The answer is false for a line the shell
+// would run as more than one command, as expansion, or as no command at all:
+// the probe mirrors word splitting and nothing else.
+func sshCommandLine(ctx context.Context, command string) (string, []string, bool) {
+	tokens, ok := splitShellTokens(command)
+	if !ok || len(tokens) == 0 || strings.HasPrefix(tokens[0], "-") {
+		return "", nil, false
+	}
+	return tokens[0], append([]string(nil), tokens[1:]...), true
+}
+
+// gitConfigSSHCommand reads core.sshCommand from git's system and global
+// configuration the way a remote read with no repository would see it. An
+// empty answer with a nil error means the key is unset; any other failure is
+// an error the caller fails closed on.
+func gitConfigSSHCommand(ctx context.Context) (string, error) {
+	ctx, cancel := context.WithTimeout(ctx, remoteProbeTimeout)
+	defer cancel()
+	out, err := exec.CommandContext(ctx, "git", "config", "--get", "core.sshCommand").Output()
+	if err != nil {
+		var exitErr *exec.ExitError
+		if errors.As(err, &exitErr) && exitErr.ExitCode() == 1 {
+			return "", nil
+		}
+		return "", err
+	}
+	return strings.TrimSpace(string(out)), nil
+}
+
+// splitShellTokens splits a shell command line into tokens the way a shell's
+// word splitting does and no further: unquoted blanks (space and tab)
+// separate tokens, single- and double-quoted segments group their characters
+// — including whitespace — into the current token, and adjacent parts
+// concatenate. A shell metacharacter outside quotes — a control operator, a
+// command separator (a newline), an expansion — an unterminated quote, or an
+// expansion metacharacter inside double quotes makes the line unemulatable,
+// and the answer is false: the probe never executes a shell, so a line whose
+// meaning depends on one must resolve nothing rather than something else.
+// Inside single quotes every character is literal; inside double quotes a
+// shell would still expand parameters and commands, so those metacharacters
+// fail closed there too.
+func splitShellTokens(command string) ([]string, bool) {
+	var tokens []string
+	var token strings.Builder
+	quoted := byte(0)
+	started := false
+	for i := 0; i < len(command); i++ {
+		c := command[i]
+		switch {
+		case quoted != 0:
+			if c == quoted {
+				quoted = 0
+				continue
+			}
+			if quoted == '"' && strings.IndexByte("$`\\", c) >= 0 {
+				return nil, false
+			}
+			token.WriteByte(c)
+		case c == '\'' || c == '"':
+			quoted = c
+			started = true
+		case c == ' ' || c == '\t':
+			if started {
+				tokens = append(tokens, token.String())
+				token.Reset()
+				started = false
+			}
+		case strings.IndexByte("$|&;<>()*?[]{}~\\#`\n\r", c) >= 0:
+			return nil, false
+		default:
+			token.WriteByte(c)
+			started = true
+		}
+	}
+	if quoted != 0 {
+		return nil, false
+	}
+	if started {
+		tokens = append(tokens, token.String())
+	}
+	return tokens, true
+}
+
 // sshEffectiveEndpoint reads the hostname and port out of `ssh -G` output.
 // The first value for each keyword wins, as ssh_config's first-obtained
-// value does; a missing or unusable value means no effective endpoint.
+// value does; a missing or unusable value means no effective endpoint. A
+// configured proxy — a proxycommand or proxyjump line with a value — means
+// no endpoint either: ssh's real connection is routed through the proxy or
+// jump host, so a direct dial to the resolved host and port would observe a
+// network path ssh never takes, and `ssh -G` prints those lines only when
+// they are set.
 func sshEffectiveEndpoint(out []byte) (string, bool) {
 	host, port := "", ""
 	for _, line := range strings.Split(string(out), "\n") {
+		for _, proxy := range []string{"proxycommand", "proxyjump"} {
+			if value, found := strings.CutPrefix(line, proxy+" "); found && strings.TrimRight(value, " \t\r") != "" {
+				return "", false
+			}
+		}
 		if host == "" {
 			if value, found := strings.CutPrefix(line, "hostname "); found {
 				host = strings.TrimRight(value, " \t\r")

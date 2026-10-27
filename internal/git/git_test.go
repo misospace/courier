@@ -42,6 +42,17 @@ func TestMain(m *testing.M) {
 			panic(err)
 		}
 	}
+	// The ssh probe resolves through the ssh command the environment and
+	// git's configuration select, so a developer's own GIT_SSH_COMMAND,
+	// GIT_SSH, or core.sshCommand must not redirect it under test; the tests
+	// that exercise that selection set it themselves. Unset, not empty: git
+	// runs a present-but-blank value as the command itself, and the probe
+	// must see the environment git would see.
+	for _, key := range []string{"GIT_SSH_COMMAND", "GIT_SSH"} {
+		if err := os.Unsetenv(key); err != nil {
+			panic(err)
+		}
+	}
 	code := m.Run()
 	_ = os.RemoveAll(home)
 	os.Exit(code)
@@ -1736,8 +1747,8 @@ func TestSSHEffectiveAddressAsksSSHForTheGitDestination(t *testing.T) {
 		t.Helper()
 		argsFile := filepath.Join(t.TempDir(), "args")
 		t.Setenv("COURIER_SSH_STUB_ARGS", argsFile)
-		t.Setenv("PATH", writeFakeSSH(t, fmt.Sprintf(`printf '%%s\n' "$@" > "$COURIER_SSH_STUB_ARGS"
-%s`, output)))
+		t.Setenv("PATH", withGit(t, writeFakeSSH(t, fmt.Sprintf(`printf '%%s\n' "$@" > "$COURIER_SSH_STUB_ARGS"
+%s`, output))))
 		return argsFile
 	}
 
@@ -1783,6 +1794,329 @@ func TestSSHEffectiveAddressAsksSSHForTheGitDestination(t *testing.T) {
 			t.Fatal("a port outside the TCP range is not an effective endpoint")
 		}
 	})
+}
+
+// stubSSHBinary installs an executable stand-in with the given binary name
+// (a name with separators creates the directories beneath the returned one)
+// that records its arguments and prints a fixed `ssh -G` answer, returning
+// the directory holding it and the file the arguments land in. PATH is set
+// to the stand-in directory plus the real git binary's: the probe resolves
+// core.sshCommand through git itself, so the stubbed environment must leave
+// git resolvable exactly as production does.
+func stubSSHBinary(t *testing.T, name, output string) (string, string) {
+	t.Helper()
+	argsFile := filepath.Join(t.TempDir(), "args")
+	t.Setenv("COURIER_SSH_STUB_ARGS", argsFile)
+	directory := t.TempDir()
+	executable := filepath.Join(directory, name)
+	if parent := filepath.Dir(executable); parent != directory {
+		if err := os.MkdirAll(parent, 0o700); err != nil {
+			t.Fatalf("create fake binary directory: %v", err)
+		}
+	}
+	script := fmt.Sprintf("printf '%%s\\n' \"$@\" > \"$COURIER_SSH_STUB_ARGS\"\n%s", output)
+	if err := os.WriteFile(executable, []byte("#!/bin/sh\n"+script), 0o700); err != nil {
+		t.Fatalf("write fake %s: %v", name, err)
+	}
+	t.Setenv("PATH", withGit(t, directory))
+	return directory, argsFile
+}
+
+// withGit prepends the directory holding the real git binary to a PATH
+// value, so a test that replaces PATH with a stub directory still resolves
+// git the way production does.
+func withGit(t *testing.T, directory string) string {
+	t.Helper()
+	gitPath, err := exec.LookPath("git")
+	if err != nil {
+		return directory
+	}
+	return directory + string(os.PathListSeparator) + filepath.Dir(gitPath)
+}
+
+// readStubArgs reads the arguments a stubSSHBinary stand-in recorded.
+func readStubArgs(t *testing.T, argsFile string) []string {
+	t.Helper()
+	data, err := os.ReadFile(argsFile)
+	if err != nil {
+		t.Fatalf("read ssh stub args: %v", err)
+	}
+	return strings.Split(strings.TrimRight(string(data), "\n"), "\n")
+}
+
+// TestSSHEffectiveAddressResolvesThroughTheSSHCommandGitInvokes pins the
+// probe's runtime dependency on git's own ssh selection: the git process
+// inherits the environment, so it may invoke a different ssh binary or extra
+// options through GIT_SSH_COMMAND or GIT_SSH, and a probe that resolved
+// through plain ssh could dial an endpoint that particular git process would
+// never dial — the wrong-target class of error #584 removed from the URL,
+// arriving here through the environment instead.
+func TestSSHEffectiveAddressResolvesThroughTheSSHCommandGitInvokes(t *testing.T) {
+	ctx := context.Background()
+	const answer = "echo \"hostname forge.internal\"\necho \"port 2222\"\n"
+	target := "git@forge584.invalid"
+
+	t.Run("a plain GIT_SSH_COMMAND resolves through its first token", func(t *testing.T) {
+		_, argsFile := stubSSHBinary(t, "custom-ssh", answer)
+		t.Setenv("GIT_SSH_COMMAND", "custom-ssh")
+		endpoint, ok := sshEffectiveAddress(ctx, target, "")
+		if !ok {
+			t.Fatal("GIT_SSH_COMMAND's binary must resolve the effective endpoint")
+		}
+		if endpoint != "forge.internal:2222" {
+			t.Fatalf("sshEffectiveAddress = %q, want %q", endpoint, "forge.internal:2222")
+		}
+		if args := readStubArgs(t, argsFile); !slices.Equal(args, []string{"-G", target}) {
+			t.Fatalf("the resolved command received %q, want [\"-G\" %q]", args, target)
+		}
+	})
+	t.Run("the command's own options pass through and the url port lands after them", func(t *testing.T) {
+		_, argsFile := stubSSHBinary(t, "custom-ssh", answer)
+		t.Setenv("GIT_SSH_COMMAND", "custom-ssh -o Port=1111 -F /etc/alt/config")
+		if _, ok := sshEffectiveAddress(ctx, target, "2222"); !ok {
+			t.Fatal("the command's options must not stop the resolution")
+		}
+		// Git places its own -p after the GIT_SSH_COMMAND options — the same
+		// position in both processes — so ssh's own option precedence
+		// resolves any overlap identically for git and the probe.
+		want := []string{"-o", "Port=1111", "-F", "/etc/alt/config", "-G", "-p", "2222", target}
+		if args := readStubArgs(t, argsFile); !slices.Equal(args, want) {
+			t.Fatalf("the resolved command received %q, want %q", args, want)
+		}
+	})
+	t.Run("GIT_SSH is exec'd directly as one path, whitespace and all", func(t *testing.T) {
+		directory, argsFile := stubSSHBinary(t, "alt ssh", answer)
+		t.Setenv("GIT_SSH", filepath.Join(directory, "alt ssh"))
+		endpoint, ok := sshEffectiveAddress(ctx, target, "")
+		if !ok {
+			t.Fatal("GIT_SSH's path must resolve the effective endpoint")
+		}
+		if endpoint != "forge.internal:2222" {
+			t.Fatalf("sshEffectiveAddress = %q, want %q", endpoint, "forge.internal:2222")
+		}
+		if args := readStubArgs(t, argsFile); !slices.Equal(args, []string{"-G", target}) {
+			t.Fatalf("GIT_SSH was split like a shell command line: %q", args)
+		}
+	})
+	t.Run("GIT_SSH_COMMAND wins over GIT_SSH as git's own precedence does", func(t *testing.T) {
+		directory, _ := stubSSHBinary(t, "custom-ssh", answer)
+		t.Setenv("GIT_SSH_COMMAND", "custom-ssh")
+		t.Setenv("GIT_SSH", filepath.Join(directory, "never-invoked"))
+		if _, ok := sshEffectiveAddress(ctx, target, ""); !ok {
+			t.Fatal("GIT_SSH_COMMAND must take precedence over GIT_SSH")
+		}
+	})
+	t.Run("quoted segments group their characters into one token", func(t *testing.T) {
+		directory, argsFile := stubSSHBinary(t, filepath.Join("my ssh", "ssh"), answer)
+		t.Setenv("GIT_SSH_COMMAND", fmt.Sprintf("%q -o %q", filepath.Join(directory, "my ssh", "ssh"), "Port=1111"))
+		if _, ok := sshEffectiveAddress(ctx, target, ""); !ok {
+			t.Fatal("a quoted binary path must resolve the effective endpoint")
+		}
+		want := []string{"-o", "Port=1111", "-G", target}
+		if args := readStubArgs(t, argsFile); !slices.Equal(args, want) {
+			t.Fatalf("the resolved command received %q, want %q", args, want)
+		}
+	})
+}
+
+// TestSSHProbeCommandYieldsNothingItCannotFaithfullyEmulate pins the
+// fail-closed half of the environment selection: git runs GIT_SSH_COMMAND
+// through the shell, and a line whose meaning depends on shell features the
+// probe does not execute — substitution, expansion, control operators —
+// must resolve no endpoint and run nothing, never an approximation of
+// itself.
+func TestSSHProbeCommandYieldsNothingItCannotFaithfullyEmulate(t *testing.T) {
+	ctx := context.Background()
+	target := "git@forge584.invalid"
+
+	t.Run("a command substitution resolves nothing and executes nothing", func(t *testing.T) {
+		sentinel := filepath.Join(t.TempDir(), "sentinel")
+		_, _ = stubSSHBinary(t, "ssh", "touch \"$COURIER_PROBE_SENTINEL\"\n")
+		t.Setenv("COURIER_PROBE_SENTINEL", sentinel)
+		t.Setenv("GIT_SSH_COMMAND", "ssh $(touch "+sentinel+")")
+		if _, ok := sshEffectiveAddress(ctx, target, ""); ok {
+			t.Fatal("a command line the shell would expand resolves no endpoint")
+		}
+		if _, err := os.Lstat(sentinel); !os.IsNotExist(err) {
+			t.Fatal("an unemulatable GIT_SSH_COMMAND must never execute, not even once")
+		}
+	})
+	t.Run("an unquoted control operator resolves nothing", func(t *testing.T) {
+		t.Setenv("PATH", t.TempDir())
+		t.Setenv("GIT_SSH_COMMAND", "ssh forge584.invalid; touch /tmp/pwned")
+		if _, ok := sshEffectiveAddress(ctx, target, ""); ok {
+			t.Fatal("a command line with a control operator resolves no endpoint")
+		}
+	})
+	t.Run("a first token starting with a dash resolves nothing", func(t *testing.T) {
+		t.Setenv("PATH", t.TempDir())
+		t.Setenv("GIT_SSH_COMMAND", "-oProxyCommand=touch-pwned")
+		if _, ok := sshEffectiveAddress(ctx, target, ""); ok {
+			t.Fatal("a first token that would reach the shell as an option resolves no endpoint")
+		}
+	})
+	t.Run("a GIT_SSH starting with a dash resolves nothing", func(t *testing.T) {
+		t.Setenv("PATH", t.TempDir())
+		t.Setenv("GIT_SSH", "-oProxyCommand=touch-pwned")
+		if _, ok := sshEffectiveAddress(ctx, target, ""); ok {
+			t.Fatal("GIT_SSH is a path, and a path that reaches exec as an option resolves no endpoint")
+		}
+	})
+	t.Run("an unterminated quote resolves nothing", func(t *testing.T) {
+		t.Setenv("PATH", t.TempDir())
+		t.Setenv("GIT_SSH_COMMAND", "\"ssh")
+		if _, ok := sshEffectiveAddress(ctx, target, ""); ok {
+			t.Fatal("a command line whose quoting never closes resolves no endpoint")
+		}
+	})
+	t.Run("a set-but-blank GIT_SSH_COMMAND resolves nothing", func(t *testing.T) {
+		t.Setenv("PATH", t.TempDir())
+		t.Setenv("GIT_SSH_COMMAND", "")
+		if _, ok := sshEffectiveAddress(ctx, target, ""); ok {
+			t.Fatal("git runs a blank GIT_SSH_COMMAND as the command itself and dials nothing: the probe must yield no evidence")
+		}
+	})
+	t.Run("a set-but-blank GIT_SSH resolves nothing", func(t *testing.T) {
+		t.Setenv("PATH", t.TempDir())
+		t.Setenv("GIT_SSH", "")
+		if _, ok := sshEffectiveAddress(ctx, target, ""); ok {
+			t.Fatal("a blank GIT_SSH is not a path git could exec: the probe must yield no evidence")
+		}
+	})
+	t.Run("a command separator resolves nothing", func(t *testing.T) {
+		t.Setenv("PATH", t.TempDir())
+		t.Setenv("GIT_SSH_COMMAND", "ssh\ngit@forge584.invalid")
+		if _, ok := sshEffectiveAddress(ctx, target, ""); ok {
+			t.Fatal("a newline makes the line two commands, not one; the probe resolves no endpoint for it")
+		}
+	})
+}
+
+// useCoreSSHCommand sets core.sshCommand in the isolated global
+// configuration TestMain pins (GIT_CONFIG_GLOBAL) and removes it when the
+// test finishes, so a later test never inherits it.
+func useCoreSSHCommand(t *testing.T, command string) {
+	t.Helper()
+	git(t, "", "config", "--global", "core.sshCommand", command)
+	t.Cleanup(func() { git(t, "", "config", "--global", "--unset", "core.sshCommand") })
+}
+
+// TestSSHProbeCommandResolvesCoreSSHCommand pins the configuration half of
+// git's ssh selection: core.sshCommand ranks between GIT_SSH_COMMAND and
+// GIT_SSH, and the remote-publication read runs outside any repository, so
+// the probe reads it from the same system and global scopes that read
+// applies.
+func TestSSHProbeCommandResolvesCoreSSHCommand(t *testing.T) {
+	ctx := context.Background()
+	const answer = "echo \"hostname forge.internal\"\necho \"port 2222\"\n"
+	target := "git@forge584.invalid"
+
+	t.Run("core.sshCommand is the resolution when the variables are unset", func(t *testing.T) {
+		_, argsFile := stubSSHBinary(t, "configured-ssh", answer)
+		useCoreSSHCommand(t, "configured-ssh -o Port=1111")
+		if _, ok := sshEffectiveAddress(ctx, target, ""); !ok {
+			t.Fatal("core.sshCommand must resolve the effective endpoint when no variable is set")
+		}
+		want := []string{"-o", "Port=1111", "-G", target}
+		if args := readStubArgs(t, argsFile); !slices.Equal(args, want) {
+			t.Fatalf("the resolved command received %q, want %q", args, want)
+		}
+	})
+	t.Run("GIT_SSH_COMMAND wins over core.sshCommand as git's precedence does", func(t *testing.T) {
+		_, argsFile := stubSSHBinary(t, "custom-ssh", answer)
+		useCoreSSHCommand(t, "never-invoked")
+		t.Setenv("GIT_SSH_COMMAND", "custom-ssh")
+		if _, ok := sshEffectiveAddress(ctx, target, ""); !ok {
+			t.Fatal("GIT_SSH_COMMAND must take precedence over core.sshCommand")
+		}
+		if args := readStubArgs(t, argsFile); !slices.Equal(args, []string{"-G", target}) {
+			t.Fatalf("GIT_SSH_COMMAND did not drive the resolution: %q", args)
+		}
+	})
+	t.Run("core.sshCommand wins over GIT_SSH as git's precedence does", func(t *testing.T) {
+		directory, _ := stubSSHBinary(t, "configured-ssh", answer)
+		useCoreSSHCommand(t, "configured-ssh")
+		t.Setenv("GIT_SSH", filepath.Join(directory, "never-invoked"))
+		if _, ok := sshEffectiveAddress(ctx, target, ""); !ok {
+			t.Fatal("core.sshCommand must take precedence over GIT_SSH")
+		}
+	})
+}
+
+// TestSSHEffectiveEndpointYieldsNoEndpointBehindAProxy pins the fail-closed
+// proxy rule: a proxycommand or proxyjump routes ssh's connection through
+// another host, so the resolved host and port is not the network path ssh's
+// traffic actually traverses, and a direct dial of it is not evidence about
+// the remote. `ssh -G` prints those lines only when they are set, so their
+// absence never disturbs the plain resolution.
+func TestSSHEffectiveEndpointYieldsNoEndpointBehindAProxy(t *testing.T) {
+	ctx := context.Background()
+	target := "git@forge584.invalid"
+	for name, output := range map[string]string{
+		"a proxycommand": "echo \"hostname forge.internal\"\necho \"port 2222\"\necho \"proxycommand nc %h %p\"\n",
+		"a proxyjump":    "echo \"hostname forge.internal\"\necho \"port 2222\"\necho \"proxyjump jump584.invalid\"\n",
+	} {
+		t.Run(name, func(t *testing.T) {
+			stubSSHBinary(t, "ssh", output)
+			if _, ok := sshEffectiveAddress(ctx, target, ""); ok {
+				t.Fatal("a proxied connection must resolve no endpoint")
+			}
+		})
+	}
+	t.Run("an unset proxy keeps the resolution", func(t *testing.T) {
+		stubSSHBinary(t, "ssh", "echo \"hostname forge.internal\"\necho \"port 2222\"\necho \"proxyusecommand no\"\n")
+		if _, ok := sshEffectiveAddress(ctx, target, ""); !ok {
+			t.Fatal("a dump without a proxy configuration must resolve normally")
+		}
+	})
+}
+
+// TestSplitShellTokens pins the tokenizer the ssh-command selection rests
+// on: it must reproduce a shell's word splitting exactly as far as it goes
+// and refuse everything beyond it.
+func TestSplitShellTokens(t *testing.T) {
+	for name, tc := range map[string]struct {
+		command string
+		tokens  []string
+		ok      bool
+	}{
+		"a plain command":                {command: "ssh", tokens: []string{"ssh"}, ok: true},
+		"blank-separated options":        {command: "ssh -o Port=2222", tokens: []string{"ssh", "-o", "Port=2222"}, ok: true},
+		"surrounding blanks":             {command: "  ssh\t-x  ", tokens: []string{"ssh", "-x"}, ok: true},
+		"quoted whitespace":              {command: `"/usr/bin/my ssh" -o "Port=2222"`, tokens: []string{"/usr/bin/my ssh", "-o", "Port=2222"}, ok: true},
+		"single quotes are literal":      {command: `ssh '$HOME'`, tokens: []string{"ssh", "$HOME"}, ok: true},
+		"adjacent parts concatenate":     {command: `"/usr/"local ssh`, tokens: []string{"/usr/local", "ssh"}, ok: true},
+		"an empty value has no tokens":   {command: "", tokens: nil, ok: true},
+		"a blank value has no tokens":    {command: "  \t ", tokens: nil, ok: true},
+		"a newline is a separator":       {command: "ssh\nfoo", ok: false},
+		"a carriage return is refused":   {command: "ssh\rfoo", ok: false},
+		"command substitution":           {command: "ssh $(x)", ok: false},
+		"parameter expansion":            {command: "ssh $HOME", ok: false},
+		"backtick substitution":          {command: "ssh `x`", ok: false},
+		"backslash":                      {command: `ssh \x`, ok: false},
+		"control operator":               {command: "ssh a && ssh b", ok: false},
+		"semicolon":                      {command: "ssh a;b", ok: false},
+		"redirection":                    {command: "ssh a >b", ok: false},
+		"pipe":                           {command: "ssh a | b", ok: false},
+		"subshell":                       {command: "(ssh)", ok: false},
+		"a glob":                         {command: "ssh *", ok: false},
+		"a tilde":                        {command: "ssh ~", ok: false},
+		"a comment character":            {command: "ssh #x", ok: false},
+		"unterminated double quote":      {command: `"ssh`, ok: false},
+		"unterminated single quote":      {command: "'ssh", ok: false},
+		"expansion inside double quotes": {command: `ssh "$HOME"`, ok: false},
+		"backslash inside double quotes": {command: `"a\ b"`, ok: false},
+	} {
+		t.Run(name, func(t *testing.T) {
+			tokens, ok := splitShellTokens(tc.command)
+			if ok != tc.ok {
+				t.Fatalf("splitShellTokens(%q) ok = %v, want %v", tc.command, ok, tc.ok)
+			}
+			if !slices.Equal(tokens, tc.tokens) {
+				t.Fatalf("splitShellTokens(%q) = %q, want %q", tc.command, tokens, tc.tokens)
+			}
+		})
+	}
 }
 
 // TestRemoteEndpointAvailableDialsTheResolvedEndpoint pins the regression
