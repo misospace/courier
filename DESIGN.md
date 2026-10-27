@@ -1368,16 +1368,21 @@ confirmed structured exhaustion is `capacity-exhaustion`. A model provider
 that never served an attempt — no session id was ever produced — is
 `provider-unavailable`. A model/agent child process that kept exiting
 non-zero until its repair budget was spent is `model-transport-error` — a
-local execution-process failure, never a provider outage. A forge **API** read
-that could not complete on a transient availability condition — a rate limit,
+local execution-process failure, never a provider outage. A forge read that could not complete on a transient availability condition — a rate limit,
 a server error, or a transport failure — is `forge-unavailable`: the world
 was never observed, so the run ends as a `blocked_external` declaration on
 the recovery channel, never as a `verifier-rejection`, which stays reserved
 for worlds the observation actually read and found contradictory. The
-git-side remote-publication read behind the same observation is not classified
-that way yet: the git transport cannot yet tell an unreachable remote from a
-command that ran and failed, so its failures stay a fail-closed
-`verifier-rejection`. Only the exact pairing — a declared `blocked_external`
+git-side remote-publication read behind the same observation is classified
+by evidence, never by git's stderr text: a git process that never ran to
+completion — it did not start, or it was killed by its deadline,
+cancellation, or a signal — is transport evidence on its own, and a git process that ran
+and failed is classified by probing the remote's endpoint directly (an HTTP
+availability request to the smart-HTTP endpoint for http(s) remotes, a TCP
+dial for ssh/git), where an endpoint that cannot be reached or answers 429
+or 5xx is transient availability, an endpoint that answers leaves git's own
+verdict standing, and a remote with no probeable network endpoint stays a
+fail-closed `verifier-rejection`. Only the exact pairing — a declared `blocked_external`
 outcome carried by a validated termination handoff whose category is
 `forge-unavailable` — opens the workspace-safety evidence gate; a
 task-shaped `blocked_external` with any other category opens nothing and

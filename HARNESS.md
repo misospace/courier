@@ -837,14 +837,19 @@ outcome tag exactly as the linkage plan does. A forge read failure during
 the legacy check is fail-closed exactly as #248's is, with one #455
 refinement: when no retry remains and the read failed on a transient
 availability condition — a rate limit, a server error, or a transport
-failure of the forge API read, classified by `forge.IsTransientAvailability`
+failure, classified by `forge.IsTransientAvailability`
 — the world was never observed, so the run ends on the recovery channel
 (`blocked_external` outcome, category `forge-unavailable`) for the operator's
 bounded retry instead of `verifier-rejection` `NeedsHuman`, replacing any
 declared outcome tag the run had carried. The git-side remote-publication read
-behind the same observation is not classified that way yet — the git transport
-cannot yet tell an unreachable remote from a command that ran and failed — so
-its failures stay a fail-closed `verifier-rejection`. That exact pairing — and
+behind the same observation is classified by the same evidence rule, never by
+git's stderr text: a git process that never ran to completion — it did not
+start, or it was killed by its deadline, cancellation, or a signal — is transport
+evidence on its own, and a ran-and-failed read is classified by probing the
+remote's endpoint directly, where an endpoint that cannot be reached or
+answers 429 or 5xx is transient availability and an endpoint that answers
+leaves git's verdict standing; a remote with no probeable network endpoint
+stays a fail-closed `verifier-rejection`. That exact pairing — and
 only that pairing — opens the operator's trusted workspace-safety evidence
 gate, so the ending persists the same secure snapshot or isolated-observer
 proof a `capacity_exhausted` handoff would and stays eligible for the fenced

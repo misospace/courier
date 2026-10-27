@@ -315,6 +315,22 @@ func (e *CommandError) ExitCode() int {
 	return exitErr.ExitCode()
 }
 
+// TransientAvailability reports whether the command failed before git could
+// produce a verdict of its own. The evidence is the process state alone,
+// never a text match on git's stderr: a process that never started, and a
+// process killed by its context deadline, cancellation, or a signal — which
+// carries no exit code — left the world unobserved and classify as transient
+// availability. A process that ran to completion and exited non-zero is
+// git's own verdict about whatever it reached, which is never transient here;
+// remote reads add network-level evidence on top in RemoteBranchHead.
+func (e *CommandError) TransientAvailability() bool {
+	var exitErr *exec.ExitError
+	if !errors.As(e.Err, &exitErr) {
+		return true
+	}
+	return exitErr.ExitCode() == -1
+}
+
 func run(ctx context.Context, directory string, args ...string) ([]byte, error) {
 	cmd := exec.CommandContext(ctx, "git", args...)
 	if directory != "" {
@@ -358,6 +374,18 @@ func RemoteBranchHead(ctx context.Context, remoteURL, branch string) (string, bo
 	}
 	out, err := run(ctx, "", "ls-remote", "--heads", "--", remoteURL, "refs/heads/"+branch)
 	if err != nil {
+		// A git process that never produced a verdict of its own is
+		// transport evidence already (TransientAvailability); a process
+		// that ran and failed is classified by the remote's own network
+		// endpoint, not by git's stderr text: an endpoint that cannot be
+		// reached, or answers 429/5xx, kept the read from observing the
+		// world, while an endpoint that answered leaves git's verdict
+		// standing. A remote with no probeable network endpoint (a local
+		// path, an unknown scheme) fails closed to the unclassified error.
+		var commandErr *CommandError
+		if errors.As(err, &commandErr) && !commandErr.TransientAvailability() && !remoteEndpointAvailable(ctx, remoteURL) {
+			err = &remoteUnavailableError{err: commandErr}
+		}
 		return "", false, err
 	}
 	trimmed := strings.TrimSpace(string(out))

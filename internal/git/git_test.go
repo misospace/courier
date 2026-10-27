@@ -5,6 +5,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -12,6 +14,9 @@ import (
 	"slices"
 	"strings"
 	"testing"
+	"time"
+
+	"github.com/misospace/courier/internal/forge"
 )
 
 // TestMain isolates git from the developer's global and system config and pins
@@ -1045,4 +1050,118 @@ func TestBlobAtReadsRevisionScopedContentAndClassifiesAbsence(t *testing.T) {
 	if _, _, err := BlobAt(context.Background(), repo, "", ".mise/config.toml"); err == nil {
 		t.Fatal("BlobAt accepted an empty revision")
 	}
+}
+
+// writeFakeGit installs an executable stand-in for the git binary on PATH and
+// returns the directory holding it, so a test can drive run()'s process-level
+// outcomes — a process that never starts, one that runs and exits, and one
+// killed by its context — without reaching the network.
+func writeFakeGit(t *testing.T, script string) string {
+	t.Helper()
+	directory := t.TempDir()
+	executable := filepath.Join(directory, "git")
+	if err := os.WriteFile(executable, []byte(script), 0o700); err != nil {
+		t.Fatalf("write fake git: %v", err)
+	}
+	return directory
+}
+
+// TestCommandErrorTransientAvailabilityClassification pins the process-level
+// evidence rule behind CommandError.TransientAvailability: a git process that
+// never ran to completion — it did not start, or it was killed by its context
+// deadline — left the world unobserved and classifies transient through
+// forge.IsTransientAvailability, while a process that ran and exited under
+// its own control is git's own verdict and never does. The classification
+// reads the process state, never git's stderr text.
+func TestCommandErrorTransientAvailabilityClassification(t *testing.T) {
+	t.Run("killed by the context deadline", func(t *testing.T) {
+		t.Setenv("PATH", writeFakeGit(t, "#!/bin/sh\nexec /bin/sleep 30\n"))
+		ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
+		defer cancel()
+		_, err := run(ctx, "", "sleep")
+		if err == nil {
+			t.Fatal("expected the killed git process to fail")
+		}
+		if !forge.IsTransientAvailability(err) {
+			t.Fatalf("a git process killed by its context deadline must classify transient: %v", err)
+		}
+	})
+	t.Run("ran and exited", func(t *testing.T) {
+		t.Setenv("PATH", writeFakeGit(t, "#!/bin/sh\nexit 3\n"))
+		_, err := run(context.Background(), "", "status")
+		if err == nil {
+			t.Fatal("expected the failing git process to fail")
+		}
+		if forge.IsTransientAvailability(err) {
+			t.Fatalf("a git process that ran and exited carries its own verdict, not a transient availability failure: %v", err)
+		}
+	})
+	t.Run("never started", func(t *testing.T) {
+		t.Setenv("PATH", t.TempDir())
+		_, err := run(context.Background(), "", "status")
+		if err == nil {
+			t.Fatal("expected the missing git binary to fail")
+		}
+		if !forge.IsTransientAvailability(err) {
+			t.Fatalf("a git process that never started must classify transient: %v", err)
+		}
+	})
+}
+
+// TestRemoteBranchHeadClassifiesEndpointEvidence pins the network-level
+// evidence rule behind the git-side remote-publication read: a git process
+// that ran and failed is classified by the remote's own endpoint, never by
+// git's stderr text. An endpoint that answers with 429 or 5xx, and an
+// endpoint the probe cannot complete against, classify transient
+// availability; an endpoint that answered with any other status carries
+// git's verdict and keeps the fail-closed behavior, as does a remote with no
+// probeable network endpoint.
+func TestRemoteBranchHeadClassifiesEndpointEvidence(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	statusServer := func(status int) *httptest.Server {
+		return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(status)
+		}))
+	}
+	resetServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, _, err := http.NewResponseController(w).Hijack()
+		if err != nil {
+			t.Errorf("hijack: %v", err)
+			return
+		}
+		_ = conn.Close()
+	}))
+	t.Cleanup(resetServer.Close)
+
+	cases := []struct {
+		name      string
+		remoteURL string
+		transient bool
+	}{
+		{"endpoint answers 500", statusServer(http.StatusInternalServerError).URL, true},
+		{"endpoint answers 429", statusServer(http.StatusTooManyRequests).URL, true},
+		{"endpoint drops the connection", resetServer.URL, true},
+		{"endpoint answers 404", statusServer(http.StatusNotFound).URL, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, _, err := RemoteBranchHead(ctx, tc.remoteURL, "main")
+			if err == nil {
+				t.Fatal("expected the remote read to fail")
+			}
+			if got := forge.IsTransientAvailability(err); got != tc.transient {
+				t.Fatalf("RemoteBranchHead(%s) transient availability = %v, want %v: %v", tc.remoteURL, got, tc.transient, err)
+			}
+		})
+	}
+	t.Run("local path carries no network endpoint", func(t *testing.T) {
+		_, _, err := RemoteBranchHead(ctx, t.TempDir(), "main")
+		if err == nil {
+			t.Fatal("expected the remote read against a non-repository path to fail")
+		}
+		if forge.IsTransientAvailability(err) {
+			t.Fatalf("a remote with no probeable network endpoint must keep the fail-closed classification: %v", err)
+		}
+	})
 }
