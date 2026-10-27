@@ -3063,6 +3063,137 @@ func TestGuardFixPRHead(t *testing.T) {
 	}
 }
 
+// TestGuardFixPRHeadRemoteReadAvailability pins the fix-pr head guard's launch
+// time failure vocabulary (#580): a remote read that could not complete on a
+// transient availability condition never observed the head, so the run ends on
+// the recovery channel (blocked_external / forge-unavailable, the same ending
+// the handoff builds) rather than as an executor crash; a read that reached the
+// fork and returned its own verdict keeps the fail-closed crash ending. A 5xx
+// endpoint is transient and a 404 is an answer, per the git-side classification.
+func TestGuardFixPRHeadRemoteReadAvailability(t *testing.T) {
+	transient := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	t.Cleanup(transient.Close)
+	answered := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusNotFound)
+	}))
+	t.Cleanup(answered.Close)
+
+	for _, test := range []struct {
+		name      string
+		remoteURL string
+		wantCode  int
+		wantOut   []string
+		notOut    []string
+	}{
+		{
+			name:      "transient head read parks the run",
+			remoteURL: transient.URL,
+			wantCode:  exitNeedsHuman,
+			wantOut:   []string{`"phase":"NeedsHuman"`, `"outcome":"blocked_external"`, `"category":"forge-unavailable"`, "parked for bounded retry", `"workspace_safety"`},
+		},
+		{
+			name:      "answered head read keeps the crash ending",
+			remoteURL: answered.URL,
+			wantCode:  exitFailed,
+			wantOut:   []string{`"phase":"Failed"`, `"category":"executor-crash"`},
+			notOut:    []string{"forge-unavailable", `"outcome":"blocked_external"`},
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			var output bytes.Buffer
+			var errorsOut bytes.Buffer
+			report := newReporter(&output, &errorsOut, config{
+				RemoteURL: test.remoteURL,
+				Mode:      "fix-pr",
+				Repo:      "acme/widgets",
+				HeadRepo:  "octocat/widgets",
+				Branch:    "fix/missing",
+			})
+			if code := report.guardFixPRHead(context.Background()); code != test.wantCode {
+				t.Fatalf("guardFixPRHead exit code = %d, want %d; stdout=%q stderr=%q", code, test.wantCode, output.String(), errorsOut.String())
+			}
+			for _, fragment := range test.wantOut {
+				if !strings.Contains(output.String(), fragment) {
+					t.Fatalf("output missing %q: %q", fragment, output.String())
+				}
+			}
+			for _, fragment := range test.notOut {
+				if strings.Contains(output.String(), fragment) {
+					t.Fatalf("output must not contain %q: %q", fragment, output.String())
+				}
+			}
+		})
+	}
+}
+
+// TestGuardAdoptionRemoteReadAvailability pins the resolve-issue adoption
+// guard's launch time failure vocabulary (#580) with the same two endings as
+// the fix-pr head guard: a transient remote read parks the run for the
+// operator's bounded retry under the forge-unavailable category, while a read
+// that returned a verdict keeps the fail-closed executor-crash ending.
+func TestGuardAdoptionRemoteReadAvailability(t *testing.T) {
+	transient := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusTooManyRequests)
+	}))
+	t.Cleanup(transient.Close)
+	answered := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusNotFound)
+	}))
+	t.Cleanup(answered.Close)
+
+	for _, test := range []struct {
+		name      string
+		remoteURL string
+		wantCode  int
+		wantOut   []string
+		notOut    []string
+	}{
+		{
+			name:      "transient adoption read parks the run",
+			remoteURL: transient.URL,
+			wantCode:  exitNeedsHuman,
+			wantOut:   []string{`"phase":"NeedsHuman"`, `"outcome":"blocked_external"`, `"category":"forge-unavailable"`, "decide adoption", `"workspace_safety"`},
+		},
+		{
+			name:      "answered adoption read keeps the crash ending",
+			remoteURL: answered.URL,
+			wantCode:  exitFailed,
+			wantOut:   []string{`"phase":"Failed"`, `"category":"executor-crash"`},
+			notOut:    []string{"forge-unavailable", `"outcome":"blocked_external"`},
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			var output bytes.Buffer
+			var errorsOut bytes.Buffer
+			report := newReporter(&output, &errorsOut, config{
+				RemoteURL: test.remoteURL,
+				Mode:      "resolve-issue",
+				Repo:      "acme/widgets",
+				Branch:    "courier/resolve-issue/acme/widgets/10",
+			})
+			code, stop := report.guardAdoption(context.Background())
+			if !stop {
+				t.Fatalf("guardAdoption stop = false after a failed adoption read; stdout=%q stderr=%q", output.String(), errorsOut.String())
+			}
+			if code != test.wantCode {
+				t.Fatalf("guardAdoption exit code = %d, want %d; stdout=%q stderr=%q", code, test.wantCode, output.String(), errorsOut.String())
+			}
+			for _, fragment := range test.wantOut {
+				if !strings.Contains(output.String(), fragment) {
+					t.Fatalf("output missing %q: %q", fragment, output.String())
+				}
+			}
+			for _, fragment := range test.notOut {
+				if strings.Contains(output.String(), fragment) {
+					t.Fatalf("output must not contain %q: %q", fragment, output.String())
+				}
+			}
+		})
+	}
+}
+
 // TestGuardFixPRBase exercises the fix-pr base guard against a scripted
 // GitHub fixture. Every case stands up a server for the pull request the
 // guard reads; a failIfHit handler fails the test on any request, pinning
