@@ -8,6 +8,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -1167,6 +1168,39 @@ func TestRemoteBranchHeadClassifiesEndpointEvidence(t *testing.T) {
 			t.Fatalf("a remote with no probeable network endpoint must keep the fail-closed classification: %v", err)
 		}
 	})
+}
+
+// TestHTTPEndpointProbeDoesNotFollowRedirects pins the probe's shape: it is
+// exactly one request to the endpoint git itself would read, never a
+// redirect chain to another host. A redirect answer proves the endpoint
+// answered, so it classifies available and leaves git's verdict standing.
+func TestHTTPEndpointProbeDoesNotFollowRedirects(t *testing.T) {
+	t.Parallel()
+	var hits, escapeHatches int
+	target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		escapeHatches++
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	t.Cleanup(target.Close)
+	redirector := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits++
+		http.Redirect(w, r, target.URL+"/escape", http.StatusFound)
+	}))
+	t.Cleanup(redirector.Close)
+
+	parsed, err := url.Parse(redirector.URL)
+	if err != nil {
+		t.Fatalf("parse probe URL: %v", err)
+	}
+	if !httpEndpointAvailable(context.Background(), parsed) {
+		t.Fatal("a redirect answer proves the endpoint answered, so the probe must classify it available")
+	}
+	if hits != 1 {
+		t.Fatalf("probe request count = %d, want exactly 1", hits)
+	}
+	if escapeHatches != 0 {
+		t.Fatalf("the probe followed the redirect to another host %d time(s)", escapeHatches)
+	}
 }
 
 // TestRemoteBranchHeadNeverStartedFailsClosed pins the boundary between a

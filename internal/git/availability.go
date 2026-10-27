@@ -79,13 +79,21 @@ func remoteEndpointAvailable(ctx context.Context, remoteURL string) bool {
 // httpEndpointAvailable probes the smart-HTTP ref advertisement endpoint
 // and reports whether the endpoint was available to it: the request must
 // complete with a status the endpoint's operator, not the network, chose.
+// Redirects are not followed — the probe is exactly one request to the
+// endpoint git itself would read, never a chain to another host — and a
+// redirect answer proves the endpoint answered, so it is available.
 func httpEndpointAvailable(ctx context.Context, parsed *url.URL) bool {
 	endpoint := parsed.Scheme + "://" + parsed.Host + strings.TrimSuffix(parsed.Path, "/") + "/info/refs?service=git-upload-pack"
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
 	if err != nil {
 		return true
 	}
-	resp, err := (&http.Client{Timeout: remoteProbeTimeout}).Do(req)
+	resp, err := (&http.Client{
+		Timeout: remoteProbeTimeout,
+		CheckRedirect: func(*http.Request, []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
+	}).Do(req)
 	if err != nil {
 		return false
 	}
