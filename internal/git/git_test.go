@@ -1263,10 +1263,11 @@ func TestScpLikeHostExtractsGitScpLikeForms(t *testing.T) {
 	}
 }
 
-// TestRemoteBranchHeadClassifiesSSHEndpointEvidence pins the ssh dial probe
-// for scheme-carrying ssh remotes: an endpoint the dial cannot complete
-// against classifies transient availability, an endpoint the dial reaches
-// keeps git's own fail-closed verdict.
+// TestRemoteBranchHeadClassifiesSSHEndpointEvidence pins the ssh handshake
+// probe for scheme-carrying ssh remotes: an endpoint the dial cannot complete
+// against, or one that closes the connection before its identification
+// banner, classifies transient availability — the handshake went unobserved;
+// an endpoint that answers keeps git's own fail-closed verdict.
 func TestRemoteBranchHeadClassifiesSSHEndpointEvidence(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
@@ -1283,23 +1284,16 @@ func TestRemoteBranchHeadClassifiesSSHEndpointEvidence(t *testing.T) {
 		}
 		return "ssh://" + addr + "/owner/repo.git"
 	}
-	listening := func(t *testing.T) string {
+	closing := func(t *testing.T) string {
 		t.Helper()
-		listener, err := net.Listen("tcp", "127.0.0.1:0")
-		if err != nil {
-			t.Fatalf("listen: %v", err)
-		}
-		t.Cleanup(func() { _ = listener.Close() })
-		go func() {
-			for {
-				conn, err := listener.Accept()
-				if err != nil {
-					return
-				}
-				_ = conn.Close()
-			}
-		}()
-		return "ssh://" + listener.Addr().String() + "/owner/repo.git"
+		return "ssh://" + accepting(t, func(conn net.Conn) { _ = conn.Close() }) + "/owner/repo.git"
+	}
+	answering := func(t *testing.T) string {
+		t.Helper()
+		return "ssh://" + accepting(t, func(conn net.Conn) {
+			_, _ = conn.Write([]byte("SSH-2.0-probe\r\n"))
+			_ = conn.Close()
+		}) + "/owner/repo.git"
 	}
 
 	t.Run("dial cannot complete", func(t *testing.T) {
@@ -1312,14 +1306,84 @@ func TestRemoteBranchHeadClassifiesSSHEndpointEvidence(t *testing.T) {
 			t.Fatalf("an ssh endpoint the dial cannot reach must classify transient: %v", err)
 		}
 	})
-	t.Run("dial reaches the endpoint", func(t *testing.T) {
+	t.Run("connection lost before an answer", func(t *testing.T) {
 		t.Parallel()
-		_, _, err := RemoteBranchHead(ctx, listening(t), "main")
+		_, _, err := RemoteBranchHead(ctx, closing(t), "main")
+		if err == nil {
+			t.Fatal("expected the remote read to fail")
+		}
+		if !forge.IsTransientAvailability(err) {
+			t.Fatalf("an ssh endpoint that closes before its banner must classify transient: %v", err)
+		}
+	})
+	t.Run("endpoint answers", func(t *testing.T) {
+		t.Parallel()
+		_, _, err := RemoteBranchHead(ctx, answering(t), "main")
 		if err == nil {
 			t.Fatal("expected the remote read to fail")
 		}
 		if forge.IsTransientAvailability(err) {
-			t.Fatalf("an ssh endpoint the dial reached must keep the fail-closed classification: %v", err)
+			t.Fatalf("an ssh endpoint that answered its banner must keep the fail-closed classification: %v", err)
 		}
 	})
+}
+
+// TestRemoteBranchHeadClassifiesGitProtocolEndpointEvidence pins the git://
+// handshake probe: the git protocol makes the client speak first, so a
+// daemon that answers the probe request keeps git's own fail-closed verdict,
+// while one that closes or is unreachable before any answer classifies
+// transient availability.
+func TestRemoteBranchHeadClassifiesGitProtocolEndpointEvidence(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+
+	t.Run("endpoint answers", func(t *testing.T) {
+		t.Parallel()
+		addr := accepting(t, func(conn net.Conn) {
+			buf := make([]byte, 128)
+			_, _ = conn.Read(buf)
+			_, _ = conn.Write([]byte("ERR access denied or repository not exported\n"))
+			_ = conn.Close()
+		})
+		_, _, err := RemoteBranchHead(ctx, "git://"+addr+"/owner/repo.git", "main")
+		if err == nil {
+			t.Fatal("expected the remote read to fail")
+		}
+		if forge.IsTransientAvailability(err) {
+			t.Fatalf("a git:// endpoint that answered the probe request must keep the fail-closed classification: %v", err)
+		}
+	})
+	t.Run("connection lost before an answer", func(t *testing.T) {
+		t.Parallel()
+		addr := accepting(t, func(conn net.Conn) { _ = conn.Close() })
+		_, _, err := RemoteBranchHead(ctx, "git://"+addr+"/owner/repo.git", "main")
+		if err == nil {
+			t.Fatal("expected the remote read to fail")
+		}
+		if !forge.IsTransientAvailability(err) {
+			t.Fatalf("a git:// endpoint that closes before answering must classify transient: %v", err)
+		}
+	})
+}
+
+// accepting serves one-shot TCP connections on an ephemeral loopback
+// listener, handling each accepted connection with handle, and returns the
+// listener's address.
+func accepting(t *testing.T, handle func(net.Conn)) string {
+	t.Helper()
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	t.Cleanup(func() { _ = listener.Close() })
+	go func() {
+		for {
+			conn, err := listener.Accept()
+			if err != nil {
+				return
+			}
+			handle(conn)
+		}
+	}()
+	return listener.Addr().String()
 }

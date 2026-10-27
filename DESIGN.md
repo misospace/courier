@@ -1382,8 +1382,12 @@ by evidence, never by git's stderr text: a git process that started but was kill
 cancellation, or a signal is transport evidence on its own; a process that never started failed inside the local executor — a missing or
 non-executable git binary, for instance — and carries no transport evidence, so it fails closed; and a git process that ran
 and failed is classified by probing the remote's endpoint directly (an HTTP
-availability request to the smart-HTTP endpoint for http(s) remotes, a TCP
-dial for ssh/git), where an endpoint that cannot be reached or answers 429
+availability request to the smart-HTTP endpoint for http(s) remotes, a
+minimal ssh/git handshake for ssh and git:// remotes — the server's own
+identification banner for ssh, where the server speaks first, and a probe
+request plus the daemon's answer for git://, where the client speaks
+first), where an endpoint that cannot be reached, closes or stalls before
+answering, or answers 429
 or 5xx is transient availability, an endpoint that answers leaves git's own
 verdict standing, and a remote with no probeable network endpoint stays a
 fail-closed `verifier-rejection`. Only the exact pairing — a declared `blocked_external`
