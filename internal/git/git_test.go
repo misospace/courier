@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -1162,6 +1163,106 @@ func TestRemoteBranchHeadClassifiesEndpointEvidence(t *testing.T) {
 		}
 		if forge.IsTransientAvailability(err) {
 			t.Fatalf("a remote with no probeable network endpoint must keep the fail-closed classification: %v", err)
+		}
+	})
+}
+
+// TestScpLikeHostExtractsGitScpLikeForms pins the scp-like host extraction
+// behind the ssh probe: git accepts the scp-like ssh form both with and
+// without a user — user@host:path and host:path — so a userless host must
+// still produce the dial target, while anything git itself would not treat
+// as a remote host (a local path, a slash or space before the separator, a
+// bracketed IPv6 literal) yields the empty string and fails closed.
+func TestScpLikeHostExtractsGitScpLikeForms(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		name      string
+		remoteURL string
+		host      string
+	}{
+		{"user at host path", "git@github.com:owner/repo.git", "github.com"},
+		{"userless host path", "github.com:owner/repo.git", "github.com"},
+		{"userless bare host", "host:repo", "host"},
+		{"at in the path is not a user", "host:pa@th", "host"},
+		{"absolute local path", "/tmp/checkout:thing", ""},
+		{"relative local path", "dir/file:thing", ""},
+		{"space in the host", "my host:repo", ""},
+		{"backslash in the host", `dir\file:thing`, ""},
+		{"empty user", "@github.com:repo", ""},
+		{"empty host", "user@:repo", ""},
+		{"bracketed ipv6 literal", "[::1]:repo", ""},
+		{"unbracketed ipv6 literal", "::1:repo", ""},
+		{"ipv6 literal splits as git splits", "user@fe80::1:repo", "fe80"},
+		{"no colon", "github.com/owner/repo.git", ""},
+		{"empty", "", ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			if got := scpLikeHost(tc.remoteURL); got != tc.host {
+				t.Fatalf("scpLikeHost(%q) = %q, want %q", tc.remoteURL, got, tc.host)
+			}
+		})
+	}
+}
+
+// TestRemoteBranchHeadClassifiesSSHEndpointEvidence pins the ssh dial probe
+// for scheme-carrying ssh remotes: an endpoint the dial cannot complete
+// against classifies transient availability, an endpoint the dial reaches
+// keeps git's own fail-closed verdict.
+func TestRemoteBranchHeadClassifiesSSHEndpointEvidence(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+
+	refused := func(t *testing.T) string {
+		t.Helper()
+		listener, err := net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			t.Fatalf("reserve a port: %v", err)
+		}
+		addr := listener.Addr().String()
+		if err := listener.Close(); err != nil {
+			t.Fatalf("release the reserved port: %v", err)
+		}
+		return "ssh://" + addr + "/owner/repo.git"
+	}
+	listening := func(t *testing.T) string {
+		t.Helper()
+		listener, err := net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			t.Fatalf("listen: %v", err)
+		}
+		t.Cleanup(func() { _ = listener.Close() })
+		go func() {
+			for {
+				conn, err := listener.Accept()
+				if err != nil {
+					return
+				}
+				_ = conn.Close()
+			}
+		}()
+		return "ssh://" + listener.Addr().String() + "/owner/repo.git"
+	}
+
+	t.Run("dial cannot complete", func(t *testing.T) {
+		t.Parallel()
+		_, _, err := RemoteBranchHead(ctx, refused(t), "main")
+		if err == nil {
+			t.Fatal("expected the remote read to fail")
+		}
+		if !forge.IsTransientAvailability(err) {
+			t.Fatalf("an ssh endpoint the dial cannot reach must classify transient: %v", err)
+		}
+	})
+	t.Run("dial reaches the endpoint", func(t *testing.T) {
+		t.Parallel()
+		_, _, err := RemoteBranchHead(ctx, listening(t), "main")
+		if err == nil {
+			t.Fatal("expected the remote read to fail")
+		}
+		if forge.IsTransientAvailability(err) {
+			t.Fatalf("an ssh endpoint the dial reached must keep the fail-closed classification: %v", err)
 		}
 	})
 }

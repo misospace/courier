@@ -109,20 +109,28 @@ func dialAvailable(ctx context.Context, address string) bool {
 }
 
 // scpLikeHost extracts the host from the scp-like remote form git accepts
-// for ssh remotes without an explicit scheme — user@host:path — and returns
-// the empty string when the URL does not have that shape. A host that still
-// contains a colon (an unbracketed IPv6 literal) is not extracted: it has no
-// unambiguous dial target, so the remote reports available and the
-// classification fails closed to git's own verdict.
+// for ssh remotes without an explicit scheme — user@host:path and the
+// userless host:path form alike — and returns the empty string when the URL
+// does not have that shape. Git treats a colon before any slash as the
+// scp-like separator, so a prefix containing a slash is a local path, not a
+// host; a space or backslash in the prefix is rejected too, since neither
+// can appear in a dialable host. An unbracketed IPv6 literal whose first
+// segment is empty (::1) has its separator before any host text, and a
+// bracketed literal is rejected by its bracket: both fail closed to git's
+// own verdict. A literal with a non-empty first segment (fe80::1) splits at
+// the first colon exactly as git itself splits it, so the extracted host
+// always matches the host git would dial.
 func scpLikeHost(remoteURL string) string {
-	at := strings.Index(remoteURL, "@")
 	colon := strings.Index(remoteURL, ":")
-	if at <= 0 || colon < at+1 || strings.ContainsAny(remoteURL[:colon], "/ ") {
+	if colon < 1 || strings.ContainsAny(remoteURL[:colon], "/\\ [") {
 		return ""
 	}
-	host := remoteURL[at+1 : colon]
-	if strings.Contains(host, ":") {
-		return ""
+	host := remoteURL[:colon]
+	if at := strings.Index(host, "@"); at >= 0 {
+		if at == 0 {
+			return ""
+		}
+		host = host[at+1:]
 	}
 	return host
 }
