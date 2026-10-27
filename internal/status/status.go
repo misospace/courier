@@ -201,50 +201,33 @@ func (p OperatorPatch) MarshalJSON() ([]byte, error) {
 		CIParkDeferral json.RawMessage `json:"ciparkDeferral,omitempty"`
 		CIParkRelease  json.RawMessage `json:"ciparkRelease,omitempty"`
 	}{alias: alias(p)}
-	if p.CIPark != nil {
-		encoded, err := json.Marshal(p.CIPark)
-		if err != nil {
-			return nil, fmt.Errorf("status: encode cipark: %w", err)
+	// The set flag is computed from the typed pointer before it enters the
+	// any-typed record slot: an interface holding a typed nil pointer is not
+	// == nil, so the pointer's own nil-ness must be decided here.
+	for _, clearable := range []struct {
+		dst    *json.RawMessage
+		set    bool
+		record any
+		clear  bool
+		name   string
+	}{
+		{&document.CIPark, p.CIPark != nil, p.CIPark, p.clearCIPark, "cipark"},
+		{&document.CIRepair, p.CIRepair != nil, p.CIRepair, p.clearCIRepair, "ciRepair"},
+		{&document.CISettlement, p.CISettlement != nil, p.CISettlement, p.clearCISettlement, "ciSettlement"},
+		{&document.CIParkDeferral, p.CIParkDeferral != nil, p.CIParkDeferral, p.clearCIParkDeferral, "ciparkDeferral"},
+		{&document.CIParkRelease, p.CIParkRelease != nil, p.CIParkRelease, p.clearCIParkRelease, "ciparkRelease"},
+	} {
+		if !clearable.set {
+			if clearable.clear {
+				*clearable.dst = json.RawMessage("null")
+			}
+			continue
 		}
-		document.CIPark = encoded
-	} else if p.clearCIPark {
-		document.CIPark = json.RawMessage("null")
-	}
-	if p.CIRepair != nil {
-		encoded, err := json.Marshal(p.CIRepair)
+		encoded, err := json.Marshal(clearable.record)
 		if err != nil {
-			return nil, fmt.Errorf("status: encode ciRepair: %w", err)
+			return nil, fmt.Errorf("status: encode %s: %w", clearable.name, err)
 		}
-		document.CIRepair = encoded
-	} else if p.clearCIRepair {
-		document.CIRepair = json.RawMessage("null")
-	}
-	if p.CISettlement != nil {
-		encoded, err := json.Marshal(p.CISettlement)
-		if err != nil {
-			return nil, fmt.Errorf("status: encode ciSettlement: %w", err)
-		}
-		document.CISettlement = encoded
-	} else if p.clearCISettlement {
-		document.CISettlement = json.RawMessage("null")
-	}
-	if p.CIParkDeferral != nil {
-		encoded, err := json.Marshal(p.CIParkDeferral)
-		if err != nil {
-			return nil, fmt.Errorf("status: encode ciparkDeferral: %w", err)
-		}
-		document.CIParkDeferral = encoded
-	} else if p.clearCIParkDeferral {
-		document.CIParkDeferral = json.RawMessage("null")
-	}
-	if p.CIParkRelease != nil {
-		encoded, err := json.Marshal(p.CIParkRelease)
-		if err != nil {
-			return nil, fmt.Errorf("status: encode ciparkRelease: %w", err)
-		}
-		document.CIParkRelease = encoded
-	} else if p.clearCIParkRelease {
-		document.CIParkRelease = json.RawMessage("null")
+		*clearable.dst = encoded
 	}
 	return json.Marshal(document)
 }
