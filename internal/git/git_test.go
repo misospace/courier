@@ -1607,20 +1607,34 @@ func requireSSH(t *testing.T) {
 	}
 }
 
-// writeSSHUserConfig installs config as a per-user ssh configuration inside
-// a fresh HOME directory and returns that directory, so a test can pin what
-// the ssh client — and with it the probe's endpoint resolution — turns a
-// destination into.
-func writeSSHUserConfig(t *testing.T, config string) string {
+// useSSHUserConfig makes the real ssh binary read an isolated test
+// configuration without relying on HOME. OpenSSH does not consistently use
+// the HOME environment variable to locate ~/.ssh/config across platforms
+// (notably the Linux CI runner), so a PATH wrapper injects -F explicitly
+// while preserving the production call shape: sshEffectiveAddress still
+// executes "ssh -G ..." and the real OpenSSH parser resolves the endpoint.
+func useSSHUserConfig(t *testing.T, config string) {
 	t.Helper()
-	home := t.TempDir()
-	if err := os.Mkdir(filepath.Join(home, ".ssh"), 0o700); err != nil {
-		t.Fatalf("create ssh config directory: %v", err)
+	realSSH, err := exec.LookPath("ssh")
+	if err != nil {
+		t.Skip("the ssh endpoint probe resolves the effective endpoint through ssh; this machine has no ssh binary")
 	}
-	if err := os.WriteFile(filepath.Join(home, ".ssh", "config"), []byte(config), 0o600); err != nil {
-		t.Fatalf("write ssh user config: %v", err)
+
+	configPath := filepath.Join(t.TempDir(), "config")
+	if err := os.WriteFile(configPath, []byte(config), 0o600); err != nil {
+		t.Fatalf("write ssh test config: %v", err)
 	}
-	return home
+
+	wrapperDir := t.TempDir()
+	wrapper := filepath.Join(wrapperDir, "ssh")
+	script := "#!/bin/sh\nexec \"$COURIER_TEST_REAL_SSH\" -F \"$COURIER_TEST_SSH_CONFIG\" \"$@\"\n"
+	if err := os.WriteFile(wrapper, []byte(script), 0o700); err != nil {
+		t.Fatalf("write ssh config wrapper: %v", err)
+	}
+
+	t.Setenv("COURIER_TEST_REAL_SSH", realSSH)
+	t.Setenv("COURIER_TEST_SSH_CONFIG", configPath)
+	t.Setenv("PATH", wrapperDir+string(os.PathListSeparator)+os.Getenv("PATH"))
 }
 
 // writeFakeSSH installs an executable stand-in for the ssh binary on PATH
@@ -1648,8 +1662,8 @@ func TestSSHEffectiveAddressResolvesTheConfiguredEndpoint(t *testing.T) {
 	if err != nil {
 		t.Fatalf("split listener address: %v", err)
 	}
-	t.Setenv("HOME", writeSSHUserConfig(t, fmt.Sprintf(
-		"Host forge584.invalid\n HostName %s\n Port %s\n", host, port)))
+	useSSHUserConfig(t, fmt.Sprintf(
+		"Host forge584.invalid\n HostName %s\n Port %s\n", host, port))
 
 	t.Run("the configured HostName and Port are the endpoint", func(t *testing.T) {
 		endpoint, ok := sshEffectiveAddress(context.Background(), "git@forge584.invalid", "")
@@ -1705,7 +1719,7 @@ func TestSSHEffectiveAddressYieldsNoEndpointWhenUnresolvable(t *testing.T) {
 	})
 	t.Run("ssh rejects its configuration", func(t *testing.T) {
 		requireSSH(t)
-		t.Setenv("HOME", writeSSHUserConfig(t, "Host forge584.invalid\n\tNoSuchKeyword yes\n"))
+		useSSHUserConfig(t, "Host forge584.invalid\n\tNoSuchKeyword yes\n")
 		if _, ok := sshEffectiveAddress(ctx, "forge584.invalid", ""); ok {
 			t.Fatal("ssh rejecting the configuration means the effective endpoint cannot be resolved: the probe must yield no endpoint")
 		}
@@ -1801,9 +1815,9 @@ func TestRemoteEndpointAvailableDialsTheResolvedEndpoint(t *testing.T) {
 	if err != nil {
 		t.Fatalf("split refused address: %v", err)
 	}
-	t.Setenv("HOME", writeSSHUserConfig(t, fmt.Sprintf(
+	useSSHUserConfig(t, fmt.Sprintf(
 		"Host answer584.invalid\n HostName %s\n Port %s\nHost refused584.invalid\n HostName %s\n Port %s\n",
-		answerHost, answerPort, refusedHost, refusedPort)))
+		answerHost, answerPort, refusedHost, refusedPort))
 
 	t.Run("the ssh url form probes the configured endpoint", func(t *testing.T) {
 		if !remoteEndpointAvailable(ctx, "ssh://answer584.invalid/owner/repo.git") {
@@ -1868,9 +1882,9 @@ func TestRemoteBranchHeadKeepsGitVerdictWhenConfigurationRedirectsTheProbe(t *te
 	if err != nil {
 		t.Fatalf("split refused address: %v", err)
 	}
-	t.Setenv("HOME", writeSSHUserConfig(t, fmt.Sprintf(
+	useSSHUserConfig(t, fmt.Sprintf(
 		"Host answer584.invalid\n HostName %s\n Port %s\nHost refused584.invalid\n HostName %s\n Port %s\n",
-		answerHost, answerPort, refusedHost, refusedPort)))
+		answerHost, answerPort, refusedHost, refusedPort))
 
 	t.Run("a configured endpoint that answered keeps git's verdict", func(t *testing.T) {
 		_, _, err := RemoteBranchHead(ctx, "ssh://answer584.invalid/owner/repo.git", "main")
