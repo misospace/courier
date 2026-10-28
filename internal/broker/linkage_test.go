@@ -340,3 +340,44 @@ func TestValidateContributeLinkageClosesOnFullURLKeyword(t *testing.T) {
 		t.Fatalf("ValidateLinkage URL behavior changed: %v", err)
 	}
 }
+
+// TestValidateContributeLinkageColonForms pins the GitHub-documented colon
+// syntax ("Fixes: #N", "Fixes: owner/repo#N", "Fixes: <url>") as a closing
+// claim under the contribute contract. ValidateLinkage keeps failing closed
+// on these inputs; the non-closing default must not let them slip through.
+func TestValidateContributeLinkageColonForms(t *testing.T) {
+	source := trustedIssue()
+	closing := []string{
+		"Fixes: #502",
+		"fixes:#502",
+		"Closes: misospace/miso-gallery#502",
+		"Resolves: https://github.com/misospace/miso-gallery/issues/502",
+		"Ships the icons. Fixed: https://ghe.example.com:8443/misospace/miso-gallery/issues/502",
+	}
+	for _, body := range closing {
+		err := ValidateContributeLinkage(body, source, false)
+		if err == nil {
+			t.Fatalf("colon/URL closing claim %q accepted without a policy choice", body)
+		}
+		if !errors.Is(err, ErrClosingLinkageNotAdmitted) {
+			t.Fatalf("err = %v, want ErrClosingLinkageNotAdmitted", err)
+		}
+	}
+	for _, body := range []string{"Fixes: #502", "Closes: misospace/miso-gallery#502"} {
+		if err := ValidateContributeLinkage(body, source, true); err != nil {
+			t.Fatalf("admitted colon-form reference %q rejected: %v", body, err)
+		}
+	}
+	if err := ValidateContributeLinkage("Fixed: https://ghe.example.com:8443/misospace/miso-gallery/issues/503", source, true); err == nil {
+		t.Fatal("admitted colon/URL reference accepted despite the wrong issue number")
+	}
+	// Non-closing colon prose with no issue reference is not a closing claim.
+	if err := ValidateContributeLinkage("Fixed: the icon manifest, no issue involved.", source, false); err != nil {
+		t.Fatalf("non-closing colon prose rejected: %v", err)
+	}
+	// resolve-issue semantics are unchanged: the colon form stays a fail-
+	// closed missing reference.
+	if err := ValidateLinkage("Fixes: #502", source); !errors.Is(err, ErrLinkageMissing) {
+		t.Fatalf("ValidateLinkage colon behavior changed: %v", err)
+	}
+}

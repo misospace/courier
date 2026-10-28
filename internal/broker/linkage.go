@@ -99,8 +99,10 @@ var ErrClosingLinkageNotAdmitted = errors.New("publication denied: pull request 
 // ("Refs #123", a plain issue URL, or no reference at all) is accepted, and
 // a contribution with no upstream issue context carries no linkage line.
 //
-// When a closing-keyword reference does appear, it is admitted only under
-// the explicit admission-time policy choice (allowClosing). When admitted,
+// When a closing-keyword reference does appear — in the bare, cross-repo,
+// colon-separated, or full-issue-URL form, all of which GitHub honors as
+// closing — it is admitted only under the explicit admission-time policy
+// choice (allowClosing). When admitted,
 // every closing reference must name the trusted source-issue identity —
 // the same strict identity rule ValidateLinkage enforces for resolve-issue
 // bodies: the model may not select a different issue or repository than the
@@ -112,6 +114,7 @@ var ErrClosingLinkageNotAdmitted = errors.New("publication denied: pull request 
 func ValidateContributeLinkage(body string, source SourceIssue, allowClosing bool) error {
 	observations := extractObservations(body, source)
 	observations = append(observations, extractURLObservations(body, source)...)
+	observations = append(observations, extractColonObservations(body, source)...)
 	if len(observations) == 0 {
 		return nil
 	}
@@ -292,14 +295,56 @@ func extractObservations(body string, source SourceIssue) []LinkageObservation {
 }
 
 // urlClosingReferencePattern matches the full-URL closing form
-// "<keyword> https://<host>/<owner>/<name>/issues/<number>". GitHub applies
-// closing keywords to full issue URLs as well as to the "#N" and
-// "owner/repo#N" forms, so the contribute-mode contract — whose default is
-// non-closing — must recognize the URL form as a closing claim even though
-// the resolve-issue validator (whose failure mode is fail-closed missing
-// linkage) never needed to reject it. A non-closing mention of the same URL
-// matches nothing: only the supported closing keywords before the URL do.
-var urlClosingReferencePattern = regexp.MustCompile(`(?i)\b(?:close|closes|closed|fix|fixes|fixed|resolve|resolves|resolved)\b\s+https?://[A-Za-z0-9.-]+/([A-Za-z0-9._-]+)/([A-Za-z0-9._-]+)/issues/(\d+)`)
+// "<keyword>[: ] https://<host>[:port]/<owner>/<name>/issues/<number>".
+// GitHub applies closing keywords to full issue URLs as well as to the "#N"
+// and "owner/repo#N" forms (optionally with a colon after the keyword), so
+// the contribute-mode contract — whose default is non-closing — must
+// recognize the URL form as a closing claim even though the resolve-issue
+// validator (whose failure mode is fail-closed missing linkage) never
+// needed to reject it. A non-closing mention of the same URL matches
+// nothing: only the supported closing keywords before the URL do.
+var urlClosingReferencePattern = regexp.MustCompile(`(?i)\b(?:close|closes|closed|fix|fixes|fixed|resolve|resolves|resolved)\b\s*:?\s+https?://[A-Za-z0-9.-]+(?::\d{1,5})?/([A-Za-z0-9._-]+)/([A-Za-z0-9._-]+)/issues/(\d+)`)
+
+// colonClosingReferencePattern matches the colon-separated closing forms
+// "<keyword>: #<number>" and "<keyword>: <owner>/<name>#<number>". GitHub
+// documents that a closing keyword may be followed by a colon, and the
+// existing bare and cross-repo patterns require the reference to follow the
+// keyword directly. resolve-issue fails closed on those inputs (no supported
+// reference), which is safe; the contribute default must instead treat them
+// as the closing claims GitHub will honor, so the contribute validator scans
+// them separately and never relaxes ValidateLinkage.
+var colonClosingReferencePattern = regexp.MustCompile(`(?i)\b(?:close|closes|closed|fix|fixes|fixed|resolve|resolves|resolved)\s*:\s*(?:([A-Za-z0-9._-]+)/([A-Za-z0-9._-]+)\s*)?#(\d+)\b`)
+
+// extractColonObservations records the colon-form closing references of a
+// body. It is confined to the contribute-mode contract for the same reason
+// as extractURLObservations: these forms close issues on GitHub, so a
+// non-closing default must see them, while the resolve-issue validator's
+// fail-closed behavior stays byte-identical.
+func extractColonObservations(body string, source SourceIssue) []LinkageObservation {
+	var out []LinkageObservation
+	for _, m := range colonClosingReferencePattern.FindAllStringSubmatchIndex(body, -1) {
+		if len(m) < 8 {
+			continue
+		}
+		number, _ := strconv.Atoi(body[m[6]:m[7]])
+		obs := LinkageObservation{Number: number}
+		if m[2] >= 0 {
+			obs.Owner = body[m[2]:m[3]]
+			obs.Name = body[m[4]:m[5]]
+			obs.Match = strings.EqualFold(obs.Owner, source.Owner) && strings.EqualFold(obs.Name, source.Name) && source.Number > 0 && number == source.Number
+		} else {
+			obs.Match = source.Number > 0 && number == source.Number
+		}
+		full := body[m[0]:m[1]]
+		keyword := full
+		if idx := strings.IndexAny(full, ":#"); idx > 0 {
+			keyword = strings.TrimSpace(full[:idx])
+		}
+		obs.Keyword = keyword
+		out = append(out, obs)
+	}
+	return out
+}
 
 // extractURLObservations records the full-URL closing references of a body.
 // It is deliberately confined to the contribute-mode contract: a URL closing
