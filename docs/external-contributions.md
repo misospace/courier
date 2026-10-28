@@ -209,11 +209,13 @@ An upstream issue referenced in `SourceContext` is read-only task context:
   permit; an inaccessible issue is non-fatal and the run proceeds without it.
 - Courier must **not** label, assign, comment on, claim, or otherwise mutate
   upstream issue state merely because the issue supplied the goal. The forge
-  vocabulary does contain a mutation verb — `CapabilityComment`
-  (`internal/forge/forge.go:39`) — so the prohibition must be an explicit
+  vocabulary does contain issue-mutation verbs — `CapabilityComment`
+  (`internal/forge/forge.go:39`) and `CapabilityRemoveWorkItemLabel`
+  (`internal/forge/forge.go:42`) — so the prohibition must be an explicit
   capability rule, not a vocabulary property: admission and publication policy
   must refuse to grant contribute runs any issue-mutation capability
-  (`CapabilityComment`), permitting only read verbs (`CapabilityReadWorkItem`,
+  (`CapabilityComment`, `CapabilityRemoveWorkItemLabel`), permitting only read
+  verbs (`CapabilityReadWorkItem`, `CapabilityListWorkItemsByLabel`,
   `CapabilityListComments`) plus the publication-only PR verbs
   (`CapabilityCreatePullRequest`, `CapabilityUpdatePullRequest`).
 - Opening the explicitly approved PR is the one authorized write, distinct

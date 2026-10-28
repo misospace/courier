@@ -39,6 +39,21 @@ dispatch:
     name: ""
     key: token
 
+# Forge label source (#16): issues carrying the trigger label become
+# resolve-issue runs and pull requests carrying the fix label become fix-pr
+# runs. Discovery and settlement reuse the operator's own GitHub credential
+# Secret (--github-credential-secret or --git-credential-secret); no separate
+# token is configured here.
+labelSource:
+  enabled: false
+  # -- owner/repo list the label source discovers work in.
+  repos: []
+  triggerLabel: courier
+  fixLabel: changes-requested
+  # -- Courier LaneProfile assigned to discovered label-source work.
+  lane: ""
+  pollInterval: 30s
+
 # -- Deployment-managed bootstrap LaneProfiles. A map of lane name to the
 #    lane's portable spec, serialized into a release ConfigMap mounted into
 #    the manager and passed through --bootstrap-lane-profiles-file; the
