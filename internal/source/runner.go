@@ -306,7 +306,14 @@ func (r *Runner) Poll(ctx context.Context) error {
 	var err error
 	r.Metrics.IncAttempts(r.Config.Source, r.Config.LaneProfile)
 	r.Metrics.SetLastAttempt(r.Config.Source, r.Config.LaneProfile, r.clock().Unix())
-	if discoverer, ok := r.Adapter.(CapacityAwareDiscoverer); ok {
+	// The gate above guarantees at least one free slot, so remaining >= 1
+	// here. A capacity-bounded adapter gets that budget at discovery time and
+	// offers no more than it, so due work the lane cannot admit this poll
+	// stays pending under the adapter's own semantics instead of being
+	// consumed and dropped.
+	if bounder, ok := r.Adapter.(CapacityBoundedDiscoverer); ok {
+		items, err = bounder.DiscoverBoundedTo(ctx, capacity-reserved)
+	} else if discoverer, ok := r.Adapter.(CapacityAwareDiscoverer); ok {
 		items, err = discoverer.DiscoverForCapacity(ctx, lane.CapacityIdentity(), exclusions)
 	} else if excluder, ok := r.Adapter.(DiscoveryExcluder); ok {
 		items, err = excluder.DiscoverExcluding(ctx, exclusions)
