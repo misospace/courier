@@ -185,6 +185,12 @@ const (
 	RetryRefusalHeldForHuman             = "held-for-human"
 )
 
+// RetryRequestMaxAttemptIDLength is the CRD maxLength on
+// status.retryRequest.attemptID: the bound the source requeue contract's
+// attempt identity must fit. The kubebuilder marker on RetryRequest.AttemptID
+// carries the same value literally; keep them in sync.
+const RetryRequestMaxAttemptIDLength = 256
+
 // RetryRequest is the operator-owned durable record of one explicit retry
 // request, translated by the controller alone from the RetryAnnotation (#97/#606).
 // The operator never writes it and no harness path can forge it; the controller

@@ -78,12 +78,17 @@ func validRetryRequestID(id string) bool {
 }
 
 // retryIdempotencyKey derives the source requeue identity from the run's
-// namespace, name, and opaque request ID, appending the run UID when set. It is
-// deterministic across reconciles so a retry after a lost status write presents
-// the same key and a source that has committed the requeue replays its original
-// result instead of launching a second replacement.
+// namespace, name, and opaque request ID, appending the run UID when set. The
+// request ID is operator-written opaque data, so it is folded into a hex
+// SHA-256 digest instead of being embedded raw in the slash-delimited key: the
+// digest is deterministic across reconciles (a retry after a lost status write
+// presents the same key, and a source that has committed the requeue replays
+// its original result instead of launching a second replacement) and it keeps
+// every key segment unambiguous — no request-ID character can alias another
+// request's key or collide with the UID segment.
 func retryIdempotencyKey(run *courierv1alpha1.CoderRun, requestID string) string {
-	key := fmt.Sprintf("coderun/%s/%s/%s", run.Namespace, run.Name, requestID)
+	digest := sha256.Sum256([]byte(requestID))
+	key := fmt.Sprintf("coderun/%s/%s/%s", run.Namespace, run.Name, hex.EncodeToString(digest[:]))
 	if run.UID != "" {
 		key += "/" + string(run.UID)
 	}
@@ -256,7 +261,7 @@ func (r *CoderRunReconciler) callRequeue(ctx context.Context, run *courierv1alph
 	}
 	result, err := requeuer.RequeueAttempt(ctx, item, req)
 	if err == nil {
-		return r.settleRetryOutcome(ctx, run, record, courierv1alpha1.RetryRequestStateRequeued, "", result.AttemptID)
+		return r.settleRetryOutcome(ctx, run, record, courierv1alpha1.RetryRequestStateRequeued, "", normalizeRetryAttemptID(ctx, run, result.AttemptID))
 	}
 	var refusal *source.RetryRefusalError
 	if errors.As(err, &refusal) {
@@ -280,6 +285,22 @@ func (r *CoderRunReconciler) callRequeue(ctx context.Context, run *courierv1alph
 	log.FromContext(ctx).V(1).Info("retry requeue transiently failed; keeping the request Requested",
 		"run", run.Name, "requestID", record.ID, "error", err.Error())
 	return ctrl.Result{RequeueAfter: retrySettlementRequeueDelay}, true, nil
+}
+
+// normalizeRetryAttemptID bounds the adapter-supplied attempt identity to the
+// CRD's maxLength on status.retryRequest.attemptID. The requeue has already
+// committed by the time the identity is examined, so a hostile or buggy adapter
+// returning an oversized value must not be allowed to fail the settle write and
+// wedge the durable record Requested forever: the value is dropped, and the
+// CRD's empty-attemptID meaning — the source requeued without exposing a new
+// identity, discovery observes the successor later — already covers that case.
+func normalizeRetryAttemptID(ctx context.Context, run *courierv1alpha1.CoderRun, attemptID string) string {
+	if utf8.RuneCountInString(attemptID) <= courierv1alpha1.RetryRequestMaxAttemptIDLength {
+		return attemptID
+	}
+	log.FromContext(ctx).V(1).Info("dropping adapter attempt identity over the CRD bound",
+		"run", run.Name, "length", utf8.RuneCountInString(attemptID))
+	return ""
 }
 
 // settleRetryOutcome overwrites the Requested record with its settled state — same

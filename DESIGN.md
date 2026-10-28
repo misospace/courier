@@ -948,7 +948,9 @@ nothing; correcting it is the operator's to do.
 `Requested`, `Requeued`, `Moot`, `Refused`. A fresh request that clears the core
 eligibility rules persists `Requested` **before** any source call, so the intent
 survives a crash before or during the call; a later reconcile replays the **same**
-idempotency key `coderun/<ns>/<name>/<requestID>[/<uid>]` and the source either
+idempotency key `coderun/<ns>/<name>/<sha256(requestID)>[/<uid>]` — the opaque
+request ID is folded into a hex digest so no operator-written character can alias
+another request's key or collide with the UID segment — and the source either
 replays its committed transition or reports it moot — one replacement attempt ever
 launches per predecessor. A transient source failure proves nothing about the
 requeue, so the `Requested` record stands unchanged and retries under the same key
@@ -977,7 +979,10 @@ transition calls. An adapter without the capability is a permanent
 `unsupported-source` refusal. An adapter-classified refusal settles `Moot` (the
 work is already requeued) or `Refused`, and any reason outside the closed
 vocabulary is normalized to `source-refused`, so a buggy adapter cannot mint
-reasons.
+reasons. The adapter's returned attempt identity is likewise bounded: a value
+over the CRD's 256-code-point limit on `status.retryRequest.attemptID` is
+dropped (settled without an identity) rather than allowed to fail the settle
+write and wedge the record `Requested` — the requeue has already committed.
 
 **The fix-pr guard reads the world through the forge.** A fix-pr run's recorded
 pull request is read through the forge read-pull-request capability, exactly as

@@ -278,7 +278,10 @@ type AttemptRequeueRequest struct {
 // re-offer, when the source can promise one. An empty AttemptID means the source
 // requeued without exposing a new identity; discovery observes the successor
 // later. Core never derives an identity here from wall-clock time, PR head,
-// reason strings, or request IDs.
+// reason strings, or request IDs. An identity an adapter returns must fit the
+// core's CRD bound on status.retryRequest.attemptID (256 code points); core
+// normalizes an oversized value to empty rather than failing the settlement
+// write, since the requeue has already committed.
 type AttemptRequeueResult struct {
 	AttemptID string
 }

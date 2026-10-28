@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"strings"
 	"testing"
 	"time"
 
@@ -123,7 +124,7 @@ func TestEnvtestRetryRoundTripsThroughCRD(t *testing.T) {
 	if rec == nil || rec.State != courierv1alpha1.RetryRequestStateRequeued || rec.ID != "req-1" || rec.AttemptID != "gen-7" || rec.SettledAt == nil {
 		t.Fatalf("retryRequest = %+v, want Requeued id=req-1 attemptID=gen-7 settledAt set through the CRD", rec)
 	}
-	wantKey := "coderun/" + namespace + "/" + name + "/req-1"
+	wantKey := "coderun/" + namespace + "/" + name + "/" + retryKeyDigest("req-1")
 	if uid != "" {
 		wantKey += "/" + uid
 	}
@@ -182,6 +183,45 @@ func TestEnvtestRetryReasonVocabularyEnforcedByCRD(t *testing.T) {
 	}
 	if err := setReason(courierv1alpha1.RetryRefusalSourceRefused); err != nil {
 		t.Fatalf("closed-vocabulary reason rejected: %v", err)
+	}
+}
+
+// TestEnvtestRetryAttemptIDBoundEnforcedByCRD proves the CRD maxLength on
+// status.retryRequest.attemptID is exactly RetryRequestMaxAttemptIDLength
+// code points: the API server rejects a value one code point over and accepts
+// one at the bound, so the Go constant the controller normalizes against and
+// the generated schema cannot silently drift apart.
+func TestEnvtestRetryAttemptIDBoundEnforcedByCRD(t *testing.T) {
+	if envtestClient == nil {
+		t.Skip("KUBEBUILDER_ASSETS is not set")
+	}
+	const name, namespace = "retry-attempt-bound", "retry-attempt-bound"
+	ctx := context.Background()
+	setupRetryNamespace(t, namespace)
+	run := envtestRunInNamespace(name, "retry-lane", namespace)
+	if err := envtestClient.Create(ctx, run); err != nil {
+		t.Fatalf("create run: %v", err)
+	}
+
+	setAttempt := func(attemptID string) error {
+		var cur courierv1alpha1.CoderRun
+		if err := envtestClient.Get(ctx, types.NamespacedName{Name: name, Namespace: namespace}, &cur); err != nil {
+			t.Fatalf("get run: %v", err)
+		}
+		cur.Status.RetryRequest = &courierv1alpha1.RetryRequest{
+			ID:          "req-1",
+			RequestedAt: metav1.NewTime(reapClock),
+			State:       courierv1alpha1.RetryRequestStateRequeued,
+			AttemptID:   attemptID,
+		}
+		return envtestClient.Status().Update(ctx, &cur)
+	}
+
+	if err := setAttempt(strings.Repeat("é", courierv1alpha1.RetryRequestMaxAttemptIDLength+1)); !apierrors.IsInvalid(err) {
+		t.Fatalf("oversized attemptID err = %v, want Invalid rejected by the CRD", err)
+	}
+	if err := setAttempt(strings.Repeat("é", courierv1alpha1.RetryRequestMaxAttemptIDLength)); err != nil {
+		t.Fatalf("attemptID at the bound rejected: %v", err)
 	}
 }
 

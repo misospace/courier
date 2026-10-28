@@ -3,6 +3,8 @@ package controller
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -153,8 +155,9 @@ func TestRetryResolveIssueRequeues(t *testing.T) {
 		t.Fatalf("condition = %s/%s, want True/Requeued", cond.Status, cond.Reason)
 	}
 	// Persist-before-dispatch: the adapter saw the run's derived idempotency key.
-	if len(src.requests) != 1 || src.requests[0].IdempotencyKey != "coderun/"+admissionNamespace+"/rr/req-1" {
-		t.Fatalf("requeue requests = %+v, want one with the derived key coderun/%s/rr/req-1", src.requests, admissionNamespace)
+	wantKey := "coderun/" + admissionNamespace + "/rr/" + retryKeyDigest("req-1")
+	if len(src.requests) != 1 || src.requests[0].IdempotencyKey != wantKey {
+		t.Fatalf("requeue requests = %+v, want one with the derived key %s", src.requests, wantKey)
 	}
 	if got := gatherMetric(t, reg, "courier_coderun_retry_requests_total", map[string]string{"lane": "local", "mode": "resolve-issue", "result": "requeued"}); got.GetCounter().GetValue() != 1 {
 		t.Fatalf("requeued counter = %v, want 1", got.GetCounter().GetValue())
@@ -166,6 +169,45 @@ func TestRetryResolveIssueRequeues(t *testing.T) {
 	}
 	if eventDetailString(events[1], "request_id") != "req-1" || eventDetailString(events[1], "attempt_id") != "gen-2" {
 		t.Fatalf("requeued event detail = %+v, want request_id=req-1 attempt_id=gen-2", events[1]["detail"])
+	}
+}
+
+func TestRetryAttemptIDOverCRDBoundDropped(t *testing.T) {
+	// The requeue has already committed when the identity arrives, so an
+	// adapter-supplied identity over the CRD's bound must be dropped — not
+	// allowed to fail the settle write and wedge the durable record Requested
+	// forever. The multibyte string pins code-point (not byte) semantics.
+	src := &requeueSource{admissionSource: &admissionSource{}, result: source.AttemptRequeueResult{AttemptID: strings.Repeat("é", courierv1alpha1.RetryRequestMaxAttemptIDLength+1)}}
+	run := retryRun("rr", courierv1alpha1.PhaseFailed, "req-1")
+	c := phaseClient(t, run)
+
+	if _, err := retryReconciler(c, src, reapClock, nil, nil).Reconcile(context.Background(), admissionRequest("rr")); err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	stored := getRetryRun(t, c, "rr")
+	rec := stored.Status.RetryRequest
+	if rec == nil || rec.State != courierv1alpha1.RetryRequestStateRequeued || rec.ID != "req-1" {
+		t.Fatalf("retryRequest = %+v, want the requeue still settled Requeued", rec)
+	}
+	if rec.AttemptID != "" {
+		t.Fatalf("attemptID = %q, want dropped empty; an oversized identity must not wedge settlement", rec.AttemptID)
+	}
+	if rec.SettledAt == nil {
+		t.Fatalf("settledAt = nil, want set on a settled Requeued record")
+	}
+}
+
+func TestRetryAttemptIDAtCRDBoundKept(t *testing.T) {
+	attemptID := strings.Repeat("é", courierv1alpha1.RetryRequestMaxAttemptIDLength)
+	src := &requeueSource{admissionSource: &admissionSource{}, result: source.AttemptRequeueResult{AttemptID: attemptID}}
+	run := retryRun("rr", courierv1alpha1.PhaseFailed, "req-1")
+	c := phaseClient(t, run)
+
+	if _, err := retryReconciler(c, src, reapClock, nil, nil).Reconcile(context.Background(), admissionRequest("rr")); err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	if rec := getRetryRun(t, c, "rr").Status.RetryRequest; rec == nil || rec.AttemptID != attemptID {
+		t.Fatalf("retryRequest = %+v, want the identity at the bound kept verbatim", rec)
 	}
 }
 
@@ -214,7 +256,7 @@ func TestRetryReplaySettlesAlreadyRequested(t *testing.T) {
 	if stored.Status.RetryRequest.State != courierv1alpha1.RetryRequestStateRequeued || stored.Status.RetryRequest.AttemptID != "gen-9" {
 		t.Fatalf("retryRequest = %+v, want Requeued via same-key replay", stored.Status.RetryRequest)
 	}
-	if len(src.requests) != 1 || src.requests[0].IdempotencyKey != "coderun/"+admissionNamespace+"/rr/req-old" {
+	if len(src.requests) != 1 || src.requests[0].IdempotencyKey != "coderun/"+admissionNamespace+"/rr/"+retryKeyDigest("req-old") {
 		t.Fatalf("requeue requests = %+v, want the replayed original key", src.requests)
 	}
 }
@@ -520,7 +562,7 @@ func TestRetryFreshRequestAfterRefusedReplacesRecord(t *testing.T) {
 	if rec.Reason != "" || rec.SettledAt == nil {
 		t.Fatalf("retryRequest = %+v, want the stale reason cleared and settledAt re-stamped", rec)
 	}
-	if len(src.requests) != 1 || src.requests[0].IdempotencyKey != "coderun/"+admissionNamespace+"/rr/req-2" {
+	if len(src.requests) != 1 || src.requests[0].IdempotencyKey != "coderun/"+admissionNamespace+"/rr/"+retryKeyDigest("req-2") {
 		t.Fatalf("requeue requests = %+v, want a request keyed by req-2", src.requests)
 	}
 }
@@ -845,16 +887,36 @@ func TestRetryDefersBehindUnsettledLifecycleReport(t *testing.T) {
 	}
 }
 
+// retryKeyDigest encodes the request-ID segment of a retry idempotency key the
+// way the controller does: the hex SHA-256 of the opaque request ID.
+func retryKeyDigest(requestID string) string {
+	sum := sha256.Sum256([]byte(requestID))
+	return hex.EncodeToString(sum[:])
+}
+
 func TestRetryIdempotencyKeyShape(t *testing.T) {
 	run := &courierv1alpha1.CoderRun{}
 	run.Namespace = "ns"
 	run.Name = "name"
-	if got, want := retryIdempotencyKey(run, "req"), "coderun/ns/name/req"; got != want {
+	if got, want := retryIdempotencyKey(run, "req"), "coderun/ns/name/"+retryKeyDigest("req"); got != want {
 		t.Fatalf("key without UID = %q, want %q", got, want)
 	}
 	run.UID = "uid-123"
-	if got, want := retryIdempotencyKey(run, "req"), "coderun/ns/name/req/uid-123"; got != want {
+	if got, want := retryIdempotencyKey(run, "req"), "coderun/ns/name/"+retryKeyDigest("req")+"/uid-123"; got != want {
 		t.Fatalf("key with UID = %q, want %q", got, want)
+	}
+	// The request ID is opaque operator data: its digest is the only thing the
+	// key carries, so no legal value can alias another request's key, collide
+	// with the UID segment, or grow the key with unbounded raw characters.
+	slashy := retryIdempotencyKey(run, "x/y/uid-123/../req")
+	if slashy != "coderun/ns/name/"+retryKeyDigest("x/y/uid-123/../req")+"/uid-123" {
+		t.Fatalf("key for opaque id = %q, want only digest segments", slashy)
+	}
+	if slashy == retryIdempotencyKey(run, "x/y/uid-123/../req2") {
+		t.Fatalf("distinct request IDs %q and %q shared one key", "x/y/uid-123/../req", "x/y/uid-123/../req2")
+	}
+	if again := retryIdempotencyKey(run, "req"); again != "coderun/ns/name/"+retryKeyDigest("req")+"/uid-123" {
+		t.Fatalf("key not deterministic across calls: %q", again)
 	}
 }
 
