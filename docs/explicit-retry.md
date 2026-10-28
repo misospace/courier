@@ -328,12 +328,16 @@ eligibility state: a per-phase retention marker may already be set and its
 window already expired when the operator annotates, and an expired window
 is not standing delete authority. The delete decision must therefore be
 made from the same read that issues it, and the mere presence of the
-`courier.misospace.dev/retry` annotation — settled or not — holds the
-run; the first reconcile that observes the annotation runs the record
-translation (persisting `Requested`, or a refusal) before any reap
-decision for that object is possible. Per-object reconcile serialization
-(controller-runtime) guarantees that once the annotation exists on the
-object, no delete decision is made from a state without it. The
+`courier.misospace.dev/retry` annotation — regardless of whether the
+record is persisted yet — aborts it; the first reconcile that observes
+the annotation runs the record translation (persisting `Requested`, or a
+refusal) before the run can be reconsidered for reaping.
+controller-runtime serializes
+reconciles per object, so a retry reconcile cannot interleave with the
+reaper's pass; to bound the remaining read-to-delete window, the reaper
+re-verifies the gate on the object state the `Delete` is issued from,
+and the annotation event that lands mid-pass wakes the object for the
+record translation immediately. The
 per-phase retention window starts only once the record settles; a settled
 record does not extend retention: the predecessor stays on its ordinary
 `Failed`/`NeedsHuman` window and audit floor. Retry never deletes, never
