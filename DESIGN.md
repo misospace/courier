@@ -1011,9 +1011,11 @@ over a settled `Refused`/`Moot` record replaces it, so an operator who fixed the
 blocker can ask again.
 
 **Retry holds the reap gate.** A run carrying an outstanding `Requested` record is
-not reap-eligible and its retention window does not start, because deletion would
-drop the durable intent; the ordinary `Failed`/`NeedsHuman` window begins only once
-the record settles. The gate is re-verified against the live object immediately
+not reap-eligible and deletion is held while it stands, because deletion would
+drop the durable intent; the retention window itself never restarts and never
+extends, so once the record settles the ordinary `Failed`/`NeedsHuman` window
+and audit floor apply exactly as they stood — a window that already expired
+makes the run reap-eligible again at the next pass. The gate is re-verified against the live object immediately
 before the reaper issues its delete, and the delete carries UID/resourceVersion
 preconditions, so an annotation that lands between the reconcile's read and the
 delete request defeats the delete instead of dropping the intent — the conflicted
@@ -2501,13 +2503,65 @@ terminal phase with the report retried on a later reconcile. (#178, #561)
 
 **Closed-unmerged PRs:** A run terminalizes as `NeedsHuman` with a precise reason; no new CRD phase. Today a `Verifying` run whose PR is closed without merge observes an empty `PRObservation` and transitions to `NeedsHuman` (#146); the gap is a PR closed after the run already settled `AwaitingReview`, which is never observed. The slow, bounded world observation added for #250 (merged -> `Done`) classifies the run's exact recorded PR identity as: merged -> `Done` (existing resolve + reap); open -> stay `AwaitingReview`; closed without merge -> `NeedsHuman` with a new `PullRequestClosedUnmerged` condition (`Status=True`, reason `ClosedUnmerged`) whose message carries the recorded PR identity, under the existing needs-human source policy (a `blocked` lifecycle report; the source parks the item and owns retry/escalation); absent, ambiguous, or a transient forge error -> no transition, stay `AwaitingReview`, and retry the observation later. A missing or unreadable PR is never treated as closed. The observation's slow cadence is durable: the `courier.misospace.dev/merge-observed-at` annotation on the run records when the recorded pull request was last read, and every wake before that cadence has passed skips the forge read entirely — whatever caused the wake, including a wake the run's own duties produce. The marker is stamped only on the paths that leave the run in `AwaitingReview`; a run that transitions to `Done` or `NeedsHuman` leaves the observation behind. The `NeedsHuman` transition publishes a `blocked` source lifecycle, and the per-phase `courier.misospace.dev/needs-human-at` annotation is stamped by the reaper on the first reap-eligible reconcile after that report settles (not derived from the original `FinishedAt`), so the seven-day inspection window starts at the operator-visible close event. No new CRD phase: `Done` would falsely attest shipped work, and a bespoke `Closed` phase is unnecessary because an existing non-successful phase already covers it. Implementation hook (#277): the `AwaitingReview` observation branch reads the run's exact recorded pull request through the configured forge `read-pull-request` capability (`PullRequestReader` / `forge.PullRequest`, the same #250 seam), where `State` distinguishes a closed pull request from an open or absent one; no `PRObservation` signal is needed, because the `Verifying` path already maps a missing pull request to `NeedsHuman`.
 
-**Deletion gates:** A terminal run is deleted only when all hold: (a) phase is `Done` (existing path) or `Failed`/`NeedsHuman` past its per-phase annotation window; (b) the lifecycle report has reached a **positive, settled state** — the run carries a `LifecycleReported` condition with `Status=True` and a permitted reason (`Published`, `Superseded`, or `PermanentRefusal` — the only reasons the condition's `Status=True` carries; `Accepted` belongs to the separate `LifecycleReportSupported` capability condition); a missing, `Unknown`, or `False` condition does **not** satisfy this gate, because a legacy, partially-upgraded, or corrupted terminal CoderRun with no published/superseded/permanently-refused report proof must not be deleted (it is the only durable retry intent and a transient `Unknown` does not prove success); a superseded report means a newer generation owns the item and the older run is reclaimable; a permanently-refused report means the source proved it will never accept this report (closed target, moved ownership, or a refused worker identity), so holding the run retries nothing and it too is reclaimable; for that settlement it is the source's own durable state, not a landed park transition, that keeps the identity from being re-offered; (c) the source report reached settlement: for `NeedsHuman` and non-CI `Failed` that is a `blocked` transition, which parks the source item so `source.Runner.Poll` will not re-offer it; for `Done`, `Resolve` (source `done`) precedes the clock; (d) owned resources: evidence Secrets and coordinator pods are owner-referenced to the run and are garbage-collected with it, so the retention window is also the evidence inspection window; (e) no park close is outstanding: a run that still owes the source its close is not deleted, because deletion would drop the owed close with the object, so its retention window starts only once the close has landed; (f) no explicit retry is outstanding: a run carrying a `Requested` retry record is not deleted, because deletion would drop the durable requeue intent with the object, so its retention window starts only once that record settles (see "Operator-initiated explicit retry"). Operators who need longer raise the TTL before it expires or retrieve evidence out-of-band (label `courier.misospace.dev/evidence=<run>`). No separate evidence clock or sweeper is added; this aligns #198/#200/#202 without duplicating them. The implementation must include regression tests for the legacy missing-condition case, the `Unknown` capability case, the still-`False` (pending) case, the `True-Published` case, the `True-Superseded` case, and the controller-restart case (gate evaluation is derived from the condition and the per-phase annotation on the object, not process memory).
+**Deletion gates:** A terminal run is deleted only when all hold: (a) phase is `Done` (existing path) or `Failed`/`NeedsHuman` past its per-phase annotation window; (b) the lifecycle report has reached a **positive, settled state** — the run carries a `LifecycleReported` condition with `Status=True` and a permitted reason (`Published`, `Superseded`, or `PermanentRefusal` — the only reasons the condition's `Status=True` carries; `Accepted` belongs to the separate `LifecycleReportSupported` capability condition); a missing, `Unknown`, or `False` condition does **not** satisfy this gate, because a legacy, partially-upgraded, or corrupted terminal CoderRun with no published/superseded/permanently-refused report proof must not be deleted (it is the only durable retry intent and a transient `Unknown` does not prove success); a superseded report means a newer generation owns the item and the older run is reclaimable; a permanently-refused report means the source proved it will never accept this report (closed target, moved ownership, or a refused worker identity), so holding the run retries nothing and it too is reclaimable; for that settlement it is the source's own durable state, not a landed park transition, that keeps the identity from being re-offered; (c) the source report reached settlement: for `NeedsHuman` and non-CI `Failed` that is a `blocked` transition, which parks the source item so `source.Runner.Poll` will not re-offer it; for `Done`, `Resolve` (source `done`) precedes the clock; (d) owned resources: evidence Secrets and coordinator pods are owner-referenced to the run and are garbage-collected with it, so the retention window is also the evidence inspection window; (e) no park close is outstanding: a run that still owes the source its close is not deleted, because deletion would drop the owed close with the object, so its retention window starts only once the close has landed; (f) no explicit retry is outstanding: a run carrying a `Requested` retry record is not deleted, because deletion would drop the durable requeue intent with the object, and once the record settles the ordinary window applies unchanged — the window is never restarted or extended (see "Operator-initiated explicit retry"). Operators who need longer raise the TTL before it expires or retrieve evidence out-of-band (label `courier.misospace.dev/evidence=<run>`). No separate evidence clock or sweeper is added; this aligns #198/#200/#202 without duplicating them. The implementation must include regression tests for the legacy missing-condition case, the `Unknown` capability case, the still-`False` (pending) case, the `True-Published` case, the `True-Superseded` case, and the controller-restart case (gate evaluation is derived from the condition and the per-phase annotation on the object, not process memory).
 
 **No accidental resubmission:** The runner dedupes only against currently-existing CoderRuns. Reaping a `Failed`/`NeedsHuman` run whose source report is positively settled is safe because the source, not the CoderRun, is the dedupe authority: the blocked report parks the item. If a source later re-offers the same identity (for example a human unblocks it), that is a new, intended dispatch that materializes a fresh CoderRun, not a duplicate of the reaped attempt. Deleting before the report reaches a positive, settled state is forbidden by gate (b). No automatic retry loop is added to fix retention; retry and escalation stay source-owned.
 
 **Covered cases:** controller restart (the per-phase annotation and the `LifecycleReported` condition are durable on the run, so a new process recomputes the remaining window from the object without re-stamping, re-arming, or distorting `FinishedAt`); absent PR (no transition, no annotation, no clock start); transient source/forge failure (no transition, no early reap); stale generation (a superseded report satisfies the settled-state gate and the newer run dedupes the identity); re-discovery (after a reaped run, a source that still offers an already-blocked/resolved item does not recreate it); late `AwaitingReview → NeedsHuman` from a closed-unmerged PR (the seven-day window starts at the fresh `courier.misospace.dev/needs-human-at` annotation stamped after the close-unmerged transition's report settles, not at the original `FinishedAt`); a missing or `Unknown`/`False` `LifecycleReported` condition (the run stays unreaped until the report reaches a positive settled state or an operator intervenes — there is no fail-open delete path).
 
 **Implementation:** Bounded retention for `Failed`/`NeedsHuman` is implemented (#287, absorbing the #276 brief). `reapTerminal` (`internal/controller/reap.go`) generalizes the reaper with the per-phase `courier.misospace.dev/needs-human-at` and `courier.misospace.dev/failed-at` annotations (set-once on the first reconcile after the lifecycle report settles, never derived from `FinishedAt`), the four flags/chart values above, and the positive `LifecycleReported` settled-state gate (legacy missing/`False`/`Unknown` runs stay unreaped). It adds a per-repository audit floor — the most recent `terminalAuditKeep` `Failed`/`NeedsHuman` runs are retained past their window, and the floor counts only those phases — and the retention metrics (`courier_coderuns_reap_requests_total` for accepted deletes, `courier_coderuns_oldest_terminal_age_seconds` for what is still retained). The stale "terminal runs are never reaped" comments and assertions were retired, scoped to `AwaitingReview` and `HandedOff`. Closed-unmerged terminalization is implemented (#277): the `AwaitingReview` observation branch (`observeMergedReviewPR`, `internal/controller/merge_observation.go`) classifies the run's exact recorded pull request identity read through the forge `read-pull-request` capability — merged -> `Done`; open or unknown -> stay `AwaitingReview` at the slow cadence; closed without merge -> `NeedsHuman` with a `PullRequestClosedUnmerged` condition (`Status=True`, reason `ClosedUnmerged`, message carrying the recorded pull request identity) and the existing `blocked` source report; absent, identity-mismatched, or unreadable -> no transition. The `needs-human-at` annotation is stamped fresh by the reaper, so a late `AwaitingReview` age never causes an immediate reap, and the per-phase annotation survives controller restarts without re-stamping. `HandedOff` retention and an independent evidence TTL remain out of scope.
+
+## Explicit retry of terminal runs
+
+A terminal `Failed` or `NeedsHuman` run is inspectable and participates in
+source/work-item deduplication; deleting the CR was the only way to let the
+work run again. The designed path is an explicit, operator-authorized
+retry (#97), specified in [docs/explicit-retry.md](./docs/explicit-retry.md)
+and implemented at the core (#613): the annotation translation, the
+`status.retryRequest` state machine, and the `AttemptRequeuer` capability
+contract in `internal/source` all exist. No adapter implements the
+capability yet (runner discovery integration, Dispatch transport, and the
+manual path remain pending, #607/#608/#609), so a retry against a real
+source today settles `unsupported-source`; the path becomes end-to-end
+supported only when the adapter transports land.
+The operator annotates the terminal run
+(`courier.misospace.dev/retry`, an opaque request ID — the soft-stop
+ingress pattern); the controller alone translates it into the durable
+`status.retryRequest` record and drives a four-state machine
+(`Requested` → `Requeued`/`Moot`/`Refused`) with persist-before-dispatch
+and same-key replay for crash recovery.
+
+The requeue is source-owned: an optional `AttemptRequeuer` adapter
+capability, shaped like the fenced capacity-settlement boundary, performs
+one atomic transition that stops the old attempt from owning the work and
+makes it discoverable again — never ordinary Release/Transition emulation.
+Core never invents an attempt identity; a fresh source-issued identity
+(a new Dispatch generation, say) is what passes the dedupe barrier, and the
+retry-settled predecessor contributes a distinct settled-history predicate
+that participates only in predecessor lookup and successor naming — reusing
+the deterministic predecessor-UID successor naming — while the old
+WorkItemID stays in the dedupe map and discovery exclusions (the
+`settledCapacityExhaustion` map-skip branches remain capacity-exhaustion
+only). Exactly one replacement attempt is launched per
+predecessor lifetime; repeated or concurrent requests settle idempotently.
+
+Invariants carried over from the issue: the old run is never phase-flipped
+or deleted, and its retention clock and evidence survive the retry
+untouched (a run owing a `Requested` retry is not reap-eligible, by the
+same gate that holds a run owing a park close — the hold is evaluated
+against the run's status on every pass and re-verified on the live object
+at the delete boundary, so the annotation's presence holds the run even
+before the record is persisted, and an expired retention window is not
+standing delete authority; the window itself is never restarted or
+extended — a settled record never holds the reaper); merged or closed upstream
+work is refused — for fix-pr, a core forge guard reads the recorded PR
+identity from `spec.repo` and verifies the returned head against
+`status.headRepo`; adopted branches are preserved, never reset; `Failed`
+and `NeedsHuman` share the one path; `BlockedExternal` stays on its
+automatic recovery channel; and #510 invokes the same annotation contract
+through ordinary RBAC, with no controller bypass. Automatic retry remains
+forbidden everywhere; retention, capacity recovery, and source re-offer
+semantics are unchanged.
 
 ## Cross-worker capacity recovery
 

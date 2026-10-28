@@ -232,12 +232,13 @@ func terminalPhase(phase courierv1alpha1.Phase) bool {
 // explicit-retry record (#97/#606) that makes it non-reap-eligible. Deleting a
 // run whose retry request may already have committed source-side would drop
 // durable intent with the object, so — exactly like a run that still owes a
-// source park close — its per-phase retention window starts only once the record
-// settles. syncRetry drives the record and holds the run while it is Requested;
-// this predicate is the reap-decision gate the terminal dispatch checks before
-// starting the window, so the invariant holds even if a reconcile reaches the
-// reap decision with a record still in Requested. A settled record does not hold:
-// a retry never extends a predecessor's retention beyond its ordinary window.
+// source park close — deletion is held while the intent is outstanding.
+// syncRetry drives the record and holds the run while it is Requested; this
+// predicate is the reap-decision gate the terminal dispatch checks, so the
+// invariant holds even if a reconcile reaches the reap decision with a record
+// still in Requested. A settled record does not hold, and the retention
+// window is never restarted or extended: a retry never extends a predecessor's
+// retention beyond its ordinary window.
 func retryHoldsReap(run *courierv1alpha1.CoderRun) bool {
 	return run != nil && run.Status.RetryRequest != nil &&
 		run.Status.RetryRequest.State == courierv1alpha1.RetryRequestStateRequested
