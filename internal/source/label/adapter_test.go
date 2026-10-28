@@ -207,7 +207,9 @@ func TestNewValidatesConfigAndProvider(t *testing.T) {
 	t.Run("invalid repository shape refused", func(t *testing.T) {
 		t.Parallel()
 		provider := &fakeProvider{caps: forge.NewCapabilities(forge.CapabilityListWorkItemsByLabel, forge.CapabilityRemoveWorkItemLabel)}
-		for _, repo := range []string{"owner", "owner/repo/extra", "/repo", "owner/"} {
+		for _, repo := range []string{"owner", "owner/repo/extra", "/repo", "owner/",
+			"../repo", "repo/..", "./repo", "repo/.", "owner/./repo",
+			"own\x00er/repo", "owner/re\x00po", "owner/re\tpo"} {
 			if _, err := New(provider, Config{Repos: []string{repo}}, nil); err == nil || !strings.Contains(err.Error(), "canonical owner/name") {
 				t.Fatalf("New() with repository %q error = %v, want canonical owner/name refusal", repo, err)
 			}

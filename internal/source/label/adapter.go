@@ -290,13 +290,26 @@ func (a Adapter) resolveLabel(mode string) (string, error) {
 // validRepository accepts exactly the canonical "owner/name" identity the
 // forge layer parses: exactly one path separator and no empty segment. A
 // typo that reaches a request instead fails discovery every poll, so the
-// shape is settled once at startup.
+// shape is settled once at startup. Dot segments and control bytes are
+// refused because the endpoint builder path-escapes each segment but leaves
+// "." and ".." unchanged, and path.Join then cleans them, moving the request
+// outside /repos/{owner}/{repo}; control bytes have no legitimate owner or
+// name shape and would travel percent-encoded.
 func validRepository(repo string) error {
 	owner, name, found := strings.Cut(repo, "/")
 	if !found || owner == "" || name == "" || strings.Contains(name, "/") {
 		return fmt.Errorf("repository %q must be a canonical owner/name identity", repo)
 	}
+	for _, segment := range []string{owner, name} {
+		if segment == "." || segment == ".." || strings.ContainsFunc(segment, isControlRune) {
+			return fmt.Errorf("repository %q must be a canonical owner/name identity", repo)
+		}
+	}
 	return nil
+}
+
+func isControlRune(r rune) bool {
+	return r < 0x20 || r == 0x7f
 }
 
 // validLabel refuses the shapes that could silently wedge settlement or
