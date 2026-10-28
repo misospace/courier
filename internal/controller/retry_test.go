@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -327,8 +328,8 @@ func TestRetryAlreadyRequeuedRecordedInEventsOnly(t *testing.T) {
 	if stored.Status.RetryRequest.ID != "req-1" || stored.Status.RetryRequest.State != courierv1alpha1.RetryRequestStateRequeued || stored.Status.RetryRequest.AttemptID != "gen-1" {
 		t.Fatalf("retryRequest = %+v, want the Requeued record left untouched", stored.Status.RetryRequest)
 	}
-	if stored.Annotations[retryAnnouncedAnnotation] != "req-2" {
-		t.Fatalf("announced marker = %q, want req-2", stored.Annotations[retryAnnouncedAnnotation])
+	if stored.Annotations[retryAnnouncedAnnotation] != retryAnnouncedMarkerPrefix+retryAnnouncedToken("req-2") {
+		t.Fatalf("announced marker = %q, want the token for req-2", stored.Annotations[retryAnnouncedAnnotation])
 	}
 	if src.calls != 0 {
 		t.Fatalf("RequeueAttempt called %d times, want 0; already-requeued never requeues", src.calls)
@@ -345,6 +346,120 @@ func TestRetryAlreadyRequeuedRecordedInEventsOnly(t *testing.T) {
 	}
 	if got := parseRetryEvents(t, buf); len(got) != 0 {
 		t.Fatalf("re-announced already-requeued on the second pass: %+v", got)
+	}
+}
+
+func TestRetryAlreadyRequeuedAlternatingValuesAnnounceOnce(t *testing.T) {
+	// The marker records the announced set, not just the latest value: after
+	// req-2 and req-3 have each been announced once, a return to req-2 must not
+	// announce it a second time.
+	src := &requeueSource{admissionSource: &admissionSource{}}
+	buf := &bytes.Buffer{}
+	run := retryRun("rr", courierv1alpha1.PhaseFailed, "req-2")
+	run.Status.RetryRequest = &courierv1alpha1.RetryRequest{
+		ID: "req-1", RequestedAt: metav1.NewTime(reapClock), State: courierv1alpha1.RetryRequestStateRequeued,
+		AttemptID: "gen-1", SettledAt: &metav1.Time{Time: reapClock},
+	}
+	c := phaseClient(t, run)
+	rec := retryReconciler(c, src, reapClock, nil, buf)
+
+	for _, value := range []string{"req-2", "req-3", "req-2"} {
+		stored := getRetryRun(t, c, "rr")
+		stored.Annotations[courierv1alpha1.RetryAnnotation] = value
+		if err := c.Update(context.Background(), stored); err != nil {
+			t.Fatalf("update annotation to %q: %v", value, err)
+		}
+		if _, err := rec.Reconcile(context.Background(), admissionRequest("rr")); err != nil {
+			t.Fatalf("Reconcile for %q: %v", value, err)
+		}
+	}
+	events := parseRetryEvents(t, buf)
+	ids := []string{}
+	for _, ev := range events {
+		ids = append(ids, eventDetailString(ev, "request_id"))
+	}
+	if len(events) != 2 || ids[0] != "req-2" || ids[1] != "req-3" {
+		t.Fatalf("run.retry events for %v, want exactly one announcement each for req-2 and req-3", ids)
+	}
+}
+
+func TestRetryAlreadyRequeuedAnnounceCapStaysBounded(t *testing.T) {
+	// The marker is bounded: once the cap is reached a further distinct value is
+	// not announced (never announced more than once), and the marker does not
+	// grow past the cap.
+	tokens := make([]string, 0, maxRetryAnnouncedTokens)
+	for i := 0; i < maxRetryAnnouncedTokens; i++ {
+		tokens = append(tokens, retryAnnouncedToken(fmt.Sprintf("seed-%d", i)))
+	}
+	seeded := retryAnnouncedMarkerPrefix + strings.Join(tokens, ",")
+	src := &requeueSource{admissionSource: &admissionSource{}}
+	buf := &bytes.Buffer{}
+	run := retryRun("rr", courierv1alpha1.PhaseFailed, "fresh-1")
+	run.Status.RetryRequest = &courierv1alpha1.RetryRequest{
+		ID: "req-1", RequestedAt: metav1.NewTime(reapClock), State: courierv1alpha1.RetryRequestStateRequeued,
+		AttemptID: "gen-1", SettledAt: &metav1.Time{Time: reapClock},
+	}
+	run.Annotations[retryAnnouncedAnnotation] = seeded
+	c := phaseClient(t, run)
+	rec := retryReconciler(c, src, reapClock, nil, buf)
+
+	for _, value := range []string{"seed-5", "fresh-1"} {
+		stored := getRetryRun(t, c, "rr")
+		stored.Annotations[courierv1alpha1.RetryAnnotation] = value
+		if err := c.Update(context.Background(), stored); err != nil {
+			t.Fatalf("update annotation to %q: %v", value, err)
+		}
+		if _, err := rec.Reconcile(context.Background(), admissionRequest("rr")); err != nil {
+			t.Fatalf("Reconcile for %q: %v", value, err)
+		}
+	}
+	if got := parseRetryEvents(t, buf); len(got) != 0 {
+		t.Fatalf("announced past the cap: %+v", got)
+	}
+	stored := getRetryRun(t, c, "rr")
+	if stored.Annotations[retryAnnouncedAnnotation] != seeded {
+		t.Fatalf("announced marker changed past the cap: %q", stored.Annotations[retryAnnouncedAnnotation])
+	}
+}
+
+func TestRetryAlreadyRequeuedLegacyMarkerMigrates(t *testing.T) {
+	// A legacy single-raw-ID marker seeds the announced set on first use, so the
+	// value it announced is never announced again across the upgrade.
+	src := &requeueSource{admissionSource: &admissionSource{}}
+	buf := &bytes.Buffer{}
+	run := retryRun("rr", courierv1alpha1.PhaseFailed, "req-2")
+	run.Status.RetryRequest = &courierv1alpha1.RetryRequest{
+		ID: "req-1", RequestedAt: metav1.NewTime(reapClock), State: courierv1alpha1.RetryRequestStateRequeued,
+		AttemptID: "gen-1", SettledAt: &metav1.Time{Time: reapClock},
+	}
+	run.Annotations[retryAnnouncedAnnotation] = "req-2"
+	c := phaseClient(t, run)
+	rec := retryReconciler(c, src, reapClock, nil, buf)
+
+	// The legacy-announced value announces nothing again.
+	if _, err := rec.Reconcile(context.Background(), admissionRequest("rr")); err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	if got := parseRetryEvents(t, buf); len(got) != 0 {
+		t.Fatalf("re-announced the legacy-announced value: %+v", got)
+	}
+
+	// A new distinct value announces once and the marker becomes the token set.
+	stored := getRetryRun(t, c, "rr")
+	stored.Annotations[courierv1alpha1.RetryAnnotation] = "req-3"
+	if err := c.Update(context.Background(), stored); err != nil {
+		t.Fatalf("update annotation: %v", err)
+	}
+	if _, err := rec.Reconcile(context.Background(), admissionRequest("rr")); err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	if got := parseRetryEvents(t, buf); len(got) != 1 || eventDetailString(got[0], "request_id") != "req-3" {
+		t.Fatalf("run.retry events = %+v, want one announcement for req-3", got)
+	}
+	stored = getRetryRun(t, c, "rr")
+	want := retryAnnouncedMarkerPrefix + retryAnnouncedToken("req-2") + "," + retryAnnouncedToken("req-3")
+	if stored.Annotations[retryAnnouncedAnnotation] != want {
+		t.Fatalf("announced marker = %q, want %q", stored.Annotations[retryAnnouncedAnnotation], want)
 	}
 }
 
@@ -487,6 +602,7 @@ func TestRetryFixPRUpstreamClosed(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			src := &requeueSource{admissionSource: &admissionSource{}}
 			reader := &fakePullRequestReader{pull: observedPR(func(p forge.PullRequest) forge.PullRequest {
+				p.HeadRef = "courier/acme/widgets/pr-42"
 				p.State = pull.state
 				p.Merged = pull.merged
 				return p
@@ -563,7 +679,10 @@ func TestRetryFixPRForgeUnreadableNotConsumed(t *testing.T) {
 
 func TestRetryFixPROpenProceedsToRequeue(t *testing.T) {
 	src := &requeueSource{admissionSource: &admissionSource{}, result: source.AttemptRequeueResult{AttemptID: "gen-1"}}
-	reader := &fakePullRequestReader{pull: observedPR(func(p forge.PullRequest) forge.PullRequest { return p })}
+	reader := &fakePullRequestReader{pull: observedPR(func(p forge.PullRequest) forge.PullRequest {
+		p.HeadRef = "courier/acme/widgets/pr-42"
+		return p
+	})}
 	run := retryRun("rr", courierv1alpha1.PhaseFailed, "req-1")
 	run.Spec.Mode = courierv1alpha1.ModeFixPR
 	run.Status.PR = "42"
@@ -578,6 +697,71 @@ func TestRetryFixPROpenProceedsToRequeue(t *testing.T) {
 	}
 	if stored := getRetryRun(t, c, "rr").Status.RetryRequest; stored == nil || stored.State != courierv1alpha1.RetryRequestStateRequeued {
 		t.Fatalf("retryRequest = %+v, want Requeued when the upstream is open", stored)
+	}
+}
+
+func TestRetryFixPRIdentityMismatchNotOurUpstream(t *testing.T) {
+	for name, pull := range map[string]forgePullCase{
+		"merged": {state: "closed", merged: true},
+		"closed": {state: "closed", merged: false},
+		"open":   {state: "open", merged: false},
+	} {
+		t.Run(name, func(t *testing.T) {
+			// The pull request at the recorded number carries a drifted head, so
+			// it is not the one this run produced: neither a merge nor a close on
+			// it is this run's outcome, exactly as the merge observation treats
+			// drift, so the guard does not refuse and the requeue proceeds.
+			src := &requeueSource{admissionSource: &admissionSource{}, result: source.AttemptRequeueResult{AttemptID: "gen-1"}}
+			reader := &fakePullRequestReader{pull: observedPR(func(p forge.PullRequest) forge.PullRequest {
+				p.HeadRef = "courier/acme/widgets/drifted-branch"
+				p.State = pull.state
+				p.Merged = pull.merged
+				return p
+			})}
+			run := retryRun("rr", courierv1alpha1.PhaseFailed, "req-1")
+			run.Spec.Mode = courierv1alpha1.ModeFixPR
+			run.Status.PR = "42"
+			run.Status.Branch = "courier/acme/widgets/pr-42"
+			run.Status.HeadRepo = "acme/widgets"
+			c := phaseClient(t, run)
+
+			rec := retryReconciler(c, src, reapClock, nil, nil)
+			rec.PullRequests = reader
+			if _, err := rec.Reconcile(context.Background(), admissionRequest("rr")); err != nil {
+				t.Fatalf("Reconcile: %v", err)
+			}
+			stored := getRetryRun(t, c, "rr").Status.RetryRequest
+			if stored == nil || stored.State != courierv1alpha1.RetryRequestStateRequeued {
+				t.Fatalf("retryRequest = %+v, want Requeued when the read PR is not this run's identity", stored)
+			}
+			if src.calls != 1 {
+				t.Fatalf("RequeueAttempt called %d times, want 1 past the mismatched identity", src.calls)
+			}
+		})
+	}
+}
+
+func TestRetryFixPRNoRecordedBranchGuardNotEngaged(t *testing.T) {
+	// A recorded PR without a recorded branch has no verifiable head identity,
+	// the same stance the merge observation takes: it is left alone rather than
+	// judged by inference, so the guard does not refuse.
+	src := &requeueSource{admissionSource: &admissionSource{}, result: source.AttemptRequeueResult{AttemptID: "gen-1"}}
+	reader := &fakePullRequestReader{}
+	run := retryRun("rr", courierv1alpha1.PhaseFailed, "req-1")
+	run.Spec.Mode = courierv1alpha1.ModeFixPR
+	run.Status.PR = "42"
+	c := phaseClient(t, run)
+
+	rec := retryReconciler(c, src, reapClock, nil, nil)
+	rec.PullRequests = reader
+	if _, err := rec.Reconcile(context.Background(), admissionRequest("rr")); err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	if reader.calls != 0 {
+		t.Fatalf("forge reads = %d, want 0 without a recorded branch", reader.calls)
+	}
+	if stored := getRetryRun(t, c, "rr").Status.RetryRequest; stored == nil || stored.State != courierv1alpha1.RetryRequestStateRequeued {
+		t.Fatalf("retryRequest = %+v, want Requeued with the guard not engaged", stored)
 	}
 }
 

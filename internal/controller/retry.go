@@ -2,8 +2,11 @@ package controller
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -37,12 +40,33 @@ const (
 	// consumes the request nor fails open into a requeue.
 	retryForgeRequeueDelay = time.Minute
 
-	// retryAnnouncedAnnotation records, per run, the retry request ID whose
-	// already-requeued event and metric were last announced. It lives on the
+	// retryAnnouncedAnnotation records, per run, the set of retry request IDs
+	// whose already-requeued event and metric were last announced, as
+	// comma-joined 64-bit hash tokens (retryAnnouncedToken). It lives on the
 	// object's metadata — never its status — so the settled Requeued record that
 	// the "events only" refusal must leave byte-for-byte immutable is not touched,
-	// while the announcement stays exactly-once across reconciles and restarts.
+	// while each announcement stays exactly-once per distinct value across
+	// reconciles and restarts.
 	retryAnnouncedAnnotation = "courier.misospace.dev/retry-announced"
+
+	// maxRetryAnnouncedTokens bounds the announced set. Each announcement needs a
+	// distinct operator-written annotation value, so the bound is far above any
+	// honest use; past it, further values are not announced (never announced more
+	// than once), and the bounded marker cannot grow the object's metadata
+	// without limit or wedge the reconcile against the API server's annotation
+	// size limits.
+	maxRetryAnnouncedTokens = 32
+
+	// retryAnnouncedTokenLength is the hex length of a marker token: the first
+	// 8 bytes of the request ID's SHA-256. Collisions among a bounded set of
+	// tokens are negligible and would only suppress an announcement, never
+	// duplicate one.
+	retryAnnouncedTokenLength = 16
+
+	// retryAnnouncedMarkerPrefix versions the announced-set marker ("v1:<token>,…")
+	// so a marker that does not carry it is unambiguously a legacy single raw-ID
+	// marker, whatever characters the request ID itself contains.
+	retryAnnouncedMarkerPrefix = "v1:"
 )
 
 // validRetryRequestID reports whether an annotation value is a usable opaque
@@ -313,20 +337,85 @@ func (r *CoderRunReconciler) writeRetryRefusal(ctx context.Context, run *courier
 // only after the marker write succeeds, so a failed write re-announces rather
 // than dropping the audit signal.
 func (r *CoderRunReconciler) announceAlreadyRequeued(ctx context.Context, run *courierv1alpha1.CoderRun, annotation string) (ctrl.Result, bool, error) {
-	if run.Annotations[retryAnnouncedAnnotation] == annotation {
+	token := retryAnnouncedToken(annotation)
+	announced := retryAnnouncedSet(run.Annotations[retryAnnouncedAnnotation])
+	if _, ok := announced[token]; ok {
 		return ctrl.Result{}, false, nil
 	}
+	if len(announced) >= maxRetryAnnouncedTokens {
+		// The marker is bounded, so past the cap a further distinct value is not
+		// announced — at most once per value still holds — and the bounded
+		// metadata write cannot wedge the reconcile against annotation-size
+		// limits.
+		log.FromContext(ctx).V(1).Info("already-requeued announcement cap reached; not announcing further distinct values",
+			"run", run.Name, "requestID", annotation, "cap", maxRetryAnnouncedTokens)
+		return ctrl.Result{}, false, nil
+	}
+	announced[token] = struct{}{}
 	before := run.DeepCopy()
 	if run.Annotations == nil {
 		run.Annotations = map[string]string{}
 	}
-	run.Annotations[retryAnnouncedAnnotation] = annotation
+	run.Annotations[retryAnnouncedAnnotation] = retryAnnouncedMarker(announced)
 	if err := r.Patch(ctx, run, client.MergeFrom(before)); err != nil {
 		return ctrl.Result{}, false, err
 	}
 	r.observeRetry(run, retryOutcomeRefused)
 	r.emitRetry(run, annotation, courierv1alpha1.RetryRequestStateRefused, courierv1alpha1.RetryRefusalAlreadyRequeued, "")
 	return ctrl.Result{}, false, nil
+}
+
+// retryAnnouncedToken derives the fixed-width marker token for a request ID: the
+// hex encoding of the first 8 bytes of its SHA-256. Tokens are compared instead
+// of raw IDs so the marker cannot be confused by delimiter characters inside an
+// opaque, operator-chosen request ID.
+func retryAnnouncedToken(id string) string {
+	sum := sha256.Sum256([]byte(id))
+	return hex.EncodeToString(sum[:8])
+}
+
+// retryAnnouncedSet parses the announced marker into the set of tokens it
+// records. A marker without the version prefix is a legacy single raw-ID marker
+// from before the set encoding: its raw value was itself an announced request
+// ID, so its token seeds the set and the value it announced is never announced
+// again across the upgrade. Unparsable entries inside a versioned marker cannot
+// equal any computed token and are dropped: that can only suppress less, never
+// announce more than once.
+func retryAnnouncedSet(marker string) map[string]struct{} {
+	set := map[string]struct{}{}
+	if marker == "" {
+		return set
+	}
+	raw, versioned := strings.CutPrefix(marker, retryAnnouncedMarkerPrefix)
+	if !versioned {
+		return map[string]struct{}{retryAnnouncedToken(marker): {}}
+	}
+	for _, token := range strings.Split(raw, ",") {
+		if len(token) == retryAnnouncedTokenLength && isHex(token) {
+			set[token] = struct{}{}
+		}
+	}
+	return set
+}
+
+// retryAnnouncedMarker serializes the announced-token set back into the marker.
+func retryAnnouncedMarker(set map[string]struct{}) string {
+	tokens := make([]string, 0, len(set))
+	for token := range set {
+		tokens = append(tokens, token)
+	}
+	sort.Strings(tokens)
+	return retryAnnouncedMarkerPrefix + strings.Join(tokens, ",")
+}
+
+// isHex reports whether s consists solely of lowercase hex digits.
+func isHex(s string) bool {
+	for _, c := range s {
+		if (c < '0' || c > '9') && (c < 'a' || c > 'f') {
+			return false
+		}
+	}
+	return s != ""
 }
 
 // coreRetryRefusal decides, from the run alone and before any source call, whether
@@ -379,15 +468,20 @@ func (r *CoderRunReconciler) activeOwnerExists(ctx context.Context, run *courier
 }
 
 // fixPRUpstreamClosed reads the run's recorded pull request through the forge
-// read-pull-request capability and reports whether the upstream request is closed
+// read-pull-request capability, with the same exact head-identity check the
+// merge observation applies, and reports whether the upstream request is closed
 // for this predecessor (merged or closed without merge). unreadable is true when
 // the capability is unavailable or the read fails: the guard proves nothing and
-// must not consume the request, and never fails open into a requeue. A run with no
-// recorded pull-request number has published nothing, so there is no upstream to
-// be closed and the guard is not engaged.
+// must not consume the request, and never fails open into a requeue. A run with
+// no recorded pull-request identity — no number, or no branch to verify the head
+// against — has published nothing verifiable, so there is no upstream to be
+// closed and the guard is not engaged. A read pull request whose head identity
+// no longer matches the recorded one is not the pull request this run produced,
+// so neither a merge nor a close on it is this run's outcome and the guard is
+// likewise not engaged.
 func (r *CoderRunReconciler) fixPRUpstreamClosed(ctx context.Context, run *courierv1alpha1.CoderRun) (closed, unreadable bool, err error) {
 	number, parseErr := strconv.Atoi(strings.TrimSpace(run.Status.PR))
-	if parseErr != nil || number <= 0 {
+	if parseErr != nil || number <= 0 || strings.TrimSpace(run.Status.Branch) == "" {
 		return false, false, nil
 	}
 	if r.PullRequests == nil || !r.PullRequests.Capabilities().Available(forge.CapabilityReadPullRequest).Available {
@@ -398,6 +492,18 @@ func (r *CoderRunReconciler) fixPRUpstreamClosed(ctx context.Context, run *couri
 		log.FromContext(ctx).V(1).Info("fix-pr retry guard could not read the recorded pull request; not consuming the request",
 			"run", run.Name, "repo", run.Spec.Repo, "pr", run.Status.PR, "error", readErr.Error())
 		return false, true, nil
+	}
+	if !exactPullRequestIdentity(run, number, pull) {
+		if pull.Merged {
+			// A merged PR that is not this run's exact recorded identity is an
+			// anomaly worth one durable line: it means the recorded head
+			// drifted, and the merged work is not this run's outcome.
+			log.FromContext(ctx).Info("recorded pull request is merged but no longer matches the run's head identity; not refusing the retry",
+				"run", run.Name, "repo", run.Spec.Repo, "pr", run.Status.PR,
+				"recordedHeadRepo", run.Status.HeadRepo, "recordedBranch", run.Status.Branch,
+				"observedHeadRepo", pull.HeadRepo, "observedBranch", pull.HeadRef)
+		}
+		return false, false, nil
 	}
 	if pull.Merged || strings.EqualFold(strings.TrimSpace(pull.State), "closed") {
 		return true, false, nil

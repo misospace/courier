@@ -981,11 +981,15 @@ reasons.
 
 **The fix-pr guard reads the world through the forge.** A fix-pr run's recorded
 pull request is read through the forge read-pull-request capability, exactly as
-the merge observation reads it. A merged or closed recorded request is permanent
-for this predecessor and refuses `upstream-closed`. An unreadable forge — missing
-capability or a failed read — proves nothing, consumes nothing, and requeues rather
-than failing open into a requeue. A run that published no pull-request number has
-no upstream to be closed and the guard is not engaged.
+the merge observation reads it — including its exact head-identity check. A
+merged or closed recorded request is permanent for this predecessor and refuses
+`upstream-closed`. An unreadable forge — missing capability or a failed read —
+proves nothing, consumes nothing, and requeues rather than failing open into a
+requeue. A run with no verifiable recorded pull-request identity — no number, or
+no branch to check the head against — has no upstream to be closed and the guard
+is not engaged; a read pull request whose head identity no longer matches the
+recorded one is not the pull request this run produced, so neither a merge nor a
+close on it is this run's outcome and the guard is likewise not engaged.
 
 **One replacement, and the settled record is immutable.** A `Requeued` record ends
 the predecessor's retry surface for good; a new annotation value over it is refused
