@@ -2567,8 +2567,11 @@ Pluggable adapters over a generic interface. An adapter both *creates* runs and
   distinct. Missed occurrences are skipped, never caught up — the in-process
   cursor starts past every boundary before startup and never rewinds, so a
   completed occurrence cannot be re-materialized after retention cleanup.
-  Schedule file transport, timezone semantics, overlap behavior, and the
-  at-most-once delivery shape are documented in
+  Discovery is capacity-bounded: each poll admits at most the lane's
+  remaining capacity, deferring due jobs without consuming their cursors, so
+  simultaneous boundaries cannot oversubscribe a lane. Schedule file
+  transport, timezone semantics, overlap behavior, and the at-most-once
+  delivery shape are documented in
   [docs/cron-schedules.md](./docs/cron-schedules.md).
 - **cli / web** — ad-hoc injection: "run this issue that isn't in dispatch."
 

@@ -132,6 +132,7 @@ func New(schedules []Schedule, diagnostics *connector.Emitter, options ...Option
 }
 
 var _ source.Adapter = (*Adapter)(nil)
+var _ source.CapacityBoundedDiscoverer = (*Adapter)(nil)
 
 func (a *Adapter) clock() time.Time {
 	if a.now != nil {
@@ -146,7 +147,26 @@ func (a *Adapter) clock() time.Time {
 // Discover is offered, earlier ones in the same gap are skipped, and
 // boundaries that passed before adapter construction are never offered.
 func (a *Adapter) Discover(ctx context.Context) ([]source.WorkItem, error) {
-	items, err := a.discover(ctx)
+	return a.offer(ctx, 0)
+}
+
+// DiscoverBoundedTo offers at most slots due occurrences, the lane's remaining
+// discovery capacity for this adapter's lane. Jobs beyond the bound are not
+// consumed: their cursors stay exactly where they were, so the latest due
+// occurrence remains pending and is offered — under the same latest-only
+// rule, with any boundary passed while deferred skipped — once a later
+// discovery has capacity for it. Config order decides which due jobs are
+// admitted first, deterministically. A non-positive bound offers nothing.
+func (a *Adapter) DiscoverBoundedTo(ctx context.Context, slots int) ([]source.WorkItem, error) {
+	if slots <= 0 {
+		a.diagnostics.Availability(a.name, reasonAvailable)
+		return nil, nil
+	}
+	return a.offer(ctx, slots)
+}
+
+func (a *Adapter) offer(ctx context.Context, bound int) ([]source.WorkItem, error) {
+	items, err := a.discover(ctx, bound)
 	if err != nil {
 		a.diagnostics.Availability(a.name, reasonUnreachable)
 		return nil, err
@@ -155,7 +175,7 @@ func (a *Adapter) Discover(ctx context.Context) ([]source.WorkItem, error) {
 	return items, nil
 }
 
-func (a *Adapter) discover(ctx context.Context) ([]source.WorkItem, error) {
+func (a *Adapter) discover(ctx context.Context, bound int) ([]source.WorkItem, error) {
 	now := a.clock()
 	a.mu.Lock()
 	defer a.mu.Unlock()
@@ -173,14 +193,14 @@ func (a *Adapter) discover(ctx context.Context) ([]source.WorkItem, error) {
 			latest  time.Time
 			skipped int
 		)
+		exhausted := false
 		for boundary := state.cursor; !boundary.After(now); boundary = state.job.schedule.next(boundary) {
 			if boundary.IsZero() {
 				// The schedule is exhausted; stop advancing instead of
 				// spinning on a zero cursor.
 				log.FromContext(ctx).Error(nil, "cron schedule exhausted, disabling job",
 					"job", state.job.name)
-				state.dead = true
-				latest = time.Time{}
+				exhausted = true
 				break
 			}
 			if !latest.IsZero() {
@@ -188,7 +208,21 @@ func (a *Adapter) discover(ctx context.Context) ([]source.WorkItem, error) {
 			}
 			latest = boundary
 		}
+		if exhausted {
+			state.dead = true
+			continue
+		}
 		if latest.IsZero() {
+			continue
+		}
+		// The lane, not the schedule, gates this occurrence: leave the cursor
+		// untouched so the latest due boundary stays pending and is offered
+		// once a later discovery admits it. Advancing here would consume the
+		// occurrence while the runner cannot materialize it, losing it under
+		// the at-most-once delivery policy.
+		if bound > 0 && len(items) >= bound {
+			log.FromContext(ctx).Info("deferring due cron job, lane capacity bound reached",
+				"job", state.job.name, "latest", latest.Format(time.RFC3339))
 			continue
 		}
 		if skipped > 0 {

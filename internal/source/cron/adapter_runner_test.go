@@ -3,6 +3,7 @@ package cron
 import (
 	"context"
 	"fmt"
+	"slices"
 	"testing"
 	"time"
 
@@ -167,5 +168,150 @@ func TestRunnerMaterializesOccurrences(t *testing.T) {
 	}
 	if !found {
 		t.Fatalf("deferred occurrence did not materialize: %v", runs.Items)
+	}
+}
+
+// TestRunnerAdmitsDueOccurrencesWithinLaneCapacity is the overlap-contract
+// regression: two cron jobs due on the same boundary with lane concurrency 1
+// admit at most one occurrence per free lane slot per poll. The job the lane
+// cannot admit is deferred without consuming its cursor, and once capacity
+// returns its latest due occurrence materializes — under the same
+// latest-only rule as any other gap, never replayed as catch-up and never
+// lost.
+func TestRunnerAdmitsDueOccurrencesWithinLaneCapacity(t *testing.T) {
+	// The adapter is constructed before the first boundary so the 11:00
+	// occurrences are due rather than pre-startup (which the cursor would
+	// skip by design).
+	current := utc(t, "2026-01-05T10:00:00Z")
+	now := func() time.Time { return current }
+	adapter := New([]Schedule{hourly("triage"), hourly("audit")}, nil, WithNow(now))
+	current = utc(t, "2026-01-05T11:00:01Z")
+
+	lane := &courierv1alpha1.LaneProfile{
+		ObjectMeta: metav1.ObjectMeta{Namespace: "courier", Name: "frontier"},
+		Spec:       courierv1alpha1.LaneProfileSpec{Concurrency: 1},
+	}
+	scheme := runtime.NewScheme()
+	if err := courierv1alpha1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	kubeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(lane).Build()
+	runner := source.NewRunner(kubeClient, adapter, source.RunnerConfig{
+		Source:      "cron",
+		SourceAgent: "frontier",
+		LaneProfile: "frontier",
+		Namespace:   "courier",
+	})
+	runner.Now = now
+
+	listRuns := func() []courierv1alpha1.CoderRun {
+		t.Helper()
+		var runs courierv1alpha1.CoderRunList
+		if err := kubeClient.List(context.Background(), &runs, client.InNamespace("courier")); err != nil {
+			t.Fatal(err)
+		}
+		return runs.Items
+	}
+	settle := func(workItemID string) {
+		t.Helper()
+		var runs courierv1alpha1.CoderRunList
+		if err := kubeClient.List(context.Background(), &runs, client.InNamespace("courier")); err != nil {
+			t.Fatal(err)
+		}
+		settled := false
+		for i := range runs.Items {
+			if runs.Items[i].Spec.WorkItemID != workItemID {
+				continue
+			}
+			// In production the operator advances the phase; the test writes
+			// it directly. A terminal phase releases the lane's discovery
+			// reservation.
+			runs.Items[i].Status.Phase = courierv1alpha1.PhaseDone
+			if err := kubeClient.Update(context.Background(), &runs.Items[i]); err != nil {
+				t.Fatal(err)
+			}
+			settled = true
+		}
+		if !settled {
+			t.Fatalf("run for %q vanished before it could settle", workItemID)
+		}
+	}
+	workItemIDs := func(runs []courierv1alpha1.CoderRun) []string {
+		out := make([]string, 0, len(runs))
+		for _, run := range runs {
+			out = append(out, run.Spec.WorkItemID)
+		}
+		return out
+	}
+
+	eleven := utc(t, "2026-01-05T11:00:00Z")
+	// Both jobs are due at the same 11:00 boundary, but the concurrency-1
+	// lane has room for exactly one new discovery reservation: the bounded
+	// adapter admits the first job in config order and exactly one run
+	// materializes.
+	if err := runner.Poll(context.Background()); err != nil {
+		t.Fatalf("poll with two jobs due on a saturated-boundary lane: %v", err)
+	}
+	runs := listRuns()
+	if len(runs) != 1 {
+		t.Fatalf("poll materialized %d runs, want exactly the lane's one free slot: %v", len(runs), workItemIDs(runs))
+	}
+	if runs[0].Spec.WorkItemID != fmt.Sprintf("triage@%d", eleven.Unix()) {
+		t.Fatalf("admitted work item = %q, want the first configured job's occurrence", runs[0].Spec.WorkItemID)
+	}
+
+	// A repeat poll while capacity is held stops at the runner's pause gate
+	// before the adapter is called: still exactly one run, nothing
+	// materialized behind it. The adapter-side deferral is exercised below,
+	// once capacity returns and discovery runs again with a bound.
+	if err := runner.Poll(context.Background()); err != nil {
+		t.Fatalf("repeat poll at capacity: %v", err)
+	}
+	if got := len(listRuns()); got != 1 {
+		t.Fatalf("repeat poll left %d runs, want 1", got)
+	}
+
+	// Capacity returns (the run settles) and the next boundary passes: the
+	// lane still admits only one occurrence per poll, so the triage job's
+	// 12:00 boundary materializes and the audit job stays deferred.
+	settle(runs[0].Spec.WorkItemID)
+	current = utc(t, "2026-01-05T12:00:01Z")
+	if err := runner.Poll(context.Background()); err != nil {
+		t.Fatalf("poll after capacity returned: %v", err)
+	}
+	twelve := utc(t, "2026-01-05T12:00:00Z")
+	runs = listRuns()
+	if len(runs) != 2 {
+		t.Fatalf("poll after capacity returned left %d runs, want 2: %v", len(runs), workItemIDs(runs))
+	}
+	if !slices.Contains(workItemIDs(runs), fmt.Sprintf("triage@%d", twelve.Unix())) {
+		t.Fatalf("newly due triage occurrence did not materialize: %v", workItemIDs(runs))
+	}
+	for _, run := range runs {
+		if run.Spec.WorkItemID == fmt.Sprintf("audit@%d", twelve.Unix()) {
+			t.Fatalf("audit occurrence materialized beyond the lane's single slot: %v", workItemIDs(runs))
+		}
+	}
+
+	// The triage run settles too; the audit job — deferred twice with its
+	// cursor untouched — now offers its latest due boundary. The 11:00
+	// occurrence it held while deferred is gone under the same latest-only
+	// rule as any other gap; it is not replayed as catch-up and not lost
+	// silently: the 12:00 occurrence is the one that materializes.
+	settle(fmt.Sprintf("triage@%d", twelve.Unix()))
+	if err := runner.Poll(context.Background()); err != nil {
+		t.Fatalf("poll admitting the deferred job: %v", err)
+	}
+	runs = listRuns()
+	if len(runs) != 3 {
+		t.Fatalf("final poll left %d runs, want 3: %v", len(runs), workItemIDs(runs))
+	}
+	if !slices.Contains(workItemIDs(runs), fmt.Sprintf("audit@%d", twelve.Unix())) {
+		t.Fatalf("deferred job's latest due occurrence did not materialize: %v", workItemIDs(runs))
+	}
+	for _, run := range runs {
+		if run.Spec.WorkItemID == fmt.Sprintf("audit@%d", eleven.Unix()) {
+			t.Fatalf("deferred occurrence replayed as catch-up: %v", workItemIDs(runs))
+		}
 	}
 }

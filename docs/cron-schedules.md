@@ -73,14 +73,20 @@ wants the next occurrence simply lets the schedule fire again.
 ## Overlap policy
 
 Deduplication is per occurrence identity only; the adapter keeps no
-overlap state. The lane's concurrency limit serializes execution: while a
-prior run holds the lane's capacity, source discovery pauses entirely, so
-the next occurrence is not materialized as a Pending run behind it — no
-CoderRun exists yet. When capacity returns, the latest due occurrence
-materializes and any boundary that passed while discovery was paused is
-skipped by the same latest-only rule as any other gap. At most one
-occurrence per job is ever outstanding, and operators pace work through
-the schedule — pick periods longer than a typical run duration.
+overlap state. The lane's concurrency limit serializes execution through
+capacity-bounded discovery: each poll's discovery is bounded to the lane's
+remaining capacity, so due occurrences beyond what the lane can admit are
+deferred, not consumed — the deferred job's cursor stays exactly where it
+was, keeping the latest due boundary pending (the adapter implements the
+`source.CapacityBoundedDiscoverer` capability; config order decides which
+due jobs are admitted first). While a prior run holds the lane's capacity,
+source discovery pauses entirely, so the next occurrence is not materialized
+as a Pending run behind it — no CoderRun exists yet. When capacity returns,
+the latest due occurrence materializes and any boundary that passed while
+the job was deferred or discovery was paused is skipped by the same
+latest-only rule as any other gap. At most one occurrence per job is ever
+outstanding, and operators pace work through the schedule — pick periods
+longer than a typical run duration.
 
 ## Delivery shape
 

@@ -3,6 +3,7 @@ package cron
 import (
 	"context"
 	"fmt"
+	"slices"
 	"testing"
 	"time"
 
@@ -362,5 +363,98 @@ func TestAvailabilityObservations(t *testing.T) {
 		"connector": connectorName, "signal": connector.SignalAvailability, "reason": reasonUnreachable,
 	}); !ok || got != 1 {
 		t.Fatalf("availability/unreachable counter = %v, ok=%v; want 1", got, ok)
+	}
+}
+
+// TestBoundedDiscoveryDefersWithoutConsuming proves the lane-capacity
+// admission contract: DiscoverBoundedTo offers at most the bound, in config
+// order, and jobs beyond the bound are not consumed — their cursors stay
+// exactly where they were, so the latest due occurrence stays pending and a
+// later discovery with capacity offers it under the same latest-only rule,
+// never as a catch-up replay.
+func TestBoundedDiscoveryDefersWithoutConsuming(t *testing.T) {
+	// The adapter is constructed before the first boundary so the 11:00
+	// occurrence is due rather than pre-startup (which the cursor would
+	// skip by design).
+	current := utc(t, "2026-01-05T10:00:00Z")
+	a := New([]Schedule{hourly("triage"), hourly("audit")}, nil, WithNow(func() time.Time {
+		return current
+	}))
+	current = utc(t, "2026-01-05T11:00:01Z")
+
+	// A non-positive bound offers nothing and consumes nothing.
+	if items, err := a.DiscoverBoundedTo(context.Background(), 0); err != nil || len(items) != 0 {
+		t.Fatalf("DiscoverBoundedTo(0) = %v, %v; want no offers", items, err)
+	}
+
+	// Two jobs are due at the same 11:00 boundary; a bound of one admits
+	// only the first job in config order.
+	items, err := a.DiscoverBoundedTo(context.Background(), 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	boundary := utc(t, "2026-01-05T11:00:00Z")
+	if got, want := ids(items), []string{fmt.Sprintf("triage@%d", boundary.Unix())}; !slices.Equal(got, want) {
+		t.Fatalf("bounded offers = %v, want %v", got, want)
+	}
+
+	// The bound still binds while the deferred job stays due: the second
+	// job's cursor was not consumed, so it keeps offering — and once the
+	// first job's boundary is past its cursor, the deferred job's latest
+	// due occurrence is admitted.
+	items, err = a.DiscoverBoundedTo(context.Background(), 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := ids(items), []string{fmt.Sprintf("audit@%d", boundary.Unix())}; !slices.Equal(got, want) {
+		t.Fatalf("deferred job offers = %v, want %v", got, want)
+	}
+
+	// Latest-only survives deferral, and deferral never consumes: hold the
+	// deferred job back past a boundary, then an unbounded Discover at the
+	// same instant offers the audit job's latest due boundary — the cursor
+	// stayed where the deferral left it, and the boundary passed while
+	// deferred is skipped, not caught up.
+	current = utc(t, "2026-01-05T13:00:01Z")
+	items, err = a.DiscoverBoundedTo(context.Background(), 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	lateBoundary := utc(t, "2026-01-05T13:00:00Z")
+	if got, want := ids(items), []string{fmt.Sprintf("triage@%d", lateBoundary.Unix())}; !slices.Equal(got, want) {
+		t.Fatalf("later bounded offers = %v, want %v", got, want)
+	}
+	if got, want := ids(discover(t, a, "2026-01-05T13:00:01Z")), []string{fmt.Sprintf("audit@%d", lateBoundary.Unix())}; !slices.Equal(got, want) {
+		t.Fatalf("deferred job's unbounded offers = %v, want %v", got, want)
+	}
+	// And the advanced cursors never replay before their next boundary.
+	if items := discover(t, a, "2026-01-05T13:59:01Z"); len(items) != 0 {
+		t.Fatalf("unbounded Discover after deferral advanced = %v, want none", items)
+	}
+}
+
+// TestBoundedDiscoveryAdmitsEverythingWhenSlotsAllow proves a bound at or
+// above the number of due jobs behaves exactly like unbounded Discover.
+func TestBoundedDiscoveryAdmitsEverythingWhenSlotsAllow(t *testing.T) {
+	current := utc(t, "2026-01-05T10:00:00Z")
+	clock := func() time.Time { return current }
+	boundedAdapter := New([]Schedule{hourly("triage"), hourly("audit")}, nil, WithNow(clock))
+	unboundedAdapter := New([]Schedule{hourly("triage"), hourly("audit")}, nil, WithNow(clock))
+	current = utc(t, "2026-01-05T11:00:01Z")
+	bounded, err := boundedAdapter.DiscoverBoundedTo(context.Background(), 5)
+	if err != nil {
+		t.Fatal(err)
+	}
+	unbounded := discover(t, unboundedAdapter, "2026-01-05T11:00:01Z")
+	boundary := utc(t, "2026-01-05T11:00:00Z")
+	want := []string{
+		fmt.Sprintf("triage@%d", boundary.Unix()),
+		fmt.Sprintf("audit@%d", boundary.Unix()),
+	}
+	if !slices.Equal(ids(bounded), want) {
+		t.Fatalf("bounded=%v, want %v", ids(bounded), want)
+	}
+	if !slices.Equal(ids(unbounded), ids(bounded)) {
+		t.Fatalf("bounded=%v unbounded=%v; want identical two-job offers", ids(bounded), ids(unbounded))
 	}
 }
