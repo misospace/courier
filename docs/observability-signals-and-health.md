@@ -690,13 +690,13 @@ so the CRD stays float-free (the "Per-run telemetry (#172)" section of
 
 ## 9. Alternate source adapter without Dispatch
 
-A label-driven forge connector (`github-label` in the "Sources" section of
-[DESIGN.md](../DESIGN.md)) uses the same core layer with no Dispatch concepts:
+A label-driven forge connector (`github-label`, implemented in
+`internal/source/label/`) uses the same core layer with no Dispatch concepts:
 
 | Capability | Behaviour under this design |
 | --- | --- |
 | discovery | emits `courier_source_discovery_*` from its own forge client; failure causes are its own `connector.diagnostic` reasons (#291) |
-| exclusions | absent — no `courier_source_discovery_skipped` beyond core validation; no exclusion signals required |
+| exclusions | implemented — the adapter filters retained same-source work itself, so `courier_source_discovery_skipped` stays limited to core validation reasons |
 | lifecycle report | optional; if unsupported, runs still record their terminal phase and `LifecycleReportSupported=False` is simply not set |
 | reservations/capacity | identical core signals; the connector knows nothing about them |
 | health | `ok`/`degraded`/`unavailable`/`starting`/`disabled` from the same rules |

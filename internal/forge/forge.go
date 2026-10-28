@@ -37,6 +37,9 @@ const (
 	CapabilityCreatePullRequest Capability = "create-pull-request"
 	CapabilityUpdatePullRequest Capability = "update-pull-request"
 	CapabilityComment           Capability = "comment"
+
+	CapabilityListWorkItemsByLabel Capability = "list-work-items-by-label"
+	CapabilityRemoveWorkItemLabel  Capability = "remove-work-item-label"
 )
 
 // knownCapabilities is the closed capability vocabulary. Register accepts
@@ -44,14 +47,16 @@ const (
 // raw-passthrough unrepresentable: they have no constant and therefore
 // cannot be registered.
 var knownCapabilities = map[Capability]struct{}{
-	CapabilityReadWorkItem:      {},
-	CapabilityReadPullRequest:   {},
-	CapabilityListReviews:       {},
-	CapabilityListComments:      {},
-	CapabilityReadChecks:        {},
-	CapabilityCreatePullRequest: {},
-	CapabilityUpdatePullRequest: {},
-	CapabilityComment:           {},
+	CapabilityReadWorkItem:         {},
+	CapabilityReadPullRequest:      {},
+	CapabilityListReviews:          {},
+	CapabilityListComments:         {},
+	CapabilityReadChecks:           {},
+	CapabilityCreatePullRequest:    {},
+	CapabilityUpdatePullRequest:    {},
+	CapabilityComment:              {},
+	CapabilityListWorkItemsByLabel: {},
+	CapabilityRemoveWorkItemLabel:  {},
 }
 
 // Availability is the diagnostic for a capability. Detail explains
@@ -321,6 +326,38 @@ type RepositoryPolicyProvider interface {
 // Implementations must include every state; callers compare full head identity.
 type PullRequestHeadLister interface {
 	ListPullRequestsByHead(context.Context, PullRequestRef, string, string) ([]PullRequest, error)
+}
+
+// WorkItemKind selects which forge objects a labeled listing returns. A
+// forge's issues endpoint commonly serves both issues and pull requests, so
+// the caller states the kind it wants and the provider filters exactly.
+type WorkItemKind string
+
+const (
+	WorkItemKindIssue       WorkItemKind = "issue"
+	WorkItemKindPullRequest WorkItemKind = "pull-request"
+)
+
+// LabeledWorkItemLister optionally lists open work items carrying a given
+// label in one repository. Implementations return only currently open items
+// of exactly the requested kind — a pull request never appears in an issue
+// listing and an issue never appears in a pull-request listing — and each
+// returned WorkItem carries its repository and forge-native ID. It is the
+// typed read behind label-driven source adapters; without it such an adapter
+// has no discovery, so a provider that cannot list by label must not claim
+// the capability.
+type LabeledWorkItemLister interface {
+	ListWorkItemsByLabel(context.Context, string /* repo */, string /* label */, WorkItemKind) ([]WorkItem, error)
+}
+
+// WorkItemLabelMutator optionally removes one label from one work item. The
+// removal is idempotent: removing a label the item no longer carries is
+// success, never an error, because a settled run must be able to retire its
+// trigger label on every retry without inventing a distinct failure. It is
+// the typed write behind label-driven source adapters; no other label
+// mutation is part of the contract.
+type WorkItemLabelMutator interface {
+	RemoveWorkItemLabel(context.Context, WorkItemRef, string /* label */) error
 }
 
 // Provider interface remains the model-influenced forge surface.
