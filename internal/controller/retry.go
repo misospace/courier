@@ -231,7 +231,8 @@ func (r *CoderRunReconciler) beginRetry(ctx context.Context, run *courierv1alpha
 // state, replaying its idempotency key against the adapter. It is the crash-
 // recovery path: whatever happened between the Requested write and the outcome
 // write, the same key is re-presented and the source replays its committed
-// transition (or reports it moot).
+// transition — the committed success, which settles Requeued — or reports that
+// the work already moved on through another path (Moot).
 func (r *CoderRunReconciler) settleRetryRecord(ctx context.Context, run *courierv1alpha1.CoderRun, record *courierv1alpha1.RetryRequest) (ctrl.Result, bool, error) {
 	adapter, item, err := r.adapterAndWorkItem(run)
 	if err != nil {
@@ -250,9 +251,11 @@ func (r *CoderRunReconciler) settleRetryRecord(ctx context.Context, run *courier
 
 // callRequeue is the single adapter-call-and-settle point for a Requested record,
 // used both immediately after the Requested write and on a later replay. Success
-// settles Requeued with any returned attempt identity; a classified refusal settles
-// Moot or Refused; any other error is transient and leaves the durable Requested
-// record untouched to retry under the same key.
+// settles Requeued with any returned attempt identity — including the success a
+// committed key replays after a lost response, so the predecessor settles
+// Requeued rather than Moot. A classified refusal settles Moot (the work already
+// moved on without this key) or Refused; any other error is transient and leaves
+// the durable Requested record untouched to retry under the same key.
 func (r *CoderRunReconciler) callRequeue(ctx context.Context, run *courierv1alpha1.CoderRun, record *courierv1alpha1.RetryRequest, requeuer source.AttemptRequeuer, item source.WorkItem) (ctrl.Result, bool, error) {
 	req := source.AttemptRequeueRequest{
 		FenceToken:     run.Status.SourceReceipt,
@@ -267,6 +270,9 @@ func (r *CoderRunReconciler) callRequeue(ctx context.Context, run *courierv1alph
 	if errors.As(err, &refusal) {
 		if refusal.Moot {
 			// The moot family carries exactly one reason in the closed vocabulary.
+			// A Moot refusal asserts that the work already moved on without this
+			// request's key; a key this request committed replays its committed
+			// success instead, which settles Requeued above.
 			// Any adapter-supplied value — empty, unknown, or longer than the CRD's
 			// 128-code-point bound — is normalized to it, so a hostile or buggy
 			// adapter cannot mint free text, and an oversized reason cannot fail the

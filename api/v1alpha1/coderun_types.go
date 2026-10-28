@@ -173,9 +173,10 @@ const (
 // refusals decided before the source call; the last three are source-state
 // refusals the adapter returns after the Requested write. already-requeued has
 // two roles: it is the single reason of the moot family, carried by a settled Moot
-// record where the source committed the requeue under the key but the controller
-// never learned (the lost-response fail-safe replay), and it is the events-only
-// reason for a fresh request arriving over an already-settled Requeued record —
+// record where the source reports the work already moved on through some other
+// request or path — never for a key this request committed, since a committed key
+// replays its committed success and settles Requeued — and it is the events-only
+// reason for a fresh request arriving over an already-settled Requeued record:
 // that announcement never rewrites the settled record.
 const (
 	RetryRefusalNotRetryablePhase        = "not-retryable-phase"
@@ -212,7 +213,11 @@ type RetryRequest struct {
 	ID string `json:"id"`
 	// RequestedAt is when the controller first stamped this request.
 	RequestedAt metav1.Time `json:"requestedAt"`
-	// State is the durable retry request state.
+	// State is the durable retry request state: Requested while the intent is
+	// outstanding, Requeued once the source committed the requeue (including the
+	// success a committed key replays after a lost response), Moot when the work
+	// already moved on without this request's key, and Refused when the request
+	// was declined.
 	State RetryRequestState `json:"state"`
 	// Reason is the bounded refusal/moot reason for a settled Refused/Moot
 	// record, and empty while Requested or for a Requeued success. It is drawn

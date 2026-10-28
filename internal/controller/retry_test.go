@@ -50,6 +50,27 @@ func (s *requeueSource) RequeueAttempt(_ context.Context, _ source.WorkItem, req
 	return s.result, nil
 }
 
+// lostResponseSource commits the requeue under the idempotency key and then
+// loses the response: the first call for a key commits and fails as a transient
+// error, and every later call with the same key replays the committed result —
+// the behavior the source contract requires of a committed key.
+type lostResponseSource struct {
+	*admissionSource
+	requests  []source.AttemptRequeueRequest
+	committed map[string]source.AttemptRequeueResult
+	commits   int
+}
+
+func (s *lostResponseSource) RequeueAttempt(_ context.Context, _ source.WorkItem, req source.AttemptRequeueRequest) (source.AttemptRequeueResult, error) {
+	s.requests = append(s.requests, req)
+	if res, ok := s.committed[req.IdempotencyKey]; ok {
+		return res, nil
+	}
+	s.commits++
+	s.committed[req.IdempotencyKey] = source.AttemptRequeueResult{AttemptID: fmt.Sprintf("gen-%d", s.commits)}
+	return source.AttemptRequeueResult{}, errors.New("source response lost after the requeue committed")
+}
+
 // retryRun returns a long-lived terminal run in the given phase with its source
 // lifecycle report positively settled (the retry-eligibility gate), carrying the
 // retry annotation. An empty requestID omits the annotation.
@@ -261,7 +282,13 @@ func TestRetryReplaySettlesAlreadyRequested(t *testing.T) {
 	}
 }
 
-func TestRetryReplayMootSettlesMoot(t *testing.T) {
+func TestRetryMootRefusalSettlesMoot(t *testing.T) {
+	// A Moot refusal asserts that the work already moved on without this
+	// request's key — it was requeued or superseded by another request or path.
+	// It is not the lost-response outcome: a key this request committed replays
+	// its committed success and settles Requeued (see
+	// TestRetryLostResponseReplaySettlesRequeued), because only Requeued
+	// releases the predecessor's barrier.
 	src := &requeueSource{admissionSource: &admissionSource{}, refusal: &source.RetryRefusalError{Moot: true}}
 	run := retryRun("rr", courierv1alpha1.PhaseFailed, "req-old")
 	run.Status.RetryRequest = &courierv1alpha1.RetryRequest{ID: "req-old", RequestedAt: metav1.NewTime(reapClock), State: courierv1alpha1.RetryRequestStateRequested}
@@ -277,6 +304,63 @@ func TestRetryReplayMootSettlesMoot(t *testing.T) {
 	}
 	if cond := retryCondition(t, stored); cond.Status != metav1.ConditionTrue || cond.Reason != courierv1alpha1.ConditionReasonRetryMoot {
 		t.Fatalf("condition = %s/%s, want True/Moot", cond.Status, cond.Reason)
+	}
+}
+
+// TestRetryLostResponseReplaySettlesRequeued pins the lost-response contract:
+// the source commits the requeue and loses the response, so the durable
+// Requested record stands; the same key is re-presented and the source replays
+// its committed success, which settles Requeued — the state the runner uses to
+// release the predecessor's barrier. A Moot settlement would strand that
+// barrier, so the replay must never be reported as moot.
+func TestRetryLostResponseReplaySettlesRequeued(t *testing.T) {
+	src := &lostResponseSource{admissionSource: &admissionSource{}, committed: map[string]source.AttemptRequeueResult{}}
+	reg := prometheus.NewRegistry()
+	run := retryRun("rr", courierv1alpha1.PhaseFailed, "req-1")
+	c := phaseClient(t, run)
+	r := retryReconciler(c, src, reapClock, reg, nil)
+
+	// First reconcile: Requested persisted, the source commits, the response is
+	// lost. Nothing about the requeue is proven, so the record stands Requested.
+	result, err := r.Reconcile(context.Background(), admissionRequest("rr"))
+	if err != nil {
+		t.Fatalf("first Reconcile: %v", err)
+	}
+	if result.RequeueAfter != retrySettlementRequeueDelay {
+		t.Fatalf("RequeueAfter = %v, want the settlement retry cadence while Requested", result.RequeueAfter)
+	}
+	held := getRetryRun(t, c, "rr")
+	if held.Status.RetryRequest == nil || held.Status.RetryRequest.State != courierv1alpha1.RetryRequestStateRequested {
+		t.Fatalf("retryRequest = %+v, want it to stay Requested after the lost response", held.Status.RetryRequest)
+	}
+
+	// Second reconcile: the same key is re-presented and the source replays the
+	// committed success.
+	if _, err := r.Reconcile(context.Background(), admissionRequest("rr")); err != nil {
+		t.Fatalf("second Reconcile: %v", err)
+	}
+	settled := getRetryRun(t, c, "rr")
+	rec := settled.Status.RetryRequest
+	if rec.State != courierv1alpha1.RetryRequestStateRequeued {
+		t.Fatalf("retryRequest = %+v, want Requeued: a committed key replays its committed success, never a moot refusal", rec)
+	}
+	if rec.AttemptID != "gen-1" {
+		t.Fatalf("attemptID = %q, want the replayed committed identity", rec.AttemptID)
+	}
+	if rec.Reason != "" {
+		t.Fatalf("reason = %q, want empty on a Requeued success", rec.Reason)
+	}
+	if cond := retryCondition(t, settled); cond.Status != metav1.ConditionTrue || cond.Reason != courierv1alpha1.ConditionReasonRetryRequeued {
+		t.Fatalf("condition = %s/%s, want True/Requeued", cond.Status, cond.Reason)
+	}
+	if src.commits != 1 {
+		t.Fatalf("source commits = %d, want exactly one replacement launched", src.commits)
+	}
+	if len(src.requests) != 2 || src.requests[0].IdempotencyKey != src.requests[1].IdempotencyKey {
+		t.Fatalf("requeue requests = %+v, want both keyed identically for the replay", src.requests)
+	}
+	if got := gatherMetric(t, reg, "courier_coderun_retry_requests_total", map[string]string{"lane": "local", "mode": "resolve-issue", "result": "requeued"}); got.GetCounter().GetValue() != 1 {
+		t.Fatalf("requeued counter = %v, want 1", got.GetCounter().GetValue())
 	}
 }
 

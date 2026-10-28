@@ -267,7 +267,10 @@ type AttemptRequeueRequest struct {
 	// attempt twice and a lost response can replay. It is derived from the
 	// immutable run incarnation and the opaque request ID, never from model,
 	// worker, or lane names. A committed key MUST replay its original result
-	// without mutating a newer owner.
+	// without mutating a newer owner — and that result is the committed
+	// success, never a refusal: a key whose requeue committed but whose
+	// response was lost replays the success, so the core settles the request
+	// Requeued.
 	IdempotencyKey string
 	// Reason is a bounded operator note carried for the source's audit; it is
 	// untrusted data and is never executed or interpreted by the adapter.
@@ -290,17 +293,19 @@ type AttemptRequeueResult struct {
 // returns to settle a retry request as Moot or Refused with a bounded reason from
 // the core's refusal vocabulary (RetryRefusalStaleGeneration,
 // RetryRefusalHeldForHuman, RetryRefusalSourceRefused, or — for the moot family —
-// RetryRefusalAlreadyRequeued). Moot is the fail-safe lost-response outcome: the
-// source committed the requeue under the same key but the controller never
-// learned, so replaying the key returns moot and no second replacement launches.
-// Any other (non-RetryRefusalError) error is a transient source failure: the
-// request stays Requested and retries under the same key. Core maps only the
-// closed reasons; an unknown reason is treated as source-refused.
+// RetryRefusalAlreadyRequeued). Any other (non-RetryRefusalError) error is a
+// transient source failure: the request stays Requested and retries under the same
+// key. Core maps only the closed reasons; an unknown reason is treated as
+// source-refused.
 type RetryRefusalError struct {
 	// Reason is a bounded value from the core refusal vocabulary.
 	Reason string
-	// Moot marks an already-committed requeue (already-requeued / superseded),
-	// which settles the record Moot rather than Refused.
+	// Moot marks work that already moved on without this request's key — it was
+	// requeued or superseded by some other request or path — so the record
+	// settles Moot rather than Refused. Moot is deliberately not the
+	// lost-response outcome: a key that committed the requeue replays its
+	// committed success (see AttemptRequeuer), so the predecessor settles
+	// Requeued and the runner can release its barrier.
 	Moot bool
 	// Err is an optional wrapped cause, never surfaced to status.
 	Err error
@@ -331,6 +336,14 @@ func (e *RetryRefusalError) Unwrap() error {
 // budget, without resolving anything, and without touching any other attempt. A
 // committed idempotency key MUST replay its original result without mutating a
 // newer owner, exactly as the capacity-settlement contract requires.
+//
+// That original result is the committed success. A key whose requeue committed
+// but whose response was lost MUST replay that success, never a refusal: the
+// core then settles the request Requeued — the only settled state that releases
+// the predecessor's barrier. Moot is reserved for work that already moved on
+// through some other request or path; returning it for a key this request
+// committed would strand the predecessor's barrier and leave the replacement
+// work unreleased.
 //
 // An adapter implements this interface only if its source can requeue atomically
 // with fencing. Adapters whose source cannot must not implement it and must never

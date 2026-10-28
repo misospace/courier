@@ -950,9 +950,12 @@ eligibility rules persists `Requested` **before** any source call, so the intent
 survives a crash before or during the call; a later reconcile replays the **same**
 idempotency key `coderun/<ns>/<name>/<sha256(requestID)>[/<uid>]` — the opaque
 request ID is folded into a hex digest so no operator-written character can alias
-another request's key or collide with the UID segment — and the source either
-replays its committed transition or reports it moot — one replacement attempt ever
-launches per predecessor. A transient source failure proves nothing about the
+another request's key or collide with the UID segment — and the source replays its
+committed transition: the committed **success**, so a request whose key committed
+the requeue but lost its response settles `Requeued`. A `Moot` refusal asserts
+something else — that the work already moved on through some *other* request or
+path — and never covers this request's own committed key. One replacement attempt
+ever launches per predecessor. A transient source failure proves nothing about the
 requeue, so the `Requested` record stands unchanged and retries under the same key
 on a bounded cadence, never the workqueue's growing backoff.
 
@@ -977,9 +980,13 @@ implement a fenced requeue that carries the run's source receipt and the
 idempotency key; the core never fakes a requeue with ordinary claim/release or
 transition calls. An adapter without the capability is a permanent
 `unsupported-source` refusal. An adapter-classified refusal settles `Moot` (the
-work is already requeued) or `Refused`, and any reason outside the closed
-vocabulary is normalized to `source-refused`, so a buggy adapter cannot mint
-reasons. The adapter's returned attempt identity is likewise bounded: a value
+work already moved on without this request's key) or `Refused`, and any reason
+outside the closed vocabulary is normalized to `source-refused`, so a buggy adapter
+cannot mint reasons. A key this request committed replays its committed success —
+never a refusal — so the predecessor settles `Requeued`; `Moot` is reserved for
+work that moved on through another path, and deliberately does not stand in for
+this request's own committed requeue. The adapter's returned attempt identity is
+likewise bounded: a value
 over the CRD's 256-code-point limit on `status.retryRequest.attemptID` is
 dropped (settled without an identity) rather than allowed to fail the settle
 write and wedge the record `Requested` — the requeue has already committed.

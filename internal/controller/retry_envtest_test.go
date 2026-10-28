@@ -288,6 +288,52 @@ func TestEnvtestRetryPartialFailureReplaysAndSettles(t *testing.T) {
 	}
 }
 
+// TestEnvtestRetryLostResponseReplaySettlesRequeued proves the lost-response
+// contract against the real API server: the source commits the requeue and
+// loses the response, so the durable record stays Requested; the same key is
+// re-presented and the source replays its committed success, which settles
+// Requeued through the CRD — never Moot, which would strand the predecessor's
+// barrier and leave the replacement work unreleased.
+func TestEnvtestRetryLostResponseReplaySettlesRequeued(t *testing.T) {
+	if envtestClient == nil {
+		t.Skip("KUBEBUILDER_ASSETS is not set")
+	}
+	const name, namespace = "retry-lost-response", "retry-lost-response"
+	ctx := context.Background()
+	createRetryTerminalRun(t, name, namespace, courierv1alpha1.PhaseFailed, "req-1", courierv1alpha1.ModeResolveIssue)
+
+	src := &lostResponseSource{admissionSource: &admissionSource{}, committed: map[string]source.AttemptRequeueResult{}}
+	reconciler := newEnvtestRetryReconciler(src, nil, nil)
+
+	// First reconcile: Requested is persisted before the source call, the source
+	// commits, and the response is lost — so nothing about the requeue is proven
+	// and the durable record stands.
+	if _, err := reconciler.Reconcile(ctx, retryEnvtestRequest(name, namespace)); err != nil {
+		t.Fatalf("first Reconcile: %v", err)
+	}
+	held := getRetryEnvtestRun(t, name, namespace)
+	if held.Status.RetryRequest == nil || held.Status.RetryRequest.State != courierv1alpha1.RetryRequestStateRequested {
+		t.Fatalf("retryRequest = %+v, want Requested after the lost source response", held.Status.RetryRequest)
+	}
+
+	// Second reconcile: the same key is re-presented and the committed success
+	// replays, settling Requeued.
+	if _, err := reconciler.Reconcile(ctx, retryEnvtestRequest(name, namespace)); err != nil {
+		t.Fatalf("second Reconcile: %v", err)
+	}
+	settled := getRetryEnvtestRun(t, name, namespace)
+	rec := settled.Status.RetryRequest
+	if rec.State != courierv1alpha1.RetryRequestStateRequeued || rec.AttemptID != "gen-1" || rec.SettledAt == nil {
+		t.Fatalf("retryRequest = %+v, want Requeued with the replayed committed identity through the CRD", rec)
+	}
+	if src.commits != 1 {
+		t.Fatalf("source commits = %d, want exactly one replacement launched", src.commits)
+	}
+	if len(src.requests) != 2 || src.requests[0].IdempotencyKey != src.requests[1].IdempotencyKey {
+		t.Fatalf("requeue requests = %+v, want both keyed identically for the replay", src.requests)
+	}
+}
+
 // TestEnvtestRetryRetentionGate proves a run carrying a Requested retry record is
 // not reap-eligible and its retention window does not start; once the record
 // settles, the ordinary Failed window begins.

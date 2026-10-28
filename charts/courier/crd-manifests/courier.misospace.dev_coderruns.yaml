@@ -902,7 +902,12 @@ spec:
                     nullable: true
                     type: string
                   state:
-                    description: State is the durable retry request state.
+                    description: |-
+                      State is the durable retry request state: Requested while the intent is
+                      outstanding, Requeued once the source committed the requeue (including the
+                      success a committed key replays after a lost response), Moot when the work
+                      already moved on without this request's key, and Refused when the request
+                      was declined.
                     enum:
                     - Requested
                     - Requeued
