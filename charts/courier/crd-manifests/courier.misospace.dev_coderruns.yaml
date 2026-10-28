@@ -109,18 +109,24 @@ spec:
                 minLength: 1
                 type: string
               mode:
-                description: 'Mode is the kind of work: resolve-issue or fix-pr.'
+                description: 'Mode is the kind of work: resolve-issue, fix-pr, or
+                  contribute.'
                 enum:
                 - resolve-issue
                 - fix-pr
+                - contribute
                 type: string
               ref:
-                description: Ref is the issue number (resolve-issue) or PR number
-                  (fix-pr).
+                description: |-
+                  Ref is the issue number (resolve-issue) or PR number (fix-pr). Required
+                  for resolve-issue and fix-pr runs; empty for contribute runs, which
+                  carry no source-owned work item (#595).
                 minimum: 1
                 type: integer
               repo:
-                description: Repo is the target repository, "owner/name".
+                description: |-
+                  Repo is the target repository, "owner/name". For a contribute run it is
+                  the base repository the pull request targets.
                 minLength: 3
                 pattern: ^[^/]+/[^/]+$
                 type: string
@@ -148,10 +154,17 @@ spec:
                   the Kubernetes name or the numeric ref.
                 minLength: 1
                 type: string
+              workRepo:
+                description: |-
+                  WorkRepo is the repository the run publishes its work branch to,
+                  "owner/name". Required for contribute runs, where it is the approved
+                  fork of Repo; empty for resolve-issue and fix-pr runs, which publish
+                  inside Repo (#595).
+                pattern: ^[^/]+/[^/]+$
+                type: string
             required:
             - lane
             - mode
-            - ref
             - repo
             - source
             - workItemID
@@ -159,6 +172,10 @@ spec:
             x-kubernetes-validations:
             - message: spec is immutable
               rule: self == oldSelf
+            - message: contribute runs require spec.workRepo and no spec.ref; resolve-issue
+                and fix-pr runs require spec.ref and no spec.workRepo
+              rule: (self.mode == 'contribute' && !has(self.ref) && has(self.workRepo))
+                || (self.mode != 'contribute' && has(self.ref) && !has(self.workRepo))
           status:
             description: CoderRunStatus is the observed state of a CoderRun.
             properties:

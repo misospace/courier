@@ -5,7 +5,7 @@ import (
 )
 
 // Mode is the kind of work a CoderRun performs.
-// +kubebuilder:validation:Enum=resolve-issue;fix-pr
+// +kubebuilder:validation:Enum=resolve-issue;fix-pr;contribute
 type Mode string
 
 const (
@@ -13,6 +13,10 @@ const (
 	ModeResolveIssue Mode = "resolve-issue"
 	// ModeFixPR: take over an existing PR and get it back to a healthy state.
 	ModeFixPR Mode = "fix-pr"
+	// ModeContribute: open a PR from the approved fork named by spec.workRepo
+	// into the base repository spec.repo, for a goal carried in spec.sourceContext
+	// and no source-owned work item (#595).
+	ModeContribute Mode = "contribute"
 )
 
 // SoftStopAnnotation is the human ingress for an operator soft-stop of a
@@ -150,8 +154,9 @@ const (
 // There is deliberately no attempts field: each CoderRun is one immutable
 // attempt at one goal. History is the sequence of runs linked by the branch/PR.
 // +kubebuilder:validation:XValidation:rule="self == oldSelf",message="spec is immutable"
+// +kubebuilder:validation:XValidation:rule="(self.mode == 'contribute' && !has(self.ref) && has(self.workRepo)) || (self.mode != 'contribute' && has(self.ref) && !has(self.workRepo))",message="contribute runs require spec.workRepo and no spec.ref; resolve-issue and fix-pr runs require spec.ref and no spec.workRepo"
 type CoderRunSpec struct {
-	// Mode is the kind of work: resolve-issue or fix-pr.
+	// Mode is the kind of work: resolve-issue, fix-pr, or contribute.
 	Mode Mode `json:"mode"`
 
 	// Source names the adapter that created this run
@@ -194,14 +199,26 @@ type CoderRunSpec struct {
 	// +kubebuilder:validation:items:MaxLength=1024
 	AssignmentReasons []string `json:"assignmentReasons,omitempty"`
 
-	// Repo is the target repository, "owner/name".
+	// Repo is the target repository, "owner/name". For a contribute run it is
+	// the base repository the pull request targets.
 	// +kubebuilder:validation:MinLength=3
 	// +kubebuilder:validation:Pattern=`^[^/]+/[^/]+$`
 	Repo string `json:"repo"`
 
-	// Ref is the issue number (resolve-issue) or PR number (fix-pr).
+	// WorkRepo is the repository the run publishes its work branch to,
+	// "owner/name". Required for contribute runs, where it is the approved
+	// fork of Repo; empty for resolve-issue and fix-pr runs, which publish
+	// inside Repo (#595).
+	// +optional
+	// +kubebuilder:validation:Pattern=`^[^/]+/[^/]+$`
+	WorkRepo string `json:"workRepo,omitempty"`
+
+	// Ref is the issue number (resolve-issue) or PR number (fix-pr). Required
+	// for resolve-issue and fix-pr runs; empty for contribute runs, which
+	// carry no source-owned work item (#595).
+	// +optional
 	// +kubebuilder:validation:Minimum=1
-	Ref int `json:"ref"`
+	Ref int `json:"ref,omitempty"`
 
 	// Lane names the LaneProfile that supplies the model ensemble and framing.
 	// +kubebuilder:validation:MinLength=1
