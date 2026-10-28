@@ -325,7 +325,19 @@ func (f *brokerFixture) remoteWorkTip() (string, bool, error) {
 // integration tree, the way a new control incarnation would.
 func (f *brokerFixture) engineFor() *PublicationEngine {
 	f.t.Helper()
-	tree := NewIntegrator(filepath.Join(f.t.TempDir(), "integration"), nil)
+	dir := filepath.Join(f.t.TempDir(), "integration")
+	// The tree is initialized here, before Seed, so the auto-gc disable
+	// lands in it: a detached background gc writing into .git after the
+	// last synchronous git command races t.TempDir cleanup on CI runners
+	// and flakes the test at cleanup. The bootstrap and artifact tests pin
+	// the same config on their integrator trees.
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		f.t.Fatalf("integration tree directory: %v", err)
+	}
+	gitCmd(f.t, dir, "init", "--quiet", "--initial-branch", "integration")
+	gitCmd(f.t, dir, "config", "gc.auto", "0")
+	gitCmd(f.t, dir, "config", "gc.autoDetach", "false")
+	tree := NewIntegrator(dir, nil)
 	engine, err := NewPublicationEngine(f.client(), tree)
 	if err != nil {
 		f.t.Fatal(err)
