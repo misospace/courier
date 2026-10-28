@@ -560,11 +560,14 @@ func TestRetryBlockedExternalAutomaticRecoveryChannel(t *testing.T) {
 func TestRetryActiveOwnerExists(t *testing.T) {
 	src := &requeueSource{admissionSource: &admissionSource{}}
 	run := retryRun("rr", courierv1alpha1.PhaseFailed, "req-1")
-	// A sibling run for the same source work is still Running.
+	// A sibling run for the same source work is still Running — with a
+	// different source agent, which must not matter: ownership is per
+	// Source + Repo + Ref, not per agent.
 	other := admissionRun("sibling", "local", courierv1alpha1.PhaseRunning)
 	other.Spec.Repo = run.Spec.Repo
 	other.Spec.Ref = run.Spec.Ref
 	other.Spec.Source = run.Spec.Source
+	other.Spec.SourceAgent = "some-other-agent"
 	c := phaseClient(t, run, other)
 
 	if _, err := retryReconciler(c, src, reapClock, nil, nil).Reconcile(context.Background(), admissionRequest("rr")); err != nil {

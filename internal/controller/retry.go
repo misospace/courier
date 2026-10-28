@@ -436,12 +436,14 @@ func coreRetryRefusal(run *courierv1alpha1.CoderRun) (string, bool) {
 	}
 }
 
-// activeOwnerExists reports whether another CoderRun for the same source-
-// granular work — qualified source identity plus repository and ref — is still
-// active (Pending, Claimed, Running, or Verifying) in the namespace. It reads
-// through the uncached reader so a sibling run's just-persisted admission is
-// never missed by a lagging cache. This is the "never bypass active ownership"
-// invariant, checked against the world independent of any source report.
+// activeOwnerExists reports whether another CoderRun for the same
+// source-granular work — qualified source identity plus repository and ref — is
+// still active (Pending, Claimed, Running, or Verifying) in the namespace. The
+// identity is Source + Repo + Ref, independent of the source agent: work is
+// owned per source work item, not per agent. It reads through the uncached
+// reader so a sibling run's just-persisted admission is never missed by a
+// lagging cache. This is the "never bypass active ownership" invariant, checked
+// against the world independent of any source report.
 func (r *CoderRunReconciler) activeOwnerExists(ctx context.Context, run *courierv1alpha1.CoderRun) (bool, error) {
 	var runs courierv1alpha1.CoderRunList
 	if err := r.reader().List(ctx, &runs, client.InNamespace(run.Namespace)); err != nil {
@@ -452,7 +454,7 @@ func (r *CoderRunReconciler) activeOwnerExists(ctx context.Context, run *courier
 		if other.Name == run.Name {
 			continue
 		}
-		if other.Spec.Source != run.Spec.Source || other.Spec.SourceAgent != run.Spec.SourceAgent {
+		if other.Spec.Source != run.Spec.Source {
 			continue
 		}
 		if other.Spec.Repo != run.Spec.Repo || other.Spec.Ref != run.Spec.Ref {
