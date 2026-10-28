@@ -82,6 +82,51 @@ func TestChartRendersDispatchConfiguration(t *testing.T) {
 	}
 }
 
+func TestChartRendersLabelSourceConfiguration(t *testing.T) {
+	if _, err := exec.LookPath("helm"); err != nil {
+		t.Skip("helm is not installed")
+	}
+	chartDir := copyChart(t)
+	if err := exec.Command("helm", "repo", "add", "bjw-s-labs", "https://bjw-s-labs.github.io/helm-charts").Run(); err != nil {
+		t.Fatalf("configure chart repository: %v", err)
+	}
+	runHelm(t, chartDir, "dependency", "build")
+	enabled := runHelm(t, chartDir, "template", "courier", ".",
+		"--set", "labelSource.enabled=true",
+		"--set", "labelSource.repos={owner/one,owner/two}",
+		"--set", "labelSource.triggerLabel=forge-work",
+		"--set", "labelSource.fixLabel=review-fix",
+		"--set", "labelSource.lane=lane-y",
+		"--set", "labelSource.pollInterval=47s",
+	)
+	for _, want := range []string{
+		"--label-source-enabled=true",
+		"--label-source-repos=owner/one,owner/two",
+		"--label-source-trigger-label=forge-work",
+		"--label-source-fix-label=review-fix",
+		"--label-source-lane=lane-y",
+		"--label-source-poll-interval=47s",
+	} {
+		if !strings.Contains(enabled, want) {
+			t.Fatalf("Label-source-enabled chart output is missing %q", want)
+		}
+	}
+
+	disabled := runHelm(t, chartDir, "template", "courier", ".", "--set", "dispatch.enabled=false")
+	for _, unwanted := range []string{
+		"--label-source-enabled",
+		"--label-source-repos",
+		"--label-source-trigger-label",
+		"--label-source-fix-label",
+		"--label-source-lane",
+		"--label-source-poll-interval",
+	} {
+		if strings.Contains(disabled, unwanted) {
+			t.Fatalf("Label-source-disabled chart output unexpectedly contains %q", unwanted)
+		}
+	}
+}
+
 func TestRBACResourceNamesMatchCoderunCRD(t *testing.T) {
 	crd := mustReadChartFile(t, "crd-manifests/courier.misospace.dev_coderruns.yaml")
 	generated := mustReadRepositoryFile(t, "config/rbac/role.yaml")

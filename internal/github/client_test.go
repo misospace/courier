@@ -1159,3 +1159,120 @@ func TestTransportErrorTransientAvailability(t *testing.T) {
 		t.Fatal("forge.IsTransientAvailability(transportError) = false, want true")
 	}
 }
+
+func TestListIssuesByLabelQueriesLabelAndOpenState(t *testing.T) {
+	t.Parallel()
+	var rawQuery string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/repos/acme/demo/issues" {
+			http.NotFound(w, r)
+			return
+		}
+		rawQuery = r.URL.RawQuery
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `[{"number":5,"state":"open","title":"issue"},{"number":7,"state":"open","title":"pr","pull_request":{}}]`)
+	}))
+	defer server.Close()
+	client, err := NewClient(server.URL, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	issues, err := client.ListIssuesByLabel(context.Background(), "acme", "demo", "courier trigger")
+	if err != nil {
+		t.Fatalf("ListIssuesByLabel: %v", err)
+	}
+	if len(issues) != 2 || issues[0].Number != 5 || issues[0].PullRequest != nil || issues[1].PullRequest == nil {
+		t.Fatalf("issues = %#v, want one issue and one pull request", issues)
+	}
+	if !strings.Contains(rawQuery, "labels=courier+trigger") && !strings.Contains(rawQuery, "labels=courier%20trigger") {
+		t.Fatalf("query %q does not carry the escaped label filter", rawQuery)
+	}
+	if !strings.Contains(rawQuery, "state=open") {
+		t.Fatalf("query %q must use state=open", rawQuery)
+	}
+}
+
+func TestListIssuesByLabelPaginate(t *testing.T) {
+	var pages []string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		pages = append(pages, r.URL.Query().Get("page"))
+		w.Header().Set("Content-Type", "application/json")
+		if r.URL.Query().Get("page") == "1" {
+			issues := make([]Issue, 100)
+			for i := range issues {
+				issues[i].Number = i + 1
+			}
+			_ = json.NewEncoder(w).Encode(issues)
+			return
+		}
+		_, _ = io.WriteString(w, `[{"number":101}]`)
+	}))
+	defer server.Close()
+	client, err := NewClient(server.URL, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	issues, err := client.ListIssuesByLabel(context.Background(), "acme", "demo", "courier")
+	if err != nil || len(issues) != 101 {
+		t.Fatalf("issues = %d, %v; want 101 issues", len(issues), err)
+	}
+	if got := strings.Join(pages, ","); got != "1,2" {
+		t.Fatalf("pages = %q, want 1,2", got)
+	}
+}
+
+func TestRemoveIssueLabel(t *testing.T) {
+	t.Parallel()
+	t.Run("success", func(t *testing.T) {
+		t.Parallel()
+		var method, path string
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			method, path = r.Method, r.URL.Path
+			w.WriteHeader(http.StatusNoContent)
+		}))
+		defer server.Close()
+		client, err := NewClient(server.URL, "")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := client.RemoveIssueLabel(context.Background(), "acme", "demo", 7, "in review"); err != nil {
+			t.Fatalf("RemoveIssueLabel: %v", err)
+		}
+		// r.URL.Path is the single-decoded form: a double-escaped label
+		// would decode back to a literal escape sequence here, which is
+		// exactly the bug this assertion exists to catch.
+		if method != http.MethodDelete || path != "/repos/acme/demo/issues/7/labels/in review" {
+			t.Fatalf("request = %s %q, want DELETE with the label escaped exactly once", method, path)
+		}
+	})
+	t.Run("missing label is idempotent success", func(t *testing.T) {
+		t.Parallel()
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			http.NotFound(w, r)
+		}))
+		defer server.Close()
+		client, err := NewClient(server.URL, "")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := client.RemoveIssueLabel(context.Background(), "acme", "demo", 7, "courier"); err != nil {
+			t.Fatalf("RemoveIssueLabel on 404 = %v, want idempotent success", err)
+		}
+	})
+	t.Run("other API errors surface", func(t *testing.T) {
+		t.Parallel()
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			http.Error(w, "boom", http.StatusInternalServerError)
+		}))
+		defer server.Close()
+		client, err := NewClient(server.URL, "")
+		if err != nil {
+			t.Fatal(err)
+		}
+		var apiErr *APIError
+		if err := client.RemoveIssueLabel(context.Background(), "acme", "demo", 7, "courier"); !errors.As(err, &apiErr) || apiErr.StatusCode != http.StatusInternalServerError {
+			t.Fatalf("RemoveIssueLabel error = %v, want HTTP 500 APIError", err)
+		}
+	})
+}

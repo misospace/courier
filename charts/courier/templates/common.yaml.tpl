@@ -26,6 +26,12 @@
 {{- $hasDispatchLaneBinding := false }}
 {{- $hasDispatchPollInterval := false }}
 {{- $hasDispatchHTTPTimeout := false }}
+{{- $hasLabelSourceEnabled := false }}
+{{- $hasLabelSourceRepos := false }}
+{{- $hasLabelSourceTriggerLabel := false }}
+{{- $hasLabelSourceFixLabel := false }}
+{{- $hasLabelSourceLane := false }}
+{{- $hasLabelSourcePollInterval := false }}
 {{- range $arg := $args }}
 {{- if hasPrefix "--executor-image=" $arg }}
 {{- $hasExecutorImage = true }}
@@ -65,6 +71,24 @@
 {{- end }}
 {{- if hasPrefix "--dispatch-http-timeout=" $arg }}
 {{- $hasDispatchHTTPTimeout = true }}
+{{- end }}
+{{- if or (eq $arg "--label-source-enabled") (hasPrefix "--label-source-enabled=" $arg) }}
+{{- $hasLabelSourceEnabled = true }}
+{{- end }}
+{{- if hasPrefix "--label-source-repos=" $arg }}
+{{- $hasLabelSourceRepos = true }}
+{{- end }}
+{{- if hasPrefix "--label-source-trigger-label=" $arg }}
+{{- $hasLabelSourceTriggerLabel = true }}
+{{- end }}
+{{- if hasPrefix "--label-source-fix-label=" $arg }}
+{{- $hasLabelSourceFixLabel = true }}
+{{- end }}
+{{- if hasPrefix "--label-source-lane=" $arg }}
+{{- $hasLabelSourceLane = true }}
+{{- end }}
+{{- if hasPrefix "--label-source-poll-interval=" $arg }}
+{{- $hasLabelSourcePollInterval = true }}
 {{- end }}
 {{- end }}
 {{- if not $hasExecutorImage }}
@@ -144,6 +168,30 @@
 {{- $env := deepCopy ($container.env | default (dict)) }}
 {{- $_ := set $env "DISPATCH_AGENT_TOKEN" (dict "valueFrom" (dict "secretKeyRef" (dict "name" $dispatch.tokenSecret.name "key" $dispatch.tokenSecret.key))) }}
 {{- $_ := set $container "env" $env }}
+{{- end }}
+{{- $labelSource := .Values.labelSource }}
+{{- if $labelSource.enabled }}
+{{- if or (not $labelSource.repos) (not $labelSource.lane) }}
+{{- fail "labelSource.enabled requires labelSource.repos and labelSource.lane" }}
+{{- end }}
+{{- $hasCredential := false }}
+{{- range $arg := $args }}
+{{- if hasPrefix "--git-credential-secret=" $arg }}
+{{- if ne (trimPrefix "--git-credential-secret=" $arg) "" }}{{- $hasCredential = true }}{{- end }}
+{{- end }}
+{{- if hasPrefix "--github-credential-secret=" $arg }}
+{{- if ne (trimPrefix "--github-credential-secret=" $arg) "" }}{{- $hasCredential = true }}{{- end }}
+{{- end }}
+{{- end }}
+{{- if not $hasCredential }}
+{{- fail "labelSource.enabled requires a non-empty --git-credential-secret or --github-credential-secret arg: the label source reuses the operator's own forge credential and fails fast without one" }}
+{{- end }}
+{{- if not $hasLabelSourceEnabled }}{{- $args = append $args "--label-source-enabled=true" }}{{- end }}
+{{- if not $hasLabelSourceRepos }}{{- $args = append $args (printf "--label-source-repos=%s" (join "," $labelSource.repos)) }}{{- end }}
+{{- if and (not $hasLabelSourceTriggerLabel) $labelSource.triggerLabel }}{{- $args = append $args (printf "--label-source-trigger-label=%s" $labelSource.triggerLabel) }}{{- end }}
+{{- if and (not $hasLabelSourceFixLabel) $labelSource.fixLabel }}{{- $args = append $args (printf "--label-source-fix-label=%s" $labelSource.fixLabel) }}{{- end }}
+{{- if not $hasLabelSourceLane }}{{- $args = append $args (printf "--label-source-lane=%s" $labelSource.lane) }}{{- end }}
+{{- if and (not $hasLabelSourcePollInterval) $labelSource.pollInterval }}{{- $args = append $args (printf "--label-source-poll-interval=%s" $labelSource.pollInterval) }}{{- end }}
 {{- end }}
 {{- $secure := .Values.secure }}
 {{- if $secure.enabled }}

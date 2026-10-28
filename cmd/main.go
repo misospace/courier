@@ -32,6 +32,7 @@ import (
 	courierlog "github.com/misospace/courier/internal/log"
 	"github.com/misospace/courier/internal/source"
 	"github.com/misospace/courier/internal/source/dispatch"
+	"github.com/misospace/courier/internal/source/label"
 	"github.com/misospace/courier/internal/source/manual"
 	"github.com/misospace/courier/internal/status"
 )
@@ -148,6 +149,18 @@ func main() {
 	flag.Var(&dispatchLaneBindings, "dispatch-lane-binding", "Repeatable Dispatch binding <queueLane>:<laneProfile>[:<agentName>]; one discovery runner per binding.")
 	flag.DurationVar(&dispatchPollInterval, "dispatch-poll-interval", 30*time.Second, "Dispatch discovery poll interval.")
 	flag.DurationVar(&dispatchHTTPTimeout, "dispatch-http-timeout", 30*time.Second, "Dispatch HTTP request timeout.")
+	var labelSourceEnabled bool
+	var labelSourceRepos string
+	var labelSourceTriggerLabel string
+	var labelSourceFixLabel string
+	var labelSourceLane string
+	var labelSourcePollInterval time.Duration
+	flag.BoolVar(&labelSourceEnabled, "label-source-enabled", false, "Enable the forge label source discovery (#16).")
+	flag.StringVar(&labelSourceRepos, "label-source-repos", "", "Comma-separated owner/repo list the label source discovers work in; required when --label-source-enabled.")
+	flag.StringVar(&labelSourceTriggerLabel, "label-source-trigger-label", label.DefaultTriggerLabel, "Issue label that offers a resolve-issue run.")
+	flag.StringVar(&labelSourceFixLabel, "label-source-fix-label", label.DefaultFixLabel, "Pull-request label that offers a fix-pr run.")
+	flag.StringVar(&labelSourceLane, "label-source-lane", "", "LaneProfile assigned to discovered label-source work; required when --label-source-enabled.")
+	flag.DurationVar(&labelSourcePollInterval, "label-source-poll-interval", 30*time.Second, "Label source discovery poll interval.")
 	flag.StringVar(&evidenceIntakeKeySecret, "evidence-intake-key-secret", "", "Name of the Secret in the operator namespace holding the evidence intake HMAC key under the \"key\" entry; empty with no --evidence-intake-service disables evidence wiring.")
 	flag.StringVar(&evidenceIntakeService, "evidence-intake-service", "", "URL coordinator pods POST failure evidence to; required with --evidence-intake-key-secret.")
 	flag.StringVar(&evidenceIntakeBind, "evidence-intake-bind", "", "Address the operator's own evidence-intake server binds to in-process (for example :8082); the chart derives the matching --evidence-intake-service URL. Empty leaves the operator-side intake off, and a non-empty value requires --evidence-intake-key-secret.")
@@ -345,6 +358,9 @@ func main() {
 	sources := controller.NewSourceRegistry(map[string]source.Adapter{
 		"manual": manual.New(diagnostics),
 	})
+	// Discovery metrics are process-wide and registered once; every source
+	// runner emits into them nil-safely via this shared instance.
+	discoveryMetrics := source.NewDiscoveryMetrics(crmetrics.Registry)
 	if dispatchEnabled {
 		if strings.TrimSpace(dispatchBaseURL) == "" || strings.TrimSpace(dispatchAgentName) == "" {
 			setupLog.Error(fmt.Errorf("dispatch requires base URL and agent name"), "unable to configure Dispatch source")
@@ -386,9 +402,6 @@ func main() {
 			legacyClient.WithPRFixExclusions(true)
 		}
 		sources.Register("dispatch", dispatch.New(legacyClient, dispatch.WithConnectorDiagnostics(diagnostics)))
-		// Discovery metrics are process-wide and registered once; each
-		// binding's runner emits into them nil-safely via the shared instance.
-		discoveryMetrics := source.NewDiscoveryMetrics(crmetrics.Registry)
 		for _, binding := range bindings {
 			bindingClient, err := dispatch.NewClientWithLane(dispatchBaseURL, binding.agentName, binding.queueLane, token, dispatchHTTPTimeout)
 			if err != nil {
@@ -424,6 +437,69 @@ func main() {
 			}
 			setupLog.Info("registered Dispatch binding", "queueLane", binding.queueLane, "laneProfile", binding.laneProfile, "agentName", binding.agentName)
 		}
+	}
+
+	if labelSourceEnabled {
+		namespace := strings.TrimSpace(os.Getenv("POD_NAMESPACE"))
+		if namespace == "" {
+			setupLog.Error(fmt.Errorf("POD_NAMESPACE is empty"), "unable to configure label source")
+			os.Exit(1)
+		}
+		if strings.TrimSpace(labelSourceLane) == "" {
+			setupLog.Error(fmt.Errorf("label source requires a LaneProfile binding"), "unable to configure label source")
+			os.Exit(1)
+		}
+		repos := make([]string, 0, 1)
+		for _, repo := range strings.Split(labelSourceRepos, ",") {
+			if repo = strings.TrimSpace(repo); repo != "" {
+				repos = append(repos, repo)
+			}
+		}
+		if len(repos) == 0 {
+			setupLog.Error(fmt.Errorf("label source requires --label-source-repos"), "unable to configure label source")
+			os.Exit(1)
+		}
+		// The label source shares the operator's own forge read/write
+		// identity: every discovery read and settlement write routes through
+		// the forge.Provider capability seam, never a forge-specific CLI.
+		token, err := loadGitHubToken(startupCtx, mgr.GetAPIReader(), namespace, githubCredentialSecret, githubTokenKey, gitCredentialSecret, gitTokenKey)
+		if err != nil {
+			setupLog.Error(err, "unable to configure label source")
+			os.Exit(1)
+		}
+		if token == "" {
+			setupLog.Error(fmt.Errorf("label source requires a GitHub API credential Secret (--github-credential-secret or --git-credential-secret)"), "unable to configure label source")
+			os.Exit(1)
+		}
+		githubClient, err := couriergithub.New(token)
+		if err != nil {
+			setupLog.Error(err, "unable to configure label source")
+			os.Exit(1)
+		}
+		provider := couriergithub.NewProvider(forge.ProviderConfig{Name: "github"}, githubClient)
+		adapter, err := label.New(provider, label.Config{
+			Repos:        repos,
+			TriggerLabel: labelSourceTriggerLabel,
+			FixLabel:     labelSourceFixLabel,
+			Lane:         labelSourceLane,
+		}, diagnostics)
+		if err != nil {
+			setupLog.Error(err, "unable to configure label source")
+			os.Exit(1)
+		}
+		sources.Register("github-label", adapter)
+		runner := source.NewRunner(mgr.GetClient(), adapter, source.RunnerConfig{
+			Source:       "github-label",
+			LaneProfile:  labelSourceLane,
+			Namespace:    namespace,
+			PollInterval: labelSourcePollInterval,
+		})
+		runner.Metrics = discoveryMetrics
+		if err := mgr.Add(runner); err != nil {
+			setupLog.Error(err, "unable to add label source discovery runner")
+			os.Exit(1)
+		}
+		setupLog.Info("registered label source", "repos", strings.Join(repos, ","), "laneProfile", labelSourceLane)
 	}
 
 	reconciler := &controller.CoderRunReconciler{
@@ -649,16 +725,38 @@ func dispatchPRStateChecker(observer controller.WorldObserver) (dispatch.PullReq
 // and merge observation — resolves its destination through the registration
 // serving the repository rather than the GitHub.com default (#377).
 func githubObserver(ctx context.Context, reader client.Reader, namespace, configuredSecret, configuredKey, gitSecret, gitKey string, registry *forge.Registry) (controller.WorldObserver, error) {
+	token, err := loadGitHubToken(ctx, reader, namespace, configuredSecret, configuredKey, gitSecret, gitKey)
+	if err != nil {
+		return nil, err
+	}
+	if token == "" {
+		return nil, nil
+	}
+	githubClient, err := couriergithub.New(token)
+	if err != nil {
+		return nil, err
+	}
+	return couriergithub.Observer{Client: githubClient, Registrations: registry}, nil
+}
+
+// loadGitHubToken resolves the operator's own GitHub API credential from the
+// configured Secret, falling back from the API-specific Secret to the legacy
+// git credential Secret the way --github-credential-secret documents. Both
+// secret names empty means the deployment configured no API credential at
+// all: the helper returns an empty token with no error, so callers that can
+// run without the credential treat it as disabled while callers that cannot
+// fail fast on the empty token.
+func loadGitHubToken(ctx context.Context, reader client.Reader, namespace, configuredSecret, configuredKey, gitSecret, gitKey string) (string, error) {
 	secretName := strings.TrimSpace(configuredSecret)
 	if secretName == "" {
 		secretName = strings.TrimSpace(gitSecret)
 	}
 	if secretName == "" {
-		return nil, nil
+		return "", nil
 	}
 	namespace = strings.TrimSpace(namespace)
 	if namespace == "" {
-		return nil, fmt.Errorf("POD_NAMESPACE is required when a GitHub credential Secret is configured")
+		return "", fmt.Errorf("POD_NAMESPACE is required when a GitHub credential Secret is configured")
 	}
 	secretKey := strings.TrimSpace(configuredKey)
 	if secretKey == "" {
@@ -670,19 +768,15 @@ func githubObserver(ctx context.Context, reader client.Reader, namespace, config
 	var secret corev1.Secret
 	if err := reader.Get(ctx, client.ObjectKey{Namespace: namespace, Name: secretName}, &secret); err != nil {
 		if apierrors.IsNotFound(err) {
-			return nil, fmt.Errorf("GitHub credential Secret %s/%s: %w", namespace, secretName, err)
+			return "", fmt.Errorf("GitHub credential Secret %s/%s: %w", namespace, secretName, err)
 		}
-		return nil, fmt.Errorf("read GitHub credential Secret %s/%s: %w", namespace, secretName, err)
+		return "", fmt.Errorf("read GitHub credential Secret %s/%s: %w", namespace, secretName, err)
 	}
 	token, ok := secret.Data[secretKey]
 	if !ok || strings.TrimSpace(string(token)) == "" {
-		return nil, fmt.Errorf("GitHub credential Secret %s/%s has no non-empty %q key", namespace, secretName, secretKey)
+		return "", fmt.Errorf("GitHub credential Secret %s/%s has no non-empty %q key", namespace, secretName, secretKey)
 	}
-	githubClient, err := couriergithub.New(string(token))
-	if err != nil {
-		return nil, err
-	}
-	return couriergithub.Observer{Client: githubClient, Registrations: registry}, nil
+	return string(token), nil
 }
 
 // loadEvidenceKey reads the evidence intake HMAC key from the named Secret in

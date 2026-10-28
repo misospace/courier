@@ -26,6 +26,11 @@ func TestProviderImplementsContract(t *testing.T) {
 	if got := p.Capabilities().Available(forge.CapabilityListReviews); got.Available {
 		t.Fatalf("CapabilityListReviews availability = %#v, want unavailable", got)
 	}
+	for _, capability := range []forge.Capability{forge.CapabilityListWorkItemsByLabel, forge.CapabilityRemoveWorkItemLabel} {
+		if got := p.Capabilities().Available(capability); !got.Available {
+			t.Fatalf("capability %q availability = %#v, want available", capability, got)
+		}
+	}
 }
 
 func TestProviderCoveredOperations(t *testing.T) {
@@ -603,5 +608,67 @@ func TestProviderCreatePullRequestCrossRepoHead(t *testing.T) {
 	}
 	if created.Number != 7 || created.BaseRepo != "acme/demo" || created.HeadRepo != "octo/widgets" || created.HeadRef != "goal-abc" || created.HeadSHA != "work123" {
 		t.Fatalf("CreatePullRequest() = %#v, want the full cross-repo identity from the response", created)
+	}
+}
+
+func TestProviderListWorkItemsByLabelFiltersKind(t *testing.T) {
+	t.Parallel()
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/repos/acme/demo/issues" {
+			http.NotFound(w, r)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `[{"number":5,"state":"open","title":"issue","html_url":"https://github.com/acme/demo/issues/5"},{"number":7,"state":"open","title":"pr","pull_request":{}}]`)
+	}))
+	defer server.Close()
+	client, err := NewClient(server.URL, "token")
+	if err != nil {
+		t.Fatal(err)
+	}
+	p := NewProvider(forge.ProviderConfig{Name: "gh", Endpoint: server.URL}, client)
+
+	issues, err := p.ListWorkItemsByLabel(context.Background(), "acme/demo", "courier", forge.WorkItemKindIssue)
+	if err != nil {
+		t.Fatalf("ListWorkItemsByLabel(issue): %v", err)
+	}
+	if len(issues) != 1 || issues[0].ID != "5" || issues[0].Repo != "acme/demo" || issues[0].Title != "issue" {
+		t.Fatalf("issues = %#v, want only the issue", issues)
+	}
+
+	pulls, err := p.ListWorkItemsByLabel(context.Background(), "acme/demo", "courier", forge.WorkItemKindPullRequest)
+	if err != nil {
+		t.Fatalf("ListWorkItemsByLabel(pull-request): %v", err)
+	}
+	if len(pulls) != 1 || pulls[0].ID != "7" || pulls[0].Title != "pr" {
+		t.Fatalf("pulls = %#v, want only the pull request", pulls)
+	}
+
+	if _, err := p.ListWorkItemsByLabel(context.Background(), "acme/demo", "courier", "other"); err == nil {
+		t.Fatal("ListWorkItemsByLabel with unknown kind succeeded, want error")
+	}
+}
+
+func TestProviderRemoveWorkItemLabel(t *testing.T) {
+	t.Parallel()
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodDelete || r.URL.Path != "/repos/acme/demo/issues/7/labels/courier" {
+			http.NotFound(w, r)
+			return
+		}
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer server.Close()
+	client, err := NewClient(server.URL, "token")
+	if err != nil {
+		t.Fatal(err)
+	}
+	p := NewProvider(forge.ProviderConfig{Name: "gh", Endpoint: server.URL}, client)
+
+	if err := p.RemoveWorkItemLabel(context.Background(), forge.WorkItemRef{Repo: "acme/demo", ID: "7"}, "courier"); err != nil {
+		t.Fatalf("RemoveWorkItemLabel: %v", err)
+	}
+	if err := p.RemoveWorkItemLabel(context.Background(), forge.WorkItemRef{Repo: "acme/demo", ID: "nope"}, "courier"); err == nil {
+		t.Fatal("RemoveWorkItemLabel with malformed ID succeeded, want error")
 	}
 }
