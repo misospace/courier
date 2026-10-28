@@ -287,8 +287,9 @@ func TestRetryMootRefusalSettlesMoot(t *testing.T) {
 	// request's key — it was requeued or superseded by another request or path.
 	// It is not the lost-response outcome: a key this request committed replays
 	// its committed success and settles Requeued (see
-	// TestRetryLostResponseReplaySettlesRequeued), because only Requeued
-	// releases the predecessor's barrier.
+	// TestRetryLostResponseReplaySettlesRequeued), which seals the
+	// predecessor's retry surface for good, while a settled Moot leaves it open
+	// to a later request.
 	src := &requeueSource{admissionSource: &admissionSource{}, refusal: &source.RetryRefusalError{Moot: true}}
 	run := retryRun("rr", courierv1alpha1.PhaseFailed, "req-old")
 	run.Status.RetryRequest = &courierv1alpha1.RetryRequest{ID: "req-old", RequestedAt: metav1.NewTime(reapClock), State: courierv1alpha1.RetryRequestStateRequested}
@@ -310,9 +311,10 @@ func TestRetryMootRefusalSettlesMoot(t *testing.T) {
 // TestRetryLostResponseReplaySettlesRequeued pins the lost-response contract:
 // the source commits the requeue and loses the response, so the durable
 // Requested record stands; the same key is re-presented and the source replays
-// its committed success, which settles Requeued — the state the runner uses to
-// release the predecessor's barrier. A Moot settlement would strand that
-// barrier, so the replay must never be reported as moot.
+// its committed success, which settles Requeued and seals the predecessor's
+// retry surface. A Moot settlement would leave the predecessor open to a later
+// request instead of recording the replacement that actually launched, so the
+// replay must never be reported as moot.
 func TestRetryLostResponseReplaySettlesRequeued(t *testing.T) {
 	src := &lostResponseSource{admissionSource: &admissionSource{}, committed: map[string]source.AttemptRequeueResult{}}
 	reg := prometheus.NewRegistry()

@@ -986,10 +986,10 @@ cannot mint reasons. A key this request committed replays its committed success 
 never a refusal — so the predecessor settles `Requeued`; `Moot` is reserved for
 work that moved on through another path, and deliberately does not stand in for
 this request's own committed requeue. The adapter's returned attempt identity is
-likewise bounded: a value
-over the CRD's 256-code-point limit on `status.retryRequest.attemptID` is
-dropped (settled without an identity) rather than allowed to fail the settle
-write and wedge the record `Requested` — the requeue has already committed.
+likewise bounded: a value over the CRD's 256-code-point limit on
+`status.retryRequest.attemptID` is dropped (settled without an identity) rather
+than allowed to fail the settle write and wedge the record `Requested` — the
+requeue has already committed.
 
 **The fix-pr guard reads the world through the forge.** A fix-pr run's recorded
 pull request is read through the forge read-pull-request capability, exactly as

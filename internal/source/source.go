@@ -304,8 +304,9 @@ type RetryRefusalError struct {
 	// requeued or superseded by some other request or path — so the record
 	// settles Moot rather than Refused. Moot is deliberately not the
 	// lost-response outcome: a key that committed the requeue replays its
-	// committed success (see AttemptRequeuer), so the predecessor settles
-	// Requeued and the runner can release its barrier.
+	// committed success (see AttemptRequeuer), so the request settles Requeued —
+	// the state the sibling runner work keys off to release the predecessor's
+	// barrier.
 	Moot bool
 	// Err is an optional wrapped cause, never surfaced to status.
 	Err error
@@ -339,11 +340,11 @@ func (e *RetryRefusalError) Unwrap() error {
 //
 // That original result is the committed success. A key whose requeue committed
 // but whose response was lost MUST replay that success, never a refusal: the
-// core then settles the request Requeued — the only settled state that releases
-// the predecessor's barrier. Moot is reserved for work that already moved on
-// through some other request or path; returning it for a key this request
-// committed would strand the predecessor's barrier and leave the replacement
-// work unreleased.
+// core then settles the request Requeued — the state the sibling runner work
+// keys off to release the predecessor's barrier. Moot is reserved for work that
+// already moved on through some other request or path; returning it for a key
+// this request committed would leave the predecessor's replacement unreleased,
+// and a settled Moot leaves the predecessor open to a later request.
 //
 // An adapter implements this interface only if its source can requeue atomically
 // with fencing. Adapters whose source cannot must not implement it and must never

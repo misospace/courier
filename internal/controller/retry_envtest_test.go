@@ -292,8 +292,8 @@ func TestEnvtestRetryPartialFailureReplaysAndSettles(t *testing.T) {
 // contract against the real API server: the source commits the requeue and
 // loses the response, so the durable record stays Requested; the same key is
 // re-presented and the source replays its committed success, which settles
-// Requeued through the CRD — never Moot, which would strand the predecessor's
-// barrier and leave the replacement work unreleased.
+// Requeued through the CRD — never Moot, which would leave the predecessor open
+// to a later request instead of recording the replacement that launched.
 func TestEnvtestRetryLostResponseReplaySettlesRequeued(t *testing.T) {
 	if envtestClient == nil {
 		t.Skip("KUBEBUILDER_ASSETS is not set")
