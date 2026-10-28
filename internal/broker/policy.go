@@ -223,6 +223,9 @@ func validatePolicy(p Policy) error {
 		if p.WorkRepo == p.BaseRepo {
 			return errors.New("publication policy: contribute requires a head repository distinct from the base")
 		}
+		if p.WorkInitiallyAbsent && p.WorkAnchorOID != "" || !p.WorkInitiallyAbsent && p.WorkAnchorOID == "" {
+			return errors.New("publication policy: contribute has inconsistent initial work tip")
+		}
 		// Upstream issue context is optional for a contribution, but when
 		// present it must be a coherent identity on the base repository:
 		// it is the only identity a linkage reference may name.
@@ -495,10 +498,12 @@ func (e *PolicyEngine) checkPR(pr *PullRequestState, workOID, trustedTip string)
 // Discovery before creation is the durable idempotency boundary: a create
 // that succeeded but was never recorded is recovered by base/head repos and
 // refs, never by title text. Exactly one open pull request at the exact
-// pinned full identity (including head OID) is adopted as this run's PR
-// without a forge write; zero proceeds to create; anything else — multiple
-// PRs claiming the pinned head, a closed or merged PR, or a PR whose head
-// differs from the published tip — fails closed rather than guessing.
+// pinned full identity (including head OID) whose body satisfies this
+// policy's body contracts is adopted without a forge write; zero proceeds to
+// create; anything else — multiple PRs claiming the pinned head, a closed or
+// merged PR, a PR whose head differs from the published tip, or a PR body
+// that violates the linkage or criterion contract (a foreign publication on
+// the run's head) — fails closed rather than guessing.
 func (e *PolicyEngine) CreatePullRequest(ctx context.Context, oid, title, body string, draft bool) (PullRequestState, *CriteriaReport, error) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
@@ -542,16 +547,27 @@ func (e *PolicyEngine) CreatePullRequest(ctx context.Context, oid, title, body s
 		return PullRequestState{}, nil, errors.New("publication denied: multiple pull requests claim the pinned head")
 	}
 	if len(existing) == 1 {
-		// The PR's existence is itself durable evidence of this run's
-		// earlier create: the pinned head identity is run-owned, so an
-		// exact match at the published tip is rediscovered and returned
-		// instead of duplicating. A non-match is not this run's PR as
-		// published (closed, merged, moved head, changed base) and the
-		// recovery is a human decision, not a second create.
+		// The PR's existence is itself durable evidence of a create at the
+		// published tip, but a forge may let anyone open a PR from a branch
+		// this run owns, so discovery alone cannot prove the record is this
+		// run's create. Before adoption reports a discovered PR as
+		// published, its body must satisfy exactly the contract this call
+		// enforces; a body that does not is a foreign publication on the
+		// run's head and fails closed to a human instead of being blessed.
 		if !matchesPR(p, existing[0], oid) {
 			return PullRequestState{}, nil, errors.New("publication denied: an existing pull request for the pinned head does not match the pinned identity")
 		}
-		return existing[0], report, nil
+		if err := validateBodyLinkage(p, existing[0].Body); err != nil {
+			return PullRequestState{}, nil, fmt.Errorf("publication denied: discovered pull request body violates the pinned linkage contract: %w", err)
+		}
+		if p.Criteria.IsPinned() {
+			adoptedReport, err := ValidateCriterionEvidence(existing[0].Body, p.Criteria)
+			if err != nil {
+				return PullRequestState{}, nil, fmt.Errorf("publication denied: discovered pull request body violates the pinned criterion contract: %w", err)
+			}
+			return existing[0], adoptedReport, nil
+		}
+		return existing[0], nil, nil
 	}
 	if e.confirmed != oid && oid != p.WorkAnchorOID {
 		return PullRequestState{}, nil, errors.New("publication denied: pull request head is not an admitted or previously confirmed run tip")

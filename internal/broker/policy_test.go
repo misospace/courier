@@ -774,6 +774,8 @@ func TestValidatePolicyContributeRejectsFixPRAnchorsAndUnbackedClosingChoice(t *
 		func(p *Policy) { p.PRNumber = 7 },
 		func(p *Policy) { p.HeadAnchorOID = "old" },
 		func(p *Policy) { p.AllowClosingLinkage = true; p.SourceIssue = SourceIssue{} },
+		func(p *Policy) { p.WorkInitiallyAbsent = true },
+		func(p *Policy) { p.WorkAnchorOID = "" },
 	} {
 		bad := contributePolicy()
 		mutate(&bad)
@@ -849,7 +851,7 @@ func TestCreatePRContributeLinkageOptionalWithoutIssueContext(t *testing.T) {
 }
 
 func pinnedDiscoveryPR(number int, mutate func(*PullRequestState)) PullRequestState {
-	pr := PullRequestState{Number: number, State: "open", BaseRepo: "org/repo", BaseRef: "main", BaseOID: "base2", HeadRepo: "fork/repo", HeadRef: "courier/org/repo/goal-abc", HeadOID: "old"}
+	pr := PullRequestState{Number: number, State: "open", BaseRepo: "org/repo", BaseRef: "main", BaseOID: "base2", HeadRepo: "fork/repo", HeadRef: "courier/org/repo/goal-abc", HeadOID: "old", Body: "Refs #502. Ships the contribution."}
 	if mutate != nil {
 		mutate(&pr)
 	}
@@ -880,8 +882,10 @@ func TestCreatePRRediscoveryFailsClosedOnAmbiguousOrNonMatchingHead(t *testing.T
 	}{
 		{"ambiguous", []PullRequestState{pinnedDiscoveryPR(5, nil), pinnedDiscoveryPR(6, nil)}, "multiple pull requests claim the pinned head"},
 		{"closed", []PullRequestState{pinnedDiscoveryPR(5, func(pr *PullRequestState) { pr.State = "closed" })}, "does not match the pinned identity"},
+		{"merged", []PullRequestState{pinnedDiscoveryPR(5, func(pr *PullRequestState) { pr.State = "merged" })}, "does not match the pinned identity"},
 		{"head-moved", []PullRequestState{pinnedDiscoveryPR(5, func(pr *PullRequestState) { pr.HeadOID = "stale" })}, "does not match the pinned identity"},
 		{"base-moved", []PullRequestState{pinnedDiscoveryPR(5, func(pr *PullRequestState) { pr.BaseRef = "release" })}, "does not match the pinned identity"},
+		{"foreign-body", []PullRequestState{pinnedDiscoveryPR(5, func(pr *PullRequestState) { pr.Body = "Fixes #999" })}, "discovered pull request body violates the pinned linkage contract"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -923,7 +927,7 @@ func TestResolveIssueRediscoveryAdoptsSamePinnedPullRequest(t *testing.T) {
 	// re-publish after a create whose number was never recorded adopts the
 	// existing same-identity PR instead of failing or duplicating.
 	o := goodObserver(ModeResolveIssue)
-	o.pulls = []PullRequestState{{Number: 11, State: "open", BaseRepo: "org/repo", BaseRef: "main", BaseOID: "base2", HeadRepo: "org/repo", HeadRef: "courier/work", HeadOID: "old"}}
+	o.pulls = []PullRequestState{{Number: 11, State: "open", BaseRepo: "org/repo", BaseRef: "main", BaseOID: "base2", HeadRepo: "org/repo", HeadRef: "courier/work", HeadOID: "old", Body: "Closes #502. Ships the fix."}}
 	e := engine(t, goodPolicy(ModeResolveIssue), o, &fakePusher{})
 	got, _, err := e.CreatePullRequest(context.Background(), "old", "title", "Closes #502", false)
 	if err != nil {

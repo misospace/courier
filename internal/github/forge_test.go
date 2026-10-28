@@ -2,6 +2,7 @@ package github
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -564,5 +565,43 @@ func TestBoundaryErrorPreservesTransientAvailability(t *testing.T) {
 	}
 	if !forge.IsTransientAvailability(err) {
 		t.Fatalf("forge.IsTransientAvailability(dropped connection) = false, want true: %v", err)
+	}
+}
+
+// TestProviderCreatePullRequestCrossRepoHead pins the fork-backed create at
+// the provider boundary: a full trusted head identity (HeadRepo distinct
+// from the base) is sent as the GitHub "head-owner:branch" selector and the
+// legacy Head field is ignored, so a contribute publication opens from the
+// fork head into the base repository through the forge capability.
+func TestProviderCreatePullRequestCrossRepoHead(t *testing.T) {
+	var createBody struct {
+		Title string `json:"title"`
+		Head  string `json:"head"`
+		Base  string `json:"base"`
+	}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if r.Method == http.MethodPost && r.URL.Path == "/repos/acme/demo/pulls" {
+			_ = json.NewDecoder(r.Body).Decode(&createBody)
+			_, _ = io.WriteString(w, `{"number":7,"state":"open","title":"t","body":"b","draft":false,"html_url":"https://github.com/acme/demo/pull/7","head":{"ref":"goal-abc","sha":"work123","repo":{"full_name":"octo/widgets"}},"base":{"ref":"main","sha":"base123","repo":{"full_name":"acme/demo"}}}`)
+			return
+		}
+		http.NotFound(w, r)
+	}))
+	defer server.Close()
+	client, err := NewClient(server.URL, "token")
+	if err != nil {
+		t.Fatal(err)
+	}
+	p := NewProvider(forge.ProviderConfig{Name: "gh", Endpoint: server.URL, CredentialRef: "secret/gh"}, client)
+	created, err := p.CreatePullRequest(context.Background(), forge.CreatePullRequestInput{Repo: "acme/demo", Head: "model-controlled-stale-selector", HeadRepo: "octo/widgets", HeadRef: "goal-abc", Base: "main", Title: "t", Body: "b"})
+	if err != nil {
+		t.Fatalf("CreatePullRequest() error = %v", err)
+	}
+	if createBody.Head != "octo:goal-abc" || createBody.Base != "main" {
+		t.Fatalf("create request = %+v, want head octo:goal-abc into main", createBody)
+	}
+	if created.Number != 7 || created.BaseRepo != "acme/demo" || created.HeadRepo != "octo/widgets" || created.HeadRef != "goal-abc" || created.HeadSHA != "work123" {
+		t.Fatalf("CreatePullRequest() = %#v, want the full cross-repo identity from the response", created)
 	}
 }

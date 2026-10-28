@@ -111,6 +111,7 @@ var ErrClosingLinkageNotAdmitted = errors.New("publication denied: pull request 
 // no global state, no clock.
 func ValidateContributeLinkage(body string, source SourceIssue, allowClosing bool) error {
 	observations := extractObservations(body, source)
+	observations = append(observations, extractURLObservations(body, source)...)
 	if len(observations) == 0 {
 		return nil
 	}
@@ -286,6 +287,45 @@ func extractObservations(body string, source SourceIssue) []LinkageObservation {
 			obs.Match = strings.EqualFold(h.owner, source.Owner) && strings.EqualFold(h.name, source.Name) && h.number == source.Number
 		}
 		out = append(out, obs)
+	}
+	return out
+}
+
+// urlClosingReferencePattern matches the full-URL closing form
+// "<keyword> https://<host>/<owner>/<name>/issues/<number>". GitHub applies
+// closing keywords to full issue URLs as well as to the "#N" and
+// "owner/repo#N" forms, so the contribute-mode contract — whose default is
+// non-closing — must recognize the URL form as a closing claim even though
+// the resolve-issue validator (whose failure mode is fail-closed missing
+// linkage) never needed to reject it. A non-closing mention of the same URL
+// matches nothing: only the supported closing keywords before the URL do.
+var urlClosingReferencePattern = regexp.MustCompile(`(?i)\b(?:close|closes|closed|fix|fixes|fixed|resolve|resolves|resolved)\b\s+https?://[A-Za-z0-9.-]+/([A-Za-z0-9._-]+)/([A-Za-z0-9._-]+)/issues/(\d+)`)
+
+// extractURLObservations records the full-URL closing references of a body.
+// It is deliberately confined to the contribute-mode contract: a URL closing
+// reference names its repository explicitly, so it matches the trusted
+// identity only when owner, name, and number all agree.
+func extractURLObservations(body string, source SourceIssue) []LinkageObservation {
+	var out []LinkageObservation
+	for _, m := range urlClosingReferencePattern.FindAllStringSubmatchIndex(body, -1) {
+		if len(m) < 8 {
+			continue
+		}
+		owner := body[m[2]:m[3]]
+		name := body[m[4]:m[5]]
+		number, _ := strconv.Atoi(body[m[6]:m[7]])
+		full := body[m[0]:m[1]]
+		keyword := full
+		if idx := strings.IndexAny(full, " \t"); idx > 0 {
+			keyword = full[:idx]
+		}
+		out = append(out, LinkageObservation{
+			Keyword: keyword,
+			Owner:   owner,
+			Name:    name,
+			Number:  number,
+			Match:   strings.EqualFold(owner, source.Owner) && strings.EqualFold(name, source.Name) && source.Number > 0 && number == source.Number,
+		})
 	}
 	return out
 }

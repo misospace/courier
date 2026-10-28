@@ -299,3 +299,44 @@ func TestValidateContributeLinkageRejectsClosingWithoutTrustedIdentity(t *testin
 		t.Fatalf("err = %v, want a structured LinkageError", err)
 	}
 }
+
+// TestValidateContributeLinkageClosesOnFullURLKeyword is the URL-form
+// closing claim: GitHub applies closing keywords to full issue URLs, so the
+// contribute contract must refuse it without the policy choice and gate it
+// on the trusted identity with it. A non-closing URL mention stays the
+// accepted default.
+func TestValidateContributeLinkageClosesOnFullURLKeyword(t *testing.T) {
+	source := trustedIssue()
+	urlRef := "https://github.com/misospace/miso-gallery/issues/502"
+	if err := ValidateContributeLinkage("See also "+urlRef+" for context.", source, false); err != nil {
+		t.Fatalf("non-closing URL mention rejected: %v", err)
+	}
+	for _, body := range []string{
+		"Fixes " + urlRef,
+		"Ships the assets. Resolves " + urlRef,
+	} {
+		err := ValidateContributeLinkage(body, source, false)
+		if err == nil {
+			t.Fatalf("URL closing claim %q accepted without a policy choice", body)
+		}
+		if !errors.Is(err, ErrClosingLinkageNotAdmitted) {
+			t.Fatalf("err = %v, want ErrClosingLinkageNotAdmitted", err)
+		}
+	}
+	if err := ValidateContributeLinkage("Closes "+urlRef, source, true); err != nil {
+		t.Fatalf("admitted URL closing reference to the trusted issue rejected: %v", err)
+	}
+	for _, body := range []string{
+		"Fixes https://github.com/other/repo/issues/502",
+		"Fixes https://github.com/misospace/miso-gallery/issues/503",
+	} {
+		if err := ValidateContributeLinkage(body, source, true); err == nil {
+			t.Fatalf("URL closing reference %q accepted despite disagreeing with the trusted identity", body)
+		}
+	}
+	// The URL form reaches no closing claim under the bare-form validator,
+	// whose failure mode stays fail-closed: ValidateLinkage is unchanged.
+	if err := ValidateLinkage("Closes "+urlRef, source); !errors.Is(err, ErrLinkageMissing) {
+		t.Fatalf("ValidateLinkage URL behavior changed: %v", err)
+	}
+}
