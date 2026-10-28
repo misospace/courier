@@ -147,6 +147,44 @@ func TestEnvtestRetryRoundTripsThroughCRD(t *testing.T) {
 	}
 }
 
+// TestEnvtestRetryReasonVocabularyEnforcedByCRD proves the CRD pattern on
+// status.retryRequest.reason admits only the empty value and the closed
+// RetryRefusal* vocabulary: the API server itself rejects arbitrary reason
+// text, so a hostile adapter or writer cannot persist free text into the record.
+func TestEnvtestRetryReasonVocabularyEnforcedByCRD(t *testing.T) {
+	if envtestClient == nil {
+		t.Skip("KUBEBUILDER_ASSETS is not set")
+	}
+	const name, namespace = "retry-reason-vocab", "retry-reason-vocab"
+	ctx := context.Background()
+	setupRetryNamespace(t, namespace)
+	run := envtestRunInNamespace(name, "retry-lane", namespace)
+	if err := envtestClient.Create(ctx, run); err != nil {
+		t.Fatalf("create run: %v", err)
+	}
+
+	setReason := func(reason string) error {
+		var cur courierv1alpha1.CoderRun
+		if err := envtestClient.Get(ctx, types.NamespacedName{Name: name, Namespace: namespace}, &cur); err != nil {
+			t.Fatalf("get run: %v", err)
+		}
+		cur.Status.RetryRequest = &courierv1alpha1.RetryRequest{
+			ID:          "req-1",
+			RequestedAt: metav1.NewTime(reapClock),
+			State:       courierv1alpha1.RetryRequestStateRefused,
+			Reason:      reason,
+		}
+		return envtestClient.Status().Update(ctx, &cur)
+	}
+
+	if err := setReason("hostile free text"); !apierrors.IsInvalid(err) {
+		t.Fatalf("arbitrary reason err = %v, want Invalid rejected by the CRD", err)
+	}
+	if err := setReason(courierv1alpha1.RetryRefusalSourceRefused); err != nil {
+		t.Fatalf("closed-vocabulary reason rejected: %v", err)
+	}
+}
+
 // retrySelectiveStatusWriter fails selected status writes (1-indexed), simulating
 // a lost response so the crash-recovery replay path is exercised against the real
 // API server and the fenced adapter.
