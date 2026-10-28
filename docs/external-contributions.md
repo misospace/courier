@@ -102,8 +102,16 @@ repository file can grant authority):
   adapter looks up the existing run by key and returns its identity instead of
   creating a second `CoderRun`. An intentional new contribution is a fresh
   key; the CLI makes that explicit rather than silent.
-- Admission is rejected before any forge mutation when authority fails; a
-  rejected request leaves no CR, no branch, and no PR.
+- Rejection and failure are two distinct points, both forge-mutation-free:
+  - **Before a CR exists**, creation-time validation (spec rules, allowlist
+    membership resolvable without forge calls) rejects the request: no CR, no
+    branch, no PR.
+  - **After the CR exists**, authority failures discovered by
+    `ResolveAdmission` (`internal/controller/secure_control.go:218`) — e.g.
+    the fork is not served by any registration — terminalize the run to
+    `NeedsHuman` without any forge mutation. Authority checks must not be
+    moved into frontends to get earlier rejection; a "rejected" contribution
+    that already has a CR is a terminal run, not a rollback.
 
 ### Who may submit
 
@@ -123,14 +131,20 @@ Settled decisions:
 - **V1 requires a pre-existing approved fork.** Fork creation, fork discovery
   for users without one, and renamed-fork migration are follow-up work; none
   of them ship implicitly.
-- **Write access is verified, not assumed.** Admission calls
-  `RepositoryPolicyProvider.CanWriteRepository` for the head repo
-  (`internal/forge/forge.go:313-318`, implemented in
-  `internal/github/forge.go:151`); the broker preflight repeats it before any
-  push. Read access to base and write access to head are checked separately.
+- **Write access is verified where the credential lives, not assumed.**
+  Admission's `AdmissionProvider` runs on the *operator's read identity*
+  (`internal/controller/secure_control.go:106-121`) and must not perform
+  credential-bound checks: at admission, write authority is established from
+  *configuration policy* — the fork's allowlist coverage and the
+  registration's credential refs. Actual push-permission verification
+  (`RepositoryPolicyProvider.CanWriteRepository`,
+  `internal/forge/forge.go:313-318`, implemented with run credentials in
+  `internal/github/forge.go:151`) happens in the broker preflight under the
+  run's pinned credentials, before any push. Read access to base and write
+  access to head are checked separately.
 - **Registry coverage.** The forge registration serving a contribution must
   cover both base and head in its `Serves` allowlist patterns
-  (`internal/forge/registry.go:57`); git credentials resolve per repository
+  (`internal/forge/registry.go:60-63`); git credentials resolve per repository
   from the same registration's credential refs (`:38`,
   `internal/broker/git_transport.go:15-30`). A fork outside the allowlist
   fails closed.
@@ -147,24 +161,37 @@ Settled decisions:
 ## Branch naming and durable PR idempotency
 
 - Contribute branches derive from the idempotency key:
-  `courier/<base-owner>/<base-repo>/goal-<8 hex of key>` — a new pure helper
+  `courier/<base-owner>/<base-repo>/goal-<12 hex of key>` — a new pure helper
   beside `ResolveIssueBranch` in `internal/branch/branch.go:14`, keeping the
   repository-scoped, collision-free convention. No issue number is involved.
+- **Work-ref admission semantics.** Contribute work refs are mutable branch
+  refs owned by the contribution identity; an explicitly pinned commit is a
+  follow-up option, not V1. At first admission, if the derived branch already
+  exists on the fork, its tip is read: a tip matching Courier's own prior
+  publication of this key (recorded in `WorkOID`/`HeadAnchorOID`,
+  `api/v1alpha1/coderun_types.go:658-669`) is adopted as resume; any foreign
+  tip fails closed to `NeedsHuman` — Courier never adopts or overwrites a
+  branch it did not author, regardless of key-entropy collisions.
 - Durable publication identity is the existing status subresource:
   `status.Branch`, `status.HeadRepo`, `status.HeadSHA`, `status.PR` (already
   present, `api/v1alpha1/coderun_types.go:716-719` area). Retries rediscover
   and update the *same* branch and the *same* PR; they never spray duplicates.
 - PR discovery matches **base/head repositories and refs**, never title text.
-  `FindPullRequest` in the broker (`internal/broker/policy.go:473`) is
-  extended to match cross-repo heads in `owner:branch` form. Ambiguous
-  matches (multiple PRs from the same head) fail closed to `NeedsHuman`
-  rather than guess.
+  Cross-repo head resolution already exists end to end:
+  `Observer.FindPullRequest` receives head repo and ref
+  (`internal/broker/policy.go:85`, called at `:468`), the adapter filters
+  `pr.HeadRepo` and builds the `owner:branch` selector
+  (`internal/broker/forge_adapter.go:148-155,191`), and the GitHub provider
+  supports fork heads (`internal/github/forge.go:223-260`). The work here is
+  contribute-mode coverage and fail-closed behavior, not new machinery:
+  ambiguous matches (multiple PRs from the same head) fail closed to
+  `NeedsHuman` rather than guess.
 - Recovery behaviors, all reusing the existing world-wins machinery:
 
   | Scenario | Behavior |
   | --- | --- |
   | Push recorded, PR not created | Re-publish is idempotent (same head SHA); create PR path resumes. |
-  | PR created, URL not recorded | Discovery by base/head repos+refs rediscovers the same PR before creating a new one (`FindPullRequest` guard, `policy.go:473`, plus the post-create recheck at `:477-503`). |
+  | PR created, URL not recorded | Discovery by base/head repos+refs rediscovers the same PR before creating a new one (`FindPullRequest` call at `policy.go:468` with the duplicate guard, plus the post-create recheck at `policy.go:497-515`). |
   | Already-merged contribution | Fail closed to `NeedsHuman`; never reopen or duplicate. |
   | Closed-unmerged PR | Reported, not reopened; a new contribution is an explicit new key. |
   | Draft / no-diff PR | Adopted as-is on resume; no-diff is surfaced as evidence, not an error state. |
@@ -187,8 +214,8 @@ An upstream issue referenced in `SourceContext` is read-only task context:
 ## PR body contract
 
 The resolve-issue linkage contract (`ValidateLinkage` in
-`internal/broker/policy.go`) requires a validated `Closes owner/repo#N`. For
-contributions:
+`internal/broker/linkage.go:119`) requires a validated `Closes owner/repo#N`.
+For contributions:
 
 - Default wording is **non-closing**: `Refs #123` or a plain issue URL.
 - `Fixes #123` (closing semantics) requires an explicit policy choice made at
@@ -196,9 +223,28 @@ contributions:
   goal text.
 - Linkage is optional: a contribution with no issue context carries no
   linkage line.
-- The criterion-evidence block contract applies unchanged when acceptance
-  criteria are pinned; absent criteria, the body is the goal summary plus
-  linkage.
+- **Contribution runs never pin acceptance criteria.** Criteria are pinned
+  from a trusted source-issue snapshot today
+  (`api/v1alpha1/coderun_types.go:613-615`); an upstream issue referenced by a
+  contribution is explicitly untrusted context. V1 contribute runs therefore
+  carry no criterion-evidence block; if criteria ever become pinnable for
+  contributions, they must come from the submitting frontend's own trusted
+  policy configuration at admission — never from upstream issue text. Absent
+  criteria, the body is the goal summary plus linkage.
+
+## Completion semantics
+
+Local validation and publication success are distinct from CI approval and
+human merge, exactly as for resolve-issue runs:
+
+- A contribute run follows the existing run lifecycle through its verifying
+  phase and ends `HandedOff` with the PR open; the operator observes CI and
+  human review after handoff (`DESIGN.md` run lifecycle). A successful push
+  is never proof the goal was satisfied.
+- A no-change completion requires evidence relevant to the submitted goal,
+  under the same contract as resolve-issue runs ([#513](https://github.com/misospace/courier/issues/513)).
+- The PR is left open, non-draft, for operator verification and human merge;
+  Courier never merges.
 
 ## Security and trust
 
@@ -214,7 +260,8 @@ contributions:
 - Publication target and base/head identities are revalidated immediately
   before push and before every PR mutation (broker preflight; pinned-endpoint
   push).
-- A request rejected before admission performs no forge mutation.
+- A request rejected before a CR exists performs no forge mutation; authority
+  failures after the CR exists terminalize the run without one.
 
 ## Admission surface
 
@@ -229,9 +276,11 @@ contributions:
 ## Failure cases covered by tests
 
 The test matrix uses a fake forge/git fixture with independently observable
-read/write operations (pattern: the recorded-ops stub provider in
-`internal/forge/forge_test.go:13`), asserting both intended results and the
-*absence* of forbidden mutations:
+read/write operations — new work patterned on the canned stub provider in
+`internal/forge/forge_test.go:13` (which today returns fixed responses and
+records nothing) and the reusable-double convention of
+`internal/connector/connectortest/cycle.go` — asserting both intended results
+and the *absence* of forbidden mutations:
 
 - no upstream branch push, issue claim, label, assignment, closing comment, or
   other issue-state mutation from optional issue context;
@@ -259,14 +308,15 @@ Implemented as bounded, file-scoped issues (each filed under #511):
    `internal/source/source.go`): adapter, idempotency key, duplicate-as-resume.
 3. Admission authority resolution (`internal/controller/secure_control.go`,
    `internal/forge/registry.go`): contribute path resolving base/work repos,
-   `CanWriteRepository` checks, allowlist coverage, fail-closed rules.
+   allowlist coverage for base and fork, fail-closed rules (push-permission
+   verification stays in the broker preflight under run credentials).
 4. Branch naming and durable idempotency (`internal/branch/branch.go`,
-   `internal/controller/phase_machine.go`): goal branches, restart recovery,
-   stale-ownership handling.
+   `internal/controller/phase_machine.go`): goal branches, work-ref admission
+   semantics, restart recovery, stale-ownership handling.
 5. Fork-backed publication (`internal/broker/policy.go`,
    `internal/broker/git_transport.go`, `internal/broker/forge_adapter.go`,
-   `internal/github/forge.go`): cross-repo PR discovery, mode-aware linkage
-   contract, non-closing default.
+   `internal/github/forge.go`): preflight write verification, contribute-mode
+   discovery coverage, mode-aware linkage contract, non-closing default.
 6. Fake forge fixture and security/failure matrix (`internal/forge/` test
    support + broker/controller tests): observable ops, injected failures,
    absence-of-mutation assertions.
