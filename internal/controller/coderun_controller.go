@@ -551,6 +551,25 @@ func (r *CoderRunReconciler) reconcileTerminal(ctx context.Context, run *courier
 			return ctrl.Result{RequeueAfter: ciparkSettlementRetryDelay}, nil
 		}
 	}
+	// The explicit retry request surface (#97/#606) is translated at the head of
+	// the terminal duties, so an operator's authorized retry converges before the
+	// run's ordinary retention, report, or recovery work. It never changes the
+	// phase, never deletes, and never touches evidence: it only reads/writes
+	// status.retryRequest and, for an eligible run, calls the source's fenced
+	// requeue capability. It is a no-op (handled=false) unless an annotation names
+	// a request or a record is outstanding, so ordinary terminal runs are
+	// unaffected.
+	retryResult, retryHandled, retryErr := r.syncRetry(ctx, run)
+	if retryErr != nil {
+		// A retry write or read that failed surfaces the error so the workqueue
+		// re-arms and re-drives the durable intent; the announce-over-Requeued patch
+		// returns handled=false with an error specifically so a lost metadata write
+		// re-announces rather than dropping the audit signal.
+		return ctrl.Result{}, retryErr
+	}
+	if retryHandled {
+		return retryResult, nil
+	}
 	// Capacity availability is independent of source reporting. Persist it
 	// before a pending or unsupported lifecycle report can return early.
 	if isCapacityExhaustionRun(run) {
@@ -601,15 +620,17 @@ func (r *CoderRunReconciler) reconcileTerminal(ctx context.Context, run *courier
 				"phase", run.Status.Phase, "lifecycleReported", lifecycleReportConditionState(run))
 			return ctrl.Result{}, nil
 		}
-		if run.Status.CISettlement != nil || run.Status.CIParkRelease != nil {
-			// The run still owes the source a park close. Deleting it would
-			// drop the owed close with the object, so the retention window
-			// starts only once the close has landed — the same posture a
-			// Done run keeps while its close is outstanding. The pending
-			// record is the owed-close signal: it is cleared only by a
-			// delivery the source accepted or a refusal proving the owed
-			// transition moot, each the proof of delivery.
-			log.FromContext(ctx).V(1).Info("terminal run still owes the source a park close; leaving it for retention",
+		if run.Status.CISettlement != nil || run.Status.CIParkRelease != nil || retryHoldsReap(run) {
+			// The run still owes the source a park close, or an explicit retry
+			// request is still Requested. Deleting it would drop that durable
+			// intent with the object, so the retention window starts only once the
+			// owed close lands or the retry record settles — the same posture a
+			// Done run keeps while its close is outstanding. A pending close is
+			// cleared only by a delivery the source accepted or a refusal proving
+			// it moot; a retry record settles through syncRetry, which drives it
+			// and holds the run while Requested, so this gate is the reap-decision
+			// backstop for that invariant.
+			log.FromContext(ctx).V(1).Info("terminal run still owes durable source intent; leaving it for retention",
 				"run", run.Name, "phase", run.Status.Phase)
 			return ctrl.Result{}, nil
 		}
@@ -2142,6 +2163,15 @@ func (r *CoderRunReconciler) patchStatus(ctx context.Context, before, after *cou
 		} else {
 			fields.CIParkRelease = after.Status.CIParkRelease
 		}
+	}
+	// RetryRequest is the operator-owned explicit-retry record (#97/#606). It is
+	// replaceable across request lifetimes and never cleared back to nil — a
+	// settled record is durable audit state, and a fresh request replaces it
+	// wholesale — so it needs no explicit-null clear path. The record's own
+	// serialization always carries reason and settledAt, so a replacement clears a
+	// predecessor's stale sub-keys under a JSON merge patch.
+	if !reflect.DeepEqual(before.Status.RetryRequest, after.Status.RetryRequest) {
+		fields.RetryRequest = after.Status.RetryRequest
 	}
 	// ControlRequest is replaceable, not set-once: a changed value replaces
 	// the record and a cleared record emits an explicit null, because a merge

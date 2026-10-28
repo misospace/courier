@@ -857,6 +857,68 @@ spec:
                   Restarts counts infra relaunches (the crashloop backstop), not work
                   retries.
                 type: integer
+              retryRequest:
+                description: |-
+                  RetryRequest is the operator-owned durable record of the explicit retry
+                  request the RetryAnnotation named (#97/#606). The controller alone writes
+                  it, translating the annotation into the Requested | Requeued | Moot |
+                  Refused state machine; no operator or harness path can forge it. A run
+                  carrying a Requested record is not reap-eligible until the record settles.
+                properties:
+                  attemptID:
+                    description: |-
+                      AttemptID is the fresh source attempt identity the adapter returned when
+                      it requeued, if the source exposes one. Empty means the source requeued
+                      without exposing a new identity; discovery observes the successor later.
+                    maxLength: 256
+                    type: string
+                  id:
+                    description: 'ID is the opaque request ID: the annotation value,
+                      verbatim.'
+                    maxLength: 128
+                    minLength: 1
+                    type: string
+                  reason:
+                    description: |-
+                      Reason is the bounded refusal/moot reason for a settled Refused/Moot
+                      record, and empty while Requested or for a Requeued success. It is drawn
+                      only from the closed RetryRefusal* vocabulary; the pattern admits the
+                      empty value plus exactly that closed set, so arbitrary reason text can
+                      never be persisted or served by the CRD.
+                    maxLength: 128
+                    pattern: ^(|not-retryable-phase|automatic-recovery-channel|active-owner-exists|already-requeued|upstream-closed|unsupported-source|stale-generation|source-refused|held-for-human)$
+                    type: string
+                  requestedAt:
+                    description: RequestedAt is when the controller first stamped
+                      this request.
+                    format: date-time
+                    type: string
+                  settledAt:
+                    description: |-
+                      SettledAt is when the record reached Requeued, Moot, or Refused. It is
+                      null while Requested, and always serialized so a replacement Requested
+                      record clears a predecessor's settled timestamp.
+                    format: date-time
+                    nullable: true
+                    type: string
+                  state:
+                    description: |-
+                      State is the durable retry request state: Requested while the intent is
+                      outstanding, Requeued once the source committed the requeue (including the
+                      success a committed key replays after a lost response), Moot when the work
+                      already moved on without this request's key, and Refused when the request
+                      was declined.
+                    enum:
+                    - Requested
+                    - Requeued
+                    - Moot
+                    - Refused
+                    type: string
+                required:
+                - id
+                - requestedAt
+                - state
+                type: object
               runDuration:
                 description: |-
                   RunDuration is the human-readable time between StartedAt and FinishedAt,

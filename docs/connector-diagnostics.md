@@ -442,19 +442,22 @@ exclusion-based dedupe is not in effect for that deployment.
 
 ## 8. Worked example: a non-Dispatch connector
 
-Consider a label-driven forge connector (the `github-label` adapter sketched in
-DESIGN.md's Sources section) or the `manual` adapter that exists today
-(`internal/source/manual/adapter.go`). It implements `Discover` and the other
-required methods but no optional interface.
+Consider a label-driven forge connector or the `manual` adapter that exists
+today (`internal/source/manual/adapter.go`). It implements `Discover` and the
+other required methods; the optional interfaces it declares vary. The
+implemented label adapter (`internal/source/label/adapter.go`) declares
+`discovery-exclusions` and `work-identity` supported — it filters retained
+work itself and mints collision-free `<repo>#<number>` identities — while
+`manual` declares neither:
 
 | Capability | State | Consequence |
 | --- | --- | --- |
 | `discovery` | supported | emits generic core signals; `protocol-error` reasons from its forge client |
-| `discovery-exclusions` | unsupported | no exclusion panel; `requested`/`limit` absent, not zero |
+| `discovery-exclusions` | supported (label adapter) / unsupported (`manual`) | no exclusion panel; `requested`/`limit` absent, not zero |
 | `ci-park-lifecycle` | unsupported | no CI park notice; a failing queued PR is reissued normally |
 | `lifecycle-report` | unsupported | no report-outcome signal; `CoderRun` status still records the local result |
 | `pre-launch-revalidation` | unsupported | no revalidation signal |
-| `work-identity` | unsupported (or supported) | identity churn is core-dedupe, not a connector diagnostic |
+| `work-identity` | supported (label adapter) / unsupported (`manual`) | identity churn is core-dedupe, not a connector diagnostic |
 | `availability` | supported | `available`/`unreachable` from its own client |
 
 Its catalogue reports `unsupported` for exclusions; a dashboard renders the
