@@ -2548,10 +2548,12 @@ predecessor lifetime; repeated or concurrent requests settle idempotently.
 Invariants carried over from the issue: the old run is never phase-flipped
 or deleted, and its retention clock and evidence survive the retry
 untouched (a run owing a `Requested` retry is not reap-eligible, by the
-same gate that holds a run owing a park close — the gate reads the live
-object on every pass, so the annotation's presence holds the run even
+same gate that holds a run owing a park close — the hold is evaluated
+against the run's status on every pass and re-verified on the live object
+at the delete boundary, so the annotation's presence holds the run even
 before the record is persisted, and an expired retention window is not
-standing delete authority); merged or closed upstream
+standing delete authority; the window itself is never restarted or
+extended — a settled record never holds the reaper); merged or closed upstream
 work is refused — for fix-pr, a core forge guard reads the recorded PR
 identity from `spec.repo` and verifies the returned head against
 `status.headRepo`; adopted branches are preserved, never reset; `Failed`

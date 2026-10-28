@@ -623,9 +623,10 @@ func (r *CoderRunReconciler) reconcileTerminal(ctx context.Context, run *courier
 		if run.Status.CISettlement != nil || run.Status.CIParkRelease != nil || retryHoldsReap(run) {
 			// The run still owes the source a park close, or an explicit retry
 			// request is still Requested. Deleting it would drop that durable
-			// intent with the object, so the retention window starts only once the
-			// owed close lands or the retry record settles — the same posture a
-			// Done run keeps while its close is outstanding. A pending close is
+			// intent with the object, so deletion is held while the intent is
+			// outstanding — the same posture a Done run keeps while its close is
+			// outstanding; the retention window itself is never restarted or
+			// extended by either duty. A pending close is
 			// cleared only by a delivery the source accepted or a refusal proving
 			// it moot; a retry record settles through syncRetry, which drives it
 			// and holds the run while Requested, so this gate is the reap-decision

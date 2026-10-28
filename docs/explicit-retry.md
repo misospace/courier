@@ -48,10 +48,15 @@ annotating the CR; no special controller bypass and no direct status or spec
 mutation exists.
 
 The controller alone translates the annotation into the operator-owned
-durable record `status.retryRequest`. An annotation on a non-terminal run
-consumes nothing: the controller records a refusal (below) and leaves the run
-untouched. A changed annotation value is a new request; re-requests are
-always explicit new values.
+durable record `status.retryRequest`. Only the terminal phases
+(`Failed`, `NeedsHuman`, `AwaitingReview`, `HandedOff`, `BlockedExternal`)
+reach that translation: there the controller records a request or a
+refusal (below) and otherwise leaves the run untouched. The execution
+phases (`Pending`, `Claimed`, `Running`, `Verifying`) and `Done` never
+reach it — an annotation on an execution phase is simply not consumed and
+rides until the run terminalizes, and `Done` has no later terminalization,
+so an annotation there can never be honored. A changed annotation value is
+a new request; re-requests are always explicit new values.
 
 The distinct annotation `courier.misospace.dev/retry-lifecycle-report` keeps
 its separate meaning: it re-publishes a pending lifecycle report on the
@@ -123,9 +128,10 @@ Core and adapter refuse different things; neither can do the other's job.
 - Phase not in `Failed` or `NeedsHuman` → `not-retryable-phase`.
   `BlockedExternal` refuses with the dedicated reason
   `automatic-recovery-channel`: it is recoverable by design and its source
-  re-issues the work without a retry request. `AwaitingReview`, `HandedOff`,
-  `Verifying`, and `Done` are not terminal failures; the source's own repair
-  and review paths own them.
+  re-issues the work without a retry request. `AwaitingReview` and
+  `HandedOff` are not terminal failures; the source's own repair and
+  review paths own them. `Verifying` and `Done` never reach the
+  translation at all (above), so no refusal exists for them.
 - The record already settled `Requeued` → `already-requeued`.
 - Another run for the same work is still active. Core matches on
   `spec.Source` (qualified identity included) plus `spec.Repo` + `spec.Ref`
@@ -348,27 +354,31 @@ The reconcile that observes a new annotation runs:
 
 **Retention interplay:** a run carrying a `Requested` retry record is not
 reap-eligible, by the same gate that holds a run owing a park close —
-deletion would drop the durable intent with the object. The gate is
-decided against the live object on every pass, never from cached
-eligibility state: a per-phase retention marker may already be set and its
-window already expired when the operator annotates, and an expired window
-is not standing delete authority. The delete decision must therefore be
-made from the same read that issues it, and the mere presence of the
-`courier.misospace.dev/retry` annotation — regardless of whether the
-record is persisted yet — aborts it; the first reconcile that observes
-the annotation runs the record translation (persisting `Requested`, or a
+deletion would drop the durable intent with the object. Every reap pass
+evaluates the hold against the run's status as that pass sees it — an
+outstanding `Requested` record holds, never from cached eligibility state
+— and the reaper re-verifies the gate on the live object at the delete
+boundary, so a per-phase retention marker that is already set with an
+already-expired window is not standing delete authority across an
+annotation's arrival: the mere presence of the
+`courier.misospace.dev/retry` annotation, new to the reconcile that
+decides the delete, aborts it, and the first reconcile that observes the
+annotation runs the record translation (persisting `Requested`, or a
 refusal) before the run can be reconsidered for reaping.
 controller-runtime serializes
 reconciles per object, so a retry reconcile cannot interleave with the
-reaper's pass; to bound the remaining read-to-delete window, the reaper
-re-verifies the gate on the object state the `Delete` is issued from,
-and the annotation event that lands mid-pass wakes the object for the
-record translation immediately. The retention window itself never
+reaper's pass; the annotation event that lands mid-pass wakes the object
+for the record translation immediately. The retention window itself never
 restarts and never extends: the per-phase window follows its existing
 ordinary rules (stamped set-once once the lifecycle report settles, never
 derived from `FinishedAt`), and retry adds only the hold — an outstanding
 `Requested` record holds deletion, and a settled record never holds the
-reaper. Once the record settles, the ordinary rules resume exactly where
+reaper. Where the annotation lands while the run is still behind its
+unsettled lifecycle report, the request defers with the run and the hold
+also defers the window's set-once stamping, so a window that had not yet
+started simply starts after the record settles — an ordinary deferral,
+never an extension of an already-running window. Once the record
+settles, the ordinary rules resume exactly where
 they were: a `Refused` or `Moot` settlement returns the run to its
 ordinary `Failed`/`NeedsHuman` window and audit floor, which may already
 have expired, making the run reap-eligible again at the next pass; a
