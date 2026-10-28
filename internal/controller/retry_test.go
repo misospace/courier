@@ -582,6 +582,36 @@ func TestRetryActiveOwnerExists(t *testing.T) {
 	}
 }
 
+func TestRetryActiveOwnerIdentityScopedToSourceRepoRef(t *testing.T) {
+	src := &requeueSource{admissionSource: &admissionSource{}, result: source.AttemptRequeueResult{AttemptID: "gen-2"}}
+	run := retryRun("rr", courierv1alpha1.PhaseFailed, "req-1")
+	// Siblings that share only part of the identity are not owners: the
+	// guard is Source + Repo + Ref, so each of these must not block.
+	for name, mutate := range map[string]func(*courierv1alpha1.CoderRun){
+		"other-source": func(o *courierv1alpha1.CoderRun) { o.Spec.Source = "elsewhere" },
+		"other-repo":   func(o *courierv1alpha1.CoderRun) { o.Spec.Repo = "acme/other" },
+		"other-ref":    func(o *courierv1alpha1.CoderRun) { o.Spec.Ref = run.Spec.Ref + 1 },
+	} {
+		other := admissionRun(name, "local", courierv1alpha1.PhaseRunning)
+		other.Spec.Source = run.Spec.Source
+		other.Spec.Repo = run.Spec.Repo
+		other.Spec.Ref = run.Spec.Ref
+		mutate(other)
+		c := phaseClient(t, run, other)
+
+		if _, err := retryReconciler(c, src, reapClock, nil, nil).Reconcile(context.Background(), admissionRequest("rr")); err != nil {
+			t.Fatalf("%s: Reconcile: %v", name, err)
+		}
+		rec := getRetryRun(t, c, "rr").Status.RetryRequest
+		if rec == nil || rec.State != courierv1alpha1.RetryRequestStateRequeued {
+			t.Fatalf("%s: retryRequest = %+v, want Requeued", name, rec)
+		}
+	}
+	if len(src.requests) != 3 {
+		t.Fatalf("RequeueAttempt issued %d requests, want 3", len(src.requests))
+	}
+}
+
 func TestRetryUnsupportedSource(t *testing.T) {
 	// admissionSource does not implement AttemptRequeuer.
 	src := &admissionSource{}
