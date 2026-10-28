@@ -18,6 +18,10 @@ The image selected with `--executor-image` must contain:
 
 - `/usr/local/bin/courier-executor` built from `./cmd/courier-executor`;
 - `git`;
+- `ssh` (the executor's remote-publication availability probe resolves an
+  ssh remote's effective endpoint through the ssh binary git invokes, so an
+  ssh remote's transient-availability evidence requires it; images without
+  `ssh` produce no ssh-remote evidence and fail closed);
 - the `opencode` binary;
 - process-tree utilities `ps`, `pgrep`, and `pkill` (the OpenCode runtime's
   subprocess preflight refuses tree-owning launches when they are missing,

@@ -51,6 +51,22 @@ func TestCoordinatorDockerfileShipsProcessTreeTools(t *testing.T) {
 	}
 }
 
+// The ssh endpoint probe (internal/git) resolves an ssh remote's effective
+// endpoint through the ssh binary git itself invokes, so the images that run
+// the executor must ship an ssh client: without one, ssh-remote availability
+// evidence is silently absent and every ssh remote fails closed to git's own
+// verdict.
+func TestCoordinatorDockerfileShipsSSH(t *testing.T) {
+	data, err := os.ReadFile(filepath.Join("..", "..", "Dockerfile"))
+	if err != nil {
+		t.Fatalf("read Dockerfile: %v", err)
+	}
+	stage := coordinatorStage(t, string(data))
+	if !strings.Contains(stage, "openssh-client") {
+		t.Fatal("coordinator Dockerfile does not install openssh-client (the ssh endpoint probe resolves ssh remotes through the ssh binary git invokes)")
+	}
+}
+
 func TestCoordinatorImageProcessTreeTools(t *testing.T) {
 	image := os.Getenv("COURIER_COORDINATOR_IMAGE")
 	if image == "" {
@@ -73,12 +89,14 @@ func TestCoordinatorImageProcessTreeTools(t *testing.T) {
 	// Smoke test runs inside the built runtime image, not against CI host
 	// utilities: the shipped image must carry the process-tree tools the
 	// OpenCode runtime preflight requires, and they must actually terminate
-	// a two-level tree. Availability is a toolchain contract; no extra
-	// runtime privileges are granted or implied.
+	// a two-level tree, and it must carry the ssh client the ssh endpoint
+	// probe resolves ssh remotes through. Availability is a toolchain
+	// contract; no extra runtime privileges are granted or implied.
 	probe := `set -eu
 for tool in ps pgrep pkill; do
 	command -v "$tool" >/dev/null || { echo "missing required tool: $tool" >&2; exit 1; }
 done
+command -v ssh >/dev/null || { echo "missing required tool: ssh (the ssh endpoint probe resolves ssh remotes through it)" >&2; exit 1; }
 sh -c 'sleep 30 & sleep 30; wait' &
 child=$!
 tries=0

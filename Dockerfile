@@ -52,7 +52,9 @@ RUN --mount=type=cache,target=/go/pkg/mod \
 	GOBIN=/out go install helm.sh/helm/v3/cmd/helm@${HELM_VERSION}
 
 # Coordinator image: the bootstrap OpenCode runtime. The executor contract
-# (BOOTSTRAP.md) requires courier-executor, git, and opencode in one image.
+# (BOOTSTRAP.md) requires courier-executor, git, ssh (the remote-read
+# availability probe resolves ssh remotes through the ssh binary git
+# invokes), and opencode in one image.
 # Debian (not alpine) because the opencode npm package ships glibc binaries.
 FROM node:26-bookworm-slim@sha256:28147155d47dc31abe0a46e0d12b59b2fb3d0a2dcc5dc65fce76a074180b16fe AS coordinator
 ARG OPENCODE_VERSION=1.18.31
@@ -66,6 +68,7 @@ RUN set -eux; \
 	apt-get update && \
 	apt-get install -y --no-install-recommends \
 		ca-certificates \
+		openssh-client \
 		procps \
 		wget \
 		build-essential \

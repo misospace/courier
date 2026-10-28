@@ -1402,10 +1402,22 @@ fail-closed
 `verifier-rejection`. For ssh remotes the probe dials the endpoint git
 itself would dial: the effective host and port ssh selects for the
 destination after applying the user's ssh configuration, resolved through
-`ssh -G` and never guessed from the URL alone — an ssh remote whose
-effective endpoint cannot be resolved (no ssh binary, a configuration ssh
-rejects) yields no evidence, so a completed git verdict is never flipped
-by a probe of an endpoint ssh would never connect to. Only the exact
+`ssh -G` and never guessed from the URL alone. The resolution runs through
+the ssh command git itself would invoke — the binary and leading arguments
+`GIT_SSH_COMMAND` names, then `core.sshCommand`, then the bare path
+`GIT_SSH` names, then plain `ssh`, in git's own order of precedence — and
+a command line relying on shell features the probe cannot faithfully
+emulate (command substitution, expansion, control operators, a command
+separator) resolves nothing, so the probe can only ever reduce evidence,
+never misdirect it. An ssh remote whose effective endpoint cannot be
+resolved — no ssh binary, a configuration ssh rejects, an unemulatable
+`GIT_SSH_COMMAND`, an effective connection routed through a proxy or jump
+host a direct dial would never traverse — yields no evidence, so a
+completed git verdict is never flipped by a probe of an endpoint ssh would
+never connect to. The runtime images that perform remote git reads ship an
+ssh client (`openssh-client` in the coordinator image contract), so
+ssh-remote availability evidence is produced in production; an image
+without `ssh` still fails closed the same way. Only the exact
 pairing — a declared `blocked_external`
 outcome carried by a validated termination handoff whose category is
 `forge-unavailable` — opens the workspace-safety evidence gate; a
