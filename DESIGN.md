@@ -2411,20 +2411,27 @@ one atomic transition that stops the old attempt from owning the work and
 makes it discoverable again — never ordinary Release/Transition emulation.
 Core never invents an attempt identity; a fresh source-issued identity
 (a new Dispatch generation, say) is what passes the dedupe barrier, and the
-retry-settled predecessor joins `settledCapacityExhaustion` as the second
-history state that releases it, reusing the deterministic predecessor-UID
-successor naming. Exactly one replacement attempt is launched per
+retry-settled predecessor contributes a distinct settled-history predicate
+that participates only in predecessor lookup and successor naming — reusing
+the deterministic predecessor-UID successor naming — while the old
+WorkItemID stays in the dedupe map and discovery exclusions (the
+`settledCapacityExhaustion` map-skip branches remain capacity-exhaustion
+only). Exactly one replacement attempt is launched per
 predecessor lifetime; repeated or concurrent requests settle idempotently.
 
 Invariants carried over from the issue: the old run is never phase-flipped
 or deleted, and its retention clock and evidence survive the retry
 untouched (a run owing a `Requested` retry is not reap-eligible, by the
-same gate that holds a run owing a park close); merged or closed upstream
+same gate that holds a run owing a park close — the gate reads the live
+object on every pass, so the annotation's presence holds the run even
+before the record is persisted, and an expired retention window is not
+standing delete authority); merged or closed upstream
 work is refused — for fix-pr, a core forge guard reads the recorded PR
-identity; adopted branches are preserved, never reset; `Failed` and
-`NeedsHuman` share the one path; `BlockedExternal` stays on its automatic
-recovery channel; and #510 invokes the same annotation contract through
-ordinary RBAC, with no controller bypass. Automatic retry remains
+identity from `spec.repo` and verifies the returned head against
+`status.headRepo`; adopted branches are preserved, never reset; `Failed`
+and `NeedsHuman` share the one path; `BlockedExternal` stays on its
+automatic recovery channel; and #510 invokes the same annotation contract
+through ordinary RBAC, with no controller bypass. Automatic retry remains
 forbidden everywhere; retention, capacity recovery, and source re-offer
 semantics are unchanged.
 

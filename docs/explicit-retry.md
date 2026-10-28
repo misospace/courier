@@ -140,15 +140,21 @@ Core and adapter refuse different things; neither can do the other's job.
   rule the capacity-recovery boundary settled).
 
 **Core additionally refuses, for `fix-pr` only (forge guard):** the run's
-recorded pull request identity (`status.pr` against `status.headRepo`, read
-through the source-neutral forge `read-pull-request` capability exactly as
-the merge observation reads it) reports the request merged or closed without
-merge → `upstream-closed`, permanent for this predecessor. A merged or
-closed upstream request must never be retried; this is the forge-truth
-check, not a source queue check, so it belongs to core where the capability
-is available. A transient or unreadable forge read proves nothing: it does
-not consume the request, no record is written yet, and the reconcile retries
-validation later. An unreadable forge never fails open into a requeue.
+recorded pull request identity (`status.pr`) is read **from `spec.repo`** —
+the repository the run was created against — through the source-neutral
+forge `read-pull-request` capability, and the returned head repository is
+then verified against the recorded `status.headRepo` (an empty
+`status.headRepo` means a same-repository head). This is exactly how the
+merge observation reads a PR; the PR number is only meaningful within
+`spec.repo`'s numbering space, so reading from `status.headRepo` itself
+could inspect an unrelated PR. The guard refuses when that request reports
+merged or closed without merge → `upstream-closed`, permanent for this
+predecessor. A merged or closed upstream request must never be retried;
+this is the forge-truth check, not a source queue check, so it belongs to
+core where the capability is available. A transient or unreadable forge
+read proves nothing: it does not consume the request, no record is written
+yet, and the reconcile retries validation later. An unreadable forge never
+fails open into a requeue.
 
 **The adapter refuses (source-state grounds, after `Requested` is durable):**
 
@@ -255,22 +261,32 @@ from wall-clock time, PR head, reason strings, or request IDs (the
 `#1045` fallback rule stands for adapters without durable attempt identity;
 such an adapter simply does not implement the capability).
 
-The discovery barrier gains a second settled-history state. Today
-`settledCapacityExhaustion` is the sole state that releases the identity
-barrier (exclusion skip, dedupe-map skip, and successor naming). A
-predecessor whose `retryRequest` settled `Requeued` joins it:
+The discovery barrier gains a second settled-history state — but **not** by
+extending the existing one. Today `settledCapacityExhaustion` is the sole
+state that releases the identity barrier, and its release is total: the
+runner skips a settled-capacity run both in the discovery-exclusion scan
+and in the dedupe map (`internal/source/runner.go`), because capacity
+recovery must let the *same* identity rematerialize. A retry successor
+needs the opposite map behavior, so the two contracts stay distinct:
 
-- The predecessor's *old* WorkItemID stays in the dedupe map — that attempt
-  is consumed; a re-offer of the old identity dedupes as before.
-- The old WorkItemID remains in discovery exclusions; exclusions are opaque
-  per-attempt IDs and cannot suppress a fresh generation (the #328
-  handout-ledger scan already absorbs re-offered truncated-out generations).
-- The offered fresh identity passes the dedupe map, and
-  `settledPredecessor` finds the retry-settled predecessor, so the successor
-  run is named `successorRunName(source, freshIdentity, predecessorUID)` —
-  the same deterministic predecessor-UID successor naming capacity handoff
-  uses, preserving history while keeping creation atomic as the dedupe
+- A predecessor whose `retryRequest` settles `Requeued` contributes a
+  distinct settled-history predicate (`settledRetryRequeue`), which
+  participates **only** in predecessor lookup and successor naming:
+  `settledPredecessor` matches it alongside `settledCapacityExhaustion`,
+  so the offered fresh identity is named
+  `successorRunName(source, freshIdentity, predecessorUID)` — the same
+  deterministic predecessor-UID successor naming capacity handoff uses,
+  preserving history while keeping creation atomic as the dedupe
   boundary.
+- The retry predicate deliberately does **not** take the
+  `settledCapacityExhaustion` skip branches. The predecessor's *old*
+  WorkItemID stays in the dedupe map — that attempt is consumed; a stale
+  or duplicate re-offer of the old identity dedupes as before, instead of
+  rematerializing the consumed attempt.
+- The old WorkItemID also stays in discovery exclusions; exclusions are
+  opaque per-attempt IDs and cannot suppress a fresh generation (the #328
+  handout-ledger scan already absorbs re-offered truncated-out
+  generations).
 - `Moot` is deliberately **not** a barrier release: the work moved without
   this record; a successor, if any, arrives through whichever path moved it.
 
@@ -306,9 +322,20 @@ The reconcile that observes a new annotation runs:
 
 **Retention interplay:** a run carrying a `Requested` retry record is not
 reap-eligible, by the same gate that holds a run owing a park close —
-deletion would drop the durable intent with the object. The per-phase
-retention window starts only once the record settles. A settled record does
-not extend retention: the predecessor stays on its ordinary
+deletion would drop the durable intent with the object. The gate is
+decided against the live object on every pass, never from cached
+eligibility state: a per-phase retention marker may already be set and its
+window already expired when the operator annotates, and an expired window
+is not standing delete authority. The delete decision must therefore be
+made from the same read that issues it, and the mere presence of the
+`courier.misospace.dev/retry` annotation — settled or not — holds the
+run; the first reconcile that observes the annotation runs the record
+translation (persisting `Requested`, or a refusal) before any reap
+decision for that object is possible. Per-object reconcile serialization
+(controller-runtime) guarantees that once the annotation exists on the
+object, no delete decision is made from a state without it. The
+per-phase retention window starts only once the record settles; a settled
+record does not extend retention: the predecessor stays on its ordinary
 `Failed`/`NeedsHuman` window and audit floor. Retry never deletes, never
 clears evidence, and never shortens a window.
 
@@ -370,8 +397,10 @@ none scheduled `status/ready` until this design lands:
    CRD/deepcopy output.
 2. **Source capability and discovery integration** — `AttemptRequeuer` and
    request/result types in `internal/source/source.go`; the fake's
-   implementation; the runner's barrier release and successor naming for
-   retry-settled predecessors (`internal/source/runner.go`).
+   implementation; the runner's distinct retry settled-history predicate
+   (predecessor lookup and successor naming only — the
+   `settledCapacityExhaustion` map-skip branches stay capacity-only)
+   (`internal/source/runner.go`).
 3. **Dispatch adapter transport** — fenced requeue route in
    `internal/source/dispatch` (client + adapter), 404 version-skew latch,
    refusal mapping. Depends on the Dispatch server contract (tracked in the
@@ -395,7 +424,7 @@ The issue's required test classes map onto the decomposition:
 | Partial failure | #1 + #2 + #3: status write lost after adapter success → key replay settles `Requeued` with the original result, never `Moot`; adapter reports moved-without-this-key (no committed transition under the key) → settles `Moot`; transient adapter error → record stays `Requested` and retries; crash between call and write covered by the replay path. |
 | Closed upstream work | #1 forge guard (merged/closed fix-pr PR refuses; unreadable forge does not consume the request) and #3 adapter refusal vocabulary. |
 | Historical auditability | #1 + #2: predecessor phase, diagnostic, evidence, and report unchanged across a retry; successor named by predecessor UID; old identity stays deduped. |
-| One replacement run only | #2 runner tests (re-offer dedupe, successor naming, `Moot` keeps the barrier) and #1 (one `Requeued` per predecessor, concurrent requests resolved deterministically). |
+| One replacement run only | #2 runner tests (re-offer of the old identity dedupes under a retry-settled predecessor — the capacity map-skip branches stay capacity-only; successor naming; `Moot` keeps the barrier) and #1 (one `Requeued` per predecessor, concurrent requests resolved deterministically). |
 
 Every acceptance scenario from the backlog disposition composes from these:
 one existing PR fix, no active writers, retained failure; an explicit retry
