@@ -3,6 +3,7 @@ package broker
 import (
 	"context"
 	"errors"
+	"strings"
 	"testing"
 
 	"github.com/misospace/courier/internal/forge"
@@ -11,9 +12,11 @@ import (
 var errMissing = errors.New("missing")
 
 type adapterForge struct {
-	cfg     forge.ProviderConfig
-	pr      forge.PullRequest
-	created int
+	cfg        forge.ProviderConfig
+	pr         forge.PullRequest
+	created    int
+	lastCreate forge.CreatePullRequestInput
+	pulls      []forge.PullRequest
 }
 
 func (f *adapterForge) Config() forge.ProviderConfig { return f.cfg }
@@ -40,6 +43,7 @@ func (f *adapterForge) ReadChecks(context.Context, forge.PullRequestRef, string)
 }
 func (f *adapterForge) CreatePullRequest(_ context.Context, in forge.CreatePullRequestInput) (forge.PullRequest, error) {
 	f.created++
+	f.lastCreate = in
 	f.pr = forge.PullRequest{Number: f.created, Repo: in.Repo, BaseRepo: in.Repo, BaseRef: in.Base, BaseSHA: "base-oid", HeadRepo: in.HeadRepo, HeadRef: in.HeadRef, HeadSHA: "work-oid", State: "open", Title: in.Title, Body: in.Body, Draft: in.Draft}
 	return f.pr, nil
 }
@@ -50,6 +54,9 @@ func (f *adapterForge) CommentPullRequest(context.Context, forge.PullRequestRef,
 	return forge.Comment{}, forge.ErrUnsupported
 }
 func (f *adapterForge) ListPullRequestsByHead(_ context.Context, base forge.PullRequestRef, repo, ref string) ([]forge.PullRequest, error) {
+	if f.pulls != nil {
+		return f.pulls, nil
+	}
 	if f.pr.Number > 0 && f.pr.BaseRepo == base.Repo && f.pr.HeadRepo == repo && f.pr.HeadRef == ref {
 		return []forge.PullRequest{f.pr}, nil
 	}
@@ -103,5 +110,89 @@ func TestForgeAdapterResolveCreateAndVerifyPullRequest(t *testing.T) {
 	}
 	if created.Number != 1 || created.BaseRepo != base.Canonical || created.BaseRef != "main" || created.HeadRepo != work.Canonical || created.HeadRef != policy.WorkRef || created.HeadOID != "work-oid" {
 		t.Fatalf("created PR identity = %#v", created)
+	}
+}
+
+func TestForgeAdapterContributeCreatesCrossRepoPullRequest(t *testing.T) {
+	ctx := context.Background()
+	base := forge.Repository{ID: "1", Canonical: "org/repo", DefaultRef: "main"}
+	work := forge.Repository{ID: "2", Canonical: "fork/repo", DefaultRef: "main"}
+	provider := &adapterForge{cfg: forge.ProviderConfig{Name: "test"}}
+	policy := Policy{RunUID: "uid", Mode: ModeContribute, Provider: "test", BaseRepo: base.Canonical, BaseRef: "main", BaseOID: "base-oid", WorkRepo: work.Canonical, WorkRef: "courier/org/repo/goal-abc12345", WorkAnchorOID: "work-oid", SourceIssue: SourceIssue{Owner: "org", Name: "repo", Number: 1}}
+	repos := adapterRepos{repos: map[string]forge.Repository{base.Canonical: base, work.Canonical: work}}
+	adapter, err := NewForgeAdapter(policy, provider, repos, base, work)
+	if err != nil {
+		t.Fatal(err)
+	}
+	engine, err := NewPolicyEngine(policy, adapter, adapterPusher{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	created, _, err := engine.CreatePullRequest(ctx, "work-oid", "title", "Refs #1", false)
+	if err != nil {
+		t.Fatalf("CreatePullRequest: %v", err)
+	}
+	if created.Number <= 0 || created.HeadRepo != work.Canonical || created.HeadRef != policy.WorkRef || created.BaseRepo != base.Canonical || created.HeadOID != "work-oid" {
+		t.Fatalf("created PR identity = %#v", created)
+	}
+	if got := provider.lastCreate; got.Head != work.Canonical+":"+policy.WorkRef || got.HeadRepo != work.Canonical || got.Repo != base.Canonical {
+		t.Fatalf("provider create input = %#v", got)
+	}
+}
+
+func TestForgeAdapterContributeRediscoveryAdoptsExistingPullRequest(t *testing.T) {
+	ctx := context.Background()
+	base := forge.Repository{ID: "1", Canonical: "org/repo", DefaultRef: "main"}
+	work := forge.Repository{ID: "2", Canonical: "fork/repo", DefaultRef: "main"}
+	provider := &adapterForge{cfg: forge.ProviderConfig{Name: "test"}, pr: forge.PullRequest{Number: 5, Repo: base.Canonical, BaseRepo: base.Canonical, BaseRef: "main", BaseSHA: "base-oid", HeadRepo: work.Canonical, HeadRef: "courier/org/repo/goal-abc12345", HeadSHA: "work-oid", State: "open", Title: "title", Body: "Refs #1"}}
+	policy := Policy{RunUID: "uid", Mode: ModeContribute, Provider: "test", BaseRepo: base.Canonical, BaseRef: "main", BaseOID: "base-oid", WorkRepo: work.Canonical, WorkRef: "courier/org/repo/goal-abc12345", WorkAnchorOID: "work-oid", SourceIssue: SourceIssue{Owner: "org", Name: "repo", Number: 1}}
+	repos := adapterRepos{repos: map[string]forge.Repository{base.Canonical: base, work.Canonical: work}}
+	adapter, err := NewForgeAdapter(policy, provider, repos, base, work)
+	if err != nil {
+		t.Fatal(err)
+	}
+	engine, err := NewPolicyEngine(policy, adapter, adapterPusher{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	created, _, err := engine.CreatePullRequest(ctx, "work-oid", "title", "Refs #1", false)
+	if err != nil {
+		t.Fatalf("CreatePullRequest: %v", err)
+	}
+	if created.Number != 5 || created.HeadRepo != work.Canonical || created.HeadRef != policy.WorkRef || created.BaseRepo != base.Canonical || created.HeadOID != "work-oid" {
+		t.Fatalf("created PR identity = %#v, want the rediscovered PR 5", created)
+	}
+	if provider.created != 0 {
+		t.Fatalf("provider created = %d, want 0 (no duplicate create)", provider.created)
+	}
+}
+
+func TestForgeAdapterContributeAmbiguousHeadFailsClosed(t *testing.T) {
+	ctx := context.Background()
+	base := forge.Repository{ID: "1", Canonical: "org/repo", DefaultRef: "main"}
+	work := forge.Repository{ID: "2", Canonical: "fork/repo", DefaultRef: "main"}
+	provider := &adapterForge{cfg: forge.ProviderConfig{Name: "test"}, pulls: []forge.PullRequest{
+		{Number: 5, Repo: base.Canonical, BaseRepo: base.Canonical, BaseRef: "main", BaseSHA: "base-oid", HeadRepo: work.Canonical, HeadRef: "courier/org/repo/goal-abc12345", HeadSHA: "work-oid", State: "open"},
+		{Number: 6, Repo: base.Canonical, BaseRepo: base.Canonical, BaseRef: "main", BaseSHA: "base-oid", HeadRepo: work.Canonical, HeadRef: "courier/org/repo/goal-abc12345", HeadSHA: "work-oid", State: "open"},
+	}}
+	policy := Policy{RunUID: "uid", Mode: ModeContribute, Provider: "test", BaseRepo: base.Canonical, BaseRef: "main", BaseOID: "base-oid", WorkRepo: work.Canonical, WorkRef: "courier/org/repo/goal-abc12345", WorkAnchorOID: "work-oid", SourceIssue: SourceIssue{Owner: "org", Name: "repo", Number: 1}}
+	repos := adapterRepos{repos: map[string]forge.Repository{base.Canonical: base, work.Canonical: work}}
+	adapter, err := NewForgeAdapter(policy, provider, repos, base, work)
+	if err != nil {
+		t.Fatal(err)
+	}
+	engine, err := NewPolicyEngine(policy, adapter, adapterPusher{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, _, err = engine.CreatePullRequest(ctx, "work-oid", "title", "Refs #1", false)
+	if err == nil {
+		t.Fatal("CreatePullRequest succeeded with two PRs claiming the pinned head")
+	}
+	if !strings.Contains(err.Error(), "multiple pull requests claim the pinned head") {
+		t.Fatalf("error = %v, want the multiple-claim denial", err)
+	}
+	if provider.created != 0 {
+		t.Fatalf("provider created = %d, want 0", provider.created)
 	}
 }
