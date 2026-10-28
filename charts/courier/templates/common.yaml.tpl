@@ -294,8 +294,8 @@
 {{- if kindIs "string" $spec.issue }}
 {{- fail (printf "cron.schedules entry %q requires issue as a number" $name) }}
 {{- end }}
-{{- if not $spec.issue }}
-{{- fail (printf "cron.schedules entry %q requires a positive issue number" $name) }}
+{{- if or (not $spec.issue) (lt (float64 $spec.issue) 1.0) (ne (float64 $spec.issue) (floor (float64 $spec.issue))) }}
+{{- fail (printf "cron.schedules entry %q requires a positive integer issue number" $name) }}
 {{- end }}
 {{- if not $spec.lane }}
 {{- fail (printf "cron.schedules entry %q requires lane" $name) }}

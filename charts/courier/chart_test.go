@@ -1077,7 +1077,31 @@ func TestChartRejectsInvalidCronValues(t *testing.T) {
 	if err == nil {
 		t.Fatalf("expected helm template fail for a job without issue, but it succeeded:\n%s", out)
 	}
-	if !strings.Contains(out, "requires a positive issue number") {
+	if !strings.Contains(out, "requires a positive integer issue number") {
+		t.Fatalf("helm template failed without expected issue message:\n%s", out)
+	}
+	out, err = runHelmOutput(t, chartDir, "template", "courier", ".",
+		"--set", "cron.schedules.nightly.repo=misospace/courier",
+		"--set", "cron.schedules.nightly.issue=-5",
+		"--set", "cron.schedules.nightly.lane=frontier",
+		"--set", "cron.schedules.nightly.schedule=* * * * *",
+	)
+	if err == nil {
+		t.Fatalf("expected helm template fail for a negative issue, but it succeeded:\n%s", out)
+	}
+	if !strings.Contains(out, "requires a positive integer issue number") {
+		t.Fatalf("helm template failed without expected issue message:\n%s", out)
+	}
+	out, err = runHelmOutput(t, chartDir, "template", "courier", ".",
+		"--set", "cron.schedules.nightly.repo=misospace/courier",
+		"--set-json", "cron.schedules.nightly.issue=12.5",
+		"--set", "cron.schedules.nightly.lane=frontier",
+		"--set", "cron.schedules.nightly.schedule=* * * * *",
+	)
+	if err == nil {
+		t.Fatalf("expected helm template fail for a fractional issue, but it succeeded:\n%s", out)
+	}
+	if !strings.Contains(out, "requires a positive integer issue number") {
 		t.Fatalf("helm template failed without expected issue message:\n%s", out)
 	}
 	out, err = runHelmOutput(t, chartDir, "template", "courier", ".",
