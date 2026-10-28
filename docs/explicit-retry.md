@@ -271,13 +271,39 @@ needs the opposite map behavior, so the two contracts stay distinct:
 
 - A predecessor whose `retryRequest` settles `Requeued` contributes a
   distinct settled-history predicate (`settledRetryRequeue`), which
-  participates **only** in predecessor lookup and successor naming:
-  `settledPredecessor` matches it alongside `settledCapacityExhaustion`,
-  so the offered fresh identity is named
+  participates **only** in predecessor lookup and successor naming — the
+  same slot `settledCapacityExhaustion` occupies for capacity recovery,
+  never in the dedupe map or the discovery-exclusion scan. A
+  retry-settled predecessor is terminal `Failed`/`NeedsHuman`, so the two
+  predicates are disjoint on any one run.
+- **Predecessor correlation is by recorded attempt identity, not by work
+  identity.** The existing `settledPredecessor` lookup compares the
+  normalized work identity of the incoming offer against each
+  predecessor's `spec.workItemID`; that comparison cannot match a retry
+  successor, because the fresh generation's identity differs from the
+  predecessor's (Dispatch's `WorkIdentity` keeps the generation:
+  `followup-pr/<repo>#<n>/<id>@<gen>`). The retry predicate therefore
+  correlates the incoming offer with a predecessor by matching the
+  offered fresh identity — normalized through the same `WorkIdentity`
+  normalization the dedupe map applies — against the `attemptID` the
+  adapter returned and the controller recorded in
+  `status.retryRequest.attemptID` when the record settled `Requeued`
+  (newest-creation-timestamp tie-break, as today). The matched
+  predecessor's UID then names the successor
   `successorRunName(source, freshIdentity, predecessorUID)` — the same
   deterministic predecessor-UID successor naming capacity handoff uses,
   preserving history while keeping creation atomic as the dedupe
   boundary.
+- When the source requeued without promising an identity (`attemptID`
+  empty — discovery observes it later), no predecessor link is claimed:
+  the fresh offer materializes under the ordinary deterministic
+  `runName(source, freshIdentity)`, and correlation lives in the
+  `run.retry` events. Naming is history preservation, never a correctness
+  gate: if the predecessor is reaped before the fresh offer arrives (its
+  ordinary window may already have expired), the fresh attempt still
+  materializes under the ordinary name with no correctness loss, because
+  the fresh identity's dedupe is owned by the successor run once it
+  exists.
 - The retry predicate deliberately does **not** take the
   `settledCapacityExhaustion` skip branches. The predecessor's *old*
   WorkItemID stays in the dedupe map — that attempt is consumed; a stale
@@ -337,11 +363,21 @@ reconciles per object, so a retry reconcile cannot interleave with the
 reaper's pass; to bound the remaining read-to-delete window, the reaper
 re-verifies the gate on the object state the `Delete` is issued from,
 and the annotation event that lands mid-pass wakes the object for the
-record translation immediately. The
-per-phase retention window starts only once the record settles; a settled
-record does not extend retention: the predecessor stays on its ordinary
-`Failed`/`NeedsHuman` window and audit floor. Retry never deletes, never
-clears evidence, and never shortens a window.
+record translation immediately. The retention window itself never
+restarts and never extends: the per-phase window follows its existing
+ordinary rules (stamped set-once once the lifecycle report settles, never
+derived from `FinishedAt`), and retry adds only the hold — an outstanding
+`Requested` record holds deletion, and a settled record never holds the
+reaper. Once the record settles, the ordinary rules resume exactly where
+they were: a `Refused` or `Moot` settlement returns the run to its
+ordinary `Failed`/`NeedsHuman` window and audit floor, which may already
+have expired, making the run reap-eligible again at the next pass; a
+`Requeued` settlement leaves the predecessor on that same original window,
+and if it has already expired the run becomes reap-eligible again too —
+losing the predecessor to reaping before its successor materializes costs
+only the history-preserving successor name (correlation stays in the
+`run.retry` events), never correctness. Retry never deletes, never clears
+evidence, and never shortens a window.
 
 **Partial failure** is therefore bounded: before the source call (nothing
 sent), after the source call (key replay), or at the source (refusal
@@ -391,7 +427,10 @@ the structured `run.retry` events. The #510 read model projects
 ## Decomposition
 
 Implementation is split into bounded, dependency-ordered, file-scoped issues,
-none scheduled `status/ready` until this design lands:
+none scheduled `status/ready` until this design lands. Status: the core
+request surface and controller state machine of item 1 landed on main via
+#613; items 2–4 remain open, and until an adapter implements the
+`AttemptRequeuer` capability a retry settles `unsupported-source`.
 
 1. **Core request surface and controller state machine** — API types
    (`api/v1alpha1/coderun_types.go`: annotation constant, `status.retryRequest`,
@@ -402,7 +441,8 @@ none scheduled `status/ready` until this design lands:
 2. **Source capability and discovery integration** — `AttemptRequeuer` and
    request/result types in `internal/source/source.go`; the fake's
    implementation; the runner's distinct retry settled-history predicate
-   (predecessor lookup and successor naming only — the
+   (predecessor lookup and successor naming only, correlated by the
+   recorded `attemptID` rather than work identity — the
    `settledCapacityExhaustion` map-skip branches stay capacity-only)
    (`internal/source/runner.go`).
 3. **Dispatch adapter transport** — fenced requeue route in
