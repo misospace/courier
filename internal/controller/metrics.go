@@ -40,6 +40,7 @@ var (
 	verificationMetricLabels = []string{"lane", "mode", "result"}
 	tokenMetricLabels        = []string{"lane", "mode", "kind"}
 	lifecycleMetricLabels    = []string{"source", "lane", "mode", "result"}
+	retryMetricLabels        = []string{"lane", "mode", "result"}
 )
 
 var (
@@ -121,6 +122,7 @@ type RunRecorder struct {
 	VerificationOutcomes    *prometheus.CounterVec
 	Tokens                  *prometheus.CounterVec
 	LifecycleReportOutcomes *prometheus.CounterVec
+	RetryRequests           *prometheus.CounterVec
 }
 
 func NewRunRecorder(reg prometheus.Registerer) *RunRecorder {
@@ -172,11 +174,15 @@ func NewRunRecorder(reg prometheus.Registerer) *RunRecorder {
 			Name: "courier_source_lifecycle_report_outcomes_total",
 			Help: "Terminal source lifecycle report attempt outcomes, by source, lane, mode, and result (published, superseded, unsupported, retryable, permanent-refusal).",
 		}, lifecycleMetricLabels),
+		RetryRequests: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "courier_coderun_retry_requests_total",
+			Help: "Explicit terminal-run retry requests observed by the controller, by lane, mode, and result (requested, requeued, moot, refused). Labels are bounded to lane and mode only — never repo, issue, or run identity; per-run correlation stays in the run.retry events.",
+		}, retryMetricLabels),
 	}
 	reg.MustRegister(rec.RunDuration, rec.QueueWait, rec.Total, rec.ReapRequests,
 		rec.PhaseTransitions, rec.PhaseDuration, rec.TerminalDiagnostics,
 		rec.InfraRestarts, rec.VerificationOutcomes, rec.Tokens,
-		rec.LifecycleReportOutcomes)
+		rec.LifecycleReportOutcomes, rec.RetryRequests)
 	return rec
 }
 
@@ -248,6 +254,15 @@ const (
 	lifecycleOutcomeUnsupported      = "unsupported"
 	lifecycleOutcomeRetryable        = "retryable"
 	lifecycleOutcomePermanentRefusal = "permanent-refusal"
+)
+
+// Retry request outcomes are a closed set: one per durable retry-request state
+// transition, never the bounded refusal reason (which rides the run.retry event).
+const (
+	retryOutcomeRequested = "requested"
+	retryOutcomeRequeued  = "requeued"
+	retryOutcomeMoot      = "moot"
+	retryOutcomeRefused   = "refused"
 )
 
 // Token kinds are the bounded TokenUsage fields; the derived Total is never
@@ -347,6 +362,22 @@ func (r *RunRecorder) ObserveLifecycleReportOutcome(sourceName, lane string, mod
 	}
 	r.LifecycleReportOutcomes.With(prometheus.Labels{
 		"source": sourceName,
+		"lane":   lane,
+		"mode":   string(mode),
+		"result": result,
+	}).Inc()
+}
+
+// ObserveRetryRequest records one explicit terminal-run retry request at a
+// durable state transition. The result label is the closed set requested,
+// requeued, moot, refused — never the bounded refusal reason, which rides only
+// the run.retry event. The refusal reason is not a label so a misbehaving or
+// hostile source cannot mint unbounded metric series through it.
+func (r *RunRecorder) ObserveRetryRequest(lane string, mode courierv1alpha1.Mode, result string) {
+	if r == nil || r.RetryRequests == nil {
+		return
+	}
+	r.RetryRequests.With(prometheus.Labels{
 		"lane":   lane,
 		"mode":   string(mode),
 		"result": result,
