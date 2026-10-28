@@ -355,6 +355,7 @@ func (w fakeStatusWriter) PatchStatus(ctx context.Context, name types.Namespaced
 			Restarts                        *int                               `json:"restarts,omitempty"`
 			Conditions                      []metav1.Condition                 `json:"conditions,omitempty"`
 			PublicationPolicy               *courierv1alpha1.PublicationPolicy `json:"publicationPolicy,omitempty"`
+			RetryRequest                    *courierv1alpha1.RetryRequest      `json:"retryRequest"`
 		} `json:"status"`
 	}
 	if err := json.Unmarshal(patch, &document); err != nil {
@@ -426,6 +427,14 @@ func (w fakeStatusWriter) PatchStatus(ctx context.Context, name types.Namespaced
 	}
 	if document.Status.PublicationPolicy != nil {
 		run.Status.PublicationPolicy = document.Status.PublicationPolicy
+	}
+	// retryRequest is always serialized with reason and settledAt present, so a
+	// whole-object assignment matches the real merge-patch behavior for every
+	// reachable transition: a replacement Requested clears a predecessor's
+	// reason/settledAt (both present as empty/null), and attemptID is only ever
+	// set on a Requeued record, which is never replaced.
+	if document.Status.RetryRequest != nil {
+		run.Status.RetryRequest = document.Status.RetryRequest
 	}
 	return w.client.Status().Update(ctx, &run)
 }

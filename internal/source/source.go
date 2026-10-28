@@ -252,6 +252,91 @@ type CapacityRecovery interface {
 	SettleCapacityExhaustion(context.Context, WorkItem, CapacityHandoff) error
 }
 
+// AttemptRequeueRequest carries the fenced identity of exactly one explicit
+// operator retry (#97/#606). It is shaped after the fenced capacity-settlement
+// boundary (CapacityHandoff), not the ordinary lifecycle report, because a retry
+// is a requeue — not a transition the ordinary lifecycle verbs can express
+// without emulating fencing.
+type AttemptRequeueRequest struct {
+	// FenceToken is the source-issued receipt fencing the attempt the retry
+	// replaces (the run's SourceReceipt). A source with real fencing rejects a
+	// token whose claim it no longer records; a source without real fencing is
+	// expected not to implement AttemptRequeuer at all.
+	FenceToken string
+	// IdempotencyKey identifies the retry so a retried call cannot requeue the
+	// attempt twice and a lost response can replay. It is derived from the
+	// immutable run incarnation and the opaque request ID, never from model,
+	// worker, or lane names. A committed key MUST replay its original result
+	// without mutating a newer owner.
+	IdempotencyKey string
+	// Reason is a bounded operator note carried for the source's audit; it is
+	// untrusted data and is never executed or interpreted by the adapter.
+	Reason string
+}
+
+// AttemptRequeueResult carries the fresh attempt identity the source will
+// re-offer, when the source can promise one. An empty AttemptID means the source
+// requeued without exposing a new identity; discovery observes the successor
+// later. Core never derives an identity here from wall-clock time, PR head,
+// reason strings, or request IDs.
+type AttemptRequeueResult struct {
+	AttemptID string
+}
+
+// RetryRefusalError is the typed, source-owned classification an AttemptRequeuer
+// returns to settle a retry request as Moot or Refused with a bounded reason from
+// the core's refusal vocabulary (RetryRefusalStaleGeneration,
+// RetryRefusalHeldForHuman, RetryRefusalSourceRefused, or — for the moot family —
+// RetryRefusalAlreadyRequeued). Moot is the fail-safe lost-response outcome: the
+// source committed the requeue under the same key but the controller never
+// learned, so replaying the key returns moot and no second replacement launches.
+// Any other (non-RetryRefusalError) error is a transient source failure: the
+// request stays Requested and retries under the same key. Core maps only the
+// closed reasons; an unknown reason is treated as source-refused.
+type RetryRefusalError struct {
+	// Reason is a bounded value from the core refusal vocabulary.
+	Reason string
+	// Moot marks an already-committed requeue (already-requeued / superseded),
+	// which settles the record Moot rather than Refused.
+	Moot bool
+	// Err is an optional wrapped cause, never surfaced to status.
+	Err error
+}
+
+func (e *RetryRefusalError) Error() string {
+	if e == nil {
+		return "source: attempt requeue refused"
+	}
+	if e.Err != nil {
+		return "source: attempt requeue refused (" + e.Reason + "): " + e.Err.Error()
+	}
+	return "source: attempt requeue refused (" + e.Reason + ")"
+}
+
+func (e *RetryRefusalError) Unwrap() error {
+	if e == nil {
+		return nil
+	}
+	return e.Err
+}
+
+// AttemptRequeuer is the optional fenced requeue boundary for an explicit
+// operator retry of a terminal run (#97/#606). In one atomic source-side
+// transition it stops the named attempt from owning the work, releases any human
+// hold the explicit request is authorized to lift, and makes the work
+// discoverable again for a compatible worker — without consuming the task-repair
+// budget, without resolving anything, and without touching any other attempt. A
+// committed idempotency key MUST replay its original result without mutating a
+// newer owner, exactly as the capacity-settlement contract requires.
+//
+// An adapter implements this interface only if its source can requeue atomically
+// with fencing. Adapters whose source cannot must not implement it and must never
+// emulate it with ordinary Claim/Release/Transition calls; the core treats a
+// missing implementation as unsupported-source and never imitates the requeue.
+type AttemptRequeuer interface {
+	RequeueAttempt(context.Context, WorkItem, AttemptRequeueRequest) (AttemptRequeueResult, error)
+}
+
 // HandoutAcker optionally acknowledges a stamped hand-out once the run that
 // owns the attempt is durably materialized (#456). Queued work that stamps a
 // per-agent hand-out on offer relies on the worker acknowledging it after the

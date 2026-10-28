@@ -105,6 +105,13 @@ const (
 	// observability, never status, and lets operators see compaction in run
 	// telemetry instead of inferring it from gateway failover.
 	EventSessionCompacted = "session.compacted"
+	// EventRunRetry reports one explicit operator-authorized retry-request
+	// transition on a terminal CoderRun (#97/#606): the request ID and the
+	// settled reason ride in the detail, and the status field carries the state
+	// (Requested, Requeued, Moot, Refused). The event is always Verbose so the
+	// audit trail reaches the log store on every finished request, not only on
+	// debug runs.
+	EventRunRetry = "run.retry"
 )
 
 // Status values for the status field.

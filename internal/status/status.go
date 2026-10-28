@@ -173,6 +173,15 @@ type OperatorPatch struct {
 	// +optional
 	CIParkRelease *courierv1alpha1.CIParkRelease `json:"ciparkRelease,omitempty"`
 
+	// RetryRequest is the operator-owned explicit-retry record (#97/#606). It is
+	// replaceable across request lifetimes but never cleared once set — a settled
+	// record is durable audit state, and a fresh request replaces it wholesale —
+	// so unlike CIPark it needs no explicit-null clear path. The record's own
+	// serialization always carries reason and settledAt so a replacement clears a
+	// predecessor's stale sub-keys under a JSON merge patch.
+	// +optional
+	RetryRequest *courierv1alpha1.RetryRequest `json:"retryRequest,omitempty"`
+
 	// clearCIPark, clearCIRepair, clearCISettlement, and clearCIParkDeferral
 	// distinguish a record the operator cleared from a record it never
 	// mentioned: only the former may be encoded as an explicit null, because

@@ -22,6 +22,16 @@ const (
 // clears or replaces the record.
 const SoftStopAnnotation = "courier.misospace.dev/soft-stop"
 
+// RetryAnnotation is the human ingress for an explicit, operator-authorized
+// retry of a terminal CoderRun (#97/#606). Its non-empty, bounded value is an
+// opaque request ID, and it mirrors the settled soft-stop ingress: the spec is
+// immutable and source-owned, the status is controller-owned, and the annotation
+// is the operator channel Kubernetes RBAC already gates. The controller alone
+// translates it into the operator-owned CoderRun.status.retryRequest record.
+// Each retry request is an explicit new annotation value: a value already served
+// or settled is a no-op, and re-requesting requires a fresh value.
+const RetryAnnotation = "courier.misospace.dev/retry"
+
 // ControlRequestKind is the action one control request names. v1 closes the
 // CRD enum to soft-stop: the only settled action is a cooperative stop.
 // +kubebuilder:validation:Enum=soft-stop
@@ -121,6 +131,98 @@ const ConditionCIRepairInapplicable = "CIRepairInapplicable"
 // ConditionCIRepairInapplicable condition when the observed head matches no
 // commit the run accounts for.
 const ConditionReasonHeadUnattributable = "HeadUnattributable"
+
+// ConditionRetryRequest is the status condition type the operator writes on a
+// CoderRun to mirror its status.retryRequest record for observability (#97/#606).
+// The condition status and reason track the record state one-for-one:
+// Unknown/Requested, True/Requeued, True/Moot, and False/Refused. A Refused
+// condition carries the bounded refusal reason in its message, matching
+// status.retryRequest.reason and the run.retry event.
+const ConditionRetryRequest = "RetryRequest"
+
+// Condition reasons mirroring the four RetryRequest states exactly, so a
+// reader can map the condition back to the record without decoding it.
+const (
+	ConditionReasonRetryRequested = "Requested"
+	ConditionReasonRetryRequeued  = "Requeued"
+	ConditionReasonRetryMoot      = "Moot"
+	ConditionReasonRetryRefused   = "Refused"
+)
+
+// RetryRequestState is the durable state of one explicit retry request
+// (#97/#606). Requested is durable intent persisted before any source call; the
+// other three are settled. A settled record is immutable, and a Requeued record
+// never reopens.
+// +kubebuilder:validation:Enum=Requested;Requeued;Moot;Refused
+type RetryRequestState string
+
+const (
+	RetryRequestStateRequested RetryRequestState = "Requested"
+	RetryRequestStateRequeued  RetryRequestState = "Requeued"
+	RetryRequestStateMoot      RetryRequestState = "Moot"
+	RetryRequestStateRefused   RetryRequestState = "Refused"
+)
+
+// The bounded retry refusal vocabulary carried by status.retryRequest.reason and
+// the run.retry event. It is a closed set: a refusal reason outside it is a
+// controller bug, never free text. The first six are core (source-agnostic)
+// refusals decided before the source call; the last three are source-state
+// refusals the adapter returns after the Requested write. already-requeued has
+// two roles: it is the single reason of the moot family, carried by a settled Moot
+// record where the source committed the requeue under the key but the controller
+// never learned (the lost-response fail-safe replay), and it is the events-only
+// reason for a fresh request arriving over an already-settled Requeued record —
+// that announcement never rewrites the settled record.
+const (
+	RetryRefusalNotRetryablePhase        = "not-retryable-phase"
+	RetryRefusalAutomaticRecoveryChannel = "automatic-recovery-channel"
+	RetryRefusalActiveOwnerExists        = "active-owner-exists"
+	RetryRefusalAlreadyRequeued          = "already-requeued"
+	RetryRefusalUpstreamClosed           = "upstream-closed"
+	RetryRefusalUnsupportedSource        = "unsupported-source"
+	RetryRefusalStaleGeneration          = "stale-generation"
+	RetryRefusalSourceRefused            = "source-refused"
+	RetryRefusalHeldForHuman             = "held-for-human"
+)
+
+// RetryRequest is the operator-owned durable record of one explicit retry
+// request, translated by the controller alone from the RetryAnnotation (#97/#606).
+// The operator never writes it and no harness path can forge it; the controller
+// is its sole writer. It is replaceable across request lifetimes — a settled
+// Refused/Moot record may be superseded by a fresh request from a new annotation
+// value — but a settled record is never otherwise mutated, and a Requeued record
+// is terminal for the predecessor's whole lifetime. Every field is serialized
+// without omitempty where a stale sub-key must be cleared by a replacement
+// record under a JSON merge patch (reason and settledAt), so a fresh Requested
+// never inherits a predecessor's refusal reason or settled timestamp.
+type RetryRequest struct {
+	// ID is the opaque request ID: the annotation value, verbatim.
+	// +kubebuilder:validation:MinLength=1
+	// +kubebuilder:validation:MaxLength=128
+	ID string `json:"id"`
+	// RequestedAt is when the controller first stamped this request.
+	RequestedAt metav1.Time `json:"requestedAt"`
+	// State is the durable retry request state.
+	State RetryRequestState `json:"state"`
+	// Reason is the bounded refusal/moot reason for a settled Refused/Moot
+	// record, and empty while Requested or for a Requeued success. It is drawn
+	// only from the closed RetryRefusal* vocabulary.
+	// +optional
+	// +kubebuilder:validation:MaxLength=128
+	Reason string `json:"reason"`
+	// AttemptID is the fresh source attempt identity the adapter returned when
+	// it requeued, if the source exposes one. Empty means the source requeued
+	// without exposing a new identity; discovery observes the successor later.
+	// +optional
+	// +kubebuilder:validation:MaxLength=256
+	AttemptID string `json:"attemptID,omitempty"`
+	// SettledAt is when the record reached Requeued, Moot, or Refused. It is
+	// null while Requested, and always serialized so a replacement Requested
+	// record clears a predecessor's settled timestamp.
+	// +optional
+	// +nullable
+	SettledAt *metav1.Time `json:"settledAt"`
+}
 
 // Phase is the lifecycle phase of a CoderRun.
 // +kubebuilder:validation:Enum=Pending;Claimed;Running;Verifying;AwaitingReview;HandedOff;NeedsHuman;Done;Failed;BlockedExternal
@@ -912,6 +1014,14 @@ type CoderRunStatus struct {
 	// the close is advisory and the record is dropped either way.
 	// +optional
 	CIParkRelease *CIParkRelease `json:"ciparkRelease,omitempty"`
+
+	// RetryRequest is the operator-owned durable record of the explicit retry
+	// request the RetryAnnotation named (#97/#606). The controller alone writes
+	// it, translating the annotation into the Requested | Requeued | Moot |
+	// Refused state machine; no operator or harness path can forge it. A run
+	// carrying a Requested record is not reap-eligible until the record settles.
+	// +optional
+	RetryRequest *RetryRequest `json:"retryRequest,omitempty"`
 
 	// Conditions is the standard condition set.
 	// +optional
