@@ -2,6 +2,7 @@ package cron
 
 import (
 	"fmt"
+	"strconv"
 	"strings"
 	"time"
 
@@ -76,19 +77,25 @@ func parseSchedule(schedule Schedule, index int) (Schedule, error) {
 		return Schedule{}, fmt.Errorf("%s %q: invalid name: %s", label, name, strings.Join(labelErrs, "; "))
 	}
 	label = fmt.Sprintf("cron schedule %q", name)
-	repo := strings.TrimSpace(schedule.Repo)
-	owner, project, found := strings.Cut(repo, "/")
-	if !found || owner == "" || project == "" || strings.Contains(project, "/") {
+	schedule.Repo = strings.TrimSpace(schedule.Repo)
+	owner, project, found := strings.Cut(schedule.Repo, "/")
+	if !found || owner == "" || project == "" || strings.Contains(project, "/") ||
+		strings.ContainsAny(schedule.Repo, " \t") {
 		return Schedule{}, fmt.Errorf("%s: repo must be owner/name, got %q", label, schedule.Repo)
 	}
 	if schedule.Issue < 1 {
-		return Schedule{}, fmt.Errorf("%s: issue must be a positive issue number", label)
+		return Schedule{}, fmt.Errorf("%s: issue must be a positive issue or pull request number", label)
 	}
-	lane := strings.TrimSpace(schedule.Lane)
-	if lane == "" {
+	schedule.Lane = strings.TrimSpace(schedule.Lane)
+	if schedule.Lane == "" {
 		return Schedule{}, fmt.Errorf("%s: lane is required", label)
 	}
-	if strings.TrimSpace(schedule.Schedule) == "" {
+	if labelErrs := utilvalidation.IsDNS1123Label(schedule.Lane); len(labelErrs) > 0 {
+		return Schedule{}, fmt.Errorf("%s: invalid lane %q: %s", label, schedule.Lane, strings.Join(labelErrs, "; "))
+	}
+	schedule.Schedule = strings.TrimSpace(schedule.Schedule)
+	schedule.Timezone = strings.TrimSpace(schedule.Timezone)
+	if schedule.Schedule == "" {
 		return Schedule{}, fmt.Errorf("%s: schedule is required", label)
 	}
 	if _, err := compile(schedule.Schedule, schedule.Timezone); err != nil {
@@ -103,11 +110,11 @@ func parseSchedule(schedule Schedule, index int) (Schedule, error) {
 	}
 	return Schedule{
 		Name:     name,
-		Repo:     repo,
+		Repo:     schedule.Repo,
 		Issue:    schedule.Issue,
-		Lane:     lane,
-		Schedule: strings.TrimSpace(schedule.Schedule),
-		Timezone: strings.TrimSpace(schedule.Timezone),
+		Lane:     schedule.Lane,
+		Schedule: schedule.Schedule,
+		Timezone: schedule.Timezone,
 		Mode:     mode,
 		Debug:    schedule.Debug,
 	}, nil
@@ -145,5 +152,5 @@ func compileJob(schedule Schedule) (job, error) {
 // polls and manager restarts derive the same identity for the same
 // occurrence, while future occurrences remain distinct.
 func (j job) occurrenceID(boundary time.Time) string {
-	return j.name + "@" + fmt.Sprintf("%d", boundary.Unix())
+	return j.name + "@" + strconv.FormatInt(boundary.Unix(), 10)
 }

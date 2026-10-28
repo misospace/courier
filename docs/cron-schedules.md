@@ -21,7 +21,7 @@ other sources are unaffected.
 schedules:
   - name: nightly-triage
     repo: misospace/courier
-    issue: 15            # positive issue number the run addresses
+    issue: 15            # issue or pull request number the run addresses
     lane: frontier       # LaneProfile assigned to materialized runs
     schedule: "30 2 * * *"
     timezone: America/New_York   # optional IANA name; default UTC
@@ -38,12 +38,16 @@ transport. There is no per-entry soft-failure at discovery time.
 ## Schedule syntax and timezone semantics
 
 Standard five-field cron expressions (minute hour day-of-month month
-day-of-week), parsed by `github.com/hashicorp/cronexpr`. The expression is
-evaluated in the configured IANA location (`timezone`), defaulting to UTC:
-wall-clock boundaries follow local time, including DST transitions. A
-boundary that falls on a nonexistent local time (a spring-forward gap) is
-skipped by the scheduler — no run is created for it, and the next boundary
-is the next real occurrence.
+day-of-week), parsed by `github.com/hashicorp/cronexpr`. Wider cronexpr
+syntax — six or seven fields with an explicit year, or `@descriptor` forms
+— is rejected: a year-pinned expression exhausts its match list, and the
+adapter's recurring cursor must never see a nonexistent boundary. The
+expression is evaluated in the configured IANA location (`timezone`),
+defaulting to UTC: wall-clock boundaries follow local time, including DST
+transitions. A boundary that falls on a nonexistent local time (a
+spring-forward gap) is skipped by the scheduler — no run is created for it,
+and the next boundary is the next real occurrence. An expression that can
+never fire is rejected at load.
 
 ## Occurrence identity
 
@@ -68,10 +72,24 @@ wants the next occurrence simply lets the schedule fire again.
 
 ## Overlap policy
 
-Occurrences are materialized regardless of any still-active prior run.
-Deduplication is per occurrence identity only; the lane's concurrency limit
-serializes execution and Pending runs queue behind it. Operators pace work
-through the schedule — pick periods longer than a typical run duration.
+Deduplication is per occurrence identity only; the adapter keeps no
+overlap state. The lane's concurrency limit serializes execution: while a
+prior run holds the lane's capacity, source discovery pauses entirely, so
+the next occurrence is not materialized as a Pending run behind it — no
+CoderRun exists yet. When capacity returns, the latest due occurrence
+materializes and any boundary that passed while discovery was paused is
+skipped by the same latest-only rule as any other gap. At most one
+occurrence per job is ever outstanding, and operators pace work through
+the schedule — pick periods longer than a typical run duration.
+
+## Delivery shape
+
+Together with the no-catch-up rule, delivery of one occurrence is
+at-most-once: the cursor advances when the occurrence is offered to the
+runner, so a materialization that fails after the offer (a Create error, a
+shutdown between offer and Create) is not retried — the next boundary is
+the recovery point. This is the deliberate trade for never
+re-materializing a completed occurrence after retention cleanup.
 
 ## Clock and restart behavior
 
@@ -89,6 +107,11 @@ No duplicate run after a manager restart or clock jitter:
 
 Like the manual adapter, the cron adapter has no external lifecycle to
 mutate: discovery and availability are its only supported capabilities, and
-every other connector capability is explicitly unsupported. With more than
-one lane in the schedule file, each lane's adapter reports under
-`cron:<lane>` so independent adapters never share metric series.
+every other connector capability is explicitly unsupported.
+
+With one or more lanes in the schedule file, each lane gets its own adapter
+and discovery runner. Every adapter reports under the connector label
+`cron:<lane>`, every run is materialized with `spec.source` `cron` and
+`spec.sourceAgent` `<lane>`, and the reconciler resolves lifecycle calls
+through the same `cron:<lane>` registry entry. The mapping is stable when
+lanes are added or removed, so retained runs never lose their adapter.

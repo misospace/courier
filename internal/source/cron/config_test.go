@@ -139,6 +139,38 @@ schedules:
     lane: frontier
     schedule: "not a schedule"
 `, "invalid schedule"},
+		{"six-field year-pinned expression", `
+schedules:
+  - name: nightly
+    repo: misospace/courier
+    issue: 15
+    lane: frontier
+    schedule: "0 0 1 1 * 2030"
+`, "want exactly five fields"},
+		{"never-firing expression", `
+schedules:
+  - name: nightly
+    repo: misospace/courier
+    issue: 15
+    lane: frontier
+    schedule: "0 0 30 2 *"
+`, "can never fire"},
+		{"invalid lane", `
+schedules:
+  - name: nightly
+    repo: misospace/courier
+    issue: 15
+    lane: "a b"
+    schedule: "* * * * *"
+`, "invalid lane"},
+		{"repo with whitespace", `
+schedules:
+  - name: nightly
+    repo: "misospace / courier"
+    issue: 15
+    lane: frontier
+    schedule: "* * * * *"
+`, "repo must be owner/name"},
 		{"invalid timezone", `
 schedules:
   - name: nightly

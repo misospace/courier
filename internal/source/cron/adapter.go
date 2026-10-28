@@ -37,6 +37,12 @@ type jobState struct {
 	// including every boundary that passed while the process was down — are
 	// skipped, never caught up.
 	cursor time.Time
+	// dead marks a schedule the cursor logic cannot advance past: next
+	// returned the zero time, meaning the expression can match no further
+	// instant. A dead job offers nothing more; compile already rejects
+	// schedules that can never fire or can exhaust, so this is defense in
+	// depth against a dependency behavior change, not a reachable state.
+	dead bool
 }
 
 // Adapter materializes scheduled work as source WorkItems. It has no
@@ -103,7 +109,12 @@ func New(schedules []Schedule, diagnostics *connector.Emitter, options ...Option
 	}
 	now := a.clock()
 	for i := range a.jobs {
-		a.jobs[i].cursor = a.jobs[i].job.schedule.next(now)
+		if next := a.jobs[i].job.schedule.next(now); next.IsZero() {
+			log.FromContext(context.Background()).Error(nil, "cron schedule can never fire, disabling job", "name", a.jobs[i].job.name)
+			a.jobs[i].dead = true
+		} else {
+			a.jobs[i].cursor = next
+		}
 	}
 	if diagnostics != nil {
 		diagnostics.RegisterConnector(a.name, map[string][]string{
@@ -151,6 +162,9 @@ func (a *Adapter) discover(ctx context.Context) ([]source.WorkItem, error) {
 	items := make([]source.WorkItem, 0, len(a.jobs))
 	for i := range a.jobs {
 		state := &a.jobs[i]
+		if state.dead {
+			continue
+		}
 		if state.cursor.IsZero() {
 			state.cursor = state.job.schedule.next(now)
 			continue
@@ -160,6 +174,15 @@ func (a *Adapter) discover(ctx context.Context) ([]source.WorkItem, error) {
 			skipped int
 		)
 		for boundary := state.cursor; !boundary.After(now); boundary = state.job.schedule.next(boundary) {
+			if boundary.IsZero() {
+				// The schedule is exhausted; stop advancing instead of
+				// spinning on a zero cursor.
+				log.FromContext(ctx).Error(nil, "cron schedule exhausted, disabling job",
+					"job", state.job.name)
+				state.dead = true
+				latest = time.Time{}
+				break
+			}
 			if !latest.IsZero() {
 				skipped++
 			}
@@ -174,6 +197,9 @@ func (a *Adapter) discover(ctx context.Context) ([]source.WorkItem, error) {
 				"latest", latest.Format(time.RFC3339))
 		}
 		state.cursor = state.job.schedule.next(latest)
+		if state.cursor.IsZero() {
+			state.dead = true
+		}
 		items = append(items, state.job.workItem(latest))
 	}
 	return items, nil

@@ -450,32 +450,25 @@ func main() {
 		}
 		// One adapter and one discovery runner per distinct LaneProfile: the
 		// runner assigns its own configured lane to everything it
-		// materializes, so jobs targeting different lanes need separate
-		// runners. Adapters report under "cron" in the single-lane case and
-		// "cron:<lane>" otherwise, mirroring the Dispatch binding identities;
-		// the SourceAgent carries the lane so the reconciler's registry
-		// lookup resolves the same adapter for lifecycle calls.
+		// materializes. Every adapter reports under "cron:<lane>" and every
+		// runner carries that lane as SourceAgent, so the reconciler's
+		// registry lookup (run.Spec.Source + ":" + run.Spec.SourceAgent)
+		// resolves the same adapter for lifecycle calls — and the mapping is
+		// stable when lanes are added or removed, unlike a bare-"cron" name
+		// that would strand retained runs materialized under a different
+		// shape.
 		lanes := cronLaneGroups(schedules)
 		for _, lane := range lanes {
-			connectorLabel := "cron"
-			sourceAgent := ""
-			if len(lanes) > 1 {
-				connectorLabel = "cron:" + lane.lane
-				sourceAgent = lane.lane
-			}
+			connectorLabel := "cron:" + lane.lane
 			if len(connectorLabel) > cron.MaxConnectorNameLength {
 				setupLog.Error(fmt.Errorf("cron connector label %q exceeds %d characters", connectorLabel, cron.MaxConnectorNameLength), "unable to configure Cron source", "lane", lane.lane)
 				os.Exit(1)
 			}
 			adapter := cron.New(lane.schedules, diagnostics, cron.WithConnectorName(connectorLabel))
-			if sourceAgent != "" {
-				sources.Register("cron:"+sourceAgent, adapter)
-			} else {
-				sources.Register("cron", adapter)
-			}
+			sources.Register(connectorLabel, adapter)
 			runner := source.NewRunner(mgr.GetClient(), adapter, source.RunnerConfig{
 				Source:       "cron",
-				SourceAgent:  sourceAgent,
+				SourceAgent:  lane.lane,
 				LaneProfile:  lane.lane,
 				Namespace:    namespace,
 				PollInterval: cronPollInterval,

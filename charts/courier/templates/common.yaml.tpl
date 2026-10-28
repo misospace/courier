@@ -323,10 +323,10 @@
   "globalMounts" (list (dict "path" "/etc/courier/cron-schedules" "readOnly" true))) }}
 {{- $_ := set .Values "persistence" $persistence }}
 {{- $args = append $args "--cron-schedules-file=/etc/courier/cron-schedules/schedules.yaml" }}
+{{- end }}
 {{- $cronPollInterval := dig "cron" "pollInterval" "" .Values }}
 {{- if $cronPollInterval }}
 {{- $args = append $args (printf "--cron-poll-interval=%s" $cronPollInterval) }}
-{{- end }}
 {{- end }}
 {{- end }}
 {{- $evidence := .Values.evidence }}

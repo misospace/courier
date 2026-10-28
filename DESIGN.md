@@ -2560,7 +2560,16 @@ Pluggable adapters over a generic interface. An adapter both *creates* runs and
   resolve-issue run; CHANGES_REQUESTED becomes a fix-pr run.
 - **cron** — scheduled work (the weekly audit, backlog grooming). This is what
   makes Courier the successor to the pre-Foreman cronjobs: scheduled and
-  queue-driven work collapse into one mechanism.
+  queue-driven work collapse into one mechanism. One adapter and discovery
+  runner per lane; occurrence identity is the job name plus the scheduled
+  boundary instant (`<job>@<unix-seconds>`), so repeated polls, restarts,
+  and replicas dedupe the same occurrence while future occurrences stay
+  distinct. Missed occurrences are skipped, never caught up — the in-process
+  cursor starts past every boundary before startup and never rewinds, so a
+  completed occurrence cannot be re-materialized after retention cleanup.
+  Schedule file transport, timezone semantics, overlap behavior, and the
+  at-most-once delivery shape are documented in
+  [docs/cron-schedules.md](./docs/cron-schedules.md).
 - **cli / web** — ad-hoc injection: "run this issue that isn't in dispatch."
 
 Dispatch is an adapter, not a dependency. Dispatch is a separate product; Courier
