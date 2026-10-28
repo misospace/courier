@@ -9,7 +9,7 @@
 ARG BINARIES=builder
 
 # Build the manager and executor binaries.
-FROM golang:1.27.3@sha256:b76020929b709ddb6202afc05410a0faefae20ae05e27ad548b3870092688a69 AS builder
+FROM golang:1.27.3@sha256:2669ec97bbb6e54602952b4171211116e3fe90e5f9c47619920c74554b3d7d09 AS builder
 ARG TARGETOS
 ARG TARGETARCH
 
@@ -41,7 +41,7 @@ COPY dist/ /workspace/
 
 FROM binaries-${BINARIES} AS binaries
 
-FROM golang:1.27.3@sha256:b76020929b709ddb6202afc05410a0faefae20ae05e27ad548b3870092688a69 AS toolchain
+FROM golang:1.27.3@sha256:2669ec97bbb6e54602952b4171211116e3fe90e5f9c47619920c74554b3d7d09 AS toolchain
 ARG CONTROLLER_TOOLS_VERSION=v0.16.5
 ARG HELM_VERSION=v3.18.6
 
