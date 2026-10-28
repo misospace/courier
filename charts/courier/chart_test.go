@@ -10,6 +10,7 @@ import (
 	"testing"
 
 	bootstrap "github.com/misospace/courier/internal/bootstrap"
+	"github.com/misospace/courier/internal/source/cron"
 	"sigs.k8s.io/yaml"
 )
 
@@ -966,4 +967,171 @@ func configMapsChecksum(t *testing.T, output string) string {
 		t.Fatalf("rendered output carries no checksum/configMaps annotation")
 	}
 	return match[1]
+}
+
+// TestChartRendersCronSchedules checks the cron.schedules values transport:
+// values serialize into a release ConfigMap the manager reads through the
+// --cron-schedules-file seam, the rendered config round-trips through the
+// manager's own parser, and the poll interval rides along.
+func TestChartRendersCronSchedules(t *testing.T) {
+	if _, err := exec.LookPath("helm"); err != nil {
+		t.Skip("helm is not installed")
+	}
+	chartDir := copyChart(t)
+	if err := exec.Command("helm", "repo", "add", "bjw-s-labs", "https://bjw-s-labs.github.io/helm-charts").Run(); err != nil {
+		t.Fatalf("configure chart repository: %v", err)
+	}
+	runHelm(t, chartDir, "dependency", "build")
+	valuesFile := filepath.Join(chartDir, "values-cron.yaml")
+	values := `cron:
+  schedules:
+    nightly-triage:
+      repo: misospace/courier
+      issue: 15
+      lane: frontier
+      schedule: "30 2 * * *"
+      timezone: America/New_York
+    weekly-sweep:
+      repo: misospace/courier
+      issue: 99
+      lane: local
+      schedule: "0 4 * * 1"
+      mode: fix-pr
+      debug: true
+  pollInterval: 45s
+`
+	if err := os.WriteFile(valuesFile, []byte(values), 0o600); err != nil {
+		t.Fatalf("write cron values: %v", err)
+	}
+	out := runHelm(t, chartDir, "template", "courier", ".", "--values", "values-cron.yaml")
+	for _, want := range []string{
+		"--cron-schedules-file=/etc/courier/cron-schedules/schedules.yaml",
+		"--cron-poll-interval=45s",
+		"name: courier-cron-schedules",
+		"mountPath: /etc/courier/cron-schedules",
+	} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("cron chart output missing %q", want)
+		}
+	}
+	configMap := findDocument(t, out, "kind: ConfigMap", "name: courier-cron-schedules")
+	var rendered struct {
+		Data map[string]string `json:"data"`
+	}
+	if err := yaml.Unmarshal([]byte(configMap), &rendered); err != nil {
+		t.Fatalf("parse rendered cron ConfigMap: %v", err)
+	}
+	config, ok := rendered.Data["schedules.yaml"]
+	if !ok {
+		t.Fatalf("cron ConfigMap carries no schedules.yaml key:\n%s", configMap)
+	}
+	schedules, err := cron.Parse([]byte(config))
+	if err != nil {
+		t.Fatalf("manager parser rejected rendered cron config: %v", err)
+	}
+	if len(schedules) != 2 {
+		t.Fatalf("parsed %d schedules, want 2", len(schedules))
+	}
+	if schedules[0].Name != "nightly-triage" || schedules[0].Repo != "misospace/courier" ||
+		schedules[0].Issue != 15 || schedules[0].Lane != "frontier" ||
+		schedules[0].Schedule != "30 2 * * *" || schedules[0].Timezone != "America/New_York" ||
+		schedules[0].Mode != cron.ModeResolveIssue {
+		t.Fatalf("nightly-triage round-trip mismatch: %#v", schedules[0])
+	}
+	if schedules[1].Name != "weekly-sweep" || schedules[1].Mode != cron.ModeFixPR ||
+		!schedules[1].Debug || schedules[1].Lane != "local" {
+		t.Fatalf("weekly-sweep round-trip mismatch: %#v", schedules[1])
+	}
+}
+
+// TestChartRejectsInvalidCronValues covers render-time job validation and
+// explicit-arg precedence: a user-supplied --cron-schedules-file arg wins
+// over cron.schedules values, and the poll interval is still rendered when
+// that precedence path is taken.
+func TestChartRejectsInvalidCronValues(t *testing.T) {
+	if _, err := exec.LookPath("helm"); err != nil {
+		t.Skip("helm is not installed")
+	}
+	chartDir := copyChart(t)
+	if err := exec.Command("helm", "repo", "add", "bjw-s-labs", "https://bjw-s-labs.github.io/helm-charts").Run(); err != nil {
+		t.Fatalf("configure chart repository: %v", err)
+	}
+	runHelm(t, chartDir, "dependency", "build")
+	out, err := runHelmOutput(t, chartDir, "template", "courier", ".",
+		"--set", "cron.schedules.Bad_Name.repo=misospace/courier",
+		"--set", "cron.schedules.Bad_Name.issue=15",
+		"--set", "cron.schedules.Bad_Name.lane=frontier",
+		"--set", "cron.schedules.Bad_Name.schedule=* * * * *",
+	)
+	if err == nil {
+		t.Fatalf("expected helm template fail for an invalid job name, but it succeeded:\n%s", out)
+	}
+	if !strings.Contains(out, "must be a valid DNS-1123 label") {
+		t.Fatalf("helm template failed without expected DNS-1123 message:\n%s", out)
+	}
+	out, err = runHelmOutput(t, chartDir, "template", "courier", ".",
+		"--set", "cron.schedules.nightly.repo=misospace/courier",
+		"--set", "cron.schedules.nightly.lane=frontier",
+		"--set", "cron.schedules.nightly.schedule=* * * * *",
+	)
+	if err == nil {
+		t.Fatalf("expected helm template fail for a job without issue, but it succeeded:\n%s", out)
+	}
+	if !strings.Contains(out, "requires a positive integer issue number") {
+		t.Fatalf("helm template failed without expected issue message:\n%s", out)
+	}
+	out, err = runHelmOutput(t, chartDir, "template", "courier", ".",
+		"--set", "cron.schedules.nightly.repo=misospace/courier",
+		"--set", "cron.schedules.nightly.issue=-5",
+		"--set", "cron.schedules.nightly.lane=frontier",
+		"--set", "cron.schedules.nightly.schedule=* * * * *",
+	)
+	if err == nil {
+		t.Fatalf("expected helm template fail for a negative issue, but it succeeded:\n%s", out)
+	}
+	if !strings.Contains(out, "requires a positive integer issue number") {
+		t.Fatalf("helm template failed without expected issue message:\n%s", out)
+	}
+	out, err = runHelmOutput(t, chartDir, "template", "courier", ".",
+		"--set", "cron.schedules.nightly.repo=misospace/courier",
+		"--set-json", "cron.schedules.nightly.issue=12.5",
+		"--set", "cron.schedules.nightly.lane=frontier",
+		"--set", "cron.schedules.nightly.schedule=* * * * *",
+	)
+	if err == nil {
+		t.Fatalf("expected helm template fail for a fractional issue, but it succeeded:\n%s", out)
+	}
+	if !strings.Contains(out, "requires a positive integer issue number") {
+		t.Fatalf("helm template failed without expected issue message:\n%s", out)
+	}
+	out, err = runHelmOutput(t, chartDir, "template", "courier", ".",
+		"--set", "cron.schedules.nightly.repo=misospace/courier",
+		"--set", "cron.schedules.nightly.issue=15",
+		"--set", "cron.schedules.nightly.lane=frontier",
+		"--set", "cron.schedules.nightly.schedule=* * * * *",
+		"--set", "cron.schedules.nightly.mode=scheduled",
+	)
+	if err == nil {
+		t.Fatalf("expected helm template fail for an invalid mode, but it succeeded:\n%s", out)
+	}
+	if !strings.Contains(out, "mode must be resolve-issue or fix-pr") {
+		t.Fatalf("helm template failed without expected mode message:\n%s", out)
+	}
+	overridden := runHelm(t, chartDir, "template", "courier", ".",
+		"--set", "cron.schedules.nightly.repo=misospace/courier",
+		"--set", "cron.schedules.nightly.issue=15",
+		"--set", "cron.schedules.nightly.lane=frontier",
+		"--set", "cron.schedules.nightly.schedule=* * * * *",
+		"--set", "cron.pollInterval=45s",
+		"--set", "controllers.main.containers.main.args={--leader-elect,--cron-schedules-file=/custom/schedules.yaml}",
+	)
+	if strings.Contains(overridden, "courier-cron-schedules") || strings.Contains(overridden, "/etc/courier/cron-schedules") {
+		t.Fatalf("explicit file arg did not disable cron transport:\n%s", overridden)
+	}
+	if !strings.Contains(overridden, "--cron-schedules-file=/custom/schedules.yaml") {
+		t.Fatalf("explicit --cron-schedules-file arg missing from output")
+	}
+	if !strings.Contains(overridden, "--cron-poll-interval=45s") {
+		t.Fatalf("cron poll interval lost under explicit-arg precedence")
+	}
 }

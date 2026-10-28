@@ -394,6 +394,20 @@ type DiscoveryExcluder interface {
 	DiscoverExcluding(context.Context, []WorkItem) ([]WorkItem, error)
 }
 
+// CapacityBoundedDiscoverer optionally scopes discovery to the number of new
+// runs the lane can still admit. Slots is the lane's remaining discovery
+// capacity, computed by the runner just before discovery; an adapter that
+// controls its own offer volume must offer at most that many items and must
+// not consume or advance source-side state for work it does not offer — a
+// deferred item must stay discoverable, under its own source semantics, once
+// capacity returns. The runner prefers this capability over every other
+// discovery shape, because offering more than the lane can admit would either
+// oversubscribe the lane or force the runner to drop already-consumed offers.
+// A non-positive slots value means the lane cannot admit anything.
+type CapacityBoundedDiscoverer interface {
+	DiscoverBoundedTo(context.Context, int) ([]WorkItem, error)
+}
+
 // CapacityAwareDiscoverer optionally scopes discovery to the lane's current
 // capacity identity. The identity is passed per call to avoid shared adapter mutation.
 type CapacityAwareDiscoverer interface {
