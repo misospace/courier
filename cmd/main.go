@@ -31,6 +31,7 @@ import (
 	couriergithub "github.com/misospace/courier/internal/github"
 	courierlog "github.com/misospace/courier/internal/log"
 	"github.com/misospace/courier/internal/source"
+	"github.com/misospace/courier/internal/source/cron"
 	"github.com/misospace/courier/internal/source/dispatch"
 	"github.com/misospace/courier/internal/source/manual"
 	"github.com/misospace/courier/internal/status"
@@ -86,6 +87,8 @@ func main() {
 	var dispatchLaneBindings stringSliceValue
 	var dispatchPollInterval time.Duration
 	var dispatchHTTPTimeout time.Duration
+	var cronSchedulesFile string
+	var cronPollInterval time.Duration
 	var evidenceIntakeKeySecret string
 	var evidenceIntakeService string
 	var evidenceIntakeBind string
@@ -148,6 +151,8 @@ func main() {
 	flag.Var(&dispatchLaneBindings, "dispatch-lane-binding", "Repeatable Dispatch binding <queueLane>:<laneProfile>[:<agentName>]; one discovery runner per binding.")
 	flag.DurationVar(&dispatchPollInterval, "dispatch-poll-interval", 30*time.Second, "Dispatch discovery poll interval.")
 	flag.DurationVar(&dispatchHTTPTimeout, "dispatch-http-timeout", 30*time.Second, "Dispatch HTTP request timeout.")
+	flag.StringVar(&cronSchedulesFile, "cron-schedules-file", "", "Path to a YAML file of scheduled jobs materialized as CoderRuns; empty disables the cron source.")
+	flag.DurationVar(&cronPollInterval, "cron-poll-interval", 30*time.Second, "Cron discovery poll interval.")
 	flag.StringVar(&evidenceIntakeKeySecret, "evidence-intake-key-secret", "", "Name of the Secret in the operator namespace holding the evidence intake HMAC key under the \"key\" entry; empty with no --evidence-intake-service disables evidence wiring.")
 	flag.StringVar(&evidenceIntakeService, "evidence-intake-service", "", "URL coordinator pods POST failure evidence to; required with --evidence-intake-key-secret.")
 	flag.StringVar(&evidenceIntakeBind, "evidence-intake-bind", "", "Address the operator's own evidence-intake server binds to in-process (for example :8082); the chart derives the matching --evidence-intake-service URL. Empty leaves the operator-side intake off, and a non-empty value requires --evidence-intake-key-secret.")
@@ -342,6 +347,10 @@ func main() {
 	// signal vocabularies and capability declarations belong to each adapter.
 	diagnostics := connector.NewEmitter(crmetrics.Registry, connector.NewEventLogSink(runEvents))
 
+	// Discovery metrics are process-wide and registered once; each source
+	// adapter emits into them nil-safely via the shared instance.
+	discoveryMetrics := source.NewDiscoveryMetrics(crmetrics.Registry)
+
 	sources := controller.NewSourceRegistry(map[string]source.Adapter{
 		"manual": manual.New(diagnostics),
 	})
@@ -386,9 +395,6 @@ func main() {
 			legacyClient.WithPRFixExclusions(true)
 		}
 		sources.Register("dispatch", dispatch.New(legacyClient, dispatch.WithConnectorDiagnostics(diagnostics)))
-		// Discovery metrics are process-wide and registered once; each
-		// binding's runner emits into them nil-safely via the shared instance.
-		discoveryMetrics := source.NewDiscoveryMetrics(crmetrics.Registry)
 		for _, binding := range bindings {
 			bindingClient, err := dispatch.NewClientWithLane(dispatchBaseURL, binding.agentName, binding.queueLane, token, dispatchHTTPTimeout)
 			if err != nil {
@@ -423,6 +429,63 @@ func main() {
 				os.Exit(1)
 			}
 			setupLog.Info("registered Dispatch binding", "queueLane", binding.queueLane, "laneProfile", binding.laneProfile, "agentName", binding.agentName)
+		}
+	}
+
+	if strings.TrimSpace(cronSchedulesFile) != "" {
+		namespace := strings.TrimSpace(os.Getenv("POD_NAMESPACE"))
+		if namespace == "" {
+			setupLog.Error(fmt.Errorf("POD_NAMESPACE is empty"), "unable to configure Cron source")
+			os.Exit(1)
+		}
+		data, err := os.ReadFile(cronSchedulesFile)
+		if err != nil {
+			setupLog.Error(err, "unable to read cron schedules file")
+			os.Exit(1)
+		}
+		schedules, err := cron.Parse(data)
+		if err != nil {
+			setupLog.Error(err, "unable to parse cron schedules file", "path", cronSchedulesFile)
+			os.Exit(1)
+		}
+		// One adapter and one discovery runner per distinct LaneProfile: the
+		// runner assigns its own configured lane to everything it
+		// materializes, so jobs targeting different lanes need separate
+		// runners. Adapters report under "cron" in the single-lane case and
+		// "cron:<lane>" otherwise, mirroring the Dispatch binding identities;
+		// the SourceAgent carries the lane so the reconciler's registry
+		// lookup resolves the same adapter for lifecycle calls.
+		lanes := cronLaneGroups(schedules)
+		for _, lane := range lanes {
+			connectorLabel := "cron"
+			sourceAgent := ""
+			if len(lanes) > 1 {
+				connectorLabel = "cron:" + lane.lane
+				sourceAgent = lane.lane
+			}
+			if len(connectorLabel) > cron.MaxConnectorNameLength {
+				setupLog.Error(fmt.Errorf("cron connector label %q exceeds %d characters", connectorLabel, cron.MaxConnectorNameLength), "unable to configure Cron source", "lane", lane.lane)
+				os.Exit(1)
+			}
+			adapter := cron.New(lane.schedules, diagnostics, cron.WithConnectorName(connectorLabel))
+			if sourceAgent != "" {
+				sources.Register("cron:"+sourceAgent, adapter)
+			} else {
+				sources.Register("cron", adapter)
+			}
+			runner := source.NewRunner(mgr.GetClient(), adapter, source.RunnerConfig{
+				Source:       "cron",
+				SourceAgent:  sourceAgent,
+				LaneProfile:  lane.lane,
+				Namespace:    namespace,
+				PollInterval: cronPollInterval,
+			})
+			runner.Metrics = discoveryMetrics
+			if err := mgr.Add(runner); err != nil {
+				setupLog.Error(err, "unable to add Cron discovery runner", "lane", lane.lane)
+				os.Exit(1)
+			}
+			setupLog.Info("registered Cron schedule lane", "lane", lane.lane, "jobs", len(lane.schedules))
 		}
 	}
 
@@ -616,6 +679,28 @@ func validDispatchAgentName(name string) bool {
 		}
 	}
 	return true
+}
+
+// cronLane pairs one LaneProfile with the schedules targeting it.
+type cronLane struct {
+	lane      string
+	schedules []cron.Schedule
+}
+
+// cronLaneGroups buckets validated schedules by lane, preserving a
+// deterministic first-appearance order so startup registration is stable.
+func cronLaneGroups(schedules []cron.Schedule) []cronLane {
+	var groups []cronLane
+	index := make(map[string]int)
+	for _, schedule := range schedules {
+		if at, ok := index[schedule.Lane]; ok {
+			groups[at].schedules = append(groups[at].schedules, schedule)
+			continue
+		}
+		index[schedule.Lane] = len(groups)
+		groups = append(groups, cronLane{lane: schedule.Lane, schedules: []cron.Schedule{schedule}})
+	}
+	return groups
 }
 
 func dispatchPRStateChecker(observer controller.WorldObserver) (dispatch.PullRequestStateChecker, error) {

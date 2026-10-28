@@ -19,6 +19,7 @@ import (
 	"github.com/misospace/courier/internal/controller"
 	"github.com/misospace/courier/internal/forge"
 	couriergithub "github.com/misospace/courier/internal/github"
+	"github.com/misospace/courier/internal/source/cron"
 	"github.com/misospace/courier/internal/source/dispatch"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -858,5 +859,27 @@ func TestLoadEvidenceKey(t *testing.T) {
 				t.Fatalf("loadEvidenceKey() = %q, want %q", got, test.want)
 			}
 		})
+	}
+}
+
+func TestCronLaneGroups(t *testing.T) {
+	schedules := []cron.Schedule{
+		{Name: "a", Lane: "frontier"},
+		{Name: "b", Lane: "local"},
+		{Name: "c", Lane: "frontier"},
+	}
+	groups := cronLaneGroups(schedules)
+	if len(groups) != 2 {
+		t.Fatalf("len(groups) = %d, want 2", len(groups))
+	}
+	if groups[0].lane != "frontier" || len(groups[0].schedules) != 2 ||
+		groups[0].schedules[0].Name != "a" || groups[0].schedules[1].Name != "c" {
+		t.Fatalf("frontier group = %+v", groups[0])
+	}
+	if groups[1].lane != "local" || len(groups[1].schedules) != 1 || groups[1].schedules[0].Name != "b" {
+		t.Fatalf("local group = %+v", groups[1])
+	}
+	if groups := cronLaneGroups(nil); len(groups) != 0 {
+		t.Fatalf("empty input produced %+v", groups)
 	}
 }
