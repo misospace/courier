@@ -246,18 +246,24 @@ func retryHoldsReap(run *courierv1alpha1.CoderRun) bool {
 // liveRetryHold reports whether the live object, re-read at the delete
 // boundary, carries durable retry intent this reconcile's snapshot could not
 // see. A Requested record holds on any phase: it is durable intent by
-// definition. The annotation holds on every reaped phase except Done — every
-// phase the terminal dispatch drives through syncRetry, so the next reconcile
-// translates it (or refuses it for a non-retryable phase) — because Done's
-// resolve path never reaches syncRetry and an annotation there cannot be
-// honored, so holding the reaper on it would wedge cleanup forever.
+// definition. A new annotation value holds on every reaped phase except Done —
+// every phase the terminal dispatch drives through syncRetry, so the next
+// reconcile translates it (or refuses it for a non-retryable phase) — because
+// Done's resolve path never reaches syncRetry and an annotation there cannot
+// be honored, so holding the reaper on it would wedge cleanup forever. The
+// annotation must be new to this reconcile: an annotation the snapshot already
+// carried was seen by syncRetry at the head of this very dispatch, so a value
+// that settled into the record must not hold the reaper forever — a retry
+// never extends a predecessor's retention beyond its ordinary window.
 func liveRetryHold(snapshot, live *courierv1alpha1.CoderRun) (bool, string) {
 	if retryHoldsReap(live) {
 		return true, "retry request record is Requested"
 	}
+	liveID := live.Annotations[courierv1alpha1.RetryAnnotation]
 	if snapshot.Status.Phase != courierv1alpha1.PhaseDone &&
-		validRetryRequestID(live.Annotations[courierv1alpha1.RetryAnnotation]) {
-		return true, "retry annotation is present"
+		validRetryRequestID(liveID) &&
+		liveID != snapshot.Annotations[courierv1alpha1.RetryAnnotation] {
+		return true, "retry annotation is new to this reconcile"
 	}
 	return false, ""
 }

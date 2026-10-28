@@ -907,17 +907,47 @@ func TestReapFailedHoldsWhenAnnotationAppearsBeforeDelete(t *testing.T) {
 	}
 
 	// The annotation update re-arms the workqueue: the next reconcile sees it
-	// and translates the request instead of losing it with the object.
+	// and translates the request instead of losing it with the object. The
+	// window is already spent, so the same dispatch reaps the predecessor once
+	// the record settles — the intent was honored (the requeue committed under
+	// the derived key), and a retry never extends the retention window.
 	if _, err := reconciler.Reconcile(context.Background(), admissionRequest("race-hold")); err != nil {
 		t.Fatalf("second reconcile: %v", err)
 	}
-	stored := getRetryRun(t, c, "race-hold")
-	rec := stored.Status.RetryRequest
-	if rec == nil || rec.State != courierv1alpha1.RetryRequestStateRequeued || rec.ID != "req-race" || rec.AttemptID != "gen-2" {
-		t.Fatalf("retryRequest = %+v, want Requeued id=req-race attemptID=gen-2 after the race", rec)
+	if src.calls != 1 {
+		t.Fatalf("requeue calls = %d, want 1: the annotation must be translated, not lost with the object", src.calls)
 	}
-	if stored.Status.Phase != courierv1alpha1.PhaseFailed {
-		t.Fatalf("phase = %q, want Failed; a retry never phase-flips the predecessor", stored.Status.Phase)
+	wantKey := "coderun/" + admissionNamespace + "/race-hold/" + retryKeyDigest("req-race")
+	if len(src.requests) != 1 || src.requests[0].IdempotencyKey != wantKey {
+		t.Fatalf("idempotency keys = %v, want [%s]", src.requests, wantKey)
+	}
+	if err := c.Get(context.Background(), admissionKey("race-hold"), &courierv1alpha1.CoderRun{}); !apierrors.IsNotFound(err) {
+		t.Fatalf("get raced run = %v, want NotFound once the settled request released the expired window", err)
+	}
+}
+
+// TestReapFailedReapsAfterAnnotationSettledIntoRecord pins the invariant the
+// delete-boundary fence must preserve: an annotation the snapshot already
+// carried was seen by syncRetry at the head of this very dispatch, and a value
+// that settled into the record must not hold the reaper forever — a retry
+// never extends a predecessor's retention beyond its ordinary window.
+func TestReapFailedReapsAfterAnnotationSettledIntoRecord(t *testing.T) {
+	src := &admissionSource{}
+	run := reapRaceRun("race-settled")
+	run.Annotations[courierv1alpha1.RetryAnnotation] = "req-1"
+	run.Status.RetryRequest = &courierv1alpha1.RetryRequest{
+		ID: "req-1", RequestedAt: metav1.NewTime(reapClock.Add(-2 * time.Hour)),
+		State: courierv1alpha1.RetryRequestStateRequeued, AttemptID: "gen-1",
+		SettledAt: &metav1.Time{Time: reapClock.Add(-time.Hour)},
+	}
+	c := phaseClient(t, run)
+	reconciler := terminalReapReconciler(c, src, reapClock, -1)
+
+	if _, err := reconciler.Reconcile(context.Background(), admissionRequest("race-settled")); err != nil {
+		t.Fatalf("Reconcile() error = %v", err)
+	}
+	if err := c.Get(context.Background(), admissionKey("race-settled"), &courierv1alpha1.CoderRun{}); !apierrors.IsNotFound(err) {
+		t.Fatalf("get settled-retry run = %v, want NotFound; a settled annotation must not wedge the reaper", err)
 	}
 }
 
@@ -931,12 +961,15 @@ func TestReapFailedHoldsWhenAnnotationAppearsBeforeDelete(t *testing.T) {
 func TestReapFailedPreconditionDefeatsDeleteAfterAnnotation(t *testing.T) {
 	src := &requeueSource{admissionSource: &admissionSource{}, result: source.AttemptRequeueResult{AttemptID: "gen-2"}}
 
+	deletes := 0
 	c := reapRaceClient(t, interceptor.Funcs{
 		Delete: func(ctx context.Context, cl client.WithWatch, obj client.Object, opts ...client.DeleteOption) error {
-			if run, ok := obj.(*courierv1alpha1.CoderRun); ok && run.Name == "race-cas" {
+			if run, ok := obj.(*courierv1alpha1.CoderRun); ok && run.Name == "race-cas" && deletes == 0 {
+				deletes++
 				// The operator's annotation lands after the fence's
 				// re-read but before the delete request reaches the API
-				// server.
+				// server. Later deletes (the retried reconcile) must pass
+				// through untouched, or the test would defeat itself.
 				live := &courierv1alpha1.CoderRun{}
 				if err := cl.Get(ctx, client.ObjectKeyFromObject(obj), live); err != nil {
 					return err
@@ -971,13 +1004,21 @@ func TestReapFailedPreconditionDefeatsDeleteAfterAnnotation(t *testing.T) {
 	}
 
 	// The conflict re-arms the workqueue: the retried reconcile's snapshot now
-	// carries the annotation and translates the request.
+	// carries the annotation and translates the request. The window is already
+	// spent, so the same dispatch reaps the predecessor once the record
+	// settles — the intent was honored, and the retention window is not
+	// extended.
 	if _, err := reconciler.Reconcile(context.Background(), admissionRequest("race-cas")); err != nil {
 		t.Fatalf("second reconcile: %v", err)
 	}
-	stored := getRetryRun(t, c, "race-cas")
-	rec := stored.Status.RetryRequest
-	if rec == nil || rec.State != courierv1alpha1.RetryRequestStateRequeued || rec.ID != "req-race" {
-		t.Fatalf("retryRequest = %+v, want Requeued id=req-race after the conflict retried", rec)
+	if src.calls != 1 {
+		t.Fatalf("requeue calls = %d, want 1: the annotation must be translated, not lost with the object", src.calls)
+	}
+	wantKey := "coderun/" + admissionNamespace + "/race-cas/" + retryKeyDigest("req-race")
+	if len(src.requests) != 1 || src.requests[0].IdempotencyKey != wantKey {
+		t.Fatalf("idempotency keys = %v, want [%s]", src.requests, wantKey)
+	}
+	if err := c.Get(context.Background(), admissionKey("race-cas"), &courierv1alpha1.CoderRun{}); !apierrors.IsNotFound(err) {
+		t.Fatalf("get raced run = %v, want NotFound once the settled request released the expired window", err)
 	}
 }

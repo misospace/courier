@@ -1018,7 +1018,10 @@ before the reaper issues its delete, and the delete carries UID/resourceVersion
 preconditions, so an annotation that lands between the reconcile's read and the
 delete request defeats the delete instead of dropping the intent — the conflicted
 reconcile re-enters the dispatch on a snapshot that sees it and persists the
-`Requested` record. Retry never changes the phase, never deletes, and never touches
+`Requested` record. The live check holds only intent the snapshot could not see:
+an annotation the reconcile already carried was translated at the head of the
+dispatch and a settled record never holds the reaper. Retry never changes the
+phase, never deletes, and never touches
 evidence: the predecessor stays exactly as terminalization left it, so the audit
 trail is preserved across a retry.
 
