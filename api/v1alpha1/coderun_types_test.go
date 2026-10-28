@@ -1,11 +1,50 @@
 package v1alpha1
 
 import (
+	"context"
 	"encoding/json"
+	"fmt"
 	"os"
 	"strings"
 	"testing"
+
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/runtime"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/envtest"
 )
+
+// envtestClient is a client against a real API server carrying the generated
+// CRDs, when KUBEBUILDER_ASSETS is set; validation-rule tests are then
+// enforced by the API server exactly as an install would enforce them.
+var envtestClient client.Client
+
+func TestMain(m *testing.M) {
+	if os.Getenv("KUBEBUILDER_ASSETS") == "" {
+		os.Exit(m.Run())
+	}
+	server := &envtest.Environment{
+		CRDDirectoryPaths:     []string{"../../charts/courier/crd-manifests"},
+		ErrorIfCRDPathMissing: true,
+	}
+	config, err := server.Start()
+	if err != nil {
+		panic(err)
+	}
+	scheme := runtime.NewScheme()
+	if err := AddToScheme(scheme); err != nil {
+		panic(err)
+	}
+	envtestClient, err = client.New(config, client.Options{Scheme: scheme})
+	if err != nil {
+		panic(err)
+	}
+	code := m.Run()
+	if err := server.Stop(); err != nil && code == 0 {
+		code = 1
+	}
+	os.Exit(code)
+}
 
 // TestPublicationPolicyWire pins the persisted policy schema: it is bound to
 // the run UID and must not carry control-pod identity, which belongs to the
@@ -243,5 +282,200 @@ func TestNativeResultReasonContract(t *testing.T) {
 	}
 	if NativeResultReason("") != "" {
 		t.Fatal("the empty kind produced a durable reason")
+	}
+}
+
+// specFixture returns a valid spec for the given mode: resolve-issue/fix-pr
+// carry a ref and no workRepo; contribute carries a workRepo, no ref, and a
+// goal-bearing SourceContext.
+func specFixture(mode Mode) CoderRunSpec {
+	spec := CoderRunSpec{
+		Mode:          mode,
+		Source:        "cli",
+		SourceContext: `{"goal":"add a security section to the README"}`,
+		WorkItemID:    "adhoc-0123456789ab",
+		Repo:          "acme/upstream",
+		Lane:          "local",
+	}
+	switch mode {
+	case ModeContribute:
+		spec.WorkRepo = "contributor/fork"
+	default:
+		spec.Ref = 7
+	}
+	return spec
+}
+
+// TestCoderRunSpecModeValidation enforces the mode-dependent spec rules
+// through the API server: contribute is accepted with base repo, workRepo,
+// and a goal-bearing SourceContext, and rejected when workRepo is missing
+// or a ref is carried; resolve-issue and fix-pr validation is unchanged
+// (ref required, no workRepo).
+func TestCoderRunSpecModeValidation(t *testing.T) {
+	if envtestClient == nil {
+		t.Skip("KUBEBUILDER_ASSETS is not set")
+	}
+	ctx := context.Background()
+	cases := []struct {
+		name    string
+		spec    CoderRunSpec
+		wantErr bool
+	}{
+		{"contribute accepted", specFixture(ModeContribute), false},
+		{"contribute without workRepo rejected", func() CoderRunSpec {
+			s := specFixture(ModeContribute)
+			s.WorkRepo = ""
+			return s
+		}(), true},
+		{"contribute with ref rejected", func() CoderRunSpec {
+			s := specFixture(ModeContribute)
+			s.Ref = 12
+			return s
+		}(), true},
+		{"contribute with malformed workRepo rejected", func() CoderRunSpec {
+			s := specFixture(ModeContribute)
+			s.WorkRepo = "not-a-repo"
+			return s
+		}(), true},
+		{"resolve-issue accepted", specFixture(ModeResolveIssue), false},
+		{"resolve-issue without ref rejected", func() CoderRunSpec {
+			s := specFixture(ModeResolveIssue)
+			s.Ref = 0
+			return s
+		}(), true},
+		{"resolve-issue with workRepo rejected", func() CoderRunSpec {
+			s := specFixture(ModeResolveIssue)
+			s.WorkRepo = "contributor/fork"
+			return s
+		}(), true},
+		{"fix-pr accepted", specFixture(ModeFixPR), false},
+		{"fix-pr without ref rejected", func() CoderRunSpec {
+			s := specFixture(ModeFixPR)
+			s.Ref = 0
+			return s
+		}(), true},
+		{"fix-pr with workRepo rejected", func() CoderRunSpec {
+			s := specFixture(ModeFixPR)
+			s.WorkRepo = "contributor/fork"
+			return s
+		}(), true},
+	}
+	for i, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			run := &CoderRun{}
+			run.Name = fmt.Sprintf("mode-validation-%d", i)
+			run.Namespace = "default"
+			run.Spec = tc.spec
+			err := envtestClient.Create(ctx, run)
+			if tc.wantErr && err == nil {
+				t.Fatalf("accepted %s, want rejection", tc.name)
+			}
+			if !tc.wantErr && err != nil {
+				t.Fatalf("rejected %s: %v", tc.name, err)
+			}
+		})
+	}
+}
+
+// TestCoderRunSpecContributeRoundTrip pins that an accepted contribute run
+// persists exactly the admitted identity: base repo, work fork, goal-bearing
+// SourceContext, and no ref.
+func TestCoderRunSpecContributeRoundTrip(t *testing.T) {
+	if envtestClient == nil {
+		t.Skip("KUBEBUILDER_ASSETS is not set")
+	}
+	ctx := context.Background()
+	run := &CoderRun{}
+	run.Name = "contribute-round-trip"
+	run.Namespace = "default"
+	run.Spec = specFixture(ModeContribute)
+	if err := envtestClient.Create(ctx, run); err != nil {
+		t.Fatalf("create contribute run: %v", err)
+	}
+	var got CoderRun
+	key := client.ObjectKeyFromObject(run)
+	if err := envtestClient.Get(ctx, key, &got); err != nil {
+		t.Fatalf("get contribute run: %v", err)
+	}
+	if got.Spec.Repo != "acme/upstream" || got.Spec.WorkRepo != "contributor/fork" {
+		t.Fatalf("contribute run lost repo/workRepo: %+v", got.Spec)
+	}
+	if got.Spec.Ref != 0 {
+		t.Fatalf("contribute run carries ref %d", got.Spec.Ref)
+	}
+	if !strings.Contains(got.Spec.SourceContext, "goal") {
+		t.Fatalf("contribute run lost goal-bearing SourceContext: %q", got.Spec.SourceContext)
+	}
+}
+
+// TestCoderRunSpecOptionalFieldsWire pins the wire contract the mode rules
+// depend on: unset ref and workRepo are absent from the serialized spec, so
+// Go writers cannot smuggle a zero-valued ref into a contribute run or an
+// empty workRepo into a resolve-issue run.
+func TestCoderRunSpecOptionalFieldsWire(t *testing.T) {
+	contribute, err := json.Marshal(specFixture(ModeContribute))
+	if err != nil {
+		t.Fatalf("marshal contribute spec: %v", err)
+	}
+	if strings.Contains(string(contribute), `"ref"`) {
+		t.Fatalf("contribute spec serializes ref: %s", contribute)
+	}
+	if !strings.Contains(string(contribute), `"workRepo"`) {
+		t.Fatalf("contribute spec omits workRepo: %s", contribute)
+	}
+	resolve, err := json.Marshal(specFixture(ModeResolveIssue))
+	if err != nil {
+		t.Fatalf("marshal resolve-issue spec: %v", err)
+	}
+	if strings.Contains(string(resolve), `"workRepo"`) {
+		t.Fatalf("resolve-issue spec serializes workRepo: %s", resolve)
+	}
+	if !strings.Contains(string(resolve), `"ref"`) {
+		t.Fatalf("resolve-issue spec omits ref: %s", resolve)
+	}
+}
+
+// TestCoderRunSpecExplicitZeroRefRejected pins the minimum bound a typed
+// omitempty writer cannot submit: a raw spec.ref of 0 is refused by the
+// minimum in every mode (for contribute the mode rule fires alongside it),
+// so stored state never distinguishes a zero ref from an absent one.
+func TestCoderRunSpecExplicitZeroRefRejected(t *testing.T) {
+	if envtestClient == nil {
+		t.Skip("KUBEBUILDER_ASSETS is not set")
+	}
+	ctx := context.Background()
+	for _, mode := range []Mode{ModeContribute, ModeResolveIssue} {
+		t.Run(string(mode), func(t *testing.T) {
+			obj := &unstructured.Unstructured{Object: map[string]any{
+				"apiVersion": GroupVersion.String(),
+				"kind":       "CoderRun",
+				"metadata": map[string]any{
+					"name":      fmt.Sprintf("explicit-zero-ref-%s", mode),
+					"namespace": "default",
+				},
+				"spec": map[string]any{
+					"mode":       string(mode),
+					"source":     "cli",
+					"workItemID": "adhoc-0123456789ab",
+					"repo":       "acme/upstream",
+					"lane":       "local",
+					"ref":        int64(0),
+				},
+			}}
+			if mode == ModeContribute {
+				if err := unstructured.SetNestedField(obj.Object, "contributor/fork", "spec", "workRepo"); err != nil {
+					t.Fatalf("set workRepo: %v", err)
+				}
+			}
+			err := envtestClient.Create(ctx, obj)
+			if err == nil {
+				t.Fatalf("accepted explicit spec.ref: 0 for %s mode", mode)
+			}
+			// The minimum, not the mode rule or the enum, must be the
+			// binding rejection in both modes.
+			if !strings.Contains(err.Error(), "spec.ref") || !strings.Contains(err.Error(), "greater than or equal to 1") {
+				t.Fatalf("expected a spec.ref minimum rejection for %s mode, got %v", mode, err)
+			}
+		})
 	}
 }
