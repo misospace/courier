@@ -521,6 +521,15 @@ func TestNumberingStartsAboveSeededPullRequests(t *testing.T) {
 	if got := len(f.PullRequests()); got != 2 {
 		t.Fatalf("PullRequests = %d, want seeded 105 plus created 106", got)
 	}
+	// A request added after New also moves the counter.
+	f.AddPullRequest(forge.PullRequest{Number: 200, Repo: "r", BaseRepo: "r", BaseRef: "main", HeadRepo: "h", HeadRef: "b", State: "open"})
+	created, err = f.CreatePullRequest(context.Background(), forge.CreatePullRequestInput{Repo: "r", Head: "b", HeadRepo: "h", HeadRef: "b", Base: "main"})
+	if err != nil {
+		t.Fatalf("CreatePullRequest: %v", err)
+	}
+	if created.Number != 201 {
+		t.Fatalf("Number = %d, want 201 (above the added request)", created.Number)
+	}
 }
 
 func TestAfterEffectInjectionSurvivesRefusedCall(t *testing.T) {

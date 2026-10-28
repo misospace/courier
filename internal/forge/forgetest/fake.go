@@ -96,7 +96,8 @@ type Config struct {
 	Capabilities []forge.Capability
 	// Unavailable registers capabilities that are offered but not usable,
 	// each with the detail its diagnostic reports, so a test can drive the
-	// "offered but down" path without removing the capability.
+	// "offered but down" path without removing the capability. Details pass
+	// through the contract's RedactDetail, like every Availability detail.
 	Unavailable  map[forge.Capability]string
 	Repositories []forge.Repository
 	// Refs maps repository identity to ref to OID.
@@ -262,8 +263,9 @@ func (f *Fake) ResolveRepository(_ context.Context, name string) (forge.Reposito
 	return forge.Repository{}, ErrNotFound
 }
 
-// ReadRef returns the live seeded state of the ref: an OID and Exists for a
-// seeded ref, or Exists false otherwise.
+// ReadRef returns the live seeded state of the ref of a seeded repository: an
+// OID and Exists for a seeded ref, or Exists false otherwise. A repository
+// that is not seeded is a fixture error, not an absent ref.
 func (f *Fake) ReadRef(_ context.Context, repo forge.Repository, ref string) (forge.RefState, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -554,9 +556,10 @@ func (f *Fake) CommentPullRequest(_ context.Context, ref forge.PullRequestRef, b
 }
 
 // FailNext queues err so that the next call of kind returns it with no
-// effect. Queue entries of a kind are consumed FIFO among pre-effect
-// injections; a queued after-effect injection at the head stays pending until
-// a call can run its effect.
+// effect, including a call the capability gate or a missing object would
+// otherwise have refused — the injection answers first. Queue entries of a
+// kind are consumed FIFO among pre-effect injections; a queued after-effect
+// injection at the head stays pending until a call can run its effect.
 func (f *Fake) FailNext(kind OpKind, err error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -612,10 +615,14 @@ func (f *Fake) SetProtected(repo string, protected bool) {
 }
 
 // AddPullRequest adds a pull request to the known set. It is a world mutation
-// and is not recorded as an Op.
+// and is not recorded as an Op. Creating requests keep numbering above every
+// request known at New or added here.
 func (f *Fake) AddPullRequest(pr forge.PullRequest) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if pr.Number >= f.nextNumber {
+		f.nextNumber = pr.Number + 1
+	}
 	f.prs[prKey(pr)] = copyPullRequest(pr)
 }
 
@@ -709,8 +716,8 @@ func (f *Fake) takeFailure(kind OpKind, wantAfterEffect bool) (failure, bool) {
 	return head, true
 }
 
-// capabilityGate reports the forge capability that governs an operation. The
-// policy reads (ResolveRepository, ReadRef, ReadEffectiveProtection,
+// offers reports whether a capability is registered and currently available.
+// The policy reads (ResolveRepository, ReadRef, ReadEffectiveProtection,
 // CanWriteRepository) and the head listing are not capability vocabulary;
 // they are always offered.
 func (f *Fake) offers(capability forge.Capability) bool {
