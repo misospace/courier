@@ -2392,6 +2392,42 @@ terminal phase with the report retried on a later reconcile. (#178, #561)
 
 **Implementation:** Bounded retention for `Failed`/`NeedsHuman` is implemented (#287, absorbing the #276 brief). `reapTerminal` (`internal/controller/reap.go`) generalizes the reaper with the per-phase `courier.misospace.dev/needs-human-at` and `courier.misospace.dev/failed-at` annotations (set-once on the first reconcile after the lifecycle report settles, never derived from `FinishedAt`), the four flags/chart values above, and the positive `LifecycleReported` settled-state gate (legacy missing/`False`/`Unknown` runs stay unreaped). It adds a per-repository audit floor — the most recent `terminalAuditKeep` `Failed`/`NeedsHuman` runs are retained past their window, and the floor counts only those phases — and the retention metrics (`courier_coderuns_reap_requests_total` for accepted deletes, `courier_coderuns_oldest_terminal_age_seconds` for what is still retained). The stale "terminal runs are never reaped" comments and assertions were retired, scoped to `AwaitingReview` and `HandedOff`. Closed-unmerged terminalization is implemented (#277): the `AwaitingReview` observation branch (`observeMergedReviewPR`, `internal/controller/merge_observation.go`) classifies the run's exact recorded pull request identity read through the forge `read-pull-request` capability — merged -> `Done`; open or unknown -> stay `AwaitingReview` at the slow cadence; closed without merge -> `NeedsHuman` with a `PullRequestClosedUnmerged` condition (`Status=True`, reason `ClosedUnmerged`, message carrying the recorded pull request identity) and the existing `blocked` source report; absent, identity-mismatched, or unreadable -> no transition. The `needs-human-at` annotation is stamped fresh by the reaper, so a late `AwaitingReview` age never causes an immediate reap, and the per-phase annotation survives controller restarts without re-stamping. `HandedOff` retention and an independent evidence TTL remain out of scope.
 
+## Explicit retry of terminal runs
+
+A terminal `Failed` or `NeedsHuman` run is inspectable and participates in
+source/work-item deduplication; deleting the CR was the only way to let the
+work run again. The supported path is now an explicit, operator-authorized
+retry (#97), specified in [docs/explicit-retry.md](./docs/explicit-retry.md).
+The operator annotates the terminal run
+(`courier.misospace.dev/retry`, an opaque request ID — the soft-stop
+ingress pattern); the controller alone translates it into the durable
+`status.retryRequest` record and drives a four-state machine
+(`Requested` → `Requeued`/`Moot`/`Refused`) with persist-before-dispatch
+and same-key replay for crash recovery.
+
+The requeue is source-owned: an optional `AttemptRequeuer` adapter
+capability, shaped like the fenced capacity-settlement boundary, performs
+one atomic transition that stops the old attempt from owning the work and
+makes it discoverable again — never ordinary Release/Transition emulation.
+Core never invents an attempt identity; a fresh source-issued identity
+(a new Dispatch generation, say) is what passes the dedupe barrier, and the
+retry-settled predecessor joins `settledCapacityExhaustion` as the second
+history state that releases it, reusing the deterministic predecessor-UID
+successor naming. Exactly one replacement attempt is launched per
+predecessor lifetime; repeated or concurrent requests settle idempotently.
+
+Invariants carried over from the issue: the old run is never phase-flipped
+or deleted, and its retention clock and evidence survive the retry
+untouched (a run owing a `Requested` retry is not reap-eligible, by the
+same gate that holds a run owing a park close); merged or closed upstream
+work is refused — for fix-pr, a core forge guard reads the recorded PR
+identity; adopted branches are preserved, never reset; `Failed` and
+`NeedsHuman` share the one path; `BlockedExternal` stays on its automatic
+recovery channel; and #510 invokes the same annotation contract through
+ordinary RBAC, with no controller bypass. Automatic retry remains
+forbidden everywhere; retention, capacity recovery, and source re-offer
+semantics are unchanged.
+
 ## Cross-worker capacity recovery
 
 Confirmed execution-resource exhaustion is distinct from a task blocker and an
