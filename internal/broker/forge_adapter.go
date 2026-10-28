@@ -93,7 +93,7 @@ func (a *ForgeAdapter) PullRequest(ctx context.Context, number int) (PullRequest
 	a.mu.Lock()
 	_, createdByAdapter := a.created[number]
 	a.mu.Unlock()
-	if number <= 0 || (a.p.Mode == ModeFixPR && number != a.p.PRNumber) || (a.p.Mode == ModeResolveIssue && !createdByAdapter) {
+	if number <= 0 || (a.p.Mode == ModeFixPR && number != a.p.PRNumber) || (a.p.Mode != ModeFixPR && !createdByAdapter) {
 		return PullRequestState{}, errors.New("forge adapter: pull request is outside pinned policy")
 	}
 	return a.readPullRequest(ctx, number)
@@ -162,8 +162,14 @@ func (a *ForgeAdapter) FindPullRequest(ctx context.Context, headRepo, headRef st
 	return out, nil
 }
 
+// CreatePullRequest passes the pinned full head identity through to the
+// provider, so a contribution's cross-repository head (fork head into base,
+// HeadRepo distinct from the base) is created as <fork-owner>:<head-ref> with
+// the repository identity carried separately. A resolve-issue policy pins the
+// work repository to the base, so its head stays same-repository by
+// construction; a fix-pr policy never creates.
 func (a *ForgeAdapter) CreatePullRequest(ctx context.Context, in CreatePullRequest) (int, error) {
-	if a.p.Mode != ModeResolveIssue || in.BaseRepo != a.p.BaseRepo || in.BaseRef != a.p.BaseRef || in.HeadRepo != a.p.WorkRepo || in.HeadRef != a.p.WorkRef {
+	if (a.p.Mode != ModeResolveIssue && a.p.Mode != ModeContribute) || in.BaseRepo != a.p.BaseRepo || in.BaseRef != a.p.BaseRef || in.HeadRepo != a.p.WorkRepo || in.HeadRef != a.p.WorkRef {
 		return 0, errors.New("forge adapter: pull request destination differs from pinned policy")
 	}
 	base, err := a.checkedRepository(ctx, a.base)
