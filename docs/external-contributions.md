@@ -103,15 +103,19 @@ repository file can grant authority):
   creating a second `CoderRun`. An intentional new contribution is a fresh
   key; the CLI makes that explicit rather than silent.
 - Rejection and failure are two distinct points, both forge-mutation-free:
-  - **Before a CR exists**, creation-time validation (spec rules, allowlist
-    membership resolvable without forge calls) rejects the request: no CR, no
-    branch, no PR.
-  - **After the CR exists**, authority failures discovered by
-    `ResolveAdmission` (`internal/controller/secure_control.go:218`) — e.g.
-    the fork is not served by any registration — terminalize the run to
-    `NeedsHuman` without any forge mutation. Authority checks must not be
-    moved into frontends to get earlier rejection; a "rejected" contribution
-    that already has a CR is a terminal run, not a rollback.
+  - **Before a CR exists**, only static spec validation rejects the request:
+    CRD-level rules (required `spec.workRepo`, empty `spec.Ref`, well-formed
+    `owner/name`). Registry allowlist membership is *not* checked here — the
+    CLI creates the `CoderRun` through the Kubernetes API and registry
+    selection happens in controller admission. At this point there is no CR,
+    no branch, no PR.
+  - **After the CR exists**, admission failures — allowlist membership and
+    authority checks in `ResolveAdmission`
+    (`internal/controller/secure_control.go:218`), e.g. the fork is not served
+    by any registration — terminalize the run to `NeedsHuman` before any forge
+    mutation. Authority checks must not be moved into frontends to get earlier
+    rejection; a "rejected" contribution that already has a CR is a terminal
+    run, not a rollback.
 
 ### Who may submit
 
@@ -205,9 +209,13 @@ An upstream issue referenced in `SourceContext` is read-only task context:
   permit; an inaccessible issue is non-fatal and the run proceeds without it.
 - Courier must **not** label, assign, comment on, claim, or otherwise mutate
   upstream issue state merely because the issue supplied the goal. The forge
-  capability vocabulary contains no issue-mutation verb
-  (`internal/forge/forge.go:25-45`), and contribution runs must not be granted
-  one.
+  vocabulary does contain a mutation verb — `CapabilityComment`
+  (`internal/forge/forge.go:39`) — so the prohibition must be an explicit
+  capability rule, not a vocabulary property: admission and publication policy
+  must refuse to grant contribute runs any issue-mutation capability
+  (`CapabilityComment`), permitting only read verbs (`CapabilityReadWorkItem`,
+  `CapabilityListComments`) plus the publication-only PR verbs
+  (`CapabilityCreatePullRequest`, `CapabilityUpdatePullRequest`).
 - Opening the explicitly approved PR is the one authorized write, distinct
   from any issue operation.
 
@@ -283,7 +291,8 @@ records nothing) and the reusable-double convention of
 and the *absence* of forbidden mutations:
 
 - no upstream branch push, issue claim, label, assignment, closing comment, or
-  other issue-state mutation from optional issue context;
+  other issue-state mutation from optional issue context; the contribute
+  run's granted capability set never includes `CapabilityComment`;
 - rejection of goal/repository instructions that change the approved fork,
   base, credential scope, or publication destination;
 - concurrent retries with the same identity create exactly one PR; a stale
