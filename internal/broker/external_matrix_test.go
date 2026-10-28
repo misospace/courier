@@ -56,8 +56,8 @@ import (
 //	12. changed upstream base denies publication
 //	    -> TestExternalMatrixChangedUpstreamBaseDeniesPublication
 //	    (ancestry: TestPublishEnforcesExpectedTipAndFastForward, policy_test.go)
-//	13. existing PR for pinned head is discovered, not duplicated
-//	    -> TestExternalMatrixExistingPRForPinnedHeadIsDiscoveredNotDuplicated
+//	13. existing PR for pinned head is adopted, not duplicated
+//	    -> TestExternalMatrixExistingPRForPinnedHeadIsAdoptedNotDuplicated
 //	    (TestCreatePRGuardsPinnedHeadAndReturnedIdentity, policy_test.go)
 //	14. stale branch ownership denies publication
 //	    -> TestExternalMatrixStaleBranchOwnershipDeniesPublication
@@ -363,35 +363,36 @@ func TestExternalMatrixStaleRunUIDDeniesBeforeAnyForgeContact(t *testing.T) {
 // The raced-duplicate denial is covered by TestBrokerIntegrationDeniesConcurrentDuplicatePR in
 // integration_test.go; this row pins the single-PR guarantee for same-identity
 // retries issued concurrently: PolicyEngine's mutex serializes the retries,
-// and each serialized call re-checks the pinned head before creating, so the
-// recorded creates prove exactly one write.
+// the first creates, and every later call discovers the single existing
+// request and adopts it — the recorded creates prove exactly one write and
+// every caller converges on the same pull request.
 func TestExternalMatrixConcurrentRetriesCreateExactlyOnePR(t *testing.T) {
 	fake, _, engine := newMatrixFixture(t, nil)
 	ctx := context.Background()
 	body := "Ships the packaging fix.\n\nCloses up/base#123"
 	const n = 4
 	errs := make([]error, n)
+	numbers := make([]int, n)
 	var wg sync.WaitGroup
 	for i := 0; i < n; i++ {
 		wg.Add(1)
 		go func(i int) {
 			defer wg.Done()
-			_, _, errs[i] = engine.CreatePullRequest(ctx, matrixAnchorOID, "issue 123", body, false)
+			pr, _, err := engine.CreatePullRequest(ctx, matrixAnchorOID, "issue 123", body, false)
+			numbers[i] = pr.Number
+			errs[i] = err
 		}(i)
 	}
 	wg.Wait()
-	var ok int
-	for _, err := range errs {
-		if err == nil {
-			ok++
-			continue
-		}
-		if !strings.Contains(err.Error(), "already exists") {
-			t.Fatalf("concurrent retry error = %v, want the existing-PR denial", err)
+	for i, err := range errs {
+		if err != nil {
+			t.Fatalf("retry %d = %v, want every caller to converge on the single pull request (create or adoption)", i, err)
 		}
 	}
-	if ok != 1 {
-		t.Fatalf("successful creates = %d, want exactly one", ok)
+	for _, number := range numbers {
+		if number != numbers[0] {
+			t.Fatalf("callers converged on different pull requests: %v", numbers)
+		}
 	}
 	if got := fake.OpsOf(forgetest.OpCreatePullRequest); len(got) != 1 {
 		t.Fatalf("create ops = %d, want exactly one", len(got))
@@ -404,8 +405,8 @@ func TestExternalMatrixConcurrentRetriesCreateExactlyOnePR(t *testing.T) {
 // Restart-after-PR-creation ownership is covered by
 // TestRestartDoesNotRecoverFromCallerOIDOrAncestry in policy_test.go; this
 // row is the lost-response window: the forge write landed, the reply was
-// lost, and the retry must discover the existing PR rather than create a
-// duplicate.
+// lost, and the retry must adopt the discovered PR by base/head identity
+// rather than create a duplicate.
 func TestExternalMatrixLostCreateResponseCreatesNoDuplicatePR(t *testing.T) {
 	fake, _, engine := newMatrixFixture(t, nil)
 	ctx := context.Background()
@@ -418,9 +419,13 @@ func TestExternalMatrixLostCreateResponseCreatesNoDuplicatePR(t *testing.T) {
 	if got := fake.PullRequests(); len(got) != 1 {
 		t.Fatalf("pull requests after the lost response = %d, want exactly one", len(got))
 	}
-	_, _, err = engine.CreatePullRequest(ctx, matrixAnchorOID, "issue 123", body, false)
-	if err == nil || !strings.Contains(err.Error(), "already exists") {
-		t.Fatalf("retry = %v, want the existing-PR denial", err)
+	landed := fake.PullRequests()[0]
+	adopted, _, err := engine.CreatePullRequest(ctx, matrixAnchorOID, "issue 123", body, false)
+	if err != nil {
+		t.Fatalf("retry = %v, want adoption of the discovered pull request", err)
+	}
+	if adopted.Number != landed.Number || adopted.HeadOID != matrixAnchorOID {
+		t.Fatalf("adopted = %+v, want the landed request %d at the pinned head", adopted, landed.Number)
 	}
 	if got := fake.OpsOf(forgetest.OpCreatePullRequest); len(got) != 1 {
 		t.Fatalf("create ops = %d, want exactly one (the attempt with the lost reply)", len(got))
@@ -552,31 +557,52 @@ func TestExternalMatrixChangedUpstreamBaseDeniesPublication(t *testing.T) {
 }
 
 // The same-head discovery is covered by TestCreatePRGuardsPinnedHeadAndReturnedIdentity in
-// policy_test.go; this row seeds an open PR at the exact pinned head and
-// proves discovery, with zero create ops as the evidence.
-func TestExternalMatrixExistingPRForPinnedHeadIsDiscoveredNotDuplicated(t *testing.T) {
-	fake, _, engine := newMatrixFixture(t, func(f *forgetest.Fake, p *Policy) {
-		f.AddPullRequest(forge.PullRequest{
-			Number:   101,
-			Repo:     matrixBaseCanonical,
-			BaseRepo: matrixBaseCanonical,
-			BaseRef:  matrixBaseRef,
-			BaseSHA:  matrixBaseOID,
-			HeadRepo: matrixWorkCanonical,
-			HeadRef:  matrixWorkRef,
-			HeadSHA:  matrixAnchorOID,
-			State:    "open",
-			Title:    "existing",
-			Body:     "Closes up/base#123",
-		})
+// policy_test.go; this row pins the adoption boundary of discovery: exactly
+// one open PR at the exact pinned head whose body satisfies this policy's
+// contract is adopted with zero create ops, while a discovered PR whose body
+// does not satisfy the contract is a foreign publication on the run's head
+// and fails closed — it is never blessed and never duplicated over.
+func TestExternalMatrixExistingPRForPinnedHeadIsAdoptedNotDuplicated(t *testing.T) {
+	seedPR := func(body string) func(*forgetest.Fake, *Policy) {
+		return func(f *forgetest.Fake, _ *Policy) {
+			f.AddPullRequest(forge.PullRequest{
+				Number:   101,
+				Repo:     matrixBaseCanonical,
+				BaseRepo: matrixBaseCanonical,
+				BaseRef:  matrixBaseRef,
+				BaseSHA:  matrixBaseOID,
+				HeadRepo: matrixWorkCanonical,
+				HeadRef:  matrixWorkRef,
+				HeadSHA:  matrixAnchorOID,
+				State:    "open",
+				Title:    "existing",
+				Body:     body,
+			})
+		}
+	}
+	t.Run("contract-satisfying PR is adopted without a create", func(t *testing.T) {
+		fake, _, engine := newMatrixFixture(t, seedPR("Ships the packaging fix.\n\nCloses up/base#123"))
+		adopted, _, err := engine.CreatePullRequest(context.Background(), matrixAnchorOID, "issue 123", "Ships the packaging fix.\n\nCloses up/base#123", false)
+		if err != nil {
+			t.Fatalf("adoption = %v, want the discovered request returned", err)
+		}
+		if adopted.Number != 101 || adopted.HeadOID != matrixAnchorOID {
+			t.Fatalf("adopted = %+v, want the seeded request 101 at the pinned head", adopted)
+		}
+		if got := fake.OpsOf(forgetest.OpCreatePullRequest); len(got) != 0 {
+			t.Fatalf("create ops = %d, want none: the seeded PR is adopted, not duplicated", len(got))
+		}
 	})
-	_, _, err := engine.CreatePullRequest(context.Background(), matrixAnchorOID, "issue 123", "Ships the packaging fix.\n\nCloses up/base#123", false)
-	if err == nil || !strings.Contains(err.Error(), "already exists") {
-		t.Fatalf("denial = %v, want the existing-PR denial", err)
-	}
-	if got := fake.OpsOf(forgetest.OpCreatePullRequest); len(got) != 0 {
-		t.Fatalf("create ops = %d, want none: the seeded PR is discovered, not duplicated", len(got))
-	}
+	t.Run("foreign-body PR on the pinned head fails closed", func(t *testing.T) {
+		fake, _, engine := newMatrixFixture(t, seedPR("someone else's publication, no closing reference"))
+		_, _, err := engine.CreatePullRequest(context.Background(), matrixAnchorOID, "issue 123", "Ships the packaging fix.\n\nCloses up/base#123", false)
+		if err == nil || !strings.Contains(err.Error(), "discovered pull request body violates the pinned linkage contract") {
+			t.Fatalf("denial = %v, want the discovered-body linkage refusal", err)
+		}
+		if got := fake.OpsOf(forgetest.OpCreatePullRequest); len(got) != 0 {
+			t.Fatalf("create ops = %d, want none: a foreign publication is neither blessed nor overwritten", len(got))
+		}
+	})
 }
 
 // Foreign tips are covered by TestPublishRejectsForeignInitiallyPresentAndRacedAbsentTips in
