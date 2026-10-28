@@ -83,6 +83,76 @@ func TestGitPusherUsesOnlyPinnedEndpointAndExactRef(t *testing.T) {
 	}
 }
 
+func TestGitPusherContributePinsBaseAndForkAndPushesOnlyFork(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	remote := filepath.Join(root, "trusted.git")
+	fork := filepath.Join(root, "fork.git")
+	repo := filepath.Join(root, "source")
+	gitTransportCommand(t, "", "init", "--bare", remote)
+	gitTransportCommand(t, "", "init", "--bare", fork)
+	gitTransportCommand(t, "", "init", repo)
+	gitTransportCommand(t, repo, "config", "user.email", "test@example.invalid")
+	gitTransportCommand(t, repo, "config", "user.name", "test")
+	if err := os.WriteFile(filepath.Join(repo, "file"), []byte("base\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	gitTransportCommand(t, repo, "add", "file")
+	gitTransportCommand(t, repo, "commit", "-m", "base")
+	gitTransportCommand(t, repo, "branch", "-M", "main")
+	base := strings.TrimSpace(string(gitTransportCommand(t, repo, "rev-parse", "HEAD")))
+	gitTransportCommand(t, repo, "push", remote, "HEAD:refs/heads/main")
+	gitTransportCommand(t, repo, "push", fork, "HEAD:refs/heads/main")
+	if err := os.WriteFile(filepath.Join(repo, "file"), []byte("proposed\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	gitTransportCommand(t, repo, "commit", "-am", "proposed")
+	proposed := strings.TrimSpace(string(gitTransportCommand(t, repo, "rev-parse", "HEAD")))
+	bundle := filepath.Join(root, "proposal.bundle")
+	gitTransportCommand(t, repo, "bundle", "create", bundle, "HEAD")
+	gitBroker, err := couriergit.NewBroker(ctx, root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(gitBroker.Directory())
+	if err := gitBroker.ImportBundle(ctx, bundle, proposed, base); err != nil {
+		t.Fatal(err)
+	}
+
+	policy := Policy{RunUID: "run", Mode: ModeContribute, Provider: "test", BaseRepo: "org/project", BaseRef: "main", BaseOID: base, WorkRepo: "fork/project", WorkRef: "courier/org/project/goal-abc12345", WorkInitiallyAbsent: true, SourceIssue: SourceIssue{Owner: "org", Name: "project", Number: 7}}
+	resolver := staticGitEndpoints{"org/project": remote, "fork/project": fork}
+	pusher, err := NewGitPusher(ctx, GitTransportConfig{Policy: policy, Git: gitBroker, Resolver: resolver})
+	if err != nil {
+		t.Fatalf("NewGitPusher: %v", err)
+	}
+	if ok, err := pusher.IsAncestor(ctx, "fork/project", base, proposed); err != nil || !ok {
+		t.Fatalf("IsAncestor = %v, %v", ok, err)
+	}
+	if err := pusher.Push(ctx, "org/project", "main", proposed); err == nil {
+		t.Fatal("accepted base ref as publication target")
+	}
+	if err := pusher.Push(ctx, "org/project", policy.WorkRef, proposed); err == nil {
+		t.Fatal("accepted the base repository as a push destination even for the work ref")
+	}
+	if err := pusher.Push(ctx, "fork/project", policy.WorkRef, proposed); err != nil {
+		t.Fatalf("Push: %v", err)
+	}
+	if got := strings.TrimSpace(string(gitTransportCommand(t, "", "--git-dir", fork, "rev-parse", "refs/heads/"+policy.WorkRef))); got != proposed {
+		t.Fatalf("fork tip = %s, want %s", got, proposed)
+	}
+	if got := strings.TrimSpace(string(gitTransportCommand(t, "", "--git-dir", remote, "rev-parse", "refs/heads/main"))); got != base {
+		t.Fatalf("upstream base tip = %s, want %s", got, base)
+	}
+	cmd := exec.Command("git", "--git-dir", remote, "rev-parse", "refs/heads/"+policy.WorkRef)
+	out, err := cmd.CombinedOutput()
+	if err == nil {
+		t.Fatalf("upstream remote gained the work ref: %s", out)
+	}
+	if err := pusher.Push(ctx, "other/project", policy.WorkRef, proposed); err == nil {
+		t.Fatal("accepted unpinned third identity")
+	}
+}
+
 func TestGitPusherRejectsHostilePinsAndNonFastForward(t *testing.T) {
 	ctx := context.Background()
 	root := t.TempDir()

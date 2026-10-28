@@ -728,3 +728,211 @@ func TestCreatePRCriterionEvidenceVacuousPaths(t *testing.T) {
 		})
 	}
 }
+
+// --- contribute mode: fork-backed publication (#599) ---
+
+func contributePolicy() Policy {
+	return Policy{RunUID: "uid-1", Mode: ModeContribute, Provider: "gh", BaseRepo: "org/repo", BaseRef: "main", BaseOID: "base1", WorkRepo: "fork/repo", WorkRef: "courier/org/repo/goal-abc", WorkAnchorOID: "old", SourceIssue: SourceIssue{Owner: "org", Name: "repo", Number: 502}}
+}
+
+func forkObserver() *adoptObserver {
+	return &adoptObserver{fakeObserver: &fakeObserver{
+		base: RepositoryState{Repo: "org/repo", Ref: "main", Exists: true, OID: "base2", Default: true, Protected: true},
+		work: RepositoryState{Repo: "fork/repo", Ref: "courier/org/repo/goal-abc", Exists: true, OID: "old", ProtectionKnown: true, Writable: true, WriteKnown: true},
+	}}
+}
+
+func TestValidatePolicyContributeRequiresDistinctFork(t *testing.T) {
+	p := contributePolicy()
+	p.WorkRepo = p.BaseRepo
+	if _, err := NewPolicyEngine(p, forkObserver(), &fakePusher{}); err == nil {
+		t.Fatal("contribute policy with the base as its own head repository accepted")
+	}
+}
+
+func TestValidatePolicyContributeOptionalSourceIssue(t *testing.T) {
+	p := contributePolicy()
+	p.SourceIssue = SourceIssue{}
+	if _, err := NewPolicyEngine(p, forkObserver(), &fakePusher{}); err != nil {
+		t.Fatalf("contribute policy without upstream issue context rejected: %v", err)
+	}
+	for _, mutate := range []func(*Policy){
+		func(p *Policy) { p.SourceIssue = SourceIssue{Owner: "other", Name: "repo", Number: 502} },
+		func(p *Policy) { p.SourceIssue = SourceIssue{Owner: "org", Name: "repo", Number: 0} },
+		func(p *Policy) { p.SourceIssue = SourceIssue{Owner: "org", Name: "repo", Number: -3} },
+	} {
+		bad := contributePolicy()
+		mutate(&bad)
+		if _, err := NewPolicyEngine(bad, forkObserver(), &fakePusher{}); err == nil {
+			t.Fatal("incomplete or mismatched contribute source-issue accepted")
+		}
+	}
+}
+
+func TestValidatePolicyContributeRejectsFixPRAnchorsAndUnbackedClosingChoice(t *testing.T) {
+	for _, mutate := range []func(*Policy){
+		func(p *Policy) { p.PRNumber = 7 },
+		func(p *Policy) { p.HeadAnchorOID = "old" },
+		func(p *Policy) { p.AllowClosingLinkage = true; p.SourceIssue = SourceIssue{} },
+	} {
+		bad := contributePolicy()
+		mutate(&bad)
+		if _, err := NewPolicyEngine(bad, forkObserver(), &fakePusher{}); err == nil {
+			t.Fatal("invalid contribute policy accepted")
+		}
+	}
+}
+
+func TestCreatePRContributeRejectsClosingLinkageWithoutPolicyChoice(t *testing.T) {
+	o := forkObserver()
+	e := criteriaEngine(t, contributePolicy(), o)
+	for _, body := range []string{"Fixes #502", "Closes org/repo#502", "Resolves #502"} {
+		_, _, err := e.CreatePullRequest(context.Background(), "old", "title", body, false)
+		if err == nil {
+			t.Fatalf("contribute create accepted closing body %q without an admission-time choice", body)
+		}
+		if !errors.Is(err, ErrClosingLinkageNotAdmitted) {
+			t.Fatalf("err = %v, want ErrClosingLinkageNotAdmitted", err)
+		}
+	}
+	if o.created.Body != "" {
+		t.Fatalf("observer CreatePullRequest reached the forge despite unadmitted closing linkage: %q", o.created.Body)
+	}
+	// The non-closing default reaches the forge write.
+	if _, _, err := e.CreatePullRequest(context.Background(), "old", "title", "Refs #502. Ships the contribution.", false); err != nil {
+		t.Fatalf("non-closing default rejected: %v", err)
+	}
+	if o.created.Body == "" {
+		t.Fatal("observer was not reached for the non-closing default")
+	}
+}
+
+func TestCreatePRContributeAdmitsPolicyGatedClosingLinkage(t *testing.T) {
+	p := contributePolicy()
+	p.AllowClosingLinkage = true
+	o := forkObserver()
+	e := criteriaEngine(t, p, o)
+	if _, _, err := e.CreatePullRequest(context.Background(), "old", "title", "Fixes #502. Ships the contribution.", false); err != nil {
+		t.Fatalf("policy-gated closing linkage rejected: %v", err)
+	}
+	if o.created.Body == "" {
+		t.Fatal("observer was not reached for admitted closing linkage")
+	}
+	for _, body := range []string{"Fixes #999", "Closes other/repo#502", "Fixes #502. Fixes #503."} {
+		o2 := forkObserver()
+		e2 := criteriaEngine(t, p, o2)
+		if _, _, err := e2.CreatePullRequest(context.Background(), "old", "title", body, false); err == nil {
+			t.Fatalf("closing body %q accepted despite disagreeing with the trusted identity", body)
+		}
+		if o2.created.Body != "" {
+			t.Fatalf("observer reached the forge despite invalid closing body %q", body)
+		}
+	}
+}
+
+func TestCreatePRContributeLinkageOptionalWithoutIssueContext(t *testing.T) {
+	p := contributePolicy()
+	p.SourceIssue = SourceIssue{}
+	o := forkObserver()
+	e := criteriaEngine(t, p, o)
+	if _, _, err := e.CreatePullRequest(context.Background(), "old", "title", "A goal summary with no issue anywhere.", false); err != nil {
+		t.Fatalf("contribution without issue context rejected: %v", err)
+	}
+	o2 := forkObserver()
+	e2 := criteriaEngine(t, p, o2)
+	if _, _, err := e2.CreatePullRequest(context.Background(), "old", "title", "Fixes #7", false); err == nil {
+		t.Fatal("closing reference accepted with no trusted identity")
+	}
+	if o2.created.Body != "" {
+		t.Fatal("observer reached the forge despite a closing reference with no trusted identity")
+	}
+}
+
+func pinnedDiscoveryPR(number int, mutate func(*PullRequestState)) PullRequestState {
+	pr := PullRequestState{Number: number, State: "open", BaseRepo: "org/repo", BaseRef: "main", BaseOID: "base2", HeadRepo: "fork/repo", HeadRef: "courier/org/repo/goal-abc", HeadOID: "old"}
+	if mutate != nil {
+		mutate(&pr)
+	}
+	return pr
+}
+
+func TestCreatePRRediscoveryAdoptsSamePinnedPullRequest(t *testing.T) {
+	o := forkObserver()
+	o.pulls = []PullRequestState{pinnedDiscoveryPR(5, nil)}
+	e := criteriaEngine(t, contributePolicy(), o)
+	got, _, err := e.CreatePullRequest(context.Background(), "old", "title", "Refs #502", false)
+	if err != nil {
+		t.Fatalf("rediscovery failed: %v", err)
+	}
+	if got.Number != 5 || got.HeadRepo != "fork/repo" || got.HeadOID != "old" {
+		t.Fatalf("rediscovered PR = %#v, want the existing fork-head PR 5", got)
+	}
+	if o.created.Body != "" {
+		t.Fatal("a duplicate create reached the forge despite rediscovery")
+	}
+}
+
+func TestCreatePRRediscoveryFailsClosedOnAmbiguousOrNonMatchingHead(t *testing.T) {
+	cases := []struct {
+		name   string
+		pulls  []PullRequestState
+		reason string
+	}{
+		{"ambiguous", []PullRequestState{pinnedDiscoveryPR(5, nil), pinnedDiscoveryPR(6, nil)}, "multiple pull requests claim the pinned head"},
+		{"closed", []PullRequestState{pinnedDiscoveryPR(5, func(pr *PullRequestState) { pr.State = "closed" })}, "does not match the pinned identity"},
+		{"head-moved", []PullRequestState{pinnedDiscoveryPR(5, func(pr *PullRequestState) { pr.HeadOID = "stale" })}, "does not match the pinned identity"},
+		{"base-moved", []PullRequestState{pinnedDiscoveryPR(5, func(pr *PullRequestState) { pr.BaseRef = "release" })}, "does not match the pinned identity"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			o := forkObserver()
+			o.pulls = tc.pulls
+			e := criteriaEngine(t, contributePolicy(), o)
+			_, _, err := e.CreatePullRequest(context.Background(), "old", "title", "Refs #502", false)
+			if err == nil {
+				t.Fatal("create proceeded despite a non-adoptable pinned head listing")
+			}
+			if !strings.Contains(err.Error(), tc.reason) {
+				t.Fatalf("err = %v, want reason %q", err, tc.reason)
+			}
+			if o.created.Body != "" {
+				t.Fatal("a forge create reached the observer despite the failed-closed discovery")
+			}
+		})
+	}
+}
+
+func TestCreatePRDiscoveryIgnoresForeignHeadClaims(t *testing.T) {
+	// A record that does not claim the pinned full head identity (a
+	// same-name fork or another branch) neither adopts nor blocks: create
+	// proceeds under the normal guards.
+	o := forkObserver()
+	o.pulls = []PullRequestState{pinnedDiscoveryPR(9, func(pr *PullRequestState) { pr.HeadRepo = "other/repo" })}
+	e := criteriaEngine(t, contributePolicy(), o)
+	got, _, err := e.CreatePullRequest(context.Background(), "old", "title", "Refs #502", false)
+	if err != nil {
+		t.Fatalf("create blocked by a foreign head claim: %v", err)
+	}
+	if got.Number != 42 || o.created.Body == "" {
+		t.Fatalf("expected the normal create path, got %#v", got)
+	}
+}
+
+func TestResolveIssueRediscoveryAdoptsSamePinnedPullRequest(t *testing.T) {
+	// The discovery-before-create boundary is shared: a resolve-issue
+	// re-publish after a create whose number was never recorded adopts the
+	// existing same-identity PR instead of failing or duplicating.
+	o := goodObserver(ModeResolveIssue)
+	o.pulls = []PullRequestState{{Number: 11, State: "open", BaseRepo: "org/repo", BaseRef: "main", BaseOID: "base2", HeadRepo: "org/repo", HeadRef: "courier/work", HeadOID: "old"}}
+	e := engine(t, goodPolicy(ModeResolveIssue), o, &fakePusher{})
+	got, _, err := e.CreatePullRequest(context.Background(), "old", "title", "Closes #502", false)
+	if err != nil {
+		t.Fatalf("rediscovery failed: %v", err)
+	}
+	if got.Number != 11 {
+		t.Fatalf("rediscovered PR = %#v, want 11", got)
+	}
+	if o.created.Body != "" {
+		t.Fatal("a duplicate create reached the forge despite rediscovery")
+	}
+}

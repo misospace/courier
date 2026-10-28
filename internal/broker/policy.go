@@ -13,6 +13,11 @@ type Mode string
 const (
 	ModeResolveIssue Mode = "resolve-issue"
 	ModeFixPR        Mode = "fix-pr"
+	// ModeContribute publishes a contribution from an approved fork: the
+	// base repository is read-only, every push goes only to the distinct
+	// work (head) repository, and the pull request opens from the fork
+	// head into the base.
+	ModeContribute Mode = "contribute"
 )
 
 // Policy is a resolved, run-UID-bound publication policy. Treat it as immutable
@@ -38,6 +43,16 @@ type Policy struct {
 	// runs leave it zero because the existing PR's identity is
 	// already pinned through PRNumber and HeadAnchorOID.
 	SourceIssue SourceIssue
+	// AllowClosingLinkage records an explicit admission-time policy choice
+	// that permits a contribute-mode pull request body to carry closing
+	// keywords ("Fixes #N"). Contribute bodies default to non-closing
+	// wording ("Refs #N" or a plain issue URL); the flag is set only by
+	// trusted admission into the publication policy, never inferred from
+	// goal text or model output, and requires a trusted source-issue
+	// identity. resolve-issue linkage is always closing and fix-pr carries
+	// no body-linkage contract, so the flag is meaningful only for
+	// contribute.
+	AllowClosingLinkage bool
 	// Criteria is the acceptance-criterion set pinned at admission
 	// (#249/#280), reconstructed from the persisted publication policy and
 	// verified by digest at binding. A zero CriterionSet means no set was
@@ -195,6 +210,47 @@ func validatePolicy(p Policy) error {
 		}
 		if p.Criteria.IsPinned() || !p.Criteria.Issue.IsZero() || len(p.Criteria.Criteria) > 0 {
 			return errors.New("publication policy: fix-pr policies carry no criterion contract")
+		}
+	case ModeContribute:
+		if p.PRNumber != 0 || p.HeadAnchorOID != "" {
+			return errors.New("publication policy: contribute carries fix-pr anchors")
+		}
+		// The structural fork invariant: a contribute policy pushes only to
+		// the work repository, so a contribute policy whose work repository
+		// is the base would make the base writable at this boundary.
+		// Admission requires an approved fork; the engine refuses to model
+		// anything else.
+		if p.WorkRepo == p.BaseRepo {
+			return errors.New("publication policy: contribute requires a head repository distinct from the base")
+		}
+		// Upstream issue context is optional for a contribution, but when
+		// present it must be a coherent identity on the base repository:
+		// it is the only identity a linkage reference may name.
+		if !p.SourceIssue.IsZero() {
+			if p.SourceIssue.Number <= 0 {
+				return errors.New("publication policy: contribute source-issue number must be positive")
+			}
+			if p.SourceIssue.Canonical() != p.BaseRepo {
+				return fmt.Errorf("publication policy: contribute source-issue repository %q does not match base repository %q", p.SourceIssue.Canonical(), p.BaseRepo)
+			}
+		}
+		// Closing wording gates on a trusted identity: without one there is
+		// nothing a "Fixes #N" reference could provably name, so an
+		// admission that sets the gate without one is a configuration
+		// error, not a publication path.
+		if p.AllowClosingLinkage && p.SourceIssue.IsZero() {
+			return errors.New("publication policy: closing linkage requires a trusted source-issue identity")
+		}
+		// The criterion pin integrity rule is the resolve-issue rule: a
+		// contribution with pinned criteria pins them against its optional
+		// upstream issue identity, and a half-set never reaches a
+		// publication boundary.
+		if p.Criteria.IsPinned() {
+			if p.SourceIssue.IsZero() || p.Criteria.Issue != p.SourceIssue {
+				return errors.New("publication policy: pinned criterion set does not name the policy's trusted source issue")
+			}
+		} else if !p.Criteria.Issue.IsZero() || len(p.Criteria.Criteria) > 0 {
+			return errors.New("publication policy: criterion set carries an identity or rows without a set digest")
 		}
 	default:
 		return fmt.Errorf("publication policy: unsupported mode %q", p.Mode)
@@ -404,16 +460,23 @@ func (e *PolicyEngine) checkPR(pr *PullRequestState, workOID, trustedTip string)
 	return nil
 }
 
-// CreatePullRequest is resolve-issue-only and adopts no existing head, including
-// a same-name fork PR. The returned PR is re-read and fully verified.
+// CreatePullRequest is resolve-issue- and contribute-only and adopts no head
+// whose full identity the policy does not pin, including a same-name fork PR
+// whose head repository differs from the pinned work repository. For a
+// contribution the pinned work repository is the approved fork, so the create
+// opens a cross-repository pull request from fork head into base, and the
+// returned PR is re-read and fully verified.
 //
-// The body must carry a closing-keyword reference to the trusted source issue
-// (validatePolicy rejects a policy with an unset SourceIssue for resolve-issue
-// runs). The check runs before the forge write so a model that picks the wrong
-// issue number, a different repository, or no closing reference at all never
-// gets to create a PR. Both the cross-repo form ("Closes owner/repo#N") and
-// the bare form ("Closes #N") are accepted when the trusted source identity
-// matches.
+// The body contract is mode-aware. A resolve-issue body must carry a
+// closing-keyword reference to the trusted source issue (validatePolicy
+// rejects a policy with an unset SourceIssue for resolve-issue runs). A
+// contribute body defaults to non-closing wording: closing keywords require
+// the admission-time AllowClosingLinkage choice and, when present, must name
+// the trusted upstream issue identity. The check runs before the forge write
+// so a model that picks the wrong issue number, a different repository, or a
+// closing keyword the policy never admitted never gets to create a PR. Both
+// the cross-repo form ("Closes owner/repo#N") and the bare form ("Closes #N")
+// are accepted when the trusted source identity matches.
 //
 // When the policy carries a criterion set pinned at admission (#249/#281),
 // the body must additionally satisfy ValidateCriterionEvidence against that
@@ -428,14 +491,22 @@ func (e *PolicyEngine) checkPR(pr *PullRequestState, workOID, trustedTip string)
 // honest record surfaces its derived coverage to the caller; carriage of
 // that result into outcome comments and telemetry is the executor boundary's
 // job, not the engine's.
+//
+// Discovery before creation is the durable idempotency boundary: a create
+// that succeeded but was never recorded is recovered by base/head repos and
+// refs, never by title text. Exactly one open pull request at the exact
+// pinned full identity (including head OID) is adopted as this run's PR
+// without a forge write; zero proceeds to create; anything else — multiple
+// PRs claiming the pinned head, a closed or merged PR, or a PR whose head
+// differs from the published tip — fails closed rather than guessing.
 func (e *PolicyEngine) CreatePullRequest(ctx context.Context, oid, title, body string, draft bool) (PullRequestState, *CriteriaReport, error) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	p := e.policy
-	if p.Mode != ModeResolveIssue {
+	if p.Mode != ModeResolveIssue && p.Mode != ModeContribute {
 		return PullRequestState{}, nil, errors.New("publication denied: fix-pr cannot create or retarget a pull request")
 	}
-	if err := ValidateLinkage(body, p.SourceIssue); err != nil {
+	if err := validateBodyLinkage(p, body); err != nil {
 		return PullRequestState{}, nil, fmt.Errorf("publication denied: %w", err)
 	}
 	// The criterion-evidence boundary (#281) is checked beside linkage,
@@ -462,15 +533,28 @@ func (e *PolicyEngine) CreatePullRequest(ctx context.Context, oid, title, body s
 	if !work.Exists || oid == "" || work.OID != oid {
 		return PullRequestState{}, nil, errors.New("publication denied: proposed OID is not the exact live head")
 	}
-	if e.confirmed != oid && oid != p.WorkAnchorOID {
-		return PullRequestState{}, nil, errors.New("publication denied: pull request head is not an admitted or previously confirmed run tip")
-	}
 	pulls, err := e.observer.FindPullRequest(ctx, p.WorkRepo, p.WorkRef)
 	if err != nil {
 		return PullRequestState{}, nil, errors.New("check existing pull request failed")
 	}
-	if len(pulls) != 0 {
-		return PullRequestState{}, nil, errors.New("publication denied: a pull request already exists for the pinned head")
+	existing := pullsForPinnedHead(p, pulls)
+	if len(existing) > 1 {
+		return PullRequestState{}, nil, errors.New("publication denied: multiple pull requests claim the pinned head")
+	}
+	if len(existing) == 1 {
+		// The PR's existence is itself durable evidence of this run's
+		// earlier create: the pinned head identity is run-owned, so an
+		// exact match at the published tip is rediscovered and returned
+		// instead of duplicating. A non-match is not this run's PR as
+		// published (closed, merged, moved head, changed base) and the
+		// recovery is a human decision, not a second create.
+		if !matchesPR(p, existing[0], oid) {
+			return PullRequestState{}, nil, errors.New("publication denied: an existing pull request for the pinned head does not match the pinned identity")
+		}
+		return existing[0], report, nil
+	}
+	if e.confirmed != oid && oid != p.WorkAnchorOID {
+		return PullRequestState{}, nil, errors.New("publication denied: pull request head is not an admitted or previously confirmed run tip")
 	}
 	number, err := e.observer.CreatePullRequest(ctx, CreatePullRequest{BaseRepo: p.BaseRepo, BaseRef: p.BaseRef, HeadRepo: p.WorkRepo, HeadRef: p.WorkRef, Title: title, Body: body, Draft: draft})
 	if err != nil {
@@ -501,19 +585,44 @@ func (e *PolicyEngine) CreatePullRequest(ctx context.Context, oid, title, body s
 		return PullRequestState{}, nil, errors.New("recheck pull requests after create failed")
 	}
 	found := false
-	for _, candidate := range pulls {
+	for _, candidate := range pullsForPinnedHead(p, pulls) {
 		if candidate.Number == number && matchesPR(p, candidate, oid) {
 			found = true
 			continue
 		}
-		if candidate.HeadRepo == p.WorkRepo && candidate.HeadRef == p.WorkRef {
-			return PullRequestState{}, nil, errors.New("publication denied: concurrent pull request exists for pinned head")
-		}
+		return PullRequestState{}, nil, errors.New("publication denied: concurrent pull request exists for pinned head")
 	}
 	if !found {
 		return PullRequestState{}, nil, errors.New("publication denied: created pull request is absent from pinned head recheck")
 	}
 	return created, report, nil
+}
+
+// validateBodyLinkage applies the mode-aware pull request body contract:
+// resolve-issue requires closing linkage to the trusted source issue, and
+// contribute defaults to non-closing wording with closing keywords gated by
+// the admission-time AllowClosingLinkage choice. fix-pr has no body-linkage
+// contract and never reaches a body-creating path.
+func validateBodyLinkage(p Policy, body string) error {
+	if p.Mode == ModeContribute {
+		return ValidateContributeLinkage(body, p.SourceIssue, p.AllowClosingLinkage)
+	}
+	return ValidateLinkage(body, p.SourceIssue)
+}
+
+// pullsForPinnedHead keeps the records that claim the pinned full head
+// identity. The forge observer contract already filters foreign records out;
+// the engine filters again so discovery, adoption, and the post-create race
+// recheck all reason over the same pinned identity, never over a record the
+// observer should not have returned.
+func pullsForPinnedHead(p Policy, pulls []PullRequestState) []PullRequestState {
+	out := make([]PullRequestState, 0, len(pulls))
+	for _, candidate := range pulls {
+		if candidate.HeadRepo == p.WorkRepo && candidate.HeadRef == p.WorkRef {
+			out = append(out, candidate)
+		}
+	}
+	return out
 }
 
 // UpdateFixPR updates metadata only after confirming the pinned PR and exact live head.

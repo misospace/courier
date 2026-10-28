@@ -212,3 +212,90 @@ func TestValidateLinkageRejectsBodyWithNoClosingReference(t *testing.T) {
 		t.Fatalf("err = %v, want ErrLinkageMissing", err)
 	}
 }
+
+// --- contribute-mode linkage contract (#599) ---
+
+func TestValidateContributeLinkageAcceptsNonClosingDefault(t *testing.T) {
+	source := trustedIssue()
+	// Linkage is optional and the default wording is non-closing: with no
+	// closing-keyword reference the body passes whether or not closing was
+	// ever admitted, and whether or not an upstream issue exists.
+	for _, allowClosing := range []bool{false, true} {
+		for _, body := range []string{
+			"This change ships the icon assets and updates the manifest.",
+			"Refs #502",
+			"refs misospace/miso-gallery#502",
+			"See https://github.com/misospace/miso-gallery/issues/502 for the upstream context.",
+			"",
+		} {
+			if err := ValidateContributeLinkage(body, source, allowClosing); err != nil {
+				t.Fatalf("ValidateContributeLinkage(%q, allow=%v) = %v, want nil", body, allowClosing, err)
+			}
+			if err := ValidateContributeLinkage(body, SourceIssue{}, allowClosing); err != nil {
+				t.Fatalf("no-context ValidateContributeLinkage(%q, allow=%v) = %v, want nil", body, allowClosing, err)
+			}
+		}
+	}
+}
+
+func TestValidateContributeLinkageRejectsClosingWithoutPolicyChoice(t *testing.T) {
+	source := trustedIssue()
+	for _, body := range []string{
+		"Fixes #502",
+		"Closes misospace/miso-gallery#502",
+		"Ships the assets. Resolves #502.",
+		"fixes #502",
+	} {
+		err := ValidateContributeLinkage(body, source, false)
+		if err == nil {
+			t.Fatalf("closing linkage %q accepted without an admission-time policy choice", body)
+		}
+		if !errors.Is(err, ErrClosingLinkageNotAdmitted) {
+			t.Fatalf("err = %v, want ErrClosingLinkageNotAdmitted", err)
+		}
+		var le *LinkageError
+		if !errors.As(err, &le) || len(le.Observed) == 0 {
+			t.Fatalf("structured observations missing: %v", err)
+		}
+	}
+}
+
+func TestValidateContributeLinkageAdmittedClosingMustMatchTrustedIdentity(t *testing.T) {
+	source := trustedIssue()
+	for _, body := range []string{
+		"Fixes #502",
+		"Closes misospace/miso-gallery#502",
+		"Ships the assets.\n\nFixes #502 and refs the design doc.",
+	} {
+		if err := ValidateContributeLinkage(body, source, true); err != nil {
+			t.Fatalf("admitted closing reference %q rejected: %v", body, err)
+		}
+	}
+	for _, body := range []string{
+		"Fixes #503",
+		"Closes other-org/miso-gallery#502",
+		"Fixes #502. Also closes #503.",
+	} {
+		err := ValidateContributeLinkage(body, source, true)
+		if err == nil {
+			t.Fatalf("closing reference %q accepted despite disagreeing with the trusted identity", body)
+		}
+		var le *LinkageError
+		if !errors.As(err, &le) {
+			t.Fatalf("err = %v, want a structured LinkageError", err)
+		}
+	}
+}
+
+func TestValidateContributeLinkageRejectsClosingWithoutTrustedIdentity(t *testing.T) {
+	// Even with closing admitted, a policy that carries no trusted
+	// source-issue identity cannot verify what "Fixes #N" claims.
+	err := ValidateContributeLinkage("Fixes #5", SourceIssue{}, true)
+	if err == nil {
+		t.Fatal("closing reference accepted with no trusted source-issue identity")
+	}
+	var le *LinkageError
+	if !errors.As(err, &le) {
+		t.Fatalf("err = %v, want a structured LinkageError", err)
+	}
+}

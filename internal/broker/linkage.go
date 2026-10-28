@@ -86,6 +86,70 @@ type LinkageObservation struct {
 // closing-keyword reference at all.
 var ErrLinkageMissing = errors.New("publication denied: pull request body has no supported closing-keyword reference to the source issue")
 
+// ErrClosingLinkageNotAdmitted is returned for a contribute-mode body that
+// carries a closing-keyword reference although the publication policy never
+// recorded the admission-time choice admitting closing linkage. The default
+// contribute wording is non-closing ("Refs #N" or a plain issue URL);
+// "Fixes #N" is a policy decision, never a model choice.
+var ErrClosingLinkageNotAdmitted = errors.New("publication denied: pull request body carries closing linkage that the publication policy did not admit")
+
+// ValidateContributeLinkage checks a contribute-mode pull request body
+// against the mode-aware linkage contract. Linkage is optional: a body with
+// no closing-keyword reference passes, so the default non-closing wording
+// ("Refs #123", a plain issue URL, or no reference at all) is accepted, and
+// a contribution with no upstream issue context carries no linkage line.
+//
+// When a closing-keyword reference does appear, it is admitted only under
+// the explicit admission-time policy choice (allowClosing). When admitted,
+// every closing reference must name the trusted source-issue identity —
+// the same strict identity rule ValidateLinkage enforces for resolve-issue
+// bodies: the model may not select a different issue or repository than the
+// operator admitted, and an ambiguous body mixing correct and incorrect
+// references is rejected. Without allowClosing, or without any trusted
+// source-issue identity to reference, a closing keyword is refused before
+// any forge write. Like ValidateLinkage, this is a pure function: no I/O,
+// no global state, no clock.
+func ValidateContributeLinkage(body string, source SourceIssue, allowClosing bool) error {
+	observations := extractObservations(body, source)
+	if len(observations) == 0 {
+		return nil
+	}
+	if !allowClosing {
+		return &LinkageError{
+			Reason: fmt.Sprintf("publication denied: contribute-mode pull request bodies default to non-closing linkage (Refs #N or an issue URL); a closing reference requires an admission-time policy choice (found: %s)",
+				FormatLinkageObservations(observations)),
+			Observed: observations,
+			sentinel: ErrClosingLinkageNotAdmitted,
+		}
+	}
+	if source.IsZero() {
+		// validatePolicy rejects this policy shape; the refusal is kept
+		// here so no caller can reach a forge write with a closing
+		// reference that names no verifiable identity.
+		return &LinkageError{
+			Reason:   "publication denied: closing linkage requires a trusted source-issue identity",
+			Observed: observations,
+		}
+	}
+	if source.Number <= 0 {
+		return errors.New("publication denied: trusted source issue number is non-positive; cannot enforce linkage")
+	}
+	allMatch := true
+	for _, obs := range observations {
+		if !obs.Match {
+			allMatch = false
+			break
+		}
+	}
+	if allMatch {
+		return nil
+	}
+	return &LinkageError{
+		Reason:   describeLinkageFailure(observations, source),
+		Observed: observations,
+	}
+}
+
 // bareClosingReferencePattern matches the simple form
 // "<keyword> #<number>". The # must be the only thing between the
 // keyword and the digits; the digits must be a non-empty positive
