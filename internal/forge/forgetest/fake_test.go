@@ -216,7 +216,8 @@ func TestCreatePullRequestEffect(t *testing.T) {
 
 func TestFailNextReadRef(t *testing.T) {
 	f := forgetest.New(forgetest.Config{
-		Refs: map[string]map[string]string{"r": {"main": "oid"}},
+		Repositories: []forge.Repository{{ID: "r", Canonical: "r", DefaultRef: "main"}},
+		Refs:         map[string]map[string]string{"r": {"main": "oid"}},
 	})
 	ctx := context.Background()
 	repo := forge.Repository{ID: "r", Canonical: "r"}
@@ -450,5 +451,137 @@ func TestNewDeepCopiesSeeds(t *testing.T) {
 	reviews, err := f.ListReviews(ctx, forge.PullRequestRef{Repo: "r", Number: 3})
 	if err != nil || len(reviews) != 1 || reviews[0].ID != "r1" {
 		t.Fatalf("ListReviews = (%+v, %v), want r1", reviews, err)
+	}
+}
+
+func TestUnregisteredVerbsRefuseAllOperations(t *testing.T) {
+	f := forgetest.New(forgetest.Config{
+		Capabilities: []forge.Capability{forge.CapabilityReadWorkItem},
+		PullRequests: []forge.PullRequest{
+			{Number: 5, Repo: "r", BaseRepo: "r", BaseRef: "main", HeadRepo: "h", HeadRef: "b", State: "open"},
+		},
+	})
+	ctx := context.Background()
+	ref := forge.PullRequestRef{Repo: "r", Number: 5}
+	if _, err := f.CreatePullRequest(ctx, forge.CreatePullRequestInput{Repo: "r", Head: "b", HeadRepo: "h", HeadRef: "b", Base: "main"}); !errors.Is(err, forge.ErrUnsupported) {
+		t.Fatalf("CreatePullRequest err = %v, want ErrUnsupported", err)
+	}
+	if _, err := f.UpdatePullRequest(ctx, ref, forge.UpdatePullRequestInput{Title: "x"}); !errors.Is(err, forge.ErrUnsupported) {
+		t.Fatalf("UpdatePullRequest err = %v, want ErrUnsupported", err)
+	}
+	if _, err := f.CommentPullRequest(ctx, ref, "x"); !errors.Is(err, forge.ErrUnsupported) {
+		t.Fatalf("CommentPullRequest err = %v, want ErrUnsupported", err)
+	}
+	if _, err := f.ReadPullRequest(ctx, ref); !errors.Is(err, forge.ErrUnsupported) {
+		t.Fatalf("ReadPullRequest err = %v, want ErrUnsupported", err)
+	}
+	// Nothing performed: no write landed and the stored request is unchanged.
+	if got := len(f.PullRequests()); got != 1 {
+		t.Fatalf("PullRequests = %d, want only the seeded 5", got)
+	}
+	if f.PullRequests()[0].Title != "" {
+		t.Fatalf("stored request mutated: %+v", f.PullRequests()[0])
+	}
+	// Refused calls are still recorded.
+	if got := f.WriteCount(); got != 3 {
+		t.Fatalf("WriteCount = %d, want 3 recorded attempts", got)
+	}
+}
+
+func TestUnavailableCapabilityReportsDetailAndRefuses(t *testing.T) {
+	f := forgetest.New(forgetest.Config{
+		Unavailable: map[forge.Capability]string{forge.CapabilityCreatePullRequest: "rate limited"},
+	})
+	caps := f.Capabilities()
+	if !caps.Has(forge.CapabilityCreatePullRequest) {
+		t.Fatalf("create capability must stay registered when unavailable")
+	}
+	if got := caps.Available(forge.CapabilityCreatePullRequest); got.Available || got.Detail != "rate limited" {
+		t.Fatalf("availability = %+v, want unavailable with detail rate limited", got)
+	}
+	_, err := f.CreatePullRequest(context.Background(), forge.CreatePullRequestInput{Repo: "r", Head: "b", HeadRepo: "r", HeadRef: "b", Base: "main"})
+	if !errors.Is(err, forge.ErrUnsupported) {
+		t.Fatalf("CreatePullRequest err = %v, want ErrUnsupported", err)
+	}
+}
+
+func TestNumberingStartsAboveSeededPullRequests(t *testing.T) {
+	f := forgetest.New(forgetest.Config{
+		PullRequests: []forge.PullRequest{
+			{Number: 105, Repo: "r", BaseRepo: "r", BaseRef: "main", HeadRepo: "h", HeadRef: "b", State: "open"},
+		},
+	})
+	created, err := f.CreatePullRequest(context.Background(), forge.CreatePullRequestInput{Repo: "r", Head: "b", HeadRepo: "h", HeadRef: "b", Base: "main"})
+	if err != nil {
+		t.Fatalf("CreatePullRequest: %v", err)
+	}
+	if created.Number != 106 {
+		t.Fatalf("Number = %d, want 106 (above the highest seeded request)", created.Number)
+	}
+	if got := len(f.PullRequests()); got != 2 {
+		t.Fatalf("PullRequests = %d, want seeded 105 plus created 106", got)
+	}
+}
+
+func TestAfterEffectInjectionSurvivesRefusedCall(t *testing.T) {
+	f := forgetest.New(forgetest.Config{})
+	ctx := context.Background()
+	ref := forge.PullRequestRef{Repo: "r", Number: 7}
+	injected := errors.New("lost response")
+	f.FailNextAfterEffect(forgetest.OpUpdatePullRequest, injected)
+
+	// The update cannot run: the request does not exist. The injection stays
+	// queued rather than being consumed with no effect.
+	if _, err := f.UpdatePullRequest(ctx, ref, forge.UpdatePullRequestInput{Title: "x"}); !errors.Is(err, forgetest.ErrNotFound) {
+		t.Fatalf("UpdatePullRequest err = %v, want ErrNotFound", err)
+	}
+	f.AddPullRequest(forge.PullRequest{Number: 7, Repo: "r", BaseRepo: "r", BaseRef: "main", HeadRepo: "h", HeadRef: "b", State: "open"})
+
+	// Now the effect runs and the queued injection delivers: the update
+	// landed, the reply is lost.
+	if _, err := f.UpdatePullRequest(ctx, ref, forge.UpdatePullRequestInput{Title: "landed"}); !errors.Is(err, injected) {
+		t.Fatalf("second UpdatePullRequest err = %v, want injected", err)
+	}
+	if got := f.PullRequests(); len(got) != 1 || got[0].Title != "landed" {
+		t.Fatalf("stored requests = %+v, want one with title landed", got)
+	}
+}
+
+func TestClosedHeadStaysFrozenWhenBranchMoves(t *testing.T) {
+	f := forgetest.New(forgetest.Config{
+		Repositories: []forge.Repository{{ID: "base", Canonical: "base", DefaultRef: "main"}},
+		Refs:         map[string]map[string]string{"head": {"b": "oid-1"}},
+		PullRequests: []forge.PullRequest{
+			{Number: 1, Repo: "base", BaseRepo: "base", BaseRef: "main", HeadRepo: "head", HeadRef: "b", HeadSHA: "oid-1", State: "open"},
+			{Number: 2, Repo: "base", BaseRepo: "base", BaseRef: "main", HeadRepo: "head", HeadRef: "b", HeadSHA: "oid-1", State: "closed"},
+		},
+	})
+	f.SetRef("head", "b", "oid-2")
+	list, err := f.ListPullRequestsByHead(context.Background(), forge.PullRequestRef{Repo: "base"}, "head", "b")
+	if err != nil || len(list) != 2 {
+		t.Fatalf("ListPullRequestsByHead = (%+v, %v), want two", list, err)
+	}
+	if list[0].Number != 1 || list[0].HeadSHA != "oid-2" {
+		t.Fatalf("open request = %+v, want head oid-2 (live)", list[0])
+	}
+	if list[1].Number != 2 || list[1].HeadSHA != "oid-1" {
+		t.Fatalf("closed request = %+v, want head frozen at oid-1", list[1])
+	}
+}
+
+func TestReadRefOnUnknownRepositoryIsFixtureError(t *testing.T) {
+	f := forgetest.New(forgetest.Config{
+		Repositories: []forge.Repository{{ID: "r", Canonical: "r", DefaultRef: "main"}},
+		Refs:         map[string]map[string]string{"r": {"main": "oid"}},
+	})
+	ctx := context.Background()
+	if _, err := f.ReadRef(ctx, forge.Repository{ID: "typo", Canonical: "typo"}, "main"); !errors.Is(err, forgetest.ErrNotFound) {
+		t.Fatalf("ReadRef on unknown repository err = %v, want ErrNotFound", err)
+	}
+	if _, err := f.ReadEffectiveProtection(ctx, forge.Repository{ID: "typo", Canonical: "typo"}, "main"); !errors.Is(err, forgetest.ErrNotFound) {
+		t.Fatalf("ReadEffectiveProtection on unknown repository err = %v, want ErrNotFound", err)
+	}
+	if _, err := f.CanWriteRepository(ctx, forge.Repository{ID: "typo", Canonical: "typo"}); !errors.Is(err, forgetest.ErrNotFound) {
+		t.Fatalf("CanWriteRepository on unknown repository err = %v, want ErrNotFound", err)
 	}
 }

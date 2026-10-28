@@ -6,8 +6,10 @@
 //
 // It is test support only: no production package imports it.
 //
-// Every provider call — successful read, write, failure, and ErrUnsupported
+// Every forge operation — successful read, write, failure, and ErrUnsupported
 // alike — is recorded as an Op in call order before its effect is applied.
+// Config and Capabilities are local introspection, not forge I/O, and are
+// deliberately not recorded.
 // Recorded ops make reads and writes independently observable: a test asserts
 // the exact sequence of operations a component performed, and WriteOps shows
 // whether a write was attempted at all, independent of whether the effect
@@ -56,8 +58,9 @@ type Op struct {
 	// Kind is the contract method invoked.
 	Kind OpKind
 	// Repo is the repository identity argument: the name passed to
-	// ResolveRepository, or the canonical identity of the Repository argument
-	// of the policy and pull-request methods.
+	// ResolveRepository, the canonical identity of the Repository argument
+	// of the policy and pull-request methods, or the head repository argument
+	// of ListPullRequestsByHead.
 	Repo string
 	// Ref is the ref argument of ReadRef and ReadEffectiveProtection, and the
 	// head ref argument of ListPullRequestsByHead.
@@ -87,10 +90,14 @@ type Op struct {
 // the Config after the call without affecting the Fake.
 type Config struct {
 	Provider forge.ProviderConfig
-	// Capabilities lists the capabilities the fake registers. Nil registers
-	// the full forge vocabulary; a non-nil slice registers exactly those
-	// listed.
+	// Capabilities lists the capabilities the fake registers as available. Nil
+	// registers the full forge vocabulary; a non-nil slice registers exactly
+	// those listed.
 	Capabilities []forge.Capability
+	// Unavailable registers capabilities that are offered but not usable,
+	// each with the detail its diagnostic reports, so a test can drive the
+	// "offered but down" path without removing the capability.
+	Unavailable  map[forge.Capability]string
 	Repositories []forge.Repository
 	// Refs maps repository identity to ref to OID.
 	Refs map[string]map[string]string
@@ -162,6 +169,12 @@ func New(cfg Config) *Fake {
 	if caps == nil {
 		caps = allCapabilities
 	}
+	nextNumber := 101
+	for _, pr := range cfg.PullRequests {
+		if pr.Number >= nextNumber {
+			nextNumber = pr.Number + 1
+		}
+	}
 	f := &Fake{
 		cfg:          cfg.Provider,
 		caps:         forge.NewCapabilities(caps...),
@@ -175,10 +188,13 @@ func New(cfg Config) *Fake {
 		reviews:     map[forge.PullRequestRef][]forge.Review{},
 		comments:    map[forge.PullRequestRef][]forge.Comment{},
 		checks:      map[forge.PullRequestRef][]forge.Check{},
-		nextNumber:  101,
+		nextNumber:  nextNumber,
 		nextComment: 1,
 
 		fails: map[OpKind][]failure{},
+	}
+	for capability, detail := range cfg.Unavailable {
+		f.caps.Register(capability, forge.Availability{Available: false, Detail: detail})
 	}
 	for repo, refs := range cfg.Refs {
 		inner := make(map[string]string, len(refs))
@@ -232,20 +248,16 @@ func (f *Fake) ResolveRepository(_ context.Context, name string) (forge.Reposito
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.record(Op{Kind: OpResolveRepository, Repo: name})
-	fail, failed := f.popFailure(OpResolveRepository)
-	if failed && !fail.afterEffect {
+	if fail, ok := f.takeFailure(OpResolveRepository, false); ok {
 		return forge.Repository{}, fail.err
 	}
 	for _, repo := range f.repositories {
 		if repo.ID == name || repo.Canonical == name {
-			if failed {
+			if fail, ok := f.takeFailure(OpResolveRepository, true); ok {
 				return forge.Repository{}, fail.err
 			}
 			return repo, nil
 		}
-	}
-	if failed {
-		return forge.Repository{}, fail.err
 	}
 	return forge.Repository{}, ErrNotFound
 }
@@ -256,17 +268,15 @@ func (f *Fake) ReadRef(_ context.Context, repo forge.Repository, ref string) (fo
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.record(Op{Kind: OpReadRef, Repo: repoKey(repo), Ref: ref})
-	fail, failed := f.popFailure(OpReadRef)
-	if failed && !fail.afterEffect {
+	if fail, ok := f.takeFailure(OpReadRef, false); ok {
 		return forge.RefState{}, fail.err
 	}
-	oid, ok := f.refs[repoKey(repo)][ref]
-	state := forge.RefState{Ref: ref}
-	if ok {
-		state.OID = oid
-		state.Exists = true
+	if !f.knownRepo(repoKey(repo)) {
+		return forge.RefState{}, ErrNotFound
 	}
-	if failed {
+	oid, exists := f.refs[repoKey(repo)][ref]
+	state := forge.RefState{Ref: ref, OID: oid, Exists: exists}
+	if fail, ok := f.takeFailure(OpReadRef, true); ok {
 		return forge.RefState{}, fail.err
 	}
 	return state, nil
@@ -278,12 +288,14 @@ func (f *Fake) ReadEffectiveProtection(_ context.Context, repo forge.Repository,
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.record(Op{Kind: OpReadEffectiveProtection, Repo: repoKey(repo), Ref: ref})
-	fail, failed := f.popFailure(OpReadEffectiveProtection)
-	if failed && !fail.afterEffect {
+	if fail, ok := f.takeFailure(OpReadEffectiveProtection, false); ok {
 		return forge.Protection{}, fail.err
 	}
+	if !f.knownRepo(repoKey(repo)) {
+		return forge.Protection{}, ErrNotFound
+	}
 	prot := forge.Protection{Protected: f.protected[repoKey(repo)]}
-	if failed {
+	if fail, ok := f.takeFailure(OpReadEffectiveProtection, true); ok {
 		return forge.Protection{}, fail.err
 	}
 	return prot, nil
@@ -295,15 +307,17 @@ func (f *Fake) CanWriteRepository(_ context.Context, repo forge.Repository) (boo
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.record(Op{Kind: OpCanWriteRepository, Repo: repoKey(repo)})
-	fail, failed := f.popFailure(OpCanWriteRepository)
-	if failed && !fail.afterEffect {
+	if fail, ok := f.takeFailure(OpCanWriteRepository, false); ok {
 		return false, fail.err
+	}
+	if !f.knownRepo(repoKey(repo)) {
+		return false, ErrNotFound
 	}
 	writable, ok := f.writable[repoKey(repo)]
 	if !ok {
 		writable = true
 	}
-	if failed {
+	if fail, ok := f.takeFailure(OpCanWriteRepository, true); ok {
 		return false, fail.err
 	}
 	return writable, nil
@@ -314,18 +328,17 @@ func (f *Fake) ReadWorkItem(_ context.Context, ref forge.WorkItemRef) (forge.Wor
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.record(Op{Kind: OpReadWorkItem, Repo: ref.Repo, WorkItem: ref})
-	fail, failed := f.popFailure(OpReadWorkItem)
-	if failed && !fail.afterEffect {
+	if fail, ok := f.takeFailure(OpReadWorkItem, false); ok {
 		return forge.WorkItem{}, fail.err
+	}
+	if !f.offers(forge.CapabilityReadWorkItem) {
+		return forge.WorkItem{}, forge.ErrUnsupported
 	}
 	item, ok := f.workItems[ref]
 	if !ok {
-		if failed {
-			return forge.WorkItem{}, fail.err
-		}
 		return forge.WorkItem{}, ErrNotFound
 	}
-	if failed {
+	if fail, ok := f.takeFailure(OpReadWorkItem, true); ok {
 		return forge.WorkItem{}, fail.err
 	}
 	return copyWorkItem(item), nil
@@ -336,18 +349,17 @@ func (f *Fake) ReadPullRequest(_ context.Context, ref forge.PullRequestRef) (for
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.record(Op{Kind: OpReadPullRequest, Repo: ref.Repo, PR: ref})
-	fail, failed := f.popFailure(OpReadPullRequest)
-	if failed && !fail.afterEffect {
+	if fail, ok := f.takeFailure(OpReadPullRequest, false); ok {
 		return forge.PullRequest{}, fail.err
+	}
+	if !f.offers(forge.CapabilityReadPullRequest) {
+		return forge.PullRequest{}, forge.ErrUnsupported
 	}
 	pr, ok := f.prs[ref]
 	if !ok {
-		if failed {
-			return forge.PullRequest{}, fail.err
-		}
 		return forge.PullRequest{}, ErrNotFound
 	}
-	if failed {
+	if fail, ok := f.takeFailure(OpReadPullRequest, true); ok {
 		return forge.PullRequest{}, fail.err
 	}
 	return copyPullRequest(pr), nil
@@ -358,12 +370,14 @@ func (f *Fake) ListReviews(_ context.Context, ref forge.PullRequestRef) ([]forge
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.record(Op{Kind: OpListReviews, Repo: ref.Repo, PR: ref})
-	fail, failed := f.popFailure(OpListReviews)
-	if failed && !fail.afterEffect {
+	if fail, ok := f.takeFailure(OpListReviews, false); ok {
 		return nil, fail.err
 	}
+	if !f.offers(forge.CapabilityListReviews) {
+		return nil, forge.ErrUnsupported
+	}
 	reviews := copySlice(f.reviews[ref])
-	if failed {
+	if fail, ok := f.takeFailure(OpListReviews, true); ok {
 		return nil, fail.err
 	}
 	return reviews, nil
@@ -374,12 +388,14 @@ func (f *Fake) ListComments(_ context.Context, ref forge.PullRequestRef) ([]forg
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.record(Op{Kind: OpListComments, Repo: ref.Repo, PR: ref})
-	fail, failed := f.popFailure(OpListComments)
-	if failed && !fail.afterEffect {
+	if fail, ok := f.takeFailure(OpListComments, false); ok {
 		return nil, fail.err
 	}
+	if !f.offers(forge.CapabilityListComments) {
+		return nil, forge.ErrUnsupported
+	}
 	comments := copySlice(f.comments[ref])
-	if failed {
+	if fail, ok := f.takeFailure(OpListComments, true); ok {
 		return nil, fail.err
 	}
 	return comments, nil
@@ -391,12 +407,14 @@ func (f *Fake) ReadChecks(_ context.Context, ref forge.PullRequestRef, headSHA s
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.record(Op{Kind: OpReadChecks, Repo: ref.Repo, PR: ref, Head: headSHA})
-	fail, failed := f.popFailure(OpReadChecks)
-	if failed && !fail.afterEffect {
+	if fail, ok := f.takeFailure(OpReadChecks, false); ok {
 		return nil, fail.err
 	}
+	if !f.offers(forge.CapabilityReadChecks) {
+		return nil, forge.ErrUnsupported
+	}
 	checks := copySlice(f.checks[ref])
-	if failed {
+	if fail, ok := f.takeFailure(OpReadChecks, true); ok {
 		return nil, fail.err
 	}
 	return checks, nil
@@ -405,27 +423,30 @@ func (f *Fake) ReadChecks(_ context.Context, ref forge.PullRequestRef, headSHA s
 // ListPullRequestsByHead returns every known pull request — seeded and
 // created, in any state — whose base repository matches the base reference's
 // repository and whose head repository and head ref match the arguments. Each
-// result's HeadSHA is refreshed from the live seeded refs map for the head
-// repository and ref when present; the stored request is not mutated.
+// open result's HeadSHA is refreshed from the live seeded refs map for the
+// head repository and ref when present, mirroring a live branch; a closed
+// request's head stays frozen, as a real forge freezes it. The stored
+// requests are never mutated.
 func (f *Fake) ListPullRequestsByHead(_ context.Context, base forge.PullRequestRef, repo, ref string) ([]forge.PullRequest, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.record(Op{Kind: OpListPullRequestsByHead, Repo: repo, PR: base, Base: base.Repo, HeadRepo: repo, Ref: ref})
-	fail, failed := f.popFailure(OpListPullRequestsByHead)
-	if failed && !fail.afterEffect {
+	if fail, ok := f.takeFailure(OpListPullRequestsByHead, false); ok {
 		return nil, fail.err
 	}
 	var out []forge.PullRequest
 	for _, pr := range f.prs {
 		if pr.BaseRepo == base.Repo && pr.HeadRepo == repo && pr.HeadRef == ref {
 			result := copyPullRequest(pr)
-			if oid, ok := f.refs[repo][ref]; ok {
-				result.HeadSHA = oid
+			if pr.State == "open" {
+				if oid, ok := f.refs[repo][ref]; ok {
+					result.HeadSHA = oid
+				}
 			}
 			out = append(out, result)
 		}
 	}
-	if failed {
+	if fail, ok := f.takeFailure(OpListPullRequestsByHead, true); ok {
 		return nil, fail.err
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].Number < out[j].Number })
@@ -433,18 +454,18 @@ func (f *Fake) ListPullRequestsByHead(_ context.Context, base forge.PullRequestR
 }
 
 // CreatePullRequest opens a pull request in the fake's state. It returns
-// forge.ErrUnsupported when the create capability is unregistered; the call
-// is recorded either way. Numbers are assigned from 101 upward, and the base
-// and head SHAs are read from the live seeded refs map.
+// forge.ErrUnsupported when the create capability is not offered; the call
+// is recorded either way. Numbers are assigned above every seeded request
+// (from 101 when none is higher), and the base and head SHAs are read from
+// the live seeded refs map.
 func (f *Fake) CreatePullRequest(_ context.Context, in forge.CreatePullRequestInput) (forge.PullRequest, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.record(Op{Kind: OpCreatePullRequest, Repo: in.Repo, Input: in})
-	fail, failed := f.popFailure(OpCreatePullRequest)
-	if failed && !fail.afterEffect {
+	if fail, ok := f.takeFailure(OpCreatePullRequest, false); ok {
 		return forge.PullRequest{}, fail.err
 	}
-	if !f.caps.Has(forge.CapabilityCreatePullRequest) {
+	if !f.offers(forge.CapabilityCreatePullRequest) {
 		return forge.PullRequest{}, forge.ErrUnsupported
 	}
 	number := f.nextNumber
@@ -467,27 +488,27 @@ func (f *Fake) CreatePullRequest(_ context.Context, in forge.CreatePullRequestIn
 		URL:      fmt.Sprintf("https://forge.invalid/%s/pulls/%d", in.Repo, number),
 	}
 	f.prs[prKey(pr)] = copyPullRequest(pr)
-	if failed {
+	if fail, ok := f.takeFailure(OpCreatePullRequest, true); ok {
 		return forge.PullRequest{}, fail.err
 	}
 	return copyPullRequest(pr), nil
 }
 
 // UpdatePullRequest applies the non-zero fields of the input to the stored
-// pull request and returns the updated request, or ErrNotFound.
+// pull request and returns the updated request, ErrUnsupported when the
+// update capability is not offered, or ErrNotFound.
 func (f *Fake) UpdatePullRequest(_ context.Context, ref forge.PullRequestRef, in forge.UpdatePullRequestInput) (forge.PullRequest, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.record(Op{Kind: OpUpdatePullRequest, Repo: ref.Repo, PR: ref, Update: in})
-	fail, failed := f.popFailure(OpUpdatePullRequest)
-	if failed && !fail.afterEffect {
+	if fail, ok := f.takeFailure(OpUpdatePullRequest, false); ok {
 		return forge.PullRequest{}, fail.err
+	}
+	if !f.offers(forge.CapabilityUpdatePullRequest) {
+		return forge.PullRequest{}, forge.ErrUnsupported
 	}
 	pr, ok := f.prs[ref]
 	if !ok {
-		if failed {
-			return forge.PullRequest{}, fail.err
-		}
 		return forge.PullRequest{}, ErrNotFound
 	}
 	if in.Title != "" {
@@ -500,40 +521,42 @@ func (f *Fake) UpdatePullRequest(_ context.Context, ref forge.PullRequestRef, in
 		pr.State = in.State
 	}
 	f.prs[ref] = copyPullRequest(pr)
-	if failed {
+	if fail, ok := f.takeFailure(OpUpdatePullRequest, true); ok {
 		return forge.PullRequest{}, fail.err
 	}
 	return copyPullRequest(pr), nil
 }
 
 // CommentPullRequest appends a comment to the stored pull request and returns
-// it, or ErrNotFound.
+// it, forge.ErrUnsupported when the comment capability is not offered, or
+// ErrNotFound.
 func (f *Fake) CommentPullRequest(_ context.Context, ref forge.PullRequestRef, body string) (forge.Comment, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.record(Op{Kind: OpCommentPullRequest, Repo: ref.Repo, PR: ref, Body: body})
-	fail, failed := f.popFailure(OpCommentPullRequest)
-	if failed && !fail.afterEffect {
+	if fail, ok := f.takeFailure(OpCommentPullRequest, false); ok {
 		return forge.Comment{}, fail.err
 	}
+	if !f.offers(forge.CapabilityComment) {
+		return forge.Comment{}, forge.ErrUnsupported
+	}
 	if _, ok := f.prs[ref]; !ok {
-		if failed {
-			return forge.Comment{}, fail.err
-		}
 		return forge.Comment{}, ErrNotFound
 	}
 	id := fmt.Sprintf("comment-%d", f.nextComment)
 	f.nextComment++
 	comment := forge.Comment{ID: id, Author: "forgetest", Body: body}
 	f.comments[ref] = append(f.comments[ref], comment)
-	if failed {
+	if fail, ok := f.takeFailure(OpCommentPullRequest, true); ok {
 		return forge.Comment{}, fail.err
 	}
 	return comment, nil
 }
 
-// FailNext queues err so that the next call of kind returns it with no effect.
-// Queue entries of a kind are consumed FIFO.
+// FailNext queues err so that the next call of kind returns it with no
+// effect. Queue entries of a kind are consumed FIFO among pre-effect
+// injections; a queued after-effect injection at the head stays pending until
+// a call can run its effect.
 func (f *Fake) FailNext(kind OpKind, err error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -542,8 +565,9 @@ func (f *Fake) FailNext(kind OpKind, err error) {
 
 // FailNextAfterEffect queues err so that the next call of kind applies its
 // default effect fully and then returns err with no response: the write
-// landed, but the caller loses the reply. Queue entries of a kind are
-// consumed FIFO.
+// landed, but the caller loses the reply. A call refused before its effect —
+// a missing object or an unsupported capability — does not consume it. Queue
+// entries of a kind are consumed FIFO among after-effect injections.
 func (f *Fake) FailNextAfterEffect(kind OpKind, err error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -585,14 +609,6 @@ func (f *Fake) SetProtected(repo string, protected bool) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.protected[repo] = protected
-}
-
-// AddRepository appends a repository to the seeded set. It is a world
-// mutation and is not recorded as an Op.
-func (f *Fake) AddRepository(repo forge.Repository) {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	f.repositories = append(f.repositories, repo)
 }
 
 // AddPullRequest adds a pull request to the known set. It is a world mutation
@@ -677,16 +693,39 @@ func (f *Fake) record(op Op) {
 	f.ops = append(f.ops, op)
 }
 
-// popFailure returns the next queued failure for kind, if any. Callers must
-// hold f.mu.
-func (f *Fake) popFailure(kind OpKind) (failure, bool) {
+// takeFailure consumes the head queued failure for kind when its after-effect
+// shape matches wantAfterEffect. A head whose shape does not match stays
+// queued, so an after-effect injection is only consumed when the effect it
+// models actually ran: a call refused before its effect — a missing object or
+// an unsupported capability — leaves it pending for the next call. Callers
+// must hold f.mu.
+func (f *Fake) takeFailure(kind OpKind, wantAfterEffect bool) (failure, bool) {
 	q := f.fails[kind]
-	if len(q) == 0 {
+	if len(q) == 0 || q[0].afterEffect != wantAfterEffect {
 		return failure{}, false
 	}
 	head := q[0]
 	f.fails[kind] = q[1:]
 	return head, true
+}
+
+// capabilityGate reports the forge capability that governs an operation. The
+// policy reads (ResolveRepository, ReadRef, ReadEffectiveProtection,
+// CanWriteRepository) and the head listing are not capability vocabulary;
+// they are always offered.
+func (f *Fake) offers(capability forge.Capability) bool {
+	return f.caps.Available(capability).Available
+}
+
+// knownRepo reports whether the repository identity is seeded. Reads against
+// an unseeded repository are a fixture error, not an absent ref.
+func (f *Fake) knownRepo(key string) bool {
+	for _, repo := range f.repositories {
+		if repoKey(repo) == key {
+			return true
+		}
+	}
+	return false
 }
 
 // repoKey is the repository identity string used for policy and ref lookups:

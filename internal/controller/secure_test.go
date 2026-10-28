@@ -3154,9 +3154,13 @@ func matrixForge(t *testing.T, issueBody string, prs ...forge.PullRequest) *forg
 
 // matrixFactory returns a ProviderFactory resolving to the given fake — the
 // same shape the production factory takes over the deployment's read-only
-// forge identity.
-func matrixFactory(fake *forgetest.Fake) ProviderFactory {
-	return func(context.Context, *forge.Registration) (AdmissionProvider, error) {
+// forge identity — and, when seen is non-nil, records the registrations
+// admission hands it so a test can assert what the provider path receives.
+func matrixFactory(fake *forgetest.Fake, seen *[]*forge.Registration) ProviderFactory {
+	return func(_ context.Context, registration *forge.Registration) (AdmissionProvider, error) {
+		if seen != nil {
+			*seen = append(*seen, registration)
+		}
 		return AdmissionProvider{Provider: fake, Policy: fake, HeadLister: fake}, nil
 	}
 }
@@ -3206,7 +3210,7 @@ func TestSecureMatrixRejectedAdmissionMakesNoForgeWrite(t *testing.T) {
 		// records no operations at all.
 		fake := matrixForge(t, "## Problem\nThe widget is missing.")
 		control, _ := secureControl(t)
-		control.Config.Providers = matrixFactory(fake)
+		control.Config.Providers = matrixFactory(fake, nil)
 		run := secureRun("matrix-rejected-early")
 		run.Namespace = "default"
 		_, _, err := control.ResolveAdmission(context.Background(), run)
@@ -3230,7 +3234,7 @@ func TestSecureMatrixRejectedAdmissionMakesNoForgeWrite(t *testing.T) {
 			HeadRef: "courier/Acme/Widgets/issue-7", State: "closed", Merged: true,
 		})
 		control, _ := secureControl(t)
-		control.Config.Providers = matrixFactory(fake)
+		control.Config.Providers = matrixFactory(fake, nil)
 		_, _, err := control.ResolveAdmission(context.Background(), secureRun("matrix-rejected-late"))
 		var permanent *SecureNeedsHumanError
 		if !errors.As(err, &permanent) || permanent.Reason != "HeadAlreadyMerged" {
@@ -3246,7 +3250,7 @@ func TestSecureMatrixRejectedAdmissionMakesNoForgeWrite(t *testing.T) {
 	t.Run("SuccessfulAdmissionMakesNoWrite", func(t *testing.T) {
 		fake := matrixForge(t, "## Problem\nThe widget is missing.")
 		control, _ := secureControl(t)
-		control.Config.Providers = matrixFactory(fake)
+		control.Config.Providers = matrixFactory(fake, nil)
 		_, policy, err := control.ResolveAdmission(context.Background(), secureRun("matrix-approved"))
 		if err != nil {
 			t.Fatalf("ResolveAdmission: %v", err)
@@ -3283,12 +3287,12 @@ func TestSecureMatrixGoalDirectivesCannotMovePublication(t *testing.T) {
 
 	adversarialFake := matrixForge(t, adversarialBody)
 	adversarialControl, _ := secureControl(t)
-	adversarialControl.Config.Providers = matrixFactory(adversarialFake)
+	adversarialControl.Config.Providers = matrixFactory(adversarialFake, nil)
 	adversarialRun := secureRun("matrix-goal")
 
 	cleanFake := matrixForge(t, cleanBody)
 	cleanControl, _ := secureControl(t)
-	cleanControl.Config.Providers = matrixFactory(cleanFake)
+	cleanControl.Config.Providers = matrixFactory(cleanFake, nil)
 	cleanRun := secureRun("matrix-goal")
 
 	advRegistration, advPolicy, err := adversarialControl.ResolveAdmission(context.Background(), adversarialRun)
@@ -3421,13 +3425,32 @@ func TestSecureMatrixAdmissionCarriesNoResolvedCredentials(t *testing.T) {
 	})
 	control, _ := secureControl(t)
 	control.Config.Registry = registry
-	control.Config.Providers = matrixFactory(fake)
+	var seenRegistrations []*forge.Registration
+	control.Config.Providers = matrixFactory(fake, &seenRegistrations)
 	registration, policy, err := control.ResolveAdmission(context.Background(), secureRun("matrix-credentials"))
 	if err != nil {
 		t.Fatalf("ResolveAdmission: %v", err)
 	}
 	if registration.Name != "github" {
 		t.Fatalf("registration = %q", registration.Name)
+	}
+
+	// The factory received the registry's registration exactly once, and
+	// that hand-off is reference-only: the registration type carries
+	// credential references (secret name and key), has no value field, and
+	// the serialized hand-off contains the secret name once and no sentinel.
+	if len(seenRegistrations) != 1 || seenRegistrations[0] != registration {
+		t.Fatalf("factory received %d registrations, want the one admission registration", len(seenRegistrations))
+	}
+	registrationJSON, err := json.Marshal(seenRegistrations[0])
+	if err != nil {
+		t.Fatalf("marshal registration: %v", err)
+	}
+	if got := strings.Count(string(registrationJSON), secretName); got != 1 {
+		t.Fatalf("secret name appears %d times in the registration handed to the factory, want exactly once (the credential reference)", got)
+	}
+	if strings.Contains(string(registrationJSON), valueSentinel) {
+		t.Fatal("the registration handed to the factory carries a resolved credential value")
 	}
 
 	// The persisted policy binds the registration by the projection's
@@ -3502,5 +3525,11 @@ func TestSecureMatrixAdmissionCarriesNoResolvedCredentials(t *testing.T) {
 	// material. The value sentinel is not seeded anywhere in this world —
 	// the registry holds references only, and CredentialRef has no value
 	// field — so its absence is asserted on the shape of every observable,
-	// not as the detection of a planted leak.
+	// not as the detection of a planted leak. The remaining surfaces of the
+	// matrix's credential row sit outside admission and are pinned by the
+	// components that write them: secret-shaped material is withheld from
+	// persisted evidence and status relay (TestEvidenceEnvtestWithheldEntry-
+	// PersistsRestAndInvalidBundlesPersistNothing, TestEvidenceIntakeRescan-
+	// RedactsMetadata, TestLongPathSecretWithheld), and forge availability
+	// diagnostics pass through RedactDetail (internal/forge/forge_test.go).
 }

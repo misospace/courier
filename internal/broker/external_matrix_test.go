@@ -27,7 +27,8 @@ import (
 //	 3. issue context does not change publication
 //	    -> TestExternalMatrixIssueContextDoesNotChangePublication
 //	 4. pinned destination cannot be redirected
-//	    -> TestExternalMatrixPinnedDestinationCannotBeRedirected
+//	    -> TestExternalMatrixDestinationOutsidePinnedPolicyIsRefused (adapter guard)
+//	    -> TestExternalMatrixProtectedDestinationDeniesBeforePush (engine guard)
 //	    (transport pin: TestGitPusherUsesOnlyPinnedEndpointAndExactRef,
 //	    TestGitPusherRejectsHostilePinsAndNonFastForward, git_transport_test.go;
 //	    protected-ref denial: TestPublishRejectsProtectedAndUnknownDestination, policy_test.go)
@@ -298,7 +299,7 @@ func TestExternalMatrixIssueContextDoesNotChangePublication(t *testing.T) {
 // TestGitPusherRejectsHostilePinsAndNonFastForward in git_transport_test.go;
 // this row pins the policy-engine side of the same boundary: a protected
 // destination is denied before the pusher is ever asked.
-func TestExternalMatrixPinnedDestinationCannotBeRedirected(t *testing.T) {
+func TestExternalMatrixProtectedDestinationDeniesBeforePush(t *testing.T) {
 	fake, pusher, engine := newMatrixFixture(t, func(f *forgetest.Fake, p *Policy) {
 		f.SetProtected(matrixWorkCanonical, true)
 	})
@@ -311,6 +312,37 @@ func TestExternalMatrixPinnedDestinationCannotBeRedirected(t *testing.T) {
 	}
 	if got := fake.WriteCount(); got != 0 {
 		t.Fatalf("denied publication wrote: %d", got)
+	}
+}
+
+// The forge adapter is the component that binds every provider call to the
+// pinned policy identity: a read, head listing, or create naming a repository
+// or destination outside the pinned policy must be refused with no provider
+// call recorded, so a substituted destination cannot even probe the forge.
+func TestExternalMatrixDestinationOutsidePinnedPolicyIsRefused(t *testing.T) {
+	fake := forgetest.New(defaultMatrixConfig())
+	p := defaultMatrixPolicy()
+	baseRepo := forge.Repository{ID: "repo-base", Canonical: matrixBaseCanonical, DefaultRef: matrixBaseRef}
+	workRepo := forge.Repository{ID: "repo-fork", Canonical: matrixWorkCanonical, DefaultRef: matrixBaseRef}
+	adapter, err := NewForgeAdapter(p, fake, fake, baseRepo, workRepo)
+	if err != nil {
+		t.Fatalf("new forge adapter: %v", err)
+	}
+	ctx := context.Background()
+	if _, err := adapter.Repository(ctx, "evil/base", matrixBaseRef); err == nil || !strings.Contains(err.Error(), "outside pinned policy") {
+		t.Fatalf("hostile repository read = %v, want the outside-policy refusal", err)
+	}
+	if _, err := adapter.FindPullRequest(ctx, "evil/head", matrixWorkRef); err == nil || !strings.Contains(err.Error(), "outside pinned policy") {
+		t.Fatalf("hostile head listing = %v, want the outside-policy refusal", err)
+	}
+	if _, err := adapter.CreatePullRequest(ctx, CreatePullRequest{BaseRepo: "evil/base", BaseRef: matrixBaseRef, HeadRepo: matrixWorkCanonical, HeadRef: matrixWorkRef, Title: "t", Body: "Closes up/base#123"}); err == nil || !strings.Contains(err.Error(), "destination differs from pinned policy") {
+		t.Fatalf("hostile create = %v, want the destination refusal", err)
+	}
+	if got := fake.Ops(); len(got) != 0 {
+		t.Fatalf("the outside-policy refusals reached the forge: %+v", got)
+	}
+	if got := fake.WriteCount(); got != 0 {
+		t.Fatalf("the outside-policy refusals wrote: %d", got)
 	}
 }
 
@@ -329,8 +361,10 @@ func TestExternalMatrixStaleRunUIDDeniesBeforeAnyForgeContact(t *testing.T) {
 }
 
 // The raced-duplicate denial is covered by TestBrokerIntegrationDeniesConcurrentDuplicatePR in
-// integration_test.go; this row proves the single-PR guarantee under true
-// concurrency on one engine, with the recorded create as the evidence.
+// integration_test.go; this row pins the single-PR guarantee for same-identity
+// retries issued concurrently: PolicyEngine's mutex serializes the retries,
+// and each serialized call re-checks the pinned head before creating, so the
+// recorded creates prove exactly one write.
 func TestExternalMatrixConcurrentRetriesCreateExactlyOnePR(t *testing.T) {
 	fake, _, engine := newMatrixFixture(t, nil)
 	ctx := context.Background()
@@ -457,8 +491,8 @@ func TestExternalMatrixMissingForkDeniesPublication(t *testing.T) {
 	cfg.Repositories = []forge.Repository{{ID: "repo-base", Canonical: matrixBaseCanonical, DefaultRef: matrixBaseRef}}
 	fake, pusher, engine := newMatrixFixtureWithConfig(t, cfg, nil)
 	_, err := engine.Publish(context.Background(), matrixPublishRequest(matrixAnchorOID))
-	if err == nil {
-		t.Fatal("publication with a missing fork accepted")
+	if err == nil || !strings.Contains(err.Error(), "observe pinned work ref") {
+		t.Fatalf("denial = %v, want the failed fork observation", err)
 	}
 	if pusher.pushCount != 0 {
 		t.Fatalf("denied publication pushed: %d", pusher.pushCount)
@@ -565,11 +599,12 @@ func TestExternalMatrixStaleBranchOwnershipDeniesPublication(t *testing.T) {
 }
 
 // Pinned-PR identity guards are covered by TestUpdateFixPRGuardsPinnedIdentity in
-// policy_test.go; this row covers the upstream work state: a closed or
-// merged work item denies the update, and only an open one with the exact
-// live head carries exactly one update write. The merged variant is
-// reported through the PR's state string, which is the only state the
-// adapter's PullRequestState carries.
+// policy_test.go; this row covers the upstream work state. A real forge
+// reports a merged request as state "closed" with a separate merged marker
+// (internal/github/forge.go), and the adapter's PullRequestState carries only
+// State, so "closed" is how both closed and merged upstream work reaches the
+// engine and denies the update; only an open request with the exact live head
+// carries exactly one update write.
 func TestExternalMatrixClosedOrMergedUpstreamWorkDeniesFixPR(t *testing.T) {
 	for _, tc := range []struct {
 		name       string
@@ -577,7 +612,7 @@ func TestExternalMatrixClosedOrMergedUpstreamWorkDeniesFixPR(t *testing.T) {
 		wantDenied bool
 	}{
 		{"closed upstream work", "closed", true},
-		{"merged upstream work", "merged", true},
+		{"merged upstream work (reported as closed)", "closed", true},
 		{"open upstream work", "open", false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -620,6 +655,9 @@ func TestExternalMatrixClosedOrMergedUpstreamWorkDeniesFixPR(t *testing.T) {
 			}
 			if updates[0].Update.Title != "after" {
 				t.Fatalf("update op = %+v, want the new title", updates[0])
+			}
+			if updates[0].PR.Number != 7 || updates[0].PR.Repo != matrixBaseCanonical {
+				t.Fatalf("update op targeted %+v, want the pinned request 7 on %s", updates[0].PR, matrixBaseCanonical)
 			}
 		})
 	}
