@@ -7,6 +7,7 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/log"
 
 	courierv1alpha1 "github.com/misospace/courier/api/v1alpha1"
 )
@@ -107,7 +108,32 @@ func (r *CoderRunReconciler) reapTerminal(ctx context.Context, run *courierv1alp
 	// topology's) can hold the object after the API server accepts the delete,
 	// and courier_coderuns_oldest_terminal_age_seconds is what shows such a run
 	// is still retained.
-	if err := r.Delete(ctx, run); err != nil {
+	// Delete-boundary fence (#606): between this reconcile's initial read and
+	// this delete request, an operator can add the retry annotation, which the
+	// snapshot cannot see — deleting then drops durable intent with no
+	// predecessor object on which syncRetry could persist the Requested record.
+	// Re-read the live object and re-verify the gate immediately before issuing
+	// the delete, and carry UID/resourceVersion preconditions so any write that
+	// lands after the re-read — the annotation above all — defeats the delete
+	// with a conflict the workqueue retries, re-entering the dispatch on a
+	// snapshot that sees the intent. A NotFound on the re-read is the same
+	// already-deleted success the delete itself accepts.
+	live := &courierv1alpha1.CoderRun{}
+	if err := r.Get(ctx, client.ObjectKeyFromObject(run), live); err != nil {
+		if apierrors.IsNotFound(err) {
+			return ctrl.Result{}, nil
+		}
+		return ctrl.Result{}, err
+	}
+	if hold, why := liveRetryHold(run, live); hold {
+		log.FromContext(ctx).V(1).Info("terminal run gained durable retry intent at the delete boundary; leaving it for the next reconcile",
+			"run", run.Name, "phase", run.Status.Phase, "why", why)
+		return ctrl.Result{}, nil
+	}
+	if err := r.Delete(ctx, live, client.Preconditions{
+		UID:             &live.UID,
+		ResourceVersion: &live.ResourceVersion,
+	}); err != nil {
 		if apierrors.IsNotFound(err) {
 			return ctrl.Result{}, nil
 		}
@@ -215,6 +241,25 @@ func terminalPhase(phase courierv1alpha1.Phase) bool {
 func retryHoldsReap(run *courierv1alpha1.CoderRun) bool {
 	return run != nil && run.Status.RetryRequest != nil &&
 		run.Status.RetryRequest.State == courierv1alpha1.RetryRequestStateRequested
+}
+
+// liveRetryHold reports whether the live object, re-read at the delete
+// boundary, carries durable retry intent this reconcile's snapshot could not
+// see. A Requested record holds on any phase: it is durable intent by
+// definition. The annotation holds on every reaped phase except Done — every
+// phase the terminal dispatch drives through syncRetry, so the next reconcile
+// translates it (or refuses it for a non-retryable phase) — because Done's
+// resolve path never reaches syncRetry and an annotation there cannot be
+// honored, so holding the reaper on it would wedge cleanup forever.
+func liveRetryHold(snapshot, live *courierv1alpha1.CoderRun) (bool, string) {
+	if retryHoldsReap(live) {
+		return true, "retry request record is Requested"
+	}
+	if snapshot.Status.Phase != courierv1alpha1.PhaseDone &&
+		validRetryRequestID(live.Annotations[courierv1alpha1.RetryAnnotation]) {
+		return true, "retry annotation is present"
+	}
+	return false, ""
 }
 
 // reapMarker parses a durable per-phase retention marker. A missing or

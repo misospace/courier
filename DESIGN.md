@@ -1013,7 +1013,12 @@ blocker can ask again.
 **Retry holds the reap gate.** A run carrying an outstanding `Requested` record is
 not reap-eligible and its retention window does not start, because deletion would
 drop the durable intent; the ordinary `Failed`/`NeedsHuman` window begins only once
-the record settles. Retry never changes the phase, never deletes, and never touches
+the record settles. The gate is re-verified against the live object immediately
+before the reaper issues its delete, and the delete carries UID/resourceVersion
+preconditions, so an annotation that lands between the reconcile's read and the
+delete request defeats the delete instead of dropping the intent — the conflicted
+reconcile re-enters the dispatch on a snapshot that sees it and persists the
+`Requested` record. Retry never changes the phase, never deletes, and never touches
 evidence: the predecessor stays exactly as terminalization left it, so the audit
 trail is preserved across a retry.
 
