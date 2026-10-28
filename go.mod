@@ -3,6 +3,7 @@ module github.com/misospace/courier
 go 1.26.0
 
 require (
+	github.com/hashicorp/cronexpr v1.1.3
 	github.com/modelcontextprotocol/go-sdk v1.8.0
 	github.com/prometheus/client_golang v1.25.0
 	github.com/prometheus/client_model v0.6.3

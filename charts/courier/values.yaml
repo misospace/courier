@@ -78,6 +78,29 @@ laneProfiles: {}
   #     coordinator: litellm/your-model
   #   framing: |
   #     keep parallelism modest and leave the pull request ready for review
+cron:
+  # -- Scheduled jobs, rendered into a release ConfigMap mounted into the
+  # manager and passed through --cron-schedules-file; empty disables the
+  # cron source. Map of job name to job spec: repo (owner/name), issue
+  # (positive issue or pull request number), lane (LaneProfile name), and
+  # schedule (5-field cron) are required; timezone (IANA name, default
+  # UTC), mode (resolve-issue|fix-pr, default resolve-issue), and debug are
+  # optional. Occurrence identity, missed-run, and restart semantics are
+  # documented in docs/cron-schedules.md. A values change updates the
+  # ConfigMap and the pod template's configMaps checksum, so a normal helm
+  # upgrade rolls the manager. An explicit --cron-schedules-file arg under
+  # controllers.main.containers.main.args takes precedence and disables
+  # this transport.
+  # cron:
+  #   nightly-triage:
+  #     repo: misospace/courier
+  #     issue: 15
+  #     lane: frontier
+  #     schedule: "30 2 * * *"
+  #     timezone: America/New_York
+  schedules: {}
+  # -- Cron discovery poll interval.
+  pollInterval: 30s
 
 # -- Secure topology (HARNESS.md). Disabled by default: the legacy
 # single-pod coordinator remains explicitly insecure. When enabled, every

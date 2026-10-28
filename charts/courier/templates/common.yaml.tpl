@@ -316,6 +316,67 @@
 {{- $args = append $args "--bootstrap-lane-profiles-file=/etc/courier/lane-profiles/profiles.yaml" }}
 {{- end }}
 {{- end }}
+{{- /* Cron schedules serialize into a chart ConfigMap mounted into the
+  manager and passed through the --cron-schedules-file seam, mirroring the
+  bootstrap-lane-profiles transport: the library's built-in configMaps
+  checksum rolls the manager on a values change, and an explicit
+  --cron-schedules-file arg takes precedence. */}}
+{{- $cronSchedules := dig "cron" "schedules" (dict) .Values }}
+{{- if $cronSchedules }}
+{{- $hasCronFile := false }}
+{{- range $arg := $args }}
+{{- if or (eq $arg "--cron-schedules-file") (hasPrefix "--cron-schedules-file=" $arg) }}{{- $hasCronFile = true }}{{- end }}
+{{- end }}
+{{- if not $hasCronFile }}
+{{- $entries := list }}
+{{- range $name, $spec := $cronSchedules }}
+{{- if not (kindIs "map" $spec) }}
+{{- fail (printf "cron.schedules entry %q must be a mapping of job fields" $name) }}
+{{- end }}
+{{- if or (not (regexMatch "^[a-z0-9]([-a-z0-9]*[a-z0-9])?$" $name)) (gt (len $name) 63) }}
+{{- fail (printf "cron.schedules name %q must be a valid DNS-1123 label (lowercase alphanumeric or '-', at most 63 characters, starting and ending with an alphanumeric)" $name) }}
+{{- end }}
+{{- if or (not $spec.repo) (not (regexMatch "^[^/]+/[^/]+$" $spec.repo)) }}
+{{- fail (printf "cron.schedules entry %q requires repo in owner/name form" $name) }}
+{{- end }}
+{{- if kindIs "string" $spec.issue }}
+{{- fail (printf "cron.schedules entry %q requires issue as a number" $name) }}
+{{- end }}
+{{- if or (not $spec.issue) (lt (float64 $spec.issue) 1.0) (ne (float64 $spec.issue) (floor (float64 $spec.issue))) }}
+{{- fail (printf "cron.schedules entry %q requires a positive integer issue number" $name) }}
+{{- end }}
+{{- if not $spec.lane }}
+{{- fail (printf "cron.schedules entry %q requires lane" $name) }}
+{{- end }}
+{{- if not $spec.schedule }}
+{{- fail (printf "cron.schedules entry %q requires schedule" $name) }}
+{{- end }}
+{{- if and $spec.mode (not (or (eq $spec.mode "resolve-issue") (eq $spec.mode "fix-pr"))) }}
+{{- fail (printf "cron.schedules entry %q mode must be resolve-issue or fix-pr" $name) }}
+{{- end }}
+{{- $entry := deepCopy $spec }}
+{{- $_ := set $entry "name" $name }}
+{{- $entries = append $entries $entry }}
+{{- end }}
+{{- $cronConfig := toYaml (dict "schedules" $entries) }}
+{{- $configMaps := deepCopy (.Values.configMaps | default dict) }}
+{{- $_ := set $configMaps "cron-schedules" (dict
+  "suffix" "cron-schedules"
+  "data" (dict "schedules.yaml" $cronConfig)) }}
+{{- $_ := set .Values "configMaps" $configMaps }}
+{{- $persistence := deepCopy (.Values.persistence | default dict) }}
+{{- $_ := set $persistence "cron-schedules" (dict
+  "type" "configMap"
+  "identifier" "cron-schedules"
+  "globalMounts" (list (dict "path" "/etc/courier/cron-schedules" "readOnly" true))) }}
+{{- $_ := set .Values "persistence" $persistence }}
+{{- $args = append $args "--cron-schedules-file=/etc/courier/cron-schedules/schedules.yaml" }}
+{{- end }}
+{{- $cronPollInterval := dig "cron" "pollInterval" "" .Values }}
+{{- if $cronPollInterval }}
+{{- $args = append $args (printf "--cron-poll-interval=%s" $cronPollInterval) }}
+{{- end }}
+{{- end }}
 {{- $evidence := .Values.evidence }}
 {{- if $evidence.enabled }}
 {{- if not $evidence.keySecret }}
