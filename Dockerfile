@@ -56,7 +56,7 @@ RUN --mount=type=cache,target=/go/pkg/mod \
 # availability probe resolves ssh remotes through the ssh binary git
 # invokes), and opencode in one image.
 # Debian (not alpine) because the opencode npm package ships glibc binaries.
-FROM node:26-bookworm-slim@sha256:28147155d47dc31abe0a46e0d12b59b2fb3d0a2dcc5dc65fce76a074180b16fe AS coordinator
+FROM node:26-bookworm-slim@sha256:88e480776c6149ff1d098cd304f44bf18057fb5d284a3329b78162d29821e28c AS coordinator
 ARG OPENCODE_VERSION=1.18.31
 # mise is pinned because the repository development bootstrap contract (#414)
 # dispatches `mise run bootstrap` in the secure worker; the binary downloads at
