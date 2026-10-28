@@ -603,6 +603,22 @@ func TestExternalMatrixExistingPRForPinnedHeadIsAdoptedNotDuplicated(t *testing.
 			t.Fatalf("create ops = %d, want none: a foreign publication is neither blessed nor overwritten", len(got))
 		}
 	})
+	t.Run("closed PR on the pinned head fails closed", func(t *testing.T) {
+		fake, _, engine := newMatrixFixture(t, func(f *forgetest.Fake, p *Policy) {
+			seedPR("Ships the packaging fix.\n\nCloses up/base#123")(f, p)
+			existing := f.PullRequests()[0]
+			existing.State = "closed"
+			existing.HeadSHA = matrixForeignOID
+			f.AddPullRequest(existing)
+		})
+		_, _, err := engine.CreatePullRequest(context.Background(), matrixAnchorOID, "issue 123", "Ships the packaging fix.\n\nCloses up/base#123", false)
+		if err == nil || !strings.Contains(err.Error(), "does not match the pinned identity") {
+			t.Fatalf("denial = %v, want the discovered-identity refusal", err)
+		}
+		if got := fake.OpsOf(forgetest.OpCreatePullRequest); len(got) != 0 {
+			t.Fatalf("create ops = %d, want none: closed upstream work is not guessed over", len(got))
+		}
+	})
 }
 
 // Foreign tips are covered by TestPublishRejectsForeignInitiallyPresentAndRacedAbsentTips in
