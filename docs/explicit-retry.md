@@ -81,7 +81,9 @@ status:
   without this record's key: the work was already requeued or superseded
   (the `ErrStaleWork`/`ErrSuperseded` family, `fence-settled`/`fence-gone`
   semantics from the park vocabulary). Settled; no replacement is launched
-  from this record.
+  from this record. Replaying a key that *did* commit under this request
+  returns the original success and settles `Requeued`, never `Moot` (see
+  Eligibility and refusal ownership, "The two lost-response outcomes").
 - **Refused** — the request can never succeed for this predecessor. Settled.
   Reasons are a closed, bounded vocabulary: `not-retryable-phase`,
   `automatic-recovery-channel`, `active-owner-exists`, `already-requeued`,
@@ -160,12 +162,27 @@ validation later. An unreadable forge never fails open into a requeue.
   `source-refused`.
 
 Adapter refusals settle the record `Refused` with the mapped reason, except
-the moot family (already requeued / superseded), which settles `Moot`. A
-`Moot` settlement is the fail-safe for a lost adapter response: if the source
-committed the requeue but the controller never learned, the next discovery
-pass re-offers the fresh attempt and the successor materializes anyway; a
-later replay of the same key returns the moot classification, and the record
-closes without launching anything else.
+the moot family (already requeued / superseded), which settles `Moot`. The
+two lost-response outcomes are distinct and must not be conflated:
+
+- If **this request's idempotency key committed the source transition** and
+  only the adapter's response or the controller's status write was lost,
+  replay returns the committed success — the original
+  `AttemptRequeueResult` — and the record settles `Requeued`. This is the
+  outcome that releases the discovery barrier and lets `settledPredecessor`
+  link the fresh attempt to this predecessor; it is the only deterministic
+  answer to "did this request take effect?" A committed key is never
+  reclassified moot on replay.
+- `Moot` is reserved for evidence that the work moved **without this
+  request's key**: the source holds no committed transition under this key,
+  but its state shows the item already requeued or superseded by some other
+  request or path. It is a classified refusal of a fresh presentation, not
+  a replayed result, and it never releases the barrier.
+
+A source that cannot distinguish "committed under this key" from "moved by
+something else" must not implement the capability: replaying a committed
+success as a moot classification would strand a transition that needs its
+`Requeued` settlement and suppress its replacement.
 
 ## Source requeue capability
 
@@ -275,13 +292,17 @@ The reconcile that observes a new annotation runs:
 3. **Persist `Requested`** with the derived idempotency key. From here the
    request is durable intent.
 4. **Call the adapter** with the fence and key. Outcomes: success → persist
-   `Requeued` (+ returned attempt ID); classified moot → persist `Moot`;
-   permanent refusal → persist `Refused`; transient error → leave
-   `Requested`, retry on a later reconcile with the same key.
+   `Requeued` (+ returned attempt ID); classified moot → persist `Moot`
+   (a moot classification means the source committed nothing under this
+   key — the work moved by some other path); permanent refusal → persist
+   `Refused`; transient error → leave `Requested`, retry on a later
+   reconcile with the same key.
 5. **A crash between 4 and the outcome write** is recovered by replay: the
    next reconcile re-presents the same key and the source replays its
-   committed transition. The status write is the proof of delivery, exactly
-   as the park settlement and lifecycle-report intents work.
+   committed transition under that key — the original success result — so
+   the record settles `Requeued`, never a moot classification. The status
+   write is the proof of delivery, exactly as the park settlement and
+   lifecycle-report intents work.
 
 **Retention interplay:** a run carrying a `Requested` retry record is not
 reap-eligible, by the same gate that holds a run owing a park close —
@@ -371,7 +392,7 @@ The issue's required test classes map onto the decomposition:
 | Class | Where |
 | --- | --- |
 | Duplicate retry requests | #1 controller unit + envtest: same annotation re-delivered is a no-op; a new value after `Requeued` refuses `already-requeued`; a new value after `Refused` opens a fresh request. |
-| Partial failure | #1 + #2 + #3: status write lost after adapter success → key replay settles; transient adapter error → record stays `Requested` and retries; crash between call and write covered by the replay path. |
+| Partial failure | #1 + #2 + #3: status write lost after adapter success → key replay settles `Requeued` with the original result, never `Moot`; adapter reports moved-without-this-key (no committed transition under the key) → settles `Moot`; transient adapter error → record stays `Requested` and retries; crash between call and write covered by the replay path. |
 | Closed upstream work | #1 forge guard (merged/closed fix-pr PR refuses; unreadable forge does not consume the request) and #3 adapter refusal vocabulary. |
 | Historical auditability | #1 + #2: predecessor phase, diagnostic, evidence, and report unchanged across a retry; successor named by predecessor UID; old identity stays deduped. |
 | One replacement run only | #2 runner tests (re-offer dedupe, successor naming, `Moot` keeps the barrier) and #1 (one `Requeued` per predecessor, concurrent requests resolved deterministically). |
