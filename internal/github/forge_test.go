@@ -2,6 +2,7 @@ package github
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -24,6 +25,11 @@ func TestProviderImplementsContract(t *testing.T) {
 	}
 	if got := p.Capabilities().Available(forge.CapabilityListReviews); got.Available {
 		t.Fatalf("CapabilityListReviews availability = %#v, want unavailable", got)
+	}
+	for _, capability := range []forge.Capability{forge.CapabilityListWorkItemsByLabel, forge.CapabilityRemoveWorkItemLabel} {
+		if got := p.Capabilities().Available(capability); !got.Available {
+			t.Fatalf("capability %q availability = %#v, want available", capability, got)
+		}
 	}
 }
 
@@ -564,5 +570,105 @@ func TestBoundaryErrorPreservesTransientAvailability(t *testing.T) {
 	}
 	if !forge.IsTransientAvailability(err) {
 		t.Fatalf("forge.IsTransientAvailability(dropped connection) = false, want true: %v", err)
+	}
+}
+
+// TestProviderCreatePullRequestCrossRepoHead pins the fork-backed create at
+// the provider boundary: a full trusted head identity (HeadRepo distinct
+// from the base) is sent as the GitHub "head-owner:branch" selector and the
+// legacy Head field is ignored, so a contribute publication opens from the
+// fork head into the base repository through the forge capability.
+func TestProviderCreatePullRequestCrossRepoHead(t *testing.T) {
+	var createBody struct {
+		Title string `json:"title"`
+		Head  string `json:"head"`
+		Base  string `json:"base"`
+	}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if r.Method == http.MethodPost && r.URL.Path == "/repos/acme/demo/pulls" {
+			_ = json.NewDecoder(r.Body).Decode(&createBody)
+			_, _ = io.WriteString(w, `{"number":7,"state":"open","title":"t","body":"b","draft":false,"html_url":"https://github.com/acme/demo/pull/7","head":{"ref":"goal-abc","sha":"work123","repo":{"full_name":"octo/widgets"}},"base":{"ref":"main","sha":"base123","repo":{"full_name":"acme/demo"}}}`)
+			return
+		}
+		http.NotFound(w, r)
+	}))
+	defer server.Close()
+	client, err := NewClient(server.URL, "token")
+	if err != nil {
+		t.Fatal(err)
+	}
+	p := NewProvider(forge.ProviderConfig{Name: "gh", Endpoint: server.URL, CredentialRef: "secret/gh"}, client)
+	created, err := p.CreatePullRequest(context.Background(), forge.CreatePullRequestInput{Repo: "acme/demo", Head: "model-controlled-stale-selector", HeadRepo: "octo/widgets", HeadRef: "goal-abc", Base: "main", Title: "t", Body: "b"})
+	if err != nil {
+		t.Fatalf("CreatePullRequest() error = %v", err)
+	}
+	if createBody.Head != "octo:goal-abc" || createBody.Base != "main" {
+		t.Fatalf("create request = %+v, want head octo:goal-abc into main", createBody)
+	}
+	if created.Number != 7 || created.BaseRepo != "acme/demo" || created.HeadRepo != "octo/widgets" || created.HeadRef != "goal-abc" || created.HeadSHA != "work123" {
+		t.Fatalf("CreatePullRequest() = %#v, want the full cross-repo identity from the response", created)
+	}
+}
+
+func TestProviderListWorkItemsByLabelFiltersKind(t *testing.T) {
+	t.Parallel()
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/repos/acme/demo/issues" {
+			http.NotFound(w, r)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `[{"number":5,"state":"open","title":"issue","html_url":"https://github.com/acme/demo/issues/5"},{"number":7,"state":"open","title":"pr","pull_request":{}}]`)
+	}))
+	defer server.Close()
+	client, err := NewClient(server.URL, "token")
+	if err != nil {
+		t.Fatal(err)
+	}
+	p := NewProvider(forge.ProviderConfig{Name: "gh", Endpoint: server.URL}, client)
+
+	issues, err := p.ListWorkItemsByLabel(context.Background(), "acme/demo", "courier", forge.WorkItemKindIssue)
+	if err != nil {
+		t.Fatalf("ListWorkItemsByLabel(issue): %v", err)
+	}
+	if len(issues) != 1 || issues[0].ID != "5" || issues[0].Repo != "acme/demo" || issues[0].Title != "issue" {
+		t.Fatalf("issues = %#v, want only the issue", issues)
+	}
+
+	pulls, err := p.ListWorkItemsByLabel(context.Background(), "acme/demo", "courier", forge.WorkItemKindPullRequest)
+	if err != nil {
+		t.Fatalf("ListWorkItemsByLabel(pull-request): %v", err)
+	}
+	if len(pulls) != 1 || pulls[0].ID != "7" || pulls[0].Title != "pr" {
+		t.Fatalf("pulls = %#v, want only the pull request", pulls)
+	}
+
+	if _, err := p.ListWorkItemsByLabel(context.Background(), "acme/demo", "courier", "other"); err == nil {
+		t.Fatal("ListWorkItemsByLabel with unknown kind succeeded, want error")
+	}
+}
+
+func TestProviderRemoveWorkItemLabel(t *testing.T) {
+	t.Parallel()
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodDelete || r.URL.Path != "/repos/acme/demo/issues/7/labels/courier" {
+			http.NotFound(w, r)
+			return
+		}
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer server.Close()
+	client, err := NewClient(server.URL, "token")
+	if err != nil {
+		t.Fatal(err)
+	}
+	p := NewProvider(forge.ProviderConfig{Name: "gh", Endpoint: server.URL}, client)
+
+	if err := p.RemoveWorkItemLabel(context.Background(), forge.WorkItemRef{Repo: "acme/demo", ID: "7"}, "courier"); err != nil {
+		t.Fatalf("RemoveWorkItemLabel: %v", err)
+	}
+	if err := p.RemoveWorkItemLabel(context.Background(), forge.WorkItemRef{Repo: "acme/demo", ID: "nope"}, "courier"); err == nil {
+		t.Fatal("RemoveWorkItemLabel with malformed ID succeeded, want error")
 	}
 }

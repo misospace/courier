@@ -212,3 +212,172 @@ func TestValidateLinkageRejectsBodyWithNoClosingReference(t *testing.T) {
 		t.Fatalf("err = %v, want ErrLinkageMissing", err)
 	}
 }
+
+// --- contribute-mode linkage contract (#599) ---
+
+func TestValidateContributeLinkageAcceptsNonClosingDefault(t *testing.T) {
+	source := trustedIssue()
+	// Linkage is optional and the default wording is non-closing: with no
+	// closing-keyword reference the body passes whether or not closing was
+	// ever admitted, and whether or not an upstream issue exists.
+	for _, allowClosing := range []bool{false, true} {
+		for _, body := range []string{
+			"This change ships the icon assets and updates the manifest.",
+			"Refs #502",
+			"refs misospace/miso-gallery#502",
+			"See https://github.com/misospace/miso-gallery/issues/502 for the upstream context.",
+			"",
+		} {
+			if err := ValidateContributeLinkage(body, source, allowClosing); err != nil {
+				t.Fatalf("ValidateContributeLinkage(%q, allow=%v) = %v, want nil", body, allowClosing, err)
+			}
+			if err := ValidateContributeLinkage(body, SourceIssue{}, allowClosing); err != nil {
+				t.Fatalf("no-context ValidateContributeLinkage(%q, allow=%v) = %v, want nil", body, allowClosing, err)
+			}
+		}
+	}
+}
+
+func TestValidateContributeLinkageRejectsClosingWithoutPolicyChoice(t *testing.T) {
+	source := trustedIssue()
+	for _, body := range []string{
+		"Fixes #502",
+		"Closes misospace/miso-gallery#502",
+		"Ships the assets. Resolves #502.",
+		"fixes #502",
+	} {
+		err := ValidateContributeLinkage(body, source, false)
+		if err == nil {
+			t.Fatalf("closing linkage %q accepted without an admission-time policy choice", body)
+		}
+		if !errors.Is(err, ErrClosingLinkageNotAdmitted) {
+			t.Fatalf("err = %v, want ErrClosingLinkageNotAdmitted", err)
+		}
+		var le *LinkageError
+		if !errors.As(err, &le) || len(le.Observed) == 0 {
+			t.Fatalf("structured observations missing: %v", err)
+		}
+	}
+}
+
+func TestValidateContributeLinkageAdmittedClosingMustMatchTrustedIdentity(t *testing.T) {
+	source := trustedIssue()
+	for _, body := range []string{
+		"Fixes #502",
+		"Closes misospace/miso-gallery#502",
+		"Ships the assets.\n\nFixes #502 and refs the design doc.",
+	} {
+		if err := ValidateContributeLinkage(body, source, true); err != nil {
+			t.Fatalf("admitted closing reference %q rejected: %v", body, err)
+		}
+	}
+	for _, body := range []string{
+		"Fixes #503",
+		"Closes other-org/miso-gallery#502",
+		"Fixes #502. Also closes #503.",
+	} {
+		err := ValidateContributeLinkage(body, source, true)
+		if err == nil {
+			t.Fatalf("closing reference %q accepted despite disagreeing with the trusted identity", body)
+		}
+		var le *LinkageError
+		if !errors.As(err, &le) {
+			t.Fatalf("err = %v, want a structured LinkageError", err)
+		}
+	}
+}
+
+func TestValidateContributeLinkageRejectsClosingWithoutTrustedIdentity(t *testing.T) {
+	// Even with closing admitted, a policy that carries no trusted
+	// source-issue identity cannot verify what "Fixes #N" claims.
+	err := ValidateContributeLinkage("Fixes #5", SourceIssue{}, true)
+	if err == nil {
+		t.Fatal("closing reference accepted with no trusted source-issue identity")
+	}
+	var le *LinkageError
+	if !errors.As(err, &le) {
+		t.Fatalf("err = %v, want a structured LinkageError", err)
+	}
+}
+
+// TestValidateContributeLinkageClosesOnFullURLKeyword is the URL-form
+// closing claim: GitHub applies closing keywords to full issue URLs, so the
+// contribute contract must refuse it without the policy choice and gate it
+// on the trusted identity with it. A non-closing URL mention stays the
+// accepted default.
+func TestValidateContributeLinkageClosesOnFullURLKeyword(t *testing.T) {
+	source := trustedIssue()
+	urlRef := "https://github.com/misospace/miso-gallery/issues/502"
+	if err := ValidateContributeLinkage("See also "+urlRef+" for context.", source, false); err != nil {
+		t.Fatalf("non-closing URL mention rejected: %v", err)
+	}
+	for _, body := range []string{
+		"Fixes " + urlRef,
+		"Ships the assets. Resolves " + urlRef,
+	} {
+		err := ValidateContributeLinkage(body, source, false)
+		if err == nil {
+			t.Fatalf("URL closing claim %q accepted without a policy choice", body)
+		}
+		if !errors.Is(err, ErrClosingLinkageNotAdmitted) {
+			t.Fatalf("err = %v, want ErrClosingLinkageNotAdmitted", err)
+		}
+	}
+	if err := ValidateContributeLinkage("Closes "+urlRef, source, true); err != nil {
+		t.Fatalf("admitted URL closing reference to the trusted issue rejected: %v", err)
+	}
+	for _, body := range []string{
+		"Fixes https://github.com/other/repo/issues/502",
+		"Fixes https://github.com/misospace/miso-gallery/issues/503",
+	} {
+		if err := ValidateContributeLinkage(body, source, true); err == nil {
+			t.Fatalf("URL closing reference %q accepted despite disagreeing with the trusted identity", body)
+		}
+	}
+	// The URL form reaches no closing claim under the bare-form validator,
+	// whose failure mode stays fail-closed: ValidateLinkage is unchanged.
+	if err := ValidateLinkage("Closes "+urlRef, source); !errors.Is(err, ErrLinkageMissing) {
+		t.Fatalf("ValidateLinkage URL behavior changed: %v", err)
+	}
+}
+
+// TestValidateContributeLinkageColonForms pins the GitHub-documented colon
+// syntax ("Fixes: #N", "Fixes: owner/repo#N", "Fixes: <url>") as a closing
+// claim under the contribute contract. ValidateLinkage keeps failing closed
+// on these inputs; the non-closing default must not let them slip through.
+func TestValidateContributeLinkageColonForms(t *testing.T) {
+	source := trustedIssue()
+	closing := []string{
+		"Fixes: #502",
+		"fixes:#502",
+		"Closes: misospace/miso-gallery#502",
+		"Resolves: https://github.com/misospace/miso-gallery/issues/502",
+		"Ships the icons. Fixed: https://ghe.example.com:8443/misospace/miso-gallery/issues/502",
+	}
+	for _, body := range closing {
+		err := ValidateContributeLinkage(body, source, false)
+		if err == nil {
+			t.Fatalf("colon/URL closing claim %q accepted without a policy choice", body)
+		}
+		if !errors.Is(err, ErrClosingLinkageNotAdmitted) {
+			t.Fatalf("err = %v, want ErrClosingLinkageNotAdmitted", err)
+		}
+	}
+	for _, body := range []string{"Fixes: #502", "Closes: misospace/miso-gallery#502"} {
+		if err := ValidateContributeLinkage(body, source, true); err != nil {
+			t.Fatalf("admitted colon-form reference %q rejected: %v", body, err)
+		}
+	}
+	if err := ValidateContributeLinkage("Fixed: https://ghe.example.com:8443/misospace/miso-gallery/issues/503", source, true); err == nil {
+		t.Fatal("admitted colon/URL reference accepted despite the wrong issue number")
+	}
+	// Non-closing colon prose with no issue reference is not a closing claim.
+	if err := ValidateContributeLinkage("Fixed: the icon manifest, no issue involved.", source, false); err != nil {
+		t.Fatalf("non-closing colon prose rejected: %v", err)
+	}
+	// resolve-issue semantics are unchanged: the colon form stays a fail-
+	// closed missing reference.
+	if err := ValidateLinkage("Fixes: #502", source); !errors.Is(err, ErrLinkageMissing) {
+		t.Fatalf("ValidateLinkage colon behavior changed: %v", err)
+	}
+}

@@ -186,6 +186,54 @@ func (c *Client) GetIssue(ctx context.Context, owner, repo string, number int) (
 	return out, err
 }
 
+// maxListedIssuePages caps a label listing the same way the head listing is
+// capped: an unbounded follower of a misbehaving endpoint must not turn one
+// discovery poll into an unbounded loop.
+const maxListedIssuePages = 1000
+
+// ListIssuesByLabel lists open issues and pull requests carrying the given
+// label, paginating every page. The issues API serves both kinds, so the
+// caller filters by kind; each entry carries the PullRequest marker exactly
+// when it is a pull request. The label is query-escaped, never path-joined.
+func (c *Client) ListIssuesByLabel(ctx context.Context, owner, repo, label string) ([]Issue, error) {
+	endpoint := repoEndpoint(owner, repo, "issues")
+	queryBase := "labels=" + url.QueryEscape(label) + "&state=open"
+	var out []Issue
+	for page := 1; ; page++ {
+		var current []Issue
+		query := queryBase + "&page=" + strconv.Itoa(page) + "&per_page=100"
+		err := c.doJSONQuery(ctx, http.MethodGet, endpoint, query, nil, &current)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, current...)
+		if len(current) < 100 {
+			return out, nil
+		}
+		if page == maxListedIssuePages {
+			return nil, fmt.Errorf("GitHub label listing response exceeded %d pages", maxListedIssuePages)
+		}
+	}
+}
+
+// RemoveIssueLabel removes one label from an issue or pull request. The label
+// goes to the endpoint builder unescaped: repoEndpoint path-escapes every
+// segment exactly once, so a pre-escaped label would be double-escaped on the
+// wire and silently miss. GitHub answers 404 when the label is no longer
+// attached; that is the idempotent success a retrying caller needs, not an
+// error.
+func (c *Client) RemoveIssueLabel(ctx context.Context, owner, repo string, number int, label string) error {
+	endpoint := repoEndpoint(owner, repo, "issues", strconv.Itoa(number), "labels", label)
+	if err := c.doJSON(ctx, http.MethodDelete, endpoint, nil, nil); err != nil {
+		var apiErr *APIError
+		if errors.As(err, &apiErr) && apiErr.StatusCode == http.StatusNotFound {
+			return nil
+		}
+		return err
+	}
+	return nil
+}
+
 // CreatePullRequestRequest is the payload for creating a pull request.
 type CreatePullRequestRequest struct {
 	Title string `json:"title"`

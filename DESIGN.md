@@ -2556,11 +2556,32 @@ Pluggable adapters over a generic interface. An adapter both *creates* runs and
   misospace/dispatch#1226; its task report does not settle the PR-fix queue.
   Courier still recognizes unsupported-outcome HTTP 400 responses from older
   or incompatible Dispatch servers and waits for explicit operator retry.
-- **github-label / gitlab / forgejo / tangled** — a labeled issue becomes a
-  resolve-issue run; CHANGES_REQUESTED becomes a fix-pr run.
+- **github-label (implemented; gitlab / forgejo / tangled planned)** — a
+  labeled issue becomes a resolve-issue run and a labeled pull request becomes
+  a fix-pr run. Both labels are configurable (defaults `courier` and
+  `changes-requested`; the fix label replaces the vaguer "CHANGES_REQUESTED
+  review state" trigger, which needs a PR scan the forge seam does not offer).
+  Every read and write routes through the forge capability seam's typed
+  `list-work-items-by-label` and `remove-work-item-label` capabilities — never
+  a forge-specific CLI. Label state is the source truth: claim, release, and
+  transition are no-ops (the runner's source-plus-work-identity dedupe is the
+  claim), and a settled run removes its trigger or fix label so resolved work
+  is not rediscovered after retention expires.
 - **cron** — scheduled work (the weekly audit, backlog grooming). This is what
   makes Courier the successor to the pre-Foreman cronjobs: scheduled and
-  queue-driven work collapse into one mechanism.
+  queue-driven work collapse into one mechanism. One adapter and discovery
+  runner per lane; occurrence identity is the job name plus the scheduled
+  boundary instant (`<job>@<unix-seconds>`), so repeated polls, restarts,
+  and replicas dedupe the same occurrence while future occurrences stay
+  distinct. Missed occurrences are skipped, never caught up — the in-process
+  cursor starts past every boundary before startup and never rewinds, so a
+  completed occurrence cannot be re-materialized after retention cleanup.
+  Discovery is capacity-bounded: each poll admits at most the lane's
+  remaining capacity, deferring due jobs without consuming their cursors, so
+  simultaneous boundaries cannot oversubscribe a lane. Schedule file
+  transport, timezone semantics, overlap behavior, and the at-most-once
+  delivery shape are documented in
+  [docs/cron-schedules.md](./docs/cron-schedules.md).
 - **cli / web** — ad-hoc injection: "run this issue that isn't in dispatch."
 
 Dispatch is an adapter, not a dependency. Dispatch is a separate product; Courier

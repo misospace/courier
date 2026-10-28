@@ -25,6 +25,8 @@ type Provider struct {
 var _ forge.Provider = (*Provider)(nil)
 var _ forge.RepositoryPolicyProvider = (*Provider)(nil)
 var _ forge.PullRequestHeadLister = (*Provider)(nil)
+var _ forge.LabeledWorkItemLister = (*Provider)(nil)
+var _ forge.WorkItemLabelMutator = (*Provider)(nil)
 
 // redactedError is an error whose string form was sanitized with
 // forge.RedactDetail before it crossed the forge boundary. It unwraps to the
@@ -71,6 +73,8 @@ func NewProvider(cfg forge.ProviderConfig, client *Client) *Provider {
 			forge.CapabilityCreatePullRequest,
 			forge.CapabilityUpdatePullRequest,
 			forge.CapabilityComment,
+			forge.CapabilityListWorkItemsByLabel,
+			forge.CapabilityRemoveWorkItemLabel,
 		),
 	}
 }
@@ -357,6 +361,62 @@ func (p *Provider) CommentPullRequest(ctx context.Context, ref forge.PullRequest
 		return forge.Comment{}, boundaryError(err)
 	}
 	return forge.Comment{ID: strconv.FormatInt(c.ID, 10), Body: c.Body, URL: c.HTMLURL}, nil
+}
+
+// ListWorkItemsByLabel lists the open work items carrying label in one
+// repository, filtered to exactly the requested kind. GitHub's issues listing
+// serves both issues and pull requests; the PullRequest marker on each entry
+// is the authoritative kind signal, and entries of the other kind are dropped
+// rather than laundered. The label query is the only label source of truth —
+// a response carrying a different label set than requested is still the
+// endpoint's answer for the requested filter — and listing never claims work.
+func (p *Provider) ListWorkItemsByLabel(ctx context.Context, repo, label string, kind forge.WorkItemKind) ([]forge.WorkItem, error) {
+	switch kind {
+	case forge.WorkItemKindIssue, forge.WorkItemKindPullRequest:
+	default:
+		return nil, fmt.Errorf("GitHub label listing requires kind %q or %q, got %q", forge.WorkItemKindIssue, forge.WorkItemKindPullRequest, kind)
+	}
+	owner, repoName, err := splitRepository(repo)
+	if err != nil {
+		return nil, err
+	}
+	issues, err := p.client.ListIssuesByLabel(ctx, owner, repoName, label)
+	if err != nil {
+		return nil, boundaryError(err)
+	}
+	out := make([]forge.WorkItem, 0, len(issues))
+	for _, issue := range issues {
+		if kind == forge.WorkItemKindIssue && issue.PullRequest != nil {
+			continue
+		}
+		if kind == forge.WorkItemKindPullRequest && issue.PullRequest == nil {
+			continue
+		}
+		out = append(out, forge.WorkItem{
+			ID:    strconv.Itoa(issue.Number),
+			Repo:  repo,
+			Title: issue.Title,
+			Body:  issue.Body,
+			State: issue.State,
+			URL:   issue.HTMLURL,
+		})
+	}
+	return out, nil
+}
+
+// RemoveWorkItemLabel removes one label from one work item. A 404 from the
+// forge means the label is already gone and is the idempotent success the
+// contract promises, so a retried settlement never fabricates a failure.
+func (p *Provider) RemoveWorkItemLabel(ctx context.Context, ref forge.WorkItemRef, label string) error {
+	owner, repo, err := splitRepository(ref.Repo)
+	if err != nil {
+		return err
+	}
+	number, err := strconv.Atoi(strings.TrimSpace(ref.ID))
+	if err != nil || number < 1 {
+		return fmt.Errorf("GitHub work item ID must be a positive issue number, got %q", ref.ID)
+	}
+	return boundaryError(p.client.RemoveIssueLabel(ctx, owner, repo, number, label))
 }
 
 // toForgePR maps a GitHub pull request to the provider-neutral shape. The
