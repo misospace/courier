@@ -206,9 +206,12 @@ type RetryRequest struct {
 	State RetryRequestState `json:"state"`
 	// Reason is the bounded refusal/moot reason for a settled Refused/Moot
 	// record, and empty while Requested or for a Requeued success. It is drawn
-	// only from the closed RetryRefusal* vocabulary.
+	// only from the closed RetryRefusal* vocabulary; the pattern admits the
+	// empty value plus exactly that closed set, so arbitrary reason text can
+	// never be persisted or served by the CRD.
 	// +optional
 	// +kubebuilder:validation:MaxLength=128
+	// +kubebuilder:validation:Pattern=`^(|not-retryable-phase|automatic-recovery-channel|active-owner-exists|already-requeued|upstream-closed|unsupported-source|stale-generation|source-refused|held-for-human)$`
 	Reason string `json:"reason"`
 	// AttemptID is the fresh source attempt identity the adapter returned when
 	// it requeued, if the source exposes one. Empty means the source requeued
