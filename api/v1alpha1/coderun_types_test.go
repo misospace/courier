@@ -307,9 +307,10 @@ func specFixture(mode Mode) CoderRunSpec {
 }
 
 // TestCoderRunSpecModeValidation enforces the mode-dependent spec rules
-// through the API server: a contribute run needs base repo, workRepo, and a
-// goal-bearing SourceContext and must not carry a ref; resolve-issue and
-// fix-pr validation is unchanged (ref required, no workRepo).
+// through the API server: contribute is accepted with base repo, workRepo,
+// and a goal-bearing SourceContext, and rejected when workRepo is missing
+// or a ref is carried; resolve-issue and fix-pr validation is unchanged
+// (ref required, no workRepo).
 func TestCoderRunSpecModeValidation(t *testing.T) {
 	if envtestClient == nil {
 		t.Skip("KUBEBUILDER_ASSETS is not set")
@@ -434,10 +435,10 @@ func TestCoderRunSpecOptionalFieldsWire(t *testing.T) {
 	}
 }
 
-// TestCoderRunSpecExplicitZeroRefRejected pins the wire-level bound an
-// omitempty typed writer cannot express: a submitted spec.ref of 0 is
-// rejected by the minimum, so a contribute run never distinguishes "zero"
-// from "absent" in stored state.
+// TestCoderRunSpecExplicitZeroRefRejected pins the minimum bound a typed
+// omitempty writer cannot submit: a raw spec.ref of 0 is refused by the
+// minimum in every mode (for contribute the mode rule fires alongside it),
+// so stored state never distinguishes a zero ref from an absent one.
 func TestCoderRunSpecExplicitZeroRefRejected(t *testing.T) {
 	if envtestClient == nil {
 		t.Skip("KUBEBUILDER_ASSETS is not set")
@@ -462,10 +463,18 @@ func TestCoderRunSpecExplicitZeroRefRejected(t *testing.T) {
 				},
 			}}
 			if mode == ModeContribute {
-				unstructured.SetNestedField(obj.Object, "contributor/fork", "spec", "workRepo")
+				if err := unstructured.SetNestedField(obj.Object, "contributor/fork", "spec", "workRepo"); err != nil {
+					t.Fatalf("set workRepo: %v", err)
+				}
 			}
-			if err := envtestClient.Create(ctx, obj); err == nil {
+			err := envtestClient.Create(ctx, obj)
+			if err == nil {
 				t.Fatalf("accepted explicit spec.ref: 0 for %s mode", mode)
+			}
+			// The minimum, not the mode rule or the enum, must be the
+			// binding rejection in both modes.
+			if !strings.Contains(err.Error(), "spec.ref") || !strings.Contains(err.Error(), "greater than or equal to 1") {
+				t.Fatalf("expected a spec.ref minimum rejection for %s mode, got %v", mode, err)
 			}
 		})
 	}
