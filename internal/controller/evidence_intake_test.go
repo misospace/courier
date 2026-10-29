@@ -1863,3 +1863,30 @@ func writeTestFile(t *testing.T, path, content string) {
 		t.Fatal(err)
 	}
 }
+
+// TestEvidenceIntakeRejectsForeignNamespaceRun is the ownership-boundary
+// gate (#632): a capture authenticated with this release's key but naming a
+// run outside the owned namespaces is refused after the HMAC check and
+// before any Secret is written, so a shared HMAC key can never make one
+// release's intake a writer inside another release's namespaces. An owned
+// capture with the same fixture still persists.
+func TestEvidenceIntakeRejectsForeignNamespaceRun(t *testing.T) {
+	t.Parallel()
+	foreign := newIntakeRun("foreign-intake-run", "production-v1", "uid-foreign", courierv1alpha1.PhaseFailed)
+	owned := newIntakeRun("owned-intake-run", "courier-runs", "uid-owned", courierv1alpha1.PhaseFailed)
+	i, _ := newIntake(t, testKey, foreign, executor.PodConfig{}, owned)
+	i.OwnedNamespaces = []string{"courier-runs"}
+
+	m := sampleIntakeManifest(foreign, "benign")
+	req, _ := intakeRequest(t, testKey, foreign, m, map[string][]byte{"src/a.go": []byte("benign")}, testNonce())
+	if rec := doIntake(i, req); rec.Code != http.StatusForbidden {
+		t.Fatalf("foreign capture code = %d, want 403; body = %s", rec.Code, rec.Body.String())
+	}
+	requireNoSecret(t, i, foreign.Name, foreign.Namespace, testNonce())
+
+	m = sampleIntakeManifest(owned, "benign")
+	req, _ = intakeRequest(t, testKey, owned, m, map[string][]byte{"src/a.go": []byte("benign")}, testNonce())
+	if rec := doIntake(i, req); rec.Code != http.StatusOK {
+		t.Fatalf("owned capture code = %d, want 200; body = %s", rec.Code, rec.Body.String())
+	}
+}

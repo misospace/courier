@@ -701,9 +701,14 @@ func TestChartRendersSecureTopologyConfiguration(t *testing.T) {
 		"--set", "secure.providers[0].name=github",
 		"--set", "secure.providers[0].type=github",
 		"--set", "secure.providers[0].endpoint=https://api.github.com/",
+		"--set", "secure.providers[0].serves[0]=misospace/*",
+		"--set", "secure.providers[0].credentials.forge-api.secretName=forge-creds",
+		"--set", "secure.providers[0].credentials.forge-api.key=token",
 		"--set", "secure.providers[0].credentials.forge-api.secretName=forge-creds",
 		"--set", "secure.providers[0].credentials.forge-api.key=token",
 		"--set", "secure.providers[0].serves[0]=misospace/*",
+		"--set", "secure.providers[0].credentials.forge-api.secretName=forge-creds",
+		"--set", "secure.providers[0].credentials.forge-api.key=token",
 		"--set", "secure.dependencyCacheService=cache-system/go-cache",
 		"--set", "secure.modelGateway.url=http://litellm:4000/v1",
 		"--set", "secure.modelGateway.keySecret=gateway-key",
@@ -1178,5 +1183,364 @@ func TestChartRejectsInvalidCronValues(t *testing.T) {
 	}
 	if !strings.Contains(overridden, "--cron-poll-interval=45s") {
 		t.Fatalf("cron poll interval lost under explicit-arg precedence")
+	}
+}
+
+func TestChartRendersSideBySideOwnershipConfiguration(t *testing.T) {
+	if _, err := exec.LookPath("helm"); err != nil {
+		t.Skip("helm is not installed")
+	}
+
+	chartDir := copyChart(t)
+	runHelm(t, chartDir, "dependency", "build")
+
+	// The default install carries no ownership surface at all: one
+	// controller keeps the backward-compatible boundary.
+	unscoped := runHelm(t, chartDir, "template", "courier", ".")
+	for _, unwanted := range []string{"--owned-namespace", "--leader-election-id", "--broker-tokenreview-cluster-role"} {
+		if strings.Contains(unscoped, unwanted) {
+			t.Fatalf("default chart output unexpectedly contains %q", unwanted)
+		}
+	}
+	if !strings.Contains(unscoped, "kind: CustomResourceDefinition") {
+		t.Fatal("default chart output must still render the CRDs")
+	}
+
+	// A secure canary beside v1: owned run namespace, distinct lease,
+	// distinct broker TokenReview ClusterRole, CRDs managed out-of-band.
+	scoped := runHelm(t, chartDir, "template", "courier-native", ".",
+		"--namespace", "courier-native-system",
+		"--set", "crds.enabled=false",
+		"--set", "secure.enabled=true",
+		"--set", "secure.runNamespace=courier-runs",
+		"--set", "secure.providers[0].name=github",
+		"--set", "secure.providers[0].type=github",
+		"--set", "secure.providers[0].endpoint=https://api.github.com/",
+		"--set", "secure.providers[0].serves[0]=misospace/*",
+		"--set", "secure.providers[0].credentials.forge-api.secretName=forge-creds",
+		"--set", "secure.providers[0].credentials.forge-api.key=token",
+		"--set", "secure.brokerTokenReviewClusterRole=courier-native-broker-tokenreview",
+		"--set", "ownership.namespaces[0]=courier-runs",
+		"--set", "ownership.leaderElectionID=courier-native.misospace.dev",
+	)
+	for _, want := range []string{
+		"--owned-namespace=courier-runs",
+		"--leader-election-id=courier-native.misospace.dev",
+		"--broker-tokenreview-cluster-role=courier-native-broker-tokenreview",
+		"name: courier-native-broker-tokenreview",
+	} {
+		if !strings.Contains(scoped, want) {
+			t.Fatalf("scoped chart output missing %q", want)
+		}
+	}
+	if strings.Contains(scoped, "kind: CustomResourceDefinition") {
+		t.Fatal("crds.enabled=false must render no CRDs so a second release never claims them")
+	}
+	if strings.Contains(scoped, "name: courier-broker-tokenreview\n") {
+		t.Fatal("an overridden broker TokenReview name must replace the historical name entirely")
+	}
+
+	// An explicit arg equal to the value stays valid; a contradicting one
+	// fails instead of binding brokers to a ClusterRole that is never
+	// rendered.
+	aligned := runHelm(t, chartDir, "template", "courier-native", ".",
+		"--set", "secure.enabled=true",
+		"--set", "secure.runNamespace=courier-runs",
+		"--set", "secure.providers[0].name=github",
+		"--set", "secure.providers[0].type=github",
+		"--set", "secure.providers[0].endpoint=https://api.github.com/",
+		"--set", "secure.providers[0].serves[0]=misospace/*",
+		"--set", "secure.providers[0].credentials.forge-api.secretName=forge-creds",
+		"--set", "secure.providers[0].credentials.forge-api.key=token",
+		"--set", "secure.brokerTokenReviewClusterRole=courier-native-broker-tokenreview",
+		"--set-string", "controllers.main.containers.main.args[0]=--leader-elect",
+		"--set-string", "controllers.main.containers.main.args[1]=--broker-tokenreview-cluster-role=courier-native-broker-tokenreview",
+	)
+	if count := strings.Count(aligned, "--broker-tokenreview-cluster-role="); count != 1 {
+		t.Fatalf("aligned explicit arg produced %d broker TokenReview flags, want exactly 1", count)
+	}
+	out, err := runHelmOutput(t, chartDir, "template", "courier-native", ".",
+		"--set", "secure.enabled=true",
+		"--set", "secure.runNamespace=courier-runs",
+		"--set", "secure.providers[0].name=github",
+		"--set", "secure.providers[0].type=github",
+		"--set", "secure.providers[0].endpoint=https://api.github.com/",
+		"--set", "secure.providers[0].serves[0]=misospace/*",
+		"--set", "secure.providers[0].credentials.forge-api.secretName=forge-creds",
+		"--set", "secure.providers[0].credentials.forge-api.key=token",
+		"--set", "secure.brokerTokenReviewClusterRole=courier-native-broker-tokenreview",
+		"--set-string", "controllers.main.containers.main.args[0]=--broker-tokenreview-cluster-role=some-other-role",
+	)
+	if err == nil || !strings.Contains(out, "contradicts the rendered broker TokenReview ClusterRole") {
+		t.Fatalf("expected a contradicting explicit broker role arg to fail, err = %v:\n%s", err, out)
+	}
+
+	// With the value left empty the chart renders the historical ClusterRole
+	// name: an aligned explicit arg stays valid, a contradicting one fails
+	// instead of binding brokers to a ClusterRole that is never rendered.
+	historical := runHelm(t, chartDir, "template", "courier-historical", ".",
+		"--set", "secure.enabled=true",
+		"--set", "secure.runNamespace=courier-runs",
+		"--set", "secure.providers[0].name=github",
+		"--set", "secure.providers[0].type=github",
+		"--set", "secure.providers[0].endpoint=https://api.github.com/",
+		"--set", "secure.providers[0].serves[0]=misospace/*",
+		"--set", "secure.providers[0].credentials.forge-api.secretName=forge-creds",
+		"--set", "secure.providers[0].credentials.forge-api.key=token",
+		"--set-string", "controllers.main.containers.main.args[0]=--broker-tokenreview-cluster-role=courier-broker-tokenreview",
+	)
+	if count := strings.Count(historical, "--broker-tokenreview-cluster-role="); count != 1 {
+		t.Fatalf("historical-aligned explicit arg produced %d broker TokenReview flags, want exactly 1", count)
+	}
+	if !strings.Contains(historical, "name: courier-broker-tokenreview") {
+		t.Fatal("historical-aligned explicit arg must render the ClusterRole under the historical name")
+	}
+	out, err = runHelmOutput(t, chartDir, "template", "courier-historical", ".",
+		"--set", "secure.enabled=true",
+		"--set", "secure.runNamespace=courier-runs",
+		"--set", "secure.providers[0].name=github",
+		"--set", "secure.providers[0].type=github",
+		"--set", "secure.providers[0].endpoint=https://api.github.com/",
+		"--set", "secure.providers[0].serves[0]=misospace/*",
+		"--set", "secure.providers[0].credentials.forge-api.secretName=forge-creds",
+		"--set", "secure.providers[0].credentials.forge-api.key=token",
+		"--set-string", "controllers.main.containers.main.args[0]=--broker-tokenreview-cluster-role=some-other-role",
+	)
+	if err == nil || !strings.Contains(out, "contradicts the rendered broker TokenReview ClusterRole") {
+		t.Fatalf("expected a contradicting explicit broker role arg to fail with an empty value, err = %v:\n%s", err, out)
+	}
+
+	// The bare "--broker-tokenreview-cluster-role <name>" form is parsed by
+	// the operator's flag parser too: an aligned bare pair stays valid, a
+	// contradicting one fails, and a bare flag with no capturable value
+	// fails at render instead of surfacing as an operator flag-parse error.
+	bareAligned := runHelm(t, chartDir, "template", "courier-native", ".",
+		"--set", "secure.enabled=true",
+		"--set", "secure.runNamespace=courier-runs",
+		"--set", "secure.providers[0].name=github",
+		"--set", "secure.providers[0].type=github",
+		"--set", "secure.providers[0].endpoint=https://api.github.com/",
+		"--set", "secure.providers[0].serves[0]=misospace/*",
+		"--set", "secure.providers[0].credentials.forge-api.secretName=forge-creds",
+		"--set", "secure.providers[0].credentials.forge-api.key=token",
+		"--set", "secure.brokerTokenReviewClusterRole=courier-native-broker-tokenreview",
+		"--set-string", "controllers.main.containers.main.args[0]=--broker-tokenreview-cluster-role",
+		"--set-string", "controllers.main.containers.main.args[1]=courier-native-broker-tokenreview",
+	)
+	if count := strings.Count(bareAligned, "--broker-tokenreview-cluster-role="); count != 0 {
+		t.Fatalf("aligned bare broker role arg produced %d generated equals-form flags, want 0", count)
+	}
+	if !strings.Contains(bareAligned, "- --broker-tokenreview-cluster-role\n") || !strings.Contains(bareAligned, "- courier-native-broker-tokenreview\n") {
+		t.Fatal("aligned bare broker role pair must survive rendering as container args")
+	}
+	if !strings.Contains(bareAligned, "name: courier-native-broker-tokenreview") {
+		t.Fatal("aligned bare broker role arg must still render the ClusterRole")
+	}
+	out, err = runHelmOutput(t, chartDir, "template", "courier-native", ".",
+		"--set", "secure.enabled=true",
+		"--set", "secure.runNamespace=courier-runs",
+		"--set", "secure.providers[0].name=github",
+		"--set", "secure.providers[0].type=github",
+		"--set", "secure.providers[0].endpoint=https://api.github.com/",
+		"--set", "secure.providers[0].serves[0]=misospace/*",
+		"--set", "secure.providers[0].credentials.forge-api.secretName=forge-creds",
+		"--set", "secure.providers[0].credentials.forge-api.key=token",
+		"--set", "secure.brokerTokenReviewClusterRole=courier-native-broker-tokenreview",
+		"--set-string", "controllers.main.containers.main.args[0]=--broker-tokenreview-cluster-role",
+		"--set-string", "controllers.main.containers.main.args[1]=some-other-role",
+	)
+	if err == nil || !strings.Contains(out, "contradicts the rendered broker TokenReview ClusterRole") {
+		t.Fatalf("expected a contradicting bare broker role arg to fail, err = %v:\n%s", err, out)
+	}
+	out, err = runHelmOutput(t, chartDir, "template", "courier-native", ".",
+		"--set", "secure.enabled=true",
+		"--set", "secure.runNamespace=courier-runs",
+		"--set", "secure.providers[0].name=github",
+		"--set", "secure.providers[0].type=github",
+		"--set", "secure.providers[0].endpoint=https://api.github.com/",
+		"--set", "secure.providers[0].serves[0]=misospace/*",
+		"--set", "secure.providers[0].credentials.forge-api.secretName=forge-creds",
+		"--set", "secure.providers[0].credentials.forge-api.key=token",
+		"--set-string", "controllers.main.containers.main.args[0]=--broker-tokenreview-cluster-role",
+		"--set-string", "controllers.main.containers.main.args[1]=--leader-elect",
+	)
+	if err == nil || !strings.Contains(out, "has no value at render time") {
+		t.Fatalf("expected a bare broker role arg with a flag-like value to fail, err = %v:\n%s", err, out)
+	}
+
+	// A bare flag as the final argument has no next argument to consume.
+	out, err = runHelmOutput(t, chartDir, "template", "courier-native", ".",
+		"--set", "secure.enabled=true",
+		"--set", "secure.runNamespace=courier-runs",
+		"--set", "secure.providers[0].name=github",
+		"--set", "secure.providers[0].type=github",
+		"--set", "secure.providers[0].endpoint=https://api.github.com/",
+		"--set", "secure.providers[0].serves[0]=misospace/*",
+		"--set", "secure.providers[0].credentials.forge-api.secretName=forge-creds",
+		"--set", "secure.providers[0].credentials.forge-api.key=token",
+		"--set-string", "controllers.main.containers.main.args[0]=--broker-tokenreview-cluster-role",
+	)
+	if err == nil || !strings.Contains(out, "has no value at render time") {
+		t.Fatalf("expected a bare broker role arg with no following argument to fail, err = %v:\n%s", err, out)
+	}
+
+	// The single-dash form is accepted by the operator's flag parser too:
+	// a contradicting one fails at render.
+	out, err = runHelmOutput(t, chartDir, "template", "courier-native", ".",
+		"--set", "secure.enabled=true",
+		"--set", "secure.runNamespace=courier-runs",
+		"--set", "secure.providers[0].name=github",
+		"--set", "secure.providers[0].type=github",
+		"--set", "secure.providers[0].endpoint=https://api.github.com/",
+		"--set", "secure.providers[0].serves[0]=misospace/*",
+		"--set", "secure.providers[0].credentials.forge-api.secretName=forge-creds",
+		"--set", "secure.providers[0].credentials.forge-api.key=token",
+		"--set", "secure.brokerTokenReviewClusterRole=courier-native-broker-tokenreview",
+		"--set-string", "controllers.main.containers.main.args[0]=-broker-tokenreview-cluster-role=some-other-role",
+	)
+	if err == nil || !strings.Contains(out, "contradicts the rendered broker TokenReview ClusterRole") {
+		t.Fatalf("expected a contradicting single-dash broker role arg to fail, err = %v:\n%s", err, out)
+	}
+}
+
+func TestChartRejectsOwnershipBoundaryThatStrandsRuns(t *testing.T) {
+	if _, err := exec.LookPath("helm"); err != nil {
+		t.Skip("helm is not installed")
+	}
+
+	chartDir := copyChart(t)
+	runHelm(t, chartDir, "dependency", "build")
+
+	secureBase := []string{
+		"--set", "secure.enabled=true",
+		"--set", "secure.runNamespace=courier-runs",
+		"--set", "secure.providers[0].name=github",
+		"--set", "secure.providers[0].type=github",
+		"--set", "secure.providers[0].endpoint=https://api.github.com/",
+		"--set", "secure.providers[0].serves[0]=misospace/*",
+		"--set", "secure.providers[0].credentials.forge-api.secretName=forge-creds",
+		"--set", "secure.providers[0].credentials.forge-api.key=token",
+	}
+
+	// The boundary must carry secure.runNamespace, or the secure controller
+	// owns nothing.
+	out, err := runHelmOutput(t, chartDir,
+		append(append([]string{"template", "courier", "."}, secureBase...), "--set", "ownership.namespaces[0]=somewhere-else")...)
+	if err == nil || !strings.Contains(out, "must appear in ownership.namespaces") {
+		t.Fatalf("expected a boundary excluding secure.runNamespace to fail, err = %v:\n%s", err, out)
+	}
+
+	// Discovery materializes runs in the release namespace; a boundary that
+	// excludes it would strand every discovered run.
+	out, err = runHelmOutput(t, chartDir, "template", "courier", ".",
+		"--namespace", "courier-system",
+		"--set", "dispatch.enabled=true",
+		"--set", "dispatch.baseURL=https://dispatch.example.test",
+		"--set", "dispatch.agentName=example-agent",
+		"--set", "dispatch.queueLane=queue-x",
+		"--set", "dispatch.laneProfile=lane-y",
+		"--set", "dispatch.tokenSecret.name=dispatch-token-secret",
+		"--set", "ownership.namespaces[0]=somewhere-else",
+	)
+	if err == nil || !strings.Contains(out, "do not own") {
+		t.Fatalf("expected a boundary excluding the discovery namespace to fail, err = %v:\n%s", err, out)
+	}
+
+	// An explicit --owned-namespace arg is the effective boundary: the same
+	// couplings must apply to it, and it must not be silently overridden by
+	// ownership.namespaces.
+	out, err = runHelmOutput(t, chartDir,
+		append(append([]string{"template", "courier", "."}, secureBase...),
+			"--set-string", "controllers.main.containers.main.args[0]=--owned-namespace=somewhere-else")...)
+	if err == nil || !strings.Contains(out, "must appear in explicit --owned-namespace args") {
+		t.Fatalf("expected an explicit boundary excluding secure.runNamespace to fail, err = %v:\n%s", err, out)
+	}
+
+	aligned := runHelm(t, chartDir,
+		append(append([]string{"template", "courier", "."}, secureBase...),
+			"--set-string", "controllers.main.containers.main.args[0]=--owned-namespace=courier-runs")...)
+	if count := strings.Count(aligned, "--owned-namespace="); count != 1 {
+		t.Fatalf("aligned explicit owned-namespace arg produced %d owned-namespace flags, want exactly 1", count)
+	}
+
+	// The bare flag form takes its value from the next argument, so the
+	// couplings see the same effective list.
+	bare := runHelm(t, chartDir,
+		append(append([]string{"template", "courier", "."}, secureBase...),
+			"--set-string", "controllers.main.containers.main.args[0]=--owned-namespace",
+			"--set-string", "controllers.main.containers.main.args[1]=courier-runs")...)
+	if count := strings.Count(bare, "--owned-namespace"); count != 1 {
+		t.Fatalf("bare explicit owned-namespace arg produced %d owned-namespace flags, want exactly 1", count)
+	}
+
+	// The operator's flag parser consumes the next argument after a bare
+	// --owned-namespace unconditionally, so a bare flag without a capturable
+	// value fails at render.
+	out, err = runHelmOutput(t, chartDir, "template", "courier", ".",
+		"--set-string", "controllers.main.containers.main.args[0]=--owned-namespace")
+	if err == nil || !strings.Contains(out, "has no value at render time") {
+		t.Fatalf("expected a bare owned-namespace flag without a value to fail, err = %v:\n%s", err, out)
+	}
+
+	// Explicit args and agreeing ownership.namespaces render the explicit
+	// boundary exactly once.
+	agreeing := runHelm(t, chartDir,
+		append(append([]string{"template", "courier", "."}, secureBase...),
+			"--set-string", "controllers.main.containers.main.args[0]=--owned-namespace=courier-runs",
+			"--set", "ownership.namespaces[0]=courier-runs")...)
+	if count := strings.Count(agreeing, "--owned-namespace="); count != 1 {
+		t.Fatalf("agreeing explicit arg and ownership.namespaces produced %d owned-namespace flags, want exactly 1", count)
+	}
+
+	out, err = runHelmOutput(t, chartDir,
+		append(append([]string{"template", "courier", "."}, secureBase...),
+			"--set-string", "controllers.main.containers.main.args[0]=--owned-namespace=somewhere-else",
+			"--set", "ownership.namespaces[0]=courier-runs")...)
+	if err == nil || !strings.Contains(out, "disagree") {
+		t.Fatalf("expected contradicting explicit args and ownership.namespaces to fail, err = %v:\n%s", err, out)
+	}
+
+	out, err = runHelmOutput(t, chartDir, "template", "courier", ".",
+		"--namespace", "courier-system",
+		"--set", "dispatch.enabled=true",
+		"--set", "dispatch.baseURL=https://dispatch.example.test",
+		"--set", "dispatch.agentName=example-agent",
+		"--set", "dispatch.queueLane=queue-x",
+		"--set", "dispatch.laneProfile=lane-y",
+		"--set", "dispatch.tokenSecret.name=dispatch-token-secret",
+		"--set-string", "controllers.main.containers.main.args[0]=--owned-namespace=somewhere-else",
+	)
+	if err == nil || !strings.Contains(out, "do not own") {
+		t.Fatalf("expected an explicit boundary excluding the discovery namespace to fail, err = %v:\n%s", err, out)
+	}
+
+	// An explicit owned namespace name that is not a DNS-1123 label fails at
+	// render too.
+	out, err = runHelmOutput(t, chartDir, "template", "courier", ".",
+		"--set-string", "controllers.main.containers.main.args[0]=--owned-namespace=Bad_Name")
+	if err == nil || !strings.Contains(out, "DNS-1123 label") {
+		t.Fatalf("expected an invalid explicit owned namespace to fail, err = %v:\n%s", err, out)
+	}
+
+	// A secure release with discovery and no explicit list derives a
+	// boundary of just secure.runNamespace, so it must live there.
+	out, err = runHelmOutput(t, chartDir,
+		append(append([]string{"template", "courier", "."}, secureBase...),
+			"--namespace", "courier-system",
+			"--set", "dispatch.enabled=true",
+			"--set", "dispatch.baseURL=https://dispatch.example.test",
+			"--set", "dispatch.agentName=example-agent",
+			"--set", "dispatch.queueLane=queue-x",
+			"--set", "dispatch.laneProfile=lane-y",
+			"--set", "dispatch.tokenSecret.name=dispatch-token-secret")...)
+	if err == nil || !strings.Contains(out, "must be deployed there") {
+		t.Fatalf("expected secure discovery outside secure.runNamespace to fail, err = %v:\n%s", err, out)
+	}
+
+	// An owned namespace name that is not a DNS-1123 label fails at render.
+	out, err = runHelmOutput(t, chartDir, "template", "courier", ".",
+		"--set", "ownership.namespaces[0]=Bad_Name")
+	if err == nil || !strings.Contains(out, "DNS-1123 label") {
+		t.Fatalf("expected an invalid owned namespace to fail, err = %v:\n%s", err, out)
 	}
 }

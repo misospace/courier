@@ -685,7 +685,7 @@ func (s *SecureControl) Revoke(ctx context.Context, run *courier.CoderRun) (bool
 		saObject(namespace, topology.WorkerSAName(runName)),
 		topology.BrokerRole(run),
 		topology.BrokerRoleBinding(run),
-		topology.BrokerTokenReviewBinding(run),
+		topology.BrokerTokenReviewBinding(run, s.tokenReviewClusterRole()),
 	}
 	for _, object := range objects {
 		if err := s.Client.Delete(ctx, object); client.IgnoreNotFound(err) != nil {
@@ -735,7 +735,7 @@ func (s *SecureControl) provisionStatic(ctx context.Context, run *courier.CoderR
 	if err := s.ensureObject(ctx, topology.BrokerRoleBinding(run)); err != nil {
 		return err
 	}
-	if err := s.ensureObject(ctx, topology.BrokerTokenReviewBinding(run)); err != nil {
+	if err := s.ensureObject(ctx, topology.BrokerTokenReviewBinding(run, s.tokenReviewClusterRole())); err != nil {
 		return err
 	}
 	for _, policy := range topology.NetworkPolicies(run, s.cachePointer(ctx), s.gatewayPointer()) {

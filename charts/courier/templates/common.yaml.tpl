@@ -224,7 +224,9 @@
 {{- $hasProbeImage := false }}
 {{- $hasCacheService := false }}
 {{- $hasCachePort := false }}
-{{- range $arg := $args }}
+{{- $hasBrokerTokenReviewRole := false }}
+{{- $explicitBrokerTokenReviewRole := "" }}
+{{- range $i, $arg := $args }}
 {{- if hasPrefix "--secure-mode=" $arg }}{{- $hasSecureMode = true }}{{- end }}
 {{- if hasPrefix "--forge-providers-file=" $arg }}{{- $hasProvidersFile = true }}{{- end }}
 {{- if hasPrefix "--run-namespace=" $arg }}{{- $hasRunNamespace = true }}{{- end }}
@@ -232,6 +234,16 @@
 {{- if hasPrefix "--probe-image=" $arg }}{{- $hasProbeImage = true }}{{- end }}
 {{- if hasPrefix "--dependency-cache-service=" $arg }}{{- $hasCacheService = true }}{{- end }}
 {{- if hasPrefix "--dependency-cache-port=" $arg }}{{- $hasCachePort = true }}{{- end }}
+{{- if hasPrefix "--broker-tokenreview-cluster-role=" $arg }}{{- $hasBrokerTokenReviewRole = true }}{{- $explicitBrokerTokenReviewRole = $arg }}
+{{- else if hasPrefix "-broker-tokenreview-cluster-role=" $arg }}{{- $hasBrokerTokenReviewRole = true }}{{- $explicitBrokerTokenReviewRole = printf "--%s" (trimPrefix "-" $arg) }}
+{{- else if or (eq $arg "--broker-tokenreview-cluster-role") (eq $arg "-broker-tokenreview-cluster-role") }}
+{{- $hasBrokerTokenReviewRole = true }}
+{{- if and (lt (add1 $i) (len $args)) (not (hasPrefix "-" (index $args (add1 $i)))) }}
+{{- $explicitBrokerTokenReviewRole = printf "--broker-tokenreview-cluster-role=%s" (index $args (add1 $i)) }}
+{{- else }}
+{{- fail "a bare --broker-tokenreview-cluster-role argument has no value at render time: the operator's flag parser consumes the next argument, so pass --broker-tokenreview-cluster-role=<name> or a value that does not start with '-'" }}
+{{- end }}
+{{- end }}
 {{- end }}
 {{- if not $hasSecureMode }}{{- $args = append $args "--secure-mode=true" }}{{- end }}
 {{- if not $hasProvidersFile }}{{- $args = append $args "--forge-providers-file=/etc/courier/forge-providers.json" }}{{- end }}
@@ -246,6 +258,14 @@
 {{- if $secure.dependencyCachePort }}
 {{- if not $hasCachePort }}{{- $args = append $args (printf "--dependency-cache-port=%d" (int $secure.dependencyCachePort)) }}{{- end }}
 {{- end }}
+{{- end }}
+{{- $effectiveBrokerTokenReviewRole := $secure.brokerTokenReviewClusterRole | default "courier-broker-tokenreview" }}
+{{- if $hasBrokerTokenReviewRole }}
+{{- if ne $explicitBrokerTokenReviewRole (printf "--broker-tokenreview-cluster-role=%s" $effectiveBrokerTokenReviewRole) }}
+{{- fail (printf "explicit arg %s contradicts the rendered broker TokenReview ClusterRole %q (secure.brokerTokenReviewClusterRole=%q): the chart renders the ClusterRole under a name the operator never binds" $explicitBrokerTokenReviewRole $effectiveBrokerTokenReviewRole $secure.brokerTokenReviewClusterRole) }}
+{{- end }}
+{{- else if $secure.brokerTokenReviewClusterRole }}
+{{- $args = append $args (printf "--broker-tokenreview-cluster-role=%s" $effectiveBrokerTokenReviewRole) }}
 {{- end }}
 {{- if $secure.modelGateway }}
 {{- if $secure.modelGateway.url }}
@@ -410,6 +430,79 @@
 {{- if and $retention.failed (not $hasFailedRetention) }}{{- $args = append $args (printf "--failed-retention=%s" $retention.failed) }}{{- end }}
 {{- if and $retention.needsHuman (not $hasNeedsHumanRetention) }}{{- $args = append $args (printf "--needs-human-retention=%s" $retention.needsHuman) }}{{- end }}
 {{- if and $retention.auditKeep (not $hasAuditKeep) }}{{- $args = append $args (printf "--terminal-audit-keep=%d" (int $retention.auditKeep)) }}{{- end }}
+{{- end }}
+{{- $ownership := .Values.ownership | default (dict) }}
+{{- $valueOwned := $ownership.namespaces | default (list) }}
+{{- $hasLeaderElectionID := false }}
+{{- $explicitOwned := list }}
+{{- $hasExplicitOwned := false }}
+{{- $argCount := len $args }}
+{{- range $i, $arg := $args }}
+{{- if hasPrefix "--leader-election-id=" $arg }}{{- $hasLeaderElectionID = true }}{{- end }}
+{{- if hasPrefix "--owned-namespace=" $arg }}
+{{- $hasExplicitOwned = true }}
+{{- $explicitOwned = append $explicitOwned (trimPrefix "--owned-namespace=" $arg) }}
+{{- else if eq $arg "--owned-namespace" }}
+{{- $hasExplicitOwned = true }}
+{{- if and (lt (add1 $i) $argCount) (not (hasPrefix "-" (index $args (add1 $i)))) }}
+{{- $explicitOwned = append $explicitOwned (index $args (add1 $i)) }}
+{{- else }}
+{{- fail "a bare --owned-namespace argument has no value at render time: the operator's flag parser consumes the next argument, so pass --owned-namespace=<namespace> or a value that does not start with '-'" }}
+{{- end }}
+{{- end }}
+{{- end }}
+{{- if and $hasExplicitOwned $valueOwned }}
+{{- range $namespace := $valueOwned }}
+{{- if not (has $namespace $explicitOwned) }}
+{{- fail (printf "ownership.namespaces %v are ignored because explicit --owned-namespace args are present and render the boundary %v: the two disagree" $valueOwned $explicitOwned) }}
+{{- end }}
+{{- end }}
+{{- range $namespace := $explicitOwned }}
+{{- if not (has $namespace $valueOwned) }}
+{{- fail (printf "explicit --owned-namespace args %v disagree with ownership.namespaces %v: the values are ignored by the operator" $explicitOwned $valueOwned) }}
+{{- end }}
+{{- end }}
+{{- end }}
+{{- if not $hasExplicitOwned }}
+{{- range $namespace := $valueOwned }}
+{{- if or (not (regexMatch "^[a-z0-9]([-a-z0-9]*[a-z0-9])?$" $namespace)) (gt (len $namespace) 63) }}
+{{- fail (printf "ownership.namespaces entry %q must be a valid DNS-1123 label (lowercase alphanumeric or '-', at most 63 characters, starting and ending with an alphanumeric)" $namespace) }}
+{{- end }}
+{{- $args = append $args (printf "--owned-namespace=%s" $namespace) }}
+{{- end }}
+{{- else }}
+{{- range $namespace := $explicitOwned }}
+{{- if or (not (regexMatch "^[a-z0-9]([-a-z0-9]*[a-z0-9])?$" $namespace)) (gt (len $namespace) 63) }}
+{{- fail (printf "--owned-namespace entry %q must be a valid DNS-1123 label (lowercase alphanumeric or '-', at most 63 characters, starting and ending with an alphanumeric)" $namespace) }}
+{{- end }}
+{{- end }}
+{{- end }}
+{{- if $ownership.leaderElectionID }}
+{{- if not (regexMatch "^[a-z0-9]([-a-z0-9.]*[a-z0-9])?$" $ownership.leaderElectionID) }}
+{{- fail (printf "ownership.leaderElectionID %q must be a lowercase DNS-1123 subdomain" $ownership.leaderElectionID) }}
+{{- end }}
+{{- if not $hasLeaderElectionID }}{{- $args = append $args (printf "--leader-election-id=%s" $ownership.leaderElectionID) }}{{- end }}
+{{- end }}
+{{- /* Mirror the operator's startup coupling (resolveOwnership) at render
+  time so the boundary fails at upgrade instead of CrashLoopBackOff: secure
+  mode's runs live in secure.runNamespace, and discovery materializes runs
+  in the operator namespace (the release namespace). */}}
+{{- $ownershipList := $explicitOwned }}
+{{- if not $hasExplicitOwned }}{{- $ownershipList = $valueOwned }}{{- end }}
+{{- $ownershipSource := "explicit --owned-namespace args" }}
+{{- if not $hasExplicitOwned }}{{- $ownershipSource = "ownership.namespaces" }}{{- end }}
+{{- $discoveryEnabled := or $dispatch.enabled $labelSource.enabled (ne (len ($cronSchedules | default (dict))) 0) }}
+{{- if $ownershipList }}
+{{- if and $secure.enabled (not (has $secure.runNamespace $ownershipList)) }}
+{{- fail (printf "secure.runNamespace %q must appear in %s; a secure controller never reconciles runs outside its run namespace" $secure.runNamespace $ownershipSource) }}
+{{- end }}
+{{- if and $discoveryEnabled (not (has .Release.Namespace $ownershipList)) }}
+{{- fail (printf "discovery sources materialize CoderRuns in the release namespace %q, which %s %v do not own; deploy this release inside an owned namespace or drop the boundary" .Release.Namespace $ownershipSource $ownershipList) }}
+{{- end }}
+{{- else }}
+{{- if and $secure.enabled $discoveryEnabled (ne .Release.Namespace $secure.runNamespace) }}
+{{- fail (printf "a secure release with discovery enabled derives an ownership boundary of just secure.runNamespace %q, so it must be deployed there (release namespace %q); list ownership.namespaces explicitly to choose otherwise" $secure.runNamespace .Release.Namespace) }}
+{{- end }}
 {{- end }}
 {{- $_ := set $container "args" $args }}
 
