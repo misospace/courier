@@ -589,6 +589,26 @@ func settledCapacityExhaustion(run *courierv1alpha1.CoderRun) bool {
 		reported != nil && reported.Status == metav1.ConditionTrue
 }
 
+// settledRetryRequeue is the second settled-history state the discovery barrier
+// knows, and it is deliberately narrower than settledCapacityExhaustion in what
+// it releases. An explicit operator retry that settled Requeued launches a fresh
+// source attempt, not a rematerialization of the consumed one, so this predicate
+// participates ONLY in predecessor correlation and successor naming — never in
+// the discovery-exclusion scan or the dedupe map. Those keep excluding and
+// deduping the predecessor's own WorkItemID exactly as before: that attempt is
+// consumed, so a stale or duplicate re-offer of it must not spawn a run. A
+// Requested, Moot, or Refused record is not a settled requeue; Moot in
+// particular is not a barrier release, because the work moved through some other
+// path that carries its own successor. An empty AttemptID means the source
+// requeued without promising an identity, so no predecessor link is claimed and
+// the fresh offer materializes under the ordinary deterministic name; correlation
+// then lives in the run.retry events.
+func settledRetryRequeue(run *courierv1alpha1.CoderRun) bool {
+	return run.Status.RetryRequest != nil &&
+		run.Status.RetryRequest.State == courierv1alpha1.RetryRequestStateRequeued &&
+		run.Status.RetryRequest.AttemptID != ""
+}
+
 // phaseUnsettled reports whether a retained run has not yet reached a terminal
 // phase. It is a ranking heuristic for discovery-exclusion order, not
 // settlement authority: terminal runs have usually published the lifecycle
@@ -642,11 +662,34 @@ func successorRunName(sourceName, workItemID string, predecessorUID types.UID) s
 	return "courier-" + hex.EncodeToString(digest[:])[:32]
 }
 
+// settledPredecessor finds the retained run the offered fresh identity succeeds
+// to, so its successor is named after that predecessor's UID and history is
+// preserved. Two disjoint settled histories qualify. A settled capacity
+// exhaustion is correlated by work identity, because a capacity successor
+// re-offers the same work. A settled retry requeue is correlated by the fresh
+// attempt identity the adapter returned and the controller recorded, not by work
+// identity: the retry successor's own work identity differs from its
+// predecessor's (a fresh generation), so only the recorded attempt ID links
+// them. A run whose record settled Moot, Refused, or still Requested never
+// qualifies, and an empty AttemptID claims no link. Newest creation wins, name
+// breaking ties.
 func settledPredecessor(runs []courierv1alpha1.CoderRun, sourceName, identity string, runner *Runner) *courierv1alpha1.CoderRun {
 	var predecessor *courierv1alpha1.CoderRun
 	for i := range runs {
 		run := &runs[i]
-		if run.Spec.Source != sourceName || !settledCapacityExhaustion(run) || run.UID == "" || runner.identity(run.Spec.WorkItemID) != identity {
+		if run.Spec.Source != sourceName || run.UID == "" {
+			continue
+		}
+		switch {
+		case settledCapacityExhaustion(run):
+			if runner.identity(run.Spec.WorkItemID) != identity {
+				continue
+			}
+		case settledRetryRequeue(run):
+			if runner.identity(run.Status.RetryRequest.AttemptID) != identity {
+				continue
+			}
+		default:
 			continue
 		}
 		if predecessor == nil || run.CreationTimestamp.Time.After(predecessor.CreationTimestamp.Time) ||
