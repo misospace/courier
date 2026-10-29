@@ -1309,6 +1309,98 @@ func TestChartRendersSideBySideOwnershipConfiguration(t *testing.T) {
 	if err == nil || !strings.Contains(out, "contradicts the rendered broker TokenReview ClusterRole") {
 		t.Fatalf("expected a contradicting explicit broker role arg to fail with an empty value, err = %v:\n%s", err, out)
 	}
+
+	// The bare "--broker-tokenreview-cluster-role <name>" form is parsed by
+	// the operator's flag parser too: an aligned bare pair stays valid, a
+	// contradicting one fails, and a bare flag with no capturable value
+	// fails at render instead of surfacing as an operator flag-parse error.
+	bareAligned := runHelm(t, chartDir, "template", "courier-native", ".",
+		"--set", "secure.enabled=true",
+		"--set", "secure.runNamespace=courier-runs",
+		"--set", "secure.providers[0].name=github",
+		"--set", "secure.providers[0].type=github",
+		"--set", "secure.providers[0].endpoint=https://api.github.com/",
+		"--set", "secure.providers[0].serves[0]=misospace/*",
+		"--set", "secure.providers[0].credentials.forge-api.secretName=forge-creds",
+		"--set", "secure.providers[0].credentials.forge-api.key=token",
+		"--set", "secure.brokerTokenReviewClusterRole=courier-native-broker-tokenreview",
+		"--set-string", "controllers.main.containers.main.args[0]=--broker-tokenreview-cluster-role",
+		"--set-string", "controllers.main.containers.main.args[1]=courier-native-broker-tokenreview",
+	)
+	if count := strings.Count(bareAligned, "--broker-tokenreview-cluster-role="); count != 0 {
+		t.Fatalf("aligned bare broker role arg produced %d generated equals-form flags, want 0", count)
+	}
+	if !strings.Contains(bareAligned, "- --broker-tokenreview-cluster-role\n") || !strings.Contains(bareAligned, "- courier-native-broker-tokenreview\n") {
+		t.Fatal("aligned bare broker role pair must survive rendering as container args")
+	}
+	if !strings.Contains(bareAligned, "name: courier-native-broker-tokenreview") {
+		t.Fatal("aligned bare broker role arg must still render the ClusterRole")
+	}
+	out, err = runHelmOutput(t, chartDir, "template", "courier-native", ".",
+		"--set", "secure.enabled=true",
+		"--set", "secure.runNamespace=courier-runs",
+		"--set", "secure.providers[0].name=github",
+		"--set", "secure.providers[0].type=github",
+		"--set", "secure.providers[0].endpoint=https://api.github.com/",
+		"--set", "secure.providers[0].serves[0]=misospace/*",
+		"--set", "secure.providers[0].credentials.forge-api.secretName=forge-creds",
+		"--set", "secure.providers[0].credentials.forge-api.key=token",
+		"--set", "secure.brokerTokenReviewClusterRole=courier-native-broker-tokenreview",
+		"--set-string", "controllers.main.containers.main.args[0]=--broker-tokenreview-cluster-role",
+		"--set-string", "controllers.main.containers.main.args[1]=some-other-role",
+	)
+	if err == nil || !strings.Contains(out, "contradicts the rendered broker TokenReview ClusterRole") {
+		t.Fatalf("expected a contradicting bare broker role arg to fail, err = %v:\n%s", err, out)
+	}
+	out, err = runHelmOutput(t, chartDir, "template", "courier-native", ".",
+		"--set", "secure.enabled=true",
+		"--set", "secure.runNamespace=courier-runs",
+		"--set", "secure.providers[0].name=github",
+		"--set", "secure.providers[0].type=github",
+		"--set", "secure.providers[0].endpoint=https://api.github.com/",
+		"--set", "secure.providers[0].serves[0]=misospace/*",
+		"--set", "secure.providers[0].credentials.forge-api.secretName=forge-creds",
+		"--set", "secure.providers[0].credentials.forge-api.key=token",
+		"--set-string", "controllers.main.containers.main.args[0]=--broker-tokenreview-cluster-role",
+		"--set-string", "controllers.main.containers.main.args[1]=--leader-elect",
+	)
+	if err == nil || !strings.Contains(out, "has no value at render time") {
+		t.Fatalf("expected a bare broker role arg with a flag-like value to fail, err = %v:\n%s", err, out)
+	}
+
+	// A bare flag as the final argument has no next argument to consume.
+	out, err = runHelmOutput(t, chartDir, "template", "courier-native", ".",
+		"--set", "secure.enabled=true",
+		"--set", "secure.runNamespace=courier-runs",
+		"--set", "secure.providers[0].name=github",
+		"--set", "secure.providers[0].type=github",
+		"--set", "secure.providers[0].endpoint=https://api.github.com/",
+		"--set", "secure.providers[0].serves[0]=misospace/*",
+		"--set", "secure.providers[0].credentials.forge-api.secretName=forge-creds",
+		"--set", "secure.providers[0].credentials.forge-api.key=token",
+		"--set-string", "controllers.main.containers.main.args[0]=--broker-tokenreview-cluster-role",
+	)
+	if err == nil || !strings.Contains(out, "has no value at render time") {
+		t.Fatalf("expected a bare broker role arg with no following argument to fail, err = %v:\n%s", err, out)
+	}
+
+	// The single-dash form is accepted by the operator's flag parser too:
+	// a contradicting one fails at render.
+	out, err = runHelmOutput(t, chartDir, "template", "courier-native", ".",
+		"--set", "secure.enabled=true",
+		"--set", "secure.runNamespace=courier-runs",
+		"--set", "secure.providers[0].name=github",
+		"--set", "secure.providers[0].type=github",
+		"--set", "secure.providers[0].endpoint=https://api.github.com/",
+		"--set", "secure.providers[0].serves[0]=misospace/*",
+		"--set", "secure.providers[0].credentials.forge-api.secretName=forge-creds",
+		"--set", "secure.providers[0].credentials.forge-api.key=token",
+		"--set", "secure.brokerTokenReviewClusterRole=courier-native-broker-tokenreview",
+		"--set-string", "controllers.main.containers.main.args[0]=-broker-tokenreview-cluster-role=some-other-role",
+	)
+	if err == nil || !strings.Contains(out, "contradicts the rendered broker TokenReview ClusterRole") {
+		t.Fatalf("expected a contradicting single-dash broker role arg to fail, err = %v:\n%s", err, out)
+	}
 }
 
 func TestChartRejectsOwnershipBoundaryThatStrandsRuns(t *testing.T) {

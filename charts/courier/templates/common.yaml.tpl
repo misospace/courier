@@ -226,7 +226,7 @@
 {{- $hasCachePort := false }}
 {{- $hasBrokerTokenReviewRole := false }}
 {{- $explicitBrokerTokenReviewRole := "" }}
-{{- range $arg := $args }}
+{{- range $i, $arg := $args }}
 {{- if hasPrefix "--secure-mode=" $arg }}{{- $hasSecureMode = true }}{{- end }}
 {{- if hasPrefix "--forge-providers-file=" $arg }}{{- $hasProvidersFile = true }}{{- end }}
 {{- if hasPrefix "--run-namespace=" $arg }}{{- $hasRunNamespace = true }}{{- end }}
@@ -234,7 +234,16 @@
 {{- if hasPrefix "--probe-image=" $arg }}{{- $hasProbeImage = true }}{{- end }}
 {{- if hasPrefix "--dependency-cache-service=" $arg }}{{- $hasCacheService = true }}{{- end }}
 {{- if hasPrefix "--dependency-cache-port=" $arg }}{{- $hasCachePort = true }}{{- end }}
-{{- if hasPrefix "--broker-tokenreview-cluster-role=" $arg }}{{- $hasBrokerTokenReviewRole = true }}{{- $explicitBrokerTokenReviewRole = $arg }}{{- end }}
+{{- if hasPrefix "--broker-tokenreview-cluster-role=" $arg }}{{- $hasBrokerTokenReviewRole = true }}{{- $explicitBrokerTokenReviewRole = $arg }}
+{{- else if hasPrefix "-broker-tokenreview-cluster-role=" $arg }}{{- $hasBrokerTokenReviewRole = true }}{{- $explicitBrokerTokenReviewRole = printf "--%s" (trimPrefix "-" $arg) }}
+{{- else if or (eq $arg "--broker-tokenreview-cluster-role") (eq $arg "-broker-tokenreview-cluster-role") }}
+{{- $hasBrokerTokenReviewRole = true }}
+{{- if and (lt (add1 $i) (len $args)) (not (hasPrefix "-" (index $args (add1 $i)))) }}
+{{- $explicitBrokerTokenReviewRole = printf "--broker-tokenreview-cluster-role=%s" (index $args (add1 $i)) }}
+{{- else }}
+{{- fail "a bare --broker-tokenreview-cluster-role argument has no value at render time: the operator's flag parser consumes the next argument, so pass --broker-tokenreview-cluster-role=<name> or a value that does not start with '-'" }}
+{{- end }}
+{{- end }}
 {{- end }}
 {{- if not $hasSecureMode }}{{- $args = append $args "--secure-mode=true" }}{{- end }}
 {{- if not $hasProvidersFile }}{{- $args = append $args "--forge-providers-file=/etc/courier/forge-providers.json" }}{{- end }}
