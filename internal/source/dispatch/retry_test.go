@@ -26,6 +26,7 @@ import (
 	"sync"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	courierv1alpha1 "github.com/misospace/courier/api/v1alpha1"
 	"github.com/misospace/courier/internal/connector"
@@ -319,13 +320,14 @@ func TestDispatchAttemptRequeueRequiresKeyAndFence(t *testing.T) {
 		{name: "missing-idempotency-key", item: queue, key: "", fence: retryTestQueueReceipt},
 		{name: "blank-idempotency-key", item: queue, key: "   ", fence: retryTestQueueReceipt},
 		{name: "over-long-idempotency-key", item: queue, key: strings.Repeat("k", 513), fence: retryTestQueueReceipt},
-		{name: "missing-fence", item: queue, key: "coderun/ns/rr/key", fence: ""},
-		{name: "non-receipt-fence", item: queue, key: "coderun/ns/rr/key", fence: "handout-1"},
-		{name: "receipt-fencing-another-attempt", item: queue, key: "coderun/ns/rr/key", fence: `{"prFixId":"other-item","generation":9,"handoutToken":"handout-1"}`},
-		{name: "queue-receipt-without-handout", item: queue, key: "coderun/ns/rr/key", fence: `{"prFixId":"queue-item-1","generation":3}`},
-		{name: "implement-receipt-without-claim", item: implement, key: "coderun/ns/rr/key", fence: retryTestQueueReceipt},
-		{name: "queueless-followup", item: queueless, key: "coderun/ns/rr/key", fence: retryTestQueueReceipt},
-		{name: "unsupported-work-type", item: mystery, key: "coderun/ns/rr/key", fence: retryTestQueueReceipt},
+		{name: "missing-fence", item: queue, key: "coderun/ns/rr/key", fence: "", wantUnsupported: true},
+		{name: "non-receipt-fence", item: queue, key: "coderun/ns/rr/key", fence: "handout-1", wantUnsupported: true},
+		{name: "receipt-fencing-another-attempt", item: queue, key: "coderun/ns/rr/key", fence: `{"prFixId":"other-item","generation":9,"handoutToken":"handout-1"}`, wantUnsupported: true},
+		{name: "queue-receipt-without-handout", item: queue, key: "coderun/ns/rr/key", fence: `{"prFixId":"queue-item-1","generation":3}`, wantUnsupported: true},
+		{name: "implement-receipt-without-claim", item: implement, key: "coderun/ns/rr/key", fence: retryTestQueueReceipt, wantUnsupported: true},
+		{name: "implement-work-without-issue-identity", item: source.WorkItem{ID: base64.RawURLEncoding.EncodeToString([]byte(`{"type":"implement","repo":"acme/widgets","number":42}`))}, key: "coderun/ns/rr/key", fence: `{"claimToken":"claim-1"}`, wantUnsupported: true},
+		{name: "queueless-followup", item: queueless, key: "coderun/ns/rr/key", fence: retryTestQueueReceipt, wantUnsupported: true},
+		{name: "unsupported-work-type", item: mystery, key: "coderun/ns/rr/key", fence: retryTestQueueReceipt, wantUnsupported: true},
 		{name: "corrupt-work-id", item: source.WorkItem{ID: "not-a-work-id"}, key: "coderun/ns/rr/key", fence: retryTestQueueReceipt, wantErr: ErrUnknownWorkID},
 		{name: "non-json-work-id", item: source.WorkItem{ID: base64.RawURLEncoding.EncodeToString([]byte("garbage"))}, key: "coderun/ns/rr/key", fence: retryTestQueueReceipt, wantErr: ErrUnknownWorkID},
 	}
@@ -812,4 +814,104 @@ func TestDispatchAdapterRequeueWithoutCapability(t *testing.T) {
 			t.Fatalf("RequeueAttempt() error = %v, want ErrEmptyWorkItemID", err)
 		}
 	})
+}
+
+// TestDispatchAttemptRequeueNoteIsBounded pins the audit note's bound: the
+// operator's request ID is untrusted data forwarded for the source's audit, so
+// an over-long value travels truncated at the contract maximum and never
+// mangled mid-rune, and an absent note travels empty rather than fabricated.
+func TestDispatchAttemptRequeueNoteIsBounded(t *testing.T) {
+	long := strings.Repeat("a", 200) + strings.Repeat("é", 200)
+	cases := []struct {
+		name    string
+		reason  string
+		wantLen int
+	}{
+		{name: "short-note", reason: "req-1", wantLen: 5},
+		{name: "empty-note", reason: "   ", wantLen: 0},
+		{name: "over-long-note", reason: long, wantLen: maxRetryNoteLength},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var note string
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.URL.Path == "/api/issues/state" {
+					_ = json.NewEncoder(w).Encode(map[string]any{"issueId": "issue-1"})
+					return
+				}
+				var body map[string]any
+				_ = json.NewDecoder(io.LimitReader(r.Body, 1<<20)).Decode(&body)
+				note, _ = body["note"].(string)
+				_ = json.NewEncoder(w).Encode(map[string]any{"success": true})
+			}))
+			defer server.Close()
+			client := retryTestClient(t, server.URL)
+			if _, err := client.RequeueAttempt(context.Background(), ciparkImplementItem().ID, source.AttemptRequeueRequest{
+				FenceToken: retryTestClaimReceipt, IdempotencyKey: "coderun/ns/rr/key", Reason: tc.reason,
+			}); err != nil {
+				t.Fatalf("RequeueAttempt() error = %v", err)
+			}
+			if len(note) != tc.wantLen {
+				t.Fatalf("note length = %d, want %d", len(note), tc.wantLen)
+			}
+			if !utf8.ValidString(note) {
+				t.Fatalf("note = %q, want valid UTF-8 at the truncation boundary", note)
+			}
+		})
+	}
+}
+
+// TestDispatchAttemptRequeueReissuedIdentityMustMatch pins that a success
+// naming a queue item other than the one this attempt requeued, or a
+// non-positive generation, is an error with no identity: a silently wrong
+// attempt identity would link a successor to the wrong predecessor, which is
+// worse than no identity at all (discovery then materializes the successor
+// under its ordinary name and correlation lives in the retry events).
+func TestDispatchAttemptRequeueReissuedIdentityMustMatch(t *testing.T) {
+	for name, response := range map[string]map[string]any{
+		"other-item":     {"success": true, "prFixItem": map[string]any{"id": "queue-item-2", "generation": 4}},
+		"zero-generated": {"success": true, "prFixItem": map[string]any{"id": "queue-item-1", "generation": 0}},
+	} {
+		t.Run(name, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				_ = json.NewEncoder(w).Encode(response)
+			}))
+			defer server.Close()
+			client := retryTestClient(t, server.URL)
+			result, err := client.RequeueAttempt(context.Background(), ciparkWorkItem().ID, source.AttemptRequeueRequest{
+				FenceToken: retryTestQueueReceipt, IdempotencyKey: "coderun/ns/rr/key",
+			})
+			if err == nil {
+				t.Fatalf("RequeueAttempt() error = nil, want a mismatched reissue refused; result = %+v", result)
+			}
+			if result.AttemptID != "" {
+				t.Fatalf("AttemptID = %q, want empty alongside the refusal", result.AttemptID)
+			}
+		})
+	}
+}
+
+// TestDispatchAttemptRequeueBare404IsRouteEvidence pins the deliberate posture
+// the latch takes on a 404: the pinned contract reserves 404 for route absence
+// and codes every per-item condition 409, so a 404 that carries an item-shaped
+// body is still read as version skew and latches for the process. The
+// alternative — reading a per-item meaning into a status the contract does not
+// grant it — would let one ambiguous response decide an operator's retry, and
+// the retry request would keep retrying a route the deployment may not have at
+// all. A server that answers per-item conditions with 404 trips this pin.
+func TestDispatchAttemptRequeueBare404IsRouteEvidence(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, `{"error":"pr-fix item not found"}`, http.StatusNotFound)
+	}))
+	defer server.Close()
+	client := retryTestClient(t, server.URL)
+	_, err := client.RequeueAttempt(context.Background(), ciparkWorkItem().ID, source.AttemptRequeueRequest{
+		FenceToken: retryTestQueueReceipt, IdempotencyKey: "coderun/ns/rr/key",
+	})
+	if !errors.Is(err, source.ErrUnsupportedRetry) {
+		t.Fatalf("RequeueAttempt() error = %v, want source.ErrUnsupportedRetry", err)
+	}
+	if !client.retryUnsupported.Load() {
+		t.Fatal("a 404 on a requeue route must latch the deployment as not having adopted it")
+	}
 }

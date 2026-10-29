@@ -230,10 +230,11 @@ func (c *HTTPClient) requeuePRFixAttempt(ctx context.Context, d workDescriptor, 
 	if !response.Success {
 		return source.AttemptRequeueResult{}, errors.New("dispatch client: attempt requeue response did not confirm success")
 	}
-	// A committed key's replay is indistinguishable from a fresh commit at this
-	// boundary and both settle Requeued, so `replayed` is pinned as part of the
-	// contract — proof the server's replay path is exercised — rather than
-	// branched on here.
+	// The client never branches on `replayed`: a committed key's replay is the
+	// same attested success as a fresh commit and both settle Requeued. It is
+	// part of the pinned wire shape, and the fixture answers a replayed key with
+	// success, so a server that stops distinguishing replays on the wire cannot
+	// silently change what Courier sends.
 	if response.PRFixItem == nil {
 		return source.AttemptRequeueResult{}, nil
 	}
@@ -302,11 +303,15 @@ func retryNote(reason string) string {
 // refusals the caller owns. A bare 404 is route evidence and reclassifies first
 // into the permanent unsupported posture (reclassifyRetryRoute404). A 409 whose
 // body carries a known reason code maps through classifyRetryRefusal. Anything
-// else proves nothing about the requeue's fate: a 5xx or transport failure stays
-// transient, a 400/403 stays the choke point's permanent refusal, and an
-// unrecognized or absent 409 reason code stays transient rather than inventing a
-// settlement the source never attested — a durable retry request would rather
-// keep retrying under its own key than settle on a body Courier cannot read.
+// else proves nothing about the requeue's fate and stays transient for the
+// retry's durable record: a 5xx or transport failure, a 400/403 (which the
+// choke point also wraps in source.ErrPermanentRefusal — that sentinel is how
+// the ordinary lifecycle report stops retrying, and the retry record reads only
+// the coded reasons and ErrUnsupportedRetry, so an uncoded refusal keeps
+// retrying rather than settling on a body Courier cannot read), and an
+// unrecognized or absent 409 reason code. A durable retry request would rather
+// keep retrying under its own key than invent a settlement the source never
+// attested.
 func (c *HTTPClient) classifyRetryExchange(err error) error {
 	if err == nil {
 		return nil
@@ -378,13 +383,17 @@ func retryRefusalCode(err error) (string, bool) {
 // the requeue refusal vocabulary is 409-coded, so a 404 on one of these routes
 // is evidence the deployment has adopted neither of them — version skew, never a
 // per-item condition — and every further requeue would retry the same 404 while
-// holding a durable retry request and the run behind its reap gate. The 404's
-// protocol-error class was already counted at the do() choke point (a requeue 404
-// is not an exchangeReclassified status), so wrapping the sentinel adds no
-// diagnostic, and nothing here flips the capability catalogue: the retry posture
-// is recorded on the run's status.retryRequest and its condition, which is the
-// audit trail. A 5xx, a transport failure, a coded 409, or a 400/403 is not route
-// evidence and is returned unchanged.
+// holding a durable retry request and the run behind its reap gate. Unlike
+// AckHandout, which reads a known item-not-found body as per-item ledger
+// evidence, this family discriminates no 404 body: the contract grants 404 no
+// per-item meaning at all, so the classification is deliberately status-only and
+// the consequence deliberately per-process. The 404's protocol-error class was
+// already counted at the do() choke point (a requeue 404 is not an
+// exchangeReclassified status), so wrapping the sentinel adds no diagnostic, and
+// nothing here flips the capability catalogue: the retry posture is recorded on
+// the run's status.retryRequest and its condition, which is the audit trail. A
+// 5xx, a transport failure, a coded 409, or a 400/403 is not route evidence and
+// is returned unchanged.
 func (c *HTTPClient) reclassifyRetryRoute404(err error) (error, bool) {
 	var apiErr *APIError
 	if !errors.As(err, &apiErr) || apiErr.StatusCode != http.StatusNotFound {

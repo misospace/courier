@@ -780,6 +780,31 @@ func TestRetryAdapterReportsUnsupportedSourceSettlesRefused(t *testing.T) {
 	}
 }
 
+// TestRetryPermanentRefusalKeepsRequested pins the posture for a source refusal
+// the adapter could not classify — a 400/403 the connector reports through
+// source.ErrPermanentRefusal rather than a coded retry reason. Courier does not
+// read a bounded refusal reason out of a body it cannot classify, so the
+// durable record stays Requested and retries on the settlement cadence; the
+// retry gate keeps holding the run, which is the conservative half of the
+// trade — a request that might still be honored is never falsely settled.
+func TestRetryPermanentRefusalKeepsRequested(t *testing.T) {
+	src := &requeueSource{admissionSource: &admissionSource{}, err: fmt.Errorf("dispatch refused the requeue: %w", source.ErrPermanentRefusal)}
+	run := retryRun("rr", courierv1alpha1.PhaseFailed, "req-1")
+	c := phaseClient(t, run)
+
+	result, err := retryReconciler(c, src, reapClock, nil, nil).Reconcile(context.Background(), admissionRequest("rr"))
+	if err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	if result.RequeueAfter != retrySettlementRequeueDelay {
+		t.Fatalf("RequeueAfter = %v, want the settlement retry cadence", result.RequeueAfter)
+	}
+	stored := getRetryRun(t, c, "rr")
+	if stored.Status.RetryRequest == nil || stored.Status.RetryRequest.State != courierv1alpha1.RetryRequestStateRequested {
+		t.Fatalf("retryRequest = %+v, want it to stay Requested on an unclassified refusal", stored.Status.RetryRequest)
+	}
+}
+
 func TestRetryFixPRUpstreamClosed(t *testing.T) {
 	for name, pull := range map[string]forgePullCase{
 		"merged": {state: "closed", merged: true},
