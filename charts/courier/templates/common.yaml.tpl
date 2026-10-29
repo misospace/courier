@@ -423,18 +423,49 @@
 {{- if and $retention.auditKeep (not $hasAuditKeep) }}{{- $args = append $args (printf "--terminal-audit-keep=%d" (int $retention.auditKeep)) }}{{- end }}
 {{- end }}
 {{- $ownership := .Values.ownership | default (dict) }}
-{{- $hasOwnedNamespace := false }}
+{{- $valueOwned := $ownership.namespaces | default (list) }}
 {{- $hasLeaderElectionID := false }}
-{{- range $arg := $args }}
-{{- if or (eq $arg "--owned-namespace") (hasPrefix "--owned-namespace=" $arg) }}{{- $hasOwnedNamespace = true }}{{- end }}
+{{- $explicitOwned := list }}
+{{- $hasExplicitOwned := false }}
+{{- $argCount := len $args }}
+{{- range $i, $arg := $args }}
 {{- if hasPrefix "--leader-election-id=" $arg }}{{- $hasLeaderElectionID = true }}{{- end }}
+{{- if hasPrefix "--owned-namespace=" $arg }}
+{{- $hasExplicitOwned = true }}
+{{- $explicitOwned = append $explicitOwned (trimPrefix "--owned-namespace=" $arg) }}
+{{- else if eq $arg "--owned-namespace" }}
+{{- $hasExplicitOwned = true }}
+{{- if and (lt (add1 $i) $argCount) (not (hasPrefix "-" (index $args (add1 $i)))) }}
+{{- $explicitOwned = append $explicitOwned (index $args (add1 $i)) }}
+{{- else }}
+{{- fail "a bare --owned-namespace argument has no value at render time: the operator's flag parser consumes the next argument, so pass --owned-namespace=<namespace> or a value that does not start with '-'" }}
 {{- end }}
-{{- if not $hasOwnedNamespace }}
-{{- range $namespace := $ownership.namespaces | default (list) }}
+{{- end }}
+{{- end }}
+{{- if and $hasExplicitOwned $valueOwned }}
+{{- range $namespace := $valueOwned }}
+{{- if not (has $namespace $explicitOwned) }}
+{{- fail (printf "ownership.namespaces %v are ignored because explicit --owned-namespace args are present and render the boundary %v: the two disagree" $valueOwned $explicitOwned) }}
+{{- end }}
+{{- end }}
+{{- range $namespace := $explicitOwned }}
+{{- if not (has $namespace $valueOwned) }}
+{{- fail (printf "explicit --owned-namespace args %v disagree with ownership.namespaces %v: the values are ignored by the operator" $explicitOwned $valueOwned) }}
+{{- end }}
+{{- end }}
+{{- end }}
+{{- if not $hasExplicitOwned }}
+{{- range $namespace := $valueOwned }}
 {{- if or (not (regexMatch "^[a-z0-9]([-a-z0-9]*[a-z0-9])?$" $namespace)) (gt (len $namespace) 63) }}
 {{- fail (printf "ownership.namespaces entry %q must be a valid DNS-1123 label (lowercase alphanumeric or '-', at most 63 characters, starting and ending with an alphanumeric)" $namespace) }}
 {{- end }}
 {{- $args = append $args (printf "--owned-namespace=%s" $namespace) }}
+{{- end }}
+{{- else }}
+{{- range $namespace := $explicitOwned }}
+{{- if or (not (regexMatch "^[a-z0-9]([-a-z0-9]*[a-z0-9])?$" $namespace)) (gt (len $namespace) 63) }}
+{{- fail (printf "--owned-namespace entry %q must be a valid DNS-1123 label (lowercase alphanumeric or '-', at most 63 characters, starting and ending with an alphanumeric)" $namespace) }}
+{{- end }}
 {{- end }}
 {{- end }}
 {{- if $ownership.leaderElectionID }}
@@ -447,14 +478,17 @@
   time so the boundary fails at upgrade instead of CrashLoopBackOff: secure
   mode's runs live in secure.runNamespace, and discovery materializes runs
   in the operator namespace (the release namespace). */}}
-{{- $ownershipList := $ownership.namespaces | default (list) }}
+{{- $ownershipList := $explicitOwned }}
+{{- if not $hasExplicitOwned }}{{- $ownershipList = $valueOwned }}{{- end }}
+{{- $ownershipSource := "explicit --owned-namespace args" }}
+{{- if not $hasExplicitOwned }}{{- $ownershipSource = "ownership.namespaces" }}{{- end }}
 {{- $discoveryEnabled := or $dispatch.enabled $labelSource.enabled (ne (len ($cronSchedules | default (dict))) 0) }}
 {{- if $ownershipList }}
 {{- if and $secure.enabled (not (has $secure.runNamespace $ownershipList)) }}
-{{- fail (printf "secure.runNamespace %q must appear in ownership.namespaces; a secure controller never reconciles runs outside its run namespace" $secure.runNamespace) }}
+{{- fail (printf "secure.runNamespace %q must appear in %s; a secure controller never reconciles runs outside its run namespace" $secure.runNamespace $ownershipSource) }}
 {{- end }}
 {{- if and $discoveryEnabled (not (has .Release.Namespace $ownershipList)) }}
-{{- fail (printf "discovery sources materialize CoderRuns in the release namespace %q, which ownership.namespaces %q does not own; deploy this release inside an owned namespace or drop the boundary" .Release.Namespace $ownershipList) }}
+{{- fail (printf "discovery sources materialize CoderRuns in the release namespace %q, which %s %v do not own; deploy this release inside an owned namespace or drop the boundary" .Release.Namespace $ownershipSource $ownershipList) }}
 {{- end }}
 {{- else }}
 {{- if and $secure.enabled $discoveryEnabled (ne .Release.Namespace $secure.runNamespace) }}

@@ -1350,8 +1350,84 @@ func TestChartRejectsOwnershipBoundaryThatStrandsRuns(t *testing.T) {
 		"--set", "dispatch.tokenSecret.name=dispatch-token-secret",
 		"--set", "ownership.namespaces[0]=somewhere-else",
 	)
-	if err == nil || !strings.Contains(out, "does not own") {
+	if err == nil || !strings.Contains(out, "do not own") {
 		t.Fatalf("expected a boundary excluding the discovery namespace to fail, err = %v:\n%s", err, out)
+	}
+
+	// An explicit --owned-namespace arg is the effective boundary: the same
+	// couplings must apply to it, and it must not be silently overridden by
+	// ownership.namespaces.
+	out, err = runHelmOutput(t, chartDir,
+		append(append([]string{"template", "courier", "."}, secureBase...),
+			"--set-string", "controllers.main.containers.main.args[0]=--owned-namespace=somewhere-else")...)
+	if err == nil || !strings.Contains(out, "must appear in explicit --owned-namespace args") {
+		t.Fatalf("expected an explicit boundary excluding secure.runNamespace to fail, err = %v:\n%s", err, out)
+	}
+
+	aligned := runHelm(t, chartDir,
+		append(append([]string{"template", "courier", "."}, secureBase...),
+			"--set-string", "controllers.main.containers.main.args[0]=--owned-namespace=courier-runs")...)
+	if count := strings.Count(aligned, "--owned-namespace="); count != 1 {
+		t.Fatalf("aligned explicit owned-namespace arg produced %d owned-namespace flags, want exactly 1", count)
+	}
+
+	// The bare flag form takes its value from the next argument, so the
+	// couplings see the same effective list.
+	bare := runHelm(t, chartDir,
+		append(append([]string{"template", "courier", "."}, secureBase...),
+			"--set-string", "controllers.main.containers.main.args[0]=--owned-namespace",
+			"--set-string", "controllers.main.containers.main.args[1]=courier-runs")...)
+	if count := strings.Count(bare, "--owned-namespace"); count != 1 {
+		t.Fatalf("bare explicit owned-namespace arg produced %d owned-namespace flags, want exactly 1", count)
+	}
+
+	// The operator's flag parser consumes the next argument after a bare
+	// --owned-namespace unconditionally, so a bare flag without a capturable
+	// value fails at render.
+	out, err = runHelmOutput(t, chartDir, "template", "courier", ".",
+		"--set-string", "controllers.main.containers.main.args[0]=--owned-namespace")
+	if err == nil || !strings.Contains(out, "has no value at render time") {
+		t.Fatalf("expected a bare owned-namespace flag without a value to fail, err = %v:\n%s", err, out)
+	}
+
+	// Explicit args and agreeing ownership.namespaces render the explicit
+	// boundary exactly once.
+	agreeing := runHelm(t, chartDir,
+		append(append([]string{"template", "courier", "."}, secureBase...),
+			"--set-string", "controllers.main.containers.main.args[0]=--owned-namespace=courier-runs",
+			"--set", "ownership.namespaces[0]=courier-runs")...)
+	if count := strings.Count(agreeing, "--owned-namespace="); count != 1 {
+		t.Fatalf("agreeing explicit arg and ownership.namespaces produced %d owned-namespace flags, want exactly 1", count)
+	}
+
+	out, err = runHelmOutput(t, chartDir,
+		append(append([]string{"template", "courier", "."}, secureBase...),
+			"--set-string", "controllers.main.containers.main.args[0]=--owned-namespace=somewhere-else",
+			"--set", "ownership.namespaces[0]=courier-runs")...)
+	if err == nil || !strings.Contains(out, "disagree") {
+		t.Fatalf("expected contradicting explicit args and ownership.namespaces to fail, err = %v:\n%s", err, out)
+	}
+
+	out, err = runHelmOutput(t, chartDir, "template", "courier", ".",
+		"--namespace", "courier-system",
+		"--set", "dispatch.enabled=true",
+		"--set", "dispatch.baseURL=https://dispatch.example.test",
+		"--set", "dispatch.agentName=example-agent",
+		"--set", "dispatch.queueLane=queue-x",
+		"--set", "dispatch.laneProfile=lane-y",
+		"--set", "dispatch.tokenSecret.name=dispatch-token-secret",
+		"--set-string", "controllers.main.containers.main.args[0]=--owned-namespace=somewhere-else",
+	)
+	if err == nil || !strings.Contains(out, "do not own") {
+		t.Fatalf("expected an explicit boundary excluding the discovery namespace to fail, err = %v:\n%s", err, out)
+	}
+
+	// An explicit owned namespace name that is not a DNS-1123 label fails at
+	// render too.
+	out, err = runHelmOutput(t, chartDir, "template", "courier", ".",
+		"--set-string", "controllers.main.containers.main.args[0]=--owned-namespace=Bad_Name")
+	if err == nil || !strings.Contains(out, "DNS-1123 label") {
+		t.Fatalf("expected an invalid explicit owned namespace to fail, err = %v:\n%s", err, out)
 	}
 
 	// A secure release with discovery and no explicit list derives a
