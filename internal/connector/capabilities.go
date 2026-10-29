@@ -13,6 +13,7 @@ const (
 	CapabilityCIParkLifecycle       = "ci-park-lifecycle"
 	CapabilityDiscovery             = "discovery"
 	CapabilityDiscoveryExclusions   = "discovery-exclusions"
+	CapabilityExecutionObservations = "execution-observations"
 	CapabilityLifecycleReport       = "lifecycle-report"
 	CapabilityPreLaunchRevalidation = "pre-launch-revalidation"
 	CapabilityWorkIdentity          = "work-identity"
@@ -25,6 +26,7 @@ var Capabilities = []string{
 	CapabilityCIParkLifecycle,
 	CapabilityDiscovery,
 	CapabilityDiscoveryExclusions,
+	CapabilityExecutionObservations,
 	CapabilityLifecycleReport,
 	CapabilityPreLaunchRevalidation,
 	CapabilityWorkIdentity,

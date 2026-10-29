@@ -386,6 +386,114 @@ type Reporter interface {
 	Report(context.Context, WorkItem, Lifecycle) error
 }
 
+// ExecutionState is a source-neutral execution-observation state (#633). It
+// describes only what Courier observed about a run's own lifecycle phases;
+// it never asserts source ownership, a lease, or model progress, because
+// pod or process existence proves none of those. A source renders a stale or
+// absent observation as unknown coverage, never as proof that no execution
+// exists.
+type ExecutionState string
+
+const (
+	// ExecutionRunning marks a run whose coordinator has started.
+	ExecutionRunning ExecutionState = "running"
+	// ExecutionVerifying marks a coordinator that stopped submitting while
+	// the operator verifies its result.
+	ExecutionVerifying ExecutionState = "verifying"
+	// ExecutionAwaitingReview marks published work waiting on external
+	// review.
+	ExecutionAwaitingReview ExecutionState = "awaiting-review"
+	// ExecutionSucceeded marks a run that settled successfully.
+	ExecutionSucceeded ExecutionState = "succeeded"
+	// ExecutionFailed marks a run whose execution failed.
+	ExecutionFailed ExecutionState = "failed"
+	// ExecutionBlocked marks work parked for a human.
+	ExecutionBlocked ExecutionState = "blocked"
+	// ExecutionBlockedExternal marks work blocked on an external
+	// prerequisite Courier cannot satisfy itself.
+	ExecutionBlockedExternal ExecutionState = "blocked-external"
+	// ExecutionHandedOff marks published work whose external verification
+	// did not pass; the source's independent repair mechanism takes over
+	// using the carried PR identity.
+	ExecutionHandedOff ExecutionState = "handed-off"
+)
+
+// ExecutionTerminal reports whether a state ends the execution it describes.
+// Sources must keep terminal observations monotonic: a delayed non-terminal
+// observation must never resurrect terminal work.
+func (s ExecutionState) Terminal() bool {
+	switch s {
+	case ExecutionSucceeded, ExecutionFailed, ExecutionBlocked,
+		ExecutionBlockedExternal, ExecutionHandedOff:
+		return true
+	default:
+		return false
+	}
+}
+
+// ExecutionObservation is the source-neutral current-state telemetry for one
+// run (#633). It is an idempotent current-state upsert, not an event log:
+// (RunUID, State) identifies the assertion and ObservedAt orders it, so
+// re-reporting after an operator restart converges instead of appending.
+// Adapters that need a dedupe key derive it from (RunUID, State, ObservedAt).
+// The observation never carries source claim receipts, fence tokens, or lease
+// proof: telemetry must not claim source ownership. RunUID is the durable
+// attempt identity and WorkIdentity the stable identity of the underlying
+// work, so a source can fence a delayed observation of an older attempt
+// against a newer one without Courier holding any queue.
+type ExecutionObservation struct {
+	// RunUID is the run's immutable identity (its Kubernetes UID).
+	RunUID string
+	// RunNamespace and RunName locate the run for display.
+	RunNamespace string
+	RunName      string
+	// WorkItemID is the source's opaque work identity, the same one claim
+	// and lifecycle calls address.
+	WorkItemID string
+	// WorkIdentity is the source's dedupe identity for the underlying work
+	// (the WorkIdentifier spelling), stable across re-offers.
+	WorkIdentity string
+	// Mode is the source-neutral work kind (the run's Mode, e.g.
+	// resolve-issue or fix-pr).
+	Mode string
+	// Source is the configured source-adapter name that produced this
+	// observation.
+	Source string
+	// State is the observed execution state.
+	State ExecutionState
+	// ObservedAt is when Courier observed this state. It is the ordering
+	// fence: a source must ignore an observation of the same run whose
+	// ObservedAt is older than one it already accepted.
+	ObservedAt time.Time
+	// PR is the run's public pull request reference, when one exists. It is
+	// display context only; secrets, prompts, and work output never belong
+	// in an observation.
+	PR string
+}
+
+// ExecutionObserver optionally publishes best-effort execution observations
+// so a source can display live Courier work without fabricating its own
+// session, claim, or heartbeat rows. Reporting is non-authoritative
+// observability: absence, rejection, or failure must never affect discovery,
+// claim/admission, launch, status updates, publication, lifecycle
+// settlement, recovery, capacity release, or retention. An adapter returns
+// ErrUnsupportedExecutionObservations when its deployment cannot accept
+// observations at all; callers must then degrade this feature only, and must
+// never imitate it with ordinary lifecycle or report calls.
+type ExecutionObserver interface {
+	ReportExecution(context.Context, ExecutionObservation) error
+}
+
+// ErrUnsupportedExecutionObservations means the source deployment has not
+// adopted the execution-observation route at all — proven, for example, by a
+// bare 404/405/501 on the observations POST. It is a permanent posture for
+// the process (re-probed by the next restart, after a peer upgrade), not a
+// per-run condition, and it never shares a class with authentication
+// failures (401/403), rate limits, or 5xx, which stay distinct retryable
+// failures. Adapters must never degrade to weaker auth or imitate the
+// report through another endpoint.
+var ErrUnsupportedExecutionObservations = errors.New("source: execution observations are unsupported")
+
 // WorkIdentifier optionally maps a work item ID to the identity that decides
 // whether two items are the same work. An opaque ID can carry incidental
 // metadata (a URL, say) that changes between offers of the same work; the
