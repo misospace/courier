@@ -31,6 +31,7 @@ import (
 	couriergithub "github.com/misospace/courier/internal/github"
 	courierlog "github.com/misospace/courier/internal/log"
 	"github.com/misospace/courier/internal/source"
+	"github.com/misospace/courier/internal/source/adhoc"
 	"github.com/misospace/courier/internal/source/cron"
 	"github.com/misospace/courier/internal/source/dispatch"
 	"github.com/misospace/courier/internal/source/label"
@@ -366,6 +367,7 @@ func main() {
 
 	sources := controller.NewSourceRegistry(map[string]source.Adapter{
 		"manual": manual.New(diagnostics),
+		"adhoc":  adhoc.New(mgr.GetClient(), mgr.GetAPIReader()),
 	})
 	if dispatchEnabled {
 		if strings.TrimSpace(dispatchBaseURL) == "" || strings.TrimSpace(dispatchAgentName) == "" {
