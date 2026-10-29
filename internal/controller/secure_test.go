@@ -48,6 +48,10 @@ type fakeAdmissionForge struct {
 	issues       map[string]forge.WorkItem
 	readErr      error
 	issueReadErr error
+	// writeChecks and protectionReads count the credential-bound policy
+	// calls admission must never make on the operator's read identity.
+	writeChecks     int
+	protectionReads int
 }
 
 func (f *fakeAdmissionForge) ResolveRepository(_ context.Context, name string) (forge.Repository, error) {
@@ -69,10 +73,12 @@ func (f *fakeAdmissionForge) ReadRef(_ context.Context, repo forge.Repository, r
 }
 
 func (f *fakeAdmissionForge) ReadEffectiveProtection(context.Context, forge.Repository, string) (forge.Protection, error) {
+	f.protectionReads++
 	return forge.Protection{Protected: false}, nil
 }
 
 func (f *fakeAdmissionForge) CanWriteRepository(context.Context, forge.Repository) (bool, error) {
+	f.writeChecks++
 	return true, nil
 }
 
@@ -330,6 +336,216 @@ func TestResolveAdmissionFixPR(t *testing.T) {
 	if policy.SourceIssue != nil || len(policy.AcceptanceCriteria) > 0 || policy.AcceptanceCriteriaDigest != "" {
 		t.Fatalf("a fix-pr run pins nothing: %+v", policy)
 	}
+}
+
+// contributeForge serves the base repository and the approved fork the
+// contribute admission path reads.
+func contributeForge() *fakeAdmissionForge {
+	base := forge.Repository{ID: "repo-1", Canonical: "Acme/Widgets", DefaultRef: "main"}
+	fork := forge.Repository{ID: "repo-2", Canonical: "Contrib/Fork", DefaultRef: "main"}
+	return &fakeAdmissionForge{
+		repos: map[string]forge.Repository{
+			"acme/widgets": base, "Acme/Widgets": base,
+			"contrib/fork": fork, "Contrib/Fork": fork,
+		},
+		refs: map[string]forge.RefState{
+			"Acme/Widgets:main": {Ref: "main", OID: "baseoid", Exists: true},
+			"Contrib/Fork:courier/Acme/Widgets/goal-abcdef123456": {Ref: "courier/Acme/Widgets/goal-abcdef123456", Exists: false},
+			"Contrib/Fork:courier/Acme/Widgets/goal-111111111111": {Ref: "courier/Acme/Widgets/goal-111111111111", OID: "forktip", Exists: true},
+		},
+	}
+}
+
+func contributeRun(name string) *courier.CoderRun {
+	run := secureRun(name)
+	run.Spec.Mode = courier.ModeContribute
+	run.Spec.Ref = 0
+	run.Spec.WorkItemID = "adhoc-abcdef123456"
+	run.Spec.WorkRepo = "contrib/fork"
+	return run
+}
+
+// contributionRegistry builds a registry of one registration per serve
+// pattern set, so contribute-selection tests can stage fork coverage and
+// ambiguity precisely.
+func contributionRegistry(t *testing.T, serves ...[]string) *forge.Registry {
+	t.Helper()
+	parts := make([]string, 0, len(serves))
+	for i, patterns := range serves {
+		quoted := make([]string, 0, len(patterns))
+		for _, pattern := range patterns {
+			quoted = append(quoted, fmt.Sprintf("%q", pattern))
+		}
+		parts = append(parts, fmt.Sprintf(
+			`{"name":"provider-%d","type":"github","endpoint":"https://api.github.com/","credentials":{"forge-api":{"secretName":"s","key":"k"}},"serves":[%s]}`,
+			i+1, strings.Join(quoted, ",")))
+	}
+	registry, err := forge.Load([]byte(`{"providers":[`+strings.Join(parts, ",")+`]}`), "github")
+	if err != nil {
+		t.Fatalf("load contribution registry: %v", err)
+	}
+	return registry
+}
+
+// Admission resolves the contribute path into a cross-repo policy: the
+// canonical base and its default branch pinned with the observed tip, the
+// canonical fork as the work repository, and the goal branch derived from
+// the immutable idempotency key. A contribution pins no source issue and
+// no acceptance criteria.
+func TestResolveAdmissionContribute(t *testing.T) {
+	provider := contributeForge()
+	control, _ := secureControl(t)
+	control.Config.Providers = fakeProviderFactory(provider)
+
+	run := contributeRun("contribute")
+	registration, policy, err := control.ResolveAdmission(context.Background(), run)
+	if err != nil {
+		t.Fatalf("ResolveAdmission: %v", err)
+	}
+	if provider.writeChecks != 0 || provider.protectionReads != 0 {
+		t.Fatalf("admission performed %d write checks and %d protection reads on the operator's read identity",
+			provider.writeChecks, provider.protectionReads)
+	}
+	if registration.Name != "github" {
+		t.Fatalf("registration = %q", registration.Name)
+	}
+	if policy.RunUID != string(run.UID) || policy.ProviderConfigRef != "github" ||
+		policy.ProviderEndpoint != "https://api.github.com/" || policy.CredentialRefDigest == "" {
+		t.Fatalf("policy identity = %+v", policy)
+	}
+	if policy.BaseRepo != "Acme/Widgets" || policy.BaseRef != "main" || policy.BaseOID != "baseoid" {
+		t.Fatalf("base = %s@%s (%s)", policy.BaseRepo, policy.BaseRef, policy.BaseOID)
+	}
+	if policy.WorkRepo != "Contrib/Fork" || policy.WorkRef != "courier/Acme/Widgets/goal-abcdef123456" {
+		t.Fatalf("work = %q/%q", policy.WorkRepo, policy.WorkRef)
+	}
+	if !policy.WorkInitiallyAbsent || policy.WorkOID != "" {
+		t.Fatalf("absent fork branch must be recorded as initially absent: %+v", policy)
+	}
+	if policy.PRNumber != 0 || policy.HeadAnchorOID != "" ||
+		policy.SourceIssue != nil || len(policy.AcceptanceCriteria) > 0 || policy.AcceptanceCriteriaDigest != "" {
+		t.Fatalf("a contribute run pins no PR anchors, source issue, or criteria: %+v", policy)
+	}
+}
+
+// An existing fork branch at admission is recorded as the work tip, not as
+// an initially absent ref: the policy carries the observed OID and the
+// broker refuses an inconsistent initial-tip shape.
+func TestResolveAdmissionContributeExistingWorkTip(t *testing.T) {
+	control, _ := secureControl(t)
+	control.Config.Providers = fakeProviderFactory(contributeForge())
+
+	run := contributeRun("contribute-resume")
+	run.Spec.WorkItemID = "adhoc-111111111111"
+	_, policy, err := control.ResolveAdmission(context.Background(), run)
+	if err != nil {
+		t.Fatalf("ResolveAdmission: %v", err)
+	}
+	if policy.WorkInitiallyAbsent || policy.WorkOID != "forktip" {
+		t.Fatalf("existing fork branch = absent=%t oid=%q, want observed tip", policy.WorkInitiallyAbsent, policy.WorkOID)
+	}
+}
+
+// Each fail-closed contribute path terminalizes with a SecureNeedsHumanError
+// and never performs a credential-bound write check: the admission provider
+// runs on the operator's read identity, and push-permission verification
+// stays in the broker preflight under run credentials.
+func TestResolveAdmissionContributeFailsClosed(t *testing.T) {
+	needsHuman := func(t *testing.T, err error, message string) {
+		t.Helper()
+		if err == nil {
+			t.Fatal("ResolveAdmission unexpectedly succeeded")
+		}
+		var permanent *SecureNeedsHumanError
+		if !errors.As(err, &permanent) {
+			t.Fatalf("error %v is not a NeedsHuman rejection", err)
+		}
+		if !strings.Contains(err.Error(), message) {
+			t.Fatalf("error %q does not mention %q", err.Error(), message)
+		}
+	}
+
+	t.Run("fork outside the allowlist", func(t *testing.T) {
+		control, _ := secureControl(t)
+		control.Config.Providers = fakeProviderFactory(contributeForge())
+		control.Config.Registry = contributionRegistry(t, []string{"acme/*"})
+		_, _, err := control.ResolveAdmission(context.Background(), contributeRun("fork-unserved"))
+		needsHuman(t, err, "approved fork")
+	})
+
+	t.Run("ambiguous dual coverage", func(t *testing.T) {
+		control, _ := secureControl(t)
+		control.Config.Providers = fakeProviderFactory(contributeForge())
+		control.Config.Registry = contributionRegistry(t, []string{"acme/*", "contrib/*"}, []string{"*/*"})
+		_, _, err := control.ResolveAdmission(context.Background(), contributeRun("fork-ambiguous"))
+		needsHuman(t, err, "ambiguously")
+	})
+
+	t.Run("fork is the base repository", func(t *testing.T) {
+		control, _ := secureControl(t)
+		control.Config.Providers = fakeProviderFactory(contributeForge())
+		run := contributeRun("fork-is-base")
+		run.Spec.WorkRepo = "acme/widgets"
+		_, _, err := control.ResolveAdmission(context.Background(), run)
+		needsHuman(t, err, "distinct head")
+	})
+
+	t.Run("fork canonicalizes onto the base", func(t *testing.T) {
+		provider := contributeForge()
+		alias := forge.Repository{ID: "repo-1", Canonical: "Acme/Widgets", DefaultRef: "main"}
+		provider.repos["alias/fork"] = alias
+		control, _ := secureControl(t)
+		control.Config.Providers = fakeProviderFactory(provider)
+		run := contributeRun("fork-alias")
+		run.Spec.WorkRepo = "alias/fork"
+		_, _, err := control.ResolveAdmission(context.Background(), run)
+		needsHuman(t, err, "distinct head")
+	})
+
+	t.Run("incomplete fork identity", func(t *testing.T) {
+		provider := contributeForge()
+		provider.repos["contrib/half"] = forge.Repository{Canonical: "Contrib/Half"}
+		control, _ := secureControl(t)
+		control.Config.Providers = fakeProviderFactory(provider)
+		run := contributeRun("fork-incomplete")
+		run.Spec.WorkRepo = "contrib/half"
+		_, _, err := control.ResolveAdmission(context.Background(), run)
+		needsHuman(t, err, "incomplete identity")
+	})
+
+	t.Run("contribute spec carries work item or misses fork", func(t *testing.T) {
+		control, _ := secureControl(t)
+		control.Config.Providers = fakeProviderFactory(contributeForge())
+		emptyFork := contributeRun("fork-missing")
+		emptyFork.Spec.WorkRepo = ""
+		_, _, err := control.ResolveAdmission(context.Background(), emptyFork)
+		needsHuman(t, err, "approved fork")
+
+		withRef := contributeRun("ref-set")
+		withRef.Spec.Ref = 7
+		_, _, err = control.ResolveAdmission(context.Background(), withRef)
+		needsHuman(t, err, "approved fork")
+
+		blankKey := contributeRun("key-blank")
+		blankKey.Spec.WorkItemID = "   "
+		_, _, err = control.ResolveAdmission(context.Background(), blankKey)
+		needsHuman(t, err, "approved fork")
+	})
+
+	t.Run("unreadable fork is transient, not NeedsHuman", func(t *testing.T) {
+		provider := contributeForge()
+		provider.readErr = errors.New("forge unavailable")
+		control, _ := secureControl(t)
+		control.Config.Providers = fakeProviderFactory(provider)
+		_, _, err := control.ResolveAdmission(context.Background(), contributeRun("fork-unreadable"))
+		if err == nil {
+			t.Fatal("ResolveAdmission unexpectedly succeeded")
+		}
+		var permanent *SecureNeedsHumanError
+		if errors.As(err, &permanent) {
+			t.Fatalf("a transport failure must stay transient for retry: %v", err)
+		}
+	})
 }
 
 // criteriaForge serves a resolve-issue run against the miso-gallery#502

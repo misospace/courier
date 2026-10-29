@@ -2053,14 +2053,15 @@ status and dies with the CR).
 
 ```yaml
 spec:                       # set once by the source adapter, then immutable
-  mode: resolve-issue | fix-pr
-  source: dispatch | github-label | cron | cli | web
+  mode: resolve-issue | fix-pr | contribute
+  source: dispatch | github-label | cron | cli | web | adhoc
   sourceAgent: <optional stable identity for a qualified source binding>
   workItemID: <opaque ID understood by the source adapter>
   assignmentKind: merge-conflict | ci-failure | review-feedback | other # optional; the adapter's normalized why-the-source-issued-this classification
   assignmentReasons: [<bounded untrusted source free text>] # optional; why the source issued the run, never dedupe identity
   repo: owner/name
-  ref: <issue# or pr#>
+  ref: <issue# or pr#>           # required for resolve-issue/fix-pr; empty for contribute
+  workRepo: owner/name           # approved fork; required for contribute, empty otherwise
   lane: local | cloud | ...        # names a LaneProfile
   debug: false                     # per-run: bumps pod log level, nothing else
   # no attempts field — by design

@@ -235,6 +235,49 @@ func registrationMatches(r *Registration, repo string) bool {
 	return false
 }
 
+// SelectContribution returns the unique registration serving both the base
+// repository and the approved fork of a contribute run. The registration
+// serving a contribution must cover both repositories in its serves
+// patterns, because git credentials resolve per repository from that one
+// registration's credential refs: a fork outside the allowlist has no
+// credential path and fails closed. Zero matches for the base fails
+// exactly like Select; a served base whose registrations do not also
+// serve the fork fails closed naming the fork; more than one registration
+// serving both fails closed on ambiguity. Neither repository string is
+// widened or rewritten by selection.
+func (r *Registry) SelectContribution(base, work string) (*Registration, error) {
+	if r == nil {
+		return nil, errors.New("forge registry is not loaded")
+	}
+	var baseMatches, both []*Registration
+	for i := range r.registrations {
+		registration := &r.registrations[i]
+		if !registrationMatches(registration, base) {
+			continue
+		}
+		baseMatches = append(baseMatches, registration)
+		if registrationMatches(registration, work) {
+			both = append(both, registration)
+		}
+	}
+	switch {
+	case len(both) == 1:
+		return both[0], nil
+	case len(baseMatches) == 0:
+		return nil, fmt.Errorf("no provider registration serves repository %q", base)
+	case len(both) == 0:
+		return nil, fmt.Errorf("no provider registration serving %q also serves the approved fork %q", base, work)
+	default:
+		names := make([]string, 0, len(both))
+		for _, match := range both {
+			names = append(names, match.Name)
+		}
+		sort.Strings(names)
+		return nil, fmt.Errorf("repositories %q and %q are served ambiguously by provider registrations %s",
+			base, work, strings.Join(names, ", "))
+	}
+}
+
 func patternHalf(pattern, value string) bool {
 	if pattern == "*" {
 		return true

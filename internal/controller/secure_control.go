@@ -224,7 +224,10 @@ func (s *SecureControl) ResolveAdmission(ctx context.Context, run *courier.Coder
 			"secure mode requires runs in the dedicated namespace %q; this run lives in %q",
 			s.Config.RunNamespace, run.Namespace)
 	}
-	registration, err := s.Config.Registry.Select(run.Spec.Repo)
+	if err := s.checkContributionShape(run); err != nil {
+		return nil, nil, err
+	}
+	registration, err := s.selectRegistration(run)
 	if err != nil {
 		return nil, nil, secureNeedsHuman("ProviderSelection", "provider selection failed for %q: %v", run.Spec.Repo, err)
 	}
@@ -377,10 +380,96 @@ func (s *SecureControl) ResolveAdmission(ctx context.Context, run *courier.Coder
 		policy.WorkOID = pr.HeadSHA
 		policy.HeadAnchorOID = pr.HeadSHA
 		policy.PRNumber = pr.Number
+	case courier.ModeContribute:
+		// The approved fork's canonical identity is resolved through the
+		// operator's read identity, exactly like the base. Write authority
+		// is never verified here: admission establishes it from
+		// configuration policy alone — the registry's dual serve coverage
+		// above and the registration's credential refs — and the
+		// credential-bound CanWriteRepository verification runs in the
+		// broker preflight under the run's own credentials.
+		workRepo, err := admission.Policy.ResolveRepository(ctx, run.Spec.WorkRepo)
+		if err != nil {
+			return nil, nil, transientOrNeedsHuman(err, "ProviderRead", "work repository read for %q failed: %v", run.Spec.WorkRepo, err)
+		}
+		if workRepo.ID == "" || workRepo.Canonical == "" {
+			return nil, nil, secureNeedsHuman("ProviderRead",
+				"work repository %q resolved to an incomplete identity", run.Spec.WorkRepo)
+		}
+		// A contribute policy publishes only into the work repository, so a
+		// fork whose canonical identity is the base itself would make the
+		// base writable; the broker refuses the same shape at its boundary.
+		if workRepo.Canonical == canonical.Canonical {
+			return nil, nil, secureNeedsHuman("ContributionPolicy",
+				"the approved fork %q is the base repository; a contribution publishes from a distinct head",
+				workRepo.Canonical)
+		}
+		// The base ref is not a spec field for a contribution: the base
+		// repository's default branch is resolved read-only here and pinned
+		// with its observed tip, which publication later rechecks.
+		base, err := admission.Policy.ReadRef(ctx, canonical, canonical.DefaultRef)
+		if err != nil {
+			return nil, nil, transientOrNeedsHuman(err, "ProviderRead", "base ref read for %q failed: %v", canonical.Canonical, err)
+		}
+		if !base.Exists || base.OID == "" {
+			return nil, nil, secureNeedsHuman("ProviderRead",
+				"base ref %q of %q does not exist", canonical.DefaultRef, canonical.Canonical)
+		}
+		workRef := branch.ResolveGoalBranch(canonical.Canonical, run.Spec.WorkItemID)
+		if workRef == "" {
+			return nil, nil, errors.New("secure admission: cannot derive the work ref")
+		}
+		work, err := admission.Policy.ReadRef(ctx, workRepo, workRef)
+		if err != nil {
+			return nil, nil, transientOrNeedsHuman(err, "ProviderRead", "work ref read for %q failed: %v", workRef, err)
+		}
+		policy.BaseRef = canonical.DefaultRef
+		policy.BaseOID = base.OID
+		policy.WorkRepo = workRepo.Canonical
+		policy.WorkRef = workRef
+		policy.WorkInitiallyAbsent = !work.Exists
+		if work.Exists {
+			policy.WorkOID = work.OID
+		}
+		// A contribution pins no acceptance criteria and no source-issue
+		// identity: upstream issue context in SourceContext is untrusted
+		// task data, and a trusted pin would have to come from the
+		// submitting frontend's own policy configuration, which V1 does
+		// not carry.
 	default:
 		return nil, nil, fmt.Errorf("secure admission: unknown run mode %q", run.Spec.Mode)
 	}
 	return registration, policy, nil
+}
+
+// selectRegistration resolves the registration for the run's immutable
+// spec.repo. A contribute run requires dual coverage: the registration
+// serving the contribution must carry both the base repository and the
+// approved fork in its serves patterns, because git credentials resolve
+// per repository from that one registration's credential refs. A fork
+// outside the allowlist or an ambiguous selection fails closed.
+func (s *SecureControl) selectRegistration(run *courier.CoderRun) (*forge.Registration, error) {
+	if run.Spec.Mode == courier.ModeContribute {
+		return s.Config.Registry.SelectContribution(run.Spec.Repo, run.Spec.WorkRepo)
+	}
+	return s.Config.Registry.Select(run.Spec.Repo)
+}
+
+// checkContributionShape fails closed before any registry or provider
+// contact when a contribute run's immutable spec cannot yield a complete
+// publication policy. The CRD rules should make this shape unreachable;
+// a direct construction that bypassed them is deterministic — the spec is
+// immutable — so it terminalizes NeedsHuman rather than retrying forever.
+func (s *SecureControl) checkContributionShape(run *courier.CoderRun) error {
+	if run.Spec.Mode != courier.ModeContribute {
+		return nil
+	}
+	if run.Spec.Ref != 0 || run.Spec.WorkRepo == "" || strings.TrimSpace(run.Spec.WorkItemID) == "" {
+		return secureNeedsHuman("ContributionPolicy",
+			"a contribute run carries an approved fork and no source-owned work item; spec.ref is %d, spec.workRepo is %q, and spec.workItemID is %q",
+			run.Spec.Ref, run.Spec.WorkRepo, run.Spec.WorkItemID)
+	}
+	return nil
 }
 
 // transientOrNeedsHuman classifies a provider read failure. Provider
