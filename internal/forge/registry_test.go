@@ -154,6 +154,63 @@ func TestSelectPatternMatching(t *testing.T) {
 	})
 }
 
+func TestSelectContributionCoversBaseAndFork(t *testing.T) {
+	load := func(data string) *Registry {
+		t.Helper()
+		registry, err := Load([]byte(data), "github")
+		if err != nil {
+			t.Fatalf("Load: %v", err)
+		}
+		return registry
+	}
+	const one = `{"providers":[{"name":"github","type":"github","endpoint":"https://api.github.com/","credentials":{"forge-api":{"secretName":"s","key":"k"}},"serves":["acme/*","contrib/*"]}]}`
+	const split = `{"providers":[
+		{"name":"upstream","type":"github","endpoint":"https://api.github.com/","credentials":{"forge-api":{"secretName":"s","key":"k"}},"serves":["acme/*"]},
+		{"name":"forks","type":"github","endpoint":"https://api.github.com/","credentials":{"forge-api":{"secretName":"s","key":"k"}},"serves":["contrib/*"]}
+	]}`
+	const two = `{"providers":[
+		{"name":"first","type":"github","endpoint":"https://api.github.com/","credentials":{"forge-api":{"secretName":"s","key":"k"}},"serves":["acme/*","contrib/*"]},
+		{"name":"second","type":"github","endpoint":"https://api.github.com/","credentials":{"forge-api":{"secretName":"s","key":"k"}},"serves":["acme/*","contrib/*"]}
+	]}`
+
+	t.Run("unique dual coverage selects", func(t *testing.T) {
+		registration, err := load(one).SelectContribution("acme/widgets", "contrib/fork")
+		if err != nil {
+			t.Fatalf("SelectContribution: %v", err)
+		}
+		if registration.Name != "github" {
+			t.Fatalf("selected registration = %q", registration.Name)
+		}
+	})
+
+	t.Run("fork outside the allowlist fails closed", func(t *testing.T) {
+		_, err := load(split).SelectContribution("acme/widgets", "contrib/fork")
+		if err == nil || !strings.Contains(err.Error(), "approved fork") {
+			t.Fatalf("fork-not-served error = %v", err)
+		}
+		if !strings.Contains(err.Error(), "contrib/fork") {
+			t.Fatalf("error must name the fork: %v", err)
+		}
+	})
+
+	t.Run("unserved base fails closed like Select", func(t *testing.T) {
+		_, err := load(one).SelectContribution("other/widgets", "contrib/fork")
+		if err == nil || !strings.Contains(err.Error(), "no provider registration serves repository") {
+			t.Fatalf("unserved-base error = %v", err)
+		}
+	})
+
+	t.Run("dual ambiguity fails closed", func(t *testing.T) {
+		_, err := load(two).SelectContribution("acme/widgets", "contrib/fork")
+		if err == nil || !strings.Contains(err.Error(), "ambiguously") {
+			t.Fatalf("ambiguous error = %v", err)
+		}
+		if !strings.Contains(err.Error(), "first") || !strings.Contains(err.Error(), "second") {
+			t.Fatalf("ambiguity diagnostic must name both registrations: %v", err)
+		}
+	})
+}
+
 func TestGitEndpointTemplate(t *testing.T) {
 	cases := map[string]struct {
 		typ, endpoint, gitEndpoint, want string
