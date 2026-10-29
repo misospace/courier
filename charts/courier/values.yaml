@@ -12,6 +12,24 @@
 crds:
   enabled: true
 
+# -- Deployment ownership boundary. The operator reconciles CoderRuns only in
+#    these namespaces; a run in any other namespace belongs to another
+#    release's controller and is a strict no-op (no status writes, source
+#    calls, pod or secret access, finalizer or retention action). Required
+#    when a second release runs side-by-side: list every namespace carrying
+#    this release's runs, and the operator namespace too when any discovery
+#    source is enabled (discovery materializes runs there). Empty keeps the
+#    single-controller default: secure mode owns secure.runNamespace, legacy
+#    mode owns every namespace. The manager's run/lane/pod watches and the
+#    capacity and retention gauges follow this set; preflight reads of nodes,
+#    namespaces and cluster services stay unrestricted.
+ownership:
+  namespaces: []
+  # -- Lease name for leader election. Two releases sharing one operator
+#    namespace need distinct IDs; separate operator namespaces already
+#    isolate the lease. Empty keeps "courier.misospace.dev".
+  leaderElectionID: ""
+
 executor:
   openCode:
     agent: coordinator
@@ -131,6 +149,15 @@ secure:
   probeImage: "busybox:1.38@sha256:fd7dc98638c8e305f4dc34e979f1c0fdfdcaeb0fbf8fcff77ae834b6da3d7e6e"
   dependencyCacheService: ""
   dependencyCachePort: 0
+  # -- Name of the ClusterRole granting per-run brokers TokenReview
+#    creation. The chart renders the ClusterRole and passes the same name to
+#    the operator, whose per-run ClusterRoleBindings reference it. Two
+#    secure-enabled releases sharing one cluster must set distinct values so
+#    the fixed cluster-scoped name never collides (#632); empty keeps the
+#    historical "courier-broker-tokenreview". Change it only while no secure
+#    runs are live: a run provisioned under the old name keeps its existing
+#    binding target until its topology is revoked.
+  brokerTokenReviewClusterRole: ""
   # -- Model gateway for the native harness control pod (#124). url is the
   #    OpenAI-compatible API root (for example http://litellm:4000/v1);
   #    keySecret names a Secret in the operator's namespace whose key holds

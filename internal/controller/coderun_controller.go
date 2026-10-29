@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"reflect"
+	"slices"
 	"strings"
 	"time"
 	"unicode/utf8"
@@ -193,6 +194,13 @@ type CoderRunReconciler struct {
 	// Nil means the deployment runs legacy mode only, which stays explicitly
 	// insecure.
 	Secure *SecureControl
+
+	// OwnedNamespaces is the deployment-ownership boundary (#632): the run
+	// namespaces this controller instance reconciles. A run outside them
+	// belongs to another deployment's controller, and every reconcile is a
+	// strict no-op ahead of any read or write. Empty means the
+	// backward-compatible single-controller default resolved by owns.
+	OwnedNamespaces []string
 }
 
 // metrics returns the run recorder to use, defaulting to the process-wide
@@ -202,6 +210,22 @@ func (r *CoderRunReconciler) metrics() *RunRecorder {
 		return r.Metrics
 	}
 	return processRunRecorder()
+}
+
+// owns reports whether this deployment owns the namespace of a run. An
+// explicit OwnedNamespaces list is authoritative. Otherwise a secure-mode
+// controller owns exactly its configured run namespace: an out-of-scope run
+// belongs to another deployment's controller, and finalizing it here would
+// finalize work owned by another controller. A legacy controller with no
+// configured list owns every namespace, the single-controller default.
+func (r *CoderRunReconciler) owns(namespace string) bool {
+	if len(r.OwnedNamespaces) > 0 {
+		return slices.Contains(r.OwnedNamespaces, namespace)
+	}
+	if r.Secure != nil && r.Secure.Config.RunNamespace != "" {
+		return namespace == r.Secure.Config.RunNamespace
+	}
+	return true
 }
 
 // +kubebuilder:rbac:groups=courier.misospace.dev,resources=coderruns,verbs=get;list;watch;create;update;patch;delete
@@ -222,6 +246,15 @@ func (r *CoderRunReconciler) metrics() *RunRecorder {
 const secureTopologyFinalizer = topology.FinalizerName
 
 func (r *CoderRunReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
+	// Deployment ownership boundary (#632): runs outside this controller's
+	// owned namespaces belong to another deployment's controller. Finalizing
+	// here would race that controller's writes, report to its source, and
+	// tear down its topology, so out-of-scope runs are a strict no-op before
+	// any read or write.
+	if !r.owns(req.Namespace) {
+		return ctrl.Result{}, nil
+	}
+
 	l := log.FromContext(ctx)
 
 	var run courierv1alpha1.CoderRun

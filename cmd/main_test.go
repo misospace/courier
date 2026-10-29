@@ -883,3 +883,217 @@ func TestCronLaneGroups(t *testing.T) {
 		t.Fatalf("empty input produced %+v", groups)
 	}
 }
+
+func TestResolveOwnership(t *testing.T) {
+	tests := []struct {
+		name        string
+		input       ownershipInput
+		wantOwned   []string
+		wantWatched []string
+		wantErr     string
+	}{
+		{
+			name:  "legacy with no list keeps the all-namespaces default",
+			input: ownershipInput{podNamespace: "courier-system"},
+		},
+		{
+			name:  "explicit list is authoritative and adds the operator namespace to the watch set",
+			input: ownershipInput{owned: []string{"runs-a", "runs-b"}, podNamespace: "courier-system"},
+			wantOwned: []string{
+				"runs-a", "runs-b",
+			},
+			wantWatched: []string{"runs-a", "runs-b", "courier-system"},
+		},
+		{
+			name:  "duplicate and whitespace entries collapse",
+			input: ownershipInput{owned: []string{" runs-a ", "runs-a", "runs-a"}},
+			wantOwned: []string{
+				"runs-a",
+			},
+			wantWatched: []string{"runs-a"},
+		},
+		{
+			name:    "empty and invalid names fail closed",
+			input:   ownershipInput{owned: []string{"Bad_Namespace"}},
+			wantErr: "not a valid namespace name",
+		},
+		{
+			name:    "blank entries fail closed",
+			input:   ownershipInput{owned: []string{"runs-a", " "}},
+			wantErr: "not a valid namespace name",
+		},
+		{
+			name:  "secure without a list owns exactly its run namespace",
+			input: ownershipInput{secureMode: true, runNamespace: "runs-a", podNamespace: "runs-a"},
+			wantOwned: []string{
+				"runs-a",
+			},
+			wantWatched: []string{"runs-a"},
+		},
+		{
+			name:    "secure requires its run namespace",
+			input:   ownershipInput{secureMode: true},
+			wantErr: "requires --run-namespace",
+		},
+		{
+			name:    "secure rejects a boundary that excludes its run namespace",
+			input:   ownershipInput{secureMode: true, runNamespace: "runs-a", owned: []string{"runs-b"}},
+			wantErr: "must be among the --owned-namespace values",
+		},
+		{
+			name:  "secure accepts a boundary carrying its run namespace",
+			input: ownershipInput{secureMode: true, runNamespace: "runs-a", owned: []string{"runs-a", "runs-b"}, podNamespace: "courier-system"},
+			wantOwned: []string{
+				"runs-a", "runs-b",
+			},
+			wantWatched: []string{"runs-a", "runs-b", "courier-system"},
+		},
+		{
+			name:  "discovery is allowed where the operator namespace is owned",
+			input: ownershipInput{owned: []string{"runs-a"}, podNamespace: "runs-a", discoveryEnabled: true},
+			wantOwned: []string{
+				"runs-a",
+			},
+			wantWatched: []string{"runs-a"},
+		},
+		{
+			name:    "discovery fails closed when the operator namespace is foreign",
+			input:   ownershipInput{owned: []string{"runs-a"}, podNamespace: "courier-system", discoveryEnabled: true},
+			wantErr: "materialize CoderRuns in the operator namespace",
+		},
+		{
+			name:    "secure discovery fails closed when the operator runs outside the run namespace",
+			input:   ownershipInput{secureMode: true, runNamespace: "runs-a", podNamespace: "courier-system", discoveryEnabled: true},
+			wantErr: "materialize CoderRuns in the operator namespace",
+		},
+		{
+			name:  "an unbounded legacy deployment discovers freely",
+			input: ownershipInput{podNamespace: "courier-system", discoveryEnabled: true},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			owned, watched, err := resolveOwnership(test.input)
+			if test.wantErr != "" {
+				if err == nil || !strings.Contains(err.Error(), test.wantErr) {
+					t.Fatalf("error = %v, want one containing %q", err, test.wantErr)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("resolveOwnership: %v", err)
+			}
+			if !reflect.DeepEqual(owned, test.wantOwned) {
+				t.Fatalf("owned = %q, want %q", owned, test.wantOwned)
+			}
+			if !reflect.DeepEqual(watched, test.wantWatched) {
+				t.Fatalf("watched = %q, want %q", watched, test.wantWatched)
+			}
+		})
+	}
+}
+
+func TestControllerCacheOptionsScopeRunKinds(t *testing.T) {
+	if opts := controllerCacheOptions(nil); len(opts.ByObject) != 0 {
+		t.Fatalf("empty watch set restricted %d object kinds, want the unrestricted default", len(opts.ByObject))
+	}
+	opts := controllerCacheOptions([]string{"runs-a", "courier-system"})
+	want := map[string]bool{
+		"CoderRun":    false,
+		"LaneProfile": false,
+		"Pod":         false,
+	}
+	for object, scoped := range opts.ByObject {
+		kind := reflect.TypeOf(object).Elem().Name()
+		if _, ok := want[kind]; !ok {
+			t.Fatalf("cache restricted unexpected kind %s; preflight-visible kinds must stay cluster-wide", kind)
+		}
+		want[kind] = true
+		if len(scoped.Namespaces) != 2 {
+			t.Fatalf("kind %s watches %d namespaces, want the watched set", kind, len(scoped.Namespaces))
+		}
+		for _, namespace := range []string{"runs-a", "courier-system"} {
+			if _, ok := scoped.Namespaces[namespace]; !ok {
+				t.Fatalf("kind %s does not watch %q", kind, namespace)
+			}
+		}
+	}
+	for kind, seen := range want {
+		if !seen {
+			t.Fatalf("cache did not restrict %s", kind)
+		}
+	}
+}
+
+func TestBuildSecureControlCarriesTokenReviewClusterRole(t *testing.T) {
+	registryFile := filepath.Join(t.TempDir(), "providers.json")
+	providers := `{"providers":[{"name":"github","type":"github","endpoint":"https://api.github.com/","credentials":{"forge-api":{"secretName":"forge-creds","key":"token"}},"serves":["*"]}]}`
+	if err := os.WriteFile(registryFile, []byte(providers), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	observerClient, err := couriergithub.NewClient("https://api.github.com/", "operator-read-token", &recordingForgeTransport{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	observer := couriergithub.Observer{Client: observerClient}
+	control, err := buildSecureControl(secureConfig{
+		providersFile:   registryFile,
+		runNamespace:    "runs",
+		observer:        observer,
+		restConfig:      &rest.Config{Host: "https://127.0.0.1:1"},
+		tokenReviewRole: "native-broker-tokenreview",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := control.Config.TokenReviewClusterRole; got != "native-broker-tokenreview" {
+		t.Fatalf("TokenReviewClusterRole = %q, want the configured override", got)
+	}
+	defaulted, err := buildSecureControl(secureConfig{
+		providersFile:   registryFile,
+		runNamespace:    "runs",
+		observer:        observer,
+		restConfig:      &rest.Config{Host: "https://127.0.0.1:1"},
+		tokenReviewRole: defaultBrokerTokenReviewClusterRole,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if defaulted.Config.TokenReviewClusterRole != defaultBrokerTokenReviewClusterRole {
+		t.Fatalf("TokenReviewClusterRole = %q, want the historical default", defaulted.Config.TokenReviewClusterRole)
+	}
+}
+
+// The operator binds the ClusterRole rendered by secure.yaml.tpl by name, so
+// the Go default and the template's fallback literal must never drift.
+func TestBrokerTokenReviewDefaultMatchesChart(t *testing.T) {
+	template, err := os.ReadFile(filepath.Join("..", "charts", "courier", "templates", "secure.yaml.tpl"))
+	if err != nil {
+		t.Fatalf("read secure template: %v", err)
+	}
+	if !strings.Contains(string(template), `default "`+defaultBrokerTokenReviewClusterRole+`"`) {
+		t.Fatalf("secure.yaml.tpl must fall back to the operator default %q for the broker TokenReview ClusterRole", defaultBrokerTokenReviewClusterRole)
+	}
+	data, err := os.ReadFile(filepath.Join("..", "charts", "courier", "values.yaml"))
+	if err != nil {
+		t.Fatalf("read chart values: %v", err)
+	}
+	var values struct {
+		Secure struct {
+			BrokerTokenReviewClusterRole string `json:"brokerTokenReviewClusterRole"`
+		} `json:"secure"`
+		Ownership struct {
+			Namespaces       []string `json:"namespaces"`
+			LeaderElectionID string   `json:"leaderElectionID"`
+		} `json:"ownership"`
+	}
+	if err := yaml.Unmarshal(data, &values); err != nil {
+		t.Fatalf("parse chart values: %v", err)
+	}
+	if strings.TrimSpace(values.Secure.BrokerTokenReviewClusterRole) != "" {
+		t.Fatal("chart default for secure.brokerTokenReviewClusterRole must stay empty so single releases keep the historical name")
+	}
+	if len(values.Ownership.Namespaces) != 0 || strings.TrimSpace(values.Ownership.LeaderElectionID) != "" {
+		t.Fatal("chart defaults for ownership must stay empty so a single release keeps the backward-compatible boundary")
+	}
+}

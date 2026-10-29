@@ -1200,3 +1200,139 @@ func TestTerminalBacklogCollectorListFailure(t *testing.T) {
 		t.Fatalf("courier_terminal_backlog_scrape_errors_total = %v, want 1", m.GetCounter())
 	}
 }
+
+// A lane collector scoped to one deployment's namespaces counts only that
+// namespace's runs and seeds only its lanes; the unscoped default counts the
+// whole cluster.
+func TestLaneCollectorScopedToNamespace(t *testing.T) {
+	local := admissionLane("local", 2)
+	cloud := admissionLane("cloud", 1)
+	cloud.Namespace = "foreign-ns"
+	localClaimed := admissionRun("local-claimed", "local", courierv1alpha1.PhaseClaimed)
+	localPending := admissionRun("local-pending", "local", courierv1alpha1.PhasePending)
+	foreignClaimed := admissionRun("foreign-claimed", "cloud", courierv1alpha1.PhaseClaimed)
+	foreignClaimed.Namespace = "foreign-ns"
+	foreignPending := admissionRun("foreign-pending", "cloud", courierv1alpha1.PhasePending)
+	foreignPending.Namespace = "foreign-ns"
+
+	c := phaseClient(t, local, cloud, localClaimed, localPending, foreignClaimed, foreignPending)
+	now := func() time.Time { return timestampClock }
+
+	scoped := NewLaneCollector(c, "default")
+	scoped.now = now
+	scopedRegistry := prometheus.NewRegistry()
+	scopedRegistry.MustRegister(scoped)
+	if got := gaugeValue(t, gatherMetric(t, scopedRegistry, "courier_coderuns_in_flight", map[string]string{"lane": "local"}), "courier_coderuns_in_flight"); got != 1 {
+		t.Fatalf("scoped in-flight local = %v, want 1", got)
+	}
+	if got := gaugeValue(t, gatherMetric(t, scopedRegistry, "courier_lane_reservations", map[string]string{"lane": "local"}), "courier_lane_reservations"); got != 2 {
+		t.Fatalf("scoped reservations local = %v, want 2 (Claimed + Pending)", got)
+	}
+	if got := gaugeValue(t, gatherMetric(t, scopedRegistry, "courier_coderuns_pending", map[string]string{"lane": "local"}), "courier_coderuns_pending"); got != 1 {
+		t.Fatalf("scoped pending local = %v, want 1", got)
+	}
+	if _, present := gaugeValueIfPresent(t, scopedRegistry, "courier_coderuns_in_flight", map[string]string{"lane": "cloud"}); present {
+		t.Fatal("scoped collector must not count a foreign namespace's runs")
+	}
+	if _, present := gaugeValueIfPresent(t, scopedRegistry, "courier_coderuns_pending", map[string]string{"lane": "cloud"}); present {
+		t.Fatal("scoped collector must not count a foreign namespace's pending runs")
+	}
+	if _, present := gaugeValueIfPresent(t, scopedRegistry, "courier_lane_suspended", map[string]string{"lane": "cloud"}); present {
+		t.Fatal("scoped collector must not seed a foreign namespace's lane")
+	}
+	if _, present := gaugeValueIfPresent(t, scopedRegistry, "courier_lane_concurrency", map[string]string{"lane": "cloud"}); present {
+		t.Fatal("scoped collector must not seed a foreign namespace's lane concurrency")
+	}
+
+	unscoped := NewLaneCollector(c)
+	unscoped.now = now
+	unscopedRegistry := prometheus.NewRegistry()
+	unscopedRegistry.MustRegister(unscoped)
+	if got := gaugeValue(t, gatherMetric(t, unscopedRegistry, "courier_coderuns_in_flight", map[string]string{"lane": "local"}), "courier_coderuns_in_flight"); got != 1 {
+		t.Fatalf("unscoped in-flight local = %v, want 1", got)
+	}
+	if got := gaugeValue(t, gatherMetric(t, unscopedRegistry, "courier_coderuns_in_flight", map[string]string{"lane": "cloud"}), "courier_coderuns_in_flight"); got != 1 {
+		t.Fatalf("unscoped in-flight cloud = %v, want 1", got)
+	}
+	if got := gaugeValue(t, gatherMetric(t, unscopedRegistry, "courier_coderuns_pending", map[string]string{"lane": "cloud"}), "courier_coderuns_pending"); got != 1 {
+		t.Fatalf("unscoped pending cloud = %v, want 1", got)
+	}
+	if got := gaugeValue(t, gatherMetric(t, unscopedRegistry, "courier_lane_concurrency", map[string]string{"lane": "cloud"}), "courier_lane_concurrency"); got != 1 {
+		t.Fatalf("unscoped lane concurrency cloud = %v, want 1", got)
+	}
+}
+
+// A terminal-age collector scoped to one namespace reports only that
+// namespace's oldest terminal run; the unscoped default sees the whole
+// cluster's oldest.
+func TestTerminalAgeCollectorScopedToNamespace(t *testing.T) {
+	now := timestampClock
+	owned := terminalReapRun("owned-failed", courierv1alpha1.PhaseFailed, now.Add(-3*time.Hour))
+	foreign := terminalReapRun("foreign-failed", courierv1alpha1.PhaseFailed, now.Add(-5*time.Hour))
+	foreign.Namespace = "foreign-ns"
+
+	c := phaseClient(t, owned, foreign)
+
+	scoped := NewTerminalAgeCollector(c, "default")
+	scoped.now = func() time.Time { return now }
+	scopedRegistry := prometheus.NewRegistry()
+	scopedRegistry.MustRegister(scoped)
+	if got := gaugeValue(t, gatherMetric(t, scopedRegistry, "courier_coderuns_oldest_terminal_age_seconds", map[string]string{"phase": "Failed"}), "courier_coderuns_oldest_terminal_age_seconds"); got != (3 * time.Hour).Seconds() {
+		t.Fatalf("scoped oldest Failed = %v, want %v", got, (3 * time.Hour).Seconds())
+	}
+
+	unscoped := NewTerminalAgeCollector(c)
+	unscoped.now = func() time.Time { return now }
+	unscopedRegistry := prometheus.NewRegistry()
+	unscopedRegistry.MustRegister(unscoped)
+	if got := gaugeValue(t, gatherMetric(t, unscopedRegistry, "courier_coderuns_oldest_terminal_age_seconds", map[string]string{"phase": "Failed"}), "courier_coderuns_oldest_terminal_age_seconds"); got != (5 * time.Hour).Seconds() {
+		t.Fatalf("unscoped oldest Failed = %v, want %v", got, (5 * time.Hour).Seconds())
+	}
+}
+
+// A terminal-backlog collector scoped to one namespace reports only that
+// namespace's terminal runs; the unscoped default reports both.
+func TestTerminalBacklogCollectorScopedToNamespace(t *testing.T) {
+	now := timestampClock
+	owned := withLifecycleReported(admissionRun("owned-pending", "local", courierv1alpha1.PhaseNeedsHuman), metav1.ConditionFalse, lifecycleReportPendingReason)
+	owned.Status.FinishedAt = &metav1.Time{Time: now.Add(-2 * time.Hour)}
+	foreign := withLifecycleReported(admissionRun("foreign-pending", "cloud", courierv1alpha1.PhaseNeedsHuman), metav1.ConditionFalse, lifecycleReportPendingReason)
+	foreign.Namespace = "foreign-ns"
+	foreign.Status.FinishedAt = &metav1.Time{Time: now.Add(-5 * time.Hour)}
+
+	c := phaseClient(t, owned, foreign)
+
+	scoped := NewTerminalBacklogCollector(c, "default")
+	scoped.now = func() time.Time { return now }
+	scopedRegistry := prometheus.NewRegistry()
+	scopedRegistry.MustRegister(scoped)
+	if got := gaugeValue(t, gatherMetric(t, scopedRegistry, "courier_coderuns_awaiting_reap", map[string]string{"phase": "NeedsHuman"}), "courier_coderuns_awaiting_reap"); got != 1 {
+		t.Fatalf("scoped awaiting reap NeedsHuman = %v, want 1", got)
+	}
+	if got := gaugeValue(t, gatherMetric(t, scopedRegistry, "courier_coderuns_lifecycle_pending", map[string]string{"lane": "local"}), "courier_coderuns_lifecycle_pending"); got != 1 {
+		t.Fatalf("scoped lifecycle pending local = %v, want 1", got)
+	}
+	if got := gaugeValue(t, gatherMetric(t, scopedRegistry, "courier_coderuns_lifecycle_pending_oldest_age_seconds", map[string]string{"lane": "local"}), "courier_coderuns_lifecycle_pending_oldest_age_seconds"); got != (2 * time.Hour).Seconds() {
+		t.Fatalf("scoped oldest pending age local = %v, want %v", got, (2 * time.Hour).Seconds())
+	}
+	if _, present := gaugeValueIfPresent(t, scopedRegistry, "courier_coderuns_lifecycle_pending", map[string]string{"lane": "cloud"}); present {
+		t.Fatal("scoped collector must not count a foreign namespace's pending report")
+	}
+
+	unscoped := NewTerminalBacklogCollector(c)
+	unscoped.now = func() time.Time { return now }
+	unscopedRegistry := prometheus.NewRegistry()
+	unscopedRegistry.MustRegister(unscoped)
+	if got := gaugeValue(t, gatherMetric(t, unscopedRegistry, "courier_coderuns_awaiting_reap", map[string]string{"phase": "NeedsHuman"}), "courier_coderuns_awaiting_reap"); got != 2 {
+		t.Fatalf("unscoped awaiting reap NeedsHuman = %v, want 2", got)
+	}
+	if got := gaugeValue(t, gatherMetric(t, unscopedRegistry, "courier_coderuns_lifecycle_pending", map[string]string{"lane": "local"}), "courier_coderuns_lifecycle_pending"); got != 1 {
+		t.Fatalf("unscoped lifecycle pending local = %v, want 1", got)
+	}
+	if got := gaugeValue(t, gatherMetric(t, unscopedRegistry, "courier_coderuns_lifecycle_pending", map[string]string{"lane": "cloud"}), "courier_coderuns_lifecycle_pending"); got != 1 {
+		t.Fatalf("unscoped lifecycle pending cloud = %v, want 1", got)
+	}
+	if got := gaugeValue(t, gatherMetric(t, unscopedRegistry, "courier_coderuns_lifecycle_pending_oldest_age_seconds", map[string]string{"lane": "cloud"}), "courier_coderuns_lifecycle_pending_oldest_age_seconds"); got != (5 * time.Hour).Seconds() {
+		t.Fatalf("unscoped oldest pending age cloud = %v, want %v", got, (5 * time.Hour).Seconds())
+	}
+}

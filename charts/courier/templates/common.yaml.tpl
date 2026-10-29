@@ -224,6 +224,8 @@
 {{- $hasProbeImage := false }}
 {{- $hasCacheService := false }}
 {{- $hasCachePort := false }}
+{{- $hasBrokerTokenReviewRole := false }}
+{{- $explicitBrokerTokenReviewRole := "" }}
 {{- range $arg := $args }}
 {{- if hasPrefix "--secure-mode=" $arg }}{{- $hasSecureMode = true }}{{- end }}
 {{- if hasPrefix "--forge-providers-file=" $arg }}{{- $hasProvidersFile = true }}{{- end }}
@@ -232,6 +234,7 @@
 {{- if hasPrefix "--probe-image=" $arg }}{{- $hasProbeImage = true }}{{- end }}
 {{- if hasPrefix "--dependency-cache-service=" $arg }}{{- $hasCacheService = true }}{{- end }}
 {{- if hasPrefix "--dependency-cache-port=" $arg }}{{- $hasCachePort = true }}{{- end }}
+{{- if hasPrefix "--broker-tokenreview-cluster-role=" $arg }}{{- $hasBrokerTokenReviewRole = true }}{{- $explicitBrokerTokenReviewRole = $arg }}{{- end }}
 {{- end }}
 {{- if not $hasSecureMode }}{{- $args = append $args "--secure-mode=true" }}{{- end }}
 {{- if not $hasProvidersFile }}{{- $args = append $args "--forge-providers-file=/etc/courier/forge-providers.json" }}{{- end }}
@@ -246,6 +249,19 @@
 {{- if $secure.dependencyCachePort }}
 {{- if not $hasCachePort }}{{- $args = append $args (printf "--dependency-cache-port=%d" (int $secure.dependencyCachePort)) }}{{- end }}
 {{- end }}
+{{- end }}
+{{- /* A side-by-side release renders the broker TokenReview ClusterRole
+  under a distinct name so the fixed cluster-scoped name never collides
+  (#632); empty keeps the historical name. The operator binds the ClusterRole
+  by the name it is given, so an explicit arg that disagrees with the value
+  would bind per-run brokers to a ClusterRole this chart never renders. */}}
+{{- if $secure.brokerTokenReviewClusterRole }}
+{{- if $hasBrokerTokenReviewRole }}
+{{- if ne $explicitBrokerTokenReviewRole (printf "--broker-tokenreview-cluster-role=%s" $secure.brokerTokenReviewClusterRole) }}
+{{- fail (printf "explicit arg %s contradicts secure.brokerTokenReviewClusterRole %q: the chart would render the ClusterRole under a name the operator never binds" $explicitBrokerTokenReviewRole $secure.brokerTokenReviewClusterRole) }}
+{{- end }}
+{{- end }}
+{{- if not $hasBrokerTokenReviewRole }}{{- $args = append $args (printf "--broker-tokenreview-cluster-role=%s" $secure.brokerTokenReviewClusterRole) }}{{- end }}
 {{- end }}
 {{- if $secure.modelGateway }}
 {{- if $secure.modelGateway.url }}
@@ -410,6 +426,49 @@
 {{- if and $retention.failed (not $hasFailedRetention) }}{{- $args = append $args (printf "--failed-retention=%s" $retention.failed) }}{{- end }}
 {{- if and $retention.needsHuman (not $hasNeedsHumanRetention) }}{{- $args = append $args (printf "--needs-human-retention=%s" $retention.needsHuman) }}{{- end }}
 {{- if and $retention.auditKeep (not $hasAuditKeep) }}{{- $args = append $args (printf "--terminal-audit-keep=%d" (int $retention.auditKeep)) }}{{- end }}
+{{- end }}
+{{- /* Deployment ownership boundary (#632): the operator reconciles only
+  the CoderRuns of these namespaces, so a side-by-side release never settles
+  another release's runs. An explicit --owned-namespace arg takes precedence,
+  like every other seam here. */}}
+{{- $ownership := .Values.ownership | default (dict) }}
+{{- $hasOwnedNamespace := false }}
+{{- $hasLeaderElectionID := false }}
+{{- range $arg := $args }}
+{{- if or (eq $arg "--owned-namespace") (hasPrefix "--owned-namespace=" $arg) }}{{- $hasOwnedNamespace = true }}{{- end }}
+{{- if hasPrefix "--leader-election-id=" $arg }}{{- $hasLeaderElectionID = true }}{{- end }}
+{{- end }}
+{{- if not $hasOwnedNamespace }}
+{{- range $namespace := $ownership.namespaces | default (list) }}
+{{- if or (not (regexMatch "^[a-z0-9]([-a-z0-9]*[a-z0-9])?$" $namespace)) (gt (len $namespace) 63) }}
+{{- fail (printf "ownership.namespaces entry %q must be a valid DNS-1123 label (lowercase alphanumeric or '-', at most 63 characters, starting and ending with an alphanumeric)" $namespace) }}
+{{- end }}
+{{- $args = append $args (printf "--owned-namespace=%s" $namespace) }}
+{{- end }}
+{{- end }}
+{{- if $ownership.leaderElectionID }}
+{{- if not (regexMatch "^[a-z0-9]([-a-z0-9.]*[a-z0-9])?$" $ownership.leaderElectionID) }}
+{{- fail (printf "ownership.leaderElectionID %q must be a lowercase DNS-1123 subdomain" $ownership.leaderElectionID) }}
+{{- end }}
+{{- if not $hasLeaderElectionID }}{{- $args = append $args (printf "--leader-election-id=%s" $ownership.leaderElectionID) }}{{- end }}
+{{- end }}
+{{- /* Mirror the operator's startup coupling (resolveOwnership) at render
+  time so the boundary fails at upgrade instead of CrashLoopBackOff: secure
+  mode's runs live in secure.runNamespace, and discovery materializes runs
+  in the operator namespace (the release namespace). */}}
+{{- $ownershipList := $ownership.namespaces | default (list) }}
+{{- $discoveryEnabled := or $dispatch.enabled $labelSource.enabled (ne (len ($cronSchedules | default (dict))) 0) }}
+{{- if $ownershipList }}
+{{- if and $secure.enabled (not (has $secure.runNamespace $ownershipList)) }}
+{{- fail (printf "secure.runNamespace %q must appear in ownership.namespaces; a secure controller never reconciles runs outside its run namespace" $secure.runNamespace) }}
+{{- end }}
+{{- if and $discoveryEnabled (not (has .Release.Namespace $ownershipList)) }}
+{{- fail (printf "discovery sources materialize CoderRuns in the release namespace %q, which ownership.namespaces %q does not own; deploy this release inside an owned namespace or drop the boundary" .Release.Namespace $ownershipList) }}
+{{- end }}
+{{- else }}
+{{- if and $secure.enabled $discoveryEnabled (ne .Release.Namespace $secure.runNamespace) }}
+{{- fail (printf "a secure release with discovery enabled derives an ownership boundary of just secure.runNamespace %q, so it must be deployed there (release namespace %q); list ownership.namespaces explicitly to choose otherwise" $secure.runNamespace .Release.Namespace) }}
+{{- end }}
 {{- end }}
 {{- $_ := set $container "args" $args }}
 
