@@ -215,8 +215,14 @@ func BrokerRoleBinding(run *courier.CoderRun) *rbacv1.RoleBinding {
 
 // BrokerTokenReviewBinding binds the deployment-level ClusterRole that grants
 // only TokenReview creation to this run's broker service account. The
-// ClusterRole itself is provisioned by the chart.
-func BrokerTokenReviewBinding(run *courier.CoderRun) *rbacv1.ClusterRoleBinding {
+// ClusterRole itself is provisioned by the chart. clusterRoleName is the
+// chart-rendered ClusterRole for this deployment: side-by-side releases
+// render distinct names so the fixed cluster-scoped name never collides
+// (#632); an empty name falls back to the historical default.
+func BrokerTokenReviewBinding(run *courier.CoderRun, clusterRoleName string) *rbacv1.ClusterRoleBinding {
+	if clusterRoleName == "" {
+		clusterRoleName = TokenReviewClusterRole
+	}
 	return &rbacv1.ClusterRoleBinding{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:            run.Namespace + "." + BrokerTokenReviewBindingName(run.Name),
@@ -226,7 +232,7 @@ func BrokerTokenReviewBinding(run *courier.CoderRun) *rbacv1.ClusterRoleBinding 
 		RoleRef: rbacv1.RoleRef{
 			APIGroup: "rbac.authorization.k8s.io",
 			Kind:     "ClusterRole",
-			Name:     TokenReviewClusterRole,
+			Name:     clusterRoleName,
 		},
 		Subjects: []rbacv1.Subject{{
 			Kind:      "ServiceAccount",

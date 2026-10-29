@@ -30,6 +30,7 @@ import (
 	"net"
 	"net/http"
 	"path"
+	"slices"
 	"sort"
 	"strings"
 	"time"
@@ -123,6 +124,14 @@ type EvidenceIntake struct {
 	// the runnable returns without binding, so a deployment that does not
 	// configure the intake runs no listener at all.
 	Bind string
+
+	// OwnedNamespaces is the deployment-ownership boundary (#632): the run
+	// namespaces this release's reconciler may act on. A capture claiming a
+	// run outside the owned set is refused before the run is read or anything
+	// is persisted, so a shared HMAC key can never turn one release's intake
+	// into a Secret writer inside another release's namespaces. Empty means
+	// every namespace, the single-controller default.
+	OwnedNamespaces []string
 }
 
 // NeedLeaderElection reports that the intake must run on every replica. The
@@ -311,6 +320,16 @@ func (i *EvidenceIntake) handle(w http.ResponseWriter, r *http.Request) {
 		// Same message as the unresolvable-run branch above: a pre-auth response
 		// must not tell an unauthenticated caller whether the run exists.
 		writeIntakeError(w, http.StatusUnauthorized, "evidence intake could not authenticate the capture")
+		return
+	}
+
+	// Ownership boundary (#632), checked only after the HMAC authenticated the
+	// capture against the live run so an unauthenticated caller gains no
+	// namespace oracle: this release never persists evidence into a namespace
+	// its reconciler refuses to own, even when two releases share key
+	// material.
+	if len(i.OwnedNamespaces) > 0 && !slices.Contains(i.OwnedNamespaces, manifest.Run.Namespace) {
+		writeIntakeError(w, http.StatusForbidden, "evidence intake capture names a run outside the owned namespaces")
 		return
 	}
 

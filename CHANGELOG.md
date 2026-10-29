@@ -1,5 +1,65 @@
 # Changelog
 
+## [0.1.12](https://github.com/misospace/courier/compare/v0.1.11...v0.1.12) (2026-10-29)
+
+
+### Features
+
+* **api:** add contribute mode and spec.workRepo for fork-backed contributions ([#615](https://github.com/misospace/courier/issues/615)) ([0496575](https://github.com/misospace/courier/commit/049657561bf2f72b048db70efbc326a5212a0bfc))
+* **broker:** fork-backed publication, discovery-based PR idempotency, mode-aware body contract ([#612](https://github.com/misospace/courier/issues/612)) ([911e07e](https://github.com/misospace/courier/commit/911e07ef7028152194557a2f7c582a4795e9603e))
+* **broker:** wire the contribute case into the policy binding ([#629](https://github.com/misospace/courier/issues/629)) ([f022ae2](https://github.com/misospace/courier/commit/f022ae2e618cae66890f164b18441b087e99ff27))
+* **controller:** contribute admission resolves base read and approved fork write ([#597](https://github.com/misospace/courier/issues/597)) ([#625](https://github.com/misospace/courier/issues/625)) ([4122a8b](https://github.com/misospace/courier/commit/4122a8b2543f42f22bed52d4b35935cda4b1aed7))
+* **controller:** durable goal-branch identity and fail-closed contribution admission ([#598](https://github.com/misospace/courier/issues/598)) ([#626](https://github.com/misospace/courier/issues/626)) ([4a357cd](https://github.com/misospace/courier/commit/4a357cd18e83c33d639a40fd0c086dd6424a1d77))
+* **controller:** explicit retry request surface and state machine for terminal CoderRuns ([#613](https://github.com/misospace/courier/issues/613)) ([52dd39a](https://github.com/misospace/courier/commit/52dd39aa3f62bce140282be4b4897208d400a557))
+* **cron:** add schedule-driven source adapter ([#605](https://github.com/misospace/courier/issues/605)) ([3b54f97](https://github.com/misospace/courier/commit/3b54f971f5661068f2dd8168247e0bb562bc70ce))
+* **deps:** update module github.com/prometheus/common (v0.72.1 → v0.73.0) ([#614](https://github.com/misospace/courier/issues/614)) ([dc76909](https://github.com/misospace/courier/commit/dc769099ed98074db39eb5c25fad194d2fd18edd))
+* **github-release:** update release node (24.22.1 → 26.12.1) ([#593](https://github.com/misospace/courier/issues/593)) ([e06cbf8](https://github.com/misospace/courier/commit/e06cbf82db47abc840f3b5daef0d899784d60017))
+* **harness:** classify trusted native outcomes and verify publication ([#577](https://github.com/misospace/courier/issues/577)) ([ec735db](https://github.com/misospace/courier/commit/ec735db2d3354b246938867526b8832a8aac8f89))
+* **source/dispatch:** fenced retry requeue transport for the Dispatch adapter ([#628](https://github.com/misospace/courier/issues/628)) ([00c427c](https://github.com/misospace/courier/commit/00c427c691043ed9a5b50072bd6137a7c7e8fbf5))
+* **source:** ad-hoc contribution adapter with source-neutral work identity ([#596](https://github.com/misospace/courier/issues/596)) ([#623](https://github.com/misospace/courier/issues/623)) ([1ba77a3](https://github.com/misospace/courier/commit/1ba77a32497a852a4e8b220a1997f040d29451bf))
+* **source:** forge label adapter over typed forge capabilities ([#16](https://github.com/misospace/courier/issues/16)) ([#618](https://github.com/misospace/courier/issues/618)) ([8d6880e](https://github.com/misospace/courier/commit/8d6880e4992a473bc056b3067e338a500178d8c8))
+* **source:** retry-aware discovery barrier and successor naming ([#607](https://github.com/misospace/courier/issues/607)) ([3e96f48](https://github.com/misospace/courier/commit/3e96f48907be5dbbd89c0fe690437900c4bddc47))
+* **source:** retry-aware discovery barrier and successor naming ([#607](https://github.com/misospace/courier/issues/607)) ([f74f1ca](https://github.com/misospace/courier/commit/f74f1ca2a463ba2f557e2a8334f70e3f780aad71))
+
+
+### Bug Fixes
+
+* **chart:** fail render when explicit broker-role arg contradicts the historical ClusterRole name ([a754760](https://github.com/misospace/courier/commit/a7547600ce44026609721927115ac90600d07908))
+* **chart:** validate bare and single-dash --broker-tokenreview-cluster-role forms at render ([c3555b3](https://github.com/misospace/courier/commit/c3555b3bb5d4fd85d9cbd89731b5944c1978fd15))
+* **chart:** validate the effective owned-namespace boundary at render ([00793b9](https://github.com/misospace/courier/commit/00793b9679006cc4b1f77c3c0ce0cb08f959a2ff))
+* **controller:** isolate native canary ownership ([58fbdf4](https://github.com/misospace/courier/commit/58fbdf4fc9ad34f2ba96d43456829c913c64863b))
+* **controller:** isolate native canary ownership ([029ee23](https://github.com/misospace/courier/commit/029ee23971874e958f59295dd6419f530462f135)), closes [#632](https://github.com/misospace/courier/issues/632)
+* **controller:** settle a repair fence a terminal run still holds ([#578](https://github.com/misospace/courier/issues/578)) ([173a1c6](https://github.com/misospace/courier/commit/173a1c6d65a8da7fd5803906b410275f51b36460))
+* **controller:** signal an inapplicable ci-repair policy on unattributable heads ([#571](https://github.com/misospace/courier/issues/571)) ([4aafd45](https://github.com/misospace/courier/commit/4aafd4538ba5353aa1bf51cce6fac83556134c25))
+* **controller:** start a ci-park's settle window at establishment ([#551](https://github.com/misospace/courier/issues/551)) ([#576](https://github.com/misospace/courier/issues/576)) ([e0d7feb](https://github.com/misospace/courier/commit/e0d7feb2b2d83d5afaa544e4de285922248a3083))
+* **deps:** update dependency astro (7.4.2 → 7.4.3) ([#617](https://github.com/misospace/courier/issues/617)) ([dd7ca9a](https://github.com/misospace/courier/commit/dd7ca9a8da80223ae1f15701b002492dc56f84f2))
+* **deps:** update dependency astro (7.4.3 → 7.4.4) ([#622](https://github.com/misospace/courier/issues/622)) ([18e2d3a](https://github.com/misospace/courier/commit/18e2d3a99bb1ee60b0c7268f023e35b3b8537797))
+* **deps:** update kubernetes monorepo (v0.37.1 → v0.37.2) ([#616](https://github.com/misospace/courier/issues/616)) ([98b137b](https://github.com/misospace/courier/commit/98b137bc15fac94671c03861a9be20db6adba745))
+* **executor:** classify a transient forge-API failure in guardAdoption's PR observation as availability ([#585](https://github.com/misospace/courier/issues/585)) ([#588](https://github.com/misospace/courier/issues/588)) ([1bb6d3a](https://github.com/misospace/courier/commit/1bb6d3a5473ed96be636bcd9814f974f3b6bd3fc))
+* **executor:** route transient launch-guard remote reads to the recovery channel ([#580](https://github.com/misospace/courier/issues/580)) ([#586](https://github.com/misospace/courier/issues/586)) ([32ea74e](https://github.com/misospace/courier/commit/32ea74ece548a7d14e1ba7d859f6c3d9400be30d))
+* **executor:** settle fix-pr assignments merged during the run as superseded ([#582](https://github.com/misospace/courier/issues/582)) ([#583](https://github.com/misospace/courier/issues/583)) ([db64226](https://github.com/misospace/courier/commit/db64226487ae081ecedd3c368dd722f29217215c))
+* **git:** probe the effective ssh endpoint resolved from the ssh configuration ([#590](https://github.com/misospace/courier/issues/590)) ([912641e](https://github.com/misospace/courier/commit/912641e2e2a44c608d56aa72ebdb1b7bf74bf03f))
+* **git:** resolve the ssh probe through the ssh command git invokes ([#592](https://github.com/misospace/courier/issues/592)) ([432005d](https://github.com/misospace/courier/commit/432005d1e2f76bb5c70959ae6565be3f1da0fc67))
+* **harness:** classify a git-side remote-publication read failure as transient availability ([#579](https://github.com/misospace/courier/issues/579)) ([988298f](https://github.com/misospace/courier/commit/988298f6f1122a4d050ff731b402d911547f1e98))
+
+
+### Chores
+
+* **container:** update image golang (2669ec9 → 2920bb1) ([#621](https://github.com/misospace/courier/issues/621)) ([2661840](https://github.com/misospace/courier/commit/2661840db6ee9fa2cb9e71bc57fc281bd10446b8))
+* **container:** update image golang (6f1acc8 → b760209) ([#611](https://github.com/misospace/courier/issues/611)) ([fcd7115](https://github.com/misospace/courier/commit/fcd71155d762b946dbe2846f4493b958b9114532))
+* **container:** update image golang (9048d5e → 921f611) ([#591](https://github.com/misospace/courier/issues/591)) ([c1e25f6](https://github.com/misospace/courier/commit/c1e25f6400fdb1633e61dedc80426d5f12d41da3))
+* **container:** update image golang (921f611 → 6f1acc8) ([#594](https://github.com/misospace/courier/issues/594)) ([2c6da5d](https://github.com/misospace/courier/commit/2c6da5d030e9dfe415224a53546d0c95f18cbe47))
+* **container:** update image golang (b760209 → 2669ec9) ([#619](https://github.com/misospace/courier/issues/619)) ([6b20240](https://github.com/misospace/courier/commit/6b202406e04c15fe17854e30477700972713fd43))
+* **container:** update image golang (f20d83a → 9048d5e) ([#581](https://github.com/misospace/courier/issues/581)) ([aaeb1b5](https://github.com/misospace/courier/commit/aaeb1b52552d217e9051e83876cadd344039c6b2))
+* **container:** update image node (2814715 → 88e4807) ([#604](https://github.com/misospace/courier/issues/604)) ([d164961](https://github.com/misospace/courier/commit/d164961584060eb5b08eaca1c924105541544551))
+* **deps:** lock file maintenance ([#574](https://github.com/misospace/courier/issues/574)) ([6442249](https://github.com/misospace/courier/commit/6442249fbf82018987a666a3c30742cc0b726508))
+
+
+### Documentation
+
+* design source-neutral ad-hoc contributions and fork-backed publication ([#603](https://github.com/misospace/courier/issues/603)) ([6eb1b39](https://github.com/misospace/courier/commit/6eb1b3908308adceea9983b340db1f3aaa069c5f))
+* **design:** settle explicit retry contract for terminal runs ([#97](https://github.com/misospace/courier/issues/97)) ([#610](https://github.com/misospace/courier/issues/610)) ([c4e4aa9](https://github.com/misospace/courier/commit/c4e4aa90222c2ace13e57d8d809dc7623fae5949))
+
 ## [0.1.11](https://github.com/misospace/courier/compare/v0.1.10...v0.1.11) (2026-10-26)
 
 

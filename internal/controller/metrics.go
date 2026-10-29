@@ -405,19 +405,44 @@ func nonNegativeSeconds(d time.Duration) float64 {
 // binding does not hoard materialized-but-unadmitted work.
 type LaneCollector struct {
 	client       client.Client
+	namespaces   []string
 	now          func() time.Time
 	scrapeErrors prometheus.Counter
 }
 
-func NewLaneCollector(c client.Client) *LaneCollector {
+// NewLaneCollector builds a lane collector. The optional namespaces scope
+// the collection to the run namespaces of one deployment (#632): each is
+// listed in turn and the pages accumulate, so a scoped collector observes
+// only the namespaces it owns. With none given the collector lists the
+// whole cluster, the single-controller default.
+func NewLaneCollector(c client.Client, namespaces ...string) *LaneCollector {
 	return &LaneCollector{
-		client: c,
-		now:    time.Now,
+		client:     c,
+		now:        time.Now,
+		namespaces: namespaces,
 		scrapeErrors: prometheus.NewCounter(prometheus.CounterOpts{
 			Name: "courier_metrics_scrape_errors_total",
 			Help: "List calls that failed while the LaneCollector collected lane metrics.",
 		}),
 	}
+}
+
+// listScoped runs one List per deployment scope (#632): with no namespaces
+// the single unrestricted List keeps the cluster-wide default; otherwise
+// every namespace is listed in turn and the list function accumulates each
+// page, so a scoped collector observes only the namespaces it owns. A
+// failed page returns its error and the collection stops, keeping the
+// scrape-error posture of a failed cluster-wide List.
+func listScoped(ctx context.Context, namespaces []string, list func(opts ...client.ListOption) error) error {
+	if len(namespaces) == 0 {
+		return list()
+	}
+	for _, ns := range namespaces {
+		if err := list(client.InNamespace(ns)); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // Describe implements prometheus.Collector.
@@ -437,39 +462,53 @@ func (c *LaneCollector) Collect(ch chan<- prometheus.Metric) {
 	defer cancel()
 	defer func() { ch <- c.scrapeErrors }()
 
-	lanes := &courierv1alpha1.LaneProfileList{}
-	if err := c.client.List(ctx, lanes); err != nil {
+	var lanes []courierv1alpha1.LaneProfile
+	if err := listScoped(ctx, c.namespaces, func(opts ...client.ListOption) error {
+		page := &courierv1alpha1.LaneProfileList{}
+		if err := c.client.List(ctx, page, opts...); err != nil {
+			return err
+		}
+		lanes = append(lanes, page.Items...)
+		return nil
+	}); err != nil {
 		c.scrapeErrors.Inc()
 		crlog.Log.Error(err, "metrics scrape: listing LaneProfiles failed")
 		return
 	}
 	// Seed every lane at zero so a lane whose runs all drained keeps
 	// reporting 0 instead of disappearing from the series.
-	inFlight := make(map[string]int, len(lanes.Items))
-	reservations := make(map[string]int, len(lanes.Items))
-	pending := make(map[string]int, len(lanes.Items))
-	concurrency := make(map[string]float64, len(lanes.Items))
-	for i := range lanes.Items {
-		lane := lanes.Items[i].Name
+	inFlight := make(map[string]int, len(lanes))
+	reservations := make(map[string]int, len(lanes))
+	pending := make(map[string]int, len(lanes))
+	concurrency := make(map[string]float64, len(lanes))
+	for i := range lanes {
+		lane := lanes[i].Name
 		inFlight[lane] = 0
 		reservations[lane] = 0
 		pending[lane] = 0
-		slots := lanes.Items[i].Spec.Concurrency
+		slots := lanes[i].Spec.Concurrency
 		if slots <= 0 {
 			slots = 1
 		}
 		concurrency[lane] = float64(slots)
 	}
 
-	runs := &courierv1alpha1.CoderRunList{}
-	if err := c.client.List(ctx, runs); err != nil {
+	var runs []courierv1alpha1.CoderRun
+	if err := listScoped(ctx, c.namespaces, func(opts ...client.ListOption) error {
+		page := &courierv1alpha1.CoderRunList{}
+		if err := c.client.List(ctx, page, opts...); err != nil {
+			return err
+		}
+		runs = append(runs, page.Items...)
+		return nil
+	}); err != nil {
 		c.scrapeErrors.Inc()
 		crlog.Log.Error(err, "metrics scrape: listing CoderRuns failed")
 		return
 	}
 	oldestReservation := make(map[string]time.Time)
-	for i := range runs.Items {
-		run := &runs.Items[i]
+	for i := range runs {
+		run := &runs[i]
 		if phaseConsumesCapacity(run.Status.Phase) {
 			inFlight[run.Spec.Lane]++
 		}
@@ -513,13 +552,13 @@ func (c *LaneCollector) Collect(ch chan<- prometheus.Metric) {
 			laneOldestReservationAgeDesc, prometheus.GaugeValue, nonNegativeSeconds(now.Sub(at)), lane)
 	}
 
-	for i := range lanes.Items {
+	for i := range lanes {
 		suspended := 0.0
-		if lanes.Items[i].Suspended() {
+		if lanes[i].Suspended() {
 			suspended = 1
 		}
 		ch <- prometheus.MustNewConstMetric(
-			laneSuspendedDesc, prometheus.GaugeValue, suspended, lanes.Items[i].Name)
+			laneSuspendedDesc, prometheus.GaugeValue, suspended, lanes[i].Name)
 	}
 }
 
@@ -534,14 +573,20 @@ func (c *LaneCollector) Collect(ch chan<- prometheus.Metric) {
 // of silently dropping the scrape.
 type TerminalAgeCollector struct {
 	client       client.Client
+	namespaces   []string
 	now          func() time.Time
 	scrapeErrors prometheus.Counter
 }
 
-func NewTerminalAgeCollector(c client.Client) *TerminalAgeCollector {
+// NewTerminalAgeCollector builds a terminal-age collector. The optional
+// namespaces scope the collection to the run namespaces of one deployment
+// (#632); with none given the collector lists the whole cluster, the
+// single-controller default.
+func NewTerminalAgeCollector(c client.Client, namespaces ...string) *TerminalAgeCollector {
 	return &TerminalAgeCollector{
-		client: c,
-		now:    time.Now,
+		client:     c,
+		now:        time.Now,
+		namespaces: namespaces,
 		scrapeErrors: prometheus.NewCounter(prometheus.CounterOpts{
 			Name: "courier_terminal_age_scrape_errors_total",
 			Help: "List calls that failed while the TerminalAgeCollector collected terminal-age metrics.",
@@ -561,15 +606,22 @@ func (c *TerminalAgeCollector) Collect(ch chan<- prometheus.Metric) {
 	defer cancel()
 	defer func() { ch <- c.scrapeErrors }()
 
-	var runs courierv1alpha1.CoderRunList
-	if err := c.client.List(ctx, &runs); err != nil {
+	var runs []courierv1alpha1.CoderRun
+	if err := listScoped(ctx, c.namespaces, func(opts ...client.ListOption) error {
+		page := &courierv1alpha1.CoderRunList{}
+		if err := c.client.List(ctx, page, opts...); err != nil {
+			return err
+		}
+		runs = append(runs, page.Items...)
+		return nil
+	}); err != nil {
 		c.scrapeErrors.Inc()
 		crlog.Log.Error(err, "metrics scrape: listing CoderRuns failed")
 		return
 	}
 	oldest := make(map[courierv1alpha1.Phase]time.Time, 6)
-	for i := range runs.Items {
-		run := &runs.Items[i]
+	for i := range runs {
+		run := &runs[i]
 		if !terminalPhase(run.Status.Phase) {
 			continue
 		}
@@ -597,14 +649,20 @@ func (c *TerminalAgeCollector) Collect(ch chan<- prometheus.Metric) {
 // dropping the scrape.
 type TerminalBacklogCollector struct {
 	client       client.Client
+	namespaces   []string
 	now          func() time.Time
 	scrapeErrors prometheus.Counter
 }
 
-func NewTerminalBacklogCollector(c client.Client) *TerminalBacklogCollector {
+// NewTerminalBacklogCollector builds a terminal-backlog collector. The
+// optional namespaces scope the collection to the run namespaces of one
+// deployment (#632); with none given the collector lists the whole cluster,
+// the single-controller default.
+func NewTerminalBacklogCollector(c client.Client, namespaces ...string) *TerminalBacklogCollector {
 	return &TerminalBacklogCollector{
-		client: c,
-		now:    time.Now,
+		client:     c,
+		now:        time.Now,
+		namespaces: namespaces,
 		scrapeErrors: prometheus.NewCounter(prometheus.CounterOpts{
 			Name: "courier_terminal_backlog_scrape_errors_total",
 			Help: "List calls that failed while the TerminalBacklogCollector collected terminal-backlog metrics.",
@@ -626,8 +684,15 @@ func (c *TerminalBacklogCollector) Collect(ch chan<- prometheus.Metric) {
 	defer cancel()
 	defer func() { ch <- c.scrapeErrors }()
 
-	var runs courierv1alpha1.CoderRunList
-	if err := c.client.List(ctx, &runs); err != nil {
+	var runs []courierv1alpha1.CoderRun
+	if err := listScoped(ctx, c.namespaces, func(opts ...client.ListOption) error {
+		page := &courierv1alpha1.CoderRunList{}
+		if err := c.client.List(ctx, page, opts...); err != nil {
+			return err
+		}
+		runs = append(runs, page.Items...)
+		return nil
+	}); err != nil {
 		c.scrapeErrors.Inc()
 		crlog.Log.Error(err, "metrics scrape: listing CoderRuns failed")
 		return
@@ -635,8 +700,8 @@ func (c *TerminalBacklogCollector) Collect(ch chan<- prometheus.Metric) {
 	awaitingReap := make(map[courierv1alpha1.Phase]int, 6)
 	pending := make(map[string]int)
 	oldest := make(map[string]time.Time)
-	for i := range runs.Items {
-		run := &runs.Items[i]
+	for i := range runs {
+		run := &runs[i]
 		if !terminalPhase(run.Status.Phase) {
 			continue
 		}

@@ -12,10 +12,12 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/runtime"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
+	validation "k8s.io/apimachinery/pkg/util/validation"
 	"k8s.io/client-go/kubernetes"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	"k8s.io/client-go/rest"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/cache"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/healthz"
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
@@ -37,6 +39,7 @@ import (
 	"github.com/misospace/courier/internal/source/label"
 	"github.com/misospace/courier/internal/source/manual"
 	"github.com/misospace/courier/internal/status"
+	"github.com/misospace/courier/internal/topology"
 )
 
 var (
@@ -102,6 +105,9 @@ func main() {
 	var secureMode bool
 	var forgeProvidersFile string
 	var runNamespace string
+	var ownedNamespaces stringSliceValue
+	var leaderElectionID string
+	var brokerTokenReviewClusterRole string
 	var harnessImage string
 	var dependencyCacheService string
 	var dependencyCachePort int
@@ -134,6 +140,9 @@ func main() {
 	flag.BoolVar(&secureMode, "secure-mode", false, "Route runs through the isolated control/broker/worker topology; legacy stays the default and remains explicitly insecure.")
 	flag.StringVar(&forgeProvidersFile, "forge-providers-file", "", "Secure mode: provider registry file carrying references only.")
 	flag.StringVar(&runNamespace, "run-namespace", "", "Secure mode: the namespace dedicated to run workloads.")
+	flag.Var(&ownedNamespaces, "owned-namespace", "Repeatable run namespace this deployment owns (#632); a run outside the owned set is a strict no-op. Empty keeps the single-controller default: secure mode owns --run-namespace, legacy mode owns every namespace.")
+	flag.StringVar(&leaderElectionID, "leader-election-id", defaultLeaderElectionID, "Lease name for leader election. Two releases sharing an operator namespace need distinct IDs; separate operator namespaces do not (#632).")
+	flag.StringVar(&brokerTokenReviewClusterRole, "broker-tokenreview-cluster-role", defaultBrokerTokenReviewClusterRole, "Name of the chart-provided ClusterRole granting broker TokenReview creation; a side-by-side release renders a distinct name so the fixed cluster-scoped name never collides (#632).")
 	flag.StringVar(&harnessImage, "harness-image", defaultsHarnessImage, "Secure mode: image carrying courier-control, courier-worker, and courier-broker.")
 	flag.StringVar(&dependencyCacheService, "dependency-cache-service", "", "Secure mode: namespace/name of the approved read-only dependency cache Service; empty means workers have no egress.")
 	flag.IntVar(&dependencyCachePort, "dependency-cache-port", 0, "Secure mode: cache port override; empty uses the Service's first port.")
@@ -189,12 +198,34 @@ func main() {
 	startupCtx, cancelStartup := context.WithTimeout(context.Background(), startupReadTimeout)
 	defer cancelStartup()
 
+	// The ownership boundary (#632) must be settled before the manager is
+	// built: it decides which namespaces the informers watch and which the
+	// reconciler acts on.
+	operatorNamespace := strings.TrimSpace(os.Getenv("POD_NAMESPACE"))
+	ownedRunNamespaces, watchedNamespaces, err := resolveOwnership(ownershipInput{
+		owned:            ownedNamespaces,
+		secureMode:       secureMode,
+		runNamespace:     runNamespace,
+		podNamespace:     operatorNamespace,
+		discoveryEnabled: dispatchEnabled || labelSourceEnabled || strings.TrimSpace(cronSchedulesFile) != "",
+	})
+	if err != nil {
+		setupLog.Error(err, "unable to configure the deployment-ownership boundary")
+		os.Exit(1)
+	}
+	if len(ownedRunNamespaces) > 0 {
+		setupLog.Info("deployment ownership boundary configured",
+			"ownedNamespaces", strings.Join(ownedRunNamespaces, ","),
+			"watchedNamespaces", strings.Join(watchedNamespaces, ","))
+	}
+
 	mgr, err := ctrl.NewManager(ctrl.GetConfigOrDie(), ctrl.Options{
 		Scheme:                 scheme,
+		Cache:                  controllerCacheOptions(watchedNamespaces),
 		Metrics:                metricsserver.Options{BindAddress: metricsAddr},
 		HealthProbeBindAddress: probeAddr,
 		LeaderElection:         enableLeaderElection,
-		LeaderElectionID:       "courier.misospace.dev",
+		LeaderElectionID:       leaderElectionID,
 	})
 	if err != nil {
 		setupLog.Error(err, "unable to start manager")
@@ -202,16 +233,19 @@ func main() {
 	}
 
 	// Per-lane capacity and suspension gauges are read from the live cluster
-	// at scrape time, so they need only the manager's client.
-	crmetrics.Registry.MustRegister(controller.NewLaneCollector(mgr.GetClient()))
+	// at scrape time, so they need only the manager's client. They are scoped
+	// to the owned run namespaces so a side-by-side release never reports
+	// another deployment's lanes (#632); with no boundary they stay
+	// cluster-wide.
+	crmetrics.Registry.MustRegister(controller.NewLaneCollector(mgr.GetClient(), ownedRunNamespaces...))
 	// The oldest retained terminal-run age is likewise read from the live
 	// cluster at scrape time, so the retention reaper's observability half
 	// needs only the manager's client.
-	crmetrics.Registry.MustRegister(controller.NewTerminalAgeCollector(mgr.GetClient()))
+	crmetrics.Registry.MustRegister(controller.NewTerminalAgeCollector(mgr.GetClient(), ownedRunNamespaces...))
 	// The terminal-run backlog (held runs and the unsettled lifecycle-report
 	// queue they wait on) is likewise read from the live cluster at scrape
 	// time.
-	crmetrics.Registry.MustRegister(controller.NewTerminalBacklogCollector(mgr.GetClient()))
+	crmetrics.Registry.MustRegister(controller.NewTerminalBacklogCollector(mgr.GetClient(), ownedRunNamespaces...))
 
 	bootstrapProfilesFile := strings.TrimSpace(bootstrapLaneProfilesFile)
 	if bootstrapProfilesFile != "" {
@@ -292,12 +326,13 @@ func main() {
 		launcher.EvidenceURL = strings.TrimSpace(evidenceIntakeService)
 		launcher.EvidenceKey = key
 		evidenceIntake = &controller.EvidenceIntake{
-			Client:    mgr.GetClient(),
-			APIReader: mgr.GetAPIReader(),
-			Scheme:    mgr.GetScheme(),
-			Key:       key,
-			Pod:       podConfig,
-			Bind:      strings.TrimSpace(evidenceIntakeBind),
+			Client:          mgr.GetClient(),
+			APIReader:       mgr.GetAPIReader(),
+			Scheme:          mgr.GetScheme(),
+			Key:             key,
+			Pod:             podConfig,
+			Bind:            strings.TrimSpace(evidenceIntakeBind),
+			OwnedNamespaces: ownedRunNamespaces,
 		}
 		if evidenceBindSet {
 			setupLog.Info("evidence intake server enabled", "bind", strings.TrimSpace(evidenceIntakeBind), "service", strings.TrimSpace(evidenceIntakeService))
@@ -577,6 +612,7 @@ func main() {
 		NeedsHumanRetention:        needsHumanRetention,
 		ProvisioningCollisionGrace: provisioningCollisionGrace,
 		TerminalAuditKeep:          terminalAuditKeep,
+		OwnedNamespaces:            ownedRunNamespaces,
 	}
 	if secureMode {
 		secure, err := buildSecureControl(secureConfig{
@@ -597,6 +633,7 @@ func main() {
 			legacyAPISecret:  githubCredentialSecret,
 			operatorNS:       os.Getenv("POD_NAMESPACE"),
 			restConfig:       mgr.GetConfig(),
+			tokenReviewRole:  brokerTokenReviewClusterRole,
 		})
 		if err != nil {
 			setupLog.Error(err, "unable to configure secure mode")
@@ -750,6 +787,100 @@ func validDispatchAgentName(name string) bool {
 		}
 	}
 	return true
+}
+
+// ownershipInput carries the startup configuration the deployment-ownership
+// boundary is settled from (#632).
+type ownershipInput struct {
+	owned            []string
+	secureMode       bool
+	runNamespace     string
+	podNamespace     string
+	discoveryEnabled bool
+}
+
+// resolveOwnership settles the deployment-ownership boundary (#632) into the
+// namespaces the reconciler acts on and the namespaces the manager may
+// watch. An explicit --owned-namespace list is authoritative. Otherwise a
+// secure-mode controller owns exactly its run namespace, and a legacy
+// controller with no list owns every namespace — the backward-compatible
+// single-controller default. The startup surface must agree with the
+// boundary: secure mode's runs live in --run-namespace, and discovery
+// materializes CoderRuns in the operator namespace, so a boundary that
+// excludes either would strand every run that source can ever produce.
+// The watched set adds the operator namespace, where bootstrap LaneProfiles
+// and discovery state live even when runs do not.
+func resolveOwnership(input ownershipInput) (owned []string, watched []string, err error) {
+	seen := map[string]bool{}
+	for _, namespace := range input.owned {
+		namespace = strings.TrimSpace(namespace)
+		if msgs := validation.IsDNS1123Label(namespace); len(msgs) > 0 {
+			return nil, nil, fmt.Errorf("--owned-namespace %q is not a valid namespace name: %s", namespace, strings.Join(msgs, "; "))
+		}
+		if seen[namespace] {
+			continue
+		}
+		seen[namespace] = true
+		owned = append(owned, namespace)
+	}
+	if input.secureMode {
+		runNamespace := strings.TrimSpace(input.runNamespace)
+		if runNamespace == "" {
+			return nil, nil, fmt.Errorf("secure mode requires --run-namespace")
+		}
+		if len(owned) == 0 {
+			owned = []string{runNamespace}
+		} else if !seen[runNamespace] {
+			return nil, nil, fmt.Errorf("secure mode: --run-namespace %q must be among the --owned-namespace values; a secure controller never reconciles runs outside its run namespace, so an ownership boundary that excludes it would admit nothing", runNamespace)
+		}
+	}
+	if input.discoveryEnabled && len(owned) > 0 {
+		if input.podNamespace == "" || !containsNamespace(owned, input.podNamespace) {
+			return nil, nil, fmt.Errorf("discovery sources materialize CoderRuns in the operator namespace %q, which the ownership boundary %q does not own; deploy the operator inside an owned namespace or drop the boundary", input.podNamespace, strings.Join(owned, ","))
+		}
+	}
+	if len(owned) > 0 {
+		watched = append(watched, owned...)
+		if input.podNamespace != "" && !containsNamespace(watched, input.podNamespace) {
+			watched = append(watched, input.podNamespace)
+		}
+	}
+	return owned, watched, nil
+}
+
+func containsNamespace(namespaces []string, namespace string) bool {
+	for _, candidate := range namespaces {
+		if candidate == namespace {
+			return true
+		}
+	}
+	return false
+}
+
+// controllerCacheOptions scopes the manager's informers to the watched
+// namespaces (#632): CoderRun, LaneProfile and Pod are listed and watched
+// only there, so a side-by-side release neither observes nor can be woken
+// by another deployment's runs, lanes, and run pods. Every other kind stays
+// cluster-wide, because secure preflight and launch pinning legitimately
+// read Nodes, Namespaces, and Services outside the run namespaces, and the
+// uncached API reader is never restricted. An empty watched set leaves the
+// cache unrestricted — the single-controller default.
+func controllerCacheOptions(watched []string) cache.Options {
+	if len(watched) == 0 {
+		return cache.Options{}
+	}
+	namespaces := make(map[string]cache.Config, len(watched))
+	for _, namespace := range watched {
+		namespaces[namespace] = cache.Config{}
+	}
+	byNamespace := cache.ByObject{Namespaces: namespaces}
+	return cache.Options{
+		ByObject: map[client.Object]cache.ByObject{
+			&courierv1alpha1.CoderRun{}:    byNamespace,
+			&courierv1alpha1.LaneProfile{}: byNamespace,
+			&corev1.Pod{}:                  byNamespace,
+		},
+	}
 }
 
 // cronLane pairs one LaneProfile with the schedules targeting it.
@@ -906,10 +1037,19 @@ type secureConfig struct {
 	legacyAPISecret  string
 	operatorNS       string
 	restConfig       *rest.Config
+	tokenReviewRole  string
 }
 
 const (
 	defaultsHarnessImage = "ghcr.io/misospace/courier-harness:latest"
+	// defaultLeaderElectionID is the historical lease name. A second release
+	// sharing the operator namespace configures a distinct ID; separate
+	// operator namespaces already isolate the lease (#632).
+	defaultLeaderElectionID = "courier.misospace.dev"
+	// defaultBrokerTokenReviewClusterRole is the historical chart-rendered
+	// ClusterRole name a side-by-side release overrides to avoid the fixed
+	// cluster-scoped collision (#632).
+	defaultBrokerTokenReviewClusterRole = topology.TokenReviewClusterRole
 	// defaultsProbeImage pins the network-probe image by digest. The probe
 	// decides whether a node passes preflight, so a republished tag must not
 	// change the code that decides it. The chart's secure.probeImage must
@@ -986,20 +1126,21 @@ func buildSecureControl(config secureConfig) (*controller.SecureControl, error) 
 	}
 	return &controller.SecureControl{
 		Config: controller.SecureConfig{
-			RunNamespace:      strings.TrimSpace(config.runNamespace),
-			Registry:          registry,
-			HarnessImage:      harnessImage,
-			ProbeImage:        probeImage,
-			CacheService:      strings.TrimSpace(config.cacheService),
-			CachePort:         int32(config.cachePort),
-			GatewayCIDR:       strings.TrimSpace(config.gatewayCIDR),
-			GatewayPort:       int32(config.gatewayPort),
-			GatewayURL:        strings.TrimSpace(config.gatewayURL),
-			GatewayKeySecret:  strings.TrimSpace(config.gatewayKeySecret),
-			GatewayKeyName:    strings.TrimSpace(config.gatewayKeyName),
-			LiveProbes:        true,
-			Kubernetes:        clientset,
-			OperatorNamespace: strings.TrimSpace(config.operatorNS),
+			RunNamespace:           strings.TrimSpace(config.runNamespace),
+			Registry:               registry,
+			HarnessImage:           harnessImage,
+			ProbeImage:             probeImage,
+			CacheService:           strings.TrimSpace(config.cacheService),
+			CachePort:              int32(config.cachePort),
+			GatewayCIDR:            strings.TrimSpace(config.gatewayCIDR),
+			GatewayPort:            int32(config.gatewayPort),
+			GatewayURL:             strings.TrimSpace(config.gatewayURL),
+			GatewayKeySecret:       strings.TrimSpace(config.gatewayKeySecret),
+			GatewayKeyName:         strings.TrimSpace(config.gatewayKeyName),
+			TokenReviewClusterRole: strings.TrimSpace(config.tokenReviewRole),
+			LiveProbes:             true,
+			Kubernetes:             clientset,
+			OperatorNamespace:      strings.TrimSpace(config.operatorNS),
 			Providers: func(ctx context.Context, registration *forge.Registration) (controller.AdmissionProvider, error) {
 				// Admission reads use the operator's own read identity. The
 				// registration's credential reference is never resolved here.

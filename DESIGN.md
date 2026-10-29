@@ -2300,6 +2300,25 @@ structurally closed. (#74)
 
 ## Reconcile loop
 
+Two operator releases may run side-by-side on one cluster (a native canary
+beside v1). Each deployment declares an ownership boundary: `--owned-namespace`
+(repeatable) lists the run namespaces it reconciles, and reconciling a CoderRun
+outside that set is a strict no-op ahead of any read or write — no status
+write, no source call, no pod or Secret access, no finalizer release, no
+retention. The defaults keep a single-controller install's admission behavior
+unchanged: a secure controller owns exactly its `--run-namespace`, so a run
+outside it belongs to another deployment and is left alone rather than
+terminalized, while a legacy controller with no configured list owns every
+namespace. The manager's informers, the capacity and retention gauges (which
+for a secure controller therefore report only the run namespace), and the
+discovery-namespace startup check follow the same boundary; preflight reads of
+Nodes, Namespaces, and cluster Services, and the uncached API reader,
+deliberately do not. The evidence intake applies the same boundary to inbound
+captures: with the ownership set configured, an authenticated capture naming a
+run outside it is refused before anything is persisted, so a key shared
+across releases cannot turn one release's intake into a writer in another's
+namespaces.
+
 - **Pending** — created by a source. The operator checks the lane's `concurrency`
   against admitted (`Claimed` + `Running`) runs on that lane. Over capacity → stays Pending (this is the
   concurrency limit; a count, no slot object). Under → proceed.
@@ -3055,6 +3074,16 @@ only informs.
   merge, mutate the queue, or access destinations outside the resolved policy.
   The target coordinator may request permitted publication, but cannot bypass
   broker policy.
+- Cluster-scoped authority names are per-release. The broker TokenReview
+  ClusterRole carries one fixed name, so two secure releases side-by-side would
+  fight over the single cluster-scoped object; `secure.brokerTokenReviewClusterRole`
+  renders the ClusterRole and `--broker-tokenreview-cluster-role` binds the
+  per-run ClusterRoleBindings to that same per-release name (empty keeps the
+  historical name for a single release). CRD ownership stays singular: a
+  side-by-side release sets `crds.enabled=false` and evolves the CRDs
+  out-of-band. Leader-election leases are namespaced, so separate operator
+  namespaces are already isolated; two releases sharing one operator namespace
+  need distinct `ownership.leaderElectionID` values (#632).
 - Source-state transitions (claim, in-review, needs-human, resolve) are the
   operator's, done by deterministic code — the one place non-determinism would be
   dangerous, kept mechanical.

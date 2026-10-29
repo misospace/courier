@@ -157,6 +157,13 @@ type SecureConfig struct {
 	OperatorNamespace string
 	// Kubernetes is the clientset used for access reviews.
 	Kubernetes kubernetes.Interface
+	// TokenReviewClusterRole names the deployment-level ClusterRole that
+	// grants TokenReview creation to per-run brokers, bound by every run's
+	// ClusterRoleBinding. Side-by-side releases render distinct names so the
+	// fixed cluster-scoped name never collides (#632); empty falls back to
+	// the historical default. The chart renders the ClusterRole under the
+	// same configured name.
+	TokenReviewClusterRole string
 	// Now supports deterministic tests.
 	Now func() time.Time
 }
@@ -191,6 +198,17 @@ func (s *SecureControl) now() time.Time {
 		return s.Config.Now()
 	}
 	return time.Now()
+}
+
+// tokenReviewClusterRole returns the deployment-level ClusterRole name the
+// per-run broker bindings reference. Empty falls back to the historical
+// fixed name, so a single release is configured exactly as before; a second
+// side-by-side release configures a distinct name (#632).
+func (s *SecureControl) tokenReviewClusterRole() string {
+	if name := strings.TrimSpace(s.Config.TokenReviewClusterRole); name != "" {
+		return name
+	}
+	return topology.TokenReviewClusterRole
 }
 
 // reader returns the reader the secure path's live reads go through — the
