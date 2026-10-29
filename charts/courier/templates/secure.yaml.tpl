@@ -22,10 +22,7 @@ data:
 ---
 # The only cluster-scoped authority a run's broker service account holds:
 # TokenReview creation. Per-run ClusterRoleBindings to this role are created
-# (and garbage-collected) by the operator with the run's topology. A
-# side-by-side release sets secure.brokerTokenReviewClusterRole so the fixed
-# cluster-scoped name never collides (#632); the operator binds the same name
-# through --broker-tokenreview-cluster-role.
+# (and garbage-collected) by the operator with the run's topology.
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
 metadata:

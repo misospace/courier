@@ -250,18 +250,13 @@
 {{- if not $hasCachePort }}{{- $args = append $args (printf "--dependency-cache-port=%d" (int $secure.dependencyCachePort)) }}{{- end }}
 {{- end }}
 {{- end }}
-{{- /* A side-by-side release renders the broker TokenReview ClusterRole
-  under a distinct name so the fixed cluster-scoped name never collides
-  (#632); empty keeps the historical name. The operator binds the ClusterRole
-  by the name it is given, so an explicit arg that disagrees with the value
-  would bind per-run brokers to a ClusterRole this chart never renders. */}}
-{{- if $secure.brokerTokenReviewClusterRole }}
+{{- $effectiveBrokerTokenReviewRole := $secure.brokerTokenReviewClusterRole | default "courier-broker-tokenreview" }}
 {{- if $hasBrokerTokenReviewRole }}
-{{- if ne $explicitBrokerTokenReviewRole (printf "--broker-tokenreview-cluster-role=%s" $secure.brokerTokenReviewClusterRole) }}
-{{- fail (printf "explicit arg %s contradicts secure.brokerTokenReviewClusterRole %q: the chart would render the ClusterRole under a name the operator never binds" $explicitBrokerTokenReviewRole $secure.brokerTokenReviewClusterRole) }}
+{{- if ne $explicitBrokerTokenReviewRole (printf "--broker-tokenreview-cluster-role=%s" $effectiveBrokerTokenReviewRole) }}
+{{- fail (printf "explicit arg %s contradicts the rendered broker TokenReview ClusterRole %q (secure.brokerTokenReviewClusterRole=%q): the chart renders the ClusterRole under a name the operator never binds" $explicitBrokerTokenReviewRole $effectiveBrokerTokenReviewRole $secure.brokerTokenReviewClusterRole) }}
 {{- end }}
-{{- end }}
-{{- if not $hasBrokerTokenReviewRole }}{{- $args = append $args (printf "--broker-tokenreview-cluster-role=%s" $secure.brokerTokenReviewClusterRole) }}{{- end }}
+{{- else if $secure.brokerTokenReviewClusterRole }}
+{{- $args = append $args (printf "--broker-tokenreview-cluster-role=%s" $effectiveBrokerTokenReviewRole) }}
 {{- end }}
 {{- if $secure.modelGateway }}
 {{- if $secure.modelGateway.url }}
@@ -427,10 +422,6 @@
 {{- if and $retention.needsHuman (not $hasNeedsHumanRetention) }}{{- $args = append $args (printf "--needs-human-retention=%s" $retention.needsHuman) }}{{- end }}
 {{- if and $retention.auditKeep (not $hasAuditKeep) }}{{- $args = append $args (printf "--terminal-audit-keep=%d" (int $retention.auditKeep)) }}{{- end }}
 {{- end }}
-{{- /* Deployment ownership boundary (#632): the operator reconciles only
-  the CoderRuns of these namespaces, so a side-by-side release never settles
-  another release's runs. An explicit --owned-namespace arg takes precedence,
-  like every other seam here. */}}
 {{- $ownership := .Values.ownership | default (dict) }}
 {{- $hasOwnedNamespace := false }}
 {{- $hasLeaderElectionID := false }}

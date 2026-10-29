@@ -1271,8 +1271,43 @@ func TestChartRendersSideBySideOwnershipConfiguration(t *testing.T) {
 		"--set", "secure.brokerTokenReviewClusterRole=courier-native-broker-tokenreview",
 		"--set-string", "controllers.main.containers.main.args[0]=--broker-tokenreview-cluster-role=some-other-role",
 	)
-	if err == nil || !strings.Contains(out, "contradicts secure.brokerTokenReviewClusterRole") {
+	if err == nil || !strings.Contains(out, "contradicts the rendered broker TokenReview ClusterRole") {
 		t.Fatalf("expected a contradicting explicit broker role arg to fail, err = %v:\n%s", err, out)
+	}
+
+	// With the value left empty the chart renders the historical ClusterRole
+	// name: an aligned explicit arg stays valid, a contradicting one fails
+	// instead of binding brokers to a ClusterRole that is never rendered.
+	historical := runHelm(t, chartDir, "template", "courier-historical", ".",
+		"--set", "secure.enabled=true",
+		"--set", "secure.runNamespace=courier-runs",
+		"--set", "secure.providers[0].name=github",
+		"--set", "secure.providers[0].type=github",
+		"--set", "secure.providers[0].endpoint=https://api.github.com/",
+		"--set", "secure.providers[0].serves[0]=misospace/*",
+		"--set", "secure.providers[0].credentials.forge-api.secretName=forge-creds",
+		"--set", "secure.providers[0].credentials.forge-api.key=token",
+		"--set-string", "controllers.main.containers.main.args[0]=--broker-tokenreview-cluster-role=courier-broker-tokenreview",
+	)
+	if count := strings.Count(historical, "--broker-tokenreview-cluster-role="); count != 1 {
+		t.Fatalf("historical-aligned explicit arg produced %d broker TokenReview flags, want exactly 1", count)
+	}
+	if !strings.Contains(historical, "name: courier-broker-tokenreview") {
+		t.Fatal("historical-aligned explicit arg must render the ClusterRole under the historical name")
+	}
+	out, err = runHelmOutput(t, chartDir, "template", "courier-historical", ".",
+		"--set", "secure.enabled=true",
+		"--set", "secure.runNamespace=courier-runs",
+		"--set", "secure.providers[0].name=github",
+		"--set", "secure.providers[0].type=github",
+		"--set", "secure.providers[0].endpoint=https://api.github.com/",
+		"--set", "secure.providers[0].serves[0]=misospace/*",
+		"--set", "secure.providers[0].credentials.forge-api.secretName=forge-creds",
+		"--set", "secure.providers[0].credentials.forge-api.key=token",
+		"--set-string", "controllers.main.containers.main.args[0]=--broker-tokenreview-cluster-role=some-other-role",
+	)
+	if err == nil || !strings.Contains(out, "contradicts the rendered broker TokenReview ClusterRole") {
+		t.Fatalf("expected a contradicting explicit broker role arg to fail with an empty value, err = %v:\n%s", err, out)
 	}
 }
 
