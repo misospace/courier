@@ -2084,6 +2084,63 @@ func TestPhaseForExitClassification(t *testing.T) {
 	}
 }
 
+func TestResolveRunBranchContribute(t *testing.T) {
+	build := func() *courierv1alpha1.CoderRun {
+		return &courierv1alpha1.CoderRun{
+			ObjectMeta: metav1.ObjectMeta{UID: "uid-1", Name: "run", Namespace: "default"},
+			Spec:       courierv1alpha1.CoderRunSpec{Mode: courierv1alpha1.ModeContribute, Source: "manual", WorkItemID: "adhoc-abcdef123456", Repo: "acme/widgets", WorkRepo: "contrib/fork", Lane: "local"},
+		}
+	}
+	first, err := resolveRunBranch(context.Background(), build(), nil)
+	if err != nil {
+		t.Fatalf("resolveRunBranch() error = %v, want nil", err)
+	}
+	want := HeadRef{Repo: "contrib/fork", Branch: "courier/acme/widgets/goal-abcdef123456"}
+	if first != want {
+		t.Fatalf("first resolution = %#v, want %#v", first, want)
+	}
+	second, err := resolveRunBranch(context.Background(), build(), nil)
+	if err != nil {
+		t.Fatalf("restart resolveRunBranch() error = %v, want nil", err)
+	}
+	if second != want {
+		t.Fatalf("restart resolution = %#v, want %#v (the branch re-derives from the immutable key, never from status)", second, want)
+	}
+	stale := build()
+	stale.Status.Branch = "stale/branch"
+	stale.Status.HeadRepo = "stale/repo"
+	stale.Status.HeadSHA = "stale-sha"
+	third, err := resolveRunBranch(context.Background(), stale, nil)
+	if err != nil {
+		t.Fatalf("resolveRunBranch() over stale status error = %v, want nil", err)
+	}
+	if third != want {
+		t.Fatalf("stale-status resolution = %#v, want %#v (status is not authority)", third, want)
+	}
+}
+
+func TestResolveRunBranchContributeFailClosed(t *testing.T) {
+	for _, tt := range []struct {
+		name     string
+		workRepo string
+		workItem string
+	}{
+		{name: "empty work repo", workRepo: "", workItem: "adhoc-abcdef123456"},
+		{name: "whitespace work repo", workRepo: "   ", workItem: "adhoc-abcdef123456"},
+		{name: "empty work item", workRepo: "contrib/fork", workItem: ""},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			run := &courierv1alpha1.CoderRun{
+				ObjectMeta: metav1.ObjectMeta{UID: "uid-1", Name: "run", Namespace: "default"},
+				Spec:       courierv1alpha1.CoderRunSpec{Mode: courierv1alpha1.ModeContribute, Source: "manual", WorkItemID: tt.workItem, Repo: "acme/widgets", WorkRepo: tt.workRepo, Lane: "local"},
+			}
+			if _, err := resolveRunBranch(context.Background(), run, nil); !errors.Is(err, ErrEmptyResolvedBranch) {
+				t.Fatalf("resolveRunBranch() error = %v, want ErrEmptyResolvedBranch", err)
+			}
+		})
+	}
+}
+
 func phaseClient(t *testing.T, objects ...runtime.Object) client.Client {
 	t.Helper()
 	scheme := runtime.NewScheme()

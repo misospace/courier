@@ -419,6 +419,51 @@ func (s *SecureControl) ResolveAdmission(ctx context.Context, run *courier.Coder
 		if workRef == "" {
 			return nil, nil, errors.New("secure admission: cannot derive the work ref")
 		}
+		// The durable contribution identity is one branch name shared by the
+		// claim-time derivation over the submitted spec.Repo and this
+		// admission derivation over the provider-canonical base. Git refs
+		// are case-sensitive: when the two derivations differ, the run would
+		// work one branch while every guard and the broker police another,
+		// so the split itself fails closed to a human (#598).
+		if run.Status.Branch != "" && run.Status.Branch != workRef {
+			return nil, nil, secureNeedsHuman("ContributionPolicy",
+				"the branch recorded at claim %q does not match the goal branch %q derived from the canonical base repository",
+				run.Status.Branch, workRef)
+		}
+		// The discovery guard searches for existing PRs on the full head
+		// identity before the work-ref read (#598). Discovery matches base
+		// and head repositories and refs, never title text, so every result
+		// is re-filtered to the pinned identity: a merged or closed PR on
+		// this head requires a human, because a contribution is never
+		// reopened or duplicated under the same key — a new contribution is
+		// a new key; more than one open PR on the same head is ambiguous and
+		// fails closed rather than a guess. A single open PR, draft
+		// included, is not an error: publication adopts it as-is on resume,
+		// and admission records no PR anchor for a contribution.
+		if admission.HeadLister != nil {
+			existing, err := admission.HeadLister.ListPullRequestsByHead(ctx,
+				forge.PullRequestRef{Repo: canonical.Canonical}, workRepo.Canonical, workRef)
+			if err != nil && !errors.Is(err, forge.ErrUnsupported) {
+				return nil, nil, transientOrNeedsHuman(err, "ProviderRead", "existing pull request search failed: %v", err)
+			}
+			numbers := map[int]bool{}
+			for _, pr := range existing {
+				if pr.BaseRepo != canonical.Canonical || pr.HeadRepo != workRepo.Canonical || pr.HeadRef != workRef {
+					continue
+				}
+				if pr.Merged || pr.State == "closed" {
+					return nil, nil, secureNeedsHuman("HeadAlreadyMerged",
+						"a closed pull request already exists for head %s:%s; a contribution is never reopened or duplicated under the same key",
+						workRepo.Canonical, workRef)
+				}
+				numbers[pr.Number] = true
+			}
+			if len(numbers) > 1 {
+				return nil, nil, secureNeedsHuman("HeadAmbiguousPR",
+					"more than one open pull request already shares head %s:%s; publication requires a human decision",
+					workRepo.Canonical, workRef)
+			}
+		}
 		work, err := admission.Policy.ReadRef(ctx, workRepo, workRef)
 		if err != nil {
 			return nil, nil, transientOrNeedsHuman(err, "ProviderRead", "work ref read for %q failed: %v", workRef, err)
@@ -427,9 +472,17 @@ func (s *SecureControl) ResolveAdmission(ctx context.Context, run *courier.Coder
 		policy.BaseOID = base.OID
 		policy.WorkRepo = workRepo.Canonical
 		policy.WorkRef = workRef
-		policy.WorkInitiallyAbsent = !work.Exists
-		if work.Exists {
+		if !work.Exists {
+			policy.WorkInitiallyAbsent = true
+		} else if work.OID == "" {
+			return nil, nil, secureNeedsHuman("ProviderRead",
+				"work ref %s of %s exists but carries no readable tip", workRef, workRepo.Canonical)
+		} else if recordedWorkTip(run, work.OID) {
 			policy.WorkOID = work.OID
+		} else {
+			return nil, nil, secureNeedsHuman("WorkRefForeign",
+				"work ref %s of %s carries tip %s, which this run never authored; a contribution never adopts or overwrites a branch it did not author",
+				workRef, workRepo.Canonical, work.OID)
 		}
 		// A contribution pins no acceptance criteria and no source-issue
 		// identity: upstream issue context in SourceContext is untrusted
@@ -440,6 +493,27 @@ func (s *SecureControl) ResolveAdmission(ctx context.Context, run *courier.Coder
 		return nil, nil, fmt.Errorf("secure admission: unknown run mode %q", run.Spec.Mode)
 	}
 	return registration, policy, nil
+}
+
+// recordedWorkTip reports whether a live work-ref tip matches a tip Courier
+// itself recorded for this run: the admission tip or head anchor of a
+// publication policy bound to this incarnation, or the observed PR head in
+// status. A production first admission carries no such record — the policy
+// is set-once and release clears the branch status — so these arms are the
+// resume boundary for any later re-admission that does carry one. An
+// unrecorded tip is foreign under any key derivation and never becomes this
+// run's anchor.
+func recordedWorkTip(run *courier.CoderRun, oid string) bool {
+	if oid == "" {
+		return false
+	}
+	if run.Status.HeadSHA == oid {
+		return true
+	}
+	if policy := run.Status.PublicationPolicy; policy != nil && policy.RunUID == string(run.UID) {
+		return policy.WorkOID == oid || policy.HeadAnchorOID == oid
+	}
+	return false
 }
 
 // selectRegistration resolves the registration for the run's immutable

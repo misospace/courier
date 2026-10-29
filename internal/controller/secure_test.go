@@ -29,6 +29,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 
 	courier "github.com/misospace/courier/api/v1alpha1"
+	"github.com/misospace/courier/internal/branch"
 	"github.com/misospace/courier/internal/broker"
 	"github.com/misospace/courier/internal/executor"
 	"github.com/misospace/courier/internal/forge"
@@ -48,6 +49,11 @@ type fakeAdmissionForge struct {
 	issues       map[string]forge.WorkItem
 	readErr      error
 	issueReadErr error
+	// headListErr stands in for a failing or unsupported head listing, and
+	// listPRsUnfiltered makes the fake return every seeded PR ignoring its
+	// own base/head filter so the guard's defensive re-filter is exercised.
+	headListErr       error
+	listPRsUnfiltered bool
 	// writeChecks and protectionReads count the credential-bound policy
 	// calls admission must never make on the operator's read identity.
 	writeChecks     int
@@ -135,9 +141,12 @@ func (f *fakeAdmissionForge) CommentPullRequest(context.Context, forge.PullReque
 }
 
 func (f *fakeAdmissionForge) ListPullRequestsByHead(_ context.Context, base forge.PullRequestRef, repo, ref string) ([]forge.PullRequest, error) {
+	if f.headListErr != nil {
+		return nil, f.headListErr
+	}
 	var out []forge.PullRequest
 	for _, pr := range f.prs {
-		if pr.BaseRepo == base.Repo && pr.HeadRepo == repo && pr.HeadRef == ref {
+		if f.listPRsUnfiltered || (pr.BaseRepo == base.Repo && pr.HeadRepo == repo && pr.HeadRef == ref) {
 			out = append(out, pr)
 		}
 	}
@@ -339,19 +348,25 @@ func TestResolveAdmissionFixPR(t *testing.T) {
 }
 
 // contributeForge serves the base repository and the approved fork the
-// contribute admission path reads.
+// contribute admission path reads. Fork goal-branch keys are derived from
+// branch.ResolveGoalBranch so a derivation change fails fixtures loudly
+// instead of silently re-pointing the guards.
 func contributeForge() *fakeAdmissionForge {
 	base := forge.Repository{ID: "repo-1", Canonical: "Acme/Widgets", DefaultRef: "main"}
 	fork := forge.Repository{ID: "repo-2", Canonical: "Contrib/Fork", DefaultRef: "main"}
+	goalAbsent := branch.ResolveGoalBranch("Acme/Widgets", "adhoc-abcdef123456")
+	goalRecorded := branch.ResolveGoalBranch("Acme/Widgets", "adhoc-111111111111")
+	goalEmptyTip := branch.ResolveGoalBranch("Acme/Widgets", "adhoc-222222222222")
 	return &fakeAdmissionForge{
 		repos: map[string]forge.Repository{
 			"acme/widgets": base, "Acme/Widgets": base,
 			"contrib/fork": fork, "Contrib/Fork": fork,
 		},
 		refs: map[string]forge.RefState{
-			"Acme/Widgets:main": {Ref: "main", OID: "baseoid", Exists: true},
-			"Contrib/Fork:courier/Acme/Widgets/goal-abcdef123456": {Ref: "courier/Acme/Widgets/goal-abcdef123456", Exists: false},
-			"Contrib/Fork:courier/Acme/Widgets/goal-111111111111": {Ref: "courier/Acme/Widgets/goal-111111111111", OID: "forktip", Exists: true},
+			"Acme/Widgets:main":            {Ref: "main", OID: "baseoid", Exists: true},
+			"Contrib/Fork:" + goalAbsent:   {Ref: goalAbsent, Exists: false},
+			"Contrib/Fork:" + goalRecorded: {Ref: goalRecorded, OID: "forktip", Exists: true},
+			"Contrib/Fork:" + goalEmptyTip: {Ref: goalEmptyTip, Exists: true},
 		},
 	}
 }
@@ -428,21 +443,245 @@ func TestResolveAdmissionContribute(t *testing.T) {
 	}
 }
 
-// An existing fork branch at admission is recorded as the work tip, not as
-// an initially absent ref: the policy carries the observed OID and the
-// broker refuses an inconsistent initial-tip shape.
+// An existing fork branch tip is adopted only when Courier recorded it for
+// this run — the admission tip or head anchor of a policy bound to this
+// incarnation, or the observed head in status. An unrecorded tip is foreign
+// and refused (#598).
 func TestResolveAdmissionContributeExistingWorkTip(t *testing.T) {
+	admit := func(t *testing.T, mutate func(run *courier.CoderRun)) (*courier.PublicationPolicy, error) {
+		t.Helper()
+		control, _ := secureControl(t)
+		control.Config.Providers = fakeProviderFactory(contributeForge())
+		run := contributeRun("contribute-resume")
+		run.Spec.WorkItemID = "adhoc-111111111111"
+		if mutate != nil {
+			mutate(run)
+		}
+		_, policy, err := control.ResolveAdmission(context.Background(), run)
+		return policy, err
+	}
+	wantsHuman := func(t *testing.T, err error, reason string) {
+		t.Helper()
+		var permanent *SecureNeedsHumanError
+		if !errors.As(err, &permanent) || permanent.Reason != reason {
+			t.Fatalf("error = %v, want NeedsHuman %s", err, reason)
+		}
+	}
+	wantAdopted := func(t *testing.T, policy *courier.PublicationPolicy, err error) {
+		t.Helper()
+		if err != nil {
+			t.Fatalf("ResolveAdmission: %v", err)
+		}
+		if policy.WorkInitiallyAbsent || policy.WorkOID != "forktip" {
+			t.Fatalf("work tip = absent=%t oid=%q, want the recorded tip adopted", policy.WorkInitiallyAbsent, policy.WorkOID)
+		}
+	}
+
+	t.Run("unrecorded tip is foreign", func(t *testing.T) {
+		_, err := admit(t, nil)
+		wantsHuman(t, err, "WorkRefForeign")
+	})
+
+	t.Run("recorded admission tip is adopted", func(t *testing.T) {
+		policy, err := admit(t, func(run *courier.CoderRun) {
+			run.Status.PublicationPolicy = &courier.PublicationPolicy{RunUID: string(run.UID), WorkOID: "forktip"}
+		})
+		wantAdopted(t, policy, err)
+	})
+
+	t.Run("recorded head anchor is adopted", func(t *testing.T) {
+		policy, err := admit(t, func(run *courier.CoderRun) {
+			run.Status.PublicationPolicy = &courier.PublicationPolicy{RunUID: string(run.UID), HeadAnchorOID: "forktip"}
+		})
+		wantAdopted(t, policy, err)
+	})
+
+	// The status-head arm is the resume boundary for a re-admission that
+	// carries an observed-head record; a production first admission never
+	// does (see recordedWorkTip).
+	t.Run("recorded observed head is adopted", func(t *testing.T) {
+		policy, err := admit(t, func(run *courier.CoderRun) {
+			run.Status.HeadSHA = "forktip"
+		})
+		wantAdopted(t, policy, err)
+	})
+
+	t.Run("a policy of another incarnation is foreign", func(t *testing.T) {
+		_, err := admit(t, func(run *courier.CoderRun) {
+			run.Status.PublicationPolicy = &courier.PublicationPolicy{RunUID: "another-incarnation", WorkOID: "forktip"}
+		})
+		wantsHuman(t, err, "WorkRefForeign")
+	})
+
+	t.Run("an existing ref without a readable tip fails closed", func(t *testing.T) {
+		_, err := admit(t, func(run *courier.CoderRun) {
+			run.Spec.WorkItemID = "adhoc-222222222222"
+		})
+		wantsHuman(t, err, "ProviderRead")
+	})
+}
+
+// The head-PR discovery guard on the contribute path fails closed on a
+// closed or merged head and on an ambiguous head, adopts a single open PR
+// as-is, re-filters foreign identities out, and performs no credential-bound
+// check at admission (#598).
+func TestResolveAdmissionContributeHeadPRGuard(t *testing.T) {
+	headRef := branch.ResolveGoalBranch("Acme/Widgets", "adhoc-abcdef123456")
+	newControl := func(t *testing.T, provider *fakeAdmissionForge) *SecureControl {
+		t.Helper()
+		control, _ := secureControl(t)
+		control.Config.Providers = fakeProviderFactory(provider)
+		return control
+	}
+	wantsHuman := func(t *testing.T, err error, reason string) {
+		t.Helper()
+		var permanent *SecureNeedsHumanError
+		if !errors.As(err, &permanent) || permanent.Reason != reason {
+			t.Fatalf("error = %v, want NeedsHuman %s", err, reason)
+		}
+	}
+	wantAdmitsAbsent := func(t *testing.T, policy *courier.PublicationPolicy, err error) {
+		t.Helper()
+		if err != nil {
+			t.Fatalf("ResolveAdmission: %v", err)
+		}
+		if !policy.WorkInitiallyAbsent || policy.PRNumber != 0 {
+			t.Fatalf("head must be adopted as-is, never anchored: absent=%t pr=%d", policy.WorkInitiallyAbsent, policy.PRNumber)
+		}
+	}
+
+	t.Run("merged head is a human decision, write-free", func(t *testing.T) {
+		provider := contributeForge()
+		provider.prs = []forge.PullRequest{{
+			Number: 100, BaseRepo: "Acme/Widgets", HeadRepo: "Contrib/Fork",
+			HeadRef: headRef, State: "merged", Merged: true,
+		}}
+		_, _, err := newControl(t, provider).ResolveAdmission(context.Background(), contributeRun("pr-merged"))
+		wantsHuman(t, err, "HeadAlreadyMerged")
+		if provider.writeChecks != 0 || provider.protectionReads != 0 {
+			t.Fatalf("admission performed %d write checks and %d protection reads on the operator's read identity",
+				provider.writeChecks, provider.protectionReads)
+		}
+	})
+
+	t.Run("closed-unmerged head is a human decision", func(t *testing.T) {
+		provider := contributeForge()
+		provider.prs = []forge.PullRequest{{
+			Number: 101, BaseRepo: "Acme/Widgets", HeadRepo: "Contrib/Fork",
+			HeadRef: headRef, State: "closed", Merged: false,
+		}}
+		_, _, err := newControl(t, provider).ResolveAdmission(context.Background(), contributeRun("pr-closed"))
+		wantsHuman(t, err, "HeadAlreadyMerged")
+	})
+
+	t.Run("ambiguous open head fails closed", func(t *testing.T) {
+		provider := contributeForge()
+		provider.prs = []forge.PullRequest{
+			{Number: 102, BaseRepo: "Acme/Widgets", HeadRepo: "Contrib/Fork", HeadRef: headRef, State: "open"},
+			{Number: 103, BaseRepo: "Acme/Widgets", HeadRepo: "Contrib/Fork", HeadRef: headRef, State: "open"},
+		}
+		_, _, err := newControl(t, provider).ResolveAdmission(context.Background(), contributeRun("pr-ambiguous"))
+		wantsHuman(t, err, "HeadAmbiguousPR")
+	})
+
+	t.Run("a single open draft head is adopted as-is", func(t *testing.T) {
+		provider := contributeForge()
+		provider.prs = []forge.PullRequest{{
+			Number: 104, BaseRepo: "Acme/Widgets", HeadRepo: "Contrib/Fork",
+			HeadRef: headRef, State: "open", Draft: true,
+		}}
+		_, policy, err := newControl(t, provider).ResolveAdmission(context.Background(), contributeRun("pr-draft"))
+		wantAdmitsAbsent(t, policy, err)
+	})
+
+	t.Run("a different base repository is re-filtered out", func(t *testing.T) {
+		provider := contributeForge()
+		// The fake ignores its own base/head filter, so only the guard's
+		// defensive re-filter can drop the foreign-base record.
+		provider.listPRsUnfiltered = true
+		provider.prs = []forge.PullRequest{{
+			Number: 105, BaseRepo: "other/repo", HeadRepo: "Contrib/Fork",
+			HeadRef: headRef, State: "open",
+		}}
+		_, policy, err := newControl(t, provider).ResolveAdmission(context.Background(), contributeRun("pr-other-base"))
+		wantAdmitsAbsent(t, policy, err)
+	})
+
+	t.Run("a different head repository is re-filtered out", func(t *testing.T) {
+		provider := contributeForge()
+		provider.listPRsUnfiltered = true
+		provider.prs = []forge.PullRequest{{
+			Number: 106, BaseRepo: "Acme/Widgets", HeadRepo: "other/fork",
+			HeadRef: headRef, State: "closed", Merged: true,
+		}}
+		_, policy, err := newControl(t, provider).ResolveAdmission(context.Background(), contributeRun("pr-other-head-repo"))
+		wantAdmitsAbsent(t, policy, err)
+	})
+
+	t.Run("a different head ref is re-filtered out", func(t *testing.T) {
+		provider := contributeForge()
+		provider.listPRsUnfiltered = true
+		provider.prs = []forge.PullRequest{{
+			Number: 107, BaseRepo: "Acme/Widgets", HeadRepo: "Contrib/Fork",
+			HeadRef: "someone-elses-branch", State: "closed", Merged: true,
+		}}
+		_, policy, err := newControl(t, provider).ResolveAdmission(context.Background(), contributeRun("pr-other-head-ref"))
+		wantAdmitsAbsent(t, policy, err)
+	})
+
+	t.Run("a closed record outranks an ambiguous head", func(t *testing.T) {
+		provider := contributeForge()
+		provider.prs = []forge.PullRequest{
+			{Number: 108, BaseRepo: "Acme/Widgets", HeadRepo: "Contrib/Fork", HeadRef: headRef, State: "open"},
+			{Number: 109, BaseRepo: "Acme/Widgets", HeadRepo: "Contrib/Fork", HeadRef: headRef, State: "closed"},
+			{Number: 110, BaseRepo: "Acme/Widgets", HeadRepo: "Contrib/Fork", HeadRef: headRef, State: "open"},
+		}
+		_, _, err := newControl(t, provider).ResolveAdmission(context.Background(), contributeRun("pr-mixed-head"))
+		wantsHuman(t, err, "HeadAlreadyMerged")
+	})
+
+	t.Run("an arbitrary head-list error is transient", func(t *testing.T) {
+		provider := contributeForge()
+		provider.headListErr = errors.New("head list unavailable")
+		_, _, err := newControl(t, provider).ResolveAdmission(context.Background(), contributeRun("pr-transient"))
+		if err == nil {
+			t.Fatal("a failed head-list read must fail admission")
+		}
+		var permanent *SecureNeedsHumanError
+		if errors.As(err, &permanent) {
+			t.Fatalf("a transport failure must stay transient, not NeedsHuman: %v", err)
+		}
+	})
+
+	t.Run("an unsupported head-list read proceeds", func(t *testing.T) {
+		provider := contributeForge()
+		provider.headListErr = forge.ErrUnsupported
+		_, policy, err := newControl(t, provider).ResolveAdmission(context.Background(), contributeRun("pr-unsupported"))
+		wantAdmitsAbsent(t, policy, err)
+	})
+}
+
+// The contribution identity is one branch name shared by the claim-time
+// derivation over the submitted spec.Repo and the admission derivation over
+// the provider-canonical base. A casing split would leave the run working
+// a branch no guard polices, so it fails closed; a recorded branch that
+// matches the derived goal branch is not an error (#598).
+func TestResolveAdmissionContributeBranchIdentityConflict(t *testing.T) {
 	control, _ := secureControl(t)
 	control.Config.Providers = fakeProviderFactory(contributeForge())
 
-	run := contributeRun("contribute-resume")
-	run.Spec.WorkItemID = "adhoc-111111111111"
-	_, policy, err := control.ResolveAdmission(context.Background(), run)
-	if err != nil {
-		t.Fatalf("ResolveAdmission: %v", err)
+	conflict := contributeRun("branch-casing-split")
+	conflict.Status.Branch = "courier/acme/widgets/goal-abcdef123456"
+	_, _, err := control.ResolveAdmission(context.Background(), conflict)
+	var permanent *SecureNeedsHumanError
+	if !errors.As(err, &permanent) || permanent.Reason != "ContributionPolicy" {
+		t.Fatalf("error = %v, want NeedsHuman ContributionPolicy", err)
 	}
-	if policy.WorkInitiallyAbsent || policy.WorkOID != "forktip" {
-		t.Fatalf("existing fork branch = absent=%t oid=%q, want observed tip", policy.WorkInitiallyAbsent, policy.WorkOID)
+
+	aligned := contributeRun("branch-aligned")
+	aligned.Status.Branch = branch.ResolveGoalBranch("Acme/Widgets", "adhoc-abcdef123456")
+	if _, _, err := control.ResolveAdmission(context.Background(), aligned); err != nil {
+		t.Fatalf("a claim-time branch matching the canonical derivation must admit: %v", err)
 	}
 }
 

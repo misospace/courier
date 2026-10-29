@@ -148,6 +148,20 @@ func resolveRunBranch(ctx context.Context, run *courierv1alpha1.CoderRun, resolv
 			return HeadRef{}, fmt.Errorf("%w: fix-pr head repository is empty", ErrHeadRepositoryGone)
 		}
 		return head, nil
+	case courierv1alpha1.ModeContribute:
+		if strings.TrimSpace(run.Spec.WorkRepo) == "" {
+			return HeadRef{}, fmt.Errorf("%w: contribute requires spec.workRepo", ErrEmptyResolvedBranch)
+		}
+		resolved := branch.ResolveGoalBranch(run.Spec.Repo, run.Spec.WorkItemID)
+		if resolved == "" {
+			return HeadRef{}, fmt.Errorf("%w: contribute", ErrEmptyResolvedBranch)
+		}
+		// The branch re-derives purely from the immutable spec (base repo plus
+		// idempotency key), so a restart re-derives the same branch. The head
+		// repository is the approved fork named by spec.workRepo, not the base,
+		// and the goal branch is a mutable branch ref: no head commit is
+		// resolved at claim, so SHA stays empty.
+		return HeadRef{Repo: run.Spec.WorkRepo, Branch: resolved}, nil
 	default:
 		return HeadRef{}, fmt.Errorf("%w: unsupported mode %q", ErrEmptyResolvedBranch, run.Spec.Mode)
 	}
