@@ -2494,6 +2494,28 @@ never succeed, so the report settles as refused (`LifecycleReported`
 run becomes reap-eligible; a transient report failure leaves the run in its
 terminal phase with the report retried on a later reconcile. (#178, #561)
 
+### Contribution admission and branch identity
+
+A `contribute` run publishes from an approved fork: the work branch lives on the
+fork (`spec.workRepo`), the PR opens from the fork head into the base
+repository. The goal branch is derived purely from the immutable spec —
+`courier/<base-owner>/<base-repo>/goal-<idempotency-key>` over the
+provider-canonical base — so a restart re-derives the identical branch, and
+`status.branch`/`headRepo`/`headSHA` are never authority for it. The goal branch
+is a mutable ref: no head SHA is resolved at claim.
+
+Admission is write-free and credential-free on the operator's read identity: the
+base and the approved fork are resolved read-only, write authority comes from
+configuration policy (one registration serving both the base and the fork), and
+the credential-bound write verification runs only in the broker preflight under
+the run's own credentials. Courier never adopts or overwrites a branch it did
+not author: an existing goal branch is adopted only when its tip is recorded for
+this run — a publication policy bound to this incarnation, or the observed head
+in status — and any unrecorded tip fails closed. PR discovery matches the exact
+base/head repositories and refs, never title text: a merged or closed head is
+terminal for the key, more than one distinct open PR fails closed, and a single
+open PR (draft included) is admitted as-is with no PR anchor recorded.
+
 ## Terminal retention and closed-unmerged PRs
 
 **The leak:** `reapDone` (`internal/controller/reap.go`) deletes only resolved `Done` runs after a default five minutes. `HandedOff`, `NeedsHuman`, and `Failed` are never reaped: `Reconcile` (`internal/controller/coderun_controller.go`) revisits a terminal phase only to retry a pending lifecycle report and otherwise returns without a timer. `AwaitingReview` was part of the same gap — the controller never re-observed a PR after a run settled — until #250 added the slow, bounded read of the recorded pull request that turns a confirmed merge into `Done`; a PR closed without merge still keeps its run indefinitely, which this design fixes below. The #179 dogfood deployment left 26 `AwaitingReview`, 6 `NeedsHuman`, 1 `Failed`, and 17 retained coordinator pods. `source.Runner.Poll` (`internal/source/runner.go`) lists every CoderRun on every poll to build its dedupe set, so the list grows without bound.
@@ -3041,6 +3063,11 @@ only informs.
   described under Liveness.
 
 ## Current limitations
+
+- Contribution publication is not yet wired end to end: the broker's
+  `PolicyFromRun` binding (`internal/broker/binding.go`) still refuses the
+  `contribute` mode, so an admitted contribution stops fail-closed at the broker
+  ingress — no forge mutation — until the binding wires the contribute case.
 
 - The default OpenCode bootstrap remains explicitly insecure: model-controlled
   processes and forge credentials share a pod. Prompt and tool restrictions
