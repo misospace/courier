@@ -5,6 +5,7 @@ import (
 	"testing"
 
 	"github.com/misospace/courier/api/v1alpha1"
+	"github.com/misospace/courier/internal/branch"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 )
@@ -25,6 +26,13 @@ func bindingRun(mode v1alpha1.Mode) *v1alpha1.CoderRun {
 		policy.WorkOID = "head-oid"
 		policy.PRNumber = 42
 		policy.HeadAnchorOID = "head-oid"
+	}
+	if mode == v1alpha1.ModeContribute {
+		spec.Ref = 0
+		spec.WorkRepo = "fork/repo"
+		spec.WorkItemID = "adhoc-0123456789ab"
+		policy.WorkRepo = "fork/repo"
+		policy.WorkRef = branch.ResolveGoalBranch("org/repo", spec.WorkItemID)
 	}
 	return &v1alpha1.CoderRun{
 		ObjectMeta: metav1.ObjectMeta{UID: types.UID("run-uid")},
@@ -302,4 +310,260 @@ func TestPolicyFromRunRejectsCorruptCriterionPins(t *testing.T) {
 			t.Fatal("a fix-pr policy must not carry resolve-issue criterion pins")
 		}
 	})
+}
+
+// A contribute policy binds from the immutable spec's approved fork and the
+// goal branch the same pure derivation admission uses, in both admitted tip
+// shapes: an absent work ref, and a recorded tip at the resume-adoption
+// boundary.
+func TestPolicyFromRunContributeBindsForkAndGoalBranch(t *testing.T) {
+	absent := bindingRun(v1alpha1.ModeContribute)
+	got, err := PolicyFromRun(absent, "providers/github", "org/repo")
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantRef := branch.ResolveGoalBranch("org/repo", "adhoc-0123456789ab")
+	if wantRef == "" || got.WorkRef != wantRef {
+		t.Fatalf("contribute work ref = %q, want the derived goal branch %q", got.WorkRef, wantRef)
+	}
+	if got.Mode != ModeContribute || got.WorkRepo != "fork/repo" || !got.WorkInitiallyAbsent || got.WorkAnchorOID != "" {
+		t.Fatalf("unexpected contribute policy: %+v", got)
+	}
+	if got.PRNumber != 0 || got.HeadAnchorOID != "" || !got.SourceIssue.IsZero() || got.Criteria.IsPinned() {
+		t.Fatalf("contribute policy carries anchors or pins: %+v", got)
+	}
+
+	resumed := bindingRun(v1alpha1.ModeContribute)
+	resumed.Status.PublicationPolicy.WorkInitiallyAbsent = false
+	resumed.Status.PublicationPolicy.WorkOID = "recorded-tip"
+	got, err = PolicyFromRun(resumed, "providers/github", "org/repo")
+	if err != nil {
+		t.Fatalf("resume-adoption shape must bind: %v", err)
+	}
+	if got.WorkInitiallyAbsent || got.WorkAnchorOID != "recorded-tip" {
+		t.Fatalf("unexpected resumed contribute policy: %+v", got)
+	}
+}
+
+// The persisted fork identity is compared case-folded, because forge
+// identities are case-insensitive while the broker holds no provider read:
+// the same repository under another casing still binds, and any other
+// repository does not.
+func TestPolicyFromRunContributeCanonicalizesApprovedFork(t *testing.T) {
+	cased := bindingRun(v1alpha1.ModeContribute)
+	cased.Spec.WorkRepo = "Contributor/Fork"
+	cased.Status.PublicationPolicy.WorkRepo = "contributor/fork"
+	if _, err := PolicyFromRun(cased, "providers/github", "org/repo"); err != nil {
+		t.Fatalf("case-folded fork identity must bind: %v", err)
+	}
+
+	// The binding proves the persisted destination is the spec's approved
+	// fork and nothing else; whether that fork is approved at all is the
+	// registry's selection, enforced at admission.
+	for _, persistedFork := range []string{"someone-else/fork", "contributor/forkish", "fork/repo/extra", "fork", ""} {
+		t.Run(persistedFork, func(t *testing.T) {
+			run := bindingRun(v1alpha1.ModeContribute)
+			run.Status.PublicationPolicy.WorkRepo = persistedFork
+			if _, err := PolicyFromRun(run, "providers/github", "org/repo"); err == nil {
+				t.Fatalf("persisted work repository %q must not bind as the approved fork", persistedFork)
+			}
+		})
+	}
+
+	malformed := bindingRun(v1alpha1.ModeContribute)
+	malformed.Spec.WorkRepo = "fork"
+	malformed.Status.PublicationPolicy.WorkRepo = "fork"
+	if _, err := PolicyFromRun(malformed, "providers/github", "org/repo"); err == nil {
+		t.Fatal("a spec work repository that is not an owner/name must be rejected")
+	}
+}
+
+// Every malformed contribute shape fails the binding closed with its own
+// reason: a spec that is not a contribution, a persisted identity that
+// describes different work, pins or anchors a contribution never records, an
+// inconsistent work tip, or a policy bound to another run or provider.
+func TestPolicyFromRunRejectsMalformedContribute(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		edit    func(*v1alpha1.CoderRun)
+		wantErr string
+	}{
+		{
+			name:    "spec ref is set",
+			edit:    func(r *v1alpha1.CoderRun) { r.Spec.Ref = 7 },
+			wantErr: "contribute run spec must carry no ref",
+		},
+		{
+			name:    "spec work repository is empty",
+			edit:    func(r *v1alpha1.CoderRun) { r.Spec.WorkRepo = "" },
+			wantErr: "requires an approved work repository",
+		},
+		{
+			name:    "spec work item identity is empty",
+			edit:    func(r *v1alpha1.CoderRun) { r.Spec.WorkItemID = "" },
+			wantErr: "requires a work item identity",
+		},
+		{
+			name:    "persisted work repository is not the approved fork",
+			edit:    func(r *v1alpha1.CoderRun) { r.Status.PublicationPolicy.WorkRepo = "other/fork" },
+			wantErr: "does not match the approved fork",
+		},
+		{
+			name: "persisted work repository is the base under another casing",
+			edit: func(r *v1alpha1.CoderRun) {
+				r.Spec.WorkRepo = "ORG/repo"
+				r.Status.PublicationPolicy.WorkRepo = "ORG/repo"
+			},
+			wantErr: "distinct from the base",
+		},
+		{
+			name:    "persisted work ref is not the derived goal branch",
+			edit:    func(r *v1alpha1.CoderRun) { r.Status.PublicationPolicy.WorkRef = "courier/org/repo/issue-7" },
+			wantErr: "does not match the goal branch",
+		},
+		{
+			name: "persisted work ref was derived over a different base",
+			edit: func(r *v1alpha1.CoderRun) {
+				r.Status.PublicationPolicy.WorkRef = branch.ResolveGoalBranch("other/repo", r.Spec.WorkItemID)
+			},
+			wantErr: "does not match the goal branch",
+		},
+		{
+			name:    "persisted pr number anchor",
+			edit:    func(r *v1alpha1.CoderRun) { r.Status.PublicationPolicy.PRNumber = 3 },
+			wantErr: "contribute policy contains fix-pr anchors",
+		},
+		{
+			name:    "persisted head anchor",
+			edit:    func(r *v1alpha1.CoderRun) { r.Status.PublicationPolicy.HeadAnchorOID = "head-oid" },
+			wantErr: "contribute policy contains fix-pr anchors",
+		},
+		{
+			name: "stray source-issue pin",
+			edit: func(r *v1alpha1.CoderRun) {
+				r.Status.PublicationPolicy.SourceIssue = &v1alpha1.SourceIssueRef{Owner: "org", Name: "repo", Number: 7}
+			},
+			wantErr: "carries source-issue or criterion pins",
+		},
+		{
+			name: "stray criterion rows",
+			edit: func(r *v1alpha1.CoderRun) {
+				r.Status.PublicationPolicy.AcceptanceCriteria = []v1alpha1.Criterion{{ID: "AC-1", Text: "stray", Digest: "sha256:" + strings.Repeat("a", 64)}}
+			},
+			wantErr: "carries source-issue or criterion pins",
+		},
+		{
+			name: "stray criterion set digest",
+			edit: func(r *v1alpha1.CoderRun) {
+				r.Status.PublicationPolicy.AcceptanceCriteriaDigest = "sha256:" + strings.Repeat("b", 64)
+			},
+			wantErr: "carries source-issue or criterion pins",
+		},
+		{
+			name: "absent work ref carries a tip",
+			edit: func(r *v1alpha1.CoderRun) {
+				r.Status.PublicationPolicy.WorkInitiallyAbsent = true
+				r.Status.PublicationPolicy.WorkOID = "unexpected-tip"
+			},
+			wantErr: "inconsistent initial work tip",
+		},
+		{
+			name: "existing work ref carries no tip",
+			edit: func(r *v1alpha1.CoderRun) {
+				r.Status.PublicationPolicy.WorkInitiallyAbsent = false
+			},
+			wantErr: "inconsistent initial work tip",
+		},
+		{
+			name:    "policy belongs to another run",
+			edit:    func(r *v1alpha1.CoderRun) { r.Status.PublicationPolicy.RunUID = "other-run" },
+			wantErr: "run UID does not match live run",
+		},
+		{
+			name:    "run incarnation changed",
+			edit:    func(r *v1alpha1.CoderRun) { r.UID = types.UID("new-incarnation") },
+			wantErr: "run UID does not match live run",
+		},
+		{
+			name:    "policy names another provider",
+			edit:    func(r *v1alpha1.CoderRun) { r.Status.PublicationPolicy.ProviderConfigRef = "providers/other" },
+			wantErr: "provider does not match trusted config",
+		},
+		{
+			name:    "persisted base is not canonical",
+			edit:    func(r *v1alpha1.CoderRun) { r.Status.PublicationPolicy.BaseRepo = "other/repo" },
+			wantErr: "does not match canonical spec repository",
+		},
+		{
+			name:    "incomplete base identity",
+			edit:    func(r *v1alpha1.CoderRun) { r.Status.PublicationPolicy.BaseOID = "" },
+			wantErr: "base and work identities are incomplete",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			run := bindingRun(v1alpha1.ModeContribute)
+			tc.edit(run)
+			_, err := PolicyFromRun(run, "providers/github", "org/repo")
+			if err == nil {
+				t.Fatalf("expected rejection containing %q", tc.wantErr)
+			}
+			if !strings.Contains(err.Error(), tc.wantErr) {
+				t.Fatalf("error = %v, want one containing %q", err, tc.wantErr)
+			}
+		})
+	}
+}
+
+// Mutable status stays out of a contribute binding: the goal branch and fork
+// come from the immutable spec and the persisted policy only.
+func TestPolicyFromRunContributeIgnoresMutableStatus(t *testing.T) {
+	run := bindingRun(v1alpha1.ModeContribute)
+	run.Status.Branch = "stale-or-mutated-branch"
+	run.Status.HeadRepo = "stale-or-mutated/repo"
+	run.Status.HeadSHA = "stale-head-sha"
+	got, err := PolicyFromRun(run, "providers/github", "org/repo")
+	if err != nil {
+		t.Fatalf("mutable status must not affect policy binding: %v", err)
+	}
+	if got.WorkRepo != "fork/repo" || got.WorkRef != branch.ResolveGoalBranch("org/repo", run.Spec.WorkItemID) {
+		t.Fatalf("policy did not preserve immutable pins: %+v", got)
+	}
+}
+
+// A canonical base the goal-branch derivation cannot name is corruption at
+// this boundary too, and each shape says so with its own reason: the binding
+// never falls back to a branch the immutable spec did not derive.
+func TestPolicyFromRunRejectsContributeBaseWithoutDerivation(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		base    string
+		workRef string
+		wantErr string
+	}{
+		{
+			name:    "base is not an owner/name",
+			base:    "no-slash",
+			workRef: "courier/no-slash/goal-0123456789ab",
+			wantErr: "canonical spec repository",
+		},
+		{
+			name:    "base cannot derive a goal branch",
+			base:    "org/re po",
+			workRef: "courier/org/re po/goal-0123456789ab",
+			wantErr: "does not match the goal branch",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			run := bindingRun(v1alpha1.ModeContribute)
+			run.Status.PublicationPolicy.BaseRepo = tc.base
+			run.Status.PublicationPolicy.WorkRef = tc.workRef
+			_, err := PolicyFromRun(run, "providers/github", tc.base)
+			if err == nil {
+				t.Fatalf("expected rejection containing %q", tc.wantErr)
+			}
+			if !strings.Contains(err.Error(), tc.wantErr) {
+				t.Fatalf("error = %v, want one containing %q", err, tc.wantErr)
+			}
+		})
+	}
 }
