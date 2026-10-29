@@ -755,6 +755,56 @@ func TestRetryUnsupportedSource(t *testing.T) {
 	}
 }
 
+// TestRetryAdapterReportsUnsupportedSourceSettlesRefused pins the supported-but-unfenced
+// posture: an adapter that implements the capability but whose deployment cannot
+// fence a requeue at all returns the sentinel, so the durable record settles
+// Refused/unsupported-source on the first call — no endless replay under the key.
+func TestRetryAdapterReportsUnsupportedSourceSettlesRefused(t *testing.T) {
+	src := &requeueSource{admissionSource: &admissionSource{}, err: fmt.Errorf("dispatch requeue route absent: %w", source.ErrUnsupportedRetry)}
+	run := retryRun("rr", courierv1alpha1.PhaseFailed, "req-1")
+	c := phaseClient(t, run)
+
+	if _, err := retryReconciler(c, src, reapClock, nil, nil).Reconcile(context.Background(), admissionRequest("rr")); err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	stored := getRetryRun(t, c, "rr")
+	rec := stored.Status.RetryRequest
+	if rec == nil || rec.State != courierv1alpha1.RetryRequestStateRefused || rec.Reason != courierv1alpha1.RetryRefusalUnsupportedSource {
+		t.Fatalf("retryRequest = %+v, want Refused/unsupported-source", rec)
+	}
+	if src.calls != 1 {
+		t.Fatalf("RequeueAttempt called %d times, want exactly one; the sentinel settles rather than retrying", src.calls)
+	}
+	if cond := retryCondition(t, stored); cond.Status != metav1.ConditionFalse || cond.Reason != courierv1alpha1.ConditionReasonRetryRefused {
+		t.Fatalf("condition = %s/%s, want False/Refused", cond.Status, cond.Reason)
+	}
+}
+
+// TestRetryPermanentRefusalKeepsRequested pins the posture for a source refusal
+// the adapter could not classify — a 400/403 the connector reports through
+// source.ErrPermanentRefusal rather than a coded retry reason. Courier does not
+// read a bounded refusal reason out of a body it cannot classify, so the
+// durable record stays Requested and retries on the settlement cadence; the
+// retry gate keeps holding the run, which is the conservative half of the
+// trade — a request that might still be honored is never falsely settled.
+func TestRetryPermanentRefusalKeepsRequested(t *testing.T) {
+	src := &requeueSource{admissionSource: &admissionSource{}, err: fmt.Errorf("dispatch refused the requeue: %w", source.ErrPermanentRefusal)}
+	run := retryRun("rr", courierv1alpha1.PhaseFailed, "req-1")
+	c := phaseClient(t, run)
+
+	result, err := retryReconciler(c, src, reapClock, nil, nil).Reconcile(context.Background(), admissionRequest("rr"))
+	if err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	if result.RequeueAfter != retrySettlementRequeueDelay {
+		t.Fatalf("RequeueAfter = %v, want the settlement retry cadence", result.RequeueAfter)
+	}
+	stored := getRetryRun(t, c, "rr")
+	if stored.Status.RetryRequest == nil || stored.Status.RetryRequest.State != courierv1alpha1.RetryRequestStateRequested {
+		t.Fatalf("retryRequest = %+v, want it to stay Requested on an unclassified refusal", stored.Status.RetryRequest)
+	}
+}
+
 func TestRetryFixPRUpstreamClosed(t *testing.T) {
 	for name, pull := range map[string]forgePullCase{
 		"merged": {state: "closed", merged: true},

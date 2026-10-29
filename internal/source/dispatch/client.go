@@ -164,6 +164,14 @@ type HTTPClient struct {
 	// latched every park-family exchange short-circuits without an HTTP
 	// round trip for the rest of the process.
 	ciParkUnsupported atomic.Bool
+	// retryUnsupported latches the permanent observation that this Dispatch
+	// deployment has not adopted the fenced attempt-requeue routes at all
+	// (internal/source/dispatch/retry.go): a bare 404 on a requeue POST is
+	// version-skew evidence, never a per-item condition, and once latched every
+	// further requeue short-circuits without an HTTP round trip for the rest of
+	// the process, so a durable retry request settles unsupported instead of
+	// retrying a route the server will never take.
+	retryUnsupported atomic.Bool
 }
 
 // NewClient creates a Dispatch HTTP client without a queue lane override.
@@ -1171,7 +1179,15 @@ func WorkIdentity(id string) string {
 	if err != nil || d.Type != "followup-pr" || d.PRFixID == "" {
 		return id
 	}
-	return fmt.Sprintf("followup-pr/%s#%d/%s@%d", d.Repo, d.Number, d.PRFixID, d.Generation)
+	return prFixWorkIdentity(d.Repo, d.Number, d.PRFixID, d.Generation)
+}
+
+// prFixWorkIdentity spells the dedupe identity of one queue-backed attempt
+// generation. The retry requeue returns the reissued generation through the
+// exact same spelling, so the identity a predecessor records correlates with
+// what the runner's dedupe normalizes a fresh offer to.
+func prFixWorkIdentity(repo string, number int, prFixID string, generation int) string {
+	return fmt.Sprintf("followup-pr/%s#%d/%s@%d", repo, number, prFixID, generation)
 }
 
 func decodeWorkID(id string) (workDescriptor, error) {
@@ -1289,7 +1305,9 @@ func (c *HTTPClient) do(ctx context.Context, method, requestPath string, body an
 // 4xx classes here would fabricate failures for successful no-ops. The CI
 // park family's coded refusals reclassify like the mark family: the caller
 // maps them into identity or stale-work outcomes (classifyCIRefusal) and
-// owns the diagnostic.
+// owns the diagnostic, and the attempt-requeue family (retry.go) does the
+// same through classifyRetryRefusal, whose refusals are 409-coded into the
+// retry vocabulary.
 func exchangeReclassified(method, requestPath string, apiErr *APIError) bool {
 	if method != http.MethodPost {
 		return false
@@ -1301,7 +1319,8 @@ func exchangeReclassified(method, requestPath string, apiErr *APIError) bool {
 		return true
 	}
 	switch requestPath {
-	case "/api/pr-fix-queue/cipark", "/api/pr-fix-queue/cireserve", "/api/pr-fix-queue/cirepair":
+	case "/api/pr-fix-queue/cipark", "/api/pr-fix-queue/cireserve", "/api/pr-fix-queue/cirepair",
+		"/api/pr-fix-queue/attempt-requeue", "/api/issues/requeue":
 		return apiErr.StatusCode == http.StatusConflict
 	}
 	return strings.HasSuffix(requestPath, "/tasks/report") &&

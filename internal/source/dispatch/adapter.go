@@ -100,6 +100,7 @@ var _ source.CapacityRecoveryPreparer = (*Adapter)(nil)
 var _ source.CapacityRecovery = (*Adapter)(nil)
 var _ source.CIParkLifecycle = (*Adapter)(nil)
 var _ source.CIParkLifecycleProbe = (*Adapter)(nil)
+var _ source.AttemptRequeuer = (*Adapter)(nil)
 
 // New creates a Dispatch adapter around an injected API client.
 func New(client Client, opts ...Option) *Adapter {
@@ -332,6 +333,26 @@ func (a *Adapter) SettleCapacityExhaustion(ctx context.Context, item source.Work
 		return source.ErrUnsupportedCapacityRecovery
 	}
 	return settler.SettleCapacityExhaustion(ctx, item.ID, item.Context, handoff)
+}
+
+// RequeueAttempt forwards one explicit operator retry (#97) to the Dispatch
+// requeue route in the shape the fenced capacity-settlement methods use: the
+// run's issued receipt and the request's run-scoped idempotency key travel
+// unchanged, and the client owns the refusal classification — a coded source
+// refusal arrives as a *source.RetryRefusalError, and a deployment that has not
+// adopted the routes as the permanent source.ErrUnsupportedRetry. A client
+// without the requeue capability cannot fence the transition at all, so the
+// adapter reports that posture instead of approximating it with an ordinary
+// lifecycle call, which the core forbids and would have to refuse anyway.
+func (a *Adapter) RequeueAttempt(ctx context.Context, item source.WorkItem, req source.AttemptRequeueRequest) (source.AttemptRequeueResult, error) {
+	if err := a.validate(item); err != nil {
+		return source.AttemptRequeueResult{}, err
+	}
+	requeuer, ok := a.client.(RequeueClient)
+	if !ok {
+		return source.AttemptRequeueResult{}, source.ErrUnsupportedRetry
+	}
+	return requeuer.RequeueAttempt(ctx, item.ID, req)
 }
 
 // Report publishes lifecycle audit metadata to Dispatch.
