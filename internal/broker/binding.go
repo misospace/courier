@@ -22,6 +22,21 @@ func splitOwnerRepo(value string) (owner, name string, ok bool) {
 	return value[:idx], value[idx+1:], true
 }
 
+// canonicalRepoIdentity normalizes an "owner/name" repository identity for the
+// spec-to-persisted cross-checks the binding can perform without a provider
+// read. Forge identities are case-insensitive while git refs are not, so the
+// binding compares case-folded owner and name: it proves the persisted identity
+// names the same repository the immutable spec approves, and never that it
+// carries the provider's exact canonical casing, which only admission's
+// provider read establishes and records.
+func canonicalRepoIdentity(value string) (string, bool) {
+	owner, name, ok := splitOwnerRepo(value)
+	if !ok {
+		return "", false
+	}
+	return strings.ToLower(owner) + "/" + strings.ToLower(name), true
+}
+
 // PolicyFromRun binds broker policy to the live run and to the registered
 // provider configuration selected by trusted startup configuration. Provider is
 // the registered configuration name, not its credential reference. This function
@@ -49,11 +64,27 @@ func PolicyFromRun(run *v1alpha1.CoderRun, providerConfigRef, canonicalSpecRepo 
 	}
 
 	mode := Mode(run.Spec.Mode)
-	if mode != ModeResolveIssue && mode != ModeFixPR {
+	if mode != ModeResolveIssue && mode != ModeFixPR && mode != ModeContribute {
 		return Policy{}, fmt.Errorf("broker binding: unsupported run mode %q", run.Spec.Mode)
 	}
-	if run.Spec.Repo == "" || run.Spec.Ref < 1 {
-		return Policy{}, errors.New("broker binding: run spec repository and positive ref are required")
+	if run.Spec.Repo == "" {
+		return Policy{}, errors.New("broker binding: run spec repository is required")
+	}
+	// A contribution carries no source-owned work item: its spec names the
+	// approved fork and no numeric ref, while every other mode is addressed
+	// by a positive issue or PR number.
+	if mode == ModeContribute {
+		if run.Spec.Ref != 0 {
+			return Policy{}, errors.New("broker binding: contribute run spec must carry no ref")
+		}
+		if run.Spec.WorkRepo == "" {
+			return Policy{}, errors.New("broker binding: contribute run spec requires an approved work repository")
+		}
+		if strings.TrimSpace(run.Spec.WorkItemID) == "" {
+			return Policy{}, errors.New("broker binding: contribute run spec requires a work item identity")
+		}
+	} else if run.Spec.Ref < 1 {
+		return Policy{}, errors.New("broker binding: run spec positive ref is required")
 	}
 	if persisted.BaseRepo == "" || persisted.BaseRepo != canonicalSpecRepo {
 		return Policy{}, errors.New("broker binding: persisted base repository does not match canonical spec repository")
@@ -131,6 +162,53 @@ func PolicyFromRun(run *v1alpha1.CoderRun, providerConfigRef, canonicalSpecRepo 
 		// policy that carries resolve-issue criterion pins is corrupt.
 		if persisted.SourceIssue != nil || len(persisted.AcceptanceCriteria) > 0 || persisted.AcceptanceCriteriaDigest != "" {
 			return Policy{}, errors.New("broker binding: fix-pr policy carries resolve-issue criterion pins")
+		}
+	case ModeContribute:
+		// The approved fork is the only destination a contribution may
+		// push to, and the immutable spec names it: a persisted policy
+		// describing any other repository is corruption, never a
+		// destination choice.
+		approvedFork, ok := canonicalRepoIdentity(run.Spec.WorkRepo)
+		if !ok {
+			return Policy{}, fmt.Errorf("broker binding: spec work repository %q is not an owner/name", run.Spec.WorkRepo)
+		}
+		persistedFork, ok := canonicalRepoIdentity(persisted.WorkRepo)
+		if !ok || persistedFork != approvedFork {
+			return Policy{}, errors.New("broker binding: persisted work repository does not match the approved fork")
+		}
+		// The structural fork invariant, checked case-folded because forge
+		// repository identities are case-insensitive: a fork that is the
+		// base under any casing would make the base writable at this
+		// boundary, which validatePolicy's byte-exact comparison cannot see.
+		canonicalBase, ok := canonicalRepoIdentity(canonicalSpecRepo)
+		if !ok {
+			return Policy{}, fmt.Errorf("broker binding: canonical spec repository %q is not an owner/name", canonicalSpecRepo)
+		}
+		if canonicalBase == persistedFork {
+			return Policy{}, errors.New("broker binding: contribute requires a work repository distinct from the base")
+		}
+		// The goal branch is the same pure derivation admission performs
+		// over the provider-canonical base, so a persisted policy naming a
+		// different branch is corruption rather than a resumable state.
+		derived := branch.ResolveGoalBranch(canonicalSpecRepo, run.Spec.WorkItemID)
+		if derived == "" || persisted.WorkRef != derived {
+			return Policy{}, errors.New("broker binding: contribute work ref does not match the goal branch derived from the immutable spec")
+		}
+		// Admission records no PR anchor for a contribution: the broker's
+		// discovery-based PR idempotency owns PR identity at publication,
+		// so a persisted anchor is corruption.
+		if persisted.PRNumber != 0 || persisted.HeadAnchorOID != "" {
+			return Policy{}, errors.New("broker binding: contribute policy contains fix-pr anchors")
+		}
+		// A contribution has no source-owned work item to link or verify
+		// against: upstream issue context stays untrusted task data, so any
+		// source-issue or criterion pin on this policy is corruption.
+		if persisted.SourceIssue != nil || len(persisted.AcceptanceCriteria) > 0 || persisted.AcceptanceCriteriaDigest != "" {
+			return Policy{}, errors.New("broker binding: contribute policy carries source-issue or criterion pins")
+		}
+		if persisted.WorkInitiallyAbsent && persisted.WorkOID != "" ||
+			!persisted.WorkInitiallyAbsent && persisted.WorkOID == "" {
+			return Policy{}, errors.New("broker binding: contribute policy has inconsistent initial work tip")
 		}
 	}
 
