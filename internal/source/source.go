@@ -433,14 +433,16 @@ func (s ExecutionState) Terminal() bool {
 
 // ExecutionObservation is the source-neutral current-state telemetry for one
 // run (#633). It is an idempotent current-state upsert, not an event log:
-// (RunUID, State) identifies the assertion and ObservedAt orders it, so
-// re-reporting after an operator restart converges instead of appending.
-// Adapters that need a dedupe key derive it from (RunUID, State, ObservedAt).
-// The observation never carries source claim receipts, fence tokens, or lease
-// proof: telemetry must not claim source ownership. RunUID is the durable
-// attempt identity and WorkIdentity the stable identity of the underlying
-// work, so a source can fence a delayed observation of an older attempt
-// against a newer one without Courier holding any queue.
+// (RunUID, State) identifies the assertion and the source keys current state
+// by it — upserting, not appending — so re-reporting after an operator
+// restart converges. Adapters may attach a delivery idempotency key derived
+// from (RunUID, State, ObservedAt); it only deduplicates byte-identical
+// deliveries (a retried lost response) and must never be the source's
+// storage identity. The observation never carries source claim receipts,
+// fence tokens, or lease proof: telemetry must not claim source ownership.
+// RunUID is the durable attempt identity and WorkIdentity the stable identity
+// of the underlying work, so a source can fence a delayed observation of an
+// older attempt against a newer one without Courier holding any queue.
 type ExecutionObservation struct {
 	// RunUID is the run's immutable identity (its Kubernetes UID).
 	RunUID string
@@ -461,9 +463,12 @@ type ExecutionObservation struct {
 	Source string
 	// State is the observed execution state.
 	State ExecutionState
-	// ObservedAt is when Courier observed this state. It is the ordering
-	// fence: a source must ignore an observation of the same run whose
-	// ObservedAt is older than one it already accepted.
+	// ObservedAt is when Courier observed this state. Sources fence primarily
+	// by state kind — a terminal observation for a run must never be replaced
+	// by a non-terminal one, whatever the clocks say — and use ObservedAt to
+	// order non-terminal state changes and to age observations for staleness
+	// display. Courier reports only the run's current state at report time;
+	// a recreated run is a new RunUID.
 	ObservedAt time.Time
 	// PR is the run's public pull request reference, when one exists. It is
 	// display context only; secrets, prompts, and work output never belong

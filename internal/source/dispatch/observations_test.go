@@ -217,9 +217,11 @@ func TestObservationLocalValidation(t *testing.T) {
 	}
 }
 
-// TestObservationIdempotencyKeyStability fixes the dedupe key: the same
-// observation reports under the same key, and a later observation of the same
-// run changes it, so a restart re-report converges instead of appending.
+// TestObservationIdempotencyKeyStability fixes the delivery idempotency key:
+// byte-identical re-sends of the same observation share the key, and a
+// changed observation time yields a different one. Restart convergence is
+// not this key's job: it comes from the source keying current state by
+// (RunUID, State) as an upsert.
 func TestObservationIdempotencyKeyStability(t *testing.T) {
 	var keys []string
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -319,9 +321,6 @@ func TestObservationNonLatchingFailures(t *testing.T) {
 			if errors.Is(err, source.ErrUnsupportedExecutionObservations) {
 				t.Fatalf("failure %v must not read as unsupported", err)
 			}
-			if f.client.executionObservationsUnsupported() {
-				t.Fatal("client must not latch unsupported")
-			}
 			assertObservationCapability(t, f.reg, connector.CapabilitySupported)
 			code = http.StatusNoContent
 			if err := f.client.ReportExecution(context.Background(), obs); err != nil {
@@ -344,9 +343,6 @@ func TestObservationNonLatchingFailures(t *testing.T) {
 		}
 		if errors.Is(err, source.ErrUnsupportedExecutionObservations) {
 			t.Fatalf("failure %v must not read as unsupported", err)
-		}
-		if f.client.executionObservationsUnsupported() {
-			t.Fatal("client must not latch unsupported")
 		}
 		assertObservationCapability(t, f.reg, connector.CapabilitySupported)
 		f.client.httpClient = original
@@ -382,9 +378,6 @@ func TestAdapterReportExecutionDegradation(t *testing.T) {
 			t.Fatalf("ReportExecution() error = %v, want %v", err, source.ErrUnsupportedExecutionObservations)
 		}
 		assertObservationCapability(t, reg, connector.CapabilityUnsupported)
-		if adapter.ExecutionObservationsUnsupported() {
-			t.Fatal("a non-HTTP client must not report the route as observed-unsupported")
-		}
 	})
 
 	t.Run("client with seam", func(t *testing.T) {
@@ -414,23 +407,4 @@ func TestAdapterReportExecutionDegradation(t *testing.T) {
 			t.Fatalf("forwarded observations = %+v, want none for an unaddressable observation", observing.observations)
 		}
 	})
-}
-
-// TestAdapterExecutionObservationsUnsupportedProbe fixes the adapter's
-// version-skew probe: unknown before any observation of the route, true once
-// the concrete client has latched a bare 404/405/501.
-func TestAdapterExecutionObservationsUnsupportedProbe(t *testing.T) {
-	code := http.StatusNotFound
-	f := newDiagnosticsFixture(t, nil, func(f *diagnosticsFixture, w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(code)
-	})
-	if f.adapter.ExecutionObservationsUnsupported() {
-		t.Fatal("probe must be unknown before any observation of the route")
-	}
-	if err := f.client.ReportExecution(context.Background(), testObservation()); !errors.Is(err, source.ErrUnsupportedExecutionObservations) {
-		t.Fatalf("ReportExecution() error = %v, want unsupported", err)
-	}
-	if !f.adapter.ExecutionObservationsUnsupported() {
-		t.Fatal("probe must report the latched route after a bare 404")
-	}
 }

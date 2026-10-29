@@ -195,12 +195,13 @@ type CoderRunReconciler struct {
 	// insecure.
 	Secure *SecureControl
 
-	// obsMu guards obsLast and obsDegraded, the process-local execution
-	// observation memory of publishExecutionObservation (#633). Both maps are
-	// lazily initialized: the reconciler is built as a struct literal, so they
-	// start nil and are created on first write.
+	// obsMu guards obsLast, obsRetry, and obsDegraded, the process-local
+	// execution-observation memory of publishExecutionObservation (#633). All
+	// maps are lazily initialized: the reconciler is built as a struct literal,
+	// so they start nil and are created on first write.
 	obsMu       sync.Mutex
-	obsLast     map[string]source.ExecutionState
+	obsLast     map[string]observationMarker
+	obsRetry    map[string]observationRetry
 	obsDegraded map[string]bool
 }
 

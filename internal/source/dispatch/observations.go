@@ -36,11 +36,13 @@ func observationWorkType(mode string) (string, bool) {
 }
 
 // ReportExecution publishes one execution observation to the Dispatch
-// execution-observation route (misospace/courier#633). The body is an
-// idempotent current-state upsert keyed by (run UID, state, observation
-// time): a process restart re-reports the current state and the source
-// converges instead of appending, so the idempotency key is derived from
-// exactly those fields.
+// execution-observation route (misospace/courier#633). Convergence across
+// restarts is the source's: it keys current state by (run UID, state) and
+// upserts rather than appends, so re-reporting a run's current state
+// converges. The body's idempotency key is a delivery key derived from
+// (run UID, state, observation time): it only deduplicates byte-identical
+// deliveries — a retried lost response — and must never be the server's
+// storage identity.
 //
 // Invariants: the observation never carries claim receipts, fence tokens, or
 // lease data — telemetry must not claim source ownership — and it must never
@@ -106,9 +108,13 @@ func observationsWorkBody(obs source.ExecutionObservation) map[string]any {
 // registered), 405 (POST not adopted), or 501 (route not implemented) is
 // evidence the deployment has not adopted the route at all: version skew,
 // never a per-run condition, and every further report would retry the same
-// refusal. The exchange's protocol-error class was already counted exactly
-// once at the do() choke point (the route is not an exchangeReclassified
-// status), so wrapping the sentinel adds no diagnostic; on the winning latch
+// refusal. The companion Dispatch contract must never reserve bare
+// 404/405/501 for per-item reasons — the same obligation cipark's precedent
+// carries — and that reservation-free status vocabulary is what makes this
+// status-only latch classification sound. The exchange's protocol-error class
+// was already counted exactly once at the do() choke point (the route is not
+// an exchangeReclassified status), so wrapping the sentinel adds no
+// diagnostic; on the winning latch
 // the capability catalogue gauge flips to the unsupported posture the
 // exchange just proved. Anything else — a 400/403 refusal, a 409, a 429, a
 // 5xx, a transport failure, a malformed response — is not route evidence and
@@ -128,13 +134,4 @@ func (c *HTTPClient) reclassifyObservationsRoute(err error) (error, bool) {
 		c.diagnostics.Capability(c.connectorName, connector.CapabilityExecutionObservations, connector.CapabilityUnsupported)
 	}
 	return fmt.Errorf("%w: %w", source.ErrUnsupportedExecutionObservations, err), true
-}
-
-// executionObservationsUnsupported reports the latched version-skew
-// observation: whether this client has seen a bare 404/405/501 on the
-// observations route and therefore knows the deployment has not adopted it.
-// False until observed, and permanent once latched, for the life of the
-// process.
-func (c *HTTPClient) executionObservationsUnsupported() bool {
-	return c.observationsUnsupported.Load()
 }

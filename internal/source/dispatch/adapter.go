@@ -194,24 +194,6 @@ func (a *Adapter) CIParkLifecycleUnsupported() bool {
 	return probe.ciParkLifecycleUnsupported()
 }
 
-// ExecutionObservationsUnsupported answers source.ExecutionObserver's
-// companion probe: whether the concrete client has latched the
-// execution-observation route as unsupported — a bare 404/405/501 on the
-// observations POST, permanent version-skew evidence for the process
-// (internal/source/dispatch/observations.go). Unknown until observed, and a
-// client that is not the concrete HTTP client — every fake — reports
-// not-known-unsupported, so the core keeps reporting exactly as it does until
-// a real skew is observed.
-func (a *Adapter) ExecutionObservationsUnsupported() bool {
-	probe, ok := a.client.(interface {
-		executionObservationsUnsupported() bool
-	})
-	if !ok {
-		return false
-	}
-	return probe.executionObservationsUnsupported()
-}
-
 // Discover returns Dispatch work that the operator can materialize as
 // CoderRuns. Discovery does not claim anything.
 // WorkIdentity implements source.WorkIdentifier.
