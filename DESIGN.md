@@ -2519,11 +2519,13 @@ work run again. The designed path is an explicit, operator-authorized
 retry (#97), specified in [docs/explicit-retry.md](./docs/explicit-retry.md)
 and implemented at the core (#613): the annotation translation, the
 `status.retryRequest` state machine, and the `AttemptRequeuer` capability
-contract in `internal/source` all exist. No adapter implements the
-capability yet (runner discovery integration, Dispatch transport, and the
-manual path remain pending, #607/#608/#609), so a retry against a real
-source today settles `unsupported-source`; the path becomes end-to-end
-supported only when the adapter transports land.
+contract in `internal/source` all exist, and the Dispatch adapter implements
+the fenced requeue transport (`internal/source/dispatch/retry.go`) against the
+wire contract its fixtures pin cross-repo. The Dispatch server has not adopted
+those routes, so a retry against Dispatch fails closed `unsupported-source`
+until it does, and the runner discovery integration and the manual path remain
+pending (#607, #609); the path becomes end-to-end supported only when both
+land.
 The operator annotates the terminal run
 (`courier.misospace.dev/retry`, an opaque request ID — the soft-stop
 ingress pattern); the controller alone translates it into the durable

@@ -254,8 +254,9 @@ func (r *CoderRunReconciler) settleRetryRecord(ctx context.Context, run *courier
 // settles Requeued with any returned attempt identity — including the success a
 // committed key replays after a lost response, so the predecessor settles
 // Requeued rather than Moot. A classified refusal settles Moot (the work already
-// moved on without this key) or Refused; any other error is transient and leaves
-// the durable Requested record untouched to retry under the same key.
+// moved on without this key) or Refused; a source that cannot fence a requeue at
+// all settles Refused/unsupported-source; any other error is transient and
+// leaves the durable Requested record untouched to retry under the same key.
 func (r *CoderRunReconciler) callRequeue(ctx context.Context, run *courierv1alpha1.CoderRun, record *courierv1alpha1.RetryRequest, requeuer source.AttemptRequeuer, item source.WorkItem) (ctrl.Result, bool, error) {
 	req := source.AttemptRequeueRequest{
 		FenceToken:     run.Status.SourceReceipt,
@@ -265,6 +266,13 @@ func (r *CoderRunReconciler) callRequeue(ctx context.Context, run *courierv1alph
 	result, err := requeuer.RequeueAttempt(ctx, item, req)
 	if err == nil {
 		return r.settleRetryOutcome(ctx, run, record, courierv1alpha1.RetryRequestStateRequeued, "", normalizeRetryAttemptID(ctx, run, result.AttemptID))
+	}
+	// A source that cannot fence a requeue at all is permanent for this predecessor: the durable record settles
+	// Refused/unsupported-source instead of retrying under the key forever, which would also hold the run behind
+	// the retry reap gate indefinitely. It precedes the refusal branch because the sentinel is not a
+	// RetryRefusalError; the core still never imitates the requeue with ordinary lifecycle calls.
+	if errors.Is(err, source.ErrUnsupportedRetry) {
+		return r.settleRetryOutcome(ctx, run, record, courierv1alpha1.RetryRequestStateRefused, courierv1alpha1.RetryRefusalUnsupportedSource, "")
 	}
 	var refusal *source.RetryRefusalError
 	if errors.As(err, &refusal) {

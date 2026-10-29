@@ -755,6 +755,31 @@ func TestRetryUnsupportedSource(t *testing.T) {
 	}
 }
 
+// TestRetryAdapterReportsUnsupportedSourceSettlesRefused pins the supported-but-unfenced
+// posture: an adapter that implements the capability but whose deployment cannot
+// fence a requeue at all returns the sentinel, so the durable record settles
+// Refused/unsupported-source on the first call — no endless replay under the key.
+func TestRetryAdapterReportsUnsupportedSourceSettlesRefused(t *testing.T) {
+	src := &requeueSource{admissionSource: &admissionSource{}, err: fmt.Errorf("dispatch requeue route absent: %w", source.ErrUnsupportedRetry)}
+	run := retryRun("rr", courierv1alpha1.PhaseFailed, "req-1")
+	c := phaseClient(t, run)
+
+	if _, err := retryReconciler(c, src, reapClock, nil, nil).Reconcile(context.Background(), admissionRequest("rr")); err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	stored := getRetryRun(t, c, "rr")
+	rec := stored.Status.RetryRequest
+	if rec == nil || rec.State != courierv1alpha1.RetryRequestStateRefused || rec.Reason != courierv1alpha1.RetryRefusalUnsupportedSource {
+		t.Fatalf("retryRequest = %+v, want Refused/unsupported-source", rec)
+	}
+	if src.calls != 1 {
+		t.Fatalf("RequeueAttempt called %d times, want exactly one; the sentinel settles rather than retrying", src.calls)
+	}
+	if cond := retryCondition(t, stored); cond.Status != metav1.ConditionFalse || cond.Reason != courierv1alpha1.ConditionReasonRetryRefused {
+		t.Fatalf("condition = %s/%s, want False/Refused", cond.Status, cond.Reason)
+	}
+}
+
 func TestRetryFixPRUpstreamClosed(t *testing.T) {
 	for name, pull := range map[string]forgePullCase{
 		"merged": {state: "closed", merged: true},

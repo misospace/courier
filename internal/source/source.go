@@ -329,6 +329,15 @@ func (e *RetryRefusalError) Unwrap() error {
 	return e.Err
 }
 
+// ErrUnsupportedRetry means the source deployment cannot fence an attempt
+// requeue at all. It is the permanent posture of an adapter whose deployment
+// has not adopted the fenced requeue route — a bare 404 there is version-skew
+// evidence, latched for the process, not a per-request transient — so the core
+// records it as the unsupported-source refusal and settles the request instead
+// of retrying under the key forever; the adapter must never emulate the
+// requeue with ordinary Claim/Release/Transition calls.
+var ErrUnsupportedRetry = errors.New("source: fenced attempt requeue is unsupported")
+
 // AttemptRequeuer is the optional fenced requeue boundary for an explicit
 // operator retry of a terminal run (#97/#606). In one atomic source-side
 // transition it stops the named attempt from owning the work, releases any human
