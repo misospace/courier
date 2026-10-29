@@ -126,6 +126,7 @@ cannot advertise a capability Courier has no seam for.
 | `ci-park-lifecycle` | `source.CIParkLifecycle` | `identity` (generation-advanced, fence-held, fence-gone, opportunity-missing, head-superseded, fence-settled), `revalidation` (closed-unmerged/merged on reserve refusal), `protocol-error` | connector |
 | `discovery` | `source.Adapter.Discover` | `discovery` (attempts/success/failure), `protocol-error` | connector |
 | `discovery-exclusions` | `source.DiscoveryExcluder` | `exclusion` (requested/accepted/overflow), `ack` (ok/missing/invalid/version-unsupported) | connector |
+| `execution-observations` | `source.ExecutionObserver` | `protocol-error` (best-effort report failures only; the observation itself never gates settlement, and a latched bare 404/405/501 flips this capability to `unsupported` for the process) | connector |
 | `lifecycle-report` | `source.Reporter` | `report` (published/superseded/unsupported/retryable/permanent-refusal), `protocol-error` | connector |
 | `pre-launch-revalidation` | `source.PreLauncher` | `revalidation` (stale/current/error) | connector |
 | `work-identity` | `source.WorkIdentifier` | `identity` (superseded) | connector |

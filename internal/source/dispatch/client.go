@@ -172,6 +172,13 @@ type HTTPClient struct {
 	// the process, so a durable retry request settles unsupported instead of
 	// retrying a route the server will never take.
 	retryUnsupported atomic.Bool
+	// observationsUnsupported latches the permanent observation that this
+	// Dispatch deployment has not adopted the execution-observation route at
+	// all (internal/source/dispatch/observations.go): a bare 404/405/501 on the
+	// observations POST is version-skew evidence, and once latched further
+	// reports short-circuit without an HTTP round trip for the life of the
+	// process.
+	observationsUnsupported atomic.Bool
 }
 
 // NewClient creates a Dispatch HTTP client without a queue lane override.

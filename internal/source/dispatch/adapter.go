@@ -46,6 +46,15 @@ type PreLauncherClient interface {
 	PreLaunch(context.Context, string) error
 }
 
+// ObserverClient is the optional Dispatch API capability used for best-effort
+// execution observations (misospace/courier#633): the run's current-state
+// upserts travel to the execution-observation route, which is non-authoritative
+// observability and must never stand in for a claim, report, or settlement
+// call.
+type ObserverClient interface {
+	ReportExecution(context.Context, source.ExecutionObservation) error
+}
+
 // API is an alias retained as a descriptive name for callers that think of
 // the injected dependency as an API rather than a client.
 type API = Client
@@ -101,6 +110,7 @@ var _ source.CapacityRecovery = (*Adapter)(nil)
 var _ source.CIParkLifecycle = (*Adapter)(nil)
 var _ source.CIParkLifecycleProbe = (*Adapter)(nil)
 var _ source.AttemptRequeuer = (*Adapter)(nil)
+var _ source.ExecutionObserver = (*Adapter)(nil)
 
 // New creates a Dispatch adapter around an injected API client.
 func New(client Client, opts ...Option) *Adapter {
@@ -158,6 +168,11 @@ func (a *Adapter) declareCapabilities() {
 	} else {
 		em.Capability(a.connectorName, connector.CapabilityCIParkLifecycle, connector.CapabilityUnsupported)
 	}
+	if _, ok := a.client.(ObserverClient); ok {
+		em.Capability(a.connectorName, connector.CapabilityExecutionObservations, connector.CapabilitySupported)
+	} else {
+		em.Capability(a.connectorName, connector.CapabilityExecutionObservations, connector.CapabilityUnsupported)
+	}
 	em.Capability(a.connectorName, connector.CapabilityWorkIdentity, connector.CapabilitySupported)
 	em.Capability(a.connectorName, connector.CapabilityAvailability, connector.CapabilitySupported)
 	em.Availability(a.connectorName, connector.AvailabilityUnknown)
@@ -177,6 +192,24 @@ func (a *Adapter) CIParkLifecycleUnsupported() bool {
 		return false
 	}
 	return probe.ciParkLifecycleUnsupported()
+}
+
+// ExecutionObservationsUnsupported answers source.ExecutionObserver's
+// companion probe: whether the concrete client has latched the
+// execution-observation route as unsupported — a bare 404/405/501 on the
+// observations POST, permanent version-skew evidence for the process
+// (internal/source/dispatch/observations.go). Unknown until observed, and a
+// client that is not the concrete HTTP client — every fake — reports
+// not-known-unsupported, so the core keeps reporting exactly as it does until
+// a real skew is observed.
+func (a *Adapter) ExecutionObservationsUnsupported() bool {
+	probe, ok := a.client.(interface {
+		executionObservationsUnsupported() bool
+	})
+	if !ok {
+		return false
+	}
+	return probe.executionObservationsUnsupported()
 }
 
 // Discover returns Dispatch work that the operator can materialize as
@@ -353,6 +386,28 @@ func (a *Adapter) RequeueAttempt(ctx context.Context, item source.WorkItem, req 
 		return source.AttemptRequeueResult{}, source.ErrUnsupportedRetry
 	}
 	return requeuer.RequeueAttempt(ctx, item.ID, req)
+}
+
+// ReportExecution publishes one best-effort execution observation
+// (misospace/courier#633). The observation is non-authoritative: its failure,
+// rejection, or absence must never affect discovery, claim/admission, launch,
+// status updates, publication, settlement, recovery, capacity release, or
+// retention. A client without the observation seam cannot accept
+// observations, so the adapter reports that posture instead of emulating the
+// report with an ordinary lifecycle call, which the core forbids; callers
+// degrade the feature only.
+func (a *Adapter) ReportExecution(ctx context.Context, obs source.ExecutionObservation) error {
+	if err := a.validateClient(); err != nil {
+		return err
+	}
+	if obs.WorkItemID == "" {
+		return ErrEmptyWorkItemID
+	}
+	observer, ok := a.client.(ObserverClient)
+	if !ok {
+		return source.ErrUnsupportedExecutionObservations
+	}
+	return observer.ReportExecution(ctx, obs)
 }
 
 // Report publishes lifecycle audit metadata to Dispatch.
