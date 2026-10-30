@@ -67,6 +67,31 @@ func servingModelInfo(body string) http.HandlerFunc {
 	}
 }
 
+// unreachableGateway returns a gateway whose every request fails at the
+// transport layer, so a test can pin how a transport failure is classified.
+//
+// It does not close an ephemeral port to get there. The kernel can hand a
+// just-released ephemeral port to the next listener that asks for one — the
+// next httptest server this process starts, or another package's test binary
+// running in parallel — and the probe then reads that server's answer
+// instead of the transport failure the test is about, so the failure it
+// asserts never happens. A transport that always fails is deterministic.
+func unreachableGateway(apiKey string) *Gateway {
+	return &Gateway{
+		BaseURL: "http://gateway.invalid",
+		APIKey:  apiKey,
+		HTTP:    &http.Client{Transport: failingTransport{}},
+	}
+}
+
+// failingTransport fails every request the way a dial failure does, without
+// touching the network.
+type failingTransport struct{}
+
+func (failingTransport) RoundTrip(*http.Request) (*http.Response, error) {
+	return nil, errors.New("dial tcp: gateway.invalid: connect: connection refused")
+}
+
 func TestModelInputLimitReadsAdvertisedLimit(t *testing.T) {
 	tests := []struct {
 		name  string
@@ -168,9 +193,7 @@ func TestModelInputLimitStatusFailureIsRedacted(t *testing.T) {
 }
 
 func TestModelInputLimitTransportFailure(t *testing.T) {
-	server := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
-	gateway := &Gateway{BaseURL: server.URL, HTTP: server.Client()}
-	server.Close()
+	gateway := unreachableGateway("")
 
 	limit, err := gateway.ModelInputLimit(context.Background(), "test/coordinator")
 	if limit != 0 {
@@ -492,9 +515,7 @@ func TestContextBudgetCapabilityRedactsProbeFailure(t *testing.T) {
 // TestContextBudgetCapabilityRetryable pins that a transient probe failure on
 // an undeclared lane is reported as a retryable, non-gating unavailability.
 func TestContextBudgetCapabilityRetryable(t *testing.T) {
-	server := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
-	gateway := &Gateway{BaseURL: server.URL, HTTP: server.Client()}
-	server.Close()
+	gateway := unreachableGateway("")
 
 	caps := ProbeCapabilities(context.Background(), budgetProbeDeps(gateway))
 	capability, ok := findCapability(caps, "context-budget:coordinator")
@@ -727,9 +748,7 @@ func TestContextBudgetProbeFailureClassification(t *testing.T) {
 	})
 
 	t.Run("a transport failure renders only its fixed class", func(t *testing.T) {
-		server := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
-		unreachable := &Gateway{BaseURL: server.URL, APIKey: "sk-test-key", HTTP: server.Client()}
-		server.Close()
+		unreachable := unreachableGateway("sk-test-key")
 
 		deps := budgetProbeDeps(unreachable)
 		deps.Context = declared
@@ -746,7 +765,7 @@ func TestContextBudgetProbeFailureClassification(t *testing.T) {
 		if !strings.Contains(capability.Detail, "the gateway read failed: harness: gateway transport failed") {
 			t.Fatalf("detail = %q, want the fixed transport class", capability.Detail)
 		}
-		for _, leak := range []string{server.URL, "127.0.0.1", "dial tcp", "sk-test-key"} {
+		for _, leak := range []string{unreachable.BaseURL, "127.0.0.1", "dial tcp", "sk-test-key"} {
 			if strings.Contains(capability.Detail, leak) {
 				t.Fatalf("detail = %q, must not carry %q", capability.Detail, leak)
 			}
