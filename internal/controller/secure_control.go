@@ -672,7 +672,7 @@ func (s *SecureControl) cachePin(ctx context.Context) (*topology.CachePin, error
 		return nil, fmt.Errorf("secure topology: --dependency-cache-service must be namespace/name, got %q", s.Config.CacheService)
 	}
 	service := &corev1.Service{}
-	if err := s.Client.Get(ctx, types.NamespacedName{Namespace: parts[0], Name: parts[1]}, service); err != nil {
+	if err := s.reader().Get(ctx, types.NamespacedName{Namespace: parts[0], Name: parts[1]}, service); err != nil {
 		if apierrors.IsNotFound(err) {
 			return nil, fmt.Errorf("secure topology: dependency cache Service %s not found", s.Config.CacheService)
 		}

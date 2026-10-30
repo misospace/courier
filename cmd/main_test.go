@@ -993,38 +993,6 @@ func TestResolveOwnership(t *testing.T) {
 	}
 }
 
-func TestControllerCacheOptionsScopeRunKinds(t *testing.T) {
-	if opts := controllerCacheOptions(nil); len(opts.ByObject) != 0 {
-		t.Fatalf("empty watch set restricted %d object kinds, want the unrestricted default", len(opts.ByObject))
-	}
-	opts := controllerCacheOptions([]string{"runs-a", "courier-system"})
-	want := map[string]bool{
-		"CoderRun":    false,
-		"LaneProfile": false,
-		"Pod":         false,
-	}
-	for object, scoped := range opts.ByObject {
-		kind := reflect.TypeOf(object).Elem().Name()
-		if _, ok := want[kind]; !ok {
-			t.Fatalf("cache restricted unexpected kind %s; preflight-visible kinds must stay cluster-wide", kind)
-		}
-		want[kind] = true
-		if len(scoped.Namespaces) != 2 {
-			t.Fatalf("kind %s watches %d namespaces, want the watched set", kind, len(scoped.Namespaces))
-		}
-		for _, namespace := range []string{"runs-a", "courier-system"} {
-			if _, ok := scoped.Namespaces[namespace]; !ok {
-				t.Fatalf("kind %s does not watch %q", kind, namespace)
-			}
-		}
-	}
-	for kind, seen := range want {
-		if !seen {
-			t.Fatalf("cache did not restrict %s", kind)
-		}
-	}
-}
-
 // TestUncachedReadObjectsCoverNoWatchKinds guards the invariant that aligns
 // the manager client's reads with the shipped chart RBAC (#641): every kind
 // read by-name during secure admission, preflight or provisioning must be

@@ -27,6 +27,7 @@ import (
 
 	courierv1alpha1 "github.com/misospace/courier/api/v1alpha1"
 	"github.com/misospace/courier/internal/bootstrap"
+	"github.com/misospace/courier/internal/cacheopts"
 	"github.com/misospace/courier/internal/connector"
 	"github.com/misospace/courier/internal/controller"
 	"github.com/misospace/courier/internal/executor"
@@ -222,7 +223,7 @@ func main() {
 
 	mgr, err := ctrl.NewManager(ctrl.GetConfigOrDie(), ctrl.Options{
 		Scheme:                 scheme,
-		Cache:                  controllerCacheOptions(watchedNamespaces),
+		Cache:                  cacheopts.Options(watchedNamespaces),
 		Client:                 client.Options{Cache: &client.CacheOptions{DisableFor: uncachedReadObjects()}},
 		Metrics:                metricsserver.Options{BindAddress: metricsAddr},
 		HealthProbeBindAddress: probeAddr,
@@ -863,33 +864,6 @@ func containsNamespace(namespaces []string, namespace string) bool {
 		}
 	}
 	return false
-}
-
-// controllerCacheOptions scopes the manager's informers to the watched
-// namespaces (#632): CoderRun, LaneProfile and Pod are listed and watched
-// only there, so a side-by-side release neither observes nor can be woken
-// by another deployment's runs, lanes, and run pods. These three are the
-// only kinds the informer cache ever holds, because they are the only kinds
-// the shipped chart RBAC grants watch on; every other kind the operator
-// reads is excluded from the cache by uncachedReadObjects and read directly
-// from the API server. An empty watched set leaves the three run kinds
-// cluster-wide — the single-controller default.
-func controllerCacheOptions(watched []string) cache.Options {
-	if len(watched) == 0 {
-		return cache.Options{}
-	}
-	namespaces := make(map[string]cache.Config, len(watched))
-	for _, namespace := range watched {
-		namespaces[namespace] = cache.Config{}
-	}
-	byNamespace := cache.ByObject{Namespaces: namespaces}
-	return cache.Options{
-		ByObject: map[client.Object]cache.ByObject{
-			&courierv1alpha1.CoderRun{}:    byNamespace,
-			&courierv1alpha1.LaneProfile{}: byNamespace,
-			&corev1.Pod{}:                  byNamespace,
-		},
-	}
 }
 
 // uncachedReadObjects lists the kinds the manager's client must read directly
