@@ -456,6 +456,153 @@ func TestCheckWaiterHonorsItsOwnContext(t *testing.T) {
 	<-resultA
 }
 
+func TestCheckTimedOutDispatchIsNotReusable(t *testing.T) {
+	worker, delegator, cleanupWorker := testWorkerAndDelegator(t)
+	defer cleanupWorker()
+	worker.snapshotTip = "snap-tip"
+	// The check hangs until the caller's bound expires; both callers'
+	// unpacks ride prepareSnapshot and need scripted tip echoes.
+	worker.hangKinds = []string{"check"}
+	worker.ordinaryResults = []protocol.Result{
+		{Status: protocol.ResultCompleted, ExitCode: 0, StdoutTail: "rerun ok\n"},
+	}
+	coordinator := newCheckCoordinator(t, delegator, snapshotProvider("snap-tip"))
+
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+	timedOut := coordinator.runCheck(ctx, checkCall("go test ./..."), "", ToolResult{ToolCallID: "c1", Name: toolCheck})
+
+	// The bound expiry delivered the worker kill (the reconcile cancelled
+	// the op), left no receipt — a timed-out invocation is never reusable
+	// evidence — and reported the timeout as an error, never a pass.
+	if !timedOut.IsError || !strings.Contains(timedOut.Content, "deadline exceeded") {
+		t.Fatalf("timed-out check = %+v, want the deadline reported as an error", timedOut)
+	}
+	if strings.Contains(timedOut.Content, "check receipt:") {
+		t.Fatalf("timed-out check content = %q, want no receipt for a dispatch that never completed", timedOut.Content)
+	}
+	cancelled := 0
+	for _, envelope := range worker.cancels {
+		if strings.HasPrefix(envelope.OpID, "check.") {
+			cancelled++
+		}
+	}
+	if cancelled == 0 {
+		t.Fatal("no check operation was cancelled; the timed-out dispatch left unverified work behind")
+	}
+	if got := taskDispatchCount(worker, notUnpackTask); got != 1 {
+		t.Fatalf("check dispatches = %d, want the timed-out request to leave the key rerunnable without a second launch", got)
+	}
+
+	// A repeat request against the unchanged state reruns rather than
+	// serving a receipt that never existed.
+	worker.hangKinds = nil
+	rerun := coordinator.runCheck(context.Background(), checkCall("go test ./..."), "", ToolResult{ToolCallID: "c2", Name: toolCheck})
+	if got := taskDispatchCount(worker, notUnpackTask); got != 2 {
+		t.Fatalf("check dispatches = %d, want the repeat request after a timeout to dispatch fresh", got)
+	}
+	if rerun.IsError || !strings.Contains(rerun.Content, "rerun ok\n") {
+		t.Fatalf("rerun check = %+v, want a fresh passing receipt", rerun)
+	}
+}
+
+func TestCheckPreservesWorkerTailsVerbatim(t *testing.T) {
+	worker, delegator, cleanupWorker := testWorkerAndDelegator(t)
+	defer cleanupWorker()
+	worker.snapshotTip = "snap-tip"
+	// The worker already bounds its captured streams to tails; the head is
+	// what truncation cuts, so both markers must survive control side to
+	// prove the receipt preserved the worker's tails exactly.
+	stdoutTail := "[truncated-head]" + strings.Repeat("o", 4096) + "[stdout-end]"
+	stderrTail := "[truncated-head]" + strings.Repeat("e", 4096) + "[stderr-end]"
+	worker.ordinaryResults = []protocol.Result{
+		{Status: protocol.ResultCompleted, ExitCode: 0, StdoutTail: stdoutTail, StderrTail: stderrTail},
+	}
+	coordinator := newCheckCoordinator(t, delegator, snapshotProvider("snap-tip"))
+
+	first := coordinator.runCheck(context.Background(), checkCall("go test ./..."), "", ToolResult{ToolCallID: "c1", Name: toolCheck})
+	second := coordinator.runCheck(context.Background(), checkCall("go test ./..."), "", ToolResult{ToolCallID: "c2", Name: toolCheck})
+
+	for i, result := range []ToolResult{first, second} {
+		for _, part := range []string{stdoutTail, stderrTail} {
+			if !strings.Contains(result.Content, part) {
+				t.Fatalf("check %d content = %q, want the worker's bounded tail preserved verbatim", i, result.Content)
+			}
+		}
+	}
+	// Reuse serves the same receipt bytes: the tails are neither
+	// re-truncated nor re-rendered across reuse.
+	if got, want := tailOf(first.Content, "stdout:\n", "\nstderr:\n"), tailOf(second.Content, "stdout:\n", "\nstderr:\n"); got != want || got != stdoutTail {
+		t.Fatalf("reused tail = %q, want the fresh tail %q served unchanged", got, want)
+	}
+}
+
+// tailOf returns the rendered segment between marker and end, with its
+// trailing newline, as renderCheckResult wrote it.
+func tailOf(content, marker, end string) string {
+	start := strings.Index(content, marker)
+	if start < 0 {
+		return ""
+	}
+	segment := content[start+len(marker):]
+	if stop := strings.Index(segment, end); stop >= 0 {
+		segment = segment[:stop]
+	}
+	return segment
+}
+
+// TestCheckRepresentativeRunAvoidsDuplicateLaunches replays the observed v1
+// failure mode from issue #635: a coordinator re-invoked the same validation
+// suite again and again to collect different summaries, growing its context
+// with every rerun. Against tracked receipts the same sequence launches one
+// dispatch per distinct (command, workspace state) instead of one per
+// request.
+func TestCheckRepresentativeRunAvoidsDuplicateLaunches(t *testing.T) {
+	worker, delegator, cleanupWorker := testWorkerAndDelegator(t)
+	defer cleanupWorker()
+	worker.snapshotTips = []string{"t1", "t1", "t1", "t1", "t2", "t2", "t2", "t2"}
+	// Only fresh check dispatches consume ordinary results; the scripted
+	// tips ride the unpack tasks.
+	worker.ordinaryResults = []protocol.Result{
+		{Status: protocol.ResultCompleted, ExitCode: 0, StdoutTail: "suite t1\n"},
+		{Status: protocol.ResultCompleted, ExitCode: 0, StdoutTail: "lint t1\n"},
+		{Status: protocol.ResultCompleted, ExitCode: 0, StdoutTail: "suite t2\n"},
+	}
+	coordinator := newCheckCoordinator(t, delegator, sequenceSnapshotProvider(worker.snapshotTips...))
+
+	const requests = 7
+	suite := "go test ./..."
+	lint := "go vet ./..."
+	sequence := []string{suite, suite, suite, lint, suite, suite, suite}
+	checked := 0
+	for i, command := range sequence {
+		result := coordinator.runCheck(context.Background(), checkCall(command), "", ToolResult{ToolCallID: fmt.Sprintf("c%d", i), Name: toolCheck})
+		if result.IsError {
+			t.Fatalf("check %d = %+v, want a passing receipt", i, result)
+		}
+		// A reused receipt is answered without a dispatch; the saved
+		// diagnostics are reprinted, not rerun for presentation.
+		if strings.Contains(result.Content, "check receipt: fresh") {
+			checked++
+		}
+	}
+	if got := taskDispatchCount(worker, notUnpackTask); got != 3 {
+		t.Fatalf("check dispatches = %d, want one per distinct (command, state) across %d requests", got, requests)
+	}
+	if checked != 3 {
+		t.Fatalf("fresh receipts = %d, want one per distinct (command, state)", checked)
+	}
+	// The duplicate presentation of the unchanged suite reprints the saved
+	// receipt rather than rerunning.
+	last := coordinator.runCheck(context.Background(), checkCall(suite), "", ToolResult{ToolCallID: "c-last", Name: toolCheck})
+	if !strings.Contains(last.Content, "check receipt: reused") || !strings.Contains(last.Content, "suite t2\n") {
+		t.Fatalf("last check content = %q, want the saved suite receipt reprinted", last.Content)
+	}
+	if got := taskDispatchCount(worker, notUnpackTask); got != 3 {
+		t.Fatalf("check dispatches = %d, want the duplicate presentation to launch nothing", got)
+	}
+}
+
 func TestCheckEvictsOldestReceiptBeyondBound(t *testing.T) {
 	worker, delegator, cleanupWorker := testWorkerAndDelegator(t)
 	defer cleanupWorker()

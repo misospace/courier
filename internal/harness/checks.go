@@ -281,6 +281,13 @@ func bootstrapEnvDigest(env []string) string {
 
 // checkStateKey digests the check's full identity: the normalized command and
 // the workspace state it ran against.
+//
+// The dispatch carries no working directory and the worker runs every task in
+// its fixed sanitized workspace root (protocol.WorkerConfig.WorkspaceDir), so
+// cwd is a per-worker constant and the command-plus-state identity is
+// complete as stands. If a cwd surface is ever added to the check tool or to
+// protocol.Task, it must become part of this key — otherwise the same command
+// string from a different directory would reuse a stale receipt.
 func checkStateKey(command, tip, envDigest string) string {
 	return digestOf(command + "\x00" + tip + "\x00" + envDigest)
 }
