@@ -69,11 +69,14 @@ func preflightBackoffDelay(failures int) time.Duration {
 // preflightBackoffRemaining reports how long the run must still wait before
 // its next secure preflight attempt, and whether it must wait at all.
 //
-// The gate fails open: a run that carries no marker, an unreadable timestamp,
-// an elapsed one, or one the clock has not reached yet is due immediately,
+// The gate fails open: a run that carries no marker, an unreadable marker, an
+// elapsed one, or one the clock has not reached yet is due immediately,
 // because a gate that cannot be read must never strand a run that could still
-// succeed. A future-dated marker is due for the same reason the merge
-// observation's marker is: clock skew must not decide that a run waits.
+// succeed. Both markers are part of the gate: the count decides how long the
+// wait is, so a timestamp without a readable count is a gate the operator
+// cannot read, and it holds the run back not at all. A future-dated marker is
+// due for the same reason the merge observation's marker is: clock skew must
+// not decide that a run waits.
 func (r *CoderRunReconciler) preflightBackoffRemaining(run *courier.CoderRun) (time.Duration, bool) {
 	raw, ok := run.Annotations[preflightFailedAtAnnotation]
 	if !ok {
@@ -83,12 +86,9 @@ func (r *CoderRunReconciler) preflightBackoffRemaining(run *courier.CoderRun) (t
 	if err != nil {
 		return 0, false
 	}
-	// A missing or unreadable count is read as a single failure: the
-	// shortest wait the schedule allows, so a garbled marker cannot hold a
-	// run back longer than the first failure would.
-	failures := 1
-	if count, ok := recordedPreflightFailures(run); ok {
-		failures = count
+	failures, ok := recordedPreflightFailures(run)
+	if !ok {
+		return 0, false
 	}
 	delay := preflightBackoffDelay(failures)
 	elapsed := r.clock().UTC().Sub(stampedAt)
@@ -99,7 +99,11 @@ func (r *CoderRunReconciler) preflightBackoffRemaining(run *courier.CoderRun) (t
 }
 
 // recordedPreflightFailures reads the consecutive-failure count exactly as the
-// run records it, and reports whether the run carries a readable one.
+// run records it, and reports whether the run carries a readable one. A count
+// the operator cannot read is no count: the gate that depends on it cannot be
+// read either, so the gate reader treats it as no gate at all rather than
+// guess a delay, and the arming path treats it as no recorded failure to
+// build on.
 func recordedPreflightFailures(run *courier.CoderRun) (int, bool) {
 	raw, ok := run.Annotations[preflightFailuresAnnotation]
 	if !ok {
@@ -145,6 +149,12 @@ func (r *CoderRunReconciler) armPreflightBackoff(ctx context.Context, run *couri
 	failures := 1
 	if previous, ok := recordedPreflightFailures(r.livePreflightFailures(ctx, run)); ok {
 		failures = previous + 1
+		if failures <= previous {
+			// The count already holds the largest number it can, so
+			// it stays there: a wrapped count would be written as a
+			// negative number, which no reader could use.
+			failures = previous
+		}
 	}
 	before := run.DeepCopy()
 	if run.Annotations == nil {

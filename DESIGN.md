@@ -2272,12 +2272,14 @@ the API server rather than the informer cache, so a lagging cache cannot
 restart the schedule. The gate is armed before the claim is released, so a
 rollback that fails still leaves the run waiting out the delay instead of
 cycling. The bound is best-effort: a marker that cannot be written leaves the
-ordinary requeue, and a marker that cannot be read is treated as no gate at
-all, because a gate that cannot be read must never strand a run that could
-still succeed. No verdict class changes: a failure that clears on a later pass
-still clears, and one that never clears still retries — only not in a tight
-loop. An ordinary preflight error is not gated at all, because the design
-classifies it as transient.
+ordinary requeue, and a marker the operator cannot read — the timestamp, or
+the failure count that decides how long the wait is, whether it is missing,
+unparseable, or not a positive number — is treated as no gate at all, because
+a gate that cannot be read must never strand a run that could still succeed.
+No verdict class changes: a failure that clears on a later pass still clears,
+and one that never clears still retries — only not in a tight loop. An
+ordinary preflight error is not gated at all, because the design classifies it
+as transient.
 The secure round is fenced before it terminalizes: a resumed launch
 reaches the launcher with a live worker and a credentialed broker, and a
 `NeedsHuman` run is no longer observed, so a fence deferred past that reconcile

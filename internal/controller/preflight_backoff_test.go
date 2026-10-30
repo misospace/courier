@@ -104,9 +104,10 @@ func TestPreflightBackoffDelay(t *testing.T) {
 
 // TestPreflightBackoffRemainingFailsOpen pins the gate's fail-open posture: a
 // marker the operator cannot read must never hold a run back, because a gate
-// that cannot be read must not strand a run that could still succeed. An
-// unreadable failure count is the one marker that is read leniently — as a
-// single failure, the shortest wait the schedule allows.
+// that cannot be read must not strand a run that could still succeed. Both
+// markers are part of the gate: the count decides how long the wait is, so a
+// timestamp without a readable count is a gate that cannot be read, and it
+// holds the run back not at all.
 func TestPreflightBackoffRemainingFailsOpen(t *testing.T) {
 	reconciler := &CoderRunReconciler{Now: func() time.Time { return preflightBackoffNow }}
 	run := admissionRun("preflight-fail-open", "local", courier.PhasePending)
@@ -124,24 +125,45 @@ func TestPreflightBackoffRemainingFailsOpen(t *testing.T) {
 		preflightFailedAtAnnotation: preflightBackoffNow.Add(-time.Second).UTC().Format(time.RFC3339),
 		preflightFailuresAnnotation: "not-a-count",
 	}
-	remaining, ok := reconciler.preflightBackoffRemaining(run)
-	if !ok {
-		t.Fatal("remaining = not gated, want the gate to hold an unreadable count as a single failure")
+	if remaining, ok := reconciler.preflightBackoffRemaining(run); ok {
+		t.Fatalf("remaining = %v, want no gate on an unreadable failure count", remaining)
 	}
-	if want := preflightBackoffBaseDelay - time.Second; remaining != want {
-		t.Fatalf("remaining = %v, want %v", remaining, want)
+
+	run.Annotations = map[string]string{
+		preflightFailedAtAnnotation: preflightBackoffNow.Add(-time.Second).UTC().Format(time.RFC3339),
+	}
+	if remaining, ok := reconciler.preflightBackoffRemaining(run); ok {
+		t.Fatalf("remaining = %v, want no gate on a missing failure count", remaining)
 	}
 
 	run.Annotations = map[string]string{
 		preflightFailedAtAnnotation: preflightBackoffNow.Add(-5 * time.Second).UTC().Format(time.RFC3339),
 		preflightFailuresAnnotation: "3",
 	}
-	remaining, ok = reconciler.preflightBackoffRemaining(run)
+	remaining, ok := reconciler.preflightBackoffRemaining(run)
 	if !ok {
 		t.Fatal("remaining = not gated, want the gate to hold a freshly armed run")
 	}
 	if want := preflightBackoffDelay(3) - 5*time.Second; remaining != want {
 		t.Fatalf("remaining = %v, want %v", remaining, want)
+	}
+
+	run.Annotations = map[string]string{
+		preflightFailedAtAnnotation: preflightBackoffNow.Add(-5 * time.Second).UTC().Format(time.RFC3339),
+		preflightFailuresAnnotation: "0",
+	}
+	if remaining, ok := reconciler.preflightBackoffRemaining(run); ok {
+		t.Fatalf("remaining = %v, want no gate on a count that is not a positive number", remaining)
+	}
+
+	// A marker the clock has not reached yet is due: clock skew must not
+	// decide that a run waits.
+	run.Annotations = map[string]string{
+		preflightFailedAtAnnotation: preflightBackoffNow.Add(time.Hour).UTC().Format(time.RFC3339),
+		preflightFailuresAnnotation: "3",
+	}
+	if remaining, ok := reconciler.preflightBackoffRemaining(run); ok {
+		t.Fatalf("remaining = %v, want no gate on a future-dated marker", remaining)
 	}
 
 	run.Annotations = map[string]string{
