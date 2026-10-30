@@ -45,25 +45,22 @@ type probeOutcome struct {
 
 // Preflight runs the secure-mode preflight for one run. It assumes the static
 // topology objects (SAs, RBAC, secrets, services, policies) are already
-// provisioned. relaunch abbreviates the check: replacement launches re-verify
-// the static guarantees but do not repeat the multi-node live probes, which
-// ran before the first workload exposure. resources and workerImage are the
-// lane-resolved values the caller already holds for this launch pass, so the
-// dry-run proof and the pods created afterwards are the same artifacts. The
-// proof carries the probe pod only on a pass that will create probes live, so
-// a deployment with no probe image never proves — and is never failed by — a
-// spec it will not create.
+// provisioned, and that the deployment-level facts that do not depend on them —
+// the operator's own grants and the dedicated run namespace's restricted Pod
+// Security label — were already proven by the launch path before it created
+// anything (checkDeploymentPreconditions). relaunch abbreviates the check:
+// replacement launches re-verify the static guarantees but do not repeat the
+// multi-node live probes, which ran before the first workload exposure.
+// resources and workerImage are the lane-resolved values the caller already
+// holds for this launch pass, so the dry-run proof and the pods created
+// afterwards are the same artifacts. The proof carries the probe pod only on a
+// pass that will create probes live, so a deployment with no probe image never
+// proves — and is never failed by — a spec it will not create.
 //
 // Permanent deployment misconfiguration returns a *SecureNeedsHumanError;
 // transient API or probe failures return an ordinary error so the run requeues
 // without launching.
 func (s *SecureControl) Preflight(ctx context.Context, run *courier.CoderRun, policy *courier.PublicationPolicy, relaunch bool, resources corev1.ResourceRequirements, workerImage string) error {
-	if err := s.checkNamespaceBoundary(ctx); err != nil {
-		return err
-	}
-	if err := s.checkOperatorAccess(ctx); err != nil {
-		return err
-	}
 	if err := s.checkBrokerRBAC(ctx, run); err != nil {
 		return err
 	}
@@ -78,6 +75,31 @@ func (s *SecureControl) Preflight(ctx context.Context, run *courier.CoderRun, po
 		return nil
 	}
 	return s.runLiveProbes(ctx, run, cache)
+}
+
+// checkDeploymentPreconditions proves the deployment-level facts the secure
+// topology depends on before the operator creates anything: the operator's own
+// provisioning grants, and the dedicated run namespace with its restricted Pod
+// Security label.
+//
+// Neither depends on the objects a run's topology creates, so both can be
+// proven first, and proving them first is what keeps a permanent
+// misconfiguration a verdict. A missing operator grant or a namespace without
+// the restricted label is a deployment the operator must fix, and a verdict is
+// the form the launch path reports it in, so the retry can be bounded. Had the
+// launch path created the topology first, the same misconfiguration would
+// surface as a raw Forbidden from a create — an ordinary error, which the
+// design classifies as transient, so the run would cycle Pending → Claimed →
+// Pending as fast as the API server allowed (#644).
+//
+// The operator's own grants are proven first: without them the namespace read
+// could fail with a raw Forbidden that no reader could tell apart from a
+// permanent misconfiguration.
+func (s *SecureControl) checkDeploymentPreconditions(ctx context.Context) error {
+	if err := s.checkOperatorAccess(ctx); err != nil {
+		return err
+	}
+	return s.checkNamespaceBoundary(ctx)
 }
 
 // checkNamespaceBoundary verifies the dedicated run namespace exists and
@@ -170,6 +192,10 @@ func (s *SecureControl) checkBrokerRBAC(ctx context.Context, run *courier.CoderR
 		{group: courier.GroupVersion.Group, resource: "coderruns", verb: "get", name: run.Name},
 		{group: courier.GroupVersion.Group, resource: "coderruns/status", verb: "get", name: run.Name},
 		{group: courier.GroupVersion.Group, resource: "coderruns/status", verb: "patch", name: run.Name},
+		// The broker's only write of the run's status is an update
+		// (internal/broker/status.go), so the update verb is the one the
+		// grant must carry for the broker to report at all.
+		{group: courier.GroupVersion.Group, resource: "coderruns/status", verb: "update", name: run.Name},
 		// The broker's pod reads are name-scoped to this run's three topology
 		// pods (§3): the Role grants get pods only through resourceNames, so
 		// an unrestricted get review fails despite every required named read

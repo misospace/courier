@@ -53,6 +53,17 @@ func (s *SecureControl) LaunchSecure(ctx context.Context, run *courier.CoderRun)
 
 	relaunch := s.topologyPodsExist(ctx, run)
 
+	// The deployment's own facts are proven before anything is created: a
+	// missing operator grant or a run namespace without the restricted Pod
+	// Security label is a misconfiguration the operator must fix, and the
+	// verdict that says so is what lets the caller bound the retry. Creating
+	// the topology first would surface the same misconfiguration as a raw
+	// Forbidden from a create — an ordinary error, retried as fast as the API
+	// server allowed, which is the churn #644 requires to stop.
+	if err := s.checkDeploymentPreconditions(ctx); err != nil {
+		return ctrl.Result{}, err
+	}
+
 	if err := s.provisionStatic(ctx, run, policy); err != nil {
 		return ctrl.Result{}, err
 	}

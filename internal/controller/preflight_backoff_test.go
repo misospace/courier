@@ -509,8 +509,7 @@ func TestPreflightBackoffArmFailureStillReleasesTheClaim(t *testing.T) {
 // TestClearPreflightBackoffAfterLaunchIsBestEffort pins the clear's contract:
 // a launch that passed the preflight is not failed over a marker that cannot
 // be written. A stale marker on a run past the preflight is inert, while
-// aborting the launch would strand that run in Claimed, holding its lane slot
-// and its source claim.
+// aborting the launch would strand that run in Claimed, holding its lane slot.
 func TestClearPreflightBackoffAfterLaunchIsBestEffort(t *testing.T) {
 	ctx := context.Background()
 	now := preflightBackoffNow
@@ -530,5 +529,92 @@ func TestClearPreflightBackoffAfterLaunchIsBestEffort(t *testing.T) {
 	}
 	if got := stored.Annotations[preflightFailuresAnnotation]; got != "3" {
 		t.Fatalf("failures = %q, want the stale marker left on the run rather than the launch failing", got)
+	}
+}
+
+// TestSecureLaunchFailureDoesNotGateTerminalVerdicts pins the other side of
+// the gate's scope: only the permanent-class, non-terminal verdicts are gated.
+// A terminal class still terminalizes the run, and it leaves no gate marker
+// behind — a run that has been handed to a human must not also be held back
+// by a retry schedule.
+func TestSecureLaunchFailureDoesNotGateTerminalVerdicts(t *testing.T) {
+	ctx := context.Background()
+	now := preflightBackoffNow
+
+	run := admissionRun("preflight-terminal", "local", courier.PhaseClaimed)
+	patches, statusWrites := 0, 0
+	c := preflightBackoffClient(t, &patches, &statusWrites, run)
+	src := &admissionSource{}
+	reconciler := &CoderRunReconciler{
+		Client:       c,
+		Sources:      NewSourceRegistry(map[string]source.Adapter{"test": src}),
+		StatusWriter: fakeStatusWriter{client: c},
+		Now:          func() time.Time { return now },
+	}
+	reconciler.Secure = &SecureControl{Client: c, Patcher: reconciler}
+	item, err := sourceWorkItem(run)
+	if err != nil {
+		t.Fatalf("sourceWorkItem: %v", err)
+	}
+
+	verdict := secureNeedsHuman("PodAdmission", "the coordinator pod spec was rejected")
+	if _, err := reconciler.secureLaunchFailure(ctx, run, src, item, verdict); err != nil {
+		t.Fatalf("secureLaunchFailure: %v, want the terminal verdict terminalized", err)
+	}
+	if _, ok := run.Annotations[preflightFailedAtAnnotation]; ok {
+		t.Fatalf("annotations = %#v, want a terminal verdict left ungated", run.Annotations)
+	}
+	if _, ok := run.Annotations[preflightFailuresAnnotation]; ok {
+		t.Fatalf("annotations = %#v, want a terminal verdict left ungated", run.Annotations)
+	}
+	var stored courier.CoderRun
+	if err := c.Get(ctx, admissionKey("preflight-terminal"), &stored); err != nil {
+		t.Fatalf("get run: %v", err)
+	}
+	if stored.Status.Phase != courier.PhaseNeedsHuman {
+		t.Fatalf("phase = %q, want NeedsHuman: a terminal verdict terminalizes", stored.Status.Phase)
+	}
+}
+
+// liveCountClient serves a run whose recorded failure count is higher than the
+// caller's copy, standing in for an informer cache that has not caught up with
+// the arming write.
+type liveCountClient struct {
+	client.Client
+	live *courier.CoderRun
+}
+
+func (c liveCountClient) Get(ctx context.Context, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+	if run, ok := obj.(*courier.CoderRun); ok && c.live != nil {
+		c.live.DeepCopyInto(run)
+		return nil
+	}
+	return c.Client.Get(ctx, key, obj, opts...)
+}
+
+// TestArmPreflightBackoffCountsFromTheLiveRun pins where the consecutive
+// count comes from: the API server, not the caller's copy of the run. A cache
+// that still shows the previous count would restart the schedule at the base
+// delay on every pass, and a cache that shows none would let the count never
+// grow at all.
+func TestArmPreflightBackoffCountsFromTheLiveRun(t *testing.T) {
+	ctx := context.Background()
+	now := preflightBackoffNow
+
+	run := admissionRun("preflight-live-count", "local", courier.PhasePending)
+	patches, statusWrites := 0, 0
+	c := preflightBackoffClient(t, &patches, &statusWrites, run)
+	live := run.DeepCopy()
+	live.Annotations = map[string]string{preflightFailuresAnnotation: "5"}
+	reconciler := &CoderRunReconciler{
+		Client: liveCountClient{Client: c, live: live},
+		Now:    func() time.Time { return now },
+	}
+
+	if err := reconciler.armPreflightBackoff(ctx, run); err != nil {
+		t.Fatalf("armPreflightBackoff: %v", err)
+	}
+	if got := run.Annotations[preflightFailuresAnnotation]; got != "6" {
+		t.Fatalf("failures = %q, want the live count carried forward to 6", got)
 	}
 }

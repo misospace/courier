@@ -2253,33 +2253,50 @@ moments ago — so terminalizing them would strand a run that was always going t
 succeed.
 The claim/release requeue a permanent-class verdict keeps is rate-bounded. A
 verdict outside the terminal classes — `BrokerRBAC`, `OperatorRBAC`,
-`PodSecurity`, `AdmissionBroken`, `IsolationBroken`, and any future reason
-naming a deployment misconfiguration only the operator can fix — requeued as
-fast as the API server allowed would churn the run through Pending and Claimed
-several times a second, the retry churn #644 required to stop. The operator
-records such a failure on the run itself:
+`PodSecurity`, `AdmissionBroken`, `IsolationBroken`, and any other verdict
+naming a deployment misconfiguration only the operator can fix, today the
+provider and contribution-policy verdicts among them — requeued as fast as the
+API server allowed would churn the run through Pending and Claimed several
+times a second, the retry churn #644 required to stop. The operator records
+such a failure on the run itself:
 `courier.misospace.dev/preflight-failed-at` carries the RFC3339 time of the last
 failed attempt and `courier.misospace.dev/preflight-failures` the count of
 consecutive failures, and the next attempt waits a delay that starts at 15s and
 doubles per consecutive failure up to a 5m ceiling. The count is consecutive
-because a launch that passes the preflight removes both markers again. The
+because a launch that passes the preflight removes both markers again; that
+clear is best-effort, so a clear that fails leaves the count where it was and
+the next failure waits the next longer delay instead of starting over. The
 wait is quiet: while it holds, the admission path neither claims the run nor
 writes its status, so nothing wakes it before its delay is up, and a claimed
-run whose rollback failed waits out the delay still holding its source claim
-and its lane slot. The markers live on the object, so a controller restart
-cannot turn the bounded wait back into the churn, and the count is read from
-the API server rather than the informer cache, so a lagging cache cannot
-restart the schedule. The gate is armed before the claim is released, so a
-rollback that fails still leaves the run waiting out the delay instead of
-cycling. The bound is best-effort: a marker that cannot be written leaves the
-ordinary requeue, and a marker the operator cannot read — the timestamp, or
-the failure count that decides how long the wait is, whether it is missing,
-unparseable, or not a positive number — is treated as no gate at all, because
-a gate that cannot be read must never strand a run that could still succeed.
-No verdict class changes: a failure that clears on a later pass still clears,
-and one that never clears still retries — only not in a tight loop. An
-ordinary preflight error is not gated at all, because the design classifies it
-as transient.
+run whose rollback failed waits out the delay still holding its lane slot —
+the source claim is by then already back with the source, because the rollback
+releases it before the status write that failed. The markers live on the
+object, so a controller restart cannot turn the bounded wait back into the
+churn. The arming path reads the failure count from the API server rather than
+from the informer cache, so a cache that has not caught up cannot restart the
+schedule at the base delay on every pass; the gate reads the markers from the
+run the reconciler holds, so the wait begins once that reconciler observes the
+arming write. The gate is armed before the claim is released, so a rollback
+that fails still leaves the run waiting out the delay instead of cycling. The
+bound is best-effort: a marker that cannot be written leaves the ordinary
+requeue, and a marker the operator cannot read — the timestamp, or the failure
+count that decides how long the wait is, whether it is missing, unparseable, or
+not a positive number — is treated as no gate at all, because a gate that
+cannot be read must never strand a run that could still succeed. No verdict
+class changes: a failure that clears on a later pass still clears, and one that
+never clears still retries — only not in a tight loop. An ordinary preflight
+error is not gated at all, because the design classifies it as transient.
+A permanent misconfiguration is only a verdict if the launch path can tell it
+from a transient one, and the deployment's own facts are what tell it: the
+operator's provisioning grants and the dedicated run namespace's restricted Pod
+Security label are proven before the operator creates anything, so a missing
+grant or an unlabelled namespace arrives as the `OperatorRBAC` or
+`PodSecurity` verdict the gate bounds. Creating the topology first would
+surface the same misconfiguration as a raw Forbidden from a create — an
+ordinary error, which the design classifies as transient, so the run would
+cycle as fast as the API server allowed. The broker's own grants are proven
+the other way round, after the Role the run renders exists, because that check
+compares the live Role against the intended one.
 The secure round is fenced before it terminalizes: a resumed launch
 reaches the launcher with a live worker and a credentialed broker, and a
 `NeedsHuman` run is no longer observed, so a fence deferred past that reconcile
