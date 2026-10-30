@@ -9,10 +9,10 @@ description = "Install the pinned toolchain, controller-gen, setup-envtest, and 
 run = "hack/bootstrap.sh tools"
 
 [tasks.check]
-description = "CI-equivalent checks mirroring the CI static job: generated-code drift, tidy diff, gofmt, vet, build, image-gating scripts"
+description = "CI-equivalent checks without requiring GNU make: generated-code drift, tidy diff, gofmt, vet, build, image-gating scripts"
 run = [
-  """cg=$(sed -n 's/^CONTROLLER_TOOLS_VERSION ?= //p' Makefile) && se=$(sed -n 's/^ENVTEST_VERSION ?= //p' Makefile) && { [ -n "$cg" ] && [ -n "$se" ]; } || { echo "could not read tool pins from Makefile" >&2; exit 1; }; make manifests generate CONTROLLER_TOOLS_VERSION="$cg" ENVTEST_VERSION="$se\"""",
-  """git diff --exit-code || { echo "generated code is stale; run 'make manifests generate' and commit" >&2; exit 1; }""",
+  "sh hack/tools.sh generate",
+  """git diff --exit-code -- ':(glob)api/**/zz_generated.deepcopy.go' charts/courier/crd-manifests config/rbac/role.yaml || { echo "generated code is stale; run 'sh hack/tools.sh generate', then commit" >&2; exit 1; }""",
   "go mod tidy -diff",
   """unformatted=$(gofmt -l .); if [ -n "$unformatted" ]; then printf '%s\\n' "$unformatted" >&2; exit 1; fi""",
   "go vet ./...",
@@ -21,13 +21,23 @@ run = [
 ]
 
 [tasks.test]
-description = "Authoritative suite: make test (manifests, generate, fmt, vet, go test -race) with envtest assets — a superset of the CI test job"
+description = "Equivalent of the Makefile test target (codegen, fmt, vet, go test -race) with envtest assets, without GNU make"
 run = '''
-cg=$(sed -n 's/^CONTROLLER_TOOLS_VERSION ?= //p' Makefile)
-se=$(sed -n 's/^ENVTEST_VERSION ?= //p' Makefile)
+set -eu
+command -v go >/dev/null 2>&1 || { echo "go is required but not on PATH" >&2; exit 1; }
+if ! command -v cc >/dev/null 2>&1 && ! command -v gcc >/dev/null 2>&1 && ! command -v clang >/dev/null 2>&1; then
+  echo "no C compiler on PATH: 'go test -race' requires cgo and a C compiler, so the race-detector suite cannot run here; install cc, gcc, or clang" >&2
+  exit 1
+fi
+if [ "$(go env CGO_ENABLED)" != 1 ]; then
+  echo "CGO_ENABLED=0 is set: 'go test -race' requires cgo; unset CGO_ENABLED" >&2
+  exit 1
+fi
+sh hack/tools.sh generate
 k8s=$(sed -n 's/^ENVTEST_K8S_VERSION ?= //p' Makefile)
-if [ -z "$cg" ] || [ -z "$se" ] || [ -z "$k8s" ]; then echo "could not read tool pins from Makefile" >&2; exit 1; fi
-make setup-envtest ENVTEST_VERSION="$se"
+if [ -z "$k8s" ]; then echo "could not read ENVTEST_K8S_VERSION from Makefile" >&2; exit 1; fi
 export KUBEBUILDER_ASSETS="$(bin/setup-envtest use -p path "$k8s")"
-make test CONTROLLER_TOOLS_VERSION="$cg" ENVTEST_VERSION="$se"
+go fmt ./...
+go vet ./...
+go test -race ./... -coverprofile cover.out
 '''
