@@ -52,7 +52,10 @@ func TestSecureOperatorCanBindBrokerTokenReviewRole(t *testing.T) {
 	}
 	create := func(obj client.Object) {
 		t.Helper()
-		if err := admin.Create(ctx, obj); err != nil {
+		// Shared cluster-scoped names (broker roles, run/operator namespaces)
+		// may already exist from other suite members; tolerate that so the
+		// suite stays order-independent, but fail on any other error.
+		if err := admin.Create(ctx, obj); err != nil && !apierrors.IsAlreadyExists(err) {
 			t.Fatalf("admin create %T/%s: %v", obj, obj.GetName(), err)
 		}
 	}

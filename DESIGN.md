@@ -3082,8 +3082,17 @@ only informs.
   historical name for a single release). CRD ownership stays singular: a
   side-by-side release sets `crds.enabled=false` and evolves the CRDs
   out-of-band. Leader-election leases are namespaced, so separate operator
-  namespaces are already isolated; two releases sharing one operator namespace
-  need distinct `ownership.leaderElectionID` values (#632).
+   namespaces are already isolated; two releases sharing one operator namespace
+   need distinct `ownership.leaderElectionID` values (#632).
+- Binding that role is a separate, chart-scoped authority. Creating the per-run
+  broker ClusterRoleBinding is refused by API-server anti-escalation unless the
+  operator can bind the referenced ClusterRole, so the secure chart grants
+  `bind` on `rbac.authorization.k8s.io` `clusterroles` `resourceNames`-scoped to
+  the effective broker TokenReview ClusterRole. It is rendered only when
+  `secure.enabled` and re-scoped with `secure.brokerTokenReviewClusterRole`, and
+  is deliberately a chart-only grant — never the `+kubebuilder:rbac`-generated
+  operator ClusterRole — so legacy-only installs gain no bind authority and
+  nothing beyond this one named role is ever bindable (#640).
 - Source-state transitions (claim, in-review, needs-human, resolve) are the
   operator's, done by deterministic code — the one place non-determinism would be
   dangerous, kept mechanical.
