@@ -299,6 +299,33 @@ func TestBuildSecureControlRejectsTaintedLegacyCredential(t *testing.T) {
 	}
 }
 
+// TestBuildSecureControlRejectsCredentialExposedAsExecutorEnvironmentSecret
+// pins that the executor environment Secret is pod-exposed through envFrom
+// like the legacy credential Secrets: a Secret configured there is wholesale
+// visible to coordinator pods and must not back a secure registration (#638).
+func TestBuildSecureControlRejectsCredentialExposedAsExecutorEnvironmentSecret(t *testing.T) {
+	registryFile := filepath.Join(t.TempDir(), "providers.json")
+	providers := `{"providers":[{"name":"github","type":"github","endpoint":"https://api.github.com/","credentials":{"forge-api":{"secretName":"courier-model-env","key":"token"}},"serves":["*"]}]}`
+	if err := os.WriteFile(registryFile, []byte(providers), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	_, err := buildSecureControl(secureConfig{
+		providersFile:     registryFile,
+		runNamespace:      "runs",
+		harnessImage:      "harness:test",
+		probeImage:        "busybox:test",
+		executorEnvSecret: "courier-model-env",
+		observer:          observerWithHeadResolver{},
+		operatorNS:        "courier-system",
+	})
+	if err == nil || !strings.Contains(err.Error(), "tainted") {
+		t.Fatalf("a registration referencing the executor environment Secret must fail startup, got %v", err)
+	}
+	if err != nil && !strings.Contains(err.Error(), "--executor-environment-secret") {
+		t.Fatalf("the taint error must name the exposing flag, got %v", err)
+	}
+}
+
 func TestBuildSecureControlRequiresObserverCredential(t *testing.T) {
 	registryFile := filepath.Join(t.TempDir(), "providers.json")
 	providers := `{"providers":[{"name":"github","type":"github","endpoint":"https://api.github.com/","credentials":{"forge-api":{"secretName":"forge-creds","key":"token"}},"serves":["*"]}]}`
@@ -471,7 +498,10 @@ func TestBuildSecureControlAcceptsObserverSeamOnSecureSecret(t *testing.T) {
 	}
 }
 
-func TestBuildSecureControlRejectsObserverSeamNamedAsLegacySecret(t *testing.T) {
+// TestBuildSecureControlRejectsObserverSeamNamedAsPodExposedSecret rejects an
+// observer seam Secret that any pod-injection flag exposes: either legacy
+// credential Secret or the executor environment Secret (#638).
+func TestBuildSecureControlRejectsObserverSeamNamedAsPodExposedSecret(t *testing.T) {
 	registryFile := filepath.Join(t.TempDir(), "providers.json")
 	providers := `{"providers":[{"name":"github","type":"github","endpoint":"https://api.github.com/","credentials":{"forge-api":{"secretName":"forge-creds","key":"token"}},"serves":["*"]}]}`
 	if err := os.WriteFile(registryFile, []byte(providers), 0o600); err != nil {
@@ -481,8 +511,8 @@ func TestBuildSecureControlRejectsObserverSeamNamedAsLegacySecret(t *testing.T) 
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, legacyField := range []string{"git", "api"} {
-		t.Run(legacyField, func(t *testing.T) {
+	for _, podExposedField := range []string{"git", "api", "env"} {
+		t.Run(podExposedField, func(t *testing.T) {
 			config := secureConfig{
 				providersFile:  registryFile,
 				runNamespace:   "runs",
@@ -490,13 +520,16 @@ func TestBuildSecureControlRejectsObserverSeamNamedAsLegacySecret(t *testing.T) 
 				observerSecret: "shared-secret",
 				restConfig:     &rest.Config{Host: "https://127.0.0.1:1"},
 			}
-			if legacyField == "git" {
+			switch podExposedField {
+			case "git":
 				config.legacyGitSecret = "shared-secret"
-			} else {
+			case "api":
 				config.legacyAPISecret = "shared-secret"
+			case "env":
+				config.executorEnvSecret = "shared-secret"
 			}
 			if _, err := buildSecureControl(config); err == nil || !strings.Contains(err.Error(), "observer credential Secret") {
-				t.Fatalf("an observer seam that is also legacy-injected must fail startup, got %v", err)
+				t.Fatalf("an observer seam that is also pod-injected must fail startup, got %v", err)
 			}
 		})
 	}

@@ -395,7 +395,8 @@ seam, `--observer-credential-secret`/`--observer-credential-key` (#638): it
 wins over the legacy flags for observation and admission reads and is never
 rendered into a coordinator pod, so one Secret can back both a registration
 and trusted observation without the §9 taint, while the taint rule still
-rejects any registration referencing a Secret that legacy injection exposes.
+rejects any registration referencing a Secret that legacy pod injection
+exposes, including the `--executor-environment-secret` envFrom source.
 
 ### Model-influenced forge operations
 

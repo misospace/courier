@@ -3254,13 +3254,15 @@ only informs.
   wins over the legacy pod-injection flags `--github-credential-secret` and
   `--git-credential-secret` (with the matching token-key fallbacks), and the
   seam is atomic: a key without a seam Secret is a startup error, never a silent
-  re-key of a legacy Secret. The seam is never rendered into
-  `executor.PodConfig`, so a Secret named only there is structurally absent
-  from legacy and model-controlled pod injection, while the legacy flags remain
-  the only writer of pod credential injection. Secure mode rejects a seam
-  Secret that is also configured as a legacy pod credential Secret, and the
-  [HARNESS.md](./HARNESS.md) §9 taint still rejects any registration
-  referencing a Secret that legacy injection exposes. A secure deployment
+   re-key of a legacy Secret. The seam is never rendered into
+   `executor.PodConfig`, so a Secret named only there is structurally absent
+   from legacy and model-controlled pod injection, while the legacy credential
+   flags and `--executor-environment-secret` remain the only writers of pod
+   Secret injection. Secure mode rejects a seam Secret that is also exposed to
+   coordinator pods through any of those flags, and the
+   [HARNESS.md](./HARNESS.md) §9 taint rejects any registration referencing a
+   Secret any of them exposes — a credential injected into a
+   model-controlled pod is tainted for secure use. A secure deployment
   therefore binds one Secret to one upstream credential — to the registration
   and to the operator's own identity — instead of duplicating it into two, and
   the chart's label-source guard accepts the seam as a credential argument,

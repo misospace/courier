@@ -639,25 +639,26 @@ func main() {
 	}
 	if secureMode {
 		secure, err := buildSecureControl(secureConfig{
-			providersFile:    forgeProvidersFile,
-			registry:         forgeRegistry,
-			runNamespace:     runNamespace,
-			harnessImage:     harnessImage,
-			probeImage:       probeImage,
-			cacheService:     dependencyCacheService,
-			cachePort:        dependencyCachePort,
-			gatewayURL:       modelGatewayURL,
-			gatewayKeySecret: modelGatewayKeySecret,
-			gatewayKeyName:   modelGatewayKeyName,
-			gatewayCIDR:      modelGatewayCIDR,
-			gatewayPort:      modelGatewayPort,
-			observer:         githubObserver,
-			observerSecret:   observerCredentialSecret,
-			legacyGitSecret:  gitCredentialSecret,
-			legacyAPISecret:  githubCredentialSecret,
-			operatorNS:       os.Getenv("POD_NAMESPACE"),
-			restConfig:       mgr.GetConfig(),
-			tokenReviewRole:  brokerTokenReviewClusterRole,
+			providersFile:     forgeProvidersFile,
+			registry:          forgeRegistry,
+			runNamespace:      runNamespace,
+			harnessImage:      harnessImage,
+			probeImage:        probeImage,
+			cacheService:      dependencyCacheService,
+			cachePort:         dependencyCachePort,
+			gatewayURL:        modelGatewayURL,
+			gatewayKeySecret:  modelGatewayKeySecret,
+			gatewayKeyName:    modelGatewayKeyName,
+			gatewayCIDR:       modelGatewayCIDR,
+			gatewayPort:       modelGatewayPort,
+			observer:          githubObserver,
+			observerSecret:    observerCredentialSecret,
+			legacyGitSecret:   gitCredentialSecret,
+			legacyAPISecret:   githubCredentialSecret,
+			executorEnvSecret: executorEnvironmentSecret,
+			operatorNS:        os.Getenv("POD_NAMESPACE"),
+			restConfig:        mgr.GetConfig(),
+			tokenReviewRole:   brokerTokenReviewClusterRole,
 		})
 		if err != nil {
 			setupLog.Error(err, "unable to configure secure mode")
@@ -1042,25 +1043,26 @@ func loadEvidenceKey(ctx context.Context, reader client.Reader, namespace, name 
 
 // secureConfig carries the parsed secure-mode flags into buildSecureControl.
 type secureConfig struct {
-	providersFile    string
-	registry         *forge.Registry
-	runNamespace     string
-	harnessImage     string
-	probeImage       string
-	cacheService     string
-	cachePort        int
-	gatewayURL       string
-	gatewayKeySecret string
-	gatewayKeyName   string
-	gatewayCIDR      string
-	gatewayPort      int
-	observer         controller.WorldObserver
-	observerSecret   string
-	legacyGitSecret  string
-	legacyAPISecret  string
-	operatorNS       string
-	restConfig       *rest.Config
-	tokenReviewRole  string
+	providersFile     string
+	registry          *forge.Registry
+	runNamespace      string
+	harnessImage      string
+	probeImage        string
+	cacheService      string
+	cachePort         int
+	gatewayURL        string
+	gatewayKeySecret  string
+	gatewayKeyName    string
+	gatewayCIDR       string
+	gatewayPort       int
+	observer          controller.WorldObserver
+	observerSecret    string
+	legacyGitSecret   string
+	legacyAPISecret   string
+	executorEnvSecret string
+	operatorNS        string
+	restConfig        *rest.Config
+	tokenReviewRole   string
 }
 
 const (
@@ -1097,10 +1099,12 @@ func loadForgeRegistry(path string) (*forge.Registry, error) {
 
 // buildSecureControl validates the provider registry (preloaded by main, or
 // loaded from the providers file for callers that wire it directly), rejects
-// registrations that reference a credential exposed to legacy pods (the §9
-// taint rule, enforced where the deployment configuration is knowable), keeps
-// the observer-only credential seam structurally separate from legacy pod
-// injection (#638), and assembles the secure control.
+// registrations that reference a credential exposed to coordinator pods
+// through any pod-injection flag — the legacy credential Secrets or the
+// executor environment Secret (the §9 taint rule, enforced where the
+// deployment configuration is knowable), keeps the observer-only credential
+// seam structurally separate from every pod-exposed Secret (#638), and
+// assembles the secure control.
 func buildSecureControl(config secureConfig) (*controller.SecureControl, error) {
 	if config.registry == nil && strings.TrimSpace(config.providersFile) == "" {
 		return nil, fmt.Errorf("secure mode requires --forge-providers-file")
@@ -1116,24 +1120,32 @@ func buildSecureControl(config secureConfig) (*controller.SecureControl, error) 
 			return nil, err
 		}
 	}
-	tainted := map[string]bool{
-		strings.TrimSpace(config.legacyGitSecret): true,
-		strings.TrimSpace(config.legacyAPISecret): true,
+	tainted := map[string]string{}
+	for _, exposed := range []struct{ secret, flag string }{
+		{strings.TrimSpace(config.legacyGitSecret), "--git-credential-secret"},
+		{strings.TrimSpace(config.legacyAPISecret), "--github-credential-secret"},
+		{strings.TrimSpace(config.executorEnvSecret), "--executor-environment-secret"},
+	} {
+		if exposed.secret != "" {
+			if _, ok := tainted[exposed.secret]; !ok {
+				tainted[exposed.secret] = exposed.flag
+			}
+		}
 	}
 	for _, registration := range registry.Registrations() {
 		for purpose, ref := range registration.Credentials {
-			if tainted[ref.SecretName] {
+			if exposure, ok := tainted[ref.SecretName]; ok {
 				return nil, fmt.Errorf(
-					"provider %q credential purpose %q references Secret %q, which is exposed to legacy coordinator pods: a credential exposed to any legacy pod is tainted and must not back a secure registration",
-					registration.Name, purpose, ref.SecretName)
+					"provider %q credential purpose %q references Secret %q, which is exposed to coordinator pods through %s: a credential exposed to any model-controlled pod is tainted and must not back a secure registration",
+					registration.Name, purpose, ref.SecretName, exposure)
 			}
 		}
 	}
 	observerSecret := strings.TrimSpace(config.observerSecret)
-	if observerSecret != "" && (observerSecret == strings.TrimSpace(config.legacyGitSecret) || observerSecret == strings.TrimSpace(config.legacyAPISecret)) {
+	if exposure, ok := tainted[observerSecret]; observerSecret != "" && ok {
 		return nil, fmt.Errorf(
-			"observer credential Secret %q is also configured as a legacy pod credential Secret: the observer seam must name a Secret no legacy or model-controlled pod injects, so a deployment that shares one must drop the legacy injection for it",
-			observerSecret)
+			"observer credential Secret %q is also exposed to coordinator pods through %s: the observer seam must name a Secret no legacy or model-controlled pod injects, so a deployment that shares one must drop that injection for it",
+			observerSecret, exposure)
 	}
 	observer, ok := config.observer.(couriergithub.Observer)
 	if !ok || observer.Client == nil {
