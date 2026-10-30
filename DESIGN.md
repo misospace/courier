@@ -2289,16 +2289,33 @@ never clears still retries — only not in a tight loop. An ordinary preflight
 error is not gated at all, because the design classifies it as transient.
 A permanent misconfiguration is only a verdict if the launch path can tell it
 from a transient one, and the deployment's own facts are what tell it: the
-operator's provisioning grants and the dedicated run namespace's restricted Pod
-Security label are proven before the operator creates anything, so a missing
-grant or an unlabelled namespace arrives as the `OperatorRBAC` or
-`PodSecurity` verdict the gate bounds — including the grant the operator needs
-to ask the access-review question at all. Creating the topology first would
-surface the same misconfiguration as a raw Forbidden from a create — an
-ordinary error, which the design classifies as transient, so the run would
-cycle as fast as the API server allowed. The broker's own grants are proven
-the other way round, after the Role the run renders exists, because that check
-compares the live Role against the intended one.
+operator's provisioning grants — the namespaced creates and deletes the secure
+topology needs, and the cluster-scoped grants the proof itself uses — and the
+dedicated run namespace's restricted Pod Security label are proven before the
+operator creates anything, so a missing one of those grants or an unlabelled
+namespace arrives as the `OperatorRBAC` or `PodSecurity` verdict the gate
+bounds — including the grants the operator needs to ask the access-review
+questions at all. Creating the topology first would surface the same
+misconfiguration as a raw Forbidden from a create — an ordinary error, which
+the design classifies as transient, so the run would cycle as fast as the API
+server allowed. The broker's own grants are proven the other way round, after
+the Role the run renders exists, because that check compares the live Role
+against the intended one.
+An access review is asked at the scope the request it stands for has. The
+broker's TokenReview creation and the operator's own cluster-scoped grants —
+the broker's ClusterRoleBinding, the node list, the run namespace read, and
+the two access-review creates — are reviewed without a namespace, so only a
+cluster-wide grant can satisfy them: a namespaced Role authorizes a
+namespaced review of a cluster-scoped resource, but never the cluster-scoped
+request itself, and crediting one would let a run launch on an authority the
+cluster would refuse. The SelfSubjectAccessReview the operator asks about
+itself is a canary rather than a proof on a stock cluster, where the API
+server's default `system:basic-user` binding already allows that create to
+every authenticated subject. The proof covers what the secure topology's
+creation needs, not every grant the operator holds: the reads the secure path
+makes outside it — the lane profile, the signing secret, the topology pods,
+and the cluster's API server and DNS services — are outside the proof, so a
+deployment missing one of those still surfaces as an ordinary refusal.
 The secure round is fenced before it terminalizes: a resumed launch
 reaches the launcher with a live worker and a credentialed broker, and a
 `NeedsHuman` run is no longer observed, so a fence deferred past that reconcile

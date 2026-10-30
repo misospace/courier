@@ -285,3 +285,114 @@ func TestPreflightBrokerRBACTokenReviewNotNamespacedEnvtest(t *testing.T) {
 		t.Fatalf("checkBrokerRBAC error = %v, want a BrokerRBAC verdict on tokenreviews", err)
 	}
 }
+
+// TestPreflightOperatorClusterScopedReviewNotNamespacedEnvtest proves the
+// scoping rule the operator's grant proof rests on, against a real RBAC
+// authorizer.
+//
+// A namespaced Role may name a cluster-scoped resource: RBAC does not police
+// the scope of the resource a rule names, and the authorizer honours the
+// grant for any request that names the role's namespace. A cluster-scoped
+// request carries no namespace, so only a cluster-wide grant authorizes it.
+// The operator's reviews therefore have to ask the cluster-scoped question:
+// a review that named the run namespace would credit the operator with a
+// grant its real request would be refused by, and the missing cluster grant
+// would read as present (#650).
+//
+// The subject asked here is an explicit user with no groups, as a
+// SubjectAccessReview for a named subject is. The SelfSubjectAccessReview the
+// operator asks about itself resolves the requester's real groups, where the
+// API server's default `system:basic-user` binding already allows the create;
+// the scoping under test is the same in both forms.
+func TestPreflightOperatorClusterScopedReviewNotNamespacedEnvtest(t *testing.T) {
+	if envtestServer == nil || envtestServer.Config == nil {
+		t.Skip("envtest is not available")
+	}
+	c, control, run := startBrokerRBACRun(t, "rbac-operator-scope")
+
+	serviceAccount := run.Name + "-scope-sa"
+	sa := &corev1.ServiceAccount{
+		ObjectMeta: metav1.ObjectMeta{Namespace: run.Namespace, Name: serviceAccount},
+	}
+	if err := c.Create(context.Background(), sa); err != nil {
+		t.Fatalf("create service account: %v", err)
+	}
+	t.Cleanup(func() { _ = c.Delete(context.Background(), sa) })
+	// One namespaced Role granting every cluster-scoped verb the operator's
+	// own reviews ask for: the grants are real, and only their scope is wrong.
+	roleName := run.Name + "-cluster-scoped-grants"
+	role := &rbacv1.Role{
+		ObjectMeta: metav1.ObjectMeta{Namespace: run.Namespace, Name: roleName},
+		Rules: []rbacv1.PolicyRule{
+			{APIGroups: []string{""}, Resources: []string{"nodes"}, Verbs: []string{"list"}},
+			{APIGroups: []string{""}, Resources: []string{"namespaces"}, Verbs: []string{"get"}},
+			{APIGroups: []string{"rbac.authorization.k8s.io"}, Resources: []string{"clusterrolebindings"}, Verbs: []string{"create"}},
+			{APIGroups: []string{"authorization.k8s.io"}, Resources: []string{"selfsubjectaccessreviews", "subjectaccessreviews"}, Verbs: []string{"create"}},
+		},
+	}
+	if err := c.Create(context.Background(), role); err != nil {
+		t.Fatalf("create namespaced cluster-scoped Role: %v", err)
+	}
+	t.Cleanup(func() { _ = c.Delete(context.Background(), role) })
+	binding := &rbacv1.RoleBinding{
+		ObjectMeta: metav1.ObjectMeta{Namespace: run.Namespace, Name: roleName},
+		RoleRef:    rbacv1.RoleRef{APIGroup: rbacv1.GroupName, Kind: "Role", Name: roleName},
+		Subjects: []rbacv1.Subject{{
+			Kind:      rbacv1.ServiceAccountKind,
+			Name:      serviceAccount,
+			Namespace: run.Namespace,
+		}},
+	}
+	if err := c.Create(context.Background(), binding); err != nil {
+		t.Fatalf("create namespaced cluster-scoped RoleBinding: %v", err)
+	}
+	t.Cleanup(func() { _ = c.Delete(context.Background(), binding) })
+
+	// The production review set, asked for the subject that holds only those
+	// namespaced grants.
+	clusterScoped := []accessReview{}
+	for _, review := range operatorAccessReviews() {
+		if review.clusterScoped {
+			clusterScoped = append(clusterScoped, review)
+		}
+	}
+	if len(clusterScoped) == 0 {
+		t.Fatal("the operator's review set has no cluster-scoped review, so nothing proves the scoping")
+	}
+
+	// Once a namespaced review is allowed the Role has propagated through the
+	// API server's RBAC informers, so the cluster-scoped denials below are the
+	// scope and not a sync lag.
+	eventually(t, func() error {
+		allowed, err := control.subjectAccessReviewAs(context.Background(), serviceAccount,
+			accessReview{group: "", resource: "nodes", verb: "list"})
+		if err != nil {
+			return err
+		}
+		if !allowed {
+			return errors.New("namespaced nodes list not yet allowed")
+		}
+		return nil
+	})
+
+	for _, review := range clusterScoped {
+		allowed, err := control.subjectAccessReviewAs(context.Background(), serviceAccount, review)
+		if err != nil {
+			t.Fatalf("cluster-scoped %s review: %v", review.resource, err)
+		}
+		if allowed {
+			t.Errorf("a namespaced Role must not satisfy the cluster-scoped %s %s review", review.verb, review.resource)
+		}
+		// The same grant, asked in the run namespace, is allowed: the denial
+		// above is about the scope of the grant, not a missing one.
+		namespaced := review
+		namespaced.clusterScoped = false
+		allowed, err = control.subjectAccessReviewAs(context.Background(), serviceAccount, namespaced)
+		if err != nil {
+			t.Fatalf("namespaced %s review: %v", review.resource, err)
+		}
+		if !allowed {
+			t.Errorf("the namespaced %s %s grant must be allowed in namespace %q", review.verb, review.resource, run.Namespace)
+		}
+	}
+}

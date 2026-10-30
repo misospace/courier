@@ -131,20 +131,61 @@ type accessReview struct {
 	resource string
 	verb     string
 	name     string
-	// clusterScoped marks a cluster-scoped resource (TokenReview) whose
-	// access review must omit the namespace. A namespaced Role can never
-	// grant a cluster-scoped verb, so sending a namespace would let a
-	// namespaced grant stand in for the cluster grant and pass a check the
-	// real request would fail.
+	// clusterScoped marks a cluster-scoped resource whose access review must
+	// omit the namespace. A namespaced Role can never grant a cluster-scoped
+	// verb, so sending a namespace would let a namespaced grant stand in for
+	// the cluster grant and pass a check the real request would fail.
 	clusterScoped bool
 }
 
 // checkOperatorAccess verifies the operator's own provisioning grants with
 // access reviews. A negative answer proves a grant is missing, which is
 // permanent deployment misconfiguration.
+//
+// A cluster-scoped grant is reviewed without a namespace, because the request
+// it stands for is cluster-scoped: the RBAC authorizer evaluates the
+// attributes literally, so a review that named the run namespace would let a
+// namespaced Role satisfy a grant the real request would be refused by —
+// crediting the operator with an authority it does not have, and turning a
+// missing cluster grant into a run that launches and then fails (#650).
 func (s *SecureControl) checkOperatorAccess(ctx context.Context) error {
+	for _, review := range operatorAccessReviews() {
+		allowed, err := s.selfSubjectAccessReview(ctx, review)
+		if err != nil {
+			return fmt.Errorf("secure preflight: access review for %s/%s %s: %w", review.group, review.resource, review.verb, err)
+		}
+		if !allowed {
+			scope := "namespace " + s.Config.RunNamespace
+			if review.clusterScoped {
+				scope = "cluster scope"
+			}
+			return secureNeedsHuman("OperatorRBAC",
+				"the operator lacks %s on %s/%s (%s) required to provision the secure topology",
+				review.verb, review.group, review.resource, scope)
+		}
+	}
+	return nil
+}
+
+// operatorAccessReviews returns the access reviews that prove the operator's
+// own provisioning grants: the namespaced resources it creates in the run
+// namespace, and the cluster-scoped ones it reads or creates cluster-wide.
+//
+// The operator creates the broker's ClusterRoleBinding, lists the cluster's
+// nodes, reads the run namespace, and creates the access reviews themselves:
+// five cluster-scoped requests, each granted by the deployment's ClusterRole.
+// Reviewed with the run namespace, a namespaced Role could satisfy any of
+// them.
+//
+// The SelfSubjectAccessReview the operator asks about itself is a canary
+// rather than a proof on a stock cluster: the API server's default
+// `system:basic-user` binding already grants that create to every
+// authenticated subject, so the review cannot fail there. It still matters on
+// a cluster whose default policy was replaced, where the operator could not
+// ask any question at all.
+func operatorAccessReviews() []accessReview {
 	core := ""
-	reviews := []accessReview{
+	return []accessReview{
 		{group: core, resource: "secrets", verb: "create"},
 		{group: core, resource: "secrets", verb: "delete"},
 		{group: core, resource: "serviceaccounts", verb: "create"},
@@ -157,22 +198,12 @@ func (s *SecureControl) checkOperatorAccess(ctx context.Context) error {
 		{group: "networking.k8s.io", resource: "networkpolicies", verb: "delete"},
 		{group: "rbac.authorization.k8s.io", resource: "roles", verb: "create"},
 		{group: "rbac.authorization.k8s.io", resource: "rolebindings", verb: "create"},
-		{group: "rbac.authorization.k8s.io", resource: "clusterrolebindings", verb: "create"},
-		{group: core, resource: "nodes", verb: "list"},
-		{group: core, resource: "namespaces", verb: "get"},
-		{group: "authorization.k8s.io", resource: "selfsubjectaccessreviews", verb: "create"},
+		{group: "rbac.authorization.k8s.io", resource: "clusterrolebindings", verb: "create", clusterScoped: true},
+		{group: core, resource: "nodes", verb: "list", clusterScoped: true},
+		{group: core, resource: "namespaces", verb: "get", clusterScoped: true},
+		{group: "authorization.k8s.io", resource: "selfsubjectaccessreviews", verb: "create", clusterScoped: true},
+		{group: "authorization.k8s.io", resource: "subjectaccessreviews", verb: "create", clusterScoped: true},
 	}
-	for _, review := range reviews {
-		allowed, err := s.selfSubjectAccessReview(ctx, review)
-		if err != nil {
-			return fmt.Errorf("secure preflight: access review for %s/%s %s: %w", review.group, review.resource, review.verb, err)
-		}
-		if !allowed {
-			return secureNeedsHuman("OperatorRBAC",
-				"the operator lacks %s on %s/%s required to provision the secure topology", review.verb, review.group, review.resource)
-		}
-	}
-	return nil
 }
 
 // checkBrokerRBAC verifies the broker's named grants two ways: the Role
