@@ -128,6 +128,50 @@ func TestChartRendersLabelSourceConfiguration(t *testing.T) {
 	}
 }
 
+// TestChartLabelSourceAcceptsOperatorCredentialSeam pins the chart's
+// label-source guard against the operator's own forge credential: the
+// observer-only seam is a credential argument on its own (#638), and a
+// deployment that names no credential at all fails the render.
+func TestChartLabelSourceAcceptsOperatorCredentialSeam(t *testing.T) {
+	if _, err := exec.LookPath("helm"); err != nil {
+		t.Skip("helm is not installed")
+	}
+	chartDir := copyChart(t)
+	if err := exec.Command("helm", "repo", "add", "bjw-s-labs", "https://bjw-s-labs.github.io/helm-charts").Run(); err != nil {
+		t.Fatalf("configure chart repository: %v", err)
+	}
+	runHelm(t, chartDir, "dependency", "build")
+
+	seamOnly := runHelm(t, chartDir, "template", "courier", ".",
+		"--set", "labelSource.enabled=true",
+		"--set", "labelSource.repos={owner/one}",
+		"--set", "labelSource.lane=lane-y",
+		"--set-string", "controllers.main.containers.main.args[0]=--leader-elect",
+		"--set-string", "controllers.main.containers.main.args[1]=--observer-credential-secret=forge-creds",
+	)
+	if !strings.Contains(seamOnly, "--observer-credential-secret=forge-creds") {
+		t.Fatal("label-source chart output is missing the observer credential seam argument")
+	}
+	if strings.Contains(seamOnly, "--git-credential-secret=") || strings.Contains(seamOnly, "--github-credential-secret=") {
+		t.Fatal("seam-only label-source chart output unexpectedly injects a legacy credential Secret")
+	}
+
+	out, err := runHelmOutput(t, chartDir, "template", "courier", ".",
+		"--set", "labelSource.enabled=true",
+		"--set", "labelSource.repos={owner/one}",
+		"--set", "labelSource.lane=lane-y",
+		"--set-string", "controllers.main.containers.main.args[0]=--leader-elect",
+	)
+	if err == nil {
+		t.Fatalf("expected helm template to fail without an operator credential argument, but it succeeded:\n%s", out)
+	}
+	for _, want := range []string{"--observer-credential-secret", "--github-credential-secret", "--git-credential-secret"} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("label-source credential guard message is missing %q:\n%s", want, out)
+		}
+	}
+}
+
 func TestRBACResourceNamesMatchCoderunCRD(t *testing.T) {
 	crd := mustReadChartFile(t, "crd-manifests/courier.misospace.dev_coderruns.yaml")
 	generated := mustReadRepositoryFile(t, "config/rbac/role.yaml")
