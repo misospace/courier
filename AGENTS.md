@@ -57,18 +57,24 @@ change in the chart's values.
 
 - `hack/bootstrap.sh` — idempotent one-shot dev setup after a fresh checkout
   (#416): pinned mise/Go/Helm, controller-gen, setup-envtest, and envtest
-  assets. Go and Helm versions live in `.mise/config.toml` + `.mise/mise.lock`
-  and controller-gen/setup-envtest versions in the `Makefile`; do not restate
-  them elsewhere.
+  assets; does not require GNU make. Go and Helm versions live in
+  `.mise/config.toml` + `.mise/mise.lock`; the Makefile remains the authority
+  for pinned controller-gen/setup-envtest versions.
 - `mise run check` — CI-equivalent verification (generated-code diff,
-gofmt, vet, build, image-gating scripts). `mise run test` —
-authoritative suite (`make test` with envtest assets). Reuse bootstrap
-environment in later commands with `mise exec -- <command>`.
-- `make build` — generate + fmt + vet + build the manager.
-- `make test` — generate + fmt + vet + `go test ./...`.
+  gofmt, vet, build, image-gating scripts); requires no GNU make, reads pins
+  from the Makefile, and installs repo-local tools itself. `mise run test` is
+  the authoritative race-detector suite with envtest assets; it also requires
+  no GNU make and fails fast with the missing prerequisite if no C compiler is
+  available (the race suite needs cgo). Reuse bootstrap environment in later
+  commands with `mise exec -- <command>`.
+- `make build` — generate + fmt + vet + build the manager (requires GNU make).
+- `make test` — generate + fmt + vet + `go test -race ./... -coverprofile
+  cover.out` (requires GNU make).
 - `make manifests generate` — regenerate CRDs, RBAC, and deepcopy after any
-  change to `api/`. **Commit the regenerated output**; CI fails if it is stale.
-- `make run` — run the manager against the current kubeconfig.
+  change to `api/` (requires GNU make). `sh hack/tools.sh generate` is the
+  make-free equivalent. **Commit the regenerated output**; CI fails if it is
+  stale.
+- `make run` — run the manager against the current kubeconfig (requires GNU make).
 
 Go is the only language. The harness drives models over litellm's
 OpenAI-compatible HTTP API, so no Python SDK is needed anywhere.

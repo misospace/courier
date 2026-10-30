@@ -71,8 +71,9 @@ hack/bootstrap.sh
 It ensures a pinned, checksum-verified [mise](https://mise.jdx.dev) (user-scoped,
 only when absent), then installs the pinned toolchain declared in
 `.mise/config.toml` with `.mise/mise.lock` as committed lock data, plus
-`controller-gen`, `setup-envtest`, and envtest assets through the existing
-Makefile targets. Re-running it is a no-op. Local dev tool versions live in
+`controller-gen`, `setup-envtest`, and envtest assets from the Makefile pins —
+no GNU make required (the `make` targets stay available where make is
+installed). Re-running it is a no-op. Local dev tool versions live in
 that config and lock (CI and the images pin independently; bump them
 together).
 
@@ -80,16 +81,18 @@ After setup, verification is explicit:
 
 ```sh
 mise run check # CI static job: generated-code diff, tidy diff, gofmt, vet, build, image-gating scripts
-mise run test    # authoritative: make test (codegen, fmt, vet, go test -race) with envtest assets
+mise run test    # authoritative: codegen, fmt, vet, go test -race, envtest assets
 ```
 
 Later shell commands reuse the same environment with `mise exec -- <command>`;
 `mise run <task>` works without any shell activation. When the launcher's
 directory (default `$HOME/.local/bin`, or `MISE_INSTALL_DIR`) is not on your
 `PATH`, invoke it by the absolute path its ready report prints, e.g.
-`"$HOME/.local/bin/mise" run check` — no shell activation required. `make` and
-`git` are host prerequisites that bootstrap fails clearly on when missing or
-too old; set `BOOTSTRAP_ALLOW_OLD_GIT=1` to proceed knowingly on older git.
+`"$HOME/.local/bin/mise" run check` — no shell activation required. `git` is a
+host prerequisite that bootstrap fails clearly on when missing or too old; set
+`BOOTSTRAP_ALLOW_OLD_GIT=1` to proceed knowingly on older git. GNU make is
+optional: the tasks above do not require it. Without a C compiler, `mise run
+test` fails fast saying so — the race suite requires cgo.
 
 ## Install
 

@@ -10,6 +10,7 @@
 # no git-hook installation, no test suite, no source generation or formatting.
 # The mise launcher is pinned by version and SHA-256 below; everything else
 # is pinned by .mise/config.toml, .mise/mise.lock, and the Makefile.
+# GNU make targets remain available where make is installed; make is not required.
 # Prerequisites: git, and one of curl, wget, or node when mise is absent.
 
 set -eu
@@ -78,8 +79,6 @@ mise_is_pinned() {
 }
 
 run_tools_steps() {
-	command -v make >/dev/null 2>&1 ||
-		fail "GNU make is required but not on PATH; the lane toolchain image and most contributor hosts provide it (mise does not manage make)"
 	command -v git >/dev/null 2>&1 ||
 		fail "git is required but not on PATH"
 
@@ -100,29 +99,9 @@ run_tools_steps() {
 	"${BOOTSTRAP_MISE:-mise}" install --locked ||
 		fail "mise install --locked failed; after changing tool versions run 'mise lock' and commit .mise/mise.lock"
 
-	# Repo-local build dependencies. The Makefile targets skip any existing
-	# executable, so a stale binary would silently outlive a pin bump:
-	# stamp the pins at install time and drop binaries that no longer
-	# match before installing (idempotent; setup-envtest cannot report its
-	# own version, so the stamp is the only reliable check for either tool).
-	cg_pin=$(sed -n 's/^CONTROLLER_TOOLS_VERSION ?= //p' Makefile)
+	# Repo-local build dependencies are installed from the Makefile pins.
+	sh "$REPO_ROOT/hack/tools.sh" install
 	se_pin=$(sed -n 's/^ENVTEST_VERSION ?= //p' Makefile)
-	if [ -z "$cg_pin" ] || [ -z "$se_pin" ]; then
-		fail "could not read CONTROLLER_TOOLS_VERSION or ENVTEST_VERSION from Makefile"
-	fi
-	pins="controller-gen $cg_pin
-setup-envtest $se_pin"
-	if { [ -x bin/controller-gen ] || [ -x bin/setup-envtest ]; } &&
-		{ [ ! -f bin/.tool-pins ] || [ "$(cat bin/.tool-pins)" != "$pins" ]; }; then
-		log "repo-local tools do not match the Makefile pins; reinstalling"
-		rm -f bin/controller-gen bin/setup-envtest
-	fi
-	# Pass the pins explicitly: the Makefile assignments use ?=, so an
-	# environment-provided override would otherwise install a binary other
-	# than the one stamped below and reported as ready.
-	make controller-gen setup-envtest \
-		CONTROLLER_TOOLS_VERSION="$cg_pin" ENVTEST_VERSION="$se_pin"
-	printf '%s\n' "$pins" > bin/.tool-pins
 
 	# envtest assets only — the suite itself stays behind an explicit task.
 	k8s=$(sed -n 's/^ENVTEST_K8S_VERSION ?= //p' Makefile)
@@ -133,7 +112,14 @@ setup-envtest $se_pin"
 	printf 'git: %s (%s)\n' "$git_version" "$(command -v git)"
 	printf 'go: %s (%s)\n' "$(go version | awk '{print $3}')" "$(command -v go)"
 	printf 'helm: %s (%s)\n' "$(helm version --short)" "$(command -v helm)"
-	printf 'make: %s (%s)\n' "$(make --version | awk 'NR==1{print $3}')" "$(command -v make)"
+	if command -v make >/dev/null 2>&1; then
+		printf 'make: %s (%s)\n' "$(make --version | awk 'NR==1{print $3}')" "$(command -v make)"
+	else
+		printf "make: not found (optional; 'mise run check' and 'mise run test' do not require it)\n"
+	fi
+	if ! command -v cc >/dev/null 2>&1 && ! command -v gcc >/dev/null 2>&1 && ! command -v clang >/dev/null 2>&1; then
+		log "warning: no C compiler (cc/gcc/clang) on PATH; 'mise run test' will refuse to run the race suite ('go test -race' requires cgo)"
+	fi
 	printf 'controller-gen: %s (%s)\n' "$(bin/controller-gen --version)" "$REPO_ROOT/bin/controller-gen"
 	printf 'setup-envtest: pinned %s (%s)\n' "$se_pin" "$REPO_ROOT/bin/setup-envtest"
 	printf 'envtest assets: k8s %s (%s)\n' "$k8s" "$assets"
