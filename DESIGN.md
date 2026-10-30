@@ -2250,7 +2250,73 @@ each of them clears on a later pass — a live probe can outrun the dataplane
 programming of the NetworkPolicy the same reconcile just wrote, and an access
 review can read an informer cache that has not yet caught up with a Role created
 moments ago — so terminalizing them would strand a run that was always going to
-succeed. The secure round is fenced before it terminalizes: a resumed launch
+succeed.
+The claim/release requeue a permanent-class verdict keeps is rate-bounded. A
+verdict outside the terminal classes — the broker's own grants
+(`BrokerRBAC`), the operator's own grants (`OperatorRBAC`), the run
+namespace's Pod Security label (`PodSecurity`), the admission proofs
+(`AdmissionBroken`, `IsolationBroken`), and the provider and policy verdicts
+the launch path raises (`ProviderSelection`, `PolicyConflict`) — requeued as
+fast as the API server allowed would churn the run through Pending and Claimed
+several times a second, the retry churn #644 required to stop. The operator
+records such a failure on the run itself:
+`courier.misospace.dev/preflight-failed-at` carries the RFC3339 time of the last
+failed attempt and `courier.misospace.dev/preflight-failures` the count of
+consecutive failures, and the next attempt waits a delay that starts at 15s and
+doubles per consecutive failure up to a 5m ceiling. The count is consecutive
+because a launch that completes removes both markers again; that clear is
+best-effort, so a clear that fails leaves the count where it was and the next
+failure waits the next longer delay instead of starting over. The wait is
+quiet: while it holds, the admission path neither claims the run nor writes
+its status, so nothing wakes it before its delay is up, and a claimed run whose
+rollback failed waits out the delay still holding its lane slot — the source
+claim is back with the source unless the release itself failed, because the
+rollback releases it before the status write that failed. The markers live on
+the object, so a controller restart cannot turn the bounded wait back into the
+churn. The arming path reads the failure count from the API server rather than
+from the informer cache, so a cache that has not caught up cannot restart the
+schedule at the base delay on every pass; the gate reads the markers from the
+run the reconciler holds, so the wait begins once that reconciler observes the
+arming write. The gate is armed before the claim is released, so a rollback
+that fails still leaves the run waiting out the delay instead of cycling. The
+bound is best-effort: a marker that cannot be written leaves the ordinary
+requeue, and a marker the operator cannot read — the timestamp, or the failure
+count that decides how long the wait is, whether it is missing, unparseable, or
+not a positive number — is treated as no gate at all, because a gate that
+cannot be read must never strand a run that could still succeed. No verdict
+class changes: a failure that clears on a later pass still clears, and one that
+never clears still retries — only not in a tight loop. An ordinary preflight
+error is not gated at all, because the design classifies it as transient.
+A permanent misconfiguration is only a verdict if the launch path can tell it
+from a transient one, and the deployment's own facts are what tell it: the
+operator's provisioning grants — the namespaced creates and deletes the secure
+topology needs, and the cluster-scoped grants the proof itself uses — and the
+dedicated run namespace's restricted Pod Security label are proven before the
+operator creates anything, so a missing one of those grants or an unlabelled
+namespace arrives as the `OperatorRBAC` or `PodSecurity` verdict the gate
+bounds — including the grants the operator needs to ask the access-review
+questions at all. Creating the topology first would surface the same
+misconfiguration as a raw Forbidden from a create — an ordinary error, which
+the design classifies as transient, so the run would cycle as fast as the API
+server allowed. The broker's own grants are proven the other way round, after
+the Role the run renders exists, because that check compares the live Role
+against the intended one.
+An access review is asked at the scope the request it stands for has. The
+broker's TokenReview creation and the operator's own cluster-scoped grants —
+the broker's ClusterRoleBinding, the node list, the run namespace read, and
+the two access-review creates — are reviewed without a namespace, so only a
+cluster-wide grant can satisfy them: a namespaced Role authorizes a
+namespaced review of a cluster-scoped resource, but never the cluster-scoped
+request itself, and crediting one would let a run launch on an authority the
+cluster would refuse. The SelfSubjectAccessReview the operator asks about
+itself is a canary rather than a proof on a stock cluster, where the API
+server's default `system:basic-user` binding already allows that create to
+every authenticated subject. The proof covers what the secure topology's
+creation needs, not every grant the operator holds: the reads the secure path
+makes outside it — the lane profile, the signing secret, the topology pods,
+and the cluster's API server and DNS services — are outside the proof, so a
+deployment missing one of those still surfaces as an ordinary refusal.
+The secure round is fenced before it terminalizes: a resumed launch
 reaches the launcher with a live worker and a credentialed broker, and a
 `NeedsHuman` run is no longer observed, so a fence deferred past that reconcile
 would leave the untrusted executor running and the broker holding credentials
