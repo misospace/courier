@@ -2141,6 +2141,12 @@ spec:
     single 3090, may queue behind a shared pool, keep parallelism modest,
     use the load tool before you fan out
   runtimeImage: <optional image>   # repository-specific coordinator/toolchain image
+  context:                         # optional per-role context budgets (#243)
+    compactAtPercent: 75           # fraction of the effective limit that fires a step-boundary compaction
+    outputReservation: 4096        # tokens reserved for the next turn's output
+    roles:
+      coordinator: {maxInputTokens: 128000}
+      coder: {maxInputTokens: 32000}
   resources:                       # optional CPU/memory sizing for this lane's pods
     requests: {cpu: 500m, memory: 1Gi}
     limits: {cpu: "4", memory: 8Gi}

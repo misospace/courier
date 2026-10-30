@@ -111,14 +111,41 @@ func runArgs(args []string) error {
 	if err != nil {
 		return err
 	}
+	// The trusted status reporter is created before the run context is
+	// reconstructed: every fail-closed ending below — a malformed declared
+	// context policy (#636) or a capability-gate failure — persists its
+	// trusted terminal result (#127) through the broker before the process
+	// exits, exactly as a run that ends through the coordinator loop does.
+	reporter := harness.NewStatusReporter(identity.brokerStatusClient(), identity.controlKubeUID, identity.workerUID, 0)
 	invocation, err := executor.InvocationFromEnv(os.Getenv)
 	if err != nil {
+		// A malformed declared context policy is operator configuration, not
+		// infrastructure: a relaunch would re-read the same pod env and fail
+		// the same way, so the run declares NeedsHuman instead of
+		// crashlooping an unparseable configuration (#636).
+		if errors.Is(err, executor.ErrInvalidContextPolicy) {
+			return declareNeedsHuman(
+				"the lane's declared context policy cannot be reconstructed from the run environment",
+				[]harness.Capability{{
+					Name: "context-policy", State: harness.StateUnavailable,
+					Detail: "COURIER_CONTEXT_JSON is not a valid context policy", Required: true,
+				}},
+				reporter, identity)
+		}
 		return fmt.Errorf("courier-control: run context: %w", err)
 	}
 	bindings, err := harness.BindRoles(invocation.Roles)
 	if err != nil {
 		return fmt.Errorf("courier-control: lane roles: %w", err)
 	}
+	// The lane's declared context policy (#636): the same policy gates the
+	// capability probe and budgets the coordinator's sessions, resolved
+	// harness-side against the gateway-verified model input limits. A lane
+	// that declares no policy converts to the zero policy: no role is
+	// gated, no session compacts — the documented unbudgeted legacy
+	// behavior, preserved for old invocations and profiles.
+	policy := harness.ContextPolicyFromLane(invocation.Context)
+	budgetInputs := make(map[string]harness.ContextBudgetInput)
 	gateway := &harness.Gateway{
 		BaseURL: os.Getenv(topology.EnvGatewayURL),
 		// Provider-specific exhaustion codes are deployment configuration:
@@ -139,12 +166,6 @@ func runArgs(args []string) error {
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
 	defer cancel()
 
-	// The trusted status reporter is created before the capability probe: a
-	// gate that fails closed must still persist its trusted terminal result
-	// (#127) through the broker before the process exits, exactly as a run
-	// that ends through the coordinator loop does.
-	reporter := harness.NewStatusReporter(identity.brokerStatusClient(), identity.controlKubeUID, identity.workerUID, 0)
-
 	// Startup capability health (§5): every semantic capability the harness
 	// depends on is probed and named. Required and unavailable fails closed
 	// before any model work starts; optional capabilities proceed degraded.
@@ -158,6 +179,18 @@ func runArgs(args []string) error {
 		Mode:               string(invocation.Mode),
 		PublicationPresent: true, // the publisher is wired below (#125)
 		SnapshotPresent:    true, // the snapshot provider is wired below (#125)
+		Context:            policy,
+		// The probe records each declared role's resolution input — declared
+		// policy plus the gateway-verified limit — and those inputs feed
+		// CoordinatorConfig.ContextBudgets verbatim (#636), so the sessions
+		// the coordinator opens execute under exactly the limits this gate
+		// verified; there is no second gateway read that could disagree with
+		// the one that decided capability health. The retry loop overwrites
+		// per role, so after the gate passes the map holds the passing
+		// round's inputs for every declared role.
+		OnContextBudget: func(role string, input harness.ContextBudgetInput) {
+			budgetInputs[role] = input
+		},
 		ProbeWorker: func(probeCtx context.Context) harness.Capability {
 			return identity.probeWorker(probeCtx)
 		},
@@ -229,6 +262,10 @@ func runArgs(args []string) error {
 		Publisher: engine,
 		Activity:  reporter,
 		Status:    reporter,
+		// The budget inputs the gate verified (#636), resolved once here by
+		// NewCoordinator — the same declared-plus-verified values the
+		// capability table reported.
+		ContextBudgets: budgetInputs,
 		// Operator soft-stop (#238): the control request arrives only
 		// through the broker's trusted listener, fenced to this exact
 		// incarnation, and is acknowledged durably through the same

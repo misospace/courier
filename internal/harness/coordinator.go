@@ -220,9 +220,10 @@ type CoordinatorConfig struct {
 	// budget — and a role named with an input that does not resolve fails
 	// startup closed rather than running on an invented context window. A
 	// role absent from the map gets the zero budget: the harness owns no
-	// policy for it and never compacts it. #295/#296 populate this map from
-	// the lane profile and the gateway-verified model input limit; nothing
-	// does yet, so no production session carries a budget.
+	// policy for it and never compacts. #636 populates this map from the
+	// lane's declared policy and the gateway-verified model input limit the
+	// capability gate verified; a lane that declares no policy populates
+	// nothing, which is the documented unbudgeted legacy behavior.
 	ContextBudgets map[string]ContextBudgetInput
 	// Compactions optionally receives one telemetry event per applied
 	// step-boundary compaction (#243). Emission is best-effort and
@@ -281,6 +282,15 @@ func (c *Coordinator) Name() string { return "native" }
 
 // Briefs exposes the run's brief ledger for diagnostics and tests.
 func (c *Coordinator) Briefs() *BriefRegistry { return c.briefs }
+
+// Budget returns the resolved context budget for a role and whether the
+// role carries one — the budget NewSession applies to that role's sessions.
+// Diagnostics and tests only: the session loop reads the resolved map at
+// startup, never this accessor.
+func (c *Coordinator) Budget(role string) (ContextBudget, bool) {
+	budget, ok := c.budgets[role]
+	return budget, ok
+}
 
 // harnessFraming is the native harness's own contract on top of the run
 // goal: the control pod has no shell or filesystem, worker output is
