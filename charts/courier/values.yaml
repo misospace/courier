@@ -251,7 +251,8 @@ controllers:
         #   --observer-credential-secret
         #                               Secret carrying the trusted operator's
         #                               own forge credential; wins over
-        #                               --github-credential-secret for operator
+        #                               --github-credential-secret and
+        #                               --git-credential-secret for operator
         #                               observation and is never injected into
         #                               coordinator pods (#638)
         #   --observer-credential-key   Optional key within it; requires
