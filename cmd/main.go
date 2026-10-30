@@ -17,7 +17,6 @@ import (
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	"k8s.io/client-go/rest"
 	ctrl "sigs.k8s.io/controller-runtime"
-	"sigs.k8s.io/controller-runtime/pkg/cache"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/healthz"
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
@@ -26,6 +25,7 @@ import (
 
 	courierv1alpha1 "github.com/misospace/courier/api/v1alpha1"
 	"github.com/misospace/courier/internal/bootstrap"
+	"github.com/misospace/courier/internal/cacheopts"
 	"github.com/misospace/courier/internal/connector"
 	"github.com/misospace/courier/internal/controller"
 	"github.com/misospace/courier/internal/executor"
@@ -225,7 +225,8 @@ func main() {
 
 	mgr, err := ctrl.NewManager(ctrl.GetConfigOrDie(), ctrl.Options{
 		Scheme:                 scheme,
-		Cache:                  controllerCacheOptions(watchedNamespaces),
+		Cache:                  cacheopts.Options(watchedNamespaces),
+		Client:                 client.Options{Cache: &client.CacheOptions{DisableFor: cacheopts.UncachedReadObjects()}},
 		Metrics:                metricsserver.Options{BindAddress: metricsAddr},
 		HealthProbeBindAddress: probeAddr,
 		LeaderElection:         enableLeaderElection,
@@ -421,6 +422,11 @@ func main() {
 		"manual": manual.New(diagnostics),
 		"adhoc":  adhoc.New(mgr.GetClient(), mgr.GetAPIReader()),
 	})
+	// A contribute run's objective is its source's own context, so each launch
+	// path resolves the owning adapter through this registry rather than
+	// decoding the context itself (#624). The registry is shared by pointer, so
+	// adapters registered below are visible to every consumer.
+	launcher.Sources = sources
 	if dispatchEnabled {
 		if strings.TrimSpace(dispatchBaseURL) == "" || strings.TrimSpace(dispatchAgentName) == "" {
 			setupLog.Error(fmt.Errorf("dispatch requires base URL and agent name"), "unable to configure Dispatch source")
@@ -661,6 +667,7 @@ func main() {
 		secure.Patcher = reconciler
 		secure.MaxRestarts = reconciler.MaxRestarts
 		secure.APIReader = mgr.GetAPIReader()
+		secure.Sources = sources
 		reconciler.Secure = secure
 	}
 	if err := reconciler.SetupWithManager(mgr); err != nil {
@@ -873,32 +880,6 @@ func containsNamespace(namespaces []string, namespace string) bool {
 		}
 	}
 	return false
-}
-
-// controllerCacheOptions scopes the manager's informers to the watched
-// namespaces (#632): CoderRun, LaneProfile and Pod are listed and watched
-// only there, so a side-by-side release neither observes nor can be woken
-// by another deployment's runs, lanes, and run pods. Every other kind stays
-// cluster-wide, because secure preflight and launch pinning legitimately
-// read Nodes, Namespaces, and Services outside the run namespaces, and the
-// uncached API reader is never restricted. An empty watched set leaves the
-// cache unrestricted — the single-controller default.
-func controllerCacheOptions(watched []string) cache.Options {
-	if len(watched) == 0 {
-		return cache.Options{}
-	}
-	namespaces := make(map[string]cache.Config, len(watched))
-	for _, namespace := range watched {
-		namespaces[namespace] = cache.Config{}
-	}
-	byNamespace := cache.ByObject{Namespaces: namespaces}
-	return cache.Options{
-		ByObject: map[client.Object]cache.ByObject{
-			&courierv1alpha1.CoderRun{}:    byNamespace,
-			&courierv1alpha1.LaneProfile{}: byNamespace,
-			&corev1.Pod{}:                  byNamespace,
-		},
-	}
 }
 
 // cronLane pairs one LaneProfile with the schedules targeting it.

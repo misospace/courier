@@ -2141,6 +2141,12 @@ spec:
     single 3090, may queue behind a shared pool, keep parallelism modest,
     use the load tool before you fan out
   runtimeImage: <optional image>   # repository-specific coordinator/toolchain image
+  context:                         # optional per-role context budgets (#243)
+    compactAtPercent: 75           # fraction of the effective limit that fires a step-boundary compaction
+    outputReservation: 4096        # tokens reserved for the next turn's output
+    roles:
+      coordinator: {maxInputTokens: 128000}
+      coder: {maxInputTokens: 32000}
   resources:                       # optional CPU/memory sizing for this lane's pods
     requests: {cpu: 500m, memory: 1Gi}
     limits: {cpu: "4", memory: 8Gi}
@@ -2250,7 +2256,73 @@ each of them clears on a later pass — a live probe can outrun the dataplane
 programming of the NetworkPolicy the same reconcile just wrote, and an access
 review can read an informer cache that has not yet caught up with a Role created
 moments ago — so terminalizing them would strand a run that was always going to
-succeed. The secure round is fenced before it terminalizes: a resumed launch
+succeed.
+The claim/release requeue a permanent-class verdict keeps is rate-bounded. A
+verdict outside the terminal classes — the broker's own grants
+(`BrokerRBAC`), the operator's own grants (`OperatorRBAC`), the run
+namespace's Pod Security label (`PodSecurity`), the admission proofs
+(`AdmissionBroken`, `IsolationBroken`), and the provider and policy verdicts
+the launch path raises (`ProviderSelection`, `PolicyConflict`) — requeued as
+fast as the API server allowed would churn the run through Pending and Claimed
+several times a second, the retry churn #644 required to stop. The operator
+records such a failure on the run itself:
+`courier.misospace.dev/preflight-failed-at` carries the RFC3339 time of the last
+failed attempt and `courier.misospace.dev/preflight-failures` the count of
+consecutive failures, and the next attempt waits a delay that starts at 15s and
+doubles per consecutive failure up to a 5m ceiling. The count is consecutive
+because a launch that completes removes both markers again; that clear is
+best-effort, so a clear that fails leaves the count where it was and the next
+failure waits the next longer delay instead of starting over. The wait is
+quiet: while it holds, the admission path neither claims the run nor writes
+its status, so nothing wakes it before its delay is up, and a claimed run whose
+rollback failed waits out the delay still holding its lane slot — the source
+claim is back with the source unless the release itself failed, because the
+rollback releases it before the status write that failed. The markers live on
+the object, so a controller restart cannot turn the bounded wait back into the
+churn. The arming path reads the failure count from the API server rather than
+from the informer cache, so a cache that has not caught up cannot restart the
+schedule at the base delay on every pass; the gate reads the markers from the
+run the reconciler holds, so the wait begins once that reconciler observes the
+arming write. The gate is armed before the claim is released, so a rollback
+that fails still leaves the run waiting out the delay instead of cycling. The
+bound is best-effort: a marker that cannot be written leaves the ordinary
+requeue, and a marker the operator cannot read — the timestamp, or the failure
+count that decides how long the wait is, whether it is missing, unparseable, or
+not a positive number — is treated as no gate at all, because a gate that
+cannot be read must never strand a run that could still succeed. No verdict
+class changes: a failure that clears on a later pass still clears, and one that
+never clears still retries — only not in a tight loop. An ordinary preflight
+error is not gated at all, because the design classifies it as transient.
+A permanent misconfiguration is only a verdict if the launch path can tell it
+from a transient one, and the deployment's own facts are what tell it: the
+operator's provisioning grants — the namespaced creates and deletes the secure
+topology needs, and the cluster-scoped grants the proof itself uses — and the
+dedicated run namespace's restricted Pod Security label are proven before the
+operator creates anything, so a missing one of those grants or an unlabelled
+namespace arrives as the `OperatorRBAC` or `PodSecurity` verdict the gate
+bounds — including the grants the operator needs to ask the access-review
+questions at all. Creating the topology first would surface the same
+misconfiguration as a raw Forbidden from a create — an ordinary error, which
+the design classifies as transient, so the run would cycle as fast as the API
+server allowed. The broker's own grants are proven the other way round, after
+the Role the run renders exists, because that check compares the live Role
+against the intended one.
+An access review is asked at the scope the request it stands for has. The
+broker's TokenReview creation and the operator's own cluster-scoped grants —
+the broker's ClusterRoleBinding, the node list, the run namespace read, and
+the two access-review creates — are reviewed without a namespace, so only a
+cluster-wide grant can satisfy them: a namespaced Role authorizes a
+namespaced review of a cluster-scoped resource, but never the cluster-scoped
+request itself, and crediting one would let a run launch on an authority the
+cluster would refuse. The SelfSubjectAccessReview the operator asks about
+itself is a canary rather than a proof on a stock cluster, where the API
+server's default `system:basic-user` binding already allows that create to
+every authenticated subject. The proof covers what the secure topology's
+creation needs, not every grant the operator holds: the reads the secure path
+makes outside it — the lane profile, the signing secret, the topology pods,
+and the cluster's API server and DNS services — are outside the proof, so a
+deployment missing one of those still surfaces as an ordinary refusal.
+The secure round is fenced before it terminalizes: a resumed launch
 reaches the launcher with a live worker and a credentialed broker, and a
 `NeedsHuman` run is no longer observed, so a fence deferred past that reconcile
 would leave the untrusted executor running and the broker holding credentials
@@ -2312,12 +2384,48 @@ terminalized, while a legacy controller with no configured list owns every
 namespace. The manager's informers, the capacity and retention gauges (which
 for a secure controller therefore report only the run namespace), and the
 discovery-namespace startup check follow the same boundary; preflight reads of
-Nodes, Namespaces, and cluster Services, and the uncached API reader,
-deliberately do not. The evidence intake applies the same boundary to inbound
+Nodes, Namespaces, and cluster Services go through the uncached API reader,
+which is not namespace-restricted. The evidence intake applies the same boundary to inbound
 captures: with the ownership set configured, an authenticated capture naming a
 run outside it is refused before anything is persisted, so a key shared
 across releases cannot turn one release's intake into a writer in another's
 namespaces.
+
+The manager's cache informer-caches only CoderRun, LaneProfile, and Pod,
+namespaced to the watched namespaces wherever an ownership set is configured
+— with no ownership set the cache is unrestricted, the single-controller
+default. Every other kind — Secrets, Services, ServiceAccounts,
+NetworkPolicies, RBAC objects, Namespaces, Nodes — is read point-wise
+through the uncached API reader (`SecureControl.reader`), never through the
+cached client. The chart's grants are what make that boundary load-bearing:
+list and watch for the three cached kinds, list without watch for Secrets,
+Services, ServiceAccounts, NetworkPolicies, and the RBAC objects, get and
+list for Nodes, and get alone for Namespaces. A read of any other kind
+through the cached client would therefore lazily start an informer that can
+never watch — its initial list pulls every object it listed into the
+operator's memory, and it relists forever. The manager's client excludes the
+get/list-only kinds from cached reads (`cacheopts.UncachedReadObjects`,
+#647), so such a read is served straight from the API server even without
+the routing; routing the secure path through the uncached reader keeps it
+correct independently of that exclusion, and each is pinned by its own test.
+`DefaultNamespaces` bounds such
+an accidental informer for a namespaced kind to the watched namespaces; a
+cluster-scoped kind (Node, Namespace) stays cluster-wide, which is why the
+live-probe Node List goes through the uncached reader. Writes stay on the
+cached client, because creates, patches, and deletes never start informers.
+
+Operator sizing follows from that boundary: the operator itself needs only
+small memory — the prior v1 operator measured ~22Mi point-in-time (#642) —
+and the chart's 128Mi default remains the sizing anchor. The boundary is
+measured, not assumed: against a real API server holding a Secret
+population, repeated secure provisioning passes and the preflight reads they
+reroute start no informer — no watch is issued for a kind the cache does not
+inform — and leave the operator's live heap below half that population
+(the measured delta was zero), while one cached Secret read starts the
+informer that pulls the whole population into memory. The residual limits
+are API-server load rather than memory: uncached point reads issue per-pass
+Gets against the API server, and the live-probe preflight issues one
+legitimate cluster-wide Node List per launch pass.
 
 - **Pending** — created by a source. The operator checks the lane's `concurrency`
   against admitted (`Claimed` + `Running`) runs on that lane. Over capacity → stays Pending (this is the
@@ -2548,6 +2656,42 @@ A contribution records no source-owned work item, so any source-issue or
 criterion pin, and any PR number or head anchor, fails the binding: the broker's
 discovery-based PR idempotency owns PR identity at publication. The work tip is
 either absent or a recorded adoption tip, never both.
+
+### Contribution execution bridge
+A `contribute` run carries no issue or pull-request number: its admitted
+objective and base ref exist only inside the source's own opaque
+`spec.sourceContext`, so rendering its coordinator goal needs a source-neutral
+execution input rather than a spec reference. `GoalWithContribution`
+(`internal/executor/executor.go`) takes that input — `executor.ContributionExecution`,
+an admitted goal plus a base ref — and is the only renderer a contribute run
+reaches; `Goal` and `NewInvocation` keep their shapes and fail closed for it.
+Translating durable source context into the input is the source's job: an
+adapter that materializes contribute runs implements the optional
+`executor.ContributionContext` surface, and each launch path resolves it through
+the source registry (`SourceRegistry.ContributionExecution` and
+`launchContribution`, `internal/controller`). Core never parses source-owned
+context and never learns a source's context key. Decoding reads durable run
+state alone — no source or forge contact — so resume and relaunch regenerate the
+identical goal. The admitted goal is untrusted task data: it is pasted verbatim
+inside framing that names it data, never instructions, and it grants no
+repository authority, mutates no policy, selects no credential, and moves no
+publication target. The source decode refuses ASCII control characters other
+than tab and newline, which would corrupt that framing or break the coordinator
+container at start. The rendered goal is the only channel — `Invocation` →
+`COURIER_GOAL` → coordinator — with no second prompt or environment field, and
+`InvocationFromEnv` accepts `contribute` with `COURIER_REF` exactly `0` where
+every other mode still requires a positive reference. A contribute run whose
+*owning adapter* refuses its durable context is permanent — that context lives in
+the immutable spec — so the launch terminalizes `NeedsHuman` (reason
+`ContributionContext`), fencing any topology the secure path already
+provisioned, rather than launching a coordinator with no objective. Reaching no
+owning adapter at all (no registry wired, no adapter registered under the run's
+source, a source that supplies no contribution surface) stays an ordinary
+retryable launch failure, because a later deployment can wire it. A contribution
+pins no acceptance criteria, so its goal
+carries no criterion-evidence grammar, and the base ref it states is task
+context only: publication stays bound to the base the broker's persisted policy
+pins (`PolicyFromRun`), which no model output can move.
 
 ## Terminal retention and closed-unmerged PRs
 
@@ -3082,8 +3226,17 @@ only informs.
   historical name for a single release). CRD ownership stays singular: a
   side-by-side release sets `crds.enabled=false` and evolves the CRDs
   out-of-band. Leader-election leases are namespaced, so separate operator
-  namespaces are already isolated; two releases sharing one operator namespace
-  need distinct `ownership.leaderElectionID` values (#632).
+   namespaces are already isolated; two releases sharing one operator namespace
+   need distinct `ownership.leaderElectionID` values (#632).
+- Binding that role is a separate, chart-scoped authority. Creating the per-run
+  broker ClusterRoleBinding is refused by API-server anti-escalation unless the
+  operator can bind the referenced ClusterRole, so the secure chart grants
+  `bind` on `rbac.authorization.k8s.io` `clusterroles` `resourceNames`-scoped to
+  the effective broker TokenReview ClusterRole. It is rendered only when
+  `secure.enabled` and re-scoped with `secure.brokerTokenReviewClusterRole`, and
+  is deliberately a chart-only grant — never the `+kubebuilder:rbac`-generated
+  operator ClusterRole — so legacy-only installs gain no bind authority and
+  nothing beyond this one named role is ever bindable (#640).
 - Source-state transitions (claim, in-review, needs-human, resolve) are the
   operator's, done by deterministic code — the one place non-determinism would be
   dangerous, kept mechanical.

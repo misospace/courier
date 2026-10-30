@@ -1,4 +1,6 @@
 {{- if .Values.secure.enabled }}
+{{- /* Initialize the merged common-library values so the serviceAccount helper resolves. */}}
+{{- include "bjw-s.common.loader.init" . }}
 ---
 apiVersion: v1
 kind: ConfigMap
@@ -33,4 +35,33 @@ rules:
   - apiGroups: [authentication.k8s.io]
     resources: [tokenreviews]
     verbs: [create]
+---
+{{- $brokerRole := .Values.secure.brokerTokenReviewClusterRole | default "courier-broker-tokenreview" }}
+{{- $operatorSA := (include "bjw-s.common.lib.serviceAccount.getByIdentifier" (dict "rootContext" . "id" "main") | fromYaml) }}
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ .Release.Name }}-broker-tokenreview-binder
+  labels:
+    app.kubernetes.io/managed-by: courier
+rules:
+  - apiGroups: [rbac.authorization.k8s.io]
+    resources: [clusterroles]
+    verbs: [bind]
+    resourceNames: [{{ $brokerRole }}]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: {{ .Release.Name }}-broker-tokenreview-binder
+  labels:
+    app.kubernetes.io/managed-by: courier
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: {{ .Release.Name }}-broker-tokenreview-binder
+subjects:
+  - kind: ServiceAccount
+    name: {{ $operatorSA.name }}
+    namespace: {{ .Release.Namespace }}
 {{- end }}

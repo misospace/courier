@@ -1462,16 +1462,48 @@ event, never status, and never lets a model assert liveness or completion.
 Implementation is three bounded, file-scoped tickets — #295 (CRD per-role
 budget schema + bootstrap mirror), #296 (gateway model-capability probe +
 effective-limit resolution + capability gate), #297 (step-boundary compaction
-enforcement + `session.compacted` emitter). #297 has landed: the session loop
-calls the policy between turns and never mid-turn, per-role budgets are
-resolved once in `NewCoordinator` from an injected `ContextBudgets` map, a
-digest that cannot fit fails the run rather than truncating, and
-`courier-control` emits `session.compacted`. #295 has landed: the declared
-schema is a real CRD field (`LaneProfileSpec.context` plus the `bootstrap.Profile`
-mirror). A role with no resolved budget
-still owns no policy and never compacts: #296 supplies the verified side, but
-nothing populates `ContextBudgets` from a lane yet, so no
-production session carries a budget.
+enforcement + `session.compacted` emitter) — all landed, and #636 wired the
+production path. The declared policy travels the trusted run/control
+invocation (`executor.Invocation.Context`, rendered as `COURIER_CONTEXT_JSON`
+in the coordinator pod's environment): the policy is pinned into the pod
+spec, so a control pod reconstructs the identical declared policy from its
+environment for its incarnation rather than re-reading the live LaneProfile,
+and a worker or model can never author it. `courier-control` resolves the policy
+once and uses it in both places that must agree: `ProbeDeps.Context` gates on
+it, and the probe hands each bound role's resolution input — declared policy
+plus the gateway-verified input limit — to `CoordinatorConfig.ContextBudgets`,
+so the sessions the coordinator opens execute under exactly the limits the
+gate verified; there is no second gateway read that could disagree with the
+one the gate decided on. `NewCoordinator` resolves each input once at
+startup and fails closed on one it cannot resolve.
+
+A role the lane declared nothing for is recorded by no budget and never
+compacts — that is the documented unbudgeted legacy behavior, preserved for
+old invocations and profiles, and it is not capacity management. The
+capability table reports enforcement honestly: a bound role the lane declares
+nothing for shows `context-budget:<role>` `unavailable` — required=no, even
+when the gateway verified a window, with the verified size named in the
+detail — because a healthy capability must never be paired with an unbounded
+session. Two consequences an operator must know. First, the LaneProfile CRD
+defaults `context.compactAtPercent` to 75 whenever a `context` block exists,
+so a lane that declares a policy for one role has declared a usable policy
+for **every** bound role: each role's model-info read becomes a required
+capability, and a gateway that cannot report an undeclared role's model fails
+the run closed rather than leaving it silently unbudgeted. Second, the pin is
+per control incarnation, not per run: the operator renders each control
+pod's environment from the live LaneProfile, so an edit to the lane's context
+policy takes effect at the next control incarnation and never
+mid-incarnation, while a restarted pod reconstructs the identical pinned
+policy for its incarnation.
+
+Production verification reads two signals: the capability table's
+`context-budget:<role>` state (`healthy` = gateway-verified and enforced,
+`configured` = declared ceiling in use without verification) identifies which
+limit is in force for the incarnation — the detail states the resolution
+basis, and the undeclared rows name the verified window no policy clamps —
+and `session.compacted` run events report when that limit's compact point or
+output reservation actually fired. A lane that declares a budget must show
+both; a lane that shows neither has no enforcement.
 
 ## 6. Long-tool liveness contract (#119)
 
@@ -2063,15 +2095,16 @@ and the acceptance tests below are satisfied.
    (admission pinning), #281 (native boundary), #282 (legacy boundary) —
    and until they land the contract exists as the tested pure seam in
    `internal/broker/criteria.go` that both paths will call.
-8. Settled in §5 (#243): the harness-owned per-role context budget and
-   pre-ceiling, step-boundary compaction policy. Implementation is three
-   bounded tickets — #295 (CRD per-role budget schema + bootstrap mirror),
-   #296 (gateway model-capability probe + effective-limit resolution +
-   capability gate), #297 (step-boundary compaction enforcement +
-   `session.compacted` telemetry) — and until they land the policy exists as
-   the tested pure seam in `internal/harness/budget.go`. The OpenCode default
-   threshold is unchanged by this design; any legacy mitigation is a separate
-   bounded ticket.
+8. Settled in §5 (#243, wired in production by #636): the harness-owned
+   per-role context budget and pre-ceiling, step-boundary compaction policy.
+   Implementation is three bounded tickets — #295 (CRD per-role budget schema
+   + bootstrap mirror), #296 (gateway model-capability probe + effective-limit
+   resolution + capability gate), #297 (step-boundary compaction enforcement +
+   `session.compacted` telemetry) — and #636 carries the declared policy
+   through the trusted run/control invocation into the capability gate and
+   the coordinator's session budgets. The OpenCode default threshold is
+   unchanged by this design; any legacy mitigation is a separate bounded
+   ticket.
 
 ## 12. Threat model and issue gates
 

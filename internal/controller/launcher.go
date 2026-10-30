@@ -111,6 +111,12 @@ type CoordinatorLauncher struct {
 	Scheme    *runtime.Scheme
 	Pod       executor.PodConfig
 	Executor  executor.Executor
+	// Sources resolves the adapter owning a run by its persisted source name.
+	// A contribute-mode run's objective lives in that source's own context, so
+	// the launch asks the owning adapter to translate it into the source-neutral
+	// goal input rather than decoding source-owned context here (#624). Nil
+	// means no contribute run can launch, which its launch fails closed.
+	Sources *SourceRegistry
 	// PRHeadResolver resolves the pinned pull request's live identity
 	// through the configured forge capability. A fix-pr run's coordinator
 	// pod is pinned to the pull request's live target ref resolved here —
@@ -217,6 +223,18 @@ func (l *CoordinatorLauncher) Launch(ctx context.Context, run *courierv1alpha1.C
 		return err
 	}
 	podConfig.Criteria = criteria
+	// A contribute run's objective is not in the spec: it is the admitted
+	// context its own source wrote. The launch resolves that context through the
+	// owning adapter and hands the source-neutral input to the pod builder, so
+	// the coordinator goal is rendered from what was admitted and a relaunch
+	// renders the identical goal (#624). Core never decodes source context, and
+	// a run whose context cannot be decoded terminalizes before any pod is
+	// rendered rather than launching with no objective.
+	contribution, err := launchContribution(l.Sources, run)
+	if err != nil {
+		return err
+	}
+	podConfig.Contribution = contribution
 	// A fix-pr run's coordinator pod must carry the pinned pull request's
 	// live target ref, never the deployment default: the run repairs a
 	// request that was opened against that base, and a stacked or fork

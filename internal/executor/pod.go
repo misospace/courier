@@ -85,6 +85,12 @@ type PodConfig struct {
 	// Empty means no set is pinned (fix-pr runs, pre-contract policies) and
 	// emits no environment variable.
 	Criteria string
+	// Contribution is the source-neutral execution input a contribute-mode
+	// run renders into its coordinator goal (#624). The value is supplied by
+	// the launch path from the run's own source adapter; the pod builder never
+	// derives it and never learns a source's context key. Empty for
+	// resolve-issue and fix-pr runs, which carry their whole goal in the spec.
+	Contribution ContributionExecution
 }
 
 // DefaultPodConfig is suitable for the temporary OpenCode shim image. The
@@ -165,7 +171,7 @@ func (b *PodBuilder) Build(run *courierv1alpha1.CoderRun, lane *courierv1alpha1.
 	if strings.TrimSpace(executorImpl.Name()) == "" {
 		return nil, ErrMissingCommandName
 	}
-	invocation, err := NewInvocation(run, lane, config.WorkspacePath)
+	invocation, err := NewInvocationWithContribution(run, lane, config.WorkspacePath, config.Contribution)
 	if err != nil {
 		return nil, err
 	}

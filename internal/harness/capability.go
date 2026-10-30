@@ -278,6 +278,19 @@ type ProbeDeps struct {
 	// value declares nothing, in which case the probe still reports the
 	// per-role budget capability but never requires it.
 	Context ContextPolicy
+	// OnContextBudget, when set, receives the context-budget resolution
+	// input of every bound role the lane declares a usable policy for
+	// (#636): the declared ceiling and overrides with the gateway-verified
+	// input limit filled in (BudgetInput). The coordinator must execute
+	// under exactly the limits the gate verified — wiring this callback is
+	// how courier-control feeds the probe's inputs into
+	// CoordinatorConfig.ContextBudgets instead of re-reading the gateway (a
+	// second read could disagree with the one the gate decided on) or
+	// running sessions the gate never budgeted. A role the lane declares
+	// nothing for is never recorded: it keeps the zero budget and the
+	// documented unbudgeted legacy behavior. A nil callback records
+	// nothing.
+	OnContextBudget func(role string, input ContextBudgetInput)
 }
 
 // requiredForgeOperations maps a run mode to the forge operations its
@@ -407,15 +420,19 @@ func probeModelBindings(ctx context.Context, deps ProbeDeps) []Capability {
 }
 
 // probeContextBudgets reports every bound role's context budget (#296). The
-// effective limit is min(declared, gateway-verified): a gateway-confirmed read
-// is healthy, a ceiling the gateway could not confirm is configured and never
-// healthy, and a role with neither is unavailable rather than quietly given an
-// implicit window. The capability is required only when the lane declared a
-// usable budget for that role, so a lane with no context policy proceeds
-// degraded instead of being gated by a policy it never opted into. A declared
-// role this run does not bind is named without gating: one LaneProfile serves
-// several lanes, so a role another lane binds is not this run's failure, but a
-// typo must not silently disable that role's capacity management either.
+// effective limit is min(declared, gateway-verified): a gateway-confirmed
+// read on a declared role is healthy, a ceiling the gateway could not confirm
+// is configured and never healthy, and a role with neither is unavailable
+// rather than quietly given an implicit window. A bound role the lane
+// declares nothing for is unavailable too — even when the gateway verified a
+// window — because no budget is enforced for it (#636): the table reports
+// capacity and enforcement, not just an advertised window. The capability is
+// required only when the lane declared a usable budget for that role, so a
+// lane with no context policy proceeds degraded instead of being gated by a
+// policy it never opted into. A declared role this run does not bind is
+// named without gating: one LaneProfile serves several lanes, so a role
+// another lane binds is not this run's failure, but a typo must not silently
+// disable that role's capacity management either.
 func probeContextBudgets(ctx context.Context, deps ProbeDeps) []Capability {
 	roles := deps.Bindings.Roles()
 	bound := make(map[string]struct{}, len(roles))
@@ -429,7 +446,7 @@ func probeContextBudgets(ctx context.Context, deps ProbeDeps) []Capability {
 	failed := make(map[string]error, len(roles))
 	for _, role := range roles {
 		name := "context-budget:" + role
-		required := deps.Context.declaresRole(role)
+		required := deps.Context.DeclaresRole(role)
 		model := deps.Bindings.Model(role)
 		inputLimit, probeErr := 0, error(nil)
 		if deps.Gateway != nil {
@@ -440,6 +457,15 @@ func probeContextBudgets(ctx context.Context, deps ProbeDeps) []Capability {
 			}
 		}
 		budget, err := deps.Context.RoleBudget(role, inputLimit)
+		// The resolution input — the declared policy plus the verified read —
+		// is recorded before it resolves, so even a gate that fails closed on
+		// this role hands the caller the exact input that failed; the
+		// coordinator can never resolve a different one (#636). Only declared
+		// roles are recorded: an undeclared role keeps the zero budget, and
+		// the coordinator must never gain a policy the lane never opted into.
+		if required && deps.OnContextBudget != nil {
+			deps.OnContextBudget(role, deps.Context.BudgetInput(role, inputLimit))
+		}
 		// A role with no usable budget: either the resolution failed closed,
 		// or the lane owns no policy for it and the budget is the zero one. The
 		// probe reason still reaches the table when there is one — it is why no
@@ -458,6 +484,19 @@ func probeContextBudgets(ctx context.Context, deps ProbeDeps) []Capability {
 			}
 			capability.Required = required
 			caps = append(caps, capability)
+			continue
+		}
+		if !required {
+			// The gateway verified a window, but the lane owns no policy for
+			// this role, so no budget is enforced (#636): the table must not
+			// report a healthy budget the sessions will not carry — a healthy
+			// capability paired with an unbounded session is exactly the
+			// gate-to-execution disagreement #636 forbids. The verified
+			// window is named so the operator can see what declaring a
+			// ceiling would clamp; the capability stays non-required, so an
+			// undeclared lane proceeds degraded as before.
+			detail := fmt.Sprintf("the gateway verified the model input limit (%d tokens), but the lane declares no context policy, so no budget is enforced", budget.EffectiveLimit)
+			caps = append(caps, unavailable(name, false, detail))
 			continue
 		}
 		capability := healthy(name, required)

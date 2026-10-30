@@ -43,27 +43,26 @@ type probeOutcome struct {
 	Got  string `json:"got"`
 }
 
-// Preflight runs the secure-mode preflight for one run. It assumes the static
+// preflight runs the secure-mode preflight for one run. It assumes the static
 // topology objects (SAs, RBAC, secrets, services, policies) are already
-// provisioned. relaunch abbreviates the check: replacement launches re-verify
-// the static guarantees but do not repeat the multi-node live probes, which
-// ran before the first workload exposure. resources and workerImage are the
-// lane-resolved values the caller already holds for this launch pass, so the
-// dry-run proof and the pods created afterwards are the same artifacts. The
-// proof carries the probe pod only on a pass that will create probes live, so
-// a deployment with no probe image never proves — and is never failed by — a
-// spec it will not create.
+// provisioned, and that the deployment-level facts that do not depend on them —
+// the operator's own grants and the dedicated run namespace's restricted Pod
+// Security label — were already proven by the launch path before it created
+// anything (checkDeploymentPreconditions). The method is unexported so that
+// proof cannot be skipped: the only caller is the launch path, which proves
+// those facts first. relaunch abbreviates the check: replacement launches
+// re-verify the static guarantees but do not repeat the multi-node live
+// probes, which ran before the first workload exposure. resources and
+// workerImage are the lane-resolved values the caller already holds for this
+// launch pass, so the dry-run proof and the pods created afterwards are the
+// same artifacts. The proof carries the probe pod only on a pass that will
+// create probes live, so a deployment with no probe image never proves — and
+// is never failed by — a spec it will not create.
 //
 // Permanent deployment misconfiguration returns a *SecureNeedsHumanError;
 // transient API or probe failures return an ordinary error so the run requeues
 // without launching.
-func (s *SecureControl) Preflight(ctx context.Context, run *courier.CoderRun, policy *courier.PublicationPolicy, relaunch bool, resources corev1.ResourceRequirements, workerImage string) error {
-	if err := s.checkNamespaceBoundary(ctx); err != nil {
-		return err
-	}
-	if err := s.checkOperatorAccess(ctx); err != nil {
-		return err
-	}
+func (s *SecureControl) preflight(ctx context.Context, run *courier.CoderRun, policy *courier.PublicationPolicy, relaunch bool, resources corev1.ResourceRequirements, workerImage string) error {
 	if err := s.checkBrokerRBAC(ctx, run); err != nil {
 		return err
 	}
@@ -80,12 +79,37 @@ func (s *SecureControl) Preflight(ctx context.Context, run *courier.CoderRun, po
 	return s.runLiveProbes(ctx, run, cache)
 }
 
+// checkDeploymentPreconditions proves the deployment-level facts the secure
+// topology depends on before the operator creates anything: the operator's own
+// provisioning grants, and the dedicated run namespace with its restricted Pod
+// Security label.
+//
+// Neither depends on the objects a run's topology creates, so both can be
+// proven first, and proving them first is what keeps a permanent
+// misconfiguration a verdict. A missing operator grant or a namespace without
+// the restricted label is a deployment the operator must fix, and a verdict is
+// the form the launch path reports it in, so the retry can be bounded. Had the
+// launch path created the topology first, the same misconfiguration would
+// surface as a raw Forbidden from a create — an ordinary error, which the
+// design classifies as transient, so the run would cycle Pending → Claimed →
+// Pending as fast as the API server allowed (#644).
+//
+// The operator's own grants are proven first: without them the namespace read
+// could fail with a raw Forbidden that no reader could tell apart from a
+// permanent misconfiguration.
+func (s *SecureControl) checkDeploymentPreconditions(ctx context.Context) error {
+	if err := s.checkOperatorAccess(ctx); err != nil {
+		return err
+	}
+	return s.checkNamespaceBoundary(ctx)
+}
+
 // checkNamespaceBoundary verifies the dedicated run namespace exists and
 // enforces the restricted Pod Security standard. A cluster that cannot prove
 // restricted admission on the run namespace cannot run secure mode.
 func (s *SecureControl) checkNamespaceBoundary(ctx context.Context) error {
 	namespace := &corev1.Namespace{}
-	if err := s.Client.Get(ctx, types.NamespacedName{Name: s.Config.RunNamespace}, namespace); err != nil {
+	if err := s.reader().Get(ctx, types.NamespacedName{Name: s.Config.RunNamespace}, namespace); err != nil {
 		return fmt.Errorf("secure preflight: read run namespace: %w", err)
 	}
 	labels := namespace.Labels
@@ -107,42 +131,79 @@ type accessReview struct {
 	resource string
 	verb     string
 	name     string
+	// clusterScoped marks a cluster-scoped resource whose access review must
+	// omit the namespace. A namespaced Role can never grant a cluster-scoped
+	// verb, so sending a namespace would let a namespaced grant stand in for
+	// the cluster grant and pass a check the real request would fail.
+	clusterScoped bool
 }
 
 // checkOperatorAccess verifies the operator's own provisioning grants with
 // access reviews. A negative answer proves a grant is missing, which is
 // permanent deployment misconfiguration.
+//
+// A cluster-scoped grant is reviewed without a namespace, because the request
+// it stands for is cluster-scoped: the RBAC authorizer evaluates the
+// attributes literally, so a review that named the run namespace would let a
+// namespaced Role satisfy a grant the real request would be refused by —
+// crediting the operator with an authority it does not have, and turning a
+// missing cluster grant into a run that launches and then fails (#650).
 func (s *SecureControl) checkOperatorAccess(ctx context.Context) error {
-	core := ""
-	reviews := []accessReview{
-		{core, "secrets", "create", ""},
-		{core, "secrets", "delete", ""},
-		{core, "serviceaccounts", "create", ""},
-		{core, "serviceaccounts", "delete", ""},
-		{core, "pods", "create", ""},
-		{core, "pods", "delete", ""},
-		{core, "services", "create", ""},
-		{core, "services", "delete", ""},
-		{"networking.k8s.io", "networkpolicies", "create", ""},
-		{"networking.k8s.io", "networkpolicies", "delete", ""},
-		{"rbac.authorization.k8s.io", "roles", "create", ""},
-		{"rbac.authorization.k8s.io", "rolebindings", "create", ""},
-		{"rbac.authorization.k8s.io", "clusterrolebindings", "create", ""},
-		{core, "nodes", "list", ""},
-		{core, "namespaces", "get", ""},
-		{"authorization.k8s.io", "selfsubjectaccessreviews", "create", ""},
-	}
-	for _, review := range reviews {
+	for _, review := range operatorAccessReviews() {
 		allowed, err := s.selfSubjectAccessReview(ctx, review)
 		if err != nil {
 			return fmt.Errorf("secure preflight: access review for %s/%s %s: %w", review.group, review.resource, review.verb, err)
 		}
 		if !allowed {
+			scope := "namespace " + s.Config.RunNamespace
+			if review.clusterScoped {
+				scope = "cluster scope"
+			}
 			return secureNeedsHuman("OperatorRBAC",
-				"the operator lacks %s on %s/%s required to provision the secure topology", review.verb, review.group, review.resource)
+				"the operator lacks %s on %s/%s (%s) required to provision the secure topology",
+				review.verb, review.group, review.resource, scope)
 		}
 	}
 	return nil
+}
+
+// operatorAccessReviews returns the access reviews that prove the operator's
+// own provisioning grants: the namespaced resources it creates in the run
+// namespace, and the cluster-scoped ones it reads or creates cluster-wide.
+//
+// The operator creates the broker's ClusterRoleBinding, lists the cluster's
+// nodes, reads the run namespace, and creates the access reviews themselves:
+// five cluster-scoped requests, each granted by the deployment's ClusterRole.
+// Reviewed with the run namespace, a namespaced Role could satisfy any of
+// them.
+//
+// The SelfSubjectAccessReview the operator asks about itself is a canary
+// rather than a proof on a stock cluster: the API server's default
+// `system:basic-user` binding already grants that create to every
+// authenticated subject, so the review cannot fail there. It still matters on
+// a cluster whose default policy was replaced, where the operator could not
+// ask any question at all.
+func operatorAccessReviews() []accessReview {
+	core := ""
+	return []accessReview{
+		{group: core, resource: "secrets", verb: "create"},
+		{group: core, resource: "secrets", verb: "delete"},
+		{group: core, resource: "serviceaccounts", verb: "create"},
+		{group: core, resource: "serviceaccounts", verb: "delete"},
+		{group: core, resource: "pods", verb: "create"},
+		{group: core, resource: "pods", verb: "delete"},
+		{group: core, resource: "services", verb: "create"},
+		{group: core, resource: "services", verb: "delete"},
+		{group: "networking.k8s.io", resource: "networkpolicies", verb: "create"},
+		{group: "networking.k8s.io", resource: "networkpolicies", verb: "delete"},
+		{group: "rbac.authorization.k8s.io", resource: "roles", verb: "create"},
+		{group: "rbac.authorization.k8s.io", resource: "rolebindings", verb: "create"},
+		{group: "rbac.authorization.k8s.io", resource: "clusterrolebindings", verb: "create", clusterScoped: true},
+		{group: core, resource: "nodes", verb: "list", clusterScoped: true},
+		{group: core, resource: "namespaces", verb: "get", clusterScoped: true},
+		{group: "authorization.k8s.io", resource: "selfsubjectaccessreviews", verb: "create", clusterScoped: true},
+		{group: "authorization.k8s.io", resource: "subjectaccessreviews", verb: "create", clusterScoped: true},
+	}
 }
 
 // checkBrokerRBAC verifies the broker's named grants two ways: the Role
@@ -153,7 +214,7 @@ func (s *SecureControl) checkOperatorAccess(ctx context.Context) error {
 func (s *SecureControl) checkBrokerRBAC(ctx context.Context, run *courier.CoderRun) error {
 	role := topology.BrokerRole(run)
 	live := role.DeepCopy()
-	if err := s.Client.Get(ctx, types.NamespacedName{Namespace: run.Namespace, Name: role.Name}, live); err != nil {
+	if err := s.reader().Get(ctx, types.NamespacedName{Namespace: run.Namespace, Name: role.Name}, live); err != nil {
 		return fmt.Errorf("secure preflight: read broker Role: %w", err)
 	}
 	if !reflect.DeepEqual(live.Rules, role.Rules) {
@@ -161,12 +222,27 @@ func (s *SecureControl) checkBrokerRBAC(ctx context.Context, run *courier.CoderR
 			"broker Role %s/%s does not match the intended named grant set", run.Namespace, role.Name)
 	}
 	reviews := []accessReview{
-		{courier.GroupVersion.Group, "coderruns", "get", run.Name},
-		{courier.GroupVersion.Group, "coderruns/status", "get", run.Name},
-		{courier.GroupVersion.Group, "coderruns/status", "patch", run.Name},
-		{"", "pods", "get", ""},
-		{"", "pods", "list", ""},
-		{"authentication.k8s.io", "tokenreviews", "create", ""},
+		{group: courier.GroupVersion.Group, resource: "coderruns", verb: "get", name: run.Name},
+		{group: courier.GroupVersion.Group, resource: "coderruns/status", verb: "get", name: run.Name},
+		{group: courier.GroupVersion.Group, resource: "coderruns/status", verb: "patch", name: run.Name},
+		// The broker's only write of the run's status is an update
+		// (internal/broker/status.go), so the update verb is the one the
+		// grant must carry for the broker to report at all.
+		{group: courier.GroupVersion.Group, resource: "coderruns/status", verb: "update", name: run.Name},
+		// The broker's pod reads are name-scoped to this run's three topology
+		// pods (§3): the Role grants get pods only through resourceNames, so
+		// an unrestricted get review fails despite every required named read
+		// being allowed. Review each exact rendered pod name instead (#644).
+		{group: "", resource: "pods", verb: "get", name: topology.ControlPodName(run.Name)},
+		{group: "", resource: "pods", verb: "get", name: topology.WorkerPodName(run.Name)},
+		{group: "", resource: "pods", verb: "get", name: topology.BrokerPodName(run.Name)},
+		// RBAC cannot name-scope a list; the run namespace is dedicated, so
+		// the authenticator's exactly-one-live-control scan stays a plain list.
+		{group: "", resource: "pods", verb: "list"},
+		// TokenReview creation is cluster-scoped and granted through the
+		// deployment's ClusterRole; review it with no namespace so a namespaced
+		// grant can never be credited for the cluster grant the broker needs (#644).
+		{group: "authentication.k8s.io", resource: "tokenreviews", verb: "create", clusterScoped: true},
 	}
 	for _, review := range reviews {
 		allowed, err := s.subjectAccessReviewAs(ctx, topology.BrokerSAName(run.Name), review)
@@ -174,6 +250,10 @@ func (s *SecureControl) checkBrokerRBAC(ctx context.Context, run *courier.CoderR
 			return fmt.Errorf("secure preflight: broker access review for %s/%s %s: %w", review.group, review.resource, review.verb, err)
 		}
 		if !allowed {
+			if review.name != "" {
+				return secureNeedsHuman("BrokerRBAC",
+					"the broker service account lacks %s on %s/%s %s", review.verb, review.group, review.resource, review.name)
+			}
 			return secureNeedsHuman("BrokerRBAC",
 				"the broker service account lacks %s on %s/%s", review.verb, review.group, review.resource)
 		}
@@ -188,7 +268,7 @@ func (s *SecureControl) selfSubjectAccessReview(ctx context.Context, review acce
 	sar, err := s.Config.Kubernetes.AuthorizationV1().SelfSubjectAccessReviews().Create(ctx, &authorizationv1.SelfSubjectAccessReview{
 		Spec: authorizationv1.SelfSubjectAccessReviewSpec{
 			ResourceAttributes: &authorizationv1.ResourceAttributes{
-				Namespace: s.Config.RunNamespace,
+				Namespace: s.reviewNamespace(review),
 				Verb:      review.verb,
 				Group:     review.group,
 				Resource:  review.resource,
@@ -197,9 +277,22 @@ func (s *SecureControl) selfSubjectAccessReview(ctx context.Context, review acce
 		},
 	}, metav1.CreateOptions{})
 	if err != nil {
-		return false, err
+		return false, s.accessReviewError(err, "self subject access reviews")
 	}
 	return sar.Status.Allowed && !sar.Status.Denied, nil
+}
+
+// accessReviewError classifies a failure to ask the API server an access
+// question. A refusal is a deployment misconfiguration the operator must fix —
+// the operator cannot even ask — so it is a verdict the retry gate can bound,
+// not an ordinary transient error the design retries as fast as the API server
+// allowed.
+func (s *SecureControl) accessReviewError(err error, resource string) error {
+	if apierrors.IsForbidden(err) {
+		return secureNeedsHuman("OperatorRBAC",
+			"the operator cannot create %s: %v", resource, err)
+	}
+	return err
 }
 
 func (s *SecureControl) subjectAccessReviewAs(ctx context.Context, serviceAccount string, review accessReview) (bool, error) {
@@ -210,7 +303,7 @@ func (s *SecureControl) subjectAccessReviewAs(ctx context.Context, serviceAccoun
 		Spec: authorizationv1.SubjectAccessReviewSpec{
 			User: "system:serviceaccount:" + s.Config.RunNamespace + ":" + serviceAccount,
 			ResourceAttributes: &authorizationv1.ResourceAttributes{
-				Namespace: s.Config.RunNamespace,
+				Namespace: s.reviewNamespace(review),
 				Verb:      review.verb,
 				Group:     review.group,
 				Resource:  review.resource,
@@ -219,9 +312,19 @@ func (s *SecureControl) subjectAccessReviewAs(ctx context.Context, serviceAccoun
 		},
 	}, metav1.CreateOptions{})
 	if err != nil {
-		return false, err
+		return false, s.accessReviewError(err, "subject access reviews")
 	}
 	return sar.Status.Allowed && !sar.Status.Denied, nil
+}
+
+// reviewNamespace returns the namespace a review must carry: the run namespace
+// for namespaced resources, and empty for cluster-scoped ones so the RBAC
+// authorizer resolves only cluster-wide grants for them.
+func (s *SecureControl) reviewNamespace(review accessReview) string {
+	if review.clusterScoped {
+		return ""
+	}
+	return s.Config.RunNamespace
 }
 
 // checkDryRuns proves what the cluster's API admits: the operator's rendered
@@ -367,7 +470,7 @@ func (s *SecureControl) checkDryRuns(ctx context.Context, run *courier.CoderRun,
 // incarnation would provision, for dry-run rendering only.
 func (s *SecureControl) renderedWorkerPublicKey(ctx context.Context, run *courier.CoderRun) ([]byte, error) {
 	secret := &corev1.Secret{}
-	err := s.Client.Get(ctx, types.NamespacedName{Namespace: run.Namespace, Name: topology.SigningSecretName(run.Name)}, secret)
+	err := s.reader().Get(ctx, types.NamespacedName{Namespace: run.Namespace, Name: topology.SigningSecretName(run.Name)}, secret)
 	if err != nil {
 		if apierrors.IsNotFound(err) {
 			// No incarnation yet: render with a placeholder key; the dry-run
@@ -389,7 +492,7 @@ func (s *SecureControl) renderedWorkerPublicKey(ctx context.Context, run *courie
 // lane-following, so no lane sizing is resolved or passed in here.
 func (s *SecureControl) runLiveProbes(ctx context.Context, run *courier.CoderRun, cache *topology.CachePin) error {
 	nodes := &corev1.NodeList{}
-	if err := s.Client.List(ctx, nodes); err != nil {
+	if err := s.reader().List(ctx, nodes); err != nil {
 		return fmt.Errorf("secure preflight: list nodes: %w", err)
 	}
 	eligible := eligibleNodes(nodes)
@@ -566,7 +669,7 @@ func (s *SecureControl) collectProbeResults(ctx context.Context, run *courier.Co
 
 func (s *SecureControl) serviceClusterIP(ctx context.Context, namespace, name string) (string, error) {
 	service := &corev1.Service{}
-	if err := s.Client.Get(ctx, types.NamespacedName{Namespace: namespace, Name: name}, service); err != nil {
+	if err := s.reader().Get(ctx, types.NamespacedName{Namespace: namespace, Name: name}, service); err != nil {
 		return "", err
 	}
 	if service.Spec.ClusterIP == "" || service.Spec.ClusterIP == "None" {

@@ -8,6 +8,7 @@ import (
 
 	courierv1alpha1 "github.com/misospace/courier/api/v1alpha1"
 	"github.com/misospace/courier/internal/branch"
+	"github.com/misospace/courier/internal/executor"
 	"github.com/misospace/courier/internal/source"
 )
 
@@ -22,6 +23,12 @@ var (
 	// filed. The condition is permanent for the pull request's current head,
 	// so callers terminate NeedsHuman instead of cycling claim and release.
 	ErrHeadRepositoryGone = errors.New("coderun controller: pull request head repository is missing")
+	// ErrContributionContextUnsupported reports that the source owning a run
+	// supplies no contribution execution surface at all. It is reported as an
+	// ordinary error, like any other unresolved source, because a later
+	// deployment can wire an adapter that does; see launchContribution for what
+	// a contribute run treats as permanent.
+	ErrContributionContextUnsupported = errors.New("coderun controller: source does not supply a contribution execution context")
 )
 
 // SourceRegistry keeps source adapters behind the source name persisted in a
@@ -70,6 +77,50 @@ func (r *SourceRegistry) lookupRun(run *courierv1alpha1.CoderRun) (source.Adapte
 		return r.lookup(run.Spec.Source + ":" + run.Spec.SourceAgent)
 	}
 	return r.lookup(run.Spec.Source)
+}
+
+// ContributionExecution resolves the adapter owning the run and asks it for the
+// source-neutral execution input its own durable context encodes (#624). The
+// registry never decodes source context itself: an adapter that materializes
+// contribute runs implements executor.ContributionContext, and a source that
+// does not fails closed here. That is what keeps core from ever learning a
+// source's context key while still refusing to launch a contribute coordinator
+// with no admitted objective.
+func (r *SourceRegistry) ContributionExecution(run *courierv1alpha1.CoderRun) (executor.ContributionExecution, error) {
+	adapter, err := r.lookupRun(run)
+	if err != nil {
+		return executor.ContributionExecution{}, err
+	}
+	provider, ok := adapter.(executor.ContributionContext)
+	if !ok {
+		return executor.ContributionExecution{}, fmt.Errorf("%w: source %q", ErrContributionContextUnsupported, run.Spec.Source)
+	}
+	return provider.ContributionExecution(run)
+}
+
+// launchContribution resolves the contribution execution input one launch
+// renders into the coordinator goal, and is empty for every run that carries
+// its whole goal in the spec.
+//
+// A refusal from the adapter owning the run is permanent: the context it
+// refused lives in the immutable spec, so the run terminalizes NeedsHuman with
+// that reason rather than relaunching without an objective. A failure to reach
+// an owning adapter at all — no registry wired, no adapter registered under the
+// run's source, a source that supplies no contribution surface — is reported as
+// an ordinary error, exactly as every other unresolved source is, because a
+// later deployment can wire it.
+func launchContribution(registry *SourceRegistry, run *courierv1alpha1.CoderRun) (executor.ContributionExecution, error) {
+	if run.Spec.Mode != courierv1alpha1.ModeContribute {
+		return executor.ContributionExecution{}, nil
+	}
+	contribution, err := registry.ContributionExecution(run)
+	if err == nil {
+		return contribution, nil
+	}
+	if errors.Is(err, ErrSourceRegistryRequired) || errors.Is(err, ErrUnknownSource) || errors.Is(err, ErrContributionContextUnsupported) {
+		return executor.ContributionExecution{}, err
+	}
+	return executor.ContributionExecution{}, secureNeedsHuman(contributionContextReason, "%v", err)
 }
 
 // HeadRef identifies the exact head of a pull request: the repository that
