@@ -107,6 +107,12 @@ type accessReview struct {
 	resource string
 	verb     string
 	name     string
+	// clusterScoped marks a cluster-scoped resource (TokenReview) whose
+	// access review must omit the namespace. A namespaced Role can never
+	// grant a cluster-scoped verb, so sending a namespace would let a
+	// namespaced grant stand in for the cluster grant and pass a check the
+	// real request would fail.
+	clusterScoped bool
 }
 
 // checkOperatorAccess verifies the operator's own provisioning grants with
@@ -115,22 +121,22 @@ type accessReview struct {
 func (s *SecureControl) checkOperatorAccess(ctx context.Context) error {
 	core := ""
 	reviews := []accessReview{
-		{core, "secrets", "create", ""},
-		{core, "secrets", "delete", ""},
-		{core, "serviceaccounts", "create", ""},
-		{core, "serviceaccounts", "delete", ""},
-		{core, "pods", "create", ""},
-		{core, "pods", "delete", ""},
-		{core, "services", "create", ""},
-		{core, "services", "delete", ""},
-		{"networking.k8s.io", "networkpolicies", "create", ""},
-		{"networking.k8s.io", "networkpolicies", "delete", ""},
-		{"rbac.authorization.k8s.io", "roles", "create", ""},
-		{"rbac.authorization.k8s.io", "rolebindings", "create", ""},
-		{"rbac.authorization.k8s.io", "clusterrolebindings", "create", ""},
-		{core, "nodes", "list", ""},
-		{core, "namespaces", "get", ""},
-		{"authorization.k8s.io", "selfsubjectaccessreviews", "create", ""},
+		{group: core, resource: "secrets", verb: "create"},
+		{group: core, resource: "secrets", verb: "delete"},
+		{group: core, resource: "serviceaccounts", verb: "create"},
+		{group: core, resource: "serviceaccounts", verb: "delete"},
+		{group: core, resource: "pods", verb: "create"},
+		{group: core, resource: "pods", verb: "delete"},
+		{group: core, resource: "services", verb: "create"},
+		{group: core, resource: "services", verb: "delete"},
+		{group: "networking.k8s.io", resource: "networkpolicies", verb: "create"},
+		{group: "networking.k8s.io", resource: "networkpolicies", verb: "delete"},
+		{group: "rbac.authorization.k8s.io", resource: "roles", verb: "create"},
+		{group: "rbac.authorization.k8s.io", resource: "rolebindings", verb: "create"},
+		{group: "rbac.authorization.k8s.io", resource: "clusterrolebindings", verb: "create"},
+		{group: core, resource: "nodes", verb: "list"},
+		{group: core, resource: "namespaces", verb: "get"},
+		{group: "authorization.k8s.io", resource: "selfsubjectaccessreviews", verb: "create"},
 	}
 	for _, review := range reviews {
 		allowed, err := s.selfSubjectAccessReview(ctx, review)
@@ -161,12 +167,23 @@ func (s *SecureControl) checkBrokerRBAC(ctx context.Context, run *courier.CoderR
 			"broker Role %s/%s does not match the intended named grant set", run.Namespace, role.Name)
 	}
 	reviews := []accessReview{
-		{courier.GroupVersion.Group, "coderruns", "get", run.Name},
-		{courier.GroupVersion.Group, "coderruns/status", "get", run.Name},
-		{courier.GroupVersion.Group, "coderruns/status", "patch", run.Name},
-		{"", "pods", "get", ""},
-		{"", "pods", "list", ""},
-		{"authentication.k8s.io", "tokenreviews", "create", ""},
+		{group: courier.GroupVersion.Group, resource: "coderruns", verb: "get", name: run.Name},
+		{group: courier.GroupVersion.Group, resource: "coderruns/status", verb: "get", name: run.Name},
+		{group: courier.GroupVersion.Group, resource: "coderruns/status", verb: "patch", name: run.Name},
+		// The broker's pod reads are name-scoped to this run's three topology
+		// pods (§3): the Role grants get pods only through resourceNames, so
+		// an unrestricted get review fails despite every required named read
+		// being allowed. Review each exact rendered pod name instead (#644).
+		{group: "", resource: "pods", verb: "get", name: topology.ControlPodName(run.Name)},
+		{group: "", resource: "pods", verb: "get", name: topology.WorkerPodName(run.Name)},
+		{group: "", resource: "pods", verb: "get", name: topology.BrokerPodName(run.Name)},
+		// RBAC cannot name-scope a list; the run namespace is dedicated, so
+		// the authenticator's exactly-one-live-control scan stays a plain list.
+		{group: "", resource: "pods", verb: "list"},
+		// TokenReview creation is cluster-scoped and granted through the
+		// deployment's ClusterRole; review it with no namespace so a namespaced
+		// grant can never be credited for the cluster grant the broker needs (#644).
+		{group: "authentication.k8s.io", resource: "tokenreviews", verb: "create", clusterScoped: true},
 	}
 	for _, review := range reviews {
 		allowed, err := s.subjectAccessReviewAs(ctx, topology.BrokerSAName(run.Name), review)
@@ -174,6 +191,10 @@ func (s *SecureControl) checkBrokerRBAC(ctx context.Context, run *courier.CoderR
 			return fmt.Errorf("secure preflight: broker access review for %s/%s %s: %w", review.group, review.resource, review.verb, err)
 		}
 		if !allowed {
+			if review.name != "" {
+				return secureNeedsHuman("BrokerRBAC",
+					"the broker service account lacks %s on %s/%s %s", review.verb, review.group, review.resource, review.name)
+			}
 			return secureNeedsHuman("BrokerRBAC",
 				"the broker service account lacks %s on %s/%s", review.verb, review.group, review.resource)
 		}
@@ -188,7 +209,7 @@ func (s *SecureControl) selfSubjectAccessReview(ctx context.Context, review acce
 	sar, err := s.Config.Kubernetes.AuthorizationV1().SelfSubjectAccessReviews().Create(ctx, &authorizationv1.SelfSubjectAccessReview{
 		Spec: authorizationv1.SelfSubjectAccessReviewSpec{
 			ResourceAttributes: &authorizationv1.ResourceAttributes{
-				Namespace: s.Config.RunNamespace,
+				Namespace: s.reviewNamespace(review),
 				Verb:      review.verb,
 				Group:     review.group,
 				Resource:  review.resource,
@@ -210,7 +231,7 @@ func (s *SecureControl) subjectAccessReviewAs(ctx context.Context, serviceAccoun
 		Spec: authorizationv1.SubjectAccessReviewSpec{
 			User: "system:serviceaccount:" + s.Config.RunNamespace + ":" + serviceAccount,
 			ResourceAttributes: &authorizationv1.ResourceAttributes{
-				Namespace: s.Config.RunNamespace,
+				Namespace: s.reviewNamespace(review),
 				Verb:      review.verb,
 				Group:     review.group,
 				Resource:  review.resource,
@@ -222,6 +243,16 @@ func (s *SecureControl) subjectAccessReviewAs(ctx context.Context, serviceAccoun
 		return false, err
 	}
 	return sar.Status.Allowed && !sar.Status.Denied, nil
+}
+
+// reviewNamespace returns the namespace a review must carry: the run namespace
+// for namespaced resources, and empty for cluster-scoped ones so the RBAC
+// authorizer resolves only cluster-wide grants for them.
+func (s *SecureControl) reviewNamespace(review accessReview) string {
+	if review.clusterScoped {
+		return ""
+	}
+	return s.Config.RunNamespace
 }
 
 // checkDryRuns proves what the cluster's API admits: the operator's rendered
