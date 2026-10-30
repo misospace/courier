@@ -2250,7 +2250,35 @@ each of them clears on a later pass — a live probe can outrun the dataplane
 programming of the NetworkPolicy the same reconcile just wrote, and an access
 review can read an informer cache that has not yet caught up with a Role created
 moments ago — so terminalizing them would strand a run that was always going to
-succeed. The secure round is fenced before it terminalizes: a resumed launch
+succeed.
+The claim/release requeue a permanent-class verdict keeps is rate-bounded. A
+verdict outside the terminal classes — `BrokerRBAC`, `OperatorRBAC`,
+`PodSecurity`, `AdmissionBroken`, `IsolationBroken`, and any future reason
+naming a deployment misconfiguration only the operator can fix — requeued as
+fast as the API server allowed would churn the run through Pending and Claimed
+several times a second, the retry churn #644 required to stop. The operator
+records such a failure on the run itself:
+`courier.misospace.dev/preflight-failed-at` carries the RFC3339 time of the last
+failed attempt and `courier.misospace.dev/preflight-failures` the count of
+consecutive failures, and the next attempt waits a delay that starts at 15s and
+doubles per consecutive failure up to a 5m ceiling. The count is consecutive
+because a launch that passes the preflight removes both markers again. The
+wait is quiet: while it holds, the admission path neither claims the run nor
+writes its status, so nothing wakes it before its delay is up, and a claimed
+run whose rollback failed waits out the delay still holding its source claim
+and its lane slot. The markers live on the object, so a controller restart
+cannot turn the bounded wait back into the churn, and the count is read from
+the API server rather than the informer cache, so a lagging cache cannot
+restart the schedule. The gate is armed before the claim is released, so a
+rollback that fails still leaves the run waiting out the delay instead of
+cycling. The bound is best-effort: a marker that cannot be written leaves the
+ordinary requeue, and a marker that cannot be read is treated as no gate at
+all, because a gate that cannot be read must never strand a run that could
+still succeed. No verdict class changes: a failure that clears on a later pass
+still clears, and one that never clears still retries — only not in a tight
+loop. An ordinary preflight error is not gated at all, because the design
+classifies it as transient.
+The secure round is fenced before it terminalizes: a resumed launch
 reaches the launcher with a live worker and a credentialed broker, and a
 `NeedsHuman` run is no longer observed, so a fence deferred past that reconcile
 would leave the untrusted executor running and the broker holding credentials

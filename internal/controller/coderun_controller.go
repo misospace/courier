@@ -445,6 +445,19 @@ func (r *CoderRunReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 		return ctrl.Result{RequeueAfter: capacityRequeueDelay}, nil
 	}
 
+	// A failed secure preflight that is not a terminal verdict leaves the run
+	// retryable, so without a gate it would cycle Pending → Claimed → Pending
+	// as fast as the API server allows. The durable gate holds the next
+	// attempt back on a bounded schedule, and the wait is quiet: no claim is
+	// taken and no status is written, so nothing wakes the run before its
+	// delay is up.
+	if remaining, ok := r.preflightBackoffRemaining(&run); ok {
+		l.V(1).Info("secure preflight backoff active, run waits",
+			"run", run.Name,
+			"remaining", remaining.String())
+		return ctrl.Result{RequeueAfter: remaining}, nil
+	}
+
 	if claimer, ok := adapter.(source.ClaimerWithReceipt); ok {
 		claimed, err := claimer.ClaimWithReceipt(ctx, item)
 		if err != nil {
@@ -515,6 +528,11 @@ func (r *CoderRunReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 			if err != nil {
 				return r.secureLaunchFailure(ctx, &run, adapter, item, err)
 			}
+			// The launch succeeded, so the deployment is no longer the
+			// misconfigured one the gate recorded: a later failure must
+			// start from the base delay again rather than inherit this
+			// failure's place in the schedule.
+			r.clearPreflightBackoffAfterLaunch(ctx, &run)
 			if result.Requeue || result.RequeueAfter > 0 {
 				// Provisioning is in flight; the run stays Claimed and the
 				// next reconcile resumes it.
@@ -725,6 +743,16 @@ func capCloseRetry(result ctrl.Result, closeRetry time.Duration) ctrl.Result {
 // down or holds a foreign pod, and writing Running over it would bind the
 // run to a dying or foreign coordinator (#217).
 func (r *CoderRunReconciler) resumeClaimed(ctx context.Context, run *courierv1alpha1.CoderRun) (ctrl.Result, error) {
+	// The same durable gate the Pending path honors: a run whose secure
+	// preflight failed on the previous pass waits out its delay before the
+	// launch is retried, and the wait is quiet — no status write, so nothing
+	// wakes the run before its delay is up.
+	if remaining, ok := r.preflightBackoffRemaining(run); ok {
+		log.FromContext(ctx).V(1).Info("secure preflight backoff active, run waits",
+			"run", run.Name,
+			"remaining", remaining.String())
+		return ctrl.Result{RequeueAfter: remaining}, nil
+	}
 	l := log.FromContext(ctx)
 	adapter, item, err := r.adapterAndWorkItem(run)
 	if err != nil {
@@ -761,6 +789,9 @@ func (r *CoderRunReconciler) resumeClaimed(ctx context.Context, run *courierv1al
 		if err != nil {
 			return r.secureLaunchFailure(ctx, run, adapter, item, err)
 		}
+		// The launch succeeded, so the gate the previous failure recorded is
+		// spent: a later failure must start from the base delay again.
+		r.clearPreflightBackoffAfterLaunch(ctx, run)
 		if result.Requeue || result.RequeueAfter > 0 {
 			return result, nil
 		}
@@ -1010,12 +1041,33 @@ func (r *CoderRunReconciler) terminateMissingHead(ctx context.Context, run *cour
 // retries the fence. Every other error keeps the launch path's transient
 // behaviour — the claim is released back to Pending — because a signal that
 // clears on a later pass must not strand the run (terminalPreflightVerdict).
+//
+// A permanent-class verdict that is not one of the terminal classes — the
+// broker's named-pod RBAC grant, the operator's own grants, the namespace's
+// Pod Security label — is a deployment misconfiguration the operator must fix,
+// but a misconfiguration that a later pass may find already repaired. It
+// neither terminalizes nor returns to the tight claim/release cycle: the
+// durable preflight gate records the failure, and the next attempt waits out
+// a bounded, growing delay before it is made. An ordinary error is not
+// gated: the design classifies it as transient, and it clears on a later
+// pass.
 func (r *CoderRunReconciler) secureLaunchFailure(ctx context.Context, run *courierv1alpha1.CoderRun, adapter source.Adapter, item source.WorkItem, err error) (ctrl.Result, error) {
 	if permanent := launchRejection(err); permanent != nil {
 		if fenceErr := r.Secure.Fence(ctx, run); fenceErr != nil {
 			return ctrl.Result{}, r.releaseClaim(ctx, run, adapter, item, fenceErr)
 		}
 		return r.Secure.transitionNeedsHuman(ctx, run, permanent.Detail)
+	}
+	var verdict *SecureNeedsHumanError
+	if errors.As(err, &verdict) {
+		if armErr := r.armPreflightBackoff(ctx, run); armErr != nil {
+			// The gate could not be recorded, so the bound this pass
+			// wanted does not exist and the run keeps the ordinary requeue.
+			// The claim is still owed back to the source, so the rollback
+			// proceeds and the write failure rides along with the launch
+			// failure rather than stranding the claim.
+			return ctrl.Result{}, r.releaseClaim(ctx, run, adapter, item, errors.Join(err, armErr))
+		}
 	}
 	return ctrl.Result{}, r.releaseClaim(ctx, run, adapter, item, err)
 }
